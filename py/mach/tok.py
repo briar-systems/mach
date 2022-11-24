@@ -13,50 +13,19 @@ class TokenType(Enum):
     EOF = auto()
     EOL = auto()
 
-    # # builtins
-    # IDENT = 0x0010
-    # USE = 0x0010
-    # PUB = 0x0011
-    # FUN = 0x0012
-    # VAR = 0x0013
-    # VAL = 0x0014
-    # REF = 0x0015
-
-    # # control flow
-    # IF = 0x0020
-    # ELIF = 0x0021
-    # ELSE = 0x0022
-    # FOR = 0x0023
-    # WHILE = 0x0024
-    # MATCH = 0x0025
-    # CASE = 0x0026
-    # BREAK = 0x0027
-    # CONTINUE = 0x0028
-    # RETURN = 0x0029
-
-    # # constant types
-    # INT = 0x0030
-    # FLOAT = 0x0031
-    # BOOL = 0x0032
-    # STRING = 0x0033
-    # CHAR = 0x0034
-    # NIL = 0x0035
-
     # literal tokens
     COMMENT = auto()
     IDENT = auto()
     INT = auto()
     FLOAT = auto()
-    BOOL = auto()
     STRING = auto()
     CHAR = auto()
-    NIL = auto()
 
     # unary operators
     NOT = auto()
     POS = auto()
     NEG = auto()
-    PTR = auto()
+    REF = auto()
     DEREF = auto()
 
     # binary operators
@@ -85,14 +54,57 @@ class TokenType(Enum):
     # other
     LPAREN = auto()
     RPAREN = auto()
-    LBRACE = auto()
-    RBRACE = auto()
     LBRACKET = auto()
     RBRACKET = auto()
+    LBRACE = auto()
+    RBRACE = auto()
     COMMA = auto()
+    DOT = auto()
     COLON = auto()
     SEMICOLON = auto()
-    DOT = auto()
-    FSLASH = auto()
-    BSLASH = auto()
-    ASTERISK = auto()
+
+
+tokens = {
+    TokenType.UNK: '\\',
+    TokenType.EOL: '\n',
+    TokenType.EOF: '\0',
+    TokenType.COMMENT: '#foo',
+    TokenType.INT: '0',
+    TokenType.FLOAT: '0.0',
+    TokenType.STRING: '\"foo\"',
+    TokenType.CHAR: '\'f\'',
+    TokenType.NOT: '!',
+    TokenType.POS: '+',
+    TokenType.NEG: '-',
+    TokenType.REF: '?',
+    TokenType.DEREF: '@',
+    TokenType.ASSIGN: '=',
+    TokenType.EQ: '==',
+    TokenType.NEQ: '!=',
+    TokenType.GTE: '>=',
+    TokenType.LTE: '<=',
+    TokenType.GT: '>',
+    TokenType.LT: '<',
+    TokenType.MUL: '*',
+    TokenType.DIV: '/',
+    TokenType.EXP: '**',
+    TokenType.MOD: '%',
+    TokenType.AND: '&&',
+    TokenType.OR: '||',
+    TokenType.BIT_AND: '&',
+    TokenType.BIT_OR: '|',
+    TokenType.BIT_XOR: '^',
+    TokenType.BIT_NOT: '~',
+    TokenType.SHL: '<<',
+    TokenType.SHR: '>>',
+    TokenType.LPAREN: '(',
+    TokenType.RPAREN: ')',
+    TokenType.LBRACKET: '[',
+    TokenType.RBRACKET: ']',
+    TokenType.LBRACE: '{',
+    TokenType.RBRACE: '}',
+    TokenType.COMMA: ',',
+    TokenType.DOT: '.',
+    TokenType.COLON: ':',
+    TokenType.SEMICOLON: ';',
+}

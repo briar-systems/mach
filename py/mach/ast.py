@@ -1,6 +1,10 @@
 from .lex import *
 
 
+class InvalidTokenException(Exception):
+    pass
+
+
 class Expr:
     def __init__(self, tok):
         self.tok = tok
@@ -33,12 +37,13 @@ class Parser:
         if self.check(tok_type):
             self.next()
             return True
-        
+
         self.next()
         return False
 
     def nl(self):
-        if not self.match(TokenType.EOL): return False
+        if not self.match(TokenType.EOL):
+            return False
         while self.check(TokenType.EOL):
             self.next()
 
@@ -46,8 +51,10 @@ class Parser:
         pass
 
     def stmt(self):
-        if self.check(TokenType.EOF): return None
-        if self.check(TokenType.EOL): return None
+        if self.check(TokenType.EOF):
+            return None
+        if self.check(TokenType.EOL):
+            return None
         if self.check(TokenType.IDENT):
             return self.expr()
         if self.check(TokenType.INT):

@@ -88,9 +88,6 @@ class Lex:
                 self.next()
             case '\n':
                 self.line += 1
-                tok = Token(';', TokenType.EOL)
-                self.next()
-            case ';':
                 tok = Token(self.char, TokenType.EOL)
                 self.next()
             case '#':
@@ -205,6 +202,12 @@ class Lex:
             case '^':
                 tok = Token(self.char, TokenType.BIT_XOR)
                 self.next()
+            case '?':
+                tok = Token(self.char, TokenType.REF)
+                self.next()
+            case '@':
+                tok = Token(self.char, TokenType.DEREF)
+                self.next()
             case _:
                 if self.char.isalpha():
                     tok = self.get_ident()
@@ -212,14 +215,13 @@ class Lex:
                 elif self.char.isdigit():
                     tok = self.get_number()
                     self.next()
+                else:
+                    tok = Token(self.char, TokenType.UNK)
 
         if tok.type != TokenType.EOL:
             print(f'{self.line:03d} | ', end='')
-            print(tok.type, tok.text, sep=' ' * (32 - len(str(tok.type))))
+            print(tok.type, tok.text, sep=' ' * (20 - len(str(tok.type))))
         else:
             print("----|----")
-
-        if tok.type == None:
-            self.abort("unexpected character " + self.char)
 
         return tok
