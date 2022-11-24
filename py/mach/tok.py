@@ -1,15 +1,10 @@
 from enum import Enum, auto
 
 
-class Token:
-    def __init__(self, text, type):
-        self.text = text
-        self.type = type
-
-
 class TokenType(Enum):
     # representational tokens
-    UNK = -1
+    UNK = auto()
+    INV = auto()
     EOF = auto()
     EOL = auto()
 
@@ -64,7 +59,17 @@ class TokenType(Enum):
     SEMICOLON = auto()
 
 
+class Token:
+    def __init__(self, pos: int, row: int, col: int, val: int, type: TokenType):
+        self.pos = pos
+        self.row = row
+        self.col = col
+        self.val = val
+        self.type = type
+
+
 tokens = {
+    TokenType.INV: '0.a',
     TokenType.UNK: '\\',
     TokenType.EOL: '\n',
     TokenType.EOF: '\0',

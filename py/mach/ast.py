@@ -5,16 +5,6 @@ class InvalidTokenException(Exception):
     pass
 
 
-class Expr:
-    def __init__(self, tok):
-        self.tok = tok
-
-
-class Stmt:
-    def __init__(self, tok):
-        self.tok = tok
-
-
 class Parser:
     def __init__(self, lex: Lex):
         self.lex = lex
@@ -64,7 +54,7 @@ class Parser:
 
         self.nl()
 
-    def parse(self):
+    def exec(self):
         while not self.check(TokenType.EOF):
             self.stmt()
             self.match(TokenType.EOL)

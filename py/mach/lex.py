@@ -4,20 +4,22 @@ from .tok import TokenType, Token
 class Lex:
     def __init__(self, input):
         self.src = input + "\n"
-        self.char = ''
-        self.pos = -1
-
-        # line is only used for error reporting
-        self.line = 1
+        self.val = ""
+        self.row = +1  # index at 1
+        self.col = +0  # index at 1
+        self.pos = -1  # index at 0
 
         self.next()
 
     def next(self):
         self.pos += 1
+        self.col += 1
         if self.pos >= len(self.src):
-            self.char = '\0'
+            self.val = '\0'
+            self.pos -= 1
+            self.col -= 1
         else:
-            self.char = self.src[self.pos]
+            self.val = self.src[self.pos]
 
     def peek(self):
         if self.pos + 1 >= len(self.src):
@@ -25,203 +27,228 @@ class Lex:
 
         return self.src[self.pos + 1]
 
-    def abort(self, msg):
-        raise Exception("lex error: " + msg)
-
     def get_ident(self):
         start = self.pos
+        # make sure the first character is a letter
+        if not self.val.isalpha() and self.val != '_':
+            return self.emit(TokenType.INV)
+
         while self.peek().isalnum():
             self.next()
 
-        return Token(self.src[start:self.pos + 1], TokenType.IDENT)
-
-    def get_number(self):
-        start = self.pos
-        while self.peek().isdigit() or self.peek() == '_':
-            self.next()
-
-        if self.peek() == '.':
-            self.next()
-            if not self.peek().isdigit():
-                self.abort("unexpected character " + self.char)
-
-            while self.peek().isdigit() or self.peek() == '_':
-                self.next()
-
-            return Token(self.src[start:self.pos + 1], TokenType.FLOAT)
-
-        return Token(self.src[start:self.pos + 1], TokenType.INT)
+        return self.emit(TokenType.IDENT, self.src[start:self.pos+1])
 
     def get_string(self):
-        start = self.pos
         self.next()
-        while self.char != '"':
+        start = self.pos
+        while self.peek() != '"':
             self.next()
-        return Token(self.src[start + 1:self.pos], TokenType.STRING)
+
+        self.next()
+        return self.emit(TokenType.STRING, self.src[start:self.pos])
 
     def get_char(self):
-        start = self.pos
         self.next()
-        while self.char != '\'':
+        start = self.pos
+        while self.peek() != '\'':
             self.next()
-        return Token(self.src[start + 1:self.pos], TokenType.CHAR)
+
+        self.next()
+        return self.emit(TokenType.CHAR, self.src[start:self.pos])
 
     def get_comment(self):
+        self.next()
         start = self.pos
         while self.peek() != '\n':
             self.next()
-        return Token(self.src[start+1:self.pos + 1], TokenType.COMMENT)
 
-    def skip_whitespace(self):
-        while self.char == ' ' or self.char == '\t' or self.char == '\r':
+        self.next()
+        return self.emit(TokenType.COMMENT, self.src[start:self.pos])
+
+    def get_number(self):
+        start = self.pos
+
+        # check for hex/oct/bin
+        if self.val == '0':
+            # hex
+            if self.val in 'xX':
+                self.next()
+                self.next()
+                while self.peek().isalnum():
+                    self.next()
+
+                return self.emit(TokenType.INT, int(self.src[start:self.pos+1], 16))
+
+            # oct/bin
+            if self.val in 'oObB':
+                self.next()
+                self.next()
+                while self.peek().isnumeric():
+                    self.next()
+
+                return self.emit(TokenType.INT, int(self.src[start:self.pos+1], 8))
+
+        # scan for digits
+        while self.peek().isdigit() or self.val == '_':
             self.next()
 
+        # check for float
+        if self.peek() == '.':
+            self.next()
+
+            while self.peek().isdigit() or self.val == '_':
+                self.next()
+
+            return self.emit(TokenType.FLOAT, float(self.src[start:self.pos+1]))
+
+        return self.emit(TokenType.INT, int(self.src[start:self.pos+1]))
+
+    def skip_whitespace(self):
+        while self.val == ' ' or self.val == '\t' or self.val == '\r':
+            self.next()
+
+    def emit(self, type, val=None):
+        val = val if val is not None else self.val
+        size = len(str(val)) - 1
+        return Token(
+            self.pos,
+            self.row,
+            self.col - size,
+            val,
+            type
+        )
+
     def next_tok(self):
-        # print('\'', self.char if self.char != '\n' else ';', '\'', sep='')
-
         self.skip_whitespace()
-        tok = Token(None, None)
+        tok = None
 
-        match self.char:
+        # TODO: clamp the size on this a bit ya? Maybe `get_operator`?
+        match self.val:
             case '\0':
-                tok = Token(self.char, TokenType.EOF)
-                self.next()
+                tok = self.emit(TokenType.EOF)
             case '\n':
-                self.line += 1
-                tok = Token(self.char, TokenType.EOL)
-                self.next()
+                tok = self.emit(TokenType.EOL)
+                self.row += 1
+                self.col = 0
             case '#':
                 tok = self.get_comment()
-                self.next()
+                self.row += 1
+                self.col = 0
             case '"':
                 tok = self.get_string()
-                self.next()
             case '\'':
                 tok = self.get_char()
-                self.next()
             case '+':
-                tok = Token(self.char, TokenType.POS)
-                self.next()
+                tok = self.emit(TokenType.POS)
             case '-':
-                tok = Token(self.char, TokenType.NEG)
-                self.next()
+                tok = self.emit(TokenType.NEG)
             case '%':
-                tok = Token(self.char, TokenType.MOD)
-                self.next()
+                tok = self.emit(TokenType.MOD)
             case '/':
-                tok = Token(self.char, TokenType.DIV)
-                self.next()
+                tok = self.emit(TokenType.DIV)
+            case '(':
+                tok = self.emit(TokenType.LPAREN)
+            case ')':
+                tok = self.emit(TokenType.RPAREN)
+            case '[':
+                tok = self.emit(TokenType.LBRACKET)
+            case ']':
+                tok = self.emit(TokenType.RBRACKET)
+            case '{':
+                tok = self.emit(TokenType.LBRACE)
+            case '}':
+                tok = self.emit(TokenType.RBRACE)
+            case ',':
+                tok = self.emit(TokenType.COMMA)
+            case ';':
+                tok = self.emit(TokenType.SEMICOLON)
+            case ':':
+                tok = self.emit(TokenType.COLON)
+            case '.':
+                tok = self.emit(TokenType.DOT)
+            case '~':
+                tok = self.emit(TokenType.BIT_NOT)
+            case '^':
+                tok = self.emit(TokenType.BIT_XOR)
+            case '?':
+                tok = self.emit(TokenType.REF)
+            case '@':
+                tok = self.emit(TokenType.DEREF)
             case '!':
                 if self.peek() == '=':
-                    tok = Token(self.char, TokenType.NEQ)
+                    start = self.pos
                     self.next()
+                    tok = self.emit(TokenType.NEQ, self.src[start:self.pos+1])
                 else:
-                    tok = Token(self.char, TokenType.NOT)
-                    self.next()
+                    tok = self.emit(TokenType.NOT)
             case '*':
                 if self.peek() == '*':
-                    tok = Token(self.char, TokenType.EXP)
+                    start = self.pos
                     self.next()
+                    tok = self.emit(TokenType.EXP, self.src[start:self.pos+1])
                 else:
-                    tok = Token(self.char, TokenType.MUL)
-                    self.next()
+                    tok = self.emit(TokenType.MUL)
             case '&':
                 if self.peek() == '&':
-                    tok = Token(self.char, TokenType.AND)
+                    start = self.pos
                     self.next()
+                    tok = self.emit(TokenType.AND, self.src[start:self.pos+1])
                 else:
-                    tok = Token(self.char, TokenType.BIT_AND)
-                    self.next()
+                    tok = self.emit(TokenType.BIT_AND)
             case '=':
                 if self.peek() == '=':
-                    tok = Token(self.char, TokenType.EQ)
+                    start = self.pos
                     self.next()
+                    tok = self.emit(TokenType.EQ, self.src[start:self.pos+1])
                 else:
-                    tok = Token(self.char, TokenType.ASSIGN)
-                    self.next()
+                    tok = self.emit(TokenType.ASSIGN)
             case '|':
                 if self.peek() == '|':
-                    tok = Token(self.char, TokenType.OR)
+                    start = self.pos
                     self.next()
+                    tok = self.emit(TokenType.OR, self.src[start:self.pos+1])
                 else:
-                    tok = Token(self.char, TokenType.BIT_OR)
-                    self.next()
+                    tok = self.emit(TokenType.BIT_OR)
             case '<':
                 if self.peek() == '=':
-                    tok = Token(self.char, TokenType.LTE)
+                    start = self.pos
                     self.next()
+                    tok = self.emit(TokenType.LTE, self.src[start:self.pos+1])
                 elif self.peek() == '<':
-                    tok = Token(self.char, TokenType.SHL)
+                    start = self.pos
                     self.next()
+                    tok = self.emit(TokenType.SHL, self.src[start:self.pos+1])
                 else:
-                    tok = Token(self.char, TokenType.LT)
-                    self.next()
+                    tok = self.emit(TokenType.LT)
             case '>':
                 if self.peek() == '=':
-                    tok = Token(self.char, TokenType.GTE)
+                    start = self.pos
                     self.next()
+                    tok = self.emit(TokenType.GTE, self.src[start:self.pos+1])
                 elif self.peek() == '>':
-                    tok = Token(self.char, TokenType.SHR)
+                    start = self.pos
                     self.next()
+                    tok = self.emit(TokenType.SHR, self.src[start:self.pos+1])
                 else:
-                    tok = Token(self.char, TokenType.GT)
-                    self.next()
-            case '(':
-                tok = Token(self.char, TokenType.LPAREN)
-                self.next()
-            case ')':
-                tok = Token(self.char, TokenType.RPAREN)
-                self.next()
-            case '[':
-                tok = Token(self.char, TokenType.LBRACKET)
-                self.next()
-            case ']':
-                tok = Token(self.char, TokenType.RBRACKET)
-                self.next()
-            case '{':
-                tok = Token(self.char, TokenType.LBRACE)
-                self.next()
-            case '}':
-                tok = Token(self.char, TokenType.RBRACE)
-                self.next()
-            case ',':
-                tok = Token(self.char, TokenType.COMMA)
-                self.next()
-            case ';':
-                tok = Token(self.char, TokenType.SEMICOLON)
-                self.next()
-            case ':':
-                tok = Token(self.char, TokenType.COLON)
-                self.next()
-            case '.':
-                tok = Token(self.char, TokenType.DOT)
-                self.next()
-            case '~':
-                tok = Token(self.char, TokenType.BIT_NOT)
-                self.next()
-            case '^':
-                tok = Token(self.char, TokenType.BIT_XOR)
-                self.next()
-            case '?':
-                tok = Token(self.char, TokenType.REF)
-                self.next()
-            case '@':
-                tok = Token(self.char, TokenType.DEREF)
-                self.next()
+                    tok = self.emit(TokenType.GT)
             case _:
-                if self.char.isalpha():
+                if self.val.isalpha():
                     tok = self.get_ident()
-                    self.next()
-                elif self.char.isdigit():
+                elif self.val.isdigit():
                     tok = self.get_number()
-                    self.next()
                 else:
-                    tok = Token(self.char, TokenType.UNK)
+                    tok = self.emit(TokenType.UNK)
+
+        if tok is None:
+            tok = self.emit(TokenType.INV, self.val)
 
         if tok.type != TokenType.EOL:
-            print(f'{self.line:03d} | ', end='')
-            print(tok.type, tok.text, sep=' ' * (20 - len(str(tok.type))))
+            print(f'{tok.row:03d}:{tok.col:03d} | ', end='')
+            print(tok.type, f"\'{tok.val}\'",
+                  sep=' ' * (20 - len(str(tok.type))))
         else:
-            print("----|----")
+            print("--------|--------")
+
+        self.next()
 
         return tok

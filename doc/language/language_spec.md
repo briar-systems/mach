@@ -2,7 +2,7 @@
 
 ```
 use
-pub
+pub !
 fun
 var
 val
@@ -150,6 +150,14 @@ dot ::= expr "." ident
 assign ::= expr "=" expr
 ```
 
+### Possible Statements
+
+```
+use <ident>[.<ident>]*
+```
+
+### Possible Expressions
+
 ## Function decleration
 
 ```
@@ -162,6 +170,6 @@ pub fun <name>(<args>) <return> {
 
 ```
 var a = 5
-ref b = &a
-var c = *b
+var b = ?a
+var c = @b
 ```
