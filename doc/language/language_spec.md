@@ -52,8 +52,8 @@ arrays ([]<type>)
 !   not
 +   positive
 -   negative
-*   dereference
-&   reference
+?   reference
+@   dereference
 ```
 
 ## Binary
@@ -95,7 +95,10 @@ possible starts:
 +
 -
 %
-/  //
+/
+#
+?
+@
 !  =
 *  **
 &  &&
