@@ -1,5 +1,5 @@
 from . import tok
-from . import errors
+from . import err
 
 
 class Lex:
@@ -137,7 +137,7 @@ class Lex:
             try:
                 next = self.next_tok()
             except Exception as e:
-                errors.add(str(e), 'lex', self.pos)
+                err.add(str(e), 'lex', self.pos)
                 return tokens
             
             tokens.append(next)

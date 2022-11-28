@@ -1,24 +1,8 @@
 import sys
 
-from mach.lex import *
-from mach.ast import *
-from mach.tok import *
-from mach import errors
-
-
-def test_lex():
-    for t, v in tokens.items():
-        lex = Lex(v)
-        tok = lex.next_tok()
-
-        if tok.val == "\n":
-            tok.val = '\\n'
-        if tok.val == "\0":
-            tok.val = '\\0'
-
-        ok = tok.type == t
-        print("OK" if ok else "!!", "|", end=" ")
-        print(t, tok.type, tok.val, sep=' ' * (20 - len(str(t))))
+from std.lang import tok
+from std.lang import lex
+from std.lang import err
 
 
 def main():
@@ -32,19 +16,19 @@ def main():
     src = open(sys.argv[1]).read()
 
     # tokenize
-    lex = Lex(src)
-    tokens = lex.exec()
+    lexer = lex.Lex(src)
+    tokens = lexer.exec()
 
     # pprint tokens
     print("ROW:COL#LEN NAME                 `VAL`")
     print("--------------------------------------")
-    for tok in tokens:
-        row, col = get_row_col(src, tok.pos)
-        print(f'{row:03}:{col:03}#{len(tok.val):03} {tok.kind.name:20} `{tok.val}`')
+    for t in tokens:
+        row, col = tok.get_row_col(src, t.pos)
+        print(f'{row:03}:{col:03}#{len(t.val):03} {t.kind.name:20} `{t.val}`')
 
     print("--------------------------------------")
     print("ERRORS:")
-    errors.print_errors()    
+    err.print_errors()    
 
     # parse
     # par = Parser(tokens)
