@@ -1,115 +1,120 @@
 from enum import Enum, auto
 
+KINDS = {}
 
-class TokenType(Enum):
-    # representational tokens
-    UNK = auto()
-    INV = auto()
-    EOF = auto()
-    EOL = auto()
 
-    # literal tokens
-    COMMENT = auto()
-    IDENT = auto()
-    INT = auto()
-    FLOAT = auto()
-    STRING = auto()
-    CHAR = auto()
+class Kind:
+    def __init__(self, name, repr):
+        self.name = name  # human readable name
+        self.repr = repr  # in-code representation
 
-    # unary operators
-    NOT = auto()
-    POS = auto()
-    NEG = auto()
-    REF = auto()
-    DEREF = auto()
+        KINDS[name] = self
 
-    # binary operators
-    ASSIGN = auto()
-    EQ = auto()
-    NEQ = auto()
-    GTE = auto()
-    LTE = auto()
-    GT = auto()
-    LT = auto()
-    ADD = auto()
-    SUB = auto()
-    MUL = auto()
-    DIV = auto()
-    EXP = auto()
-    MOD = auto()
-    AND = auto()
-    OR = auto()
-    BIT_AND = auto()
-    BIT_OR = auto()
-    BIT_XOR = auto()
-    BIT_NOT = auto()
-    SHL = auto()
-    SHR = auto()
-
-    # other
-    LPAREN = auto()
-    RPAREN = auto()
-    LBRACKET = auto()
-    RBRACKET = auto()
-    LBRACE = auto()
-    RBRACE = auto()
-    COMMA = auto()
-    DOT = auto()
-    COLON = auto()
-    SEMICOLON = auto()
-
+    def __str__(self):
+        return self.name
 
 class Token:
-    def __init__(self, pos: int, row: int, col: int, val: int, type: TokenType):
+    def __init__(self, kind: Kind, pos: int, val):
         self.pos = pos
-        self.row = row
-        self.col = col
         self.val = val
-        self.type = type
+        self.kind = kind
+
+    def end(self):
+        return self.pos + len(self)
+
+    def __str__(self):
+        return f'{self.kind}\t`{self.val}`'
+    
+    def __len__(self):
+        return len(self.val)
+    
+
+# TODO:
+# - `do`
+# - `in`
+INV = Kind("invalid", None)
+UNK = Kind("unknown", None)
+EOF = Kind("end of file", '\0')
+EOL = Kind("end of line", '\n')
+COMMENT = Kind("comment", "#")
+IDENT = Kind("identifier", None)
+
+LIT_INT = Kind("integer literal", None)
+LIT_FLOAT = Kind("float literal", None)
+LIT_STR = Kind("string literal", None)
+LIT_CHAR = Kind("character literal", None)
+LIT_BOOL = Kind("boolean literal", None)
+
+UNOP_NOT = Kind("not", "!")
+UNOP_POS = Kind("positive", "+")
+UNOP_NEG = Kind("negative", "-")
+UNOP_REF = Kind("reference", "?")
+UNOP_DEREF = Kind("dereference", "@")
+
+BINOP_ASSIGN = Kind("assignment", "=")
+BINOP_EQ = Kind("equality", "==")
+BINOP_NEQ = Kind("inequality", "!=")
+BINOP_GTE = Kind("greater than or equal to", ">=")
+BINOP_LTE = Kind("less than or equal to", "<=")
+BINOP_GT = Kind("greater than", ">")
+BINOP_LT = Kind("less than", "<")
+BINOP_MUL = Kind("multiplication", "*")
+BINOP_DIV = Kind("division", "/")
+BINOP_EXP = Kind("exponentiation", "**")
+BINOP_MOD = Kind("modulus", "%")
+BINOP_AND = Kind("and", "&&")
+BINOP_OR = Kind("or", "||")
+
+BINOP_BIT_AND = Kind("bitwise and", "&")
+BINOP_BIT_OR = Kind("bitwise or", "|")
+BINOP_BIT_XOR = Kind("bitwise xor", "^")
+BINOP_BIT_NOT = Kind("bitwise not", "~")
+BINOP_SHL = Kind("shift left", "<<")
+BINOP_SHR = Kind("shift right", ">>")
+
+LPAREN = Kind("left parenthesis", "(")
+RPAREN = Kind("right parenthesis", ")")
+LBRACKET = Kind("left bracket", "[")
+RBRACKET = Kind("right bracket", "]")
+LBRACE = Kind("left brace", "{")
+RBRACE = Kind("right brace", "}")
+COMMA = Kind("comma", ",")
+DOT = Kind("dot", ".")
+COLON = Kind("colon", ":")
+SEMICOLON = Kind("semicolon", ";")
+
+KW_USE = Kind("use", "use")
+KW_FUN = Kind("function", "fun")
+KW_VAR = Kind("variable", "var")
+KW_VAL = Kind("value", "val")
+KW_TYPE = Kind("type", "type")
+KW_IF = Kind("if", "if")
+KW_ELSE = Kind("else", "else")
+KW_ELIF = Kind("elif", "elif")
+KW_FOR = Kind("for", "for")
+KW_MATCH = Kind("match", "match")
+KW_BREAK = Kind("break", "break")
+KW_CONT = Kind("continue", "cont")
+KW_RET = Kind("return", "ret")
 
 
-tokens = {
-    TokenType.INV: '0.a',
-    TokenType.UNK: '\\',
-    TokenType.EOL: '\n',
-    TokenType.EOF: '\0',
-    TokenType.COMMENT: '#foo',
-    TokenType.INT: '0',
-    TokenType.FLOAT: '0.0',
-    TokenType.STRING: '\"foo\"',
-    TokenType.CHAR: '\'f\'',
-    TokenType.NOT: '!',
-    TokenType.POS: '+',
-    TokenType.NEG: '-',
-    TokenType.REF: '?',
-    TokenType.DEREF: '@',
-    TokenType.ASSIGN: '=',
-    TokenType.EQ: '==',
-    TokenType.NEQ: '!=',
-    TokenType.GTE: '>=',
-    TokenType.LTE: '<=',
-    TokenType.GT: '>',
-    TokenType.LT: '<',
-    TokenType.MUL: '*',
-    TokenType.DIV: '/',
-    TokenType.EXP: '**',
-    TokenType.MOD: '%',
-    TokenType.AND: '&&',
-    TokenType.OR: '||',
-    TokenType.BIT_AND: '&',
-    TokenType.BIT_OR: '|',
-    TokenType.BIT_XOR: '^',
-    TokenType.BIT_NOT: '~',
-    TokenType.SHL: '<<',
-    TokenType.SHR: '>>',
-    TokenType.LPAREN: '(',
-    TokenType.RPAREN: ')',
-    TokenType.LBRACKET: '[',
-    TokenType.RBRACKET: ']',
-    TokenType.LBRACE: '{',
-    TokenType.RBRACE: '}',
-    TokenType.COMMA: ',',
-    TokenType.DOT: '.',
-    TokenType.COLON: ':',
-    TokenType.SEMICOLON: ';',
-}
+def find(val) -> Kind:
+    for _, v in KINDS.items():
+        if v.repr == val:
+            return v
+
+    return None
+
+
+def get_row_col(src, pos):
+    row = 1
+    col = 1
+
+    for i in range(pos):
+        if src[i] == '\n':
+            row += 1
+            col = 1
+        else:
+            col += 1
+
+    return row, col
