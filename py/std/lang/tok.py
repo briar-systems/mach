@@ -13,6 +13,7 @@ class Kind:
     def __str__(self):
         return self.name
 
+
 class Token:
     def __init__(self, kind: Kind, pos: int, val):
         self.pos = pos
@@ -24,10 +25,10 @@ class Token:
 
     def __str__(self):
         return f'{self.kind}\t`{self.val}`'
-    
+
     def __len__(self):
         return len(self.val)
-    
+
 
 # TODO:
 # - `do`
@@ -94,8 +95,8 @@ KW_ELIF = Kind("elif", "elif")
 KW_FOR = Kind("for", "for")
 KW_MATCH = Kind("match", "match")
 KW_BREAK = Kind("break", "break")
-KW_CONT = Kind("continue", "cont")
-KW_RET = Kind("return", "ret")
+KW_CONT = Kind("continue", "continue")
+KW_RET = Kind("return", "return")
 
 
 def find(val) -> Kind:
