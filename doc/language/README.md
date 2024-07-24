@@ -1,20 +1,18 @@
-The "Mach" Programming Language
-===
+# Mach Language Documentation
 
-This document serves as a table-of-contents for the language documentation, as well as a high-level overview of the Mach programming language. Please note that the _standard library_ is documented elsewhere.
+This document serves as a table-of-contents for the language documentation as well as a small overview of the syntax.
 
-## What is Mach?
+> The standard library is documented elsewhere and provides a significant number of additional language features that are intentionally not documented here.
+> This collection of documents relates solely to the base language, its syntax, and its usage.
 
-Pronounced "mack", Mach is a low level, compiled, statically typed programming langauge.
+## Table of Contents
 
-> TODO: explain what mach is
+- [Overview](#overview)
+- [Styleguide](styleguide.md)
+- [Keywords](keywords.md)
+- [Operators](operators.md)
+- [Types](types.md)
 
-## Why is Mach?
+## Overview
 
-> TODO: explain why mach is
-
-## Why the name, "Mach"?
-
-"Mach" is a simple, short, easy to pronounce name that happened to not be taken by any other large programming languages. It is a reference to the speed of sound, as well as the first four letters of the word "machine", signifying the emphasis on performance and low-level control.
-
-Mach was almost named "Bones" in reference to the "barebones" nature of the language design, however, it didn't quite stick.
+Mach is a small, clearly defined, and well-documented language with a familiar and easy-to-read syntax.
