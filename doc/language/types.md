@@ -21,14 +21,14 @@ The Mach compiler understands these base types out of the box:
 
 | type                       | description                  |
 | -------------------------- | ---------------------------- |
-| `i8`                       | signed 8-bit integer         |
-| `i16`                      | signed 16-bit integer        |
-| `i32`                      | signed 32-bit integer        |
-| `i64`                      | signed 64-bit integer        |
 | `u8`                       | unsigned 8-bit integer       |
 | `u16`                      | unsigned 16-bit integer      |
 | `u32`                      | unsigned 32-bit integer      |
 | `u64`                      | unsigned 64-bit integer      |
+| `i8`                       | signed 8-bit integer         |
+| `i16`                      | signed 16-bit integer        |
+| `i32`                      | signed 32-bit integer        |
+| `i64`                      | signed 64-bit integer        |
 | `f32`                      | 32-bit floating point number |
 | `f64`                      | 64-bit floating point number |
 | [function](#function-type) | function signature           |
