@@ -12,6 +12,7 @@ This document serves as a table-of-contents for the language documentation as we
 - [Keywords](keywords.md)
 - [Operators](operators.md)
 - [Types](types.md)
+- [Memory](memory.md)
 
 ## Overview
 

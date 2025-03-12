@@ -4,7 +4,7 @@
 | ----------- | ---------------------------------------------------------------- |
 | `out/`      | Output directory for compiled binaries                           |
 | `lib/`      | Directory for project-specific libraries or precompiled binaries |
-| `dep/`      | Directory for project-specific uncompiled dependencies           |
+| `dep/`      | Directory for project-specific uncompiled mach dependencies      |
 | `src/`      | Directory for project source files                               |
 | `mach.json` | Project configuration file                                       |
 

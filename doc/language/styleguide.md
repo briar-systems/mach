@@ -3,7 +3,7 @@
 There are a few stylistic guidelines that a programmer should follow when writing Mach code:
 
 - Use 4 spaces for indentation.
-- Use lower `snake_case` for everything except constant values, which should be upper `SNAKE_CASE`.
+- Use `lower_snake_case` for everything except constant values, which should be upper `SNAKE_CASE`.
 - Opening brackets are not required to have their own line.
 - Use spaces around operators.
 - Use spaces after commas.
@@ -16,19 +16,19 @@ There are a few stylistic guidelines that a programmer should follow when writin
 
 Examples of the indentation guideline in practice is as follows:
 ```mach
-// variable types and assignment operators
-val my_variable:       u32            = 2;
-val my_other_variable: long_type_name = 4;
+# variable types and assignment operators
+val my_variable:       u32            = 2
+val my_other_variable: long_type_name = 4
 
-// inline conditional statements
-if (foo_bar)            { ret 0; }
-or (bar_foo == baz_bam) { ret 1; }
-or                      { ret 2; }
+# inline conditional statements
+if foo_bar            { ret 0 }
+or bar_foo == baz_bam { ret 1 }
+or                    { ret 2 }
 
-// comments following code
-str: foo {
-    my_variable:       u32;            // comment documenting my_variable
-    my_other_variable: long_type_name; // comment documenting my_other_variable
+# comments following code
+str foo {
+    my_variable:       u32            # comment documenting my_variable
+    my_other_variable: long_type_name # comment documenting my_other_variable
 }
 ```
 

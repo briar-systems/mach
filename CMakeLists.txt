@@ -1,23 +1,43 @@
 cmake_minimum_required(VERSION 3.10)
-project(mach)
+project(mach C)
 
-set(SRC_DIR src)
-set(INCLUDE_DIR src)
-file(GLOB SRCS ${SRC_DIR}/*.c)
+find_package(LLVM REQUIRED CONFIG)
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
-include_directories(${INCLUDE_DIR})
+include_directories(${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
 
-if (NOT CMAKE_BUILD_TYPE)
-    message(STATUS "No build type specified, defaulting to Release")
-    set(CMAKE_BUILD_TYPE Release)
+file(GLOB SOURCES "src/*.c")
+
+add_executable(mach ${SOURCES})
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -std=c99")
+if(CMAKE_BUILD_TYPE MATCHES Debug)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g")
 endif()
 
-if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    message(STATUS "Debug build")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -O0")
-else()
-    message(STATUS "Release build")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
+target_link_libraries(mach PRIVATE LLVM)
+
+if(NOT TARGET LLVM)
+  message(STATUS "Falling back to explicit LLVM component linking")
+  llvm_map_components_to_libnames(llvm_libs
+    Core
+    Support
+    BitWriter
+    Analysis
+    Target
+    TransformUtils
+    InstCombine
+    ScalarOpts
+    ipo
+    CodeGen
+    MC
+    MCParser
+    MCDisassembler
+    Option
+    Passes
+    native
+    )
+  target_link_libraries(mach PRIVATE ${llvm_libs})
 endif()
-    
-add_executable(${PROJECT_NAME} ${SRCS})

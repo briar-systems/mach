@@ -67,13 +67,7 @@ Mach only supports one.
 
 ### Reference Operators
 
-Reference operators are used in conjunction with [reference types](types.md#reference-type) and [pointer types](types.md#pointer-type) to manage references and pointers.
-
 | operator | description          |
 | -------- | -------------------- |
 | `?`      | reference operator   |
-| `@`      | dereference operator |
 
-> NOTE: here is an easy way to remember which operator is which:
-> - `?foo` can be read as "where is `foo`"
-> - `@foo` can be read as "what is at `foo`"
