@@ -8,6 +8,7 @@
 typedef enum NodeKind NodeKind;
 typedef struct Node Node;
 typedef struct NodeList NodeList;
+typedef struct NodeTable NodeTable;
 
 enum NodeKind
 {
@@ -129,7 +130,7 @@ struct Node
         struct
         {
             Operator op;
-            Node *right;
+            Node *expr;
         } expr_unary;
 
         struct
@@ -264,7 +265,12 @@ struct Node
     };
 };
 
-
+struct NodeTable {
+    Node **keys;
+    void **values;
+    int len;
+    int cap;
+};
 
 const char *node_kind_to_string(NodeKind kind);
 
@@ -275,5 +281,11 @@ bool node_list_init(NodeList *list);
 void node_list_free(NodeList *list);
 Node *node_list_add(NodeList *list, Node *node);
 Node *node_list_get(NodeList *list, int index);
+
+bool node_table_init(NodeTable *table);
+void node_table_free(NodeTable *table);
+void *node_table_get(NodeTable *table, Node *key);
+bool node_table_set(NodeTable *table, Node *key, void *value);
+bool node_table_del(NodeTable *table, Node *key);
 
 #endif // AST_H

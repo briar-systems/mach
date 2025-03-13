@@ -136,8 +136,8 @@ void node_free(Node *node)
         node->post_cast.type_node = NULL;
         break;
     case NODE_EXPR_UNARY:
-        node_free(node->expr_unary.right);
-        node->expr_unary.right = NULL;
+        node_free(node->expr_unary.expr);
+        node->expr_unary.expr = NULL;
         break;
     case NODE_EXPR_BINARY:
         node_free(node->expr_binary.left);
@@ -328,4 +328,116 @@ Node *node_list_get(NodeList *list, int index)
     }
 
     return list->nodes[index];
+}
+
+bool node_table_init(NodeTable *table)
+{
+    if (!table)
+    {
+        return false;
+    }
+
+    table->keys = NULL;
+    table->values = NULL;
+    table->len = 0;
+    table->cap = 0;
+
+    return true;
+}
+
+void node_table_free(NodeTable *table)
+{
+    if (!table)
+    {
+        return;
+    }
+
+    for (int i = 0; i < table->len; i++)
+    {
+        // TODO: figure out why the fuck this is double freeing
+        // free(table->keys[i]);
+        table->keys[i] = NULL;
+    }
+
+    free(table->keys);
+    table->keys = NULL;
+
+    free(table->values);
+    table->values = NULL;
+
+    free(table);
+}
+
+void *node_table_get(NodeTable *table, Node *key)
+{
+    for (int i = 0; i < table->len; i++)
+    {
+        if (table->keys[i] == key)
+        {
+            return table->values[i];
+        }
+    }
+
+    return NULL;
+}
+
+bool node_table_set(NodeTable *table, Node *key, void *value)
+{
+    for (int i = 0; i < table->len; i++)
+    {
+        if (table->keys[i] == key)
+        {
+            table->values[i] = value;
+            return true;
+        }
+    }
+
+    if (table->len >= table->cap)
+    {
+        table->cap = table->cap == 0 ? 8 : table->cap * 2;
+        Node **new_keys = realloc(table->keys, table->cap * sizeof(Node *));
+        if (!new_keys)
+        {
+            return false;
+        }
+
+        void **new_values = realloc(table->values, table->cap * sizeof(void *));
+        if (!new_values)
+        {
+            return false;
+        }
+
+        table->keys = new_keys;
+        table->values = new_values;
+    }
+
+    table->keys[table->len] = key;
+    table->values[table->len] = value;
+    table->len++;
+
+    return true;
+}
+
+bool node_table_del(NodeTable *table, Node *key)
+{
+    for (int i = 0; i < table->len; i++)
+    {
+        if (table->keys[i] == key)
+        {
+            free(table->keys[i]);
+            table->keys[i] = NULL;
+
+            for (int j = i; j < table->len - 1; j++)
+            {
+                table->keys[j] = table->keys[j + 1];
+                table->values[j] = table->values[j + 1];
+            }
+
+            table->len--;
+
+            return true;
+        }
+    }
+
+    return false;
 }

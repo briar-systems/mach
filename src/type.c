@@ -35,43 +35,83 @@ void type_free(Type *type)
         break;
     case TYPE_PTR:
         type_free(type->ptr.target);
+        type->ptr.target = NULL;
         break;
     case TYPE_ARR:
         type_free(type->arr.element_type);
+        type->arr.element_type = NULL;
         break;
     case TYPE_STR:
         free(type->str.name);
+        type->str.name = NULL;
+
         for (int i = 0; i < type->str.field_count; i++)
         {
             type_free(type->str.field_types[i]);
-            free(type->str.field_names[i]);
+            type->str.field_types[i] = NULL;
+
+            if (type->str.field_names)
+            {
+                free(type->str.field_names[i]);
+                type->str.field_names[i] = NULL;
+            }
         }
+
         free(type->str.field_types);
+        type->str.field_types = NULL;
+
         free(type->str.field_names);
-        free(type->str.field_offsets); // Free field offsets
+        type->str.field_names = NULL;
+
+        free(type->str.field_offsets);
+        type->str.field_offsets = NULL;
         break;
     case TYPE_UNI:
         free(type->uni.name);
+        type->uni.name = NULL;
+
         for (int i = 0; i < type->uni.field_count; i++)
         {
             type_free(type->uni.field_types[i]);
-            free(type->uni.field_names[i]);
+            type->uni.field_types[i] = NULL;
+
+            if (type->uni.field_names)
+            {
+                free(type->uni.field_names[i]);
+                type->uni.field_names[i] = NULL;
+            }
         }
+
         free(type->uni.field_types);
+        type->uni.field_types = NULL;
+
         free(type->uni.field_names);
+        type->uni.field_names = NULL;
         break;
     case TYPE_FUN:
+        free(type->fun.name);
+        type->fun.name = NULL;
+
         type_free(type->fun.return_type);
+        type->fun.return_type = NULL;
+
         for (int i = 0; i < type->fun.param_count; i++)
         {
             type_free(type->fun.param_types[i]);
+            type->fun.param_types[i] = NULL;
+            
             if (type->fun.param_names)
             {
                 free(type->fun.param_names[i]);
+                type->fun.param_names[i] = NULL;
             }
         }
+
         free(type->fun.param_types);
+        type->fun.param_types = NULL;
+
         free(type->fun.param_names);
+        type->fun.param_names = NULL;
         break;
     default:
         break;
@@ -80,148 +120,17 @@ void type_free(Type *type)
     free(type);
 }
 
-Type *type_make_error(const char *message)
+Type *type_make(TypeKind kind)
 {
-    Type *err = calloc(sizeof(Type), 1);
-    if (!err)
+    Type *type = calloc(sizeof(Type), 1);
+    if (!type_init(type, kind))
     {
-        fprintf(stderr, "failed to allocate memory for error type\n");
-        return NULL;
-    }
-    err->err.message = strdup(message);
-
-    return err;
-}
-
-Type *type_make_ptr(Type *target)
-{
-    if (!target)
-    {
+        fprintf(stderr, "failed to initialize type\n");
+        free(type);
         return NULL;
     }
 
-    Type *ref = calloc(sizeof(Type), 1);
-    if (!ref)
-    {
-        fprintf(stderr, "failed to allocate memory for pointer type\n");
-        return NULL;
-    }
-    ref->ptr.target = target;
-
-    return ref;
-}
-
-Type *type_make_array(Type *element_type, int len)
-{
-    if (!element_type)
-        return NULL;
-
-    Type *arr = calloc(sizeof(Type), 1);
-    if (!arr)
-    {
-        fprintf(stderr, "failed to allocate memory for array type\n");
-        return NULL;
-    }
-    arr->arr.element_type = element_type;
-    arr->arr.len = len;
-
-    return arr;
-}
-
-Type *type_make_struct(const char *name, Type **field_types, char **field_names, int field_count)
-{
-    Type *str = calloc(sizeof(Type), 1);
-    if (!str)
-    {
-        fprintf(stderr, "failed to allocate memory for struct type\n");
-        return NULL;
-    }
-
-    if (name)
-    {
-        str->str.name = strdup(name);
-    }
-    else
-    {
-        str->str.name = NULL;
-    }
-
-    if (field_count > 0)
-    {
-        str->str.field_types = malloc(field_count * sizeof(Type *));
-        if (field_names)
-        {
-            str->str.field_names = malloc(field_count * sizeof(char *));
-        }
-        else
-        {
-            str->str.field_names = NULL;
-        }
-        str->str.field_count = field_count;
-
-        for (int i = 0; i < field_count; i++)
-        {
-            str->str.field_types[i] = field_types[i];
-            if (field_names && field_names[i])
-            {
-                str->str.field_names[i] = strdup(field_names[i]);
-            }
-        }
-    }
-    else
-    {
-        str->str.field_types = NULL;
-        str->str.field_names = NULL;
-        str->str.field_count = 0;
-    }
-
-    // Allocate field_offsets if needed
-    str->str.field_offsets = field_count > 0 ? calloc(field_count, sizeof(size_t)) : NULL;
-
-    return str;
-}
-
-Type *type_make_function(Type *return_type, Type **param_types, char **param_names, int param_count)
-{
-    Type *fun = calloc(sizeof(Type), 1);
-    if (!fun)
-    {
-        fprintf(stderr, "failed to allocate memory for function type\n");
-        return NULL;
-    }
-
-    fun->fun.return_type = return_type;
-
-    if (param_count > 0)
-    {
-        fun->fun.param_types = malloc(param_count * sizeof(Type *));
-        if (param_names)
-        {
-            fun->fun.param_names = malloc(param_count * sizeof(char *));
-        }
-        else
-        {
-            fun->fun.param_names = NULL;
-        }
-        fun->fun.param_count = param_count;
-
-        for (int i = 0; i < param_count; i++)
-        {
-            fun->fun.param_types[i] = param_types[i];
-            if (param_names && param_names[i])
-            {
-                fun->fun.param_names[i] = strdup(param_names[i]);
-            }
-        }
-    }
-    else
-    {
-        fun->fun.param_types = NULL;
-        fun->fun.param_names = NULL;
-        fun->fun.param_count = 0;
-    }
-
-    return fun;
+    return type;
 }
 
 size_t primitive_size(TypeKind kind, Target target)
@@ -642,7 +551,7 @@ const char *type_kind_to_string(TypeKind kind)
     case TYPE_F64:
         return "f64";
     case TYPE_PTR:
-        return "ref";
+        return "ptr";
     case TYPE_ARR:
         return "arr";
     case TYPE_STR:

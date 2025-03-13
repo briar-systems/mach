@@ -310,7 +310,7 @@ void printer_expr_unary(Visitor *visitor, Node *node) {
     
     print_indent(visitor);
     printf("  Operand: ");
-    visitor_visit(visitor, node->expr_unary.right);
+    visitor_visit(visitor, node->expr_unary.expr);
 }
 
 void printer_expr_binary(Visitor *visitor, Node *node) {

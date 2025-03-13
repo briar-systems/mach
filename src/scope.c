@@ -85,13 +85,18 @@ bool scope_init(Scope *scope, Scope *parent)
 void scope_free(Scope *scope)
 {
     if (!scope)
+    {
         return;
+    }
 
     for (int i = 0; i < scope->symbols.len; i++)
     {
         free(scope->symbols.symbols[i].name);
+        scope->symbols.symbols[i].name = NULL;
     }
     free(scope->symbols.symbols);
+    scope->symbols.symbols = NULL;
+
     free(scope);
 }
 
@@ -102,9 +107,13 @@ Symbol *scope_lookup(Scope *scope, const char *name)
     {
         Symbol *symbol = symbol_table_lookup(&current->symbols, name);
         if (symbol)
+        {
             return symbol;
+        }
+
         current = current->parent;
     }
+
     return NULL;
 }
 

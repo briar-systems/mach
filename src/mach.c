@@ -8,6 +8,7 @@
 #include "parser.h"
 #include "target.h"
 #include "visitor.h"
+#include "sema.h"
 
 void print_usage(const char *program_name)
 {
@@ -208,20 +209,58 @@ int main(int argc, char *argv[])
         printf("No parse errors found in `%s`\n", input_file);
     }
 
-    Visitor *printer = calloc(sizeof(Visitor), 1);
-    if (!visitor_init_printer(printer, lexer))
+    // ast debug print
+    // Visitor *printer = calloc(sizeof(Visitor), 1);
+    // if (!visitor_init_printer(printer, lexer))
+    // {
+    //     fprintf(stderr, "error: failed to create printer visitor\n");
+    //     parser_free(parser);
+    //     lexer_free(lexer);
+    //     free(source);
+    //     return 1;
+    // }
+
+    // run semantic analysis
+    Visitor visitor;
+    SEMAContext *sema = calloc(sizeof(SEMAContext), 1);
+    if (!sema_init(sema, target))
     {
-        fprintf(stderr, "error: failed to create printer visitor\n");
+        fprintf(stderr, "error: failed to initialize semantic analysis context\n");
         parser_free(parser);
         lexer_free(lexer);
         free(source);
         return 1;
     }
 
-    visitor_visit(printer, ast);
-    printf("\n");
+    if (!visitor_init_sema(&visitor, sema))
+    {
+        fprintf(stderr, "error: failed to create semantic analysis visitor\n");
+        sema_free(sema);
+        parser_free(parser);
+        lexer_free(lexer);
+        free(source);
+        return 1;
+    }
+    visitor_visit(&visitor, ast);
 
-    // Lower AST to MIR
+    if (sema->errors.len > 0)
+    {
+        printf("Semantic errors found in `%s`\n", input_file);
+        sema_print_errors(sema, lexer, input_file);
+        sema_free(sema);
+        parser_free(parser);
+        lexer_free(lexer);
+        free(source);
+        return 1;
+    }
+    else {
+        printf("No semantic errors found in `%s`\n", input_file);
+    }
+
+    // visitor_visit(printer, ast);
+    // printf("\n");
+
+    // lower AST to MIR
     // MIRModule *module = lower_ast_to_mir(ast, target, "main");
     // if (!module)
     // {

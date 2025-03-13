@@ -51,6 +51,8 @@ struct Type
         {
             Type *element_type;
             int len;
+            int cap;
+            bool is_slice;
         } arr;
 
         struct
@@ -72,6 +74,7 @@ struct Type
 
         struct
         {
+            char *name;
             struct Type *return_type;
             struct Type **param_types;
             char **param_names;
@@ -85,11 +88,7 @@ typedef struct TypeVisited TypeVisited;
 bool type_init(Type *type, TypeKind kind);
 void type_free(Type *type);
 
-Type *type_make_error(const char *message);
-Type *type_make_ptr(Type *target);
-Type *type_make_array(Type *element_type, int len);
-Type *type_make_struct(const char *name, Type **field_types, char **field_names, int field_count);
-Type *type_make_function(Type *return_type, Type **param_types, char **param_names, int param_count);
+Type *type_make(TypeKind kind);
 
 size_t type_size(Type *type, Target target);
 size_t type_align(Type *type, Target target);

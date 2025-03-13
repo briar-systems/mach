@@ -674,11 +674,12 @@ MIRValue mir_build_alloca(MIRBlock *block, Type *type)
         return mir_value_error("mir_build_alloca: block or type is NULL");
     }
 
-    Type *ptr_type = type_make_ptr(type);
+    Type *ptr_type = type_make(TYPE_PTR);
     if (!ptr_type)
     {
-        return mir_value_error("mir_build_alloca: type_make_ptr failed");
+        return mir_value_error("mir_build_alloca: type_make failed");
     }
+    ptr_type->ptr.target = type;
 
     MIRValue result = mir_create_register(block->parent, ptr_type);
     if (result.kind == MIR_VAL_ERROR)
@@ -809,20 +810,20 @@ MIRValue mir_build_field_offset(MIRBlock *block, MIRValue base, int field_index)
         return mir_value_error("mir_build_field_offset: block or base is NULL");
     }
 
-    // Get the pointed-to type
     Type *struct_type = base.type->ptr.target;
     if (struct_type->kind != TYPE_STR)
     {
         return mir_value_error("mir_build_field_offset: base is not a pointer to a struct");
     }
 
-    // Create a virtual register for the result
+    // create a virtual register for the result
     Type *field_type = struct_type->str.field_types[field_index];
-    Type *field_ptr_type = type_make_ptr(field_type);
+    Type *field_ptr_type = type_make(TYPE_PTR);
     if (!field_ptr_type)
     {
-        return mir_value_error("mir_build_field_offset: type_make_ptr failed");
+        return mir_value_error("mir_build_field_offset: type_make failed");
     }
+    field_ptr_type->ptr.target = field_type;
 
     MIRValue result = mir_create_register(block->parent, field_ptr_type);
     if (result.kind == MIR_VAL_ERROR)

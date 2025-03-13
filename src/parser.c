@@ -163,6 +163,16 @@ Token parser_prev(Parser *parser)
     return parser->tokens[parser->tokens_cur - 1];
 }
 
+Token parser_peek(Parser *parser, int offset)
+{
+    if (parser->tokens_cur + offset >= parser->tokens_len)
+    {
+        return parser->tokens[parser->tokens_len - 1];
+    }
+
+    return parser->tokens[parser->tokens_cur + offset];
+}
+
 bool parser_is_at_end(Parser *parser) { return parser->tokens_cur >= parser->tokens_len || parser_curr(parser).kind == TOKEN_EOF; }
 
 Token parser_advance(Parser *parser)
@@ -1587,7 +1597,7 @@ Node *parse_expr_unary(Parser *parser)
             return NULL;
         }
         unary->expr_unary.op = op;
-        unary->expr_unary.right = expr;
+        unary->expr_unary.expr = expr;
 
         return unary;
     }
@@ -1688,12 +1698,17 @@ Node *parse_expr(Parser *parser) { return parse_expr_binary(parser, 0); }
 Node *parse_type_arr(Parser *parser)
 {
     Token token = parser_prev(parser);
-
-    Node *size = parse_expr(parser);
-    if (!size)
+    
+    Node *size = NULL;
+    // check for unbound array syntax, e.g `[]u8`
+    if (!parser_check(parser, TOKEN_R_BRACKET))
     {
-        parser_error(parser, parser_curr(parser), "expected expression after '['");
-        return NULL;
+        size = parse_expr(parser);
+        if (!size)
+        {
+            parser_error(parser, parser_curr(parser), "expected expression after '['");
+            return NULL;
+        }
     }
 
     if (!parser_match(parser, TOKEN_R_BRACKET))
@@ -1931,6 +1946,9 @@ Node *parse_type(Parser *parser)
     case TOKEN_ASTERISK:
         parser_advance(parser);
         return parse_type_ptr(parser);
+    case TOKEN_L_BRACKET:
+        parser_advance(parser);
+        return parse_type_arr(parser);
     case TOKEN_FUN:
         parser_advance(parser);
         return parse_type_fun(parser);
