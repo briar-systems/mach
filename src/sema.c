@@ -299,7 +299,7 @@ bool sema_types_compatible(Type *a, Type *b)
         {
             return true;
         }
-        
+
         if (a->arr.is_slice && !b->arr.is_slice)
         {
             return true;
@@ -1330,56 +1330,53 @@ void visit_stmt_block(Visitor *visitor, Node *node)
     sema_exit_scope(sema);
 }
 
+// basically 'const var'
+// must have a constant initializer
+// becomes a constant itself (can constant fold)
 void visit_stmt_val(Visitor *visitor, Node *node)
 {
     SEMAContext *sema = visitor->context;
 
-    // for 'val' declarations, initializer must be a constant expression
-    bool old_const_context = sema->in_const_context;
-    sema->in_const_context = true;
-
-    // process the type (must be provided)
-    Type *var_type = NULL;
-    if (!node->stmt_val.type_node)
+    Type *val_type = NULL;
+    if (!node->stmt_var.type_node)
     {
-        sema_report_error(sema, node->token, "'val' declaration must have a type");
+        sema_report_error(sema, node->token, "constant declaration must have a type");
     }
     else
     {
-        visitor_visit(visitor, node->stmt_val.type_node);
-        var_type = sema_get_type(sema, node->stmt_val.type_node);
+        visitor_visit(visitor, node->stmt_var.type_node);
+        val_type = sema_get_type(sema, node->stmt_var.type_node);
     }
 
-    if (!node->stmt_val.expr)
+    if (!node->stmt_var.expr)
     {
-        sema_report_error(sema, node->token, "'val' declaration requires an initializer");
+        sema_report_error(sema, node->token, "constant declaration must have an initializer");
     }
     else
     {
-        visitor_visit(visitor, node->stmt_val.expr);
-    }
+        visitor_visit(visitor, node->stmt_var.expr);
 
-    // initializer must match declared type
-    Type *init_type = sema_get_type(sema, node->stmt_val.expr);
-    if (!sema_types_compatible(var_type, init_type))
-    {
-        sema_report_error(sema, node->token, "cannot initialize value of type '%s' with expression of type '%s'", type_to_string(var_type), type_to_string(init_type));
-    }
-
-    // ensure initializer is constant
-    if (!sema_is_constant(sema, node->stmt_val.expr))
-    {
-        sema_report_error(sema, node->token, "'val' declaration requires a constant initializer");
-    }
-
-    sema->in_const_context = old_const_context;
-
-    if (var_type && node->stmt_val.ident->kind == NODE_IDENTIFIER)
-    {
-        char *name = strndup(node->stmt_val.ident->token.start, node->stmt_val.ident->token.len);
-        if (!scope_define(sema->scope_current, name, node, var_type))
+        // initializer must be a constant expression
+        if (!sema_is_constant(sema, node->stmt_var.expr))
         {
-            sema_report_error(sema, node->stmt_val.ident->token, "redefinition of '%s'", name);
+            sema_report_error(sema, node->stmt_var.expr->token, "initializer for constant must be a constant expression");
+            return;
+        }
+
+        Node *const_value = sema_get_constant(sema, node->stmt_var.expr);
+        if (const_value)
+        {
+            sema_set_constant(sema, node, const_value);
+        }
+    }
+
+    // add to symbol table
+    if (val_type && node->stmt_var.ident->kind == NODE_IDENTIFIER)
+    {
+        char *name = strndup(node->stmt_var.ident->token.start, node->stmt_var.ident->token.len);
+        if (!scope_define(sema->scope_current, name, node, val_type))
+        {
+            sema_report_error(sema, node->stmt_var.ident->token, "redefinition of '%s'", name);
         }
         free(name);
     }
@@ -2055,7 +2052,7 @@ void visit_type_fun(Visitor *visitor, Node *node)
     fun_type->fun.param_types = param_types;
     fun_type->fun.param_names = param_names;
     fun_type->fun.name = NULL;
-    
+
     sema_set_type(sema, node, fun_type);
 }
 
@@ -2189,11 +2186,7 @@ void visit_type_uni(Visitor *visitor, Node *node)
     sema_set_type(sema, node, uni_type);
 }
 
-void visit_field(Visitor *visitor, Node *node)
-{
-    visitor_visit(visitor, node->field.type_node);
-}
-
+void visit_field(Visitor *visitor, Node *node) { visitor_visit(visitor, node->field.type_node); }
 
 bool visitor_init_sema(Visitor *visitor, SEMAContext *context)
 {
