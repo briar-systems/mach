@@ -5,10 +5,9 @@
 
 #include <stdbool.h>
 
-typedef enum Operator Operator;
 typedef struct OpTokenKinds OpTokenKinds;
 
-enum Operator
+typedef enum Operator
 {
     OP_UNKNOWN,
 
@@ -41,7 +40,7 @@ enum Operator
     OP_DEREFERENCE, // @
 
     OP_COUNT,
-};
+} Operator;
 
 struct OpTokenKinds
 {

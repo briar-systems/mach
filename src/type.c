@@ -135,8 +135,6 @@ Type *type_make(TypeKind kind)
 
 size_t primitive_size(TypeKind kind, Target target)
 {
-    TargetInfo info = target_info(target);
-
     switch (kind)
     {
     case TYPE_VOID:
@@ -156,7 +154,7 @@ size_t primitive_size(TypeKind kind, Target target)
     case TYPE_F64:
         return 8;
     case TYPE_PTR:
-        return info.size;
+        return target.ptr_size;
     default:
         return 0;
     }
@@ -164,8 +162,6 @@ size_t primitive_size(TypeKind kind, Target target)
 
 size_t primitive_align(TypeKind kind, Target target)
 {
-    TargetInfo info = target_info(target);
-
     switch (kind)
     {
     case TYPE_VOID:
@@ -185,7 +181,7 @@ size_t primitive_align(TypeKind kind, Target target)
     case TYPE_F64:
         return 8;
     case TYPE_PTR:
-        return info.alignment;
+        return target.data_alignment;
     default:
         return 1;
     }
@@ -222,9 +218,7 @@ size_t type_size_internal(Type *type, Target target, TypeVisited *visited)
     // check for recursive types
     if (type_visited_contains(visited, type))
     {
-        // recursive reference, return pointer size
-        TargetInfo info = target_info(target);
-        return info.size;
+        return primitive_size(TYPE_PTR, target);
     }
 
     type_visited_add(visited, type);
@@ -249,8 +243,8 @@ size_t type_size_internal(Type *type, Target target, TypeVisited *visited)
     {
         if (type->arr.len < 0)
         {
-            TargetInfo info = target_info(target);
-            return info.size + 8;
+            // dynamic array, return pointer size
+            return primitive_size(TYPE_PTR, target);
         }
 
         if (type->arr.len == 0)
@@ -346,12 +340,11 @@ size_t type_align_internal(Type *type, Target target, TypeVisited *visited)
     if (!type)
         return 1;
 
-    // check for recursive types
+    
     if (type_visited_contains(visited, type))
     {
         // recursive reference, return pointer alignment
-        TargetInfo info = target_info(target);
-        return info.alignment;
+        return primitive_align(TYPE_PTR, target);
     }
 
     type_visited_add(visited, type);

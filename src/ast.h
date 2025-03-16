@@ -3,14 +3,12 @@
 
 #include "operator.h"
 #include "token.h"
-#include <llvm-c-19/llvm-c/Types.h>
 
-typedef enum NodeKind NodeKind;
 typedef struct Node Node;
 typedef struct NodeList NodeList;
 typedef struct NodeTable NodeTable;
 
-enum NodeKind
+typedef enum NodeKind
 {
     NODE_UNKNOWN,
 
@@ -56,7 +54,7 @@ enum NodeKind
     NODE_TYPE_STR,
     NODE_TYPE_UNI,
     NODE_FIELD,
-};
+} NodeKind;
 
 struct NodeList
 {
