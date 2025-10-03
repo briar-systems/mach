@@ -149,3 +149,16 @@ Mach, at its core, stands on the shoulders of countles giants that have contribu
 Mach is released under the [Unlicense](https://unlicense.org/).
 
 > Take it. Use it. Hate it. Break it. Fix it. Love it. It's yours.
+
+## local test app
+
+this repository also includes a minimal test program under `src/` used to validate the compiler’s dependency resolution:
+
+- `mach.toml` declares the std dependency and maps `std -> dep.std` for imports
+- dependencies compile to `out/obj/**.o` automatically when building the app
+- [runtime] is configured as `std.runtime` so the executable has a proper `main`
+
+build and run:
+
+- make clean all V=1
+- ./bin/app
