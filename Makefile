@@ -11,7 +11,7 @@ OBJ_DIR := $(OUT_DIR)/obj
 # sources
 SRC      := src/main.mach
 OBJ      := $(OBJ_DIR)/main.o
-EXE      := $(BIN_DIR)/app
+EXE      := $(BIN_DIR)/mach
 
 .PHONY: all run clean print
 
@@ -19,7 +19,7 @@ all: $(EXE)
 
 $(EXE): $(OBJ) | $(BIN_DIR)
 	@echo exe = $@
-	@OBJS="$$(find $(OBJ_DIR) -type f -name '*.o' -print 2>/dev/null)"; cc -pie -o $@ $$OBJS
+	@OBJS="$$(find $(OBJ_DIR) -type f -name '*.o' -print 2>/dev/null)"; cc -nostartfiles -nostdlib -no-pie -o $@ $$OBJS
 
 $(OBJ): $(SRC) | $(OBJ_DIR)
 	@$(CMACH) build $< --emit-obj --no-link -o $@
