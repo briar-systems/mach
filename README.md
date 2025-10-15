@@ -84,7 +84,7 @@ fun main(args: []string): i64 {
 use std.runtime;
 use std.io.console;
 
-fun fibr(n: i32): i64 {
+fun fibr(n: i64): i64 {
     if (n < 2) {
         ret n;
     }
