@@ -4,7 +4,7 @@ MACH
 Mach is a statically-typed, compiled programming language designed to be simple, fast, and easy to use.
 It is intended to be a systems programming language, but can be used for a wide variety of applications.
 
-> :warning: The language is still alpha quality. Expect breaking changes as the compiler and standard library iterate.
+> Mach is still alpha quality. Expect breaking changes as the compiler and standard library iterate.
 
 # Overview
 
