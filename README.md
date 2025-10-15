@@ -94,7 +94,7 @@ fun fibr(n: i64): i64 {
 
 fun main(): i64 {
     var max: i64 = 10;
-    print("%u", fibr(max));
+    print("%i", fibr(max));
 
     ret 0;
 }
@@ -117,7 +117,7 @@ fun fact(n: i64): i64 {
 
 fun main(): i64 {
     var max: i64 = 10;
-    print("%u", fact(max));
+    print("%i", fact(max));
 
     ret 0;
 }
