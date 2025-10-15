@@ -8,17 +8,64 @@ Mach is a statically typed, compiled systems language with explicit control over
 
 ## Table of contents
 
-1. [Guiding principles](#guiding-principles)
-2. [Source form](#source-form)
-3. [Lexical structure](#lexical-structure)
-4. [Types](#types)
-5. [Declarations](#declarations)
-6. [Statements](#statements)
-7. [Expressions](#expressions)
-8. [Intrinsics and runtime conventions](#intrinsics-and-runtime-conventions)
-9. [Modules and projects](#modules-and-projects)
-10. [Standard library conventions](#standard-library-conventions)
-11. [Design notes and future direction](#design-notes-and-future-direction)
+- [Mach Language Specification](#mach-language-specification)
+  - [Table of contents](#table-of-contents)
+  - [Guiding principles](#guiding-principles)
+  - [Source form](#source-form)
+  - [Lexical structure](#lexical-structure)
+    - [Identifiers](#identifiers)
+    - [Keywords](#keywords)
+    - [Literals](#literals)
+    - [Tokens](#tokens)
+  - [Types](#types)
+    - [Primitive types](#primitive-types)
+    - [Typed pointers](#typed-pointers)
+    - [Arrays (slices)](#arrays-slices)
+    - [Structs](#structs)
+    - [Unions](#unions)
+    - [Function types](#function-types)
+    - [Type aliases](#type-aliases)
+  - [Declarations](#declarations)
+    - [Visibility (`pub`)](#visibility-pub)
+    - [Module imports (`use`)](#module-imports-use)
+    - [External bindings (`ext`)](#external-bindings-ext)
+    - [Type aliases (`def`)](#type-aliases-def)
+    - [Structs (`str`) and unions (`uni`)](#structs-str-and-unions-uni)
+    - [Variables (`var`) and values (`val`)](#variables-var-and-values-val)
+    - [Functions (`fun`)](#functions-fun)
+    - [Inline assembly (`asm`)](#inline-assembly-asm)
+  - [Statements](#statements)
+    - [Blocks](#blocks)
+    - [`if` / `or`](#if--or)
+    - [`for`](#for)
+    - [`ret`](#ret)
+    - [`asm { ... }`](#asm---)
+    - [Expression statements](#expression-statements)
+  - [Expressions](#expressions)
+    - [Literals](#literals-1)
+    - [Identifier lookup](#identifier-lookup)
+    - [Pointer operators](#pointer-operators)
+    - [Arithmetic and bitwise operators](#arithmetic-and-bitwise-operators)
+    - [Comparisons](#comparisons)
+    - [Logical operators](#logical-operators)
+    - [Unary operators](#unary-operators)
+    - [Casts (`::`)](#casts-)
+    - [Indexing](#indexing)
+    - [Field access](#field-access)
+    - [Function calls](#function-calls)
+    - [Assignments](#assignments)
+    - [Inline assembly expressions](#inline-assembly-expressions)
+  - [Intrinsics and runtime conventions](#intrinsics-and-runtime-conventions)
+    - [Variadic forwarding](#variadic-forwarding)
+  - [Modules and projects](#modules-and-projects)
+    - [Project configuration (`mach.toml`)](#project-configuration-machtoml)
+  - [Standard library conventions](#standard-library-conventions)
+    - [Dynamic arrays (`std.types.array`)](#dynamic-arrays-stdtypesarray)
+    - [Strings (`std.types.string`)](#strings-stdtypesstring)
+    - [Console I/O (`std.io.console`)](#console-io-stdioconsole)
+    - [Memory (`std.system.memory`)](#memory-stdsystemmemory)
+  - [Design notes and future direction](#design-notes-and-future-direction)
+
 
 ---
 
@@ -55,13 +102,22 @@ Mach is a statically typed, compiled systems language with explicit control over
 
 ### Keywords
 
-```
-as, asm, bool, brk, cnt, def, else, ext, for, fun, i8, i16, i32, i64,
-if, import (reserved), nil, or, pub, ret, str, true, false, u8, u16,
-u32, u64, uni, use, val, var, ...
-```
-
-`true`, `false`, and `nil` behave as literals; treat them as keywords for lexical purposes.
+- `asm`: Assembly language inline block.
+- `fun`: Function declaration.
+- `str`: Struct declaration.
+- `uni`: Union declaration.
+- `var`: Mutable variable declaration.
+- `val`: Immutable value declaration.
+- `use`: Import statement.
+- `if`: Conditional statement.
+- `or`: Else-if / else branch.
+- `for`: Loop statement.
+- `ret`: Return from function.
+- `brk`: Break from loop.
+- `cnt`: Continue to next loop iteration.
+- `def`: Type alias declaration.
+- `ext`: External function declaration.
+- `pub`: Public visibility modifier.
 
 ### Literals
 
@@ -69,6 +125,7 @@ u32, u64, uni, use, val, var, ...
 - **Float literals**: decimal with optional fraction and exponent (`3.14`, `6.02e23`). Always treated as `f64` unless directed otherwise.
 - **Character literals**: `'a'`, `'\n'`. Represent unsigned bytes (`u8`). Escape sequences mirror C (`\n`, `\t`, `\\`, `\'`, `\"`, `\xNN`).
 - **String literals**: double-quoted UTF-8 sequences with the same escapes as characters. Each literal lowers to a readonly `[]u8` with static storage duration.
+- **Null pointer literal**: `nil` represents an untyped pointer to address zero.
 
 ### Tokens
 
@@ -102,7 +159,6 @@ Mach resolves every expression to a `Type`. The bootstrap compiler caches descri
 | `i8`, `i16`, `i32`, `i64` | 1, 2, 4, 8 bytes | Signed integers |
 | `f16`, `f32`, `f64` | 2, 4, 8 bytes | IEEE 754 floats |
 | `ptr` | 8 bytes | Untyped pointer |
-| `bool` | Alias for `u8` (provided by `std.types.bool`) |
 
 ### Typed pointers
 
@@ -145,7 +201,7 @@ Declared with `uni` blocks and share the semantics of C unions.
 ```mach
 uni Value {
     int: i64;
-    ptr: *ptr;
+    p:   ptr;
 }
 ```
 
@@ -158,8 +214,8 @@ uni Value {
 Function signatures appear both as declarations and as types:
 
 ```mach
-fun main(argc: i32, argv: *ptr) i32 { ... }
-val fnPtr: fun(i32, *ptr) i32 = main;
+fun main(argc: i32, argv: ptr) i32 { ... }
+val fnPtr: fun(i32, ptr) i32 = main;
 ```
 
 - Parameter list is ordered; each parameter has `name: Type` in declarations and only `Type` in bare function types.
@@ -189,9 +245,8 @@ use std.io.console;
 
 - Path segments are dot-separated identifiers.
 - Semicolons required.
-- Aliases (e.g. `use foo.bar as baz;`) are not yet implemented.
 - During semantic analysis the compiler resolves the path via `mach.toml` and the project’s module map. Public symbols from the target module are injected into the current scope.
-- Imported modules themselves can be referenced as expressions (`module.symbol`).
+- All public symbols from imported modules are available for use.
 
 ### External bindings (`ext`)
 
@@ -345,7 +400,6 @@ Expressions evaluate to values. The compiler tracks whether an expression is an 
 
 - `?expr` – address-of. Requires `expr` to be an lvalue.
 - `@expr` – dereference. `expr` must have a pointer type.
-- `expr->field` – shorthand for `@expr.field` when `expr` is a pointer to a struct.
 
 ### Arithmetic and bitwise operators
 
@@ -446,10 +500,6 @@ The bootstrap compiler recognises several built-in functions that bypass normal 
 - `...` as an expression (only inside a Mach-managed variadic function) forwards the current variadic pack to another variadic function.
 - Forwarding must appear as the last argument in the call.
 
-### Runtime hooks
-
-The bootstrap runtime exposes `mach_panic([]u8)` and `abort()` for fatal errors (bounds checks, assertions). Programs may call them directly.
-
 ---
 
 ## Modules and projects
@@ -518,85 +568,7 @@ Standard library modules are not special-cased by the compiler; they are ordinar
 ## Design notes and future direction
 
 - **Self-hosted compiler.** This repository (`mach`) will house the future compiler written in Mach. The language surface defined here must remain valid even when the implementation changes.
-- **Generics and traits.** Not currently implemented. Any future design must preserve explicit type instantiation and keep generated code predictable.
+- **Generics and traits.** Generics are a brand new feature and will require syntax and semantic updates. Traits (interfaces) are not yet designed and are not part of the initial language.
 - **Pattern matching and higher-level flow control.** The initial language sticks to `if`, `for`, and direct expressions. Additional constructs will require updates to this document and the semantic checker.
 - **Memory safety.** Mach deliberately leaves safety to the programmer. Libraries may offer safe wrappers, but the core language keeps pointer manipulation unrestricted.
 - **Toolchain evolution.** While `mach-c` is the current compiler, this spec avoids referencing implementation details wherever possible. When the self-hosted version diverges, the spec should be updated to reflect intentional design choices, not incidental behaviour.
-
----
-
-## Appendix: Grammar sketch
-
-A simplified grammar (EBNF-like) to guide parser implementations:
-
-```
-program      ::= { declaration } EOF
-
-declaration  ::= use_decl | ext_decl | type_decl | var_decl | fun_decl | asm_block
-use_decl     ::= "use" module_path ";"
-module_path  ::= IDENT { "." IDENT }
-
-ext_decl     ::= [ "pub" ] "ext" [ string_literal ] IDENT ":" func_type ";"
-
-type_decl    ::= [ "pub" ] ( struct_decl | union_decl | alias_decl )
-struct_decl  ::= "str" IDENT "{" { field_decl } "}"
-field_decl   ::= IDENT ":" type_expr ";"
-union_decl   ::= "uni" IDENT "{" { field_decl } "}"
-alias_decl   ::= "def" IDENT ":" type_expr ";"
-
-var_decl     ::= [ "pub" ] ( "var" | "val" ) IDENT ":" type_expr [ "=" expression ] ";"
-
-fun_decl     ::= [ "pub" ] "fun" IDENT "(" [ param_list ] ")" [ type_expr ] block
-param_list   ::= param { "," param }
-param        ::= IDENT ":" type_expr | "..."
-
-asm_block    ::= "asm" block
-
-type_expr    ::= IDENT
-               | "*" type_expr
-               | "[]" type_expr
-               | "[" expression "]" type_expr
-               | "fun" "(" [ type_list ] ")" [ type_expr ]
-               | "str" "{" { field_decl } "}"
-               | "uni" "{" { field_decl } "}"
-
-block        ::= "{" { statement } "}"
-statement    ::= var_decl
-               | if_stmt
-               | for_stmt
-               | asm_block
-               | "ret" [ expression ] ";"
-               | "brk" ";"
-               | "cnt" ";"
-               | expression ";"
-
-if_stmt      ::= "if" "(" expression ")" block { "or" [ "(" expression ")" ] block }
-for_stmt     ::= "for" "(" expression ")" block
-
-expression   ::= assignment
-assignment   ::= logical_or [ "=" assignment ]
-logical_or   ::= logical_and { "||" logical_and }
-logical_and  ::= equality { "&&" equality }
-equality     ::= comparison { ( "==" | "!=" ) comparison }
-comparison   ::= shift { ( "<" | "<=" | ">" | ">=" ) shift }
-shift        ::= sum { ( "<<" | " >>" ) sum }
-sum          ::= product { ( "+" | "-" ) product }
-product      ::= unary { ( "*" | "/" | "%" ) unary }
-unary        ::= ( "-" | "!" | "~" | "?" | "@" ) unary
-               | postfix
-postfix      ::= primary { postfix_op }
-postfix_op   ::= "(" [ arg_list ] ")"
-               | "[" expression "]"
-               | "." IDENT
-               | "->" IDENT
-               | "::" type_expr
-primary      ::= IDENT
-               | literal
-               | "(" expression ")"
-               | array_literal
-               | struct_literal
-
-literal      ::= int_lit | float_lit | string_lit | char_lit | "true" | "false" | "nil"
-```
-
-This sketch omits precedence details for brevity but mirrors the current parser implementation. Update it alongside the compiler when syntax evolves.
