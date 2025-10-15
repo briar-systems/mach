@@ -4,6 +4,8 @@ MACH
 Mach is a statically-typed, compiled programming language designed to be simple, fast, and easy to use.
 It is intended to be a systems programming language, but can be used for a wide variety of applications.
 
+> :warning: The language is still alpha quality. Expect breaking changes as the compiler and standard library iterate.
+
 # Overview
 
 - [MACH](#mach)
@@ -15,7 +17,6 @@ It is intended to be a systems programming language, but can be used for a wide 
     - [Hello World](#hello-world)
     - [Fibonacci](#fibonacci)
     - [Factorial](#factorial)
-- [TODO](#todo)
 - [Credit](#credit)
 - [License](#license)
 
@@ -32,12 +33,12 @@ Mach is NOT designed to prioritize:
 - **Features**: Batteries are not included.
 - **Flexibility**: Mach is rigid and opinionated. It should not be flexible or allow for many ways to do the same thing.
 - **Code Reduction**: Mach is explicit and verbose. More code is not bad code.
-- **Safety**: Safety is the responsibility of the programmer. Mach does not hold your hand.
+- **Safety**: Safety is the responsibility of the programmer and is often project-specific. Mach does not hold your hand or put you on a leash.
 
 
 ## Key Features
 
-- No magic. No side effects. No bullshit. Code written in Mach follows the WYSIWYG principle.
+- No magic. No side effects. No bullshit. Code written in Mach follows the WYSIWYG principle down to the metal.
 - Small, clearly defined, and well documented feature set.
 - Familiar and easy to read syntax. You do not need to take a class to use mach.
 - Barebones standard library with enough to do the basics, but not enough to overload the language.
@@ -66,9 +67,10 @@ The following examples are provided to give a sense of the language's syntax and
 ### Hello World
 
 ```mach
-use std.io.print;
+use std.runtime;
+use std.io.console;
 
-fun main(): i32 {
+fun main(args: []string): i64 {
     print("Hello, World!");
 
     ret 0;
@@ -79,9 +81,10 @@ fun main(): i32 {
 ### Fibonacci
 
 ```mach
-use std.io.print;
+use std.runtime;
+use std.io.console;
 
-fun fibr(n: i32): i32 {
+fun fibr(n: i32): i64 {
     if (n < 2) {
         ret n;
     }
@@ -89,9 +92,9 @@ fun fibr(n: i32): i32 {
     ret fibr(n - 1) + fibr(n - 2);
 }
 
-fun main(): i32 {
-    var max: i32 = 10;
-    print(fibr(max));
+fun main(): i64 {
+    var max: i64 = 10;
+    print("%u", fibr(max));
 
     ret 0;
 }
@@ -101,9 +104,10 @@ fun main(): i32 {
 ### Factorial
 
 ```mach
-use std.io.print;
+use std.runtime;
+use std.io.console;
 
-fun fact(n: i32): i32 {
+fun fact(n: i64): i64 {
     if (n == 0) {
         ret 1;
     }
@@ -111,23 +115,13 @@ fun fact(n: i32): i32 {
     ret n * fact(n - 1);
 }
 
-fun main(): i32 {
-    var max: i32 = 10;
-    print(fact(max));
+fun main(): i64 {
+    var max: i64 = 10;
+    print("%u", fact(max));
 
     ret 0;
 }
 ```
-
-# TODO
-
-- Allow for the creation of both fixed size and unbounded arrays.
-- Add a means to perform FFI with C code, and a framework to extend to other languages.
-  - `ext` keyword?
-- Convert AST to IR and add optimizations.
-- Convert IR to ASM and add optimizations.
-- Compile ASM to object code.
-- Link object code to create executable.
 
 # Credit
 
@@ -146,19 +140,6 @@ Mach, at its core, stands on the shoulders of countles giants that have contribu
 
 # License
 
-Mach is released under the [Unlicense](https://unlicense.org/).
+Mach currently operates under the [Unlicense](https://unlicense.org/).
 
 > Take it. Use it. Hate it. Break it. Fix it. Love it. It's yours.
-
-## local test app
-
-this repository also includes a minimal test program under `src/` used to validate the compiler’s dependency resolution:
-
-- `mach.toml` declares the std dependency and maps `std -> dep.std` for imports
-- dependencies compile to `out/obj/**.o` automatically when building the app
-- [runtime] is configured as `std.runtime` so the executable has a proper `main`
-
-build and run:
-
-- make clean all V=1
-- ./bin/app
