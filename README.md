@@ -28,6 +28,7 @@ Mach is designed with the following principles in mind:
 - **Readability**: Mach is easy to read and understand.
 - **Explicivity**: Mach is explicit and verbose. WYSIWYG, always. Computers are not magic. Your code should not promote this illusion.
 - **Performance**: Mach is fast and efficient.
+- **Predictability**: Mach is predictable and consistent. There are no hidden behaviors or side effects.
 
 Mach is NOT designed to prioritize:
 - **Features**: Batteries are not included.
