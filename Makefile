@@ -1,5 +1,3 @@
-# Makefile for building and running a Mach test program using cmach
-
 # paths
 CMACH     ?= ../mach-c/bin/cmach
 
