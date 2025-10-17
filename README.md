@@ -48,11 +48,11 @@ Mach is NOT designed to prioritize:
 
 # Getting Started
 
-We encourage you to not even install Mach until you have read the [language documentation](doc/language/README.md). The docs are written more like a pamphlet then a bible, and assumes that you are familiar with basic programming concepts from other languages.
+We encourage you to not even install Mach until you have read the [language documentation](doc/README.md). The docs are written more like a pamphlet then a bible, and assumes that you are familiar with basic programming concepts from other languages.
 
 The reason for this is that Mach may not be for you. If the language does not include some features you hope to use, includes things you despise, or if you just don't like the syntax, then you should look elsewhere. If you read the documentation and have decided that you like the language, then you will have learned the basics and should be capable of diving in.
 
-The [documentation](doc/README.md) includes instructions for how to [install the Mach compiler](doc/language/installation.md) on your system.
+The [documentation](doc/README.md) includes instructions for how to [get started](doc/getting_started.md) with Mach.
 
 If you are new to programming in general, then Mach may not be for you. There are lots of other languages that are better suited for beginners (mostly because of the level of documentation), and we encourage you to look into those instead. Some good "first" programming languages are:
 - [Python](https://www.python.org/)
@@ -69,8 +69,10 @@ The following examples are provided to give a sense of the language's syntax and
 
 ```mach
 use std.runtime;
+use std.types.string;
 use std.io.console;
 
+#@symbol("main")
 fun main(args: []string): i64 {
     print("Hello, World!");
 
@@ -83,6 +85,7 @@ fun main(args: []string): i64 {
 
 ```mach
 use std.runtime;
+use std.types.string;
 use std.io.console;
 
 fun fibr(n: i64): i64 {
@@ -93,7 +96,8 @@ fun fibr(n: i64): i64 {
     ret fibr(n - 1) + fibr(n - 2);
 }
 
-fun main(): i64 {
+#@symbol("main")
+fun main(args: []string): i64 {
     var max: i64 = 10;
     print("%i", fibr(max));
 
@@ -106,6 +110,7 @@ fun main(): i64 {
 
 ```mach
 use std.runtime;
+use std.types.string;
 use std.io.console;
 
 fun fact(n: i64): i64 {
@@ -116,7 +121,8 @@ fun fact(n: i64): i64 {
     ret n * fact(n - 1);
 }
 
-fun main(): i64 {
+#@symbol("main")
+fun main(args: []string): i64 {
     var max: i64 = 10;
     print("%i", fact(max));
 
