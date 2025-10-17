@@ -68,14 +68,13 @@ The following examples are provided to give a sense of the language's syntax and
 ### Hello World
 
 ```mach
-use std.runtime;
-use std.types.string;
-use std.io.console;
+use          std.runtime;
+use          std.types.string;
+use console: std.io.console;
 
 #@symbol("main")
 fun main(args: []string): i64 {
-    print("Hello, World!");
-
+    console.print("Hello, World!");
     ret 0;
 }
 ```
@@ -84,9 +83,9 @@ fun main(args: []string): i64 {
 ### Fibonacci
 
 ```mach
-use std.runtime;
-use std.types.string;
-use std.io.console;
+use          std.runtime;
+use          std.types.string;
+use console: std.io.console;
 
 fun fibr(n: i64): i64 {
     if (n < 2) {
@@ -99,8 +98,7 @@ fun fibr(n: i64): i64 {
 #@symbol("main")
 fun main(args: []string): i64 {
     var max: i64 = 10;
-    print("%i", fibr(max));
-
+    console.print("%i", fibr(max));
     ret 0;
 }
 ```
@@ -109,9 +107,9 @@ fun main(args: []string): i64 {
 ### Factorial
 
 ```mach
-use std.runtime;
-use std.types.string;
-use std.io.console;
+use          std.runtime;
+use          std.types.string;
+use console: std.io.console;
 
 fun fact(n: i64): i64 {
     if (n == 0) {
@@ -124,8 +122,7 @@ fun fact(n: i64): i64 {
 #@symbol("main")
 fun main(args: []string): i64 {
     var max: i64 = 10;
-    print("%i", fact(max));
-
+    console.print("%i", fact(max));
     ret 0;
 }
 ```
