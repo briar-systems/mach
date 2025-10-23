@@ -7,6 +7,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// global variable to store command-line provided std path
+static const char *g_std_path_override = NULL;
+
 // simple toml parser for configuration
 typedef struct TomlParser
 {
@@ -14,6 +17,57 @@ typedef struct TomlParser
     size_t      pos;
     size_t      len;
 } TomlParser;
+
+// set std path override from command line
+void config_set_std_path(const char *path)
+{
+    g_std_path_override = path;
+}
+
+// resolve path with variable substitution
+// supports $MACH_STD placeholder and command line override
+static char *resolve_path_variables(const char *path)
+{
+    if (!path)
+        return NULL;
+
+    // check if path contains $MACH_STD
+    const char *placeholder = strstr(path, "$MACH_STD");
+    if (!placeholder)
+        return strdup(path); // no substitution needed
+
+    // determine the std path to substitute
+    const char *std_path = g_std_path_override;
+    if (!std_path)
+    {
+        // try environment variable
+        std_path = getenv("MACH_STD");
+    }
+
+    if (!std_path)
+    {
+        fprintf(stderr, "warning: $MACH_STD used in dependency path but MACH_STD environment variable not set and --std flag not provided\n");
+        return strdup(path); // return as-is
+    }
+
+    // build the resolved path
+    size_t prefix_len = placeholder - path;
+    size_t suffix_len = strlen(placeholder + 9); // skip "$MACH_STD"
+    size_t total_len  = prefix_len + strlen(std_path) + suffix_len + 1;
+
+    char *result = malloc(total_len);
+    if (!result)
+        return NULL;
+
+    // copy prefix
+    memcpy(result, path, prefix_len);
+    // copy std_path
+    strcpy(result + prefix_len, std_path);
+    // copy suffix
+    strcpy(result + prefix_len + strlen(std_path), placeholder + 9);
+
+    return result;
+}
 
 static void toml_parser_init(TomlParser *parser, const char *input)
 {
@@ -559,22 +613,29 @@ ProjectConfig *config_load(const char *config_path)
             char *dep_path = toml_parse_string(&parser);
             if (dep_path)
             {
-                DepSpec *dep = calloc(1, sizeof(DepSpec));
-                dep->name    = strdup(key);
-                dep->path    = dep_path;
-                dep->src_dir = NULL; // no src subdir
+                // resolve path variables (e.g., $MACH_STD)
+                char *resolved_path = resolve_path_variables(dep_path);
+                free(dep_path);
 
-                DepSpec **new_arr = realloc(config->deps, (config->dep_count + 1) * sizeof(DepSpec *));
-                if (new_arr)
+                if (resolved_path)
                 {
-                    config->deps                      = new_arr;
-                    config->deps[config->dep_count++] = dep;
-                }
-                else
-                {
-                    free(dep->name);
-                    free(dep->path);
-                    free(dep);
+                    DepSpec *dep = calloc(1, sizeof(DepSpec));
+                    dep->name    = strdup(key);
+                    dep->path    = resolved_path;
+                    dep->src_dir = NULL; // no src subdir
+
+                    DepSpec **new_arr = realloc(config->deps, (config->dep_count + 1) * sizeof(DepSpec *));
+                    if (new_arr)
+                    {
+                        config->deps                      = new_arr;
+                        config->deps[config->dep_count++] = dep;
+                    }
+                    else
+                    {
+                        free(dep->name);
+                        free(dep->path);
+                        free(dep);
+                    }
                 }
             }
         }

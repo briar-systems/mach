@@ -23,6 +23,7 @@ void mach_print_usage(const char *program_name)
     fprintf(stderr, "  --no-debug         disable debug info\n");
     fprintf(stderr, "  -I <dir>           add module search directory\n");
     fprintf(stderr, "  -M n=dir           map module prefix 'n' to base directory 'dir'\n");
+    fprintf(stderr, "  --std <path>       path to standard library (can also use MACH_STD env var)\n");
 }
 
 int mach_cmd_build(int argc, char **argv)
@@ -148,6 +149,19 @@ int mach_cmd_build(int argc, char **argv)
             else
             {
                 fprintf(stderr, "error: -M requires name=dir\n");
+                build_options_dnit(&opts);
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--std") == 0)
+        {
+            if (i + 1 < argc)
+            {
+                config_set_std_path(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "error: --std requires a path\n");
                 build_options_dnit(&opts);
                 return 1;
             }

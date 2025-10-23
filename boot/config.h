@@ -56,6 +56,9 @@ ProjectConfig *config_load_from_dir(const char *dir_path);
 bool           config_save(ProjectConfig *config, const char *config_path);
 ProjectConfig *config_create_default(const char *project_name);
 
+// std path override
+void config_set_std_path(const char *path);
+
 // configuration lifecycle
 void config_init(ProjectConfig *config);
 void config_dnit(ProjectConfig *config);
