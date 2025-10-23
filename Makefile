@@ -10,8 +10,9 @@ CFLAGS := -std=c23 -Wall -Wextra -Werror -pedantic -O2
 CFLAGS_DEBUG := -std=c23 -Wall -Wextra -Werror -pedantic -g -O0 -DDEBUG
 
 # llvm configuration
-LLVM_CFLAGS := $(shell llvm-config --cflags)
-LLVM_LDFLAGS := $(shell llvm-config --ldflags --libs core)
+LLVM_CONFIG := $(shell which llvm-config-18 || which llvm-config)
+LLVM_CFLAGS := $(shell $(LLVM_CONFIG) --cflags)
+LLVM_LDFLAGS := $(shell $(LLVM_CONFIG) --ldflags --libs core)
 
 OUT_DIR := out
 
