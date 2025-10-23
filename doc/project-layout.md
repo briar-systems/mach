@@ -189,12 +189,38 @@ use http.client;
 
 ### Standard library
 
-The Mach standard library is typically a dependency:
+The Mach standard library is typically a dependency. You can specify its path in several ways:
 
+**Using environment variable (recommended):**
 ```toml
 [deps]
-std = "path/to/std"
+std = "$MACH_STD"
 ```
+
+Then set the environment variable:
+```bash
+export MACH_STD=/path/to/mach/std
+mach build mach.toml
+```
+
+**Using command line flag:**
+```bash
+mach build mach.toml --std /path/to/mach/std
+```
+
+**Using absolute path (traditional):**
+```toml
+[deps]
+std = "/absolute/path/to/std"
+```
+
+**Using relative path:**
+```toml
+[deps]
+std = "../mach/std"
+```
+
+The `--std` flag takes precedence over the `MACH_STD` environment variable, which takes precedence over the literal path in `mach.toml`. This allows for flexible configuration across different development environments.
 
 Common imports:
 ```mach
@@ -208,8 +234,6 @@ use std.system.memory;       # memory allocation
 use std.system.time;         # time utilities
 use std.system.env;          # environment variables
 ```
-
-> NOTE: The standard library path will be eventually resolved through environment variables or global configuration rather than hardcoding in each project. This option will still be required, but the syntax and usage may change to support this feature in the future.
 
 ---
 

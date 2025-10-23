@@ -215,7 +215,35 @@ out-dir = "out"
 
 ### Using the Standard Library
 
-The Mach standard library is located in the `std/` directory. Import modules with `use`:
+The Mach standard library is located in the `std/` directory. For standalone projects, you can configure the standard library path using:
+
+**1. Environment variable (recommended for system-wide installation):**
+```bash
+export MACH_STD=/path/to/mach/std
+```
+
+**2. Command line flag (per-build override):**
+```bash
+cmach build mach.toml --std /path/to/mach/std
+```
+
+**3. In `mach.toml` using environment variable:**
+```toml
+[deps]
+std = "$MACH_STD"
+```
+
+**4. In `mach.toml` using absolute or relative path:**
+```toml
+[deps]
+std = "/absolute/path/to/std"
+# or
+std = "../mach/std"
+```
+
+The `--std` flag takes precedence over `MACH_STD`, which takes precedence over the literal path in `mach.toml`.
+
+**Import standard library modules with `use`:**
 
 ```mach
 use std.types.string;        # string utilities
