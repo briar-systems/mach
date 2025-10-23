@@ -9,19 +9,20 @@ void mach_print_usage(const char *program_name)
 {
     fprintf(stderr, "usage: %s build <file> [options]\n", program_name);
     fprintf(stderr, "options:\n");
-    fprintf(stderr, "  -o <file>     set output file name\n");
-    fprintf(stderr, "  -O<level>     optimization level (0-3, default: 2)\n");
-    fprintf(stderr, "  --emit-obj    emit object file (.o file)\n");
-    fprintf(stderr, "  --emit-ast[=<file>]  dump parsed AST for debugging\n");
-    fprintf(stderr, "  --emit-ir[=<file>]   dump LLVM IR\n");
-    fprintf(stderr, "  --emit-asm[=<file>]  dump target assembly\n");
-    fprintf(stderr, "  --no-link     don't create executable (just compile)\n");
-    fprintf(stderr, "  --no-pie      disable position independent executable\n");
-    fprintf(stderr, "  --link <obj>  link with additional object file\n");
-    fprintf(stderr, "  -g, --debug   include debug info (default)\n");
-    fprintf(stderr, "  --no-debug    disable debug info\n");
-    fprintf(stderr, "  -I <dir>      add module search directory\n");
-    fprintf(stderr, "  -M n=dir      map module prefix 'n' to base directory 'dir'\n");
+    fprintf(stderr, "  -o <file>          output file (executable or object)\n");
+    fprintf(stderr, "  -O<level>          optimization level (0-3, default: 2)\n");
+    fprintf(stderr, "  --no-link          compile only, don't link (produces object file)\n");
+    fprintf(stderr, "  --emit-asm[=<file>]  emit target assembly\n");
+    fprintf(stderr, "  --emit-ir[=<file>]   emit LLVM IR\n");
+    fprintf(stderr, "  --emit-ast[=<file>]  emit parsed AST for debugging\n");
+    fprintf(stderr, "  --obj-dir=<dir>    directory for intermediate object files\n");
+    fprintf(stderr, "  --dep-dir=<dir>    directory for dependency object files\n");
+    fprintf(stderr, "  --no-pie           disable position independent executable\n");
+    fprintf(stderr, "  --link <obj>       link with additional object file\n");
+    fprintf(stderr, "  -g, --debug        include debug info (default)\n");
+    fprintf(stderr, "  --no-debug         disable debug info\n");
+    fprintf(stderr, "  -I <dir>           add module search directory\n");
+    fprintf(stderr, "  -M n=dir           map module prefix 'n' to base directory 'dir'\n");
 }
 
 int mach_cmd_build(int argc, char **argv)
@@ -61,7 +62,7 @@ int mach_cmd_build(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--emit-obj") == 0)
         {
-            opts.link_exe = 0;
+            opts.emit_obj = 1;
         }
         else if (strcmp(argv[i], "--no-link") == 0)
         {
@@ -84,6 +85,14 @@ int mach_cmd_build(int argc, char **argv)
             opts.emit_asm = 1;
             if (argv[i][10] == '=' && argv[i][11] != '\0')
                 opts.emit_asm_path = argv[i] + 11;
+        }
+        else if (strncmp(argv[i], "--obj-dir=", 10) == 0)
+        {
+            opts.obj_dir = argv[i] + 10;
+        }
+        else if (strncmp(argv[i], "--dep-dir=", 10) == 0)
+        {
+            opts.dep_dir = argv[i] + 10;
         }
         else if (strcmp(argv[i], "--no-pie") == 0)
         {

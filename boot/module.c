@@ -1199,7 +1199,7 @@ bool module_has_circular_dependency(ModuleManager *manager, Module *module, cons
 }
 
 // helper declarations
-static bool compile_module_to_object(ModuleManager *manager, Module *module, const char *output_dir, int opt_level, bool no_pie, bool debug_info, SpecializationCache *spec_cache);
+static bool compile_module_to_object(ModuleManager *manager, Module *module, const char *output_dir, int opt_level, bool no_pie, bool debug_info, bool emit_asm, bool emit_ir, bool emit_ast, SpecializationCache *spec_cache);
 
 char *module_make_object_path(const char *output_dir, const char *module_name)
 {
@@ -1241,7 +1241,39 @@ char *module_make_object_path(const char *output_dir, const char *module_name)
     return path;
 }
 
-bool module_manager_compile_dependencies(ModuleManager *manager, const char *output_dir, int opt_level, bool no_pie, bool debug_info, SpecializationCache *spec_cache)
+static char *module_make_artifact_path(const char *output_dir, const char *module_name, const char *extension)
+{
+    if (!output_dir || !module_name || !extension)
+        return NULL;
+
+    const char *name = module_name;
+    if (strncmp(name, "dep.", 4) == 0)
+        name += 4; // strip dep prefix
+
+    size_t len = strlen(name);
+    char  *rel = malloc(len + 1);
+    if (!rel)
+        return NULL;
+    for (size_t i = 0; i < len; i++)
+        rel[i] = (name[i] == '.') ? '/' : name[i];
+    rel[len] = '\0';
+
+    size_t dir_len  = strlen(output_dir);
+    size_t ext_len  = strlen(extension);
+    size_t path_len = dir_len + 1 + strlen(rel) + ext_len + 1;
+    char  *path     = malloc(path_len);
+    if (!path)
+    {
+        free(rel);
+        return NULL;
+    }
+    snprintf(path, path_len, "%s/%s%s", output_dir, rel, extension);
+
+    free(rel);
+    return path;
+}
+
+bool module_manager_compile_dependencies(ModuleManager *manager, const char *output_dir, int opt_level, bool no_pie, bool debug_info, bool emit_asm, bool emit_ir, bool emit_ast, SpecializationCache *spec_cache)
 {
     if (!manager)
         return false;
@@ -1279,7 +1311,7 @@ bool module_manager_compile_dependencies(ModuleManager *manager, const char *out
 
             // no info output
 
-            if (!compile_module_to_object(manager, module, output_dir, opt_level, no_pie, debug_info, spec_cache))
+            if (!compile_module_to_object(manager, module, output_dir, opt_level, no_pie, debug_info, emit_asm, emit_ir, emit_ast, spec_cache))
             {
                 return false;
             }
@@ -1339,7 +1371,7 @@ bool module_manager_get_link_objects(ModuleManager *manager, char ***object_file
     return true;
 }
 
-static bool compile_module_to_object(ModuleManager *manager, Module *module, const char *output_dir, int opt_level, bool no_pie, bool debug_info, SpecializationCache *spec_cache)
+static bool compile_module_to_object(ModuleManager *manager, Module *module, const char *output_dir, int opt_level, bool no_pie, bool debug_info, bool emit_asm, bool emit_ir, bool emit_ast, SpecializationCache *spec_cache)
 {
     if (!module || !module->ast)
         return false;
@@ -1381,6 +1413,78 @@ static bool compile_module_to_object(ModuleManager *manager, Module *module, con
 
     if (success)
     {
+        // emit AST if requested
+        if (emit_ast)
+        {
+            char *parent = fs_dirname(output_dir);
+            if (parent)
+            {
+                char ast_dir[1024];
+                snprintf(ast_dir, sizeof(ast_dir), "%s/ast", parent);
+                char *ast_path = module_make_artifact_path(ast_dir, module->name, ".ast");
+                if (ast_path)
+                {
+                    char *ast_parent = fs_dirname(ast_path);
+                    if (ast_parent)
+                    {
+                        fs_ensure_dir_recursive(ast_parent);
+                        free(ast_parent);
+                    }
+                    ast_emit(module->ast, ast_path);
+                    free(ast_path);
+                }
+                free(parent);
+            }
+        }
+
+        // emit IR if requested
+        if (emit_ir)
+        {
+            char *parent = fs_dirname(output_dir);
+            if (parent)
+            {
+                char ir_dir[1024];
+                snprintf(ir_dir, sizeof(ir_dir), "%s/ir", parent);
+                char *ir_path = module_make_artifact_path(ir_dir, module->name, ".ll");
+                if (ir_path)
+                {
+                    char *ir_parent = fs_dirname(ir_path);
+                    if (ir_parent)
+                    {
+                        fs_ensure_dir_recursive(ir_parent);
+                        free(ir_parent);
+                    }
+                    codegen_emit_llvm_ir(&ctx, ir_path);
+                    free(ir_path);
+                }
+                free(parent);
+            }
+        }
+
+        // emit assembly if requested
+        if (emit_asm)
+        {
+            char *parent = fs_dirname(output_dir);
+            if (parent)
+            {
+                char asm_dir[1024];
+                snprintf(asm_dir, sizeof(asm_dir), "%s/asm", parent);
+                char *asm_path = module_make_artifact_path(asm_dir, module->name, ".s");
+                if (asm_path)
+                {
+                    char *asm_parent = fs_dirname(asm_path);
+                    if (asm_parent)
+                    {
+                        fs_ensure_dir_recursive(asm_parent);
+                        free(asm_parent);
+                    }
+                    codegen_emit_assembly(&ctx, asm_path);
+                    free(asm_path);
+                }
+                free(parent);
+            }
+        }
+
         success = codegen_emit_object(&ctx, module->object_path);
         if (!success)
         {

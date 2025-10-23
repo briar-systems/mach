@@ -39,9 +39,8 @@ MACH_BIN_DIR := $(MACH_OUT_DIR)/bin
 MACH_EXE := $(MACH_BIN_DIR)/mach
 
 # compiler flags for each build stage
-CMACH_FLAGS := -I $(MACH_SRC_DIR) -M mach=$(MACH_SRC_DIR) -I $(STD_DIR) -M std=$(STD_DIR)
-IMACH_FLAGS := -I $(MACH_SRC_DIR) -M mach=$(MACH_SRC_DIR) -I $(STD_DIR) -M std=$(STD_DIR)
-MACH_FLAGS :=
+CMACH_FLAGS := -I $(MACH_SRC_DIR) -M mach=$(MACH_SRC_DIR) -I $(STD_DIR) -M std=$(STD_DIR) --obj-dir=$(IMACH_OBJ_DIR) --dep-dir=$(IMACH_OBJ_DIR) --emit-asm --emit-ast --emit-ir
+MACH_FLAGS := 
 
 # bootstrap compiler sources
 BOOT_SOURCES := $(wildcard $(BOOT_DIR)/*.c)
@@ -134,7 +133,10 @@ $(CMACH): $(BOOT_OBJECTS) | $(CMACH_BIN_DIR)
 $(IMACH_BIN_DIR):
 	@mkdir -p $(IMACH_BIN_DIR)
 
-$(IMACH_EXE): $(MACH_MAIN) $(CMACH) | $(IMACH_BIN_DIR)
+$(IMACH_OBJ_DIR):
+	@mkdir -p $(IMACH_OBJ_DIR)
+
+$(IMACH_EXE): $(MACH_MAIN) $(CMACH) | $(IMACH_BIN_DIR) $(IMACH_OBJ_DIR)
 	@echo "  cmach -> imach"
 	@$(CMACH) build $(MACH_MAIN) $(CMACH_FLAGS) -o $@
 	@echo "intermediary compiler ready: $@"
@@ -145,5 +147,5 @@ $(MACH_BIN_DIR):
 
 $(MACH_EXE): $(MACH_MAIN) $(IMACH_EXE) | $(MACH_BIN_DIR)
 	@echo "  imach -> mach"
-	@$(IMACH_EXE) build $(MACH_MAIN) $(IMACH_FLAGS) -o $@
+	@$(IMACH_EXE) build $(MACH_MAIN) $(MACH_FLAGS) -o $@
 	@echo "final compiler ready: $@"

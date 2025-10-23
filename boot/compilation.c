@@ -71,6 +71,43 @@ static void alias_vec_dnit(AliasVec *v)
     v->cap   = 0;
 }
 
+// build hierarchical path from module name: "std.io.console" + "obj" + ".o" -> "obj/std/io/console.o"
+static char *build_module_artifact_path(const char *base_dir, const char *module_name, const char *extension)
+{
+    if (!module_name || !extension)
+        return NULL;
+
+    size_t base_len   = base_dir ? strlen(base_dir) : 0;
+    size_t module_len = strlen(module_name);
+    size_t ext_len    = strlen(extension);
+    size_t total_len  = base_len + (base_len ? 1 : 0) + module_len + ext_len + 1;
+
+    char *path = malloc(total_len);
+    if (!path)
+        return NULL;
+
+    size_t pos = 0;
+    if (base_len)
+    {
+        memcpy(path, base_dir, base_len);
+        pos = base_len;
+        if (base_dir[base_len - 1] != '/')
+            path[pos++] = '/';
+    }
+
+    // convert module name to path: dots become slashes
+    for (size_t i = 0; i < module_len; i++)
+    {
+        char c = module_name[i];
+        path[pos++] = (c == '.') ? '/' : c;
+    }
+
+    memcpy(path + pos, extension, ext_len);
+    path[pos + ext_len] = '\0';
+
+    return path;
+}
+
 void build_options_init(BuildOptions *opts)
 {
     memset(opts, 0, sizeof(BuildOptions));
@@ -341,13 +378,52 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
         const char *ast_path = ctx->options->emit_ast_path;
         if (!ast_path || ast_path[0] == '\0')
         {
-            char  *base = fs_get_base_filename(ctx->options->input_file);
-            size_t len  = strlen(base) + 5;
-            auto_ast    = malloc(len);
-            snprintf(auto_ast, len, "%s.ast", base);
+            // derive base directory from obj_dir or use "ast"
+            const char *base_dir = ctx->options->obj_dir;
+            char       *parent   = NULL;
+            if (base_dir)
+            {
+                // extract parent: "out/imach/obj" -> "out/imach/ast"
+                parent = fs_dirname(base_dir);
+                if (parent)
+                {
+                    size_t len = strlen(parent) + 5; // "/ast" + \0
+                    auto_ast   = malloc(len);
+                    snprintf(auto_ast, len, "%s/ast", parent);
+                    free(parent);
+                    base_dir = auto_ast;
+                }
+            }
+            else
+            {
+                base_dir = "ast";
+            }
+
+            char *ast_full = build_module_artifact_path(base_dir, ctx->module_name, ".ast");
+            if (ast_full)
+            {
+                free(auto_ast);
+                auto_ast = ast_full;
+            }
+            else
+            {
+                char  *base = fs_get_base_filename(ctx->options->input_file);
+                size_t len  = strlen(base) + 5;
+                auto_ast    = malloc(len);
+                snprintf(auto_ast, len, "%s.ast", base);
+                free(base);
+            }
             ast_path = auto_ast;
-            free(base);
         }
+
+        // ensure directory exists
+        char *dir = fs_dirname(ast_path);
+        if (dir)
+        {
+            fs_ensure_dir_recursive(dir);
+            free(dir);
+        }
+
         if (!ast_emit(ctx->ast, ast_path))
         {
             fprintf(stderr, "error: failed to emit ast file '%s'\n", ast_path);
@@ -361,13 +437,52 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
         const char *ir_path = ctx->options->emit_ir_path;
         if (!ir_path || ir_path[0] == '\0')
         {
-            char  *base = fs_get_base_filename(ctx->options->input_file);
-            size_t len  = strlen(base) + 4;
-            auto_ir     = malloc(len);
-            snprintf(auto_ir, len, "%s.ll", base);
+            // derive base directory from obj_dir or use "ir"
+            const char *base_dir = ctx->options->obj_dir;
+            char       *parent   = NULL;
+            if (base_dir)
+            {
+                // extract parent: "out/imach/obj" -> "out/imach/ir"
+                parent = fs_dirname(base_dir);
+                if (parent)
+                {
+                    size_t len = strlen(parent) + 4; // "/ir" + \0
+                    auto_ir    = malloc(len);
+                    snprintf(auto_ir, len, "%s/ir", parent);
+                    free(parent);
+                    base_dir = auto_ir;
+                }
+            }
+            else
+            {
+                base_dir = "ir";
+            }
+
+            char *ir_full = build_module_artifact_path(base_dir, ctx->module_name, ".ll");
+            if (ir_full)
+            {
+                free(auto_ir);
+                auto_ir = ir_full;
+            }
+            else
+            {
+                char  *base = fs_get_base_filename(ctx->options->input_file);
+                size_t len  = strlen(base) + 4;
+                auto_ir     = malloc(len);
+                snprintf(auto_ir, len, "%s.ll", base);
+                free(base);
+            }
             ir_path = auto_ir;
-            free(base);
         }
+
+        // ensure directory exists
+        char *dir = fs_dirname(ir_path);
+        if (dir)
+        {
+            fs_ensure_dir_recursive(dir);
+            free(dir);
+        }
+
         if (!codegen_emit_llvm_ir(&ctx->codegen, ir_path))
         {
             fprintf(stderr, "error: failed to emit llvm ir '%s'\n", ir_path);
@@ -381,13 +496,52 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
         const char *asm_path = ctx->options->emit_asm_path;
         if (!asm_path || asm_path[0] == '\0')
         {
-            char  *base = fs_get_base_filename(ctx->options->input_file);
-            size_t len  = strlen(base) + 3;
-            auto_asm    = malloc(len);
-            snprintf(auto_asm, len, "%s.s", base);
+            // derive base directory from obj_dir or use "asm"
+            const char *base_dir = ctx->options->obj_dir;
+            char       *parent   = NULL;
+            if (base_dir)
+            {
+                // extract parent: "out/imach/obj" -> "out/imach/asm"
+                parent = fs_dirname(base_dir);
+                if (parent)
+                {
+                    size_t len = strlen(parent) + 5; // "/asm" + \0
+                    auto_asm   = malloc(len);
+                    snprintf(auto_asm, len, "%s/asm", parent);
+                    free(parent);
+                    base_dir = auto_asm;
+                }
+            }
+            else
+            {
+                base_dir = "asm";
+            }
+
+            char *asm_full = build_module_artifact_path(base_dir, ctx->module_name, ".s");
+            if (asm_full)
+            {
+                free(auto_asm);
+                auto_asm = asm_full;
+            }
+            else
+            {
+                char  *base = fs_get_base_filename(ctx->options->input_file);
+                size_t len  = strlen(base) + 3;
+                auto_asm    = malloc(len);
+                snprintf(auto_asm, len, "%s.s", base);
+                free(base);
+            }
             asm_path = auto_asm;
-            free(base);
         }
+
+        // ensure directory exists
+        char *dir = fs_dirname(asm_path);
+        if (dir)
+        {
+            fs_ensure_dir_recursive(dir);
+            free(dir);
+        }
+
         if (!codegen_emit_assembly(&ctx->codegen, asm_path))
         {
             fprintf(stderr, "error: failed to emit assembly '%s'\n", asm_path);
@@ -396,19 +550,51 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
     }
 
     // determine object file path and store it in context
-    if (!ctx->options->output_file || ctx->options->link_exe)
+    if (!ctx->options->link_exe)
     {
-        // when linking or no output specified, use default .o name
-        char  *base = fs_get_base_filename(ctx->options->input_file);
-        size_t len  = strlen(base) + 3;
-        ctx->source = malloc(len); // reuse source pointer (already freed)
-        snprintf(ctx->source, len, "%s.o", base);
-        free(base);
+        // --no-link: object is primary output
+        if (ctx->options->output_file)
+        {
+            ctx->source = strdup(ctx->options->output_file);
+        }
+        else if (ctx->options->obj_dir)
+        {
+            char *obj_path = build_module_artifact_path(ctx->options->obj_dir, ctx->module_name, ".o");
+            ctx->source    = obj_path ? obj_path : strdup("main.o");
+        }
+        else
+        {
+            char  *base = fs_get_base_filename(ctx->options->input_file);
+            size_t len  = strlen(base) + 3;
+            ctx->source = malloc(len);
+            snprintf(ctx->source, len, "%s.o", base);
+            free(base);
+        }
     }
     else
     {
-        // output file is the object file
-        ctx->source = strdup(ctx->options->output_file);
+        // linking: place object in obj_dir if specified, else current dir
+        if (ctx->options->obj_dir)
+        {
+            char *obj_path = build_module_artifact_path(ctx->options->obj_dir, ctx->module_name, ".o");
+            ctx->source    = obj_path ? obj_path : strdup("main.o");
+        }
+        else
+        {
+            char  *base = fs_get_base_filename(ctx->options->input_file);
+            size_t len  = strlen(base) + 3;
+            ctx->source = malloc(len);
+            snprintf(ctx->source, len, "%s.o", base);
+            free(base);
+        }
+    }
+
+    // ensure directory exists for object file
+    char *obj_dir = fs_dirname(ctx->source);
+    if (obj_dir)
+    {
+        fs_ensure_dir_recursive(obj_dir);
+        free(obj_dir);
     }
 
     if (!codegen_emit_object(&ctx->codegen, ctx->source))
@@ -426,10 +612,17 @@ bool compilation_compile_dependencies(CompilationContext *ctx)
         return true;
 
     char dep_out_dir[1024];
-    snprintf(dep_out_dir, sizeof(dep_out_dir), "%s/out/obj", ctx->project_root);
+    if (ctx->options->dep_dir)
+    {
+        snprintf(dep_out_dir, sizeof(dep_out_dir), "%s", ctx->options->dep_dir);
+    }
+    else
+    {
+        snprintf(dep_out_dir, sizeof(dep_out_dir), "%s/out/obj", ctx->project_root);
+    }
     fs_ensure_dir_recursive(dep_out_dir);
 
-    if (!module_manager_compile_dependencies(&ctx->driver->module_manager, dep_out_dir, ctx->options->opt_level, ctx->options->no_pie, ctx->options->debug_info, &ctx->driver->spec_cache))
+    if (!module_manager_compile_dependencies(&ctx->driver->module_manager, dep_out_dir, ctx->options->opt_level, ctx->options->no_pie, ctx->options->debug_info, ctx->options->emit_asm, ctx->options->emit_ir, ctx->options->emit_ast, &ctx->driver->spec_cache))
     {
         fprintf(stderr, "error: failed to compile dependencies\n");
         return false;

@@ -88,7 +88,7 @@ Module *module_manager_find_module(ModuleManager *manager, const char *name);
 Module *module_manager_find_by_file_path(ModuleManager *manager, const char *file_path);
 
 // dependency compilation and linking
-bool module_manager_compile_dependencies(ModuleManager *manager, const char *output_dir, int opt_level, bool no_pie, bool debug_info, SpecializationCache *spec_cache);
+bool module_manager_compile_dependencies(ModuleManager *manager, const char *output_dir, int opt_level, bool no_pie, bool debug_info, bool emit_asm, bool emit_ir, bool emit_ast, SpecializationCache *spec_cache);
 bool module_manager_get_link_objects(ModuleManager *manager, char ***object_files, int *count);
 
 // utility helpers
