@@ -1,6 +1,11 @@
 MACH
 ===
 
+![License](https://img.shields.io/github/license/octalide/mach)
+![Code Size](https://img.shields.io/github/languages/code-size/octalide/mach)
+![Last Commit](https://img.shields.io/github/last-commit/octalide/mach)
+![Issues](https://img.shields.io/github/issues/octalide/mach)
+
 Mach is a statically-typed, compiled programming language designed to be simple, fast, and easy to use.
 It is intended to be a systems programming language, but can be used for a wide variety of applications.
 
