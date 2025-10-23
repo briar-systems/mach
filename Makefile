@@ -143,5 +143,8 @@ $(MACH_BIN_DIR):
 
 $(MACH_EXE): $(MACH_MAIN) $(IMACH_EXE) | $(MACH_BIN_DIR)
 	@echo "  imach -> mach"
+	@echo ""
+	@echo "  NOTE: This stage of the pipeline is incomplete and included for scaffolding purposes"
+	@echo ""
 	@$(IMACH_EXE) build $(MACH_MAIN) $(MACH_FLAGS) -o $@
 	@echo "final compiler ready: $@"
