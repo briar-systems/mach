@@ -13,11 +13,13 @@ It is intended to be a systems programming language, but can be used for a wide 
   - [Philosophy](#philosophy)
   - [Key Features](#key-features)
 - [Getting Started](#getting-started)
+  - [Building From Source](#building-from-source)
   - [Simple Examples](#simple-examples)
     - [Hello World](#hello-world)
     - [Fibonacci](#fibonacci)
     - [Factorial](#factorial)
 - [Credit](#credit)
+  - [Contributing](#contributing)
 - [License](#license)
 
 
@@ -52,13 +54,14 @@ We encourage you to not even install Mach until you have read the [language docu
 
 The reason for this is that Mach may not be for you. If the language does not include some features you hope to use, includes things you despise, or if you just don't like the syntax, then you should look elsewhere. If you read the documentation and have decided that you like the language, then you will have learned the basics and should be capable of diving in.
 
-The [documentation](doc/README.md) includes instructions for how to [get started](doc/getting_started.md) with Mach.
-
 If you are new to programming in general, then Mach may not be for you. There are lots of other languages that are better suited for beginners (mostly because of the level of documentation), and we encourage you to look into those instead. Some good "first" programming languages are:
 - [Python](https://www.python.org/)
 - [Lua](https://www.lua.org/)
 - [Javascript](https://www.javascript.com/)
 
+## Building From Source
+
+The docs include a [getting started guide](doc/getting-started.md) that walks you through building the compiler from source and running your first Mach program.
 
 ## Simple Examples
 
@@ -142,8 +145,10 @@ The original compiler would not have been written without the ability to referen
 
 Mach, at its core, stands on the shoulders of countles giants that have contributed to the development of these languages either directly or by proxy. It is out of respect for their work that Mach will always be fully open source. Thank you all.
 
+## Contributing
+
+We welcome contributions to Mach! If you would like to contribute, please read our [contributing guidelines](CONTRIBUTING.md) first.
+
 # License
 
-Mach currently operates under the [Unlicense](https://unlicense.org/).
-
-> Take it. Use it. Hate it. Break it. Fix it. Love it. It's yours.
+Mach is licensed under the [MIT License](LICENSE).

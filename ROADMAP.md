@@ -3,8 +3,8 @@ Generalized Roadmap
 
 # High level tasking
 
-- [ ] C Compiler:
-  - [ ] Stabalize syntax
+- [x] C Compiler:
+  - [x] Stabalize syntax
 - [ ] Self-Hosted Compiler:
   - [ ] 1:1 capability parity with C compiler
 - [ ] Tooling:

@@ -563,7 +563,7 @@ ProjectConfig *config_load(const char *config_path)
                 dep->name    = strdup(key);
                 dep->path    = dep_path;
                 dep->src_dir = NULL; // no src subdir
-                
+
                 DepSpec **new_arr = realloc(config->deps, (config->dep_count + 1) * sizeof(DepSpec *));
                 if (new_arr)
                 {
@@ -1200,18 +1200,18 @@ char *config_get_package_src_dir(ProjectConfig *config, const char *project_dir,
     char *root = config_resolve_package_root(config, project_dir, package_name);
     if (!root)
         return NULL;
-    
+
     // for self, use project's src-dir
     if (strcmp(package_name, config->name) == 0)
     {
         const char *src_rel = config->src_dir ? config->src_dir : "src";
-        size_t len  = strlen(root) + 1 + strlen(src_rel) + 1;
-        char  *path = malloc(len);
+        size_t      len     = strlen(root) + 1 + strlen(src_rel) + 1;
+        char       *path    = malloc(len);
         snprintf(path, len, "%s/%s", root, src_rel);
         free(root);
         return path;
     }
-    
+
     // for deps, path is the src dir (no subdir)
     return root;
 }

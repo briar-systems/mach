@@ -75,7 +75,6 @@ help:
 	@echo "  mach         - clean and build mach"
 	@echo ""
 	@echo "meta:"
-	@echo "  full         - build entire chain (cmach -> imach -> mach)"
 	@echo "  clean        - clean all build artifacts"
 
 # bootstrap compiler
@@ -104,9 +103,6 @@ mach-clean:
 mach-build: $(MACH_EXE)
 
 mach: mach-clean mach-build
-
-# build entire chain
-full: cmach imach mach
 
 # clean everything
 clean:

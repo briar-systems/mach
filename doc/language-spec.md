@@ -1,8 +1,8 @@
 # Mach Language Specification
 
-**Status:** Draft. This document reflects the current language surface as implemented by the bootstrap compiler (`mach-c`). Future self-hosted compilers will use this document as the canonical contract.
-
 Mach is a statically typed, compiled systems language with explicit control over data layout and resource management. The design emphasises predictable semantics, C interoperability, and a minimal core that applications can reason about without hidden behaviour.
+
+> NOTE: This document reflects the current language surface as implemented by the bootstrap compiler (`cmach`). Future self-hosted or third party compilers should use this document as the canonical contract.
 
 ---
 
@@ -25,6 +25,7 @@ Mach is a statically typed, compiled systems language with explicit control over
     - [Unions](#unions)
     - [Function types](#function-types)
     - [Type aliases](#type-aliases)
+    - [Generics](#generics)
   - [Declarations](#declarations)
     - [Visibility (`pub`)](#visibility-pub)
     - [Module imports (`use`)](#module-imports-use)
@@ -33,7 +34,9 @@ Mach is a statically typed, compiled systems language with explicit control over
     - [Structs (`str`) and unions (`uni`)](#structs-str-and-unions-uni)
     - [Variables (`var`) and values (`val`)](#variables-var-and-values-val)
     - [Functions (`fun`)](#functions-fun)
+    - [Method syntax](#method-syntax)
     - [Inline assembly (`asm`)](#inline-assembly-asm)
+    - [Preprocessor directives](#preprocessor-directives)
   - [Statements](#statements)
     - [Blocks](#blocks)
     - [`if` / `or`](#if--or)
@@ -59,11 +62,6 @@ Mach is a statically typed, compiled systems language with explicit control over
     - [Variadic forwarding](#variadic-forwarding)
   - [Modules and projects](#modules-and-projects)
     - [Project configuration (`mach.toml`)](#project-configuration-machtoml)
-  - [Standard library conventions](#standard-library-conventions)
-    - [Dynamic arrays (`std.types.array`)](#dynamic-arrays-stdtypesarray)
-    - [Strings (`std.types.string`)](#strings-stdtypesstring)
-    - [Console I/O (`std.io.console`)](#console-io-stdioconsole)
-    - [Memory (`std.system.memory`)](#memory-stdsystemmemory)
   - [Design notes and future direction](#design-notes-and-future-direction)
 
 
@@ -98,7 +96,7 @@ Mach is a statically typed, compiled systems language with explicit control over
 
 - Start with `[A-Za-z_]`, followed by zero or more letters, digits, or underscores.
 - Case-sensitive.
-- Keywords cannot be redefined (see below).
+- Keywords and builtin types cannot be redefined (see below).
 
 ### Keywords
 
@@ -118,10 +116,11 @@ Mach is a statically typed, compiled systems language with explicit control over
 - `def`: Type alias declaration.
 - `ext`: External function declaration.
 - `pub`: Public visibility modifier.
+- `nil`: Null pointer literal.
 
 ### Literals
 
-- **Integer literals**: decimal (`42`), hexadecimal (`0xFF`), binary (`0b1010`). Suffixes are not currently supported; the semantic analyser determines a concrete type based on context (see [Expressions](#expressions)).
+- **Integer literals**: decimal (`42`), hexadecimal (`0xFF`), binary (`0b1010`). Suffixes are not currently supported; the semantic analyser determines a concrete type based on context (see [Expressions](#expressions)). When no context is available, integer literals default to `i32`.
 - **Float literals**: decimal with optional fraction and exponent (`3.14`, `6.02e23`). Always treated as `f64` unless directed otherwise.
 - **Character literals**: `'a'`, `'\n'`. Represent unsigned bytes (`u8`). Escape sequences mirror C (`\n`, `\t`, `\\`, `\'`, `\"`, `\xNN`).
 - **String literals**: double-quoted UTF-8 sequences with the same escapes as characters. Each literal lowers to a readonly `[]u8` with static storage duration.
@@ -165,8 +164,8 @@ Mach resolves every expression to a `Type`. The bootstrap compiler caches descri
 `*T` references the location of a value of type `T`.
 
 - Size/alignment: 8 bytes on 64-bit targets.
-- `ptr` is a separate built-in representing “pointer to unknown”; `*ptr` therefore corresponds to C’s `void **`.
-- Pointer arithmetic is limited to integer offsets (see [Expressions](#expressions)) and yields typed pointers.
+- `ptr` is a separate built-in representing “pointer to unknown”; `*ptr` therefore corresponds to C’s `void**`.
+- Pointer arithmetic is limited to integer offsets and yields typed pointers.
 - The address-of operator `?expr` produces a typed pointer when `expr` is an lvalue.
 
 ### Arrays (slices)
@@ -225,6 +224,45 @@ val fnPtr: fun(i32, ptr) i32 = main;
 ### Type aliases
 
 `def Name: ExistingType;` creates a distinct type name pointing to another descriptor. Aliases participate in equality checks by identity until resolved (`type_resolve_alias` strips layers when needed).
+
+### Generics
+
+Mach supports generic types and functions using angle bracket syntax `<T>`. Generic parameters are resolved at compile time based on usage.
+
+**Generic structs:**
+
+```mach
+pub str List<T> {
+    data: *T;
+    len:  u64;
+    cap:  u64;
+}
+```
+
+**Generic functions:**
+
+```mach
+pub fun list_new<T>(cap: u64) Result<List<T>, string> {
+    val data: *T = mem.alloc<T>(cap);
+    // ...
+}
+```
+
+**Generic instantiation:**
+
+When calling generic functions or constructing generic types, the compiler accepts only explicit type parameters:
+
+```mach
+val my_list: List<i32> = list_new<i32>(10).unwrap_ok();
+```
+
+Generic type parameters can appear in:
+- Struct and union definitions
+- Function signatures (parameters and return types)
+- Type aliases
+- Method definitions
+
+Type parameter constraints are not yet supported; all generic parameters are unbounded.
 
 ---
 
@@ -295,7 +333,23 @@ pub fun main(args: []string) i64 {
 - Optional return type. Absent return types imply no value (`ret;`).
 - Variadics append `...` to the parameter list (no identifier). Forwarding uses the expression `...` as the final argument in a call.
 - Nested functions are disallowed.
-- Forward declarations are supported by repeating the signature without a body, followed later by the full definition.
+- Function bodies are required; there is no support for forward declarations without a body.
+
+### Method syntax
+
+Mach supports method-style function definitions that associate functions with types. Methods use dot notation for the type before the function name:
+
+```mach
+pub fun List<T>.reserve(this: *List<T>, additional: u64) Option<string> {
+    // ...
+}
+```
+
+- The first parameter is typically named `this` and represents the receiver.
+- Methods can take the receiver by value (`this: Type`) or by pointer (`this: *Type`).
+- Method calls use dot syntax: `my_list.reserve(10)`.
+- Methods are desugared to regular functions during compilation; they are syntactic sugar for organizational clarity.
+- Methods can be defined for any type, including generic types with their type parameters.
 
 ### Inline assembly (`asm`)
 
@@ -308,6 +362,42 @@ asm {
 - Available at top level and within blocks.
 - `pub asm` is invalid.
 - Content between braces is copied as-is into the generated LLVM IR.
+
+### Preprocessor directives
+
+Mach includes a simple preprocessor that processes directives starting with `#@`. These directives are evaluated before lexical analysis.
+
+**Conditional compilation:**
+
+```mach
+#@if (OS == OS_LINUX)
+use sys: std.system.platform.linux.sys;
+#@or (OS == OS_DARWIN)
+use sys: std.system.platform.darwin.sys;
+#@or (OS == OS_WINDOWS)
+use sys: std.system.platform.windows.sys;
+#@end
+```
+
+- `#@if (condition)` begins a conditional block.
+- `#@or (condition)` provides an else-if branch.
+- `#@or` without a condition acts as else.
+- `#@end` closes the conditional block.
+- Conditions support identifiers, numeric comparisons (`==`, `!=`), and logical operators (`&&`, `||`, `!`).
+- Common predefined identifiers: `OS`, `OS_LINUX`, `OS_DARWIN`, `OS_WINDOWS`.
+
+**Symbol directives:**
+
+```mach
+#@symbol("main")
+fun main(args: []string) i64 { ... }
+```
+
+- `#@symbol("name")` overrides the symbol name in generated code.
+- Useful for controlling exported symbols and C interoperability.
+- Must appear immediately before the declaration it modifies.
+
+Preprocessor directives are line-oriented and preserve line numbers by inserting blank lines where directives are removed, ensuring error messages reference correct source locations.
 
 ---
 
@@ -386,7 +476,7 @@ Expressions evaluate to values. The compiler tracks whether an expression is an 
 
 ### Literals
 
-- Integer literals default to the smallest unsigned type that fits (`u8`/`u16`/`u32`/`u64`) but are promoted to at least `u32` to avoid unexpected overflow. When a literal appears with an expected integer type, the compiler checks whether the value fits; otherwise it falls back to the inference rule.
+- Integer literals default to `i32` when no type context is available. When a literal appears with an expected integer type, the compiler checks whether the value fits and uses that type.
 - Float literals default to `f64`.
 - Character literals produce `u8` values.
 - String literals produce `[]u8` slices.
@@ -412,8 +502,8 @@ Binary operators:
 ```
 
 - Both operands must be numeric (`type_is_numeric`).
-- For addition (`+`) and subtraction (`-`), pointer arithmetic is allowed: pointer ± integer → pointer. Pointer differences are not yet defined.
-- Operands promote via `type_promote_binary`, which performs float precedence first, then integer rank (with signedness rules). Narrow integer literals are promoted to at least 32 bits to avoid overflow.
+- For addition (`+`) and subtraction (`-`), pointer arithmetic is allowed: pointer ± integer → pointer. Pointer subtraction (pointer - pointer) is also supported and returns a `u64` representing the difference.
+- Operands are promoted based on size and signedness. If operand sizes differ, the larger type is used. For same-sized integer types, unsigned types are preferred over signed types.
 
 ### Comparisons
 
@@ -487,10 +577,10 @@ The bootstrap compiler recognises several built-in functions that bypass normal 
 
 | Intrinsic | Description |
 |-----------|-------------|
-| `size_of(expr_or_type)` | Returns the size (bytes) of the operand’s type as `u64`. Operand is analysed but not evaluated. |
-| `align_of(expr_or_type)` | Returns the alignment (bytes) of the operand’s type as `u64`. |
+| `size_of(type)` | Returns the size (bytes) of the operand’s type as `u64`. Operand is analysed but not evaluated. |
+| `align_of(type)` | Returns the alignment (bytes) of the operand’s type as `u64`. |
 | `offset_of(typeExpr, fieldName)` | Struct type and field identifier. Returns the byte offset of the named field. |
-| `type_of(expr)` | Produces a `u64` identifier representing the expression’s type (implementation detail; used for diagnostics/runtime tagging). |
+| `type_of(type)` | Produces a `u64` identifier representing the expression’s type (implementation detail; used for diagnostics/runtime tagging). |
 | `va_count()` | Inside Mach variadic functions: returns number of variadic arguments supplied at the call site. |
 | `va_arg(index)` | Returns a `ptr` to the variadic argument at `index`. Caller must cast manually. |
 
@@ -536,39 +626,11 @@ std = "std"
 
 ---
 
-## Standard library conventions
-
-While Mach does not bake in a standard library, `mach-std` ships alongside the compiler and establishes idioms for common tasks.
-
-### Dynamic arrays (`std.types.array`)
-
-- Functions are prefixed with `array_` to keep the public symbol namespace stable (important for future self-hosted builds).
-- Arrays maintain hidden capacity metadata directly before the slice data pointer. Functions like `array_append`, `array_reserve`, `array_shrink_to_fit`, `array_clear`, and `array_free` manage growth and lifetime.
-- Always reassign the result of these helpers: each call may allocate a new backing buffer.
-
-### Strings (`std.types.string`)
-
-- `string` is an alias for `[]u8`.
-- Helpers include equality (`string_equal`), substring operations, and indexing.
-
-### Console I/O (`std.io.console`)
-
-- Provides `print` and `error` formatted output functions. The format syntax mirrors a small subset of C’s `printf` (e.g., `%s`, `%d`, `%u`, `%f`).
-- Implementations ultimately delegate to platform-specific write syscalls.
-
-### Memory (`std.system.memory`)
-
-- Thin wrappers around OS allocation primitives (`allocate`, `reallocate`, `deallocate`). Behaviour is platform-specific with Linux using `mmap/munmap`.
-- Reallocation semantics mirror `realloc`: allocate new space, copy existing bytes up to the lesser of old/new size, free the old block.
-
-Standard library modules are not special-cased by the compiler; they are ordinary Mach code built against these conventions.
-
----
-
 ## Design notes and future direction
 
 - **Self-hosted compiler.** This repository (`mach`) will house the future compiler written in Mach. The language surface defined here must remain valid even when the implementation changes.
-- **Generics and traits.** Generics are a brand new feature and will require syntax and semantic updates. Traits (interfaces) are not yet designed and are not part of the initial language.
+- **Generics.** Basic generic support is now implemented for types and functions. Future work includes constraints, trait bounds, and specialization.
+- **Traits.** Traits (interfaces) are not yet designed and are not part of the current language.
 - **Pattern matching and higher-level flow control.** The initial language sticks to `if`, `for`, and direct expressions. Additional constructs will require updates to this document and the semantic checker.
 - **Memory safety.** Mach deliberately leaves safety to the programmer. Libraries may offer safe wrappers, but the core language keeps pointer manipulation unrestricted.
-- **Toolchain evolution.** While `mach-c` is the current compiler, this spec avoids referencing implementation details wherever possible. When the self-hosted version diverges, the spec should be updated to reflect intentional design choices, not incidental behaviour.
+- **Toolchain evolution.** While `cmach` (the bootstrap C compiler) is the current compiler, this spec avoids referencing implementation details wherever possible. When the self-hosted version diverges, the spec should be updated to reflect intentional design choices, not incidental behaviour.

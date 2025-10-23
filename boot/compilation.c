@@ -98,7 +98,7 @@ static char *build_module_artifact_path(const char *base_dir, const char *module
     // convert module name to path: dots become slashes
     for (size_t i = 0; i < module_len; i++)
     {
-        char c = module_name[i];
+        char c      = module_name[i];
         path[pos++] = (c == '.') ? '/' : c;
     }
 
@@ -622,7 +622,8 @@ bool compilation_compile_dependencies(CompilationContext *ctx)
     }
     fs_ensure_dir_recursive(dep_out_dir);
 
-    if (!module_manager_compile_dependencies(&ctx->driver->module_manager, dep_out_dir, ctx->options->opt_level, ctx->options->no_pie, ctx->options->debug_info, ctx->options->emit_asm, ctx->options->emit_ir, ctx->options->emit_ast, &ctx->driver->spec_cache))
+    if (!module_manager_compile_dependencies(
+            &ctx->driver->module_manager, dep_out_dir, ctx->options->opt_level, ctx->options->no_pie, ctx->options->debug_info, ctx->options->emit_asm, ctx->options->emit_ir, ctx->options->emit_ast, &ctx->driver->spec_cache))
     {
         fprintf(stderr, "error: failed to compile dependencies\n");
         return false;

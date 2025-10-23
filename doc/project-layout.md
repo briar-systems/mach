@@ -1,89 +1,235 @@
-# Project layout
+# Project Layout
 
-A Mach project is defined by a manifest (`mach.toml`), a source tree, and a build pipeline that drives the compiler. This document explains how those pieces fit together using this repository as the template.
+This document defines the standard layout for Mach projects, including the project manifest (`mach.toml`), directory structure conventions, and how modules are organized and referenced.
 
-## Directory structure
+It is meant to serve as a "best practices" guide for Mach projects to ensure consistency and compatibility with tooling. It is not strictly enforced; projects may deviate as needed, but following these conventions will improve developer experience and tool support.
+
+---
+
+## Table of Contents
+
+- [Project Layout](#project-layout)
+  - [Table of Contents](#table-of-contents)
+  - [Standard Directory Structure](#standard-directory-structure)
+  - [Project Manifest (`mach.toml`)](#project-manifest-machtoml)
+    - [Basic structure](#basic-structure)
+    - [`[project]` section](#project-section)
+    - [`[directories]` section](#directories-section)
+    - [`[deps]` section](#deps-section)
+  - [Build Organization](#build-organization)
+    - [Build artifacts](#build-artifacts)
+  - [Dependencies](#dependencies)
+    - [Local dependency example](#local-dependency-example)
+    - [Standard library](#standard-library)
+  - [Entry points](#entry-points)
+
+---
+
+## Standard Directory Structure
+
+A typical Mach project follows this layout:
 
 ```
-mach/
-├── Makefile          # reference build for the sample CLI
-├── mach.toml         # project manifest consumed by cmach
-├── src/
-│   ├── main.mach     # program entry point (calls commands_dispatch)
-│   └── commands.mach # command-line handling and option parsing
-└── doc/              # language spec + project guides (this directory)
+my-project/
+├── dep/               # external dependencies (optional)
+│   └── some-lib/
+├── doc/               # documentation (optional)
+├── out/               # build artifacts (generated)
+│   ├── obj/           # object files
+│   └── bin/           # executables
+├── src/               # source files
+│   ├── main.mach      # entry point
+│   └── ...            # other source files specific to the project
+├── mach.toml          # project manifest
+└── Makefile           # build system (optional)
 ```
 
-Future self-hosted compiler sources will live alongside these files.
+**Directory conventions:**
 
-## `mach.toml`
+- **`src/`** – Primary source directory. Contains `.mach` files for your project.
+- **`dep/`** – External dependencies. Each dependency is a subdirectory containing its own Mach source.
+- **`doc/`** – Project documentation.
+- **`out/`** – Generated build artifacts. Should be excluded from version control.
+
+**Minimal project:**
+
+At minimum, a Mach project needs:
+- `mach.toml` – project configuration
+- `src/` – at least one `.mach` file with an entry point
+
+---
+
+## Project Manifest (`mach.toml`)
+
+Every Mach project requires a `mach.toml` file at the root. This TOML file configures the project, specifies directories, and declares dependencies.
+
+> NOTE: The mach project file is technically NOT required to build simple projects, as the compiler can be invoked with explicit flags. However, using `mach.toml` simplifies builds by providing defaults and reducing command-line complexity.
+
+### Basic structure
 
 ```toml
 [project]
-name = "mach"
-version = "0.0.1"
+name = "my_project"
+version = "0.1.0"
 entrypoint = "main.mach"
 
 [directories]
-src-dir = "src"
-dep-dir = "dep"
-out-dir = "out"
+src = "src"
+out = "out"
 
 [deps]
-std = { path = "../mach-std", src = "src" }
-
-[modules]
-std = "std"
+# dependency declarations
 ```
 
-- `project` – identifies the build artefact and entry point (relative to `src-dir`).
-- `directories` – controls where sources, dependencies, and build outputs live.
-- `deps` – maps dependency names (`std`) to filesystem locations. Each entry points at a repository and the subdirectory that contains `.mach` files.
-- `modules` – maps import prefixes to dependency entries. With `std = "std"`, `use std.io.console;` resolves into the dependency declared above.
+### `[project]` section
 
-## Makefile pipeline
+Identifies the project and its entry point:
 
-The `Makefile` keeps the build reproducible:
+- **`name`** (required) – Project name. Used for build artifacts and identification.
+- **`version`** (required) – Semantic version string (e.g., `"0.1.0"`).
+- **`entrypoint`** (required) – Main source file relative to the `src` directory. Must contain the program's entry point.
 
-1. **Compile:**
-   ```make
-   $(CMACH) build src/main.mach --emit-obj --no-link -o out/obj/main.o
-   ```
-   `CMACH` defaults to `../mach-c/bin/cmach`. The manifest is auto-detected, so module paths defined in `mach.toml` are available during compilation.
+**Example:**
+```toml
+[project]
+name = "http-server"
+version = "1.2.3"
+entrypoint = "main.mach"
+```
 
-2. **Link:**
-   ```make
-   cc -nostartfiles -nostdlib -no-pie -o out/bin/mach $(OBJ_FILES) ../mach-std/out/lib/libmachstd.a
-   ```
-   The sample app links directly against the static standard library. Projects can add additional objects or libraries as needed.
+### `[directories]` section
 
-3. **Run / Clean:** `make run` executes `out/bin/mach`; `make clean` removes the `out/` tree.
+Specifies project directory layout:
 
-Adapt this flow for multi-file applications by adding more compilation rules that target `out/obj/*.o` and extending the link step.
+- **`src`** (optional, default: `"src"`) – Source directory containing `.mach` files.
+- **`out`** (optional, default: `"out"`) – Output directory for build artifacts.
 
-## Module usage
+**Example:**
+```toml
+[directories]
+src = "source"
+out = "build"
+```
 
-Within `src/commands.mach` you can see typical imports:
+### `[deps]` section
+
+Maps dependency names to their locations. Dependencies are effectively mappings for module resolution.
+
+**Simple local dependency:**
+```toml
+[deps]
+std = "std"              # points to ./std/
+mylib = "dep/mylib/src"  # points to ./dep/mylib/src
+```
+
+Dependencies must point to mach SOURCE directories, not project roots.
+
+> NOTE: This is likely to change in the future to support more complex dependency specifications.
+
+---
+
+## Build Organization
+
+### Build artifacts
+
+The compiler generates several types of artifacts in the `out/` directory:
+
+```
+out/
+├── obj/               # compiled object files (.o)
+├── asm/               # assembly listings (with --emit-asm)
+├── ast/               # AST dumps (with --emit-ast)
+├── ir/                # LLVM IR (with --emit-ir)
+└── bin/               # final executables or libraries
+    └── my_project
+```
+
+**Exclude from version control:**
+
+Add to `.gitignore`:
+```
+out/
+*.o
+*.a
+```
+
+---
+
+## Dependencies
+
+### Local dependency example
+
+Place dependencies in the `dep/` directory:
+
+```
+my-project/
+├── mach.toml
+├── src/
+│   └── main.mach
+└── dep/
+    ├── json-parser/
+    │   ├── parser.mach
+    │   └── types.mach
+    └── http-client/
+        └── client.mach
+```
+
+Configure in `mach.toml`:
+```toml
+[deps]
+json = "dep/json-parser"
+http = "dep/http-client"
+```
+
+Import in code:
+```mach
+use json.parser;
+use http.client;
+```
+
+### Standard library
+
+The Mach standard library is typically a dependency:
+
+```toml
+[deps]
+std = "path/to/std"
+```
+
+Common imports:
+```mach
+use std.types.string;        # string utilities
+use std.types.list;          # dynamic arrays (List<T>)
+use std.types.option;        # optional values (Option<T>)
+use std.types.result;        # result type (Result<T, E>)
+use std.io.console;          # console i/o
+use std.io.fs;               # file system
+use std.system.memory;       # memory allocation
+use std.system.time;         # time utilities
+use std.system.env;          # environment variables
+```
+
+> NOTE: The standard library path will be eventually resolved through environment variables or global configuration rather than hardcoding in each project. This option will still be required, but the syntax and usage may change to support this feature in the future.
+
+---
+
+## Entry points
+
+The entry point must contain a main function:
 
 ```mach
-use std.io.console;
-use std.types.array;
+use std.runtime;
 use std.types.string;
+
+#@symbol("main")
+fun main(args: []string) i64 {
+    # program logic
+    ret 0;
+}
 ```
 
-These work because `mach.toml` maps the prefix `std` to `../mach-std/src`. When you add your own libraries, define new entries under `[deps]` and add corresponding mappings under `[modules]`.
+The `#@symbol("main")` directive removes name mangling for the entry point defined in `std.runtime` in this example. This is a requirement for the runtime included in the standard library to link properly. If you are seeing issues related to undefined references to `main` or lack of a `_start` symbol, ensure this directive is present and the runtime is imported without an alias.
 
-## Dynamic arrays and memory
+---
 
-The codebase relies on the helpers in `std.types.array` to manage growable slices. Keep the naming convention (`array_*`) when adding new helpers so the exported symbols remain stable for the forthcoming self-hosted compiler. Always reassign the result of array helpers:
-
-```mach
-arr = array_append<u8>(arr, value);
-arr = array_free<u8>(arr);
-```
-
-`std.system.memory` exposes low-level allocation (`allocate`, `reallocate`, `deallocate`) if you need custom data structures.
-
-## Updating the layout
-
-As the self-hosted compiler grows, document every new directory or build artifact here. The goal is for contributors to understand the repository at a glance without reading the entire source tree.
+This layout provides a consistent structure for Mach projects, making them easy to understand and maintain. Projects can deviate from this structure when needed, but following these conventions improves tooling compatibility and developer experience.
