@@ -83,7 +83,7 @@ AstNode *parser_parse_stmt_def(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_val(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_var(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public);
-AstNode *parser_parse_stmt_str(Parser *parser, bool is_public);
+AstNode *parser_parse_stmt_rec(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_uni(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_if(Parser *parser);
 AstNode *parser_parse_stmt_for(Parser *parser);
@@ -108,7 +108,7 @@ AstNode *parser_parse_type_name(Parser *parser);
 AstNode *parser_parse_type_ptr(Parser *parser);
 AstNode *parser_parse_type_array(Parser *parser);
 AstNode *parser_parse_type_fun(Parser *parser);
-AstNode *parser_parse_type_str(Parser *parser);
+AstNode *parser_parse_type_rec(Parser *parser);
 AstNode *parser_parse_type_uni(Parser *parser);
 
 // list parsing

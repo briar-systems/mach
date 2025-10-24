@@ -641,16 +641,16 @@ Type *type_resolve(AstNode *type_node, SymbolTable *symbol_table)
         return func_type;
     }
 
-    case AST_TYPE_STR:
+    case AST_TYPE_REC:
     {
-        if (type_node->type_str.name)
+        if (type_node->type_rec.name)
         {
             if (!symbol_table)
             {
                 return NULL;
             }
 
-            Symbol *symbol = symbol_lookup(symbol_table, type_node->type_str.name);
+            Symbol *symbol = symbol_lookup(symbol_table, type_node->type_rec.name);
             if (symbol && symbol->kind == SYMBOL_TYPE)
             {
                 return symbol->type;
@@ -666,11 +666,11 @@ Type *type_resolve(AstNode *type_node, SymbolTable *symbol_table)
         size_t  max_align   = 1;
         size_t  field_count = 0;
 
-        if (type_node->type_str.fields)
+        if (type_node->type_rec.fields)
         {
-            for (int i = 0; i < type_node->type_str.fields->count; i++)
+            for (int i = 0; i < type_node->type_rec.fields->count; i++)
             {
-                AstNode *field_node = type_node->type_str.fields->items[i];
+                AstNode *field_node = type_node->type_rec.fields->items[i];
                 Type    *field_type = type_resolve(field_node->field_stmt.type, symbol_table);
                 if (!field_type)
                 {
@@ -858,7 +858,7 @@ char *type_to_string(Type *type)
         break;
 
     case TYPE_STRUCT:
-        snprintf(result, 256, "str %s", type->name ? type->name : "(anonymous)");
+        snprintf(result, 256, "rec %s", type->name ? type->name : "(anonymous)");
         break;
 
     case TYPE_UNION:

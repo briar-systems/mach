@@ -21,7 +21,7 @@ Mach is a statically typed, compiled systems language with explicit control over
     - [Primitive types](#primitive-types)
     - [Typed pointers](#typed-pointers)
     - [Arrays (slices)](#arrays-slices)
-    - [Structs](#structs)
+    - [Records](#records)
     - [Unions](#unions)
     - [Function types](#function-types)
     - [Type aliases](#type-aliases)
@@ -31,7 +31,7 @@ Mach is a statically typed, compiled systems language with explicit control over
     - [Module imports (`use`)](#module-imports-use)
     - [External bindings (`ext`)](#external-bindings-ext)
     - [Type aliases (`def`)](#type-aliases-def)
-    - [Structs (`str`) and unions (`uni`)](#structs-str-and-unions-uni)
+    - [Records (`rec`) and unions (`uni`)](#records-rec-and-unions-uni)
     - [Variables (`var`) and values (`val`)](#variables-var-and-values-val)
     - [Functions (`fun`)](#functions-fun)
     - [Method syntax](#method-syntax)
@@ -71,7 +71,7 @@ Mach is a statically typed, compiled systems language with explicit control over
 
 - **Explicit control.** Mach performs no implicit heap allocation, lifetime management, or type coercion. Code specifies where data lives and how it is manipulated.
 - **Predictable semantics.** Expressions have a single, well-defined type. Operations fail at compile time if their operand types do not match.
-- **Interoperability with C.** Data layout mirrors C: struct field alignment, pointer sizes (64-bit), and calling conventions align with the platform C ABI.
+- **Interoperability with C.** Data layout mirrors C: record field alignment, pointer sizes (64-bit), and calling conventions align with the platform C ABI.
 - **Small, orthogonal feature set.** Rather than chasing syntactic sugar, Mach supports a minimal collection of statements and expressions that compose well.
 - **Toolability.** The grammar avoids context-sensitive constructs. The compiler is a sequence of simple passes (lex, parse, semantic analysis, codegen).
 
@@ -102,7 +102,7 @@ Mach is a statically typed, compiled systems language with explicit control over
 
 - `asm`: Assembly language inline block.
 - `fun`: Function declaration.
-- `str`: Struct declaration.
+- `rec`: Record declaration.
 - `uni`: Union declaration.
 - `var`: Mutable variable declaration.
 - `val`: Immutable value declaration.
@@ -136,13 +136,13 @@ Operators and punctuation:
 << >>
 == != < <= > >=
 =  ::
-?  @  ->
+?  @
 ( ) [ ] { }
 ,  ;  .  :
 ...
 ```
 
-`::` is used for casts; `?` and `@` handle address-of and dereference; `->` dereferences a pointer then accesses a struct field.
+`::` is used for casts; `?` and `@` handle address-of and dereference.
 
 ---
 
@@ -178,12 +178,12 @@ Mach resolves every expression to a `Type`. The bootstrap compiler caches descri
   2. `[]T{ data_ptr, len_expr }` – slice literal; reuses existing memory. The compiler verifies the pointer matches `*T` and the length is integer-compatible with `u64`.
 - Type aliases that resolve to arrays honour the same literal forms (`Alias{ ... }`).
 
-### Structs
+### Records
 
-Declared with `str` blocks.
+Declared with `rec` blocks.
 
 ```mach
-pub str Vec2 {
+pub rec Vec2 {
     x: f32;
     y: f32;
 }
@@ -191,7 +191,7 @@ pub str Vec2 {
 
 - Fields require trailing semicolons.
 - Layout uses C rules: each field aligned to its natural requirement, total size rounded up to the maximum field alignment.
-- Struct literals use `Type{ field: expression, ... }`. All fields must be initialised, and order does not matter.
+- Record literals use `Type{ field: expression, ... }`. All fields must be initialised, and order does not matter.
 
 ### Unions
 
@@ -229,10 +229,10 @@ val fnPtr: fun(i32, ptr) i32 = main;
 
 Mach supports generic types and functions using angle bracket syntax `<T>`. Generic parameters are resolved at compile time based on usage.
 
-**Generic structs:**
+**Generic records:**
 
 ```mach
-pub str List<T> {
+pub rec List<T> {
     data: *T;
     len:  u64;
     cap:  u64;
@@ -257,7 +257,7 @@ val my_list: List<i32> = list_new<i32>(10).unwrap_ok();
 ```
 
 Generic type parameters can appear in:
-- Struct and union definitions
+- Record and union definitions
 - Function signatures (parameters and return types)
 - Type aliases
 - Method definitions
@@ -272,7 +272,7 @@ Mach programs are a sequence of top-level declarations interspersed with `use` s
 
 ### Visibility (`pub`)
 
-- Prepend `pub` to export a symbol from the current module. Supported for `fun`, `str`, `uni`, `def`, `var`, and `val` declarations.
+- Prepend `pub` to export a symbol from the current module. Supported for `fun`, `rec`, `uni`, `def`, `var`, and `val` declarations.
 - `pub` is illegal inside function bodies.
 
 ### Module imports (`use`)
@@ -305,9 +305,9 @@ def Size: u64;
 
 - Introduces a new type name. Aliases may be public.
 
-### Structs (`str`) and unions (`uni`)
+### Records (`rec`) and unions (`uni`)
 
-Defined as shown in the [Types](#types) section. `pub str`/`pub uni` exports them.
+Defined as shown in the [Types](#types) section. `pub rec`/`pub uni` exports them.
 
 ### Variables (`var`) and values (`val`)
 
@@ -545,7 +545,7 @@ Binary operators:
 
 ### Field access
 
-`expr.field` – `expr` must be a struct or pointer to struct.
+`expr.field` – `expr` must be a record or pointer to record.
 
 ### Function calls
 
@@ -577,10 +577,10 @@ The bootstrap compiler recognises several built-in functions that bypass normal 
 
 | Intrinsic | Description |
 |-----------|-------------|
-| `size_of(type)` | Returns the size (bytes) of the operand’s type as `u64`. Operand is analysed but not evaluated. |
-| `align_of(type)` | Returns the alignment (bytes) of the operand’s type as `u64`. |
-| `offset_of(typeExpr, fieldName)` | Struct type and field identifier. Returns the byte offset of the named field. |
-| `type_of(type)` | Produces a `u64` identifier representing the expression’s type (implementation detail; used for diagnostics/runtime tagging). |
+| `size_of(type)` | Returns the size (bytes) of the operand's type as `u64`. Operand is analysed but not evaluated. |
+| `align_of(type)` | Returns the alignment (bytes) of the operand's type as `u64`. |
+| `offset_of(typeExpr, fieldName)` | Record type and field identifier. Returns the byte offset of the named field. |
+| `type_of(type)` | Produces a `u64` identifier representing the expression's type (implementation detail; used for diagnostics/runtime tagging). |
 | `va_count()` | Inside Mach variadic functions: returns number of variadic arguments supplied at the call site. |
 | `va_arg(index)` | Returns a `ptr` to the variadic argument at `index`. Caller must cast manually. |
 
