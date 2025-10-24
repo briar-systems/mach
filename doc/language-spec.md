@@ -612,29 +612,81 @@ The bootstrap compiler recognises several built-in functions that bypass normal 
 
 ### Project configuration (`mach.toml`)
 
-Projects describe layout and dependency mapping in TOML. Example:
+Projects describe layout, build targets, and dependency mapping in TOML. Every Mach project requires a `mach.toml` file at the root.
+
+**Basic structure:**
 
 ```toml
 [project]
 name = "example"
-version = "0.0.1"
-entrypoint = "main.mach"
+version = "0.1.0"
+src = "src"
+target = "native"  # or "all", or a specific target name
 
-[directories]
-src-dir = "src"
-dep-dir = "dep"
-out-dir = "out"
-
-[deps]
-std = { path = "../mach-std", src = "src" }
-
-[modules]
+[dependencies]
 std = "std"
+
+[targets.linux]
+triple = "x86_64-pc-linux-gnu"
+entrypoint = "main.mach"
+artifacts = "out/example/linux"
+out = "bin/example"
+opt-level = 2
+emit-ast = true
+emit-ir = true
+emit-asm = true
+emit-object = true
+build-library = false
+no-pie = false
 ```
 
-- `deps` entries point at repositories or folders containing Mach modules.
-- `modules` map import prefixes (left) to dependency names (right). `use std.io.console` is resolved through this map to the `mach-std` source tree.
-- The compiler caches compiled modules under `out/` to avoid recompilation.
+**`[project]` section** identifies the project and default build configuration:
+- `name` (required) – Project name.
+- `version` (required) – Semantic version (e.g., `"0.1.0"`).
+- `src` (required) – Source directory containing `.mach` files (default: `"src"`).
+- `target` (required) – Default target: `"native"` (host platform), `"all"` (all defined targets), or a specific target name.
+
+**`[targets.<name>]` sections** define per-platform build configurations:
+- `triple` (required) – LLVM target triple (e.g., `"x86_64-pc-linux-gnu"`).
+- `entrypoint` (required) – Main source file relative to `src`.
+- `artifacts` (required) – Directory for intermediate build artifacts (AST, IR, ASM, OBJ).
+- `out` (required) – Final executable or library output path.
+- `opt-level` (required) – Optimization level (0–3).
+- `emit-ast`, `emit-ir`, `emit-asm`, `emit-object` (required) – Control which intermediate files are generated.
+- `build-library` (required) – Build as library instead of executable.
+- `shared` (optional) – Build shared library if `build-library=true`.
+- `no-pie` (optional) – Disable position-independent executable.
+- `link` (optional, repeatable) – External libraries to link. Specify full paths to library files (`.a`, `.so`, `.dylib`, etc.). Can be repeated multiple times to link multiple libraries.
+
+**Example with external libraries:**
+```toml
+[targets.linux]
+triple = "x86_64-pc-linux-gnu"
+entrypoint = "main.mach"
+artifacts = "out/app/linux"
+out = "bin/app"
+opt-level = 2
+emit-ast = false
+emit-ir = false
+emit-asm = false
+emit-object = true
+build-library = false
+no-pie = false
+link = "/usr/lib/x86_64-linux-gnu/libm.so.6"
+link = "/usr/local/lib/libglfw.so"
+link = "dep/custom/libutil.a"
+```
+
+**`[dependencies]` section** maps dependency names to their source locations:
+```toml
+[dependencies]
+std = "std"              # points to ./std/
+mylib = "dep/mylib/src"  # points to ./dep/mylib/src
+```
+- Dependencies must point to Mach source directories, not project roots.
+- Import paths like `use std.io.console` are resolved via these mappings.
+
+The compiler caches compiled modules under the `artifacts` directory to avoid recompilation.
 
 ---
 

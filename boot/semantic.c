@@ -3364,8 +3364,23 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
                         addr_of->token           = NULL; // don't share token to avoid double-free
                         addr_of->unary_expr.op   = TOKEN_QUESTION;
                         addr_of->unary_expr.expr = receiver;
-                        addr_of->type            = type_pointer_create(receiver_type);
-                        receiver_arg             = addr_of;
+                        // Don't set type here - let analyze_expr compute it
+                        receiver_arg = addr_of;
+                    }
+                }
+                else if (first_param_type && first_param_type->kind != TYPE_POINTER)
+                {
+                    // method expects value receiver, but we have pointer type
+                    if (receiver_type->kind == TYPE_POINTER)
+                    {
+                        // create dereference operation
+                        AstNode *deref = malloc(sizeof(AstNode));
+                        ast_node_init(deref, AST_EXPR_UNARY);
+                        deref->token           = NULL; // don't share token to avoid double-free
+                        deref->unary_expr.op   = TOKEN_AT;
+                        deref->unary_expr.expr = receiver;
+                        // Don't set type here - let analyze_expr compute it
+                        receiver_arg = deref;
                     }
                 }
             }
