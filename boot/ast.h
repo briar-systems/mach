@@ -22,7 +22,7 @@ typedef enum AstKind
     AST_STMT_FUN,
     AST_STMT_FIELD,
     AST_STMT_PARAM,
-    AST_STMT_STR,
+    AST_STMT_REC,
     AST_STMT_UNI,
     AST_STMT_IF,
     AST_STMT_OR,
@@ -54,7 +54,7 @@ typedef enum AstKind
     AST_TYPE_ARRAY,
     AST_TYPE_PARAM,
     AST_TYPE_FUN,
-    AST_TYPE_STR,
+    AST_TYPE_REC,
     AST_TYPE_UNI,
 } AstKind;
 
@@ -143,14 +143,14 @@ struct AstNode
             AstNode *method_receiver; // typename before '.' for method declarations
         } fun_stmt;
 
-        // struct statement
+        // record statement
         struct
         {
             char    *name;
             AstList *generics;
             AstList *fields;
             bool     is_public;
-        } str_stmt;
+        } rec_stmt;
 
         // union statement
         struct
@@ -338,7 +338,7 @@ struct AstNode
         {
             char    *name; // can be null for anonymous
             AstList *fields;
-        } type_str;
+        } type_rec;
 
         struct
         {

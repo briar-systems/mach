@@ -111,17 +111,17 @@ void ast_node_dnit(AstNode *node)
         }
         break;
 
-    case AST_STMT_STR:
-        free(node->str_stmt.name);
-        if (node->str_stmt.generics)
+    case AST_STMT_REC:
+        free(node->rec_stmt.name);
+        if (node->rec_stmt.generics)
         {
-            ast_list_dnit(node->str_stmt.generics);
-            free(node->str_stmt.generics);
+            ast_list_dnit(node->rec_stmt.generics);
+            free(node->rec_stmt.generics);
         }
-        if (node->str_stmt.fields)
+        if (node->rec_stmt.fields)
         {
-            ast_list_dnit(node->str_stmt.fields);
-            free(node->str_stmt.fields);
+            ast_list_dnit(node->rec_stmt.fields);
+            free(node->rec_stmt.fields);
         }
         break;
 
@@ -400,12 +400,12 @@ void ast_node_dnit(AstNode *node)
         }
         break;
 
-    case AST_TYPE_STR:
-        free(node->type_str.name);
-        if (node->type_str.fields)
+    case AST_TYPE_REC:
+        free(node->type_rec.name);
+        if (node->type_rec.fields)
         {
-            ast_list_dnit(node->type_str.fields);
-            free(node->type_str.fields);
+            ast_list_dnit(node->type_rec.fields);
+            free(node->type_rec.fields);
         }
         break;
 
@@ -590,11 +590,11 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->fun_stmt.method_receiver = ast_clone_checked(node->fun_stmt.method_receiver);
         break;
 
-    case AST_STMT_STR:
-        clone->str_stmt.name      = ast_strdup(node->str_stmt.name);
-        clone->str_stmt.generics  = ast_list_clone(node->str_stmt.generics);
-        clone->str_stmt.fields    = ast_list_clone(node->str_stmt.fields);
-        clone->str_stmt.is_public = node->str_stmt.is_public;
+    case AST_STMT_REC:
+        clone->rec_stmt.name      = ast_strdup(node->rec_stmt.name);
+        clone->rec_stmt.generics  = ast_list_clone(node->rec_stmt.generics);
+        clone->rec_stmt.fields    = ast_list_clone(node->rec_stmt.fields);
+        clone->rec_stmt.is_public = node->rec_stmt.is_public;
         break;
 
     case AST_STMT_UNI:
@@ -748,9 +748,9 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->type_fun.is_variadic = node->type_fun.is_variadic;
         break;
 
-    case AST_TYPE_STR:
-        clone->type_str.name   = ast_strdup(node->type_str.name);
-        clone->type_str.fields = ast_list_clone(node->type_str.fields);
+    case AST_TYPE_REC:
+        clone->type_rec.name   = ast_strdup(node->type_rec.name);
+        clone->type_rec.fields = ast_list_clone(node->type_rec.fields);
         break;
 
     case AST_TYPE_UNI:
@@ -887,11 +887,11 @@ void ast_print(AstNode *node, int indent)
         }
         break;
 
-    case AST_STMT_STR:
-        printf("STR %s\n", node->str_stmt.name);
-        for (int i = 0; i < node->str_stmt.fields->count; i++)
+    case AST_STMT_REC:
+        printf("REC %s\n", node->rec_stmt.name);
+        for (int i = 0; i < node->rec_stmt.fields->count; i++)
         {
-            ast_print(node->str_stmt.fields->items[i], indent + 1);
+            ast_print(node->rec_stmt.fields->items[i], indent + 1);
         }
         break;
     case AST_STMT_ASM:
@@ -1147,16 +1147,16 @@ void ast_print(AstNode *node, int indent)
         }
         break;
 
-    case AST_TYPE_STR:
-        printf("TYPE_STR");
-        if (node->type_str.name)
+    case AST_TYPE_REC:
+        printf("TYPE_REC");
+        if (node->type_rec.name)
         {
-            printf(" %s", node->type_str.name);
+            printf(" %s", node->type_rec.name);
         }
         printf("\n");
-        for (int i = 0; i < node->type_str.fields->count; i++)
+        for (int i = 0; i < node->type_rec.fields->count; i++)
         {
-            ast_print(node->type_str.fields->items[i], indent + 1);
+            ast_print(node->type_rec.fields->items[i], indent + 1);
         }
         break;
 
@@ -1195,8 +1195,8 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "VAR";
     case AST_STMT_FUN:
         return "FUN";
-    case AST_STMT_STR:
-        return "STR";
+    case AST_STMT_REC:
+        return "REC";
     case AST_STMT_UNI:
         return "UNI";
     case AST_STMT_FIELD:
@@ -1257,8 +1257,8 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "TYPE_PARAM";
     case AST_TYPE_FUN:
         return "TYPE_FUN";
-    case AST_TYPE_STR:
-        return "TYPE_STR";
+    case AST_TYPE_REC:
+        return "TYPE_REC";
     case AST_TYPE_UNI:
         return "TYPE_UNI";
 
@@ -1386,11 +1386,11 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
             ast_print_to_file(node->fun_stmt.body, file, indent + 2);
         }
         break;
-    case AST_STMT_STR:
-        fprintf(file, "STR %s\n", node->str_stmt.name);
-        for (int i = 0; i < node->str_stmt.fields->count; i++)
+    case AST_STMT_REC:
+        fprintf(file, "REC %s\n", node->rec_stmt.name);
+        for (int i = 0; i < node->rec_stmt.fields->count; i++)
         {
-            ast_print_to_file(node->str_stmt.fields->items[i], file, indent + 1);
+            ast_print_to_file(node->rec_stmt.fields->items[i], file, indent + 1);
         }
         break;
     case AST_STMT_UNI:
@@ -1618,16 +1618,16 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
             ast_print_to_file(node->type_fun.return_type, file, indent + 2);
         }
         break;
-    case AST_TYPE_STR:
-        fprintf(file, "TYPE_STR");
-        if (node->type_str.name)
+    case AST_TYPE_REC:
+        fprintf(file, "TYPE_REC");
+        if (node->type_rec.name)
         {
-            fprintf(file, " %s", node->type_str.name);
+            fprintf(file, " %s", node->type_rec.name);
         }
         fprintf(file, "\n");
-        for (int i = 0; i < node->type_str.fields->count; i++)
+        for (int i = 0; i < node->type_rec.fields->count; i++)
         {
-            ast_print_to_file(node->type_str.fields->items[i], file, indent + 1);
+            ast_print_to_file(node->type_rec.fields->items[i], file, indent + 1);
         }
         break;
     case AST_TYPE_UNI:
