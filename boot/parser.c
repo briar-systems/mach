@@ -602,7 +602,7 @@ void parser_synchronize(Parser *parser)
         case TOKEN_KW_USE:
         case TOKEN_KW_EXT:
         case TOKEN_KW_DEF:
-        case TOKEN_KW_STR:
+        case TOKEN_KW_REC:
         case TOKEN_KW_UNI:
         case TOKEN_KW_VAL:
         case TOKEN_KW_VAR:
@@ -1095,8 +1095,8 @@ AstNode *parser_parse_stmt_top(Parser *parser)
     case TOKEN_KW_FUN:
         result = parser_parse_stmt_fun(parser, is_public);
         break;
-    case TOKEN_KW_STR:
-        result = parser_parse_stmt_str(parser, is_public);
+    case TOKEN_KW_REC:
+        result = parser_parse_stmt_rec(parser, is_public);
         break;
     case TOKEN_KW_UNI:
         result = parser_parse_stmt_uni(parser, is_public);
@@ -1664,34 +1664,34 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
     return node;
 }
 
-AstNode *parser_parse_stmt_str(Parser *parser, bool is_public)
+AstNode *parser_parse_stmt_rec(Parser *parser, bool is_public)
 {
-    if (!parser_consume(parser, TOKEN_KW_STR, "expected 'str' keyword"))
+    if (!parser_consume(parser, TOKEN_KW_REC, "expected 'rec' keyword"))
     {
         return NULL;
     }
 
-    AstNode *node = parser_alloc_node(parser, AST_STMT_STR, parser->previous);
+    AstNode *node = parser_alloc_node(parser, AST_STMT_REC, parser->previous);
     if (!node)
     {
         return NULL;
     }
 
-    node->str_stmt.name = parser_parse_identifier(parser);
-    if (!node->str_stmt.name)
+    node->rec_stmt.name = parser_parse_identifier(parser);
+    if (!node->rec_stmt.name)
     {
-        parser_error_at_current(parser, "expected identifier after 'str'");
+        parser_error_at_current(parser, "expected identifier after 'rec'");
         ast_node_dnit(node);
         free(node);
         return NULL;
     }
 
     // parse optional generic parameters
-    node->str_stmt.generics = NULL;
+    node->rec_stmt.generics = NULL;
     if (parser_match(parser, TOKEN_LESS))
     {
-        node->str_stmt.generics = parser_parse_generic_param_list(parser);
-        if (!node->str_stmt.generics)
+        node->rec_stmt.generics = parser_parse_generic_param_list(parser);
+        if (!node->rec_stmt.generics)
         {
             ast_node_dnit(node);
             free(node);
@@ -1699,29 +1699,29 @@ AstNode *parser_parse_stmt_str(Parser *parser, bool is_public)
         }
     }
 
-    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' after struct name"))
+    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' after record name"))
     {
         ast_node_dnit(node);
         free(node);
         return NULL;
     }
 
-    node->str_stmt.fields = parser_parse_field_list(parser);
-    if (!node->str_stmt.fields)
+    node->rec_stmt.fields = parser_parse_field_list(parser);
+    if (!node->rec_stmt.fields)
     {
         ast_node_dnit(node);
         free(node);
         return NULL;
     }
 
-    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after struct fields"))
+    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after record fields"))
     {
         ast_node_dnit(node);
         free(node);
         return NULL;
     }
 
-    node->str_stmt.is_public = is_public;
+    node->rec_stmt.is_public = is_public;
 
     return node;
 }
@@ -2582,7 +2582,7 @@ AstNode *parser_parse_expr_atom(Parser *parser)
         return pack;
     }
 
-    case TOKEN_KW_STR:
+    case TOKEN_KW_REC:
         parser_advance(parser);
         return parser_parse_anonymous_composite_literal(parser, false);
 
@@ -2600,7 +2600,7 @@ AstNode *parser_parse_expr_atom(Parser *parser)
         ident->ident_expr.name = lexer_raw_value(parser->lexer, parser->current);
         parser_advance(parser);
 
-        // check for literal (could be array or struct)
+        // check for literal (could be array or record)
         if (parser_check(parser, TOKEN_L_BRACE))
         {
             AstNode *type = parser_alloc_node(parser, AST_TYPE_NAME, ident->token);
@@ -2716,7 +2716,7 @@ AstNode *parser_parse_array_literal(Parser *parser)
 
 AstNode *parser_parse_struct_literal(Parser *parser, AstNode *type)
 {
-    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' to start struct literal"))
+    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' to start record literal"))
     {
         ast_node_dnit(type);
         free(type);
@@ -2788,7 +2788,7 @@ AstNode *parser_parse_struct_literal(Parser *parser, AstNode *type)
         } while (parser_match(parser, TOKEN_COMMA));
     }
 
-    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after struct fields"))
+    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after record fields"))
     {
         ast_node_dnit(struct_lit);
         free(struct_lit);
@@ -2807,9 +2807,9 @@ AstNode *parser_parse_type(Parser *parser)
         parser_advance(parser);
         return parser_parse_type_fun(parser);
 
-    case TOKEN_KW_STR:
+    case TOKEN_KW_REC:
         parser_advance(parser);
-        return parser_parse_type_str(parser);
+        return parser_parse_type_rec(parser);
 
     case TOKEN_KW_UNI:
         parser_advance(parser);
@@ -2999,44 +2999,44 @@ AstNode *parser_parse_type_fun(Parser *parser)
     return fun;
 }
 
-AstNode *parser_parse_type_str(Parser *parser)
+AstNode *parser_parse_type_rec(Parser *parser)
 {
-    AstNode *str = parser_alloc_node(parser, AST_TYPE_STR, parser->previous);
-    if (!str)
+    AstNode *rec = parser_alloc_node(parser, AST_TYPE_REC, parser->previous);
+    if (!rec)
     {
         return NULL;
     }
 
     if (parser_check(parser, TOKEN_IDENTIFIER))
     {
-        str->type_str.name = parser_parse_identifier(parser);
+        rec->type_rec.name = parser_parse_identifier(parser);
     }
     else if (parser_check(parser, TOKEN_L_BRACE))
     {
         parser_advance(parser);
-        str->type_str.fields = parser_parse_field_list(parser);
-        if (!str->type_str.fields)
+        rec->type_rec.fields = parser_parse_field_list(parser);
+        if (!rec->type_rec.fields)
         {
-            ast_node_dnit(str);
-            free(str);
+            ast_node_dnit(rec);
+            free(rec);
             return NULL;
         }
-        if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after struct fields"))
+        if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after record fields"))
         {
-            ast_node_dnit(str);
-            free(str);
+            ast_node_dnit(rec);
+            free(rec);
             return NULL;
         }
     }
     else
     {
-        parser_error_at_current(parser, "expected struct name or anonymous struct definition");
-        ast_node_dnit(str);
-        free(str);
+        parser_error_at_current(parser, "expected record name or anonymous record definition");
+        ast_node_dnit(rec);
+        free(rec);
         return NULL;
     }
 
-    return str;
+    return rec;
 }
 
 AstNode *parser_parse_type_uni(Parser *parser)

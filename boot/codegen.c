@@ -1208,9 +1208,9 @@ LLVMValueRef codegen_stmt(CodegenContext *ctx, AstNode *stmt)
     case AST_STMT_DEF:
         // type definitions don't generate code
         return NULL;
-    case AST_STMT_STR:
+    case AST_STMT_REC:
     case AST_STMT_UNI:
-        // struct/union definitions don't generate code directly
+        // record/union definitions don't generate code directly
         return NULL;
     case AST_STMT_USE:
         return codegen_stmt_use(ctx, stmt);
@@ -1781,7 +1781,7 @@ LLVMValueRef codegen_stmt_if(CodegenContext *ctx, AstNode *stmt)
         }
         else
         {
-            codegen_error(ctx, stmt, "invalid truthiness for condition (struct/union not allowed)");
+            codegen_error(ctx, stmt, "invalid truthiness for condition (record/union not allowed)");
             return NULL;
         }
     }
@@ -1870,7 +1870,7 @@ LLVMValueRef codegen_stmt_for(CodegenContext *ctx, AstNode *stmt)
         }
         else
         {
-            codegen_error(ctx, stmt, "invalid truthiness for loop condition (struct/union not allowed)");
+            codegen_error(ctx, stmt, "invalid truthiness for loop condition (record/union not allowed)");
             return NULL;
         }
 
@@ -2514,7 +2514,7 @@ LLVMValueRef codegen_expr_call(CodegenContext *ctx, AstNode *expr)
 
             if (!found)
             {
-                codegen_error(ctx, expr, "field '%s' not found in struct", field_name);
+                codegen_error(ctx, expr, "field '%s' not found in record", field_name);
                 return NULL;
             }
 
@@ -3706,7 +3706,7 @@ LLVMValueRef codegen_expr_struct(CodegenContext *ctx, AstNode *expr)
 
     if (struct_type->kind != TYPE_STRUCT)
     {
-        codegen_error(ctx, expr, "struct literal has non-struct type");
+        codegen_error(ctx, expr, "record literal has non-record type");
         return NULL;
     }
 

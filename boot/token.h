@@ -20,7 +20,7 @@ typedef enum TokenKind
     TOKEN_KW_EXT, // ext
     TOKEN_KW_DEF, // def
     TOKEN_KW_PUB, // pub
-    TOKEN_KW_STR, // str
+    TOKEN_KW_REC, // rec
     TOKEN_KW_UNI, // uni
     TOKEN_KW_VAL, // val
     TOKEN_KW_VAR, // var
@@ -33,20 +33,6 @@ typedef enum TokenKind
     TOKEN_KW_BRK, // brk
     TOKEN_KW_ASM, // asm
     TOKEN_KW_NIL, // nil
-
-    // type keywords
-    // TOKEN_TYPE_PTR, // untyped pointer
-    // TOKEN_TYPE_I8,  // i8
-    // TOKEN_TYPE_I16, // i16
-    // TOKEN_TYPE_I32, // i32
-    // TOKEN_TYPE_I64, // i64
-    // TOKEN_TYPE_U8,  // u8
-    // TOKEN_TYPE_U16, // u16
-    // TOKEN_TYPE_U32, // u32
-    // TOKEN_TYPE_U64, // u64
-    // TOKEN_TYPE_F16, // f16
-    // TOKEN_TYPE_F32, // f32
-    // TOKEN_TYPE_F64, // f64
 
     // punctuation
     TOKEN_L_PAREN,    // (

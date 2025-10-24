@@ -948,22 +948,22 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
         return func;
     }
 
-    case AST_TYPE_STR:
+    case AST_TYPE_REC:
     {
-        // named struct - look it up
-        if (type_node->type_str.name)
+        // named record - look it up
+        if (type_node->type_rec.name)
         {
-            Symbol *sym = symbol_lookup_scope(ctx->current_scope, type_node->type_str.name);
+            Symbol *sym = symbol_lookup_scope(ctx->current_scope, type_node->type_rec.name);
             if (!sym || sym->kind != SYMBOL_TYPE)
             {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "unknown type '%s'", type_node->type_str.name);
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "unknown type '%s'", type_node->type_rec.name);
                 return NULL;
             }
             type_node->type = sym->type;
             return sym->type;
         }
 
-        // anonymous struct - create inline
+        // anonymous record - create inline
         Type   *struct_type = type_struct_create(NULL);
         Symbol *head        = NULL;
         Symbol *tail        = NULL;
@@ -971,11 +971,11 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
         size_t  max_align   = 1;
         size_t  field_count = 0;
 
-        if (type_node->type_str.fields)
+        if (type_node->type_rec.fields)
         {
-            for (int i = 0; i < type_node->type_str.fields->count; i++)
+            for (int i = 0; i < type_node->type_rec.fields->count; i++)
             {
-                AstNode *field_node = type_node->type_str.fields->items[i];
+                AstNode *field_node = type_node->type_rec.fields->items[i];
                 Type    *field_type = resolve_type_in_context(driver, ctx, field_node->field_stmt.type);
                 if (!field_type)
                 {
@@ -1021,7 +1021,7 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
         }
 
         size_t final_align = max_align ? max_align : 1;
-        offset             = (offset + final_align - 1) / final_align * final_align; // align struct size
+        offset             = (offset + final_align - 1) / final_align * final_align; // align record size
 
         struct_type->size                  = offset;
         struct_type->alignment             = final_align;
@@ -1421,48 +1421,48 @@ static bool declare_def_stmt(SemanticDriver *driver, const AnalysisContext *ctx,
     return true;
 }
 
-// declare struct
-static bool declare_str_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+// declare record
+static bool declare_rec_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
 {
-    const char *name = stmt->str_stmt.name;
+    const char *name = stmt->rec_stmt.name;
 
     // check for redefinition
     Symbol *existing = symbol_lookup_scope(ctx->current_scope, name);
     if (existing)
     {
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "redefinition of struct '%s'", name);
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "redefinition of record '%s'", name);
         return false;
     }
 
-    // create struct type - fields resolved in pass B
+    // create record type - fields resolved in pass B
     Type   *struct_type       = type_struct_create(name);
     Symbol *symbol            = symbol_create(SYMBOL_TYPE, name, struct_type, stmt);
     symbol->type_def.is_alias = false;
-    symbol->is_public         = stmt->str_stmt.is_public;
+    symbol->is_public         = stmt->rec_stmt.is_public;
     symbol->module_name       = ctx->module_name ? strdup(ctx->module_name) : NULL;
     symbol->home_scope        = ctx->current_scope;
 
     // check if generic
-    if (stmt->str_stmt.generics && stmt->str_stmt.generics->count > 0)
+    if (stmt->rec_stmt.generics && stmt->rec_stmt.generics->count > 0)
     {
-        // mark as generic template - actual struct creation happens during instantiation
+        // mark as generic template - actual record creation happens during instantiation
         symbol->type_def.is_generic          = true;
-        symbol->type_def.generic_param_count = stmt->str_stmt.generics->count;
+        symbol->type_def.generic_param_count = stmt->rec_stmt.generics->count;
 
         // store generic parameter names for later instantiation
-        size_t param_count                   = (size_t)stmt->str_stmt.generics->count;
+        size_t param_count                   = (size_t)stmt->rec_stmt.generics->count;
         symbol->type_def.generic_param_names = malloc(sizeof(char *) * param_count);
         if (symbol->type_def.generic_param_names)
         {
             for (size_t i = 0; i < param_count; i++)
             {
-                AstNode    *type_param                  = stmt->str_stmt.generics->items[i];
+                AstNode    *type_param                  = stmt->rec_stmt.generics->items[i];
                 const char *param_name                  = type_param->type_param.name;
                 symbol->type_def.generic_param_names[i] = param_name ? strdup(param_name) : NULL;
             }
         }
 
-        diagnostic_emit(&driver->diagnostics, DIAG_NOTE, stmt, ctx->file_path, "generic struct '%s' registered", name);
+        diagnostic_emit(&driver->diagnostics, DIAG_NOTE, stmt, ctx->file_path, "generic record '%s' registered", name);
     }
     else
     {
@@ -1784,8 +1784,8 @@ static bool analyze_pass_a_declarations(SemanticDriver *driver, const AnalysisCo
                 success = false;
             break;
 
-        case AST_STMT_STR:
-            if (!declare_str_stmt(driver, ctx, stmt))
+        case AST_STMT_REC:
+            if (!declare_rec_stmt(driver, ctx, stmt))
                 success = false;
             break;
 
@@ -1823,7 +1823,7 @@ static bool analyze_pass_a_declarations(SemanticDriver *driver, const AnalysisCo
     return success;
 }
 
-// resolve struct fields
+// resolve record fields
 static bool resolve_str_fields(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
 {
     if (!stmt->symbol || !stmt->symbol->type || stmt->symbol->type->kind != TYPE_STRUCT)
@@ -1831,8 +1831,8 @@ static bool resolve_str_fields(SemanticDriver *driver, const AnalysisContext *ct
 
     Type *struct_type = stmt->symbol->type;
 
-    if (!stmt->str_stmt.fields || stmt->str_stmt.fields->count == 0)
-        return true; // empty struct is valid
+    if (!stmt->rec_stmt.fields || stmt->rec_stmt.fields->count == 0)
+        return true; // empty record is valid
 
     Symbol *field_list_head = NULL;
     Symbol *field_list_tail = NULL;
@@ -1840,9 +1840,9 @@ static bool resolve_str_fields(SemanticDriver *driver, const AnalysisContext *ct
     size_t  offset          = 0;
     size_t  max_alignment   = 1;
 
-    for (int i = 0; i < stmt->str_stmt.fields->count; i++)
+    for (int i = 0; i < stmt->rec_stmt.fields->count; i++)
     {
-        AstNode *field_node = stmt->str_stmt.fields->items[i];
+        AstNode *field_node = stmt->rec_stmt.fields->items[i];
         if (field_node->kind != AST_STMT_FIELD)
             continue;
 
@@ -1888,7 +1888,7 @@ static bool resolve_str_fields(SemanticDriver *driver, const AnalysisContext *ct
         field_node->type   = field_type;
     }
 
-    // align final struct size
+    // align final record size
     if (max_alignment > 0)
     {
         size_t remainder = offset % max_alignment;
@@ -2130,12 +2130,12 @@ static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisCont
         }
     }
 
-    // resolve struct fields
+    // resolve record fields
     for (int i = 0; i < root->program.stmts->count; i++)
     {
         AstNode *stmt = root->program.stmts->items[i];
 
-        if (stmt->kind == AST_STMT_STR && stmt->symbol && !stmt->symbol->type_def.is_generic)
+        if (stmt->kind == AST_STMT_REC && stmt->symbol && !stmt->symbol->type_def.is_generic)
         {
             if (!resolve_str_fields(driver, ctx, stmt))
                 success = false;
@@ -2189,7 +2189,7 @@ static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisCont
     return success;
 }
 
-// instantiate generic struct
+// instantiate generic record
 static Symbol *instantiate_generic_struct(SemanticDriver *driver, const AnalysisContext *ctx, Symbol *generic_sym, Type **type_args, size_t arg_count)
 {
     if (!generic_sym || !generic_sym->decl || arg_count == 0)
@@ -2209,7 +2209,7 @@ static Symbol *instantiate_generic_struct(SemanticDriver *driver, const Analysis
     if (!specialized_name)
         return NULL;
 
-    // create specialized struct type
+    // create specialized record type
     Type   *specialized_type             = type_struct_create(specialized_name);
     Symbol *specialized_sym              = symbol_create(SYMBOL_TYPE, specialized_name, specialized_type, generic_sym->decl);
     specialized_sym->type_def.is_alias   = false;
@@ -2231,16 +2231,16 @@ static Symbol *instantiate_generic_struct(SemanticDriver *driver, const Analysis
     AstNode          *generic_decl = generic_sym->decl;
     GenericBindingCtx bindings     = ctx->bindings;
 
-    if (generic_decl->kind == AST_STMT_STR && generic_decl->str_stmt.generics)
+    if (generic_decl->kind == AST_STMT_REC && generic_decl->rec_stmt.generics)
     {
-        for (size_t i = 0; i < arg_count && i < (size_t)generic_decl->str_stmt.generics->count; i++)
+        for (size_t i = 0; i < arg_count && i < (size_t)generic_decl->rec_stmt.generics->count; i++)
         {
-            AstNode    *param      = generic_decl->str_stmt.generics->items[i];
+            AstNode    *param      = generic_decl->rec_stmt.generics->items[i];
             const char *param_name = param->type_param.name;
             bindings               = generic_binding_ctx_push(&bindings, param_name, type_args[i]);
         }
     }
-    else if (generic_decl->kind == AST_STMT_STR && generic_sym->type_def.generic_param_names)
+    else if (generic_decl->kind == AST_STMT_REC && generic_sym->type_def.generic_param_names)
     {
         // fallback: use stored generic parameter names from symbol
         for (size_t i = 0; i < arg_count && i < generic_sym->type_def.generic_param_count; i++)
@@ -2249,16 +2249,16 @@ static Symbol *instantiate_generic_struct(SemanticDriver *driver, const Analysis
             bindings               = generic_binding_ctx_push(&bindings, param_name, type_args[i]);
         }
     }
-    else if (generic_decl->kind == AST_STMT_STR)
+    else if (generic_decl->kind == AST_STMT_REC)
     {
         // debug: neither source worked
         diagnostic_emit(&driver->diagnostics,
                         DIAG_ERROR,
                         NULL,
                         ctx->file_path,
-                        "internal error: generic struct '%s' has no parameter names (generics=%p, param_names=%p, count=%zu)",
+                        "internal error: generic record '%s' has no parameter names (generics=%p, param_names=%p, count=%zu)",
                         generic_sym->name,
-                        (void *)generic_decl->str_stmt.generics,
+                        (void *)generic_decl->rec_stmt.generics,
                         (void *)generic_sym->type_def.generic_param_names,
                         generic_sym->type_def.generic_param_count);
     }
@@ -2298,7 +2298,7 @@ static Symbol *instantiate_generic_struct(SemanticDriver *driver, const Analysis
 found_module:;
 
     // resolve fields with specialized context
-    if (generic_decl->str_stmt.fields)
+    if (generic_decl->rec_stmt.fields)
     {
         Symbol *field_head  = NULL;
         Symbol *field_tail  = NULL;
@@ -2306,9 +2306,9 @@ found_module:;
         size_t  max_align   = 1;
         size_t  field_count = 0;
 
-        for (int i = 0; i < generic_decl->str_stmt.fields->count; i++)
+        for (int i = 0; i < generic_decl->rec_stmt.fields->count; i++)
         {
-            AstNode *field_node = generic_decl->str_stmt.fields->items[i];
+            AstNode *field_node = generic_decl->rec_stmt.fields->items[i];
             Type    *field_type = resolve_type_in_context(driver, &specialized_ctx, field_node->field_stmt.type);
 
             if (!field_type)
@@ -3871,14 +3871,14 @@ static Type *analyze_cast_expr(SemanticDriver *driver, const AnalysisContext *ct
 
 static Type *analyze_struct_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
 {
-    // resolve struct/union type
+    // resolve record/union type
     Type *struct_type = NULL;
     if (expr->struct_expr.type)
     {
         struct_type = resolve_type_in_context(driver, ctx, expr->struct_expr.type);
         if (!struct_type)
         {
-            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "cannot resolve type in struct literal");
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "cannot resolve type in record literal");
             return NULL;
         }
     }
@@ -3890,7 +3890,7 @@ static Type *analyze_struct_expr(SemanticDriver *driver, const AnalysisContext *
     else
     {
         // Type inference not yet implemented - for now require explicit type
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "struct literal requires explicit type (type inference not yet implemented)");
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "record literal requires explicit type (type inference not yet implemented)");
         return NULL;
     }
 
@@ -3907,7 +3907,7 @@ static Type *analyze_struct_expr(SemanticDriver *driver, const AnalysisContext *
     }
 
     // analyze field initializers
-    // Look up field types from the struct/union and use them for type inference
+    // Look up field types from the record/union and use them for type inference
     if (expr->struct_expr.fields && resolved_type->kind == TYPE_STRUCT)
     {
         for (int i = 0; i < expr->struct_expr.fields->count; i++)
@@ -3918,7 +3918,7 @@ static Type *analyze_struct_expr(SemanticDriver *driver, const AnalysisContext *
                 const char *field_name = field_init->field_expr.field;
                 AstNode    *value_expr = field_init->field_expr.object;
 
-                // find field in struct type
+                // find field in record type
                 Symbol *field_sym  = resolved_type->composite.fields;
                 Type   *field_type = NULL;
                 while (field_sym)
@@ -3931,7 +3931,7 @@ static Type *analyze_struct_expr(SemanticDriver *driver, const AnalysisContext *
                     field_sym = field_sym->next;
                 }
 
-                // if value is also a struct literal without type, inject the field's type
+                // if value is also a record literal without type, inject the field's type
                 Type *value_type = analyze_expr_with_hint(driver, ctx, value_expr, field_type);
                 if (!value_type)
                     return NULL;
