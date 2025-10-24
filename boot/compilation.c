@@ -350,26 +350,38 @@ bool compilation_codegen(CompilationContext *ctx)
 
 bool compilation_emit_artifacts(CompilationContext *ctx)
 {
-    const char *config_target_name = NULL;
-    if (ctx->config)
-    {
-        TargetConfig *def_target = config_get_default_target(ctx->config);
-        if (def_target)
-            config_target_name = def_target->name;
-    }
+    const char *config_target_name = ctx->options->target_name;
 
+    // Determine emit flags (config overrides or CLI overrides)
     int emit_ast = ctx->options->emit_ast;
     int emit_ir  = ctx->options->emit_ir;
     int emit_asm = ctx->options->emit_asm;
 
-    if (ctx->config && config_target_name)
+    // For project builds with config, use config-based directory resolution
+    char *auto_ast_dir = NULL;
+    char *auto_ir_dir  = NULL;
+    char *auto_asm_dir = NULL;
+    char *auto_obj_dir = NULL;
+
+    if (ctx->config && config_target_name && ctx->project_root)
     {
-        if (config_should_emit_ast(ctx->config, config_target_name))
-            emit_ast = 1;
-        if (config_should_emit_ir(ctx->config, config_target_name))
-            emit_ir = 1;
-        if (config_should_emit_asm(ctx->config, config_target_name))
-            emit_asm = 1;
+        // Use config-based directories for project builds
+        if (!ctx->options->emit_ast_path && emit_ast)
+        {
+            auto_ast_dir = config_resolve_ast_dir(ctx->config, ctx->project_root, config_target_name);
+        }
+        if (!ctx->options->emit_ir_path && emit_ir)
+        {
+            auto_ir_dir = config_resolve_ir_dir(ctx->config, ctx->project_root, config_target_name);
+        }
+        if (!ctx->options->emit_asm_path && emit_asm)
+        {
+            auto_asm_dir = config_resolve_asm_dir(ctx->config, ctx->project_root, config_target_name);
+        }
+        if (!ctx->options->obj_dir)
+        {
+            auto_obj_dir = config_resolve_obj_dir(ctx->config, ctx->project_root, config_target_name);
+        }
     }
 
     char *auto_ast = NULL;
@@ -378,25 +390,28 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
         const char *ast_path = ctx->options->emit_ast_path;
         if (!ast_path || ast_path[0] == '\0')
         {
-            // derive base directory from obj_dir or use "ast"
-            const char *base_dir = ctx->options->obj_dir;
-            char       *parent   = NULL;
-            if (base_dir)
+            // Use config-based directory if available, otherwise derive from obj_dir
+            const char *base_dir = auto_ast_dir;
+            if (!base_dir)
             {
-                // extract parent: "out/imach/obj" -> "out/imach/ast"
-                parent = fs_dirname(base_dir);
-                if (parent)
+                base_dir     = ctx->options->obj_dir;
+                char *parent = NULL;
+                if (base_dir)
                 {
-                    size_t len = strlen(parent) + 5; // "/ast" + \0
-                    auto_ast   = malloc(len);
-                    snprintf(auto_ast, len, "%s/ast", parent);
-                    free(parent);
-                    base_dir = auto_ast;
+                    parent = fs_dirname(base_dir);
+                    if (parent)
+                    {
+                        size_t len = strlen(parent) + 5;
+                        auto_ast   = malloc(len);
+                        snprintf(auto_ast, len, "%s/ast", parent);
+                        free(parent);
+                        base_dir = auto_ast;
+                    }
                 }
-            }
-            else
-            {
-                base_dir = "ast";
+                else
+                {
+                    base_dir = "ast";
+                }
             }
 
             char *ast_full = build_module_artifact_path(base_dir, ctx->module_name, ".ast");
@@ -407,10 +422,20 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
             }
             else
             {
-                char  *base = fs_get_base_filename(ctx->options->input_file);
-                size_t len  = strlen(base) + 5;
-                auto_ast    = malloc(len);
-                snprintf(auto_ast, len, "%s.ast", base);
+                // Fallback: use base filename in the configured directory
+                char *base = fs_get_base_filename(ctx->options->input_file);
+                if (base_dir && strlen(base_dir) > 0)
+                {
+                    size_t len = strlen(base_dir) + 1 + strlen(base) + 5;
+                    auto_ast   = malloc(len);
+                    snprintf(auto_ast, len, "%s/%s.ast", base_dir, base);
+                }
+                else
+                {
+                    size_t len = strlen(base) + 5;
+                    auto_ast   = malloc(len);
+                    snprintf(auto_ast, len, "%s.ast", base);
+                }
                 free(base);
             }
             ast_path = auto_ast;
@@ -437,25 +462,28 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
         const char *ir_path = ctx->options->emit_ir_path;
         if (!ir_path || ir_path[0] == '\0')
         {
-            // derive base directory from obj_dir or use "ir"
-            const char *base_dir = ctx->options->obj_dir;
-            char       *parent   = NULL;
-            if (base_dir)
+            // Use config-based directory if available, otherwise derive from obj_dir
+            const char *base_dir = auto_ir_dir;
+            if (!base_dir)
             {
-                // extract parent: "out/imach/obj" -> "out/imach/ir"
-                parent = fs_dirname(base_dir);
-                if (parent)
+                base_dir     = ctx->options->obj_dir;
+                char *parent = NULL;
+                if (base_dir)
                 {
-                    size_t len = strlen(parent) + 4; // "/ir" + \0
-                    auto_ir    = malloc(len);
-                    snprintf(auto_ir, len, "%s/ir", parent);
-                    free(parent);
-                    base_dir = auto_ir;
+                    parent = fs_dirname(base_dir);
+                    if (parent)
+                    {
+                        size_t len = strlen(parent) + 4;
+                        auto_ir    = malloc(len);
+                        snprintf(auto_ir, len, "%s/ir", parent);
+                        free(parent);
+                        base_dir = auto_ir;
+                    }
                 }
-            }
-            else
-            {
-                base_dir = "ir";
+                else
+                {
+                    base_dir = "ir";
+                }
             }
 
             char *ir_full = build_module_artifact_path(base_dir, ctx->module_name, ".ll");
@@ -466,10 +494,20 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
             }
             else
             {
-                char  *base = fs_get_base_filename(ctx->options->input_file);
-                size_t len  = strlen(base) + 4;
-                auto_ir     = malloc(len);
-                snprintf(auto_ir, len, "%s.ll", base);
+                // Fallback: use base filename in the configured directory
+                char *base = fs_get_base_filename(ctx->options->input_file);
+                if (base_dir && strlen(base_dir) > 0)
+                {
+                    size_t len = strlen(base_dir) + 1 + strlen(base) + 4;
+                    auto_ir    = malloc(len);
+                    snprintf(auto_ir, len, "%s/%s.ll", base_dir, base);
+                }
+                else
+                {
+                    size_t len = strlen(base) + 4;
+                    auto_ir    = malloc(len);
+                    snprintf(auto_ir, len, "%s.ll", base);
+                }
                 free(base);
             }
             ir_path = auto_ir;
@@ -496,25 +534,28 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
         const char *asm_path = ctx->options->emit_asm_path;
         if (!asm_path || asm_path[0] == '\0')
         {
-            // derive base directory from obj_dir or use "asm"
-            const char *base_dir = ctx->options->obj_dir;
-            char       *parent   = NULL;
-            if (base_dir)
+            // Use config-based directory if available, otherwise derive from obj_dir
+            const char *base_dir = auto_asm_dir;
+            if (!base_dir)
             {
-                // extract parent: "out/imach/obj" -> "out/imach/asm"
-                parent = fs_dirname(base_dir);
-                if (parent)
+                base_dir     = ctx->options->obj_dir;
+                char *parent = NULL;
+                if (base_dir)
                 {
-                    size_t len = strlen(parent) + 5; // "/asm" + \0
-                    auto_asm   = malloc(len);
-                    snprintf(auto_asm, len, "%s/asm", parent);
-                    free(parent);
-                    base_dir = auto_asm;
+                    parent = fs_dirname(base_dir);
+                    if (parent)
+                    {
+                        size_t len = strlen(parent) + 5;
+                        auto_asm   = malloc(len);
+                        snprintf(auto_asm, len, "%s/asm", parent);
+                        free(parent);
+                        base_dir = auto_asm;
+                    }
                 }
-            }
-            else
-            {
-                base_dir = "asm";
+                else
+                {
+                    base_dir = "asm";
+                }
             }
 
             char *asm_full = build_module_artifact_path(base_dir, ctx->module_name, ".s");
@@ -525,10 +566,20 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
             }
             else
             {
-                char  *base = fs_get_base_filename(ctx->options->input_file);
-                size_t len  = strlen(base) + 3;
-                auto_asm    = malloc(len);
-                snprintf(auto_asm, len, "%s.s", base);
+                // Fallback: use base filename in the configured directory
+                char *base = fs_get_base_filename(ctx->options->input_file);
+                if (base_dir && strlen(base_dir) > 0)
+                {
+                    size_t len = strlen(base_dir) + 1 + strlen(base) + 3;
+                    auto_asm   = malloc(len);
+                    snprintf(auto_asm, len, "%s/%s.s", base_dir, base);
+                }
+                else
+                {
+                    size_t len = strlen(base) + 3;
+                    auto_asm   = malloc(len);
+                    snprintf(auto_asm, len, "%s.s", base);
+                }
                 free(base);
             }
             asm_path = auto_asm;
@@ -550,6 +601,8 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
     }
 
     // determine object file path and store it in context
+    const char *obj_dir_to_use = auto_obj_dir ? auto_obj_dir : ctx->options->obj_dir;
+
     if (!ctx->options->link_exe)
     {
         // --no-link: object is primary output
@@ -557,10 +610,22 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
         {
             ctx->source = strdup(ctx->options->output_file);
         }
-        else if (ctx->options->obj_dir)
+        else if (obj_dir_to_use)
         {
-            char *obj_path = build_module_artifact_path(ctx->options->obj_dir, ctx->module_name, ".o");
-            ctx->source    = obj_path ? obj_path : strdup("main.o");
+            char *obj_path = build_module_artifact_path(obj_dir_to_use, ctx->module_name, ".o");
+            if (obj_path)
+            {
+                ctx->source = obj_path;
+            }
+            else
+            {
+                // Fallback: use base filename in the configured directory
+                char  *base = fs_get_base_filename(ctx->options->input_file);
+                size_t len  = strlen(obj_dir_to_use) + 1 + strlen(base) + 3;
+                ctx->source = malloc(len);
+                snprintf(ctx->source, len, "%s/%s.o", obj_dir_to_use, base);
+                free(base);
+            }
         }
         else
         {
@@ -574,10 +639,22 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
     else
     {
         // linking: place object in obj_dir if specified, else current dir
-        if (ctx->options->obj_dir)
+        if (obj_dir_to_use)
         {
-            char *obj_path = build_module_artifact_path(ctx->options->obj_dir, ctx->module_name, ".o");
-            ctx->source    = obj_path ? obj_path : strdup("main.o");
+            char *obj_path = build_module_artifact_path(obj_dir_to_use, ctx->module_name, ".o");
+            if (obj_path)
+            {
+                ctx->source = obj_path;
+            }
+            else
+            {
+                // Fallback: use base filename in the configured directory
+                char  *base = fs_get_base_filename(ctx->options->input_file);
+                size_t len  = strlen(obj_dir_to_use) + 1 + strlen(base) + 3;
+                ctx->source = malloc(len);
+                snprintf(ctx->source, len, "%s/%s.o", obj_dir_to_use, base);
+                free(base);
+            }
         }
         else
         {
@@ -611,10 +688,28 @@ bool compilation_compile_dependencies(CompilationContext *ctx)
     if (!ctx->config)
         return true;
 
-    char dep_out_dir[1024];
-    if (ctx->options->dep_dir)
+    // Use the same obj directory structure for dependencies
+    const char *target_name = ctx->options->target_name;
+    char        dep_out_dir[1024];
+
+    if (target_name && ctx->project_root)
     {
-        snprintf(dep_out_dir, sizeof(dep_out_dir), "%s", ctx->options->dep_dir);
+        // For project builds, use target-based directory
+        char *obj_dir = config_resolve_obj_dir(ctx->config, ctx->project_root, target_name);
+        if (obj_dir)
+        {
+            snprintf(dep_out_dir, sizeof(dep_out_dir), "%s", obj_dir);
+            free(obj_dir);
+        }
+        else
+        {
+            snprintf(dep_out_dir, sizeof(dep_out_dir), "%s/out/obj", ctx->project_root);
+        }
+    }
+    else if (ctx->options->obj_dir)
+    {
+        // Use explicitly provided obj_dir
+        snprintf(dep_out_dir, sizeof(dep_out_dir), "%s", ctx->options->obj_dir);
     }
     else
     {
@@ -641,13 +736,46 @@ bool compilation_link(CompilationContext *ctx)
     char *exe = NULL;
     if (!ctx->options->output_file)
     {
-        exe = fs_get_base_filename(ctx->options->input_file);
+        // No -o specified: derive output path
+        if (ctx->options->target_name && ctx->project_root && ctx->config)
+        {
+            // Project mode: use config_resolve_final_output_path for per-target paths
+            exe = config_resolve_final_output_path(ctx->config, ctx->project_root, ctx->options->target_name);
+            if (exe)
+            {
+                // Ensure parent directory exists
+                char *dir = fs_dirname(exe);
+                if (dir)
+                {
+                    fs_ensure_dir_recursive(dir);
+                    free(dir);
+                }
+            }
+            else
+            {
+                // Fallback to entrypoint basename
+                exe = fs_get_base_filename(ctx->options->input_file);
+            }
+        }
+        else
+        {
+            // Single-file mode: use entrypoint basename
+            exe = fs_get_base_filename(ctx->options->input_file);
+        }
     }
     else
     {
+        // -o specified: use it exactly as provided
         exe = strdup(ctx->options->output_file);
-    }
 
+        // Ensure parent directory exists
+        char *dir = fs_dirname(exe);
+        if (dir)
+        {
+            fs_ensure_dir_recursive(dir);
+            free(dir);
+        }
+    }
     // use object file path stored in ctx->source from emit_artifacts
     const char *obj_file = ctx->source;
     if (!obj_file)

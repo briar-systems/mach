@@ -1,6 +1,9 @@
 #include "config.h"
 #include <dirent.h>
 #include <errno.h>
+#include <llvm-c/Core.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -133,7 +136,7 @@ static char *toml_parse_section_name(TomlParser *parser)
         {
             break;
         }
-        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')
+        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
         {
             parser->pos++;
         }
@@ -271,18 +274,105 @@ static char *read_file_to_string(const char *path)
     return buffer;
 }
 
+// expand environment variables in format ${VAR_NAME}
+static char *expand_env_vars(const char *input)
+{
+    if (!input)
+        return NULL;
+
+    size_t input_len = strlen(input);
+    size_t buf_size  = input_len * 2; // initial buffer size
+    char  *result    = malloc(buf_size);
+    if (!result)
+        return NULL;
+
+    size_t      pos = 0;
+    const char *p   = input;
+
+    while (*p)
+    {
+        if (*p == '$' && *(p + 1) == '{')
+        {
+            // find closing brace
+            const char *start = p + 2;
+            const char *end   = strchr(start, '}');
+            if (!end)
+            {
+                // malformed - just copy literal
+                if (pos + 2 >= buf_size)
+                {
+                    buf_size *= 2;
+                    result = realloc(result, buf_size);
+                }
+                result[pos++] = *p++;
+                continue;
+            }
+
+            // extract variable name
+            size_t var_len  = end - start;
+            char  *var_name = malloc(var_len + 1);
+            memcpy(var_name, start, var_len);
+            var_name[var_len] = '\0';
+
+            // get environment variable
+            const char *value = getenv(var_name);
+            if (!value)
+            {
+                fprintf(stderr, "error: undefined environment variable '${%s}'\n", var_name);
+                free(var_name);
+                free(result);
+                return NULL;
+            }
+
+            // append value to result
+            size_t value_len = strlen(value);
+            while (pos + value_len >= buf_size)
+            {
+                buf_size *= 2;
+                result = realloc(result, buf_size);
+            }
+            memcpy(result + pos, value, value_len);
+            pos += value_len;
+
+            free(var_name);
+            p = end + 1; // skip past '}'
+        }
+        else
+        {
+            if (pos + 1 >= buf_size)
+            {
+                buf_size *= 2;
+                result = realloc(result, buf_size);
+            }
+            result[pos++] = *p++;
+        }
+    }
+
+    result[pos] = '\0';
+    return result;
+}
+
 void target_config_init(TargetConfig *target)
 {
     memset(target, 0, sizeof(TargetConfig));
-    target->opt_level   = 2;    // default optimization level
-    target->emit_object = true; // default to emitting object files
-    target->shared      = true; // default shared when building libraries
+    // No defaults - all fields must be explicitly set (mach explicitness philosophy)
 }
 
 void target_config_dnit(TargetConfig *target)
 {
     free(target->name);
     free(target->target_triple);
+    free(target->entrypoint);
+    free(target->artifacts_dir);
+    free(target->out);
+
+    // Free link libraries
+    for (int i = 0; i < target->link_lib_count; i++)
+    {
+        free(target->link_libraries[i]);
+    }
+    free(target->link_libraries);
+
     memset(target, 0, sizeof(TargetConfig));
 }
 
@@ -307,10 +397,8 @@ void config_dnit(ProjectConfig *config)
     free(config->name);
     free(config->version);
     free(config->main_file);
-    free(config->target_name);
-    free(config->default_target);
+    free(config->target);
     free(config->src_dir);
-    free(config->out_dir);
 
     // cleanup targets
     for (int i = 0; i < config->target_count; i++)
@@ -384,9 +472,13 @@ TargetConfig *config_get_target_by_triple(ProjectConfig *config, const char *tar
 
 TargetConfig *config_get_default_target(ProjectConfig *config)
 {
-    if (config->default_target && strcmp(config->default_target, "all") != 0)
+    if (config->target && strcmp(config->target, "all") != 0 && strcmp(config->target, "native") != 0)
     {
-        return config_get_target(config, config->default_target);
+        return config_get_target(config, config->target);
+    }
+    else if (config->target && strcmp(config->target, "native") == 0)
+    {
+        return config_resolve_native_target(config);
     }
     else if (config->target_count > 0)
     {
@@ -395,9 +487,97 @@ TargetConfig *config_get_default_target(ProjectConfig *config)
     return NULL;
 }
 
+TargetConfig *config_resolve_native_target(ProjectConfig *config)
+{
+    // Use LLVM to get the native host triple
+    char *native_triple = LLVMGetDefaultTargetTriple();
+    if (!native_triple)
+    {
+        fprintf(stderr, "error: 'native' target requested but could not determine host triple\n");
+        return NULL;
+    }
+
+    // Try exact match first
+    for (int i = 0; i < config->target_count; i++)
+    {
+        TargetConfig *target = config->targets[i];
+        if (target->target_triple && strcmp(target->target_triple, native_triple) == 0)
+        {
+            LLVMDisposeMessage(native_triple);
+            return target;
+        }
+    }
+
+    // Try normalized triple match (LLVM normalizes triples)
+    // Parse the native triple to extract arch-vendor-os
+    char *arch_start   = native_triple;
+    char *vendor_start = strchr(arch_start, '-');
+    if (!vendor_start)
+    {
+        LLVMDisposeMessage(native_triple);
+        fprintf(stderr, "error: 'native' target has malformed triple '%s'\n", native_triple);
+        return NULL;
+    }
+    vendor_start++; // skip the dash
+
+    char *os_start = strchr(vendor_start, '-');
+    if (!os_start)
+    {
+        LLVMDisposeMessage(native_triple);
+        fprintf(stderr, "error: 'native' target has malformed triple '%s'\n", native_triple);
+        return NULL;
+    }
+    os_start++; // skip the dash
+
+    // Extract components
+    size_t arch_len = vendor_start - arch_start - 1;
+    // vendor component not used in matching (can vary between platforms)
+
+    // Now try fuzzy matching on architecture and OS
+    for (int i = 0; i < config->target_count; i++)
+    {
+        TargetConfig *target = config->targets[i];
+        if (!target->target_triple)
+            continue;
+
+        // Check if arch and OS match (vendor can vary)
+        const char *t        = target->target_triple;
+        char       *t_vendor = strchr(t, '-');
+        if (!t_vendor)
+            continue;
+
+        size_t t_arch_len = t_vendor - t;
+        if (t_arch_len != arch_len || strncmp(t, arch_start, arch_len) != 0)
+            continue;
+
+        t_vendor++; // skip dash
+        char *t_os = strchr(t_vendor, '-');
+        if (!t_os)
+            continue;
+        t_os++; // skip dash
+
+        // Check if OS component matches (allow some flexibility)
+        if (strncmp(os_start, t_os, strlen(t_os)) == 0 || strncmp(t_os, os_start, strlen(os_start)) == 0)
+        {
+            LLVMDisposeMessage(native_triple);
+            return target;
+        }
+    }
+
+    fprintf(stderr, "error: 'native' target requested but no matching target found for host triple '%s'\n", native_triple);
+    fprintf(stderr, "available targets and triples:\n");
+    for (int i = 0; i < config->target_count; i++)
+    {
+        fprintf(stderr, "  %s: %s\n", config->targets[i]->name, config->targets[i]->target_triple);
+    }
+
+    LLVMDisposeMessage(native_triple);
+    return NULL;
+}
+
 bool config_is_build_all_targets(ProjectConfig *config)
 {
-    return !config->default_target || strcmp(config->default_target, "all") == 0;
+    return !config->target || strcmp(config->target, "all") == 0;
 }
 
 ProjectConfig *config_load(const char *config_path)
@@ -449,7 +629,7 @@ ProjectConfig *config_load(const char *config_path)
         // parse value based on section and key
         if (!current_section || strcmp(current_section, "project") == 0)
         {
-            // handle project section keys
+            // handle project section keys (merged with directories)
             if (strcmp(key, "name") == 0)
             {
                 config->name = toml_parse_string(&parser);
@@ -458,29 +638,18 @@ ProjectConfig *config_load(const char *config_path)
             {
                 config->version = toml_parse_string(&parser);
             }
-            else if (strcmp(key, "entrypoint") == 0)
-            {
-                config->main_file = toml_parse_string(&parser);
-            }
-            else if (strcmp(key, "target-name") == 0)
-            {
-                config->target_name = toml_parse_string(&parser);
-            }
-            else if (strcmp(key, "default-target") == 0)
-            {
-                config->default_target = toml_parse_string(&parser);
-            }
-        }
-        else if (strcmp(current_section, "directories") == 0)
-        {
-            // handle directories section keys
-            if (strcmp(key, "src") == 0)
+            else if (strcmp(key, "src") == 0)
             {
                 config->src_dir = toml_parse_string(&parser);
             }
-            else if (strcmp(key, "out") == 0)
+            else if (strcmp(key, "target") == 0)
             {
-                config->out_dir = toml_parse_string(&parser);
+                config->target = toml_parse_string(&parser);
+            }
+            else
+            {
+                // skip unknown keys in project section
+                toml_skip_table_value(&parser);
             }
         }
         else if (strncmp(current_section, "targets.", 8) == 0)
@@ -489,25 +658,47 @@ ProjectConfig *config_load(const char *config_path)
             const char   *target_name = current_section + 8;
             TargetConfig *target      = config_get_target(config, target_name);
 
-            // create target if it doesn't exist
-            if (!target && strcmp(key, "target") == 0)
+            // create target if it doesn't exist (on first key encountered)
+            if (!target)
             {
-                char *target_triple = toml_parse_string(&parser);
-                if (target_triple)
-                {
-                    config_add_target(config, target_name, target_triple);
-                    target = config_get_target(config, target_name);
-                    free(target_triple);
-                }
+                // Create target with empty triple, will be filled in when we parse triple key
+                config_add_target(config, target_name, "");
+                target = config_get_target(config, target_name);
             }
 
             if (target)
             {
                 // parse target-specific options
-                if (strcmp(key, "target") == 0)
+                if (strcmp(key, "triple") == 0)
                 {
-                    // target triple already handled above
-                    toml_skip_table_value(&parser);
+                    char *target_triple = toml_parse_string(&parser);
+                    if (target_triple)
+                    {
+                        free(target->target_triple);
+                        target->target_triple = target_triple;
+                    }
+                }
+                else if (strcmp(key, "entrypoint") == 0)
+                {
+                    target->entrypoint = toml_parse_string(&parser);
+                }
+                else if (strcmp(key, "artifacts") == 0)
+                {
+                    target->artifacts_dir = toml_parse_string(&parser);
+                }
+                else if (strcmp(key, "out") == 0)
+                {
+                    target->out = toml_parse_string(&parser);
+                }
+                else if (strcmp(key, "link") == 0)
+                {
+                    // Parse link library (can be called multiple times or as array)
+                    char *lib_path = toml_parse_string(&parser);
+                    if (lib_path)
+                    {
+                        target->link_libraries                           = realloc(target->link_libraries, (target->link_lib_count + 1) * sizeof(char *));
+                        target->link_libraries[target->link_lib_count++] = lib_path;
+                    }
                 }
                 else if (strcmp(key, "opt-level") == 0)
                 {
@@ -541,28 +732,42 @@ ProjectConfig *config_load(const char *config_path)
                 {
                     target->no_pie = toml_parse_bool(&parser);
                 }
+                else
+                {
+                    // skip unknown target options
+                    toml_skip_table_value(&parser);
+                }
             }
             else
             {
-                // skip unknown target options
+                // skip unknown target options when target doesn't exist
                 toml_skip_table_value(&parser);
             }
         }
-        else if (strcmp(current_section, "build") == 0)
+        else if (strcmp(current_section, "dependencies") == 0)
         {
-            // legacy build section - skip
-            toml_skip_table_value(&parser);
-        }
-        else if (strcmp(current_section, "deps") == 0)
-        {
-            // parse dependency: name = "path"
-            char *dep_path = toml_parse_string(&parser);
-            if (dep_path)
+            // parse dependency: name = "path" with env var expansion
+            char *dep_path_raw = toml_parse_string(&parser);
+            if (dep_path_raw)
             {
+                char *dep_path = expand_env_vars(dep_path_raw);
+                free(dep_path_raw);
+
+                if (!dep_path)
+                {
+                    fprintf(stderr, "error: failed to expand environment variables in dependency '%s'\n", key);
+                    free(key);
+                    free(current_section);
+                    free(content);
+                    config_dnit(config);
+                    free(config);
+                    return NULL;
+                }
+
                 DepSpec *dep = calloc(1, sizeof(DepSpec));
                 dep->name    = strdup(key);
                 dep->path    = dep_path;
-                dep->src_dir = NULL; // no src subdir
+                dep->src_dir = NULL; // will be resolved later
 
                 DepSpec **new_arr = realloc(config->deps, (config->dep_count + 1) * sizeof(DepSpec *));
                 if (new_arr)
@@ -592,69 +797,7 @@ ProjectConfig *config_load_from_dir(const char *dir_path)
     char config_path[1024];
     snprintf(config_path, sizeof(config_path), "%s/mach.toml", dir_path);
 
-    ProjectConfig *cfg = config_load(config_path);
-    if (!cfg)
-        return NULL;
-
-    // auto-discover dependencies in dep directory so projects work without [deps]
-    const char *dep_rel = "dep";
-    char        dep_abs[1024];
-    snprintf(dep_abs, sizeof(dep_abs), "%s/%s", dir_path, dep_rel);
-
-    DIR *d = opendir(dep_abs);
-    if (d)
-    {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL)
-        {
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-                continue;
-
-            // construct child path
-            char child_path[1024];
-            snprintf(child_path, sizeof(child_path), "%s/%s", dep_abs, ent->d_name);
-            struct stat st;
-            if (stat(child_path, &st) != 0 || !S_ISDIR(st.st_mode))
-                continue;
-
-            // ensure it looks like a mach dependency (has a src directory)
-            char src_path[1200];
-            snprintf(src_path, sizeof(src_path), "%s/src", child_path);
-            if (stat(src_path, &st) != 0 || !S_ISDIR(st.st_mode))
-                continue;
-
-            // skip if already declared in [deps]
-            if (config_has_dep(cfg, ent->d_name))
-                continue;
-
-            // add discovered dep with default src = "src" and relative path = dep/<name>
-            DepSpec *dep = calloc(1, sizeof(DepSpec));
-            if (!dep)
-                continue;
-            dep->name    = strdup(ent->d_name);
-            dep->src_dir = strdup("src");
-
-            char rel_path[1024];
-            snprintf(rel_path, sizeof(rel_path), "%s/%s", dep_rel, ent->d_name);
-            dep->path = strdup(rel_path);
-
-            DepSpec **new_arr = realloc(cfg->deps, (cfg->dep_count + 1) * sizeof(DepSpec *));
-            if (!new_arr)
-            {
-                free(dep->name);
-                free(dep->src_dir);
-                free(dep->path);
-                free(dep);
-                continue;
-            }
-            cfg->deps                 = new_arr;
-            cfg->deps[cfg->dep_count] = dep;
-            cfg->dep_count++;
-        }
-        closedir(d);
-    }
-
-    return cfg;
+    return config_load(config_path);
 }
 
 bool config_save(ProjectConfig *config, const char *config_path)
@@ -664,25 +807,17 @@ bool config_save(ProjectConfig *config, const char *config_path)
         return false;
 
     fprintf(file, "# mach project configuration\n");
-    fprintf(file, "# this file defines the project structure and build settings\n\n");
+    fprintf(file, "# all fields are required (mach explicitness philosophy)\n\n");
 
     fprintf(file, "[project]\n");
     if (config->name)
         fprintf(file, "name = \"%s\"\n", config->name);
     if (config->version)
         fprintf(file, "version = \"%s\"\n", config->version);
-    if (config->main_file)
-        fprintf(file, "entrypoint = \"%s\"\n", config->main_file);
-    if (config->target_name)
-        fprintf(file, "target-name = \"%s\"\n", config->target_name);
-    if (config->default_target)
-        fprintf(file, "default-target = \"%s\"\n", config->default_target);
-
-    fprintf(file, "\n[directories]\n");
     if (config->src_dir)
-        fprintf(file, "src-dir = \"%s\"\n", config->src_dir);
-    if (config->out_dir)
-        fprintf(file, "out-dir = \"%s\"\n", config->out_dir);
+        fprintf(file, "src = \"%s\"\n", config->src_dir);
+    if (config->target)
+        fprintf(file, "target = \"%s\"\n", config->target);
 
     // save targets
     for (int i = 0; i < config->target_count; i++)
@@ -690,7 +825,13 @@ bool config_save(ProjectConfig *config, const char *config_path)
         TargetConfig *target = config->targets[i];
         fprintf(file, "\n[targets.%s]\n", target->name);
         if (target->target_triple)
-            fprintf(file, "target = \"%s\"\n", target->target_triple);
+            fprintf(file, "triple = \"%s\"\n", target->target_triple);
+        if (target->entrypoint)
+            fprintf(file, "entrypoint = \"%s\"\n", target->entrypoint);
+        if (target->artifacts_dir)
+            fprintf(file, "artifacts = \"%s\"\n", target->artifacts_dir);
+        if (target->out)
+            fprintf(file, "out = \"%s\"\n", target->out);
         fprintf(file, "opt-level = %d\n", target->opt_level);
         // always write booleans explicitly for transparency
         fprintf(file, "emit-ast = %s\n", target->emit_ast ? "true" : "false");
@@ -700,24 +841,24 @@ bool config_save(ProjectConfig *config, const char *config_path)
         fprintf(file, "build-library = %s\n", target->build_library ? "true" : "false");
         fprintf(file, "shared = %s\n", target->shared ? "true" : "false");
         fprintf(file, "no-pie = %s\n", target->no_pie ? "true" : "false");
+
+        // Write link libraries if any
+        for (int j = 0; j < target->link_lib_count; j++)
+        {
+            fprintf(file, "link = \"%s\"\n", target->link_libraries[j]);
+        }
     }
 
     // dependencies (also serve as module aliases)
     if (config->dep_count > 0)
     {
-        fprintf(file, "\n[deps]\n");
+        fprintf(file, "\n[dependencies]\n");
         for (int i = 0; i < config->dep_count; i++)
         {
             DepSpec *d = config->deps[i];
-            fprintf(file, "%s = { path = \"%s\"", d->name, d->path);
-            if (d->src_dir && strcmp(d->src_dir, "src") != 0)
-                fprintf(file, ", src = \"%s\"", d->src_dir);
-            fprintf(file, " }\n");
+            fprintf(file, "%s = \"%s\"\n", d->name, d->path);
         }
     }
-
-    // save library dependencies
-    // no lib-dependencies block
 
     fclose(file);
     return true;
@@ -728,20 +869,26 @@ ProjectConfig *config_create_default(const char *project_name)
     ProjectConfig *config = malloc(sizeof(ProjectConfig));
     config_init(config);
 
-    config->name        = strdup(project_name);
-    config->version     = strdup("0.1.0");
-    config->main_file   = strdup("main.mach");
-    config->target_name = strdup(project_name);
-    // directories
+    config->name    = strdup(project_name);
+    config->version = strdup("0.1.0");
     config->src_dir = strdup("src");
-    config->out_dir = strdup("out");
+    config->target  = strdup("native");
+    // note: no default entrypoint or out_dir - they are per-target now
 
     return config;
 }
 
 bool config_has_main_file(ProjectConfig *config)
 {
-    return config && config->main_file && strlen(config->main_file) > 0;
+    // Check if at least one target has an entrypoint
+    if (!config)
+        return false;
+    for (int i = 0; i < config->target_count; i++)
+    {
+        if (config->targets[i]->entrypoint && strlen(config->targets[i]->entrypoint) > 0)
+            return true;
+    }
+    return false;
 }
 
 bool config_should_emit_ast(ProjectConfig *config, const char *target_name)
@@ -802,13 +949,15 @@ bool config_is_shared_library(ProjectConfig *config, const char *target_name)
 
 char *config_default_executable_name(ProjectConfig *config)
 {
-    const char *name = config && config->target_name ? config->target_name : (config && config->name ? config->name : "a.out");
+    // Deprecated - use per-target final_name instead
+    const char *name = config && config->name ? config->name : "a.out";
     return strdup(name);
 }
 
 char *config_default_library_name(ProjectConfig *config, bool shared)
 {
-    const char *base = config && config->target_name ? config->target_name : (config && config->name ? config->name : "libmach");
+    // Deprecated - use per-target final_name instead
+    const char *base = config && config->name ? config->name : "libmach";
     size_t      nlen = strlen(base);
     const char *ext  = shared ? ".so" : ".a";
     size_t      len  = 3 + nlen + strlen(ext) + 1;
@@ -817,8 +966,78 @@ char *config_default_library_name(ProjectConfig *config, bool shared)
     return out;
 }
 
+char *config_resolve_final_output_path(ProjectConfig *config, const char *project_dir, const char *target_name)
+{
+    if (!config || !target_name)
+        return NULL;
+
+    TargetConfig *target = config_get_target(config, target_name);
+    if (!target)
+        return NULL;
+
+    // out field is required and must be a path specification
+    const char *out_spec = target->out;
+    if (!out_spec || strlen(out_spec) == 0)
+    {
+        fprintf(stderr, "error: target '%s' missing required 'out' field\n", target_name);
+        return NULL;
+    }
+
+    // if out is absolute path, use as-is
+    if (out_spec[0] == '/')
+        return strdup(out_spec);
+
+    // check if out_spec contains path separators (relative path from project root)
+    if (strchr(out_spec, '/'))
+    {
+        // out_spec is a relative path - resolve it relative to project_dir
+        size_t len  = strlen(project_dir) + strlen(out_spec) + 2;
+        char  *path = malloc(len);
+        snprintf(path, len, "%s/%s", project_dir, out_spec);
+        return path;
+    }
+
+    // out_spec is a simple name - place in bin_dir (artifacts_dir/bin/)
+    char *bin_dir = config_resolve_bin_dir(config, project_dir, target_name);
+    if (!bin_dir)
+    {
+        fprintf(stderr, "error: could not resolve bin directory for target '%s'\n", target_name);
+        return NULL;
+    }
+
+    size_t len  = strlen(bin_dir) + strlen(out_spec) + 2;
+    char  *path = malloc(len);
+    snprintf(path, len, "%s/%s", bin_dir, out_spec);
+
+    free(bin_dir);
+    return path;
+}
+
+char *config_resolve_artifacts_dir(ProjectConfig *config, const char *project_dir, const char *target_name)
+{
+    if (!config || !target_name)
+        return NULL;
+
+    TargetConfig *target = config_get_target(config, target_name);
+    if (!target || !target->artifacts_dir)
+        return NULL;
+
+    // if artifacts dir is absolute path, return as is
+    if (target->artifacts_dir[0] == '/')
+        return strdup(target->artifacts_dir);
+
+    // resolve relative to project directory
+    size_t len  = strlen(project_dir) + strlen(target->artifacts_dir) + 2;
+    char  *path = malloc(len);
+    snprintf(path, len, "%s/%s", project_dir, target->artifacts_dir);
+
+    return path;
+}
+
 char *config_resolve_main_file(ProjectConfig *config, const char *project_dir)
 {
+    // Deprecated: main_file is now per-target (entrypoint field)
+    // This function kept for backward compatibility but should not be used
     if (!config || !config->main_file)
         return NULL;
 
@@ -834,6 +1053,32 @@ char *config_resolve_main_file(ProjectConfig *config, const char *project_dir)
     size_t len  = strlen(src_dir) + strlen(config->main_file) + 2;
     char  *path = malloc(len);
     snprintf(path, len, "%s/%s", src_dir, config->main_file);
+
+    free(src_dir);
+    return path;
+}
+
+char *config_resolve_target_entrypoint(ProjectConfig *config, const char *project_dir, const char *target_name)
+{
+    if (!config || !target_name)
+        return NULL;
+
+    TargetConfig *target = config_get_target(config, target_name);
+    if (!target || !target->entrypoint)
+        return NULL;
+
+    // if entrypoint is absolute path, return as is
+    if (target->entrypoint[0] == '/')
+        return strdup(target->entrypoint);
+
+    // resolve relative to src directory
+    char *src_dir = config_resolve_src_dir(config, project_dir);
+    if (!src_dir)
+        return NULL;
+
+    size_t len  = strlen(src_dir) + strlen(target->entrypoint) + 2;
+    char  *path = malloc(len);
+    snprintf(path, len, "%s/%s", src_dir, target->entrypoint);
 
     free(src_dir);
     return path;
@@ -856,62 +1101,78 @@ char *config_resolve_src_dir(ProjectConfig *config, const char *project_dir)
     return path;
 }
 
-char *config_resolve_out_dir(ProjectConfig *config, const char *project_dir)
-{
-    if (!config || !config->out_dir)
-        return NULL;
-
-    // if out dir is absolute path, return as is
-    if (config->out_dir[0] == '/')
-        return strdup(config->out_dir);
-
-    // resolve relative to project directory
-    size_t len  = strlen(project_dir) + strlen(config->out_dir) + 2;
-    char  *path = malloc(len);
-    snprintf(path, len, "%s/%s", project_dir, config->out_dir);
-
-    return path;
-}
-
 char *config_resolve_bin_dir(ProjectConfig *config, const char *project_dir, const char *target_name)
 {
-    char *out_dir = config_resolve_out_dir(config, project_dir);
-    if (!out_dir)
+    char *artifacts_dir = config_resolve_artifacts_dir(config, project_dir, target_name);
+    if (!artifacts_dir)
         return NULL;
 
-    if (!target_name)
-    {
-        free(out_dir);
-        return NULL;
-    }
-
-    // compute bin directory: out_dir/target_name/bin
-    size_t len  = strlen(out_dir) + strlen(target_name) + strlen("/bin") + 3;
+    // bin directory is directly under artifacts_dir
+    size_t len  = strlen(artifacts_dir) + strlen("/bin") + 2;
     char  *path = malloc(len);
-    snprintf(path, len, "%s/%s/bin", out_dir, target_name);
+    snprintf(path, len, "%s/bin", artifacts_dir);
 
-    free(out_dir);
+    free(artifacts_dir);
     return path;
 }
 
 char *config_resolve_obj_dir(ProjectConfig *config, const char *project_dir, const char *target_name)
 {
-    char *out_dir = config_resolve_out_dir(config, project_dir);
-    if (!out_dir)
+    char *artifacts_dir = config_resolve_artifacts_dir(config, project_dir, target_name);
+    if (!artifacts_dir)
         return NULL;
 
-    if (!target_name)
-    {
-        free(out_dir);
-        return NULL;
-    }
-
-    // compute obj directory: out_dir/target_name/obj
-    size_t len  = strlen(out_dir) + strlen(target_name) + strlen("/obj") + 3;
+    // obj directory is directly under artifacts_dir
+    size_t len  = strlen(artifacts_dir) + strlen("/obj") + 2;
     char  *path = malloc(len);
-    snprintf(path, len, "%s/%s/obj", out_dir, target_name);
+    snprintf(path, len, "%s/obj", artifacts_dir);
 
-    free(out_dir);
+    free(artifacts_dir);
+    return path;
+}
+
+char *config_resolve_asm_dir(ProjectConfig *config, const char *project_dir, const char *target_name)
+{
+    char *artifacts_dir = config_resolve_artifacts_dir(config, project_dir, target_name);
+    if (!artifacts_dir)
+        return NULL;
+
+    // asm directory is directly under artifacts_dir
+    size_t len  = strlen(artifacts_dir) + strlen("/asm") + 2;
+    char  *path = malloc(len);
+    snprintf(path, len, "%s/asm", artifacts_dir);
+
+    free(artifacts_dir);
+    return path;
+}
+
+char *config_resolve_ir_dir(ProjectConfig *config, const char *project_dir, const char *target_name)
+{
+    char *artifacts_dir = config_resolve_artifacts_dir(config, project_dir, target_name);
+    if (!artifacts_dir)
+        return NULL;
+
+    // ir directory is directly under artifacts_dir
+    size_t len  = strlen(artifacts_dir) + strlen("/ir") + 2;
+    char  *path = malloc(len);
+    snprintf(path, len, "%s/ir", artifacts_dir);
+
+    free(artifacts_dir);
+    return path;
+}
+
+char *config_resolve_ast_dir(ProjectConfig *config, const char *project_dir, const char *target_name)
+{
+    char *artifacts_dir = config_resolve_artifacts_dir(config, project_dir, target_name);
+    if (!artifacts_dir)
+        return NULL;
+
+    // ast directory is directly under artifacts_dir
+    size_t len  = strlen(artifacts_dir) + strlen("/ast") + 2;
+    char  *path = malloc(len);
+    snprintf(path, len, "%s/ast", artifacts_dir);
+
+    free(artifacts_dir);
     return path;
 }
 
@@ -963,21 +1224,22 @@ bool config_ensure_directories(ProjectConfig *config, const char *project_dir)
         free(src_dir);
     }
 
-    char *out_dir = config_resolve_out_dir(config, project_dir);
-    if (out_dir)
-    {
-        if (!ensure_directory_exists(out_dir))
-        {
-            free(out_dir);
-            return false;
-        }
-        free(out_dir);
-    }
-
     // create target-specific directories for each target
     for (int i = 0; i < config->target_count; i++)
     {
         const char *target_name = config->targets[i]->name;
+
+        // ensure base artifacts_dir for this target
+        char *artifacts_dir = config_resolve_artifacts_dir(config, project_dir, target_name);
+        if (artifacts_dir)
+        {
+            if (!ensure_directory_exists(artifacts_dir))
+            {
+                free(artifacts_dir);
+                return false;
+            }
+            free(artifacts_dir);
+        }
 
         char *bin_dir = config_resolve_bin_dir(config, project_dir, target_name);
         if (bin_dir)
@@ -1000,6 +1262,39 @@ bool config_ensure_directories(ProjectConfig *config, const char *project_dir)
             }
             free(obj_dir);
         }
+
+        char *asm_dir = config_resolve_asm_dir(config, project_dir, target_name);
+        if (asm_dir)
+        {
+            if (!ensure_directory_exists(asm_dir))
+            {
+                free(asm_dir);
+                return false;
+            }
+            free(asm_dir);
+        }
+
+        char *ir_dir = config_resolve_ir_dir(config, project_dir, target_name);
+        if (ir_dir)
+        {
+            if (!ensure_directory_exists(ir_dir))
+            {
+                free(ir_dir);
+                return false;
+            }
+            free(ir_dir);
+        }
+
+        char *ast_dir = config_resolve_ast_dir(config, project_dir, target_name);
+        if (ast_dir)
+        {
+            if (!ensure_directory_exists(ast_dir))
+            {
+                free(ast_dir);
+                return false;
+            }
+            free(ast_dir);
+        }
     }
 
     return true;
@@ -1008,34 +1303,80 @@ bool config_ensure_directories(ProjectConfig *config, const char *project_dir)
 bool config_validate(ProjectConfig *config)
 {
     if (!config)
+    {
+        fprintf(stderr, "error: config is NULL\n");
         return false;
+    }
 
+    // Validate [project] section - all fields required
     if (!config->name || strlen(config->name) == 0)
+    {
+        fprintf(stderr, "error: [project] name is required\n");
         return false;
+    }
 
-    if (!config->main_file || strlen(config->main_file) == 0)
+    if (!config->version || strlen(config->version) == 0)
+    {
+        fprintf(stderr, "error: [project] version is required\n");
         return false;
+    }
 
-    // validate that required directories are configured
-    if (!config->src_dir)
+    if (!config->src_dir || strlen(config->src_dir) == 0)
+    {
+        fprintf(stderr, "error: [project] src is required\n");
         return false;
+    }
 
-    if (!config->out_dir)
-        return false;
-
-    // validate targets
+    // Validate at least one target exists
     if (config->target_count == 0)
+    {
+        fprintf(stderr, "error: at least one [targets.<name>] section is required\n");
         return false;
+    }
 
+    // Validate each target - all fields required
     for (int i = 0; i < config->target_count; i++)
     {
         TargetConfig *target = config->targets[i];
+
         if (!target->name || strlen(target->name) == 0)
+        {
+            fprintf(stderr, "error: target name is missing\n");
             return false;
+        }
+
         if (!target->target_triple || strlen(target->target_triple) == 0)
+        {
+            fprintf(stderr, "error: [targets.%s] triple is required\n", target->name);
             return false;
+        }
+
+        if (!target->artifacts_dir || strlen(target->artifacts_dir) == 0)
+        {
+            fprintf(stderr, "error: [targets.%s] artifacts is required\n", target->name);
+            return false;
+        }
+
+        if (!target->out || strlen(target->out) == 0)
+        {
+            fprintf(stderr, "error: [targets.%s] out is required\n", target->name);
+            return false;
+        }
+
+        if (!target->entrypoint || strlen(target->entrypoint) == 0)
+        {
+            fprintf(stderr, "error: [targets.%s] entrypoint is required\n", target->name);
+            return false;
+        }
+
         if (target->opt_level < 0 || target->opt_level > 3)
+        {
+            fprintf(stderr, "error: [targets.%s] opt-level must be 0-3 (got %d)\n", target->name, target->opt_level);
             return false;
+        }
+
+        // Note: boolean fields (emit-ast, emit-ir, emit-asm, emit-object, build-library, no-pie)
+        // are implicitly validated as they default to false if not specified in parsing
     }
 
     return true;
@@ -1212,7 +1553,45 @@ char *config_get_package_src_dir(ProjectConfig *config, const char *project_dir,
         return path;
     }
 
-    // for deps, path is the src dir (no subdir)
+    // for dependencies, check if root/mach.toml exists
+    size_t toml_path_len = strlen(root) + strlen("/mach.toml") + 1;
+    char  *toml_path     = malloc(toml_path_len);
+    snprintf(toml_path, toml_path_len, "%s/mach.toml", root);
+
+    struct stat st;
+    if (stat(toml_path, &st) == 0 && S_ISREG(st.st_mode))
+    {
+        // mach.toml exists - load it to find src directory
+        ProjectConfig *dep_config = config_load(toml_path);
+        free(toml_path);
+
+        if (dep_config && dep_config->src_dir)
+        {
+            // build path: root/src_dir
+            size_t len  = strlen(root) + 1 + strlen(dep_config->src_dir) + 1;
+            char  *path = malloc(len);
+            snprintf(path, len, "%s/%s", root, dep_config->src_dir);
+
+            config_dnit(dep_config);
+            free(dep_config);
+            free(root);
+            return path;
+        }
+
+        if (dep_config)
+        {
+            config_dnit(dep_config);
+            free(dep_config);
+        }
+
+        // if config load failed or no src_dir, fall through to assume root is src
+    }
+    else
+    {
+        free(toml_path);
+    }
+
+    // no mach.toml or couldn't read it - assume path IS the source directory
     return root;
 }
 

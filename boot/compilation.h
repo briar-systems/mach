@@ -31,7 +31,6 @@ typedef struct
     int         link_exe;
     int         no_pie;
     int         debug_info;
-    int         emit_obj;
     int         emit_ast;
     int         emit_ir;
     int         emit_asm;
@@ -39,7 +38,7 @@ typedef struct
     const char *emit_ir_path;
     const char *emit_asm_path;
     const char *obj_dir;
-    const char *dep_dir;
+    const char *target_name; // for project builds - determines out/<target>/ structure
     StringVec   include_paths;
     StringVec   link_objects;
     AliasVec    aliases;
