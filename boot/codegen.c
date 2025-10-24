@@ -2635,7 +2635,13 @@ LLVMValueRef codegen_expr_call(CodegenContext *ctx, AstNode *expr)
             codegen_error(ctx, expr, "failed to generate call argument %d", arg_src_index);
             return NULL;
         }
-        value            = codegen_load_if_needed(ctx, value, arg_node->type, arg_node);
+
+        // Don't load if this is an address-of operation - it already returns the correct pointer
+        bool is_address_of = arg_node->kind == AST_EXPR_UNARY && arg_node->unary_expr.op == TOKEN_QUESTION;
+        if (!is_address_of)
+        {
+            value = codegen_load_if_needed(ctx, value, arg_node->type, arg_node);
+        }
         args[fixed_emit] = value;
 
         Type *param_type = func_type->function.param_types[fixed_emit];
