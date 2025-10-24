@@ -72,9 +72,11 @@ make full
 ```
 
 This builds three compiler stages:
-1. **cmach** - Bootstrap C compiler (`boot/` → `out/cmach/bin/cmach`)
-2. **imach** - Intermediary Mach compiler (`src/` → `out/imach/bin/imach`)
-3. **mach** - Final Mach compiler (`src/` → `out/mach/bin/mach`)
+1. **cmach** - Bootstrap C compiler (`boot/` → `out/bin/cmach`)
+2. **imach** - Intermediary Mach compiler (`src/` → `out/bin/imach`)
+3. **mach** - Final Mach compiler (`src/` → `out/bin/mach`)
+
+All executables are placed in `out/bin/` with stage-specific artifacts in `out/cmach/`, `out/imach/<target>/`, and `out/mach/<target>/`.
 
 ### Understanding the Build Process
 
@@ -119,9 +121,10 @@ make help           # show all targets
 ```
 
 **Build output:**
-- Bootstrap compiler: `out/cmach/bin/cmach`
-- Intermediary compiler: `out/imach/bin/imach`
-- Final compiler: `out/mach/bin/mach`
+- All executables: `out/bin/` directory
+- Bootstrap artifacts: `out/cmach/obj/`
+- Intermediary artifacts: `out/imach/<target>/` (ast, ir, asm, obj subdirectories)
+- Final artifacts: `out/mach/<target>/` (ast, ir, asm, obj subdirectories)
 
 ---
 
@@ -147,10 +150,10 @@ fun main(args: []string) i64 {
 
 ```bash
 # using the bootstrap compiler
-./out/cmach/bin/cmach build hello.mach -o hello
+./out/bin/cmach build hello.mach -o hello
 
 # or using the final compiler
-./out/mach/bin/mach build hello.mach -o hello
+./out/bin/mach build hello.mach -o hello
 
 # run the program
 ./hello
@@ -171,7 +174,7 @@ Common `cmach` flags:
 
 **Example with flags:**
 ```bash
-./out/cmach/bin/cmach build hello.mach \
+./out/bin/cmach build hello.mach \
     -I std \
     -M std=std \
     --obj-dir=build/obj \
@@ -202,16 +205,27 @@ Create a `mach.toml` for your project:
 [project]
 name = "my-project"
 version = "0.1.0"
+src = "src"
+target = "native"
+
+[dependencies]
+std = "std"
+
+[targets.linux]
+triple = "x86_64-pc-linux-gnu"
 entrypoint = "main.mach"
-
-[directories]
-src-dir = "src"
-dep-dir = "dep"
-out-dir = "out"
-
-[modules]
-# module mappings
+artifacts = "out/my-project/linux"
+out = "bin/my-project"
+opt-level = 2
+emit-ast = false
+emit-ir = false
+emit-asm = false
+emit-object = true
+build-library = false
+no-pie = false
 ```
+
+See [`doc/project-layout.md`](project-layout.md) for complete configuration details.
 
 ### Using the Standard Library
 

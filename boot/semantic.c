@@ -3268,158 +3268,154 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
         // try to find method on alias type before resolving (for types like string = []char)
         if (lookup_type->kind == TYPE_ALIAS && lookup_type->name)
         {
-                snprintf(mangled_name, sizeof(mangled_name), "%s__%s", lookup_type->name, method_name);
+            snprintf(mangled_name, sizeof(mangled_name), "%s__%s", lookup_type->name, method_name);
+            method_sym = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, mangled_name);
+        }
+
+        // Store the original type before resolving, in case we need it later
+        Type *original_type = lookup_type;
+
+        // resolve aliases for further processing
+        lookup_type = type_resolve_alias(lookup_type);
+
+        // try looking up methods on the resolved type
+        if (!method_sym && (lookup_type->kind == TYPE_STRUCT || lookup_type->kind == TYPE_UNION || lookup_type->kind == TYPE_ARRAY))
+        {
+            // For array types that came from an alias, use the alias name
+            const char *type_name_for_lookup = NULL;
+            if (lookup_type->kind == TYPE_ARRAY && original_type->kind == TYPE_ALIAS && original_type->name)
+            {
+                type_name_for_lookup = original_type->name;
+            }
+            else if (lookup_type->name)
+            {
+                type_name_for_lookup = lookup_type->name;
+            }
+
+            if (type_name_for_lookup)
+            {
+                // first try: look up fully specialized method
+                // "std_types_result__Result$string$string" -> "std_types_result__Result$string$string__is_err"
+                snprintf(mangled_name, sizeof(mangled_name), "%s__%s", type_name_for_lookup, method_name);
                 method_sym = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, mangled_name);
-            }
 
-            // Store the original type before resolving, in case we need it later
-            Type *original_type = lookup_type;
-
-            // resolve aliases for further processing
-            lookup_type = type_resolve_alias(lookup_type);
-
-            // try looking up methods on the resolved type
-            if (!method_sym && (lookup_type->kind == TYPE_STRUCT || lookup_type->kind == TYPE_UNION || lookup_type->kind == TYPE_ARRAY))
-            {
-                // For array types that came from an alias, use the alias name
-                const char *type_name_for_lookup = NULL;
-                if (lookup_type->kind == TYPE_ARRAY && original_type->kind == TYPE_ALIAS && original_type->name)
+                // if not found and type is specialized, instantiate generic method
+                if (!method_sym && lookup_type->generic_origin && lookup_type->type_arg_count > 0)
                 {
-                    type_name_for_lookup = original_type->name;
-                }
-                else if (lookup_type->name)
-                {
-                    type_name_for_lookup = lookup_type->name;
-                }
-                
-                if (type_name_for_lookup)
-                {
-                    // first try: look up fully specialized method
-                    // "std_types_result__Result$string$string" -> "std_types_result__Result$string$string__is_err"
-                    snprintf(mangled_name, sizeof(mangled_name), "%s__%s", type_name_for_lookup, method_name);
-                    method_sym = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, mangled_name);
+                    // use stored type arguments from the specialized type
+                    Symbol *generic_type_sym = lookup_type->generic_origin;
 
-                    // if not found and type is specialized, instantiate generic method
-                    if (!method_sym && lookup_type->generic_origin && lookup_type->type_arg_count > 0)
+                    // construct generic method name from the generic type
+                    char generic_method_name[256];
+                    snprintf(generic_method_name, sizeof(generic_method_name), "%s__%s", generic_type_sym->name, method_name);
+
+                    Symbol *generic_method = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, generic_method_name);
+
+                    if (!generic_method)
                     {
-                        // use stored type arguments from the specialized type
-                        Symbol *generic_type_sym = lookup_type->generic_origin;
+                        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "generic method '%s' not found in any scope", generic_method_name);
+                        return NULL;
+                    }
 
-                        // construct generic method name from the generic type
-                        char generic_method_name[256];
-                        snprintf(generic_method_name, sizeof(generic_method_name), "%s__%s", generic_type_sym->name, method_name);
+                    if (generic_method->kind != SYMBOL_FUNC)
+                    {
+                        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "symbol '%s' is not a function (kind=%d)", generic_method_name, generic_method->kind);
+                        return NULL;
+                    }
 
-                        Symbol *generic_method = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, generic_method_name);
+                    if (!generic_method->func.is_generic)
+                    {
+                        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "function '%s' is not generic", generic_method_name);
+                        return NULL;
+                    }
 
-                        if (!generic_method)
-                        {
-                            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "generic method '%s' not found in any scope", generic_method_name);
-                            return NULL;
-                        }
+                    if (!generic_method->func.is_method)
+                    {
+                        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "function '%s' is not a method", generic_method_name);
+                        return NULL;
+                    }
 
-                        if (generic_method->kind != SYMBOL_FUNC)
-                        {
-                            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "symbol '%s' is not a function (kind=%d)", generic_method_name, generic_method->kind);
-                            return NULL;
-                        }
+                    // instantiate generic method with type arguments from the specialized type
+                    method_sym = instantiate_generic_function(driver, ctx, generic_method, lookup_type->type_args, lookup_type->type_arg_count);
+                    if (!method_sym)
+                    {
+                        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "failed to instantiate generic method '%s' with %zu type arguments", generic_method_name, lookup_type->type_arg_count);
+                        return NULL;
+                    }
+                }
+            }
+        }
 
-                        if (!generic_method->func.is_generic)
-                        {
-                            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "function '%s' is not generic", generic_method_name);
-                            return NULL;
-                        }
-
-                        if (!generic_method->func.is_method)
-                        {
-                            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "function '%s' is not a method", generic_method_name);
-                            return NULL;
-                        }
-
-                        // instantiate generic method with type arguments from the specialized type
-                        method_sym = instantiate_generic_function(driver, ctx, generic_method, lookup_type->type_args, lookup_type->type_arg_count);
-                        if (!method_sym)
-                        {
-                            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "failed to instantiate generic method '%s' with %zu type arguments", generic_method_name, lookup_type->type_arg_count);
-                            return NULL;
-                        }
+        if (method_sym && method_sym->kind == SYMBOL_FUNC && method_sym->func.is_method)
+        {
+            // check if method expects pointer receiver and coerce if needed
+            AstNode *receiver_arg = receiver;
+            if (method_sym->type && method_sym->type->kind == TYPE_FUNCTION && method_sym->type->function.param_count > 0)
+            {
+                Type *first_param_type = method_sym->type->function.param_types[0];
+                if (first_param_type && first_param_type->kind == TYPE_POINTER)
+                {
+                    // method expects pointer receiver, but we have value type
+                    if (receiver_type->kind != TYPE_POINTER)
+                    {
+                        // create address-of operation
+                        AstNode *addr_of = malloc(sizeof(AstNode));
+                        ast_node_init(addr_of, AST_EXPR_UNARY);
+                        addr_of->token           = NULL; // don't share token to avoid double-free
+                        addr_of->unary_expr.op   = TOKEN_QUESTION;
+                        addr_of->unary_expr.expr = receiver;
+                        addr_of->type            = type_pointer_create(receiver_type);
+                        receiver_arg             = addr_of;
                     }
                 }
             }
 
-            if (method_sym && method_sym->kind == SYMBOL_FUNC && method_sym->func.is_method)
+            // transform method call: prepend receiver as first argument
+            if (!expr->call_expr.args)
             {
-                // check if method expects pointer receiver and coerce if needed
-                AstNode *receiver_arg = receiver;
-                if (method_sym->type && method_sym->type->kind == TYPE_FUNCTION && method_sym->type->function.param_count > 0)
-                {
-                    Type *first_param_type = method_sym->type->function.param_types[0];
-                    if (first_param_type && first_param_type->kind == TYPE_POINTER)
-                    {
-                        // method expects pointer receiver, but we have value type
-                        if (receiver_type->kind != TYPE_POINTER)
-                        {
-                            // create address-of operation
-                            AstNode *addr_of = malloc(sizeof(AstNode));
-                            ast_node_init(addr_of, AST_EXPR_UNARY);
-                            addr_of->token           = NULL; // don't share token to avoid double-free
-                            addr_of->unary_expr.op   = TOKEN_QUESTION;
-                            addr_of->unary_expr.expr = receiver;
-                            addr_of->type            = type_pointer_create(receiver_type);
-                            receiver_arg             = addr_of;
-                        }
-                    }
-                }
-
-                // transform method call: prepend receiver as first argument
-                if (!expr->call_expr.args)
-                {
-                    expr->call_expr.args = malloc(sizeof(AstList));
-                    ast_list_init(expr->call_expr.args);
-                }
-
-                // insert receiver at the beginning
-                ast_list_prepend(expr->call_expr.args, receiver_arg);
-
-                // replace func with identifier pointing to method symbol
-                AstNode *ident = malloc(sizeof(AstNode));
-                ast_node_init(ident, AST_EXPR_IDENT);
-                ident->token           = field_expr->token;
-                ident->ident_expr.name = strdup(mangled_name);
-                ident->symbol          = method_sym;
-                ident->type            = method_sym->type;
-
-                // clear receiver from field expr to prevent double-free
-                // receiver is now owned by either:
-                // - the addr_of node (if wrapped), which is in args
-                // - directly in args (if not wrapped)
-                field_expr->field_expr.object = NULL;
-                field_expr->token             = NULL;
-
-                // replace func
-                expr->call_expr.func           = ident;
-                expr->call_expr.is_method_call = true;
-
-                // free the old field expression
-                ast_node_dnit(field_expr);
-                free(field_expr);
-
-                // continue with normal call analysis below
+                expr->call_expr.args = malloc(sizeof(AstList));
+                ast_list_init(expr->call_expr.args);
             }
-            else
-            {
-                // not a method - might be a function stored in a field, which isn't supported yet
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, 
-                                "no method '%s' found on type (kind=%d, name=%s)", 
-                                method_name,
-                                receiver_type ? receiver_type->kind : -1,
-                                receiver_type && receiver_type->name ? receiver_type->name : "(null)");
-                return NULL;
-            }
+
+            // insert receiver at the beginning
+            ast_list_prepend(expr->call_expr.args, receiver_arg);
+
+            // replace func with identifier pointing to method symbol
+            AstNode *ident = malloc(sizeof(AstNode));
+            ast_node_init(ident, AST_EXPR_IDENT);
+            ident->token           = field_expr->token;
+            ident->ident_expr.name = strdup(mangled_name);
+            ident->symbol          = method_sym;
+            ident->type            = method_sym->type;
+
+            // clear receiver from field expr to prevent double-free
+            // receiver is now owned by either:
+            // - the addr_of node (if wrapped), which is in args
+            // - directly in args (if not wrapped)
+            field_expr->field_expr.object = NULL;
+            field_expr->token             = NULL;
+
+            // replace func
+            expr->call_expr.func           = ident;
+            expr->call_expr.is_method_call = true;
+
+            // free the old field expression
+            ast_node_dnit(field_expr);
+            free(field_expr);
+
+            // continue with normal call analysis below
+        }
+        else
+        {
+            // not a method - might be a function stored in a field, which isn't supported yet
+            diagnostic_emit(
+                &driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "no method '%s' found on type (kind=%d, name=%s)", method_name, receiver_type ? receiver_type->kind : -1, receiver_type && receiver_type->name ? receiver_type->name : "(null)");
+            return NULL;
+        }
     }
 
-normal_call_analysis:
-    ;  // label must be followed by a statement
-    
+normal_call_analysis:; // label must be followed by a statement
+
     if (expr->call_expr.func && expr->call_expr.func->kind == AST_EXPR_IDENT)
     {
         const char *intr_name = expr->call_expr.func->ident_expr.name;

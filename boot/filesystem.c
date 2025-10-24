@@ -39,6 +39,26 @@ int fs_file_exists(const char *path)
     return stat(path, &st) == 0;
 }
 
+int fs_is_directory(const char *path)
+{
+    if (!path)
+        return 0;
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+    return S_ISDIR(st.st_mode);
+}
+
+int fs_is_mach_file(const char *path)
+{
+    if (!path)
+        return 0;
+    size_t len = strlen(path);
+    if (len < 6) // minimum: "a.mach"
+        return 0;
+    return strcmp(path + len - 5, ".mach") == 0;
+}
+
 int fs_ensure_dir_recursive(const char *path)
 {
     if (!path || !*path)

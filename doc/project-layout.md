@@ -14,8 +14,8 @@ It is meant to serve as a "best practices" guide for Mach projects to ensure con
   - [Project Manifest (`mach.toml`)](#project-manifest-machtoml)
     - [Basic structure](#basic-structure)
     - [`[project]` section](#project-section)
-    - [`[directories]` section](#directories-section)
-    - [`[deps]` section](#deps-section)
+    - [`[targets.<name>]` section](#targetsname-section)
+    - [`[dependencies]` section (formerly `[directories]` and `[deps]`)](#dependencies-section-formerly-directories-and-deps)
   - [Build Organization](#build-organization)
     - [Build artifacts](#build-artifacts)
   - [Dependencies](#dependencies)
@@ -35,8 +35,20 @@ my-project/
 │   └── some-lib/
 ├── doc/               # documentation (optional)
 ├── out/               # build artifacts (generated)
-│   ├── obj/           # object files
-│   └── bin/           # executables
+│   ├── bin/           # final executables (all stages)
+│   │   ├── cmach      # bootstrap compiler
+│   │   ├── imach      # intermediate compiler
+│   │   └── mach       # final compiler
+│   ├── cmach/         # bootstrap compiler artifacts
+│   │   └── obj/       # object files
+│   ├── imach/         # intermediate compiler artifacts
+│   │   └── <target>/  # per-target artifacts
+│   │       ├── ast/   # AST files
+│   │       ├── ir/    # LLVM IR
+│   │       ├── asm/   # assembly
+│   │       └── obj/   # object files
+│   └── mach/          # final compiler artifacts
+│       └── <target>/  # per-target artifacts
 ├── src/               # source files
 │   ├── main.mach      # entry point
 │   └── ...            # other source files specific to the project
@@ -50,6 +62,8 @@ my-project/
 - **`dep/`** – External dependencies. Each dependency is a subdirectory containing its own Mach source.
 - **`doc/`** – Project documentation.
 - **`out/`** – Generated build artifacts. Should be excluded from version control.
+  - **`out/bin/`** – Final executables from all build stages
+  - **`out/<stage>/<target>/`** – Per-stage, per-target build artifacts
 
 **Minimal project:**
 
@@ -61,9 +75,9 @@ At minimum, a Mach project needs:
 
 ## Project Manifest (`mach.toml`)
 
-Every Mach project requires a `mach.toml` file at the root. This TOML file configures the project, specifies directories, and declares dependencies.
+Every Mach project requires a `mach.toml` file at the root. This TOML file configures the project, specifies build targets, and declares dependencies.
 
-> NOTE: The mach project file is technically NOT required to build simple projects, as the compiler can be invoked with explicit flags. However, using `mach.toml` simplifies builds by providing defaults and reducing command-line complexity.
+> NOTE: The mach project file is technically NOT required to build simple programs or to customize the build process, as the compiler can be invoked with explicit flags. However, using `mach.toml` simplifies builds by providing defaults and reducing command-line complexity.
 
 ### Basic structure
 
@@ -71,53 +85,101 @@ Every Mach project requires a `mach.toml` file at the root. This TOML file confi
 [project]
 name = "my_project"
 version = "0.1.0"
-entrypoint = "main.mach"
-
-[directories]
 src = "src"
-out = "out"
+target = "native"  # or "all", or a specific target name
 
-[deps]
-# dependency declarations
+[dependencies]
+std = "std"
+
+[targets.linux]
+triple = "x86_64-pc-linux-gnu"
+entrypoint = "main.mach"
+artifacts = "out/mach/linux"
+out = "bin/mach"
+opt-level = 2
+emit-ast = true
+emit-ir = true
+emit-asm = true
+emit-object = true
+build-library = false
+no-pie = false
 ```
 
 ### `[project]` section
 
-Identifies the project and its entry point:
+Identifies the project and build configuration:
 
-- **`name`** (required) – Project name. Used for build artifacts and identification.
+- **`name`** (required) – Project name. Used for build artifacts and module namespace.
 - **`version`** (required) – Semantic version string (e.g., `"0.1.0"`).
-- **`entrypoint`** (required) – Main source file relative to the `src` directory. Must contain the program's entry point.
+- **`src`** (required) – Source directory containing `.mach` files (default: `"src"`).
+- **`target`** (required) – Default target to build:
+  - `"native"` – Build for the host platform (auto-detected via LLVM)
+  - `"all"` – Build for all defined targets
+  - `"<target-name>"` – Build a specific target (e.g., `"linux"`, `"darwin"`, `"windows"`)
 
 **Example:**
 ```toml
 [project]
 name = "http-server"
 version = "1.2.3"
-entrypoint = "main.mach"
+src = "src"
+target = "native"
 ```
 
-### `[directories]` section
+### `[targets.<name>]` section
 
-Specifies project directory layout:
+Each target defines a build configuration for a specific platform:
 
-- **`src`** (optional, default: `"src"`) – Source directory containing `.mach` files.
-- **`out`** (optional, default: `"out"`) – Output directory for build artifacts.
+- **`triple`** (required) – LLVM target triple (e.g., `"x86_64-pc-linux-gnu"`)
+- **`entrypoint`** (required) – Main source file relative to the `src` directory
+- **`artifacts`** (required) – Directory for build artifacts (AST, IR, ASM, OBJ) relative to project root
+- **`out`** (required) – Final executable/library path (relative to project root or absolute)
+- **`opt-level`** (required) – Optimization level (0-3)
+- **`emit-ast`** (required) – Emit AST files (true/false)
+- **`emit-ir`** (required) – Emit LLVM IR files (true/false)
+- **`emit-asm`** (required) – Emit assembly files (true/false)
+- **`emit-object`** (required) – Emit object files (true/false)
+- **`build-library`** (required) – Build as library instead of executable (true/false)
+- **`shared`** (optional) – Build shared library if build-library=true (true/false)
+- **`no-pie`** (optional) – Disable position-independent executable (true/false)
+- **`link`** (optional, repeatable) – External libraries to link (e.g., `link = "/usr/lib/libglfw.so"`)
 
 **Example:**
 ```toml
-[directories]
-src = "source"
-out = "build"
+[targets.linux]
+triple = "x86_64-pc-linux-gnu"
+entrypoint = "main.mach"
+artifacts = "out/mach/linux"
+out = "bin/mach"
+opt-level = 2
+emit-ast = true
+emit-ir = true
+emit-asm = true
+emit-object = true
+build-library = false
+no-pie = false
+
+[targets.darwin]
+triple = "x86_64-apple-darwin"
+entrypoint = "main.mach"
+artifacts = "out/mach/darwin"
+out = "bin/mach"
+opt-level = 2
+emit-ast = false
+emit-ir = false
+emit-asm = false
+emit-object = true
+build-library = false
+no-pie = false
 ```
 
-### `[deps]` section
+### `[dependencies]` section (formerly `[directories]` and `[deps]`)
 
 Maps dependency names to their locations. Dependencies are effectively mappings for module resolution.
 
 **Simple local dependency:**
 ```toml
-[deps]
+[dependencies]
 std = "std"              # points to ./std/
 mylib = "dep/mylib/src"  # points to ./dep/mylib/src
 ```
@@ -132,17 +194,40 @@ Dependencies must point to mach SOURCE directories, not project roots.
 
 ### Build artifacts
 
-The compiler generates several types of artifacts in the `out/` directory:
+The compiler generates several types of artifacts organized by build stage and target:
 
 ```
 out/
-├── obj/               # compiled object files (.o)
-├── asm/               # assembly listings (with --emit-asm)
-├── ast/               # AST dumps (with --emit-ast)
-├── ir/                # LLVM IR (with --emit-ir)
-└── bin/               # final executables or libraries
-    └── my_project
+├── bin/                      # final executables from all build stages
+│   ├── cmach                 # bootstrap compiler (C-based)
+│   ├── imach                 # intermediate compiler (Mach-based)
+│   └── mach                  # final compiler (Mach-based)
+├── cmach/                    # bootstrap compiler artifacts
+│   └── obj/                  # object files (.o)
+├── imach/                    # intermediate compiler artifacts
+│   └── <target>/             # per-target (e.g., linux, darwin, windows)
+│       ├── ast/              # AST files (.ast)
+│       │   └── <namespace>/  # module namespace (e.g., mach/)
+│       ├── ir/               # LLVM IR files (.ll)
+│       │   └── <namespace>/
+│       ├── asm/              # assembly files (.s)
+│       │   └── <namespace>/
+│       └── obj/              # object files (.o)
+│           └── <namespace>/
+└── mach/                     # final compiler artifacts
+    └── <target>/             # per-target organization
+        ├── ast/
+        ├── ir/
+        ├── asm/
+        └── obj/
 ```
+
+**Key points:**
+
+- All final executables go in `out/bin/` regardless of build stage
+- Artifacts are organized by stage (`cmach`, `imach`, `mach`)
+- Multi-stage builds use per-target subdirectories for cross-compilation
+- Modules are namespaced within artifact directories (e.g., `mach/main.ll`)
 
 **Exclude from version control:**
 
@@ -176,7 +261,7 @@ my-project/
 
 Configure in `mach.toml`:
 ```toml
-[deps]
+[dependencies]
 json = "dep/json-parser"
 http = "dep/http-client"
 ```
@@ -192,7 +277,7 @@ use http.client;
 The Mach standard library is typically a dependency:
 
 ```toml
-[deps]
+[dependencies]
 std = "path/to/std"
 ```
 

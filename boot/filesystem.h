@@ -7,6 +7,12 @@ char *fs_read_file(const char *path);
 // check if file exists
 int fs_file_exists(const char *path);
 
+// check if path is a directory
+int fs_is_directory(const char *path);
+
+// check if path ends with .mach extension
+int fs_is_mach_file(const char *path);
+
 // recursively create directory and all parent directories
 int fs_ensure_dir_recursive(const char *path);
 
