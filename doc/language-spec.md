@@ -128,21 +128,33 @@ Mach is a statically typed, compiled systems language with explicit control over
 
 ### Tokens
 
-Operators and punctuation:
+**Operators:**
 
-```
-+  -  *  /  %
-&  |  ^  ~
-<< >>
-== != < <= > >=
-=  ::
-?  @
-( ) [ ] { }
-,  ;  .  :
-...
-```
+| Operator | Description | Example |
+|----------|-------------|---------|
+| `+` `-` `*` `/` `%` | Arithmetic: addition, subtraction, multiplication, division, modulo | `a + b`, `x * y` |
+| `&` `|` `^` `~` | Bitwise: AND, OR, XOR, NOT | `flags & mask`, `~bits` |
+| `<<` `>>` | Bitwise shifts: left shift, right shift | `value << 4` |
+| `==` `!=` | Equality: equal, not equal | `x == y` |
+| `<` `<=` `>` `>=` | Relational: less than, less or equal, greater than, greater or equal | `a < b` |
+| `&&` `||` `!` | Logical: AND, OR, NOT | `valid && ready`, `!flag` |
+| `=` | Assignment | `x = 10` |
+| `::` | Type cast | `value :: u64` |
+| `?` | Address-of (pointer from lvalue) | `?variable` |
+| `@` | Dereference (lvalue from pointer) | `@pointer` |
 
-`::` is used for casts; `?` and `@` handle address-of and dereference.
+**Punctuation:**
+
+| Symbol | Purpose |
+|--------|---------|
+| `( )` | Function calls, grouping expressions, type parameters |
+| `[ ]` | Array indexing, array type declarations |
+| `{ }` | Block statements, record/union bodies, literals |
+| `,` | Separator for arguments, parameters, and fields |
+| `;` | Statement terminator |
+| `.` | Field access, module path separator |
+| `:` | Type annotations |
+| `...` | Variadic function parameters, variadic argument forwarding |
 
 ---
 
