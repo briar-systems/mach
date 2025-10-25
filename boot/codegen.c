@@ -1570,6 +1570,10 @@ LLVMValueRef codegen_stmt_fun(CodegenContext *ctx, AstNode *stmt)
     if (!func)
     {
         func = LLVMAddFunction(ctx->module, func_name, llvm_func_type);
+
+        // prevent LLVM from optimizing code into library calls (e.g., loop -> strlen)
+        // we don't link to libc and provide our own implementations
+        LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex, LLVMCreateStringAttribute(ctx->context, "no-builtins", 11, "", 0));
     }
     free(param_types);
 
