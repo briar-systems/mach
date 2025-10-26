@@ -18,6 +18,16 @@ static LLVMMetadataRef codegen_get_current_scope(CodegenContext *ctx);
 static LLVMMetadataRef codegen_debug_get_unknown_type(CodegenContext *ctx);
 static LLVMMetadataRef codegen_debug_create_subprogram(CodegenContext *ctx, AstNode *stmt, LLVMValueRef func, const char *display_name, const char *link_name, size_t param_count);
 
+// Helper function to add a function with required attributes
+// Prevents LLVM from optimizing code into library calls (e.g., loop -> strlen)
+// This is critical since we don't link to libc and provide our own implementations
+static LLVMValueRef codegen_add_function(CodegenContext *ctx, const char *name, LLVMTypeRef function_type)
+{
+    LLVMValueRef func = LLVMAddFunction(ctx->module, name, function_type);
+    LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex, LLVMCreateStringAttribute(ctx->context, "no-builtins", 11, "", 0));
+    return func;
+}
+
 // simple constant folding for integers/booleans used in global initializers
 static bool codegen_eval_const_i64(CodegenContext *ctx, AstNode *expr, int64_t *out)
 {
@@ -578,7 +588,7 @@ static void codegen_declare_function_symbol(CodegenContext *ctx, Symbol *sym)
     {
         func = LLVMGetNamedFunction(ctx->module, llvm_name);
         if (!func)
-            func = LLVMAddFunction(ctx->module, llvm_name, llvm_func_type);
+            func = codegen_add_function(ctx, llvm_name, llvm_func_type);
     }
 
     if (param_types)
@@ -1338,7 +1348,7 @@ LLVMValueRef codegen_stmt_ext(CodegenContext *ctx, AstNode *stmt)
     LLVMTypeRef llvm_func_type = LLVMFunctionType(return_type, param_types, llvm_param_count, uses_mach_varargs ? false : func_type->function.is_variadic);
 
     // create function declaration with target symbol name
-    func = LLVMAddFunction(ctx->module, symbol_name, llvm_func_type);
+    func = codegen_add_function(ctx, symbol_name, llvm_func_type);
 
     free(param_types);
 
@@ -1569,11 +1579,7 @@ LLVMValueRef codegen_stmt_fun(CodegenContext *ctx, AstNode *stmt)
     LLVMValueRef func           = LLVMGetNamedFunction(ctx->module, func_name);
     if (!func)
     {
-        func = LLVMAddFunction(ctx->module, func_name, llvm_func_type);
-
-        // prevent LLVM from optimizing code into library calls (e.g., loop -> strlen)
-        // we don't link to libc and provide our own implementations
-        LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex, LLVMCreateStringAttribute(ctx->context, "no-builtins", 11, "", 0));
+        func = codegen_add_function(ctx, func_name, llvm_func_type);
     }
     free(param_types);
 
@@ -2430,7 +2436,7 @@ LLVMValueRef codegen_expr_call(CodegenContext *ctx, AstNode *expr)
             LLVMValueRef abort_func = LLVMGetNamedFunction(ctx->module, "abort");
             if (!abort_func)
             {
-                abort_func = LLVMAddFunction(ctx->module, "abort", abort_type);
+                abort_func = codegen_add_function(ctx, "abort", abort_type);
             }
             LLVMBuildCall2(ctx->builder, abort_type, abort_func, NULL, 0, "");
             LLVMBuildUnreachable(ctx->builder);
@@ -3369,7 +3375,7 @@ LLVMValueRef codegen_expr_index(CodegenContext *ctx, AstNode *expr)
             LLVMValueRef abort_func = LLVMGetNamedFunction(ctx->module, "abort");
             if (!abort_func)
             {
-                abort_func = LLVMAddFunction(ctx->module, "abort", abort_type);
+                abort_func = codegen_add_function(ctx, "abort", abort_type);
             }
             LLVMBuildCall2(ctx->builder, abort_type, abort_func, NULL, 0, "");
             LLVMBuildUnreachable(ctx->builder);
