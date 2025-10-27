@@ -11,6 +11,8 @@ It is intended to be a systems programming language, but can be used for a wide 
 
 > Mach is still alpha quality. Expect breaking changes as the compiler and standard library iterate.
 
+We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
+
 # Overview
 
 - [MACH](#mach)
@@ -95,7 +97,7 @@ use          std.runtime;
 use          std.types.string;
 use console: std.io.console;
 
-fun fibr(n: i64): i64 {
+fun fibr(n: i64) i64 {
     if (n < 2) {
         ret n;
     }
@@ -104,7 +106,7 @@ fun fibr(n: i64): i64 {
 }
 
 #@symbol("main")
-fun main(args: []string): i64 {
+fun main(args: []string) i64 {
     var max: i64 = 10;
     console.print("%i", fibr(max));
     ret 0;
@@ -119,7 +121,7 @@ use          std.runtime;
 use          std.types.string;
 use console: std.io.console;
 
-fun fact(n: i64): i64 {
+fun fact(n: i64) i64 {
     if (n == 0) {
         ret 1;
     }
@@ -128,7 +130,7 @@ fun fact(n: i64): i64 {
 }
 
 #@symbol("main")
-fun main(args: []string): i64 {
+fun main(args: []string) i64 {
     var max: i64 = 10;
     console.print("%i", fact(max));
     ret 0;
