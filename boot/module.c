@@ -4,7 +4,6 @@
 #include "filesystem.h"
 #include "ioutil.h"
 #include "lexer.h"
-#include "preprocessor.h"
 #include "symbol.h"
 #include <llvm-c/Core.h>
 #include <llvm-c/Target.h>
@@ -269,9 +268,6 @@ void module_manager_init(ModuleManager *manager)
     manager->target_os     = NULL;
     manager->target_arch   = NULL;
 
-    manager->cached_constants       = NULL;
-    manager->cached_constants_count = 0;
-
     module_error_list_init(&manager->errors);
     manager->had_error = false;
 
@@ -313,8 +309,6 @@ void module_manager_dnit(ModuleManager *manager)
     free(manager->target_triple);
     free(manager->target_os);
     free(manager->target_arch);
-
-    free(manager->cached_constants);
 
     // clean up errors
     module_error_list_dnit(&manager->errors);
@@ -524,16 +518,6 @@ static void module_manager_update_target_info(ModuleManager *manager)
 
     if (owned_triple)
         LLVMDisposeMessage(owned_triple);
-
-    // rebuild cached constants
-    free(manager->cached_constants);
-    manager->cached_constants       = malloc(32 * sizeof(PreprocessorConstant));
-    manager->cached_constants_count = 0;
-
-    if (manager->cached_constants)
-    {
-        manager->cached_constants_count = module_manager_collect_constants(manager, manager->cached_constants, 32);
-    }
 }
 
 void module_manager_add_search_path(ModuleManager *manager, const char *path)
@@ -758,31 +742,6 @@ static Module *module_manager_load_module_internal(ModuleManager *manager, const
             }
             free(platform_path);
         }
-
-        PreprocessorConstant constants[32];
-        size_t               constant_count = module_manager_collect_constants(manager, constants, sizeof(constants) / sizeof(constants[0]));
-
-        PreprocessorOutput pp_output;
-        preprocessor_output_init(&pp_output);
-
-        if (!preprocessor_run(source, constants, constant_count, &pp_output))
-        {
-            const char *msg = pp_output.message ? pp_output.message : "conditional directive failure";
-            char        error_msg[256];
-            snprintf(error_msg, sizeof(error_msg), "#! directive error on line %d: %s", pp_output.line, msg);
-            module_error_list_add(&manager->errors, canonical, file_path, error_msg);
-            manager->had_error = true;
-            preprocessor_output_dnit(&pp_output);
-            free(source);
-            free(file_path);
-            free(canonical);
-            return NULL;
-        }
-
-        free(source);
-        source           = pp_output.source;
-        pp_output.source = NULL;
-        preprocessor_output_dnit(&pp_output);
     }
 
     if (is_target_builtin)
@@ -906,87 +865,126 @@ static unsigned int map_arch_id(const char *arch_part)
     return 255u; // unknown
 }
 
-size_t module_manager_collect_constants(ModuleManager *manager, PreprocessorConstant *out, size_t max_count)
+static unsigned int module_manager_current_os_id(ModuleManager *manager)
 {
-    if (!out || max_count == 0)
+    if (!manager || !manager->target_os)
+        return 255u;
+
+    const char *os = manager->target_os;
+    if (strcmp(os, "linux") == 0)
+        return 1u;
+    if (strcmp(os, "darwin") == 0)
+        return 2u;
+    if (strcmp(os, "windows") == 0)
+        return 3u;
+    if (strcmp(os, "freebsd") == 0)
+        return 4u;
+    if (strcmp(os, "netbsd") == 0)
+        return 5u;
+    if (strcmp(os, "openbsd") == 0)
+        return 6u;
+    if (strcmp(os, "dragonfly") == 0)
+        return 7u;
+    if (strcmp(os, "wasm") == 0)
+        return 8u;
+    return 255u;
+}
+
+static unsigned int module_manager_current_arch_id(ModuleManager *manager)
+{
+    if (!manager || !manager->target_arch)
+        return 255u;
+
+    const char *arch = manager->target_arch;
+    if (strcmp(arch, "x86_64") == 0)
+        return 1u;
+    if (strcmp(arch, "aarch64") == 0)
+        return 2u;
+    if (strcmp(arch, "riscv64") == 0)
+        return 3u;
+    if (strcmp(arch, "wasm32") == 0)
+        return 4u;
+    if (strcmp(arch, "wasm64") == 0)
+        return 5u;
+    return 255u;
+}
+
+bool module_manager_try_get_constant(ModuleManager *manager, const char *name, long long *value_out)
+{
+    if (!manager || !name || !value_out)
     {
-        return 0;
+        return false;
     }
 
-    // use cached constants if available
-    if (manager && manager->cached_constants && manager->cached_constants_count > 0)
-    {
-        size_t copy_count = manager->cached_constants_count < max_count ? manager->cached_constants_count : max_count;
-        memcpy(out, manager->cached_constants, copy_count * sizeof(PreprocessorConstant));
-        return copy_count;
-    }
+    unsigned int os_id   = module_manager_current_os_id(manager);
+    unsigned int arch_id = module_manager_current_arch_id(manager);
+    unsigned int ptr_w   = (unsigned int)(sizeof(void *) * 8);
 
-    // fallback: build constants from scratch
-    size_t count = 0;
-
-    const char *triple    = manager ? manager->target_triple : NULL;
-    char       *arch_part = NULL;
-    char       *os_part   = NULL;
-
-    if (triple && *triple)
-    {
-        split_triple(triple, &arch_part, &os_part);
-    }
-
-    unsigned int os_id   = map_os_id(os_part);
-    unsigned int arch_id = map_arch_id(arch_part);
-
-    unsigned int ptr_width = (unsigned int)(sizeof(void *) * 8);
     union
     {
         uint16_t      v;
         unsigned char b[2];
-    } u;
-    u.v                 = 0x0102;
-    unsigned int endian = (u.b[0] == 0x02) ? 0u : 1u;
+    } endian_check      = {.v = 0x0102};
+    unsigned int endian = (endian_check.b[0] == 0x02) ? 0u : 1u;
 
     unsigned int debug_flag = 0u;
 
-#define ADD_CONST(NAME, VALUE)                     \
-    do                                             \
-    {                                              \
-        if (count < max_count)                     \
-        {                                          \
-            out[count].name  = (NAME);             \
-            out[count].value = (long long)(VALUE); \
-            count++;                               \
-        }                                          \
-    } while (0)
+    struct ConstantEntry
+    {
+        const char  *name;
+        unsigned int value;
+    } entries[] = {{"OS_LINUX", 1u},
+                   {"OS_DARWIN", 2u},
+                   {"OS_WINDOWS", 3u},
+                   {"OS_FREEBSD", 4u},
+                   {"OS_NETBSD", 5u},
+                   {"OS_OPENBSD", 6u},
+                   {"OS_DRAGONFLY", 7u},
+                   {"OS_WASM", 8u},
+                   {"OS_UNKNOWN", 255u},
+                   {"ARCH_X86_64", 1u},
+                   {"ARCH_AARCH64", 2u},
+                   {"ARCH_RISCV64", 3u},
+                   {"ARCH_WASM32", 4u},
+                   {"ARCH_WASM64", 5u},
+                   {"ARCH_UNKNOWN", 255u}};
 
-    ADD_CONST("OS_LINUX", 1u);
-    ADD_CONST("OS_DARWIN", 2u);
-    ADD_CONST("OS_WINDOWS", 3u);
-    ADD_CONST("OS_FREEBSD", 4u);
-    ADD_CONST("OS_NETBSD", 5u);
-    ADD_CONST("OS_OPENBSD", 6u);
-    ADD_CONST("OS_DRAGONFLY", 7u);
-    ADD_CONST("OS_WASM", 8u);
-    ADD_CONST("OS_UNKNOWN", 255u);
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++)
+    {
+        if (strcmp(entries[i].name, name) == 0)
+        {
+            *value_out = (long long)entries[i].value;
+            return true;
+        }
+    }
 
-    ADD_CONST("ARCH_X86_64", 1u);
-    ADD_CONST("ARCH_AARCH64", 2u);
-    ADD_CONST("ARCH_RISCV64", 3u);
-    ADD_CONST("ARCH_WASM32", 4u);
-    ADD_CONST("ARCH_WASM64", 5u);
-    ADD_CONST("ARCH_UNKNOWN", 255u);
+    if (strcmp(name, "OS") == 0)
+    {
+        *value_out = (long long)os_id;
+        return true;
+    }
+    if (strcmp(name, "ARCH") == 0)
+    {
+        *value_out = (long long)arch_id;
+        return true;
+    }
+    if (strcmp(name, "PTR_WIDTH") == 0)
+    {
+        *value_out = (long long)ptr_w;
+        return true;
+    }
+    if (strcmp(name, "ENDIAN") == 0)
+    {
+        *value_out = (long long)endian;
+        return true;
+    }
+    if (strcmp(name, "DEBUG") == 0)
+    {
+        *value_out = (long long)debug_flag;
+        return true;
+    }
 
-    ADD_CONST("OS", os_id);
-    ADD_CONST("ARCH", arch_id);
-    ADD_CONST("PTR_WIDTH", ptr_width);
-    ADD_CONST("ENDIAN", endian);
-    ADD_CONST("DEBUG", debug_flag);
-
-#undef ADD_CONST
-
-    free(arch_part);
-    free(os_part);
-
-    return count;
+    return false;
 }
 
 static char *dup_fragment(const char *start, size_t len)

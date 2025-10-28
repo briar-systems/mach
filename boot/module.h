@@ -3,7 +3,6 @@
 
 #include "ast.h"
 #include "parser.h"
-#include "preprocessor.h"
 #include <stdbool.h>
 
 typedef struct Module              Module;
@@ -66,10 +65,6 @@ struct ModuleManager
     char *target_triple; // cached target triple (from config or host)
     char *target_os;     // normalized os name (linux/windows/darwin/...) for platform suffix resolution
     char *target_arch;   // normalized arch name (x86_64/aarch64/...)
-
-    // cached preprocessor constants
-    PreprocessorConstant *cached_constants;
-    size_t                cached_constants_count;
 };
 
 // module manager lifecycle
@@ -77,10 +72,10 @@ void module_manager_init(ModuleManager *manager);
 void module_manager_dnit(ModuleManager *manager);
 
 // search path management
-void   module_manager_add_search_path(ModuleManager *manager, const char *path);
-void   module_manager_add_alias(ModuleManager *manager, const char *name, const char *base_dir);
-void   module_manager_set_config(ModuleManager *manager, void *config, const char *project_dir);
-size_t module_manager_collect_constants(ModuleManager *manager, PreprocessorConstant *out, size_t max_count);
+void module_manager_add_search_path(ModuleManager *manager, const char *path);
+void module_manager_add_alias(ModuleManager *manager, const char *name, const char *base_dir);
+void module_manager_set_config(ModuleManager *manager, void *config, const char *project_dir);
+bool module_manager_try_get_constant(ModuleManager *manager, const char *name, long long *value_out);
 
 // module loading
 Module *module_manager_load_module(ModuleManager *manager, const char *module_path);
