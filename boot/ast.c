@@ -235,6 +235,18 @@ void ast_node_dnit(AstNode *node)
         free(node->asm_stmt.code);
         free(node->asm_stmt.constraints);
         break;
+    case AST_STMT_WHEN:
+        if (node->when_stmt.cond)
+        {
+            ast_node_dnit(node->when_stmt.cond);
+            free(node->when_stmt.cond);
+        }
+        if (node->when_stmt.body)
+        {
+            ast_node_dnit(node->when_stmt.body);
+            free(node->when_stmt.body);
+        }
+        break;
 
     case AST_EXPR_BINARY:
         if (node->binary_expr.left)
@@ -627,6 +639,13 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->asm_stmt.code        = ast_strdup(node->asm_stmt.code);
         clone->asm_stmt.constraints = ast_strdup(node->asm_stmt.constraints);
         break;
+    case AST_STMT_WHEN:
+        clone->when_stmt.cond         = ast_clone_checked(node->when_stmt.cond);
+        clone->when_stmt.body         = ast_clone_checked(node->when_stmt.body);
+        clone->when_stmt.is_top_level = node->when_stmt.is_top_level;
+        clone->when_stmt.evaluated    = node->when_stmt.evaluated;
+        clone->when_stmt.cond_value   = node->when_stmt.cond_value;
+        break;
 
     case AST_STMT_RET:
         clone->ret_stmt.expr = ast_clone_checked(node->ret_stmt.expr);
@@ -896,6 +915,24 @@ void ast_print(AstNode *node, int indent)
         break;
     case AST_STMT_ASM:
         printf("ASM %s\n", node->asm_stmt.code ? node->asm_stmt.code : "");
+        break;
+    case AST_STMT_WHEN:
+        printf("WHEN");
+        if (node->when_stmt.is_top_level)
+        {
+            printf(" [top-level]");
+        }
+        if (node->when_stmt.evaluated)
+        {
+            printf(" [cond=%s]", node->when_stmt.cond_value ? "true" : "false");
+        }
+        printf("\n");
+        print_indent(indent + 1);
+        printf("cond:\n");
+        ast_print(node->when_stmt.cond, indent + 2);
+        print_indent(indent + 1);
+        printf("body:\n");
+        ast_print(node->when_stmt.body, indent + 2);
         break;
 
     case AST_STMT_UNI:
@@ -1209,6 +1246,8 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "EXPR_STMT";
     case AST_STMT_ASM:
         return "ASM";
+    case AST_STMT_WHEN:
+        return "WHEN";
     case AST_STMT_RET:
         return "RET";
     case AST_STMT_IF:
@@ -1421,6 +1460,24 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         break;
     case AST_STMT_ASM:
         fprintf(file, "ASM %s\n", node->asm_stmt.code ? node->asm_stmt.code : "");
+        break;
+    case AST_STMT_WHEN:
+        fprintf(file, "WHEN");
+        if (node->when_stmt.is_top_level)
+        {
+            fprintf(file, " [top-level]");
+        }
+        if (node->when_stmt.evaluated)
+        {
+            fprintf(file, " [cond=%s]", node->when_stmt.cond_value ? "true" : "false");
+        }
+        fprintf(file, "\n");
+        print_indent_to_file(file, indent + 1);
+        fprintf(file, "cond:\n");
+        ast_print_to_file(node->when_stmt.cond, file, indent + 2);
+        print_indent_to_file(file, indent + 1);
+        fprintf(file, "body:\n");
+        ast_print_to_file(node->when_stmt.body, file, indent + 2);
         break;
     case AST_STMT_RET:
         fprintf(file, "RET\n");

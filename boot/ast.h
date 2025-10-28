@@ -33,6 +33,7 @@ typedef enum AstKind
     AST_STMT_BLOCK,
     AST_STMT_EXPR,
     AST_STMT_ASM,
+    AST_STMT_WHEN,
 
     // expressions
     AST_EXPR_BINARY,
@@ -194,6 +195,16 @@ struct AstNode
             char *code;        // raw assembly text (single line for now)
             char *constraints; // optional LLVM asm constraints/clobbers string
         } asm_stmt;
+
+        // compile-time conditional block
+        struct
+        {
+            AstNode *cond;
+            AstNode *body;         // block for block-scoped expansion
+            bool     is_top_level; // true when parsed from top-level context
+            bool     evaluated;    // true once condition evaluated
+            bool     cond_value;   // cached condition result when evaluated
+        } when_stmt;
 
         // return statement
         struct
