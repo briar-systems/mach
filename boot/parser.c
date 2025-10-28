@@ -5,80 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-// helper functions
-static bool     parser_is_method_decl(Parser *parser);
-static AstNode *parser_alloc_node(Parser *parser, AstKind kind, Token *token)
-{
-    AstNode *node = malloc(sizeof(AstNode));
-    if (!node)
-    {
-        parser_error_at_current(parser, "memory allocation failed");
-        return NULL;
-    }
-    ast_node_init(node, kind);
-
-    if (token)
-    {
-        node->token = malloc(sizeof(Token));
-        if (!node->token)
-        {
-            free(node);
-            parser_error_at_current(parser, "memory allocation failed for token");
-            return NULL;
-        }
-        token_copy(token, node->token);
-    }
-
-    return node;
-}
-
-static AstList *parser_alloc_list(Parser *parser)
-{
-    AstList *list = malloc(sizeof(AstList));
-    if (!list)
-    {
-        parser_error_at_current(parser, "memory allocation failed for list");
-        return NULL;
-    }
-    ast_list_init(list);
-    return list;
-}
-
-static TokenKind parser_peek_next_kind(Parser *parser)
-{
-    if (!parser || !parser->lexer)
-    {
-        return TOKEN_EOF;
-    }
-
-    int       saved_pos = parser->lexer->pos;
-    TokenKind kind      = TOKEN_EOF;
-
-    for (;;)
-    {
-        Token *peek = lexer_next(parser->lexer);
-        if (!peek)
-        {
-            kind = TOKEN_EOF;
-            break;
-        }
-
-        kind = peek->kind;
-
-        bool skip = (kind == TOKEN_COMMENT);
-
-        token_dnit(peek);
-        free(peek);
-
-        if (!skip)
-        {
-            break;
-        }
-    }
-
-    parser->lexer->pos = saved_pos;
-    return kind;
-}
+static void      parser_set_pending_mangle(Parser *parser, char *value);
+static char     *parser_take_pending_mangle(Parser *parser);
+static AstNode  *parser_alloc_node(Parser *parser, AstKind kind, Token *token);
+static AstList  *parser_alloc_list(Parser *parser);
+static AstNode  *parser_parse_directive(Parser *parser, bool allow_top_level);
+static AstNode  *parser_parse_stmt_asm(Parser *parser);
+static TokenKind parser_peek_next_kind(Parser *parser);
 
 static void parser_set_pending_mangle(Parser *parser, char *value)
 {
@@ -104,179 +37,265 @@ static char *parser_take_pending_mangle(Parser *parser)
     return value;
 }
 
-static void parser_handle_comment(Parser *parser, Token *token)
+static AstNode *parser_alloc_node(Parser *parser, AstKind kind, Token *token)
 {
-    if (!parser || !token)
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
     {
-        return;
+        parser_error(parser, token ? token : parser->current, "out of memory allocating AST node");
+        return NULL;
     }
 
-    char *raw = lexer_raw_value(parser->lexer, token);
-    if (!raw)
+    ast_node_init(node, kind);
+    node->token = NULL;
+
+    if (token)
     {
-        return;
+        Token *copy = malloc(sizeof(Token));
+        if (!copy)
+        {
+            parser_error(parser, token, "out of memory allocating token copy");
+            free(node);
+            return NULL;
+        }
+
+        token_copy(token, copy);
+        node->token = copy;
     }
 
-    if (strncmp(raw, "#@", 2) != 0)
-    {
-        free(raw);
-        return;
-    }
-
-    const char *cursor = raw + 2;
-    while (isspace((unsigned char)*cursor))
-    {
-        cursor++;
-    }
-
-    if (strncmp(cursor, "symbol", 6) == 0)
-    {
-        cursor += 6;
-        while (isspace((unsigned char)*cursor))
-        {
-            cursor++;
-        }
-
-        if (*cursor != '(')
-        {
-            parser_error(parser, token, "expected '(' after '#@symbol'");
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-        cursor++;
-
-        while (isspace((unsigned char)*cursor))
-        {
-            cursor++;
-        }
-
-        if (*cursor != '"')
-        {
-            parser_error(parser, token, "expected string literal in '#@symbol'");
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-        cursor++;
-
-        size_t buffer_cap = strlen(cursor) + 1;
-        char  *buffer     = malloc(buffer_cap);
-        if (!buffer)
-        {
-            parser_error(parser, token, "memory allocation failed for '#@symbol'");
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-
-        size_t buffer_len = 0;
-        bool   ok         = true;
-
-        while (*cursor && *cursor != '"')
-        {
-            char ch = *cursor++;
-            if (ch == '\\')
-            {
-                if (*cursor == '\0')
-                {
-                    ok = false;
-                    break;
-                }
-                char esc = *cursor++;
-                switch (esc)
-                {
-                case 'n':
-                    ch = '\n';
-                    break;
-                case 'r':
-                    ch = '\r';
-                    break;
-                case 't':
-                    ch = '\t';
-                    break;
-                case '\\':
-                    ch = '\\';
-                    break;
-                case '"':
-                    ch = '"';
-                    break;
-                default:
-                    ch = esc;
-                    break;
-                }
-            }
-
-            if (buffer_len + 1 >= buffer_cap)
-            {
-                size_t new_cap = buffer_cap * 2;
-                char  *tmp     = realloc(buffer, new_cap);
-                if (!tmp)
-                {
-                    ok = false;
-                    break;
-                }
-                buffer     = tmp;
-                buffer_cap = new_cap;
-            }
-
-            buffer[buffer_len++] = ch;
-        }
-
-        if (!ok || *cursor != '"')
-        {
-            parser_error(parser, token, "unterminated string in '#@symbol'");
-            free(buffer);
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-
-        buffer[buffer_len] = '\0';
-        cursor++;
-
-        while (isspace((unsigned char)*cursor))
-        {
-            cursor++;
-        }
-
-        if (*cursor != ')')
-        {
-            parser_error(parser, token, "expected ')' after '#@symbol' string");
-            free(buffer);
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-        cursor++;
-
-        while (isspace((unsigned char)*cursor))
-        {
-            cursor++;
-        }
-
-        if (*cursor != '\0')
-        {
-            parser_error(parser, token, "unexpected characters after '#@symbol' directive");
-            free(buffer);
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-
-        parser_set_pending_mangle(parser, buffer);
-        free(raw);
-        return;
-    }
-
-    // unknown #@ directive
-    parser_error(parser, token, "unknown '#@' directive");
-    parser_set_pending_mangle(parser, NULL);
-    free(raw);
+    return node;
 }
 
-// forward for asm stmt
-static AstNode *parser_parse_stmt_asm(Parser *parser);
+static AstList *parser_alloc_list(Parser *parser)
+{
+    AstList *list = malloc(sizeof(AstList));
+    if (!list)
+    {
+        parser_error(parser, parser->current, "out of memory allocating AST list");
+        return NULL;
+    }
+
+    ast_list_init(list);
+    return list;
+}
+static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
+{
+    if (!parser_consume(parser, TOKEN_DOLLAR, "expected '$'"))
+    {
+        return NULL;
+    }
+
+    Token *directive_token = parser->previous;
+
+    if (!parser_check(parser, TOKEN_IDENTIFIER))
+    {
+        parser_error_at_current(parser, "expected directive after '$'");
+        return NULL;
+    }
+
+    char *directive = parser_parse_identifier(parser);
+    if (!directive)
+    {
+        parser_error_at_current(parser, "expected directive after '$'");
+        return NULL;
+    }
+
+    bool is_when   = (strcmp(directive, "when") == 0);
+    bool is_symbol = (strcmp(directive, "symbol") == 0);
+
+    if (is_symbol)
+    {
+        free(directive);
+
+        if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after '$symbol'"))
+        {
+            parser_set_pending_mangle(parser, NULL);
+            return NULL;
+        }
+
+        if (!parser_match(parser, TOKEN_LIT_STRING))
+        {
+            parser_error_at_current(parser, "expected string literal in '$symbol'");
+            parser_set_pending_mangle(parser, NULL);
+
+            while (!parser_check(parser, TOKEN_R_PAREN) && !parser_is_at_end(parser))
+            {
+                parser_advance(parser);
+            }
+
+            if (parser_check(parser, TOKEN_R_PAREN))
+            {
+                parser_advance(parser);
+            }
+
+            parser_match(parser, TOKEN_SEMICOLON);
+            return NULL;
+        }
+
+        char *symbol = lexer_eval_lit_string(parser->lexer, parser->previous);
+        if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after '$symbol' string"))
+        {
+            free(symbol);
+            parser_set_pending_mangle(parser, NULL);
+            return NULL;
+        }
+
+        parser_match(parser, TOKEN_SEMICOLON);
+
+        parser_set_pending_mangle(parser, symbol);
+        return NULL;
+    }
+
+    if (!is_when)
+    {
+        parser_error(parser, directive_token, "unknown compile-time directive");
+        free(directive);
+        return NULL;
+    }
+
+    free(directive);
+
+    if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after '$when'"))
+    {
+        return NULL;
+    }
+
+    AstNode *cond = parser_parse_expr(parser);
+    if (!cond)
+    {
+        parser_error_at_current(parser, "expected compile-time expression");
+        return NULL;
+    }
+
+    if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after '$when' condition"))
+    {
+        ast_node_dnit(cond);
+        free(cond);
+        return NULL;
+    }
+
+    AstNode *body = NULL;
+
+    if (allow_top_level)
+    {
+        if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' after '$when' condition"))
+        {
+            ast_node_dnit(cond);
+            free(cond);
+            return NULL;
+        }
+
+        body = parser_alloc_node(parser, AST_STMT_BLOCK, parser->previous);
+        if (!body)
+        {
+            ast_node_dnit(cond);
+            free(cond);
+            return NULL;
+        }
+
+        body->block_stmt.stmts = parser_alloc_list(parser);
+        if (!body->block_stmt.stmts)
+        {
+            ast_node_dnit(body);
+            free(body);
+            ast_node_dnit(cond);
+            free(cond);
+            return NULL;
+        }
+
+        while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
+        {
+            AstNode *inner = parser_parse_stmt_top(parser);
+            if (!inner)
+            {
+                parser_error_at_current(parser, "expected statement in '$when' block");
+                ast_node_dnit(body);
+                free(body);
+                ast_node_dnit(cond);
+                free(cond);
+                return NULL;
+            }
+            ast_list_append(body->block_stmt.stmts, inner);
+        }
+
+        if (parser->pending_mangle)
+        {
+            parser_error_at_current(parser, "'$symbol' must precede 'val', 'var', or 'fun'");
+            parser_set_pending_mangle(parser, NULL);
+        }
+
+        if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after '$when' block"))
+        {
+            ast_node_dnit(body);
+            free(body);
+            ast_node_dnit(cond);
+            free(cond);
+            return NULL;
+        }
+    }
+    else
+    {
+        body = parser_parse_stmt_block(parser);
+        if (!body)
+        {
+            ast_node_dnit(cond);
+            free(cond);
+            return NULL;
+        }
+    }
+
+    AstNode *node = parser_alloc_node(parser, AST_STMT_WHEN, directive_token);
+    if (!node)
+    {
+        if (body)
+        {
+            ast_node_dnit(body);
+            free(body);
+        }
+        ast_node_dnit(cond);
+        free(cond);
+        return NULL;
+    }
+
+    node->when_stmt.cond         = cond;
+    node->when_stmt.body         = body;
+    node->when_stmt.is_top_level = allow_top_level;
+    node->when_stmt.evaluated    = false;
+    node->when_stmt.cond_value   = false;
+    return node;
+}
+
+static TokenKind parser_peek_next_kind(Parser *parser)
+{
+    if (!parser || !parser->lexer)
+    {
+        return TOKEN_EOF;
+    }
+
+    int saved_pos = parser->lexer->pos;
+
+    for (;;)
+    {
+        Token *tok = lexer_next(parser->lexer);
+        if (!tok)
+        {
+            parser->lexer->pos = saved_pos;
+            return TOKEN_EOF;
+        }
+
+        TokenKind kind = tok->kind;
+        token_dnit(tok);
+        free(tok);
+
+        if (kind == TOKEN_COMMENT)
+        {
+            continue;
+        }
+
+        parser->lexer->pos = saved_pos;
+        return kind;
+    }
+}
 
 static bool     parser_should_parse_type_args(Parser *parser);
 static AstList *parser_parse_type_arguments(Parser *parser);
@@ -535,7 +554,6 @@ void parser_advance(Parser *parser)
         // skip comments
         if (parser->current->kind == TOKEN_COMMENT)
         {
-            parser_handle_comment(parser, parser->current);
             token_dnit(parser->current);
             free(parser->current);
             continue;
@@ -608,6 +626,7 @@ void parser_synchronize(Parser *parser)
         case TOKEN_KW_VAR:
         case TOKEN_KW_FUN:
         case TOKEN_KW_ASM:
+        case TOKEN_DOLLAR:
             return;
         default:
             parser_advance(parser);
@@ -623,14 +642,12 @@ bool parser_is_at_end(Parser *parser)
 // error handling
 void parser_error(Parser *parser, Token *token, const char *message)
 {
-    if (parser->panic_mode)
+    if (!parser->panic_mode)
     {
-        return;
+        parser->panic_mode = true;
+        parser->had_error  = true;
+        parser_error_list_add(&parser->errors, token, message);
     }
-
-    parser->panic_mode = true;
-    parser->had_error  = true;
-    parser_error_list_add(&parser->errors, token, message);
 }
 
 void parser_error_at_current(Parser *parser, const char *message)
@@ -1048,7 +1065,7 @@ AstNode *parser_parse_stmt_top(Parser *parser)
         TokenKind next_kind = parser->current->kind;
         if (next_kind != TOKEN_KW_VAL && next_kind != TOKEN_KW_VAR && next_kind != TOKEN_KW_FUN)
         {
-            parser_error_at_current(parser, "'#@symbol' must precede 'val', 'var', or 'fun'");
+            parser_error_at_current(parser, "'$symbol' must precede 'val', 'var', or 'fun'");
             parser_set_pending_mangle(parser, NULL);
         }
     }
@@ -1110,6 +1127,18 @@ AstNode *parser_parse_stmt_top(Parser *parser)
         }
         result = parser_parse_stmt_asm(parser);
         break;
+    case TOKEN_DOLLAR:
+        if (is_public)
+        {
+            parser_error_at_current(parser, "'pub' cannot precede compile-time directives");
+        }
+        result = parser_parse_directive(parser, true);
+        // $symbol returns NULL and sets pending_mangle; recursively parse next statement
+        if (!result && !parser->had_error)
+        {
+            return parser_parse_stmt_top(parser);
+        }
+        break;
     default:
         if (is_public)
         {
@@ -1133,7 +1162,7 @@ AstNode *parser_parse_stmt(Parser *parser)
         TokenKind kind = parser->current->kind;
         if (kind != TOKEN_KW_VAL && kind != TOKEN_KW_VAR && kind != TOKEN_KW_FUN)
         {
-            parser_error_at_current(parser, "'#@symbol' must precede 'val', 'var', or 'fun'");
+            parser_error_at_current(parser, "'$symbol' must precede 'val', 'var', or 'fun'");
             parser_set_pending_mangle(parser, NULL);
         }
     }
@@ -1158,6 +1187,8 @@ AstNode *parser_parse_stmt(Parser *parser)
         return parser_parse_stmt_block(parser);
     case TOKEN_KW_ASM:
         return parser_parse_stmt_asm(parser);
+    case TOKEN_DOLLAR:
+        return parser_parse_directive(parser, false);
     default:
         return parser_parse_stmt_expr(parser);
     }
@@ -3089,6 +3120,14 @@ AstList *parser_parse_field_list(Parser *parser)
 
     while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
     {
+        if (parser->current->kind == TOKEN_DOLLAR)
+        {
+            parser_error_at_current(parser, "'$when' is not allowed inside record or union declarations");
+            ast_list_dnit(list);
+            free(list);
+            return NULL;
+        }
+
         AstNode *field = parser_alloc_node(parser, AST_STMT_FIELD, parser->current);
         if (!field)
         {

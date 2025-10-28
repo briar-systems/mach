@@ -15,6 +15,13 @@ static Type *analyze_lit_expr_with_hint(SemanticDriver *driver, const AnalysisCo
 static Type *analyze_null_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
 static Type *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr);
 static bool  ensure_assignable(SemanticDriver *driver, const AnalysisContext *ctx, Type *expected, Type *actual, AstNode *site, const char *what);
+static bool  evaluate_when_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value);
+static bool  evaluate_when_expr_bool(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, bool *out_value);
+static bool  analyze_when_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt);
+
+typedef bool (*TopLevelVisitor)(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt);
+static bool visit_top_level_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt, TopLevelVisitor visitor);
+static bool visit_top_level_list(SemanticDriver *driver, const AnalysisContext *ctx, AstList *list, TopLevelVisitor visitor);
 
 void diagnostic_sink_init(DiagnosticSink *sink)
 {
@@ -1122,6 +1129,30 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
 }
 
 // enqueue module for analysis (loads and collects dependencies)
+static bool enqueue_dependency_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_USE)
+    {
+        const char *dep_path = stmt->use_stmt.module_path;
+        if (dep_path && !enqueue_module(driver, dep_path))
+        {
+            const char *file_path = ctx ? ctx->file_path : NULL;
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, file_path, "failed to load module '%s'", dep_path);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool process_use_stmt_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_USE)
+    {
+        return process_use_statement(driver, ctx, stmt);
+    }
+    return true;
+}
+
 static bool enqueue_module(SemanticDriver *driver, const char *module_path)
 {
     Module *module = load_module_deferred(driver, module_path);
@@ -1131,20 +1162,9 @@ static bool enqueue_module(SemanticDriver *driver, const char *module_path)
     // scan for use statements and enqueue dependencies
     if (module->ast && module->ast->kind == AST_PROGRAM)
     {
-        for (int i = 0; i < module->ast->program.stmts->count; i++)
-        {
-            AstNode *stmt = module->ast->program.stmts->items[i];
-            if (stmt->kind == AST_STMT_USE)
-            {
-                const char *dep_path = stmt->use_stmt.module_path;
-                if (dep_path)
-                {
-                    // recursively enqueue dependencies
-                    if (!enqueue_module(driver, dep_path))
-                        return false;
-                }
-            }
-        }
+        AnalysisContext dep_ctx = analysis_context_create(driver->symbol_table.global_scope, NULL, module->name, module->file_path);
+        if (!visit_top_level_list(driver, &dep_ctx, module->ast->program.stmts, enqueue_dependency_visitor))
+            return false;
     }
 
     return true;
@@ -1613,10 +1633,10 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
     symbol->module_name = ctx->module_name ? strdup(ctx->module_name) : NULL;
     symbol->home_scope  = ctx->current_scope;
 
-    // set mangled name for methods: check for #@symbol directive, otherwise use module__Type__method
+    // set mangled name for methods: check for $symbol directive, otherwise use module__Type__method
     if (stmt->fun_stmt.mangle_name && stmt->fun_stmt.mangle_name[0])
     {
-        // explicit symbol name from #@symbol directive
+        // explicit symbol name from $symbol directive
         symbol->func.extern_name = strdup(stmt->fun_stmt.mangle_name);
     }
     else if (!is_generic && ctx->module_name && ctx->module_name[0])
@@ -1683,10 +1703,10 @@ static bool declare_fun_stmt(SemanticDriver *driver, const AnalysisContext *ctx,
     symbol->module_name = ctx->module_name ? strdup(ctx->module_name) : NULL;
     symbol->home_scope  = ctx->current_scope;
 
-    // set mangled name: use #@symbol directive if present, otherwise mangle with module name
+    // set mangled name: use $symbol directive if present, otherwise mangle with module name
     if (stmt->fun_stmt.mangle_name && stmt->fun_stmt.mangle_name[0])
     {
-        // explicit symbol name from #@symbol directive
+        // explicit symbol name from $symbol directive
         symbol->func.extern_name = strdup(stmt->fun_stmt.mangle_name);
     }
     else if (!is_generic && ctx->module_name && ctx->module_name[0])
@@ -1766,61 +1786,43 @@ static bool declare_var_stmt(SemanticDriver *driver, const AnalysisContext *ctx,
     return true;
 }
 
+static bool pass_a_declare_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    switch (stmt->kind)
+    {
+    case AST_STMT_DEF:
+        return declare_def_stmt(driver, ctx, stmt);
+
+    case AST_STMT_REC:
+        return declare_rec_stmt(driver, ctx, stmt);
+
+    case AST_STMT_UNI:
+        return declare_uni_stmt(driver, ctx, stmt);
+
+    case AST_STMT_FUN:
+        return declare_fun_stmt(driver, ctx, stmt);
+
+    case AST_STMT_EXT:
+        return declare_ext_stmt(driver, ctx, stmt);
+
+    case AST_STMT_VAL:
+    case AST_STMT_VAR:
+        return declare_var_stmt(driver, ctx, stmt);
+
+    case AST_STMT_USE:
+        return true; // processed later
+
+    default:
+        return true;
+    }
+}
+
 static bool analyze_pass_a_declarations(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *root)
 {
     if (!root || root->kind != AST_PROGRAM)
         return false;
 
-    bool success = true;
-
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        switch (stmt->kind)
-        {
-        case AST_STMT_DEF:
-            if (!declare_def_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_REC:
-            if (!declare_rec_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_UNI:
-            if (!declare_uni_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_FUN:
-            if (!declare_fun_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_EXT:
-            if (!declare_ext_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_VAL:
-        case AST_STMT_VAR:
-            if (!declare_var_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_USE:
-            // defer use statement processing until after Pass A
-            // this prevents infinite recursion during module loading
-            break;
-
-        default:
-            break;
-        }
-    }
-
-    return success;
+    return visit_top_level_list(driver, ctx, root->program.stmts, pass_a_declare_visitor);
 }
 
 // resolve record fields
@@ -2103,6 +2105,64 @@ static bool resolve_var_type(SemanticDriver *driver, const AnalysisContext *ctx,
     return true;
 }
 
+static bool pass_b_resolve_alias_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_DEF && stmt->symbol)
+    {
+        Type *resolved = resolve_type_in_context(driver, ctx, stmt->def_stmt.type);
+        if (resolved)
+        {
+            stmt->symbol->type->alias.target = resolved;
+            stmt->type                       = resolved;
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool pass_b_resolve_struct_fields_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_REC && stmt->symbol && !stmt->symbol->type_def.is_generic)
+    {
+        return resolve_str_fields(driver, ctx, stmt);
+    }
+    return true;
+}
+
+static bool pass_b_resolve_union_fields_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_UNI && stmt->symbol && !stmt->symbol->type_def.is_generic)
+    {
+        return resolve_uni_fields(driver, ctx, stmt);
+    }
+    return true;
+}
+
+static bool pass_b_resolve_fun_signature_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_FUN && stmt->symbol && !stmt->symbol->func.is_generic)
+    {
+        return resolve_fun_signature(driver, ctx, stmt);
+    }
+
+    if (stmt->kind == AST_STMT_EXT && stmt->symbol)
+    {
+        return resolve_ext_signature(driver, ctx, stmt);
+    }
+
+    return true;
+}
+
+static bool pass_b_resolve_var_type_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if ((stmt->kind == AST_STMT_VAL || stmt->kind == AST_STMT_VAR) && stmt->symbol)
+    {
+        return resolve_var_type(driver, ctx, stmt);
+    }
+    return true;
+}
+
 static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *root)
 {
     if (!root || root->kind != AST_PROGRAM)
@@ -2110,81 +2170,11 @@ static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisCont
 
     bool success = true;
 
-    // resolve type aliases
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_DEF && stmt->symbol)
-        {
-            Type *resolved = resolve_type_in_context(driver, ctx, stmt->def_stmt.type);
-            if (resolved)
-            {
-                stmt->symbol->type->alias.target = resolved;
-                stmt->type                       = resolved;
-            }
-            else
-            {
-                success = false;
-            }
-        }
-    }
-
-    // resolve record fields
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_REC && stmt->symbol && !stmt->symbol->type_def.is_generic)
-        {
-            if (!resolve_str_fields(driver, ctx, stmt))
-                success = false;
-        }
-    }
-
-    // resolve union fields
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_UNI && stmt->symbol && !stmt->symbol->type_def.is_generic)
-        {
-            if (!resolve_uni_fields(driver, ctx, stmt))
-                success = false;
-        }
-    }
-
-    // resolve function signatures
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_FUN && stmt->symbol && !stmt->symbol->func.is_generic)
-        {
-            // handle both regular functions and methods
-            if (!resolve_fun_signature(driver, ctx, stmt))
-                success = false;
-        }
-
-        // also handle external functions
-        if (stmt->kind == AST_STMT_EXT && stmt->symbol)
-        {
-            if (!resolve_ext_signature(driver, ctx, stmt))
-                success = false;
-        }
-    }
-
-    // resolve variable types
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if ((stmt->kind == AST_STMT_VAL || stmt->kind == AST_STMT_VAR) && stmt->symbol)
-        {
-            if (!resolve_var_type(driver, ctx, stmt))
-                success = false;
-        }
-    }
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_alias_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_struct_fields_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_union_fields_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_fun_signature_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_var_type_visitor) && success;
 
     return success;
 }
@@ -4410,6 +4400,275 @@ static bool analyze_ret_stmt(SemanticDriver *driver, const AnalysisContext *ctx,
     return true;
 }
 
+static bool evaluate_when_expr_bool(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, bool *out_value)
+{
+    long long value = 0;
+    if (!evaluate_when_expr_int(driver, ctx, expr, &value))
+    {
+        return false;
+    }
+    *out_value = (value != 0);
+    return true;
+}
+
+static bool evaluate_when_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value)
+{
+    if (!expr || !out_value)
+    {
+        return false;
+    }
+
+    switch (expr->kind)
+    {
+    case AST_EXPR_LIT:
+        switch (expr->lit_expr.kind)
+        {
+        case TOKEN_LIT_INT:
+            *out_value = (long long)expr->lit_expr.int_val;
+            return true;
+        case TOKEN_LIT_CHAR:
+            *out_value = (long long)expr->lit_expr.char_val;
+            return true;
+        default:
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "literal not allowed in '$when' condition");
+            return false;
+        }
+
+    case AST_EXPR_IDENT:
+    {
+        const char *name = expr->ident_expr.name;
+        long long   value;
+        if (module_manager_try_get_constant(&driver->module_manager, name, &value))
+        {
+            *out_value = value;
+            return true;
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time constant '%s'", name ? name : "<anon>");
+        return false;
+    }
+
+    case AST_EXPR_UNARY:
+    {
+        long long operand = 0;
+        if (!evaluate_when_expr_int(driver, ctx, expr->unary_expr.expr, &operand))
+        {
+            return false;
+        }
+
+        switch (expr->unary_expr.op)
+        {
+        case TOKEN_BANG:
+            *out_value = (operand == 0) ? 1 : 0;
+            return true;
+        case TOKEN_MINUS:
+            *out_value = -operand;
+            return true;
+        case TOKEN_PLUS:
+            *out_value = operand;
+            return true;
+        default:
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported unary operator in '$when' condition");
+            return false;
+        }
+    }
+
+    case AST_EXPR_BINARY:
+    {
+        TokenKind op = expr->binary_expr.op;
+
+        if (op == TOKEN_AMPERSAND_AMPERSAND)
+        {
+            bool left_value = false;
+            if (!evaluate_when_expr_bool(driver, ctx, expr->binary_expr.left, &left_value))
+            {
+                return false;
+            }
+            if (!left_value)
+            {
+                *out_value = 0;
+                return true;
+            }
+
+            bool right_value = false;
+            if (!evaluate_when_expr_bool(driver, ctx, expr->binary_expr.right, &right_value))
+            {
+                return false;
+            }
+            *out_value = right_value ? 1 : 0;
+            return true;
+        }
+
+        if (op == TOKEN_PIPE_PIPE)
+        {
+            bool left_value = false;
+            if (!evaluate_when_expr_bool(driver, ctx, expr->binary_expr.left, &left_value))
+            {
+                return false;
+            }
+            if (left_value)
+            {
+                *out_value = 1;
+                return true;
+            }
+
+            bool right_value = false;
+            if (!evaluate_when_expr_bool(driver, ctx, expr->binary_expr.right, &right_value))
+            {
+                return false;
+            }
+            *out_value = right_value ? 1 : 0;
+            return true;
+        }
+
+        if (op == TOKEN_EQUAL_EQUAL || op == TOKEN_BANG_EQUAL)
+        {
+            long long left_value  = 0;
+            long long right_value = 0;
+            if (!evaluate_when_expr_int(driver, ctx, expr->binary_expr.left, &left_value))
+            {
+                return false;
+            }
+            if (!evaluate_when_expr_int(driver, ctx, expr->binary_expr.right, &right_value))
+            {
+                return false;
+            }
+
+            bool result = (left_value == right_value);
+            if (op == TOKEN_BANG_EQUAL)
+            {
+                result = !result;
+            }
+            *out_value = result ? 1 : 0;
+            return true;
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported operator in '$when' condition");
+        return false;
+    }
+
+    default:
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "expression not allowed in '$when' condition");
+        return false;
+    }
+
+    // unreachable, but keeps compiler happy
+    return false;
+}
+
+static bool visit_top_level_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt, TopLevelVisitor visitor)
+{
+    if (!stmt || !visitor)
+        return true;
+
+    if (stmt->kind == AST_STMT_WHEN && stmt->when_stmt.is_top_level)
+    {
+        bool cond_value = stmt->when_stmt.cond_value;
+        if (!stmt->when_stmt.evaluated)
+        {
+            if (!evaluate_when_expr_bool(driver, ctx, stmt->when_stmt.cond, &cond_value))
+            {
+                return false;
+            }
+            stmt->when_stmt.evaluated  = true;
+            stmt->when_stmt.cond_value = cond_value;
+        }
+
+        if (!cond_value)
+        {
+            if (stmt->when_stmt.body)
+            {
+                ast_node_dnit(stmt->when_stmt.body);
+                free(stmt->when_stmt.body);
+                stmt->when_stmt.body = NULL;
+            }
+            return true;
+        }
+
+        if (!stmt->when_stmt.body || stmt->when_stmt.body->kind != AST_STMT_BLOCK || !stmt->when_stmt.body->block_stmt.stmts)
+        {
+            return true;
+        }
+
+        bool     success = true;
+        AstList *inner   = stmt->when_stmt.body->block_stmt.stmts;
+        for (int i = 0; i < inner->count; i++)
+        {
+            success = visit_top_level_stmt(driver, ctx, inner->items[i], visitor) && success;
+        }
+        return success;
+    }
+
+    return visitor(driver, ctx, stmt);
+}
+
+static bool visit_top_level_list(SemanticDriver *driver, const AnalysisContext *ctx, AstList *list, TopLevelVisitor visitor)
+{
+    if (!list)
+        return true;
+
+    bool success = true;
+    for (int i = 0; i < list->count; i++)
+    {
+        success = visit_top_level_stmt(driver, ctx, list->items[i], visitor) && success;
+    }
+    return success;
+}
+
+static bool analyze_when_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (!stmt || !stmt->when_stmt.cond)
+    {
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "malformed '$when' directive");
+        return false;
+    }
+
+    bool cond_value = stmt->when_stmt.cond_value;
+    if (!stmt->when_stmt.evaluated)
+    {
+        if (!evaluate_when_expr_bool(driver, ctx, stmt->when_stmt.cond, &cond_value))
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "unable to evaluate '$when' condition at compile time");
+            return false;
+        }
+        stmt->when_stmt.evaluated  = true;
+        stmt->when_stmt.cond_value = cond_value;
+    }
+
+    if (!cond_value)
+    {
+        if (stmt->when_stmt.body)
+        {
+            ast_node_dnit(stmt->when_stmt.body);
+            free(stmt->when_stmt.body);
+            stmt->when_stmt.body = NULL;
+        }
+        return true;
+    }
+
+    if (!stmt->when_stmt.body)
+    {
+        return true;
+    }
+
+    if (stmt->when_stmt.is_top_level)
+    {
+        if (stmt->when_stmt.body->kind == AST_STMT_BLOCK && stmt->when_stmt.body->block_stmt.stmts)
+        {
+            bool     success = true;
+            AstList *inner   = stmt->when_stmt.body->block_stmt.stmts;
+            for (int i = 0; i < inner->count; i++)
+            {
+                success = analyze_stmt(driver, ctx, inner->items[i]) && success;
+            }
+            return success;
+        }
+        return true;
+    }
+
+    return analyze_stmt(driver, ctx, stmt->when_stmt.body);
+}
+
 static bool analyze_if_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
 {
     Type *cond_type = NULL;
@@ -4465,6 +4724,8 @@ static bool analyze_stmt(SemanticDriver *driver, const AnalysisContext *ctx, Ast
         return analyze_if_stmt(driver, ctx, stmt);
     case AST_STMT_FOR:
         return analyze_for_stmt(driver, ctx, stmt);
+    case AST_STMT_WHEN:
+        return analyze_when_stmt(driver, ctx, stmt);
     default:
         return true;
     }
@@ -4552,6 +4813,32 @@ static bool analyze_function_body(SemanticDriver *driver, const AnalysisContext 
     return success;
 }
 
+static bool pass_c_global_init_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if ((stmt->kind == AST_STMT_VAL || stmt->kind == AST_STMT_VAR) && stmt->var_stmt.init)
+    {
+        if (!analyze_var_stmt_body(driver, ctx, stmt))
+        {
+            fprintf(stderr, "error: failed to analyze global variable '%s'\n", stmt->var_stmt.name ? stmt->var_stmt.name : "<anon>");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool pass_c_function_body_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_FUN && stmt->symbol && !stmt->symbol->func.is_generic)
+    {
+        if (!analyze_function_body(driver, ctx, stmt))
+        {
+            fprintf(stderr, "error: failed to analyze function '%s'\n", stmt->fun_stmt.name ? stmt->fun_stmt.name : "<anon>");
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool analyze_pass_c_bodies(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *root)
 {
     if (!root || root->kind != AST_PROGRAM)
@@ -4559,35 +4846,8 @@ static bool analyze_pass_c_bodies(SemanticDriver *driver, const AnalysisContext 
 
     bool success = true;
 
-    // analyze global initializers
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if ((stmt->kind == AST_STMT_VAL || stmt->kind == AST_STMT_VAR) && stmt->var_stmt.init)
-        {
-            if (!analyze_var_stmt_body(driver, ctx, stmt))
-            {
-                fprintf(stderr, "error: failed to analyze global variable '%s'\n", stmt->var_stmt.name ? stmt->var_stmt.name : "<anon>");
-                success = false;
-            }
-        }
-    }
-
-    // analyze function bodies (including methods)
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_FUN && stmt->symbol && !stmt->symbol->func.is_generic)
-        {
-            if (!analyze_function_body(driver, ctx, stmt))
-            {
-                fprintf(stderr, "error: failed to analyze function '%s'\n", stmt->fun_stmt.name ? stmt->fun_stmt.name : "<anon>");
-                success = false;
-            }
-        }
-    }
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_c_global_init_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_c_function_body_visitor) && success;
 
     return success;
 }
@@ -4608,20 +4868,7 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
 
     bool success = true;
 
-    // Enqueue dependencies from entry module
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-        if (stmt->kind == AST_STMT_USE)
-        {
-            const char *dep_path = stmt->use_stmt.module_path;
-            if (dep_path && !enqueue_module(driver, dep_path))
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, module_path, "failed to load module '%s'", dep_path);
-                success = false;
-            }
-        }
-    }
+    success = visit_top_level_list(driver, &ctx, root->program.stmts, enqueue_dependency_visitor) && success;
 
     if (!success)
     {
@@ -4661,18 +4908,7 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
     }
 
     // Process imports in entry module
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-        if (stmt->kind == AST_STMT_USE)
-        {
-            if (!process_use_statement(driver, &ctx, stmt))
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, module_path, "failed to process use statement");
-                success = false;
-            }
-        }
-    }
+    success = visit_top_level_list(driver, &ctx, root->program.stmts, process_use_stmt_visitor) && success;
 
     // Process imports in all loaded modules
     FOR_EACH_MODULE(&driver->module_manager, module)
@@ -4682,18 +4918,7 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
             Scope          *module_scope = module->symbols->global_scope;
             AnalysisContext module_ctx   = analysis_context_create(module_scope, module_scope, module->name, module->file_path);
 
-            for (int j = 0; j < module->ast->program.stmts->count; j++)
-            {
-                AstNode *stmt = module->ast->program.stmts->items[j];
-                if (stmt->kind == AST_STMT_USE)
-                {
-                    if (!process_use_statement(driver, &module_ctx, stmt))
-                    {
-                        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, module->name, "failed to process use statement in module '%s'", module->name);
-                        success = false;
-                    }
-                }
-            }
+            success = visit_top_level_list(driver, &module_ctx, module->ast->program.stmts, process_use_stmt_visitor) && success;
         }
     }
 
