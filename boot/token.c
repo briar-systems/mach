@@ -106,6 +106,8 @@ char *token_kind_to_string(TokenKind kind)
         return "?";
     case TOKEN_AT:
         return "@";
+    case TOKEN_DOLLAR:
+        return "$";
     case TOKEN_DOT:
         return ".";
     case TOKEN_COMMA:
