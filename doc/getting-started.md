@@ -135,11 +135,11 @@ make help           # show all targets
 Create a file `hello.mach`:
 
 ```mach
-use          std.runtime;
-use          std.types.string;
+use std.runtime;
+use std.types.string;
 use console: std.io.console;
 
-#@symbol("main")
+$main.symbol = "main";
 fun main(args: []string) i64 {
     console.print("hello, world!\n");
     ret 0;
