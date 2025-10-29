@@ -5,37 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void      parser_set_pending_mangle(Parser *parser, char *value);
-static char     *parser_take_pending_mangle(Parser *parser);
 static AstNode  *parser_alloc_node(Parser *parser, AstKind kind, Token *token);
 static AstList  *parser_alloc_list(Parser *parser);
 static AstNode  *parser_parse_directive(Parser *parser, bool allow_top_level);
+static AstNode  *parser_parse_comptime_if_top(Parser *parser);
+static AstNode  *parser_parse_top_level_block(Parser *parser);
 static AstNode  *parser_parse_stmt_asm(Parser *parser);
 static TokenKind parser_peek_next_kind(Parser *parser);
-
-static void parser_set_pending_mangle(Parser *parser, char *value)
-{
-    if (!parser)
-    {
-        free(value);
-        return;
-    }
-
-    free(parser->pending_mangle);
-    parser->pending_mangle = value;
-}
-
-static char *parser_take_pending_mangle(Parser *parser)
-{
-    if (!parser)
-    {
-        return NULL;
-    }
-
-    char *value            = parser->pending_mangle;
-    parser->pending_mangle = NULL;
-    return value;
-}
 
 static AstNode *parser_alloc_node(Parser *parser, AstKind kind, Token *token)
 {
@@ -78,6 +54,23 @@ static AstList *parser_alloc_list(Parser *parser)
     ast_list_init(list);
     return list;
 }
+static bool parser_token_is_attr_category(TokenKind kind)
+{
+    switch (kind)
+    {
+    case TOKEN_KW_FUN:
+    case TOKEN_KW_VAL:
+    case TOKEN_KW_VAR:
+    case TOKEN_KW_REC:
+    case TOKEN_KW_UNI:
+    case TOKEN_KW_EXT:
+    case TOKEN_KW_DEF:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
 {
     if (!parser_consume(parser, TOKEN_DOLLAR, "expected '$'"))
@@ -87,181 +80,56 @@ static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
 
     Token *directive_token = parser->previous;
 
-    if (!parser_check(parser, TOKEN_IDENTIFIER))
-    {
-        parser_error_at_current(parser, "expected directive after '$'");
-        return NULL;
-    }
-
-    char *directive = parser_parse_identifier(parser);
-    if (!directive)
-    {
-        parser_error_at_current(parser, "expected directive after '$'");
-        return NULL;
-    }
-
-    bool is_when   = (strcmp(directive, "when") == 0);
-    bool is_symbol = (strcmp(directive, "symbol") == 0);
-
-    if (is_symbol)
-    {
-        free(directive);
-
-        if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after '$symbol'"))
-        {
-            parser_set_pending_mangle(parser, NULL);
-            return NULL;
-        }
-
-        if (!parser_match(parser, TOKEN_LIT_STRING))
-        {
-            parser_error_at_current(parser, "expected string literal in '$symbol'");
-            parser_set_pending_mangle(parser, NULL);
-
-            while (!parser_check(parser, TOKEN_R_PAREN) && !parser_is_at_end(parser))
-            {
-                parser_advance(parser);
-            }
-
-            if (parser_check(parser, TOKEN_R_PAREN))
-            {
-                parser_advance(parser);
-            }
-
-            parser_match(parser, TOKEN_SEMICOLON);
-            return NULL;
-        }
-
-        char *symbol = lexer_eval_lit_string(parser->lexer, parser->previous);
-        if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after '$symbol' string"))
-        {
-            free(symbol);
-            parser_set_pending_mangle(parser, NULL);
-            return NULL;
-        }
-
-        parser_match(parser, TOKEN_SEMICOLON);
-
-        parser_set_pending_mangle(parser, symbol);
-        return NULL;
-    }
-
-    if (!is_when)
-    {
-        parser_error(parser, directive_token, "unknown compile-time directive");
-        free(directive);
-        return NULL;
-    }
-
-    free(directive);
-
-    if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after '$when'"))
+    // Create AST_COMPTIME node
+    AstNode *node = parser_alloc_node(parser, AST_COMPTIME, directive_token);
+    if (!node)
     {
         return NULL;
     }
 
-    AstNode *cond = parser_parse_expr(parser);
-    if (!cond)
+    // Parse the expression or statement following $
+    // This could be:
+    // - Assignment: $fun.symbol = "name"
+    // - If statement: $if (cond) { ... }
+    // - Call: $size_of(Type)
+    // - Identifier: $OS, $ARCH
+    AstNode *inner = NULL;
+
+    // Try parsing as statement first (for $if, blocks, etc.)
+    if (parser_check(parser, TOKEN_KW_IF))
     {
-        parser_error_at_current(parser, "expected compile-time expression");
-        return NULL;
-    }
-
-    if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after '$when' condition"))
-    {
-        ast_node_dnit(cond);
-        free(cond);
-        return NULL;
-    }
-
-    AstNode *body = NULL;
-
-    if (allow_top_level)
-    {
-        if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' after '$when' condition"))
+        // $if (cond) { ... }
+        if (allow_top_level)
         {
-            ast_node_dnit(cond);
-            free(cond);
-            return NULL;
+            inner = parser_parse_comptime_if_top(parser);
         }
-
-        body = parser_alloc_node(parser, AST_STMT_BLOCK, parser->previous);
-        if (!body)
+        else
         {
-            ast_node_dnit(cond);
-            free(cond);
-            return NULL;
-        }
-
-        body->block_stmt.stmts = parser_alloc_list(parser);
-        if (!body->block_stmt.stmts)
-        {
-            ast_node_dnit(body);
-            free(body);
-            ast_node_dnit(cond);
-            free(cond);
-            return NULL;
-        }
-
-        while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
-        {
-            AstNode *inner = parser_parse_stmt_top(parser);
-            if (!inner)
-            {
-                parser_error_at_current(parser, "expected statement in '$when' block");
-                ast_node_dnit(body);
-                free(body);
-                ast_node_dnit(cond);
-                free(cond);
-                return NULL;
-            }
-            ast_list_append(body->block_stmt.stmts, inner);
-        }
-
-        if (parser->pending_mangle)
-        {
-            parser_error_at_current(parser, "'$symbol' must precede 'val', 'var', or 'fun'");
-            parser_set_pending_mangle(parser, NULL);
-        }
-
-        if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after '$when' block"))
-        {
-            ast_node_dnit(body);
-            free(body);
-            ast_node_dnit(cond);
-            free(cond);
-            return NULL;
+            inner = parser_parse_stmt_if(parser);
         }
     }
     else
     {
-        body = parser_parse_stmt_block(parser);
-        if (!body)
+        // Otherwise parse as expression (for assignments, calls, identifiers)
+        if (parser_token_is_attr_category(parser->current->kind))
         {
-            ast_node_dnit(cond);
-            free(cond);
-            return NULL;
+            parser->current->kind = TOKEN_IDENTIFIER;
         }
+        inner = parser_parse_expr(parser);
+
+        // Consume optional semicolon for expression-style directives
+        parser_match(parser, TOKEN_SEMICOLON);
     }
 
-    AstNode *node = parser_alloc_node(parser, AST_STMT_WHEN, directive_token);
-    if (!node)
+    if (!inner)
     {
-        if (body)
-        {
-            ast_node_dnit(body);
-            free(body);
-        }
-        ast_node_dnit(cond);
-        free(cond);
+        parser_error_at_current(parser, "expected expression or statement after '$'");
+        ast_node_dnit(node);
+        free(node);
         return NULL;
     }
 
-    node->when_stmt.cond         = cond;
-    node->when_stmt.body         = body;
-    node->when_stmt.is_top_level = allow_top_level;
-    node->when_stmt.evaluated    = false;
-    node->when_stmt.cond_value   = false;
+    node->comptime.inner = inner;
     return node;
 }
 
@@ -295,6 +163,147 @@ static TokenKind parser_peek_next_kind(Parser *parser)
         parser->lexer->pos = saved_pos;
         return kind;
     }
+}
+
+static AstNode *parser_parse_top_level_block(Parser *parser)
+{
+    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{'"))
+    {
+        return NULL;
+    }
+
+    AstNode *block = parser_alloc_node(parser, AST_STMT_BLOCK, parser->previous);
+    if (!block)
+    {
+        return NULL;
+    }
+
+    block->block_stmt.stmts = parser_alloc_list(parser);
+    if (!block->block_stmt.stmts)
+    {
+        ast_node_dnit(block);
+        free(block);
+        return NULL;
+    }
+
+    while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
+    {
+        AstNode *stmt = parser_parse_stmt_top(parser);
+        if (!stmt)
+        {
+            parser_error_at_current(parser, "expected top-level statement in compile-time block");
+            ast_node_dnit(block);
+            free(block);
+            return NULL;
+        }
+        ast_list_append(block->block_stmt.stmts, stmt);
+    }
+
+    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' to close compile-time block"))
+    {
+        ast_node_dnit(block);
+        free(block);
+        return NULL;
+    }
+
+    return block;
+}
+
+static AstNode *parser_parse_comptime_if_top(Parser *parser)
+{
+    if (!parser_consume(parser, TOKEN_KW_IF, "expected 'if' keyword"))
+    {
+        return NULL;
+    }
+
+    AstNode *node = parser_alloc_node(parser, AST_STMT_IF, parser->previous);
+    if (!node)
+    {
+        return NULL;
+    }
+
+    if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after '$if'"))
+    {
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    node->cond_stmt.cond = parser_parse_expr(parser);
+    if (!node->cond_stmt.cond)
+    {
+        parser_error_at_current(parser, "expected condition expression");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after $if condition"))
+    {
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    node->cond_stmt.body = parser_parse_top_level_block(parser);
+    if (!node->cond_stmt.body)
+    {
+        parser_error_at_current(parser, "expected block after $if condition");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    AstNode **tail = &node->cond_stmt.stmt_or;
+    while (parser_match(parser, TOKEN_KW_OR))
+    {
+        AstNode *or_node = parser_alloc_node(parser, AST_STMT_OR, parser->previous);
+        if (!or_node)
+        {
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
+        }
+
+        if (parser_match(parser, TOKEN_L_PAREN))
+        {
+            or_node->cond_stmt.cond = parser_parse_expr(parser);
+            if (!or_node->cond_stmt.cond)
+            {
+                parser_error_at_current(parser, "expected condition expression after 'or'");
+                ast_node_dnit(or_node);
+                free(or_node);
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+
+            if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after 'or' condition"))
+            {
+                ast_node_dnit(or_node);
+                free(or_node);
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+        }
+
+        or_node->cond_stmt.body = parser_parse_top_level_block(parser);
+        if (!or_node->cond_stmt.body)
+        {
+            parser_error_at_current(parser, "expected block after 'or'");
+            ast_node_dnit(or_node);
+            free(or_node);
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
+        }
+
+        *tail = or_node;
+        tail  = &or_node->cond_stmt.stmt_or;
+    }
+
+    return node;
 }
 
 static bool     parser_should_parse_type_args(Parser *parser);
@@ -438,12 +447,11 @@ cleanup:
 // parser lifecycle
 void parser_init(Parser *parser, Lexer *lexer)
 {
-    parser->lexer          = lexer;
-    parser->current        = NULL;
-    parser->previous       = NULL;
-    parser->panic_mode     = false;
-    parser->had_error      = false;
-    parser->pending_mangle = NULL;
+    parser->lexer      = lexer;
+    parser->current    = NULL;
+    parser->previous   = NULL;
+    parser->panic_mode = false;
+    parser->had_error  = false;
     parser_error_list_init(&parser->errors);
 
     // prime the parser
@@ -462,8 +470,6 @@ void parser_dnit(Parser *parser)
         token_dnit(parser->previous);
         free(parser->previous);
     }
-    free(parser->pending_mangle);
-    parser->pending_mangle = NULL;
     parser_error_list_dnit(&parser->errors);
 }
 
@@ -1060,16 +1066,6 @@ AstNode *parser_parse_stmt_top(Parser *parser)
     bool     is_public = parser_match(parser, TOKEN_KW_PUB);
     AstNode *result    = NULL;
 
-    if (parser->pending_mangle)
-    {
-        TokenKind next_kind = parser->current->kind;
-        if (next_kind != TOKEN_KW_VAL && next_kind != TOKEN_KW_VAR && next_kind != TOKEN_KW_FUN)
-        {
-            parser_error_at_current(parser, "'$symbol' must precede 'val', 'var', or 'fun'");
-            parser_set_pending_mangle(parser, NULL);
-        }
-    }
-
     switch (parser->current->kind)
     {
     case TOKEN_KW_NIL:
@@ -1133,11 +1129,6 @@ AstNode *parser_parse_stmt_top(Parser *parser)
             parser_error_at_current(parser, "'pub' cannot precede compile-time directives");
         }
         result = parser_parse_directive(parser, true);
-        // $symbol returns NULL and sets pending_mangle; recursively parse next statement
-        if (!result && !parser->had_error)
-        {
-            return parser_parse_stmt_top(parser);
-        }
         break;
     default:
         if (is_public)
@@ -1157,16 +1148,6 @@ AstNode *parser_parse_stmt_top(Parser *parser)
 // parse statements allowed at the function level
 AstNode *parser_parse_stmt(Parser *parser)
 {
-    if (parser->pending_mangle)
-    {
-        TokenKind kind = parser->current->kind;
-        if (kind != TOKEN_KW_VAL && kind != TOKEN_KW_VAR && kind != TOKEN_KW_FUN)
-        {
-            parser_error_at_current(parser, "'$symbol' must precede 'val', 'var', or 'fun'");
-            parser_set_pending_mangle(parser, NULL);
-        }
-    }
-
     switch (parser->current->kind)
     {
     case TOKEN_KW_VAL:
@@ -1433,8 +1414,6 @@ static AstNode *parser_parse_var_decl(Parser *parser, bool is_val, bool is_publi
         return NULL;
     }
 
-    node->var_stmt.mangle_name = parser_take_pending_mangle(parser);
-
     node->var_stmt.is_val    = is_val;
     node->var_stmt.is_public = is_public;
     node->var_stmt.name      = parser_parse_identifier(parser);
@@ -1524,8 +1503,6 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
     {
         return NULL;
     }
-
-    node->fun_stmt.mangle_name = parser_take_pending_mangle(parser);
 
     bool is_method = parser_is_method_decl(parser);
     if (is_method)
@@ -2620,6 +2597,32 @@ AstNode *parser_parse_expr_atom(Parser *parser)
     case TOKEN_KW_UNI:
         parser_advance(parser);
         return parser_parse_anonymous_composite_literal(parser, true);
+
+    case TOKEN_DOLLAR:
+    {
+        // Parse compile-time expression: $size_of(T), $OS_LINUX, $target.os, etc.
+        Token dollar_token = *parser->current;
+        parser_advance(parser);
+
+        // Parse the expression/identifier after $
+        AstNode *inner = parser_parse_expr(parser);
+        if (!inner)
+        {
+            return NULL;
+        }
+
+        // Wrap it in AST_COMPTIME
+        AstNode *comptime = parser_alloc_node(parser, AST_COMPTIME, &dollar_token);
+        if (!comptime)
+        {
+            ast_node_dnit(inner);
+            free(inner);
+            return NULL;
+        }
+
+        comptime->comptime.inner = inner;
+        return comptime;
+    }
 
     case TOKEN_IDENTIFIER:
     {
