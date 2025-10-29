@@ -3834,7 +3834,7 @@ normal_call_analysis:; // label must be followed by a statement
     Symbol *base_sym       = func_sym && func_sym->import_origin ? func_sym->import_origin : func_sym;
     size_t  type_arg_count = expr->call_expr.type_args ? expr->call_expr.type_args->count : 0;
 
-    // specialize generic functions on demand (e.g. mem.alloc<T>)
+    // specialize generic functions on demand (e.g. mem.alloc[T])
     if (base_sym && base_sym->kind == SYMBOL_FUNC && base_sym->func.is_generic)
     {
         AstNode *decl                = base_sym->decl;

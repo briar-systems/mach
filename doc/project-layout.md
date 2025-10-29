@@ -284,9 +284,9 @@ std = "path/to/std"
 Common imports:
 ```mach
 use std.types.string;        # string utilities
-use std.types.list;          # dynamic arrays (List<T>)
-use std.types.option;        # optional values (Option<T>)
-use std.types.result;        # result type (Result<T, E>)
+use std.types.list;          # dynamic arrays (List[T])
+use std.types.option;        # optional values (Option[T])
+use std.types.result;        # result type (Result[T, E])
 use std.io.console;          # console i/o
 use std.io.fs;               # file system
 use std.system.memory;       # memory allocation

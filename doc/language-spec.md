@@ -244,12 +244,12 @@ val fnPtr: fun(i32, ptr) i32 = main;
 
 ### Generics
 
-Mach supports generic types and functions using angle bracket syntax `<T>`. Generic parameters are resolved at compile time based on usage.
+Mach supports generic types and functions using bracket syntax `[T]`. Generic parameters are resolved at compile time based on usage.
 
 **Generic records:**
 
 ```mach
-pub rec List<T> {
+pub rec List[T] {
     data: *T;
     len:  u64;
     cap:  u64;
@@ -259,8 +259,8 @@ pub rec List<T> {
 **Generic functions:**
 
 ```mach
-pub fun list_new<T>(cap: u64) Result<List<T>, string> {
-    val data: *T = mem.alloc<T>(cap);
+pub fun list_new[T](cap: u64) Result[List[T], string] {
+    val data: *T = mem.alloc[T](cap);
     // ...
 }
 ```
@@ -270,7 +270,7 @@ pub fun list_new<T>(cap: u64) Result<List<T>, string> {
 When calling generic functions or constructing generic types, the compiler accepts only explicit type parameters:
 
 ```mach
-val my_list: List<i32> = list_new<i32>(10).unwrap_ok();
+val my_list: List[i32] = list_new[i32](10).unwrap_ok();
 ```
 
 Generic type parameters can appear in:
@@ -357,7 +357,7 @@ pub fun main(args: []string) i64 {
 Mach supports method-style function definitions that associate functions with types. Methods use dot notation for the type before the function name:
 
 ```mach
-pub fun List<T>.reserve(this: *List<T>, additional: u64) Option<string> {
+pub fun List[T].reserve(this: *List[T], additional: u64) Option[string] {
     // ...
 }
 ```

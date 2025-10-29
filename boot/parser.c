@@ -375,7 +375,7 @@ static bool parser_is_method_decl(Parser *parser)
     if (!look)
         goto cleanup;
 
-    if (look->kind == TOKEN_LESS)
+    if (look->kind == TOKEN_L_BRACKET)
     {
         int depth = 1;
         while (depth > 0)
@@ -383,9 +383,9 @@ static bool parser_is_method_decl(Parser *parser)
             Token *g = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
             if (!g)
                 goto cleanup;
-            if (g->kind == TOKEN_LESS)
+            if (g->kind == TOKEN_L_BRACKET)
                 depth++;
-            else if (g->kind == TOKEN_GREATER)
+            else if (g->kind == TOKEN_R_BRACKET)
                 depth--;
         }
         look = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
@@ -408,7 +408,7 @@ static bool parser_is_method_decl(Parser *parser)
     if (!after)
         goto cleanup;
 
-    if (after->kind == TOKEN_LESS)
+    if (after->kind == TOKEN_L_BRACKET)
     {
         int depth = 1;
         while (depth > 0)
@@ -416,9 +416,9 @@ static bool parser_is_method_decl(Parser *parser)
             Token *g = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
             if (!g)
                 goto cleanup;
-            if (g->kind == TOKEN_LESS)
+            if (g->kind == TOKEN_L_BRACKET)
                 depth++;
-            else if (g->kind == TOKEN_GREATER)
+            else if (g->kind == TOKEN_R_BRACKET)
                 depth--;
         }
         after = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
@@ -677,64 +677,73 @@ char *parser_parse_identifier(Parser *parser)
 
 static bool parser_should_parse_type_args(Parser *parser)
 {
-    if (!parser || !parser->current || parser->current->kind != TOKEN_LESS)
+    if (!parser || !parser->current || parser->current->kind != TOKEN_L_BRACKET)
     {
         return false;
     }
 
-    char *source = parser->lexer->source;
-    if (!source)
-    {
-        return false;
-    }
+    int     saved_pos     = parser->lexer->pos;
+    Token **peeked_tokens = NULL;
+    size_t  peek_count    = 0;
+    size_t  peek_capacity = 0;
+    bool    result        = false;
+    bool    has_payload   = false;
+    int     depth         = 1; // start at 1 to account for the opening '[' we're standing on
 
-    int  index      = parser->current->pos + 1;
-    int  depth      = 1;
-    bool has_tokens = false;
-
-    while (source[index] != '\0')
+    // process tokens after the opening bracket
+    while (true)
     {
-        char c = source[index];
-        if (c == '<')
+        Token *tok = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
+        if (!tok || tok->kind == TOKEN_EOF || tok->kind == TOKEN_SEMICOLON)
+        {
+            break;
+        }
+
+        if (tok->kind == TOKEN_L_BRACKET)
         {
             depth++;
         }
-        else if (c == '>')
+        else if (tok->kind == TOKEN_R_BRACKET)
         {
             depth--;
-            index++;
             if (depth == 0)
             {
                 break;
             }
         }
-        else if (c == '\n' || c == ';')
+        else if (depth > 0)
         {
-            return false;
+            has_payload = true;
         }
-        else if (!isspace((unsigned char)c))
+    }
+
+    if (has_payload && depth == 0)
+    {
+        // Check if we have '(' after the closing ']'
+        Token *after = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
+        if (after && after->kind == TOKEN_L_PAREN)
         {
-            has_tokens = true;
+            result = true;
         }
-        index++;
     }
 
-    if (depth != 0 || !has_tokens)
+    // Restore lexer position
+    parser->lexer->pos = saved_pos;
+
+    // Clean up peeked tokens
+    for (size_t i = 0; i < peek_count; i++)
     {
-        return false;
+        token_dnit(peeked_tokens[i]);
+        free(peeked_tokens[i]);
     }
+    free(peeked_tokens);
 
-    while (isspace((unsigned char)source[index]))
-    {
-        index++;
-    }
-
-    return source[index] == '(';
+    return result;
 }
 
 static AstList *parser_parse_type_arguments(Parser *parser)
 {
-    if (!parser_consume(parser, TOKEN_LESS, "expected '<' to start type arguments"))
+    if (!parser_consume(parser, TOKEN_L_BRACKET, "expected '[' to start type arguments"))
     {
         return NULL;
     }
@@ -745,7 +754,7 @@ static AstList *parser_parse_type_arguments(Parser *parser)
         return NULL;
     }
 
-    if (!parser_check(parser, TOKEN_GREATER))
+    if (!parser_check(parser, TOKEN_R_BRACKET))
     {
         do
         {
@@ -760,7 +769,7 @@ static AstList *parser_parse_type_arguments(Parser *parser)
         } while (parser_match(parser, TOKEN_COMMA));
     }
 
-    if (!parser_consume(parser, TOKEN_GREATER, "expected '>' after type arguments"))
+    if (!parser_consume(parser, TOKEN_R_BRACKET, "expected ']' after type arguments"))
     {
         ast_list_dnit(args);
         free(args);
@@ -778,7 +787,7 @@ static AstList *parser_parse_generic_param_list(Parser *parser)
         return NULL;
     }
 
-    if (!parser_check(parser, TOKEN_GREATER))
+    if (!parser_check(parser, TOKEN_R_BRACKET))
     {
         do
         {
@@ -804,7 +813,7 @@ static AstList *parser_parse_generic_param_list(Parser *parser)
         } while (parser_match(parser, TOKEN_COMMA));
     }
 
-    if (!parser_consume(parser, TOKEN_GREATER, "expected '>' after generic parameters"))
+    if (!parser_consume(parser, TOKEN_R_BRACKET, "expected ']' after generic parameters"))
     {
         ast_list_dnit(params);
         free(params);
@@ -1559,7 +1568,7 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
         }
     }
 
-    if (parser_match(parser, TOKEN_LESS))
+    if (parser_match(parser, TOKEN_L_BRACKET))
     {
         node->fun_stmt.generics = parser_parse_generic_param_list(parser);
         if (!node->fun_stmt.generics)
@@ -1707,7 +1716,7 @@ AstNode *parser_parse_stmt_rec(Parser *parser, bool is_public)
 
     // parse optional generic parameters
     node->rec_stmt.generics = NULL;
-    if (parser_match(parser, TOKEN_LESS))
+    if (parser_match(parser, TOKEN_L_BRACKET))
     {
         node->rec_stmt.generics = parser_parse_generic_param_list(parser);
         if (!node->rec_stmt.generics)
@@ -1769,7 +1778,7 @@ AstNode *parser_parse_stmt_uni(Parser *parser, bool is_public)
 
     // parse optional generic parameters
     node->uni_stmt.generics = NULL;
-    if (parser_match(parser, TOKEN_LESS))
+    if (parser_match(parser, TOKEN_L_BRACKET))
     {
         node->uni_stmt.generics = parser_parse_generic_param_list(parser);
         if (!node->uni_stmt.generics)
@@ -2367,7 +2376,7 @@ AstNode *parser_parse_expr_postfix(Parser *parser)
 
     for (;;)
     {
-        if (parser_check(parser, TOKEN_LESS) && parser_should_parse_type_args(parser))
+        if (parser_check(parser, TOKEN_L_BRACKET) && parser_should_parse_type_args(parser))
         {
             AstList *type_args = parser_parse_type_arguments(parser);
             if (!type_args)
@@ -2893,7 +2902,7 @@ AstNode *parser_parse_type_name(Parser *parser)
         return NULL;
     }
 
-    if (parser_check(parser, TOKEN_LESS))
+    if (parser_check(parser, TOKEN_L_BRACKET))
     {
         AstList *generic_args = parser_parse_type_arguments(parser);
         if (!generic_args)
