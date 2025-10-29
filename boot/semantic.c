@@ -3436,6 +3436,128 @@ static Type *analyze_comptime_intrinsic(SemanticDriver *driver, const AnalysisCo
         return call_expr->type;
     }
 
+    if (strcmp(func_name, "offset_of") == 0)
+    {
+        if (arg_count != 2)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of expects exactly two arguments (type, field)");
+            return NULL;
+        }
+
+        AstNode *type_arg  = call_expr->call_expr.args->items[0];
+        AstNode *field_arg = call_expr->call_expr.args->items[1];
+
+        Type *record_type = NULL;
+
+        if (type_arg->kind >= AST_TYPE_NAME && type_arg->kind <= AST_TYPE_UNI)
+        {
+            record_type    = resolve_type_in_context(driver, ctx, type_arg);
+            type_arg->type = record_type;
+        }
+        else if (type_arg->kind == AST_EXPR_IDENT)
+        {
+            AstNode type_node                = {0};
+            type_node.kind                   = AST_TYPE_NAME;
+            type_node.type_name.name         = type_arg->ident_expr.name;
+            type_node.type_name.generic_args = NULL;
+
+            record_type = resolve_type_in_context(driver, ctx, &type_node);
+            if (!record_type || record_type == type_error())
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of expects a record type as its first argument");
+                return NULL;
+            }
+
+            type_arg->type = record_type;
+        }
+        else
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of expects a type as its first argument");
+            return NULL;
+        }
+
+        if (!record_type || record_type == type_error())
+            return NULL;
+
+        record_type = type_resolve_alias(record_type);
+        if (!record_type || (record_type->kind != TYPE_STRUCT && record_type->kind != TYPE_UNION))
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of requires a record or union type");
+            return NULL;
+        }
+
+        const char *field_name = NULL;
+
+        if (field_arg->kind == AST_EXPR_IDENT)
+        {
+            field_name = field_arg->ident_expr.name;
+        }
+        else
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of expects a field name identifier as its second argument");
+            return NULL;
+        }
+
+        bool field_found = false;
+        if (record_type->composite.fields)
+        {
+            for (size_t i = 0; i < record_type->composite.field_count; i++)
+            {
+                Symbol *field = &record_type->composite.fields[i];
+                if (strcmp(field->name, field_name) == 0)
+                {
+                    field_found     = true;
+                    field_arg->type = field->type;
+                    break;
+                }
+            }
+        }
+
+        if (!field_found)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "field '%s' not found on type", field_name);
+            return NULL;
+        }
+
+        call_expr->type = type_u64();
+        return call_expr->type;
+    }
+
+    if (strcmp(func_name, "type_of") == 0)
+    {
+        if (arg_count != 1)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "type_of expects exactly one argument");
+            return NULL;
+        }
+
+        AstNode *arg      = call_expr->call_expr.args->items[0];
+        Type    *arg_type = NULL;
+
+        if (arg->kind >= AST_TYPE_NAME && arg->kind <= AST_TYPE_UNI)
+        {
+            arg_type  = resolve_type_in_context(driver, ctx, arg);
+            arg->type = arg_type;
+        }
+        else if (arg->kind == AST_EXPR_IDENT)
+        {
+            arg_type = analyze_ident_expr(driver, ctx, arg);
+        }
+        else
+        {
+            arg_type = analyze_expr(driver, ctx, arg);
+        }
+
+        if (!arg_type || arg_type == type_error())
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "type_of could not resolve argument type");
+            return NULL;
+        }
+
+        call_expr->type = type_u64();
+        return call_expr->type;
+    }
+
     return NULL;
 }
 
@@ -4368,7 +4490,7 @@ static Type *analyze_comptime_expr(SemanticDriver *driver, const AnalysisContext
         {
             const char *func_name = inner->call_expr.func->ident_expr.name;
 
-            if (strcmp(func_name, "size_of") == 0 || strcmp(func_name, "align_of") == 0)
+            if (strcmp(func_name, "size_of") == 0 || strcmp(func_name, "align_of") == 0 || strcmp(func_name, "offset_of") == 0 || strcmp(func_name, "type_of") == 0)
             {
                 // use the dedicated intrinsic handler - it modifies the CALL node in place
                 Type *result_type = analyze_comptime_intrinsic(driver, ctx, inner, func_name);
@@ -4751,6 +4873,121 @@ static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisCon
         }
 
         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "field access not allowed in compile-time condition");
+        return false;
+    }
+
+    case AST_EXPR_CALL:
+    {
+        if (!expr->call_expr.func || expr->call_expr.func->kind != AST_EXPR_IDENT)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported compile-time function call");
+            return false;
+        }
+
+        const char *name    = expr->call_expr.func->ident_expr.name;
+        size_t      arg_cnt = expr->call_expr.args ? expr->call_expr.args->count : 0;
+
+        if (strcmp(name, "size_of") == 0 || strcmp(name, "align_of") == 0)
+        {
+            if (arg_cnt != 1)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "%s expects exactly one argument", name);
+                return false;
+            }
+
+            AstNode *arg_node = expr->call_expr.args->items[0];
+            Type    *arg_type = arg_node ? type_resolve_alias(arg_node->type) : NULL;
+            if (!arg_type || arg_type == type_error())
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "%s argument could not be resolved to a type", name);
+                return false;
+            }
+
+            size_t value = (strcmp(name, "size_of") == 0) ? type_sizeof(arg_type) : type_alignof(arg_type);
+            *out_value   = (long long)value;
+            return true;
+        }
+
+        if (strcmp(name, "offset_of") == 0)
+        {
+            if (arg_cnt != 2)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "offset_of expects exactly two arguments");
+                return false;
+            }
+
+            AstNode *type_arg  = expr->call_expr.args->items[0];
+            AstNode *field_arg = expr->call_expr.args->items[1];
+
+            Type *record_type = type_arg ? type_resolve_alias(type_arg->type) : NULL;
+            if (!record_type || record_type == type_error() || (record_type->kind != TYPE_STRUCT && record_type->kind != TYPE_UNION))
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "offset_of first argument must be a record or union type");
+                return false;
+            }
+
+            const char *field_name = NULL;
+            if (field_arg && field_arg->kind == AST_EXPR_IDENT)
+            {
+                field_name = field_arg->ident_expr.name;
+            }
+            else
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "offset_of second argument must be a field identifier");
+                return false;
+            }
+
+            if (!field_name)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "offset_of requires a named field");
+                return false;
+            }
+
+            if (!record_type->composite.fields)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "record type does not contain any fields");
+                return false;
+            }
+
+            for (size_t i = 0; i < record_type->composite.field_count; i++)
+            {
+                Symbol *field = &record_type->composite.fields[i];
+                if (strcmp(field->name, field_name) == 0)
+                {
+                    *out_value = (long long)field->field.offset;
+                    return true;
+                }
+            }
+
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "field '%s' not found on type", field_name);
+            return false;
+        }
+
+        if (strcmp(name, "type_of") == 0)
+        {
+            if (arg_cnt != 1)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "type_of expects exactly one argument");
+                return false;
+            }
+
+            AstNode *arg      = expr->call_expr.args->items[0];
+            Type    *arg_type = arg ? type_resolve_alias(arg->type) : NULL;
+            if (!arg_type || arg_type == type_error())
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "type_of could not resolve argument type");
+                return false;
+            }
+
+            uint64_t type_hash = (uint64_t)arg_type->kind;
+            type_hash          = type_hash * 31 + type_sizeof(arg_type);
+            type_hash          = type_hash * 31 + type_alignof(arg_type);
+
+            *out_value = (long long)type_hash;
+            return true;
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time intrinsic '%s'", name ? name : "<anon>");
         return false;
     }
 

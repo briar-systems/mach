@@ -928,11 +928,12 @@ static AstNode *parser_finish_call(Parser *parser, AstNode *callee, AstList *typ
     }
 
     // Check if this is a type intrinsic that expects type arguments instead of expressions
-    bool is_type_intrinsic = false;
+    bool        is_type_intrinsic = false;
+    const char *intrinsic_name    = NULL;
     if (callee->kind == AST_EXPR_IDENT)
     {
-        const char *name = callee->ident_expr.name;
-        if (strcmp(name, "size_of") == 0 || strcmp(name, "align_of") == 0 || strcmp(name, "offset_of") == 0 || strcmp(name, "type_of") == 0)
+        intrinsic_name = callee->ident_expr.name;
+        if (strcmp(intrinsic_name, "size_of") == 0 || strcmp(intrinsic_name, "align_of") == 0 || strcmp(intrinsic_name, "offset_of") == 0 || strcmp(intrinsic_name, "type_of") == 0)
         {
             is_type_intrinsic = true;
         }
@@ -942,11 +943,21 @@ static AstNode *parser_finish_call(Parser *parser, AstNode *callee, AstList *typ
     {
         do
         {
-            AstNode *arg = NULL;
+            AstNode *arg       = NULL;
+            size_t   arg_index = call->call_expr.args->count;
+
             if (is_type_intrinsic)
             {
-                // Parse as type instead of expression
-                arg = parser_parse_type(parser);
+                // offset_of expects the second argument to be a field name expression
+                if (intrinsic_name && strcmp(intrinsic_name, "offset_of") == 0 && arg_index == 1)
+                {
+                    arg = parser_parse_expr(parser);
+                }
+                else
+                {
+                    // Parse as type instead of expression
+                    arg = parser_parse_type(parser);
+                }
             }
             else
             {
