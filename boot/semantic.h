@@ -2,6 +2,7 @@
 #define SEMANTIC_NEW_H
 
 #include "ast.h"
+#include "comptime.h"
 #include "module.h"
 #include "symbol.h"
 #include "type.h"
@@ -134,16 +135,33 @@ struct InstantiationQueue
     size_t                count;
 };
 
+// symbol attribute: compile-time attribute associated with a symbol
+typedef struct SymbolAttribute
+{
+    char                   *symbol_name; // the symbol this attribute applies to
+    char                   *attr_name;   // attribute name (e.g., "symbol", "inline")
+    char                   *attr_value;  // attribute value (string literal)
+    struct SymbolAttribute *next;        // linked list
+} SymbolAttribute;
+
+// symbol attribute map: stores all compile-time attributes
+typedef struct SymbolAttributeMap
+{
+    SymbolAttribute *head;
+} SymbolAttributeMap;
+
 // semantic driver: orchestrates multi-pass analysis
 struct SemanticDriver
 {
-    ModuleManager       module_manager;
-    SymbolTable         symbol_table; // for codegen compatibility
-    SpecializationCache spec_cache;
-    InstantiationQueue  inst_queue;
-    DiagnosticSink      diagnostics;
-    AstNode            *program_root;
-    const char         *entry_module_name;
+    ModuleManager        module_manager;
+    SymbolTable          symbol_table; // for codegen compatibility
+    SpecializationCache  spec_cache;
+    InstantiationQueue   inst_queue;
+    DiagnosticSink       diagnostics;
+    AstNode             *program_root;
+    const char          *entry_module_name;
+    SymbolAttributeMap   attributes;   // compile-time attributes
+    ComptimeBuildContext comptime_ctx; // compile-time build context
 };
 
 // driver lifecycle

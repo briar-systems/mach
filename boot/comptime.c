@@ -43,58 +43,6 @@
 
 #define MACH_VERSION "0.1.0"
 
-// Helper to get OS string from enum
-static const char *comptime_os_string(ComptimeOS os)
-{
-    switch (os)
-    {
-    case COMPTIME_OS_LINUX:
-        return "linux";
-    case COMPTIME_OS_DARWIN:
-        return "darwin";
-    case COMPTIME_OS_WINDOWS:
-        return "windows";
-    case COMPTIME_OS_BSD:
-        return "bsd";
-    default:
-        return "unknown";
-    }
-}
-
-// Helper to get arch string from enum
-static const char *comptime_arch_string(ComptimeArch arch)
-{
-    switch (arch)
-    {
-    case COMPTIME_ARCH_X86_64:
-        return "x86_64";
-    case COMPTIME_ARCH_ARM64:
-        return "arm64";
-    case COMPTIME_ARCH_ARM:
-        return "arm";
-    case COMPTIME_ARCH_RISCV64:
-        return "riscv64";
-    default:
-        return "unknown";
-    }
-}
-
-// Helper to get pointer size from arch
-static unsigned int comptime_arch_pointer_size(ComptimeArch arch)
-{
-    switch (arch)
-    {
-    case COMPTIME_ARCH_X86_64:
-    case COMPTIME_ARCH_ARM64:
-    case COMPTIME_ARCH_RISCV64:
-        return 8;
-    case COMPTIME_ARCH_ARM:
-        return 4;
-    default:
-        return 8;
-    }
-}
-
 void comptime_build_context_init_host(ComptimeBuildContext *ctx)
 {
     if (!ctx)
