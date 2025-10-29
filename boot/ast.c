@@ -68,7 +68,6 @@ void ast_node_dnit(AstNode *node)
     case AST_STMT_VAL:
     case AST_STMT_VAR:
         free(node->var_stmt.name);
-        free(node->var_stmt.mangle_name);
         if (node->var_stmt.type)
         {
             ast_node_dnit(node->var_stmt.type);
@@ -83,7 +82,6 @@ void ast_node_dnit(AstNode *node)
 
     case AST_STMT_FUN:
         free(node->fun_stmt.name);
-        free(node->fun_stmt.mangle_name);
         if (node->fun_stmt.params)
         {
             ast_list_dnit(node->fun_stmt.params);
@@ -235,16 +233,12 @@ void ast_node_dnit(AstNode *node)
         free(node->asm_stmt.code);
         free(node->asm_stmt.constraints);
         break;
-    case AST_STMT_WHEN:
-        if (node->when_stmt.cond)
+
+    case AST_COMPTIME:
+        if (node->comptime.inner)
         {
-            ast_node_dnit(node->when_stmt.cond);
-            free(node->when_stmt.cond);
-        }
-        if (node->when_stmt.body)
-        {
-            ast_node_dnit(node->when_stmt.body);
-            free(node->when_stmt.body);
+            ast_node_dnit(node->comptime.inner);
+            free(node->comptime.inner);
         }
         break;
 
@@ -581,12 +575,11 @@ static AstNode *ast_clone_checked(const AstNode *node)
 
     case AST_STMT_VAL:
     case AST_STMT_VAR:
-        clone->var_stmt.name        = ast_strdup(node->var_stmt.name);
-        clone->var_stmt.type        = ast_clone_checked(node->var_stmt.type);
-        clone->var_stmt.init        = ast_clone_checked(node->var_stmt.init);
-        clone->var_stmt.is_val      = node->var_stmt.is_val;
-        clone->var_stmt.is_public   = node->var_stmt.is_public;
-        clone->var_stmt.mangle_name = ast_strdup(node->var_stmt.mangle_name);
+        clone->var_stmt.name      = ast_strdup(node->var_stmt.name);
+        clone->var_stmt.type      = ast_clone_checked(node->var_stmt.type);
+        clone->var_stmt.init      = ast_clone_checked(node->var_stmt.init);
+        clone->var_stmt.is_val    = node->var_stmt.is_val;
+        clone->var_stmt.is_public = node->var_stmt.is_public;
         break;
 
     case AST_STMT_FUN:
@@ -597,7 +590,6 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->fun_stmt.body            = ast_clone_checked(node->fun_stmt.body);
         clone->fun_stmt.is_variadic     = node->fun_stmt.is_variadic;
         clone->fun_stmt.is_public       = node->fun_stmt.is_public;
-        clone->fun_stmt.mangle_name     = ast_strdup(node->fun_stmt.mangle_name);
         clone->fun_stmt.is_method       = node->fun_stmt.is_method;
         clone->fun_stmt.method_receiver = ast_clone_checked(node->fun_stmt.method_receiver);
         break;
@@ -639,12 +631,9 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->asm_stmt.code        = ast_strdup(node->asm_stmt.code);
         clone->asm_stmt.constraints = ast_strdup(node->asm_stmt.constraints);
         break;
-    case AST_STMT_WHEN:
-        clone->when_stmt.cond         = ast_clone_checked(node->when_stmt.cond);
-        clone->when_stmt.body         = ast_clone_checked(node->when_stmt.body);
-        clone->when_stmt.is_top_level = node->when_stmt.is_top_level;
-        clone->when_stmt.evaluated    = node->when_stmt.evaluated;
-        clone->when_stmt.cond_value   = node->when_stmt.cond_value;
+
+    case AST_COMPTIME:
+        clone->comptime.inner = ast_clone_checked(node->comptime.inner);
         break;
 
     case AST_STMT_RET:
@@ -839,10 +828,7 @@ void ast_print(AstNode *node, int indent)
         break;
 
     case AST_STMT_VAL:
-        printf("VAL %s", node->var_stmt.name);
-        if (node->var_stmt.mangle_name)
-            printf(" [mangle=%s]", node->var_stmt.mangle_name);
-        printf(":\n");
+        printf("VAL %s:\n", node->var_stmt.name);
         if (node->var_stmt.type)
         {
             ast_print(node->var_stmt.type, indent + 1);
@@ -856,10 +842,7 @@ void ast_print(AstNode *node, int indent)
         break;
 
     case AST_STMT_VAR:
-        printf("VAR %s", node->var_stmt.name);
-        if (node->var_stmt.mangle_name)
-            printf(" [mangle=%s]", node->var_stmt.mangle_name);
-        printf(":\n");
+        printf("VAR %s:\n", node->var_stmt.name);
         if (node->var_stmt.type)
         {
             ast_print(node->var_stmt.type, indent + 1);
@@ -873,10 +856,7 @@ void ast_print(AstNode *node, int indent)
         break;
 
     case AST_STMT_FUN:
-        printf("FUN %s", node->fun_stmt.name);
-        if (node->fun_stmt.mangle_name)
-            printf(" [mangle=%s]", node->fun_stmt.mangle_name);
-        printf(":\n");
+        printf("FUN %s:\n", node->fun_stmt.name);
         if (node->fun_stmt.generics && node->fun_stmt.generics->count > 0)
         {
             print_indent(indent + 1);
@@ -916,23 +896,10 @@ void ast_print(AstNode *node, int indent)
     case AST_STMT_ASM:
         printf("ASM %s\n", node->asm_stmt.code ? node->asm_stmt.code : "");
         break;
-    case AST_STMT_WHEN:
-        printf("WHEN");
-        if (node->when_stmt.is_top_level)
-        {
-            printf(" [top-level]");
-        }
-        if (node->when_stmt.evaluated)
-        {
-            printf(" [cond=%s]", node->when_stmt.cond_value ? "true" : "false");
-        }
-        printf("\n");
-        print_indent(indent + 1);
-        printf("cond:\n");
-        ast_print(node->when_stmt.cond, indent + 2);
-        print_indent(indent + 1);
-        printf("body:\n");
-        ast_print(node->when_stmt.body, indent + 2);
+
+    case AST_COMPTIME:
+        printf("COMPTIME\n");
+        ast_print(node->comptime.inner, indent + 1);
         break;
 
     case AST_STMT_UNI:
@@ -1246,8 +1213,8 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "EXPR_STMT";
     case AST_STMT_ASM:
         return "ASM";
-    case AST_STMT_WHEN:
-        return "WHEN";
+    case AST_COMPTIME:
+        return "COMPTIME";
     case AST_STMT_RET:
         return "RET";
     case AST_STMT_IF:
@@ -1361,10 +1328,7 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         ast_print_to_file(node->def_stmt.type, file, indent + 1);
         break;
     case AST_STMT_VAL:
-        fprintf(file, "VAL %s", node->var_stmt.name);
-        if (node->var_stmt.mangle_name)
-            fprintf(file, " [mangle=%s]", node->var_stmt.mangle_name);
-        fprintf(file, ":\n");
+        fprintf(file, "VAL %s:\n", node->var_stmt.name);
         if (node->var_stmt.type)
         {
             ast_print_to_file(node->var_stmt.type, file, indent + 1);
@@ -1377,10 +1341,7 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         }
         break;
     case AST_STMT_VAR:
-        fprintf(file, "VAR %s", node->var_stmt.name);
-        if (node->var_stmt.mangle_name)
-            fprintf(file, " [mangle=%s]", node->var_stmt.mangle_name);
-        fprintf(file, ":\n");
+        fprintf(file, "VAR %s:\n", node->var_stmt.name);
         if (node->var_stmt.type)
         {
             ast_print_to_file(node->var_stmt.type, file, indent + 1);
@@ -1393,10 +1354,7 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         }
         break;
     case AST_STMT_FUN:
-        fprintf(file, "FUN %s", node->fun_stmt.name);
-        if (node->fun_stmt.mangle_name)
-            fprintf(file, " [mangle=%s]", node->fun_stmt.mangle_name);
-        fprintf(file, ":\n");
+        fprintf(file, "FUN %s:\n", node->fun_stmt.name);
         if (node->fun_stmt.generics && node->fun_stmt.generics->count > 0)
         {
             print_indent_to_file(file, indent + 1);
@@ -1449,9 +1407,12 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         break;
     case AST_STMT_BLOCK:
         fprintf(file, "BLOCK\n");
-        for (int i = 0; i < node->block_stmt.stmts->count; i++)
+        if (node->block_stmt.stmts)
         {
-            ast_print_to_file(node->block_stmt.stmts->items[i], file, indent + 1);
+            for (int i = 0; i < node->block_stmt.stmts->count; i++)
+            {
+                ast_print_to_file(node->block_stmt.stmts->items[i], file, indent + 1);
+            }
         }
         break;
     case AST_STMT_EXPR:
@@ -1461,24 +1422,12 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
     case AST_STMT_ASM:
         fprintf(file, "ASM %s\n", node->asm_stmt.code ? node->asm_stmt.code : "");
         break;
-    case AST_STMT_WHEN:
-        fprintf(file, "WHEN");
-        if (node->when_stmt.is_top_level)
-        {
-            fprintf(file, " [top-level]");
-        }
-        if (node->when_stmt.evaluated)
-        {
-            fprintf(file, " [cond=%s]", node->when_stmt.cond_value ? "true" : "false");
-        }
-        fprintf(file, "\n");
-        print_indent_to_file(file, indent + 1);
-        fprintf(file, "cond:\n");
-        ast_print_to_file(node->when_stmt.cond, file, indent + 2);
-        print_indent_to_file(file, indent + 1);
-        fprintf(file, "body:\n");
-        ast_print_to_file(node->when_stmt.body, file, indent + 2);
+
+    case AST_COMPTIME:
+        fprintf(file, "COMPTIME\n");
+        ast_print_to_file(node->comptime.inner, file, indent + 1);
         break;
+
     case AST_STMT_RET:
         fprintf(file, "RET\n");
         if (node->ret_stmt.expr)
