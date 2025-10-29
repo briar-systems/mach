@@ -1,5 +1,4 @@
 #include "semantic.h"
-#include "compilation.h"
 #include "comptime.h"
 #include "ioutil.h"
 #include "lexer.h"
