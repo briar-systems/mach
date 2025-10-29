@@ -135,10 +135,10 @@ struct AstNode
         {
             char    *name;
             AstList *params;
-            AstList *generics;      // optional generic parameters
-            AstNode *return_type;   // null for no return
-            AstNode *body;          // null for external functions
-            bool     is_variadic;   // true if function has variadic arguments
+            AstList *generics;    // optional generic parameters
+            AstNode *return_type; // null for no return
+            AstNode *body;        // null for external functions
+            bool     is_variadic; // true if function has variadic arguments
             bool     is_public;
             bool     is_method;
             AstNode *method_receiver; // typename before '.' for method declarations
