@@ -1,4 +1,5 @@
 #include "compilation.h"
+#include "comptime.h"
 #include "filesystem.h"
 #include "lexer.h"
 #include "parser.h"
@@ -204,6 +205,13 @@ bool compilation_context_init(CompilationContext *ctx, BuildOptions *opts)
         fprintf(stderr, "error: failed to create semantic driver\n");
         return false;
     }
+    
+    if (opts)
+    {
+        ctx->driver->comptime_ctx.build_debug = opts->debug_info ? true : false;
+        ctx->driver->comptime_ctx.opt_level   = opts->opt_level;
+    }
+    
     return true;
 }
 
