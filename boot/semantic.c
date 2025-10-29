@@ -4696,7 +4696,7 @@ static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisCon
             *out_value = (long long)expr->lit_expr.char_val;
             return true;
         default:
-            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "literal not allowed in '$when' condition");
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "literal not allowed in '$if' condition");
             return false;
         }
 
@@ -4774,7 +4774,7 @@ static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisCon
             *out_value = operand;
             return true;
         default:
-            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported unary operator in '$when' condition");
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported unary operator in '$if' condition");
             return false;
         }
     }
@@ -4849,12 +4849,12 @@ static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisCon
             return true;
         }
 
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported operator in '$when' condition");
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported operator in '$if' condition");
         return false;
     }
 
     default:
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "expression not allowed in '$when' condition");
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "expression not allowed in '$if' condition");
         return false;
     }
 

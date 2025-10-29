@@ -3125,7 +3125,7 @@ AstList *parser_parse_field_list(Parser *parser)
     {
         if (parser->current->kind == TOKEN_DOLLAR)
         {
-            parser_error_at_current(parser, "'$when' is not allowed inside record or union declarations");
+            parser_error_at_current(parser, "'$if' is not allowed inside record or union declarations");
             ast_list_dnit(list);
             free(list);
             return NULL;
