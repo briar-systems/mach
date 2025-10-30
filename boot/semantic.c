@@ -11,14 +11,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-static Type *analyze_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
-static Type *analyze_lit_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
-static Type *analyze_null_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
-static Type *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr);
-static bool  ensure_assignable(SemanticDriver *driver, const AnalysisContext *ctx, Type *expected, Type *actual, AstNode *site, const char *what);
-static bool  evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value);
-static bool  evaluate_comptime_expr_bool(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, bool *out_value);
-static bool  analyze_comptime_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt);
+static Type   *analyze_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
+static Type   *analyze_lit_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
+static Type   *analyze_null_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
+static Type   *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr);
+static bool    ensure_assignable(SemanticDriver *driver, const AnalysisContext *ctx, Type *expected, Type *actual, AstNode *site, const char *what);
+static bool    evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value);
+static bool    evaluate_comptime_expr_bool(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, bool *out_value);
+static bool    analyze_comptime_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt);
+static Symbol *lookup_in_scope_chain(Scope *current_scope, Scope *module_scope, Scope *global_scope, const char *name);
+static Symbol *instantiate_generic_type(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *type_node, Symbol *generic_sym);
 
 typedef bool (*TopLevelVisitor)(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt);
 static bool visit_top_level_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt, TopLevelVisitor visitor);
@@ -969,15 +971,59 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
     {
     case AST_TYPE_NAME:
     {
-        const char *name = type_node->type_name.name;
+        const char *alias            = type_node->type_name.module_alias;
+        const char *name             = type_node->type_name.name;
+        bool        has_generic_args = type_node->type_name.generic_args && type_node->type_name.generic_args->count > 0;
 
-        // check for generic binding first - this resolves type parameters like T, E, etc.
-        Type *bound = generic_binding_ctx_lookup(&ctx->bindings, name);
-        if (bound)
-            return bound;
+        if (!alias)
+        {
+            // check for generic binding first - this resolves type parameters like T, E, etc.
+            Type *bound = generic_binding_ctx_lookup(&ctx->bindings, name);
+            if (bound)
+                return bound;
+        }
 
-        // check for generic instantiation (must come before caching)
-        if (type_node->type_name.generic_args && type_node->type_name.generic_args->count > 0)
+        if (type_node->type && !ctx->bindings.count && !has_generic_args)
+            return type_node->type;
+
+        if (alias)
+        {
+            Symbol *alias_sym = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, alias);
+            if (!alias_sym || alias_sym->kind != SYMBOL_MODULE)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "unknown module alias '%s'", alias);
+                return NULL;
+            }
+
+            if (!alias_sym->module.scope)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "module alias '%s' has no exported scope", alias);
+                return NULL;
+            }
+
+            Symbol *type_sym = symbol_lookup_scope(alias_sym->module.scope, name);
+            if (!type_sym || type_sym->kind != SYMBOL_TYPE)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "module alias '%s' has no type '%s'", alias, name);
+                return NULL;
+            }
+
+            if (has_generic_args)
+            {
+                Symbol *specialized = instantiate_generic_type(driver, ctx, type_node, type_sym);
+                if (specialized && specialized->type)
+                    return specialized->type;
+
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "failed to instantiate generic type '%s.%s'", alias, name);
+                return NULL;
+            }
+
+            if (!ctx->bindings.count)
+                type_node->type = type_sym->type;
+            return type_sym->type;
+        }
+
+        if (has_generic_args)
         {
             Symbol *specialized = request_generic_type_instantiation(driver, ctx, type_node);
             if (specialized && specialized->type)
@@ -988,10 +1034,6 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
             diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "failed to instantiate generic type '%s'", name);
             return NULL;
         }
-
-        // cache if already resolved (only for non-generic, non-parameterized references)
-        if (type_node->type && !ctx->bindings.count)
-            return type_node->type;
 
         // check builtin types
         Type *builtin = type_lookup_builtin(name);
@@ -2899,6 +2941,52 @@ static bool process_instantiation_queue(SemanticDriver *driver, const AnalysisCo
 }
 
 // helper to request instantiation for type node with generic args
+static Symbol *instantiate_generic_type(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *type_node, Symbol *generic_sym)
+{
+    if (!type_node || type_node->kind != AST_TYPE_NAME)
+        return NULL;
+
+    if (!generic_sym || generic_sym->kind != SYMBOL_TYPE)
+        return NULL;
+
+    if (!type_node->type_name.generic_args || type_node->type_name.generic_args->count == 0)
+        return NULL;
+
+    if (generic_sym->import_origin)
+        generic_sym = generic_sym->import_origin;
+
+    size_t arg_count = type_node->type_name.generic_args->count;
+    Type **type_args = malloc(sizeof(Type *) * arg_count);
+    if (!type_args)
+        return NULL;
+
+    for (size_t i = 0; i < arg_count; i++)
+    {
+        type_args[i] = resolve_type_in_context(driver, ctx, type_node->type_name.generic_args->items[i]);
+        if (!type_args[i])
+        {
+            free(type_args);
+            return NULL;
+        }
+    }
+
+    Symbol *specialized = specialization_cache_find(&driver->spec_cache, generic_sym, type_args, arg_count);
+    if (!specialized)
+    {
+        InstantiationKind kind = INST_STRUCT;
+        if (generic_sym->type && generic_sym->type->kind == TYPE_UNION)
+            kind = INST_UNION;
+
+        if (kind == INST_STRUCT)
+            specialized = instantiate_generic_struct(driver, ctx, generic_sym, type_args, arg_count);
+        else
+            specialized = instantiate_generic_union(driver, ctx, generic_sym, type_args, arg_count);
+    }
+
+    free(type_args);
+    return specialized;
+}
+
 static Symbol *request_generic_type_instantiation(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *type_node)
 {
     if (!type_node || type_node->kind != AST_TYPE_NAME)
@@ -2914,49 +3002,7 @@ static Symbol *request_generic_type_instantiation(SemanticDriver *driver, const 
     if (!generic_sym)
         generic_sym = symbol_lookup_scope(ctx->global_scope, type_node->type_name.name);
 
-    if (!generic_sym || generic_sym->kind != SYMBOL_TYPE)
-        return NULL;
-
-    if (generic_sym->import_origin)
-        generic_sym = generic_sym->import_origin;
-
-    Symbol *origin_sym = generic_sym->import_origin ? generic_sym->import_origin : generic_sym;
-    generic_sym        = origin_sym;
-
-    // resolve type arguments
-    size_t arg_count = type_node->type_name.generic_args->count;
-    Type **type_args = malloc(sizeof(Type *) * arg_count);
-
-    for (size_t i = 0; i < arg_count; i++)
-    {
-        type_args[i] = resolve_type_in_context(driver, ctx, type_node->type_name.generic_args->items[i]);
-        if (!type_args[i])
-        {
-            free(type_args);
-            return NULL;
-        }
-    }
-
-    // check if already specialized
-    Symbol *specialized = specialization_cache_find(&driver->spec_cache, generic_sym, type_args, arg_count);
-    if (specialized)
-    {
-        free(type_args);
-        return specialized;
-    }
-
-    // determine kind and instantiate immediately (synchronous for types)
-    InstantiationKind kind = INST_STRUCT;
-    if (generic_sym->type && generic_sym->type->kind == TYPE_UNION)
-        kind = INST_UNION;
-
-    if (kind == INST_STRUCT)
-        specialized = instantiate_generic_struct(driver, ctx, generic_sym, type_args, arg_count);
-    else
-        specialized = instantiate_generic_union(driver, ctx, generic_sym, type_args, arg_count);
-
-    free(type_args);
-    return specialized;
+    return instantiate_generic_type(driver, ctx, type_node, generic_sym);
 }
 
 // forward declarations for mutual recursion

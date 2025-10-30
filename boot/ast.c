@@ -360,6 +360,7 @@ void ast_node_dnit(AstNode *node)
         break;
 
     case AST_TYPE_NAME:
+        free(node->type_name.module_alias);
         free(node->type_name.name);
         if (node->type_name.generic_args)
         {
@@ -733,6 +734,7 @@ static AstNode *ast_clone_checked(const AstNode *node)
         break;
 
     case AST_TYPE_NAME:
+        clone->type_name.module_alias = ast_strdup(node->type_name.module_alias);
         clone->type_name.name         = ast_strdup(node->type_name.name);
         clone->type_name.generic_args = ast_list_clone(node->type_name.generic_args);
         break;
@@ -1096,7 +1098,10 @@ void ast_print(AstNode *node, int indent)
         break;
 
     case AST_TYPE_NAME:
-        printf("TYPE %s\n", node->type_name.name);
+        if (node->type_name.module_alias)
+            printf("TYPE %s.%s\n", node->type_name.module_alias, node->type_name.name);
+        else
+            printf("TYPE %s\n", node->type_name.name);
         if (node->type_name.generic_args && node->type_name.generic_args->count > 0)
         {
             print_indent(indent + 1);
@@ -1574,7 +1579,10 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         }
         break;
     case AST_TYPE_NAME:
-        fprintf(file, "TYPE %s\n", node->type_name.name);
+        if (node->type_name.module_alias)
+            fprintf(file, "TYPE %s.%s\n", node->type_name.module_alias, node->type_name.name);
+        else
+            fprintf(file, "TYPE %s\n", node->type_name.name);
         if (node->type_name.generic_args && node->type_name.generic_args->count > 0)
         {
             print_indent_to_file(file, indent + 1);

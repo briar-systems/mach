@@ -314,6 +314,7 @@ struct AstNode
         // type expressions
         struct
         {
+            char    *module_alias;
             char    *name;
             AstList *generic_args;
         } type_name;
