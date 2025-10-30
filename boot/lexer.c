@@ -611,6 +611,8 @@ Token *lexer_next(Lexer *lexer)
         return lexer_emit(lexer, TOKEN_QUESTION, 1);
     case '@':
         return lexer_emit(lexer, TOKEN_AT, 1);
+    case '$':
+        return lexer_emit(lexer, TOKEN_DOLLAR, 1);
     case '.':
         if (lexer_peek(lexer, 1) == '.' && lexer_peek(lexer, 2) == '.')
         {

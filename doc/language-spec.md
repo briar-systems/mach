@@ -36,7 +36,12 @@ Mach is a statically typed, compiled systems language with explicit control over
     - [Functions (`fun`)](#functions-fun)
     - [Method syntax](#method-syntax)
     - [Inline assembly (`asm`)](#inline-assembly-asm)
-    - [Preprocessor directives](#preprocessor-directives)
+  - [Compile-Time System](#compile-time-system)
+    - [Evaluation model](#evaluation-model)
+    - [Namespaces and constants](#namespaces-and-constants)
+    - [Intrinsic functions](#intrinsic-functions)
+    - [Interaction with `$if`](#interaction-with-if)
+    - [Compile-time attributes](#compile-time-attributes)
   - [Statements](#statements)
     - [Blocks](#blocks)
     - [`if` / `or`](#if--or)
@@ -130,31 +135,31 @@ Mach is a statically typed, compiled systems language with explicit control over
 
 **Operators:**
 
-| Operator | Description | Example |
-|----------|-------------|---------|
-| `+` `-` `*` `/` `%` | Arithmetic: addition, subtraction, multiplication, division, modulo | `a + b`, `x * y` |
-| `&` `|` `^` `~` | Bitwise: AND, OR, XOR, NOT | `flags & mask`, `~bits` |
-| `<<` `>>` | Bitwise shifts: left shift, right shift | `value << 4` |
-| `==` `!=` | Equality: equal, not equal | `x == y` |
-| `<` `<=` `>` `>=` | Relational: less than, less or equal, greater than, greater or equal | `a < b` |
-| `&&` `||` `!` | Logical: AND, OR, NOT | `valid && ready`, `!flag` |
-| `=` | Assignment | `x = 10` |
-| `::` | Type cast | `value :: u64` |
-| `?` | Address-of (pointer from lvalue) | `?variable` |
-| `@` | Dereference (lvalue from pointer) | `@pointer` |
+| Operator            | Description                                                          | Example                   |
+| ------------------- | -------------------------------------------------------------------- | ------------------------- |
+| `+` `-` `*` `/` `%` | Arithmetic: addition, subtraction, multiplication, division, modulo  | `a + b`, `x * y`          |
+| `&` `\|` `^` `~`    | Bitwise: AND, OR, XOR, NOT                                           | `flags & mask`, `~bits`   |
+| `<<` `>>`           | Bitwise shifts: left shift, right shift                              | `value << 4`              |
+| `==` `!=`           | Equality: equal, not equal                                           | `x == y`                  |
+| `<` `<=` `>` `>=`   | Relational: less than, less or equal, greater than, greater or equal | `a < b`                   |
+| `&&` `\|\|` `!`     | Logical: AND, OR, NOT                                                | `valid && ready`, `!flag` |
+| `=`                 | Assignment                                                           | `x = 10`                  |
+| `::`                | Type cast                                                            | `value :: u64`            |
+| `?`                 | Address-of (pointer from lvalue)                                     | `?variable`               |
+| `@`                 | Dereference (lvalue from pointer)                                    | `@pointer`                |
 
 **Punctuation:**
 
-| Symbol | Purpose |
-|--------|---------|
-| `( )` | Function calls, grouping expressions, type parameters |
-| `[ ]` | Array indexing, array type declarations |
-| `{ }` | Block statements, record/union bodies, literals |
-| `,` | Separator for arguments, parameters, and fields |
-| `;` | Statement terminator |
-| `.` | Field access, module path separator |
-| `:` | Type annotations |
-| `...` | Variadic function parameters, variadic argument forwarding |
+| Symbol | Purpose                                                    |
+| ------ | ---------------------------------------------------------- |
+| `( )`  | Function calls, grouping expressions, type parameters      |
+| `[ ]`  | Array indexing, array type declarations                    |
+| `{ }`  | Block statements, record/union bodies, literals            |
+| `,`    | Separator for arguments, parameters, and fields            |
+| `;`    | Statement terminator                                       |
+| `.`    | Field access, module path separator                        |
+| `:`    | Type annotations                                           |
+| `...`  | Variadic function parameters, variadic argument forwarding |
 
 ---
 
@@ -164,12 +169,12 @@ Mach resolves every expression to a `Type`. The bootstrap compiler caches descri
 
 ### Primitive types
 
-| Name | Size | Notes |
-|------|------|-------|
+| Name                      | Size             | Notes             |
+| ------------------------- | ---------------- | ----------------- |
 | `u8`, `u16`, `u32`, `u64` | 1, 2, 4, 8 bytes | Unsigned integers |
-| `i8`, `i16`, `i32`, `i64` | 1, 2, 4, 8 bytes | Signed integers |
-| `f16`, `f32`, `f64` | 2, 4, 8 bytes | IEEE 754 floats |
-| `ptr` | 8 bytes | Untyped pointer |
+| `i8`, `i16`, `i32`, `i64` | 1, 2, 4, 8 bytes | Signed integers   |
+| `f16`, `f32`, `f64`       | 2, 4, 8 bytes    | IEEE 754 floats   |
+| `ptr`                     | 8 bytes          | Untyped pointer   |
 
 ### Typed pointers
 
@@ -239,12 +244,12 @@ val fnPtr: fun(i32, ptr) i32 = main;
 
 ### Generics
 
-Mach supports generic types and functions using angle bracket syntax `<T>`. Generic parameters are resolved at compile time based on usage.
+Mach supports generic types and functions using bracket syntax `[T]`. Generic parameters are resolved at compile time based on usage.
 
 **Generic records:**
 
 ```mach
-pub rec List<T> {
+pub rec List[T] {
     data: *T;
     len:  u64;
     cap:  u64;
@@ -254,8 +259,8 @@ pub rec List<T> {
 **Generic functions:**
 
 ```mach
-pub fun list_new<T>(cap: u64) Result<List<T>, string> {
-    val data: *T = mem.alloc<T>(cap);
+pub fun list_new[T](cap: u64) Result[List[T], string] {
+    val data: *T = mem.alloc[T](cap);
     // ...
 }
 ```
@@ -265,7 +270,7 @@ pub fun list_new<T>(cap: u64) Result<List<T>, string> {
 When calling generic functions or constructing generic types, the compiler accepts only explicit type parameters:
 
 ```mach
-val my_list: List<i32> = list_new<i32>(10).unwrap_ok();
+val my_list: List[i32] = list_new[i32](10).unwrap_ok();
 ```
 
 Generic type parameters can appear in:
@@ -352,7 +357,7 @@ pub fun main(args: []string) i64 {
 Mach supports method-style function definitions that associate functions with types. Methods use dot notation for the type before the function name:
 
 ```mach
-pub fun List<T>.reserve(this: *List<T>, additional: u64) Option<string> {
+pub fun List[T].reserve(this: *List[T], additional: u64) Option[string] {
     // ...
 }
 ```
@@ -375,41 +380,83 @@ asm {
 - `pub asm` is invalid.
 - Content between braces is copied as-is into the generated LLVM IR.
 
-### Preprocessor directives
+---
 
-Mach includes a simple preprocessor that processes directives starting with `#@`. These directives are evaluated before lexical analysis.
+## Compile-Time System
 
-**Conditional compilation:**
+Mach exposes build- and target-specific information through a dedicated compile-time subsystem. Expressions prefixed with `$` are evaluated during semantic analysis and replaced with literal values before type checking continues. If resolution fails the compiler emits an error and stops compilation.
+
+### Evaluation model
+
+- Only three expression forms are recognised:
+  1. **Identifiers** that name well-known constants (for example `$OS_LINUX`).
+  2. **Namespaced fields** of the form `$namespace.member` (for example `$target.pointer_size`).
+  3. **Intrinsic function calls** such as `$size_of(Type)`.
+- The evaluated value is written back into the AST as a literal. The resulting literal type must satisfy the surrounding context just like any other expression.
+- Integer results use Mach unsigned integer types: enumerations are `u8` and sizes/alignment are `u64`. String results are `[]u8` slices containing UTF‑8 data owned by the compiler.
+- Compile-time expressions cannot currently perform arithmetic or arbitrary function calls. Attempting to use other expression forms (casts, binary operators, user functions, etc.) produces `unsupported compile-time expression` diagnostics.
+
+### Namespaces and constants
+
+| Form                                                        | Type              | Description                                                                                                                                                             |
+| ----------------------------------------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `$OS_LINUX`, `$OS_DARWIN`, `$OS_WINDOWS`, `$OS_BSD`         | `u8`              | Enumerated operating system identifiers.                                                                                                                                |
+| `$ARCH_X86_64`, `$ARCH_ARM64`, `$ARCH_ARM`, `$ARCH_RISCV64` | `u8`              | Enumerated architecture identifiers.                                                                                                                                    |
+| `$target.os`                                                | `u8`              | Active build target OS (matches the constants above).                                                                                                                   |
+| `$target.arch`                                              | `u8`              | Active build target architecture (matches the constants above).                                                                                                         |
+| `$target.pointer_size`                                      | `u64`             | Pointer size of the target in bytes.                                                                                                                                    |
+| `$target.word_size`                                         | `u64`             | Alias for pointer size; provided for readability when dealing with word-sized data.                                                                                     |
+| `$target.triple`                                            | `[]u8`            | LLVM target triple string resolved from project configuration or the host when not specified.                                                                           |
+| `$build.debug`                                              | `u8`              | `1` when the build is emitting debug information, `0` otherwise.                                                                                                        |
+| `$mach.version`                                             | `[]u8`            | Version string of the compiler performing the build.                                                                                                                    |
+| `$OS`, `$ARCH`, `$PTR_WIDTH`                                | `u8`, `u8`, `u64` | Backwards-compatible aliases that mirror `$target.os`, `$target.arch`, and the pointer width in **bits** respectively. Prefer the modern `target.*` forms for new code. |
+
+The `target.*` and `build.*` values reflect the target selected in `mach.toml` (or via the CLI). When cross-compiling these values describe the *output* platform, not the host machine running the compiler.
+
+### Intrinsic functions
+
+Four intrinsics are presently available. They are invoked by wrapping the call in a `$` prefix:
 
 ```mach
-#@if (OS == OS_LINUX)
-use sys: std.system.platform.linux.sys;
-#@or (OS == OS_DARWIN)
-use sys: std.system.platform.darwin.sys;
-#@or (OS == OS_WINDOWS)
-use sys: std.system.platform.windows.sys;
-#@end
+val size_bytes: u64  = $size_of(MyType);
+val alignment: u64   = $align_of(MyType);
+val field_offset: u64 = $offset_of(MyRecord, value);
+val type_id: u64      = $type_of(MyRecord);
 ```
 
-- `#@if (condition)` begins a conditional block.
-- `#@or (condition)` provides an else-if branch.
-- `#@or` without a condition acts as else.
-- `#@end` closes the conditional block.
-- Conditions support identifiers, numeric comparisons (`==`, `!=`), and logical operators (`&&`, `||`, `!`).
-- Common predefined identifiers: `OS`, `OS_LINUX`, `OS_DARWIN`, `OS_WINDOWS`.
+- `size_of(Type)` – evaluates to the size of `Type` in bytes as a `u64`.
+- `align_of(Type)` – evaluates to the ABI alignment requirement of `Type` in bytes as a `u64`.
+- `offset_of(RecordType, field)` – yields the byte offset of `field` within `RecordType` (records and unions only).
+- `type_of(expr_or_type)` – produces a deterministic `u64` identifier for the resolved type. The value is derived from the type kind, size, and alignment and is intended for comparisons rather than serialization.
 
-**Symbol directives:**
+All intrinsics accept fully resolved types. The resulting value is constant-folded and can be used anywhere a `u64` literal is expected.
+
+### Interaction with `$if`
+
+`$if` conditions are ordinary compile-time expressions. They typically compare the constants above to select platform-specific code:
 
 ```mach
-#@symbol("main")
-fun main(args: []string) i64 { ... }
+$if ($target.os == $OS_LINUX) {
+  use sys: std.system.platform.linux.sys;
+}
 ```
 
-- `#@symbol("name")` overrides the symbol name in generated code.
-- Useful for controlling exported symbols and C interoperability.
-- Must appear immediately before the declaration it modifies.
+Because only identifiers and field accesses are supported, `$if` conditions must be written in terms of comparisons, conjunctions, disjunctions, and unary negation. Any failure to resolve the expression aborts compilation.
 
-Preprocessor directives are line-oriented and preserve line numbers by inserting blank lines where directives are removed, ensuring error messages reference correct source locations.
+### Compile-time attributes
+
+Symbol metadata can be attached using assignment syntax. The most common attribute is `symbol`, which overrides the exported identifier of the following declaration:
+
+```mach
+$main.symbol = "main";
+fun main(args: []string) i64 {
+    ret 0;
+}
+```
+
+- Attribute assignments accept either string literals (`"name"`) or integer literals.
+- Attributes are applied before semantic analysis so later passes observe the finalised metadata.
+- Additional attributes may be added in future releases; unknown attributes currently produce diagnostics.
 
 ---
 
@@ -587,14 +634,10 @@ lhs = rhs;
 
 The bootstrap compiler recognises several built-in functions that bypass normal symbol resolution. They reside in the global namespace.
 
-| Intrinsic | Description |
-|-----------|-------------|
-| `size_of(type)` | Returns the size (bytes) of the operand's type as `u64`. Operand is analysed but not evaluated. |
-| `align_of(type)` | Returns the alignment (bytes) of the operand's type as `u64`. |
-| `offset_of(typeExpr, fieldName)` | Record type and field identifier. Returns the byte offset of the named field. |
-| `type_of(type)` | Produces a `u64` identifier representing the expression's type (implementation detail; used for diagnostics/runtime tagging). |
-| `va_count()` | Inside Mach variadic functions: returns number of variadic arguments supplied at the call site. |
-| `va_arg(index)` | Returns a `ptr` to the variadic argument at `index`. Caller must cast manually. |
+| Intrinsic       | Description                                                                                     |
+| --------------- | ----------------------------------------------------------------------------------------------- |
+| `va_count()`    | Inside Mach variadic functions: returns number of variadic arguments supplied at the call site. |
+| `va_arg(index)` | Returns a `ptr` to the variadic argument at `index`. Caller must cast manually.                 |
 
 ### Variadic forwarding
 

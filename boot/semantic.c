@@ -1,4 +1,5 @@
 #include "semantic.h"
+#include "comptime.h"
 #include "ioutil.h"
 #include "lexer.h"
 #include "symbol.h"
@@ -10,11 +11,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-static Type *analyze_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
-static Type *analyze_lit_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
-static Type *analyze_null_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
-static Type *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr);
-static bool  ensure_assignable(SemanticDriver *driver, const AnalysisContext *ctx, Type *expected, Type *actual, AstNode *site, const char *what);
+static Type   *analyze_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
+static Type   *analyze_lit_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
+static Type   *analyze_null_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
+static Type   *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr);
+static bool    ensure_assignable(SemanticDriver *driver, const AnalysisContext *ctx, Type *expected, Type *actual, AstNode *site, const char *what);
+static bool    evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value);
+static bool    evaluate_comptime_expr_bool(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, bool *out_value);
+static bool    analyze_comptime_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt);
+static Symbol *lookup_in_scope_chain(Scope *current_scope, Scope *module_scope, Scope *global_scope, const char *name);
+static Symbol *instantiate_generic_type(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *type_node, Symbol *generic_sym);
+
+typedef bool (*TopLevelVisitor)(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt);
+static bool visit_top_level_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt, TopLevelVisitor visitor);
+static bool visit_top_level_list(SemanticDriver *driver, const AnalysisContext *ctx, AstList *list, TopLevelVisitor visitor);
 
 void diagnostic_sink_init(DiagnosticSink *sink)
 {
@@ -726,8 +736,11 @@ SemanticDriver *semantic_driver_create(void)
     specialization_cache_init(&driver->spec_cache);
     instantiation_queue_init(&driver->inst_queue);
     diagnostic_sink_init(&driver->diagnostics);
+    comptime_build_context_init_host(&driver->comptime_ctx);
     driver->program_root      = NULL;
     driver->entry_module_name = NULL;
+    driver->attributes.head   = NULL;
+
     return driver;
 }
 
@@ -738,7 +751,168 @@ void semantic_driver_destroy(SemanticDriver *driver)
     specialization_cache_dnit(&driver->spec_cache);
     instantiation_queue_dnit(&driver->inst_queue);
     diagnostic_sink_dnit(&driver->diagnostics);
+
+    SymbolAttribute *attr = driver->attributes.head;
+    while (attr)
+    {
+        SymbolAttribute *next = attr->next;
+        free(attr->symbol_name);
+        free(attr->attr_name);
+        free(attr->attr_value);
+        free(attr);
+        attr = next;
+    }
+
     free(driver);
+}
+
+static void add_symbol_attribute(SemanticDriver *driver, const char *symbol_name, const char *attr_name, const char *attr_value)
+{
+    SymbolAttribute *attr   = malloc(sizeof(SymbolAttribute));
+    attr->symbol_name       = strdup(symbol_name);
+    attr->attr_name         = strdup(attr_name);
+    attr->attr_value        = strdup(attr_value);
+    attr->next              = driver->attributes.head;
+    driver->attributes.head = attr;
+}
+
+static const char *get_symbol_attribute(SemanticDriver *driver, const char *symbol_name, const char *attr_name)
+{
+    for (SymbolAttribute *attr = driver->attributes.head; attr; attr = attr->next)
+    {
+        if (strcmp(attr->symbol_name, symbol_name) == 0 && strcmp(attr->attr_name, attr_name) == 0)
+        {
+            return attr->attr_value;
+        }
+    }
+    return NULL;
+}
+
+static AstNode *select_comptime_branch(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *if_stmt, bool *out_success, AstNode **out_holder);
+static AstList *extract_block_statements(AstNode *block, bool take_ownership);
+static void     comptime_convert_to_block(AstNode *stmt, AstList *stmts);
+static bool     process_top_level_comptime_if(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt, TopLevelVisitor visitor);
+
+static AstNode *select_comptime_branch(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *if_stmt, bool *out_success, AstNode **out_holder)
+{
+    if (out_success)
+        *out_success = false;
+
+    if (!if_stmt || if_stmt->kind != AST_STMT_IF)
+        return NULL;
+
+    bool cond_value = false;
+    if (!evaluate_comptime_expr_bool(driver, ctx, if_stmt->cond_stmt.cond, &cond_value))
+        return NULL;
+
+    if (cond_value)
+    {
+        if (out_holder)
+            *out_holder = if_stmt;
+        if (out_success)
+            *out_success = true;
+        return if_stmt->cond_stmt.body;
+    }
+
+    AstNode *current = if_stmt->cond_stmt.stmt_or;
+    while (current)
+    {
+        bool branch_taken = false;
+        if (current->cond_stmt.cond)
+        {
+            if (!evaluate_comptime_expr_bool(driver, ctx, current->cond_stmt.cond, &cond_value))
+                return NULL;
+            branch_taken = cond_value;
+        }
+        else
+        {
+            branch_taken = true;
+        }
+
+        if (branch_taken)
+        {
+            if (out_holder)
+                *out_holder = current;
+            if (out_success)
+                *out_success = true;
+            return current->cond_stmt.body;
+        }
+
+        current = current->cond_stmt.stmt_or;
+    }
+
+    if (out_holder)
+        *out_holder = NULL;
+    if (out_success)
+        *out_success = true;
+    return NULL;
+}
+
+static AstList *extract_block_statements(AstNode *block, bool take_ownership)
+{
+    if (!block)
+        return NULL;
+
+    if (block->kind == AST_STMT_BLOCK)
+    {
+        AstList *stmts          = block->block_stmt.stmts;
+        block->block_stmt.stmts = NULL;
+        if (take_ownership)
+        {
+            // only deinit the block wrapper, not the statements we extracted
+            // the statements are now owned by the returned list
+            free(block);
+        }
+        return stmts;
+    }
+
+    // not a block, wrap single statement in a list
+    AstList *list = malloc(sizeof(AstList));
+    if (!list)
+        return NULL;
+    ast_list_init(list);
+
+    // don't try to take ownership of non-block statements here
+    // they're already detached by the caller
+    ast_list_append(list, block);
+    return list;
+}
+
+static void comptime_convert_to_block(AstNode *stmt, AstList *stmts)
+{
+    // clear the union before changing kind to avoid accessing stale data
+    memset(&stmt->program, 0, sizeof(stmt->program));
+    stmt->kind             = AST_STMT_BLOCK;
+    stmt->block_stmt.stmts = stmts;
+}
+
+static bool process_top_level_comptime_if(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt, TopLevelVisitor visitor)
+{
+    AstNode *if_stmt = stmt->comptime.inner;
+    bool     success = false;
+    AstNode *holder  = NULL;
+    AstNode *body    = select_comptime_branch(driver, ctx, if_stmt, &success, &holder);
+    if (!success)
+        return false;
+
+    AstList *stmts = NULL;
+    if (body)
+    {
+        if (holder)
+            holder->cond_stmt.body = NULL;
+        stmts = extract_block_statements(body, true);
+    }
+
+    ast_node_dnit(if_stmt);
+    free(if_stmt);
+
+    stmt->comptime.inner = NULL;
+    comptime_convert_to_block(stmt, stmts);
+
+    if (!stmt->block_stmt.stmts)
+        return true;
+
+    return visit_top_level_list(driver, ctx, stmt->block_stmt.stmts, visitor);
 }
 
 static bool    analyze_pass_a_declarations(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *root);
@@ -797,15 +971,59 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
     {
     case AST_TYPE_NAME:
     {
-        const char *name = type_node->type_name.name;
+        const char *alias            = type_node->type_name.module_alias;
+        const char *name             = type_node->type_name.name;
+        bool        has_generic_args = type_node->type_name.generic_args && type_node->type_name.generic_args->count > 0;
 
-        // check for generic binding first - this resolves type parameters like T, E, etc.
-        Type *bound = generic_binding_ctx_lookup(&ctx->bindings, name);
-        if (bound)
-            return bound;
+        if (!alias)
+        {
+            // check for generic binding first - this resolves type parameters like T, E, etc.
+            Type *bound = generic_binding_ctx_lookup(&ctx->bindings, name);
+            if (bound)
+                return bound;
+        }
 
-        // check for generic instantiation (must come before caching)
-        if (type_node->type_name.generic_args && type_node->type_name.generic_args->count > 0)
+        if (type_node->type && !ctx->bindings.count && !has_generic_args)
+            return type_node->type;
+
+        if (alias)
+        {
+            Symbol *alias_sym = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, alias);
+            if (!alias_sym || alias_sym->kind != SYMBOL_MODULE)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "unknown module alias '%s'", alias);
+                return NULL;
+            }
+
+            if (!alias_sym->module.scope)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "module alias '%s' has no exported scope", alias);
+                return NULL;
+            }
+
+            Symbol *type_sym = symbol_lookup_scope(alias_sym->module.scope, name);
+            if (!type_sym || type_sym->kind != SYMBOL_TYPE)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "module alias '%s' has no type '%s'", alias, name);
+                return NULL;
+            }
+
+            if (has_generic_args)
+            {
+                Symbol *specialized = instantiate_generic_type(driver, ctx, type_node, type_sym);
+                if (specialized && specialized->type)
+                    return specialized->type;
+
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "failed to instantiate generic type '%s.%s'", alias, name);
+                return NULL;
+            }
+
+            if (!ctx->bindings.count)
+                type_node->type = type_sym->type;
+            return type_sym->type;
+        }
+
+        if (has_generic_args)
         {
             Symbol *specialized = request_generic_type_instantiation(driver, ctx, type_node);
             if (specialized && specialized->type)
@@ -816,10 +1034,6 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
             diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "failed to instantiate generic type '%s'", name);
             return NULL;
         }
-
-        // cache if already resolved (only for non-generic, non-parameterized references)
-        if (type_node->type && !ctx->bindings.count)
-            return type_node->type;
 
         // check builtin types
         Type *builtin = type_lookup_builtin(name);
@@ -1122,6 +1336,30 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
 }
 
 // enqueue module for analysis (loads and collects dependencies)
+static bool enqueue_dependency_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_USE)
+    {
+        const char *dep_path = stmt->use_stmt.module_path;
+        if (dep_path && !enqueue_module(driver, dep_path))
+        {
+            const char *file_path = ctx ? ctx->file_path : NULL;
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, file_path, "failed to load module '%s'", dep_path);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool process_use_stmt_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_USE)
+    {
+        return process_use_statement(driver, ctx, stmt);
+    }
+    return true;
+}
+
 static bool enqueue_module(SemanticDriver *driver, const char *module_path)
 {
     Module *module = load_module_deferred(driver, module_path);
@@ -1131,20 +1369,9 @@ static bool enqueue_module(SemanticDriver *driver, const char *module_path)
     // scan for use statements and enqueue dependencies
     if (module->ast && module->ast->kind == AST_PROGRAM)
     {
-        for (int i = 0; i < module->ast->program.stmts->count; i++)
-        {
-            AstNode *stmt = module->ast->program.stmts->items[i];
-            if (stmt->kind == AST_STMT_USE)
-            {
-                const char *dep_path = stmt->use_stmt.module_path;
-                if (dep_path)
-                {
-                    // recursively enqueue dependencies
-                    if (!enqueue_module(driver, dep_path))
-                        return false;
-                }
-            }
-        }
+        AnalysisContext dep_ctx = analysis_context_create(driver->symbol_table.global_scope, NULL, module->name, module->file_path);
+        if (!visit_top_level_list(driver, &dep_ctx, module->ast->program.stmts, enqueue_dependency_visitor))
+            return false;
     }
 
     return true;
@@ -1613,11 +1840,13 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
     symbol->module_name = ctx->module_name ? strdup(ctx->module_name) : NULL;
     symbol->home_scope  = ctx->current_scope;
 
-    // set mangled name for methods: check for #@symbol directive, otherwise use module__Type__method
-    if (stmt->fun_stmt.mangle_name && stmt->fun_stmt.mangle_name[0])
+    // check for symbol override attribute: $<method_name>.symbol = "..."
+    const char *extern_symbol_name = get_symbol_attribute(driver, method_name, "symbol");
+
+    if (extern_symbol_name)
     {
-        // explicit symbol name from #@symbol directive
-        symbol->func.extern_name = strdup(stmt->fun_stmt.mangle_name);
+        // explicit symbol name from $<name>.symbol attribute
+        symbol->func.extern_name = strdup(extern_symbol_name);
     }
     else if (!is_generic && ctx->module_name && ctx->module_name[0])
     {
@@ -1683,11 +1912,13 @@ static bool declare_fun_stmt(SemanticDriver *driver, const AnalysisContext *ctx,
     symbol->module_name = ctx->module_name ? strdup(ctx->module_name) : NULL;
     symbol->home_scope  = ctx->current_scope;
 
-    // set mangled name: use #@symbol directive if present, otherwise mangle with module name
-    if (stmt->fun_stmt.mangle_name && stmt->fun_stmt.mangle_name[0])
+    // check for symbol override attribute: $<name>.symbol = "..."
+    const char *extern_symbol_name = get_symbol_attribute(driver, name, "symbol");
+
+    if (extern_symbol_name)
     {
-        // explicit symbol name from #@symbol directive
-        symbol->func.extern_name = strdup(stmt->fun_stmt.mangle_name);
+        // explicit symbol name from $<name>.symbol attribute
+        symbol->func.extern_name = strdup(extern_symbol_name);
     }
     else if (!is_generic && ctx->module_name && ctx->module_name[0])
     {
@@ -1766,61 +1997,43 @@ static bool declare_var_stmt(SemanticDriver *driver, const AnalysisContext *ctx,
     return true;
 }
 
+static bool pass_a_declare_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    switch (stmt->kind)
+    {
+    case AST_STMT_DEF:
+        return declare_def_stmt(driver, ctx, stmt);
+
+    case AST_STMT_REC:
+        return declare_rec_stmt(driver, ctx, stmt);
+
+    case AST_STMT_UNI:
+        return declare_uni_stmt(driver, ctx, stmt);
+
+    case AST_STMT_FUN:
+        return declare_fun_stmt(driver, ctx, stmt);
+
+    case AST_STMT_EXT:
+        return declare_ext_stmt(driver, ctx, stmt);
+
+    case AST_STMT_VAL:
+    case AST_STMT_VAR:
+        return declare_var_stmt(driver, ctx, stmt);
+
+    case AST_STMT_USE:
+        return true; // processed later
+
+    default:
+        return true;
+    }
+}
+
 static bool analyze_pass_a_declarations(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *root)
 {
     if (!root || root->kind != AST_PROGRAM)
         return false;
 
-    bool success = true;
-
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        switch (stmt->kind)
-        {
-        case AST_STMT_DEF:
-            if (!declare_def_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_REC:
-            if (!declare_rec_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_UNI:
-            if (!declare_uni_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_FUN:
-            if (!declare_fun_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_EXT:
-            if (!declare_ext_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_VAL:
-        case AST_STMT_VAR:
-            if (!declare_var_stmt(driver, ctx, stmt))
-                success = false;
-            break;
-
-        case AST_STMT_USE:
-            // defer use statement processing until after Pass A
-            // this prevents infinite recursion during module loading
-            break;
-
-        default:
-            break;
-        }
-    }
-
-    return success;
+    return visit_top_level_list(driver, ctx, root->program.stmts, pass_a_declare_visitor);
 }
 
 // resolve record fields
@@ -2103,6 +2316,64 @@ static bool resolve_var_type(SemanticDriver *driver, const AnalysisContext *ctx,
     return true;
 }
 
+static bool pass_b_resolve_alias_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_DEF && stmt->symbol)
+    {
+        Type *resolved = resolve_type_in_context(driver, ctx, stmt->def_stmt.type);
+        if (resolved)
+        {
+            stmt->symbol->type->alias.target = resolved;
+            stmt->type                       = resolved;
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool pass_b_resolve_struct_fields_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_REC && stmt->symbol && !stmt->symbol->type_def.is_generic)
+    {
+        return resolve_str_fields(driver, ctx, stmt);
+    }
+    return true;
+}
+
+static bool pass_b_resolve_union_fields_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_UNI && stmt->symbol && !stmt->symbol->type_def.is_generic)
+    {
+        return resolve_uni_fields(driver, ctx, stmt);
+    }
+    return true;
+}
+
+static bool pass_b_resolve_fun_signature_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_FUN && stmt->symbol && !stmt->symbol->func.is_generic)
+    {
+        return resolve_fun_signature(driver, ctx, stmt);
+    }
+
+    if (stmt->kind == AST_STMT_EXT && stmt->symbol)
+    {
+        return resolve_ext_signature(driver, ctx, stmt);
+    }
+
+    return true;
+}
+
+static bool pass_b_resolve_var_type_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if ((stmt->kind == AST_STMT_VAL || stmt->kind == AST_STMT_VAR) && stmt->symbol)
+    {
+        return resolve_var_type(driver, ctx, stmt);
+    }
+    return true;
+}
+
 static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *root)
 {
     if (!root || root->kind != AST_PROGRAM)
@@ -2110,81 +2381,11 @@ static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisCont
 
     bool success = true;
 
-    // resolve type aliases
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_DEF && stmt->symbol)
-        {
-            Type *resolved = resolve_type_in_context(driver, ctx, stmt->def_stmt.type);
-            if (resolved)
-            {
-                stmt->symbol->type->alias.target = resolved;
-                stmt->type                       = resolved;
-            }
-            else
-            {
-                success = false;
-            }
-        }
-    }
-
-    // resolve record fields
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_REC && stmt->symbol && !stmt->symbol->type_def.is_generic)
-        {
-            if (!resolve_str_fields(driver, ctx, stmt))
-                success = false;
-        }
-    }
-
-    // resolve union fields
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_UNI && stmt->symbol && !stmt->symbol->type_def.is_generic)
-        {
-            if (!resolve_uni_fields(driver, ctx, stmt))
-                success = false;
-        }
-    }
-
-    // resolve function signatures
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_FUN && stmt->symbol && !stmt->symbol->func.is_generic)
-        {
-            // handle both regular functions and methods
-            if (!resolve_fun_signature(driver, ctx, stmt))
-                success = false;
-        }
-
-        // also handle external functions
-        if (stmt->kind == AST_STMT_EXT && stmt->symbol)
-        {
-            if (!resolve_ext_signature(driver, ctx, stmt))
-                success = false;
-        }
-    }
-
-    // resolve variable types
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if ((stmt->kind == AST_STMT_VAL || stmt->kind == AST_STMT_VAR) && stmt->symbol)
-        {
-            if (!resolve_var_type(driver, ctx, stmt))
-                success = false;
-        }
-    }
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_alias_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_struct_fields_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_union_fields_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_fun_signature_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_var_type_visitor) && success;
 
     return success;
 }
@@ -2740,6 +2941,52 @@ static bool process_instantiation_queue(SemanticDriver *driver, const AnalysisCo
 }
 
 // helper to request instantiation for type node with generic args
+static Symbol *instantiate_generic_type(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *type_node, Symbol *generic_sym)
+{
+    if (!type_node || type_node->kind != AST_TYPE_NAME)
+        return NULL;
+
+    if (!generic_sym || generic_sym->kind != SYMBOL_TYPE)
+        return NULL;
+
+    if (!type_node->type_name.generic_args || type_node->type_name.generic_args->count == 0)
+        return NULL;
+
+    if (generic_sym->import_origin)
+        generic_sym = generic_sym->import_origin;
+
+    size_t arg_count = type_node->type_name.generic_args->count;
+    Type **type_args = malloc(sizeof(Type *) * arg_count);
+    if (!type_args)
+        return NULL;
+
+    for (size_t i = 0; i < arg_count; i++)
+    {
+        type_args[i] = resolve_type_in_context(driver, ctx, type_node->type_name.generic_args->items[i]);
+        if (!type_args[i])
+        {
+            free(type_args);
+            return NULL;
+        }
+    }
+
+    Symbol *specialized = specialization_cache_find(&driver->spec_cache, generic_sym, type_args, arg_count);
+    if (!specialized)
+    {
+        InstantiationKind kind = INST_STRUCT;
+        if (generic_sym->type && generic_sym->type->kind == TYPE_UNION)
+            kind = INST_UNION;
+
+        if (kind == INST_STRUCT)
+            specialized = instantiate_generic_struct(driver, ctx, generic_sym, type_args, arg_count);
+        else
+            specialized = instantiate_generic_union(driver, ctx, generic_sym, type_args, arg_count);
+    }
+
+    free(type_args);
+    return specialized;
+}
+
 static Symbol *request_generic_type_instantiation(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *type_node)
 {
     if (!type_node || type_node->kind != AST_TYPE_NAME)
@@ -2755,49 +3002,7 @@ static Symbol *request_generic_type_instantiation(SemanticDriver *driver, const 
     if (!generic_sym)
         generic_sym = symbol_lookup_scope(ctx->global_scope, type_node->type_name.name);
 
-    if (!generic_sym || generic_sym->kind != SYMBOL_TYPE)
-        return NULL;
-
-    if (generic_sym->import_origin)
-        generic_sym = generic_sym->import_origin;
-
-    Symbol *origin_sym = generic_sym->import_origin ? generic_sym->import_origin : generic_sym;
-    generic_sym        = origin_sym;
-
-    // resolve type arguments
-    size_t arg_count = type_node->type_name.generic_args->count;
-    Type **type_args = malloc(sizeof(Type *) * arg_count);
-
-    for (size_t i = 0; i < arg_count; i++)
-    {
-        type_args[i] = resolve_type_in_context(driver, ctx, type_node->type_name.generic_args->items[i]);
-        if (!type_args[i])
-        {
-            free(type_args);
-            return NULL;
-        }
-    }
-
-    // check if already specialized
-    Symbol *specialized = specialization_cache_find(&driver->spec_cache, generic_sym, type_args, arg_count);
-    if (specialized)
-    {
-        free(type_args);
-        return specialized;
-    }
-
-    // determine kind and instantiate immediately (synchronous for types)
-    InstantiationKind kind = INST_STRUCT;
-    if (generic_sym->type && generic_sym->type->kind == TYPE_UNION)
-        kind = INST_UNION;
-
-    if (kind == INST_STRUCT)
-        specialized = instantiate_generic_struct(driver, ctx, generic_sym, type_args, arg_count);
-    else
-        specialized = instantiate_generic_union(driver, ctx, generic_sym, type_args, arg_count);
-
-    free(type_args);
-    return specialized;
+    return instantiate_generic_type(driver, ctx, type_node, generic_sym);
 }
 
 // forward declarations for mutual recursion
@@ -3225,16 +3430,193 @@ static Type *analyze_unary_expr(SemanticDriver *driver, const AnalysisContext *c
     return NULL;
 }
 
+static Type *analyze_comptime_intrinsic(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *call_expr, const char *func_name)
+{
+    size_t arg_count = call_expr->call_expr.args ? call_expr->call_expr.args->count : 0;
+
+    if (strcmp(func_name, "size_of") == 0 || strcmp(func_name, "align_of") == 0)
+    {
+        if (arg_count != 1)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "%s expects exactly one argument", func_name);
+            return NULL;
+        }
+
+        AstNode *arg      = call_expr->call_expr.args->items[0];
+        Type    *arg_type = NULL;
+
+        // check if argument is a type node (e.g., $size_of(*u64))
+        if (arg->kind >= AST_TYPE_NAME && arg->kind <= AST_TYPE_UNI)
+        {
+            arg_type  = resolve_type_in_context(driver, ctx, arg);
+            arg->type = arg_type;
+        }
+        // check if it's an identifier - try to resolve as a type name
+        else if (arg->kind == AST_EXPR_IDENT)
+        {
+            AstNode type_node                = {0};
+            type_node.kind                   = AST_TYPE_NAME;
+            type_node.type_name.name         = arg->ident_expr.name;
+            type_node.type_name.generic_args = NULL;
+
+            arg_type = resolve_type_in_context(driver, ctx, &type_node);
+
+            if (!arg_type || arg_type == type_error())
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "%s expects a type, but '%s' is not a valid type", func_name, arg->ident_expr.name);
+                return NULL;
+            }
+
+            arg->type = arg_type;
+        }
+        else
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "%s expects a type argument, not an expression", func_name);
+            return NULL;
+        }
+
+        if (!arg_type)
+            return NULL;
+
+        call_expr->type = type_u64();
+        return call_expr->type;
+    }
+
+    if (strcmp(func_name, "offset_of") == 0)
+    {
+        if (arg_count != 2)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of expects exactly two arguments (type, field)");
+            return NULL;
+        }
+
+        AstNode *type_arg  = call_expr->call_expr.args->items[0];
+        AstNode *field_arg = call_expr->call_expr.args->items[1];
+
+        Type *record_type = NULL;
+
+        if (type_arg->kind >= AST_TYPE_NAME && type_arg->kind <= AST_TYPE_UNI)
+        {
+            record_type    = resolve_type_in_context(driver, ctx, type_arg);
+            type_arg->type = record_type;
+        }
+        else if (type_arg->kind == AST_EXPR_IDENT)
+        {
+            AstNode type_node                = {0};
+            type_node.kind                   = AST_TYPE_NAME;
+            type_node.type_name.name         = type_arg->ident_expr.name;
+            type_node.type_name.generic_args = NULL;
+
+            record_type = resolve_type_in_context(driver, ctx, &type_node);
+            if (!record_type || record_type == type_error())
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of expects a record type as its first argument");
+                return NULL;
+            }
+
+            type_arg->type = record_type;
+        }
+        else
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of expects a type as its first argument");
+            return NULL;
+        }
+
+        if (!record_type || record_type == type_error())
+            return NULL;
+
+        record_type = type_resolve_alias(record_type);
+        if (!record_type || (record_type->kind != TYPE_STRUCT && record_type->kind != TYPE_UNION))
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of requires a record or union type");
+            return NULL;
+        }
+
+        const char *field_name = NULL;
+
+        if (field_arg->kind == AST_EXPR_IDENT)
+        {
+            field_name = field_arg->ident_expr.name;
+        }
+        else
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "offset_of expects a field name identifier as its second argument");
+            return NULL;
+        }
+
+        bool field_found = false;
+        if (record_type->composite.fields)
+        {
+            for (size_t i = 0; i < record_type->composite.field_count; i++)
+            {
+                Symbol *field = &record_type->composite.fields[i];
+                if (strcmp(field->name, field_name) == 0)
+                {
+                    field_found     = true;
+                    field_arg->type = field->type;
+                    break;
+                }
+            }
+        }
+
+        if (!field_found)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "field '%s' not found on type", field_name);
+            return NULL;
+        }
+
+        call_expr->type = type_u64();
+        return call_expr->type;
+    }
+
+    if (strcmp(func_name, "type_of") == 0)
+    {
+        if (arg_count != 1)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "type_of expects exactly one argument");
+            return NULL;
+        }
+
+        AstNode *arg      = call_expr->call_expr.args->items[0];
+        Type    *arg_type = NULL;
+
+        if (arg->kind >= AST_TYPE_NAME && arg->kind <= AST_TYPE_UNI)
+        {
+            arg_type  = resolve_type_in_context(driver, ctx, arg);
+            arg->type = arg_type;
+        }
+        else if (arg->kind == AST_EXPR_IDENT)
+        {
+            arg_type = analyze_ident_expr(driver, ctx, arg);
+        }
+        else
+        {
+            arg_type = analyze_expr(driver, ctx, arg);
+        }
+
+        if (!arg_type || arg_type == type_error())
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "type_of could not resolve argument type");
+            return NULL;
+        }
+
+        call_expr->type = type_u64();
+        return call_expr->type;
+    }
+
+    return NULL;
+}
+
 static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
 {
-    // Handle potential method calls FIRST: obj.method(args) -> method(obj, args)
-    // This must happen before analyzing the func to avoid rejecting valid method calls
+    // handle potential method calls FIRST: obj.method(args) -> method(obj, args)
+    // this must happen before analyzing the func to avoid rejecting valid method calls
     if (expr->call_expr.func && expr->call_expr.func->kind == AST_EXPR_FIELD)
     {
         AstNode *field_expr = expr->call_expr.func;
         AstNode *receiver   = field_expr->field_expr.object;
 
-        // Special case: check if this is module.function() where object is an identifier for a module
+        // special case: check if this is module.function() where object is an identifier for a module
         if (receiver->kind == AST_EXPR_IDENT)
         {
             const char *obj_name = receiver->ident_expr.name;
@@ -3242,13 +3624,13 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
 
             if (obj_sym && obj_sym->kind == SYMBOL_MODULE)
             {
-                // This is module.function() - fall through to normal call analysis
-                // The field expression will look up the function in the module scope
+                // this is module.function() - fall through to normal call analysis
+                // the field expression will look up the function in the module scope
                 goto normal_call_analysis;
             }
         }
 
-        // Potential method call: analyze receiver and try method lookup
+        // potential method call: analyze receiver and try method lookup
         // analyze receiver to get its type
         Type *receiver_type = analyze_expr(driver, ctx, receiver);
         if (!receiver_type)
@@ -3272,7 +3654,7 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
             method_sym = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, mangled_name);
         }
 
-        // Store the original type before resolving, in case we need it later
+        // store the original type before resolving, in case we need it later
         Type *original_type = lookup_type;
 
         // resolve aliases for further processing
@@ -3431,119 +3813,11 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
 
 normal_call_analysis:; // label must be followed by a statement
 
+    // handle runtime intrinsics (va_count, va_arg)
     if (expr->call_expr.func && expr->call_expr.func->kind == AST_EXPR_IDENT)
     {
         const char *intr_name = expr->call_expr.func->ident_expr.name;
         size_t      arg_count = expr->call_expr.args ? expr->call_expr.args->count : 0;
-
-        if (strcmp(intr_name, "size_of") == 0)
-        {
-            if (arg_count != 1)
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "size_of expects exactly one argument");
-                return NULL;
-            }
-
-            AstNode *arg      = expr->call_expr.args->items[0];
-            Type    *arg_type = NULL;
-
-            // Check if argument is a type node (e.g., size_of(*u64))
-            if (arg->kind >= AST_TYPE_NAME && arg->kind <= AST_TYPE_UNI)
-            {
-                arg_type = resolve_type_in_context(driver, ctx, arg);
-                // Store the resolved type on the arg node for codegen
-                arg->type = arg_type;
-            }
-            // Check if it's an identifier - try to resolve as a type name first
-            else if (arg->kind == AST_EXPR_IDENT)
-            {
-                // Create a temporary type node and try resolving it
-                AstNode type_node                = {0};
-                type_node.kind                   = AST_TYPE_NAME;
-                type_node.type_name.name         = arg->ident_expr.name;
-                type_node.type_name.generic_args = NULL;
-
-                // Try to resolve it as a type (handles builtins and user types)
-                arg_type = resolve_type_in_context(driver, ctx, &type_node);
-
-                // If it resolved to error type, it's not a valid type identifier
-                // So reject it rather than falling back to expression analysis
-                if (!arg_type || arg_type == type_error())
-                {
-                    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "size_of expects a type, but '%s' is not a valid type", arg->ident_expr.name);
-                    return NULL;
-                }
-
-                // Store the resolved type on the arg node for codegen
-                arg->type = arg_type;
-            }
-            else
-            {
-                // Reject expressions - size_of should only accept types
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "size_of expects a type argument, not an expression");
-                return NULL;
-            }
-
-            if (!arg_type)
-                return NULL;
-
-            expr->type = type_u64();
-            return expr->type;
-        }
-
-        if (strcmp(intr_name, "align_of") == 0)
-        {
-            if (arg_count != 1)
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "align_of expects exactly one argument");
-                return NULL;
-            }
-
-            AstNode *arg      = expr->call_expr.args->items[0];
-            Type    *arg_type = NULL;
-
-            // Check if argument is a type node (e.g., align_of(*u64))
-            if (arg->kind >= AST_TYPE_NAME && arg->kind <= AST_TYPE_UNI)
-            {
-                arg_type = resolve_type_in_context(driver, ctx, arg);
-                // Store the resolved type on the arg node for codegen
-                arg->type = arg_type;
-            }
-            // Check if it's an identifier - try to resolve as a type name first
-            else if (arg->kind == AST_EXPR_IDENT)
-            {
-                // Create a temporary type node and try resolving it
-                AstNode type_node                = {0};
-                type_node.kind                   = AST_TYPE_NAME;
-                type_node.type_name.name         = arg->ident_expr.name;
-                type_node.type_name.generic_args = NULL;
-
-                // Try to resolve it as a type (handles builtins and user types)
-                arg_type = resolve_type_in_context(driver, ctx, &type_node);
-
-                // If it resolved to error type, it's not a valid type identifier
-                if (!arg_type || arg_type == type_error())
-                {
-                    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "align_of expects a type, but '%s' is not a valid type", arg->ident_expr.name);
-                    return NULL;
-                }
-
-                // Store the resolved type on the arg node for codegen
-                arg->type = arg_type;
-            }
-            else
-            {
-                // Reject expressions - align_of should only accept types
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "align_of expects a type argument, not an expression");
-                return NULL;
-            }
-
-            if (!arg_type)
-                return NULL;
-
-            expr->type = type_u64();
-            return expr->type;
-        }
 
         if (strcmp(intr_name, "va_count") == 0)
         {
@@ -3606,7 +3880,7 @@ normal_call_analysis:; // label must be followed by a statement
     Symbol *base_sym       = func_sym && func_sym->import_origin ? func_sym->import_origin : func_sym;
     size_t  type_arg_count = expr->call_expr.type_args ? expr->call_expr.type_args->count : 0;
 
-    // specialize generic functions on demand (e.g. mem.alloc<T>)
+    // specialize generic functions on demand (e.g. mem.alloc[T])
     if (base_sym && base_sym->kind == SYMBOL_FUNC && base_sym->func.is_generic)
     {
         AstNode *decl                = base_sym->decl;
@@ -4140,6 +4414,154 @@ static Type *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *c
     return expr->type;
 }
 
+static Type *analyze_comptime_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
+{
+    if (!expr || expr->kind != AST_COMPTIME || !expr->comptime.inner)
+    {
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "malformed compile-time expression");
+        return NULL;
+    }
+
+    AstNode *inner = expr->comptime.inner;
+
+    // handle $<constant> - simple identifier like $OS_LINUX
+    if (inner->kind == AST_EXPR_IDENT)
+    {
+        const char   *name = inner->ident_expr.name;
+        ComptimeValue ct_value;
+
+        if (comptime_get_constant(name, &ct_value, &driver->comptime_ctx))
+        {
+            // replace with literal value
+            ast_node_dnit(inner);
+            free(inner);
+
+            ast_node_init(expr, AST_EXPR_LIT);
+            if (ct_value.kind == COMPTIME_U8)
+            {
+                expr->lit_expr.kind    = TOKEN_LIT_INT;
+                expr->lit_expr.int_val = (long long)ct_value.u8_val;
+                expr->type             = type_u8();
+            }
+            else if (ct_value.kind == COMPTIME_U64)
+            {
+                expr->lit_expr.kind    = TOKEN_LIT_INT;
+                expr->lit_expr.int_val = (long long)ct_value.u64_val;
+                expr->type             = type_u64();
+            }
+            else if (ct_value.kind == COMPTIME_STRING)
+            {
+                expr->lit_expr.kind       = TOKEN_LIT_STRING;
+                expr->lit_expr.string_val = strdup(ct_value.string_val);
+                if (!expr->lit_expr.string_val)
+                {
+                    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "out of memory allocating string constant");
+                    return NULL;
+                }
+                expr->type = type_array_create(type_u8());
+            }
+            else
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported compile-time constant type");
+                return NULL;
+            }
+            return expr->type;
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time constant '$%s'", name);
+        return NULL;
+    }
+
+    // handle $category.field - field access like $target.os
+    if (inner->kind == AST_EXPR_FIELD)
+    {
+        if (inner->field_expr.object && inner->field_expr.object->kind == AST_EXPR_IDENT && inner->field_expr.field)
+        {
+            const char *category = inner->field_expr.object->ident_expr.name;
+            const char *field    = inner->field_expr.field;
+
+            // Build dotted name: "category.field"
+            char dotted_name[256];
+            snprintf(dotted_name, sizeof(dotted_name), "%s.%s", category, field);
+
+            ComptimeValue ct_value;
+            if (comptime_get_constant(dotted_name, &ct_value, &driver->comptime_ctx))
+            {
+                // Replace with literal value
+                ast_node_dnit(inner);
+                free(inner);
+
+                ast_node_init(expr, AST_EXPR_LIT);
+                if (ct_value.kind == COMPTIME_U8)
+                {
+                    expr->lit_expr.kind    = TOKEN_LIT_INT;
+                    expr->lit_expr.int_val = (long long)ct_value.u8_val;
+                    expr->type             = type_u8();
+                }
+                else if (ct_value.kind == COMPTIME_U64)
+                {
+                    expr->lit_expr.kind    = TOKEN_LIT_INT;
+                    expr->lit_expr.int_val = (long long)ct_value.u64_val;
+                    expr->type             = type_u64();
+                }
+                else if (ct_value.kind == COMPTIME_STRING)
+                {
+                    expr->lit_expr.kind       = TOKEN_LIT_STRING;
+                    expr->lit_expr.string_val = strdup(ct_value.string_val);
+                    if (!expr->lit_expr.string_val)
+                    {
+                        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "out of memory allocating string constant");
+                        return NULL;
+                    }
+                    expr->type = type_array_create(type_u8());
+                }
+                else
+                {
+                    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported compile-time constant type");
+                    return NULL;
+                }
+                return expr->type;
+            }
+
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time constant '$%s.%s'", category, field);
+            return NULL;
+        }
+    }
+
+    // handle $size_of(Type), $align_of(Type) - compile-time intrinsic function calls
+    if (inner->kind == AST_EXPR_CALL)
+    {
+        // Check if it's a call to a known compile-time intrinsic
+        if (inner->call_expr.func && inner->call_expr.func->kind == AST_EXPR_IDENT)
+        {
+            const char *func_name = inner->call_expr.func->ident_expr.name;
+
+            if (strcmp(func_name, "size_of") == 0 || strcmp(func_name, "align_of") == 0 || strcmp(func_name, "offset_of") == 0 || strcmp(func_name, "type_of") == 0)
+            {
+                // use the dedicated intrinsic handler - it modifies the CALL node in place
+                Type *result_type = analyze_comptime_intrinsic(driver, ctx, inner, func_name);
+                if (!result_type)
+                    return NULL;
+
+                // the inner call node now has the type set
+                // we need to "unwrap" the COMPTIME node - replace it with the analyzed call
+                // but since the call node will be evaluated at compile time by codegen,
+                // we just mark the COMPTIME node as a CALL and copy over the structure
+                AstNode temp         = *inner;
+                expr->comptime.inner = NULL;
+                *expr                = temp;
+                return result_type;
+            }
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time intrinsic function");
+        return NULL;
+    }
+
+    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported compile-time expression");
+    return NULL;
+}
+
 static Type *analyze_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected)
 {
     if (!expr)
@@ -4201,6 +4623,8 @@ static Type *analyze_expr(SemanticDriver *driver, const AnalysisContext *ctx, As
         return expr->type;
     case AST_EXPR_NULL:
         return analyze_null_expr_with_hint(driver, ctx, expr, NULL);
+    case AST_COMPTIME:
+        return analyze_comptime_expr(driver, ctx, expr);
     default:
         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported expression kind");
         return NULL;
@@ -4410,6 +4834,357 @@ static bool analyze_ret_stmt(SemanticDriver *driver, const AnalysisContext *ctx,
     return true;
 }
 
+static bool evaluate_comptime_expr_bool(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, bool *out_value)
+{
+    long long value = 0;
+    if (!evaluate_comptime_expr_int(driver, ctx, expr, &value))
+    {
+        return false;
+    }
+    *out_value = (value != 0);
+    return true;
+}
+
+static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value)
+{
+    if (!expr || !out_value)
+    {
+        return false;
+    }
+
+    switch (expr->kind)
+    {
+    case AST_EXPR_LIT:
+        switch (expr->lit_expr.kind)
+        {
+        case TOKEN_LIT_INT:
+            *out_value = (long long)expr->lit_expr.int_val;
+            return true;
+        case TOKEN_LIT_CHAR:
+            *out_value = (long long)expr->lit_expr.char_val;
+            return true;
+        default:
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "literal not allowed in '$if' condition");
+            return false;
+        }
+
+    case AST_EXPR_IDENT:
+    {
+        const char   *name = expr->ident_expr.name;
+        ComptimeValue ct_value;
+        if (comptime_get_constant(name, &ct_value, &driver->comptime_ctx))
+        {
+            if (ct_value.kind == COMPTIME_U8)
+                *out_value = (long long)ct_value.u8_val;
+            else if (ct_value.kind == COMPTIME_U64)
+                *out_value = (long long)ct_value.u64_val;
+            else
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "compile-time constant '%s' is not an integer", name ? name : "<anon>");
+                return false;
+            }
+            return true;
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time constant '%s'", name ? name : "<anon>");
+        return false;
+    }
+
+    case AST_EXPR_FIELD:
+    {
+        // handle dotted constants like $target.os
+        if (expr->field_expr.object && expr->field_expr.object->kind == AST_EXPR_IDENT && expr->field_expr.field)
+        {
+            const char *object_name = expr->field_expr.object->ident_expr.name;
+            const char *field_name  = expr->field_expr.field;
+
+            // build dotted name
+            char dotted_name[256];
+            snprintf(dotted_name, sizeof(dotted_name), "%s.%s", object_name, field_name);
+
+            ComptimeValue ct_value;
+            if (comptime_get_constant(dotted_name, &ct_value, &driver->comptime_ctx))
+            {
+                if (ct_value.kind == COMPTIME_U8)
+                    *out_value = (long long)ct_value.u8_val;
+                else if (ct_value.kind == COMPTIME_U64)
+                    *out_value = (long long)ct_value.u64_val;
+                else
+                {
+                    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "compile-time constant '%s' is not an integer", dotted_name);
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "field access not allowed in compile-time condition");
+        return false;
+    }
+
+    case AST_EXPR_CALL:
+    {
+        if (!expr->call_expr.func || expr->call_expr.func->kind != AST_EXPR_IDENT)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported compile-time function call");
+            return false;
+        }
+
+        const char *name    = expr->call_expr.func->ident_expr.name;
+        size_t      arg_cnt = expr->call_expr.args ? expr->call_expr.args->count : 0;
+
+        if (strcmp(name, "size_of") == 0 || strcmp(name, "align_of") == 0)
+        {
+            if (arg_cnt != 1)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "%s expects exactly one argument", name);
+                return false;
+            }
+
+            AstNode *arg_node = expr->call_expr.args->items[0];
+            Type    *arg_type = arg_node ? type_resolve_alias(arg_node->type) : NULL;
+            if (!arg_type || arg_type == type_error())
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "%s argument could not be resolved to a type", name);
+                return false;
+            }
+
+            size_t value = (strcmp(name, "size_of") == 0) ? type_sizeof(arg_type) : type_alignof(arg_type);
+            *out_value   = (long long)value;
+            return true;
+        }
+
+        if (strcmp(name, "offset_of") == 0)
+        {
+            if (arg_cnt != 2)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "offset_of expects exactly two arguments");
+                return false;
+            }
+
+            AstNode *type_arg  = expr->call_expr.args->items[0];
+            AstNode *field_arg = expr->call_expr.args->items[1];
+
+            Type *record_type = type_arg ? type_resolve_alias(type_arg->type) : NULL;
+            if (!record_type || record_type == type_error() || (record_type->kind != TYPE_STRUCT && record_type->kind != TYPE_UNION))
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "offset_of first argument must be a record or union type");
+                return false;
+            }
+
+            const char *field_name = NULL;
+            if (field_arg && field_arg->kind == AST_EXPR_IDENT)
+            {
+                field_name = field_arg->ident_expr.name;
+            }
+            else
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "offset_of second argument must be a field identifier");
+                return false;
+            }
+
+            if (!field_name)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "offset_of requires a named field");
+                return false;
+            }
+
+            if (!record_type->composite.fields)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "record type does not contain any fields");
+                return false;
+            }
+
+            for (size_t i = 0; i < record_type->composite.field_count; i++)
+            {
+                Symbol *field = &record_type->composite.fields[i];
+                if (strcmp(field->name, field_name) == 0)
+                {
+                    *out_value = (long long)field->field.offset;
+                    return true;
+                }
+            }
+
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "field '%s' not found on type", field_name);
+            return false;
+        }
+
+        if (strcmp(name, "type_of") == 0)
+        {
+            if (arg_cnt != 1)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "type_of expects exactly one argument");
+                return false;
+            }
+
+            AstNode *arg      = expr->call_expr.args->items[0];
+            Type    *arg_type = arg ? type_resolve_alias(arg->type) : NULL;
+            if (!arg_type || arg_type == type_error())
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "type_of could not resolve argument type");
+                return false;
+            }
+
+            uint64_t type_hash = (uint64_t)arg_type->kind;
+            type_hash          = type_hash * 31 + type_sizeof(arg_type);
+            type_hash          = type_hash * 31 + type_alignof(arg_type);
+
+            *out_value = (long long)type_hash;
+            return true;
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time intrinsic '%s'", name ? name : "<anon>");
+        return false;
+    }
+
+    case AST_EXPR_UNARY:
+    {
+        long long operand = 0;
+        if (!evaluate_comptime_expr_int(driver, ctx, expr->unary_expr.expr, &operand))
+        {
+            return false;
+        }
+
+        switch (expr->unary_expr.op)
+        {
+        case TOKEN_BANG:
+            *out_value = (operand == 0) ? 1 : 0;
+            return true;
+        case TOKEN_MINUS:
+            *out_value = -operand;
+            return true;
+        case TOKEN_PLUS:
+            *out_value = operand;
+            return true;
+        default:
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported unary operator in '$if' condition");
+            return false;
+        }
+    }
+
+    case AST_EXPR_BINARY:
+    {
+        TokenKind op = expr->binary_expr.op;
+
+        if (op == TOKEN_AMPERSAND_AMPERSAND)
+        {
+            bool left_value = false;
+            if (!evaluate_comptime_expr_bool(driver, ctx, expr->binary_expr.left, &left_value))
+            {
+                return false;
+            }
+            if (!left_value)
+            {
+                *out_value = 0;
+                return true;
+            }
+
+            bool right_value = false;
+            if (!evaluate_comptime_expr_bool(driver, ctx, expr->binary_expr.right, &right_value))
+            {
+                return false;
+            }
+            *out_value = right_value ? 1 : 0;
+            return true;
+        }
+
+        if (op == TOKEN_PIPE_PIPE)
+        {
+            bool left_value = false;
+            if (!evaluate_comptime_expr_bool(driver, ctx, expr->binary_expr.left, &left_value))
+            {
+                return false;
+            }
+            if (left_value)
+            {
+                *out_value = 1;
+                return true;
+            }
+
+            bool right_value = false;
+            if (!evaluate_comptime_expr_bool(driver, ctx, expr->binary_expr.right, &right_value))
+            {
+                return false;
+            }
+            *out_value = right_value ? 1 : 0;
+            return true;
+        }
+
+        if (op == TOKEN_EQUAL_EQUAL || op == TOKEN_BANG_EQUAL)
+        {
+            long long left_value  = 0;
+            long long right_value = 0;
+            if (!evaluate_comptime_expr_int(driver, ctx, expr->binary_expr.left, &left_value))
+            {
+                return false;
+            }
+            if (!evaluate_comptime_expr_int(driver, ctx, expr->binary_expr.right, &right_value))
+            {
+                return false;
+            }
+
+            bool result = (left_value == right_value);
+            if (op == TOKEN_BANG_EQUAL)
+            {
+                result = !result;
+            }
+            *out_value = result ? 1 : 0;
+            return true;
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported operator in '$if' condition");
+        return false;
+    }
+
+    default:
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "expression not allowed in '$if' condition");
+        return false;
+    }
+
+    // unreachable, but keeps compiler happy
+    return false;
+}
+
+static bool visit_top_level_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt, TopLevelVisitor visitor)
+{
+    if (!stmt || !visitor)
+        return true;
+
+    // handle compile-time constructs first
+    if (stmt->kind == AST_COMPTIME)
+    {
+        if (stmt->comptime.inner && stmt->comptime.inner->kind == AST_STMT_IF)
+        {
+            return process_top_level_comptime_if(driver, ctx, stmt, visitor);
+        }
+
+        // other comptime directives (like attribute assignments)
+        return analyze_comptime_stmt(driver, ctx, stmt);
+    }
+
+    if (stmt->kind == AST_STMT_BLOCK)
+    {
+        if (!stmt->block_stmt.stmts)
+            return true;
+        return visit_top_level_list(driver, ctx, stmt->block_stmt.stmts, visitor);
+    }
+
+    return visitor(driver, ctx, stmt);
+}
+
+static bool visit_top_level_list(SemanticDriver *driver, const AnalysisContext *ctx, AstList *list, TopLevelVisitor visitor)
+{
+    if (!list)
+        return true;
+
+    bool success = true;
+    for (int i = 0; i < list->count; i++)
+    {
+        success = visit_top_level_stmt(driver, ctx, list->items[i], visitor) && success;
+    }
+    return success;
+}
+
 static bool analyze_if_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
 {
     Type *cond_type = NULL;
@@ -4444,6 +5219,102 @@ static bool analyze_for_stmt(SemanticDriver *driver, const AnalysisContext *ctx,
     return analyze_stmt(driver, ctx, stmt->for_stmt.body);
 }
 
+static bool analyze_comptime_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (!stmt || !stmt->comptime.inner)
+        return true;
+
+    AstNode *inner = stmt->comptime.inner;
+
+    // check if this is an attribute assignment: $symbol.attribute = value
+    if (inner->kind == AST_EXPR_BINARY && inner->binary_expr.op == TOKEN_EQUAL && inner->binary_expr.left && inner->binary_expr.left->kind == AST_EXPR_FIELD)
+    {
+        AstNode *field_access = inner->binary_expr.left;
+        AstNode *value_expr   = inner->binary_expr.right;
+
+        // extract symbol name and attribute name
+        if (field_access->field_expr.object && field_access->field_expr.object->kind == AST_EXPR_IDENT && field_access->field_expr.field)
+        {
+            const char *symbol_name = field_access->field_expr.object->ident_expr.name;
+            const char *attr_name   = field_access->field_expr.field;
+
+            // support string and integer literal values
+            if (value_expr->kind == AST_EXPR_LIT)
+            {
+                char        attr_value_buf[64];
+                const char *attr_value = NULL;
+
+                if (value_expr->lit_expr.kind == TOKEN_LIT_STRING)
+                {
+                    attr_value = value_expr->lit_expr.string_val;
+                }
+                else if (value_expr->lit_expr.kind == TOKEN_LIT_INT)
+                {
+                    snprintf(attr_value_buf, sizeof(attr_value_buf), "%lld", value_expr->lit_expr.int_val);
+                    attr_value = attr_value_buf;
+                }
+                else
+                {
+                    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "$%s.%s requires a string or integer literal value", symbol_name, attr_name);
+                    return false;
+                }
+
+                add_symbol_attribute(driver, symbol_name, attr_name, attr_value);
+                return true;
+            }
+            else
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "$%s.%s requires a literal value", symbol_name, attr_name);
+                return false;
+            }
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "invalid compile-time attribute assignment");
+        return false;
+    }
+
+    // check if this is a compile-time $if statement
+    if (inner->kind == AST_STMT_IF)
+    {
+        bool     success = false;
+        AstNode *holder  = NULL;
+        AstNode *body    = select_comptime_branch(driver, ctx, inner, &success, &holder);
+        if (!success)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "unable to evaluate $if condition at compile time");
+            return false;
+        }
+
+        AstList *stmts = NULL;
+        if (body)
+        {
+            if (holder)
+                holder->cond_stmt.body = NULL;
+            stmts = extract_block_statements(body, true);
+        }
+
+        ast_node_dnit(inner);
+        free(inner);
+        stmt->comptime.inner = NULL;
+
+        comptime_convert_to_block(stmt, stmts);
+
+        if (!stmt->block_stmt.stmts)
+            return true;
+
+        bool ok = true;
+        for (int i = 0; i < stmt->block_stmt.stmts->count; i++)
+        {
+            ok = analyze_stmt(driver, ctx, stmt->block_stmt.stmts->items[i]) && ok;
+        }
+        return ok;
+    }
+
+    // for now, other comptime constructs are not yet implemented
+    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "unknown compile-time statement");
+    return false;
+}
+
 static bool analyze_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
 {
     if (!stmt)
@@ -4465,6 +5336,8 @@ static bool analyze_stmt(SemanticDriver *driver, const AnalysisContext *ctx, Ast
         return analyze_if_stmt(driver, ctx, stmt);
     case AST_STMT_FOR:
         return analyze_for_stmt(driver, ctx, stmt);
+    case AST_COMPTIME:
+        return analyze_comptime_stmt(driver, ctx, stmt);
     default:
         return true;
     }
@@ -4552,6 +5425,32 @@ static bool analyze_function_body(SemanticDriver *driver, const AnalysisContext 
     return success;
 }
 
+static bool pass_c_global_init_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if ((stmt->kind == AST_STMT_VAL || stmt->kind == AST_STMT_VAR) && stmt->var_stmt.init)
+    {
+        if (!analyze_var_stmt_body(driver, ctx, stmt))
+        {
+            fprintf(stderr, "error: failed to analyze global variable '%s'\n", stmt->var_stmt.name ? stmt->var_stmt.name : "<anon>");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool pass_c_function_body_visitor(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
+{
+    if (stmt->kind == AST_STMT_FUN && stmt->symbol && !stmt->symbol->func.is_generic)
+    {
+        if (!analyze_function_body(driver, ctx, stmt))
+        {
+            fprintf(stderr, "error: failed to analyze function '%s'\n", stmt->fun_stmt.name ? stmt->fun_stmt.name : "<anon>");
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool analyze_pass_c_bodies(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *root)
 {
     if (!root || root->kind != AST_PROGRAM)
@@ -4559,35 +5458,8 @@ static bool analyze_pass_c_bodies(SemanticDriver *driver, const AnalysisContext 
 
     bool success = true;
 
-    // analyze global initializers
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if ((stmt->kind == AST_STMT_VAL || stmt->kind == AST_STMT_VAR) && stmt->var_stmt.init)
-        {
-            if (!analyze_var_stmt_body(driver, ctx, stmt))
-            {
-                fprintf(stderr, "error: failed to analyze global variable '%s'\n", stmt->var_stmt.name ? stmt->var_stmt.name : "<anon>");
-                success = false;
-            }
-        }
-    }
-
-    // analyze function bodies (including methods)
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-
-        if (stmt->kind == AST_STMT_FUN && stmt->symbol && !stmt->symbol->func.is_generic)
-        {
-            if (!analyze_function_body(driver, ctx, stmt))
-            {
-                fprintf(stderr, "error: failed to analyze function '%s'\n", stmt->fun_stmt.name ? stmt->fun_stmt.name : "<anon>");
-                success = false;
-            }
-        }
-    }
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_c_global_init_visitor) && success;
+    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_c_function_body_visitor) && success;
 
     return success;
 }
@@ -4608,20 +5480,7 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
 
     bool success = true;
 
-    // Enqueue dependencies from entry module
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-        if (stmt->kind == AST_STMT_USE)
-        {
-            const char *dep_path = stmt->use_stmt.module_path;
-            if (dep_path && !enqueue_module(driver, dep_path))
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, module_path, "failed to load module '%s'", dep_path);
-                success = false;
-            }
-        }
-    }
+    success = visit_top_level_list(driver, &ctx, root->program.stmts, enqueue_dependency_visitor) && success;
 
     if (!success)
     {
@@ -4661,18 +5520,7 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
     }
 
     // Process imports in entry module
-    for (int i = 0; i < root->program.stmts->count; i++)
-    {
-        AstNode *stmt = root->program.stmts->items[i];
-        if (stmt->kind == AST_STMT_USE)
-        {
-            if (!process_use_statement(driver, &ctx, stmt))
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, module_path, "failed to process use statement");
-                success = false;
-            }
-        }
-    }
+    success = visit_top_level_list(driver, &ctx, root->program.stmts, process_use_stmt_visitor) && success;
 
     // Process imports in all loaded modules
     FOR_EACH_MODULE(&driver->module_manager, module)
@@ -4682,18 +5530,7 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
             Scope          *module_scope = module->symbols->global_scope;
             AnalysisContext module_ctx   = analysis_context_create(module_scope, module_scope, module->name, module->file_path);
 
-            for (int j = 0; j < module->ast->program.stmts->count; j++)
-            {
-                AstNode *stmt = module->ast->program.stmts->items[j];
-                if (stmt->kind == AST_STMT_USE)
-                {
-                    if (!process_use_statement(driver, &module_ctx, stmt))
-                    {
-                        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, module->name, "failed to process use statement in module '%s'", module->name);
-                        success = false;
-                    }
-                }
-            }
+            success = visit_top_level_list(driver, &module_ctx, module->ast->program.stmts, process_use_stmt_visitor) && success;
         }
     }
 

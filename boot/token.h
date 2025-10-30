@@ -45,6 +45,7 @@ typedef enum TokenKind
     TOKEN_SEMICOLON,  // ;
     TOKEN_QUESTION,   // ?
     TOKEN_AT,         // @
+    TOKEN_DOLLAR,     // $
     TOKEN_DOT,        // .
     TOKEN_COMMA,      // ,
     TOKEN_UNDERSCORE, // _

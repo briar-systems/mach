@@ -45,7 +45,6 @@ typedef struct Parser
     bool            panic_mode;
     bool            had_error;
     ParserErrorList errors;
-    char           *pending_mangle;
 } Parser;
 
 // parser lifecycle
