@@ -1183,6 +1183,9 @@ LLVMValueRef codegen_stmt(CodegenContext *ctx, AstNode *stmt)
         return codegen_stmt_fun(ctx, stmt);
     case AST_STMT_RET:
         return codegen_stmt_ret(ctx, stmt);
+    case AST_COMPTIME:
+        // compile-time directives do not emit runtime code
+        return NULL;
     case AST_STMT_IF:
         return codegen_stmt_if(ctx, stmt);
     case AST_STMT_OR:

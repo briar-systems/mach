@@ -284,9 +284,9 @@ std = "path/to/std"
 Common imports:
 ```mach
 use std.types.string;        # string utilities
-use std.types.list;          # dynamic arrays (List<T>)
-use std.types.option;        # optional values (Option<T>)
-use std.types.result;        # result type (Result<T, E>)
+use std.types.list;          # dynamic arrays (List[T])
+use std.types.option;        # optional values (Option[T])
+use std.types.result;        # result type (Result[T, E])
 use std.io.console;          # console i/o
 use std.io.fs;               # file system
 use std.system.memory;       # memory allocation
@@ -306,14 +306,14 @@ The entry point must contain a main function:
 use std.runtime;
 use std.types.string;
 
-#@symbol("main")
+$main.symbol = "main";
 fun main(args: []string) i64 {
     # program logic
     ret 0;
 }
 ```
 
-The `#@symbol("main")` directive removes name mangling for the entry point defined in `std.runtime` in this example. This is a requirement for the runtime included in the standard library to link properly. If you are seeing issues related to undefined references to `main` or lack of a `_start` symbol, ensure this directive is present and the runtime is imported without an alias.
+The `$main.symbol = "main"` attribute assignment ensures the function is exported with an unmangled symbol name. This is a requirement for the runtime included in the standard library to link properly. If you are seeing issues related to undefined references to `main` or lack of a `_start` symbol, ensure this attribute is set and the runtime is imported without an alias.
 
 ---
 

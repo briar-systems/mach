@@ -5,28 +5,40 @@
 #include <stdlib.h>
 #include <string.h>
 
-// helper functions
-static bool     parser_is_method_decl(Parser *parser);
+static AstNode  *parser_alloc_node(Parser *parser, AstKind kind, Token *token);
+static AstList  *parser_alloc_list(Parser *parser);
+static AstNode  *parser_parse_directive(Parser *parser, bool allow_top_level);
+static AstNode  *parser_parse_comptime_if_top(Parser *parser);
+static AstNode  *parser_parse_top_level_block(Parser *parser);
+static AstNode  *parser_parse_stmt_asm(Parser *parser);
+static TokenKind parser_peek_next_kind(Parser *parser);
+static bool      parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind);
+static AstNode  *parser_expr_to_type(Parser *parser, AstNode *expr, AstList *generic_args);
+
 static AstNode *parser_alloc_node(Parser *parser, AstKind kind, Token *token)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
     {
-        parser_error_at_current(parser, "memory allocation failed");
+        parser_error(parser, token ? token : parser->current, "out of memory allocating AST node");
         return NULL;
     }
+
     ast_node_init(node, kind);
+    node->token = NULL;
 
     if (token)
     {
-        node->token = malloc(sizeof(Token));
-        if (!node->token)
+        Token *copy = malloc(sizeof(Token));
+        if (!copy)
         {
+            parser_error(parser, token, "out of memory allocating token copy");
             free(node);
-            parser_error_at_current(parser, "memory allocation failed for token");
             return NULL;
         }
-        token_copy(token, node->token);
+
+        token_copy(token, copy);
+        node->token = copy;
     }
 
     return node;
@@ -37,11 +49,90 @@ static AstList *parser_alloc_list(Parser *parser)
     AstList *list = malloc(sizeof(AstList));
     if (!list)
     {
-        parser_error_at_current(parser, "memory allocation failed for list");
+        parser_error(parser, parser->current, "out of memory allocating AST list");
         return NULL;
     }
+
     ast_list_init(list);
     return list;
+}
+static bool parser_token_is_attr_category(TokenKind kind)
+{
+    switch (kind)
+    {
+    case TOKEN_KW_FUN:
+    case TOKEN_KW_VAL:
+    case TOKEN_KW_VAR:
+    case TOKEN_KW_REC:
+    case TOKEN_KW_UNI:
+    case TOKEN_KW_EXT:
+    case TOKEN_KW_DEF:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
+{
+    if (!parser_consume(parser, TOKEN_DOLLAR, "expected '$'"))
+    {
+        return NULL;
+    }
+
+    Token *directive_token = parser->previous;
+
+    // Create AST_COMPTIME node
+    AstNode *node = parser_alloc_node(parser, AST_COMPTIME, directive_token);
+    if (!node)
+    {
+        return NULL;
+    }
+
+    // Parse the expression or statement following $
+    // This could be:
+    // - Assignment: $fun.symbol = "name"
+    // - If statement: $if (cond) { ... }
+    // - Call: $size_of(Type)
+    // - Identifier: $OS, $ARCH
+    AstNode *inner = NULL;
+
+    // Try parsing as statement first (for $if, blocks, etc.)
+    if (parser_check(parser, TOKEN_KW_IF))
+    {
+        // $if (cond) { ... }
+        if (allow_top_level)
+        {
+            inner = parser_parse_comptime_if_top(parser);
+        }
+        else
+        {
+            inner = parser_parse_stmt_if(parser);
+        }
+    }
+    else
+    {
+        // Otherwise parse as expression (for assignments, calls, identifiers)
+        if (parser_token_is_attr_category(parser->current->kind))
+        {
+            parser->current->kind = TOKEN_IDENTIFIER;
+        }
+        inner = parser_parse_expr(parser);
+
+        // Consume optional semicolon for expression-style directives
+        parser_match(parser, TOKEN_SEMICOLON);
+    }
+
+    if (!inner)
+    {
+        parser_error_at_current(parser, "expected expression or statement after '$'");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    node->comptime.inner = inner;
+    return node;
 }
 
 static TokenKind parser_peek_next_kind(Parser *parser)
@@ -51,234 +142,173 @@ static TokenKind parser_peek_next_kind(Parser *parser)
         return TOKEN_EOF;
     }
 
-    int       saved_pos = parser->lexer->pos;
-    TokenKind kind      = TOKEN_EOF;
+    int saved_pos = parser->lexer->pos;
 
     for (;;)
     {
-        Token *peek = lexer_next(parser->lexer);
-        if (!peek)
+        Token *tok = lexer_next(parser->lexer);
+        if (!tok)
         {
-            kind = TOKEN_EOF;
-            break;
+            parser->lexer->pos = saved_pos;
+            return TOKEN_EOF;
         }
 
-        kind = peek->kind;
+        TokenKind kind = tok->kind;
+        token_dnit(tok);
+        free(tok);
 
-        bool skip = (kind == TOKEN_COMMENT);
-
-        token_dnit(peek);
-        free(peek);
-
-        if (!skip)
+        if (kind == TOKEN_COMMENT)
         {
-            break;
+            continue;
         }
-    }
 
-    parser->lexer->pos = saved_pos;
-    return kind;
+        parser->lexer->pos = saved_pos;
+        return kind;
+    }
 }
 
-static void parser_set_pending_mangle(Parser *parser, char *value)
+static AstNode *parser_parse_top_level_block(Parser *parser)
 {
-    if (!parser)
-    {
-        free(value);
-        return;
-    }
-
-    free(parser->pending_mangle);
-    parser->pending_mangle = value;
-}
-
-static char *parser_take_pending_mangle(Parser *parser)
-{
-    if (!parser)
+    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{'"))
     {
         return NULL;
     }
 
-    char *value            = parser->pending_mangle;
-    parser->pending_mangle = NULL;
-    return value;
+    AstNode *block = parser_alloc_node(parser, AST_STMT_BLOCK, parser->previous);
+    if (!block)
+    {
+        return NULL;
+    }
+
+    block->block_stmt.stmts = parser_alloc_list(parser);
+    if (!block->block_stmt.stmts)
+    {
+        ast_node_dnit(block);
+        free(block);
+        return NULL;
+    }
+
+    while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
+    {
+        AstNode *stmt = parser_parse_stmt_top(parser);
+        if (!stmt)
+        {
+            parser_error_at_current(parser, "expected top-level statement in compile-time block");
+            ast_node_dnit(block);
+            free(block);
+            return NULL;
+        }
+        ast_list_append(block->block_stmt.stmts, stmt);
+    }
+
+    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' to close compile-time block"))
+    {
+        ast_node_dnit(block);
+        free(block);
+        return NULL;
+    }
+
+    return block;
 }
 
-static void parser_handle_comment(Parser *parser, Token *token)
+static AstNode *parser_parse_comptime_if_top(Parser *parser)
 {
-    if (!parser || !token)
+    if (!parser_consume(parser, TOKEN_KW_IF, "expected 'if' keyword"))
     {
-        return;
+        return NULL;
     }
 
-    char *raw = lexer_raw_value(parser->lexer, token);
-    if (!raw)
+    AstNode *node = parser_alloc_node(parser, AST_STMT_IF, parser->previous);
+    if (!node)
     {
-        return;
+        return NULL;
     }
 
-    if (strncmp(raw, "#@", 2) != 0)
+    if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after '$if'"))
     {
-        free(raw);
-        return;
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
     }
 
-    const char *cursor = raw + 2;
-    while (isspace((unsigned char)*cursor))
+    node->cond_stmt.cond = parser_parse_expr(parser);
+    if (!node->cond_stmt.cond)
     {
-        cursor++;
+        parser_error_at_current(parser, "expected condition expression");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
     }
 
-    if (strncmp(cursor, "symbol", 6) == 0)
+    if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after $if condition"))
     {
-        cursor += 6;
-        while (isspace((unsigned char)*cursor))
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    node->cond_stmt.body = parser_parse_top_level_block(parser);
+    if (!node->cond_stmt.body)
+    {
+        parser_error_at_current(parser, "expected block after $if condition");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    AstNode **tail = &node->cond_stmt.stmt_or;
+    while (parser_match(parser, TOKEN_KW_OR))
+    {
+        AstNode *or_node = parser_alloc_node(parser, AST_STMT_OR, parser->previous);
+        if (!or_node)
         {
-            cursor++;
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
         }
 
-        if (*cursor != '(')
+        if (parser_match(parser, TOKEN_L_PAREN))
         {
-            parser_error(parser, token, "expected '(' after '#@symbol'");
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-        cursor++;
-
-        while (isspace((unsigned char)*cursor))
-        {
-            cursor++;
-        }
-
-        if (*cursor != '"')
-        {
-            parser_error(parser, token, "expected string literal in '#@symbol'");
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-        cursor++;
-
-        size_t buffer_cap = strlen(cursor) + 1;
-        char  *buffer     = malloc(buffer_cap);
-        if (!buffer)
-        {
-            parser_error(parser, token, "memory allocation failed for '#@symbol'");
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-
-        size_t buffer_len = 0;
-        bool   ok         = true;
-
-        while (*cursor && *cursor != '"')
-        {
-            char ch = *cursor++;
-            if (ch == '\\')
+            or_node->cond_stmt.cond = parser_parse_expr(parser);
+            if (!or_node->cond_stmt.cond)
             {
-                if (*cursor == '\0')
-                {
-                    ok = false;
-                    break;
-                }
-                char esc = *cursor++;
-                switch (esc)
-                {
-                case 'n':
-                    ch = '\n';
-                    break;
-                case 'r':
-                    ch = '\r';
-                    break;
-                case 't':
-                    ch = '\t';
-                    break;
-                case '\\':
-                    ch = '\\';
-                    break;
-                case '"':
-                    ch = '"';
-                    break;
-                default:
-                    ch = esc;
-                    break;
-                }
+                parser_error_at_current(parser, "expected condition expression after 'or'");
+                ast_node_dnit(or_node);
+                free(or_node);
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
             }
 
-            if (buffer_len + 1 >= buffer_cap)
+            if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after 'or' condition"))
             {
-                size_t new_cap = buffer_cap * 2;
-                char  *tmp     = realloc(buffer, new_cap);
-                if (!tmp)
-                {
-                    ok = false;
-                    break;
-                }
-                buffer     = tmp;
-                buffer_cap = new_cap;
+                ast_node_dnit(or_node);
+                free(or_node);
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
             }
-
-            buffer[buffer_len++] = ch;
         }
 
-        if (!ok || *cursor != '"')
+        or_node->cond_stmt.body = parser_parse_top_level_block(parser);
+        if (!or_node->cond_stmt.body)
         {
-            parser_error(parser, token, "unterminated string in '#@symbol'");
-            free(buffer);
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
+            parser_error_at_current(parser, "expected block after 'or'");
+            ast_node_dnit(or_node);
+            free(or_node);
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
         }
 
-        buffer[buffer_len] = '\0';
-        cursor++;
-
-        while (isspace((unsigned char)*cursor))
-        {
-            cursor++;
-        }
-
-        if (*cursor != ')')
-        {
-            parser_error(parser, token, "expected ')' after '#@symbol' string");
-            free(buffer);
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-        cursor++;
-
-        while (isspace((unsigned char)*cursor))
-        {
-            cursor++;
-        }
-
-        if (*cursor != '\0')
-        {
-            parser_error(parser, token, "unexpected characters after '#@symbol' directive");
-            free(buffer);
-            parser_set_pending_mangle(parser, NULL);
-            free(raw);
-            return;
-        }
-
-        parser_set_pending_mangle(parser, buffer);
-        free(raw);
-        return;
+        *tail = or_node;
+        tail  = &or_node->cond_stmt.stmt_or;
     }
 
-    // unknown #@ directive
-    parser_error(parser, token, "unknown '#@' directive");
-    parser_set_pending_mangle(parser, NULL);
-    free(raw);
+    return node;
 }
 
-// forward for asm stmt
-static AstNode *parser_parse_stmt_asm(Parser *parser);
-
-static bool     parser_should_parse_type_args(Parser *parser);
+static bool     parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind);
 static AstList *parser_parse_type_arguments(Parser *parser);
 static AstList *parser_parse_generic_param_list(Parser *parser);
 
@@ -347,7 +377,7 @@ static bool parser_is_method_decl(Parser *parser)
     if (!look)
         goto cleanup;
 
-    if (look->kind == TOKEN_LESS)
+    if (look->kind == TOKEN_L_BRACKET)
     {
         int depth = 1;
         while (depth > 0)
@@ -355,9 +385,9 @@ static bool parser_is_method_decl(Parser *parser)
             Token *g = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
             if (!g)
                 goto cleanup;
-            if (g->kind == TOKEN_LESS)
+            if (g->kind == TOKEN_L_BRACKET)
                 depth++;
-            else if (g->kind == TOKEN_GREATER)
+            else if (g->kind == TOKEN_R_BRACKET)
                 depth--;
         }
         look = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
@@ -380,7 +410,7 @@ static bool parser_is_method_decl(Parser *parser)
     if (!after)
         goto cleanup;
 
-    if (after->kind == TOKEN_LESS)
+    if (after->kind == TOKEN_L_BRACKET)
     {
         int depth = 1;
         while (depth > 0)
@@ -388,9 +418,9 @@ static bool parser_is_method_decl(Parser *parser)
             Token *g = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
             if (!g)
                 goto cleanup;
-            if (g->kind == TOKEN_LESS)
+            if (g->kind == TOKEN_L_BRACKET)
                 depth++;
-            else if (g->kind == TOKEN_GREATER)
+            else if (g->kind == TOKEN_R_BRACKET)
                 depth--;
         }
         after = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
@@ -419,12 +449,11 @@ cleanup:
 // parser lifecycle
 void parser_init(Parser *parser, Lexer *lexer)
 {
-    parser->lexer          = lexer;
-    parser->current        = NULL;
-    parser->previous       = NULL;
-    parser->panic_mode     = false;
-    parser->had_error      = false;
-    parser->pending_mangle = NULL;
+    parser->lexer      = lexer;
+    parser->current    = NULL;
+    parser->previous   = NULL;
+    parser->panic_mode = false;
+    parser->had_error  = false;
     parser_error_list_init(&parser->errors);
 
     // prime the parser
@@ -443,8 +472,6 @@ void parser_dnit(Parser *parser)
         token_dnit(parser->previous);
         free(parser->previous);
     }
-    free(parser->pending_mangle);
-    parser->pending_mangle = NULL;
     parser_error_list_dnit(&parser->errors);
 }
 
@@ -535,7 +562,6 @@ void parser_advance(Parser *parser)
         // skip comments
         if (parser->current->kind == TOKEN_COMMENT)
         {
-            parser_handle_comment(parser, parser->current);
             token_dnit(parser->current);
             free(parser->current);
             continue;
@@ -608,6 +634,7 @@ void parser_synchronize(Parser *parser)
         case TOKEN_KW_VAR:
         case TOKEN_KW_FUN:
         case TOKEN_KW_ASM:
+        case TOKEN_DOLLAR:
             return;
         default:
             parser_advance(parser);
@@ -623,14 +650,12 @@ bool parser_is_at_end(Parser *parser)
 // error handling
 void parser_error(Parser *parser, Token *token, const char *message)
 {
-    if (parser->panic_mode)
+    if (!parser->panic_mode)
     {
-        return;
+        parser->panic_mode = true;
+        parser->had_error  = true;
+        parser_error_list_add(&parser->errors, token, message);
     }
-
-    parser->panic_mode = true;
-    parser->had_error  = true;
-    parser_error_list_add(&parser->errors, token, message);
 }
 
 void parser_error_at_current(Parser *parser, const char *message)
@@ -652,66 +677,84 @@ char *parser_parse_identifier(Parser *parser)
     return lexer_raw_value(parser->lexer, parser->previous);
 }
 
-static bool parser_should_parse_type_args(Parser *parser)
+static bool parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind)
 {
-    if (!parser || !parser->current || parser->current->kind != TOKEN_LESS)
+    if (follow_kind)
+    {
+        *follow_kind = TOKEN_ERROR;
+    }
+
+    if (!parser || !parser->current || parser->current->kind != TOKEN_L_BRACKET)
     {
         return false;
     }
 
-    char *source = parser->lexer->source;
-    if (!source)
-    {
-        return false;
-    }
+    int     saved_pos     = parser->lexer->pos;
+    Token **peeked_tokens = NULL;
+    size_t  peek_count    = 0;
+    size_t  peek_capacity = 0;
+    bool    result        = false;
+    bool    has_payload   = false;
+    int     depth         = 1; // start at 1 to account for the opening '[' we're standing on
 
-    int  index      = parser->current->pos + 1;
-    int  depth      = 1;
-    bool has_tokens = false;
-
-    while (source[index] != '\0')
+    // process tokens after the opening bracket
+    while (true)
     {
-        char c = source[index];
-        if (c == '<')
+        Token *tok = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
+        if (!tok || tok->kind == TOKEN_EOF || tok->kind == TOKEN_SEMICOLON)
+        {
+            break;
+        }
+
+        if (tok->kind == TOKEN_L_BRACKET)
         {
             depth++;
         }
-        else if (c == '>')
+        else if (tok->kind == TOKEN_R_BRACKET)
         {
             depth--;
-            index++;
             if (depth == 0)
             {
                 break;
             }
         }
-        else if (c == '\n' || c == ';')
+        else if (depth > 0)
         {
-            return false;
+            has_payload = true;
         }
-        else if (!isspace((unsigned char)c))
+    }
+
+    if (has_payload && depth == 0)
+    {
+        // Check what comes after the closing ']'
+        Token *after = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
+        if (after && (after->kind == TOKEN_L_PAREN || after->kind == TOKEN_L_BRACE))
         {
-            has_tokens = true;
+            result = true;
+            if (follow_kind)
+            {
+                *follow_kind = after->kind;
+            }
         }
-        index++;
     }
 
-    if (depth != 0 || !has_tokens)
+    // Restore lexer position
+    parser->lexer->pos = saved_pos;
+
+    // Clean up peeked tokens
+    for (size_t i = 0; i < peek_count; i++)
     {
-        return false;
+        token_dnit(peeked_tokens[i]);
+        free(peeked_tokens[i]);
     }
+    free(peeked_tokens);
 
-    while (isspace((unsigned char)source[index]))
-    {
-        index++;
-    }
-
-    return source[index] == '(';
+    return result;
 }
 
 static AstList *parser_parse_type_arguments(Parser *parser)
 {
-    if (!parser_consume(parser, TOKEN_LESS, "expected '<' to start type arguments"))
+    if (!parser_consume(parser, TOKEN_L_BRACKET, "expected '[' to start type arguments"))
     {
         return NULL;
     }
@@ -722,7 +765,7 @@ static AstList *parser_parse_type_arguments(Parser *parser)
         return NULL;
     }
 
-    if (!parser_check(parser, TOKEN_GREATER))
+    if (!parser_check(parser, TOKEN_R_BRACKET))
     {
         do
         {
@@ -737,7 +780,7 @@ static AstList *parser_parse_type_arguments(Parser *parser)
         } while (parser_match(parser, TOKEN_COMMA));
     }
 
-    if (!parser_consume(parser, TOKEN_GREATER, "expected '>' after type arguments"))
+    if (!parser_consume(parser, TOKEN_R_BRACKET, "expected ']' after type arguments"))
     {
         ast_list_dnit(args);
         free(args);
@@ -755,7 +798,7 @@ static AstList *parser_parse_generic_param_list(Parser *parser)
         return NULL;
     }
 
-    if (!parser_check(parser, TOKEN_GREATER))
+    if (!parser_check(parser, TOKEN_R_BRACKET))
     {
         do
         {
@@ -781,7 +824,7 @@ static AstList *parser_parse_generic_param_list(Parser *parser)
         } while (parser_match(parser, TOKEN_COMMA));
     }
 
-    if (!parser_consume(parser, TOKEN_GREATER, "expected '>' after generic parameters"))
+    if (!parser_consume(parser, TOKEN_R_BRACKET, "expected ']' after generic parameters"))
     {
         ast_list_dnit(params);
         free(params);
@@ -905,11 +948,12 @@ static AstNode *parser_finish_call(Parser *parser, AstNode *callee, AstList *typ
     }
 
     // Check if this is a type intrinsic that expects type arguments instead of expressions
-    bool is_type_intrinsic = false;
+    bool        is_type_intrinsic = false;
+    const char *intrinsic_name    = NULL;
     if (callee->kind == AST_EXPR_IDENT)
     {
-        const char *name = callee->ident_expr.name;
-        if (strcmp(name, "size_of") == 0 || strcmp(name, "align_of") == 0 || strcmp(name, "offset_of") == 0 || strcmp(name, "type_of") == 0)
+        intrinsic_name = callee->ident_expr.name;
+        if (strcmp(intrinsic_name, "size_of") == 0 || strcmp(intrinsic_name, "align_of") == 0 || strcmp(intrinsic_name, "offset_of") == 0 || strcmp(intrinsic_name, "type_of") == 0)
         {
             is_type_intrinsic = true;
         }
@@ -919,11 +963,21 @@ static AstNode *parser_finish_call(Parser *parser, AstNode *callee, AstList *typ
     {
         do
         {
-            AstNode *arg = NULL;
+            AstNode *arg       = NULL;
+            size_t   arg_index = call->call_expr.args->count;
+
             if (is_type_intrinsic)
             {
-                // Parse as type instead of expression
-                arg = parser_parse_type(parser);
+                // offset_of expects the second argument to be a field name expression
+                if (intrinsic_name && strcmp(intrinsic_name, "offset_of") == 0 && arg_index == 1)
+                {
+                    arg = parser_parse_expr(parser);
+                }
+                else
+                {
+                    // Parse as type instead of expression
+                    arg = parser_parse_type(parser);
+                }
             }
             else
             {
@@ -1043,16 +1097,6 @@ AstNode *parser_parse_stmt_top(Parser *parser)
     bool     is_public = parser_match(parser, TOKEN_KW_PUB);
     AstNode *result    = NULL;
 
-    if (parser->pending_mangle)
-    {
-        TokenKind next_kind = parser->current->kind;
-        if (next_kind != TOKEN_KW_VAL && next_kind != TOKEN_KW_VAR && next_kind != TOKEN_KW_FUN)
-        {
-            parser_error_at_current(parser, "'#@symbol' must precede 'val', 'var', or 'fun'");
-            parser_set_pending_mangle(parser, NULL);
-        }
-    }
-
     switch (parser->current->kind)
     {
     case TOKEN_KW_NIL:
@@ -1110,6 +1154,13 @@ AstNode *parser_parse_stmt_top(Parser *parser)
         }
         result = parser_parse_stmt_asm(parser);
         break;
+    case TOKEN_DOLLAR:
+        if (is_public)
+        {
+            parser_error_at_current(parser, "'pub' cannot precede compile-time directives");
+        }
+        result = parser_parse_directive(parser, true);
+        break;
     default:
         if (is_public)
         {
@@ -1128,16 +1179,6 @@ AstNode *parser_parse_stmt_top(Parser *parser)
 // parse statements allowed at the function level
 AstNode *parser_parse_stmt(Parser *parser)
 {
-    if (parser->pending_mangle)
-    {
-        TokenKind kind = parser->current->kind;
-        if (kind != TOKEN_KW_VAL && kind != TOKEN_KW_VAR && kind != TOKEN_KW_FUN)
-        {
-            parser_error_at_current(parser, "'#@symbol' must precede 'val', 'var', or 'fun'");
-            parser_set_pending_mangle(parser, NULL);
-        }
-    }
-
     switch (parser->current->kind)
     {
     case TOKEN_KW_VAL:
@@ -1158,6 +1199,8 @@ AstNode *parser_parse_stmt(Parser *parser)
         return parser_parse_stmt_block(parser);
     case TOKEN_KW_ASM:
         return parser_parse_stmt_asm(parser);
+    case TOKEN_DOLLAR:
+        return parser_parse_directive(parser, false);
     default:
         return parser_parse_stmt_expr(parser);
     }
@@ -1402,8 +1445,6 @@ static AstNode *parser_parse_var_decl(Parser *parser, bool is_val, bool is_publi
         return NULL;
     }
 
-    node->var_stmt.mangle_name = parser_take_pending_mangle(parser);
-
     node->var_stmt.is_val    = is_val;
     node->var_stmt.is_public = is_public;
     node->var_stmt.name      = parser_parse_identifier(parser);
@@ -1494,21 +1535,22 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
         return NULL;
     }
 
-    node->fun_stmt.mangle_name = parser_take_pending_mangle(parser);
-
     bool is_method = parser_is_method_decl(parser);
     if (is_method)
     {
-        AstNode *receiver = parser_parse_type_name(parser);
+        // parse method receiver type
+        AstNode *receiver = parser_alloc_node(parser, AST_TYPE_NAME, parser->current);
         if (!receiver)
         {
-            parser_error_at_current(parser, "expected method receiver type after 'fun'");
             ast_node_dnit(node);
             free(node);
             return NULL;
         }
 
-        if (!parser_consume(parser, TOKEN_DOT, "expected '.' after method receiver type"))
+        // NOTE: method receivers do not support module aliases
+        receiver->type_name.module_alias = NULL;
+        receiver->type_name.name         = parser_parse_identifier(parser);
+        if (!receiver->type_name.name)
         {
             ast_node_dnit(receiver);
             free(receiver);
@@ -1517,9 +1559,32 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
             return NULL;
         }
 
-        node->fun_stmt.method_receiver = receiver;
+        // optional generic parameters: Foo[T, U]
+        if (parser_check(parser, TOKEN_L_BRACKET))
+        {
+            AstList *generic_args = parser_parse_type_arguments(parser);
+            if (!generic_args)
+            {
+                ast_node_dnit(receiver);
+                free(receiver);
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+            receiver->type_name.generic_args = generic_args;
+        }
+
         node->fun_stmt.is_method       = true;
-        node->fun_stmt.name            = parser_parse_identifier(parser);
+        node->fun_stmt.method_receiver = receiver;
+
+        if (!parser_consume(parser, TOKEN_DOT, "expected '.' after method receiver type"))
+        {
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
+        }
+
+        node->fun_stmt.name = parser_parse_identifier(parser);
         if (!node->fun_stmt.name)
         {
             parser_error_at_current(parser, "expected method name after receiver type");
@@ -1540,7 +1605,7 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
         }
     }
 
-    if (parser_match(parser, TOKEN_LESS))
+    if (parser_match(parser, TOKEN_L_BRACKET))
     {
         node->fun_stmt.generics = parser_parse_generic_param_list(parser);
         if (!node->fun_stmt.generics)
@@ -1688,7 +1753,7 @@ AstNode *parser_parse_stmt_rec(Parser *parser, bool is_public)
 
     // parse optional generic parameters
     node->rec_stmt.generics = NULL;
-    if (parser_match(parser, TOKEN_LESS))
+    if (parser_match(parser, TOKEN_L_BRACKET))
     {
         node->rec_stmt.generics = parser_parse_generic_param_list(parser);
         if (!node->rec_stmt.generics)
@@ -1750,7 +1815,7 @@ AstNode *parser_parse_stmt_uni(Parser *parser, bool is_public)
 
     // parse optional generic parameters
     node->uni_stmt.generics = NULL;
-    if (parser_match(parser, TOKEN_LESS))
+    if (parser_match(parser, TOKEN_L_BRACKET))
     {
         node->uni_stmt.generics = parser_parse_generic_param_list(parser);
         if (!node->uni_stmt.generics)
@@ -2338,6 +2403,191 @@ AstNode *parser_parse_expr_prefix(Parser *parser)
     return parser_parse_expr_postfix(parser);
 }
 
+static AstNode *parser_expr_to_type(Parser *parser, AstNode *expr, AstList *generic_args)
+{
+    if (!expr)
+    {
+        if (generic_args)
+        {
+            ast_list_dnit(generic_args);
+            free(generic_args);
+        }
+        return NULL;
+    }
+
+    AstNode *type = NULL;
+
+    switch (expr->kind)
+    {
+    case AST_EXPR_IDENT:
+    {
+        type = parser_alloc_node(parser, AST_TYPE_NAME, expr->token);
+        if (!type)
+        {
+            if (generic_args)
+            {
+                ast_list_dnit(generic_args);
+                free(generic_args);
+            }
+            ast_node_dnit(expr);
+            free(expr);
+            return NULL;
+        }
+
+        type->type_name.module_alias = NULL;
+        type->type_name.name         = expr->ident_expr.name;
+        type->type_name.generic_args = generic_args;
+        expr->ident_expr.name        = NULL;
+        break;
+    }
+    case AST_EXPR_FIELD:
+    {
+        AstNode *object = expr->field_expr.object;
+        if (!object || object->kind != AST_EXPR_IDENT)
+        {
+            parser_error(parser, expr->token ? expr->token : parser->previous, "invalid type name");
+            if (generic_args)
+            {
+                ast_list_dnit(generic_args);
+                free(generic_args);
+            }
+            ast_node_dnit(expr);
+            free(expr);
+            return NULL;
+        }
+
+        type = parser_alloc_node(parser, AST_TYPE_NAME, expr->token);
+        if (!type)
+        {
+            if (generic_args)
+            {
+                ast_list_dnit(generic_args);
+                free(generic_args);
+            }
+            ast_node_dnit(expr);
+            free(expr);
+            return NULL;
+        }
+
+        type->type_name.module_alias = object->ident_expr.name;
+        type->type_name.name         = expr->field_expr.field;
+        type->type_name.generic_args = generic_args;
+
+        object->ident_expr.name = NULL;
+        expr->field_expr.field  = NULL;
+
+        ast_node_dnit(object);
+        free(object);
+        expr->field_expr.object = NULL;
+        break;
+    }
+    case AST_EXPR_INDEX:
+    {
+        if (generic_args)
+        {
+            parser_error(parser, expr->token ? expr->token : parser->previous, "unexpected nested type arguments");
+            ast_list_dnit(generic_args);
+            free(generic_args);
+            ast_node_dnit(expr);
+            free(expr);
+            return NULL;
+        }
+
+        AstNode *base_expr     = expr->index_expr.array;
+        AstNode *index_expr    = expr->index_expr.index;
+        expr->index_expr.array = NULL;
+        expr->index_expr.index = NULL;
+
+        AstNode *base_type = parser_expr_to_type(parser, base_expr, NULL);
+        if (!base_type)
+        {
+            if (index_expr)
+            {
+                ast_node_dnit(index_expr);
+                free(index_expr);
+            }
+            ast_node_dnit(expr);
+            free(expr);
+            return NULL;
+        }
+
+        AstList *type_args = parser_alloc_list(parser);
+        if (!type_args)
+        {
+            if (index_expr)
+            {
+                ast_node_dnit(index_expr);
+                free(index_expr);
+            }
+            ast_node_dnit(base_type);
+            free(base_type);
+            ast_node_dnit(expr);
+            free(expr);
+            return NULL;
+        }
+
+        AstNode *type_arg = parser_expr_to_type(parser, index_expr, NULL);
+        if (!type_arg)
+        {
+            ast_list_dnit(type_args);
+            free(type_args);
+            ast_node_dnit(base_type);
+            free(base_type);
+            ast_node_dnit(expr);
+            free(expr);
+            return NULL;
+        }
+
+        ast_list_append(type_args, type_arg);
+
+        if (base_type->kind != AST_TYPE_NAME)
+        {
+            parser_error(parser, expr->token ? expr->token : parser->previous, "invalid type expression");
+            ast_list_dnit(type_args);
+            free(type_args);
+            ast_node_dnit(base_type);
+            free(base_type);
+            ast_node_dnit(expr);
+            free(expr);
+            return NULL;
+        }
+
+        if (base_type->type_name.generic_args)
+        {
+            AstList *existing = base_type->type_name.generic_args;
+            for (int i = 0; i < type_args->count; i++)
+            {
+                ast_list_append(existing, type_args->items[i]);
+                type_args->items[i] = NULL;
+            }
+            free(type_args->items);
+            free(type_args);
+        }
+        else
+        {
+            base_type->type_name.generic_args = type_args;
+        }
+
+        type = base_type;
+        break;
+    }
+    default:
+        parser_error(parser, expr->token ? expr->token : parser->previous, "expected type name");
+        if (generic_args)
+        {
+            ast_list_dnit(generic_args);
+            free(generic_args);
+        }
+        ast_node_dnit(expr);
+        free(expr);
+        return NULL;
+    }
+
+    ast_node_dnit(expr);
+    free(expr);
+    return type;
+}
+
 AstNode *parser_parse_expr_postfix(Parser *parser)
 {
     AstNode *expr = parser_parse_expr_atom(parser);
@@ -2348,7 +2598,8 @@ AstNode *parser_parse_expr_postfix(Parser *parser)
 
     for (;;)
     {
-        if (parser_check(parser, TOKEN_LESS) && parser_should_parse_type_args(parser))
+        TokenKind follow_kind = TOKEN_ERROR;
+        if (parser_check(parser, TOKEN_L_BRACKET) && parser_should_parse_type_args(parser, &follow_kind))
         {
             AstList *type_args = parser_parse_type_arguments(parser);
             if (!type_args)
@@ -2358,22 +2609,51 @@ AstNode *parser_parse_expr_postfix(Parser *parser)
                 return NULL;
             }
 
-            if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after type arguments"))
+            if (follow_kind == TOKEN_L_PAREN)
             {
+                if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after type arguments"))
+                {
+                    ast_list_dnit(type_args);
+                    free(type_args);
+                    ast_node_dnit(expr);
+                    free(expr);
+                    return NULL;
+                }
+
+                AstNode *call = parser_finish_call(parser, expr, type_args);
+                if (!call)
+                {
+                    return NULL;
+                }
+
+                expr = call;
+                continue;
+            }
+            else if (follow_kind == TOKEN_L_BRACE)
+            {
+                AstNode *type = parser_expr_to_type(parser, expr, type_args);
+                if (!type)
+                {
+                    return NULL;
+                }
+
+                expr = parser_parse_typed_literal(parser, type);
+                if (!expr)
+                {
+                    return NULL;
+                }
+
+                continue;
+            }
+            else
+            {
+                parser_error_at_current(parser, "unexpected token after type arguments");
                 ast_list_dnit(type_args);
                 free(type_args);
                 ast_node_dnit(expr);
                 free(expr);
                 return NULL;
             }
-
-            AstNode *call = parser_finish_call(parser, expr, type_args);
-            if (!call)
-            {
-                return NULL;
-            }
-
-            expr = call;
         }
         else if (parser_match(parser, TOKEN_L_PAREN))
         {
@@ -2467,6 +2747,20 @@ AstNode *parser_parse_expr_postfix(Parser *parser)
             cast->cast_expr.expr = expr;
             cast->cast_expr.type = type;
             expr                 = cast;
+        }
+        else if (parser_check(parser, TOKEN_L_BRACE))
+        {
+            AstNode *type = parser_expr_to_type(parser, expr, NULL);
+            if (!type)
+            {
+                return NULL;
+            }
+
+            expr = parser_parse_typed_literal(parser, type);
+            if (!expr)
+            {
+                return NULL;
+            }
         }
         else
         {
@@ -2590,6 +2884,32 @@ AstNode *parser_parse_expr_atom(Parser *parser)
         parser_advance(parser);
         return parser_parse_anonymous_composite_literal(parser, true);
 
+    case TOKEN_DOLLAR:
+    {
+        // Parse compile-time expression: $size_of(T), $OS_LINUX, $target.os, etc.
+        Token dollar_token = *parser->current;
+        parser_advance(parser);
+
+        // Parse the expression/identifier after $
+        AstNode *inner = parser_parse_expr(parser);
+        if (!inner)
+        {
+            return NULL;
+        }
+
+        // Wrap it in AST_COMPTIME
+        AstNode *comptime = parser_alloc_node(parser, AST_COMPTIME, &dollar_token);
+        if (!comptime)
+        {
+            ast_node_dnit(inner);
+            free(inner);
+            return NULL;
+        }
+
+        comptime->comptime.inner = inner;
+        return comptime;
+    }
+
     case TOKEN_IDENTIFIER:
     {
         AstNode *ident = parser_alloc_node(parser, AST_EXPR_IDENT, parser->current);
@@ -2599,24 +2919,6 @@ AstNode *parser_parse_expr_atom(Parser *parser)
         }
         ident->ident_expr.name = lexer_raw_value(parser->lexer, parser->current);
         parser_advance(parser);
-
-        // check for literal (could be array or record)
-        if (parser_check(parser, TOKEN_L_BRACE))
-        {
-            AstNode *type = parser_alloc_node(parser, AST_TYPE_NAME, ident->token);
-            if (!type)
-            {
-                ast_node_dnit(ident);
-                free(ident);
-                return NULL;
-            }
-            type->type_name.name   = ident->ident_expr.name;
-            ident->ident_expr.name = NULL;
-            ast_node_dnit(ident);
-            free(ident);
-            return parser_parse_typed_literal(parser, type);
-        }
-
         return ident;
     }
 
@@ -2840,7 +3142,8 @@ AstNode *parser_parse_type_name(Parser *parser)
         return NULL;
     }
 
-    type->type_name.name = parser_parse_identifier(parser);
+    type->type_name.module_alias = NULL;
+    type->type_name.name         = parser_parse_identifier(parser);
     if (!type->type_name.name)
     {
         ast_node_dnit(type);
@@ -2848,7 +3151,27 @@ AstNode *parser_parse_type_name(Parser *parser)
         return NULL;
     }
 
-    if (parser_check(parser, TOKEN_LESS))
+    if (parser_match(parser, TOKEN_DOT))
+    {
+        type->type_name.module_alias = type->type_name.name;
+        type->type_name.name         = parser_parse_identifier(parser);
+        if (!type->type_name.name)
+        {
+            ast_node_dnit(type);
+            free(type);
+            return NULL;
+        }
+
+        if (parser_check(parser, TOKEN_DOT))
+        {
+            parser_error_at_current(parser, "unexpected '.' in type name");
+            ast_node_dnit(type);
+            free(type);
+            return NULL;
+        }
+    }
+
+    if (parser_check(parser, TOKEN_L_BRACKET))
     {
         AstList *generic_args = parser_parse_type_arguments(parser);
         if (!generic_args)
@@ -3089,6 +3412,14 @@ AstList *parser_parse_field_list(Parser *parser)
 
     while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
     {
+        if (parser->current->kind == TOKEN_DOLLAR)
+        {
+            parser_error_at_current(parser, "'$if' is not allowed inside record or union declarations");
+            ast_list_dnit(list);
+            free(list);
+            return NULL;
+        }
+
         AstNode *field = parser_alloc_node(parser, AST_STMT_FIELD, parser->current);
         if (!field)
         {

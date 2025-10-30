@@ -34,6 +34,9 @@ typedef enum AstKind
     AST_STMT_EXPR,
     AST_STMT_ASM,
 
+    // compile-time constructs
+    AST_COMPTIME,
+
     // expressions
     AST_EXPR_BINARY,
     AST_EXPR_UNARY,
@@ -125,7 +128,6 @@ struct AstNode
             AstNode *init; // initializer expression
             bool     is_val;
             bool     is_public;
-            char    *mangle_name;
         } var_stmt;
 
         // function statement
@@ -138,7 +140,6 @@ struct AstNode
             AstNode *body;        // null for external functions
             bool     is_variadic; // true if function has variadic arguments
             bool     is_public;
-            char    *mangle_name;
             bool     is_method;
             AstNode *method_receiver; // typename before '.' for method declarations
         } fun_stmt;
@@ -194,6 +195,12 @@ struct AstNode
             char *code;        // raw assembly text (single line for now)
             char *constraints; // optional LLVM asm constraints/clobbers string
         } asm_stmt;
+
+        // compile-time construct (unified $ prefix handler)
+        struct
+        {
+            AstNode *inner; // the expression/statement following $
+        } comptime;
 
         // return statement
         struct
@@ -307,6 +314,7 @@ struct AstNode
         // type expressions
         struct
         {
+            char    *module_alias;
             char    *name;
             AstList *generic_args;
         } type_name;

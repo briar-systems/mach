@@ -1,8 +1,8 @@
 #include "compilation.h"
+#include "comptime.h"
 #include "filesystem.h"
 #include "lexer.h"
 #include "parser.h"
-#include "preprocessor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -205,6 +205,13 @@ bool compilation_context_init(CompilationContext *ctx, BuildOptions *opts)
         fprintf(stderr, "error: failed to create semantic driver\n");
         return false;
     }
+    
+    if (opts)
+    {
+        ctx->driver->comptime_ctx.build_debug = opts->debug_info ? true : false;
+        ctx->driver->comptime_ctx.opt_level   = opts->opt_level;
+    }
+    
     return true;
 }
 
@@ -269,23 +276,6 @@ bool compilation_load_and_preprocess(CompilationContext *ctx)
         fprintf(stderr, "error: could not read '%s'\n", ctx->options->input_file);
         return false;
     }
-
-    PreprocessorConstant constants[32];
-    size_t               constant_count = module_manager_collect_constants(&ctx->driver->module_manager, constants, sizeof(constants) / sizeof(constants[0]));
-
-    PreprocessorOutput pp_output;
-    preprocessor_output_init(&pp_output);
-    if (!preprocessor_run(ctx->source, constants, constant_count, &pp_output))
-    {
-        fprintf(stderr, "#! directive error in '%s' line %d: %s\n", ctx->options->input_file, pp_output.line, pp_output.message ? pp_output.message : "unknown");
-        preprocessor_output_dnit(&pp_output);
-        return false;
-    }
-
-    free(ctx->source);
-    ctx->source      = pp_output.source;
-    pp_output.source = NULL;
-    preprocessor_output_dnit(&pp_output);
 
     return true;
 }
