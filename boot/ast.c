@@ -97,6 +97,7 @@ void ast_node_dnit(AstNode *node)
             ast_node_dnit(node->fun_stmt.method_receiver);
             free(node->fun_stmt.method_receiver);
         }
+        free(node->fun_stmt.method_receiver_name);
         if (node->fun_stmt.return_type)
         {
             ast_node_dnit(node->fun_stmt.return_type);
@@ -593,6 +594,7 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->fun_stmt.is_public       = node->fun_stmt.is_public;
         clone->fun_stmt.is_method       = node->fun_stmt.is_method;
         clone->fun_stmt.method_receiver = ast_clone_checked(node->fun_stmt.method_receiver);
+        clone->fun_stmt.method_receiver_name = ast_strdup(node->fun_stmt.method_receiver_name);
         break;
 
     case AST_STMT_REC:

@@ -352,21 +352,96 @@ pub fun main(args: []string) i64 {
 - Nested functions are disallowed.
 - Function bodies are required; there is no support for forward declarations without a body.
 
+
 ### Method syntax
 
-Mach supports method-style function definitions that associate functions with types. Methods use dot notation for the type before the function name:
+
+
+Mach supports methods declared outside of type definitions using receiver-first syntax. The receiver appears in parentheses before the method name and becomes the first parameter at call time.
 
 ```mach
-pub fun List[T].reserve(this: *List[T], additional: u64) Option[string] {
-    // ...
+pub fun (this: Vec2) magnitude() f32 {
+    ret math.sqrt((this.x * this.x) + (this.y * this.y));
+}
+
+pub fun (this: *Vec2) scale(factor: f32) {
+    this.x = this.x * factor;
+    this.y = this.y * factor;
 }
 ```
 
-- The first parameter is typically named `this` and represents the receiver.
-- Methods can take the receiver by value (`this: Type`) or by pointer (`this: *Type`).
-- Method calls use dot syntax: `my_list.reserve(10)`.
-- Methods are desugared to regular functions during compilation; they are syntactic sugar for organizational clarity.
-- Methods can be defined for any type, including generic types with their type parameters.
+- Methods are declared at module scope. The receiver parameter is typically named `this`.
+- The receiver may be by value (`this: T`) or by pointer (`this: *T`).
+- Calls use dot syntax: `v.magnitude()` and `v.scale(2.0)`.
+- Methods are resolved to regular functions during compilation by prepending the receiver as the first argument.
+
+Go-style implicit receiver adjustments
+At method call sites (and for field access), the compiler inserts minimal adjustments:
+- Auto-deref: If you have `*T` (or `**…*T`) and the method expects `T`, the call desugars by dereferencing as needed.
+- Auto-address-of (one level): If you have an addressable `T` and the method expects `*T`, the call desugars by taking the address. Temporaries that are not addressable cause an error.
+- No multi-level address-of: The compiler will not synthesize `**T` or deeper.
+- Scope: These adjustments apply only to method calls and field access. They are not applied to free function calls or arbitrary expressions.
+- Mutability: Pointer receivers that mutate require a mutable, addressable receiver.
+
+Examples:
+
+```mach
+var v: Vec2;
+val m: f32 = v.magnitude();   # value receiver
+v.scale(2.0);                 # pointer receiver; desugars to (?v).scale(2.0)
+
+var p: *Vec2 = ?v;
+val m2: f32 = p.magnitude();  # pointer -> value; desugars to (@p).magnitude()
+
+mk_vec().scale(2.0);          # ERROR: cannot take address of temporary; assign to a variable first
+```
+
+Same-module rule
+- Methods must be declared in the same module as their receiver type.
+- You may split methods across files within the same module.
+- Defining methods for types from other modules is not allowed.
+
+```mach
+# my/vec.mach
+pub rec Vec2 { x: f32; y: f32; }
+
+# my/vec_extra.mach (same module)
+pub fun (this: *Vec2) add(other: Vec2) {
+    this.x = this.x + other.x;
+    this.y = this.y + other.y;
+}
+
+# other/module/user_code.mach
+use my.vec;
+# ERROR: cannot define method for type from another module
+# pub fun (this: vec.Vec2) hacked() { ... }
+```
+
+Generics
+- Methods can be defined for generic types and use the receiver’s type parameters:
+
+```mach
+pub rec Option[T] { is_some: bool; value: T; }
+
+pub fun (this: Option[T]) is_some() bool { ret this.is_some; }
+pub fun (this: Option[T]) unwrap() T { ret this.value; }
+
+val o: Option[i32] = some[i32](42);
+if (o.is_some()) { val x = o.unwrap(); }
+```
+
+Restriction: not callable as free functions
+- Methods cannot be called as free functions; use dot syntax:
+
+```mach
+pub fun (this: Vec2) magnitude() f32 { ret math.sqrt((this.x * this.x) + (this.y * this.y)); }
+
+var v: Vec2;
+val m1 = v.magnitude();     # OK
+val m2 = magnitude(v);      # ERROR: method not in free function namespace
+val m3 = Vec2.magnitude(v); # ERROR: cannot call method as free function
+```
+
 
 ### Inline assembly (`asm`)
 

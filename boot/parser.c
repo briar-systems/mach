@@ -56,6 +56,7 @@ static AstList *parser_alloc_list(Parser *parser)
     ast_list_init(list);
     return list;
 }
+
 static bool parser_token_is_attr_category(TokenKind kind)
 {
     switch (kind)
@@ -82,25 +83,16 @@ static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
 
     Token *directive_token = parser->previous;
 
-    // Create AST_COMPTIME node
     AstNode *node = parser_alloc_node(parser, AST_COMPTIME, directive_token);
     if (!node)
     {
         return NULL;
     }
 
-    // Parse the expression or statement following $
-    // This could be:
-    // - Assignment: $fun.symbol = "name"
-    // - If statement: $if (cond) { ... }
-    // - Call: $size_of(Type)
-    // - Identifier: $OS, $ARCH
     AstNode *inner = NULL;
 
-    // Try parsing as statement first (for $if, blocks, etc.)
     if (parser_check(parser, TOKEN_KW_IF))
     {
-        // $if (cond) { ... }
         if (allow_top_level)
         {
             inner = parser_parse_comptime_if_top(parser);
@@ -112,14 +104,12 @@ static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
     }
     else
     {
-        // Otherwise parse as expression (for assignments, calls, identifiers)
         if (parser_token_is_attr_category(parser->current->kind))
         {
             parser->current->kind = TOKEN_IDENTIFIER;
         }
         inner = parser_parse_expr(parser);
 
-        // Consume optional semicolon for expression-style directives
         parser_match(parser, TOKEN_SEMICOLON);
     }
 
@@ -144,7 +134,7 @@ static TokenKind parser_peek_next_kind(Parser *parser)
 
     int saved_pos = parser->lexer->pos;
 
-    for (;;)
+    while (true)
     {
         Token *tok = lexer_next(parser->lexer);
         if (!tok)
@@ -351,99 +341,6 @@ static Token *parser_next_non_comment(Parser *parser, Token ***storage, size_t *
         (*storage)[(*count)++] = tok;
         return tok;
     }
-}
-
-static bool parser_is_method_decl(Parser *parser)
-{
-    if (!parser || !parser->current)
-    {
-        return false;
-    }
-
-    int     saved_pos     = parser->lexer->pos;
-    Token **peeked_tokens = NULL;
-    size_t  peek_count    = 0;
-    size_t  peek_capacity = 0;
-    bool    result        = false;
-
-    Token *token = parser->current;
-
-    if (!token || token->kind != TOKEN_IDENTIFIER)
-    {
-        goto cleanup;
-    }
-
-    Token *look = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
-    if (!look)
-        goto cleanup;
-
-    if (look->kind == TOKEN_L_BRACKET)
-    {
-        int depth = 1;
-        while (depth > 0)
-        {
-            Token *g = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
-            if (!g)
-                goto cleanup;
-            if (g->kind == TOKEN_L_BRACKET)
-                depth++;
-            else if (g->kind == TOKEN_R_BRACKET)
-                depth--;
-        }
-        look = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
-        if (!look)
-            goto cleanup;
-    }
-
-    if (look->kind != TOKEN_DOT)
-    {
-        goto cleanup;
-    }
-
-    Token *method_tok = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
-    if (!method_tok || method_tok->kind != TOKEN_IDENTIFIER)
-    {
-        goto cleanup;
-    }
-
-    Token *after = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
-    if (!after)
-        goto cleanup;
-
-    if (after->kind == TOKEN_L_BRACKET)
-    {
-        int depth = 1;
-        while (depth > 0)
-        {
-            Token *g = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
-            if (!g)
-                goto cleanup;
-            if (g->kind == TOKEN_L_BRACKET)
-                depth++;
-            else if (g->kind == TOKEN_R_BRACKET)
-                depth--;
-        }
-        after = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
-        if (!after)
-            goto cleanup;
-    }
-
-    if (after->kind == TOKEN_L_PAREN)
-    {
-        result = true;
-    }
-
-cleanup:
-    parser->lexer->pos = saved_pos;
-
-    for (size_t i = 0; i < peek_count; i++)
-    {
-        token_dnit(peeked_tokens[i]);
-        free(peeked_tokens[i]);
-    }
-    free(peeked_tokens);
-
-    return result;
 }
 
 // parser lifecycle
@@ -1535,59 +1432,53 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
         return NULL;
     }
 
-    bool is_method = parser_is_method_decl(parser);
-    if (is_method)
+    if (parser_check(parser, TOKEN_L_PAREN))
     {
-        // parse method receiver type
-        AstNode *receiver = parser_alloc_node(parser, AST_TYPE_NAME, parser->current);
-        if (!receiver)
+        parser_advance(parser); // consume '('
+
+        char *receiver_name = parser_parse_identifier(parser);
+        if (!receiver_name)
         {
             ast_node_dnit(node);
             free(node);
             return NULL;
         }
 
-        // NOTE: method receivers do not support module aliases
-        receiver->type_name.module_alias = NULL;
-        receiver->type_name.name         = parser_parse_identifier(parser);
-        if (!receiver->type_name.name)
+        if (!parser_consume(parser, TOKEN_COLON, "expected ':' after method receiver name"))
         {
-            ast_node_dnit(receiver);
-            free(receiver);
+            free(receiver_name);
             ast_node_dnit(node);
             free(node);
             return NULL;
         }
 
-        // optional generic parameters: Foo[T, U]
-        if (parser_check(parser, TOKEN_L_BRACKET))
+        AstNode *receiver_type = parser_parse_type(parser);
+        if (!receiver_type)
         {
-            AstList *generic_args = parser_parse_type_arguments(parser);
-            if (!generic_args)
-            {
-                ast_node_dnit(receiver);
-                free(receiver);
-                ast_node_dnit(node);
-                free(node);
-                return NULL;
-            }
-            receiver->type_name.generic_args = generic_args;
-        }
-
-        node->fun_stmt.is_method       = true;
-        node->fun_stmt.method_receiver = receiver;
-
-        if (!parser_consume(parser, TOKEN_DOT, "expected '.' after method receiver type"))
-        {
+            free(receiver_name);
             ast_node_dnit(node);
             free(node);
             return NULL;
         }
+
+        if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after method receiver"))
+        {
+            free(receiver_name);
+            ast_node_dnit(receiver_type);
+            free(receiver_type);
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
+        }
+
+        node->fun_stmt.is_method            = true;
+        node->fun_stmt.method_receiver       = receiver_type;
+        node->fun_stmt.method_receiver_name  = receiver_name;
 
         node->fun_stmt.name = parser_parse_identifier(parser);
         if (!node->fun_stmt.name)
         {
-            parser_error_at_current(parser, "expected method name after receiver type");
+            parser_error_at_current(parser, "expected method name after receiver");
             ast_node_dnit(node);
             free(node);
             return NULL;
@@ -1631,6 +1522,40 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
         ast_node_dnit(node);
         free(node);
         return NULL;
+    }
+
+    if (node->fun_stmt.is_method)
+    {
+        AstNode *receiver_param = parser_alloc_node(parser, AST_STMT_PARAM, parser->current);
+        if (!receiver_param)
+        {
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
+        }
+
+        receiver_param->param_stmt.is_variadic = false;
+        receiver_param->param_stmt.name        = strdup(node->fun_stmt.method_receiver_name ? node->fun_stmt.method_receiver_name : "");
+        if (!receiver_param->param_stmt.name)
+        {
+            ast_node_dnit(receiver_param);
+            free(receiver_param);
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
+        }
+
+        receiver_param->param_stmt.type = ast_clone(node->fun_stmt.method_receiver);
+        if (!receiver_param->param_stmt.type)
+        {
+            ast_node_dnit(receiver_param);
+            free(receiver_param);
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
+        }
+
+        ast_list_append(node->fun_stmt.params, receiver_param);
     }
 
     if (!parser_check(parser, TOKEN_R_PAREN))

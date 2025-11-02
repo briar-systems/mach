@@ -1758,14 +1758,39 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
 {
     const char *method_name = stmt->fun_stmt.name;
 
-    // extract owner type name from method_receiver
-    if (!stmt->fun_stmt.method_receiver || stmt->fun_stmt.method_receiver->kind != AST_TYPE_NAME)
+    if (!stmt->fun_stmt.method_receiver)
     {
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "method '%s' missing valid receiver type", method_name);
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "method '%s' missing receiver", method_name);
         return false;
     }
 
-    const char *owner_name = stmt->fun_stmt.method_receiver->type_name.name;
+    AstNode *receiver_node      = stmt->fun_stmt.method_receiver;
+    bool     receiver_is_pointer = false;
+
+    while (receiver_node && receiver_node->kind == AST_TYPE_PTR)
+    {
+        receiver_is_pointer = true;
+        receiver_node       = receiver_node->type_ptr.base;
+    }
+
+    if (!receiver_node || receiver_node->kind != AST_TYPE_NAME)
+    {
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "method '%s' receiver must be named type", method_name);
+        return false;
+    }
+
+    if (receiver_node->type_name.module_alias)
+    {
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "method '%s' receiver cannot reference external module", method_name);
+        return false;
+    }
+
+    const char *owner_name = receiver_node->type_name.name;
+    if (!owner_name)
+    {
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "method '%s' receiver missing type name", method_name);
+        return false;
+    }
 
     // find owner type symbol
     Symbol *owner_sym = symbol_lookup_scope(ctx->current_scope, owner_name);
@@ -1777,6 +1802,13 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
     if (!owner_sym || owner_sym->kind != SYMBOL_TYPE)
     {
         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "method owner type '%s' not found", owner_name);
+        return false;
+    }
+
+    if (owner_sym->home_scope != ctx->module_scope)
+    {
+        const char *owner_module = owner_sym->module_name ? owner_sym->module_name : "<unknown>";
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "cannot define method for type '%s' from module '%s'", owner_name, owner_module);
         return false;
     }
 
@@ -1805,6 +1837,11 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
     symbol->func.uses_mach_varargs              = stmt->fun_stmt.is_variadic; // mark variadic methods
     symbol->func.method_owner                   = owner_sym;
     symbol->func.method_forwarded_generic_count = owner_generic_count;
+    symbol->func.method_receiver_is_pointer     = receiver_is_pointer;
+    if (stmt->fun_stmt.method_receiver_name)
+    {
+        symbol->func.method_receiver_name = strdup(stmt->fun_stmt.method_receiver_name);
+    }
 
     // store all generic parameter names (owner params first, then method params)
     if (is_generic && total_generic_count > 0)
@@ -3879,6 +3916,28 @@ normal_call_analysis:; // label must be followed by a statement
     Symbol *func_sym       = expr->call_expr.func ? expr->call_expr.func->symbol : NULL;
     Symbol *base_sym       = func_sym && func_sym->import_origin ? func_sym->import_origin : func_sym;
     size_t  type_arg_count = expr->call_expr.type_args ? expr->call_expr.type_args->count : 0;
+
+    if (base_sym && base_sym->kind == SYMBOL_FUNC && base_sym->func.is_method && !expr->call_expr.is_method_call)
+    {
+        const char *owner_name_for_error = (base_sym->func.method_owner && base_sym->func.method_owner->name) ? base_sym->func.method_owner->name : "<type>";
+        const char *method_name_for_error = NULL;
+
+        if (base_sym->decl && base_sym->decl->kind == AST_STMT_FUN && base_sym->decl->fun_stmt.name)
+        {
+            method_name_for_error = base_sym->decl->fun_stmt.name;
+        }
+        else if (func_sym && func_sym->decl && func_sym->decl->kind == AST_STMT_FUN && func_sym->decl->fun_stmt.name)
+        {
+            method_name_for_error = func_sym->decl->fun_stmt.name;
+        }
+        else if (base_sym->name)
+        {
+            method_name_for_error = base_sym->name;
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "method '%s.%s' cannot be called as free function", owner_name_for_error, method_name_for_error ? method_name_for_error : "<unknown>");
+        return NULL;
+    }
 
     // specialize generic functions on demand (e.g. mem.alloc[T])
     if (base_sym && base_sym->kind == SYMBOL_FUNC && base_sym->func.is_generic)
