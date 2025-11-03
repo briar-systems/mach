@@ -141,7 +141,7 @@ struct AstNode
             bool     is_variadic; // true if function has variadic arguments
             bool     is_public;
             bool     is_method;
-            AstNode *method_receiver;     // receiver type from '(name: Type)' syntax
+            AstNode *method_receiver;      // receiver type from '(name: Type)' syntax
             char    *method_receiver_name; // receiver identifier from '(name: Type)'
         } fun_stmt;
 
@@ -328,7 +328,7 @@ struct AstNode
         struct
         {
             AstNode *elem_type;
-            AstNode *size; // null for unbound arrays [_]
+            AstNode *size; // null for slices []
         } type_array;
 
         struct

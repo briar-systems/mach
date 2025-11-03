@@ -1472,8 +1472,8 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
         }
 
         node->fun_stmt.is_method            = true;
-        node->fun_stmt.method_receiver       = receiver_type;
-        node->fun_stmt.method_receiver_name  = receiver_name;
+        node->fun_stmt.method_receiver      = receiver_type;
+        node->fun_stmt.method_receiver_name = receiver_name;
 
         node->fun_stmt.name = parser_parse_identifier(parser);
         if (!node->fun_stmt.name)
@@ -2871,11 +2871,7 @@ AstNode *parser_parse_array_literal(Parser *parser)
     }
 
     // size or unbounded
-    if (parser_match(parser, TOKEN_UNDERSCORE))
-    {
-        array->array_expr.type->type_array.size = NULL;
-    }
-    else if (!parser_check(parser, TOKEN_R_BRACKET))
+    if (!parser_check(parser, TOKEN_R_BRACKET))
     {
         array->array_expr.type->type_array.size = parser_parse_expr(parser);
         if (!array->array_expr.type->type_array.size)
@@ -3139,11 +3135,7 @@ AstNode *parser_parse_type_array(Parser *parser)
     }
 
     // size or unbounded
-    if (parser_match(parser, TOKEN_UNDERSCORE))
-    {
-        array->type_array.size = NULL;
-    }
-    else if (!parser_check(parser, TOKEN_R_BRACKET))
+    if (!parser_check(parser, TOKEN_R_BRACKET))
     {
         array->type_array.size = parser_parse_expr(parser);
         if (!array->type_array.size)
