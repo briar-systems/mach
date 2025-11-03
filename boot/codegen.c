@@ -1076,21 +1076,35 @@ LLVMTypeRef codegen_get_llvm_type(CodegenContext *ctx, Type *type)
     case TYPE_UNION:
     {
         // unions are represented as a struct with a single field of the largest member type
-        size_t      max_size     = 0;
-        LLVMTypeRef largest_type = NULL;
+        size_t      max_size       = 0;
+        LLVMTypeRef largest_type   = NULL;
+        bool        has_any_fields = false;
 
         for (Symbol *field = type->composite.fields; field; field = field->next)
         {
-            if (field->type->size > max_size)
+            has_any_fields = true;
+
+            size_t field_size = type_sizeof(field->type);
+            if (!largest_type || field_size > max_size)
             {
-                max_size     = field->type->size;
-                largest_type = codegen_get_llvm_type(ctx, field->type);
+                LLVMTypeRef candidate = codegen_get_llvm_type(ctx, field->type);
+                if (candidate)
+                {
+                    max_size     = field_size;
+                    largest_type = candidate;
+                }
             }
         }
 
         if (largest_type)
         {
             llvm_type = LLVMStructTypeInContext(ctx->context, &largest_type, 1, false);
+        }
+        else if (has_any_fields)
+        {
+            size_t      storage_size = max_size > 0 ? max_size : 1;
+            LLVMTypeRef byte_array   = LLVMArrayType(LLVMInt8TypeInContext(ctx->context), (unsigned)storage_size);
+            llvm_type                = LLVMStructTypeInContext(ctx->context, &byte_array, 1, false);
         }
         else
         {

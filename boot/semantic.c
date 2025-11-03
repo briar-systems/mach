@@ -2360,8 +2360,11 @@ static bool pass_b_resolve_alias_visitor(SemanticDriver *driver, const AnalysisC
         Type *resolved = resolve_type_in_context(driver, ctx, stmt->def_stmt.type);
         if (resolved)
         {
-            stmt->symbol->type->alias.target = resolved;
-            stmt->type                       = resolved;
+            Type *alias_type = stmt->symbol->type;
+            alias_type->alias.target = resolved;
+            alias_type->size         = type_sizeof(resolved);
+            alias_type->alignment    = type_alignof(resolved);
+            stmt->type               = resolved;
             return true;
         }
         return false;
@@ -4200,11 +4203,11 @@ static Type *analyze_cast_expr(SemanticDriver *driver, const AnalysisContext *ct
         valid = true;
 
     // pointer to pointer (always allowed)
-    else if (source->kind == TYPE_POINTER && target->kind == TYPE_POINTER)
+    else if (type_is_pointer_like(source) && type_is_pointer_like(target))
         valid = true;
 
     // integer to pointer or pointer to integer (unsafe but allowed)
-    else if ((type_is_integer(source) && target->kind == TYPE_POINTER) || (source->kind == TYPE_POINTER && type_is_integer(target)))
+    else if ((type_is_integer(source) && type_is_pointer_like(target)) || (type_is_pointer_like(source) && type_is_integer(target)))
         valid = true;
 
     if (!valid)
