@@ -1,11 +1,34 @@
-# Mach documentation
+# Mach Language Reference
 
-This directory is the authoritative home of the Mach language specification and project guides. The self-hosted compiler will live in this repository; keeping the language docs alongside the source ensures they evolve together.
 
-## Contents
+This is the comprehensive reference for the Mach programming language.
 
-- [getting-started.md](./getting-started.md) &mdash; Installation, build instructions, and running your first Mach program.
-- [language-spec.md](./language-spec.md) &mdash; Complete language reference covering syntax, semantics, intrinsics, and module conventions.
-- [project-layout.md](./project-layout.md) &mdash; How `mach.toml`, module mapping, and the `Makefile` fit together.
+This documentation is organized so that you can read it linearly or jump directly to a topic of interest. Begin with the [A Quick Tour](language-tour.md) to see the language in action, then use the sections under Core Language and Data Definitions to look up specifics. Advanced Features cover compile-time behavior, external bindings, and inline assembly. The Reference section includes a complete list of keywords and a formal grammar.
 
-When the language changes, update `language-spec.md` first, then adjust the supplemental guides as needed. The bootstrap compiler (`cmach`) should continue to match the spec until the self-hosted compiler takes over.
+---
+
+## Table of Contents
+
+- Overview
+  - [A Quick Tour](language-tour.md)
+  - [Lexical Structure](lexical-structure.md)
+- Core Language
+  - [Types](types.md)
+  - [Literals](literals.md)
+  - [Variables and Constants](variables.md)
+  - [Functions and Methods](functions-and-methods.md)
+  - [Expressions and Operators](expressions-and-operators.md)
+  - [Control Flow](control-flow.md)
+  - [Modules and Visibility](modules-and-visibility.md)
+- Data Definitions
+  - [Records and Unions](records-and-unions.md)
+  - [Arrays and Slices](arrays-and-slices.md)
+  - [Pointers and Memory](pointers-and-memory.md)
+  - [Generics](generics.md)
+- Advanced Features
+  - [Compile-time Features](compile-time.md)
+  - [External Declarations and Interoperability](interoperability.md)
+  - [Inline Assembly](inline-assembly.md)
+- Reference
+  - [Keywords and Symbols](keywords-and-symbols.md)
+  - [Grammar Reference](grammar.md)

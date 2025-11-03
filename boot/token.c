@@ -114,6 +114,8 @@ char *token_kind_to_string(TokenKind kind)
         return ",";
     case TOKEN_UNDERSCORE:
         return "_";
+    case TOKEN_ELLIPSIS:
+        return "...";
 
     case TOKEN_PLUS:
         return "+";
