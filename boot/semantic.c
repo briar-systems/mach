@@ -1805,7 +1805,9 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
         return false;
     }
 
-    if (owner_sym->home_scope != ctx->module_scope)
+    Scope *allowed_scope = ctx->module_scope ? ctx->module_scope : ctx->global_scope;
+
+    if (owner_sym->home_scope != allowed_scope)
     {
         const char *owner_module = owner_sym->module_name ? owner_sym->module_name : "<unknown>";
         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "cannot define method for type '%s' from module '%s'", owner_name, owner_module);
@@ -3161,6 +3163,21 @@ static Symbol *lookup_in_scope_chain(Scope *current_scope, Scope *module_scope, 
             return sym;
     }
 
+    // fallback: search in module alias scopes visible from module_scope
+    // this handles method lookups on types from imported modules
+    if (module_scope)
+    {
+        for (Symbol *mod_sym = module_scope->symbols; mod_sym; mod_sym = mod_sym->next)
+        {
+            if (mod_sym->kind == SYMBOL_MODULE && mod_sym->module.scope)
+            {
+                Symbol *sym = symbol_lookup_scope(mod_sym->module.scope, name);
+                if (sym)
+                    return sym;
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -3806,6 +3823,28 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
                     }
                 }
             }
+            else if (method_sym->func.method_receiver_is_pointer && receiver_type->kind != TYPE_POINTER)
+            {
+                // fallback: use stored method receiver info if function type not yet resolved
+                // create address-of operation
+                AstNode *addr_of = malloc(sizeof(AstNode));
+                ast_node_init(addr_of, AST_EXPR_UNARY);
+                addr_of->token           = NULL; // don't share token to avoid double-free
+                addr_of->unary_expr.op   = TOKEN_QUESTION;
+                addr_of->unary_expr.expr = receiver;
+                receiver_arg = addr_of;
+            }
+            else if (!method_sym->func.method_receiver_is_pointer && receiver_type->kind == TYPE_POINTER)
+            {
+                // fallback: use stored method receiver info if function type not yet resolved
+                // create dereference operation
+                AstNode *deref = malloc(sizeof(AstNode));
+                ast_node_init(deref, AST_EXPR_UNARY);
+                deref->token           = NULL; // don't share token to avoid double-free
+                deref->unary_expr.op   = TOKEN_AT;
+                deref->unary_expr.expr = receiver;
+                receiver_arg = deref;
+            }
 
             // transform method call: prepend receiver as first argument
             if (!expr->call_expr.args)
@@ -4086,10 +4125,17 @@ static Type *analyze_field_expr(SemanticDriver *driver, const AnalysisContext *c
                 member->type = member->import_origin->type;
             if (member->import_origin && member->import_origin->type)
                 target = member->import_origin;
+            
+            // ensure const value is propagated to the target symbol
             if (!member->has_const_i64 && member->import_origin && member->import_origin->has_const_i64)
             {
                 member->has_const_i64 = true;
                 member->const_i64     = member->import_origin->const_i64;
+            }
+            if (!target->has_const_i64 && member->has_const_i64)
+            {
+                target->has_const_i64 = true;
+                target->const_i64     = member->const_i64;
             }
 
             expr->field_expr.object->symbol = sym;

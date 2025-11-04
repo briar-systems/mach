@@ -202,6 +202,35 @@ static bool codegen_eval_const_i64(CodegenContext *ctx, AstNode *expr, int64_t *
         }
     }
 
+    case AST_EXPR_FIELD:
+        // for module.constant access
+        if (expr->symbol && expr->symbol->has_const_i64)
+        {
+            *out = expr->symbol->const_i64;
+            return true;
+        }
+        // try evaluating via initializer
+        if (expr->symbol && (expr->symbol->kind == SYMBOL_VAL || expr->symbol->kind == SYMBOL_VAR) && expr->symbol->decl)
+        {
+            AstNode *decl = expr->symbol->decl;
+            AstNode *init = NULL;
+            if (decl->kind == AST_STMT_VAL || decl->kind == AST_STMT_VAR)
+            {
+                init = decl->var_stmt.init;
+            }
+
+            if (init && codegen_eval_const_i64(ctx, init, out))
+            {
+                if (expr->symbol->kind == SYMBOL_VAL)
+                {
+                    expr->symbol->has_const_i64 = true;
+                    expr->symbol->const_i64     = *out;
+                }
+                return true;
+            }
+        }
+        return false;
+
     case AST_EXPR_CAST:
     {
         int64_t value = 0;
@@ -3171,6 +3200,27 @@ LLVMValueRef codegen_expr_field(CodegenContext *ctx, AstNode *expr)
             // semantic analysis stored the resolved member symbol in expr->symbol
             if (expr->symbol)
             {
+                // try constant folding first for val constants
+                if (expr->symbol->has_const_i64)
+                {
+                    LLVMTypeRef llvm_type = codegen_get_llvm_type(ctx, expr->type);
+                    if (llvm_type)
+                    {
+                        return LLVMConstInt(llvm_type, (unsigned long long)expr->symbol->const_i64, 1);
+                    }
+                }
+
+                // try evaluating as constant expression
+                int64_t const_val = 0;
+                if (codegen_eval_const_i64(ctx, expr, &const_val))
+                {
+                    LLVMTypeRef llvm_type = codegen_get_llvm_type(ctx, expr->type);
+                    if (llvm_type)
+                    {
+                        return LLVMConstInt(llvm_type, (unsigned long long)const_val, 1);
+                    }
+                }
+
                 LLVMValueRef value = codegen_get_symbol_value(ctx, expr->symbol);
                 if (!value)
                 {
