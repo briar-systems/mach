@@ -2416,6 +2416,29 @@ static bool pass_b_resolve_var_type_visitor(SemanticDriver *driver, const Analys
     return true;
 }
 
+static bool run_pass_b_stage(SemanticDriver *driver, const AnalysisContext *entry_ctx, AstNode *entry_root, TopLevelVisitor visitor)
+{
+    bool success = true;
+
+    FOR_EACH_MODULE(&driver->module_manager, module)
+    {
+        if (!module->ast || module->ast->kind != AST_PROGRAM || !module->symbols || !module->symbols->global_scope)
+            continue;
+
+        Scope          *module_scope = module->symbols->global_scope;
+        AnalysisContext module_ctx   = analysis_context_create(module_scope, module_scope, module->name, module->file_path);
+
+        success = visit_top_level_list(driver, &module_ctx, module->ast->program.stmts, visitor) && success;
+    }
+
+    if (entry_root && entry_root->kind == AST_PROGRAM)
+    {
+        success = visit_top_level_list(driver, entry_ctx, entry_root->program.stmts, visitor) && success;
+    }
+
+    return success;
+}
+
 static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *root)
 {
     if (!root || root->kind != AST_PROGRAM)
@@ -2423,11 +2446,11 @@ static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisCont
 
     bool success = true;
 
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_alias_visitor) && success;
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_struct_fields_visitor) && success;
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_union_fields_visitor) && success;
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_fun_signature_visitor) && success;
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_var_type_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_alias_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_struct_fields_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_union_fields_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_fun_signature_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_var_type_visitor) && success;
 
     return success;
 }
@@ -4552,7 +4575,14 @@ static Type *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *c
     return expr->type;
 }
 
+static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
+
 static Type *analyze_comptime_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
+{
+    return analyze_comptime_expr_with_hint(driver, ctx, expr, NULL);
+}
+
+static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected)
 {
     if (!expr || expr->kind != AST_COMPTIME || !expr->comptime.inner)
     {
@@ -4579,13 +4609,13 @@ static Type *analyze_comptime_expr(SemanticDriver *driver, const AnalysisContext
             {
                 expr->lit_expr.kind    = TOKEN_LIT_INT;
                 expr->lit_expr.int_val = (long long)ct_value.u8_val;
-                expr->type             = type_u8();
+                expr->type             = (expected && type_is_integer(expected)) ? expected : type_u8();
             }
             else if (ct_value.kind == COMPTIME_U64)
             {
                 expr->lit_expr.kind    = TOKEN_LIT_INT;
                 expr->lit_expr.int_val = (long long)ct_value.u64_val;
-                expr->type             = type_u64();
+                expr->type             = (expected && type_is_integer(expected)) ? expected : type_u64();
             }
             else if (ct_value.kind == COMPTIME_STRING)
             {
@@ -4634,13 +4664,13 @@ static Type *analyze_comptime_expr(SemanticDriver *driver, const AnalysisContext
                 {
                     expr->lit_expr.kind    = TOKEN_LIT_INT;
                     expr->lit_expr.int_val = (long long)ct_value.u8_val;
-                    expr->type             = type_u8();
+                    expr->type             = (expected && type_is_integer(expected)) ? expected : type_u8();
                 }
                 else if (ct_value.kind == COMPTIME_U64)
                 {
                     expr->lit_expr.kind    = TOKEN_LIT_INT;
                     expr->lit_expr.int_val = (long long)ct_value.u64_val;
-                    expr->type             = type_u64();
+                    expr->type             = (expected && type_is_integer(expected)) ? expected : type_u64();
                 }
                 else if (ct_value.kind == COMPTIME_STRING)
                 {
@@ -4717,6 +4747,8 @@ static Type *analyze_expr_with_hint(SemanticDriver *driver, const AnalysisContex
         if (expected && !expr->struct_expr.type)
             expr->type = expected;
         return analyze_struct_expr(driver, ctx, expr);
+    case AST_COMPTIME:
+        return analyze_comptime_expr_with_hint(driver, ctx, expr, expected);
     default:
         return analyze_expr(driver, ctx, expr);
     }
@@ -5679,28 +5711,9 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
         return false;
     }
 
-    // Resolve signatures in all loaded modules FIRST (before entry module)
-    // This ensures that aliases and types from imported modules are fully resolved
-    // before the entry module tries to use them
-    FOR_EACH_MODULE(&driver->module_manager, module)
-    {
-        if (success && module->ast && module->ast->kind == AST_PROGRAM)
-        {
-            Scope          *module_scope = module->symbols->global_scope;
-            AnalysisContext module_ctx   = analysis_context_create(module_scope, module_scope, module->name, module->file_path);
-
-            if (!analyze_pass_b_signatures(driver, &module_ctx, module->ast))
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, NULL, module->name, "signature resolution pass failed for module '%s'", module->name);
-                success = false;
-            }
-        }
-    }
-
-    // Resolve signatures in entry module AFTER imported modules
     if (!analyze_pass_b_signatures(driver, &ctx, root))
     {
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, NULL, module_path, "signature resolution pass failed for entry module");
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, NULL, module_path, "signature resolution pass failed");
         success = false;
     }
 
