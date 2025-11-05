@@ -3282,8 +3282,10 @@ static bool is_lvalue_expr(const AstNode *expr)
 
 static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
 {
-    Type *left  = analyze_expr(driver, ctx, expr->binary_expr.left);
-    Type *right = analyze_expr(driver, ctx, expr->binary_expr.right);
+    Type *left = analyze_expr(driver, ctx, expr->binary_expr.left);
+
+    // for assignment, pass LHS type as hint to RHS for proper literal typing
+    Type *right = (expr->binary_expr.op == TOKEN_EQUAL) ? analyze_expr_with_hint(driver, ctx, expr->binary_expr.right, left) : analyze_expr(driver, ctx, expr->binary_expr.right);
 
     if (!left || !right)
         return NULL;
