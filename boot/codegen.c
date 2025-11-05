@@ -2225,6 +2225,7 @@ LLVMValueRef codegen_stmt_if(CodegenContext *ctx, AstNode *stmt)
             codegen_error(ctx, stmt, "failed to generate if condition");
             return NULL;
         }
+        cond_value = codegen_load_if_needed(ctx, cond_value, stmt->cond_stmt.cond->type, stmt->cond_stmt.cond);
         Type *ct = type_resolve_alias(stmt->cond_stmt.cond->type);
         if (type_is_integer(ct) || type_is_pointer_like(ct))
         {
@@ -3218,8 +3219,22 @@ LLVMValueRef codegen_expr_call(CodegenContext *ctx, AstNode *expr)
 
             if (extra_arg_count > 0)
             {
-                LLVMValueRef count_val   = LLVMConstInt(i64_ty, (unsigned long long)extra_arg_count, false);
-                LLVMValueRef array_alloc = LLVMBuildArrayAlloca(ctx->builder, i8_ptr_ty, count_val, "mach_vararg_array");
+                LLVMValueRef count_val = LLVMConstInt(i64_ty, (unsigned long long)extra_arg_count, false);
+
+                // allocate vararg array in entry block to ensure it persists for the entire call
+                LLVMBasicBlockRef entry       = LLVMGetEntryBasicBlock(ctx->current_function);
+                LLVMBuilderRef    tmp_builder = LLVMCreateBuilderInContext(ctx->context);
+                LLVMValueRef      first_inst  = LLVMGetFirstInstruction(entry);
+                if (first_inst)
+                {
+                    LLVMPositionBuilderBefore(tmp_builder, first_inst);
+                }
+                else
+                {
+                    LLVMPositionBuilderAtEnd(tmp_builder, entry);
+                }
+                LLVMValueRef array_alloc = LLVMBuildArrayAlloca(tmp_builder, i8_ptr_ty, count_val, "mach_vararg_array");
+                LLVMDisposeBuilder(tmp_builder);
 
                 for (int j = 0; j < extra_arg_count; j++)
                 {
@@ -3513,6 +3528,32 @@ LLVMValueRef codegen_create_alloca(CodegenContext *ctx, LLVMTypeRef type, const 
     return alloca;
 }
 
+static LLVMValueRef codegen_strip_pointer_casts(LLVMValueRef value)
+{
+    while (value)
+    {
+        if (LLVMIsABitCastInst(value) || LLVMIsAPtrToIntInst(value) || LLVMIsAIntToPtrInst(value))
+        {
+            value = LLVMGetOperand(value, 0);
+            continue;
+        }
+
+        if (LLVMIsAConstantExpr(value))
+        {
+            LLVMOpcode opcode = LLVMGetConstOpcode(value);
+            if (opcode == LLVMBitCast || opcode == LLVMPtrToInt || opcode == LLVMIntToPtr)
+            {
+                value = LLVMGetOperand(value, 0);
+                continue;
+            }
+        }
+
+        break;
+    }
+
+    return value;
+}
+
 LLVMValueRef codegen_load_if_needed(CodegenContext *ctx, LLVMValueRef value, Type *type, AstNode *source_expr)
 {
     // if no expected type, assume value is already in the right form
@@ -3529,14 +3570,21 @@ LLVMValueRef codegen_load_if_needed(CodegenContext *ctx, LLVMValueRef value, Typ
         return value;
     }
 
-    bool is_alloca       = LLVMIsAAllocaInst(value);
-    bool is_global       = LLVMIsAGlobalVariable(value);
-    bool is_gep          = LLVMIsAGetElementPtrInst(value);
-    bool value_is_memory = is_alloca || is_global || is_gep;
+    LLVMValueRef base_value   = codegen_strip_pointer_casts(value);
+    bool         is_alloca    = LLVMIsAAllocaInst(base_value);
+    bool         is_global    = LLVMIsAGlobalVariable(base_value);
+    bool         is_gep       = LLVMIsAGetElementPtrInst(base_value);
+    if (!is_gep && LLVMIsAConstantExpr(base_value) && LLVMGetConstOpcode(base_value) == LLVMGetElementPtr)
+        is_gep = true;
+    bool         value_is_memory = is_alloca || is_global || is_gep;
 
     if (type->kind == TYPE_PTR || type->kind == TYPE_POINTER)
     {
-        bool pointer_from_memory = is_alloca || is_global || (is_gep && source_expr && codegen_is_lvalue(source_expr));
+        bool pointer_from_memory = value_is_memory;
+        if (is_gep && source_expr && !codegen_is_lvalue(source_expr))
+        {
+            pointer_from_memory = false;
+        }
 
         if (!pointer_from_memory)
         {
