@@ -5,6 +5,7 @@
 - If the bootstrap compiler is modified, once all changes are complete, format the C code using `clang-format` if available on the host system.
 
 # Quality
+- Reference language documentation in `doc` for proper usage of language features.
 - Maintain clarity and simplicity in all code changes.
 - Avoid introducing compatibility shims. Prefer full implementations.
 - Fully remove any dead code or lost features if affected by a change. This includes replaced functionality.
