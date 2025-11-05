@@ -53,6 +53,14 @@ struct CodegenContext
         int          capacity;
     } type_cache;
 
+    struct
+    {
+        Type            **types;
+        LLVMMetadataRef  *di_types;
+        int               count;
+        int               capacity;
+    } di_type_cache;
+
     // current function context
     LLVMValueRef      current_function;
     Type             *current_function_type; // mach type for current function

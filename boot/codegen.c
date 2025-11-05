@@ -6,6 +6,7 @@
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,10 @@ static void            codegen_debug_finalize(CodegenContext *ctx);
 static void            codegen_set_debug_location(CodegenContext *ctx, AstNode *node);
 static LLVMMetadataRef codegen_get_current_scope(CodegenContext *ctx);
 static LLVMMetadataRef codegen_debug_get_unknown_type(CodegenContext *ctx);
+static LLVMMetadataRef codegen_debug_get_type(CodegenContext *ctx, Type *type);
+static bool            codegen_debug_push_scope(CodegenContext *ctx, AstNode *node, LLVMMetadataRef *out_prev_scope);
+static void            codegen_debug_pop_scope(CodegenContext *ctx, LLVMMetadataRef previous_scope, bool pushed);
+static void            codegen_debug_declare_symbol(CodegenContext *ctx, Symbol *symbol, Type *type, LLVMValueRef storage, AstNode *node, bool is_parameter, unsigned arg_index);
 static LLVMMetadataRef codegen_debug_create_subprogram(CodegenContext *ctx, AstNode *stmt, LLVMValueRef func, const char *display_name, const char *link_name, size_t param_count);
 
 // Helper function to add a function with required attributes
@@ -456,6 +461,8 @@ static void codegen_debug_init(CodegenContext *ctx)
         return;
     }
 
+    LLVMSetIsNewDbgInfoFormat(ctx->module, 1);
+
     ctx->di_unknown_type = NULL;
 
     LLVMValueRef    debug_version_val = LLVMConstInt(LLVMInt32TypeInContext(ctx->context), LLVMDebugMetadataVersion(), false);
@@ -516,6 +523,353 @@ static LLVMMetadataRef codegen_debug_get_unknown_type(CodegenContext *ctx)
         ctx->di_unknown_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, name, strlen(name), 0, 64, 0);
     }
     return ctx->di_unknown_type;
+}
+
+static LLVMMetadataRef codegen_debug_get_type(CodegenContext *ctx, Type *type)
+{
+    if (!ctx->debug_info || !ctx->di_builder)
+        return codegen_debug_get_unknown_type(ctx);
+    if (!type)
+        return codegen_debug_get_unknown_type(ctx);
+
+    Type *resolved = type_resolve_alias(type);
+    if (!resolved)
+        resolved = type;
+
+    // check cache - including entries being built (NULL means in-progress)
+    for (int i = 0; i < ctx->di_type_cache.count; i++)
+    {
+        if (ctx->di_type_cache.types[i] == resolved)
+        {
+            // if we found it with a NULL di_type, we're in a recursive call
+            // return unknown type to break the cycle
+            if (!ctx->di_type_cache.di_types[i])
+                return codegen_debug_get_unknown_type(ctx);
+            return ctx->di_type_cache.di_types[i];
+        }
+    }
+
+    if (ctx->di_type_cache.count >= ctx->di_type_cache.capacity)
+    {
+        ctx->di_type_cache.capacity  = ctx->di_type_cache.capacity ? ctx->di_type_cache.capacity * 2 : 16;
+        ctx->di_type_cache.types     = realloc(ctx->di_type_cache.types, sizeof(Type *) * ctx->di_type_cache.capacity);
+        ctx->di_type_cache.di_types  = realloc(ctx->di_type_cache.di_types, sizeof(LLVMMetadataRef) * ctx->di_type_cache.capacity);
+    }
+
+    // reserve entry immediately with NULL to detect cycles
+    const int index = ctx->di_type_cache.count++;
+    ctx->di_type_cache.types[index]    = resolved;
+    ctx->di_type_cache.di_types[index] = NULL;
+
+    const size_t    size_bytes  = type_sizeof(resolved);
+    const uint64_t  size_bits   = (uint64_t)size_bytes * 8;
+    const size_t    align_bytes = type_alignof(resolved);
+    const unsigned  align_bits  = (unsigned)(align_bytes * 8);
+    LLVMMetadataRef di_type     = NULL;
+
+    switch (resolved->kind)
+    {
+    case TYPE_U8:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "u8", 2, 0, 8, align_bits);
+        break;
+    case TYPE_U16:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "u16", 3, 0, 16, align_bits);
+        break;
+    case TYPE_U32:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "u32", 3, 0, 32, align_bits);
+        break;
+    case TYPE_U64:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "u64", 3, 0, 64, align_bits);
+        break;
+    case TYPE_I8:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "i8", 2, 0, 8, align_bits);
+        break;
+    case TYPE_I16:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "i16", 3, 0, 16, align_bits);
+        break;
+    case TYPE_I32:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "i32", 3, 0, 32, align_bits);
+        break;
+    case TYPE_I64:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "i64", 3, 0, 64, align_bits);
+        break;
+    case TYPE_F16:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "f16", 3, 0, 16, align_bits);
+        break;
+    case TYPE_F32:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "f32", 3, 0, 32, align_bits);
+        break;
+    case TYPE_F64:
+        di_type = LLVMDIBuilderCreateBasicType(ctx->di_builder, "f64", 3, 0, 64, align_bits);
+        break;
+    case TYPE_PTR:
+    case TYPE_POINTER:
+    {
+        LLVMMetadataRef base = resolved->kind == TYPE_POINTER && resolved->pointer.base ? codegen_debug_get_type(ctx, resolved->pointer.base) : codegen_debug_get_unknown_type(ctx);
+        di_type              = LLVMDIBuilderCreatePointerType(ctx->di_builder, base, size_bits, align_bits, 0, "", 0);
+        break;
+    }
+    case TYPE_ARRAY:
+    {
+        if (resolved->array.is_slice)
+        {
+            const char     *name         = resolved->name ? resolved->name : "slice";
+            LLVMMetadataRef scope        = ctx->di_compile_unit ? ctx->di_compile_unit : ctx->di_file;
+            LLVMMetadataRef file         = ctx->di_file ? ctx->di_file : scope;
+            LLVMTypeRef     raw_ptr_type = LLVMPointerTypeInContext(ctx->context, 0);
+            uint64_t        pointer_bits = LLVMSizeOfTypeInBits(ctx->data_layout, raw_ptr_type);
+            uint32_t        pointer_align_bits = (uint32_t)(LLVMABIAlignmentOfType(ctx->data_layout, raw_ptr_type) * 8);
+            LLVMMetadataRef elem_ptr     = LLVMDIBuilderCreatePointerType(ctx->di_builder, codegen_debug_get_type(ctx, resolved->array.elem_type), pointer_bits, pointer_align_bits, 0, "", 0);
+            LLVMMetadataRef len_type     = codegen_debug_get_type(ctx, type_u64());
+            uint32_t        len_align_bits     = (uint32_t)(type_alignof(type_u64()) * 8);
+            LLVMMetadataRef members[2];
+            members[0] = LLVMDIBuilderCreateMemberType(ctx->di_builder, scope, "data", 4, file, 0, pointer_bits, pointer_align_bits, 0, LLVMDIFlagZero, elem_ptr);
+            members[1] = LLVMDIBuilderCreateMemberType(ctx->di_builder, scope, "len", 3, file, 0, 64, len_align_bits, pointer_bits, LLVMDIFlagZero, len_type);
+            di_type    = LLVMDIBuilderCreateStructType(ctx->di_builder, scope, name, strlen(name), file, 0, size_bits, align_bits, LLVMDIFlagZero, NULL, members, 2, 0, NULL, "", 0);
+        }
+        else
+        {
+            LLVMMetadataRef elem_type   = codegen_debug_get_type(ctx, resolved->array.elem_type);
+            LLVMMetadataRef subrange    = LLVMDIBuilderGetOrCreateSubrange(ctx->di_builder, 0, (int64_t)resolved->array.size);
+            LLVMMetadataRef subscripts[1] = {subrange};
+            di_type = LLVMDIBuilderCreateArrayType(ctx->di_builder, size_bits, align_bits, elem_type, subscripts, 1);
+        }
+        break;
+    }
+    case TYPE_STRUCT:
+    {
+        const char     *name  = resolved->name ? resolved->name : "anon.struct";
+        LLVMMetadataRef scope = ctx->di_compile_unit ? ctx->di_compile_unit : ctx->di_file;
+        LLVMMetadataRef file  = ctx->di_file ? ctx->di_file : scope;
+        LLVMMetadataRef *members    = NULL;
+        unsigned         member_cnt = 0;
+        if (resolved->composite.field_count > 0 && resolved->composite.fields)
+        {
+            member_cnt = (unsigned)resolved->composite.field_count;
+            members    = malloc(sizeof(LLVMMetadataRef) * member_cnt);
+            if (members)
+            {
+                Symbol   *field_iter = resolved->composite.fields;
+                unsigned  i          = 0;
+                while (field_iter && i < member_cnt)
+                {
+                    Symbol *field      = field_iter;
+                    field_iter         = field_iter->next;
+                    const char *fname  = field->name ? field->name : "field";
+                    Type *field_type   = field->type ? field->type : type_u64();
+                    LLVMMetadataRef field_di_type = codegen_debug_get_type(ctx, field_type);
+                    uint64_t         field_size_bits   = (uint64_t)type_sizeof(field_type) * 8;
+                    uint32_t         field_align_bits  = (uint32_t)(type_alignof(field_type) * 8);
+                    uint64_t         field_offset_bits = (uint64_t)field->field.offset * 8;
+
+                    unsigned field_line = 0;
+                    if (field->decl && field->decl->token && ctx->source_lexer)
+                        field_line = (unsigned)(lexer_get_pos_line(ctx->source_lexer, field->decl->token->pos) + 1);
+
+                    members[i] = LLVMDIBuilderCreateMemberType(ctx->di_builder, scope, fname, strlen(fname), file, field_line, field_size_bits, field_align_bits, field_offset_bits, LLVMDIFlagZero, field_di_type);
+                    i++;
+                }
+                member_cnt = i;
+            }
+        }
+
+        di_type = LLVMDIBuilderCreateStructType(ctx->di_builder, scope, name, strlen(name), file, 0, size_bits, align_bits, LLVMDIFlagZero, NULL, members, members ? member_cnt : 0, 0, NULL, "", 0);
+        free(members);
+        break;
+    }
+    case TYPE_UNION:
+    {
+        const char     *name  = resolved->name ? resolved->name : "anon.union";
+        LLVMMetadataRef scope = ctx->di_compile_unit ? ctx->di_compile_unit : ctx->di_file;
+        LLVMMetadataRef file  = ctx->di_file ? ctx->di_file : scope;
+        LLVMMetadataRef *members    = NULL;
+        unsigned         member_cnt = 0;
+        if (resolved->composite.field_count > 0 && resolved->composite.fields)
+        {
+            member_cnt = (unsigned)resolved->composite.field_count;
+            members    = malloc(sizeof(LLVMMetadataRef) * member_cnt);
+            if (members)
+            {
+                Symbol   *field_iter = resolved->composite.fields;
+                unsigned  i          = 0;
+                while (field_iter && i < member_cnt)
+                {
+                    Symbol *field      = field_iter;
+                    field_iter         = field_iter->next;
+                    const char *fname  = field->name ? field->name : "field";
+                    Type *field_type   = field->type ? field->type : type_u64();
+                    LLVMMetadataRef field_di_type = codegen_debug_get_type(ctx, field_type);
+                    uint64_t         field_size_bits  = (uint64_t)type_sizeof(field_type) * 8;
+                    uint32_t         field_align_bits = (uint32_t)(type_alignof(field_type) * 8);
+
+                    unsigned field_line = 0;
+                    if (field->decl && field->decl->token && ctx->source_lexer)
+                        field_line = (unsigned)(lexer_get_pos_line(ctx->source_lexer, field->decl->token->pos) + 1);
+
+                    members[i] = LLVMDIBuilderCreateMemberType(ctx->di_builder, scope, fname, strlen(fname), file, field_line, field_size_bits, field_align_bits, 0, LLVMDIFlagZero, field_di_type);
+                    i++;
+                }
+                member_cnt = i;
+            }
+        }
+
+        di_type = LLVMDIBuilderCreateUnionType(ctx->di_builder, scope, name, strlen(name), file, 0, size_bits, align_bits, LLVMDIFlagZero, members, members ? member_cnt : 0, 0, "", 0);
+        free(members);
+        break;
+    }
+    case TYPE_FUNCTION:
+    {
+        size_t total = resolved->function.param_count + 1;
+        if (total == 0)
+        {
+            di_type = LLVMDIBuilderCreatePointerType(ctx->di_builder, codegen_debug_get_unknown_type(ctx), size_bits, align_bits, 0, "", 0);
+            break;
+        }
+
+        LLVMMetadataRef *params = malloc(sizeof(LLVMMetadataRef) * total);
+        if (!params)
+        {
+            di_type = codegen_debug_get_unknown_type(ctx);
+            break;
+        }
+
+        params[0] = resolved->function.return_type ? codegen_debug_get_type(ctx, resolved->function.return_type) : codegen_debug_get_unknown_type(ctx);
+        for (size_t i = 0; i < resolved->function.param_count; i++)
+        {
+            Type *param_type = resolved->function.param_types[i];
+            params[i + 1] = codegen_debug_get_type(ctx, param_type);
+        }
+
+        LLVMMetadataRef subroutine = LLVMDIBuilderCreateSubroutineType(ctx->di_builder, ctx->di_file ? ctx->di_file : ctx->di_compile_unit, params, (unsigned)total, 0);
+        free(params);
+        if (!subroutine)
+        {
+            di_type = codegen_debug_get_unknown_type(ctx);
+            break;
+        }
+
+        di_type = LLVMDIBuilderCreatePointerType(ctx->di_builder, subroutine, size_bits, align_bits, 0, "", 0);
+        break;
+    }
+    case TYPE_ALIAS:
+        di_type = codegen_debug_get_type(ctx, resolved->alias.target);
+        break;
+    default:
+        di_type = codegen_debug_get_unknown_type(ctx);
+        break;
+    }
+
+    if (!di_type)
+        di_type = codegen_debug_get_unknown_type(ctx);
+
+    ctx->di_type_cache.di_types[index] = di_type;
+    return di_type;
+}
+
+static bool codegen_debug_push_scope(CodegenContext *ctx, AstNode *node, LLVMMetadataRef *out_prev_scope)
+{
+    if (!ctx->debug_info || !ctx->di_builder)
+        return false;
+
+    LLVMMetadataRef parent_scope = codegen_get_current_scope(ctx);
+    if (!parent_scope)
+        return false;
+
+    unsigned line = 0;
+    unsigned col  = 0;
+    if (node && node->token && ctx->source_lexer)
+    {
+        line = (unsigned)(lexer_get_pos_line(ctx->source_lexer, node->token->pos) + 1);
+        col  = (unsigned)(lexer_get_pos_line_offset(ctx->source_lexer, node->token->pos) + 1);
+    }
+
+    LLVMMetadataRef file_meta = ctx->di_file ? ctx->di_file : ctx->di_compile_unit;
+    LLVMMetadataRef block     = LLVMDIBuilderCreateLexicalBlock(ctx->di_builder, parent_scope, file_meta, line, col);
+    if (!block)
+        return false;
+
+    if (out_prev_scope)
+        *out_prev_scope = ctx->current_di_scope;
+
+    ctx->current_di_scope = block;
+    return true;
+}
+
+static void codegen_debug_pop_scope(CodegenContext *ctx, LLVMMetadataRef previous_scope, bool pushed)
+{
+    if (!pushed || !ctx->debug_info || !ctx->di_builder)
+        return;
+
+    if (previous_scope)
+        ctx->current_di_scope = previous_scope;
+    else
+        ctx->current_di_scope = ctx->di_compile_unit;
+}
+
+static void codegen_debug_declare_symbol(CodegenContext *ctx, Symbol *symbol, Type *type, LLVMValueRef storage, AstNode *node, bool is_parameter, unsigned arg_index)
+{
+    if (!ctx->debug_info || !ctx->di_builder || !ctx->current_function)
+        return;
+    if (!storage)
+        return;
+
+    const char *name = NULL;
+    if (symbol && symbol->name)
+        name = symbol->name;
+    else if (node && (node->kind == AST_STMT_VAR || node->kind == AST_STMT_VAL))
+        name = node->var_stmt.name;
+    else if (node && node->kind == AST_STMT_PARAM)
+        name = node->param_stmt.name;
+
+    if (!name || !name[0])
+        return;
+
+    unsigned line = 0;
+    unsigned col  = 0;
+    if (node && node->token && ctx->source_lexer)
+    {
+        line = (unsigned)(lexer_get_pos_line(ctx->source_lexer, node->token->pos) + 1);
+        col  = (unsigned)(lexer_get_pos_line_offset(ctx->source_lexer, node->token->pos) + 1);
+    }
+
+    LLVMMetadataRef scope = codegen_get_current_scope(ctx);
+    if (!scope)
+        scope = ctx->di_compile_unit;
+
+    LLVMMetadataRef file_meta = ctx->di_file ? ctx->di_file : scope;
+    LLVMMetadataRef di_type   = codegen_debug_get_type(ctx, type);
+    if (!di_type)
+        di_type = codegen_debug_get_unknown_type(ctx);
+
+    LLVMMetadataRef var_meta = NULL;
+    if (is_parameter)
+    {
+        if (arg_index == 0)
+            arg_index = 1;
+        var_meta = LLVMDIBuilderCreateParameterVariable(ctx->di_builder, scope, name, strlen(name), arg_index, file_meta, line, di_type, true, LLVMDIFlagZero);
+    }
+    else
+    {
+        unsigned align_bits = (unsigned)(type ? type_alignof(type) * 8 : 0);
+        var_meta            = LLVMDIBuilderCreateAutoVariable(ctx->di_builder, scope, name, strlen(name), file_meta, line, di_type, true, LLVMDIFlagZero, align_bits);
+    }
+
+    if (!var_meta)
+        return;
+
+    LLVMMetadataRef expr        = LLVMDIBuilderCreateExpression(ctx->di_builder, NULL, 0);
+    LLVMBasicBlockRef insert_at = LLVMGetInsertBlock(ctx->builder);
+    if (!expr || !insert_at)
+        return;
+
+    LLVMMetadataRef loc = LLVMDIBuilderCreateDebugLocation(ctx->context, line, col, scope, NULL);
+    if (!loc)
+        loc = LLVMDIBuilderCreateDebugLocation(ctx->context, line, col, ctx->di_compile_unit ? ctx->di_compile_unit : scope, NULL);
+
+    if (loc)
+    {
+        LLVMDIBuilderInsertDeclareRecordAtEnd(ctx->di_builder, storage, var_meta, expr, loc, insert_at);
+    }
 }
 
 static LLVMMetadataRef codegen_debug_create_subprogram(CodegenContext *ctx, AstNode *stmt, LLVMValueRef func, const char *display_name, const char *link_name, size_t param_count)
@@ -741,6 +1095,11 @@ void codegen_context_init(CodegenContext *ctx, const char *module_name, bool no_
     ctx->type_cache.count      = 0;
     ctx->type_cache.capacity   = 0;
 
+    ctx->di_type_cache.types     = NULL;
+    ctx->di_type_cache.di_types  = NULL;
+    ctx->di_type_cache.count     = 0;
+    ctx->di_type_cache.capacity  = 0;
+
     ctx->current_function        = NULL;
     ctx->current_function_type   = NULL;
     ctx->break_block             = NULL;
@@ -789,6 +1148,8 @@ void codegen_context_dnit(CodegenContext *ctx)
     free(ctx->symbol_map.values);
     free(ctx->type_cache.types);
     free(ctx->type_cache.llvm_types);
+    free(ctx->di_type_cache.types);
+    free(ctx->di_type_cache.di_types);
 
     if (ctx->di_builder)
     {
@@ -875,7 +1236,7 @@ bool codegen_generate(CodegenContext *ctx, AstNode *root, SymbolTable *symbols)
     }
 
     // run optimization passes
-    if (ctx->opt_level > 0 && !ctx->has_errors)
+    if (ctx->opt_level > 0 && !ctx->has_errors && !ctx->debug_info)
     {
         LLVMPassBuilderOptionsRef options = LLVMCreatePassBuilderOptions();
 
@@ -1408,6 +1769,9 @@ LLVMValueRef codegen_stmt_block(CodegenContext *ctx, AstNode *stmt)
 {
     LLVMValueRef last = NULL;
 
+    LLVMMetadataRef prev_scope = NULL;
+    bool            pushed     = codegen_debug_push_scope(ctx, stmt, &prev_scope);
+
     if (stmt->block_stmt.stmts)
     {
         for (int i = 0; i < stmt->block_stmt.stmts->count; i++)
@@ -1416,6 +1780,7 @@ LLVMValueRef codegen_stmt_block(CodegenContext *ctx, AstNode *stmt)
         }
     }
 
+    codegen_debug_pop_scope(ctx, prev_scope, pushed);
     return last;
 }
 
@@ -1557,6 +1922,8 @@ LLVMValueRef codegen_stmt_var(CodegenContext *ctx, AstNode *stmt)
                 LLVMBuildStore(ctx->builder, init_value, alloca);
             }
         }
+
+        codegen_debug_declare_symbol(ctx, stmt->symbol, stmt->type, alloca, stmt, false, 0);
         return alloca;
     }
 }
@@ -1702,6 +2069,7 @@ LLVMValueRef codegen_stmt_fun(CodegenContext *ctx, AstNode *stmt)
                 LLVMBuildStore(ctx->builder, param_value, param_alloca);
                 if (param->symbol)
                     codegen_set_symbol_value(ctx, param->symbol, param_alloca);
+                codegen_debug_declare_symbol(ctx, param->symbol, param->type, param_alloca, param, true, (unsigned)(fixed_index + 1));
                 fixed_index++;
             }
         }
@@ -1856,7 +2224,10 @@ LLVMValueRef codegen_stmt_if(CodegenContext *ctx, AstNode *stmt)
 
     // generate then block
     LLVMPositionBuilderAtEnd(ctx->builder, then_block);
+    LLVMMetadataRef then_prev_scope = NULL;
+    bool            then_pushed     = codegen_debug_push_scope(ctx, stmt->cond_stmt.body, &then_prev_scope);
     codegen_stmt(ctx, stmt->cond_stmt.body);
+    codegen_debug_pop_scope(ctx, then_prev_scope, then_pushed);
     bool then_falls_through = false;
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)))
     {
@@ -1868,7 +2239,10 @@ LLVMValueRef codegen_stmt_if(CodegenContext *ctx, AstNode *stmt)
     LLVMPositionBuilderAtEnd(ctx->builder, else_block);
     if (stmt->cond_stmt.stmt_or)
     {
+        LLVMMetadataRef else_prev_scope = NULL;
+        bool            else_pushed     = codegen_debug_push_scope(ctx, stmt->cond_stmt.stmt_or, &else_prev_scope);
         codegen_stmt(ctx, stmt->cond_stmt.stmt_or);
+        codegen_debug_pop_scope(ctx, else_prev_scope, else_pushed);
     }
     bool else_falls_through = false;
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)))
@@ -1940,7 +2314,10 @@ LLVMValueRef codegen_stmt_for(CodegenContext *ctx, AstNode *stmt)
 
     // generate body
     LLVMPositionBuilderAtEnd(ctx->builder, body_block);
+    LLVMMetadataRef body_prev_scope = NULL;
+    bool            body_pushed     = codegen_debug_push_scope(ctx, stmt->for_stmt.body, &body_prev_scope);
     codegen_stmt(ctx, stmt->for_stmt.body);
+    codegen_debug_pop_scope(ctx, body_prev_scope, body_pushed);
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)))
     {
         LLVMBuildBr(ctx->builder, loop_block);
@@ -2825,7 +3202,8 @@ LLVMValueRef codegen_expr_call(CodegenContext *ctx, AstNode *expr)
                     if (arg_type && (arg_type->kind == TYPE_ARRAY || arg_type->kind == TYPE_STRUCT || arg_type->kind == TYPE_UNION))
                     {
                         // Composite types: if it's a pointer to the composite, load it
-                        if (LLVMIsAAllocaInst(value) || LLVMIsAGlobalVariable(value))
+                        // This includes allocas, globals, and GEPs (e.g., array element access)
+                        if (LLVMIsAAllocaInst(value) || LLVMIsAGlobalVariable(value) || LLVMIsAGetElementPtrInst(value))
                         {
                             LLVMTypeRef composite_ty = codegen_get_llvm_type(ctx, arg_type);
                             value                    = LLVMBuildLoad2(ctx->builder, composite_ty, value, "composite_load");

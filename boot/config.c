@@ -394,6 +394,7 @@ void config_init(ProjectConfig *config)
 
 void config_dnit(ProjectConfig *config)
 {
+    free(config->id);
     free(config->name);
     free(config->version);
     free(config->main_file);
@@ -630,7 +631,11 @@ ProjectConfig *config_load(const char *config_path)
         if (!current_section || strcmp(current_section, "project") == 0)
         {
             // handle project section keys (merged with directories)
-            if (strcmp(key, "name") == 0)
+            if (strcmp(key, "id") == 0)
+            {
+                config->id = toml_parse_string(&parser);
+            }
+            else if (strcmp(key, "name") == 0)
             {
                 config->name = toml_parse_string(&parser);
             }
@@ -810,6 +815,8 @@ bool config_save(ProjectConfig *config, const char *config_path)
     fprintf(file, "# all fields are required (mach explicitness philosophy)\n\n");
 
     fprintf(file, "[project]\n");
+    if (config->id)
+        fprintf(file, "id = \"%s\"\n", config->id);
     if (config->name)
         fprintf(file, "name = \"%s\"\n", config->name);
     if (config->version)
@@ -869,6 +876,7 @@ ProjectConfig *config_create_default(const char *project_name)
     ProjectConfig *config = malloc(sizeof(ProjectConfig));
     config_init(config);
 
+    config->id      = strdup(project_name); // default id to project_name
     config->name    = strdup(project_name);
     config->version = strdup("0.1.0");
     config->src_dir = strdup("src");
@@ -945,25 +953,6 @@ bool config_is_shared_library(ProjectConfig *config, const char *target_name)
         return true;
     TargetConfig *target = config_get_target(config, target_name);
     return target && target->shared;
-}
-
-char *config_default_executable_name(ProjectConfig *config)
-{
-    // Deprecated - use per-target final_name instead
-    const char *name = config && config->name ? config->name : "a.out";
-    return strdup(name);
-}
-
-char *config_default_library_name(ProjectConfig *config, bool shared)
-{
-    // Deprecated - use per-target final_name instead
-    const char *base = config && config->name ? config->name : "libmach";
-    size_t      nlen = strlen(base);
-    const char *ext  = shared ? ".so" : ".a";
-    size_t      len  = 3 + nlen + strlen(ext) + 1;
-    char       *out  = malloc(len);
-    snprintf(out, len, "lib%s%s", base, ext);
-    return out;
 }
 
 char *config_resolve_final_output_path(ProjectConfig *config, const char *project_dir, const char *target_name)
@@ -1309,6 +1298,12 @@ bool config_validate(ProjectConfig *config)
     }
 
     // Validate [project] section - all fields required
+    if (!config->id || strlen(config->id) == 0)
+    {
+        fprintf(stderr, "error: [project] id is required\n");
+        return false;
+    }
+
     if (!config->name || strlen(config->name) == 0)
     {
         fprintf(stderr, "error: [project] name is required\n");
@@ -1434,10 +1429,10 @@ char *config_expand_module_path(ProjectConfig *config, const char *module_path)
 
     // legacy 'dep.' prefix removed
 
-    size_t project_name_len = config->name ? strlen(config->name) : 0;
-    if (project_name_len > 0 && strncmp(module_path, config->name, project_name_len) == 0)
+    size_t project_id_len = config->id ? strlen(config->id) : 0;
+    if (project_id_len > 0 && strncmp(module_path, config->id, project_id_len) == 0)
     {
-        char next = module_path[project_name_len];
+        char next = module_path[project_id_len];
         if (next == '\0' || next == '.')
             return strdup(module_path);
     }
@@ -1452,9 +1447,9 @@ char *config_expand_module_path(ProjectConfig *config, const char *module_path)
     head[head_len] = '\0';
 
     const char *alias_target = NULL;
-    if (is_self_alias(head) && project_name_len > 0)
+    if (is_self_alias(head) && project_id_len > 0)
     {
-        alias_target = config->name;
+        alias_target = config->id;
     }
     else
     {
@@ -1483,13 +1478,13 @@ char *config_expand_module_path(ProjectConfig *config, const char *module_path)
 
     if (!dot)
     {
-        if (project_name_len > 0)
+        if (project_id_len > 0)
         {
             size_t tail_len = strlen(module_path);
-            size_t total    = project_name_len + 1 + tail_len + 1;
+            size_t total    = project_id_len + 1 + tail_len + 1;
             result          = malloc(total);
             if (result)
-                snprintf(result, total, "%s.%s", config->name, module_path);
+                snprintf(result, total, "%s.%s", config->id, module_path);
         }
         else
         {
@@ -1518,8 +1513,8 @@ char *config_resolve_package_root(ProjectConfig *config, const char *project_dir
 {
     if (!config || !project_dir || !package_name)
         return NULL;
-    // root project
-    if (strcmp(package_name, config->name) == 0)
+    // root project (match by id)
+    if (strcmp(package_name, config->id) == 0)
     {
         return strdup(project_dir);
     }
@@ -1542,8 +1537,8 @@ char *config_get_package_src_dir(ProjectConfig *config, const char *project_dir,
     if (!root)
         return NULL;
 
-    // for self, use project's src-dir
-    if (strcmp(package_name, config->name) == 0)
+    // for self, use project's src-dir (match by id)
+    if (strcmp(package_name, config->id) == 0)
     {
         const char *src_rel = config->src_dir ? config->src_dir : "src";
         size_t      len     = strlen(root) + 1 + strlen(src_rel) + 1;

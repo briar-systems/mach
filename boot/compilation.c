@@ -328,6 +328,11 @@ bool compilation_codegen(CompilationContext *ctx)
     ctx->codegen.source_lexer = &ctx->lexer;
     ctx->codegen.spec_cache   = &ctx->driver->spec_cache;
 
+    if (ctx->codegen.debug_info)
+    {
+        ctx->codegen.opt_level = 0;
+    }
+
     if (!codegen_generate(&ctx->codegen, ctx->ast, &ctx->driver->symbol_table))
     {
         fprintf(stderr, "code generation failed:\n");
@@ -799,6 +804,8 @@ bool compilation_link(CompilationContext *ctx)
         strcat(cmd, " -pie");
     if (ctx->options->debug_info)
         strcat(cmd, " -g");
+    if (ctx->options->debug_info)
+        strcat(cmd, " -fno-omit-frame-pointer");
     strcat(cmd, " -o ");
     strcat(cmd, exe);
     strcat(cmd, " ");

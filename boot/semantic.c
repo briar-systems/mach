@@ -1764,7 +1764,7 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
         return false;
     }
 
-    AstNode *receiver_node      = stmt->fun_stmt.method_receiver;
+    AstNode *receiver_node       = stmt->fun_stmt.method_receiver;
     bool     receiver_is_pointer = false;
 
     while (receiver_node && receiver_node->kind == AST_TYPE_PTR)
@@ -2362,7 +2362,7 @@ static bool pass_b_resolve_alias_visitor(SemanticDriver *driver, const AnalysisC
         Type *resolved = resolve_type_in_context(driver, ctx, stmt->def_stmt.type);
         if (resolved)
         {
-            Type *alias_type = stmt->symbol->type;
+            Type *alias_type         = stmt->symbol->type;
             alias_type->alias.target = resolved;
             alias_type->size         = type_sizeof(resolved);
             alias_type->alignment    = type_alignof(resolved);
@@ -3391,6 +3391,34 @@ static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *
     // comparison operators
     if (op == TOKEN_EQUAL_EQUAL || op == TOKEN_BANG_EQUAL || op == TOKEN_LESS || op == TOKEN_LESS_EQUAL || op == TOKEN_GREATER || op == TOKEN_GREATER_EQUAL)
     {
+        bool is_equality = (op == TOKEN_EQUAL_EQUAL || op == TOKEN_BANG_EQUAL);
+
+        // reject composite types (structs, arrays, unions) for all comparisons
+        if (left->kind == TYPE_STRUCT || left->kind == TYPE_ARRAY || left->kind == TYPE_UNION)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "illegal composite type in comparison");
+            return NULL;
+        }
+
+        if (right->kind == TYPE_STRUCT || right->kind == TYPE_ARRAY || right->kind == TYPE_UNION)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "illegal composite type in comparison");
+            return NULL;
+        }
+
+        // for ordering comparisons (<, <=, >, >=), require numeric types or pointers
+        if (!is_equality)
+        {
+            bool left_orderable  = type_is_numeric(left) || type_is_pointer_like(left);
+            bool right_orderable = type_is_numeric(right) || type_is_pointer_like(right);
+
+            if (!left_orderable || !right_orderable)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "ordering comparison requires numeric or pointer operands");
+                return NULL;
+            }
+        }
+
         expr->type = type_u8(); // boolean result as u8
         return expr->type;
     }
@@ -3832,7 +3860,7 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
                 addr_of->token           = NULL; // don't share token to avoid double-free
                 addr_of->unary_expr.op   = TOKEN_QUESTION;
                 addr_of->unary_expr.expr = receiver;
-                receiver_arg = addr_of;
+                receiver_arg             = addr_of;
             }
             else if (!method_sym->func.method_receiver_is_pointer && receiver_type->kind == TYPE_POINTER)
             {
@@ -3843,7 +3871,7 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
                 deref->token           = NULL; // don't share token to avoid double-free
                 deref->unary_expr.op   = TOKEN_AT;
                 deref->unary_expr.expr = receiver;
-                receiver_arg = deref;
+                receiver_arg           = deref;
             }
 
             // transform method call: prepend receiver as first argument
@@ -3961,7 +3989,7 @@ normal_call_analysis:; // label must be followed by a statement
 
     if (base_sym && base_sym->kind == SYMBOL_FUNC && base_sym->func.is_method && !expr->call_expr.is_method_call)
     {
-        const char *owner_name_for_error = (base_sym->func.method_owner && base_sym->func.method_owner->name) ? base_sym->func.method_owner->name : "<type>";
+        const char *owner_name_for_error  = (base_sym->func.method_owner && base_sym->func.method_owner->name) ? base_sym->func.method_owner->name : "<type>";
         const char *method_name_for_error = NULL;
 
         if (base_sym->decl && base_sym->decl->kind == AST_STMT_FUN && base_sym->decl->fun_stmt.name)
@@ -4125,7 +4153,7 @@ static Type *analyze_field_expr(SemanticDriver *driver, const AnalysisContext *c
                 member->type = member->import_origin->type;
             if (member->import_origin && member->import_origin->type)
                 target = member->import_origin;
-            
+
             // ensure const value is propagated to the target symbol
             if (!member->has_const_i64 && member->import_origin && member->import_origin->has_const_i64)
             {
@@ -5649,14 +5677,9 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
         return false;
     }
 
-    // Resolve signatures in entry module
-    if (!analyze_pass_b_signatures(driver, &ctx, root))
-    {
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, NULL, module_path, "signature resolution pass failed for entry module");
-        success = false;
-    }
-
-    // Resolve signatures in all loaded modules
+    // Resolve signatures in all loaded modules FIRST (before entry module)
+    // This ensures that aliases and types from imported modules are fully resolved
+    // before the entry module tries to use them
     FOR_EACH_MODULE(&driver->module_manager, module)
     {
         if (success && module->ast && module->ast->kind == AST_PROGRAM)
@@ -5670,6 +5693,13 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
                 success = false;
             }
         }
+    }
+
+    // Resolve signatures in entry module AFTER imported modules
+    if (!analyze_pass_b_signatures(driver, &ctx, root))
+    {
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, NULL, module_path, "signature resolution pass failed for entry module");
+        success = false;
     }
 
     if (!success)
