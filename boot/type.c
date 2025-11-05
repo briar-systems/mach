@@ -550,12 +550,19 @@ bool type_can_assign_to(Type *from, Type *to)
 
 size_t type_sizeof(Type *type)
 {
-    return type->size;
+    if (!type)
+        return 0;
+        
+    // resolve alias to get actual type size
+    Type *resolved = type_resolve_alias(type);
+    return resolved ? resolved->size : 0;
 }
 
 size_t type_alignof(Type *type)
 {
-    return type->alignment;
+    // resolve alias to get actual type alignment
+    Type *resolved = type_resolve_alias(type);
+    return resolved ? resolved->alignment : 0;
 }
 
 Type *type_resolve(AstNode *type_node, SymbolTable *symbol_table)

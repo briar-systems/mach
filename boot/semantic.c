@@ -1764,7 +1764,7 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
         return false;
     }
 
-    AstNode *receiver_node      = stmt->fun_stmt.method_receiver;
+    AstNode *receiver_node       = stmt->fun_stmt.method_receiver;
     bool     receiver_is_pointer = false;
 
     while (receiver_node && receiver_node->kind == AST_TYPE_PTR)
@@ -1805,7 +1805,9 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
         return false;
     }
 
-    if (owner_sym->home_scope != ctx->module_scope)
+    Scope *allowed_scope = ctx->module_scope ? ctx->module_scope : ctx->global_scope;
+
+    if (owner_sym->home_scope != allowed_scope)
     {
         const char *owner_module = owner_sym->module_name ? owner_sym->module_name : "<unknown>";
         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "cannot define method for type '%s' from module '%s'", owner_name, owner_module);
@@ -2360,8 +2362,11 @@ static bool pass_b_resolve_alias_visitor(SemanticDriver *driver, const AnalysisC
         Type *resolved = resolve_type_in_context(driver, ctx, stmt->def_stmt.type);
         if (resolved)
         {
-            stmt->symbol->type->alias.target = resolved;
-            stmt->type                       = resolved;
+            Type *alias_type         = stmt->symbol->type;
+            alias_type->alias.target = resolved;
+            alias_type->size         = type_sizeof(resolved);
+            alias_type->alignment    = type_alignof(resolved);
+            stmt->type               = resolved;
             return true;
         }
         return false;
@@ -2411,6 +2416,29 @@ static bool pass_b_resolve_var_type_visitor(SemanticDriver *driver, const Analys
     return true;
 }
 
+static bool run_pass_b_stage(SemanticDriver *driver, const AnalysisContext *entry_ctx, AstNode *entry_root, TopLevelVisitor visitor)
+{
+    bool success = true;
+
+    FOR_EACH_MODULE(&driver->module_manager, module)
+    {
+        if (!module->ast || module->ast->kind != AST_PROGRAM || !module->symbols || !module->symbols->global_scope)
+            continue;
+
+        Scope          *module_scope = module->symbols->global_scope;
+        AnalysisContext module_ctx   = analysis_context_create(module_scope, module_scope, module->name, module->file_path);
+
+        success = visit_top_level_list(driver, &module_ctx, module->ast->program.stmts, visitor) && success;
+    }
+
+    if (entry_root && entry_root->kind == AST_PROGRAM)
+    {
+        success = visit_top_level_list(driver, entry_ctx, entry_root->program.stmts, visitor) && success;
+    }
+
+    return success;
+}
+
 static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *root)
 {
     if (!root || root->kind != AST_PROGRAM)
@@ -2418,11 +2446,11 @@ static bool analyze_pass_b_signatures(SemanticDriver *driver, const AnalysisCont
 
     bool success = true;
 
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_alias_visitor) && success;
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_struct_fields_visitor) && success;
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_union_fields_visitor) && success;
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_fun_signature_visitor) && success;
-    success = visit_top_level_list(driver, ctx, root->program.stmts, pass_b_resolve_var_type_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_alias_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_struct_fields_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_union_fields_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_fun_signature_visitor) && success;
+    success = run_pass_b_stage(driver, ctx, root, pass_b_resolve_var_type_visitor) && success;
 
     return success;
 }
@@ -3158,6 +3186,21 @@ static Symbol *lookup_in_scope_chain(Scope *current_scope, Scope *module_scope, 
             return sym;
     }
 
+    // fallback: search in module alias scopes visible from module_scope
+    // this handles method lookups on types from imported modules
+    if (module_scope)
+    {
+        for (Symbol *mod_sym = module_scope->symbols; mod_sym; mod_sym = mod_sym->next)
+        {
+            if (mod_sym->kind == SYMBOL_MODULE && mod_sym->module.scope)
+            {
+                Symbol *sym = symbol_lookup_scope(mod_sym->module.scope, name);
+                if (sym)
+                    return sym;
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -3262,8 +3305,10 @@ static bool is_lvalue_expr(const AstNode *expr)
 
 static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
 {
-    Type *left  = analyze_expr(driver, ctx, expr->binary_expr.left);
-    Type *right = analyze_expr(driver, ctx, expr->binary_expr.right);
+    Type *left = analyze_expr(driver, ctx, expr->binary_expr.left);
+
+    // for assignment, pass LHS type as hint to RHS for proper literal typing
+    Type *right = (expr->binary_expr.op == TOKEN_EQUAL) ? analyze_expr_with_hint(driver, ctx, expr->binary_expr.right, left) : analyze_expr(driver, ctx, expr->binary_expr.right);
 
     if (!left || !right)
         return NULL;
@@ -3371,6 +3416,34 @@ static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *
     // comparison operators
     if (op == TOKEN_EQUAL_EQUAL || op == TOKEN_BANG_EQUAL || op == TOKEN_LESS || op == TOKEN_LESS_EQUAL || op == TOKEN_GREATER || op == TOKEN_GREATER_EQUAL)
     {
+        bool is_equality = (op == TOKEN_EQUAL_EQUAL || op == TOKEN_BANG_EQUAL);
+
+        // reject composite types (structs, arrays, unions) for all comparisons
+        if (left->kind == TYPE_STRUCT || left->kind == TYPE_ARRAY || left->kind == TYPE_UNION)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "illegal composite type in comparison");
+            return NULL;
+        }
+
+        if (right->kind == TYPE_STRUCT || right->kind == TYPE_ARRAY || right->kind == TYPE_UNION)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "illegal composite type in comparison");
+            return NULL;
+        }
+
+        // for ordering comparisons (<, <=, >, >=), require numeric types or pointers
+        if (!is_equality)
+        {
+            bool left_orderable  = type_is_numeric(left) || type_is_pointer_like(left);
+            bool right_orderable = type_is_numeric(right) || type_is_pointer_like(right);
+
+            if (!left_orderable || !right_orderable)
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "ordering comparison requires numeric or pointer operands");
+                return NULL;
+            }
+        }
+
         expr->type = type_u8(); // boolean result as u8
         return expr->type;
     }
@@ -3803,6 +3876,28 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
                     }
                 }
             }
+            else if (method_sym->func.method_receiver_is_pointer && receiver_type->kind != TYPE_POINTER)
+            {
+                // fallback: use stored method receiver info if function type not yet resolved
+                // create address-of operation
+                AstNode *addr_of = malloc(sizeof(AstNode));
+                ast_node_init(addr_of, AST_EXPR_UNARY);
+                addr_of->token           = NULL; // don't share token to avoid double-free
+                addr_of->unary_expr.op   = TOKEN_QUESTION;
+                addr_of->unary_expr.expr = receiver;
+                receiver_arg             = addr_of;
+            }
+            else if (!method_sym->func.method_receiver_is_pointer && receiver_type->kind == TYPE_POINTER)
+            {
+                // fallback: use stored method receiver info if function type not yet resolved
+                // create dereference operation
+                AstNode *deref = malloc(sizeof(AstNode));
+                ast_node_init(deref, AST_EXPR_UNARY);
+                deref->token           = NULL; // don't share token to avoid double-free
+                deref->unary_expr.op   = TOKEN_AT;
+                deref->unary_expr.expr = receiver;
+                receiver_arg           = deref;
+            }
 
             // transform method call: prepend receiver as first argument
             if (!expr->call_expr.args)
@@ -3919,7 +4014,7 @@ normal_call_analysis:; // label must be followed by a statement
 
     if (base_sym && base_sym->kind == SYMBOL_FUNC && base_sym->func.is_method && !expr->call_expr.is_method_call)
     {
-        const char *owner_name_for_error = (base_sym->func.method_owner && base_sym->func.method_owner->name) ? base_sym->func.method_owner->name : "<type>";
+        const char *owner_name_for_error  = (base_sym->func.method_owner && base_sym->func.method_owner->name) ? base_sym->func.method_owner->name : "<type>";
         const char *method_name_for_error = NULL;
 
         if (base_sym->decl && base_sym->decl->kind == AST_STMT_FUN && base_sym->decl->fun_stmt.name)
@@ -4083,10 +4178,17 @@ static Type *analyze_field_expr(SemanticDriver *driver, const AnalysisContext *c
                 member->type = member->import_origin->type;
             if (member->import_origin && member->import_origin->type)
                 target = member->import_origin;
+
+            // ensure const value is propagated to the target symbol
             if (!member->has_const_i64 && member->import_origin && member->import_origin->has_const_i64)
             {
                 member->has_const_i64 = true;
                 member->const_i64     = member->import_origin->const_i64;
+            }
+            if (!target->has_const_i64 && member->has_const_i64)
+            {
+                target->has_const_i64 = true;
+                target->const_i64     = member->const_i64;
             }
 
             expr->field_expr.object->symbol = sym;
@@ -4200,11 +4302,11 @@ static Type *analyze_cast_expr(SemanticDriver *driver, const AnalysisContext *ct
         valid = true;
 
     // pointer to pointer (always allowed)
-    else if (source->kind == TYPE_POINTER && target->kind == TYPE_POINTER)
+    else if (type_is_pointer_like(source) && type_is_pointer_like(target))
         valid = true;
 
     // integer to pointer or pointer to integer (unsafe but allowed)
-    else if ((type_is_integer(source) && target->kind == TYPE_POINTER) || (source->kind == TYPE_POINTER && type_is_integer(target)))
+    else if ((type_is_integer(source) && type_is_pointer_like(target)) || (type_is_pointer_like(source) && type_is_integer(target)))
         valid = true;
 
     if (!valid)
@@ -4473,7 +4575,14 @@ static Type *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *c
     return expr->type;
 }
 
+static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
+
 static Type *analyze_comptime_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
+{
+    return analyze_comptime_expr_with_hint(driver, ctx, expr, NULL);
+}
+
+static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected)
 {
     if (!expr || expr->kind != AST_COMPTIME || !expr->comptime.inner)
     {
@@ -4500,13 +4609,13 @@ static Type *analyze_comptime_expr(SemanticDriver *driver, const AnalysisContext
             {
                 expr->lit_expr.kind    = TOKEN_LIT_INT;
                 expr->lit_expr.int_val = (long long)ct_value.u8_val;
-                expr->type             = type_u8();
+                expr->type             = (expected && type_is_integer(expected)) ? expected : type_u8();
             }
             else if (ct_value.kind == COMPTIME_U64)
             {
                 expr->lit_expr.kind    = TOKEN_LIT_INT;
                 expr->lit_expr.int_val = (long long)ct_value.u64_val;
-                expr->type             = type_u64();
+                expr->type             = (expected && type_is_integer(expected)) ? expected : type_u64();
             }
             else if (ct_value.kind == COMPTIME_STRING)
             {
@@ -4555,13 +4664,13 @@ static Type *analyze_comptime_expr(SemanticDriver *driver, const AnalysisContext
                 {
                     expr->lit_expr.kind    = TOKEN_LIT_INT;
                     expr->lit_expr.int_val = (long long)ct_value.u8_val;
-                    expr->type             = type_u8();
+                    expr->type             = (expected && type_is_integer(expected)) ? expected : type_u8();
                 }
                 else if (ct_value.kind == COMPTIME_U64)
                 {
                     expr->lit_expr.kind    = TOKEN_LIT_INT;
                     expr->lit_expr.int_val = (long long)ct_value.u64_val;
-                    expr->type             = type_u64();
+                    expr->type             = (expected && type_is_integer(expected)) ? expected : type_u64();
                 }
                 else if (ct_value.kind == COMPTIME_STRING)
                 {
@@ -4638,6 +4747,8 @@ static Type *analyze_expr_with_hint(SemanticDriver *driver, const AnalysisContex
         if (expected && !expr->struct_expr.type)
             expr->type = expected;
         return analyze_struct_expr(driver, ctx, expr);
+    case AST_COMPTIME:
+        return analyze_comptime_expr_with_hint(driver, ctx, expr, expected);
     default:
         return analyze_expr(driver, ctx, expr);
     }
@@ -5600,27 +5711,10 @@ bool semantic_driver_analyze(SemanticDriver *driver, AstNode *root, const char *
         return false;
     }
 
-    // Resolve signatures in entry module
     if (!analyze_pass_b_signatures(driver, &ctx, root))
     {
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, NULL, module_path, "signature resolution pass failed for entry module");
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, NULL, module_path, "signature resolution pass failed");
         success = false;
-    }
-
-    // Resolve signatures in all loaded modules
-    FOR_EACH_MODULE(&driver->module_manager, module)
-    {
-        if (success && module->ast && module->ast->kind == AST_PROGRAM)
-        {
-            Scope          *module_scope = module->symbols->global_scope;
-            AnalysisContext module_ctx   = analysis_context_create(module_scope, module_scope, module->name, module->file_path);
-
-            if (!analyze_pass_b_signatures(driver, &module_ctx, module->ast))
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, NULL, module->name, "signature resolution pass failed for module '%s'", module->name);
-                success = false;
-            }
-        }
     }
 
     if (!success)

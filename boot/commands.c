@@ -189,11 +189,11 @@ int mach_cmd_build(int argc, char **argv)
                 // Set up target-based output directories
                 target_opts.obj_dir = config_resolve_obj_dir(config, project_root, current_target_name);
 
-                // Register project source directory as module alias
+                // Register project source directory as module alias (use id for module prefix)
                 char *src_dir = config_resolve_src_dir(config, project_root);
                 if (src_dir)
                 {
-                    build_options_add_alias(&target_opts, config->name, src_dir);
+                    build_options_add_alias(&target_opts, config->id, src_dir);
                     free(src_dir);
                 }
 
@@ -289,11 +289,11 @@ int mach_cmd_build(int argc, char **argv)
         opts.target_name = target_name; // store target name for directory structure
 
         // Step 4.5: Register project source directory as module alias
-        // this ensures entrypoint and project files are namespaced under the project name
+        // this ensures entrypoint and project files are namespaced under the project id
         char *src_dir = config_resolve_src_dir(config, project_root);
         if (src_dir)
         {
-            build_options_add_alias(&opts, config->name, src_dir);
+            build_options_add_alias(&opts, config->id, src_dir);
             free(src_dir);
         }
 

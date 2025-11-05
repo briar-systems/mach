@@ -1555,7 +1555,7 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
             return NULL;
         }
 
-        ast_list_append(node->fun_stmt.params, receiver_param);
+        ast_list_prepend(node->fun_stmt.params, receiver_param);
     }
 
     if (!parser_check(parser, TOKEN_R_PAREN))

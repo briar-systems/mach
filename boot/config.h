@@ -38,7 +38,8 @@ typedef struct DepSpec
 // project configuration
 typedef struct ProjectConfig
 {
-    char *name;      // project name
+    char *id;        // project id (used for module prefix and soft uniqueness)
+    char *name;      // project name (canonical, human-readable)
     char *version;   // project version
     char *main_file; // main source file (relative to src_dir) - deprecated, use target entrypoint
     char *target;    // target name (or "native" to auto-detect, or "all")
