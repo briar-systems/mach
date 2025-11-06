@@ -3876,6 +3876,22 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
 
                     Symbol *generic_method = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, generic_method_name);
 
+                    /*
+                     * If the generic method wasn't found via the usual scope chain lookup
+                     * (which respects imports), try to locate it directly in the module
+                     * / home scope where the generic type was declared. This allows
+                     * method lookup for generic methods to succeed even when the
+                     * declaring module wasn't explicitly imported into the current
+                     * module — the method is associated with the generic type and
+                     * should be discoverable from its declaration site.
+                     */
+                    if (!generic_method && generic_type_sym->home_scope)
+                    {
+                        Symbol *direct = symbol_lookup_scope(generic_type_sym->home_scope, generic_method_name);
+                        if (direct)
+                            generic_method = direct;
+                    }
+
                     if (!generic_method)
                     {
                         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "generic method '%s' not found in any scope", generic_method_name);
