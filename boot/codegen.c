@@ -372,6 +372,111 @@ static bool codegen_eval_const_i64(CodegenContext *ctx, AstNode *expr, int64_t *
 
                 return false;
             }
+
+            if (strcmp(name, "min") == 0)
+            {
+                if (expr->call_expr.args->count != 1)
+                {
+                    return false;
+                }
+
+                AstNode *arg = expr->call_expr.args->items[0];
+                if (!arg || !arg->type)
+                {
+                    return false;
+                }
+
+                Type *arg_type = type_resolve_alias(arg->type);
+                if (!arg_type)
+                {
+                    return false;
+                }
+
+                switch (arg_type->kind)
+                {
+                case TYPE_U8:
+                case TYPE_U16:
+                case TYPE_U32:
+                case TYPE_U64:
+                    *out = 0;
+                    return true;
+                case TYPE_I8:
+                    *out = -128;
+                    return true;
+                case TYPE_I16:
+                    *out = -32768;
+                    return true;
+                case TYPE_I32:
+                    *out = -2147483648LL;
+                    return true;
+                case TYPE_I64:
+                    *out = (int64_t)(1ULL << 63); // -9223372036854775808
+                    return true;
+                default:
+                    return false;
+                }
+            }
+
+            if (strcmp(name, "max") == 0)
+            {
+                if (expr->call_expr.args->count != 1)
+                {
+                    return false;
+                }
+
+                AstNode *arg = expr->call_expr.args->items[0];
+                if (!arg || !arg->type)
+                {
+                    return false;
+                }
+
+                Type *arg_type = type_resolve_alias(arg->type);
+                if (!arg_type)
+                {
+                    return false;
+                }
+
+                switch (arg_type->kind)
+                {
+                case TYPE_U8:
+                    *out = 255;
+                    return true;
+                case TYPE_U16:
+                    *out = 65535;
+                    return true;
+                case TYPE_U32:
+                    *out = 4294967295U;
+                    return true;
+                case TYPE_U64:
+                    *out = (int64_t)0xFFFFFFFFFFFFFFFFULL;
+                    return true;
+                case TYPE_I8:
+                    *out = 127;
+                    return true;
+                case TYPE_I16:
+                    *out = 32767;
+                    return true;
+                case TYPE_I32:
+                    *out = 2147483647;
+                    return true;
+                case TYPE_I64:
+                    *out = 9223372036854775807LL;
+                    return true;
+                default:
+                    return false;
+                }
+            }
+
+            if (strcmp(name, "iota") == 0)
+            {
+                if (expr->call_expr.args->count != 0)
+                {
+                    return false;
+                }
+
+                *out = (int64_t)ctx->iota_counter++;
+                return true;
+            }
         }
         return false;
 
