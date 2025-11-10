@@ -75,6 +75,7 @@ int lexer_get_pos_line_offset(Lexer *lexer, int pos)
         if (lexer->source[i] == '\n')
         {
             offset = 0;
+            continue;
         }
 
         offset++;

@@ -3985,6 +3985,12 @@ LLVMValueRef codegen_expr_field(CodegenContext *ctx, AstNode *expr)
 
         if (can_gep)
         {
+            if (object_is_pointer && (LLVMIsAAllocaInst(object) || LLVMIsAGlobalVariable(object) || LLVMIsAGetElementPtrInst(object)))
+            {
+                LLVMTypeRef ptr_ty = codegen_get_llvm_type(ctx, original_type);
+                object             = LLVMBuildLoad2(ctx->builder, ptr_ty, object, "array_ptr");
+            }
+
             // return GEP to field (works for both reading and writing)
             LLVMTypeRef  llvm_i32  = LLVMInt32TypeInContext(ctx->context);
             LLVMTypeRef  array_ty  = codegen_get_llvm_type(ctx, object_type);
