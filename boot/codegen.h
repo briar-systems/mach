@@ -98,6 +98,9 @@ struct CodegenContext
 
     // specialization cache for cross-module generic instantiation
     struct SpecializationCache *spec_cache;
+
+    // compile-time intrinsics state
+    unsigned long iota_counter; // for $iota() - incrementing compile-time counter
 };
 
 // context lifecycle

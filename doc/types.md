@@ -140,6 +140,49 @@ For more on array and slice expressions and semantics, see [Arrays and Slices](a
 
 ---
 
+## Strings
+
+String data in Mach is represented with slices of bytes. The standard library module `std.types.string` provides helpers for both borrowed views and owned buffers.
+
+- `char` is an alias of `u8` for individual code units.
+- `str` is an alias of `[]char`. It behaves like any other slice and offers utility methods such as `.equals`, `.starts_with`, `.contains`, `.index_of`, `.clone()`, and `.as_cstr()` for working with string data. The `.clone()` helper returns `Result[String, str]` (from `std.types.result`) so you can surface allocation failures to callers.
+- `cstr` is defined as `*char` for interoperating with null-terminated buffers. Methods like `.len()` and `.to_str()` bridge between `cstr` and `str`.
+- `String` is an owning buffer type (a thin alias of `str`) that is managed through pointer-receiver methods on `*String`.
+
+Typical usage keeps the owning storage in a `String` and consumes views as `str`:
+
+```
+use std.types.option;
+use std.types.string;
+
+fun build_message() {
+    var view: str = "mach";
+    if (view.starts_with("ma")) {
+        # handle match
+    }
+
+    var buf: String;
+    val init_err: Option[str] = buf.init(32);
+    if (init_err.is_some()) {
+        ret;  # allocation failed; error message in init_err.unwrap()
+    }
+
+    if (buf.append(view) == false) {
+        buf.dnit();
+        ret;
+    }
+
+    val assembled: str = buf.as_str();
+    # use 'assembled' while 'buf' remains alive
+
+    buf.dnit();  # release owned storage
+}
+```
+
+`String.init(len)` returns an `Option[str]` where `none` indicates success and `some` carries an error message on failure. Always pair successful `init` calls with `dnit()` to release memory. Methods such as `push`, `append`, `ensure_len`, `as_cstr`, and `clone` rely on the allocation helpers provided by `std.system.memory` (see [Pointers and Memory](pointers-and-memory.md)).
+
+---
+
 ## Composite types: records and unions
 
 Records and unions are composite types.

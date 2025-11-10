@@ -3544,6 +3544,79 @@ static Type *analyze_comptime_intrinsic(SemanticDriver *driver, const AnalysisCo
 {
     size_t arg_count = call_expr->call_expr.args ? call_expr->call_expr.args->count : 0;
 
+    if (strcmp(func_name, "min") == 0 || strcmp(func_name, "max") == 0)
+    {
+        if (arg_count != 1)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "%s expects exactly one argument (type)", func_name);
+            return NULL;
+        }
+
+        AstNode *arg      = call_expr->call_expr.args->items[0];
+        Type    *arg_type = NULL;
+
+        // check if argument is a type node
+        if (arg->kind >= AST_TYPE_NAME && arg->kind <= AST_TYPE_UNI)
+        {
+            arg_type  = resolve_type_in_context(driver, ctx, arg);
+            arg->type = arg_type;
+        }
+        // check if it's an identifier - try to resolve as a type name
+        else if (arg->kind == AST_EXPR_IDENT)
+        {
+            AstNode type_node                = {0};
+            type_node.kind                   = AST_TYPE_NAME;
+            type_node.type_name.name         = arg->ident_expr.name;
+            type_node.type_name.generic_args = NULL;
+
+            arg_type = resolve_type_in_context(driver, ctx, &type_node);
+
+            if (!arg_type || arg_type == type_error())
+            {
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "%s expects a numeric type, but '%s' is not a valid type", func_name, arg->ident_expr.name);
+                return NULL;
+            }
+
+            arg->type = arg_type;
+        }
+        else
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "%s expects a type argument", func_name);
+            return NULL;
+        }
+
+        if (!arg_type)
+            return NULL;
+
+        // resolve aliases to get the actual primitive type
+        arg_type = type_resolve_alias(arg_type);
+
+        // verify it's a numeric type
+        bool is_numeric = (arg_type->kind >= TYPE_U8 && arg_type->kind <= TYPE_I64) || (arg_type->kind >= TYPE_F16 && arg_type->kind <= TYPE_F64);
+        if (!is_numeric)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "%s requires a numeric type (integer or float)", func_name);
+            return NULL;
+        }
+
+        // return the same type as the argument for type safety
+        call_expr->type = arg_type;
+        return call_expr->type;
+    }
+
+    if (strcmp(func_name, "iota") == 0)
+    {
+        if (arg_count != 0)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, call_expr, ctx->file_path, "iota expects no arguments");
+            return NULL;
+        }
+
+        // iota returns u64 - it's an incrementing compile-time counter
+        call_expr->type = type_u64();
+        return call_expr->type;
+    }
+
     if (strcmp(func_name, "size_of") == 0 || strcmp(func_name, "align_of") == 0)
     {
         if (arg_count != 1)
@@ -3802,6 +3875,22 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
                     snprintf(generic_method_name, sizeof(generic_method_name), "%s__%s", generic_type_sym->name, method_name);
 
                     Symbol *generic_method = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, generic_method_name);
+
+                    /*
+                     * If the generic method wasn't found via the usual scope chain lookup
+                     * (which respects imports), try to locate it directly in the module
+                     * / home scope where the generic type was declared. This allows
+                     * method lookup for generic methods to succeed even when the
+                     * declaring module wasn't explicitly imported into the current
+                     * module — the method is associated with the generic type and
+                     * should be discoverable from its declaration site.
+                     */
+                    if (!generic_method && generic_type_sym->home_scope)
+                    {
+                        Symbol *direct = symbol_lookup_scope(generic_type_sym->home_scope, generic_method_name);
+                        if (direct)
+                            generic_method = direct;
+                    }
 
                     if (!generic_method)
                     {
@@ -4704,7 +4793,7 @@ static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const Analy
         {
             const char *func_name = inner->call_expr.func->ident_expr.name;
 
-            if (strcmp(func_name, "size_of") == 0 || strcmp(func_name, "align_of") == 0 || strcmp(func_name, "offset_of") == 0 || strcmp(func_name, "type_of") == 0)
+            if (strcmp(func_name, "size_of") == 0 || strcmp(func_name, "align_of") == 0 || strcmp(func_name, "offset_of") == 0 || strcmp(func_name, "type_of") == 0 || strcmp(func_name, "min") == 0 || strcmp(func_name, "max") == 0 || strcmp(func_name, "iota") == 0)
             {
                 // use the dedicated intrinsic handler - it modifies the CALL node in place
                 Type *result_type = analyze_comptime_intrinsic(driver, ctx, inner, func_name);

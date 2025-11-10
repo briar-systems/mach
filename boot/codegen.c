@@ -372,6 +372,111 @@ static bool codegen_eval_const_i64(CodegenContext *ctx, AstNode *expr, int64_t *
 
                 return false;
             }
+
+            if (strcmp(name, "min") == 0)
+            {
+                if (expr->call_expr.args->count != 1)
+                {
+                    return false;
+                }
+
+                AstNode *arg = expr->call_expr.args->items[0];
+                if (!arg || !arg->type)
+                {
+                    return false;
+                }
+
+                Type *arg_type = type_resolve_alias(arg->type);
+                if (!arg_type)
+                {
+                    return false;
+                }
+
+                switch (arg_type->kind)
+                {
+                case TYPE_U8:
+                case TYPE_U16:
+                case TYPE_U32:
+                case TYPE_U64:
+                    *out = 0;
+                    return true;
+                case TYPE_I8:
+                    *out = -128;
+                    return true;
+                case TYPE_I16:
+                    *out = -32768;
+                    return true;
+                case TYPE_I32:
+                    *out = -2147483648LL;
+                    return true;
+                case TYPE_I64:
+                    *out = (int64_t)(1ULL << 63); // -9223372036854775808
+                    return true;
+                default:
+                    return false;
+                }
+            }
+
+            if (strcmp(name, "max") == 0)
+            {
+                if (expr->call_expr.args->count != 1)
+                {
+                    return false;
+                }
+
+                AstNode *arg = expr->call_expr.args->items[0];
+                if (!arg || !arg->type)
+                {
+                    return false;
+                }
+
+                Type *arg_type = type_resolve_alias(arg->type);
+                if (!arg_type)
+                {
+                    return false;
+                }
+
+                switch (arg_type->kind)
+                {
+                case TYPE_U8:
+                    *out = 255;
+                    return true;
+                case TYPE_U16:
+                    *out = 65535;
+                    return true;
+                case TYPE_U32:
+                    *out = 4294967295U;
+                    return true;
+                case TYPE_U64:
+                    *out = (int64_t)0xFFFFFFFFFFFFFFFFULL;
+                    return true;
+                case TYPE_I8:
+                    *out = 127;
+                    return true;
+                case TYPE_I16:
+                    *out = 32767;
+                    return true;
+                case TYPE_I32:
+                    *out = 2147483647;
+                    return true;
+                case TYPE_I64:
+                    *out = 9223372036854775807LL;
+                    return true;
+                default:
+                    return false;
+                }
+            }
+
+            if (strcmp(name, "iota") == 0)
+            {
+                if (expr->call_expr.args->count != 0)
+                {
+                    return false;
+                }
+
+                *out = (int64_t)ctx->iota_counter++;
+                return true;
+            }
         }
         return false;
 
@@ -1158,6 +1263,8 @@ void codegen_context_init(CodegenContext *ctx, const char *module_name, bool no_
     ctx->current_vararg_array       = NULL;
     ctx->current_fixed_param_count  = 0;
     ctx->source_file                = NULL;
+
+    ctx->iota_counter = 0;
     ctx->source_lexer               = NULL;
 }
 
@@ -2912,6 +3019,129 @@ LLVMValueRef codegen_expr_call(CodegenContext *ctx, AstNode *expr)
             return value_ptr;
         }
 
+        // handle min() intrinsic - returns minimum value for numeric type
+        if (strcmp(func_name, "min") == 0)
+        {
+            if (!expr->call_expr.args || expr->call_expr.args->count != 1)
+            {
+                codegen_error(ctx, expr, "min() expects exactly one argument");
+                return NULL;
+            }
+
+            AstNode *arg      = expr->call_expr.args->items[0];
+            Type    *arg_type = type_resolve_alias(arg->type);
+
+            // generate min value based on type
+            LLVMTypeRef llvm_type = codegen_get_llvm_type(ctx, arg_type);
+            LLVMValueRef min_val  = NULL;
+
+            switch (arg_type->kind)
+            {
+            case TYPE_U8:
+            case TYPE_U16:
+            case TYPE_U32:
+            case TYPE_U64:
+                // unsigned min is always 0
+                min_val = LLVMConstInt(llvm_type, 0, false);
+                break;
+            case TYPE_I8:
+                min_val = LLVMConstInt(llvm_type, -128, true);
+                break;
+            case TYPE_I16:
+                min_val = LLVMConstInt(llvm_type, -32768, true);
+                break;
+            case TYPE_I32:
+                min_val = LLVMConstInt(llvm_type, -2147483648LL, true);
+                break;
+            case TYPE_I64:
+                min_val = LLVMConstInt(llvm_type, (1ULL << 63), true); // -9223372036854775808
+                break;
+            case TYPE_F16:
+            case TYPE_F32:
+            case TYPE_F64:
+                // for floats, return negative infinity or smallest representable value
+                min_val = LLVMConstRealOfString(llvm_type, "-inf");
+                break;
+            default:
+                codegen_error(ctx, expr, "min() requires a numeric type");
+                return NULL;
+            }
+
+            return min_val;
+        }
+
+        // handle max() intrinsic - returns maximum value for numeric type
+        if (strcmp(func_name, "max") == 0)
+        {
+            if (!expr->call_expr.args || expr->call_expr.args->count != 1)
+            {
+                codegen_error(ctx, expr, "max() expects exactly one argument");
+                return NULL;
+            }
+
+            AstNode *arg      = expr->call_expr.args->items[0];
+            Type    *arg_type = type_resolve_alias(arg->type);
+
+            // generate max value based on type
+            LLVMTypeRef llvm_type = codegen_get_llvm_type(ctx, arg_type);
+            LLVMValueRef max_val  = NULL;
+
+            switch (arg_type->kind)
+            {
+            case TYPE_U8:
+                max_val = LLVMConstInt(llvm_type, 255, false);
+                break;
+            case TYPE_U16:
+                max_val = LLVMConstInt(llvm_type, 65535, false);
+                break;
+            case TYPE_U32:
+                max_val = LLVMConstInt(llvm_type, 4294967295U, false);
+                break;
+            case TYPE_U64:
+                max_val = LLVMConstInt(llvm_type, 0xFFFFFFFFFFFFFFFFULL, false);
+                break;
+            case TYPE_I8:
+                max_val = LLVMConstInt(llvm_type, 127, true);
+                break;
+            case TYPE_I16:
+                max_val = LLVMConstInt(llvm_type, 32767, true);
+                break;
+            case TYPE_I32:
+                max_val = LLVMConstInt(llvm_type, 2147483647, true);
+                break;
+            case TYPE_I64:
+                max_val = LLVMConstInt(llvm_type, 9223372036854775807LL, true);
+                break;
+            case TYPE_F16:
+            case TYPE_F32:
+            case TYPE_F64:
+                // for floats, return positive infinity or largest representable value
+                max_val = LLVMConstRealOfString(llvm_type, "inf");
+                break;
+            default:
+                codegen_error(ctx, expr, "max() requires a numeric type");
+                return NULL;
+            }
+
+            return max_val;
+        }
+
+        // handle iota() intrinsic - compile-time incrementing counter
+        if (strcmp(func_name, "iota") == 0)
+        {
+            if (!expr->call_expr.args || expr->call_expr.args->count != 0)
+            {
+                codegen_error(ctx, expr, "iota() expects no arguments");
+                return NULL;
+            }
+
+            // increment and return the iota counter
+            unsigned long iota_value = ctx->iota_counter++;
+            expr->type               = type_u64();
+
+            return LLVMConstInt(LLVMInt64TypeInContext(ctx->context), iota_value, false);
+        }
+
         // handle size_of() intrinsic
         if (strcmp(func_name, "size_of") == 0)
         {
@@ -3755,6 +3985,12 @@ LLVMValueRef codegen_expr_field(CodegenContext *ctx, AstNode *expr)
 
         if (can_gep)
         {
+            if (object_is_pointer && (LLVMIsAAllocaInst(object) || LLVMIsAGlobalVariable(object) || LLVMIsAGetElementPtrInst(object)))
+            {
+                LLVMTypeRef ptr_ty = codegen_get_llvm_type(ctx, original_type);
+                object             = LLVMBuildLoad2(ctx->builder, ptr_ty, object, "array_ptr");
+            }
+
             // return GEP to field (works for both reading and writing)
             LLVMTypeRef  llvm_i32  = LLVMInt32TypeInContext(ctx->context);
             LLVMTypeRef  array_ty  = codegen_get_llvm_type(ctx, object_type);

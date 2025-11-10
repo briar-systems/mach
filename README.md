@@ -83,7 +83,7 @@ use std.types.string;
 use console: std.io.console;
 
 $main.symbol = "main";
-fun main(args: []string) i64 {
+fun main(args: []str) i64 {
     console.print("Hello, World!\n");
     ret 0;
 }
@@ -106,7 +106,7 @@ fun fibr(n: i64) i64 {
 }
 
 $main.symbol = "main";
-fun main(args: []string) i64 {
+fun main(args: []str) i64 {
     var max: i64 = 10;
     console.print("fib(%d) = %d\n", max, fibr(max));
     ret 0;
@@ -130,7 +130,7 @@ fun fact(n: i64) i64 {
 }
 
 $main.symbol = "main";
-fun main(args: []string) i64 {
+fun main(args: []str) i64 {
     var max: i64 = 10;
     console.print("fact(%d) = %d\n", max, fact(max));
     ret 0;

@@ -2815,8 +2815,8 @@ AstNode *parser_parse_expr_atom(Parser *parser)
         Token dollar_token = *parser->current;
         parser_advance(parser);
 
-        // Parse the expression/identifier after $
-        AstNode *inner = parser_parse_expr(parser);
+        // Parse the prefix expression after $ (not full expression with binary ops)
+        AstNode *inner = parser_parse_expr_prefix(parser);
         if (!inner)
         {
             return NULL;
