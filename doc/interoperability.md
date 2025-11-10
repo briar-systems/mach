@@ -158,6 +158,8 @@ fun demo() {
 }
 ```
 
+Note: For purely Mach-side code, prefer the helpers in `std.system.memory` (e.g., `mem.raw_copy`, `mem.raw_zero`) instead of binding to `memcpy`/`memset` explicitly.
+
 Working with external globals:
 ```/dev/null/interop.mach#L1-18
 # Example global pointer

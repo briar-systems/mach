@@ -37,7 +37,7 @@ Forms:
   ```
   Public symbols from the imported module are available directly in the current module’s scope:
   ```
-  fun main(args: []string) i64 {  # 'string' came from std.types.string
+  fun main(args: []str) i64 {     # 'str' came from std.types.string
       ret dispatch(args);         # 'dispatch' came from commands
   }
   ```
@@ -106,8 +106,8 @@ When a module is imported with an alias, refer to its public symbols via `alias.
 
 - Types:
   ```
-  use string: std.types.string;
-  val msg: string = "ok";
+  use strings: std.types.string;
+  val msg: strings.str = "ok";
   ```
 
 - Qualified type names in type positions:
@@ -152,7 +152,7 @@ Unaliased import and direct usage:
 use std.types.string;
 use commands;
 
-fun main(args: []string) i64 {
+fun main(args: []str) i64 {
     ret dispatch(args);
 }
 ```
@@ -171,7 +171,7 @@ Combining both:
 use std.types.string;
 use console: std.io.console;
 
-pub fun greet(name: string) {
+pub fun greet(name: str) {
     console.print("hello, %s\n", name);
 }
 ```

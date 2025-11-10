@@ -158,6 +158,40 @@ See [Arrays and Slices](arrays-and-slices.md) for full details.
 
 See [Records and Unions](records-and-unions.md).
 
+## Allocation helpers in `std.system.memory`
+
+The standard library module `std.system.memory` complements raw pointers with generic allocation routines. These helpers operate on element counts (not byte counts) and return `Option` (from `std.types.option`) to signal failure.
+
+- `mem.allocate[T](count)` — allocates `count` elements of `T`, returning `some[*T]` on success or `none` on failure.
+- `mem.zallocate[T](count)` — same as `allocate` but zero-initialises the memory on success.
+- `mem.deallocate[T](ptr, count)` — releases a block previously obtained via the allocation helpers; passing `nil` or `count == 0` is a no-op.
+- `mem.reallocate[T](ptr, old_count, new_count)` — grows or shrinks an existing allocation, returning a fresh pointer on success.
+- `mem.fill`, `mem.copy`, and `mem.zero` — type-aware routines for writing repeated values, copying elements, or zeroing memory.
+- `mem.raw_fill`, `mem.raw_copy`, and `mem.raw_zero` — byte-oriented variants that accept raw `ptr` values.
+
+These helpers are used throughout the standard library, including the owning string type `String`. Pair successful allocations with the appropriate release (`deallocate` or higher-level destructors such as `String.dnit`) to avoid leaks.
+
+Typical usage checks the returned `Option` before touching the memory:
+
+```
+use mem: std.system.memory;
+use std.types.option;
+
+fun make_buffer(count: usize) Option[*u8] {
+    val storage: Option[*u8] = mem.zallocate[u8](count);
+    if (storage.is_none()) {
+        ret none[*u8]();
+    }
+
+    # storage.unwrap() is safe after the nil check
+    ret storage;
+}
+
+fun release_buffer(buf: *u8, count: usize) {
+    mem.deallocate[u8](buf, count);  # safe when buf == nil or count == 0
+}
+```
+
 ## Methods and pointer receivers
 
 Methods can declare either value or pointer receivers. Method calls apply auto address-of/deref to match the receiver type:
