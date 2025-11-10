@@ -68,7 +68,7 @@ If you are new to programming in general, then Mach may not be for you. There ar
 
 ## Building From Source
 
-The docs include a [getting started guide](doc/getting-started.md) that walks you through building the compiler from source and running your first Mach program.
+Before compiling the toolchain, follow the [getting started checklist](doc/getting-started.md) to install dependencies, export `MACH_HOME`, and configure `mach.toml` entries for the standard library. After that, the [language tour](doc/language-tour.md) provides a guided walkthrough of Mach syntax and usage, with deeper reference material available throughout the `doc/` directory.
 
 ## Simple Examples
 

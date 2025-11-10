@@ -10,6 +10,7 @@ This documentation is organized so that you can read it linearly or jump directl
 ## Table of Contents
 
 - Overview
+  - [Getting Started](getting-started.md)
   - [A Quick Tour](language-tour.md)
   - [Lexical Structure](lexical-structure.md)
 - Core Language
