@@ -2732,6 +2732,26 @@ LLVMValueRef codegen_expr_binary(CodegenContext *ctx, AstNode *expr)
     Type *lhs_type = type_resolve_alias(expr->binary_expr.left->type);
     Type *rhs_type = type_resolve_alias(expr->binary_expr.right->type);
 
+    // extend i1 comparison results to match declared type (u8)
+    if (lhs && lhs_type && type_is_integer(lhs_type))
+    {
+        LLVMTypeRef lhs_llvm_ty = LLVMTypeOf(lhs);
+        LLVMTypeRef expected_ty = codegen_get_llvm_type(ctx, lhs_type);
+        if (LLVMGetTypeKind(lhs_llvm_ty) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(lhs_llvm_ty) == 1)
+        {
+            lhs = LLVMBuildZExt(ctx->builder, lhs, expected_ty, "boolext");
+        }
+    }
+    if (rhs && rhs_type && type_is_integer(rhs_type))
+    {
+        LLVMTypeRef rhs_llvm_ty = LLVMTypeOf(rhs);
+        LLVMTypeRef expected_ty = codegen_get_llvm_type(ctx, rhs_type);
+        if (LLVMGetTypeKind(rhs_llvm_ty) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(rhs_llvm_ty) == 1)
+        {
+            rhs = LLVMBuildZExt(ctx->builder, rhs, expected_ty, "boolext");
+        }
+    }
+
     // handle integer type mismatches by extending smaller type
     if (type_is_integer(lhs_type) && type_is_integer(rhs_type) && lhs_type->kind != rhs_type->kind)
     {
@@ -2871,9 +2891,25 @@ LLVMValueRef codegen_expr_binary(CodegenContext *ctx, AstNode *expr)
     case TOKEN_CARET:
         return LLVMBuildXor(ctx->builder, lhs, rhs, "xor");
     case TOKEN_LESS_LESS:
-        return LLVMBuildShl(ctx->builder, lhs, rhs, "shl");
     case TOKEN_GREATER_GREATER:
-        return is_signed ? LLVMBuildAShr(ctx->builder, lhs, rhs, "shr") : LLVMBuildLShr(ctx->builder, lhs, rhs, "shr");
+    {
+        // llvm requires shift amount to match operand width
+        LLVMTypeRef lhs_ty = LLVMTypeOf(lhs);
+        LLVMTypeRef rhs_ty = LLVMTypeOf(rhs);
+        if (lhs_ty != rhs_ty)
+        {
+            unsigned lhs_bits = LLVMGetIntTypeWidth(lhs_ty);
+            unsigned rhs_bits = LLVMGetIntTypeWidth(rhs_ty);
+            if (rhs_bits > lhs_bits)
+                rhs = LLVMBuildTrunc(ctx->builder, rhs, lhs_ty, "shamt");
+            else if (rhs_bits < lhs_bits)
+                rhs = LLVMBuildZExt(ctx->builder, rhs, lhs_ty, "shamt");
+        }
+        if (expr->binary_expr.op == TOKEN_LESS_LESS)
+            return LLVMBuildShl(ctx->builder, lhs, rhs, "shl");
+        else
+            return is_signed ? LLVMBuildAShr(ctx->builder, lhs, rhs, "shr") : LLVMBuildLShr(ctx->builder, lhs, rhs, "shr");
+    }
         {
         default:
             codegen_error(ctx, expr, "unimplemented binary operator");
