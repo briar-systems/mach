@@ -3307,16 +3307,16 @@ static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *
 {
     Type *left = analyze_expr(driver, ctx, expr->binary_expr.left);
 
-    // for assignment, pass LHS type as hint to RHS for proper literal typing
-    Type *right = (expr->binary_expr.op == TOKEN_EQUAL) ? analyze_expr_with_hint(driver, ctx, expr->binary_expr.right, left) : analyze_expr(driver, ctx, expr->binary_expr.right);
+    // for assignment and shifts, pass LHS type as hint to RHS for proper literal typing
+    TokenKind op    = expr->binary_expr.op;
+    bool      hints = (op == TOKEN_EQUAL || op == TOKEN_LESS_LESS || op == TOKEN_GREATER_GREATER);
+    Type     *right = hints ? analyze_expr_with_hint(driver, ctx, expr->binary_expr.right, left) : analyze_expr(driver, ctx, expr->binary_expr.right);
 
     if (!left || !right)
         return NULL;
 
     left  = type_resolve_alias(left);
     right = type_resolve_alias(right);
-
-    TokenKind op        = expr->binary_expr.op;
     bool      left_ptr  = type_is_pointer_like(left);
     bool      right_ptr = type_is_pointer_like(right);
 
@@ -3533,6 +3533,17 @@ static Type *analyze_unary_expr(SemanticDriver *driver, const AnalysisContext *c
             return NULL;
         }
         expr->type = type_pointer_create(operand);
+        return expr->type;
+    }
+
+    if (op == TOKEN_TILDE) // bitwise not (~expr)
+    {
+        if (!type_is_integer(operand))
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "bitwise not requires integer operand");
+            return NULL;
+        }
+        expr->type = operand;
         return expr->type;
     }
 
@@ -5314,6 +5325,9 @@ static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisCon
             return true;
         case TOKEN_PLUS:
             *out_value = operand;
+            return true;
+        case TOKEN_TILDE:
+            *out_value = ~operand;
             return true;
         default:
             diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported unary operator in '$if' condition");
