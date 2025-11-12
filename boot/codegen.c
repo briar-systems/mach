@@ -11,6 +11,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#ifndef PATH_MAX
+#define PATH_MAX 260
+#endif
+#endif
+
 static LLVMValueRef    codegen_load_rvalue(CodegenContext *ctx, LLVMValueRef value, Type *type, AstNode *source_expr);
 static void            codegen_debug_init(CodegenContext *ctx);
 static void            codegen_debug_finalize(CodegenContext *ctx);
@@ -532,10 +539,17 @@ static void codegen_debug_init(CodegenContext *ctx)
 
     char  resolved[PATH_MAX];
     char *full_path = NULL;
+#ifdef _WIN32
+    if (_fullpath(resolved, source_path, PATH_MAX))
+        full_path = strdup(resolved);
+    else
+        full_path = strdup(source_path);
+#else
     if (realpath(source_path, resolved))
         full_path = strdup(resolved);
     else
         full_path = strdup(source_path);
+#endif
 
     if (!full_path)
     {
@@ -1265,7 +1279,7 @@ void codegen_context_init(CodegenContext *ctx, const char *module_name, bool no_
     ctx->source_file                = NULL;
 
     ctx->iota_counter = 0;
-    ctx->source_lexer               = NULL;
+    ctx->source_lexer = NULL;
 }
 
 void codegen_context_dnit(CodegenContext *ctx)
@@ -2333,7 +2347,7 @@ LLVMValueRef codegen_stmt_if(CodegenContext *ctx, AstNode *stmt)
             return NULL;
         }
         cond_value = codegen_load_if_needed(ctx, cond_value, stmt->cond_stmt.cond->type, stmt->cond_stmt.cond);
-        Type *ct = type_resolve_alias(stmt->cond_stmt.cond->type);
+        Type *ct   = type_resolve_alias(stmt->cond_stmt.cond->type);
         if (type_is_integer(ct) || type_is_pointer_like(ct))
         {
             LLVMValueRef zero = LLVMConstNull(LLVMTypeOf(cond_value));
@@ -3068,8 +3082,8 @@ LLVMValueRef codegen_expr_call(CodegenContext *ctx, AstNode *expr)
             Type    *arg_type = type_resolve_alias(arg->type);
 
             // generate min value based on type
-            LLVMTypeRef llvm_type = codegen_get_llvm_type(ctx, arg_type);
-            LLVMValueRef min_val  = NULL;
+            LLVMTypeRef  llvm_type = codegen_get_llvm_type(ctx, arg_type);
+            LLVMValueRef min_val   = NULL;
 
             switch (arg_type->kind)
             {
@@ -3119,8 +3133,8 @@ LLVMValueRef codegen_expr_call(CodegenContext *ctx, AstNode *expr)
             Type    *arg_type = type_resolve_alias(arg->type);
 
             // generate max value based on type
-            LLVMTypeRef llvm_type = codegen_get_llvm_type(ctx, arg_type);
-            LLVMValueRef max_val  = NULL;
+            LLVMTypeRef  llvm_type = codegen_get_llvm_type(ctx, arg_type);
+            LLVMValueRef max_val   = NULL;
 
             switch (arg_type->kind)
             {
@@ -3836,13 +3850,13 @@ LLVMValueRef codegen_load_if_needed(CodegenContext *ctx, LLVMValueRef value, Typ
         return value;
     }
 
-    LLVMValueRef base_value   = codegen_strip_pointer_casts(value);
-    bool         is_alloca    = LLVMIsAAllocaInst(base_value);
-    bool         is_global    = LLVMIsAGlobalVariable(base_value);
-    bool         is_gep       = LLVMIsAGetElementPtrInst(base_value);
+    LLVMValueRef base_value = codegen_strip_pointer_casts(value);
+    bool         is_alloca  = LLVMIsAAllocaInst(base_value);
+    bool         is_global  = LLVMIsAGlobalVariable(base_value);
+    bool         is_gep     = LLVMIsAGetElementPtrInst(base_value);
     if (!is_gep && LLVMIsAConstantExpr(base_value) && LLVMGetConstOpcode(base_value) == LLVMGetElementPtr)
         is_gep = true;
-    bool         value_is_memory = is_alloca || is_global || is_gep;
+    bool value_is_memory = is_alloca || is_global || is_gep;
 
     if (type->kind == TYPE_PTR || type->kind == TYPE_POINTER)
     {

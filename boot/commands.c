@@ -6,6 +6,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#ifndef PATH_MAX
+#define PATH_MAX 260
+#endif
+#endif
+
 void mach_print_usage(const char *program_name)
 {
     fprintf(stderr, "usage: %s build <path|file> [options]\n", program_name);
@@ -65,7 +72,13 @@ int mach_cmd_build(int argc, char **argv)
     if (is_project_build)
     {
         // Step 1: Load project configuration
+#ifdef _WIN32
+        char resolved[PATH_MAX];
+        if (_fullpath(resolved, input_arg, PATH_MAX))
+            project_root = strdup(resolved);
+#else
         project_root = realpath(input_arg, NULL);
+#endif
         if (!project_root)
         {
             fprintf(stderr, "error: could not resolve path '%s'\n", input_arg);
@@ -186,6 +199,12 @@ int mach_cmd_build(int argc, char **argv)
                 target_opts.debug_info  = 1;
                 target_opts.target_name = current_target_name;
 
+                // Add target link libraries
+                for (int j = 0; j < current_target->link_lib_count; j++)
+                {
+                    build_options_add_link_object(&target_opts, current_target->link_libraries[j]);
+                }
+
                 // Set up target-based output directories
                 target_opts.obj_dir = config_resolve_obj_dir(config, project_root, current_target_name);
 
@@ -287,6 +306,12 @@ int mach_cmd_build(int argc, char **argv)
         opts.no_pie      = target->no_pie;
         opts.debug_info  = 1;           // default to debug info
         opts.target_name = target_name; // store target name for directory structure
+
+        // Add target link libraries
+        for (int i = 0; i < target->link_lib_count; i++)
+        {
+            build_options_add_link_object(&opts, target->link_libraries[i]);
+        }
 
         // Step 4.5: Register project source directory as module alias
         // this ensures entrypoint and project files are namespaced under the project id
