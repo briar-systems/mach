@@ -3482,14 +3482,23 @@ static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *
     return NULL;
 }
 
-static Type *analyze_unary_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
+static Type *analyze_unary_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected)
 {
-    Type *operand = analyze_expr(driver, ctx, expr->unary_expr.expr);
+    // for unary +/-, pass the hint through to the operand (e.g., "-86400" with hint i64 should type the literal as i64)
+    TokenKind op = expr->unary_expr.op;
+    Type *operand = NULL;
+    if ((op == TOKEN_MINUS || op == TOKEN_PLUS) && expected && type_is_numeric(expected))
+    {
+        operand = analyze_expr_with_hint(driver, ctx, expr->unary_expr.expr, expected);
+    }
+    else
+    {
+        operand = analyze_expr(driver, ctx, expr->unary_expr.expr);
+    }
+    
     if (!operand)
         return NULL;
     operand = type_resolve_alias(operand);
-
-    TokenKind op = expr->unary_expr.op;
 
     if (op == TOKEN_MINUS || op == TOKEN_PLUS)
     {
@@ -3550,6 +3559,11 @@ static Type *analyze_unary_expr(SemanticDriver *driver, const AnalysisContext *c
 
     diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported unary operator");
     return NULL;
+}
+
+static Type *analyze_unary_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
+{
+    return analyze_unary_expr_with_hint(driver, ctx, expr, NULL);
 }
 
 static Type *analyze_comptime_intrinsic(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *call_expr, const char *func_name)
@@ -4865,6 +4879,8 @@ static Type *analyze_expr_with_hint(SemanticDriver *driver, const AnalysisContex
         return analyze_lit_expr_with_hint(driver, ctx, expr, expected);
     case AST_EXPR_NULL:
         return analyze_null_expr_with_hint(driver, ctx, expr, expected);
+    case AST_EXPR_UNARY:
+        return analyze_unary_expr_with_hint(driver, ctx, expr, expected);
     case AST_EXPR_ARRAY:
         return analyze_array_expr(driver, ctx, expr);
     case AST_EXPR_STRUCT:
