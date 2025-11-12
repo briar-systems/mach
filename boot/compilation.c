@@ -6,7 +6,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
+
+#ifdef _WIN32
+#include <windows.h>
+#ifndef PATH_MAX
+#define PATH_MAX 260
+#endif
+
+// windows realpath equivalent
+static char *realpath_windows(const char *path, char *resolved)
+{
+    char buffer[PATH_MAX];
+    if (!_fullpath(buffer, path, PATH_MAX))
+        return NULL;
+
+    if (resolved)
+    {
+        strcpy(resolved, buffer);
+        return resolved;
+    }
+    return strdup(buffer);
+}
+#define realpath realpath_windows
+#endif
 
 static void string_vec_push(StringVec *v, const char *s)
 {
@@ -205,13 +230,13 @@ bool compilation_context_init(CompilationContext *ctx, BuildOptions *opts)
         fprintf(stderr, "error: failed to create semantic driver\n");
         return false;
     }
-    
+
     if (opts)
     {
         ctx->driver->comptime_ctx.build_debug = opts->debug_info ? true : false;
         ctx->driver->comptime_ctx.opt_level   = opts->opt_level;
     }
-    
+
     return true;
 }
 
@@ -797,11 +822,18 @@ bool compilation_link(CompilationContext *ctx)
         return false;
     }
 
+#ifdef _WIN32
+    strcpy(cmd, "clang -nostartfiles -nostdlib -Wl,/subsystem:console -Wl,/entry:_start");
+#else
     strcpy(cmd, "cc -nostartfiles -nostdlib");
+#endif
     if (ctx->options->no_pie)
         strcat(cmd, " -no-pie");
     else
+#ifndef _WIN32
         strcat(cmd, " -pie");
+#endif
+    ;
     if (ctx->options->debug_info)
         strcat(cmd, " -g");
     if (ctx->options->debug_info)
@@ -819,7 +851,18 @@ bool compilation_link(CompilationContext *ctx)
     for (int i = 0; i < ctx->options->link_objects.count; i++)
     {
         strcat(cmd, " ");
+#ifdef _WIN32
+        // on windows, pass .lib files via -Xlinker so clang forwards them properly
+        const char *obj = ctx->options->link_objects.items[i];
+        size_t      len = strlen(obj);
+        if (len > 4 && strcmp(obj + len - 4, ".lib") == 0)
+        {
+            strcat(cmd, "-Xlinker ");
+        }
+        strcat(cmd, obj);
+#else
         strcat(cmd, ctx->options->link_objects.items[i]);
+#endif
     }
 
     int result = system(cmd);

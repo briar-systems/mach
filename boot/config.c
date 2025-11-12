@@ -1,5 +1,4 @@
 #include "config.h"
-#include <dirent.h>
 #include <errno.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/Target.h>
@@ -7,8 +6,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <sys/stat.h>
+#define mkdir(path, mode) _mkdir(path)
+#define stat _stat
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#else
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 // simple toml parser for configuration
 typedef struct TomlParser
@@ -248,6 +259,54 @@ static bool toml_expect_char(TomlParser *parser, char expected)
 
     parser->pos++;
     return true;
+}
+
+// parse string array: ["item1", "item2", ...]
+// returns array of strings and sets count, caller must free
+static char **toml_parse_string_array(TomlParser *parser, int *count)
+{
+    *count = 0;
+    toml_skip_whitespace(parser);
+
+    if (parser->pos >= parser->len || parser->input[parser->pos] != '[')
+        return NULL;
+
+    parser->pos++; // skip '['
+
+    char **items    = NULL;
+    int    capacity = 0;
+
+    toml_skip_whitespace(parser);
+
+    while (parser->pos < parser->len && parser->input[parser->pos] != ']')
+    {
+        char *str = toml_parse_string(parser);
+        if (!str)
+            break;
+
+        // grow array if needed
+        if (*count >= capacity)
+        {
+            capacity = capacity == 0 ? 4 : capacity * 2;
+            items    = realloc(items, capacity * sizeof(char *));
+        }
+
+        items[(*count)++] = str;
+
+        toml_skip_whitespace(parser);
+
+        // check for comma or end of array
+        if (parser->pos < parser->len && parser->input[parser->pos] == ',')
+        {
+            parser->pos++;
+            toml_skip_whitespace(parser);
+        }
+    }
+
+    if (parser->pos < parser->len && parser->input[parser->pos] == ']')
+        parser->pos++; // skip ']'
+
+    return items;
 }
 
 static char *read_file_to_string(const char *path)
@@ -697,12 +756,34 @@ ProjectConfig *config_load(const char *config_path)
                 }
                 else if (strcmp(key, "link") == 0)
                 {
-                    // Parse link library (can be called multiple times or as array)
-                    char *lib_path = toml_parse_string(&parser);
-                    if (lib_path)
+                    // parse link library (supports both string and array)
+                    toml_skip_whitespace(&parser);
+
+                    if (parser.pos < parser.len && parser.input[parser.pos] == '[')
                     {
-                        target->link_libraries                           = realloc(target->link_libraries, (target->link_lib_count + 1) * sizeof(char *));
-                        target->link_libraries[target->link_lib_count++] = lib_path;
+                        // parse as array
+                        int    array_count = 0;
+                        char **array_items = toml_parse_string_array(&parser, &array_count);
+
+                        if (array_items)
+                        {
+                            for (int i = 0; i < array_count; i++)
+                            {
+                                target->link_libraries                           = realloc(target->link_libraries, (target->link_lib_count + 1) * sizeof(char *));
+                                target->link_libraries[target->link_lib_count++] = array_items[i];
+                            }
+                            free(array_items); // free array container, but not the strings
+                        }
+                    }
+                    else
+                    {
+                        // parse as single string
+                        char *lib_path = toml_parse_string(&parser);
+                        if (lib_path)
+                        {
+                            target->link_libraries                           = realloc(target->link_libraries, (target->link_lib_count + 1) * sizeof(char *));
+                            target->link_libraries[target->link_lib_count++] = lib_path;
+                        }
                     }
                 }
                 else if (strcmp(key, "opt-level") == 0)
