@@ -3307,9 +3307,10 @@ static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *
 {
     Type *left = analyze_expr(driver, ctx, expr->binary_expr.left);
 
-    // for assignment and shifts, pass LHS type as hint to RHS for proper literal typing
+    // for assignment, shifts, and arithmetic ops, pass LHS type as hint to RHS for proper literal typing
     TokenKind op    = expr->binary_expr.op;
-    bool      hints = (op == TOKEN_EQUAL || op == TOKEN_LESS_LESS || op == TOKEN_GREATER_GREATER);
+    bool      hints = (op == TOKEN_EQUAL || op == TOKEN_LESS_LESS || op == TOKEN_GREATER_GREATER ||
+                       op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_STAR || op == TOKEN_SLASH || op == TOKEN_PERCENT);
     Type     *right = hints ? analyze_expr_with_hint(driver, ctx, expr->binary_expr.right, left) : analyze_expr(driver, ctx, expr->binary_expr.right);
 
     if (!left || !right)
@@ -3855,11 +3856,14 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
         lookup_type = type_resolve_alias(lookup_type);
 
         // try looking up methods on the resolved type
-        if (!method_sym && (lookup_type->kind == TYPE_STRUCT || lookup_type->kind == TYPE_UNION || lookup_type->kind == TYPE_ARRAY))
+        // also search if original type was an alias (e.g., "def Duration: u64" where methods are on Duration, not u64)
+        if (!method_sym && (lookup_type->kind == TYPE_STRUCT || lookup_type->kind == TYPE_UNION || lookup_type->kind == TYPE_ARRAY || original_type->kind == TYPE_ALIAS))
         {
-            // For array types that came from an alias, use the alias name
+            // For types that came from an alias, use the alias name
+            // This is critical for type aliases like "def Duration: u64" where methods
+            // are defined on "Duration", not on the resolved type "u64"
             const char *type_name_for_lookup = NULL;
-            if (lookup_type->kind == TYPE_ARRAY && original_type->kind == TYPE_ALIAS && original_type->name)
+            if (original_type->kind == TYPE_ALIAS && original_type->name)
             {
                 type_name_for_lookup = original_type->name;
             }
@@ -3874,6 +3878,26 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
                 // "std_types_result__Result$string$string" -> "std_types_result__Result$string$string__is_err"
                 snprintf(mangled_name, sizeof(mangled_name), "%s__%s", type_name_for_lookup, method_name);
                 method_sym = lookup_in_scope_chain(ctx->current_scope, ctx->module_scope, ctx->global_scope, mangled_name);
+
+                // if not found in local scopes, search in all imported module scopes
+                // this handles methods from imported types where the methods are registered in the type's defining module
+                if (!method_sym)
+                {
+                    // search through all imported modules
+                    Scope *search_scope = ctx->module_scope ? ctx->module_scope : ctx->global_scope;
+                    if (search_scope && search_scope->symbols)
+                    {
+                        for (Symbol *sym = search_scope->symbols; sym; sym = sym->next)
+                        {
+                            if (sym->kind == SYMBOL_MODULE && sym->module.scope)
+                            {
+                                method_sym = symbol_lookup_scope(sym->module.scope, mangled_name);
+                                if (method_sym)
+                                    break;
+                            }
+                        }
+                    }
+                }
 
                 // if not found and type is specialized, instantiate generic method
                 if (!method_sym && lookup_type->generic_origin && lookup_type->type_arg_count > 0)
