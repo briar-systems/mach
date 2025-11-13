@@ -2,14 +2,23 @@
 #include "compilation.h"
 #include "filesystem.h"
 
+#include <linux/limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 void mach_print_usage(const char *program_name)
 {
-    fprintf(stderr, "usage: %s build <path|file> [options]\n", program_name);
+    fprintf(stderr, "usage: %s <command> [options]\n", program_name);
     fprintf(stderr, "\n");
+    fprintf(stderr, "commands:\n");
+    fprintf(stderr, "  new <name>           create a new Mach project\n");
+    fprintf(stderr, "  build <path|file>    build a project or single file\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "build options:\n");
     fprintf(stderr, "  <path>               build project from directory (requires mach.toml)\n");
     fprintf(stderr, "  <file.mach>          compile single file (no mach.toml required)\n");
     fprintf(stderr, "\n");
@@ -551,4 +560,102 @@ int mach_cmd_build(int argc, char **argv)
             free(project_root);
 
     return success ? 0 : 1;
+}
+
+// Template for generating main.mach file.
+static const char *mach_main_template = "use std.runtime;\n"
+                                        "use std.types.string;\n"
+                                        "use console: std.io.console;\n"
+                                        "\n"
+                                        "$main.symbol = \"main\";\n"
+                                        "fun main(args: []str) i64 {\n"
+                                        "  console.print(\"Hello, World!\\n\");\n"
+                                        "  ret 0;\n"
+                                        "}\n";
+
+// Template for generating mach.toml files.
+// TODO: Currently only generates Linux target configuration.
+// should select the appropriate target based on the platform
+const char *mach_toml_template = "[project]\n"
+                                 "id = \"%s\"\n"
+                                 "name = \"%s\"\n"
+                                 "version = \"%s\"\n"
+                                 "src = \"%s\"\n"
+                                 "target = \"%s\"\n\n"
+                                 "[dependencies]\n"
+                                 "std = \"%s\"\n\n"
+                                 "[targets.linux]\n"
+                                 "triple = \"x86_64-pc-linux-gnu\"\n"
+                                 "entrypoint = \"%s\"\n"
+                                 "artifacts = \"%s\"\n"
+                                 "out = \"%s\"\n"
+                                 "opt-level = %d\n"
+                                 "emit-ast = %s\n"
+                                 "emit-ir = %s\n"
+                                 "emit-asm = %s\n"
+                                 "emit-object = %s\n"
+                                 "build-library = %s\n"
+                                 "no-pie = %s\n";
+
+int mach_cmd_new(int argc, char **argv)
+{
+    if (argc < 3)
+    {
+        mach_print_usage(argv[0]);
+        return 1;
+    }
+
+    char *project_name = argv[2];
+    char *src_dir      = "src";
+
+    if (mkdir(project_name, S_IRWXU) != 0)
+    {
+        fprintf(stderr, "error: failed to create project directory\n");
+        return 1;
+    }
+
+    chdir(project_name);
+
+    if (mkdir(src_dir, S_IRWXU) != 0)
+    {
+        fprintf(stderr, "error: failed to create src directory\n");
+        return 1;
+    }
+
+    FILE *mach_toml = fopen("mach.toml", "w");
+    if (!mach_toml)
+    {
+        fprintf(stderr, "error: failed to create mach.toml file\n");
+        return 1;
+    }
+
+    const char *version    = "0.1.0";
+    const char *src        = "src";
+    const char *target     = "all";
+    const char *std_path   = "${MACH_HOME}/std";
+    const char *entrypoint = "main.mach";
+
+    char artifacts[256];
+    char out[256];
+
+    snprintf(artifacts, sizeof(artifacts), "out/%s/linux", project_name);
+    snprintf(out, sizeof(out), "out/bin/%s", project_name);
+
+    fprintf(mach_toml, mach_toml_template, project_name, project_name, version, src, target, std_path, entrypoint, artifacts, out, 2, "true", "true", "true", "true", "false", "false");
+
+    fclose(mach_toml);
+
+    chdir(src_dir);
+
+    FILE *main_file = fopen("main.mach", "w");
+    if (!main_file)
+    {
+        fprintf(stderr, "error: failed to create main file\n");
+        return 1;
+    }
+
+    fputs(mach_main_template, main_file);
+    fclose(main_file);
+
+    return 0;
 }

@@ -22,6 +22,10 @@ int main(int argc, char **argv)
     {
         return mach_cmd_build(argc, argv);
     }
+    else if (strcmp(command, "new") == 0)
+    {
+        return mach_cmd_new(argc, argv);
+    }
     else
     {
         fprintf(stderr, "error: unknown command '%s'\n", command);
