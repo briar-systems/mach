@@ -3,8 +3,38 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <sys/stat.h>
+#ifndef PATH_MAX
+#define PATH_MAX 260
+#endif
+#define mkdir(path, mode) _mkdir(path)
+#define stat _stat
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+
+// windows realpath equivalent
+static char *realpath_windows(const char *path, char *resolved)
+{
+    char buffer[PATH_MAX];
+    if (!_fullpath(buffer, path, PATH_MAX))
+        return NULL;
+
+    if (resolved)
+    {
+        strcpy(resolved, buffer);
+        return resolved;
+    }
+    return strdup(buffer);
+}
+#define realpath realpath_windows
+#else
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 char *fs_read_file(const char *path)
 {
