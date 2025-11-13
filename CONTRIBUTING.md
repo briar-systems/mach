@@ -28,7 +28,7 @@ Be respectful, constructive, and professional. Treat Mach like a passion project
 
 ### Prerequisites
 - C compiler: `clang` with C23 support
-- LLVM 14+ with development headers
+- LLVM 19+ with development headers
 - GNU Make
 - Git
 
