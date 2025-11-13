@@ -3225,7 +3225,7 @@ AstNode *parser_parse_type_fun(Parser *parser)
     }
 
     // optional return type
-    if (!parser_is_at_end(parser) && !parser_check(parser, TOKEN_SEMICOLON) && !parser_check(parser, TOKEN_COMMA) && !parser_check(parser, TOKEN_R_PAREN) && !parser_check(parser, TOKEN_R_BRACKET) && !parser_check(parser, TOKEN_R_BRACE))
+    if (!parser_is_at_end(parser) && !parser_check(parser, TOKEN_SEMICOLON) && !parser_check(parser, TOKEN_COMMA) && !parser_check(parser, TOKEN_R_PAREN) && !parser_check(parser, TOKEN_R_BRACKET) && !parser_check(parser, TOKEN_R_BRACE) && !parser_check(parser, TOKEN_EQUAL))
     {
         fun->type_fun.return_type = parser_parse_type(parser);
         if (!fun->type_fun.return_type)
