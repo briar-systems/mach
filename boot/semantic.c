@@ -2493,6 +2493,9 @@ static Symbol *instantiate_generic_struct(SemanticDriver *driver, const Analysis
         memcpy(specialized_type->type_args, type_args, sizeof(Type *) * arg_count);
     }
 
+    // cache the specialization BEFORE resolving fields to break cycles
+    specialization_cache_insert(&driver->spec_cache, generic_sym, type_args, arg_count, specialized_sym);
+
     // build binding context from type parameters
     AstNode          *generic_decl = generic_sym->decl;
     GenericBindingCtx bindings     = ctx->bindings;
@@ -2621,9 +2624,6 @@ found_module:;
         specialized_type->alignment             = max_align;
     }
 
-    // cache the specialization
-    specialization_cache_insert(&driver->spec_cache, generic_sym, type_args, arg_count, specialized_sym);
-
     free(specialized_name);
     return specialized_sym;
 }
@@ -2665,6 +2665,9 @@ static Symbol *instantiate_generic_union(SemanticDriver *driver, const AnalysisC
         specialized_type->type_args = malloc(sizeof(Type *) * arg_count);
         memcpy(specialized_type->type_args, type_args, sizeof(Type *) * arg_count);
     }
+
+    // cache the specialization BEFORE resolving fields to break cycles
+    specialization_cache_insert(&driver->spec_cache, generic_sym, type_args, arg_count, specialized_sym);
 
     // build binding context
     AstNode          *generic_decl = generic_sym->decl;
@@ -2775,9 +2778,6 @@ found_union_module:;
         specialized_type->size                  = max_size;
         specialized_type->alignment             = max_align;
     }
-
-    // cache the specialization
-    specialization_cache_insert(&driver->spec_cache, generic_sym, type_args, arg_count, specialized_sym);
 
     free(specialized_name);
     return specialized_sym;
