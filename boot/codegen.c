@@ -2967,6 +2967,19 @@ LLVMValueRef codegen_expr_unary(CodegenContext *ctx, AstNode *expr)
     case TOKEN_TILDE: // bitwise not
         operand = codegen_load_if_needed(ctx, operand, expr->unary_expr.expr->type, expr->unary_expr.expr);
         return LLVMBuildNot(ctx->builder, operand, "bnot");
+    case TOKEN_BANG: // logical not
+        operand = codegen_load_if_needed(ctx, operand, expr->unary_expr.expr->type, expr->unary_expr.expr);
+        // compare against zero: !x becomes x == 0
+        if (type_is_float(expr->unary_expr.expr->type))
+        {
+            LLVMValueRef zero = LLVMConstReal(LLVMTypeOf(operand), 0.0);
+            return LLVMBuildFCmp(ctx->builder, LLVMRealOEQ, operand, zero, "lnot");
+        }
+        else
+        {
+            LLVMValueRef zero = LLVMConstInt(LLVMTypeOf(operand), 0, false);
+            return LLVMBuildICmp(ctx->builder, LLVMIntEQ, operand, zero, "lnot");
+        }
     default:
         codegen_error(ctx, expr, "unimplemented unary operator");
         return NULL;
@@ -3691,6 +3704,19 @@ LLVMValueRef codegen_expr_cast(CodegenContext *ctx, AstNode *expr)
     }
 
     LLVMTypeRef to_llvm_type = codegen_get_llvm_type(ctx, to_type);
+
+    // same type cast (no-op, just type reinterpretation at compile time)
+    // handles type aliases that resolve to the same underlying type
+    if (resolved_from_type == resolved_to_type)
+    {
+        return value;
+    }
+
+    // same size, same kind cast (type aliases with matching structure)
+    if (resolved_from_type->size == resolved_to_type->size && resolved_from_type->kind == resolved_to_type->kind)
+    {
+        return value;
+    }
 
     // numeric casts
     if (type_is_numeric(resolved_from_type) && type_is_numeric(resolved_to_type))
