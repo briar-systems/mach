@@ -881,7 +881,11 @@ ProjectConfig *config_load(const char *config_path)
 ProjectConfig *config_load_from_dir(const char *dir_path)
 {
     char config_path[1024];
+#ifdef _WIN32
+    snprintf(config_path, sizeof(config_path), "%s\\mach.toml", dir_path);
+#else
     snprintf(config_path, sizeof(config_path), "%s/mach.toml", dir_path);
+#endif
 
     return config_load(config_path);
 }
