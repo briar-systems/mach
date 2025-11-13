@@ -1814,6 +1814,23 @@ static bool declare_method_stmt(SemanticDriver *driver, const AnalysisContext *c
         return false;
     }
 
+    // check if method name conflicts with field name
+    if (owner_sym->type)
+    {
+        Type *owner_type = type_resolve_alias(owner_sym->type);
+        if (owner_type && (owner_type->kind == TYPE_STRUCT || owner_type->kind == TYPE_UNION))
+        {
+            for (Symbol *field = owner_type->composite.fields; field; field = field->next)
+            {
+                if (field->name && strcmp(field->name, method_name) == 0)
+                {
+                    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "method '%s' conflicts with field name in type '%s'", method_name, owner_name);
+                    return false;
+                }
+            }
+        }
+    }
+
     // check if method or owner is generic
     bool   is_generic           = (stmt->fun_stmt.generics && stmt->fun_stmt.generics->count > 0) || (owner_sym->type_def.is_generic);
     size_t method_generic_count = stmt->fun_stmt.generics ? (size_t)stmt->fun_stmt.generics->count : 0;
@@ -4074,7 +4091,44 @@ static Type *analyze_call_expr(SemanticDriver *driver, const AnalysisContext *ct
         }
         else
         {
-            // not a method - might be a function stored in a field, which isn't supported yet
+            // no method found - check if this is a field holding a function pointer
+            Type *lookup_type = receiver_type;
+            if (lookup_type->kind == TYPE_POINTER)
+                lookup_type = lookup_type->pointer.base;
+
+            lookup_type = type_resolve_alias(lookup_type);
+
+            // check if receiver is a struct/union with a field matching the method name
+            if (lookup_type->kind == TYPE_STRUCT || lookup_type->kind == TYPE_UNION)
+            {
+                Symbol *field_sym = NULL;
+                for (Symbol *field = lookup_type->composite.fields; field; field = field->next)
+                {
+                    if (field->name && strcmp(field->name, method_name) == 0)
+                    {
+                        field_sym = field;
+                        break;
+                    }
+                }
+
+                // if field found and it's a function type, treat this as a function pointer call
+                if (field_sym && field_sym->type)
+                {
+                    Type *field_type = type_resolve_alias(field_sym->type);
+                    if (field_type->kind == TYPE_FUNCTION)
+                    {
+                        // replace the field expression with just the field access
+                        // call analysis will handle the rest
+                        expr->call_expr.func->type   = field_type;
+                        expr->call_expr.func->symbol = field_sym;
+
+                        // continue with normal call analysis
+                        goto normal_call_analysis;
+                    }
+                }
+            }
+
+            // not a method and not a function field
             diagnostic_emit(
                 &driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "no method '%s' found on type (kind=%d, name=%s)", method_name, receiver_type ? receiver_type->kind : -1, receiver_type && receiver_type->name ? receiver_type->name : "(null)");
             return NULL;
