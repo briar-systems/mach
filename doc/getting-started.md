@@ -33,6 +33,26 @@ std = "${MACH_HOME}/std"
 
 Using the environment variable keeps project configuration portable by avoiding hard-coded absolute paths.
 
+Each build target now explicitly declares its output kind and optimization toggles. A minimal target definition looks like this:
+
+```toml
+[targets.native]
+triple = "x86_64-pc-linux-gnu"
+entrypoint = "main.mach"
+artifacts = "out/foo/native"
+output = "out/bin/foo"
+mode = "executable"      # executable | library | shared
+debug = true              # controls debug info emission
+optimize = true           # toggles the optimizer (O2 equivalent when true)
+emit-ast = true
+emit-ir = true
+emit-asm = true
+emit-object = true
+no-pie = false
+```
+
+Projects that previously relied on `opt-level` or `build-library` must migrate to the schema above.
+
 ---
 
 ## Building the compiler

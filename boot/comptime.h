@@ -32,6 +32,7 @@ typedef struct ComptimeBuildContext
     int  opt_level;
 
     const char *mach_version;
+    const char *build_version;
 } ComptimeBuildContext;
 
 typedef enum ComptimeValueKind

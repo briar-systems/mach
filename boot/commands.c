@@ -80,13 +80,14 @@ const char *mach_toml_template = "[project]\n"
                                  "triple = \"x86_64-pc-linux-gnu\"\n"
                                  "entrypoint = \"%s\"\n"
                                  "artifacts = \"%s\"\n"
-                                 "out = \"%s\"\n"
-                                 "opt-level = %d\n"
+                                 "output = \"%s\"\n"
+                                 "mode = \"executable\"\n"
+                                 "debug = true\n"
+                                 "optimize = true\n"
                                  "emit-ast = %s\n"
                                  "emit-ir = %s\n"
                                  "emit-asm = %s\n"
                                  "emit-object = %s\n"
-                                 "build-library = %s\n"
                                  "no-pie = %s\n";
 
 int mach_cmd_init(int argc, char **argv)
@@ -133,7 +134,7 @@ int mach_cmd_init(int argc, char **argv)
     snprintf(artifacts, sizeof(artifacts), "out/%s/linux", project_name);
     snprintf(out, sizeof(out), "out/%s/linux/bin/%s", project_name, project_name);
 
-    fprintf(mach_toml, mach_toml_template, project_name, project_name, version, src, target, std_path, entrypoint, artifacts, out, 2, "true", "true", "true", "true", "false", "false");
+    fprintf(mach_toml, mach_toml_template, project_name, project_name, version, src, target, std_path, entrypoint, artifacts, out, "true", "true", "true", "true", "false");
 
     fclose(mach_toml);
 
@@ -306,12 +307,12 @@ int mach_cmd_build(int argc, char **argv)
                 }
 
                 target_opts.input_file  = entrypoint_path;
-                target_opts.opt_level   = current_target->opt_level;
+                target_opts.opt_level   = current_target->optimize ? 2 : 0;
                 target_opts.emit_ast    = current_target->emit_ast;
                 target_opts.emit_ir     = current_target->emit_ir;
                 target_opts.emit_asm    = current_target->emit_asm;
                 target_opts.no_pie      = current_target->no_pie;
-                target_opts.debug_info  = 1;
+                target_opts.debug_info  = current_target->debug ? 1 : 0;
                 target_opts.target_name = current_target_name;
 
                 // Add target link libraries
@@ -414,12 +415,12 @@ int mach_cmd_build(int argc, char **argv)
         opts.input_file = entrypoint_path;
 
         // Step 4: Apply config defaults from target
-        opts.opt_level   = target->opt_level;
+        opts.opt_level   = target->optimize ? 2 : 0;
         opts.emit_ast    = target->emit_ast;
         opts.emit_ir     = target->emit_ir;
         opts.emit_asm    = target->emit_asm;
         opts.no_pie      = target->no_pie;
-        opts.debug_info  = 1;           // default to debug info
+        opts.debug_info  = target->debug ? 1 : 0;
         opts.target_name = target_name; // store target name for directory structure
 
         // Add target link libraries
