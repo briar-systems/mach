@@ -10,17 +10,17 @@ typedef struct TargetConfig
     char *target_triple; // target architecture triple
     char *entrypoint;    // main source file for this target (relative to src_dir)
     char *artifacts_dir; // artifact output directory for this target (relative to project root)
-    char *out;           // final executable/library output path (relative to artifacts_dir/bin or absolute)
+    char *output;        // final executable/library output path (relative to artifacts_dir/bin or absolute)
+    char *mode;          // build mode: executable|library|shared
 
     // build options
-    int  opt_level;     // optimization level (0-3)
-    bool emit_ast;      // emit AST files
-    bool emit_ir;       // emit LLVM IR
-    bool emit_asm;      // emit assembly
-    bool emit_object;   // emit object files
-    bool build_library; // build as library
-    bool no_pie;        // disable PIE
-    bool shared;        // build shared library when building a library
+    bool emit_ast;     // emit AST files
+    bool emit_ir;      // emit LLVM IR
+    bool emit_asm;     // emit assembly
+    bool emit_object;  // emit object files
+    bool debug;        // emit debug info for this target
+    bool optimize;     // enable optimizations for this target
+    bool no_pie;       // disable PIE
 
     // linking options
     char **link_libraries; // libraries to link (paths to .a, .so, .dylib, etc.)

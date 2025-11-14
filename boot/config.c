@@ -21,6 +21,14 @@
 #include <unistd.h>
 #endif
 
+static bool config_target_mode_valid(const char *mode)
+{
+    if (!mode)
+        return false;
+
+    return strcmp(mode, "executable") == 0 || strcmp(mode, "library") == 0 || strcmp(mode, "shared") == 0;
+}
+
 // simple toml parser for configuration
 typedef struct TomlParser
 {
@@ -196,40 +204,6 @@ static void toml_skip_table_value(TomlParser *parser)
             brace_count--;
         parser->pos++;
     }
-}
-
-static int toml_parse_number(TomlParser *parser)
-{
-    toml_skip_whitespace(parser);
-
-    if (parser->pos >= parser->len)
-        return 0;
-
-    size_t start = parser->pos;
-    while (parser->pos < parser->len)
-    {
-        char c = parser->input[parser->pos];
-        if (c >= '0' && c <= '9')
-        {
-            parser->pos++;
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    if (parser->pos == start)
-        return 0;
-
-    char *number_str = malloc(parser->pos - start + 1);
-    strncpy(number_str, parser->input + start, parser->pos - start);
-    number_str[parser->pos - start] = '\0';
-
-    int result = atoi(number_str);
-    free(number_str);
-
-    return result;
 }
 
 static bool toml_parse_bool(TomlParser *parser)
@@ -423,7 +397,8 @@ void target_config_dnit(TargetConfig *target)
     free(target->target_triple);
     free(target->entrypoint);
     free(target->artifacts_dir);
-    free(target->out);
+    free(target->output);
+    free(target->mode);
 
     // Free link libraries
     for (int i = 0; i < target->link_lib_count; i++)
@@ -750,9 +725,9 @@ ProjectConfig *config_load(const char *config_path)
                 {
                     target->artifacts_dir = toml_parse_string(&parser);
                 }
-                else if (strcmp(key, "out") == 0)
+                else if (strcmp(key, "output") == 0)
                 {
-                    target->out = toml_parse_string(&parser);
+                    target->output = toml_parse_string(&parser);
                 }
                 else if (strcmp(key, "link") == 0)
                 {
@@ -786,9 +761,17 @@ ProjectConfig *config_load(const char *config_path)
                         }
                     }
                 }
-                else if (strcmp(key, "opt-level") == 0)
+                else if (strcmp(key, "mode") == 0)
                 {
-                    target->opt_level = toml_parse_number(&parser);
+                    target->mode = toml_parse_string(&parser);
+                }
+                else if (strcmp(key, "debug") == 0)
+                {
+                    target->debug = toml_parse_bool(&parser);
+                }
+                else if (strcmp(key, "optimize") == 0)
+                {
+                    target->optimize = toml_parse_bool(&parser);
                 }
                 else if (strcmp(key, "emit-ast") == 0)
                 {
@@ -805,14 +788,6 @@ ProjectConfig *config_load(const char *config_path)
                 else if (strcmp(key, "emit-object") == 0)
                 {
                     target->emit_object = toml_parse_bool(&parser);
-                }
-                else if (strcmp(key, "build-library") == 0)
-                {
-                    target->build_library = toml_parse_bool(&parser);
-                }
-                else if (strcmp(key, "shared") == 0)
-                {
-                    target->shared = toml_parse_bool(&parser);
                 }
                 else if (strcmp(key, "no-pie") == 0)
                 {
@@ -922,16 +897,17 @@ bool config_save(ProjectConfig *config, const char *config_path)
             fprintf(file, "entrypoint = \"%s\"\n", target->entrypoint);
         if (target->artifacts_dir)
             fprintf(file, "artifacts = \"%s\"\n", target->artifacts_dir);
-        if (target->out)
-            fprintf(file, "out = \"%s\"\n", target->out);
-        fprintf(file, "opt-level = %d\n", target->opt_level);
+        if (target->output)
+            fprintf(file, "output = \"%s\"\n", target->output);
+        if (target->mode)
+            fprintf(file, "mode = \"%s\"\n", target->mode);
+        fprintf(file, "debug = %s\n", target->debug ? "true" : "false");
+        fprintf(file, "optimize = %s\n", target->optimize ? "true" : "false");
         // always write booleans explicitly for transparency
         fprintf(file, "emit-ast = %s\n", target->emit_ast ? "true" : "false");
         fprintf(file, "emit-ir = %s\n", target->emit_ir ? "true" : "false");
         fprintf(file, "emit-asm = %s\n", target->emit_asm ? "true" : "false");
         fprintf(file, "emit-object = %s\n", target->emit_object ? "true" : "false");
-        fprintf(file, "build-library = %s\n", target->build_library ? "true" : "false");
-        fprintf(file, "shared = %s\n", target->shared ? "true" : "false");
         fprintf(file, "no-pie = %s\n", target->no_pie ? "true" : "false");
 
         // Write link libraries if any
@@ -1021,7 +997,9 @@ bool config_should_build_library(ProjectConfig *config, const char *target_name)
     if (!config || !target_name)
         return false;
     TargetConfig *target = config_get_target(config, target_name);
-    return target && target->build_library;
+    if (!target || !target->mode)
+        return false;
+    return strcmp(target->mode, "library") == 0 || strcmp(target->mode, "shared") == 0;
 }
 
 bool config_should_link_executable(ProjectConfig *config, const char *target_name)
@@ -1029,7 +1007,9 @@ bool config_should_link_executable(ProjectConfig *config, const char *target_nam
     if (!config || !target_name)
         return true;
     TargetConfig *target = config_get_target(config, target_name);
-    return target && !target->build_library;
+    if (!target || !target->mode)
+        return true;
+    return strcmp(target->mode, "executable") == 0;
 }
 
 bool config_is_shared_library(ProjectConfig *config, const char *target_name)
@@ -1037,7 +1017,9 @@ bool config_is_shared_library(ProjectConfig *config, const char *target_name)
     if (!config || !target_name)
         return true;
     TargetConfig *target = config_get_target(config, target_name);
-    return target && target->shared;
+    if (!target || !target->mode)
+        return false;
+    return strcmp(target->mode, "shared") == 0;
 }
 
 char *config_resolve_final_output_path(ProjectConfig *config, const char *project_dir, const char *target_name)
@@ -1049,11 +1031,11 @@ char *config_resolve_final_output_path(ProjectConfig *config, const char *projec
     if (!target)
         return NULL;
 
-    // out field is required and must be a path specification
-    const char *out_spec = target->out;
+    // output field is required and must be a path specification
+    const char *out_spec = target->output;
     if (!out_spec || strlen(out_spec) == 0)
     {
-        fprintf(stderr, "error: target '%s' missing required 'out' field\n", target_name);
+        fprintf(stderr, "error: target '%s' missing required 'output' field\n", target_name);
         return NULL;
     }
 
@@ -1437,9 +1419,21 @@ bool config_validate(ProjectConfig *config)
             return false;
         }
 
-        if (!target->out || strlen(target->out) == 0)
+        if (!target->output || strlen(target->output) == 0)
         {
-            fprintf(stderr, "error: [targets.%s] out is required\n", target->name);
+            fprintf(stderr, "error: [targets.%s] output is required\n", target->name);
+            return false;
+        }
+
+        if (!target->mode || strlen(target->mode) == 0)
+        {
+            fprintf(stderr, "error: [targets.%s] mode is required\n", target->name);
+            return false;
+        }
+
+        if (!config_target_mode_valid(target->mode))
+        {
+            fprintf(stderr, "error: [targets.%s] mode must be executable, library, or shared (got '%s')\n", target->name, target->mode);
             return false;
         }
 
@@ -1449,13 +1443,7 @@ bool config_validate(ProjectConfig *config)
             return false;
         }
 
-        if (target->opt_level < 0 || target->opt_level > 3)
-        {
-            fprintf(stderr, "error: [targets.%s] opt-level must be 0-3 (got %d)\n", target->name, target->opt_level);
-            return false;
-        }
-
-        // Note: boolean fields (emit-ast, emit-ir, emit-asm, emit-object, build-library, no-pie)
+        // Note: boolean fields (emit-ast, emit-ir, emit-asm, emit-object, debug, optimize, no-pie)
         // are implicitly validated as they default to false if not specified in parsing
     }
 
