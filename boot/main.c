@@ -30,6 +30,10 @@ int main(int argc, char **argv)
     {
         return mach_cmd_run(argc, argv);
     }
+    else if (strcmp(command, "dep") == 0)
+    {
+        return mach_cmd_dep(argc, argv);
+    }
     else
     {
         fprintf(stderr, "error: unknown command '%s'\n", command);

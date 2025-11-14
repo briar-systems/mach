@@ -25,6 +25,7 @@ void mach_print_usage(const char *program_name)
     fprintf(stderr, "  init  <name>         create a new Mach project\n");
     fprintf(stderr, "  build <path|file>    build a project or single file\n");
     fprintf(stderr, "  run   [path]         run a project executable\n");
+    fprintf(stderr, "  dep   <subcommand>   manage project dependencies\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "build options:\n");
     fprintf(stderr, "  <path>               build project from directory (requires mach.toml)\n");
@@ -73,8 +74,9 @@ const char *mach_toml_template = "[project]\n"
                                  "src = \"%s\"\n"
                                  "target = \"%s\"\n"
                                  "\n"
-                                 "[dependencies]\n"
-                                 "std = \"%s\"\n"
+                                 "[deps.std]\n"
+                                 "type = \"local\"\n"
+                                 "path = \"%s\"\n"
                                  "\n"
                                  "[targets.linux]\n"
                                  "triple = \"x86_64-pc-linux-gnu\"\n"

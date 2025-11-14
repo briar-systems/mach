@@ -27,12 +27,13 @@ typedef struct TargetConfig
     int    link_lib_count; // number of libraries to link
 } TargetConfig;
 
-// explicit dependency specification (parsed from [dependencies] table)
+// explicit dependency specification (parsed from [deps] tables)
 typedef struct DepSpec
 {
-    char *name;    // dependency/package name (key, also becomes module alias)
-    char *path;    // relative or absolute path to dependency source or mach.toml
-    char *src_dir; // resolved source directory inside dependency (computed)
+    char *name;    // dependency/package key (also becomes module alias)
+    char *type;    // dependency source classification: remote|local
+    char *path;    // remote URL or local filesystem path (used by dep tooling)
+    char *version; // optional version selector (required for remote)
 } DepSpec;
 
 // project configuration
