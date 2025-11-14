@@ -287,6 +287,14 @@ bool compilation_load_and_preprocess(CompilationContext *ctx)
     if (ctx->config)
     {
         module_manager_set_config(&ctx->driver->module_manager, ctx->config, ctx->project_root);
+        if (ctx->config->version && ctx->config->version[0] != '\0')
+            ctx->driver->comptime_ctx.build_version = ctx->config->version;
+        else
+            ctx->driver->comptime_ctx.build_version = "";
+    }
+    else
+    {
+        ctx->driver->comptime_ctx.build_version = "";
     }
 
     for (int i = 0; i < ctx->options->include_paths.count; i++)

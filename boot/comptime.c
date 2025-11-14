@@ -55,6 +55,7 @@ void comptime_build_context_init_host(ComptimeBuildContext *ctx)
     ctx->build_debug         = true;
     ctx->opt_level           = 0;
     ctx->mach_version        = MACH_VERSION;
+    ctx->build_version       = "";
 }
 
 bool comptime_get_constant(const char *name, ComptimeValue *out_value, const ComptimeBuildContext *ctx)
@@ -164,6 +165,12 @@ bool comptime_get_constant(const char *name, ComptimeValue *out_value, const Com
     {
         out_value->kind   = COMPTIME_U8;
         out_value->u8_val = ctx->build_debug ? 1 : 0;
+        return true;
+    }
+    if (strcmp(name, "build.version") == 0)
+    {
+        out_value->kind       = COMPTIME_STRING;
+        out_value->string_val = ctx->build_version ? ctx->build_version : "";
         return true;
     }
 
