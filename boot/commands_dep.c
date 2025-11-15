@@ -84,15 +84,24 @@ static void cmd_dep_help(void)
     printf("commands:\n");
     printf("  list                 list dependencies in the current project\n");
     printf("  info <name>          show information about a dependency\n");
-    printf("  add  [--local] <path> [name]\n");
+    printf("  add  [--local] <path> [name] [--version <version>]\n");
     printf("                       register a dependency (assumes remote by default)\n");
     printf("  del  <name>          remove a dependency entry\n");
     printf("  pull [name]          refresh vendored dependencies\n");
+    printf("\n");
+    printf("version formats:\n");
+    printf("  branch/main          track a specific branch\n");
+    printf("  ^1.2.3               semver caret (>=1.2.3 <2.0.0)\n");
+    printf("  ~1.2.3               semver tilde (>=1.2.3 <1.3.0)\n");
+    printf("  1.2.3                exact semver tag\n");
+    printf("  <commit-hash>        specific commit (default if not specified)\n");
     printf("\n");
     printf("examples:\n");
     printf("  mach dep info std\n");
     printf("  mach dep list\n");
     printf("  mach dep add https://example.com/foo.git\n");
+    printf("  mach dep add https://example.com/foo.git --version branch/main\n");
+    printf("  mach dep add https://example.com/foo.git --version ^1.0.0\n");
     printf("  mach dep add --local path/to/proj std\n");
     printf("  mach dep del std\n");
     printf("  mach dep pull\n");
@@ -226,31 +235,55 @@ static int cmd_dep_add(int argc, char **argv)
         return 1;
     }
 
-    int         is_local    = 0;
-    const char *path_or_url = NULL;
-    const char *dep_name    = NULL;
+    int         is_local         = 0;
+    const char *path_or_url      = NULL;
+    const char *dep_name         = NULL;
+    const char *version_override = NULL;
 
     // parse arguments
     int arg_idx = 3;
-    if (strcmp(argv[arg_idx], "--local") == 0)
+    while (arg_idx < argc)
     {
-        is_local = 1;
-        arg_idx++;
-        if (argc <= arg_idx)
+        if (strcmp(argv[arg_idx], "--local") == 0)
         {
-            fprintf(stderr, "error: --local requires a path argument\n");
+            is_local = 1;
+            arg_idx++;
+        }
+        else if (strcmp(argv[arg_idx], "--version") == 0)
+        {
+            arg_idx++;
+            if (arg_idx >= argc)
+            {
+                fprintf(stderr, "error: --version requires a version argument\n");
+                return 1;
+            }
+            version_override = argv[arg_idx];
+            arg_idx++;
+        }
+        else if (!path_or_url)
+        {
+            path_or_url = argv[arg_idx];
+            arg_idx++;
+        }
+        else if (!dep_name)
+        {
+            dep_name = argv[arg_idx];
+            arg_idx++;
+        }
+        else
+        {
+            fprintf(stderr, "error: unexpected argument '%s'\n", argv[arg_idx]);
             return 1;
         }
     }
 
-    path_or_url = argv[arg_idx];
-    arg_idx++;
-
-    if (argc > arg_idx)
+    if (!path_or_url)
     {
-        dep_name = argv[arg_idx];
+        fprintf(stderr, "error: path/url argument is required\n");
+        return 1;
     }
-    else
+
+    if (!dep_name)
     {
         // extract name from path/url
         const char *last_slash = strrchr(path_or_url, '/');
@@ -357,30 +390,39 @@ static int cmd_dep_add(int argc, char **argv)
             return 1;
         }
 
-        // get the current commit hash to pin the dependency
-        char hash_cmd[PATH_MAX * 2];
-        snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
-
-        FILE *hash_pipe = popen(hash_cmd, "r");
-        if (hash_pipe)
+        // use version override if provided, otherwise get current commit hash
+        if (version_override)
         {
-            char commit_hash[256];
-            if (fgets(commit_hash, sizeof(commit_hash), hash_pipe))
-            {
-                size_t len = strlen(commit_hash);
-                if (len > 0 && commit_hash[len - 1] == '\n')
-                    commit_hash[len - 1] = '\0';
-
-                printf("pinning '%s' to commit '%s'\n", dep_name, commit_hash);
-                new_dep->version = strdup(commit_hash);
-            }
-            pclose(hash_pipe);
+            printf("setting version to '%s'\n", version_override);
+            new_dep->version = strdup(version_override);
         }
-
-        if (!new_dep->version)
+        else
         {
-            fprintf(stderr, "warning: failed to resolve commit hash for '%s'\n", dep_name);
-            new_dep->version = strdup("HEAD"); // fallback
+            // get the current commit hash to pin the dependency
+            char hash_cmd[PATH_MAX * 2];
+            snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
+
+            FILE *hash_pipe = popen(hash_cmd, "r");
+            if (hash_pipe)
+            {
+                char commit_hash[256];
+                if (fgets(commit_hash, sizeof(commit_hash), hash_pipe))
+                {
+                    size_t len = strlen(commit_hash);
+                    if (len > 0 && commit_hash[len - 1] == '\n')
+                        commit_hash[len - 1] = '\0';
+
+                    printf("pinning '%s' to commit '%s'\n", dep_name, commit_hash);
+                    new_dep->version = strdup(commit_hash);
+                }
+                pclose(hash_pipe);
+            }
+
+            if (!new_dep->version)
+            {
+                fprintf(stderr, "warning: failed to resolve commit hash for '%s'\n", dep_name);
+                new_dep->version = strdup("HEAD"); // fallback
+            }
         }
     }
 
