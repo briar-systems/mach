@@ -5,10 +5,149 @@
 #include "ioutil.h"
 #include "lexer.h"
 #include "symbol.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+static char *module_manager_vformat(const char *fmt, va_list args)
+{
+    va_list copy;
+    va_copy(copy, args);
+    int needed = vsnprintf(NULL, 0, fmt, copy);
+    va_end(copy);
+    if (needed < 0)
+        return NULL;
+
+    char *buf = malloc((size_t)needed + 1);
+    if (!buf)
+        return NULL;
+
+    if (vsnprintf(buf, (size_t)needed + 1, fmt, args) < 0)
+    {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+static char *module_manager_format(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char *result = module_manager_vformat(fmt, args);
+    va_end(args);
+    return result;
+}
+
+static char *module_strndup_local(const char *start, size_t len)
+{
+    char *out = malloc(len + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return out;
+}
+
+static int module_path_is_absolute(const char *path)
+{
+    if (!path || path[0] == '\0')
+        return 0;
+    if (path[0] == '/' || path[0] == '\\')
+        return 1;
+    if (strlen(path) >= 2 && path[1] == ':')
+        return 1;
+    return 0;
+}
+
+static char *module_manager_build_vendor_dir(ModuleManager *manager, const char *dep_name)
+{
+    if (!manager || !manager->project_dir || !dep_name)
+        return NULL;
+    size_t len = strlen(manager->project_dir) + strlen("/dep/") + strlen(dep_name) + 1;
+    char  *path = malloc(len);
+    if (!path)
+        return NULL;
+    snprintf(path, len, "%s/dep/%s", manager->project_dir, dep_name);
+    return path;
+}
+
+static char *module_manager_resolve_dep_path(ModuleManager *manager, DepSpec *dep)
+{
+    if (!dep || !dep->path || dep->path[0] == '\0')
+        return NULL;
+
+    if (module_path_is_absolute(dep->path) || !manager || !manager->project_dir)
+        return strdup(dep->path);
+
+    size_t len = strlen(manager->project_dir) + 1 + strlen(dep->path) + 1;
+    char  *path = malloc(len);
+    if (!path)
+        return NULL;
+    snprintf(path, len, "%s/%s", manager->project_dir, dep->path);
+    return path;
+}
+
+static char *module_manager_build_resolution_message(ModuleManager *manager, const char *import_name, const char *canonical_name)
+{
+    if (!manager || !manager->config || !manager->project_dir || !canonical_name)
+        return NULL;
+
+    const char *use_name = import_name ? import_name : canonical_name;
+    const char *dot      = strchr(canonical_name, '.');
+    if (!dot)
+        return module_manager_format("module '%s' must include a package prefix", use_name);
+
+    size_t prefix_len = (size_t)(dot - canonical_name);
+    char  *prefix     = module_strndup_local(canonical_name, prefix_len);
+    if (!prefix)
+        return NULL;
+
+    ProjectConfig *config = (ProjectConfig *)manager->config;
+
+    if (config->id && strlen(config->id) == prefix_len && strncmp(config->id, canonical_name, prefix_len) == 0)
+    {
+        const char *src_rel = config->src_dir ? config->src_dir : "src";
+        char       *message = module_manager_format("module '%s' not found under %s/%s", use_name, manager->project_dir, src_rel);
+        free(prefix);
+        return message;
+    }
+
+    DepSpec *dep = config_get_dep(config, prefix);
+    if (!dep)
+    {
+        char *message = module_manager_format("unknown module prefix '%s' in import '%s'", prefix, use_name);
+        free(prefix);
+        return message;
+    }
+
+    char *vendor_dir = module_manager_build_vendor_dir(manager, dep->name ? dep->name : prefix);
+    if (vendor_dir && !fs_is_directory(vendor_dir))
+    {
+        char *message = module_manager_format("dependency '%s' is not vendored (expected %s)", prefix, vendor_dir);
+        free(vendor_dir);
+        free(prefix);
+        return message;
+    }
+    if (vendor_dir)
+        free(vendor_dir);
+
+    char *dep_path = module_manager_resolve_dep_path(manager, dep);
+    if (dep_path && !fs_is_directory(dep_path))
+    {
+        char *message = module_manager_format("dependency '%s' path '%s' does not exist", prefix, dep_path);
+        free(dep_path);
+        free(prefix);
+        return message;
+    }
+    if (dep_path)
+        free(dep_path);
+
+    free(prefix);
+    return NULL;
+}
 
 // error handling functions
 void module_error_list_init(ModuleErrorList *list)
@@ -479,8 +618,14 @@ static Module *module_manager_load_module_internal(ModuleManager *manager, const
     char *file_path = module_path_to_file_path(manager, canonical);
     if (!file_path)
     {
-        char *guess = module_guess_file_path(manager, canonical);
-        module_error_list_add(&manager->errors, canonical, guess ? guess : "<unknown>", "Could not find module file");
+        char *guess    = module_guess_file_path(manager, canonical);
+        char *diagnose = module_manager_build_resolution_message(manager, module_fqn, canonical);
+        module_error_list_add(&manager->errors,
+                              canonical,
+                              guess ? guess : "<unknown>",
+                              diagnose ? diagnose : "Could not find module file");
+        if (diagnose)
+            free(diagnose);
         if (guess)
             free(guess);
         manager->had_error = true;

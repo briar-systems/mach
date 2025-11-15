@@ -14,25 +14,26 @@ typedef struct TargetConfig
     char *mode;          // build mode: executable|library|shared
 
     // build options
-    bool emit_ast;     // emit AST files
-    bool emit_ir;      // emit LLVM IR
-    bool emit_asm;     // emit assembly
-    bool emit_object;  // emit object files
-    bool debug;        // emit debug info for this target
-    bool optimize;     // enable optimizations for this target
-    bool no_pie;       // disable PIE
+    bool emit_ast;    // emit AST files
+    bool emit_ir;     // emit LLVM IR
+    bool emit_asm;    // emit assembly
+    bool emit_object; // emit object files
+    bool debug;       // emit debug info for this target
+    bool optimize;    // enable optimizations for this target
+    bool no_pie;      // disable PIE
 
     // linking options
     char **link_libraries; // libraries to link (paths to .a, .so, .dylib, etc.)
     int    link_lib_count; // number of libraries to link
 } TargetConfig;
 
-// explicit dependency specification (parsed from [dependencies] table)
+// explicit dependency specification (parsed from [deps] tables)
 typedef struct DepSpec
 {
-    char *name;    // dependency/package name (key, also becomes module alias)
-    char *path;    // relative or absolute path to dependency source or mach.toml
-    char *src_dir; // resolved source directory inside dependency (computed)
+    char *name;    // dependency/package key (also becomes module alias)
+    char *type;    // dependency source classification: remote|local
+    char *path;    // remote URL or local filesystem path (used by dep tooling)
+    char *version; // optional version selector (required for remote)
 } DepSpec;
 
 // project configuration
@@ -46,6 +47,7 @@ typedef struct ProjectConfig
 
     // project directory structure
     char *src_dir; // source files directory
+    char *dep_dir; // dependencies directory
 
     // targets (per-target out_dir: targets[i].out_dir)
     TargetConfig **targets;      // array of target configurations
@@ -96,6 +98,7 @@ char *config_default_library_name(ProjectConfig *config, bool shared);
 char *config_resolve_main_file(ProjectConfig *config, const char *project_dir); // deprecated
 char *config_resolve_target_entrypoint(ProjectConfig *config, const char *project_dir, const char *target_name);
 char *config_resolve_src_dir(ProjectConfig *config, const char *project_dir);
+char *config_resolve_dep_dir(ProjectConfig *config, const char *project_dir);
 char *config_resolve_artifacts_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
 char *config_resolve_bin_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
 char *config_resolve_obj_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
@@ -125,5 +128,6 @@ bool config_ensure_directories(ProjectConfig *config, const char *project_dir);
 
 // configuration validation
 bool config_validate(ProjectConfig *config);
+bool config_validate_dep_structure(ProjectConfig *config, const char *project_dir);
 
 #endif

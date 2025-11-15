@@ -29,6 +29,14 @@ static bool config_target_mode_valid(const char *mode)
     return strcmp(mode, "executable") == 0 || strcmp(mode, "library") == 0 || strcmp(mode, "shared") == 0;
 }
 
+static bool config_dep_type_valid(const char *type)
+{
+    if (!type)
+        return false;
+
+    return strcmp(type, "remote") == 0 || strcmp(type, "local") == 0;
+}
+
 // simple toml parser for configuration
 typedef struct TomlParser
 {
@@ -434,6 +442,7 @@ void config_dnit(ProjectConfig *config)
     free(config->main_file);
     free(config->target);
     free(config->src_dir);
+    free(config->dep_dir);
 
     // cleanup targets
     for (int i = 0; i < config->target_count; i++)
@@ -450,14 +459,49 @@ void config_dnit(ProjectConfig *config)
         if (d)
         {
             free(d->name);
+            free(d->type);
             free(d->path);
-            free(d->src_dir);
+            free(d->version);
             free(d);
         }
     }
     free(config->deps);
 
     memset(config, 0, sizeof(ProjectConfig));
+}
+
+static DepSpec *config_ensure_dep(ProjectConfig *config, const char *name)
+{
+    if (!config || !name)
+        return NULL;
+
+    DepSpec *existing = config_get_dep(config, name);
+    if (existing)
+        return existing;
+
+    DepSpec *dep = calloc(1, sizeof(DepSpec));
+    if (!dep)
+        return NULL;
+
+    dep->name = strdup(name);
+    if (!dep->name)
+    {
+        free(dep);
+        return NULL;
+    }
+
+    DepSpec **new_arr = realloc(config->deps, (config->dep_count + 1) * sizeof(DepSpec *));
+    if (!new_arr)
+    {
+        free(dep->name);
+        free(dep);
+        return NULL;
+    }
+
+    config->deps                    = new_arr;
+    config->deps[config->dep_count] = dep;
+    config->dep_count++;
+    return dep;
 }
 
 bool config_add_target(ProjectConfig *config, const char *name, const char *target_triple)
@@ -805,43 +849,65 @@ ProjectConfig *config_load(const char *config_path)
                 toml_skip_table_value(&parser);
             }
         }
-        else if (strcmp(current_section, "dependencies") == 0)
+        else if (strncmp(current_section, "deps.", 5) == 0)
         {
-            // parse dependency: name = "path" with env var expansion
-            char *dep_path_raw = toml_parse_string(&parser);
-            if (dep_path_raw)
+            const char *dep_name = current_section + 5;
+            DepSpec    *dep      = config_ensure_dep(config, dep_name);
+            if (!dep)
             {
-                char *dep_path = expand_env_vars(dep_path_raw);
-                free(dep_path_raw);
+                fprintf(stderr, "error: failed to register dependency '%s'\n", dep_name);
+                free(key);
+                free(current_section);
+                free(content);
+                config_dnit(config);
+                free(config);
+                return NULL;
+            }
 
-                if (!dep_path)
+            if (strcmp(key, "type") == 0)
+            {
+                char *dep_type = toml_parse_string(&parser);
+                if (dep_type)
                 {
-                    fprintf(stderr, "error: failed to expand environment variables in dependency '%s'\n", key);
-                    free(key);
-                    free(current_section);
-                    free(content);
-                    config_dnit(config);
-                    free(config);
-                    return NULL;
+                    free(dep->type);
+                    dep->type = dep_type;
                 }
-
-                DepSpec *dep = calloc(1, sizeof(DepSpec));
-                dep->name    = strdup(key);
-                dep->path    = dep_path;
-                dep->src_dir = NULL; // will be resolved later
-
-                DepSpec **new_arr = realloc(config->deps, (config->dep_count + 1) * sizeof(DepSpec *));
-                if (new_arr)
+            }
+            else if (strcmp(key, "path") == 0)
+            {
+                char *dep_path_raw = toml_parse_string(&parser);
+                if (dep_path_raw)
                 {
-                    config->deps                      = new_arr;
-                    config->deps[config->dep_count++] = dep;
-                }
-                else
-                {
-                    free(dep->name);
+                    char *dep_path = expand_env_vars(dep_path_raw);
+                    free(dep_path_raw);
+
+                    if (!dep_path)
+                    {
+                        fprintf(stderr, "error: failed to expand environment variables in dependency '%s'\n", dep_name);
+                        free(key);
+                        free(current_section);
+                        free(content);
+                        config_dnit(config);
+                        free(config);
+                        return NULL;
+                    }
+
                     free(dep->path);
-                    free(dep);
+                    dep->path = dep_path;
                 }
+            }
+            else if (strcmp(key, "version") == 0)
+            {
+                char *dep_version = toml_parse_string(&parser);
+                if (dep_version)
+                {
+                    free(dep->version);
+                    dep->version = dep_version;
+                }
+            }
+            else
+            {
+                toml_skip_table_value(&parser);
             }
         }
 
@@ -871,9 +937,6 @@ bool config_save(ProjectConfig *config, const char *config_path)
     if (!file)
         return false;
 
-    fprintf(file, "# mach project configuration\n");
-    fprintf(file, "# all fields are required (mach explicitness philosophy)\n\n");
-
     fprintf(file, "[project]\n");
     if (config->id)
         fprintf(file, "id = \"%s\"\n", config->id);
@@ -883,6 +946,8 @@ bool config_save(ProjectConfig *config, const char *config_path)
         fprintf(file, "version = \"%s\"\n", config->version);
     if (config->src_dir)
         fprintf(file, "src = \"%s\"\n", config->src_dir);
+    if (config->dep_dir)
+        fprintf(file, "dep = \"%s\"\n", config->dep_dir);
     if (config->target)
         fprintf(file, "target = \"%s\"\n", config->target);
 
@@ -910,21 +975,33 @@ bool config_save(ProjectConfig *config, const char *config_path)
         fprintf(file, "emit-object = %s\n", target->emit_object ? "true" : "false");
         fprintf(file, "no-pie = %s\n", target->no_pie ? "true" : "false");
 
-        // Write link libraries if any
-        for (int j = 0; j < target->link_lib_count; j++)
+        // write link libraries as array if any
+        if (target->link_lib_count > 0)
         {
-            fprintf(file, "link = \"%s\"\n", target->link_libraries[j]);
+            fprintf(file, "link = [");
+            for (int j = 0; j < target->link_lib_count; j++)
+            {
+                fprintf(file, "\"%s\"", target->link_libraries[j]);
+                if (j < target->link_lib_count - 1)
+                    fprintf(file, ", ");
+            }
+            fprintf(file, "]\n");
         }
     }
 
     // dependencies (also serve as module aliases)
     if (config->dep_count > 0)
     {
-        fprintf(file, "\n[dependencies]\n");
         for (int i = 0; i < config->dep_count; i++)
         {
             DepSpec *d = config->deps[i];
-            fprintf(file, "%s = \"%s\"\n", d->name, d->path);
+            fprintf(file, "\n[deps.%s]\n", d->name);
+            if (d->type)
+                fprintf(file, "type = \"%s\"\n", d->type);
+            if (d->path)
+                fprintf(file, "path = \"%s\"\n", d->path);
+            if (d->version)
+                fprintf(file, "version = \"%s\"\n", d->version);
         }
     }
 
@@ -941,6 +1018,7 @@ ProjectConfig *config_create_default(const char *project_name)
     config->name    = strdup(project_name);
     config->version = strdup("0.1.0");
     config->src_dir = strdup("src");
+    config->dep_dir = strdup("dep");
     config->target  = strdup("native");
     // note: no default entrypoint or out_dir - they are per-target now
 
@@ -1153,6 +1231,26 @@ char *config_resolve_src_dir(ProjectConfig *config, const char *project_dir)
     size_t len  = strlen(project_dir) + strlen(config->src_dir) + 2;
     char  *path = malloc(len);
     snprintf(path, len, "%s/%s", project_dir, config->src_dir);
+
+    return path;
+}
+
+char *config_resolve_dep_dir(ProjectConfig *config, const char *project_dir)
+{
+    if (!config)
+        return NULL;
+
+    // use default "dep" if not configured
+    const char *dep_dir = config->dep_dir ? config->dep_dir : "dep";
+
+    // if dep dir is absolute path, return as is
+    if (dep_dir[0] == '/')
+        return strdup(dep_dir);
+
+    // resolve relative to project directory
+    size_t len  = strlen(project_dir) + strlen(dep_dir) + 2;
+    char  *path = malloc(len);
+    snprintf(path, len, "%s/%s", project_dir, dep_dir);
 
     return path;
 }
@@ -1437,9 +1535,11 @@ bool config_validate(ProjectConfig *config)
             return false;
         }
 
-        if (!target->entrypoint || strlen(target->entrypoint) == 0)
+        // entrypoint is required for executables, optional for libraries
+        bool is_library = strcmp(target->mode, "library") == 0 || strcmp(target->mode, "shared") == 0;
+        if (!is_library && (!target->entrypoint || strlen(target->entrypoint) == 0))
         {
-            fprintf(stderr, "error: [targets.%s] entrypoint is required\n", target->name);
+            fprintf(stderr, "error: [targets.%s] entrypoint is required for executable mode\n", target->name);
             return false;
         }
 
@@ -1447,7 +1547,67 @@ bool config_validate(ProjectConfig *config)
         // are implicitly validated as they default to false if not specified in parsing
     }
 
+    for (int i = 0; i < config->dep_count; i++)
+    {
+        DepSpec *dep = config->deps[i];
+        if (!dep->name || strlen(dep->name) == 0)
+        {
+            fprintf(stderr, "error: dependency entry missing name\n");
+            return false;
+        }
+
+        if (!config_dep_type_valid(dep->type))
+        {
+            fprintf(stderr, "error: [deps.%s] type must be 'remote' or 'local'\n", dep->name);
+            return false;
+        }
+
+        if (!dep->path || strlen(dep->path) == 0)
+        {
+            fprintf(stderr, "error: [deps.%s] path is required\n", dep->name);
+            return false;
+        }
+
+        if (strcmp(dep->type, "remote") == 0)
+        {
+            if (!dep->version || strlen(dep->version) == 0)
+            {
+                fprintf(stderr, "error: [deps.%s] version is required for remote dependencies\n", dep->name);
+                return false;
+            }
+        }
+    }
+
     return true;
+}
+
+bool config_validate_dep_structure(ProjectConfig *config, const char *project_dir)
+{
+    if (!config || !project_dir)
+        return true;
+
+    bool has_errors = false;
+
+    // check that each dependency has a valid mach.toml
+    for (int i = 0; i < config->dep_count; i++)
+    {
+        DepSpec *dep = config->deps[i];
+        if (!dep || !dep->name)
+            continue;
+
+        // build path to dependency's mach.toml
+        char dep_toml[PATH_MAX];
+        snprintf(dep_toml, sizeof(dep_toml), "%s/dep/%s/mach.toml", project_dir, dep->name);
+
+        struct stat st;
+        if (stat(dep_toml, &st) != 0 || !S_ISREG(st.st_mode))
+        {
+            fprintf(stderr, "error: dependency '%s' is missing a mach.toml file\n", dep->name);
+            has_errors = true;
+        }
+    }
+
+    return !has_errors;
 }
 
 // dependency discovery functions
@@ -1461,6 +1621,45 @@ DepSpec *config_get_dep(ProjectConfig *config, const char *name)
         if (strcmp(config->deps[i]->name, name) == 0)
             return config->deps[i];
     }
+    return NULL;
+}
+
+// get dependency by module prefix (checks dependency's project ID from mach.toml)
+static DepSpec *config_get_dep_by_prefix(ProjectConfig *config, const char *project_dir, const char *prefix)
+{
+    if (!config || !prefix)
+        return NULL;
+
+    // check each dependency's project ID from its mach.toml
+    for (int i = 0; i < config->dep_count; i++)
+    {
+        DepSpec *d = config->deps[i];
+        if (!d || !d->name)
+            continue;
+
+        // build path to dependency's mach.toml
+        char dep_root[PATH_MAX];
+        snprintf(dep_root, sizeof(dep_root), "%s/dep/%s/mach.toml", project_dir, d->name);
+
+        struct stat st;
+        if (stat(dep_root, &st) == 0 && S_ISREG(st.st_mode))
+        {
+            // load the dependency's config to get its project ID
+            ProjectConfig *dep_config = config_load(dep_root);
+            if (dep_config && dep_config->id && strcmp(dep_config->id, prefix) == 0)
+            {
+                config_dnit(dep_config);
+                free(dep_config);
+                return d;
+            }
+            if (dep_config)
+            {
+                config_dnit(dep_config);
+                free(dep_config);
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -1591,13 +1790,27 @@ char *config_resolve_package_root(ProjectConfig *config, const char *project_dir
     {
         return strdup(project_dir);
     }
-    // external
-    DepSpec *dep = config_get_dep(config, package_name);
+    // external - resolve by module prefix (project ID)
+    DepSpec *dep = config_get_dep_by_prefix(config, project_dir, package_name);
     if (!dep)
         return NULL;
-    // path is relative to project_dir if not absolute
+    size_t vendor_len = strlen(project_dir) + strlen("/dep/") + strlen(dep->name ? dep->name : package_name) + 1;
+    char  *vendor     = malloc(vendor_len);
+    snprintf(vendor, vendor_len, "%s/dep/%s", project_dir, dep->name ? dep->name : package_name);
+
+    struct stat st;
+    if (stat(vendor, &st) == 0 && S_ISDIR(st.st_mode))
+    {
+        return vendor;
+    }
+    free(vendor);
+
+    if (!dep->path || dep->path[0] == '\0')
+        return NULL;
+
     if (dep->path[0] == '/')
         return strdup(dep->path);
+
     size_t len = strlen(project_dir) + 1 + strlen(dep->path) + 1;
     char  *buf = malloc(len);
     snprintf(buf, len, "%s/%s", project_dir, dep->path);

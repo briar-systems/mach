@@ -219,3 +219,130 @@ char *fs_get_base_filename(const char *path)
     base[len] = '\0';
     return base;
 }
+
+#ifndef _WIN32
+#include <dirent.h>
+#endif
+
+static void fs_list_mach_files_recursive_impl(const char *dir_path, char ***files, int *count, int *capacity)
+{
+#ifdef _WIN32
+    // windows directory traversal using FindFirstFile/FindNextFile
+    WIN32_FIND_DATA find_data;
+    char search_path[PATH_MAX];
+    snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
+    
+    HANDLE handle = FindFirstFile(search_path, &find_data);
+    if (handle == INVALID_HANDLE_VALUE)
+        return;
+    
+    do {
+        if (strcmp(find_data.cFileName, ".") == 0 || strcmp(find_data.cFileName, "..") == 0)
+            continue;
+        
+        char full_path[PATH_MAX];
+        snprintf(full_path, sizeof(full_path), "%s\\%s", dir_path, find_data.cFileName);
+        
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            // recurse into subdirectory
+            fs_list_mach_files_recursive_impl(full_path, files, count, capacity);
+        }
+        else
+        {
+            // check if it's a .mach file
+            size_t len = strlen(find_data.cFileName);
+            if (len > 5 && strcmp(find_data.cFileName + len - 5, ".mach") == 0)
+            {
+                if (*count >= *capacity)
+                {
+                    *capacity = *capacity == 0 ? 16 : *capacity * 2;
+                    *files = realloc(*files, sizeof(char*) * (*capacity + 1));
+                }
+                (*files)[*count] = strdup(full_path);
+                (*count)++;
+            }
+        }
+    } while (FindNextFile(handle, &find_data));
+    
+    FindClose(handle);
+#else
+    // unix directory traversal using opendir/readdir
+    DIR *dir = opendir(dir_path);
+    if (!dir)
+        return;
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        
+        char full_path[PATH_MAX];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
+        
+        struct stat st;
+        if (stat(full_path, &st) != 0)
+            continue;
+        
+        if (S_ISDIR(st.st_mode))
+        {
+            // recurse into subdirectory
+            fs_list_mach_files_recursive_impl(full_path, files, count, capacity);
+        }
+        else if (S_ISREG(st.st_mode))
+        {
+            // check if it's a .mach file
+            size_t len = strlen(entry->d_name);
+            if (len > 5 && strcmp(entry->d_name + len - 5, ".mach") == 0)
+            {
+                if (*count >= *capacity)
+                {
+                    *capacity = *capacity == 0 ? 16 : *capacity * 2;
+                    *files = realloc(*files, sizeof(char*) * (*capacity + 1));
+                }
+                (*files)[*count] = strdup(full_path);
+                (*count)++;
+            }
+        }
+    }
+    
+    closedir(dir);
+#endif
+}
+
+char **fs_list_mach_files_recursive(const char *dir_path)
+{
+    char **files = NULL;
+    int count = 0;
+    int capacity = 0;
+    
+    fs_list_mach_files_recursive_impl(dir_path, &files, &count, &capacity);
+    
+    // null-terminate the array
+    if (count > 0)
+    {
+        files = realloc(files, sizeof(char*) * (count + 1));
+        files[count] = NULL;
+    }
+    else
+    {
+        // return empty null-terminated array
+        files = malloc(sizeof(char*));
+        files[0] = NULL;
+    }
+    
+    return files;
+}
+
+void fs_free_string_array(char **array)
+{
+    if (!array)
+        return;
+    
+    for (int i = 0; array[i] != NULL; i++)
+    {
+        free(array[i]);
+    }
+    free(array);
+}
