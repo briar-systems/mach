@@ -24,12 +24,17 @@ Many Mach projects, including the mach compiler itself, expect the `MACH_HOME` e
 export MACH_HOME="/path/to/mach"
 ```
 
-When authoring a `mach.toml` file, reference the standard library via `MACH_HOME` so that downstream consumers resolve the dependency correctly:
+When authoring a `mach.toml`, declare dependencies with `[deps.<name>]` tables so downstream consumers resolve them consistently. The parent `[deps]` header is optional. For example, vendoring the standard library from your local checkout looks like this:
 
 ```toml
-[dependencies]
-std = "${MACH_HOME}/std"
+[deps.std]
+type = "local"
+path = "${MACH_HOME}/std"
 ```
+
+Run `mach dep info <name>` or `mach dep list` at the project root to inspect configured dependencies and their expected vendored locations under `dep/<name>`. Use `mach dep add [--local] <path> <name>` to declare new dependencies (defaulting to remote sources, with `--local` kept for filesystem paths). The `mach dep add`, `mach dep del`, and `mach dep pull` commands are scaffolds for future automation (local copies vs. remote git sources); for now they simply report that the functionality is not implemented yet while the tooling is designed.
+
+Remote dependencies must also specify a `version` field; local dependencies may omit it.
 
 Using the environment variable keeps project configuration portable by avoiding hard-coded absolute paths.
 

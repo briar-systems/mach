@@ -25,6 +25,7 @@ void mach_print_usage(const char *program_name)
     fprintf(stderr, "  init  <name>         create a new Mach project\n");
     fprintf(stderr, "  build <path|file>    build a project or single file\n");
     fprintf(stderr, "  run   [path]         run a project executable\n");
+    fprintf(stderr, "  dep   <subcommand>   manage project dependencies\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "build options:\n");
     fprintf(stderr, "  <path>               build project from directory (requires mach.toml)\n");
@@ -73,8 +74,9 @@ const char *mach_toml_template = "[project]\n"
                                  "src = \"%s\"\n"
                                  "target = \"%s\"\n"
                                  "\n"
-                                 "[dependencies]\n"
-                                 "std = \"%s\"\n"
+                                 "[deps.std]\n"
+                                 "type = \"local\"\n"
+                                 "path = \"%s\"\n"
                                  "\n"
                                  "[targets.linux]\n"
                                  "triple = \"x86_64-pc-linux-gnu\"\n"
@@ -216,6 +218,20 @@ int mach_cmd_build(int argc, char **argv)
         if (!config_validate(config))
         {
             fprintf(stderr, "error: invalid configuration in mach.toml\n");
+            if (config)
+            {
+                config_dnit(config);
+            }
+
+            if (project_root)
+                free(project_root);
+            build_options_dnit(&opts);
+            return 1;
+        }
+
+        // Validate dependency structure
+        if (!config_validate_dep_structure(config, project_root))
+        {
             if (config)
             {
                 config_dnit(config);
@@ -396,9 +412,11 @@ int mach_cmd_build(int argc, char **argv)
             }
         }
 
-        // Step 3: Resolve entrypoint from target
+        // Step 3: Resolve entrypoint from target (or handle library mode without entrypoint)
         char *entrypoint_path = config_resolve_target_entrypoint(config, project_root, target_name);
-        if (!entrypoint_path)
+        bool  is_library      = config_should_build_library(config, target_name);
+
+        if (!entrypoint_path && !is_library)
         {
             fprintf(stderr, "error: could not resolve entrypoint for target '%s'\n", target_name);
             build_options_dnit(&opts);
@@ -412,6 +430,140 @@ int mach_cmd_build(int argc, char **argv)
             return 1;
         }
 
+        if (!entrypoint_path && is_library)
+        {
+            // Library mode - check for lib.mach entrypoint
+            char *lib_src_dir = config_resolve_src_dir(config, project_root);
+            if (!lib_src_dir)
+            {
+                fprintf(stderr, "error: could not resolve source directory for target '%s'\n", target_name);
+                build_options_dnit(&opts);
+                if (config)
+                    config_dnit(config);
+                if (project_root)
+                    free(project_root);
+                return 1;
+            }
+
+            // try to find lib.mach as entrypoint
+            size_t lib_mach_path_len = strlen(lib_src_dir) + strlen("/lib.mach") + 1;
+            char  *lib_mach_path     = malloc(lib_mach_path_len);
+            snprintf(lib_mach_path, lib_mach_path_len, "%s/lib.mach", lib_src_dir);
+
+            if (fs_file_exists(lib_mach_path))
+            {
+                // use lib.mach as entrypoint
+                entrypoint_path = lib_mach_path;
+                free(lib_src_dir);
+            }
+            else
+            {
+                // fallback to old behavior: compile all source files
+                free(lib_mach_path);
+
+                // discover all .mach files in source directory
+                char **mach_files = fs_list_mach_files_recursive(lib_src_dir);
+            if (!mach_files || mach_files[0] == NULL)
+            {
+                fprintf(stderr, "error: no .mach files found in source directory '%s'\n", lib_src_dir);
+                free(lib_src_dir);
+                fs_free_string_array(mach_files);
+                build_options_dnit(&opts);
+                if (config)
+                    config_dnit(config);
+                if (project_root)
+                    free(project_root);
+                return 1;
+            }
+
+            // compile each file
+            bool all_success = true;
+            for (int i = 0; mach_files[i] != NULL; i++)
+            {
+                BuildOptions file_opts;
+                build_options_init(&file_opts);
+
+                file_opts.input_file  = mach_files[i];
+                file_opts.opt_level   = target->optimize ? 2 : 0;
+                file_opts.emit_ast    = target->emit_ast;
+                file_opts.emit_ir     = target->emit_ir;
+                file_opts.emit_asm    = target->emit_asm;
+                file_opts.no_pie      = target->no_pie;
+                file_opts.debug_info  = target->debug ? 1 : 0;
+                file_opts.link_exe    = 0; // never link individual library files
+                file_opts.target_name = target_name;
+
+                // copy target link libraries
+                for (int j = 0; j < target->link_lib_count; j++)
+                    build_options_add_link_object(&file_opts, target->link_libraries[j]);
+
+                // register project source directory as module alias
+                build_options_add_alias(&file_opts, config->id, lib_src_dir);
+
+                // set up output directories
+                if (!file_opts.obj_dir)
+                    file_opts.obj_dir = config_resolve_obj_dir(config, project_root, target_name);
+
+                // add dependency mappings
+                for (int j = 0; j < config->dep_count; j++)
+                {
+                    DepSpec *dep = config->deps[j];
+                    if (strcmp(dep->type, "local") == 0)
+                    {
+                        char *dep_path = dep->path;
+                        if (dep_path[0] != '/')
+                        {
+                            size_t len      = strlen(project_root) + strlen(dep_path) + 2;
+                            char  *abs_path = malloc(len);
+                            snprintf(abs_path, len, "%s/%s", project_root, dep_path);
+                            build_options_add_alias(&file_opts, dep->name, abs_path);
+                            free(abs_path);
+                        }
+                        else
+                        {
+                            build_options_add_alias(&file_opts, dep->name, dep_path);
+                        }
+                    }
+                }
+
+                CompilationContext ctx;
+                if (!compilation_context_init(&ctx, &file_opts))
+                {
+                    fprintf(stderr, "error: failed to initialize compilation context for '%s'\n", mach_files[i]);
+                    all_success = false;
+                    build_options_dnit(&file_opts);
+                    continue;
+                }
+
+                // set target os/arch from target triple for library mode
+                if (target->target_triple)
+                {
+                    comptime_build_context_init_from_triple(&ctx.driver->comptime_ctx, target->target_triple);
+                }
+
+                bool success = compilation_run(&ctx);
+                if (!success)
+                {
+                    fprintf(stderr, "error: compilation failed for '%s'\n", mach_files[i]);
+                    all_success = false;
+                }
+
+                compilation_context_dnit(&ctx);
+                build_options_dnit(&file_opts);
+            }
+
+                free(lib_src_dir);
+                fs_free_string_array(mach_files);
+                build_options_dnit(&opts);
+                if (config)
+                    config_dnit(config);
+                if (project_root)
+                    free(project_root);
+
+                return all_success ? 0 : 1;
+            }
+        }
+
         opts.input_file = entrypoint_path;
 
         // Step 4: Apply config defaults from target
@@ -422,6 +574,12 @@ int mach_cmd_build(int argc, char **argv)
         opts.no_pie      = target->no_pie;
         opts.debug_info  = target->debug ? 1 : 0;
         opts.target_name = target_name; // store target name for directory structure
+
+        // disable linking for library targets
+        if (is_library)
+        {
+            opts.link_exe = 0;
+        }
 
         // Add target link libraries
         for (int i = 0; i < target->link_lib_count; i++)
@@ -687,7 +845,93 @@ int mach_cmd_build(int argc, char **argv)
         return 1;
     }
 
+    // set target os/arch from target triple for project mode
+    if (target && target->target_triple)
+    {
+        comptime_build_context_init_from_triple(&ctx.driver->comptime_ctx, target->target_triple);
+    }
+
     bool success = compilation_run(&ctx);
+
+    // for library mode, create static or shared library from all modules
+    bool is_library_mode = target && config_should_build_library(config, target_name);
+    if (success && is_library_mode && target)
+    {
+        // collect all object files from module manager
+        char **obj_files = NULL;
+        int    obj_count = 0;
+        module_manager_get_link_objects(&ctx.driver->module_manager, &obj_files, &obj_count);
+
+        if (obj_count > 0)
+        {
+            char *lib_output = config_resolve_final_output_path(config, project_root, target_name);
+            if (lib_output)
+            {
+                // ensure output directory exists
+                char *lib_dir = fs_dirname(lib_output);
+                if (lib_dir)
+                {
+                    fs_ensure_dir_recursive(lib_dir);
+                    free(lib_dir);
+                }
+
+                bool is_shared = config_is_shared_library(config, target_name);
+
+                if (is_shared)
+                {
+                    // create shared library
+                    size_t cmd_size = 512;
+                    for (int i = 0; i < obj_count; i++)
+                        cmd_size += strlen(obj_files[i]) + 1;
+
+                    char *cmd = malloc(cmd_size);
+#ifdef _WIN32
+                    snprintf(cmd, cmd_size, "clang -shared -o %s", lib_output);
+#else
+                    snprintf(cmd, cmd_size, "cc -shared -o %s", lib_output);
+#endif
+                    for (int i = 0; i < obj_count; i++)
+                    {
+                        strcat(cmd, " ");
+                        strcat(cmd, obj_files[i]);
+                    }
+
+                    int result = system(cmd);
+                    if (result != 0)
+                    {
+                        fprintf(stderr, "error: failed to create shared library '%s'\n", lib_output);
+                        success = false;
+                    }
+                    free(cmd);
+                }
+                else
+                {
+                    // create static library using ar
+                    size_t cmd_size = 512;
+                    for (int i = 0; i < obj_count; i++)
+                        cmd_size += strlen(obj_files[i]) + 1;
+
+                    char *cmd = malloc(cmd_size);
+                    snprintf(cmd, cmd_size, "ar rcs %s", lib_output);
+                    for (int i = 0; i < obj_count; i++)
+                    {
+                        strcat(cmd, " ");
+                        strcat(cmd, obj_files[i]);
+                    }
+
+                    int result = system(cmd);
+                    if (result != 0)
+                    {
+                        fprintf(stderr, "error: failed to create static library '%s'\n", lib_output);
+                        success = false;
+                    }
+                    free(cmd);
+                }
+
+                free(lib_output);
+            }
+        }
+    }
 
     compilation_context_dnit(&ctx);
     build_options_dnit(&opts);
