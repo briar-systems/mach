@@ -25,4 +25,11 @@ char *fs_get_base_filename(const char *path);
 // duplicate directory portion of path
 char *fs_dirname(const char *path);
 
+// recursively list all .mach files in directory
+// returns array of absolute paths, terminated by NULL
+char **fs_list_mach_files_recursive(const char *dir_path);
+
+// free array of strings
+void fs_free_string_array(char **array);
+
 #endif

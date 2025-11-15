@@ -47,6 +47,7 @@ typedef struct ProjectConfig
 
     // project directory structure
     char *src_dir; // source files directory
+    char *dep_dir; // dependencies directory
 
     // targets (per-target out_dir: targets[i].out_dir)
     TargetConfig **targets;      // array of target configurations
@@ -97,6 +98,7 @@ char *config_default_library_name(ProjectConfig *config, bool shared);
 char *config_resolve_main_file(ProjectConfig *config, const char *project_dir); // deprecated
 char *config_resolve_target_entrypoint(ProjectConfig *config, const char *project_dir, const char *target_name);
 char *config_resolve_src_dir(ProjectConfig *config, const char *project_dir);
+char *config_resolve_dep_dir(ProjectConfig *config, const char *project_dir);
 char *config_resolve_artifacts_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
 char *config_resolve_bin_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
 char *config_resolve_obj_dir(ProjectConfig *config, const char *project_dir, const char *target_name);

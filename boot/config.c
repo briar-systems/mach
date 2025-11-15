@@ -442,6 +442,7 @@ void config_dnit(ProjectConfig *config)
     free(config->main_file);
     free(config->target);
     free(config->src_dir);
+    free(config->dep_dir);
 
     // cleanup targets
     for (int i = 0; i < config->target_count; i++)
@@ -948,6 +949,8 @@ bool config_save(ProjectConfig *config, const char *config_path)
         fprintf(file, "version = \"%s\"\n", config->version);
     if (config->src_dir)
         fprintf(file, "src = \"%s\"\n", config->src_dir);
+    if (config->dep_dir)
+        fprintf(file, "dep = \"%s\"\n", config->dep_dir);
     if (config->target)
         fprintf(file, "target = \"%s\"\n", config->target);
 
@@ -1011,6 +1014,7 @@ ProjectConfig *config_create_default(const char *project_name)
     config->name    = strdup(project_name);
     config->version = strdup("0.1.0");
     config->src_dir = strdup("src");
+    config->dep_dir = strdup("dep");
     config->target  = strdup("native");
     // note: no default entrypoint or out_dir - they are per-target now
 
@@ -1223,6 +1227,26 @@ char *config_resolve_src_dir(ProjectConfig *config, const char *project_dir)
     size_t len  = strlen(project_dir) + strlen(config->src_dir) + 2;
     char  *path = malloc(len);
     snprintf(path, len, "%s/%s", project_dir, config->src_dir);
+
+    return path;
+}
+
+char *config_resolve_dep_dir(ProjectConfig *config, const char *project_dir)
+{
+    if (!config)
+        return NULL;
+
+    // use default "dep" if not configured
+    const char *dep_dir = config->dep_dir ? config->dep_dir : "dep";
+
+    // if dep dir is absolute path, return as is
+    if (dep_dir[0] == '/')
+        return strdup(dep_dir);
+
+    // resolve relative to project directory
+    size_t len  = strlen(project_dir) + strlen(dep_dir) + 2;
+    char  *path = malloc(len);
+    snprintf(path, len, "%s/%s", project_dir, dep_dir);
 
     return path;
 }
@@ -1507,9 +1531,11 @@ bool config_validate(ProjectConfig *config)
             return false;
         }
 
-        if (!target->entrypoint || strlen(target->entrypoint) == 0)
+        // entrypoint is required for executables, optional for libraries
+        bool is_library = strcmp(target->mode, "library") == 0 || strcmp(target->mode, "shared") == 0;
+        if (!is_library && (!target->entrypoint || strlen(target->entrypoint) == 0))
         {
-            fprintf(stderr, "error: [targets.%s] entrypoint is required\n", target->name);
+            fprintf(stderr, "error: [targets.%s] entrypoint is required for executable mode\n", target->name);
             return false;
         }
 
