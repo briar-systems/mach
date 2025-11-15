@@ -54,6 +54,7 @@ typedef struct ComptimeValue
 } ComptimeValue;
 
 void comptime_build_context_init_host(ComptimeBuildContext *ctx);
+void comptime_build_context_init_from_triple(ComptimeBuildContext *ctx, const char *target_triple);
 bool comptime_get_constant(const char *name, ComptimeValue *out_value, const ComptimeBuildContext *ctx);
 
 #endif // COMPTIME_H

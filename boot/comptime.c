@@ -58,6 +58,59 @@ void comptime_build_context_init_host(ComptimeBuildContext *ctx)
     ctx->build_version       = "";
 }
 
+// parse target triple and initialize comptime context
+void comptime_build_context_init_from_triple(ComptimeBuildContext *ctx, const char *target_triple)
+{
+    if (!ctx || !target_triple)
+        return;
+
+    // initialize with host defaults first
+    comptime_build_context_init_host(ctx);
+
+    // override with parsed triple
+    ctx->target_triple = target_triple;
+
+    // parse arch from triple (arch-vendor-os)
+    if (strncmp(target_triple, "x86_64", 6) == 0)
+    {
+        ctx->target_arch         = COMPTIME_ARCH_X86_64;
+        ctx->target_pointer_size = 8;
+    }
+    else if (strncmp(target_triple, "aarch64", 7) == 0 || strncmp(target_triple, "arm64", 5) == 0)
+    {
+        ctx->target_arch         = COMPTIME_ARCH_ARM64;
+        ctx->target_pointer_size = 8;
+    }
+    else if (strncmp(target_triple, "arm", 3) == 0)
+    {
+        ctx->target_arch         = COMPTIME_ARCH_ARM;
+        ctx->target_pointer_size = 4;
+    }
+    else if (strncmp(target_triple, "riscv64", 7) == 0)
+    {
+        ctx->target_arch         = COMPTIME_ARCH_RISCV64;
+        ctx->target_pointer_size = 8;
+    }
+
+    // parse os from triple
+    if (strstr(target_triple, "linux"))
+    {
+        ctx->target_os = COMPTIME_OS_LINUX;
+    }
+    else if (strstr(target_triple, "darwin") || strstr(target_triple, "macos"))
+    {
+        ctx->target_os = COMPTIME_OS_DARWIN;
+    }
+    else if (strstr(target_triple, "windows") || strstr(target_triple, "msvc") || strstr(target_triple, "mingw"))
+    {
+        ctx->target_os = COMPTIME_OS_WINDOWS;
+    }
+    else if (strstr(target_triple, "bsd") || strstr(target_triple, "freebsd") || strstr(target_triple, "openbsd"))
+    {
+        ctx->target_os = COMPTIME_OS_BSD;
+    }
+}
+
 bool comptime_get_constant(const char *name, ComptimeValue *out_value, const ComptimeBuildContext *ctx)
 {
     if (!name || !out_value)

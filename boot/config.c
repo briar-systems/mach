@@ -937,9 +937,6 @@ bool config_save(ProjectConfig *config, const char *config_path)
     if (!file)
         return false;
 
-    fprintf(file, "# mach project configuration\n");
-    fprintf(file, "# all fields are required (mach explicitness philosophy)\n\n");
-
     fprintf(file, "[project]\n");
     if (config->id)
         fprintf(file, "id = \"%s\"\n", config->id);

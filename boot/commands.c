@@ -432,7 +432,7 @@ int mach_cmd_build(int argc, char **argv)
 
         if (!entrypoint_path && is_library)
         {
-            // Library mode without entrypoint - compile all source files in src directory
+            // Library mode - check for lib.mach entrypoint
             char *lib_src_dir = config_resolve_src_dir(config, project_root);
             if (!lib_src_dir)
             {
@@ -445,8 +445,24 @@ int mach_cmd_build(int argc, char **argv)
                 return 1;
             }
 
-            // discover all .mach files in source directory
-            char **mach_files = fs_list_mach_files_recursive(lib_src_dir);
+            // try to find lib.mach as entrypoint
+            size_t lib_mach_path_len = strlen(lib_src_dir) + strlen("/lib.mach") + 1;
+            char  *lib_mach_path     = malloc(lib_mach_path_len);
+            snprintf(lib_mach_path, lib_mach_path_len, "%s/lib.mach", lib_src_dir);
+
+            if (fs_file_exists(lib_mach_path))
+            {
+                // use lib.mach as entrypoint
+                entrypoint_path = lib_mach_path;
+                free(lib_src_dir);
+            }
+            else
+            {
+                // fallback to old behavior: compile all source files
+                free(lib_mach_path);
+
+                // discover all .mach files in source directory
+                char **mach_files = fs_list_mach_files_recursive(lib_src_dir);
             if (!mach_files || mach_files[0] == NULL)
             {
                 fprintf(stderr, "error: no .mach files found in source directory '%s'\n", lib_src_dir);
@@ -519,6 +535,12 @@ int mach_cmd_build(int argc, char **argv)
                     continue;
                 }
 
+                // set target os/arch from target triple for library mode
+                if (target->target_triple)
+                {
+                    comptime_build_context_init_from_triple(&ctx.driver->comptime_ctx, target->target_triple);
+                }
+
                 bool success = compilation_run(&ctx);
                 if (!success)
                 {
@@ -530,15 +552,16 @@ int mach_cmd_build(int argc, char **argv)
                 build_options_dnit(&file_opts);
             }
 
-            free(lib_src_dir);
-            fs_free_string_array(mach_files);
-            build_options_dnit(&opts);
-            if (config)
-                config_dnit(config);
-            if (project_root)
-                free(project_root);
+                free(lib_src_dir);
+                fs_free_string_array(mach_files);
+                build_options_dnit(&opts);
+                if (config)
+                    config_dnit(config);
+                if (project_root)
+                    free(project_root);
 
-            return all_success ? 0 : 1;
+                return all_success ? 0 : 1;
+            }
         }
 
         opts.input_file = entrypoint_path;
@@ -822,7 +845,93 @@ int mach_cmd_build(int argc, char **argv)
         return 1;
     }
 
+    // set target os/arch from target triple for project mode
+    if (target && target->target_triple)
+    {
+        comptime_build_context_init_from_triple(&ctx.driver->comptime_ctx, target->target_triple);
+    }
+
     bool success = compilation_run(&ctx);
+
+    // for library mode, create static or shared library from all modules
+    bool is_library_mode = target && config_should_build_library(config, target_name);
+    if (success && is_library_mode && target)
+    {
+        // collect all object files from module manager
+        char **obj_files = NULL;
+        int    obj_count = 0;
+        module_manager_get_link_objects(&ctx.driver->module_manager, &obj_files, &obj_count);
+
+        if (obj_count > 0)
+        {
+            char *lib_output = config_resolve_final_output_path(config, project_root, target_name);
+            if (lib_output)
+            {
+                // ensure output directory exists
+                char *lib_dir = fs_dirname(lib_output);
+                if (lib_dir)
+                {
+                    fs_ensure_dir_recursive(lib_dir);
+                    free(lib_dir);
+                }
+
+                bool is_shared = config_is_shared_library(config, target_name);
+
+                if (is_shared)
+                {
+                    // create shared library
+                    size_t cmd_size = 512;
+                    for (int i = 0; i < obj_count; i++)
+                        cmd_size += strlen(obj_files[i]) + 1;
+
+                    char *cmd = malloc(cmd_size);
+#ifdef _WIN32
+                    snprintf(cmd, cmd_size, "clang -shared -o %s", lib_output);
+#else
+                    snprintf(cmd, cmd_size, "cc -shared -o %s", lib_output);
+#endif
+                    for (int i = 0; i < obj_count; i++)
+                    {
+                        strcat(cmd, " ");
+                        strcat(cmd, obj_files[i]);
+                    }
+
+                    int result = system(cmd);
+                    if (result != 0)
+                    {
+                        fprintf(stderr, "error: failed to create shared library '%s'\n", lib_output);
+                        success = false;
+                    }
+                    free(cmd);
+                }
+                else
+                {
+                    // create static library using ar
+                    size_t cmd_size = 512;
+                    for (int i = 0; i < obj_count; i++)
+                        cmd_size += strlen(obj_files[i]) + 1;
+
+                    char *cmd = malloc(cmd_size);
+                    snprintf(cmd, cmd_size, "ar rcs %s", lib_output);
+                    for (int i = 0; i < obj_count; i++)
+                    {
+                        strcat(cmd, " ");
+                        strcat(cmd, obj_files[i]);
+                    }
+
+                    int result = system(cmd);
+                    if (result != 0)
+                    {
+                        fprintf(stderr, "error: failed to create static library '%s'\n", lib_output);
+                        success = false;
+                    }
+                    free(cmd);
+                }
+
+                free(lib_output);
+            }
+        }
+    }
 
     compilation_context_dnit(&ctx);
     build_options_dnit(&opts);
