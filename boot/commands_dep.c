@@ -317,6 +317,29 @@ static int cmd_dep_add(int argc, char **argv)
         char vendor_path[PATH_MAX];
         snprintf(vendor_path, sizeof(vendor_path), "dep/%s", dep_name);
 
+        // clean up any orphaned submodule state
+        struct stat st;
+        char        modules_path[PATH_MAX];
+        snprintf(modules_path, sizeof(modules_path), "%s/.git/modules/%s", project_root, vendor_path);
+        if (stat(modules_path, &st) == 0)
+        {
+            // orphaned .git/modules entry exists, remove it
+            printf("cleaning up orphaned submodule data for '%s'...\n", dep_name);
+            char rm_cmd[PATH_MAX * 2];
+            snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", modules_path);
+            run_git_command(rm_cmd);
+        }
+
+        // remove any orphaned working tree directory
+        char vendor_full_path[PATH_MAX];
+        snprintf(vendor_full_path, sizeof(vendor_full_path), "%s/%s", project_root, vendor_path);
+        if (stat(vendor_full_path, &st) == 0)
+        {
+            char rm_cmd[PATH_MAX * 2];
+            snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", vendor_full_path);
+            run_git_command(rm_cmd);
+        }
+
         char git_cmd[PATH_MAX * 2];
         snprintf(git_cmd, sizeof(git_cmd), "cd %s && git submodule add %s %s", project_root, path_or_url, vendor_path);
 
@@ -332,6 +355,32 @@ static int cmd_dep_add(int argc, char **argv)
             free(config);
             free(project_root);
             return 1;
+        }
+
+        // get the current commit hash to pin the dependency
+        char hash_cmd[PATH_MAX * 2];
+        snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
+
+        FILE *hash_pipe = popen(hash_cmd, "r");
+        if (hash_pipe)
+        {
+            char commit_hash[256];
+            if (fgets(commit_hash, sizeof(commit_hash), hash_pipe))
+            {
+                size_t len = strlen(commit_hash);
+                if (len > 0 && commit_hash[len - 1] == '\n')
+                    commit_hash[len - 1] = '\0';
+
+                printf("pinning '%s' to commit '%s'\n", dep_name, commit_hash);
+                new_dep->version = strdup(commit_hash);
+            }
+            pclose(hash_pipe);
+        }
+
+        if (!new_dep->version)
+        {
+            fprintf(stderr, "warning: failed to resolve commit hash for '%s'\n", dep_name);
+            new_dep->version = strdup("HEAD"); // fallback
         }
     }
 
@@ -411,13 +460,30 @@ static int cmd_dep_del(int argc, char **argv)
         char vendor_path[PATH_MAX];
         snprintf(vendor_path, sizeof(vendor_path), "dep/%s", dep_name);
 
-        char git_cmd[PATH_MAX * 2];
-        snprintf(git_cmd, sizeof(git_cmd), "cd %s && git submodule deinit -f %s && git rm -f %s", project_root, vendor_path, vendor_path);
-
         printf("removing git submodule for '%s'...\n", dep_name);
+
+        // step 1: deinit the submodule
+        char git_cmd[PATH_MAX * 2];
+        snprintf(git_cmd, sizeof(git_cmd), "cd %s && git submodule deinit -f %s", project_root, vendor_path);
         if (run_git_command(git_cmd) != 0)
         {
-            fprintf(stderr, "warning: failed to remove git submodule (continuing anyway)\n");
+            fprintf(stderr, "warning: failed to deinit git submodule\n");
+        }
+
+        // step 2: remove from working tree and .gitmodules
+        snprintf(git_cmd, sizeof(git_cmd), "cd %s && git rm -f %s", project_root, vendor_path);
+        if (run_git_command(git_cmd) != 0)
+        {
+            fprintf(stderr, "warning: failed to remove submodule from git\n");
+        }
+
+        // step 3: remove .git/modules entry
+        char modules_path[PATH_MAX];
+        snprintf(modules_path, sizeof(modules_path), "%s/.git/modules/%s", project_root, vendor_path);
+        snprintf(git_cmd, sizeof(git_cmd), "rm -rf %s", modules_path);
+        if (run_git_command(git_cmd) != 0)
+        {
+            fprintf(stderr, "warning: failed to clean up .git/modules entry\n");
         }
     }
 
@@ -505,6 +571,13 @@ static int cmd_dep_pull(int argc, char **argv)
             continue;
         }
 
+        // fetch latest changes
+        snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git fetch --all --tags", project_root, vendor_path);
+        if (run_git_command(git_cmd) != 0)
+        {
+            fprintf(stderr, "warning: failed to fetch updates for '%s'\n", dep->name);
+        }
+
         // determine what to checkout based on version field
         char *resolved_ref = NULL;
         if (dep->version && strlen(dep->version) > 0)
@@ -512,7 +585,7 @@ static int cmd_dep_pull(int argc, char **argv)
             // check if version starts with "branch/"
             if (strncmp(dep->version, "branch/", 7) == 0)
             {
-                // branch reference
+                // branch reference - checkout and pull latest
                 const char *branch_name = dep->version + 7;
                 printf("  checking out branch '%s'\n", branch_name);
                 snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout %s && git pull origin %s", project_root, vendor_path, branch_name, branch_name);
@@ -522,82 +595,157 @@ static int cmd_dep_pull(int argc, char **argv)
                     success = 0;
                     continue;
                 }
-                resolved_ref = strdup(branch_name);
+
+                // get the new commit hash after pulling
+                char hash_cmd[PATH_MAX * 2];
+                snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
+                FILE *hash_pipe = popen(hash_cmd, "r");
+                if (hash_pipe)
+                {
+                    char commit_hash[256];
+                    if (fgets(commit_hash, sizeof(commit_hash), hash_pipe))
+                    {
+                        size_t len = strlen(commit_hash);
+                        if (len > 0 && commit_hash[len - 1] == '\n')
+                            commit_hash[len - 1] = '\0';
+                        printf("  updated to commit '%s'\n", commit_hash);
+                        resolved_ref = strdup(commit_hash);
+                    }
+                    pclose(hash_pipe);
+                }
+                if (!resolved_ref)
+                    resolved_ref = strdup(branch_name);
             }
             else
             {
-                // try semver tag resolution first
-                snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git fetch --tags", project_root, vendor_path);
-                if (run_git_command(git_cmd) != 0)
+                // check if it looks like a commit hash (40 hex chars)
+                int is_commit_hash = strlen(dep->version) == 40;
+                if (is_commit_hash)
                 {
-                    fprintf(stderr, "warning: failed to fetch tags for '%s'\n", dep->name);
-                }
-
-                char tag_cmd[PATH_MAX * 2];
-                snprintf(tag_cmd, sizeof(tag_cmd), "cd %s/%s && git tag -l", project_root, vendor_path);
-
-                FILE *tag_pipe = popen(tag_cmd, "r");
-                if (tag_pipe)
-                {
-                    char best_tag[256] = {0};
-                    int  best_major = -1, best_minor = -1, best_patch = -1;
-                    char line[256];
-
-                    while (fgets(line, sizeof(line), tag_pipe))
+                    for (size_t j = 0; j < strlen(dep->version); j++)
                     {
-                        size_t len = strlen(line);
-                        if (len > 0 && line[len - 1] == '\n')
-                            line[len - 1] = '\0';
-
-                        int major, minor, patch;
-                        if (parse_semver_tag(line, &major, &minor, &patch))
+                        char c = dep->version[j];
+                        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
                         {
-                            if (semver_matches(dep->version, major, minor, patch))
-                            {
-                                if (major > best_major || (major == best_major && minor > best_minor) || (major == best_major && minor == best_minor && patch > best_patch))
-                                {
-                                    best_major = major;
-                                    best_minor = minor;
-                                    best_patch = patch;
-                                    strncpy(best_tag, line, sizeof(best_tag) - 1);
-                                }
-                            }
+                            is_commit_hash = 0;
+                            break;
                         }
-                    }
-                    pclose(tag_pipe);
-
-                    if (strlen(best_tag) > 0)
-                    {
-                        printf("  checking out tag '%s' for version constraint '%s'\n", best_tag, dep->version);
-                        snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout %s", project_root, vendor_path, best_tag);
-                        if (run_git_command(git_cmd) != 0)
-                        {
-                            fprintf(stderr, "error: failed to checkout tag '%s' for '%s'\n", best_tag, dep->name);
-                            success = 0;
-                            continue;
-                        }
-                        resolved_ref = strdup(best_tag);
                     }
                 }
 
-                // if no semver match, try as literal ref (tag name or commit hash)
-                if (!resolved_ref)
+                if (is_commit_hash)
                 {
-                    printf("  checking out ref '%s'\n", dep->version);
-                    snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout %s", project_root, vendor_path, dep->version);
+                    // commit hash - update to latest HEAD
+                    printf("  updating to latest commit\n");
+                    snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout origin/HEAD", project_root, vendor_path);
                     if (run_git_command(git_cmd) != 0)
                     {
-                        fprintf(stderr, "error: failed to checkout ref '%s' for '%s'\n", dep->version, dep->name);
+                        fprintf(stderr, "error: failed to update to latest commit for '%s'\n", dep->name);
                         success = 0;
                         continue;
                     }
-                    resolved_ref = strdup(dep->version);
+
+                    // get the new commit hash
+                    char hash_cmd[PATH_MAX * 2];
+                    snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
+                    FILE *hash_pipe = popen(hash_cmd, "r");
+                    if (hash_pipe)
+                    {
+                        char commit_hash[256];
+                        if (fgets(commit_hash, sizeof(commit_hash), hash_pipe))
+                        {
+                            size_t len = strlen(commit_hash);
+                            if (len > 0 && commit_hash[len - 1] == '\n')
+                                commit_hash[len - 1] = '\0';
+
+                            printf("  pinned to commit '%s'\n", commit_hash);
+                            resolved_ref = strdup(commit_hash);
+
+                            // update the config with the new commit
+                            free(dep->version);
+                            dep->version = strdup(commit_hash);
+                        }
+                        pclose(hash_pipe);
+                    }
+                }
+                else
+                {
+                    // try semver tag resolution
+                    char tag_cmd[PATH_MAX * 2];
+                    snprintf(tag_cmd, sizeof(tag_cmd), "cd %s/%s && git tag -l", project_root, vendor_path);
+
+                    FILE *tag_pipe = popen(tag_cmd, "r");
+                    if (tag_pipe)
+                    {
+                        char best_tag[256] = {0};
+                        int  best_major = -1, best_minor = -1, best_patch = -1;
+                        char line[256];
+
+                        while (fgets(line, sizeof(line), tag_pipe))
+                        {
+                            size_t len = strlen(line);
+                            if (len > 0 && line[len - 1] == '\n')
+                                line[len - 1] = '\0';
+
+                            int major, minor, patch;
+                            if (parse_semver_tag(line, &major, &minor, &patch))
+                            {
+                                if (semver_matches(dep->version, major, minor, patch))
+                                {
+                                    if (major > best_major || (major == best_major && minor > best_minor) || (major == best_major && minor == best_minor && patch > best_patch))
+                                    {
+                                        best_major = major;
+                                        best_minor = minor;
+                                        best_patch = patch;
+                                        strncpy(best_tag, line, sizeof(best_tag) - 1);
+                                    }
+                                }
+                            }
+                        }
+                        pclose(tag_pipe);
+
+                        if (strlen(best_tag) > 0)
+                        {
+                            printf("  checking out tag '%s' for version constraint '%s'\n", best_tag, dep->version);
+                            snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout %s", project_root, vendor_path, best_tag);
+                            if (run_git_command(git_cmd) != 0)
+                            {
+                                fprintf(stderr, "error: failed to checkout tag '%s' for '%s'\n", best_tag, dep->name);
+                                success = 0;
+                                continue;
+                            }
+                            resolved_ref = strdup(best_tag);
+                        }
+                    }
+
+                    // if no semver match, try as literal ref (tag name)
+                    if (!resolved_ref)
+                    {
+                        printf("  checking out ref '%s'\n", dep->version);
+                        snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout %s", project_root, vendor_path, dep->version);
+                        if (run_git_command(git_cmd) != 0)
+                        {
+                            fprintf(stderr, "error: failed to checkout ref '%s' for '%s'\n", dep->version, dep->name);
+                            success = 0;
+                            continue;
+                        }
+                        resolved_ref = strdup(dep->version);
+                    }
                 }
             }
         }
         else
         {
-            // no version specified, get latest commit hash and store it
+            // no version specified, get latest commit from default branch
+            printf("  updating to latest commit\n");
+            snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout origin/HEAD", project_root, vendor_path);
+            if (run_git_command(git_cmd) != 0)
+            {
+                fprintf(stderr, "error: failed to update to latest commit for '%s'\n", dep->name);
+                success = 0;
+                continue;
+            }
+
             char hash_cmd[PATH_MAX * 2];
             snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
 
@@ -611,7 +759,7 @@ static int cmd_dep_pull(int argc, char **argv)
                     if (len > 0 && commit_hash[len - 1] == '\n')
                         commit_hash[len - 1] = '\0';
 
-                    printf("  pinning to commit '%s'\n", commit_hash);
+                    printf("  pinned to commit '%s'\n", commit_hash);
                     resolved_ref = strdup(commit_hash);
 
                     // update the config with the resolved commit

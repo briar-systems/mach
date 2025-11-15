@@ -14,13 +14,13 @@ typedef struct TargetConfig
     char *mode;          // build mode: executable|library|shared
 
     // build options
-    bool emit_ast;     // emit AST files
-    bool emit_ir;      // emit LLVM IR
-    bool emit_asm;     // emit assembly
-    bool emit_object;  // emit object files
-    bool debug;        // emit debug info for this target
-    bool optimize;     // enable optimizations for this target
-    bool no_pie;       // disable PIE
+    bool emit_ast;    // emit AST files
+    bool emit_ir;     // emit LLVM IR
+    bool emit_asm;    // emit assembly
+    bool emit_object; // emit object files
+    bool debug;       // emit debug info for this target
+    bool optimize;    // enable optimizations for this target
+    bool no_pie;      // disable PIE
 
     // linking options
     char **link_libraries; // libraries to link (paths to .a, .so, .dylib, etc.)
@@ -128,5 +128,6 @@ bool config_ensure_directories(ProjectConfig *config, const char *project_dir);
 
 // configuration validation
 bool config_validate(ProjectConfig *config);
+bool config_validate_dep_structure(ProjectConfig *config, const char *project_dir);
 
 #endif

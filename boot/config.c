@@ -978,10 +978,17 @@ bool config_save(ProjectConfig *config, const char *config_path)
         fprintf(file, "emit-object = %s\n", target->emit_object ? "true" : "false");
         fprintf(file, "no-pie = %s\n", target->no_pie ? "true" : "false");
 
-        // Write link libraries if any
-        for (int j = 0; j < target->link_lib_count; j++)
+        // write link libraries as array if any
+        if (target->link_lib_count > 0)
         {
-            fprintf(file, "link = \"%s\"\n", target->link_libraries[j]);
+            fprintf(file, "link = [");
+            for (int j = 0; j < target->link_lib_count; j++)
+            {
+                fprintf(file, "\"%s\"", target->link_libraries[j]);
+                if (j < target->link_lib_count - 1)
+                    fprintf(file, ", ");
+            }
+            fprintf(file, "]\n");
         }
     }
 
@@ -1577,6 +1584,35 @@ bool config_validate(ProjectConfig *config)
     return true;
 }
 
+bool config_validate_dep_structure(ProjectConfig *config, const char *project_dir)
+{
+    if (!config || !project_dir)
+        return true;
+
+    bool has_errors = false;
+
+    // check that each dependency has a valid mach.toml
+    for (int i = 0; i < config->dep_count; i++)
+    {
+        DepSpec *dep = config->deps[i];
+        if (!dep || !dep->name)
+            continue;
+
+        // build path to dependency's mach.toml
+        char dep_toml[PATH_MAX];
+        snprintf(dep_toml, sizeof(dep_toml), "%s/dep/%s/mach.toml", project_dir, dep->name);
+
+        struct stat st;
+        if (stat(dep_toml, &st) != 0 || !S_ISREG(st.st_mode))
+        {
+            fprintf(stderr, "error: dependency '%s' is missing a mach.toml file\n", dep->name);
+            has_errors = true;
+        }
+    }
+
+    return !has_errors;
+}
+
 // dependency discovery functions
 // new dependency management implementation
 DepSpec *config_get_dep(ProjectConfig *config, const char *name)
@@ -1588,6 +1624,45 @@ DepSpec *config_get_dep(ProjectConfig *config, const char *name)
         if (strcmp(config->deps[i]->name, name) == 0)
             return config->deps[i];
     }
+    return NULL;
+}
+
+// get dependency by module prefix (checks dependency's project ID from mach.toml)
+static DepSpec *config_get_dep_by_prefix(ProjectConfig *config, const char *project_dir, const char *prefix)
+{
+    if (!config || !prefix)
+        return NULL;
+
+    // check each dependency's project ID from its mach.toml
+    for (int i = 0; i < config->dep_count; i++)
+    {
+        DepSpec *d = config->deps[i];
+        if (!d || !d->name)
+            continue;
+
+        // build path to dependency's mach.toml
+        char dep_root[PATH_MAX];
+        snprintf(dep_root, sizeof(dep_root), "%s/dep/%s/mach.toml", project_dir, d->name);
+
+        struct stat st;
+        if (stat(dep_root, &st) == 0 && S_ISREG(st.st_mode))
+        {
+            // load the dependency's config to get its project ID
+            ProjectConfig *dep_config = config_load(dep_root);
+            if (dep_config && dep_config->id && strcmp(dep_config->id, prefix) == 0)
+            {
+                config_dnit(dep_config);
+                free(dep_config);
+                return d;
+            }
+            if (dep_config)
+            {
+                config_dnit(dep_config);
+                free(dep_config);
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -1718,8 +1793,8 @@ char *config_resolve_package_root(ProjectConfig *config, const char *project_dir
     {
         return strdup(project_dir);
     }
-    // external
-    DepSpec *dep = config_get_dep(config, package_name);
+    // external - resolve by module prefix (project ID)
+    DepSpec *dep = config_get_dep_by_prefix(config, project_dir, package_name);
     if (!dep)
         return NULL;
     size_t vendor_len = strlen(project_dir) + strlen("/dep/") + strlen(dep->name ? dep->name : package_name) + 1;
