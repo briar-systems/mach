@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2025-11-15
 
 ### Added
 - Target triple parsing for cross-compilation support
@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Cross-compilation now correctly uses target triple for compile-time constants
 
-## [0.6.8] - 2025-11-15
+## [0.6.8] - 2025-11-14
 
 ### Added
 - Dependency management commands (add, remove, list, update)
@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migrated std library to standalone mach-std repository
 - Enhanced configuration handling for dependencies
 
-## [0.6.7] - 2024-11-15
+## [0.6.7] - 2024-11-14
 
 ### Fixed
 - Function pointer handling inside records with proper symbol mapping
