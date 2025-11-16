@@ -15,7 +15,6 @@ Overview:
 Semantics:
 - [Keywords](keywords.md)
 - [Literals](literals.md)
-- [Variables](variables.md)
 - [Types](types.md)
 - [Expressions](expressions.md)
 
@@ -25,3 +24,4 @@ Advanced Features:
 
 Reference:
 - [Cheatsheet](cheatsheet.md)
+- [Quirks](quirks.md)

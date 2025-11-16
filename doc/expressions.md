@@ -130,7 +130,7 @@ Literal values represent fixed data directly in source code. See the [Literals](
 val n: i32 = 42;
 val x: f64 = 3.14159;
 val c: u8  = 'A';
-val s: *u8 = "Hello";
+val s: []u8 = "Hello";
 ```
 
 
