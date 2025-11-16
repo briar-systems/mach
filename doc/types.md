@@ -1,309 +1,284 @@
 # Types
 
-This document describes the Mach type system: primitive numeric types, composite types, pointers, arrays and slices, function types, and type aliases. It focuses on the syntax and semantics you use in programs. For records and unions in depth, see [Records and Unions](records-and-unions.md). For generics, see [Generics](generics.md). For casts, see [Expressions and Operators](expressions-and-operators.md).
+This section describes Mach's type system.
 
-- All declarations use explicit types; there is no implicit type inference in `val`/`var` declarations.
-- Type names can be qualified with a module alias: `alias.TypeName`.
-- Generic types are instantiated with type arguments: `TypeName[Arg1, Arg2, ...]`.
+- [Types](#types)
+  - [Primitives](#primitives)
+  - [Type Aliases](#type-aliases)
+  - [Compound Types](#compound-types)
+    - [Records](#records)
+    - [Unions](#unions)
+  - [Methods](#methods)
+  - [Anonymous `rec` and `uni`](#anonymous-rec-and-uni)
+  - [Arrays](#arrays)
+  - [Slices](#slices)
+  - [Generics](#generics)
+  - [Type Casting](#type-casting)
+    - [Inference](#inference)
+    - [Coercion](#coercion)
 
-## Overview of categories
 
-- Primitive numeric types
-  - Unsigned integers: `u8`, `u16`, `u32`, `u64`
-  - Signed integers: `i8`, `i16`, `i32`, `i64`
-  - Floating-point: `f16`, `f32`, `f64`
-- Pointers
-  - Typed pointers: `*T`
-- Arrays and slices
-  - Fixed-size arrays: `[N]T`
-  - Slices (runtime-sized fat pointers): `[]T`
-- Composite types
-  - Records (struct-like): `rec { ... }` and named `rec Name { ... }`
-  - Unions: `uni { ... }` and named `uni Name { ... }`
-- Function types
-  - `fun(T1, T2, ...) RetType` with optional variadic `...`
-- Aliases
-  - `def Name: Type;`
+## Primitives
 
-Mach uses `u8` as the boolean type in conditions. The null literal is `nil`.
+Mach includes the following primitive types:
 
----
+| Type  | Description                                 |
+| ----- | ------------------------------------------- |
+| `u8`  | 8-bit unsigned integer                      |
+| `u16` | 16-bit unsigned integer                     |
+| `u32` | 32-bit unsigned integer                     |
+| `u64` | 64-bit unsigned integer                     |
+| `i8`  | 8-bit signed integer                        |
+| `i16` | 16-bit signed integer                       |
+| `i32` | 32-bit signed integer                       |
+| `i64` | 64-bit signed integer                       |
+| `f32` | 32-bit floating-point number                |
+| `f64` | 64-bit floating-point number                |
+| `ptr` | Untyped pointer (equivalent to C's `void*`) |
 
-## Primitive numeric types
+## Type Aliases
 
-- Unsigned integers: `u8`, `u16`, `u32`, `u64`
-- Signed integers: `i8`, `i16`, `i32`, `i64`
-- Floating-point: `f16`, `f32`, `f64`
+Type aliases can be created using the `def` keyword.
 
-Notes:
-- Sizes are the numeric suffix (e.g., `u16` is 16 bits).
-- Arithmetic, comparisons, shifts, bitwise operations apply per operator rules in [Expressions and Operators](expressions-and-operators.md).
-- Use explicit casts with `::` to convert between numeric types when needed.
+Aliases provide a way to create more meaningful names for existing types, improving code readability.
 
-Examples:
-```
-val a: u32 = 10;
-val b: i64 = a :: i64;
-val x: f64 = 3.14;
-```
+Aliased types do NOT inherit any special properties, methods, or behaviors from their original types. They are simply alternative names.
 
-### Booleans
+See the [Keywords](keywords.md#def) documentation for details.
 
-Conditions in control flow use `u8` as the boolean type. Conventionally, zero is false and nonzero is true.
 
-```
-fun ok(flag: u8) {
-    if (flag) { /* ... */ }
-    or { /* ... */ }
+## Compound Types
+
+Mach supports four primary compound types:
+- [Records](#records): Used to group related data fields together.
+- [Unions](#unions): Used to define a type that can hold one of several different types.
+- [Arrays](#arrays): Fixed-size collections of elements of the same type.
+- [Slices](#slices): Dynamically-sized collections of elements of the same type.
+
+
+### Records
+
+Records are defined using the `rec` keyword. See the [`rec`](keywords.md#rec) documentation for syntax details.
+
+Records contain named fields of any other type:
+
+```mach
+rec Point {
+    x: f64;
+    y: f64;
 }
 ```
 
-### Character and string literals
+Records can have methods associated with them, defined using a Go-style method syntax. See the [Method Syntax](keywords.md#method-syntax) section for syntax details and the [Methods](#methods) section for more information.
 
-Character literals (e.g., `'a'`) and string literals (e.g., `"hello"`) are literals; their exact types are resolved by context. See [Literals](literals.md).
 
----
+### Unions
 
-## Pointers
+Unions are defined using the `uni` keyword. See the [`uni`](keywords.md#uni) documentation for syntax details.
 
-A pointer to a type `T` is written `*T`.
+Unions contain named fields of any other type, but only one field can hold a value at a time:
 
-- Address-of: `?expr` yields `*T` when `expr` has type `T` and is an lvalue.
-- Dereference: `@expr` yields `T` when `expr` has type `*T`.
-- The null literal `nil` can be used for pointer-like values.
-- Pointers can be used as function parameters and return values.
-
-Examples:
-```
-var x: u64 = 42;
-var p: *u64 = ?x;
-@p = @p + 1;   # write through pointer
-```
-
-Casting to or from pointer types uses `::`:
-```
-var p8: *u8 = p :: *u8;
-```
-
-For pointer usage within composite types and arrays, see [Records and Unions](records-and-unions.md) and [Arrays and Slices](arrays-and-slices.md).
-
----
-
-## Arrays and slices
-
-Mach distinguishes between fixed-size arrays `[N]T` and slices `[]T`.
-
-- Fixed-size array `[N]T`:
-  - Compile-time length `N`
-  - Contiguous storage of `N` elements of type `T`
-  - Indexed with `array[i]`
-
-- Slice `[]T`:
-  - Runtime-sized fat pointer to contiguous `T` elements
-  - Carries both `.data` (pointer to first element) and `.len` (length) fields
-  - Indexed with `slice[i]`
-  - Useful for passing views without copying
-
-Type syntax:
-```
-val a: [4]u32 = [4]u32{ 1, 2, 3, 4 };
-var s: []u32;            # slice, may be set at runtime
-```
-
-Literal initialization:
-```
-val x: [3]u8 = [3]u8{ 10, 20, 30 };
-val y: []u8  = []u8{ 1, 2, 3, 4, 5 };
-```
-
-Slice fields:
-```
-var len: u64 = y.len;
-var ptr: *u8 = y.data;
-```
-
-Indexing:
-```
-val first: u8 = a[0];
-var i: u64 = 0;
-for (i < y.len) {
-    # use y[i]
-    i = i + 1;
+```mach
+uni Value {
+    int_value:   i32;
+    float_value: f64;
 }
 ```
 
-Notes:
-- Slices are first-class and carry bounds (`.len`). Indexing a slice is subject to bounds rules of the target.
-- When passing a slice to a parameter of type `*T`, the data pointer is used. See [Functions and Methods](functions-and-methods.md).
+The size of a union is determined by its largest variant. In the above example, `Value` would occupy enough space to hold a `f64`, since `float_value` is its largest field.
 
-For more on array and slice expressions and semantics, see [Arrays and Slices](arrays-and-slices.md).
+Union types can also have methods associated with them, defined using the same Go-style method syntax as records. See the [Method Syntax](keywords.md#method-syntax) section for syntax details and the [Methods](#methods) section for more information.
 
----
 
-## Strings
+## Methods
 
-String data in Mach is represented with slices of bytes. The standard library module `std.types.string` provides helpers for both borrowed views and owned buffers.
+Methods are functions associated with a record, union, or aliased type, allowing them to operate on instances of that type.
+They are defined using the same `fun` keyword, but include a special first parameter that represents the instance the method is called on.
 
-- `char` is an alias of `u8` for individual code units.
-- `str` is an alias of `[]char`. It behaves like any other slice and offers utility methods such as `.equals`, `.starts_with`, `.contains`, `.index_of`, `.clone()`, and `.as_cstr()` for working with string data. The `.clone()` helper returns `Result[String, str]` (from `std.types.result`) so you can surface allocation failures to callers.
-- `cstr` is defined as `*char` for interoperating with null-terminated buffers. Methods like `.len()` and `.to_str()` bridge between `cstr` and `str`.
-- `String` is an owning buffer type (a thin alias of `str`) that is managed through pointer-receiver methods on `*String`.
+The instance itself can be specified as either a named value or a pointer to a named value.
+The instance parameter is conventionally named `this`, but any valid identifier can be used.
 
-Typical usage keeps the owning storage in a `String` and consumes views as `str`:
+```mach
+rec Point {
+    x: f32;
+    y: f32;
+}
 
-```
-use std.types.option;
-use std.types.string;
-
-fun build_message() {
-    var view: str = "mach";
-    if (view.starts_with("ma")) {
-        # handle match
-    }
-
-    var buf: String;
-    val init_err: Option[str] = buf.init(32);
-    if (init_err.is_some()) {
-        ret;  # allocation failed; error message in init_err.unwrap()
-    }
-
-    if (buf.append(view) == false) {
-        buf.dnit();
-        ret;
-    }
-
-    val assembled: str = buf.as_str();
-    # use 'assembled' while 'buf' remains alive
-
-    buf.dnit();  # release owned storage
+fun (this: *Point) move(dx: f32, dy: f32) {
+    this.x = this.x + dx;
+    this.y = this.y + dy;
 }
 ```
 
-`String.init(len)` returns an `Option[str]` where `none` indicates success and `some` carries an error message on failure. Always pair successful `init` calls with `dnit()` to release memory. Methods such as `push`, `append`, `ensure_len`, `as_cstr`, and `clone` rely on the allocation helpers provided by `std.system.memory` (see [Pointers and Memory](pointers-and-memory.md)).
+Methods may be called on instances of the type they are associated with using dot notation:
 
----
-
-## Composite types: records and unions
-
-Records and unions are composite types.
-
-- Record (struct-like) type literal: `rec { field: Type; ... }`
-- Union type literal: `uni { field: Type; ... }`
-
-Named forms are introduced as top-level declarations (see [Records and Unions](records-and-unions.md)), and can be referenced by name as types. Anonymous type literals can be used directly where a type is required.
-
-Examples (type syntax):
-```
-val P: rec { x: f64; y: f64; } = rec { x: 0.0, y: 0.0 };
-
-val U: uni { i: i32; f: f32; } = uni { i: 123 };
+```mach
+val p: Point = Point {
+  x: 0.0,
+  y: 0.0,
+};
+p.move(5.0, 10.0);
 ```
 
-For construction, field access, and layout-related topics (e.g., `$offset_of(T, field)`), see [Records and Unions](records-and-unions.md) and [Compile-time Features](compile-time.md).
+Accessing the fields of the instance within the method is done using the instance parameter (`this` in the example above).
+This parameter behaves like any other parameter, so it can be named differently or passed by value instead of by pointer, depending on the desired semantics.
 
----
+If the instance parameter is passed by value, modifications to its fields will not affect the original instance outside the method.
 
-## Function types
+This behaviour is particularly similar to how methods work in Go, where the receiver can be either a value or a pointer.
 
-Function types describe callable signatures. Syntax:
+Calling a method on a value type will automatically pass a pointer to the instance if the method expects a pointer receiver, and vice versa.
 
-```
-fun(T1, T2, ..., Tn) RetType
-```
 
-- Parameter list is comma-separated. Use `...` as the last parameter to indicate a variadic function type.
-- Return type is optional; if omitted, the function type returns no value.
+## Anonymous `rec` and `uni`
 
-Examples:
-```
-val f: fun(u64, u64) u64;
-val g: fun(*u8, ...) i32;   # variadic function type
-```
+Mach supports anonymous records and unions in certain contexts.
+The most common application of this feature is in nested data structures, where a record or union is defined inline without a name:
 
-Function types are used in:
-- External declarations (`ext`) to bind foreign symbols
-- Variables and fields to store function references
-- Casts involving callable values
-
-See [Functions and Methods](functions-and-methods.md) for declaring and calling functions and methods.
-
----
-
-## Type aliases
-
-A type alias creates a new name bound to an existing type:
-
-```
-def Index: u64;
-def Bytes: []u8;
+```mach
+rec Container {
+    id: u32;
+    data: uni {
+        int_data: i32;
+        float_data: f64;
+    };
+}
 ```
 
-- Aliases can improve readability and express intent.
-- Aliases can refer to primitive, pointer, array/slice, function, or composite types.
-- Use the alias name anywhere a type is expected.
 
----
+## Arrays
 
-## Qualified type names and generics
+Arrays are fixed-size collections of elements of the same type. The size of an array is specified in square brackets (`[<n>]`) before the element type where `n` is a positive integer literal or a constant expression that evaluates to a positive integer.
 
-Type names may be qualified with a module alias and may carry generic type arguments.
-
-- Qualified names: `alias.TypeName`
-- Generic instantiation: `TypeName[Arg1, Arg2, ...]`
-
-Examples:
-```
-use net: mylib.network;
-val s: net.SocketState;
-
-rec Box[T] { value: T; }
-val b: Box[u64];
+```mach
+val a: [3]u8;
 ```
 
-See [Generics](generics.md) for details on declaring and using generic records, unions, and functions.
+Arrays have a fixed size that is determined at compile time and cannot be changed at runtime.
 
----
+On the backend, arrays are represented as a contiguous block of memory containing the elements in sequence.
 
-## Casting
+Arrays have two intrinsic fields:
+- `.data`: A pointer to the first element of the array.
+- `.len`: The length of the array (number of elements).
 
-Use `expr :: Type` to convert a value to a different type where supported:
 
-```
-val a: u32 = 10;
-val b: i64 = a :: i64;
+## Slices
 
-var p: *u8 = ?a :: *u8;  # example involving address-of + cast
-```
+Slices are dynamically-sized sets of contiguous elements. The size of a slice is not fixed at compile time and can change at runtime. Slices are defined using empty square brackets (`[]`) before the element type.
 
-Cast rules follow the language’s type conversion semantics (numeric conversions, pointer conversions, etc.). See [Expressions and Operators](expressions-and-operators.md).
-
----
-
-## Null
-
-`nil` is the null literal. It is commonly used with pointer-like types and in contexts that accept null values.
-
-```
-var p: *u8 = nil;
+```mach
+val s: []u8;
 ```
 
----
+Slices are represented as fat pointers, containing both a pointer to the data and the length of the slice.
 
-## Summary
+Like arrays, slices have two intrinsic fields:
+- `.data`: A pointer to the first element of the slice.
+- `.len`: The length of the slice (number of elements).
 
-- Choose among primitive numeric types (`u*`, `i*`, `f*`) for values and arithmetic.
-- Use `*T`, `?expr`, and `@expr` for pointer types, address-of, and dereference.
-- Model contiguous data with `[N]T` and pass views using `[]T` slices (with `.data` and `.len`).
-- Compose data with records (`rec`) and unions (`uni`); employ type literals or named declarations.
-- Describe callables with `fun(...) Ret` types; add `...` for variadics.
-- Create readable names with `def Name: Type;`.
-- Qualify types with module aliases and instantiate generics with `[TypeArgs]`.
-- Perform explicit casts via `::` as needed.
+While their syntax and usage are similar, slices and arrays are distinct types in Mach and are not interchangeable without explicit casting.
 
-Related topics:
-- [Expressions and Operators](expressions-and-operators.md)
-- [Arrays and Slices](arrays-and-slices.md)
-- [Records and Unions](records-and-unions.md)
-- [Functions and Methods](functions-and-methods.md)
-- [Generics](generics.md)
-- [Compile-time Features](compile-time.md)
+## Generics
+
+Mach supports a limited form of generics for records, unions, and functions.
+This comes in the form of monomorphized templating, where type parameters are specified in square brackets (`[ ]`) after the type or function name and are replaced with concrete types at compile time.
+
+```mach
+rec Pair[T, U] {
+    first: T;
+    second: U;
+}
+
+fun make_pair[T, U](first: T, second: U) Pair[T, U] {
+    return Pair[T, U] {
+        first:  first,
+        second: second,
+    };
+}
+```
+
+In the above example, both `T` and `U` are type parameters that can be replaced with any concrete types when creating instances of `Pair` or calling `make_pair`. They can both be used in any context that requires a type.
+
+When using generic types or functions, the type parameters must be specified explicitly:
+
+```mach
+val p: Pair[i32, f64] = make_pair[i32, f64](42, 3.14);
+```
+
+Mach does not support advanced generic features such as type constraints, variance, or higher-kinded types.
+
+## Type Casting
+
+Mach requires explicit type casting between different types using the `::` operator:
+
+```mach
+val a: i32 = 42;
+val b: i64 = a::i64;
+```
+
+This cast operator is extremely literal and does not perform any implicit conversions or coercions. This is important to keep in mind when working with different types, as you must ensure that the cast is valid and makes sense in the context of your program and the underlying data representation.
+
+For example, this example will produce unusable results, as the bit patterns of `f32` and `i32` are not directly compatible:
+
+```mach
+val x: f32 = 3.14;
+val y: i32 = x::i32; # This is NOT a valid conversion of the underlying bit pattern
+```
+
+The above example WILL compile and execute successfully, but the resulting value of `y` will not represent the integer equivalent of `3.14`. Instead, it will represent the raw bit pattern of the `f32` value interpreted as an `i32`, which is likely not what you want.
+
+This cast operator is extremely powerful, but it comes with the responsibility of ensuring that the conversions you perform are valid and meaningful.
+
+The compiler will warn you if you attempt to cast between incompatible types. Incompatible types are those that do not have identical sizes. This means that the cast operator DOES allow for casting between types of the same size but different representations. Here is a special example that demonstrates the power of such a system:
+
+```mach
+rec Color {
+    r: u8;
+    g: u8;
+    b: u8;
+    a: u8;
+}
+
+fun convert_color_to_u32(color: Color) u32 {
+    ret color::u32;
+}
+
+fun convert_u32_to_color(value: u32) Color {
+    ret value::Color;
+}
+```
+
+### Inference
+
+Mach does not support type inference under any circumstances.
+
+
+### Coercion
+
+Mach only supports type coercion in the context of literal declarations themselves.
+
+```mach
+val x:  u8 = 42;    # `42` is coerced to `u8`
+val y:  u8 = x % 2; # `2` and the result of `x % 2` are coerced to `u8`
+```
+
+For example:
+```mach
+rec Byte {
+    value: u8;
+}
+
+val b: Byte = Byte{ value: 255 }; # `255` is coerced to `u8`
+val n: u8   = b::u8; # `b` requires an explicit cast to `u8` even though they have the same underlying data representation
+```
+
+The only case in which automatic coercion is allowed is when two aliased with equal underlying types are involved. These can be used interchangeably without explicit casting.
+
+```mach
+def Age:    u8;
+def Height: u8;
+
+val my_age:    Age    = 30;     # `30` is coerced to `u8`, which is the underlying type of `Age`
+val my_height: Height = my_age; # no explicit cast needed, both have underlying type `u8`
+```
