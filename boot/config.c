@@ -725,6 +725,10 @@ ProjectConfig *config_load(const char *config_path)
             {
                 config->src_dir = toml_parse_string(&parser);
             }
+            else if (strcmp(key, "dep") == 0)
+            {
+                config->dep_dir = toml_parse_string(&parser);
+            }
             else if (strcmp(key, "target") == 0)
             {
                 config->target = toml_parse_string(&parser);
@@ -1017,9 +1021,6 @@ ProjectConfig *config_create_default(const char *project_name)
     config->id      = strdup(project_name); // default id to project_name
     config->name    = strdup(project_name);
     config->version = strdup("0.1.0");
-    config->src_dir = strdup("src");
-    config->dep_dir = strdup("dep");
-    config->target  = strdup("native");
     // note: no default entrypoint or out_dir - they are per-target now
 
     return config;
@@ -1237,11 +1238,10 @@ char *config_resolve_src_dir(ProjectConfig *config, const char *project_dir)
 
 char *config_resolve_dep_dir(ProjectConfig *config, const char *project_dir)
 {
-    if (!config)
+    if (!config || !config->dep_dir)
         return NULL;
 
-    // use default "dep" if not configured
-    const char *dep_dir = config->dep_dir ? config->dep_dir : "dep";
+    const char *dep_dir = config->dep_dir;
 
     // if dep dir is absolute path, return as is
     if (dep_dir[0] == '/')
@@ -1487,6 +1487,18 @@ bool config_validate(ProjectConfig *config)
         return false;
     }
 
+    if (!config->dep_dir || strlen(config->dep_dir) == 0)
+    {
+        fprintf(stderr, "error: [project] dep is required\n");
+        return false;
+    }
+
+    if (!config->target || strlen(config->target) == 0)
+    {
+        fprintf(stderr, "error: [project] target is required\n");
+        return false;
+    }
+
     // Validate at least one target exists
     if (config->target_count == 0)
     {
@@ -1588,6 +1600,13 @@ bool config_validate_dep_structure(ProjectConfig *config, const char *project_di
 
     bool has_errors = false;
 
+    char *dep_root = config_resolve_dep_dir(config, project_dir);
+    if (!dep_root)
+    {
+        fprintf(stderr, "error: [project] dep directory cannot be resolved\n");
+        return false;
+    }
+
     // check that each dependency has a valid mach.toml
     for (int i = 0; i < config->dep_count; i++)
     {
@@ -1597,7 +1616,7 @@ bool config_validate_dep_structure(ProjectConfig *config, const char *project_di
 
         // build path to dependency's mach.toml
         char dep_toml[PATH_MAX];
-        snprintf(dep_toml, sizeof(dep_toml), "%s/dep/%s/mach.toml", project_dir, dep->name);
+        snprintf(dep_toml, sizeof(dep_toml), "%s/%s/mach.toml", dep_root, dep->name);
 
         struct stat st;
         if (stat(dep_toml, &st) != 0 || !S_ISREG(st.st_mode))
@@ -1607,6 +1626,7 @@ bool config_validate_dep_structure(ProjectConfig *config, const char *project_di
         }
     }
 
+    free(dep_root);
     return !has_errors;
 }
 
@@ -1630,6 +1650,12 @@ static DepSpec *config_get_dep_by_prefix(ProjectConfig *config, const char *proj
     if (!config || !prefix)
         return NULL;
 
+    char *deps_dir = config_resolve_dep_dir(config, project_dir);
+    if (!deps_dir)
+        return NULL;
+
+    DepSpec *result = NULL;
+
     // check each dependency's project ID from its mach.toml
     for (int i = 0; i < config->dep_count; i++)
     {
@@ -1639,7 +1665,7 @@ static DepSpec *config_get_dep_by_prefix(ProjectConfig *config, const char *proj
 
         // build path to dependency's mach.toml
         char dep_root[PATH_MAX];
-        snprintf(dep_root, sizeof(dep_root), "%s/dep/%s/mach.toml", project_dir, d->name);
+        snprintf(dep_root, sizeof(dep_root), "%s/%s/mach.toml", deps_dir, d->name);
 
         struct stat st;
         if (stat(dep_root, &st) == 0 && S_ISREG(st.st_mode))
@@ -1648,9 +1674,10 @@ static DepSpec *config_get_dep_by_prefix(ProjectConfig *config, const char *proj
             ProjectConfig *dep_config = config_load(dep_root);
             if (dep_config && dep_config->id && strcmp(dep_config->id, prefix) == 0)
             {
+                result = d;
                 config_dnit(dep_config);
                 free(dep_config);
-                return d;
+                break;
             }
             if (dep_config)
             {
@@ -1660,7 +1687,8 @@ static DepSpec *config_get_dep_by_prefix(ProjectConfig *config, const char *proj
         }
     }
 
-    return NULL;
+    free(deps_dir);
+    return result;
 }
 
 bool config_has_dep(ProjectConfig *config, const char *name)
@@ -1794,9 +1822,15 @@ char *config_resolve_package_root(ProjectConfig *config, const char *project_dir
     DepSpec *dep = config_get_dep_by_prefix(config, project_dir, package_name);
     if (!dep)
         return NULL;
-    size_t vendor_len = strlen(project_dir) + strlen("/dep/") + strlen(dep->name ? dep->name : package_name) + 1;
+
+    char *deps_dir = config_resolve_dep_dir(config, project_dir);
+    if (!deps_dir)
+        return NULL;
+
+    size_t vendor_len = strlen(deps_dir) + 1 + strlen(dep->name ? dep->name : package_name) + 1;
     char  *vendor     = malloc(vendor_len);
-    snprintf(vendor, vendor_len, "%s/dep/%s", project_dir, dep->name ? dep->name : package_name);
+    snprintf(vendor, vendor_len, "%s/%s", deps_dir, dep->name ? dep->name : package_name);
+    free(deps_dir);
 
     struct stat st;
     if (stat(vendor, &st) == 0 && S_ISDIR(st.st_mode))
@@ -1826,7 +1860,13 @@ char *config_get_package_src_dir(ProjectConfig *config, const char *project_dir,
     // for self, use project's src-dir (match by id)
     if (strcmp(package_name, config->id) == 0)
     {
-        const char *src_rel = config->src_dir ? config->src_dir : "src";
+        if (!config->src_dir || config->src_dir[0] == '\0')
+        {
+            free(root);
+            return NULL;
+        }
+
+        const char *src_rel = config->src_dir;
         size_t      len     = strlen(root) + 1 + strlen(src_rel) + 1;
         char       *path    = malloc(len);
         snprintf(path, len, "%s/%s", root, src_rel);

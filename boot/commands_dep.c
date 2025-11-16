@@ -29,6 +29,9 @@ static void cmd_dep_help(void);
 static int   run_git_command(const char *command);
 static int   vendor_dir_exists(const char *path);
 static char *find_project_root(const char *start_path);
+static char *resolve_dep_root(ProjectConfig *config, const char *project_root);
+static char *resolve_dep_relative(ProjectConfig *config, const char *project_root);
+static int   path_is_absolute(const char *path);
 static int   config_add_dep_and_save(ProjectConfig *config, const char *config_path, DepSpec *dep);
 static int   config_remove_dep_and_save(ProjectConfig *config, const char *config_path, const char *dep_name);
 static int   parse_semver_tag(const char *tag, int *major, int *minor, int *patch);
@@ -136,6 +139,16 @@ static int cmd_dep_list(int argc, char **argv)
         return 0;
     }
 
+    char *dep_root = resolve_dep_root(config, project_root);
+    if (!dep_root)
+    {
+        fprintf(stderr, "error: failed to resolve dependency directory\n");
+        config_dnit(config);
+        free(config);
+        free(project_root);
+        return 1;
+    }
+
     printf("dependencies:\n");
     for (int i = 0; i < config->dep_count; i++)
     {
@@ -152,10 +165,11 @@ static int cmd_dep_list(int argc, char **argv)
         }
 
         char vendor_path[PATH_MAX];
-        snprintf(vendor_path, sizeof(vendor_path), "%s/dep/%s", project_root, dep->name ? dep->name : "(unnamed)");
+        snprintf(vendor_path, sizeof(vendor_path), "%s/%s", dep_root, dep->name ? dep->name : "(unnamed)");
         printf("    vendor: %s\n", vendor_path);
     }
 
+    free(dep_root);
     config_dnit(config);
     free(config);
     free(project_root);
@@ -187,6 +201,16 @@ static int cmd_dep_info(int argc, char **argv)
         return 1;
     }
 
+    char *dep_root = resolve_dep_root(config, project_root);
+    if (!dep_root)
+    {
+        fprintf(stderr, "error: failed to resolve dependency directory\n");
+        config_dnit(config);
+        free(config);
+        free(project_root);
+        return 1;
+    }
+
     DepSpec *dep = NULL;
     for (int i = 0; i < config->dep_count; i++)
     {
@@ -200,6 +224,7 @@ static int cmd_dep_info(int argc, char **argv)
     if (!dep)
     {
         fprintf(stderr, "error: dependency '%s' not found in mach.toml\n", dep_name);
+        free(dep_root);
         config_dnit(config);
         free(config);
         free(project_root);
@@ -207,7 +232,7 @@ static int cmd_dep_info(int argc, char **argv)
     }
 
     char vendor_path[PATH_MAX];
-    snprintf(vendor_path, sizeof(vendor_path), "%s/dep/%s", project_root, dep->name);
+    snprintf(vendor_path, sizeof(vendor_path), "%s/%s", dep_root, dep->name);
     int exists = vendor_dir_exists(vendor_path);
 
     printf("dependency '%s'\n", dep->name);
@@ -220,6 +245,7 @@ static int cmd_dep_info(int argc, char **argv)
     printf("  vendor dir: %s\n", vendor_path);
     printf("  status: %s\n", exists ? "vendored" : "missing");
 
+    free(dep_root);
     config_dnit(config);
     free(config);
     free(project_root);
@@ -344,11 +370,42 @@ static int cmd_dep_add(int argc, char **argv)
     new_dep->path    = strdup(path_or_url);
     new_dep->version = NULL;
 
+    char *dep_root = resolve_dep_root(config, project_root);
+    if (!dep_root)
+    {
+        fprintf(stderr, "error: failed to resolve dependency directory\n");
+        free(new_dep->name);
+        free(new_dep->type);
+        free(new_dep->path);
+        free(new_dep);
+        config_dnit(config);
+        free(config);
+        free(project_root);
+        return 1;
+    }
+
     // for remote deps, add git submodule
     if (!is_local)
     {
+        char *dep_rel = resolve_dep_relative(config, project_root);
+        if (!dep_rel)
+        {
+            fprintf(stderr, "error: [project].dep must reside inside the project root to manage remote dependencies\n");
+            free(dep_root);
+            free(new_dep->name);
+            free(new_dep->type);
+            free(new_dep->path);
+            free(new_dep);
+            config_dnit(config);
+            free(config);
+            free(project_root);
+            return 1;
+        }
+
         char vendor_path[PATH_MAX];
-        snprintf(vendor_path, sizeof(vendor_path), "dep/%s", dep_name);
+        char vendor_full_path[PATH_MAX];
+        snprintf(vendor_path, sizeof(vendor_path), "%s/%s", dep_rel, dep_name);
+        snprintf(vendor_full_path, sizeof(vendor_full_path), "%s/%s", dep_root, dep_name);
 
         // clean up any orphaned submodule state
         struct stat st;
@@ -364,8 +421,6 @@ static int cmd_dep_add(int argc, char **argv)
         }
 
         // remove any orphaned working tree directory
-        char vendor_full_path[PATH_MAX];
-        snprintf(vendor_full_path, sizeof(vendor_full_path), "%s/%s", project_root, vendor_path);
         if (stat(vendor_full_path, &st) == 0)
         {
             char rm_cmd[PATH_MAX * 2];
@@ -384,6 +439,8 @@ static int cmd_dep_add(int argc, char **argv)
             free(new_dep->type);
             free(new_dep->path);
             free(new_dep);
+            free(dep_rel);
+            free(dep_root);
             config_dnit(config);
             free(config);
             free(project_root);
@@ -400,7 +457,7 @@ static int cmd_dep_add(int argc, char **argv)
         {
             // get the current commit hash to pin the dependency
             char hash_cmd[PATH_MAX * 2];
-            snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
+            snprintf(hash_cmd, sizeof(hash_cmd), "cd %s && git rev-parse HEAD", vendor_full_path);
 
             FILE *hash_pipe = popen(hash_cmd, "r");
             if (hash_pipe)
@@ -424,6 +481,8 @@ static int cmd_dep_add(int argc, char **argv)
                 new_dep->version = strdup("HEAD"); // fallback
             }
         }
+
+        free(dep_rel);
     }
 
     // add to config and save
@@ -434,6 +493,7 @@ static int cmd_dep_add(int argc, char **argv)
         free(new_dep->type);
         free(new_dep->path);
         free(new_dep);
+        free(dep_root);
         config_dnit(config);
         free(config);
         free(project_root);
@@ -442,6 +502,7 @@ static int cmd_dep_add(int argc, char **argv)
 
     printf("dependency '%s' added successfully\n", dep_name);
 
+    free(dep_root);
     config_dnit(config);
     free(config);
     free(project_root);
@@ -499,8 +560,18 @@ static int cmd_dep_del(int argc, char **argv)
     // for remote deps, remove git submodule
     if (dep->type && strcmp(dep->type, "remote") == 0)
     {
+        char *dep_rel = resolve_dep_relative(config, project_root);
+        if (!dep_rel)
+        {
+            fprintf(stderr, "error: [project].dep must reside inside the project root to manage remote dependencies\n");
+            config_dnit(config);
+            free(config);
+            free(project_root);
+            return 1;
+        }
+
         char vendor_path[PATH_MAX];
-        snprintf(vendor_path, sizeof(vendor_path), "dep/%s", dep_name);
+        snprintf(vendor_path, sizeof(vendor_path), "%s/%s", dep_rel, dep_name);
 
         printf("removing git submodule for '%s'...\n", dep_name);
 
@@ -527,6 +598,8 @@ static int cmd_dep_del(int argc, char **argv)
         {
             fprintf(stderr, "warning: failed to clean up .git/modules entry\n");
         }
+
+        free(dep_rel);
     }
 
     // remove from config and save
@@ -579,7 +652,18 @@ static int cmd_dep_pull(int argc, char **argv)
         return 0;
     }
 
-    int success = 1;
+    char *dep_root = resolve_dep_root(config, project_root);
+    if (!dep_root)
+    {
+        fprintf(stderr, "error: failed to resolve dependency directory\n");
+        config_dnit(config);
+        free(config);
+        free(project_root);
+        return 1;
+    }
+
+    char *dep_rel_base = NULL;
+    int   success      = 1;
     for (int i = 0; i < config->dep_count; i++)
     {
         DepSpec *dep = config->deps[i];
@@ -597,8 +681,21 @@ static int cmd_dep_pull(int argc, char **argv)
             continue;
         }
 
+        if (!dep_rel_base)
+        {
+            dep_rel_base = resolve_dep_relative(config, project_root);
+            if (!dep_rel_base)
+            {
+                fprintf(stderr, "error: [project].dep must reside inside the project root to manage remote dependencies\n");
+                success = 0;
+                break;
+            }
+        }
+
         char vendor_path[PATH_MAX];
-        snprintf(vendor_path, sizeof(vendor_path), "dep/%s", dep->name);
+        char vendor_full_path[PATH_MAX];
+        snprintf(vendor_path, sizeof(vendor_path), "%s/%s", dep_rel_base, dep->name);
+        snprintf(vendor_full_path, sizeof(vendor_full_path), "%s/%s", dep_root, dep->name);
 
         printf("pulling dependency '%s'...\n", dep->name);
 
@@ -614,7 +711,7 @@ static int cmd_dep_pull(int argc, char **argv)
         }
 
         // fetch latest changes
-        snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git fetch --all --tags", project_root, vendor_path);
+        snprintf(git_cmd, sizeof(git_cmd), "cd %s && git fetch --all --tags", vendor_full_path);
         if (run_git_command(git_cmd) != 0)
         {
             fprintf(stderr, "warning: failed to fetch updates for '%s'\n", dep->name);
@@ -630,7 +727,7 @@ static int cmd_dep_pull(int argc, char **argv)
                 // branch reference - checkout and pull latest
                 const char *branch_name = dep->version + 7;
                 printf("  checking out branch '%s'\n", branch_name);
-                snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout %s && git pull origin %s", project_root, vendor_path, branch_name, branch_name);
+                snprintf(git_cmd, sizeof(git_cmd), "cd %s && git checkout %s && git pull origin %s", vendor_full_path, branch_name, branch_name);
                 if (run_git_command(git_cmd) != 0)
                 {
                     fprintf(stderr, "error: failed to checkout branch '%s' for '%s'\n", branch_name, dep->name);
@@ -640,7 +737,7 @@ static int cmd_dep_pull(int argc, char **argv)
 
                 // get the new commit hash after pulling
                 char hash_cmd[PATH_MAX * 2];
-                snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
+                snprintf(hash_cmd, sizeof(hash_cmd), "cd %s && git rev-parse HEAD", vendor_full_path);
                 FILE *hash_pipe = popen(hash_cmd, "r");
                 if (hash_pipe)
                 {
@@ -679,7 +776,7 @@ static int cmd_dep_pull(int argc, char **argv)
                 {
                     // commit hash - update to latest HEAD
                     printf("  updating to latest commit\n");
-                    snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout origin/HEAD", project_root, vendor_path);
+                    snprintf(git_cmd, sizeof(git_cmd), "cd %s && git checkout origin/HEAD", vendor_full_path);
                     if (run_git_command(git_cmd) != 0)
                     {
                         fprintf(stderr, "error: failed to update to latest commit for '%s'\n", dep->name);
@@ -689,7 +786,7 @@ static int cmd_dep_pull(int argc, char **argv)
 
                     // get the new commit hash
                     char hash_cmd[PATH_MAX * 2];
-                    snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
+                    snprintf(hash_cmd, sizeof(hash_cmd), "cd %s && git rev-parse HEAD", vendor_full_path);
                     FILE *hash_pipe = popen(hash_cmd, "r");
                     if (hash_pipe)
                     {
@@ -714,7 +811,7 @@ static int cmd_dep_pull(int argc, char **argv)
                 {
                     // try semver tag resolution
                     char tag_cmd[PATH_MAX * 2];
-                    snprintf(tag_cmd, sizeof(tag_cmd), "cd %s/%s && git tag -l", project_root, vendor_path);
+                    snprintf(tag_cmd, sizeof(tag_cmd), "cd %s && git tag -l", vendor_full_path);
 
                     FILE *tag_pipe = popen(tag_cmd, "r");
                     if (tag_pipe)
@@ -749,7 +846,7 @@ static int cmd_dep_pull(int argc, char **argv)
                         if (strlen(best_tag) > 0)
                         {
                             printf("  checking out tag '%s' for version constraint '%s'\n", best_tag, dep->version);
-                            snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout %s", project_root, vendor_path, best_tag);
+                            snprintf(git_cmd, sizeof(git_cmd), "cd %s && git checkout %s", vendor_full_path, best_tag);
                             if (run_git_command(git_cmd) != 0)
                             {
                                 fprintf(stderr, "error: failed to checkout tag '%s' for '%s'\n", best_tag, dep->name);
@@ -764,7 +861,7 @@ static int cmd_dep_pull(int argc, char **argv)
                     if (!resolved_ref)
                     {
                         printf("  checking out ref '%s'\n", dep->version);
-                        snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout %s", project_root, vendor_path, dep->version);
+                        snprintf(git_cmd, sizeof(git_cmd), "cd %s && git checkout %s", vendor_full_path, dep->version);
                         if (run_git_command(git_cmd) != 0)
                         {
                             fprintf(stderr, "error: failed to checkout ref '%s' for '%s'\n", dep->version, dep->name);
@@ -780,7 +877,7 @@ static int cmd_dep_pull(int argc, char **argv)
         {
             // no version specified, get latest commit from default branch
             printf("  updating to latest commit\n");
-            snprintf(git_cmd, sizeof(git_cmd), "cd %s/%s && git checkout origin/HEAD", project_root, vendor_path);
+            snprintf(git_cmd, sizeof(git_cmd), "cd %s && git checkout origin/HEAD", vendor_full_path);
             if (run_git_command(git_cmd) != 0)
             {
                 fprintf(stderr, "error: failed to update to latest commit for '%s'\n", dep->name);
@@ -789,7 +886,7 @@ static int cmd_dep_pull(int argc, char **argv)
             }
 
             char hash_cmd[PATH_MAX * 2];
-            snprintf(hash_cmd, sizeof(hash_cmd), "cd %s/%s && git rev-parse HEAD", project_root, vendor_path);
+            snprintf(hash_cmd, sizeof(hash_cmd), "cd %s && git rev-parse HEAD", vendor_full_path);
 
             FILE *hash_pipe = popen(hash_cmd, "r");
             if (hash_pipe)
@@ -833,6 +930,8 @@ static int cmd_dep_pull(int argc, char **argv)
         fprintf(stderr, "warning: failed to save updated dependency versions\n");
     }
 
+    free(dep_rel_base);
+    free(dep_root);
     config_dnit(config);
     free(config);
     free(project_root);
@@ -856,6 +955,44 @@ static int vendor_dir_exists(const char *path)
 static char *find_project_root(const char *start_path)
 {
     return fs_find_project_root(start_path);
+}
+
+static char *resolve_dep_root(ProjectConfig *config, const char *project_root)
+{
+    if (!config || !project_root)
+        return NULL;
+    return config_resolve_dep_dir(config, project_root);
+}
+
+static int path_is_absolute(const char *path)
+{
+    if (!path || path[0] == '\0')
+        return 0;
+#ifdef _WIN32
+    if (path[0] == '/' || path[0] == '\\')
+        return 1;
+    if (strlen(path) >= 2 && path[1] == ':')
+        return 1;
+    return 0;
+#else
+    return path[0] == '/';
+#endif
+}
+
+static char *resolve_dep_relative(ProjectConfig *config, const char *project_root)
+{
+    if (!config || !project_root || !config->dep_dir)
+        return NULL;
+
+    const char *dep_dir = config->dep_dir;
+    if (!path_is_absolute(dep_dir))
+        return strdup(dep_dir);
+
+    size_t root_len = strlen(project_root);
+    if (strncmp(dep_dir, project_root, root_len) == 0 && (dep_dir[root_len] == '/' || dep_dir[root_len] == '\\'))
+        return strdup(dep_dir + root_len + 1);
+
+    return NULL;
 }
 
 static int config_add_dep_and_save(ProjectConfig *config, const char *config_path, DepSpec *dep)

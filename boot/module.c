@@ -66,11 +66,24 @@ static char *module_manager_build_vendor_dir(ModuleManager *manager, const char 
 {
     if (!manager || !manager->project_dir || !dep_name)
         return NULL;
-    size_t len = strlen(manager->project_dir) + strlen("/dep/") + strlen(dep_name) + 1;
+
+    ProjectConfig *config = (ProjectConfig *)manager->config;
+    if (!config)
+        return NULL;
+
+    char *dep_root = config_resolve_dep_dir(config, manager->project_dir);
+    if (!dep_root)
+        return NULL;
+
+    size_t len  = strlen(dep_root) + 1 + strlen(dep_name) + 1;
     char  *path = malloc(len);
     if (!path)
+    {
+        free(dep_root);
         return NULL;
-    snprintf(path, len, "%s/dep/%s", manager->project_dir, dep_name);
+    }
+    snprintf(path, len, "%s/%s", dep_root, dep_name);
+    free(dep_root);
     return path;
 }
 
@@ -82,7 +95,7 @@ static char *module_manager_resolve_dep_path(ModuleManager *manager, DepSpec *de
     if (module_path_is_absolute(dep->path) || !manager || !manager->project_dir)
         return strdup(dep->path);
 
-    size_t len = strlen(manager->project_dir) + 1 + strlen(dep->path) + 1;
+    size_t len  = strlen(manager->project_dir) + 1 + strlen(dep->path) + 1;
     char  *path = malloc(len);
     if (!path)
         return NULL;
@@ -109,8 +122,17 @@ static char *module_manager_build_resolution_message(ModuleManager *manager, con
 
     if (config->id && strlen(config->id) == prefix_len && strncmp(config->id, canonical_name, prefix_len) == 0)
     {
-        const char *src_rel = config->src_dir ? config->src_dir : "src";
-        char       *message = module_manager_format("module '%s' not found under %s/%s", use_name, manager->project_dir, src_rel);
+        char *src_dir = config_resolve_src_dir(config, manager->project_dir);
+        char *message;
+        if (src_dir)
+        {
+            message = module_manager_format("module '%s' not found under %s", use_name, src_dir);
+            free(src_dir);
+        }
+        else
+        {
+            message = module_manager_format("module '%s' not found; failed to resolve src directory", use_name);
+        }
         free(prefix);
         return message;
     }
@@ -620,10 +642,7 @@ static Module *module_manager_load_module_internal(ModuleManager *manager, const
     {
         char *guess    = module_guess_file_path(manager, canonical);
         char *diagnose = module_manager_build_resolution_message(manager, module_fqn, canonical);
-        module_error_list_add(&manager->errors,
-                              canonical,
-                              guess ? guess : "<unknown>",
-                              diagnose ? diagnose : "Could not find module file");
+        module_error_list_add(&manager->errors, canonical, guess ? guess : "<unknown>", diagnose ? diagnose : "Could not find module file");
         if (diagnose)
             free(diagnose);
         if (guess)
