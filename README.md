@@ -6,8 +6,7 @@ MACH
 ![Last Commit](https://img.shields.io/github/last-commit/octalide/mach)
 ![Issues](https://img.shields.io/github/issues/octalide/mach)
 
-Mach is a statically-typed, compiled programming language designed to be simple, fast, and easy to use.
-It is intended to be a systems programming language, but can be used for a wide variety of applications.
+Mach is a statically-typed, compiled programming language designed to be simple, fast, verbose, and intuitive.
 
 > Mach is still alpha quality. Expect breaking changes as the compiler and standard library iterate.
 
@@ -17,10 +16,9 @@ We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
 
 - [MACH](#mach)
 - [Overview](#overview)
-  - [Philosophy](#philosophy)
-  - [Key Features](#key-features)
+  - [Core Philosophy](#core-philosophy)
 - [Getting Started](#getting-started)
-  - [Building From Source](#building-from-source)
+  - [Building Mach](#building-mach)
   - [Simple Examples](#simple-examples)
     - [Hello World](#hello-world)
     - [Fibonacci](#fibonacci)
@@ -30,56 +28,54 @@ We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
 - [License](#license)
 
 
-## Philosophy
+## Core Philosophy
 
 Mach is designed with the following principles in mind:
-- **Simplicity**: Mach is easy to learn and use.
-- **Readability**: Mach is easy to read and understand.
+- **Simplicity**: Mach is built to be easy to learn, read, write, and maintain.
 - **Explicivity**: Mach is explicit and verbose. WYSIWYG, always. Computers are not magic. Your code should not promote this illusion.
-- **Performance**: Mach is fast and efficient.
-- **Predictability**: Mach is predictable and consistent. There are no hidden behaviors or side effects.
+- **Maintainability**: Mach's semantics and design principles prioritize long-term maintainability over short-term convenience.
 
 Mach is NOT designed to prioritize:
-- **Features**: Batteries are not included.
+- **Features**: Batteries are not included. Ever.
 - **Flexibility**: Mach is rigid and opinionated. It should not be flexible or allow for many ways to do the same thing.
-- **Code Reduction**: Mach is explicit and verbose. More code is not bad code.
-- **Safety**: Safety is the responsibility of the programmer and is often project-specific. Mach does not hold your hand or put you on a leash.
-
-
-## Key Features
-
-- No magic. No side effects. No bullshit. Code written in Mach follows the WYSIWYG principle down to the metal.
-- Small, clearly defined, and well documented feature set.
-- Familiar and easy to read syntax. You do not need to take a class to use mach.
-- Barebones standard library with enough to do the basics, but not enough to overload the language.
-- Compatibility with C at the ABI level.
+- **Code Reduction**: Mach is explicit and verbose. More code is not worse code.
+- **Safety**: Safety is the responsibility of the programmer and is often project-specific. Mach does not hold your hand or put you on a leash when it does not need to.
 
 
 # Getting Started
 
-We encourage you to not even install Mach until you have read the [language documentation](doc/README.md). The docs are written more like a pamphlet then a bible, and assumes that you are familiar with basic programming concepts from other languages.
+We encourage you to not even install Mach until you have read the [language documentation](doc/README.md). The docs are written more like a pamphlet than a bible, and assume that you are familiar with basic programming concepts from other languages.
 
 The reason for this is that Mach may not be for you. If the language does not include some features you hope to use, includes things you despise, or if you just don't like the syntax, then you should look elsewhere. If you read the documentation and have decided that you like the language, then you will have learned the basics and should be capable of diving in.
 
-If you are new to programming in general, then Mach may not be for you. There are lots of other languages that are better suited for beginners (mostly because of the level of documentation), and we encourage you to look into those instead. Some good "first" programming languages are:
-- [Python](https://www.python.org/)
-- [Lua](https://www.lua.org/)
-- [Javascript](https://www.javascript.com/)
+## Building Mach
 
-## Building From Source
+Before compiling the toolchain, follow the [getting started checklist](doc/getting-started.md) to ensure that your system is capable of building Mach from source.
 
-Before compiling the toolchain, follow the [getting started checklist](doc/getting-started.md) to install dependencies, export `MACH_HOME`, and configure `mach.toml` entries for the standard library. After that, the [language tour](doc/language-tour.md) provides a guided walkthrough of Mach syntax and usage, with deeper reference material available throughout the `doc/` directory.
+Once everything is set up, building a usable mach compiler is as simple as:
+
+```bash
+git clone https://github.com/octalide/mach
+cd mach
+make cmach
+```
+
+> NOTE: The above command builds the bootstrap compiler, `cmach`, which is written in C. Mach's fully self-hosted compiler, `mach`, is currently under heavy development and is not yet functional.
 
 ## Simple Examples
 
 The following examples are provided to give a sense of the language's syntax and structure.
 
+> The examples are functional, but they expect the standard library to be included as a dependency during compilation. This is NOT default behaviour and must be explicitly specified to the compiler.
+>
+> For a fully working out-of-the-box example, please refer to the [Mach Sieve](https://github.com/octalide/mach-sieve) project.
+
 
 ### Hello World
 
 ```mach
-use std.runtime;
-use std.types.string;
+use          std.system.runtime;
+use          std.types.string;
 use console: std.io.console;
 
 $main.symbol = "main";
@@ -93,8 +89,8 @@ fun main(args: []str) i64 {
 ### Fibonacci
 
 ```mach
-use std.runtime;
-use std.types.string;
+use          std.system.runtime;
+use          std.types.string;
 use console: std.io.console;
 
 fun fibr(n: i64) i64 {
@@ -117,8 +113,8 @@ fun main(args: []str) i64 {
 ### Factorial
 
 ```mach
-use std.runtime;
-use std.types.string;
+use          std.system.runtime;
+use          std.types.string;
 use console: std.io.console;
 
 fun fact(n: i64) i64 {
