@@ -235,25 +235,5 @@ bool comptime_get_constant(const char *name, ComptimeValue *out_value, const Com
         return true;
     }
 
-    // Legacy constants (for backward compatibility - use target from context)
-    if (strcmp(name, "OS") == 0)
-    {
-        out_value->kind   = COMPTIME_U8;
-        out_value->u8_val = (unsigned char)ctx->target_os;
-        return true;
-    }
-    if (strcmp(name, "ARCH") == 0)
-    {
-        out_value->kind   = COMPTIME_U8;
-        out_value->u8_val = (unsigned char)ctx->target_arch;
-        return true;
-    }
-    if (strcmp(name, "PTR_WIDTH") == 0)
-    {
-        out_value->kind    = COMPTIME_U64;
-        out_value->u64_val = ctx->target_pointer_size * 8;
-        return true;
-    }
-
     return false;
 }
