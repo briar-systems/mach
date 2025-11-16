@@ -16,6 +16,8 @@ This document describes the expression system in Mach, including operators, oper
 		- [Varargs Pack](#varargs-pack)
 	- [Postfix Expressions](#postfix-expressions)
 		- [Function Calls](#function-calls)
+		- [Array Initialization](#array-initialization)
+		- [Slice Initialization](#slice-initialization)
 		- [Array Indexing](#array-indexing)
 		- [Field Access](#field-access)
 		- [Type Casting](#type-casting)
@@ -79,7 +81,6 @@ Unary operators take a single operand and operate on it. They bind more tightly 
 | -------- | ------------------------------------ |
 | `!`      | Logical NOT                          |
 | `-`      | Numeric negation                     |
-| `+`      | Numeric positive (identity)          |
 | `~`      | Bitwise NOT                          |
 | `?`      | Address-of (pointer creation)        |
 | `@`      | Pointer dereference                  |
@@ -102,7 +103,7 @@ Operators are evaluated according to their precedence level, from lowest to high
 9. Shift (`<<`, `>>`)
 10. Term (`+`, `-`)
 11. Factor (`*`, `/`, `%`)
-12. Unary (`!`, `-`, `+`, `~`, `?`, `@`)
+12. Unary (`!`, `-`, `~`, `?`, `@`)
 13. Postfix (calls, indexing, field access, casts)
 14. Primary (literals, identifiers)
 
@@ -196,6 +197,28 @@ val result: i32 = generic_fn[i32, u64](arg1, arg2);
 ```
 
 See the [Types](types.md#generics) documentation for details on generic types.
+
+
+### Array Initialization
+
+Arrays can be initialized using a typed literal syntax:
+
+```mach
+val arr:  [3]i32 = [3]i32{ 1, 2, 3 }; # initialize array
+```
+
+
+### Slice Initialization
+
+Slices must be initialized using a typed literal syntax with both `data` and `len` components:
+
+```mach
+var arr:   [3]i32 = [3]i32{ 1, 2, 3 };           # initialize array
+val slice: []i32  = []i32{ data: ?arr, len: 3 }; # initialize slice from array
+```
+
+- `data` is a pointer to the first element and must be of type `*T` where `T` is the element type.
+- `len` is the number of elements in the slice and is not managed automatically.
 
 
 ### Array Indexing
@@ -305,18 +328,18 @@ See the [Compiletime Systems](compiletime.md) documentation for details on compi
 Assignment updates the value of a mutable variable. The left-hand side must be a mutable location (e.g., a `var` declaration or dereferenced pointer).
 
 ```mach
-var x: i32 = 10;
-x = 20;  # update x
+var x: i32 = 10; # declare and initialize x
+x = 20;          # update x
 
-var p: *i32 = ?x;
-@p = 30;  # update through pointer
+var p: *i32 = ?x; # create pointer to x
+@p = 30;          # update through pointer
 ```
 
 Assignment has the lowest precedence of all operators. The right-hand side is fully evaluated before assignment occurs.
 
 ```mach
-var a: i32 = 5;
-a = a + 10;  # evaluates to 15
+var a: i32 = 5; # declare and initialize a
+a = a + 10;     # evaluates to 15
 ```
 
 Only variables declared with `var` can be assigned to. Variables declared with `val` are immutable after initialization. See the [Keywords](keywords.md#var) and [Keywords](keywords.md#val) documentation for details.
