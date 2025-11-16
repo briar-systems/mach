@@ -13,8 +13,8 @@ This guide walks through the minimum setup required to build Mach from source.
   - [Building the Bootstrap Compiler](#building-the-bootstrap-compiler)
   - [Building the Self-hosted Compiler](#building-the-self-hosted-compiler)
   - [Making a New Project](#making-a-new-project)
+  - [Hello, World!](#hello-world)
 
----
 
 ## Prerequisites
 
@@ -115,3 +115,36 @@ or directly with:
 ```bash
 ./out/bin/mach-project
 ```
+
+## Hello, World!
+
+The standard `mach init` command creates a simple "Hello, World!" application by default.
+The main source file is located at `src/main.mach`:
+
+```mach
+use          std.system.runtime;
+use          std.types.string;
+use console: std.io.console;
+
+$main.symbol = "main"
+fun main(args: []str) i64 {
+    console.print("Hello, World!\n");
+    ret 0;
+}
+```
+
+You can use the `mach build .` and `mach run .` commands as described above to build and run this application.
+
+> At the time of writing, the only functional compiler is the bootstrap compiler (`cmach`).
+> Please use `cmach` in place of `mach` until the self-hosted compiler is complete.
+
+Note that this example uses the standard library, which is not delivered as a part of the Mach compiler itself.
+The [standard library](https://github.com/octalide/mach-std) can be added to your project as a dependency using:
+
+```bash
+cmach dep add https://github.com/octalide/mach-std --version branch/main
+```
+
+See [dependencies.md](dependencies.md) for more information about including dependencies in your Mach projects.
+
+For information as to why `$main.symbol` and explicit runtime imports are necessary, see the runtime entry in the [quirks file](quirks.md#runtime).

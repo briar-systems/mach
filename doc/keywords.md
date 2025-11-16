@@ -21,9 +21,7 @@ This reference lists the reserved keywords and token symbols in the Mach languag
   - [`cnt`](#cnt)
   - [`brk`](#brk)
   - [`asm`](#asm)
-  - [`ptr`](#ptr)
 
----
 
 # Reserved Keywords
 
@@ -326,18 +324,6 @@ asm {
 }
 ```
 
+`asm` is allowed at both global and function scope.
+
 > At the time of writing, inline assembly blocks do not support interpolation of Mach variables into the assembly code or "clobber" declarations.
-
-
-## `ptr`
-
-> `ptr`
-
-The `ptr` keyword is used to denote an untyped pointer.
-It represents a raw memory address.
-
-It's semantically equivalent to C's `void*`.
-
-```mach
-var q: ptr;
-```

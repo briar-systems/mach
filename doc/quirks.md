@@ -10,6 +10,8 @@ Mach has several idiosyncrasies that may seem unusual to programmers coming from
   - ["Record" (`rec`) Instead of "Struct" (`struct`)](#record-rec-instead-of-struct-struct)
   - [No Implicit Type Coercion](#no-implicit-type-coercion)
   - [Vendoring of the Standard Library](#vendoring-of-the-standard-library)
+  - [Runtime](#runtime)
+    - [`$main.symbol = "main"`](#mainsymbol--main)
 
 
 ## Boolean Type as u8
@@ -63,3 +65,29 @@ This approach was chosen to ensure that projects have full control over the vers
 It also decouples the compiler itself from the standard library, allowing for independent updates and modifications.
 
 Projects can include the standard library by adding it as a submodule or copying the source files directly into their project structure. This allows for easy customization and ensures that the standard library is always in sync with the project's needs.
+
+
+## Runtime
+
+By default, Mach does not have a runtime.
+Any runtime used by a Mach program is entirely opt-in.
+
+Because of this, Mach requires explicit declaration of the program's entry point and runtime symbols.
+This is done to provide flexibility in defining how programs start and interact with the runtime environment and to remove the "magic" from this process that most languages impose.
+
+The [standard library](https://github.com/octalide/mach-std) provides a baseline runtime implementation that can be used by most projects, but developers are free to define their own runtimes as needed.
+
+
+### `$main.symbol = "main"`
+
+This declaration specifies the name of the main entry point function for the program.
+By default, Mach does not assume a specific entry point name, allowing developers to define their own conventions.
+
+The standard library's runtime module (`std.system.runtime`) expects a function named `main` to be defined at link-time:
+
+From [runtime.mach](https://github.com/octalide/mach-std/blob/main/src/system/runtime.mach):
+```mach
+pub ext main: fun([]str) i64;
+```
+
+This expectation of a `main` function is why the `$main.symbol = "main"` annotation is necessary in user code as its inclusion manually controls the mangled symbol of the user-defined entry point function.
