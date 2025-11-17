@@ -127,7 +127,10 @@ If the instance parameter is passed by value, modifications to its fields will n
 
 This behaviour is particularly similar to how methods work in Go, where the receiver can be either a value or a pointer.
 
-Calling a method on a value type will automatically pass a pointer to the instance if the method expects a pointer receiver, and vice versa.
+The compiler automatically converts between value and pointer types when calling methods.
+If a method has a pointer receiver but is called on a value, the address is taken automatically.
+If a method has a value receiver but is called on a pointer, the pointer is dereferenced automatically.
+This means `.` is used uniformly for both field access and method calls, regardless of whether the instance is a value or pointer.
 
 
 ## Anonymous `rec` and `uni`

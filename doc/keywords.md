@@ -3,6 +3,7 @@
 This reference lists the reserved keywords and token symbols in the Mach language, with brief descriptions and links to relevant sections of the language reference.
 
 - [Keywords and Symbols](#keywords-and-symbols)
+- [Comments](#comments)
 - [Reserved Keywords](#reserved-keywords)
   - [`use`](#use)
   - [`ext`](#ext)
@@ -21,6 +22,18 @@ This reference lists the reserved keywords and token symbols in the Mach languag
   - [`cnt`](#cnt)
   - [`brk`](#brk)
   - [`asm`](#asm)
+
+
+# Comments
+
+Mach uses `#` for single-line comments. Comments begin with `#` and continue to the end of the line:
+
+```mach
+# This is a comment
+val x: i32 = 42;  # inline comment
+```
+
+There are no multi-line or block comments in Mach.
 
 
 # Reserved Keywords

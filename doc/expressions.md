@@ -235,7 +235,7 @@ See the [Types](types.md#arrays) documentation for details on arrays and indexin
 
 ### Field Access
 
-Field access retrieves a named field from a record or union.
+Field access retrieves a named field from a record or union using the `.` operator.
 
 ```mach
 rec Point {
@@ -247,6 +247,13 @@ val p:       Point = Point{x: 1.0, y: 2.0};
 val x_coord: f32   = p.x;
 ```
 
+The `.` operator works uniformly for both values and pointers. When accessing fields through a pointer, Mach automatically dereferences:
+
+```mach
+val ptr:     *Point = ?p;
+val y_coord: f32    = ptr.y;  # no special syntax needed
+```
+
 Field access is also used to call methods on types:
 
 ```mach
@@ -256,6 +263,8 @@ fun (this: *Point) distance() f32 {
 
 val dist: f32 = p.distance();
 ```
+
+When calling methods, the compiler automatically converts between value and pointer types to match the receiver type declared in the method signature.
 
 See the [Types](types.md#methods) documentation for details on method syntax.
 
