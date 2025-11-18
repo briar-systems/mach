@@ -21,6 +21,7 @@ This reference lists the reserved keywords and token symbols in the Mach languag
   - [`for`](#for)
   - [`cnt`](#cnt)
   - [`brk`](#brk)
+  - [`fin`](#fin)
   - [`asm`](#asm)
 
 
@@ -319,6 +320,27 @@ for {
     if (i == 5) {
         brk;
     }
+}
+```
+
+
+## `fin`
+
+> `fin <statement>;`
+
+The `fin` keyword introduces a deferred statement that will be executed when the current block exits.
+Deferred statements are executed in LIFO (Last-In, First-Out) order.
+
+`fin` is block-scoped, meaning the deferred statement runs at the end of the enclosing block (`{ ... }`), not necessarily at the end of the function.
+
+```mach
+fun example() {
+    var x: i32 = 0;
+    {
+        fin x = x + 1;
+        x = 10;
+    }
+    # x is 11 here
 }
 ```
 

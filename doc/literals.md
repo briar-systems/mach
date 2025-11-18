@@ -76,7 +76,7 @@ val q:   u8 = '\"';
 
 String literals are enclosed in double quotes: `"hello"`
 
-String literals evaluate to the built-in `str` type, which is a record with `data: *u8` and a pointer-sized `len` field. Literal data is UTF-8 encoded and lives in read-only memory.
+String literals evaluate to the built-in `str` type, which is a record with `data: &u8` and a pointer-sized `len` field. Literal data is UTF-8 encoded and lives in read-only memory.
 
 The following escape sequences are allowed:
 - `\'` for single quote
@@ -89,7 +89,7 @@ The following escape sequences are allowed:
 
 ```mach
 val greeting: str = "Hello, World!\n";
-val bytes:   *u8 = greeting.data;
+val bytes:   &u8 = greeting.data;
 val length:  u64 = greeting.len;
 ```
 
