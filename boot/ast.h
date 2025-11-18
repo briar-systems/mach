@@ -298,9 +298,8 @@ struct AstNode
         // array literal
         struct
         {
-            AstNode *type;             // element type
-            AstList *elems;            // elements
-            bool     is_slice_literal; // true when expressed as pointer+length literal
+            AstNode *type;  // element type
+            AstList *elems; // elements
         } array_expr;
 
         // struct literal
@@ -328,7 +327,7 @@ struct AstNode
         struct
         {
             AstNode *elem_type;
-            AstNode *size; // null for slices []
+            AstNode *size; // required for fixed-size arrays
         } type_array;
 
         struct

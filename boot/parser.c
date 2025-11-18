@@ -2870,16 +2870,21 @@ AstNode *parser_parse_array_literal(Parser *parser)
         return NULL;
     }
 
-    // size or unbounded
-    if (!parser_check(parser, TOKEN_R_BRACKET))
+    // require explicit length (slices removed)
+    if (parser_check(parser, TOKEN_R_BRACKET))
     {
-        array->array_expr.type->type_array.size = parser_parse_expr(parser);
-        if (!array->array_expr.type->type_array.size)
-        {
-            ast_node_dnit(array);
-            free(array);
-            return NULL;
-        }
+        parser_error_at_current(parser, "array literal requires explicit length (use [N]T; slices []T have been removed)");
+        ast_node_dnit(array);
+        free(array);
+        return NULL;
+    }
+
+    array->array_expr.type->type_array.size = parser_parse_expr(parser);
+    if (!array->array_expr.type->type_array.size)
+    {
+        ast_node_dnit(array);
+        free(array);
+        return NULL;
     }
 
     if (!parser_consume(parser, TOKEN_R_BRACKET, "expected ']' in array type"))
@@ -3134,16 +3139,21 @@ AstNode *parser_parse_type_array(Parser *parser)
         return NULL;
     }
 
-    // size or unbounded
-    if (!parser_check(parser, TOKEN_R_BRACKET))
+    // require explicit length (slices removed)
+    if (parser_check(parser, TOKEN_R_BRACKET))
     {
-        array->type_array.size = parser_parse_expr(parser);
-        if (!array->type_array.size)
-        {
-            ast_node_dnit(array);
-            free(array);
-            return NULL;
-        }
+        parser_error_at_current(parser, "array type requires explicit length (use [N]T; slices []T have been removed)");
+        ast_node_dnit(array);
+        free(array);
+        return NULL;
+    }
+
+    array->type_array.size = parser_parse_expr(parser);
+    if (!array->type_array.size)
+    {
+        ast_node_dnit(array);
+        free(array);
+        return NULL;
     }
 
     if (!parser_consume(parser, TOKEN_R_BRACKET, "expected ']' after array size"))
@@ -3225,7 +3235,8 @@ AstNode *parser_parse_type_fun(Parser *parser)
     }
 
     // optional return type
-    if (!parser_is_at_end(parser) && !parser_check(parser, TOKEN_SEMICOLON) && !parser_check(parser, TOKEN_COMMA) && !parser_check(parser, TOKEN_R_PAREN) && !parser_check(parser, TOKEN_R_BRACKET) && !parser_check(parser, TOKEN_R_BRACE) && !parser_check(parser, TOKEN_EQUAL))
+    if (!parser_is_at_end(parser) && !parser_check(parser, TOKEN_SEMICOLON) && !parser_check(parser, TOKEN_COMMA) && !parser_check(parser, TOKEN_R_PAREN) && !parser_check(parser, TOKEN_R_BRACKET) && !parser_check(parser, TOKEN_R_BRACE) &&
+        !parser_check(parser, TOKEN_EQUAL))
     {
         fun->type_fun.return_type = parser_parse_type(parser);
         if (!fun->type_fun.return_type)

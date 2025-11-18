@@ -11,7 +11,7 @@ This section describes Mach's type system.
   - [Methods](#methods)
   - [Anonymous `rec` and `uni`](#anonymous-rec-and-uni)
   - [Arrays](#arrays)
-  - [Slices](#slices)
+    - [String Primitive](#string-primitive)
   - [Generics](#generics)
   - [Type Casting](#type-casting)
     - [Inference](#inference)
@@ -35,6 +35,7 @@ Mach includes the following primitive types:
 | `f32` | 32-bit floating-point number                |
 | `f64` | 64-bit floating-point number                |
 | `ptr` | Untyped pointer (equivalent to C's `void*`) |
+| `str` | String literal record `{ data: *u8, len: <pointer-sized-uint> }` |
 
 ## Type Aliases
 
@@ -53,7 +54,6 @@ Mach supports four primary compound types:
 - [Records](#records): Used to group related data fields together.
 - [Unions](#unions): Used to define a type that can hold one of several different types.
 - [Arrays](#arrays): Fixed-size collections of elements of the same type.
-- [Slices](#slices): Dynamically-sized collections of elements of the same type.
 
 
 ### Records
@@ -161,26 +161,20 @@ Arrays have a fixed size that is determined at compile time and cannot be change
 
 On the backend, arrays are represented as a contiguous block of memory containing the elements in sequence.
 
-Arrays have two intrinsic fields:
-- `.data`: A pointer to the first element of the array.
-- `.len`: The length of the array (number of elements).
+Arrays expose no intrinsic fields. They behave like POD aggregates with a fixed number of elements known at compile time. If you need runtime-sized views into memory, use a record type from the standard library such as `std.types.Slice[T]` or `std.types.String`.
 
+## String Primitive
 
-## Slices
-
-Slices are dynamically-sized sets of contiguous elements. The size of a slice is not fixed at compile time and can change at runtime. Slices are defined using empty square brackets (`[]`) before the element type.
+`str` is the only compiler known composite type. It represents string literals embedded in the binary and is exposed as a simple record:
 
 ```mach
-val s: []u8;
+rec str {
+    data: *u8;
+    len: u64; # pointer-sized unsigned integer (u32 on 32-bit targets)
+}
 ```
 
-Slices are represented as fat pointers, containing both a pointer to the data and the length of the slice.
-
-Like arrays, slices have two intrinsic fields:
-- `.data`: A pointer to the first element of the slice.
-- `.len`: The length of the slice (number of elements).
-
-While their syntax and usage are similar, slices and arrays are distinct types in Mach and are not interchangeable without explicit casting.
+The `len` field uses the pointer-sized unsigned integer for the current target (e.g., `u64` on 64-bit platforms). All string literals have type `str`, are UTF-8 encoded, and live in read-only memory. Access the data and length through the exposed fields just like any other record. For owned or mutable strings, prefer the standard library's `std.types.String` type.
 
 ## Generics
 

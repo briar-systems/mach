@@ -585,15 +585,15 @@ static AstNode *ast_clone_checked(const AstNode *node)
         break;
 
     case AST_STMT_FUN:
-        clone->fun_stmt.name            = ast_strdup(node->fun_stmt.name);
-        clone->fun_stmt.params          = ast_list_clone(node->fun_stmt.params);
-        clone->fun_stmt.generics        = ast_list_clone(node->fun_stmt.generics);
-        clone->fun_stmt.return_type     = ast_clone_checked(node->fun_stmt.return_type);
-        clone->fun_stmt.body            = ast_clone_checked(node->fun_stmt.body);
-        clone->fun_stmt.is_variadic     = node->fun_stmt.is_variadic;
-        clone->fun_stmt.is_public       = node->fun_stmt.is_public;
-        clone->fun_stmt.is_method       = node->fun_stmt.is_method;
-        clone->fun_stmt.method_receiver = ast_clone_checked(node->fun_stmt.method_receiver);
+        clone->fun_stmt.name                 = ast_strdup(node->fun_stmt.name);
+        clone->fun_stmt.params               = ast_list_clone(node->fun_stmt.params);
+        clone->fun_stmt.generics             = ast_list_clone(node->fun_stmt.generics);
+        clone->fun_stmt.return_type          = ast_clone_checked(node->fun_stmt.return_type);
+        clone->fun_stmt.body                 = ast_clone_checked(node->fun_stmt.body);
+        clone->fun_stmt.is_variadic          = node->fun_stmt.is_variadic;
+        clone->fun_stmt.is_public            = node->fun_stmt.is_public;
+        clone->fun_stmt.is_method            = node->fun_stmt.is_method;
+        clone->fun_stmt.method_receiver      = ast_clone_checked(node->fun_stmt.method_receiver);
         clone->fun_stmt.method_receiver_name = ast_strdup(node->fun_stmt.method_receiver_name);
         break;
 
@@ -723,9 +723,8 @@ static AstNode *ast_clone_checked(const AstNode *node)
         break;
 
     case AST_EXPR_ARRAY:
-        clone->array_expr.type             = ast_clone_checked(node->array_expr.type);
-        clone->array_expr.elems            = ast_list_clone(node->array_expr.elems);
-        clone->array_expr.is_slice_literal = node->array_expr.is_slice_literal;
+        clone->array_expr.type  = ast_clone_checked(node->array_expr.type);
+        clone->array_expr.elems = ast_list_clone(node->array_expr.elems);
         break;
 
     case AST_EXPR_STRUCT:

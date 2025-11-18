@@ -23,6 +23,7 @@ typedef enum TypeKind
     TYPE_F32,
     TYPE_F64,
     TYPE_PTR,     // generic pointer
+    TYPE_STR,     // builtin string literal type
     TYPE_POINTER, // typed pointer
     TYPE_ARRAY,
     TYPE_STRUCT,
@@ -56,8 +57,7 @@ typedef struct Type
         struct
         {
             struct Type *elem_type;
-            size_t       size;     // 0 for slices/fat pointers, >0 for fixed-size arrays
-            bool         is_slice; // true for []T (fat pointer), false for [N]T (fixed-size)
+            size_t       size; // element count for fixed-size arrays
         } array;
 
         // TYPE_STRUCT, TYPE_UNION
@@ -101,11 +101,12 @@ Type *type_f16(void);
 Type *type_f32(void);
 Type *type_f64(void);
 Type *type_ptr(void);
+Type *type_str(void);
+Type *type_pointer_uint(void);
 Type *type_error(void);
 
 // type constructors
 Type *type_pointer_create(Type *base);
-Type *type_array_create(Type *elem_type);                    // creates slice/fat pointer []T
 Type *type_fixed_array_create(Type *elem_type, size_t size); // creates fixed-size [N]T
 Type *type_struct_create(const char *name);
 Type *type_union_create(const char *name);
