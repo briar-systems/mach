@@ -9,7 +9,7 @@ This document describes the literal forms available in Mach and how they are use
   - [String literals](#string-literals)
   - [Null literal](#null-literal)
   - [Composite literals](#composite-literals)
-    - [Array and slice typed literals](#array-and-slice-typed-literals)
+    - [Array typed literals](#array-typed-literals)
     - [Array literal short form](#array-literal-short-form)
     - [Record and union typed literals](#record-and-union-typed-literals)
     - [Anonymous composite literals](#anonymous-composite-literals)
@@ -76,7 +76,7 @@ val q:   u8 = '\"';
 
 String literals are enclosed in double quotes: `"hello"`
 
-String literals evaluate to a slice of `u8` (`[]u8`).
+String literals evaluate to the built-in `str` type, which is a record with `data: *u8` and a pointer-sized `len` field. Literal data is UTF-8 encoded and lives in read-only memory.
 
 The following escape sequences are allowed:
 - `\'` for single quote
@@ -88,8 +88,9 @@ The following escape sequences are allowed:
 - `\0` for null
 
 ```mach
-val greeting: []u8 = "Hello, World!\n";
-val path:     []u8 = "C:\\Program Files\\";
+val greeting: str = "Hello, World!\n";
+val bytes:   *u8 = greeting.data;
+val length:  u64 = greeting.len;
 ```
 
 
@@ -114,30 +115,24 @@ Use `nil` in pointer-like contexts or where a null value is acceptable.
 
 Mach supports constructing composite values with brace initializers. The initializer syntax is driven by the type on the left.
 
-### Array and slice typed literals
+### Array typed literals
 
 Typed array literal:
 ```
 val a: [3]u8 = [3]u8{ 1, 2, 3 };
 ```
 
-Typed slice (runtime-sized) literal:
-```
-val b: []u8 = []u8{ 10, 20, 30, 40 };
-```
-
 Notes:
 - Arrays `[N]T` have fixed length `N`.
-- Slices `[]T` (runtime-sized) are fat pointers with `.data` and `.len`.
 - Elements are comma-separated; a trailing comma is not required.
 
 Access:
 ```
 val x: u8  = a[0];
 var i: u64 = 0;
-for (i < b.len) {
-    # use b[i]
-    i = i + 1;
+for (i < 3) {
+  # use a[i]
+  i = i + 1;
 }
 ```
 
@@ -248,10 +243,9 @@ var p: *u8 = nil;
 if (p == nil) { /* ... */ }
 ```
 
-Array and slice:
+Array:
 ```
 val a: [3]u8 = [3]u8{ 1, 2, 3 };
-val s: []u8  = []u8{ 10, 20, 30, 40 };
 val first: u8 = a[0];
 ```
 

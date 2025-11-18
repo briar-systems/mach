@@ -1102,28 +1102,30 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
         if (!elem)
             return NULL;
 
-        Type *arr = NULL;
-        if (type_node->type_array.size)
+        if (!type_node->type_array.size)
         {
-            // fixed-size array [N]T - evaluate size
-            // for now, only support integer literals
-            if (type_node->type_array.size->kind != AST_EXPR_LIT || type_node->type_array.size->lit_expr.kind != TOKEN_LIT_INT)
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "array size must be an integer literal");
-                return NULL;
-            }
-            int64_t size_val = type_node->type_array.size->lit_expr.int_val;
-            if (size_val <= 0)
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "array size must be positive");
-                return NULL;
-            }
-            arr = type_fixed_array_create(elem, (size_t)size_val);
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "array type requires explicit length (slices []T are no longer supported)");
+            return NULL;
         }
-        else
+
+        if (type_node->type_array.size->kind != AST_EXPR_LIT || type_node->type_array.size->lit_expr.kind != TOKEN_LIT_INT)
         {
-            // slice/fat pointer []T
-            arr = type_array_create(elem);
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "array size must be an integer literal");
+            return NULL;
+        }
+
+        int64_t size_val = type_node->type_array.size->lit_expr.int_val;
+        if (size_val <= 0)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "array size must be positive");
+            return NULL;
+        }
+
+        Type *arr = type_fixed_array_create(elem, (size_t)size_val);
+        if (!arr)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "failed to create array type");
+            return NULL;
         }
 
         type_node->type = arr;
@@ -3169,7 +3171,7 @@ static Type *analyze_lit_expr_with_hint(SemanticDriver *driver, const AnalysisCo
         expr->type = type_u8();
         return expr->type;
     case TOKEN_LIT_STRING:
-        expr->type = type_array_create(type_u8());
+        expr->type = type_str();
         return expr->type;
     default:
         return NULL;
@@ -3326,17 +3328,16 @@ static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *
 
     // for assignment, shifts, and arithmetic ops, pass LHS type as hint to RHS for proper literal typing
     TokenKind op    = expr->binary_expr.op;
-    bool      hints = (op == TOKEN_EQUAL || op == TOKEN_LESS_LESS || op == TOKEN_GREATER_GREATER ||
-                       op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_STAR || op == TOKEN_SLASH || op == TOKEN_PERCENT);
+    bool      hints = (op == TOKEN_EQUAL || op == TOKEN_LESS_LESS || op == TOKEN_GREATER_GREATER || op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_STAR || op == TOKEN_SLASH || op == TOKEN_PERCENT);
     Type     *right = hints ? analyze_expr_with_hint(driver, ctx, expr->binary_expr.right, left) : analyze_expr(driver, ctx, expr->binary_expr.right);
 
     if (!left || !right)
         return NULL;
 
-    left  = type_resolve_alias(left);
-    right = type_resolve_alias(right);
-    bool      left_ptr  = type_is_pointer_like(left);
-    bool      right_ptr = type_is_pointer_like(right);
+    left           = type_resolve_alias(left);
+    right          = type_resolve_alias(right);
+    bool left_ptr  = type_is_pointer_like(left);
+    bool right_ptr = type_is_pointer_like(right);
 
     if ((op == TOKEN_PLUS || op == TOKEN_MINUS) && (left_ptr || right_ptr))
     {
@@ -3502,8 +3503,8 @@ static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *
 static Type *analyze_unary_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected)
 {
     // for unary +/-, pass the hint through to the operand (e.g., "-86400" with hint i64 should type the literal as i64)
-    TokenKind op = expr->unary_expr.op;
-    Type *operand = NULL;
+    TokenKind op      = expr->unary_expr.op;
+    Type     *operand = NULL;
     if ((op == TOKEN_MINUS || op == TOKEN_PLUS) && expected && type_is_numeric(expected))
     {
         operand = analyze_expr_with_hint(driver, ctx, expr->unary_expr.expr, expected);
@@ -3512,7 +3513,7 @@ static Type *analyze_unary_expr_with_hint(SemanticDriver *driver, const Analysis
     {
         operand = analyze_expr(driver, ctx, expr->unary_expr.expr);
     }
-    
+
     if (!operand)
         return NULL;
     operand = type_resolve_alias(operand);
@@ -4399,21 +4400,7 @@ static Type *analyze_field_expr(SemanticDriver *driver, const AnalysisContext *c
 
     object_type = type_resolve_alias(object_type);
 
-    if (object_type->kind == TYPE_ARRAY)
-    {
-        if (strcmp(expr->field_expr.field, "len") == 0)
-        {
-            expr->type = type_u64();
-            return expr->type;
-        }
-        if (strcmp(expr->field_expr.field, "data") == 0)
-        {
-            expr->type = type_pointer_create(object_type->array.elem_type);
-            return expr->type;
-        }
-    }
-
-    if (object_type->kind != TYPE_STRUCT && object_type->kind != TYPE_UNION)
+    if (object_type->kind != TYPE_STRUCT && object_type->kind != TYPE_UNION && object_type->kind != TYPE_STR)
     {
         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "member access on non-composite type");
         return NULL;
@@ -4540,6 +4527,12 @@ static Type *analyze_struct_expr(SemanticDriver *driver, const AnalysisContext *
     Type *resolved_type = type_resolve_alias(struct_type);
     if (!resolved_type)
         resolved_type = struct_type;
+
+    if (resolved_type->kind == TYPE_ARRAY)
+    {
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "array types do not support field initializers; use array literals instead");
+        return NULL;
+    }
 
     // validate union literal
     if (expr->struct_expr.is_union_literal && resolved_type->kind != TYPE_UNION)
@@ -4673,64 +4666,16 @@ static Type *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *c
 
     if (resolved_type->kind == TYPE_ARRAY)
     {
-        size_t elem_count     = expr->array_expr.elems ? (size_t)expr->array_expr.elems->count : 0;
-        bool   treat_as_slice = false;
+        size_t elem_count = expr->array_expr.elems ? (size_t)expr->array_expr.elems->count : 0;
+        size_t expected   = resolved_type->array.size;
 
-        if (expr->array_expr.type && expr->array_expr.type->kind == AST_TYPE_ARRAY)
+        if (elem_count != expected)
         {
-            treat_as_slice = (expr->array_expr.type->type_array.size == NULL);
-        }
-        else if ((!expr->array_expr.type || expr->array_expr.type->kind == AST_TYPE_NAME) && elem_count <= 2)
-        {
-            // type aliases to slices appear as names; treat them as slices as well
-            treat_as_slice = true;
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "array literal element count mismatch (expected %zu, got %zu)", expected, elem_count);
+            return NULL;
         }
 
         Type *elem_type = resolved_type->array.elem_type;
-
-        if (treat_as_slice)
-        {
-            expr->array_expr.is_slice_literal = true;
-
-            Type *data_type = type_pointer_create(elem_type);
-            Type *len_type  = type_u64();
-
-            if (elem_count == 0)
-            {
-                expr->type = specified_type;
-                return specified_type;
-            }
-
-            if (elem_count > 2)
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "slice literal expects at most data and length expressions");
-                return NULL;
-            }
-
-            AstNode *data_expr = expr->array_expr.elems->items[0];
-            Type    *data_val  = analyze_expr_with_hint(driver, ctx, data_expr, data_type);
-            if (!data_val)
-                return NULL;
-            if (!ensure_assignable(driver, ctx, data_type, data_val, data_expr, "slice data"))
-                return NULL;
-
-            if (elem_count == 1)
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "slice literal missing length expression");
-                return NULL;
-            }
-
-            AstNode *len_expr = expr->array_expr.elems->items[1];
-            Type    *len_val  = analyze_expr_with_hint(driver, ctx, len_expr, len_type);
-            if (!len_val)
-                return NULL;
-            if (!ensure_assignable(driver, ctx, len_type, len_val, len_expr, "slice length"))
-                return NULL;
-
-            expr->type = specified_type;
-            return specified_type;
-        }
-
         for (size_t i = 0; i < elem_count; i++)
         {
             AstNode *elem       = expr->array_expr.elems->items[i];
@@ -4749,22 +4694,8 @@ static Type *analyze_array_expr(SemanticDriver *driver, const AnalysisContext *c
     if (resolved_type->kind == TYPE_STRUCT || resolved_type->kind == TYPE_UNION)
         return analyze_array_as_struct(driver, ctx, expr, specified_type, resolved_type);
 
-    Type  *elem_type  = resolved_type;
-    size_t elem_count = expr->array_expr.elems ? (size_t)expr->array_expr.elems->count : 0;
-
-    for (size_t i = 0; i < elem_count; i++)
-    {
-        AstNode *elem       = expr->array_expr.elems->items[i];
-        Type    *value_type = analyze_expr_with_hint(driver, ctx, elem, elem_type);
-        if (!value_type)
-            return NULL;
-
-        if (!ensure_assignable(driver, ctx, elem_type, value_type, elem, "array element"))
-            return NULL;
-    }
-
-    expr->type = type_array_create(elem_type);
-    return expr->type;
+    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "array literal requires an array or composite type");
+    return NULL;
 }
 
 static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected);
@@ -4818,7 +4749,7 @@ static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const Analy
                     diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "out of memory allocating string constant");
                     return NULL;
                 }
-                expr->type = type_array_create(type_u8());
+                expr->type = type_str();
             }
             else
             {
@@ -4873,7 +4804,7 @@ static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const Analy
                         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "out of memory allocating string constant");
                         return NULL;
                     }
-                    expr->type = type_array_create(type_u8());
+                    expr->type = type_str();
                 }
                 else
                 {
@@ -4896,7 +4827,8 @@ static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const Analy
         {
             const char *func_name = inner->call_expr.func->ident_expr.name;
 
-            if (strcmp(func_name, "size_of") == 0 || strcmp(func_name, "align_of") == 0 || strcmp(func_name, "offset_of") == 0 || strcmp(func_name, "type_of") == 0 || strcmp(func_name, "min") == 0 || strcmp(func_name, "max") == 0 || strcmp(func_name, "iota") == 0)
+            if (strcmp(func_name, "size_of") == 0 || strcmp(func_name, "align_of") == 0 || strcmp(func_name, "offset_of") == 0 || strcmp(func_name, "type_of") == 0 || strcmp(func_name, "min") == 0 || strcmp(func_name, "max") == 0 ||
+                strcmp(func_name, "iota") == 0)
             {
                 // use the dedicated intrinsic handler - it modifies the CALL node in place
                 Type *result_type = analyze_comptime_intrinsic(driver, ctx, inner, func_name);

@@ -85,6 +85,7 @@ mach.toml                # project.id = "myapp"
 | `f32` | 32-bit floating-point              |
 | `f64` | 64-bit floating-point              |
 | `ptr` | Untyped pointer (like C's `void*`) |
+| `str` | String literal record `{ data: *u8, len: pointer-sized-uint }` |
 
 
 ## Builtin Values
@@ -138,7 +139,6 @@ In addition to the builtin primitive types, Mach supports several native compoun
 | -------- | ------ |
 | Pointer  | `*T`   |
 | Array    | `[N]T` |
-| Slice    | `[]T`  |
 
 Records and unions can contain fields of any other type, including other generics.
 Anonymous `rec { ... }` and `uni { ... }` blocks are valid anywhere a type expression is allowed.
@@ -149,7 +149,7 @@ Anonymous `rec { ... }` and `uni { ... }` blocks are valid anywhere a type expre
 | Construct     | Example                                   | Notes                                        |
 | ------------- | ----------------------------------------- | -------------------------------------------- |
 | Field access  | `point.x`                                 | Works on records or module namespaces.       |
-| Indexing      | `buffer[i]`                               | Arrays, slices, or pointer-like values.      |
+| Indexing      | `buffer[i]`                               | Arrays or pointer-like values.               |
 | Call          | `func(arg1, arg2)`                        | Methods rewrite to calls with receivers.     |
 | Generic call  | `func[i32](value)`                        | Supply type arguments before parentheses.    |
 | Typed literal | `Pair[i32, f64]{ first: 1, second: 2.0 }` | Construct generic values directly.           |
@@ -195,7 +195,7 @@ for {
 
 ## Entry points
 
-The runtime included in the Mach standard library looks for a function with the signature `main([][]u8) i64` as the program's entry point.
+The runtime included in the Mach standard library looks for a function returning `i64`. Pass runtime arguments using one of the collection types provided by `std.types`, for example a `List[str]`.
 This is not enforced by the compiler itself, but by convention outlined in `std.system.runtime`.
 
 Because of this, a minimal Mach program must use the standard library as a dependency.
@@ -203,11 +203,11 @@ With that in place, a simple "Hello, World!" program looks like this:
 
 ```mach
 use          std.system.runtime;
-use          std.types.string;
+use          std.types.list;
 use console: std.io.console;
 
 $main.symbol = "main";
-fun main(args: []str) i64 {
+fun main(args: list.List[str]) i64 {
     console.print("Hello, World!\n");
     ret 0;
 }
