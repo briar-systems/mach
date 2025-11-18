@@ -33,6 +33,7 @@ typedef enum TokenKind
     TOKEN_KW_BRK, // brk
     TOKEN_KW_ASM, // asm
     TOKEN_KW_NIL, // nil
+    TOKEN_KW_FIN, // fin
 
     // punctuation
     TOKEN_L_PAREN,    // (

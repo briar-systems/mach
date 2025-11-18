@@ -182,6 +182,7 @@ struct AstNode
         struct
         {
             AstList *stmts;
+            AstList *deferred_stmts; // statements to execute at block exit (fin)
         } block_stmt;
 
         // expression statement
@@ -322,6 +323,7 @@ struct AstNode
         struct
         {
             AstNode *base;
+            bool     is_read_only;
         } type_ptr;
 
         struct

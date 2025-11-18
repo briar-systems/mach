@@ -66,6 +66,16 @@ struct CodegenContext
     Type             *current_function_type; // mach type for current function
     LLVMBasicBlockRef break_block;
     LLVMBasicBlockRef continue_block;
+    int               break_depth;    // deferred stack depth for break target
+    int               continue_depth; // deferred stack depth for continue target
+
+    // deferred statements stack (for fin)
+    struct
+    {
+        AstList **blocks; // stack of deferred statement lists
+        int       count;
+        int       capacity;
+    } deferred_stack;
 
     // initialization context
     bool generating_mutable_init; // true when generating initializer for var (not val)

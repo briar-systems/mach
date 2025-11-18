@@ -162,6 +162,11 @@ void ast_node_dnit(AstNode *node)
             ast_list_dnit(node->block_stmt.stmts);
             free(node->block_stmt.stmts);
         }
+        if (node->block_stmt.deferred_stmts)
+        {
+            ast_list_dnit(node->block_stmt.deferred_stmts);
+            free(node->block_stmt.deferred_stmts);
+        }
         break;
 
     case AST_STMT_EXPR:
@@ -1115,7 +1120,7 @@ void ast_print(AstNode *node, int indent)
         break;
 
     case AST_TYPE_PTR:
-        printf("TYPE_PTR\n");
+        printf("TYPE_PTR%s\n", node->type_ptr.is_read_only ? " (read-only)" : "");
         ast_print(node->type_ptr.base, indent + 1);
         break;
 
@@ -1595,7 +1600,7 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         }
         break;
     case AST_TYPE_PTR:
-        fprintf(file, "TYPE_PTR\n");
+        fprintf(file, "TYPE_PTR%s\n", node->type_ptr.is_read_only ? " (read-only)" : "");
         ast_print_to_file(node->type_ptr.base, file, indent + 1);
         break;
     case AST_TYPE_ARRAY:

@@ -13,6 +13,7 @@ static Type *g_error_type                  = NULL;
 typedef struct PointerCacheEntry
 {
     Type                     *base;
+    bool                      is_read_only;
     Type                     *pointer;
     struct PointerCacheEntry *next;
 } PointerCacheEntry;
@@ -86,7 +87,7 @@ void type_system_init(void)
 
         if (type->kind == TYPE_STR)
         {
-            Type  *data_type  = type_pointer_create(type_u8());
+            Type  *data_type  = type_pointer_create(type_u8(), false);
             Type  *len_type   = type_pointer_uint();
             size_t data_align = data_type ? data_type->alignment : sizeof(void *);
             size_t data_size  = data_type ? data_type->size : sizeof(void *);
@@ -259,11 +260,11 @@ Type *type_lookup_builtin(const char *name)
     return NULL;
 }
 
-Type *type_pointer_create(Type *base)
+Type *type_pointer_create(Type *base, bool is_read_only)
 {
     for (PointerCacheEntry *entry = g_pointer_cache; entry; entry = entry->next)
     {
-        if (entry->base == base)
+        if (entry->base == base && entry->is_read_only == is_read_only)
         {
             return entry->pointer;
         }
@@ -279,9 +280,11 @@ Type *type_pointer_create(Type *base)
     type->alignment      = pointer_size;
     type->name           = NULL;
     type->pointer.base   = base;
+    type->pointer.is_read_only = is_read_only;
 
     PointerCacheEntry *entry = malloc(sizeof(PointerCacheEntry));
     entry->base              = base;
+    entry->is_read_only      = is_read_only;
     entry->pointer           = type;
     entry->next              = g_pointer_cache;
     g_pointer_cache          = entry;
@@ -402,6 +405,8 @@ bool type_equals(Type *a, Type *b)
     switch (a->kind)
     {
     case TYPE_POINTER:
+        if (a->pointer.is_read_only != b->pointer.is_read_only)
+            return false;
         return type_equals(a->pointer.base, b->pointer.base);
 
     case TYPE_ARRAY:
@@ -593,7 +598,16 @@ bool type_can_assign_to(Type *from, Type *to)
 
     // pointer conversions (same pointer types, but not functions)
     if (type_is_pointer_like(from) && type_is_pointer_like(to) && from->kind != TYPE_FUNCTION && to->kind != TYPE_FUNCTION)
+    {
+        // allow *T -> &T (mutable to read-only)
+        // disallow &T -> *T (read-only to mutable)
+        if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER)
+        {
+            if (from->pointer.is_read_only && !to->pointer.is_read_only)
+                return false;
+        }
         return true;
+    }
 
     // array to pointer decay
     if (from->kind == TYPE_ARRAY && to->kind == TYPE_POINTER)
@@ -656,7 +670,7 @@ Type *type_resolve(AstNode *type_node, SymbolTable *symbol_table)
         Type *base = type_resolve(type_node->type_ptr.base, symbol_table);
         if (!base)
             return NULL;
-        return type_pointer_create(base);
+        return type_pointer_create(base, type_node->type_ptr.is_read_only);
     }
 
     case AST_TYPE_ARRAY:
@@ -924,8 +938,12 @@ char *type_to_string(Type *type)
         break;
 
     case TYPE_POINTER:
-        snprintf(result, 256, "*%s", type_to_string(type->pointer.base));
+    {
+        char *base_str = type_to_string(type->pointer.base);
+        snprintf(result, 256, "%s%s", type->pointer.is_read_only ? "&" : "*", base_str);
+        free(base_str);
         break;
+    }
 
     case TYPE_ARRAY:
     {
