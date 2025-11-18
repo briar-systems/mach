@@ -1104,7 +1104,7 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
 
         if (!type_node->type_array.size)
         {
-            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "array type requires explicit length (slices []T are no longer supported)");
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "array type requires explicit length");
             return NULL;
         }
 

@@ -2906,10 +2906,10 @@ AstNode *parser_parse_array_literal(Parser *parser)
         return NULL;
     }
 
-    // require explicit length (slices removed)
+    // require explicit length
     if (parser_check(parser, TOKEN_R_BRACKET))
     {
-        parser_error_at_current(parser, "array literal requires explicit length (use [N]T; slices []T have been removed)");
+        parser_error_at_current(parser, "array literal requires explicit length (use [N]T)");
         ast_node_dnit(array);
         free(array);
         return NULL;
@@ -3178,10 +3178,10 @@ AstNode *parser_parse_type_array(Parser *parser)
         return NULL;
     }
 
-    // require explicit length (slices removed)
+    // require explicit length
     if (parser_check(parser, TOKEN_R_BRACKET))
     {
-        parser_error_at_current(parser, "array type requires explicit length (use [N]T; slices []T have been removed)");
+        parser_error_at_current(parser, "array type requires explicit length (use [N]T)");
         ast_node_dnit(array);
         free(array);
         return NULL;

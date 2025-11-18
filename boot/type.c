@@ -87,7 +87,7 @@ void type_system_init(void)
 
         if (type->kind == TYPE_STR)
         {
-            Type  *data_type  = type_pointer_create(type_u8(), false);
+            Type  *data_type  = type_pointer_create(type_u8(), true); // str.data is read-only (&u8)
             Type  *len_type   = type_pointer_uint();
             size_t data_align = data_type ? data_type->alignment : sizeof(void *);
             size_t data_size  = data_type ? data_type->size : sizeof(void *);
