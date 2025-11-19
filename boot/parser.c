@@ -2847,7 +2847,7 @@ AstNode *parser_parse_expr_atom(Parser *parser)
 
     case TOKEN_DOLLAR:
     {
-        // Parse compile-time expression: $size_of(T), $OS_LINUX, $target.os, etc.
+        // Parse compile-time expression: $size_of(T), $mach.os.linux, $mach.build.target.os, etc.
         Token dollar_token = *parser->current;
         parser_advance(parser);
 

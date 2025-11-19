@@ -70,38 +70,50 @@ Code that does not meet the compiletime conditions is completely omitted from th
 
 The Mach compiler provides several built-in symbols that can be used for compile-time introspection and conditional compilation.
 
-| Symbol                 | Description                                               |
-| ---------------------- | --------------------------------------------------------- |
-| `$OS_LINUX`            | Enum value representing the Linux operating system        |
-| `$OS_DARWIN`           | Enum value representing the macOS operating system        |
-| `$OS_WINDOWS`          | Enum value representing the Windows operating system      |
-| `$OS_BSD`              | Enum value representing the BSD operating system          |
-| `$ARCH_X86_64`         | Enum value representing the x86_64 architecture           |
-| `$ARCH_ARM64`          | Enum value representing the ARM64 architecture            |
-| `$ARCH_ARM`            | Enum value representing the ARM architecture              |
-| `$ARCH_RISCV64`        | Enum value representing the RISC-V architecture           |
-| `$target.os`           | Enum value of the target operating system                 |
-| `$target.arch`         | Enum value of the target architecture                     |
-| `$target.pointer_size` | Size of a pointer on the target platform in bytes         |
-| `$target.word_size`    | Size of a machine word on the target platform in bytes    |
-| `$target.triple`       | Target triple string (e.g., "x86_64-pc-linux-gnu")        |
-| `$build.debug`         | Integer exposing the `debug` config option (1 if enabled) |
-| `$build.version`       | String exposing the `version` config option               |
-| `$mach.version`        | String representing the Mach compiler version             |
+| Symbol                         | Description                                                                  |
+| ------------------------------ | ---------------------------------------------------------------------------- |
+| `$mach.build.target.os`        | Target operating system info (see `std.compiler.target.OSInfo`)             |
+| `$mach.build.target.arch`      | Target architecture info (`std.compiler.target.ArchitectureInfo`)           |
+| `$mach.build.target.abi`       | Target ABI descriptor (`std.compiler.target.ABIInfo`)                       |
+| `$mach.build.target.vendor`    | Target vendor descriptor (`std.compiler.target.VendorInfo`)                 |
+| `$mach.build.target.environment` | Target environment descriptor (`std.compiler.target.EnvironmentInfo`)      |
+| `$mach.build.target.object_format` | Target object format descriptor (`std.compiler.target.ObjectFormatInfo`) |
+| `$mach.build.target.endianness` | Target endianness descriptor (`std.compiler.target.EndiannessInfo`)        |
+| `$mach.build.target.backend`   | Target backend descriptor (`std.compiler.target.BackendKindInfo`)           |
+| `$mach.build.target.pointer_width` | Pointer width of the compilation target in bytes                          |
+| `$mach.build.target.triple`    | Target triple string used for code generation                               |
+| `$mach.build.debug`            | Non-zero when the current build is a debug build                            |
+| `$mach.build.version`          | User-provided build version string                                           |
+| `$mach.version`                | Compiler version string                                                      |
+| `$mach.os`                     | Namespace containing all supported operating system descriptors              |
+| `$mach.arch`                   | Namespace containing architecture descriptors                                |
+| `$mach.abi`                    | Namespace containing ABI descriptors                                         |
+| `$mach.vendor`                 | Namespace containing vendor descriptors                                      |
+| `$mach.environment`            | Namespace containing environment descriptors                                 |
+| `$mach.endianness`             | Namespace containing endianness descriptors                                  |
+| `$mach.object_format`          | Namespace containing object-format descriptors                               |
+| `$mach.backend`                | Namespace containing backend descriptors                                     |
+| `$mach.feature`                | Namespace containing architecture feature descriptors                        |
+
+All compile-time identifiers must be explicitly qualified with `$`. Even inside `$if` blocks you must prefix every access, for example:
+
+```mach
+$if ($mach.build.target.os.id == $mach.os.linux.id) {
+    # linux-specific code
+}
+```
 
 > These symbols are subject to change as the Mach language and compiler evolve. They will be documented in future releases and will eventually be stable.
 
 Example:
 ```mach
-$if (target.os == OS_LINUX) {
+$if ($mach.build.target.os.id == $mach.os.linux.id) {
     # Linux-specific code
 }
-or (target.os == OS_DARWIN) {
+or ($mach.build.target.os.id == $mach.os.darwin.id) {
     # macOS-specific code
 }
 ```
-
-Note that at the moment, compiler constants like `$target.os` do not need the leading `$` when used in compile-time expressions. This behaviour is subject to change in future releases.
 
 
 ## Symbol Attributes

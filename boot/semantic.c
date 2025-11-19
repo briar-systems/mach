@@ -4838,7 +4838,7 @@ static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const Analy
         return NULL;
     }
 
-    // handle $category.field - field access like $target.os
+    // handle $category.field - field access like $mach.build.target.os
     if (inner->kind == AST_EXPR_FIELD)
     {
         if (inner->field_expr.object && inner->field_expr.object->kind == AST_EXPR_IDENT && inner->field_expr.field)
@@ -5229,96 +5229,366 @@ static bool analyze_ret_stmt(SemanticDriver *driver, const AnalysisContext *ctx,
     return true;
 }
 
-static bool evaluate_comptime_expr_bool(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, bool *out_value)
+static bool evaluate_comptime_value_internal(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, ComptimeValue *out_value, bool allow_unqualified);
+static bool evaluate_comptime_value(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, ComptimeValue *out_value);
+
+static void comptime_value_set_bool(ComptimeValue *out_value, bool value)
 {
-    long long value = 0;
-    if (!evaluate_comptime_expr_int(driver, ctx, expr, &value))
-    {
-        return false;
-    }
-    *out_value = (value != 0);
-    return true;
+    out_value->kind = COMPTIME_BOOL;
+    out_value->bool_val = value;
 }
 
-static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value)
+static void comptime_value_set_u64(ComptimeValue *out_value, unsigned long value)
 {
-    if (!expr || !out_value)
-    {
-        return false;
+    out_value->kind = COMPTIME_U64;
+    out_value->u64_val = value;
+}
+
+static void comptime_value_set_string(ComptimeValue *out_value, const char *value)
+{
+    out_value->kind = COMPTIME_STRING;
+    out_value->string_val = value ? value : "";
+}
+
+static bool ast_flatten_dotted_name(AstNode *expr, char *buf, size_t size)
+{
+    if (expr->kind == AST_EXPR_IDENT) {
+        snprintf(buf, size, "%s", expr->ident_expr.name);
+        return true;
     }
+    if (expr->kind == AST_EXPR_FIELD) {
+        if (!ast_flatten_dotted_name(expr->field_expr.object, buf, size)) return false;
+        size_t len = strlen(buf);
+        if (len + 1 + strlen(expr->field_expr.field) >= size) return false;
+        snprintf(buf + len, size - len, ".%s", expr->field_expr.field);
+        return true;
+    }
+    return false;
+}
+
+static bool evaluate_comptime_value(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, ComptimeValue *out_value)
+{
+    return evaluate_comptime_value_internal(driver, ctx, expr, out_value, false);
+}
+
+static bool evaluate_comptime_value_internal(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, ComptimeValue *out_value, bool allow_unqualified)
+{
+    if (!expr || !out_value) return false;
 
     switch (expr->kind)
     {
+    case AST_COMPTIME:
+        if (!expr->comptime.inner)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "malformed compile-time expression");
+            return false;
+        }
+        return evaluate_comptime_value_internal(driver, ctx, expr->comptime.inner, out_value, true);
+
     case AST_EXPR_LIT:
         switch (expr->lit_expr.kind)
         {
         case TOKEN_LIT_INT:
-            *out_value = (long long)expr->lit_expr.int_val;
+            out_value->kind = COMPTIME_U64;
+            out_value->u64_val = expr->lit_expr.int_val;
             return true;
         case TOKEN_LIT_CHAR:
-            *out_value = (long long)expr->lit_expr.char_val;
+            out_value->kind = COMPTIME_U64;
+            out_value->u64_val = expr->lit_expr.char_val;
+            return true;
+        case TOKEN_LIT_STRING:
+            out_value->kind = COMPTIME_STRING;
+            out_value->string_val = expr->lit_expr.string_val;
             return true;
         default:
-            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "literal not allowed in '$if' condition");
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "literal not allowed in compile-time expression");
             return false;
         }
 
     case AST_EXPR_IDENT:
     {
-        const char   *name = expr->ident_expr.name;
-        ComptimeValue ct_value;
-        if (comptime_get_constant(name, &ct_value, &driver->comptime_ctx))
+        const char *name = expr->ident_expr.name;
+        if (strcmp(name, "true") == 0)
         {
-            if (ct_value.kind == COMPTIME_U8)
-                *out_value = (long long)ct_value.u8_val;
-            else if (ct_value.kind == COMPTIME_U64)
-                *out_value = (long long)ct_value.u64_val;
-            else
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "compile-time constant '%s' is not an integer", name ? name : "<anon>");
-                return false;
-            }
+            out_value->kind    = COMPTIME_BOOL;
+            out_value->bool_val = true;
+            return true;
+        }
+        if (strcmp(name, "false") == 0)
+        {
+            out_value->kind    = COMPTIME_BOOL;
+            out_value->bool_val = false;
             return true;
         }
 
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time constant '%s'", name ? name : "<anon>");
+        if (!allow_unqualified)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "identifier '%s' is not available at compile time without '$'", name);
+            return false;
+        }
+
+        if (comptime_get_constant(name, out_value, &driver->comptime_ctx))
+        {
+            return true;
+        }
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time constant '%s'", name);
         return false;
     }
 
     case AST_EXPR_FIELD:
     {
-        // handle dotted constants like $target.os
-        if (expr->field_expr.object && expr->field_expr.object->kind == AST_EXPR_IDENT && expr->field_expr.field)
+        if (!allow_unqualified)
         {
-            const char *object_name = expr->field_expr.object->ident_expr.name;
-            const char *field_name  = expr->field_expr.field;
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "field access requires '$' qualifier");
+            return false;
+        }
 
-            // build dotted name
-            char dotted_name[256];
-            snprintf(dotted_name, sizeof(dotted_name), "%s.%s", object_name, field_name);
-
-            ComptimeValue ct_value;
-            if (comptime_get_constant(dotted_name, &ct_value, &driver->comptime_ctx))
-            {
-                if (ct_value.kind == COMPTIME_U8)
-                    *out_value = (long long)ct_value.u8_val;
-                else if (ct_value.kind == COMPTIME_U64)
-                    *out_value = (long long)ct_value.u64_val;
-                else
-                {
-                    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "compile-time constant '%s' is not an integer", dotted_name);
-                    return false;
-                }
+        // 1. Try to resolve as a dotted constant string first
+        char dotted_name[256];
+        if (ast_flatten_dotted_name(expr, dotted_name, sizeof(dotted_name))) {
+            if (comptime_get_constant(dotted_name, out_value, &driver->comptime_ctx)) {
                 return true;
             }
         }
 
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "field access not allowed in compile-time condition");
+        // 2. Evaluate object recursively
+        ComptimeValue obj_value;
+        if (!evaluate_comptime_value_internal(driver, ctx, expr->field_expr.object, &obj_value, allow_unqualified))
+        {
+            return false;
+        }
+
+        const char *field = expr->field_expr.field;
+
+        if (obj_value.kind == COMPTIME_OS_NAMESPACE) {
+            if (strcmp(field, "linux") == 0) { out_value->kind = COMPTIME_OS_INFO; out_value->os_info = obj_value.os_namespace->os_linux; return true; }
+            if (strcmp(field, "windows") == 0) { out_value->kind = COMPTIME_OS_INFO; out_value->os_info = obj_value.os_namespace->os_windows; return true; }
+            if (strcmp(field, "darwin") == 0) { out_value->kind = COMPTIME_OS_INFO; out_value->os_info = obj_value.os_namespace->os_darwin; return true; }
+            if (strcmp(field, "wasi") == 0) { out_value->kind = COMPTIME_OS_INFO; out_value->os_info = obj_value.os_namespace->os_wasi; return true; }
+            if (strcmp(field, "freestanding") == 0) { out_value->kind = COMPTIME_OS_INFO; out_value->os_info = obj_value.os_namespace->os_freestanding; return true; }
+            if (strcmp(field, "zephyr") == 0) { out_value->kind = COMPTIME_OS_INFO; out_value->os_info = obj_value.os_namespace->os_zephyr; return true; }
+            if (strcmp(field, "none") == 0) { out_value->kind = COMPTIME_OS_INFO; out_value->os_info = obj_value.os_namespace->os_none; return true; }
+        }
+        else if (obj_value.kind == COMPTIME_ARCH_NAMESPACE) {
+            if (strcmp(field, "x86") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->x86; return true; }
+            if (strcmp(field, "x86_64") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->x86_64; return true; }
+            if (strcmp(field, "arm") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->arm; return true; }
+            if (strcmp(field, "aarch64") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->aarch64; return true; }
+            if (strcmp(field, "thumb") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->thumb; return true; }
+            if (strcmp(field, "thumbv6m") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->thumbv6m; return true; }
+            if (strcmp(field, "thumbv7m") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->thumbv7m; return true; }
+            if (strcmp(field, "thumbv7em") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->thumbv7em; return true; }
+            if (strcmp(field, "riscv32") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->riscv32; return true; }
+            if (strcmp(field, "riscv64") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->riscv64; return true; }
+            if (strcmp(field, "avr") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->avr; return true; }
+            if (strcmp(field, "msp430") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->msp430; return true; }
+            if (strcmp(field, "wasm32") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->wasm32; return true; }
+            if (strcmp(field, "wasm64") == 0) { out_value->kind = COMPTIME_ARCH_INFO; out_value->arch_info = obj_value.arch_namespace->wasm64; return true; }
+        }
+        else if (obj_value.kind == COMPTIME_ABI_NAMESPACE) {
+            if (strcmp(field, "gnu") == 0) { out_value->kind = COMPTIME_ABI_INFO; out_value->abi_info = obj_value.abi_namespace->gnu; return true; }
+            if (strcmp(field, "msvc") == 0) { out_value->kind = COMPTIME_ABI_INFO; out_value->abi_info = obj_value.abi_namespace->msvc; return true; }
+            if (strcmp(field, "musl") == 0) { out_value->kind = COMPTIME_ABI_INFO; out_value->abi_info = obj_value.abi_namespace->musl; return true; }
+            if (strcmp(field, "newlib") == 0) { out_value->kind = COMPTIME_ABI_INFO; out_value->abi_info = obj_value.abi_namespace->newlib; return true; }
+            if (strcmp(field, "bare") == 0) { out_value->kind = COMPTIME_ABI_INFO; out_value->abi_info = obj_value.abi_namespace->bare; return true; }
+            if (strcmp(field, "wasi") == 0) { out_value->kind = COMPTIME_ABI_INFO; out_value->abi_info = obj_value.abi_namespace->wasi; return true; }
+        }
+        else if (obj_value.kind == COMPTIME_VENDOR_NAMESPACE) {
+            if (strcmp(field, "pc") == 0) { out_value->kind = COMPTIME_VENDOR_INFO; out_value->vendor_info = obj_value.vendor_namespace->pc; return true; }
+            if (strcmp(field, "apple") == 0) { out_value->kind = COMPTIME_VENDOR_INFO; out_value->vendor_info = obj_value.vendor_namespace->apple; return true; }
+            if (strcmp(field, "msp") == 0) { out_value->kind = COMPTIME_VENDOR_INFO; out_value->vendor_info = obj_value.vendor_namespace->msp; return true; }
+            if (strcmp(field, "espressif") == 0) { out_value->kind = COMPTIME_VENDOR_INFO; out_value->vendor_info = obj_value.vendor_namespace->espressif; return true; }
+            if (strcmp(field, "custom") == 0) { out_value->kind = COMPTIME_VENDOR_INFO; out_value->vendor_info = obj_value.vendor_namespace->custom; return true; }
+        }
+        else if (obj_value.kind == COMPTIME_ENVIRONMENT_NAMESPACE) {
+            if (strcmp(field, "none") == 0) { out_value->kind = COMPTIME_ENVIRONMENT_INFO; out_value->environment_info = obj_value.environment_namespace->none; return true; }
+            if (strcmp(field, "gnu") == 0) { out_value->kind = COMPTIME_ENVIRONMENT_INFO; out_value->environment_info = obj_value.environment_namespace->gnu; return true; }
+            if (strcmp(field, "musl") == 0) { out_value->kind = COMPTIME_ENVIRONMENT_INFO; out_value->environment_info = obj_value.environment_namespace->musl; return true; }
+            if (strcmp(field, "newlib") == 0) { out_value->kind = COMPTIME_ENVIRONMENT_INFO; out_value->environment_info = obj_value.environment_namespace->newlib; return true; }
+            if (strcmp(field, "wasi") == 0) { out_value->kind = COMPTIME_ENVIRONMENT_INFO; out_value->environment_info = obj_value.environment_namespace->wasi; return true; }
+            if (strcmp(field, "bare") == 0) { out_value->kind = COMPTIME_ENVIRONMENT_INFO; out_value->environment_info = obj_value.environment_namespace->bare; return true; }
+        }
+        else if (obj_value.kind == COMPTIME_ENDIANNESS_NAMESPACE) {
+            if (strcmp(field, "little") == 0) { out_value->kind = COMPTIME_ENDIANNESS_INFO; out_value->endianness_info = obj_value.endianness_namespace->little; return true; }
+            if (strcmp(field, "big") == 0) { out_value->kind = COMPTIME_ENDIANNESS_INFO; out_value->endianness_info = obj_value.endianness_namespace->big; return true; }
+            if (strcmp(field, "mixed") == 0) { out_value->kind = COMPTIME_ENDIANNESS_INFO; out_value->endianness_info = obj_value.endianness_namespace->mixed; return true; }
+        }
+        else if (obj_value.kind == COMPTIME_OBJECT_FORMAT_NAMESPACE) {
+            if (strcmp(field, "elf") == 0) { out_value->kind = COMPTIME_OBJECT_FORMAT_INFO; out_value->object_format_info = obj_value.object_format_namespace->elf; return true; }
+            if (strcmp(field, "pe") == 0) { out_value->kind = COMPTIME_OBJECT_FORMAT_INFO; out_value->object_format_info = obj_value.object_format_namespace->pe; return true; }
+            if (strcmp(field, "macho") == 0) { out_value->kind = COMPTIME_OBJECT_FORMAT_INFO; out_value->object_format_info = obj_value.object_format_namespace->macho; return true; }
+            if (strcmp(field, "wasm") == 0) { out_value->kind = COMPTIME_OBJECT_FORMAT_INFO; out_value->object_format_info = obj_value.object_format_namespace->wasm; return true; }
+            if (strcmp(field, "rawbin") == 0) { out_value->kind = COMPTIME_OBJECT_FORMAT_INFO; out_value->object_format_info = obj_value.object_format_namespace->rawbin; return true; }
+            if (strcmp(field, "hex") == 0) { out_value->kind = COMPTIME_OBJECT_FORMAT_INFO; out_value->object_format_info = obj_value.object_format_namespace->hex; return true; }
+            if (strcmp(field, "uf2") == 0) { out_value->kind = COMPTIME_OBJECT_FORMAT_INFO; out_value->object_format_info = obj_value.object_format_namespace->uf2; return true; }
+        }
+        else if (obj_value.kind == COMPTIME_BACKEND_NAMESPACE) {
+            if (strcmp(field, "native") == 0) { out_value->kind = COMPTIME_BACKEND_KIND_INFO; out_value->backend_kind_info = obj_value.backend_namespace->native; return true; }
+            if (strcmp(field, "wasm") == 0) { out_value->kind = COMPTIME_BACKEND_KIND_INFO; out_value->backend_kind_info = obj_value.backend_namespace->wasm; return true; }
+            if (strcmp(field, "embedded") == 0) { out_value->kind = COMPTIME_BACKEND_KIND_INFO; out_value->backend_kind_info = obj_value.backend_namespace->embedded; return true; }
+            if (strcmp(field, "custom") == 0) { out_value->kind = COMPTIME_BACKEND_KIND_INFO; out_value->backend_kind_info = obj_value.backend_namespace->custom; return true; }
+        }
+        else if (obj_value.kind == COMPTIME_FEATURE_NAMESPACE) {
+            if (strcmp(field, "soft_float") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->soft_float; return true; }
+            if (strcmp(field, "hard_float") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->hard_float; return true; }
+            if (strcmp(field, "simd") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->simd; return true; }
+            if (strcmp(field, "unaligned_memory") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->unaligned_memory; return true; }
+            if (strcmp(field, "atomics_64") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->atomics_64; return true; }
+            if (strcmp(field, "atomics_128") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->atomics_128; return true; }
+            if (strcmp(field, "threads") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->threads; return true; }
+            if (strcmp(field, "mmu") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->mmu; return true; }
+            if (strcmp(field, "cache") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->cache; return true; }
+            if (strcmp(field, "vector_ext") == 0) { out_value->kind = COMPTIME_FEATURE_INFO; out_value->feature_info = obj_value.feature_namespace->vector_ext; return true; }
+        }
+        else if (obj_value.kind == COMPTIME_OS_INFO) {
+            if (strcmp(field, "id") == 0) { comptime_value_set_u64(out_value, obj_value.os_info.id); return true; }
+            if (strcmp(field, "name") == 0) { comptime_value_set_string(out_value, obj_value.os_info.name); return true; }
+            if (strcmp(field, "supports_filesystem") == 0) { comptime_value_set_bool(out_value, obj_value.os_info.supports_filesystem); return true; }
+            if (strcmp(field, "supports_networking") == 0) { comptime_value_set_bool(out_value, obj_value.os_info.supports_networking); return true; }
+            if (strcmp(field, "supports_threads") == 0) { comptime_value_set_bool(out_value, obj_value.os_info.supports_threads); return true; }
+            if (strcmp(field, "has_mmu") == 0) { comptime_value_set_bool(out_value, obj_value.os_info.has_mmu); return true; }
+            if (strcmp(field, "is_freestanding") == 0) { comptime_value_set_bool(out_value, obj_value.os_info.is_freestanding); return true; }
+        }
+        else if (obj_value.kind == COMPTIME_ARCH_INFO) {
+            if (strcmp(field, "id") == 0) { comptime_value_set_u64(out_value, obj_value.arch_info.id); return true; }
+            if (strcmp(field, "name") == 0) { comptime_value_set_string(out_value, obj_value.arch_info.name); return true; }
+            if (strcmp(field, "word_size") == 0) { comptime_value_set_u64(out_value, obj_value.arch_info.word_size); return true; }
+            if (strcmp(field, "is_64bit") == 0) { comptime_value_set_bool(out_value, obj_value.arch_info.is_64bit); return true; }
+            if (strcmp(field, "is_embedded") == 0) { comptime_value_set_bool(out_value, obj_value.arch_info.is_embedded); return true; }
+            if (strcmp(field, "has_fpu") == 0) { comptime_value_set_bool(out_value, obj_value.arch_info.has_fpu); return true; }
+        }
+        else if (obj_value.kind == COMPTIME_ABI_INFO) {
+            if (strcmp(field, "id") == 0) { comptime_value_set_u64(out_value, obj_value.abi_info.id); return true; }
+            if (strcmp(field, "name") == 0) { comptime_value_set_string(out_value, obj_value.abi_info.name); return true; }
+            if (strcmp(field, "requires_libc") == 0) { comptime_value_set_bool(out_value, obj_value.abi_info.requires_libc); return true; }
+        }
+        else if (obj_value.kind == COMPTIME_VENDOR_INFO) {
+            if (strcmp(field, "id") == 0) { comptime_value_set_u64(out_value, obj_value.vendor_info.id); return true; }
+            if (strcmp(field, "name") == 0) { comptime_value_set_string(out_value, obj_value.vendor_info.name); return true; }
+        }
+        else if (obj_value.kind == COMPTIME_ENVIRONMENT_INFO) {
+            if (strcmp(field, "id") == 0) { comptime_value_set_u64(out_value, obj_value.environment_info.id); return true; }
+            if (strcmp(field, "name") == 0) { comptime_value_set_string(out_value, obj_value.environment_info.name); return true; }
+        }
+        else if (obj_value.kind == COMPTIME_ENDIANNESS_INFO) {
+            if (strcmp(field, "id") == 0) { comptime_value_set_u64(out_value, obj_value.endianness_info.id); return true; }
+            if (strcmp(field, "name") == 0) { comptime_value_set_string(out_value, obj_value.endianness_info.name); return true; }
+        }
+        else if (obj_value.kind == COMPTIME_OBJECT_FORMAT_INFO) {
+            if (strcmp(field, "id") == 0) { comptime_value_set_u64(out_value, obj_value.object_format_info.id); return true; }
+            if (strcmp(field, "name") == 0) { comptime_value_set_string(out_value, obj_value.object_format_info.name); return true; }
+        }
+        else if (obj_value.kind == COMPTIME_BACKEND_KIND_INFO) {
+            if (strcmp(field, "id") == 0) { comptime_value_set_u64(out_value, obj_value.backend_kind_info.id); return true; }
+            if (strcmp(field, "name") == 0) { comptime_value_set_string(out_value, obj_value.backend_kind_info.name); return true; }
+        }
+        else if (obj_value.kind == COMPTIME_FEATURE_INFO) {
+            if (strcmp(field, "id") == 0) { comptime_value_set_u64(out_value, obj_value.feature_info.id); return true; }
+            if (strcmp(field, "name") == 0) { comptime_value_set_string(out_value, obj_value.feature_info.name); return true; }
+        }
+
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "field '%s' not found on compile-time value", field);
+        return false;
+    }
+
+    case AST_EXPR_BINARY:
+    {
+        TokenKind op = expr->binary_expr.op;
+
+        if (op == TOKEN_AMPERSAND_AMPERSAND)
+        {
+            ComptimeValue left;
+            if (!evaluate_comptime_value_internal(driver, ctx, expr->binary_expr.left, &left, allow_unqualified)) return false;
+            
+            bool left_bool = (left.kind == COMPTIME_BOOL) ? left.bool_val : (left.u64_val != 0);
+            if (!left_bool) {
+                out_value->kind = COMPTIME_BOOL;
+                out_value->bool_val = false;
+                return true;
+            }
+
+            ComptimeValue right;
+            if (!evaluate_comptime_value_internal(driver, ctx, expr->binary_expr.right, &right, allow_unqualified)) return false;
+            
+            bool right_bool = (right.kind == COMPTIME_BOOL) ? right.bool_val : (right.u64_val != 0);
+            out_value->kind = COMPTIME_BOOL;
+            out_value->bool_val = right_bool;
+            return true;
+        }
+
+        if (op == TOKEN_PIPE_PIPE)
+        {
+            ComptimeValue left;
+            if (!evaluate_comptime_value_internal(driver, ctx, expr->binary_expr.left, &left, allow_unqualified)) return false;
+            
+            bool left_bool = (left.kind == COMPTIME_BOOL) ? left.bool_val : (left.u64_val != 0);
+            if (left_bool) {
+                out_value->kind = COMPTIME_BOOL;
+                out_value->bool_val = true;
+                return true;
+            }
+
+            ComptimeValue right;
+            if (!evaluate_comptime_value_internal(driver, ctx, expr->binary_expr.right, &right, allow_unqualified)) return false;
+            
+            bool right_bool = (right.kind == COMPTIME_BOOL) ? right.bool_val : (right.u64_val != 0);
+            out_value->kind = COMPTIME_BOOL;
+            out_value->bool_val = right_bool;
+            return true;
+        }
+
+        ComptimeValue left, right;
+        if (!evaluate_comptime_value_internal(driver, ctx, expr->binary_expr.left, &left, allow_unqualified) ||
+            !evaluate_comptime_value_internal(driver, ctx, expr->binary_expr.right, &right, allow_unqualified))
+        {
+            return false;
+        }
+        
+        if (op == TOKEN_EQUAL_EQUAL || op == TOKEN_BANG_EQUAL) {
+            bool equal = false;
+            if (left.kind != right.kind) {
+                equal = false;
+            } else {
+                switch (left.kind) {
+                    case COMPTIME_U8: equal = (left.u8_val == right.u8_val); break;
+                    case COMPTIME_U64: equal = (left.u64_val == right.u64_val); break;
+                    case COMPTIME_BOOL: equal = (left.bool_val == right.bool_val); break;
+                    case COMPTIME_STRING: equal = (strcmp(left.string_val, right.string_val) == 0); break;
+                    case COMPTIME_OS_INFO: equal = (left.os_info.id == right.os_info.id); break;
+                    case COMPTIME_ARCH_INFO: equal = (left.arch_info.id == right.arch_info.id); break;
+                    default: equal = false; break;
+                }
+            }
+            
+            out_value->kind = COMPTIME_BOOL;
+            out_value->bool_val = (op == TOKEN_EQUAL_EQUAL) ? equal : !equal;
+            return true;
+        }
+        
+        long long l_val = (left.kind == COMPTIME_U8) ? left.u8_val : left.u64_val;
+        long long r_val = (right.kind == COMPTIME_U8) ? right.u8_val : right.u64_val;
+        
+        // Basic arithmetic support for now
+        switch (op) {
+            case TOKEN_PLUS: out_value->kind = COMPTIME_U64; out_value->u64_val = l_val + r_val; return true;
+            case TOKEN_MINUS: out_value->kind = COMPTIME_U64; out_value->u64_val = l_val - r_val; return true;
+            case TOKEN_STAR: out_value->kind = COMPTIME_U64; out_value->u64_val = l_val * r_val; return true;
+            case TOKEN_SLASH: out_value->kind = COMPTIME_U64; out_value->u64_val = (r_val != 0) ? l_val / r_val : 0; return true;
+            default: break;
+        }
+        
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported binary operator in compile-time expression");
         return false;
     }
 
     case AST_EXPR_CALL:
     {
+        if (!allow_unqualified)
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "compile-time calls require '$' qualifier");
+            return false;
+        }
+
         if (!expr->call_expr.func || expr->call_expr.func->kind != AST_EXPR_IDENT)
         {
             diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported compile-time function call");
@@ -5345,10 +5615,11 @@ static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisCon
             }
 
             size_t value = (strcmp(name, "size_of") == 0) ? type_sizeof(arg_type) : type_alignof(arg_type);
-            *out_value   = (long long)value;
+            out_value->kind = COMPTIME_U64;
+            out_value->u64_val = value;
             return true;
         }
-
+        
         if (strcmp(name, "offset_of") == 0)
         {
             if (arg_cnt != 2)
@@ -5378,12 +5649,6 @@ static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisCon
                 return false;
             }
 
-            if (!field_name)
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "offset_of requires a named field");
-                return false;
-            }
-
             if (!record_type->composite.fields)
             {
                 diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "record type does not contain any fields");
@@ -5395,7 +5660,8 @@ static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisCon
                 Symbol *field = &record_type->composite.fields[i];
                 if (strcmp(field->name, field_name) == 0)
                 {
-                    *out_value = (long long)field->field.offset;
+                    out_value->kind = COMPTIME_U64;
+                    out_value->u64_val = field->field.offset;
                     return true;
                 }
             }
@@ -5424,122 +5690,102 @@ static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisCon
             type_hash          = type_hash * 31 + type_sizeof(arg_type);
             type_hash          = type_hash * 31 + type_alignof(arg_type);
 
-            *out_value = (long long)type_hash;
+            out_value->kind = COMPTIME_U64;
+            out_value->u64_val = type_hash;
             return true;
         }
 
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time intrinsic '%s'", name ? name : "<anon>");
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unknown compile-time intrinsic '%s'", name);
         return false;
     }
 
     case AST_EXPR_UNARY:
     {
-        long long operand = 0;
-        if (!evaluate_comptime_expr_int(driver, ctx, expr->unary_expr.expr, &operand))
+        ComptimeValue operand;
+        if (!evaluate_comptime_value_internal(driver, ctx, expr->unary_expr.expr, &operand, allow_unqualified))
         {
             return false;
         }
+        
+        long long val = (operand.kind == COMPTIME_U8) ? operand.u8_val : operand.u64_val;
 
         switch (expr->unary_expr.op)
         {
         case TOKEN_BANG:
-            *out_value = (operand == 0) ? 1 : 0;
+            out_value->kind = COMPTIME_BOOL;
+            out_value->bool_val = (val == 0);
             return true;
         case TOKEN_MINUS:
-            *out_value = -operand;
+            out_value->kind = COMPTIME_U64;
+            out_value->u64_val = -val;
             return true;
         case TOKEN_PLUS:
-            *out_value = operand;
+            out_value->kind = COMPTIME_U64;
+            out_value->u64_val = val;
             return true;
         case TOKEN_TILDE:
-            *out_value = ~operand;
+            out_value->kind = COMPTIME_U64;
+            out_value->u64_val = ~val;
             return true;
         default:
-            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported unary operator in '$if' condition");
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported unary operator in compile-time expression");
             return false;
         }
     }
-
-    case AST_EXPR_BINARY:
-    {
-        TokenKind op = expr->binary_expr.op;
-
-        if (op == TOKEN_AMPERSAND_AMPERSAND)
-        {
-            bool left_value = false;
-            if (!evaluate_comptime_expr_bool(driver, ctx, expr->binary_expr.left, &left_value))
-            {
-                return false;
-            }
-            if (!left_value)
-            {
-                *out_value = 0;
-                return true;
-            }
-
-            bool right_value = false;
-            if (!evaluate_comptime_expr_bool(driver, ctx, expr->binary_expr.right, &right_value))
-            {
-                return false;
-            }
-            *out_value = right_value ? 1 : 0;
-            return true;
-        }
-
-        if (op == TOKEN_PIPE_PIPE)
-        {
-            bool left_value = false;
-            if (!evaluate_comptime_expr_bool(driver, ctx, expr->binary_expr.left, &left_value))
-            {
-                return false;
-            }
-            if (left_value)
-            {
-                *out_value = 1;
-                return true;
-            }
-
-            bool right_value = false;
-            if (!evaluate_comptime_expr_bool(driver, ctx, expr->binary_expr.right, &right_value))
-            {
-                return false;
-            }
-            *out_value = right_value ? 1 : 0;
-            return true;
-        }
-
-        if (op == TOKEN_EQUAL_EQUAL || op == TOKEN_BANG_EQUAL)
-        {
-            long long left_value  = 0;
-            long long right_value = 0;
-            if (!evaluate_comptime_expr_int(driver, ctx, expr->binary_expr.left, &left_value))
-            {
-                return false;
-            }
-            if (!evaluate_comptime_expr_int(driver, ctx, expr->binary_expr.right, &right_value))
-            {
-                return false;
-            }
-
-            bool result = (left_value == right_value);
-            if (op == TOKEN_BANG_EQUAL)
-            {
-                result = !result;
-            }
-            *out_value = result ? 1 : 0;
-            return true;
-        }
-
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported operator in '$if' condition");
-        return false;
-    }
-
+    
     default:
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "expression not allowed in '$if' condition");
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported expression kind %d in compile-time condition", expr->kind);
         return false;
     }
+}
 
-    // unreachable, but keeps compiler happy
+static bool evaluate_comptime_expr_bool(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, bool *out_value)
+{
+    ComptimeValue val;
+    if (!evaluate_comptime_value(driver, ctx, expr, &val))
+    {
+        return false;
+    }
+    
+    if (val.kind == COMPTIME_BOOL) {
+        *out_value = val.bool_val;
+        return true;
+    }
+    if (val.kind == COMPTIME_U64) {
+        *out_value = (val.u64_val != 0);
+        return true;
+    }
+    if (val.kind == COMPTIME_U8) {
+        *out_value = (val.u8_val != 0);
+        return true;
+    }
+    
+    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "expression does not evaluate to a boolean");
+    return false;
+}
+
+static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value)
+{
+    ComptimeValue val;
+    if (!evaluate_comptime_value(driver, ctx, expr, &val))
+    {
+        return false;
+    }
+    
+    if (val.kind == COMPTIME_U64) {
+        *out_value = (long long)val.u64_val;
+        return true;
+    }
+    if (val.kind == COMPTIME_U8) {
+        *out_value = (long long)val.u8_val;
+        return true;
+    }
+    if (val.kind == COMPTIME_BOOL) {
+        *out_value = val.bool_val ? 1 : 0;
+        return true;
+    }
+    
+    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "expression does not evaluate to an integer");
     return false;
 }
 
@@ -5635,36 +5881,40 @@ static bool analyze_comptime_stmt(SemanticDriver *driver, const AnalysisContext 
         {
             const char *symbol_name = field_access->field_expr.object->ident_expr.name;
             const char *attr_name   = field_access->field_expr.field;
-
-            // support string and integer literal values
-            if (value_expr->kind == AST_EXPR_LIT)
+            ComptimeValue attr_value;
+            if (!evaluate_comptime_value(driver, ctx, value_expr, &attr_value))
             {
-                char        attr_value_buf[64];
-                const char *attr_value = NULL;
-
-                if (value_expr->lit_expr.kind == TOKEN_LIT_STRING)
-                {
-                    attr_value = value_expr->lit_expr.string_val;
-                }
-                else if (value_expr->lit_expr.kind == TOKEN_LIT_INT)
-                {
-                    snprintf(attr_value_buf, sizeof(attr_value_buf), "%lld", value_expr->lit_expr.int_val);
-                    attr_value = attr_value_buf;
-                }
-                else
-                {
-                    diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "$%s.%s requires a string or integer literal value", symbol_name, attr_name);
-                    return false;
-                }
-
-                add_symbol_attribute(driver, symbol_name, attr_name, attr_value);
-                return true;
-            }
-            else
-            {
-                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "$%s.%s requires a literal value", symbol_name, attr_name);
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "unable to evaluate value for $%s.%s", symbol_name, attr_name);
                 return false;
             }
+
+            char        attr_value_buf[64];
+            const char *attr_value_str = NULL;
+
+            switch (attr_value.kind)
+            {
+            case COMPTIME_STRING:
+                attr_value_str = attr_value.string_val;
+                break;
+            case COMPTIME_U8:
+                snprintf(attr_value_buf, sizeof(attr_value_buf), "%u", attr_value.u8_val);
+                attr_value_str = attr_value_buf;
+                break;
+            case COMPTIME_U64:
+                snprintf(attr_value_buf, sizeof(attr_value_buf), "%llu", (unsigned long long)attr_value.u64_val);
+                attr_value_str = attr_value_buf;
+                break;
+            case COMPTIME_BOOL:
+                snprintf(attr_value_buf, sizeof(attr_value_buf), "%s", attr_value.bool_val ? "1" : "0");
+                attr_value_str = attr_value_buf;
+                break;
+            default:
+                diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "$%s.%s requires a string or integer-compatible value", symbol_name, attr_name);
+                return false;
+            }
+
+            add_symbol_attribute(driver, symbol_name, attr_name, attr_value_str);
+            return true;
         }
 
         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "invalid compile-time attribute assignment");
@@ -5706,6 +5956,17 @@ static bool analyze_comptime_stmt(SemanticDriver *driver, const AnalysisContext 
             ok = analyze_stmt(driver, ctx, stmt->block_stmt.stmts->items[i]) && ok;
         }
         return ok;
+    }
+
+    if (inner->kind == AST_EXPR_IDENT || inner->kind == AST_EXPR_FIELD || inner->kind == AST_EXPR_CALL)
+    {
+        ComptimeValue sink;
+        if (!evaluate_comptime_value(driver, ctx, inner, &sink))
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, stmt, ctx->file_path, "unable to evaluate compile-time expression");
+            return false;
+        }
+        return true;
     }
 
     // for now, other comptime constructs are not yet implemented

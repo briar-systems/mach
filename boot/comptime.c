@@ -414,6 +414,60 @@ const ComptimeFeatureNamespace comptime_feature_namespace = {
     .vector_ext       = {COMPTIME_FEATURE_VECTOR_EXT, "vector_ext"},
 };
 
+static void comptime_apply_os_defaults(ComptimeBuildContext *ctx)
+{
+    if (!ctx)
+        return;
+
+    ctx->abi = comptime_abi_info(COMPTIME_ABI_UNKNOWN);
+    ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_UNKNOWN);
+    ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_UNKNOWN);
+    ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_UNKNOWN);
+
+    switch (ctx->os.id)
+    {
+    case COMPTIME_OS_LINUX:
+        ctx->abi = comptime_abi_info(COMPTIME_ABI_GNU);
+        ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_PC);
+        ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_GNU);
+        ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_ELF);
+        break;
+    case COMPTIME_OS_WINDOWS:
+        ctx->abi = comptime_abi_info(COMPTIME_ABI_MSVC);
+        ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_PC);
+        ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_NONE);
+        ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_PE);
+        break;
+    case COMPTIME_OS_DARWIN:
+        ctx->abi = comptime_abi_info(COMPTIME_ABI_GNU);
+        ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_APPLE);
+        ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_NONE);
+        ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_MACHO);
+        break;
+    case COMPTIME_OS_WASI:
+        ctx->abi = comptime_abi_info(COMPTIME_ABI_WASI);
+        ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_CUSTOM);
+        ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_WASI);
+        ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_WASM);
+        break;
+    case COMPTIME_OS_ZEPHYR:
+        ctx->abi = comptime_abi_info(COMPTIME_ABI_NEWLIB);
+        ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_CUSTOM);
+        ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_BARE);
+        ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_RAWBIN);
+        break;
+    case COMPTIME_OS_FREESTANDING:
+    case COMPTIME_OS_NONE:
+        ctx->abi = comptime_abi_info(COMPTIME_ABI_BARE);
+        ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_CUSTOM);
+        ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_BARE);
+        ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_RAWBIN);
+        break;
+    default:
+        break;
+    }
+}
+
 void comptime_build_context_init_host(ComptimeBuildContext *ctx)
 {
     if (!ctx)
@@ -424,30 +478,10 @@ void comptime_build_context_init_host(ComptimeBuildContext *ctx)
     ctx->pointer_width = HOST_POINTER_SIZE;
     
     // Defaults for host
-    ctx->abi = comptime_abi_info(COMPTIME_ABI_UNKNOWN);
-    ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_UNKNOWN);
-    ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_UNKNOWN);
     ctx->endianness = comptime_endianness_info(COMPTIME_ENDIANNESS_LITTLE); // Most hosts are little endian
-    ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_UNKNOWN);
     ctx->backend = comptime_backend_kind_info(COMPTIME_BACKEND_KIND_NATIVE);
 
-    // Refine defaults based on OS
-    if (ctx->os.id == COMPTIME_OS_LINUX) {
-        ctx->abi = comptime_abi_info(COMPTIME_ABI_GNU);
-        ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_PC);
-        ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_GNU);
-        ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_ELF);
-    } else if (ctx->os.id == COMPTIME_OS_WINDOWS) {
-        ctx->abi = comptime_abi_info(COMPTIME_ABI_MSVC);
-        ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_PC);
-        ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_NONE);
-        ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_PE);
-    } else if (ctx->os.id == COMPTIME_OS_DARWIN) {
-        ctx->abi = comptime_abi_info(COMPTIME_ABI_GNU); // Darwin uses GNU-like ABI usually? Or just "Darwin"?
-        ctx->vendor = comptime_vendor_info(COMPTIME_VENDOR_APPLE);
-        ctx->environment = comptime_environment_info(COMPTIME_ENVIRONMENT_NONE);
-        ctx->object_format = comptime_object_format_info(COMPTIME_OBJECT_FORMAT_MACHO);
-    }
+    comptime_apply_os_defaults(ctx);
 
     // Build triple from arch and os names
     static char triple_buf[256];
@@ -525,6 +559,8 @@ void comptime_build_context_init_from_triple(ComptimeBuildContext *ctx, const ch
     ctx->arch = comptime_arch_info(parsed_arch);
     ctx->os = comptime_os_info(parsed_os);
     ctx->pointer_width = parsed_pointer_width;
+
+    comptime_apply_os_defaults(ctx);
 }
 
 bool comptime_get_constant(const char *name, ComptimeValue *out_value, const ComptimeBuildContext *ctx)
@@ -545,595 +581,129 @@ bool comptime_get_constant(const char *name, ComptimeValue *out_value, const Com
         ctx = &default_ctx;
     }
 
-    // $mach.build.target - returns full target info
-    if (strcmp(name, "mach.build.target") == 0)
-    {
-        // For now, we'll handle field access separately
-        // This would be the full Target record access point
-        return false;
-    }
-
-    // $mach.build.target.arch - returns ArchitectureInfo
-    if (strcmp(name, "mach.build.target.arch") == 0)
-    {
-        out_value->kind = COMPTIME_ARCH_INFO;
-        out_value->arch_info = ctx->arch;
-        return true;
-    }
-
-    // $mach.build.target.os - returns OSInfo
+    // Target info
     if (strcmp(name, "mach.build.target.os") == 0)
     {
         out_value->kind = COMPTIME_OS_INFO;
         out_value->os_info = ctx->os;
         return true;
     }
-
-    // $mach.build.target.triple - returns string
-    if (strcmp(name, "mach.build.target.triple") == 0)
+    if (strcmp(name, "mach.build.target.arch") == 0)
     {
-        out_value->kind = COMPTIME_STRING;
-        out_value->string_val = ctx->triple;
+        out_value->kind = COMPTIME_ARCH_INFO;
+        out_value->arch_info = ctx->arch;
         return true;
     }
-
-    // $mach.build.target.pointer_width - returns u8
-    if (strcmp(name, "mach.build.target.pointer_width") == 0)
-    {
-        out_value->kind = COMPTIME_U8;
-        out_value->u8_val = ctx->pointer_width;
-        return true;
-    }
-
-    // $mach.build.target.abi
     if (strcmp(name, "mach.build.target.abi") == 0)
     {
         out_value->kind = COMPTIME_ABI_INFO;
         out_value->abi_info = ctx->abi;
         return true;
     }
-
-    // $mach.build.target.vendor
     if (strcmp(name, "mach.build.target.vendor") == 0)
     {
         out_value->kind = COMPTIME_VENDOR_INFO;
         out_value->vendor_info = ctx->vendor;
         return true;
     }
-
-    // $mach.build.target.environment
     if (strcmp(name, "mach.build.target.environment") == 0)
     {
         out_value->kind = COMPTIME_ENVIRONMENT_INFO;
         out_value->environment_info = ctx->environment;
         return true;
     }
-
-    // $mach.build.target.endianness
-    if (strcmp(name, "mach.build.target.endianness") == 0)
-    {
-        out_value->kind = COMPTIME_ENDIANNESS_INFO;
-        out_value->endianness_info = ctx->endianness;
-        return true;
-    }
-
-    // $mach.build.target.object_format
     if (strcmp(name, "mach.build.target.object_format") == 0)
     {
         out_value->kind = COMPTIME_OBJECT_FORMAT_INFO;
         out_value->object_format_info = ctx->object_format;
         return true;
     }
-
-    // $mach.build.target.backend
+    if (strcmp(name, "mach.build.target.endianness") == 0)
+    {
+        out_value->kind = COMPTIME_ENDIANNESS_INFO;
+        out_value->endianness_info = ctx->endianness;
+        return true;
+    }
     if (strcmp(name, "mach.build.target.backend") == 0)
     {
         out_value->kind = COMPTIME_BACKEND_KIND_INFO;
         out_value->backend_kind_info = ctx->backend;
         return true;
     }
-
-    // Nested field access for descriptors
-    // $mach.build.target.arch.id, $mach.build.target.arch.name, etc.
-    if (strncmp(name, "mach.build.target.arch.", 23) == 0)
+    if (strcmp(name, "mach.build.target.pointer_width") == 0)
     {
-        const char *field = name + 23;
-        if (strcmp(field, "id") == 0)
-        {
-            out_value->kind = COMPTIME_U8;
-            out_value->u8_val = (unsigned char)ctx->arch.id;
-            return true;
-        }
-        if (strcmp(field, "name") == 0)
-        {
-            out_value->kind = COMPTIME_STRING;
-            out_value->string_val = ctx->arch.name;
-            return true;
-        }
-        if (strcmp(field, "word_size") == 0)
-        {
-            out_value->kind = COMPTIME_U8;
-            out_value->u8_val = ctx->arch.word_size;
-            return true;
-        }
-        if (strcmp(field, "is_64bit") == 0)
-        {
-            out_value->kind = COMPTIME_BOOL;
-            out_value->bool_val = ctx->arch.is_64bit;
-            return true;
-        }
-        if (strcmp(field, "is_embedded") == 0)
-        {
-            out_value->kind = COMPTIME_BOOL;
-            out_value->bool_val = ctx->arch.is_embedded;
-            return true;
-        }
-        if (strcmp(field, "has_fpu") == 0)
-        {
-            out_value->kind = COMPTIME_BOOL;
-            out_value->bool_val = ctx->arch.has_fpu;
-            return true;
-        }
+        out_value->kind = COMPTIME_U64;
+        out_value->u64_val = ctx->pointer_width;
+        return true;
+    }
+    if (strcmp(name, "mach.build.target.triple") == 0)
+    {
+        out_value->kind = COMPTIME_STRING;
+        out_value->string_val = ctx->triple ? ctx->triple : "";
+        return true;
     }
 
-    // $mach.build.target.os.id, $mach.build.target.os.name, etc.
-    if (strncmp(name, "mach.build.target.os.", 21) == 0)
-    {
-        const char *field = name + 21;
-        if (strcmp(field, "id") == 0)
-        {
-            out_value->kind = COMPTIME_U8;
-            out_value->u8_val = (unsigned char)ctx->os.id;
-            return true;
-        }
-        if (strcmp(field, "name") == 0)
-        {
-            out_value->kind = COMPTIME_STRING;
-            out_value->string_val = ctx->os.name;
-            return true;
-        }
-        if (strcmp(field, "supports_filesystem") == 0)
-        {
-            out_value->kind = COMPTIME_BOOL;
-            out_value->bool_val = ctx->os.supports_filesystem;
-            return true;
-        }
-        if (strcmp(field, "supports_networking") == 0)
-        {
-            out_value->kind = COMPTIME_BOOL;
-            out_value->bool_val = ctx->os.supports_networking;
-            return true;
-        }
-        if (strcmp(field, "supports_threads") == 0)
-        {
-            out_value->kind = COMPTIME_BOOL;
-            out_value->bool_val = ctx->os.supports_threads;
-            return true;
-        }
-        if (strcmp(field, "has_mmu") == 0)
-        {
-            out_value->kind = COMPTIME_BOOL;
-            out_value->bool_val = ctx->os.has_mmu;
-            return true;
-        }
-        if (strcmp(field, "is_freestanding") == 0)
-        {
-            out_value->kind = COMPTIME_BOOL;
-            out_value->bool_val = ctx->os.is_freestanding;
-            return true;
-        }
-    }
-
-    // Namespace access: $mach.os, $mach.arch, $mach.abi, etc.
     if (strcmp(name, "mach.os") == 0)
     {
         out_value->kind = COMPTIME_OS_NAMESPACE;
         out_value->os_namespace = &comptime_os_namespace;
         return true;
     }
+
     if (strcmp(name, "mach.arch") == 0)
     {
         out_value->kind = COMPTIME_ARCH_NAMESPACE;
         out_value->arch_namespace = &comptime_arch_namespace;
         return true;
     }
+
     if (strcmp(name, "mach.abi") == 0)
     {
         out_value->kind = COMPTIME_ABI_NAMESPACE;
         out_value->abi_namespace = &comptime_abi_namespace;
         return true;
     }
+
     if (strcmp(name, "mach.vendor") == 0)
     {
         out_value->kind = COMPTIME_VENDOR_NAMESPACE;
         out_value->vendor_namespace = &comptime_vendor_namespace;
         return true;
     }
+
     if (strcmp(name, "mach.environment") == 0)
     {
         out_value->kind = COMPTIME_ENVIRONMENT_NAMESPACE;
         out_value->environment_namespace = &comptime_environment_namespace;
         return true;
     }
+
     if (strcmp(name, "mach.endianness") == 0)
     {
         out_value->kind = COMPTIME_ENDIANNESS_NAMESPACE;
         out_value->endianness_namespace = &comptime_endianness_namespace;
         return true;
     }
+
     if (strcmp(name, "mach.object_format") == 0)
     {
         out_value->kind = COMPTIME_OBJECT_FORMAT_NAMESPACE;
         out_value->object_format_namespace = &comptime_object_format_namespace;
         return true;
     }
+
     if (strcmp(name, "mach.backend") == 0)
     {
         out_value->kind = COMPTIME_BACKEND_NAMESPACE;
         out_value->backend_namespace = &comptime_backend_namespace;
         return true;
     }
+
     if (strcmp(name, "mach.feature") == 0)
     {
         out_value->kind = COMPTIME_FEATURE_NAMESPACE;
         out_value->feature_namespace = &comptime_feature_namespace;
         return true;
-    }
-
-    // Namespace field access: $mach.os.linux, $mach.arch.x86_64, etc.
-    if (strncmp(name, "mach.os.", 8) == 0)
-    {
-        const char *field = name + 8;
-        if (strcmp(field, "linux") == 0) {
-            out_value->kind = COMPTIME_OS_INFO;
-            out_value->os_info = comptime_os_namespace.os_linux;
-            return true;
-        }
-        if (strcmp(field, "windows") == 0) {
-            out_value->kind = COMPTIME_OS_INFO;
-            out_value->os_info = comptime_os_namespace.os_windows;
-            return true;
-        }
-        if (strcmp(field, "darwin") == 0) {
-            out_value->kind = COMPTIME_OS_INFO;
-            out_value->os_info = comptime_os_namespace.os_darwin;
-            return true;
-        }
-        if (strcmp(field, "wasi") == 0) {
-            out_value->kind = COMPTIME_OS_INFO;
-            out_value->os_info = comptime_os_namespace.os_wasi;
-            return true;
-        }
-        if (strcmp(field, "freestanding") == 0) {
-            out_value->kind = COMPTIME_OS_INFO;
-            out_value->os_info = comptime_os_namespace.os_freestanding;
-            return true;
-        }
-        if (strcmp(field, "zephyr") == 0) {
-            out_value->kind = COMPTIME_OS_INFO;
-            out_value->os_info = comptime_os_namespace.os_zephyr;
-            return true;
-        }
-        if (strcmp(field, "none") == 0) {
-            out_value->kind = COMPTIME_OS_INFO;
-            out_value->os_info = comptime_os_namespace.os_none;
-            return true;
-        }
-    }
-
-    if (strncmp(name, "mach.arch.", 10) == 0)
-    {
-        const char *field = name + 10;
-        if (strcmp(field, "x86") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.x86;
-            return true;
-        }
-        if (strcmp(field, "x86_64") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.x86_64;
-            return true;
-        }
-        if (strcmp(field, "arm") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.arm;
-            return true;
-        }
-        if (strcmp(field, "aarch64") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.aarch64;
-            return true;
-        }
-        if (strcmp(field, "thumb") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.thumb;
-            return true;
-        }
-        if (strcmp(field, "thumbv6m") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.thumbv6m;
-            return true;
-        }
-        if (strcmp(field, "thumbv7m") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.thumbv7m;
-            return true;
-        }
-        if (strcmp(field, "thumbv7em") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.thumbv7em;
-            return true;
-        }
-        if (strcmp(field, "riscv32") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.riscv32;
-            return true;
-        }
-        if (strcmp(field, "riscv64") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.riscv64;
-            return true;
-        }
-        if (strcmp(field, "avr") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.avr;
-            return true;
-        }
-        if (strcmp(field, "msp430") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.msp430;
-            return true;
-        }
-        if (strcmp(field, "wasm32") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.wasm32;
-            return true;
-        }
-        if (strcmp(field, "wasm64") == 0) {
-            out_value->kind = COMPTIME_ARCH_INFO;
-            out_value->arch_info = comptime_arch_namespace.wasm64;
-            return true;
-        }
-    }
-
-    if (strncmp(name, "mach.abi.", 9) == 0)
-    {
-        const char *field = name + 9;
-        if (strcmp(field, "gnu") == 0) {
-            out_value->kind = COMPTIME_ABI_INFO;
-            out_value->abi_info = comptime_abi_namespace.gnu;
-            return true;
-        }
-        if (strcmp(field, "msvc") == 0) {
-            out_value->kind = COMPTIME_ABI_INFO;
-            out_value->abi_info = comptime_abi_namespace.msvc;
-            return true;
-        }
-        if (strcmp(field, "musl") == 0) {
-            out_value->kind = COMPTIME_ABI_INFO;
-            out_value->abi_info = comptime_abi_namespace.musl;
-            return true;
-        }
-        if (strcmp(field, "newlib") == 0) {
-            out_value->kind = COMPTIME_ABI_INFO;
-            out_value->abi_info = comptime_abi_namespace.newlib;
-            return true;
-        }
-        if (strcmp(field, "bare") == 0) {
-            out_value->kind = COMPTIME_ABI_INFO;
-            out_value->abi_info = comptime_abi_namespace.bare;
-            return true;
-        }
-        if (strcmp(field, "wasi") == 0) {
-            out_value->kind = COMPTIME_ABI_INFO;
-            out_value->abi_info = comptime_abi_namespace.wasi;
-            return true;
-        }
-    }
-
-    if (strncmp(name, "mach.vendor.", 12) == 0)
-    {
-        const char *field = name + 12;
-        if (strcmp(field, "pc") == 0) {
-            out_value->kind = COMPTIME_VENDOR_INFO;
-            out_value->vendor_info = comptime_vendor_namespace.pc;
-            return true;
-        }
-        if (strcmp(field, "apple") == 0) {
-            out_value->kind = COMPTIME_VENDOR_INFO;
-            out_value->vendor_info = comptime_vendor_namespace.apple;
-            return true;
-        }
-        if (strcmp(field, "msp") == 0) {
-            out_value->kind = COMPTIME_VENDOR_INFO;
-            out_value->vendor_info = comptime_vendor_namespace.msp;
-            return true;
-        }
-        if (strcmp(field, "espressif") == 0) {
-            out_value->kind = COMPTIME_VENDOR_INFO;
-            out_value->vendor_info = comptime_vendor_namespace.espressif;
-            return true;
-        }
-        if (strcmp(field, "custom") == 0) {
-            out_value->kind = COMPTIME_VENDOR_INFO;
-            out_value->vendor_info = comptime_vendor_namespace.custom;
-            return true;
-        }
-    }
-
-    if (strncmp(name, "mach.environment.", 17) == 0)
-    {
-        const char *field = name + 17;
-        if (strcmp(field, "none") == 0) {
-            out_value->kind = COMPTIME_ENVIRONMENT_INFO;
-            out_value->environment_info = comptime_environment_namespace.none;
-            return true;
-        }
-        if (strcmp(field, "gnu") == 0) {
-            out_value->kind = COMPTIME_ENVIRONMENT_INFO;
-            out_value->environment_info = comptime_environment_namespace.gnu;
-            return true;
-        }
-        if (strcmp(field, "musl") == 0) {
-            out_value->kind = COMPTIME_ENVIRONMENT_INFO;
-            out_value->environment_info = comptime_environment_namespace.musl;
-            return true;
-        }
-        if (strcmp(field, "newlib") == 0) {
-            out_value->kind = COMPTIME_ENVIRONMENT_INFO;
-            out_value->environment_info = comptime_environment_namespace.newlib;
-            return true;
-        }
-        if (strcmp(field, "wasi") == 0) {
-            out_value->kind = COMPTIME_ENVIRONMENT_INFO;
-            out_value->environment_info = comptime_environment_namespace.wasi;
-            return true;
-        }
-        if (strcmp(field, "bare") == 0) {
-            out_value->kind = COMPTIME_ENVIRONMENT_INFO;
-            out_value->environment_info = comptime_environment_namespace.bare;
-            return true;
-        }
-    }
-
-    if (strncmp(name, "mach.endianness.", 16) == 0)
-    {
-        const char *field = name + 16;
-        if (strcmp(field, "little") == 0) {
-            out_value->kind = COMPTIME_ENDIANNESS_INFO;
-            out_value->endianness_info = comptime_endianness_namespace.little;
-            return true;
-        }
-        if (strcmp(field, "big") == 0) {
-            out_value->kind = COMPTIME_ENDIANNESS_INFO;
-            out_value->endianness_info = comptime_endianness_namespace.big;
-            return true;
-        }
-        if (strcmp(field, "mixed") == 0) {
-            out_value->kind = COMPTIME_ENDIANNESS_INFO;
-            out_value->endianness_info = comptime_endianness_namespace.mixed;
-            return true;
-        }
-    }
-
-    if (strncmp(name, "mach.object_format.", 19) == 0)
-    {
-        const char *field = name + 19;
-        if (strcmp(field, "elf") == 0) {
-            out_value->kind = COMPTIME_OBJECT_FORMAT_INFO;
-            out_value->object_format_info = comptime_object_format_namespace.elf;
-            return true;
-        }
-        if (strcmp(field, "pe") == 0) {
-            out_value->kind = COMPTIME_OBJECT_FORMAT_INFO;
-            out_value->object_format_info = comptime_object_format_namespace.pe;
-            return true;
-        }
-        if (strcmp(field, "macho") == 0) {
-            out_value->kind = COMPTIME_OBJECT_FORMAT_INFO;
-            out_value->object_format_info = comptime_object_format_namespace.macho;
-            return true;
-        }
-        if (strcmp(field, "wasm") == 0) {
-            out_value->kind = COMPTIME_OBJECT_FORMAT_INFO;
-            out_value->object_format_info = comptime_object_format_namespace.wasm;
-            return true;
-        }
-        if (strcmp(field, "rawbin") == 0) {
-            out_value->kind = COMPTIME_OBJECT_FORMAT_INFO;
-            out_value->object_format_info = comptime_object_format_namespace.rawbin;
-            return true;
-        }
-        if (strcmp(field, "hex") == 0) {
-            out_value->kind = COMPTIME_OBJECT_FORMAT_INFO;
-            out_value->object_format_info = comptime_object_format_namespace.hex;
-            return true;
-        }
-        if (strcmp(field, "uf2") == 0) {
-            out_value->kind = COMPTIME_OBJECT_FORMAT_INFO;
-            out_value->object_format_info = comptime_object_format_namespace.uf2;
-            return true;
-        }
-    }
-
-    if (strncmp(name, "mach.backend.", 13) == 0)
-    {
-        const char *field = name + 13;
-        if (strcmp(field, "native") == 0) {
-            out_value->kind = COMPTIME_BACKEND_KIND_INFO;
-            out_value->backend_kind_info = comptime_backend_namespace.native;
-            return true;
-        }
-        if (strcmp(field, "wasm") == 0) {
-            out_value->kind = COMPTIME_BACKEND_KIND_INFO;
-            out_value->backend_kind_info = comptime_backend_namespace.wasm;
-            return true;
-        }
-        if (strcmp(field, "embedded") == 0) {
-            out_value->kind = COMPTIME_BACKEND_KIND_INFO;
-            out_value->backend_kind_info = comptime_backend_namespace.embedded;
-            return true;
-        }
-        if (strcmp(field, "custom") == 0) {
-            out_value->kind = COMPTIME_BACKEND_KIND_INFO;
-            out_value->backend_kind_info = comptime_backend_namespace.custom;
-            return true;
-        }
-    }
-
-    if (strncmp(name, "mach.feature.", 13) == 0)
-    {
-        const char *field = name + 13;
-        if (strcmp(field, "soft_float") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.soft_float;
-            return true;
-        }
-        if (strcmp(field, "hard_float") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.hard_float;
-            return true;
-        }
-        if (strcmp(field, "simd") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.simd;
-            return true;
-        }
-        if (strcmp(field, "unaligned_memory") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.unaligned_memory;
-            return true;
-        }
-        if (strcmp(field, "atomics_64") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.atomics_64;
-            return true;
-        }
-        if (strcmp(field, "atomics_128") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.atomics_128;
-            return true;
-        }
-        if (strcmp(field, "threads") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.threads;
-            return true;
-        }
-        if (strcmp(field, "mmu") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.mmu;
-            return true;
-        }
-        if (strcmp(field, "cache") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.cache;
-            return true;
-        }
-        if (strcmp(field, "vector_ext") == 0) {
-            out_value->kind = COMPTIME_FEATURE_INFO;
-            out_value->feature_info = comptime_feature_namespace.vector_ext;
-            return true;
-        }
     }
 
     // Build configuration (unchanged)
@@ -1155,6 +725,18 @@ bool comptime_get_constant(const char *name, ComptimeValue *out_value, const Com
     {
         out_value->kind = COMPTIME_STRING;
         out_value->string_val = ctx->mach_version;
+        return true;
+    }
+    if (strcmp(name, "true") == 0)
+    {
+        out_value->kind = COMPTIME_BOOL;
+        out_value->bool_val = true;
+        return true;
+    }
+    if (strcmp(name, "false") == 0)
+    {
+        out_value->kind = COMPTIME_BOOL;
+        out_value->bool_val = false;
         return true;
     }
 
