@@ -4495,6 +4495,12 @@ static Type *analyze_index_expr(SemanticDriver *driver, const AnalysisContext *c
     if (!array_type || !index_type)
         return NULL;
 
+    if (!type_is_integer(index_type))
+    {
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr->index_expr.index, ctx->file_path, "array index must be integer");
+        return NULL;
+    }
+
     // Store original type to preserve aliases
     Type *original_array_type = array_type;
 
@@ -4506,13 +4512,15 @@ static Type *analyze_index_expr(SemanticDriver *driver, const AnalysisContext *c
 
     if (array_type->kind != TYPE_ARRAY)
     {
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "cannot index non-array type");
-        return NULL;
-    }
+        // Allow indexing pointers
+        Type *resolved_original = type_resolve_alias(original_array_type);
+        if (resolved_original->kind == TYPE_POINTER)
+        {
+            expr->type = resolved_original->pointer.base;
+            return expr->type;
+        }
 
-    if (!type_is_integer(index_type))
-    {
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr->index_expr.index, ctx->file_path, "array index must be integer");
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "cannot index non-array type");
         return NULL;
     }
 
