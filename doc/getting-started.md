@@ -124,10 +124,11 @@ The main source file is located at `src/main.mach`:
 ```mach
 use          std.system.runtime;
 use          std.types.string;
+use          std.types.slice;
 use console: std.io.console;
 
 $main.symbol = "main"
-fun main(args: []str) i64 {
+fun main(args: Slice[str]) i64 {
     console.print("Hello, World!\n");
     ret 0;
 }

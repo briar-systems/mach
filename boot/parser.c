@@ -178,6 +178,14 @@ static AstNode *parser_parse_top_level_block(Parser *parser)
         return NULL;
     }
 
+    block->block_stmt.deferred_stmts = parser_alloc_list(parser);
+    if (!block->block_stmt.deferred_stmts)
+    {
+        ast_node_dnit(block);
+        free(block);
+        return NULL;
+    }
+
     while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
     {
         AstNode *stmt = parser_parse_stmt_top(parser);
@@ -953,6 +961,7 @@ static bool is_unary_op(TokenKind kind)
     case TOKEN_QUESTION:
     case TOKEN_AT:
     case TOKEN_STAR:
+    case TOKEN_AMPERSAND:
         return true;
     default:
         return false;
@@ -1369,6 +1378,9 @@ static AstNode *parser_parse_var_decl(Parser *parser, bool is_val, bool is_publi
         return NULL;
     }
 
+    // DEBUG
+    // printf("Parsed type for var %s. Next token: %s\n", node->var_stmt.name, token_kind_to_string(parser->current->kind));
+
     // val requires initialization, var is optional
     if (is_val)
     {
@@ -1389,9 +1401,11 @@ static AstNode *parser_parse_var_decl(Parser *parser, bool is_val, bool is_publi
     }
     else if (parser_match(parser, TOKEN_EQUAL))
     {
+        printf("DEBUG: Found =. Parsing init expr. Current token: %s\n", token_kind_to_string(parser->current->kind));
         node->var_stmt.init = parser_parse_expr(parser);
         if (!node->var_stmt.init)
         {
+            printf("DEBUG: Failed to parse init expr\n");
             parser_error_at_current(parser, "expected expression after '='");
             ast_node_dnit(node);
             free(node);
@@ -2024,8 +2038,30 @@ AstNode *parser_parse_stmt_block(Parser *parser)
         return NULL;
     }
 
+    node->block_stmt.deferred_stmts = parser_alloc_list(parser);
+    if (!node->block_stmt.deferred_stmts)
+    {
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
     while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
     {
+        if (parser_match(parser, TOKEN_KW_FIN))
+        {
+            AstNode *stmt = parser_parse_stmt(parser);
+            if (!stmt)
+            {
+                parser_error_at_current(parser, "expected statement after 'fin'");
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+            ast_list_append(node->block_stmt.deferred_stmts, stmt);
+            continue;
+        }
+
         AstNode *stmt = parser_parse_stmt(parser);
         if (!stmt)
         {
@@ -2870,10 +2906,10 @@ AstNode *parser_parse_array_literal(Parser *parser)
         return NULL;
     }
 
-    // require explicit length (slices removed)
+    // require explicit length
     if (parser_check(parser, TOKEN_R_BRACKET))
     {
-        parser_error_at_current(parser, "array literal requires explicit length (use [N]T; slices []T have been removed)");
+        parser_error_at_current(parser, "array literal requires explicit length (use [N]T)");
         ast_node_dnit(array);
         free(array);
         return NULL;
@@ -3044,6 +3080,7 @@ AstNode *parser_parse_type(Parser *parser)
         return parser_parse_type_uni(parser);
 
     case TOKEN_STAR:
+    case TOKEN_AMPERSAND:
         parser_advance(parser);
         return parser_parse_type_ptr(parser);
 
@@ -3120,6 +3157,8 @@ AstNode *parser_parse_type_ptr(Parser *parser)
         return NULL;
     }
 
+    ptr->type_ptr.is_read_only = (parser->previous->kind == TOKEN_AMPERSAND);
+
     ptr->type_ptr.base = parser_parse_type(parser);
     if (!ptr->type_ptr.base)
     {
@@ -3139,10 +3178,10 @@ AstNode *parser_parse_type_array(Parser *parser)
         return NULL;
     }
 
-    // require explicit length (slices removed)
+    // require explicit length
     if (parser_check(parser, TOKEN_R_BRACKET))
     {
-        parser_error_at_current(parser, "array type requires explicit length (use [N]T; slices []T have been removed)");
+        parser_error_at_current(parser, "array type requires explicit length (use [N]T)");
         ast_node_dnit(array);
         free(array);
         return NULL;

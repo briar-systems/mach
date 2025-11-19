@@ -17,7 +17,6 @@ This document describes the expression system in Mach, including operators, oper
 	- [Postfix Expressions](#postfix-expressions)
 		- [Function Calls](#function-calls)
 		- [Array Initialization](#array-initialization)
-		- [Slice Initialization](#slice-initialization)
 		- [Array Indexing](#array-indexing)
 		- [Field Access](#field-access)
 		- [Type Casting](#type-casting)
@@ -208,19 +207,6 @@ val arr:  [3]i32 = [3]i32{ 1, 2, 3 }; # initialize array
 ```
 
 
-### Slice Initialization
-
-Slices must be initialized using a typed literal syntax with both `data` and `len` components:
-
-```mach
-var arr:   [3]i32 = [3]i32{ 1, 2, 3 };           # initialize array
-val slice: []i32  = []i32{ data: ?arr, len: 3 }; # initialize slice from array
-```
-
-- `data` is a pointer to the first element and must be of type `*T` where `T` is the element type.
-- `len` is the number of elements in the slice and is not managed automatically.
-
-
 ### Array Indexing
 
 Array indexing accesses an element at a specific position.
@@ -231,6 +217,14 @@ val elem: i32    = arr[1];            # access second element
 ```
 
 See the [Types](types.md#arrays) documentation for details on arrays and indexing.
+
+Note that this syntax also works for pointers, as pointer arithmetic and indexing are supported uniformly:
+
+```mach
+val arr:  [3]i32 = [3]i32{ 1, 2, 3 }; # initialize array
+val p:    &i32   = ?arr;              # pointer to first element
+val elem: i32    = p[1];              # access second element via pointer
+```
 
 
 ### Field Access

@@ -87,7 +87,7 @@ The standard library's runtime module (`std.system.runtime`) expects a function 
 
 From [runtime.mach](https://github.com/octalide/mach-std/blob/main/src/system/runtime.mach):
 ```mach
-pub ext main: fun([]str) i64;
+pub ext main: fun(Slice[str]) i64;
 ```
 
 This expectation of a `main` function is why the `$main.symbol = "main"` annotation is necessary in user code as its inclusion manually controls the mangled symbol of the user-defined entry point function.

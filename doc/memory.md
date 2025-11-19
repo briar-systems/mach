@@ -23,10 +23,11 @@ The language provides two primary operators for working with pointers:
 
 ## Pointer Types
 
-Pointer types are denoted with a `*` prefix followed by the pointed-to type:
+Pointer types are denoted with a `*` prefix for mutable pointers and `&` for read-only pointers:
 
 ```mach
-val int_ptr:   *i32 = nil;  # pointer to i32
+val int_ptr:   *i32 = nil;  # mutable pointer to i32
+val read_only: &i32 = nil;  # read-only pointer to i32
 val float_ptr: *f64 = nil;  # pointer to f64
 val ptr_ptr:   **u8 = nil;  # pointer to pointer to u8
 ```
@@ -42,12 +43,21 @@ See the [Types](types.md#primitives) documentation for details on primitive type
 
 ## Creating Pointers
 
-The `?` operator takes the address of a variable, creating a pointer to it:
+The `?` operator takes the address of a variable, creating a pointer to it.
+The resulting pointer type depends on the mutability of the source variable:
+
+- Taking the address of a `var` yields a mutable pointer `*T`.
+- Taking the address of a `val` yields a read-only pointer `&T`.
 
 ```mach
 var x: i32  = 42;
-val p: *i32 = ?x;  # p now points to x
+val p: *i32 = ?x;  # p is *i32 because x is mutable
+
+val y: i32  = 100;
+val q: &i32 = ?y;  # q is &i32 because y is immutable
 ```
+
+Mutable pointers (`*T`) can be implicitly cast to read-only pointers (`&T`), but the reverse is not allowed.
 
 
 ## Dereferencing Pointers
@@ -60,6 +70,16 @@ var p: *i32 = ?x;
 
 val value: i32 = @p;  # read the value (42)
 @p = 100;             # write through the pointer (x is now 100)
+```
+
+Dereferencing a read-only pointer (`&T`) yields a value that cannot be assigned to.
+
+```mach
+val y: i32  = 100;
+val q: &i32 = ?y;
+
+val v: i32 = @q; # OK: reading is allowed
+# @q = 200;      # ERROR: cannot assign to read-only location
 ```
 
 Dereferencing a null pointer or an invalid pointer results in undefined behavior.

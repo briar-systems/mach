@@ -35,19 +35,19 @@
 
 ## Types
 Primitives: `u8` `u16` `u32` `u64` `i8` `i16` `i32` `i64` `f32` `f64` `ptr` (untyped pointer)
-Compounds: `*T` (pointer) `[N]T` (fixed array) `[]T` (slice)
+Compounds: `*T` (mutable pointer) `&T` (read-only pointer) `[N]T` (fixed array)
 Anonymous: `rec{x: i32;}` and `uni{some: T; none: ptr;}` valid in type position
 Generics: `Name[TypeParam]` for both records and unions
 
 ## Operators and expressions
 - `obj.field` - field access (records) or namespace access (modules). Uses `.` for both values and pointers
-- `arr[idx]` - indexing arrays, slices, pointers
+- `arr[idx]` - indexing arrays, pointers
 - `func(a, b)` - function call
 - `obj.method()` - method calls auto-convert between value/pointer as needed for receiver type
 - `func[i32]()` - generic call with explicit type arguments
 - `Type{field: value}` or `Generic[T]{field: value}` - literal construction
 - `value::TargetType` - cast (sizes must match, bit reinterpret (`i64` to `f64` bad etc.))
-- `?expr` - address-of (operand must be lvalue, returns pointer)
+- `?expr` - address-of (operand must be lvalue, returns `*T` for var, `&T` for val)
 - `@ptr` - dereference pointer
 - Standard arithmetic: `+` `-` `*` `/` `%`
 - Comparison: `==` `!=` `<` `>` `<=` `>=`
@@ -64,12 +64,14 @@ for (condition) { body }  // conditional loop
 for { body }              // infinite loop
 cnt;                      // continue
 brk;                      // break
+fin stmt;                 // deferred statement (block-scoped)
 ```
 
 ## Type system semantics
 - Literal coercion only at declaration point. Explicit casts required elsewhere.
 - Aliases with identical underlying types are interchangeable without casts.
 - All sizes in casts must match exactly (no implicit widening/narrowing).
+- `*T` can implicitly cast to `&T`, but not vice-versa.
 
 ## Module system
 - Modules map 1:1 with `.mach` files under `[project].src` in `mach.toml`
@@ -77,5 +79,6 @@ brk;                      // break
 - Dependencies declared in `mach.toml` under `[deps.name]` with `source` and `version`
 
 ## Entry point convention
-Standard library runtime expects: `fun main(args: []str) i64` with `$main.symbol = "main";`
+Standard library runtime expects: `fun main(args: Slice[str]) i64` with `$main.symbol = "main";` defined above it per convention.
+Note that a "conventional" entrypoint should also `use std.system.runtime;` and the types it requires for the signature like `std.types.string` and `std.types.slice`.
 Comptime directives: `$directive.key = value;` evaluated at compile time.

@@ -1091,7 +1091,7 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
         Type *base = resolve_type_in_context(driver, ctx, type_node->type_ptr.base);
         if (!base)
             return NULL;
-        Type *ptr       = type_pointer_create(base);
+        Type *ptr       = type_pointer_create(base, type_node->type_ptr.is_read_only);
         type_node->type = ptr;
         return ptr;
     }
@@ -1104,7 +1104,7 @@ static Type *resolve_type_in_context(SemanticDriver *driver, const AnalysisConte
 
         if (!type_node->type_array.size)
         {
-            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "array type requires explicit length (slices []T are no longer supported)");
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, type_node, ctx->file_path, "array type requires explicit length");
             return NULL;
         }
 
@@ -2224,15 +2224,11 @@ static bool resolve_uni_fields(SemanticDriver *driver, const AnalysisContext *ct
 
         size_t field_size  = type_sizeof(field_type);
         size_t field_align = type_alignof(field_type);
-
         if (field_size > max_size)
             max_size = field_size;
         if (field_align > max_alignment)
             max_alignment = field_align;
         field_count++;
-
-        field_node->symbol = field_sym;
-        field_node->type   = field_type;
     }
 
     // align final union size
@@ -3322,6 +3318,8 @@ static bool is_lvalue_expr(const AstNode *expr)
     }
 }
 
+static bool is_expr_read_only(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr);
+
 static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
 {
     Type *left = analyze_expr(driver, ctx, expr->binary_expr.left);
@@ -3483,6 +3481,12 @@ static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *
             return NULL;
         }
 
+        if (is_expr_read_only(driver, ctx, expr->binary_expr.left))
+        {
+            diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "cannot assign to read-only location");
+            return NULL;
+        }
+
         if (!type_equals(left, right) && !type_can_assign_to(right, left))
         {
             char *lhs = type_to_string(left);
@@ -3498,6 +3502,68 @@ static Type *analyze_binary_expr(SemanticDriver *driver, const AnalysisContext *
 
     diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "unsupported binary operator");
     return NULL;
+}
+
+static bool is_expr_read_only(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr)
+{
+    switch (expr->kind)
+    {
+    case AST_EXPR_IDENT:
+    {
+        Symbol *sym = symbol_lookup_scope(ctx->current_scope, expr->ident_expr.name);
+        if (!sym)
+        {
+            // fallback to module/global scope if not found in current scope
+            // Note: symbol_lookup_scope only checks one scope, we need full lookup logic here
+            // but we don't have the SymbolTable handy in AnalysisContext.
+            // However, ctx->current_scope should be linked to parents.
+            Scope *s = ctx->current_scope;
+            while (s)
+            {
+                sym = symbol_lookup_scope(s, expr->ident_expr.name);
+                if (sym) break;
+                s = s->parent;
+            }
+        }
+
+        if (sym)
+        {
+            if (sym->kind == SYMBOL_VAL || sym->kind == SYMBOL_PARAM)
+                return true;
+        }
+        return false;
+    }
+    case AST_EXPR_UNARY:
+    {
+        if (expr->unary_expr.op == TOKEN_AT)
+        {
+            Type *ptr_type = expr->unary_expr.expr->type;
+            if (ptr_type && ptr_type->kind == TYPE_POINTER && ptr_type->pointer.is_read_only)
+                return true;
+        }
+        return false;
+    }
+    case AST_EXPR_FIELD:
+    {
+        Type *obj_type = expr->field_expr.object->type;
+        if (obj_type && obj_type->kind == TYPE_POINTER)
+        {
+            return obj_type->pointer.is_read_only;
+        }
+        return is_expr_read_only(driver, ctx, expr->field_expr.object);
+    }
+    case AST_EXPR_INDEX:
+    {
+        Type *arr_type = expr->index_expr.array->type;
+        if (arr_type && arr_type->kind == TYPE_POINTER)
+        {
+            return arr_type->pointer.is_read_only;
+        }
+        return is_expr_read_only(driver, ctx, expr->index_expr.array);
+    }
+    default:
+        return false;
+    }
 }
 
 static Type *analyze_unary_expr_with_hint(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, Type *expected)
@@ -3560,7 +3626,8 @@ static Type *analyze_unary_expr_with_hint(SemanticDriver *driver, const Analysis
             diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "address-of requires lvalue");
             return NULL;
         }
-        expr->type = type_pointer_create(operand);
+        bool is_ro = is_expr_read_only(driver, ctx, expr->unary_expr.expr);
+        expr->type = type_pointer_create(operand, is_ro);
         return expr->type;
     }
 
@@ -4188,7 +4255,7 @@ normal_call_analysis:; // label must be followed by a statement
                 return NULL;
             }
 
-            expr->type = type_pointer_create(type_u8());
+            expr->type = type_pointer_create(type_u8(), false);
             return expr->type;
         }
     }
@@ -4428,6 +4495,12 @@ static Type *analyze_index_expr(SemanticDriver *driver, const AnalysisContext *c
     if (!array_type || !index_type)
         return NULL;
 
+    if (!type_is_integer(index_type))
+    {
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr->index_expr.index, ctx->file_path, "array index must be integer");
+        return NULL;
+    }
+
     // Store original type to preserve aliases
     Type *original_array_type = array_type;
 
@@ -4439,13 +4512,15 @@ static Type *analyze_index_expr(SemanticDriver *driver, const AnalysisContext *c
 
     if (array_type->kind != TYPE_ARRAY)
     {
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "cannot index non-array type");
-        return NULL;
-    }
+        // Allow indexing pointers
+        Type *resolved_original = type_resolve_alias(original_array_type);
+        if (resolved_original->kind == TYPE_POINTER)
+        {
+            expr->type = resolved_original->pointer.base;
+            return expr->type;
+        }
 
-    if (!type_is_integer(index_type))
-    {
-        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr->index_expr.index, ctx->file_path, "array index must be integer");
+        diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "cannot index non-array type");
         return NULL;
     }
 
@@ -4930,20 +5005,44 @@ static Type *analyze_expr(SemanticDriver *driver, const AnalysisContext *ctx, As
 // statement analysis
 static bool analyze_block_stmt(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *stmt)
 {
-    if (!stmt->block_stmt.stmts)
-        return true;
-
     // create a new scope for the block
     Scope          *block_scope = scope_create(ctx->current_scope, "block");
     AnalysisContext block_ctx   = analysis_context_with_scope(ctx, block_scope);
 
     bool success = true;
-    for (int i = 0; i < stmt->block_stmt.stmts->count; i++)
+    if (stmt->block_stmt.stmts)
     {
-        AstNode *inner = stmt->block_stmt.stmts->items[i];
-        if (!analyze_stmt(driver, &block_ctx, inner))
+        for (int i = 0; i < stmt->block_stmt.stmts->count; i++)
         {
-            success = false;
+            AstNode *inner = stmt->block_stmt.stmts->items[i];
+            if (!analyze_stmt(driver, &block_ctx, inner))
+            {
+                success = false;
+            }
+        }
+    }
+
+    if (stmt->block_stmt.deferred_stmts)
+    {
+        for (int i = 0; i < stmt->block_stmt.deferred_stmts->count; i++)
+        {
+            AstNode *inner = stmt->block_stmt.deferred_stmts->items[i];
+            if (!analyze_stmt(driver, &block_ctx, inner))
+            {
+                success = false;
+            }
+        }
+    }
+
+    if (stmt->block_stmt.deferred_stmts)
+    {
+        for (int i = 0; i < stmt->block_stmt.deferred_stmts->count; i++)
+        {
+            AstNode *inner = stmt->block_stmt.deferred_stmts->items[i];
+            if (!analyze_stmt(driver, &block_ctx, inner))
+            {
+                success = false;
+            }
         }
     }
 

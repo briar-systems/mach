@@ -11,7 +11,7 @@ This section describes Mach's type system.
   - [Methods](#methods)
   - [Anonymous `rec` and `uni`](#anonymous-rec-and-uni)
   - [Arrays](#arrays)
-    - [String Primitive](#string-primitive)
+  - [String Primitive](#string-primitive)
   - [Generics](#generics)
   - [Type Casting](#type-casting)
     - [Inference](#inference)
@@ -22,20 +22,20 @@ This section describes Mach's type system.
 
 Mach includes the following primitive types:
 
-| Type  | Description                                 |
-| ----- | ------------------------------------------- |
-| `u8`  | 8-bit unsigned integer                      |
-| `u16` | 16-bit unsigned integer                     |
-| `u32` | 32-bit unsigned integer                     |
-| `u64` | 64-bit unsigned integer                     |
-| `i8`  | 8-bit signed integer                        |
-| `i16` | 16-bit signed integer                       |
-| `i32` | 32-bit signed integer                       |
-| `i64` | 64-bit signed integer                       |
-| `f32` | 32-bit floating-point number                |
-| `f64` | 64-bit floating-point number                |
-| `ptr` | Untyped pointer (equivalent to C's `void*`) |
-| `str` | String literal record `{ data: *u8, len: <pointer-sized-uint> }` |
+| Type  | Description                                                      |
+| ----- | ---------------------------------------------------------------- |
+| `u8`  | 8-bit unsigned integer                                           |
+| `u16` | 16-bit unsigned integer                                          |
+| `u32` | 32-bit unsigned integer                                          |
+| `u64` | 64-bit unsigned integer                                          |
+| `i8`  | 8-bit signed integer                                             |
+| `i16` | 16-bit signed integer                                            |
+| `i32` | 32-bit signed integer                                            |
+| `i64` | 64-bit signed integer                                            |
+| `f32` | 32-bit floating-point number                                     |
+| `f64` | 64-bit floating-point number                                     |
+| `ptr` | Untyped pointer (equivalent to C's `void*`)                      |
+| `str` | String literal record `{ data: &u8, len: <pointer-sized-uint> }` |
 
 ## Type Aliases
 
@@ -165,16 +165,20 @@ Arrays expose no intrinsic fields. They behave like POD aggregates with a fixed 
 
 ## String Primitive
 
-`str` is the only compiler known composite type. It represents string literals embedded in the binary and is exposed as a simple record:
+`str` is the only compiler known composite type.
+It represents string literals embedded in the binary and is exposed as a simple record:
 
 ```mach
 rec str {
-    data: *u8;
-    len: u64; # pointer-sized unsigned integer (u32 on 32-bit targets)
+    data: &u8; # readonly pointer to UTF-8 data start
+    len:  u64; # pointer-sized unsigned integer (u32 on 32-bit targets)
 }
 ```
 
-The `len` field uses the pointer-sized unsigned integer for the current target (e.g., `u64` on 64-bit platforms). All string literals have type `str`, are UTF-8 encoded, and live in read-only memory. Access the data and length through the exposed fields just like any other record. For owned or mutable strings, prefer the standard library's `std.types.String` type.
+The `len` field uses the pointer-sized unsigned integer for the current target (e.g., `u64` on 64-bit platforms).
+All string literals have type `str`, are UTF-8 encoded, and live in read-only memory.
+Access the data and length through the exposed fields just like any other record.
+For owned or mutable strings, prefer the standard library's `std.types.String` type.
 
 ## Generics
 

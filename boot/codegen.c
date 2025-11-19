@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Transforms/PassBuilder.h>
+#include <llvm-c/DebugInfo.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -728,7 +729,11 @@ static LLVMMetadataRef codegen_debug_get_type(CodegenContext *ctx, Type *type)
     case TYPE_POINTER:
     {
         LLVMMetadataRef base = resolved->kind == TYPE_POINTER && resolved->pointer.base ? codegen_debug_get_type(ctx, resolved->pointer.base) : codegen_debug_get_unknown_type(ctx);
-        di_type              = LLVMDIBuilderCreatePointerType(ctx->di_builder, base, size_bits, align_bits, 0, "", 0);
+        if (resolved->kind == TYPE_POINTER && resolved->pointer.is_read_only)
+        {
+            base = LLVMDIBuilderCreateQualifiedType(ctx->di_builder, 38, base); // 38 = DW_TAG_const_type
+        }
+        di_type = LLVMDIBuilderCreatePointerType(ctx->di_builder, base, size_bits, align_bits, 0, "", 0);
         break;
     }
     case TYPE_ARRAY:
@@ -1215,6 +1220,11 @@ void codegen_context_init(CodegenContext *ctx, const char *module_name, bool no_
 
     ctx->spec_cache = NULL;
 
+    // initialize deferred stack
+    ctx->deferred_stack.blocks   = NULL;
+    ctx->deferred_stack.count    = 0;
+    ctx->deferred_stack.capacity = 0;
+
     // initialize maps
     ctx->symbol_map.symbols  = NULL;
     ctx->symbol_map.values   = NULL;
@@ -1283,6 +1293,7 @@ void codegen_context_dnit(CodegenContext *ctx)
     free(ctx->type_cache.llvm_types);
     free(ctx->di_type_cache.types);
     free(ctx->di_type_cache.di_types);
+    free(ctx->deferred_stack.blocks);
 
     if (ctx->di_builder)
     {
@@ -1759,6 +1770,19 @@ LLVMValueRef codegen_stmt(CodegenContext *ctx, AstNode *stmt)
     case AST_STMT_BRK:
         if (ctx->break_block)
         {
+            // execute deferred statements for all active blocks in reverse order
+            // only down to the loop's scope
+            for (int i = ctx->deferred_stack.count - 1; i >= ctx->break_depth; i--)
+            {
+                AstList *deferred = ctx->deferred_stack.blocks[i];
+                if (deferred)
+                {
+                    for (int j = deferred->count - 1; j >= 0; j--)
+                    {
+                        codegen_stmt(ctx, deferred->items[j]);
+                    }
+                }
+            }
             LLVMBuildBr(ctx->builder, ctx->break_block);
         }
         else
@@ -1769,6 +1793,19 @@ LLVMValueRef codegen_stmt(CodegenContext *ctx, AstNode *stmt)
     case AST_STMT_CNT:
         if (ctx->continue_block)
         {
+            // execute deferred statements for all active blocks in reverse order
+            // only down to the loop's scope
+            for (int i = ctx->deferred_stack.count - 1; i >= ctx->continue_depth; i--)
+            {
+                AstList *deferred = ctx->deferred_stack.blocks[i];
+                if (deferred)
+                {
+                    for (int j = deferred->count - 1; j >= 0; j--)
+                    {
+                        codegen_stmt(ctx, deferred->items[j]);
+                    }
+                }
+            }
             LLVMBuildBr(ctx->builder, ctx->continue_block);
         }
         else
@@ -1928,6 +1965,14 @@ LLVMValueRef codegen_stmt_block(CodegenContext *ctx, AstNode *stmt)
     LLVMMetadataRef prev_scope = NULL;
     bool            pushed     = codegen_debug_push_scope(ctx, stmt, &prev_scope);
 
+    // push deferred statements list to stack
+    if (ctx->deferred_stack.count >= ctx->deferred_stack.capacity)
+    {
+        ctx->deferred_stack.capacity = ctx->deferred_stack.capacity == 0 ? 8 : ctx->deferred_stack.capacity * 2;
+        ctx->deferred_stack.blocks   = realloc(ctx->deferred_stack.blocks, ctx->deferred_stack.capacity * sizeof(AstList *));
+    }
+    ctx->deferred_stack.blocks[ctx->deferred_stack.count++] = stmt->block_stmt.deferred_stmts;
+
     if (stmt->block_stmt.stmts)
     {
         for (int i = 0; i < stmt->block_stmt.stmts->count; i++)
@@ -1935,6 +1980,18 @@ LLVMValueRef codegen_stmt_block(CodegenContext *ctx, AstNode *stmt)
             last = codegen_stmt(ctx, stmt->block_stmt.stmts->items[i]);
         }
     }
+
+    // execute deferred statements in reverse order
+    if (stmt->block_stmt.deferred_stmts && !LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)))
+    {
+        for (int i = stmt->block_stmt.deferred_stmts->count - 1; i >= 0; i--)
+        {
+            codegen_stmt(ctx, stmt->block_stmt.deferred_stmts->items[i]);
+        }
+    }
+
+    // pop deferred statements list
+    ctx->deferred_stack.count--;
 
     codegen_debug_pop_scope(ctx, prev_scope, pushed);
     return last;
@@ -2294,9 +2351,10 @@ LLVMValueRef codegen_stmt_ret(CodegenContext *ctx, AstNode *stmt)
 {
     codegen_set_debug_location(ctx, stmt);
 
+    LLVMValueRef value = NULL;
     if (stmt->ret_stmt.expr)
     {
-        LLVMValueRef value = codegen_expr(ctx, stmt->ret_stmt.expr);
+        value = codegen_expr(ctx, stmt->ret_stmt.expr);
         if (!value)
         {
             codegen_error(ctx, stmt, "failed to generate return value");
@@ -2345,6 +2403,23 @@ LLVMValueRef codegen_stmt_ret(CodegenContext *ctx, AstNode *stmt)
                 value = LLVMBuildIntToPtr(ctx->builder, value, rty, "inttoptr_ret");
             }
         }
+    }
+
+    // execute deferred statements for all active blocks in reverse order
+    for (int i = ctx->deferred_stack.count - 1; i >= 0; i--)
+    {
+        AstList *deferred = ctx->deferred_stack.blocks[i];
+        if (deferred)
+        {
+            for (int j = deferred->count - 1; j >= 0; j--)
+            {
+                codegen_stmt(ctx, deferred->items[j]);
+            }
+        }
+    }
+
+    if (value)
+    {
         return LLVMBuildRet(ctx->builder, value);
     }
     else
@@ -2447,8 +2522,13 @@ LLVMValueRef codegen_stmt_for(CodegenContext *ctx, AstNode *stmt)
     // save loop context
     LLVMBasicBlockRef prev_break    = ctx->break_block;
     LLVMBasicBlockRef prev_continue = ctx->continue_block;
-    ctx->break_block                = exit_block;
-    ctx->continue_block             = loop_block;
+    int               prev_break_depth = ctx->break_depth;
+    int               prev_continue_depth = ctx->continue_depth;
+
+    ctx->break_block    = exit_block;
+    ctx->continue_block = loop_block;
+    ctx->break_depth    = ctx->deferred_stack.count;
+    ctx->continue_depth = ctx->deferred_stack.count;
 
     // jump to loop header
     LLVMBuildBr(ctx->builder, loop_block);
@@ -2503,6 +2583,8 @@ LLVMValueRef codegen_stmt_for(CodegenContext *ctx, AstNode *stmt)
     // restore loop context
     ctx->break_block    = prev_break;
     ctx->continue_block = prev_continue;
+    ctx->break_depth    = prev_break_depth;
+    ctx->continue_depth = prev_continue_depth;
 
     // continue at exit block
     LLVMPositionBuilderAtEnd(ctx->builder, exit_block);

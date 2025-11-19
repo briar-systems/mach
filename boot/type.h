@@ -51,6 +51,7 @@ typedef struct Type
         struct
         {
             struct Type *base;
+            bool         is_read_only;
         } pointer;
 
         // TYPE_ARRAY
@@ -106,7 +107,7 @@ Type *type_pointer_uint(void);
 Type *type_error(void);
 
 // type constructors
-Type *type_pointer_create(Type *base);
+Type *type_pointer_create(Type *base, bool is_read_only);
 Type *type_fixed_array_create(Type *elem_type, size_t size); // creates fixed-size [N]T
 Type *type_struct_create(const char *name);
 Type *type_union_create(const char *name);
