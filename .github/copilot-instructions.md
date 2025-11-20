@@ -76,6 +76,7 @@ fin stmt;                 // deferred statement (block-scoped)
 ## Module system
 - Modules map 1:1 with `.mach` files under `[project].src` in `mach.toml`
 - Module path follows directory structure: `src/driver/pipeline.mach` → `project.driver.pipeline`
+- Symbols included from other modules via `use` are accessible without qualification. Alias can be provided to "namespace" the import.
 - Dependencies declared in `mach.toml` under `[deps.name]` with `source` and `version`
 
 ## Entry point convention
