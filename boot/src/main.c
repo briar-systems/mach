@@ -1,43 +1,46 @@
-// small dispatcher for commands; implementation is in src/commands.c
-#include "commands.h"
 #include <stdio.h>
 #include <string.h>
+
+#include "commands/cmd_build.h"
+#include "commands/cmd_dep.h"
+#include "commands/cmd_help.h"
+#include "commands/cmd_init.h"
+#include "commands/cmd_run.h"
 
 int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        mach_print_usage(argv[0]);
+        cmd_help_general();
         return 1;
     }
 
     const char *command = argv[1];
 
-    if (strcmp(command, "help") == 0)
+    if (strcmp(command, "init") == 0)
     {
-        mach_print_usage(argv[0]);
-        return 0;
+        return cmd_init_handle(argc, argv);
     }
     else if (strcmp(command, "build") == 0)
     {
-        return mach_cmd_build(argc, argv);
-    }
-    else if (strcmp(command, "init") == 0)
-    {
-        return mach_cmd_init(argc, argv);
+        return cmd_build_handle(argc, argv);
     }
     else if (strcmp(command, "run") == 0)
     {
-        return mach_cmd_run(argc, argv);
+        return cmd_run_handle(argc, argv);
     }
     else if (strcmp(command, "dep") == 0)
     {
-        return mach_cmd_dep(argc, argv);
+        return cmd_dep_handle(argc, argv);
+    }
+    else if (strcmp(command, "help") == 0)
+    {
+        return cmd_help_handle(argc, argv);
     }
     else
     {
         fprintf(stderr, "error: unknown command '%s'\n", command);
-        mach_print_usage(argv[0]);
+        cmd_help_general();
         return 1;
     }
 }
