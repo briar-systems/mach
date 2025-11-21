@@ -3167,7 +3167,8 @@ static Type *analyze_lit_expr_with_hint(SemanticDriver *driver, const AnalysisCo
         expr->type = type_u8();
         return expr->type;
     case TOKEN_LIT_STRING:
-        expr->type = type_str();
+        // String literals are *u8 (null-terminated)
+        expr->type = type_pointer_create(type_u8(), false);
         return expr->type;
     default:
         return NULL;
@@ -4467,7 +4468,7 @@ static Type *analyze_field_expr(SemanticDriver *driver, const AnalysisContext *c
 
     object_type = type_resolve_alias(object_type);
 
-    if (object_type->kind != TYPE_STRUCT && object_type->kind != TYPE_UNION && object_type->kind != TYPE_STR)
+    if (object_type->kind != TYPE_STRUCT && object_type->kind != TYPE_UNION)
     {
         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "member access on non-composite type");
         return NULL;
@@ -4824,7 +4825,7 @@ static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const Analy
                     diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "out of memory allocating string constant");
                     return NULL;
                 }
-                expr->type = type_str();
+                expr->type = type_pointer_create(type_u8(), false);
             }
             else
             {
@@ -4879,7 +4880,7 @@ static Type *analyze_comptime_expr_with_hint(SemanticDriver *driver, const Analy
                         diagnostic_emit(&driver->diagnostics, DIAG_ERROR, expr, ctx->file_path, "out of memory allocating string constant");
                         return NULL;
                     }
-                    expr->type = type_str();
+                    expr->type = type_pointer_create(type_u8(), false);
                 }
                 else
                 {
@@ -5764,7 +5765,7 @@ static bool evaluate_comptime_expr_bool(SemanticDriver *driver, const AnalysisCo
     return false;
 }
 
-static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value)
+__attribute__((unused)) static bool evaluate_comptime_expr_int(SemanticDriver *driver, const AnalysisContext *ctx, AstNode *expr, long long *out_value)
 {
     ComptimeValue val;
     if (!evaluate_comptime_value(driver, ctx, expr, &val))

@@ -1023,7 +1023,8 @@ static bool compile_module_to_object(ModuleManager *manager, Module *module, con
     ctx.debug_info   = debug_info;
     ctx.source_file  = module->file_path;
     ctx.source_lexer = NULL;
-    ctx.spec_cache   = spec_cache; // pass cache to codegen for generating specialized functions
+    // spec_cache removed - will be reintroduced with MIR implementation
+    (void)spec_cache;
 
     Lexer *debug_lexer_ptr = NULL;
     Lexer  debug_lexer;
@@ -1080,7 +1081,8 @@ static bool compile_module_to_object(ModuleManager *manager, Module *module, con
                         fs_ensure_dir_recursive(ir_parent);
                         free(ir_parent);
                     }
-                    codegen_emit_llvm_ir(&ctx, ir_path);
+                    // IR emission not yet implemented (MIR will replace this)
+                    (void)ir_path;
                     free(ir_path);
                 }
                 free(parent);
@@ -1104,7 +1106,8 @@ static bool compile_module_to_object(ModuleManager *manager, Module *module, con
                         fs_ensure_dir_recursive(asm_parent);
                         free(asm_parent);
                     }
-                    codegen_emit_assembly(&ctx, asm_path);
+                    // Assembly emission not yet implemented (MIR will replace this)
+                    (void)asm_path;
                     free(asm_path);
                 }
                 free(parent);

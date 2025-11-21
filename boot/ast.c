@@ -235,10 +235,6 @@ void ast_node_dnit(AstNode *node)
     case AST_STMT_BRK:
     case AST_STMT_CNT:
         break;
-    case AST_STMT_ASM:
-        free(node->asm_stmt.code);
-        free(node->asm_stmt.constraints);
-        break;
 
     case AST_COMPTIME:
         if (node->comptime.inner)
@@ -635,11 +631,6 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->expr_stmt.expr = ast_clone_checked(node->expr_stmt.expr);
         break;
 
-    case AST_STMT_ASM:
-        clone->asm_stmt.code        = ast_strdup(node->asm_stmt.code);
-        clone->asm_stmt.constraints = ast_strdup(node->asm_stmt.constraints);
-        break;
-
     case AST_COMPTIME:
         clone->comptime.inner = ast_clone_checked(node->comptime.inner);
         break;
@@ -900,9 +891,6 @@ void ast_print(AstNode *node, int indent)
         {
             ast_print(node->rec_stmt.fields->items[i], indent + 1);
         }
-        break;
-    case AST_STMT_ASM:
-        printf("ASM %s\n", node->asm_stmt.code ? node->asm_stmt.code : "");
         break;
 
     case AST_COMPTIME:
@@ -1222,8 +1210,6 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "BLOCK";
     case AST_STMT_EXPR:
         return "EXPR_STMT";
-    case AST_STMT_ASM:
-        return "ASM";
     case AST_COMPTIME:
         return "COMPTIME";
     case AST_STMT_RET:
@@ -1429,9 +1415,6 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
     case AST_STMT_EXPR:
         fprintf(file, "EXPR_STMT\n");
         ast_print_to_file(node->expr_stmt.expr, file, indent + 1);
-        break;
-    case AST_STMT_ASM:
-        fprintf(file, "ASM %s\n", node->asm_stmt.code ? node->asm_stmt.code : "");
         break;
 
     case AST_COMPTIME:

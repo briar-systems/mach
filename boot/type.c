@@ -7,7 +7,7 @@
 #include <string.h>
 
 // builtin types storage
-static Type *g_builtin_types[TYPE_STR + 1] = {0};
+static Type *g_builtin_types[TYPE_PTR + 1] = {0};
 static Type *g_error_type                  = NULL;
 
 typedef struct PointerCacheEntry
@@ -62,7 +62,6 @@ static struct
     {TYPE_F32, 4, 4, "f32"},
     {TYPE_F64, 8, 8, "f64"},
     {TYPE_PTR, 8, 8, "ptr"},
-    {TYPE_STR, 0, 8, "str"},
 };
 
 void type_system_init(void)
@@ -84,43 +83,6 @@ void type_system_init(void)
         type->generic_origin = NULL;
         type->type_args      = NULL;
         type->type_arg_count = 0;
-
-        if (type->kind == TYPE_STR)
-        {
-            Type  *data_type  = type_pointer_create(type_u8(), true); // str.data is read-only (&u8)
-            Type  *len_type   = type_pointer_uint();
-            size_t data_align = data_type ? data_type->alignment : sizeof(void *);
-            size_t data_size  = data_type ? data_type->size : sizeof(void *);
-            size_t len_align  = len_type ? len_type->alignment : sizeof(void *);
-            size_t len_size   = len_type ? len_type->size : sizeof(void *);
-
-            size_t offset      = 0;
-            size_t data_offset = type_align_to(offset, data_align);
-            offset             = data_offset + data_size;
-            size_t len_offset  = type_align_to(offset, len_align);
-            offset             = len_offset + len_size;
-            size_t max_align   = data_align > len_align ? data_align : len_align;
-
-            type->size      = offset;
-            type->alignment = max_align ? max_align : data_align;
-
-            Symbol *data_field = symbol_create(SYMBOL_FIELD, "data", data_type, NULL);
-            Symbol *len_field  = symbol_create(SYMBOL_FIELD, "len", len_type, NULL);
-
-            if (data_field)
-            {
-                data_field->field.offset = data_offset;
-                data_field->next         = len_field;
-            }
-            if (len_field)
-            {
-                len_field->field.offset = len_offset;
-                len_field->next         = NULL;
-            }
-
-            type->composite.fields      = data_field;
-            type->composite.field_count = (data_field ? 1 : 0) + (len_field ? 1 : 0);
-        }
 
         g_builtin_types[type->kind] = type;
     }
@@ -144,12 +106,6 @@ void type_system_dnit(void)
     {
         if (g_builtin_types[i])
         {
-            if (g_builtin_types[i]->kind == TYPE_STR && g_builtin_types[i]->composite.fields)
-            {
-                type_free_field_list(g_builtin_types[i]->composite.fields);
-                g_builtin_types[i]->composite.fields      = NULL;
-                g_builtin_types[i]->composite.field_count = 0;
-            }
             free(g_builtin_types[i]->name);
             free(g_builtin_types[i]);
             g_builtin_types[i] = NULL;
@@ -224,11 +180,6 @@ Type *type_ptr(void)
     return g_builtin_types[TYPE_PTR];
 }
 
-Type *type_str(void)
-{
-    return g_builtin_types[TYPE_STR];
-}
-
 Type *type_pointer_uint(void)
 {
     Type  *ptr_type = type_ptr();
@@ -250,6 +201,12 @@ Type *type_lookup_builtin(const char *name)
 {
     if (!name)
         return NULL;
+
+    // str is an alias for *u8 (null-terminated pointer)
+    if (strcmp(name, "str") == 0)
+    {
+        return type_pointer_create(type_u8(), false);
+    }
 
     for (size_t i = 0; i < sizeof(type_info_table) / sizeof(type_info_table[0]); i++)
     {
@@ -933,7 +890,6 @@ char *type_to_string(Type *type)
     case TYPE_F32:
     case TYPE_F64:
     case TYPE_PTR:
-    case TYPE_STR:
         snprintf(result, 256, "%s", type->name);
         break;
 

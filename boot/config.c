@@ -1,8 +1,6 @@
 #include "config.h"
 #include <errno.h>
-#include <llvm-c/Core.h>
-#include <llvm-c/Target.h>
-#include <llvm-c/TargetMachine.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -566,13 +564,36 @@ TargetConfig *config_get_default_target(ProjectConfig *config)
     return NULL;
 }
 
+static const char *get_native_triple(void)
+{
+    // simple platform detection based on compile-time macros
+#if defined(__x86_64__) || defined(_M_X64)
+    #if defined(__linux__)
+        return "x86_64-unknown-linux-gnu";
+    #elif defined(__APPLE__)
+        return "x86_64-apple-darwin";
+    #elif defined(_WIN32)
+        return "x86_64-pc-windows-msvc";
+    #endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    #if defined(__linux__)
+        return "aarch64-unknown-linux-gnu";
+    #elif defined(__APPLE__)
+        return "aarch64-apple-darwin";
+    #elif defined(_WIN32)
+        return "aarch64-pc-windows-msvc";
+    #endif
+#endif
+    return NULL;
+}
+
 TargetConfig *config_resolve_native_target(ProjectConfig *config)
 {
-    // Use LLVM to get the native host triple
-    char *native_triple = LLVMGetDefaultTargetTriple();
+    const char *native_triple = get_native_triple();
     if (!native_triple)
     {
         fprintf(stderr, "error: 'native' target requested but could not determine host triple\n");
+        fprintf(stderr, "error: unsupported architecture or platform\n");
         return NULL;
     }
 
@@ -582,27 +603,24 @@ TargetConfig *config_resolve_native_target(ProjectConfig *config)
         TargetConfig *target = config->targets[i];
         if (target->target_triple && strcmp(target->target_triple, native_triple) == 0)
         {
-            LLVMDisposeMessage(native_triple);
             return target;
         }
     }
 
-    // Try normalized triple match (LLVM normalizes triples)
+    // Try normalized triple match
     // Parse the native triple to extract arch-vendor-os
-    char *arch_start   = native_triple;
-    char *vendor_start = strchr(arch_start, '-');
+    const char *arch_start   = native_triple;
+    const char *vendor_start = strchr(arch_start, '-');
     if (!vendor_start)
     {
-        LLVMDisposeMessage(native_triple);
         fprintf(stderr, "error: 'native' target has malformed triple '%s'\n", native_triple);
         return NULL;
     }
     vendor_start++; // skip the dash
 
-    char *os_start = strchr(vendor_start, '-');
+    const char *os_start = strchr(vendor_start, '-');
     if (!os_start)
     {
-        LLVMDisposeMessage(native_triple);
         fprintf(stderr, "error: 'native' target has malformed triple '%s'\n", native_triple);
         return NULL;
     }
@@ -610,7 +628,6 @@ TargetConfig *config_resolve_native_target(ProjectConfig *config)
 
     // Extract components
     size_t arch_len = vendor_start - arch_start - 1;
-    // vendor component not used in matching (can vary between platforms)
 
     // Now try fuzzy matching on architecture and OS
     for (int i = 0; i < config->target_count; i++)
@@ -621,7 +638,7 @@ TargetConfig *config_resolve_native_target(ProjectConfig *config)
 
         // Check if arch and OS match (vendor can vary)
         const char *t        = target->target_triple;
-        char       *t_vendor = strchr(t, '-');
+        const char *t_vendor = strchr(t, '-');
         if (!t_vendor)
             continue;
 
@@ -630,7 +647,7 @@ TargetConfig *config_resolve_native_target(ProjectConfig *config)
             continue;
 
         t_vendor++; // skip dash
-        char *t_os = strchr(t_vendor, '-');
+        const char *t_os = strchr(t_vendor, '-');
         if (!t_os)
             continue;
         t_os++; // skip dash
@@ -638,7 +655,6 @@ TargetConfig *config_resolve_native_target(ProjectConfig *config)
         // Check if OS component matches (allow some flexibility)
         if (strncmp(os_start, t_os, strlen(t_os)) == 0 || strncmp(t_os, os_start, strlen(os_start)) == 0)
         {
-            LLVMDisposeMessage(native_triple);
             return target;
         }
     }
@@ -650,7 +666,6 @@ TargetConfig *config_resolve_native_target(ProjectConfig *config)
         fprintf(stderr, "  %s: %s\n", config->targets[i]->name, config->targets[i]->target_triple);
     }
 
-    LLVMDisposeMessage(native_triple);
     return NULL;
 }
 

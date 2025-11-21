@@ -81,8 +81,6 @@ char *token_kind_to_string(TokenKind kind)
         return "cnt";
     case TOKEN_KW_BRK:
         return "brk";
-    case TOKEN_KW_ASM:
-        return "asm";
     case TOKEN_KW_NIL:
         return "nil";
     case TOKEN_KW_FIN:
@@ -189,10 +187,6 @@ TokenKind token_kind_from_identifier(const char *text, int len)
         if (strncmp(text, "nil", 3) == 0)
         {
             return TOKEN_KW_NIL;
-        }
-        if (strncmp(text, "asm", 3) == 0)
-        {
-            return TOKEN_KW_ASM;
         }
         if (strncmp(text, "use", 3) == 0)
         {

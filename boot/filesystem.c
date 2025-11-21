@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+extern char *realpath(const char *restrict path, char *restrict resolved_path);
+#endif
+
 #ifdef _WIN32
 #include <direct.h>
 #include <io.h>

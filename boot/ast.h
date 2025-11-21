@@ -32,7 +32,6 @@ typedef enum AstKind
     AST_STMT_RET,
     AST_STMT_BLOCK,
     AST_STMT_EXPR,
-    AST_STMT_ASM,
 
     // compile-time constructs
     AST_COMPTIME,
@@ -190,13 +189,6 @@ struct AstNode
         {
             AstNode *expr;
         } expr_stmt;
-
-        // inline asm statement
-        struct
-        {
-            char *code;        // raw assembly text (single line for now)
-            char *constraints; // optional LLVM asm constraints/clobbers string
-        } asm_stmt;
 
         // compile-time construct (unified $ prefix handler)
         struct

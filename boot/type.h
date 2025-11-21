@@ -23,7 +23,6 @@ typedef enum TypeKind
     TYPE_F32,
     TYPE_F64,
     TYPE_PTR,     // generic pointer
-    TYPE_STR,     // builtin string literal type
     TYPE_POINTER, // typed pointer
     TYPE_ARRAY,
     TYPE_STRUCT,
@@ -102,7 +101,6 @@ Type *type_f16(void);
 Type *type_f32(void);
 Type *type_f64(void);
 Type *type_ptr(void);
-Type *type_str(void);
 Type *type_pointer_uint(void);
 Type *type_error(void);
 

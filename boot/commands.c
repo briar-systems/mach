@@ -2,13 +2,18 @@
 #include "compilation.h"
 #include "filesystem.h"
 
-#include <linux/limits.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+// realpath declaration for POSIX systems
+#ifndef _WIN32
+extern char *realpath(const char *restrict path, char *restrict resolved_path);
+#endif
 
 #ifdef _WIN32
 #include <windows.h>

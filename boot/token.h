@@ -31,7 +31,6 @@ typedef enum TokenKind
     TOKEN_KW_FOR, // for
     TOKEN_KW_CNT, // cnt
     TOKEN_KW_BRK, // brk
-    TOKEN_KW_ASM, // asm
     TOKEN_KW_NIL, // nil
     TOKEN_KW_FIN, // fin
 

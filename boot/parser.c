@@ -10,7 +10,6 @@ static AstList  *parser_alloc_list(Parser *parser);
 static AstNode  *parser_parse_directive(Parser *parser, bool allow_top_level);
 static AstNode  *parser_parse_comptime_if_top(Parser *parser);
 static AstNode  *parser_parse_top_level_block(Parser *parser);
-static AstNode  *parser_parse_stmt_asm(Parser *parser);
 static TokenKind parser_peek_next_kind(Parser *parser);
 static bool      parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind);
 static AstNode  *parser_expr_to_type(Parser *parser, AstNode *expr, AstList *generic_args);
@@ -538,7 +537,6 @@ void parser_synchronize(Parser *parser)
         case TOKEN_KW_VAL:
         case TOKEN_KW_VAR:
         case TOKEN_KW_FUN:
-        case TOKEN_KW_ASM:
         case TOKEN_DOLLAR:
             return;
         default:
@@ -1051,15 +1049,6 @@ AstNode *parser_parse_stmt_top(Parser *parser)
     case TOKEN_KW_UNI:
         result = parser_parse_stmt_uni(parser, is_public);
         break;
-    case TOKEN_KW_ASM:
-        if (is_public)
-        {
-            parser_error_at_current(parser, "'pub' cannot be applied to asm blocks");
-            parser_synchronize(parser);
-            return NULL;
-        }
-        result = parser_parse_stmt_asm(parser);
-        break;
     case TOKEN_DOLLAR:
         if (is_public)
         {
@@ -1103,8 +1092,6 @@ AstNode *parser_parse_stmt(Parser *parser)
         return parser_parse_stmt_ret(parser);
     case TOKEN_L_BRACE:
         return parser_parse_stmt_block(parser);
-    case TOKEN_KW_ASM:
-        return parser_parse_stmt_asm(parser);
     case TOKEN_DOLLAR:
         return parser_parse_directive(parser, false);
     default:
@@ -2167,119 +2154,6 @@ AstNode *parser_parse_stmt_expr(Parser *parser)
         return NULL;
     }
 
-    return node;
-}
-
-static AstNode *parser_parse_stmt_asm(Parser *parser)
-{
-    if (!parser_consume(parser, TOKEN_KW_ASM, "expected 'asm' keyword"))
-    {
-        return NULL;
-    }
-
-    Token *tok = parser->previous;
-
-    if (!parser_check(parser, TOKEN_L_BRACE))
-    {
-        parser_error_at_current(parser, "expected '{' after 'asm'");
-        return NULL;
-    }
-
-    Token      *open_token = parser->current;
-    const char *source     = parser->lexer->source;
-    int         source_len = (int)strlen(source);
-    int         start_pos  = open_token->pos + open_token->len;
-    int         pos        = start_pos;
-    int         depth      = 1;
-
-    while (pos < source_len && depth > 0)
-    {
-        char c = source[pos];
-        if (c == '{')
-        {
-            depth++;
-        }
-        else if (c == '}')
-        {
-            depth--;
-        }
-        pos++;
-    }
-
-    if (depth != 0)
-    {
-        parser_error(parser, open_token, "unterminated asm block");
-        return NULL;
-    }
-
-    int close_pos = pos - 1;
-    if (close_pos < start_pos)
-    {
-        close_pos = start_pos;
-    }
-
-    int   code_len = close_pos - start_pos;
-    char *code     = calloc((size_t)code_len + 1, 1);
-    if (!code)
-    {
-        parser_error(parser, tok, "memory allocation failed for asm block");
-        return NULL;
-    }
-
-    if (code_len > 0)
-    {
-        memcpy(code, source + start_pos, (size_t)code_len);
-    }
-    code[code_len] = '\0';
-
-    while (code_len > 0 && (code[0] == '\n' || code[0] == '\r'))
-    {
-        memmove(code, code + 1, (size_t)code_len);
-        code_len--;
-        code[code_len] = '\0';
-    }
-
-    while (code_len > 0)
-    {
-        char tail = code[code_len - 1];
-        if (tail == ' ' || tail == '\t' || tail == '\n' || tail == '\r')
-        {
-            code[code_len - 1] = '\0';
-            code_len--;
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    int next_pos = pos;
-    while (next_pos < source_len && isspace((unsigned char)source[next_pos]))
-    {
-        next_pos++;
-    }
-
-    if (next_pos < source_len && source[next_pos] == ';')
-    {
-        next_pos++;
-        while (next_pos < source_len && isspace((unsigned char)source[next_pos]))
-        {
-            next_pos++;
-        }
-    }
-
-    parser->lexer->pos = next_pos;
-    parser_advance(parser);
-
-    AstNode *node = parser_alloc_node(parser, AST_STMT_ASM, tok);
-    if (!node)
-    {
-        free(code);
-        return NULL;
-    }
-
-    node->asm_stmt.code        = code;
-    node->asm_stmt.constraints = NULL;
     return node;
 }
 

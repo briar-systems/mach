@@ -8,6 +8,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <unistd.h>
+extern char *realpath(const char *restrict path, char *restrict resolved_path);
 #endif
 
 #ifdef _WIN32
@@ -359,7 +360,6 @@ bool compilation_codegen(CompilationContext *ctx)
     ctx->codegen.debug_info   = ctx->options->debug_info;
     ctx->codegen.source_file  = ctx->options->input_file;
     ctx->codegen.source_lexer = &ctx->lexer;
-    ctx->codegen.spec_cache   = &ctx->driver->spec_cache;
 
     if (ctx->codegen.debug_info)
     {
@@ -549,10 +549,8 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
             free(dir);
         }
 
-        if (!codegen_emit_llvm_ir(&ctx->codegen, ir_path))
-        {
-            fprintf(stderr, "error: failed to emit llvm ir '%s'\n", ir_path);
-        }
+        // IR emission not yet implemented (MIR will replace this)
+        fprintf(stderr, "warning: IR emission not yet implemented, skipping '%s'\n", ir_path);
         free(auto_ir);
     }
 
@@ -621,10 +619,8 @@ bool compilation_emit_artifacts(CompilationContext *ctx)
             free(dir);
         }
 
-        if (!codegen_emit_assembly(&ctx->codegen, asm_path))
-        {
-            fprintf(stderr, "error: failed to emit assembly '%s'\n", asm_path);
-        }
+        // Assembly emission not yet implemented (MIR will replace this)
+        fprintf(stderr, "warning: assembly emission not yet implemented, skipping '%s'\n", asm_path);
         free(auto_asm);
     }
 
