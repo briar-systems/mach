@@ -13,12 +13,8 @@
 
 # compiler and flags
 CC := clang
-CFLAGS := -std=c23 -Wall -Wextra -Werror -pedantic -O2
-CFLAGS_DEBUG := -std=c23 -Wall -Wextra -Werror -pedantic -g -O0 -DDEBUG
-
-# llvm configuration
-LLVM_CFLAGS := $(shell llvm-config --cflags)
-LLVM_LDFLAGS := $(shell llvm-config --ldflags --libs core)
+CFLAGS := -std=c23 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pedantic -O2
+CFLAGS_DEBUG := -std=c23 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pedantic -g -O0 -DDEBUG
 
 OUT_DIR := out
 BIN_DIR := $(OUT_DIR)/bin
@@ -37,9 +33,9 @@ IMACH := $(BIN_DIR)/imach
 MACH := $(BIN_DIR)/mach
 
 # bootstrap compiler sources
-BOOT_SOURCES := $(wildcard $(BOOT_DIR)/*.c)
+BOOT_SOURCES := $(shell find $(BOOT_DIR) -type f -name '*.c')
 BOOT_OBJECTS := $(BOOT_SOURCES:$(BOOT_DIR)/%.c=$(CMACH_OBJ_DIR)/%.o)
-BOOT_HEADERS := $(wildcard $(BOOT_DIR)/*.h)
+BOOT_HEADERS := $(shell find $(BOOT_DIR) -type f -name '*.h')
 
 # main targets
 .PHONY: help cmach-clean cmach-build cmach imach-clean imach-build imach mach-clean mach-build mach full clean
@@ -122,12 +118,13 @@ $(CMACH_OBJ_DIR):
 
 $(CMACH_OBJ_DIR)/%.o: $(BOOT_DIR)/%.c $(BOOT_HEADERS) | $(CMACH_OBJ_DIR)
 	@echo "  cc  $<"
-	@$(CC) $(CFLAGS) $(LLVM_CFLAGS) -I$(BOOT_DIR) -c $< -o $@
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -I$(BOOT_DIR) -c $< -o $@
 
 # bootstrap compiler build
 $(CMACH): $(BOOT_OBJECTS) | $(BIN_DIR)
 	@echo "  ld  $@"
-	@$(CC) $(BOOT_OBJECTS) $(LLVM_LDFLAGS) -o $@
+	@$(CC) $(BOOT_OBJECTS) -o $@
 	@echo "bootstrap compiler ready: $@"
 
 # intermediary compiler build (using cmach)
