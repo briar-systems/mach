@@ -25,6 +25,8 @@ MACH_SRC_DIR := src
 
 # bootstrap compiler
 BOOT_DIR := boot
+BOOT_SRC_DIR := $(BOOT_DIR)/src
+BOOT_INC_DIR := $(BOOT_DIR)/include
 CMACH_OBJ_DIR := $(OUT_DIR)/cmach/obj
 
 # final executables
@@ -33,9 +35,9 @@ IMACH := $(BIN_DIR)/imach
 MACH := $(BIN_DIR)/mach
 
 # bootstrap compiler sources
-BOOT_SOURCES := $(shell find $(BOOT_DIR) -type f -name '*.c')
-BOOT_OBJECTS := $(BOOT_SOURCES:$(BOOT_DIR)/%.c=$(CMACH_OBJ_DIR)/%.o)
-BOOT_HEADERS := $(shell find $(BOOT_DIR) -type f -name '*.h')
+BOOT_SOURCES := $(shell find $(BOOT_SRC_DIR) -type f -name '*.c')
+BOOT_OBJECTS := $(BOOT_SOURCES:$(BOOT_SRC_DIR)/%.c=$(CMACH_OBJ_DIR)/%.o)
+BOOT_HEADERS := $(shell find $(BOOT_INC_DIR) -type f -name '*.h')
 
 # main targets
 .PHONY: help cmach-clean cmach-build cmach imach-clean imach-build imach mach-clean mach-build mach full clean
@@ -116,10 +118,10 @@ $(BIN_DIR):
 $(CMACH_OBJ_DIR):
 	@mkdir -p $(CMACH_OBJ_DIR)
 
-$(CMACH_OBJ_DIR)/%.o: $(BOOT_DIR)/%.c $(BOOT_HEADERS) | $(CMACH_OBJ_DIR)
+$(CMACH_OBJ_DIR)/%.o: $(BOOT_SRC_DIR)/%.c $(BOOT_HEADERS) | $(CMACH_OBJ_DIR)
 	@echo "  cc  $<"
 	@mkdir -p $(dir $@)
-	@$(CC) $(CFLAGS) -I$(BOOT_DIR) -c $< -o $@
+	@$(CC) $(CFLAGS) -I$(BOOT_INC_DIR) -c $< -o $@
 
 # bootstrap compiler build
 $(CMACH): $(BOOT_OBJECTS) | $(BIN_DIR)
