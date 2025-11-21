@@ -3,131 +3,145 @@
 
 #include <stdbool.h>
 
+// target modes
+typedef enum
+{
+    TARGET_MODE_EXECUTABLE,
+    TARGET_MODE_LIBRARY,
+    TARGET_MODE_SHARED
+} TargetModeKind;
+
+typedef struct TargetMode
+{
+    TargetModeKind kind;
+    const char    *value;
+} TargetMode;
+
+static const TargetMode TARGET_MODES[] = {{TARGET_MODE_EXECUTABLE, "executable"}, {TARGET_MODE_LIBRARY, "library"}, {TARGET_MODE_SHARED, "shared"}};
+
+// target platforms
+typedef enum
+{
+    TARGET_PLATFORM_LINUX,
+} TargetPlatformKind;
+
+typedef struct TargetPlatform
+{
+    TargetPlatformKind kind;
+    const char        *value;
+} TargetPlatform;
+
+static const TargetPlatform TARGET_PLATFORMS[] = {
+    {TARGET_PLATFORM_LINUX, "linux"},
+};
+
+// target architectures
+typedef enum
+{
+    TARGET_ARCH_X86_64,
+} TargetArchKind;
+
+typedef struct TargetArch
+{
+    TargetArchKind kind;
+    const char    *value;
+} TargetArch;
+
+static const TargetArch TARGET_ARCHS[] = {
+    {TARGET_ARCH_X86_64, "x86_64"},
+};
+
+// dependency types
+typedef enum
+{
+    DEP_TYPE_REMOTE,
+    DEP_TYPE_LOCAL
+} DepTypeKind;
+
+typedef struct DepType
+{
+    DepTypeKind kind;
+    const char *value;
+} DepType;
+
+static const DepType DEP_TYPES[] = {
+    {DEP_TYPE_REMOTE, "remote"},
+    {DEP_TYPE_LOCAL, "local"},
+};
+
+// dependency version kinds
+typedef enum
+{
+    DEP_VERSION_KIND_BRANCH,
+    DEP_VERSION_KIND_SEMVER,
+    DEP_VERSION_KIND_COMMIT
+} DepVersionKind;
+
+typedef struct DepVersion
+{
+    DepVersionKind kind;
+    const char    *value;
+} DepVersion;
+
 // target-specific configuration
 typedef struct TargetConfig
 {
-    char *name;          // target name (e.g., "linux", "macos", "windows")
-    char *target_triple; // target architecture triple
-    char *entrypoint;    // main source file for this target (relative to src_dir)
-    char *artifacts_dir; // artifact output directory for this target (relative to project root)
-    char *output;        // final executable/library output path (relative to artifacts_dir/bin or absolute)
-    char *mode;          // build mode: executable|library|shared
-
-    // build options
-    bool emit_ast;    // emit AST files
-    bool emit_ir;     // emit LLVM IR
-    bool emit_asm;    // emit assembly
-    bool emit_object; // emit object files
-    bool debug;       // emit debug info for this target
-    bool optimize;    // enable optimizations for this target
-    bool no_pie;      // disable PIE
-
-    // linking options
-    char **link_libraries; // libraries to link (paths to .a, .so, .dylib, etc.)
-    int    link_lib_count; // number of libraries to link
+    char           *name;       // target name
+    TargetPlatform *platform;   // target platform/os
+    TargetArch     *arch;       // target architecture
+    TargetMode     *mode;       // build mode: executable|library
+    char           *entrypoint; // main source file (relative to src_dir)
+    char           *artifacts;  // artifacts directory (relative to out_dir)
+    char           *binary;     // output binary path (relative to out_dir)
 } TargetConfig;
 
 // explicit dependency specification (parsed from [deps] tables)
 typedef struct DepSpec
 {
-    char *name;    // dependency/package key (also becomes module alias)
-    char *type;    // dependency source classification: remote|local
-    char *path;    // remote URL or local filesystem path (used by dep tooling)
-    char *version; // optional version selector (required for remote)
+    char       *name;    // dependency name
+    DepType    *type;    // dependency type: remote|local
+    char       *path;    // remote URL or local filesystem path (used by dep tooling)
+    DepVersion *version; // version specifier (for remote deps): branch/semver/commit
 } DepSpec;
 
 // project configuration
 typedef struct ProjectConfig
 {
-    char *id;        // project id (used for module prefix and soft uniqueness)
-    char *name;      // project name (canonical, human-readable)
-    char *version;   // project version
-    char *main_file; // main source file (relative to src_dir) - deprecated, use target entrypoint
-    char *target;    // target name (or "native" to auto-detect, or "all")
+    char *id;      // project id (used for module prefix and soft uniqueness)
+    char *name;    // project name (canonical, human-readable)
+    char *version; // project version
+    char *dir_src; // source files directory
+    char *dir_out; // output files directory
+    char *dir_dep; // dependencies directory
+    char *target;  // target name (or "native" to auto-detect)
 
-    // project directory structure
-    char *src_dir; // source files directory
-    char *dep_dir; // dependencies directory
+    TargetConfig **targets;
+    int            target_count;
 
-    // targets (per-target out_dir: targets[i].out_dir)
-    TargetConfig **targets;      // array of target configurations
-    int            target_count; // number of targets
-
-    // dependencies (also serve as module aliases)
-    DepSpec **deps;      // dependency specs
-    int       dep_count; // number of deps
+    DepSpec **deps;
+    int       dep_count;
 } ProjectConfig;
 
-// configuration file management
-ProjectConfig *config_load(const char *config_path);
-ProjectConfig *config_load_from_dir(const char *dir_path);
-bool           config_save(ProjectConfig *config, const char *config_path);
-ProjectConfig *config_create_default(const char *project_name);
+// target management
+void target_config_init(TargetConfig *target);
+void target_config_dnit(TargetConfig *target);
+
+// dependency management
+void dep_spec_init(DepSpec *dep);
+void dep_spec_dnit(DepSpec *dep);
 
 // configuration lifecycle
 void config_init(ProjectConfig *config);
 void config_dnit(ProjectConfig *config);
 
-// target management
-TargetConfig *target_config_create(const char *name, const char *target_triple);
-void          target_config_init(TargetConfig *target);
-void          target_config_dnit(TargetConfig *target);
+// configuration file management
+ProjectConfig *config_load(const char *config_path);
+bool           config_save(ProjectConfig *config, const char *config_path);
+
 bool          config_add_target(ProjectConfig *config, const char *name, const char *target_triple);
 TargetConfig *config_get_target(ProjectConfig *config, const char *name);
-TargetConfig *config_get_target_by_triple(ProjectConfig *config, const char *target_triple);
-TargetConfig *config_get_default_target(ProjectConfig *config);
-TargetConfig *config_resolve_native_target(ProjectConfig *config);
-char        **config_get_target_names(ProjectConfig *config);
-bool          config_is_build_all_targets(ProjectConfig *config);
-
-// configuration queries (target-specific)
-bool config_has_main_file(ProjectConfig *config);
-bool config_should_emit_ast(ProjectConfig *config, const char *target_name);
-bool config_should_emit_ir(ProjectConfig *config, const char *target_name);
-bool config_should_emit_asm(ProjectConfig *config, const char *target_name);
-bool config_should_emit_object(ProjectConfig *config, const char *target_name);
-bool config_should_build_library(ProjectConfig *config, const char *target_name);
-bool config_should_link_executable(ProjectConfig *config, const char *target_name);
-// library type queries
-bool config_is_shared_library(ProjectConfig *config, const char *target_name);
-// derive default output names
-char *config_default_executable_name(ProjectConfig *config);
-char *config_default_library_name(ProjectConfig *config, bool shared);
-
-// path resolution (target-specific)
-char *config_resolve_main_file(ProjectConfig *config, const char *project_dir); // deprecated
-char *config_resolve_target_entrypoint(ProjectConfig *config, const char *project_dir, const char *target_name);
-char *config_resolve_src_dir(ProjectConfig *config, const char *project_dir);
-char *config_resolve_dep_dir(ProjectConfig *config, const char *project_dir);
-char *config_resolve_artifacts_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
-char *config_resolve_bin_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
-char *config_resolve_obj_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
-char *config_resolve_asm_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
-char *config_resolve_ir_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
-char *config_resolve_ast_dir(ProjectConfig *config, const char *project_dir, const char *target_name);
-char *config_resolve_final_output_path(ProjectConfig *config, const char *project_dir, const char *target_name);
-
-// dependency management
-DepSpec *config_get_dep(ProjectConfig *config, const char *name);
-bool     config_has_dep(ProjectConfig *config, const char *name);
-// resolve package root directory (root project or dependency). returns malloc'd string
-char *config_resolve_package_root(ProjectConfig *config, const char *project_dir, const char *package_name);
-// get package src dir (may load dependency mach.toml lazily)
-char *config_get_package_src_dir(ProjectConfig *config, const char *project_dir, const char *package_name);
-// load dependency config to fill missing src_dir if needed
-bool config_ensure_dep_loaded(ProjectConfig *config, const char *project_dir, DepSpec *dep);
-
-// module path expansion (deps serve as aliases automatically)
-char *config_expand_module_path(ProjectConfig *config, const char *module_path);
-
-// canonical module resolution: given FQN pkg.segment1.segment2 -> absolute file path (.mach)
-char *config_resolve_module_fqn(ProjectConfig *config, const char *project_dir, const char *fqn);
-
-// directory management
-bool config_ensure_directories(ProjectConfig *config, const char *project_dir);
-
-// configuration validation
-bool config_validate(ProjectConfig *config);
-bool config_validate_dep_structure(ProjectConfig *config, const char *project_dir);
+bool          config_add_dependency(ProjectConfig *config, DepSpec *dep);
+DepSpec      *config_get_dependency(ProjectConfig *config, const char *name);
+bool          config_del_dependency(ProjectConfig *config, const char *name);
 
 #endif
