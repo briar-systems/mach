@@ -1,11 +1,13 @@
-#include "backend.h"
-#include "codegen.h"
+#include "backend/backend.h"
+#include "backend/codegen.h"
 #include <stdio.h>
 
-bool backend_emit_with_target(const BackendTarget *target, MirModule *module, const char *output_path)
+bool backend_emit_with_target(const Target *target, MirModule *module, const char *output_path)
 {
     if (!target || !module || !output_path || !target->isa || !target->writer)
+    {
         return false;
+    }
 
     BackendCodegenResult result;
     backend_codegen_result_init(&result);
@@ -15,7 +17,9 @@ bool backend_emit_with_target(const BackendTarget *target, MirModule *module, co
     {
         ok = target->writer->write_executable(target, &result, output_path);
         if (!ok)
+        {
             fprintf(stderr, "backend: object writer failed for target\n");
+        }
     }
     else
     {
@@ -28,8 +32,10 @@ bool backend_emit_with_target(const BackendTarget *target, MirModule *module, co
 
 bool backend_emit_executable(TargetDescriptor desc, MirModule *module, const char *output_path)
 {
-    const BackendTarget *target = backend_target_lookup(desc);
+    const Target *target = target_lookup(desc);
     if (!target)
+    {
         return false;
+    }
     return backend_emit_with_target(target, module, output_path);
 }

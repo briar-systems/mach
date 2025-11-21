@@ -1,9 +1,9 @@
-#include "x86_64.h"
-#include "../../mir.h"
-#include "../codegen.h"
-#include "../codebuf.h"
-#include "../object/elf64.h"
-#include "../reloc.h"
+#include "backend/isa/x86_64.h"
+#include "mir/mir.h"
+#include "backend/codegen.h"
+#include "backend/codebuf.h"
+#include "backend/object/elf64.h"
+#include "backend/reloc.h"
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -19,7 +19,7 @@ typedef struct X86FunctionFrame
 
 typedef struct X86Emitter
 {
-    const BackendTarget   *target;
+    const Target   *target;
     MirModule             *module;
     BackendCodegenResult  *result;
     MirPhysicalReg        *vreg_map;
@@ -28,7 +28,7 @@ typedef struct X86Emitter
     bool                   in_function;
 } X86Emitter;
 
-static bool x86_lower(const BackendTarget *target, MirModule *module, BackendCodegenResult *result);
+static bool x86_lower(const Target *target, MirModule *module, BackendCodegenResult *result);
 
 #define SCRATCH_REG MIR_PREG_R11
 #define SHIFT_REG   MIR_PREG_RCX
@@ -847,7 +847,7 @@ static bool emit_block(X86Emitter *ctx, MirBasicBlock *block)
     return true;
 }
 
-static bool x86_lower(const BackendTarget *target, MirModule *module, BackendCodegenResult *result)
+static bool x86_lower(const Target *target, MirModule *module, BackendCodegenResult *result)
 {
     X86Emitter ctx = {
         .target = target,
@@ -883,7 +883,7 @@ bool backend_register_target_x86_64_linux(void)
     static TargetISA isa = { .lower = x86_lower };
     static TargetABI abi = { .name = "sysv64" };
     static RuntimeShim runtime = { .entry_label = "_start" };
-    static BackendTarget target;
+    static Target target;
     static bool registered = false;
 
     if (registered)
@@ -896,6 +896,6 @@ bool backend_register_target_x86_64_linux(void)
     target.writer = backend_object_writer_elf64();
     target.runtime = &runtime;
 
-    registered = backend_target_register(&target);
+    registered = target_register(&target);
     return registered;
 }

@@ -1,4 +1,4 @@
-#include "codegen.h"
+#include "backend/codegen.h"
 
 void backend_codegen_result_init(BackendCodegenResult *result)
 {
@@ -17,7 +17,9 @@ void backend_codegen_result_init(BackendCodegenResult *result)
 void backend_codegen_result_destroy(BackendCodegenResult *result)
 {
     if (!result)
+    {
         return;
+    }
 
     codebuf_free(&result->text.buffer);
     codebuf_free(&result->rodata.buffer);

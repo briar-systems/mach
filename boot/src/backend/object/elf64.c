@@ -1,6 +1,6 @@
-#include "elf64.h"
-#include "../codegen.h"
-#include "../reloc.h"
+#include "backend/object/elf64.h"
+#include "backend/codegen.h"
+#include "backend/reloc.h"
 #include <elf.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +9,9 @@
 static size_t align_up(size_t value, size_t alignment)
 {
     if (alignment == 0)
+    {
         return value;
+    }
     size_t mask = alignment - 1;
     return (value + mask) & ~mask;
 }
@@ -32,19 +34,20 @@ static CodeBuffer *get_buffer(BackendCodegenResult *result, BackendSectionKind k
 static const BackendLabel *find_label(const BackendCodegenResult *result, const char *name)
 {
     if (!name)
+    {
         return NULL;
+    }
     for (size_t i = 0; i < result->labels.count; i++)
     {
         if (strcmp(result->labels.items[i].name, name) == 0)
+        {
             return &result->labels.items[i];
+        }
     }
     return NULL;
 }
 
-static size_t section_base_vaddr(BackendSectionKind kind,
-                                 size_t text_vaddr,
-                                 size_t rodata_vaddr,
-                                 size_t data_vaddr)
+static size_t section_base_vaddr(BackendSectionKind kind, size_t text_vaddr, size_t rodata_vaddr, size_t data_vaddr)
 {
     switch (kind)
     {
@@ -59,21 +62,22 @@ static size_t section_base_vaddr(BackendSectionKind kind,
     }
 }
 
-static bool apply_relocations(BackendCodegenResult *result,
-                              size_t text_vaddr,
-                              size_t rodata_vaddr,
-                              size_t data_vaddr)
+static bool apply_relocations(BackendCodegenResult *result, size_t text_vaddr, size_t rodata_vaddr, size_t data_vaddr)
 {
     for (size_t i = 0; i < result->relocs.count; i++)
     {
         BackendReloc *reloc = &result->relocs.items[i];
         CodeBuffer   *buf   = get_buffer(result, reloc->section);
         if (!buf)
+        {
             return false;
+        }
 
         const BackendLabel *label = find_label(result, reloc->symbol);
         if (!label)
+        {
             return false;
+        }
 
         size_t symbol_addr = section_base_vaddr(label->section, text_vaddr, rodata_vaddr, data_vaddr) + label->offset;
         size_t place_addr  = section_base_vaddr(reloc->section, text_vaddr, rodata_vaddr, data_vaddr) + reloc->offset;
@@ -83,8 +87,10 @@ static bool apply_relocations(BackendCodegenResult *result,
         case BACKEND_RELOC_X86_64_PC32:
         {
             if (reloc->offset + 4 > buf->size)
+            {
                 return false;
-            int64_t value = (int64_t)symbol_addr + reloc->addend - (int64_t)place_addr;
+            }
+            int64_t value                = (int64_t)symbol_addr + reloc->addend - (int64_t)place_addr;
             buf->data[reloc->offset + 0] = (uint8_t)(value & 0xFF);
             buf->data[reloc->offset + 1] = (uint8_t)((value >> 8) & 0xFF);
             buf->data[reloc->offset + 2] = (uint8_t)((value >> 16) & 0xFF);
@@ -94,7 +100,9 @@ static bool apply_relocations(BackendCodegenResult *result,
         case BACKEND_RELOC_ABSOLUTE64:
         {
             if (reloc->offset + 8 > buf->size)
+            {
                 return false;
+            }
             int64_t value = (int64_t)symbol_addr + reloc->addend;
             for (int byte = 0; byte < 8; byte++)
             {
@@ -118,15 +126,19 @@ typedef struct SectionBuilder
 static uint32_t shstrtab_add(CodeBuffer *buf, const char *name)
 {
     if (!name)
+    {
         name = "";
+    }
     uint32_t offset = (uint32_t)buf->size;
     for (const char *p = name; *p; ++p)
+    {
         codebuf_emit_byte(buf, (uint8_t)*p);
+    }
     codebuf_emit_byte(buf, 0);
     return offset;
 }
 
-static bool elf64_write_executable(const BackendTarget *target, BackendCodegenResult *result, const char *path)
+static bool elf64_write_executable(const Target *target, BackendCodegenResult *result, const char *path)
 {
     const size_t page_size  = 0x1000;
     const size_t image_base = 0x400000;
@@ -140,38 +152,52 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
 
     size_t rodata_offset = 0;
     if (rodata_size > 0)
+    {
         rodata_offset = align_up(text_end, page_size);
+    }
 
     size_t rodata_end = (rodata_size > 0) ? (rodata_offset + rodata_size) : text_end;
 
     size_t data_offset = 0;
     if (data_size > 0)
+    {
         data_offset = align_up(rodata_end, page_size);
+    }
 
     size_t text_vaddr   = image_base + code_offset;
     size_t rodata_vaddr = (rodata_size > 0) ? image_base + rodata_offset : 0;
     size_t data_vaddr   = (data_size > 0) ? image_base + data_offset : 0;
 
     // Entry point
-    const char *entry_label_name = target->runtime ? target->runtime->entry_label : NULL;
-    const BackendLabel *entry_label = find_label(result, entry_label_name ? entry_label_name : "_start");
+    const char         *entry_label_name = target->runtime ? target->runtime->entry_label : NULL;
+    const BackendLabel *entry_label      = find_label(result, entry_label_name ? entry_label_name : "_start");
     if (!entry_label || entry_label->section != BACKEND_SECTION_TEXT)
+    {
         return false;
+    }
 
     size_t entry_addr = text_vaddr + entry_label->offset;
 
     if (!apply_relocations(result, text_vaddr, rodata_vaddr, data_vaddr))
+    {
         return false;
+    }
 
     FILE *f = fopen(path, "wb");
     if (!f)
+    {
         return false;
+    }
 
     uint16_t phnum = 1;
     if (rodata_size > 0)
+    {
         phnum++;
+    }
     if (data_size > 0)
+    {
         phnum++;
+    }
 
     Elf64_Ehdr ehdr;
     memset(&ehdr, 0, sizeof(ehdr));
@@ -283,9 +309,18 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
     codebuf_emit_byte(&shstrtab, 0); // null entry
 
     size_t section_count = 1; // null
-    if (text_size > 0) section_count++;
-    if (rodata_size > 0) section_count++;
-    if (data_size > 0) section_count++;
+    if (text_size > 0)
+    {
+        section_count++;
+    }
+    if (rodata_size > 0)
+    {
+        section_count++;
+    }
+    if (data_size > 0)
+    {
+        section_count++;
+    }
     size_t shstr_index = section_count;
     section_count++;
 
@@ -300,7 +335,7 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
     size_t sec_idx = 1;
     if (text_size > 0)
     {
-        SectionBuilder *sec = &sections[sec_idx++];
+        SectionBuilder *sec    = &sections[sec_idx++];
         sec->shdr.sh_name      = shstrtab_add(&shstrtab, ".text");
         sec->shdr.sh_type      = SHT_PROGBITS;
         sec->shdr.sh_flags     = SHF_ALLOC | SHF_EXECINSTR;
@@ -311,7 +346,7 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
     }
     if (rodata_size > 0)
     {
-        SectionBuilder *sec = &sections[sec_idx++];
+        SectionBuilder *sec    = &sections[sec_idx++];
         sec->shdr.sh_name      = shstrtab_add(&shstrtab, ".rodata");
         sec->shdr.sh_type      = SHT_PROGBITS;
         sec->shdr.sh_flags     = SHF_ALLOC;
@@ -322,7 +357,7 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
     }
     if (data_size > 0)
     {
-        SectionBuilder *sec = &sections[sec_idx++];
+        SectionBuilder *sec    = &sections[sec_idx++];
         sec->shdr.sh_name      = shstrtab_add(&shstrtab, ".data");
         sec->shdr.sh_type      = SHT_PROGBITS;
         sec->shdr.sh_flags     = SHF_ALLOC | SHF_WRITE;
@@ -332,7 +367,7 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
         sec->shdr.sh_addralign = 16;
     }
 
-    SectionBuilder *shstr_sec = &sections[shstr_index];
+    SectionBuilder *shstr_sec    = &sections[shstr_index];
     shstr_sec->shdr.sh_name      = shstrtab_add(&shstrtab, ".shstrtab");
     shstr_sec->shdr.sh_type      = SHT_STRTAB;
     shstr_sec->shdr.sh_flags     = 0;

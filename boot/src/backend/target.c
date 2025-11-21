@@ -1,12 +1,12 @@
-#include "target.h"
+#include "backend/target.h"
 #include <stddef.h>
 
 #define MAX_BACKEND_TARGETS 16
 
-static const BackendTarget *g_targets[MAX_BACKEND_TARGETS];
+static const Target *g_targets[MAX_BACKEND_TARGETS];
 static size_t g_target_count = 0;
 
-bool backend_target_register(const BackendTarget *target)
+bool backend_target_register(const Target *target)
 {
     if (!target || !target->isa || !target->abi || !target->writer || !target->runtime)
         return false;
@@ -28,7 +28,7 @@ bool backend_target_register(const BackendTarget *target)
     return true;
 }
 
-const BackendTarget *backend_target_lookup(TargetDescriptor desc)
+const Target *backend_target_lookup(TargetDescriptor desc)
 {
     for (size_t i = 0; i < g_target_count; i++)
     {
