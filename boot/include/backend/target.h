@@ -4,13 +4,13 @@
 #include <stdbool.h>
 
 // forward declarations
-typedef struct MirModule MirModule;
+typedef struct MirModule            MirModule;
 typedef struct BackendCodegenResult BackendCodegenResult;
-struct BackendTarget;
+struct Target;
 
 typedef struct TargetISA
 {
-    bool (*lower)(const struct BackendTarget *target, MirModule *module, BackendCodegenResult *result);
+    bool (*lower)(const struct Target *target, MirModule *module, BackendCodegenResult *result);
 } TargetISA;
 
 typedef struct TargetABI
@@ -20,9 +20,7 @@ typedef struct TargetABI
 
 typedef struct ObjectWriter
 {
-    bool (*write_executable)(const struct BackendTarget *target,
-                             BackendCodegenResult          *result,
-                             const char                    *path);
+    bool (*write_executable)(const struct Target *target, BackendCodegenResult *result, const char *path);
 } ObjectWriter;
 
 typedef struct RuntimeShim
@@ -34,8 +32,6 @@ typedef struct RuntimeShim
 typedef enum TargetArch
 {
     TARGET_ARCH_X86_64,
-    TARGET_ARCH_AARCH64,
-    TARGET_ARCH_RISCV64,
     TARGET_ARCH_COUNT
 } TargetArch;
 
@@ -43,8 +39,6 @@ typedef enum TargetArch
 typedef enum TargetOS
 {
     TARGET_OS_LINUX,
-    TARGET_OS_MACOS,
-    TARGET_OS_WINDOWS,
     TARGET_OS_COUNT
 } TargetOS;
 
@@ -52,8 +46,6 @@ typedef enum TargetOS
 typedef enum TargetObjectFormat
 {
     TARGET_OBJ_ELF,
-    TARGET_OBJ_MACHO,
-    TARGET_OBJ_PE,
     TARGET_OBJ_COUNT
 } TargetObjectFormat;
 
@@ -65,20 +57,20 @@ typedef struct TargetDescriptor
 } TargetDescriptor;
 
 // fully described backend target
-typedef struct BackendTarget
+typedef struct Target
 {
-    TargetDescriptor    desc;
-    TargetObjectFormat  format;
+    TargetDescriptor   desc;
+    TargetObjectFormat format;
 
     const TargetISA    *isa;
     const TargetABI    *abi;
     const ObjectWriter *writer;
     const RuntimeShim  *runtime;
-} BackendTarget;
+} Target;
 
 // registry api
-const BackendTarget *backend_target_lookup(TargetDescriptor desc);
-bool backend_target_register(const BackendTarget *target);
+const Target *target_lookup(TargetDescriptor desc);
+bool          target_register(const Target *target);
 
 // helper for building descriptor
 static inline TargetDescriptor target_desc(TargetArch arch, TargetOS os)
