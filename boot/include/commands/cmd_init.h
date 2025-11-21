@@ -1,9 +1,10 @@
 #ifndef CMD_INIT_H
 #define CMD_INIT_H
 
-void cmd_help_general();
+#include <stdio.h>
 
-void cmd_init_help();
-int cmd_init_handle(int argc, char **argv);
+void cmd_help_general(FILE *stream);
+void cmd_init_help(FILE *stream);
+int  cmd_init_handle(int argc, char **argv);
 
 #endif
