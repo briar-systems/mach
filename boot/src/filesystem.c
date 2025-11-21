@@ -40,6 +40,17 @@ static char *realpath_windows(const char *path, char *resolved)
 #include <unistd.h>
 #endif
 
+int fs_chdir(const char *path)
+{
+    if (!path)
+        return 0;
+#ifdef _WIN32
+    return _chdir(path) == 0;
+#else
+    return chdir(path) == 0;
+#endif
+}
+
 char *fs_read_file(const char *path)
 {
     FILE *file = fopen(path, "rb");
@@ -313,40 +324,4 @@ static void fs_list_mach_files_recursive_impl(const char *dir_path, char ***file
     
     closedir(dir);
 #endif
-}
-
-char **fs_list_mach_files_recursive(const char *dir_path)
-{
-    char **files = NULL;
-    int count = 0;
-    int capacity = 0;
-    
-    fs_list_mach_files_recursive_impl(dir_path, &files, &count, &capacity);
-    
-    // null-terminate the array
-    if (count > 0)
-    {
-        files = realloc(files, sizeof(char*) * (count + 1));
-        files[count] = NULL;
-    }
-    else
-    {
-        // return empty null-terminated array
-        files = malloc(sizeof(char*));
-        files[0] = NULL;
-    }
-    
-    return files;
-}
-
-void fs_free_string_array(char **array)
-{
-    if (!array)
-        return;
-    
-    for (int i = 0; array[i] != NULL; i++)
-    {
-        free(array[i]);
-    }
-    free(array);
 }

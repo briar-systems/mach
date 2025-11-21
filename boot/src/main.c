@@ -11,7 +11,7 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        cmd_help_general();
+        cmd_help_general(stderr);
         return 1;
     }
 
@@ -40,7 +40,7 @@ int main(int argc, char **argv)
     else
     {
         fprintf(stderr, "error: unknown command '%s'\n", command);
-        cmd_help_general();
+        cmd_help_general(stderr);
         return 1;
     }
 }
