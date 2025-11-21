@@ -1,8 +1,8 @@
-#include <stdio.h>
-#include <string.h>
-
 #include "commands/cmd_init.h"
 #include "filesystem.h"
+
+#include <stdio.h>
+#include <string.h>
 
 // NOTE: update this to match standard libary convention if and when it changes
 static const char *template_main_mach = "use          std.system.runtime;\n"
@@ -27,14 +27,19 @@ const char *template_mach_toml = "[project]\n"
                                  "target  = \"native\"\n"
                                  "\n"
                                  "[targets.linux]\n"
-                                 "platform    = \"linux\"\n"
-                                 "arch        = \"x86_64\"\n"
-                                 "mode        = \"executable\"\n"
-                                 "entrypoint  = \"main.mach\"\n"
-                                 "artifacts   = \"linux\"\n"
-                                 "binary      = \"linux/bin/%s\"\n";
+                                 "platform   = \"linux\"\n"
+                                 "arch       = \"x86_64\"\n"
+                                 "mode       = \"executable\"\n"
+                                 "entrypoint = \"main.mach\"\n"
+                                 "artifacts  = \"linux\"\n"
+                                 "binary     = \"linux/bin/%s\"\n"
+                                 "\n"
+                                 "[dep.mach-std]\n"
+                                 "type    = \"remote\"\n"
+                                 "path    = \"https://github.com/octalide/mach-std\"\n"
+                                 "version = \"branch/main\"\n";
 
-void cmd_init_help(FILE* stream)
+void cmd_init_help(FILE *stream)
 {
     fprintf(stream, "usage: mach init <project_id>\n");
     fprintf(stream, "\n");
@@ -128,6 +133,10 @@ int cmd_init_handle(int argc, char **argv)
     fputs(template_main_mach, main_file);
 
     fclose(main_file);
+
+    // TODO: initialize git repository
+    // TODO: create .gitignore file
+    // TODO: trigger `mach dep pull mach-std` mechanism to initialize dep directory
 
     printf("created a new project at '%s'\n", project_id);
 

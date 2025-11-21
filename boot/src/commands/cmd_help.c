@@ -1,13 +1,13 @@
-#include <stdio.h>
-#include <string.h>
-
 #include "commands/cmd_build.h"
 #include "commands/cmd_dep.h"
 #include "commands/cmd_help.h"
 #include "commands/cmd_init.h"
 #include "commands/cmd_run.h"
 
-void cmd_help_general(FILE* stream)
+#include <stdio.h>
+#include <string.h>
+
+void cmd_help_general(FILE *stream)
 {
     fprintf(stream, "usage: mach <command> [options]\n");
     fprintf(stream, "\n");
@@ -20,7 +20,7 @@ void cmd_help_general(FILE* stream)
     fprintf(stream, "use 'mach help <command>' for more information on a specific command.\n");
 }
 
-void cmd_help_help(FILE* stream)
+void cmd_help_help(FILE *stream)
 {
     fprintf(stream, "usage: mach help <command>\n");
     fprintf(stream, "\n");
