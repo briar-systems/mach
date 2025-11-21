@@ -10,6 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct X86FunctionFrame
+{
+    size_t stack_size;       // total stack frame size in bytes
+    size_t locals_offset;    // offset from rbp for locals
+    bool   needs_frame;      // whether to emit prologue/epilogue
+} X86FunctionFrame;
+
 typedef struct X86Emitter
 {
     const BackendTarget   *target;
@@ -17,6 +24,8 @@ typedef struct X86Emitter
     BackendCodegenResult  *result;
     MirPhysicalReg        *vreg_map;
     size_t                 vreg_count;
+    X86FunctionFrame       current_frame;
+    bool                   in_function;
 } X86Emitter;
 
 static bool x86_lower(const BackendTarget *target, MirModule *module, BackendCodegenResult *result);
@@ -61,6 +70,20 @@ static void emit_rex_w(CodeBuffer *buf, uint8_t reg, uint8_t rm)
     if (rm >= 8)
         rex |= 0x01; // REX.B
     codebuf_emit_byte(buf, rex);
+}
+
+static void emit_push_reg(CodeBuffer *buf, uint8_t reg)
+{
+    if (reg >= 8)
+        codebuf_emit_byte(buf, 0x40 | 0x01); // REX.B
+    codebuf_emit_byte(buf, 0x50 + (reg & 7));
+}
+
+static void emit_pop_reg(CodeBuffer *buf, uint8_t reg)
+{
+    if (reg >= 8)
+        codebuf_emit_byte(buf, 0x40 | 0x01); // REX.B
+    codebuf_emit_byte(buf, 0x58 + (reg & 7));
 }
 
 static uint8_t modrm(uint8_t mod, uint8_t reg, uint8_t rm)
@@ -193,6 +216,51 @@ static bool emit_rel32_placeholder(X86Emitter *ctx, const char *label)
                                   BACKEND_RELOC_X86_64_PC32,
                                   label,
                                   -4);
+}
+
+static void emit_function_prologue(X86Emitter *ctx)
+{
+    CodeBuffer *buf = &ctx->result->text.buffer;
+    uint8_t rbp = encode_preg(MIR_PREG_RBP);
+    uint8_t rsp = encode_preg(MIR_PREG_RSP);
+    
+    // push rbp
+    emit_push_reg(buf, rbp);
+    
+    // mov rbp, rsp
+    emit_rex_w(buf, rsp, rbp);
+    codebuf_emit_byte(buf, 0x89);
+    codebuf_emit_byte(buf, modrm(3, rsp, rbp));
+    
+    // sub rsp, frame_size (if needed)
+    if (ctx->current_frame.stack_size > 0)
+    {
+        size_t frame_size = ctx->current_frame.stack_size;
+        // align to 16 bytes
+        frame_size = (frame_size + 15) & ~15;
+        
+        emit_rex_w(buf, 0, rsp);
+        if (frame_size <= 127)
+        {
+            codebuf_emit_byte(buf, 0x83);
+            codebuf_emit_byte(buf, modrm(3, 5, rsp));
+            codebuf_emit_byte(buf, (uint8_t)frame_size);
+        }
+        else
+        {
+            codebuf_emit_byte(buf, 0x81);
+            codebuf_emit_byte(buf, modrm(3, 5, rsp));
+            codebuf_emit_u32(buf, (uint32_t)frame_size);
+        }
+    }
+}
+
+static void emit_function_epilogue(X86Emitter *ctx)
+{
+    CodeBuffer *buf = &ctx->result->text.buffer;
+    
+    // leave (mov rsp, rbp; pop rbp)
+    codebuf_emit_byte(buf, 0xC9);
 }
 
 static void emit_mov_reg_imm(X86Emitter *ctx, uint8_t dst_reg, int64_t imm)
@@ -476,6 +544,72 @@ static bool emit_instruction(X86Emitter *ctx, MirInstruction *inst)
         }
         break;
     }
+    case MIR_OP_MUL:
+    {
+        // imul dst, src (two-operand form)
+        uint8_t dst_reg = get_operand_reg(ctx, &inst->operands[0]);
+        if (!move_operand_into_reg(ctx, &inst->operands[1], dst_reg))
+            return false;
+        
+        MirOperand *rhs = &inst->operands[2];
+        if (rhs->kind == MIR_OPERAND_IMM)
+        {
+            // imul dst, imm32
+            emit_rex_w(buf, dst_reg, dst_reg);
+            codebuf_emit_byte(buf, 0x69);
+            codebuf_emit_byte(buf, modrm(3, dst_reg, dst_reg));
+            codebuf_emit_u32(buf, (uint32_t)rhs->immediate);
+        }
+        else
+        {
+            uint8_t src_reg = get_operand_reg(ctx, rhs);
+            emit_rex_w(buf, dst_reg, src_reg);
+            codebuf_emit_byte(buf, 0x0F);
+            codebuf_emit_byte(buf, 0xAF);
+            codebuf_emit_byte(buf, modrm(3, dst_reg, src_reg));
+        }
+        break;
+    }
+    case MIR_OP_DIV:
+    case MIR_OP_MOD:
+    {
+        // div/mod: rax = dividend, operand = divisor, result in rax (quotient) or rdx (remainder)
+        uint8_t dst_reg = get_operand_reg(ctx, &inst->operands[0]);
+        uint8_t rax = encode_preg(MIR_PREG_RAX);
+        uint8_t rdx = encode_preg(MIR_PREG_RDX);
+        
+        // move dividend into rax
+        if (!move_operand_into_reg(ctx, &inst->operands[1], rax))
+            return false;
+        
+        // sign-extend rax into rdx:rax (cqo)
+        codebuf_emit_byte(buf, 0x48);
+        codebuf_emit_byte(buf, 0x99);
+        
+        // get divisor into a register
+        MirOperand *divisor = &inst->operands[2];
+        uint8_t divisor_reg;
+        if (!materialize_operand_reg(ctx, divisor, scratch_reg_code(), &divisor_reg))
+            return false;
+        
+        // idiv divisor_reg
+        emit_rex_w(buf, 0, divisor_reg);
+        codebuf_emit_byte(buf, 0xF7);
+        codebuf_emit_byte(buf, modrm(3, 7, divisor_reg));
+        
+        // move result to dst
+        if (inst->opcode == MIR_OP_DIV)
+        {
+            if (dst_reg != rax)
+                emit_mov_reg_reg(ctx, dst_reg, rax);
+        }
+        else // MOD
+        {
+            if (dst_reg != rdx)
+                emit_mov_reg_reg(ctx, dst_reg, rdx);
+        }
+        break;
+    }
     case MIR_OP_NOT:
     case MIR_OP_NEG:
     {
@@ -486,6 +620,29 @@ static bool emit_instruction(X86Emitter *ctx, MirInstruction *inst)
         emit_rex_w(buf, 0, dst_reg);
         codebuf_emit_byte(buf, 0xF7);
         codebuf_emit_byte(buf, modrm(3, subcode, dst_reg));
+        break;
+    }
+    case MIR_OP_ZEXT:
+    case MIR_OP_SEXT:
+    case MIR_OP_TRUNC:
+    {
+        // for now, simple register moves (proper size handling would check inst->type/type2)
+        uint8_t dst_reg = get_operand_reg(ctx, &inst->operands[0]);
+        if (!move_operand_into_reg(ctx, &inst->operands[1], dst_reg))
+            return false;
+        
+        // ZEXT: movzx if needed (for now just ensure high bits clear)
+        // SEXT: movsx if needed
+        // TRUNC: just use lower bits
+        // Proper implementation would check source/dest sizes from inst->type/type2
+        break;
+    }
+    case MIR_OP_BITCAST:
+    {
+        // bitcast: reinterpret bits, just move register
+        uint8_t dst_reg = get_operand_reg(ctx, &inst->operands[0]);
+        if (!move_operand_into_reg(ctx, &inst->operands[1], dst_reg))
+            return false;
         break;
     }
     case MIR_OP_SHL:
@@ -604,12 +761,39 @@ static bool emit_instruction(X86Emitter *ctx, MirInstruction *inst)
         codebuf_emit_byte(buf, 0x05);
         break;
     case MIR_OP_RET:
+        // emit epilogue if in a function
+        if (ctx->in_function && ctx->current_frame.needs_frame)
+        {
+            emit_function_epilogue(ctx);
+        }
         codebuf_emit_byte(buf, 0xC3);
         break;
     case MIR_OP_UNREACHABLE:
         codebuf_emit_byte(buf, 0x0F);
         codebuf_emit_byte(buf, 0x0B);
         break;
+    case MIR_OP_ALLOCA:
+    {
+        // alloca: allocate stack space and return address in dst
+        // For now, just bump the frame size and return rbp-offset
+        MirOperand *dst = &inst->operands[0];
+        // operands[1] would be size, but for simple case assume compile-time known
+        
+        // allocate 16 bytes aligned
+        size_t alloc_size = 16;
+        ctx->current_frame.stack_size += alloc_size;
+        size_t offset = ctx->current_frame.stack_size;
+        
+        uint8_t dst_reg = get_operand_reg(ctx, dst);
+        uint8_t rbp = encode_preg(MIR_PREG_RBP);
+        
+        // lea dst, [rbp - offset]
+        emit_rex_w(buf, dst_reg, rbp);
+        codebuf_emit_byte(buf, 0x8D);
+        codebuf_emit_byte(buf, modrm(2, dst_reg, rbp));
+        codebuf_emit_u32(buf, (uint32_t)(-((int32_t)offset)));
+        break;
+    }
     default:
         return false;
     }
@@ -618,11 +802,43 @@ static bool emit_instruction(X86Emitter *ctx, MirInstruction *inst)
 
 static bool emit_block(X86Emitter *ctx, MirBasicBlock *block)
 {
-    if (block->label)
+    // detect function entry: exported block starts a new function
+    if (block->is_exported)
     {
-        if (!add_text_label(ctx, block->label))
-            return false;
+        // finish previous function if any
+        if (ctx->in_function)
+        {
+            ctx->in_function = false;
+        }
+        
+        // start new function
+        ctx->in_function = true;
+        ctx->current_frame.stack_size = 0;
+        ctx->current_frame.locals_offset = 0;
+        ctx->current_frame.needs_frame = true;
+        
+        if (block->label)
+        {
+            if (!add_text_label(ctx, block->label))
+                return false;
+        }
+        
+        // emit prologue
+        if (ctx->current_frame.needs_frame)
+        {
+            emit_function_prologue(ctx);
+        }
     }
+    else
+    {
+        // regular block label
+        if (block->label)
+        {
+            if (!add_text_label(ctx, block->label))
+                return false;
+        }
+    }
+    
     for (MirInstruction *inst = block->instructions; inst; inst = inst->next)
     {
         if (!emit_instruction(ctx, inst))
@@ -639,6 +855,8 @@ static bool x86_lower(const BackendTarget *target, MirModule *module, BackendCod
         .result = result,
         .vreg_map = NULL,
         .vreg_count = 0,
+        .current_frame = {0},
+        .in_function = false,
     };
 
     if (!x86_allocate_registers(&ctx))

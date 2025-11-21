@@ -110,6 +110,22 @@ static bool apply_relocations(BackendCodegenResult *result,
     return true;
 }
 
+typedef struct SectionBuilder
+{
+    Elf64_Shdr shdr;
+} SectionBuilder;
+
+static uint32_t shstrtab_add(CodeBuffer *buf, const char *name)
+{
+    if (!name)
+        name = "";
+    uint32_t offset = (uint32_t)buf->size;
+    for (const char *p = name; *p; ++p)
+        codebuf_emit_byte(buf, (uint8_t)*p);
+    codebuf_emit_byte(buf, 0);
+    return offset;
+}
+
 static bool elf64_write_executable(const BackendTarget *target, BackendCodegenResult *result, const char *path)
 {
     const size_t page_size  = 0x1000;
@@ -117,13 +133,24 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
 
     size_t text_size   = result->text.buffer.size;
     size_t rodata_size = result->rodata.buffer.size;
+    size_t data_size   = result->data.buffer.size;
 
-    // Layout
-    size_t code_offset   = page_size;
-    size_t rodata_offset = align_up(code_offset + text_size, page_size);
-    size_t text_vaddr    = image_base + code_offset;
-    size_t rodata_vaddr  = image_base + rodata_offset;
-    size_t data_vaddr    = 0; // not used yet
+    size_t code_offset = page_size;
+    size_t text_end    = code_offset + text_size;
+
+    size_t rodata_offset = 0;
+    if (rodata_size > 0)
+        rodata_offset = align_up(text_end, page_size);
+
+    size_t rodata_end = (rodata_size > 0) ? (rodata_offset + rodata_size) : text_end;
+
+    size_t data_offset = 0;
+    if (data_size > 0)
+        data_offset = align_up(rodata_end, page_size);
+
+    size_t text_vaddr   = image_base + code_offset;
+    size_t rodata_vaddr = (rodata_size > 0) ? image_base + rodata_offset : 0;
+    size_t data_vaddr   = (data_size > 0) ? image_base + data_offset : 0;
 
     // Entry point
     const char *entry_label_name = target->runtime ? target->runtime->entry_label : NULL;
@@ -140,7 +167,11 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
     if (!f)
         return false;
 
-    uint16_t phnum = rodata_size > 0 ? 2 : 1;
+    uint16_t phnum = 1;
+    if (rodata_size > 0)
+        phnum++;
+    if (data_size > 0)
+        phnum++;
 
     Elf64_Ehdr ehdr;
     memset(&ehdr, 0, sizeof(ehdr));
@@ -191,6 +222,21 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
         fwrite(&phdr_rodata, sizeof(phdr_rodata), 1, f);
     }
 
+    if (data_size > 0)
+    {
+        Elf64_Phdr phdr_data;
+        memset(&phdr_data, 0, sizeof(phdr_data));
+        phdr_data.p_type   = PT_LOAD;
+        phdr_data.p_flags  = PF_R | PF_W;
+        phdr_data.p_offset = data_offset;
+        phdr_data.p_vaddr  = data_vaddr;
+        phdr_data.p_paddr  = data_vaddr;
+        phdr_data.p_filesz = data_size;
+        phdr_data.p_memsz  = data_size;
+        phdr_data.p_align  = page_size;
+        fwrite(&phdr_data, sizeof(phdr_data), 1, f);
+    }
+
     // Pad up to code offset
     size_t current_offset = sizeof(Elf64_Ehdr) + phnum * sizeof(Elf64_Phdr);
     if (current_offset > code_offset)
@@ -209,19 +255,121 @@ static bool elf64_write_executable(const BackendTarget *target, BackendCodegenRe
 
     // Pad to rodata offset
     current_offset = code_offset + text_size;
-    while (current_offset < rodata_offset)
+    if (rodata_size > 0)
+    {
+        while (current_offset < rodata_offset)
+        {
+            fputc(0, f);
+            current_offset++;
+        }
+        fwrite(result->rodata.buffer.data, 1, rodata_size, f);
+        current_offset = rodata_offset + rodata_size;
+    }
+
+    if (data_size > 0)
+    {
+        while (current_offset < data_offset)
+        {
+            fputc(0, f);
+            current_offset++;
+        }
+        fwrite(result->data.buffer.data, 1, data_size, f);
+        current_offset = data_offset + data_size;
+    }
+
+    // Build section headers and string table
+    CodeBuffer shstrtab;
+    codebuf_init(&shstrtab);
+    codebuf_emit_byte(&shstrtab, 0); // null entry
+
+    size_t section_count = 1; // null
+    if (text_size > 0) section_count++;
+    if (rodata_size > 0) section_count++;
+    if (data_size > 0) section_count++;
+    size_t shstr_index = section_count;
+    section_count++;
+
+    SectionBuilder *sections = calloc(section_count, sizeof(SectionBuilder));
+    if (!sections)
+    {
+        codebuf_free(&shstrtab);
+        fclose(f);
+        return false;
+    }
+
+    size_t sec_idx = 1;
+    if (text_size > 0)
+    {
+        SectionBuilder *sec = &sections[sec_idx++];
+        sec->shdr.sh_name      = shstrtab_add(&shstrtab, ".text");
+        sec->shdr.sh_type      = SHT_PROGBITS;
+        sec->shdr.sh_flags     = SHF_ALLOC | SHF_EXECINSTR;
+        sec->shdr.sh_addr      = text_vaddr;
+        sec->shdr.sh_offset    = code_offset;
+        sec->shdr.sh_size      = text_size;
+        sec->shdr.sh_addralign = 16;
+    }
+    if (rodata_size > 0)
+    {
+        SectionBuilder *sec = &sections[sec_idx++];
+        sec->shdr.sh_name      = shstrtab_add(&shstrtab, ".rodata");
+        sec->shdr.sh_type      = SHT_PROGBITS;
+        sec->shdr.sh_flags     = SHF_ALLOC;
+        sec->shdr.sh_addr      = rodata_vaddr;
+        sec->shdr.sh_offset    = rodata_offset;
+        sec->shdr.sh_size      = rodata_size;
+        sec->shdr.sh_addralign = 16;
+    }
+    if (data_size > 0)
+    {
+        SectionBuilder *sec = &sections[sec_idx++];
+        sec->shdr.sh_name      = shstrtab_add(&shstrtab, ".data");
+        sec->shdr.sh_type      = SHT_PROGBITS;
+        sec->shdr.sh_flags     = SHF_ALLOC | SHF_WRITE;
+        sec->shdr.sh_addr      = data_vaddr;
+        sec->shdr.sh_offset    = data_offset;
+        sec->shdr.sh_size      = data_size;
+        sec->shdr.sh_addralign = 16;
+    }
+
+    SectionBuilder *shstr_sec = &sections[shstr_index];
+    shstr_sec->shdr.sh_name      = shstrtab_add(&shstrtab, ".shstrtab");
+    shstr_sec->shdr.sh_type      = SHT_STRTAB;
+    shstr_sec->shdr.sh_flags     = 0;
+    shstr_sec->shdr.sh_addralign = 1;
+
+    size_t shstrtab_offset = current_offset;
+    fwrite(shstrtab.data, 1, shstrtab.size, f);
+    current_offset += shstrtab.size;
+
+    size_t shoff = align_up(current_offset, 8);
+    while (current_offset < shoff)
     {
         fputc(0, f);
         current_offset++;
     }
 
-    // Write rodata
-    if (rodata_size > 0)
+    shstr_sec->shdr.sh_offset = shstrtab_offset;
+    shstr_sec->shdr.sh_size   = shstrtab.size;
+
+    ehdr.e_shoff     = shoff;
+    ehdr.e_shentsize = sizeof(Elf64_Shdr);
+    ehdr.e_shnum     = (uint16_t)section_count;
+    ehdr.e_shstrndx  = (uint16_t)shstr_index;
+
+    // rewrite ELF header with updated section info
+    fseek(f, 0, SEEK_SET);
+    fwrite(&ehdr, sizeof(ehdr), 1, f);
+
+    fseek(f, shoff, SEEK_SET);
+    for (size_t i = 0; i < section_count; i++)
     {
-        fwrite(result->rodata.buffer.data, 1, rodata_size, f);
+        fwrite(&sections[i].shdr, sizeof(Elf64_Shdr), 1, f);
     }
 
     fclose(f);
+    codebuf_free(&shstrtab);
+    free(sections);
     return true;
 }
 
