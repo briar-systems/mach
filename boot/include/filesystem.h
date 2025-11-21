@@ -1,6 +1,9 @@
 #ifndef FILESYSTEM_H
 #define FILESYSTEM_H
 
+// change current working directory
+int fs_chdir(const char *path);
+
 // read entire file into memory (binary safe)
 char *fs_read_file(const char *path);
 
