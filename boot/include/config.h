@@ -9,29 +9,29 @@ typedef enum
     TARGET_MODE_EXECUTABLE,
     TARGET_MODE_LIBRARY,
     TARGET_MODE_SHARED
-} TargetModeKind;
+} ConfigTargetModeKind;
 
-typedef struct TargetMode
+typedef struct ConfigTargetMode
 {
-    TargetModeKind kind;
+    ConfigTargetModeKind kind;
     const char    *value;
-} TargetMode;
+} ConfigTargetMode;
 
-static const TargetMode TARGET_MODES[] = {{TARGET_MODE_EXECUTABLE, "executable"}, {TARGET_MODE_LIBRARY, "library"}, {TARGET_MODE_SHARED, "shared"}};
+static const ConfigTargetMode TARGET_MODES[] = {{TARGET_MODE_EXECUTABLE, "executable"}, {TARGET_MODE_LIBRARY, "library"}, {TARGET_MODE_SHARED, "shared"}};
 
 // target platforms
 typedef enum
 {
     TARGET_PLATFORM_LINUX,
-} TargetPlatformKind;
+} ConfigTargetPlatformKind;
 
-typedef struct TargetPlatform
+typedef struct ConfigTargetPlatform
 {
-    TargetPlatformKind kind;
+    ConfigTargetPlatformKind kind;
     const char        *value;
-} TargetPlatform;
+} ConfigTargetPlatform;
 
-static const TargetPlatform TARGET_PLATFORMS[] = {
+static const ConfigTargetPlatform TARGET_PLATFORMS[] = {
     {TARGET_PLATFORM_LINUX, "linux"},
 };
 
@@ -39,15 +39,15 @@ static const TargetPlatform TARGET_PLATFORMS[] = {
 typedef enum
 {
     TARGET_ARCH_X86_64,
-} TargetArchKind;
+} ConfigTargetArchKind;
 
-typedef struct TargetArch
+typedef struct ConfigTargetArch
 {
-    TargetArchKind kind;
+    ConfigTargetArchKind kind;
     const char    *value;
-} TargetArch;
+} ConfigTargetArch;
 
-static const TargetArch TARGET_ARCHS[] = {
+static const ConfigTargetArch TARGET_ARCHS[] = {
     {TARGET_ARCH_X86_64, "x86_64"},
 };
 
@@ -56,15 +56,15 @@ typedef enum
 {
     DEP_TYPE_REMOTE,
     DEP_TYPE_LOCAL
-} DepTypeKind;
+} ConfigDepTypeKind;
 
-typedef struct DepType
+typedef struct ConfigDepType
 {
-    DepTypeKind kind;
+    ConfigDepTypeKind kind;
     const char *value;
-} DepType;
+} ConfigDepType;
 
-static const DepType DEP_TYPES[] = {
+static const ConfigDepType DEP_TYPES[] = {
     {DEP_TYPE_REMOTE, "remote"},
     {DEP_TYPE_LOCAL, "local"},
 };
@@ -75,37 +75,37 @@ typedef enum
     DEP_VERSION_KIND_BRANCH,
     DEP_VERSION_KIND_SEMVER,
     DEP_VERSION_KIND_COMMIT
-} DepVersionKind;
+} ConfigDepVersionKind;
 
-typedef struct DepVersion
+typedef struct ConfigDepVersion
 {
-    DepVersionKind kind;
-    const char    *value;
-} DepVersion;
+    ConfigDepVersionKind kind;
+    const char          *value;
+} ConfigDepVersion;
 
 // target-specific configuration
-typedef struct TargetConfig
+typedef struct ConfigTarget
 {
-    char           *name;       // target name
-    TargetPlatform *platform;   // target platform/os
-    TargetArch     *arch;       // target architecture
-    TargetMode     *mode;       // build mode: executable|library
-    char           *entrypoint; // main source file (relative to src_dir)
-    char           *artifacts;  // artifacts directory (relative to out_dir)
-    char           *binary;     // output binary path (relative to out_dir)
-} TargetConfig;
+    char                 *name;       // target name
+    ConfigTargetPlatform *platform;   // target platform/os
+    ConfigTargetArch     *arch;       // target architecture
+    ConfigTargetMode     *mode;       // build mode: executable|library
+    char                 *entrypoint; // main source file (relative to src_dir)
+    char                 *artifacts;  // artifacts directory (relative to out_dir)
+    char                 *binary;     // output binary path (relative to out_dir)
+} ConfigTarget;
 
 // explicit dependency specification (parsed from [deps] tables)
-typedef struct DepSpec
+typedef struct ConfigDep
 {
-    char       *name;    // dependency name
-    DepType    *type;    // dependency type: remote|local
-    char       *path;    // remote URL or local filesystem path (used by dep tooling)
-    DepVersion *version; // version specifier (for remote deps): branch/semver/commit
-} DepSpec;
+    char             *name;    // dependency name
+    ConfigDepType          *type;    // dependency type: remote|local
+    char             *path;    // remote URL or local filesystem path (used by dep tooling)
+    ConfigDepVersion *version; // version specifier (for remote deps): branch/semver/commit
+} ConfigDep;
 
 // project configuration
-typedef struct ProjectConfig
+typedef struct Config
 {
     char *id;      // project id (used for module prefix and soft uniqueness)
     char *name;    // project name (canonical, human-readable)
@@ -115,33 +115,33 @@ typedef struct ProjectConfig
     char *dir_dep; // dependencies directory
     char *target;  // target name (or "native" to auto-detect)
 
-    TargetConfig **targets;
+    ConfigTarget **targets;
     int            target_count;
 
-    DepSpec **deps;
-    int       dep_count;
-} ProjectConfig;
+    ConfigDep **deps;
+    int         dep_count;
+} Config;
 
 // target management
-void target_config_init(TargetConfig *target);
-void target_config_dnit(TargetConfig *target);
+void target_config_init(ConfigTarget *target);
+void target_config_dnit(ConfigTarget *target);
 
 // dependency management
-void dep_spec_init(DepSpec *dep);
-void dep_spec_dnit(DepSpec *dep);
+void dep_spec_init(ConfigDep *dep);
+void dep_spec_dnit(ConfigDep *dep);
 
 // configuration lifecycle
-void config_init(ProjectConfig *config);
-void config_dnit(ProjectConfig *config);
+void config_init(Config *config);
+void config_dnit(Config *config);
 
 // configuration file management
-ProjectConfig *config_load(const char *config_path);
-bool           config_save(ProjectConfig *config, const char *config_path);
+Config *config_load(const char *config_path);
+bool    config_save(Config *config, const char *config_path);
 
-bool          config_add_target(ProjectConfig *config, const char *name, const char *target_triple);
-TargetConfig *config_get_target(ProjectConfig *config, const char *name);
-bool          config_add_dependency(ProjectConfig *config, DepSpec *dep);
-DepSpec      *config_get_dependency(ProjectConfig *config, const char *name);
-bool          config_del_dependency(ProjectConfig *config, const char *name);
+bool          config_add_target(Config *config, ConfigTarget *target);
+ConfigTarget *config_get_target(Config *config, const char *name);
+bool          config_add_dependency(Config *config, ConfigDep *dep);
+ConfigDep    *config_get_dependency(Config *config, const char *name);
+bool          config_del_dependency(Config *config, const char *name);
 
 #endif
