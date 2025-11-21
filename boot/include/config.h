@@ -14,7 +14,7 @@ typedef enum
 typedef struct ConfigTargetMode
 {
     ConfigTargetModeKind kind;
-    const char    *value;
+    const char          *value;
 } ConfigTargetMode;
 
 static const ConfigTargetMode TARGET_MODES[] = {{TARGET_MODE_EXECUTABLE, "executable"}, {TARGET_MODE_LIBRARY, "library"}, {TARGET_MODE_SHARED, "shared"}};
@@ -28,7 +28,7 @@ typedef enum
 typedef struct ConfigTargetPlatform
 {
     ConfigTargetPlatformKind kind;
-    const char        *value;
+    const char              *value;
 } ConfigTargetPlatform;
 
 static const ConfigTargetPlatform TARGET_PLATFORMS[] = {
@@ -44,7 +44,7 @@ typedef enum
 typedef struct ConfigTargetArch
 {
     ConfigTargetArchKind kind;
-    const char    *value;
+    const char          *value;
 } ConfigTargetArch;
 
 static const ConfigTargetArch TARGET_ARCHS[] = {
@@ -61,7 +61,7 @@ typedef enum
 typedef struct ConfigDepType
 {
     ConfigDepTypeKind kind;
-    const char *value;
+    const char       *value;
 } ConfigDepType;
 
 static const ConfigDepType DEP_TYPES[] = {
@@ -99,7 +99,7 @@ typedef struct ConfigTarget
 typedef struct ConfigDep
 {
     char             *name;    // dependency name
-    ConfigDepType          *type;    // dependency type: remote|local
+    ConfigDepType    *type;    // dependency type: remote|local
     char             *path;    // remote URL or local filesystem path (used by dep tooling)
     ConfigDepVersion *version; // version specifier (for remote deps): branch/semver/commit
 } ConfigDep;
