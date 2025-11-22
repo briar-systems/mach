@@ -1,6 +1,8 @@
 #include "config.h"
 #include "filesystem.h"
 #include "toml.h"
+#include "backend/target.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,38 +24,61 @@ static ConfigTargetMode *find_target_mode(const char *value)
     return NULL;
 }
 
-// helper: find target platform by string value
-static ConfigTargetPlatform *find_target_platform(const char *value)
+// helper: find target os by string value
+static TargetOSKind find_target_os(const char *value)
 {
     if (!value)
     {
-        return NULL;
+        return TARGET_OS_KIND_COUNT;
     }
-    for (size_t i = 0; i < sizeof(TARGET_PLATFORMS) / sizeof(TARGET_PLATFORMS[0]); i++)
+
+    for (size_t i = 0; i < sizeof(TARGET_OS_NAMES) / sizeof(TARGET_OS_NAMES[0]); i++)
     {
-        if (strcmp(TARGET_PLATFORMS[i].value, value) == 0)
+        if (strcmp(TARGET_OS_NAMES[i], value) == 0)
         {
-            return (ConfigTargetPlatform *)&TARGET_PLATFORMS[i];
+            return (TargetOSKind)i;
         }
     }
-    return NULL;
+
+    return TARGET_OS_KIND_COUNT;
 }
 
-// helper: find target arch by string value
-static ConfigTargetArch *find_target_arch(const char *value)
+// helper: find target isa by string value
+static TargetISAKind find_target_isa(const char *value)
 {
     if (!value)
     {
-        return NULL;
+        return TARGET_ISA_KIND_COUNT;
     }
-    for (size_t i = 0; i < sizeof(TARGET_ARCHS) / sizeof(TARGET_ARCHS[0]); i++)
+
+    for (size_t i = 0; i < sizeof(TARGET_ISA_NAMES) / sizeof(TARGET_ISA_NAMES[0]); i++)
     {
-        if (strcmp(TARGET_ARCHS[i].value, value) == 0)
+        if (strcmp(TARGET_ISA_NAMES[i], value) == 0)
         {
-            return (ConfigTargetArch *)&TARGET_ARCHS[i];
+            return (TargetISAKind)i;
         }
     }
-    return NULL;
+
+    return TARGET_ISA_KIND_COUNT;
+}
+
+// helper: find target abi by string value
+static TargetABIKind find_target_abi(const char *value)
+{
+    if (!value)
+    {
+        return TARGET_ABI_KIND_COUNT;
+    }
+
+    for (size_t i = 0; i < sizeof(TARGET_ABI_NAMES) / sizeof(TARGET_ABI_NAMES[0]); i++)
+    {
+        if (strcmp(TARGET_ABI_NAMES[i], value) == 0)
+        {
+            return (TargetABIKind)i;
+        }
+    }
+
+    return TARGET_ABI_KIND_COUNT;
 }
 
 // helper: find dependency type by string value
@@ -114,8 +139,9 @@ static ConfigDepVersionKind determine_version_kind(const char *version)
 void target_config_init(ConfigTarget *target)
 {
     target->name       = NULL;
-    target->platform   = NULL;
-    target->arch       = NULL;
+    target->os   = TARGET_OS_KIND_COUNT;
+    target->isa       = TARGET_ISA_KIND_COUNT;
+    target->abi       = TARGET_ABI_KIND_COUNT;
     target->mode       = NULL;
     target->entrypoint = NULL;
     target->artifacts  = NULL;
@@ -290,16 +316,22 @@ Config *config_load(const char *config_path)
             {
                 toml_table_t *target_table = entry->value.as.table;
 
-                toml_value_t *platform = toml_table_get(target_table, "platform");
-                if (platform && toml_value_is_string(platform))
+                toml_value_t *os = toml_table_get(target_table, "os");
+                if (os && toml_value_is_string(os))
                 {
-                    config->targets[i]->platform = find_target_platform(platform->as.string);
+                    config->targets[i]->os = find_target_os(os->as.string);
                 }
 
-                toml_value_t *arch = toml_table_get(target_table, "arch");
-                if (arch && toml_value_is_string(arch))
+                toml_value_t *isa = toml_table_get(target_table, "isa");
+                if (isa && toml_value_is_string(isa))
                 {
-                    config->targets[i]->arch = find_target_arch(arch->as.string);
+                    config->targets[i]->isa = find_target_isa(isa->as.string);
+                }
+
+                toml_value_t *abi = toml_table_get(target_table, "abi");
+                if (abi && toml_value_is_string(abi))
+                {
+                    config->targets[i]->abi = find_target_abi(abi->as.string);
                 }
 
                 toml_value_t *mode = toml_table_get(target_table, "mode");
@@ -434,13 +466,17 @@ bool config_save(Config *config, const char *config_path)
         if (target->name)
         {
             fprintf(f, "\n[targets.%s]\n", target->name);
-            if (target->platform)
+            if (target->os != TARGET_OS_KIND_COUNT)
             {
-                fprintf(f, "platform = \"%s\"\n", target->platform->value);
+                fprintf(f, "os = \"%s\"\n", target_os_name(target->os));
             }
-            if (target->arch)
+            if (target->isa != TARGET_ISA_KIND_COUNT)
             {
-                fprintf(f, "arch = \"%s\"\n", target->arch->value);
+                fprintf(f, "isa = \"%s\"\n", target_isa_name(target->isa));
+            }
+            if (target->abi != TARGET_ABI_KIND_COUNT)
+            {
+                fprintf(f, "abi = \"%s\"\n", target_abi_name(target->abi));
             }
             if (target->mode)
             {

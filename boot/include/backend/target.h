@@ -11,6 +11,11 @@ typedef enum TargetABIKind
     TARGET_ABI_KIND_COUNT
 } TargetABIKind;
 
+// string representations of target ABIs
+static const char *TARGET_ABI_NAMES[] = {
+    "sysv64",
+};
+
 // represents information about a specific application binary interface
 typedef struct TargetABI
 {
@@ -25,6 +30,11 @@ typedef enum TargetISAKind
     TARGET_ISA_KIND_COUNT
 } TargetISAKind;
 
+// string representations of target ISAs
+static const char *TARGET_ISA_NAMES[] = {
+    "x86_64",
+};
+
 // represents information about a specific instruction set architecture
 typedef struct TargetISA
 {
@@ -34,18 +44,23 @@ typedef struct TargetISA
 } TargetISA;
 
 // target object format kinds
-typedef enum TargetObjectFormatKind
+typedef enum TargetOFKind
 {
     TARGET_OBJ_KIND_ELF,
     TARGET_OBJ_KIND_COUNT
-} TargetObjectFormatKind;
+} TargetOFKind;
+
+// string representations of target object formats
+static const char *TARGET_OBJ_NAMES[] = {
+    "elf",
+};
 
 // represents information about a specific object format
-typedef struct TargetObjectFormat
+typedef struct TargetOF
 {
-    TargetObjectFormatKind kind;
-    const char            *name;
-} TargetObjectFormat;
+    TargetOFKind kind;
+    const char  *name;
+} TargetOF;
 
 // target OS kinds
 typedef enum TargetOSKind
@@ -54,13 +69,18 @@ typedef enum TargetOSKind
     TARGET_OS_KIND_COUNT
 } TargetOSKind;
 
+// string representations of target operating systems
+static const char *TARGET_OS_NAMES[] = {
+    "linux",
+};
+
 // represents information about a specific operating system
 typedef struct TargetOS
 {
     TargetOSKind kind;
     const char  *name;
 
-    const TargetObjectFormat *format;
+    const TargetOF *format;
 } TargetOS;
 
 // represents a specific target configuration
@@ -71,7 +91,12 @@ typedef struct Target
     const TargetABI *abi;
 } Target;
 
-const Target    *target_get(TargetISAKind isa, TargetABIKind abi, TargetOSKind os);
-const Target    *target_native();
+const Target *target_get(TargetISAKind isa, TargetABIKind abi, TargetOSKind os);
+const Target *target_native();
+
+const char *target_abi_name(TargetABIKind abi);
+const char *target_isa_name(TargetISAKind isa);
+const char *target_os_name(TargetOSKind os);
+const char *target_of_name(TargetOFKind of);
 
 #endif

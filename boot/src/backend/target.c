@@ -61,3 +61,35 @@ const Target *target_native()
 
     return target_get(isa, abi, os);
 }
+
+const char *target_abi_name(TargetABIKind abi) {
+    if (abi >= TARGET_ABI_KIND_COUNT) {
+        return "unknown";
+    }
+
+    return TARGET_ABI_NAMES[abi];
+}
+
+const char *target_isa_name(TargetISAKind isa) {
+    if (isa >= TARGET_ISA_KIND_COUNT) {
+        return "unknown";
+    }
+
+    return TARGET_ISA_NAMES[isa];
+}
+
+const char *target_os_name(TargetOSKind os) {
+    if (os >= TARGET_OS_KIND_COUNT) {
+        return "unknown";
+    }
+
+    return TARGET_OS_NAMES[os];
+}
+
+const char *target_of_name(TargetOFKind of) {
+    if (of >= TARGET_OBJ_KIND_COUNT) {
+        return "unknown";
+    }
+
+    return TARGET_OBJ_NAMES[of];
+}

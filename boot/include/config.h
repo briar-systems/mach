@@ -1,6 +1,8 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include "backend/target.h"
+
 #include <stdbool.h>
 
 // target modes
@@ -18,38 +20,6 @@ typedef struct ConfigTargetMode
 } ConfigTargetMode;
 
 static const ConfigTargetMode TARGET_MODES[] = {{TARGET_MODE_EXECUTABLE, "executable"}, {TARGET_MODE_LIBRARY, "library"}, {TARGET_MODE_SHARED, "shared"}};
-
-// target platforms
-typedef enum
-{
-    TARGET_PLATFORM_LINUX,
-} ConfigTargetPlatformKind;
-
-typedef struct ConfigTargetPlatform
-{
-    ConfigTargetPlatformKind kind;
-    const char              *value;
-} ConfigTargetPlatform;
-
-static const ConfigTargetPlatform TARGET_PLATFORMS[] = {
-    {TARGET_PLATFORM_LINUX, "linux"},
-};
-
-// target architectures
-typedef enum
-{
-    TARGET_ARCH_X86_64,
-} ConfigTargetArchKind;
-
-typedef struct ConfigTargetArch
-{
-    ConfigTargetArchKind kind;
-    const char          *value;
-} ConfigTargetArch;
-
-static const ConfigTargetArch TARGET_ARCHS[] = {
-    {TARGET_ARCH_X86_64, "x86_64"},
-};
 
 // dependency types
 typedef enum
@@ -86,13 +56,14 @@ typedef struct ConfigDepVersion
 // target-specific configuration
 typedef struct ConfigTarget
 {
-    char                 *name;       // target name
-    ConfigTargetPlatform *platform;   // target platform/os
-    ConfigTargetArch     *arch;       // target architecture
-    ConfigTargetMode     *mode;       // build mode: executable|library
-    char                 *entrypoint; // main source file (relative to src_dir)
-    char                 *artifacts;  // artifacts directory (relative to out_dir)
-    char                 *binary;     // output binary path (relative to out_dir)
+    char             *name;       // target name
+    TargetOSKind      os;         // target operating system
+    TargetISAKind     isa;        // target ISA
+    TargetABIKind     abi;        // target ABI
+    ConfigTargetMode *mode;       // build mode: executable|library
+    char             *entrypoint; // main source file (relative to src_dir)
+    char             *artifacts;  // artifacts directory (relative to out_dir)
+    char             *binary;     // output binary path (relative to out_dir)
 } ConfigTarget;
 
 // explicit dependency specification (parsed from [deps] tables)
