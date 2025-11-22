@@ -1,62 +1,63 @@
 #include "backend/target.h"
 #include "backend/isa/x86_64.h"
+#include "backend/abi/sysv64.h"
 #include "backend/os/linux.h"
-#include "backend/object/elf64.h"
 
 #include <stddef.h>
 
-// determine the native target for the current system
-const Target *target_native()
+const Target *target_get(TargetISAKind isa, TargetABIKind abi, TargetOSKind os)
 {
-#if defined(__x86_64__) || defined(_M_X64)
-    #if defined(__linux__)
-        return target_get(TARGET_ARCH_KIND_X86_64, TARGET_OS_KIND_LINUX);
-    #else
-        return NULL; // unsupported native target
-    #endif
-#else
-    return NULL; // unsupported native architecture
-#endif
-}
-
-const Target *target_get(TargetArchKind arch, TargetOSKind os)
-{
-    // compose target from arch + os + format components
-    if (arch == TARGET_ARCH_KIND_X86_64 && os == TARGET_OS_KIND_LINUX)
+    // check that all components are valid
+    if (isa == TARGET_ISA_KIND_COUNT || abi == TARGET_ABI_KIND_COUNT || os == TARGET_OS_KIND_COUNT)
     {
-        static RuntimeShim runtime = {.entry_label = "_start"};
-        static TargetObjectFormat format = {
-            .kind  = TARGET_OBJ_KIND_ELF,
-            .name = "elf"
-        };
-        static Target target;
-
-        target.arch    = backend_arch_x86_64();
-        target.os      = backend_os_linux_x86_64();
-        target.format  = &format;
-        target.isa     = backend_isa_x86_64();
-        target.abi     = backend_abi_sysv64();
-        target.writer  = backend_object_writer_elf64();
-        target.runtime = &runtime;
-
-        return &target;
+        return NULL;
     }
 
-    // future: add support for other arch/os combinations
-    // if (arch == TARGET_ARCH_KIND_X86_64 && os == TARGET_OS_KIND_DARWIN)
-    // {
-    //     target.arch   = backend_arch_x86_64();
-    //     target.os     = backend_os_darwin_x86_64();
-    //     target.format = backend_format_macho();
-    //     target.isa    = backend_isa_x86_64();
-    //     target.abi    = backend_abi_sysv64();
-    //     ...
-    // }
+    static Target target;
 
-    return NULL;
+    switch (isa)
+    {
+    case TARGET_ISA_KIND_X86_64:
+        target.isa = isa_x86_64();
+        break;
+    default:
+        return NULL;
+    }
+
+    switch (abi)
+    {
+    case TARGET_ABI_KIND_SYSV64:
+        target.abi = abi_sysv64();
+        break;
+    default:
+        return NULL;
+    }
+
+    switch (os)
+    {
+    case TARGET_OS_KIND_LINUX:
+        target.os = os_linux();
+        break;
+    default:
+        return NULL;
+    }
+
+    return &target;
 }
 
-const Target *target_lookup(TargetDescriptor desc)
+const Target *target_native()
 {
-    return target_get(desc.arch, desc.os);
+    static TargetISAKind isa = TARGET_ISA_KIND_COUNT;
+    static TargetABIKind abi = TARGET_ABI_KIND_COUNT;
+    static TargetOSKind  os  = TARGET_OS_KIND_COUNT;
+
+#if defined(__x86_64__) || defined(_M_X64)
+    isa = TARGET_ISA_KIND_X86_64;
+#endif
+#if defined(__linux__)
+    abi = TARGET_ABI_KIND_SYSV64;
+    os  = TARGET_OS_KIND_LINUX;
+#endif
+
+    return target_get(isa, abi, os);
 }

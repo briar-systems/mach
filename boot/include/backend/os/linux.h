@@ -1,8 +1,8 @@
-#ifndef BACKEND_OS_LINUX_H
-#define BACKEND_OS_LINUX_H
+#ifndef OS_LINUX_H
+#define OS_LINUX_H
 
-#include "../target.h"
+#include "backend/target.h"
 
-const TargetOS *backend_os_linux_x86_64(void);
+const TargetOS *os_linux();
 
-#endif // BACKEND_OS_LINUX_H
+#endif
