@@ -112,7 +112,6 @@ static char *parse_string(parser_t *p)
     l->pos++;
     l->col++;
 
-    size_t start    = l->pos;
     size_t capacity = 64;
     size_t len      = 0;
     char  *result   = malloc(capacity);

@@ -208,9 +208,9 @@ static bool elf64_write_executable(const Target *target, BackendCodegenResult *r
     ehdr.e_ident[EI_CLASS]   = ELFCLASS64;
     ehdr.e_ident[EI_DATA]    = ELFDATA2LSB;
     ehdr.e_ident[EI_VERSION] = EV_CURRENT;
-    ehdr.e_ident[EI_OSABI]   = ELFOSABI_SYSV;
+    ehdr.e_ident[EI_OSABI]   = target->os ? target->os->elf_osabi : 0x00;
     ehdr.e_type              = ET_EXEC;
-    ehdr.e_machine           = EM_X86_64;
+    ehdr.e_machine           = target->arch ? target->arch->elf_machine : 0x3E;
     ehdr.e_version           = EV_CURRENT;
     ehdr.e_entry             = entry_addr;
     ehdr.e_phoff             = sizeof(Elf64_Ehdr);

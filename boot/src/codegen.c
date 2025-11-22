@@ -81,7 +81,7 @@ bool codegen_generate(CodegenContext *ctx, AstNode *root, SymbolTable *symbols)
 
 bool codegen_emit_object(CodegenContext *ctx, const char *filename)
 {
-    TargetDescriptor target = target_desc(TARGET_ARCH_X86_64, TARGET_OS_LINUX);
+    TargetDescriptor target = target_desc(TARGET_ARCH_KIND_X86_64, TARGET_OS_KIND_LINUX);
     return backend_emit_executable(target, ctx->module, filename);
 }
 

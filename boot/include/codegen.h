@@ -4,7 +4,7 @@
 #include "frontend/ast.h"
 #include "frontend/lexer.h"
 #include "frontend/semantic.h"
-#include "mir.h"
+#include "mir/mir.h"
 #include <stdbool.h>
 
 typedef struct CodegenContext CodegenContext;

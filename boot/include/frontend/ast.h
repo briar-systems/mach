@@ -2,7 +2,7 @@
 #define AST_H
 
 #include "frontend/token.h"
-#include "mir.h"
+#include "mir/mir.h"
 #include <stdbool.h>
 
 // forward statements
