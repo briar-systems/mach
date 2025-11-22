@@ -1,5 +1,6 @@
 #include "filesystem.h"
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,54 @@ static char *realpath_windows(const char *path, char *resolved)
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+// os-independent path join (uses correct path separator for platform)
+char *fs_path_join(const char *first, ...)
+{
+    if (!first)
+        return NULL;
+
+    char *result = strdup(first);
+    if (!result)
+        return NULL;
+
+    va_list args;
+    va_start(args, first);
+
+    const char *part;
+    while ((part = va_arg(args, const char *)) != NULL)
+    {
+        size_t len1 = strlen(result);
+        size_t len2 = strlen(part);
+        int    need_sep = (len1 > 0 && result[len1 - 1] != '/' && result[len1 - 1] != '\\' &&
+                           len2 > 0 && part[0] != '/' && part[0] != '\\');
+
+        char *new_result = malloc(len1 + len2 + (need_sep ? 2 : 1));
+        if (!new_result)
+        {
+            free(result);
+            va_end(args);
+            return NULL;
+        }
+
+        strcpy(new_result, result);
+        if (need_sep)
+        {
+#ifdef _WIN32
+            strcat(new_result, "\\");
+#else
+            strcat(new_result, "/");
+#endif
+        }
+        strcat(new_result, part);
+
+        free(result);
+        result = new_result;
+    }
+
+    va_end(args);
+    return result;
+}
 
 int fs_chdir(const char *path)
 {

@@ -1,6 +1,9 @@
 #ifndef FILESYSTEM_H
 #define FILESYSTEM_H
 
+// join varargs of paths into a single path
+char *fs_path_join(const char *first, ...);
+
 // change current working directory
 int fs_chdir(const char *path);
 
