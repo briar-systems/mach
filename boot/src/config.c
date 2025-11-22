@@ -553,6 +553,31 @@ ConfigTarget *config_get_target(Config *config, const char *name)
         return NULL;
     }
 
+    // "native" special case
+    if (strcmp(name, "native") == 0)
+    {
+        const Target *target = target_native();
+        if (!target)
+        {
+            return NULL;
+        }
+        
+        // match target to config target based on OS, ISA, and ABI
+        for (int i = 0; i < config->target_count; i++)
+        {
+            ConfigTarget *cfg_target = config->targets[i];
+            if (cfg_target->os == target->os->kind &&
+                cfg_target->isa == target->isa->kind &&
+                cfg_target->abi == target->abi->kind)
+            {
+                return cfg_target;
+            }
+        }
+
+        return NULL;
+    }
+
+
     for (int i = 0; i < config->target_count; i++)
     {
         if (config->targets[i]->name && strcmp(config->targets[i]->name, name) == 0)
