@@ -1,22 +1,59 @@
-#ifndef BACKEND_TARGET_H
-#define BACKEND_TARGET_H
+#ifndef TARGET_H
+#define TARGET_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 // forward declarations
 typedef struct MirModule            MirModule;
 typedef struct BackendCodegenResult BackendCodegenResult;
 struct Target;
 
-typedef struct TargetISA
+typedef enum TargetABIKind
 {
-    bool (*lower)(const struct Target *target, MirModule *module, BackendCodegenResult *result);
-} TargetISA;
+    TARGET_ABI_KIND_SYSV64,
+    TARGET_ABI_KIND_COUNT
+} TargetABIKind;
 
 typedef struct TargetABI
 {
-    const char *name;
+    TargetABIKind kind;
+    const char   *name;
 } TargetABI;
+
+typedef enum TargetISAKind
+{
+    TARGET_ISA_KIND_X86_64,
+    TARGET_ISA_KIND_COUNT
+} TargetISAKind;
+
+typedef struct TargetISA
+{
+    TargetISAKind kind;
+    const char   *name;         // string representation ("x86_64", "arm64", etc.)
+    uint16_t      elf_machine;  // ELF e_machine value (EM_X86_64, EM_AARCH64, etc.)
+    uint8_t       pointer_size; // pointer size in bytes
+
+    bool (*lower)(const struct Target *target, MirModule *module, BackendCodegenResult *result);
+} TargetISA;
+
+// operating system / platform enum
+typedef enum TargetOSKind
+{
+    TARGET_OS_KIND_LINUX,
+    TARGET_OS_KIND_COUNT
+} TargetOSKind;
+
+// os-specific information
+typedef struct TargetOS
+{
+    TargetOSKind kind;
+    const char  *name;              // string representation ("linux", "darwin", "windows", etc.)
+    uint8_t      elf_osabi;         // ELF EI_OSABI value (ELFOSABI_SYSV, ELFOSABI_FREEBSD, etc.)
+    const char  *syscall_conv;      // syscall convention identifier ("linux-x64", "darwin-x64", etc.)
+    uint8_t      syscall_opcode[4]; // syscall instruction bytes (e.g., {0x0F, 0x05} for linux x64)
+    uint8_t      syscall_len;       // length of syscall instruction in bytes
+} TargetOS;
 
 typedef struct ObjectWriter
 {
@@ -25,58 +62,45 @@ typedef struct ObjectWriter
 
 typedef struct RuntimeShim
 {
-    const char *entry_label; // e.g. "_start"
+    const char *entry_label;
 } RuntimeShim;
 
-// architecture enum
-typedef enum TargetArch
-{
-    TARGET_ARCH_X86_64,
-    TARGET_ARCH_COUNT
-} TargetArch;
-
-// operating system / platform enum
-typedef enum TargetOS
-{
-    TARGET_OS_LINUX,
-    TARGET_OS_COUNT
-} TargetOS;
-
 // binary format enum
-typedef enum TargetObjectFormat
+typedef enum TargetObjectFormatKind
 {
-    TARGET_OBJ_ELF,
-    TARGET_OBJ_COUNT
-} TargetObjectFormat;
+    TARGET_OBJ_KIND_ELF,
+    TARGET_OBJ_KIND_COUNT
+} TargetObjectFormatKind;
 
-// descriptor for selecting a target
-typedef struct TargetDescriptor
+// object format information
+typedef struct TargetObjectFormat
 {
-    TargetArch arch;
-    TargetOS   os;
-} TargetDescriptor;
+    TargetObjectFormatKind kind;
+    const char            *name; // string representation ("elf", "macho", "pe", etc.)
+} TargetObjectFormat;
 
 // fully described backend target
 typedef struct Target
 {
-    TargetDescriptor   desc;
-    TargetObjectFormat format;
+    const TargetISA          *isa;
+    const TargetABI          *abi;
+    const TargetOS           *os;
+    const TargetObjectFormat *format;
 
-    const TargetISA    *isa;
-    const TargetABI    *abi;
     const ObjectWriter *writer;
     const RuntimeShim  *runtime;
 } Target;
 
-// registry api
-const Target *target_lookup(TargetDescriptor desc);
-bool          target_register(const Target *target);
-
-// helper for building descriptor
-static inline TargetDescriptor target_desc(TargetArch arch, TargetOS os)
+typedef struct TargetDescriptor
 {
-    TargetDescriptor d = {arch, os};
-    return d;
-}
+    TargetISAKind isa;
+    TargetABIKind abi;
+    TargetOSKind  os;
+} TargetDescriptor;
 
-#endif // BACKEND_TARGET_H
+const Target *target_get(TargetDescriptor desc);
+
+TargetDescriptor target_native_descriptor();
+TargetDescriptor target_get_descriptor(const Target *target);
+
+#endif
