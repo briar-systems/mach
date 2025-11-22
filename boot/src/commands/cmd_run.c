@@ -1,11 +1,74 @@
 #include "commands/cmd_run.h"
 #include "config.h"
+#include "filesystem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-void cmd_run_help(FILE* stream)
+#ifdef _WIN32
+#include <process.h>
+#include <windows.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+// helper: execute process at path with args, return exit code
+// platform-specific implementation
+static int process_execute(const char *path, char **args)
+{
+#ifdef _WIN32
+    // windows implementation using _spawnv
+    int exit_code = _spawnv(_P_WAIT, path, (const char *const *)args);
+    if (exit_code == -1)
+    {
+        fprintf(stderr, "error: failed to execute '%s'\n", path);
+        return 1;
+    }
+    return exit_code;
+#else
+    // unix implementation (linux, darwin) using fork/execv
+    pid_t pid = fork();
+    if (pid == -1)
+    {
+        fprintf(stderr, "error: failed to fork process\n");
+        return 1;
+    }
+
+    if (pid == 0)
+    {
+        // child process
+        execv(path, args);
+        // if execv returns, it failed
+        fprintf(stderr, "error: failed to execute '%s'\n", path);
+        exit(1);
+    }
+    else
+    {
+        // parent process
+        int status;
+        if (waitpid(pid, &status, 0) == -1)
+        {
+            fprintf(stderr, "error: failed to wait for process\n");
+            return 1;
+        }
+
+        if (WIFEXITED(status))
+        {
+            return WEXITSTATUS(status);
+        }
+        else if (WIFSIGNALED(status))
+        {
+            // process was terminated by a signal
+            return 128 + WTERMSIG(status);
+        }
+        return 1;
+    }
+#endif
+}
+
+void cmd_run_help(FILE *stream)
 {
     fprintf(stream, "usage: mach run <path> [--target <name>] [args...]\n");
     fprintf(stream, "\n");
@@ -25,7 +88,7 @@ int cmd_run_handle(int argc, char **argv)
 {
     const char *project_path = ".";
     const char *target_name  = NULL;
-    int arg_start            = 3; // index of first arg to pass to executable
+    int         arg_start    = 3; // index of first arg to pass to executable
 
     // parse arguments
     if (argc >= 3)
@@ -38,7 +101,9 @@ int cmd_run_handle(int argc, char **argv)
 #ifdef _WIN32
     char resolved[PATH_MAX];
     if (_fullpath(resolved, project_path, PATH_MAX))
+    {
         project_root = strdup(resolved);
+    }
 #else
     project_root = realpath(project_path, NULL);
 #endif
@@ -90,26 +155,45 @@ int cmd_run_handle(int argc, char **argv)
     }
     else
     {
-        target = config_get_default_target(config);
+        target = config_get_target(config, config->target);
         if (!target)
         {
-            fprintf(stderr, "error: no default target set in mach.toml\n");
+            fprintf(stderr, "error: default target '%s' not found in mach.toml\n", config->target);
             config_dnit(config);
             free(project_root);
             return 1;
         }
     }
-    target_name = target->name;
-}
 
-    // resolve executable path
-    char *exe_path = config_resolve_final_output_path(config, project_root, target_name);
-    if (!exe_path)
+    if (target == NULL)
     {
-        fprintf(stderr, "error: failed to resolve executable path for target '%s'\n", target_name);
+        fprintf(stderr, "error: unable to find valid target\n");
         config_dnit(config);
         free(project_root);
         return 1;
     }
 
-    // check if executable exists
+    // construct binary path
+    char *binary_path = NULL;
+
+    // NOTE: binary_path is a mandatory field in ConfigTarget
+    binary_path = fs_path_join(project_root, config->dir_out, target->binary);
+
+    // prepare arguments for execv
+    int    exec_argc = argc - arg_start + 1;
+    char **exec_argv = malloc(sizeof(char *) * (exec_argc + 1));
+    exec_argv[0]     = binary_path;
+    for (int i = 1; i < exec_argc; i++)
+    {
+        exec_argv[i] = argv[arg_start + i - 1];
+    }
+    exec_argv[exec_argc] = NULL;
+    int exit_code        = process_execute(binary_path, exec_argv);
+
+    free(exec_argv);
+    free(binary_path);
+    config_dnit(config);
+    free(project_root);
+
+    return exit_code;
+}
