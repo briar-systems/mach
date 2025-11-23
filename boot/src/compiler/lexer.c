@@ -493,7 +493,9 @@ char *lexer_eval_lit_string(Lexer *lexer, Token *token)
     int   src_len = token->len - 2; // inside quotes
     char *value   = malloc((size_t)src_len + 1);
     if (!value)
+    {
         return NULL;
+    }
 
     int j = 0;
     for (int i = 0; i < src_len; i++)

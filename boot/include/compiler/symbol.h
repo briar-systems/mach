@@ -1,7 +1,8 @@
 #ifndef SYMBOL_H
 #define SYMBOL_H
 
-#include "frontend/type.h"
+#include "compiler/type.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 

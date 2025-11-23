@@ -1,6 +1,7 @@
-#include "frontend/type.h"
-#include "frontend/ast.h"
-#include "frontend/symbol.h"
+#include "compiler/type.h"
+#include "compiler/ast.h"
+#include "compiler/symbol.h"
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -186,9 +187,13 @@ Type *type_pointer_uint(void)
     size_t size     = ptr_type ? ptr_type->size : sizeof(void *);
 
     if (size <= 2)
+    {
         return type_u16();
+    }
     if (size <= 4)
+    {
         return type_u32();
+    }
     return type_u64();
 }
 
@@ -200,7 +205,9 @@ Type *type_error(void)
 Type *type_lookup_builtin(const char *name)
 {
     if (!name)
+    {
         return NULL;
+    }
 
     // str is an alias for *u8 (null-terminated pointer)
     if (strcmp(name, "str") == 0)
@@ -211,7 +218,9 @@ Type *type_lookup_builtin(const char *name)
     for (size_t i = 0; i < sizeof(type_info_table) / sizeof(type_info_table[0]); i++)
     {
         if (strcmp(name, type_info_table[i].name) == 0)
+        {
             return g_builtin_types[type_info_table[i].kind];
+        }
     }
 
     return NULL;
@@ -227,16 +236,16 @@ Type *type_pointer_create(Type *base, bool is_read_only)
         }
     }
 
-    Type *type           = malloc(sizeof(Type));
-    type->generic_origin = NULL;
-    type->type_args      = NULL;
-    type->type_arg_count = 0;
-    type->kind           = TYPE_POINTER;
-    size_t pointer_size  = type_ptr() ? type_ptr()->size : sizeof(void *);
-    type->size           = pointer_size;
-    type->alignment      = pointer_size;
-    type->name           = NULL;
-    type->pointer.base   = base;
+    Type *type                 = malloc(sizeof(Type));
+    type->generic_origin       = NULL;
+    type->type_args            = NULL;
+    type->type_arg_count       = 0;
+    type->kind                 = TYPE_POINTER;
+    size_t pointer_size        = type_ptr() ? type_ptr()->size : sizeof(void *);
+    type->size                 = pointer_size;
+    type->alignment            = pointer_size;
+    type->name                 = NULL;
+    type->pointer.base         = base;
     type->pointer.is_read_only = is_read_only;
 
     PointerCacheEntry *entry = malloc(sizeof(PointerCacheEntry));
@@ -343,41 +352,63 @@ Type *type_alias_create(const char *name, Type *target)
 bool type_equals(Type *a, Type *b)
 {
     if (a == b)
+    {
         return true;
+    }
     if (!a || !b)
+    {
         return false;
+    }
 
     // resolve aliases
     while (a->kind == TYPE_ALIAS)
+    {
         a = a->alias.target;
+    }
     while (b->kind == TYPE_ALIAS)
+    {
         b = b->alias.target;
+    }
 
     if (a->kind == TYPE_ERROR || b->kind == TYPE_ERROR)
+    {
         return false;
+    }
 
     if (a->kind != b->kind)
+    {
         return false;
+    }
 
     switch (a->kind)
     {
     case TYPE_POINTER:
         if (a->pointer.is_read_only != b->pointer.is_read_only)
+        {
             return false;
+        }
         return type_equals(a->pointer.base, b->pointer.base);
 
     case TYPE_ARRAY:
         if (a->array.size != b->array.size)
+        {
             return false;
+        }
         return type_equals(a->array.elem_type, b->array.elem_type);
 
     case TYPE_FUNCTION:
         if (a->function.param_count != b->function.param_count)
+        {
             return false;
+        }
         if (a->function.is_variadic != b->function.is_variadic)
+        {
             return false;
+        }
         if (!type_equals(a->function.return_type, b->function.return_type))
+        {
             return false;
+        }
 
         for (size_t i = 0; i < a->function.param_count; i++)
         {
@@ -406,9 +437,13 @@ bool type_equals(Type *a, Type *b)
 bool type_is_numeric(Type *type)
 {
     if (!type)
+    {
         return false;
+    }
     while (type->kind == TYPE_ALIAS)
+    {
         type = type->alias.target;
+    }
 
     return type_is_integer(type) || type_is_float(type);
 }
@@ -416,9 +451,13 @@ bool type_is_numeric(Type *type)
 bool type_is_integer(Type *type)
 {
     if (!type)
+    {
         return false;
+    }
     while (type->kind == TYPE_ALIAS)
+    {
         type = type->alias.target;
+    }
 
     return type->kind >= TYPE_U8 && type->kind <= TYPE_I64;
 }
@@ -426,9 +465,13 @@ bool type_is_integer(Type *type)
 bool type_is_float(Type *type)
 {
     if (!type)
+    {
         return false;
+    }
     while (type->kind == TYPE_ALIAS)
+    {
         type = type->alias.target;
+    }
 
     return type->kind >= TYPE_F16 && type->kind <= TYPE_F64;
 }
@@ -436,9 +479,13 @@ bool type_is_float(Type *type)
 bool type_is_signed(Type *type)
 {
     if (!type)
+    {
         return false;
+    }
     while (type->kind == TYPE_ALIAS)
+    {
         type = type->alias.target;
+    }
 
     return (type->kind >= TYPE_I8 && type->kind <= TYPE_I64) || (type->kind >= TYPE_F16 && type->kind <= TYPE_F64);
 }
@@ -446,9 +493,13 @@ bool type_is_signed(Type *type)
 bool type_is_pointer_like(Type *type)
 {
     if (!type)
+    {
         return false;
+    }
     while (type->kind == TYPE_ALIAS)
+    {
         type = type->alias.target;
+    }
 
     return type->kind == TYPE_PTR || type->kind == TYPE_POINTER || type->kind == TYPE_FUNCTION;
 }
@@ -456,9 +507,13 @@ bool type_is_pointer_like(Type *type)
 bool type_is_truthy(Type *type)
 {
     if (!type)
+    {
         return false;
+    }
     while (type->kind == TYPE_ALIAS)
+    {
         type = type->alias.target;
+    }
 
     // only raw u8 values (0 or 1 at runtime) are valid boolean conditions
     return type->kind == TYPE_U8;
@@ -467,10 +522,14 @@ bool type_is_truthy(Type *type)
 bool type_is_error(Type *type)
 {
     if (!type)
+    {
         return false;
+    }
 
     while (type->kind == TYPE_ALIAS && type->alias.target)
+    {
         type = type->alias.target;
+    }
 
     return type->kind == TYPE_ERROR;
 }
@@ -478,14 +537,22 @@ bool type_is_error(Type *type)
 bool type_can_cast_to(Type *from, Type *to)
 {
     if (!from || !to)
+    {
         return false;
+    }
     while (from->kind == TYPE_ALIAS)
+    {
         from = from->alias.target;
+    }
     while (to->kind == TYPE_ALIAS)
+    {
         to = to->alias.target;
+    }
 
     if (from->kind == TYPE_ERROR || to->kind == TYPE_ERROR)
+    {
         return false;
+    }
 
     // array to pointer decay is not supported via cast - use ?array[0] instead
     if (from->kind == TYPE_ARRAY && (to->kind == TYPE_PTR || to->kind == TYPE_POINTER))
@@ -495,27 +562,39 @@ bool type_can_cast_to(Type *from, Type *to)
 
     // same type
     if (type_equals(from, to))
+    {
         return true;
+    }
 
     // same size casting (reinterpretation)
     if (from->size == to->size)
+    {
         return true;
+    }
 
     // numeric conversions
     if (type_is_numeric(from) && type_is_numeric(to))
+    {
         return true;
+    }
 
     // pointer conversions
     if (type_is_pointer_like(from) && type_is_pointer_like(to))
+    {
         return true;
+    }
 
     // integer to pointer conversions (common in C)
     if (type_is_integer(from) && type_is_pointer_like(to))
+    {
         return true;
+    }
 
     // pointer to integer conversions
     if (type_is_pointer_like(from) && type_is_integer(to))
+    {
         return true;
+    }
 
     return false;
 }
@@ -523,18 +602,28 @@ bool type_can_cast_to(Type *from, Type *to)
 bool type_can_assign_to(Type *from, Type *to)
 {
     if (!from || !to)
+    {
         return false;
+    }
     while (from->kind == TYPE_ALIAS)
+    {
         from = from->alias.target;
+    }
     while (to->kind == TYPE_ALIAS)
+    {
         to = to->alias.target;
+    }
 
     if (from->kind == TYPE_ERROR || to->kind == TYPE_ERROR)
+    {
         return false;
+    }
 
     // same type
     if (type_equals(from, to))
+    {
         return true;
+    }
 
     // numeric conversions (more restrictive than casting)
     if (type_is_numeric(from) && type_is_numeric(to))
@@ -544,11 +633,15 @@ bool type_can_assign_to(Type *from, Type *to)
 
         // no implicit conversions between int and float
         if (from_is_float != to_is_float)
+        {
             return false;
+        }
 
         // allow integer narrowing/widening; still guard floating-point to wider only
         if (!from_is_float)
+        {
             return true;
+        }
 
         return from->size <= to->size;
     }
@@ -561,7 +654,9 @@ bool type_can_assign_to(Type *from, Type *to)
         if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER)
         {
             if (from->pointer.is_read_only && !to->pointer.is_read_only)
+            {
                 return false;
+            }
         }
         return true;
     }
@@ -579,7 +674,9 @@ bool type_can_assign_to(Type *from, Type *to)
 size_t type_sizeof(Type *type)
 {
     if (!type)
+    {
         return 0;
+    }
 
     // resolve alias to get actual type size
     Type *resolved = type_resolve_alias(type);
@@ -596,7 +693,9 @@ size_t type_alignof(Type *type)
 Type *type_resolve(AstNode *type_node, SymbolTable *symbol_table)
 {
     if (!type_node)
+    {
         return NULL;
+    }
 
     switch (type_node->kind)
     {
@@ -607,7 +706,9 @@ Type *type_resolve(AstNode *type_node, SymbolTable *symbol_table)
         // check builtin types
         Type *builtin = type_lookup_builtin(name);
         if (builtin)
+        {
             return builtin;
+        }
 
         // look up user-defined types in symbol table
         if (symbol_table)
@@ -626,7 +727,9 @@ Type *type_resolve(AstNode *type_node, SymbolTable *symbol_table)
     {
         Type *base = type_resolve(type_node->type_ptr.base, symbol_table);
         if (!base)
+        {
             return NULL;
+        }
         return type_pointer_create(base, type_node->type_ptr.is_read_only);
     }
 
@@ -634,7 +737,9 @@ Type *type_resolve(AstNode *type_node, SymbolTable *symbol_table)
     {
         Type *elem_type = type_resolve(type_node->type_array.elem_type, symbol_table);
         if (!elem_type)
+        {
             return NULL;
+        }
         if (!type_node->type_array.size || type_node->type_array.size->kind != AST_EXPR_LIT || type_node->type_array.size->lit_expr.kind != TOKEN_LIT_INT)
         {
             return NULL;
@@ -847,14 +952,18 @@ Type *type_resolve(AstNode *type_node, SymbolTable *symbol_table)
 Type *type_resolve_alias(Type *type)
 {
     if (!type)
+    {
         return NULL;
+    }
 
     // resolve alias chain to final type
     while (type->kind == TYPE_ALIAS)
     {
         type = type->alias.target;
         if (!type)
+        {
             return NULL;
+        }
     }
 
     return type;
@@ -873,7 +982,9 @@ void type_print(Type *type)
 char *type_to_string(Type *type)
 {
     if (!type)
+    {
         return strdup("(null)");
+    }
 
     char *result = malloc(256);
     switch (type->kind)
@@ -922,7 +1033,9 @@ char *type_to_string(Type *type)
         for (size_t i = 0; i < type->function.param_count; i++)
         {
             if (i > 0)
+            {
                 strcat(result, ", ");
+            }
             char *param_str = type_to_string(type->function.param_types[i]);
             strcat(result, param_str);
             free(param_str);
@@ -930,9 +1043,13 @@ char *type_to_string(Type *type)
         if (type->function.is_variadic)
         {
             if (type->function.param_count > 0)
+            {
                 strcat(result, ", ...");
+            }
             else
+            {
                 strcat(result, "...");
+            }
         }
         strcat(result, ") ");
         if (type->function.return_type)

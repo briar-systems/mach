@@ -1,5 +1,6 @@
-#include "frontend/symbol.h"
-#include "frontend/ast.h"
+#include "compiler/symbol.h"
+#include "compiler/ast.h"
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +34,9 @@ Scope *scope_create(Scope *parent, const char *name)
 void scope_destroy(Scope *scope)
 {
     if (!scope)
+    {
         return;
+    }
 
     // destroy all symbols
     Symbol *symbol = scope->symbols;
@@ -82,7 +85,9 @@ Symbol *symbol_create(SymbolKind kind, const char *name, Type *type, AstNode *de
 {
     Symbol *symbol = malloc(sizeof(Symbol));
     if (!symbol)
+    {
         return NULL;
+    }
 
     memset(symbol, 0, sizeof(Symbol));
 
@@ -155,7 +160,9 @@ Symbol *symbol_create(SymbolKind kind, const char *name, Type *type, AstNode *de
 void symbol_destroy(Symbol *symbol)
 {
     if (!symbol)
+    {
         return;
+    }
 
     free(symbol->name);
     free(symbol->module_name);
@@ -241,10 +248,14 @@ void symbol_destroy(Symbol *symbol)
 void symbol_add(Scope *scope, Symbol *symbol)
 {
     if (!scope || !symbol)
+    {
         return;
+    }
 
     if (!symbol->home_scope)
+    {
         symbol->home_scope = scope;
+    }
 
     // add to front of list
     symbol->next   = scope->symbols;
@@ -254,14 +265,18 @@ void symbol_add(Scope *scope, Symbol *symbol)
 Symbol *symbol_lookup(SymbolTable *table, const char *name)
 {
     if (!table || !name)
+    {
         return NULL;
+    }
 
     // search from current scope up to global
     for (Scope *scope = table->current_scope; scope; scope = scope->parent)
     {
         Symbol *symbol = symbol_lookup_scope(scope, name);
         if (symbol)
+        {
             return symbol;
+        }
     }
 
     return NULL;
@@ -270,7 +285,9 @@ Symbol *symbol_lookup(SymbolTable *table, const char *name)
 Symbol *symbol_lookup_scope(Scope *scope, const char *name)
 {
     if (!scope || !name)
+    {
         return NULL;
+    }
 
     for (Symbol *symbol = scope->symbols; symbol; symbol = symbol->next)
     {
@@ -286,7 +303,9 @@ Symbol *symbol_lookup_scope(Scope *scope, const char *name)
 Symbol *symbol_lookup_module(SymbolTable *table, const char *module, const char *name)
 {
     if (!table || !module || !name)
+    {
         return NULL;
+    }
 
     // find module symbol first
     Symbol *module_symbol = symbol_lookup(table, module);
@@ -307,7 +326,9 @@ Symbol *symbol_lookup_module(SymbolTable *table, const char *module, const char 
 Symbol *symbol_add_field(Symbol *composite_symbol, const char *field_name, Type *field_type, AstNode *decl)
 {
     if (!composite_symbol || !field_name || !field_type)
+    {
         return NULL;
+    }
     if (composite_symbol->type->kind != TYPE_STRUCT && composite_symbol->type->kind != TYPE_UNION)
     {
         return NULL;
@@ -325,7 +346,9 @@ Symbol *symbol_add_field(Symbol *composite_symbol, const char *field_name, Type 
         // find last field and append
         Symbol *last = composite_symbol->type->composite.fields;
         while (last->next)
+        {
             last = last->next;
+        }
         last->next = field_symbol;
     }
 
@@ -337,7 +360,9 @@ Symbol *symbol_add_field(Symbol *composite_symbol, const char *field_name, Type 
 Symbol *symbol_find_field(Symbol *composite_symbol, const char *field_name)
 {
     if (!composite_symbol || !field_name)
+    {
         return NULL;
+    }
     if (composite_symbol->type->kind != TYPE_STRUCT && composite_symbol->type->kind != TYPE_UNION)
     {
         return NULL;
@@ -357,9 +382,13 @@ Symbol *symbol_find_field(Symbol *composite_symbol, const char *field_name)
 void type_add_method(Symbol *type_symbol, Symbol *method_symbol)
 {
     if (!type_symbol || !method_symbol)
+    {
         return;
+    }
     if (type_symbol->kind != SYMBOL_TYPE || method_symbol->kind != SYMBOL_FUNC)
+    {
         return;
+    }
 
     method_symbol->method_next       = type_symbol->type_def.methods;
     type_symbol->type_def.methods    = method_symbol;
@@ -375,14 +404,20 @@ void type_add_method(Symbol *type_symbol, Symbol *method_symbol)
 Symbol *type_find_method(Symbol *type_symbol, const char *method_name, bool receiver_is_pointer)
 {
     if (!type_symbol || type_symbol->kind != SYMBOL_TYPE || !method_name)
+    {
         return NULL;
+    }
 
     for (Symbol *method = type_symbol->type_def.methods; method; method = method->method_next)
     {
         if (!method->name || strcmp(method->name, method_name) != 0)
+        {
             continue;
+        }
         if (method->func.method_receiver_is_pointer != receiver_is_pointer)
+        {
             continue;
+        }
         return method;
     }
 
@@ -397,7 +432,9 @@ static size_t align_offset(size_t offset, size_t alignment)
 size_t symbol_calculate_struct_layout(Symbol *struct_symbol)
 {
     if (!struct_symbol || struct_symbol->type->kind != TYPE_STRUCT)
+    {
         return 0;
+    }
 
     size_t offset        = 0;
     size_t max_alignment = 1;
@@ -428,7 +465,9 @@ size_t symbol_calculate_struct_layout(Symbol *struct_symbol)
 size_t symbol_calculate_union_layout(Symbol *union_symbol)
 {
     if (!union_symbol || union_symbol->type->kind != TYPE_UNION)
+    {
         return 0;
+    }
 
     size_t max_size      = 0;
     size_t max_alignment = 1;
@@ -471,7 +510,9 @@ Symbol *symbol_create_module(const char *name, const char *path)
 void symbol_add_module(SymbolTable *table, Symbol *module_symbol)
 {
     if (!table || !module_symbol || module_symbol->kind != SYMBOL_MODULE)
+    {
         return;
+    }
 
     symbol_add(table->global_scope, module_symbol);
 }
@@ -479,7 +520,9 @@ void symbol_add_module(SymbolTable *table, Symbol *module_symbol)
 Symbol *symbol_find_module(SymbolTable *table, const char *name)
 {
     if (!table || !name)
+    {
         return NULL;
+    }
 
     Symbol *symbol = symbol_lookup_scope(table->global_scope, name);
     if (symbol && symbol->kind == SYMBOL_MODULE)
@@ -493,10 +536,14 @@ Symbol *symbol_find_module(SymbolTable *table, const char *name)
 void symbol_print(Symbol *symbol, int indent)
 {
     if (!symbol)
+    {
         return;
+    }
 
     for (int i = 0; i < indent; i++)
+    {
         printf("  ");
+    }
 
     const char *kind_name;
     switch (symbol->kind)
@@ -535,10 +582,14 @@ void symbol_print(Symbol *symbol, int indent)
 void scope_print(Scope *scope, int indent)
 {
     if (!scope)
+    {
         return;
+    }
 
     for (int i = 0; i < indent; i++)
+    {
         printf("  ");
+    }
     printf("scope %s {\n", scope->name ? scope->name : "(anonymous)");
 
     for (Symbol *symbol = scope->symbols; symbol; symbol = symbol->next)
@@ -547,6 +598,8 @@ void scope_print(Scope *scope, int indent)
     }
 
     for (int i = 0; i < indent; i++)
+    {
         printf("  ");
+    }
     printf("}\n");
 }
