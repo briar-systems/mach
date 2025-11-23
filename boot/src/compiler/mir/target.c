@@ -1,4 +1,4 @@
-#include "mir/target.h"
+#include "compiler/mir/target.h"
 // #include "backend/isa/x86_64.h"
 // #include "backend/abi/sysv64.h"
 // #include "backend/os/linux.h"

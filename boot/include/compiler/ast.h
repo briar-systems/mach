@@ -1,8 +1,7 @@
 #ifndef AST_H
 #define AST_H
 
-#include "frontend/token.h"
-#include "mir/mir.h"
+#include "compiler/token.h"
 #include <stdbool.h>
 
 // forward statements
@@ -92,7 +91,8 @@ struct AstNode
         // mir block
         struct
         {
-            MirBasicBlock *blocks;
+            // TODO: figure out how to represent MIR here
+            AstNode *mir_block;
         } mir;
 
         // module statement

@@ -1,4 +1,4 @@
-#include "frontend/ast.h"
+#include "compiler/ast.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +12,9 @@ void ast_node_init(AstNode *node, AstKind kind)
 void ast_node_dnit(AstNode *node)
 {
     if (!node)
+    {
         return;
+    }
 
     // free token if present
     if (node->token)
@@ -237,13 +239,10 @@ void ast_node_dnit(AstNode *node)
         break;
 
     case AST_STMT_MIR:
+        if (node->mir.mir_block)
         {
-            MirBasicBlock *block = node->mir.blocks;
-            while (block) {
-                MirBasicBlock *next = block->next;
-                mir_block_destroy(block);
-                block = next;
-            }
+            ast_node_dnit(node->mir.mir_block);
+            free(node->mir.mir_block);
         }
         break;
 
@@ -450,7 +449,9 @@ void ast_list_init(AstList *list)
 void ast_list_dnit(AstList *list)
 {
     if (!list)
+    {
         return;
+    }
 
     for (int i = 0; i < list->count; i++)
     {
@@ -476,7 +477,9 @@ void ast_list_append(AstList *list, AstNode *node)
 void ast_list_prepend(AstList *list, AstNode *node)
 {
     if (!list)
+    {
         return;
+    }
 
     if (list->count >= list->capacity)
     {
@@ -503,11 +506,15 @@ static AstNode *ast_clone_checked(const AstNode *node);
 AstList *ast_list_clone(const AstList *list)
 {
     if (!list)
+    {
         return NULL;
+    }
 
     AstList *clone = malloc(sizeof(AstList));
     if (!clone)
+    {
         return NULL;
+    }
 
     ast_list_init(clone);
 
@@ -534,11 +541,15 @@ AstNode *ast_clone(const AstNode *node)
 static AstNode *ast_clone_checked(const AstNode *node)
 {
     if (!node)
+    {
         return NULL;
+    }
 
     AstNode *clone = malloc(sizeof(AstNode));
     if (!clone)
+    {
         return NULL;
+    }
 
     ast_node_init(clone, node->kind);
     clone->type   = NULL;
@@ -666,6 +677,10 @@ static AstNode *ast_clone_checked(const AstNode *node)
     case AST_STMT_CNT:
         break;
 
+    case AST_STMT_MIR:
+        clone->mir.mir_block = ast_clone_checked(node->mir.mir_block);
+        break;
+
     case AST_EXPR_BINARY:
         clone->binary_expr.left  = ast_clone_checked(node->binary_expr.left);
         clone->binary_expr.right = ast_clone_checked(node->binary_expr.right);
@@ -786,6 +801,35 @@ static void print_indent(int indent)
     for (int i = 0; i < indent; i++)
     {
         printf("  ");
+    }
+}
+
+// helper to print escaped string
+static void print_escaped_string(FILE *stream, const char *str)
+{
+    while (*str)
+    {
+        switch (*str)
+        {
+        case '\n':
+            fprintf(stream, "\\n");
+            break;
+        case '\t':
+            fprintf(stream, "\\t");
+            break;
+        case '\r':
+            fprintf(stream, "\\r");
+            break;
+        case '\\':
+            fprintf(stream, "\\\\");
+            break;
+        case '\"':
+            fprintf(stream, "\\\"");
+            break;
+        default:
+            fputc(*str, stream);
+        }
+        str++;
     }
 }
 
@@ -1001,6 +1045,11 @@ void ast_print(AstNode *node, int indent)
         printf("CNT\n");
         break;
 
+    case AST_STMT_MIR:
+        printf("MIR_BLOCK\n");
+        ast_print(node->mir.mir_block, indent + 1);
+        break;
+
     case AST_EXPR_BINARY:
         printf("BINARY %s\n", token_kind_to_string(node->binary_expr.op));
         ast_print(node->binary_expr.left, indent + 1);
@@ -1069,7 +1118,9 @@ void ast_print(AstNode *node, int indent)
             printf("CHAR '%c'\n", node->lit_expr.char_val);
             break;
         case TOKEN_LIT_STRING:
-            printf("STRING \"%s\"\n", node->lit_expr.string_val);
+            printf("STRING \"");
+            print_escaped_string(stdout, node->lit_expr.string_val);
+            printf("\"\n");
             break;
         default:
             printf("???\n");
@@ -1104,9 +1155,13 @@ void ast_print(AstNode *node, int indent)
 
     case AST_TYPE_NAME:
         if (node->type_name.module_alias)
+        {
             printf("TYPE %s.%s\n", node->type_name.module_alias, node->type_name.name);
+        }
         else
+        {
             printf("TYPE %s\n", node->type_name.name);
+        }
         if (node->type_name.generic_args && node->type_name.generic_args->count > 0)
         {
             print_indent(indent + 1);
@@ -1489,6 +1544,10 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
     case AST_STMT_CNT:
         fprintf(file, "CNT\n");
         break;
+    case AST_STMT_MIR:
+        fprintf(file, "MIR_BLOCK\n");
+        ast_print_to_file(node->mir.mir_block, file, indent + 1);
+        break;
     case AST_EXPR_BINARY:
         fprintf(file, "BINARY %s\n", token_kind_to_string(node->binary_expr.op));
         ast_print_to_file(node->binary_expr.left, file, indent + 1);
@@ -1550,7 +1609,9 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
             fprintf(file, "CHAR '%c'\n", node->lit_expr.char_val);
             break;
         case TOKEN_LIT_STRING:
-            fprintf(file, "STRING \"%s\"\n", node->lit_expr.string_val);
+            fprintf(file, "STRING \"");
+            print_escaped_string(file, node->lit_expr.string_val);
+            fprintf(file, "\"\n");
             break;
         default:
             fprintf(file, "???\n");
@@ -1581,9 +1642,13 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         break;
     case AST_TYPE_NAME:
         if (node->type_name.module_alias)
+        {
             fprintf(file, "TYPE %s.%s\n", node->type_name.module_alias, node->type_name.name);
+        }
         else
+        {
             fprintf(file, "TYPE %s\n", node->type_name.name);
+        }
         if (node->type_name.generic_args && node->type_name.generic_args->count > 0)
         {
             print_indent_to_file(file, indent + 1);
@@ -1663,7 +1728,9 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
 bool ast_emit(AstNode *node, const char *file_path)
 {
     if (!node || !file_path)
+    {
         return false;
+    }
 
     FILE *file = fopen(file_path, "w");
     if (!file)

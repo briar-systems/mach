@@ -1,7 +1,7 @@
 #ifndef LEXER_H
 #define LEXER_H
 
-#include "frontend/token.h"
+#include "compiler/token.h"
 
 #include <stdbool.h>
 
