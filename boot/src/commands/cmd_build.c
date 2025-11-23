@@ -13,3 +13,11 @@ void cmd_build_help(FILE *stream)
     fprintf(stream, "  -o <file>            output file (executable or object)\n");
     fprintf(stream, "  -I n=dir             map module prefix 'n' to base directory 'dir'\n");
 }
+
+int cmd_build_handle(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "error: build command not yet implemented\n");
+    return 1;
+}

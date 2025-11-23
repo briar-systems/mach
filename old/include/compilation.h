@@ -1,9 +1,9 @@
 #ifndef COMPILATION_H
 #define COMPILATION_H
 
-#include "frontend/ast.h"
 #include "codegen.h"
 #include "config.h"
+#include "frontend/ast.h"
 #include "frontend/module.h"
 #include "frontend/semantic.h"
 #include <stdbool.h>
@@ -48,7 +48,7 @@ typedef struct
 {
     BuildOptions   *options;
     SemanticDriver *driver;
-    ProjectConfig  *config;
+    Config         *config;
     char           *project_root;
     char           *source;
     AstNode        *ast;

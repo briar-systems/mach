@@ -1,7 +1,7 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#include "backend/target.h"
+#include "mir/target.h"
 
 #include <stdbool.h>
 

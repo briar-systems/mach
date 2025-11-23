@@ -1,5 +1,6 @@
 #include "backend/backend.h"
 #include "backend/codegen.h"
+#include "backend/mir/lower.h"
 #include <stdio.h>
 
 bool backend_emit_with_target(const Target *target, MirModule *module, const char *output_path)
@@ -9,10 +10,10 @@ bool backend_emit_with_target(const Target *target, MirModule *module, const cha
         return false;
     }
 
-    BackendCodegenResult result;
+    CodegenResult result;
     backend_codegen_result_init(&result);
 
-    bool ok = target->isa->lower(target, module, &result);
+    bool ok = backend_mir_lower(target, module, &result);
     if (ok)
     {
         ok = target->writer->write_executable(target, &result, output_path);

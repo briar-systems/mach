@@ -1,7 +1,6 @@
 #include "config.h"
 #include "filesystem.h"
 #include "toml.h"
-#include "backend/target.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -232,7 +231,7 @@ void config_dnit(Config *config)
 // configuration file management
 Config *config_load(const char *config_path)
 {
-    char *content = fs_read_file(config_path);
+    char *content = read_file(config_path);
     if (!content)
     {
         fprintf(stderr, "error: failed to read config file: %s\n", config_path);
@@ -253,44 +252,47 @@ Config *config_load(const char *config_path)
     Config *config = malloc(sizeof(Config));
     config_init(config);
 
-    // parse project fields
-    toml_value_t *id = toml_table_get(root, "id");
+    // parse project section
+    toml_value_t *project_val = toml_table_get(root, "project");
+    toml_table_t *project = project_val && toml_value_is_table(project_val) ? project_val->as.table : root;
+
+    toml_value_t *id = toml_table_get(project, "id");
     if (id && toml_value_is_string(id))
     {
         config->id = strdup(id->as.string);
     }
 
-    toml_value_t *name = toml_table_get(root, "name");
+    toml_value_t *name = toml_table_get(project, "name");
     if (name && toml_value_is_string(name))
     {
         config->name = strdup(name->as.string);
     }
 
-    toml_value_t *version = toml_table_get(root, "version");
+    toml_value_t *version = toml_table_get(project, "version");
     if (version && toml_value_is_string(version))
     {
         config->version = strdup(version->as.string);
     }
 
-    toml_value_t *dir_src = toml_table_get(root, "dir.src");
+    toml_value_t *dir_src = toml_table_get(project, "dir_src");
     if (dir_src && toml_value_is_string(dir_src))
     {
         config->dir_src = strdup(dir_src->as.string);
     }
 
-    toml_value_t *dir_out = toml_table_get(root, "dir.out");
+    toml_value_t *dir_out = toml_table_get(project, "dir_out");
     if (dir_out && toml_value_is_string(dir_out))
     {
         config->dir_out = strdup(dir_out->as.string);
     }
 
-    toml_value_t *dir_dep = toml_table_get(root, "dir.dep");
+    toml_value_t *dir_dep = toml_table_get(project, "dir_dep");
     if (dir_dep && toml_value_is_string(dir_dep))
     {
         config->dir_dep = strdup(dir_dep->as.string);
     }
 
-    toml_value_t *target = toml_table_get(root, "target");
+    toml_value_t *target = toml_table_get(project, "target");
     if (target && toml_value_is_string(target))
     {
         config->target = strdup(target->as.string);
@@ -410,6 +412,148 @@ Config *config_load(const char *config_path)
     }
 
     toml_table_free(root);
+
+    // validate mandatory fields in [project]
+    if (!config->id)
+    {
+        fprintf(stderr, "error: missing mandatory field 'id' in [project]\n");
+        config_dnit(config);
+        free(config);
+        return NULL;
+    }
+    if (!config->name)
+    {
+        fprintf(stderr, "error: missing mandatory field 'name' in [project]\n");
+        config_dnit(config);
+        free(config);
+        return NULL;
+    }
+    if (!config->version)
+    {
+        fprintf(stderr, "error: missing mandatory field 'version' in [project]\n");
+        config_dnit(config);
+        free(config);
+        return NULL;
+    }
+    if (!config->dir_src)
+    {
+        fprintf(stderr, "error: missing mandatory field 'dir_src' in [project]\n");
+        config_dnit(config);
+        free(config);
+        return NULL;
+    }
+    if (!config->dir_out)
+    {
+        fprintf(stderr, "error: missing mandatory field 'dir_out' in [project]\n");
+        config_dnit(config);
+        free(config);
+        return NULL;
+    }
+    if (!config->dir_dep)
+    {
+        fprintf(stderr, "error: missing mandatory field 'dir_dep' in [project]\n");
+        config_dnit(config);
+        free(config);
+        return NULL;
+    }
+    if (!config->target)
+    {
+        fprintf(stderr, "error: missing mandatory field 'target' in [project]\n");
+        config_dnit(config);
+        free(config);
+        return NULL;
+    }
+
+    // validate mandatory fields in targets
+    for (int i = 0; i < config->target_count; i++)
+    {
+        ConfigTarget *t = config->targets[i];
+        if (!t->name)
+        {
+            fprintf(stderr, "error: target %d missing name\n", i);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+        if (t->os == TARGET_OS_KIND_COUNT)
+        {
+            fprintf(stderr, "error: target '%s' missing mandatory field 'os'\n", t->name);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+        if (t->isa == TARGET_ISA_KIND_COUNT)
+        {
+            fprintf(stderr, "error: target '%s' missing mandatory field 'isa'\n", t->name);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+        if (t->abi == TARGET_ABI_KIND_COUNT)
+        {
+            fprintf(stderr, "error: target '%s' missing mandatory field 'abi'\n", t->name);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+        if (!t->mode)
+        {
+            fprintf(stderr, "error: target '%s' missing mandatory field 'mode'\n", t->name);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+        if (!t->entrypoint)
+        {
+            fprintf(stderr, "error: target '%s' missing mandatory field 'entrypoint'\n", t->name);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+        if (!t->binary)
+        {
+            fprintf(stderr, "error: target '%s' missing mandatory field 'binary'\n", t->name);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+    }
+
+    // validate mandatory fields in deps
+    for (int i = 0; i < config->dep_count; i++)
+    {
+        ConfigDep *d = config->deps[i];
+        if (!d->name)
+        {
+            fprintf(stderr, "error: dependency %d missing name\n", i);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+        if (!d->type)
+        {
+            fprintf(stderr, "error: dependency '%s' missing mandatory field 'type'\n", d->name);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+        if (!d->path)
+        {
+            fprintf(stderr, "error: dependency '%s' missing mandatory field 'path'\n", d->name);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+        // version is mandatory for remote dependencies
+        if (d->type->kind == DEP_TYPE_REMOTE && !d->version)
+        {
+            fprintf(stderr, "error: remote dependency '%s' missing mandatory field 'version'\n", d->name);
+            config_dnit(config);
+            free(config);
+            return NULL;
+        }
+    }
+
     return config;
 }
 
@@ -426,7 +570,8 @@ bool config_save(Config *config, const char *config_path)
         return false;
     }
 
-    // write project fields
+    // write project section
+    fprintf(f, "[project]\n");
     if (config->id)
     {
         fprintf(f, "id = \"%s\"\n", config->id);
@@ -439,24 +584,21 @@ bool config_save(Config *config, const char *config_path)
     {
         fprintf(f, "version = \"%s\"\n", config->version);
     }
-    if (config->target)
-    {
-        fprintf(f, "target = \"%s\"\n", config->target);
-    }
-
-    // write dir section
-    fprintf(f, "\n[dir]\n");
     if (config->dir_src)
     {
-        fprintf(f, "src = \"%s\"\n", config->dir_src);
-    }
-    if (config->dir_out)
-    {
-        fprintf(f, "out = \"%s\"\n", config->dir_out);
+        fprintf(f, "dir_src = \"%s\"\n", config->dir_src);
     }
     if (config->dir_dep)
     {
-        fprintf(f, "dep = \"%s\"\n", config->dir_dep);
+        fprintf(f, "dir_dep = \"%s\"\n", config->dir_dep);
+    }
+    if (config->dir_out)
+    {
+        fprintf(f, "dir_out = \"%s\"\n", config->dir_out);
+    }
+    if (config->target)
+    {
+        fprintf(f, "target = \"%s\"\n", config->target);
     }
 
     // write targets
@@ -510,7 +652,7 @@ bool config_save(Config *config, const char *config_path)
             }
             if (dep->path)
             {
-                fprintf(f, "source = \"%s\"\n", dep->path);
+                fprintf(f, "path = \"%s\"\n", dep->path);
             }
             if (dep->version && dep->version->value)
             {

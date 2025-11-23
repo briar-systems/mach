@@ -178,7 +178,7 @@ static char *parse_string(parser_t *p)
     return result;
 }
 
-// parse key (bare, quoted)
+// parse key (bare, quoted, or dotted)
 static char *parse_key(parser_t *p)
 {
     lexer_t *l = &p->lexer;
@@ -190,9 +190,9 @@ static char *parse_key(parser_t *p)
         return parse_string(p);
     }
 
-    // bare key
+    // bare key (can include dots for dotted keys)
     size_t start = l->pos;
-    while (l->input[l->pos] && (isalnum(l->input[l->pos]) || l->input[l->pos] == '_' || l->input[l->pos] == '-'))
+    while (l->input[l->pos] && (isalnum(l->input[l->pos]) || l->input[l->pos] == '_' || l->input[l->pos] == '-' || l->input[l->pos] == '.'))
     {
         l->pos++;
         l->col++;
@@ -526,7 +526,7 @@ toml_table_t *toml_parse(const char *input, char **error)
         {
             consume(&parser.lexer);
 
-            // parse table header
+            // parse table header (may contain dots for nested tables)
             char *table_name = parse_key(&parser);
             if (!table_name || parser.error)
             {
@@ -540,18 +540,63 @@ toml_table_t *toml_parse(const char *input, char **error)
                 break;
             }
 
-            // find or create nested table
-            toml_value_t *existing = toml_table_get(root, table_name);
+            // handle dotted table names by creating nested structure
+            // e.g., [deps.mach-std] creates deps table with mach-std subtable
+            current_table = root;
+            char *key_start = table_name;
+            char *dot_pos;
+
+            while ((dot_pos = strchr(key_start, '.')) != NULL)
+            {
+                // extract current segment
+                size_t seg_len = (size_t)(dot_pos - key_start);
+                char *segment = malloc(seg_len + 1);
+                memcpy(segment, key_start, seg_len);
+                segment[seg_len] = '\0';
+
+                // find or create this level
+                toml_value_t *existing = toml_table_get(current_table, segment);
+                if (existing && existing->type == TOML_TABLE)
+                {
+                    current_table = existing->as.table;
+                    free(segment);
+                }
+                else
+                {
+                    if (current_table->count >= current_table->capacity)
+                    {
+                        current_table->capacity *= 2;
+                        current_table->entries = realloc(current_table->entries, current_table->capacity * sizeof(toml_entry_t));
+                    }
+
+                    toml_table_t *new_table = malloc(sizeof(toml_table_t));
+                    new_table->capacity     = 8;
+                    new_table->count        = 0;
+                    new_table->entries      = malloc(new_table->capacity * sizeof(toml_entry_t));
+
+                    current_table->entries[current_table->count].key            = segment;
+                    current_table->entries[current_table->count].value.type     = TOML_TABLE;
+                    current_table->entries[current_table->count].value.as.table = new_table;
+                    current_table->count++;
+
+                    current_table = new_table;
+                }
+
+                key_start = dot_pos + 1;
+            }
+
+            // handle final segment
+            toml_value_t *existing = toml_table_get(current_table, key_start);
             if (existing && existing->type == TOML_TABLE)
             {
                 current_table = existing->as.table;
             }
             else
             {
-                if (root->count >= root->capacity)
+                if (current_table->count >= current_table->capacity)
                 {
-                    root->capacity *= 2;
-                    root->entries = realloc(root->entries, root->capacity * sizeof(toml_entry_t));
+                    current_table->capacity *= 2;
+                    current_table->entries = realloc(current_table->entries, current_table->capacity * sizeof(toml_entry_t));
                 }
 
                 toml_table_t *new_table = malloc(sizeof(toml_table_t));
@@ -559,13 +604,15 @@ toml_table_t *toml_parse(const char *input, char **error)
                 new_table->count        = 0;
                 new_table->entries      = malloc(new_table->capacity * sizeof(toml_entry_t));
 
-                root->entries[root->count].key            = table_name;
-                root->entries[root->count].value.type     = TOML_TABLE;
-                root->entries[root->count].value.as.table = new_table;
-                root->count++;
+                current_table->entries[current_table->count].key            = strdup(key_start);
+                current_table->entries[current_table->count].value.type     = TOML_TABLE;
+                current_table->entries[current_table->count].value.as.table = new_table;
+                current_table->count++;
 
                 current_table = new_table;
             }
+
+            free(table_name);
             continue;
         }
 

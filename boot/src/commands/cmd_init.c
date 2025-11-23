@@ -1,5 +1,6 @@
 #include "commands/cmd_init.h"
 #include "filesystem.h"
+#include "git.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -27,14 +28,15 @@ const char *template_mach_toml = "[project]\n"
                                  "target  = \"native\"\n"
                                  "\n"
                                  "[targets.linux]\n"
-                                 "platform   = \"linux\"\n"
-                                 "arch       = \"x86_64\"\n"
+                                 "os         = \"linux\"\n"
+                                 "isa        = \"x86_64\"\n"
+                                 "abi        = \"sysv64\"\n"
                                  "mode       = \"executable\"\n"
                                  "entrypoint = \"main.mach\"\n"
                                  "artifacts  = \"linux\"\n"
                                  "binary     = \"linux/bin/%s\"\n"
                                  "\n"
-                                 "[dep.mach-std]\n"
+                                 "[deps.mach-std]\n"
                                  "type    = \"remote\"\n"
                                  "path    = \"https://github.com/octalide/mach-std\"\n"
                                  "version = \"branch/main\"\n";
@@ -63,15 +65,22 @@ int cmd_init_handle(int argc, char **argv)
         return 1;
     }
 
+    // ensure project does not already exist
+    if (file_exists(project_id))
+    {
+        fprintf(stderr, "error: directory '%s' already exists\n", project_id);
+        return 1;
+    }
+
     // create project directory
-    if (!fs_ensure_dir_recursive(project_id))
+    if (!ensure_dir_recursive(project_id))
     {
         fprintf(stderr, "error: failed to create project directory\n");
         return 1;
     }
 
     // cd into it
-    if (!fs_chdir(project_id))
+    if (!chdir_path(project_id))
     {
         fprintf(stderr, "error: failed to change to project directory\n");
         return 1;
@@ -79,7 +88,7 @@ int cmd_init_handle(int argc, char **argv)
 
     // create src directory
     const char *src_dir = "src";
-    if (!fs_ensure_dir_recursive(src_dir))
+    if (!ensure_dir_recursive(src_dir))
     {
         fprintf(stderr, "error: failed to create src directory\n");
         return 1;
@@ -87,7 +96,7 @@ int cmd_init_handle(int argc, char **argv)
 
     // create dep directory
     const char *dep_dir = "dep";
-    if (!fs_ensure_dir_recursive(dep_dir))
+    if (!ensure_dir_recursive(dep_dir))
     {
         fprintf(stderr, "error: failed to create dep directory\n");
         return 1;
@@ -95,7 +104,7 @@ int cmd_init_handle(int argc, char **argv)
 
     // create out directory
     const char *out_dir = "out";
-    if (!fs_ensure_dir_recursive(out_dir))
+    if (!ensure_dir_recursive(out_dir))
     {
         fprintf(stderr, "error: failed to create out directory\n");
         return 1;
@@ -115,7 +124,7 @@ int cmd_init_handle(int argc, char **argv)
     fclose(mach_toml);
 
     // cd into src directory
-    if (!fs_chdir(src_dir))
+    if (!chdir_path(src_dir))
     {
         fprintf(stderr, "error: failed to change to src directory\n");
         return 1;
@@ -134,9 +143,50 @@ int cmd_init_handle(int argc, char **argv)
 
     fclose(main_file);
 
-    // TODO: initialize git repository
-    // TODO: create .gitignore file
-    // TODO: trigger `mach dep pull mach-std` mechanism to initialize dep directory
+    // go back to project root
+    if (!chdir_path(".."))
+    {
+        fprintf(stderr, "warning: failed to return to project root\n");
+    }
+
+    // initialize git repository
+    printf("initializing git repository...\n");
+    if (git_exec("git init") != 0)
+    {
+        fprintf(stderr, "warning: failed to initialize git repository\n");
+    }
+
+    // create .gitignore file
+    FILE *gitignore = fopen(".gitignore", "w");
+    if (gitignore)
+    {
+        fprintf(gitignore, "out/\n");
+        fprintf(gitignore, ".DS_Store\n");
+        fprintf(gitignore, "Thumbs.db\n");
+        fclose(gitignore);
+    }
+    else
+    {
+        fprintf(stderr, "warning: failed to create .gitignore file\n");
+    }
+
+    // initialize mach-std dependency
+    printf("initializing mach-std dependency...\n");
+    const char *mach_std_path = "dep/mach-std";
+    const char *mach_std_url = "https://github.com/octalide/mach-std";
+    
+    if (!git_submodule_init(mach_std_path, mach_std_url))
+    {
+        fprintf(stderr, "warning: failed to initialize mach-std submodule\n");
+    }
+    else
+    {
+        // checkout branch/main
+        if (!git_checkout_version(mach_std_path, "branch/main"))
+        {
+            fprintf(stderr, "warning: failed to checkout mach-std version\n");
+        }
+    }
 
     printf("created a new project at '%s'\n", project_id);
 

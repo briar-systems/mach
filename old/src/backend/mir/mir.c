@@ -1,4 +1,4 @@
-#include "mir.h"
+#include "backend/mir/mir.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>

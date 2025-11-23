@@ -1,6 +1,5 @@
-#include "backend/reloc.h"
-#include <stdlib.h>
-#include <string.h>
+#include "backend/codegen.h"
+
 
 static char *dup_string(const char *str)
 {
@@ -113,4 +112,34 @@ bool backend_reloc_list_add(BackendRelocList *list, BackendSectionKind section, 
     reloc->symbol       = dup_string(symbol);
     reloc->addend       = addend;
     return reloc->symbol != NULL;
+}
+
+
+void backend_codegen_result_init(CodegenResult *result)
+{
+    result->text.kind   = SECTION_TEXT;
+    result->rodata.kind = SECTION_RODATA;
+    result->data.kind   = SECTION_DATA;
+
+    codebuf_init(&result->text.buffer);
+    codebuf_init(&result->rodata.buffer);
+    codebuf_init(&result->data.buffer);
+
+    backend_label_list_init(&result->labels);
+    backend_reloc_list_init(&result->relocs);
+}
+
+void backend_codegen_result_destroy(CodegenResult *result)
+{
+    if (!result)
+    {
+        return;
+    }
+
+    codebuf_free(&result->text.buffer);
+    codebuf_free(&result->rodata.buffer);
+    codebuf_free(&result->data.buffer);
+
+    backend_label_list_destroy(&result->labels);
+    backend_reloc_list_destroy(&result->relocs);
 }

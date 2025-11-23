@@ -70,54 +70,52 @@ static int process_execute(const char *path, char **args)
 
 void cmd_run_help(FILE *stream)
 {
-    fprintf(stream, "usage: mach run <path> [--target <name>] [args...]\n");
+    fprintf(stream, "usage: mach run [--target <name>] [args...]\n");
     fprintf(stream, "\n");
-    fprintf(stream, "run the built executable for a Mach project located at the specified path\n");
+    fprintf(stream, "run the built executable for a Mach project in the current directory\n");
     fprintf(stream, "\n");
     fprintf(stream, "options:\n");
-    fprintf(stream, "  <path>               project directory (default: current directory)\n");
     fprintf(stream, "  --target <name>      select target to run (default: default project target)\n");
     fprintf(stream, "  [args...]            arguments to pass to the executable\n");
 }
 
 // execute a Mach project executable
-// looks for mach.toml in the specified directory to determine target and output path
+// looks for mach.toml in the current directory to determine target and output path
 // passes any additional arguments to the executable
 // returns exit code of the executed program
 int cmd_run_handle(int argc, char **argv)
 {
-    const char *project_path = ".";
     const char *target_name  = NULL;
-    int         arg_start    = 3; // index of first arg to pass to executable
+    int         arg_start    = 2; // index of first arg to pass to executable
 
-    // parse arguments
-    if (argc >= 3)
+    // find project root from current directory
+    char *project_root = find_project_root(".");
+    if (!project_root)
     {
-        project_path = argv[2];
+        fprintf(stderr, "error: failed to find project root\n");
+        return 1;
     }
 
-    // build project config path from project_path + "/mach.toml"
-    char *project_root = NULL;
-#ifdef _WIN32
-    char resolved[PATH_MAX];
-    if (_fullpath(resolved, project_path, PATH_MAX))
+    // build config path
+    char *config_path = path_join(project_root, "mach.toml");
+    if (!config_path)
     {
-        project_root = strdup(resolved);
+        fprintf(stderr, "error: failed to build config path\n");
+        free(project_root);
+        return 1;
     }
-#else
-    project_root = realpath(project_path, NULL);
-#endif
 
-    Config *config = config_load(project_root);
+    Config *config = config_load(config_path);
+    free(config_path);
     if (!config)
     {
-        fprintf(stderr, "error: failed to load mach.toml\n");
+        fprintf(stderr, "error: failed to load mach.toml from current directory\n");
         free(project_root);
         return 1;
     }
 
     // parse --target flag
-    for (int i = 3; i < argc; i++)
+    for (int i = 2; i < argc; i++)
     {
         if (strcmp(argv[i], "--target") == 0)
         {
@@ -177,7 +175,9 @@ int cmd_run_handle(int argc, char **argv)
     char *binary_path = NULL;
 
     // NOTE: binary_path is a mandatory field in ConfigTarget
-    binary_path = fs_path_join(project_root, config->dir_out, target->binary);
+    char *out_path = path_join(project_root, config->dir_out);
+    binary_path = path_join(out_path, target->binary);
+    free(out_path);
 
     // prepare arguments for execv
     int    exec_argc = argc - arg_start + 1;

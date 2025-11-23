@@ -1,7 +1,7 @@
-#include "backend/target.h"
-#include "backend/isa/x86_64.h"
-#include "backend/abi/sysv64.h"
-#include "backend/os/linux.h"
+#include "mir/target.h"
+// #include "backend/isa/x86_64.h"
+// #include "backend/abi/sysv64.h"
+// #include "backend/os/linux.h"
 
 #include <stddef.h>
 
@@ -18,7 +18,7 @@ const Target *target_get(TargetISAKind isa, TargetABIKind abi, TargetOSKind os)
     switch (isa)
     {
     case TARGET_ISA_KIND_X86_64:
-        target.isa = isa_x86_64();
+        // target.isa = isa_x86_64();
         break;
     default:
         return NULL;
@@ -27,7 +27,7 @@ const Target *target_get(TargetISAKind isa, TargetABIKind abi, TargetOSKind os)
     switch (abi)
     {
     case TARGET_ABI_KIND_SYSV64:
-        target.abi = abi_sysv64();
+        // target.abi = abi_sysv64();
         break;
     default:
         return NULL;
@@ -36,7 +36,7 @@ const Target *target_get(TargetISAKind isa, TargetABIKind abi, TargetOSKind os)
     switch (os)
     {
     case TARGET_OS_KIND_LINUX:
-        target.os = os_linux();
+        // target.os = os_linux();
         break;
     default:
         return NULL;

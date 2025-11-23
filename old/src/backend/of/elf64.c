@@ -16,22 +16,22 @@ static size_t align_up(size_t value, size_t alignment)
     return (value + mask) & ~mask;
 }
 
-static CodeBuffer *get_buffer(BackendCodegenResult *result, BackendSectionKind kind)
+static CodeBuffer *get_buffer(CodegenResult *result, SectionKind kind)
 {
     switch (kind)
     {
-    case BACKEND_SECTION_TEXT:
+    case SECTION_TEXT:
         return &result->text.buffer;
-    case BACKEND_SECTION_RODATA:
+    case SECTION_RODATA:
         return &result->rodata.buffer;
-    case BACKEND_SECTION_DATA:
+    case SECTION_DATA:
         return &result->data.buffer;
     default:
         return NULL;
     }
 }
 
-static const BackendLabel *find_label(const BackendCodegenResult *result, const char *name)
+static const RelocLabel *find_label(const CodegenResult *result, const char *name)
 {
     if (!name)
     {
@@ -47,33 +47,33 @@ static const BackendLabel *find_label(const BackendCodegenResult *result, const 
     return NULL;
 }
 
-static size_t section_base_vaddr(BackendSectionKind kind, size_t text_vaddr, size_t rodata_vaddr, size_t data_vaddr)
+static size_t section_base_vaddr(SectionKind kind, size_t text_vaddr, size_t rodata_vaddr, size_t data_vaddr)
 {
     switch (kind)
     {
-    case BACKEND_SECTION_TEXT:
+    case SECTION_TEXT:
         return text_vaddr;
-    case BACKEND_SECTION_RODATA:
+    case SECTION_RODATA:
         return rodata_vaddr;
-    case BACKEND_SECTION_DATA:
+    case SECTION_DATA:
         return data_vaddr;
     default:
         return 0;
     }
 }
 
-static bool apply_relocations(BackendCodegenResult *result, size_t text_vaddr, size_t rodata_vaddr, size_t data_vaddr)
+static bool apply_relocations(CodegenResult *result, size_t text_vaddr, size_t rodata_vaddr, size_t data_vaddr)
 {
     for (size_t i = 0; i < result->relocs.count; i++)
     {
-        BackendReloc *reloc = &result->relocs.items[i];
+        Reloc *reloc = &result->relocs.items[i];
         CodeBuffer   *buf   = get_buffer(result, reloc->section);
         if (!buf)
         {
             return false;
         }
 
-        const BackendLabel *label = find_label(result, reloc->symbol);
+        const RelocLabel *label = find_label(result, reloc->symbol);
         if (!label)
         {
             return false;
@@ -82,9 +82,9 @@ static bool apply_relocations(BackendCodegenResult *result, size_t text_vaddr, s
         size_t symbol_addr = section_base_vaddr(label->section, text_vaddr, rodata_vaddr, data_vaddr) + label->offset;
         size_t place_addr  = section_base_vaddr(reloc->section, text_vaddr, rodata_vaddr, data_vaddr) + reloc->offset;
 
-        switch (reloc->type)
+        switch (reloc->kind)
         {
-        case BACKEND_RELOC_X86_64_PC32:
+        case RELOC_X86_64_PC32:
         {
             if (reloc->offset + 4 > buf->size)
             {
@@ -97,7 +97,7 @@ static bool apply_relocations(BackendCodegenResult *result, size_t text_vaddr, s
             buf->data[reloc->offset + 3] = (uint8_t)((value >> 24) & 0xFF);
             break;
         }
-        case BACKEND_RELOC_ABSOLUTE64:
+        case RELOC_ABSOLUTE64:
         {
             if (reloc->offset + 8 > buf->size)
             {
@@ -138,7 +138,7 @@ static uint32_t shstrtab_add(CodeBuffer *buf, const char *name)
     return offset;
 }
 
-static bool elf64_write_executable(const Target *target, BackendCodegenResult *result, const char *path)
+static bool elf64_write_executable(const Target *target, CodegenResult *result, const char *path)
 {
     const size_t page_size  = 0x1000;
     const size_t image_base = 0x400000;
@@ -170,8 +170,8 @@ static bool elf64_write_executable(const Target *target, BackendCodegenResult *r
 
     // Entry point
     const char         *entry_label_name = target->runtime ? target->runtime->entry_label : NULL;
-    const BackendLabel *entry_label      = find_label(result, entry_label_name ? entry_label_name : "_start");
-    if (!entry_label || entry_label->section != BACKEND_SECTION_TEXT)
+    const RelocLabel *entry_label      = find_label(result, entry_label_name ? entry_label_name : "_start");
+    if (!entry_label || entry_label->section != SECTION_TEXT)
     {
         return false;
     }

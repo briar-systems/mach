@@ -17,7 +17,7 @@ void codegen_context_init(CodegenContext *ctx, const char *module_name, bool no_
     ctx->has_errors  = false;
     ctx->errors      = NULL;
     ctx->source_file = NULL;
-    
+
     ctx->module = mir_module_create(module_name);
 }
 
@@ -37,8 +37,9 @@ void codegen_context_dnit(CodegenContext *ctx)
         free(err);
         err = next;
     }
-    
-    if (ctx->module) {
+
+    if (ctx->module)
+    {
         mir_module_destroy(ctx->module);
     }
 
@@ -48,40 +49,55 @@ void codegen_context_dnit(CodegenContext *ctx)
 bool codegen_generate(CodegenContext *ctx, AstNode *root, SymbolTable *symbols)
 {
     (void)symbols;
-    if (!root || root->kind != AST_PROGRAM) return false;
-    
+    if (!root || root->kind != AST_PROGRAM)
+    {
+        return false;
+    }
+
     AstList *stmts = root->program.stmts;
-    if (!stmts) return true;
-    
-    for (int i = 0; i < stmts->count; i++) {
+    if (!stmts)
+    {
+        return true;
+    }
+
+    for (int i = 0; i < stmts->count; i++)
+    {
         AstNode *stmt = stmts->items[i];
-        if (stmt->kind == AST_STMT_MIR) {
+        if (stmt->kind == AST_STMT_MIR)
+        {
             // Append blocks to module
             MirBasicBlock *blocks = stmt->mir.blocks;
-            if (blocks) {
-                if (ctx->module->last_block) {
+            if (blocks)
+            {
+                if (ctx->module->last_block)
+                {
                     ctx->module->last_block->next = blocks;
-                } else {
+                }
+                else
+                {
                     ctx->module->blocks = blocks;
                 }
-                
+
                 // Update last_block
                 MirBasicBlock *curr = blocks;
-                while (curr->next) curr = curr->next;
+                while (curr->next)
+                {
+                    curr = curr->next;
+                }
                 ctx->module->last_block = curr;
-                
+
                 // Detach from AST node to avoid double free
-                stmt->mir.blocks = NULL; 
+                stmt->mir.blocks = NULL;
             }
         }
     }
-    
+
     return !ctx->has_errors;
 }
 
 bool codegen_emit_object(CodegenContext *ctx, const char *filename)
 {
-    TargetDescriptor target = target_desc(TARGET_ARCH_KIND_X86_64, TARGET_OS_KIND_LINUX);
+    TargetDescriptor target = {.isa = TARGET_ISA_KIND_X86_64, .abi = TARGET_ABI_KIND_SYSV64, .os = TARGET_OS_KIND_LINUX};
     return backend_emit_executable(target, ctx->module, filename);
 }
 
