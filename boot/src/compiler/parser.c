@@ -1,6 +1,5 @@
-#include "frontend/parser.h"
-#include "frontend/lexer.h"
-#include <ctype.h>
+#include "compiler/parser.h"
+#include "compiler/lexer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2031,26 +2030,44 @@ AstNode *parser_parse_stmt_mir(Parser *parser)
         return NULL;
     }
 
-    node->mir_stmt.instructions = parser_alloc_list(parser);
-    if (!node->mir_stmt.instructions)
+    // capture starting position after '{'
+    Token *start_token = parser->current;
+    int    brace_depth = 1;
+
+    // scan until matching closing brace
+    while (brace_depth > 0 && !parser_is_at_end(parser))
+    {
+        if (parser_check(parser, TOKEN_L_BRACE))
+        {
+            brace_depth++;
+        }
+        else if (parser_check(parser, TOKEN_R_BRACE))
+        {
+            brace_depth--;
+            if (brace_depth == 0)
+            {
+                break;
+            }
+        }
+        parser_advance(parser);
+    }
+
+    // calculate length of content between braces
+    Token *end_token = parser->current;
+    int    start_pos = start_token->pos;
+    int    end_pos   = end_token->pos;
+    int    len       = end_pos - start_pos;
+
+    // extract raw content
+    node->mir_stmt.content = (char *)malloc(len + 1);
+    if (!node->mir_stmt.content)
     {
         ast_node_dnit(node);
         free(node);
         return NULL;
     }
-
-    while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
-    {
-        AstNode *instr = parser_parse_mir_instruction(parser);
-        if (!instr)
-        {
-            parser_error_at_current(parser, "expected MIR instruction");
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-        ast_list_append(node->mir_stmt.instructions, instr);
-    }
+    memcpy(node->mir_stmt.content, parser->lexer->source + start_pos, len);
+    node->mir_stmt.content[len] = '\0';
 
     if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after mir block"))
     {

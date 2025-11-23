@@ -91,9 +91,8 @@ struct AstNode
         // mir block
         struct
         {
-            // TODO: figure out how to represent MIR here
-            AstNode *mir_block;
-        } mir;
+            char *content; // raw MIR text content
+        } mir_stmt;
 
         // module statement
         struct

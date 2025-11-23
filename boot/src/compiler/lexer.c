@@ -1,5 +1,5 @@
-#include "frontend/lexer.h"
-#include "frontend/token.h"
+#include "compiler/lexer.h"
+#include "compiler/token.h"
 
 #include <ctype.h>
 #include <stdlib.h>

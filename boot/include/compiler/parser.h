@@ -1,8 +1,8 @@
 #ifndef PARSER_H
 #define PARSER_H
 
-#include "frontend/ast.h"
-#include "frontend/lexer.h"
+#include "compiler/ast.h"
+#include "compiler/lexer.h"
 #include <stdbool.h>
 
 typedef enum

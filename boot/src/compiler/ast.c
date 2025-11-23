@@ -239,10 +239,9 @@ void ast_node_dnit(AstNode *node)
         break;
 
     case AST_STMT_MIR:
-        if (node->mir.mir_block)
+        if (node->mir_stmt.content)
         {
-            ast_node_dnit(node->mir.mir_block);
-            free(node->mir.mir_block);
+            free(node->mir_stmt.content);
         }
         break;
 
@@ -678,7 +677,10 @@ static AstNode *ast_clone_checked(const AstNode *node)
         break;
 
     case AST_STMT_MIR:
-        clone->mir.mir_block = ast_clone_checked(node->mir.mir_block);
+        if (node->mir_stmt.content)
+        {
+            clone->mir_stmt.content = strdup(node->mir_stmt.content);
+        }
         break;
 
     case AST_EXPR_BINARY:
@@ -1047,7 +1049,11 @@ void ast_print(AstNode *node, int indent)
 
     case AST_STMT_MIR:
         printf("MIR_BLOCK\n");
-        ast_print(node->mir.mir_block, indent + 1);
+        if (node->mir_stmt.content)
+        {
+            print_indent(indent + 1);
+            printf("content: %s\n", node->mir_stmt.content);
+        }
         break;
 
     case AST_EXPR_BINARY:
@@ -1546,7 +1552,11 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         break;
     case AST_STMT_MIR:
         fprintf(file, "MIR_BLOCK\n");
-        ast_print_to_file(node->mir.mir_block, file, indent + 1);
+        if (node->mir_stmt.content)
+        {
+            print_indent_to_file(file, indent + 1);
+            fprintf(file, "content: %s\n", node->mir_stmt.content);
+        }
         break;
     case AST_EXPR_BINARY:
         fprintf(file, "BINARY %s\n", token_kind_to_string(node->binary_expr.op));
