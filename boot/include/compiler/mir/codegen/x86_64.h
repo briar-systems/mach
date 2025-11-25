@@ -31,6 +31,7 @@ typedef struct X86_64_Relocation
     uint64_t offset;      // offset in code where relocation is needed
     char    *symbol_name; // symbol to relocate to
     int      type;        // relocation type (ELF R_X86_64_*)
+    int64_t  addend;      // addend for relocation
     struct X86_64_Relocation *next;
 } X86_64_Relocation;
 

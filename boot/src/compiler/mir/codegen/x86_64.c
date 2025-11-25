@@ -108,7 +108,7 @@ static void emit_dword(X86_64_CodegenContext *ctx, uint32_t value)
     emit_byte(ctx, (value >> 24) & 0xFF);
 }
 
-static void add_relocation(X86_64_CodegenContext *ctx, uint64_t offset, const char *symbol_name, int type)
+static void add_relocation(X86_64_CodegenContext *ctx, uint64_t offset, const char *symbol_name, int type, int64_t addend)
 {
     X86_64_Relocation *reloc = malloc(sizeof(X86_64_Relocation));
     if (!reloc)
@@ -119,6 +119,7 @@ static void add_relocation(X86_64_CodegenContext *ctx, uint64_t offset, const ch
     reloc->offset = offset;
     reloc->symbol_name = strdup(symbol_name);
     reloc->type = type;
+    reloc->addend = addend;
     reloc->next = ctx->relocations;
     reloc->next = ctx->relocations;
     ctx->relocations = reloc;
@@ -194,8 +195,8 @@ static X86_64_Reg get_physical_reg(X86_64_CodegenContext *ctx, uint32_t virtual_
 
 int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
 {
-    // simple allocation: assign physical registers in order
-    // this is a naive implementation - real allocator would do graph coloring or linear scan
+    // ABI-aware allocation with parameter mapping
+    // System V AMD64 ABI: params in RDI, RSI, RDX, RCX, R8, R9
     
     // allocate map
     if (func->next_value_id > ctx->reg_map.capacity)
@@ -212,15 +213,55 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
 
     ctx->reg_map.count = func->next_value_id;
 
-    // assign registers (simple strategy: use rax, rcx, rdx, rbx, rsi, rdi)
-    static const X86_64_Reg available_regs[] = {
-        X86_64_RAX, X86_64_RCX, X86_64_RDX, X86_64_RBX, X86_64_RSI, X86_64_RDI
+    // ABI parameter registers (System V AMD64)
+    static const X86_64_Reg param_regs[] = {
+        X86_64_RDI, X86_64_RSI, X86_64_RDX, X86_64_RCX, X86_64_R8, X86_64_R9
     };
-    size_t num_available = sizeof(available_regs) / sizeof(available_regs[0]);
-
+    
+    // Allocatable registers for non-parameters (excluding param regs)
+    // RAX - return value, scratch
+    // RBX - callee-saved (skip for now)
+    // R10, R11 - caller-saved scratch
+    static const X86_64_Reg allocatable_regs[] = {
+        X86_64_RAX, X86_64_R10, X86_64_R11, X86_64_RBX
+    };
+    size_t num_allocatable = sizeof(allocatable_regs) / sizeof(allocatable_regs[0]);
+    
+    // Track which parameter values are (first param_count values)
+    size_t param_count = func->param_count;
+    if (param_count > 6) param_count = 6; // Only first 6 in registers
+    
+    // Step 1: Assign parameter registers
+    for (size_t i = 0; i < param_count; i++)
+    {
+        if (func->params[i])
+        {
+            uint32_t param_id = func->params[i]->id;
+            ctx->reg_map.map[param_id] = param_regs[i];
+        }
+    }
+    
+    // Step 2: Assign non-parameter values to allocatable registers
+    // Simple strategy: round-robin through allocatable regs
+    size_t alloc_idx = 0;
     for (uint32_t i = 0; i < func->next_value_id; i++)
     {
-        ctx->reg_map.map[i] = available_regs[i % num_available];
+        // Skip if already assigned (parameter)
+        bool is_param = false;
+        for (size_t j = 0; j < param_count; j++)
+        {
+            if (func->params[j] && func->params[j]->id == i)
+            {
+                is_param = true;
+                break;
+            }
+        }
+        
+        if (!is_param)
+        {
+            ctx->reg_map.map[i] = allocatable_regs[alloc_idx % num_allocatable];
+            alloc_idx++;
+        }
     }
 
     return 0;
@@ -486,7 +527,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 emit_byte(ctx, 0x05 | (reg_to_x86_encoding(dst) << 3));
                 uint64_t reloc_offset = ctx->code.size;
                 emit_dword(ctx, 0);   // displacement filled by relocation
-                add_relocation(ctx, reloc_offset, inst->operands[0].global_name, 2); // R_X86_64_PC32
+                add_relocation(ctx, reloc_offset, inst->operands[0].global_name, 2, -4); // R_X86_64_PC32 with addend -4
             }
             else if (inst->operands[0].kind == MIR_OPERAND_IMM_INT)
             {
@@ -740,7 +781,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                     emit_byte(ctx, 0x8D); // LEA
                     emit_byte(ctx, 0x05); // ModR/M: [rip+disp32] -> rax
                     emit_dword(ctx, 0);   // displacement filled by relocation
-                    add_relocation(ctx, reloc_offset, inst->operands[0].global_name, 2); // R_X86_64_PC32
+                    add_relocation(ctx, reloc_offset, inst->operands[0].global_name, 2, -4); // R_X86_64_PC32 with addend -4 for LEA
                 }
             }
             
@@ -765,7 +806,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                     emit_byte(ctx, 0x05 | (reg_to_x86_encoding(dst) << 3)); // ModR/M: [rip + disp32]
                     uint64_t reloc_offset = ctx->code.size; // relocation at displacement field
                     emit_dword(ctx, 0); // displacement filled by linker
-                    add_relocation(ctx, reloc_offset, inst->operands[i].global_name, 2); // R_X86_64_PC32
+                    add_relocation(ctx, reloc_offset, inst->operands[i].global_name, 2, -4); // R_X86_64_PC32 with addend -4 for LEA
                 }
             }
             
@@ -817,7 +858,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                     emit_byte(ctx, 0x05 | (reg_to_x86_encoding(dst) << 3));
                     uint64_t reloc_offset = ctx->code.size;
                     emit_dword(ctx, 0);
-                    add_relocation(ctx, reloc_offset, inst->operands[i].global_name, 2);
+                    add_relocation(ctx, reloc_offset, inst->operands[i].global_name, 2, -4); // R_X86_64_PC32 with addend -4 for LEA
                 }
             }
             
@@ -827,7 +868,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 emit_byte(ctx, 0xE8); // CALL rel32
                 uint64_t reloc_offset = ctx->code.size;
                 emit_dword(ctx, 0); // displacement filled by linker
-                add_relocation(ctx, reloc_offset, func_name, 4); // R_X86_64_PLT32
+                add_relocation(ctx, reloc_offset, func_name, 4, -4); // R_X86_64_PLT32 with addend -4
             }
             
             // result is in rax - if instruction has result, move to allocated register

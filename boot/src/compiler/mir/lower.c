@@ -704,12 +704,22 @@ int mir_parse_inline_block(MIRFunction *func, MIRBlock *current_block, const cha
                 }
                 else if (*p == '%')
                 {
-                    // SSA value: %0, %1, etc.
+                    // SSA value: %0, %1, etc. - refers to function parameters
                     p++;
-                    int val_id = atoi(p);
-                    mir_inst_add_operand(inst, mir_operand_value(val_id));
+                    int param_idx = atoi(p);
                     
-                    while (*p >= '0' && *p <= '9')
+                    // Map %N to the Nth function parameter's value ID
+                    if (param_idx >= 0 && param_idx < (int)func->param_count && func->params[param_idx])
+                    {
+                        mir_inst_add_operand(inst, mir_operand_value(func->params[param_idx]->id));
+                    }
+                    else
+                    {
+                        // Invalid parameter reference, use 0 as fallback
+                        mir_inst_add_operand(inst, mir_operand_value(0));
+                    }
+                    
+                    while (*p >= '0' &&  *p <= '9')
                     {
                         p++;
                     }

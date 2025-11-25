@@ -47,7 +47,7 @@ void elf_write_section_data(ELFContext *ctx, int section_id, const void *data, s
 void elf_add_symbol(ELFContext *ctx, const char *name, uint64_t value, int section_id, bool is_global, bool is_function);
 
 // relocations
-void elf_add_relocation(ELFContext *ctx, int section_id, uint64_t offset, const char *symbol_name, ELFX86_64RelocType type);
+void elf_add_relocation(ELFContext *ctx, int section_id, uint64_t offset, const char *symbol_name, ELFX86_64RelocType type, int64_t addend);
 
 // section queries
 uint64_t elf_get_section_size(ELFContext *ctx, int section_id);

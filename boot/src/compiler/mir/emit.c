@@ -145,7 +145,7 @@ static int emit_function_code(EmitContext *ctx, MIRFunction *func)
     X86_64_Relocation *reloc = x86_64_codegen_get_relocations(codegen);
     while (reloc)
     {
-        elf_add_relocation(ctx->elf, ctx->text_section, text_offset + reloc->offset, reloc->symbol_name, reloc->type);
+        elf_add_relocation(ctx->elf, ctx->text_section, text_offset + reloc->offset, reloc->symbol_name, reloc->type, reloc->addend);
         reloc = reloc->next;
     }
 

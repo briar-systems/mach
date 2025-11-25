@@ -86,6 +86,7 @@ typedef struct ELFRelocation
     uint64_t           offset;
     char              *symbol_name;
     ELFX86_64RelocType type;
+    int64_t            addend;
     struct ELFRelocation *next;
 } ELFRelocation;
 
@@ -267,7 +268,7 @@ void elf_add_symbol(ELFContext *ctx, const char *name, uint64_t value, int secti
     ctx->symbol_count++;
 }
 
-void elf_add_relocation(ELFContext *ctx, int section_id, uint64_t offset, const char *symbol_name, ELFX86_64RelocType type)
+void elf_add_relocation(ELFContext *ctx, int section_id, uint64_t offset, const char *symbol_name, ELFX86_64RelocType type, int64_t addend)
 {
     if (!ctx || !symbol_name)
     {
@@ -284,6 +285,7 @@ void elf_add_relocation(ELFContext *ctx, int section_id, uint64_t offset, const 
     reloc->offset = offset;
     reloc->symbol_name = strdup(symbol_name);
     reloc->type = type;
+    reloc->addend = addend;
     reloc->next = ctx->relocations;
 
     ctx->relocations = reloc;
@@ -689,7 +691,7 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
                     
                     relas[rela_idx].r_offset = reloc->offset;
                     relas[rela_idx].r_info = ((uint64_t)sym_idx << 32) | (uint64_t)reloc->type;
-                    relas[rela_idx].r_addend = 0;
+                    relas[rela_idx].r_addend = reloc->addend;
                     rela_idx++;
                 }
             }
