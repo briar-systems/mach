@@ -1,6 +1,8 @@
 #ifndef MIR_OPCODE_H
 #define MIR_OPCODE_H
 
+#include <stdbool.h>
+
 // mir operation codes - architecture-agnostic ssa instructions
 
 typedef enum MIROp
