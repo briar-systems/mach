@@ -1,6 +1,7 @@
 #include "compiler/mir/emit.h"
 #include "compiler/mir/of/elf.h"
 #include "compiler/mir/codegen/x86_64.h"
+#include <stdio.h>
 #include <stdlib.h>
 
 // emission context
@@ -193,7 +194,23 @@ int mir_emit_object(MIRModule *module, const MIRTarget *target, const char *outp
 
 int mir_emit_executable(MIRModule *module, const MIRTarget *target, const char *output_path)
 {
-    // for now, executable generation is same as object file
-    // later, this will link and produce a proper executable
-    return mir_emit_object(module, target, output_path);
+    // emit object file first
+    char temp_obj[256];
+    snprintf(temp_obj, sizeof(temp_obj), "%s.o", output_path);
+    
+    if (mir_emit_object(module, target, temp_obj) < 0)
+    {
+        return -1;
+    }
+
+    // link using ld (simple approach for now)
+    char link_cmd[512];
+    snprintf(link_cmd, sizeof(link_cmd), "ld -o %s %s 2>/dev/null", output_path, temp_obj);
+    
+    int result = system(link_cmd);
+    
+    // clean up temp object file
+    remove(temp_obj);
+    
+    return result == 0 ? 0 : -1;
 }

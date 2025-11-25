@@ -110,6 +110,25 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
     return 0;
 }
 
+// map our register enum to x86 encoding
+static uint8_t reg_to_x86_encoding(X86_64_Reg reg)
+{
+    // x86-64 register encoding: RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7
+    // our enum: RAX=0, RBX=1, RCX=2, RDX=3, RSI=4, RDI=5, RBP=6, RSP=7
+    static const uint8_t encoding_map[] = {
+        0, // RAX -> 0
+        3, // RBX -> 3
+        1, // RCX -> 1
+        2, // RDX -> 2
+        6, // RSI -> 6
+        7, // RDI -> 7
+        5, // RBP -> 5
+        4, // RSP -> 4
+        0, 1, 2, 3, 4, 5, 6, 7 // R8-R15 (low 3 bits)
+    };
+    return encoding_map[reg];
+}
+
 // emit x86_64 instruction encodings
 static void emit_mov_reg_imm64(X86_64_CodegenContext *ctx, X86_64_Reg dst, int64_t imm)
 {
@@ -120,7 +139,7 @@ static void emit_mov_reg_imm64(X86_64_CodegenContext *ctx, X86_64_Reg dst, int64
         rex |= 0x01; // REX.B
     }
     emit_byte(ctx, rex);
-    emit_byte(ctx, 0xB8 + (dst % 8));
+    emit_byte(ctx, 0xB8 + reg_to_x86_encoding(dst));
     
     // emit 64-bit immediate (little endian)
     for (int i = 0; i < 8; i++)
@@ -145,7 +164,7 @@ static void emit_add_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_
     emit_byte(ctx, 0x01);
     
     // ModR/M byte: mod=11 (register), reg=src, rm=dst
-    uint8_t modrm = 0xC0 | ((src % 8) << 3) | (dst % 8);
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(src) << 3) | reg_to_x86_encoding(dst);
     emit_byte(ctx, modrm);
 }
 
@@ -153,6 +172,38 @@ static void emit_ret(X86_64_CodegenContext *ctx)
 {
     // ret: C3
     emit_byte(ctx, 0xC3);
+}
+
+static void emit_syscall(X86_64_CodegenContext *ctx)
+{
+    // syscall: 0F 05
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x05);
+}
+
+static void emit_mov_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
+{
+    // mov dst, src: REX.W + 89 /r
+    if (dst == src)
+    {
+        return; // no-op
+    }
+    
+    uint8_t rex = 0x48; // REX.W
+    if (dst >= X86_64_R8)
+    {
+        rex |= 0x01; // REX.B
+    }
+    if (src >= X86_64_R8)
+    {
+        rex |= 0x04; // REX.R
+    }
+    emit_byte(ctx, rex);
+    emit_byte(ctx, 0x89);
+    
+    // ModR/M byte: mod=11 (register), reg=src, rm=dst
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(src) << 3) | reg_to_x86_encoding(dst);
+    emit_byte(ctx, modrm);
 }
 
 static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
@@ -193,20 +244,47 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         if (inst->operand_count > 0 && inst->operands[0].kind == MIR_OPERAND_VALUE)
         {
             X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
-            if (src != X86_64_RAX)
-            {
-                // mov rax, src - simplified encoding
-                uint8_t rex = 0x48;
-                if (src >= X86_64_R8)
-                {
-                    rex |= 0x04;
-                }
-                emit_byte(ctx, rex);
-                emit_byte(ctx, 0x89);
-                emit_byte(ctx, 0xC0 | ((src % 8) << 3));
-            }
+            emit_mov_reg_reg(ctx, X86_64_RAX, src);
         }
         emit_ret(ctx);
+        break;
+
+    case MIR_OP_SYSCALL:
+        // linux x86_64 syscall convention:
+        // syscall number in rax
+        // args in rdi, rsi, rdx, r10, r8, r9
+        // for our simple case: operand[0] = syscall num, operand[1..6] = args
+        {
+            static const X86_64_Reg syscall_arg_regs[] = {
+                X86_64_RDI, X86_64_RSI, X86_64_RDX, X86_64_R10, X86_64_R8, X86_64_R9
+            };
+            
+            // move syscall number to rax
+            if (inst->operand_count > 0 && inst->operands[0].kind == MIR_OPERAND_VALUE)
+            {
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                emit_mov_reg_reg(ctx, X86_64_RAX, src);
+            }
+            
+            // move arguments to proper registers
+            for (size_t i = 1; i < inst->operand_count && i <= 6; i++)
+            {
+                if (inst->operands[i].kind == MIR_OPERAND_VALUE)
+                {
+                    X86_64_Reg src = get_physical_reg(ctx, inst->operands[i].value_id);
+                    emit_mov_reg_reg(ctx, syscall_arg_regs[i - 1], src);
+                }
+            }
+            
+            // emit syscall instruction
+            emit_syscall(ctx);
+        }
+        break;
+
+    case MIR_OP_UNREACHABLE:
+        // ud2: 0F 0B (undefined instruction)
+        emit_byte(ctx, 0x0F);
+        emit_byte(ctx, 0x0B);
         break;
 
     default:

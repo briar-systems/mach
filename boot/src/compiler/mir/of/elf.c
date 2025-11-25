@@ -290,45 +290,52 @@ void elf_add_relocation(ELFContext *ctx, int section_id, uint64_t offset, const 
     ctx->reloc_count++;
 }
 
-// build string table from section names
-static size_t build_shstrtab(ELFContext *ctx, uint8_t **out_data)
+// string table builder helper
+typedef struct
 {
-    // calculate total size needed
-    size_t total_size = 1; // null byte at start
-    
-    // add null section name
-    total_size += 1;
-    
-    // add section names
-    for (ELFSection *sec = ctx->sections; sec; sec = sec->next)
-    {
-        total_size += strlen(sec->name) + 1;
-    }
-    
-    // add .shstrtab name itself
-    total_size += strlen(".shstrtab") + 1;
-    
-    // allocate
-    uint8_t *data = malloc(total_size);
-    if (!data)
+    uint8_t *data;
+    size_t   size;
+    size_t   capacity;
+} StringTable;
+
+static void strtab_init(StringTable *st)
+{
+    st->capacity = 256;
+    st->data = malloc(st->capacity);
+    st->size = 1; // start with null byte
+    st->data[0] = 0;
+}
+
+static uint32_t strtab_add(StringTable *st, const char *str)
+{
+    if (!str)
     {
         return 0;
     }
     
-    // build string table
-    size_t offset = 0;
-    data[offset++] = 0; // null byte
+    size_t len = strlen(str) + 1;
     
-    // write section names and record their offsets
-    for (ELFSection *sec = ctx->sections; sec; sec = sec->next)
+    // ensure capacity
+    while (st->size + len > st->capacity)
     {
-        sec->name[0] = offset; // store offset in first byte temporarily (hack)
-        strcpy((char *)(data + offset), sec->name);
-        offset += strlen(sec->name) + 1;
+        st->capacity *= 2;
+        st->data = realloc(st->data, st->capacity);
     }
     
-    *out_data = data;
-    return total_size;
+    uint32_t offset = st->size;
+    strcpy((char *)(st->data + offset), str);
+    st->size += len;
+    
+    return offset;
+}
+
+static void strtab_free(StringTable *st)
+{
+    if (st->data)
+    {
+        free(st->data);
+        st->data = NULL;
+    }
 }
 
 int elf_write_to_file(ELFContext *ctx, const char *output_path)
@@ -344,91 +351,209 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
         return -1;
     }
 
-    // count sections (including null, shstrtab)
-    int section_count = 2; // null + shstrtab
+    // build string tables
+    StringTable shstrtab, strtab;
+    strtab_init(&shstrtab);
+    strtab_init(&strtab);
+    
+    // count sections and reverse the order (they're stored backwards in linked list)
+    int regular_section_count = 0;
     for (ELFSection *sec = ctx->sections; sec; sec = sec->next)
     {
-        section_count++;
+        regular_section_count++;
     }
     
-    // build section string table
-    uint8_t *shstrtab_data = NULL;
-    size_t shstrtab_size = build_shstrtab(ctx, &shstrtab_data);
+    // create array of sections in proper order
+    ELFSection **sections_array = malloc(regular_section_count * sizeof(ELFSection *));
+    int idx = regular_section_count - 1;
+    for (ELFSection *sec = ctx->sections; sec; sec = sec->next)
+    {
+        sections_array[idx--] = sec;
+    }
     
-    // write elf header
+    // add section names to shstrtab
+    uint32_t *section_name_offsets = malloc(regular_section_count * sizeof(uint32_t));
+    for (int i = 0; i < regular_section_count; i++)
+    {
+        section_name_offsets[i] = strtab_add(&shstrtab, sections_array[i]->name);
+    }
+    
+    uint32_t symtab_name_offset = strtab_add(&shstrtab, ".symtab");
+    uint32_t strtab_name_offset = strtab_add(&shstrtab, ".strtab");
+    uint32_t shstrtab_name_offset = strtab_add(&shstrtab, ".shstrtab");
+    
+    // build symbol table and add symbol names to strtab
+    int symbol_count = 1; // null symbol
+    for (ELFSymbol *sym = ctx->symbols; sym; sym = sym->next)
+    {
+        symbol_count++;
+    }
+    
+    Elf64_Sym *symbols = calloc(symbol_count, sizeof(Elf64_Sym));
+    
+    // null symbol at index 0 is already zeroed
+    
+    // add real symbols
+    idx = 1;
+    for (ELFSymbol *sym = ctx->symbols; sym; sym = sym->next)
+    {
+        symbols[idx].st_name = strtab_add(&strtab, sym->name);
+        symbols[idx].st_info = ((sym->is_global ? 1 : 0) << 4) | (sym->is_function ? 2 : 1);
+        symbols[idx].st_other = 0;
+        symbols[idx].st_shndx = sym->section_id + 1; // +1 for null section
+        symbols[idx].st_value = sym->value;
+        symbols[idx].st_size = 0;
+        idx++;
+    }
+    
+    // calculate section count
+    int section_count = 1; // null section
+    section_count += regular_section_count;
+    section_count += 3; // symtab, strtab, shstrtab
+    
+    // calculate file layout
+    uint64_t current_offset = sizeof(Elf64_Ehdr) + (section_count * sizeof(Elf64_Shdr));
+    
+    // data sections come first
+    uint64_t *section_offsets = malloc(regular_section_count * sizeof(uint64_t));
+    for (int i = 0; i < regular_section_count; i++)
+    {
+        section_offsets[i] = current_offset;
+        current_offset += sections_array[i]->size;
+    }
+    
+    // then symtab
+    uint64_t symtab_offset = current_offset;
+    size_t symtab_size = symbol_count * sizeof(Elf64_Sym);
+    current_offset += symtab_size;
+    
+    // then strtab
+    uint64_t strtab_offset = current_offset;
+    current_offset += strtab.size;
+    
+    // finally shstrtab
+    uint64_t shstrtab_offset = current_offset;
+    
+    // write ELF header
     Elf64_Ehdr ehdr = {0};
-    
-    // elf magic
     ehdr.e_ident[0] = 0x7F;
     ehdr.e_ident[1] = 'E';
     ehdr.e_ident[2] = 'L';
     ehdr.e_ident[3] = 'F';
     ehdr.e_ident[4] = 2; // 64-bit
     ehdr.e_ident[5] = 1; // little endian
-    ehdr.e_ident[6] = 1; // elf version
+    ehdr.e_ident[6] = 1; // current version
     ehdr.e_ident[7] = 0; // system v abi
     
-    ehdr.e_type = 1;      // relocatable
+    ehdr.e_type = 1; // relocatable
     ehdr.e_machine = 0x3E; // x86-64
     ehdr.e_version = 1;
+    ehdr.e_entry = 0;
+    ehdr.e_phoff = 0; // no program headers
+    ehdr.e_shoff = sizeof(Elf64_Ehdr);
+    ehdr.e_flags = 0;
     ehdr.e_ehsize = sizeof(Elf64_Ehdr);
+    ehdr.e_phentsize = 0;
+    ehdr.e_phnum = 0;
     ehdr.e_shentsize = sizeof(Elf64_Shdr);
     ehdr.e_shnum = section_count;
-    ehdr.e_shstrndx = section_count - 1; // shstrtab is last section
-    ehdr.e_shoff = sizeof(Elf64_Ehdr); // sections follow header
+    ehdr.e_shstrndx = section_count - 1; // shstrtab is last
     
     fwrite(&ehdr, sizeof(ehdr), 1, f);
     
-    // calculate section data offsets
-    uint64_t data_offset = sizeof(Elf64_Ehdr) + (section_count * sizeof(Elf64_Shdr));
-    
     // write section headers
-    // null section
-    Elf64_Shdr null_shdr = {0};
-    fwrite(&null_shdr, sizeof(null_shdr), 1, f);
     
-    // regular sections
-    for (ELFSection *sec = ctx->sections; sec; sec = sec->next)
+    // null section header
+    Elf64_Shdr shdr = {0};
+    fwrite(&shdr, sizeof(shdr), 1, f);
+    
+    // data section headers
+    for (int i = 0; i < regular_section_count; i++)
     {
-        Elf64_Shdr shdr = {0};
-        shdr.sh_name = (uint32_t)(uintptr_t)sec->name[0]; // offset we stored earlier
+        ELFSection *sec = sections_array[i];
+        memset(&shdr, 0, sizeof(shdr));
+        shdr.sh_name = section_name_offsets[i];
         shdr.sh_type = sec->type;
         shdr.sh_flags = sec->flags;
         shdr.sh_addr = 0;
-        shdr.sh_offset = data_offset;
+        shdr.sh_offset = section_offsets[i];
         shdr.sh_size = sec->size;
         shdr.sh_link = 0;
         shdr.sh_info = 0;
-        shdr.sh_addralign = 1;
+        shdr.sh_addralign = (sec->type == ELF_SHT_NOBITS) ? 1 : 1;
         shdr.sh_entsize = 0;
-        
         fwrite(&shdr, sizeof(shdr), 1, f);
-        data_offset += sec->size;
     }
     
-    // shstrtab section
-    Elf64_Shdr shstrtab_shdr = {0};
-    shstrtab_shdr.sh_name = 1; // ".shstrtab" name offset
-    shstrtab_shdr.sh_type = ELF_SHT_STRTAB;
-    shstrtab_shdr.sh_flags = 0;
-    shstrtab_shdr.sh_offset = data_offset;
-    shstrtab_shdr.sh_size = shstrtab_size;
-    shstrtab_shdr.sh_addralign = 1;
-    fwrite(&shstrtab_shdr, sizeof(shstrtab_shdr), 1, f);
+    // symtab section header
+    memset(&shdr, 0, sizeof(shdr));
+    shdr.sh_name = symtab_name_offset;
+    shdr.sh_type = ELF_SHT_SYMTAB;
+    shdr.sh_flags = 0;
+    shdr.sh_addr = 0;
+    shdr.sh_offset = symtab_offset;
+    shdr.sh_size = symtab_size;
+    shdr.sh_link = section_count - 2; // link to strtab (second to last)
+    shdr.sh_info = 1; // one local symbol (the null symbol)
+    shdr.sh_addralign = 8;
+    shdr.sh_entsize = sizeof(Elf64_Sym);
+    fwrite(&shdr, sizeof(shdr), 1, f);
+    
+    // strtab section header
+    memset(&shdr, 0, sizeof(shdr));
+    shdr.sh_name = strtab_name_offset;
+    shdr.sh_type = ELF_SHT_STRTAB;
+    shdr.sh_flags = 0;
+    shdr.sh_addr = 0;
+    shdr.sh_offset = strtab_offset;
+    shdr.sh_size = strtab.size;
+    shdr.sh_link = 0;
+    shdr.sh_info = 0;
+    shdr.sh_addralign = 1;
+    shdr.sh_entsize = 0;
+    fwrite(&shdr, sizeof(shdr), 1, f);
+    
+    // shstrtab section header
+    memset(&shdr, 0, sizeof(shdr));
+    shdr.sh_name = shstrtab_name_offset;
+    shdr.sh_type = ELF_SHT_STRTAB;
+    shdr.sh_flags = 0;
+    shdr.sh_addr = 0;
+    shdr.sh_offset = shstrtab_offset;
+    shdr.sh_size = shstrtab.size;
+    shdr.sh_link = 0;
+    shdr.sh_info = 0;
+    shdr.sh_addralign = 1;
+    shdr.sh_entsize = 0;
+    fwrite(&shdr, sizeof(shdr), 1, f);
     
     // write section data
-    for (ELFSection *sec = ctx->sections; sec; sec = sec->next)
+    for (int i = 0; i < regular_section_count; i++)
     {
-        if (sec->data && sec->size > 0)
+        ELFSection *sec = sections_array[i];
+        if (sec->type != ELF_SHT_NOBITS && sec->data && sec->size > 0)
         {
             fwrite(sec->data, 1, sec->size, f);
         }
     }
     
-    // write shstrtab data
-    fwrite(shstrtab_data, 1, shstrtab_size, f);
+    // write symtab
+    fwrite(symbols, sizeof(Elf64_Sym), symbol_count, f);
     
-    free(shstrtab_data);
+    // write strtab
+    fwrite(strtab.data, 1, strtab.size, f);
+    
+    // write shstrtab
+    fwrite(shstrtab.data, 1, shstrtab.size, f);
+    
+    // cleanup
+    free(sections_array);
+    free(section_name_offsets);
+    free(section_offsets);
+    free(symbols);
+    strtab_free(&shstrtab);
+    strtab_free(&strtab);
     fclose(f);
+    
     return 0;
 }
