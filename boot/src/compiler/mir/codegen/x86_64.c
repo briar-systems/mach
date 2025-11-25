@@ -499,12 +499,7 @@ static void emit_ret(X86_64_CodegenContext *ctx)
     emit_byte(ctx, 0xC3);
 }
 
-static void emit_syscall(X86_64_CodegenContext *ctx)
-{
-    // syscall: 0F 05
-    emit_byte(ctx, 0x0F);
-    emit_byte(ctx, 0x05);
-}
+
 
 static void emit_mov_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
 {
@@ -574,24 +569,92 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         break;
 
     case MIR_OP_LOAD:
-        // Load from stack slot: [rbp + offset] -> register
-        if (inst->result && inst->operand_count > 0 && inst->operands[0].kind == MIR_OPERAND_IMM_INT)
+        // Load from memory
+        if (inst->result && inst->operand_count > 0)
         {
             X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
-            int32_t offset = (int32_t)inst->operands[0].imm_int;
-            emit_mov_mem_to_reg(ctx, dst, offset);
+            
+            if (inst->operands[0].kind == MIR_OPERAND_IMM_INT)
+            {
+                // Load from stack slot: [rbp + offset] -> register
+                int32_t offset = (int32_t)inst->operands[0].imm_int;
+                emit_mov_mem_to_reg(ctx, dst, offset);
+            }
+            else if (inst->operands[0].kind == MIR_OPERAND_VALUE)
+            {
+                // Load from address in register: [src] -> dst
+                // mov dst, [src]
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                
+                // REX.W + 8B /r
+                uint8_t rex = 0x48; // REX.W
+                if (dst >= X86_64_R8) rex |= 0x04; // REX.R
+                if (src >= X86_64_R8) rex |= 0x01; // REX.B
+                
+                emit_byte(ctx, rex);
+                emit_byte(ctx, 0x8B);
+                
+                // ModR/M: mod=00 (indirect), reg=dst, rm=src
+                uint8_t modrm = (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
+                emit_byte(ctx, modrm);
+            }
         }
         break;
 
     case MIR_OP_STORE:
-        // Store to stack slot: register -> [rbp + offset]
-        if (inst->operand_count >= 2 && 
-            inst->operands[0].kind == MIR_OPERAND_VALUE &&
-            inst->operands[1].kind == MIR_OPERAND_IMM_INT)
+        // Store to memory
+        if (inst->operand_count >= 2)
         {
-            X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
-            int32_t offset = (int32_t)inst->operands[1].imm_int;
-            emit_mov_reg_to_mem(ctx, offset, src);
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                inst->operands[1].kind == MIR_OPERAND_IMM_INT)
+            {
+                // Store to stack slot: register -> [rbp + offset]
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                int32_t offset = (int32_t)inst->operands[1].imm_int;
+                emit_mov_reg_to_mem(ctx, offset, src);
+            }
+            else if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                     inst->operands[1].kind == MIR_OPERAND_VALUE)
+            {
+                // Store to address in register: src -> [dst_addr]
+                // mov [dst_addr], src
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg dst_addr = get_physical_reg(ctx, inst->operands[1].value_id);
+                
+                // REX.W + 89 /r
+                uint8_t rex = 0x48; // REX.W
+                if (src >= X86_64_R8) rex |= 0x04; // REX.R
+                if (dst_addr >= X86_64_R8) rex |= 0x01; // REX.B
+                
+                emit_byte(ctx, rex);
+                emit_byte(ctx, 0x89);
+                
+                // ModR/M: mod=00 (indirect), reg=src, rm=dst_addr
+                uint8_t modrm = (reg_to_x86_encoding(src) << 3) | reg_to_x86_encoding(dst_addr);
+                emit_byte(ctx, modrm);
+            }
+        }
+        break;
+
+    case MIR_OP_ADDR:
+        // Get address of stack slot: lea dst, [rbp + offset]
+        if (inst->result && inst->operand_count > 0 && inst->operands[0].kind == MIR_OPERAND_IMM_INT)
+        {
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            int32_t offset = (int32_t)inst->operands[0].imm_int;
+            
+            // REX.W + 8D /r
+            uint8_t rex = 0x48; // REX.W
+            if (dst >= X86_64_R8) rex |= 0x04; // REX.R
+            
+            emit_byte(ctx, rex);
+            emit_byte(ctx, 0x8D); // LEA
+            
+            // ModR/M: mod=10 (disp32), reg=dst, rm=101 (RBP)
+            uint8_t modrm = 0x80 | (reg_to_x86_encoding(dst) << 3) | 0x05;
+            emit_byte(ctx, modrm);
+            
+            emit_dword(ctx, (uint32_t)offset);
         }
         break;
 
@@ -820,6 +883,35 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 X86_64_RDI, X86_64_RSI, X86_64_RDX, X86_64_R10, X86_64_R8, X86_64_R9
             };
             
+            // load arguments to proper registers FIRST to avoid clobbering if they are in RAX
+            for (size_t i = 1; i < inst->operand_count && i <= 6; i++)
+            {
+                if (inst->operands[i].kind == MIR_OPERAND_IMM_INT)
+                {
+                    emit_mov_reg_imm64(ctx, syscall_arg_regs[i - 1], inst->operands[i].imm_int);
+                }
+                else if (inst->operands[i].kind == MIR_OPERAND_VALUE)
+                {
+                    X86_64_Reg src = get_physical_reg(ctx, inst->operands[i].value_id);
+                    emit_mov_reg_reg(ctx, syscall_arg_regs[i - 1], src);
+                }
+                else if (inst->operands[i].kind == MIR_OPERAND_GLOBAL)
+                {
+                    // lea reg, [rip + symbol] with PC-relative relocation
+                    X86_64_Reg dst = syscall_arg_regs[i - 1];
+                    
+                    // lea dst, [rip + symbol]
+                    uint8_t rex = 0x48; // REX.W
+                    if (dst >= X86_64_R8) rex |= 0x04; // REX.R
+                    emit_byte(ctx, rex);
+                    emit_byte(ctx, 0x8D); // LEA
+                    emit_byte(ctx, 0x05 | (reg_to_x86_encoding(dst) << 3));
+                    uint64_t reloc_offset = ctx->code.size;
+                    emit_dword(ctx, 0);
+                    add_relocation(ctx, reloc_offset, inst->operands[i].global_name, 2, -4); // R_X86_64_PC32 with addend -4 for LEA
+                }
+            }
+
             // load syscall number to rax
             if (inst->operand_count > 0)
             {
@@ -844,32 +936,20 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 }
             }
             
-            // load arguments to proper registers
-            for (size_t i = 1; i < inst->operand_count && i <= 6; i++)
+            // emit call instruction with PC-relative relocation
+            // (syscall instruction is 0F 05, not CALL)
+            emit_byte(ctx, 0x0F);
+            emit_byte(ctx, 0x05);
+            
+            // result is in rax - if instruction has result, move to allocated register
+            if (inst->result)
             {
-                if (inst->operands[i].kind == MIR_OPERAND_IMM_INT)
+                X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+                if (dst != X86_64_RAX)
                 {
-                    emit_mov_reg_imm64(ctx, syscall_arg_regs[i - 1], inst->operands[i].imm_int);
-                }
-                else if (inst->operands[i].kind == MIR_OPERAND_VALUE)
-                {
-                    X86_64_Reg src = get_physical_reg(ctx, inst->operands[i].value_id);
-                    emit_mov_reg_reg(ctx, syscall_arg_regs[i - 1], src);
-                }
-                else if (inst->operands[i].kind == MIR_OPERAND_GLOBAL)
-                {
-                    // lea reg, [rip + symbol] with PC-relative relocation
-                    X86_64_Reg dst = syscall_arg_regs[i - 1];
-                    emit_byte(ctx, 0x48); // REX.W
-                    emit_byte(ctx, 0x8D); // LEA
-                    emit_byte(ctx, 0x05 | (reg_to_x86_encoding(dst) << 3)); // ModR/M: [rip + disp32]
-                    uint64_t reloc_offset = ctx->code.size; // relocation at displacement field
-                    emit_dword(ctx, 0); // displacement filled by linker
-                    add_relocation(ctx, reloc_offset, inst->operands[i].global_name, 2, -4); // R_X86_64_PC32 with addend -4 for LEA
+                    emit_mov_reg_reg(ctx, dst, X86_64_RAX);
                 }
             }
-            
-            emit_syscall(ctx);
         }
         break;
 

@@ -460,15 +460,83 @@ static int lower_stmt(LowerContext *ctx, AstNode *node)
 }
 
 // lower expression to MIR value
-static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
+// lower unary expression
+static MIRValue *lower_unary_expr(LowerContext *ctx, AstNode *node)
 {
-    if (!node || !ctx->current_function)
+    if (!node || node->kind != AST_EXPR_UNARY)
     {
         return NULL;
     }
     
+    if (node->unary_expr.op == TOKEN_QUESTION)
+    {
+        // Address-of: ?expr
+        AstNode *operand = node->unary_expr.expr;
+        
+        // Handle local variable address
+        if (operand->kind == AST_EXPR_IDENT && operand->symbol && operand->symbol->kind == SYMBOL_VARIABLE)
+        {
+            int32_t offset = lower_context_get_stack_offset(ctx, operand->symbol->decl);
+            if (offset != 0)
+            {
+                // Local variable: emit MIR_OP_ADDR
+                MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "addr");
+                MIRInst *inst = mir_inst_create(MIR_OP_ADDR, NULL);
+                mir_inst_add_operand(inst, mir_operand_imm_int(offset));
+                mir_inst_set_result(inst, result);
+                mir_block_append_inst(ctx->current_block, inst);
+                return result;
+            }
+            else
+            {
+                // Global variable: emit MIR_OP_MOV with global operand (LEA)
+                MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
+                MIRInst *inst = mir_inst_create(MIR_OP_MOV, NULL);
+                mir_inst_add_operand(inst, mir_operand_global(operand->symbol->name));
+                mir_inst_set_result(inst, result);
+                mir_block_append_inst(ctx->current_block, inst);
+                return result;
+            }
+        }
+        return NULL; // Only variables supported for now
+    }
+    else if (node->unary_expr.op == TOKEN_AT)
+    {
+        // Dereference: @expr
+        MIRValue *ptr = lower_expr(ctx, node->unary_expr.expr);
+        if (!ptr) return NULL;
+        
+        // Emit MIR_OP_LOAD with pointer value
+        MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "deref");
+        MIRInst *inst = mir_inst_create(MIR_OP_LOAD, NULL);
+        mir_inst_add_operand(inst, mir_operand_value(ptr->id));
+        mir_inst_set_result(inst, result);
+        mir_block_append_inst(ctx->current_block, inst);
+        return result;
+    }
+    
+    return NULL;
+}
+
+static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
+{
+    if (!ctx || !node)
+    {
+        return NULL;
+    }
+    
+    // check if we already lowered this node
+    MIRValue *val = lower_context_get_value(ctx, node);
+    if (val)
+    {
+        return val;
+    }
+    
     switch (node->kind)
     {
+    case AST_EXPR_UNARY:
+        return lower_unary_expr(ctx, node);
+        
     case AST_EXPR_LIT:
         if (node->token && node->token->kind == TOKEN_LIT_INT)
         {
@@ -542,6 +610,50 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         
     case AST_EXPR_BINARY:
     {
+        // Handle assignment separately
+        if (node->binary_expr.op == TOKEN_EQUAL)
+        {
+            AstNode *lhs = node->binary_expr.left;
+            MIRValue *rhs_val = lower_expr(ctx, node->binary_expr.right);
+            if (!rhs_val) return NULL;
+            
+            if (lhs->kind == AST_EXPR_IDENT)
+            {
+                // Variable assignment: var = val
+                if (lhs->symbol && lhs->symbol->kind == SYMBOL_VARIABLE)
+                {
+                    int32_t offset = lower_context_get_stack_offset(ctx, lhs->symbol->decl);
+                    if (offset != 0)
+                    {
+                        // Local variable: store to stack
+                        MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                        mir_inst_add_operand(store, mir_operand_value(rhs_val->id));
+                        mir_inst_add_operand(store, mir_operand_imm_int(offset));
+                        mir_block_append_inst(ctx->current_block, store);
+                    }
+                    else
+                    {
+                        // Global variable: store to global
+                        // TODO: Implement global store if needed (requires address calculation)
+                    }
+                }
+            }
+            else if (lhs->kind == AST_EXPR_UNARY && lhs->unary_expr.op == TOKEN_AT)
+            {
+                // Pointer assignment: @ptr = val
+                MIRValue *ptr_val = lower_expr(ctx, lhs->unary_expr.expr);
+                if (ptr_val)
+                {
+                    MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                    mir_inst_add_operand(store, mir_operand_value(rhs_val->id));
+                    mir_inst_add_operand(store, mir_operand_value(ptr_val->id));
+                    mir_block_append_inst(ctx->current_block, store);
+                }
+            }
+            
+            return rhs_val;
+        }
+
         MIRValue *left = lower_expr(ctx, node->binary_expr.left);
         MIRValue *right = lower_expr(ctx, node->binary_expr.right);
         

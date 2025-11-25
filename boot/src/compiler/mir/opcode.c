@@ -8,6 +8,7 @@ const char *mir_op_to_string(MIROp op)
     case MIR_OP_MOV: return "mov";
     case MIR_OP_LOAD: return "load";
     case MIR_OP_STORE: return "store";
+    case MIR_OP_ADDR: return "addr";
     case MIR_OP_PHI: return "phi";
     case MIR_OP_ADD: return "add";
     case MIR_OP_SUB: return "sub";

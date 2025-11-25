@@ -352,7 +352,29 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
         {
             return -1;
         }
-        node->type = node->unary_expr.expr->type;
+        
+        if (node->unary_expr.op == TOKEN_QUESTION)
+        {
+            // Address-of: ?T -> *T
+            // TODO: check if operand is an l-value (variable)
+            node->type = type_create_pointer(node->unary_expr.expr->type, false);
+        }
+        else if (node->unary_expr.op == TOKEN_AT)
+        {
+            // Dereference: @T -> T
+            Type *operand_type = node->unary_expr.expr->type;
+            if (operand_type->kind != TYPE_POINTER)
+            {
+                sema_error(sema, node->token, "cannot dereference non-pointer type");
+                return -1;
+            }
+            node->type = operand_type->pointer.base;
+        }
+        else
+        {
+            // other unary ops (-, !, etc.) preserve type
+            node->type = node->unary_expr.expr->type;
+        }
         return 0;
 
     case AST_EXPR_CALL:
@@ -423,8 +445,11 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
     }
 
     case AST_TYPE_PTR:
-        // pointer type - simplified implementation
-        return type_get_primitive(TYPE_PTR);
+    {
+        Type *base = sema_resolve_type(sema, type_node->type_ptr.base);
+        if (!base) return NULL;
+        return type_create_pointer(base, type_node->type_ptr.is_read_only);
+    }
 
     default:
         return NULL;

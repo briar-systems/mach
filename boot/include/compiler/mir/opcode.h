@@ -14,6 +14,7 @@ typedef enum MIROp
     MIR_OP_MOV,
     MIR_OP_LOAD,
     MIR_OP_STORE,
+    MIR_OP_ADDR, // get address of stack slot
     MIR_OP_PHI,
 
     // arithmetic
@@ -35,7 +36,7 @@ typedef enum MIROp
     MIR_OP_SHR,
     MIR_OP_SAR,
 
-    // comparison (produce i8: 0 or 1)
+    // comparison (produce u8: 0 or 1)
     MIR_OP_EQ,
     MIR_OP_NE,
     MIR_OP_LT,
