@@ -24,60 +24,39 @@ static ConfigTargetMode *find_target_mode(const char *value)
 }
 
 // helper: find target os by string value
-static TargetOSKind find_target_os(const char *value)
+static MIRTargetOS find_target_os(const char *value)
 {
     if (!value)
     {
-        return TARGET_OS_KIND_COUNT;
+        return MIR_OS_COUNT;
     }
-
-    for (size_t i = 0; i < sizeof(TARGET_OS_NAMES) / sizeof(TARGET_OS_NAMES[0]); i++)
-    {
-        if (strcmp(TARGET_OS_NAMES[i], value) == 0)
-        {
-            return (TargetOSKind)i;
-        }
-    }
-
-    return TARGET_OS_KIND_COUNT;
+    
+    MIRTargetOS os = mir_target_os_from_name(value);
+    return os;
 }
 
 // helper: find target isa by string value
-static TargetISAKind find_target_isa(const char *value)
+static MIRTargetISA find_target_isa(const char *value)
 {
     if (!value)
     {
-        return TARGET_ISA_KIND_COUNT;
+        return MIR_ISA_COUNT;
     }
-
-    for (size_t i = 0; i < sizeof(TARGET_ISA_NAMES) / sizeof(TARGET_ISA_NAMES[0]); i++)
-    {
-        if (strcmp(TARGET_ISA_NAMES[i], value) == 0)
-        {
-            return (TargetISAKind)i;
-        }
-    }
-
-    return TARGET_ISA_KIND_COUNT;
+    
+    MIRTargetISA isa = mir_target_isa_from_name(value);
+    return isa;
 }
 
 // helper: find target abi by string value
-static TargetABIKind find_target_abi(const char *value)
+static MIRTargetABI find_target_abi(const char *value)
 {
     if (!value)
     {
-        return TARGET_ABI_KIND_COUNT;
+        return MIR_ABI_COUNT;
     }
-
-    for (size_t i = 0; i < sizeof(TARGET_ABI_NAMES) / sizeof(TARGET_ABI_NAMES[0]); i++)
-    {
-        if (strcmp(TARGET_ABI_NAMES[i], value) == 0)
-        {
-            return (TargetABIKind)i;
-        }
-    }
-
-    return TARGET_ABI_KIND_COUNT;
+    
+    MIRTargetABI abi = mir_target_abi_from_name(value);
+    return abi;
 }
 
 // helper: find dependency type by string value
@@ -138,9 +117,9 @@ static ConfigDepVersionKind determine_version_kind(const char *version)
 void target_config_init(ConfigTarget *target)
 {
     target->name       = NULL;
-    target->os   = TARGET_OS_KIND_COUNT;
-    target->isa       = TARGET_ISA_KIND_COUNT;
-    target->abi       = TARGET_ABI_KIND_COUNT;
+    target->os   = MIR_OS_COUNT;
+    target->isa       = MIR_ISA_COUNT;
+    target->abi       = MIR_ABI_COUNT;
     target->mode       = NULL;
     target->entrypoint = NULL;
     target->artifacts  = NULL;
@@ -475,21 +454,21 @@ Config *config_load(const char *config_path)
             free(config);
             return NULL;
         }
-        if (t->os == TARGET_OS_KIND_COUNT)
+        if (t->os == MIR_OS_COUNT)
         {
             fprintf(stderr, "error: target '%s' missing mandatory field 'os'\n", t->name);
             config_dnit(config);
             free(config);
             return NULL;
         }
-        if (t->isa == TARGET_ISA_KIND_COUNT)
+        if (t->isa == MIR_ISA_COUNT)
         {
             fprintf(stderr, "error: target '%s' missing mandatory field 'isa'\n", t->name);
             config_dnit(config);
             free(config);
             return NULL;
         }
-        if (t->abi == TARGET_ABI_KIND_COUNT)
+        if (t->abi == MIR_ABI_COUNT)
         {
             fprintf(stderr, "error: target '%s' missing mandatory field 'abi'\n", t->name);
             config_dnit(config);
@@ -608,17 +587,17 @@ bool config_save(Config *config, const char *config_path)
         if (target->name)
         {
             fprintf(f, "\n[targets.%s]\n", target->name);
-            if (target->os != TARGET_OS_KIND_COUNT)
+            if (target->os != MIR_OS_COUNT)
             {
-                fprintf(f, "os = \"%s\"\n", target_os_name(target->os));
+                fprintf(f, "os = \"%s\"\n", mir_target_os_name(target->os));
             }
-            if (target->isa != TARGET_ISA_KIND_COUNT)
+            if (target->isa != MIR_ISA_COUNT)
             {
-                fprintf(f, "isa = \"%s\"\n", target_isa_name(target->isa));
+                fprintf(f, "isa = \"%s\"\n", mir_target_isa_name(target->isa));
             }
-            if (target->abi != TARGET_ABI_KIND_COUNT)
+            if (target->abi != MIR_ABI_COUNT)
             {
-                fprintf(f, "abi = \"%s\"\n", target_abi_name(target->abi));
+                fprintf(f, "abi = \"%s\"\n", mir_target_abi_name(target->abi));
             }
             if (target->mode)
             {
@@ -698,19 +677,15 @@ ConfigTarget *config_get_target(Config *config, const char *name)
     // "native" special case
     if (strcmp(name, "native") == 0)
     {
-        const Target *target = target_native();
-        if (!target)
-        {
-            return NULL;
-        }
+        MIRTarget target = mir_target_native();
         
         // match target to config target based on OS, ISA, and ABI
         for (int i = 0; i < config->target_count; i++)
         {
             ConfigTarget *cfg_target = config->targets[i];
-            if (cfg_target->os == target->os->kind &&
-                cfg_target->isa == target->isa->kind &&
-                cfg_target->abi == target->abi->kind)
+            if (cfg_target->os == target.os &&
+                cfg_target->isa == target.isa &&
+                cfg_target->abi == target.abi)
             {
                 return cfg_target;
             }

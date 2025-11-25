@@ -1,95 +1,146 @@
 #include "compiler/mir/target.h"
-// #include "backend/isa/x86_64.h"
-// #include "backend/abi/sysv64.h"
-// #include "backend/os/linux.h"
+#include <string.h>
 
-#include <stddef.h>
+// string name tables
+static const char *MIR_ISA_NAMES[] = {"x86_64"};
+static const char *MIR_ABI_NAMES[] = {"sysv64"};
+static const char *MIR_OS_NAMES[] = {"linux"};
+static const char *MIR_OF_NAMES[] = {"elf"};
 
-const Target *target_get(TargetISAKind isa, TargetABIKind abi, TargetOSKind os)
+MIRTarget mir_target_create(MIRTargetISA isa, MIRTargetABI abi, MIRTargetOS os, MIRTargetOF of)
 {
-    // check that all components are valid
-    if (isa == TARGET_ISA_KIND_COUNT || abi == TARGET_ABI_KIND_COUNT || os == TARGET_OS_KIND_COUNT)
-    {
-        return NULL;
-    }
-
-    static Target target;
-
-    switch (isa)
-    {
-    case TARGET_ISA_KIND_X86_64:
-        // target.isa = isa_x86_64();
-        break;
-    default:
-        return NULL;
-    }
-
-    switch (abi)
-    {
-    case TARGET_ABI_KIND_SYSV64:
-        // target.abi = abi_sysv64();
-        break;
-    default:
-        return NULL;
-    }
-
-    switch (os)
-    {
-    case TARGET_OS_KIND_LINUX:
-        // target.os = os_linux();
-        break;
-    default:
-        return NULL;
-    }
-
-    return &target;
+    MIRTarget target;
+    target.isa = isa;
+    target.abi = abi;
+    target.os = os;
+    target.of = of;
+    return target;
 }
 
-const Target *target_native()
+MIRTarget mir_target_native()
 {
-    static TargetISAKind isa = TARGET_ISA_KIND_COUNT;
-    static TargetABIKind abi = TARGET_ABI_KIND_COUNT;
-    static TargetOSKind  os  = TARGET_OS_KIND_COUNT;
+    MIRTargetISA isa = MIR_ISA_COUNT;
+    MIRTargetABI abi = MIR_ABI_COUNT;
+    MIRTargetOS os = MIR_OS_COUNT;
+    MIRTargetOF of = MIR_OF_COUNT;
 
 #if defined(__x86_64__) || defined(_M_X64)
-    isa = TARGET_ISA_KIND_X86_64;
+    isa = MIR_ISA_X86_64;
 #endif
+
 #if defined(__linux__)
-    abi = TARGET_ABI_KIND_SYSV64;
-    os  = TARGET_OS_KIND_LINUX;
+    abi = MIR_ABI_SYSV64;
+    os = MIR_OS_LINUX;
+    of = MIR_OF_ELF;
 #endif
 
-    return target_get(isa, abi, os);
+    return mir_target_create(isa, abi, os, of);
 }
 
-const char *target_abi_name(TargetABIKind abi) {
-    if (abi >= TARGET_ABI_KIND_COUNT) {
+const char *mir_target_isa_name(MIRTargetISA isa)
+{
+    if (isa >= MIR_ISA_COUNT)
+    {
         return "unknown";
     }
-
-    return TARGET_ABI_NAMES[abi];
+    return MIR_ISA_NAMES[isa];
 }
 
-const char *target_isa_name(TargetISAKind isa) {
-    if (isa >= TARGET_ISA_KIND_COUNT) {
+const char *mir_target_abi_name(MIRTargetABI abi)
+{
+    if (abi >= MIR_ABI_COUNT)
+    {
         return "unknown";
     }
-
-    return TARGET_ISA_NAMES[isa];
+    return MIR_ABI_NAMES[abi];
 }
 
-const char *target_os_name(TargetOSKind os) {
-    if (os >= TARGET_OS_KIND_COUNT) {
+const char *mir_target_os_name(MIRTargetOS os)
+{
+    if (os >= MIR_OS_COUNT)
+    {
         return "unknown";
     }
-
-    return TARGET_OS_NAMES[os];
+    return MIR_OS_NAMES[os];
 }
 
-const char *target_of_name(TargetOFKind of) {
-    if (of >= TARGET_OBJ_KIND_COUNT) {
+const char *mir_target_of_name(MIRTargetOF of)
+{
+    if (of >= MIR_OF_COUNT)
+    {
         return "unknown";
     }
+    return MIR_OF_NAMES[of];
+}
 
-    return TARGET_OBJ_NAMES[of];
+MIRTargetISA mir_target_isa_from_name(const char *name)
+{
+    if (!name)
+    {
+        return MIR_ISA_COUNT;
+    }
+
+    for (int i = 0; i < MIR_ISA_COUNT; i++)
+    {
+        if (strcmp(MIR_ISA_NAMES[i], name) == 0)
+        {
+            return (MIRTargetISA)i;
+        }
+    }
+
+    return MIR_ISA_COUNT;
+}
+
+MIRTargetABI mir_target_abi_from_name(const char *name)
+{
+    if (!name)
+    {
+        return MIR_ABI_COUNT;
+    }
+
+    for (int i = 0; i < MIR_ABI_COUNT; i++)
+    {
+        if (strcmp(MIR_ABI_NAMES[i], name) == 0)
+        {
+            return (MIRTargetABI)i;
+        }
+    }
+
+    return MIR_ABI_COUNT;
+}
+
+MIRTargetOS mir_target_os_from_name(const char *name)
+{
+    if (!name)
+    {
+        return MIR_OS_COUNT;
+    }
+
+    for (int i = 0; i < MIR_OS_COUNT; i++)
+    {
+        if (strcmp(MIR_OS_NAMES[i], name) == 0)
+        {
+            return (MIRTargetOS)i;
+        }
+    }
+
+    return MIR_OS_COUNT;
+}
+
+MIRTargetOF mir_target_of_from_name(const char *name)
+{
+    if (!name)
+    {
+        return MIR_OF_COUNT;
+    }
+
+    for (int i = 0; i < MIR_OF_COUNT; i++)
+    {
+        if (strcmp(MIR_OF_NAMES[i], name) == 0)
+        {
+            return (MIRTargetOF)i;
+        }
+    }
+
+    return MIR_OF_COUNT;
 }

@@ -57,9 +57,9 @@ typedef struct ConfigDepVersion
 typedef struct ConfigTarget
 {
     char             *name;       // target name
-    TargetOSKind      os;         // target operating system
-    TargetISAKind     isa;        // target ISA
-    TargetABIKind     abi;        // target ABI
+    MIRTargetOS       os;         // target operating system
+    MIRTargetISA      isa;        // target ISA
+    MIRTargetABI      abi;        // target ABI
     ConfigTargetMode *mode;       // build mode: executable|library
     char             *entrypoint; // main source file (relative to src_dir)
     char             *artifacts;  // artifacts directory (relative to out_dir)

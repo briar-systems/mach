@@ -1,102 +1,61 @@
-#ifndef TARGET_H
-#define TARGET_H
+#ifndef MIR_TARGET_H
+#define MIR_TARGET_H
 
 #include <stdbool.h>
 #include <stdint.h>
 
-// target ABI kinds
-typedef enum TargetABIKind
+// mir compilation target configuration
+// defines isa, abi, os, and object file format for code generation
+
+// instruction set architecture kinds
+typedef enum MIRTargetISA
 {
-    TARGET_ABI_KIND_SYSV64,
-    TARGET_ABI_KIND_COUNT
-} TargetABIKind;
+    MIR_ISA_X86_64,
+    MIR_ISA_COUNT
+} MIRTargetISA;
 
-// string representations of target ABIs
-static const char *TARGET_ABI_NAMES[] = {
-    "sysv64",
-};
-
-// represents information about a specific application binary interface
-typedef struct TargetABI
+// application binary interface kinds
+typedef enum MIRTargetABI
 {
-    TargetABIKind kind;
-    const char   *name;
-} TargetABI;
+    MIR_ABI_SYSV64,
+    MIR_ABI_COUNT
+} MIRTargetABI;
 
-// target ISA kinds
-typedef enum TargetISAKind
+// operating system kinds
+typedef enum MIRTargetOS
 {
-    TARGET_ISA_KIND_X86_64,
-    TARGET_ISA_KIND_COUNT
-} TargetISAKind;
+    MIR_OS_LINUX,
+    MIR_OS_COUNT
+} MIRTargetOS;
 
-// string representations of target ISAs
-static const char *TARGET_ISA_NAMES[] = {
-    "x86_64",
-};
-
-// represents information about a specific instruction set architecture
-typedef struct TargetISA
+// object file format kinds
+typedef enum MIRTargetOF
 {
-    TargetISAKind kind;
-    const char   *name;
-    uint8_t       pointer_size;
-} TargetISA;
+    MIR_OF_ELF,
+    MIR_OF_COUNT
+} MIRTargetOF;
 
-// target object format kinds
-typedef enum TargetOFKind
+// complete target specification
+typedef struct MIRTarget
 {
-    TARGET_OBJ_KIND_ELF,
-    TARGET_OBJ_KIND_COUNT
-} TargetOFKind;
+    MIRTargetISA isa;
+    MIRTargetABI abi;
+    MIRTargetOS  os;
+    MIRTargetOF  of;
+} MIRTarget;
 
-// string representations of target object formats
-static const char *TARGET_OBJ_NAMES[] = {
-    "elf",
-};
+// target construction
+MIRTarget mir_target_create(MIRTargetISA isa, MIRTargetABI abi, MIRTargetOS os, MIRTargetOF of);
+MIRTarget mir_target_native();
 
-// represents information about a specific object format
-typedef struct TargetOF
-{
-    TargetOFKind kind;
-    const char  *name;
-} TargetOF;
+// string conversions
+const char   *mir_target_isa_name(MIRTargetISA isa);
+const char   *mir_target_abi_name(MIRTargetABI abi);
+const char   *mir_target_os_name(MIRTargetOS os);
+const char   *mir_target_of_name(MIRTargetOF of);
+MIRTargetISA  mir_target_isa_from_name(const char *name);
+MIRTargetABI  mir_target_abi_from_name(const char *name);
+MIRTargetOS   mir_target_os_from_name(const char *name);
+MIRTargetOF   mir_target_of_from_name(const char *name);
 
-// target OS kinds
-typedef enum TargetOSKind
-{
-    TARGET_OS_KIND_LINUX,
-    TARGET_OS_KIND_COUNT
-} TargetOSKind;
-
-// string representations of target operating systems
-static const char *TARGET_OS_NAMES[] = {
-    "linux",
-};
-
-// represents information about a specific operating system
-typedef struct TargetOS
-{
-    TargetOSKind kind;
-    const char  *name;
-
-    const TargetOF *format;
-} TargetOS;
-
-// represents a specific target configuration
-typedef struct Target
-{
-    const TargetOS  *os;
-    const TargetISA *isa;
-    const TargetABI *abi;
-} Target;
-
-const Target *target_get(TargetISAKind isa, TargetABIKind abi, TargetOSKind os);
-const Target *target_native();
-
-const char *target_abi_name(TargetABIKind abi);
-const char *target_isa_name(TargetISAKind isa);
-const char *target_os_name(TargetOSKind os);
-const char *target_of_name(TargetOFKind of);
-
-#endif
+#endif // MIR_TARGET_H
