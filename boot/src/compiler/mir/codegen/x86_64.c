@@ -526,6 +526,32 @@ static void emit_mov_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_
     emit_byte(ctx, modrm);
 }
 
+static void emit_add_reg_imm(X86_64_CodegenContext *ctx, X86_64_Reg dst, int32_t imm)
+{
+    // add dst, imm
+    // if imm fits in 8 bits: REX.W + 83 /0 ib
+    // else: REX.W + 81 /0 id
+    
+    uint8_t rex = 0x48; // REX.W
+    if (dst >= X86_64_R8) rex |= 0x01; // REX.B
+    emit_byte(ctx, rex);
+    
+    if (imm >= -128 && imm <= 127)
+    {
+        emit_byte(ctx, 0x83);
+        uint8_t modrm = 0xC0 | (0 << 3) | reg_to_x86_encoding(dst); // /0
+        emit_byte(ctx, modrm);
+        emit_byte(ctx, (uint8_t)imm);
+    }
+    else
+    {
+        emit_byte(ctx, 0x81);
+        uint8_t modrm = 0xC0 | (0 << 3) | reg_to_x86_encoding(dst); // /0
+        emit_byte(ctx, modrm);
+        emit_dword(ctx, (uint32_t)imm);
+    }
+}
+
 static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
 {
     switch (inst->op)
@@ -658,6 +684,10 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         }
         break;
 
+
+
+// ... existing code ...
+
     case MIR_OP_ADD:
         if (inst->result && inst->operand_count >= 2)
         {
@@ -671,10 +701,15 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                     emit_mov_reg_reg(ctx, dst, src1);
                 }
             }
+            
             if (inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
                 X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
                 emit_add_reg_reg(ctx, dst, src2);
+            }
+            else if (inst->operands[1].kind == MIR_OPERAND_IMM_INT)
+            {
+                emit_add_reg_imm(ctx, dst, (int32_t)inst->operands[1].imm_int);
             }
         }
         break;

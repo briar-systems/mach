@@ -282,20 +282,58 @@ static int lower_var(LowerContext *ctx, AstNode *node)
     else
     {
         // Local variable - allocate stack slot
-        // For now, assume all variables are 8 bytes (i64/pointer size)
-        int32_t offset = lower_context_alloc_stack_slot(ctx, node, 8);
+        size_t size = node->type ? node->type->size : 8;
+        if (size == 0) size = 8; // default if unknown
+        int32_t offset = lower_context_alloc_stack_slot(ctx, node, size);
         
         // Handle initializer
         if (node->var_stmt.init)
         {
-            MIRValue *init_val = lower_expr(ctx, node->var_stmt.init);
-            if (init_val)
+            if (node->var_stmt.init->kind == AST_EXPR_STRUCT)
             {
-                // Generate STORE: store init_val to [rbp + offset]
-                MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
-                mir_inst_add_operand(store, mir_operand_value(init_val->id));
-                mir_inst_add_operand(store, mir_operand_imm_int(offset));
-                mir_block_append_inst(ctx->current_block, store);
+                // In-place initialization for struct literal
+                AstNode *struct_expr = node->var_stmt.init;
+                Type *type = struct_expr->type;
+                
+                if (struct_expr->struct_expr.fields)
+                {
+                    for (int i = 0; i < struct_expr->struct_expr.fields->count; i++)
+                    {
+                        AstNode *field_init = struct_expr->struct_expr.fields->items[i];
+                        // find field offset
+                        int32_t field_offset = 0;
+                        for (int j = 0; j < type->structure.field_count; j++)
+                        {
+                            if (strcmp(type->structure.fields[j].name, field_init->field_expr.field) == 0)
+                            {
+                                field_offset = (int32_t)type->structure.fields[j].offset;
+                                break;
+                            }
+                        }
+                        
+                        // lower init expr
+                        MIRValue *val = lower_expr(ctx, field_init->field_expr.object);
+                        if (val)
+                        {
+                            // store to stack at offset + field_offset
+                            MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                            mir_inst_add_operand(store, mir_operand_value(val->id));
+                            mir_inst_add_operand(store, mir_operand_imm_int(offset + field_offset));
+                            mir_block_append_inst(ctx->current_block, store);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                MIRValue *val = lower_expr(ctx, node->var_stmt.init);
+                if (val)
+                {
+                    MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                    mir_inst_add_operand(store, mir_operand_value(val->id));
+                    mir_inst_add_operand(store, mir_operand_imm_int(offset));
+                    mir_block_append_inst(ctx->current_block, store);
+                }
             }
         }
         // No init value means uninitialized - stack slot is already allocated
@@ -608,18 +646,180 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         }
         return NULL;
         
+    case AST_EXPR_FIELD:
+    {
+        // Field access: obj.field
+        // We need the address of obj to add the offset
+        
+        MIRValue *base_addr = NULL;
+        AstNode *obj = node->field_expr.object;
+        
+        if (obj->kind == AST_EXPR_IDENT && obj->symbol && obj->symbol->kind == SYMBOL_VARIABLE)
+        {
+            // Local variable: get stack address
+            int32_t offset = lower_context_get_stack_offset(ctx, obj->symbol->decl);
+            if (offset != 0)
+            {
+                base_addr = mir_function_alloc_value(ctx->current_function, NULL, "base_addr");
+                MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
+                mir_inst_add_operand(addr, mir_operand_imm_int(offset));
+                mir_inst_set_result(addr, base_addr);
+                mir_block_append_inst(ctx->current_block, addr);
+            }
+            else
+            {
+                // Global variable
+                base_addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
+                MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+                mir_inst_add_operand(mov, mir_operand_global(obj->symbol->name));
+                mir_inst_set_result(mov, base_addr);
+                mir_block_append_inst(ctx->current_block, mov);
+            }
+        }
+        else if (obj->kind == AST_EXPR_UNARY && obj->unary_expr.op == TOKEN_AT)
+        {
+            // Dereference: @ptr.field -> ptr is the base address
+            base_addr = lower_expr(ctx, obj->unary_expr.expr);
+        }
+        else
+        {
+            // Complex expression: assume it evaluates to a pointer or we need to spill it?
+            // For now, assume it's a pointer if it's not a direct variable
+            // TODO: Handle nested field access (p.x.y)
+            // If p.x is a struct, lower_expr(p.x) would load it. We want the address.
+            // We need a lower_address function.
+            return NULL; 
+        }
+
+        if (!base_addr) return NULL;
+
+        // Find field offset
+        Type *obj_type = obj->type;
+        if (obj_type->kind == TYPE_POINTER) obj_type = obj_type->pointer.base;
+        
+        int32_t field_offset = 0;
+        if (obj_type->kind == TYPE_STRUCT)
+        {
+            for (int i = 0; i < obj_type->structure.field_count; i++)
+            {
+                if (strcmp(obj_type->structure.fields[i].name, node->field_expr.field) == 0)
+                {
+                    field_offset = (int32_t)obj_type->structure.fields[i].offset;
+                    break;
+                }
+            }
+        }
+
+        // Add offset
+        MIRValue *field_addr = base_addr;
+        if (field_offset != 0)
+        {
+            field_addr = mir_function_alloc_value(ctx->current_function, NULL, "field_addr");
+            MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, 
+                                           mir_operand_value(base_addr->id), 
+                                           mir_operand_imm_int(field_offset));
+            mir_inst_set_result(add, field_addr);
+            mir_block_append_inst(ctx->current_block, add);
+        }
+
+        // Load value
+        MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "field_val");
+        MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
+        mir_inst_add_operand(load, mir_operand_value(field_addr->id));
+        mir_inst_set_result(load, result);
+        mir_block_append_inst(ctx->current_block, load);
+        
+        return result;
+    }
+
+    case AST_EXPR_INDEX:
+    {
+        // Array indexing: arr[index]
+        // Address = base_addr + index * elem_size
+        
+        MIRValue *base_addr = NULL;
+        AstNode *arr = node->index_expr.array;
+        
+        if (arr->kind == AST_EXPR_IDENT && arr->symbol && arr->symbol->kind == SYMBOL_VARIABLE)
+        {
+            // Local variable: get stack address
+            int32_t offset = lower_context_get_stack_offset(ctx, arr->symbol->decl);
+            if (offset != 0)
+            {
+                base_addr = mir_function_alloc_value(ctx->current_function, NULL, "base_addr");
+                MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
+                mir_inst_add_operand(addr, mir_operand_imm_int(offset));
+                mir_inst_set_result(addr, base_addr);
+                mir_block_append_inst(ctx->current_block, addr);
+            }
+            else
+            {
+                // Global variable
+                base_addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
+                MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+                mir_inst_add_operand(mov, mir_operand_global(arr->symbol->name));
+                mir_inst_set_result(mov, base_addr);
+                mir_block_append_inst(ctx->current_block, mov);
+            }
+        }
+        else
+        {
+            // Assume pointer or complex expression evaluating to address
+            base_addr = lower_expr(ctx, arr);
+        }
+
+        if (!base_addr) return NULL;
+
+        MIRValue *index_val = lower_expr(ctx, node->index_expr.index);
+        if (!index_val) return NULL;
+
+        // Get element size
+        Type *obj_type = arr->type;
+        Type *elem_type = NULL;
+        if (obj_type->kind == TYPE_ARRAY) elem_type = obj_type->array.elem_type;
+        else if (obj_type->kind == TYPE_POINTER) elem_type = obj_type->pointer.base;
+        
+        size_t elem_size = elem_type ? elem_type->size : 8;
+
+        // Calculate offset: index * elem_size
+        MIRValue *offset_val = mir_function_alloc_value(ctx->current_function, NULL, "index_offset");
+        MIRInst *mul = mir_inst_binary(MIR_OP_MUL, NULL, 
+                                       mir_operand_value(index_val->id), 
+                                       mir_operand_imm_int(elem_size));
+        mir_inst_set_result(mul, offset_val);
+        mir_block_append_inst(ctx->current_block, mul);
+
+        // Add offset to base
+        MIRValue *elem_addr = mir_function_alloc_value(ctx->current_function, NULL, "elem_addr");
+        MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, 
+                                       mir_operand_value(base_addr->id), 
+                                       mir_operand_value(offset_val->id));
+        mir_inst_set_result(add, elem_addr);
+        mir_block_append_inst(ctx->current_block, add);
+
+        // Load value
+        MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "elem_val");
+        MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
+        mir_inst_add_operand(load, mir_operand_value(elem_addr->id));
+        mir_inst_set_result(load, result);
+        mir_block_append_inst(ctx->current_block, load);
+        
+        return result;
+    }
+
     case AST_EXPR_BINARY:
     {
         // Handle assignment separately
         if (node->binary_expr.op == TOKEN_EQUAL)
         {
             AstNode *lhs = node->binary_expr.left;
-            MIRValue *rhs_val = lower_expr(ctx, node->binary_expr.right);
-            if (!rhs_val) return NULL;
             
             if (lhs->kind == AST_EXPR_IDENT)
             {
                 // Variable assignment: var = val
+                MIRValue *rhs_val = lower_expr(ctx, node->binary_expr.right);
+                if (!rhs_val) return NULL;
+
                 if (lhs->symbol && lhs->symbol->kind == SYMBOL_VARIABLE)
                 {
                     int32_t offset = lower_context_get_stack_offset(ctx, lhs->symbol->decl);
@@ -634,24 +834,170 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                     else
                     {
                         // Global variable: store to global
-                        // TODO: Implement global store if needed (requires address calculation)
+                        // TODO: Implement global store if needed
                     }
                 }
+                return rhs_val;
             }
             else if (lhs->kind == AST_EXPR_UNARY && lhs->unary_expr.op == TOKEN_AT)
             {
                 // Pointer assignment: @ptr = val
+                // Evaluate ptr first
                 MIRValue *ptr_val = lower_expr(ctx, lhs->unary_expr.expr);
-                if (ptr_val)
+                if (!ptr_val) return NULL;
+                
+                MIRValue *rhs_val = lower_expr(ctx, node->binary_expr.right);
+                if (!rhs_val) return NULL;
+
+                MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                mir_inst_add_operand(store, mir_operand_value(rhs_val->id));
+                mir_inst_add_operand(store, mir_operand_value(ptr_val->id));
+                mir_block_append_inst(ctx->current_block, store);
+                
+                return rhs_val;
+            }
+            else if (lhs->kind == AST_EXPR_FIELD)
+            {
+                // Field assignment: obj.field = val
+                MIRValue *base_addr = NULL;
+                AstNode *obj = lhs->field_expr.object;
+                
+                if (obj->kind == AST_EXPR_IDENT && obj->symbol && obj->symbol->kind == SYMBOL_VARIABLE)
                 {
+                    int32_t offset = lower_context_get_stack_offset(ctx, obj->symbol->decl);
+                    if (offset != 0)
+                    {
+                        base_addr = mir_function_alloc_value(ctx->current_function, NULL, "base_addr");
+                        MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
+                        mir_inst_add_operand(addr, mir_operand_imm_int(offset));
+                        mir_inst_set_result(addr, base_addr);
+                        mir_block_append_inst(ctx->current_block, addr);
+                    }
+                    else
+                    {
+                        base_addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
+                        MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+                        mir_inst_add_operand(mov, mir_operand_global(obj->symbol->name));
+                        mir_inst_set_result(mov, base_addr);
+                        mir_block_append_inst(ctx->current_block, mov);
+                    }
+                }
+                else if (obj->kind == AST_EXPR_UNARY && obj->unary_expr.op == TOKEN_AT)
+                {
+                    base_addr = lower_expr(ctx, obj->unary_expr.expr);
+                }
+                
+                if (base_addr)
+                {
+                    Type *obj_type = obj->type;
+                    if (obj_type->kind == TYPE_POINTER) obj_type = obj_type->pointer.base;
+                    
+                    int32_t field_offset = 0;
+                    if (obj_type->kind == TYPE_STRUCT)
+                    {
+                        for (int i = 0; i < obj_type->structure.field_count; i++)
+                        {
+                            if (strcmp(obj_type->structure.fields[i].name, lhs->field_expr.field) == 0)
+                            {
+                                field_offset = (int32_t)obj_type->structure.fields[i].offset;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    MIRValue *field_addr = base_addr;
+                    if (field_offset != 0)
+                    {
+                        field_addr = mir_function_alloc_value(ctx->current_function, NULL, "field_addr");
+                        MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, 
+                                                       mir_operand_value(base_addr->id), 
+                                                       mir_operand_imm_int(field_offset));
+                        mir_inst_set_result(add, field_addr);
+                        mir_block_append_inst(ctx->current_block, add);
+                    }
+                    
+                    MIRValue *rhs_val = lower_expr(ctx, node->binary_expr.right);
+                    if (!rhs_val) return NULL;
+
                     MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
                     mir_inst_add_operand(store, mir_operand_value(rhs_val->id));
-                    mir_inst_add_operand(store, mir_operand_value(ptr_val->id));
+                    mir_inst_add_operand(store, mir_operand_value(field_addr->id));
                     mir_block_append_inst(ctx->current_block, store);
+                    
+                    return rhs_val;
+                }
+            }
+            else if (lhs->kind == AST_EXPR_INDEX)
+            {
+                // Array assignment: arr[index] = val
+                MIRValue *base_addr = NULL;
+                AstNode *arr = lhs->index_expr.array;
+                
+                if (arr->kind == AST_EXPR_IDENT && arr->symbol && arr->symbol->kind == SYMBOL_VARIABLE)
+                {
+                    int32_t offset = lower_context_get_stack_offset(ctx, arr->symbol->decl);
+                    if (offset != 0)
+                    {
+                        base_addr = mir_function_alloc_value(ctx->current_function, NULL, "base_addr");
+                        MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
+                        mir_inst_add_operand(addr, mir_operand_imm_int(offset));
+                        mir_inst_set_result(addr, base_addr);
+                        mir_block_append_inst(ctx->current_block, addr);
+                    }
+                    else
+                    {
+                        base_addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
+                        MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+                        mir_inst_add_operand(mov, mir_operand_global(arr->symbol->name));
+                        mir_inst_set_result(mov, base_addr);
+                        mir_block_append_inst(ctx->current_block, mov);
+                    }
+                }
+                else
+                {
+                    base_addr = lower_expr(ctx, arr);
+                }
+                
+                if (base_addr)
+                {
+                    MIRValue *index_val = lower_expr(ctx, lhs->index_expr.index);
+                    if (index_val)
+                    {
+                        Type *obj_type = arr->type;
+                        Type *elem_type = NULL;
+                        if (obj_type->kind == TYPE_ARRAY) elem_type = obj_type->array.elem_type;
+                        else if (obj_type->kind == TYPE_POINTER) elem_type = obj_type->pointer.base;
+                        
+                        size_t elem_size = elem_type ? elem_type->size : 8;
+                        
+                        MIRValue *offset_val = mir_function_alloc_value(ctx->current_function, NULL, "index_offset");
+                        MIRInst *mul = mir_inst_binary(MIR_OP_MUL, NULL, 
+                                                       mir_operand_value(index_val->id), 
+                                                       mir_operand_imm_int(elem_size));
+                        mir_inst_set_result(mul, offset_val);
+                        mir_block_append_inst(ctx->current_block, mul);
+                        
+                        MIRValue *elem_addr = mir_function_alloc_value(ctx->current_function, NULL, "elem_addr");
+                        MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, 
+                                                       mir_operand_value(base_addr->id), 
+                                                       mir_operand_value(offset_val->id));
+                        mir_inst_set_result(add, elem_addr);
+                        mir_block_append_inst(ctx->current_block, add);
+                        
+                        MIRValue *rhs_val = lower_expr(ctx, node->binary_expr.right);
+                        if (!rhs_val) return NULL;
+
+                        MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                        mir_inst_add_operand(store, mir_operand_value(rhs_val->id));
+                        mir_inst_add_operand(store, mir_operand_value(elem_addr->id));
+                        mir_block_append_inst(ctx->current_block, store);
+                        
+                        return rhs_val;
+                    }
                 }
             }
             
-            return rhs_val;
+            return NULL;
         }
 
         MIRValue *left = lower_expr(ctx, node->binary_expr.left);

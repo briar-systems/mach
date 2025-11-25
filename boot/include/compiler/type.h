@@ -30,6 +30,13 @@ typedef enum TypeKind
 
 typedef struct Type Type;
 
+typedef struct TypeField
+{
+    char *name;
+    Type *type;
+    size_t offset;
+} TypeField;
+
 struct Type
 {
     TypeKind kind;
@@ -59,6 +66,14 @@ struct Type
             Type **param_types;
             int    param_count;
         } function;
+
+        // TYPE_STRUCT
+        struct
+        {
+            char *name;
+            TypeField *fields;
+            int field_count;
+        } structure;
     };
 };
 
@@ -69,6 +84,7 @@ Type *type_get_primitive(TypeKind kind);
 Type *type_create_pointer(Type *base, bool is_const);
 Type *type_create_array(Type *elem_type, size_t count);
 Type *type_create_function(Type *return_type, Type **param_types, int param_count);
+Type *type_create_struct(const char *name, TypeField *fields, int field_count);
 
 // type checking
 bool type_equals(Type *a, Type *b);

@@ -217,6 +217,88 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
 }
 
 // analyze statement
+// analyze record definition
+static int sema_analyze_rec(Sema *sema, AstNode *node)
+{
+    if (node->kind != AST_STMT_REC)
+    {
+        return -1;
+    }
+
+    Symbol *sym = symbol_create(node->rec_stmt.name, SYMBOL_TYPE);
+    if (!sym)
+    {
+        return -1;
+    }
+
+    // process fields
+    int field_count = node->rec_stmt.fields ? node->rec_stmt.fields->count : 0;
+    TypeField *fields = NULL;
+    
+    if (field_count > 0)
+    {
+        fields = malloc(sizeof(TypeField) * field_count);
+        if (!fields)
+        {
+            symbol_destroy(sym);
+            return -1;
+        }
+
+        for (int i = 0; i < field_count; i++)
+        {
+            AstNode *field_node = node->rec_stmt.fields->items[i];
+            if (field_node->kind != AST_STMT_FIELD)
+            {
+                free(fields);
+                symbol_destroy(sym);
+                return -1;
+            }
+
+            fields[i].name = strdup(field_node->field_stmt.name);
+            fields[i].type = sema_resolve_type(sema, field_node->field_stmt.type);
+            fields[i].offset = 0; // calculated in type_create_struct
+
+            if (!fields[i].type)
+            {
+                sema_error(sema, field_node->token, "failed to resolve field type");
+                // cleanup
+                for (int j = 0; j <= i; j++) free(fields[j].name);
+                free(fields);
+                symbol_destroy(sym);
+                return -1;
+            }
+        }
+    }
+
+    // create struct type
+    Type *rec_type = type_create_struct(node->rec_stmt.name, fields, field_count);
+    if (!rec_type)
+    {
+        // cleanup
+        if (fields)
+        {
+            for (int i = 0; i < field_count; i++) free(fields[i].name);
+            free(fields);
+        }
+        symbol_destroy(sym);
+        return -1;
+    }
+
+    sym->type = rec_type;
+    node->symbol = sym;
+    node->type = rec_type;
+
+    // add to symbol table
+    if (symbol_table_insert(sema->current_table, sym) < 0)
+    {
+        sema_error(sema, node->token, "duplicate type definition");
+        symbol_destroy(sym);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int sema_analyze_stmt(Sema *sema, AstNode *node)
 {
     if (!node)
@@ -226,8 +308,12 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
 
     switch (node->kind)
     {
+    case AST_STMT_REC:
+        return sema_analyze_rec(sema, node);
+
     case AST_STMT_FUN:
         return sema_analyze_fun(sema, node);
+
 
     case AST_STMT_VAL:
     case AST_STMT_VAR:
@@ -401,6 +487,144 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
         }
         return 0;
 
+    case AST_EXPR_FIELD:
+    {
+        if (sema_analyze_expr(sema, node->field_expr.object) < 0)
+        {
+            return -1;
+        }
+
+        Type *obj_type = node->field_expr.object->type;
+        
+        // auto-dereference pointer to struct
+        if (obj_type->kind == TYPE_POINTER && obj_type->pointer.base->kind == TYPE_STRUCT)
+        {
+            obj_type = obj_type->pointer.base;
+        }
+
+        if (obj_type->kind != TYPE_STRUCT)
+        {
+            sema_error(sema, node->token, "field access on non-struct type");
+            return -1;
+        }
+
+        // find field
+        TypeField *field = NULL;
+        for (int i = 0; i < obj_type->structure.field_count; i++)
+        {
+            if (strcmp(obj_type->structure.fields[i].name, node->field_expr.field) == 0)
+            {
+                field = &obj_type->structure.fields[i];
+                break;
+            }
+        }
+
+        if (!field)
+        {
+            sema_error(sema, node->token, "undefined field");
+            return -1;
+        }
+
+        node->type = field->type;
+        return 0;
+    }
+
+    case AST_EXPR_STRUCT:
+    {
+        Type *type = sema_resolve_type(sema, node->struct_expr.type);
+        if (!type || type->kind != TYPE_STRUCT)
+        {
+            sema_error(sema, node->token, "invalid struct type");
+            return -1;
+        }
+
+        // verify fields
+        if (node->struct_expr.fields)
+        {
+            for (int i = 0; i < node->struct_expr.fields->count; i++)
+            {
+                AstNode *field_init = node->struct_expr.fields->items[i];
+                // field_init is AST_EXPR_FIELD (field: name, object: init_expr)
+                
+                // find field in struct type
+                TypeField *field = NULL;
+                for (int j = 0; j < type->structure.field_count; j++)
+                {
+                    if (strcmp(type->structure.fields[j].name, field_init->field_expr.field) == 0)
+                    {
+                        field = &type->structure.fields[j];
+                        break;
+                    }
+                }
+
+                if (!field)
+                {
+                    sema_error(sema, field_init->token, "undefined field in struct literal");
+                    return -1;
+                }
+
+                // analyze init expression
+                if (sema_analyze_expr(sema, field_init->field_expr.object) < 0)
+                {
+                    return -1;
+                }
+
+                if (!type_equals(field->type, field_init->field_expr.object->type))
+                {
+                    sema_error(sema, field_init->token, "field type mismatch");
+                    return -1;
+                }
+            }
+        }
+        
+        // TODO: Check for missing fields?
+
+        node->type = type;
+        return 0;
+    }
+
+    case AST_EXPR_INDEX:
+    {
+        if (sema_analyze_expr(sema, node->index_expr.array) < 0)
+        {
+            return -1;
+        }
+        if (sema_analyze_expr(sema, node->index_expr.index) < 0)
+        {
+            return -1;
+        }
+
+        Type *obj_type = node->index_expr.array->type;
+        Type *index_type = node->index_expr.index->type;
+
+        // Check index type (must be integer)
+        if (index_type->kind != TYPE_I64 && index_type->kind != TYPE_U64 &&
+            index_type->kind != TYPE_I32 && index_type->kind != TYPE_U32 &&
+            index_type->kind != TYPE_I16 && index_type->kind != TYPE_U16 &&
+            index_type->kind != TYPE_I8 && index_type->kind != TYPE_U8)
+        {
+            sema_error(sema, node->index_expr.index->token, "array index must be an integer");
+            return -1;
+        }
+
+        // Check object type (array or pointer)
+        if (obj_type->kind == TYPE_ARRAY)
+        {
+            node->type = obj_type->array.elem_type;
+        }
+        else if (obj_type->kind == TYPE_POINTER)
+        {
+            node->type = obj_type->pointer.base;
+        }
+        else
+        {
+            sema_error(sema, node->token, "indexing on non-array/pointer type");
+            return -1;
+        }
+
+        return 0;
+    }
+
     default:
         // other expressions not implemented yet
         return 0;
@@ -449,6 +673,26 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
         Type *base = sema_resolve_type(sema, type_node->type_ptr.base);
         if (!base) return NULL;
         return type_create_pointer(base, type_node->type_ptr.is_read_only);
+    }
+
+    case AST_TYPE_ARRAY:
+    {
+        Type *elem = sema_resolve_type(sema, type_node->type_array.elem_type);
+        if (!elem) return NULL;
+        
+        // Evaluate size
+        AstNode *size_expr = type_node->type_array.size;
+        // Simple check for integer literal
+        if (size_expr->kind == AST_EXPR_LIT && size_expr->token->kind == TOKEN_LIT_INT)
+        {
+            size_t count = (size_t)size_expr->lit_expr.int_val;
+            return type_create_array(elem, count);
+        }
+        else
+        {
+            sema_error(sema, size_expr->token, "array size must be a constant integer");
+            return NULL;
+        }
     }
 
     default:

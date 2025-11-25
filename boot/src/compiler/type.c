@@ -93,6 +93,58 @@ Type *type_create_function(Type *return_type, Type **param_types, int param_coun
     return type;
 }
 
+Type *type_create_struct(const char *name, TypeField *fields, int field_count)
+{
+    Type *type = malloc(sizeof(Type));
+    if (!type)
+    {
+        return NULL;
+    }
+
+    type->kind = TYPE_STRUCT;
+    type->structure.name = name ? strdup(name) : NULL;
+    type->structure.fields = fields;
+    type->structure.field_count = field_count;
+
+    // calculate size and alignment
+    size_t size = 0;
+    size_t alignment = 1;
+
+    for (int i = 0; i < field_count; i++)
+    {
+        Type *field_type = fields[i].type;
+        size_t field_size = field_type->size;
+        size_t field_align = field_type->alignment;
+
+        // update struct alignment
+        if (field_align > alignment)
+        {
+            alignment = field_align;
+        }
+
+        // add padding
+        if (size % field_align != 0)
+        {
+            size += field_align - (size % field_align);
+        }
+
+        // set field offset
+        fields[i].offset = size;
+        size += field_size;
+    }
+
+    // align total size
+    if (size % alignment != 0)
+    {
+        size += alignment - (size % alignment);
+    }
+
+    type->size = size;
+    type->alignment = alignment;
+
+    return type;
+}
+
 bool type_equals(Type *a, Type *b)
 {
     if (!a || !b)
@@ -140,6 +192,26 @@ bool type_equals(Type *a, Type *b)
         for (int i = 0; i < a->function.param_count; i++)
         {
             if (!type_equals(a->function.param_types[i], b->function.param_types[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+
+    case TYPE_STRUCT:
+        // Nominal typing for structs: equal if they have the same name
+        if (a->structure.name && b->structure.name)
+        {
+            return strcmp(a->structure.name, b->structure.name) == 0;
+        }
+        // If anonymous, check structure
+        if (a->structure.field_count != b->structure.field_count)
+        {
+            return false;
+        }
+        for (int i = 0; i < a->structure.field_count; i++)
+        {
+            if (!type_equals(a->structure.fields[i].type, b->structure.fields[i].type))
             {
                 return false;
             }
