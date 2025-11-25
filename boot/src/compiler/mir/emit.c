@@ -1,5 +1,6 @@
 #include "compiler/mir/emit.h"
 #include "compiler/mir/of/elf.h"
+#include "compiler/mir/codegen/x86_64.h"
 #include <stdlib.h>
 
 // emission context
@@ -94,16 +95,36 @@ static int emit_globals(EmitContext *ctx, MIRModule *module)
     return 0;
 }
 
-static int emit_function_stub(EmitContext *ctx, MIRFunction *func)
+static int emit_function_code(EmitContext *ctx, MIRFunction *func)
 {
-    // for now, just add function symbol
-    // actual code generation will be implemented later
+    // create x86_64 codegen context
+    X86_64_CodegenContext *codegen = x86_64_codegen_create();
+    if (!codegen)
+    {
+        return -1;
+    }
+
+    // generate machine code
+    if (x86_64_emit_function(codegen, func) < 0)
+    {
+        x86_64_codegen_destroy(codegen);
+        return -1;
+    }
+
+    // get generated code
+    size_t code_size = 0;
+    uint8_t *code = x86_64_codegen_get_code(codegen, &code_size);
+
+    // add function symbol at current .text offset
     elf_add_symbol(ctx->elf, func->name, 0, ctx->text_section, func->is_exported, true);
 
-    // placeholder: emit a ret instruction (0xC3 in x86-64)
-    uint8_t ret_instruction = 0xC3;
-    elf_write_section_data(ctx->elf, ctx->text_section, &ret_instruction, 1);
+    // write code to .text section
+    if (code && code_size > 0)
+    {
+        elf_write_section_data(ctx->elf, ctx->text_section, code, code_size);
+    }
 
+    x86_64_codegen_destroy(codegen);
     return 0;
 }
 
@@ -112,7 +133,7 @@ static int emit_functions(EmitContext *ctx, MIRModule *module)
     // emit all functions
     for (MIRFunction *func = module->functions; func; func = func->next)
     {
-        if (emit_function_stub(ctx, func) < 0)
+        if (emit_function_code(ctx, func) < 0)
         {
             return -1;
         }
