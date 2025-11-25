@@ -277,6 +277,10 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         }
         return sema_analyze_stmt(sema, node->for_stmt.body);
 
+    case AST_STMT_MIR:
+        // inline MIR blocks are opaque to semantic analysis
+        return 0;
+
     default:
         // other statements not implemented yet
         return 0;

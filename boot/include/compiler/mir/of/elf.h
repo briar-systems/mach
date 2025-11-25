@@ -49,6 +49,9 @@ void elf_add_symbol(ELFContext *ctx, const char *name, uint64_t value, int secti
 // relocations
 void elf_add_relocation(ELFContext *ctx, int section_id, uint64_t offset, const char *symbol_name, ELFX86_64RelocType type);
 
+// section queries
+uint64_t elf_get_section_size(ELFContext *ctx, int section_id);
+
 // finalize and write
 int elf_write_to_file(ELFContext *ctx, const char *output_path);
 

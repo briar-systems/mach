@@ -290,6 +290,26 @@ void elf_add_relocation(ELFContext *ctx, int section_id, uint64_t offset, const 
     ctx->reloc_count++;
 }
 
+uint64_t elf_get_section_size(ELFContext *ctx, int section_id)
+{
+    if (!ctx)
+    {
+        return 0;
+    }
+
+    // find section by id (sections are stored in reverse order)
+    int current_id = ctx->section_count - 1;
+    for (ELFSection *sec = ctx->sections; sec; sec = sec->next, current_id--)
+    {
+        if (current_id == section_id)
+        {
+            return sec->size;
+        }
+    }
+
+    return 0;
+}
+
 // string table builder helper
 typedef struct
 {
@@ -393,22 +413,68 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
     
     // null symbol at index 0 is already zeroed
     
-    // add real symbols
+    // add real symbols - local symbols first, then global symbols (ELF requirement)
     idx = 1;
+    int first_global_idx = symbol_count; // will be updated when we find first global
+    
+    // first pass: add local symbols
     for (ELFSymbol *sym = ctx->symbols; sym; sym = sym->next)
     {
-        symbols[idx].st_name = strtab_add(&strtab, sym->name);
-        symbols[idx].st_info = ((sym->is_global ? 1 : 0) << 4) | (sym->is_function ? 2 : 1);
-        symbols[idx].st_other = 0;
-        symbols[idx].st_shndx = sym->section_id + 1; // +1 for null section
-        symbols[idx].st_value = sym->value;
-        symbols[idx].st_size = 0;
-        idx++;
+        if (!sym->is_global)
+        {
+            symbols[idx].st_name = strtab_add(&strtab, sym->name);
+            symbols[idx].st_info = (0 << 4) | (sym->is_function ? 2 : 1); // STB_LOCAL
+            symbols[idx].st_other = 0;
+            symbols[idx].st_shndx = sym->section_id + 1; // +1 for null section
+            symbols[idx].st_value = sym->value;
+            symbols[idx].st_size = 0;
+            idx++;
+        }
+    }
+    
+    // record where globals start
+    first_global_idx = idx;
+    
+    // second pass: add global symbols
+    for (ELFSymbol *sym = ctx->symbols; sym; sym = sym->next)
+    {
+        if (sym->is_global)
+        {
+            symbols[idx].st_name = strtab_add(&strtab, sym->name);
+            symbols[idx].st_info = (1 << 4) | (sym->is_function ? 2 : 1); // STB_GLOBAL
+            symbols[idx].st_other = 0;
+            symbols[idx].st_shndx = sym->section_id + 1; // +1 for null section
+            symbols[idx].st_value = sym->value;
+            symbols[idx].st_size = 0;
+            idx++;
+        }
+    }
+    
+    // count relocations per section
+    int *reloc_counts = calloc(regular_section_count, sizeof(int));
+    for (ELFRelocation *reloc = ctx->relocations; reloc; reloc = reloc->next)
+    {
+        if (reloc->section_id >= 0 && reloc->section_id < regular_section_count)
+        {
+            reloc_counts[reloc->section_id]++;
+        }
     }
     
     // calculate section count
     int section_count = 1; // null section
     section_count += regular_section_count;
+    
+    // add relocation sections for sections that have relocations
+    int rela_section_count = 0;
+    for (int i = 0; i < regular_section_count; i++)
+    {
+        if (reloc_counts[i] > 0)
+        {
+            rela_section_count++;
+        }
+    }
+    section_count += rela_section_count;
+    
     section_count += 3; // symtab, strtab, shstrtab
     
     // calculate file layout
@@ -420,6 +486,21 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
     {
         section_offsets[i] = current_offset;
         current_offset += sections_array[i]->size;
+    }
+    
+    // then relocation sections
+    uint64_t *rela_offsets = calloc(regular_section_count, sizeof(uint64_t));
+    uint32_t *rela_name_offsets = calloc(regular_section_count, sizeof(uint32_t));
+    for (int i = 0; i < regular_section_count; i++)
+    {
+        if (reloc_counts[i] > 0)
+        {
+            char rela_name[256];
+            snprintf(rela_name, sizeof(rela_name), ".rela%s", sections_array[i]->name);
+            rela_name_offsets[i] = strtab_add(&shstrtab, rela_name);
+            rela_offsets[i] = current_offset;
+            current_offset += reloc_counts[i] * sizeof(Elf64_Rela);
+        }
     }
     
     // then symtab
@@ -485,6 +566,26 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
         fwrite(&shdr, sizeof(shdr), 1, f);
     }
     
+    // relocation section headers
+    for (int i = 0; i < regular_section_count; i++)
+    {
+        if (reloc_counts[i] > 0)
+        {
+            memset(&shdr, 0, sizeof(shdr));
+            shdr.sh_name = rela_name_offsets[i];
+            shdr.sh_type = ELF_SHT_RELA;
+            shdr.sh_flags = 0;
+            shdr.sh_addr = 0;
+            shdr.sh_offset = rela_offsets[i];
+            shdr.sh_size = reloc_counts[i] * sizeof(Elf64_Rela);
+            shdr.sh_link = section_count - 3; // link to symtab
+            shdr.sh_info = i + 1; // section to apply relocations to (+1 for null)
+            shdr.sh_addralign = 8;
+            shdr.sh_entsize = sizeof(Elf64_Rela);
+            fwrite(&shdr, sizeof(shdr), 1, f);
+        }
+    }
+    
     // symtab section header
     memset(&shdr, 0, sizeof(shdr));
     shdr.sh_name = symtab_name_offset;
@@ -494,7 +595,7 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
     shdr.sh_offset = symtab_offset;
     shdr.sh_size = symtab_size;
     shdr.sh_link = section_count - 2; // link to strtab (second to last)
-    shdr.sh_info = 1; // one local symbol (the null symbol)
+    shdr.sh_info = first_global_idx; // index of first global symbol
     shdr.sh_addralign = 8;
     shdr.sh_entsize = sizeof(Elf64_Sym);
     fwrite(&shdr, sizeof(shdr), 1, f);
@@ -537,6 +638,67 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
         }
     }
     
+    // write relocation data
+    for (int i = 0; i < regular_section_count; i++)
+    {
+        if (reloc_counts[i] > 0)
+        {
+            // collect relocations for this section
+            Elf64_Rela *relas = calloc(reloc_counts[i], sizeof(Elf64_Rela));
+            int rela_idx = 0;
+            
+            for (ELFRelocation *reloc = ctx->relocations; reloc; reloc = reloc->next)
+            {
+                if (reloc->section_id == i)
+                {
+                    // find symbol index
+                    int sym_idx = 0;
+                    int cur_idx = 1; // skip null symbol
+                    
+                    // check local symbols
+                    for (ELFSymbol *sym = ctx->symbols; sym; sym = sym->next)
+                    {
+                        if (!sym->is_global)
+                        {
+                            if (strcmp(sym->name, reloc->symbol_name) == 0)
+                            {
+                                sym_idx = cur_idx;
+                                break;
+                            }
+                            cur_idx++;
+                        }
+                    }
+                    
+                    // check global symbols if not found
+                    if (sym_idx == 0)
+                    {
+                        cur_idx = first_global_idx;
+                        for (ELFSymbol *sym = ctx->symbols; sym; sym = sym->next)
+                        {
+                            if (sym->is_global)
+                            {
+                                if (strcmp(sym->name, reloc->symbol_name) == 0)
+                                {
+                                    sym_idx = cur_idx;
+                                    break;
+                                }
+                                cur_idx++;
+                            }
+                        }
+                    }
+                    
+                    relas[rela_idx].r_offset = reloc->offset;
+                    relas[rela_idx].r_info = ((uint64_t)sym_idx << 32) | (uint64_t)reloc->type;
+                    relas[rela_idx].r_addend = 0;
+                    rela_idx++;
+                }
+            }
+            
+            fwrite(relas, sizeof(Elf64_Rela), reloc_counts[i], f);
+            free(relas);
+        }
+    }
+    
     // write symtab
     fwrite(symbols, sizeof(Elf64_Sym), symbol_count, f);
     
@@ -551,6 +713,9 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
     free(section_name_offsets);
     free(section_offsets);
     free(symbols);
+    free(reloc_counts);
+    free(rela_offsets);
+    free(rela_name_offsets);
     strtab_free(&shstrtab);
     strtab_free(&strtab);
     fclose(f);

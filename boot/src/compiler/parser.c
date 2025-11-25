@@ -1098,6 +1098,8 @@ AstNode *parser_parse_stmt(Parser *parser)
         return parser_parse_stmt_ret(parser);
     case TOKEN_L_BRACE:
         return parser_parse_stmt_block(parser);
+    case TOKEN_KW_MIR:
+        return parser_parse_stmt_mir(parser);
     case TOKEN_DOLLAR:
         return parser_parse_directive(parser, false);
     default:
@@ -2030,9 +2032,9 @@ AstNode *parser_parse_stmt_mir(Parser *parser)
         return NULL;
     }
 
-    // capture starting position after '{'
-    Token *start_token = parser->current;
-    int    brace_depth = 1;
+    // capture starting position after '{' using character position in source
+    int start_pos = parser->current->pos;
+    int brace_depth = 1;
 
     // scan until matching closing brace
     while (brace_depth > 0 && !parser_is_at_end(parser))
@@ -2053,10 +2055,8 @@ AstNode *parser_parse_stmt_mir(Parser *parser)
     }
 
     // calculate length of content between braces
-    Token *end_token = parser->current;
-    int    start_pos = start_token->pos;
-    int    end_pos   = end_token->pos;
-    int    len       = end_pos - start_pos;
+    int end_pos = parser->current->pos;
+    int len = end_pos - start_pos;
 
     // extract raw content
     node->mir_stmt.content = (char *)malloc(len + 1);

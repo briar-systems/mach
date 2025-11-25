@@ -3,6 +3,7 @@
 #include "compiler/mir/codegen/x86_64.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // emission context
 typedef struct
@@ -81,15 +82,27 @@ static int emit_globals(EmitContext *ctx, MIRModule *module)
             section = ctx->data_section;
         }
 
-        // add symbol
-        elf_add_symbol(ctx->elf, global->name, 0, section, global->is_exported, false);
+        // get current section offset for symbol
+        uint64_t offset = elf_get_section_size(ctx->elf, section);
 
-        // write initial data (simplified - would need proper serialization)
+        // add symbol at current offset
+        elf_add_symbol(ctx->elf, global->name, offset, section, global->is_exported, false);
+
+        // write initial data
         if (global->kind != MIR_GLOBAL_UNINIT)
         {
-            // placeholder: write zeros for now
-            uint8_t zero = 0;
-            elf_write_section_data(ctx->elf, section, &zero, 1);
+            if (global->init.string_value)
+            {
+                // string literal - write with null terminator
+                size_t len = strlen(global->init.string_value);
+                elf_write_section_data(ctx->elf, section, (const uint8_t *)global->init.string_value, len + 1);
+            }
+            else
+            {
+                // integer/float - write 8 bytes for now
+                uint64_t value = (uint64_t)global->init.int_value;
+                elf_write_section_data(ctx->elf, section, (const uint8_t *)&value, 8);
+            }
         }
     }
 
@@ -116,13 +129,24 @@ static int emit_function_code(EmitContext *ctx, MIRFunction *func)
     size_t code_size = 0;
     uint8_t *code = x86_64_codegen_get_code(codegen, &code_size);
 
+    // get current .text offset for symbol
+    uint64_t text_offset = elf_get_section_size(ctx->elf, ctx->text_section);
+
     // add function symbol at current .text offset
-    elf_add_symbol(ctx->elf, func->name, 0, ctx->text_section, func->is_exported, true);
+    elf_add_symbol(ctx->elf, func->name, text_offset, ctx->text_section, func->is_exported, true);
 
     // write code to .text section
     if (code && code_size > 0)
     {
         elf_write_section_data(ctx->elf, ctx->text_section, code, code_size);
+    }
+
+    // transfer relocations from codegen to ELF (adjust offsets to section-relative)
+    X86_64_Relocation *reloc = x86_64_codegen_get_relocations(codegen);
+    while (reloc)
+    {
+        elf_add_relocation(ctx->elf, ctx->text_section, text_offset + reloc->offset, reloc->symbol_name, reloc->type);
+        reloc = reloc->next;
     }
 
     x86_64_codegen_destroy(codegen);
