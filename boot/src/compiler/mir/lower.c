@@ -11,6 +11,13 @@
 #include <string.h>
 #include <stdio.h>
 
+// Stack slot mapping for local variables
+typedef struct
+{
+    AstNode *node;      // Variable AST node
+    int32_t  offset;    // Stack offset from RBP (negative)
+} StackSlot;
+
 // lowering context tracks state during lowering
 typedef struct LowerContext
 {
@@ -25,6 +32,12 @@ typedef struct LowerContext
     } *value_map;
     int value_map_count;
     int value_map_capacity;
+    
+    // Stack frame management
+    StackSlot *stack_slots;
+    int        stack_slot_count;
+    int        stack_slot_capacity;
+    int32_t    frame_size;  // Total stack space needed (in bytes)
 } LowerContext;
 
 static LowerContext *lower_context_create(MIRModule *module)
@@ -41,6 +54,10 @@ static LowerContext *lower_context_create(MIRModule *module)
     ctx->value_map = NULL;
     ctx->value_map_count = 0;
     ctx->value_map_capacity = 0;
+    ctx->stack_slots = NULL;
+    ctx->stack_slot_count = 0;
+    ctx->stack_slot_capacity = 0;
+    ctx->frame_size = 0;
     
     return ctx;
 }
@@ -55,6 +72,11 @@ static void lower_context_destroy(LowerContext *ctx)
     if (ctx->value_map)
     {
         free(ctx->value_map);
+    }
+    
+    if (ctx->stack_slots)
+    {
+        free(ctx->stack_slots);
     }
     
     free(ctx);
@@ -103,6 +125,59 @@ static MIRValue *lower_context_get_value(LowerContext *ctx, AstNode *node)
     return NULL;
 }
 
+// Allocate a stack slot for a local variable
+// Returns the negative offset from RBP (e.g., -8, -16, -24...)
+static int32_t lower_context_alloc_stack_slot(LowerContext *ctx, AstNode *node, size_t size)
+{
+    if (!ctx || !node)
+    {
+        return 0;
+    }
+    
+    // Expand capacity if needed
+    if (ctx->stack_slot_count >= ctx->stack_slot_capacity)
+    {
+        int new_capacity = ctx->stack_slot_capacity == 0 ? 16 : ctx->stack_slot_capacity * 2;
+        void *new_slots = realloc(ctx->stack_slots, new_capacity * sizeof(StackSlot));
+        if (!new_slots)
+        {
+            return 0;
+        }
+        ctx->stack_slots = new_slots;
+        ctx->stack_slot_capacity = new_capacity;
+    }
+    
+    // Allocate new stack space (stack grows down)
+    ctx->frame_size += size;
+    int32_t offset = -(int32_t)ctx->frame_size;
+    
+    // Record the slot
+    ctx->stack_slots[ctx->stack_slot_count].node = node;
+    ctx->stack_slots[ctx->stack_slot_count].offset = offset;
+    ctx->stack_slot_count++;
+    
+    return offset;
+}
+
+// Get stack offset for a variable
+static int32_t lower_context_get_stack_offset(LowerContext *ctx, AstNode *node)
+{
+    if (!ctx || !node)
+    {
+        return 0;
+    }
+    
+    for (int i = 0; i < ctx->stack_slot_count; i++)
+    {
+        if (ctx->stack_slots[i].node == node)
+        {
+            return ctx->stack_slots[i].offset;
+        }
+    }
+    
+    return 0; // Not found
+}
+
 // forward declarations
 static int lower_stmt(LowerContext *ctx, AstNode *node);
 static MIRValue *lower_expr(LowerContext *ctx, AstNode *node);
@@ -122,7 +197,10 @@ static int lower_function(LowerContext *ctx, AstNode *node)
         return -1;
     }
     
+    // reset function-specific context state
     ctx->current_function = func;
+    ctx->frame_size = 0;
+    ctx->stack_slot_count = 0;
     
     // add parameters
     if (node->fun_stmt.params)
@@ -147,6 +225,9 @@ static int lower_function(LowerContext *ctx, AstNode *node)
     {
         lower_stmt(ctx, node->fun_stmt.body);
     }
+    
+    // set function frame size
+    func->frame_size = ctx->frame_size;
     
     // ensure block is terminated
     if (ctx->current_block && !ctx->current_block->last_inst)
@@ -200,23 +281,24 @@ static int lower_var(LowerContext *ctx, AstNode *node)
     }
     else
     {
-        // local variable - allocate a value in the function
-        MIRValue *val = mir_function_alloc_value(ctx->current_function, NULL, node->var_stmt.name);
+        // Local variable - allocate stack slot
+        // For now, assume all variables are 8 bytes (i64/pointer size)
+        int32_t offset = lower_context_alloc_stack_slot(ctx, node, 8);
         
-        // handle initializer
+        // Handle initializer
         if (node->var_stmt.init)
         {
             MIRValue *init_val = lower_expr(ctx, node->var_stmt.init);
             if (init_val)
             {
-                // create assignment (for now, just map the node to the init value)
-                lower_context_map_value(ctx, node, init_val);
+                // Generate STORE: store init_val to [rbp + offset]
+                MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                mir_inst_add_operand(store, mir_operand_value(init_val->id));
+                mir_inst_add_operand(store, mir_operand_imm_int(offset));
+                mir_block_append_inst(ctx->current_block, store);
             }
         }
-        else
-        {
-            lower_context_map_value(ctx, node, val);
-        }
+        // No init value means uninitialized - stack slot is already allocated
     }
     
     return 0;
@@ -367,7 +449,7 @@ static int lower_stmt(LowerContext *ctx, AstNode *node)
         // inline MIR block
         if (node->mir_stmt.content && ctx->current_function && ctx->current_block)
         {
-            mir_parse_inline_block(ctx->current_function, ctx->current_block, node->mir_stmt.content);
+            mir_parse_inline_block(ctx, ctx->current_function, ctx->current_block, node->mir_stmt.content);
         }
         return 0;
         
@@ -407,11 +489,26 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         // look up value from symbol
         if (node->symbol)
         {
-            // check if it's a global variable by checking if we have no local mapping
-            // and it's a variable symbol
+            // check if it's a variable symbol
             if (node->symbol->kind == SYMBOL_VARIABLE)
             {
-                // check if we've already lowered this as a local
+                // Check if it's a local variable on the stack
+                int32_t offset = lower_context_get_stack_offset(ctx, node->symbol->decl);
+                if (offset != 0)
+                {
+                    // It's a local variable on stack - generate LOAD
+                    MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "local_load");
+                    
+                    // Generate LOAD: result = load(offset)
+                    MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
+                    mir_inst_add_operand(load, mir_operand_imm_int(offset));
+                    mir_inst_set_result(load, result);
+                    mir_block_append_inst(ctx->current_block, load);
+                    
+                    return result;
+                }
+                
+                // check if we've already lowered this as a value (e.g. function param)
                 MIRValue *local_val = lower_context_get_value(ctx, node->symbol->decl);
                 if (!local_val)
                 {
@@ -653,7 +750,7 @@ MIRGlobal *mir_lower_global(AstNode *ast_var)
 }
 
 // simple inline MIR parser for basic instructions
-int mir_parse_inline_block(MIRFunction *func, MIRBlock *current_block, const char *mir_text)
+int mir_parse_inline_block(LowerContext *ctx, MIRFunction *func, MIRBlock *current_block, const char *mir_text)
 {
     if (!func || !current_block || !mir_text)
     {
@@ -742,6 +839,56 @@ int mir_parse_inline_block(MIRFunction *func, MIRBlock *current_block, const cha
                     name[name_len] = '\0';
                     
                     mir_inst_add_operand(inst, mir_operand_global(name));
+                }
+                else if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_')
+                {
+                    // identifier (local variable)
+                    const char *name_start = p;
+                    while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || 
+                                 (*p >= '0' && *p <= '9') || *p == '_'))
+                    {
+                        p++;
+                    }
+                    
+                    int name_len = p - name_start;
+                    char *name = malloc(name_len + 1);
+                    memcpy(name, name_start, name_len);
+                    name[name_len] = '\0';
+                    
+                    // Look up stack offset
+                    int32_t offset = 0;
+                    if (ctx && ctx->stack_slots)
+                    {
+                        for (int i = 0; i < ctx->stack_slot_count; i++)
+                        {
+                            if (ctx->stack_slots[i].node && 
+                                (ctx->stack_slots[i].node->kind == AST_STMT_VAR || ctx->stack_slots[i].node->kind == AST_STMT_VAL) &&
+                                ctx->stack_slots[i].node->var_stmt.name &&
+                                strcmp(ctx->stack_slots[i].node->var_stmt.name, name) == 0)
+                            {
+                                offset = ctx->stack_slots[i].offset;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (offset != 0)
+                    {
+                        // Generate LOAD
+                        MIRValue *val = mir_function_alloc_value(func, NULL, "inline_load");
+                        MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
+                        mir_inst_add_operand(load, mir_operand_imm_int(offset));
+                        mir_inst_set_result(load, val);
+                        mir_block_append_inst(current_block, load);
+                        
+                        mir_inst_add_operand(inst, mir_operand_value(val->id));
+                        free(name); // name not needed for value operand
+                    }
+                    else
+                    {
+                        // Not found locally, assume global reference
+                        mir_inst_add_operand(inst, mir_operand_global(name));
+                    }
                 }
                 else if (*p == ')')
                 {

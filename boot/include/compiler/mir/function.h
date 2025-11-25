@@ -21,6 +21,7 @@ typedef struct MIRFunction
     size_t      block_count;
     uint32_t    next_value_id;     // value counter
     uint32_t    next_block_id;     // block counter
+    size_t      frame_size;        // stack frame size in bytes
     struct MIRFunction *next;      // linked list within module
 } MIRFunction;
 

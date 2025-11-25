@@ -211,6 +211,7 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
 
     node->symbol = sym;
     node->type = sym->type;
+    sym->decl = node; // Link symbol back to declaration node
 
     return 0;
 }

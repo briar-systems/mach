@@ -456,6 +456,43 @@ static void emit_test_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64
     emit_byte(ctx, modrm);
 }
 
+// Load from [rbp + offset] to register
+// mov dst, [rbp + offset]
+static void emit_mov_mem_to_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, int32_t offset)
+{
+    // REX.W + 8B /r [rbp + disp32]
+    uint8_t rex = 0x48; // REX.W
+    if (dst >= X86_64_R8) rex |= 0x04; // REX.R
+    
+    emit_byte(ctx, rex);
+    emit_byte(ctx, 0x8B); // MOV r64, r/m64
+    
+    // ModR/M: mod=10 (disp32), reg=dst, rm=101 (RBP)
+    uint8_t modrm = 0x80 | (reg_to_x86_encoding(dst) << 3) | 0x05;
+    emit_byte(ctx, modrm);
+    
+    // 32-bit displacement (little-endian)
+    emit_dword(ctx, (uint32_t)offset);
+}
+
+// Store from register to [rbp + offset]
+// mov [rbp + offset], src
+static void emit_mov_reg_to_mem(X86_64_CodegenContext *ctx, int32_t offset, X86_64_Reg src)
+{
+    // REX.W + 89 /r [rbp + disp32]
+    uint8_t rex = 0x48; // REX.W
+    if (src >= X86_64_R8) rex |= 0x04; // REX.R
+    
+    emit_byte(ctx, rex);
+    emit_byte(ctx, 0x89); // MOV r/m64, r64
+    
+    // ModR/M: mod=10 (disp32), reg=src, rm=101 (RBP)
+    uint8_t modrm = 0x80 | (reg_to_x86_encoding(src) << 3) | 0x05;
+    emit_byte(ctx, modrm);
+    
+    // 32-bit displacement (little-endian)
+    emit_dword(ctx, (uint32_t)offset);
+}
 static void emit_ret(X86_64_CodegenContext *ctx)
 {
     // ret: C3
@@ -533,6 +570,28 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             {
                 emit_mov_reg_imm64(ctx, dst, inst->operands[0].imm_int);
             }
+        }
+        break;
+
+    case MIR_OP_LOAD:
+        // Load from stack slot: [rbp + offset] -> register
+        if (inst->result && inst->operand_count > 0 && inst->operands[0].kind == MIR_OPERAND_IMM_INT)
+        {
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            int32_t offset = (int32_t)inst->operands[0].imm_int;
+            emit_mov_mem_to_reg(ctx, dst, offset);
+        }
+        break;
+
+    case MIR_OP_STORE:
+        // Store to stack slot: register -> [rbp + offset]
+        if (inst->operand_count >= 2 && 
+            inst->operands[0].kind == MIR_OPERAND_VALUE &&
+            inst->operands[1].kind == MIR_OPERAND_IMM_INT)
+        {
+            X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+            int32_t offset = (int32_t)inst->operands[1].imm_int;
+            emit_mov_reg_to_mem(ctx, offset, src);
         }
         break;
 
@@ -911,10 +970,24 @@ int x86_64_emit_function(X86_64_CodegenContext *ctx, MIRFunction *func)
         return -1;
     }
 
-    // emit prologue (simplified - no stack frame for now)
+    // emit prologue
     // push rbp; mov rbp, rsp
     emit_byte(ctx, 0x55); // push rbp
     emit_bytes(ctx, (uint8_t[]){0x48, 0x89, 0xE5}, 3); // mov rbp, rsp
+
+    // allocate stack frame if needed
+    if (func->frame_size > 0)
+    {
+        // align frame size to 16 bytes (ABI requirement)
+        size_t aligned_size = (func->frame_size + 15) & ~15;
+        
+        // sub rsp, aligned_size
+        // REX.W + 81 /5 id
+        emit_byte(ctx, 0x48);
+        emit_byte(ctx, 0x81);
+        emit_byte(ctx, 0xEC); // ModRM: 11 101 100 (rsp)
+        emit_dword(ctx, (uint32_t)aligned_size);
+    }
 
     // emit all blocks
     for (MIRBlock *block = func->first_block; block; block = block->next)
@@ -929,7 +1002,8 @@ int x86_64_emit_function(X86_64_CodegenContext *ctx, MIRFunction *func)
     }
 
     // emit epilogue
-    emit_byte(ctx, 0x5D); // pop rbp
+    // leave; ret
+    emit_byte(ctx, 0xC9); // leave (mov rsp, rbp; pop rbp)
     emit_ret(ctx);
     
     resolve_jumps(ctx);

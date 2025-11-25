@@ -11,8 +11,11 @@ MIRModule   *mir_lower_module(AstNode *ast_module);
 MIRFunction *mir_lower_function(AstNode *ast_function);
 MIRGlobal   *mir_lower_global(AstNode *ast_var);
 
+// opaque context
+typedef struct LowerContext LowerContext;
+
 // inline mir block parsing
 // parses raw mir text (from ast_node->mir_stmt.content) and injects into function
-int mir_parse_inline_block(MIRFunction *func, MIRBlock *current_block, const char *mir_text);
+int mir_parse_inline_block(LowerContext *ctx, MIRFunction *func, MIRBlock *current_block, const char *mir_text);
 
 #endif // MIR_LOWER_H

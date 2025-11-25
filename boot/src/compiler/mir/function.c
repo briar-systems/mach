@@ -21,6 +21,7 @@ MIRFunction *mir_function_create(const char *name, Type *type, bool is_exported)
     func->block_count = 0;
     func->next_value_id = 0;
     func->next_block_id = 0;
+    func->frame_size = 0;
     func->next = NULL;
 
     return func;
