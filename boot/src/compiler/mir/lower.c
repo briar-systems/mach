@@ -43,8 +43,9 @@ typedef struct LowerContext
     MIRBlock *loop_start_block; // For continue
     MIRBlock *loop_end_block;   // For break
     
-    // Float constant counter
+    // Constant counters
     int float_const_count;
+    int string_const_count;
 } LowerContext;
 
 static LowerContext *lower_context_create(MIRModule *module)
@@ -989,6 +990,26 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
             mir_inst_add_operand(load, mir_operand_value(addr->id));
             mir_inst_set_result(load, result);
             mir_block_append_inst(ctx->current_block, load);
+            
+            lower_context_map_value(ctx, node, result);
+            return result;
+        }
+        else if (node->token && node->token->kind == TOKEN_LIT_STRING)
+        {
+            // Create a synthetic global for the string constant
+            char name[64];
+            snprintf(name, sizeof(name), "__str_const_%d", ctx->string_const_count++);
+            
+            MIRGlobal *global = mir_global_create(name, type_get_primitive(TYPE_PTR), MIR_GLOBAL_VAL, false);
+            mir_global_set_string_init(global, node->lit_expr.string_val);
+            mir_module_add_global(ctx->module, global);
+            
+            // Load address of global as &u8
+            MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "str");
+            MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+            mir_inst_add_operand(mov, mir_operand_global(global->name));
+            mir_inst_set_result(mov, result);
+            mir_block_append_inst(ctx->current_block, mov);
             
             lower_context_map_value(ctx, node, result);
             return result;
