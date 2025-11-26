@@ -21,6 +21,7 @@ typedef struct Symbol
 {
     SymbolKind     kind;
     char          *name;
+    char          *export_name; // name used in object file (can be overridden)
     Type          *type;
     AstNode       *decl;        // declaration node
     bool           is_public;   // pub qualifier

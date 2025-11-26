@@ -221,6 +221,25 @@ void ast_node_dnit(AstNode *node)
             free(node->cond_stmt.stmt_or);
         }
         break;
+
+    case AST_STMT_COMPTIME_IF:
+    case AST_STMT_COMPTIME_OR:
+        if (node->comptime_if_stmt.cond)
+        {
+            ast_node_dnit(node->comptime_if_stmt.cond);
+            free(node->comptime_if_stmt.cond);
+        }
+        if (node->comptime_if_stmt.body)
+        {
+            ast_node_dnit(node->comptime_if_stmt.body);
+            free(node->comptime_if_stmt.body);
+        }
+        if (node->comptime_if_stmt.stmt_or)
+        {
+            ast_node_dnit(node->comptime_if_stmt.stmt_or);
+            free(node->comptime_if_stmt.stmt_or);
+        }
+        break;
     case AST_STMT_FOR:
         if (node->for_stmt.cond)
         {
@@ -667,6 +686,13 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->cond_stmt.stmt_or = ast_clone_checked(node->cond_stmt.stmt_or);
         break;
 
+    case AST_STMT_COMPTIME_IF:
+    case AST_STMT_COMPTIME_OR:
+        clone->comptime_if_stmt.cond    = ast_clone_checked(node->comptime_if_stmt.cond);
+        clone->comptime_if_stmt.body    = ast_clone_checked(node->comptime_if_stmt.body);
+        clone->comptime_if_stmt.stmt_or = ast_clone_checked(node->comptime_if_stmt.stmt_or);
+        break;
+
     case AST_STMT_FOR:
         clone->for_stmt.cond = ast_clone_checked(node->for_stmt.cond);
         clone->for_stmt.body = ast_clone_checked(node->for_stmt.body);
@@ -1026,6 +1052,38 @@ void ast_print(AstNode *node, int indent)
         }
         break;
 
+    case AST_STMT_COMPTIME_IF:
+        printf("COMPTIME IF\n");
+        print_indent(indent + 1);
+        printf("cond:\n");
+        ast_print(node->comptime_if_stmt.cond, indent + 2);
+        print_indent(indent + 1);
+        printf("then:\n");
+        ast_print(node->comptime_if_stmt.body, indent + 2);
+        if (node->comptime_if_stmt.stmt_or)
+        {
+            print_indent(indent + 1);
+            printf("else:\n");
+            ast_print(node->comptime_if_stmt.stmt_or, indent + 2);
+        }
+        break;
+
+    case AST_STMT_COMPTIME_OR:
+        printf("COMPTIME OR\n");
+        print_indent(indent + 1);
+        printf("cond:\n");
+        ast_print(node->comptime_if_stmt.cond, indent + 2);
+        print_indent(indent + 1);
+        printf("then:\n");
+        ast_print(node->comptime_if_stmt.body, indent + 2);
+        if (node->comptime_if_stmt.stmt_or)
+        {
+            print_indent(indent + 1);
+            printf("or:\n");
+            ast_print(node->comptime_if_stmt.stmt_or, indent + 2);
+        }
+        break;
+
     case AST_STMT_FOR:
         printf("FOR\n");
         if (node->for_stmt.cond)
@@ -1290,6 +1348,10 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "IF";
     case AST_STMT_OR:
         return "OR";
+    case AST_STMT_COMPTIME_IF:
+        return "COMPTIME_IF";
+    case AST_STMT_COMPTIME_OR:
+        return "COMPTIME_OR";
     case AST_STMT_FOR:
         return "FOR";
     case AST_STMT_BRK:
@@ -1530,6 +1592,38 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
             print_indent_to_file(file, indent + 1);
             fprintf(file, "or:\n");
             ast_print_to_file(node->cond_stmt.stmt_or, file, indent + 2);
+        }
+        break;
+
+    case AST_STMT_COMPTIME_IF:
+        fprintf(file, "COMPTIME IF\n");
+        print_indent_to_file(file, indent + 1);
+        fprintf(file, "cond:\n");
+        ast_print_to_file(node->comptime_if_stmt.cond, file, indent + 2);
+        print_indent_to_file(file, indent + 1);
+        fprintf(file, "then:\n");
+        ast_print_to_file(node->comptime_if_stmt.body, file, indent + 2);
+        if (node->comptime_if_stmt.stmt_or)
+        {
+            print_indent_to_file(file, indent + 1);
+            fprintf(file, "else:\n");
+            ast_print_to_file(node->comptime_if_stmt.stmt_or, file, indent + 2);
+        }
+        break;
+
+    case AST_STMT_COMPTIME_OR:
+        fprintf(file, "COMPTIME OR\n");
+        print_indent_to_file(file, indent + 1);
+        fprintf(file, "cond:\n");
+        ast_print_to_file(node->comptime_if_stmt.cond, file, indent + 2);
+        print_indent_to_file(file, indent + 1);
+        fprintf(file, "then:\n");
+        ast_print_to_file(node->comptime_if_stmt.body, file, indent + 2);
+        if (node->comptime_if_stmt.stmt_or)
+        {
+            print_indent_to_file(file, indent + 1);
+            fprintf(file, "or:\n");
+            ast_print_to_file(node->comptime_if_stmt.stmt_or, file, indent + 2);
         }
         break;
     case AST_STMT_FOR:

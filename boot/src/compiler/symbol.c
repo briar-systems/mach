@@ -12,6 +12,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind)
 
     symbol->kind = kind;
     symbol->name = name ? strdup(name) : NULL;
+    symbol->export_name = NULL;
     symbol->type = NULL;
     symbol->decl = NULL;
     symbol->is_public = false;
@@ -31,6 +32,10 @@ void symbol_destroy(Symbol *symbol)
     if (symbol->name)
     {
         free(symbol->name);
+    }
+    if (symbol->export_name)
+    {
+        free(symbol->export_name);
     }
 
     free(symbol);

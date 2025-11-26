@@ -301,6 +301,132 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
     return 0;
 }
 
+static bool sema_eval_comptime_int(Sema *sema, AstNode *node, int64_t *out_val)
+{
+    if (!node) return false;
+
+    if (node->kind == AST_COMPTIME)
+    {
+        if (node->comptime.value_kind == COMPTIME_INT)
+        {
+            *out_val = node->comptime.int_value;
+            return true;
+        }
+        return false;
+    }
+    
+    if (node->kind == AST_EXPR_LIT)
+    {
+        if (node->lit_expr.kind == TOKEN_LIT_INT)
+        {
+            *out_val = (int64_t)node->lit_expr.int_val;
+            return true;
+        }
+        return false;
+    }
+    
+    if (node->kind == AST_EXPR_BINARY)
+    {
+        int64_t left, right;
+        if (!sema_eval_comptime_int(sema, node->binary_expr.left, &left)) return false;
+        if (!sema_eval_comptime_int(sema, node->binary_expr.right, &right)) return false;
+        
+        switch (node->binary_expr.op)
+        {
+            case TOKEN_PLUS: *out_val = left + right; return true;
+            case TOKEN_MINUS: *out_val = left - right; return true;
+            case TOKEN_STAR: *out_val = left * right; return true;
+            case TOKEN_SLASH: *out_val = (right != 0) ? (left / right) : 0; return true;
+            case TOKEN_EQUAL_EQUAL: *out_val = (left == right); return true;
+            case TOKEN_BANG_EQUAL: *out_val = (left != right); return true;
+            case TOKEN_LESS: *out_val = (left < right); return true;
+            case TOKEN_GREATER: *out_val = (left > right); return true;
+            case TOKEN_LESS_EQUAL: *out_val = (left <= right); return true;
+            case TOKEN_GREATER_EQUAL: *out_val = (left >= right); return true;
+            default: return false;
+        }
+    }
+    
+    return false;
+}
+
+static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
+{
+    // node is AST_COMPTIME
+    AstNode *inner = node->comptime.inner;
+
+    // Check if it is an assignment
+    if (inner->kind == AST_EXPR_BINARY && inner->binary_expr.op == TOKEN_EQUAL)
+    {
+        AstNode *lhs = inner->binary_expr.left;
+        AstNode *rhs = inner->binary_expr.right;
+
+        // Evaluate RHS
+        if (sema_analyze_expr(sema, rhs) < 0)
+        {
+            return -1;
+        }
+
+        // RHS must be constant
+        // For now, only string literals for name attribute
+        if (rhs->kind != AST_EXPR_LIT || rhs->lit_expr.kind != TOKEN_LIT_STRING)
+        {
+            sema_error(sema, rhs->token, "expected string literal for attribute value");
+            return -1;
+        }
+
+        // LHS must be field access on symbol
+        // $foo.name
+        // LHS is AST_EXPR_FIELD(object=foo, field=name)
+
+        if (lhs->kind != AST_EXPR_FIELD)
+        {
+            sema_error(sema, lhs->token, "expected attribute access (e.g. $foo.name)");
+            return -1;
+        }
+
+        AstNode *object = lhs->field_expr.object;
+        char *field     = lhs->field_expr.field;
+
+        // Object must be identifier (symbol)
+        if (object->kind != AST_EXPR_IDENT)
+        {
+            sema_error(sema, object->token, "expected symbol identifier");
+            return -1;
+        }
+
+        // Look up symbol
+        Symbol *sym = symbol_table_lookup(sema->current_table, object->ident_expr.name);
+        if (!sym)
+        {
+            sema_error(sema, object->token, "undefined symbol");
+            return -1;
+        }
+
+        // Handle attributes
+        if (strcmp(field, "name") == 0)
+        {
+            if (sym->export_name)
+            {
+                free(sym->export_name);
+            }
+            sym->export_name = strdup(rhs->lit_expr.string_val);
+        }
+        else
+        {
+            sema_error(sema, lhs->token, "unknown attribute");
+            return -1;
+        }
+
+        return 0;
+    }
+
+    // If not assignment, it's a read (e.g. $mach.os.id).
+    // As a statement, it does nothing.
+    // But we should analyze it to ensure it's valid.
+    return sema_analyze_expr(sema, inner);
+}
+
 static int sema_analyze_stmt(Sema *sema, AstNode *node)
 {
     if (!node)
@@ -310,6 +436,42 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
 
     switch (node->kind)
     {
+    case AST_COMPTIME:
+        return sema_analyze_comptime_stmt(sema, node);
+
+    case AST_STMT_COMPTIME_IF:
+    case AST_STMT_COMPTIME_OR:
+    {
+        bool cond_val = true;
+        if (node->comptime_if_stmt.cond)
+        {
+            if (sema_analyze_expr(sema, node->comptime_if_stmt.cond) < 0) return -1;
+            
+            int64_t val = 0;
+            if (!sema_eval_comptime_int(sema, node->comptime_if_stmt.cond, &val))
+            {
+                sema_error(sema, node->token, "expression is not a compile-time constant");
+                return -1;
+            }
+            cond_val = (val != 0);
+        }
+        
+        if (cond_val)
+        {
+            node->comptime_if_stmt.taken_branch = node->comptime_if_stmt.body;
+            return sema_analyze_stmt(sema, node->comptime_if_stmt.body);
+        }
+        else
+        {
+            node->comptime_if_stmt.taken_branch = node->comptime_if_stmt.stmt_or;
+            if (node->comptime_if_stmt.stmt_or)
+            {
+                return sema_analyze_stmt(sema, node->comptime_if_stmt.stmt_or);
+            }
+        }
+        return 0;
+    }
+
     case AST_STMT_REC:
         return sema_analyze_rec(sema, node);
 

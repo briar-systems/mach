@@ -204,7 +204,12 @@ static int lower_function(LowerContext *ctx, AstNode *node)
     }
     
     // create mir function
-    MIRFunction *func = mir_function_create(node->fun_stmt.name, NULL, node->fun_stmt.is_public);
+    const char *func_name = node->fun_stmt.name;
+    if (node->symbol && node->symbol->export_name)
+    {
+        func_name = node->symbol->export_name;
+    }
+    MIRFunction *func = mir_function_create(func_name, NULL, node->fun_stmt.is_public);
     if (!func)
     {
         return -1;
@@ -304,8 +309,13 @@ static int lower_var(LowerContext *ctx, AstNode *node)
     if (!ctx->current_function)
     {
         // global variable
+        const char *var_name = node->var_stmt.name;
+        if (node->symbol && node->symbol->export_name)
+        {
+            var_name = node->symbol->export_name;
+        }
         MIRGlobalKind kind = (node->kind == AST_STMT_VAL) ? MIR_GLOBAL_VAL : MIR_GLOBAL_VAR;
-        MIRGlobal *global = mir_global_create(node->var_stmt.name, node->type, kind, node->var_stmt.is_public);
+        MIRGlobal *global = mir_global_create(var_name, node->type, kind, node->var_stmt.is_public);
         
         // handle initializer
         if (node->var_stmt.init)
@@ -604,6 +614,14 @@ static int lower_stmt(LowerContext *ctx, AstNode *node)
                     return -1;
                 }
             }
+        }
+        return 0;
+        
+    case AST_STMT_COMPTIME_IF:
+    case AST_STMT_COMPTIME_OR:
+        if (node->comptime_if_stmt.taken_branch)
+        {
+            return lower_stmt(ctx, node->comptime_if_stmt.taken_branch);
         }
         return 0;
         
@@ -1114,7 +1132,9 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                     // Load global address
                     MIRValue *addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
                     MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
-                    mir_inst_add_operand(mov, mir_operand_global(node->symbol->name));
+                    const char *sym_name = node->symbol->name;
+                    if (node->symbol->export_name) sym_name = node->symbol->export_name;
+                    mir_inst_add_operand(mov, mir_operand_global(sym_name));
                     mir_inst_set_result(mov, addr);
                     mir_block_append_inst(ctx->current_block, mov);
                     
@@ -1353,7 +1373,9 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                         // Load global address
                         MIRValue *addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
                         MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
-                        mir_inst_add_operand(mov, mir_operand_global(lhs->symbol->name));
+                        const char *sym_name = lhs->symbol->name;
+                        if (lhs->symbol->export_name) sym_name = lhs->symbol->export_name;
+                        mir_inst_add_operand(mov, mir_operand_global(sym_name));
                         mir_inst_set_result(mov, addr);
                         mir_block_append_inst(ctx->current_block, mov);
                         
@@ -1532,7 +1554,9 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                     {
                         base_addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
                         MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
-                        mir_inst_add_operand(mov, mir_operand_global(arr->symbol->name));
+                        const char *sym_name = arr->symbol->name;
+                        if (arr->symbol->export_name) sym_name = arr->symbol->export_name;
+                        mir_inst_add_operand(mov, mir_operand_global(sym_name));
                         mir_inst_set_result(mov, base_addr);
                         mir_block_append_inst(ctx->current_block, mov);
                     }
@@ -1635,6 +1659,10 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         if (node->call_expr.func->kind == AST_EXPR_IDENT)
         {
             func_name = node->call_expr.func->ident_expr.name;
+            if (node->call_expr.func->symbol && node->call_expr.func->symbol->export_name)
+            {
+                func_name = node->call_expr.func->symbol->export_name;
+            }
         }
         
         if (!func_name)

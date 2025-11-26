@@ -72,11 +72,119 @@ static bool parser_token_is_attr_category(TokenKind kind)
     }
 }
 
+static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
+{
+    if (!parser_consume(parser, TOKEN_KW_IF, "expected 'if' after '$'"))
+    {
+        return NULL;
+    }
+
+    AstNode *node = parser_alloc_node(parser, AST_STMT_COMPTIME_IF, parser->previous);
+    if (!node)
+    {
+        return NULL;
+    }
+
+    if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after '$if'"))
+    {
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    node->comptime_if_stmt.cond = parser_parse_expr(parser);
+    if (!node->comptime_if_stmt.cond)
+    {
+        parser_error_at_current(parser, "expected condition expression");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after condition"))
+    {
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    node->comptime_if_stmt.body = parser_parse_stmt_block(parser);
+    if (!node->comptime_if_stmt.body)
+    {
+        parser_error_at_current(parser, "expected block after '$if' condition");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    // handle $or chains
+    AstNode **tail = &node->comptime_if_stmt.stmt_or;
+    while (parser_check(parser, TOKEN_DOLLAR) && parser_peek_next_kind(parser) == TOKEN_KW_OR)
+    {
+        parser_advance(parser); // consume $
+        parser_advance(parser); // consume OR
+
+        AstNode *or_node = parser_alloc_node(parser, AST_STMT_COMPTIME_OR, parser->previous);
+        if (!or_node)
+        {
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
+        }
+
+        // optional condition
+        if (parser_match(parser, TOKEN_L_PAREN))
+        {
+            or_node->comptime_if_stmt.cond = parser_parse_expr(parser);
+            if (!or_node->comptime_if_stmt.cond)
+            {
+                parser_error_at_current(parser, "expected condition expression");
+                ast_node_dnit(or_node);
+                free(or_node);
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+
+            if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after '$or' condition"))
+            {
+                ast_node_dnit(or_node);
+                free(or_node);
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+        }
+
+        or_node->comptime_if_stmt.body = parser_parse_stmt_block(parser);
+        if (!or_node->comptime_if_stmt.body)
+        {
+            parser_error_at_current(parser, "expected block after '$or'");
+            ast_node_dnit(or_node);
+            free(or_node);
+            ast_node_dnit(node);
+            free(node);
+            return NULL;
+        }
+
+        *tail = or_node;
+        tail  = &or_node->comptime_if_stmt.stmt_or;
+    }
+
+    return node;
+}
+
 static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
 {
+    (void)allow_top_level;
     if (!parser_consume(parser, TOKEN_DOLLAR, "expected '$'"))
     {
         return NULL;
+    }
+
+    if (parser_check(parser, TOKEN_KW_IF))
+    {
+        return parser_parse_stmt_comptime_if(parser);
     }
 
     Token *directive_token = parser->previous;
@@ -89,27 +197,13 @@ static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
 
     AstNode *inner = NULL;
 
-    if (parser_check(parser, TOKEN_KW_IF))
+    if (parser_token_is_attr_category(parser->current->kind))
     {
-        if (allow_top_level)
-        {
-            inner = parser_parse_comptime_if_top(parser);
-        }
-        else
-        {
-            inner = parser_parse_stmt_if(parser);
-        }
+        parser->current->kind = TOKEN_IDENTIFIER;
     }
-    else
-    {
-        if (parser_token_is_attr_category(parser->current->kind))
-        {
-            parser->current->kind = TOKEN_IDENTIFIER;
-        }
-        inner = parser_parse_expr(parser);
+    inner = parser_parse_expr(parser);
 
-        parser_match(parser, TOKEN_SEMICOLON);
-    }
+    parser_match(parser, TOKEN_SEMICOLON);
 
     if (!inner)
     {
@@ -207,6 +301,7 @@ static AstNode *parser_parse_top_level_block(Parser *parser)
     return block;
 }
 
+static AstNode *parser_parse_comptime_if_top(Parser *parser) __attribute__((unused));
 static AstNode *parser_parse_comptime_if_top(Parser *parser)
 {
     if (!parser_consume(parser, TOKEN_KW_IF, "expected 'if' keyword"))

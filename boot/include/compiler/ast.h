@@ -27,6 +27,8 @@ typedef enum AstKind
     AST_STMT_UNI,
     AST_STMT_IF,
     AST_STMT_OR,
+    AST_STMT_COMPTIME_IF,
+    AST_STMT_COMPTIME_OR,
     AST_STMT_FOR,
     AST_STMT_BRK,
     AST_STMT_CNT,
@@ -224,6 +226,15 @@ struct AstNode
             AstNode *body;
             AstNode *stmt_or; // can be another conditional (or)
         } cond_stmt;
+
+        // compile-time if statement
+        struct
+        {
+            AstNode *cond;
+            AstNode *body;
+            AstNode *stmt_or;
+            AstNode *taken_branch; // filled by sema
+        } comptime_if_stmt;
 
         // for loop
         struct
