@@ -204,11 +204,9 @@ static int lower_function(LowerContext *ctx, AstNode *node)
     }
     
     // create mir function
-    const char *func_name = node->fun_stmt.name;
-    if (node->symbol && node->symbol->export_name)
-    {
-        func_name = node->symbol->export_name;
-    }
+    const char *func_name = symbol_get_linkage_name(node->symbol);
+    if (!func_name) func_name = node->fun_stmt.name;
+
     MIRFunction *func = mir_function_create(func_name, NULL, node->fun_stmt.is_public);
     if (!func)
     {
@@ -309,11 +307,9 @@ static int lower_var(LowerContext *ctx, AstNode *node)
     if (!ctx->current_function)
     {
         // global variable
-        const char *var_name = node->var_stmt.name;
-        if (node->symbol && node->symbol->export_name)
-        {
-            var_name = node->symbol->export_name;
-        }
+        const char *var_name = symbol_get_linkage_name(node->symbol);
+        if (!var_name) var_name = node->var_stmt.name;
+
         MIRGlobalKind kind = (node->kind == AST_STMT_VAL) ? MIR_GLOBAL_VAL : MIR_GLOBAL_VAR;
         MIRGlobal *global = mir_global_create(var_name, node->type, kind, node->var_stmt.is_public);
         
@@ -1132,8 +1128,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                     // Load global address
                     MIRValue *addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
                     MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
-                    const char *sym_name = node->symbol->name;
-                    if (node->symbol->export_name) sym_name = node->symbol->export_name;
+                    const char *sym_name = symbol_get_linkage_name(node->symbol);
                     mir_inst_add_operand(mov, mir_operand_global(sym_name));
                     mir_inst_set_result(mov, addr);
                     mir_block_append_inst(ctx->current_block, mov);
@@ -1373,8 +1368,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                         // Load global address
                         MIRValue *addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
                         MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
-                        const char *sym_name = lhs->symbol->name;
-                        if (lhs->symbol->export_name) sym_name = lhs->symbol->export_name;
+                        const char *sym_name = symbol_get_linkage_name(lhs->symbol);
                         mir_inst_add_operand(mov, mir_operand_global(sym_name));
                         mir_inst_set_result(mov, addr);
                         mir_block_append_inst(ctx->current_block, mov);
@@ -1554,8 +1548,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                     {
                         base_addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
                         MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
-                        const char *sym_name = arr->symbol->name;
-                        if (arr->symbol->export_name) sym_name = arr->symbol->export_name;
+                        const char *sym_name = symbol_get_linkage_name(arr->symbol);
                         mir_inst_add_operand(mov, mir_operand_global(sym_name));
                         mir_inst_set_result(mov, base_addr);
                         mir_block_append_inst(ctx->current_block, mov);
@@ -1659,9 +1652,9 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         if (node->call_expr.func->kind == AST_EXPR_IDENT)
         {
             func_name = node->call_expr.func->ident_expr.name;
-            if (node->call_expr.func->symbol && node->call_expr.func->symbol->export_name)
+            if (node->call_expr.func->symbol)
             {
-                func_name = node->call_expr.func->symbol->export_name;
+                func_name = symbol_get_linkage_name(node->call_expr.func->symbol);
             }
         }
         

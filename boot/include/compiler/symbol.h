@@ -22,6 +22,7 @@ typedef struct Symbol
     SymbolKind     kind;
     char          *name;
     char          *export_name; // name used in object file (can be overridden)
+    char          *mangled_name; // unique mangled name
     Type          *type;
     AstNode       *decl;        // declaration node
     bool           is_public;   // pub qualifier
@@ -40,6 +41,8 @@ typedef struct SymbolTable
 // symbol operations
 Symbol *symbol_create(const char *name, SymbolKind kind);
 void    symbol_destroy(Symbol *symbol);
+void    symbol_mangle(Symbol *symbol);
+const char *symbol_get_linkage_name(Symbol *symbol);
 
 // symbol table operations
 SymbolTable *symbol_table_create(SymbolTable *parent);

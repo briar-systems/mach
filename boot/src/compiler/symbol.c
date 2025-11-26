@@ -1,6 +1,7 @@
 #include "compiler/symbol.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 Symbol *symbol_create(const char *name, SymbolKind kind)
 {
@@ -13,6 +14,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind)
     symbol->kind = kind;
     symbol->name = name ? strdup(name) : NULL;
     symbol->export_name = NULL;
+    symbol->mangled_name = NULL;
     symbol->type = NULL;
     symbol->decl = NULL;
     symbol->is_public = false;
@@ -37,8 +39,65 @@ void symbol_destroy(Symbol *symbol)
     {
         free(symbol->export_name);
     }
+    if (symbol->mangled_name)
+    {
+        free(symbol->mangled_name);
+    }
 
     free(symbol);
+}
+
+void symbol_mangle(Symbol *symbol)
+{
+    if (!symbol || !symbol->name)
+    {
+        return;
+    }
+
+    if (symbol->mangled_name)
+    {
+        return; // already mangled
+    }
+
+    // Simple mangling scheme for now: _M<module_len><module_name>N<name_len><name>
+    // Default module "main"
+    const char *module = "main";
+    size_t mod_len = strlen(module);
+    size_t name_len = strlen(symbol->name);
+    
+    // Calculate length: _M + mod_len_str + module + N + name_len_str + name + null
+    char mod_len_str[32];
+    char name_len_str[32];
+    sprintf(mod_len_str, "%zu", mod_len);
+    sprintf(name_len_str, "%zu", name_len);
+    
+    size_t total_len = 2 + strlen(mod_len_str) + mod_len + 1 + strlen(name_len_str) + name_len + 1;
+    
+    symbol->mangled_name = malloc(total_len);
+    if (symbol->mangled_name)
+    {
+        sprintf(symbol->mangled_name, "_M%s%sN%s%s", mod_len_str, module, name_len_str, symbol->name);
+    }
+}
+
+const char *symbol_get_linkage_name(Symbol *symbol)
+{
+    if (!symbol)
+    {
+        return NULL;
+    }
+
+    if (symbol->export_name)
+    {
+        return symbol->export_name;
+    }
+
+    if (!symbol->mangled_name)
+    {
+        symbol_mangle(symbol);
+    }
+
+    return symbol->mangled_name ? symbol->mangled_name : symbol->name;
 }
 
 SymbolTable *symbol_table_create(SymbolTable *parent)
