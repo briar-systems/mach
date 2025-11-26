@@ -218,18 +218,34 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
         X86_64_RDI, X86_64_RSI, X86_64_RDX, X86_64_RCX, X86_64_R8, X86_64_R9
     };
     
-    // Allocatable registers for non-parameters (excluding param regs)
-    // RAX - return value, scratch
-    // RBX - callee-saved (skip for now)
-    // R10, R11 - caller-saved scratch
-    static const X86_64_Reg allocatable_regs[] = {
-        X86_64_RAX, X86_64_R10, X86_64_R11, X86_64_RBX
-    };
-    size_t num_allocatable = sizeof(allocatable_regs) / sizeof(allocatable_regs[0]);
+    // Allocatable registers
+    // Start with callee-saved
+    X86_64_Reg allocatable_regs[16];
+    int num_allocatable = 0;
     
-    // Track which parameter values are (first param_count values)
+    allocatable_regs[num_allocatable++] = X86_64_RBX;
+    allocatable_regs[num_allocatable++] = X86_64_R12;
+    allocatable_regs[num_allocatable++] = X86_64_R13;
+    allocatable_regs[num_allocatable++] = X86_64_R14;
+    allocatable_regs[num_allocatable++] = X86_64_R15;
+    
+    // Add caller-saved registers that are NOT used for parameters
+    // RAX, R10, R11 are always available (not used for args)
+    allocatable_regs[num_allocatable++] = X86_64_RAX;
+    allocatable_regs[num_allocatable++] = X86_64_R10;
+    allocatable_regs[num_allocatable++] = X86_64_R11;
+    
+    // Add unused argument registers
     size_t param_count = func->param_count;
-    if (param_count > 6) param_count = 6; // Only first 6 in registers
+    if (param_count > 6) param_count = 6;
+    
+    // param_regs: RDI, RSI, RDX, RCX, R8, R9
+    if (param_count < 1) allocatable_regs[num_allocatable++] = X86_64_RDI;
+    if (param_count < 2) allocatable_regs[num_allocatable++] = X86_64_RSI;
+    if (param_count < 3) allocatable_regs[num_allocatable++] = X86_64_RDX;
+    if (param_count < 4) allocatable_regs[num_allocatable++] = X86_64_RCX;
+    if (param_count < 5) allocatable_regs[num_allocatable++] = X86_64_R8;
+    if (param_count < 6) allocatable_regs[num_allocatable++] = X86_64_R9;
     
     // Step 1: Assign parameter registers
     for (size_t i = 0; i < param_count; i++)
@@ -242,7 +258,6 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
     }
     
     // Step 2: Assign non-parameter values to allocatable registers
-    // Simple strategy: round-robin through allocatable regs
     size_t alloc_idx = 0;
     for (uint32_t i = 0; i < func->next_value_id; i++)
     {
@@ -406,9 +421,6 @@ static void emit_cmp_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_
 
 static void emit_setcc(X86_64_CodegenContext *ctx, int cond, X86_64_Reg dst)
 {
-    // xor dst, dst (clear register)
-    emit_xor_reg_reg(ctx, dst, dst);
-    
     // setcc dst (low byte)
     // 0F 9x /0
     
@@ -423,6 +435,18 @@ static void emit_setcc(X86_64_CodegenContext *ctx, int cond, X86_64_Reg dst)
     emit_byte(ctx, 0x90 | cond);
     
     uint8_t modrm = 0xC0 | (0 << 3) | reg_to_x86_encoding(dst);
+    emit_byte(ctx, modrm);
+    
+    // movzx dst, dst (byte to qword) to clear upper bytes
+    // REX.W + 0F B6 /r
+    rex = 0x48; // REX.W
+    if (dst >= X86_64_R8) rex |= 0x05; // REX.W + REX.R + REX.B (dst is both reg and rm)
+    
+    emit_byte(ctx, rex);
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0xB6);
+    
+    modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(dst);
     emit_byte(ctx, modrm);
 }
 
@@ -460,6 +484,9 @@ static void emit_test_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64
 // mov dst, [rbp + offset]
 static void emit_mov_mem_to_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, int32_t offset)
 {
+    // Adjust offset for saved registers (5 * 8 = 40 bytes)
+    offset -= 40;
+
     // REX.W + 8B /r [rbp + disp32]
     uint8_t rex = 0x48; // REX.W
     if (dst >= X86_64_R8) rex |= 0x04; // REX.R
@@ -479,6 +506,9 @@ static void emit_mov_mem_to_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, int3
 // mov [rbp + offset], src
 static void emit_mov_reg_to_mem(X86_64_CodegenContext *ctx, int32_t offset, X86_64_Reg src)
 {
+    // Adjust offset for saved registers (5 * 8 = 40 bytes)
+    offset -= 40;
+
     // REX.W + 89 /r [rbp + disp32]
     uint8_t rex = 0x48; // REX.W
     if (src >= X86_64_R8) rex |= 0x04; // REX.R
@@ -552,6 +582,36 @@ static void emit_add_reg_imm(X86_64_CodegenContext *ctx, X86_64_Reg dst, int32_t
     }
 }
 
+static void emit_epilogue(X86_64_CodegenContext *ctx)
+{
+    MIRFunction *func = ctx->current_function;
+    
+    if (func->frame_size > 0)
+    {
+        size_t aligned_size = (func->frame_size + 15) & ~15;
+        // add rsp, aligned_size
+        emit_byte(ctx, 0x48);
+        emit_byte(ctx, 0x81);
+        emit_byte(ctx, 0xC4); // ModRM: 11 000 100 (rsp)
+        emit_dword(ctx, (uint32_t)aligned_size);
+    }
+
+    // pop r15
+    emit_bytes(ctx, (uint8_t[]){0x41, 0x5F}, 2);
+    // pop r14
+    emit_bytes(ctx, (uint8_t[]){0x41, 0x5E}, 2);
+    // pop r13
+    emit_bytes(ctx, (uint8_t[]){0x41, 0x5D}, 2);
+    // pop r12
+    emit_bytes(ctx, (uint8_t[]){0x41, 0x5C}, 2);
+    // pop rbx
+    emit_byte(ctx, 0x5B);
+
+    // leave; ret
+    emit_byte(ctx, 0xC9); // leave (mov rsp, rbp; pop rbp)
+    emit_ret(ctx);
+}
+
 static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
 {
     switch (inst->op)
@@ -620,9 +680,28 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 emit_byte(ctx, rex);
                 emit_byte(ctx, 0x8B);
                 
-                // ModR/M: mod=00 (indirect), reg=dst, rm=src
-                uint8_t modrm = (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
-                emit_byte(ctx, modrm);
+                uint8_t rm = reg_to_x86_encoding(src);
+                uint8_t reg = reg_to_x86_encoding(dst);
+                
+                if ((rm & 7) == 4) // RSP or R12 (encoding 4)
+                {
+                    // SIB required
+                    // Mod=00, Reg=dst, RM=100 (SIB)
+                    emit_byte(ctx, (reg << 3) | 0x04);
+                    // SIB: Scale=0, Index=4 (none), Base=rm
+                    emit_byte(ctx, 0x24);
+                }
+                else if ((rm & 7) == 5) // RBP or R13 (encoding 5)
+                {
+                    // Mod=01 (disp8), Reg=dst, RM=101
+                    emit_byte(ctx, 0x40 | (reg << 3) | 0x05);
+                    emit_byte(ctx, 0x00); // disp8 = 0
+                }
+                else
+                {
+                    // Mod=00, Reg=dst, RM=rm
+                    emit_byte(ctx, (reg << 3) | rm);
+                }
             }
         }
         break;
@@ -655,9 +734,28 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 emit_byte(ctx, rex);
                 emit_byte(ctx, 0x89);
                 
-                // ModR/M: mod=00 (indirect), reg=src, rm=dst_addr
-                uint8_t modrm = (reg_to_x86_encoding(src) << 3) | reg_to_x86_encoding(dst_addr);
-                emit_byte(ctx, modrm);
+                uint8_t rm = reg_to_x86_encoding(dst_addr);
+                uint8_t reg = reg_to_x86_encoding(src);
+                
+                if ((rm & 7) == 4) // RSP or R12 (encoding 4)
+                {
+                    // SIB required
+                    // Mod=00, Reg=src, RM=100 (SIB)
+                    emit_byte(ctx, (reg << 3) | 0x04);
+                    // SIB: Scale=0, Index=4 (none), Base=rm
+                    emit_byte(ctx, 0x24);
+                }
+                else if ((rm & 7) == 5) // RBP or R13 (encoding 5)
+                {
+                    // Mod=01 (disp8), Reg=src, RM=101
+                    emit_byte(ctx, 0x40 | (reg << 3) | 0x05);
+                    emit_byte(ctx, 0x00); // disp8 = 0
+                }
+                else
+                {
+                    // Mod=00, Reg=src, RM=rm
+                    emit_byte(ctx, (reg << 3) | rm);
+                }
             }
         }
         break;
@@ -668,6 +766,8 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         {
             X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
             int32_t offset = (int32_t)inst->operands[0].imm_int;
+            // Adjust offset for saved registers (5 * 8 = 40 bytes)
+            offset -= 40;
             
             // REX.W + 8D /r
             uint8_t rex = 0x48; // REX.W
@@ -907,7 +1007,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
             emit_mov_reg_reg(ctx, X86_64_RAX, src);
         }
-        emit_ret(ctx);
+        emit_epilogue(ctx);
         break;
 
     case MIR_OP_SYSCALL:
@@ -1070,6 +1170,8 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
     }
 }
 
+
+
 int x86_64_emit_function(X86_64_CodegenContext *ctx, MIRFunction *func)
 {
     if (!ctx || !func)
@@ -1089,6 +1191,18 @@ int x86_64_emit_function(X86_64_CodegenContext *ctx, MIRFunction *func)
     // push rbp; mov rbp, rsp
     emit_byte(ctx, 0x55); // push rbp
     emit_bytes(ctx, (uint8_t[]){0x48, 0x89, 0xE5}, 3); // mov rbp, rsp
+
+    // save callee-saved registers: RBX, R12, R13, R14, R15
+    // push rbx
+    emit_byte(ctx, 0x53);
+    // push r12
+    emit_bytes(ctx, (uint8_t[]){0x41, 0x54}, 2);
+    // push r13
+    emit_bytes(ctx, (uint8_t[]){0x41, 0x55}, 2);
+    // push r14
+    emit_bytes(ctx, (uint8_t[]){0x41, 0x56}, 2);
+    // push r15
+    emit_bytes(ctx, (uint8_t[]){0x41, 0x57}, 2);
 
     // allocate stack frame if needed
     if (func->frame_size > 0)
@@ -1117,9 +1231,7 @@ int x86_64_emit_function(X86_64_CodegenContext *ctx, MIRFunction *func)
     }
 
     // emit epilogue
-    // leave; ret
-    emit_byte(ctx, 0xC9); // leave (mov rsp, rbp; pop rbp)
-    emit_ret(ctx);
+    emit_epilogue(ctx);
     
     resolve_jumps(ctx);
 

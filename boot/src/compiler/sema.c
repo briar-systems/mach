@@ -146,6 +146,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
                     }
                     symbol_table_insert(sema->current_table, param_sym);
                     param->symbol = param_sym;
+                    param_sym->decl = param;
                 }
             }
         }
