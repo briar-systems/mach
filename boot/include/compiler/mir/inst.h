@@ -27,6 +27,7 @@ void     mir_inst_set_result(MIRInst *inst, MIRValue *result);
 
 // instruction builders for common patterns
 MIRInst *mir_inst_const(Type *type, int64_t value);
+MIRInst *mir_inst_const_float(Type *type, double value);
 MIRInst *mir_inst_binary(MIROp op, Type *type, MIROperand left, MIROperand right);
 MIRInst *mir_inst_unary(MIROp op, Type *type, MIROperand operand);
 MIRInst *mir_inst_load(Type *type, MIROperand ptr);

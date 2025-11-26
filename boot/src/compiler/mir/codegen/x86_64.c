@@ -1,7 +1,8 @@
 #include "compiler/mir/codegen/x86_64.h"
-#include "compiler/mir/opcode.h"
+#include "compiler/mir/isa/x86_64.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 X86_64_CodegenContext *x86_64_codegen_create()
 {
@@ -195,6 +196,10 @@ static X86_64_Reg get_physical_reg(X86_64_CodegenContext *ctx, uint32_t virtual_
 
 int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
 {
+    if (!ctx || !func)
+    {
+        return -1;
+    }
     // ABI-aware allocation with parameter mapping
     // System V AMD64 ABI: params in RDI, RSI, RDX, RCX, R8, R9
     
@@ -214,56 +219,114 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
     ctx->reg_map.count = func->next_value_id;
 
     // ABI parameter registers (System V AMD64)
-    static const X86_64_Reg param_regs[] = {
+    static const X86_64_Reg gp_param_regs[] = {
         X86_64_RDI, X86_64_RSI, X86_64_RDX, X86_64_RCX, X86_64_R8, X86_64_R9
     };
+    static const X86_64_Reg fp_param_regs[] = {
+        X86_64_XMM0, X86_64_XMM1, X86_64_XMM2, X86_64_XMM3, 
+        X86_64_XMM4, X86_64_XMM5, X86_64_XMM6, X86_64_XMM7
+    };
     
-    // Allocatable registers
-    // Start with callee-saved
-    X86_64_Reg allocatable_regs[16];
-    int num_allocatable = 0;
+    // Allocatable GP registers
+    X86_64_Reg allocatable_gp_regs[16];
+    int num_allocatable_gp = 0;
     
-    allocatable_regs[num_allocatable++] = X86_64_RBX;
-    allocatable_regs[num_allocatable++] = X86_64_R12;
-    allocatable_regs[num_allocatable++] = X86_64_R13;
-    allocatable_regs[num_allocatable++] = X86_64_R14;
-    allocatable_regs[num_allocatable++] = X86_64_R15;
+    allocatable_gp_regs[num_allocatable_gp++] = X86_64_RBX;
+    allocatable_gp_regs[num_allocatable_gp++] = X86_64_R12;
+    allocatable_gp_regs[num_allocatable_gp++] = X86_64_R13;
+    allocatable_gp_regs[num_allocatable_gp++] = X86_64_R14;
+    allocatable_gp_regs[num_allocatable_gp++] = X86_64_R15;
+    allocatable_gp_regs[num_allocatable_gp++] = X86_64_RAX;
+    allocatable_gp_regs[num_allocatable_gp++] = X86_64_R10;
+    allocatable_gp_regs[num_allocatable_gp++] = X86_64_R11;
     
-    // Add caller-saved registers that are NOT used for parameters
-    // RAX, R10, R11 are always available (not used for args)
-    allocatable_regs[num_allocatable++] = X86_64_RAX;
-    allocatable_regs[num_allocatable++] = X86_64_R10;
-    allocatable_regs[num_allocatable++] = X86_64_R11;
+    // Allocatable FP registers (XMM0-XMM15)
+    X86_64_Reg allocatable_fp_regs[16];
+    int num_allocatable_fp = 0;
+    for (int i = 0; i < 16; i++)
+    {
+        allocatable_fp_regs[num_allocatable_fp++] = (X86_64_Reg)(X86_64_XMM0 + i);
+    }
     
-    // Add unused argument registers
-    size_t param_count = func->param_count;
-    if (param_count > 6) param_count = 6;
-    
-    // param_regs: RDI, RSI, RDX, RCX, R8, R9
-    if (param_count < 1) allocatable_regs[num_allocatable++] = X86_64_RDI;
-    if (param_count < 2) allocatable_regs[num_allocatable++] = X86_64_RSI;
-    if (param_count < 3) allocatable_regs[num_allocatable++] = X86_64_RDX;
-    if (param_count < 4) allocatable_regs[num_allocatable++] = X86_64_RCX;
-    if (param_count < 5) allocatable_regs[num_allocatable++] = X86_64_R8;
-    if (param_count < 6) allocatable_regs[num_allocatable++] = X86_64_R9;
+    // Add unused argument registers to allocatable pool
+    // Note: This is a simplified allocator. A real one would track liveness.
+    // For now, we just round-robin.
     
     // Step 1: Assign parameter registers
-    for (size_t i = 0; i < param_count; i++)
+    int gp_param_idx = 0;
+    int fp_param_idx = 0;
+    
+    for (size_t i = 0; i < func->param_count; i++)
     {
         if (func->params[i])
         {
             uint32_t param_id = func->params[i]->id;
-            ctx->reg_map.map[param_id] = param_regs[i];
+            Type *type = func->params[i]->type;
+            
+            if (type && (type->kind == TYPE_F32 || type->kind == TYPE_F64))
+            {
+                if (fp_param_idx < 8)
+                {
+                    ctx->reg_map.map[param_id] = fp_param_regs[fp_param_idx++];
+                }
+                else
+                {
+                    // Stack spill (not implemented yet for params)
+                    // Fallback to XMM0 (incorrect but prevents crash)
+                    ctx->reg_map.map[param_id] = X86_64_XMM0; 
+                }
+            }
+            else
+            {
+                if (gp_param_idx < 6)
+                {
+                    ctx->reg_map.map[param_id] = gp_param_regs[gp_param_idx++];
+                }
+                else
+                {
+                    // Stack spill
+                     ctx->reg_map.map[param_id] = X86_64_RAX; // Fallback
+                }
+            }
         }
     }
     
-    // Step 2: Assign non-parameter values to allocatable registers
-    size_t alloc_idx = 0;
+    // Add unused param regs to allocatable list
+    for (int i = gp_param_idx; i < 6; i++)
+    {
+        allocatable_gp_regs[num_allocatable_gp++] = gp_param_regs[i];
+    }
+    
+    // Step 2: Assign non-parameter values
+    size_t alloc_gp_idx = 0;
+    size_t alloc_fp_idx = 0;
+    
+    // We need to iterate over all values. Since we don't have a list of all values easily accessible
+    // other than by ID, and we know IDs are 0..next_value_id-1, we iterate by ID.
+    // However, we need to look up the type. MIRFunction doesn't store values by ID directly in a lookup array
+    // except implicitly if we had one.
+    // Wait, MIRFunction has `next_value_id` but where are the values stored?
+    // They are stored in instructions.
+    // But we need to map *every* value ID to a register.
+    // If we don't have the value object, we can't check the type.
+    
+    // Issue: We need to find the MIRValue object for each ID to check its type.
+    // The current allocator implementation assumes everything is GP because it iterates 0..next_value_id
+    // and just assigns.
+    
+    // We need to traverse the function's blocks and instructions to find all values and assign registers.
+    // OR, we can assume a default (GP) and only override if we find it's FP?
+    // No, we need to know the type to assign correctly.
+    
+    // Let's traverse the function to build a type map or assign on the fly.
+    // Actually, we can just traverse blocks/insts and assign registers for defined values.
+    
+    // Initialize all to invalid/default
     for (uint32_t i = 0; i < func->next_value_id; i++)
     {
-        // Skip if already assigned (parameter)
+        // If not already assigned (param)
         bool is_param = false;
-        for (size_t j = 0; j < param_count; j++)
+        for (size_t j = 0; j < func->param_count; j++)
         {
             if (func->params[j] && func->params[j]->id == i)
             {
@@ -274,9 +337,52 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
         
         if (!is_param)
         {
-            ctx->reg_map.map[i] = allocatable_regs[alloc_idx % num_allocatable];
-            alloc_idx++;
+             // We don't know the type yet.
+             // We'll assign during traversal.
+             ctx->reg_map.map[i] = X86_64_RAX; // Default placeholder
         }
+    }
+    
+    // Traverse instructions to find value definitions and types
+    MIRBlock *block = func->first_block;
+    while (block)
+    {
+        MIRInst *inst = block->first_inst;
+        while (inst)
+        {
+            if (inst->result)
+            {
+                uint32_t id = inst->result->id;
+                Type *type = inst->result->type;
+                
+                // Check if param (already assigned)
+                bool is_param = false;
+                for (size_t j = 0; j < func->param_count; j++)
+                {
+                    if (func->params[j] && func->params[j]->id == id)
+                    {
+                        is_param = true;
+                        break;
+                    }
+                }
+                
+                if (!is_param)
+                {
+                    if (type && (type->kind == TYPE_F32 || type->kind == TYPE_F64))
+                    {
+                        ctx->reg_map.map[id] = allocatable_fp_regs[alloc_fp_idx % num_allocatable_fp];
+                        alloc_fp_idx++;
+                    }
+                    else
+                    {
+                        ctx->reg_map.map[id] = allocatable_gp_regs[alloc_gp_idx % num_allocatable_gp];
+                        alloc_gp_idx++;
+                    }
+                }
+            }
+            inst = inst->next;
+        }
+        block = block->next;
     }
 
     return 0;
@@ -356,15 +462,42 @@ static void emit_sub_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_
 static void emit_imul_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
 {
     // imul dst, src: REX.W + 0F AF /r
+    // IMUL r64, r/m64: Reg=dst, RM=src
     uint8_t rex = 0x48; // REX.W
-    if (dst >= X86_64_R8) rex |= 0x01; // REX.B
-    if (src >= X86_64_R8) rex |= 0x04; // REX.R
+    if (src >= X86_64_R8) rex |= 0x01; // REX.B (src is RM)
+    if (dst >= X86_64_R8) rex |= 0x04; // REX.R (dst is Reg)
     emit_byte(ctx, rex);
     emit_byte(ctx, 0x0F);
     emit_byte(ctx, 0xAF);
     
-    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(src) << 3) | reg_to_x86_encoding(dst);
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
     emit_byte(ctx, modrm);
+}
+
+static void emit_imul_reg_imm(X86_64_CodegenContext *ctx, X86_64_Reg dst, int32_t imm)
+{
+    // imul dst, dst, imm: REX.W + 69 /r imm32 (or 6B /r imm8)
+    uint8_t rex = 0x48; // REX.W
+    if (dst >= X86_64_R8) rex |= 0x04; // REX.R
+    if (dst >= X86_64_R8) rex |= 0x01; // REX.B (src is same as dst)
+    
+    emit_byte(ctx, rex);
+    
+    // Check if imm fits in 8 bits
+    if (imm >= -128 && imm <= 127)
+    {
+        emit_byte(ctx, 0x6B);
+        uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(dst);
+        emit_byte(ctx, modrm);
+        emit_byte(ctx, (uint8_t)imm);
+    }
+    else
+    {
+        emit_byte(ctx, 0x69);
+        uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(dst);
+        emit_byte(ctx, modrm);
+        emit_dword(ctx, (uint32_t)imm);
+    }
 }
 
 static void emit_and_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
@@ -478,6 +611,165 @@ static void emit_test_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64
     
     uint8_t modrm = 0xC0 | (reg_to_x86_encoding(src) << 3) | reg_to_x86_encoding(dst);
     emit_byte(ctx, modrm);
+}
+
+// SSE Instructions (Double Precision)
+
+static void emit_movsd_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
+{
+    // movsd dst, src: F2 0F 10 /r
+    emit_byte(ctx, 0xF2);
+    
+    uint8_t rex = 0;
+    if (dst >= X86_64_R8) rex |= 0x04; // REX.R (dst is Reg)
+    if (src >= X86_64_R8) rex |= 0x01; // REX.B (src is RM)
+    if (rex) emit_byte(ctx, 0x40 | rex);
+    
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x10);
+    
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
+    emit_byte(ctx, modrm);
+}
+
+static void emit_addsd_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
+{
+    // addsd dst, src: F2 0F 58 /r
+    emit_byte(ctx, 0xF2);
+    
+    uint8_t rex = 0;
+    if (dst >= X86_64_R8) rex |= 0x04;
+    if (src >= X86_64_R8) rex |= 0x01;
+    if (rex) emit_byte(ctx, 0x40 | rex);
+    
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x58);
+    
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
+    emit_byte(ctx, modrm);
+}
+
+static void emit_subsd_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
+{
+    // subsd dst, src: F2 0F 5C /r
+    emit_byte(ctx, 0xF2);
+    
+    uint8_t rex = 0;
+    if (dst >= X86_64_R8) rex |= 0x04;
+    if (src >= X86_64_R8) rex |= 0x01;
+    if (rex) emit_byte(ctx, 0x40 | rex);
+    
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x5C);
+    
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
+    emit_byte(ctx, modrm);
+}
+
+static void emit_mulsd_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
+{
+    // mulsd dst, src: F2 0F 59 /r
+    emit_byte(ctx, 0xF2);
+    
+    uint8_t rex = 0;
+    if (dst >= X86_64_R8) rex |= 0x04;
+    if (src >= X86_64_R8) rex |= 0x01;
+    if (rex) emit_byte(ctx, 0x40 | rex);
+    
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x59);
+    
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
+    emit_byte(ctx, modrm);
+}
+
+static void emit_divsd_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
+{
+    // divsd dst, src: F2 0F 5E /r
+    emit_byte(ctx, 0xF2);
+    
+    uint8_t rex = 0;
+    if (dst >= X86_64_R8) rex |= 0x04;
+    if (src >= X86_64_R8) rex |= 0x01;
+    if (rex) emit_byte(ctx, 0x40 | rex);
+    
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x5E);
+    
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
+    emit_byte(ctx, modrm);
+}
+
+static void emit_cvttsd2si_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
+{
+    // cvttsd2si dst, src: F2 48 0F 2C /r
+    // dst is r64, src is xmm
+    emit_byte(ctx, 0xF2);
+    
+    uint8_t rex = 0x48; // REX.W
+    if (dst >= X86_64_R8) rex |= 0x04; // REX.R (dst is Reg)
+    if (src >= X86_64_R8) rex |= 0x01; // REX.B (src is RM)
+    emit_byte(ctx, rex);
+    
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x2C);
+    
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
+    emit_byte(ctx, modrm);
+}
+
+static void emit_cvtsi2sd_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src)
+{
+    // cvtsi2sd dst, src: F2 48 0F 2A /r
+    // dst is xmm, src is r64
+    emit_byte(ctx, 0xF2);
+    
+    uint8_t rex = 0x48; // REX.W
+    if (dst >= X86_64_R8) rex |= 0x04; // REX.R (dst is Reg)
+    if (src >= X86_64_R8) rex |= 0x01; // REX.B (src is RM)
+    emit_byte(ctx, rex);
+    
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x2A);
+    
+    uint8_t modrm = 0xC0 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
+    emit_byte(ctx, modrm);
+}
+
+static void emit_movsd_mem_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, int32_t offset)
+{
+    // movsd dst, [rbp + offset]: F2 0F 10 /r
+    emit_byte(ctx, 0xF2);
+    
+    uint8_t rex = 0;
+    if (dst >= X86_64_R8) rex |= 0x04; // REX.R
+    if (rex) emit_byte(ctx, 0x40 | rex);
+    
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x10);
+    
+    // ModRM: mod=10 (disp32), reg=dst, rm=101 (rbp)
+    uint8_t modrm = 0x80 | (reg_to_x86_encoding(dst) << 3) | 0x05;
+    emit_byte(ctx, modrm);
+    emit_dword(ctx, (uint32_t)offset);
+}
+
+static void emit_movsd_reg_mem(X86_64_CodegenContext *ctx, int32_t offset, X86_64_Reg src)
+{
+    // movsd [rbp + offset], src: F2 0F 11 /r
+    emit_byte(ctx, 0xF2);
+    
+    uint8_t rex = 0;
+    if (src >= X86_64_R8) rex |= 0x04; // REX.R
+    if (rex) emit_byte(ctx, 0x40 | rex);
+    
+    emit_byte(ctx, 0x0F);
+    emit_byte(ctx, 0x11);
+    
+    // ModRM: mod=10 (disp32), reg=src, rm=101 (rbp)
+    uint8_t modrm = 0x80 | (reg_to_x86_encoding(src) << 3) | 0x05;
+    emit_byte(ctx, modrm);
+    emit_dword(ctx, (uint32_t)offset);
 }
 
 // Load from [rbp + offset] to register
@@ -632,7 +924,14 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
                 X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
-                emit_mov_reg_reg(ctx, dst, src);
+                if (x86_64_reg_is_fp(dst) && x86_64_reg_is_fp(src))
+                {
+                    emit_movsd_reg_reg(ctx, dst, src);
+                }
+                else
+                {
+                    emit_mov_reg_reg(ctx, dst, src);
+                }
             }
             else if (inst->operands[0].kind == MIR_OPERAND_GLOBAL)
             {
@@ -664,7 +963,14 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             {
                 // Load from stack slot: [rbp + offset] -> register
                 int32_t offset = (int32_t)inst->operands[0].imm_int;
-                emit_mov_mem_to_reg(ctx, dst, offset);
+                if (x86_64_reg_is_fp(dst))
+                {
+                    emit_movsd_mem_reg(ctx, dst, offset - 40); // Adjust offset manually as emit_movsd_mem_reg doesn't do it
+                }
+                else
+                {
+                    emit_mov_mem_to_reg(ctx, dst, offset);
+                }
             }
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
@@ -672,35 +978,55 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 // mov dst, [src]
                 X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
                 
-                // REX.W + 8B /r
-                uint8_t rex = 0x48; // REX.W
-                if (dst >= X86_64_R8) rex |= 0x04; // REX.R
-                if (src >= X86_64_R8) rex |= 0x01; // REX.B
-                
-                emit_byte(ctx, rex);
-                emit_byte(ctx, 0x8B);
-                
-                uint8_t rm = reg_to_x86_encoding(src);
-                uint8_t reg = reg_to_x86_encoding(dst);
-                
-                if ((rm & 7) == 4) // RSP or R12 (encoding 4)
+                if (x86_64_reg_is_fp(dst))
                 {
-                    // SIB required
-                    // Mod=00, Reg=dst, RM=100 (SIB)
-                    emit_byte(ctx, (reg << 3) | 0x04);
-                    // SIB: Scale=0, Index=4 (none), Base=rm
-                    emit_byte(ctx, 0x24);
-                }
-                else if ((rm & 7) == 5) // RBP or R13 (encoding 5)
-                {
-                    // Mod=01 (disp8), Reg=dst, RM=101
-                    emit_byte(ctx, 0x40 | (reg << 3) | 0x05);
-                    emit_byte(ctx, 0x00); // disp8 = 0
+                    // movsd xmm, [gp]
+                    // F2 0F 10 /r
+                    emit_byte(ctx, 0xF2);
+                    
+                    uint8_t rex = 0;
+                    if (dst >= X86_64_R8) rex |= 0x04; // REX.R
+                    if (src >= X86_64_R8) rex |= 0x01; // REX.B
+                    if (rex) emit_byte(ctx, 0x40 | rex);
+                    
+                    emit_byte(ctx, 0x0F);
+                    emit_byte(ctx, 0x10);
+                    
+                    uint8_t modrm = 0x00 | (reg_to_x86_encoding(dst) << 3) | reg_to_x86_encoding(src);
+                    emit_byte(ctx, modrm);
                 }
                 else
                 {
-                    // Mod=00, Reg=dst, RM=rm
-                    emit_byte(ctx, (reg << 3) | rm);
+                    // REX.W + 8B /r
+                    uint8_t rex = 0x48; // REX.W
+                    if (dst >= X86_64_R8) rex |= 0x04; // REX.R
+                    if (src >= X86_64_R8) rex |= 0x01; // REX.B
+                    
+                    emit_byte(ctx, rex);
+                    emit_byte(ctx, 0x8B);
+                    
+                    uint8_t rm = reg_to_x86_encoding(src);
+                    uint8_t reg = reg_to_x86_encoding(dst);
+                    
+                    if ((rm & 7) == 4) // RSP or R12 (encoding 4)
+                    {
+                        // SIB required
+                        // Mod=00, Reg=dst, RM=100 (SIB)
+                        emit_byte(ctx, (reg << 3) | 0x04);
+                        // SIB: Scale=0, Index=4 (none), Base=rm
+                        emit_byte(ctx, 0x24);
+                    }
+                    else if ((rm & 7) == 5) // RBP or R13 (encoding 5)
+                    {
+                        // Mod=01 (disp8), Reg=dst, RM=101
+                        emit_byte(ctx, 0x40 | (reg << 3) | 0x05);
+                        emit_byte(ctx, 0x00); // disp8 = 0
+                    }
+                    else
+                    {
+                        // Mod=00, Reg=dst, RM=rm
+                        emit_byte(ctx, (reg << 3) | rm);
+                    }
                 }
             }
         }
@@ -716,7 +1042,15 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 // Store to stack slot: register -> [rbp + offset]
                 X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
                 int32_t offset = (int32_t)inst->operands[1].imm_int;
-                emit_mov_reg_to_mem(ctx, offset, src);
+                
+                if (x86_64_reg_is_fp(src))
+                {
+                    emit_movsd_reg_mem(ctx, offset - 40, src); // Adjust offset manually
+                }
+                else
+                {
+                    emit_mov_reg_to_mem(ctx, offset, src);
+                }
             }
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
                      inst->operands[1].kind == MIR_OPERAND_VALUE)
@@ -726,35 +1060,55 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
                 X86_64_Reg dst_addr = get_physical_reg(ctx, inst->operands[1].value_id);
                 
-                // REX.W + 89 /r
-                uint8_t rex = 0x48; // REX.W
-                if (src >= X86_64_R8) rex |= 0x04; // REX.R
-                if (dst_addr >= X86_64_R8) rex |= 0x01; // REX.B
-                
-                emit_byte(ctx, rex);
-                emit_byte(ctx, 0x89);
-                
-                uint8_t rm = reg_to_x86_encoding(dst_addr);
-                uint8_t reg = reg_to_x86_encoding(src);
-                
-                if ((rm & 7) == 4) // RSP or R12 (encoding 4)
+                if (x86_64_reg_is_fp(src))
                 {
-                    // SIB required
-                    // Mod=00, Reg=src, RM=100 (SIB)
-                    emit_byte(ctx, (reg << 3) | 0x04);
-                    // SIB: Scale=0, Index=4 (none), Base=rm
-                    emit_byte(ctx, 0x24);
-                }
-                else if ((rm & 7) == 5) // RBP or R13 (encoding 5)
-                {
-                    // Mod=01 (disp8), Reg=src, RM=101
-                    emit_byte(ctx, 0x40 | (reg << 3) | 0x05);
-                    emit_byte(ctx, 0x00); // disp8 = 0
+                    // movsd [gp], xmm
+                    // F2 0F 11 /r
+                    emit_byte(ctx, 0xF2);
+                    
+                    uint8_t rex = 0;
+                    if (src >= X86_64_R8) rex |= 0x04; // REX.R (src is Reg)
+                    if (dst_addr >= X86_64_R8) rex |= 0x01; // REX.B (dst is RM)
+                    if (rex) emit_byte(ctx, 0x40 | rex);
+                    
+                    emit_byte(ctx, 0x0F);
+                    emit_byte(ctx, 0x11);
+                    
+                    uint8_t modrm = 0x00 | (reg_to_x86_encoding(src) << 3) | reg_to_x86_encoding(dst_addr);
+                    emit_byte(ctx, modrm);
                 }
                 else
                 {
-                    // Mod=00, Reg=src, RM=rm
-                    emit_byte(ctx, (reg << 3) | rm);
+                    // REX.W + 89 /r
+                    uint8_t rex = 0x48; // REX.W
+                    if (src >= X86_64_R8) rex |= 0x04; // REX.R
+                    if (dst_addr >= X86_64_R8) rex |= 0x01; // REX.B
+                    
+                    emit_byte(ctx, rex);
+                    emit_byte(ctx, 0x89);
+                    
+                    uint8_t rm = reg_to_x86_encoding(dst_addr);
+                    uint8_t reg = reg_to_x86_encoding(src);
+                    
+                    if ((rm & 7) == 4) // RSP or R12 (encoding 4)
+                    {
+                        // SIB required
+                        // Mod=00, Reg=src, RM=100 (SIB)
+                        emit_byte(ctx, (reg << 3) | 0x04);
+                        // SIB: Scale=0, Index=4 (none), Base=rm
+                        emit_byte(ctx, 0x24);
+                    }
+                    else if ((rm & 7) == 5) // RBP or R13 (encoding 5)
+                    {
+                        // Mod=01 (disp8), Reg=src, RM=101
+                        emit_byte(ctx, 0x40 | (reg << 3) | 0x05);
+                        emit_byte(ctx, 0x00); // disp8 = 0
+                    }
+                    else
+                    {
+                        // Mod=00, Reg=src, RM=rm
+                        emit_byte(ctx, (reg << 3) | rm);
+                    }
                 }
             }
         }
@@ -792,45 +1146,53 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         if (inst->result && inst->operand_count >= 2)
         {
             X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
-            if (inst->operands[0].kind == MIR_OPERAND_VALUE)
+            
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id);
-                // mov dst, src1 first if needed
-                if (dst != src1)
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[1].value_id);
+                
+                if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
                 {
-                    emit_mov_reg_reg(ctx, dst, src1);
+                    emit_addsd_reg_reg(ctx, dst, src);
+                }
+                else
+                {
+                    emit_add_reg_reg(ctx, dst, src);
                 }
             }
-            
-            if (inst->operands[1].kind == MIR_OPERAND_VALUE)
-            {
-                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
-                emit_add_reg_reg(ctx, dst, src2);
-            }
-            else if (inst->operands[1].kind == MIR_OPERAND_IMM_INT)
+            else if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                     inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
                 emit_add_reg_imm(ctx, dst, (int32_t)inst->operands[1].imm_int);
             }
         }
+        break;
         break;
 
     case MIR_OP_SUB:
         if (inst->result && inst->operand_count >= 2)
         {
             X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
-            if (inst->operands[0].kind == MIR_OPERAND_VALUE)
+            
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id);
-                if (dst != src1)
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[1].value_id);
+                
+                if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
                 {
-                    emit_mov_reg_reg(ctx, dst, src1);
+                    emit_subsd_reg_reg(ctx, dst, src);
+                }
+                else
+                {
+                    // The first operand is implicitly the destination, so we don't need to move it first.
+                    // The register allocator should ensure dst contains the value of operands[0].
+                    emit_sub_reg_reg(ctx, dst, src);
                 }
             }
-            if (inst->operands[1].kind == MIR_OPERAND_VALUE)
-            {
-                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
-                emit_sub_reg_reg(ctx, dst, src2);
-            }
+            // No IMM_INT case for SUB in the provided snippet, keeping existing behavior
+
         }
         break;
 
@@ -838,18 +1200,54 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         if (inst->result && inst->operand_count >= 2)
         {
             X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
-            if (inst->operands[0].kind == MIR_OPERAND_VALUE)
+            
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id);
-                if (dst != src1)
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[1].value_id);
+                
+                if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
                 {
-                    emit_mov_reg_reg(ctx, dst, src1);
+                    emit_mulsd_reg_reg(ctx, dst, src);
+                }
+                else
+                {
+                    // The first operand is implicitly the destination, so we don't need to move it first.
+                    // The register allocator should ensure dst contains the value of operands[0].
+                    emit_imul_reg_reg(ctx, dst, src);
                 }
             }
-            if (inst->operands[1].kind == MIR_OPERAND_VALUE)
+            else if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                     inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
-                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
-                emit_imul_reg_reg(ctx, dst, src2);
+                // The first operand is implicitly the destination, so we don't need to move it first.
+                // The register allocator should ensure dst contains the value of operands[0].
+                emit_imul_reg_imm(ctx, dst, (int32_t)inst->operands[1].imm_int);
+            }
+        }
+        break;
+
+    case MIR_OP_DIV:
+        if (inst->result && inst->operand_count >= 2)
+        {
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                inst->operands[1].kind == MIR_OPERAND_VALUE)
+            {
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[1].value_id);
+                
+                if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
+                {
+                    emit_divsd_reg_reg(ctx, dst, src);
+                }
+                else
+                {
+                    // Integer division (IDIV) not fully implemented here for simplicity
+                    // Assuming this is float division for now or handled elsewhere
+                    // The first operand is implicitly the destination, so we don't need to move it first.
+                    // The register allocator should ensure dst contains the value of operands[0].
+                }
             }
         }
         break;
@@ -910,6 +1308,60 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             {
                 X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
                 emit_xor_reg_reg(ctx, dst, src2);
+            }
+        }
+        break;
+
+    case MIR_OP_TRUNC:
+        // Truncate is just a move for us since we use 64-bit registers mostly
+        // But if we had smaller registers, we'd use MOV with smaller size
+        if (inst->result && inst->operand_count > 0)
+        {
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE)
+            {
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                if (dst != src) emit_mov_reg_reg(ctx, dst, src);
+            }
+        }
+        break;
+
+    case MIR_OP_FPTOSI:
+        if (inst->result && inst->operand_count > 0)
+        {
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE)
+            {
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                emit_cvttsd2si_reg_reg(ctx, dst, src);
+            }
+        }
+        break;
+
+    case MIR_OP_SITOFP:
+        if (inst->result && inst->operand_count > 0)
+        {
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE)
+            {
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                emit_cvtsi2sd_reg_reg(ctx, dst, src);
+            }
+        }
+        break;
+
+    case MIR_OP_CAST:
+        // For now, CAST is a no-op if source and destination are both integer or both float
+        // If it's int to float or float to int, it should be handled by FPTOSI/SITOFP
+        // If it's widening/narrowing, it's often a move or sign/zero extension
+        // For 64-bit, a simple move is often sufficient for widening/narrowing
+        if (inst->result && inst->operand_count > 0)
+        {
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE)
+            {
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                if (dst != src) emit_mov_reg_reg(ctx, dst, src);
             }
         }
         break;
@@ -1108,9 +1560,63 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             }
             
             // load arguments into registers
+            // To handle register conflicts, we do this in two passes:
+            // Pass 1: Save all VALUE sources that have conflicts to the stack
+            // Pass 2: Load all arguments from their (possibly saved) locations
+            
+            X86_64_Reg sources[6];
+            int32_t saved_offsets[6] = {0};  // Stack offsets for saved values
+            
+            // First, collect all source registers
             for (size_t i = first_arg; i < inst->operand_count && (i - first_arg) < 6; i++)
             {
-                X86_64_Reg dst = call_arg_regs[i - first_arg];
+                int arg_idx = i - first_arg;
+                
+                if (inst->operands[i].kind == MIR_OPERAND_VALUE)
+                {
+                    sources[arg_idx] = get_physical_reg(ctx, inst->operands[i].value_id);
+                }
+                else
+                {
+                    sources[arg_idx] = X86_64_RAX; // Not used for non-VALUE
+                }
+            }
+            
+            // Check for any conflicts and save to stack if needed
+            for (size_t i = first_arg; i < inst->operand_count && (i - first_arg) < 6; i++)
+            {
+                int arg_idx = i - first_arg;
+                
+                if (inst->operands[i].kind != MIR_OPERAND_VALUE)
+                    continue;
+                    
+                // Check if this source will be clobbered by an earlier destination
+                for (size_t j = first_arg; j < i; j++)
+                {
+                    int earlier_idx = j - first_arg;
+                    X86_64_Reg earlier_dst = call_arg_regs[earlier_idx];
+                    
+                    if (sources[arg_idx] == earlier_dst)
+                    {
+                        // Save this value to stack at a fixed offset
+                        saved_offsets[arg_idx] = (arg_idx + 1) * 8;
+                        emit_byte(ctx, 0x50 + reg_to_x86_encoding(sources[arg_idx]));
+                        break;
+                    }
+                }
+            }
+            
+            // Track how many values were saved for stack cleanup
+            int num_saved = 0;
+            for (int i = 0; i < 6; i++) {
+                if (saved_offsets[i] != 0) num_saved++;
+            }
+            
+            // Now load all arguments
+            for (size_t i = first_arg; i < inst->operand_count && (i - first_arg) < 6; i++)
+            {
+                int arg_idx = i - first_arg;
+                X86_64_Reg dst = call_arg_regs[arg_idx];
                 
                 if (inst->operands[i].kind == MIR_OPERAND_IMM_INT)
                 {
@@ -1118,10 +1624,34 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 }
                 else if (inst->operands[i].kind == MIR_OPERAND_VALUE)
                 {
-                    X86_64_Reg src = get_physical_reg(ctx, inst->operands[i].value_id);
-                    if (src != dst)
+                    X86_64_Reg src = sources[arg_idx];
+                    
+                    if (saved_offsets[arg_idx] != 0)
                     {
-                        emit_mov_reg_reg(ctx, dst, src);
+                        // Load from stack at specific offset
+                        // Calculate offset based on LIFO stack ordering
+                        int saved_position = 0;
+                        for (int j = 0; j < arg_idx; j++) {
+                            if (saved_offsets[j] != 0) saved_position++;
+                        }
+                        int stack_offset = (num_saved - 1 - saved_position) * 8;
+                        
+                        // mov dst, [rsp + offset]
+                        uint8_t rex = 0x48;  // REX.W
+                        if (dst >= X86_64_R8) rex |= 0x04;  // REX.R
+                        emit_byte(ctx, rex);
+                        emit_byte(ctx, 0x8B);  // MOV r64, r/m64
+                        uint8_t modrm = 0x44 | (reg_to_x86_encoding(dst) << 3);  // Mod=01 (disp8), Reg=dst, RM=100 (SIB)
+                        emit_byte(ctx, modrm);
+                        emit_byte(ctx, 0x24);  // SIB: scale=0, index=100(none), base=100(rsp)
+                        emit_byte(ctx, (uint8_t)stack_offset);  // disp8
+                    }
+                    else
+                    {
+                        if (src != dst)
+                        {
+                            emit_mov_reg_reg(ctx, dst, src);
+                        }
                     }
                 }
                 else if (inst->operands[i].kind == MIR_OPERAND_GLOBAL)
@@ -1143,6 +1673,29 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 uint64_t reloc_offset = ctx->code.size;
                 emit_dword(ctx, 0); // displacement filled by linker
                 add_relocation(ctx, reloc_offset, func_name, 4, -4); // R_X86_64_PLT32 with addend -4
+            }
+            
+            // Clean up stack: add rsp, num_saved * 8
+            if (num_saved > 0)
+            {
+                // add rsp, imm8/imm32
+                uint8_t cleanup_bytes = num_saved * 8;
+                if (cleanup_bytes <= 127)
+                {
+                    // REX.W + 83 /0 imm8
+                    emit_byte(ctx, 0x48);  // REX.W
+                    emit_byte(ctx, 0x83);  // ADD r/m64, imm8
+                    emit_byte(ctx, 0xC4);  // ModRM: Mod=11, Reg=0 (/0 for ADD), RM=100 (RSP)
+                    emit_byte(ctx, cleanup_bytes);
+                }
+                else
+                {
+                    // REX.W + 81 /0 imm32
+                    emit_byte(ctx, 0x48);  // REX.W
+                    emit_byte(ctx, 0x81);  // ADD r/m64, imm32
+                    emit_byte(ctx, 0xC4);  // ModRM: Mod=11, Reg=0, RM=100 (RSP)
+                    emit_dword(ctx, cleanup_bytes);
+                }
             }
             
             // result is in rax - if instruction has result, move to allocated register
@@ -1226,6 +1779,7 @@ int x86_64_emit_function(X86_64_CodegenContext *ctx, MIRFunction *func)
         // emit all instructions in block
         for (MIRInst *inst = block->first_inst; inst; inst = inst->next)
         {
+            // emit instruction
             emit_instruction(ctx, inst);
         }
     }

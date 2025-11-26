@@ -38,6 +38,13 @@ typedef struct LowerContext
     int        stack_slot_count;
     int        stack_slot_capacity;
     int32_t    frame_size;  // Total stack space needed (in bytes)
+    
+    // Loop control flow
+    MIRBlock *loop_start_block; // For continue
+    MIRBlock *loop_end_block;   // For break
+    
+    // Float constant counter
+    int float_const_count;
 } LowerContext;
 
 static LowerContext *lower_context_create(MIRModule *module)
@@ -58,6 +65,9 @@ static LowerContext *lower_context_create(MIRModule *module)
     ctx->stack_slot_count = 0;
     ctx->stack_slot_capacity = 0;
     ctx->frame_size = 0;
+    ctx->loop_start_block = NULL;
+    ctx->loop_end_block = NULL;
+    ctx->float_const_count = 0;
     
     return ctx;
 }
@@ -171,10 +181,12 @@ static int32_t lower_context_get_stack_offset(LowerContext *ctx, AstNode *node)
     {
         if (ctx->stack_slots[i].node == node)
         {
+            printf("GET_OFFSET: found node %p at offset %d\n", (void*)node, ctx->stack_slots[i].offset);
             return ctx->stack_slots[i].offset;
         }
     }
     
+    printf("GET_OFFSET: node %p NOT FOUND, returning 0\n", (void*)node);
     return 0; // Not found
 }
 
@@ -303,6 +315,10 @@ static int lower_var(LowerContext *ctx, AstNode *node)
                 {
                     mir_global_set_int_init(global, node->var_stmt.init->lit_expr.int_val);
                 }
+                else if (node->var_stmt.init->token->kind == TOKEN_LIT_FLOAT)
+                {
+                    mir_global_set_float_init(global, node->var_stmt.init->lit_expr.float_val);
+                }
                 else if (node->var_stmt.init->token->kind == TOKEN_LIT_STRING)
                 {
                     mir_global_set_string_init(global, node->var_stmt.init->lit_expr.string_val);
@@ -357,6 +373,30 @@ static int lower_var(LowerContext *ctx, AstNode *node)
                     }
                 }
             }
+            else if (node->var_stmt.init->kind == AST_EXPR_ARRAY)
+            {
+                // In-place initialization for array literal
+                AstNode *array_expr = node->var_stmt.init;
+                Type *type = node->type;
+                size_t elem_size = type->array.elem_type->size;
+                
+                if (array_expr->array_expr.elems)
+                {
+                    for (int i = 0; i < array_expr->array_expr.elems->count; i++)
+                    {
+                        AstNode *item_expr = array_expr->array_expr.elems->items[i];
+                        MIRValue *val = lower_expr(ctx, item_expr);
+                        if (val)
+                        {
+                            // store to stack at offset + i * elem_size
+                            MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                            mir_inst_add_operand(store, mir_operand_value(val->id));
+                            mir_inst_add_operand(store, mir_operand_imm_int(offset + i * elem_size));
+                            mir_block_append_inst(ctx->current_block, store);
+                        }
+                    }
+                }
+            }
             else
             {
                 MIRValue *val = lower_expr(ctx, node->var_stmt.init);
@@ -373,16 +413,27 @@ static int lower_var(LowerContext *ctx, AstNode *node)
                         
                         MIRValue *src_addr = mir_function_alloc_value(ctx->current_function, NULL, "src_addr");
                         MIRValue *tmp = mir_function_alloc_value(ctx->current_function, NULL, "copy_tmp");
+                        MIRValue *val_copy = mir_function_alloc_value(ctx->current_function, NULL, "val_copy");
+                        
+                        // Copy val to val_copy to preserve it across loop (avoid reg collision with tmp)
+                        MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+                        mir_inst_add_operand(mov, mir_operand_value(val->id));
+                        mir_inst_set_result(mov, val_copy);
+                        mir_block_append_inst(ctx->current_block, mov);
+                        
+                        printf("MEMCPY: copying %zu bytes from val (id=%u) to offset %d\n",
+                               size, val->id, offset);
                         
                         for (size_t i = 0; i < size; i += 8)
                         {
-                            // Calculate src address: val + i
-                            MIRValue *curr_src = val;
+                            printf("  MEMCPY iteration i=%zu\n", i);
+                            // Calculate src address: val_copy + i
+                            MIRValue *curr_src = val_copy;
                             if (i > 0)
                             {
                                 // Reuse src_addr value
                                 MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, 
-                                                               mir_operand_value(val->id), 
+                                                               mir_operand_value(val_copy->id), 
                                                                mir_operand_imm_int(i));
                                 mir_inst_set_result(add, src_addr);
                                 mir_block_append_inst(ctx->current_block, add);
@@ -410,6 +461,10 @@ static int lower_var(LowerContext *ctx, AstNode *node)
                         mir_block_append_inst(ctx->current_block, store);
                     }
                 }
+                else
+                {
+                    // failed to lower init expr
+                }
             }
         }
         // No init value means uninitialized - stack slot is already allocated
@@ -420,7 +475,13 @@ static int lower_var(LowerContext *ctx, AstNode *node)
 
 static int lower_if_stmt(LowerContext *ctx, AstNode *node)
 {
-    if (node->kind != AST_STMT_IF) return -1;
+    if (node->kind != AST_STMT_IF && node->kind != AST_STMT_OR) return -1;
+    
+    // If it's an OR node without condition (else), just lower the body
+    if (node->kind == AST_STMT_OR && !node->cond_stmt.cond)
+    {
+        return lower_stmt(ctx, node->cond_stmt.body);
+    }
     
     // create blocks
     MIRBlock *then_block = mir_function_add_block(ctx->current_function, "if.then");
@@ -465,10 +526,18 @@ static int lower_for_stmt(LowerContext *ctx, AstNode *node)
 {
     if (node->kind != AST_STMT_FOR) return -1;
     
+    // Save previous loop context
+    MIRBlock *prev_start = ctx->loop_start_block;
+    MIRBlock *prev_end = ctx->loop_end_block;
+    
     // create blocks
     MIRBlock *cond_block = mir_function_add_block(ctx->current_function, "for.cond");
     MIRBlock *body_block = mir_function_add_block(ctx->current_function, "for.body");
     MIRBlock *end_block = mir_function_add_block(ctx->current_function, "for.end");
+    
+    // Set current loop context
+    ctx->loop_start_block = cond_block;
+    ctx->loop_end_block = end_block;
     
     // jump to condition
     mir_block_append_inst(ctx->current_block, mir_inst_br(cond_block->id));
@@ -499,6 +568,11 @@ static int lower_for_stmt(LowerContext *ctx, AstNode *node)
     }
     
     ctx->current_block = end_block;
+    
+    // Restore previous loop context
+    ctx->loop_start_block = prev_start;
+    ctx->loop_end_block = prev_end;
+    
     return 0;
 }
 
@@ -557,14 +631,28 @@ static int lower_stmt(LowerContext *ctx, AstNode *node)
                     MIRValue *dst_addr = mir_function_alloc_value(ctx->current_function, NULL, "dst_addr");
                     MIRValue *tmp = mir_function_alloc_value(ctx->current_function, NULL, "copy_tmp");
                     
+                    MIRValue *val_copy = mir_function_alloc_value(ctx->current_function, NULL, "val_copy");
+                    MIRValue *hidden_ptr_copy = mir_function_alloc_value(ctx->current_function, NULL, "hidden_ptr_copy");
+                    
+                    // Copy val and hidden_ptr to temps to preserve them across loop
+                    MIRInst *mov1 = mir_inst_create(MIR_OP_MOV, NULL);
+                    mir_inst_add_operand(mov1, mir_operand_value(val->id));
+                    mir_inst_set_result(mov1, val_copy);
+                    mir_block_append_inst(ctx->current_block, mov1);
+                    
+                    MIRInst *mov2 = mir_inst_create(MIR_OP_MOV, NULL);
+                    mir_inst_add_operand(mov2, mir_operand_value(hidden_ptr->id));
+                    mir_inst_set_result(mov2, hidden_ptr_copy);
+                    mir_block_append_inst(ctx->current_block, mov2);
+                    
                     for (size_t i = 0; i < size; i += 8)
                     {
-                        // Calculate src address: val + i
-                        MIRValue *curr_src = val;
+                        // Calculate src address: val_copy + i
+                        MIRValue *curr_src = val_copy;
                         if (i > 0)
                         {
                             MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, 
-                                                           mir_operand_value(val->id), 
+                                                           mir_operand_value(val_copy->id), 
                                                            mir_operand_imm_int(i));
                             mir_inst_set_result(add, src_addr);
                             mir_block_append_inst(ctx->current_block, add);
@@ -577,12 +665,12 @@ static int lower_stmt(LowerContext *ctx, AstNode *node)
                         mir_inst_set_result(load, tmp);
                         mir_block_append_inst(ctx->current_block, load);
                         
-                        // Calculate dst address: hidden_ptr + i
-                        MIRValue *curr_dst = hidden_ptr;
+                        // Calculate dst address: hidden_ptr_copy + i
+                        MIRValue *curr_dst = hidden_ptr_copy;
                         if (i > 0)
                         {
                             MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, 
-                                                           mir_operand_value(hidden_ptr->id), 
+                                                           mir_operand_value(hidden_ptr_copy->id), 
                                                            mir_operand_imm_int(i));
                             mir_inst_set_result(add, dst_addr);
                             mir_block_append_inst(ctx->current_block, add);
@@ -596,7 +684,7 @@ static int lower_stmt(LowerContext *ctx, AstNode *node)
                         mir_block_append_inst(ctx->current_block, store);
                     }
                     
-                    // Return hidden pointer in RAX
+                    // Return the hidden pointer
                     MIRInst *ret = mir_inst_ret(NULL, mir_operand_value(hidden_ptr->id));
                     mir_block_append_inst(ctx->current_block, ret);
                 }
@@ -622,6 +710,31 @@ static int lower_stmt(LowerContext *ctx, AstNode *node)
         
     case AST_STMT_EXPR:
         lower_expr(ctx, node->expr_stmt.expr);
+        return 0;
+        
+        return 0;
+        
+    case AST_STMT_OR:
+        return lower_if_stmt(ctx, node);
+        
+    case AST_STMT_BRK:
+        if (ctx->loop_end_block)
+        {
+            mir_block_append_inst(ctx->current_block, mir_inst_br(ctx->loop_end_block->id));
+            // Create a new unreachable block for subsequent instructions (dead code)
+            MIRBlock *unreachable = mir_function_add_block(ctx->current_function, "unreachable");
+            ctx->current_block = unreachable;
+        }
+        return 0;
+        
+    case AST_STMT_CNT:
+        if (ctx->loop_start_block)
+        {
+            mir_block_append_inst(ctx->current_block, mir_inst_br(ctx->loop_start_block->id));
+            // Create a new unreachable block for subsequent instructions (dead code)
+            MIRBlock *unreachable = mir_function_add_block(ctx->current_function, "unreachable");
+            ctx->current_block = unreachable;
+        }
         return 0;
         
     case AST_STMT_MIR:
@@ -853,7 +966,52 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
             lower_context_map_value(ctx, node, result);
             return result;
         }
+        else if (node->token && node->token->kind == TOKEN_LIT_FLOAT)
+        {
+            // Create a synthetic global for the float constant
+            char name[64];
+            snprintf(name, sizeof(name), "__float_const_%d", ctx->float_const_count++);
+            
+            MIRGlobal *global = mir_global_create(name, type_get_primitive(TYPE_F64), MIR_GLOBAL_VAL, false);
+            mir_global_set_float_init(global, node->lit_expr.float_val);
+            mir_module_add_global(ctx->module, global);
+            
+            // Load address of global
+            MIRValue *addr = mir_function_alloc_value(ctx->current_function, NULL, "float_addr");
+            MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+            mir_inst_add_operand(mov, mir_operand_global(global->name));
+            mir_inst_set_result(mov, addr);
+            mir_block_append_inst(ctx->current_block, mov);
+            
+            // Load value from address
+            MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "lit_f");
+            MIRInst *load = mir_inst_create(MIR_OP_LOAD, type_get_primitive(TYPE_F64));
+            mir_inst_add_operand(load, mir_operand_value(addr->id));
+            mir_inst_set_result(load, result);
+            mir_block_append_inst(ctx->current_block, load);
+            
+            lower_context_map_value(ctx, node, result);
+            return result;
+        }
         return NULL;
+
+    case AST_EXPR_CAST:
+    {
+        // Lower expression
+        MIRValue *val = lower_expr(ctx, node->cast_expr.expr);
+        if (!val) return NULL;
+        
+        // Cast is raw bit reinterpretation (bitcast), not type conversion
+        // Emit a MOV to ensure type safety in MIR
+        MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "cast");
+        MIRInst *inst = mir_inst_create(MIR_OP_MOV, NULL);
+        mir_inst_add_operand(inst, mir_operand_value(val->id));
+        mir_inst_set_result(inst, result);
+        mir_block_append_inst(ctx->current_block, inst);
+        
+        lower_context_map_value(ctx, node, result);
+        return result;
+    }
         
     case AST_EXPR_IDENT:
         // look up value from symbol
@@ -1122,6 +1280,63 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                 }
                 return rhs_val;
             }
+            else if (lhs->kind == AST_EXPR_INDEX)
+            {
+                // Array element assignment: arr[i] = val
+                MIRValue *rhs_val = lower_expr(ctx, node->binary_expr.right);
+                if (!rhs_val) return NULL;
+                
+                AstNode *base = lhs->index_expr.array;
+                AstNode *index = lhs->index_expr.index;
+                
+                // Lower base address
+                MIRValue *base_addr = NULL;
+                if (base->kind == AST_EXPR_IDENT && base->symbol && base->symbol->kind == SYMBOL_VARIABLE)
+                {
+                    int32_t offset = lower_context_get_stack_offset(ctx, base->symbol->decl);
+                    if (offset != 0)
+                    {
+                        base_addr = mir_function_alloc_value(ctx->current_function, NULL, "base_addr");
+                        MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
+                        mir_inst_add_operand(addr, mir_operand_imm_int(offset));
+                        mir_inst_set_result(addr, base_addr);
+                        mir_block_append_inst(ctx->current_block, addr);
+                    }
+                }
+                
+                if (!base_addr) return NULL; // Only local arrays supported for now
+                
+                // Lower index
+                MIRValue *index_val = lower_expr(ctx, index);
+                if (!index_val) return NULL;
+                
+                // Element size
+                size_t elem_size = base->type->array.elem_type->size;
+                
+                // Calculate offset: index * elem_size
+                MIRValue *offset_val = mir_function_alloc_value(ctx->current_function, NULL, "index_offset");
+                MIRInst *mul = mir_inst_binary(MIR_OP_MUL, NULL, 
+                                               mir_operand_value(index_val->id), 
+                                               mir_operand_imm_int(elem_size));
+                mir_inst_set_result(mul, offset_val);
+                mir_block_append_inst(ctx->current_block, mul);
+                
+                // Add offset to base
+                MIRValue *elem_addr = mir_function_alloc_value(ctx->current_function, NULL, "elem_addr");
+                MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, 
+                                               mir_operand_value(base_addr->id), 
+                                               mir_operand_value(offset_val->id));
+                mir_inst_set_result(add, elem_addr);
+                mir_block_append_inst(ctx->current_block, add);
+                
+                // Store value
+                MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                mir_inst_add_operand(store, mir_operand_value(rhs_val->id));
+                mir_inst_add_operand(store, mir_operand_value(elem_addr->id)); // Store to address in register
+                mir_block_append_inst(ctx->current_block, store);
+                
+                return rhs_val;
+            }
             else if (lhs->kind == AST_EXPR_UNARY && lhs->unary_expr.op == TOKEN_AT)
             {
                 // Pointer assignment: @ptr = val
@@ -1346,15 +1561,18 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         bool has_hidden_ptr = (ret_type && ret_type->kind == TYPE_STRUCT && ret_type->size > 16);
         
         MIRValue *hidden_ptr_slot = NULL;
+        int32_t hidden_ptr_offset = 0;
+        
         if (has_hidden_ptr)
         {
             // Allocate stack slot for return value
-            int32_t offset = lower_context_alloc_stack_slot(ctx, NULL, ret_type->size);
+            // Pass node to properly track this allocation and prevent stack slot overlaps
+            hidden_ptr_offset = lower_context_alloc_stack_slot(ctx, node, ret_type->size);
             
             // Get address of slot
             hidden_ptr_slot = mir_function_alloc_value(ctx->current_function, NULL, "hidden_ret_addr");
             MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
-            mir_inst_add_operand(addr, mir_operand_imm_int(offset));
+            mir_inst_add_operand(addr, mir_operand_imm_int(hidden_ptr_offset));
             mir_inst_set_result(addr, hidden_ptr_slot);
             mir_block_append_inst(ctx->current_block, addr);
         }
@@ -1407,8 +1625,16 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         if (has_hidden_ptr)
         {
             // Return address of stack slot
-            lower_context_map_value(ctx, node, hidden_ptr_slot);
-            return hidden_ptr_slot;
+            // CRITICAL: The register holding hidden_ptr_slot might have been clobbered by the call.
+            // We must re-calculate the address after the call to ensure we have a valid register.
+            MIRValue *ret_val = mir_function_alloc_value(ctx->current_function, NULL, "hidden_ret_addr_reload");
+            MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
+            mir_inst_add_operand(addr, mir_operand_imm_int(hidden_ptr_offset));
+            mir_inst_set_result(addr, ret_val);
+            mir_block_append_inst(ctx->current_block, addr);
+            
+            lower_context_map_value(ctx, node, ret_val);
+            return ret_val;
         }
         else
         {

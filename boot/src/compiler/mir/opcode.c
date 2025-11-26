@@ -39,6 +39,8 @@ const char *mir_op_to_string(MIROp op)
     case MIR_OP_SEXT: return "sext";
     case MIR_OP_TRUNC: return "trunc";
     case MIR_OP_CAST: return "cast";
+    case MIR_OP_FPTOSI: return "fptosi";
+    case MIR_OP_SITOFP: return "sitofp";
     case MIR_OP_GEP: return "gep";
     case MIR_OP_RET: return "ret";
     case MIR_OP_BR: return "br";

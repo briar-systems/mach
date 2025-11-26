@@ -1787,6 +1787,7 @@ AstNode *parser_parse_stmt_uni(Parser *parser, bool is_public)
     return node;
 }
 
+
 AstNode *parser_parse_stmt_if(Parser *parser)
 {
     if (!parser_consume(parser, TOKEN_KW_IF, "expected 'if' keyword"))

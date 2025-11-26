@@ -53,6 +53,8 @@ typedef enum MIROp
     MIR_OP_SEXT,
     MIR_OP_TRUNC,
     MIR_OP_CAST,
+    MIR_OP_FPTOSI, // float to signed int
+    MIR_OP_SITOFP, // signed int to float
 
     // memory
     MIR_OP_GEP, // get element pointer (pointer arithmetic)

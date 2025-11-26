@@ -358,6 +358,21 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         }
         return 0;
 
+    case AST_STMT_OR:
+        if (node->cond_stmt.cond && sema_analyze_expr(sema, node->cond_stmt.cond) < 0)
+        {
+            return -1;
+        }
+        if (sema_analyze_stmt(sema, node->cond_stmt.body) < 0)
+        {
+            return -1;
+        }
+        if (node->cond_stmt.stmt_or)
+        {
+            return sema_analyze_stmt(sema, node->cond_stmt.stmt_or);
+        }
+        return 0;
+
     case AST_STMT_FOR:
         if (node->for_stmt.cond && sema_analyze_expr(sema, node->for_stmt.cond) < 0)
         {
@@ -376,6 +391,8 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
 }
 
 // analyze expression
+static Type *sema_resolve_type(Sema *sema, AstNode *type_node);
+
 static int sema_analyze_expr(Sema *sema, AstNode *node)
 {
     if (!node)
@@ -581,6 +598,24 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
         // TODO: Check for missing fields?
 
         node->type = type;
+        return 0;
+    }
+
+    case AST_EXPR_CAST:
+    {
+        if (sema_analyze_expr(sema, node->cast_expr.expr) < 0)
+        {
+            return -1;
+        }
+        
+        Type *target_type = sema_resolve_type(sema, node->cast_expr.type);
+        if (!target_type)
+        {
+            sema_error(sema, node->token, "invalid cast type");
+            return -1;
+        }
+        
+        node->type = target_type;
         return 0;
     }
 

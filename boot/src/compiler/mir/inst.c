@@ -84,6 +84,18 @@ MIRInst *mir_inst_const(Type *type, int64_t value)
     return inst;
 }
 
+MIRInst *mir_inst_const_float(Type *type, double value)
+{
+    MIRInst *inst = mir_inst_create(MIR_OP_CONST, type);
+    if (!inst)
+    {
+        return NULL;
+    }
+
+    mir_inst_add_operand(inst, mir_operand_imm_flt(value));
+    return inst;
+}
+
 MIRInst *mir_inst_binary(MIROp op, Type *type, MIROperand left, MIROperand right)
 {
     MIRInst *inst = mir_inst_create(op, type);

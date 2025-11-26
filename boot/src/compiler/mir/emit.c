@@ -91,17 +91,27 @@ static int emit_globals(EmitContext *ctx, MIRModule *module)
         // write initial data
         if (global->kind != MIR_GLOBAL_UNINIT)
         {
-            if (global->init.string_value)
+            if (global->type->kind == TYPE_F32 || global->type->kind == TYPE_F64)
+            {
+                // float - write as double (8 bytes)
+                double value = global->init.float_value;
+                elf_write_section_data(ctx->elf, section, (const uint8_t *)&value, 8);
+            }
+            else if (global->type->kind == TYPE_I64 || global->type->kind == TYPE_U64 ||
+                     global->type->kind == TYPE_I32 || global->type->kind == TYPE_U32 ||
+                     global->type->kind == TYPE_I16 || global->type->kind == TYPE_U16 ||
+                     global->type->kind == TYPE_I8  || global->type->kind == TYPE_U8  ||
+                     global->type->kind == TYPE_PTR)
+            {
+                // integer/pointer - write 8 bytes
+                uint64_t value = (uint64_t)global->init.int_value;
+                elf_write_section_data(ctx->elf, section, (const uint8_t *)&value, 8);
+            }
+            else if (global->init.string_value)
             {
                 // string literal - write with null terminator
                 size_t len = strlen(global->init.string_value);
                 elf_write_section_data(ctx->elf, section, (const uint8_t *)global->init.string_value, len + 1);
-            }
-            else
-            {
-                // integer/float - write 8 bytes for now
-                uint64_t value = (uint64_t)global->init.int_value;
-                elf_write_section_data(ctx->elf, section, (const uint8_t *)&value, 8);
             }
         }
     }
