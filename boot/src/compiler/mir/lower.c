@@ -305,7 +305,7 @@ static int lower_var(LowerContext *ctx, AstNode *node)
     {
         // global variable
         MIRGlobalKind kind = (node->kind == AST_STMT_VAL) ? MIR_GLOBAL_VAL : MIR_GLOBAL_VAR;
-        MIRGlobal *global = mir_global_create(node->var_stmt.name, NULL, kind, node->var_stmt.is_public);
+        MIRGlobal *global = mir_global_create(node->var_stmt.name, node->type, kind, node->var_stmt.is_public);
         
         // handle initializer
         if (node->var_stmt.init)
@@ -1073,17 +1073,32 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                 if (!local_val)
                 {
                     // not a local, must be a global
-                    // for globals, we need to load the address
-                    MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "global_ref");
+                    // Load global address
+                    MIRValue *addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
+                    MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+                    mir_inst_add_operand(mov, mir_operand_global(node->symbol->name));
+                    mir_inst_set_result(mov, addr);
+                    mir_block_append_inst(ctx->current_block, mov);
                     
-                    // create a MOV instruction that loads from the global
-                    MIRInst *inst = mir_inst_create(MIR_OP_MOV, NULL);
-                    mir_inst_add_operand(inst, mir_operand_global(node->symbol->name));
-                    mir_inst_set_result(inst, result);
-                    mir_block_append_inst(ctx->current_block, inst);
-                    
-                    lower_context_map_value(ctx, node, result);
-                    return result;
+                    // Load value from global (unless it's a large struct)
+                    if (node->type && node->type->size > 8)
+                    {
+                        // For large structs, return address directly
+                        lower_context_map_value(ctx, node, addr);
+                        return addr;
+                    }
+                    else
+                    {
+                        // For primitives and small values, load the value
+                        MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "global_val");
+                        MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
+                        mir_inst_add_operand(load, mir_operand_value(addr->id));
+                        mir_inst_set_result(load, result);
+                        mir_block_append_inst(ctx->current_block, load);
+                        
+                        lower_context_map_value(ctx, node, result);
+                        return result;
+                    }
                 }
                 else
                 {
@@ -1296,7 +1311,18 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                     else
                     {
                         // Global variable: store to global
-                        // TODO: Implement global store if needed
+                        // Load global address
+                        MIRValue *addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
+                        MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+                        mir_inst_add_operand(mov, mir_operand_global(lhs->symbol->name));
+                        mir_inst_set_result(mov, addr);
+                        mir_block_append_inst(ctx->current_block, mov);
+                        
+                        // Store value to global (operands: value, address)
+                        MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                        mir_inst_add_operand(store, mir_operand_value(rhs_val->id));
+                        mir_inst_add_operand(store, mir_operand_value(addr->id));
+                        mir_block_append_inst(ctx->current_block, store);
                     }
                 }
                 return rhs_val;
