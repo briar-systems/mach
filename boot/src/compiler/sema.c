@@ -420,6 +420,72 @@ static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
 
         return 0;
     }
+    else if (inner->kind == AST_EXPR_CALL)
+    {
+        // Handle $error(...) and $assert(...)
+        AstNode *func = inner->call_expr.func;
+        if (func->kind == AST_EXPR_IDENT)
+        {
+            char *name = func->ident_expr.name;
+            if (strcmp(name, "error") == 0)
+            {
+                // $error("message")
+                if (!inner->call_expr.args || inner->call_expr.args->count != 1)
+                {
+                    sema_error(sema, inner->token, "expected 1 argument for $error");
+                    return -1;
+                }
+                
+                AstNode *arg = inner->call_expr.args->items[0];
+                if (sema_analyze_expr(sema, arg) < 0) return -1;
+                
+                if (arg->kind != AST_EXPR_LIT || arg->lit_expr.kind != TOKEN_LIT_STRING)
+                {
+                    sema_error(sema, arg->token, "expected string literal for error message");
+                    return -1;
+                }
+                
+                sema_error(sema, inner->token, arg->lit_expr.string_val);
+                return -1;
+            }
+            else if (strcmp(name, "assert") == 0)
+            {
+                // $assert(cond, "message")
+                if (!inner->call_expr.args || inner->call_expr.args->count != 2)
+                {
+                    sema_error(sema, inner->token, "expected 2 arguments for $assert");
+                    return -1;
+                }
+                
+                AstNode *cond = inner->call_expr.args->items[0];
+                AstNode *msg = inner->call_expr.args->items[1];
+                
+                if (sema_analyze_expr(sema, cond) < 0) return -1;
+                if (sema_analyze_expr(sema, msg) < 0) return -1;
+                
+                int64_t val = 0;
+                if (!sema_eval_comptime_int(sema, cond, &val))
+                {
+                    sema_error(sema, cond->token, "condition is not a compile-time constant");
+                    return -1;
+                }
+                
+                if (msg->kind != AST_EXPR_LIT || msg->lit_expr.kind != TOKEN_LIT_STRING)
+                {
+                    sema_error(sema, msg->token, "expected string literal for assertion message");
+                    return -1;
+                }
+                
+                if (val == 0)
+                {
+                    sema_error(sema, inner->token, msg->lit_expr.string_val);
+                    return -1;
+                }
+                
+                return 0;
+            }
+        }
+    }
 
     // If not assignment, it's a read (e.g. $mach.os.id).
     // As a statement, it does nothing.
