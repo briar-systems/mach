@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "compiler/comptime.h"
 
 // semantic analyzer context
 struct Sema
@@ -665,6 +666,12 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
     {
         // Evaluate compile-time expression
         AstNode *inner = node->comptime.inner;
+        
+        // Try to resolve as $mach constant first
+        if (comptime_lookup(sema, node) == 0)
+        {
+            return 0;
+        }
         
         // Handle $Symbol.attribute pattern
         if (inner && inner->kind == AST_EXPR_FIELD)

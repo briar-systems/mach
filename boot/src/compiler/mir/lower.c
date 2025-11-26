@@ -1255,9 +1255,10 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         MIRValue *base_addr = NULL;
         AstNode *arr = node->index_expr.array;
         
-        if (arr->kind == AST_EXPR_IDENT && arr->symbol && arr->symbol->kind == SYMBOL_VARIABLE)
+        if (arr->kind == AST_EXPR_IDENT && arr->symbol && arr->symbol->kind == SYMBOL_VARIABLE &&
+            arr->type && arr->type->kind == TYPE_ARRAY)
         {
-            // Local variable: get stack address
+            // Local array: get stack address
             int32_t offset = lower_context_get_stack_offset(ctx, arr->symbol->decl);
             if (offset != 0)
             {
@@ -1279,7 +1280,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         }
         else
         {
-            // Assume pointer or complex expression evaluating to address
+            // Pointer or complex expression: evaluate to get address
             base_addr = lower_expr(ctx, arr);
         }
 
@@ -1313,7 +1314,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         mir_block_append_inst(ctx->current_block, add);
 
         // Load value
-        MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "elem_val");
+        MIRValue *result = mir_function_alloc_value(ctx->current_function, elem_type, "elem_val");
         MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
         mir_inst_add_operand(load, mir_operand_value(elem_addr->id));
         mir_inst_set_result(load, result);
@@ -1955,10 +1956,20 @@ int mir_parse_inline_block(LowerContext *ctx, MIRFunction *func, MIRBlock *curre
                     {
                         for (int i = 0; i < ctx->stack_slot_count; i++)
                         {
-                            if (ctx->stack_slots[i].node && 
-                                (ctx->stack_slots[i].node->kind == AST_STMT_VAR || ctx->stack_slots[i].node->kind == AST_STMT_VAL) &&
-                                ctx->stack_slots[i].node->var_stmt.name &&
-                                strcmp(ctx->stack_slots[i].node->var_stmt.name, name) == 0)
+                            if (!ctx->stack_slots[i].node) continue;
+                            
+                            const char *slot_name = NULL;
+                            if (ctx->stack_slots[i].node->kind == AST_STMT_VAR || 
+                                ctx->stack_slots[i].node->kind == AST_STMT_VAL)
+                            {
+                                slot_name = ctx->stack_slots[i].node->var_stmt.name;
+                            }
+                            else if (ctx->stack_slots[i].node->kind == AST_STMT_PARAM)
+                            {
+                                slot_name = ctx->stack_slots[i].node->param_stmt.name;
+                            }
+                            
+                            if (slot_name && strcmp(slot_name, name) == 0)
                             {
                                 offset = ctx->stack_slots[i].offset;
                                 break;

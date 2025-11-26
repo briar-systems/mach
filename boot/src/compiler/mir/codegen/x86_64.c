@@ -997,13 +997,25 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 }
                 else
                 {
-                    // REX.W + 8B /r
+                    Type *type = inst->result->type;
+                    bool is_byte = (type && (type->kind == TYPE_U8 || type->kind == TYPE_I8));
+                    
+                    // REX.W + 8B /r (MOV) or REX.W + 0F B6 /r (MOVZX)
                     uint8_t rex = 0x48; // REX.W
                     if (dst >= X86_64_R8) rex |= 0x04; // REX.R
                     if (src >= X86_64_R8) rex |= 0x01; // REX.B
                     
                     emit_byte(ctx, rex);
-                    emit_byte(ctx, 0x8B);
+                    
+                    if (is_byte)
+                    {
+                        emit_byte(ctx, 0x0F);
+                        emit_byte(ctx, 0xB6);
+                    }
+                    else
+                    {
+                        emit_byte(ctx, 0x8B);
+                    }
                     
                     uint8_t rm = reg_to_x86_encoding(src);
                     uint8_t reg = reg_to_x86_encoding(dst);
