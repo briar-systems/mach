@@ -660,6 +660,80 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
 
         return 0;
     }
+    
+    case AST_COMPTIME:
+    {
+        // Evaluate compile-time expression
+        AstNode *inner = node->comptime.inner;
+        
+        // Handle $Symbol.attribute pattern
+        if (inner && inner->kind == AST_EXPR_FIELD)
+        {
+            AstNode *obj = inner->field_expr.object;
+            if (obj->kind != AST_EXPR_IDENT)
+            {
+                sema_error(sema, node->token, "compiletime attribute access requires symbol name");
+                return -1;
+            }
+            
+            // Look up symbol
+            Symbol *sym = symbol_table_lookup(sema->current_table, obj->ident_expr.name);
+            if (!sym)
+            {
+                sema_error(sema, obj->token, "undefined symbol in compiletime expression");
+                return -1;
+            }
+            
+            const char *attr_name = inner->field_expr.field;
+            
+            // Evaluate attribute
+            if (strcmp(attr_name, "name") == 0)
+            {
+                // Return symbol name as string
+                node->comptime.value_kind = COMPTIME_STRING;
+                node->comptime.string_value = strdup(obj->ident_expr.name);
+                node->type = type_get_primitive(TYPE_PTR); // &u8
+                return 0;
+            }
+            else if (strcmp(attr_name, "size") == 0)
+            {
+                // Return type size as integer
+                node->comptime.value_kind = COMPTIME_INT;
+                node->comptime.int_value = sym->type ? sym->type->size : 0;
+                node->type = type_get_primitive(TYPE_I64);
+                return 0;
+            }
+            else if (strcmp(attr_name, "align") == 0)
+            {
+                // Return type alignment (use size as alignment for now)
+                node->comptime.value_kind = COMPTIME_INT;
+                node->comptime.int_value = sym->type ? sym->type->size : 0;
+                node->type = type_get_primitive(TYPE_I64);
+                return 0;
+            }
+            else if (strcmp(attr_name, "field_count") == 0)
+            {
+                // Return number of fields (record types only)
+                if (sym->type && sym->type->kind == TYPE_STRUCT)
+                {
+                    node->comptime.value_kind = COMPTIME_INT;
+                    node->comptime.int_value = sym->type->structure.field_count;
+                    node->type = type_get_primitive(TYPE_I64);
+                    return 0;
+                }
+                sema_error(sema, node->token, "field_count only valid for record types");
+                return -1;
+            }
+            else
+            {
+                sema_error(sema, node->token, "unknown compiletime attribute");
+                return -1;
+            }
+        }
+        
+        sema_error(sema, node->token, "unsupported compiletime expression");
+        return -1;
+    }
 
     default:
         // other expressions not implemented yet

@@ -1015,6 +1015,44 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
             return result;
         }
         return NULL;
+    
+    case AST_COMPTIME:
+    {
+        // Lower compile-time constant (already evaluated in sema)
+        if (node->comptime.value_kind == COMPTIME_INT)
+        {
+            // Integer constant
+            MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "comptime_int");
+            MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+            mir_inst_add_operand(mov, mir_operand_imm_int(node->comptime.int_value));
+            mir_inst_set_result(mov, result);
+            mir_block_append_inst(ctx->current_block, mov);
+            
+            lower_context_map_value(ctx, node, result);
+            return result;
+        }
+        else if (node->comptime.value_kind == COMPTIME_STRING)
+        {
+            // String constant - create global like string literals
+            char name[64];
+            snprintf(name, sizeof(name), "__comptime_str_%d", ctx->string_const_count++);
+            
+            MIRGlobal *global = mir_global_create(name, type_get_primitive(TYPE_PTR), MIR_GLOBAL_VAL, false);
+            mir_global_set_string_init(global, node->comptime.string_value);
+            mir_module_add_global(ctx->module, global);
+            
+            // Load address as &u8
+            MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "comptime_str");
+            MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
+            mir_inst_add_operand(mov, mir_operand_global(global->name));
+            mir_inst_set_result(mov, result);
+            mir_block_append_inst(ctx->current_block, mov);
+            
+            lower_context_map_value(ctx, node, result);
+            return result;
+        }
+        return NULL;
+    }
 
     case AST_EXPR_CAST:
     {

@@ -3,6 +3,7 @@
 
 #include "compiler/token.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 // forward statements
 typedef struct Type   Type;
@@ -197,10 +198,17 @@ struct AstNode
             AstNode *expr;
         } expr_stmt;
 
-        // compile-time construct (unified $ prefix handler)
+        // compile-time expression
         struct
         {
-            AstNode *inner; // the expression/statement following $
+            AstNode *inner; // wrapped expression
+            
+            // Evaluated compile-time value
+            enum { COMPTIME_UNEVALUATED, COMPTIME_INT, COMPTIME_STRING } value_kind;
+            union {
+                int64_t int_value;
+                char   *string_value;
+            };
         } comptime;
 
         // return statement
