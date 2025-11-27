@@ -1158,18 +1158,35 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         
         MIRValue *base_addr = NULL;
         AstNode *obj = node->field_expr.object;
+        Type *obj_type = obj->type;
+        
+        // Check if object is a pointer - if so, we need to load it first
+        bool obj_is_pointer = (obj_type && obj_type->kind == TYPE_POINTER);
         
         if (obj->kind == AST_EXPR_IDENT && obj->symbol && obj->symbol->kind == SYMBOL_VARIABLE)
         {
-            // Local variable: get stack address
             int32_t offset = lower_context_get_stack_offset(ctx, obj->symbol->decl);
             if (offset != 0)
             {
-                base_addr = mir_function_alloc_value(ctx->current_function, NULL, "base_addr");
-                MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
-                mir_inst_add_operand(addr, mir_operand_imm_int(offset));
-                mir_inst_set_result(addr, base_addr);
-                mir_block_append_inst(ctx->current_block, addr);
+                if (obj_is_pointer)
+                {
+                    // Pointer variable: load the pointer value from the stack
+                    base_addr = mir_function_alloc_value(ctx->current_function, NULL, "ptr_val");
+                    MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
+                    mir_inst_add_operand(load, mir_operand_imm_int(offset));
+                    mir_inst_add_operand(load, mir_operand_imm_int(8)); // pointer size
+                    mir_inst_set_result(load, base_addr);
+                    mir_block_append_inst(ctx->current_block, load);
+                }
+                else
+                {
+                    // Value variable: get stack address
+                    base_addr = mir_function_alloc_value(ctx->current_function, NULL, "base_addr");
+                    MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
+                    mir_inst_add_operand(addr, mir_operand_imm_int(offset));
+                    mir_inst_set_result(addr, base_addr);
+                    mir_block_append_inst(ctx->current_block, addr);
+                }
             }
             else
             {
@@ -1198,18 +1215,18 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
 
         if (!base_addr) return NULL;
 
-        // Find field offset
-        Type *obj_type = obj->type;
-        if (obj_type->kind == TYPE_POINTER) obj_type = obj_type->pointer.base;
+        // Find field offset - unwrap pointer if needed
+        Type *struct_type = obj_type;
+        if (struct_type->kind == TYPE_POINTER) struct_type = struct_type->pointer.base;
         
         int32_t field_offset = 0;
-        if (obj_type->kind == TYPE_STRUCT)
+        if (struct_type->kind == TYPE_STRUCT)
         {
-            for (int i = 0; i < obj_type->structure.field_count; i++)
+            for (int i = 0; i < struct_type->structure.field_count; i++)
             {
-                if (strcmp(obj_type->structure.fields[i].name, node->field_expr.field) == 0)
+                if (strcmp(struct_type->structure.fields[i].name, node->field_expr.field) == 0)
                 {
-                    field_offset = (int32_t)obj_type->structure.fields[i].offset;
+                    field_offset = (int32_t)struct_type->structure.fields[i].offset;
                     break;
                 }
             }
@@ -1444,17 +1461,33 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                 // Field assignment: obj.field = val
                 MIRValue *base_addr = NULL;
                 AstNode *obj = lhs->field_expr.object;
+                Type *obj_type = obj->type;
+                bool obj_is_pointer = (obj_type && obj_type->kind == TYPE_POINTER);
                 
                 if (obj->kind == AST_EXPR_IDENT && obj->symbol && obj->symbol->kind == SYMBOL_VARIABLE)
                 {
                     int32_t offset = lower_context_get_stack_offset(ctx, obj->symbol->decl);
                     if (offset != 0)
                     {
-                        base_addr = mir_function_alloc_value(ctx->current_function, NULL, "base_addr");
-                        MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
-                        mir_inst_add_operand(addr, mir_operand_imm_int(offset));
-                        mir_inst_set_result(addr, base_addr);
-                        mir_block_append_inst(ctx->current_block, addr);
+                        if (obj_is_pointer)
+                        {
+                            // Pointer variable: load the pointer value from the stack
+                            base_addr = mir_function_alloc_value(ctx->current_function, NULL, "ptr_val");
+                            MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
+                            mir_inst_add_operand(load, mir_operand_imm_int(offset));
+                            mir_inst_add_operand(load, mir_operand_imm_int(8)); // pointer size
+                            mir_inst_set_result(load, base_addr);
+                            mir_block_append_inst(ctx->current_block, load);
+                        }
+                        else
+                        {
+                            // Value variable: get stack address
+                            base_addr = mir_function_alloc_value(ctx->current_function, NULL, "base_addr");
+                            MIRInst *addr = mir_inst_create(MIR_OP_ADDR, NULL);
+                            mir_inst_add_operand(addr, mir_operand_imm_int(offset));
+                            mir_inst_set_result(addr, base_addr);
+                            mir_block_append_inst(ctx->current_block, addr);
+                        }
                     }
                     else
                     {
@@ -1472,17 +1505,17 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                 
                 if (base_addr)
                 {
-                    Type *obj_type = obj->type;
-                    if (obj_type->kind == TYPE_POINTER) obj_type = obj_type->pointer.base;
+                    Type *struct_type = obj_type;
+                    if (struct_type && struct_type->kind == TYPE_POINTER) struct_type = struct_type->pointer.base;
                     
                     int32_t field_offset = 0;
-                    if (obj_type->kind == TYPE_STRUCT)
+                    if (struct_type && struct_type->kind == TYPE_STRUCT)
                     {
-                        for (int i = 0; i < obj_type->structure.field_count; i++)
+                        for (int i = 0; i < struct_type->structure.field_count; i++)
                         {
-                            if (strcmp(obj_type->structure.fields[i].name, lhs->field_expr.field) == 0)
+                            if (strcmp(struct_type->structure.fields[i].name, lhs->field_expr.field) == 0)
                             {
-                                field_offset = (int32_t)obj_type->structure.fields[i].offset;
+                                field_offset = (int32_t)struct_type->structure.fields[i].offset;
                                 break;
                             }
                         }
@@ -1639,6 +1672,19 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
             if (node->call_expr.func->symbol)
             {
                 func_name = symbol_get_linkage_name(node->call_expr.func->symbol);
+            }
+        }
+        else if (node->call_expr.func->kind == AST_EXPR_FIELD && 
+                 node->call_expr.func->field_expr.is_method)
+        {
+            // method call - get function name from the field's symbol
+            if (node->call_expr.func->symbol)
+            {
+                func_name = symbol_get_linkage_name(node->call_expr.func->symbol);
+            }
+            else
+            {
+                func_name = node->call_expr.func->field_expr.field;
             }
         }
         

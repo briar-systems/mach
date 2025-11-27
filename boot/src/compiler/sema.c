@@ -179,22 +179,21 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
     }
     
     sym->type = type_create_function(ret_type, param_types, param_count);
-    // type_create_function copies the array? No, usually it takes ownership or copies.
-    // Looking at type.c would confirm, but usually safe to free if it copies.
-    // If it takes ownership, I shouldn't free.
-    // Let's assume it copies for now or I'll check type.c later.
-    // Actually, to be safe, I'll check type.c.
+    sym->decl = node;
     
     // add function to symbol table
     if (symbol_table_insert(sema->current_table, sym) < 0)
     {
         sema_error(sema, node->token, "duplicate function declaration");
         symbol_destroy(sym);
-        // free(param_types); // depends on ownership
         return -1;
     }
 
     node->symbol = sym;
+    
+    // Note: We don't insert into the type's methods table here because symbols
+    // can only be in one linked list at a time. Method lookup will scan the 
+    // symbol table for methods with matching receiver type instead.
 
     // analyze function body if present
     if (node->fun_stmt.body)
@@ -225,10 +224,6 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
 
         sema->current_table = prev_table;
     }
-    
-    // cleanup param_types array if type_create_function copied it
-    // I'll assume it did for now.
-    // if (param_types) free(param_types);
 
     return 0;
 }
@@ -301,7 +296,9 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
     return 0;
 }
 
-// analyze statement
+// forward declaration for generic type instantiation
+static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstList *type_args);
+
 // analyze record definition
 static int sema_analyze_rec(Sema *sema, AstNode *node)
 {
@@ -316,7 +313,25 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
         return -1;
     }
 
-    // process fields
+    // check for generics - if present, defer field resolution until instantiation
+    if (node->rec_stmt.generics && node->rec_stmt.generics->count > 0)
+    {
+        sym->is_generic = true;
+        sym->decl = node;
+        
+        // add to symbol table without resolving fields
+        if (symbol_table_insert(sema->current_table, sym) < 0)
+        {
+            sema_error(sema, node->token, "duplicate type definition");
+            symbol_destroy(sym);
+            return -1;
+        }
+        
+        node->symbol = sym;
+        return 0;
+    }
+
+    // process fields for non-generic records
     int field_count = node->rec_stmt.fields ? node->rec_stmt.fields->count : 0;
     TypeField *fields = NULL;
     
@@ -370,6 +385,7 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
     }
 
     sym->type = rec_type;
+    sym->decl = node;
     node->symbol = sym;
     node->type = rec_type;
 
@@ -819,6 +835,61 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
         Type *func_type = node->call_expr.func->type;
         Symbol *func_sym = node->call_expr.func->symbol;
+        
+        // Handle method calls: obj.method(args) -> method(obj, args)
+        if (node->call_expr.func->kind == AST_EXPR_FIELD && 
+            node->call_expr.func->field_expr.is_method)
+        {
+            node->call_expr.is_method_call = true;
+            
+            // get receiver and determine if we need auto-ref
+            AstNode *receiver = node->call_expr.func->field_expr.object;
+            Type *receiver_type = receiver->type;
+            
+            // check what the method expects
+            Type *expected_receiver_type = NULL;
+            if (func_sym && func_sym->decl && func_sym->decl->fun_stmt.method_receiver)
+            {
+                expected_receiver_type = sema_resolve_type(sema, func_sym->decl->fun_stmt.method_receiver);
+            }
+            
+            // auto-ref: if method expects pointer but receiver is value, wrap in address-of
+            if (expected_receiver_type && expected_receiver_type->kind == TYPE_POINTER &&
+                receiver_type && receiver_type->kind != TYPE_POINTER)
+            {
+                // create address-of expression: ?receiver
+                AstNode *addr_of = malloc(sizeof(AstNode));
+                memset(addr_of, 0, sizeof(AstNode));
+                addr_of->kind = AST_EXPR_UNARY;
+                addr_of->unary_expr.op = TOKEN_QUESTION;
+                addr_of->unary_expr.expr = receiver;
+                addr_of->type = type_create_pointer(receiver_type, false);
+                receiver = addr_of;
+            }
+            // auto-deref: if method expects value but receiver is pointer, wrap in dereference
+            else if (expected_receiver_type && expected_receiver_type->kind != TYPE_POINTER &&
+                     receiver_type && receiver_type->kind == TYPE_POINTER)
+            {
+                // create dereference expression: @receiver
+                AstNode *deref = malloc(sizeof(AstNode));
+                memset(deref, 0, sizeof(AstNode));
+                deref->kind = AST_EXPR_UNARY;
+                deref->unary_expr.op = TOKEN_AT;
+                deref->unary_expr.expr = receiver;
+                deref->type = receiver_type->pointer.base;
+                receiver = deref;
+            }
+            
+            if (!node->call_expr.args)
+            {
+                node->call_expr.args = malloc(sizeof(AstList));
+                node->call_expr.args->items = NULL;
+                node->call_expr.args->count = 0;
+                node->call_expr.args->capacity = 0;
+            }
+            
+            ast_list_prepend(node->call_expr.args, receiver);
+        }
 
         // Handle generics
         if (func_sym && func_sym->is_generic)
@@ -927,37 +998,72 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
         Type *obj_type = node->field_expr.object->type;
         
-        // auto-dereference pointer to struct
-        if (obj_type->kind == TYPE_POINTER && obj_type->pointer.base->kind == TYPE_STRUCT)
+        // auto-dereference pointer to struct/union
+        if (obj_type->kind == TYPE_POINTER && 
+            (obj_type->pointer.base->kind == TYPE_STRUCT || obj_type->pointer.base->kind == TYPE_UNION))
         {
             obj_type = obj_type->pointer.base;
         }
 
-        if (obj_type->kind != TYPE_STRUCT)
+        if (obj_type->kind != TYPE_STRUCT && obj_type->kind != TYPE_UNION)
         {
-            sema_error(sema, node->token, "field access on non-struct type");
+            sema_error(sema, node->token, "field access on non-struct/union type");
             return -1;
         }
 
         // find field
+        TypeField *fields = (obj_type->kind == TYPE_STRUCT) 
+            ? obj_type->structure.fields 
+            : obj_type->union_type.fields;
+        int field_count = (obj_type->kind == TYPE_STRUCT) 
+            ? obj_type->structure.field_count 
+            : obj_type->union_type.field_count;
+        
         TypeField *field = NULL;
-        for (int i = 0; i < obj_type->structure.field_count; i++)
+        for (int i = 0; i < field_count; i++)
         {
-            if (strcmp(obj_type->structure.fields[i].name, node->field_expr.field) == 0)
+            if (strcmp(fields[i].name, node->field_expr.field) == 0)
             {
-                field = &obj_type->structure.fields[i];
+                field = &fields[i];
                 break;
             }
         }
 
-        if (!field)
+        if (field)
         {
-            sema_error(sema, node->token, "undefined field");
-            return -1;
+            node->type = field->type;
+            return 0;
+        }
+        
+        // field not found - look for method in the symbol table
+        // scan for a function with matching name that is a method with compatible receiver type
+        Symbol *method = symbol_table_lookup(sema->current_table, node->field_expr.field);
+        if (method && method->kind == SYMBOL_FUNCTION && method->decl && 
+            method->decl->kind == AST_STMT_FUN && method->decl->fun_stmt.is_method)
+        {
+            // check receiver type compatibility
+            Type *method_receiver_type = sema_resolve_type(sema, method->decl->fun_stmt.method_receiver);
+            if (method_receiver_type)
+            {
+                Type *method_base_type = method_receiver_type;
+                if (method_base_type->kind == TYPE_POINTER)
+                {
+                    method_base_type = method_base_type->pointer.base;
+                }
+                
+                // check if the receiver base type matches the object type
+                if (type_equals(method_base_type, obj_type))
+                {
+                    node->field_expr.is_method = true;
+                    node->symbol = method;
+                    node->type = method->type;
+                    return 0;
+                }
+            }
         }
 
-        node->type = field->type;
-        return 0;
+        sema_error(sema, node->token, "undefined field or method");
+        return -1;
     }
 
     case AST_EXPR_STRUCT:
@@ -1213,8 +1319,9 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
     case AST_EXPR_IDENT:
     {
         const char *name = (type_node->kind == AST_TYPE_NAME) ? type_node->type_name.name : type_node->ident_expr.name;
+        AstList *generic_args = (type_node->kind == AST_TYPE_NAME) ? type_node->type_name.generic_args : NULL;
         
-        // check primitive types
+        // check primitive types (no generics allowed)
         if (strcmp(name, "i8") == 0) return type_get_primitive(TYPE_I8);
         if (strcmp(name, "i16") == 0) return type_get_primitive(TYPE_I16);
         if (strcmp(name, "i32") == 0) return type_get_primitive(TYPE_I32);
@@ -1230,7 +1337,19 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
         
         // look up user-defined types
         Symbol *sym = symbol_table_lookup(sema->current_table, name);
-        if (sym && sym->type)
+        if (!sym)
+        {
+            return NULL;
+        }
+        
+        // handle generic type instantiation
+        if (sym->is_generic && generic_args && generic_args->count > 0)
+        {
+            return sema_instantiate_generic_type(sema, sym, generic_args);
+        }
+        
+        // non-generic type or generic type used without args (error case, but return type for now)
+        if (sym->type)
         {
             return sym->type;
         }
@@ -1306,6 +1425,153 @@ int sema_analyze(Sema *sema, AstNode *ast)
     }
 
     return sema->error_count > 0 ? -1 : 0;
+}
+
+// Instantiate a generic struct/union type with type arguments
+// Returns the instantiated Type* (cached if already instantiated)
+static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstList *type_args)
+{
+    if (!sema || !generic_sym || !type_args)
+    {
+        return NULL;
+    }
+
+    if (!generic_sym->is_generic || !generic_sym->decl)
+    {
+        return NULL;
+    }
+
+    AstNode *decl = generic_sym->decl;
+    AstList *generic_params = NULL;
+    bool is_struct = false;
+    
+    if (decl->kind == AST_STMT_REC)
+    {
+        generic_params = decl->rec_stmt.generics;
+        is_struct = true;
+    }
+    else if (decl->kind == AST_STMT_UNI)
+    {
+        generic_params = decl->uni_stmt.generics;
+        is_struct = false;
+    }
+    else
+    {
+        return NULL; // not a type declaration
+    }
+    
+    if (!generic_params || generic_params->count != type_args->count)
+    {
+        return NULL;
+    }
+
+    // 1. Generate mangled name for this instantiation
+    // Itanium-style: <name>I<type_args>E
+    char mangled_name[512];
+    int pos = snprintf(mangled_name, sizeof(mangled_name), "%s", generic_sym->name);
+    
+    pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "I");
+    
+    for (int i = 0; i < type_args->count; i++)
+    {
+        AstNode *arg_node = type_args->items[i];
+        Type *arg_type = sema_resolve_type(sema, arg_node);
+        if (arg_type)
+        {
+            pos += type_mangle(arg_type, mangled_name + pos, sizeof(mangled_name) - pos);
+        }
+    }
+    
+    pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "E");
+
+    // 2. Check if already instantiated
+    Symbol *inst_sym = symbol_table_lookup(sema->root_table, mangled_name);
+    if (inst_sym && inst_sym->type)
+    {
+        return inst_sym->type;
+    }
+
+    // 3. Create scope with generic parameter bindings
+    SymbolTable *scope = symbol_table_create(sema->current_table);
+    SymbolTable *prev_table = sema->current_table;
+    
+    for (int i = 0; i < generic_params->count; i++)
+    {
+        AstNode *param_node = generic_params->items[i];
+        AstNode *arg_node = type_args->items[i];
+        if (param_node->kind == AST_TYPE_PARAM)
+        {
+            Type *arg_type = sema_resolve_type(sema, arg_node);
+            Symbol *type_sym = symbol_create(param_node->type_param.name, SYMBOL_TYPE, sema->module_path);
+            type_sym->type = arg_type;
+            symbol_table_insert(scope, type_sym);
+        }
+    }
+    
+    sema->current_table = scope;
+
+    // 4. Resolve fields with substituted types
+    AstList *fields_ast = is_struct ? decl->rec_stmt.fields : decl->uni_stmt.fields;
+    int field_count = fields_ast ? fields_ast->count : 0;
+    TypeField *fields = NULL;
+    
+    if (field_count > 0)
+    {
+        fields = malloc(sizeof(TypeField) * field_count);
+        if (!fields)
+        {
+            sema->current_table = prev_table;
+            return NULL;
+        }
+
+        for (int i = 0; i < field_count; i++)
+        {
+            AstNode *field_node = fields_ast->items[i];
+            if (field_node->kind != AST_STMT_FIELD)
+            {
+                free(fields);
+                sema->current_table = prev_table;
+                return NULL;
+            }
+
+            fields[i].name = strdup(field_node->field_stmt.name);
+            fields[i].type = sema_resolve_type(sema, field_node->field_stmt.type);
+            fields[i].offset = 0;
+
+            if (!fields[i].type)
+            {
+                for (int j = 0; j <= i; j++) free(fields[j].name);
+                free(fields);
+                sema->current_table = prev_table;
+                return NULL;
+            }
+        }
+    }
+    
+    sema->current_table = prev_table;
+
+    // 5. Create the instantiated type
+    Type *inst_type = is_struct 
+        ? type_create_struct(mangled_name, fields, field_count)
+        : type_create_union(mangled_name, fields, field_count);
+    
+    if (!inst_type)
+    {
+        if (fields)
+        {
+            for (int i = 0; i < field_count; i++) free(fields[i].name);
+            free(fields);
+        }
+        return NULL;
+    }
+
+    // 6. Create and register symbol for the instantiated type
+    inst_sym = symbol_create(mangled_name, SYMBOL_TYPE, sema->module_path);
+    inst_sym->type = inst_type;
+    inst_sym->decl = decl; // reference original declaration
+    symbol_table_insert(sema->root_table, inst_sym);
+
+    return inst_type;
 }
 
 // Instantiate a generic function with type arguments
