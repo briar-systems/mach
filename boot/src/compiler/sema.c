@@ -1341,17 +1341,27 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     }
 
     // 1. Generate mangled name for this instantiation
-    // Format: original_name + "_inst" + type_arg_names...
-    // This is a simplified mangling for now
-    char mangled_name[256];
-    snprintf(mangled_name, sizeof(mangled_name), "%s_inst", generic_sym->name);
+    // Itanium-style: <name>I<type_args>E
+    // e.g., identity[i64] -> identityI3i64E
+    char mangled_name[512];
+    int pos = snprintf(mangled_name, sizeof(mangled_name), "%s", generic_sym->name);
     
+    // start template args
+    pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "I");
+    
+    // resolve and mangle each type argument
     for (int i = 0; i < type_args->count; i++)
     {
-        // Append simplified type representation
-        // Ideally we should use a proper type mangler
-        strncat(mangled_name, "_T", sizeof(mangled_name) - strlen(mangled_name) - 1);
+        AstNode *arg_node = type_args->items[i];
+        Type *arg_type = sema_resolve_type(sema, arg_node);
+        if (arg_type)
+        {
+            pos += type_mangle(arg_type, mangled_name + pos, sizeof(mangled_name) - pos);
+        }
     }
+    
+    // end template args
+    pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "E");
 
     // 2. Check if already instantiated
     Symbol *inst = symbol_table_lookup(sema->root_table, mangled_name);
@@ -1390,7 +1400,7 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     SymbolTable *scope = symbol_table_create(sema->root_table);
     SymbolTable *prev_table = sema->current_table;
     
-    // Bind generic params
+    // Bind generic params (re-resolve types now that we've committed to instantiation)
     for (int i = 0; i < generic_params->count; i++)
     {
         AstNode *param_node = generic_params->items[i];

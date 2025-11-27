@@ -111,4 +111,9 @@ bool type_is_integer(Type *t);
 bool type_is_float(Type *t);
 bool type_is_numeric(Type *t);
 
+// type mangling (Itanium-style encoding for symbol names)
+// writes encoded type to buffer, returns number of chars written
+// buffer should be at least 256 bytes
+int type_mangle(Type *type, char *buffer, size_t buffer_size);
+
 #endif // TYPE_H

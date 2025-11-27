@@ -1,6 +1,7 @@
 #include "compiler/type.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 // primitive type singletons
 static Type primitive_types[11] = {0};
@@ -327,4 +328,141 @@ bool type_is_float(Type *t)
 bool type_is_numeric(Type *t)
 {
     return type_is_integer(t) || type_is_float(t);
+}
+
+// mangle a type into Itanium-style encoding
+// primitives: length-prefixed name (e.g., "3i64", "2u8")
+// pointers: P<type> for mutable, K<type> for const/readonly
+// arrays: A<count>_<elem_type>
+// structs/unions: length-prefixed name, with I...E for generic args
+// returns number of chars written (not including null terminator)
+int type_mangle(Type *type, char *buffer, size_t buffer_size)
+{
+    if (!type || !buffer || buffer_size == 0)
+    {
+        return 0;
+    }
+
+    int written = 0;
+    
+    switch (type->kind)
+    {
+    // primitives - use length-prefixed type names
+    case TYPE_U8:
+        written = snprintf(buffer, buffer_size, "2u8");
+        break;
+    case TYPE_U16:
+        written = snprintf(buffer, buffer_size, "3u16");
+        break;
+    case TYPE_U32:
+        written = snprintf(buffer, buffer_size, "3u32");
+        break;
+    case TYPE_U64:
+        written = snprintf(buffer, buffer_size, "3u64");
+        break;
+    case TYPE_I8:
+        written = snprintf(buffer, buffer_size, "2i8");
+        break;
+    case TYPE_I16:
+        written = snprintf(buffer, buffer_size, "3i16");
+        break;
+    case TYPE_I32:
+        written = snprintf(buffer, buffer_size, "3i32");
+        break;
+    case TYPE_I64:
+        written = snprintf(buffer, buffer_size, "3i64");
+        break;
+    case TYPE_F32:
+        written = snprintf(buffer, buffer_size, "3f32");
+        break;
+    case TYPE_F64:
+        written = snprintf(buffer, buffer_size, "3f64");
+        break;
+    case TYPE_PTR:
+        written = snprintf(buffer, buffer_size, "3ptr");
+        break;
+        
+    case TYPE_POINTER:
+    {
+        // P = mutable pointer, K = const/readonly pointer
+        char prefix = type->pointer.is_const ? 'K' : 'P';
+        written = snprintf(buffer, buffer_size, "%c", prefix);
+        if (written < (int)buffer_size && type->pointer.base)
+        {
+            written += type_mangle(type->pointer.base, buffer + written, buffer_size - written);
+        }
+        break;
+    }
+    
+    case TYPE_ARRAY:
+    {
+        // A<count>_<elem_type>
+        written = snprintf(buffer, buffer_size, "A%zu_", type->array.count);
+        if (written < (int)buffer_size && type->array.elem_type)
+        {
+            written += type_mangle(type->array.elem_type, buffer + written, buffer_size - written);
+        }
+        break;
+    }
+    
+    case TYPE_STRUCT:
+    {
+        // length-prefixed struct name
+        const char *name = type->structure.name ? type->structure.name : "anon";
+        size_t name_len = strlen(name);
+        written = snprintf(buffer, buffer_size, "%zu%s", name_len, name);
+        // note: generic args for structs would be appended by caller with I...E
+        break;
+    }
+    
+    case TYPE_UNION:
+    {
+        // length-prefixed union name
+        const char *name = type->union_type.name ? type->union_type.name : "anon";
+        size_t name_len = strlen(name);
+        written = snprintf(buffer, buffer_size, "%zu%s", name_len, name);
+        break;
+    }
+    
+    case TYPE_FUNCTION:
+    {
+        // F<return_type><param_types>E
+        written = snprintf(buffer, buffer_size, "F");
+        if (type->function.return_type && written < (int)buffer_size)
+        {
+            written += type_mangle(type->function.return_type, buffer + written, buffer_size - written);
+        }
+        else if (written < (int)buffer_size)
+        {
+            written += snprintf(buffer + written, buffer_size - written, "v"); // void
+        }
+        for (int i = 0; i < type->function.param_count && written < (int)buffer_size; i++)
+        {
+            if (type->function.param_types[i])
+            {
+                written += type_mangle(type->function.param_types[i], buffer + written, buffer_size - written);
+            }
+        }
+        if (written < (int)buffer_size)
+        {
+            written += snprintf(buffer + written, buffer_size - written, "E");
+        }
+        break;
+    }
+    
+    case TYPE_GENERIC_PARAM:
+    {
+        // should not appear in instantiated types, but handle gracefully
+        const char *name = type->generic_param.name ? type->generic_param.name : "T";
+        size_t name_len = strlen(name);
+        written = snprintf(buffer, buffer_size, "%zu%s", name_len, name);
+        break;
+    }
+    
+    default:
+        written = snprintf(buffer, buffer_size, "?");
+        break;
+    }
+    
+    return written;
 }

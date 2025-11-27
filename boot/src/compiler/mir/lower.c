@@ -1739,6 +1739,21 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
     }
 }
 
+// check if a symbol name contains Itanium-style template args (I...E pattern)
+static bool has_template_args(const char *name)
+{
+    if (!name) return false;
+    
+    const char *i_pos = strchr(name, 'I');
+    if (!i_pos) return false;
+    
+    // check there's content between I and E
+    const char *e_pos = strrchr(name, 'E');
+    if (!e_pos || e_pos <= i_pos + 1) return false;
+    
+    return true;
+}
+
 // helper to lower instantiated generic functions from symbol table
 static void lower_instantiated_generics(LowerContext *ctx, SymbolTable *table)
 {
@@ -1750,12 +1765,12 @@ static void lower_instantiated_generics(LowerContext *ctx, SymbolTable *table)
         // - kind is SYMBOL_FUNCTION
         // - is_generic is false (it's an instantiation, not a template)
         // - decl is set and is a function
-        // - name contains "_inst_" (instantiation marker)
+        // - name contains I...E pattern (Itanium-style template args)
         if (sym->kind == SYMBOL_FUNCTION && 
             !sym->is_generic && 
             sym->decl && 
             sym->decl->kind == AST_STMT_FUN &&
-            strstr(sym->name, "_inst_") != NULL)
+            has_template_args(sym->name))
         {
             lower_function(ctx, sym->decl);
         }
