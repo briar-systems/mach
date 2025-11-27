@@ -23,4 +23,7 @@ SymbolTable *sema_get_root_table(Sema *sema);
 int  sema_get_error_count(Sema *sema);
 void sema_print_errors(Sema *sema);
 
+// generic instantiation
+Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_args);
+
 #endif // SEMA_H

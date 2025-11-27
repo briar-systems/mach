@@ -20,6 +20,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind, const char *module_path
     symbol->decl = NULL;
     symbol->is_public = false;
     symbol->is_mutable = false;
+    symbol->is_generic = false;
     symbol->next = NULL;
 
     return symbol;

@@ -1739,7 +1739,30 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
     }
 }
 
-MIRModule *mir_lower_module(AstNode *ast_module)
+// helper to lower instantiated generic functions from symbol table
+static void lower_instantiated_generics(LowerContext *ctx, SymbolTable *table)
+{
+    if (!table) return;
+    
+    for (Symbol *sym = table->symbols; sym; sym = sym->next)
+    {
+        // look for function symbols that are instantiated generics:
+        // - kind is SYMBOL_FUNCTION
+        // - is_generic is false (it's an instantiation, not a template)
+        // - decl is set and is a function
+        // - name contains "_inst_" (instantiation marker)
+        if (sym->kind == SYMBOL_FUNCTION && 
+            !sym->is_generic && 
+            sym->decl && 
+            sym->decl->kind == AST_STMT_FUN &&
+            strstr(sym->name, "_inst_") != NULL)
+        {
+            lower_function(ctx, sym->decl);
+        }
+    }
+}
+
+MIRModule *mir_lower_module(AstNode *ast_module, SymbolTable *symbols)
 {
     if (!ast_module)
     {
@@ -1795,12 +1818,17 @@ MIRModule *mir_lower_module(AstNode *ast_module)
             }
         }
         
-        // Second pass: lower all functions
+        // Second pass: lower all non-generic functions
         for (int i = 0; i < stmts->count; i++)
         {
             AstNode *stmt = stmts->items[i];
             if (stmt->kind == AST_STMT_FUN)
             {
+                // skip generic template functions - they are instantiated on demand
+                if (stmt->fun_stmt.generics && stmt->fun_stmt.generics->count > 0)
+                {
+                    continue;
+                }
                 lower_stmt(ctx, stmt);
             }
         }
@@ -1814,6 +1842,12 @@ MIRModule *mir_lower_module(AstNode *ast_module)
                 lower_stmt(ctx, stmt);
             }
         }
+    }
+
+    // Fourth pass: lower instantiated generic functions from symbol table
+    if (symbols)
+    {
+        lower_instantiated_generics(ctx, symbols);
     }
 
     lower_context_destroy(ctx);

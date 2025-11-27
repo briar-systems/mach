@@ -26,6 +26,7 @@ typedef enum TypeKind
     TYPE_FUNCTION, // function type
     TYPE_STRUCT,   // record
     TYPE_UNION,    // union
+    TYPE_GENERIC_PARAM, // generic parameter (T)
 } TypeKind;
 
 typedef struct Type Type;
@@ -73,7 +74,23 @@ struct Type
             char *name;
             TypeField *fields;
             int field_count;
+            struct SymbolTable *methods; // methods associated with this type
         } structure;
+
+        // TYPE_UNION
+        struct
+        {
+            char *name;
+            TypeField *fields;
+            int field_count;
+            struct SymbolTable *methods; // methods associated with this type
+        } union_type;
+
+        // TYPE_GENERIC_PARAM
+        struct
+        {
+            char *name;
+        } generic_param;
     };
 };
 
@@ -85,6 +102,8 @@ Type *type_create_pointer(Type *base, bool is_const);
 Type *type_create_array(Type *elem_type, size_t count);
 Type *type_create_function(Type *return_type, Type **param_types, int param_count);
 Type *type_create_struct(const char *name, TypeField *fields, int field_count);
+Type *type_create_union(const char *name, TypeField *fields, int field_count);
+Type *type_create_generic_param(const char *name);
 
 // type checking
 bool type_equals(Type *a, Type *b);

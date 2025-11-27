@@ -269,7 +269,7 @@ int cmd_build_handle(int argc, char **argv)
     }
 
     // lower to MIR
-    MIRModule *mir = mir_lower_module(ast);
+    MIRModule *mir = mir_lower_module(ast, sema_get_root_table(sema));
     if (!mir)
     {
         fprintf(stderr, "error: lowering to MIR failed\n");

@@ -28,6 +28,7 @@ typedef struct Symbol
     AstNode       *decl;        // declaration node
     bool           is_public;   // pub qualifier
     bool           is_mutable;  // false for val, true for var
+    bool           is_generic;  // true if this is a generic template
     struct Symbol *next;        // for linked list in scope
 } Symbol;
 

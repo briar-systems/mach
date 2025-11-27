@@ -218,9 +218,90 @@ bool type_equals(Type *a, Type *b)
         }
         return true;
 
+    case TYPE_UNION:
+        // Nominal typing for unions
+        if (a->union_type.name && b->union_type.name)
+        {
+            return strcmp(a->union_type.name, b->union_type.name) == 0;
+        }
+        if (a->union_type.field_count != b->union_type.field_count)
+        {
+            return false;
+        }
+        for (int i = 0; i < a->union_type.field_count; i++)
+        {
+            if (!type_equals(a->union_type.fields[i].type, b->union_type.fields[i].type))
+            {
+                return false;
+            }
+        }
+        return true;
+
+    case TYPE_GENERIC_PARAM:
+        // Generic params are equal if they have the same name
+        return strcmp(a->generic_param.name, b->generic_param.name) == 0;
+
     default:
         return false;
     }
+}
+
+Type *type_create_union(const char *name, TypeField *fields, int field_count)
+{
+    Type *type = malloc(sizeof(Type));
+    if (!type)
+    {
+        return NULL;
+    }
+
+    type->kind = TYPE_UNION;
+    type->union_type.name = name ? strdup(name) : NULL;
+    type->union_type.fields = fields;
+    type->union_type.field_count = field_count;
+
+    // Union size is max of fields, alignment is max of fields
+    size_t size = 0;
+    size_t alignment = 1;
+
+    for (int i = 0; i < field_count; i++)
+    {
+        Type *field_type = fields[i].type;
+        if (field_type->size > size)
+        {
+            size = field_type->size;
+        }
+        if (field_type->alignment > alignment)
+        {
+            alignment = field_type->alignment;
+        }
+    }
+
+    // align total size
+    if (size % alignment != 0)
+    {
+        size += alignment - (size % alignment);
+    }
+
+    type->size = size;
+    type->alignment = alignment;
+
+    return type;
+}
+
+Type *type_create_generic_param(const char *name)
+{
+    Type *type = malloc(sizeof(Type));
+    if (!type)
+    {
+        return NULL;
+    }
+
+    type->kind = TYPE_GENERIC_PARAM;
+    type->size = 0; // unknown size until instantiated
+    type->alignment = 0;
+    type->generic_param.name = name ? strdup(name) : NULL;
+
+    return type;
 }
 
 bool type_is_integer(Type *t)

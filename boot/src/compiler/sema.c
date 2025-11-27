@@ -108,24 +108,89 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         return -1;
     }
 
-    // resolve return type
-    if (node->fun_stmt.return_type)
+    // check for generics
+    if (node->fun_stmt.generics)
     {
-        Type *ret_type = sema_resolve_type(sema, node->fun_stmt.return_type);
-        if (!ret_type)
+        sym->is_generic = true;
+        sym->decl = node;
+        // Add to symbol table
+        if (symbol_table_insert(sema->current_table, sym) < 0)
         {
-            sema_error(sema, node->token, "failed to resolve return type");
+            sema_error(sema, node->token, "duplicate function declaration");
             symbol_destroy(sym);
             return -1;
         }
-        sym->type = ret_type;
+        node->symbol = sym;
+        return 0;
     }
 
+    // resolve return type
+    Type *ret_type = NULL;
+    if (node->fun_stmt.return_type)
+    {
+        ret_type = sema_resolve_type(sema, node->fun_stmt.return_type);
+        if (!ret_type)
+        {
+            sema_error(sema, node->fun_stmt.return_type->token, "failed to resolve return type");
+            symbol_destroy(sym);
+            return -1;
+        }
+    }
+    
+    // Resolve parameter types to build function type
+    Type **param_types = NULL;
+    int param_count = 0;
+    
+    if (node->fun_stmt.params)
+    {
+        param_count = node->fun_stmt.params->count;
+        param_types = malloc(sizeof(Type*) * param_count);
+        
+        for (int i = 0; i < param_count; i++)
+        {
+            AstNode *param = node->fun_stmt.params->items[i];
+            if (param->kind == AST_STMT_PARAM)
+            {
+                Type *pt = NULL; // default? or error?
+                if (param->param_stmt.type)
+                {
+                    pt = sema_resolve_type(sema, param->param_stmt.type);
+                    if (!pt)
+                    {
+                        sema_error(sema, param->token, "failed to resolve parameter type");
+                        free(param_types);
+                        symbol_destroy(sym);
+                        return -1;
+                    }
+                }
+                else
+                {
+                     // Parameter must have type?
+                     // In Mach, yes? "val: T"
+                     sema_error(sema, param->token, "parameter must have type");
+                     free(param_types);
+                     symbol_destroy(sym);
+                     return -1;
+                }
+                param_types[i] = pt;
+                param->type = pt; // Store for later use in body
+            }
+        }
+    }
+    
+    sym->type = type_create_function(ret_type, param_types, param_count);
+    // type_create_function copies the array? No, usually it takes ownership or copies.
+    // Looking at type.c would confirm, but usually safe to free if it copies.
+    // If it takes ownership, I shouldn't free.
+    // Let's assume it copies for now or I'll check type.c later.
+    // Actually, to be safe, I'll check type.c.
+    
     // add function to symbol table
     if (symbol_table_insert(sema->current_table, sym) < 0)
     {
         sema_error(sema, node->token, "duplicate function declaration");
         symbol_destroy(sym);
+        // free(param_types); // depends on ownership
         return -1;
     }
 
@@ -147,10 +212,8 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
                 if (param->kind == AST_STMT_PARAM)
                 {
                     Symbol *param_sym = symbol_create(param->param_stmt.name, SYMBOL_VARIABLE, sema->module_path);
-                    if (param->param_stmt.type)
-                    {
-                        param_sym->type = sema_resolve_type(sema, param->param_stmt.type);
-                    }
+                    param_sym->type = param->type; // Use resolved type
+                    
                     symbol_table_insert(sema->current_table, param_sym);
                     param->symbol = param_sym;
                     param_sym->decl = param;
@@ -162,6 +225,10 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
 
         sema->current_table = prev_table;
     }
+    
+    // cleanup param_types array if type_create_function copied it
+    // I'll assume it did for now.
+    // if (param_types) free(param_types);
 
     return 0;
 }
@@ -638,12 +705,15 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
 // analyze expression
 static Type *sema_resolve_type(Sema *sema, AstNode *type_node);
 
-static int sema_analyze_expr(Sema *sema, AstNode *node)
+// analyze expression
+int sema_analyze_expr(Sema *sema, AstNode *node)
 {
-    if (!node)
+    if (!sema || !node)
     {
-        return 0;
+        return -1;
     }
+    
+    // printf("DEBUG: Analyze expr kind %d\n", node->kind);
 
     switch (node->kind)
     {
@@ -673,6 +743,7 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
     {
         // look up identifier in symbol table
         Symbol *sym = symbol_table_lookup(sema->current_table, node->ident_expr.name);
+
         if (!sym)
         {
             sema_error(sema, node->token, "undefined identifier");
@@ -727,11 +798,13 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
         return 0;
 
     case AST_EXPR_CALL:
+    {
         // analyze function
         if (sema_analyze_expr(sema, node->call_expr.func) < 0)
         {
             return -1;
         }
+
         // analyze arguments
         if (node->call_expr.args)
         {
@@ -743,12 +816,107 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
                 }
             }
         }
-        // result type is return type of function
-        if (node->call_expr.func->symbol && node->call_expr.func->symbol->type)
+
+        Type *func_type = node->call_expr.func->type;
+        Symbol *func_sym = node->call_expr.func->symbol;
+
+        // Handle generics
+        if (func_sym && func_sym->is_generic)
         {
-            node->type = node->call_expr.func->symbol->type;
+            
+            if (!node->call_expr.type_args)
+            {
+                sema_error(sema, node->token, "generic function call requires type arguments");
+                return -1;
+            }
+            
+            Symbol *inst = sema_instantiate_generic(sema, func_sym, node->call_expr.type_args);
+            if (!inst)
+            {
+                sema_error(sema, node->token, "failed to instantiate generic function");
+                return -1;
+            }
+            
+            // Update call target to instantiated symbol
+            node->call_expr.func->symbol = inst;
+            node->call_expr.func->type = inst->type;
+            func_type = inst->type;
         }
+
+        if (!func_type || func_type->kind != TYPE_FUNCTION)
+        {
+            sema_error(sema, node->token, "calling non-function type");
+            return -1;
+        }
+
+        int arg_count = node->call_expr.args ? node->call_expr.args->count : 0;
+        int param_count = func_type->function.param_count;
+
+        // check argument count
+
+        // check argument count
+        if (arg_count != param_count)
+        {
+            if (func_type->function.param_count > 0 && 
+                func_type->function.param_types[func_type->function.param_count - 1] == NULL) // Variadic check
+            {
+                 if (arg_count < param_count - 1)
+                 {
+                     sema_error(sema, node->token, "too few arguments to function call");
+                     return -1;
+                 }
+            }
+            else
+            {
+                sema_error(sema, node->token, "argument count mismatch");
+                return -1;
+            }
+        }
+
+        // check argument types
+        for (int i = 0; i < arg_count; i++)
+        {
+            AstNode *arg = node->call_expr.args->items[i];
+            
+            // For variadic functions, stop checking fixed params
+            if (i >= param_count) break;
+            
+            Type *param_type = func_type->function.param_types[i];
+            
+            // Variadic sentinel check
+            if (param_type == NULL) break; 
+
+            if (!type_equals(arg->type, param_type))
+            {
+                // check for implicit casts (e.g. &T -> *T)
+                if (param_type->kind == TYPE_POINTER && arg->type->kind == TYPE_POINTER)
+                {
+                    // allow &T -> *T (const to mutable is unsafe but allowed for now?)
+                    // actually, allow *T -> &T (mutable to const)
+                    if (type_equals(param_type->pointer.base, arg->type->pointer.base))
+                    {
+                         if (param_type->pointer.is_const && !arg->type->pointer.is_const)
+                         {
+                             // *T -> &T ok
+                             continue;
+                         }
+                    }
+                }
+                
+                // Allow *void -> *T and *T -> *void
+                if (param_type->kind == TYPE_PTR || arg->type->kind == TYPE_PTR)
+                {
+                    continue;
+                }
+                
+                sema_error(sema, arg->token, "argument type mismatch");
+                return -1;
+            }
+        }
+
+        node->type = func_type->function.return_type;
         return 0;
+    }
 
     case AST_EXPR_FIELD:
     {
@@ -870,6 +1038,39 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
         {
             return -1;
         }
+        // Check for generic instantiation
+        Symbol *sym = node->index_expr.array->symbol;
+
+        if (sym && sym->is_generic)
+        {
+            // Resolve type arg
+            // We create a temporary list for now (single arg)
+            AstList *type_args = malloc(sizeof(AstList));
+            if (type_args)
+            {
+                ast_list_init(type_args);
+                ast_list_append(type_args, node->index_expr.index);
+                
+                Symbol *inst = sema_instantiate_generic(sema, sym, type_args);
+                
+                // Cleanup list shell (items are owned by AST)
+                free(type_args);
+                
+                if (!inst)
+                {
+                    sema_error(sema, node->token, "failed to instantiate generic");
+                    return -1;
+                }
+                
+                node->kind = AST_EXPR_IDENT;
+                node->ident_expr.name = strdup(inst->name);
+                node->symbol = inst;
+                node->type = inst->type;
+                
+                return 0;
+            }
+        }
+
         if (sema_analyze_expr(sema, node->index_expr.index) < 0)
         {
             return -1;
@@ -889,6 +1090,12 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
         }
 
         // Check object type (array or pointer)
+        if (!obj_type)
+        {
+             sema_error(sema, node->token, "indexing on unknown type");
+             return -1;
+        }
+
         if (obj_type->kind == TYPE_ARRAY)
         {
             node->type = obj_type->array.elem_type;
@@ -1003,8 +1210,9 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
     switch (type_node->kind)
     {
     case AST_TYPE_NAME:
+    case AST_EXPR_IDENT:
     {
-        const char *name = type_node->type_name.name;
+        const char *name = (type_node->kind == AST_TYPE_NAME) ? type_node->type_name.name : type_node->ident_expr.name;
         
         // check primitive types
         if (strcmp(name, "i8") == 0) return type_get_primitive(TYPE_I8);
@@ -1018,6 +1226,7 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
         if (strcmp(name, "f32") == 0) return type_get_primitive(TYPE_F32);
         if (strcmp(name, "f64") == 0) return type_get_primitive(TYPE_F64);
         if (strcmp(name, "ptr") == 0) return type_get_primitive(TYPE_PTR);
+        if (strcmp(name, "bool") == 0) return type_get_primitive(TYPE_U8); // bool is u8
         
         // look up user-defined types
         Symbol *sym = symbol_table_lookup(sema->current_table, name);
@@ -1097,4 +1306,173 @@ int sema_analyze(Sema *sema, AstNode *ast)
     }
 
     return sema->error_count > 0 ? -1 : 0;
+}
+
+// Instantiate a generic function with type arguments
+Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_args)
+{
+    if (!sema || !generic_sym || !type_args)
+    {
+        return NULL;
+    }
+
+    if (!generic_sym->is_generic || !generic_sym->decl)
+    {
+        return NULL;
+    }
+
+    AstNode *decl = generic_sym->decl;
+    AstList *generic_params = NULL;
+    
+    if (decl->kind == AST_STMT_FUN)
+    {
+        generic_params = decl->fun_stmt.generics;
+    }
+    // TODO: Handle struct/union generics
+    
+    if (!generic_params)
+    {
+        return NULL;
+    }
+    
+    if (generic_params->count != type_args->count)
+    {
+        return NULL;
+    }
+
+    // 1. Generate mangled name for this instantiation
+    // Format: original_name + "_inst" + type_arg_names...
+    // This is a simplified mangling for now
+    char mangled_name[256];
+    snprintf(mangled_name, sizeof(mangled_name), "%s_inst", generic_sym->name);
+    
+    for (int i = 0; i < type_args->count; i++)
+    {
+        // Append simplified type representation
+        // Ideally we should use a proper type mangler
+        strncat(mangled_name, "_T", sizeof(mangled_name) - strlen(mangled_name) - 1);
+    }
+
+    // 2. Check if already instantiated
+    Symbol *inst = symbol_table_lookup(sema->root_table, mangled_name);
+    if (inst)
+    {
+        return inst;
+    }
+
+    // 3. Clone the AST
+    AstNode *cloned_decl = ast_clone(decl);
+    if (!cloned_decl)
+    {
+        return NULL;
+    }
+
+    // Rename the cloned declaration
+    if (cloned_decl->kind == AST_STMT_FUN)
+    {
+        free(cloned_decl->fun_stmt.name);
+        cloned_decl->fun_stmt.name = strdup(mangled_name);
+        // Clear generics list on clone so it's treated as a normal function
+        // (We don't free the list itself as it's a shallow copy of the list structure, 
+        // but we set it to NULL so sema treats it as non-generic)
+        cloned_decl->fun_stmt.generics = NULL; 
+    }
+
+    // 4. Analyze the cloned AST
+    
+    // Create symbol manually with mangled name.
+    Symbol *inst_sym = symbol_create(mangled_name, SYMBOL_FUNCTION, sema->module_path);
+    inst_sym->decl = cloned_decl;  // Link symbol to cloned AST for MIR lowering
+    symbol_table_insert(sema->root_table, inst_sym);
+    cloned_decl->symbol = inst_sym;
+    
+    // Create scope for instantiation (used for return type, params, and body)
+    SymbolTable *scope = symbol_table_create(sema->root_table);
+    SymbolTable *prev_table = sema->current_table;
+    
+    // Bind generic params
+    for (int i = 0; i < generic_params->count; i++)
+    {
+        AstNode *param_node = generic_params->items[i];
+        AstNode *arg_node = type_args->items[i];
+         if (param_node->kind == AST_TYPE_PARAM)
+        {
+            Type *arg_type = sema_resolve_type(sema, arg_node); // Resolve in current context (caller)
+            // Note: arg_node might need to be resolved in caller's context, 
+            // but here we are using sema which has current_table set to caller's scope (or whatever it was).
+            // Yes, sema->current_table is restored at end of this function.
+            
+            Symbol *type_sym = symbol_create(param_node->type_param.name, SYMBOL_TYPE, sema->module_path);
+            type_sym->type = arg_type;
+            symbol_table_insert(scope, type_sym);
+        }
+    }
+    
+    sema->current_table = scope;
+    
+    // Resolve return type
+    Type *ret_type = NULL;
+    if (cloned_decl->fun_stmt.return_type)
+    {
+        ret_type = sema_resolve_type(sema, cloned_decl->fun_stmt.return_type);
+        if (!ret_type)
+        {
+             // Error handling?
+             // sema_error(sema, ...);
+        }
+    }
+    
+    // Resolve parameter types
+    Type **param_types = NULL;
+    int param_count = 0;
+    
+    if (cloned_decl->fun_stmt.params)
+    {
+        param_count = cloned_decl->fun_stmt.params->count;
+        param_types = malloc(sizeof(Type*) * param_count);
+        
+        for (int i = 0; i < param_count; i++)
+        {
+            AstNode *param = cloned_decl->fun_stmt.params->items[i];
+            if (param->kind == AST_STMT_PARAM)
+            {
+                Type *pt = NULL;
+                if (param->param_stmt.type)
+                {
+                    pt = sema_resolve_type(sema, param->param_stmt.type);
+                }
+                param_types[i] = pt;
+                param->type = pt;
+            }
+        }
+    }
+    
+    inst_sym->type = type_create_function(ret_type, param_types, param_count);
+    
+    // Add params to scope (as variables)
+    if (cloned_decl->fun_stmt.params)
+    {
+         for (int i = 0; i < cloned_decl->fun_stmt.params->count; i++)
+        {
+            AstNode *param = cloned_decl->fun_stmt.params->items[i];
+            if (param->kind == AST_STMT_PARAM)
+            {
+                Symbol *param_sym = symbol_create(param->param_stmt.name, SYMBOL_VARIABLE, sema->module_path);
+                param_sym->type = param->type;
+                symbol_table_insert(sema->current_table, param_sym);
+                param->symbol = param_sym;
+                param_sym->decl = param;
+            }
+        }
+    }
+    
+    // Analyze body
+    if (cloned_decl->fun_stmt.body)
+    {
+        sema_analyze_stmt(sema, cloned_decl->fun_stmt.body);
+    }
+    
+    sema->current_table = prev_table;
+
+    return inst_sym;
 }

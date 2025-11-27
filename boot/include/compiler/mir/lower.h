@@ -3,11 +3,12 @@
 
 #include "compiler/ast.h"
 #include "compiler/mir/module.h"
+#include "compiler/symbol.h"
 
 // lowers high-level mach ast to ssa mir
 
 // lowering entry points
-MIRModule   *mir_lower_module(AstNode *ast_module);
+MIRModule   *mir_lower_module(AstNode *ast_module, SymbolTable *symbols);
 MIRFunction *mir_lower_function(AstNode *ast_function);
 MIRGlobal   *mir_lower_global(AstNode *ast_var);
 
