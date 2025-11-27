@@ -1491,11 +1491,9 @@ static AstNode *parser_parse_var_decl(Parser *parser, bool is_val, bool is_publi
     }
     else if (parser_match(parser, TOKEN_EQUAL))
     {
-        printf("DEBUG: Found =. Parsing init expr. Current token: %s\n", token_kind_to_string(parser->current->kind));
         node->var_stmt.init = parser_parse_expr(parser);
         if (!node->var_stmt.init)
         {
-            printf("DEBUG: Failed to parse init expr\n");
             parser_error_at_current(parser, "expected expression after '='");
             ast_node_dnit(node);
             free(node);

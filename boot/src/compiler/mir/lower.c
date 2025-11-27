@@ -182,13 +182,11 @@ static int32_t lower_context_get_stack_offset(LowerContext *ctx, AstNode *node)
     {
         if (ctx->stack_slots[i].node == node)
         {
-            printf("GET_OFFSET: found node %p at offset %d\n", (void*)node, ctx->stack_slots[i].offset);
             return ctx->stack_slots[i].offset;
         }
     }
     
-    printf("GET_OFFSET: node %p NOT FOUND, returning 0\n", (void*)node);
-    return 0; // Not found
+    return 0; // Not found (probably a global variable)
 }
 
 // forward declarations
@@ -1125,7 +1123,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                 if (!local_val)
                 {
                     // not a local, must be a global
-                    // Load global address
+                    // Get address of global
                     MIRValue *addr = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
                     MIRInst *mov = mir_inst_create(MIR_OP_MOV, NULL);
                     const char *sym_name = symbol_get_linkage_name(node->symbol);
@@ -1133,25 +1131,10 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                     mir_inst_set_result(mov, addr);
                     mir_block_append_inst(ctx->current_block, mov);
                     
-                    // Load value from global (unless it's a large struct)
-                    if (node->type && node->type->size > 8)
-                    {
-                        // For large structs, return address directly
-                        lower_context_map_value(ctx, node, addr);
-                        return addr;
-                    }
-                    else
-                    {
-                        // For primitives and small values, load the value
-                        MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "global_val");
-                        MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
-                        mir_inst_add_operand(load, mir_operand_value(addr->id));
-                        mir_inst_set_result(load, result);
-                        mir_block_append_inst(ctx->current_block, load);
-                        
-                        lower_context_map_value(ctx, node, result);
-                        return result;
-                    }
+                    // For globals, return the address directly (no automatic dereferencing)
+                    // The user must explicitly dereference if they want the value
+                    lower_context_map_value(ctx, node, addr);
+                    return addr;
                 }
                 else
                 {
@@ -1620,6 +1603,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         case TOKEN_MINUS: op = MIR_OP_SUB; break;
         case TOKEN_STAR:  op = MIR_OP_MUL; break;
         case TOKEN_SLASH: op = MIR_OP_DIV; break;
+        case TOKEN_PERCENT: op = MIR_OP_MOD; break;
         case TOKEN_EQUAL_EQUAL: op = MIR_OP_EQ; break;
         case TOKEN_BANG_EQUAL: op = MIR_OP_NE; break;
         case TOKEN_LESS:    op = MIR_OP_LT; break;
@@ -1801,9 +1785,34 @@ MIRModule *mir_lower_module(AstNode *ast_module)
 
     if (stmts)
     {
+        // First pass: lower all globals (variables)
         for (int i = 0; i < stmts->count; i++)
         {
-            lower_stmt(ctx, stmts->items[i]);
+            AstNode *stmt = stmts->items[i];
+            if (stmt->kind == AST_STMT_VAR || stmt->kind == AST_STMT_VAL)
+            {
+                lower_stmt(ctx, stmt);
+            }
+        }
+        
+        // Second pass: lower all functions
+        for (int i = 0; i < stmts->count; i++)
+        {
+            AstNode *stmt = stmts->items[i];
+            if (stmt->kind == AST_STMT_FUN)
+            {
+                lower_stmt(ctx, stmt);
+            }
+        }
+        
+        // Third pass: lower everything else (types, etc.)
+        for (int i = 0; i < stmts->count; i++)
+        {
+            AstNode *stmt = stmts->items[i];
+            if (stmt->kind != AST_STMT_VAR && stmt->kind != AST_STMT_VAL && stmt->kind != AST_STMT_FUN)
+            {
+                lower_stmt(ctx, stmt);
+            }
         }
     }
 
@@ -1865,7 +1874,7 @@ MIRGlobal *mir_lower_global(AstNode *ast_var)
     return global;
 }
 
-// simple inline MIR parser for basic instructions
+// simple inline MIR parser
 int mir_parse_inline_block(LowerContext *ctx, MIRFunction *func, MIRBlock *current_block, const char *mir_text)
 {
     if (!func || !current_block || !mir_text)
@@ -1873,226 +1882,317 @@ int mir_parse_inline_block(LowerContext *ctx, MIRFunction *func, MIRBlock *curre
         return -1;
     }
     
-    // parse SSA-style inline MIR with immediates as operands
     const char *p = mir_text;
+    
+    // Map for local SSA values within the block: name -> value_id
+    // Simple fixed-size map for now
+    struct {
+        char *name;
+        uint32_t id;
+    } local_values[64];
+    int local_value_count = 0;
     
     while (*p)
     {
         // skip whitespace
-        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
-        {
-            p++;
-        }
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '\0') break;
         
-        if (*p == '\0')
+        // Check for assignment: %name = ...
+        char *dest_name = NULL;
+        if (*p == '%')
         {
-            break;
-        }
-        
-        // parse instruction
-        if (strncmp(p, "syscall(", 8) == 0)
-        {
-            // SSA-style: syscall(60, 42) - immediates directly as operands
-            p += 8;
+            const char *start = p;
+            while (*p && *p != ' ' && *p != '=' && *p != '\t') p++;
             
-            MIRInst *inst = mir_inst_create(MIR_OP_SYSCALL, NULL);
+            // Check if it's an assignment
+            const char *check = p;
+            while (*check == ' ' || *check == '\t') check++;
             
-            // parse arguments
-            while (*p && *p != ')')
+            if (*check == '=')
             {
-                while (*p == ' ' || *p == '\t' || *p == ',')
-                {
-                    p++;
-                }
-                
+                int len = p - start;
+                dest_name = malloc(len + 1);
+                memcpy(dest_name, start, len);
+                dest_name[len] = '\0';
+                p = check + 1; // skip =
+                while (*p == ' ' || *p == '\t') p++;
+            }
+            else
+            {
+                // Not an assignment, reset
+                p = start;
+            }
+        }
+        
+        // Parse opcode
+        const char *op_start = p;
+        while (*p && (*p >= 'a' && *p <= 'z')) p++;
+        int op_len = p - op_start;
+        char op_name[32];
+        if (op_len >= 32) op_len = 31;
+        memcpy(op_name, op_start, op_len);
+        op_name[op_len] = '\0';
+        
+        MIROp op = MIR_OP_ADD; // default/invalid
+        if (strcmp(op_name, "syscall") == 0) op = MIR_OP_SYSCALL;
+        else if (strcmp(op_name, "store") == 0) op = MIR_OP_STORE;
+        else if (strcmp(op_name, "load") == 0) op = MIR_OP_LOAD;
+        else if (strcmp(op_name, "ret") == 0) op = MIR_OP_RET;
+        else if (strcmp(op_name, "mov") == 0) op = MIR_OP_MOV;
+        else if (strcmp(op_name, "add") == 0) op = MIR_OP_ADD;
+        else if (strcmp(op_name, "sub") == 0) op = MIR_OP_SUB;
+        else if (strcmp(op_name, "mul") == 0) op = MIR_OP_MUL;
+        else if (strcmp(op_name, "div") == 0) op = MIR_OP_DIV;
+        else if (strcmp(op_name, "addr") == 0) op = MIR_OP_ADDR;
+        
+        MIRInst *inst = mir_inst_create(op, NULL);
+        
+        // Parse operands
+        // Expect operands separated by comma or space, possibly in parens?
+        // The example used `syscall(1, ...)` but `store %val, %ptr`.
+        // Let's support both: optional parens, comma/space separators.
+        
+        if (*p == '(') p++;
+        
+        while (*p && *p != ')' && *p != ';' && *p != '\n')
+        {
+            while (*p == ' ' || *p == '\t' || *p == ',') p++;
+            if (*p == '\0' || *p == ')' || *p == ';' || *p == '\n') break;
+            
+            if (*p == '%')
+            {
+                // SSA value or parameter
+                const char *start = p;
+                p++;
                 if (*p >= '0' && *p <= '9')
                 {
-                    int64_t value = atoll(p);
-                    mir_inst_add_operand(inst, mir_operand_imm_int(value));
-                    
-                    while (*p >= '0' && *p <= '9')
-                    {
-                        p++;
-                    }
-                }
-                else if (*p == '%')
-                {
-                    // SSA value: %0, %1, etc. - refers to function parameters
-                    p++;
+                    // %0, %1 -> function parameters - need to load from stack
                     int param_idx = atoi(p);
+                    while (*p >= '0' && *p <= '9') p++;
                     
-                    // Map %N to the Nth function parameter's value ID
                     if (param_idx >= 0 && param_idx < (int)func->param_count && func->params[param_idx])
                     {
-                        mir_inst_add_operand(inst, mir_operand_value(func->params[param_idx]->id));
-                    }
-                    else
-                    {
-                        // Invalid parameter reference, use 0 as fallback
-                        mir_inst_add_operand(inst, mir_operand_value(0));
-                    }
-                    
-                    while (*p >= '0' &&  *p <= '9')
-                    {
-                        p++;
-                    }
-                }
-                else if (*p == '@')
-                {
-                    // global reference: @name
-                    p++;
-                    const char *name_start = p;
-                    while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || 
-                                 (*p >= '0' && *p <= '9') || *p == '_'))
-                    {
-                        p++;
-                    }
-                    
-                    // copy name
-                    int name_len = p - name_start;
-                    char *name = malloc(name_len + 1);
-                    memcpy(name, name_start, name_len);
-                    name[name_len] = '\0';
-                    
-                    mir_inst_add_operand(inst, mir_operand_global(name));
-                }
-                else if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_')
-                {
-                    // identifier (local variable)
-                    const char *name_start = p;
-                    while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || 
-                                 (*p >= '0' && *p <= '9') || *p == '_'))
-                    {
-                        p++;
-                    }
-                    
-                    int name_len = p - name_start;
-                    char *name = malloc(name_len + 1);
-                    memcpy(name, name_start, name_len);
-                    name[name_len] = '\0';
-                    
-                    // Look up stack offset
-                    int32_t offset = 0;
-                    if (ctx && ctx->stack_slots)
-                    {
-                        for (int i = 0; i < ctx->stack_slot_count; i++)
+                        // Parameters are spilled to stack, so we need to load them
+                        // Find the parameter's stack slot
+                        int32_t offset = 0;
+                        if (ctx && ctx->stack_slots)
                         {
-                            if (!ctx->stack_slots[i].node) continue;
-                            
-                            const char *slot_name = NULL;
-                            if (ctx->stack_slots[i].node->kind == AST_STMT_VAR || 
-                                ctx->stack_slots[i].node->kind == AST_STMT_VAL)
+                            // Parameters are at the beginning of stack_slots
+                            // stack_slots[0] is param 0, stack_slots[1] is param 1, etc.
+                            if (param_idx < ctx->stack_slot_count)
                             {
-                                slot_name = ctx->stack_slots[i].node->var_stmt.name;
-                            }
-                            else if (ctx->stack_slots[i].node->kind == AST_STMT_PARAM)
-                            {
-                                slot_name = ctx->stack_slots[i].node->param_stmt.name;
-                            }
-                            
-                            if (slot_name && strcmp(slot_name, name) == 0)
-                            {
-                                offset = ctx->stack_slots[i].offset;
-                                break;
+                                offset = ctx->stack_slots[param_idx].offset;
                             }
                         }
-                    }
-                    
-                    if (offset != 0)
-                    {
-                        // Generate LOAD
-                        MIRValue *val = mir_function_alloc_value(func, NULL, "inline_load");
-                        MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
-                        mir_inst_add_operand(load, mir_operand_imm_int(offset));
-                        mir_inst_set_result(load, val);
-                        mir_block_append_inst(current_block, load);
                         
-                        mir_inst_add_operand(inst, mir_operand_value(val->id));
-                        free(name); // name not needed for value operand
+                        if (offset != 0)
+                        {
+                            // Generate a LOAD instruction to read the parameter from its stack slot
+                            MIRValue *loaded = mir_function_alloc_value(func, NULL, "param_load");
+                            MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
+                            mir_inst_add_operand(load, mir_operand_imm_int(offset));
+                            mir_inst_set_result(load, loaded);
+                            mir_block_append_inst(current_block, load);
+                            
+                            mir_inst_add_operand(inst, mir_operand_value(loaded->id));
+                        }
+                        else
+                        {
+                            // Fallback: use the parameter value directly (might not work)
+                            mir_inst_add_operand(inst, mir_operand_value(func->params[param_idx]->id));
+                        }
                     }
                     else
                     {
-                        // Not found locally, assume global reference
-                        mir_inst_add_operand(inst, mir_operand_global(name));
+                        mir_inst_add_operand(inst, mir_operand_value(0));
                     }
-                }
-                else if (*p == ')')
-                {
-                    break;
                 }
                 else
                 {
-                    p++;
+                    // Named SSA value: %name
+                    while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || 
+                                 (*p >= '0' && *p <= '9') || *p == '_')) p++;
+                    
+                    int len = p - start;
+                    char *name = malloc(len + 1);
+                    memcpy(name, start, len);
+                    name[len] = '\0';
+                    
+                    // Look up in local values
+                    uint32_t id = 0;
+                    for (int i = 0; i < local_value_count; i++)
+                    {
+                        if (strcmp(local_values[i].name, name) == 0)
+                        {
+                            id = local_values[i].id;
+                            break;
+                        }
+                    }
+                    
+                    // Also check parameters by name?
+                    if (id == 0)
+                    {
+                         for (size_t i = 0; i < func->param_count; i++)
+                         {
+                             // Param names don't have %, but we might use %param
+                             if (func->params[i] && func->params[i]->name && 
+                                 strcmp(func->params[i]->name, name + 1) == 0)
+                             {
+                                 id = func->params[i]->id;
+                                 break;
+                             }
+                         }
+                    }
+                    
+                    mir_inst_add_operand(inst, mir_operand_value(id));
+                    free(name);
                 }
             }
-            
-            if (*p == ')')
+            else if (*p == '@')
             {
+                // Global - need to find the mangled name
                 p++;
-            }
-            
-            mir_block_append_inst(current_block, inst);
-        }
-        else if (strncmp(p, "ret", 3) == 0)
-        {
-            p += 3;
-            
-            while (*p == ' ' || *p == '\t')
-            {
-                p++;
-            }
-            
-            if (*p == '\n' || *p == '\0' || *p == ';')
-            {
-                // ret void
-                MIRInst *inst = mir_inst_ret_void();
-                mir_block_append_inst(current_block, inst);
-            }
-            else if (*p >= '0' && *p <= '9')
-            {
-                // ret with immediate - materialize it
-                int64_t value = atoll(p);
-                MIRValue *result = mir_function_alloc_value(func, NULL, "const");
-                MIRInst *const_inst = mir_inst_const(NULL, value);
-                mir_inst_set_result(const_inst, result);
-                mir_block_append_inst(current_block, const_inst);
+                const char *start = p;
+                while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || 
+                             (*p >= '0' && *p <= '9') || *p == '_')) p++;
+                int len = p - start;
+                char *name = malloc(len + 1);
+                memcpy(name, start, len);
+                name[len] = '\0';
                 
-                MIRInst *ret_inst = mir_inst_ret(NULL, mir_operand_value(result->id));
-                mir_block_append_inst(current_block, ret_inst);
-                
-                while (*p >= '0' && *p <= '9')
+                // Look up the global in the module to get its mangled name
+                const char *mangled_name = NULL;
+                if (ctx && ctx->module)
                 {
-                    p++;
+                    for (MIRGlobal *g = ctx->module->globals; g; g = g->next)
+                    {
+                        // Check if the mangled name contains the unmangled name
+                        if (strstr(g->name, name) != NULL)
+                        {
+                            mangled_name = g->name;
+                            break;
+                        }
+                    }
                 }
-            }
-            else if (*p == '%')
-            {
-                // ret with SSA value
-                p++;
-                int val_id = atoi(p);
-                MIRInst *inst = mir_inst_ret(NULL, mir_operand_value(val_id));
-                mir_block_append_inst(current_block, inst);
                 
-                while (*p >= '0' && *p <= '9')
-                {
-                    p++;
-                }
+                // Use the mangled name if found, otherwise use the original name
+                mir_inst_add_operand(inst, mir_operand_global(mangled_name ? mangled_name : name));
+                free(name);
             }
-        }
-        else
-        {
-            // skip unknown instruction
-            while (*p && *p != '\n')
+            else if ((*p >= '0' && *p <= '9') || *p == '-')
             {
-                p++;
+                // Integer literal
+                int64_t val = atoll(p);
+                if (*p == '-') p++;
+                while (*p >= '0' && *p <= '9') p++;
+                mir_inst_add_operand(inst, mir_operand_imm_int(val));
+            }
+            else if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_')
+            {
+                // Identifier (local variable)
+                const char *start = p;
+                while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || 
+                             (*p >= '0' && *p <= '9') || *p == '_')) p++;
+                int len = p - start;
+                char *name = malloc(len + 1);
+                memcpy(name, start, len);
+                name[len] = '\0';
+                
+                // Look up stack offset
+                int32_t offset = 0;
+                if (ctx && ctx->stack_slots)
+                {
+                    for (int i = 0; i < ctx->stack_slot_count; i++)
+                    {
+                        if (!ctx->stack_slots[i].node) continue;
+                        const char *slot_name = NULL;
+                        if (ctx->stack_slots[i].node->kind == AST_STMT_VAR || 
+                            ctx->stack_slots[i].node->kind == AST_STMT_VAL)
+                            slot_name = ctx->stack_slots[i].node->var_stmt.name;
+                        else if (ctx->stack_slots[i].node->kind == AST_STMT_PARAM)
+                            slot_name = ctx->stack_slots[i].node->param_stmt.name;
+                        
+                        if (slot_name && strcmp(slot_name, name) == 0)
+                        {
+                            offset = ctx->stack_slots[i].offset;
+                            break;
+                        }
+                    }
+                }
+                
+                if (offset != 0)
+                {
+                    // Load address or value?
+                    // For 'store %val, var', var is address.
+                    // For 'mov %val, var', var is value (load).
+                    // This is ambiguous.
+                    // Convention: identifiers in MIR block refer to the VALUE of the variable (LOAD).
+                    // If we want address, we should use specific syntax or context.
+                    // But for 'store %val, %ptr', %ptr is address.
+                    // If we do 'store %val, var', we probably mean store to var's address.
+                    
+                    // However, 'store' takes (value, address).
+                    // If second operand is identifier, we want its address.
+                    // If first operand is identifier, we want its value.
+                    
+                    // Let's implement a heuristic:
+                    // Always emit LOAD for identifier.
+                    // If we need address, we should have used `addr var` or similar?
+                    // Or maybe we check opcode?
+                    
+                    // For simplicity: Emit LOAD.
+                    // If user wants address, they should use `&var` (not supported yet) or `alloca`.
+                    
+                    MIRValue *val = mir_function_alloc_value(func, NULL, "inline_load");
+                    MIRInst *load = mir_inst_create(MIR_OP_LOAD, NULL);
+                    mir_inst_add_operand(load, mir_operand_imm_int(offset));
+                    mir_inst_set_result(load, val);
+                    mir_block_append_inst(current_block, load);
+                    
+                    mir_inst_add_operand(inst, mir_operand_value(val->id));
+                }
+                else
+                {
+                    // Global?
+                    mir_inst_add_operand(inst, mir_operand_global(name));
+                }
+                free(name);
+            }
+            else
+            {
+                p++; // skip unknown
             }
         }
         
-        // skip optional semicolon
-        if (*p == ';')
+        if (*p == ')') p++;
+        if (*p == ';') p++;
+        
+        // Handle result assignment
+        if (dest_name)
         {
-            p++;
+            MIRValue *res = mir_function_alloc_value(func, NULL, dest_name);
+            mir_inst_set_result(inst, res);
+            
+            if (local_value_count < 64)
+            {
+                local_values[local_value_count].name = dest_name;
+                local_values[local_value_count].id = res->id;
+                local_value_count++;
+            }
+            else
+            {
+                free(dest_name);
+            }
         }
+        
+        mir_block_append_inst(current_block, inst);
+    }
+    
+    // cleanup
+    for (int i = 0; i < local_value_count; i++)
+    {
+        free(local_values[i].name);
     }
     
     return 0;

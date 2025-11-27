@@ -32,4 +32,7 @@ char *find_project_root(const char *start_path);
 bool  is_mach_file(const char *path);
 char *get_base_filename(const char *path);
 
+// helper
+bool is_sep(char c);
+
 #endif

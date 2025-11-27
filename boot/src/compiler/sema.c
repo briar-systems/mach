@@ -11,9 +11,10 @@ struct Sema
     SymbolTable *root_table;
     SymbolTable *current_table;
     int          error_count;
+    char        *module_path;
 };
 
-Sema *sema_create()
+Sema *sema_create(const char *module_path)
 {
     Sema *sema = malloc(sizeof(Sema));
     if (!sema)
@@ -24,6 +25,7 @@ Sema *sema_create()
     sema->root_table = symbol_table_create(NULL);
     sema->current_table = sema->root_table;
     sema->error_count = 0;
+    sema->module_path = module_path ? strdup(module_path) : NULL;
 
     return sema;
 }
@@ -38,6 +40,10 @@ void sema_destroy(Sema *sema)
     if (sema->root_table)
     {
         symbol_table_destroy(sema->root_table);
+    }
+    if (sema->module_path)
+    {
+        free(sema->module_path);
     }
 
     free(sema);
@@ -96,7 +102,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
     }
 
     // create symbol for function
-    Symbol *sym = symbol_create(node->fun_stmt.name, SYMBOL_FUNCTION);
+    Symbol *sym = symbol_create(node->fun_stmt.name, SYMBOL_FUNCTION, sema->module_path);
     if (!sym)
     {
         return -1;
@@ -140,7 +146,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
                 AstNode *param = node->fun_stmt.params->items[i];
                 if (param->kind == AST_STMT_PARAM)
                 {
-                    Symbol *param_sym = symbol_create(param->param_stmt.name, SYMBOL_VARIABLE);
+                    Symbol *param_sym = symbol_create(param->param_stmt.name, SYMBOL_VARIABLE, sema->module_path);
                     if (param->param_stmt.type)
                     {
                         param_sym->type = sema_resolve_type(sema, param->param_stmt.type);
@@ -168,7 +174,7 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
         return -1;
     }
 
-    Symbol *sym = symbol_create(node->var_stmt.name, SYMBOL_VARIABLE);
+    Symbol *sym = symbol_create(node->var_stmt.name, SYMBOL_VARIABLE, sema->module_path);
     if (!sym)
     {
         return -1;
@@ -201,6 +207,16 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
         {
             sym->type = node->var_stmt.init->type;
         }
+        // check type compatibility if type was explicit
+        else if (sym->type && node->var_stmt.init->type)
+        {
+            if (!type_equals(sym->type, node->var_stmt.init->type))
+            {
+                sema_error(sema, node->token, "type mismatch: cannot assign type to variable");
+                symbol_destroy(sym);
+                return -1;
+            }
+        }
     }
 
     // add to symbol table
@@ -227,7 +243,7 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
         return -1;
     }
 
-    Symbol *sym = symbol_create(node->rec_stmt.name, SYMBOL_TYPE);
+    Symbol *sym = symbol_create(node->rec_stmt.name, SYMBOL_TYPE, sema->module_path);
     if (!sym)
     {
         return -1;
@@ -645,7 +661,7 @@ static int sema_analyze_expr(Sema *sema, AstNode *node)
                 break;
             case TOKEN_LIT_STRING:
                 // simplified: string is pointer to u8
-                node->type = type_get_primitive(TYPE_PTR);
+                node->type = type_create_pointer(type_get_primitive(TYPE_U8), false);
                 break;
             default:
                 break;

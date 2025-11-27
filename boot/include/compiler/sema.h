@@ -9,7 +9,7 @@
 typedef struct Sema Sema;
 
 // create/destroy semantic analyzer
-Sema *sema_create();
+Sema *sema_create(const char *module_path);
 void  sema_destroy(Sema *sema);
 
 // analyze ast and populate types/symbols

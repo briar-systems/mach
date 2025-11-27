@@ -3,7 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 
-Symbol *symbol_create(const char *name, SymbolKind kind)
+Symbol *symbol_create(const char *name, SymbolKind kind, const char *module_path)
 {
     Symbol *symbol = malloc(sizeof(Symbol));
     if (!symbol)
@@ -15,6 +15,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind)
     symbol->name = name ? strdup(name) : NULL;
     symbol->export_name = NULL;
     symbol->mangled_name = NULL;
+    symbol->module_path = module_path ? strdup(module_path) : NULL;
     symbol->type = NULL;
     symbol->decl = NULL;
     symbol->is_public = false;
@@ -43,6 +44,10 @@ void symbol_destroy(Symbol *symbol)
     {
         free(symbol->mangled_name);
     }
+    if (symbol->module_path)
+    {
+        free(symbol->module_path);
+    }
 
     free(symbol);
 }
@@ -59,25 +64,54 @@ void symbol_mangle(Symbol *symbol)
         return; // already mangled
     }
 
-    // Simple mangling scheme for now: _M<module_len><module_name>N<name_len><name>
-    // Default module "main"
-    const char *module = "main";
-    size_t mod_len = strlen(module);
-    size_t name_len = strlen(symbol->name);
+    // Mangling scheme: _M<encoded_module_path>N<name_len><name>
+    // Encoded module path: length-prefixed segments of dot-separated path
+    // e.g. "std.io" -> "3std2io"
     
-    // Calculate length: _M + mod_len_str + module + N + name_len_str + name + null
-    char mod_len_str[32];
+    // Default module "main" if not specified
+    const char *path = symbol->module_path ? symbol->module_path : "main";
+    
+    // First pass: calculate length
+    size_t encoded_len = 0;
+    char *path_copy = strdup(path);
+    char *saveptr;
+    char *token = strtok_r(path_copy, ".", &saveptr);
+    while (token)
+    {
+        char len_str[32];
+        sprintf(len_str, "%zu", strlen(token));
+        encoded_len += strlen(len_str) + strlen(token);
+        token = strtok_r(NULL, ".", &saveptr);
+    }
+    free(path_copy);
+    
+    size_t name_len = strlen(symbol->name);
     char name_len_str[32];
-    sprintf(mod_len_str, "%zu", mod_len);
     sprintf(name_len_str, "%zu", name_len);
     
-    size_t total_len = 2 + strlen(mod_len_str) + mod_len + 1 + strlen(name_len_str) + name_len + 1;
+    // _M + encoded_len + N + name_len_str + name + null
+    size_t total_len = 2 + encoded_len + 1 + strlen(name_len_str) + name_len + 1;
     
     symbol->mangled_name = malloc(total_len);
-    if (symbol->mangled_name)
+    if (!symbol->mangled_name)
     {
-        sprintf(symbol->mangled_name, "_M%s%sN%s%s", mod_len_str, module, name_len_str, symbol->name);
+        return;
     }
+    
+    // Second pass: build string
+    char *ptr = symbol->mangled_name;
+    ptr += sprintf(ptr, "_M");
+    
+    path_copy = strdup(path);
+    token = strtok_r(path_copy, ".", &saveptr);
+    while (token)
+    {
+        ptr += sprintf(ptr, "%zu%s", strlen(token), token);
+        token = strtok_r(NULL, ".", &saveptr);
+    }
+    free(path_copy);
+    
+    sprintf(ptr, "N%zu%s", name_len, symbol->name);
 }
 
 const char *symbol_get_linkage_name(Symbol *symbol)

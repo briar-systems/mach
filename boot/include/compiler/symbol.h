@@ -21,8 +21,9 @@ typedef struct Symbol
 {
     SymbolKind     kind;
     char          *name;
-    char          *export_name; // name used in object file (can be overridden)
-    char          *mangled_name; // unique mangled name
+    char          *export_name; // override name for export (e.g. from $symbol.name)
+    char          *mangled_name; // cached mangled name
+    char          *module_path;  // dot-separated module path (e.g. "std.io")
     Type          *type;
     AstNode       *decl;        // declaration node
     bool           is_public;   // pub qualifier
@@ -39,7 +40,7 @@ typedef struct SymbolTable
 } SymbolTable;
 
 // symbol operations
-Symbol *symbol_create(const char *name, SymbolKind kind);
+Symbol *symbol_create(const char *name, SymbolKind kind, const char *module_path);
 void    symbol_destroy(Symbol *symbol);
 void    symbol_mangle(Symbol *symbol);
 const char *symbol_get_linkage_name(Symbol *symbol);

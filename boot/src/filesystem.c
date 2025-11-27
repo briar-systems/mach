@@ -27,7 +27,7 @@ extern char *realpath(const char *restrict path, char *restrict resolved_path);
 #endif
 
 // helper: check if character is a path separator
-static inline bool is_sep(char c)
+bool is_sep(char c)
 {
     return c == '/' || c == '\\';
 }

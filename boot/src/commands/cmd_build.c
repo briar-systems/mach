@@ -5,6 +5,8 @@
 #include "compiler/mir/lower.h"
 #include "compiler/mir/emit.h"
 #include "compiler/mir/target.h"
+#include "config.h"
+#include "filesystem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +21,7 @@ void cmd_build_help(FILE *stream)
     fprintf(stream, "options:\n");
     fprintf(stream, "  --target <name>      select target from mach.toml (required for projects)\n");
     fprintf(stream, "  -o <file>            output file (executable or object)\n");
+    fprintf(stream, "  -m <path>            set module path (e.g. 'std.io')\n");
     fprintf(stream, "  -I n=dir             map module prefix 'n' to base directory 'dir'\n");
 }
 
@@ -44,13 +47,91 @@ int cmd_build_handle(int argc, char **argv)
         }
     }
 
-    // default output name
-    if (!output_file)
+    // check if input is a directory
+    bool is_project = is_directory(input_file);
+    const char *project_root = is_project ? input_file : NULL;
+    const char *target_binary = NULL;
+    
+    if (is_project)
+    {
+        char *config_path = path_join(input_file, "mach.toml");
+        if (!file_exists(config_path))
+        {
+            fprintf(stderr, "error: directory '%s' does not contain mach.toml\n", input_file);
+            free(config_path);
+            return 1;
+        }
+
+        Config *config = config_load(config_path);
+        free(config_path);
+
+        if (!config)
+        {
+            return 1; // config_load prints error
+        }
+
+        // find target (default to first or specified)
+        if (config->target_count == 0)
+        {
+            fprintf(stderr, "error: no targets defined in mach.toml\n");
+            config_dnit(config);
+            free(config);
+            return 1;
+        }
+
+        ConfigTarget *target = config->targets[0];
+        if (!target->entrypoint)
+        {
+            fprintf(stderr, "error: target '%s' has no entrypoint\n", target->name);
+            config_dnit(config);
+            free(config);
+            return 1;
+        }
+
+        // Store target binary path for output location
+        if (target->binary)
+        {
+            target_binary = strdup(target->binary);
+        }
+
+        // construct full path to entrypoint
+        char *src_dir = path_join(input_file, config->dir_src ? config->dir_src : "src");
+        char *entry_path = path_join(src_dir, target->entrypoint);
+        
+        input_file = entry_path; 
+        
+        free(src_dir);
+        config_dnit(config);
+        free(config);
+    }
+
+    // Determine output file
+    if (!output_file && is_project && project_root && target_binary)
+    {
+        // Build to out/<binary path> (binary is relative to out dir in mach.toml)
+        // e.g. if binary = "linux/bin/mach", we build to "<project_root>/out/linux/bin/mach"
+        char out_path[1024];
+        snprintf(out_path, sizeof(out_path), "%s/out/%s", project_root, target_binary);
+        output_file = strdup(out_path);
+        
+        // Create output directory if it doesn't exist
+        char *out_dir = strdup(output_file);
+        char *last_sep = strrchr(out_dir, '/');
+        if (last_sep)
+        {
+            *last_sep = '\0';
+            // Create directory recursively
+            char mkdir_cmd[1536];
+            snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s 2>/dev/null", out_dir);
+            system(mkdir_cmd);
+        }
+        free(out_dir);
+    }
+    else if (!output_file)
     {
         output_file = "output";
     }
 
-    printf("Compiling %s...\n", input_file);
 
     // read source file
     FILE *f = fopen(input_file, "r");
@@ -95,19 +176,87 @@ int cmd_build_handle(int argc, char **argv)
         return 1;
     }
 
+    // determine module path
+    char *module_path = NULL;
+
+    // check for -m flag
+    for (int i = 3; i < argc; i++)
+    {
+        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc)
+        {
+            module_path = strdup(argv[++i]);
+            break;
+        }
+    }
+
+    // if not specified, try to derive from project
+    if (!module_path)
+    {
+        char *project_root = find_project_root(input_file);
+        if (project_root && strcmp(project_root, ".") != 0)
+        {
+            char *config_path = path_join(project_root, "mach.toml");
+            Config *config = config_load(config_path);
+            free(config_path);
+
+            if (config)
+            {
+                // calculate relative path from src_dir
+                char *src_dir = path_join(project_root, config->dir_src ? config->dir_src : "src");
+                char *abs_input = absolutize_path(input_file);
+                
+                if (strncmp(abs_input, src_dir, strlen(src_dir)) == 0)
+                {
+                    // file is inside src_dir
+                    char *rel_path = abs_input + strlen(src_dir);
+                    if (is_sep(*rel_path)) rel_path++; // skip leading separator
+                    
+                    // construct module path: project_id + . + rel_path (with / -> .)
+                    // remove extension .mach
+                    char *rel_no_ext = strdup(rel_path);
+                    char *dot = strrchr(rel_no_ext, '.');
+                    if (dot) *dot = '\0';
+                    
+                    // replace separators with dots
+                    for (char *p = rel_no_ext; *p; p++)
+                    {
+                        if (is_sep(*p)) *p = '.';
+                    }
+                    
+                    size_t len = strlen(config->id) + 1 + strlen(rel_no_ext) + 1;
+                    module_path = malloc(len);
+                    snprintf(module_path, len, "%s.%s", config->id, rel_no_ext);
+                    
+                    free(rel_no_ext);
+                }
+                
+                free(abs_input);
+                free(src_dir);
+                config_dnit(config);
+                free(config);
+            }
+        }
+        free(project_root);
+    }
+
+    // 3. Default to "main"
+    if (!module_path)
+    {
+        module_path = strdup("main");
+    }
+
     // semantic analysis
-    Sema *sema = sema_create();
+    Sema *sema = sema_create(module_path);
+    free(module_path); // sema makes a copy
     if (!sema)
     {
         fprintf(stderr, "error: failed to create semantic analyzer\n");
-        // ast cleanup would go here
         parser_dnit(&parser);
         lexer_dnit(&lexer);
         free(source);
         return 1;
     }
 
-    printf("  Running semantic analysis...\n");
     if (sema_analyze(sema, ast) < 0)
     {
         fprintf(stderr, "error: semantic analysis failed\n");
@@ -120,7 +269,6 @@ int cmd_build_handle(int argc, char **argv)
     }
 
     // lower to MIR
-    printf("  Lowering to MIR...\n");
     MIRModule *mir = mir_lower_module(ast);
     if (!mir)
     {
@@ -133,7 +281,6 @@ int cmd_build_handle(int argc, char **argv)
     }
 
     // generate object file
-    printf("  Generating object file...\n");
     char obj_file[512];
     snprintf(obj_file, sizeof(obj_file), "%s.o", output_file);
 
@@ -150,7 +297,6 @@ int cmd_build_handle(int argc, char **argv)
     }
 
     // link into executable
-    printf("  Linking executable...\n");
     char link_cmd[1024];
     snprintf(link_cmd, sizeof(link_cmd), "ld -o %s %s 2>&1", output_file, obj_file);
 
@@ -166,7 +312,7 @@ int cmd_build_handle(int argc, char **argv)
         return 1;
     }
 
-    printf("✓ Successfully built '%s'\n", output_file);
+    // Silent on success - no output
 
     // cleanup
     mir_module_destroy(mir);

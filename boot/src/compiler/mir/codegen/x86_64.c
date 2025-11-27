@@ -1162,20 +1162,25 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
                 inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
                 
                 if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
                 {
-                    emit_addsd_reg_reg(ctx, dst, src);
+                    if (dst != lhs) emit_movsd_reg_reg(ctx, dst, lhs);
+                    emit_addsd_reg_reg(ctx, dst, rhs);
                 }
                 else
                 {
-                    emit_add_reg_reg(ctx, dst, src);
+                    if (dst != lhs) emit_mov_reg_reg(ctx, dst, lhs);
+                    emit_add_reg_reg(ctx, dst, rhs);
                 }
             }
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
                      inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                if (dst != lhs) emit_mov_reg_reg(ctx, dst, lhs);
                 emit_add_reg_imm(ctx, dst, (int32_t)inst->operands[1].imm_int);
             }
         }
@@ -1190,21 +1195,37 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
                 inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
                 
                 if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
                 {
-                    emit_subsd_reg_reg(ctx, dst, src);
+                    if (dst != lhs) emit_movsd_reg_reg(ctx, dst, lhs);
+                    emit_subsd_reg_reg(ctx, dst, rhs);
                 }
                 else
                 {
-                    // The first operand is implicitly the destination, so we don't need to move it first.
-                    // The register allocator should ensure dst contains the value of operands[0].
-                    emit_sub_reg_reg(ctx, dst, src);
+                    if (dst != lhs) emit_mov_reg_reg(ctx, dst, lhs);
+                    emit_sub_reg_reg(ctx, dst, rhs);
                 }
             }
-            // No IMM_INT case for SUB in the provided snippet, keeping existing behavior
-
+            else if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                     inst->operands[1].kind == MIR_OPERAND_IMM_INT)
+            {
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                int32_t imm = (int32_t)inst->operands[1].imm_int;
+                
+                if (dst != lhs) emit_mov_reg_reg(ctx, dst, lhs);
+                
+                // sub dst, imm
+                // REX.W + 81 /5 imm32
+                uint8_t rex = 0x48;
+                if (dst >= X86_64_R8) rex |= 0x01; // REX.B
+                emit_byte(ctx, rex);
+                emit_byte(ctx, 0x81);
+                emit_byte(ctx, 0xE8 | reg_to_x86_encoding(dst)); // ModRM: 11 101 reg -> E8 | reg
+                emit_dword(ctx, imm);
+            }
         }
         break;
 
@@ -1216,24 +1237,25 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
                 inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
                 
                 if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
                 {
-                    emit_mulsd_reg_reg(ctx, dst, src);
+                    if (dst != lhs) emit_mulsd_reg_reg(ctx, dst, lhs);
+                    emit_mulsd_reg_reg(ctx, dst, rhs);
                 }
                 else
                 {
-                    // The first operand is implicitly the destination, so we don't need to move it first.
-                    // The register allocator should ensure dst contains the value of operands[0].
-                    emit_imul_reg_reg(ctx, dst, src);
+                    if (dst != lhs) emit_mov_reg_reg(ctx, dst, lhs);
+                    emit_imul_reg_reg(ctx, dst, rhs);
                 }
             }
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
                      inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
-                // The first operand is implicitly the destination, so we don't need to move it first.
-                // The register allocator should ensure dst contains the value of operands[0].
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                if (dst != lhs) emit_mov_reg_reg(ctx, dst, lhs);
                 emit_imul_reg_imm(ctx, dst, (int32_t)inst->operands[1].imm_int);
             }
         }
@@ -1255,11 +1277,121 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 }
                 else
                 {
-                    // Integer division (IDIV) not fully implemented here for simplicity
-                    // Assuming this is float division for now or handled elsewhere
-                    // The first operand is implicitly the destination, so we don't need to move it first.
-                    // The register allocator should ensure dst contains the value of operands[0].
+                    // Integer division
+                    // Uses IDIV: RDX:RAX / src -> RAX=quotient, RDX=remainder
+                    
+                    X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                    X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
+                    
+                    // mov rax, lhs
+                    emit_mov_reg_reg(ctx, X86_64_RAX, lhs);
+                    
+                    // cqo
+                    emit_byte(ctx, 0x48);
+                    emit_byte(ctx, 0x99);
+                    
+                    // idiv rhs
+                    uint8_t rex = 0x48;
+                    if (rhs >= X86_64_R8) rex |= 0x01; // REX.B
+                    emit_byte(ctx, rex);
+                    emit_byte(ctx, 0xF7);
+                    emit_byte(ctx, 0xF8 | reg_to_x86_encoding(rhs));
+                    
+                    // mov dst, rax (quotient)
+                    emit_mov_reg_reg(ctx, dst, X86_64_RAX);
                 }
+            }
+            else if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                     inst->operands[1].kind == MIR_OPERAND_IMM_INT)
+            {
+                // Integer division with immediate
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                int64_t imm = inst->operands[1].imm_int;
+                
+                // mov rax, lhs
+                emit_mov_reg_reg(ctx, X86_64_RAX, lhs);
+                
+                // cqo
+                emit_byte(ctx, 0x48);
+                emit_byte(ctx, 0x99);
+                
+                // mov rcx, imm
+                emit_mov_reg_imm64(ctx, X86_64_RCX, imm);
+                
+                // idiv rcx
+                emit_byte(ctx, 0x48);
+                emit_byte(ctx, 0xF7);
+                emit_byte(ctx, 0xF9);
+                
+                // mov dst, rax (quotient)
+                emit_mov_reg_reg(ctx, dst, X86_64_RAX);
+            }
+        }
+        break;
+
+    case MIR_OP_MOD:
+        if (inst->result && inst->operand_count >= 2)
+        {
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            
+            if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                inst->operands[1].kind == MIR_OPERAND_VALUE)
+            {
+                // Integer modulo
+                // Uses IDIV: RDX:RAX / src -> RAX=quotient, RDX=remainder
+                
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
+                
+                // mov rax, lhs
+                emit_mov_reg_reg(ctx, X86_64_RAX, lhs);
+                
+                // cqo (sign extend RAX to RDX:RAX)
+                // REX.W + 99
+                emit_byte(ctx, 0x48);
+                emit_byte(ctx, 0x99);
+                
+                // idiv rhs
+                // REX.W + F7 /7
+                uint8_t rex = 0x48;
+                if (rhs >= X86_64_R8) rex |= 0x01; // REX.B
+                emit_byte(ctx, rex);
+                emit_byte(ctx, 0xF7);
+                // ModRM: 11 111 reg -> 0xF8 | reg
+                emit_byte(ctx, 0xF8 | reg_to_x86_encoding(rhs));
+                
+                // mov dst, rdx (remainder)
+                emit_mov_reg_reg(ctx, dst, X86_64_RDX);
+            }
+            else if (inst->operands[0].kind == MIR_OPERAND_VALUE &&
+                     inst->operands[1].kind == MIR_OPERAND_IMM_INT)
+            {
+                // Integer modulo with immediate
+                // IDIV requires register/memory, cannot take immediate
+                // Move immediate to RCX (scratch)
+                
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                int64_t imm = inst->operands[1].imm_int;
+                
+                // mov rax, lhs
+                emit_mov_reg_reg(ctx, X86_64_RAX, lhs);
+                
+                // cqo
+                emit_byte(ctx, 0x48);
+                emit_byte(ctx, 0x99);
+                
+                // mov rcx, imm
+                emit_mov_reg_imm64(ctx, X86_64_RCX, imm);
+                
+                // idiv rcx
+                // REX.W + F7 /7 (RCX is 1)
+                // ModRM: 11 111 001 = F9
+                emit_byte(ctx, 0x48);
+                emit_byte(ctx, 0xF7);
+                emit_byte(ctx, 0xF9);
+                
+                // mov dst, rdx
+                emit_mov_reg_reg(ctx, dst, X86_64_RDX);
             }
         }
         break;
@@ -1397,6 +1529,37 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
                 
                 emit_cmp_reg_reg(ctx, src1, src2); // cmp src1, src2
+                
+                int cond = 0;
+                switch (inst->op) {
+                    case MIR_OP_EQ: cond = 0x4; break; // Z
+                    case MIR_OP_NE: cond = 0x5; break; // NZ
+                    case MIR_OP_LT: cond = 0xC; break; // L
+                    case MIR_OP_LE: cond = 0xE; break; // LE
+                    case MIR_OP_GT: cond = 0xF; break; // G
+                    case MIR_OP_GE: cond = 0xD; break; // GE
+                    case MIR_OP_ULT: cond = 0x2; break; // B
+                    case MIR_OP_ULE: cond = 0x6; break; // BE
+                    case MIR_OP_UGT: cond = 0x7; break; // A
+                    case MIR_OP_UGE: cond = 0x3; break; // AE
+                    default: break;
+                }
+                
+                emit_setcc(ctx, cond, dst);
+            }
+            else if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_IMM_INT)
+            {
+                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id);
+                int32_t imm = (int32_t)inst->operands[1].imm_int;
+                
+                // cmp src1, imm
+                // REX.W + 81 /7 imm32
+                uint8_t rex = 0x48;
+                if (src1 >= X86_64_R8) rex |= 0x01; // REX.B
+                emit_byte(ctx, rex);
+                emit_byte(ctx, 0x81);
+                emit_byte(ctx, 0xF8 | reg_to_x86_encoding(src1)); // ModRM: 11 111 reg -> F8 | reg
+                emit_dword(ctx, imm);
                 
                 int cond = 0;
                 switch (inst->op) {
