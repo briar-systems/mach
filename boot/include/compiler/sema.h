@@ -12,12 +12,22 @@ typedef struct Sema Sema;
 Sema *sema_create(const char *module_path);
 void  sema_destroy(Sema *sema);
 
+// configure module resolution paths
+// project_id: the project's id from mach.toml (used as module prefix)
+// src_root: absolute path to the source directory
+// dep_root: absolute path to the dependencies directory (may be NULL)
+void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_root, const char *dep_root);
+
 // analyze ast and populate types/symbols
 // returns 0 on success, -1 on error
 int sema_analyze(Sema *sema, AstNode *ast);
 
 // get root symbol table (for inspection/codegen)
 SymbolTable *sema_get_root_table(Sema *sema);
+
+// get all loaded module ASTs (for codegen)
+// returns count, fills asts array (must be pre-allocated)
+int sema_get_loaded_modules(Sema *sema, AstNode **asts, int max_count);
 
 // error reporting
 int  sema_get_error_count(Sema *sema);

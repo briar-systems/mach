@@ -1,10 +1,10 @@
 #include "commands/cmd_build.h"
 #include "compiler/lexer.h"
+#include "compiler/mir/emit.h"
+#include "compiler/mir/lower.h"
+#include "compiler/mir/target.h"
 #include "compiler/parser.h"
 #include "compiler/sema.h"
-#include "compiler/mir/lower.h"
-#include "compiler/mir/emit.h"
-#include "compiler/mir/target.h"
 #include "config.h"
 #include "filesystem.h"
 
@@ -35,7 +35,7 @@ int cmd_build_handle(int argc, char **argv)
         return 1;
     }
 
-    const char *input_file = argv[2];
+    const char *input_file  = argv[2];
     const char *output_file = NULL;
 
     // parse options
@@ -48,10 +48,15 @@ int cmd_build_handle(int argc, char **argv)
     }
 
     // check if input is a directory
-    bool is_project = is_directory(input_file);
-    const char *project_root = is_project ? input_file : NULL;
+    bool        is_project    = is_directory(input_file);
+    const char *project_root  = is_project ? input_file : NULL;
     const char *target_binary = NULL;
-    
+
+    // module resolution info (stored for sema)
+    char *project_id = NULL;
+    char *src_root   = NULL;
+    char *dep_root   = NULL;
+
     if (is_project)
     {
         char *config_path = path_join(input_file, "mach.toml");
@@ -94,13 +99,30 @@ int cmd_build_handle(int argc, char **argv)
             target_binary = strdup(target->binary);
         }
 
+        // Store module resolution info
+        if (config->id)
+        {
+            project_id = strdup(config->id);
+        }
+
         // construct full path to entrypoint
-        char *src_dir = path_join(input_file, config->dir_src ? config->dir_src : "src");
-        char *entry_path = path_join(src_dir, target->entrypoint);
-        
-        input_file = entry_path; 
-        
-        free(src_dir);
+        char *src_dir_path = path_join(input_file, config->dir_src ? config->dir_src : "src");
+        char *entry_path   = path_join(src_dir_path, target->entrypoint);
+
+        // store absolute src_root for module resolution
+        src_root = absolutize_path(src_dir_path);
+
+        // store dep_root if configured
+        if (config->dir_dep)
+        {
+            char *dep_dir_path = path_join(input_file, config->dir_dep);
+            dep_root           = absolutize_path(dep_dir_path);
+            free(dep_dir_path);
+        }
+
+        input_file = entry_path;
+
+        free(src_dir_path);
         config_dnit(config);
         free(config);
     }
@@ -113,9 +135,9 @@ int cmd_build_handle(int argc, char **argv)
         char out_path[1024];
         snprintf(out_path, sizeof(out_path), "%s/out/%s", project_root, target_binary);
         output_file = strdup(out_path);
-        
+
         // Create output directory if it doesn't exist
-        char *out_dir = strdup(output_file);
+        char *out_dir  = strdup(output_file);
         char *last_sep = strrchr(out_dir, '/');
         if (last_sep)
         {
@@ -131,7 +153,6 @@ int cmd_build_handle(int argc, char **argv)
     {
         output_file = "output";
     }
-
 
     // read source file
     FILE *f = fopen(input_file, "r");
@@ -195,41 +216,50 @@ int cmd_build_handle(int argc, char **argv)
         char *project_root = find_project_root(input_file);
         if (project_root && strcmp(project_root, ".") != 0)
         {
-            char *config_path = path_join(project_root, "mach.toml");
-            Config *config = config_load(config_path);
+            char   *config_path = path_join(project_root, "mach.toml");
+            Config *config      = config_load(config_path);
             free(config_path);
 
             if (config)
             {
                 // calculate relative path from src_dir
-                char *src_dir = path_join(project_root, config->dir_src ? config->dir_src : "src");
+                char *src_dir   = path_join(project_root, config->dir_src ? config->dir_src : "src");
                 char *abs_input = absolutize_path(input_file);
-                
+
                 if (strncmp(abs_input, src_dir, strlen(src_dir)) == 0)
                 {
                     // file is inside src_dir
                     char *rel_path = abs_input + strlen(src_dir);
-                    if (is_sep(*rel_path)) rel_path++; // skip leading separator
-                    
+                    if (is_sep(*rel_path))
+                    {
+                        rel_path++; // skip leading separator
+                    }
+
                     // construct module path: project_id + . + rel_path (with / -> .)
                     // remove extension .mach
                     char *rel_no_ext = strdup(rel_path);
-                    char *dot = strrchr(rel_no_ext, '.');
-                    if (dot) *dot = '\0';
-                    
+                    char *dot        = strrchr(rel_no_ext, '.');
+                    if (dot)
+                    {
+                        *dot = '\0';
+                    }
+
                     // replace separators with dots
                     for (char *p = rel_no_ext; *p; p++)
                     {
-                        if (is_sep(*p)) *p = '.';
+                        if (is_sep(*p))
+                        {
+                            *p = '.';
+                        }
                     }
-                    
-                    size_t len = strlen(config->id) + 1 + strlen(rel_no_ext) + 1;
+
+                    size_t len  = strlen(config->id) + 1 + strlen(rel_no_ext) + 1;
                     module_path = malloc(len);
                     snprintf(module_path, len, "%s.%s", config->id, rel_no_ext);
-                    
+
                     free(rel_no_ext);
                 }
-                
+
                 free(abs_input);
                 free(src_dir);
                 config_dnit(config);
@@ -254,8 +284,29 @@ int cmd_build_handle(int argc, char **argv)
         parser_dnit(&parser);
         lexer_dnit(&lexer);
         free(source);
+        if (project_id)
+        {
+            free(project_id);
+        }
+        if (src_root)
+        {
+            free(src_root);
+        }
+        if (dep_root)
+        {
+            free(dep_root);
+        }
         return 1;
     }
+
+    // set module resolution roots if available
+    if (project_id && src_root)
+    {
+        sema_set_module_roots(sema, project_id, src_root, dep_root);
+    }
+    free(project_id);
+    free(src_root);
+    free(dep_root);
 
     if (sema_analyze(sema, ast) < 0)
     {
@@ -268,7 +319,7 @@ int cmd_build_handle(int argc, char **argv)
         return 1;
     }
 
-    // lower to MIR
+    // lower to MIR - first the main module
     MIRModule *mir = mir_lower_module(ast, sema_get_root_table(sema));
     if (!mir)
     {
@@ -278,6 +329,20 @@ int cmd_build_handle(int argc, char **argv)
         lexer_dnit(&lexer);
         free(source);
         return 1;
+    }
+
+    // lower all imported modules
+    AstNode *loaded_asts[64];
+    int      loaded_count = sema_get_loaded_modules(sema, loaded_asts, 64);
+    for (int i = 0; i < loaded_count; i++)
+    {
+        MIRModule *imported_mir = mir_lower_module(loaded_asts[i], sema_get_root_table(sema));
+        if (imported_mir)
+        {
+            // merge imported module into main module
+            mir_module_merge(mir, imported_mir);
+            mir_module_destroy(imported_mir);
+        }
     }
 
     // generate object file
