@@ -18,14 +18,14 @@ typedef enum TypeKind
     TYPE_I64,
     TYPE_F32,
     TYPE_F64,
-    TYPE_PTR,      // untyped pointer
-    
+    TYPE_PTR, // untyped pointer
+
     // compound types
-    TYPE_POINTER,  // typed pointer
-    TYPE_ARRAY,    // fixed-size array
-    TYPE_FUNCTION, // function type
-    TYPE_STRUCT,   // record
-    TYPE_UNION,    // union
+    TYPE_POINTER,       // typed pointer
+    TYPE_ARRAY,         // fixed-size array
+    TYPE_FUNCTION,      // function type
+    TYPE_STRUCT,        // record
+    TYPE_UNION,         // union
     TYPE_GENERIC_PARAM, // generic parameter (T)
 } TypeKind;
 
@@ -33,8 +33,8 @@ typedef struct Type Type;
 
 typedef struct TypeField
 {
-    char *name;
-    Type *type;
+    char  *name;
+    Type  *type;
     size_t offset;
 } TypeField;
 
@@ -43,7 +43,7 @@ struct Type
     TypeKind kind;
     size_t   size;      // size in bytes (0 if unknown)
     size_t   alignment; // alignment requirement
-    
+
     union
     {
         // TYPE_POINTER
@@ -52,18 +52,18 @@ struct Type
             Type *base;
             bool  is_const; // for & (read-only) vs * (mutable)
         } pointer;
-        
+
         // TYPE_ARRAY
         struct
         {
             Type  *elem_type;
             size_t count; // element count
         } array;
-        
+
         // TYPE_FUNCTION
         struct
         {
-            Type *return_type;
+            Type  *return_type;
             Type **param_types;
             int    param_count;
         } function;
@@ -71,18 +71,18 @@ struct Type
         // TYPE_STRUCT
         struct
         {
-            char *name;
-            TypeField *fields;
-            int field_count;
+            char               *name;
+            TypeField          *fields;
+            int                 field_count;
             struct SymbolTable *methods; // methods associated with this type
         } structure;
 
         // TYPE_UNION
         struct
         {
-            char *name;
-            TypeField *fields;
-            int field_count;
+            char               *name;
+            TypeField          *fields;
+            int                 field_count;
             struct SymbolTable *methods; // methods associated with this type
         } union_type;
 
@@ -107,6 +107,7 @@ Type *type_create_generic_param(const char *name);
 
 // type checking
 bool type_equals(Type *a, Type *b);
+bool type_can_assign_to(Type *from, Type *to); // check if 'from' can be assigned to 'to'
 bool type_is_integer(Type *t);
 bool type_is_float(Type *t);
 bool type_is_numeric(Type *t);

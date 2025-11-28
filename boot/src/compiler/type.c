@@ -1,11 +1,11 @@
 #include "compiler/type.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 // primitive type singletons
 static Type primitive_types[11] = {0};
-static bool types_initialized = false;
+static bool types_initialized   = false;
 
 static void init_primitive_types()
 {
@@ -15,11 +15,11 @@ static void init_primitive_types()
     }
 
     // initialize primitive types
-    primitive_types[TYPE_U8]  = (Type){.kind = TYPE_U8,  .size = 1, .alignment = 1};
+    primitive_types[TYPE_U8]  = (Type){.kind = TYPE_U8, .size = 1, .alignment = 1};
     primitive_types[TYPE_U16] = (Type){.kind = TYPE_U16, .size = 2, .alignment = 2};
     primitive_types[TYPE_U32] = (Type){.kind = TYPE_U32, .size = 4, .alignment = 4};
     primitive_types[TYPE_U64] = (Type){.kind = TYPE_U64, .size = 8, .alignment = 8};
-    primitive_types[TYPE_I8]  = (Type){.kind = TYPE_I8,  .size = 1, .alignment = 1};
+    primitive_types[TYPE_I8]  = (Type){.kind = TYPE_I8, .size = 1, .alignment = 1};
     primitive_types[TYPE_I16] = (Type){.kind = TYPE_I16, .size = 2, .alignment = 2};
     primitive_types[TYPE_I32] = (Type){.kind = TYPE_I32, .size = 4, .alignment = 4};
     primitive_types[TYPE_I64] = (Type){.kind = TYPE_I64, .size = 8, .alignment = 8};
@@ -50,10 +50,10 @@ Type *type_create_pointer(Type *base, bool is_const)
         return NULL;
     }
 
-    type->kind = TYPE_POINTER;
-    type->size = 8;
-    type->alignment = 8;
-    type->pointer.base = base;
+    type->kind             = TYPE_POINTER;
+    type->size             = 8;
+    type->alignment        = 8;
+    type->pointer.base     = base;
     type->pointer.is_const = is_const;
 
     return type;
@@ -67,11 +67,11 @@ Type *type_create_array(Type *elem_type, size_t count)
         return NULL;
     }
 
-    type->kind = TYPE_ARRAY;
-    type->size = elem_type ? elem_type->size * count : 0;
-    type->alignment = elem_type ? elem_type->alignment : 1;
+    type->kind            = TYPE_ARRAY;
+    type->size            = elem_type ? elem_type->size * count : 0;
+    type->alignment       = elem_type ? elem_type->alignment : 1;
     type->array.elem_type = elem_type;
-    type->array.count = count;
+    type->array.count     = count;
 
     return type;
 }
@@ -84,9 +84,9 @@ Type *type_create_function(Type *return_type, Type **param_types, int param_coun
         return NULL;
     }
 
-    type->kind = TYPE_FUNCTION;
-    type->size = 0; // functions don't have a size
-    type->alignment = 0;
+    type->kind                 = TYPE_FUNCTION;
+    type->size                 = 0; // functions don't have a size
+    type->alignment            = 0;
     type->function.return_type = return_type;
     type->function.param_types = param_types;
     type->function.param_count = param_count;
@@ -102,20 +102,20 @@ Type *type_create_struct(const char *name, TypeField *fields, int field_count)
         return NULL;
     }
 
-    type->kind = TYPE_STRUCT;
-    type->structure.name = name ? strdup(name) : NULL;
-    type->structure.fields = fields;
+    type->kind                  = TYPE_STRUCT;
+    type->structure.name        = name ? strdup(name) : NULL;
+    type->structure.fields      = fields;
     type->structure.field_count = field_count;
-    type->structure.methods = NULL;  // initialize methods table
+    type->structure.methods     = NULL; // initialize methods table
 
     // calculate size and alignment
-    size_t size = 0;
+    size_t size      = 0;
     size_t alignment = 1;
 
     for (int i = 0; i < field_count; i++)
     {
-        Type *field_type = fields[i].type;
-        size_t field_size = field_type->size;
+        Type  *field_type  = fields[i].type;
+        size_t field_size  = field_type->size;
         size_t field_align = field_type->alignment;
 
         // update struct alignment
@@ -141,7 +141,7 @@ Type *type_create_struct(const char *name, TypeField *fields, int field_count)
         size += alignment - (size % alignment);
     }
 
-    type->size = size;
+    type->size      = size;
     type->alignment = alignment;
 
     return type;
@@ -175,12 +175,10 @@ bool type_equals(Type *a, Type *b)
         return true; // primitives are equal if kinds match
 
     case TYPE_POINTER:
-        return type_equals(a->pointer.base, b->pointer.base) &&
-               a->pointer.is_const == b->pointer.is_const;
+        return type_equals(a->pointer.base, b->pointer.base) && a->pointer.is_const == b->pointer.is_const;
 
     case TYPE_ARRAY:
-        return a->array.count == b->array.count &&
-               type_equals(a->array.elem_type, b->array.elem_type);
+        return a->array.count == b->array.count && type_equals(a->array.elem_type, b->array.elem_type);
 
     case TYPE_FUNCTION:
         if (!type_equals(a->function.return_type, b->function.return_type))
@@ -248,6 +246,48 @@ bool type_equals(Type *a, Type *b)
     }
 }
 
+bool type_can_assign_to(Type *from, Type *to)
+{
+    if (!from || !to)
+    {
+        return from == to;
+    }
+
+    // exact type match
+    if (type_equals(from, to))
+    {
+        return true;
+    }
+
+    // *T -> &T: mutable pointer can be assigned to readonly pointer
+    if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER)
+    {
+        // check base types match
+        if (type_equals(from->pointer.base, to->pointer.base))
+        {
+            // *T -> &T is allowed (mutable to readonly)
+            if (!from->pointer.is_const && to->pointer.is_const)
+            {
+                return true;
+            }
+        }
+    }
+
+    // TYPE_PTR (untyped pointer) can be assigned to any typed pointer
+    if (from->kind == TYPE_PTR && to->kind == TYPE_POINTER)
+    {
+        return true;
+    }
+
+    // typed pointer can be assigned to TYPE_PTR
+    if (from->kind == TYPE_POINTER && to->kind == TYPE_PTR)
+    {
+        return true;
+    }
+
+    return false;
+}
+
 Type *type_create_union(const char *name, TypeField *fields, int field_count)
 {
     Type *type = malloc(sizeof(Type));
@@ -256,14 +296,14 @@ Type *type_create_union(const char *name, TypeField *fields, int field_count)
         return NULL;
     }
 
-    type->kind = TYPE_UNION;
-    type->union_type.name = name ? strdup(name) : NULL;
-    type->union_type.fields = fields;
+    type->kind                   = TYPE_UNION;
+    type->union_type.name        = name ? strdup(name) : NULL;
+    type->union_type.fields      = fields;
     type->union_type.field_count = field_count;
-    type->union_type.methods = NULL;  // initialize methods table
+    type->union_type.methods     = NULL; // initialize methods table
 
     // Union size is max of fields, alignment is max of fields
-    size_t size = 0;
+    size_t size      = 0;
     size_t alignment = 1;
 
     for (int i = 0; i < field_count; i++)
@@ -285,7 +325,7 @@ Type *type_create_union(const char *name, TypeField *fields, int field_count)
         size += alignment - (size % alignment);
     }
 
-    type->size = size;
+    type->size      = size;
     type->alignment = alignment;
 
     return type;
@@ -299,9 +339,9 @@ Type *type_create_generic_param(const char *name)
         return NULL;
     }
 
-    type->kind = TYPE_GENERIC_PARAM;
-    type->size = 0; // unknown size until instantiated
-    type->alignment = 0;
+    type->kind               = TYPE_GENERIC_PARAM;
+    type->size               = 0; // unknown size until instantiated
+    type->alignment          = 0;
     type->generic_param.name = name ? strdup(name) : NULL;
 
     return type;
@@ -346,7 +386,7 @@ int type_mangle(Type *type, char *buffer, size_t buffer_size)
     }
 
     int written = 0;
-    
+
     switch (type->kind)
     {
     // primitives - use length-prefixed type names
@@ -383,19 +423,19 @@ int type_mangle(Type *type, char *buffer, size_t buffer_size)
     case TYPE_PTR:
         written = snprintf(buffer, buffer_size, "3ptr");
         break;
-        
+
     case TYPE_POINTER:
     {
         // P = mutable pointer, K = const/readonly pointer
         char prefix = type->pointer.is_const ? 'K' : 'P';
-        written = snprintf(buffer, buffer_size, "%c", prefix);
+        written     = snprintf(buffer, buffer_size, "%c", prefix);
         if (written < (int)buffer_size && type->pointer.base)
         {
             written += type_mangle(type->pointer.base, buffer + written, buffer_size - written);
         }
         break;
     }
-    
+
     case TYPE_ARRAY:
     {
         // A<count>_<elem_type>
@@ -406,26 +446,26 @@ int type_mangle(Type *type, char *buffer, size_t buffer_size)
         }
         break;
     }
-    
+
     case TYPE_STRUCT:
     {
         // length-prefixed struct name
-        const char *name = type->structure.name ? type->structure.name : "anon";
-        size_t name_len = strlen(name);
-        written = snprintf(buffer, buffer_size, "%zu%s", name_len, name);
+        const char *name     = type->structure.name ? type->structure.name : "anon";
+        size_t      name_len = strlen(name);
+        written              = snprintf(buffer, buffer_size, "%zu%s", name_len, name);
         // note: generic args for structs would be appended by caller with I...E
         break;
     }
-    
+
     case TYPE_UNION:
     {
         // length-prefixed union name
-        const char *name = type->union_type.name ? type->union_type.name : "anon";
-        size_t name_len = strlen(name);
-        written = snprintf(buffer, buffer_size, "%zu%s", name_len, name);
+        const char *name     = type->union_type.name ? type->union_type.name : "anon";
+        size_t      name_len = strlen(name);
+        written              = snprintf(buffer, buffer_size, "%zu%s", name_len, name);
         break;
     }
-    
+
     case TYPE_FUNCTION:
     {
         // F<return_type><param_types>E
@@ -451,20 +491,20 @@ int type_mangle(Type *type, char *buffer, size_t buffer_size)
         }
         break;
     }
-    
+
     case TYPE_GENERIC_PARAM:
     {
         // should not appear in instantiated types, but handle gracefully
-        const char *name = type->generic_param.name ? type->generic_param.name : "T";
-        size_t name_len = strlen(name);
-        written = snprintf(buffer, buffer_size, "%zu%s", name_len, name);
+        const char *name     = type->generic_param.name ? type->generic_param.name : "T";
+        size_t      name_len = strlen(name);
+        written              = snprintf(buffer, buffer_size, "%zu%s", name_len, name);
         break;
     }
-    
+
     default:
         written = snprintf(buffer, buffer_size, "?");
         break;
     }
-    
+
     return written;
 }

@@ -357,7 +357,7 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
         // check type compatibility if type was explicit
         else if (sym->type && node->var_stmt.init->type)
         {
-            if (!type_equals(sym->type, node->var_stmt.init->type))
+            if (!type_can_assign_to(node->var_stmt.init->type, sym->type))
             {
                 sema_error(sema, node->token, "type mismatch: cannot assign type to variable");
                 symbol_destroy(sym);
@@ -1369,29 +1369,8 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 break;
             }
 
-            if (!type_equals(arg->type, param_type))
+            if (!type_can_assign_to(arg->type, param_type))
             {
-                // check for implicit casts (e.g. &T -> *T)
-                if (param_type->kind == TYPE_POINTER && arg->type->kind == TYPE_POINTER)
-                {
-                    // allow &T -> *T (const to mutable is unsafe but allowed for now?)
-                    // actually, allow *T -> &T (mutable to const)
-                    if (type_equals(param_type->pointer.base, arg->type->pointer.base))
-                    {
-                        if (param_type->pointer.is_const && !arg->type->pointer.is_const)
-                        {
-                            // *T -> &T ok
-                            continue;
-                        }
-                    }
-                }
-
-                // Allow *void -> *T and *T -> *void
-                if (param_type->kind == TYPE_PTR || arg->type->kind == TYPE_PTR)
-                {
-                    continue;
-                }
-
                 sema_error(sema, arg->token, "argument type mismatch");
                 return -1;
             }
@@ -1408,57 +1387,61 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
-        Type *obj_type = node->field_expr.object->type;
+        Type *obj_type   = node->field_expr.object->type;
+        Type *deref_type = obj_type;
 
-        // auto-dereference pointer to struct/union
+        // auto-dereference pointer to struct/union for field access
         if (obj_type->kind == TYPE_POINTER && (obj_type->pointer.base->kind == TYPE_STRUCT || obj_type->pointer.base->kind == TYPE_UNION))
         {
-            obj_type = obj_type->pointer.base;
+            deref_type = obj_type->pointer.base;
         }
 
-        if (obj_type->kind != TYPE_STRUCT && obj_type->kind != TYPE_UNION)
+        // try field access on structs/unions
+        if (deref_type->kind == TYPE_STRUCT || deref_type->kind == TYPE_UNION)
         {
-            sema_error(sema, node->token, "field access on non-struct/union type");
-            return -1;
-        }
+            TypeField *fields      = (deref_type->kind == TYPE_STRUCT) ? deref_type->structure.fields : deref_type->union_type.fields;
+            int        field_count = (deref_type->kind == TYPE_STRUCT) ? deref_type->structure.field_count : deref_type->union_type.field_count;
 
-        // find field
-        TypeField *fields      = (obj_type->kind == TYPE_STRUCT) ? obj_type->structure.fields : obj_type->union_type.fields;
-        int        field_count = (obj_type->kind == TYPE_STRUCT) ? obj_type->structure.field_count : obj_type->union_type.field_count;
-
-        TypeField *field = NULL;
-        for (int i = 0; i < field_count; i++)
-        {
-            if (strcmp(fields[i].name, node->field_expr.field) == 0)
+            for (int i = 0; i < field_count; i++)
             {
-                field = &fields[i];
-                break;
+                if (strcmp(fields[i].name, node->field_expr.field) == 0)
+                {
+                    node->type = fields[i].type;
+                    return 0;
+                }
             }
         }
 
-        if (field)
-        {
-            node->type = field->type;
-            return 0;
-        }
-
-        // field not found - look for method in the symbol table
-        // scan for a function with matching name that is a method with compatible receiver type
+        // look for method - methods can be defined on any type including pointers
         Symbol *method = symbol_table_lookup(sema->current_table, node->field_expr.field);
         if (method && method->kind == SYMBOL_FUNCTION && method->decl && method->decl->kind == AST_STMT_FUN && method->decl->fun_stmt.is_method)
         {
-            // check receiver type compatibility
             Type *method_receiver_type = sema_resolve_type(sema, method->decl->fun_stmt.method_receiver);
             if (method_receiver_type)
             {
+                // check if receiver type matches object type (including pointer coercion)
+                if (type_can_assign_to(obj_type, method_receiver_type))
+                {
+                    node->field_expr.is_method = true;
+                    node->symbol               = method;
+                    node->type                 = method->type;
+                    return 0;
+                }
+
+                // also check base types for pointer receivers (auto-ref/deref)
                 Type *method_base_type = method_receiver_type;
                 if (method_base_type->kind == TYPE_POINTER)
                 {
                     method_base_type = method_base_type->pointer.base;
                 }
 
-                // check if the receiver base type matches the object type
-                if (type_equals(method_base_type, obj_type))
+                Type *obj_base_type = obj_type;
+                if (obj_base_type->kind == TYPE_POINTER)
+                {
+                    obj_base_type = obj_base_type->pointer.base;
+                }
+
+                if (type_equals(method_base_type, obj_base_type))
                 {
                     node->field_expr.is_method = true;
                     node->symbol               = method;
@@ -1512,7 +1495,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                     return -1;
                 }
 
-                if (!type_equals(field->type, field_init->field_expr.object->type))
+                if (!type_can_assign_to(field_init->field_expr.object->type, field->type))
                 {
                     sema_error(sema, field_init->token, "field type mismatch");
                     return -1;
