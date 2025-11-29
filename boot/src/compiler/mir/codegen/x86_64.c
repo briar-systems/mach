@@ -1,6 +1,5 @@
 #include "compiler/mir/codegen/x86_64.h"
 #include "compiler/mir/isa/x86_64.h"
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -414,6 +413,22 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
     // Step 4: Linear scan register allocation with liveness
     // Sort values by their first use (already in order by ID for simple cases)
 
+    bool *value_live = calloc(func->next_value_id, sizeof(bool));
+    if (!value_live)
+    {
+        free(liveness);
+        return -1;
+    }
+
+    // mark parameters as live since they've been assigned registers already
+    for (size_t j = 0; j < func->param_count; j++)
+    {
+        if (func->params[j])
+        {
+            value_live[func->params[j]->id] = true;
+        }
+    }
+
     // Track which physical registers are currently in use
     bool gp_in_use[16] = {false};
     bool fp_in_use[16] = {false};
@@ -429,7 +444,7 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
             // Free registers for values that are no longer live
             for (uint32_t i = 0; i < func->next_value_id; i++)
             {
-                if (liveness[i].last_use < inst_idx && liveness[i].first_use != (size_t)-1)
+                if (liveness[i].last_use < inst_idx && liveness[i].first_use != (size_t)-1 && value_live[i])
                 {
                     // Value is no longer live, free its register
                     X86_64_Reg reg = ctx->reg_map.map[i];
@@ -450,6 +465,8 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
                             }
                         }
                     }
+
+                    value_live[i]    = false;
                 }
             }
 
@@ -489,6 +506,7 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
                         {
                             ctx->reg_map.map[id] = allocatable_fp_regs[free_fp];
                             fp_in_use[free_fp]   = true;
+                            value_live[id]       = true;
                         }
                         else
                         {
@@ -513,11 +531,13 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
                         {
                             ctx->reg_map.map[id] = allocatable_gp_regs[free_gp];
                             gp_in_use[free_gp]   = true;
+                            value_live[id]       = true;
                         }
                         else
                         {
                             // All GP registers in use, reuse round-robin
                             ctx->reg_map.map[id] = allocatable_gp_regs[id % num_allocatable_gp];
+                            value_live[id]       = true;
                         }
                     }
                 }
@@ -529,6 +549,7 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
         block = block->next;
     }
 
+    free(value_live);
     free(liveness);
     return 0;
 }
