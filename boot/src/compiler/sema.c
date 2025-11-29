@@ -11,9 +11,20 @@
 typedef struct LoadedModule
 {
     char                *module_path; // FQN of the module
+    char                *source;      // source text (kept for error reporting)
+    char                *file_path;   // file path for error messages
     AstNode             *ast;         // parsed AST
     struct LoadedModule *next;
 } LoadedModule;
+
+// semantic error record
+typedef struct SemaError
+{
+    Token *token;
+    char  *message;
+    char  *file_path; // which file the error is in
+    char  *source;    // source text for that file
+} SemaError;
 
 // semantic analyzer context
 struct Sema
@@ -23,12 +34,51 @@ struct Sema
     int          error_count;
     char        *module_path;
 
+    // error list
+    SemaError *errors;
+    int        errors_count;
+    int        errors_capacity;
+
+    // current file context for error reporting
+    char *current_file_path;
+    char *current_source;
+
     // module resolution
     char         *project_id;     // project id (module prefix)
     char         *src_root;       // source directory path
     char         *dep_root;       // dependencies directory path
     LoadedModule *loaded_modules; // cache of loaded modules
 };
+
+// add error to list
+static void sema_error_list_add(Sema *sema, Token *token, const char *message)
+{
+    if (sema->errors_count >= sema->errors_capacity)
+    {
+        sema->errors_capacity = sema->errors_capacity ? sema->errors_capacity * 2 : 8;
+        sema->errors          = realloc(sema->errors, sizeof(SemaError) * sema->errors_capacity);
+    }
+
+    SemaError *err = &sema->errors[sema->errors_count++];
+
+    // copy token
+    if (token)
+    {
+        err->token = malloc(sizeof(Token));
+        if (err->token)
+        {
+            token_copy(token, err->token);
+        }
+    }
+    else
+    {
+        err->token = NULL;
+    }
+
+    err->message   = strdup(message);
+    err->file_path = sema->current_file_path ? strdup(sema->current_file_path) : NULL;
+    err->source    = sema->current_source ? strdup(sema->current_source) : NULL;
+}
 
 Sema *sema_create(const char *module_path)
 {
@@ -38,14 +88,19 @@ Sema *sema_create(const char *module_path)
         return NULL;
     }
 
-    sema->root_table     = symbol_table_create(NULL);
-    sema->current_table  = sema->root_table;
-    sema->error_count    = 0;
-    sema->module_path    = module_path ? strdup(module_path) : NULL;
-    sema->project_id     = NULL;
-    sema->src_root       = NULL;
-    sema->dep_root       = NULL;
-    sema->loaded_modules = NULL;
+    sema->root_table        = symbol_table_create(NULL);
+    sema->current_table     = sema->root_table;
+    sema->error_count       = 0;
+    sema->module_path       = module_path ? strdup(module_path) : NULL;
+    sema->errors            = NULL;
+    sema->errors_count      = 0;
+    sema->errors_capacity   = 0;
+    sema->current_file_path = NULL;
+    sema->current_source    = NULL;
+    sema->project_id        = NULL;
+    sema->src_root          = NULL;
+    sema->dep_root          = NULL;
+    sema->loaded_modules    = NULL;
 
     return sema;
 }
@@ -78,12 +133,32 @@ void sema_destroy(Sema *sema)
         free(sema->dep_root);
     }
 
+    // free error list
+    for (int i = 0; i < sema->errors_count; i++)
+    {
+        if (sema->errors[i].token)
+        {
+            token_dnit(sema->errors[i].token);
+            free(sema->errors[i].token);
+        }
+        free(sema->errors[i].message);
+        free(sema->errors[i].file_path);
+        free(sema->errors[i].source);
+    }
+    free(sema->errors);
+
+    // free current file context
+    free(sema->current_file_path);
+    free(sema->current_source);
+
     // free loaded modules
     LoadedModule *mod = sema->loaded_modules;
     while (mod)
     {
         LoadedModule *next = mod->next;
         free(mod->module_path);
+        free(mod->file_path);
+        free(mod->source);
         // note: ast is not freed here as it may still be in use
         free(mod);
         mod = next;
@@ -117,6 +192,20 @@ void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_r
     sema->dep_root   = dep_root ? strdup(dep_root) : NULL;
 }
 
+void sema_set_file_context(Sema *sema, const char *file_path, const char *source)
+{
+    if (!sema)
+    {
+        return;
+    }
+
+    free(sema->current_file_path);
+    free(sema->current_source);
+
+    sema->current_file_path = file_path ? strdup(file_path) : NULL;
+    sema->current_source    = source ? strdup(source) : NULL;
+}
+
 SymbolTable *sema_get_root_table(Sema *sema)
 {
     return sema ? sema->root_table : NULL;
@@ -144,11 +233,120 @@ int sema_get_error_count(Sema *sema)
     return sema ? sema->error_count : 0;
 }
 
+// helper: get line number from position in source
+static int sema_get_line(const char *source, int pos)
+{
+    int line = 0;
+    for (int i = 0; i < pos && source[i] != '\0'; i++)
+    {
+        if (source[i] == '\n')
+        {
+            line++;
+        }
+    }
+    return line;
+}
+
+// helper: get column offset from position in source
+static int sema_get_column(const char *source, int pos)
+{
+    int col = 0;
+    for (int i = 0; i < pos && source[i] != '\0'; i++)
+    {
+        if (source[i] == '\n')
+        {
+            col = 0;
+        }
+        else
+        {
+            col++;
+        }
+    }
+    return col;
+}
+
+// helper: get line text from source
+static char *sema_get_line_text(const char *source, int line)
+{
+    int line_start   = 0;
+    int current_line = 0;
+
+    while (current_line < line && source[line_start] != '\0')
+    {
+        if (source[line_start] == '\n')
+        {
+            current_line++;
+        }
+        line_start++;
+    }
+
+    if (source[line_start] == '\0')
+    {
+        return strdup("");
+    }
+
+    int line_end = line_start;
+    while (source[line_end] != '\n' && source[line_end] != '\0')
+    {
+        line_end++;
+    }
+
+    int   line_len  = line_end - line_start;
+    char *line_text = malloc(line_len + 1);
+    if (line_text)
+    {
+        strncpy(line_text, source + line_start, line_len);
+        line_text[line_len] = '\0';
+    }
+    return line_text;
+}
+
 void sema_print_errors(Sema *sema)
 {
-    if (!sema || sema->error_count == 0)
+    if (!sema || sema->errors_count == 0)
     {
         return;
+    }
+
+    for (int i = 0; i < sema->errors_count; i++)
+    {
+        SemaError *err = &sema->errors[i];
+
+        if (err->token && err->source)
+        {
+            int   line      = sema_get_line(err->source, err->token->pos);
+            int   col       = sema_get_column(err->source, err->token->pos);
+            char *line_text = sema_get_line_text(err->source, line);
+
+            fprintf(stderr, "error: %s\n", err->message);
+            fprintf(stderr, "%s:%d:%d\n", err->file_path ? err->file_path : "<unknown>", line + 1, col + 1);
+            fprintf(stderr, "%5d | %s\n", line + 1, line_text ? line_text : "");
+
+            // print caret
+            fprintf(stderr, "      | ");
+            for (int j = 0; j < col; j++)
+            {
+                fprintf(stderr, " ");
+            }
+            // underline the token
+            int underline_len = err->token->len > 0 ? err->token->len : 1;
+            fprintf(stderr, "^");
+            for (int j = 1; j < underline_len; j++)
+            {
+                fprintf(stderr, "~");
+            }
+            fprintf(stderr, "\n");
+
+            free(line_text);
+        }
+        else if (err->token)
+        {
+            fprintf(stderr, "error at position %d: %s\n", err->token->pos, err->message);
+        }
+        else
+        {
+            fprintf(stderr, "error: %s\n", err->message);
+        }
     }
 
     fprintf(stderr, "%d semantic error(s) found\n", sema->error_count);
@@ -162,15 +360,7 @@ static void sema_error(Sema *sema, Token *token, const char *message)
     }
 
     sema->error_count++;
-
-    if (token)
-    {
-        fprintf(stderr, "semantic error at position %d: %s\n", token->pos, message);
-    }
-    else
-    {
-        fprintf(stderr, "semantic error: %s\n", message);
-    }
+    sema_error_list_add(sema, token, message);
 }
 
 // forward declarations for mutual recursion
@@ -1117,20 +1307,27 @@ static int sema_load_module(Sema *sema, const char *module_path, AstNode **out_a
         return -1;
     }
 
-    // cache the module
+    // cache the module (keep source for error reporting)
     LoadedModule *mod = malloc(sizeof(LoadedModule));
     if (mod)
     {
         mod->module_path     = strdup(module_path);
+        mod->file_path       = strdup(file_path);
+        mod->source          = source; // take ownership
         mod->ast             = ast;
         mod->next            = sema->loaded_modules;
         sema->loaded_modules = mod;
     }
 
     // analyze the imported module
-    // save current module path and restore after
+    // save current context and restore after
     char *saved_module_path = sema->module_path;
+    char *saved_file_path   = sema->current_file_path;
+    char *saved_source      = sema->current_source;
+
     sema->module_path       = strdup(module_path);
+    sema->current_file_path = strdup(file_path);
+    sema->current_source    = source; // borrowed from mod
 
     int result = 0;
     if (ast->kind == AST_PROGRAM && ast->program.stmts)
@@ -1153,10 +1350,12 @@ static int sema_load_module(Sema *sema, const char *module_path, AstNode **out_a
     }
 
     free(sema->module_path);
-    sema->module_path = saved_module_path;
+    free(sema->current_file_path);
+    sema->module_path       = saved_module_path;
+    sema->current_file_path = saved_file_path;
+    sema->current_source    = saved_source;
 
-    // clean up parser/lexer (source is kept alive for tokens)
-    // note: we don't free source because tokens reference it
+    // clean up parser/lexer
     parser_dnit(&parser);
     lexer_dnit(&lexer);
     free(file_path);

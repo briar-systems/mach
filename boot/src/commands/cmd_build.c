@@ -308,9 +308,11 @@ int cmd_build_handle(int argc, char **argv)
     free(src_root);
     free(dep_root);
 
+    // set file context for error reporting
+    sema_set_file_context(sema, input_file, source);
+
     if (sema_analyze(sema, ast) < 0)
     {
-        fprintf(stderr, "error: semantic analysis failed\n");
         sema_print_errors(sema);
         sema_destroy(sema);
         parser_dnit(&parser);
