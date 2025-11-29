@@ -5,6 +5,9 @@
 #include "compiler/symbol.h"
 #include <stdbool.h>
 
+// forward declarations
+struct ConfigDep;
+
 // semantic analyzer context
 typedef struct Sema Sema;
 
@@ -16,7 +19,9 @@ void  sema_destroy(Sema *sema);
 // project_id: the project's id from mach.toml (used as module prefix)
 // src_root: absolute path to the source directory
 // dep_root: absolute path to the dependencies directory (may be NULL)
-void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_root, const char *dep_root);
+// deps: array of dependency pointers from Config (may be NULL)
+// dep_count: number of dependencies
+void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_root, const char *dep_root, struct ConfigDep **deps, int dep_count);
 
 // set file context for error reporting (call before analyzing a file)
 void sema_set_file_context(Sema *sema, const char *file_path, const char *source);

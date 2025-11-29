@@ -53,9 +53,10 @@ int cmd_build_handle(int argc, char **argv)
     const char *target_binary = NULL;
 
     // module resolution info (stored for sema)
-    char *project_id = NULL;
-    char *src_root   = NULL;
-    char *dep_root   = NULL;
+    char   *project_id = NULL;
+    char   *src_root   = NULL;
+    char   *dep_root   = NULL;
+    Config *config     = NULL;
 
     if (is_project)
     {
@@ -67,7 +68,7 @@ int cmd_build_handle(int argc, char **argv)
             return 1;
         }
 
-        Config *config = config_load(config_path);
+        config = config_load(config_path);
         free(config_path);
 
         if (!config)
@@ -123,8 +124,7 @@ int cmd_build_handle(int argc, char **argv)
         input_file = entry_path;
 
         free(src_dir_path);
-        config_dnit(config);
-        free(config);
+        // note: config is kept alive until after sema_set_module_roots
     }
 
     // Determine output file
@@ -302,11 +302,18 @@ int cmd_build_handle(int argc, char **argv)
     // set module resolution roots if available
     if (project_id && src_root)
     {
-        sema_set_module_roots(sema, project_id, src_root, dep_root);
+        sema_set_module_roots(sema, project_id, src_root, dep_root, config ? config->deps : NULL, config ? config->dep_count : 0);
     }
     free(project_id);
     free(src_root);
     free(dep_root);
+    
+    // now we can free the config
+    if (config)
+    {
+        config_dnit(config);
+        free(config);
+    }
 
     // set file context for error reporting
     sema_set_file_context(sema, input_file, source);

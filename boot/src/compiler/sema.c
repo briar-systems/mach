@@ -3,6 +3,7 @@
 #include "compiler/lexer.h"
 #include "compiler/parser.h"
 #include "compiler/type.h"
+#include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +57,8 @@ struct Sema
     char         *project_id;     // project id (module prefix)
     char         *src_root;       // source directory path
     char         *dep_root;       // dependencies directory path
+    ConfigDep   **deps;           // dependencies for module resolution
+    int           dep_count;      // number of dependencies
     LoadedModule *loaded_modules; // cache of loaded modules
     ImportAlias  *import_aliases; // linked list of import aliases
 };
@@ -110,6 +113,8 @@ Sema *sema_create(const char *module_path)
     sema->project_id        = NULL;
     sema->src_root          = NULL;
     sema->dep_root          = NULL;
+    sema->deps              = NULL;
+    sema->dep_count         = 0;
     sema->loaded_modules    = NULL;
     sema->import_aliases    = NULL;
 
@@ -142,6 +147,21 @@ void sema_destroy(Sema *sema)
     if (sema->dep_root)
     {
         free(sema->dep_root);
+    }
+
+    // free deep-copied dependencies
+    if (sema->deps)
+    {
+        for (int i = 0; i < sema->dep_count; i++)
+        {
+            if (sema->deps[i])
+            {
+                free(sema->deps[i]->name);
+                free(sema->deps[i]->path);
+                free(sema->deps[i]);
+            }
+        }
+        free(sema->deps);
     }
 
     // free error list
@@ -190,7 +210,7 @@ void sema_destroy(Sema *sema)
     free(sema);
 }
 
-void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_root, const char *dep_root)
+void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_root, const char *dep_root, ConfigDep **deps, int dep_count)
 {
     if (!sema)
     {
@@ -209,10 +229,49 @@ void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_r
     {
         free(sema->dep_root);
     }
+    if (sema->deps)
+    {
+        free(sema->deps);
+    }
 
     sema->project_id = project_id ? strdup(project_id) : NULL;
     sema->src_root   = src_root ? strdup(src_root) : NULL;
     sema->dep_root   = dep_root ? strdup(dep_root) : NULL;
+    
+    // make deep copies of dependencies (they will be freed by Config before sema is destroyed)
+    if (deps && dep_count > 0)
+    {
+        sema->deps = malloc(sizeof(ConfigDep *) * dep_count);
+        if (sema->deps)
+        {
+            for (int i = 0; i < dep_count; i++)
+            {
+                ConfigDep *dep_copy = malloc(sizeof(ConfigDep));
+                if (dep_copy && deps[i])
+                {
+                    dep_copy->name = deps[i]->name ? strdup(deps[i]->name) : NULL;
+                    dep_copy->type = deps[i]->type;
+                    dep_copy->path = deps[i]->path ? strdup(deps[i]->path) : NULL;
+                    dep_copy->version = NULL; // we don't need version info for module resolution
+                }
+                else
+                {
+                    dep_copy = NULL;
+                }
+                sema->deps[i] = dep_copy;
+            }
+            sema->dep_count = dep_count;
+        }
+        else
+        {
+            sema->dep_count = 0;
+        }
+    }
+    else
+    {
+        sema->deps = NULL;
+        sema->dep_count = 0;
+    }
 }
 
 void sema_set_file_context(Sema *sema, const char *file_path, const char *source)
@@ -1305,9 +1364,75 @@ static char *sema_resolve_module_path(Sema *sema, const char *module_path)
     size_t id_len = strlen(sema->project_id);
 
     // check if module_path starts with project_id
-    if (strncmp(module_path, sema->project_id, id_len) != 0)
+    if (strncmp(module_path, sema->project_id, id_len) != 0 || (module_path[id_len] != '.' && module_path[id_len] != '\0'))
     {
-        // check dependencies (TODO: implement dependency resolution)
+        // check dependencies
+        if (sema->deps && sema->dep_count > 0 && sema->dep_root)
+        {
+            // try each dependency
+            for (int i = 0; i < sema->dep_count; i++)
+            {
+                ConfigDep *dep = sema->deps[i];
+                if (!dep || !dep->name)
+                {
+                    continue;
+                }
+
+                size_t dep_name_len = strlen(dep->name);
+
+                // check if module_path starts with dependency name
+                if (strncmp(module_path, dep->name, dep_name_len) == 0 && (module_path[dep_name_len] == '.' || module_path[dep_name_len] == '\0'))
+                {
+                    // found matching dependency, resolve path
+                    const char *rest = module_path + dep_name_len;
+                    if (*rest == '.')
+                    {
+                        rest++;
+                    }
+
+                    // construct path: dep_root/dep_name/src/rest.mach
+                    size_t rest_len = strlen(rest);
+                    size_t dep_root_len = strlen(sema->dep_root);
+                    size_t dep_name_path_len = dep_name_len;
+                    size_t path_len = dep_root_len + 1 + dep_name_path_len + 5 + rest_len + 6; // dep_root + '/' + dep_name + "/src/" + rest + ".mach\0"
+
+                    char *file_path = malloc(path_len);
+                    if (!file_path)
+                    {
+                        return NULL;
+                    }
+
+                    // build path: dep_root/dep_name/src/rest.mach
+                    strcpy(file_path, sema->dep_root);
+                    strcat(file_path, "/");
+                    strcat(file_path, dep->name);
+                    strcat(file_path, "/src/");
+
+                    // copy rest, replacing dots with slashes
+                    char *dst = file_path + strlen(file_path);
+                    const char *src = rest;
+                    while (*src)
+                    {
+                        if (*src == '.')
+                        {
+                            *dst++ = '/';
+                        }
+                        else
+                        {
+                            *dst++ = *src;
+                        }
+                        src++;
+                    }
+                    *dst = '\0';
+
+                    strcat(file_path, ".mach");
+
+                    return file_path;
+                }
+            }
+        }
+
+        // no matching dependency found
         return NULL;
     }
 

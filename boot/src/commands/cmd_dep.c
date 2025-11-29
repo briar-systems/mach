@@ -21,7 +21,7 @@ void cmd_dep_help(FILE *stream)
     fprintf(stream, "  list                 list dependencies in the current project\n");
     fprintf(stream, "  info <name>          show information about a dependency\n");
     fprintf(stream, "  tidy                 perform a submodule maintenance pass\n");
-    fprintf(stream, "  add [--local] <path> [name] [--version <version>]\n");
+    fprintf(stream, "  add [--local] <path> <name> [--version <version>]\n");
     fprintf(stream, "                       register a dependency (assumes remote by default)\n");
     fprintf(stream, "  del  <name>          remove a dependency entry\n");
     fprintf(stream, "  pull [name]          refresh vendored dependencies\n");
@@ -428,8 +428,8 @@ static int handle_dep_add(int argc, char **argv)
 {
     if (argc < 4)
     {
-        fprintf(stderr, "error: dep add requires at least a path/url argument\n");
-        cmd_dep_help(stderr);
+        fprintf(stderr, "error: dep add requires a path/url and dependency name\n");
+        fprintf(stderr, "usage: mach dep add [--local] <path> <name> [--version <version>]\n");
         return 1;
     }
 
@@ -478,6 +478,14 @@ static int handle_dep_add(int argc, char **argv)
     if (!path_or_url)
     {
         fprintf(stderr, "error: dep add requires a path/url argument\n");
+        fprintf(stderr, "usage: mach dep add [--local] <path> <name> [--version <version>]\n");
+        return 1;
+    }
+    
+    if (!dep_name)
+    {
+        fprintf(stderr, "error: dep add requires a dependency name\n");
+        fprintf(stderr, "usage: mach dep add [--local] <path> <name> [--version <version>]\n");
         return 1;
     }
 
