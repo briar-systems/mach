@@ -17,6 +17,15 @@ typedef struct LoadedModule
     struct LoadedModule *next;
 } LoadedModule;
 
+// track import aliases (use alias: module.path;)
+typedef struct ImportAlias
+{
+    char               *alias;       // the alias name
+    char               *module_path; // FQN of the module
+    SymbolTable        *table;       // symbol table of the imported module
+    struct ImportAlias *next;
+} ImportAlias;
+
 // semantic error record
 typedef struct SemaError
 {
@@ -48,6 +57,7 @@ struct Sema
     char         *src_root;       // source directory path
     char         *dep_root;       // dependencies directory path
     LoadedModule *loaded_modules; // cache of loaded modules
+    ImportAlias  *import_aliases; // linked list of import aliases
 };
 
 // add error to list
@@ -101,6 +111,7 @@ Sema *sema_create(const char *module_path)
     sema->src_root          = NULL;
     sema->dep_root          = NULL;
     sema->loaded_modules    = NULL;
+    sema->import_aliases    = NULL;
 
     return sema;
 }
@@ -162,6 +173,18 @@ void sema_destroy(Sema *sema)
         // note: ast is not freed here as it may still be in use
         free(mod);
         mod = next;
+    }
+
+    // free import aliases
+    ImportAlias *alias = sema->import_aliases;
+    while (alias)
+    {
+        ImportAlias *next = alias->next;
+        free(alias->alias);
+        free(alias->module_path);
+        // note: symbol table is not freed here as it's part of loaded modules
+        free(alias);
+        alias = next;
     }
 
     free(sema);
@@ -1486,8 +1509,19 @@ static int sema_analyze_use(Sema *sema, AstNode *node)
         return -1;
     }
 
-    // TODO: aliased imports should create a namespace wrapper
-    (void)alias;
+    // if aliased, store the alias mapping
+    if (alias)
+    {
+        ImportAlias *new_alias = malloc(sizeof(ImportAlias));
+        if (new_alias)
+        {
+            new_alias->alias       = strdup(alias);
+            new_alias->module_path = strdup(module_path);
+            new_alias->table       = sema->root_table; // symbols are in root table
+            new_alias->next        = sema->import_aliases;
+            sema->import_aliases   = new_alias;
+        }
+    }
 
     return 0;
 }
@@ -1907,6 +1941,63 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
     case AST_EXPR_FIELD:
     {
+        // check if this is an aliased module access (alias.symbol) BEFORE analyzing the object
+        // this prevents errors when the alias name is not in the symbol table
+        if (node->field_expr.object->kind == AST_EXPR_IDENT)
+        {
+            const char *ident_name = node->field_expr.object->ident_expr.name;
+
+            // check if ident_name matches an import alias
+            ImportAlias *alias = sema->import_aliases;
+            while (alias)
+            {
+                if (strcmp(alias->alias, ident_name) == 0)
+                {
+                    // this is an aliased module access
+                    // look up the symbol in the module's namespace
+                    const char *symbol_name = node->field_expr.field;
+
+                    // find symbols from the imported module by checking module_path
+                    Symbol *sym = sema->root_table->symbols;
+                    while (sym)
+                    {
+                        if (sym->module_path && strcmp(sym->module_path, alias->module_path) == 0 && strcmp(sym->name, symbol_name) == 0 && sym->is_public)
+                        {
+                            // found matching symbol from the aliased module
+                            // if symbol was collected but not yet analyzed, analyze it now
+                            if (!sym->type && sym->decl)
+                            {
+                                SymbolTable *saved_table = sema->current_table;
+                                sema->current_table      = sema->root_table;
+
+                                if (sema_analyze_stmt(sema, sym->decl) < 0)
+                                {
+                                    sema->current_table = saved_table;
+                                    return -1;
+                                }
+
+                                sema->current_table = saved_table;
+                            }
+
+                            // convert this field access into an identifier
+                            node->kind            = AST_EXPR_IDENT;
+                            node->ident_expr.name = strdup(symbol_name);
+                            node->symbol          = sym;
+                            node->type            = sym->type;
+                            return 0;
+                        }
+                        sym = sym->next;
+                    }
+
+                    // symbol not found in aliased module
+                    sema_error(sema, node->token, "undefined symbol in aliased module");
+                    return -1;
+                }
+                alias = alias->next;
+            }
+        }
+
+        // not an alias, analyze object normally
         if (sema_analyze_expr(sema, node->field_expr.object) < 0)
         {
             return -1;
