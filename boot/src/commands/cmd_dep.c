@@ -403,17 +403,33 @@ static int handle_dep_del(int argc, char **argv)
 
     printf("dependency '%s' removed successfully\n", dep_name);
 
-    // remove the submodule if it exists
-    if (git_is_repo("."))
+    // remove the cached dependency directory
+    const char *dep_dir = config->dir_dep ? config->dir_dep : "dep";
+    char *dep_path = path_join(dep_dir, dep_name);
+    if (dep_path)
     {
-        const char *dep_dir = config->dir_dep ? config->dir_dep : "dep";
-        char *dep_path = path_join(dep_dir, dep_name);
-        if (dep_path && git_is_repo(dep_path))
+        if (is_directory(dep_path))
         {
-            printf("removing submodule '%s'...\n", dep_name);
-            if (!git_submodule_remove(dep_path))
+            if (git_is_repo(dep_path))
             {
-                fprintf(stderr, "warning: failed to remove submodule '%s'\n", dep_name);
+                // it's a git submodule
+                printf("removing submodule '%s'...\n", dep_name);
+                if (!git_submodule_remove(dep_path))
+                {
+                    fprintf(stderr, "warning: failed to remove submodule '%s'\n", dep_name);
+                }
+            }
+            else
+            {
+                // it's a local dependency (copied directory)
+                printf("removing cached dependency directory '%s'...\n", dep_name);
+                char rm_cmd[1024];
+                snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf \"%s\"", dep_path);
+                int result = system(rm_cmd);
+                if (result != 0)
+                {
+                    fprintf(stderr, "warning: failed to remove dependency directory '%s'\n", dep_name);
+                }
             }
         }
         free(dep_path);
