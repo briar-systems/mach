@@ -1455,6 +1455,17 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
                 }
             }
         }
+        // analyze deferred statements (fin)
+        if (node->block_stmt.deferred_stmts)
+        {
+            for (int i = 0; i < node->block_stmt.deferred_stmts->count; i++)
+            {
+                if (sema_analyze_stmt(sema, node->block_stmt.deferred_stmts->items[i]) < 0)
+                {
+                    return -1;
+                }
+            }
+        }
         return 0;
 
     case AST_STMT_RET:
