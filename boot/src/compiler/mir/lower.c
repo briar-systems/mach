@@ -146,6 +146,53 @@ static void lower_pop_deferred_frame(LowerContext *ctx)
 static int       lower_stmt(LowerContext *ctx, AstNode *node);
 static MIRValue *lower_expr(LowerContext *ctx, AstNode *node);
 
+// check if an expression tree contains a function call
+static bool expr_contains_call(AstNode *node)
+{
+    if (!node)
+    {
+        return false;
+    }
+
+    switch (node->kind)
+    {
+    case AST_EXPR_CALL:
+        return true;
+
+    case AST_EXPR_BINARY:
+        return expr_contains_call(node->binary_expr.left) || expr_contains_call(node->binary_expr.right);
+
+    case AST_EXPR_UNARY:
+        return expr_contains_call(node->unary_expr.expr);
+
+    case AST_EXPR_CAST:
+        return expr_contains_call(node->cast_expr.expr);
+
+    case AST_EXPR_INDEX:
+        return expr_contains_call(node->index_expr.array) || expr_contains_call(node->index_expr.index);
+
+    case AST_EXPR_FIELD:
+        return expr_contains_call(node->field_expr.object);
+
+    case AST_EXPR_STRUCT:
+        if (node->struct_expr.fields)
+        {
+            for (int i = 0; i < node->struct_expr.fields->count; i++)
+            {
+                AstNode *field = node->struct_expr.fields->items[i];
+                if (field && expr_contains_call(field->field_expr.object))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+
+    default:
+        return false;
+    }
+}
+
 // emit deferred statements for current block only (in LIFO order)
 static void lower_emit_deferred_current(LowerContext *ctx)
 {
@@ -245,9 +292,10 @@ static MIRValue *lower_context_get_value(LowerContext *ctx, AstNode *node)
 
 // Allocate a stack slot for a local variable
 // Returns the negative offset from RBP (e.g., -8, -16, -24...)
+// If node is NULL, allocates an anonymous temporary slot
 static int32_t lower_context_alloc_stack_slot(LowerContext *ctx, AstNode *node, size_t size)
 {
-    if (!ctx || !node)
+    if (!ctx)
     {
         return 0;
     }
@@ -269,7 +317,7 @@ static int32_t lower_context_alloc_stack_slot(LowerContext *ctx, AstNode *node, 
     ctx->frame_size += size;
     int32_t offset = -(int32_t)ctx->frame_size;
 
-    // Record the slot
+    // Record the slot (node can be NULL for anonymous temporaries)
     ctx->stack_slots[ctx->stack_slot_count].node   = node;
     ctx->stack_slots[ctx->stack_slot_count].offset = offset;
     ctx->stack_slot_count++;
@@ -1945,6 +1993,9 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         }
 
         // lower arguments
+        // To handle nested calls correctly, we need to spill arguments to stack
+        // before evaluating any argument that contains a call. This prevents
+        // register corruption when nested calls use the same registers.
         MIROperand *args      = NULL;
         int         arg_count = 0;
         if (node->call_expr.args)
@@ -1963,12 +2014,79 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                 args[arg_idx++] = mir_operand_value(hidden_ptr_slot->id);
             }
 
+            // Check if any argument contains a call
+            bool has_nested_call = false;
             for (int i = 0; i < node->call_expr.args->count; i++)
             {
-                MIRValue *arg = lower_expr(ctx, node->call_expr.args->items[i]);
-                if (arg)
+                if (expr_contains_call(node->call_expr.args->items[i]))
                 {
-                    args[arg_idx++] = mir_operand_value(arg->id);
+                    has_nested_call = true;
+                    break;
+                }
+            }
+
+            if (has_nested_call)
+            {
+                // Spill strategy: evaluate each argument and immediately spill to stack
+                // then reload all arguments from stack before the call
+                int32_t   *spill_offsets = malloc(node->call_expr.args->count * sizeof(int32_t));
+                MIRValue **arg_values    = malloc(node->call_expr.args->count * sizeof(MIRValue *));
+
+                for (int i = 0; i < node->call_expr.args->count; i++)
+                {
+                    // Evaluate argument
+                    MIRValue *arg = lower_expr(ctx, node->call_expr.args->items[i]);
+                    arg_values[i] = arg;
+
+                    if (arg)
+                    {
+                        // Allocate stack slot for this argument
+                        spill_offsets[i] = lower_context_alloc_stack_slot(ctx, NULL, 8);
+
+                        // Spill to stack
+                        MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                        mir_inst_add_operand(store, mir_operand_value(arg->id));
+                        mir_inst_add_operand(store, mir_operand_imm_int(spill_offsets[i]));
+                        mir_block_append_inst(ctx->current_block, store);
+                    }
+                    else
+                    {
+                        spill_offsets[i] = 0;
+                    }
+                }
+
+                // Reload all arguments from stack
+                for (int i = 0; i < node->call_expr.args->count; i++)
+                {
+                    if (arg_values[i] && spill_offsets[i] != 0)
+                    {
+                        MIRValue *reloaded = mir_function_alloc_value(ctx->current_function, NULL, "arg_reload");
+                        MIRInst  *load     = mir_inst_create(MIR_OP_LOAD, NULL);
+                        mir_inst_add_operand(load, mir_operand_imm_int(spill_offsets[i]));
+                        mir_inst_set_result(load, reloaded);
+                        mir_block_append_inst(ctx->current_block, load);
+
+                        args[arg_idx++] = mir_operand_value(reloaded->id);
+                    }
+                    else if (arg_values[i])
+                    {
+                        args[arg_idx++] = mir_operand_value(arg_values[i]->id);
+                    }
+                }
+
+                free(spill_offsets);
+                free(arg_values);
+            }
+            else
+            {
+                // No nested calls - just evaluate arguments normally
+                for (int i = 0; i < node->call_expr.args->count; i++)
+                {
+                    MIRValue *arg = lower_expr(ctx, node->call_expr.args->items[i]);
+                    if (arg)
+                    {
+                        args[arg_idx++] = mir_operand_value(arg->id);
+                    }
                 }
             }
         }
