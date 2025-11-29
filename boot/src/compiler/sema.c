@@ -177,13 +177,24 @@ static void sema_error(Sema *sema, Token *token, const char *message)
 static int   sema_analyze_stmt(Sema *sema, AstNode *node);
 static int   sema_analyze_expr(Sema *sema, AstNode *node);
 static Type *sema_resolve_type(Sema *sema, AstNode *type_node);
+static int   sema_collect_symbols(Sema *sema, AstNode *node);
+static int   sema_analyze_use(Sema *sema, AstNode *node);
 
-// analyze function declaration
-static int sema_analyze_fun(Sema *sema, AstNode *node)
+// collect symbols from a statement (first pass - no body analysis)
+static int sema_collect_fun_symbol(Sema *sema, AstNode *node)
 {
     if (node->kind != AST_STMT_FUN)
     {
         return -1;
+    }
+
+    // check if symbol already exists (from forward declaration or previous pass)
+    Symbol *existing = symbol_table_lookup_local(sema->current_table, node->fun_stmt.name);
+    if (existing)
+    {
+        // symbol already collected, just link it
+        node->symbol = existing;
+        return 0;
     }
 
     // create symbol for function
@@ -193,19 +204,217 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         return -1;
     }
 
-    // check for generics
-    if (node->fun_stmt.generics)
+    sym->is_public = node->fun_stmt.is_public;
+    sym->decl      = node;
+
+    // check for generics - defer full resolution
+    if (node->fun_stmt.generics && node->fun_stmt.generics->count > 0)
     {
         sym->is_generic = true;
-        sym->decl       = node;
-        // Add to symbol table
-        if (symbol_table_insert(sema->current_table, sym) < 0)
+    }
+
+    // add function to symbol table (type will be resolved in analysis pass)
+    if (symbol_table_insert(sema->current_table, sym) < 0)
+    {
+        sema_error(sema, node->token, "duplicate function declaration");
+        symbol_destroy(sym);
+        return -1;
+    }
+
+    node->symbol = sym;
+    return 0;
+}
+
+static int sema_collect_rec_symbol(Sema *sema, AstNode *node)
+{
+    if (node->kind != AST_STMT_REC)
+    {
+        return -1;
+    }
+
+    Symbol *existing = symbol_table_lookup_local(sema->current_table, node->rec_stmt.name);
+    if (existing)
+    {
+        node->symbol = existing;
+        return 0;
+    }
+
+    Symbol *sym = symbol_create(node->rec_stmt.name, SYMBOL_TYPE, sema->module_path);
+    if (!sym)
+    {
+        return -1;
+    }
+
+    sym->is_public = node->rec_stmt.is_public;
+    sym->decl      = node;
+
+    if (node->rec_stmt.generics && node->rec_stmt.generics->count > 0)
+    {
+        sym->is_generic = true;
+    }
+
+    if (symbol_table_insert(sema->current_table, sym) < 0)
+    {
+        sema_error(sema, node->token, "duplicate type definition");
+        symbol_destroy(sym);
+        return -1;
+    }
+
+    node->symbol = sym;
+    return 0;
+}
+
+static int sema_collect_def_symbol(Sema *sema, AstNode *node)
+{
+    if (node->kind != AST_STMT_DEF)
+    {
+        return -1;
+    }
+
+    Symbol *existing = symbol_table_lookup_local(sema->current_table, node->def_stmt.name);
+    if (existing)
+    {
+        node->symbol = existing;
+        return 0;
+    }
+
+    Symbol *sym = symbol_create(node->def_stmt.name, SYMBOL_TYPE, sema->module_path);
+    if (!sym)
+    {
+        return -1;
+    }
+
+    sym->is_public = node->def_stmt.is_public;
+    sym->decl      = node;
+
+    if (symbol_table_insert(sema->current_table, sym) < 0)
+    {
+        sema_error(sema, node->token, "duplicate type definition");
+        symbol_destroy(sym);
+        return -1;
+    }
+
+    node->symbol = sym;
+    return 0;
+}
+
+static int sema_collect_var_symbol(Sema *sema, AstNode *node)
+{
+    if (node->kind != AST_STMT_VAL && node->kind != AST_STMT_VAR)
+    {
+        return -1;
+    }
+
+    Symbol *existing = symbol_table_lookup_local(sema->current_table, node->var_stmt.name);
+    if (existing)
+    {
+        node->symbol = existing;
+        return 0;
+    }
+
+    Symbol *sym = symbol_create(node->var_stmt.name, SYMBOL_VARIABLE, sema->module_path);
+    if (!sym)
+    {
+        return -1;
+    }
+
+    sym->is_public  = node->var_stmt.is_public;
+    sym->is_mutable = (node->kind == AST_STMT_VAR);
+    sym->decl       = node;
+
+    if (symbol_table_insert(sema->current_table, sym) < 0)
+    {
+        sema_error(sema, node->token, "duplicate variable declaration");
+        symbol_destroy(sym);
+        return -1;
+    }
+
+    node->symbol = sym;
+    return 0;
+}
+
+// collect all top-level symbols from a list of statements
+static int sema_collect_symbols(Sema *sema, AstNode *node)
+{
+    if (!node)
+    {
+        return 0;
+    }
+
+    switch (node->kind)
+    {
+    case AST_STMT_FUN:
+        return sema_collect_fun_symbol(sema, node);
+
+    case AST_STMT_REC:
+        return sema_collect_rec_symbol(sema, node);
+
+    case AST_STMT_DEF:
+        return sema_collect_def_symbol(sema, node);
+
+    case AST_STMT_VAL:
+    case AST_STMT_VAR:
+        return sema_collect_var_symbol(sema, node);
+
+    case AST_STMT_USE:
+        // process use statements during collection to make imported symbols available
+        return sema_analyze_use(sema, node);
+
+    case AST_COMPTIME:
+    case AST_STMT_COMPTIME_IF:
+    case AST_STMT_COMPTIME_OR:
+        // comptime statements are processed in the analysis pass
+        return 0;
+
+    default:
+        return 0;
+    }
+}
+
+// analyze function declaration (second pass - full analysis)
+static int sema_analyze_fun(Sema *sema, AstNode *node)
+{
+    if (node->kind != AST_STMT_FUN)
+    {
+        return -1;
+    }
+
+    // get symbol from collection pass (or create if not collected)
+    Symbol *sym = node->symbol;
+    if (!sym)
+    {
+        sym = symbol_table_lookup_local(sema->current_table, node->fun_stmt.name);
+        if (!sym)
         {
-            sema_error(sema, node->token, "duplicate function declaration");
-            symbol_destroy(sym);
-            return -1;
+            // symbol wasn't collected, create it now
+            sym = symbol_create(node->fun_stmt.name, SYMBOL_FUNCTION, sema->module_path);
+            if (!sym)
+            {
+                return -1;
+            }
+            sym->is_public = node->fun_stmt.is_public;
+            sym->decl      = node;
+
+            if (symbol_table_insert(sema->current_table, sym) < 0)
+            {
+                sema_error(sema, node->token, "duplicate function declaration");
+                symbol_destroy(sym);
+                return -1;
+            }
         }
         node->symbol = sym;
+    }
+
+    // skip if already analyzed (e.g., via on-demand analysis)
+    if (sym->type)
+    {
+        return 0;
+    }
+
+    // check for generics - defer full analysis
+    if (node->fun_stmt.generics && node->fun_stmt.generics->count > 0)
+    {
+        sym->is_generic = true;
         return 0;
     }
 
@@ -217,7 +426,6 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         if (!ret_type)
         {
             sema_error(sema, node->fun_stmt.return_type->token, "failed to resolve return type");
-            symbol_destroy(sym);
             return -1;
         }
     }
@@ -236,7 +444,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
             AstNode *param = node->fun_stmt.params->items[i];
             if (param->kind == AST_STMT_PARAM)
             {
-                Type *pt = NULL; // default? or error?
+                Type *pt = NULL;
                 if (param->param_stmt.type)
                 {
                     pt = sema_resolve_type(sema, param->param_stmt.type);
@@ -244,37 +452,22 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
                     {
                         sema_error(sema, param->token, "failed to resolve parameter type");
                         free(param_types);
-                        symbol_destroy(sym);
                         return -1;
                     }
                 }
                 else
                 {
-                    // Parameter must have type?
-                    // In Mach, yes? "val: T"
                     sema_error(sema, param->token, "parameter must have type");
                     free(param_types);
-                    symbol_destroy(sym);
                     return -1;
                 }
                 param_types[i] = pt;
-                param->type    = pt; // Store for later use in body
+                param->type    = pt;
             }
         }
     }
 
     sym->type = type_create_function(ret_type, param_types, param_count);
-    sym->decl = node;
-
-    // add function to symbol table
-    if (symbol_table_insert(sema->current_table, sym) < 0)
-    {
-        sema_error(sema, node->token, "duplicate function declaration");
-        symbol_destroy(sym);
-        return -1;
-    }
-
-    node->symbol = sym;
 
     // Note: We don't insert into the type's methods table here because symbols
     // can only be in one linked list at a time. Method lookup will scan the
@@ -296,7 +489,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
                 if (param->kind == AST_STMT_PARAM)
                 {
                     Symbol *param_sym = symbol_create(param->param_stmt.name, SYMBOL_VARIABLE, sema->module_path);
-                    param_sym->type   = param->type; // Use resolved type
+                    param_sym->type   = param->type;
 
                     symbol_table_insert(sema->current_table, param_sym);
                     param->symbol   = param_sym;
@@ -321,10 +514,30 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
         return -1;
     }
 
-    Symbol *sym = symbol_create(node->var_stmt.name, SYMBOL_VARIABLE, sema->module_path);
+    // get symbol from collection pass (or create if not collected)
+    Symbol *sym = node->symbol;
     if (!sym)
     {
-        return -1;
+        sym = symbol_table_lookup_local(sema->current_table, node->var_stmt.name);
+        if (!sym)
+        {
+            sym = symbol_create(node->var_stmt.name, SYMBOL_VARIABLE, sema->module_path);
+            if (!sym)
+            {
+                return -1;
+            }
+            sym->is_public  = node->var_stmt.is_public;
+            sym->is_mutable = (node->kind == AST_STMT_VAR);
+            sym->decl       = node;
+
+            if (symbol_table_insert(sema->current_table, sym) < 0)
+            {
+                sema_error(sema, node->token, "duplicate variable declaration");
+                symbol_destroy(sym);
+                return -1;
+            }
+        }
+        node->symbol = sym;
     }
 
     // resolve explicit type if provided
@@ -334,7 +547,6 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
         if (!var_type)
         {
             sema_error(sema, node->token, "failed to resolve variable type");
-            symbol_destroy(sym);
             return -1;
         }
         sym->type = var_type;
@@ -345,7 +557,6 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
     {
         if (sema_analyze_expr(sema, node->var_stmt.init) < 0)
         {
-            symbol_destroy(sym);
             return -1;
         }
 
@@ -360,24 +571,12 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
             if (!type_can_assign_to(node->var_stmt.init->type, sym->type))
             {
                 sema_error(sema, node->token, "type mismatch: cannot assign type to variable");
-                symbol_destroy(sym);
                 return -1;
             }
         }
     }
 
-    // add to symbol table
-    if (symbol_table_insert(sema->current_table, sym) < 0)
-    {
-        sema_error(sema, node->token, "duplicate variable declaration");
-        symbol_destroy(sym);
-        return -1;
-    }
-
-    node->symbol = sym;
-    node->type   = sym->type;
-    sym->decl    = node; // Link symbol back to declaration node
-
+    node->type = sym->type;
     return 0;
 }
 
@@ -392,27 +591,35 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
         return -1;
     }
 
-    Symbol *sym = symbol_create(node->rec_stmt.name, SYMBOL_TYPE, sema->module_path);
+    // get symbol from collection pass (or create if not collected)
+    Symbol *sym = node->symbol;
     if (!sym)
     {
-        return -1;
+        sym = symbol_table_lookup_local(sema->current_table, node->rec_stmt.name);
+        if (!sym)
+        {
+            sym = symbol_create(node->rec_stmt.name, SYMBOL_TYPE, sema->module_path);
+            if (!sym)
+            {
+                return -1;
+            }
+            sym->is_public = node->rec_stmt.is_public;
+            sym->decl      = node;
+
+            if (symbol_table_insert(sema->current_table, sym) < 0)
+            {
+                sema_error(sema, node->token, "duplicate type definition");
+                symbol_destroy(sym);
+                return -1;
+            }
+        }
+        node->symbol = sym;
     }
 
     // check for generics - if present, defer field resolution until instantiation
     if (node->rec_stmt.generics && node->rec_stmt.generics->count > 0)
     {
         sym->is_generic = true;
-        sym->decl       = node;
-
-        // add to symbol table without resolving fields
-        if (symbol_table_insert(sema->current_table, sym) < 0)
-        {
-            sema_error(sema, node->token, "duplicate type definition");
-            symbol_destroy(sym);
-            return -1;
-        }
-
-        node->symbol = sym;
         return 0;
     }
 
@@ -425,7 +632,6 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
         fields = malloc(sizeof(TypeField) * field_count);
         if (!fields)
         {
-            symbol_destroy(sym);
             return -1;
         }
 
@@ -435,7 +641,6 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
             if (field_node->kind != AST_STMT_FIELD)
             {
                 free(fields);
-                symbol_destroy(sym);
                 return -1;
             }
 
@@ -446,13 +651,11 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
             if (!fields[i].type)
             {
                 sema_error(sema, field_node->token, "failed to resolve field type");
-                // cleanup
                 for (int j = 0; j <= i; j++)
                 {
                     free(fields[j].name);
                 }
                 free(fields);
-                symbol_destroy(sym);
                 return -1;
             }
         }
@@ -462,7 +665,6 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
     Type *rec_type = type_create_struct(node->rec_stmt.name, fields, field_count);
     if (!rec_type)
     {
-        // cleanup
         if (fields)
         {
             for (int i = 0; i < field_count; i++)
@@ -471,22 +673,11 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
             }
             free(fields);
         }
-        symbol_destroy(sym);
         return -1;
     }
 
-    sym->type    = rec_type;
-    sym->decl    = node;
-    node->symbol = sym;
-    node->type   = rec_type;
-
-    // add to symbol table
-    if (symbol_table_insert(sema->current_table, sym) < 0)
-    {
-        sema_error(sema, node->token, "duplicate type definition");
-        symbol_destroy(sym);
-        return -1;
-    }
+    sym->type  = rec_type;
+    node->type = rec_type;
 
     return 0;
 }
@@ -499,6 +690,31 @@ static int sema_analyze_def(Sema *sema, AstNode *node)
         return -1;
     }
 
+    // get symbol from collection pass (or create if not collected)
+    Symbol *sym = node->symbol;
+    if (!sym)
+    {
+        sym = symbol_table_lookup_local(sema->current_table, node->def_stmt.name);
+        if (!sym)
+        {
+            sym = symbol_create(node->def_stmt.name, SYMBOL_TYPE, sema->module_path);
+            if (!sym)
+            {
+                return -1;
+            }
+            sym->is_public = node->def_stmt.is_public;
+            sym->decl      = node;
+
+            if (symbol_table_insert(sema->current_table, sym) < 0)
+            {
+                sema_error(sema, node->token, "duplicate type definition");
+                symbol_destroy(sym);
+                return -1;
+            }
+        }
+        node->symbol = sym;
+    }
+
     // resolve the aliased type
     Type *aliased_type = sema_resolve_type(sema, node->def_stmt.type);
     if (!aliased_type)
@@ -507,27 +723,9 @@ static int sema_analyze_def(Sema *sema, AstNode *node)
         return -1;
     }
 
-    // create symbol for the type alias
-    Symbol *sym = symbol_create(node->def_stmt.name, SYMBOL_TYPE, sema->module_path);
-    if (!sym)
-    {
-        return -1;
-    }
-
     // type aliases are transparent - the alias has the same type as the underlying type
-    sym->type      = aliased_type;
-    sym->decl      = node;
-    sym->is_public = node->def_stmt.is_public;
-    node->symbol   = sym;
-    node->type     = aliased_type;
-
-    // add to symbol table
-    if (symbol_table_insert(sema->current_table, sym) < 0)
-    {
-        sema_error(sema, node->token, "duplicate type definition");
-        symbol_destroy(sym);
-        return -1;
-    }
+    sym->type  = aliased_type;
+    node->type = aliased_type;
 
     return 0;
 }
@@ -937,6 +1135,13 @@ static int sema_load_module(Sema *sema, const char *module_path, AstNode **out_a
     int result = 0;
     if (ast->kind == AST_PROGRAM && ast->program.stmts)
     {
+        // first pass: collect all symbols
+        for (int i = 0; i < ast->program.stmts->count; i++)
+        {
+            sema_collect_symbols(sema, ast->program.stmts->items[i]);
+        }
+
+        // second pass: full analysis
         for (int i = 0; i < ast->program.stmts->count; i++)
         {
             if (sema_analyze_stmt(sema, ast->program.stmts->items[i]) < 0)
@@ -1175,6 +1380,23 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             sema_error(sema, node->token, "undefined identifier");
             return -1;
         }
+
+        // if symbol was collected but not yet analyzed, analyze its declaration now
+        // temporarily switch to root scope since top-level declarations belong there
+        if (!sym->type && sym->decl)
+        {
+            SymbolTable *saved_table = sema->current_table;
+            sema->current_table      = sema->root_table;
+
+            if (sema_analyze_stmt(sema, sym->decl) < 0)
+            {
+                sema->current_table = saved_table;
+                return -1;
+            }
+
+            sema->current_table = saved_table;
+        }
+
         node->symbol = sym;
         node->type   = sym->type;
         return 0;
@@ -1830,6 +2052,13 @@ int sema_analyze(Sema *sema, AstNode *ast)
     {
         if (ast->program.stmts)
         {
+            // first pass: collect all top-level symbols
+            for (int i = 0; i < ast->program.stmts->count; i++)
+            {
+                sema_collect_symbols(sema, ast->program.stmts->items[i]);
+            }
+
+            // second pass: full analysis
             for (int i = 0; i < ast->program.stmts->count; i++)
             {
                 if (sema_analyze_stmt(sema, ast->program.stmts->items[i]) < 0)
@@ -1843,6 +2072,13 @@ int sema_analyze(Sema *sema, AstNode *ast)
     {
         if (ast->module.stmts)
         {
+            // first pass: collect all top-level symbols
+            for (int i = 0; i < ast->module.stmts->count; i++)
+            {
+                sema_collect_symbols(sema, ast->module.stmts->items[i]);
+            }
+
+            // second pass: full analysis
             for (int i = 0; i < ast->module.stmts->count; i++)
             {
                 if (sema_analyze_stmt(sema, ast->module.stmts->items[i]) < 0)
