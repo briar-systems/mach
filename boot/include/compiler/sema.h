@@ -18,6 +18,9 @@ void  sema_destroy(Sema *sema);
 // dep_root: absolute path to the dependencies directory (may be NULL)
 void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_root, const char *dep_root);
 
+// set file context for error reporting (call before analyzing a file)
+void sema_set_file_context(Sema *sema, const char *file_path, const char *source);
+
 // analyze ast and populate types/symbols
 // returns 0 on success, -1 on error
 int sema_analyze(Sema *sema, AstNode *ast);
