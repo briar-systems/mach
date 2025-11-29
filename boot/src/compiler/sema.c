@@ -1610,7 +1610,18 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         if (node->unary_expr.op == TOKEN_QUESTION)
         {
             // Address-of: ?T -> *T
-            // TODO: check if operand is an l-value (variable)
+            // check if operand is an l-value
+            AstNode *operand   = node->unary_expr.expr;
+            bool     is_lvalue = operand->kind == AST_EXPR_IDENT ||                                     // variable
+                             (operand->kind == AST_EXPR_UNARY && operand->unary_expr.op == TOKEN_AT) || // dereference
+                             operand->kind == AST_EXPR_FIELD ||                                         // field access
+                             operand->kind == AST_EXPR_INDEX;                                           // array indexing
+
+            if (!is_lvalue)
+            {
+                sema_error(sema, node->token, "cannot take address of temporary or r-value");
+                return -1;
+            }
             node->type = type_create_pointer(node->unary_expr.expr->type, false);
         }
         else if (node->unary_expr.op == TOKEN_AT)
@@ -1866,6 +1877,14 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
+        // track which fields have been initialized
+        int   field_count    = type->structure.field_count;
+        bool *field_provided = calloc(field_count, sizeof(bool));
+        if (!field_provided && field_count > 0)
+        {
+            return -1;
+        }
+
         // verify fields
         if (node->struct_expr.fields)
         {
@@ -1875,12 +1894,14 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 // field_init is AST_EXPR_FIELD (field: name, object: init_expr)
 
                 // find field in struct type
-                TypeField *field = NULL;
-                for (int j = 0; j < type->structure.field_count; j++)
+                TypeField *field     = NULL;
+                int        field_idx = -1;
+                for (int j = 0; j < field_count; j++)
                 {
                     if (strcmp(type->structure.fields[j].name, field_init->field_expr.field) == 0)
                     {
-                        field = &type->structure.fields[j];
+                        field     = &type->structure.fields[j];
+                        field_idx = j;
                         break;
                     }
                 }
@@ -1888,23 +1909,49 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 if (!field)
                 {
                     sema_error(sema, field_init->token, "undefined field in struct literal");
+                    free(field_provided);
                     return -1;
                 }
+
+                // check for duplicate field initialization
+                if (field_provided[field_idx])
+                {
+                    sema_error(sema, field_init->token, "duplicate field initialization");
+                    free(field_provided);
+                    return -1;
+                }
+                field_provided[field_idx] = true;
 
                 // analyze init expression
                 if (sema_analyze_expr(sema, field_init->field_expr.object) < 0)
                 {
+                    free(field_provided);
                     return -1;
                 }
 
                 if (!type_can_assign_to(field_init->field_expr.object->type, field->type))
                 {
                     sema_error(sema, field_init->token, "field type mismatch");
+                    free(field_provided);
                     return -1;
                 }
             }
         }
 
+        // check for missing required fields
+        for (int i = 0; i < field_count; i++)
+        {
+            if (!field_provided[i])
+            {
+                char errmsg[256];
+                snprintf(errmsg, sizeof(errmsg), "missing required field '%s' in struct literal", type->structure.fields[i].name);
+                sema_error(sema, node->token, errmsg);
+                free(field_provided);
+                return -1;
+            }
+        }
+
+        free(field_provided);
         node->type = type;
         return 0;
     }
@@ -2071,6 +2118,62 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
         sema_error(sema, node->token, "unsupported compiletime expression");
         return -1;
+    }
+
+    case AST_EXPR_NULL:
+    {
+        // null literal has untyped pointer type
+        node->type = type_get_primitive(TYPE_PTR);
+        return 0;
+    }
+
+    case AST_EXPR_ARRAY:
+    {
+        // array literal: [elem_type]{elem1, elem2, ...}
+        if (!node->array_expr.type)
+        {
+            sema_error(sema, node->token, "array literal requires element type");
+            return -1;
+        }
+
+        Type *elem_type = sema_resolve_type(sema, node->array_expr.type);
+        if (!elem_type)
+        {
+            sema_error(sema, node->token, "failed to resolve array element type");
+            return -1;
+        }
+
+        int elem_count = node->array_expr.elems ? node->array_expr.elems->count : 0;
+
+        // analyze and type-check each element
+        if (node->array_expr.elems)
+        {
+            for (int i = 0; i < elem_count; i++)
+            {
+                AstNode *elem = node->array_expr.elems->items[i];
+                if (sema_analyze_expr(sema, elem) < 0)
+                {
+                    return -1;
+                }
+
+                if (!type_can_assign_to(elem->type, elem_type))
+                {
+                    sema_error(sema, elem->token, "array element type mismatch");
+                    return -1;
+                }
+            }
+        }
+
+        node->type = type_create_array(elem_type, elem_count);
+        return 0;
+    }
+
+    case AST_EXPR_VARARGS:
+    {
+        // variadic argument pack - type is determined by context
+        // for now, treat as untyped pointer
+        node->type = type_get_primitive(TYPE_PTR);
+        return 0;
     }
 
     default:

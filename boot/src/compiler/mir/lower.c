@@ -145,6 +145,7 @@ static void lower_pop_deferred_frame(LowerContext *ctx)
 // forward declarations
 static int       lower_stmt(LowerContext *ctx, AstNode *node);
 static MIRValue *lower_expr(LowerContext *ctx, AstNode *node);
+static MIRValue *lower_address(LowerContext *ctx, AstNode *node);
 
 // check if an expression tree contains a function call
 static bool expr_contains_call(AstNode *node)
@@ -1157,6 +1158,191 @@ static MIRValue *lower_unary_expr(LowerContext *ctx, AstNode *node)
     return NULL;
 }
 
+// compute the address of an expression without loading its value
+// used for nested field access (p.x.y) and address-of operations
+static MIRValue *lower_address(LowerContext *ctx, AstNode *node)
+{
+    if (!ctx || !node)
+    {
+        return NULL;
+    }
+
+    switch (node->kind)
+    {
+    case AST_EXPR_IDENT:
+    {
+        if (!node->symbol || node->symbol->kind != SYMBOL_VARIABLE)
+        {
+            return NULL;
+        }
+
+        int32_t offset = lower_context_get_stack_offset(ctx, node->symbol->decl);
+        if (offset != 0)
+        {
+            // local variable: compute stack address
+            MIRValue *addr      = mir_function_alloc_value(ctx->current_function, NULL, "var_addr");
+            MIRInst  *addr_inst = mir_inst_create(MIR_OP_ADDR, NULL);
+            mir_inst_add_operand(addr_inst, mir_operand_imm_int(offset));
+            mir_inst_set_result(addr_inst, addr);
+            mir_block_append_inst(ctx->current_block, addr_inst);
+            return addr;
+        }
+        else
+        {
+            // global variable
+            MIRValue   *addr     = mir_function_alloc_value(ctx->current_function, NULL, "global_addr");
+            MIRInst    *mov      = mir_inst_create(MIR_OP_MOV, NULL);
+            const char *sym_name = symbol_get_linkage_name(node->symbol);
+            mir_inst_add_operand(mov, mir_operand_global(sym_name));
+            mir_inst_set_result(mov, addr);
+            mir_block_append_inst(ctx->current_block, mov);
+            return addr;
+        }
+    }
+
+    case AST_EXPR_UNARY:
+    {
+        if (node->unary_expr.op == TOKEN_AT)
+        {
+            // dereference: address of @ptr is ptr itself
+            return lower_expr(ctx, node->unary_expr.expr);
+        }
+        return NULL;
+    }
+
+    case AST_EXPR_FIELD:
+    {
+        // field access: obj.field
+        AstNode *obj      = node->field_expr.object;
+        Type    *obj_type = obj->type;
+
+        // check if object is a pointer
+        bool obj_is_pointer = (obj_type && obj_type->kind == TYPE_POINTER);
+
+        MIRValue *base_addr = NULL;
+
+        if (obj_is_pointer)
+        {
+            // pointer: load the pointer value
+            base_addr = lower_expr(ctx, obj);
+        }
+        else
+        {
+            // value: get the address of the object (recursive for nested access)
+            base_addr = lower_address(ctx, obj);
+        }
+
+        if (!base_addr)
+        {
+            return NULL;
+        }
+
+        // find field offset
+        Type *struct_type = obj_type;
+        if (struct_type->kind == TYPE_POINTER)
+        {
+            struct_type = struct_type->pointer.base;
+        }
+
+        int32_t field_offset = 0;
+        if (struct_type->kind == TYPE_STRUCT)
+        {
+            for (int i = 0; i < struct_type->structure.field_count; i++)
+            {
+                if (strcmp(struct_type->structure.fields[i].name, node->field_expr.field) == 0)
+                {
+                    field_offset = (int32_t)struct_type->structure.fields[i].offset;
+                    break;
+                }
+            }
+        }
+        else if (struct_type->kind == TYPE_UNION)
+        {
+            // unions have all fields at offset 0
+            field_offset = 0;
+        }
+
+        // add offset to base
+        if (field_offset != 0)
+        {
+            MIRValue *field_addr = mir_function_alloc_value(ctx->current_function, NULL, "field_addr");
+            MIRInst  *add        = mir_inst_binary(MIR_OP_ADD, NULL, mir_operand_value(base_addr->id), mir_operand_imm_int(field_offset));
+            mir_inst_set_result(add, field_addr);
+            mir_block_append_inst(ctx->current_block, add);
+            return field_addr;
+        }
+
+        return base_addr;
+    }
+
+    case AST_EXPR_INDEX:
+    {
+        // array indexing: arr[index]
+        AstNode *arr = node->index_expr.array;
+
+        MIRValue *base_addr = NULL;
+
+        if (arr->type && arr->type->kind == TYPE_POINTER)
+        {
+            // pointer: load the pointer value
+            base_addr = lower_expr(ctx, arr);
+        }
+        else
+        {
+            // array: get address
+            base_addr = lower_address(ctx, arr);
+        }
+
+        if (!base_addr)
+        {
+            return NULL;
+        }
+
+        MIRValue *index_val = lower_expr(ctx, node->index_expr.index);
+        if (!index_val)
+        {
+            return NULL;
+        }
+
+        // get element size
+        Type  *elem_type = NULL;
+        size_t elem_size = 8;
+        if (arr->type)
+        {
+            if (arr->type->kind == TYPE_ARRAY)
+            {
+                elem_type = arr->type->array.elem_type;
+            }
+            else if (arr->type->kind == TYPE_POINTER)
+            {
+                elem_type = arr->type->pointer.base;
+            }
+            if (elem_type)
+            {
+                elem_size = elem_type->size;
+            }
+        }
+
+        // calculate offset: index * elem_size
+        MIRValue *offset_val = mir_function_alloc_value(ctx->current_function, NULL, "index_offset");
+        MIRInst  *mul        = mir_inst_binary(MIR_OP_MUL, NULL, mir_operand_value(index_val->id), mir_operand_imm_int(elem_size));
+        mir_inst_set_result(mul, offset_val);
+        mir_block_append_inst(ctx->current_block, mul);
+
+        // add offset to base
+        MIRValue *elem_addr = mir_function_alloc_value(ctx->current_function, NULL, "elem_addr");
+        MIRInst  *add       = mir_inst_binary(MIR_OP_ADD, NULL, mir_operand_value(base_addr->id), mir_operand_value(offset_val->id));
+        mir_inst_set_result(add, elem_addr);
+        mir_block_append_inst(ctx->current_block, add);
+
+        return elem_addr;
+    }
+
+    default:
+        return NULL;
+    }
+}
+
 static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
 {
     if (!ctx || !node)
@@ -1419,12 +1605,18 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         }
         else
         {
-            // Complex expression: assume it evaluates to a pointer or we need to spill it?
-            // For now, assume it's a pointer if it's not a direct variable
-            // TODO: Handle nested field access (p.x.y)
-            // If p.x is a struct, lower_expr(p.x) would load it. We want the address.
-            // We need a lower_address function.
-            return NULL;
+            // nested field access or other complex expression
+            // use lower_address to get the address without loading
+            if (obj_is_pointer)
+            {
+                // pointer expression: load the pointer value
+                base_addr = lower_expr(ctx, obj);
+            }
+            else
+            {
+                // value expression: get its address
+                base_addr = lower_address(ctx, obj);
+            }
         }
 
         if (!base_addr)
