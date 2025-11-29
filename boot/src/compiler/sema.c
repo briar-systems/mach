@@ -454,6 +454,45 @@ static int sema_collect_rec_symbol(Sema *sema, AstNode *node)
     return 0;
 }
 
+static int sema_collect_uni_symbol(Sema *sema, AstNode *node)
+{
+    if (node->kind != AST_STMT_UNI)
+    {
+        return -1;
+    }
+
+    Symbol *existing = symbol_table_lookup_local(sema->current_table, node->uni_stmt.name);
+    if (existing)
+    {
+        node->symbol = existing;
+        return 0;
+    }
+
+    Symbol *sym = symbol_create(node->uni_stmt.name, SYMBOL_TYPE, sema->module_path);
+    if (!sym)
+    {
+        return -1;
+    }
+
+    sym->is_public = node->uni_stmt.is_public;
+    sym->decl      = node;
+
+    if (node->uni_stmt.generics && node->uni_stmt.generics->count > 0)
+    {
+        sym->is_generic = true;
+    }
+
+    if (symbol_table_insert(sema->current_table, sym) < 0)
+    {
+        sema_error(sema, node->token, "duplicate type definition");
+        symbol_destroy(sym);
+        return -1;
+    }
+
+    node->symbol = sym;
+    return 0;
+}
+
 static int sema_collect_def_symbol(Sema *sema, AstNode *node)
 {
     if (node->kind != AST_STMT_DEF)
@@ -538,6 +577,9 @@ static int sema_collect_symbols(Sema *sema, AstNode *node)
 
     case AST_STMT_REC:
         return sema_collect_rec_symbol(sema, node);
+
+    case AST_STMT_UNI:
+        return sema_collect_uni_symbol(sema, node);
 
     case AST_STMT_DEF:
         return sema_collect_def_symbol(sema, node);
@@ -656,7 +698,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
                             // bind the actual type name (e.g., "T") as a type parameter
                             // in this scope, so when we resolve "T" in return types/params,
                             // it resolves to this type parameter symbol
-                            Symbol *param_sym = symbol_create(actual->type_name.name, SYMBOL_TYPE, sema->module_path);
+                            Symbol *param_sym           = symbol_create(actual->type_name.name, SYMBOL_TYPE, sema->module_path);
                             param_sym->is_generic_param = true;
                             // store the formal parameter name for instantiation lookup
                             param_sym->generic_param_name = strdup(formal->type_param.name);
@@ -2115,11 +2157,13 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
     case AST_EXPR_STRUCT:
     {
         Type *type = sema_resolve_type(sema, node->struct_expr.type);
-        if (!type || type->kind != TYPE_STRUCT)
+        if (!type || (type->kind != TYPE_STRUCT && type->kind != TYPE_UNION))
         {
-            sema_error(sema, node->token, "invalid struct type");
+            sema_error(sema, node->token, "invalid struct or union type");
             return -1;
         }
+
+        bool is_union = (type->kind == TYPE_UNION);
 
         // track which fields have been initialized
         int   field_count    = type->structure.field_count;
@@ -2137,7 +2181,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 AstNode *field_init = node->struct_expr.fields->items[i];
                 // field_init is AST_EXPR_FIELD (field: name, object: init_expr)
 
-                // find field in struct type
+                // find field in struct/union type
                 TypeField *field     = NULL;
                 int        field_idx = -1;
                 for (int j = 0; j < field_count; j++)
@@ -2152,7 +2196,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
                 if (!field)
                 {
-                    sema_error(sema, field_init->token, "undefined field in struct literal");
+                    sema_error(sema, field_init->token, is_union ? "undefined field in union literal" : "undefined field in struct literal");
                     free(field_provided);
                     return -1;
                 }
@@ -2182,16 +2226,39 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
         }
 
-        // check for missing required fields
+        // validation: structs need all fields, unions need exactly one field
+        int initialized_count = 0;
         for (int i = 0; i < field_count; i++)
         {
-            if (!field_provided[i])
+            if (field_provided[i])
             {
-                char errmsg[256];
-                snprintf(errmsg, sizeof(errmsg), "missing required field '%s' in struct literal", type->structure.fields[i].name);
-                sema_error(sema, node->token, errmsg);
+                initialized_count++;
+            }
+        }
+
+        if (is_union)
+        {
+            // unions must have exactly one field initialized
+            if (initialized_count != 1)
+            {
+                sema_error(sema, node->token, "union literal must initialize exactly one field");
                 free(field_provided);
                 return -1;
+            }
+        }
+        else
+        {
+            // structs must have all fields initialized
+            for (int i = 0; i < field_count; i++)
+            {
+                if (!field_provided[i])
+                {
+                    char errmsg[256];
+                    snprintf(errmsg, sizeof(errmsg), "missing required field '%s' in struct literal", type->structure.fields[i].name);
+                    sema_error(sema, node->token, errmsg);
+                    free(field_provided);
+                    return -1;
+                }
             }
         }
 
