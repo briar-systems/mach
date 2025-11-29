@@ -321,10 +321,10 @@ struct AstNode
             AstList *elems; // elements
         } array_expr;
 
-        // struct literal
+        // record literal
         struct
         {
-            AstNode *type;                 // struct type
+            AstNode *type;                 // record type
             AstList *fields;               // field initializers
             bool     is_union_literal;     // true when literal uses 'uni' keyword without explicit type
             bool     is_anonymous_literal; // true when literal omits explicit type name

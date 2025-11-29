@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
-// NOTE: update this to match standard libary convention if and when it changes
+// note: update this to match standard libary convention if and when it changes
 static const char *template_main_mach = "use          std.system.runtime;\n"
                                         "use          std.types.string;\n"
                                         "use          std.collections.slice;\n"
@@ -17,8 +17,8 @@ static const char *template_main_mach = "use          std.system.runtime;\n"
                                         "    ret 0;\n"
                                         "}\n";
 
-// NOTE: update this to match config convention if and when it changes
-const char *template_mach_toml = "[project]\n"
+// note: update this to match config convention if and when it changes
+static const char *template_mach_toml = "[project]\n"
                                  "id      = \"%s\"\n"
                                  "name    = \"%s\"\n"
                                  "version = \"0.1.0\"\n"

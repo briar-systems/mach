@@ -376,7 +376,7 @@ bool type_is_numeric(Type *t)
 // primitives: length-prefixed name (e.g., "3i64", "2u8")
 // pointers: P<type> for mutable, K<type> for const/readonly
 // arrays: A<count>_<elem_type>
-// structs/unions: length-prefixed name, with I...E for generic args
+// records/unions: length-prefixed name, with I...E for generic args
 // returns number of chars written (not including null terminator)
 int type_mangle(Type *type, char *buffer, size_t buffer_size)
 {

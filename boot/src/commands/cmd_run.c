@@ -174,7 +174,7 @@ int cmd_run_handle(int argc, char **argv)
     // construct binary path
     char *binary_path = NULL;
 
-    // NOTE: binary_path is a mandatory field in ConfigTarget
+    // note: binary_path is a mandatory field in ConfigTarget
     char *out_path = path_join(project_root, config->dir_out);
     binary_path = path_join(out_path, target->binary);
     free(out_path);

@@ -119,8 +119,8 @@ int comptime_lookup(Sema *sema, AstNode *node)
             {
                 if (strcmp(segments[3], "os") == 0)
                 {
-                    // Hardcoded for now, ideally comes from build config
-                    set_string_result(node, "linux"); 
+                    // hardcoded for now, ideally comes from build config
+                    set_string_result(node, "x86_64");
                 }
                 else if (strcmp(segments[3], "arch") == 0)
                 {

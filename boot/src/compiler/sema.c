@@ -1040,7 +1040,7 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
         }
     }
 
-    // create struct type
+    // create record type
     Type *rec_type = type_create_struct(node->rec_stmt.name, fields, field_count);
     if (!rec_type)
     {
@@ -2131,13 +2131,13 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         Type *obj_type   = node->field_expr.object->type;
         Type *deref_type = obj_type;
 
-        // auto-dereference pointer to struct/union for field access
+        // auto-dereference pointer to record/union for field access
         if (obj_type->kind == TYPE_POINTER && (obj_type->pointer.base->kind == TYPE_STRUCT || obj_type->pointer.base->kind == TYPE_UNION))
         {
             deref_type = obj_type->pointer.base;
         }
 
-        // try field access on structs/unions
+        // try field access on records/unions
         if (deref_type->kind == TYPE_STRUCT || deref_type->kind == TYPE_UNION)
         {
             TypeField *fields      = (deref_type->kind == TYPE_STRUCT) ? deref_type->structure.fields : deref_type->union_type.fields;
@@ -2222,7 +2222,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                                 {
                                     ast_list_init(type_args);
 
-                                    // for each formal param, find the corresponding actual type from the instantiated struct
+                                    // for each formal param, find the corresponding actual type from the instantiated record
                                     for (int i = 0; i < formal_params->count && i < receiver_ast->type_name.generic_args->count; i++)
                                     {
                                         // get the field at the same index to infer type
@@ -2375,7 +2375,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         Type *type = sema_resolve_type(sema, node->struct_expr.type);
         if (!type || (type->kind != TYPE_STRUCT && type->kind != TYPE_UNION))
         {
-            sema_error(sema, node->token, "invalid struct or union type");
+            sema_error(sema, node->token, "invalid record or union type");
             return -1;
         }
 
@@ -2397,7 +2397,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 AstNode *field_init = node->struct_expr.fields->items[i];
                 // field_init is AST_EXPR_FIELD (field: name, object: init_expr)
 
-                // find field in struct/union type
+                // find field in record/union type
                 TypeField *field     = NULL;
                 int        field_idx = -1;
                 for (int j = 0; j < field_count; j++)
@@ -2412,7 +2412,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
                 if (!field)
                 {
-                    sema_error(sema, field_init->token, is_union ? "undefined field in union literal" : "undefined field in struct literal");
+                    sema_error(sema, field_init->token, is_union ? "undefined field in union literal" : "undefined field in record literal");
                     free(field_provided);
                     return -1;
                 }
@@ -2442,7 +2442,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
         }
 
-        // validation: structs need all fields, unions need exactly one field
+        // validation: records need all fields, unions need exactly one field
         int initialized_count = 0;
         for (int i = 0; i < field_count; i++)
         {
@@ -2464,13 +2464,13 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         }
         else
         {
-            // structs must have all fields initialized
+            // records must have all fields initialized
             for (int i = 0; i < field_count; i++)
             {
                 if (!field_provided[i])
                 {
                     char errmsg[256];
-                    snprintf(errmsg, sizeof(errmsg), "missing required field '%s' in struct literal", type->structure.fields[i].name);
+                    snprintf(errmsg, sizeof(errmsg), "missing required field '%s' in record literal", type->structure.fields[i].name);
                     sema_error(sema, node->token, errmsg);
                     free(field_provided);
                     return -1;
@@ -2767,10 +2767,6 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
         if (strcmp(name, "ptr") == 0)
         {
             return type_get_primitive(TYPE_PTR);
-        }
-        if (strcmp(name, "bool") == 0)
-        {
-            return type_get_primitive(TYPE_U8); // bool is u8
         }
 
         // look up user-defined types
