@@ -620,7 +620,6 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         }
     }
 
-    // Resolve parameter types to build function type
     Type **param_types = NULL;
     int    param_count = 0;
 
@@ -659,11 +658,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
 
     sym->type = type_create_function(ret_type, param_types, param_count);
 
-    // Note: We don't insert into the type's methods table here because symbols
-    // can only be in one linked list at a time. Method lookup will scan the
-    // symbol table for methods with matching receiver type instead.
-
-    // analyze function body if present
+    // analyze body
     if (node->fun_stmt.body)
     {
         // create new scope for function body
@@ -1001,33 +996,27 @@ static bool sema_eval_comptime_int(Sema *sema, AstNode *node, int64_t *out_val)
 
 static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
 {
-    // node is AST_COMPTIME
     AstNode *inner = node->comptime.inner;
 
-    // Check if it is an assignment
+    // handle assignment: $symbol.attr = value
     if (inner->kind == AST_EXPR_BINARY && inner->binary_expr.op == TOKEN_EQUAL)
     {
         AstNode *lhs = inner->binary_expr.left;
         AstNode *rhs = inner->binary_expr.right;
 
-        // Evaluate RHS
         if (sema_analyze_expr(sema, rhs) < 0)
         {
             return -1;
         }
 
-        // RHS must be constant
-        // For now, only string literals for name attribute
+        // rhs must be a string literal
         if (rhs->kind != AST_EXPR_LIT || rhs->lit_expr.kind != TOKEN_LIT_STRING)
         {
             sema_error(sema, rhs->token, "expected string literal for attribute value");
             return -1;
         }
 
-        // LHS must be field access on symbol
-        // $foo.name
-        // LHS is AST_EXPR_FIELD(object=foo, field=name)
-
+        // lhs must be $symbol.attribute
         if (lhs->kind != AST_EXPR_FIELD)
         {
             sema_error(sema, lhs->token, "expected attribute access (e.g. $foo.name)");
@@ -1037,22 +1026,18 @@ static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
         AstNode *object = lhs->field_expr.object;
         char    *field  = lhs->field_expr.field;
 
-        // Object must be identifier (symbol)
         if (object->kind != AST_EXPR_IDENT)
         {
             sema_error(sema, object->token, "expected symbol identifier");
             return -1;
         }
 
-        // Look up symbol
         Symbol *sym = symbol_table_lookup(sema->current_table, object->ident_expr.name);
         if (!sym)
         {
             sema_error(sema, object->token, "undefined symbol");
             return -1;
         }
-
-        // Handle attributes
         if (strcmp(field, "name") == 0)
         {
             if (sym->export_name)
@@ -1071,7 +1056,6 @@ static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
     }
     else if (inner->kind == AST_EXPR_CALL)
     {
-        // Handle $error(...) and $assert(...)
         AstNode *func = inner->call_expr.func;
         if (func->kind == AST_EXPR_IDENT)
         {
@@ -1390,9 +1374,7 @@ static int sema_analyze_use(Sema *sema, AstNode *node)
         return -1;
     }
 
-    // if alias is provided, we need to create a namespace
-    // for now, symbols are directly available (no namespacing without alias)
-    // TODO: implement aliased imports with namespace wrapper
+    // TODO: aliased imports should create a namespace wrapper
     (void)alias;
 
     return 0;
@@ -1523,27 +1505,21 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         return sema_analyze_stmt(sema, node->for_stmt.body);
 
     case AST_STMT_MIR:
-        // inline MIR blocks are opaque to semantic analysis
         return 0;
 
     default:
-        // other statements not implemented yet
         return 0;
     }
 }
 
-// analyze expression
 static Type *sema_resolve_type(Sema *sema, AstNode *type_node);
 
-// analyze expression
 int sema_analyze_expr(Sema *sema, AstNode *node)
 {
     if (!sema || !node)
     {
         return -1;
     }
-
-    // printf("DEBUG: Analyze expr kind %d\n", node->kind);
 
     switch (node->kind)
     {
@@ -1667,7 +1643,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         Type   *func_type = node->call_expr.func->type;
         Symbol *func_sym  = node->call_expr.func->symbol;
 
-        // Handle method calls: obj.method(args) -> method(obj, args)
         if (node->call_expr.func->kind == AST_EXPR_FIELD && node->call_expr.func->field_expr.is_method)
         {
             node->call_expr.is_method_call = true;
@@ -1719,7 +1694,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             ast_list_prepend(node->call_expr.args, receiver);
         }
 
-        // Handle generics
         if (func_sym && func_sym->is_generic)
         {
 
@@ -1736,7 +1710,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 return -1;
             }
 
-            // Update call target to instantiated symbol
             node->call_expr.func->symbol = inst;
             node->call_expr.func->type   = inst->type;
             func_type                    = inst->type;
@@ -1751,9 +1724,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         int arg_count   = node->call_expr.args ? node->call_expr.args->count : 0;
         int param_count = func_type->function.param_count;
 
-        // check argument count
-
-        // check argument count
         if (arg_count != param_count)
         {
             if (func_type->function.param_count > 0 && func_type->function.param_types[func_type->function.param_count - 1] == NULL) // Variadic check
@@ -1924,8 +1894,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
         }
 
-        // TODO: Check for missing fields?
-
         node->type = type;
         return 0;
     }
@@ -1954,13 +1922,10 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         {
             return -1;
         }
-        // Check for generic instantiation
         Symbol *sym = node->index_expr.array->symbol;
 
         if (sym && sym->is_generic)
         {
-            // Resolve type arg
-            // We create a temporary list for now (single arg)
             AstList *type_args = malloc(sizeof(AstList));
             if (type_args)
             {
@@ -1995,7 +1960,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         Type *obj_type   = node->index_expr.array->type;
         Type *index_type = node->index_expr.index->type;
 
-        // Check index type (must be integer)
         if (index_type->kind != TYPE_I64 && index_type->kind != TYPE_U64 && index_type->kind != TYPE_I32 && index_type->kind != TYPE_U32 && index_type->kind != TYPE_I16 && index_type->kind != TYPE_U16 && index_type->kind != TYPE_I8 &&
             index_type->kind != TYPE_U8)
         {
@@ -2003,7 +1967,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
-        // Check object type (array or pointer)
         if (!obj_type)
         {
             sema_error(sema, node->token, "indexing on unknown type");
@@ -2029,16 +1992,15 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
     case AST_COMPTIME:
     {
-        // Evaluate compile-time expression
         AstNode *inner = node->comptime.inner;
 
-        // Try to resolve as $mach constant first
+        // check for $mach constants
         if (comptime_lookup(sema, node) == 0)
         {
             return 0;
         }
 
-        // Handle $Symbol.attribute pattern
+        // handle $symbol.attribute pattern
         if (inner && inner->kind == AST_EXPR_FIELD)
         {
             AstNode *obj = inner->field_expr.object;
@@ -2048,7 +2010,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 return -1;
             }
 
-            // Look up symbol
             Symbol *sym = symbol_table_lookup(sema->current_table, obj->ident_expr.name);
             if (!sym)
             {
@@ -2057,11 +2018,8 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
 
             const char *attr_name = inner->field_expr.field;
-
-            // Evaluate attribute
             if (strcmp(attr_name, "name") == 0)
             {
-                // Return symbol name as string
                 node->comptime.value_kind   = COMPTIME_STRING;
                 node->comptime.string_value = strdup(obj->ident_expr.name);
                 node->type                  = type_get_primitive(TYPE_PTR); // &u8
@@ -2069,7 +2027,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
             else if (strcmp(attr_name, "size") == 0)
             {
-                // Return type size as integer
                 node->comptime.value_kind = COMPTIME_INT;
                 node->comptime.int_value  = sym->type ? sym->type->size : 0;
                 node->type                = type_get_primitive(TYPE_I64);
@@ -2077,7 +2034,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
             else if (strcmp(attr_name, "align") == 0)
             {
-                // Return type alignment (use size as alignment for now)
                 node->comptime.value_kind = COMPTIME_INT;
                 node->comptime.int_value  = sym->type ? sym->type->size : 0;
                 node->type                = type_get_primitive(TYPE_I64);
@@ -2085,7 +2041,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
             else if (strcmp(attr_name, "field_count") == 0)
             {
-                // Return number of fields (record types only)
                 if (sym->type && sym->type->kind == TYPE_STRUCT)
                 {
                     node->comptime.value_kind = COMPTIME_INT;
@@ -2108,12 +2063,10 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
     }
 
     default:
-        // other expressions not implemented yet
         return 0;
     }
 }
 
-// resolve type from AST type node
 static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
 {
     if (!type_node)
@@ -2221,7 +2174,6 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
 
         // Evaluate size
         AstNode *size_expr = type_node->type_array.size;
-        // Simple check for integer literal
         if (size_expr->kind == AST_EXPR_LIT && size_expr->token->kind == TOKEN_LIT_INT)
         {
             size_t count = (size_t)size_expr->lit_expr.int_val;
@@ -2291,8 +2243,6 @@ int sema_analyze(Sema *sema, AstNode *ast)
     return sema->error_count > 0 ? -1 : 0;
 }
 
-// Instantiate a generic struct/union type with type arguments
-// Returns the instantiated Type* (cached if already instantiated)
 static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstList *type_args)
 {
     if (!sema || !generic_sym || !type_args)
@@ -2329,8 +2279,7 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
         return NULL;
     }
 
-    // 1. Generate mangled name for this instantiation
-    // Itanium-style: <name>I<type_args>E
+    // generate mangled name: <name>I<type_args>E
     char mangled_name[512];
     int  pos = snprintf(mangled_name, sizeof(mangled_name), "%s", generic_sym->name);
 
@@ -2348,14 +2297,14 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
 
     pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "E");
 
-    // 2. Check if already instantiated
+    // check if already instantiated
     Symbol *inst_sym = symbol_table_lookup(sema->root_table, mangled_name);
     if (inst_sym && inst_sym->type)
     {
         return inst_sym->type;
     }
 
-    // 3. Create scope with generic parameter bindings
+    // create scope with generic parameter bindings
     SymbolTable *scope      = symbol_table_create(sema->current_table);
     SymbolTable *prev_table = sema->current_table;
 
@@ -2374,7 +2323,7 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
 
     sema->current_table = scope;
 
-    // 4. Resolve fields with substituted types
+    // resolve fields with substituted types
     AstList   *fields_ast  = is_struct ? decl->rec_stmt.fields : decl->uni_stmt.fields;
     int        field_count = fields_ast ? fields_ast->count : 0;
     TypeField *fields      = NULL;
@@ -2417,7 +2366,7 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
 
     sema->current_table = prev_table;
 
-    // 5. Create the instantiated type
+    // create instantiated type
     Type *inst_type = is_struct ? type_create_struct(mangled_name, fields, field_count) : type_create_union(mangled_name, fields, field_count);
 
     if (!inst_type)
@@ -2433,7 +2382,6 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
         return NULL;
     }
 
-    // 6. Create and register symbol for the instantiated type
     inst_sym       = symbol_create(mangled_name, SYMBOL_TYPE, sema->module_path);
     inst_sym->type = inst_type;
     inst_sym->decl = decl; // reference original declaration
@@ -2442,7 +2390,6 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
     return inst_type;
 }
 
-// Instantiate a generic function with type arguments
 Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_args)
 {
     if (!sema || !generic_sym || !type_args)
@@ -2462,7 +2409,6 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     {
         generic_params = decl->fun_stmt.generics;
     }
-    // TODO: Handle struct/union generics
 
     if (!generic_params)
     {
@@ -2474,16 +2420,12 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
         return NULL;
     }
 
-    // 1. Generate mangled name for this instantiation
-    // Itanium-style: <name>I<type_args>E
-    // e.g., identity[i64] -> identityI3i64E
+    // generate mangled name: <name>I<type_args>E
     char mangled_name[512];
     int  pos = snprintf(mangled_name, sizeof(mangled_name), "%s", generic_sym->name);
 
-    // start template args
     pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "I");
 
-    // resolve and mangle each type argument
     for (int i = 0; i < type_args->count; i++)
     {
         AstNode *arg_node = type_args->items[i];
@@ -2494,58 +2436,42 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
         }
     }
 
-    // end template args
     pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "E");
 
-    // 2. Check if already instantiated
     Symbol *inst = symbol_table_lookup(sema->root_table, mangled_name);
     if (inst)
     {
         return inst;
     }
 
-    // 3. Clone the AST
     AstNode *cloned_decl = ast_clone(decl);
     if (!cloned_decl)
     {
         return NULL;
     }
 
-    // Rename the cloned declaration
     if (cloned_decl->kind == AST_STMT_FUN)
     {
         free(cloned_decl->fun_stmt.name);
-        cloned_decl->fun_stmt.name = strdup(mangled_name);
-        // Clear generics list on clone so it's treated as a normal function
-        // (We don't free the list itself as it's a shallow copy of the list structure,
-        // but we set it to NULL so sema treats it as non-generic)
+        cloned_decl->fun_stmt.name     = strdup(mangled_name);
         cloned_decl->fun_stmt.generics = NULL;
     }
 
-    // 4. Analyze the cloned AST
-
-    // Create symbol manually with mangled name.
     Symbol *inst_sym = symbol_create(mangled_name, SYMBOL_FUNCTION, sema->module_path);
     inst_sym->decl   = cloned_decl; // Link symbol to cloned AST for MIR lowering
     symbol_table_insert(sema->root_table, inst_sym);
     cloned_decl->symbol = inst_sym;
 
-    // Create scope for instantiation (used for return type, params, and body)
     SymbolTable *scope      = symbol_table_create(sema->root_table);
     SymbolTable *prev_table = sema->current_table;
 
-    // Bind generic params (re-resolve types now that we've committed to instantiation)
     for (int i = 0; i < generic_params->count; i++)
     {
         AstNode *param_node = generic_params->items[i];
         AstNode *arg_node   = type_args->items[i];
         if (param_node->kind == AST_TYPE_PARAM)
         {
-            Type *arg_type = sema_resolve_type(sema, arg_node); // Resolve in current context (caller)
-            // Note: arg_node might need to be resolved in caller's context,
-            // but here we are using sema which has current_table set to caller's scope (or whatever it was).
-            // Yes, sema->current_table is restored at end of this function.
-
+            Type   *arg_type = sema_resolve_type(sema, arg_node);
             Symbol *type_sym = symbol_create(param_node->type_param.name, SYMBOL_TYPE, sema->module_path);
             type_sym->type   = arg_type;
             symbol_table_insert(scope, type_sym);
@@ -2554,19 +2480,12 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
 
     sema->current_table = scope;
 
-    // Resolve return type
     Type *ret_type = NULL;
     if (cloned_decl->fun_stmt.return_type)
     {
         ret_type = sema_resolve_type(sema, cloned_decl->fun_stmt.return_type);
-        if (!ret_type)
-        {
-            // Error handling?
-            // sema_error(sema, ...);
-        }
     }
 
-    // Resolve parameter types
     Type **param_types = NULL;
     int    param_count = 0;
 
@@ -2593,7 +2512,6 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
 
     inst_sym->type = type_create_function(ret_type, param_types, param_count);
 
-    // Add params to scope (as variables)
     if (cloned_decl->fun_stmt.params)
     {
         for (int i = 0; i < cloned_decl->fun_stmt.params->count; i++)
@@ -2610,7 +2528,6 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
         }
     }
 
-    // Analyze body
     if (cloned_decl->fun_stmt.body)
     {
         sema_analyze_stmt(sema, cloned_decl->fun_stmt.body);
