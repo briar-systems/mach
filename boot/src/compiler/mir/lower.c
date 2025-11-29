@@ -1,9 +1,11 @@
 #include "compiler/mir/lower.h"
+#include "compiler/mir/abi.h"
 #include "compiler/mir/block.h"
 #include "compiler/mir/function.h"
 #include "compiler/mir/global.h"
 #include "compiler/mir/inst.h"
 #include "compiler/mir/opcode.h"
+#include "compiler/mir/target.h"
 #include "compiler/symbol.h"
 #include "compiler/token.h"
 #include "compiler/type.h"
@@ -31,6 +33,7 @@ typedef struct LowerContext
     MIRModule   *module;
     MIRFunction *current_function;
     MIRBlock    *current_block;
+    MIRTarget    target; // compilation target for ABI decisions
 
     // value map: ast node -> mir value (for expressions)
     struct
@@ -71,6 +74,7 @@ static LowerContext *lower_context_create(MIRModule *module)
     ctx->module              = module;
     ctx->current_function    = NULL;
     ctx->current_block       = NULL;
+    ctx->target              = mir_target_native(); // use native target for now
     ctx->value_map           = NULL;
     ctx->value_map_count     = 0;
     ctx->value_map_capacity  = 0;
@@ -405,8 +409,6 @@ static int lower_function(LowerContext *ctx, AstNode *node)
             AstNode *param = node->fun_stmt.params->items[i];
             if (param->kind == AST_STMT_PARAM)
             {
-                MIRValue *param_val = mir_function_add_param(func, NULL, param->param_stmt.name);
-
                 // Allocate stack slot for parameter
                 size_t size = (param->type) ? param->type->size : 8;
                 if (size == 0)
@@ -416,11 +418,38 @@ static int lower_function(LowerContext *ctx, AstNode *node)
 
                 int32_t offset = lower_context_alloc_stack_slot(ctx, param, size);
 
-                // Store parameter register to stack slot
-                MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
-                mir_inst_add_operand(store, mir_operand_value(param_val->id));
-                mir_inst_add_operand(store, mir_operand_imm_int(offset));
-                mir_block_append_inst(ctx->current_block, store);
+                // use ABI to determine how many register slots this parameter occupies
+                int param_slots = mir_abi_classify_param(ctx->target.abi, param->type);
+
+                if (param_slots == 2)
+                {
+                    // multi-register parameter: add multiple mir params
+                    MIRValue *param_val1 = mir_function_add_param(func, NULL, param->param_stmt.name);
+                    MIRValue *param_val2 = mir_function_add_param(func, param->type, ".second_half");
+
+                    // store first chunk
+                    MIRInst *store1 = mir_inst_create(MIR_OP_STORE, NULL);
+                    mir_inst_add_operand(store1, mir_operand_value(param_val1->id));
+                    mir_inst_add_operand(store1, mir_operand_imm_int(offset));
+                    mir_block_append_inst(ctx->current_block, store1);
+
+                    // store second chunk at offset + 8
+                    MIRInst *store2 = mir_inst_create(MIR_OP_STORE, NULL);
+                    mir_inst_add_operand(store2, mir_operand_value(param_val2->id));
+                    mir_inst_add_operand(store2, mir_operand_imm_int(offset + 8));
+                    mir_block_append_inst(ctx->current_block, store2);
+                }
+                else if (param_slots == 1)
+                {
+                    MIRValue *param_val = mir_function_add_param(func, NULL, param->param_stmt.name);
+
+                    // store parameter register to stack slot
+                    MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                    mir_inst_add_operand(store, mir_operand_value(param_val->id));
+                    mir_inst_add_operand(store, mir_operand_imm_int(offset));
+                    mir_block_append_inst(ctx->current_block, store);
+                }
+                // param_slots == 0 means passed by reference (not implemented yet)
             }
         }
     }
@@ -590,11 +619,8 @@ static int lower_var(LowerContext *ctx, AstNode *node)
                         mir_inst_set_result(mov, val_copy);
                         mir_block_append_inst(ctx->current_block, mov);
 
-                        printf("MEMCPY: copying %zu bytes from val (id=%u) to offset %d\n", size, val->id, offset);
-
                         for (size_t i = 0; i < size; i += 8)
                         {
-                            printf("  MEMCPY iteration i=%zu\n", i);
                             // Calculate src address: val_copy + i
                             MIRValue *curr_src = val_copy;
                             if (i > 0)
@@ -1216,6 +1242,13 @@ static MIRValue *lower_address(LowerContext *ctx, AstNode *node)
         AstNode *obj      = node->field_expr.object;
         Type    *obj_type = obj->type;
 
+        if (obj_type && obj_type->kind == TYPE_STRUCT)
+        {
+            for (int i = 0; i < obj_type->structure.field_count; i++)
+            {
+            }
+        }
+
         // check if object is a pointer
         bool obj_is_pointer = (obj_type && obj_type->kind == TYPE_POINTER);
 
@@ -1559,6 +1592,19 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         MIRValue *base_addr = NULL;
         AstNode  *obj       = node->field_expr.object;
         Type     *obj_type  = obj->type;
+
+        if (obj_type)
+        {
+            if (obj_type->kind == TYPE_STRUCT)
+            {
+            }
+        }
+        if (obj->symbol)
+        {
+            if (obj->symbol->type && obj->symbol->type->kind == TYPE_STRUCT)
+            {
+            }
+        }
 
         // Check if object is a pointer - if so, we need to load it first
         bool obj_is_pointer = (obj_type && obj_type->kind == TYPE_POINTER);
@@ -2197,6 +2243,17 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
             {
                 arg_count++; // Add hidden pointer arg
             }
+            
+            // use ABI to determine total register slots needed for all arguments
+            for (int i = 0; i < node->call_expr.args->count; i++)
+            {
+                Type *arg_type = node->call_expr.args->items[i]->type;
+                int slots = mir_abi_classify_param(ctx->target.abi, arg_type);
+                if (slots > 1)
+                {
+                    arg_count += (slots - 1); // add extra slots
+                }
+            }
 
             args = malloc(arg_count * sizeof(MIROperand));
 
@@ -2221,34 +2278,85 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
             {
                 // Spill strategy: evaluate each argument and immediately spill to stack
                 // then reload all arguments from stack before the call
-                int32_t   *spill_offsets = malloc(node->call_expr.args->count * sizeof(int32_t));
-                MIRValue **arg_values    = malloc(node->call_expr.args->count * sizeof(MIRValue *));
+                int32_t   *spill_offsets = malloc(node->call_expr.args->count * 2 * sizeof(int32_t)); // *2 for potential split
+                MIRValue **arg_values    = malloc(node->call_expr.args->count * 2 * sizeof(MIRValue *));
+                int arg_value_count = 0;
 
                 for (int i = 0; i < node->call_expr.args->count; i++)
                 {
-                    // Evaluate argument
-                    MIRValue *arg = lower_expr(ctx, node->call_expr.args->items[i]);
-                    arg_values[i] = arg;
-
-                    if (arg)
+                    AstNode *arg_node = node->call_expr.args->items[i];
+                    Type *arg_type = arg_node->type;
+                    int param_slots = mir_abi_classify_param(ctx->target.abi, arg_type);
+                    
+                    // multi-register arguments need to be split
+                    if (param_slots == 2)
                     {
-                        // Allocate stack slot for this argument
-                        spill_offsets[i] = lower_context_alloc_stack_slot(ctx, NULL, 8);
-
-                        // Spill to stack
-                        MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
-                        mir_inst_add_operand(store, mir_operand_value(arg->id));
-                        mir_inst_add_operand(store, mir_operand_imm_int(spill_offsets[i]));
-                        mir_block_append_inst(ctx->current_block, store);
+                        MIRValue *struct_addr = lower_expr(ctx, arg_node);
+                        if (struct_addr)
+                        {
+                            // Load and spill first 8 bytes
+                            MIRValue *first = mir_function_alloc_value(ctx->current_function, NULL, "arg_first");
+                            MIRInst *load1 = mir_inst_create(MIR_OP_LOAD, NULL);
+                            mir_inst_add_operand(load1, mir_operand_value(struct_addr->id));
+                            mir_inst_set_result(load1, first);
+                            mir_block_append_inst(ctx->current_block, load1);
+                            
+                            arg_values[arg_value_count] = first;
+                            spill_offsets[arg_value_count] = lower_context_alloc_stack_slot(ctx, NULL, 8);
+                            MIRInst *store1 = mir_inst_create(MIR_OP_STORE, NULL);
+                            mir_inst_add_operand(store1, mir_operand_value(first->id));
+                            mir_inst_add_operand(store1, mir_operand_imm_int(spill_offsets[arg_value_count]));
+                            mir_block_append_inst(ctx->current_block, store1);
+                            arg_value_count++;
+                            
+                            // Load and spill second 8 bytes
+                            MIRValue *offset_addr = mir_function_alloc_value(ctx->current_function, NULL, "arg_offset");
+                            MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, mir_operand_value(struct_addr->id), mir_operand_imm_int(8));
+                            mir_inst_set_result(add, offset_addr);
+                            mir_block_append_inst(ctx->current_block, add);
+                            
+                            MIRValue *second = mir_function_alloc_value(ctx->current_function, NULL, "arg_second");
+                            MIRInst *load2 = mir_inst_create(MIR_OP_LOAD, NULL);
+                            mir_inst_add_operand(load2, mir_operand_value(offset_addr->id));
+                            mir_inst_set_result(load2, second);
+                            mir_block_append_inst(ctx->current_block, load2);
+                            
+                            arg_values[arg_value_count] = second;
+                            spill_offsets[arg_value_count] = lower_context_alloc_stack_slot(ctx, NULL, 8);
+                            MIRInst *store2 = mir_inst_create(MIR_OP_STORE, NULL);
+                            mir_inst_add_operand(store2, mir_operand_value(second->id));
+                            mir_inst_add_operand(store2, mir_operand_imm_int(spill_offsets[arg_value_count]));
+                            mir_block_append_inst(ctx->current_block, store2);
+                            arg_value_count++;
+                        }
                     }
                     else
                     {
-                        spill_offsets[i] = 0;
+                        // Evaluate argument
+                        MIRValue *arg = lower_expr(ctx, arg_node);
+                        arg_values[arg_value_count] = arg;
+
+                        if (arg)
+                        {
+                            // Allocate stack slot for this argument
+                            spill_offsets[arg_value_count] = lower_context_alloc_stack_slot(ctx, NULL, 8);
+
+                            // Spill to stack
+                            MIRInst *store = mir_inst_create(MIR_OP_STORE, NULL);
+                            mir_inst_add_operand(store, mir_operand_value(arg->id));
+                            mir_inst_add_operand(store, mir_operand_imm_int(spill_offsets[arg_value_count]));
+                            mir_block_append_inst(ctx->current_block, store);
+                        }
+                        else
+                        {
+                            spill_offsets[arg_value_count] = 0;
+                        }
+                        arg_value_count++;
                     }
                 }
 
                 // Reload all arguments from stack
-                for (int i = 0; i < node->call_expr.args->count; i++)
+                for (int i = 0; i < arg_value_count; i++)
                 {
                     if (arg_values[i] && spill_offsets[i] != 0)
                     {
@@ -2274,10 +2382,46 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
                 // No nested calls - just evaluate arguments normally
                 for (int i = 0; i < node->call_expr.args->count; i++)
                 {
-                    MIRValue *arg = lower_expr(ctx, node->call_expr.args->items[i]);
-                    if (arg)
+                    AstNode *arg_node = node->call_expr.args->items[i];
+                    Type *arg_type = arg_node->type;
+                    int param_slots = mir_abi_classify_param(ctx->target.abi, arg_type);
+                    
+                    // multi-register arguments need to be split
+                    if (param_slots == 2)
                     {
-                        args[arg_idx++] = mir_operand_value(arg->id);
+                        MIRValue *struct_addr = lower_expr(ctx, arg_node);
+                        if (struct_addr)
+                        {
+                            // Load first 8 bytes
+                            MIRValue *first = mir_function_alloc_value(ctx->current_function, NULL, "arg_first");
+                            MIRInst *load1 = mir_inst_create(MIR_OP_LOAD, NULL);
+                            mir_inst_add_operand(load1, mir_operand_value(struct_addr->id));
+                            mir_inst_set_result(load1, first);
+                            mir_block_append_inst(ctx->current_block, load1);
+                            
+                            // Load second 8 bytes
+                            MIRValue *offset_addr = mir_function_alloc_value(ctx->current_function, NULL, "arg_offset");
+                            MIRInst *add = mir_inst_binary(MIR_OP_ADD, NULL, mir_operand_value(struct_addr->id), mir_operand_imm_int(8));
+                            mir_inst_set_result(add, offset_addr);
+                            mir_block_append_inst(ctx->current_block, add);
+                            
+                            MIRValue *second = mir_function_alloc_value(ctx->current_function, NULL, "arg_second");
+                            MIRInst *load2 = mir_inst_create(MIR_OP_LOAD, NULL);
+                            mir_inst_add_operand(load2, mir_operand_value(offset_addr->id));
+                            mir_inst_set_result(load2, second);
+                            mir_block_append_inst(ctx->current_block, load2);
+                            
+                            args[arg_idx++] = mir_operand_value(first->id);
+                            args[arg_idx++] = mir_operand_value(second->id);
+                        }
+                    }
+                    else
+                    {
+                        MIRValue *arg = lower_expr(ctx, arg_node);
+                        if (arg)
+                        {
+                            args[arg_idx++] = mir_operand_value(arg->id);
+                        }
                     }
                 }
             }
@@ -2438,6 +2582,11 @@ MIRModule *mir_lower_module(AstNode *ast_module, SymbolTable *symbols)
             {
                 // skip generic template functions - they are instantiated on demand
                 if (stmt->fun_stmt.generics && stmt->fun_stmt.generics->count > 0)
+                {
+                    continue;
+                }
+                // also skip methods on generic types (marked as generic via receiver)
+                if (stmt->symbol && stmt->symbol->is_generic)
                 {
                     continue;
                 }

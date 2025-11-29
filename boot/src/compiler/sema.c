@@ -601,10 +601,80 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         return 0;
     }
 
-    // check for generics - defer full analysis
+    // check for explicit generics - defer full analysis
     if (node->fun_stmt.generics && node->fun_stmt.generics->count > 0)
     {
         sym->is_generic = true;
+        return 0;
+    }
+
+    // for methods on generic types, extract type parameters from receiver
+    // e.g., fun (this: Option[T]) unwrap() T - the T comes from Option's generic param
+    SymbolTable *method_scope = NULL;
+    if (node->fun_stmt.is_method && node->fun_stmt.method_receiver)
+    {
+        AstNode *receiver_type = node->fun_stmt.method_receiver;
+
+        // handle pointer receivers: unwrap *T or &T to get base type
+        while (receiver_type->kind == AST_TYPE_PTR)
+        {
+            receiver_type = receiver_type->type_ptr.base;
+        }
+
+        if (receiver_type->kind == AST_TYPE_NAME && receiver_type->type_name.generic_args && receiver_type->type_name.generic_args->count > 0)
+        {
+            // look up the generic type
+            Symbol *type_sym = symbol_table_lookup(sema->current_table, receiver_type->type_name.name);
+            if (type_sym && type_sym->is_generic && type_sym->decl)
+            {
+                AstList *formal_params = NULL;
+                if (type_sym->decl->kind == AST_STMT_REC)
+                {
+                    formal_params = type_sym->decl->rec_stmt.generics;
+                }
+                else if (type_sym->decl->kind == AST_STMT_UNI)
+                {
+                    formal_params = type_sym->decl->uni_stmt.generics;
+                }
+
+                if (formal_params && formal_params->count == receiver_type->type_name.generic_args->count)
+                {
+                    // create scope with type parameter bindings
+                    method_scope        = symbol_table_create(sema->current_table);
+                    sema->current_table = method_scope;
+
+                    // mark method as implicitly generic
+                    sym->is_generic = true;
+
+                    for (int i = 0; i < formal_params->count; i++)
+                    {
+                        AstNode *formal = formal_params->items[i];
+                        AstNode *actual = receiver_type->type_name.generic_args->items[i];
+
+                        if (formal->kind == AST_TYPE_PARAM && actual->kind == AST_TYPE_NAME)
+                        {
+                            // bind the actual type name (e.g., "T") as a type parameter
+                            // in this scope, so when we resolve "T" in return types/params,
+                            // it resolves to this type parameter symbol
+                            Symbol *param_sym = symbol_create(actual->type_name.name, SYMBOL_TYPE, sema->module_path);
+                            param_sym->is_generic_param = true;
+                            // store the formal parameter name for instantiation lookup
+                            param_sym->generic_param_name = strdup(formal->type_param.name);
+                            symbol_table_insert(method_scope, param_sym);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // if method is now marked generic, defer full analysis
+    if (sym->is_generic)
+    {
+        if (method_scope)
+        {
+            sema->current_table = method_scope->parent;
+        }
         return 0;
     }
 
@@ -1827,8 +1897,182 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
         // look for method - methods can be defined on any type including pointers
         Symbol *method = symbol_table_lookup(sema->current_table, node->field_expr.field);
+        if (method)
+        {
+            if (method->decl)
+            {
+            }
+        }
         if (method && method->kind == SYMBOL_FUNCTION && method->decl && method->decl->kind == AST_STMT_FUN && method->decl->fun_stmt.is_method)
         {
+            AstNode *receiver_ast = method->decl->fun_stmt.method_receiver;
+
+            // handle pointer receivers: unwrap *T or &T to get base type
+            while (receiver_ast && receiver_ast->kind == AST_TYPE_PTR)
+            {
+                receiver_ast = receiver_ast->type_ptr.base;
+            }
+
+            // check if this is a method on a generic type
+            if (receiver_ast && receiver_ast->kind == AST_TYPE_NAME && receiver_ast->type_name.generic_args && receiver_ast->type_name.generic_args->count > 0)
+            {
+                // get the base type name (e.g., "Option" from "Option[T]")
+                const char *generic_type_name = receiver_ast->type_name.name;
+
+                // get the object's type name (e.g., "OptionIi64E" for Option[i64])
+                Type *check_type = obj_type;
+                if (check_type->kind == TYPE_POINTER)
+                {
+                    check_type = check_type->pointer.base;
+                }
+
+                // check if object type is an instantiation of this generic type
+                if (check_type->kind == TYPE_STRUCT || check_type->kind == TYPE_UNION)
+                {
+                    const char *inst_name = (check_type->kind == TYPE_STRUCT) ? check_type->structure.name : check_type->union_type.name;
+
+                    // check if inst_name starts with generic_type_name followed by 'I' (mangling convention)
+                    size_t base_len = strlen(generic_type_name);
+                    if (inst_name && strncmp(inst_name, generic_type_name, base_len) == 0 && inst_name[base_len] == 'I')
+                    {
+                        // this is an instantiated generic type - need to instantiate the method
+                        // extract type arguments from the object's instantiated type
+
+                        // look up the original generic type symbol
+                        Symbol *generic_type_sym = symbol_table_lookup(sema->current_table, generic_type_name);
+                        if (generic_type_sym && generic_type_sym->is_generic && generic_type_sym->decl)
+                        {
+                            AstList *formal_params = NULL;
+                            if (generic_type_sym->decl->kind == AST_STMT_REC)
+                            {
+                                formal_params = generic_type_sym->decl->rec_stmt.generics;
+                            }
+                            else if (generic_type_sym->decl->kind == AST_STMT_UNI)
+                            {
+                                formal_params = generic_type_sym->decl->uni_stmt.generics;
+                            }
+
+                            if (formal_params)
+                            {
+                                // create type args from the instantiated type's fields
+                                // for now, extract from the mangled name or use the object's type directly
+                                // since we stored the instantiated type in check_type, we can match field types
+
+                                // create synthetic type_args list from the object's actual type
+                                AstList *type_args = malloc(sizeof(AstList));
+                                if (type_args)
+                                {
+                                    ast_list_init(type_args);
+
+                                    // for each formal param, find the corresponding actual type from the instantiated struct
+                                    for (int i = 0; i < formal_params->count && i < receiver_ast->type_name.generic_args->count; i++)
+                                    {
+                                        // get the field at the same index to infer type
+                                        // (this is a simplification - proper impl would parse the mangled name or store type args)
+                                        if (check_type->kind == TYPE_STRUCT && check_type->structure.field_count > 0)
+                                        {
+                                            // find a field that uses the type parameter and get its actual type
+                                            Type *actual_type = NULL;
+
+                                            // look for the 'value' field which should have type T
+                                            for (int j = 0; j < check_type->structure.field_count; j++)
+                                            {
+                                                if (strcmp(check_type->structure.fields[j].name, "value") == 0)
+                                                {
+                                                    actual_type = check_type->structure.fields[j].type;
+                                                    break;
+                                                }
+                                            }
+
+                                            if (actual_type)
+                                            {
+                                                // create a type node for the actual type
+                                                AstNode *type_node = malloc(sizeof(AstNode));
+                                                if (type_node)
+                                                {
+                                                    memset(type_node, 0, sizeof(AstNode));
+                                                    type_node->kind = AST_TYPE_NAME;
+                                                    type_node->type = actual_type;
+
+                                                    // set the name based on type kind
+                                                    if (actual_type->kind == TYPE_I64)
+                                                    {
+                                                        type_node->type_name.name = strdup("i64");
+                                                    }
+                                                    else if (actual_type->kind == TYPE_I32)
+                                                    {
+                                                        type_node->type_name.name = strdup("i32");
+                                                    }
+                                                    else if (actual_type->kind == TYPE_U8)
+                                                    {
+                                                        type_node->type_name.name = strdup("u8");
+                                                    }
+                                                    else if (actual_type->kind == TYPE_U64)
+                                                    {
+                                                        type_node->type_name.name = strdup("u64");
+                                                    }
+                                                    else if (actual_type->kind == TYPE_PTR)
+                                                    {
+                                                        type_node->type_name.name = strdup("ptr");
+                                                    }
+                                                    else
+                                                    {
+                                                        type_node->type_name.name = strdup("i64"); // fallback
+                                                    }
+
+                                                    ast_list_append(type_args, type_node);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (type_args->count > 0)
+                                    {
+                                        // instantiate the method with these type args
+                                        Symbol *inst_method = sema_instantiate_generic(sema, method, type_args);
+                                        if (inst_method)
+                                        {
+                                            node->field_expr.is_method = true;
+                                            node->symbol               = inst_method;
+                                            node->type                 = inst_method->type;
+
+                                            // cleanup type_args
+                                            for (int i = 0; i < type_args->count; i++)
+                                            {
+                                                AstNode *tn = type_args->items[i];
+                                                if (tn->type_name.name)
+                                                {
+                                                    free(tn->type_name.name);
+                                                }
+                                                free(tn);
+                                            }
+                                            free(type_args->items);
+                                            free(type_args);
+
+                                            return 0;
+                                        }
+                                    }
+
+                                    // cleanup on failure
+                                    for (int i = 0; i < type_args->count; i++)
+                                    {
+                                        AstNode *tn = type_args->items[i];
+                                        if (tn->type_name.name)
+                                        {
+                                            free(tn->type_name.name);
+                                        }
+                                        free(tn);
+                                    }
+                                    free(type_args->items);
+                                    free(type_args);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // non-generic method resolution
             Type *method_receiver_type = sema_resolve_type(sema, method->decl->fun_stmt.method_receiver);
             if (method_receiver_type)
             {
@@ -2522,6 +2766,33 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     if (decl->kind == AST_STMT_FUN)
     {
         generic_params = decl->fun_stmt.generics;
+
+        // for methods on generic types, get params from receiver type
+        if (!generic_params && decl->fun_stmt.is_method && decl->fun_stmt.method_receiver)
+        {
+            AstNode *receiver = decl->fun_stmt.method_receiver;
+            while (receiver && receiver->kind == AST_TYPE_PTR)
+            {
+                receiver = receiver->type_ptr.base;
+            }
+
+            if (receiver && receiver->kind == AST_TYPE_NAME && receiver->type_name.generic_args)
+            {
+                // look up the generic type to get its formal parameters
+                Symbol *type_sym = symbol_table_lookup(sema->current_table, receiver->type_name.name);
+                if (type_sym && type_sym->is_generic && type_sym->decl)
+                {
+                    if (type_sym->decl->kind == AST_STMT_REC)
+                    {
+                        generic_params = type_sym->decl->rec_stmt.generics;
+                    }
+                    else if (type_sym->decl->kind == AST_STMT_UNI)
+                    {
+                        generic_params = type_sym->decl->uni_stmt.generics;
+                    }
+                }
+            }
+        }
     }
 
     if (!generic_params)
@@ -2576,7 +2847,7 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     symbol_table_insert(sema->root_table, inst_sym);
     cloned_decl->symbol = inst_sym;
 
-    SymbolTable *scope      = symbol_table_create(sema->root_table);
+    SymbolTable *scope      = symbol_table_create(sema->current_table);
     SymbolTable *prev_table = sema->current_table;
 
     for (int i = 0; i < generic_params->count; i++)
@@ -2617,6 +2888,12 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
                 if (param->param_stmt.type)
                 {
                     pt = sema_resolve_type(sema, param->param_stmt.type);
+                    if (pt && pt->kind == TYPE_STRUCT)
+                    {
+                        for (int j = 0; j < pt->structure.field_count; j++)
+                        {
+                        }
+                    }
                 }
                 param_types[i] = pt;
                 param->type    = pt;

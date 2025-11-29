@@ -21,6 +21,8 @@ Symbol *symbol_create(const char *name, SymbolKind kind, const char *module_path
     symbol->is_public = false;
     symbol->is_mutable = false;
     symbol->is_generic = false;
+    symbol->is_generic_param = false;
+    symbol->generic_param_name = NULL;
     symbol->next = NULL;
 
     return symbol;
@@ -48,6 +50,10 @@ void symbol_destroy(Symbol *symbol)
     if (symbol->module_path)
     {
         free(symbol->module_path);
+    }
+    if (symbol->generic_param_name)
+    {
+        free(symbol->generic_param_name);
     }
 
     free(symbol);

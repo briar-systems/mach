@@ -116,3 +116,61 @@ bool sysv64_is_callee_saved(int physical_reg_id)
            physical_reg_id == X86_64_RBP ||
            (physical_reg_id >= X86_64_R12 && physical_reg_id <= X86_64_R15);
 }
+
+int sysv64_classify_param(Type *type)
+{
+    if (!type)
+    {
+        return 1; // default: single register
+    }
+
+    // primitives and pointers: single register
+    if (type->size <= 8)
+    {
+        return 1;
+    }
+
+    // structs > 16 bytes: passed by reference (return 0)
+    if (type->kind == TYPE_STRUCT && type->size > 16)
+    {
+        return 0;
+    }
+
+    // structs 9-16 bytes: split across 2 registers
+    if (type->kind == TYPE_STRUCT && type->size > 8 && type->size <= 16)
+    {
+        return 2;
+    }
+
+    // default: single register
+    return 1;
+}
+
+int sysv64_classify_return(Type *type)
+{
+    if (!type)
+    {
+        return 0; // void
+    }
+
+    // primitives and pointers: single register
+    if (type->size <= 8)
+    {
+        return 1;
+    }
+
+    // structs <= 16 bytes: up to 2 registers (rax, rdx)
+    if (type->kind == TYPE_STRUCT && type->size <= 16)
+    {
+        return (type->size > 8) ? 2 : 1;
+    }
+
+    // structs > 16 bytes: return via hidden pointer (return 0)
+    if (type->kind == TYPE_STRUCT && type->size > 16)
+    {
+        return 0;
+    }
+
+    // default: single register
+    return 1;
+}
