@@ -43,7 +43,7 @@ static MIRType *mir_type_from_type(Type *type)
             {
                 fields[i] = mir_type_from_type(type->structure.fields[i].type);
             }
-            MIRType *res = mir_type_create_struct(fields, type->structure.field_count);
+            MIRType *res = mir_type_create_record(fields, type->structure.field_count);
             free(fields);
             return res;
         }

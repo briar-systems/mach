@@ -20,7 +20,7 @@ typedef enum MIRTypeKind
     MIR_TYPE_F64,
     MIR_TYPE_PTR,
     MIR_TYPE_ARRAY,
-    MIR_TYPE_STRUCT,
+    MIR_TYPE_RECORD,
     MIR_TYPE_FUNCTION
 } MIRTypeKind;
 
@@ -36,12 +36,12 @@ struct MIRType
     MIRType *elem_type;
     size_t   elem_count;
     
-    // for structs
+    // for records
     struct {
         MIRType **fields;
         size_t    count;
         size_t   *offsets;
-    } structure;
+    } record;
     
     // for functions
     struct {
@@ -54,7 +54,7 @@ struct MIRType
 
 MIRType *mir_type_create(MIRTypeKind kind);
 MIRType *mir_type_create_array(MIRType *elem_type, size_t count);
-MIRType *mir_type_create_struct(MIRType **fields, size_t count);
+MIRType *mir_type_create_record(MIRType **fields, size_t count);
 MIRType *mir_type_create_function(MIRType *ret_type, MIRType **params, size_t param_count, bool is_variadic);
 void     mir_type_destroy(MIRType *type);
 

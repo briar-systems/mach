@@ -56,21 +56,21 @@ MIRType *mir_type_create_array(MIRType *elem_type, size_t count)
     return type;
 }
 
-MIRType *mir_type_create_struct(MIRType **fields, size_t count)
+MIRType *mir_type_create_record(MIRType **fields, size_t count)
 {
-    MIRType *type = mir_type_create(MIR_TYPE_STRUCT);
+    MIRType *type = mir_type_create(MIR_TYPE_RECORD);
     if (!type) return NULL;
     
-    type->structure.fields = malloc(sizeof(MIRType*) * count);
-    type->structure.offsets = malloc(sizeof(size_t) * count);
-    type->structure.count = count;
+    type->record.fields = malloc(sizeof(MIRType*) * count);
+    type->record.offsets = malloc(sizeof(size_t) * count);
+    type->record.count = count;
     
     size_t current_offset = 0;
     size_t max_align = 1;
     
     for (size_t i = 0; i < count; i++)
     {
-        type->structure.fields[i] = fields[i];
+        type->record.fields[i] = fields[i];
         
         // align offset
         size_t align = fields[i]->align;
@@ -81,11 +81,11 @@ MIRType *mir_type_create_struct(MIRType **fields, size_t count)
             current_offset += align - (current_offset % align);
         }
         
-        type->structure.offsets[i] = current_offset;
+        type->record.offsets[i] = current_offset;
         current_offset += fields[i]->size;
     }
     
-    // align struct size
+    // align record size
     if (current_offset % max_align != 0)
     {
         current_offset += max_align - (current_offset % max_align);
@@ -118,10 +118,10 @@ void mir_type_destroy(MIRType *type)
 {
     if (!type) return;
     
-    if (type->kind == MIR_TYPE_STRUCT)
+    if (type->kind == MIR_TYPE_RECORD)
     {
-        free(type->structure.fields);
-        free(type->structure.offsets);
+        free(type->record.fields);
+        free(type->record.offsets);
     }
     else if (type->kind == MIR_TYPE_FUNCTION)
     {
