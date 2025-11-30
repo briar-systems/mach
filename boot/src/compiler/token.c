@@ -1,16 +1,24 @@
 #include "compiler/token.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 void token_init(Token *token, TokenKind kind, int pos, int len)
 {
-    token->kind = kind;
-    token->pos  = pos;
-    token->len  = len;
+    token->kind        = kind;
+    token->pos         = pos;
+    token->len         = len;
+    token->type_suffix = NULL;
 }
 
 void token_dnit(Token *token)
 {
+    if (token->type_suffix)
+    {
+        free(token->type_suffix);
+        token->type_suffix = NULL;
+    }
+
     token->kind = TOKEN_ERROR;
     token->pos  = -1;
     token->len  = -1;
@@ -23,9 +31,10 @@ void token_copy(Token *src, Token *dst)
         return;
     }
 
-    dst->kind = src->kind;
-    dst->pos  = src->pos;
-    dst->len  = src->len;
+    dst->kind        = src->kind;
+    dst->pos         = src->pos;
+    dst->len         = src->len;
+    dst->type_suffix = src->type_suffix ? strdup(src->type_suffix) : NULL;
 }
 
 char *token_kind_to_string(TokenKind kind)

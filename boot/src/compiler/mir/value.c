@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-MIRValue *mir_value_create(uint32_t id, Type *type, const char *name)
+MIRValue *mir_value_create(uint32_t id, MIRType *type, const char *name)
 {
     MIRValue *value = malloc(sizeof(MIRValue));
     if (!value)

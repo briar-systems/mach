@@ -15,12 +15,12 @@
 // section types
 typedef enum ELFSectionType
 {
-    ELF_SHT_NULL,
-    ELF_SHT_PROGBITS,
-    ELF_SHT_SYMTAB,
-    ELF_SHT_STRTAB,
-    ELF_SHT_RELA,
-    ELF_SHT_NOBITS,
+    ELF_SHT_NULL = 0,
+    ELF_SHT_PROGBITS = 1,
+    ELF_SHT_SYMTAB = 2,
+    ELF_SHT_STRTAB = 3,
+    ELF_SHT_RELA = 4,
+    ELF_SHT_NOBITS = 8,
 } ELFSectionType;
 
 // relocation types (x86_64)

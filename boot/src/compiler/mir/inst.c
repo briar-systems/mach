@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-MIRInst *mir_inst_create(MIROp op, Type *type)
+MIRInst *mir_inst_create(MIROp op, MIRType *type)
 {
     MIRInst *inst = malloc(sizeof(MIRInst));
     if (!inst)
@@ -72,7 +72,7 @@ void mir_inst_set_result(MIRInst *inst, MIRValue *result)
     }
 }
 
-MIRInst *mir_inst_const(Type *type, int64_t value)
+MIRInst *mir_inst_const(MIRType *type, int64_t value)
 {
     MIRInst *inst = mir_inst_create(MIR_OP_CONST, type);
     if (!inst)
@@ -84,7 +84,7 @@ MIRInst *mir_inst_const(Type *type, int64_t value)
     return inst;
 }
 
-MIRInst *mir_inst_const_float(Type *type, double value)
+MIRInst *mir_inst_const_float(MIRType *type, double value)
 {
     MIRInst *inst = mir_inst_create(MIR_OP_CONST, type);
     if (!inst)
@@ -96,7 +96,7 @@ MIRInst *mir_inst_const_float(Type *type, double value)
     return inst;
 }
 
-MIRInst *mir_inst_binary(MIROp op, Type *type, MIROperand left, MIROperand right)
+MIRInst *mir_inst_binary(MIROp op, MIRType *type, MIROperand left, MIROperand right)
 {
     MIRInst *inst = mir_inst_create(op, type);
     if (!inst)
@@ -109,7 +109,7 @@ MIRInst *mir_inst_binary(MIROp op, Type *type, MIROperand left, MIROperand right
     return inst;
 }
 
-MIRInst *mir_inst_unary(MIROp op, Type *type, MIROperand operand)
+MIRInst *mir_inst_unary(MIROp op, MIRType *type, MIROperand operand)
 {
     MIRInst *inst = mir_inst_create(op, type);
     if (!inst)
@@ -121,7 +121,7 @@ MIRInst *mir_inst_unary(MIROp op, Type *type, MIROperand operand)
     return inst;
 }
 
-MIRInst *mir_inst_load(Type *type, MIROperand ptr)
+MIRInst *mir_inst_load(MIRType *type, MIROperand ptr)
 {
     MIRInst *inst = mir_inst_create(MIR_OP_LOAD, type);
     if (!inst)
@@ -133,7 +133,7 @@ MIRInst *mir_inst_load(Type *type, MIROperand ptr)
     return inst;
 }
 
-MIRInst *mir_inst_store(Type *type, MIROperand ptr, MIROperand value)
+MIRInst *mir_inst_store(MIRType *type, MIROperand ptr, MIROperand value)
 {
     MIRInst *inst = mir_inst_create(MIR_OP_STORE, type);
     if (!inst)
@@ -146,7 +146,7 @@ MIRInst *mir_inst_store(Type *type, MIROperand ptr, MIROperand value)
     return inst;
 }
 
-MIRInst *mir_inst_gep(Type *type, MIROperand ptr, MIROperand offset)
+MIRInst *mir_inst_gep(MIRType *type, MIROperand ptr, MIROperand offset)
 {
     MIRInst *inst = mir_inst_create(MIR_OP_GEP, type);
     if (!inst)
@@ -159,7 +159,7 @@ MIRInst *mir_inst_gep(Type *type, MIROperand ptr, MIROperand offset)
     return inst;
 }
 
-MIRInst *mir_inst_call(Type *return_type, const char *func_name, MIROperand *args, size_t arg_count)
+MIRInst *mir_inst_call(MIRType *return_type, const char *func_name, MIROperand *args, size_t arg_count)
 {
     MIRInst *inst = mir_inst_create(MIR_OP_CALL, return_type);
     if (!inst)
@@ -177,7 +177,7 @@ MIRInst *mir_inst_call(Type *return_type, const char *func_name, MIROperand *arg
     return inst;
 }
 
-MIRInst *mir_inst_ret(Type *type, MIROperand value)
+MIRInst *mir_inst_ret(MIRType *type, MIROperand value)
 {
     MIRInst *inst = mir_inst_create(MIR_OP_RET, type);
     if (!inst)

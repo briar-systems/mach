@@ -3,7 +3,7 @@
 
 #include "compiler/mir/block.h"
 #include "compiler/mir/value.h"
-#include "compiler/type.h"
+#include "compiler/mir/type.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -11,7 +11,7 @@
 typedef struct MIRFunction
 {
     char       *name;              // function name
-    Type       *type;              // function type
+    MIRType    *type;              // function type
     bool        is_exported;       // pub function
     MIRValue  **params;            // parameter values
     size_t      param_count;
@@ -26,7 +26,7 @@ typedef struct MIRFunction
 } MIRFunction;
 
 // function management
-MIRFunction *mir_function_create(const char *name, Type *type, bool is_exported);
+MIRFunction *mir_function_create(const char *name, MIRType *type, bool is_exported);
 void         mir_function_destroy(MIRFunction *func);
 
 // block operations
@@ -34,7 +34,7 @@ MIRBlock *mir_function_add_block(MIRFunction *func, const char *label);
 MIRBlock *mir_function_get_entry_block(MIRFunction *func);
 
 // value operations
-MIRValue *mir_function_alloc_value(MIRFunction *func, Type *type, const char *name);
-MIRValue *mir_function_add_param(MIRFunction *func, Type *type, const char *name);
+MIRValue *mir_function_alloc_value(MIRFunction *func, MIRType *type, const char *name);
+MIRValue *mir_function_add_param(MIRFunction *func, MIRType *type, const char *name);
 
 #endif // MIR_FUNCTION_H

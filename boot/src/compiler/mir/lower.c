@@ -9,9 +9,65 @@
 #include "compiler/symbol.h"
 #include "compiler/token.h"
 #include "compiler/type.h"
+#include "compiler/mir/type.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static MIRType *mir_type_from_type(Type *type)
+{
+    if (!type) return mir_type_create(MIR_TYPE_VOID);
+    
+    switch (type->kind)
+    {
+        case TYPE_I8:   return mir_type_create(MIR_TYPE_I8);
+        case TYPE_U8:   return mir_type_create(MIR_TYPE_U8);
+        case TYPE_I16:  return mir_type_create(MIR_TYPE_I16);
+        case TYPE_U16:  return mir_type_create(MIR_TYPE_U16);
+        case TYPE_I32:  return mir_type_create(MIR_TYPE_I32);
+        case TYPE_U32:  return mir_type_create(MIR_TYPE_U32);
+        case TYPE_I64:  return mir_type_create(MIR_TYPE_I64);
+        case TYPE_U64:  return mir_type_create(MIR_TYPE_U64);
+        case TYPE_F32:  return mir_type_create(MIR_TYPE_F32);
+        case TYPE_F64:  return mir_type_create(MIR_TYPE_F64);
+        case TYPE_PTR:  return mir_type_create(MIR_TYPE_PTR);
+        case TYPE_POINTER: return mir_type_create(MIR_TYPE_PTR);
+        
+        case TYPE_ARRAY:
+            return mir_type_create_array(mir_type_from_type(type->array.elem_type), type->array.count);
+            
+        case TYPE_STRUCT:
+        {
+            MIRType **fields = malloc(sizeof(MIRType*) * type->structure.field_count);
+            for (int i = 0; i < type->structure.field_count; i++)
+            {
+                fields[i] = mir_type_from_type(type->structure.fields[i].type);
+            }
+            MIRType *res = mir_type_create_struct(fields, type->structure.field_count);
+            free(fields);
+            return res;
+        }
+        
+        case TYPE_FUNCTION:
+        {
+            MIRType **params = malloc(sizeof(MIRType*) * type->function.param_count);
+            for (int i = 0; i < type->function.param_count; i++)
+            {
+                params[i] = mir_type_from_type(type->function.param_types[i]);
+            }
+            MIRType *res = mir_type_create_function(
+                mir_type_from_type(type->function.return_type),
+                params,
+                type->function.param_count,
+                false
+            );
+            free(params);
+            return res;
+        }
+        
+        default: return mir_type_create(MIR_TYPE_I64);
+    }
+}
 
 // stack slot mapping for local variables
 typedef struct
@@ -413,7 +469,7 @@ static int lower_function(LowerContext *ctx, AstNode *node)
                 if (param_slots == 2)
                 {
                     MIRValue *param_val1 = mir_function_add_param(func, NULL, param->param_stmt.name);
-                    MIRValue *param_val2 = mir_function_add_param(func, param->type, ".second_half");
+                    MIRValue *param_val2 = mir_function_add_param(func, mir_type_from_type(param->type), ".second_half");
 
                     MIRInst *store1 = mir_inst_create(MIR_OP_STORE, NULL);
                     mir_inst_add_operand(store1, mir_operand_value(param_val1->id));
@@ -484,7 +540,7 @@ static int lower_var(LowerContext *ctx, AstNode *node)
         }
 
         MIRGlobalKind kind   = (node->kind == AST_STMT_VAL) ? MIR_GLOBAL_VAL : MIR_GLOBAL_VAR;
-        MIRGlobal    *global = mir_global_create(var_name, node->type, kind, node->var_stmt.is_public);
+        MIRGlobal    *global = mir_global_create(var_name, mir_type_from_type(node->type), kind, node->var_stmt.is_public);
 
         // handle initializer
         if (node->var_stmt.init)
@@ -1380,7 +1436,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
             char name[64];
             snprintf(name, sizeof(name), "__float_const_%d", ctx->float_const_count++);
 
-            MIRGlobal *global = mir_global_create(name, type_get_primitive(TYPE_F64), MIR_GLOBAL_VAL, false);
+            MIRGlobal *global = mir_global_create(name, mir_type_from_type(type_get_primitive(TYPE_F64)), MIR_GLOBAL_VAL, false);
             mir_global_set_float_init(global, node->lit_expr.float_val);
             mir_module_add_global(ctx->module, global);
 
@@ -1393,7 +1449,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
 
             // load value from address
             MIRValue *result = mir_function_alloc_value(ctx->current_function, NULL, "lit_f");
-            MIRInst  *load   = mir_inst_create(MIR_OP_LOAD, type_get_primitive(TYPE_F64));
+            MIRInst  *load   = mir_inst_create(MIR_OP_LOAD, mir_type_from_type(type_get_primitive(TYPE_F64)));
             mir_inst_add_operand(load, mir_operand_value(addr->id));
             mir_inst_set_result(load, result);
             mir_block_append_inst(ctx->current_block, load);
@@ -1407,7 +1463,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
             char name[64];
             snprintf(name, sizeof(name), "__str_const_%d", ctx->string_const_count++);
 
-            MIRGlobal *global = mir_global_create(name, type_get_primitive(TYPE_PTR), MIR_GLOBAL_VAL, false);
+            MIRGlobal *global = mir_global_create(name, mir_type_from_type(type_get_primitive(TYPE_PTR)), MIR_GLOBAL_VAL, false);
             mir_global_set_string_init(global, node->lit_expr.string_val);
             mir_module_add_global(ctx->module, global);
 
@@ -1444,7 +1500,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
             char name[64];
             snprintf(name, sizeof(name), "__comptime_str_%d", ctx->string_const_count++);
 
-            MIRGlobal *global = mir_global_create(name, type_get_primitive(TYPE_PTR), MIR_GLOBAL_VAL, false);
+            MIRGlobal *global = mir_global_create(name, mir_type_from_type(type_get_primitive(TYPE_PTR)), MIR_GLOBAL_VAL, false);
             mir_global_set_string_init(global, node->comptime.string_value);
             mir_module_add_global(ctx->module, global);
 
@@ -1757,7 +1813,7 @@ static MIRValue *lower_expr(LowerContext *ctx, AstNode *node)
         mir_block_append_inst(ctx->current_block, add);
 
         // load value
-        MIRValue *result = mir_function_alloc_value(ctx->current_function, elem_type, "elem_val");
+        MIRValue *result = mir_function_alloc_value(ctx->current_function, mir_type_from_type(elem_type), "elem_val");
         MIRInst  *load   = mir_inst_create(MIR_OP_LOAD, NULL);
         mir_inst_add_operand(load, mir_operand_value(elem_addr->id));
         mir_inst_set_result(load, result);

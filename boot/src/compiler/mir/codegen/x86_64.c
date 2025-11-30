@@ -16,6 +16,7 @@ X86_64_CodegenContext *x86_64_codegen_create()
     ctx->code.capacity = 0;
 
     ctx->reg_map.map      = NULL;
+    ctx->reg_map.stack_slots = NULL;
     ctx->reg_map.count    = 0;
     ctx->reg_map.capacity = 0;
 
@@ -47,6 +48,11 @@ void x86_64_codegen_destroy(X86_64_CodegenContext *ctx)
     if (ctx->reg_map.map)
     {
         free(ctx->reg_map.map);
+    }
+
+    if (ctx->reg_map.stack_slots)
+    {
+        free(ctx->reg_map.stack_slots);
     }
 
     // free relocations
@@ -187,6 +193,32 @@ static void resolve_jumps(X86_64_CodegenContext *ctx)
     }
 }
 
+// map our register enum to the encoding used by x86
+static uint8_t reg_to_x86_encoding(X86_64_Reg reg)
+{
+    // x86-64 register encoding: rax=0, rcx=1, rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7
+    // our enum: rax=0, rbx=1, rcx=2, rdx=3, rsi=4, rdi=5, rbp=6, rsp=7
+    static const uint8_t encoding_map[] = {
+        0, // rax -> 0
+        3, // rbx -> 3
+        1, // rcx -> 1
+        2, // rdx -> 2
+        6, // rsi -> 6
+        7, // rdi -> 7
+        5, // rbp -> 5
+        4, // rsp -> 4
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7 // r8-r15 (low 3 bits)
+    };
+    return encoding_map[reg];
+}
+
 // liveness information for a value
 typedef struct
 {
@@ -196,13 +228,34 @@ typedef struct
     bool     is_fp;     // whether value is floating point
 } ValueLiveness;
 
-static X86_64_Reg get_physical_reg(X86_64_CodegenContext *ctx, uint32_t virtual_reg)
+static X86_64_Reg get_physical_reg(X86_64_CodegenContext *ctx, uint32_t virtual_reg, X86_64_Reg scratch)
 {
     if (virtual_reg >= ctx->reg_map.count)
     {
         return X86_64_RAX; // fallback
     }
-    return ctx->reg_map.map[virtual_reg];
+    
+    X86_64_Reg reg = ctx->reg_map.map[virtual_reg];
+    if (reg == X86_64_REG_COUNT) // stack slot
+    {
+        int32_t offset = ctx->reg_map.stack_slots[virtual_reg];
+        if (offset != 0)
+        {
+            // emit load: mov scratch, [rbp + offset]
+            uint8_t rex = 0x48;
+            if (scratch >= X86_64_R8) rex |= 0x04;
+            emit_byte(ctx, rex);
+            emit_byte(ctx, 0x8B);
+            
+            // modrm: mod=10 (disp32), reg=scratch, rm=101 (rbp)
+            uint8_t modrm = 0x80 | (reg_to_x86_encoding(scratch) << 3) | 0x05;
+            emit_byte(ctx, modrm);
+            emit_dword(ctx, (uint32_t)offset);
+            
+            return scratch;
+        }
+    }
+    return reg;
 }
 
 // compute liveness information for all values in function
@@ -248,8 +301,8 @@ static ValueLiveness *compute_liveness(MIRFunction *func, size_t *liveness_count
                 liveness[id].last_use = inst_idx;
 
                 // track type
-                Type *type = inst->result->type;
-                if (type && (type->kind == TYPE_F32 || type->kind == TYPE_F64))
+                MIRType *type = inst->result->type;
+                if (type && (type->kind == MIR_TYPE_F32 || type->kind == MIR_TYPE_F64))
                 {
                     liveness[id].is_fp = true;
                 }
@@ -293,15 +346,19 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
     {
         size_t      new_capacity = func->next_value_id;
         X86_64_Reg *new_map      = realloc(ctx->reg_map.map, new_capacity * sizeof(X86_64_Reg));
-        if (!new_map)
+        int32_t    *new_slots    = realloc(ctx->reg_map.stack_slots, new_capacity * sizeof(int32_t));
+        
+        if (!new_map || !new_slots)
         {
             return -1;
         }
-        ctx->reg_map.map      = new_map;
-        ctx->reg_map.capacity = new_capacity;
+        ctx->reg_map.map         = new_map;
+        ctx->reg_map.stack_slots = new_slots;
+        ctx->reg_map.capacity    = new_capacity;
     }
 
     ctx->reg_map.count = func->next_value_id;
+    memset(ctx->reg_map.stack_slots, 0, ctx->reg_map.count * sizeof(int32_t));
 
     // abi parameter registers (system v amd64)
     static const X86_64_Reg gp_param_regs[] = {X86_64_RDI, X86_64_RSI, X86_64_RDX, X86_64_RCX, X86_64_R8, X86_64_R9};
@@ -338,9 +395,9 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
         if (func->params[i])
         {
             uint32_t param_id = func->params[i]->id;
-            Type    *type     = func->params[i]->type;
+            MIRType *type     = func->params[i]->type;
 
-            if (type && (type->kind == TYPE_F32 || type->kind == TYPE_F64))
+            if (type && (type->kind == MIR_TYPE_F32 || type->kind == MIR_TYPE_F64))
             {
                 if (fp_param_idx < 8)
                 {
@@ -363,9 +420,12 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
                 }
                 else
                 {
-                    // parameter fell to the stack so reserve a temporary register for now
-                    // proper stack parameter support will load it in the prologue (r11 fallback)
-                    ctx->reg_map.map[param_id] = X86_64_R11;
+                    // parameter fell to the stack
+                    // stack parameters arrive right to left at [rbp + 16], [rbp + 24], ...
+                    int32_t offset = 16 + (gp_param_idx - 6) * 8;
+                    ctx->reg_map.map[param_id] = X86_64_REG_COUNT; // mark as stack
+                    ctx->reg_map.stack_slots[param_id] = offset;
+                    gp_param_idx++;
                 }
             }
         }
@@ -505,8 +565,14 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
                         }
                         else
                         {
-                            // all fp registers are in use, fall back to round-robin reuse
-                            ctx->reg_map.map[id] = allocatable_fp_regs[id % num_allocatable_fp];
+                            // spill to stack
+                            ctx->reg_map.map[id] = X86_64_REG_COUNT;
+                            func->frame_size += 8;
+                            // raw offset from RBP (locals start at -40)
+                            // lower.c frame_size is relative to locals start
+                            int32_t offset = -40 - (int32_t)func->frame_size;
+                            ctx->reg_map.stack_slots[id] = offset;
+                            value_live[id] = true;
                         }
                     }
                     else
@@ -530,9 +596,12 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
                         }
                         else
                         {
-                            // all gp registers are in use, fall back to round-robin reuse
-                            ctx->reg_map.map[id] = allocatable_gp_regs[id % num_allocatable_gp];
-                            value_live[id]       = true;
+                            // spill to stack
+                            ctx->reg_map.map[id] = X86_64_REG_COUNT;
+                            func->frame_size += 8;
+                            int32_t offset = -40 - (int32_t)func->frame_size;
+                            ctx->reg_map.stack_slots[id] = offset;
+                            value_live[id] = true;
                         }
                     }
                 }
@@ -547,32 +616,6 @@ int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func)
     free(value_live);
     free(liveness);
     return 0;
-}
-
-// map our register enum to the encoding used by x86
-static uint8_t reg_to_x86_encoding(X86_64_Reg reg)
-{
-    // x86-64 register encoding: rax=0, rcx=1, rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7
-    // our enum: rax=0, rbx=1, rcx=2, rdx=3, rsi=4, rdi=5, rbp=6, rsp=7
-    static const uint8_t encoding_map[] = {
-        0, // rax -> 0
-        3, // rbx -> 3
-        1, // rcx -> 1
-        2, // rdx -> 2
-        6, // rsi -> 6
-        7, // rdi -> 7
-        5, // rbp -> 5
-        4, // rsp -> 4
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7 // r8-r15 (low 3 bits)
-    };
-    return encoding_map[reg];
 }
 
 // emit x86_64 instruction encodings
@@ -1166,17 +1209,13 @@ static void emit_add_reg_imm(X86_64_CodegenContext *ctx, X86_64_Reg dst, int32_t
 
 static void emit_epilogue(X86_64_CodegenContext *ctx)
 {
-    MIRFunction *func = ctx->current_function;
-
-    if (func->frame_size > 0)
-    {
-        size_t aligned_size = (func->frame_size + 15) & ~15;
-        // add rsp, aligned_size
-        emit_byte(ctx, 0x48);
-        emit_byte(ctx, 0x81);
-        emit_byte(ctx, 0xC4);
-        emit_dword(ctx, (uint32_t)aligned_size);
-    }
+    // restore stack pointer to point to saved registers
+    // lea rsp, [rbp - 40] (5 regs * 8 bytes)
+    // this works regardless of frame size and ensures we point to the saved regs
+    emit_byte(ctx, 0x48);
+    emit_byte(ctx, 0x8D);
+    emit_byte(ctx, 0x65);
+    emit_byte(ctx, 0xD8); // -40
 
     // restore callee-saved gp registers
     emit_bytes(ctx, (uint8_t[]){0x41, 0x5F}, 2);
@@ -1189,6 +1228,29 @@ static void emit_epilogue(X86_64_CodegenContext *ctx)
     emit_ret(ctx);
 }
 
+static void emit_spill_store(X86_64_CodegenContext *ctx, MIRValue *val, X86_64_Reg src)
+{
+    if (!val) return;
+    if (val->id >= ctx->reg_map.count) return;
+    
+    if (ctx->reg_map.map[val->id] == X86_64_REG_COUNT)
+    {
+        int32_t offset = ctx->reg_map.stack_slots[val->id];
+        if (offset != 0)
+        {
+            // store src to [rbp + offset]
+            uint8_t rex = 0x48;
+            if (src >= X86_64_R8) rex |= 0x04;
+            emit_byte(ctx, rex);
+            emit_byte(ctx, 0x89);
+            
+            uint8_t modrm = 0x80 | (reg_to_x86_encoding(src) << 3) | 0x05;
+            emit_byte(ctx, modrm);
+            emit_dword(ctx, (uint32_t)offset);
+        }
+    }
+}
+
 static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
 {
     switch (inst->op)
@@ -1196,19 +1258,20 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
     case MIR_OP_CONST:
         if (inst->result && inst->operand_count > 0 && inst->operands[0].kind == MIR_OPERAND_IMM_INT)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             emit_mov_reg_imm64(ctx, dst, inst->operands[0].imm_int);
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
     case MIR_OP_MOV:
         if (inst->result && inst->operand_count > 0)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
 
             if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 if (x86_64_reg_is_fp(dst) && x86_64_reg_is_fp(src))
                 {
                     emit_movsd_reg_reg(ctx, dst, src);
@@ -1238,6 +1301,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             {
                 emit_mov_reg_imm64(ctx, dst, inst->operands[0].imm_int);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
@@ -1245,7 +1309,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         // load from memory
         if (inst->result && inst->operand_count > 0)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
 
             if (inst->operands[0].kind == MIR_OPERAND_IMM_INT)
             {
@@ -1257,13 +1321,38 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 }
                 else
                 {
-                    emit_mov_mem_to_reg(ctx, dst, offset);
+                    // check if loading a byte value - use movzx for u8/i8
+                    MIRType *type = inst->result->type;
+                    bool  is_byte = (type && (type->kind == MIR_TYPE_U8 || type->kind == MIR_TYPE_I8));
+                    
+                    if (is_byte)
+                    {
+                        // movzx dst, byte [rbp + offset]
+                        offset -= 40; // adjust like emit_mov_mem_to_reg does
+                        
+                        uint8_t rex = 0x48;
+                        if (dst >= X86_64_R8)
+                        {
+                            rex |= 0x04;
+                        }
+                        emit_byte(ctx, rex);
+                        emit_byte(ctx, 0x0F);
+                        emit_byte(ctx, 0xB6);
+                        
+                        uint8_t modrm = 0x80 | (reg_to_x86_encoding(dst) << 3) | 0x05;
+                        emit_byte(ctx, modrm);
+                        emit_dword(ctx, (uint32_t)offset);
+                    }
+                    else
+                    {
+                        emit_mov_mem_to_reg(ctx, dst, offset);
+                    }
                 }
             }
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
                 // load from address in register: [src] -> dst
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
 
                 if (x86_64_reg_is_fp(dst))
                 {
@@ -1291,8 +1380,8 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 }
                 else
                 {
-                    Type *type    = inst->result->type;
-                    bool  is_byte = (type && (type->kind == TYPE_U8 || type->kind == TYPE_I8));
+                    MIRType *type = inst->result->type;
+                    bool  is_byte = (type && (type->kind == MIR_TYPE_U8 || type->kind == MIR_TYPE_I8));
 
                     uint8_t rex = 0x48;
                     if (dst >= X86_64_R8)
@@ -1338,6 +1427,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                     }
                 }
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
@@ -1348,7 +1438,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
                 // store to stack slot: register -> [rbp + offset]
-                X86_64_Reg src    = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src    = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 int32_t    offset = (int32_t)inst->operands[1].imm_int;
 
                 if (x86_64_reg_is_fp(src))
@@ -1363,8 +1453,8 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
                 // store to address in register: src -> [dst_addr]
-                X86_64_Reg src      = get_physical_reg(ctx, inst->operands[0].value_id);
-                X86_64_Reg dst_addr = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg src      = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
+                X86_64_Reg dst_addr = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
 
                 if (x86_64_reg_is_fp(src))
                 {
@@ -1435,7 +1525,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         // get the address of a stack slot via lea
         if (inst->result && inst->operand_count > 0 && inst->operands[0].kind == MIR_OPERAND_IMM_INT)
         {
-            X86_64_Reg dst    = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst    = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             int32_t    offset = (int32_t)inst->operands[0].imm_int;
             // adjust offset for saved registers (5 * 8 = 40 bytes)
             offset -= 40;
@@ -1454,22 +1544,21 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             emit_byte(ctx, modrm);
 
             emit_dword(ctx, (uint32_t)offset);
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
-
-        // ... existing code ...
 
     case MIR_OP_ADD:
         if (inst->result && inst->operand_count >= 2)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
 
             if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
-                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
+                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
 
-                if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
+                if (inst->type && (inst->type->kind == MIR_TYPE_F32 || inst->type->kind == MIR_TYPE_F64))
                 {
                     if (dst != lhs)
                     {
@@ -1488,13 +1577,14 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             }
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
-                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 if (dst != lhs)
                 {
                     emit_mov_reg_reg(ctx, dst, lhs);
                 }
                 emit_add_reg_imm(ctx, dst, (int32_t)inst->operands[1].imm_int);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
         break;
@@ -1502,14 +1592,14 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
     case MIR_OP_SUB:
         if (inst->result && inst->operand_count >= 2)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
 
             if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
-                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
+                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
 
-                if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
+                if (inst->type && (inst->type->kind == MIR_TYPE_F32 || inst->type->kind == MIR_TYPE_F64))
                 {
                     if (dst != lhs)
                     {
@@ -1528,7 +1618,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             }
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
-                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 int32_t    imm = (int32_t)inst->operands[1].imm_int;
 
                 if (dst != lhs)
@@ -1547,20 +1637,21 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 emit_byte(ctx, 0xE8 | reg_to_x86_encoding(dst));
                 emit_dword(ctx, imm);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
     case MIR_OP_MUL:
         if (inst->result && inst->operand_count >= 2)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
 
             if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
-                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
+                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
 
-                if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
+                if (inst->type && (inst->type->kind == MIR_TYPE_F32 || inst->type->kind == MIR_TYPE_F64))
                 {
                     if (dst != lhs)
                     {
@@ -1579,26 +1670,27 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             }
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
-                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 if (dst != lhs)
                 {
                     emit_mov_reg_reg(ctx, dst, lhs);
                 }
                 emit_imul_reg_imm(ctx, dst, (int32_t)inst->operands[1].imm_int);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
     case MIR_OP_DIV:
         if (inst->result && inst->operand_count >= 2)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
 
             if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
 
-                if (inst->type && (inst->type->kind == TYPE_F32 || inst->type->kind == TYPE_F64))
+                if (inst->type && (inst->type->kind == MIR_TYPE_F32 || inst->type->kind == MIR_TYPE_F64))
                 {
                     emit_divsd_reg_reg(ctx, dst, src);
                 }
@@ -1606,8 +1698,8 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 {
                     // integer division via idiv (rdx:rax / src)
 
-                    X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
-                    X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
+                    X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
+                    X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
 
                     emit_mov_reg_reg(ctx, X86_64_RAX, lhs);
 
@@ -1629,7 +1721,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
                 // integer division with an immediate, routing through rcx
-                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 int64_t    imm = inst->operands[1].imm_int;
 
                 emit_mov_reg_reg(ctx, X86_64_RAX, lhs);
@@ -1645,20 +1737,21 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
 
                 emit_mov_reg_reg(ctx, dst, X86_64_RAX);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
     case MIR_OP_MOD:
         if (inst->result && inst->operand_count >= 2)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
 
             if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
                 // integer modulo via idiv (rdx captures the remainder)
 
-                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
-                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
+                X86_64_Reg rhs = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
 
                 emit_mov_reg_reg(ctx, X86_64_RAX, lhs);
 
@@ -1680,7 +1773,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             {
                 // integer modulo with immediate: move literal into rcx first
 
-                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg lhs = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 int64_t    imm = inst->operands[1].imm_int;
 
                 emit_mov_reg_reg(ctx, X86_64_RAX, lhs);
@@ -1696,16 +1789,17 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
 
                 emit_mov_reg_reg(ctx, dst, X86_64_RDX);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
     case MIR_OP_AND:
         if (inst->result && inst->operand_count >= 2)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 if (dst != src1)
                 {
                     emit_mov_reg_reg(ctx, dst, src1);
@@ -1713,19 +1807,20 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             }
             if (inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
                 emit_and_reg_reg(ctx, dst, src2);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
     case MIR_OP_OR:
         if (inst->result && inst->operand_count >= 2)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 if (dst != src1)
                 {
                     emit_mov_reg_reg(ctx, dst, src1);
@@ -1733,19 +1828,20 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             }
             if (inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
                 emit_or_reg_reg(ctx, dst, src2);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
     case MIR_OP_XOR:
         if (inst->result && inst->operand_count >= 2)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 if (dst != src1)
                 {
                     emit_mov_reg_reg(ctx, dst, src1);
@@ -1753,9 +1849,10 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             }
             if (inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
                 emit_xor_reg_reg(ctx, dst, src2);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
@@ -1763,39 +1860,42 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         // truncation is effectively a move since we mostly operate on 64-bit regs
         if (inst->result && inst->operand_count > 0)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 if (dst != src)
                 {
                     emit_mov_reg_reg(ctx, dst, src);
                 }
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
     case MIR_OP_FPTOSI:
         if (inst->result && inst->operand_count > 0)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 emit_cvttsd2si_reg_reg(ctx, dst, src);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
     case MIR_OP_SITOFP:
         if (inst->result && inst->operand_count > 0)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 emit_cvtsi2sd_reg_reg(ctx, dst, src);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
@@ -1804,15 +1904,16 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         // other conversions are delegated to the dedicated mir opcodes during lowering
         if (inst->result && inst->operand_count > 0)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             if (inst->operands[0].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 if (dst != src)
                 {
                     emit_mov_reg_reg(ctx, dst, src);
                 }
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
@@ -1828,11 +1929,11 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
     case MIR_OP_UGE:
         if (inst->result && inst->operand_count >= 2)
         {
-            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+            X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
             if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_VALUE)
             {
-                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id);
-                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id);
+                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
+                X86_64_Reg src2 = get_physical_reg(ctx, inst->operands[1].value_id, X86_64_R11);
 
                 emit_cmp_reg_reg(ctx, src1, src2);
 
@@ -1877,7 +1978,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             }
             else if (inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_IMM_INT)
             {
-                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id);
+                X86_64_Reg src1 = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                 int32_t    imm  = (int32_t)inst->operands[1].imm_int;
 
                 uint8_t rex = 0x48;
@@ -1929,6 +2030,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
 
                 emit_setcc(ctx, cond, dst);
             }
+            emit_spill_store(ctx, inst->result, dst);
         }
         break;
 
@@ -1956,7 +2058,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
     case MIR_OP_BRCOND:
         if (inst->operand_count >= 3 && inst->operands[0].kind == MIR_OPERAND_VALUE && inst->operands[1].kind == MIR_OPERAND_BLOCK && inst->operands[2].kind == MIR_OPERAND_BLOCK)
         {
-            X86_64_Reg cond_reg = get_physical_reg(ctx, inst->operands[0].value_id);
+            X86_64_Reg cond_reg = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
 
             // test cond, cond
             emit_test_reg_reg(ctx, cond_reg, cond_reg);
@@ -1992,7 +2094,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
         // move return value to rax if needed
         if (inst->operand_count > 0 && inst->operands[0].kind == MIR_OPERAND_VALUE)
         {
-            X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+            X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
             emit_mov_reg_reg(ctx, X86_64_RAX, src);
         }
         emit_epilogue(ctx);
@@ -2013,7 +2115,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 }
                 else if (inst->operands[i].kind == MIR_OPERAND_VALUE)
                 {
-                    X86_64_Reg src = get_physical_reg(ctx, inst->operands[i].value_id);
+                    X86_64_Reg src = get_physical_reg(ctx, inst->operands[i].value_id, X86_64_R10);
                     emit_mov_reg_reg(ctx, syscall_arg_regs[i - 1], src);
                 }
                 else if (inst->operands[i].kind == MIR_OPERAND_GLOBAL)
@@ -2044,7 +2146,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 }
                 else if (inst->operands[0].kind == MIR_OPERAND_VALUE)
                 {
-                    X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id);
+                    X86_64_Reg src = get_physical_reg(ctx, inst->operands[0].value_id, X86_64_R10);
                     emit_mov_reg_reg(ctx, X86_64_RAX, src);
                 }
                 else if (inst->operands[0].kind == MIR_OPERAND_GLOBAL)
@@ -2066,11 +2168,12 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
             // result is in rax - if instruction has result, move to allocated register
             if (inst->result)
             {
-                X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+                X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
                 if (dst != X86_64_RAX)
                 {
                     emit_mov_reg_reg(ctx, dst, X86_64_RAX);
                 }
+                emit_spill_store(ctx, inst->result, dst);
             }
         }
         break;
@@ -2090,6 +2193,35 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 first_arg = 1;
             }
 
+            // push stack arguments (right to left)
+            size_t total_args = inst->operand_count - first_arg;
+            size_t num_stack_args = 0;
+            if (total_args > 6)
+            {
+                num_stack_args = total_args - 6;
+                for (size_t i = total_args; i > 6; i--)
+                {
+                    size_t arg_idx = first_arg + i - 1;
+                    if (inst->operands[arg_idx].kind == MIR_OPERAND_VALUE)
+                    {
+                        X86_64_Reg src = get_physical_reg(ctx, inst->operands[arg_idx].value_id, X86_64_R10);
+                        // push src
+                        if (src >= X86_64_R8) {
+                            emit_byte(ctx, 0x41);
+                            emit_byte(ctx, 0x50 + (src - X86_64_R8));
+                        } else {
+                            emit_byte(ctx, 0x50 + src);
+                        }
+                    }
+                    else if (inst->operands[arg_idx].kind == MIR_OPERAND_IMM_INT)
+                    {
+                        emit_mov_reg_imm64(ctx, X86_64_R10, inst->operands[arg_idx].imm_int);
+                        emit_byte(ctx, 0x41);
+                        emit_byte(ctx, 0x50 + (X86_64_R10 - X86_64_R8));
+                    }
+                }
+            }
+
             // load arguments into registers in two passes:
             //   1) save conflicting values to the stack
             //   2) reload arguments from their safe locations
@@ -2104,7 +2236,7 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
 
                 if (inst->operands[i].kind == MIR_OPERAND_VALUE)
                 {
-                    sources[arg_idx] = get_physical_reg(ctx, inst->operands[i].value_id);
+                    sources[arg_idx] = get_physical_reg(ctx, inst->operands[i].value_id, X86_64_R10);
                 }
                 else
                 {
@@ -2214,34 +2346,37 @@ static void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst)
                 add_relocation(ctx, reloc_offset, func_name, 4, -4);
             }
 
-            // clean up stack: add rsp, num_saved * 8
-            if (num_saved > 0)
+            // clean up stack: add rsp, (num_saved + num_stack_args) * 8
+            // NOTE: stack args are pushed BEFORE saved regs, so they are deeper in the stack
+            // but we pop everything at once
+            size_t total_cleanup = (num_saved + num_stack_args) * 8;
+            if (total_cleanup > 0)
             {
-                uint8_t cleanup_bytes = num_saved * 8;
-                if (cleanup_bytes <= 127)
+                if (total_cleanup <= 127)
                 {
                     emit_byte(ctx, 0x48);
                     emit_byte(ctx, 0x83);
                     emit_byte(ctx, 0xC4);
-                    emit_byte(ctx, cleanup_bytes);
+                    emit_byte(ctx, (uint8_t)total_cleanup);
                 }
                 else
                 {
                     emit_byte(ctx, 0x48);
                     emit_byte(ctx, 0x81);
                     emit_byte(ctx, 0xC4);
-                    emit_dword(ctx, cleanup_bytes);
+                    emit_dword(ctx, (uint32_t)total_cleanup);
                 }
             }
 
             // result is in rax - if instruction has result, move to allocated register
             if (inst->result)
             {
-                X86_64_Reg dst = get_physical_reg(ctx, inst->result->id);
+                X86_64_Reg dst = get_physical_reg(ctx, inst->result->id, X86_64_R11);
                 if (dst != X86_64_RAX)
                 {
                     emit_mov_reg_reg(ctx, dst, X86_64_RAX);
                 }
+                emit_spill_store(ctx, inst->result, dst);
             }
         }
         break;
@@ -2291,12 +2426,14 @@ int x86_64_emit_function(X86_64_CodegenContext *ctx, MIRFunction *func)
     // push r15
     emit_bytes(ctx, (uint8_t[]){0x41, 0x57}, 2);
 
-    // allocate stack frame if needed
-    if (func->frame_size > 0)
-    {
-        // align frame size to 16 bytes (ABI requirement)
-        size_t aligned_size = (func->frame_size + 15) & ~15;
+    // allocate stack frame
+    // ensure 16-byte alignment relative to return address (ABI requirement)
+    // current rsp is 8-byte aligned (after 6 pushes: rbp + 5 callee-saved regs)
+    // we need (alloc_size % 16) == 8 to restore 16-byte alignment
+    size_t aligned_size = ((func->frame_size + 8 + 15) & ~15) - 8;
 
+    if (aligned_size > 0)
+    {
         // sub rsp, aligned_size using rex.w + 81 /5
         emit_byte(ctx, 0x48);
         emit_byte(ctx, 0x81);

@@ -1,7 +1,7 @@
 #ifndef MIR_GLOBAL_H
 #define MIR_GLOBAL_H
 
-#include "compiler/type.h"
+#include "compiler/mir/type.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -13,12 +13,22 @@ typedef enum MIRGlobalKind
     MIR_GLOBAL_UNINIT, // var (uninitialized, bss)
 } MIRGlobalKind;
 
+typedef enum MIRGlobalInitKind
+{
+    MIR_INIT_NONE,
+    MIR_INIT_INT,
+    MIR_INIT_FLOAT,
+    MIR_INIT_STRING,
+    MIR_INIT_ARRAY
+} MIRGlobalInitKind;
+
 // mir global data
 typedef struct MIRGlobal
 {
     char          *name;
-    Type          *type;
+    MIRType       *type;
     MIRGlobalKind  kind;
+    MIRGlobalInitKind init_kind;
     bool           is_exported;
     
     // initializer data
@@ -34,7 +44,7 @@ typedef struct MIRGlobal
 } MIRGlobal;
 
 // global management
-MIRGlobal *mir_global_create(const char *name, Type *type, MIRGlobalKind kind, bool is_exported);
+MIRGlobal *mir_global_create(const char *name, MIRType *type, MIRGlobalKind kind, bool is_exported);
 void       mir_global_destroy(MIRGlobal *global);
 void       mir_global_set_int_init(MIRGlobal *global, int64_t value);
 void       mir_global_set_float_init(MIRGlobal *global, double value);

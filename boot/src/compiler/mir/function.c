@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-MIRFunction *mir_function_create(const char *name, Type *type, bool is_exported)
+MIRFunction *mir_function_create(const char *name, MIRType *type, bool is_exported)
 {
     MIRFunction *func = malloc(sizeof(MIRFunction));
     if (!func)
@@ -95,7 +95,7 @@ MIRBlock *mir_function_get_entry_block(MIRFunction *func)
     return func ? func->first_block : NULL;
 }
 
-MIRValue *mir_function_alloc_value(MIRFunction *func, Type *type, const char *name)
+MIRValue *mir_function_alloc_value(MIRFunction *func, MIRType *type, const char *name)
 {
     if (!func)
     {
@@ -105,7 +105,7 @@ MIRValue *mir_function_alloc_value(MIRFunction *func, Type *type, const char *na
     return mir_value_create(func->next_value_id++, type, name);
 }
 
-MIRValue *mir_function_add_param(MIRFunction *func, Type *type, const char *name)
+MIRValue *mir_function_add_param(MIRFunction *func, MIRType *type, const char *name)
 {
     if (!func)
     {

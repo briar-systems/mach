@@ -21,6 +21,7 @@ typedef struct
 typedef struct
 {
     X86_64_Reg *map;
+    int32_t    *stack_slots; // stack offset if spilled/stack param (0 if in reg)
     size_t      count;
     size_t      capacity;
 } X86_64_RegMap;

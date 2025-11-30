@@ -125,6 +125,53 @@ void lexer_skip_whitespace(Lexer *lexer)
     }
 }
 
+// parse type suffix for numeric literals (u8, u16, u32, u64, i8, i16, i32, i64, f32, f64)
+// returns allocated string or NULL if no valid suffix
+static char *lexer_parse_type_suffix(Lexer *lexer)
+{
+    int suffix_start = lexer->pos;
+
+    // check for valid type suffix starting with i, u, or f
+    if (lexer_current(lexer) != 'i' && lexer_current(lexer) != 'u' && lexer_current(lexer) != 'f')
+    {
+        return NULL;
+    }
+
+    lexer_advance(lexer);
+
+    // collect digits for bit width
+    int width_start = lexer->pos;
+    while (!lexer_at_end(lexer) && isdigit(lexer_current(lexer)))
+    {
+        lexer_advance(lexer);
+    }
+
+    int width_len = lexer->pos - width_start;
+    if (width_len == 0)
+    {
+        // no digits after i/u/f, reset and return NULL
+        lexer->pos = suffix_start;
+        return NULL;
+    }
+
+    // validate it's a known type: u8, u16, u32, u64, i8, i16, i32, i64, f32, f64
+    int  suffix_len = lexer->pos - suffix_start;
+    char suffix[8];
+    strncpy(suffix, lexer->source + suffix_start, suffix_len);
+    suffix[suffix_len] = '\0';
+
+    if (strcmp(suffix, "u8") == 0 || strcmp(suffix, "u16") == 0 || strcmp(suffix, "u32") == 0 || strcmp(suffix, "u64") == 0 ||
+        strcmp(suffix, "i8") == 0 || strcmp(suffix, "i16") == 0 || strcmp(suffix, "i32") == 0 || strcmp(suffix, "i64") == 0 ||
+        strcmp(suffix, "f32") == 0 || strcmp(suffix, "f64") == 0)
+    {
+        return strdup(suffix);
+    }
+
+    // invalid suffix, reset position
+    lexer->pos = suffix_start;
+    return NULL;
+}
+
 // identifier formatting rules:
 // - only alphanumeric characters and underscores are acceptable
 Token *lexer_parse_identifier(Lexer *lexer)
@@ -193,24 +240,33 @@ Token *lexer_parse_lit_number(Lexer *lexer)
             {
                 lexer_advance(lexer);
             }
-            Token *token = malloc(sizeof(Token));
-            token_init(token, TOKEN_LIT_INT, start, lexer->pos - start);
+            Token *token     = malloc(sizeof(Token));
+            char  *suffix    = lexer_parse_type_suffix(lexer);
+            int    token_len = lexer->pos - start;
+            token_init(token, TOKEN_LIT_INT, start, token_len);
+            token->type_suffix = suffix;
             return token;
         case 8:
             while (!lexer_at_end(lexer) && ((lexer_current(lexer) >= '0' && lexer_current(lexer) <= '7') || lexer_current(lexer) == '_'))
             {
                 lexer_advance(lexer);
             }
-            Token *octal_token = malloc(sizeof(Token));
-            token_init(octal_token, TOKEN_LIT_INT, start, lexer->pos - start);
+            Token *octal_token  = malloc(sizeof(Token));
+            char  *octal_suffix = lexer_parse_type_suffix(lexer);
+            int    octal_len    = lexer->pos - start;
+            token_init(octal_token, TOKEN_LIT_INT, start, octal_len);
+            octal_token->type_suffix = octal_suffix;
             return octal_token;
         case 16:
             while (!lexer_at_end(lexer) && (isxdigit(lexer_current(lexer)) || lexer_current(lexer) == '_'))
             {
                 lexer_advance(lexer);
             }
-            Token *hex_token = malloc(sizeof(Token));
-            token_init(hex_token, TOKEN_LIT_INT, start, lexer->pos - start);
+            Token *hex_token  = malloc(sizeof(Token));
+            char  *hex_suffix = lexer_parse_type_suffix(lexer);
+            int    hex_len    = lexer->pos - start;
+            token_init(hex_token, TOKEN_LIT_INT, start, hex_len);
+            hex_token->type_suffix = hex_suffix;
             return hex_token;
         default:
             lexer_advance(lexer);
@@ -232,13 +288,19 @@ Token *lexer_parse_lit_number(Lexer *lexer)
             lexer_advance(lexer);
         }
 
-        Token *float_token = malloc(sizeof(Token));
-        token_init(float_token, TOKEN_LIT_FLOAT, start, lexer->pos - start);
+        Token *float_token  = malloc(sizeof(Token));
+        char  *float_suffix = lexer_parse_type_suffix(lexer);
+        int    float_len    = lexer->pos - start;
+        token_init(float_token, TOKEN_LIT_FLOAT, start, float_len);
+        float_token->type_suffix = float_suffix;
         return float_token;
     }
 
-    Token *int_token = malloc(sizeof(Token));
-    token_init(int_token, TOKEN_LIT_INT, start, lexer->pos - start);
+    Token *int_token  = malloc(sizeof(Token));
+    char  *int_suffix = lexer_parse_type_suffix(lexer);
+    int    int_len    = lexer->pos - start;
+    token_init(int_token, TOKEN_LIT_INT, start, int_len);
+    int_token->type_suffix = int_suffix;
     return int_token;
 }
 

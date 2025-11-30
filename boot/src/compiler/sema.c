@@ -1818,17 +1818,69 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
     switch (node->kind)
     {
     case AST_EXPR_LIT:
-        // literals have types based on their token
+        // literals have types based on their token and type suffix
         if (node->token)
         {
             switch (node->token->kind)
             {
             case TOKEN_LIT_INT:
-                node->type = type_get_primitive(TYPE_I64);
-                break;
             case TOKEN_LIT_FLOAT:
-                node->type = type_get_primitive(TYPE_F64);
+            {
+                // require type suffix for numeric literals
+                if (!node->token->type_suffix)
+                {
+                    sema_error(sema, node->token, "numeric literal requires type suffix (e.g., 42i64, 3.14f32)");
+                    return -1;
+                }
+
+                // parse type suffix to determine type
+                if (strcmp(node->token->type_suffix, "u8") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_U8);
+                }
+                else if (strcmp(node->token->type_suffix, "u16") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_U16);
+                }
+                else if (strcmp(node->token->type_suffix, "u32") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_U32);
+                }
+                else if (strcmp(node->token->type_suffix, "u64") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_U64);
+                }
+                else if (strcmp(node->token->type_suffix, "i8") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_I8);
+                }
+                else if (strcmp(node->token->type_suffix, "i16") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_I16);
+                }
+                else if (strcmp(node->token->type_suffix, "i32") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_I32);
+                }
+                else if (strcmp(node->token->type_suffix, "i64") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_I64);
+                }
+                else if (strcmp(node->token->type_suffix, "f32") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_F32);
+                }
+                else if (strcmp(node->token->type_suffix, "f64") == 0)
+                {
+                    node->type = type_get_primitive(TYPE_F64);
+                }
+                else
+                {
+                    sema_error(sema, node->token, "invalid type suffix for numeric literal");
+                    return -1;
+                }
                 break;
+            }
             case TOKEN_LIT_STRING:
                 // simplified: string is pointer to u8
                 node->type = type_create_pointer(type_get_primitive(TYPE_U8), false);

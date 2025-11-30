@@ -84,6 +84,7 @@ typedef struct Token
     TokenKind kind;
     int       pos;
     int       len;
+    char     *type_suffix; // for literals: u8, i32, f64, etc.
 } Token;
 
 void token_init(Token *token, TokenKind kind, int pos, int len);
