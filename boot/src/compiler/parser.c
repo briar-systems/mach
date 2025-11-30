@@ -723,7 +723,7 @@ static bool parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind
 
     if (has_payload && depth == 0)
     {
-        // Check what comes after the closing ']'
+        // check what follows the closing ']'
         Token *after = parser_next_non_comment(parser, &peeked_tokens, &peek_count, &peek_capacity);
         if (after && (after->kind == TOKEN_L_PAREN || after->kind == TOKEN_L_BRACE))
         {
@@ -735,10 +735,10 @@ static bool parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind
         }
     }
 
-    // Restore lexer position
+    // restore lexer position
     parser->lexer->pos = saved_pos;
 
-    // Clean up peeked tokens
+    // clean up peeked tokens
     for (size_t i = 0; i < peek_count; i++)
     {
         token_dnit(peeked_tokens[i]);
@@ -944,7 +944,7 @@ static AstNode *parser_finish_call(Parser *parser, AstNode *callee, AstList *typ
         return NULL;
     }
 
-    // Check if this is a type intrinsic that expects type arguments instead of expressions
+    // check if this is a type intrinsic that expects type arguments instead of expressions
     bool        is_type_intrinsic = false;
     const char *intrinsic_name    = NULL;
     if (callee->kind == AST_EXPR_IDENT)
@@ -972,13 +972,13 @@ static AstNode *parser_finish_call(Parser *parser, AstNode *callee, AstList *typ
                 }
                 else
                 {
-                    // Parse as type instead of expression
+                    // parse as type instead of expression
                     arg = parser_parse_type(parser);
                 }
             }
             else
             {
-                // Normal expression argument
+                // normal expression argument
                 arg = parser_parse_expr(parser);
             }
 
@@ -1467,9 +1467,6 @@ static AstNode *parser_parse_var_decl(Parser *parser, bool is_val, bool is_publi
         free(node);
         return NULL;
     }
-
-    // DEBUG
-    // printf("Parsed type for var %s. Next token: %s\n", node->var_stmt.name, token_kind_to_string(parser->current->kind));
 
     // val requires initialization, var is optional
     if (is_val)
@@ -2890,18 +2887,18 @@ AstNode *parser_parse_expr_atom(Parser *parser)
 
     case TOKEN_DOLLAR:
     {
-        // Parse compile-time expression: $size_of(T), $mach.os.linux, $mach.build.target.os, etc.
+        // parse compile-time expression: $size_of(T), $mach.os.linux, $mach.build.target.os, etc.
         Token dollar_token = *parser->current;
         parser_advance(parser);
 
-        // Parse the prefix expression after $ (not full expression with binary ops)
+        // parse the prefix expression after $ (not full expression with binary ops)
         AstNode *inner = parser_parse_expr_prefix(parser);
         if (!inner)
         {
             return NULL;
         }
 
-        // Wrap it in AST_COMPTIME
+        // wrap it in AST_COMPTIME
         AstNode *comptime = parser_alloc_node(parser, AST_COMPTIME, &dollar_token);
         if (!comptime)
         {

@@ -199,12 +199,12 @@ bool type_equals(Type *a, Type *b)
         return true;
 
     case TYPE_STRUCT:
-        // Nominal typing for structs: equal if they have the same name
+        // nominal typing for structs: equal if they share the same name
         if (a->structure.name && b->structure.name)
         {
             return strcmp(a->structure.name, b->structure.name) == 0;
         }
-        // If anonymous, check structure
+        // if anonymous, compare structure
         if (a->structure.field_count != b->structure.field_count)
         {
             return false;
@@ -219,7 +219,7 @@ bool type_equals(Type *a, Type *b)
         return true;
 
     case TYPE_UNION:
-        // Nominal typing for unions
+        // nominal typing for unions
         if (a->union_type.name && b->union_type.name)
         {
             return strcmp(a->union_type.name, b->union_type.name) == 0;
@@ -238,7 +238,7 @@ bool type_equals(Type *a, Type *b)
         return true;
 
     case TYPE_GENERIC_PARAM:
-        // Generic params are equal if they have the same name
+        // generic params are equal if they share the same name
         return strcmp(a->generic_param.name, b->generic_param.name) == 0;
 
     default:
@@ -273,7 +273,7 @@ bool type_can_assign_to(Type *from, Type *to)
         }
     }
 
-    // TYPE_PTR (untyped pointer) can be assigned to any typed pointer
+    // untyped pointer TYPE_PTR can be assigned to any typed pointer
     if (from->kind == TYPE_PTR && to->kind == TYPE_POINTER)
     {
         return true;
@@ -302,7 +302,7 @@ Type *type_create_union(const char *name, TypeField *fields, int field_count)
     type->union_type.field_count = field_count;
     type->union_type.methods     = NULL; // initialize methods table
 
-    // Union size is max of fields, alignment is max of fields
+    // union size is the max of field sizes and alignment is the max of field alignments
     size_t size      = 0;
     size_t alignment = 1;
 
@@ -426,7 +426,7 @@ int type_mangle(Type *type, char *buffer, size_t buffer_size)
 
     case TYPE_POINTER:
     {
-        // P = mutable pointer, K = const/readonly pointer
+        // use 'P' for mutable pointers and 'K' for const/readonly pointers
         char prefix = type->pointer.is_const ? 'K' : 'P';
         written     = snprintf(buffer, buffer_size, "%c", prefix);
         if (written < (int)buffer_size && type->pointer.base)
@@ -438,7 +438,7 @@ int type_mangle(Type *type, char *buffer, size_t buffer_size)
 
     case TYPE_ARRAY:
     {
-        // A<count>_<elem_type>
+        // arrays use the pattern 'A<count>_<elem_type>'
         written = snprintf(buffer, buffer_size, "A%zu_", type->array.count);
         if (written < (int)buffer_size && type->array.elem_type)
         {
@@ -468,7 +468,7 @@ int type_mangle(Type *type, char *buffer, size_t buffer_size)
 
     case TYPE_FUNCTION:
     {
-        // F<return_type><param_types>E
+        // functions use the pattern 'F<return_type><param_types>E'
         written = snprintf(buffer, buffer_size, "F");
         if (type->function.return_type && written < (int)buffer_size)
         {

@@ -11,7 +11,7 @@
 // track loaded modules to avoid circular imports and redundant work
 typedef struct LoadedModule
 {
-    char                *module_path; // FQN of the module
+    char                *module_path; // fully qualified module path
     char                *source;      // source text (kept for error reporting)
     char                *file_path;   // file path for error messages
     AstNode             *ast;         // parsed AST
@@ -22,7 +22,7 @@ typedef struct LoadedModule
 typedef struct ImportAlias
 {
     char               *alias;       // the alias name
-    char               *module_path; // FQN of the module
+    char               *module_path; // fully qualified module path
     SymbolTable        *table;       // symbol table of the imported module
     struct ImportAlias *next;
 } ImportAlias;
@@ -1323,9 +1323,7 @@ static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
         }
     }
 
-    // If not assignment, it's a read (e.g. $mach.os.id).
-    // As a statement, it does nothing.
-    // But we should analyze it to ensure it's valid.
+    // treat bare comptime reads (e.g. $mach.os.id) as no-ops but still analyze them for validity
     return sema_analyze_expr(sema, inner);
 }
 
@@ -1880,7 +1878,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
         if (node->unary_expr.op == TOKEN_QUESTION)
         {
-            // Address-of: ?T -> *T
+            // address-of: ?T -> *T
             // check if operand is an l-value
             AstNode *operand   = node->unary_expr.expr;
             bool     is_lvalue = operand->kind == AST_EXPR_IDENT ||                                     // variable
@@ -1897,7 +1895,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         }
         else if (node->unary_expr.op == TOKEN_AT)
         {
-            // Dereference: @T -> T
+            // dereference: @T -> T
             Type *operand_type = node->unary_expr.expr->type;
             if (operand_type->kind != TYPE_POINTER)
             {
@@ -2019,7 +2017,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
         if (arg_count != param_count)
         {
-            if (func_type->function.param_count > 0 && func_type->function.param_types[func_type->function.param_count - 1] == NULL) // Variadic check
+            if (func_type->function.param_count > 0 && func_type->function.param_types[func_type->function.param_count - 1] == NULL) // variadic check
             {
                 if (arg_count < param_count - 1)
                 {
@@ -2039,7 +2037,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         {
             AstNode *arg = node->call_expr.args->items[i];
 
-            // For variadic functions, stop checking fixed params
+            // for variadic functions, stop checking fixed params
             if (i >= param_count)
             {
                 break;
@@ -2047,7 +2045,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
             Type *param_type = func_type->function.param_types[i];
 
-            // Variadic sentinel check
+            // variadic sentinel check
             if (param_type == NULL)
             {
                 break;
@@ -2519,7 +2517,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
                 Symbol *inst = sema_instantiate_generic(sema, sym, type_args);
 
-                // Cleanup list shell (items are owned by AST)
+                // cleanup list shell (items are owned by ast)
                 free(type_args);
 
                 if (!inst)
@@ -2809,7 +2807,7 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
             return NULL;
         }
 
-        // Evaluate size
+        // evaluate size
         AstNode *size_expr = type_node->type_array.size;
         if (size_expr->kind == AST_EXPR_LIT && size_expr->token->kind == TOKEN_LIT_INT)
         {
@@ -3122,7 +3120,7 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     }
 
     Symbol *inst_sym = symbol_create(mangled_name, SYMBOL_FUNCTION, sema->module_path);
-    inst_sym->decl   = cloned_decl; // Link symbol to cloned AST for MIR lowering
+    inst_sym->decl   = cloned_decl; // link symbol to cloned ast for MIR lowering
     symbol_table_insert(sema->root_table, inst_sym);
     cloned_decl->symbol = inst_sym;
 

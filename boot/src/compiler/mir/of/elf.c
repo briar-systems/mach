@@ -425,7 +425,7 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
         if (!sym->is_global)
         {
             symbols[idx].st_name = strtab_add(&strtab, sym->name);
-            symbols[idx].st_info = (0 << 4) | (sym->is_function ? 2 : 1); // STB_LOCAL
+            symbols[idx].st_info = (0 << 4) | (sym->is_function ? 2 : 1); // stb_local
             symbols[idx].st_other = 0;
             symbols[idx].st_shndx = sym->section_id + 1; // +1 for null section
             symbols[idx].st_value = sym->value;
@@ -443,7 +443,7 @@ int elf_write_to_file(ELFContext *ctx, const char *output_path)
         if (sym->is_global)
         {
             symbols[idx].st_name = strtab_add(&strtab, sym->name);
-            symbols[idx].st_info = (1 << 4) | (sym->is_function ? 2 : 1); // STB_GLOBAL
+            symbols[idx].st_info = (1 << 4) | (sym->is_function ? 2 : 1); // stb_global
             symbols[idx].st_other = 0;
             symbols[idx].st_shndx = sym->section_id + 1; // +1 for null section
             symbols[idx].st_value = sym->value;

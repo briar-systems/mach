@@ -71,14 +71,14 @@ void symbol_mangle(Symbol *symbol)
         return; // already mangled
     }
 
-    // Mangling scheme: _M<encoded_module_path>N<name_len><name>
-    // Encoded module path: length-prefixed segments of dot-separated path
+    // mangling scheme: _M<encoded_module_path>N<name_len><name>
+    // encoded module path: length-prefixed segments of dot-separated path
     // e.g. "std.io" -> "3std2io"
     
-    // Default module "main" if not specified
+    // default module "main" if not specified
     const char *path = symbol->module_path ? symbol->module_path : "main";
     
-    // First pass: calculate length
+    // first pass: calculate length
     size_t encoded_len = 0;
     char *path_copy = strdup(path);
     char *saveptr;
@@ -105,7 +105,7 @@ void symbol_mangle(Symbol *symbol)
         return;
     }
     
-    // Second pass: build string
+    // second pass: build string
     char *ptr = symbol->mangled_name;
     ptr += sprintf(ptr, "_M");
     

@@ -94,13 +94,13 @@ int cmd_build_handle(int argc, char **argv)
             return 1;
         }
 
-        // Store target binary path for output location
+        // store target binary path for output location
         if (target->binary)
         {
             target_binary = strdup(target->binary);
         }
 
-        // Store module resolution info
+        // store module resolution info
         if (config->id)
         {
             project_id = strdup(config->id);
@@ -127,22 +127,22 @@ int cmd_build_handle(int argc, char **argv)
         // note: config is kept alive until after sema_set_module_roots
     }
 
-    // Determine output file
+    // determine output file
     if (!output_file && is_project && project_root && target_binary)
     {
-        // Build to out/<binary path> (binary is relative to out dir in mach.toml)
+        // build to out/<binary path> (binary is relative to out dir in mach.toml)
         // e.g. if binary = "linux/bin/mach", we build to "<project_root>/out/linux/bin/mach"
         char out_path[1024];
         snprintf(out_path, sizeof(out_path), "%s/out/%s", project_root, target_binary);
         output_file = strdup(out_path);
 
-        // Create output directory if it doesn't exist
+        // create output directory if it doesn't exist
         char *out_dir  = strdup(output_file);
         char *last_sep = strrchr(out_dir, '/');
         if (last_sep)
         {
             *last_sep = '\0';
-            // Create directory recursively
+            // create directory recursively
             char mkdir_cmd[1536];
             snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s 2>/dev/null", out_dir);
             system(mkdir_cmd);
@@ -386,7 +386,7 @@ int cmd_build_handle(int argc, char **argv)
         return 1;
     }
 
-    // Silent on success - no output
+    // silent on success - no output
 
     // cleanup
     mir_module_destroy(mir);
