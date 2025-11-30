@@ -20,16 +20,16 @@ MIR supports three kinds of global data:
 
 ```c
 typedef struct MIRGlobal {
-    char *name;              // Global symbol name
-    Type *type;              // Type of the global
-    MIRGlobalKind kind;      // VAL, VAR, or UNINIT
-    bool is_exported;        // Visible to linker?
+    char *name;              // global symbol name
+    Type *type;              // type of the global
+    MIRGlobalKind kind;      // val, var, or uninit
+    bool is_exported;        // visible to linker?
     
     union {
-        int64_t int_value;       // For integer constants
-        double float_value;      // For float constants  
-        const char *string_value; // For string literals
-        void *array_data;        // For array data
+        int64_t int_value;       // for integer constants
+        double float_value;      // for float constants  
+        const char *string_value; // for string literals
+        void *array_data;        // for array data
     } init;
 } MIRGlobal;
 ```

@@ -2,17 +2,13 @@
 
 This document describes how MIR is lowered to machine code, using the x86_64 backend as a reference implementation. The compiler is designed to support multiple targets through pluggable backends.
 
-# Code Generation
-
-This document describes how MIR is lowered to machine code, using the x86_64 backend as a reference implementation. The compiler is designed to support multiple targets through pluggable backends.
-
 ## Target Selection
 
 The code generator is selected based on the `MIRTarget` configuration:
 
 ```c
-MIRTarget target = mir_target_native();  // Detect host platform
-// Or explicitly:
+MIRTarget target = mir_target_native();  // detect host platform
+// or explicitly:
 MIRTarget target = mir_target_create(MIR_ISA_X86_64, MIR_ABI_SYSV64, 
                                      MIR_OS_LINUX, MIR_OF_ELF);
 ```
@@ -61,9 +57,9 @@ See [ABI](abi.md) for calling convention details.
 
 ```c
 int x86_64_allocate_registers(X86_64_CodegenContext *ctx, MIRFunction *func) {
-    // Map parameters to ABI registers
-    // Allocate temporaries
-    // Track value → register mapping
+    // map parameters to abi registers
+    // allocate temporaries
+    // track value → register mapping
 }
 ```
 
@@ -107,11 +103,11 @@ static X86_64_Reg float_param_regs[] = {
 Example:
 ```c
 void emit_add_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src) {
-    uint8_t rex = 0x48; // REX.W for 64-bit
-    if (dst >= X86_64_R8) rex |= 0x01; // REX.B
-    if (src >= X86_64_R8) rex |= 0x04; // REX.R
+    uint8_t rex = 0x48; // rex.w for 64-bit
+    if (dst >= X86_64_R8) rex |= 0x01; // rex.b
+    if (src >= X86_64_R8) rex |= 0x04; // rex.r
     emit_byte(ctx, rex);
-    emit_byte(ctx, 0x01); // ADD r/m64, r64
+    emit_byte(ctx, 0x01); // add r/m64, r64
     emit_byte(ctx, modrm(dst, src));
 }
 ```
@@ -129,10 +125,10 @@ void emit_add_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src
 Example:
 ```c
 void emit_addsd_reg_reg(X86_64_CodegenContext *ctx, X86_64_Reg dst, X86_64_Reg src) {
-    emit_byte(ctx, 0xF2);  // ADDSD prefix
-    // REX prefix if needed
+    emit_byte(ctx, 0xF2);  // addsd prefix
+    // rex prefix if needed
     emit_byte(ctx, 0x0F);
-    emit_byte(ctx, 0x58);  // ADDSD opcode
+    emit_byte(ctx, 0x58);  // addsd opcode
     emit_byte(ctx, modrm(dst, src));
 }
 ```
@@ -144,9 +140,9 @@ void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst) {
     switch (inst->op) {
     case MIR_OP_ADD:
         if (inst->type && type_is_float(inst->type)) {
-            emit_addsd_reg_reg(ctx, dst, src);  // SSE
+            emit_addsd_reg_reg(ctx, dst, src);  // sse
         } else {
-            emit_add_reg_reg(ctx, dst, src);    // Integer
+            emit_add_reg_reg(ctx, dst, src);    // integer
         }
         break;
     }
@@ -160,9 +156,9 @@ void emit_instruction(X86_64_CodegenContext *ctx, MIRInst *inst) {
 ```c
 case MIR_OP_LOAD:
     if (type_is_float(inst->type)) {
-        emit_movsd_mem_reg(ctx, dst, offset);  // MOVSD for floats
+        emit_movsd_mem_reg(ctx, dst, offset);  // movsd for floats
     } else {
-        emit_mov_mem_reg(ctx, dst, offset);    // MOV for integers
+        emit_mov_mem_reg(ctx, dst, offset);    // mov for integers
     }
 ```
 
@@ -171,9 +167,9 @@ case MIR_OP_LOAD:
 ```c
 case MIR_OP_STORE:
     if (type_is_float(inst->type)) {
-        emit_movsd_reg_mem(ctx, src, offset);  // MOVSD
+        emit_movsd_reg_mem(ctx, src, offset);  // movsd
     } else {
-        emit_mov_reg_mem(ctx, src, offset);    // MOV
+        emit_mov_reg_mem(ctx, src, offset);    // mov
     }
 ```
 
@@ -183,7 +179,7 @@ Local variables accessed via RBP offset:
 
 ```asm
 movsd xmm0, [rbp - 8]   # Load local float
-mov rax, [rbp - 16]     # Load local integer
+mov rax, [rbp - 16]     # load local integer
 ```
 
 ## Global References
@@ -191,17 +187,17 @@ mov rax, [rbp - 16]     # Load local integer
 Globals use RIP-relative addressing:
 
 ```c
-// Load global address
+// load global address
 emit_lea_rip_rel(ctx, reg, "@global_name");
 
-// Generate relocation
+// generate relocation
 add_relocation(ctx, offset, "global_name", R_X86_64_PC32, -4);
 ```
 
 Example assembly:
 ```asm
 lea rax, [rip + __float_const_0]  # RIP-relative
-movsd xmm0, [rax]                 # Load float constant
+movsd xmm0, [rax]                 # load float constant
 ```
 
 ## Type Conversions
@@ -210,14 +206,14 @@ movsd xmm0, [rax]                 # Load float constant
 
 ```asm
 movzx rax, al   # Zero-extend (ZEXT)
-movsx rax, al   # Sign-extend (SEXT)
+movsx rax, al   # sign-extend (sext)
 ```
 
 ### Float Conversions
 
 ```asm
-cvttsd2si rax, xmm0   # f64 → i64 (FPTOSI)
-cvtsi2sd xmm0, rax    # i64 → f64 (SITOFP)
+cvttsd2si rax, xmm0   # f64 → i64 (fptosi)
+cvtsi2sd xmm0, rax    # i64 → f64 (sitofp)
 ```
 
 ## Control Flow
@@ -275,10 +271,10 @@ The code generator tracks relocations for:
 
 ```c
 typedef struct X86_64_Relocation {
-    uint64_t offset;        // Offset in code
-    char *symbol_name;      // Symbol being referenced
+    uint64_t offset;        // offset in code
+    char *symbol_name;      // symbol being referenced
     int type;               // R_X86_64_PC32, R_X86_64_PLT32, etc.
-    int64_t addend;         // Addend value
+    int64_t addend;         // addend value
     struct X86_64_Relocation *next;
 } X86_64_Relocation;
 ```

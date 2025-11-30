@@ -14,18 +14,18 @@ All MIR instructions and values carry type information used for:
 
 ```c
 typedef enum TypeKind {
-    // Primitives
+    // primitives
     TYPE_U8, TYPE_U16, TYPE_U32, TYPE_U64,
     TYPE_I8, TYPE_I16, TYPE_I32, TYPE_I64,
     TYPE_F32, TYPE_F64,
-    TYPE_PTR,  // Untyped pointer
+    TYPE_PTR,  // untyped pointer
     
-    // Compound types
-    TYPE_POINTER,  // Typed pointer (*T)
-    TYPE_ARRAY,    // Fixed-size array ([N]T)
-    TYPE_FUNCTION, // Function type
-    TYPE_STRUCT,   // Record
-    TYPE_UNION     // Union
+    // compound types
+    TYPE_POINTER,  // typed pointer (*T)
+    TYPE_ARRAY,    // fixed-size array ([N]T)
+    TYPE_FUNCTION, // function type
+    TYPE_STRUCT,   // record
+    TYPE_UNION     // union
 } TypeKind;
 ```
 
@@ -131,7 +131,7 @@ Helper functions to check type properties:
 bool type_is_integer(Type *t);  // u8-u64, i8-i64
 bool type_is_float(Type *t);    // f32, f64
 bool type_is_numeric(Type *t);  // integer or float
-bool type_equals(Type *a, Type *b);  // Structural equality
+bool type_equals(Type *a, Type *b);  // structural equality
 ```
 
 ## Example Usage
@@ -139,7 +139,7 @@ bool type_equals(Type *a, Type *b);  // Structural equality
 ### Instruction with Type
 
 ```c
-// Create typed ADD instruction
+// create typed add instruction
 MIRInst *inst = mir_inst_create(MIR_OP_ADD, type_get_primitive(TYPE_I64));
 ```
 
@@ -148,11 +148,11 @@ MIRInst *inst = mir_inst_create(MIR_OP_ADD, type_get_primitive(TYPE_I64));
 Type determines which assembly instruction is used:
 
 ```c
-// Integer add
-inst->type = TYPE_I64;  // → ADD instruction
+// integer add
+inst->type = TYPE_I64;  // → add instruction
 
-// Float add  
-inst->type = TYPE_F64;  // → ADDSD instruction
+// float add  
+inst->type = TYPE_F64;  // → addsd instruction
 ```
 
 ### Register Class Selection
@@ -162,7 +162,7 @@ bool x86_64_reg_is_fp(X86_64_Reg reg) {
     return reg >= X86_64_XMM0 && reg <= X86_64_XMM15;
 }
 
-// Allocate based on type
+// allocate based on type
 if (type_is_float(value->type)) {
     reg = allocate_xmm_register();
 } else {

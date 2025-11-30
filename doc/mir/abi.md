@@ -163,13 +163,13 @@ The register allocator in `boot/src/compiler/mir/codegen/x86_64.c` follows the A
 ### Parameter Mapping
 
 ```c
-// Integer parameter registers
+// integer parameter registers
 static X86_64_Reg integer_param_regs[] = {
     X86_64_RDI, X86_64_RSI, X86_64_RDX,
     X86_64_RCX, X86_64_R8, X86_64_R9
 };
 
-// Float parameter registers  
+// float parameter registers  
 static X86_64_Reg float_param_regs[] = {
     X86_64_XMM0, X86_64_XMM1, X86_64_XMM2, X86_64_XMM3,
     X86_64_XMM4, X86_64_XMM5, X86_64_XMM6, X86_64_XMM7

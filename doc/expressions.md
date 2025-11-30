@@ -318,7 +318,11 @@ See the [Types](types.md#anonymous-rec-and-uni) documentation for details on ano
 
 The `$` prefix marks an expression for compile-time evaluation. This is used for compile-time intrinsics, target information, and other compile-time operations.
 
+The snippet below imports `std.types.bool`, which provides the `bool`, `true`, and `false` symbols used for compile-time flags.
+
 ```mach
+use std.types.bool;
+
 val size:     u64  = $size_of(i32);
 val is_linux: bool = $OS_LINUX;
 ```

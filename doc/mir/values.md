@@ -121,19 +121,19 @@ Operands are represented as tagged unions in the implementation:
 
 ```c
 typedef enum MIROperandKind {
-    MIR_OPERAND_VALUE,   // SSA value reference
-    MIR_OPERAND_IMM,     // Immediate constant
-    MIR_OPERAND_GLOBAL,  // Global symbol
-    MIR_OPERAND_BLOCK    // Block label
+    MIR_OPERAND_VALUE,   // ssa value reference
+    MIR_OPERAND_IMM,     // immediate constant
+    MIR_OPERAND_GLOBAL,  // global symbol
+    MIR_OPERAND_BLOCK    // block label
 } MIROperandKind;
 
 typedef struct MIROperand {
     MIROperandKind kind;
     union {
-        uint32_t value_id;    // For VALUE
-        int64_t imm_value;    // For IMM
-        char *global_name;    // For GLOBAL
-        uint32_t block_id;    // For BLOCK
+        uint32_t value_id;    // for value
+        int64_t imm_value;    // for imm
+        char *global_name;    // for global
+        uint32_t block_id;    // for block
     };
 } MIROperand;
 ```
@@ -141,8 +141,6 @@ typedef struct MIROperand {
 ### Helper Functions
 
 ```c
-// Create operands
-MIROperand mir_operand_value(uint32_t id);
 MIROperand mir_operand_imm(int64_t value);
 MIROperand mir_operand_global(const char *name);
 MIROperand mir_operand_block(uint32_t block_id);
