@@ -6,8 +6,10 @@
 
 static AstNode  *parser_alloc_node(Parser *parser, AstKind kind, Token *token);
 static AstList  *parser_alloc_list(Parser *parser);
-static AstNode  *parser_parse_directive(Parser *parser, bool allow_top_level);
-static AstNode  *parser_parse_comptime_if_top(Parser *parser);
+static void      parser_free_node(AstNode *node);
+static void      parser_report_alloc_failure(Parser *parser, const char *context);
+static char     *parser_strdup_checked(Parser *parser, const char *value, const char *context);
+static AstNode  *parser_parse_directive(Parser *parser);
 static AstNode  *parser_parse_top_level_block(Parser *parser);
 static TokenKind parser_peek_next_kind(Parser *parser);
 static bool      parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind);
@@ -42,6 +44,42 @@ static AstNode *parser_alloc_node(Parser *parser, AstKind kind, Token *token)
     return node;
 }
 
+static void parser_free_node(AstNode *node)
+{
+    if (!node)
+    {
+        return;
+    }
+
+    ast_node_dnit(node);
+    free(node);
+}
+
+static void parser_report_alloc_failure(Parser *parser, const char *context)
+{
+    if (!parser)
+    {
+        return;
+    }
+
+    Token *token = parser->current ? parser->current : parser->previous;
+    parser_error(parser, token, context ? context : "out of memory");
+}
+
+static char *parser_strdup_checked(Parser *parser, const char *value, const char *context)
+{
+    if (!value)
+    {
+        return NULL;
+    }
+
+    char *copy = strdup(value);
+    if (!copy)
+    {
+        parser_report_alloc_failure(parser, context);
+    }
+    return copy;
+}
 static AstList *parser_alloc_list(Parser *parser)
 {
     AstList *list = malloc(sizeof(AstList));
@@ -87,8 +125,7 @@ static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
 
     if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after '$if'"))
     {
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
@@ -96,15 +133,13 @@ static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
     if (!node->comptime_if_stmt.cond)
     {
         parser_error_at_current(parser, "expected condition expression");
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
     if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after condition"))
     {
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
@@ -112,8 +147,7 @@ static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
     if (!node->comptime_if_stmt.body)
     {
         parser_error_at_current(parser, "expected block after '$if' condition");
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
@@ -127,8 +161,7 @@ static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
         AstNode *or_node = parser_alloc_node(parser, AST_STMT_COMPTIME_OR, parser->previous);
         if (!or_node)
         {
-            ast_node_dnit(node);
-            free(node);
+            parser_free_node(node);
             return NULL;
         }
 
@@ -139,19 +172,15 @@ static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
             if (!or_node->comptime_if_stmt.cond)
             {
                 parser_error_at_current(parser, "expected condition expression");
-                ast_node_dnit(or_node);
-                free(or_node);
-                ast_node_dnit(node);
-                free(node);
+                parser_free_node(or_node);
+                parser_free_node(node);
                 return NULL;
             }
 
             if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after '$or' condition"))
             {
-                ast_node_dnit(or_node);
-                free(or_node);
-                ast_node_dnit(node);
-                free(node);
+                parser_free_node(or_node);
+                parser_free_node(node);
                 return NULL;
             }
         }
@@ -160,10 +189,8 @@ static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
         if (!or_node->comptime_if_stmt.body)
         {
             parser_error_at_current(parser, "expected block after '$or'");
-            ast_node_dnit(or_node);
-            free(or_node);
-            ast_node_dnit(node);
-            free(node);
+            parser_free_node(or_node);
+            parser_free_node(node);
             return NULL;
         }
 
@@ -174,9 +201,8 @@ static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
     return node;
 }
 
-static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
+static AstNode *parser_parse_directive(Parser *parser)
 {
-    (void)allow_top_level;
     if (!parser_consume(parser, TOKEN_DOLLAR, "expected '$'"))
     {
         return NULL;
@@ -195,21 +221,19 @@ static AstNode *parser_parse_directive(Parser *parser, bool allow_top_level)
         return NULL;
     }
 
-    AstNode *inner = NULL;
-
     if (parser_token_is_attr_category(parser->current->kind))
     {
         parser->current->kind = TOKEN_IDENTIFIER;
     }
-    inner = parser_parse_expr(parser);
+
+    AstNode *inner = parser_parse_expr(parser);
 
     parser_match(parser, TOKEN_SEMICOLON);
 
     if (!inner)
     {
         parser_error_at_current(parser, "expected expression or statement after '$'");
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
@@ -265,16 +289,14 @@ static AstNode *parser_parse_top_level_block(Parser *parser)
     block->block_stmt.stmts = parser_alloc_list(parser);
     if (!block->block_stmt.stmts)
     {
-        ast_node_dnit(block);
-        free(block);
+        parser_free_node(block);
         return NULL;
     }
 
     block->block_stmt.deferred_stmts = parser_alloc_list(parser);
     if (!block->block_stmt.deferred_stmts)
     {
-        ast_node_dnit(block);
-        free(block);
+        parser_free_node(block);
         return NULL;
     }
 
@@ -284,8 +306,7 @@ static AstNode *parser_parse_top_level_block(Parser *parser)
         if (!stmt)
         {
             parser_error_at_current(parser, "expected top-level statement in compile-time block");
-            ast_node_dnit(block);
-            free(block);
+            parser_free_node(block);
             return NULL;
         }
         ast_list_append(block->block_stmt.stmts, stmt);
@@ -293,110 +314,11 @@ static AstNode *parser_parse_top_level_block(Parser *parser)
 
     if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' to close compile-time block"))
     {
-        ast_node_dnit(block);
-        free(block);
+        parser_free_node(block);
         return NULL;
     }
 
     return block;
-}
-
-static AstNode *parser_parse_comptime_if_top(Parser *parser) __attribute__((unused));
-static AstNode *parser_parse_comptime_if_top(Parser *parser)
-{
-    if (!parser_consume(parser, TOKEN_KW_IF, "expected 'if' keyword"))
-    {
-        return NULL;
-    }
-
-    AstNode *node = parser_alloc_node(parser, AST_STMT_IF, parser->previous);
-    if (!node)
-    {
-        return NULL;
-    }
-
-    if (!parser_consume(parser, TOKEN_L_PAREN, "expected '(' after '$if'"))
-    {
-        ast_node_dnit(node);
-        free(node);
-        return NULL;
-    }
-
-    node->cond_stmt.cond = parser_parse_expr(parser);
-    if (!node->cond_stmt.cond)
-    {
-        parser_error_at_current(parser, "expected condition expression");
-        ast_node_dnit(node);
-        free(node);
-        return NULL;
-    }
-
-    if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after $if condition"))
-    {
-        ast_node_dnit(node);
-        free(node);
-        return NULL;
-    }
-
-    node->cond_stmt.body = parser_parse_top_level_block(parser);
-    if (!node->cond_stmt.body)
-    {
-        parser_error_at_current(parser, "expected block after $if condition");
-        ast_node_dnit(node);
-        free(node);
-        return NULL;
-    }
-
-    AstNode **tail = &node->cond_stmt.stmt_or;
-    while (parser_match(parser, TOKEN_KW_OR))
-    {
-        AstNode *or_node = parser_alloc_node(parser, AST_STMT_OR, parser->previous);
-        if (!or_node)
-        {
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-
-        if (parser_match(parser, TOKEN_L_PAREN))
-        {
-            or_node->cond_stmt.cond = parser_parse_expr(parser);
-            if (!or_node->cond_stmt.cond)
-            {
-                parser_error_at_current(parser, "expected condition expression after 'or'");
-                ast_node_dnit(or_node);
-                free(or_node);
-                ast_node_dnit(node);
-                free(node);
-                return NULL;
-            }
-
-            if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after 'or' condition"))
-            {
-                ast_node_dnit(or_node);
-                free(or_node);
-                ast_node_dnit(node);
-                free(node);
-                return NULL;
-            }
-        }
-
-        or_node->cond_stmt.body = parser_parse_top_level_block(parser);
-        if (!or_node->cond_stmt.body)
-        {
-            parser_error_at_current(parser, "expected block after 'or'");
-            ast_node_dnit(or_node);
-            free(or_node);
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-
-        *tail = or_node;
-        tail  = &or_node->cond_stmt.stmt_or;
-    }
-
-    return node;
 }
 
 static bool     parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind);
@@ -496,8 +418,15 @@ void parser_error_list_add(ParserErrorList *list, Token *token, const char *mess
 {
     if (list->count >= list->capacity)
     {
-        list->capacity = list->capacity ? list->capacity * 2 : 8;
-        list->errors   = realloc(list->errors, sizeof(ParserError) * list->capacity);
+        int          new_capacity = list->capacity ? list->capacity * 2 : 8;
+        ParserError *new_errors   = realloc(list->errors, sizeof(ParserError) * new_capacity);
+        if (!new_errors)
+        {
+            fprintf(stderr, "error: memory allocation failed for parser error list\n");
+            exit(EXIT_FAILURE);
+        }
+        list->errors   = new_errors;
+        list->capacity = new_capacity;
     }
 
     Token *error_token = malloc(sizeof(Token));
@@ -1155,7 +1084,7 @@ AstNode *parser_parse_stmt_top(Parser *parser)
         {
             parser_error_at_current(parser, "'pub' cannot precede compile-time directives");
         }
-        result = parser_parse_directive(parser, true);
+        result = parser_parse_directive(parser);
         break;
     default:
         if (is_public)
@@ -1196,7 +1125,7 @@ AstNode *parser_parse_stmt(Parser *parser)
     case TOKEN_KW_MIR:
         return parser_parse_stmt_mir(parser);
     case TOKEN_DOLLAR:
-        return parser_parse_directive(parser, false);
+        return parser_parse_directive(parser);
     default:
         return parser_parse_stmt_expr(parser);
     }
@@ -1220,8 +1149,7 @@ AstNode *parser_parse_stmt_use(Parser *parser)
     if (!first)
     {
         parser_error_at_current(parser, "expected identifier after 'use'");
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
@@ -1236,8 +1164,7 @@ AstNode *parser_parse_stmt_use(Parser *parser)
         {
             parser_error_at_current(parser, "expected module name after alias colon");
             free(alias);
-            ast_node_dnit(node);
-            free(node);
+            parser_free_node(node);
             return NULL;
         }
         module_path = head;
@@ -1256,13 +1183,21 @@ AstNode *parser_parse_stmt_use(Parser *parser)
             parser_error_at_current(parser, "expected identifier after '.'");
             free(alias);
             free(module_path);
-            ast_node_dnit(node);
-            free(node);
+            parser_free_node(node);
             return NULL;
         }
 
         size_t len      = strlen(module_path) + strlen(next) + 2;
         char  *new_path = malloc(len);
+        if (!new_path)
+        {
+            parser_report_alloc_failure(parser, "out of memory expanding module path");
+            free(alias);
+            free(module_path);
+            free(next);
+            parser_free_node(node);
+            return NULL;
+        }
         snprintf(new_path, len, "%s.%s", module_path, next);
         free(module_path);
         free(next);
@@ -1274,8 +1209,7 @@ AstNode *parser_parse_stmt_use(Parser *parser)
 
     if (!parser_consume(parser, TOKEN_SEMICOLON, "expected ';' after use statement"))
     {
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
@@ -1305,11 +1239,27 @@ AstNode *parser_parse_stmt_ext(Parser *parser, bool is_public)
     // check for optional calling convention/symbol specification
     if (parser_match(parser, TOKEN_LIT_STRING))
     {
-        char  *raw       = lexer_raw_value(parser->lexer, parser->previous);
-        size_t len       = strlen(raw) - 2; // remove quotes
-        char  *conv_spec = malloc(len + 1);
-        memcpy(conv_spec, raw + 1, len);
-        conv_spec[len] = '\0';
+        char *raw = lexer_raw_value(parser->lexer, parser->previous);
+        if (!raw)
+        {
+            parser_report_alloc_failure(parser, "out of memory reading extern metadata");
+            parser_free_node(node);
+            return NULL;
+        }
+
+        size_t raw_len   = strlen(raw);
+        size_t copy_len  = raw_len >= 2 ? raw_len - 2 : 0; // remove quotes safely
+        char  *conv_spec = malloc(copy_len + 1);
+        if (!conv_spec)
+        {
+            free(raw);
+            parser_report_alloc_failure(parser, "out of memory parsing extern metadata");
+            parser_free_node(node);
+            return NULL;
+        }
+
+        memcpy(conv_spec, raw + 1, copy_len);
+        conv_spec[copy_len] = '\0';
         free(raw);
 
         // parse "convention:symbol" or just "convention"
@@ -1317,12 +1267,30 @@ AstNode *parser_parse_stmt_ext(Parser *parser, bool is_public)
         if (colon)
         {
             *colon                    = '\0';
-            node->ext_stmt.convention = strdup(conv_spec);
-            node->ext_stmt.symbol     = strdup(colon + 1);
+            node->ext_stmt.convention = parser_strdup_checked(parser, conv_spec, "out of memory duplicating convention");
+            if (!node->ext_stmt.convention)
+            {
+                free(conv_spec);
+                parser_free_node(node);
+                return NULL;
+            }
+            node->ext_stmt.symbol = parser_strdup_checked(parser, colon + 1, "out of memory duplicating external symbol");
+            if (!node->ext_stmt.symbol)
+            {
+                free(conv_spec);
+                parser_free_node(node);
+                return NULL;
+            }
         }
         else
         {
-            node->ext_stmt.convention = strdup(conv_spec);
+            node->ext_stmt.convention = parser_strdup_checked(parser, conv_spec, "out of memory duplicating convention");
+            if (!node->ext_stmt.convention)
+            {
+                free(conv_spec);
+                parser_free_node(node);
+                return NULL;
+            }
         }
 
         free(conv_spec);
@@ -1332,27 +1300,35 @@ AstNode *parser_parse_stmt_ext(Parser *parser, bool is_public)
     if (!node->ext_stmt.name)
     {
         parser_error_at_current(parser, "expected identifier after 'ext'");
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
     // if no symbol specified, use the function name
     if (!node->ext_stmt.symbol)
     {
-        node->ext_stmt.symbol = strdup(node->ext_stmt.name);
+        node->ext_stmt.symbol = parser_strdup_checked(parser, node->ext_stmt.name, "out of memory duplicating external symbol");
+        if (!node->ext_stmt.symbol)
+        {
+            parser_free_node(node);
+            return NULL;
+        }
     }
 
     // if no convention specified, default to "C"
     if (!node->ext_stmt.convention)
     {
-        node->ext_stmt.convention = strdup("C");
+        node->ext_stmt.convention = parser_strdup_checked(parser, "C", "out of memory duplicating convention");
+        if (!node->ext_stmt.convention)
+        {
+            parser_free_node(node);
+            return NULL;
+        }
     }
 
     if (!parser_consume(parser, TOKEN_COLON, "expected ':' after external name"))
     {
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
@@ -1360,15 +1336,13 @@ AstNode *parser_parse_stmt_ext(Parser *parser, bool is_public)
     if (!node->ext_stmt.type)
     {
         parser_error_at_current(parser, "expected type after ':' in external statement");
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
     if (!parser_consume(parser, TOKEN_SEMICOLON, "expected ';' after external statement"))
     {
-        ast_node_dnit(node);
-        free(node);
+        parser_free_node(node);
         return NULL;
     }
 
@@ -1877,7 +1851,6 @@ AstNode *parser_parse_stmt_uni(Parser *parser, bool is_public)
     return node;
 }
 
-
 AstNode *parser_parse_stmt_if(Parser *parser)
 {
     if (!parser_consume(parser, TOKEN_KW_IF, "expected 'if' keyword"))
@@ -2124,7 +2097,7 @@ AstNode *parser_parse_stmt_mir(Parser *parser)
     }
 
     // capture starting position after '{' using character position in source
-    int start_pos = parser->current->pos;
+    int start_pos   = parser->current->pos;
     int brace_depth = 1;
 
     // scan until matching closing brace
@@ -2147,7 +2120,7 @@ AstNode *parser_parse_stmt_mir(Parser *parser)
 
     // calculate length of content between braces
     int end_pos = parser->current->pos;
-    int len = end_pos - start_pos;
+    int len     = end_pos - start_pos;
 
     // extract raw content
     node->mir_stmt.content = (char *)malloc(len + 1);
