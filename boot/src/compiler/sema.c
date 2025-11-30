@@ -249,10 +249,11 @@ void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_r
                 ConfigDep *dep_copy = malloc(sizeof(ConfigDep));
                 if (dep_copy && deps[i])
                 {
-                    dep_copy->name = deps[i]->name ? strdup(deps[i]->name) : NULL;
-                    dep_copy->type = deps[i]->type;
-                    dep_copy->path = deps[i]->path ? strdup(deps[i]->path) : NULL;
-                    dep_copy->version = NULL; // we don't need version info for module resolution
+                    dep_copy->name    = deps[i]->name ? strdup(deps[i]->name) : NULL;
+                    dep_copy->type    = deps[i]->type;
+                    dep_copy->path    = deps[i]->path ? strdup(deps[i]->path) : NULL;
+                    dep_copy->version = NULL;           // we don't need version info for module resolution
+                    dep_copy->config  = deps[i]->config; // share the config pointer (not owned by sema)
                 }
                 else
                 {
@@ -1351,8 +1352,8 @@ static char *sema_resolve_module_path(Sema *sema, const char *module_path)
         return NULL;
     }
 
-    // module_path is like "project.subdir.module"
-    // we need to check if the first segment matches project_id
+    // module_path is like "project_id.subdir.module"
+    // check if the first segment matches this project's project_id
 
     if (!sema->project_id || !sema->src_root)
     {
@@ -1361,126 +1362,130 @@ static char *sema_resolve_module_path(Sema *sema, const char *module_path)
 
     size_t id_len = strlen(sema->project_id);
 
-    // check if module_path starts with project_id
-    if (strncmp(module_path, sema->project_id, id_len) != 0 || (module_path[id_len] != '.' && module_path[id_len] != '\0'))
+    // check if module_path starts with this project's project_id
+    if (strncmp(module_path, sema->project_id, id_len) == 0 && (module_path[id_len] == '.' || module_path[id_len] == '\0'))
     {
-        // check dependencies
-        if (sema->deps && sema->dep_count > 0 && sema->dep_root)
+        // this module is from the current project
+        // skip project_id and the following dot
+        const char *rest = module_path + id_len;
+        if (*rest == '.')
         {
-            // try each dependency
-            for (int i = 0; i < sema->dep_count; i++)
+            rest++;
+        }
+
+        // convert remaining dots to slashes and add .mach extension
+        size_t rest_len = strlen(rest);
+        size_t src_len  = strlen(sema->src_root);
+        size_t path_len = src_len + 1 + rest_len + 6; // src_root + '/' + path + ".mach\0"
+
+        char *file_path = malloc(path_len);
+        if (!file_path)
+        {
+            return NULL;
+        }
+
+        // build path: src_root/path.mach
+        strcpy(file_path, sema->src_root);
+        strcat(file_path, "/");
+
+        // copy rest, replacing dots with slashes
+        char       *dst = file_path + src_len + 1;
+        const char *src = rest;
+        while (*src)
+        {
+            if (*src == '.')
             {
-                ConfigDep *dep = sema->deps[i];
-                if (!dep || !dep->name)
+                *dst++ = '/';
+            }
+            else
+            {
+                *dst++ = *src;
+            }
+            src++;
+        }
+        *dst = '\0';
+
+        strcat(file_path, ".mach");
+
+        return file_path;
+    }
+
+    // check dependencies - match against their project IDs (not dependency names)
+    if (sema->deps && sema->dep_count > 0 && sema->dep_root)
+    {
+        // try each dependency
+        for (int i = 0; i < sema->dep_count; i++)
+        {
+            ConfigDep *dep = sema->deps[i];
+            if (!dep || !dep->name || !dep->config || !dep->config->id)
+            {
+                continue;
+            }
+
+            // get the dependency's project ID from its config
+            const char *dep_project_id = dep->config->id;
+            size_t      dep_id_len     = strlen(dep_project_id);
+
+            // check if module_path starts with dependency's project ID
+            if (strncmp(module_path, dep_project_id, dep_id_len) == 0 && (module_path[dep_id_len] == '.' || module_path[dep_id_len] == '\0'))
+            {
+                // found matching dependency, resolve path
+                const char *rest = module_path + dep_id_len;
+                if (*rest == '.')
                 {
-                    continue;
+                    rest++;
                 }
 
+                // get the dependency's source directory (default to "src" if not specified)
+                const char *dep_src_dir = dep->config->dir_src ? dep->config->dir_src : "src";
+
+                // construct path: dep_root/dep_name/dep_src_dir/rest.mach
+                size_t rest_len     = strlen(rest);
+                size_t dep_root_len = strlen(sema->dep_root);
                 size_t dep_name_len = strlen(dep->name);
+                size_t dep_src_len  = strlen(dep_src_dir);
+                size_t path_len     = dep_root_len + 1 + dep_name_len + 1 + dep_src_len + 1 + rest_len + 6; // dep_root + '/' + dep_name + '/' + dep_src_dir + '/' + rest + ".mach\0"
 
-                // check if module_path starts with dependency name
-                if (strncmp(module_path, dep->name, dep_name_len) == 0 && (module_path[dep_name_len] == '.' || module_path[dep_name_len] == '\0'))
+                char *file_path = malloc(path_len);
+                if (!file_path)
                 {
-                    // found matching dependency, resolve path
-                    const char *rest = module_path + dep_name_len;
-                    if (*rest == '.')
-                    {
-                        rest++;
-                    }
-
-                    // construct path: dep_root/dep_name/src/rest.mach
-                    size_t rest_len = strlen(rest);
-                    size_t dep_root_len = strlen(sema->dep_root);
-                    size_t dep_name_path_len = dep_name_len;
-                    size_t path_len = dep_root_len + 1 + dep_name_path_len + 5 + rest_len + 6; // dep_root + '/' + dep_name + "/src/" + rest + ".mach\0"
-
-                    char *file_path = malloc(path_len);
-                    if (!file_path)
-                    {
-                        return NULL;
-                    }
-
-                    // build path: dep_root/dep_name/src/rest.mach
-                    strcpy(file_path, sema->dep_root);
-                    strcat(file_path, "/");
-                    strcat(file_path, dep->name);
-                    strcat(file_path, "/src/");
-
-                    // copy rest, replacing dots with slashes
-                    char *dst = file_path + strlen(file_path);
-                    const char *src = rest;
-                    while (*src)
-                    {
-                        if (*src == '.')
-                        {
-                            *dst++ = '/';
-                        }
-                        else
-                        {
-                            *dst++ = *src;
-                        }
-                        src++;
-                    }
-                    *dst = '\0';
-
-                    strcat(file_path, ".mach");
-
-                    return file_path;
+                    return NULL;
                 }
+
+                // build path: dep_root/dep_name/dep_src_dir/rest.mach
+                strcpy(file_path, sema->dep_root);
+                strcat(file_path, "/");
+                strcat(file_path, dep->name);
+                strcat(file_path, "/");
+                strcat(file_path, dep_src_dir);
+                strcat(file_path, "/");
+
+                // copy rest, replacing dots with slashes
+                char       *dst = file_path + strlen(file_path);
+                const char *src = rest;
+                while (*src)
+                {
+                    if (*src == '.')
+                    {
+                        *dst++ = '/';
+                    }
+                    else
+                    {
+                        *dst++ = *src;
+                    }
+                    src++;
+                }
+                *dst = '\0';
+
+                strcat(file_path, ".mach");
+
+                return file_path;
             }
         }
-
-        // no matching dependency found
-        return NULL;
     }
 
-    // skip project_id and the following dot
-    const char *rest = module_path + id_len;
-    if (*rest == '.')
-    {
-        rest++;
-    }
-    else if (*rest != '\0')
-    {
-        // project_id is a prefix but not a full segment
-        return NULL;
-    }
-
-    // convert remaining dots to slashes and add .mach extension
-    size_t rest_len = strlen(rest);
-    size_t src_len  = strlen(sema->src_root);
-    size_t path_len = src_len + 1 + rest_len + 6; // src_root + '/' + path + ".mach\0"
-
-    char *file_path = malloc(path_len);
-    if (!file_path)
-    {
-        return NULL;
-    }
-
-    // build path: src_root/path.mach
-    strcpy(file_path, sema->src_root);
-    strcat(file_path, "/");
-
-    // copy rest, replacing dots with slashes
-    char       *dst = file_path + src_len + 1;
-    const char *src = rest;
-    while (*src)
-    {
-        if (*src == '.')
-        {
-            *dst++ = '/';
-        }
-        else
-        {
-            *dst++ = *src;
-        }
-        src++;
-    }
-    *dst = '\0';
-
-    strcat(file_path, ".mach");
-
-    return file_path;
+    // no matching project or dependency found
+    return NULL;
 }
 
 // load and analyze a module
@@ -1616,6 +1621,13 @@ static int sema_analyze_use(Sema *sema, AstNode *node)
 
     const char *module_path = node->use_stmt.module_path;
     const char *alias       = node->use_stmt.alias;
+    
+    // check for NULL module_path
+    if (!module_path)
+    {
+        sema_error(sema, node->token, "use statement has null module path");
+        return -1;
+    }
 
     // if no project_id is set, we can't resolve modules
     if (!sema->project_id || !sema->src_root)
@@ -1628,7 +1640,9 @@ static int sema_analyze_use(Sema *sema, AstNode *node)
     AstNode *module_ast = NULL;
     if (sema_load_module(sema, module_path, &module_ast) < 0)
     {
-        sema_error(sema, node->token, "failed to load module");
+        char errmsg[512];
+        snprintf(errmsg, sizeof(errmsg), "failed to load module '%s'", module_path);
+        sema_error(sema, node->token, errmsg);
         return -1;
     }
 

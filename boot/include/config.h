@@ -67,12 +67,14 @@ typedef struct ConfigTarget
 } ConfigTarget;
 
 // explicit dependency specification (parsed from [deps] tables)
+typedef struct Config Config; // forward declaration
 typedef struct ConfigDep
 {
-    char             *name;    // dependency name
+    char             *name;    // dependency name (key in [deps] table)
     ConfigDepType    *type;    // dependency type: remote|local
     char             *path;    // remote URL or local filesystem path (used by dep tooling)
     ConfigDepVersion *version; // version specifier (for remote deps): branch/semver/commit
+    Config           *config;  // loaded dependency config (contains project.id and dir_src)
 } ConfigDep;
 
 // project configuration

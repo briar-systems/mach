@@ -10,7 +10,6 @@ static void      parser_free_node(AstNode *node);
 static void      parser_report_alloc_failure(Parser *parser, const char *context);
 static char     *parser_strdup_checked(Parser *parser, const char *value, const char *context);
 static AstNode  *parser_parse_directive(Parser *parser);
-static AstNode  *parser_parse_top_level_block(Parser *parser);
 static TokenKind parser_peek_next_kind(Parser *parser);
 static bool      parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind);
 static AstNode  *parser_expr_to_type(Parser *parser, AstNode *expr, AstList *generic_args);
@@ -271,54 +270,6 @@ static TokenKind parser_peek_next_kind(Parser *parser)
         parser->lexer->pos = saved_pos;
         return kind;
     }
-}
-
-static AstNode *parser_parse_top_level_block(Parser *parser)
-{
-    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{'"))
-    {
-        return NULL;
-    }
-
-    AstNode *block = parser_alloc_node(parser, AST_STMT_BLOCK, parser->previous);
-    if (!block)
-    {
-        return NULL;
-    }
-
-    block->block_stmt.stmts = parser_alloc_list(parser);
-    if (!block->block_stmt.stmts)
-    {
-        parser_free_node(block);
-        return NULL;
-    }
-
-    block->block_stmt.deferred_stmts = parser_alloc_list(parser);
-    if (!block->block_stmt.deferred_stmts)
-    {
-        parser_free_node(block);
-        return NULL;
-    }
-
-    while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
-    {
-        AstNode *stmt = parser_parse_stmt_top(parser);
-        if (!stmt)
-        {
-            parser_error_at_current(parser, "expected top-level statement in compile-time block");
-            parser_free_node(block);
-            return NULL;
-        }
-        ast_list_append(block->block_stmt.stmts, stmt);
-    }
-
-    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' to close compile-time block"))
-    {
-        parser_free_node(block);
-        return NULL;
-    }
-
-    return block;
 }
 
 static bool     parser_should_parse_type_args(Parser *parser, TokenKind *follow_kind);

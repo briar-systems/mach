@@ -308,12 +308,7 @@ int cmd_build_handle(int argc, char **argv)
     free(src_root);
     free(dep_root);
     
-    // now we can free the config
-    if (config)
-    {
-        config_dnit(config);
-        free(config);
-    }
+    // NOTE: config must stay alive until sema is destroyed, as sema holds pointers to dep configs
 
     // set file context for error reporting
     sema_set_file_context(sema, input_file, source);
@@ -322,6 +317,14 @@ int cmd_build_handle(int argc, char **argv)
     {
         sema_print_errors(sema);
         sema_destroy(sema);
+        
+        // clean up config after sema is destroyed
+        if (config)
+        {
+            config_dnit(config);
+            free(config);
+        }
+        
         parser_dnit(&parser);
         lexer_dnit(&lexer);
         free(source);
@@ -334,6 +337,14 @@ int cmd_build_handle(int argc, char **argv)
     {
         fprintf(stderr, "error: lowering to MIR failed\n");
         sema_destroy(sema);
+        
+        // clean up config after sema is destroyed
+        if (config)
+        {
+            config_dnit(config);
+            free(config);
+        }
+        
         parser_dnit(&parser);
         lexer_dnit(&lexer);
         free(source);
@@ -364,6 +375,14 @@ int cmd_build_handle(int argc, char **argv)
         fprintf(stderr, "error: failed to emit object file\n");
         mir_module_destroy(mir);
         sema_destroy(sema);
+        
+        // clean up config after sema is destroyed
+        if (config)
+        {
+            config_dnit(config);
+            free(config);
+        }
+        
         parser_dnit(&parser);
         lexer_dnit(&lexer);
         free(source);
@@ -380,6 +399,14 @@ int cmd_build_handle(int argc, char **argv)
         fprintf(stderr, "error: linking failed\n");
         mir_module_destroy(mir);
         sema_destroy(sema);
+        
+        // clean up config after sema is destroyed
+        if (config)
+        {
+            config_dnit(config);
+            free(config);
+        }
+        
         parser_dnit(&parser);
         lexer_dnit(&lexer);
         free(source);
@@ -391,6 +418,14 @@ int cmd_build_handle(int argc, char **argv)
     // cleanup
     mir_module_destroy(mir);
     sema_destroy(sema);
+    
+    // clean up config after sema is destroyed
+    if (config)
+    {
+        config_dnit(config);
+        free(config);
+    }
+    
     parser_dnit(&parser);
     lexer_dnit(&lexer);
     free(source);

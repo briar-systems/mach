@@ -145,6 +145,7 @@ void dep_spec_init(ConfigDep *dep)
     dep->type    = NULL;
     dep->path    = NULL;
     dep->version = NULL;
+    dep->config  = NULL;
 }
 
 void dep_spec_dnit(ConfigDep *dep)
@@ -159,6 +160,11 @@ void dep_spec_dnit(ConfigDep *dep)
     {
         free((void *)dep->version->value);
         free(dep->version);
+    }
+    if (dep->config)
+    {
+        config_dnit(dep->config);
+        free(dep->config);
     }
 }
 
@@ -208,7 +214,34 @@ void config_dnit(Config *config)
 }
 
 // configuration file management
+// internal helper for recursive loading
+static Config *config_load_internal(const char *config_path, const char *project_root, bool load_deps);
+
 Config *config_load(const char *config_path)
+{
+    // get project root from config path
+    char *abs_config_path = absolutize_path(config_path);
+    if (!abs_config_path)
+    {
+        return NULL;
+    }
+    
+    char *project_root = strdup(abs_config_path);
+    char *last_sep = strrchr(project_root, '/');
+    if (last_sep)
+    {
+        *last_sep = '\0';
+    }
+    
+    Config *config = config_load_internal(abs_config_path, project_root, true);
+    
+    free(abs_config_path);
+    free(project_root);
+    
+    return config;
+}
+
+static Config *config_load_internal(const char *config_path, const char *project_root, bool load_deps)
 {
     char *content = read_file(config_path);
     if (!content)
@@ -386,6 +419,31 @@ Config *config_load(const char *config_path)
                     dep_version->value            = strdup(version->as.string);
                     config->deps[i]->version      = dep_version;
                 }
+            }
+        }
+    }
+
+    // load dependency configs if requested
+    if (load_deps && config->dep_count > 0 && config->dir_dep && project_root)
+    {
+        for (int i = 0; i < config->dep_count; i++)
+        {
+            ConfigDep *dep = config->deps[i];
+            if (dep && dep->name)
+            {
+                // construct path to dependency: project_root/dir_dep/dep_name/mach.toml
+                char dep_config_path[1024];
+                snprintf(dep_config_path, sizeof(dep_config_path), "%s/%s/%s/mach.toml", 
+                         project_root, config->dir_dep, dep->name);
+                
+                // construct dependency project root for recursive loading
+                char dep_project_root[1024];
+                snprintf(dep_project_root, sizeof(dep_project_root), "%s/%s/%s", 
+                         project_root, config->dir_dep, dep->name);
+                
+                // load dependency config (without loading its dependencies to avoid deep recursion)
+                dep->config = config_load_internal(dep_config_path, dep_project_root, false);
+                // if loading fails, continue (dependency might not be fetched yet)
             }
         }
     }
