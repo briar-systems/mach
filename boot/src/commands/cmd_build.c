@@ -1,8 +1,8 @@
 #include "commands/cmd_build.h"
 #include "compiler/lexer.h"
-#include "compiler/mir/emit.h"
-#include "compiler/mir/lower.h"
-#include "compiler/mir/target.h"
+#include "compiler/masm/emit.h"
+#include "compiler/masm/lower.h"
+#include "compiler/masm/target.h"
 #include "compiler/parser.h"
 #include "compiler/sema.h"
 #include "config.h"
@@ -331,11 +331,11 @@ int cmd_build_handle(int argc, char **argv)
         return 1;
     }
 
-    // lower to MIR - first the main module
-    MIRModule *mir = mir_lower_module(ast, sema_get_root_table(sema));
-    if (!mir)
+    // lower to MASM - first the main module
+    Masm *masm = masm_lower_module(ast, sema_get_root_table(sema));
+    if (!masm)
     {
-        fprintf(stderr, "error: lowering to MIR failed\n");
+        fprintf(stderr, "error: lowering to MASM failed\n");
         sema_destroy(sema);
         
         // clean up config after sema is destroyed
@@ -356,12 +356,12 @@ int cmd_build_handle(int argc, char **argv)
     int      loaded_count = sema_get_loaded_modules(sema, loaded_asts, 64);
     for (int i = 0; i < loaded_count; i++)
     {
-        MIRModule *imported_mir = mir_lower_module(loaded_asts[i], sema_get_root_table(sema));
-        if (imported_mir)
+        Masm *imported_masm = masm_lower_module(loaded_asts[i], sema_get_root_table(sema));
+        if (imported_masm)
         {
-            // merge imported module into main module
-            mir_module_merge(mir, imported_mir);
-            mir_module_destroy(imported_mir);
+            // TODO: merge imported module into main module
+            // masm_module_merge(masm, imported_masm);
+            masm_destroy(imported_masm);
         }
     }
 
@@ -369,11 +369,10 @@ int cmd_build_handle(int argc, char **argv)
     char obj_file[512];
     snprintf(obj_file, sizeof(obj_file), "%s.o", output_file);
 
-    MIRTarget target = mir_target_native();
-    if (mir_emit_object(mir, &target, obj_file) < 0)
+    if (masm_emit_object(masm, obj_file) < 0)
     {
         fprintf(stderr, "error: failed to emit object file\n");
-        mir_module_destroy(mir);
+        masm_destroy(masm);
         sema_destroy(sema);
         
         // clean up config after sema is destroyed
@@ -397,7 +396,7 @@ int cmd_build_handle(int argc, char **argv)
     if (link_result != 0)
     {
         fprintf(stderr, "error: linking failed\n");
-        mir_module_destroy(mir);
+        masm_destroy(masm);
         sema_destroy(sema);
         
         // clean up config after sema is destroyed
@@ -416,7 +415,7 @@ int cmd_build_handle(int argc, char **argv)
     // silent on success - no output
 
     // cleanup
-    mir_module_destroy(mir);
+    masm_destroy(masm);
     sema_destroy(sema);
     
     // clean up config after sema is destroyed
