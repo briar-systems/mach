@@ -3048,6 +3048,38 @@ AstNode *parser_parse_type(Parser *parser)
         parser_advance(parser);
         return parser_parse_type_ptr(parser);
 
+    case TOKEN_AMPERSAND_AMPERSAND:
+    {
+        parser_advance(parser);
+        AstNode *outer = parser_alloc_node(parser, AST_TYPE_PTR, parser->previous);
+        if (!outer)
+        {
+            return NULL;
+        }
+        outer->type_ptr.is_read_only = true;
+
+        AstNode *inner = parser_alloc_node(parser, AST_TYPE_PTR, parser->previous);
+        if (!inner)
+        {
+            ast_node_dnit(outer);
+            free(outer);
+            return NULL;
+        }
+        inner->type_ptr.is_read_only = true;
+
+        outer->type_ptr.base = inner;
+        inner->type_ptr.base = parser_parse_type(parser);
+
+        if (!inner->type_ptr.base)
+        {
+            ast_node_dnit(outer);
+            free(outer);
+            return NULL;
+        }
+
+        return outer;
+    }
+
     case TOKEN_L_BRACKET:
         parser_advance(parser);
         return parser_parse_type_array(parser);

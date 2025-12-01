@@ -387,9 +387,6 @@ int cmd_build_handle(int argc, char **argv)
         free(source);
         return 1;
     }
-    printf("Build successful: %s\n", output_file);
-
-    // silent on success - no output
 
     // cleanup
     masm_destroy(masm);
