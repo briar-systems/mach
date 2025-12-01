@@ -4,6 +4,5 @@
 
 int masm_emit_object(Masm *masm, const char *filename)
 {
-    // TODO: support other formats based on target
     return masm_elf_write(masm, filename);
 }

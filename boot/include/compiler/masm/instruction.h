@@ -16,12 +16,15 @@ typedef enum MasmOpcode
     MASM_OP_ADD,
     MASM_OP_SUB,
     MASM_OP_MUL,
+    MASM_OP_IMUL,
     MASM_OP_DIV,
+    MASM_OP_IDIV,
     MASM_OP_AND,
     MASM_OP_OR,
     MASM_OP_XOR,
     MASM_OP_SHL,
     MASM_OP_SHR,
+    MASM_OP_CQO,
     
     // control flow
     MASM_OP_JMP,

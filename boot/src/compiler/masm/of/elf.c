@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ELF Definitions
+// elf64 type definitions
 typedef uint64_t Elf64_Addr;
 typedef uint64_t Elf64_Off;
 typedef uint16_t Elf64_Half;
@@ -66,34 +66,15 @@ int masm_elf_write(Masm *masm, const char *filename)
         return -1;
     }
 
-    // Pass 1: Calculate offsets and record label positions
+    // pass 1: calculate offsets and record label positions
     size_t current_offset = 0;
-    // We need to store instruction offsets to calculate relative jumps later
-    // For now, assume we can re-calculate or store them.
-    // Let's store label offsets in the symbol table.
-    
-    // We need to iterate instructions and update symbol offsets if we see a label definition.
-    // But wait, MASM_OP_LABEL *is* the definition.
-    
-    // We also need to know the size of each instruction.
-    // masm_x86_encode returns size. We can use a dummy buffer.
     uint8_t dummy_buffer[16];
-    
-    // To avoid re-encoding everything twice, we could store instruction sizes or offsets.
-    // For simplicity, we'll re-encode.
-    
-    // Map label names to offsets.
-    // Since we don't have a hash map handy in C easily without pulling in deps,
-    // and we have a small number of labels (main, _start), we can just search.
-    // Actually, `masm` has a symbol table `masm->symbols`.
-    // We should update `MasmSymbol` with the offset.
     
     for (size_t i = 0; i < text->inst_count; i++)
     {
         MasmInstruction *inst = &text->instructions[i];
         if (inst->opcode == MASM_OP_LABEL)
         {
-            // Update symbol offset
             if (inst->operands[0].label)
             {
                 MasmSymbol *sym = masm_get_symbol(masm, inst->operands[0].label);
@@ -101,7 +82,6 @@ int masm_elf_write(Masm *masm, const char *filename)
                 {
                     sym->offset = current_offset;
                 }
-                // Also handle local labels if any (not yet)
             }
         }
         else
@@ -113,11 +93,9 @@ int masm_elf_write(Masm *masm, const char *filename)
     
     size_t total_code_size = current_offset;
 
-    // Buffer for code
     uint8_t *code_buffer = malloc(total_code_size);
     size_t code_size = 0;
     
-    // Find entry point (_start)
     uint64_t entry_offset = 0;
     MasmSymbol *start_sym = masm_get_symbol(masm, "_start");
     if (start_sym)
@@ -125,7 +103,7 @@ int masm_elf_write(Masm *masm, const char *filename)
         entry_offset = start_sym->offset;
     }
 
-    // Pass 2: Encode with label resolution
+    // pass 2: encode with label resolution
     for (size_t i = 0; i < text->inst_count; i++)
     {
         MasmInstruction inst = text->instructions[i];
@@ -134,25 +112,15 @@ int masm_elf_write(Masm *masm, const char *filename)
             continue;
         }
         
-        // Check for CALL/JMP with label operand
         if (inst.opcode == MASM_OP_CALL && inst.operands[0].kind == MASM_OPERAND_LABEL)
         {
-            // Calculate relative offset
             MasmSymbol *target = masm_get_symbol(masm, inst.operands[0].label);
             if (target)
             {
-                // Target offset - (Current offset + Instruction size)
-                // Instruction size for CALL rel32 is 5 bytes
                 int32_t rel = (int32_t)(target->offset - (code_size + 5));
                 
-                // We need to manually encode CALL here or pass the 'rel' to encoder?
-                // masm_x86_encode doesn't take 'rel'.
-                // We can hack it: change operand to IMM with the relative value?
-                // No, CALL expects LABEL or IMM?
-                // Let's manually encode CALL here to override x86_64.c behavior
                 code_buffer[code_size++] = 0xE8;
                 
-                // emit int32
                 for (int k = 0; k < 4; k++)
                 {
                     code_buffer[code_size++] = (rel >> (k * 8)) & 0xFF;
@@ -164,29 +132,27 @@ int masm_elf_write(Masm *masm, const char *filename)
         code_size += masm_x86_encode(inst, code_buffer + code_size, total_code_size - code_size);
     }
 
-    // Base address for executable
     uint64_t base_addr = 0x400000;
-    // Align to page size (4096)
-    uint64_t code_offset = 0x1000; // simplified alignment
+    uint64_t code_offset = 0x1000;
     uint64_t entry_addr = base_addr + code_offset + entry_offset;
 
-    // 2. Write ELF Header
+    // write elf header
     Elf64_Ehdr ehdr;
     memset(&ehdr, 0, sizeof(ehdr));
     ehdr.e_ident[0] = 0x7F;
     ehdr.e_ident[1] = 'E';
     ehdr.e_ident[2] = 'L';
     ehdr.e_ident[3] = 'F';
-    ehdr.e_ident[4] = 2; // Class: 64-bit
-    ehdr.e_ident[5] = 1; // Data: 2's complement, little endian
-    ehdr.e_ident[6] = 1; // Version
-    ehdr.e_ident[7] = 0; // OS ABI: System V
+    ehdr.e_ident[4] = 2;
+    ehdr.e_ident[5] = 1;
+    ehdr.e_ident[6] = 1;
+    ehdr.e_ident[7] = 0;
     ehdr.e_type = ET_EXEC;
     ehdr.e_machine = EM_X86_64;
     ehdr.e_version = 1;
     ehdr.e_entry = entry_addr;
     ehdr.e_phoff = sizeof(Elf64_Ehdr);
-    ehdr.e_shoff = 0; // No section headers for now
+    ehdr.e_shoff = 0;
     ehdr.e_ehsize = sizeof(Elf64_Ehdr);
     ehdr.e_phentsize = sizeof(Elf64_Phdr);
     ehdr.e_phnum = 1;
@@ -196,12 +162,12 @@ int masm_elf_write(Masm *masm, const char *filename)
 
     fwrite(&ehdr, 1, sizeof(ehdr), f);
 
-    // 3. Write Program Header
+    // write program header
     Elf64_Phdr phdr;
     memset(&phdr, 0, sizeof(phdr));
     phdr.p_type = PT_LOAD;
-    phdr.p_flags = PF_R | PF_X; // Read + Execute
-    phdr.p_offset = code_offset; // Offset in file
+    phdr.p_flags = PF_R | PF_X;
+    phdr.p_offset = code_offset;
     phdr.p_vaddr = base_addr + code_offset;
     phdr.p_paddr = base_addr + code_offset;
     phdr.p_filesz = code_size;
@@ -210,10 +176,8 @@ int masm_elf_write(Masm *masm, const char *filename)
 
     fwrite(&phdr, 1, sizeof(phdr), f);
 
-    // Pad to code offset
     fseek(f, code_offset, SEEK_SET);
 
-    // 4. Write Code
     fwrite(code_buffer, 1, code_size, f);
 
     free(code_buffer);
