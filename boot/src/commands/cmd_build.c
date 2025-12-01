@@ -365,11 +365,11 @@ int cmd_build_handle(int argc, char **argv)
         }
     }
 
-    // generate object file
-    char obj_file[512];
-    snprintf(obj_file, sizeof(obj_file), "%s.o", output_file);
+    // generate object file (now executable directly via MASM)
+    // char obj_file[512];
+    // snprintf(obj_file, sizeof(obj_file), "%s.o", output_file);
 
-    if (masm_emit_object(masm, obj_file) < 0)
+    if (masm_emit_object(masm, output_file) < 0)
     {
         fprintf(stderr, "error: failed to emit object file\n");
         masm_destroy(masm);
@@ -387,30 +387,7 @@ int cmd_build_handle(int argc, char **argv)
         free(source);
         return 1;
     }
-
-    // link into executable
-    char link_cmd[1024];
-    snprintf(link_cmd, sizeof(link_cmd), "ld -o %s %s 2>&1", output_file, obj_file);
-
-    int link_result = system(link_cmd);
-    if (link_result != 0)
-    {
-        fprintf(stderr, "error: linking failed\n");
-        masm_destroy(masm);
-        sema_destroy(sema);
-        
-        // clean up config after sema is destroyed
-        if (config)
-        {
-            config_dnit(config);
-            free(config);
-        }
-        
-        parser_dnit(&parser);
-        lexer_dnit(&lexer);
-        free(source);
-        return 1;
-    }
+    printf("Build successful: %s\n", output_file);
 
     // silent on success - no output
 

@@ -45,6 +45,9 @@ typedef enum MasmOpcode
     // system
     MASM_OP_SYSCALL,
     
+    // pseudo-ops
+    MASM_OP_LABEL,
+    
     // target specific start
     MASM_OP_TARGET_SPECIFIC_START = 1000
 } MasmOpcode;
