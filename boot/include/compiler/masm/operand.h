@@ -50,6 +50,7 @@ MasmOperand masm_operand_none();
 MasmOperand masm_operand_register(uint32_t id, uint8_t size);
 MasmOperand masm_operand_imm(int64_t value);
 MasmOperand masm_operand_memory(MasmRegister base, MasmRegister index, uint8_t scale, int64_t disp, uint8_t size);
+MasmOperand masm_operand_memory_simple(uint32_t base_reg, int32_t disp, uint8_t size);
 MasmOperand masm_operand_symbol(const char *name);
 MasmOperand masm_operand_label(const char *name);
 

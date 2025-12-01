@@ -128,6 +128,50 @@ int masm_elf_write(Masm *masm, const char *filename)
                 continue;
             }
         }
+        else if (inst.opcode == MASM_OP_JMP && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            MasmSymbol *target = masm_get_symbol(masm, inst.operands[0].label);
+            if (target)
+            {
+                int32_t rel = (int32_t)(target->offset - (code_size + 5));
+                
+                code_buffer[code_size++] = 0xE9;
+                
+                for (int k = 0; k < 4; k++)
+                {
+                    code_buffer[code_size++] = (rel >> (k * 8)) & 0xFF;
+                }
+                continue;
+            }
+        }
+        else if (inst.opcode >= MASM_OP_JE && inst.opcode <= MASM_OP_JLE && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            MasmSymbol *target = masm_get_symbol(masm, inst.operands[0].label);
+            if (target)
+            {
+                int32_t rel = (int32_t)(target->offset - (code_size + 6));
+                
+                code_buffer[code_size++] = 0x0F;
+                
+                uint8_t opcode = 0x84;
+                switch (inst.opcode)
+                {
+                    case MASM_OP_JE:  opcode = 0x84; break;
+                    case MASM_OP_JNE: opcode = 0x85; break;
+                    case MASM_OP_JL:  opcode = 0x8C; break;
+                    case MASM_OP_JG:  opcode = 0x8F; break;
+                    case MASM_OP_JLE: opcode = 0x8E; break;
+                    case MASM_OP_JGE: opcode = 0x8D; break;
+                }
+                code_buffer[code_size++] = opcode;
+                
+                for (int k = 0; k < 4; k++)
+                {
+                    code_buffer[code_size++] = (rel >> (k * 8)) & 0xFF;
+                }
+                continue;
+            }
+        }
         
         code_size += masm_x86_encode(inst, code_buffer + code_size, total_code_size - code_size);
     }

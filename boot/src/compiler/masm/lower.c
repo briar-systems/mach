@@ -5,15 +5,72 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt);
-static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr);
+// local variable tracking
+typedef struct LocalVar {
+    const char *name;
+    int32_t offset;  // offset from RBP (negative for locals)
+    uint8_t size;
+} LocalVar;
+
+typedef struct LowerContext {
+    LocalVar *vars;
+    int var_count;
+    int var_capacity;
+    int32_t stack_offset;  // current stack allocation offset
+} LowerContext;
+
+static LowerContext *create_context()
+{
+    LowerContext *ctx = malloc(sizeof(LowerContext));
+    ctx->vars = malloc(sizeof(LocalVar) * 16);
+    ctx->var_count = 0;
+    ctx->var_capacity = 16;
+    ctx->stack_offset = 0;
+    return ctx;
+}
+
+static void destroy_context(LowerContext *ctx)
+{
+    if (ctx)
+    {
+        free(ctx->vars);
+        free(ctx);
+    }
+}
+
+static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, uint8_t size)
+{
+    if (ctx->var_count >= ctx->var_capacity)
+    {
+        ctx->var_capacity *= 2;
+        ctx->vars = realloc(ctx->vars, sizeof(LocalVar) * ctx->var_capacity);
+    }
+    ctx->vars[ctx->var_count].name = name;
+    ctx->vars[ctx->var_count].offset = offset;
+    ctx->vars[ctx->var_count].size = size;
+    ctx->var_count++;
+}
+
+static LocalVar *find_local_var(LowerContext *ctx, const char *name)
+{
+    for (int i = 0; i < ctx->var_count; i++)
+    {
+        if (strcmp(ctx->vars[i].name, name) == 0)
+        {
+            return &ctx->vars[i];
+        }
+    }
+    return NULL;
+}
+
+static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContext *ctx);
+static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx);
 static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content);
 static MasmOperand parse_operand(const char *str);
 
-static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr)
+static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
 {
     (void)masm;
-    (void)text;
     
     if (expr->kind == AST_EXPR_LIT)
     {
@@ -22,29 +79,230 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr)
             return masm_operand_imm((int64_t)expr->lit_expr.int_val);
         }
     }
+    else if (expr->kind == AST_EXPR_IDENT)
+    {
+        // variable access - load from stack
+        LocalVar *var = find_local_var(ctx, expr->ident_expr.name);
+        if (var)
+        {
+            // load variable from [rbp + offset] into RAX
+            MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
+            MasmOperand result = masm_operand_register(MASM_X86_RAX, var->size);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, var_mem));
+            return result;
+        }
+        // if not found, fall through to return none
+    }
     else if (expr->kind == AST_EXPR_BINARY)
     {
-        MasmOperand left = lower_expr(masm, text, expr->binary_expr.left);
-        MasmOperand right = lower_expr(masm, text, expr->binary_expr.right);
-        
-        MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
-        
-        // move left operand to result register
-        if (left.kind != MASM_OPERAND_REGISTER || left.reg.id != MASM_X86_RAX)
+        // Short-circuit operators
+        if (expr->binary_expr.op == TOKEN_AMPERSAND_AMPERSAND)
         {
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, left));
+            static int label_counter = 0;
+            char false_label[32];
+            char end_label[32];
+            snprintf(false_label, sizeof(false_label), ".Land_false_%d", label_counter);
+            snprintf(end_label, sizeof(end_label), ".Land_end_%d", label_counter++);
+            
+            // evaluate left
+            MasmOperand left = lower_expr(masm, text, expr->binary_expr.left, ctx);
+            MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
+            
+            if (left.kind != MASM_OPERAND_REGISTER || left.reg.id != MASM_X86_RAX)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, left));
+            }
+            
+            // check left
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, result, result));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JE, masm_operand_label(strdup(false_label))));
+            
+            // evaluate right
+            MasmOperand right = lower_expr(masm, text, expr->binary_expr.right, ctx);
+            if (right.kind != MASM_OPERAND_REGISTER || right.reg.id != MASM_X86_RAX)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, right));
+            }
+            
+            // check right
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, result, result));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JE, masm_operand_label(strdup(false_label))));
+            
+            // true
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(1)));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(end_label))));
+            
+            // false
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(false_label))));
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(0)));
+            
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(end_label))));
+            
+            masm_add_symbol(masm, masm_symbol_create(false_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+            masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+            
+            return result;
+        }
+        else if (expr->binary_expr.op == TOKEN_PIPE_PIPE)
+        {
+            static int label_counter = 0;
+            char true_label[32];
+            char end_label[32];
+            snprintf(true_label, sizeof(true_label), ".Lor_true_%d", label_counter);
+            snprintf(end_label, sizeof(end_label), ".Lor_end_%d", label_counter++);
+            
+            // evaluate left
+            MasmOperand left = lower_expr(masm, text, expr->binary_expr.left, ctx);
+            MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
+            
+            if (left.kind != MASM_OPERAND_REGISTER || left.reg.id != MASM_X86_RAX)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, left));
+            }
+            
+            // check left
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, result, result));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JNE, masm_operand_label(strdup(true_label))));
+            
+            // evaluate right
+            MasmOperand right = lower_expr(masm, text, expr->binary_expr.right, ctx);
+            if (right.kind != MASM_OPERAND_REGISTER || right.reg.id != MASM_X86_RAX)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, right));
+            }
+            
+            // check right
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, result, result));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JNE, masm_operand_label(strdup(true_label))));
+            
+            // false
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(0)));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(end_label))));
+            
+            // true
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(true_label))));
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(1)));
+            
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(end_label))));
+            
+            masm_add_symbol(masm, masm_symbol_create(true_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+            masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+            
+            return result;
+        }
+            
+            // false
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(0)));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(end_label)));
+            
+            // true
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(true_label)));
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(1)));
+            
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(end_label)));
+            
+            masm_add_symbol(masm, masm_symbol_create(true_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+            masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+            
+            return result;
+        }
+        else if (expr->binary_expr.op == TOKEN_EQUAL)
+        {
+            // Assignment: left = right
+            MasmOperand right_val = lower_expr(masm, text, expr->binary_expr.right, ctx);
+            
+            if (expr->binary_expr.left->kind == AST_EXPR_IDENT)
+            {
+                LocalVar *var = find_local_var(ctx, expr->binary_expr.left->ident_expr.name);
+                if (var)
+                {
+                    MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
+                    
+                    // Store right_val into var_mem
+                    if (right_val.kind == MASM_OPERAND_REGISTER)
+                    {
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, right_val));
+                    }
+                    else if (right_val.kind == MASM_OPERAND_IMM)
+                    {
+                        MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, right_val));
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, temp));
+                        
+                        // return value in RAX
+                        return temp;
+                    }
+                    
+                    // if right_val was register, it's already in a register (likely RAX), so return it
+                    return right_val;
+                }
+            }
+            return masm_operand_none();
+        }
+
+        MasmOperand left = lower_expr(masm, text, expr->binary_expr.left, ctx);
+        
+        // if left is in RAX, push it to preserve it across right evaluation
+        bool pushed = false;
+        if (left.kind == MASM_OPERAND_REGISTER && left.reg.id == MASM_X86_RAX)
+        {
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, left));
+            pushed = true;
         }
         
-        // if right is immediate, need to load into register first for reg-reg operations
+        MasmOperand right = lower_expr(masm, text, expr->binary_expr.right, ctx);
+        
+        MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
         MasmOperand right_op = right;
-        if (right.kind == MASM_OPERAND_IMM)
+        MasmOperand rcx = masm_operand_register(MASM_X86_RCX, 8);
+        
+        if (pushed)
         {
-            MasmOperand temp = masm_operand_register(MASM_X86_RCX, 8);
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, right));
-            right_op = temp;
+            // right is in RAX (if register) or immediate.
+            // Move right to RCX to free up RAX for left.
+            if (right.kind == MASM_OPERAND_REGISTER && right.reg.id == MASM_X86_RAX)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, right));
+                right_op = rcx;
+            }
+            else if (right.kind == MASM_OPERAND_IMM)
+            {
+                // Load immediate into RCX to be safe and uniform
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, right));
+                right_op = rcx;
+            }
+            
+            // Pop left back into RAX
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, result));
+        }
+        else
+        {
+            // left was immediate (or other reg).
+            // right is in RAX (if complex).
+            
+            // We want left in RAX.
+            // If right is in RAX, move it to RCX first.
+            if (right.kind == MASM_OPERAND_REGISTER && right.reg.id == MASM_X86_RAX)
+            {
+                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, right));
+                 right_op = rcx;
+            }
+            
+            // Load left into RAX
+            if (left.kind == MASM_OPERAND_IMM)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, left));
+            }
+            else if (left.kind == MASM_OPERAND_REGISTER && left.reg.id != MASM_X86_RAX)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, left));
+            }
         }
         
         uint32_t opcode = 0;
+        uint32_t setcc_opcode = 0;
+        bool is_comparison = false;
+        
         switch (expr->binary_expr.op)
         {
             case TOKEN_PLUS:  opcode = MASM_OP_ADD; break;
@@ -53,11 +311,63 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr)
             case TOKEN_SLASH: 
                 opcode = MASM_OP_IDIV;
                 break;
+            
+            case TOKEN_AMPERSAND:
+                opcode = MASM_OP_AND;
+                break;
+            
+            // comparison operators
+            case TOKEN_EQUAL_EQUAL:
+                opcode = MASM_OP_CMP;
+                setcc_opcode = MASM_OP_SETE;
+                is_comparison = true;
+                break;
+            case TOKEN_BANG_EQUAL:
+                opcode = MASM_OP_CMP;
+                setcc_opcode = MASM_OP_SETNE;
+                is_comparison = true;
+                break;
+            case TOKEN_LESS:
+                opcode = MASM_OP_CMP;
+                setcc_opcode = MASM_OP_SETL;
+                is_comparison = true;
+                break;
+            case TOKEN_GREATER:
+                opcode = MASM_OP_CMP;
+                setcc_opcode = MASM_OP_SETG;
+                is_comparison = true;
+                break;
+            case TOKEN_LESS_EQUAL:
+                opcode = MASM_OP_CMP;
+                setcc_opcode = MASM_OP_SETLE;
+                is_comparison = true;
+                break;
+            case TOKEN_GREATER_EQUAL:
+                opcode = MASM_OP_CMP;
+                setcc_opcode = MASM_OP_SETGE;
+                is_comparison = true;
+                break;
+            
             default:
                 return masm_operand_none();
         }
         
-        if (opcode == MASM_OP_IDIV)
+        if (is_comparison)
+        {
+            // emit comparison: cmp left, right
+            masm_section_append_inst(text, masm_inst_2(opcode, result, right_op));
+            
+            // set low byte based on condition
+            MasmOperand al = masm_operand_register(MASM_X86_RAX, 1);
+            masm_section_append_inst(text, masm_inst_1(setcc_opcode, al));
+            
+            // zero-extend AL to RAX using AND RAX, 1
+            // This assumes boolean result is 0 or 1.
+            // High bytes of RAX are preserved from 'left' operand, so we must clear them.
+            // AND RAX, 1 keeps only the LSB (which is the result of SETcc).
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, result, masm_operand_imm(1)));
+        }
+        else if (opcode == MASM_OP_IDIV)
         {
             masm_section_append_inst(text, masm_inst_0(MASM_OP_CQO));
             masm_section_append_inst(text, masm_inst_1(opcode, right_op));
@@ -69,20 +379,58 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr)
         
         return result;
     }
+    else if (expr->kind == AST_EXPR_UNARY)
+    {
+        MasmOperand operand = lower_expr(masm, text, expr->unary_expr.expr, ctx);
+        MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
+        
+        if (operand.kind != MASM_OPERAND_REGISTER || operand.reg.id != MASM_X86_RAX)
+        {
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, operand));
+        }
+        
+        if (expr->unary_expr.op == TOKEN_BANG)
+        {
+            // !expr -> cmp rax, 0; sete al; and rax, 1
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_CMP, result, masm_operand_imm(0)));
+            
+            MasmOperand al = masm_operand_register(MASM_X86_RAX, 1);
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_SETE, al));
+            
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, result, masm_operand_imm(1)));
+        }
+        else if (expr->unary_expr.op == TOKEN_MINUS)
+        {
+            // -expr -> sub 0, rax
+            MasmOperand rcx = masm_operand_register(MASM_X86_RCX, 8);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, result));
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(0)));
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_SUB, result, rcx));
+        }
+        
+        return result;
+    }
     
     return masm_operand_none();
 }
 
-static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt)
+static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContext *ctx)
 {
     if (stmt->kind == AST_STMT_RET)
     {
         AstNode *expr = stmt->ret_stmt.expr;
         if (expr)
         {
-            MasmOperand op = lower_expr(masm, text, expr);
+            MasmOperand op = lower_expr(masm, text, expr, ctx);
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, masm_operand_register(MASM_X86_RAX, 8), op));
         }
+        
+        // emit epilogue before return
+        MasmOperand rbp = masm_operand_register(MASM_X86_RBP, 8);
+        MasmOperand rsp = masm_operand_register(MASM_X86_RSP, 8);
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rsp, rbp));
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, rbp));
+        
         masm_section_append_inst(text, masm_inst_0(MASM_OP_RET));
     }
     else if (stmt->kind == AST_STMT_BLOCK)
@@ -90,7 +438,38 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt)
         AstList *stmts = stmt->block_stmt.stmts;
         for (int i = 0; i < stmts->count; i++)
         {
-            lower_stmt(masm, text, stmts->items[i]);
+            lower_stmt(masm, text, stmts->items[i], ctx);
+        }
+    }
+    else if (stmt->kind == AST_STMT_VAR)
+    {
+        // allocate space on stack for variable
+        ctx->stack_offset -= 8;  // allocate 8 bytes
+        int32_t offset = ctx->stack_offset;
+        
+        // add to symbol table
+        add_local_var(ctx, stmt->var_stmt.name, offset, 8);
+        
+        // if there's an initializer, evaluate and store it
+        if (stmt->var_stmt.init)
+        {
+            MasmOperand value = lower_expr(masm, text, stmt->var_stmt.init, ctx);
+            
+            // store value to stack location [rbp + offset]
+            MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, offset, 8);
+            
+            // if value is in a register, store it directly
+            if (value.kind == MASM_OPERAND_REGISTER)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, value));
+            }
+            // if value is immediate, move to register first
+            else if (value.kind == MASM_OPERAND_IMM)
+            {
+                MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, value));
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, temp));
+            }
         }
     }
     else if (stmt->kind == AST_STMT_MASM)
@@ -100,6 +479,10 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt)
             // parse inline masm content and emit instructions
             lower_inline_masm(masm, text, stmt->masm_stmt.content);
         }
+    }
+    else if (stmt->kind == AST_STMT_EXPR)
+    {
+        lower_expr(masm, text, stmt->expr_stmt.expr, ctx);
     }
 }
 
@@ -123,9 +506,71 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
         {
             masm_section_append_inst(text, masm_inst_0(MASM_OP_SYSCALL));
         }
+        else if (strncmp(token, "call ", 5) == 0)
+        {
+            char *label = token + 5;
+            while (*label == ' ') label++;
+            
+            // trim trailing whitespace
+            size_t len = strlen(label);
+            while (len > 0 && (label[len-1] == ' ' || label[len-1] == '\t' || label[len-1] == '\r'))
+            {
+                label[--len] = '\0';
+            }
+            
+            MasmOperand target = masm_operand_label(strdup(label));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_CALL, target));
+        }
         else if (strncmp(token, "ret", 3) == 0)
         {
             masm_section_append_inst(text, masm_inst_0(MASM_OP_RET));
+        }
+        else if (strncmp(token, "cmp ", 4) == 0)
+        {
+            // parse cmp instruction: "cmp rax, rcx"
+            char *operands = token + 4;
+            char *comma = strchr(operands, ',');
+            if (comma)
+            {
+                *comma = '\0';
+                char *dest = operands;
+                char *src = comma + 1;
+                
+                while (*dest == ' ') dest++;
+                while (*src == ' ') src++;
+                
+                MasmOperand dst_op = parse_operand(dest);
+                MasmOperand src_op = parse_operand(src);
+                
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_CMP, dst_op, src_op));
+            }
+        }
+        else if (strncmp(token, "xor ", 4) == 0)
+        {
+            // parse xor instruction: "xor eax, eax"
+            char *operands = token + 4;
+            char *comma = strchr(operands, ',');
+            if (comma)
+            {
+                *comma = '\0';
+                char *dest = operands;
+                char *src = comma + 1;
+                
+                while (*dest == ' ') dest++;
+                while (*src == ' ') src++;
+                
+                MasmOperand dst_op = parse_operand(dest);
+                MasmOperand src_op = parse_operand(src);
+                
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_XOR, dst_op, src_op));
+            }
+        }
+        else if (strncmp(token, "sete ", 5) == 0)
+        {
+            char *reg = token + 5;
+            while (*reg == ' ') reg++;
+            MasmOperand dst_op = parse_operand(reg);
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_SETE, dst_op));
         }
         else if (strncmp(token, "mov ", 4) == 0)
         {
@@ -160,6 +605,8 @@ static MasmOperand parse_operand(const char *str)
 {
     // parse register or immediate
     if (strcmp(str, "rax") == 0) return masm_operand_register(MASM_X86_RAX, 8);
+    if (strcmp(str, "eax") == 0) return masm_operand_register(MASM_X86_RAX, 4);
+    if (strcmp(str, "al") == 0) return masm_operand_register(MASM_X86_RAX, 1);
     if (strcmp(str, "rdi") == 0) return masm_operand_register(MASM_X86_RDI, 8);
     if (strcmp(str, "rsi") == 0) return masm_operand_register(MASM_X86_RSI, 8);
     if (strcmp(str, "rdx") == 0) return masm_operand_register(MASM_X86_RDX, 8);
@@ -189,14 +636,50 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
     
     masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(func_name)));
     
+    // create context for this function
+    LowerContext *ctx = create_context();
+    
+    // emit prologue: push rbp; mov rbp, rsp
+    MasmOperand rbp = masm_operand_register(MASM_X86_RBP, 8);
+    MasmOperand rsp = masm_operand_register(MASM_X86_RSP, 8);
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, rbp));
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rbp, rsp));
+    
+    // reserve space for locals (placeholder, will be patched)
+    size_t sub_rsp_idx = text->inst_count;
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_SUB, rsp, masm_operand_imm(0)));
+    
     if (func_node->fun_stmt.body)
     {
-        lower_stmt(masm, text, func_node->fun_stmt.body);
+        lower_stmt(masm, text, func_node->fun_stmt.body, ctx);
+    }
+    
+    // patch stack allocation
+    // stack grows down, so stack_offset is negative.
+    // size = -stack_offset
+    // align to 16 bytes
+    int32_t frame_size = -ctx->stack_offset;
+    if (frame_size % 16 != 0)
+    {
+        frame_size = (frame_size + 15) & ~15;
+    }
+    
+    if (frame_size > 0)
+    {
+        text->instructions[sub_rsp_idx].operands[1].imm = frame_size;
     }
     else
     {
-        masm_section_append_inst(text, masm_inst_0(MASM_OP_RET));
+        // if no locals, we can make this a NOP or just SUB RSP, 0 (which is harmless but wasteful)
+        // For now, SUB RSP, 0 is fine, or we could overwrite with NOP if we had one.
+        // Actually, we can just leave it as SUB RSP, 0.
     }
+    
+    // emit epilogue: mov rsp, rbp; pop rbp; ret
+    // Note: ret statements will already emit ret, so we only add epilogue if function doesn't end with ret
+    // For now, always add epilogue before ret in lower_stmt for AST_STMT_RET
+    
+    destroy_context(ctx);
 }
 
 Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
