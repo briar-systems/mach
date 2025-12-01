@@ -1798,7 +1798,7 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         }
         return sema_analyze_stmt(sema, node->for_stmt.body);
 
-    case AST_STMT_MIR:
+    case AST_STMT_MASM:
         return 0;
 
     default:

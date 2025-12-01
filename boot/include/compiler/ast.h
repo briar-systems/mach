@@ -34,7 +34,7 @@ typedef enum AstKind
     AST_STMT_CNT,
     AST_STMT_RET,
     AST_STMT_BLOCK,
-    AST_STMT_MIR,
+    AST_STMT_MASM,
     AST_STMT_EXPR,
 
     // compile-time constructs
@@ -91,11 +91,11 @@ struct AstNode
             AstList *stmts;
         } program;
 
-        // mir block
+        // masm block
         struct
         {
-            char *content; // raw MIR text content
-        } mir_stmt;
+            char *content;
+        } masm_stmt;
 
         // module statement
         struct

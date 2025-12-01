@@ -257,10 +257,10 @@ void ast_node_dnit(AstNode *node)
     case AST_STMT_CNT:
         break;
 
-    case AST_STMT_MIR:
-        if (node->mir_stmt.content)
+    case AST_STMT_MASM:
+        if (node->masm_stmt.content)
         {
-            free(node->mir_stmt.content);
+            free(node->masm_stmt.content);
         }
         break;
 
@@ -702,10 +702,10 @@ static AstNode *ast_clone_checked(const AstNode *node)
     case AST_STMT_CNT:
         break;
 
-    case AST_STMT_MIR:
-        if (node->mir_stmt.content)
+    case AST_STMT_MASM:
+        if (node->masm_stmt.content)
         {
-            clone->mir_stmt.content = strdup(node->mir_stmt.content);
+            clone->masm_stmt.content = strdup(node->masm_stmt.content);
         }
         break;
 
@@ -1105,12 +1105,12 @@ void ast_print(AstNode *node, int indent)
         printf("CNT\n");
         break;
 
-    case AST_STMT_MIR:
+    case AST_STMT_MASM:
         printf("MIR_BLOCK\n");
-        if (node->mir_stmt.content)
+        if (node->masm_stmt.content)
         {
             print_indent(indent + 1);
-            printf("content: %s\n", node->mir_stmt.content);
+            printf("content: %s\n", node->masm_stmt.content);
         }
         break;
 
@@ -1644,12 +1644,12 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
     case AST_STMT_CNT:
         fprintf(file, "CNT\n");
         break;
-    case AST_STMT_MIR:
+    case AST_STMT_MASM:
         fprintf(file, "MIR_BLOCK\n");
-        if (node->mir_stmt.content)
+        if (node->masm_stmt.content)
         {
             print_indent_to_file(file, indent + 1);
-            fprintf(file, "content: %s\n", node->mir_stmt.content);
+            fprintf(file, "content: %s\n", node->masm_stmt.content);
         }
         break;
     case AST_EXPR_BINARY:

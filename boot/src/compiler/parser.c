@@ -1023,7 +1023,7 @@ AstNode *parser_parse_stmt_top(Parser *parser)
     case TOKEN_KW_UNI:
         result = parser_parse_stmt_uni(parser, is_public);
         break;
-    case TOKEN_KW_MIR:
+    case TOKEN_KW_MASM:
         if (is_public)
         {
             parser_error_at_current(parser, "'pub' cannot precede 'mir' block");
@@ -1069,12 +1069,12 @@ AstNode *parser_parse_stmt(Parser *parser)
         return parser_parse_stmt_brk(parser);
     case TOKEN_KW_CNT:
         return parser_parse_stmt_cnt(parser);
+    case TOKEN_KW_MASM:
+        return parser_parse_stmt_mir(parser);
     case TOKEN_KW_RET:
         return parser_parse_stmt_ret(parser);
     case TOKEN_L_BRACE:
         return parser_parse_stmt_block(parser);
-    case TOKEN_KW_MIR:
-        return parser_parse_stmt_mir(parser);
     case TOKEN_DOLLAR:
         return parser_parse_directive(parser);
     default:
@@ -2029,12 +2029,12 @@ AstNode *parser_parse_stmt_ret(Parser *parser)
 
 AstNode *parser_parse_stmt_mir(Parser *parser)
 {
-    if (!parser_consume(parser, TOKEN_KW_MIR, "expected 'mir' keyword"))
+    if (!parser_consume(parser, TOKEN_KW_MASM, "expected 'mir' keyword"))
     {
         return NULL;
     }
 
-    AstNode *node = parser_alloc_node(parser, AST_STMT_MIR, parser->previous);
+    AstNode *node = parser_alloc_node(parser, AST_STMT_MASM, parser->previous);
     if (!node)
     {
         return NULL;
@@ -2074,15 +2074,15 @@ AstNode *parser_parse_stmt_mir(Parser *parser)
     int len     = end_pos - start_pos;
 
     // extract raw content
-    node->mir_stmt.content = (char *)malloc(len + 1);
-    if (!node->mir_stmt.content)
+    node->masm_stmt.content = (char *)malloc(len + 1);
+    if (!node->masm_stmt.content)
     {
         ast_node_dnit(node);
         free(node);
         return NULL;
     }
-    memcpy(node->mir_stmt.content, parser->lexer->source + start_pos, len);
-    node->mir_stmt.content[len] = '\0';
+    memcpy(node->masm_stmt.content, parser->lexer->source + start_pos, len);
+    node->masm_stmt.content[len] = '\0';
 
     if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after mir block"))
     {

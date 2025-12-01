@@ -1003,11 +1003,10 @@ static int lower_stmt(LowerContext *ctx, AstNode *node)
         }
         return 0;
 
-    case AST_STMT_MIR:
-        // inline MIR block
-        if (node->mir_stmt.content && ctx->current_function && ctx->current_block)
+    case AST_STMT_MASM:
+        if (node->masm_stmt.content && ctx->current_function && ctx->current_block)
         {
-            mir_parse_inline_block(ctx, ctx->current_function, ctx->current_block, node->mir_stmt.content);
+            mir_parse_inline_block(ctx, ctx->current_function, ctx->current_block, node->masm_stmt.content);
         }
         return 0;
 

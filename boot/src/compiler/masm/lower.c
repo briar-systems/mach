@@ -2,10 +2,13 @@
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/x86_64.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt);
 static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr);
+static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content);
+static MasmOperand parse_operand(const char *str);
 
 static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr)
 {
@@ -90,6 +93,87 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt)
             lower_stmt(masm, text, stmts->items[i]);
         }
     }
+    else if (stmt->kind == AST_STMT_MASM)
+    {
+        if (stmt->masm_stmt.content)
+        {
+            // parse inline masm content and emit instructions
+            lower_inline_masm(masm, text, stmt->masm_stmt.content);
+        }
+    }
+}
+
+static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content)
+{
+    (void)masm;
+    
+    // simple parser for inline masm blocks
+    // format: "opcode operand1, operand2"
+    // for now, support basic syscall pattern
+    char *line = strdup(content);
+    char *saveptr = NULL;
+    char *token = strtok_r(line, "\n;", &saveptr);
+    
+    while (token)
+    {
+        // skip whitespace
+        while (*token == ' ' || *token == '\t') token++;
+        
+        if (strncmp(token, "syscall", 7) == 0)
+        {
+            masm_section_append_inst(text, masm_inst_0(MASM_OP_SYSCALL));
+        }
+        else if (strncmp(token, "ret", 3) == 0)
+        {
+            masm_section_append_inst(text, masm_inst_0(MASM_OP_RET));
+        }
+        else if (strncmp(token, "mov ", 4) == 0)
+        {
+            // parse mov instruction: "mov rax, 60"
+            char *operands = token + 4;
+            char *comma = strchr(operands, ',');
+            if (comma)
+            {
+                *comma = '\0';
+                char *dest = operands;
+                char *src = comma + 1;
+                
+                // trim whitespace
+                while (*dest == ' ') dest++;
+                while (*src == ' ') src++;
+                
+                // parse destination register
+                MasmOperand dst_op = parse_operand(dest);
+                MasmOperand src_op = parse_operand(src);
+                
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst_op, src_op));
+            }
+        }
+        
+        token = strtok_r(NULL, "\n;", &saveptr);
+    }
+    
+    free(line);
+}
+
+static MasmOperand parse_operand(const char *str)
+{
+    // parse register or immediate
+    if (strcmp(str, "rax") == 0) return masm_operand_register(MASM_X86_RAX, 8);
+    if (strcmp(str, "rdi") == 0) return masm_operand_register(MASM_X86_RDI, 8);
+    if (strcmp(str, "rsi") == 0) return masm_operand_register(MASM_X86_RSI, 8);
+    if (strcmp(str, "rdx") == 0) return masm_operand_register(MASM_X86_RDX, 8);
+    if (strcmp(str, "rcx") == 0) return masm_operand_register(MASM_X86_RCX, 8);
+    
+    // parse immediate (number)
+    char *end;
+    long val = strtol(str, &end, 10);
+    if (*end == '\0')
+    {
+        return masm_operand_imm(val);
+    }
+    
+    return masm_operand_none();
 }
 
 static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
@@ -132,17 +216,6 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
             }
         }
     }
-    
-    // inject _start entry point
-    MasmSymbol *start_sym = masm_symbol_create("_start", MASM_SYMBOL_FUNCTION, MASM_BIND_GLOBAL);
-    masm_add_symbol(masm, start_sym);
-    
-    MasmSection *text = masm_get_or_create_section(masm, ".text", MASM_SECTION_TEXT);
-    masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label("_start")));
-    masm_section_append_inst(text, masm_inst_1(MASM_OP_CALL, masm_operand_label("main")));
-    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, masm_operand_register(MASM_X86_RDI, 8), masm_operand_register(MASM_X86_RAX, 8)));
-    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, masm_operand_register(MASM_X86_RAX, 8), masm_operand_imm(60)));
-    masm_section_append_inst(text, masm_inst_0(MASM_OP_SYSCALL));
     
     return masm;
 }
