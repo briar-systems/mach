@@ -62,12 +62,17 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             
             if (inst.operands[0].reg.size == 8)
             {
-                emit_byte(buffer, &offset, size, 0x48);
+                uint8_t rex = 0x48;
+                if (reg >= 8) rex |= 0x01; // REX.B
+                emit_byte(buffer, &offset, size, rex);
                 emit_byte(buffer, &offset, size, 0xB8 + (reg & 7));
                 emit_imm64(buffer, &offset, size, imm);
             }
             else if (inst.operands[0].reg.size == 4)
             {
+                uint8_t rex = 0;
+                if (reg >= 8) rex |= 0x41; // REX.B (no W bit for 32-bit, but need REX if reg >= 8)
+                if (rex) emit_byte(buffer, &offset, size, rex);
                 emit_byte(buffer, &offset, size, 0xB8 + (reg & 7));
                 emit_imm32(buffer, &offset, size, (int32_t)imm);
             }
@@ -81,7 +86,10 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
              
              if (inst.operands[0].reg.size == 8 && inst.operands[1].reg.size == 8)
              {
-                 emit_byte(buffer, &offset, size, 0x48);
+                 uint8_t rex = 0x48;
+                 if (src >= 8) rex |= 0x04; // REX.R
+                 if (dst >= 8) rex |= 0x01; // REX.B
+                 emit_byte(buffer, &offset, size, rex);
                  emit_byte(buffer, &offset, size, 0x89);
                  uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                  emit_byte(buffer, &offset, size, modrm);
@@ -98,7 +106,10 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             
             if (inst.operands[0].reg.size == 8)
             {
-                emit_byte(buffer, &offset, size, 0x48);  // REX.W
+                uint8_t rex = 0x48;
+                if (dst_reg >= 8) rex |= 0x04; // REX.R (dst is reg field)
+                if (base_reg >= 8) rex |= 0x01; // REX.B (base is r/m field)
+                emit_byte(buffer, &offset, size, rex);
                 emit_byte(buffer, &offset, size, 0x8B);  // MOV r64, r/m64
                 
                 // ModR/M byte: mod=01 (disp8) or mod=10 (disp32), reg=dst, r/m=base
@@ -124,7 +135,10 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             
             if (inst.operands[1].reg.size == 8)
             {
-                emit_byte(buffer, &offset, size, 0x48);  // REX.W
+                uint8_t rex = 0x48;
+                if (src_reg >= 8) rex |= 0x04; // REX.R (src is reg field)
+                if (base_reg >= 8) rex |= 0x01; // REX.B (base is r/m field)
+                emit_byte(buffer, &offset, size, rex);
                 emit_byte(buffer, &offset, size, 0x89);  // MOV r/m64, r64
                 
                 // ModR/M byte

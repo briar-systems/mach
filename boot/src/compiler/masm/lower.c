@@ -1,6 +1,7 @@
 #include "compiler/masm/lower.h"
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/x86_64.h"
+#include "compiler/masm/abi/sysv64.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,10 @@ typedef struct LowerContext {
     int var_count;
     int var_capacity;
     int32_t stack_offset;  // current stack allocation offset
+    
+    // Loop labels for break/continue
+    const char *loop_start_label;
+    const char *loop_end_label;
 } LowerContext;
 
 static LowerContext *create_context()
@@ -26,6 +31,8 @@ static LowerContext *create_context()
     ctx->var_count = 0;
     ctx->var_capacity = 16;
     ctx->stack_offset = 0;
+    ctx->loop_start_label = NULL;
+    ctx->loop_end_label = NULL;
     return ctx;
 }
 
@@ -191,21 +198,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             return result;
         }
             
-            // false
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(0)));
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(end_label)));
-            
-            // true
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(true_label)));
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(1)));
-            
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(end_label)));
-            
-            masm_add_symbol(masm, masm_symbol_create(true_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
-            masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
-            
-            return result;
-        }
+
         else if (expr->binary_expr.op == TOKEN_EQUAL)
         {
             // Assignment: left = right
@@ -379,6 +372,45 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         
         return result;
     }
+    else if (expr->kind == AST_EXPR_CALL)
+    {
+        // evaluate arguments
+        AstList *args = expr->call_expr.args;
+        if (args)
+        {
+            for (int i = 0; i < args->count && i < 6; i++)
+            {
+                // evaluate arg
+                MasmOperand arg_op = lower_expr(masm, text, args->items[i], ctx);
+                
+                // move to register
+                MasmX86Reg reg = masm_sysv64_arg_reg(i);
+                MasmOperand dst = masm_operand_register(reg, 8);
+                
+                if (arg_op.kind == MASM_OPERAND_REGISTER && arg_op.reg.id == reg)
+                {
+                    // already in correct register
+                }
+                else
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, arg_op));
+                }
+            }
+        }
+        
+        // emit call
+        AstNode *func = expr->call_expr.func;
+        if (func->kind == AST_EXPR_IDENT)
+        {
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_CALL, masm_operand_label(strdup(func->ident_expr.name))));
+        }
+        else
+        {
+            // TODO: indirect call
+        }
+        
+        return masm_operand_register(MASM_X86_RAX, 8);
+    }
     else if (expr->kind == AST_EXPR_UNARY)
     {
         MasmOperand operand = lower_expr(masm, text, expr->unary_expr.expr, ctx);
@@ -478,6 +510,192 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             // parse inline masm content and emit instructions
             lower_inline_masm(masm, text, stmt->masm_stmt.content);
+        }
+    }
+    else if (stmt->kind == AST_STMT_IF)
+    {
+        static int label_counter = 0;
+        char else_label[32];
+        char end_label[32];
+        snprintf(else_label, sizeof(else_label), ".Lif_else_%d", label_counter);
+        snprintf(end_label, sizeof(end_label), ".Lif_end_%d", label_counter++);
+        
+        // evaluate condition
+        MasmOperand cond = lower_expr(masm, text, stmt->cond_stmt.cond, ctx);
+        
+        // check condition
+        if (cond.kind == MASM_OPERAND_REGISTER)
+        {
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, cond, cond));
+        }
+        else if (cond.kind == MASM_OPERAND_IMM)
+        {
+             MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
+             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, cond));
+             masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, temp, temp));
+        }
+        else
+        {
+             // memory or other
+             MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
+             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, cond));
+             masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, temp, temp));
+        }
+        
+        // jump to else/end if false (zero)
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_JE, masm_operand_label(strdup(else_label))));
+        
+        // lower body
+        lower_stmt(masm, text, stmt->cond_stmt.body, ctx);
+        
+        // jump to end (skip else)
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(end_label))));
+        
+        // else label
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(else_label))));
+        masm_add_symbol(masm, masm_symbol_create(else_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+        
+        // lower else block if exists
+        if (stmt->cond_stmt.stmt_or)
+        {
+            lower_stmt(masm, text, stmt->cond_stmt.stmt_or, ctx);
+        }
+        
+        // end label
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(end_label))));
+        masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+    }
+    else if (stmt->kind == AST_STMT_OR)
+    {
+        if (stmt->cond_stmt.cond)
+        {
+            // Same as IF
+            static int label_counter = 0;
+            char else_label[32];
+            char end_label[32];
+            snprintf(else_label, sizeof(else_label), ".Lor_else_%d", label_counter);
+            snprintf(end_label, sizeof(end_label), ".Lor_end_%d", label_counter++);
+            
+            // evaluate condition
+            MasmOperand cond = lower_expr(masm, text, stmt->cond_stmt.cond, ctx);
+            
+            // check condition
+            if (cond.kind == MASM_OPERAND_REGISTER)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, cond, cond));
+            }
+            else if (cond.kind == MASM_OPERAND_IMM)
+            {
+                 MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
+                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, cond));
+                 masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, temp, temp));
+            }
+            else
+            {
+                 MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
+                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, cond));
+                 masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, temp, temp));
+            }
+            
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JE, masm_operand_label(strdup(else_label))));
+            
+            lower_stmt(masm, text, stmt->cond_stmt.body, ctx);
+            
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(end_label))));
+            
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(else_label))));
+            masm_add_symbol(masm, masm_symbol_create(else_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+            
+            if (stmt->cond_stmt.stmt_or)
+            {
+                lower_stmt(masm, text, stmt->cond_stmt.stmt_or, ctx);
+            }
+            
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(end_label))));
+            masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+        }
+        else
+        {
+            // Unconditional OR (else)
+            lower_stmt(masm, text, stmt->cond_stmt.body, ctx);
+        }
+    }
+    else if (stmt->kind == AST_STMT_FOR)
+    {
+        static int label_counter = 0;
+        char start_label[32];
+        char end_label[32];
+        snprintf(start_label, sizeof(start_label), ".Lfor_start_%d", label_counter);
+        snprintf(end_label, sizeof(end_label), ".Lfor_end_%d", label_counter++);
+        
+        // save previous loop labels
+        const char *prev_start = ctx->loop_start_label;
+        const char *prev_end = ctx->loop_end_label;
+        
+        // set new loop labels (must be duplicated because they are stack allocated here)
+        // actually, we can just use strdup once and free later, or rely on the fact that we use them immediately.
+        // But lower_stmt is recursive, so we need them to persist during the recursion.
+        // We can use the stack buffer if we are careful, but strdup is safer.
+        ctx->loop_start_label = strdup(start_label);
+        ctx->loop_end_label = strdup(end_label);
+        
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(start_label))));
+        masm_add_symbol(masm, masm_symbol_create(start_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+        
+        // check condition if exists
+        if (stmt->for_stmt.cond)
+        {
+            MasmOperand cond = lower_expr(masm, text, stmt->for_stmt.cond, ctx);
+            
+            if (cond.kind == MASM_OPERAND_REGISTER)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, cond, cond));
+            }
+            else if (cond.kind == MASM_OPERAND_IMM)
+            {
+                 MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
+                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, cond));
+                 masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, temp, temp));
+            }
+            else
+            {
+                 MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
+                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, cond));
+                 masm_section_append_inst(text, masm_inst_2(MASM_OP_TEST, temp, temp));
+            }
+            
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JE, masm_operand_label(strdup(end_label))));
+        }
+        
+        // lower body
+        lower_stmt(masm, text, stmt->for_stmt.body, ctx);
+        
+        // jump back to start
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(start_label))));
+        
+        // end label
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(end_label))));
+        masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+        
+        // restore previous loop labels
+        // free current ones (cast away const)
+        free((void*)ctx->loop_start_label);
+        free((void*)ctx->loop_end_label);
+        ctx->loop_start_label = prev_start;
+        ctx->loop_end_label = prev_end;
+    }
+    else if (stmt->kind == AST_STMT_BRK)
+    {
+        if (ctx->loop_end_label)
+        {
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_end_label))));
+        }
+    }
+    else if (stmt->kind == AST_STMT_CNT)
+    {
+        if (ctx->loop_start_label)
+        {
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_start_label))));
         }
     }
     else if (stmt->kind == AST_STMT_EXPR)
@@ -648,6 +866,31 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
     // reserve space for locals (placeholder, will be patched)
     size_t sub_rsp_idx = text->inst_count;
     masm_section_append_inst(text, masm_inst_2(MASM_OP_SUB, rsp, masm_operand_imm(0)));
+    
+    // handle parameters
+    if (func_node->fun_stmt.params)
+    {
+        AstList *params = func_node->fun_stmt.params;
+        for (int i = 0; i < params->count; i++)
+        {
+            AstNode *param = params->items[i];
+            // allocate stack space
+            ctx->stack_offset -= 8;
+            int32_t offset = ctx->stack_offset;
+            
+            // add to symbol table
+            add_local_var(ctx, param->param_stmt.name, offset, 8);
+            
+            // move register to stack
+            if (i < 6)
+            {
+                MasmX86Reg reg = masm_sysv64_arg_reg(i);
+                MasmOperand src = masm_operand_register(reg, 8);
+                MasmOperand dst = masm_operand_memory_simple(MASM_X86_RBP, offset, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+            }
+        }
+    }
     
     if (func_node->fun_stmt.body)
     {
