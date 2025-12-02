@@ -19,11 +19,12 @@ typedef struct LowerContext {
     LocalVar *vars;
     int var_count;
     int var_capacity;
-    int32_t stack_offset;  // current stack allocation offset
+    int32_t stack_offset;
+    AstList *local_vars; // List of LocalVar
     
     // Loop labels for break/continue
-    const char *loop_start_label;
-    const char *loop_end_label;
+    char *loop_start_label;
+    char *loop_end_label;
 } LowerContext;
 
 static LowerContext *create_context()
@@ -33,6 +34,8 @@ static LowerContext *create_context()
     ctx->var_count = 0;
     ctx->var_capacity = 16;
     ctx->stack_offset = 0;
+    ctx->local_vars = malloc(sizeof(AstList));
+    ast_list_init(ctx->local_vars);
     ctx->loop_start_label = NULL;
     ctx->loop_end_label = NULL;
     return ctx;
@@ -1024,19 +1027,32 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             {
                 // Memory to Memory copy
                 int32_t src_disp = value.mem.disp;
-                int32_t dst_disp = offset;
                 
                 // copy in 8-byte chunks
                 for (size_t i = 0; i < size; i += 8)
                 {
                     MasmOperand src_chunk = masm_operand_memory_simple(value.mem.base.id, src_disp + i, 8);
-                    MasmOperand dst_chunk = masm_operand_memory_simple(MASM_X86_RBP, dst_disp + i, 8);
+                    MasmOperand dst_chunk = masm_operand_memory_simple(MASM_X86_RBP, offset + i, 8);
                     
                     MasmOperand tmp = masm_operand_register(MASM_X86_RAX, 8);
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src_chunk));
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst_chunk, tmp));
                 }
             }
+        }
+    }
+    else if (stmt->kind == AST_STMT_BRK)
+    {
+        if (ctx->loop_end_label)
+        {
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_end_label))));
+        }
+    }
+    else if (stmt->kind == AST_STMT_CNT)
+    {
+        if (ctx->loop_start_label)
+        {
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_start_label))));
         }
     }
     else if (stmt->kind == AST_STMT_MASM)
@@ -1099,6 +1115,57 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         // end label
         masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(end_label))));
         masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+    }
+    else if (stmt->kind == AST_STMT_FOR)
+    {
+        static int loop_counter = 0;
+        char start_label[32];
+        char end_label[32];
+        snprintf(start_label, sizeof(start_label), ".Lloop_start_%d", loop_counter);
+        snprintf(end_label, sizeof(end_label), ".Lloop_end_%d", loop_counter++);
+        
+        // Save previous loop labels
+        char *prev_start = ctx->loop_start_label;
+        char *prev_end = ctx->loop_end_label;
+        
+        ctx->loop_start_label = strdup(start_label);
+        ctx->loop_end_label = strdup(end_label);
+        
+        masm_add_symbol(masm, masm_symbol_create(ctx->loop_start_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+        masm_add_symbol(masm, masm_symbol_create(ctx->loop_end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+        
+        // Emit start label
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(ctx->loop_start_label)));
+        
+        // Condition
+        if (stmt->for_stmt.cond)
+        {
+            MasmOperand cond = lower_expr(masm, text, stmt->for_stmt.cond, ctx);
+            MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
+            
+            if (cond.kind != MASM_OPERAND_REGISTER || cond.reg.id != MASM_X86_RAX)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, cond));
+            }
+            
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_CMP, result, masm_operand_imm(0)));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JE, masm_operand_label(ctx->loop_end_label)));
+        }
+        
+        // Body
+        lower_stmt(masm, text, stmt->for_stmt.body, ctx);
+        
+        // Jump back to start
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(ctx->loop_start_label)));
+        
+        // Emit end label
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(ctx->loop_end_label)));
+        
+        // Restore previous loop labels
+        free(ctx->loop_start_label);
+        free(ctx->loop_end_label);
+        ctx->loop_start_label = prev_start;
+        ctx->loop_end_label = prev_end;
     }
     else if (stmt->kind == AST_STMT_OR)
     {
@@ -1164,8 +1231,8 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         snprintf(end_label, sizeof(end_label), ".Lfor_end_%d", label_counter++);
         
         // save previous loop labels
-        const char *prev_start = ctx->loop_start_label;
-        const char *prev_end = ctx->loop_end_label;
+        char *prev_start = ctx->loop_start_label;
+        char *prev_end = ctx->loop_end_label;
         
         // set new loop labels (must be duplicated because they are stack allocated here)
         // actually, we can just use strdup once and free later, or rely on the fact that we use them immediately.
