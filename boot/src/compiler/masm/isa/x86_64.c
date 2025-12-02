@@ -244,6 +244,36 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             }
         }
     }
+    else if (inst.opcode == MASM_OP_LEA)
+    {
+        if (inst.operand_count == 2 &&
+            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
+            inst.operands[1].kind == MASM_OPERAND_MEMORY)
+        {
+            uint32_t dst_reg = inst.operands[0].reg.id;
+            uint32_t base_reg = inst.operands[1].mem.base.id;
+            int32_t disp = (int32_t)inst.operands[1].mem.disp;
+            
+            if (inst.operands[0].reg.size == 8)
+            {
+                uint8_t rex = 0x48;
+                if (dst_reg >= 8) rex |= 0x04; // REX.R
+                if (base_reg >= 8) rex |= 0x01; // REX.B
+                emit_byte(buffer, &offset, size, rex);
+                emit_byte(buffer, &offset, size, 0x8D);
+                
+                // ModR/M
+                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t modrm = mod | ((dst_reg & 7) << 3) | (base_reg & 7);
+                emit_byte(buffer, &offset, size, modrm);
+                
+                if (mod == 0x40)
+                    emit_byte(buffer, &offset, size, (int8_t)disp);
+                else
+                    emit_imm32(buffer, &offset, size, disp);
+            }
+        }
+    }
     else if (inst.opcode == MASM_OP_ADD)
     {
         if (inst.operand_count == 2 &&

@@ -1,4 +1,5 @@
 #include "compiler/masm/lower.h"
+#include "compiler/masm/masm.h"
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/x86_64.h"
 #include "compiler/masm/abi/sysv64.h"
@@ -203,6 +204,65 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         else if (expr->binary_expr.op == TOKEN_EQUAL)
         {
             // Assignment: left = right
+            
+            // Handle dereference assignment: @ptr = val
+            if (expr->binary_expr.left->kind == AST_EXPR_UNARY)
+            {
+                if (expr->binary_expr.left->unary_expr.op == TOKEN_AT)
+                {
+                    // 1. Evaluate ptr -> RAX
+                MasmOperand ptr = lower_expr(masm, text, expr->binary_expr.left->unary_expr.expr, ctx);
+                
+                if (ptr.kind != MASM_OPERAND_REGISTER)
+                {
+                    MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, ptr));
+                    ptr = rax;
+                }
+                
+                // Push ptr
+                masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, ptr));
+                
+                // 2. Evaluate RHS -> RAX
+                MasmOperand val = lower_expr(masm, text, expr->binary_expr.right, ctx);
+                
+                // Move val to RCX
+                MasmOperand val_reg;
+                if (val.kind == MASM_OPERAND_REGISTER)
+                {
+                    if (val.reg.id == MASM_X86_RAX)
+                    {
+                        val_reg = masm_operand_register(MASM_X86_RCX, 8);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
+                    }
+                    else
+                    {
+                        val_reg = val;
+                    }
+                }
+                else
+                {
+                    val_reg = masm_operand_register(MASM_X86_RCX, 8);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
+                }
+                
+                // 3. Pop ptr -> RAX
+                MasmOperand ptr_reg = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, ptr_reg));
+                
+                // 4. Store [ptr] = val
+                int size = 4;
+                if (expr->binary_expr.left->type) size = expr->binary_expr.left->type->size;
+                
+                MasmOperand dst = masm_operand_memory_simple(ptr_reg.reg.id, 0, size);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val_reg));
+                
+                // Return val (in RCX) moved to RAX
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, ptr_reg, val_reg));
+                return ptr_reg;
+            }
+            }
+
             MasmOperand right_val = lower_expr(masm, text, expr->binary_expr.right, ctx);
             
             if (expr->binary_expr.left->kind == AST_EXPR_IDENT)
@@ -458,6 +518,42 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     }
     else if (expr->kind == AST_EXPR_UNARY)
     {
+        if (expr->unary_expr.op == TOKEN_QUESTION)
+        {
+            // Address-of: ?expr
+            AstNode *operand_node = expr->unary_expr.expr;
+            
+            if (operand_node->kind == AST_EXPR_IDENT)
+            {
+                LocalVar *var = find_local_var(ctx, operand_node->ident_expr.name);
+                if (var)
+                {
+                    MasmOperand src = masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
+                    MasmOperand dst = masm_operand_register(MASM_X86_RAX, 8);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, dst, src));
+                    return dst;
+                }
+            }
+            return masm_operand_none();
+        }
+        else if (expr->unary_expr.op == TOKEN_AT)
+        {
+            // Dereference: @expr
+            MasmOperand ptr = lower_expr(masm, text, expr->unary_expr.expr, ctx);
+            
+            if (ptr.kind != MASM_OPERAND_REGISTER)
+            {
+                MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, ptr));
+                ptr = rax;
+            }
+            
+            int size = 8;
+            if (expr->type) size = expr->type->size;
+            
+            return masm_operand_memory_simple(ptr.reg.id, 0, size);
+        }
+
         MasmOperand operand = lower_expr(masm, text, expr->unary_expr.expr, ctx);
         MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
         
