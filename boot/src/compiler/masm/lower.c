@@ -637,6 +637,65 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         
         return result;
     }
+    else if (expr->kind == AST_EXPR_FIELD)
+    {
+        // obj.field or ptr.field
+        MasmOperand obj = lower_expr(masm, text, expr->field_expr.object, ctx);
+        Type *obj_type = expr->field_expr.object->type;
+        
+        if (!obj_type) return masm_operand_none();
+        
+        Type *struct_type = obj_type;
+        bool is_pointer = false;
+        
+        if (obj_type->kind == TYPE_POINTER)
+        {
+            struct_type = obj_type->pointer.base;
+            is_pointer = true;
+        }
+        
+        if (struct_type->kind == TYPE_STRUCT)
+        {
+            // Find field offset
+            int32_t offset = 0;
+            TypeField *field = NULL;
+            for (int i = 0; i < struct_type->structure.field_count; i++)
+            {
+                if (strcmp(struct_type->structure.fields[i].name, expr->field_expr.field) == 0)
+                {
+                    field = &struct_type->structure.fields[i];
+                    offset = (int32_t)field->offset;
+                    break;
+                }
+            }
+            
+            if (field)
+            {
+                if (is_pointer)
+                {
+                    // obj is a register containing the address
+                    if (obj.kind != MASM_OPERAND_REGISTER)
+                    {
+                        MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, obj));
+                        obj = rax;
+                    }
+                    
+                    return masm_operand_memory_simple(obj.reg.id, offset, field->type->size);
+                }
+                else
+                {
+                    // obj is a memory operand (struct on stack)
+                    if (obj.kind == MASM_OPERAND_MEMORY)
+                    {
+                        // Adjust displacement
+                        return masm_operand_memory_simple(obj.mem.base.id, obj.mem.disp + offset, field->type->size);
+                    }
+                }
+            }
+        }
+        return masm_operand_none();
+    }
     else if (expr->kind == AST_EXPR_STRUCT)
     {
         Type *type = expr->type;
