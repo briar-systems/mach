@@ -369,10 +369,64 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         uint32_t setcc_opcode = 0;
         bool is_comparison = false;
         
+
         switch (expr->binary_expr.op)
         {
-            case TOKEN_PLUS:  opcode = MASM_OP_ADD; break;
-            case TOKEN_MINUS: opcode = MASM_OP_SUB; break;
+            case TOKEN_PLUS: 
+                // Pointer arithmetic: ptr + int
+                if (expr->binary_expr.left->type && expr->binary_expr.left->type->kind == TYPE_POINTER)
+                {
+                    // Scale right operand
+                    int size = expr->binary_expr.left->type->pointer.base->size;
+                    if (size > 1)
+                    {
+                        // IMUL right_op, size
+                        // right_op is in RCX or is immediate.
+                        // If immediate, we can just multiply it.
+                        // If register, we need to multiply it.
+                        
+                        if (right_op.kind == MASM_OPERAND_IMM)
+                        {
+                            right_op.imm *= size;
+                        }
+                        else
+                        {
+                            // imul rcx, size
+                            masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, right_op, right_op, masm_operand_imm(size)));
+                        }
+                    }
+                }
+                else if (expr->binary_expr.right->type && expr->binary_expr.right->type->kind == TYPE_POINTER)
+                {
+                    // int + ptr -> ptr + int (commutative)
+                    // Scale left operand (which is in RAX)
+                    int size = expr->binary_expr.right->type->pointer.base->size;
+                    if (size > 1)
+                    {
+                         masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, result, result, masm_operand_imm(size)));
+                    }
+                }
+                break;
+            case TOKEN_MINUS: 
+                opcode = MASM_OP_SUB; 
+                // Pointer arithmetic: ptr - int
+                if (expr->binary_expr.left->type && expr->binary_expr.left->type->kind == TYPE_POINTER)
+                {
+                    // Scale right operand
+                    int size = expr->binary_expr.left->type->pointer.base->size;
+                    if (size > 1)
+                    {
+                        if (right_op.kind == MASM_OPERAND_IMM)
+                        {
+                            right_op.imm *= size;
+                        }
+                        else
+                        {
+                            masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, right_op, right_op, masm_operand_imm(size)));
+                        }
+                    }
+                }
+                break;
             case TOKEN_STAR:  opcode = MASM_OP_IMUL; break;
             case TOKEN_SLASH: 
                 opcode = MASM_OP_IDIV;
