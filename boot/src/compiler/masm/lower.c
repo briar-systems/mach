@@ -2,6 +2,7 @@
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/x86_64.h"
 #include "compiler/masm/abi/sysv64.h"
+#include "compiler/type.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -290,6 +291,18 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             {
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, left));
             }
+            else if (left.kind == MASM_OPERAND_MEMORY)
+            {
+                if (left.mem.size == 4)
+                {
+                    MasmOperand eax = masm_operand_register(MASM_X86_RAX, 4);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, eax, left));
+                }
+                else
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, left));
+                }
+            }
         }
         
         uint32_t opcode = 0;
@@ -474,6 +487,112 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         
         return result;
     }
+    else if (expr->kind == AST_EXPR_STRUCT)
+    {
+        Type *type = expr->type;
+        if (!type || type->kind != TYPE_STRUCT) return masm_operand_none();
+        
+        // allocate stack space
+        ctx->stack_offset -= type->size;
+        // align to 8 bytes
+        if (ctx->stack_offset % 8 != 0) ctx->stack_offset -= (8 - (ctx->stack_offset % 8));
+        
+        int32_t base_offset = ctx->stack_offset;
+        
+        // initialize fields
+        AstList *fields = expr->struct_expr.fields;
+        if (fields)
+        {
+            for (int i = 0; i < fields->count; i++)
+            {
+                AstNode *field_node = fields->items[i];
+                // field_node is AST_EXPR_FIELD
+                char *field_name = field_node->field_expr.field;
+                AstNode *init_expr = field_node->field_expr.object;
+                
+                // find field offset
+                size_t offset = 0;
+                Type *field_type = NULL;
+                for (int j = 0; j < type->structure.field_count; j++)
+                {
+                    if (strcmp(type->structure.fields[j].name, field_name) == 0)
+                    {
+                        offset = type->structure.fields[j].offset;
+                        field_type = type->structure.fields[j].type;
+                        break;
+                    }
+                }
+                
+                // evaluate init expr
+                MasmOperand init_op = lower_expr(masm, text, init_expr, ctx);
+                
+                // store to stack
+                // [rbp + base_offset + offset]
+                int32_t dest_disp = base_offset + (int32_t)offset;
+                MasmOperand dest = masm_operand_memory_simple(MASM_X86_RBP, dest_disp, field_type->size > 8 ? 8 : field_type->size);
+                
+                if (init_op.kind == MASM_OPERAND_REGISTER)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dest, init_op));
+                }
+                else if (init_op.kind == MASM_OPERAND_IMM)
+                {
+                    if (init_op.imm > 2147483647 || init_op.imm < -2147483648)
+                    {
+                         MasmOperand tmp = masm_operand_register(MASM_X86_RAX, 8);
+                         masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, init_op));
+                         masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dest, tmp));
+                    }
+                    else
+                    {
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dest, init_op));
+                    }
+                }
+                else if (init_op.kind == MASM_OPERAND_MEMORY)
+                {
+                    // Mem to Mem -> use register
+                    MasmOperand tmp = masm_operand_register(MASM_X86_RAX, 8); 
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, init_op));
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dest, tmp));
+                }
+            }
+        }
+        
+        return masm_operand_memory_simple(MASM_X86_RBP, base_offset, 8);
+    }
+    else if (expr->kind == AST_EXPR_FIELD)
+    {
+        MasmOperand obj_op = lower_expr(masm, text, expr->field_expr.object, ctx);
+        
+        if (obj_op.kind == MASM_OPERAND_MEMORY)
+        {
+            // find field offset
+            Type *obj_type = expr->field_expr.object->type;
+            if (obj_type && obj_type->kind == TYPE_STRUCT)
+            {
+                char *field_name = expr->field_expr.field;
+                size_t offset = 0;
+                Type *field_type = NULL;
+                
+                for (int i = 0; i < obj_type->structure.field_count; i++)
+                {
+                    if (strcmp(obj_type->structure.fields[i].name, field_name) == 0)
+                    {
+                        offset = obj_type->structure.fields[i].offset;
+                        field_type = obj_type->structure.fields[i].type;
+                        break;
+                    }
+                }
+                
+                if (field_type)
+                {
+                    // return new memory operand with offset
+                    return masm_operand_memory_simple(obj_op.mem.base.id, obj_op.mem.disp + offset, field_type->size > 8 ? 8 : field_type->size);
+                }
+            }
+        }
+        // TODO: handle pointers to structs
+    }
     
     return masm_operand_none();
 }
@@ -507,12 +626,28 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_VAR)
     {
+        // determine size
+        size_t size = 8;
+        if (stmt->type)
+        {
+            size = stmt->type->size;
+        }
+        else if (stmt->var_stmt.init && stmt->var_stmt.init->type)
+        {
+            size = stmt->var_stmt.init->type->size;
+        }
+        
+        if (size == 0) size = 8; // fallback
+        
+        // align size to 8 bytes for stack slots
+        if (size % 8 != 0) size += (8 - (size % 8));
+        
         // allocate space on stack for variable
-        ctx->stack_offset -= 8;  // allocate 8 bytes
+        ctx->stack_offset -= size;
         int32_t offset = ctx->stack_offset;
         
         // add to symbol table
-        add_local_var(ctx, stmt->var_stmt.name, offset, 8);
+        add_local_var(ctx, stmt->var_stmt.name, offset, size);
         
         // if there's an initializer, evaluate and store it
         if (stmt->var_stmt.init)
@@ -520,7 +655,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             MasmOperand value = lower_expr(masm, text, stmt->var_stmt.init, ctx);
             
             // store value to stack location [rbp + offset]
-            MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, offset, 8);
+            MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, offset, size > 8 ? 8 : size);
             
             // if value is in a register, store it directly
             if (value.kind == MASM_OPERAND_REGISTER)
@@ -533,6 +668,23 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                 MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, value));
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, temp));
+            }
+            else if (value.kind == MASM_OPERAND_MEMORY)
+            {
+                // Memory to Memory copy
+                int32_t src_disp = value.mem.disp;
+                int32_t dst_disp = offset;
+                
+                // copy in 8-byte chunks
+                for (size_t i = 0; i < size; i += 8)
+                {
+                    MasmOperand src_chunk = masm_operand_memory_simple(value.mem.base.id, src_disp + i, 8);
+                    MasmOperand dst_chunk = masm_operand_memory_simple(MASM_X86_RBP, dst_disp + i, 8);
+                    
+                    MasmOperand tmp = masm_operand_register(MASM_X86_RAX, 8);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src_chunk));
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst_chunk, tmp));
+                }
             }
         }
     }

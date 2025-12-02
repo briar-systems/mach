@@ -123,6 +123,26 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 else
                     emit_imm32(buffer, &offset, size, disp);
             }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst_reg >= 8) rex |= 0x04; // REX.R
+                if (base_reg >= 8) rex |= 0x01; // REX.B
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
+                emit_byte(buffer, &offset, size, 0x8B);  // MOV r32, r/m32
+                
+                // ModR/M byte
+                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t modrm = mod | ((dst_reg & 7) << 3) | (base_reg & 7);
+                emit_byte(buffer, &offset, size, modrm);
+                
+                // Displacement
+                if (mod == 0x40)
+                    emit_byte(buffer, &offset, size, (int8_t)disp);
+                else
+                    emit_imm32(buffer, &offset, size, disp);
+            }
         }
         // MOV [mem], reg - store to memory
         else if (inst.operand_count == 2 &&
@@ -151,6 +171,76 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                     emit_byte(buffer, &offset, size, (int8_t)disp);
                 else
                     emit_imm32(buffer, &offset, size, disp);
+            }
+            else if (inst.operands[1].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (src_reg >= 8) rex |= 0x04; // REX.R
+                if (base_reg >= 8) rex |= 0x01; // REX.B
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
+                emit_byte(buffer, &offset, size, 0x89);  // MOV r/m32, r32
+                
+                // ModR/M byte
+                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t modrm = mod | ((src_reg & 7) << 3) | (base_reg & 7);
+                emit_byte(buffer, &offset, size, modrm);
+                
+                // Displacement
+                if (mod == 0x40)
+                    emit_byte(buffer, &offset, size, (int8_t)disp);
+                else
+                    emit_imm32(buffer, &offset, size, disp);
+            }
+        }
+        // MOV [mem], imm
+        else if (inst.operand_count == 2 &&
+                 inst.operands[0].kind == MASM_OPERAND_MEMORY &&
+                 inst.operands[1].kind == MASM_OPERAND_IMM)
+        {
+            uint32_t base_reg = inst.operands[0].mem.base.id;
+            int32_t disp = (int32_t)inst.operands[0].mem.disp;
+            int64_t imm = inst.operands[1].imm;
+            uint8_t mem_size = inst.operands[0].mem.size;
+            
+            if (mem_size == 8)
+            {
+                // MOV r/m64, imm32 (sign extended)
+                uint8_t rex = 0x48;
+                if (base_reg >= 8) rex |= 0x01; // REX.B
+                emit_byte(buffer, &offset, size, rex);
+                emit_byte(buffer, &offset, size, 0xC7);
+                
+                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t modrm = mod | (0 << 3) | (base_reg & 7); // /0
+                emit_byte(buffer, &offset, size, modrm);
+                
+                if (mod == 0x40)
+                    emit_byte(buffer, &offset, size, (int8_t)disp);
+                else
+                    emit_imm32(buffer, &offset, size, disp);
+                    
+                emit_imm32(buffer, &offset, size, (int32_t)imm);
+            }
+            else if (mem_size == 4)
+            {
+                // MOV r/m32, imm32
+                uint8_t rex = 0;
+                if (base_reg >= 8) rex |= 0x01; // REX.B
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
+                emit_byte(buffer, &offset, size, 0xC7);
+                
+                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t modrm = mod | (0 << 3) | (base_reg & 7); // /0
+                emit_byte(buffer, &offset, size, modrm);
+                
+                if (mod == 0x40)
+                    emit_byte(buffer, &offset, size, (int8_t)disp);
+                else
+                    emit_imm32(buffer, &offset, size, disp);
+                    
+                emit_imm32(buffer, &offset, size, (int32_t)imm);
             }
         }
     }
