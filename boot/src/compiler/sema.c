@@ -2727,12 +2727,13 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
-        Type *elem_type = sema_resolve_type(sema, node->array_expr.type);
-        if (!elem_type)
+        Type *array_type = sema_resolve_type(sema, node->array_expr.type);
+        if (!array_type || array_type->kind != TYPE_ARRAY)
         {
-            sema_error(sema, node->token, "failed to resolve array element type");
+            sema_error(sema, node->token, "failed to resolve array type");
             return -1;
         }
+        Type *elem_type = array_type->array.elem_type;
 
         int elem_count = node->array_expr.elems ? node->array_expr.elems->count : 0;
 

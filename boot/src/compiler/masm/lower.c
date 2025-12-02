@@ -261,6 +261,50 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, ptr_reg, val_reg));
                 return ptr_reg;
             }
+            else if (expr->binary_expr.left->kind == AST_EXPR_INDEX || 
+                     expr->binary_expr.left->kind == AST_EXPR_FIELD)
+            {
+                // Generic lvalue assignment (index, field)
+                // 1. Evaluate LHS to memory operand
+                MasmOperand left_mem = lower_expr(masm, text, expr->binary_expr.left, ctx);
+                
+                // 2. Load effective address into RAX
+                MasmOperand addr = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, addr, left_mem));
+                
+                // 3. Push address
+                masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, addr));
+                
+                // 4. Evaluate RHS
+                MasmOperand val = lower_expr(masm, text, expr->binary_expr.right, ctx);
+                
+                // 5. Move val to RCX (to free RAX)
+                MasmOperand val_reg = masm_operand_register(MASM_X86_RCX, 8);
+                if (val.kind == MASM_OPERAND_REGISTER)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
+                }
+                else if (val.kind == MASM_OPERAND_IMM)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
+                }
+                else
+                {
+                    // memory to register
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
+                }
+                
+                // 6. Pop address to RAX
+                masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, addr));
+                
+                // 7. Store [RAX] = RCX
+                int size = expr->binary_expr.left->type->size;
+                MasmOperand dst = masm_operand_memory_simple(MASM_X86_RAX, 0, size);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val_reg));
+                
+                // 8. Return result in RAX
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, addr, val_reg));
+                return addr;
             }
 
             MasmOperand right_val = lower_expr(masm, text, expr->binary_expr.right, ctx);
@@ -696,6 +740,136 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
         return masm_operand_none();
     }
+    else if (expr->kind == AST_EXPR_ARRAY)
+    {
+        Type *type = expr->type;
+        if (!type || type->kind != TYPE_ARRAY) return masm_operand_none();
+        
+        // allocate stack space
+        ctx->stack_offset -= type->size;
+        // align to 8 bytes if needed (simple alignment for now)
+        if (ctx->stack_offset % 8 != 0) ctx->stack_offset -= (8 - (abs(ctx->stack_offset) % 8));
+        
+        int32_t base_offset = ctx->stack_offset;
+        Type *elem_type = type->array.elem_type;
+        int elem_size = elem_type->size;
+        
+        AstList *elems = expr->array_expr.elems;
+        if (elems)
+        {
+            for (int i = 0; i < elems->count; i++)
+            {
+                MasmOperand val = lower_expr(masm, text, elems->items[i], ctx);
+                int32_t elem_offset = base_offset + (i * elem_size);
+                MasmOperand dst = masm_operand_memory_simple(MASM_X86_RBP, elem_offset, elem_size);
+                
+                if (val.kind == MASM_OPERAND_REGISTER)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val));
+                }
+                else if (val.kind == MASM_OPERAND_IMM)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val));
+                }
+                else if (val.kind == MASM_OPERAND_MEMORY)
+                {
+                    // mem to mem copy
+                    MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, val));
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, rax));
+                }
+            }
+        }
+        
+        return masm_operand_memory_simple(MASM_X86_RBP, base_offset, type->size);
+    }
+
+    else if (expr->kind == AST_EXPR_INDEX)
+    {
+        // arr[i]
+        MasmOperand arr = lower_expr(masm, text, expr->index_expr.array, ctx);
+        MasmOperand idx = lower_expr(masm, text, expr->index_expr.index, ctx);
+        
+        Type *arr_type = expr->index_expr.array->type;
+        if (!arr_type) return masm_operand_none();
+        
+        Type *elem_type = NULL;
+        if (arr_type->kind == TYPE_ARRAY) elem_type = arr_type->array.elem_type;
+        else if (arr_type->kind == TYPE_POINTER) elem_type = arr_type->pointer.base;
+        else return masm_operand_none();
+        
+        int elem_size = elem_type->size;
+        
+        // Handle immediate index
+        if (idx.kind == MASM_OPERAND_IMM)
+        {
+            int64_t offset = idx.imm * elem_size;
+            
+            if (arr.kind == MASM_OPERAND_REGISTER)
+            {
+                // [reg + offset]
+                return masm_operand_memory_simple(arr.reg.id, offset, elem_size);
+            }
+            else if (arr.kind == MASM_OPERAND_MEMORY)
+            {
+                // [base + disp + offset]
+                return masm_operand_memory_simple(arr.mem.base.id, arr.mem.disp + offset, elem_size);
+            }
+        }
+        else
+        {
+            // Register index
+            MasmOperand idx_reg = idx;
+            if (idx.kind != MASM_OPERAND_REGISTER)
+            {
+                MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, idx));
+                idx_reg = rax;
+            }
+            
+            // Check if scale is valid (1, 2, 4, 8)
+            bool valid_scale = (elem_size == 1 || elem_size == 2 || elem_size == 4 || elem_size == 8);
+            
+            if (!valid_scale)
+            {
+                // Manual scaling: imul idx_reg, elem_size
+                // We need to move idx to a temp register if it's not already, to avoid clobbering if it's a variable?
+                // Actually lower_expr returns a result which is usually a temp or a variable.
+                // If it's a variable (memory), we already moved it to RAX above.
+                // If it's a register, we can multiply it in place if it's a temp (RAX/RCX).
+                // But if it's a variable in a register (not supported yet), we should be careful.
+                // For now, assume we can modify the register if it's RAX.
+                
+                if (idx_reg.reg.id != MASM_X86_RAX && idx_reg.reg.id != MASM_X86_RCX)
+                {
+                    MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, idx_reg));
+                    idx_reg = rax;
+                }
+                
+                masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, idx_reg, idx_reg, masm_operand_imm(elem_size)));
+                elem_size = 1; // scale is now 1
+            }
+            
+            if (arr.kind == MASM_OPERAND_REGISTER)
+            {
+                // [base + index * scale]
+                MasmRegister base = { arr.reg.id, 8 };
+                MasmRegister index = { idx_reg.reg.id, 8 };
+                return masm_operand_memory(base, index, elem_size, 0, elem_type->size);
+            }
+            else if (arr.kind == MASM_OPERAND_MEMORY)
+            {
+                // [base + disp + index * scale]
+                // arr.mem.base is usually RBP
+                MasmRegister base = arr.mem.base;
+                MasmRegister index = { idx_reg.reg.id, 8 };
+                return masm_operand_memory(base, index, elem_size, arr.mem.disp, elem_type->size);
+            }
+        }
+        
+        return masm_operand_none();
+    }
     else if (expr->kind == AST_EXPR_STRUCT)
     {
         Type *type = expr->type;
@@ -769,40 +943,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         
         return masm_operand_memory_simple(MASM_X86_RBP, base_offset, 8);
     }
-    else if (expr->kind == AST_EXPR_FIELD)
-    {
-        MasmOperand obj_op = lower_expr(masm, text, expr->field_expr.object, ctx);
-        
-        if (obj_op.kind == MASM_OPERAND_MEMORY)
-        {
-            // find field offset
-            Type *obj_type = expr->field_expr.object->type;
-            if (obj_type && obj_type->kind == TYPE_STRUCT)
-            {
-                char *field_name = expr->field_expr.field;
-                size_t offset = 0;
-                Type *field_type = NULL;
-                
-                for (int i = 0; i < obj_type->structure.field_count; i++)
-                {
-                    if (strcmp(obj_type->structure.fields[i].name, field_name) == 0)
-                    {
-                        offset = obj_type->structure.fields[i].offset;
-                        field_type = obj_type->structure.fields[i].type;
-                        break;
-                    }
-                }
-                
-                if (field_type)
-                {
-                    // return new memory operand with offset
-                    return masm_operand_memory_simple(obj_op.mem.base.id, obj_op.mem.disp + offset, field_type->size > 8 ? 8 : field_type->size);
-                }
-            }
-        }
-        // TODO: handle pointers to structs
-    }
-    
+    return masm_operand_none();
+}
     return masm_operand_none();
 }
 
