@@ -1,7 +1,7 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#include "compiler/mir/target.h"
+#include "compiler/masm/target.h"
 
 #include <stdbool.h>
 
@@ -57,9 +57,9 @@ typedef struct ConfigDepVersion
 typedef struct ConfigTarget
 {
     char             *name;       // target name
-    MIRTargetOS       os;         // target operating system
-    MIRTargetISA      isa;        // target ISA
-    MIRTargetABI      abi;        // target ABI
+    MasmTargetOS      os;         // target operating system
+    MasmTargetISA     isa;        // target ISA
+    MasmTargetABI     abi;        // target ABI
     ConfigTargetMode *mode;       // build mode: executable|library
     char             *entrypoint; // main source file (relative to src_dir)
     char             *artifacts;  // artifacts directory (relative to out_dir)

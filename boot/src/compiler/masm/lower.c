@@ -376,8 +376,33 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     {
         // evaluate arguments
         AstList *args = expr->call_expr.args;
+        int stack_args = 0;
         if (args)
         {
+            // push stack arguments (reverse order)
+            for (int i = args->count - 1; i >= 6; i--)
+            {
+                MasmOperand arg_op = lower_expr(masm, text, args->items[i], ctx);
+                
+                if (arg_op.kind == MASM_OPERAND_REGISTER)
+                {
+                    masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, arg_op));
+                }
+                else if (arg_op.kind == MASM_OPERAND_IMM)
+                {
+                    // PUSH imm is valid
+                    masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, arg_op));
+                }
+                else
+                {
+                    MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, arg_op));
+                    masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, rax));
+                }
+                stack_args++;
+            }
+            
+            // register arguments (forward order)
             for (int i = 0; i < args->count && i < 6; i++)
             {
                 // evaluate arg
@@ -407,6 +432,13 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         else
         {
             // TODO: indirect call
+        }
+        
+        // clean up stack arguments
+        if (stack_args > 0)
+        {
+            MasmOperand rsp = masm_operand_register(MASM_X86_RSP, 8);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, rsp, masm_operand_imm(stack_args * 8)));
         }
         
         return masm_operand_register(MASM_X86_RAX, 8);
@@ -888,6 +920,20 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
                 MasmOperand src = masm_operand_register(reg, 8);
                 MasmOperand dst = masm_operand_memory_simple(MASM_X86_RBP, offset, 8);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+            }
+            else
+            {
+                // stack parameter
+                // [rbp + 16 + (i-6)*8]
+                int32_t stack_param_offset = 16 + (i - 6) * 8;
+                MasmOperand src = masm_operand_memory_simple(MASM_X86_RBP, stack_param_offset, 8);
+                MasmOperand dst = masm_operand_memory_simple(MASM_X86_RBP, offset, 8);
+                MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                
+                // mov rax, [rbp + offset]
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, src));
+                // mov [rbp - local], rax
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, rax));
             }
         }
     }

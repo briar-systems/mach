@@ -443,6 +443,22 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 emit_byte(buffer, &offset, size, 0x50 + (reg & 7));
             }
         }
+        else if (inst.operand_count == 1 && inst.operands[0].kind == MASM_OPERAND_IMM)
+        {
+            int64_t imm = inst.operands[0].imm;
+            if (imm >= -128 && imm <= 127)
+            {
+                // 6A ib: PUSH imm8
+                emit_byte(buffer, &offset, size, 0x6A);
+                emit_byte(buffer, &offset, size, (int8_t)imm);
+            }
+            else
+            {
+                // 68 id: PUSH imm32
+                emit_byte(buffer, &offset, size, 0x68);
+                emit_imm32(buffer, &offset, size, (int32_t)imm);
+            }
+        }
     }
     else if (inst.opcode == MASM_OP_POP)
     {
