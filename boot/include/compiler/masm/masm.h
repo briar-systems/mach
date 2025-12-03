@@ -32,4 +32,7 @@ MasmSection *masm_get_or_create_section(Masm *masm, const char *name, MasmSectio
 MasmSymbol  *masm_get_symbol(Masm *masm, const char *name);
 void         masm_add_symbol(Masm *masm, MasmSymbol *symbol);
 
+// module management
+void         masm_merge(Masm *dest, Masm *src);
+
 #endif // MASM_H

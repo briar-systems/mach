@@ -34,6 +34,8 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
 {
     size_t offset = 0;
     
+    printf("Encoding opcode %d\n", inst.opcode);
+    
     if (inst.opcode == MASM_OP_RET)
     {
         emit_byte(buffer, &offset, size, 0xC3);
@@ -90,6 +92,18 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                  if (src >= 8) rex |= 0x04; // REX.R
                  if (dst >= 8) rex |= 0x01; // REX.B
                  emit_byte(buffer, &offset, size, rex);
+                 emit_byte(buffer, &offset, size, 0x89);
+                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
+                 emit_byte(buffer, &offset, size, modrm);
+             }
+             else if (inst.operands[0].reg.size == 4 && inst.operands[1].reg.size == 4)
+             {
+                 // printf("MOV r32, r32\n");
+                 uint8_t rex = 0;
+                 if (src >= 8) rex |= 0x04; // REX.R
+                 if (dst >= 8) rex |= 0x01; // REX.B
+                 if (rex) emit_byte(buffer, &offset, size, rex);
+                 
                  emit_byte(buffer, &offset, size, 0x89);
                  uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                  emit_byte(buffer, &offset, size, modrm);
@@ -504,6 +518,17 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
             }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x01;
+                if (src >= 8) rex |= 0x04;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
+                emit_byte(buffer, &offset, size, 0x01);
+                uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
+                emit_byte(buffer, &offset, size, modrm);
+            }
         }
         else if (inst.operand_count == 2 &&
                  inst.operands[0].kind == MASM_OPERAND_REGISTER &&
@@ -518,6 +543,27 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 
                 // 81 /0 id: ADD r/m64, imm32
                 // 83 /0 ib: ADD r/m64, imm8
+                if (imm >= -128 && imm <= 127)
+                {
+                    emit_byte(buffer, &offset, size, 0x83);
+                    uint8_t modrm = 0xC0 | (0 << 3) | (dst & 7);
+                    emit_byte(buffer, &offset, size, modrm);
+                    emit_byte(buffer, &offset, size, (int8_t)imm);
+                }
+                else
+                {
+                    emit_byte(buffer, &offset, size, 0x81);
+                    uint8_t modrm = 0xC0 | (0 << 3) | (dst & 7);
+                    emit_byte(buffer, &offset, size, modrm);
+                    emit_imm32(buffer, &offset, size, (int32_t)imm);
+                }
+            }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x01;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
                 if (imm >= -128 && imm <= 127)
                 {
                     emit_byte(buffer, &offset, size, 0x83);
@@ -551,6 +597,17 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
             }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x01;
+                if (src >= 8) rex |= 0x04;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
+                emit_byte(buffer, &offset, size, 0x21);
+                uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
+                emit_byte(buffer, &offset, size, modrm);
+            }
         }
         else if (inst.operand_count == 2 &&
                  inst.operands[0].kind == MASM_OPERAND_REGISTER &&
@@ -565,6 +622,27 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 
                 // 81 /4 id: AND r/m64, imm32
                 // 83 /4 ib: AND r/m64, imm8
+                if (imm >= -128 && imm <= 127)
+                {
+                    emit_byte(buffer, &offset, size, 0x83);
+                    uint8_t modrm = 0xC0 | (4 << 3) | (dst & 7);
+                    emit_byte(buffer, &offset, size, modrm);
+                    emit_byte(buffer, &offset, size, (int8_t)imm);
+                }
+                else
+                {
+                    emit_byte(buffer, &offset, size, 0x81);
+                    uint8_t modrm = 0xC0 | (4 << 3) | (dst & 7);
+                    emit_byte(buffer, &offset, size, modrm);
+                    emit_imm32(buffer, &offset, size, (int32_t)imm);
+                }
+            }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x01;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
                 if (imm >= -128 && imm <= 127)
                 {
                     emit_byte(buffer, &offset, size, 0x83);
@@ -598,6 +676,17 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
             }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x01;
+                if (src >= 8) rex |= 0x04;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
+                emit_byte(buffer, &offset, size, 0x29);
+                uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
+                emit_byte(buffer, &offset, size, modrm);
+            }
         }
         else if (inst.operand_count == 2 &&
                  inst.operands[0].kind == MASM_OPERAND_REGISTER &&
@@ -612,6 +701,27 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 
                 // 81 /5 id: SUB r/m64, imm32
                 // 83 /5 ib: SUB r/m64, imm8
+                if (imm >= -128 && imm <= 127)
+                {
+                    emit_byte(buffer, &offset, size, 0x83);
+                    uint8_t modrm = 0xC0 | (5 << 3) | (dst & 7);
+                    emit_byte(buffer, &offset, size, modrm);
+                    emit_byte(buffer, &offset, size, (int8_t)imm);
+                }
+                else
+                {
+                    emit_byte(buffer, &offset, size, 0x81);
+                    uint8_t modrm = 0xC0 | (5 << 3) | (dst & 7);
+                    emit_byte(buffer, &offset, size, modrm);
+                    emit_imm32(buffer, &offset, size, (int32_t)imm);
+                }
+            }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x01;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
                 if (imm >= -128 && imm <= 127)
                 {
                     emit_byte(buffer, &offset, size, 0x83);
@@ -646,6 +756,18 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 uint8_t modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
                 emit_byte(buffer, &offset, size, modrm);
             }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x04;
+                if (src >= 8) rex |= 0x01;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
+                emit_byte(buffer, &offset, size, 0x0F);
+                emit_byte(buffer, &offset, size, 0xAF);
+                uint8_t modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
+                emit_byte(buffer, &offset, size, modrm);
+            }
         }
     }
     else if (inst.opcode == MASM_OP_IDIV)
@@ -658,6 +780,16 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
+                emit_byte(buffer, &offset, size, 0xF7);
+                uint8_t modrm = 0xF8 | (divisor & 7);
+                emit_byte(buffer, &offset, size, modrm);
+            }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (divisor >= 8) rex |= 0x01;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
                 emit_byte(buffer, &offset, size, 0xF7);
                 uint8_t modrm = 0xF8 | (divisor & 7);
                 emit_byte(buffer, &offset, size, modrm);
@@ -685,6 +817,17 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
             }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x01;
+                if (src >= 8) rex |= 0x04;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
+                emit_byte(buffer, &offset, size, 0x39);
+                uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
+                emit_byte(buffer, &offset, size, modrm);
+            }
         }
         else if (inst.operand_count == 2 &&
                  inst.operands[0].kind == MASM_OPERAND_REGISTER &&
@@ -699,6 +842,27 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 
                 // 81 /7 id: CMP r/m64, imm32
                 // 83 /7 ib: CMP r/m64, imm8
+                if (imm >= -128 && imm <= 127)
+                {
+                    emit_byte(buffer, &offset, size, 0x83);
+                    uint8_t modrm = 0xC0 | (7 << 3) | (dst & 7);
+                    emit_byte(buffer, &offset, size, modrm);
+                    emit_byte(buffer, &offset, size, (int8_t)imm);
+                }
+                else
+                {
+                    emit_byte(buffer, &offset, size, 0x81);
+                    uint8_t modrm = 0xC0 | (7 << 3) | (dst & 7);
+                    emit_byte(buffer, &offset, size, modrm);
+                    emit_imm32(buffer, &offset, size, (int32_t)imm);
+                }
+            }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x01;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
                 if (imm >= -128 && imm <= 127)
                 {
                     emit_byte(buffer, &offset, size, 0x83);
@@ -741,6 +905,17 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
+                emit_byte(buffer, &offset, size, 0x85);
+                uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
+                emit_byte(buffer, &offset, size, modrm);
+            }
+            else if (inst.operands[0].reg.size == 4)
+            {
+                uint8_t rex = 0;
+                if (dst >= 8) rex |= 0x01;
+                if (src >= 8) rex |= 0x04;
+                if (rex) emit_byte(buffer, &offset, size, rex);
+                
                 emit_byte(buffer, &offset, size, 0x85);
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
@@ -814,6 +989,7 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             uint32_t reg = inst.operands[0].reg.id;
             if (inst.operands[0].reg.size == 8)
             {
+                // printf("POP r64 %d\n", reg);
                 // 58+rd: POP r64
                 if (reg > 7)
                 {

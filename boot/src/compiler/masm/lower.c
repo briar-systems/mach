@@ -77,18 +77,48 @@ static LocalVar *find_local_var(LowerContext *ctx, const char *name)
 
 static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContext *ctx);
 static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx);
-static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content);
-static MasmOperand parse_operand(const char *str);
+static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content, LowerContext *ctx);
+static MasmOperand parse_operand(const char *str, LowerContext *ctx);
 
 static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
 {
     (void)masm;
+    fprintf(stderr, "lower_expr kind: %d\n", expr->kind);
     
     if (expr->kind == AST_EXPR_LIT)
     {
         if (expr->lit_expr.kind == TOKEN_LIT_INT)
         {
             return masm_operand_imm((int64_t)expr->lit_expr.int_val);
+        }
+        else if (expr->lit_expr.kind == TOKEN_LIT_STRING)
+        {
+            // Create unique label
+            static int str_counter = 0;
+            char label[32];
+            snprintf(label, sizeof(label), ".Lstr_%d", str_counter++);
+            
+            // Add to .rodata
+            MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
+            
+            // Add label symbol
+            MasmSymbol *sym = masm_symbol_create(label, MASM_SYMBOL_DATA, MASM_BIND_LOCAL);
+            sym->section_name = strdup(".rodata");
+            sym->offset = rodata->data_size;
+            size_t len = strlen(expr->lit_expr.string_val);
+            sym->size = len + 1;
+            masm_add_symbol(masm, sym);
+            
+            // Append data
+            masm_section_append_data(rodata, expr->lit_expr.string_val, len + 1);
+            
+            // Return address of string
+            MasmOperand res = masm_operand_register(MASM_X86_RAX, 8);
+            MasmOperand src = masm_operand_label(strdup(label));
+            
+            // MOV RAX, label (absolute address)
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, res, src));
+            return res;
         }
     }
     else if (expr->kind == AST_EXPR_IDENT)
@@ -97,11 +127,34 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         LocalVar *var = find_local_var(ctx, expr->ident_expr.name);
         if (var)
         {
+            fprintf(stderr, "Loading local var %s from offset %d\n", expr->ident_expr.name, var->offset);
             // load variable from [rbp + offset] into RAX
             MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
             MasmOperand result = masm_operand_register(MASM_X86_RAX, var->size);
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, var_mem));
             return result;
+        }
+        else
+        {
+            fprintf(stderr, "Looking for global var %s\n", expr->ident_expr.name);
+            // Check global
+            MasmSymbol *sym = masm_get_symbol(masm, expr->ident_expr.name);
+            if (sym)
+            {
+                fprintf(stderr, "Found global var %s\n", sym->name);
+                // Load address
+                MasmOperand addr = masm_operand_register(MASM_X86_RAX, 8);
+                MasmOperand label_op = masm_operand_label(strdup(sym->name));
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, addr, label_op));
+                
+                // Load value
+                // [RAX]
+                MasmOperand mem = masm_operand_memory_simple(MASM_X86_RAX, 0, sym->size > 8 ? 8 : sym->size);
+                MasmOperand result = masm_operand_register(MASM_X86_RAX, sym->size > 8 ? 8 : sym->size);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, mem));
+                
+                return result;
+            }
         }
         // if not found, fall through to return none
     }
@@ -347,15 +400,21 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         bool pushed = false;
         if (left.kind == MASM_OPERAND_REGISTER && left.reg.id == MASM_X86_RAX)
         {
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, left));
+            // Promote to 64-bit for PUSH (PUSH r32 is not valid in 64-bit mode)
+            MasmOperand push_op = left;
+            push_op.reg.size = 8;
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, push_op));
             pushed = true;
         }
         
         MasmOperand right = lower_expr(masm, text, expr->binary_expr.right, ctx);
         
         MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
+        if (left.kind == MASM_OPERAND_REGISTER) result.reg.size = left.reg.size;
+        else if (left.kind == MASM_OPERAND_MEMORY) result.reg.size = left.mem.size;
+        
         MasmOperand right_op = right;
-        MasmOperand rcx = masm_operand_register(MASM_X86_RCX, 8);
+        MasmOperand rcx = masm_operand_register(MASM_X86_RCX, result.reg.size);
         
         if (pushed)
         {
@@ -363,7 +422,11 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             // Move right to RCX to free up RAX for left.
             if (right.kind == MASM_OPERAND_REGISTER && right.reg.id == MASM_X86_RAX)
             {
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, right));
+                // Ensure right operand size matches RCX size for MOV
+                MasmOperand src = right;
+                if (src.reg.size != rcx.reg.size) src.reg.size = rcx.reg.size; // Assume zero extension/truncation handled by MOV
+                
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, src));
                 right_op = rcx;
             }
             else if (right.kind == MASM_OPERAND_IMM)
@@ -373,8 +436,10 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 right_op = rcx;
             }
             
-            // Pop left back into RAX
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, result));
+            // Pop left back into RAX (POP r32 is invalid)
+            MasmOperand pop_op = result;
+            pop_op.reg.size = 8;
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, pop_op));
         }
         else
         {
@@ -416,107 +481,115 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         uint32_t setcc_opcode = 0;
         bool is_comparison = false;
         
-
-        switch (expr->binary_expr.op)
+        if (expr->binary_expr.op == TOKEN_PLUS)
         {
-            case TOKEN_PLUS: 
-                // Pointer arithmetic: ptr + int
-                if (expr->binary_expr.left->type && expr->binary_expr.left->type->kind == TYPE_POINTER)
+            opcode = MASM_OP_ADD;
+            // Pointer arithmetic: ptr + int
+            if (expr->binary_expr.left->type && expr->binary_expr.left->type->kind == TYPE_POINTER)
+            {
+                // Scale right operand
+                int size = expr->binary_expr.left->type->pointer.base->size;
+                if (size > 1)
                 {
-                    // Scale right operand
-                    int size = expr->binary_expr.left->type->pointer.base->size;
-                    if (size > 1)
+                    // IMUL right_op, size
+                    // right_op is in RCX or is immediate.
+                    // If immediate, we can just multiply it.
+                    // If register, we need to multiply it.
+                    
+                    if (right_op.kind == MASM_OPERAND_IMM)
                     {
-                        // IMUL right_op, size
-                        // right_op is in RCX or is immediate.
-                        // If immediate, we can just multiply it.
-                        // If register, we need to multiply it.
-                        
-                        if (right_op.kind == MASM_OPERAND_IMM)
-                        {
-                            right_op.imm *= size;
-                        }
-                        else
-                        {
-                            // imul rcx, size
-                            masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, right_op, right_op, masm_operand_imm(size)));
-                        }
+                        right_op.imm *= size;
+                    }
+                    else
+                    {
+                        // imul rcx, size
+                        masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, right_op, right_op, masm_operand_imm(size)));
                     }
                 }
-                else if (expr->binary_expr.right->type && expr->binary_expr.right->type->kind == TYPE_POINTER)
+            }
+            else if (expr->binary_expr.right->type && expr->binary_expr.right->type->kind == TYPE_POINTER)
+            {
+                // int + ptr -> ptr + int (commutative)
+                // Scale left operand (which is in RAX)
+                int size = expr->binary_expr.right->type->pointer.base->size;
+                if (size > 1)
                 {
-                    // int + ptr -> ptr + int (commutative)
-                    // Scale left operand (which is in RAX)
-                    int size = expr->binary_expr.right->type->pointer.base->size;
-                    if (size > 1)
+                     masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, result, result, masm_operand_imm(size)));
+                }
+            }
+        }
+        else if (expr->binary_expr.op == TOKEN_MINUS)
+        {
+            opcode = MASM_OP_SUB; 
+            // Pointer arithmetic: ptr - int
+            if (expr->binary_expr.left->type && expr->binary_expr.left->type->kind == TYPE_POINTER)
+            {
+                // Scale right operand
+                int size = expr->binary_expr.left->type->pointer.base->size;
+                if (size > 1)
+                {
+                    if (right_op.kind == MASM_OPERAND_IMM)
                     {
-                         masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, result, result, masm_operand_imm(size)));
+                        right_op.imm *= size;
+                    }
+                    else
+                    {
+                        masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, right_op, right_op, masm_operand_imm(size)));
                     }
                 }
-                break;
-            case TOKEN_MINUS: 
-                opcode = MASM_OP_SUB; 
-                // Pointer arithmetic: ptr - int
-                if (expr->binary_expr.left->type && expr->binary_expr.left->type->kind == TYPE_POINTER)
-                {
-                    // Scale right operand
-                    int size = expr->binary_expr.left->type->pointer.base->size;
-                    if (size > 1)
-                    {
-                        if (right_op.kind == MASM_OPERAND_IMM)
-                        {
-                            right_op.imm *= size;
-                        }
-                        else
-                        {
-                            masm_section_append_inst(text, masm_inst_3(MASM_OP_IMUL, right_op, right_op, masm_operand_imm(size)));
-                        }
-                    }
-                }
-                break;
-            case TOKEN_STAR:  opcode = MASM_OP_IMUL; break;
-            case TOKEN_SLASH: 
-                opcode = MASM_OP_IDIV;
-                break;
-            
-            case TOKEN_AMPERSAND:
-                opcode = MASM_OP_AND;
-                break;
-            
-            // comparison operators
-            case TOKEN_EQUAL_EQUAL:
-                opcode = MASM_OP_CMP;
-                setcc_opcode = MASM_OP_SETE;
-                is_comparison = true;
-                break;
-            case TOKEN_BANG_EQUAL:
-                opcode = MASM_OP_CMP;
-                setcc_opcode = MASM_OP_SETNE;
-                is_comparison = true;
-                break;
-            case TOKEN_LESS:
-                opcode = MASM_OP_CMP;
-                setcc_opcode = MASM_OP_SETL;
-                is_comparison = true;
-                break;
-            case TOKEN_GREATER:
-                opcode = MASM_OP_CMP;
-                setcc_opcode = MASM_OP_SETG;
-                is_comparison = true;
-                break;
-            case TOKEN_LESS_EQUAL:
-                opcode = MASM_OP_CMP;
-                setcc_opcode = MASM_OP_SETLE;
-                is_comparison = true;
-                break;
-            case TOKEN_GREATER_EQUAL:
-                opcode = MASM_OP_CMP;
-                setcc_opcode = MASM_OP_SETGE;
-                is_comparison = true;
-                break;
-            
-            default:
-                return masm_operand_none();
+            }
+        }
+        else if (expr->binary_expr.op == TOKEN_STAR)
+        {
+            opcode = MASM_OP_IMUL;
+        }
+        else if (expr->binary_expr.op == TOKEN_SLASH)
+        {
+            opcode = MASM_OP_IDIV;
+        }
+        else if (expr->binary_expr.op == TOKEN_AMPERSAND)
+        {
+            opcode = MASM_OP_AND;
+        }
+        else if (expr->binary_expr.op == TOKEN_EQUAL_EQUAL)
+        {
+            opcode = MASM_OP_CMP;
+            setcc_opcode = MASM_OP_SETE;
+            is_comparison = true;
+        }
+        else if (expr->binary_expr.op == TOKEN_BANG_EQUAL)
+        {
+            opcode = MASM_OP_CMP;
+            setcc_opcode = MASM_OP_SETNE;
+            is_comparison = true;
+        }
+        else if (expr->binary_expr.op == TOKEN_LESS)
+        {
+            opcode = MASM_OP_CMP;
+            setcc_opcode = MASM_OP_SETL;
+            is_comparison = true;
+        }
+        else if (expr->binary_expr.op == TOKEN_GREATER)
+        {
+            opcode = MASM_OP_CMP;
+            setcc_opcode = MASM_OP_SETG;
+            is_comparison = true;
+        }
+        else if (expr->binary_expr.op == TOKEN_LESS_EQUAL)
+        {
+            opcode = MASM_OP_CMP;
+            setcc_opcode = MASM_OP_SETLE;
+            is_comparison = true;
+        }
+        else if (expr->binary_expr.op == TOKEN_GREATER_EQUAL)
+        {
+            opcode = MASM_OP_CMP;
+            setcc_opcode = MASM_OP_SETGE;
+            is_comparison = true;
+        }
+        else
+        {
+            return masm_operand_none();
         }
         
         if (is_comparison)
@@ -980,6 +1053,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_VAR)
     {
+        fprintf(stderr, "Lowering local var %s\n", stmt->var_stmt.name);
         // determine size
         size_t size = 8;
         if (stmt->type)
@@ -1006,6 +1080,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         // if there's an initializer, evaluate and store it
         if (stmt->var_stmt.init)
         {
+            fprintf(stderr, "Var %s has init\n", stmt->var_stmt.name);
             MasmOperand value = lower_expr(masm, text, stmt->var_stmt.init, ctx);
             
             // store value to stack location [rbp + offset]
@@ -1060,7 +1135,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         if (stmt->masm_stmt.content)
         {
             // parse inline masm content and emit instructions
-            lower_inline_masm(masm, text, stmt->masm_stmt.content);
+            lower_inline_masm(masm, text, stmt->masm_stmt.content, ctx);
         }
     }
     else if (stmt->kind == AST_STMT_IF)
@@ -1306,7 +1381,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
 }
 
-static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content)
+static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content, LowerContext *ctx)
 {
     (void)masm;
     
@@ -1359,8 +1434,8 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 while (*dest == ' ') dest++;
                 while (*src == ' ') src++;
                 
-                MasmOperand dst_op = parse_operand(dest);
-                MasmOperand src_op = parse_operand(src);
+                MasmOperand dst_op = parse_operand(dest, ctx);
+                MasmOperand src_op = parse_operand(src, ctx);
                 
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_CMP, dst_op, src_op));
             }
@@ -1379,8 +1454,8 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 while (*dest == ' ') dest++;
                 while (*src == ' ') src++;
                 
-                MasmOperand dst_op = parse_operand(dest);
-                MasmOperand src_op = parse_operand(src);
+                MasmOperand dst_op = parse_operand(dest, ctx);
+                MasmOperand src_op = parse_operand(src, ctx);
                 
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_XOR, dst_op, src_op));
             }
@@ -1389,7 +1464,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
         {
             char *reg = token + 5;
             while (*reg == ' ') reg++;
-            MasmOperand dst_op = parse_operand(reg);
+            MasmOperand dst_op = parse_operand(reg, ctx);
             masm_section_append_inst(text, masm_inst_1(MASM_OP_SETE, dst_op));
         }
         else if (strncmp(token, "mov ", 4) == 0)
@@ -1408,8 +1483,8 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 while (*src == ' ') src++;
                 
                 // parse destination register
-                MasmOperand dst_op = parse_operand(dest);
-                MasmOperand src_op = parse_operand(src);
+                MasmOperand dst_op = parse_operand(dest, ctx);
+                MasmOperand src_op = parse_operand(src, ctx);
                 
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst_op, src_op));
             }
@@ -1421,7 +1496,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
     free(line);
 }
 
-static MasmOperand parse_operand(const char *str)
+static MasmOperand parse_operand(const char *str, LowerContext *ctx)
 {
     // parse register or immediate
     if (strcmp(str, "rax") == 0) return masm_operand_register(MASM_X86_RAX, 8);
@@ -1435,9 +1510,24 @@ static MasmOperand parse_operand(const char *str)
     // parse immediate (number)
     char *end;
     long val = strtol(str, &end, 10);
-    if (*end == '\0')
+    if (str != end && *end == '\0')
     {
         return masm_operand_imm(val);
+    }
+    
+    // parse variable
+    if (ctx)
+    {
+        LocalVar *var = find_local_var(ctx, str);
+        if (var)
+        {
+            fprintf(stderr, "Found inline masm var %s at offset %d\n", str, var->offset);
+            return masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
+        }
+        else
+        {
+             fprintf(stderr, "Inline masm var %s not found\n", str);
+        }
     }
     
     return masm_operand_none();
@@ -1541,6 +1631,8 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
     destroy_context(ctx);
 }
 
+static void lower_global_var(Masm *masm, AstNode *stmt);
+
 Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
 {
     MasmTarget target = masm_target_native();
@@ -1556,8 +1648,83 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
             {
                 lower_function(masm, decl, symbols);
             }
+            else if (decl->kind == AST_STMT_VAR)
+            {
+                lower_global_var(masm, decl);
+            }
         }
     }
     
     return masm;
+}
+
+static void lower_global_var(Masm *masm, AstNode *stmt)
+{
+    const char *name = stmt->var_stmt.name;
+    fprintf(stderr, "Lowering global var %s\n", name);
+    
+    // Determine size
+    size_t size = 8;
+    if (stmt->type)
+    {
+        size = stmt->type->size;
+    }
+    else if (stmt->var_stmt.init && stmt->var_stmt.init->type)
+    {
+        size = stmt->var_stmt.init->type->size;
+    }
+    
+    if (size == 0) size = 8;
+
+    // Determine section and initial value
+    bool is_bss = true;
+    uint64_t init_val = 0;
+    
+    if (stmt->var_stmt.init)
+    {
+        // printf("Global var %s init kind: %d\n", name, stmt->var_stmt.init->kind);
+        if (stmt->var_stmt.init->kind == AST_EXPR_LIT)
+        {
+            // printf("Lit kind: %d\n", stmt->var_stmt.init->lit_expr.kind);
+            if (stmt->var_stmt.init->lit_expr.kind == TOKEN_LIT_INT)
+            {
+                is_bss = false;
+                init_val = stmt->var_stmt.init->lit_expr.int_val;
+                // printf("Int val: %ld\n", init_val);
+            }
+        }
+    }
+    
+    MasmSection *section;
+    if (is_bss)
+    {
+        section = masm_get_or_create_section(masm, ".bss", MASM_SECTION_BSS);
+    }
+    else
+    {
+        section = masm_get_or_create_section(masm, ".data", MASM_SECTION_DATA);
+    }
+    
+    // Create symbol
+    MasmSymbol *sym = masm_symbol_create(name, MASM_SYMBOL_DATA, MASM_BIND_GLOBAL);
+    sym->section_name = strdup(section->name);
+    sym->offset = section->data_size;
+    sym->size = size;
+    
+    masm_add_symbol(masm, sym);
+    
+    // Append data
+    if (is_bss)
+    {
+        masm_section_append_zero(section, size);
+    }
+    else
+    {
+        // Write value (little endian)
+        masm_section_append_data(section, &init_val, size > 8 ? 8 : size);
+        if (size > 8)
+        {
+            masm_section_append_zero(section, size - 8);
+        }
+    }
 }

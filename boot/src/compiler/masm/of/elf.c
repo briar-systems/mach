@@ -60,6 +60,10 @@ int masm_elf_write(Masm *masm, const char *filename)
     if (!f) return -1;
 
     MasmSection *text = masm_get_section(masm, ".text");
+    MasmSection *rodata = masm_get_section(masm, ".rodata");
+    MasmSection *data = masm_get_section(masm, ".data");
+    MasmSection *bss = masm_get_section(masm, ".bss");
+
     if (!text)
     {
         fclose(f);
@@ -84,6 +88,12 @@ int masm_elf_write(Masm *masm, const char *filename)
                 }
             }
         }
+        else if (inst->opcode == MASM_OP_MOV && inst->operands[1].kind == MASM_OPERAND_LABEL)
+        {
+            // MOV reg64, label -> MOV reg64, imm64
+            // Size is 10 bytes (2 opcode + 8 immediate)
+            current_offset += 10;
+        }
         else
         {
             size_t sz = masm_x86_encode(*inst, dummy_buffer, sizeof(dummy_buffer));
@@ -91,17 +101,118 @@ int masm_elf_write(Masm *masm, const char *filename)
         }
     }
     
-    size_t total_code_size = current_offset;
-
-    uint8_t *code_buffer = malloc(total_code_size);
-    size_t code_size = 0;
+    size_t text_size = current_offset;
     
+    // Layout
+    uint64_t base_addr = 0x400000;
+    
+    // Segment 1: Text + Rodata
+    uint64_t seg1_offset = 0x1000;
+    uint64_t seg1_vaddr = base_addr + seg1_offset;
+    size_t   seg1_filesz = text_size;
+    size_t   seg1_memsz = text_size;
+    
+    size_t rodata_size = rodata ? rodata->data_size : 0;
+    size_t rodata_start_offset = text_size;
+    
+    if (rodata_size > 0) {
+        // Align rodata to 16 bytes
+        size_t padding = (16 - (seg1_filesz % 16)) % 16;
+        seg1_filesz += padding;
+        seg1_memsz += padding;
+        rodata_start_offset = seg1_filesz;
+        
+        seg1_filesz += rodata_size;
+        seg1_memsz += rodata_size;
+    }
+
+    // Segment 2: Data + BSS
+    // Align to page boundary (0x1000)
+    uint64_t seg2_offset = (seg1_offset + seg1_filesz + 0xFFF) & ~0xFFF;
+    uint64_t seg2_vaddr = base_addr + seg2_offset;
+    size_t   seg2_filesz = 0;
+    size_t   seg2_memsz = 0;
+    
+    size_t data_size = data ? data->data_size : 0;
+    size_t bss_size = bss ? bss->data_size : 0;
+    
+    if (data_size > 0 || bss_size > 0) {
+        seg2_filesz = data_size + bss_size;
+        seg2_memsz = seg2_filesz;
+        printf("Data size: %zu, BSS size: %zu\n", data_size, bss_size);
+        if (data_size > 0) {
+            printf("Data content: %02x %02x %02x %02x\n", data->data[0], data->data[1], data->data[2], data->data[3]);
+        }
+    }
+
+    int phnum = 1;
+    if (seg2_memsz > 0) phnum++;
+
     uint64_t entry_offset = 0;
     MasmSymbol *start_sym = masm_get_symbol(masm, "_start");
     if (start_sym)
     {
         entry_offset = start_sym->offset;
     }
+
+    // write elf header
+    Elf64_Ehdr ehdr;
+    memset(&ehdr, 0, sizeof(ehdr));
+    ehdr.e_ident[0] = 0x7F;
+    ehdr.e_ident[1] = 'E';
+    ehdr.e_ident[2] = 'L';
+    ehdr.e_ident[3] = 'F';
+    ehdr.e_ident[4] = 2;
+    ehdr.e_ident[5] = 1;
+    ehdr.e_ident[6] = 1;
+    ehdr.e_ident[7] = 0;
+    ehdr.e_type = ET_EXEC;
+    ehdr.e_machine = EM_X86_64;
+    ehdr.e_version = 1;
+    ehdr.e_entry = seg1_vaddr + entry_offset;
+    ehdr.e_phoff = sizeof(Elf64_Ehdr);
+    ehdr.e_shoff = 0;
+    ehdr.e_ehsize = sizeof(Elf64_Ehdr);
+    ehdr.e_phentsize = sizeof(Elf64_Phdr);
+    ehdr.e_phnum = phnum;
+    ehdr.e_shentsize = 0;
+    ehdr.e_shnum = 0;
+    ehdr.e_shstrndx = 0;
+
+    fwrite(&ehdr, 1, sizeof(ehdr), f);
+
+    // write program header
+    Elf64_Phdr phdr;
+    memset(&phdr, 0, sizeof(phdr));
+    phdr.p_type = PT_LOAD;
+    phdr.p_flags = PF_R | PF_X;
+    phdr.p_offset = seg1_offset;
+    phdr.p_vaddr = seg1_vaddr;
+    phdr.p_paddr = seg1_vaddr;
+    phdr.p_filesz = seg1_filesz;
+    phdr.p_memsz = seg1_memsz;
+    phdr.p_align = 0x1000;
+
+    fwrite(&phdr, 1, sizeof(phdr), f);
+    
+    if (phnum > 1) {
+        Elf64_Phdr phdr2;
+        memset(&phdr2, 0, sizeof(phdr2));
+        phdr2.p_type = PT_LOAD;
+        phdr2.p_flags = PF_R | PF_W;
+        phdr2.p_offset = seg2_offset;
+        phdr2.p_vaddr = seg2_vaddr;
+        phdr2.p_paddr = seg2_vaddr;
+        phdr2.p_filesz = seg2_filesz;
+        phdr2.p_memsz = seg2_memsz;
+        phdr2.p_align = 0x1000;
+        fwrite(&phdr2, 1, sizeof(phdr2), f);
+    }
+
+    fseek(f, seg1_offset, SEEK_SET);
+
+    uint8_t *code_buffer = malloc(text_size);
+    size_t code_size = 0;
 
     // pass 2: encode with label resolution
     for (size_t i = 0; i < text->inst_count; i++)
@@ -172,59 +283,64 @@ int masm_elf_write(Masm *masm, const char *filename)
                 continue;
             }
         }
+        else if (inst.opcode == MASM_OP_MOV && inst.operands[1].kind == MASM_OPERAND_LABEL)
+        {
+            // MOV reg, label -> MOV reg, imm64 (absolute address)
+            MasmSymbol *sym = masm_get_symbol(masm, inst.operands[1].label);
+            if (sym)
+            {
+                uint64_t addr = 0;
+                if (sym->section_name && strcmp(sym->section_name, ".rodata") == 0) {
+                    addr = seg1_vaddr + rodata_start_offset + sym->offset;
+                } else if (sym->section_name && strcmp(sym->section_name, ".data") == 0) {
+                    addr = seg2_vaddr + sym->offset;
+                } else if (sym->section_name && strcmp(sym->section_name, ".bss") == 0) {
+                    addr = seg2_vaddr + data_size + sym->offset;
+                } else if (sym->section_name && strcmp(sym->section_name, ".text") == 0) {
+                    addr = seg1_vaddr + sym->offset;
+                }
+                
+                printf("Resolving label %s to %lx (sec: %s)\n", sym->name, addr, sym->section_name);
+                
+                // Create a temporary instruction with IMM operand
+                MasmOperand imm_op = masm_operand_imm(addr);
+                MasmInstruction tmp_inst = masm_inst_2(MASM_OP_MOV, inst.operands[0], imm_op);
+                
+                code_size += masm_x86_encode(tmp_inst, code_buffer + code_size, text_size - code_size);
+                
+                // Don't destroy tmp_inst operands as they share memory or are stack allocated
+                // masm_inst_2 allocates array for operands, so we should free it
+                masm_inst_destroy(tmp_inst);
+                continue;
+            }
+        }
         
-        code_size += masm_x86_encode(inst, code_buffer + code_size, total_code_size - code_size);
+        code_size += masm_x86_encode(inst, code_buffer + code_size, text_size - code_size);
     }
 
-    uint64_t base_addr = 0x400000;
-    uint64_t code_offset = 0x1000;
-    uint64_t entry_addr = base_addr + code_offset + entry_offset;
-
-    // write elf header
-    Elf64_Ehdr ehdr;
-    memset(&ehdr, 0, sizeof(ehdr));
-    ehdr.e_ident[0] = 0x7F;
-    ehdr.e_ident[1] = 'E';
-    ehdr.e_ident[2] = 'L';
-    ehdr.e_ident[3] = 'F';
-    ehdr.e_ident[4] = 2;
-    ehdr.e_ident[5] = 1;
-    ehdr.e_ident[6] = 1;
-    ehdr.e_ident[7] = 0;
-    ehdr.e_type = ET_EXEC;
-    ehdr.e_machine = EM_X86_64;
-    ehdr.e_version = 1;
-    ehdr.e_entry = entry_addr;
-    ehdr.e_phoff = sizeof(Elf64_Ehdr);
-    ehdr.e_shoff = 0;
-    ehdr.e_ehsize = sizeof(Elf64_Ehdr);
-    ehdr.e_phentsize = sizeof(Elf64_Phdr);
-    ehdr.e_phnum = 1;
-    ehdr.e_shentsize = 0;
-    ehdr.e_shnum = 0;
-    ehdr.e_shstrndx = 0;
-
-    fwrite(&ehdr, 1, sizeof(ehdr), f);
-
-    // write program header
-    Elf64_Phdr phdr;
-    memset(&phdr, 0, sizeof(phdr));
-    phdr.p_type = PT_LOAD;
-    phdr.p_flags = PF_R | PF_X;
-    phdr.p_offset = code_offset;
-    phdr.p_vaddr = base_addr + code_offset;
-    phdr.p_paddr = base_addr + code_offset;
-    phdr.p_filesz = code_size;
-    phdr.p_memsz = code_size;
-    phdr.p_align = 0x1000;
-
-    fwrite(&phdr, 1, sizeof(phdr), f);
-
-    fseek(f, code_offset, SEEK_SET);
-
     fwrite(code_buffer, 1, code_size, f);
-
     free(code_buffer);
+    
+    // Padding for Rodata
+    size_t padding = rodata_start_offset - text_size;
+    if (padding > 0) {
+        uint8_t *pad = calloc(1, padding);
+        fwrite(pad, 1, padding, f);
+        free(pad);
+    }
+    
+    // Rodata
+    if (rodata_size > 0) {
+        fwrite(rodata->data, 1, rodata_size, f);
+    }
+    
+    // Segment 2
+    if (phnum > 1) {
+        fseek(f, seg2_offset, SEEK_SET);
+        if (data_size > 0) fwrite(data->data, 1, data_size, f);
+        if (bss_size > 0) fwrite(bss->data, 1, bss_size, f);
+    }
+
     fclose(f);
     return 0;
 }

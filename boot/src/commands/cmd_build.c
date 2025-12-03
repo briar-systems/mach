@@ -359,8 +359,7 @@ int cmd_build_handle(int argc, char **argv)
         Masm *imported_masm = masm_lower_module(loaded_asts[i], sema_get_root_table(sema));
         if (imported_masm)
         {
-            // TODO: merge imported module into main module
-            // masm_module_merge(masm, imported_masm);
+            masm_merge(masm, imported_masm);
             masm_destroy(imported_masm);
         }
     }

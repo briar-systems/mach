@@ -1,4 +1,5 @@
 #include "compiler/masm/masm.h"
+#include "compiler/masm/instruction.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -96,4 +97,51 @@ void masm_add_symbol(Masm *masm, MasmSymbol *symbol)
     }
     
     masm->symbols[masm->symbol_count++] = symbol;
+}
+
+void masm_merge(Masm *dest, Masm *src)
+{
+    if (!dest || !src) return;
+
+    // Merge sections
+    for (size_t i = 0; i < src->section_count; i++)
+    {
+        MasmSection *src_sec = src->sections[i];
+        MasmSection *dest_sec = masm_get_or_create_section(dest, src_sec->name, src_sec->kind);
+
+        // Append instructions
+        for (size_t j = 0; j < src_sec->inst_count; j++)
+        {
+            MasmInstruction *src_inst = &src_sec->instructions[j];
+            // Create a copy of the instruction (allocates new operand array)
+            MasmInstruction new_inst = masm_inst_create(src_inst->opcode, src_inst->operands, src_inst->operand_count);
+            masm_section_append_inst(dest_sec, new_inst);
+        }
+        
+        // Append data
+        if (src_sec->data_size > 0)
+        {
+            masm_section_append_data(dest_sec, src_sec->data, src_sec->data_size);
+        }
+    }
+
+    // Merge symbols
+    for (size_t i = 0; i < src->symbol_count; i++)
+    {
+        MasmSymbol *src_sym = src->symbols[i];
+        
+        // Create new symbol (duplicates name)
+        MasmSymbol *new_sym = masm_symbol_create(src_sym->name, src_sym->kind, src_sym->bind);
+        
+        // Copy other properties
+        new_sym->offset = src_sym->offset;
+        new_sym->size = src_sym->size;
+        
+        if (src_sym->section_name)
+        {
+            new_sym->section_name = strdup(src_sym->section_name);
+        }
+        
+        masm_add_symbol(dest, new_sym);
+    }
 }
