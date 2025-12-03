@@ -10,6 +10,8 @@ typedef enum MasmOpcode
 {
     // data movement
     MASM_OP_MOV,
+    MASM_OP_MOVSX,
+    MASM_OP_MOVZX,
     MASM_OP_LEA,
     
     // arithmetic
