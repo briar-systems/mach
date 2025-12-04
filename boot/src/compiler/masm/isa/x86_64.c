@@ -33,9 +33,9 @@ static void emit_imm32(uint8_t *buffer, size_t *offset, size_t size, int32_t imm
 int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
 {
     size_t offset = 0;
-    
+
     printf("Encoding opcode %d\n", inst.opcode);
-    
+
     if (inst.opcode == MASM_OP_RET)
     {
         emit_byte(buffer, &offset, size, 0xC3);
@@ -52,20 +52,80 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             emit_byte(buffer, &offset, size, 0xE8);
             emit_imm32(buffer, &offset, size, 0);
         }
+        else if (inst.operand_count == 1 && inst.operands[0].kind == MASM_OPERAND_REGISTER)
+        {
+            // indirect call: CALL r64
+            // opcode: FF /2 (ModRM.reg = 2)
+            uint32_t reg = inst.operands[0].reg.id;
+            if (reg >= 8)
+            {
+                emit_byte(buffer, &offset, size, 0x41); // REX.B
+            }
+            emit_byte(buffer, &offset, size, 0xFF);
+            emit_byte(buffer, &offset, size, 0xD0 + (reg & 7)); // ModRM: mod=11, reg=2, rm=reg
+        }
+        else if (inst.operand_count == 1 && inst.operands[0].kind == MASM_OPERAND_MEMORY)
+        {
+            // indirect call through memory: CALL [mem]
+            // opcode: FF /2
+            uint32_t base = inst.operands[0].mem.base.id;
+            int32_t  disp = (int32_t)inst.operands[0].mem.disp;
+
+            uint8_t rex = 0;
+            if (base >= 8)
+            {
+                rex |= 0x41; // REX.B
+            }
+            if (rex)
+            {
+                emit_byte(buffer, &offset, size, rex);
+            }
+
+            emit_byte(buffer, &offset, size, 0xFF);
+
+            // modrm: reg = 2 (CALL), mod depends on disp
+            if (disp == 0 && (base & 7) != 5) // rbp/r13 needs disp8 of 0
+            {
+                emit_byte(buffer, &offset, size, 0x10 + (base & 7)); // mod=00, reg=2
+                if ((base & 7) == 4)
+                {
+                    emit_byte(buffer, &offset, size, 0x24); // SIB for rsp/r12
+                }
+            }
+            else if (disp >= -128 && disp <= 127)
+            {
+                emit_byte(buffer, &offset, size, 0x50 + (base & 7)); // mod=01, reg=2
+                if ((base & 7) == 4)
+                {
+                    emit_byte(buffer, &offset, size, 0x24); // SIB
+                }
+                emit_byte(buffer, &offset, size, (uint8_t)disp);
+            }
+            else
+            {
+                emit_byte(buffer, &offset, size, 0x90 + (base & 7)); // mod=10, reg=2
+                if ((base & 7) == 4)
+                {
+                    emit_byte(buffer, &offset, size, 0x24); // SIB
+                }
+                emit_imm32(buffer, &offset, size, disp);
+            }
+        }
     }
     else if (inst.opcode == MASM_OP_MOV)
     {
-        if (inst.operand_count == 2 && 
-            inst.operands[0].kind == MASM_OPERAND_REGISTER && 
-            inst.operands[1].kind == MASM_OPERAND_IMM)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_IMM)
         {
             uint32_t reg = inst.operands[0].reg.id;
             int64_t  imm = inst.operands[1].imm;
-            
+
             if (inst.operands[0].reg.size == 8)
             {
                 uint8_t rex = 0x48;
-                if (reg >= 8) rex |= 0x01; // REX.B
+                if (reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
                 emit_byte(buffer, &offset, size, rex);
                 emit_byte(buffer, &offset, size, 0xB8 + (reg & 7));
                 emit_imm64(buffer, &offset, size, imm);
@@ -73,173 +133,255 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (reg >= 8) rex |= 0x41; // REX.B (no W bit for 32-bit, but need REX if reg >= 8)
-                if (rex) emit_byte(buffer, &offset, size, rex);
+                if (reg >= 8)
+                {
+                    rex |= 0x41; // REX.B (no W bit for 32-bit, but need REX if reg >= 8)
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
                 emit_byte(buffer, &offset, size, 0xB8 + (reg & 7));
                 emit_imm32(buffer, &offset, size, (int32_t)imm);
             }
         }
-        else if (inst.operand_count == 2 &&
-                 inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-                 inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
-             uint32_t dst = inst.operands[0].reg.id;
-             uint32_t src = inst.operands[1].reg.id;
-             
-             if (inst.operands[0].reg.size == 8 && inst.operands[1].reg.size == 8)
-             {
-                 uint8_t rex = 0x48;
-                 if (src >= 8) rex |= 0x04; // REX.R
-                 if (dst >= 8) rex |= 0x01; // REX.B
-                 emit_byte(buffer, &offset, size, rex);
-                 emit_byte(buffer, &offset, size, 0x89);
-                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
-                 emit_byte(buffer, &offset, size, modrm);
-             }
-             else if (inst.operands[0].reg.size == 4 && inst.operands[1].reg.size == 4)
-             {
-                 // printf("MOV r32, r32\n");
-                 uint8_t rex = 0;
-                 if (src >= 8) rex |= 0x04; // REX.R
-                 if (dst >= 8) rex |= 0x01; // REX.B
-                 if (rex) emit_byte(buffer, &offset, size, rex);
-                 
-                 emit_byte(buffer, &offset, size, 0x89);
-                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
-                 emit_byte(buffer, &offset, size, modrm);
-             }
+            uint32_t dst = inst.operands[0].reg.id;
+            uint32_t src = inst.operands[1].reg.id;
+
+            if (inst.operands[0].reg.size == 8 && inst.operands[1].reg.size == 8)
+            {
+                uint8_t rex = 0x48;
+                if (src >= 8)
+                {
+                    rex |= 0x04; // REX.R
+                }
+                if (dst >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+                emit_byte(buffer, &offset, size, rex);
+                emit_byte(buffer, &offset, size, 0x89);
+                uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
+                emit_byte(buffer, &offset, size, modrm);
+            }
+            else if (inst.operands[0].reg.size == 4 && inst.operands[1].reg.size == 4)
+            {
+                // printf("MOV r32, r32\n");
+                uint8_t rex = 0;
+                if (src >= 8)
+                {
+                    rex |= 0x04; // REX.R
+                }
+                if (dst >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
+                emit_byte(buffer, &offset, size, 0x89);
+                uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
+                emit_byte(buffer, &offset, size, modrm);
+            }
         }
         // MOV reg, [mem] - load from memory
-        else if (inst.operand_count == 2 &&
-                 inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-                 inst.operands[1].kind == MASM_OPERAND_MEMORY)
+        else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_MEMORY)
         {
-            uint32_t dst_reg = inst.operands[0].reg.id;
+            uint32_t dst_reg  = inst.operands[0].reg.id;
             uint32_t base_reg = inst.operands[1].mem.base.id;
-            int32_t disp = (int32_t)inst.operands[1].mem.disp;
-            
+            int32_t  disp     = (int32_t)inst.operands[1].mem.disp;
+
             if (inst.operands[0].reg.size == 8)
             {
                 uint8_t rex = 0x48;
-                if (dst_reg >= 8) rex |= 0x04; // REX.R (dst is reg field)
-                if (base_reg >= 8) rex |= 0x01; // REX.B (base is r/m field)
+                if (dst_reg >= 8)
+                {
+                    rex |= 0x04; // REX.R (dst is reg field)
+                }
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B (base is r/m field)
+                }
                 emit_byte(buffer, &offset, size, rex);
-                emit_byte(buffer, &offset, size, 0x8B);  // MOV r64, r/m64
-                
+                emit_byte(buffer, &offset, size, 0x8B); // MOV r64, r/m64
+
                 // ModR/M byte: mod=01 (disp8) or mod=10 (disp32), reg=dst, r/m=base
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | ((dst_reg & 7) << 3) | (base_reg & 7);
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 // Displacement
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
+                }
             }
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst_reg >= 8) rex |= 0x04; // REX.R
-                if (base_reg >= 8) rex |= 0x01; // REX.B
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
-                emit_byte(buffer, &offset, size, 0x8B);  // MOV r32, r/m32
-                
+                if (dst_reg >= 8)
+                {
+                    rex |= 0x04; // REX.R
+                }
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
+                emit_byte(buffer, &offset, size, 0x8B); // MOV r32, r/m32
+
                 // ModR/M byte
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | ((dst_reg & 7) << 3) | (base_reg & 7);
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 // Displacement
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
+                }
             }
             else if (inst.operands[0].reg.size == 1)
             {
                 // MOV r8, r/m8
                 uint8_t rex = 0;
-                if (dst_reg >= 8) rex |= 0x04; // REX.R
-                if (base_reg >= 8) rex |= 0x01; // REX.B
-                
+                if (dst_reg >= 8)
+                {
+                    rex |= 0x04; // REX.R
+                }
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+
                 // Check for SPL/BPL/SIL/DIL access (regs 4-7) which needs REX
-                if (dst_reg >= 4 && dst_reg <= 7 && rex == 0) {
+                if (dst_reg >= 4 && dst_reg <= 7 && rex == 0)
+                {
                     rex |= 0x40;
                 }
-                
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
-                emit_byte(buffer, &offset, size, 0x8A);  // MOV r8, r/m8
-                
+
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
+                emit_byte(buffer, &offset, size, 0x8A); // MOV r8, r/m8
+
                 // ModR/M byte
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | ((dst_reg & 7) << 3) | (base_reg & 7);
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 // Displacement
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
+                }
             }
         }
         // MOV [mem], reg - store to memory
-        else if (inst.operand_count == 2 &&
-                 inst.operands[0].kind == MASM_OPERAND_MEMORY &&
-                 inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_MEMORY && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t base_reg = inst.operands[0].mem.base.id;
-            uint32_t src_reg = inst.operands[1].reg.id;
-            int32_t disp = (int32_t)inst.operands[0].mem.disp;
-            
+            uint32_t src_reg  = inst.operands[1].reg.id;
+            int32_t  disp     = (int32_t)inst.operands[0].mem.disp;
+
             if (inst.operands[1].reg.size == 8)
             {
                 uint8_t rex = 0x48;
-                if (src_reg >= 8) rex |= 0x04; // REX.R (src is reg field)
-                if (base_reg >= 8) rex |= 0x01; // REX.B (base is r/m field)
+                if (src_reg >= 8)
+                {
+                    rex |= 0x04; // REX.R (src is reg field)
+                }
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B (base is r/m field)
+                }
                 emit_byte(buffer, &offset, size, rex);
-                emit_byte(buffer, &offset, size, 0x89);  // MOV r/m64, r64
-                
+                emit_byte(buffer, &offset, size, 0x89); // MOV r/m64, r64
+
                 // ModR/M byte
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | ((src_reg & 7) << 3) | (base_reg & 7);
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 // Displacement
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
+                }
             }
             else if (inst.operands[1].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (src_reg >= 8) rex |= 0x04; // REX.R
-                if (base_reg >= 8) rex |= 0x01; // REX.B
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
-                emit_byte(buffer, &offset, size, 0x89);  // MOV r/m32, r32
-                
+                if (src_reg >= 8)
+                {
+                    rex |= 0x04; // REX.R
+                }
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
+                emit_byte(buffer, &offset, size, 0x89); // MOV r/m32, r32
+
                 // ModR/M byte
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | ((src_reg & 7) << 3) | (base_reg & 7);
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 // Displacement
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
+                }
             }
             else if (inst.operands[1].reg.size == 1)
             {
                 // MOV r/m8, r8
                 uint8_t rex = 0;
-                if (src_reg >= 8) rex |= 0x04; // REX.R
-                if (base_reg >= 8) rex |= 0x01; // REX.B
-                if (src_reg >= 4 && src_reg <= 7 && rex == 0) {
+                if (src_reg >= 8)
+                {
+                    rex |= 0x04; // REX.R
+                }
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+                if (src_reg >= 4 && src_reg <= 7 && rex == 0)
+                {
                     // accessing SPL/BPL/SIL/DIL requires REX prefix if not using legacy AH/CH/DH/BH
                     // But here we assume low bytes.
                     // Actually, if we use REX, we access low bytes of 4-7.
@@ -256,139 +398,194 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                     // So we NEED REX for 4-7 to access low bytes!
                     rex |= 0x40; // Empty REX to force new regs
                 }
-                
-                if (rex == 0) rex |= 0x40; // Force REX for debugging
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
-                emit_byte(buffer, &offset, size, 0x88);  // MOV r/m8, r8
-                
+
+                if (rex == 0)
+                {
+                    rex |= 0x40; // Force REX for debugging
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
+                emit_byte(buffer, &offset, size, 0x88); // MOV r/m8, r8
+
                 // ModR/M byte
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | ((src_reg & 7) << 3) | (base_reg & 7);
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 // Displacement
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
+                }
             }
         }
         // MOV [mem], imm
-        else if (inst.operand_count == 2 &&
-                 inst.operands[0].kind == MASM_OPERAND_MEMORY &&
-                 inst.operands[1].kind == MASM_OPERAND_IMM)
+        else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_MEMORY && inst.operands[1].kind == MASM_OPERAND_IMM)
         {
             uint32_t base_reg = inst.operands[0].mem.base.id;
-            int32_t disp = (int32_t)inst.operands[0].mem.disp;
-            int64_t imm = inst.operands[1].imm;
-            uint8_t mem_size = inst.operands[0].mem.size;
-            
+            int32_t  disp     = (int32_t)inst.operands[0].mem.disp;
+            int64_t  imm      = inst.operands[1].imm;
+            uint8_t  mem_size = inst.operands[0].mem.size;
+
             if (mem_size == 8)
             {
                 // MOV r/m64, imm32 (sign extended)
                 uint8_t rex = 0x48;
-                if (base_reg >= 8) rex |= 0x01; // REX.B
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
                 emit_byte(buffer, &offset, size, rex);
                 emit_byte(buffer, &offset, size, 0xC7);
-                
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | (0 << 3) | (base_reg & 7); // /0
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
-                    
+                }
+
                 emit_imm32(buffer, &offset, size, (int32_t)imm);
             }
             else if (mem_size == 4)
             {
                 // MOV r/m32, imm32
                 uint8_t rex = 0;
-                if (base_reg >= 8) rex |= 0x01; // REX.B
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0xC7);
-                
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | (0 << 3) | (base_reg & 7); // /0
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
-                    
+                }
+
                 emit_imm32(buffer, &offset, size, (int32_t)imm);
             }
             else if (mem_size == 1)
             {
                 // MOV r/m8, imm8
                 uint8_t rex = 0;
-                if (base_reg >= 8) rex |= 0x01; // REX.B
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0xC6);
-                
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | (0 << 3) | (base_reg & 7); // /0
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
-                    
+                }
+
                 emit_byte(buffer, &offset, size, (int8_t)imm);
             }
             else if (mem_size == 1)
             {
                 // MOV r/m8, imm8
                 uint8_t rex = 0;
-                if (base_reg >= 8) rex |= 0x01; // REX.B
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0xC6);
-                
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | (0 << 3) | (base_reg & 7); // /0
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
-                    
+                }
+
                 emit_byte(buffer, &offset, size, (int8_t)imm);
             }
         }
     }
     else if (inst.opcode == MASM_OP_MOVSX)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
-            uint32_t dst = inst.operands[0].reg.id;
-            uint32_t src = inst.operands[1].reg.id;
-            uint8_t dst_size = inst.operands[0].reg.size;
-            uint8_t src_size = inst.operands[1].reg.size;
-            
+            uint32_t dst      = inst.operands[0].reg.id;
+            uint32_t src      = inst.operands[1].reg.id;
+            uint8_t  dst_size = inst.operands[0].reg.size;
+            uint8_t  src_size = inst.operands[1].reg.size;
+
             // MOVSX r64, r32 (MOVSXD)
             if (dst_size == 8 && src_size == 4)
             {
                 uint8_t rex = 0x48;
-                if (src >= 8) rex |= 0x04; // REX.R
-                if (dst >= 8) rex |= 0x01; // REX.B (dst is in r/m field? No, dst is reg, src is r/m)
+                if (src >= 8)
+                {
+                    rex |= 0x04; // REX.R
+                }
+                if (dst >= 8)
+                {
+                    rex |= 0x01; // REX.B (dst is in r/m field? No, dst is reg, src is r/m)
+                }
                 // Wait, standard is: op reg, r/m
                 // reg field = dst, r/m field = src
-                
+
                 rex = 0x48;
-                if (dst >= 8) rex |= 0x04; // REX.R (dst)
-                if (src >= 8) rex |= 0x01; // REX.B (src)
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x04; // REX.R (dst)
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x01; // REX.B (src)
+                }
+
                 emit_byte(buffer, &offset, size, rex);
                 emit_byte(buffer, &offset, size, 0x63);
                 uint8_t modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
@@ -398,15 +595,30 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (src_size == 1)
             {
                 uint8_t rex = 0;
-                if (dst_size == 8) rex |= 0x48;
-                else if (dst_size == 2) emit_byte(buffer, &offset, size, 0x66); // operand size override
-                
-                if (dst >= 8) rex |= 0x04;
-                if (src >= 8) rex |= 0x01;
+                if (dst_size == 8)
+                {
+                    rex |= 0x48;
+                }
+                else if (dst_size == 2)
+                {
+                    emit_byte(buffer, &offset, size, 0x66); // operand size override
+                }
+
+                if (dst >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x01;
+                }
                 // REX required if accessing SPL/BPL/SIL/DIL (regs 4-7)? No, that's for new regs.
                 // But generally if we use REX, we can access all bytes.
-                
-                if (rex) emit_byte(buffer, &offset, size, rex);
+
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
                 emit_byte(buffer, &offset, size, 0x0F);
                 emit_byte(buffer, &offset, size, 0xBE);
                 uint8_t modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
@@ -416,12 +628,24 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (src_size == 2)
             {
                 uint8_t rex = 0;
-                if (dst_size == 8) rex |= 0x48;
-                
-                if (dst >= 8) rex |= 0x04;
-                if (src >= 8) rex |= 0x01;
-                
-                if (rex) emit_byte(buffer, &offset, size, rex);
+                if (dst_size == 8)
+                {
+                    rex |= 0x48;
+                }
+
+                if (dst >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x01;
+                }
+
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
                 emit_byte(buffer, &offset, size, 0x0F);
                 emit_byte(buffer, &offset, size, 0xBF);
                 uint8_t modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
@@ -431,25 +655,35 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
     else if (inst.opcode == MASM_OP_MOVZX)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
-            uint32_t dst = inst.operands[0].reg.id;
-            uint32_t src = inst.operands[1].reg.id;
-            uint8_t dst_size = inst.operands[0].reg.size;
-            uint8_t src_size = inst.operands[1].reg.size;
-            
+            uint32_t dst      = inst.operands[0].reg.id;
+            uint32_t src      = inst.operands[1].reg.id;
+            uint8_t  dst_size = inst.operands[0].reg.size;
+            uint8_t  src_size = inst.operands[1].reg.size;
+
             // MOVZX r64/r32/r16, r8
             if (src_size == 1)
             {
                 uint8_t rex = 0;
-                if (dst_size == 8) rex |= 0x48;
-                
-                if (dst >= 8) rex |= 0x04;
-                if (src >= 8) rex |= 0x01;
-                
-                if (rex) emit_byte(buffer, &offset, size, rex);
+                if (dst_size == 8)
+                {
+                    rex |= 0x48;
+                }
+
+                if (dst >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x01;
+                }
+
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
                 emit_byte(buffer, &offset, size, 0x0F);
                 emit_byte(buffer, &offset, size, 0xB6);
                 uint8_t modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
@@ -459,12 +693,24 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (src_size == 2)
             {
                 uint8_t rex = 0;
-                if (dst_size == 8) rex |= 0x48;
-                
-                if (dst >= 8) rex |= 0x04;
-                if (src >= 8) rex |= 0x01;
-                
-                if (rex) emit_byte(buffer, &offset, size, rex);
+                if (dst_size == 8)
+                {
+                    rex |= 0x48;
+                }
+
+                if (dst >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x01;
+                }
+
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
                 emit_byte(buffer, &offset, size, 0x0F);
                 emit_byte(buffer, &offset, size, 0xB7);
                 uint8_t modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
@@ -474,43 +720,49 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
     else if (inst.opcode == MASM_OP_LEA)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_MEMORY)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_MEMORY)
         {
-            uint32_t dst_reg = inst.operands[0].reg.id;
+            uint32_t dst_reg  = inst.operands[0].reg.id;
             uint32_t base_reg = inst.operands[1].mem.base.id;
-            int32_t disp = (int32_t)inst.operands[1].mem.disp;
-            
+            int32_t  disp     = (int32_t)inst.operands[1].mem.disp;
+
             if (inst.operands[0].reg.size == 8)
             {
                 uint8_t rex = 0x48;
-                if (dst_reg >= 8) rex |= 0x04; // REX.R
-                if (base_reg >= 8) rex |= 0x01; // REX.B
+                if (dst_reg >= 8)
+                {
+                    rex |= 0x04; // REX.R
+                }
+                if (base_reg >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
                 emit_byte(buffer, &offset, size, rex);
                 emit_byte(buffer, &offset, size, 0x8D);
-                
+
                 // ModR/M
-                uint8_t mod = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
+                uint8_t mod   = (disp >= -128 && disp <= 127) ? 0x40 : 0x80;
                 uint8_t modrm = mod | ((dst_reg & 7) << 3) | (base_reg & 7);
                 emit_byte(buffer, &offset, size, modrm);
-                
+
                 if (mod == 0x40)
+                {
                     emit_byte(buffer, &offset, size, (int8_t)disp);
+                }
                 else
+                {
                     emit_imm32(buffer, &offset, size, disp);
+                }
             }
         }
     }
     else if (inst.opcode == MASM_OP_ADD)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t dst = inst.operands[0].reg.id;
             uint32_t src = inst.operands[1].reg.id;
-            
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
@@ -521,26 +773,33 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01;
-                if (src >= 8) rex |= 0x04;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0x01);
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
             }
         }
-        else if (inst.operand_count == 2 &&
-                 inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-                 inst.operands[1].kind == MASM_OPERAND_IMM)
+        else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_IMM)
         {
             uint32_t dst = inst.operands[0].reg.id;
-            int64_t imm = inst.operands[1].imm;
-            
+            int64_t  imm = inst.operands[1].imm;
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
-                
+
                 // 81 /0 id: ADD r/m64, imm32
                 // 83 /0 ib: ADD r/m64, imm8
                 if (imm >= -128 && imm <= 127)
@@ -561,9 +820,15 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 if (imm >= -128 && imm <= 127)
                 {
                     emit_byte(buffer, &offset, size, 0x83);
@@ -583,13 +848,11 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
     else if (inst.opcode == MASM_OP_AND)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t dst = inst.operands[0].reg.id;
             uint32_t src = inst.operands[1].reg.id;
-            
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
@@ -600,26 +863,33 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01;
-                if (src >= 8) rex |= 0x04;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0x21);
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
             }
         }
-        else if (inst.operand_count == 2 &&
-                 inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-                 inst.operands[1].kind == MASM_OPERAND_IMM)
+        else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_IMM)
         {
             uint32_t dst = inst.operands[0].reg.id;
-            int64_t imm = inst.operands[1].imm;
-            
+            int64_t  imm = inst.operands[1].imm;
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
-                
+
                 // 81 /4 id: AND r/m64, imm32
                 // 83 /4 ib: AND r/m64, imm8
                 if (imm >= -128 && imm <= 127)
@@ -640,9 +910,15 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 if (imm >= -128 && imm <= 127)
                 {
                     emit_byte(buffer, &offset, size, 0x83);
@@ -662,13 +938,11 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
     else if (inst.opcode == MASM_OP_SUB)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t dst = inst.operands[0].reg.id;
             uint32_t src = inst.operands[1].reg.id;
-            
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
@@ -679,26 +953,33 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01;
-                if (src >= 8) rex |= 0x04;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0x29);
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
             }
         }
-        else if (inst.operand_count == 2 &&
-                 inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-                 inst.operands[1].kind == MASM_OPERAND_IMM)
+        else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_IMM)
         {
             uint32_t dst = inst.operands[0].reg.id;
-            int64_t imm = inst.operands[1].imm;
-            
+            int64_t  imm = inst.operands[1].imm;
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
-                
+
                 // 81 /5 id: SUB r/m64, imm32
                 // 83 /5 ib: SUB r/m64, imm8
                 if (imm >= -128 && imm <= 127)
@@ -719,9 +1000,15 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 if (imm >= -128 && imm <= 127)
                 {
                     emit_byte(buffer, &offset, size, 0x83);
@@ -741,13 +1028,11 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
     else if (inst.opcode == MASM_OP_IMUL)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t dst = inst.operands[0].reg.id;
             uint32_t src = inst.operands[1].reg.id;
-            
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
@@ -759,10 +1044,19 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x04;
-                if (src >= 8) rex |= 0x01;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0x0F);
                 emit_byte(buffer, &offset, size, 0xAF);
                 uint8_t modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
@@ -772,11 +1066,10 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
     else if (inst.opcode == MASM_OP_IDIV)
     {
-        if (inst.operand_count == 1 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 1 && inst.operands[0].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t divisor = inst.operands[0].reg.id;
-            
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
@@ -787,9 +1080,15 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (divisor >= 8) rex |= 0x01;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (divisor >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0xF7);
                 uint8_t modrm = 0xF8 | (divisor & 7);
                 emit_byte(buffer, &offset, size, modrm);
@@ -803,13 +1102,11 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
     else if (inst.opcode == MASM_OP_CMP)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t dst = inst.operands[0].reg.id;
             uint32_t src = inst.operands[1].reg.id;
-            
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
@@ -820,26 +1117,33 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01;
-                if (src >= 8) rex |= 0x04;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0x39);
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
             }
         }
-        else if (inst.operand_count == 2 &&
-                 inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-                 inst.operands[1].kind == MASM_OPERAND_IMM)
+        else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_IMM)
         {
             uint32_t dst = inst.operands[0].reg.id;
-            int64_t imm = inst.operands[1].imm;
-            
+            int64_t  imm = inst.operands[1].imm;
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
-                
+
                 // 81 /7 id: CMP r/m64, imm32
                 // 83 /7 ib: CMP r/m64, imm8
                 if (imm >= -128 && imm <= 127)
@@ -860,9 +1164,15 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 if (imm >= -128 && imm <= 127)
                 {
                     emit_byte(buffer, &offset, size, 0x83);
@@ -882,10 +1192,19 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             {
                 // 80 /7 ib: CMP r/m8, imm8
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01; // REX.B
-                if (dst >= 4 && dst <= 7 && rex == 0) rex |= 0x40; // Force REX for SPL/BPL/SIL/DIL
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01; // REX.B
+                }
+                if (dst >= 4 && dst <= 7 && rex == 0)
+                {
+                    rex |= 0x40; // Force REX for SPL/BPL/SIL/DIL
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0x80);
                 uint8_t modrm = 0xC0 | (7 << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
@@ -895,13 +1214,11 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
     else if (inst.opcode == MASM_OP_TEST)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t dst = inst.operands[0].reg.id;
             uint32_t src = inst.operands[1].reg.id;
-            
+
             if (inst.operands[0].reg.size == 8)
             {
                 emit_byte(buffer, &offset, size, 0x48);
@@ -912,10 +1229,19 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             else if (inst.operands[0].reg.size == 4)
             {
                 uint8_t rex = 0;
-                if (dst >= 8) rex |= 0x01;
-                if (src >= 8) rex |= 0x04;
-                if (rex) emit_byte(buffer, &offset, size, rex);
-                
+                if (dst >= 8)
+                {
+                    rex |= 0x01;
+                }
+                if (src >= 8)
+                {
+                    rex |= 0x04;
+                }
+                if (rex)
+                {
+                    emit_byte(buffer, &offset, size, rex);
+                }
+
                 emit_byte(buffer, &offset, size, 0x85);
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
                 emit_byte(buffer, &offset, size, modrm);
@@ -928,21 +1254,33 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
         if (inst.operand_count == 1 && inst.operands[0].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t reg = inst.operands[0].reg.id;
-            
+
             emit_byte(buffer, &offset, size, 0x0F);
-            
+
             // opcode map for SETcc
             uint8_t setcc_opcode = 0x94;
             switch (inst.opcode)
             {
-                case MASM_OP_SETE:   setcc_opcode = 0x94; break;
-                case MASM_OP_SETNE:  setcc_opcode = 0x95; break;
-                case MASM_OP_SETL:   setcc_opcode = 0x9C; break;
-                case MASM_OP_SETG:   setcc_opcode = 0x9F; break;
-                case MASM_OP_SETLE:  setcc_opcode = 0x9E; break;
-                case MASM_OP_SETGE:  setcc_opcode = 0x9D; break;
+            case MASM_OP_SETE:
+                setcc_opcode = 0x94;
+                break;
+            case MASM_OP_SETNE:
+                setcc_opcode = 0x95;
+                break;
+            case MASM_OP_SETL:
+                setcc_opcode = 0x9C;
+                break;
+            case MASM_OP_SETG:
+                setcc_opcode = 0x9F;
+                break;
+            case MASM_OP_SETLE:
+                setcc_opcode = 0x9E;
+                break;
+            case MASM_OP_SETGE:
+                setcc_opcode = 0x9D;
+                break;
             }
-            
+
             emit_byte(buffer, &offset, size, setcc_opcode);
             uint8_t modrm = 0xC0 | (reg & 7);
             emit_byte(buffer, &offset, size, modrm);
@@ -1001,13 +1339,11 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
     else if (inst.opcode == MASM_OP_XOR)
     {
-        if (inst.operand_count == 2 &&
-            inst.operands[0].kind == MASM_OPERAND_REGISTER &&
-            inst.operands[1].kind == MASM_OPERAND_REGISTER)
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t dst = inst.operands[0].reg.id;
             uint32_t src = inst.operands[1].reg.id;
-            
+
             // XOR r32, r32 (also clears upper 32 bits, effectively r64, r64 zeroing)
             if (inst.operands[0].reg.size == 4)
             {
@@ -1015,8 +1351,8 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 // REX prefix not needed for 32-bit unless regs > 7
                 if (dst > 7 || src > 7)
                 {
-                     uint8_t rex = 0x40 | ((src >> 3) << 2) | (dst >> 3);
-                     emit_byte(buffer, &offset, size, rex);
+                    uint8_t rex = 0x40 | ((src >> 3) << 2) | (dst >> 3);
+                    emit_byte(buffer, &offset, size, rex);
                 }
                 emit_byte(buffer, &offset, size, 0x31);
                 uint8_t modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
@@ -1046,18 +1382,30 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
         if (inst.operand_count == 1 && inst.operands[0].kind == MASM_OPERAND_LABEL)
         {
             emit_byte(buffer, &offset, size, 0x0F);
-            
+
             uint8_t opcode = 0x84; // JE
             switch (inst.opcode)
             {
-                case MASM_OP_JE:  opcode = 0x84; break;
-                case MASM_OP_JNE: opcode = 0x85; break;
-                case MASM_OP_JL:  opcode = 0x8C; break;
-                case MASM_OP_JG:  opcode = 0x8F; break;
-                case MASM_OP_JLE: opcode = 0x8E; break;
-                case MASM_OP_JGE: opcode = 0x8D; break;
+            case MASM_OP_JE:
+                opcode = 0x84;
+                break;
+            case MASM_OP_JNE:
+                opcode = 0x85;
+                break;
+            case MASM_OP_JL:
+                opcode = 0x8C;
+                break;
+            case MASM_OP_JG:
+                opcode = 0x8F;
+                break;
+            case MASM_OP_JLE:
+                opcode = 0x8E;
+                break;
+            case MASM_OP_JGE:
+                opcode = 0x8D;
+                break;
             }
-            
+
             emit_byte(buffer, &offset, size, opcode);
             emit_imm32(buffer, &offset, size, 0); // placeholder
         }
@@ -1065,6 +1413,6 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     else if (inst.opcode == MASM_OP_LABEL)
     {
     }
-    
+
     return offset;
 }
