@@ -3,6 +3,7 @@
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/x86_64.h"
 #include "compiler/masm/masm.h"
+#include "compiler/symbol.h"
 #include "compiler/type.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1636,7 +1637,16 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
 {
     (void)symbols;
 
+    // use export_name if available (from $funcname.name = "..."), otherwise use AST name
     const char *func_name = func_node->fun_stmt.name;
+    if (func_node->symbol)
+    {
+        const char *link_name = symbol_get_linkage_name(func_node->symbol);
+        if (link_name)
+        {
+            func_name = link_name;
+        }
+    }
 
     MasmSymbol *sym = masm_symbol_create(func_name, MASM_SYMBOL_FUNCTION, MASM_BIND_GLOBAL);
     masm_add_symbol(masm, sym);
