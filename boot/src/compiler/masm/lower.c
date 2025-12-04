@@ -637,30 +637,66 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     {
         // evaluate arguments
         AstList *args       = expr->call_expr.args;
-        int      stack_args = 0;
+        int      stack_args_count = 0;
+        int      padding = 0;
+        
         if (args)
         {
-            // push stack arguments (reverse order)
+            // Calculate stack space needed
+            if (args->count > 6)
+            {
+                stack_args_count = args->count - 6;
+                // Ensure 16-byte alignment before call
+                // RSP is 16-byte aligned here (inside function body)
+                // We need RSP to be 16-byte aligned BEFORE the call instruction
+                // The call instruction pushes 8 bytes, so on entry to callee RSP is 8-byte aligned (correct)
+                // So we just need to ensure we subtract a multiple of 16 from RSP?
+                // No, ABI says (RSP + 8) is multiple of 16 on entry.
+                // Which means RSP is multiple of 16 before CALL.
+                
+                // If we push odd number of args (8 bytes each), RSP is misaligned.
+                // So if stack_args_count is odd, we need 8 bytes padding.
+                if (stack_args_count % 2 != 0)
+                {
+                    padding = 8;
+                }
+            }
+            
+            int total_stack_space = (stack_args_count * 8) + padding;
+            
+            if (total_stack_space > 0)
+            {
+                MasmOperand rsp = masm_operand_register(MASM_X86_RSP, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_SUB, rsp, masm_operand_imm(total_stack_space)));
+            }
+
+            // push stack arguments (reverse order to preserve evaluation order)
             for (int i = args->count - 1; i >= 6; i--)
             {
                 MasmOperand arg_op = lower_expr(masm, text, args->items[i], ctx);
-
-                if (arg_op.kind == MASM_OPERAND_REGISTER)
+                
+                // Calculate offset from current RSP
+                // i goes from count-1 down to 6.
+                // The last arg (count-1) is at the highest address (bottom of stack frame)
+                // The first stack arg (6) is at [rsp]
+                // So arg[6] is at [rsp + 0]
+                // arg[7] is at [rsp + 8]
+                // arg[i] is at [rsp + (i-6)*8]
+                
+                int offset = (i - 6) * 8;
+                MasmOperand dst = masm_operand_memory_simple(MASM_X86_RSP, offset, 8);
+                
+                if (arg_op.kind == MASM_OPERAND_MEMORY)
                 {
-                    masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, arg_op));
-                }
-                else if (arg_op.kind == MASM_OPERAND_IMM)
-                {
-                    // PUSH imm is valid
-                    masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, arg_op));
+                    // memory-to-memory move requires intermediate register
+                    MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, arg_op));
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, rax));
                 }
                 else
                 {
-                    MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, arg_op));
-                    masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, rax));
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, arg_op));
                 }
-                stack_args++;
             }
 
             // register arguments (forward order)
@@ -707,10 +743,11 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
 
         // clean up stack arguments
-        if (stack_args > 0)
+        int total_cleanup = (stack_args_count * 8) + padding;
+        if (total_cleanup > 0)
         {
             MasmOperand rsp = masm_operand_register(MASM_X86_RSP, 8);
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, rsp, masm_operand_imm(stack_args * 8)));
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, rsp, masm_operand_imm(total_cleanup)));
         }
 
         return masm_operand_register(MASM_X86_RAX, 8);
