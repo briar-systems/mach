@@ -3,6 +3,7 @@
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/x86_64.h"
 #include "compiler/masm/masm.h"
+#include "compiler/masm/regalloc.h"
 #include "compiler/symbol.h"
 #include "compiler/type.h"
 #include <stdio.h>
@@ -28,6 +29,9 @@ typedef struct LowerContext
     // Loop labels for break/continue
     char *loop_start_label;
     char *loop_end_label;
+
+    // Register allocator
+    RegAlloc regalloc;
 } LowerContext;
 
 static LowerContext *create_context()
@@ -41,6 +45,7 @@ static LowerContext *create_context()
     ast_list_init(ctx->local_vars);
     ctx->loop_start_label = NULL;
     ctx->loop_end_label   = NULL;
+    regalloc_init(&ctx->regalloc);
     return ctx;
 }
 
@@ -401,18 +406,38 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
         MasmOperand left = lower_expr(masm, text, expr->binary_expr.left, ctx);
 
-        // if left is in RAX, push it to preserve it across right evaluation
-        bool pushed = false;
+        // try to use register allocator to avoid PUSH/POP spilling
+        bool       pushed        = false;
+        MasmX86Reg left_save_reg = MASM_X86_REG_COUNT;
+
         if (left.kind == MASM_OPERAND_REGISTER && left.reg.id == MASM_X86_RAX)
         {
-            // Promote to 64-bit for PUSH (PUSH r32 is not valid in 64-bit mode)
-            MasmOperand push_op = left;
-            push_op.reg.size    = 8;
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, push_op));
-            pushed = true;
+            // try to allocate a register to save left value
+            left_save_reg = regalloc_alloc(&ctx->regalloc);
+            if (left_save_reg != MASM_X86_REG_COUNT)
+            {
+                // move left to allocated register
+                MasmOperand save_reg = masm_operand_register(left_save_reg, left.reg.size);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, save_reg, left));
+                left = save_reg;
+            }
+            else
+            {
+                // fallback to PUSH/POP
+                MasmOperand push_op = left;
+                push_op.reg.size    = 8;
+                masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, push_op));
+                pushed = true;
+            }
         }
 
         MasmOperand right = lower_expr(masm, text, expr->binary_expr.right, ctx);
+
+        // free the save register if we used one
+        if (left_save_reg != MASM_X86_REG_COUNT)
+        {
+            regalloc_free(&ctx->regalloc, left_save_reg);
+        }
 
         MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
         if (left.kind == MASM_OPERAND_REGISTER)
@@ -454,6 +479,22 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             MasmOperand pop_op = result;
             pop_op.reg.size    = 8;
             masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, pop_op));
+        }
+        else if (left_save_reg != MASM_X86_REG_COUNT)
+        {
+            // left is in an allocated register, right may be in RAX
+            // We want result in RAX for compatibility with existing code
+
+            // If right is in RAX, move it to RCX
+            if (right.kind == MASM_OPERAND_REGISTER && right.reg.id == MASM_X86_RAX)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, right));
+                right_op = rcx;
+            }
+
+            // Move left from save register to RAX
+            MasmOperand save_reg = masm_operand_register(left_save_reg, result.reg.size);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, save_reg));
         }
         else
         {
@@ -636,10 +677,10 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     else if (expr->kind == AST_EXPR_CALL)
     {
         // evaluate arguments
-        AstList *args       = expr->call_expr.args;
+        AstList *args             = expr->call_expr.args;
         int      stack_args_count = 0;
-        int      padding = 0;
-        
+        int      padding          = 0;
+
         if (args)
         {
             // Calculate stack space needed
@@ -653,7 +694,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 // So we just need to ensure we subtract a multiple of 16 from RSP?
                 // No, ABI says (RSP + 8) is multiple of 16 on entry.
                 // Which means RSP is multiple of 16 before CALL.
-                
+
                 // If we push odd number of args (8 bytes each), RSP is misaligned.
                 // So if stack_args_count is odd, we need 8 bytes padding.
                 if (stack_args_count % 2 != 0)
@@ -661,9 +702,9 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                     padding = 8;
                 }
             }
-            
+
             int total_stack_space = (stack_args_count * 8) + padding;
-            
+
             if (total_stack_space > 0)
             {
                 MasmOperand rsp = masm_operand_register(MASM_X86_RSP, 8);
@@ -674,7 +715,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             for (int i = args->count - 1; i >= 6; i--)
             {
                 MasmOperand arg_op = lower_expr(masm, text, args->items[i], ctx);
-                
+
                 // Calculate offset from current RSP
                 // i goes from count-1 down to 6.
                 // The last arg (count-1) is at the highest address (bottom of stack frame)
@@ -682,10 +723,10 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 // So arg[6] is at [rsp + 0]
                 // arg[7] is at [rsp + 8]
                 // arg[i] is at [rsp + (i-6)*8]
-                
-                int offset = (i - 6) * 8;
-                MasmOperand dst = masm_operand_memory_simple(MASM_X86_RSP, offset, 8);
-                
+
+                int         offset = (i - 6) * 8;
+                MasmOperand dst    = masm_operand_memory_simple(MASM_X86_RSP, offset, 8);
+
                 if (arg_op.kind == MASM_OPERAND_MEMORY)
                 {
                     // memory-to-memory move requires intermediate register
