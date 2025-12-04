@@ -26,6 +26,16 @@ typedef struct LowerContext
     int32_t   stack_offset;
     AstList  *local_vars; // List of LocalVar
 
+    // deferred statements (fin)
+    AstNode **deferred;
+    int       deferred_count;
+    int       deferred_capacity;
+
+    // loop defer stack markers (index into deferred stack)
+    int *loop_defer_stack;
+    int  loop_defer_count;
+    int  loop_defer_capacity;
+
     // Loop labels for break/continue
     char *loop_start_label;
     char *loop_end_label;
@@ -43,6 +53,14 @@ static LowerContext *create_context()
     ctx->stack_offset = 0;
     ctx->local_vars   = malloc(sizeof(AstList));
     ast_list_init(ctx->local_vars);
+
+    ctx->deferred          = malloc(sizeof(AstNode *) * 8);
+    ctx->deferred_count    = 0;
+    ctx->deferred_capacity = 8;
+
+    ctx->loop_defer_stack     = malloc(sizeof(int) * 8);
+    ctx->loop_defer_count     = 0;
+    ctx->loop_defer_capacity  = 8;
     ctx->loop_start_label = NULL;
     ctx->loop_end_label   = NULL;
     regalloc_init(&ctx->regalloc);
@@ -54,7 +72,52 @@ static void destroy_context(LowerContext *ctx)
     if (ctx)
     {
         free(ctx->vars);
+        free(ctx->deferred);
+        free(ctx->loop_defer_stack);
+        free(ctx->local_vars);
         free(ctx);
+    }
+}
+
+static void        lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContext *ctx);
+static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx);
+static void        lower_inline_masm(Masm *masm, MasmSection *text, const char *content, LowerContext *ctx);
+static MasmOperand parse_operand(const char *str, LowerContext *ctx);
+
+static void push_deferred(LowerContext *ctx, AstNode *stmt)
+{
+    if (ctx->deferred_count >= ctx->deferred_capacity)
+    {
+        ctx->deferred_capacity *= 2;
+        ctx->deferred = realloc(ctx->deferred, sizeof(AstNode *) * ctx->deferred_capacity);
+    }
+    ctx->deferred[ctx->deferred_count++] = stmt;
+}
+
+static void emit_deferred_from(Masm *masm, MasmSection *text, LowerContext *ctx, int start_index)
+{
+    for (int i = ctx->deferred_count - 1; i >= start_index; i--)
+    {
+        lower_stmt(masm, text, ctx->deferred[i], ctx);
+    }
+    ctx->deferred_count = start_index;
+}
+
+static void push_loop_defer_mark(LowerContext *ctx, int mark)
+{
+    if (ctx->loop_defer_count >= ctx->loop_defer_capacity)
+    {
+        ctx->loop_defer_capacity *= 2;
+        ctx->loop_defer_stack = realloc(ctx->loop_defer_stack, sizeof(int) * ctx->loop_defer_capacity);
+    }
+    ctx->loop_defer_stack[ctx->loop_defer_count++] = mark;
+}
+
+static void pop_loop_defer_mark(LowerContext *ctx)
+{
+    if (ctx->loop_defer_count > 0)
+    {
+        ctx->loop_defer_count--;
     }
 }
 
@@ -82,11 +145,6 @@ static LocalVar *find_local_var(LowerContext *ctx, const char *name)
     }
     return NULL;
 }
-
-static void        lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContext *ctx);
-static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx);
-static void        lower_inline_masm(Masm *masm, MasmSection *text, const char *content, LowerContext *ctx);
-static MasmOperand parse_operand(const char *str, LowerContext *ctx);
 
 static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
 {
@@ -761,6 +819,37 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             }
         }
 
+        // determine if callee is variadic (last param type sentinel NULL)
+        bool is_variadic = false;
+        if (expr->call_expr.func && expr->call_expr.func->type && expr->call_expr.func->type->kind == TYPE_FUNCTION)
+        {
+            Type *ft = expr->call_expr.func->type;
+            if (ft->function.param_count > 0 && ft->function.param_types[ft->function.param_count - 1] == NULL)
+            {
+                is_variadic = true;
+            }
+        }
+
+        // for System V variadic calls, AL holds the number of XMM registers used
+        if (is_variadic)
+        {
+            int sse_args = 0;
+            if (args)
+            {
+                for (int i = 0; i < args->count && i < 8; i++)
+                {
+                    AstNode *arg = args->items[i];
+                    if (arg && arg->type && type_is_float(arg->type))
+                    {
+                        sse_args++;
+                    }
+                }
+            }
+
+            MasmOperand al = masm_operand_register(MASM_X86_RAX, 1);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, al, masm_operand_imm(sse_args & 0xFF)));
+        }
+
         // emit call
         AstNode *func = expr->call_expr.func;
         if (func->kind == AST_EXPR_IDENT)
@@ -1166,6 +1255,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, masm_operand_register(MASM_X86_RAX, 8), op));
         }
 
+        // run all deferred statements before returning
+        emit_deferred_from(masm, text, ctx, 0);
+
         // emit epilogue before return
         MasmOperand rbp = masm_operand_register(MASM_X86_RBP, 8);
         MasmOperand rsp = masm_operand_register(MASM_X86_RSP, 8);
@@ -1174,13 +1266,35 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
 
         masm_section_append_inst(text, masm_inst_0(MASM_OP_RET));
     }
+    else if (stmt->kind == AST_STMT_COMPTIME_IF || stmt->kind == AST_STMT_COMPTIME_OR)
+    {
+        // sema selects the active branch in taken_branch
+        if (stmt->comptime_if_stmt.taken_branch)
+        {
+            lower_stmt(masm, text, stmt->comptime_if_stmt.taken_branch, ctx);
+        }
+    }
     else if (stmt->kind == AST_STMT_BLOCK)
     {
+        int start_deferred = ctx->deferred_count;
+
+        // register deferred statements for this scope (LIFO execution on exit)
+        if (stmt->block_stmt.deferred_stmts)
+        {
+            for (int i = 0; i < stmt->block_stmt.deferred_stmts->count; i++)
+            {
+                push_deferred(ctx, stmt->block_stmt.deferred_stmts->items[i]);
+            }
+        }
+
         AstList *stmts = stmt->block_stmt.stmts;
         for (int i = 0; i < stmts->count; i++)
         {
             lower_stmt(masm, text, stmts->items[i], ctx);
         }
+
+        // run defers registered in this block on normal exit
+        emit_deferred_from(masm, text, ctx, start_deferred);
     }
     else if (stmt->kind == AST_STMT_VAR)
     {
@@ -1253,6 +1367,8 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_BRK)
     {
+        int defer_mark = ctx->loop_defer_count > 0 ? ctx->loop_defer_stack[ctx->loop_defer_count - 1] : ctx->deferred_count;
+        emit_deferred_from(masm, text, ctx, defer_mark);
         if (ctx->loop_end_label)
         {
             masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_end_label))));
@@ -1260,6 +1376,8 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_CNT)
     {
+        int defer_mark = ctx->loop_defer_count > 0 ? ctx->loop_defer_stack[ctx->loop_defer_count - 1] : ctx->deferred_count;
+        emit_deferred_from(masm, text, ctx, defer_mark);
         if (ctx->loop_start_label)
         {
             masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_start_label))));
@@ -1334,6 +1452,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         snprintf(start_label, sizeof(start_label), ".Lloop_start_%d", loop_counter);
         snprintf(end_label, sizeof(end_label), ".Lloop_end_%d", loop_counter++);
 
+        int defer_mark = ctx->deferred_count;
+        push_loop_defer_mark(ctx, defer_mark);
+
         // Save previous loop labels
         char *prev_start = ctx->loop_start_label;
         char *prev_end   = ctx->loop_end_label;
@@ -1376,6 +1497,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         free(ctx->loop_end_label);
         ctx->loop_start_label = prev_start;
         ctx->loop_end_label   = prev_end;
+
+        emit_deferred_from(masm, text, ctx, defer_mark);
+        pop_loop_defer_mark(ctx);
     }
     else if (stmt->kind == AST_STMT_OR)
     {
@@ -1440,6 +1564,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         snprintf(start_label, sizeof(start_label), ".Lfor_start_%d", label_counter);
         snprintf(end_label, sizeof(end_label), ".Lfor_end_%d", label_counter++);
 
+        int defer_mark = ctx->deferred_count;
+        push_loop_defer_mark(ctx, defer_mark);
+
         // save previous loop labels
         char *prev_start = ctx->loop_start_label;
         char *prev_end   = ctx->loop_end_label;
@@ -1495,9 +1622,14 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         free((void *)ctx->loop_end_label);
         ctx->loop_start_label = prev_start;
         ctx->loop_end_label   = prev_end;
+
+        emit_deferred_from(masm, text, ctx, defer_mark);
+        pop_loop_defer_mark(ctx);
     }
     else if (stmt->kind == AST_STMT_BRK)
     {
+        int defer_mark = ctx->loop_defer_count > 0 ? ctx->loop_defer_stack[ctx->loop_defer_count - 1] : ctx->deferred_count;
+        emit_deferred_from(masm, text, ctx, defer_mark);
         if (ctx->loop_end_label)
         {
             masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_end_label))));
@@ -1505,6 +1637,8 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_CNT)
     {
+        int defer_mark = ctx->loop_defer_count > 0 ? ctx->loop_defer_stack[ctx->loop_defer_count - 1] : ctx->deferred_count;
+        emit_deferred_from(masm, text, ctx, defer_mark);
         if (ctx->loop_start_label)
         {
             masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_start_label))));
