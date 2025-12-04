@@ -83,7 +83,9 @@ static MasmOperand parse_operand(const char *str, LowerContext *ctx);
 static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
 {
     (void)masm;
-    fprintf(stderr, "lower_expr kind: %d\n", expr->kind);
+    if (!expr) {
+        return masm_operand_none();
+    }
     
     if (expr->kind == AST_EXPR_LIT)
     {
@@ -127,7 +129,6 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         LocalVar *var = find_local_var(ctx, expr->ident_expr.name);
         if (var)
         {
-            fprintf(stderr, "Loading local var %s from offset %d\n", expr->ident_expr.name, var->offset);
             // load variable from [rbp + offset] into RAX
             MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
             MasmOperand result = masm_operand_register(MASM_X86_RAX, var->size);
@@ -136,12 +137,10 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
         else
         {
-            fprintf(stderr, "Looking for global var %s\n", expr->ident_expr.name);
             // Check global
             MasmSymbol *sym = masm_get_symbol(masm, expr->ident_expr.name);
             if (sym)
             {
-                fprintf(stderr, "Found global var %s\n", sym->name);
                 // Load address
                 MasmOperand addr = masm_operand_register(MASM_X86_RAX, 8);
                 MasmOperand label_op = masm_operand_label(strdup(sym->name));
@@ -267,55 +266,56 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 if (expr->binary_expr.left->unary_expr.op == TOKEN_AT)
                 {
                     // 1. Evaluate ptr -> RAX
-                MasmOperand ptr = lower_expr(masm, text, expr->binary_expr.left->unary_expr.expr, ctx);
-                
-                if (ptr.kind != MASM_OPERAND_REGISTER)
-                {
-                    MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, ptr));
-                    ptr = rax;
-                }
-                
-                // Push ptr
-                masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, ptr));
-                
-                // 2. Evaluate RHS -> RAX
-                MasmOperand val = lower_expr(masm, text, expr->binary_expr.right, ctx);
-                
-                // Move val to RCX
-                MasmOperand val_reg;
-                if (val.kind == MASM_OPERAND_REGISTER)
-                {
-                    if (val.reg.id == MASM_X86_RAX)
+                    MasmOperand ptr = lower_expr(masm, text, expr->binary_expr.left->unary_expr.expr, ctx);
+                    
+                    if (ptr.kind != MASM_OPERAND_REGISTER)
+                    {
+                        MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, ptr));
+                        ptr = rax;
+                    }
+                    
+                    // Push ptr
+                    masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, ptr));
+                    
+                    // 2. Evaluate RHS -> RAX
+                    MasmOperand val = lower_expr(masm, text, expr->binary_expr.right, ctx);
+                    
+                    // Move val to RCX
+                    MasmOperand val_reg;
+                    if (val.kind == MASM_OPERAND_REGISTER)
+                    {
+                        if (val.reg.id == MASM_X86_RAX)
+                        {
+                            val_reg = masm_operand_register(MASM_X86_RCX, 8);
+                            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
+                        }
+                        else
+                        {
+                            val_reg = val;
+                        }
+                    }
+                    else
                     {
                         val_reg = masm_operand_register(MASM_X86_RCX, 8);
                         masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
                     }
-                    else
-                    {
-                        val_reg = val;
-                    }
+                    
+                    // 3. Pop ptr -> RAX
+                    MasmOperand ptr_reg = masm_operand_register(MASM_X86_RAX, 8);
+                    masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, ptr_reg));
+                    
+                    // 4. Store [ptr] = val
+                    int size = 4;
+                    if (expr->binary_expr.left->type) size = expr->binary_expr.left->type->size;
+                    
+                    MasmOperand dst = masm_operand_memory_simple(ptr_reg.reg.id, 0, size);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val_reg));
+                    
+                    // Return val (in RCX) moved to RAX
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, ptr_reg, val_reg));
+                    return ptr_reg;
                 }
-                else
-                {
-                    val_reg = masm_operand_register(MASM_X86_RCX, 8);
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
-                }
-                
-                // 3. Pop ptr -> RAX
-                MasmOperand ptr_reg = masm_operand_register(MASM_X86_RAX, 8);
-                masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, ptr_reg));
-                
-                // 4. Store [ptr] = val
-                int size = 4;
-                if (expr->binary_expr.left->type) size = expr->binary_expr.left->type->size;
-                
-                MasmOperand dst = masm_operand_memory_simple(ptr_reg.reg.id, 0, size);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val_reg));
-                
-                // Return val (in RCX) moved to RAX
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, ptr_reg, val_reg));
-                return ptr_reg;
             }
             else if (expr->binary_expr.left->kind == AST_EXPR_INDEX || 
                      expr->binary_expr.left->kind == AST_EXPR_FIELD)
@@ -1021,8 +1021,6 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     }
     return masm_operand_none();
 }
-    return masm_operand_none();
-}
 
 static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContext *ctx)
 {
@@ -1053,7 +1051,6 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_VAR)
     {
-        fprintf(stderr, "Lowering local var %s\n", stmt->var_stmt.name);
         // determine size
         size_t size = 8;
         if (stmt->type)
@@ -1080,7 +1077,6 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         // if there's an initializer, evaluate and store it
         if (stmt->var_stmt.init)
         {
-            fprintf(stderr, "Var %s has init\n", stmt->var_stmt.name);
             MasmOperand value = lower_expr(masm, text, stmt->var_stmt.init, ctx);
             
             // store value to stack location [rbp + offset]
@@ -1521,12 +1517,7 @@ static MasmOperand parse_operand(const char *str, LowerContext *ctx)
         LocalVar *var = find_local_var(ctx, str);
         if (var)
         {
-            fprintf(stderr, "Found inline masm var %s at offset %d\n", str, var->offset);
             return masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
-        }
-        else
-        {
-             fprintf(stderr, "Inline masm var %s not found\n", str);
         }
     }
     
@@ -1661,7 +1652,6 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
 static void lower_global_var(Masm *masm, AstNode *stmt)
 {
     const char *name = stmt->var_stmt.name;
-    fprintf(stderr, "Lowering global var %s\n", name);
     
     // Determine size
     size_t size = 8;
