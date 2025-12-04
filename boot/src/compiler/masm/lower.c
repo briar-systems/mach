@@ -1953,6 +1953,29 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
 }
 
 static void lower_global_var(Masm *masm, AstNode *stmt);
+static bool is_function_decl_in_program(AstNode *program, AstNode *decl)
+{
+    if (!program || program->kind != AST_PROGRAM || !decl)
+    {
+        return false;
+    }
+
+    AstList *stmts = program->program.stmts;
+    if (!stmts)
+    {
+        return false;
+    }
+
+    for (int i = 0; i < stmts->count; i++)
+    {
+        if (stmts->items[i] == decl)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
 {
@@ -1972,6 +1995,42 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
             else if (decl->kind == AST_STMT_VAR)
             {
                 lower_global_var(masm, decl);
+            }
+        }
+
+        // lower any instantiated generic functions that are not part of the original AST
+        if (symbols)
+        {
+            for (Symbol *sym = symbols->symbols; sym; sym = sym->next)
+            {
+                if (sym->kind != SYMBOL_FUNCTION)
+                {
+                    continue;
+                }
+
+                if (sym->is_generic)
+                {
+                    // skip generic templates; only instantiated copies are lowered
+                    continue;
+                }
+
+                if (!sym->decl || sym->decl->kind != AST_STMT_FUN)
+                {
+                    continue;
+                }
+
+                if (is_function_decl_in_program(ast, sym->decl))
+                {
+                    continue; // already lowered from the program AST
+                }
+
+                // skip external/FFI functions with no body
+                if (!sym->decl->fun_stmt.body)
+                {
+                    continue;
+                }
+
+                lower_function(masm, sym->decl, symbols);
             }
         }
     }
