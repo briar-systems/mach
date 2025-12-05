@@ -78,6 +78,8 @@ int masm_elf_write(Masm *masm, const char *filename)
     size_t  current_offset = 0;
     uint8_t dummy_buffer[16];
 
+    uint64_t entry_offset   = 0;
+
     for (size_t i = 0; i < text->inst_count; i++)
     {
         MasmInstruction *inst = &text->instructions[i];
@@ -90,6 +92,11 @@ int masm_elf_write(Masm *masm, const char *filename)
                 {
                     sym->offset = current_offset;
                 }
+            }
+
+            if (strcmp(inst->operands[0].label, "_start") == 0)
+            {
+                entry_offset = current_offset;
             }
         }
         else if (inst->opcode == MASM_OP_MOV && inst->operands[1].kind == MASM_OPERAND_LABEL)
@@ -106,6 +113,36 @@ int masm_elf_write(Masm *masm, const char *filename)
     }
 
     size_t text_size = current_offset;
+
+    // fallback: if _start wasn't seen in pass 1 (e.g., due to ordering), try symbol table
+    if (entry_offset == 0)
+    {
+        MasmSymbol *start_sym = masm_get_symbol(masm, "_start");
+        if (start_sym && start_sym->offset != 0)
+        {
+            entry_offset = start_sym->offset;
+        }
+        else
+        {
+            // search for any symbol ending with "_start" (e.g., namespaced)
+            for (size_t si = 0; si < masm->symbol_count; si++)
+            {
+                MasmSymbol *sym = masm->symbols[si];
+                if (!sym || !sym->name)
+                {
+                    continue;
+                }
+                size_t nlen = strlen(sym->name);
+                const char *suffix = "_start";
+                size_t slen = strlen(suffix);
+                if (nlen >= slen && strcmp(sym->name + (nlen - slen), suffix) == 0)
+                {
+                    entry_offset = sym->offset;
+                    break;
+                }
+            }
+        }
+    }
 
     // Layout
     uint64_t base_addr = 0x400000;
@@ -156,13 +193,6 @@ int masm_elf_write(Masm *masm, const char *filename)
     if (seg2_memsz > 0)
     {
         phnum++;
-    }
-
-    uint64_t    entry_offset = 0;
-    MasmSymbol *start_sym    = masm_get_symbol(masm, "_start");
-    if (start_sym)
-    {
-        entry_offset = start_sym->offset;
     }
 
     // write elf header

@@ -1663,10 +1663,30 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 
     while (token)
     {
-        // skip whitespace
+        // trim leading whitespace
         while (*token == ' ' || *token == '\t')
         {
             token++;
+        }
+
+        // strip inline comments starting with '#'
+        char *comment = strchr(token, '#');
+        if (comment)
+        {
+            *comment = '\0';
+        }
+
+        // trim trailing whitespace now that comments are stripped
+        size_t tlen = strlen(token);
+        while (tlen > 0 && (token[tlen - 1] == ' ' || token[tlen - 1] == '\t' || token[tlen - 1] == '\r'))
+        {
+            token[--tlen] = '\0';
+        }
+
+        if (*token == '\0')
+        {
+            token = strtok_r(NULL, "\n;", &saveptr);
+            continue;
         }
 
         if (strncmp(token, "syscall", 7) == 0)
@@ -1757,6 +1777,81 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
             MasmOperand dst_op = parse_operand(reg, ctx);
             masm_section_append_inst(text, masm_inst_1(MASM_OP_SETE, dst_op));
         }
+        else if (strncmp(token, "lea ", 4) == 0)
+        {
+            char *operands = token + 4;
+            char *comma    = strchr(operands, ',');
+            if (comma)
+            {
+                *comma     = '\0';
+                char *dest = operands;
+                char *src  = comma + 1;
+
+                while (*dest == ' ')
+                {
+                    dest++;
+                }
+                while (*src == ' ')
+                {
+                    src++;
+                }
+
+                MasmOperand dst_op = parse_operand(dest, ctx);
+                MasmOperand src_op = parse_operand(src, ctx);
+
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, dst_op, src_op));
+            }
+        }
+        else if (strncmp(token, "and ", 4) == 0)
+        {
+            char *operands = token + 4;
+            char *comma    = strchr(operands, ',');
+            if (comma)
+            {
+                *comma     = '\0';
+                char *dest = operands;
+                char *src  = comma + 1;
+
+                while (*dest == ' ')
+                {
+                    dest++;
+                }
+                while (*src == ' ')
+                {
+                    src++;
+                }
+
+                MasmOperand dst_op = parse_operand(dest, ctx);
+                MasmOperand src_op = parse_operand(src, ctx);
+
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, dst_op, src_op));
+            }
+        }
+        else if (strncmp(token, "sub ", 4) == 0)
+        {
+            char *operands = token + 4;
+            char *comma    = strchr(operands, ',');
+            if (comma)
+            {
+                *comma     = '\0';
+                char *dest = operands;
+                char *src  = comma + 1;
+
+                while (*dest == ' ')
+                {
+                    dest++;
+                }
+                while (*src == ' ')
+                {
+                    src++;
+                }
+
+                MasmOperand dst_op = parse_operand(dest, ctx);
+                MasmOperand src_op = parse_operand(src, ctx);
+
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_SUB, dst_op, src_op));
+            }
+        }
         else if (strncmp(token, "mov ", 4) == 0)
         {
             // parse mov instruction: "mov rax, 60"
@@ -1795,33 +1890,48 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 static MasmOperand parse_operand(const char *str, LowerContext *ctx)
 {
     // parse register or immediate
-    if (strcmp(str, "rax") == 0)
+    if (strcmp(str, "rax") == 0) return masm_operand_register(MASM_X86_RAX, 8);
+    if (strcmp(str, "eax") == 0) return masm_operand_register(MASM_X86_RAX, 4);
+    if (strcmp(str, "al") == 0) return masm_operand_register(MASM_X86_RAX, 1);
+    if (strcmp(str, "rdi") == 0) return masm_operand_register(MASM_X86_RDI, 8);
+    if (strcmp(str, "rsi") == 0) return masm_operand_register(MASM_X86_RSI, 8);
+    if (strcmp(str, "rdx") == 0) return masm_operand_register(MASM_X86_RDX, 8);
+    if (strcmp(str, "rcx") == 0) return masm_operand_register(MASM_X86_RCX, 8);
+    if (strcmp(str, "rsp") == 0) return masm_operand_register(MASM_X86_RSP, 8);
+    if (strcmp(str, "rbp") == 0) return masm_operand_register(MASM_X86_RBP, 8);
+
+    // parse simple memory operands: [reg] or [reg+imm]
+    if (str[0] == '[')
     {
-        return masm_operand_register(MASM_X86_RAX, 8);
-    }
-    if (strcmp(str, "eax") == 0)
-    {
-        return masm_operand_register(MASM_X86_RAX, 4);
-    }
-    if (strcmp(str, "al") == 0)
-    {
-        return masm_operand_register(MASM_X86_RAX, 1);
-    }
-    if (strcmp(str, "rdi") == 0)
-    {
-        return masm_operand_register(MASM_X86_RDI, 8);
-    }
-    if (strcmp(str, "rsi") == 0)
-    {
-        return masm_operand_register(MASM_X86_RSI, 8);
-    }
-    if (strcmp(str, "rdx") == 0)
-    {
-        return masm_operand_register(MASM_X86_RDX, 8);
-    }
-    if (strcmp(str, "rcx") == 0)
-    {
-        return masm_operand_register(MASM_X86_RCX, 8);
+        size_t len = strlen(str);
+        if (len >= 3 && str[len - 1] == ']')
+        {
+            char  inner[64];
+            size_t copy_len = len - 2 < sizeof(inner) - 1 ? len - 2 : sizeof(inner) - 1;
+            memcpy(inner, str + 1, copy_len);
+            inner[copy_len] = '\0';
+
+            // split on '+' if present
+            char *plus = strchr(inner, '+');
+            char *reg_str = inner;
+            char *off_str = NULL;
+            if (plus)
+            {
+                *plus   = '\0';
+                off_str = plus + 1;
+            }
+
+            MasmOperand base = parse_operand(reg_str, ctx);
+            if (base.kind == MASM_OPERAND_REGISTER)
+            {
+                int64_t disp = 0;
+                if (off_str)
+                {
+                    disp = strtoll(off_str, NULL, 0);
+                }
+                return masm_operand_memory_simple(base.reg.id, (int32_t)disp, 8);
+            }
+        }
     }
 
     // parse immediate (number)
