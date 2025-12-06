@@ -128,7 +128,7 @@ static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, u
         ctx->var_capacity *= 2;
         ctx->vars = realloc(ctx->vars, sizeof(LocalVar) * ctx->var_capacity);
     }
-    ctx->vars[ctx->var_count].name   = name;
+    ctx->vars[ctx->var_count].name   = strdup(name);
     ctx->vars[ctx->var_count].offset = offset;
     ctx->vars[ctx->var_count].size   = size;
     ctx->var_count++;
@@ -854,7 +854,15 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         AstNode *func = expr->call_expr.func;
         if (func->kind == AST_EXPR_IDENT)
         {
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_CALL, masm_operand_label(strdup(func->ident_expr.name))));
+            const char *call_name = func->ident_expr.name;
+            Symbol     *call_sym  = func->symbol;
+
+            if (call_sym && call_sym->export_name)
+            {
+                call_name = call_sym->export_name;
+            }
+
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_CALL, masm_operand_label(strdup(call_name))));
         }
         else
         {
@@ -1349,18 +1357,29 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             }
             else if (value.kind == MASM_OPERAND_MEMORY)
             {
-                // Memory to Memory copy
-                int32_t src_disp = value.mem.disp;
+                bool has_index = value.mem.index.size != 0 || value.mem.scale != 0;
 
-                // copy in 8-byte chunks
-                for (size_t i = 0; i < size; i += 8)
+                // if indexed or small, load once into tmp then store
+                if (has_index || size <= 8)
                 {
-                    MasmOperand src_chunk = masm_operand_memory_simple(value.mem.base.id, src_disp + i, 8);
-                    MasmOperand dst_chunk = masm_operand_memory_simple(MASM_X86_RBP, offset + i, 8);
-
                     MasmOperand tmp = masm_operand_register(MASM_X86_RAX, 8);
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src_chunk));
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst_chunk, tmp));
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, value));
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, tmp));
+                }
+                else
+                {
+                    // Memory to Memory copy in 8-byte chunks
+                    int32_t src_disp = value.mem.disp;
+
+                    for (size_t i = 0; i < size; i += 8)
+                    {
+                        MasmOperand src_chunk = masm_operand_memory_simple(value.mem.base.id, src_disp + i, 8);
+                        MasmOperand dst_chunk = masm_operand_memory_simple(MASM_X86_RBP, offset + i, 8);
+
+                        MasmOperand tmp = masm_operand_register(MASM_X86_RAX, 8);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src_chunk));
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst_chunk, tmp));
+                    }
                 }
             }
         }
@@ -1959,39 +1978,52 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
 {
     (void)symbols;
 
-    // use export_name if available (from $funcname.name = "..."), otherwise use AST name
-    const char *func_name = func_node->fun_stmt.name;
-    if (func_node->symbol)
+    // determine name and entry flag before mangling/linkage
+    const char *ast_name = func_node->fun_stmt.name;
+    bool        is_entry = ast_name && strcmp(ast_name, "_start") == 0;
+
+    // prefer explicit export name, otherwise use AST name (keep _start unmangled)
+    const char *func_name = ast_name;
+    if (func_node->symbol && func_node->symbol->export_name)
     {
-        const char *link_name = symbol_get_linkage_name(func_node->symbol);
-        if (link_name)
-        {
-            func_name = link_name;
-        }
+        func_name = func_node->symbol->export_name;
     }
 
-    MasmSymbol *sym = masm_symbol_create(func_name, MASM_SYMBOL_FUNCTION, MASM_BIND_GLOBAL);
+    if (is_entry)
+    {
+        func_name = "_start";
+    }
+
+    fprintf(stderr, "[lower] func %s (entry=%d)\n", func_name, is_entry);
+
+    char *func_name_copy = strdup(func_name);
+    MasmSymbol *sym = masm_symbol_create(func_name_copy, MASM_SYMBOL_FUNCTION, MASM_BIND_GLOBAL);
     masm_add_symbol(masm, sym);
 
     MasmSection *text = masm_get_or_create_section(masm, ".text", MASM_SECTION_TEXT);
 
-    masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(func_name)));
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(func_name))));
 
     // create context for this function
     LowerContext *ctx = create_context();
 
-    // emit prologue: push rbp; mov rbp, rsp
     MasmOperand rbp = masm_operand_register(MASM_X86_RBP, 8);
     MasmOperand rsp = masm_operand_register(MASM_X86_RSP, 8);
-    masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, rbp));
-    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rbp, rsp));
 
-    // reserve space for locals (placeholder, will be patched)
-    size_t sub_rsp_idx = text->inst_count;
-    masm_section_append_inst(text, masm_inst_2(MASM_OP_SUB, rsp, masm_operand_imm(0)));
+    size_t sub_rsp_idx = 0;
+    if (!is_entry)
+    {
+        // emit prologue: push rbp; mov rbp, rsp
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_PUSH, rbp));
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rbp, rsp));
 
-    // handle parameters
-    if (func_node->fun_stmt.params)
+        // reserve space for locals (placeholder, will be patched)
+        sub_rsp_idx = text->inst_count;
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_SUB, rsp, masm_operand_imm(0)));
+    }
+
+    // handle parameters (skip for _start)
+    if (!is_entry && func_node->fun_stmt.params)
     {
         AstList *params = func_node->fun_stmt.params;
         for (int i = 0; i < params->count; i++)
@@ -2014,16 +2046,12 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
             }
             else
             {
-                // stack parameter
-                // [rbp + 16 + (i-6)*8]
                 int32_t     stack_param_offset = 16 + (i - 6) * 8;
                 MasmOperand src                = masm_operand_memory_simple(MASM_X86_RBP, stack_param_offset, 8);
                 MasmOperand dst                = masm_operand_memory_simple(MASM_X86_RBP, offset, 8);
                 MasmOperand rax                = masm_operand_register(MASM_X86_RAX, 8);
 
-                // mov rax, [rbp + offset]
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, src));
-                // mov [rbp - local], rax
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, rax));
             }
         }
@@ -2034,59 +2062,25 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
         lower_stmt(masm, text, func_node->fun_stmt.body, ctx);
     }
 
-    // patch stack allocation
-    // stack grows down, so stack_offset is negative.
-    // size = -stack_offset
-    // align to 16 bytes
-    int32_t frame_size = -ctx->stack_offset;
-    if (frame_size % 16 != 0)
+    if (!is_entry)
     {
-        frame_size = (frame_size + 15) & ~15;
-    }
+        // patch stack allocation
+        int32_t frame_size = -ctx->stack_offset;
+        if (frame_size % 16 != 0)
+        {
+            frame_size = (frame_size + 15) & ~15;
+        }
 
-    if (frame_size > 0)
-    {
-        text->instructions[sub_rsp_idx].operands[1].imm = frame_size;
+        if (frame_size > 0)
+        {
+            text->instructions[sub_rsp_idx].operands[1].imm = frame_size;
+        }
     }
-    else
-    {
-        // if no locals, we can make this a NOP or just SUB RSP, 0 (which is harmless but wasteful)
-        // For now, SUB RSP, 0 is fine, or we could overwrite with NOP if we had one.
-        // Actually, we can just leave it as SUB RSP, 0.
-    }
-
-    // emit epilogue: mov rsp, rbp; pop rbp; ret
-    // Note: ret statements will already emit ret, so we only add epilogue if function doesn't end with ret
-    // For now, always add epilogue before ret in lower_stmt for AST_STMT_RET
 
     destroy_context(ctx);
 }
 
 static void lower_global_var(Masm *masm, AstNode *stmt);
-static bool is_function_decl_in_program(AstNode *program, AstNode *decl)
-{
-    if (!program || program->kind != AST_PROGRAM || !decl)
-    {
-        return false;
-    }
-
-    AstList *stmts = program->program.stmts;
-    if (!stmts)
-    {
-        return false;
-    }
-
-    for (int i = 0; i < stmts->count; i++)
-    {
-        if (stmts->items[i] == decl)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
 {
     MasmTarget target = masm_target_native();
@@ -2108,41 +2102,9 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
             }
         }
 
-        // lower any instantiated generic functions that are not part of the original AST
-        if (symbols)
-        {
-            for (Symbol *sym = symbols->symbols; sym; sym = sym->next)
-            {
-                if (sym->kind != SYMBOL_FUNCTION)
-                {
-                    continue;
-                }
-
-                if (sym->is_generic)
-                {
-                    // skip generic templates; only instantiated copies are lowered
-                    continue;
-                }
-
-                if (!sym->decl || sym->decl->kind != AST_STMT_FUN)
-                {
-                    continue;
-                }
-
-                if (is_function_decl_in_program(ast, sym->decl))
-                {
-                    continue; // already lowered from the program AST
-                }
-
-                // skip external/FFI functions with no body
-                if (!sym->decl->fun_stmt.body)
-                {
-                    continue;
-                }
-
-                lower_function(masm, sym->decl, symbols);
-            }
-        }
+        // TODO: lower instantiated generic functions not present in the original AST
+        // disabled for now to avoid duplicate lowering of functions that are already present
+        // in the program AST.
     }
 
     return masm;
