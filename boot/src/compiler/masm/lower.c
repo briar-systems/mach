@@ -196,7 +196,16 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         LocalVar *var = find_local_var(ctx, expr->ident_expr.name);
         if (var)
         {
-            // load variable from [rbp + offset] into RAX
+            // arrays/large aggregates: return address with LEA
+            if (var->size > 8)
+            {
+                MasmOperand result = masm_operand_register(MASM_X86_RAX, 8);
+                MasmOperand addr   = masm_operand_memory_simple(MASM_X86_RBP, var->offset, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, result, addr));
+                return result;
+            }
+
+            // scalar: load value
             MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
             MasmOperand result  = masm_operand_register(MASM_X86_RAX, var->size);
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, var_mem));
@@ -208,13 +217,17 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             MasmSymbol *sym = masm_get_symbol(masm, expr->ident_expr.name);
             if (sym)
             {
-                // Load address
+                // For aggregates/arrays, return address in RAX
                 MasmOperand addr     = masm_operand_register(MASM_X86_RAX, 8);
                 MasmOperand label_op = masm_operand_label(strdup(sym->name));
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, addr, label_op));
 
-                // Load value
-                // [RAX]
+                if (sym->size > 8)
+                {
+                    return addr;
+                }
+
+                // scalar: load value from address
                 MasmOperand mem    = masm_operand_memory_simple(MASM_X86_RAX, 0, sym->size > 8 ? 8 : sym->size);
                 MasmOperand result = masm_operand_register(MASM_X86_RAX, sym->size > 8 ? 8 : sym->size);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, mem));
@@ -1136,14 +1149,6 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 return masm_operand_none();
             }
 
-            if (elem_size == 1)
-            {
-                MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, mem));
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, rax, masm_operand_imm(0xFF)));
-                return rax;
-            }
-
             return mem;
         }
         else
@@ -1200,14 +1205,6 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             else
             {
                 return masm_operand_none();
-            }
-
-            if (elem_size == 1)
-            {
-                MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, mem));
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, rax, masm_operand_imm(0xFF)));
-                return rax;
             }
 
             return mem;
@@ -1356,6 +1353,12 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         if (stmt->type)
         {
             size = stmt->type->size;
+
+            // compute array size explicitly if missing
+            if (size == 0 && stmt->type->kind == TYPE_ARRAY && stmt->type->array.elem_type)
+            {
+                size = stmt->type->array.count * stmt->type->array.elem_type->size;
+            }
         }
         else if (stmt->var_stmt.init && stmt->var_stmt.init->type)
         {
