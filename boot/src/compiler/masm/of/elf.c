@@ -74,234 +74,75 @@ int masm_elf_write(Masm *masm, const char *filename)
         return -1;
     }
 
-    // pass 1: calculate offsets and record label positions
-    size_t  current_offset = 0;
-    uint8_t dummy_buffer[16];
-
-    uint64_t entry_offset   = 0;
+    // pass 1: compute instruction sizes and symbol offsets consistently
+    size_t current_offset = 0;
+    uint64_t entry_offset = 0;
 
     for (size_t i = 0; i < text->inst_count; i++)
     {
         MasmInstruction *inst = &text->instructions[i];
+
         if (inst->opcode == MASM_OP_LABEL)
         {
-            if (inst->operands[0].label)
+            const char *lbl = inst->operands[0].label;
+            if (lbl && strcmp(lbl, ".text") != 0)
             {
-                const char *lbl = inst->operands[0].label;
-                if (strcmp(lbl, ".text") == 0)
-                {
-                    continue; // skip bogus label
-                }
-
                 MasmSymbol *sym = masm_get_symbol(masm, lbl);
                 if (sym)
                 {
-                    bool is_start = strcmp(sym->name, "_start") == 0;
-                    if (sym->section_name == NULL)
-                    {
-                        sym->section_name = strdup(text->name);
-                        sym->offset       = current_offset;
-                    }
-                    else if (is_start && current_offset > sym->offset)
-                    {
-                        sym->offset = current_offset;
-                    }
-                    else if (!is_start && current_offset < sym->offset)
-                    {
-                        sym->offset = current_offset;
-                    }
+                    sym->section_name = sym->section_name ? sym->section_name : strdup(text->name);
+                    sym->offset       = current_offset;
                 }
-            }
-
-            if (inst->operands[0].label && strcmp(inst->operands[0].label, "_start") == 0)
-            {
-                if (current_offset > entry_offset)
+                if (strcmp(lbl, "_start") == 0)
                 {
                     entry_offset = current_offset;
                 }
             }
-            fprintf(stderr, "[label] %s @ %zu\n", inst->operands[0].label, current_offset);
+            continue;
+        }
+
+        size_t sz = 0;
+        if (inst->opcode == MASM_OP_CALL && inst->operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            sz = 5;
+        }
+        else if (inst->opcode == MASM_OP_JMP && inst->operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            sz = 5;
+        }
+        else if (inst->opcode >= MASM_OP_JE && inst->opcode <= MASM_OP_JLE && inst->operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            sz = 6;
         }
         else if (inst->opcode == MASM_OP_MOV && inst->operands[1].kind == MASM_OPERAND_LABEL)
         {
-            // MOV reg64, label -> MOV reg64, imm64
-            // Size is 10 bytes (2 opcode + 8 immediate)
-            current_offset += 10;
-        }
-        else if (inst->opcode == MASM_OP_CALL && inst->operands[0].kind == MASM_OPERAND_LABEL)
-        {
-            // CALL rel32
-            current_offset += 5;
+            // encode with placeholder imm64
+            MasmOperand     imm_op   = masm_operand_imm(0);
+            MasmInstruction tmp_inst = masm_inst_2(MASM_OP_MOV, inst->operands[0], imm_op);
+            sz = masm_x86_encode(tmp_inst, NULL, 0);
+            masm_inst_destroy(tmp_inst);
         }
         else
         {
-            size_t sz = masm_x86_encode(*inst, dummy_buffer, sizeof(dummy_buffer));
-            current_offset += sz;
+            sz = masm_x86_encode(*inst, NULL, 0);
         }
+
+        current_offset += sz;
     }
 
     size_t text_size = current_offset;
 
-    for (size_t si = 0; si < masm->symbol_count; si++)
-    {
-        MasmSymbol *sym = masm->symbols[si];
-        if (sym && sym->name)
-        {
-            fprintf(stderr, "[sym] %s sec=%s off=%lu\n", sym->name, sym->section_name ? sym->section_name : "?", sym->offset);
-        }
-    }
+    size_t rodata_size = rodata ? rodata->data_size : 0;
+    size_t data_size   = data ? data->data_size : 0;
+    size_t bss_size    = bss ? bss->data_size : 0;
 
-    // fallback: if _start wasn't seen in pass 1 (e.g., due to ordering), try symbol table
-    if (entry_offset == 0)
-    {
-        MasmSymbol *start_sym = masm_get_symbol(masm, "_start");
-        if (start_sym && start_sym->offset != 0)
-        {
-            entry_offset = start_sym->offset;
-        }
-        else
-        {
-            // search for any symbol ending with "_start" (e.g., namespaced)
-            for (size_t si = 0; si < masm->symbol_count; si++)
-            {
-                MasmSymbol *sym = masm->symbols[si];
-                if (!sym || !sym->name)
-                {
-                    continue;
-                }
-                size_t nlen = strlen(sym->name);
-                const char *suffix = "_start";
-                size_t slen = strlen(suffix);
-                if (nlen >= slen && strcmp(sym->name + (nlen - slen), suffix) == 0)
-                {
-                    entry_offset = sym->offset;
-                    break;
-                }
-            }
-        }
-    }
+    // base address constant for layout
+    uint64_t base_addr   = 0x400000;
 
-    // Layout
-    uint64_t base_addr = 0x400000;
-
-    // Segment 1: Text + Rodata
-    uint64_t seg1_offset = 0x1000;
-    uint64_t seg1_vaddr  = base_addr + seg1_offset;
-    size_t   seg1_filesz = text_size;
-    size_t   seg1_memsz  = text_size;
-
-    size_t rodata_size         = rodata ? rodata->data_size : 0;
-    size_t rodata_start_offset = text_size;
-
-    if (rodata_size > 0)
-    {
-        // Align rodata to 16 bytes
-        size_t padding = (16 - (seg1_filesz % 16)) % 16;
-        seg1_filesz += padding;
-        seg1_memsz += padding;
-        rodata_start_offset = seg1_filesz;
-
-        seg1_filesz += rodata_size;
-        seg1_memsz += rodata_size;
-    }
-
-    // Segment 2: Data + BSS
-    // Align to page boundary (0x1000)
-    uint64_t seg2_offset = (seg1_offset + seg1_filesz + 0xFFF) & ~0xFFF;
-    uint64_t seg2_vaddr  = base_addr + seg2_offset;
-    size_t   seg2_filesz = 0;
-    size_t   seg2_memsz  = 0;
-
-    size_t data_size = data ? data->data_size : 0;
-    size_t bss_size  = bss ? bss->data_size : 0;
-
-    if (data_size > 0 || bss_size > 0)
-    {
-        seg2_filesz = data_size + bss_size;
-        seg2_memsz  = seg2_filesz;
-        printf("Data size: %zu, BSS size: %zu\n", data_size, bss_size);
-        if (data_size > 0)
-        {
-            printf("Data content: %02x %02x %02x %02x\n", data->data[0], data->data[1], data->data[2], data->data[3]);
-        }
-    }
-
-    int phnum = 1;
-    if (seg2_memsz > 0)
-    {
-        phnum++;
-    }
-
-    // write elf header
-    Elf64_Ehdr ehdr;
-    memset(&ehdr, 0, sizeof(ehdr));
-    ehdr.e_ident[0]  = 0x7F;
-    ehdr.e_ident[1]  = 'E';
-    ehdr.e_ident[2]  = 'L';
-    ehdr.e_ident[3]  = 'F';
-    ehdr.e_ident[4]  = 2;
-    ehdr.e_ident[5]  = 1;
-    ehdr.e_ident[6]  = 1;
-    ehdr.e_ident[7]  = 0;
-    ehdr.e_type      = ET_EXEC;
-    ehdr.e_machine   = EM_X86_64;
-    ehdr.e_version   = 1;
-    ehdr.e_entry     = seg1_vaddr + entry_offset;
-    ehdr.e_phoff     = sizeof(Elf64_Ehdr);
-    ehdr.e_shoff     = 0;
-    ehdr.e_ehsize    = sizeof(Elf64_Ehdr);
-    ehdr.e_phentsize = sizeof(Elf64_Phdr);
-    ehdr.e_phnum     = phnum;
-    ehdr.e_shentsize = 0;
-    ehdr.e_shnum     = 0;
-    ehdr.e_shstrndx  = 0;
-
-    fwrite(&ehdr, 1, sizeof(ehdr), f);
-
-    // write program header
-    Elf64_Phdr phdr;
-    memset(&phdr, 0, sizeof(phdr));
-    phdr.p_type   = PT_LOAD;
-    phdr.p_flags  = PF_R | PF_X;
-    phdr.p_offset = seg1_offset;
-    phdr.p_vaddr  = seg1_vaddr;
-    phdr.p_paddr  = seg1_vaddr;
-    phdr.p_filesz = seg1_filesz;
-    phdr.p_memsz  = seg1_memsz;
-    phdr.p_align  = 0x1000;
-
-    fwrite(&phdr, 1, sizeof(phdr), f);
-
-    if (phnum > 1)
-    {
-        Elf64_Phdr phdr2;
-        memset(&phdr2, 0, sizeof(phdr2));
-        phdr2.p_type   = PT_LOAD;
-        phdr2.p_flags  = PF_R | PF_W;
-        phdr2.p_offset = seg2_offset;
-        phdr2.p_vaddr  = seg2_vaddr;
-        phdr2.p_paddr  = seg2_vaddr;
-        phdr2.p_filesz = seg2_filesz;
-        phdr2.p_memsz  = seg2_memsz;
-        phdr2.p_align  = 0x1000;
-        fwrite(&phdr2, 1, sizeof(phdr2), f);
-    }
-
-    fseek(f, seg1_offset, SEEK_SET);
-
-    uint8_t *code_buffer  = malloc(text_size);
+    size_t   buf_cap      = text_size > 0 ? text_size : 64;
+    uint8_t *code_buffer  = malloc(buf_cap);
     size_t   code_size    = 0;
     int      label_errors = 0;
-
-    // debug: dump all label instructions
-    for (size_t i = 0; i < text->inst_count; i++)
-    {
-        MasmInstruction *inst = &text->instructions[i];
-        if (inst->opcode == MASM_OP_LABEL && inst->operands[0].label && strcmp(inst->operands[0].label, ".text") != 0)
-        {
-            fprintf(stderr, "[label2] %s (idx=%zu)\n", inst->operands[0].label, i);
-        }
-    }
 
     // pass 2: encode with label resolution
     for (size_t i = 0; i < text->inst_count; i++)
@@ -420,6 +261,176 @@ int masm_elf_write(Masm *masm, const char *filename)
         else if (inst.opcode == MASM_OP_MOV && inst.operands[1].kind == MASM_OPERAND_LABEL)
         {
             // MOV reg, label -> MOV reg, imm64 (absolute address)
+            // first pass: just account for size using a placeholder immediate
+            MasmOperand     imm_op   = masm_operand_imm(0);
+            MasmInstruction tmp_inst = masm_inst_2(MASM_OP_MOV, inst.operands[0], imm_op);
+            code_size += masm_x86_encode(tmp_inst, code_buffer + code_size, buf_cap - code_size);
+            masm_inst_destroy(tmp_inst);
+            continue;
+        }
+
+        // ensure capacity (worst-case instruction length ~15 bytes)
+        if (code_size + 16 > buf_cap)
+        {
+            buf_cap *= 2;
+            code_buffer = realloc(code_buffer, buf_cap);
+        }
+
+        code_size += masm_x86_encode(inst, code_buffer + code_size, buf_cap - code_size);
+    }
+
+    // use the actual encoded size for text size
+    text_size = code_size;
+
+    // recompute accurate entry_offset using final instruction sizes
+    size_t recomputed_offset = 0;
+    for (size_t i = 0; i < text->inst_count; i++)
+    {
+        MasmInstruction inst = text->instructions[i];
+        if (inst.opcode == MASM_OP_LABEL)
+        {
+            if (inst.operands[0].label && strcmp(inst.operands[0].label, "_start") == 0)
+            {
+                entry_offset = recomputed_offset;
+                break;
+            }
+            continue;
+        }
+
+        if (inst.opcode == MASM_OP_CALL && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            recomputed_offset += 5;
+        }
+        else if (inst.opcode == MASM_OP_JMP && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            recomputed_offset += 5;
+        }
+        else if (inst.opcode >= MASM_OP_JE && inst.opcode <= MASM_OP_JLE && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            recomputed_offset += 6;
+        }
+        else if (inst.opcode == MASM_OP_MOV && inst.operands[1].kind == MASM_OPERAND_LABEL)
+        {
+            MasmOperand     imm_op   = masm_operand_imm(0);
+            MasmInstruction tmp_inst = masm_inst_2(MASM_OP_MOV, inst.operands[0], imm_op);
+            recomputed_offset += masm_x86_encode(tmp_inst, NULL, 0);
+            masm_inst_destroy(tmp_inst);
+        }
+        else
+        {
+            recomputed_offset += masm_x86_encode(inst, NULL, 0);
+        }
+    }
+
+    // layout now that final text_size is known
+    size_t rodata_start_offset = text_size;
+    uint64_t seg1_offset = 0x1000;
+    uint64_t seg1_vaddr  = base_addr + seg1_offset;
+    size_t   seg1_filesz = text_size;
+    size_t   seg1_memsz  = text_size;
+
+    if (rodata_size > 0)
+    {
+        size_t pad = (16 - (seg1_filesz % 16)) % 16;
+        seg1_filesz += pad;
+        seg1_memsz += pad;
+        rodata_start_offset = seg1_filesz;
+        seg1_filesz += rodata_size;
+        seg1_memsz += rodata_size;
+    }
+
+    uint64_t seg2_offset = (seg1_offset + seg1_filesz + 0xFFF) & ~0xFFF;
+    uint64_t seg2_vaddr  = base_addr + seg2_offset;
+    size_t   seg2_filesz = 0;
+    size_t   seg2_memsz  = 0;
+    if (data_size > 0 || bss_size > 0)
+    {
+        seg2_filesz = data_size + bss_size;
+        seg2_memsz  = seg2_filesz;
+    }
+
+    int phnum = 1 + (seg2_memsz > 0 ? 1 : 0);
+
+    // re-encode with correct layout for label-based MOV (rodata/data addresses)
+    code_size = 0;
+    if (buf_cap < text_size)
+    {
+        buf_cap = text_size;
+        code_buffer = realloc(code_buffer, buf_cap);
+    }
+
+    for (size_t i = 0; i < text->inst_count; i++)
+    {
+        MasmInstruction inst = text->instructions[i];
+        if (inst.opcode == MASM_OP_LABEL)
+        {
+            continue;
+        }
+
+        if (inst.opcode == MASM_OP_CALL && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            MasmSymbol *target = masm_get_symbol(masm, inst.operands[0].label);
+            if (target)
+            {
+                int64_t rel64 = (int64_t)target->offset - (int64_t)(code_size + 5);
+                int32_t rel   = (int32_t)rel64;
+                code_buffer[code_size++] = 0xE8;
+                for (int k = 0; k < 4; k++) code_buffer[code_size++] = (rel >> (k * 8)) & 0xFF;
+                continue;
+            }
+            else
+            {
+                label_errors++;
+                continue;
+            }
+        }
+        else if (inst.opcode == MASM_OP_JMP && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            MasmSymbol *target = masm_get_symbol(masm, inst.operands[0].label);
+            if (target)
+            {
+                int64_t rel64 = (int64_t)target->offset - (int64_t)(code_size + 5);
+                int32_t rel   = (int32_t)rel64;
+                code_buffer[code_size++] = 0xE9;
+                for (int k = 0; k < 4; k++) code_buffer[code_size++] = (rel >> (k * 8)) & 0xFF;
+                continue;
+            }
+            else
+            {
+                label_errors++;
+                continue;
+            }
+        }
+        else if (inst.opcode >= MASM_OP_JE && inst.opcode <= MASM_OP_JLE && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            MasmSymbol *target = masm_get_symbol(masm, inst.operands[0].label);
+            if (target)
+            {
+                int64_t rel64 = (int64_t)target->offset - (int64_t)(code_size + 6);
+                int32_t rel   = (int32_t)rel64;
+                code_buffer[code_size++] = 0x0F;
+                uint8_t opcode = 0x84;
+                switch (inst.opcode)
+                {
+                case MASM_OP_JNE: opcode = 0x85; break;
+                case MASM_OP_JL: opcode = 0x8C; break;
+                case MASM_OP_JG: opcode = 0x8F; break;
+                case MASM_OP_JLE: opcode = 0x8E; break;
+                case MASM_OP_JGE: opcode = 0x8D; break;
+                default: opcode = 0x84; break;
+                }
+                code_buffer[code_size++] = opcode;
+                for (int k = 0; k < 4; k++) code_buffer[code_size++] = (rel >> (k * 8)) & 0xFF;
+                continue;
+            }
+            else
+            {
+                label_errors++;
+                continue;
+            }
+        }
+        else if (inst.opcode == MASM_OP_MOV && inst.operands[1].kind == MASM_OPERAND_LABEL)
+        {
             MasmSymbol *sym = masm_get_symbol(masm, inst.operands[1].label);
             if (sym)
             {
@@ -441,30 +452,29 @@ int masm_elf_write(Masm *masm, const char *filename)
                     addr = seg1_vaddr + sym->offset;
                 }
 
-                printf("Resolving label %s to %lx (sec: %s)\n", sym->name, addr, sym->section_name);
-
-                // Create a temporary instruction with IMM operand
                 MasmOperand     imm_op   = masm_operand_imm(addr);
                 MasmInstruction tmp_inst = masm_inst_2(MASM_OP_MOV, inst.operands[0], imm_op);
-
-                code_size += masm_x86_encode(tmp_inst, code_buffer + code_size, text_size - code_size);
-
-                // Don't destroy tmp_inst operands as they share memory or are stack allocated
-                // masm_inst_2 allocates array for operands, so we should free it
+                code_size += masm_x86_encode(tmp_inst, code_buffer + code_size, buf_cap - code_size);
                 masm_inst_destroy(tmp_inst);
                 continue;
             }
             else
             {
-                fprintf(stderr, "warning: undefined symbol '%s' (skipping mov label)\n", inst.operands[1].label);
+                label_errors++;
                 continue;
             }
         }
 
-        code_size += masm_x86_encode(inst, code_buffer + code_size, text_size - code_size);
+        if (code_size + 16 > buf_cap)
+        {
+            buf_cap *= 2;
+            code_buffer = realloc(code_buffer, buf_cap);
+        }
+        code_size += masm_x86_encode(inst, code_buffer + code_size, buf_cap - code_size);
     }
 
-    // abort if there were label resolution errors
+    text_size = code_size;
+
     if (label_errors > 0)
     {
         fprintf(stderr, "error: %d label resolution error(s)\n", label_errors);
@@ -473,11 +483,64 @@ int masm_elf_write(Masm *masm, const char *filename)
         return -1;
     }
 
-    fwrite(code_buffer, 1, code_size, f);
-    free(code_buffer);
+    // rewind and write ELF headers with final sizes
+    fseek(f, 0, SEEK_SET);
 
-    // Padding for Rodata
-    size_t padding = rodata_start_offset - text_size;
+    Elf64_Ehdr ehdr;
+    memset(&ehdr, 0, sizeof(ehdr));
+    ehdr.e_ident[0]  = 0x7F;
+    ehdr.e_ident[1]  = 'E';
+    ehdr.e_ident[2]  = 'L';
+    ehdr.e_ident[3]  = 'F';
+    ehdr.e_ident[4]  = 2;
+    ehdr.e_ident[5]  = 1;
+    ehdr.e_ident[6]  = 1;
+    ehdr.e_ident[7]  = 0;
+    ehdr.e_type      = ET_EXEC;
+    ehdr.e_machine   = EM_X86_64;
+    ehdr.e_version   = 1;
+    ehdr.e_entry     = seg1_vaddr + entry_offset;
+    ehdr.e_phoff     = sizeof(Elf64_Ehdr);
+    ehdr.e_shoff     = 0;
+    ehdr.e_ehsize    = sizeof(Elf64_Ehdr);
+    ehdr.e_phentsize = sizeof(Elf64_Phdr);
+    ehdr.e_phnum     = phnum;
+    ehdr.e_shentsize = 0;
+    ehdr.e_shnum     = 0;
+    ehdr.e_shstrndx  = 0;
+    fwrite(&ehdr, 1, sizeof(ehdr), f);
+
+    Elf64_Phdr phdr;
+    memset(&phdr, 0, sizeof(phdr));
+    phdr.p_type   = PT_LOAD;
+    phdr.p_flags  = PF_R | PF_X;
+    phdr.p_offset = seg1_offset;
+    phdr.p_vaddr  = seg1_vaddr;
+    phdr.p_paddr  = seg1_vaddr;
+    phdr.p_filesz = seg1_filesz;
+    phdr.p_memsz  = seg1_memsz;
+    phdr.p_align  = 0x1000;
+    fwrite(&phdr, 1, sizeof(phdr), f);
+
+    if (phnum > 1)
+    {
+        Elf64_Phdr phdr2;
+        memset(&phdr2, 0, sizeof(phdr2));
+        phdr2.p_type   = PT_LOAD;
+        phdr2.p_flags  = PF_R | PF_W;
+        phdr2.p_offset = seg2_offset;
+        phdr2.p_vaddr  = seg2_vaddr;
+        phdr2.p_paddr  = seg2_vaddr;
+        phdr2.p_filesz = seg2_filesz;
+        phdr2.p_memsz  = seg2_memsz;
+        phdr2.p_align  = 0x1000;
+        fwrite(&phdr2, 1, sizeof(phdr2), f);
+    }
+
+    fseek(f, seg1_offset, SEEK_SET);
+    fwrite(code_buffer, 1, code_size, f);
+
+    size_t padding = rodata_start_offset > text_size ? rodata_start_offset - text_size : 0;
     if (padding > 0)
     {
         uint8_t *pad = calloc(1, padding);
@@ -485,26 +548,19 @@ int masm_elf_write(Masm *masm, const char *filename)
         free(pad);
     }
 
-    // Rodata
     if (rodata_size > 0)
     {
         fwrite(rodata->data, 1, rodata_size, f);
     }
 
-    // Segment 2
     if (phnum > 1)
     {
         fseek(f, seg2_offset, SEEK_SET);
-        if (data_size > 0)
-        {
-            fwrite(data->data, 1, data_size, f);
-        }
-        if (bss_size > 0)
-        {
-            fwrite(bss->data, 1, bss_size, f);
-        }
+        if (data_size > 0) fwrite(data->data, 1, data_size, f);
+        if (bss_size > 0) fwrite(bss->data, 1, bss_size, f);
     }
 
+    free(code_buffer);
     fclose(f);
     return 0;
 }

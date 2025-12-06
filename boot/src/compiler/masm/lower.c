@@ -1075,8 +1075,23 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     else if (expr->kind == AST_EXPR_INDEX)
     {
         // arr[i]
-        MasmOperand arr = lower_expr(masm, text, expr->index_expr.array, ctx);
+        // evaluate index first to keep base register live afterwards
         MasmOperand idx = lower_expr(masm, text, expr->index_expr.index, ctx);
+
+        // stash index into RCX early so later evaluations (array) won't clobber it
+        MasmOperand idx_reg;
+        if (idx.kind != MASM_OPERAND_REGISTER)
+        {
+            idx_reg = masm_operand_register(MASM_X86_RCX, 8);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, idx_reg, idx));
+        }
+        else
+        {
+            idx_reg = masm_operand_register(MASM_X86_RCX, 8);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, idx_reg, idx));
+        }
+
+        MasmOperand arr = lower_expr(masm, text, expr->index_expr.array, ctx);
 
         Type *arr_type = expr->index_expr.array->type;
         if (!arr_type)
@@ -1105,26 +1120,41 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         {
             int64_t offset = idx.imm * elem_size;
 
+            MasmOperand mem;
             if (arr.kind == MASM_OPERAND_REGISTER)
             {
                 // [reg + offset]
-                return masm_operand_memory_simple(arr.reg.id, offset, elem_size);
+                mem = masm_operand_memory_simple(arr.reg.id, offset, elem_size);
             }
             else if (arr.kind == MASM_OPERAND_MEMORY)
             {
                 // [base + disp + offset]
-                return masm_operand_memory_simple(arr.mem.base.id, arr.mem.disp + offset, elem_size);
+                mem = masm_operand_memory_simple(arr.mem.base.id, arr.mem.disp + offset, elem_size);
             }
+            else
+            {
+                return masm_operand_none();
+            }
+
+            if (elem_size == 1)
+            {
+                MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, mem));
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, rax, masm_operand_imm(0xFF)));
+                return rax;
+            }
+
+            return mem;
         }
         else
         {
             // Register index
-            MasmOperand idx_reg = idx;
-            if (idx.kind != MASM_OPERAND_REGISTER)
+            // ensure base and index do not alias; if arr uses RCX, move idx to RDX
+            if (arr.kind == MASM_OPERAND_REGISTER && arr.reg.id == idx_reg.reg.id)
             {
-                MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, idx));
-                idx_reg = rax;
+                MasmOperand rdx = masm_operand_register(MASM_X86_RDX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rdx, idx_reg));
+                idx_reg = rdx;
             }
 
             // Check if scale is valid (1, 2, 4, 8)
@@ -1151,12 +1181,13 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 elem_size = 1; // scale is now 1
             }
 
+            MasmOperand mem;
             if (arr.kind == MASM_OPERAND_REGISTER)
             {
                 // [base + index * scale]
                 MasmRegister base  = {arr.reg.id, 8};
                 MasmRegister index = {idx_reg.reg.id, 8};
-                return masm_operand_memory(base, index, elem_size, 0, elem_type->size);
+                mem = masm_operand_memory(base, index, elem_size, 0, elem_type->size);
             }
             else if (arr.kind == MASM_OPERAND_MEMORY)
             {
@@ -1164,8 +1195,22 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 // arr.mem.base is usually RBP
                 MasmRegister base  = arr.mem.base;
                 MasmRegister index = {idx_reg.reg.id, 8};
-                return masm_operand_memory(base, index, elem_size, arr.mem.disp, elem_type->size);
+                mem = masm_operand_memory(base, index, elem_size, arr.mem.disp, elem_type->size);
             }
+            else
+            {
+                return masm_operand_none();
+            }
+
+            if (elem_size == 1)
+            {
+                MasmOperand rax = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, mem));
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, rax, masm_operand_imm(0xFF)));
+                return rax;
+            }
+
+            return mem;
         }
 
         return masm_operand_none();
@@ -1485,7 +1530,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         masm_add_symbol(masm, masm_symbol_create(ctx->loop_end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
 
         // Emit start label
-        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(ctx->loop_start_label)));
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(ctx->loop_start_label))));
 
         // Condition
         if (stmt->for_stmt.cond)
@@ -1499,17 +1544,17 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             }
 
             masm_section_append_inst(text, masm_inst_2(MASM_OP_CMP, result, masm_operand_imm(0)));
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_JE, masm_operand_label(ctx->loop_end_label)));
+            masm_section_append_inst(text, masm_inst_1(MASM_OP_JE, masm_operand_label(strdup(ctx->loop_end_label))));
         }
 
         // Body
         lower_stmt(masm, text, stmt->for_stmt.body, ctx);
 
         // Jump back to start
-        masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(ctx->loop_start_label)));
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_start_label))));
 
         // Emit end label
-        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(ctx->loop_end_label)));
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(ctx->loop_end_label))));
 
         // Restore previous loop labels
         free(ctx->loop_start_label);
