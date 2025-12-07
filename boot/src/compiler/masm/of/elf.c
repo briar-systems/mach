@@ -322,12 +322,12 @@ int masm_elf_write(Masm *masm, const char *filename)
         }
     }
 
-    // layout now that final text_size is known
+    // layout now that text_size is known (will be recomputed after final encode as well)
     size_t rodata_start_offset = text_size;
-    uint64_t seg1_offset = 0x1000;
-    uint64_t seg1_vaddr  = base_addr + seg1_offset;
-    size_t   seg1_filesz = text_size;
-    size_t   seg1_memsz  = text_size;
+    uint64_t seg1_offset       = 0x1000;
+    uint64_t seg1_vaddr        = base_addr + seg1_offset;
+    size_t   seg1_filesz       = text_size;
+    size_t   seg1_memsz        = text_size;
 
     if (rodata_size > 0)
     {
@@ -474,6 +474,36 @@ int masm_elf_write(Masm *masm, const char *filename)
     }
 
     text_size = code_size;
+
+    // recompute layout with final text_size so program header sizes match written data
+    rodata_start_offset = text_size;
+    seg1_filesz         = text_size;
+    seg1_memsz          = text_size;
+
+    if (rodata_size > 0)
+    {
+        size_t pad = (16 - (seg1_filesz % 16)) % 16;
+        seg1_filesz += pad;
+        seg1_memsz += pad;
+        rodata_start_offset = seg1_filesz;
+        seg1_filesz += rodata_size;
+        seg1_memsz += rodata_size;
+    }
+
+    // ensure the load segment covers everything we will write (text + rodata)
+    seg1_filesz = rodata_start_offset + (rodata_size > 0 ? rodata_size : 0);
+    seg1_memsz  = seg1_filesz;
+
+    seg2_offset = (seg1_offset + seg1_filesz + 0xFFF) & ~0xFFF;
+    seg2_vaddr  = base_addr + seg2_offset;
+    seg2_filesz = 0;
+    seg2_memsz  = 0;
+    if (data_size > 0 || bss_size > 0)
+    {
+        seg2_filesz = data_size + bss_size;
+        seg2_memsz  = seg2_filesz;
+    }
+    phnum = 1 + (seg2_memsz > 0 ? 1 : 0);
 
     if (label_errors > 0)
     {

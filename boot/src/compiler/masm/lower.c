@@ -190,6 +190,33 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             return res;
         }
     }
+    else if (expr->kind == AST_EXPR_CAST)
+    {
+        MasmOperand inner = lower_expr(masm, text, expr->cast_expr.expr, ctx);
+        uint8_t     size  = (expr->type && expr->type->size) ? expr->type->size : 8;
+
+        if (inner.kind == MASM_OPERAND_REGISTER)
+        {
+            inner.reg.size = size;
+            return inner;
+        }
+        else if (inner.kind == MASM_OPERAND_IMM)
+        {
+            return inner; // keep immediate; size handled by consumers
+        }
+        else if (inner.kind == MASM_OPERAND_MEMORY)
+        {
+            MasmOperand dst = masm_operand_register(MASM_X86_RAX, size > 8 ? 8 : size);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, inner));
+            return dst;
+        }
+        return inner;
+    }
+    else if (expr->kind == AST_EXPR_NULL)
+    {
+        // nil literal
+        return masm_operand_imm(0);
+    }
     else if (expr->kind == AST_EXPR_IDENT)
     {
         // variable access - load from stack
@@ -209,6 +236,12 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
             MasmOperand result  = masm_operand_register(MASM_X86_RAX, var->size);
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, var_mem));
+            if (var->size < 4)
+            {
+                uint64_t mask = (var->size == 1) ? 0xFFull : 0xFFFFull;
+                MasmOperand rax64 = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, rax64, masm_operand_imm(mask)));
+            }
             return result;
         }
         else
@@ -360,23 +393,21 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                     // 2. Evaluate RHS -> RAX
                     MasmOperand val = lower_expr(masm, text, expr->binary_expr.right, ctx);
 
-                    // Move val to RCX
-                    MasmOperand val_reg;
-                    if (val.kind == MASM_OPERAND_REGISTER)
+                    int store_size = 8;
+                    if (expr->binary_expr.left->type && expr->binary_expr.left->type->size > 0)
                     {
-                        if (val.reg.id == MASM_X86_RAX)
-                        {
-                            val_reg = masm_operand_register(MASM_X86_RCX, 8);
-                            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
-                        }
-                        else
-                        {
-                            val_reg = val;
-                        }
+                        store_size = expr->binary_expr.left->type->size;
+                        if (store_size > 8) store_size = 8;
+                    }
+
+                    // Move val to RCX with correct width
+                    MasmOperand val_reg = masm_operand_register(MASM_X86_RCX, store_size);
+                    if (val.kind == MASM_OPERAND_REGISTER && val.reg.id == val_reg.reg.id && val.reg.size == store_size)
+                    {
+                        // already correct register/width
                     }
                     else
                     {
-                        val_reg = masm_operand_register(MASM_X86_RCX, 8);
                         masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
                     }
 
@@ -385,12 +416,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                     masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, ptr_reg));
 
                     // 4. Store [ptr] = val
-                    int size = 4;
-                    if (expr->binary_expr.left->type)
-                    {
-                        size = expr->binary_expr.left->type->size;
-                    }
-
+                    int size = store_size;
                     MasmOperand dst = masm_operand_memory_simple(ptr_reg.reg.id, 0, size);
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val_reg));
 
@@ -415,19 +441,18 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 // 4. Evaluate RHS
                 MasmOperand val = lower_expr(masm, text, expr->binary_expr.right, ctx);
 
-                // 5. Move val to RCX (to free RAX)
-                MasmOperand val_reg = masm_operand_register(MASM_X86_RCX, 8);
-                if (val.kind == MASM_OPERAND_REGISTER)
+                // 5. Move val to RCX (to free RAX) using correct width
+                int store_size = expr->binary_expr.left->type ? expr->binary_expr.left->type->size : 8;
+                if (store_size == 0) store_size = 8;
+                if (store_size > 8) store_size = 8;
+
+                MasmOperand val_reg = masm_operand_register(MASM_X86_RCX, store_size);
+                if (val.kind == MASM_OPERAND_REGISTER && val.reg.id == val_reg.reg.id && val.reg.size == store_size)
                 {
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
-                }
-                else if (val.kind == MASM_OPERAND_IMM)
-                {
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
+                    // already correct
                 }
                 else
                 {
-                    // memory to register
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, val_reg, val));
                 }
 
@@ -436,6 +461,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
                 // 7. Store [RAX] = RCX
                 int         size = expr->binary_expr.left->type->size;
+                if (size == 0) size = store_size;
                 MasmOperand dst  = masm_operand_memory_simple(MASM_X86_RAX, 0, size);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val_reg));
 
@@ -595,10 +621,19 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 {
                     MasmOperand eax = masm_operand_register(MASM_X86_RAX, 4);
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, eax, left));
+                    // mov r/m32 zero-extends to 64-bit in x86_64, so no extra mask needed
                 }
                 else
                 {
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, left));
+                    // zero-extend smaller loads to avoid garbage in upper bits when later
+                    // operations widen the register (e.g., test on full rax)
+                    if (left.mem.size < 4)
+                    {
+                        uint64_t mask = (left.mem.size == 1) ? 0xFFull : 0xFFFFull;
+                        MasmOperand rax64 = masm_operand_register(MASM_X86_RAX, 8);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, rax64, masm_operand_imm(mask)));
+                    }
                 }
             }
         }
@@ -673,6 +708,10 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         {
             opcode = MASM_OP_IDIV;
         }
+        else if (expr->binary_expr.op == TOKEN_PERCENT)
+        {
+            opcode = MASM_OP_IDIV; // use idiv to get remainder in RDX
+        }
         else if (expr->binary_expr.op == TOKEN_AMPERSAND)
         {
             opcode = MASM_OP_AND;
@@ -735,12 +774,43 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
         else if (opcode == MASM_OP_IDIV)
         {
+            // idiv requires divisor in r/m, not immediate. materialize immediates.
+            MasmOperand div_op = right_op;
+            if (right_op.kind == MASM_OPERAND_IMM)
+            {
+                MasmOperand rcx = masm_operand_register(MASM_X86_RCX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, right_op));
+                div_op = rcx;
+            }
+
+            // idiv uses RAX as dividend; ensure result is in RAX and save previous if needed
+            if (result.kind != MASM_OPERAND_REGISTER || result.reg.id != MASM_X86_RAX)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, masm_operand_register(MASM_X86_RAX, result.reg.size), result));
+                result = masm_operand_register(MASM_X86_RAX, result.reg.size);
+            }
+
             masm_section_append_inst(text, masm_inst_0(MASM_OP_CQO));
-            masm_section_append_inst(text, masm_inst_1(opcode, right_op));
+            masm_section_append_inst(text, masm_inst_1(opcode, div_op));
+
+            if (expr->binary_expr.op == TOKEN_PERCENT)
+            {
+                // remainder in RDX
+                MasmOperand rdx = masm_operand_register(MASM_X86_RDX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, rdx));
+            }
         }
         else
         {
-            masm_section_append_inst(text, masm_inst_2(opcode, result, right_op));
+            // prefer 3-operand form for imul with immediates to ensure encoding support
+            if (opcode == MASM_OP_IMUL && right_op.kind == MASM_OPERAND_IMM)
+            {
+                masm_section_append_inst(text, masm_inst_3(opcode, result, result, right_op));
+            }
+            else
+            {
+                masm_section_append_inst(text, masm_inst_2(opcode, result, right_op));
+            }
         }
 
         return result;
@@ -907,20 +977,28 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     {
         if (expr->unary_expr.op == TOKEN_QUESTION)
         {
-            // Address-of: ?expr
-            AstNode *operand_node = expr->unary_expr.expr;
+            // Address-of: ?expr (produce pointer to lvalue)
+            MasmOperand val = lower_expr(masm, text, expr->unary_expr.expr, ctx);
 
-            if (operand_node->kind == AST_EXPR_IDENT)
+            if (val.kind == MASM_OPERAND_MEMORY)
             {
-                LocalVar *var = find_local_var(ctx, operand_node->ident_expr.name);
-                if (var)
-                {
-                    MasmOperand src = masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
-                    MasmOperand dst = masm_operand_register(MASM_X86_RAX, 8);
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, dst, src));
-                    return dst;
-                }
+                MasmOperand dst = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, dst, val));
+                return dst;
             }
+            else if (val.kind == MASM_OPERAND_LABEL)
+            {
+                // absolute address of label/rodata
+                MasmOperand dst = masm_operand_register(MASM_X86_RAX, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val));
+                return dst;
+            }
+            else if (val.kind == MASM_OPERAND_REGISTER)
+            {
+                // already a pointer
+                return val;
+            }
+
             return masm_operand_none();
         }
         else if (expr->unary_expr.op == TOKEN_AT)
@@ -1348,40 +1426,40 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_VAR)
     {
-        // determine size
-        size_t size = 8;
+        // determine logical size of the variable (do not inflate small types)
+        size_t var_size = 8;
         if (stmt->type)
         {
-            size = stmt->type->size;
+            var_size = stmt->type->size;
 
             // compute array size explicitly if missing
-            if (size == 0 && stmt->type->kind == TYPE_ARRAY && stmt->type->array.elem_type)
+            if (var_size == 0 && stmt->type->kind == TYPE_ARRAY && stmt->type->array.elem_type)
             {
-                size = stmt->type->array.count * stmt->type->array.elem_type->size;
+                var_size = stmt->type->array.count * stmt->type->array.elem_type->size;
             }
         }
         else if (stmt->var_stmt.init && stmt->var_stmt.init->type)
         {
-            size = stmt->var_stmt.init->type->size;
+            var_size = stmt->var_stmt.init->type->size;
         }
 
-        if (size == 0)
+        if (var_size == 0)
         {
-            size = 8; // fallback
+            var_size = 8; // fallback
         }
 
-        // align size to 8 bytes for stack slots
-        if (size % 8 != 0)
+        // allocate aligned stack space but keep the declared size for loads/stores
+        size_t alloc_size = var_size;
+        if (alloc_size % 8 != 0)
         {
-            size += (8 - (size % 8));
+            alloc_size += (8 - (alloc_size % 8));
         }
 
-        // allocate space on stack for variable
-        ctx->stack_offset -= size;
+        ctx->stack_offset -= alloc_size;
         int32_t offset = ctx->stack_offset;
 
-        // add to symbol table
-        add_local_var(ctx, stmt->var_stmt.name, offset, size);
+        // add to symbol table with the logical size (so later loads use correct width)
+        add_local_var(ctx, stmt->var_stmt.name, offset, (int)var_size);
 
         // if there's an initializer, evaluate and store it
         if (stmt->var_stmt.init)
@@ -1389,17 +1467,24 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             MasmOperand value = lower_expr(masm, text, stmt->var_stmt.init, ctx);
 
             // store value to stack location [rbp + offset]
-            MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, offset, size > 8 ? 8 : size);
+            MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, offset, var_size > 8 ? 8 : (int)var_size);
 
-            // if value is in a register, store it directly
+            // if value is in a register, match width (use subregister when narrower)
             if (value.kind == MASM_OPERAND_REGISTER)
             {
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, value));
+                MasmOperand src = value;
+                if (var_mem.mem.size < value.reg.size)
+                {
+                    src = masm_operand_register(value.reg.id, var_mem.mem.size);
+                }
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, src));
             }
-            // if value is immediate, move to register first
+            // if value is immediate, move to register first using correct width
             else if (value.kind == MASM_OPERAND_IMM)
             {
-                MasmOperand temp = masm_operand_register(MASM_X86_RAX, 8);
+                int reg_size = var_mem.mem.size;
+                if (reg_size < 1) reg_size = 8;
+                MasmOperand temp = masm_operand_register(MASM_X86_RAX, reg_size);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, value));
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, temp));
             }
@@ -1408,9 +1493,11 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                 bool has_index = value.mem.index.size != 0 || value.mem.scale != 0;
 
                 // if indexed or small, load once into tmp then store
-                if (has_index || size <= 8)
+                if (has_index || var_size <= 8)
                 {
-                    MasmOperand tmp = masm_operand_register(MASM_X86_RAX, 8);
+                    int reg_size = value.mem.size ? value.mem.size : var_mem.mem.size;
+                    if (reg_size == 0) reg_size = 8;
+                    MasmOperand tmp = masm_operand_register(MASM_X86_RAX, reg_size);
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, value));
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, tmp));
                 }
@@ -1419,7 +1506,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                     // Memory to Memory copy in 8-byte chunks
                     int32_t src_disp = value.mem.disp;
 
-                    for (size_t i = 0; i < size; i += 8)
+                    for (size_t i = 0; i < var_size; i += 8)
                     {
                         MasmOperand src_chunk = masm_operand_memory_simple(value.mem.base.id, src_disp + i, 8);
                         MasmOperand dst_chunk = masm_operand_memory_simple(MASM_X86_RBP, offset + i, 8);
@@ -2123,6 +2210,19 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
         {
             text->instructions[sub_rsp_idx].operands[1].imm = frame_size;
         }
+    }
+
+    // emit remaining deferred statements for fallthrough paths
+    emit_deferred_from(masm, text, ctx, 0);
+
+    if (!is_entry)
+    {
+        // implicit epilogue for functions without explicit return
+        MasmOperand rbp = masm_operand_register(MASM_X86_RBP, 8);
+        MasmOperand rsp = masm_operand_register(MASM_X86_RSP, 8);
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rsp, rbp));
+        masm_section_append_inst(text, masm_inst_1(MASM_OP_POP, rbp));
+        masm_section_append_inst(text, masm_inst_0(MASM_OP_RET));
     }
 
     destroy_context(ctx);
