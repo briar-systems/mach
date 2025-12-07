@@ -529,6 +529,46 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
         }
         break;
 
+    case MASM_OP_MOVZX:
+    case MASM_OP_MOVSX:
+        if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER &&
+            (inst.operands[1].kind == MASM_OPERAND_MEMORY || inst.operands[1].kind == MASM_OPERAND_REGISTER))
+        {
+            uint32_t dst     = inst.operands[0].reg.id;
+            bool     dst64   = inst.operands[0].reg.size == 8;
+            uint8_t  srcsize = (inst.operands[1].kind == MASM_OPERAND_MEMORY) ? inst.operands[1].mem.size : inst.operands[1].reg.size;
+            bool     src16   = srcsize == 2;
+            bool     src8    = srcsize == 1;
+            if (!(src8 || src16))
+                break; // unsupported width
+
+            uint8_t opcode = 0x0F;
+            uint8_t ext    = (inst.opcode == MASM_OP_MOVZX) ? (src16 ? 0xB7 : 0xB6) : (src16 ? 0xBF : 0xBE);
+
+            if (inst.operands[1].kind == MASM_OPERAND_REGISTER)
+            {
+                uint32_t src   = inst.operands[1].reg.id;
+                bool     rex_r = dst >= 8;                            // reg field
+                bool     rex_b = (src >= 8) || (src8 && src >= 4);    // rm field for high/low-byte regs
+                emit_rex(buffer, &offset, size, dst64, rex_r, false, rex_b);
+                emit_byte(buffer, &offset, size, opcode);
+                emit_byte(buffer, &offset, size, ext);
+                emit_byte(buffer, &offset, size, encode_modrm(0xC0, reg_low(dst), reg_low(src)));
+            }
+            else
+            {
+                bool rex_r = dst >= 8; // reg field
+                bool rex_x = inst.operands[1].mem.index.id >= 8;
+                bool rex_b = inst.operands[1].mem.base.id >= 8;
+                emit_rex(buffer, &offset, size, dst64, rex_r, rex_x, rex_b);
+                emit_byte(buffer, &offset, size, opcode);
+                emit_byte(buffer, &offset, size, ext);
+                emit_mem(buffer, &offset, size, inst.operands[1].mem.base.id, inst.operands[1].mem.index.id, inst.operands[1].mem.scale,
+                         (int32_t)inst.operands[1].mem.disp, dst);
+            }
+        }
+        break;
+
     case MASM_OP_LABEL:
         break;
 

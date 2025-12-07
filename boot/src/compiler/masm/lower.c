@@ -234,14 +234,15 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
             // scalar: load value
             MasmOperand var_mem = masm_operand_memory_simple(MASM_X86_RBP, var->offset, var->size);
-            MasmOperand result  = masm_operand_register(MASM_X86_RAX, var->size);
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, var_mem));
-            if (var->size < 4)
+            if (var->size == 1 || var->size == 2)
             {
-                uint64_t mask = (var->size == 1) ? 0xFFull : 0xFFFFull;
                 MasmOperand rax64 = masm_operand_register(MASM_X86_RAX, 8);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, rax64, masm_operand_imm(mask)));
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, rax64, var_mem));
+                return rax64;
             }
+
+            MasmOperand result = masm_operand_register(MASM_X86_RAX, var->size);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, var_mem));
             return result;
         }
         else
@@ -617,23 +618,19 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             }
             else if (left.kind == MASM_OPERAND_MEMORY)
             {
-                if (left.mem.size == 4)
+                if (left.mem.size == 1 || left.mem.size == 2)
                 {
-                    MasmOperand eax = masm_operand_register(MASM_X86_RAX, 4);
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, eax, left));
-                    // mov r/m32 zero-extends to 64-bit in x86_64, so no extra mask needed
+                    MasmOperand rax64 = masm_operand_register(MASM_X86_RAX, 8);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, rax64, left));
                 }
                 else
                 {
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, left));
-                    // zero-extend smaller loads to avoid garbage in upper bits when later
-                    // operations widen the register (e.g., test on full rax)
-                    if (left.mem.size < 4)
+                    MasmOperand mov_dst = result;
+                    if (left.mem.size == 4)
                     {
-                        uint64_t mask = (left.mem.size == 1) ? 0xFFull : 0xFFFFull;
-                        MasmOperand rax64 = masm_operand_register(MASM_X86_RAX, 8);
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, rax64, masm_operand_imm(mask)));
+                        mov_dst.reg.size = 4; // mov r/m32 zero-extends to 64-bit automatically
                     }
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, mov_dst, left));
                 }
             }
         }
@@ -2032,6 +2029,54 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 MasmOperand src_op = parse_operand(src, ctx);
 
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst_op, src_op));
+            }
+        }
+        else if (strncmp(token, "movzx ", 6) == 0)
+        {
+            char *operands = token + 6;
+            char *comma    = strchr(operands, ',');
+            if (comma)
+            {
+                *comma     = '\0';
+                char *dest = operands;
+                char *src  = comma + 1;
+
+                while (*dest == ' ')
+                {
+                    dest++;
+                }
+                while (*src == ' ')
+                {
+                    src++;
+                }
+
+                MasmOperand dst_op = parse_operand(dest, ctx);
+                MasmOperand src_op = parse_operand(src, ctx);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, dst_op, src_op));
+            }
+        }
+        else if (strncmp(token, "movsx ", 6) == 0)
+        {
+            char *operands = token + 6;
+            char *comma    = strchr(operands, ',');
+            if (comma)
+            {
+                *comma     = '\0';
+                char *dest = operands;
+                char *src  = comma + 1;
+
+                while (*dest == ' ')
+                {
+                    dest++;
+                }
+                while (*src == ' ')
+                {
+                    src++;
+                }
+
+                MasmOperand dst_op = parse_operand(dest, ctx);
+                MasmOperand src_op = parse_operand(src, ctx);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVSX, dst_op, src_op));
             }
         }
 
