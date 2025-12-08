@@ -1116,19 +1116,24 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
             sema_error(sema, node->token, "could not infer variable type");
             return -1;
         }
-        // check type compatibility if type was explicit
-        else if (sym->type && node->var_stmt.init->type)
+
+        // explicit variable type exists — align untyped numeric initializer with it
+        if (sym->type)
         {
             sema_infer_numeric_expr(node->var_stmt.init, sym->type);
 
+            if (!node->var_stmt.init->type && sema_is_untyped_numeric_literal(node->var_stmt.init) && type_is_numeric(sym->type))
+            {
+                node->var_stmt.init->type = sym->type;
+            }
+        }
+
+        // check type compatibility if both sides are now typed
+        if (sym->type && node->var_stmt.init->type)
+        {
             if (!type_can_assign_to(node->var_stmt.init->type, sym->type))
             {
                 sema_error(sema, node->token, "type mismatch: cannot assign type to variable");
-                return -1;
-            }
-
-            if (!sema_check_untyped_numeric(sema, node->var_stmt.init, "could not infer type of numeric literal for variable"))
-            {
                 return -1;
             }
         }

@@ -1578,7 +1578,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         static int label_counter = 0;
         char       else_label[32];
         char       end_label[32];
-        snprintf(else_label, sizeof(else_label), ".Lif_else_%d", label_counter);
+        snprintf(else_label, sizeof(else_label), ".Lif_or_%d", label_counter);
         snprintf(end_label, sizeof(end_label), ".Lif_end_%d", label_counter++);
 
         // evaluate condition
@@ -2205,7 +2205,9 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
         func_name = "_start";
     }
 
+    #ifdef MASM_DEBUG
     fprintf(stderr, "[lower] func %s (entry=%d)\n", func_name, is_entry);
+    #endif
 
     char *func_name_copy = strdup(func_name);
     MasmSymbol *sym = masm_symbol_create(func_name_copy, MASM_SYMBOL_FUNCTION, MASM_BIND_GLOBAL);
