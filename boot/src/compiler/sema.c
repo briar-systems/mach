@@ -43,6 +43,7 @@ struct Sema
     SymbolTable *current_table;
     int          error_count;
     char        *module_path;
+    Type        *current_function_return_type;
 
     // error list
     SemaError *errors;
@@ -101,22 +102,23 @@ Sema *sema_create(const char *module_path)
         return NULL;
     }
 
-    sema->root_table        = symbol_table_create(NULL);
-    sema->current_table     = sema->root_table;
-    sema->error_count       = 0;
-    sema->module_path       = module_path ? strdup(module_path) : NULL;
-    sema->errors            = NULL;
-    sema->errors_count      = 0;
-    sema->errors_capacity   = 0;
-    sema->current_file_path = NULL;
-    sema->current_source    = NULL;
-    sema->project_id        = NULL;
-    sema->src_root          = NULL;
-    sema->dep_root          = NULL;
-    sema->deps              = NULL;
-    sema->dep_count         = 0;
-    sema->loaded_modules    = NULL;
-    sema->import_aliases    = NULL;
+    sema->root_table                 = symbol_table_create(NULL);
+    sema->current_table              = sema->root_table;
+    sema->error_count                = 0;
+    sema->module_path                = module_path ? strdup(module_path) : NULL;
+    sema->errors                     = NULL;
+    sema->errors_count               = 0;
+    sema->errors_capacity            = 0;
+    sema->current_file_path          = NULL;
+    sema->current_source             = NULL;
+    sema->project_id                 = NULL;
+    sema->src_root                   = NULL;
+    sema->dep_root                   = NULL;
+    sema->deps                       = NULL;
+    sema->dep_count                  = 0;
+    sema->loaded_modules             = NULL;
+    sema->import_aliases             = NULL;
+    sema->current_function_return_type = NULL;
 
     return sema;
 }
@@ -449,6 +451,161 @@ static void sema_error(Sema *sema, Token *token, const char *message)
 // forward declarations for mutual recursion
 static int   sema_analyze_stmt(Sema *sema, AstNode *node);
 static int   sema_analyze_expr(Sema *sema, AstNode *node);
+
+// helpers for numeric literal inference
+static bool sema_try_infer_numeric_literal(AstNode *node, Type *target);
+static bool sema_is_untyped_numeric_literal(AstNode *node)
+{
+    if (!node || node->kind != AST_EXPR_LIT || !node->token)
+    {
+        return false;
+    }
+
+    if (node->type != NULL)
+    {
+        return false; // already has a type
+    }
+
+    if (node->token->type_suffix != NULL)
+    {
+        return false; // explicitly typed literal
+    }
+
+    return node->token->kind == TOKEN_LIT_INT || node->token->kind == TOKEN_LIT_FLOAT;
+}
+
+static void sema_infer_numeric_expr(AstNode *node, Type *target)
+{
+    if (!node || !target || !type_is_numeric(target))
+    {
+        return;
+    }
+
+    switch (node->kind)
+    {
+    case AST_EXPR_LIT:
+        sema_try_infer_numeric_literal(node, target);
+        break;
+
+    case AST_EXPR_UNARY:
+        sema_infer_numeric_expr(node->unary_expr.expr, target);
+        if (!node->type && node->unary_expr.expr && node->unary_expr.expr->type && type_is_numeric(node->unary_expr.expr->type))
+        {
+            node->type = node->unary_expr.expr->type;
+        }
+        break;
+
+    case AST_EXPR_BINARY:
+        sema_infer_numeric_expr(node->binary_expr.left, target);
+        sema_infer_numeric_expr(node->binary_expr.right, target);
+        if (!node->type)
+        {
+            if (node->binary_expr.left && node->binary_expr.left->type == target)
+            {
+                node->type = target;
+            }
+            else if (node->binary_expr.right && node->binary_expr.right->type == target)
+            {
+                node->type = target;
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+static bool sema_check_untyped_numeric(Sema *sema, AstNode *node, const char *message)
+{
+    if (!node)
+    {
+        return true;
+    }
+
+    if (sema_is_untyped_numeric_literal(node))
+    {
+        sema_error(sema, node->token, message);
+        return false;
+    }
+
+    switch (node->kind)
+    {
+    case AST_EXPR_UNARY:
+        return sema_check_untyped_numeric(sema, node->unary_expr.expr, message);
+
+    case AST_EXPR_BINARY:
+        return sema_check_untyped_numeric(sema, node->binary_expr.left, message) && sema_check_untyped_numeric(sema, node->binary_expr.right, message);
+
+    case AST_EXPR_CALL:
+        if (node->call_expr.args)
+        {
+            for (int i = 0; i < node->call_expr.args->count; i++)
+            {
+                if (!sema_check_untyped_numeric(sema, node->call_expr.args->items[i], message))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+
+    case AST_EXPR_ARRAY:
+        if (node->array_expr.elems)
+        {
+            for (int i = 0; i < node->array_expr.elems->count; i++)
+            {
+                if (!sema_check_untyped_numeric(sema, node->array_expr.elems->items[i], message))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+
+    case AST_EXPR_STRUCT:
+        if (node->struct_expr.fields)
+        {
+            for (int i = 0; i < node->struct_expr.fields->count; i++)
+            {
+                AstNode *field_init = node->struct_expr.fields->items[i];
+                if (field_init && !sema_check_untyped_numeric(sema, field_init->field_expr.object, message))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+
+    case AST_EXPR_FIELD:
+        return sema_check_untyped_numeric(sema, node->field_expr.object, message);
+
+    case AST_EXPR_CAST:
+        return sema_check_untyped_numeric(sema, node->cast_expr.expr, message);
+
+    case AST_EXPR_INDEX:
+        return sema_check_untyped_numeric(sema, node->index_expr.index, message);
+
+    default:
+        return true;
+    }
+}
+
+static bool sema_try_infer_numeric_literal(AstNode *node, Type *target)
+{
+    if (!target || !type_is_numeric(target))
+    {
+        return false;
+    }
+
+    if (!sema_is_untyped_numeric_literal(node))
+    {
+        return false;
+    }
+
+    node->type = target;
+    return true;
+}
 static Type *sema_resolve_type(Sema *sema, AstNode *type_node);
 static int   sema_collect_symbols(Sema *sema, AstNode *node);
 static int   sema_analyze_use(Sema *sema, AstNode *node);
@@ -860,6 +1017,9 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         SymbolTable *prev_table = sema->current_table;
         sema->current_table     = symbol_table_create(prev_table);
 
+        Type *prev_return_type               = sema->current_function_return_type;
+        sema->current_function_return_type = sym->type ? sym->type->function.return_type : NULL;
+
         // add parameters to scope
         if (node->fun_stmt.params)
         {
@@ -881,6 +1041,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         sema_analyze_stmt(sema, node->fun_stmt.body);
 
         sema->current_table = prev_table;
+        sema->current_function_return_type = prev_return_type;
     }
 
     return 0;
@@ -945,14 +1106,36 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
         {
             sym->type = node->var_stmt.init->type;
         }
+        else if (!sym->type && sema_is_untyped_numeric_literal(node->var_stmt.init))
+        {
+            sema_error(sema, node->var_stmt.init->token, "could not infer type of numeric literal for variable");
+            return -1;
+        }
+        else if (!sym->type)
+        {
+            sema_error(sema, node->token, "could not infer variable type");
+            return -1;
+        }
         // check type compatibility if type was explicit
         else if (sym->type && node->var_stmt.init->type)
         {
+            sema_infer_numeric_expr(node->var_stmt.init, sym->type);
+
             if (!type_can_assign_to(node->var_stmt.init->type, sym->type))
             {
                 sema_error(sema, node->token, "type mismatch: cannot assign type to variable");
                 return -1;
             }
+
+            if (!sema_check_untyped_numeric(sema, node->var_stmt.init, "could not infer type of numeric literal for variable"))
+            {
+                return -1;
+            }
+        }
+
+        if (!sema_check_untyped_numeric(sema, node->var_stmt.init, "could not infer type of numeric literal for variable"))
+        {
+            return -1;
         }
     }
 
@@ -1754,15 +1937,59 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
     case AST_STMT_RET:
         if (node->ret_stmt.expr)
         {
-            return sema_analyze_expr(sema, node->ret_stmt.expr);
+            if (sema_analyze_expr(sema, node->ret_stmt.expr) < 0)
+            {
+                return -1;
+            }
+
+            if (sema->current_function_return_type)
+            {
+                sema_infer_numeric_expr(node->ret_stmt.expr, sema->current_function_return_type);
+
+                if (!sema_check_untyped_numeric(sema, node->ret_stmt.expr, "could not infer type of numeric literal in return"))
+                {
+                    return -1;
+                }
+
+                if (!type_can_assign_to(node->ret_stmt.expr->type, sema->current_function_return_type))
+                {
+                    sema_error(sema, node->ret_stmt.expr->token, "return type mismatch");
+                    return -1;
+                }
+            }
+            else
+            {
+                if (!sema_check_untyped_numeric(sema, node->ret_stmt.expr, "could not infer type of numeric literal in return"))
+                {
+                    return -1;
+                }
+            }
+
+            return 0;
         }
         return 0;
 
     case AST_STMT_EXPR:
-        return sema_analyze_expr(sema, node->expr_stmt.expr);
+    {
+        if (sema_analyze_expr(sema, node->expr_stmt.expr) < 0)
+        {
+            return -1;
+        }
+
+        if (!sema_check_untyped_numeric(sema, node->expr_stmt.expr, "could not infer type of numeric literal"))
+        {
+            return -1;
+        }
+
+        return 0;
+    }
 
     case AST_STMT_IF:
         if (sema_analyze_expr(sema, node->cond_stmt.cond) < 0)
+        {
+            return -1;
+        }
+        if (!sema_check_untyped_numeric(sema, node->cond_stmt.cond, "could not infer type of numeric literal in condition"))
         {
             return -1;
         }
@@ -1781,6 +2008,10 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         {
             return -1;
         }
+        if (node->cond_stmt.cond && !sema_check_untyped_numeric(sema, node->cond_stmt.cond, "could not infer type of numeric literal in condition"))
+        {
+            return -1;
+        }
         if (sema_analyze_stmt(sema, node->cond_stmt.body) < 0)
         {
             return -1;
@@ -1793,6 +2024,10 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
 
     case AST_STMT_FOR:
         if (node->for_stmt.cond && sema_analyze_expr(sema, node->for_stmt.cond) < 0)
+        {
+            return -1;
+        }
+        if (node->for_stmt.cond && !sema_check_untyped_numeric(sema, node->for_stmt.cond, "could not infer type of numeric literal in loop condition"))
         {
             return -1;
         }
@@ -1818,7 +2053,10 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
     switch (node->kind)
     {
     case AST_EXPR_LIT:
-        // literals have types based on their token and type suffix
+        // literals have types based on suffix if provided; otherwise they must
+        // be inferred from context. If inference fails by the time the
+        // expression is fully processed, a semantic error is emitted by
+        // callers.
         if (node->token)
         {
             switch (node->token->kind)
@@ -1826,58 +2064,53 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             case TOKEN_LIT_INT:
             case TOKEN_LIT_FLOAT:
             {
-                // require type suffix for numeric literals
-                if (!node->token->type_suffix)
+                if (node->token->type_suffix)
                 {
-                    sema_error(sema, node->token, "numeric literal requires type suffix (e.g., 42i64, 3.14f32)");
-                    return -1;
-                }
-
-                // parse type suffix to determine type
-                if (strcmp(node->token->type_suffix, "u8") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_U8);
-                }
-                else if (strcmp(node->token->type_suffix, "u16") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_U16);
-                }
-                else if (strcmp(node->token->type_suffix, "u32") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_U32);
-                }
-                else if (strcmp(node->token->type_suffix, "u64") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_U64);
-                }
-                else if (strcmp(node->token->type_suffix, "i8") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_I8);
-                }
-                else if (strcmp(node->token->type_suffix, "i16") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_I16);
-                }
-                else if (strcmp(node->token->type_suffix, "i32") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_I32);
-                }
-                else if (strcmp(node->token->type_suffix, "i64") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_I64);
-                }
-                else if (strcmp(node->token->type_suffix, "f32") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_F32);
-                }
-                else if (strcmp(node->token->type_suffix, "f64") == 0)
-                {
-                    node->type = type_get_primitive(TYPE_F64);
-                }
-                else
-                {
-                    sema_error(sema, node->token, "invalid type suffix for numeric literal");
-                    return -1;
+                    if (strcmp(node->token->type_suffix, "u8") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_U8);
+                    }
+                    else if (strcmp(node->token->type_suffix, "u16") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_U16);
+                    }
+                    else if (strcmp(node->token->type_suffix, "u32") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_U32);
+                    }
+                    else if (strcmp(node->token->type_suffix, "u64") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_U64);
+                    }
+                    else if (strcmp(node->token->type_suffix, "i8") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_I8);
+                    }
+                    else if (strcmp(node->token->type_suffix, "i16") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_I16);
+                    }
+                    else if (strcmp(node->token->type_suffix, "i32") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_I32);
+                    }
+                    else if (strcmp(node->token->type_suffix, "i64") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_I64);
+                    }
+                    else if (strcmp(node->token->type_suffix, "f32") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_F32);
+                    }
+                    else if (strcmp(node->token->type_suffix, "f64") == 0)
+                    {
+                        node->type = type_get_primitive(TYPE_F64);
+                    }
+                    else
+                    {
+                        sema_error(sema, node->token, "invalid type suffix for numeric literal");
+                        return -1;
+                    }
                 }
                 break;
             }
@@ -1932,8 +2165,18 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         {
             return -1;
         }
-        // simplified: result type is same as left operand
-        node->type = node->binary_expr.left->type;
+        // attempt to align untyped numeric literals with their counterpart
+        if (type_is_numeric(node->binary_expr.left->type))
+        {
+            sema_try_infer_numeric_literal(node->binary_expr.right, node->binary_expr.left->type);
+        }
+        if (type_is_numeric(node->binary_expr.right->type))
+        {
+            sema_try_infer_numeric_literal(node->binary_expr.left, node->binary_expr.right->type);
+        }
+
+        // simplified: result type is same as left operand (fallback to right if left unset)
+        node->type = node->binary_expr.left->type ? node->binary_expr.left->type : node->binary_expr.right->type;
         return 0;
 
     case AST_EXPR_UNARY:
@@ -2115,6 +2358,13 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             if (param_type == NULL)
             {
                 break;
+            }
+
+            sema_infer_numeric_expr(arg, param_type);
+
+            if (!sema_check_untyped_numeric(sema, arg, "could not infer type of numeric literal for argument"))
+            {
+                return -1;
             }
 
             if (!type_can_assign_to(arg->type, param_type))
@@ -2497,9 +2747,16 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                     return -1;
                 }
 
+                sema_infer_numeric_expr(field_init->field_expr.object, field->type);
+
                 if (!type_can_assign_to(field_init->field_expr.object->type, field->type))
                 {
                     sema_error(sema, field_init->token, "field type mismatch");
+                    free(field_provided);
+                    return -1;
+                }
+                if (!sema_check_untyped_numeric(sema, field_init->field_expr.object, "could not infer type of numeric literal for field"))
+                {
                     free(field_provided);
                     return -1;
                 }
@@ -2561,6 +2818,13 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
+        sema_infer_numeric_expr(node->cast_expr.expr, target_type);
+
+        if (!sema_check_untyped_numeric(sema, node->cast_expr.expr, "could not infer type of numeric literal in cast"))
+        {
+            return -1;
+        }
+
         node->type = target_type;
         return 0;
     }
@@ -2606,8 +2870,26 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
+        // index context requires an integer; infer to i64 if untyped numeric
+        if (sema_is_untyped_numeric_literal(node->index_expr.index))
+        {
+            sema_infer_numeric_expr(node->index_expr.index, type_get_primitive(TYPE_I64));
+        }
+
         Type *obj_type   = node->index_expr.array->type;
         Type *index_type = node->index_expr.index->type;
+
+        if (sema_is_untyped_numeric_literal(node->index_expr.index))
+        {
+            sema_error(sema, node->index_expr.index->token, "could not infer type of numeric literal for index");
+            return -1;
+        }
+
+        if (!index_type)
+        {
+            sema_error(sema, node->index_expr.index->token, "array index type unknown");
+            return -1;
+        }
 
         if (index_type->kind != TYPE_I64 && index_type->kind != TYPE_U64 && index_type->kind != TYPE_I32 && index_type->kind != TYPE_U32 && index_type->kind != TYPE_I16 && index_type->kind != TYPE_U16 && index_type->kind != TYPE_I8 &&
             index_type->kind != TYPE_U8)
@@ -2748,9 +3030,15 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                     return -1;
                 }
 
+                sema_infer_numeric_expr(elem, elem_type);
+
                 if (!type_can_assign_to(elem->type, elem_type))
                 {
                     sema_error(sema, elem->token, "array element type mismatch");
+                    return -1;
+                }
+                if (!sema_check_untyped_numeric(sema, elem, "could not infer type of numeric literal for array element"))
+                {
                     return -1;
                 }
             }

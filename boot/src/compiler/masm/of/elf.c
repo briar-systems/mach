@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 // elf64 type definitions
 typedef uint64_t Elf64_Addr;
@@ -592,5 +593,9 @@ int masm_elf_write(Masm *masm, const char *filename)
 
     free(code_buffer);
     fclose(f);
+
+    // ensure executable permission bits are set on the produced binary
+    chmod(filename, 0755);
+
     return 0;
 }

@@ -86,10 +86,55 @@ void cmd_run_help(FILE *stream)
 int cmd_run_handle(int argc, char **argv)
 {
     const char *target_name  = NULL;
-    int         arg_start    = 2; // index of first arg to pass to executable
+    const char *project_path = NULL;
+    int         arg_start    = argc; // will compute
 
-    // find project root from current directory
-    char *project_root = find_project_root(".");
+    // parse flags/positional args: first non-flag becomes project path (optional)
+    for (int i = 2; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--target") == 0)
+        {
+            if (i + 1 < argc)
+            {
+                target_name = argv[++i];
+                continue;
+            }
+            else
+            {
+                fprintf(stderr, "error: --target requires a target name\n");
+                return 1;
+            }
+        }
+        else if (strncmp(argv[i], "--target=", 9) == 0)
+        {
+            target_name = argv[i] + 9;
+            continue;
+        }
+
+        // first non-flag positional is project path
+        if (!project_path)
+        {
+            project_path = argv[i];
+            continue;
+        }
+
+        // the rest are executable arguments
+        arg_start = i;
+        break;
+    }
+
+    if (!project_path)
+    {
+        project_path = ".";
+    }
+
+    if (arg_start == argc)
+    {
+        arg_start = argc; // no args to pass
+    }
+
+    // find project root from provided path
+    char *project_root = find_project_root(project_path);
     if (!project_root)
     {
         fprintf(stderr, "error: failed to find project root\n");
@@ -112,31 +157,6 @@ int cmd_run_handle(int argc, char **argv)
         fprintf(stderr, "error: failed to load mach.toml from current directory\n");
         free(project_root);
         return 1;
-    }
-
-    // parse --target flag
-    for (int i = 2; i < argc; i++)
-    {
-        if (strcmp(argv[i], "--target") == 0)
-        {
-            if (i + 1 < argc)
-            {
-                target_name = argv[++i];
-            }
-            else
-            {
-                fprintf(stderr, "error: --target requires a target name\n");
-                config_dnit(config);
-                free(project_root);
-                return 1;
-            }
-            arg_start = i + 1;
-        }
-        else if (strncmp(argv[i], "--target=", 9) == 0)
-        {
-            target_name = argv[i] + 9;
-            arg_start   = i + 1;
-        }
     }
 
     ConfigTarget *target = NULL;
