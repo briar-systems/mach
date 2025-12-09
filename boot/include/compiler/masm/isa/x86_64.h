@@ -4,6 +4,12 @@
 #include "compiler/masm/operand.h"
 #include "compiler/masm/instruction.h"
 
+// x86_64-specific opcodes live in the target-specific range
+typedef enum MasmX86Opcode
+{
+    MASM_OP_X86_SYSCALL = MASM_OP_TARGET_SPECIFIC_START
+} MasmX86Opcode;
+
 // x86_64 registers
 typedef enum MasmX86Reg
 {

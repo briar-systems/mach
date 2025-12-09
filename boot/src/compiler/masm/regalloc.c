@@ -1,58 +1,74 @@
 #include "compiler/masm/regalloc.h"
 #include "compiler/masm/instruction.h"
-#include <string.h>
+#include <stdlib.h>
 
-// scratch registers in allocation priority order
-// avoid argument registers when possible to reduce conflicts
-static const MasmX86Reg SCRATCH_REGS[REGALLOC_SCRATCH_COUNT] = {
-    MASM_X86_R10, // caller-saved, not used for args
-    MASM_X86_R11, // caller-saved, not used for args
-    MASM_X86_RAX, // return value, but usable as scratch
-    MASM_X86_RCX, // arg 4, but commonly free
-    MASM_X86_RDX, // arg 3 / return value 2
-    MASM_X86_RSI, // arg 2
-    MASM_X86_RDI, // arg 1
-    MASM_X86_R8,  // arg 5
-    MASM_X86_R9,  // arg 6
-};
-
-void regalloc_init(RegAlloc *ra)
+static bool is_reserved(RegAlloc *ra, uint32_t reg)
 {
-    memset(ra->in_use, 0, sizeof(ra->in_use));
-
-    // reserve RSP and RBP - never allocate these
-    ra->in_use[MASM_X86_RSP] = true;
-    ra->in_use[MASM_X86_RBP] = true;
-
-    // also reserve callee-saved registers for now (simpler implementation)
-    // a more sophisticated allocator would save/restore these
-    ra->in_use[MASM_X86_RBX] = true;
-    ra->in_use[MASM_X86_R12] = true;
-    ra->in_use[MASM_X86_R13] = true;
-    ra->in_use[MASM_X86_R14] = true;
-    ra->in_use[MASM_X86_R15] = true;
-
-    ra->spill_offset = 0;
-    ra->spill_count  = 0;
+    for (uint8_t i = 0; i < ra->reserved_count; i++)
+    {
+        if (ra->reserved_regs[i] == reg) return true;
+    }
+    return false;
 }
 
-MasmX86Reg regalloc_alloc(RegAlloc *ra)
+void regalloc_init(RegAlloc *ra, const MasmISASpec *isa, uint32_t fp_reg, uint32_t sp_reg, uint8_t spill_slot_size)
 {
-    for (int i = 0; i < REGALLOC_SCRATCH_COUNT; i++)
+    ra->reg_count      = isa ? isa->reg_count : 0;
+    ra->scratch_regs   = isa ? isa->scratch_regs : NULL;
+    ra->scratch_count  = isa ? isa->scratch_count : 0;
+    ra->reserved_regs  = isa ? isa->reserved_regs : NULL;
+    ra->reserved_count = isa ? isa->reserved_count : 0;
+    ra->spill_slot_size = spill_slot_size ? spill_slot_size : 8;
+    ra->fp_reg         = fp_reg;
+    ra->spill_offset   = 0;
+    ra->spill_count    = 0;
+
+    if (ra->reg_count == 0)
     {
-        MasmX86Reg reg = SCRATCH_REGS[i];
-        if (!ra->in_use[reg])
+        ra->in_use = NULL;
+        return;
+    }
+
+    ra->in_use = calloc(ra->reg_count, sizeof(bool));
+
+    // reserve registers listed by ISA (e.g., sp/fp, callee-saved)
+    for (uint8_t i = 0; i < ra->reserved_count; i++)
+    {
+        uint32_t reg = ra->reserved_regs[i];
+        if (reg < ra->reg_count)
+        {
+            ra->in_use[reg] = true;
+        }
+    }
+
+    // always reserve frame pointer passed in
+    if (fp_reg < ra->reg_count)
+    {
+        ra->in_use[fp_reg] = true;
+    }
+    if (sp_reg < ra->reg_count)
+    {
+        ra->in_use[sp_reg] = true;
+    }
+}
+
+uint32_t regalloc_alloc(RegAlloc *ra)
+{
+    for (uint8_t i = 0; i < ra->scratch_count; i++)
+    {
+        uint32_t reg = ra->scratch_regs[i];
+        if (reg < ra->reg_count && !ra->in_use[reg])
         {
             ra->in_use[reg] = true;
             return reg;
         }
     }
-    return MASM_X86_REG_COUNT; // none available
+    return UINT32_MAX; // none available
 }
 
-bool regalloc_alloc_specific(RegAlloc *ra, MasmX86Reg reg)
+bool regalloc_alloc_specific(RegAlloc *ra, uint32_t reg)
 {
-    if (reg >= MASM_X86_REG_COUNT)
+    if (reg >= ra->reg_count)
     {
         return false;
     }
@@ -64,30 +80,30 @@ bool regalloc_alloc_specific(RegAlloc *ra, MasmX86Reg reg)
     return true;
 }
 
-void regalloc_free(RegAlloc *ra, MasmX86Reg reg)
+void regalloc_free(RegAlloc *ra, uint32_t reg)
 {
-    if (reg < MASM_X86_REG_COUNT)
+    if (reg < ra->reg_count)
     {
         // don't free reserved registers
-        if (reg != MASM_X86_RSP && reg != MASM_X86_RBP && reg != MASM_X86_RBX && reg != MASM_X86_R12 && reg != MASM_X86_R13 && reg != MASM_X86_R14 && reg != MASM_X86_R15)
+        if (!is_reserved(ra, reg) && reg != ra->fp_reg)
         {
             ra->in_use[reg] = false;
         }
     }
 }
 
-bool regalloc_is_available(RegAlloc *ra, MasmX86Reg reg)
+bool regalloc_is_available(RegAlloc *ra, uint32_t reg)
 {
-    if (reg >= MASM_X86_REG_COUNT)
+    if (reg >= ra->reg_count)
     {
         return false;
     }
     return !ra->in_use[reg];
 }
 
-void regalloc_reserve(RegAlloc *ra, MasmX86Reg reg)
+void regalloc_reserve(RegAlloc *ra, uint32_t reg)
 {
-    if (reg < MASM_X86_REG_COUNT)
+    if (reg < ra->reg_count)
     {
         ra->in_use[reg] = true;
     }
@@ -95,28 +111,26 @@ void regalloc_reserve(RegAlloc *ra, MasmX86Reg reg)
 
 int32_t regalloc_get_spill_slot(RegAlloc *ra)
 {
-    ra->spill_offset -= 8; // each spill slot is 8 bytes
+    ra->spill_offset -= ra->spill_slot_size ? ra->spill_slot_size : 8;
     ra->spill_count++;
     return ra->spill_offset;
 }
 
-void regalloc_emit_spill(RegAlloc *ra, MasmSection *text, MasmX86Reg reg, int32_t slot)
+void regalloc_emit_spill(RegAlloc *ra, MasmSection *text, uint32_t reg, int32_t slot)
 {
-    (void)ra;
-    MasmOperand src = masm_operand_register(reg, 8);
-    MasmOperand dst = masm_operand_memory_simple(MASM_X86_RBP, slot, 8);
+    MasmOperand src = masm_operand_register(reg, ra->spill_slot_size);
+    MasmOperand dst = masm_operand_memory_simple(ra->fp_reg, slot, ra->spill_slot_size);
     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
 }
 
-void regalloc_emit_reload(RegAlloc *ra, MasmSection *text, MasmX86Reg reg, int32_t slot)
+void regalloc_emit_reload(RegAlloc *ra, MasmSection *text, uint32_t reg, int32_t slot)
 {
-    (void)ra;
-    MasmOperand dst = masm_operand_register(reg, 8);
-    MasmOperand src = masm_operand_memory_simple(MASM_X86_RBP, slot, 8);
+    MasmOperand dst = masm_operand_register(reg, ra->spill_slot_size);
+    MasmOperand src = masm_operand_memory_simple(ra->fp_reg, slot, ra->spill_slot_size);
     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
 }
 
-const MasmX86Reg *regalloc_scratch_regs(void)
+const uint32_t *regalloc_scratch_regs(RegAlloc *ra)
 {
-    return SCRATCH_REGS;
+    return ra->scratch_regs;
 }

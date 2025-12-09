@@ -5,7 +5,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// generic opcodes
+// generic opcodes (portable across supported targets). ISA/OS-specific opcodes
+// must be defined within their respective backend headers and use values at or
+// beyond MASM_OP_TARGET_SPECIFIC_START.
 typedef enum MasmOpcode
 {
     // data movement
@@ -49,17 +51,14 @@ typedef enum MasmOpcode
     MASM_OP_CALL,
     MASM_OP_RET,
     
-    // special
+    // special (generic)
     MASM_OP_PUSH,
     MASM_OP_POP,
     
-    // system
-    MASM_OP_SYSCALL,
-    
-    // pseudo-ops
+    // pseudo-ops (generic, non-ISA)
     MASM_OP_LABEL,
-    
-    // target specific start
+
+    // target specific start — ISA/OS-specific opcodes live at or beyond this value
     MASM_OP_TARGET_SPECIFIC_START = 1000
 } MasmOpcode;
 

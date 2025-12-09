@@ -1,4 +1,7 @@
 #include "compiler/masm/isa/x86_64.h"
+#include "compiler/masm/isa/spec.h"
+#include "compiler/masm/abi/sysv64.h"
+#include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -127,7 +130,7 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
         emit_byte(buffer, &offset, size, 0xC3);
         break;
 
-    case MASM_OP_SYSCALL:
+    case MASM_OP_X86_SYSCALL:
         emit_byte(buffer, &offset, size, 0x0F);
         emit_byte(buffer, &offset, size, 0x05);
         break;
@@ -577,4 +580,96 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     }
 
     return (int)offset;
+}
+
+// ISA spec implementation for x86_64
+static MasmOperand x86_reg_result(uint8_t size) { return masm_operand_register(MASM_X86_RAX, size); }
+static MasmOperand x86_reg_tmp0(uint8_t size) { return masm_operand_register(MASM_X86_RCX, size); }
+static MasmOperand x86_reg_tmp1(uint8_t size) { return masm_operand_register(MASM_X86_RDX, size); }
+static MasmOperand x86_reg_div_hi(uint8_t size) { return masm_operand_register(MASM_X86_RDX, size); }
+static MasmOperand x86_reg_div_lo(uint8_t size) { return masm_operand_register(MASM_X86_RAX, size); }
+static MasmOperand x86_reg_arg(int index, uint8_t size)
+{
+    uint32_t reg = masm_sysv64_arg_reg(index);
+    if (reg == (uint32_t)MASM_X86_REG_COUNT) return masm_operand_none();
+    return masm_operand_register(reg, size);
+}
+static MasmOperand x86_reg_sp(uint8_t size) { return masm_operand_register(MASM_X86_RSP, size); }
+static MasmOperand x86_reg_fp(uint8_t size) { return masm_operand_register(MASM_X86_RBP, size); }
+static uint32_t x86_op_syscall() { return MASM_OP_X86_SYSCALL; }
+
+static const uint32_t X86_SCRATCH[] = {
+    MASM_X86_R10,
+    MASM_X86_R11,
+    MASM_X86_RAX,
+    MASM_X86_RCX,
+    MASM_X86_RDX,
+    MASM_X86_RSI,
+    MASM_X86_RDI,
+    MASM_X86_R8,
+    MASM_X86_R9,
+};
+
+static const uint32_t X86_RESERVED[] = {
+    MASM_X86_RSP,
+    MASM_X86_RBP,
+    MASM_X86_RBX,
+    MASM_X86_R12,
+    MASM_X86_R13,
+    MASM_X86_R14,
+    MASM_X86_R15,
+};
+
+static MasmOperand x86_parse_reg(const char *name, uint8_t ptr_size)
+{
+    if (!name) return masm_operand_none();
+    if (strcmp(name, "rax") == 0) return masm_operand_register(MASM_X86_RAX, ptr_size);
+    if (strcmp(name, "eax") == 0) return masm_operand_register(MASM_X86_RAX, 4);
+    if (strcmp(name, "ax") == 0) return masm_operand_register(MASM_X86_RAX, 2);
+    if (strcmp(name, "al") == 0) return masm_operand_register(MASM_X86_RAX, 1);
+    if (strcmp(name, "rbx") == 0) return masm_operand_register(MASM_X86_RBX, ptr_size);
+    if (strcmp(name, "rcx") == 0) return masm_operand_register(MASM_X86_RCX, ptr_size);
+    if (strcmp(name, "rdx") == 0) return masm_operand_register(MASM_X86_RDX, ptr_size);
+    if (strcmp(name, "rsi") == 0) return masm_operand_register(MASM_X86_RSI, ptr_size);
+    if (strcmp(name, "rdi") == 0) return masm_operand_register(MASM_X86_RDI, ptr_size);
+    if (strcmp(name, "rbp") == 0) return masm_operand_register(MASM_X86_RBP, ptr_size);
+    if (strcmp(name, "rsp") == 0) return masm_operand_register(MASM_X86_RSP, ptr_size);
+    if (strcmp(name, "r8") == 0) return masm_operand_register(MASM_X86_R8, ptr_size);
+    if (strcmp(name, "r9") == 0) return masm_operand_register(MASM_X86_R9, ptr_size);
+    if (strcmp(name, "r10") == 0) return masm_operand_register(MASM_X86_R10, ptr_size);
+    if (strcmp(name, "r11") == 0) return masm_operand_register(MASM_X86_R11, ptr_size);
+    if (strcmp(name, "r12") == 0) return masm_operand_register(MASM_X86_R12, ptr_size);
+    if (strcmp(name, "r13") == 0) return masm_operand_register(MASM_X86_R13, ptr_size);
+    if (strcmp(name, "r14") == 0) return masm_operand_register(MASM_X86_R14, ptr_size);
+    if (strcmp(name, "r15") == 0) return masm_operand_register(MASM_X86_R15, ptr_size);
+    return masm_operand_none();
+}
+
+static const MasmISASpec X86_64_SPEC = {
+    .reg_result = x86_reg_result,
+    .reg_tmp0   = x86_reg_tmp0,
+    .reg_tmp1   = x86_reg_tmp1,
+    .reg_div_hi = x86_reg_div_hi,
+    .reg_div_lo = x86_reg_div_lo,
+    .reg_arg    = x86_reg_arg,
+    .reg_sp     = x86_reg_sp,
+    .reg_fp     = x86_reg_fp,
+    .op_syscall = x86_op_syscall,
+    .parse_reg  = x86_parse_reg,
+    .reg_count      = MASM_X86_REG_COUNT,
+    .scratch_regs   = X86_SCRATCH,
+    .scratch_count  = sizeof(X86_SCRATCH) / sizeof(X86_SCRATCH[0]),
+    .reserved_regs  = X86_RESERVED,
+    .reserved_count = sizeof(X86_RESERVED) / sizeof(X86_RESERVED[0]),
+};
+
+const MasmISASpec *masm_isa_spec_select(MasmTarget target)
+{
+    switch (target.isa)
+    {
+    case MASM_ISA_X86_64:
+        return &X86_64_SPEC;
+    default:
+        return NULL;
+    }
 }
