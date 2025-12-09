@@ -228,6 +228,9 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
         else if (expr->lit_expr.kind == TOKEN_LIT_STRING)
         {
+            #ifdef MASM_DEBUG
+            fprintf(stderr, "[lower] string literal '%s'\n", expr->lit_expr.string_val);
+            #endif
             // Create unique label
             static int str_counter = 0;
             char       label[32];
@@ -243,6 +246,11 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             size_t len        = strlen(expr->lit_expr.string_val);
             sym->size         = len + 1;
             masm_add_symbol(masm, sym);
+
+            // append string data (null-terminated) to .rodata
+            masm_section_append_data(rodata, expr->lit_expr.string_val, len);
+            uint8_t zero = 0;
+            masm_section_append_data(rodata, &zero, 1);
 
             // MOV result, label (absolute address)
             MasmOperand res = isa_result(ctx, 8);
