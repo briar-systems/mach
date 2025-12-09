@@ -5,20 +5,29 @@
 #include <stdint.h>
 #include "compiler/masm/target.h"
 
-// generic ABI query helpers (current implementation: sysv64 on x86_64)
+typedef struct MasmABISpec
+{
+	uint8_t  pointer_size;
+	uint8_t  stack_align;
+	bool     has_red_zone;
 
+	const uint32_t *int_arg_regs;
+	uint8_t        int_arg_count;
+
+	const uint32_t *int_ret_regs;
+	uint8_t        int_ret_count;
+} MasmABISpec;
+
+// select ABI spec for a target; returns NULL if unsupported
+const MasmABISpec *masm_abi_spec_select(MasmTarget target);
+
+// compatibility helpers (now powered by the selected ABI spec)
 uint8_t  masm_abi_pointer_size(MasmTarget target);
 uint8_t  masm_abi_stack_align(MasmTarget target);
 bool     masm_abi_has_red_zone(MasmTarget target);
-
 uint8_t  masm_abi_int_arg_count(MasmTarget target);
 uint32_t masm_abi_int_arg_reg(MasmTarget target, int index);
-
 uint8_t  masm_abi_int_ret_count(MasmTarget target);
 uint32_t masm_abi_int_ret_reg(MasmTarget target, int index);
-
-// convenience helpers for common frame registers
-uint32_t masm_target_stack_pointer_reg(MasmTarget target);
-uint32_t masm_target_frame_pointer_reg(MasmTarget target);
 
 #endif // MASM_ABI_H

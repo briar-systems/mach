@@ -22,6 +22,7 @@ typedef struct LowerContext
 {
     MasmTarget target;
     const MasmISASpec *isa;
+    const MasmABISpec *abi;
     uint8_t    ptr_size;
     uint8_t    stack_align;
     uint8_t    int_arg_count;
@@ -79,12 +80,18 @@ static LowerContext *create_context(MasmTarget target)
         fprintf(stderr, "masm lower: unsupported isa for lowering (isa=%s)\n", masm_target_isa_name(target.isa));
         exit(1);
     }
+    ctx->abi = masm_abi_spec_select(target);
+    if (!ctx->abi)
+    {
+        fprintf(stderr, "masm lower: unsupported abi for lowering (abi=%s)\n", masm_target_abi_name(target.abi));
+        exit(1);
+    }
     ctx->target       = target;
-    ctx->ptr_size     = masm_abi_pointer_size(target);
-    ctx->stack_align  = masm_abi_stack_align(target);
-    ctx->int_arg_count = masm_abi_int_arg_count(target);
-    ctx->fp_reg       = masm_target_frame_pointer_reg(target);
-    ctx->sp_reg       = masm_target_stack_pointer_reg(target);
+    ctx->ptr_size     = ctx->abi->pointer_size;
+    ctx->stack_align  = ctx->abi->stack_align;
+    ctx->int_arg_count = ctx->abi->int_arg_count;
+    ctx->fp_reg       = ctx->isa->reg_fp(ctx->ptr_size).reg.id;
+    ctx->sp_reg       = ctx->isa->reg_sp(ctx->ptr_size).reg.id;
     if (ctx->fp_reg == UINT32_MAX || ctx->sp_reg == UINT32_MAX)
     {
         fprintf(stderr, "masm lower: unsupported fp/sp reg for isa %s\n", masm_target_isa_name(target.isa));
@@ -940,7 +947,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 MasmOperand arg_op = lower_expr(masm, text, args->items[i], ctx);
 
                 // move to register
-                uint32_t    reg = masm_abi_int_arg_reg(ctx->target, i);
+                uint32_t    reg = (i < ctx->abi->int_arg_count) ? ctx->abi->int_arg_regs[i] : UINT32_MAX;
                 MasmOperand dst = masm_operand_register(reg, ctx->ptr_size);
 
                 if (arg_op.kind == MASM_OPERAND_REGISTER && arg_op.reg.id == reg)
@@ -2285,7 +2292,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
             // move register to stack
             if (i < ctx->int_arg_count)
             {
-                uint32_t    reg = masm_abi_int_arg_reg(ctx->target, i);
+                uint32_t    reg = ctx->abi->int_arg_regs[i];
                 MasmOperand src = masm_operand_register(reg, ctx->ptr_size);
                 MasmOperand dst = frame_mem(ctx, offset, ctx->ptr_size);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
