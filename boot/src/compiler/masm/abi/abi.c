@@ -1,4 +1,4 @@
-#include "compiler/masm/abi/abi.h"
+#include "compiler/masm/abi/spec.h"
 #include "compiler/masm/isa/x86_64.h"
 
 // sysv64 spec

@@ -1,5 +1,5 @@
 #include "compiler/masm/lower.h"
-#include "compiler/masm/abi/abi.h"
+#include "compiler/masm/abi/spec.h"
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/spec.h"
 #include "compiler/masm/masm.h"
