@@ -1421,7 +1421,7 @@ static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
             sema_error(sema, object->token, "undefined symbol");
             return -1;
         }
-        if (strcmp(field, "name") == 0)
+        if (strcmp(field, "name") == 0 || strcmp(field, "symbol") == 0)
         {
             if (sym->export_name)
             {

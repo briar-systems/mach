@@ -1007,9 +1007,13 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             const char *call_name = func->ident_expr.name;
             Symbol     *call_sym  = func->symbol;
 
-            if (call_sym && call_sym->export_name)
+            if (call_sym)
             {
-                call_name = call_sym->export_name;
+                const char *link_name = symbol_get_linkage_name(call_sym);
+                if (link_name)
+                {
+                    call_name = link_name;
+                }
             }
 
             masm_section_append_inst(text, masm_inst_1(MASM_OP_CALL, masm_operand_label(strdup(call_name))));
@@ -2237,21 +2241,20 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
         exit(1);
     }
 
-    // determine name and entry flag before mangling/linkage
-    const char *ast_name = func_node->fun_stmt.name;
-    bool        is_entry = ast_name && strcmp(ast_name, "_start") == 0;
-
-    // prefer explicit export name, otherwise use AST name (keep _start unmangled)
+    // determine linkage name (mangled unless overridden) and entry flag
+    const char *ast_name  = func_node->fun_stmt.name;
     const char *func_name = ast_name;
-    if (func_node->symbol && func_node->symbol->export_name)
+
+    if (func_node->symbol)
     {
-        func_name = func_node->symbol->export_name;
+        const char *link_name = symbol_get_linkage_name(func_node->symbol);
+        if (link_name)
+        {
+            func_name = link_name;
+        }
     }
 
-    if (is_entry)
-    {
-        func_name = "_start";
-    }
+    bool is_entry = func_name && strcmp(func_name, "_start") == 0;
 
     #ifdef MASM_DEBUG
     fprintf(stderr, "[lower] func %s (entry=%d)\n", func_name, is_entry);
