@@ -23,6 +23,11 @@ void  sema_destroy(Sema *sema);
 // dep_count: number of dependencies
 void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_root, const char *dep_root, struct ConfigDep **deps, int dep_count);
 
+// add an additional module root mapping.
+// this is primarily for single-file compilation mode, where the user may
+// provide explicit `-I prefix=/abs/path/to/src` mappings.
+void sema_add_module_root(Sema *sema, const char *module_prefix, const char *src_root);
+
 // set file context for error reporting (call before analyzing a file)
 void sema_set_file_context(Sema *sema, const char *file_path, const char *source);
 

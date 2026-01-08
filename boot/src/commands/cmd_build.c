@@ -38,12 +38,55 @@ int cmd_build_handle(int argc, char **argv)
     const char *input_file  = argv[2];
     const char *output_file = NULL;
 
+    // extra module roots for single-file mode: -I prefix=dir
+    char *include_prefixes[64];
+    char *include_dirs[64];
+    int   include_count = 0;
+
     // parse options
     for (int i = 3; i < argc; i++)
     {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc)
         {
             output_file = argv[++i];
+        }
+        else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc)
+        {
+            if (include_count >= 64)
+            {
+                fprintf(stderr, "error: too many -I mappings (max 64)\n");
+                return 1;
+            }
+
+            const char *spec = argv[++i];
+            const char *eq   = strchr(spec, '=');
+            if (!eq || eq == spec || *(eq + 1) == '\0')
+            {
+                fprintf(stderr, "error: invalid -I mapping '%s' (expected prefix=dir)\n", spec);
+                return 1;
+            }
+
+            size_t prefix_len = (size_t)(eq - spec);
+            char  *prefix     = malloc(prefix_len + 1);
+            if (!prefix)
+            {
+                fprintf(stderr, "error: out of memory\n");
+                return 1;
+            }
+            memcpy(prefix, spec, prefix_len);
+            prefix[prefix_len] = '\0';
+
+            char *dir_abs = absolutize_path(eq + 1);
+            if (!dir_abs)
+            {
+                fprintf(stderr, "error: failed to resolve include dir '%s'\n", eq + 1);
+                free(prefix);
+                return 1;
+            }
+
+            include_prefixes[include_count] = prefix;
+            include_dirs[include_count]     = dir_abs;
+            include_count++;
         }
     }
 
@@ -303,6 +346,14 @@ int cmd_build_handle(int argc, char **argv)
     if (project_id && src_root)
     {
         sema_set_module_roots(sema, project_id, src_root, dep_root, config ? config->deps : NULL, config ? config->dep_count : 0);
+    }
+
+    // apply explicit single-file module root mappings
+    for (int i = 0; i < include_count; i++)
+    {
+        sema_add_module_root(sema, include_prefixes[i], include_dirs[i]);
+        free(include_prefixes[i]);
+        free(include_dirs[i]);
     }
     free(project_id);
     free(src_root);
