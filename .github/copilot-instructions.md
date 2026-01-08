@@ -10,6 +10,8 @@
 - Avoid introducing compatibility shims. Prefer full implementations.
 - Fully remove any dead code or lost features if affected by a change. This includes replaced functionality.
 
+If there are ever any changes to be made that would affect the Mach lanuage syntax, semantics, behaviour, or otherwise similar core aspects of the language to any degree, please pause and discuss with the user before proceeding.
+
 # Documentation
 - If a change requires documentation, update any existing documentation files in `doc` that pertain to the change.
 - Maintain parity with the existing documentation style.

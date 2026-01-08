@@ -802,6 +802,40 @@ static int sema_collect_var_symbol(Sema *sema, AstNode *node)
     return 0;
 }
 
+static int sema_collect_ext_symbol(Sema *sema, AstNode *node)
+{
+    if (node->kind != AST_STMT_EXT)
+    {
+        return -1;
+    }
+
+    Symbol *existing = symbol_table_lookup_local(sema->current_table, node->ext_stmt.name);
+    if (existing)
+    {
+        node->symbol = existing;
+        return 0;
+    }
+
+    Symbol *sym = symbol_create(node->ext_stmt.name, SYMBOL_FUNCTION, sema->module_path);
+    if (!sym)
+    {
+        return -1;
+    }
+
+    sym->is_public = node->ext_stmt.is_public;
+    sym->decl      = node;
+
+    if (symbol_table_insert(sema->current_table, sym) < 0)
+    {
+        sema_error(sema, node->token, "duplicate external declaration");
+        symbol_destroy(sym);
+        return -1;
+    }
+
+    node->symbol = sym;
+    return 0;
+}
+
 // collect all top-level symbols from a list of statements
 static int sema_collect_symbols(Sema *sema, AstNode *node)
 {
@@ -824,6 +858,9 @@ static int sema_collect_symbols(Sema *sema, AstNode *node)
     case AST_STMT_DEF:
         return sema_collect_def_symbol(sema, node);
 
+    case AST_STMT_EXT:
+        return sema_collect_ext_symbol(sema, node);
+
     case AST_STMT_VAL:
     case AST_STMT_VAR:
         return sema_collect_var_symbol(sema, node);
@@ -841,6 +878,60 @@ static int sema_collect_symbols(Sema *sema, AstNode *node)
     default:
         return 0;
     }
+}
+
+static int sema_analyze_ext(Sema *sema, AstNode *node)
+{
+    if (node->kind != AST_STMT_EXT)
+    {
+        return -1;
+    }
+
+    Symbol *sym = node->symbol;
+    if (!sym)
+    {
+        sym = symbol_table_lookup_local(sema->current_table, node->ext_stmt.name);
+        if (!sym)
+        {
+            sym = symbol_create(node->ext_stmt.name, SYMBOL_FUNCTION, sema->module_path);
+            if (!sym)
+            {
+                return -1;
+            }
+            sym->is_public = node->ext_stmt.is_public;
+            sym->decl      = node;
+            if (symbol_table_insert(sema->current_table, sym) < 0)
+            {
+                sema_error(sema, node->token, "duplicate external declaration");
+                symbol_destroy(sym);
+                return -1;
+            }
+        }
+        node->symbol = sym;
+    }
+
+    // resolve external function type
+    Type *t = sema_resolve_type(sema, node->ext_stmt.type);
+    if (!t || t->kind != TYPE_FUNCTION)
+    {
+        sema_error(sema, node->token, "external declaration requires a function type");
+        return -1;
+    }
+
+    sym->type  = t;
+    node->type = t;
+
+    // set linkage/export name to the underlying symbol name
+    if (node->ext_stmt.symbol)
+    {
+        if (sym->export_name)
+        {
+            free(sym->export_name);
+        }
+        sym->export_name = strdup(node->ext_stmt.symbol);
+    }
+
+    return 0;
 }
 
 // analyze function declaration (second pass - full analysis)
@@ -1151,6 +1242,68 @@ static int sema_analyze_var(Sema *sema, AstNode *node)
 // forward declaration for generic type instantiation
 static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstList *type_args);
 
+static AstNode *sema_type_node_from_type(Type *t)
+{
+    if (!t)
+    {
+        return NULL;
+    }
+
+    AstNode *node = calloc(1, sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    switch (t->kind)
+    {
+    case TYPE_I8:  node->kind = AST_TYPE_NAME; node->type_name.name = strdup("i8");  break;
+    case TYPE_I16: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("i16"); break;
+    case TYPE_I32: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("i32"); break;
+    case TYPE_I64: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("i64"); break;
+    case TYPE_U8:  node->kind = AST_TYPE_NAME; node->type_name.name = strdup("u8");  break;
+    case TYPE_U16: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("u16"); break;
+    case TYPE_U32: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("u32"); break;
+    case TYPE_U64: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("u64"); break;
+    case TYPE_F32: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("f32"); break;
+    case TYPE_F64: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("f64"); break;
+    case TYPE_PTR: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("ptr"); break;
+
+    case TYPE_POINTER:
+    {
+        AstNode *base = sema_type_node_from_type(t->pointer.base);
+        if (!base)
+        {
+            free(node);
+            return NULL;
+        }
+        node->kind = AST_TYPE_PTR;
+        node->type_ptr.base = base;
+        node->type_ptr.is_read_only = t->pointer.is_const;
+        break;
+    }
+
+    case TYPE_STRUCT:
+    {
+        node->kind = AST_TYPE_NAME;
+        node->type_name.name = strdup(t->structure.name ? t->structure.name : "");
+        break;
+    }
+    case TYPE_UNION:
+    {
+        node->kind = AST_TYPE_NAME;
+        node->type_name.name = strdup(t->union_type.name ? t->union_type.name : "");
+        break;
+    }
+
+    default:
+        free(node);
+        return NULL;
+    }
+
+    return node;
+}
+
 // analyze record definition
 static int sema_analyze_rec(Sema *sema, AstNode *node)
 {
@@ -1368,6 +1521,33 @@ static bool sema_eval_comptime_int(Sema *sema, AstNode *node, int64_t *out_val)
             return true;
         case TOKEN_GREATER_EQUAL:
             *out_val = (left >= right);
+            return true;
+        case TOKEN_AMPERSAND_AMPERSAND:
+            *out_val = ((left != 0) && (right != 0));
+            return true;
+        case TOKEN_PIPE_PIPE:
+            *out_val = ((left != 0) || (right != 0));
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    if (node->kind == AST_EXPR_UNARY)
+    {
+        int64_t inner = 0;
+        if (!sema_eval_comptime_int(sema, node->unary_expr.expr, &inner))
+        {
+            return false;
+        }
+
+        switch (node->unary_expr.op)
+        {
+        case TOKEN_BANG:
+            *out_val = (inner == 0);
+            return true;
+        case TOKEN_MINUS:
+            *out_val = -inner;
             return true;
         default:
             return false;
@@ -1902,6 +2082,9 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
     case AST_STMT_DEF:
         return sema_analyze_def(sema, node);
 
+    case AST_STMT_EXT:
+        return sema_analyze_ext(sema, node);
+
     case AST_STMT_USE:
         return sema_analyze_use(sema, node);
 
@@ -2180,8 +2363,30 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             sema_try_infer_numeric_literal(node->binary_expr.left, node->binary_expr.right->type);
         }
 
-        // simplified: result type is same as left operand (fallback to right if left unset)
-        node->type = node->binary_expr.left->type ? node->binary_expr.left->type : node->binary_expr.right->type;
+        // result type depends on operator
+        switch (node->binary_expr.op)
+        {
+        case TOKEN_EQUAL: // assignment
+            node->type = node->binary_expr.left->type;
+            break;
+
+        case TOKEN_EQUAL_EQUAL:
+        case TOKEN_BANG_EQUAL:
+        case TOKEN_LESS:
+        case TOKEN_GREATER:
+        case TOKEN_LESS_EQUAL:
+        case TOKEN_GREATER_EQUAL:
+        case TOKEN_AMPERSAND_AMPERSAND:
+        case TOKEN_PIPE_PIPE:
+            // comparisons/logical operators produce boolean. bool is defined in std as u8.
+            node->type = type_get_primitive(TYPE_U8);
+            break;
+
+        default:
+            // arithmetic/bitwise/etc: simplified rule for now.
+            node->type = node->binary_expr.left->type ? node->binary_expr.left->type : node->binary_expr.right->type;
+            break;
+        }
         return 0;
 
     case AST_EXPR_UNARY:
@@ -2218,9 +2423,14 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
             node->type = operand_type->pointer.base;
         }
+        else if (node->unary_expr.op == TOKEN_BANG)
+        {
+            // logical not produces boolean
+            node->type = type_get_primitive(TYPE_U8);
+        }
         else
         {
-            // other unary ops (-, !, etc.) preserve type
+            // other unary ops (-, ~, etc.) preserve type
             node->type = node->unary_expr.expr->type;
         }
         return 0;
@@ -2482,6 +2692,89 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         }
         if (method && method->kind == SYMBOL_FUNCTION && method->decl && method->decl->kind == AST_STMT_FUN && method->decl->fun_stmt.is_method)
         {
+            // if this is a generic method on an instantiated generic receiver type,
+            // instantiate it using the receiver's concrete type args.
+            if (method->is_generic)
+            {
+                Type *recv_type = obj_type;
+                if (recv_type && recv_type->kind == TYPE_POINTER)
+                {
+                    recv_type = recv_type->pointer.base;
+                }
+
+                Type **args = NULL;
+                int    arg_count = 0;
+                if (recv_type && recv_type->kind == TYPE_STRUCT)
+                {
+                    args = recv_type->structure.generic_args;
+                    arg_count = recv_type->structure.generic_arg_count;
+                }
+                else if (recv_type && recv_type->kind == TYPE_UNION)
+                {
+                    args = recv_type->union_type.generic_args;
+                    arg_count = recv_type->union_type.generic_arg_count;
+                }
+
+                if (args && arg_count > 0)
+                {
+                    AstList *type_args = malloc(sizeof(AstList));
+                    if (type_args)
+                    {
+                        ast_list_init(type_args);
+                        for (int i = 0; i < arg_count; i++)
+                        {
+                            AstNode *tn = sema_type_node_from_type(args[i]);
+                            if (tn)
+                            {
+                                ast_list_append(type_args, tn);
+                            }
+                        }
+
+                        if (type_args->count == arg_count)
+                        {
+                            Symbol *inst_method = sema_instantiate_generic(sema, method, type_args);
+                            if (inst_method)
+                            {
+                                node->field_expr.is_method = true;
+                                node->symbol               = inst_method;
+                                node->type                 = inst_method->type;
+
+                                // keep type_args nodes alive for now (owned by AST list)
+                                free(type_args->items);
+                                free(type_args);
+                                return 0;
+                            }
+                        }
+
+                        // cleanup on failure
+                        for (int i = 0; i < type_args->count; i++)
+                        {
+                            AstNode *tn = type_args->items[i];
+                            if (tn)
+                            {
+                                if (tn->kind == AST_TYPE_NAME)
+                                {
+                                    free(tn->type_name.name);
+                                }
+                                else if (tn->kind == AST_TYPE_PTR)
+                                {
+                                    // free base node (only simple forms are built here)
+                                    AstNode *base = tn->type_ptr.base;
+                                    if (base && base->kind == AST_TYPE_NAME)
+                                    {
+                                        free(base->type_name.name);
+                                    }
+                                    free(base);
+                                }
+                                free(tn);
+                            }
+                        }
+                        free(type_args->items);
+                        free(type_args);
+                    }
+                }
+            }
+
             AstNode *receiver_ast = method->decl->fun_stmt.method_receiver;
 
             // handle pointer receivers: unwrap *T or &T to get base type
@@ -2994,6 +3287,74 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
         }
 
+        // handle comptime intrinsics: $size_of(T), $align_of(T), $offset_of(T, field)
+        if (inner && inner->kind == AST_EXPR_CALL && inner->call_expr.func && inner->call_expr.func->kind == AST_EXPR_IDENT)
+        {
+            const char *name = inner->call_expr.func->ident_expr.name;
+
+            if (name && (strcmp(name, "size_of") == 0 || strcmp(name, "align_of") == 0))
+            {
+                if (!inner->call_expr.args || inner->call_expr.args->count != 1)
+                {
+                    sema_error(sema, node->token, "expected 1 type argument");
+                    return -1;
+                }
+
+                Type *t = sema_resolve_type(sema, inner->call_expr.args->items[0]);
+                if (!t)
+                {
+                    sema_error(sema, node->token, "failed to resolve type in comptime intrinsic");
+                    return -1;
+                }
+
+                node->comptime.value_kind = COMPTIME_INT;
+                node->comptime.int_value  = (strcmp(name, "size_of") == 0) ? (int64_t)t->size : (int64_t)t->alignment;
+                node->type                = type_get_primitive(TYPE_I64);
+                return 0;
+            }
+
+            if (name && strcmp(name, "offset_of") == 0)
+            {
+                if (!inner->call_expr.args || inner->call_expr.args->count != 2)
+                {
+                    sema_error(sema, node->token, "expected 2 arguments for offset_of(Type, field)");
+                    return -1;
+                }
+
+                Type *t = sema_resolve_type(sema, inner->call_expr.args->items[0]);
+                if (!t || (t->kind != TYPE_STRUCT && t->kind != TYPE_UNION))
+                {
+                    sema_error(sema, node->token, "offset_of requires a record or union type");
+                    return -1;
+                }
+
+                AstNode *field_expr = inner->call_expr.args->items[1];
+                if (!field_expr || field_expr->kind != AST_EXPR_FIELD)
+                {
+                    sema_error(sema, node->token, "offset_of second argument must be a field expression");
+                    return -1;
+                }
+
+                const char *field_name = field_expr->field_expr.field;
+                TypeField  *fields = (t->kind == TYPE_STRUCT) ? t->structure.fields : t->union_type.fields;
+                int         count  = (t->kind == TYPE_STRUCT) ? t->structure.field_count : t->union_type.field_count;
+
+                for (int i = 0; i < count; i++)
+                {
+                    if (strcmp(fields[i].name, field_name) == 0)
+                    {
+                        node->comptime.value_kind = COMPTIME_INT;
+                        node->comptime.int_value  = (int64_t)fields[i].offset;
+                        node->type                = type_get_primitive(TYPE_I64);
+                        return 0;
+                    }
+                }
+
+                sema_error(sema, node->token, "unknown field in offset_of");
+                return -1;
+            }
+        }
+
         sema_error(sema, node->token, "unsupported compiletime expression");
         return -1;
     }
@@ -3181,6 +3542,104 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
         }
     }
 
+    case AST_TYPE_PARAM:
+    {
+        // generic parameter type (e.g. T). these are typically bound to concrete
+        // types in a temporary scope during instantiation.
+        Symbol *sym = symbol_table_lookup(sema->current_table, type_node->type_param.name);
+        if (sym && sym->type)
+        {
+            return sym->type;
+        }
+
+        // if unbound, treat it as an opaque generic param.
+        return type_create_generic_param(type_node->type_param.name);
+    }
+
+    case AST_TYPE_FUN:
+    {
+        Type  *ret_type   = NULL;
+        Type **param_types = NULL;
+        int    param_count = 0;
+
+        if (type_node->type_fun.return_type)
+        {
+            ret_type = sema_resolve_type(sema, type_node->type_fun.return_type);
+            if (!ret_type)
+            {
+                return NULL;
+            }
+        }
+
+        if (type_node->type_fun.params)
+        {
+            param_count = type_node->type_fun.params->count;
+            param_types = malloc(sizeof(Type *) * param_count);
+            if (!param_types)
+            {
+                return NULL;
+            }
+
+            for (int i = 0; i < param_count; i++)
+            {
+                AstNode *pt_node = type_node->type_fun.params->items[i];
+                Type    *pt      = sema_resolve_type(sema, pt_node);
+                if (!pt)
+                {
+                    free(param_types);
+                    return NULL;
+                }
+                param_types[i] = pt;
+            }
+        }
+
+        return type_create_function(ret_type, param_types, param_count);
+    }
+
+    case AST_TYPE_REC:
+    case AST_TYPE_UNI:
+    {
+        AstList *fields_ast = (type_node->kind == AST_TYPE_REC) ? type_node->type_rec.fields : type_node->type_uni.fields;
+        int      field_count = fields_ast ? fields_ast->count : 0;
+
+        TypeField *fields = NULL;
+        if (field_count > 0)
+        {
+            fields = malloc(sizeof(TypeField) * field_count);
+            if (!fields)
+            {
+                return NULL;
+            }
+
+            for (int i = 0; i < field_count; i++)
+            {
+                AstNode *field_node = fields_ast->items[i];
+                if (!field_node || field_node->kind != AST_STMT_FIELD)
+                {
+                    free(fields);
+                    return NULL;
+                }
+
+                fields[i].name   = strdup(field_node->field_stmt.name);
+                fields[i].type   = sema_resolve_type(sema, field_node->field_stmt.type);
+                fields[i].offset = 0;
+
+                if (!fields[i].type)
+                {
+                    for (int j = 0; j <= i; j++)
+                    {
+                        free(fields[j].name);
+                    }
+                    free(fields);
+                    return NULL;
+                }
+            }
+        }
+
+        const char *name = (type_node->kind == AST_TYPE_REC) ? type_node->type_rec.name : type_node->type_uni.name;
+        return (type_node->kind == AST_TYPE_REC) ? type_create_struct(name, fields, field_count) : type_create_union(name, fields, field_count);
+    }
+
     default:
         return NULL;
     }
@@ -3274,6 +3733,25 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
         return NULL;
     }
 
+    // resolve and retain concrete type args
+    Type **resolved_args = malloc(sizeof(Type *) * type_args->count);
+    if (!resolved_args)
+    {
+        return NULL;
+    }
+
+    for (int i = 0; i < type_args->count; i++)
+    {
+        AstNode *arg_node = type_args->items[i];
+        Type    *arg_type = sema_resolve_type(sema, arg_node);
+        if (!arg_type)
+        {
+            free(resolved_args);
+            return NULL;
+        }
+        resolved_args[i] = arg_type;
+    }
+
     // generate mangled name: <name>I<type_args>E
     char mangled_name[512];
     int  pos = snprintf(mangled_name, sizeof(mangled_name), "%s", generic_sym->name);
@@ -3282,12 +3760,7 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
 
     for (int i = 0; i < type_args->count; i++)
     {
-        AstNode *arg_node = type_args->items[i];
-        Type    *arg_type = sema_resolve_type(sema, arg_node);
-        if (arg_type)
-        {
-            pos += type_mangle(arg_type, mangled_name + pos, sizeof(mangled_name) - pos);
-        }
+        pos += type_mangle(resolved_args[i], mangled_name + pos, sizeof(mangled_name) - pos);
     }
 
     pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "E");
@@ -3296,6 +3769,7 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
     Symbol *inst_sym = symbol_table_lookup(sema->root_table, mangled_name);
     if (inst_sym && inst_sym->type)
     {
+        free(resolved_args);
         return inst_sym->type;
     }
 
@@ -3306,10 +3780,9 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
     for (int i = 0; i < generic_params->count; i++)
     {
         AstNode *param_node = generic_params->items[i];
-        AstNode *arg_node   = type_args->items[i];
         if (param_node->kind == AST_TYPE_PARAM)
         {
-            Type   *arg_type = sema_resolve_type(sema, arg_node);
+            Type   *arg_type = resolved_args[i];
             Symbol *type_sym = symbol_create(param_node->type_param.name, SYMBOL_TYPE, sema->module_path);
             type_sym->type   = arg_type;
             symbol_table_insert(scope, type_sym);
@@ -3374,7 +3847,20 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
             }
             free(fields);
         }
+        free(resolved_args);
         return NULL;
+    }
+
+    // attach concrete generic args for later method instantiation
+    if (is_struct)
+    {
+        inst_type->structure.generic_args = resolved_args;
+        inst_type->structure.generic_arg_count = type_args->count;
+    }
+    else
+    {
+        inst_type->union_type.generic_args = resolved_args;
+        inst_type->union_type.generic_arg_count = type_args->count;
     }
 
     inst_sym       = symbol_create(mangled_name, SYMBOL_TYPE, sema->module_path);

@@ -501,6 +501,12 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 // 1. Evaluate LHS to memory operand
                 MasmOperand left_mem = lower_expr(masm, text, expr->binary_expr.left, ctx);
 
+                if (left_mem.kind != MASM_OPERAND_MEMORY)
+                {
+                    fprintf(stderr, "masm lower: unsupported lvalue in assignment\n");
+                    exit(1);
+                }
+
                 // 2. Load effective address into result
                 MasmOperand addr = isa_result(ctx, 8);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, addr, left_mem));
@@ -1142,16 +1148,30 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             is_pointer  = true;
         }
 
-        if (struct_type->kind == TYPE_STRUCT)
+        if (struct_type->kind == TYPE_STRUCT || struct_type->kind == TYPE_UNION)
         {
             // Find field offset
             int32_t    offset = 0;
             TypeField *field  = NULL;
-            for (int i = 0; i < struct_type->structure.field_count; i++)
+
+            TypeField *fields     = NULL;
+            int        field_count = 0;
+            if (struct_type->kind == TYPE_STRUCT)
             {
-                if (strcmp(struct_type->structure.fields[i].name, expr->field_expr.field) == 0)
+                fields = struct_type->structure.fields;
+                field_count = struct_type->structure.field_count;
+            }
+            else
+            {
+                fields = struct_type->union_type.fields;
+                field_count = struct_type->union_type.field_count;
+            }
+
+            for (int i = 0; i < field_count; i++)
+            {
+                if (strcmp(fields[i].name, expr->field_expr.field) == 0)
                 {
-                    field  = &struct_type->structure.fields[i];
+                    field  = &fields[i];
                     offset = (int32_t)field->offset;
                     break;
                 }
@@ -1159,17 +1179,12 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
             if (field)
             {
-                if (is_pointer)
+                // note: for large aggregates, lower_expr(AST_EXPR_IDENT) returns a register
+                // containing the address of the object (LEA). treat that like pointer access.
+                if (is_pointer || obj.kind == MASM_OPERAND_REGISTER)
                 {
-                    // obj is a register containing the address
-                    if (obj.kind != MASM_OPERAND_REGISTER)
-                    {
-                        MasmOperand r_res = isa_result(ctx, ctx->ptr_size);
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, r_res, obj));
-                        obj = r_res;
-                    }
-
-                    return masm_operand_memory_simple(obj.reg.id, offset, field->type->size);
+                    uint8_t size = field->type && field->type->size ? (uint8_t)field->type->size : ctx->ptr_size;
+                    return masm_operand_memory_simple(obj.reg.id, offset, size);
                 }
                 else
                 {
@@ -1177,7 +1192,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                     if (obj.kind == MASM_OPERAND_MEMORY)
                     {
                         // Adjust displacement
-                        return masm_operand_memory_simple(obj.mem.base.id, obj.mem.disp + offset, field->type->size);
+                        uint8_t size = field->type && field->type->size ? (uint8_t)field->type->size : ctx->ptr_size;
+                        return masm_operand_memory_simple(obj.mem.base.id, obj.mem.disp + offset, size);
                     }
                 }
             }
@@ -2359,10 +2375,51 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
 }
 
 static void lower_global_var(Masm *masm, AstNode *stmt);
+
+static bool lowered_name_has(char **names, int count, const char *name)
+{
+    if (!names || !name)
+    {
+        return false;
+    }
+    for (int i = 0; i < count; i++)
+    {
+        if (names[i] && strcmp(names[i], name) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void lowered_name_add(char ***names, int *count, int *cap, const char *name)
+{
+    if (!names || !count || !cap || !name)
+    {
+        return;
+    }
+    if (lowered_name_has(*names, *count, name))
+    {
+        return;
+    }
+    if (*count >= *cap)
+    {
+        *cap = (*cap) ? (*cap) * 2 : 16;
+        *names = realloc(*names, sizeof(char *) * (*cap));
+    }
+    (*names)[(*count)++] = strdup(name);
+}
+
 Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
 {
     MasmTarget target = masm_target_native();
     Masm      *masm   = masm_create(target);
+
+    // track lowered function names to avoid duplicate emission when also lowering
+    // instantiated generic functions that are not present in the original AST.
+    char **lowered_names = NULL;
+    int    lowered_count = 0;
+    int    lowered_cap   = 0;
 
     if (ast->kind == AST_PROGRAM)
     {
@@ -2372,7 +2429,18 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
             AstNode *decl = stmts->items[i];
             if (decl->kind == AST_STMT_FUN)
             {
+                // skip generic templates; only instantiated functions are lowered.
+                if (decl->fun_stmt.generics && decl->fun_stmt.generics->count > 0)
+                {
+                    continue;
+                }
+                if (decl->symbol && decl->symbol->is_generic)
+                {
+                    continue;
+                }
+
                 lower_function(masm, decl, symbols);
+                lowered_name_add(&lowered_names, &lowered_count, &lowered_cap, decl->fun_stmt.name);
             }
             else if (decl->kind == AST_STMT_VAR)
             {
@@ -2380,10 +2448,40 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
             }
         }
 
-        // TODO: lower instantiated generic functions not present in the original AST
-        // disabled for now to avoid duplicate lowering of functions that are already present
-        // in the program AST.
+        // lower instantiated generic functions that are not present in the original AST.
+        if (symbols)
+        {
+            for (Symbol *sym = symbols->symbols; sym; sym = sym->next)
+            {
+                if (sym->kind != SYMBOL_FUNCTION || sym->is_generic)
+                {
+                    continue;
+                }
+                if (!sym->decl || sym->decl->kind != AST_STMT_FUN)
+                {
+                    continue;
+                }
+                AstNode *fn = sym->decl;
+                if (fn->fun_stmt.generics && fn->fun_stmt.generics->count > 0)
+                {
+                    continue;
+                }
+                if (lowered_name_has(lowered_names, lowered_count, fn->fun_stmt.name))
+                {
+                    continue;
+                }
+
+                lower_function(masm, fn, symbols);
+                lowered_name_add(&lowered_names, &lowered_count, &lowered_cap, fn->fun_stmt.name);
+            }
+        }
     }
+
+    for (int i = 0; i < lowered_count; i++)
+    {
+        free(lowered_names[i]);
+    }
+    free(lowered_names);
 
     return masm;
 }

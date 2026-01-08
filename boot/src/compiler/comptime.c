@@ -13,6 +13,7 @@ typedef struct
 
 static TargetDescriptor detect_host_os(void);
 static TargetDescriptor detect_host_arch(void);
+static int64_t          detect_host_pointer_width(void);
 static int64_t          os_id_from_name(const char *name);
 static int64_t          arch_id_from_name(const char *name);
 static int              ensure_segment_capacity(const char ***segments_ptr, int *capacity, int count);
@@ -65,6 +66,11 @@ static TargetDescriptor detect_host_arch(void)
 #else
     return (TargetDescriptor){"unknown", 0};
 #endif
+}
+
+static int64_t detect_host_pointer_width(void)
+{
+    return (int64_t)sizeof(void *);
 }
 
 static int64_t os_id_from_name(const char *name)
@@ -238,6 +244,11 @@ int comptime_lookup(Sema *sema, AstNode *node)
             else if (strcmp(segments[3], "arch") == 0)
             {
                 set_string_result(node, host_arch.name);
+                result = 0;
+            }
+            else if (strcmp(segments[3], "pointer_width") == 0)
+            {
+                set_int_result(node, detect_host_pointer_width());
                 result = 0;
             }
         }

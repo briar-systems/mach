@@ -107,6 +107,8 @@ Type *type_create_struct(const char *name, TypeField *fields, int field_count)
     type->structure.fields      = fields;
     type->structure.field_count = field_count;
     type->structure.methods     = NULL; // initialize methods table
+    type->structure.generic_args = NULL;
+    type->structure.generic_arg_count = 0;
 
     // calculate size and alignment
     size_t size      = 0;
@@ -301,6 +303,8 @@ Type *type_create_union(const char *name, TypeField *fields, int field_count)
     type->union_type.fields      = fields;
     type->union_type.field_count = field_count;
     type->union_type.methods     = NULL; // initialize methods table
+    type->union_type.generic_args = NULL;
+    type->union_type.generic_arg_count = 0;
 
     // union size is the max of field sizes and alignment is the max of field alignments
     size_t size      = 0;

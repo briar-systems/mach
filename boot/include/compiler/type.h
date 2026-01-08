@@ -75,6 +75,8 @@ struct Type
             TypeField          *fields;
             int                 field_count;
             struct SymbolTable *methods; // methods associated with this type
+            Type              **generic_args; // concrete args for instantiated generic types
+            int                 generic_arg_count;
         } structure;
 
         // TYPE_UNION
@@ -84,6 +86,8 @@ struct Type
             TypeField          *fields;
             int                 field_count;
             struct SymbolTable *methods; // methods associated with this type
+            Type              **generic_args; // concrete args for instantiated generic types
+            int                 generic_arg_count;
         } union_type;
 
         // TYPE_GENERIC_PARAM

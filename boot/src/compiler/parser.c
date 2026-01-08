@@ -109,6 +109,46 @@ static bool parser_token_is_attr_category(TokenKind kind)
     }
 }
 
+// parse a block that may contain top-level declarations (used for comptime $if/$or bodies).
+static AstNode *parser_parse_stmt_block_top(Parser *parser)
+{
+    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{'"))
+    {
+        return NULL;
+    }
+
+    AstNode *block = parser_alloc_node(parser, AST_STMT_BLOCK, parser->previous);
+    if (!block)
+    {
+        return NULL;
+    }
+
+    block->block_stmt.stmts          = parser_alloc_list(parser);
+    block->block_stmt.deferred_stmts = parser_alloc_list(parser);
+    if (!block->block_stmt.stmts || !block->block_stmt.deferred_stmts)
+    {
+        parser_free_node(block);
+        return NULL;
+    }
+
+    while (!parser_check(parser, TOKEN_R_BRACE) && !parser_is_at_end(parser))
+    {
+        AstNode *stmt = parser_parse_stmt_top(parser);
+        if (stmt)
+        {
+            ast_list_append(block->block_stmt.stmts, stmt);
+        }
+    }
+
+    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after block"))
+    {
+        parser_free_node(block);
+        return NULL;
+    }
+
+    return block;
+}
+
 static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
 {
     if (!parser_consume(parser, TOKEN_KW_IF, "expected 'if' after '$'"))
@@ -142,7 +182,7 @@ static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
         return NULL;
     }
 
-    node->comptime_if_stmt.body = parser_parse_stmt_block(parser);
+    node->comptime_if_stmt.body = parser_parse_stmt_block_top(parser);
     if (!node->comptime_if_stmt.body)
     {
         parser_error_at_current(parser, "expected block after '$if' condition");
@@ -184,7 +224,7 @@ static AstNode *parser_parse_stmt_comptime_if(Parser *parser)
             }
         }
 
-        or_node->comptime_if_stmt.body = parser_parse_stmt_block(parser);
+        or_node->comptime_if_stmt.body = parser_parse_stmt_block_top(parser);
         if (!or_node->comptime_if_stmt.body)
         {
             parser_error_at_current(parser, "expected block after '$or'");
