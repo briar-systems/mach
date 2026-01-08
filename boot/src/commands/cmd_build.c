@@ -12,6 +12,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+static bool str_ends_with(const char *s, const char *suffix)
+{
+    if (!s || !suffix)
+    {
+        return false;
+    }
+    size_t sl = strlen(s);
+    size_t su = strlen(suffix);
+    if (su > sl)
+    {
+        return false;
+    }
+    return memcmp(s + (sl - su), suffix, su) == 0;
+}
+
 void cmd_build_help(FILE *stream)
 {
     fprintf(stream, "usage: mach build <project|file> [options]\n");
@@ -128,7 +143,16 @@ int cmd_build_handle(int argc, char **argv)
             return 1;
         }
 
-        ConfigTarget *target = config->targets[0];
+        // pick the configured default target for the project (fallback: first)
+        ConfigTarget *target = NULL;
+        if (config->target)
+        {
+            target = config_get_target(config, config->target);
+        }
+        if (!target)
+        {
+            target = config->targets[0];
+        }
         if (!target->entrypoint)
         {
             fprintf(stderr, "error: target '%s' has no entrypoint\n", target->name);
@@ -415,27 +439,114 @@ int cmd_build_handle(int argc, char **argv)
         }
     }
 
-    // generate object file (now executable directly via MASM)
-    // char obj_file[512];
-    // snprintf(obj_file, sizeof(obj_file), "%s.o", output_file);
+    // emit object (ET_REL) first.
+    // - single-file mode: output is the object at `-o` (or default "output")
+    // - project mode: emit an intermediate `<final_output>.o`, then link/archive
+    const char *final_output = output_file;
+    const char *obj_output   = output_file;
+    char        obj_path[2048];
+    if (is_project)
+    {
+        snprintf(obj_path, sizeof(obj_path), "%s.o", final_output);
+        obj_output = obj_path;
+    }
 
-    if (masm_emit_object(masm, output_file) < 0)
+    if (masm_emit_object(masm, obj_output) < 0)
     {
         fprintf(stderr, "error: failed to emit object file\n");
         masm_destroy(masm);
         sema_destroy(sema);
-        
+
         // clean up config after sema is destroyed
         if (config)
         {
             config_dnit(config);
             free(config);
         }
-        
+
         parser_dnit(&parser);
         lexer_dnit(&lexer);
         free(source);
         return 1;
+    }
+
+    if (is_project && config)
+    {
+        // select the same target used above
+        ConfigTarget *target = NULL;
+        if (config->target)
+        {
+            target = config_get_target(config, config->target);
+        }
+        if (!target)
+        {
+            target = config->targets[0];
+        }
+
+        ConfigTargetModeKind mode = TARGET_MODE_EXECUTABLE;
+        if (target && target->mode)
+        {
+            mode = target->mode->kind;
+        }
+
+        if (mode == TARGET_MODE_LIBRARY)
+        {
+            // build a static archive
+            (void)remove(final_output);
+            char ar_cmd[4096];
+            snprintf(ar_cmd, sizeof(ar_cmd), "ar rcs %s %s", final_output, obj_output);
+            int rc = system(ar_cmd);
+            if (rc != 0)
+            {
+                fprintf(stderr, "error: archiving failed (%d)\n", rc);
+                masm_destroy(masm);
+                sema_destroy(sema);
+                if (config)
+                {
+                    config_dnit(config);
+                    free(config);
+                }
+                parser_dnit(&parser);
+                lexer_dnit(&lexer);
+                free(source);
+                return 1;
+            }
+
+            // keep the intermediate object; it can help debugging.
+        }
+        else
+        {
+            // link an executable (or shared in the future)
+            // default: use cc as the linker driver; we provide our own _start.
+            (void)remove(final_output);
+            char link_cmd[4096];
+            // note: -no-pie is important on many distros defaulting to PIE
+            snprintf(link_cmd, sizeof(link_cmd), "cc -nostdlib -no-pie -Wl,-e,_start -o %s %s", final_output, obj_output);
+            int rc = system(link_cmd);
+            if (rc != 0)
+            {
+                fprintf(stderr, "error: linking failed (%d)\n", rc);
+                masm_destroy(masm);
+                sema_destroy(sema);
+                if (config)
+                {
+                    config_dnit(config);
+                    free(config);
+                }
+                parser_dnit(&parser);
+                lexer_dnit(&lexer);
+                free(source);
+                return 1;
+            }
+
+            // ensure executable bit when linking through cc without crt
+            if (!str_ends_with(final_output, ".a") && !str_ends_with(final_output, ".o"))
+            {
+                char chmod_cmd[4096];
+                snprintf(chmod_cmd, sizeof(chmod_cmd), "chmod +x %s 2>/dev/null", final_output);
+                (void)system(chmod_cmd);
+            }
+        }
     }
 
     // cleanup

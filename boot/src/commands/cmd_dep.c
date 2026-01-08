@@ -639,7 +639,7 @@ static int handle_dep_pull(int argc, char **argv)
         }
 
         printf("pulling dependency '%s'...\n", dep->name ? dep->name : "unknown");
-        if (!pull_dependency(config, dep))
+        if (pull_dependency(config, dep) != 0)
         {
             fprintf(stderr, "error: failed to pull dependency '%s'\n", dep->name ? dep->name : "unknown");
             config_dnit(config);
