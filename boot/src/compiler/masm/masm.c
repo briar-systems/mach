@@ -103,11 +103,33 @@ void masm_merge(Masm *dest, Masm *src)
 {
     if (!dest || !src) return;
 
+    // when we append section contents from `src` onto `dest`, any symbols with
+    // concrete offsets into those sections must be adjusted by the base offset
+    // in the destination section.
+    typedef struct
+    {
+        const char *name;
+        uint64_t    data_base;
+    } SectionBase;
+
+    SectionBase bases[64];
+    size_t      base_count = 0;
+
     // Merge sections
     for (size_t i = 0; i < src->section_count; i++)
     {
         MasmSection *src_sec = src->sections[i];
         MasmSection *dest_sec = masm_get_or_create_section(dest, src_sec->name, src_sec->kind);
+
+        // record the destination base *before* we append anything from src.
+        // note: we only use this for data-backed sections; text symbol offsets
+        // are resolved during encoding from label positions.
+        if (base_count < (sizeof(bases) / sizeof(bases[0])))
+        {
+            bases[base_count].name      = src_sec->name;
+            bases[base_count].data_base = (uint64_t)dest_sec->data_size;
+            base_count++;
+        }
 
         // Append instructions
         for (size_t j = 0; j < src_sec->inst_count; j++)
@@ -140,6 +162,19 @@ void masm_merge(Masm *dest, Masm *src)
         if (src_sym->section_name)
         {
             new_sym->section_name = strdup(src_sym->section_name);
+        }
+
+        // adjust concrete offsets for merged data sections
+        if (new_sym->section_name && strcmp(new_sym->section_name, ".text") != 0)
+        {
+            for (size_t j = 0; j < base_count; j++)
+            {
+                if (strcmp(bases[j].name, new_sym->section_name) == 0)
+                {
+                    new_sym->offset += bases[j].data_base;
+                    break;
+                }
+            }
         }
         
         masm_add_symbol(dest, new_sym);
