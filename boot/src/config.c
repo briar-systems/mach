@@ -440,10 +440,17 @@ static Config *config_load_internal(const char *config_path, const char *project
                 char dep_project_root[1024];
                 snprintf(dep_project_root, sizeof(dep_project_root), "%s/%s/%s", 
                          project_root, config->dir_dep, dep->name);
-                
+
+                // dependency vendoring is allowed to lag behind config. only attempt to load
+                // the dependency config if it exists on disk.
+                if (!file_exists(dep_config_path))
+                {
+                    continue;
+                }
+
                 // load dependency config (without loading its dependencies to avoid deep recursion)
                 dep->config = config_load_internal(dep_config_path, dep_project_root, false);
-                // if loading fails, continue (dependency might not be fetched yet)
+                // if loading fails, continue
             }
         }
     }

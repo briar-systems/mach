@@ -512,6 +512,75 @@ static int handle_dep_add(int argc, char **argv)
         return 1;
     }
 
+    // if the dependency already exists, treat this as an idempotent operation:
+    // ensure the existing spec is up to date (version override) and vendor it.
+    ConfigDep *existing = config_get_dependency(config, dep_name);
+    if (existing)
+    {
+        if ((is_local && (!existing->type || existing->type->kind != DEP_TYPE_LOCAL)) ||
+            (!is_local && existing->type && existing->type->kind == DEP_TYPE_LOCAL))
+        {
+            fprintf(stderr, "error: dependency '%s' already exists with a different type\n", dep_name);
+            fprintf(stderr, "hint: run 'mach dep del %s' first\n", dep_name);
+            config_dnit(config);
+            return 1;
+        }
+
+        if (existing->path && strcmp(existing->path, path_or_url) != 0)
+        {
+            fprintf(stderr, "error: dependency '%s' already exists with a different path\n", dep_name);
+            fprintf(stderr, "hint: run 'mach dep del %s' first\n", dep_name);
+            config_dnit(config);
+            return 1;
+        }
+
+        if (version_override)
+        {
+            if (existing->version)
+            {
+                free((void *)existing->version->value);
+                free(existing->version);
+            }
+
+            existing->version = malloc(sizeof(ConfigDepVersion));
+            if (!existing->version)
+            {
+                fprintf(stderr, "error: failed to allocate memory for dependency version\n");
+                config_dnit(config);
+                return 1;
+            }
+            existing->version->value = strdup(version_override);
+            if (strncmp(version_override, "branch/", 7) == 0)
+            {
+                existing->version->kind = DEP_VERSION_KIND_BRANCH;
+            }
+            else if (strncmp(version_override, "commit/", 7) == 0)
+            {
+                existing->version->kind = DEP_VERSION_KIND_COMMIT;
+            }
+            else
+            {
+                existing->version->kind = DEP_VERSION_KIND_SEMVER;
+            }
+
+            if (!config_save(config, MACH_TOML_CONFIG_PATH))
+            {
+                fprintf(stderr, "error: failed to save updated mach.toml\n");
+                config_dnit(config);
+                return 1;
+            }
+        }
+
+        printf("dependency '%s' already declared; syncing vendor directory...\n", dep_name);
+        int result = pull_dependency(config, existing);
+        if (result != 0)
+        {
+            fprintf(stderr, "error: failed to vendor dependency '%s'\n", dep_name);
+        }
+        config_dnit(config);
+        return result;
+    }
+
     // allocate and initialize dependency
     ConfigDep *dep = malloc(sizeof(ConfigDep));
     if (!dep)
@@ -580,27 +649,15 @@ static int handle_dep_add(int argc, char **argv)
 
     printf("dependency '%s' added successfully\n", dep_name ? dep_name : path_or_url);
 
-    // initialize the submodule if it's a remote dependency
-    if (git_is_repo(".") && dep->type && dep->type->kind == DEP_TYPE_REMOTE)
+    // vendor it immediately so the directory exists and version overrides are applied.
+    int result = pull_dependency(config, dep);
+    if (result != 0)
     {
-        const char *dep_dir = config->dir_dep ? config->dir_dep : "dep";
-        char *dep_path = path_join(dep_dir, dep->name);
-        if (dep_path)
-        {
-            if (!git_is_repo(dep_path))
-            {
-                printf("initializing submodule '%s'...\n", dep->name);
-                if (!git_submodule_init(dep_path, dep->path))
-                {
-                    fprintf(stderr, "warning: failed to initialize submodule '%s'\n", dep->name);
-                }
-            }
-            free(dep_path);
-        }
+        fprintf(stderr, "error: failed to vendor dependency '%s'\n", dep->name ? dep->name : "unknown");
     }
 
     config_dnit(config);
-    return 0;
+    return result;
 }
 
 static int handle_dep_pull(int argc, char **argv)
