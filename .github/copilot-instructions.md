@@ -10,7 +10,9 @@
 - Avoid introducing compatibility shims. Prefer full implementations.
 - Fully remove any dead code or lost features if affected by a change. This includes replaced functionality.
 
-If there are ever any changes to be made that would affect the Mach lanuage syntax, semantics, behaviour, or otherwise similar core aspects of the language to any degree, please pause and discuss with the user before proceeding.
+# General
+- Any files inside of `dep` directories in mach projects are entirely off limits and are to be managed by the Mach dependency manager subcommand only.
+- If there are ever any changes to be made that would affect the Mach lanuage syntax, semantics, behaviour, or otherwise similar core aspects of the language to any degree, please pause and discuss with the user before proceeding.
 
 # Documentation
 - If a change requires documentation, update any existing documentation files in `doc` that pertain to the change.
