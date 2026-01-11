@@ -1811,6 +1811,21 @@ static bool sema_eval_comptime_int(Sema *sema, AstNode *node, int64_t *out_val)
         case TOKEN_SLASH:
             *out_val = (right != 0) ? (left / right) : 0;
             return true;
+        case TOKEN_AMPERSAND:
+            *out_val = left & right;
+            return true;
+        case TOKEN_PIPE:
+            *out_val = left | right;
+            return true;
+        case TOKEN_CARET:
+            *out_val = left ^ right;
+            return true;
+        case TOKEN_LESS_LESS:
+            *out_val = left << right;
+            return true;
+        case TOKEN_GREATER_GREATER:
+            *out_val = left >> right;
+            return true;
         case TOKEN_EQUAL_EQUAL:
             *out_val = (left == right);
             return true;
@@ -1855,6 +1870,9 @@ static bool sema_eval_comptime_int(Sema *sema, AstNode *node, int64_t *out_val)
             return true;
         case TOKEN_MINUS:
             *out_val = -inner;
+            return true;
+        case TOKEN_TILDE:
+            *out_val = ~inner;
             return true;
         default:
             return false;
@@ -2646,6 +2664,10 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 }
                 break;
             }
+            case TOKEN_LIT_CHAR:
+                // chars are u8 per language docs
+                node->type = type_get_primitive(TYPE_U8);
+                break;
             case TOKEN_LIT_STRING:
                 // simplified: string is pointer to u8
                 node->type = type_create_pointer(type_get_primitive(TYPE_U8), false);

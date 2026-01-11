@@ -422,6 +422,10 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         {
             return masm_operand_imm((int64_t)expr->lit_expr.int_val);
         }
+        else if (expr->lit_expr.kind == TOKEN_LIT_CHAR)
+        {
+            return masm_operand_imm((int64_t)(uint8_t)expr->lit_expr.char_val);
+        }
         else if (expr->lit_expr.kind == TOKEN_LIT_STRING)
         {
             #ifdef MASM_DEBUG
@@ -797,23 +801,21 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 {
                     MasmOperand var_mem = frame_mem(ctx, var->offset, var->size);
 
-                    // Store right_val into var_mem
-                    if (right_val.kind == MASM_OPERAND_REGISTER)
+                    // materialize RHS into RAX for the expression result, then store using the lvalue width.
+                    MasmOperand rax = isa_result(ctx, ctx->ptr_size);
+                    if (!(right_val.kind == MASM_OPERAND_REGISTER && right_val.reg.id == isa_result_id(ctx)))
                     {
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, right_val));
-                    }
-                    else if (right_val.kind == MASM_OPERAND_IMM)
-                    {
-                        MasmOperand temp = isa_result(ctx, ctx->ptr_size);
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, temp, right_val));
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, temp));
-
-                        // return value in result
-                        return temp;
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, right_val));
                     }
 
-                    // if right_val was register, it's already in a register (likely RAX), so return it
-                    return right_val;
+                    MasmOperand store_src = rax;
+                    if (var->size < rax.reg.size)
+                    {
+                        store_src = masm_operand_register(rax.reg.id, (uint8_t)var->size);
+                    }
+
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, store_src));
+                    return rax;
                 }
             }
             return masm_operand_none();
@@ -867,12 +869,6 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
 
         MasmOperand right = lower_expr(masm, text, expr->binary_expr.right, ctx);
-
-        // free the save register if we used one
-        if (left_save_reg != UINT32_MAX)
-        {
-            regalloc_free(&ctx->regalloc, left_save_reg);
-        }
 
         MasmOperand result = isa_result(ctx, 8);
         if (left.kind == MASM_OPERAND_REGISTER)
@@ -930,6 +926,9 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             // Move left from save register to RAX
             MasmOperand save_reg = masm_operand_register(left_save_reg, result.reg.size);
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, save_reg));
+
+            // now that we've restored left, the save register can be reused.
+            regalloc_free(&ctx->regalloc, left_save_reg);
         }
         else
         {
@@ -1054,6 +1053,18 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         {
             opcode = MASM_OP_OR;
         }
+        else if (expr->binary_expr.op == TOKEN_CARET)
+        {
+            opcode = MASM_OP_XOR;
+        }
+        else if (expr->binary_expr.op == TOKEN_LESS_LESS)
+        {
+            opcode = MASM_OP_SHL;
+        }
+        else if (expr->binary_expr.op == TOKEN_GREATER_GREATER)
+        {
+            opcode = MASM_OP_SHR;
+        }
         else if (expr->binary_expr.op == TOKEN_EQUAL_EQUAL)
         {
             opcode        = MASM_OP_CMP;
@@ -1093,6 +1104,23 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         else
         {
             return masm_operand_none();
+        }
+
+        // shifts on x86_64 take their variable count from CL.
+        // ensure the count is either an imm8 or in RCX.
+        if (opcode == MASM_OP_SHL || opcode == MASM_OP_SHR)
+        {
+            if (right_op.kind == MASM_OPERAND_REGISTER && right_op.reg.id != rcx.reg.id)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, right_op));
+                right_op = rcx;
+            }
+
+            if (right_op.kind == MASM_OPERAND_REGISTER)
+            {
+                // encoded as CL; size here is informational.
+                right_op.reg.size = 1;
+            }
         }
 
         if (is_comparison)
@@ -1531,6 +1559,25 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, result));
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, masm_operand_imm(0)));
             masm_section_append_inst(text, masm_inst_2(MASM_OP_SUB, result, rcx));
+        }
+
+        else if (expr->unary_expr.op == TOKEN_TILDE)
+        {
+            // ~expr -> bitwise not. constrain to the static type width when known.
+            uint8_t sz = (expr->type && expr->type->size) ? (uint8_t)expr->type->size : (uint8_t)ctx->ptr_size;
+            if (sz == 0) sz = (uint8_t)ctx->ptr_size;
+            if (sz > 8) sz = 8;
+
+            int64_t mask = -1;
+            if (sz < 8)
+            {
+                mask = (int64_t)(((uint64_t)1ULL << (sz * 8)) - 1ULL);
+
+                // clear high bits first so ~ behaves like an N-bit operation.
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, result, masm_operand_imm(mask)));
+            }
+
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_XOR, result, masm_operand_imm(mask)));
         }
 
         return result;
