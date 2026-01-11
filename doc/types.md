@@ -211,16 +211,13 @@ Mach does not support advanced generic features such as type constraints, varian
 
 ## Type Casting
 
-Mach requires explicit type casting between different types using the `::` operator:
+Mach provides an explicit cast operator, `::`.
 
-```mach
-val a: i32 = 42;
-val b: i64 = a::i64;
-```
+This cast is a **pure bit reinterpretation** of a value's in-memory representation. It has no conversion semantics (no sign/zero extension, no float/int conversion, etc).
 
-This cast operator is extremely literal and does not perform any implicit conversions or coercions. This is important to keep in mind when working with different types, as you must ensure that the cast is valid and makes sense in the context of your program and the underlying data representation.
+As a result, casts require **identical, known type sizes**.
 
-For example, this example will produce unusable results, as the bit patterns of `f32` and `i32` are not directly compatible:
+For example, reinterpreting the bit pattern of a `f32` as an `i32` is allowed (both are 4 bytes):
 
 ```mach
 val x: f32 = 3.14;
@@ -229,9 +226,9 @@ val y: i32 = x::i32; # This is NOT a valid conversion of the underlying bit patt
 
 The above example WILL compile and execute successfully, but the resulting value of `y` will not represent the integer equivalent of `3.14`. Instead, it will represent the raw bit pattern of the `f32` value interpreted as an `i32`, which is likely not what you want.
 
-This cast operator is extremely powerful, but it comes with the responsibility of ensuring that the conversions you perform are valid and meaningful.
+Numeric conversions (such as widening `u8` to `u64`, truncating `u64` to `u8`, etc) are provided by the standard library (for example, `std.types.int`).
 
-The compiler will warn you if you attempt to cast between incompatible types. Incompatible types are those that do not have identical sizes. This means that the cast operator DOES allow for casting between types of the same size but different representations. Here is a special example that demonstrates the power of such a system:
+Here is a special example that demonstrates the power of bit reinterpreting between types of the same size:
 
 ```mach
 rec Color {

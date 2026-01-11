@@ -265,11 +265,11 @@ See the [Types](types.md#methods) documentation for details on method syntax.
 
 ### Type Casting
 
-The `::` operator performs an explicit type cast.
+The `::` operator performs an explicit bit reinterpretation cast.
 
 ```mach
-val x: i32 = 42;
-val y: i64 = x::i64;  # cast i32 to i64
+val x: f32 = 3.14;
+val y: i32 = x::i32;  # reinterpret f32 bits as i32
 ```
 
 See the [Types](types.md#type-casting) documentation for details on casting rules and semantics.
