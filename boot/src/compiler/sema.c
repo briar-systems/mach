@@ -4737,6 +4737,9 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
 
     inst_sym->type = type_create_function(ret_type, param_types, param_count);
 
+    // make the instantiated decl self-contained for later lowering passes.
+    cloned_decl->type = inst_sym->type;
+
     if (cloned_decl->fun_stmt.params)
     {
         for (int i = 0; i < cloned_decl->fun_stmt.params->count; i++)

@@ -13,6 +13,15 @@ static bool same_register(MasmOperand a, MasmOperand b)
     return a.reg.id == b.reg.id && a.reg.size == b.reg.size;
 }
 
+static bool mem_uses_reg(MasmOperand mem_op, uint32_t reg_id)
+{
+    if (mem_op.kind != MASM_OPERAND_MEMORY)
+    {
+        return false;
+    }
+    return mem_op.mem.base.id == reg_id || mem_op.mem.index.id == reg_id;
+}
+
 // peephole optimization pass
 static void masm_opt_peephole(MasmSection *section)
 {
@@ -49,7 +58,9 @@ static void masm_opt_peephole(MasmSection *section)
         }
 
         // pattern 2: MOV rax, X; MOV rax, Y -> remove first MOV (dead store)
-        // only if no labels between them and X is not memory (could have side effects)
+        // only if no labels between them, X is not memory, and the next MOV does not
+        // use the destination register as part of its source addressing (e.g.
+        // `mov rax, label; mov rax, [rax]` is a load-from-address idiom and is not dead).
         if (inst->opcode == MASM_OP_MOV && inst->operand_count == 2 && i + 1 < section->inst_count)
         {
             MasmInstruction *next = &section->instructions[i + 1];
@@ -58,8 +69,12 @@ static void masm_opt_peephole(MasmSection *section)
                 // same destination register, source is not memory
                 if (same_register(inst->operands[0], next->operands[0]) && inst->operands[1].kind != MASM_OPERAND_MEMORY)
                 {
-                    remove[i] = 1;
-                    continue;
+                    uint32_t dst_reg = inst->operands[0].reg.id;
+                    if (!mem_uses_reg(next->operands[1], dst_reg))
+                    {
+                        remove[i] = 1;
+                        continue;
+                    }
                 }
             }
         }
