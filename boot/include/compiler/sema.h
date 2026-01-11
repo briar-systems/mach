@@ -35,12 +35,20 @@ void sema_set_file_context(Sema *sema, const char *file_path, const char *source
 // returns 0 on success, -1 on error
 int sema_analyze(Sema *sema, AstNode *ast);
 
-// get root symbol table (for inspection/codegen)
-SymbolTable *sema_get_root_table(Sema *sema);
+// get the current (entry) module's symbol table (for codegen)
+SymbolTable *sema_get_main_module_table(Sema *sema);
+
+// loaded module info for codegen
+typedef struct SemaLoadedModule
+{
+	const char  *module_path;
+	AstNode     *ast;
+	SymbolTable *table;
+} SemaLoadedModule;
 
 // get all loaded module ASTs (for codegen)
-// returns count, fills asts array (must be pre-allocated)
-int sema_get_loaded_modules(Sema *sema, AstNode **asts, int max_count);
+// returns count, fills modules array (must be pre-allocated)
+int sema_get_loaded_modules(Sema *sema, SemaLoadedModule *modules, int max_count);
 
 // error reporting
 int  sema_get_error_count(Sema *sema);

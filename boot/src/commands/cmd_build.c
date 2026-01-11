@@ -407,7 +407,7 @@ int cmd_build_handle(int argc, char **argv)
     }
 
     // lower to MASM - first the main module
-    Masm *masm = masm_lower_module(ast, sema_get_root_table(sema));
+    Masm *masm = masm_lower_module(ast, sema_get_main_module_table(sema));
     if (!masm)
     {
         fprintf(stderr, "error: lowering to MASM failed\n");
@@ -427,11 +427,11 @@ int cmd_build_handle(int argc, char **argv)
     }
 
     // lower all imported modules
-    AstNode *loaded_asts[64];
-    int      loaded_count = sema_get_loaded_modules(sema, loaded_asts, 64);
+    SemaLoadedModule loaded[64];
+    int              loaded_count = sema_get_loaded_modules(sema, loaded, 64);
     for (int i = 0; i < loaded_count; i++)
     {
-        Masm *imported_masm = masm_lower_module(loaded_asts[i], sema_get_root_table(sema));
+        Masm *imported_masm = masm_lower_module(loaded[i].ast, loaded[i].table);
         if (imported_masm)
         {
             masm_merge(masm, imported_masm);

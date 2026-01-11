@@ -8,24 +8,42 @@
 #include <stdlib.h>
 #include <string.h>
 
-// track loaded modules to avoid circular imports and redundant work
-typedef struct LoadedModule
+static bool sema_trace_enabled(void)
 {
-    char                *module_path; // fully qualified module path
-    char                *source;      // source text (kept for error reporting)
-    char                *file_path;   // file path for error messages
-    AstNode             *ast;         // parsed AST
-    struct LoadedModule *next;
-} LoadedModule;
+    const char *v = getenv("MACH_SEMA_TRACE");
+    return v && v[0] != '\0';
+}
 
-// track import aliases (use alias: module.path;)
-typedef struct ImportAlias
+typedef struct SemaModule SemaModule;
+
+typedef struct ModuleImport
 {
-    char               *alias;       // the alias name
-    char               *module_path; // fully qualified module path
-    SymbolTable        *table;       // symbol table of the imported module
-    struct ImportAlias *next;
-} ImportAlias;
+    SemaModule          *module;
+    struct ModuleImport *next;
+} ModuleImport;
+
+typedef struct ModuleAlias
+{
+    char              *alias;
+    SemaModule        *module;
+    struct ModuleAlias *next;
+} ModuleAlias;
+
+// track loaded modules to avoid circular imports and redundant work.
+// each module has its own global symbol table.
+struct SemaModule
+{
+    char       *module_path; // fully qualified module path
+    char       *source;      // source text (kept for error reporting)
+    char       *file_path;   // file path for error messages
+    AstNode    *ast;         // parsed AST
+    SymbolTable *table;      // module-level global symbol table
+
+    ModuleImport *imports;   // unaliased `use module.path;` imports
+    ModuleAlias  *aliases;   // aliased `use a: module.path;` imports
+
+    struct SemaModule *next;
+};
 
 // additional module roots (prefix -> src_root)
 // used by single-file compilation mode via `-I prefix=/abs/dir`.
@@ -47,10 +65,15 @@ typedef struct SemaError
 // semantic analyzer context
 struct Sema
 {
-    SymbolTable *root_table;
+    // module state
+    SemaModule  *modules;        // loaded modules (including entry module)
+    SemaModule  *main_module;    // entry module
+    SemaModule  *current_module; // module currently being analyzed
+
+    SymbolTable *root_table;      // used only for nested scopes that are not module globals (kept for compatibility)
     SymbolTable *current_table;
     int          error_count;
-    char        *module_path;
+    const char  *module_path; // borrowed from current_module->module_path
     Type        *current_function_return_type;
 
     // error list
@@ -68,8 +91,7 @@ struct Sema
     char         *dep_root;       // dependencies directory path
     ConfigDep   **deps;           // dependencies for module resolution
     int           dep_count;      // number of dependencies
-    LoadedModule *loaded_modules; // cache of loaded modules
-    ImportAlias  *import_aliases; // linked list of import aliases
+    // modules are tracked in `modules`
 
     // extra module roots (for single-file mode)
     ModuleRoot *extra_roots;
@@ -115,10 +137,14 @@ Sema *sema_create(const char *module_path)
         return NULL;
     }
 
-    sema->root_table                 = symbol_table_create(NULL);
-    sema->current_table              = sema->root_table;
+    sema->modules                    = NULL;
+    sema->main_module                = NULL;
+    sema->current_module             = NULL;
+
+    sema->root_table                 = NULL;
+    sema->current_table              = NULL;
     sema->error_count                = 0;
-    sema->module_path                = module_path ? strdup(module_path) : NULL;
+    sema->module_path                = NULL;
     sema->errors                     = NULL;
     sema->errors_count               = 0;
     sema->errors_capacity            = 0;
@@ -129,12 +155,49 @@ Sema *sema_create(const char *module_path)
     sema->dep_root                   = NULL;
     sema->deps                       = NULL;
     sema->dep_count                  = 0;
-    sema->loaded_modules             = NULL;
-    sema->import_aliases             = NULL;
     sema->current_function_return_type = NULL;
     sema->extra_roots                = NULL;
     sema->extra_root_count           = 0;
     sema->extra_root_capacity        = 0;
+
+
+    // create entry module
+    SemaModule *main_mod = calloc(1, sizeof(SemaModule));
+    if (!main_mod)
+    {
+        free(sema);
+        return NULL;
+    }
+
+    main_mod->module_path = module_path ? strdup(module_path) : strdup("main");
+    main_mod->source      = NULL;
+    main_mod->file_path   = NULL;
+    main_mod->ast         = NULL;
+    main_mod->table       = symbol_table_create(NULL);
+    main_mod->imports     = NULL;
+    main_mod->aliases     = NULL;
+    main_mod->next        = NULL;
+
+    if (!main_mod->module_path || !main_mod->table)
+    {
+        if (main_mod->module_path)
+        {
+            free(main_mod->module_path);
+        }
+        if (main_mod->table)
+        {
+            symbol_table_destroy(main_mod->table);
+        }
+        free(main_mod);
+        free(sema);
+        return NULL;
+    }
+
+    sema->modules        = main_mod;
+    sema->main_module    = main_mod;
+    sema->current_module = main_mod;
+    sema->module_path    = main_mod->module_path;
+    sema->current_table  = main_mod->table;
 
     return sema;
 }
@@ -149,10 +212,6 @@ void sema_destroy(Sema *sema)
     if (sema->root_table)
     {
         symbol_table_destroy(sema->root_table);
-    }
-    if (sema->module_path)
-    {
-        free(sema->module_path);
     }
     if (sema->project_id)
     {
@@ -196,33 +255,42 @@ void sema_destroy(Sema *sema)
     }
     free(sema->errors);
 
-    // free current file context
-    free(sema->current_file_path);
-    free(sema->current_source);
+    // current file context is borrowed from the current module; do not free here.
 
-    // free loaded modules
-    LoadedModule *mod = sema->loaded_modules;
+    // free loaded modules (including entry module)
+    SemaModule *mod = sema->modules;
     while (mod)
     {
-        LoadedModule *next = mod->next;
+        SemaModule *next = mod->next;
+
         free(mod->module_path);
         free(mod->file_path);
         free(mod->source);
+        if (mod->table)
+        {
+            symbol_table_destroy(mod->table);
+        }
+
+        ModuleImport *imp = mod->imports;
+        while (imp)
+        {
+            ModuleImport *imp_next = imp->next;
+            free(imp);
+            imp = imp_next;
+        }
+
+        ModuleAlias *al = mod->aliases;
+        while (al)
+        {
+            ModuleAlias *al_next = al->next;
+            free(al->alias);
+            free(al);
+            al = al_next;
+        }
+
         // note: ast is not freed here as it may still be in use
         free(mod);
         mod = next;
-    }
-
-    // free import aliases
-    ImportAlias *alias = sema->import_aliases;
-    while (alias)
-    {
-        ImportAlias *next = alias->next;
-        free(alias->alias);
-        free(alias->module_path);
-        // note: symbol table is not freed here as it's part of loaded modules
-        free(alias);
-        alias = next;
     }
 
     // free extra module roots
@@ -354,32 +422,47 @@ void sema_set_file_context(Sema *sema, const char *file_path, const char *source
         return;
     }
 
-    free(sema->current_file_path);
-    free(sema->current_source);
+    // associate the provided context with the entry module
+    if (sema->main_module)
+    {
+        free(sema->main_module->file_path);
+        free(sema->main_module->source);
 
-    sema->current_file_path = file_path ? strdup(file_path) : NULL;
-    sema->current_source    = source ? strdup(source) : NULL;
+        sema->main_module->file_path = file_path ? strdup(file_path) : NULL;
+        sema->main_module->source    = source ? strdup(source) : NULL;
+    }
+
+    // update current reporting context to match current module
+    sema->current_file_path = sema->main_module ? sema->main_module->file_path : NULL;
+    sema->current_source    = sema->main_module ? sema->main_module->source : NULL;
 }
 
-SymbolTable *sema_get_root_table(Sema *sema)
+SymbolTable *sema_get_main_module_table(Sema *sema)
 {
-    return sema ? sema->root_table : NULL;
+    return (sema && sema->main_module) ? sema->main_module->table : NULL;
 }
 
-int sema_get_loaded_modules(Sema *sema, AstNode **asts, int max_count)
+int sema_get_loaded_modules(Sema *sema, SemaLoadedModule *modules, int max_count)
 {
-    if (!sema || !asts || max_count <= 0)
+    if (!sema || !modules || max_count <= 0)
     {
         return 0;
     }
 
-    int           count = 0;
-    LoadedModule *mod   = sema->loaded_modules;
+    int        count = 0;
+    SemaModule *mod  = sema->modules;
     while (mod && count < max_count)
     {
-        asts[count++] = mod->ast;
-        mod           = mod->next;
+        if (mod != sema->main_module)
+        {
+            modules[count].module_path = mod->module_path;
+            modules[count].ast         = mod->ast;
+            modules[count].table       = mod->table;
+            count++;
+        }
+        mod = mod->next;
     }
+
     return count;
 }
 
@@ -512,6 +595,16 @@ static void sema_error(Sema *sema, Token *token, const char *message)
     if (!sema)
     {
         return;
+    }
+
+    if (sema_trace_enabled())
+    {
+        fprintf(stderr, "[sema] error: module=%s file=%s pos=%d len=%d msg=%s\n",
+                sema->module_path ? sema->module_path : "(null)",
+                sema->current_file_path ? sema->current_file_path : "(null)",
+                token ? token->pos : -1,
+                token ? token->len : -1,
+                message ? message : "(null)");
     }
 
     sema->error_count++;
@@ -677,8 +770,152 @@ static bool sema_try_infer_numeric_literal(AstNode *node, Type *target)
     return true;
 }
 static Type *sema_resolve_type(Sema *sema, AstNode *type_node);
+
+static bool sema_expr_is_lvalue(Sema *sema, AstNode *node)
+{
+    (void)sema;
+    if (!node)
+    {
+        return false;
+    }
+
+    switch (node->kind)
+    {
+    case AST_EXPR_IDENT:
+        // only variables (var/val) and parameters denote assignable storage
+        return node->symbol && (node->symbol->kind == SYMBOL_VARIABLE || node->symbol->kind == SYMBOL_PARAMETER);
+
+    case AST_EXPR_UNARY:
+        // dereference yields an lvalue
+        if (node->unary_expr.op == TOKEN_AT)
+        {
+            Type *t = node->unary_expr.expr ? node->unary_expr.expr->type : NULL;
+            return t && t->kind == TYPE_POINTER;
+        }
+        return false;
+
+    case AST_EXPR_FIELD:
+    {
+        // method references are not lvalues
+        if (node->field_expr.is_method)
+        {
+            return false;
+        }
+
+        Type *obj_type = node->field_expr.object ? node->field_expr.object->type : NULL;
+        if (!obj_type)
+        {
+            return false;
+        }
+
+        // field through a pointer denotes storage even if the pointer expression is an rvalue
+        if (obj_type->kind == TYPE_POINTER)
+        {
+            return true;
+        }
+
+        // field of a value is an lvalue only if the object is an lvalue
+        return sema_expr_is_lvalue(sema, node->field_expr.object);
+    }
+
+    case AST_EXPR_INDEX:
+    {
+        Type *arr_type = node->index_expr.array ? node->index_expr.array->type : NULL;
+        if (!arr_type)
+        {
+            return false;
+        }
+
+        // indexing through a pointer denotes storage even if the pointer expression is an rvalue
+        if (arr_type->kind == TYPE_POINTER)
+        {
+            return true;
+        }
+
+        // indexing into an array value is an lvalue only if the array expression is an lvalue
+        if (arr_type->kind == TYPE_ARRAY)
+        {
+            return sema_expr_is_lvalue(sema, node->index_expr.array);
+        }
+
+        return false;
+    }
+
+    default:
+        return false;
+    }
+}
+
+static bool sema_expr_is_mutable_lvalue(Sema *sema, AstNode *node)
+{
+    if (!sema_expr_is_lvalue(sema, node))
+    {
+        return false;
+    }
+
+    switch (node->kind)
+    {
+    case AST_EXPR_IDENT:
+        // only 'var' bindings are mutable; parameters are treated as immutable
+        return node->symbol && node->symbol->kind == SYMBOL_VARIABLE && node->symbol->is_mutable;
+
+    case AST_EXPR_UNARY:
+        if (node->unary_expr.op == TOKEN_AT)
+        {
+            Type *t = node->unary_expr.expr ? node->unary_expr.expr->type : NULL;
+            return t && t->kind == TYPE_POINTER && !t->pointer.is_const;
+        }
+        return false;
+
+    case AST_EXPR_FIELD:
+    {
+        if (node->field_expr.is_method)
+        {
+            return false;
+        }
+
+        Type *obj_type = node->field_expr.object ? node->field_expr.object->type : NULL;
+        if (!obj_type)
+        {
+            return false;
+        }
+
+        if (obj_type->kind == TYPE_POINTER)
+        {
+            return !obj_type->pointer.is_const;
+        }
+
+        return sema_expr_is_mutable_lvalue(sema, node->field_expr.object);
+    }
+
+    case AST_EXPR_INDEX:
+    {
+        Type *arr_type = node->index_expr.array ? node->index_expr.array->type : NULL;
+        if (!arr_type)
+        {
+            return false;
+        }
+
+        if (arr_type->kind == TYPE_POINTER)
+        {
+            return !arr_type->pointer.is_const;
+        }
+
+        if (arr_type->kind == TYPE_ARRAY)
+        {
+            return sema_expr_is_mutable_lvalue(sema, node->index_expr.array);
+        }
+
+        return false;
+    }
+
+    default:
+        return false;
+    }
+}
 static int   sema_collect_symbols(Sema *sema, AstNode *node);
 static int   sema_analyze_use(Sema *sema, AstNode *node);
+static void  sema_maybe_analyze_symbol_decl_in_module(Sema *sema, SemaModule *mod, Symbol *sym);
 
 // collect symbols from a statement (first pass - no body analysis)
 static int sema_collect_fun_symbol(Sema *sema, AstNode *node)
@@ -1766,20 +2003,24 @@ static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
     return sema_analyze_expr(sema, inner);
 }
 
-// check if a module has already been loaded
-static LoadedModule *sema_find_loaded_module(Sema *sema, const char *module_path)
-{
-    LoadedModule *mod = sema->loaded_modules;
-    while (mod)
+    // check if a module has already been loaded
+    static SemaModule *sema_find_module(Sema *sema, const char *module_path)
     {
-        if (strcmp(mod->module_path, module_path) == 0)
+        if (!sema || !module_path)
         {
-            return mod;
+            return NULL;
         }
-        mod = mod->next;
+
+        for (SemaModule *mod = sema->modules; mod; mod = mod->next)
+        {
+            if (mod->module_path && strcmp(mod->module_path, module_path) == 0)
+            {
+                return mod;
+            }
+        }
+
+        return NULL;
     }
-    return NULL;
-}
 
 // resolve a module path to a filesystem path
 // returns NULL if the module cannot be found
@@ -1910,20 +2151,20 @@ static char *sema_resolve_module_path(Sema *sema, const char *module_path)
 }
 
 // load and analyze a module
-static int sema_load_module(Sema *sema, const char *module_path, AstNode **out_ast)
+static int sema_load_module(Sema *sema, const char *module_path, SemaModule **out_mod)
 {
-    if (!sema || !module_path || !out_ast)
+    if (!sema || !module_path || !out_mod)
     {
         return -1;
     }
 
-    *out_ast = NULL;
+    *out_mod = NULL;
 
     // check if already loaded
-    LoadedModule *cached = sema_find_loaded_module(sema, module_path);
+    SemaModule *cached = sema_find_module(sema, module_path);
     if (cached)
     {
-        *out_ast = cached->ast;
+        *out_mod = cached;
         return 0;
     }
 
@@ -1975,27 +2216,63 @@ static int sema_load_module(Sema *sema, const char *module_path, AstNode **out_a
         return -1;
     }
 
-    // cache the module (keep source for error reporting)
-    LoadedModule *mod = malloc(sizeof(LoadedModule));
-    if (mod)
+    // create and cache module (keep source for error reporting)
+    SemaModule *mod = calloc(1, sizeof(SemaModule));
+    if (!mod)
     {
-        mod->module_path     = strdup(module_path);
-        mod->file_path       = strdup(file_path);
-        mod->source          = source; // take ownership
-        mod->ast             = ast;
-        mod->next            = sema->loaded_modules;
-        sema->loaded_modules = mod;
+        parser_dnit(&parser);
+        lexer_dnit(&lexer);
+        free(source);
+        free(file_path);
+        return -1;
     }
+
+    mod->module_path = strdup(module_path);
+    mod->file_path   = strdup(file_path);
+    mod->source      = source; // take ownership
+    mod->ast         = ast;
+    mod->table       = symbol_table_create(NULL);
+    mod->imports     = NULL;
+    mod->aliases     = NULL;
+
+    if (!mod->module_path || !mod->file_path || !mod->table)
+    {
+        parser_dnit(&parser);
+        lexer_dnit(&lexer);
+        free(file_path);
+        free(source);
+        if (mod->module_path)
+        {
+            free(mod->module_path);
+        }
+        if (mod->file_path)
+        {
+            free(mod->file_path);
+        }
+        if (mod->table)
+        {
+            symbol_table_destroy(mod->table);
+        }
+        free(mod);
+        return -1;
+    }
+
+    mod->next     = sema->modules;
+    sema->modules = mod;
 
     // analyze the imported module
     // save current context and restore after
-    char *saved_module_path = sema->module_path;
-    char *saved_file_path   = sema->current_file_path;
-    char *saved_source      = sema->current_source;
+    SemaModule  *saved_module      = sema->current_module;
+    SymbolTable *saved_table       = sema->current_table;
+    const char  *saved_module_path = sema->module_path;
+    char        *saved_file_path   = sema->current_file_path;
+    char        *saved_source      = sema->current_source;
 
-    sema->module_path       = strdup(module_path);
-    sema->current_file_path = strdup(file_path);
-    sema->current_source    = source; // borrowed from mod
+    sema->current_module    = mod;
+    sema->current_table     = mod->table;
+    sema->module_path       = mod->module_path;
+    sema->current_file_path = mod->file_path;
+    sema->current_source    = mod->source;
 
     int result = 0;
     if (ast->kind == AST_PROGRAM && ast->program.stmts)
@@ -2017,8 +2294,8 @@ static int sema_load_module(Sema *sema, const char *module_path, AstNode **out_a
         }
     }
 
-    free(sema->module_path);
-    free(sema->current_file_path);
+    sema->current_module    = saved_module;
+    sema->current_table     = saved_table;
     sema->module_path       = saved_module_path;
     sema->current_file_path = saved_file_path;
     sema->current_source    = saved_source;
@@ -2028,7 +2305,7 @@ static int sema_load_module(Sema *sema, const char *module_path, AstNode **out_a
     lexer_dnit(&lexer);
     free(file_path);
 
-    *out_ast = ast;
+    *out_mod = mod;
     return result;
 }
 
@@ -2058,8 +2335,8 @@ static int sema_analyze_use(Sema *sema, AstNode *node)
     }
 
     // load and analyze the module
-    AstNode *module_ast = NULL;
-    if (sema_load_module(sema, module_path, &module_ast) < 0)
+    SemaModule *module = NULL;
+    if (sema_load_module(sema, module_path, &module) < 0)
     {
         char errmsg[512];
         snprintf(errmsg, sizeof(errmsg), "failed to load module '%s'", module_path);
@@ -2067,19 +2344,33 @@ static int sema_analyze_use(Sema *sema, AstNode *node)
         return -1;
     }
 
-    // if aliased, store the alias mapping
+    if (!module || !sema->current_module)
+    {
+        return 0;
+    }
+
     if (alias)
     {
-        ImportAlias *new_alias = malloc(sizeof(ImportAlias));
-        if (new_alias)
+        ModuleAlias *al = calloc(1, sizeof(ModuleAlias));
+        if (!al)
         {
-            new_alias->alias       = strdup(alias);
-            new_alias->module_path = strdup(module_path);
-            new_alias->table       = sema->root_table; // symbols are in root table
-            new_alias->next        = sema->import_aliases;
-            sema->import_aliases   = new_alias;
+            return 0;
         }
+        al->alias  = strdup(alias);
+        al->module = module;
+        al->next   = sema->current_module->aliases;
+        sema->current_module->aliases = al;
+        return 0;
     }
+
+    ModuleImport *imp = calloc(1, sizeof(ModuleImport));
+    if (!imp)
+    {
+        return 0;
+    }
+    imp->module = module;
+    imp->next   = sema->current_module->imports;
+    sema->current_module->imports = imp;
 
     return 0;
 }
@@ -2367,8 +2658,29 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
     case AST_EXPR_IDENT:
     {
-        // look up identifier in symbol table
-        Symbol *sym = symbol_table_lookup(sema->current_table, node->ident_expr.name);
+        // look up identifier in local scopes
+        Symbol     *sym    = symbol_table_lookup(sema->current_table, node->ident_expr.name);
+        SemaModule *origin = NULL;
+
+        // if not found locally, check unaliased imports of the current module
+        if (!sym && sema->current_module)
+        {
+            for (ModuleImport *imp = sema->current_module->imports; imp; imp = imp->next)
+            {
+                if (!imp->module || !imp->module->table)
+                {
+                    continue;
+                }
+
+                Symbol *cand = symbol_table_lookup_local(imp->module->table, node->ident_expr.name);
+                if (cand && cand->is_public)
+                {
+                    sym    = cand;
+                    origin = imp->module;
+                    break;
+                }
+            }
+        }
 
         if (!sym)
         {
@@ -2376,20 +2688,47 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
+        if (!origin)
+        {
+            origin = sema_find_module(sema, sym->module_path);
+        }
+
         // if symbol was collected but not yet analyzed, analyze its declaration now
-        // temporarily switch to root scope since top-level declarations belong there
         if (!sym->type && sym->decl)
         {
-            SymbolTable *saved_table = sema->current_table;
-            sema->current_table      = sema->root_table;
+            SemaModule  *saved_module      = sema->current_module;
+            SymbolTable *saved_table       = sema->current_table;
+            const char  *saved_module_path = sema->module_path;
+            char        *saved_file_path   = sema->current_file_path;
+            char        *saved_source      = sema->current_source;
+            Type        *saved_return_type = sema->current_function_return_type;
+
+            if (origin)
+            {
+                sema->current_module    = origin;
+                sema->current_table     = origin->table;
+                sema->module_path       = origin->module_path;
+                sema->current_file_path = origin->file_path;
+                sema->current_source    = origin->source;
+            }
 
             if (sema_analyze_stmt(sema, sym->decl) < 0)
             {
-                sema->current_table = saved_table;
+                sema->current_module    = saved_module;
+                sema->current_table     = saved_table;
+                sema->module_path       = saved_module_path;
+                sema->current_file_path = saved_file_path;
+                sema->current_source    = saved_source;
+                sema->current_function_return_type = saved_return_type;
                 return -1;
             }
 
-            sema->current_table = saved_table;
+            sema->current_module    = saved_module;
+            sema->current_table     = saved_table;
+            sema->module_path       = saved_module_path;
+            sema->current_file_path = saved_file_path;
+            sema->current_source    = saved_source;
+            sema->current_function_return_type = saved_return_type;
         }
 
         node->symbol = sym;
@@ -2420,8 +2759,38 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         switch (node->binary_expr.op)
         {
         case TOKEN_EQUAL: // assignment
-            node->type = node->binary_expr.left->type;
+        {
+            AstNode *lhs = node->binary_expr.left;
+            AstNode *rhs = node->binary_expr.right;
+
+            if (!sema_expr_is_lvalue(sema, lhs))
+            {
+                sema_error(sema, lhs->token ? lhs->token : node->token, "left-hand side of assignment must be an lvalue");
+                return -1;
+            }
+
+            if (!sema_expr_is_mutable_lvalue(sema, lhs))
+            {
+                sema_error(sema, lhs->token ? lhs->token : node->token, "cannot assign to immutable location");
+                return -1;
+            }
+
+            // infer numeric literals on rhs from lhs type
+            sema_infer_numeric_expr(rhs, lhs->type);
+            if (!sema_check_untyped_numeric(sema, rhs, "could not infer type of numeric literal in assignment"))
+            {
+                return -1;
+            }
+
+            if (!type_can_assign_to(rhs->type, lhs->type))
+            {
+                sema_error(sema, node->token, "type mismatch in assignment");
+                return -1;
+            }
+
+            node->type = lhs->type;
             break;
+        }
 
         case TOKEN_EQUAL_EQUAL:
         case TOKEN_BANG_EQUAL:
@@ -2450,20 +2819,17 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
         if (node->unary_expr.op == TOKEN_QUESTION)
         {
-            // address-of: ?T -> *T
-            // check if operand is an l-value
-            AstNode *operand   = node->unary_expr.expr;
-            bool     is_lvalue = operand->kind == AST_EXPR_IDENT ||                                     // variable
-                             (operand->kind == AST_EXPR_UNARY && operand->unary_expr.op == TOKEN_AT) || // dereference
-                             operand->kind == AST_EXPR_FIELD ||                                         // field access
-                             operand->kind == AST_EXPR_INDEX;                                           // array indexing
-
-            if (!is_lvalue)
+            // address-of: ?expr
+            // operand must be an lvalue. result is *T for mutable lvalues, &T for immutable lvalues.
+            AstNode *operand = node->unary_expr.expr;
+            if (!sema_expr_is_lvalue(sema, operand))
             {
                 sema_error(sema, node->token, "cannot take address of temporary or r-value");
                 return -1;
             }
-            node->type = type_create_pointer(node->unary_expr.expr->type, false);
+
+            bool is_const = !sema_expr_is_mutable_lvalue(sema, operand);
+            node->type = type_create_pointer(operand->type, is_const);
         }
         else if (node->unary_expr.op == TOKEN_AT)
         {
@@ -2529,13 +2895,20 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             // auto-ref: if method expects pointer but receiver is value, wrap in address-of
             if (expected_receiver_type && expected_receiver_type->kind == TYPE_POINTER && receiver_type && receiver_type->kind != TYPE_POINTER)
             {
+                if (!sema_expr_is_lvalue(sema, receiver))
+                {
+                    sema_error(sema, receiver->token ? receiver->token : node->token, "cannot take address of temporary or r-value");
+                    return -1;
+                }
+
                 // create address-of expression: ?receiver
                 AstNode *addr_of = malloc(sizeof(AstNode));
                 memset(addr_of, 0, sizeof(AstNode));
                 addr_of->kind            = AST_EXPR_UNARY;
                 addr_of->unary_expr.op   = TOKEN_QUESTION;
                 addr_of->unary_expr.expr = receiver;
-                addr_of->type            = type_create_pointer(receiver_type, false);
+                addr_of->token           = receiver->token;
+                addr_of->type            = type_create_pointer(receiver_type, !sema_expr_is_mutable_lvalue(sema, receiver));
                 receiver                 = addr_of;
             }
             // auto-deref: if method expects value but receiver is pointer, wrap in dereference
@@ -2654,53 +3027,71 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         {
             const char *ident_name = node->field_expr.object->ident_expr.name;
 
-            // check if ident_name matches an import alias
-            ImportAlias *alias = sema->import_aliases;
-            while (alias)
+            if (sema->current_module)
             {
-                if (strcmp(alias->alias, ident_name) == 0)
+                for (ModuleAlias *al = sema->current_module->aliases; al; al = al->next)
                 {
-                    // this is an aliased module access
-                    // look up the symbol in the module's namespace
-                    const char *symbol_name = node->field_expr.field;
-
-                    // find symbols from the imported module by checking module_path
-                    Symbol *sym = sema->root_table->symbols;
-                    while (sym)
+                    if (!al->alias || strcmp(al->alias, ident_name) != 0)
                     {
-                        if (sym->module_path && strcmp(sym->module_path, alias->module_path) == 0 && strcmp(sym->name, symbol_name) == 0 && sym->is_public)
-                        {
-                            // found matching symbol from the aliased module
-                            // if symbol was collected but not yet analyzed, analyze it now
-                            if (!sym->type && sym->decl)
-                            {
-                                SymbolTable *saved_table = sema->current_table;
-                                sema->current_table      = sema->root_table;
-
-                                if (sema_analyze_stmt(sema, sym->decl) < 0)
-                                {
-                                    sema->current_table = saved_table;
-                                    return -1;
-                                }
-
-                                sema->current_table = saved_table;
-                            }
-
-                            // convert this field access into an identifier
-                            node->kind            = AST_EXPR_IDENT;
-                            node->ident_expr.name = strdup(symbol_name);
-                            node->symbol          = sym;
-                            node->type            = sym->type;
-                            return 0;
-                        }
-                        sym = sym->next;
+                        continue;
                     }
 
-                    // symbol not found in aliased module
-                    sema_error(sema, node->token, "undefined symbol in aliased module");
-                    return -1;
+                    const char *symbol_name = node->field_expr.field;
+                    if (!al->module || !al->module->table)
+                    {
+                        sema_error(sema, node->token, "undefined symbol in aliased module");
+                        return -1;
+                    }
+
+                    Symbol *sym = symbol_table_lookup_local(al->module->table, symbol_name);
+                    if (!sym || !sym->is_public)
+                    {
+                        sema_error(sema, node->token, "undefined symbol in aliased module");
+                        return -1;
+                    }
+
+                    // if symbol was collected but not yet analyzed, analyze it now under the module context
+                    if (!sym->type && sym->decl)
+                    {
+                        SemaModule  *saved_module      = sema->current_module;
+                        SymbolTable *saved_table       = sema->current_table;
+                        const char  *saved_module_path = sema->module_path;
+                        char        *saved_file_path   = sema->current_file_path;
+                        char        *saved_source      = sema->current_source;
+                        Type        *saved_return_type = sema->current_function_return_type;
+
+                        sema->current_module    = al->module;
+                        sema->current_table     = al->module->table;
+                        sema->module_path       = al->module->module_path;
+                        sema->current_file_path = al->module->file_path;
+                        sema->current_source    = al->module->source;
+
+                        if (sema_analyze_stmt(sema, sym->decl) < 0)
+                        {
+                            sema->current_module    = saved_module;
+                            sema->current_table     = saved_table;
+                            sema->module_path       = saved_module_path;
+                            sema->current_file_path = saved_file_path;
+                            sema->current_source    = saved_source;
+                            sema->current_function_return_type = saved_return_type;
+                            return -1;
+                        }
+
+                        sema->current_module    = saved_module;
+                        sema->current_table     = saved_table;
+                        sema->module_path       = saved_module_path;
+                        sema->current_file_path = saved_file_path;
+                        sema->current_source    = saved_source;
+                        sema->current_function_return_type = saved_return_type;
+                    }
+
+                    // convert this field access into an identifier
+                    node->kind            = AST_EXPR_IDENT;
+                    node->ident_expr.name = strdup(symbol_name);
+                    node->symbol          = sym;
+                    node->type            = sym->type;
+                    return 0;
                 }
-                alias = alias->next;
             }
         }
 
@@ -2735,13 +3126,40 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
         }
 
-        // look for method - methods can be defined on any type including pointers
-        Symbol *method = symbol_table_lookup(sema->current_table, node->field_expr.field);
-        if (method)
+        // look for method - methods can be defined on any type including pointers.
+        // local lookup first, then search unaliased imports (same as identifier resolution).
+        Symbol     *method        = symbol_table_lookup(sema->current_table, node->field_expr.field);
+        SemaModule *method_origin = NULL;
+
+        if (!method && sema->current_module)
         {
-            if (method->decl)
+            for (ModuleImport *imp = sema->current_module->imports; imp; imp = imp->next)
             {
+                if (!imp->module || !imp->module->table)
+                {
+                    continue;
+                }
+
+                Symbol *cand = symbol_table_lookup_local(imp->module->table, node->field_expr.field);
+                if (!cand || cand->kind != SYMBOL_FUNCTION || !cand->is_public)
+                {
+                    continue;
+                }
+
+                method        = cand;
+                method_origin = imp->module;
+                break;
             }
+        }
+
+        // if the method exists but hasn't been analyzed yet, analyze it under its module context
+        if (method && !method->type && method->decl)
+        {
+            if (!method_origin)
+            {
+                method_origin = sema_find_module(sema, method->module_path);
+            }
+            sema_maybe_analyze_symbol_decl_in_module(sema, method_origin, method);
         }
         if (method && method->kind == SYMBOL_FUNCTION && method->decl && method->decl->kind == AST_STMT_FUN && method->decl->fun_stmt.is_method)
         {
@@ -3176,6 +3594,37 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
+        // casts are pure bit reinterpretation.
+        // require both types to be sized and identical size.
+        Type *from_type = node->cast_expr.expr->type;
+        if (!from_type)
+        {
+            sema_error(sema, node->token, "cannot cast value with unknown type");
+            return -1;
+        }
+
+        if (from_type->size == 0 || target_type->size == 0)
+        {
+            sema_error(sema, node->token, "cast requires sized types");
+            return -1;
+        }
+
+        if (from_type->size != target_type->size)
+        {
+            sema_error(sema, node->token, "cast requires identical type sizes");
+            return -1;
+        }
+
+        // forbid dropping constness: &T -> *U (cast-away-const)
+        if (from_type->kind == TYPE_POINTER && target_type->kind == TYPE_POINTER)
+        {
+            if (from_type->pointer.is_const && !target_type->pointer.is_const)
+            {
+                sema_error(sema, node->token, "cannot cast readonly pointer to mutable pointer");
+                return -1;
+            }
+        }
+
         node->type = target_type;
         return 0;
     }
@@ -3311,14 +3760,14 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             {
                 node->comptime.value_kind = COMPTIME_INT;
                 node->comptime.int_value  = sym->type ? sym->type->size : 0;
-                node->type                = type_get_primitive(TYPE_I64);
+                node->type                = type_get_primitive(TYPE_U64);
                 return 0;
             }
             else if (strcmp(attr_name, "align") == 0)
             {
                 node->comptime.value_kind = COMPTIME_INT;
-                node->comptime.int_value  = sym->type ? sym->type->size : 0;
-                node->type                = type_get_primitive(TYPE_I64);
+                node->comptime.int_value  = sym->type ? sym->type->alignment : 0;
+                node->type                = type_get_primitive(TYPE_U64);
                 return 0;
             }
             else if (strcmp(attr_name, "field_count") == 0)
@@ -3327,7 +3776,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 {
                     node->comptime.value_kind = COMPTIME_INT;
                     node->comptime.int_value  = sym->type->structure.field_count;
-                    node->type                = type_get_primitive(TYPE_I64);
+                    node->type                = type_get_primitive(TYPE_U64);
                     return 0;
                 }
                 sema_error(sema, node->token, "field_count only valid for record types");
@@ -3362,7 +3811,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
                 node->comptime.value_kind = COMPTIME_INT;
                 node->comptime.int_value  = (strcmp(name, "size_of") == 0) ? (int64_t)t->size : (int64_t)t->alignment;
-                node->type                = type_get_primitive(TYPE_I64);
+                node->type                = type_get_primitive(TYPE_U64);
                 return 0;
             }
 
@@ -3398,7 +3847,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                     {
                         node->comptime.value_kind = COMPTIME_INT;
                         node->comptime.int_value  = (int64_t)fields[i].offset;
-                        node->type                = type_get_primitive(TYPE_I64);
+                        node->type                = type_get_primitive(TYPE_U64);
                         return 0;
                     }
                 }
@@ -3480,6 +3929,118 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
     }
 }
 
+// resolve a type symbol (SYMBOL_TYPE) considering module imports.
+// - unqualified: search local scopes, then unaliased imports.
+// - qualified: alias.Type resolves against the aliased module only.
+//
+// note: tokens do not carry file/module information, so any lazy analysis must
+// run under the correct module context to keep diagnostics accurate.
+static void sema_maybe_analyze_symbol_decl_in_module(Sema *sema, SemaModule *mod, Symbol *sym)
+{
+    if (!sema || !sym || sym->type || !sym->decl)
+    {
+        return;
+    }
+
+    SemaModule  *saved_module      = sema->current_module;
+    SymbolTable *saved_table       = sema->current_table;
+    const char  *saved_module_path = sema->module_path;
+    char        *saved_file_path   = sema->current_file_path;
+    char        *saved_source      = sema->current_source;
+    Type        *saved_return_type = sema->current_function_return_type;
+
+    if (mod)
+    {
+        sema->current_module    = mod;
+        sema->current_table     = mod->table;
+        sema->module_path       = mod->module_path;
+        sema->current_file_path = mod->file_path;
+        sema->current_source    = mod->source;
+    }
+
+    (void)sema_analyze_stmt(sema, sym->decl);
+
+    sema->current_module    = saved_module;
+    sema->current_table     = saved_table;
+    sema->module_path       = saved_module_path;
+    sema->current_file_path = saved_file_path;
+    sema->current_source    = saved_source;
+    sema->current_function_return_type = saved_return_type;
+}
+
+static Symbol *sema_lookup_type_symbol(Sema *sema, const char *module_alias, const char *name)
+{
+    if (!sema || !name)
+    {
+        return NULL;
+    }
+
+    // alias-qualified type: alias.Type
+    if (module_alias)
+    {
+        if (!sema->current_module)
+        {
+            return NULL;
+        }
+
+        for (ModuleAlias *al = sema->current_module->aliases; al; al = al->next)
+        {
+            if (!al->alias || strcmp(al->alias, module_alias) != 0)
+            {
+                continue;
+            }
+
+            if (!al->module || !al->module->table)
+            {
+                return NULL;
+            }
+
+            Symbol *sym = symbol_table_lookup_local(al->module->table, name);
+            if (!sym || sym->kind != SYMBOL_TYPE || !sym->is_public)
+            {
+                return NULL;
+            }
+
+            sema_maybe_analyze_symbol_decl_in_module(sema, al->module, sym);
+            return sym;
+        }
+
+        return NULL;
+    }
+
+    // unqualified type: first check local scopes
+    Symbol *sym = symbol_table_lookup(sema->current_table, name);
+    if (sym && sym->kind == SYMBOL_TYPE)
+    {
+        SemaModule *origin = sema_find_module(sema, sym->module_path);
+        sema_maybe_analyze_symbol_decl_in_module(sema, origin, sym);
+        return sym;
+    }
+
+    // then check unaliased imports (`use foo.bar;` brings public symbols into scope)
+    if (sema->current_module)
+    {
+        for (ModuleImport *imp = sema->current_module->imports; imp; imp = imp->next)
+        {
+            if (!imp->module || !imp->module->table)
+            {
+                continue;
+            }
+
+            Symbol *cand = symbol_table_lookup_local(imp->module->table, name);
+            if (!cand || cand->kind != SYMBOL_TYPE || !cand->is_public)
+            {
+                continue;
+            }
+
+            sema_maybe_analyze_symbol_decl_in_module(sema, imp->module, cand);
+            return cand;
+        }
+    }
+
+    return NULL;
+}
+
 static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
 {
     if (!type_node)
@@ -3493,6 +4054,7 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
     case AST_EXPR_IDENT:
     {
         const char *name         = (type_node->kind == AST_TYPE_NAME) ? type_node->type_name.name : type_node->ident_expr.name;
+        const char *module_alias = (type_node->kind == AST_TYPE_NAME) ? type_node->type_name.module_alias : NULL;
         AstList    *generic_args = (type_node->kind == AST_TYPE_NAME) ? type_node->type_name.generic_args : NULL;
 
         // check primitive types (no generics allowed)
@@ -3541,9 +4103,14 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
             return type_get_primitive(TYPE_PTR);
         }
 
-        // look up user-defined types
-        Symbol *sym = symbol_table_lookup(sema->current_table, name);
+        // look up user-defined types (local scope, then imports; or alias-qualified)
+        Symbol *sym = sema_lookup_type_symbol(sema, module_alias, name);
         if (!sym)
+        {
+            return NULL;
+        }
+
+        if (sym->kind != SYMBOL_TYPE)
         {
             return NULL;
         }
@@ -3818,10 +4385,34 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
 
     pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "E");
 
+    // instantiate within the originating module scope
+    SemaModule  *saved_module      = sema->current_module;
+    SymbolTable *saved_table       = sema->current_table;
+    const char  *saved_module_path = sema->module_path;
+    char        *saved_file_path   = sema->current_file_path;
+    char        *saved_source      = sema->current_source;
+    Type        *saved_return_type = sema->current_function_return_type;
+
+    SemaModule *origin = sema_find_module(sema, generic_sym->module_path);
+    if (origin)
+    {
+        sema->current_module    = origin;
+        sema->current_table     = origin->table;
+        sema->module_path       = origin->module_path;
+        sema->current_file_path = origin->file_path;
+        sema->current_source    = origin->source;
+    }
+
     // check if already instantiated
-    Symbol *inst_sym = symbol_table_lookup(sema->root_table, mangled_name);
+    Symbol *inst_sym = (origin && origin->table) ? symbol_table_lookup_local(origin->table, mangled_name) : NULL;
     if (inst_sym && inst_sym->type)
     {
+        sema->current_module    = saved_module;
+        sema->current_table     = saved_table;
+        sema->module_path       = saved_module_path;
+        sema->current_file_path = saved_file_path;
+        sema->current_source    = saved_source;
+        sema->current_function_return_type = saved_return_type;
         free(resolved_args);
         return inst_sym->type;
     }
@@ -3916,10 +4507,23 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
         inst_type->union_type.generic_arg_count = type_args->count;
     }
 
-    inst_sym       = symbol_create(mangled_name, SYMBOL_TYPE, sema->module_path);
+    inst_sym       = symbol_create(mangled_name, SYMBOL_TYPE, generic_sym->module_path);
     inst_sym->type = inst_type;
     inst_sym->decl = decl; // reference original declaration
-    symbol_table_insert(sema->root_table, inst_sym);
+
+    // cache within the originating module
+    if (origin && origin->table)
+    {
+        symbol_table_insert(origin->table, inst_sym);
+    }
+
+    // restore caller context
+    sema->current_module    = saved_module;
+    sema->current_table     = saved_table;
+    sema->module_path       = saved_module_path;
+    sema->current_file_path = saved_file_path;
+    sema->current_source    = saved_source;
+    sema->current_function_return_type = saved_return_type;
 
     return inst_type;
 }
@@ -3954,8 +4558,11 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
 
             if (receiver && receiver->kind == AST_TYPE_NAME && receiver->type_name.generic_args)
             {
-                // look up the generic type to get its formal parameters
-                Symbol *type_sym = symbol_table_lookup(sema->current_table, receiver->type_name.name);
+                // look up the generic type to get its formal parameters.
+                // prefer the method's originating module table (receiver type is declared there).
+                SemaModule  *origin_mod  = sema_find_module(sema, generic_sym->module_path);
+                SymbolTable *origin_table = (origin_mod && origin_mod->table) ? origin_mod->table : sema->current_table;
+                Symbol      *type_sym     = origin_table ? symbol_table_lookup(origin_table, receiver->type_name.name) : NULL;
                 if (type_sym && type_sym->is_generic && type_sym->decl)
                 {
                     if (type_sym->decl->kind == AST_STMT_REC)
@@ -3981,6 +4588,25 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
         return NULL;
     }
 
+    // resolve type arguments in the caller's current scope BEFORE switching modules.
+    // this is required for dependent type args like `*T` where `T` is bound in the
+    // caller's instantiation scope.
+    Type **resolved_args = malloc(sizeof(Type *) * type_args->count);
+    if (!resolved_args)
+    {
+        return NULL;
+    }
+    for (int i = 0; i < type_args->count; i++)
+    {
+        AstNode *arg_node = type_args->items[i];
+        resolved_args[i]  = sema_resolve_type(sema, arg_node);
+        if (!resolved_args[i])
+        {
+            free(resolved_args);
+            return NULL;
+        }
+    }
+
     // generate mangled name: <name>I<type_args>E
     char mangled_name[512];
     int  pos = snprintf(mangled_name, sizeof(mangled_name), "%s", generic_sym->name);
@@ -3989,25 +4615,56 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
 
     for (int i = 0; i < type_args->count; i++)
     {
-        AstNode *arg_node = type_args->items[i];
-        Type    *arg_type = sema_resolve_type(sema, arg_node);
-        if (arg_type)
-        {
-            pos += type_mangle(arg_type, mangled_name + pos, sizeof(mangled_name) - pos);
-        }
+        pos += type_mangle(resolved_args[i], mangled_name + pos, sizeof(mangled_name) - pos);
     }
 
     pos += snprintf(mangled_name + pos, sizeof(mangled_name) - pos, "E");
 
-    Symbol *inst = symbol_table_lookup(sema->root_table, mangled_name);
+    // instantiate within the originating module scope to avoid cross-module collisions
+    SemaModule  *saved_module      = sema->current_module;
+    SymbolTable *saved_table       = sema->current_table;
+    const char  *saved_module_path = sema->module_path;
+    char        *saved_file_path   = sema->current_file_path;
+    char        *saved_source      = sema->current_source;
+    Type        *saved_return_type = sema->current_function_return_type;
+
+    SemaModule *origin = sema_find_module(sema, generic_sym->module_path);
+    if (origin)
+    {
+        sema->current_module    = origin;
+        sema->current_table     = origin->table;
+        sema->module_path       = origin->module_path;
+        sema->current_file_path = origin->file_path;
+        sema->current_source    = origin->source;
+    }
+
+    Symbol *inst = NULL;
+    if (origin && origin->table)
+    {
+        inst = symbol_table_lookup_local(origin->table, mangled_name);
+    }
     if (inst)
     {
+        sema->current_module    = saved_module;
+        sema->current_table     = saved_table;
+        sema->module_path       = saved_module_path;
+        sema->current_file_path = saved_file_path;
+        sema->current_source    = saved_source;
+        sema->current_function_return_type = saved_return_type;
+        free(resolved_args);
         return inst;
     }
 
     AstNode *cloned_decl = ast_clone(decl);
     if (!cloned_decl)
     {
+        sema->current_module    = saved_module;
+        sema->current_table     = saved_table;
+        sema->module_path       = saved_module_path;
+        sema->current_file_path = saved_file_path;
+        sema->current_source    = saved_source;
+        sema->current_function_return_type = saved_return_type;
+        free(resolved_args);
         return NULL;
     }
 
@@ -4018,9 +4675,12 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
         cloned_decl->fun_stmt.generics = NULL;
     }
 
-    Symbol *inst_sym = symbol_create(mangled_name, SYMBOL_FUNCTION, sema->module_path);
+    Symbol *inst_sym = symbol_create(mangled_name, SYMBOL_FUNCTION, generic_sym->module_path);
     inst_sym->decl   = cloned_decl; // link symbol to cloned ast for MIR lowering
-    symbol_table_insert(sema->root_table, inst_sym);
+    if (origin && origin->table)
+    {
+        symbol_table_insert(origin->table, inst_sym);
+    }
     cloned_decl->symbol = inst_sym;
 
     SymbolTable *scope      = symbol_table_create(sema->current_table);
@@ -4029,12 +4689,10 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     for (int i = 0; i < generic_params->count; i++)
     {
         AstNode *param_node = generic_params->items[i];
-        AstNode *arg_node   = type_args->items[i];
         if (param_node->kind == AST_TYPE_PARAM)
         {
-            Type   *arg_type = sema_resolve_type(sema, arg_node);
-            Symbol *type_sym = symbol_create(param_node->type_param.name, SYMBOL_TYPE, sema->module_path);
-            type_sym->type   = arg_type;
+            Symbol *type_sym = symbol_create(param_node->type_param.name, SYMBOL_TYPE, generic_sym->module_path);
+            type_sym->type   = resolved_args[i];
             symbol_table_insert(scope, type_sym);
         }
     }
@@ -4086,7 +4744,7 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
             AstNode *param = cloned_decl->fun_stmt.params->items[i];
             if (param->kind == AST_STMT_PARAM)
             {
-                Symbol *param_sym = symbol_create(param->param_stmt.name, SYMBOL_VARIABLE, sema->module_path);
+                Symbol *param_sym = symbol_create(param->param_stmt.name, SYMBOL_VARIABLE, generic_sym->module_path);
                 param_sym->type   = param->type;
                 symbol_table_insert(sema->current_table, param_sym);
                 param->symbol   = param_sym;
@@ -4097,10 +4755,23 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
 
     if (cloned_decl->fun_stmt.body)
     {
+        // ensure return statements inside the instantiated body are checked
+        // against this instantiated function's return type.
+        sema->current_function_return_type = ret_type;
         sema_analyze_stmt(sema, cloned_decl->fun_stmt.body);
+        sema->current_function_return_type = saved_return_type;
     }
 
     sema->current_table = prev_table;
 
+    // restore caller context
+    sema->current_module    = saved_module;
+    sema->current_table     = saved_table;
+    sema->module_path       = saved_module_path;
+    sema->current_file_path = saved_file_path;
+    sema->current_source    = saved_source;
+    sema->current_function_return_type = saved_return_type;
+
+    free(resolved_args);
     return inst_sym;
 }

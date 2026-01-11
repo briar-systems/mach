@@ -1507,8 +1507,14 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         // run defers registered in this block on normal exit
         emit_deferred_from(masm, text, ctx, start_deferred);
     }
-    else if (stmt->kind == AST_STMT_VAR)
+    else if (stmt->kind == AST_STMT_VAR || stmt->kind == AST_STMT_VAL)
     {
+        if (stmt->kind == AST_STMT_VAL && stmt->var_stmt.init == NULL)
+        {
+            fprintf(stderr, "masm lower: val must have initializer\n");
+            exit(1);
+        }
+
         // determine logical size of the variable (do not inflate small types)
         size_t var_size = 8;
         if (stmt->type)
@@ -2442,7 +2448,7 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
                 lower_function(masm, decl, symbols);
                 lowered_name_add(&lowered_names, &lowered_count, &lowered_cap, decl->fun_stmt.name);
             }
-            else if (decl->kind == AST_STMT_VAR)
+            else if (decl->kind == AST_STMT_VAR || decl->kind == AST_STMT_VAL)
             {
                 lower_global_var(masm, decl);
             }

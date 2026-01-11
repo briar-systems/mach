@@ -200,7 +200,6 @@ int symbol_table_insert(SymbolTable *table, Symbol *symbol)
 
     return 0;
 }
-
 Symbol *symbol_table_lookup_local(SymbolTable *table, const char *name)
 {
     if (!table || !name)
