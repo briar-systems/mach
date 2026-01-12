@@ -6,13 +6,11 @@
 #include <string.h>
 
 // note: update this to match standard libary convention if and when it changes
-static const char *template_main_mach = "use          std.system.runtime;\n"
-                                        "use          std.types.string;\n"
-                                        "use          std.collections.slice;\n"
+static const char *template_main_mach = "use          std.runtime;\n"
                                         "use print:   std.print;\n"
                                         "\n"
                                         "$main.symbol = \"main\";\n"
-                                        "fun main(args: Slice[str]) i64 {\n"
+                                        "fun main(argc: i64, argv: &&u8) i64 {\n"
                                         "    print.println(\"Hello, World!\");\n"
                                         "    ret 0;\n"
                                         "}\n";
@@ -39,7 +37,7 @@ static const char *template_mach_toml = "[project]\n"
                                         "[deps.mach-std]\n"
                                         "type    = \"remote\"\n"
                                         "path    = \"https://github.com/octalide/mach-std\"\n"
-                                        "version = \"branch/main\"\n";
+                                        "version = \"branch/feat/masm\"\n";
 
 void cmd_init_help(FILE *stream)
 {
@@ -181,8 +179,8 @@ int cmd_init_handle(int argc, char **argv)
     }
     else
     {
-        // checkout branch/main
-        if (!git_checkout_version(mach_std_path, "branch/main"))
+        // checkout branch/feat/masm
+        if (!git_checkout_version(mach_std_path, "branch/feat/masm"))
         {
             fprintf(stderr, "warning: failed to checkout mach-std version\n");
         }

@@ -132,7 +132,7 @@ Most notably, the `symbol` attribute is used in most Mach programs to remove nam
 
 ```mach
 $main.symbol = "main"
-fun main(args: []str) i64 {
+fun main(argc: i64, argv: &&u8) i64 {
     ret 0;
 }
 ```

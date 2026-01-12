@@ -78,12 +78,12 @@ fin stmt;                 // deferred statement (block-scoped)
 - `*T` can implicitly cast to `&T`, but not vice-versa.
 
 ## Module system
-- Modules map 1:1 with `.mach` files under `[project].src` in `mach.toml`
+- Modules map 1:1 with `.mach` files under `[project].dir_src` in `mach.toml`
 - Module path follows directory structure: `src/driver/pipeline.mach` → `project.driver.pipeline`
 - Symbols included from other modules via `use` are accessible without qualification. Alias can be provided to "namespace" the import.
-- Dependencies declared in `mach.toml` under `[deps.name]` with `source` and `version`
+- Dependencies declared in `mach.toml` under `[deps.name]` with `type`, `path`, and `version`
 
 ## Entry point convention
-Standard library runtime expects: `fun main(args: Slice[str]) i64` with `$main.symbol = "main";` defined above it per convention.
-Note that a "conventional" entrypoint should also `use std.system.runtime;` and the types it requires for the signature like `std.types.string` and `std.types.slice`.
+Standard library runtime expects: `fun main(argc: i64, argv: &&u8) i64` with `$main.symbol = "main";` defined above it per convention.
+Note that a "conventional" entrypoint should also `use std.runtime;`.
 Comptime directives: `$directive.key = value;` evaluated at compile time.

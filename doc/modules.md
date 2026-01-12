@@ -6,8 +6,8 @@ Many fields referenced in this document are described in detail in [config.md](c
 
 - [Overview](#overview)
 - [Namespaces and naming rules](#namespaces-and-naming-rules)
-  - [Project source root (`src`)](#project-source-root-src)
-  - [Dependency root (`dep`)](#dependency-root-dep)
+    - [Project source root (`dir_src`)](#project-source-root-dir_src)
+    - [Dependency root (`dir_dep`)](#dependency-root-dir_dep)
   - [Project modules](#project-modules)
   - [Dependency modules](#dependency-modules)
 - [A note on library entrypoints](#a-note-on-library-entrypoints)
@@ -18,22 +18,22 @@ Mach’s module namespace is entirely deterministic.
 Given the same `mach.toml`, the compiler will always assign the same FQN to the same file, regardless of the host machine.
 
 
-### Project source root (`src`)
+### Project source root (`dir_src`)
 
-`[project].src` points to the directory that contains the project’s code.
+`[project].dir_src` points to the directory that contains the project’s code.
 It is interpreted relative to the project root.
 
 
-### Dependency root (`dep`)
+### Dependency root (`dir_dep`)
 
-`[project].dep` defines the directory where dependencies are vendored.
+`[project].dir_dep` defines the directory where dependencies are vendored.
 Both local and remote dependencies alike are copied or cloned into this directory under their declared alias names.
 
 
 ### Project modules
 
 1. **Project ID prefix:** `[project].id` is mandatory and becomes the prefix for every module defined inside the project. If `id = "mach"`, the file `src/main.mach` is `mach.main`.
-2. **Path segments:** Everything after the prefix mirrors the path from the `src` directory, using dots instead of slashes and dropping the `.mach` extension. `src/driver/pipeline.mach` becomes `mach.driver.pipeline`.
+2. **Path segments:** Everything after the prefix mirrors the path from the `dir_src` directory, using dots instead of slashes and dropping the `.mach` extension. `src/driver/pipeline.mach` becomes `mach.driver.pipeline`.
 3. **One file, one module:** There is no multi-module source file concept. Duplicating filenames is supported as long as the relative path (and therefore the namespace) remains unique.
 
 Because IDs are user-chosen (there is no global registry), you are responsible for picking values that will not collide with your dependencies.
@@ -46,7 +46,7 @@ The alias is only a user-facing handle used by tools like `mach dep list` and by
 When the loader processes an import it:
 
 1. Looks up the alias in the dependency table.
-2. Loads the dependency’s own `mach.toml` from `<dep>/<alias>/mach.toml`.
+2. Loads the dependency’s own `mach.toml` from `<dir_dep>/<alias>/mach.toml`.
 3. Reads that dependency’s `[project].id` and replaces the alias with the real project ID.
 
 This example shows how the filesystem layout maps to module names according to these rules and given hypothetical `mach.toml` files:
@@ -66,7 +66,7 @@ mach.toml                   # [project].id = "my_app"
 ## A note on library entrypoints
 
 Each target declared in `[targets.<name>]` must specify `entrypoint`, even for library-style builds.
-The entrypoint path is relative to `[project].src` and identifies the root module for that build.
+The entrypoint path is relative to `[project].dir_src` and identifies the root module for that build.
 
 This system is in place because of Mach's fully deterministic module resolution system.
 The Mach compiler does not "scan" any source tree or "discover" modules automatically.

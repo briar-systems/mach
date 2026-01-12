@@ -76,14 +76,12 @@ The following examples are provided to give a sense of the language's syntax and
 ### Hello World
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
-use          std.types.slice;
-use console: std.io.console;
+use          std.runtime;
+use print:   std.print;
 
 $main.symbol = "main";
-fun main(args: Slice[str]) i64 {
-    console.print("Hello, World!\n");
+fun main(argc: i64, argv: &&u8) i64 {
+    print.println("Hello, World!");
     ret 0;
 }
 ```
@@ -92,12 +90,10 @@ fun main(args: Slice[str]) i64 {
 ### Fibonacci
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
-use          std.types.slice;
-use console: std.io.console;
+use          std.runtime;
+use print:   std.print;
 
-fun fibr(n: i64) i64 {
+fun fibr(n: u64) u64 {
     if (n < 2) {
         ret n;
     }
@@ -106,9 +102,13 @@ fun fibr(n: i64) i64 {
 }
 
 $main.symbol = "main";
-fun main(args: Slice[str]) i64 {
-    var max: i64 = 10;
-    console.print("fib(%d) = %d\n", max, fibr(max));
+fun main(argc: i64, argv: &&u8) i64 {
+    val max: u64 = 10;
+    print.print("fib(");
+    print.u64(max);
+    print.print(") = ");
+    print.u64(fibr(max));
+    print.println("");
     ret 0;
 }
 ```
@@ -117,12 +117,10 @@ fun main(args: Slice[str]) i64 {
 ### Factorial
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
-use          std.types.slice;
-use console: std.io.console;
+use          std.runtime;
+use print:   std.print;
 
-fun fact(n: i64) i64 {
+fun fact(n: u64) u64 {
     if (n == 0) {
         ret 1;
     }
@@ -131,9 +129,13 @@ fun fact(n: i64) i64 {
 }
 
 $main.symbol = "main";
-fun main(args: Slice[str]) i64 {
-    var max: i64 = 10;
-    console.print("fact(%d) = %d\n", max, fact(max));
+fun main(argc: i64, argv: &&u8) i64 {
+    val max: u64 = 10;
+    print.print("fact(");
+    print.u64(max);
+    print.print(") = ");
+    print.u64(fact(max));
+    print.println("");
     ret 0;
 }
 ```

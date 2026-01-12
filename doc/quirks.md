@@ -83,11 +83,12 @@ The [standard library](https://github.com/octalide/mach-std) provides a baseline
 This declaration specifies the name of the main entry point function for the program.
 By default, Mach does not assume a specific entry point name, allowing developers to define their own conventions.
 
-The standard library's runtime module (`std.system.runtime`) expects a function named `main` to be defined at link-time:
+The standard library's runtime module (`std.runtime`) expects a function named `main` to be defined at link-time:
 
-From [runtime.mach](https://github.com/octalide/mach-std/blob/main/src/system/runtime.mach):
+From [runtime.mach](https://github.com/octalide/mach-std/blob/main/src/runtime.mach):
 ```mach
-pub ext main: fun(Slice[str]) i64;
+$main.symbol = "main";
+fun main(argc: i64, argv: &&u8) i64 { ... }
 ```
 
 This expectation of a `main` function is why the `$main.symbol = "main"` annotation is necessary in user code as its inclusion manually controls the mangled symbol of the user-defined entry point function.

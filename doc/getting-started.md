@@ -122,14 +122,12 @@ The standard `mach init` command creates a simple "Hello, World!" application by
 The main source file is located at `src/main.mach`:
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
-use          std.collections.slice;
+use          std.runtime;
 use print:   std.print;
 
 $main.symbol = "main"
-fun main(args: Slice[str]) i64 {
-  print.println("Hello, World!");
+fun main(argc: i64, argv: &&u8) i64 {
+    print.println("Hello, World!");
     ret 0;
 }
 ```

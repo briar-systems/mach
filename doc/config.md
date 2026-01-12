@@ -4,20 +4,18 @@
   - [`id`](#id)
   - [`name`](#name)
   - [`version`](#version)
-  - [`src`](#src)
-  - [`dep`](#dep)
+  - [`dir_src`](#dir_src)
+  - [`dir_out`](#dir_out)
+  - [`dir_dep`](#dir_dep)
   - [`target`](#target)
 - [`[targets.<name>]` sections](#targetsname-sections)
-  - [`triple`](#triple)
+  - [`os`](#os)
+  - [`isa`](#isa)
+  - [`abi`](#abi)
   - [`entrypoint`](#entrypoint)
   - [`artifacts`](#artifacts)
-  - [`output`](#output)
+  - [`binary`](#binary)
   - [`mode`](#mode)
-  - [`debug`](#debug)
-  - [`optimize`](#optimize)
-  - [`emit-ast`, `emit-ir`, `emit-asm`, `emit-object`](#emit-ast-emit-ir-emit-asm-emit-object)
-  - [`no-pie`](#no-pie)
-  - [`link`](#link)
 - [`[deps.<alias>]` sections](#depsalias-sections)
   - [`type`](#type)
   - [`path`](#path)
@@ -33,25 +31,20 @@ Every Mach project is driven by a `mach.toml` file located at the project root. 
 [project]
 id = "mach"
 name = "Mach Compiler"
-version = "0.7.0"
-src = "src"
-dep = "dep"
+version = "0.7.1"
+dir_src = "src"
+dir_out = "out"
+dir_dep = "dep"
 target = "native"
 
 [targets.linux]
-triple = "x86_64-pc-linux-gnu"
+os = "linux"
+isa = "x86_64"
+abi = "sysv64"
 entrypoint = "main.mach"
-artifacts = "out/imach/linux"
-output = "out/bin/imach"
+artifacts = "linux"
+binary = "linux/bin/mach"
 mode = "executable"
-debug = true
-optimize = true
-emit-ast = true
-emit-ir = true
-emit-asm = true
-emit-object = true
-no-pie = false
-link = ["pthread", "m"]
 
 [deps.mach-std]
 type = "remote"
@@ -103,14 +96,18 @@ This is primarily used for display purposes in diagnostics and packaging tools.
 The version string of the project, following [semantic versioning](https://semver.org/) conventions.
 
 
-### `src`
+### `dir_src`
 
 The relative path to the project's source directory.
 All modules defined within the project are expected to reside under this directory.
 Project module discovery and resolution are based on this root path.
 
+### `dir_out`
 
-### `dep`
+The directory where build output is written (per-target, under `dir_out/<artifacts>`).
+
+
+### `dir_dep`
 
 The root directory where dependencies are vendored into.
 
@@ -125,20 +122,29 @@ This may be a concrete target name (e.g., `linux`, `darwin`) or `"native"` to au
 
 ## `[targets.<name>]` sections
 
-Each target table describes how to build for one platform/format combination.
-The name (`linux`, `darwin`, `windows`, etc.) is arbitrary but typically mirrors the host OS.
+Each target table describes how to build for one platform and ABI combination.
+The name (`linux`, `darwin`, `windows`, etc.) is arbitrary and only used as a selector by tooling.
 
 
-### `triple`
+### `os`
 
-The `triple` field specifies the target triple associated with this build target.
-Its format follows LLVM conventions (e.g., `x86_64-pc-linux-gnu`).
+The target operating system identifier (e.g. `linux`).
+
+
+### `isa`
+
+The target instruction set architecture identifier (e.g. `x86_64`).
+
+
+### `abi`
+
+The target ABI identifier (e.g. `sysv64`).
 
 
 ### `entrypoint`
 
 The `entrypoint` field defines the path to the root module that serves as the starting point for compilation.
-This path is relative to the project's `src` directory and is required for all targets.
+This path is relative to `[project].dir_src` and is required for all targets.
 
 > While it may not make sense to have an "entrypoint" for a library target, this field (and a corresponding module) is still required to establish the module graph.
 > See `lib.mach` in the standard library for an example of a library entrypoint.
@@ -146,20 +152,18 @@ This path is relative to the project's `src` directory and is required for all t
 
 ### `artifacts`
 
-The `artifacts` field specifies the directory where intermediate build files (object files, assembly, IR, AST dumps) are stored during the compilation process.
-This path is relative to the project root.
-
-The compiler constructs per-target paths under `artifacts` for each emission stage.
-For example, a target called `linux` with `artifacts = "out/imach/linux"` may produce:
+The `artifacts` field names the per-target subdirectory under `[project].dir_out`.
+For example, with `dir_out = "out"` and `artifacts = "linux"`, intermediate and output files live under:
 
 ```
-out/imach/linux/{obj,asm,ir,ast}
+out/linux/
 ```
 
-### `output`
 
-The `output` field defines the final binary output path for the compiled target.
-It can be either an absolute path or relative to the project root.
+### `binary`
+
+The `binary` field defines the output path for the produced executable or library.
+This path is relative to `[project].dir_out/<artifacts>`.
 
 
 ### `mode`
@@ -170,62 +174,17 @@ It accepts one of three values:
 - `library`: The driver produces a static library archive (`.a` file).
 - `shared`: The driver produces a shared object (`.so`, `.dll`, etc.).
 
-> While the binary *type* is defined by `mode`, the actual file extensions are determined by the [`output`](#output) path provided.
-> They are not inferred automatically.
-
-
-### `debug`
-
-The `debug` field is a boolean toggle that enables or disables the emission of debug information in the compiled output.
-When set to `true`, the compiler includes debug symbols to facilitate debugging.
-
-
-### `optimize`
-
-The `optimize` field is a boolean that controls whether optimizations are applied during code generation.
-When set to `true`, the compiler enables LLVM optimizations to improve performance.
-
-> There is currently no granular control over particular optimization levels or passes.
-
-
-### `emit-ast`, `emit-ir`, `emit-asm`, `emit-object`
-
-These fields are boolean toggles that control whether the compiler emits specific intermediate artifacts during the build process:
-
-- `emit-ast`: Emit representations of each module's Abstract Syntax Tree (AST).
-- `emit-ir`: Emit each module's IR representation.
-- `emit-asm`: Emit the assembly code generated for each module.
-- `emit-object`: Emit the object files produced for each module.
-
-See the [`artifacts`](#artifacts) section for details on where these files are written.
-
-
-### `no-pie`
-
-The `no-pie` field is a boolean toggle that disables position-independent executable (PIE) linking on toolchains that support it.
-This is useful for kernel or freestanding builds where PIE is not desired.
-
-
-### `link`
-
-The `link` field is an array of additional libraries to link against during the final linking stage.
-These libraries are passed directly to the linker (e.g., `"pthread"`, `"kernel32.lib"`).
-
-> Libraries specified here should be named according to the conventions of the target platform and toolchain.
-> A full path may be necessary for many system libraries.
-> This system may be expanded in the future to support more complex linking scenarios.
-
 
 ## `[deps.<alias>]` sections
 
 Dependencies are declared per-alias.
 The `<alias>` is not significant beyond serving as an alias for command-line tools and diagnostics.
 
-When using the `mach dep pull` command, dependencies are checked out under `<project-root>/<dep>/<alias>` where `<alias>` is defined as `[deps.<alias>]`.
+When using the `mach dep pull` command, dependencies are checked out under `<project-root>/<dir_dep>/<alias>` where `<alias>` is defined as `[deps.<alias>]`.
 
 Note that this `<alias>` is distinct from the dependency's own project ID, which may differ.
 For remote dependencies, this key corresponds to the repository name by default.
-The directory referenced by `dep` must live inside the project root so that `mach dep` can manage git submodules safely.
+The directory referenced by `dir_dep` must live inside the project root so that `mach dep` can manage git submodules safely.
 
 
 ### `type`

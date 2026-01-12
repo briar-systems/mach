@@ -24,8 +24,8 @@ Each table must specify fields according to the specification in [config.md](con
 
 ## Vendoring layout and lifecycle
 
-The `[project].dep` key defines the dependency root (default `dep`).
-Remote dependencies are cloned into `<dep>/<alias>` as git submodules, while local dependencies are copied from the specified path.
+The `[project].dir_dep` key defines the dependency root (default `dep`).
+Remote dependencies are cloned into `<dir_dep>/<alias>` as git submodules, while local dependencies are copied from the specified path.
 For example:
 
 ```
@@ -38,7 +38,7 @@ dep/
 
 Key points:
 
-- **Canonical structure.** The compiler loads each dependency’s `mach.toml` to learn its `[project].id` and `src` directory. If either file is missing or out of date, module resolution will fail.
+- **Canonical structure.** The compiler loads each dependency’s `mach.toml` to learn its `[project].id` and `dir_src` directory. If either file is missing or out of date, module resolution will fail.
 - **Commit locking.** Remote dependencies will only update to a version matching the specified selector when you run `mach dep pull`. This may be a specific commit hash, branch, or semver tag.
 - **Local development.** For `type = "local"`, no submodule is created. The compiler will, however, copy the source files from the specified path into the vendor directory when "update"-style commands like `mach dep pull` are run. This ensures that the dependency is always available in a consistent location, even if the original path changes or is deleted.
 
@@ -77,7 +77,7 @@ Prints every `[deps.*]` entry along with metadata:
 - Type (`remote` or `local`)
 - Source path
 - Recorded `version` (if any)
-- Vendor directory (`<dep>/<alias>`)
+- Vendor directory (`<dir_dep>/<alias>`)
 
 Use this to verify that your config matches what the compiler expects.
 

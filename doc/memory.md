@@ -128,8 +128,7 @@ Patterns such as Zig's allocator model or other stylizations can be employed to 
 The [standard library](https://github.com/octalide/mach-std) provides some utilities for memory management. Here's a simple example of allocating and freeing memory using the standard library's utilities:
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
+use          std.runtime;
 use          std.types.option;
 use print:   std.print;
 
@@ -137,7 +136,7 @@ use print:   std.print;
 use mem: std.system.memory;
 
 $main.symbol = "main"
-fun main(args: []str) i64 {
+fun main(argc: i64, argv: &&u8) i64 {
     # allocate memory for 10 i32 values
     var opt_alloc: Option[*i32] = mem.allocate[i32](10);
     if (opt_alloc.is_none()) {
