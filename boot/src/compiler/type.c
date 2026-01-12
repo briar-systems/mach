@@ -71,7 +71,7 @@ Type *type_create_array(Type *elem_type, size_t count)
 
     type->kind            = TYPE_ARRAY;
     type->size            = elem_type ? elem_type->size * count : 0;
-    type->alignment       = elem_type ? elem_type->alignment : 1;
+    type->alignment       = (elem_type && elem_type->alignment) ? elem_type->alignment : 1;
     type->array.elem_type = elem_type;
     type->array.count     = count;
 
@@ -86,9 +86,12 @@ Type *type_create_function(Type *return_type, Type **param_types, int param_coun
         return NULL;
     }
 
-    type->kind                 = TYPE_FUNCTION;
-    type->size                 = 0; // functions don't have a size
-    type->alignment            = 0;
+    type->kind = TYPE_FUNCTION;
+    // function values are pointers to code (at least for stage1: sysv64).
+    // keep this layout-safe so functions can appear in records as callbacks.
+    Type *ptr_t                = type_get_primitive(TYPE_PTR);
+    type->size                 = ptr_t ? ptr_t->size : 8;
+    type->alignment            = ptr_t ? ptr_t->alignment : 8;
     type->function.return_type = return_type;
     type->function.param_types = param_types;
     type->function.param_count = param_count;
@@ -104,12 +107,12 @@ Type *type_create_struct(const char *name, TypeField *fields, int field_count)
         return NULL;
     }
 
-    type->kind                  = TYPE_STRUCT;
-    type->structure.name        = name ? strdup(name) : NULL;
-    type->structure.fields      = fields;
-    type->structure.field_count = field_count;
-    type->structure.methods     = NULL; // initialize methods table
-    type->structure.generic_args = NULL;
+    type->kind                        = TYPE_STRUCT;
+    type->structure.name              = name ? strdup(name) : NULL;
+    type->structure.fields            = fields;
+    type->structure.field_count       = field_count;
+    type->structure.methods           = NULL; // initialize methods table
+    type->structure.generic_args      = NULL;
     type->structure.generic_arg_count = 0;
 
     // calculate size and alignment
@@ -119,8 +122,8 @@ Type *type_create_struct(const char *name, TypeField *fields, int field_count)
     for (int i = 0; i < field_count; i++)
     {
         Type  *field_type  = fields[i].type;
-        size_t field_size  = field_type->size;
-        size_t field_align = field_type->alignment;
+        size_t field_size  = field_type ? field_type->size : 0;
+        size_t field_align = (field_type && field_type->alignment) ? field_type->alignment : 1;
 
         // update struct alignment
         if (field_align > alignment)
@@ -332,12 +335,12 @@ Type *type_create_union(const char *name, TypeField *fields, int field_count)
         return NULL;
     }
 
-    type->kind                   = TYPE_UNION;
-    type->union_type.name        = name ? strdup(name) : NULL;
-    type->union_type.fields      = fields;
-    type->union_type.field_count = field_count;
-    type->union_type.methods     = NULL; // initialize methods table
-    type->union_type.generic_args = NULL;
+    type->kind                         = TYPE_UNION;
+    type->union_type.name              = name ? strdup(name) : NULL;
+    type->union_type.fields            = fields;
+    type->union_type.field_count       = field_count;
+    type->union_type.methods           = NULL; // initialize methods table
+    type->union_type.generic_args      = NULL;
     type->union_type.generic_arg_count = 0;
 
     // union size is the max of field sizes and alignment is the max of field alignments
@@ -384,7 +387,6 @@ Type *type_create_generic_param(const char *name)
 
     return type;
 }
-
 
 bool type_is_integer(Type *t)
 {
