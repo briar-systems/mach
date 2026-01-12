@@ -276,6 +276,7 @@ static MasmOperand va_load_gp_slot(Masm *masm, MasmSection *text, LowerContext *
     masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, reg_save, off64));
 
     MasmOperand out = isa_result(ctx, ctx->ptr_size);
+    MasmOperand out_ret = masm_operand_register(out.reg.id, load_size);
     MasmOperand src = masm_operand_memory_simple(reg_save.reg.id, 0, load_size);
     if (load_size == 1 || load_size == 2)
     {
@@ -320,7 +321,7 @@ static MasmOperand va_load_gp_slot(Masm *masm, MasmSection *text, LowerContext *
     masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(end_label))));
     masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
 
-    return out;
+    return out_ret;
 }
 
 static MasmOperand va_load_fp_slot(Masm *masm, MasmSection *text, LowerContext *ctx, MasmOperand ap, uint8_t load_size)

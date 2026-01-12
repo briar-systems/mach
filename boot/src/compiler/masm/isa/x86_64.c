@@ -40,6 +40,11 @@ static uint8_t reg_low(uint32_t r)
     return (uint8_t)(r & 7);
 }
 
+static bool operand_is_xmm(MasmOperand op)
+{
+    return op.kind == MASM_OPERAND_REGISTER && op.reg.size == 16;
+}
+
 static void emit_rex(uint8_t *buf, size_t *off, size_t cap, bool w, bool r, bool x, bool b)
 {
     uint8_t rex = 0x40 | (w ? 8 : 0) | (r ? 4 : 0) | (x ? 2 : 0) | (b ? 1 : 0);
@@ -144,6 +149,82 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     case MASM_OP_X86_SYSCALL:
         emit_byte(buffer, &offset, size, 0x0F);
         emit_byte(buffer, &offset, size, 0x05);
+        break;
+
+    case MASM_OP_X86_MOVQ:
+        // movd/movq between xmm and r/m32|r/m64:
+        //  - xmm <- r/m : 66 0F 6E /r (REX.W selects 64-bit)
+        //  - r/m <- xmm : 66 0F 7E /r (REX.W selects 64-bit)
+        if (inst.operand_count == 2)
+        {
+            MasmOperand a = inst.operands[0];
+            MasmOperand b = inst.operands[1];
+
+            // xmm <- r/m
+            if (operand_is_xmm(a) && (b.kind == MASM_OPERAND_REGISTER || b.kind == MASM_OPERAND_MEMORY))
+            {
+                uint8_t rm_size = (b.kind == MASM_OPERAND_REGISTER) ? b.reg.size : b.mem.size;
+                if (rm_size != 4 && rm_size != 8)
+                {
+                    break;
+                }
+
+                bool w     = rm_size == 8;
+                bool rex_r = a.reg.id >= 8;
+
+                emit_byte(buffer, &offset, size, 0x66);
+
+                if (b.kind == MASM_OPERAND_REGISTER)
+                {
+                    uint32_t rm = b.reg.id;
+                    emit_rex(buffer, &offset, size, w, rex_r, false, rm >= 8);
+                    emit_byte(buffer, &offset, size, 0x0F);
+                    emit_byte(buffer, &offset, size, 0x6E);
+                    emit_byte(buffer, &offset, size, encode_modrm(0xC0, reg_low(a.reg.id), reg_low(rm)));
+                }
+                else
+                {
+                    bool rex_x = b.mem.index.id >= 8;
+                    bool rex_b = b.mem.base.id >= 8;
+                    emit_rex(buffer, &offset, size, w, rex_r, rex_x, rex_b);
+                    emit_byte(buffer, &offset, size, 0x0F);
+                    emit_byte(buffer, &offset, size, 0x6E);
+                    emit_mem(buffer, &offset, size, b.mem.base.id, b.mem.index.id, b.mem.scale, (int32_t)b.mem.disp, reg_low(a.reg.id));
+                }
+            }
+            // r/m <- xmm
+            else if ((a.kind == MASM_OPERAND_REGISTER || a.kind == MASM_OPERAND_MEMORY) && operand_is_xmm(b))
+            {
+                uint8_t rm_size = (a.kind == MASM_OPERAND_REGISTER) ? a.reg.size : a.mem.size;
+                if (rm_size != 4 && rm_size != 8)
+                {
+                    break;
+                }
+
+                bool w     = rm_size == 8;
+                bool rex_r = b.reg.id >= 8;
+
+                emit_byte(buffer, &offset, size, 0x66);
+
+                if (a.kind == MASM_OPERAND_REGISTER)
+                {
+                    uint32_t rm = a.reg.id;
+                    emit_rex(buffer, &offset, size, w, rex_r, false, rm >= 8);
+                    emit_byte(buffer, &offset, size, 0x0F);
+                    emit_byte(buffer, &offset, size, 0x7E);
+                    emit_byte(buffer, &offset, size, encode_modrm(0xC0, reg_low(b.reg.id), reg_low(rm)));
+                }
+                else
+                {
+                    bool rex_x = a.mem.index.id >= 8;
+                    bool rex_b = a.mem.base.id >= 8;
+                    emit_rex(buffer, &offset, size, w, rex_r, rex_x, rex_b);
+                    emit_byte(buffer, &offset, size, 0x0F);
+                    emit_byte(buffer, &offset, size, 0x7E);
+                    emit_mem(buffer, &offset, size, a.mem.base.id, a.mem.index.id, a.mem.scale, (int32_t)a.mem.disp, reg_low(b.reg.id));
+                }
+            }
+        }
         break;
 
     case MASM_OP_CQO:

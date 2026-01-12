@@ -16,6 +16,15 @@ typedef struct MasmABISpec
 
     const uint32_t *int_ret_regs;
     uint8_t        int_ret_count;
+
+    // floating-point (SSE) calling convention registers.
+    // these IDs are target-specific; for x86_64 SYSV64 we encode XMM regs by
+    // convention as masm_operand_register(xmm_index, 16).
+    const uint32_t *float_arg_regs;
+    uint8_t        float_arg_count;
+
+    const uint32_t *float_ret_regs;
+    uint8_t        float_ret_count;
 } MasmABISpec;
 
 // select ABI spec for a target; returns NULL if unsupported
@@ -29,5 +38,10 @@ uint8_t  masm_abi_int_arg_count(MasmTarget target);
 uint32_t masm_abi_int_arg_reg(MasmTarget target, int index);
 uint8_t  masm_abi_int_ret_count(MasmTarget target);
 uint32_t masm_abi_int_ret_reg(MasmTarget target, int index);
+
+uint8_t  masm_abi_float_arg_count(MasmTarget target);
+uint32_t masm_abi_float_arg_reg(MasmTarget target, int index);
+uint8_t  masm_abi_float_ret_count(MasmTarget target);
+uint32_t masm_abi_float_ret_reg(MasmTarget target, int index);
 
 #endif // MASM_ABI_SPEC_H

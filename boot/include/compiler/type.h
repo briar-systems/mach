@@ -121,4 +121,13 @@ bool type_is_numeric(Type *t);
 // buffer should be at least 256 bytes
 int type_mangle(Type *type, char *buffer, size_t buffer_size);
 
+// builtin types
+//
+// SysV x86_64 va_list layout:
+//   u32 gp_offset;
+//   u32 fp_offset;
+//   ptr overflow_arg_area;
+//   ptr reg_save_area;
+Type *type_get_builtin_va_list(void);
+
 #endif // TYPE_H

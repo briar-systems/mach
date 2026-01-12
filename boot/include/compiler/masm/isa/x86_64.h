@@ -7,7 +7,11 @@
 // x86_64-specific opcodes live in the target-specific range
 typedef enum MasmX86Opcode
 {
-    MASM_OP_X86_SYSCALL = MASM_OP_TARGET_SPECIFIC_START
+    MASM_OP_X86_SYSCALL = MASM_OP_TARGET_SPECIFIC_START,
+
+    // sse moves between xmm regs (encoded as masm_operand_register(xmm_index, 16))
+    // and r/m32|r/m64 using MOVD/MOVQ encodings.
+    MASM_OP_X86_MOVQ,
 } MasmX86Opcode;
 
 // x86_64 registers

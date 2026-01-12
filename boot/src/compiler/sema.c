@@ -75,6 +75,7 @@ struct Sema
     int          error_count;
     const char  *module_path; // borrowed from current_module->module_path
     Type        *current_function_return_type;
+    bool         current_function_is_variadic;
 
     // error list
     SemaError *errors;
@@ -156,6 +157,7 @@ Sema *sema_create(const char *module_path)
     sema->deps                       = NULL;
     sema->dep_count                  = 0;
     sema->current_function_return_type = NULL;
+    sema->current_function_is_variadic = false;
     sema->extra_roots                = NULL;
     sema->extra_root_count           = 0;
     sema->extra_root_capacity        = 0;
@@ -1372,13 +1374,18 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
 
     Type **param_types = NULL;
     int    param_count = 0;
+    int    fixed_count = node->fun_stmt.params ? node->fun_stmt.params->count : 0;
 
-    if (node->fun_stmt.params)
+    if (fixed_count > 0 || node->fun_stmt.is_variadic)
     {
-        param_count = node->fun_stmt.params->count;
-        param_types = malloc(sizeof(Type *) * param_count);
+        int alloc_count = fixed_count + (node->fun_stmt.is_variadic ? 1 : 0);
+        param_types = malloc(sizeof(Type *) * alloc_count);
+        if (!param_types)
+        {
+            return -1;
+        }
 
-        for (int i = 0; i < param_count; i++)
+        for (int i = 0; i < fixed_count; i++)
         {
             AstNode *param = node->fun_stmt.params->items[i];
             if (param->kind == AST_STMT_PARAM)
@@ -1404,6 +1411,16 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
                 param->type    = pt;
             }
         }
+
+        if (node->fun_stmt.is_variadic)
+        {
+            param_types[fixed_count] = NULL; // sentinel for variadic
+            param_count = alloc_count;
+        }
+        else
+        {
+            param_count = fixed_count;
+        }
     }
 
     sym->type = type_create_function(ret_type, param_types, param_count);
@@ -1416,7 +1433,9 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         sema->current_table     = symbol_table_create(prev_table);
 
         Type *prev_return_type               = sema->current_function_return_type;
-        sema->current_function_return_type = sym->type ? sym->type->function.return_type : NULL;
+        bool   prev_is_variadic              = sema->current_function_is_variadic;
+        sema->current_function_return_type  = sym->type ? sym->type->function.return_type : NULL;
+        sema->current_function_is_variadic  = node->fun_stmt.is_variadic;
 
         // add parameters to scope
         if (node->fun_stmt.params)
@@ -1440,6 +1459,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
 
         sema->current_table = prev_table;
         sema->current_function_return_type = prev_return_type;
+        sema->current_function_is_variadic = prev_is_variadic;
     }
 
     return 0;
@@ -2878,6 +2898,82 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
     case AST_EXPR_CALL:
     {
+        // runtime varargs builtins (no `$` prefix)
+        //
+        // va_start(*va_list)
+        // va_arg[T](*va_list) -> T
+        // va_end(*va_list)
+        if (node->call_expr.func && node->call_expr.func->kind == AST_EXPR_IDENT)
+        {
+            const char *bname = node->call_expr.func->ident_expr.name;
+            bool is_varargs_builtin = bname && (!strcmp(bname, "va_start") || !strcmp(bname, "va_end") || !strcmp(bname, "va_arg"));
+            if (is_varargs_builtin)
+            {
+                // analyze arguments (callee need not resolve to a symbol)
+                if (node->call_expr.args)
+                {
+                    for (int i = 0; i < node->call_expr.args->count; i++)
+                    {
+                        if (sema_analyze_expr(sema, node->call_expr.args->items[i]) < 0)
+                        {
+                            return -1;
+                        }
+                    }
+                }
+
+                if (!sema->current_function_is_variadic)
+                {
+                    sema_error(sema, node->token, "va_* builtins are only valid in variadic functions");
+                    return -1;
+                }
+
+                int arg_count = node->call_expr.args ? node->call_expr.args->count : 0;
+                if (arg_count != 1)
+                {
+                    sema_error(sema, node->token, "va_* builtins expect exactly 1 argument");
+                    return -1;
+                }
+
+                AstNode *ap_expr = node->call_expr.args->items[0];
+                Type    *ap_type = ap_expr ? ap_expr->type : NULL;
+                Type    *va_list = type_get_builtin_va_list();
+                if (!va_list)
+                {
+                    sema_error(sema, node->token, "failed to resolve builtin va_list type");
+                    return -1;
+                }
+
+                if (!ap_type || ap_type->kind != TYPE_POINTER || ap_type->pointer.is_const || !type_equals(ap_type->pointer.base, va_list))
+                {
+                    sema_error(sema, node->token, "va_* builtins require a mutable pointer to va_list");
+                    return -1;
+                }
+
+                if (!strcmp(bname, "va_arg"))
+                {
+                    if (!node->call_expr.type_args || node->call_expr.type_args->count != 1)
+                    {
+                        sema_error(sema, node->token, "va_arg requires exactly 1 type argument: va_arg[T](ap)");
+                        return -1;
+                    }
+
+                    Type *t = sema_resolve_type(sema, node->call_expr.type_args->items[0]);
+                    if (!t)
+                    {
+                        sema_error(sema, node->token, "failed to resolve va_arg type argument");
+                        return -1;
+                    }
+
+                    node->type = t;
+                    return 0;
+                }
+
+                // va_start/va_end return void
+                node->type = NULL;
+                return 0;
+            }
+        }
+
         // analyze function
         if (sema_analyze_expr(sema, node->call_expr.func) < 0)
         {
@@ -4125,6 +4221,12 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
             return type_get_primitive(TYPE_PTR);
         }
 
+        // builtin va_list
+        if (strcmp(name, "va_list") == 0)
+        {
+            return type_get_builtin_va_list();
+        }
+
         // look up user-defined types (local scope, then imports; or alias-qualified)
         Symbol *sym = sema_lookup_type_symbol(sema, module_alias, name);
         if (!sym)
@@ -4213,16 +4315,17 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
             }
         }
 
-        if (type_node->type_fun.params)
+        int fixed_count = type_node->type_fun.params ? type_node->type_fun.params->count : 0;
+        if (fixed_count > 0 || type_node->type_fun.is_variadic)
         {
-            param_count = type_node->type_fun.params->count;
-            param_types = malloc(sizeof(Type *) * param_count);
+            int alloc_count = fixed_count + (type_node->type_fun.is_variadic ? 1 : 0);
+            param_types = malloc(sizeof(Type *) * alloc_count);
             if (!param_types)
             {
                 return NULL;
             }
 
-            for (int i = 0; i < param_count; i++)
+            for (int i = 0; i < fixed_count; i++)
             {
                 AstNode *pt_node = type_node->type_fun.params->items[i];
                 Type    *pt      = sema_resolve_type(sema, pt_node);
@@ -4232,6 +4335,16 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
                     return NULL;
                 }
                 param_types[i] = pt;
+            }
+
+            if (type_node->type_fun.is_variadic)
+            {
+                param_types[fixed_count] = NULL; // sentinel
+                param_count = alloc_count;
+            }
+            else
+            {
+                param_count = fixed_count;
             }
         }
 
@@ -4729,13 +4842,19 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
 
     Type **param_types = NULL;
     int    param_count = 0;
+    int    fixed_count = cloned_decl->fun_stmt.params ? cloned_decl->fun_stmt.params->count : 0;
 
-    if (cloned_decl->fun_stmt.params)
+    if (fixed_count > 0 || cloned_decl->fun_stmt.is_variadic)
     {
-        param_count = cloned_decl->fun_stmt.params->count;
-        param_types = malloc(sizeof(Type *) * param_count);
+        int alloc_count = fixed_count + (cloned_decl->fun_stmt.is_variadic ? 1 : 0);
+        param_types = malloc(sizeof(Type *) * alloc_count);
+        if (!param_types)
+        {
+            sema->current_table = prev_table;
+            return NULL;
+        }
 
-        for (int i = 0; i < param_count; i++)
+        for (int i = 0; i < fixed_count; i++)
         {
             AstNode *param = cloned_decl->fun_stmt.params->items[i];
             if (param->kind == AST_STMT_PARAM)
@@ -4744,16 +4863,20 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
                 if (param->param_stmt.type)
                 {
                     pt = sema_resolve_type(sema, param->param_stmt.type);
-                    if (pt && pt->kind == TYPE_STRUCT)
-                    {
-                        for (int j = 0; j < pt->structure.field_count; j++)
-                        {
-                        }
-                    }
                 }
                 param_types[i] = pt;
                 param->type    = pt;
             }
+        }
+
+        if (cloned_decl->fun_stmt.is_variadic)
+        {
+            param_types[fixed_count] = NULL; // sentinel
+            param_count = alloc_count;
+        }
+        else
+        {
+            param_count = fixed_count;
         }
     }
 
