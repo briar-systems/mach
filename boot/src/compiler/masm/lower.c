@@ -2,6 +2,7 @@
 #include "compiler/masm/abi/spec.h"
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/spec.h"
+#include "compiler/masm/isa/x86_64.h"
 #include "compiler/masm/masm.h"
 #include "compiler/masm/regalloc.h"
 #include "compiler/symbol.h"
@@ -26,6 +27,7 @@ typedef struct LowerContext
     uint8_t    ptr_size;
     uint8_t    stack_align;
     uint8_t    int_arg_count;
+    uint8_t    float_arg_count;
     uint32_t   fp_reg;
     uint32_t   sp_reg;
 
@@ -56,6 +58,13 @@ typedef struct LowerContext
     Type    *fn_ret_type;
     bool     fn_has_sret;
     int32_t  sret_offset; // stack slot holding hidden sret pointer (rbp-relative)
+
+    // variadic function lowering state
+    bool     fn_is_variadic;
+    int32_t  va_reg_save_off; // rbp-relative base offset for reg_save_area
+    int      va_named_gp;     // named gp regs consumed (excluding sret)
+    int      va_named_fp;     // named fp regs consumed
+    int      va_named_stack_slots; // named params passed on stack
 } LowerContext;
 
 // Select ISA spec via shared selector
@@ -95,6 +104,7 @@ static LowerContext *create_context(MasmTarget target)
     ctx->ptr_size     = ctx->abi->pointer_size;
     ctx->stack_align  = ctx->abi->stack_align;
     ctx->int_arg_count = ctx->abi->int_arg_count;
+    ctx->float_arg_count = ctx->abi->float_arg_count;
     ctx->fp_reg       = ctx->isa->reg_fp(ctx->ptr_size).reg.id;
     ctx->sp_reg       = ctx->isa->reg_sp(ctx->ptr_size).reg.id;
     if (ctx->fp_reg == UINT32_MAX || ctx->sp_reg == UINT32_MAX)
@@ -123,6 +133,11 @@ static LowerContext *create_context(MasmTarget target)
     ctx->fn_ret_type = NULL;
     ctx->fn_has_sret = false;
     ctx->sret_offset = 0;
+    ctx->fn_is_variadic = false;
+    ctx->va_reg_save_off = 0;
+    ctx->va_named_gp = 0;
+    ctx->va_named_fp = 0;
+    ctx->va_named_stack_slots = 0;
     return ctx;
 }
 
@@ -160,6 +175,210 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 static inline bool type_is_large_aggregate(Type *t, uint8_t ptr_size)
 {
     return t && (t->kind == TYPE_STRUCT || t->kind == TYPE_UNION || t->kind == TYPE_ARRAY) && t->size > ptr_size;
+}
+
+static inline bool type_is_fp_class(Type *t)
+{
+    return t && (t->kind == TYPE_F32 || t->kind == TYPE_F64);
+}
+
+static inline uint8_t type_fp_size(Type *t)
+{
+    if (!t)
+    {
+        return 8;
+    }
+    return (t->kind == TYPE_F32) ? 4 : 8;
+}
+
+static inline MasmOperand masm_xmm(uint32_t xmm_id)
+{
+    return masm_operand_register(xmm_id, 16);
+}
+
+static void materialize_bits_to_gpr(MasmSection *text, LowerContext *ctx, MasmOperand dst, MasmOperand src, uint8_t size)
+{
+    (void)ctx;
+
+    if (dst.kind != MASM_OPERAND_REGISTER)
+    {
+        return;
+    }
+
+    dst.reg.size = size;
+
+    if (src.kind == MASM_OPERAND_REGISTER)
+    {
+        MasmOperand s = src;
+        s.reg.size = size;
+        if (s.reg.id != dst.reg.id || s.reg.size != dst.reg.size)
+        {
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, s));
+        }
+        return;
+    }
+    else if (src.kind == MASM_OPERAND_MEMORY)
+    {
+        MasmOperand m = src;
+        m.mem.size = size;
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, m));
+        return;
+    }
+    else if (src.kind == MASM_OPERAND_IMM || src.kind == MASM_OPERAND_LABEL)
+    {
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+        return;
+    }
+
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+}
+
+static inline int32_t align_up_i32(int32_t v, int32_t align)
+{
+    if (align <= 1)
+    {
+        return v;
+    }
+    int32_t r = v % align;
+    return r ? (v + (align - r)) : v;
+}
+
+// SysV x86_64 va_list layout:
+//   +0  u32 gp_offset
+//   +4  u32 fp_offset
+//   +8  ptr overflow_arg_area
+//   +16 ptr reg_save_area
+static MasmOperand va_load_gp_slot(Masm *masm, MasmSection *text, LowerContext *ctx, MasmOperand ap, uint8_t load_size)
+{
+    static int label_counter = 0;
+    int id = label_counter++;
+
+    char overflow_label[48];
+    char end_label[48];
+    snprintf(overflow_label, sizeof(overflow_label), ".Lva_gp_overflow_%d", id);
+    snprintf(end_label, sizeof(end_label), ".Lva_gp_end_%d", id);
+
+    // gp_offset
+    MasmOperand gp_off32 = isa_tmp(ctx, 4);
+    MasmOperand gp_mem   = masm_operand_memory_simple(ap.reg.id, 0, 4);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, gp_off32, gp_mem));
+
+    // if gp_offset >= 48 => overflow
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_CMP, gp_off32, masm_operand_imm(48)));
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_JGE, masm_operand_label(strdup(overflow_label))));
+
+    // reg_save_area + gp_offset
+    MasmOperand reg_save = isa_tmp2(ctx, ctx->ptr_size);
+    MasmOperand rsa_mem  = masm_operand_memory_simple(ap.reg.id, 16, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, reg_save, rsa_mem));
+
+    MasmOperand off64 = masm_operand_register(gp_off32.reg.id, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, reg_save, off64));
+
+    MasmOperand out = isa_result(ctx, ctx->ptr_size);
+    MasmOperand src = masm_operand_memory_simple(reg_save.reg.id, 0, load_size);
+    if (load_size == 1 || load_size == 2)
+    {
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, out, src));
+    }
+    else
+    {
+        // mov into a 32-bit reg zero-extends on x86_64; treat result as ptr-sized.
+        MasmOperand out_n = masm_operand_register(out.reg.id, (load_size == 4) ? 4 : ctx->ptr_size);
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, out_n, src));
+    }
+
+    // gp_offset += 8
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, gp_off32, masm_operand_imm(8)));
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, gp_mem, gp_off32));
+
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(end_label))));
+
+    // overflow path
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(overflow_label))));
+    masm_add_symbol(masm, masm_symbol_create(overflow_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+
+    MasmOperand overflow_ptr = isa_tmp(ctx, ctx->ptr_size);
+    MasmOperand ov_mem       = masm_operand_memory_simple(ap.reg.id, 8, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, overflow_ptr, ov_mem));
+
+    MasmOperand ov_src = masm_operand_memory_simple(overflow_ptr.reg.id, 0, load_size);
+    if (load_size == 1 || load_size == 2)
+    {
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, out, ov_src));
+    }
+    else
+    {
+        MasmOperand out_n = masm_operand_register(out.reg.id, (load_size == 4) ? 4 : ctx->ptr_size);
+        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, out_n, ov_src));
+    }
+
+    // overflow_arg_area += 8
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, overflow_ptr, masm_operand_imm(8)));
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, ov_mem, overflow_ptr));
+
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(end_label))));
+    masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+
+    return out;
+}
+
+static MasmOperand va_load_fp_slot(Masm *masm, MasmSection *text, LowerContext *ctx, MasmOperand ap, uint8_t load_size)
+{
+    static int label_counter = 0;
+    int id = label_counter++;
+
+    char overflow_label[48];
+    char end_label[48];
+    snprintf(overflow_label, sizeof(overflow_label), ".Lva_fp_overflow_%d", id);
+    snprintf(end_label, sizeof(end_label), ".Lva_fp_end_%d", id);
+
+    // fp_offset
+    MasmOperand fp_off32 = isa_tmp(ctx, 4);
+    MasmOperand fp_mem   = masm_operand_memory_simple(ap.reg.id, 4, 4);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, fp_off32, fp_mem));
+
+    // if fp_offset >= 176 => overflow
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_CMP, fp_off32, masm_operand_imm(176)));
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_JGE, masm_operand_label(strdup(overflow_label))));
+
+    // reg_save_area + fp_offset
+    MasmOperand reg_save = isa_tmp2(ctx, ctx->ptr_size);
+    MasmOperand rsa_mem  = masm_operand_memory_simple(ap.reg.id, 16, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, reg_save, rsa_mem));
+
+    MasmOperand off64 = masm_operand_register(fp_off32.reg.id, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, reg_save, off64));
+
+    MasmOperand out = isa_result(ctx, load_size);
+    MasmOperand src = masm_operand_memory_simple(reg_save.reg.id, 0, load_size);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, out, src));
+
+    // fp_offset += 16
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, fp_off32, masm_operand_imm(16)));
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, fp_mem, fp_off32));
+
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(end_label))));
+
+    // overflow path
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(overflow_label))));
+    masm_add_symbol(masm, masm_symbol_create(overflow_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+
+    MasmOperand overflow_ptr = isa_tmp(ctx, ctx->ptr_size);
+    MasmOperand ov_mem       = masm_operand_memory_simple(ap.reg.id, 8, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, overflow_ptr, ov_mem));
+
+    MasmOperand ov_src = masm_operand_memory_simple(overflow_ptr.reg.id, 0, load_size);
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, out, ov_src));
+
+    // overflow_arg_area += 8
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, overflow_ptr, masm_operand_imm(8)));
+    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, ov_mem, overflow_ptr));
+
+    masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(end_label))));
+    masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+
+    return out;
 }
 
 static Type *infer_ret_type_from_stmt(AstNode *stmt)
@@ -1184,19 +1403,183 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     }
     else if (expr->kind == AST_EXPR_CALL)
     {
-        // evaluate arguments
+        // varargs builtins (no `$` prefix). these are handled as special calls and do not
+        // require a declared symbol.
+        if (ctx->fn_is_variadic && expr->call_expr.func && expr->call_expr.func->kind == AST_EXPR_IDENT)
+        {
+            const char *bname = expr->call_expr.func->ident_expr.name;
+            AstList    *bargs = expr->call_expr.args;
+            int         bargc = bargs ? bargs->count : 0;
+
+            if (bname && (!strcmp(bname, "va_start") || !strcmp(bname, "va_end") || !strcmp(bname, "va_arg")))
+            {
+                // sema should enforce exactly one argument.
+                if (bargc != 1)
+                {
+                    return masm_operand_none();
+                }
+
+                MasmOperand ap = lower_expr(masm, text, bargs->items[0], ctx);
+                if (ap.kind != MASM_OPERAND_REGISTER)
+                {
+                    MasmOperand tmp = isa_result(ctx, ctx->ptr_size);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, ap));
+                    ap = tmp;
+                }
+
+                if (!strcmp(bname, "va_end"))
+                {
+                    // SysV x86_64: va_end is a no-op.
+                    return masm_operand_none();
+                }
+
+                if (!strcmp(bname, "va_start"))
+                {
+                    // initialize *va_list
+                    // gp_offset
+                    {
+                        uint32_t gp0 = (uint32_t)(ctx->va_named_gp * 8);
+                        MasmOperand tmp32 = isa_tmp(ctx, 4);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp32, masm_operand_imm((int64_t)gp0)));
+                        MasmOperand dst = masm_operand_memory_simple(ap.reg.id, 0, 4);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp32));
+                    }
+
+                    // fp_offset
+                    {
+                        uint32_t fp0 = (uint32_t)(48 + ctx->va_named_fp * 16);
+                        MasmOperand tmp32 = isa_tmp(ctx, 4);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp32, masm_operand_imm((int64_t)fp0)));
+                        MasmOperand dst = masm_operand_memory_simple(ap.reg.id, 4, 4);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp32));
+                    }
+
+                    // overflow_arg_area = rbp + 16 + named_stack_slots*8
+                    {
+                        int32_t off = (int32_t)(2 * ctx->ptr_size + (ctx->va_named_stack_slots * ctx->ptr_size));
+                        MasmOperand tmp = isa_tmp(ctx, ctx->ptr_size);
+                        MasmOperand addr = frame_mem(ctx, off, ctx->ptr_size);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, tmp, addr));
+                        MasmOperand dst = masm_operand_memory_simple(ap.reg.id, 8, ctx->ptr_size);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp));
+                    }
+
+                    // reg_save_area = rbp + va_reg_save_off
+                    {
+                        MasmOperand tmp = isa_tmp(ctx, ctx->ptr_size);
+                        MasmOperand addr = frame_mem(ctx, ctx->va_reg_save_off, ctx->ptr_size);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, tmp, addr));
+                        MasmOperand dst = masm_operand_memory_simple(ap.reg.id, 16, ctx->ptr_size);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp));
+                    }
+
+                    return masm_operand_none();
+                }
+
+                // va_arg[T](ap)
+                Type *t = expr->type;
+                if (type_is_fp_class(t))
+                {
+                    uint8_t sz = type_fp_size(t);
+                    return va_load_fp_slot(masm, text, ctx, ap, sz);
+                }
+
+                bool is_agg = t && (t->kind == TYPE_STRUCT || t->kind == TYPE_UNION || t->kind == TYPE_ARRAY);
+                if (is_agg)
+                {
+                    size_t tsize = t->size;
+                    if (tsize == 0)
+                    {
+                        return masm_operand_none();
+                    }
+
+                    bool byptr = tsize > ctx->ptr_size;
+
+                    // allocate stack storage for the extracted value
+                    int32_t alloc = (int32_t)align_up_i32((int32_t)tsize, (int32_t)ctx->ptr_size);
+                    if (alloc < (int32_t)ctx->ptr_size)
+                    {
+                        alloc = (int32_t)ctx->ptr_size;
+                    }
+                    ctx->stack_offset -= alloc;
+                    int align = ctx->ptr_size ? ctx->ptr_size : 1;
+                    if (align > 1 && (abs(ctx->stack_offset) % align) != 0)
+                    {
+                        ctx->stack_offset -= (align - (abs(ctx->stack_offset) % align));
+                    }
+                    int32_t tmp_off = ctx->stack_offset;
+
+                    MasmOperand dst_ptr = isa_tmp2(ctx, ctx->ptr_size);
+                    MasmOperand dst_addr = frame_mem(ctx, tmp_off, ctx->ptr_size);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, dst_ptr, dst_addr));
+
+                    if (byptr)
+                    {
+                        // vararg slot holds a pointer to the value bytes
+                        MasmOperand src_ptr = va_load_gp_slot(masm, text, ctx, ap, ctx->ptr_size);
+
+                        for (int32_t off = 0; off < (int32_t)tsize;)
+                        {
+                            int32_t chunk = (int32_t)tsize - off;
+                            if (chunk > 8)
+                                chunk = 8;
+                            else if (chunk > 4)
+                                chunk = 4;
+                            else if (chunk > 2)
+                                chunk = 2;
+                            else
+                                chunk = 1;
+
+                            MasmOperand tmp = isa_tmp(ctx, (uint8_t)chunk);
+                            MasmOperand src = masm_operand_memory_simple(src_ptr.reg.id, (int64_t)off, (size_t)chunk);
+                            MasmOperand dst = masm_operand_memory_simple(dst_ptr.reg.id, (int64_t)off, (size_t)chunk);
+                            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src));
+                            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp));
+                            off += chunk;
+                        }
+
+                        // large aggregates are represented by address
+                        return dst_ptr;
+                    }
+                    else
+                    {
+                        // small aggregates are represented in an 8-byte slot
+                        MasmOperand bits = va_load_gp_slot(masm, text, ctx, ap, ctx->ptr_size);
+                        MasmOperand dst = frame_mem(ctx, tmp_off, ctx->ptr_size);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, bits));
+                        return dst;
+                    }
+                }
+
+                // integer/pointer-like types
+                uint8_t load_size = ctx->ptr_size;
+                if (t)
+                {
+                    if (t->kind == TYPE_U8 || t->kind == TYPE_I8)
+                        load_size = 1;
+                    else if (t->kind == TYPE_U16 || t->kind == TYPE_I16)
+                        load_size = 2;
+                    else if (t->kind == TYPE_U32 || t->kind == TYPE_I32)
+                        load_size = 4;
+                    else
+                        load_size = ctx->ptr_size;
+                }
+
+                return va_load_gp_slot(masm, text, ctx, ap, load_size);
+            }
+        }
+
         AstList *args = expr->call_expr.args;
 
         int explicit_arg_count = args ? args->count : 0;
 
         // determine whether we can use the internal aggregate ABI (Mach functions).
-        AstNode *func          = expr->call_expr.func;
-        Symbol  *call_sym      = func ? func->symbol : NULL;
+        AstNode *func             = expr->call_expr.func;
+        Symbol  *call_sym         = func ? func->symbol : NULL;
         bool     internal_agg_abi = call_sym && call_sym->decl && call_sym->decl->kind == AST_STMT_FUN;
 
         // internal ABI: aggregate returns (> ptr_size) are returned via an implicit sret pointer
         // passed in the first integer argument register.
-        // prefer the callee function type's return type over expr->type (which may be stale).
         Type *ret_type = NULL;
         if (func && func->symbol && func->symbol->type && func->symbol->type->kind == TYPE_FUNCTION)
         {
@@ -1226,22 +1609,102 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             {
                 ctx->stack_offset -= (align - (abs(ctx->stack_offset) % align));
             }
-
             sret_offset = ctx->stack_offset;
         }
 
-        int stack_args_count = 0;
-        int padding          = 0;
+        int arg_shift    = needs_sret ? 1 : 0;
+        int abi_arg_count = explicit_arg_count + arg_shift;
 
-        int abi_arg_count = explicit_arg_count + (needs_sret ? 1 : 0);
-        if (abi_arg_count > ctx->int_arg_count)
+        typedef enum CallArgKind
         {
-            stack_args_count = abi_arg_count - ctx->int_arg_count;
-            if (stack_args_count % 2 != 0)
+            CALL_ARG_GP,
+            CALL_ARG_FP,
+            CALL_ARG_STACK,
+        } CallArgKind;
+
+        typedef struct CallArgLoc
+        {
+            CallArgKind kind;
+            int         gp_index;
+            int         fp_index;
+            int         stack_slot;
+            uint8_t     size;
+            bool        is_fp;
+        } CallArgLoc;
+
+        CallArgLoc *locs = NULL;
+        if (abi_arg_count > 0)
+        {
+            locs = calloc((size_t)abi_arg_count, sizeof(CallArgLoc));
+        }
+
+        // size per fp reg index (movd for f32, movq for f64)
+        uint8_t fp_reg_sizes[8] = {0};
+
+        int gp_i    = 0;
+        int fp_i    = 0;
+        int stack_i = 0;
+
+        for (int i = 0; i < abi_arg_count; i++)
+        {
+            CallArgLoc *loc = &locs[i];
+            loc->gp_index   = -1;
+            loc->fp_index   = -1;
+            loc->stack_slot = -1;
+            loc->size       = ctx->ptr_size;
+            loc->is_fp      = false;
+
+            if (needs_sret && i == 0)
             {
-                padding = 8;
+                loc->kind     = CALL_ARG_GP;
+                loc->gp_index = gp_i++;
+                continue;
+            }
+
+            int      explicit_index = i - arg_shift;
+            AstNode *arg_expr       = args ? args->items[explicit_index] : NULL;
+            bool     byptr          = internal_agg_abi && arg_expr && type_is_large_aggregate(arg_expr->type, ctx->ptr_size);
+            bool     is_fp          = !byptr && arg_expr && type_is_fp_class(arg_expr->type);
+            uint8_t  fp_size        = is_fp ? type_fp_size(arg_expr->type) : ctx->ptr_size;
+
+            loc->is_fp = is_fp;
+            loc->size  = is_fp ? fp_size : ctx->ptr_size;
+
+            if (is_fp)
+            {
+                if (fp_i < ctx->float_arg_count)
+                {
+                    loc->kind     = CALL_ARG_FP;
+                    loc->fp_index = fp_i;
+                    if (fp_i < 8)
+                    {
+                        fp_reg_sizes[fp_i] = fp_size;
+                    }
+                    fp_i++;
+                }
+                else
+                {
+                    loc->kind      = CALL_ARG_STACK;
+                    loc->stack_slot = stack_i++;
+                }
+            }
+            else
+            {
+                if (gp_i < ctx->int_arg_count)
+                {
+                    loc->kind     = CALL_ARG_GP;
+                    loc->gp_index = gp_i++;
+                }
+                else
+                {
+                    loc->kind      = CALL_ARG_STACK;
+                    loc->stack_slot = stack_i++;
+                }
             }
         }
+
+        int stack_args_count = stack_i;
+        int padding          = (stack_args_count % 2 != 0) ? 8 : 0;
 
         int total_stack_space = (stack_args_count * 8) + padding;
         if (total_stack_space > 0)
@@ -1251,50 +1714,87 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
 
         // stack arguments (reverse order)
-        for (int i = abi_arg_count - 1; i >= ctx->int_arg_count; i--)
+        for (int i = abi_arg_count - 1; i >= 0; i--)
         {
-            // note: sret (if present) is arg[0] and never a stack arg.
-            int explicit_index = i - (needs_sret ? 1 : 0);
-            AstNode    *arg_expr = args->items[explicit_index];
-            bool        byptr    = internal_agg_abi && arg_expr && type_is_large_aggregate(arg_expr->type, ctx->ptr_size);
-            MasmOperand arg_op   = byptr ? lower_byval_arg_ptr(masm, text, arg_expr, ctx) : lower_expr(masm, text, arg_expr, ctx);
+            if (!locs || locs[i].kind != CALL_ARG_STACK)
+            {
+                continue;
+            }
+
+            int explicit_index = i - arg_shift;
+            AstNode *arg_expr  = args ? args->items[explicit_index] : NULL;
+
+            bool byptr = internal_agg_abi && arg_expr && type_is_large_aggregate(arg_expr->type, ctx->ptr_size);
+            MasmOperand arg_op = byptr ? lower_byval_arg_ptr(masm, text, arg_expr, ctx) : lower_expr(masm, text, arg_expr, ctx);
             if (byptr && arg_op.kind == MASM_OPERAND_NONE)
             {
                 arg_op = lower_expr(masm, text, arg_expr, ctx);
             }
 
-            int         offset = (i - ctx->int_arg_count) * ctx->ptr_size;
-            MasmOperand dst    = masm_operand_memory_simple(ctx->sp_reg, offset, ctx->ptr_size);
+            int32_t disp = (int32_t)(locs[i].stack_slot * 8);
+            MasmOperand dst = masm_operand_memory_simple(ctx->sp_reg, disp, locs[i].size);
 
-            if (arg_op.kind == MASM_OPERAND_MEMORY)
+            if (locs[i].is_fp)
             {
-                MasmOperand tmp = isa_tmp(ctx, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, arg_op));
+                MasmOperand tmp = isa_result(ctx, locs[i].size);
+                materialize_bits_to_gpr(text, ctx, tmp, arg_op, locs[i].size);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp));
             }
             else
             {
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, arg_op));
+                if (arg_op.kind == MASM_OPERAND_MEMORY)
+                {
+                    MasmOperand tmp = isa_tmp(ctx, ctx->ptr_size);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, arg_op));
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp));
+                }
+                else
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, arg_op));
+                }
             }
         }
 
-        // register arguments: evaluate into scratch slots first to avoid clobbering
-        // already-prepared argument registers during nested arg evaluation.
-        int     reg_arg_count    = abi_arg_count < ctx->int_arg_count ? abi_arg_count : ctx->int_arg_count;
-        int32_t reg_scratch_base = 0;
-        if (reg_arg_count > 0)
+        int gp_used = gp_i;
+        int fp_used = fp_i;
+
+        int32_t gp_scratch_base = 0;
+        int32_t fp_scratch_base = 0;
+
+        if (gp_used > 0)
         {
-            ctx->stack_offset -= (int32_t)(reg_arg_count * ctx->ptr_size);
+            ctx->stack_offset -= (int32_t)(gp_used * ctx->ptr_size);
             int align = ctx->ptr_size ? ctx->ptr_size : 1;
             if (align > 1 && (abs(ctx->stack_offset) % align) != 0)
             {
                 ctx->stack_offset -= (align - (abs(ctx->stack_offset) % align));
             }
-            reg_scratch_base = ctx->stack_offset;
+            gp_scratch_base = ctx->stack_offset;
+        }
 
-            for (int i = 0; i < reg_arg_count; i++)
+        if (fp_used > 0)
+        {
+            ctx->stack_offset -= (int32_t)(fp_used * ctx->ptr_size);
+            int align = ctx->ptr_size ? ctx->ptr_size : 1;
+            if (align > 1 && (abs(ctx->stack_offset) % align) != 0)
             {
-                MasmOperand slot  = frame_mem(ctx, reg_scratch_base + (i * (int32_t)ctx->ptr_size), ctx->ptr_size);
+                ctx->stack_offset -= (align - (abs(ctx->stack_offset) % align));
+            }
+            fp_scratch_base = ctx->stack_offset;
+        }
+
+        // register arguments: stage into scratch slots first to avoid clobbering
+        // already-prepared argument registers during nested arg evaluation.
+        for (int i = 0; i < abi_arg_count; i++)
+        {
+            if (!locs)
+            {
+                break;
+            }
+
+            if (locs[i].kind == CALL_ARG_GP)
+            {
+                MasmOperand slot  = frame_mem(ctx, gp_scratch_base + (locs[i].gp_index * (int32_t)ctx->ptr_size), ctx->ptr_size);
                 MasmOperand tmp64 = isa_result(ctx, ctx->ptr_size);
 
                 if (needs_sret && i == 0)
@@ -1305,8 +1805,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                     continue;
                 }
 
-                int      explicit_index = i - (needs_sret ? 1 : 0);
-                AstNode *arg_expr       = args->items[explicit_index];
+                int      explicit_index = i - arg_shift;
+                AstNode *arg_expr       = args ? args->items[explicit_index] : NULL;
                 bool     byptr          = internal_agg_abi && arg_expr && type_is_large_aggregate(arg_expr->type, ctx->ptr_size);
                 MasmOperand arg_op      = byptr ? lower_byval_arg_ptr(masm, text, arg_expr, ctx) : lower_expr(masm, text, arg_expr, ctx);
                 if (byptr && arg_op.kind == MASM_OPERAND_NONE)
@@ -1344,21 +1844,45 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 }
                 else
                 {
-                    // unsupported operand kind; treat as none.
-                    return masm_operand_none();
+                    fprintf(stderr, "masm lower: unsupported operand kind in call arg\n");
+                    exit(1);
                 }
 
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, slot, tmp64));
             }
-
-            // load scratch values into the real ABI argument registers
-            for (int i = 0; i < reg_arg_count; i++)
+            else if (locs[i].kind == CALL_ARG_FP)
             {
-                uint32_t    reg = (i < ctx->abi->int_arg_count) ? ctx->abi->int_arg_regs[i] : UINT32_MAX;
-                MasmOperand dst = masm_operand_register(reg, ctx->ptr_size);
-                MasmOperand src = frame_mem(ctx, reg_scratch_base + (i * (int32_t)ctx->ptr_size), ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+                int      explicit_index = i - arg_shift;
+                AstNode *arg_expr       = args ? args->items[explicit_index] : NULL;
+                MasmOperand arg_op      = lower_expr(masm, text, arg_expr, ctx);
+
+                MasmOperand slot = frame_mem(ctx, fp_scratch_base + (locs[i].fp_index * (int32_t)ctx->ptr_size), locs[i].size);
+                MasmOperand tmp  = isa_result(ctx, locs[i].size);
+
+                materialize_bits_to_gpr(text, ctx, tmp, arg_op, locs[i].size);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, slot, tmp));
             }
+        }
+
+        // load staged gp args into the real ABI argument registers
+        for (int i = 0; i < gp_used; i++)
+        {
+            uint32_t reg = (i < ctx->abi->int_arg_count) ? ctx->abi->int_arg_regs[i] : UINT32_MAX;
+            MasmOperand dst = masm_operand_register(reg, ctx->ptr_size);
+            MasmOperand src = frame_mem(ctx, gp_scratch_base + (i * (int32_t)ctx->ptr_size), ctx->ptr_size);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+        }
+
+        // load staged fp args into xmm regs (via a non-arg scratch gpr)
+        for (int i = 0; i < fp_used; i++)
+        {
+            uint32_t xmm_id = (i < ctx->abi->float_arg_count) ? ctx->abi->float_arg_regs[i] : UINT32_MAX;
+            uint8_t  sz     = fp_reg_sizes[i] ? fp_reg_sizes[i] : 8;
+            MasmOperand xmm = masm_xmm(xmm_id);
+            MasmOperand src = frame_mem(ctx, fp_scratch_base + (i * (int32_t)ctx->ptr_size), sz);
+            MasmOperand tmp = masm_operand_register(MASM_X86_R11, sz);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src));
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, xmm, tmp));
         }
 
         // determine if callee is variadic (last param type sentinel NULL)
@@ -1380,31 +1904,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             }
         }
 
-        // for System V variadic calls, AL holds the number of XMM registers used (ISA role result low byte)
-        if (is_variadic)
-        {
-            int sse_args = 0;
-            if (args)
-            {
-                for (int i = 0; i < args->count && i < 8; i++)
-                {
-                    AstNode *arg = args->items[i];
-                    if (arg && arg->type && type_is_float(arg->type))
-                    {
-                        sse_args++;
-                    }
-                }
-            }
-
-            MasmOperand al = isa_result(ctx, 1);
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, al, masm_operand_imm(sse_args & 0xFF)));
-        }
-
         // emit call
         {
-            // Prefer direct calls when sema resolved a symbol, even if the AST isn't a plain ident.
-            // This covers method calls (`obj.method()`) where `func` is typically AST_EXPR_FIELD,
-            // as well as module-qualified calls.
             const char *call_name = NULL;
             Symbol     *call_sym2 = func ? func->symbol : NULL;
 
@@ -1423,6 +1924,16 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
             if (call_name)
             {
+                if (is_variadic)
+                {
+                    int xmm_used = fp_used;
+                    if (xmm_used > 8)
+                    {
+                        xmm_used = 8;
+                    }
+                    MasmOperand al = isa_result(ctx, 1);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, al, masm_operand_imm(xmm_used & 0xFF)));
+                }
                 masm_section_append_inst(text, masm_inst_1(MASM_OP_CALL, masm_operand_label(strdup(call_name))));
             }
             else
@@ -1430,12 +1941,22 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 // indirect call: evaluate function pointer expression
                 MasmOperand func_ptr = lower_expr(masm, text, func, ctx);
 
-                // ensure function pointer is in a register
                 if (func_ptr.kind != MASM_OPERAND_REGISTER)
                 {
                     MasmOperand r_res = isa_result(ctx, ctx->ptr_size);
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, r_res, func_ptr));
                     func_ptr = r_res;
+                }
+
+                if (is_variadic)
+                {
+                    int xmm_used = fp_used;
+                    if (xmm_used > 8)
+                    {
+                        xmm_used = 8;
+                    }
+                    MasmOperand al = isa_result(ctx, 1);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, al, masm_operand_imm(xmm_used & 0xFF)));
                 }
 
                 masm_section_append_inst(text, masm_inst_1(MASM_OP_CALL, func_ptr));
@@ -1450,10 +1971,24 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             masm_section_append_inst(text, masm_inst_2(MASM_OP_ADD, rsp, masm_operand_imm(total_cleanup)));
         }
 
+        if (locs)
+        {
+            free(locs);
+        }
+
         if (needs_sret)
         {
-            // return as a memory operand pointing at the start of the sret buffer.
             return frame_mem(ctx, sret_offset, ctx->ptr_size);
+        }
+
+        // materialize fp returns (xmm0) back into a gpr holding the raw bits
+        if (type_is_fp_class(ret_type) && ctx->abi->float_ret_count > 0)
+        {
+            uint8_t  rsz  = type_fp_size(ret_type);
+            uint32_t xmm0 = ctx->abi->float_ret_regs[0];
+            MasmOperand dst = isa_result(ctx, rsz);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, dst, masm_xmm(xmm0)));
+            return dst;
         }
 
         return isa_result(ctx, ctx->ptr_size);
@@ -1979,8 +2514,21 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         }
         else if (expr)
         {
-            MasmOperand op = lower_expr(masm, text, expr, ctx);
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, isa_result(ctx, ctx->ptr_size), op));
+            if (ctx->fn_ret_type && type_is_fp_class(ctx->fn_ret_type) && ctx->abi->float_ret_count > 0)
+            {
+                uint8_t     rsz  = type_fp_size(ctx->fn_ret_type);
+                MasmOperand val  = lower_expr(masm, text, expr, ctx);
+                MasmOperand bits = isa_result(ctx, rsz);
+                materialize_bits_to_gpr(text, ctx, bits, val, rsz);
+
+                uint32_t xmm0 = ctx->abi->float_ret_regs[0];
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, masm_xmm(xmm0), bits));
+            }
+            else
+            {
+                MasmOperand op = lower_expr(masm, text, expr, ctx);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, isa_result(ctx, ctx->ptr_size), op));
+            }
         }
 
         // run all deferred statements before returning
@@ -2870,9 +3418,40 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
         masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
     }
 
+    // detect and reserve register save area for variadic functions (non-entry)
+    if (!is_entry)
+    {
+        bool fn_is_variadic = false;
+        if (func_node->fun_stmt.is_variadic)
+        {
+            fn_is_variadic = true;
+        }
+        else if (fn_type && fn_type->kind == TYPE_FUNCTION && fn_type->function.param_count > 0 && fn_type->function.param_types[fn_type->function.param_count - 1] == NULL)
+        {
+            fn_is_variadic = true;
+        }
+
+        if (fn_is_variadic)
+        {
+            ctx->fn_is_variadic = true;
+            // allocate 176 bytes: 6 GP regs (48) + 8 XMM slots (128)
+            ctx->stack_offset -= (int32_t)176;
+            int align = ctx->stack_align ? ctx->stack_align : 16;
+            if (align > 1 && (abs(ctx->stack_offset) % align) != 0)
+            {
+                ctx->stack_offset -= (align - (abs(ctx->stack_offset) % align));
+            }
+            ctx->va_reg_save_off = ctx->stack_offset;
+        }
+    }
+
     // handle parameters (skip for _start)
     if (!is_entry && func_node->fun_stmt.params)
     {
+        int gp_i    = arg_shift;
+        int fp_i    = 0;
+        int stack_i = 0;
+
         AstList *params = func_node->fun_stmt.params;
         for (int i = 0; i < params->count; i++)
         {
@@ -2893,6 +3472,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
             }
 
             bool byval_ptr = type_is_large_aggregate(ptype, ctx->ptr_size);
+            bool is_fp     = !byval_ptr && type_is_fp_class(ptype);
 
             // allocate aligned stack space for the local parameter copy
             size_t alloc_size = param_size;
@@ -2909,21 +3489,39 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
             add_local_var(ctx, param->param_stmt.name, offset, (int)param_size);
 
             // load from ABI arg location
-            int arg_index = i + arg_shift;
-            if (!byval_ptr)
+            if (!byval_ptr && is_fp)
+            {
+                uint8_t     store_size = type_fp_size(ptype);
+                MasmOperand dst        = frame_mem(ctx, offset, store_size);
+
+                if (fp_i < ctx->float_arg_count)
+                {
+                    uint32_t xmm_id = ctx->abi->float_arg_regs[fp_i++];
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, dst, masm_xmm(xmm_id)));
+                }
+                else
+                {
+                    int32_t     stack_param_offset = (int32_t)(2 * ctx->ptr_size + (stack_i++ * ctx->ptr_size));
+                    MasmOperand src_mem            = frame_mem(ctx, stack_param_offset, store_size);
+                    MasmOperand tmp                = isa_result(ctx, store_size);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src_mem));
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp));
+                }
+            }
+            else if (!byval_ptr)
             {
                 uint8_t store_size = (uint8_t)(param_size > ctx->ptr_size ? ctx->ptr_size : param_size);
                 MasmOperand dst    = frame_mem(ctx, offset, store_size);
 
-                if (arg_index < ctx->int_arg_count)
+                if (gp_i < ctx->int_arg_count)
                 {
-                    uint32_t    reg = ctx->abi->int_arg_regs[arg_index];
+                    uint32_t    reg = ctx->abi->int_arg_regs[gp_i++];
                     MasmOperand src = masm_operand_register(reg, store_size);
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
                 }
                 else
                 {
-                    int32_t     stack_param_offset = (int32_t)(2 * ctx->ptr_size + (arg_index - ctx->int_arg_count) * ctx->ptr_size);
+                    int32_t     stack_param_offset = (int32_t)(2 * ctx->ptr_size + (stack_i++ * ctx->ptr_size));
                     MasmOperand src_mem            = frame_mem(ctx, stack_param_offset, ctx->ptr_size);
                     MasmOperand tmp                = isa_tmp(ctx, ctx->ptr_size);
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src_mem));
@@ -2935,9 +3533,10 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
             {
                 // large aggregate passed by pointer: copy into our local value slot
                 MasmOperand src_ptr = isa_result(ctx, ctx->ptr_size);
-                if (arg_index < ctx->int_arg_count)
+
+                if (gp_i < ctx->int_arg_count)
                 {
-                    uint32_t    reg = ctx->abi->int_arg_regs[arg_index];
+                    uint32_t    reg = ctx->abi->int_arg_regs[gp_i++];
                     MasmOperand src = masm_operand_register(reg, ctx->ptr_size);
                     if (src.reg.id != src_ptr.reg.id)
                     {
@@ -2946,7 +3545,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
                 }
                 else
                 {
-                    int32_t     stack_param_offset = (int32_t)(2 * ctx->ptr_size + (arg_index - ctx->int_arg_count) * ctx->ptr_size);
+                    int32_t     stack_param_offset = (int32_t)(2 * ctx->ptr_size + (stack_i++ * ctx->ptr_size));
                     MasmOperand src_mem            = frame_mem(ctx, stack_param_offset, ctx->ptr_size);
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, src_ptr, src_mem));
                 }
@@ -2975,8 +3574,36 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
                     off += chunk;
                 }
             }
+
+        }
+
+        // if variadic, record named counts and save register-save area
+        if (ctx->fn_is_variadic)
+        {
+            ctx->va_named_gp = gp_i - arg_shift;
+            ctx->va_named_fp = fp_i;
+            ctx->va_named_stack_slots = stack_i;
+
+            // save GP regs (RDI, RSI, RDX, RCX, R8, R9) into reg_save_area offsets 0,8,16,24,32,40
+            for (int i = 0; i < 6; i++)
+            {
+                int32_t off = ctx->va_reg_save_off + (i * ctx->ptr_size);
+                MasmOperand dst = frame_mem(ctx, off, ctx->ptr_size);
+                MasmOperand src = masm_operand_register(ctx->abi->int_arg_regs[i], ctx->ptr_size);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+            }
+
+            // save low 8 bytes of XMM0..XMM7 into offsets 48 + 16*i
+            for (int i = 0; i < 8; i++)
+            {
+                int32_t off = ctx->va_reg_save_off + (48 + i * 16);
+                MasmOperand dst = frame_mem(ctx, off, 8);
+                uint32_t xmmid = ctx->abi->float_arg_regs[i];
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, dst, masm_xmm(xmmid)));
+            }
         }
     }
+
 
     if (func_node->fun_stmt.body)
     {

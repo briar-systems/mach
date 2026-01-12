@@ -7,6 +7,8 @@
 static Type primitive_types[11] = {0};
 static bool types_initialized   = false;
 
+static Type *builtin_va_list_type = NULL;
+
 static void init_primitive_types()
 {
     if (types_initialized)
@@ -147,6 +149,38 @@ Type *type_create_struct(const char *name, TypeField *fields, int field_count)
     type->alignment = alignment;
 
     return type;
+}
+
+Type *type_get_builtin_va_list(void)
+{
+    if (builtin_va_list_type)
+    {
+        return builtin_va_list_type;
+    }
+
+    // NOTE: keep this in sync with the SysV x86_64 va_list implementation in the backend.
+    // note: field names are for diagnostics only.
+    TypeField *fields = calloc(4, sizeof(TypeField));
+    if (!fields)
+    {
+        return NULL;
+    }
+
+    fields[0].name = strdup("gp_offset");
+    fields[0].type = type_get_primitive(TYPE_U32);
+
+    fields[1].name = strdup("fp_offset");
+    fields[1].type = type_get_primitive(TYPE_U32);
+
+    fields[2].name = strdup("overflow_arg_area");
+    fields[2].type = type_get_primitive(TYPE_PTR);
+
+    fields[3].name = strdup("reg_save_area");
+    fields[3].type = type_get_primitive(TYPE_PTR);
+
+    // ignore strdup failures; type_create_struct will still compute layout.
+    builtin_va_list_type = type_create_struct("va_list", fields, 4);
+    return builtin_va_list_type;
 }
 
 bool type_equals(Type *a, Type *b)
@@ -350,6 +384,7 @@ Type *type_create_generic_param(const char *name)
 
     return type;
 }
+
 
 bool type_is_integer(Type *t)
 {
