@@ -42,7 +42,7 @@ Because IDs are user-chosen (there is no global registry), you are responsible f
 ### Dependency modules
 
 Each dependency is declared under `[deps.<alias>]` (see [config.md](config.md#depsalias-sections)).
-The alias is only a user-facing handle used by tools like `mach dep list` and by source imports (`use std.io.console;`).
+The alias is only a user-facing handle used by tools like `mach dep list` and by source imports (`use std.print;`).
 When the loader processes an import it:
 
 1. Looks up the alias in the dependency table.

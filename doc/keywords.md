@@ -54,7 +54,7 @@ It allows for an alias to be specified which can be used to "contain" the import
 ```mach
 use std.types.bool;
 
-use console: std.io.console;
+use print: std.print;
 ```
 
 

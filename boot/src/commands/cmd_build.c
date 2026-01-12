@@ -36,7 +36,7 @@ void cmd_build_help(FILE *stream)
     fprintf(stream, "options:\n");
     fprintf(stream, "  --target <name>      select target from mach.toml (required for projects)\n");
     fprintf(stream, "  -o <file>            output file (executable or object)\n");
-    fprintf(stream, "  -m <path>            set module path (e.g. 'std.io')\n");
+    fprintf(stream, "  -m <path>            set module path (e.g. 'std.print')\n");
     fprintf(stream, "  -I n=dir             map module prefix 'n' to base directory 'dir'\n");
 }
 
@@ -382,7 +382,7 @@ int cmd_build_handle(int argc, char **argv)
     free(project_id);
     free(src_root);
     free(dep_root);
-    
+
     // NOTE: config must stay alive until sema is destroyed, as sema holds pointers to dep configs
 
     // set file context for error reporting
@@ -392,14 +392,14 @@ int cmd_build_handle(int argc, char **argv)
     {
         sema_print_errors(sema);
         sema_destroy(sema);
-        
+
         // clean up config after sema is destroyed
         if (config)
         {
             config_dnit(config);
             free(config);
         }
-        
+
         parser_dnit(&parser);
         lexer_dnit(&lexer);
         free(source);
@@ -412,14 +412,14 @@ int cmd_build_handle(int argc, char **argv)
     {
         fprintf(stderr, "error: lowering to MASM failed\n");
         sema_destroy(sema);
-        
+
         // clean up config after sema is destroyed
         if (config)
         {
             config_dnit(config);
             free(config);
         }
-        
+
         parser_dnit(&parser);
         lexer_dnit(&lexer);
         free(source);
@@ -552,14 +552,14 @@ int cmd_build_handle(int argc, char **argv)
     // cleanup
     masm_destroy(masm);
     sema_destroy(sema);
-    
+
     // clean up config after sema is destroyed
     if (config)
     {
         config_dnit(config);
         free(config);
     }
-    
+
     parser_dnit(&parser);
     lexer_dnit(&lexer);
     free(source);

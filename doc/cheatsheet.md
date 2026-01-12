@@ -98,7 +98,7 @@ mach.toml                # project.id = "myapp"
 
 ```mach
 # aliased import
-use console: std.io.console;
+use print: std.print;
 
 val answer:  i32 = 42; # immutable binding
 var counter: i32 = 0;  # mutable binding
@@ -203,12 +203,13 @@ With that in place, a simple "Hello, World!" program looks like this:
 
 ```mach
 use          std.system.runtime;
-use          std.types.list;
-use console: std.io.console;
+use          std.types.string;
+use          std.collections.slice;
+use print:   std.print;
 
 $main.symbol = "main";
-fun main(args: list.List[str]) i64 {
-    console.print("Hello, World!\n");
+fun main(args: Slice[str]) i64 {
+    print.println("Hello, World!");
     ret 0;
 }
 ```

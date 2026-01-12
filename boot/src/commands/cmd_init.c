@@ -9,37 +9,37 @@
 static const char *template_main_mach = "use          std.system.runtime;\n"
                                         "use          std.types.string;\n"
                                         "use          std.collections.slice;\n"
-                                        "use console: std.io.console;\n"
+                                        "use print:   std.print;\n"
                                         "\n"
                                         "$main.symbol = \"main\";\n"
                                         "fun main(args: Slice[str]) i64 {\n"
-                                        "    console.print(\"Hello, World!\\n\");\n"
+                                        "    print.println(\"Hello, World!\");\n"
                                         "    ret 0;\n"
                                         "}\n";
 
 // note: update this to match config convention if and when it changes
 static const char *template_mach_toml = "[project]\n"
-                                 "id      = \"%s\"\n"
-                                 "name    = \"%s\"\n"
-                                 "version = \"0.1.0\"\n"
-                                 "dir_src = \"src\"\n"
-                                 "dir_out = \"out\"\n"
-                                 "dir_dep = \"dep\"\n"
-                                 "target  = \"native\"\n"
-                                 "\n"
-                                 "[targets.linux]\n"
-                                 "os         = \"linux\"\n"
-                                 "isa        = \"x86_64\"\n"
-                                 "abi        = \"sysv64\"\n"
-                                 "mode       = \"executable\"\n"
-                                 "entrypoint = \"main.mach\"\n"
-                                 "artifacts  = \"linux\"\n"
-                                 "binary     = \"linux/bin/%s\"\n"
-                                 "\n"
-                                 "[deps.mach-std]\n"
-                                 "type    = \"remote\"\n"
-                                 "path    = \"https://github.com/octalide/mach-std\"\n"
-                                 "version = \"branch/main\"\n";
+                                        "id      = \"%s\"\n"
+                                        "name    = \"%s\"\n"
+                                        "version = \"0.1.0\"\n"
+                                        "dir_src = \"src\"\n"
+                                        "dir_out = \"out\"\n"
+                                        "dir_dep = \"dep\"\n"
+                                        "target  = \"native\"\n"
+                                        "\n"
+                                        "[targets.linux]\n"
+                                        "os         = \"linux\"\n"
+                                        "isa        = \"x86_64\"\n"
+                                        "abi        = \"sysv64\"\n"
+                                        "mode       = \"executable\"\n"
+                                        "entrypoint = \"main.mach\"\n"
+                                        "artifacts  = \"linux\"\n"
+                                        "binary     = \"linux/bin/%s\"\n"
+                                        "\n"
+                                        "[deps.mach-std]\n"
+                                        "type    = \"remote\"\n"
+                                        "path    = \"https://github.com/octalide/mach-std\"\n"
+                                        "version = \"branch/main\"\n";
 
 void cmd_init_help(FILE *stream)
 {
@@ -173,8 +173,8 @@ int cmd_init_handle(int argc, char **argv)
     // initialize mach-std dependency
     printf("initializing mach-std dependency...\n");
     const char *mach_std_path = "dep/mach-std";
-    const char *mach_std_url = "https://github.com/octalide/mach-std";
-    
+    const char *mach_std_url  = "https://github.com/octalide/mach-std";
+
     if (!git_submodule_init(mach_std_path, mach_std_url))
     {
         fprintf(stderr, "warning: failed to initialize mach-std submodule\n");
