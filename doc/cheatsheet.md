@@ -67,7 +67,7 @@ mach.toml                # project.id = "myapp"
 | `for`   | `for [(<condition>)] { <body> }`                                                                                                                         | Loop construct                         |
 | `cnt`   | `cnt;`                                                                                                                                                   | Continue to the next iteration         |
 | `brk`   | `brk;`                                                                                                                                                   | Break out of a loop                    |
-| `asm`   | `asm { <assembly-instructions> }`                                                                                                                        | Inline assembly                        |
+| `masm`   | `masm { <assembly-instructions> }`                                                                                                                        | Inline masm (limited dialect)                        |
 
 
 ## Builtin Types
