@@ -135,7 +135,7 @@ $(IMACH): $(CMACH)
 	@echo "  cleaning artifacts for imach build"
 	@rm -rf $(OUT_DIR)/imach
 	@echo "  cmach -> imach"
-	@$(CMACH) build .
+	@$(CMACH) build . -o out/linux/bin/imach
 	@echo "intermediary compiler ready: $@"
 
 # final compiler build (using imach)
