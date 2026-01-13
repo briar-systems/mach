@@ -24,8 +24,8 @@ typedef struct ModuleImport
 
 typedef struct ModuleAlias
 {
-    char              *alias;
-    SemaModule        *module;
+    char               *alias;
+    SemaModule         *module;
     struct ModuleAlias *next;
 } ModuleAlias;
 
@@ -33,14 +33,14 @@ typedef struct ModuleAlias
 // each module has its own global symbol table.
 struct SemaModule
 {
-    char       *module_path; // fully qualified module path
-    char       *source;      // source text (kept for error reporting)
-    char       *file_path;   // file path for error messages
-    AstNode    *ast;         // parsed AST
-    SymbolTable *table;      // module-level global symbol table
+    char        *module_path; // fully qualified module path
+    char        *source;      // source text (kept for error reporting)
+    char        *file_path;   // file path for error messages
+    AstNode     *ast;         // parsed AST
+    SymbolTable *table;       // module-level global symbol table
 
-    ModuleImport *imports;   // unaliased `use module.path;` imports
-    ModuleAlias  *aliases;   // aliased `use a: module.path;` imports
+    ModuleImport *imports; // unaliased `use module.path;` imports
+    ModuleAlias  *aliases; // aliased `use a: module.path;` imports
 
     struct SemaModule *next;
 };
@@ -66,11 +66,11 @@ typedef struct SemaError
 struct Sema
 {
     // module state
-    SemaModule  *modules;        // loaded modules (including entry module)
-    SemaModule  *main_module;    // entry module
-    SemaModule  *current_module; // module currently being analyzed
+    SemaModule *modules;        // loaded modules (including entry module)
+    SemaModule *main_module;    // entry module
+    SemaModule *current_module; // module currently being analyzed
 
-    SymbolTable *root_table;      // used only for nested scopes that are not module globals (kept for compatibility)
+    SymbolTable *root_table; // used only for nested scopes that are not module globals (kept for compatibility)
     SymbolTable *current_table;
     int          error_count;
     const char  *module_path; // borrowed from current_module->module_path
@@ -87,11 +87,11 @@ struct Sema
     char *current_source;
 
     // module resolution
-    char         *project_id;     // project id (module prefix)
-    char         *src_root;       // source directory path
-    char         *dep_root;       // dependencies directory path
-    ConfigDep   **deps;           // dependencies for module resolution
-    int           dep_count;      // number of dependencies
+    char       *project_id; // project id (module prefix)
+    char       *src_root;   // source directory path
+    char       *dep_root;   // dependencies directory path
+    ConfigDep **deps;       // dependencies for module resolution
+    int         dep_count;  // number of dependencies
     // modules are tracked in `modules`
 
     // extra module roots (for single-file mode)
@@ -138,30 +138,29 @@ Sema *sema_create(const char *module_path)
         return NULL;
     }
 
-    sema->modules                    = NULL;
-    sema->main_module                = NULL;
-    sema->current_module             = NULL;
+    sema->modules        = NULL;
+    sema->main_module    = NULL;
+    sema->current_module = NULL;
 
-    sema->root_table                 = NULL;
-    sema->current_table              = NULL;
-    sema->error_count                = 0;
-    sema->module_path                = NULL;
-    sema->errors                     = NULL;
-    sema->errors_count               = 0;
-    sema->errors_capacity            = 0;
-    sema->current_file_path          = NULL;
-    sema->current_source             = NULL;
-    sema->project_id                 = NULL;
-    sema->src_root                   = NULL;
-    sema->dep_root                   = NULL;
-    sema->deps                       = NULL;
-    sema->dep_count                  = 0;
+    sema->root_table                   = NULL;
+    sema->current_table                = NULL;
+    sema->error_count                  = 0;
+    sema->module_path                  = NULL;
+    sema->errors                       = NULL;
+    sema->errors_count                 = 0;
+    sema->errors_capacity              = 0;
+    sema->current_file_path            = NULL;
+    sema->current_source               = NULL;
+    sema->project_id                   = NULL;
+    sema->src_root                     = NULL;
+    sema->dep_root                     = NULL;
+    sema->deps                         = NULL;
+    sema->dep_count                    = 0;
     sema->current_function_return_type = NULL;
     sema->current_function_is_variadic = false;
-    sema->extra_roots                = NULL;
-    sema->extra_root_count           = 0;
-    sema->extra_root_capacity        = 0;
-
+    sema->extra_roots                  = NULL;
+    sema->extra_root_count             = 0;
+    sema->extra_root_capacity          = 0;
 
     // create entry module
     SemaModule *main_mod = calloc(1, sizeof(SemaModule));
@@ -315,7 +314,7 @@ void sema_add_module_root(Sema *sema, const char *module_prefix, const char *src
 
     if (sema->extra_root_count >= sema->extra_root_capacity)
     {
-        int new_cap = sema->extra_root_capacity ? sema->extra_root_capacity * 2 : 4;
+        int         new_cap   = sema->extra_root_capacity ? sema->extra_root_capacity * 2 : 4;
         ModuleRoot *new_roots = realloc(sema->extra_roots, sizeof(ModuleRoot) * new_cap);
         if (!new_roots)
         {
@@ -326,8 +325,8 @@ void sema_add_module_root(Sema *sema, const char *module_prefix, const char *src
     }
 
     ModuleRoot *mr = &sema->extra_roots[sema->extra_root_count++];
-    mr->prefix      = strdup(module_prefix);
-    mr->src_root    = strdup(src_root);
+    mr->prefix     = strdup(module_prefix);
+    mr->src_root   = strdup(src_root);
 }
 
 void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_root, const char *dep_root, ConfigDep **deps, int dep_count)
@@ -357,7 +356,7 @@ void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_r
     sema->project_id = project_id ? strdup(project_id) : NULL;
     sema->src_root   = src_root ? strdup(src_root) : NULL;
     sema->dep_root   = dep_root ? strdup(dep_root) : NULL;
-    
+
     // make deep copies of dependencies (they will be freed by Config before sema is destroyed)
     if (deps && dep_count > 0)
     {
@@ -372,7 +371,7 @@ void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_r
                     dep_copy->name    = deps[i]->name ? strdup(deps[i]->name) : NULL;
                     dep_copy->type    = deps[i]->type;
                     dep_copy->path    = deps[i]->path ? strdup(deps[i]->path) : NULL;
-                    dep_copy->version = NULL;           // we don't need version info for module resolution
+                    dep_copy->version = NULL;            // we don't need version info for module resolution
                     dep_copy->config  = deps[i]->config; // share the config pointer (not owned by sema)
                 }
                 else
@@ -390,7 +389,7 @@ void sema_set_module_roots(Sema *sema, const char *project_id, const char *src_r
     }
     else
     {
-        sema->deps = NULL;
+        sema->deps      = NULL;
         sema->dep_count = 0;
     }
 }
@@ -451,8 +450,8 @@ int sema_get_loaded_modules(Sema *sema, SemaLoadedModule *modules, int max_count
         return 0;
     }
 
-    int        count = 0;
-    SemaModule *mod  = sema->modules;
+    int         count = 0;
+    SemaModule *mod   = sema->modules;
     while (mod && count < max_count)
     {
         if (mod != sema->main_module)
@@ -601,7 +600,8 @@ static void sema_error(Sema *sema, Token *token, const char *message)
 
     if (sema_trace_enabled())
     {
-        fprintf(stderr, "[sema] error: module=%s file=%s pos=%d len=%d msg=%s\n",
+        fprintf(stderr,
+                "[sema] error: module=%s file=%s pos=%d len=%d msg=%s\n",
                 sema->module_path ? sema->module_path : "(null)",
                 sema->current_file_path ? sema->current_file_path : "(null)",
                 token ? token->pos : -1,
@@ -614,8 +614,8 @@ static void sema_error(Sema *sema, Token *token, const char *message)
 }
 
 // forward declarations for mutual recursion
-static int   sema_analyze_stmt(Sema *sema, AstNode *node);
-static int   sema_analyze_expr(Sema *sema, AstNode *node);
+static int sema_analyze_stmt(Sema *sema, AstNode *node);
+static int sema_analyze_expr(Sema *sema, AstNode *node);
 
 // helpers for numeric literal inference
 static bool sema_try_infer_numeric_literal(AstNode *node, Type *target);
@@ -915,9 +915,9 @@ static bool sema_expr_is_mutable_lvalue(Sema *sema, AstNode *node)
         return false;
     }
 }
-static int   sema_collect_symbols(Sema *sema, AstNode *node);
-static int   sema_analyze_use(Sema *sema, AstNode *node);
-static void  sema_maybe_analyze_symbol_decl_in_module(Sema *sema, SemaModule *mod, Symbol *sym);
+static int  sema_collect_symbols(Sema *sema, AstNode *node);
+static int  sema_analyze_use(Sema *sema, AstNode *node);
+static void sema_maybe_analyze_symbol_decl_in_module(Sema *sema, SemaModule *mod, Symbol *sym);
 
 // collect symbols from a statement (first pass - no body analysis)
 static int sema_collect_fun_symbol(Sema *sema, AstNode *node)
@@ -1379,7 +1379,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
     if (fixed_count > 0 || node->fun_stmt.is_variadic)
     {
         int alloc_count = fixed_count + (node->fun_stmt.is_variadic ? 1 : 0);
-        param_types = malloc(sizeof(Type *) * alloc_count);
+        param_types     = malloc(sizeof(Type *) * alloc_count);
         if (!param_types)
         {
             return -1;
@@ -1415,7 +1415,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         if (node->fun_stmt.is_variadic)
         {
             param_types[fixed_count] = NULL; // sentinel for variadic
-            param_count = alloc_count;
+            param_count              = alloc_count;
         }
         else
         {
@@ -1432,10 +1432,10 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
         SymbolTable *prev_table = sema->current_table;
         sema->current_table     = symbol_table_create(prev_table);
 
-        Type *prev_return_type               = sema->current_function_return_type;
-        bool   prev_is_variadic              = sema->current_function_is_variadic;
-        sema->current_function_return_type  = sym->type ? sym->type->function.return_type : NULL;
-        sema->current_function_is_variadic  = node->fun_stmt.is_variadic;
+        Type *prev_return_type             = sema->current_function_return_type;
+        bool  prev_is_variadic             = sema->current_function_is_variadic;
+        sema->current_function_return_type = sym->type ? sym->type->function.return_type : NULL;
+        sema->current_function_is_variadic = node->fun_stmt.is_variadic;
 
         // add parameters to scope
         if (node->fun_stmt.params)
@@ -1457,7 +1457,7 @@ static int sema_analyze_fun(Sema *sema, AstNode *node)
 
         sema_analyze_stmt(sema, node->fun_stmt.body);
 
-        sema->current_table = prev_table;
+        sema->current_table                = prev_table;
         sema->current_function_return_type = prev_return_type;
         sema->current_function_is_variadic = prev_is_variadic;
     }
@@ -1584,17 +1584,50 @@ static AstNode *sema_type_node_from_type(Type *t)
 
     switch (t->kind)
     {
-    case TYPE_I8:  node->kind = AST_TYPE_NAME; node->type_name.name = strdup("i8");  break;
-    case TYPE_I16: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("i16"); break;
-    case TYPE_I32: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("i32"); break;
-    case TYPE_I64: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("i64"); break;
-    case TYPE_U8:  node->kind = AST_TYPE_NAME; node->type_name.name = strdup("u8");  break;
-    case TYPE_U16: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("u16"); break;
-    case TYPE_U32: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("u32"); break;
-    case TYPE_U64: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("u64"); break;
-    case TYPE_F32: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("f32"); break;
-    case TYPE_F64: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("f64"); break;
-    case TYPE_PTR: node->kind = AST_TYPE_NAME; node->type_name.name = strdup("ptr"); break;
+    case TYPE_I8:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("i8");
+        break;
+    case TYPE_I16:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("i16");
+        break;
+    case TYPE_I32:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("i32");
+        break;
+    case TYPE_I64:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("i64");
+        break;
+    case TYPE_U8:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("u8");
+        break;
+    case TYPE_U16:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("u16");
+        break;
+    case TYPE_U32:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("u32");
+        break;
+    case TYPE_U64:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("u64");
+        break;
+    case TYPE_F32:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("f32");
+        break;
+    case TYPE_F64:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("f64");
+        break;
+    case TYPE_PTR:
+        node->kind           = AST_TYPE_NAME;
+        node->type_name.name = strdup("ptr");
+        break;
 
     case TYPE_POINTER:
     {
@@ -1604,21 +1637,21 @@ static AstNode *sema_type_node_from_type(Type *t)
             free(node);
             return NULL;
         }
-        node->kind = AST_TYPE_PTR;
-        node->type_ptr.base = base;
+        node->kind                  = AST_TYPE_PTR;
+        node->type_ptr.base         = base;
         node->type_ptr.is_read_only = t->pointer.is_const;
         break;
     }
 
     case TYPE_STRUCT:
     {
-        node->kind = AST_TYPE_NAME;
+        node->kind           = AST_TYPE_NAME;
         node->type_name.name = strdup(t->structure.name ? t->structure.name : "");
         break;
     }
     case TYPE_UNION:
     {
-        node->kind = AST_TYPE_NAME;
+        node->kind           = AST_TYPE_NAME;
         node->type_name.name = strdup(t->union_type.name ? t->union_type.name : "");
         break;
     }
@@ -1726,6 +1759,104 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
 
     sym->type  = rec_type;
     node->type = rec_type;
+
+    return 0;
+}
+
+static int sema_analyze_uni(Sema *sema, AstNode *node)
+{
+    if (node->kind != AST_STMT_UNI)
+    {
+        return -1;
+    }
+
+    // get symbol from collection pass (or create if not collected)
+    Symbol *sym = node->symbol;
+    if (!sym)
+    {
+        sym = symbol_table_lookup_local(sema->current_table, node->uni_stmt.name);
+        if (!sym)
+        {
+            sym = symbol_create(node->uni_stmt.name, SYMBOL_TYPE, sema->module_path);
+            if (!sym)
+            {
+                return -1;
+            }
+            sym->is_public = node->uni_stmt.is_public;
+            sym->decl      = node;
+
+            if (symbol_table_insert(sema->current_table, sym) < 0)
+            {
+                sema_error(sema, node->token, "duplicate type definition");
+                symbol_destroy(sym);
+                return -1;
+            }
+        }
+        node->symbol = sym;
+    }
+
+    // check for generics - if present, defer field resolution until instantiation
+    if (node->uni_stmt.generics && node->uni_stmt.generics->count > 0)
+    {
+        sym->is_generic = true;
+        return 0;
+    }
+
+    // process fields for non-generic unions
+    int        field_count = node->uni_stmt.fields ? node->uni_stmt.fields->count : 0;
+    TypeField *fields      = NULL;
+
+    if (field_count > 0)
+    {
+        fields = malloc(sizeof(TypeField) * field_count);
+        if (!fields)
+        {
+            return -1;
+        }
+
+        for (int i = 0; i < field_count; i++)
+        {
+            AstNode *field_node = node->uni_stmt.fields->items[i];
+            if (field_node->kind != AST_STMT_FIELD)
+            {
+                free(fields);
+                return -1;
+            }
+
+            fields[i].name   = strdup(field_node->field_stmt.name);
+            fields[i].type   = sema_resolve_type(sema, field_node->field_stmt.type);
+            fields[i].offset = 0; // unused for unions
+
+            if (!fields[i].type)
+            {
+                sema_error(sema, field_node->token, "failed to resolve field type");
+                for (int j = 0; j <= i; j++)
+                {
+                    free(fields[j].name);
+                }
+                free(fields);
+                return -1;
+            }
+        }
+    }
+
+    // create union type
+    Type *uni_type = type_create_union(node->uni_stmt.name, fields, field_count);
+    if (!uni_type)
+    {
+        if (fields)
+        {
+            for (int i = 0; i < field_count; i++)
+            {
+                free(fields[i].name);
+            }
+            free(fields);
+        }
+        return -1;
+    }
+
+    sym->type  = uni_type;
+    node->type = uni_type;
 
     return 0;
 }
@@ -2041,24 +2172,24 @@ static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
     return sema_analyze_expr(sema, inner);
 }
 
-    // check if a module has already been loaded
-    static SemaModule *sema_find_module(Sema *sema, const char *module_path)
+// check if a module has already been loaded
+static SemaModule *sema_find_module(Sema *sema, const char *module_path)
+{
+    if (!sema || !module_path)
     {
-        if (!sema || !module_path)
-        {
-            return NULL;
-        }
-
-        for (SemaModule *mod = sema->modules; mod; mod = mod->next)
-        {
-            if (mod->module_path && strcmp(mod->module_path, module_path) == 0)
-            {
-                return mod;
-            }
-        }
-
         return NULL;
     }
+
+    for (SemaModule *mod = sema->modules; mod; mod = mod->next)
+    {
+        if (mod->module_path && strcmp(mod->module_path, module_path) == 0)
+        {
+            return mod;
+        }
+    }
+
+    return NULL;
+}
 
 // resolve a module path to a filesystem path
 // returns NULL if the module cannot be found
@@ -2357,7 +2488,7 @@ static int sema_analyze_use(Sema *sema, AstNode *node)
 
     const char *module_path = node->use_stmt.module_path;
     const char *alias       = node->use_stmt.alias;
-    
+
     // check for NULL module_path
     if (!module_path)
     {
@@ -2394,9 +2525,9 @@ static int sema_analyze_use(Sema *sema, AstNode *node)
         {
             return 0;
         }
-        al->alias  = strdup(alias);
-        al->module = module;
-        al->next   = sema->current_module->aliases;
+        al->alias                     = strdup(alias);
+        al->module                    = module;
+        al->next                      = sema->current_module->aliases;
         sema->current_module->aliases = al;
         return 0;
     }
@@ -2406,8 +2537,8 @@ static int sema_analyze_use(Sema *sema, AstNode *node)
     {
         return 0;
     }
-    imp->module = module;
-    imp->next   = sema->current_module->imports;
+    imp->module                   = module;
+    imp->next                     = sema->current_module->imports;
     sema->current_module->imports = imp;
 
     return 0;
@@ -2472,6 +2603,9 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
 
     case AST_STMT_REC:
         return sema_analyze_rec(sema, node);
+
+    case AST_STMT_UNI:
+        return sema_analyze_uni(sema, node);
 
     case AST_STMT_FUN:
         return sema_analyze_fun(sema, node);
@@ -2756,20 +2890,20 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
             if (sema_analyze_stmt(sema, sym->decl) < 0)
             {
-                sema->current_module    = saved_module;
-                sema->current_table     = saved_table;
-                sema->module_path       = saved_module_path;
-                sema->current_file_path = saved_file_path;
-                sema->current_source    = saved_source;
+                sema->current_module               = saved_module;
+                sema->current_table                = saved_table;
+                sema->module_path                  = saved_module_path;
+                sema->current_file_path            = saved_file_path;
+                sema->current_source               = saved_source;
                 sema->current_function_return_type = saved_return_type;
                 return -1;
             }
 
-            sema->current_module    = saved_module;
-            sema->current_table     = saved_table;
-            sema->module_path       = saved_module_path;
-            sema->current_file_path = saved_file_path;
-            sema->current_source    = saved_source;
+            sema->current_module               = saved_module;
+            sema->current_table                = saved_table;
+            sema->module_path                  = saved_module_path;
+            sema->current_file_path            = saved_file_path;
+            sema->current_source               = saved_source;
             sema->current_function_return_type = saved_return_type;
         }
 
@@ -2871,7 +3005,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
 
             bool is_const = !sema_expr_is_mutable_lvalue(sema, operand);
-            node->type = type_create_pointer(operand->type, is_const);
+            node->type    = type_create_pointer(operand->type, is_const);
         }
         else if (node->unary_expr.op == TOKEN_AT)
         {
@@ -2905,8 +3039,8 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         // va_end(*va_list)
         if (node->call_expr.func && node->call_expr.func->kind == AST_EXPR_IDENT)
         {
-            const char *bname = node->call_expr.func->ident_expr.name;
-            bool is_varargs_builtin = bname && (!strcmp(bname, "va_start") || !strcmp(bname, "va_end") || !strcmp(bname, "va_arg"));
+            const char *bname              = node->call_expr.func->ident_expr.name;
+            bool        is_varargs_builtin = bname && (!strcmp(bname, "va_start") || !strcmp(bname, "va_end") || !strcmp(bname, "va_arg"));
             if (is_varargs_builtin)
             {
                 // analyze arguments (callee need not resolve to a symbol)
@@ -3186,20 +3320,20 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
                         if (sema_analyze_stmt(sema, sym->decl) < 0)
                         {
-                            sema->current_module    = saved_module;
-                            sema->current_table     = saved_table;
-                            sema->module_path       = saved_module_path;
-                            sema->current_file_path = saved_file_path;
-                            sema->current_source    = saved_source;
+                            sema->current_module               = saved_module;
+                            sema->current_table                = saved_table;
+                            sema->module_path                  = saved_module_path;
+                            sema->current_file_path            = saved_file_path;
+                            sema->current_source               = saved_source;
                             sema->current_function_return_type = saved_return_type;
                             return -1;
                         }
 
-                        sema->current_module    = saved_module;
-                        sema->current_table     = saved_table;
-                        sema->module_path       = saved_module_path;
-                        sema->current_file_path = saved_file_path;
-                        sema->current_source    = saved_source;
+                        sema->current_module               = saved_module;
+                        sema->current_table                = saved_table;
+                        sema->module_path                  = saved_module_path;
+                        sema->current_file_path            = saved_file_path;
+                        sema->current_source               = saved_source;
                         sema->current_function_return_type = saved_return_type;
                     }
 
@@ -3291,16 +3425,16 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                     recv_type = recv_type->pointer.base;
                 }
 
-                Type **args = NULL;
+                Type **args      = NULL;
                 int    arg_count = 0;
                 if (recv_type && recv_type->kind == TYPE_STRUCT)
                 {
-                    args = recv_type->structure.generic_args;
+                    args      = recv_type->structure.generic_args;
                     arg_count = recv_type->structure.generic_arg_count;
                 }
                 else if (recv_type && recv_type->kind == TYPE_UNION)
                 {
-                    args = recv_type->union_type.generic_args;
+                    args      = recv_type->union_type.generic_args;
                     arg_count = recv_type->union_type.generic_arg_count;
                 }
 
@@ -3956,8 +4090,8 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 }
 
                 const char *field_name = field_expr->field_expr.field;
-                TypeField  *fields = (t->kind == TYPE_STRUCT) ? t->structure.fields : t->union_type.fields;
-                int         count  = (t->kind == TYPE_STRUCT) ? t->structure.field_count : t->union_type.field_count;
+                TypeField  *fields     = (t->kind == TYPE_STRUCT) ? t->structure.fields : t->union_type.fields;
+                int         count      = (t->kind == TYPE_STRUCT) ? t->structure.field_count : t->union_type.field_count;
 
                 for (int i = 0; i < count; i++)
                 {
@@ -4078,11 +4212,11 @@ static void sema_maybe_analyze_symbol_decl_in_module(Sema *sema, SemaModule *mod
 
     (void)sema_analyze_stmt(sema, sym->decl);
 
-    sema->current_module    = saved_module;
-    sema->current_table     = saved_table;
-    sema->module_path       = saved_module_path;
-    sema->current_file_path = saved_file_path;
-    sema->current_source    = saved_source;
+    sema->current_module               = saved_module;
+    sema->current_table                = saved_table;
+    sema->module_path                  = saved_module_path;
+    sema->current_file_path            = saved_file_path;
+    sema->current_source               = saved_source;
     sema->current_function_return_type = saved_return_type;
 }
 
@@ -4302,7 +4436,7 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
 
     case AST_TYPE_FUN:
     {
-        Type  *ret_type   = NULL;
+        Type  *ret_type    = NULL;
         Type **param_types = NULL;
         int    param_count = 0;
 
@@ -4319,7 +4453,7 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
         if (fixed_count > 0 || type_node->type_fun.is_variadic)
         {
             int alloc_count = fixed_count + (type_node->type_fun.is_variadic ? 1 : 0);
-            param_types = malloc(sizeof(Type *) * alloc_count);
+            param_types     = malloc(sizeof(Type *) * alloc_count);
             if (!param_types)
             {
                 return NULL;
@@ -4340,7 +4474,7 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
             if (type_node->type_fun.is_variadic)
             {
                 param_types[fixed_count] = NULL; // sentinel
-                param_count = alloc_count;
+                param_count              = alloc_count;
             }
             else
             {
@@ -4354,7 +4488,7 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
     case AST_TYPE_REC:
     case AST_TYPE_UNI:
     {
-        AstList *fields_ast = (type_node->kind == AST_TYPE_REC) ? type_node->type_rec.fields : type_node->type_uni.fields;
+        AstList *fields_ast  = (type_node->kind == AST_TYPE_REC) ? type_node->type_rec.fields : type_node->type_uni.fields;
         int      field_count = fields_ast ? fields_ast->count : 0;
 
         TypeField *fields = NULL;
@@ -4542,11 +4676,11 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
     Symbol *inst_sym = (origin && origin->table) ? symbol_table_lookup_local(origin->table, mangled_name) : NULL;
     if (inst_sym && inst_sym->type)
     {
-        sema->current_module    = saved_module;
-        sema->current_table     = saved_table;
-        sema->module_path       = saved_module_path;
-        sema->current_file_path = saved_file_path;
-        sema->current_source    = saved_source;
+        sema->current_module               = saved_module;
+        sema->current_table                = saved_table;
+        sema->module_path                  = saved_module_path;
+        sema->current_file_path            = saved_file_path;
+        sema->current_source               = saved_source;
         sema->current_function_return_type = saved_return_type;
         free(resolved_args);
         return inst_sym->type;
@@ -4633,12 +4767,12 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
     // attach concrete generic args for later method instantiation
     if (is_struct)
     {
-        inst_type->structure.generic_args = resolved_args;
+        inst_type->structure.generic_args      = resolved_args;
         inst_type->structure.generic_arg_count = type_args->count;
     }
     else
     {
-        inst_type->union_type.generic_args = resolved_args;
+        inst_type->union_type.generic_args      = resolved_args;
         inst_type->union_type.generic_arg_count = type_args->count;
     }
 
@@ -4653,11 +4787,11 @@ static Type *sema_instantiate_generic_type(Sema *sema, Symbol *generic_sym, AstL
     }
 
     // restore caller context
-    sema->current_module    = saved_module;
-    sema->current_table     = saved_table;
-    sema->module_path       = saved_module_path;
-    sema->current_file_path = saved_file_path;
-    sema->current_source    = saved_source;
+    sema->current_module               = saved_module;
+    sema->current_table                = saved_table;
+    sema->module_path                  = saved_module_path;
+    sema->current_file_path            = saved_file_path;
+    sema->current_source               = saved_source;
     sema->current_function_return_type = saved_return_type;
 
     return inst_type;
@@ -4695,7 +4829,7 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
             {
                 // look up the generic type to get its formal parameters.
                 // prefer the method's originating module table (receiver type is declared there).
-                SemaModule  *origin_mod  = sema_find_module(sema, generic_sym->module_path);
+                SemaModule  *origin_mod   = sema_find_module(sema, generic_sym->module_path);
                 SymbolTable *origin_table = (origin_mod && origin_mod->table) ? origin_mod->table : sema->current_table;
                 Symbol      *type_sym     = origin_table ? symbol_table_lookup(origin_table, receiver->type_name.name) : NULL;
                 if (type_sym && type_sym->is_generic && type_sym->decl)
@@ -4780,11 +4914,11 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     }
     if (inst)
     {
-        sema->current_module    = saved_module;
-        sema->current_table     = saved_table;
-        sema->module_path       = saved_module_path;
-        sema->current_file_path = saved_file_path;
-        sema->current_source    = saved_source;
+        sema->current_module               = saved_module;
+        sema->current_table                = saved_table;
+        sema->module_path                  = saved_module_path;
+        sema->current_file_path            = saved_file_path;
+        sema->current_source               = saved_source;
         sema->current_function_return_type = saved_return_type;
         free(resolved_args);
         return inst;
@@ -4793,11 +4927,11 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     AstNode *cloned_decl = ast_clone(decl);
     if (!cloned_decl)
     {
-        sema->current_module    = saved_module;
-        sema->current_table     = saved_table;
-        sema->module_path       = saved_module_path;
-        sema->current_file_path = saved_file_path;
-        sema->current_source    = saved_source;
+        sema->current_module               = saved_module;
+        sema->current_table                = saved_table;
+        sema->module_path                  = saved_module_path;
+        sema->current_file_path            = saved_file_path;
+        sema->current_source               = saved_source;
         sema->current_function_return_type = saved_return_type;
         free(resolved_args);
         return NULL;
@@ -4847,7 +4981,7 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     if (fixed_count > 0 || cloned_decl->fun_stmt.is_variadic)
     {
         int alloc_count = fixed_count + (cloned_decl->fun_stmt.is_variadic ? 1 : 0);
-        param_types = malloc(sizeof(Type *) * alloc_count);
+        param_types     = malloc(sizeof(Type *) * alloc_count);
         if (!param_types)
         {
             sema->current_table = prev_table;
@@ -4872,7 +5006,7 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
         if (cloned_decl->fun_stmt.is_variadic)
         {
             param_types[fixed_count] = NULL; // sentinel
-            param_count = alloc_count;
+            param_count              = alloc_count;
         }
         else
         {
@@ -4913,11 +5047,11 @@ Symbol *sema_instantiate_generic(Sema *sema, Symbol *generic_sym, AstList *type_
     sema->current_table = prev_table;
 
     // restore caller context
-    sema->current_module    = saved_module;
-    sema->current_table     = saved_table;
-    sema->module_path       = saved_module_path;
-    sema->current_file_path = saved_file_path;
-    sema->current_source    = saved_source;
+    sema->current_module               = saved_module;
+    sema->current_table                = saved_table;
+    sema->module_path                  = saved_module_path;
+    sema->current_file_path            = saved_file_path;
+    sema->current_source               = saved_source;
     sema->current_function_return_type = saved_return_type;
 
     free(resolved_args);
