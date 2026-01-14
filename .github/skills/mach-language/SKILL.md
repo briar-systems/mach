@@ -67,6 +67,8 @@ A compact, actionable summary to help agents and contributors write correct Mach
 - Conditional and loops: `if (cond) { .. } or { .. }`, `for (cond) { .. }`, `for { .. }` (infinite).
 - Deferred finalizers: `fin stmt;` (deferred in scope).
 - Methods with receivers: `fun (this: *T) method() { ... }` — method calls auto-convert between value and pointer receivers as needed.
+- Mach does NOT have tertiary (C-style) for loop syntax. `for` is effectively equivalent to `while` in C.
+- Mach does NOT have a `while` statement.
 
 ---
 
