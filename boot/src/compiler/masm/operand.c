@@ -44,6 +44,7 @@ MasmOperand masm_operand_memory(MasmRegister base, MasmRegister index, uint8_t s
 MasmOperand masm_operand_symbol(const char *name)
 {
     MasmOperand op;
+    memset(&op, 0, sizeof(MasmOperand));
     op.kind   = MASM_OPERAND_SYMBOL;
     op.symbol = name;
     return op;
@@ -52,6 +53,7 @@ MasmOperand masm_operand_symbol(const char *name)
 MasmOperand masm_operand_label(const char *name)
 {
     MasmOperand op;
+    memset(&op, 0, sizeof(MasmOperand));
     op.kind  = MASM_OPERAND_LABEL;
     op.label = name;
     return op;

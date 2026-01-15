@@ -12,6 +12,19 @@ MasmInstruction masm_inst_create(uint32_t opcode, MasmOperand *operands, uint8_t
     {
         inst.operands = malloc(sizeof(MasmOperand) * count);
         memcpy(inst.operands, operands, sizeof(MasmOperand) * count);
+        
+        // deep copy strings to avoid ownership issues
+        for (int i = 0; i < count; i++)
+        {
+            if (inst.operands[i].kind == MASM_OPERAND_LABEL && inst.operands[i].label)
+            {
+                inst.operands[i].label = strdup(inst.operands[i].label);
+            }
+            else if (inst.operands[i].kind == MASM_OPERAND_SYMBOL && inst.operands[i].symbol)
+            {
+                inst.operands[i].symbol = strdup(inst.operands[i].symbol);
+            }
+        }
     }
     else
     {
@@ -47,6 +60,17 @@ void masm_inst_destroy(MasmInstruction inst)
 {
     if (inst.operands)
     {
+        for (int i = 0; i < inst.operand_count; i++)
+        {
+            if (inst.operands[i].kind == MASM_OPERAND_LABEL && inst.operands[i].label)
+            {
+                free((void*)inst.operands[i].label);
+            }
+            else if (inst.operands[i].kind == MASM_OPERAND_SYMBOL && inst.operands[i].symbol)
+            {
+                free((void*)inst.operands[i].symbol);
+            }
+        }
         free(inst.operands);
     }
 }

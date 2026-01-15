@@ -70,7 +70,15 @@ static void masm_opt_peephole(MasmSection *section)
                 if (same_register(inst->operands[0], next->operands[0]) && inst->operands[1].kind != MASM_OPERAND_MEMORY)
                 {
                     uint32_t dst_reg = inst->operands[0].reg.id;
-                    if (!mem_uses_reg(next->operands[1], dst_reg))
+                    
+                    // check if next instruction reads the register (memory or register source)
+                    bool next_reads_reg = mem_uses_reg(next->operands[1], dst_reg);
+                    if (!next_reads_reg && next->operands[1].kind == MASM_OPERAND_REGISTER && next->operands[1].reg.id == dst_reg)
+                    {
+                        next_reads_reg = true;
+                    }
+
+                    if (!next_reads_reg)
                     {
                         remove[i] = 1;
                         continue;
