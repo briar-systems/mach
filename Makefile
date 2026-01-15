@@ -136,11 +136,11 @@ $(CMACH): $(BOOT_OBJECTS) | $(BIN_DIR)
 
 # intermediary compiler build (using cmach)
 # mach.toml determines target and output paths
-$(IMACH): $(CMACH)
+$(IMACH): $(CMACH) | $(BIN_DIR)
 	@echo "  cleaning artifacts for imach build"
 	@rm -rf $(OUT_DIR)/imach
 	@echo "  cmach -> imach"
-	@$(CMACH) build . -o out/linux/bin/imach
+	@$(CMACH) build . -o $(IMACH)
 	@echo "intermediary compiler ready: $@"
 
 # final compiler build (using imach)
