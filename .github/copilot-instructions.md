@@ -1,85 +1,21 @@
-# Style
-- Maintain existing coding style and conventions.
-- Keep comments lowercase and concise.
-- Avoid overcommenting trivial code or changes. Focus comments on complex logic.
-- If the bootstrap compiler is modified, once all changes are complete, format the C code using `clang-format` if available on the host system.
+# hard rules (mach repo)
+- do not manually edit anything under `dep/`. use `cmach dep ...` in the consuming project instead.
+- if a change would affect mach language syntax, semantics, behavior, or other core language aspects, pause and discuss before proceeding.
 
-# Quality
-- Reference language documentation in `doc` for proper usage of language features.
-- Maintain clarity and simplicity in all code changes.
-- Avoid introducing compatibility shims. Prefer full implementations.
-- Fully remove any dead code or lost features if affected by a change. This includes replaced functionality.
+# code changes
+- maintain existing coding style and conventions.
+- keep comments lowercase and concise; avoid overcommenting trivial changes.
+- avoid compatibility shims; prefer full implementations.
+- remove dead code or replaced functionality when a change would otherwise strand it.
 
-# Documentation
-- If a change requires documentation, update any existing documentation files in `doc` that pertain to the change.
-- Maintain parity with the existing documentation style.
+# documentation
+- treat `doc/*` as the source of truth for language/tooling behavior.
+- if a change is user-visible, update the relevant `doc/*` pages and keep examples compiling.
 
-# Mach language cheatsheet
+# formatting
+- if you modify bootstrap compiler c code under `boot/`, run `clang-format` when available.
 
-## Comments
-`#` for single-line comments only (no block comments). Extends to end of line.
-
-## Keywords and declarations
-- `use [alias:] project.module;` - import module, one file = one module
-- `pub` - export symbol from module
-- `ext "ABI:link_name" binding: type;` - external FFI symbol
-- `def Alias: BaseType;` - type alias
-- `val name: type = expr;` - immutable binding
-- `var name: type = expr;` - mutable binding, can omit initializer
-- `fun name(param: Type) RetType { body }` - function
-- `fun(this: *T) method() { body }` - method with receiver (pointer)
-- `rec Name { field: Type; }` - record type (struct)
-- `uni Name[T] { variant: Type; }` - union type (tagged union), supports generics
-- `ret expr;` - return from function
-- `asm { ... }` - inline assembly
-
-## Types
-Primitives: `u8` `u16` `u32` `u64` `i8` `i16` `i32` `i64` `f32` `f64` `ptr` (untyped pointer)
-Compounds: `*T` (mutable pointer) `&T` (read-only pointer) `[N]T` (fixed array)
-Anonymous: `rec{x: i32;}` and `uni{some: T; none: ptr;}` valid in type position
-Generics: `Name[TypeParam]` for both records and unions
-
-## Operators and expressions
-- `obj.field` - field access (records) or namespace access (modules). Uses `.` for both values and pointers
-- `arr[idx]` - indexing arrays, pointers
-- `func(a, b)` - function call
-- `obj.method()` - method calls auto-convert between value/pointer as needed for receiver type
-- `func[i32]()` - generic call with explicit type arguments
-- `Type{field: value}` or `Generic[T]{field: value}` - literal construction
-- `value::TargetType` - cast (sizes must match, bit reinterpret (`i64` to `f64` bad etc.))
-- `?expr` - address-of (operand must be lvalue, returns `*T` for var, `&T` for val)
-- `@ptr` - dereference pointer
-- Standard arithmetic: `+` `-` `*` `/` `%`
-- Comparison: `==` `!=` `<` `>` `<=` `>=`
-- Logical: `&&` `||` `!`
-- Bitwise: `&` `|` `^` `~` `<<` `>>`
-
-## Control flow
-```mach
-if (condition) { body }
-or (condition) { body }
-or { fallback }
-
-for (condition) { body }  // conditional loop
-for { body }              // infinite loop
-cnt;                      // continue
-brk;                      // break
-fin stmt;                 // deferred statement (block-scoped)
-```
-
-## Type system semantics
-- Literal coercion only at declaration point. Explicit casts required elsewhere.
-- Aliases with identical underlying types are interchangeable without casts.
-- All sizes in casts must match exactly (no implicit widening/narrowing).
-- `*T` can implicitly cast to `&T`, but not vice-versa.
-
-## Module system
-- Modules map 1:1 with `.mach` files under `[project].src` in `mach.toml`
-- Module path follows directory structure: `src/driver/pipeline.mach` → `project.driver.pipeline`
-- Symbols included from other modules via `use` are accessible without qualification. Alias can be provided to "namespace" the import.
-- Dependencies declared in `mach.toml` under `[deps.name]` with `source` and `version`
-
-## Entry point convention
-Standard library runtime expects: `fun main(args: Slice[str]) i64` with `$main.symbol = "main";` defined above it per convention.
-Note that a "conventional" entrypoint should also `use std.system.runtime;` and the types it requires for the signature like `std.types.string` and `std.types.slice`.
-Comptime directives: `$directive.key = value;` evaluated at compile time.
+# reference skills
+- `.github/skills/mach-project-overview/SKILL.md`
+- `.github/skills/mach-compiler-commands/SKILL.md`
+- `.github/skills/mach-language/SKILL.md`

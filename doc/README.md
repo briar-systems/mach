@@ -18,6 +18,9 @@ Advanced Features:
 - [Pointers and Memory Management](memory.md)
 - [Compiletime Systems](compiletime.md)
 
+Compiler Internals:
+- [MIR (Mid-level IR)](mir/README.md)
+
 Reference:
 - [Cheatsheet](cheatsheet.md)
 - [Quirks](quirks.md)

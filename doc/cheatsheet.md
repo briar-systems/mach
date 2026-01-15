@@ -34,7 +34,7 @@ See [config.md](config.md) and [dependencies.md](dependencies.md) for details.
 
 ## Module basics
 
-- Modules map one-to-one with `.mach` files under `[project].src` or the dependency's source tree.
+- Modules map one-to-one with `.mach` files under `[project].dir_src` or the dependency's source tree.
 - `use project.module;` makes the module's public symbols available.
 - `use alias: project.module;` creates a local alias for easier access.
 
@@ -67,7 +67,7 @@ mach.toml                # project.id = "myapp"
 | `for`   | `for [(<condition>)] { <body> }`                                                                                                                         | Loop construct                         |
 | `cnt`   | `cnt;`                                                                                                                                                   | Continue to the next iteration         |
 | `brk`   | `brk;`                                                                                                                                                   | Break out of a loop                    |
-| `asm`   | `asm { <assembly-instructions> }`                                                                                                                        | Inline assembly                        |
+| `masm`   | `masm { <assembly-instructions> }`                                                                                                                        | Inline masm (limited dialect)                        |
 
 
 ## Builtin Types
@@ -98,7 +98,7 @@ mach.toml                # project.id = "myapp"
 
 ```mach
 # aliased import
-use console: std.io.console;
+use print: std.print;
 
 val answer:  i32 = 42; # immutable binding
 var counter: i32 = 0;  # mutable binding
@@ -195,20 +195,19 @@ for {
 
 ## Entry points
 
-The runtime included in the Mach standard library looks for a function returning `i64`. Pass runtime arguments using one of the collection types provided by `std.types`, for example a `List[str]`.
-This is not enforced by the compiler itself, but by convention outlined in `std.system.runtime`.
+The runtime included in the Mach standard library looks for a function returning `i64` with a C-like signature: `argc` and `argv`.
+This is not enforced by the compiler itself, but by convention outlined in `std.runtime`.
 
 Because of this, a minimal Mach program must use the standard library as a dependency.
 With that in place, a simple "Hello, World!" program looks like this:
 
 ```mach
-use          std.system.runtime;
-use          std.types.list;
-use console: std.io.console;
+use          std.runtime;
+use print:   std.print;
 
 $main.symbol = "main";
-fun main(args: list.List[str]) i64 {
-    console.print("Hello, World!\n");
+fun main(argc: i64, argv: &&u8) i64 {
+    print.println("Hello, World!");
     ret 0;
 }
 ```

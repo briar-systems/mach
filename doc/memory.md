@@ -128,27 +128,26 @@ Patterns such as Zig's allocator model or other stylizations can be employed to 
 The [standard library](https://github.com/octalide/mach-std) provides some utilities for memory management. Here's a simple example of allocating and freeing memory using the standard library's utilities:
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
+use          std.runtime;
 use          std.types.option;
-use console: std.io.console;
+use print:   std.print;
 
 # memory utilities are found in the `std.system.memory` module
 use mem: std.system.memory;
 
 $main.symbol = "main"
-fun main(args: []str) i64 {
+fun main(argc: i64, argv: &&u8) i64 {
     # allocate memory for 10 i32 values
     var opt_alloc: Option[*i32] = mem.allocate[i32](10);
     if (opt_alloc.is_none()) {
-        console.print("Memory allocation failed\n");
+        print.println("Memory allocation failed");
         ret 1;
     }
 
     var p: *i32 = opt_alloc.unwrap();
     # `p` now points to the first byte of the allocated memory
 
-    console.print("Memory allocation succeeded! Location: %p\n", p);
+    print.println("Memory allocation succeeded");
 
     # use the allocated memory
     var i: i32 = 0;
@@ -157,11 +156,15 @@ fun main(args: []str) i64 {
         i = i + 1;
     }
 
-    # print the values
+    # verify the values
     i = 0;
     for (i < 10) {
         val value: i32 = @(p + i);
-        console.print("Value at index %u: %u\n", i, value);
+        if (value != i * 10) {
+            print.println("unexpected value");
+            mem.deallocate[i32](p, 10);
+            ret 1;
+        }
         i = i + 1;
     }
 

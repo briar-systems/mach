@@ -49,8 +49,12 @@ var t: $type_of(size);                # `t` will be `u64`
 
 Mach supports conditional compilation through the use of compile-time `if` statements. This allows you to include or exclude code based on compile-time conditions.
 
+The example below pulls in `std.types.bool`, which defines the `bool`, `true`, and `false` symbols used for the flag.
+
 Example:
 ```mach
+use std.types.bool;
+
 $if ($size_of(u64) == 8) {
     var is_64_bit: bool = true;
 }
@@ -128,7 +132,7 @@ Most notably, the `symbol` attribute is used in most Mach programs to remove nam
 
 ```mach
 $main.symbol = "main"
-fun main(args: []str) i64 {
+fun main(argc: i64, argv: &&u8) i64 {
     ret 0;
 }
 ```

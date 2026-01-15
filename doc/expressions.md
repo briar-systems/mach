@@ -265,11 +265,11 @@ See the [Types](types.md#methods) documentation for details on method syntax.
 
 ### Type Casting
 
-The `::` operator performs an explicit type cast.
+The `::` operator performs an explicit bit reinterpretation cast.
 
 ```mach
-val x: i32 = 42;
-val y: i64 = x::i64;  # cast i32 to i64
+val x: f32 = 3.14;
+val y: i32 = x::i32;  # reinterpret f32 bits as i32
 ```
 
 See the [Types](types.md#type-casting) documentation for details on casting rules and semantics.
@@ -318,7 +318,11 @@ See the [Types](types.md#anonymous-rec-and-uni) documentation for details on ano
 
 The `$` prefix marks an expression for compile-time evaluation. This is used for compile-time intrinsics, target information, and other compile-time operations.
 
+The snippet below imports `std.types.bool`, which provides the `bool`, `true`, and `false` symbols used for compile-time flags.
+
 ```mach
+use std.types.bool;
+
 val size:     u64  = $size_of(i32);
 val is_linux: bool = $OS_LINUX;
 ```

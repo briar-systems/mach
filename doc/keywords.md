@@ -22,7 +22,7 @@ This reference lists the reserved keywords and token symbols in the Mach languag
   - [`cnt`](#cnt)
   - [`brk`](#brk)
   - [`fin`](#fin)
-  - [`asm`](#asm)
+  - [`masm`](#masm)
 
 
 # Comments
@@ -54,7 +54,7 @@ It allows for an alias to be specified which can be used to "contain" the import
 ```mach
 use std.types.bool;
 
-use console: std.io.console;
+use print: std.print;
 ```
 
 
@@ -345,20 +345,25 @@ fun example() {
 ```
 
 
-## `asm`
+## `masm`
 
-> `asm { <assembly-instructions> }`
+> `masm { <assembly-instructions> }`
 
-The `asm` keyword is used to introduce an inline assembly statement.
-It allows embedding low-level assembly instructions directly within Mach code for performance-critical or hardware-specific operations.
+The `masm` keyword introduces an inline masm block.
+It allows embedding a limited, target-specific inline masm dialect; operands may reference local variables by name.
 
 ```mach
-asm {
-    mov eax, 1;
-    int 0x80;
+fun call_sys(n: u64) u64 {
+    var out: u64 = 0;
+    masm {
+        mov rax, n
+        syscall
+        mov out, rax
+    }
+    ret out;
 }
 ```
 
-`asm` is allowed at both global and function scope.
+`masm` is allowed at both global and function scope, but is currently only lowered inside function bodies.
 
-> At the time of writing, inline assembly blocks do not support interpolation of Mach variables into the assembly code or "clobber" declarations.
+> Note: this is a limited inline `masm` dialect. Operands may reference local variables by name; it is not intended as a full inline-asm facility with rich interpolation or explicit clobber lists.
