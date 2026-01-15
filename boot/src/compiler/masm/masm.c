@@ -2,6 +2,7 @@
 #include "compiler/masm/instruction.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 Masm *masm_create(MasmTarget target)
 {
@@ -132,13 +133,23 @@ void masm_merge(Masm *dest, Masm *src)
         }
 
         // Append instructions
+        fprintf(stderr, "[masm_merge] merging section %s: src has %zu insts, dest has %zu insts before\n",
+                src_sec->name, src_sec->inst_count, dest_sec->inst_count);
         for (size_t j = 0; j < src_sec->inst_count; j++)
         {
             MasmInstruction *src_inst = &src_sec->instructions[j];
             // Create a copy of the instruction (allocates new operand array)
             MasmInstruction new_inst = masm_inst_create(src_inst->opcode, src_inst->operands, src_inst->operand_count);
+            if (src_inst->opcode == MASM_OP_MOV && src_inst->operand_count >= 2 && src_inst->operands[1].kind == MASM_OPERAND_LABEL)
+            {
+                fprintf(stderr, "[masm_merge] copying MOV with label %s at inst %zu, dest will be %zu\n", 
+                        src_inst->operands[1].label, j, dest_sec->inst_count);
+                fprintf(stderr, "[masm_merge] new_inst op0 kind=%d, op1 kind=%d\n", 
+                        new_inst.operands[0].kind, new_inst.operands[1].kind);
+            }
             masm_section_append_inst(dest_sec, new_inst);
         }
+        fprintf(stderr, "[masm_merge] dest now has %zu insts after\n", dest_sec->inst_count);
         
         // Append data
         if (src_sec->data_size > 0)

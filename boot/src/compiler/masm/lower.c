@@ -689,9 +689,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
         else if (expr->lit_expr.kind == TOKEN_LIT_STRING)
         {
-#ifdef MASM_DEBUG
-            fprintf(stderr, "[lower] string literal '%s'\n", expr->lit_expr.string_val);
-#endif
+            fprintf(stderr, "[lower_expr] string literal '%s', text=%p, inst_count before=%zu\n",
+                    expr->lit_expr.string_val, (void *)text, text->inst_count);
             // Create unique label
             static int str_counter = 0;
             char       label[32];
@@ -717,6 +716,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             MasmOperand res = isa_result(ctx, 8);
             MasmOperand src = masm_operand_label(strdup(label));
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, res, src));
+            fprintf(stderr, "[lower_expr] string literal: emitted MOV, text section inst_count after=%zu\n",
+                    text->inst_count);
             return res;
         }
     }
@@ -753,8 +754,13 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         LocalVar *var = find_local_var(ctx, expr->ident_expr.name);
         if (var)
         {
-            // arrays/large aggregates: return address with LEA
-            if (var->size > 8)
+            // aggregates: return address with LEA
+            // arrays and structs need LEA regardless of size because
+            // indexing/field access expects a pointer base
+            bool is_aggregate = expr->type && (expr->type->kind == TYPE_ARRAY ||
+                                               expr->type->kind == TYPE_STRUCT ||
+                                               expr->type->kind == TYPE_UNION);
+            if (var->size > 8 || is_aggregate)
             {
                 MasmOperand result = isa_result(ctx, 8);
                 MasmOperand addr   = frame_mem(ctx, var->offset, ctx->ptr_size);
@@ -1178,6 +1184,21 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, right));
                 right_op = rcx;
             }
+            // If right is a memory operand using RAX as base, load it before POP
+            else if (right.kind == MASM_OPERAND_MEMORY && right.mem.base.id == isa_result_id(ctx))
+            {
+                uint8_t sz = right.mem.size ? right.mem.size : ctx->ptr_size;
+                if (sz == 1 || sz == 2)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, rcx, right));
+                }
+                else
+                {
+                    MasmOperand rcx_sized = masm_operand_register(rcx.reg.id, sz);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx_sized, right));
+                }
+                right_op = rcx;
+            }
 
             // Pop left back into RAX (POP r32 is invalid)
             MasmOperand pop_op = result;
@@ -1193,6 +1214,21 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             if (right.kind == MASM_OPERAND_REGISTER && right.reg.id == isa_result_id(ctx))
             {
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx, right));
+                right_op = rcx;
+            }
+            // If right is a memory operand using RAX as base, load it before restoring left
+            else if (right.kind == MASM_OPERAND_MEMORY && right.mem.base.id == isa_result_id(ctx))
+            {
+                uint8_t sz = right.mem.size ? right.mem.size : ctx->ptr_size;
+                if (sz == 1 || sz == 2)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, rcx, right));
+                }
+                else
+                {
+                    MasmOperand rcx_sized = masm_operand_register(rcx.reg.id, sz);
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rcx_sized, right));
+                }
                 right_op = rcx;
             }
 
@@ -2629,6 +2665,11 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     if (stmt->kind == AST_STMT_RET)
     {
         AstNode *expr = stmt->ret_stmt.expr;
+        fprintf(stderr, "[lower_stmt] RET: expr=%p, fn_has_sret=%d, fn_ret_type=%p (size=%zu)\n",
+                (void *)expr,
+                ctx->fn_has_sret,
+                (void *)ctx->fn_ret_type,
+                ctx->fn_ret_type ? ctx->fn_ret_type->size : 0);
         if (ctx->fn_has_sret && ctx->fn_ret_type && ctx->fn_ret_type->size > ctx->ptr_size)
         {
             if (expr)
@@ -2704,6 +2745,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             if (ctx->fn_ret_type && type_is_fp_class(ctx->fn_ret_type) && ctx->abi->float_ret_count > 0)
             {
+                fprintf(stderr, "[lower_stmt] RET: float path\n");
                 uint8_t     rsz  = type_fp_size(ctx->fn_ret_type);
                 MasmOperand val  = lower_expr(masm, text, expr, ctx);
                 MasmOperand bits = isa_result(ctx, rsz);
@@ -2714,7 +2756,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             }
             else
             {
+                fprintf(stderr, "[lower_stmt] RET: normal path, calling lower_expr\n");
                 MasmOperand op = lower_expr(masm, text, expr, ctx);
+                fprintf(stderr, "[lower_stmt] RET: lower_expr returned kind=%d\n", op.kind);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, isa_result(ctx, ctx->ptr_size), op));
             }
         }
@@ -3548,6 +3592,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
     MasmSection *text = masm_get_or_create_section(masm, ".text", MASM_SECTION_TEXT);
 
     masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(func_name))));
+    fprintf(stderr, "[lower_function] starting %s, text=%p, inst_count=%zu\n", func_name, (void *)text, text->inst_count);
 
     // create context for this function
     LowerContext *ctx = create_context(masm->target);
@@ -4006,6 +4051,31 @@ static void lower_global_var(Masm *masm, AstNode *stmt)
                 init_val = stmt->var_stmt.init->lit_expr.int_val;
                 // printf("Int val: %ld\n", init_val);
             }
+        }
+        // Handle unary negation of literal: -N
+        else if (stmt->var_stmt.init->kind == AST_EXPR_UNARY &&
+                 stmt->var_stmt.init->unary_expr.op == TOKEN_MINUS &&
+                 stmt->var_stmt.init->unary_expr.expr &&
+                 stmt->var_stmt.init->unary_expr.expr->kind == AST_EXPR_LIT &&
+                 stmt->var_stmt.init->unary_expr.expr->lit_expr.kind == TOKEN_LIT_INT)
+        {
+            is_bss   = false;
+            init_val = (uint64_t)(-(int64_t)stmt->var_stmt.init->unary_expr.expr->lit_expr.int_val);
+        }
+        // Handle binary expression: 0 - N (compile-time constant)
+        else if (stmt->var_stmt.init->kind == AST_EXPR_BINARY &&
+                 stmt->var_stmt.init->binary_expr.op == TOKEN_MINUS &&
+                 stmt->var_stmt.init->binary_expr.left &&
+                 stmt->var_stmt.init->binary_expr.left->kind == AST_EXPR_LIT &&
+                 stmt->var_stmt.init->binary_expr.left->lit_expr.kind == TOKEN_LIT_INT &&
+                 stmt->var_stmt.init->binary_expr.right &&
+                 stmt->var_stmt.init->binary_expr.right->kind == AST_EXPR_LIT &&
+                 stmt->var_stmt.init->binary_expr.right->lit_expr.kind == TOKEN_LIT_INT)
+        {
+            is_bss = false;
+            int64_t left_val  = (int64_t)stmt->var_stmt.init->binary_expr.left->lit_expr.int_val;
+            int64_t right_val = (int64_t)stmt->var_stmt.init->binary_expr.right->lit_expr.int_val;
+            init_val          = (uint64_t)(left_val - right_val);
         }
     }
 

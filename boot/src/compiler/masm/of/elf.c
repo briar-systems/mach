@@ -503,12 +503,19 @@ int masm_elf_write(Masm *masm, const char *filename)
     uint8_t *text_buf = malloc(text_size ? text_size : 1);
     size_t   off = 0;
 
+    fprintf(stderr, "[elf] starting text encoding, inst_count=%zu\n", text->inst_count);
     for (size_t i = 0; i < text->inst_count; i++)
     {
         MasmInstruction inst = text->instructions[i];
         if (inst.opcode == MASM_OP_LABEL)
         {
             continue;
+        }
+
+        // check for MOV instructions specifically
+        if (inst.opcode == MASM_OP_MOV && inst.operand_count >= 2)
+        {
+            fprintf(stderr, "[elf] MOV at %zu: op0 kind=%d, op1 kind=%d\n", i, inst.operands[0].kind, inst.operands[1].kind);
         }
 
         if ((inst.opcode == MASM_OP_CALL || inst.opcode == MASM_OP_JMP) && inst.operands[0].kind == MASM_OPERAND_LABEL)
@@ -588,10 +595,13 @@ int masm_elf_write(Masm *masm, const char *filename)
 
         if (inst.opcode == MASM_OP_MOV && inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_LABEL)
         {
+            fprintf(stderr, "[elf] found MOV with label %s at inst %zu\n", inst.operands[1].label, i);
             uint32_t dst = inst.operands[0].reg.id;
             uint8_t  sz  = inst.operands[0].reg.size;
+            fprintf(stderr, "[elf] dst=%u, sz=%u\n", dst, sz);
             if (sz != 8)
             {
+                fprintf(stderr, "[elf] sz != 8, emitting zero\n");
                 MasmOperand     imm_op   = masm_operand_imm(0);
                 MasmInstruction tmp_inst = masm_inst_2(MASM_OP_MOV, inst.operands[0], imm_op);
                 off += masm_x86_encode(tmp_inst, text_buf + off, text_size - off);
