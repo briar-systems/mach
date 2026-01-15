@@ -689,8 +689,9 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
         else if (expr->lit_expr.kind == TOKEN_LIT_STRING)
         {
-            fprintf(stderr, "[lower_expr] string literal '%s', text=%p, inst_count before=%zu\n",
-                    expr->lit_expr.string_val, (void *)text, text->inst_count);
+#ifdef MASM_DEBUG
+            fprintf(stderr, "[lower_expr] string literal '%s', text=%p, inst_count before=%zu\n", expr->lit_expr.string_val, (void *)text, text->inst_count);
+#endif
             // Create unique label
             static int str_counter = 0;
             char       label[32];
@@ -716,8 +717,9 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             MasmOperand res = isa_result(ctx, 8);
             MasmOperand src = masm_operand_label(strdup(label));
             masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, res, src));
-            fprintf(stderr, "[lower_expr] string literal: emitted MOV, text section inst_count after=%zu\n",
-                    text->inst_count);
+#ifdef MASM_DEBUG
+            fprintf(stderr, "[lower_expr] string literal: emitted MOV, text section inst_count after=%zu\n", text->inst_count);
+#endif
             return res;
         }
     }
@@ -725,6 +727,41 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     {
         MasmOperand inner = lower_expr(masm, text, expr->cast_expr.expr, ctx);
         uint8_t     size  = (expr->type && expr->type->size) ? expr->type->size : 8;
+        if (size == 0)
+        {
+            size = ctx->ptr_size;
+        }
+
+        Type *from_type = expr->cast_expr.expr ? expr->cast_expr.expr->type : NULL;
+        bool  from_agg  = from_type && (from_type->kind == TYPE_STRUCT || from_type->kind == TYPE_UNION || from_type->kind == TYPE_ARRAY);
+
+        if (from_agg)
+        {
+            uint8_t     load_size = size > 8 ? 8 : size;
+            MasmOperand dst       = isa_result(ctx, load_size);
+
+            if (inner.kind == MASM_OPERAND_REGISTER)
+            {
+                MasmOperand src = masm_operand_memory_simple(inner.reg.id, 0, load_size);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+                return dst;
+            }
+            else if (inner.kind == MASM_OPERAND_MEMORY)
+            {
+                MasmOperand src = inner;
+                src.mem.size    = load_size;
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+                return dst;
+            }
+            else if (inner.kind == MASM_OPERAND_LABEL)
+            {
+                MasmOperand addr = isa_tmp(ctx, ctx->ptr_size);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, addr, inner));
+                MasmOperand src = masm_operand_memory_simple(addr.reg.id, 0, load_size);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+                return dst;
+            }
+        }
 
         if (inner.kind == MASM_OPERAND_REGISTER)
         {
@@ -757,9 +794,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             // aggregates: return address with LEA
             // arrays and structs need LEA regardless of size because
             // indexing/field access expects a pointer base
-            bool is_aggregate = expr->type && (expr->type->kind == TYPE_ARRAY ||
-                                               expr->type->kind == TYPE_STRUCT ||
-                                               expr->type->kind == TYPE_UNION);
+            bool is_aggregate = expr->type && (expr->type->kind == TYPE_ARRAY || expr->type->kind == TYPE_STRUCT || expr->type->kind == TYPE_UNION);
             if (var->size > 8 || is_aggregate)
             {
                 MasmOperand result = isa_result(ctx, 8);
@@ -2665,11 +2700,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     if (stmt->kind == AST_STMT_RET)
     {
         AstNode *expr = stmt->ret_stmt.expr;
-        fprintf(stderr, "[lower_stmt] RET: expr=%p, fn_has_sret=%d, fn_ret_type=%p (size=%zu)\n",
-                (void *)expr,
-                ctx->fn_has_sret,
-                (void *)ctx->fn_ret_type,
-                ctx->fn_ret_type ? ctx->fn_ret_type->size : 0);
+#ifdef MASM_DEBUG
+        fprintf(stderr, "[lower_stmt] RET: expr=%p, fn_has_sret=%d, fn_ret_type=%p (size=%zu)\n", (void *)expr, ctx->fn_has_sret, (void *)ctx->fn_ret_type, ctx->fn_ret_type ? ctx->fn_ret_type->size : 0);
+#endif
         if (ctx->fn_has_sret && ctx->fn_ret_type && ctx->fn_ret_type->size > ctx->ptr_size)
         {
             if (expr)
@@ -2745,7 +2778,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             if (ctx->fn_ret_type && type_is_fp_class(ctx->fn_ret_type) && ctx->abi->float_ret_count > 0)
             {
+#ifdef MASM_DEBUG
                 fprintf(stderr, "[lower_stmt] RET: float path\n");
+#endif
                 uint8_t     rsz  = type_fp_size(ctx->fn_ret_type);
                 MasmOperand val  = lower_expr(masm, text, expr, ctx);
                 MasmOperand bits = isa_result(ctx, rsz);
@@ -2756,9 +2791,13 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             }
             else
             {
+#ifdef MASM_DEBUG
                 fprintf(stderr, "[lower_stmt] RET: normal path, calling lower_expr\n");
+#endif
                 MasmOperand op = lower_expr(masm, text, expr, ctx);
+#ifdef MASM_DEBUG
                 fprintf(stderr, "[lower_stmt] RET: lower_expr returned kind=%d\n", op.kind);
+#endif
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, isa_result(ctx, ctx->ptr_size), op));
             }
         }
@@ -3592,7 +3631,9 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
     MasmSection *text = masm_get_or_create_section(masm, ".text", MASM_SECTION_TEXT);
 
     masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(func_name))));
+#ifdef MASM_DEBUG
     fprintf(stderr, "[lower_function] starting %s, text=%p, inst_count=%zu\n", func_name, (void *)text, text->inst_count);
+#endif
 
     // create context for this function
     LowerContext *ctx = create_context(masm->target);
@@ -4053,26 +4094,18 @@ static void lower_global_var(Masm *masm, AstNode *stmt)
             }
         }
         // Handle unary negation of literal: -N
-        else if (stmt->var_stmt.init->kind == AST_EXPR_UNARY &&
-                 stmt->var_stmt.init->unary_expr.op == TOKEN_MINUS &&
-                 stmt->var_stmt.init->unary_expr.expr &&
-                 stmt->var_stmt.init->unary_expr.expr->kind == AST_EXPR_LIT &&
+        else if (stmt->var_stmt.init->kind == AST_EXPR_UNARY && stmt->var_stmt.init->unary_expr.op == TOKEN_MINUS && stmt->var_stmt.init->unary_expr.expr && stmt->var_stmt.init->unary_expr.expr->kind == AST_EXPR_LIT &&
                  stmt->var_stmt.init->unary_expr.expr->lit_expr.kind == TOKEN_LIT_INT)
         {
             is_bss   = false;
             init_val = (uint64_t)(-(int64_t)stmt->var_stmt.init->unary_expr.expr->lit_expr.int_val);
         }
         // Handle binary expression: 0 - N (compile-time constant)
-        else if (stmt->var_stmt.init->kind == AST_EXPR_BINARY &&
-                 stmt->var_stmt.init->binary_expr.op == TOKEN_MINUS &&
-                 stmt->var_stmt.init->binary_expr.left &&
-                 stmt->var_stmt.init->binary_expr.left->kind == AST_EXPR_LIT &&
-                 stmt->var_stmt.init->binary_expr.left->lit_expr.kind == TOKEN_LIT_INT &&
-                 stmt->var_stmt.init->binary_expr.right &&
-                 stmt->var_stmt.init->binary_expr.right->kind == AST_EXPR_LIT &&
+        else if (stmt->var_stmt.init->kind == AST_EXPR_BINARY && stmt->var_stmt.init->binary_expr.op == TOKEN_MINUS && stmt->var_stmt.init->binary_expr.left && stmt->var_stmt.init->binary_expr.left->kind == AST_EXPR_LIT &&
+                 stmt->var_stmt.init->binary_expr.left->lit_expr.kind == TOKEN_LIT_INT && stmt->var_stmt.init->binary_expr.right && stmt->var_stmt.init->binary_expr.right->kind == AST_EXPR_LIT &&
                  stmt->var_stmt.init->binary_expr.right->lit_expr.kind == TOKEN_LIT_INT)
         {
-            is_bss = false;
+            is_bss            = false;
             int64_t left_val  = (int64_t)stmt->var_stmt.init->binary_expr.left->lit_expr.int_val;
             int64_t right_val = (int64_t)stmt->var_stmt.init->binary_expr.right->lit_expr.int_val;
             init_val          = (uint64_t)(left_val - right_val);

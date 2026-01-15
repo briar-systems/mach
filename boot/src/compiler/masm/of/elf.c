@@ -66,18 +66,18 @@ typedef struct
 
 typedef struct
 {
-    Elf64_Word  st_name;
+    Elf64_Word    st_name;
     unsigned char st_info;
     unsigned char st_other;
-    Elf64_Half  st_shndx;
-    Elf64_Addr  st_value;
-    Elf64_Xword st_size;
+    Elf64_Half    st_shndx;
+    Elf64_Addr    st_value;
+    Elf64_Xword   st_size;
 } Elf64_Sym;
 
 typedef struct
 {
-    Elf64_Addr  r_offset;
-    Elf64_Xword r_info;
+    Elf64_Addr   r_offset;
+    Elf64_Xword  r_info;
     Elf64_Sxword r_addend;
 } Elf64_Rela;
 
@@ -247,9 +247,7 @@ static uint8_t kind_to_elf_type(MasmSymbolKind k)
     }
 }
 
-static Elf64_Word sym_lookup_or_add(StrTab *strtab, Elf64_Sym **syms, size_t *sym_count, size_t *sym_cap,
-                                    SymIndex **idx, size_t *idx_count, size_t *idx_cap,
-                                    const char *name)
+static Elf64_Word sym_lookup_or_add(StrTab *strtab, Elf64_Sym **syms, size_t *sym_count, size_t *sym_cap, SymIndex **idx, size_t *idx_count, size_t *idx_cap, const char *name)
 {
     for (size_t i = 0; i < *idx_count; i++)
     {
@@ -280,7 +278,7 @@ static Elf64_Word sym_lookup_or_add(StrTab *strtab, Elf64_Sym **syms, size_t *sy
     s.st_value = 0;
     s.st_size  = 0;
 
-    Elf64_Word new_idx = (Elf64_Word)(*sym_count);
+    Elf64_Word new_idx      = (Elf64_Word)(*sym_count);
     (*syms)[(*sym_count)++] = s;
 
     (*idx)[*idx_count].name      = strdup(name);
@@ -418,21 +416,21 @@ int masm_elf_write(Masm *masm, const char *filename)
     // undef symbol
     Elf64_Sym undef;
     memset(&undef, 0, sizeof(undef));
-    syms    = malloc(sizeof(Elf64_Sym) * 64);
-    sym_cap = 64;
+    syms              = malloc(sizeof(Elf64_Sym) * 64);
+    sym_cap           = 64;
     syms[sym_count++] = undef;
 
     // section symbols (local)
     Elf64_Sym sec;
     memset(&sec, 0, sizeof(sec));
-    sec.st_info = ELF64_ST_INFO(STB_LOCAL, STT_SECTION);
-    sec.st_shndx = 1;
+    sec.st_info       = ELF64_ST_INFO(STB_LOCAL, STT_SECTION);
+    sec.st_shndx      = 1;
     syms[sym_count++] = sec;
-    sec.st_shndx = 2;
+    sec.st_shndx      = 2;
     syms[sym_count++] = sec;
-    sec.st_shndx = 3;
+    sec.st_shndx      = 3;
     syms[sym_count++] = sec;
-    sec.st_shndx = 4;
+    sec.st_shndx      = 4;
     syms[sym_count++] = sec;
 
     // add defined masm symbols (locals first, then globals/weak)
@@ -466,12 +464,12 @@ int masm_elf_write(Masm *masm, const char *filename)
                 sym_cap *= 2;
                 syms = realloc(syms, sizeof(Elf64_Sym) * sym_cap);
             }
-            Elf64_Word si = (Elf64_Word)sym_count;
+            Elf64_Word si     = (Elf64_Word)sym_count;
             syms[sym_count++] = s;
 
             if (idx_count >= idx_cap)
             {
-                idx_cap = idx_cap == 0 ? 64 : idx_cap * 2;
+                idx_cap   = idx_cap == 0 ? 64 : idx_cap * 2;
                 sym_index = realloc(sym_index, sizeof(SymIndex) * idx_cap);
             }
             sym_index[idx_count].name      = strdup(ms->name);
@@ -501,9 +499,11 @@ int masm_elf_write(Masm *masm, const char *filename)
 
     // encode .text and collect relocations
     uint8_t *text_buf = malloc(text_size ? text_size : 1);
-    size_t   off = 0;
+    size_t   off      = 0;
 
+#ifdef MASM_DEBUG
     fprintf(stderr, "[elf] starting text encoding, inst_count=%zu\n", text->inst_count);
+#endif
     for (size_t i = 0; i < text->inst_count; i++)
     {
         MasmInstruction inst = text->instructions[i];
@@ -515,7 +515,9 @@ int masm_elf_write(Masm *masm, const char *filename)
         // check for MOV instructions specifically
         if (inst.opcode == MASM_OP_MOV && inst.operand_count >= 2)
         {
+#ifdef MASM_DEBUG
             fprintf(stderr, "[elf] MOV at %zu: op0 kind=%d, op1 kind=%d\n", i, inst.operands[0].kind, inst.operands[1].kind);
+#endif
         }
 
         if ((inst.opcode == MASM_OP_CALL || inst.opcode == MASM_OP_JMP) && inst.operands[0].kind == MASM_OPERAND_LABEL)
@@ -523,17 +525,17 @@ int masm_elf_write(Masm *masm, const char *filename)
             const char *name = inst.operands[0].label;
             Elf64_Word  si   = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
 
-            text_buf[off++] = (inst.opcode == MASM_OP_CALL) ? 0xE8 : 0xE9;
+            text_buf[off++]    = (inst.opcode == MASM_OP_CALL) ? 0xE8 : 0xE9;
             Elf64_Addr rel_off = (Elf64_Addr)off;
-            text_buf[off++] = 0;
-            text_buf[off++] = 0;
-            text_buf[off++] = 0;
-            text_buf[off++] = 0;
+            text_buf[off++]    = 0;
+            text_buf[off++]    = 0;
+            text_buf[off++]    = 0;
+            text_buf[off++]    = 0;
 
             if (rela_count >= rela_cap)
             {
                 rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
-                rela = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
             }
             rela[rela_count].r_offset = rel_off;
             rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
@@ -573,18 +575,18 @@ int masm_elf_write(Masm *masm, const char *filename)
                 break;
             }
 
-            text_buf[off++] = 0x0F;
-            text_buf[off++] = cond;
+            text_buf[off++]    = 0x0F;
+            text_buf[off++]    = cond;
             Elf64_Addr rel_off = (Elf64_Addr)off;
-            text_buf[off++] = 0;
-            text_buf[off++] = 0;
-            text_buf[off++] = 0;
-            text_buf[off++] = 0;
+            text_buf[off++]    = 0;
+            text_buf[off++]    = 0;
+            text_buf[off++]    = 0;
+            text_buf[off++]    = 0;
 
             if (rela_count >= rela_cap)
             {
                 rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
-                rela = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
             }
             rela[rela_count].r_offset = rel_off;
             rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
@@ -595,13 +597,19 @@ int masm_elf_write(Masm *masm, const char *filename)
 
         if (inst.opcode == MASM_OP_MOV && inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_LABEL)
         {
+#ifdef MASM_DEBUG
             fprintf(stderr, "[elf] found MOV with label %s at inst %zu\n", inst.operands[1].label, i);
+#endif
             uint32_t dst = inst.operands[0].reg.id;
             uint8_t  sz  = inst.operands[0].reg.size;
+#ifdef MASM_DEBUG
             fprintf(stderr, "[elf] dst=%u, sz=%u\n", dst, sz);
+#endif
             if (sz != 8)
             {
+#ifdef MASM_DEBUG
                 fprintf(stderr, "[elf] sz != 8, emitting zero\n");
+#endif
                 MasmOperand     imm_op   = masm_operand_imm(0);
                 MasmInstruction tmp_inst = masm_inst_2(MASM_OP_MOV, inst.operands[0], imm_op);
                 off += masm_x86_encode(tmp_inst, text_buf + off, text_size - off);
@@ -625,7 +633,7 @@ int masm_elf_write(Masm *masm, const char *filename)
             if (rela_count >= rela_cap)
             {
                 rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
-                rela = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
             }
             rela[rela_count].r_offset = rel_off;
             rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_64);
@@ -646,33 +654,33 @@ int masm_elf_write(Masm *masm, const char *filename)
     size_t file_off = sizeof(Elf64_Ehdr);
 
     size_t text_file_off = align_up(file_off, 16);
-    file_off = text_file_off + text_size;
+    file_off             = text_file_off + text_size;
 
     size_t rodata_file_off = align_up(file_off, 16);
-    file_off = rodata_file_off + rodata_size;
+    file_off               = rodata_file_off + rodata_size;
 
     size_t data_file_off = align_up(file_off, 16);
-    file_off = data_file_off + data_size;
+    file_off             = data_file_off + data_size;
 
     size_t rela_file_off = align_up(file_off, 8);
-    size_t rela_size = rela_count * sizeof(Elf64_Rela);
-    file_off = rela_file_off + rela_size;
+    size_t rela_size     = rela_count * sizeof(Elf64_Rela);
+    file_off             = rela_file_off + rela_size;
 
     size_t symtab_file_off = align_up(file_off, 8);
-    size_t symtab_size = sym_count * sizeof(Elf64_Sym);
-    file_off = symtab_file_off + symtab_size;
+    size_t symtab_size     = sym_count * sizeof(Elf64_Sym);
+    file_off               = symtab_file_off + symtab_size;
 
     size_t strtab_file_off = align_up(file_off, 1);
-    size_t strtab_size = str.len;
-    file_off = strtab_file_off + strtab_size;
+    size_t strtab_size     = str.len;
+    file_off               = strtab_file_off + strtab_size;
 
     size_t shstr_file_off = align_up(file_off, 1);
-    size_t shstr_size = shstr.len;
-    file_off = shstr_file_off + shstr_size;
+    size_t shstr_size     = shstr.len;
+    file_off              = shstr_file_off + shstr_size;
 
     size_t shoff = align_up(file_off, 8);
 
-    const int shnum = 9;
+    const int  shnum = 9;
     Elf64_Shdr shdrs[shnum];
     memset(shdrs, 0, sizeof(shdrs));
 
