@@ -1661,6 +1661,7 @@ static AstNode *sema_type_node_from_type(Type *t)
         return NULL;
     }
 
+    node->type = t;
     return node;
 }
 
@@ -3383,6 +3384,12 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         Symbol     *method        = symbol_table_lookup(sema->current_table, node->field_expr.field);
         SemaModule *method_origin = NULL;
 
+        // ignore non-method symbols that shadow method names
+        if (method && (method->kind != SYMBOL_FUNCTION || !method->decl || method->decl->kind != AST_STMT_FUN || !method->decl->fun_stmt.is_method))
+        {
+            method = NULL;
+        }
+
         if (!method && sema->current_module)
         {
             for (ModuleImport *imp = sema->current_module->imports; imp; imp = imp->next)
@@ -3393,7 +3400,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 }
 
                 Symbol *cand = symbol_table_lookup_local(imp->module->table, node->field_expr.field);
-                if (!cand || cand->kind != SYMBOL_FUNCTION || !cand->is_public)
+                if (!cand || cand->kind != SYMBOL_FUNCTION || !cand->is_public || !cand->decl || cand->decl->kind != AST_STMT_FUN || !cand->decl->fun_stmt.is_method)
                 {
                     continue;
                 }
@@ -4298,6 +4305,12 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
     if (!type_node)
     {
         return NULL;
+    }
+
+    // if the node already carries a resolved type, reuse it
+    if (type_node->type)
+    {
+        return type_node->type;
     }
 
     switch (type_node->kind)
