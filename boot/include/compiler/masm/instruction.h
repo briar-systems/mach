@@ -28,6 +28,7 @@ typedef enum MasmOpcode
     MASM_OP_XOR,
     MASM_OP_SHL,
     MASM_OP_SHR,
+    MASM_OP_SAR,
     MASM_OP_CQO,
     
     // comparison and logical
@@ -39,6 +40,10 @@ typedef enum MasmOpcode
     MASM_OP_SETG,
     MASM_OP_SETLE,
     MASM_OP_SETGE,
+    MASM_OP_SETB,
+    MASM_OP_SETA,
+    MASM_OP_SETBE,
+    MASM_OP_SETAE,
     
     // control flow
     MASM_OP_JMP,

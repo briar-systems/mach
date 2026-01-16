@@ -12,6 +12,16 @@ typedef enum MasmX86Opcode
     // sse moves between xmm regs (encoded as masm_operand_register(xmm_index, 16))
     // and r/m32|r/m64 using MOVD/MOVQ encodings.
     MASM_OP_X86_MOVQ,
+
+    // sse comparison: ucomisd xmm1, xmm2/m64
+    // sets EFLAGS (ZF, PF, CF) based on unordered comparison
+    MASM_OP_X86_UCOMISD,
+
+    // sse arithmetic (scalar double-precision)
+    MASM_OP_X86_ADDSD,  // addsd xmm1, xmm2/m64
+    MASM_OP_X86_SUBSD,  // subsd xmm1, xmm2/m64
+    MASM_OP_X86_MULSD,  // mulsd xmm1, xmm2/m64
+    MASM_OP_X86_DIVSD,  // divsd xmm1, xmm2/m64
 } MasmX86Opcode;
 
 // x86_64 registers
