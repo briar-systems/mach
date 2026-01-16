@@ -6,7 +6,6 @@
   - [`version`](#version)
   - [`dir_src`](#dir_src)
   - [`dir_out`](#dir_out)
-  - [`dir_tests`](#dir_tests)
   - [`dir_dep`](#dir_dep)
   - [`target`](#target)
 - [`[targets.<name>]` sections](#targetsname-sections)
@@ -15,6 +14,7 @@
   - [`abi`](#abi)
   - [`entrypoint`](#entrypoint)
   - [`artifacts`](#artifacts)
+  - [`dir_tests`](#dir_tests)
   - [`binary`](#binary)
   - [`mode`](#mode)
 - [`[deps.<alias>]` sections](#depsalias-sections)
@@ -35,7 +35,6 @@ name = "Mach Compiler"
 version = "0.7.1"
 dir_src = "src"
 dir_out = "out"
-dir_tests = "tests"
 dir_dep = "dep"
 target = "native"
 
@@ -45,6 +44,7 @@ isa = "x86_64"
 abi = "sysv64"
 entrypoint = "main.mach"
 artifacts = "linux"
+dir_tests = "tests"
 binary = "linux/bin/mach"
 mode = "executable"
 
@@ -109,17 +109,6 @@ Project module discovery and resolution are based on this root path.
 The directory where build output is written (per-target, under `dir_out/<artifacts>`).
 
 
-### `dir_tests`
-
-The directory under `dir_out/<artifacts>` where `mach test` writes test binaries.
-For example, with `dir_out = "out"`, `artifacts = "linux"`, and `dir_tests = "tests"`,
-test binaries are written under:
-
-```
-out/linux/tests/
-```
-
-
 ### `dir_dep`
 
 The root directory where dependencies are vendored into.
@@ -170,6 +159,17 @@ For example, with `dir_out = "out"` and `artifacts = "linux"`, intermediate and 
 
 ```
 out/linux/
+```
+
+
+### `dir_tests`
+
+The directory under `dir_out/<artifacts>` where `mach test` writes test binaries for the target.
+For example, with `dir_out = "out"`, `artifacts = "linux"`, and `dir_tests = "tests"`,
+test binaries are written under:
+
+```
+out/linux/tests/
 ```
 
 

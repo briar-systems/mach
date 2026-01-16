@@ -123,6 +123,7 @@ void target_config_init(ConfigTarget *target)
     target->mode       = NULL;
     target->entrypoint = NULL;
     target->artifacts  = NULL;
+    target->dir_tests  = NULL;
     target->binary     = NULL;
 }
 
@@ -135,6 +136,7 @@ void target_config_dnit(ConfigTarget *target)
     free(target->name);
     free(target->entrypoint);
     free(target->artifacts);
+    free(target->dir_tests);
     free(target->binary);
 }
 
@@ -176,7 +178,6 @@ void config_init(Config *config)
     config->version      = NULL;
     config->dir_src      = NULL;
     config->dir_out      = NULL;
-    config->dir_tests    = NULL;
     config->dir_dep      = NULL;
     config->target       = NULL;
     config->targets      = NULL;
@@ -196,7 +197,6 @@ void config_dnit(Config *config)
     free(config->version);
     free(config->dir_src);
     free(config->dir_out);
-    free(config->dir_tests);
     free(config->dir_dep);
     free(config->target);
 
@@ -300,11 +300,7 @@ static Config *config_load_internal(const char *config_path, const char *project
         config->dir_out = strdup(dir_out->as.string);
     }
 
-    toml_value_t *dir_tests = toml_table_get(project, "dir_tests");
-    if (dir_tests && toml_value_is_string(dir_tests))
-    {
-        config->dir_tests = strdup(dir_tests->as.string);
-    }
+
 
     toml_value_t *dir_dep = toml_table_get(project, "dir_dep");
     if (dir_dep && toml_value_is_string(dir_dep))
@@ -372,6 +368,12 @@ static Config *config_load_internal(const char *config_path, const char *project
                 if (artifacts && toml_value_is_string(artifacts))
                 {
                     config->targets[i]->artifacts = strdup(artifacts->as.string);
+                }
+
+                toml_value_t *dir_tests = toml_table_get(target_table, "dir_tests");
+                if (dir_tests && toml_value_is_string(dir_tests))
+                {
+                    config->targets[i]->dir_tests = strdup(dir_tests->as.string);
                 }
 
                 toml_value_t *binary = toml_table_get(target_table, "binary");
@@ -499,13 +501,7 @@ static Config *config_load_internal(const char *config_path, const char *project
         free(config);
         return NULL;
     }
-    if (!config->dir_tests)
-    {
-        fprintf(stderr, "error: missing mandatory field 'dir_tests' in [project]\n");
-        config_dnit(config);
-        free(config);
-        return NULL;
-    }
+
     if (!config->dir_dep)
     {
         fprintf(stderr, "error: missing mandatory field 'dir_dep' in [project]\n");
@@ -567,6 +563,7 @@ static Config *config_load_internal(const char *config_path, const char *project
             free(config);
             return NULL;
         }
+
         if (!t->binary)
         {
             fprintf(stderr, "error: target '%s' missing mandatory field 'binary'\n", t->name);
@@ -653,10 +650,7 @@ bool config_save(Config *config, const char *config_path)
     {
         fprintf(f, "dir_out = \"%s\"\n", config->dir_out);
     }
-    if (config->dir_tests)
-    {
-        fprintf(f, "dir_tests = \"%s\"\n", config->dir_tests);
-    }
+
     if (config->target)
     {
         fprintf(f, "target = \"%s\"\n", config->target);
@@ -692,6 +686,10 @@ bool config_save(Config *config, const char *config_path)
             if (target->artifacts)
             {
                 fprintf(f, "artifacts = \"%s\"\n", target->artifacts);
+            }
+            if (target->dir_tests)
+            {
+                fprintf(f, "dir_tests = \"%s\"\n", target->dir_tests);
             }
             if (target->binary)
             {

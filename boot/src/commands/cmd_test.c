@@ -373,6 +373,54 @@ static char *make_test_fn_name(const char *module_path, int index)
     return strdup(buf);
 }
 
+static char *build_mangled_symbol(const char *module_path, const char *name)
+{
+    const char *path = module_path ? module_path : "main";
+    if (!name)
+    {
+        return NULL;
+    }
+
+    size_t encoded_len = 0;
+    char  *path_copy   = strdup(path);
+    char  *saveptr     = NULL;
+    char  *token       = strtok_r(path_copy, ".", &saveptr);
+    while (token)
+    {
+        char len_str[32];
+        snprintf(len_str, sizeof(len_str), "%zu", strlen(token));
+        encoded_len += strlen(len_str) + strlen(token);
+        token = strtok_r(NULL, ".", &saveptr);
+    }
+    free(path_copy);
+
+    size_t name_len = strlen(name);
+    char   name_len_str[32];
+    snprintf(name_len_str, sizeof(name_len_str), "%zu", name_len);
+
+    size_t total_len = 2 + encoded_len + 1 + strlen(name_len_str) + name_len + 1;
+    char  *mangled   = malloc(total_len);
+    if (!mangled)
+    {
+        return NULL;
+    }
+
+    char *ptr = mangled;
+    ptr += sprintf(ptr, "_M");
+
+    path_copy = strdup(path);
+    token     = strtok_r(path_copy, ".", &saveptr);
+    while (token)
+    {
+        ptr += sprintf(ptr, "%zu%s", strlen(token), token);
+        token = strtok_r(NULL, ".", &saveptr);
+    }
+    free(path_copy);
+
+    sprintf(ptr, "N%zu%s", name_len, name);
+    return mangled;
+}
+
 static bool program_has_fun_name(AstNode *program, const char *name)
 {
     if (!program || program->kind != AST_PROGRAM || !program->program.stmts || !name)
@@ -514,7 +562,12 @@ static AstNode *build_test_start_fn(void)
                                         "syscall\n");
     ast_list_append(body->block_stmt.stmts, exit_masm);
 
-    return make_fun("_start", make_list(), NULL, body);
+    AstNode *start_fn = make_fun("_start", make_list(), NULL, body);
+    if (start_fn)
+    {
+        start_fn->fun_stmt.is_public = true;
+    }
+    return start_fn;
 }
 
 static int collect_tests(AstNode *program, TestInfo **out_tests)
@@ -723,7 +776,7 @@ static char *build_test_output_path(const char *project_root, Config *config, Co
 
     char *out_root   = path_join(project_root, config->dir_out);
     char *out_target = path_join(out_root, target->artifacts);
-    char *tests_root = path_join(out_target, config->dir_tests);
+    char *tests_root = path_join(out_target, target->dir_tests);
     char *output     = path_join(tests_root, rel_path);
 
     free(rel_path);
@@ -803,15 +856,6 @@ int cmd_test_handle(int argc, char **argv)
         return 1;
     }
 
-    if (!config->dir_tests)
-    {
-        fprintf(stderr, "error: missing 'dir_tests' in mach.toml\n");
-        config_dnit(config);
-        free(config);
-        free(project_root);
-        return 1;
-    }
-
     ConfigTarget *target = NULL;
     if (target_name)
     {
@@ -836,6 +880,15 @@ int cmd_test_handle(int argc, char **argv)
             free(project_root);
             return 1;
         }
+    }
+
+    if (!target->dir_tests)
+    {
+        fprintf(stderr, "error: missing 'dir_tests' for target in mach.toml\n");
+        config_dnit(config);
+        free(config);
+        free(project_root);
+        return 1;
     }
 
     char *src_root = path_join(project_root, config->dir_src);
@@ -1047,9 +1100,25 @@ int cmd_test_handle(int argc, char **argv)
             continue;
         }
 
+        char *entry_symbol = build_mangled_symbol(module_path, "_start");
+        if (!entry_symbol)
+        {
+            fprintf(stderr, "error: failed to build entry symbol for '%s'\n", files[i]);
+            free(output_path);
+            masm_destroy(masm);
+            sema_destroy(sema);
+            parser_dnit(&parser);
+            lexer_dnit(&lexer);
+            free(source);
+            free(module_path);
+            had_error = true;
+            continue;
+        }
+
         char link_cmd[4096];
-        snprintf(link_cmd, sizeof(link_cmd), "cc -nostdlib -no-pie -Wl,-e,_start -o %s %s", output_path, obj_path);
+        snprintf(link_cmd, sizeof(link_cmd), "cc -nostdlib -no-pie -Wl,-e,%s -o %s %s", entry_symbol, output_path, obj_path);
         int rc = system(link_cmd);
+        free(entry_symbol);
         if (rc != 0)
         {
             fprintf(stderr, "error: linking failed for '%s' (%d)\n", files[i], rc);
