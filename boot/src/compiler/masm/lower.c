@@ -1131,6 +1131,88 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, var_mem, store_src));
                     return rax;
                 }
+
+                // global assignment
+                const char *name = expr->binary_expr.left->ident_expr.name;
+                if (expr->binary_expr.left->symbol)
+                {
+                    const char *link_name = symbol_get_linkage_name(expr->binary_expr.left->symbol);
+                    if (link_name)
+                    {
+                        name = link_name;
+                    }
+                }
+
+                size_t sym_size = ctx->ptr_size;
+                if (expr->binary_expr.left->type && expr->binary_expr.left->type->size)
+                {
+                    sym_size = expr->binary_expr.left->type->size;
+                }
+                else if (expr->binary_expr.left->symbol && expr->binary_expr.left->symbol->type && expr->binary_expr.left->symbol->type->size)
+                {
+                    sym_size = expr->binary_expr.left->symbol->type->size;
+                }
+
+                if (sym_size == 0)
+                {
+                    sym_size = ctx->ptr_size;
+                }
+
+                // materialize RHS into RAX for expression result
+                MasmOperand rax = isa_result(ctx, ctx->ptr_size);
+                if (!(right_val.kind == MASM_OPERAND_REGISTER && right_val.reg.id == isa_result_id(ctx)))
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, rax, right_val));
+                }
+
+                // load global address
+                MasmOperand addr     = isa_tmp(ctx, ctx->ptr_size);
+                MasmOperand label_op = masm_operand_label(strdup(name));
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, addr, label_op));
+
+                if (sym_size <= 8)
+                {
+                    MasmOperand dst = masm_operand_memory_simple(addr.reg.id, 0, sym_size ? sym_size : 1);
+                    MasmOperand src = rax;
+                    if (sym_size < rax.reg.size)
+                    {
+                        src = masm_operand_register(rax.reg.id, (uint8_t)sym_size);
+                    }
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+                }
+                else
+                {
+                    // copy aggregate bytes from address in rax to global storage
+                    for (int32_t off = 0; off < (int32_t)sym_size;)
+                    {
+                        int32_t chunk = (int32_t)sym_size - off;
+                        if (chunk > 8)
+                        {
+                            chunk = 8;
+                        }
+                        else if (chunk > 4)
+                        {
+                            chunk = 4;
+                        }
+                        else if (chunk > 2)
+                        {
+                            chunk = 2;
+                        }
+                        else
+                        {
+                            chunk = 1;
+                        }
+
+                        MasmOperand tmp = isa_tmp2(ctx, (uint32_t)chunk);
+                        MasmOperand src = masm_operand_memory_simple(rax.reg.id, (int64_t)off, (size_t)chunk);
+                        MasmOperand dst = masm_operand_memory_simple(addr.reg.id, (int64_t)off, (size_t)chunk);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src));
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp));
+                        off += chunk;
+                    }
+                }
+
+                return rax;
             }
             return masm_operand_none();
         }
@@ -3095,8 +3177,8 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             static int label_counter = 0;
             char       else_label[32];
             char       end_label[32];
-            snprintf(else_label, sizeof(else_label), ".Lor_else_%d", label_counter);
-            snprintf(end_label, sizeof(end_label), ".Lor_end_%d", label_counter++);
+            snprintf(else_label, sizeof(else_label), ".Lor_stmt_else_%d", label_counter);
+            snprintf(end_label, sizeof(end_label), ".Lor_stmt_end_%d", label_counter++);
 
             // evaluate condition
             MasmOperand cond = lower_expr(masm, text, stmt->cond_stmt.cond, ctx);
