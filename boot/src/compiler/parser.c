@@ -551,6 +551,7 @@ void parser_synchronize(Parser *parser)
         case TOKEN_KW_VAL:
         case TOKEN_KW_VAR:
         case TOKEN_KW_FUN:
+        case TOKEN_KW_TEST:
         case TOKEN_DOLLAR:
             return;
         default:
@@ -1056,6 +1057,15 @@ AstNode *parser_parse_stmt_top(Parser *parser)
         break;
     case TOKEN_KW_FUN:
         result = parser_parse_stmt_fun(parser, is_public);
+        break;
+    case TOKEN_KW_TEST:
+        if (is_public)
+        {
+            parser_error_at_current(parser, "'pub' cannot precede test blocks");
+            parser_synchronize(parser);
+            return NULL;
+        }
+        result = parser_parse_stmt_test(parser);
         break;
     case TOKEN_KW_REC:
         result = parser_parse_stmt_rec(parser, is_public);
@@ -1710,6 +1720,48 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
     if (!node->fun_stmt.body)
     {
         parser_error_at_current(parser, "expected function body");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    return node;
+}
+
+AstNode *parser_parse_stmt_test(Parser *parser)
+{
+    if (!parser_consume(parser, TOKEN_KW_TEST, "expected 'test' keyword"))
+    {
+        return NULL;
+    }
+
+    AstNode *node = parser_alloc_node(parser, AST_STMT_TEST, parser->previous);
+    if (!node)
+    {
+        return NULL;
+    }
+
+    if (!parser_consume(parser, TOKEN_LIT_STRING, "expected test name string"))
+    {
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    char *name = lexer_eval_lit_string(parser->lexer, parser->previous);
+    if (!name)
+    {
+        parser_report_alloc_failure(parser, "out of memory reading test name");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    node->test_stmt.name = name;
+    node->test_stmt.meta = NULL;
+    node->test_stmt.body = parser_parse_stmt_block(parser);
+    if (!node->test_stmt.body)
+    {
         ast_node_dnit(node);
         free(node);
         return NULL;

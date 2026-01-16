@@ -112,6 +112,20 @@ void ast_node_dnit(AstNode *node)
         }
         break;
 
+    case AST_STMT_TEST:
+        free(node->test_stmt.name);
+        if (node->test_stmt.body)
+        {
+            ast_node_dnit(node->test_stmt.body);
+            free(node->test_stmt.body);
+        }
+        if (node->test_stmt.meta)
+        {
+            ast_list_dnit(node->test_stmt.meta);
+            free(node->test_stmt.meta);
+        }
+        break;
+
     case AST_STMT_REC:
         free(node->rec_stmt.name);
         if (node->rec_stmt.generics)
@@ -638,6 +652,12 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->fun_stmt.method_receiver_name = ast_strdup(node->fun_stmt.method_receiver_name);
         break;
 
+    case AST_STMT_TEST:
+        clone->test_stmt.name = ast_strdup(node->test_stmt.name);
+        clone->test_stmt.body = ast_clone_checked(node->test_stmt.body);
+        clone->test_stmt.meta = ast_list_clone(node->test_stmt.meta);
+        break;
+
     case AST_STMT_REC:
         clone->rec_stmt.name      = ast_strdup(node->rec_stmt.name);
         clone->rec_stmt.generics  = ast_list_clone(node->rec_stmt.generics);
@@ -965,6 +985,16 @@ void ast_print(AstNode *node, int indent)
             print_indent(indent + 1);
             printf("body:\n");
             ast_print(node->fun_stmt.body, indent + 2);
+        }
+        break;
+
+    case AST_STMT_TEST:
+        printf("TEST %s\n", node->test_stmt.name ? node->test_stmt.name : "<unnamed>");
+        if (node->test_stmt.body)
+        {
+            print_indent(indent + 1);
+            printf("body:\n");
+            ast_print(node->test_stmt.body, indent + 2);
         }
         break;
 
@@ -1328,6 +1358,8 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "VAR";
     case AST_STMT_FUN:
         return "FUN";
+    case AST_STMT_TEST:
+        return "TEST";
     case AST_STMT_REC:
         return "REC";
     case AST_STMT_UNI:
@@ -1512,6 +1544,16 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
             print_indent_to_file(file, indent + 1);
             fprintf(file, "body:\n");
             ast_print_to_file(node->fun_stmt.body, file, indent + 2);
+        }
+        break;
+
+    case AST_STMT_TEST:
+        fprintf(file, "TEST %s\n", node->test_stmt.name ? node->test_stmt.name : "<unnamed>");
+        if (node->test_stmt.body)
+        {
+            print_indent_to_file(file, indent + 1);
+            fprintf(file, "body:\n");
+            ast_print_to_file(node->test_stmt.body, file, indent + 2);
         }
         break;
 

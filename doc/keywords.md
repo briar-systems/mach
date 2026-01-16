@@ -23,6 +23,7 @@ This reference lists the reserved keywords and token symbols in the Mach languag
   - [`brk`](#brk)
   - [`fin`](#fin)
   - [`masm`](#masm)
+    - [`test`](#test)
 
 
 # Comments
@@ -365,5 +366,16 @@ fun call_sys(n: u64) u64 {
 ```
 
 `masm` is allowed at both global and function scope, but is currently only lowered inside function bodies.
+
+
+## `test`
+
+> `test "name" { <body> }`
+
+The `test` keyword introduces a top-level test block.
+Each test has a string name and a body that executes in a function-like context.
+Tests are only run when invoking `mach test`.
+Return a non-zero integer to signal failure.
+The bootstrap test runner currently targets Linux x86_64 syscalls.
 
 > Note: this is a limited inline `masm` dialect. Operands may reference local variables by name; it is not intended as a full inline-asm facility with rich interpolation or explicit clobber lists.

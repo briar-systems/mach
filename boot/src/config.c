@@ -30,7 +30,7 @@ static MasmTargetOS find_target_os(const char *value)
     {
         return MASM_OS_COUNT;
     }
-    
+
     MasmTargetOS os = masm_target_os_from_name(value);
     return os;
 }
@@ -42,7 +42,7 @@ static MasmTargetISA find_target_isa(const char *value)
     {
         return MASM_ISA_COUNT;
     }
-    
+
     MasmTargetISA isa = masm_target_isa_from_name(value);
     return isa;
 }
@@ -54,7 +54,7 @@ static MasmTargetABI find_target_abi(const char *value)
     {
         return MASM_ABI_COUNT;
     }
-    
+
     MasmTargetABI abi = masm_target_abi_from_name(value);
     return abi;
 }
@@ -117,9 +117,9 @@ static ConfigDepVersionKind determine_version_kind(const char *version)
 void target_config_init(ConfigTarget *target)
 {
     target->name       = NULL;
-    target->os   = MASM_OS_COUNT;
-    target->isa       = MASM_ISA_COUNT;
-    target->abi       = MASM_ABI_COUNT;
+    target->os         = MASM_OS_COUNT;
+    target->isa        = MASM_ISA_COUNT;
+    target->abi        = MASM_ABI_COUNT;
     target->mode       = NULL;
     target->entrypoint = NULL;
     target->artifacts  = NULL;
@@ -176,6 +176,7 @@ void config_init(Config *config)
     config->version      = NULL;
     config->dir_src      = NULL;
     config->dir_out      = NULL;
+    config->dir_tests    = NULL;
     config->dir_dep      = NULL;
     config->target       = NULL;
     config->targets      = NULL;
@@ -195,6 +196,7 @@ void config_dnit(Config *config)
     free(config->version);
     free(config->dir_src);
     free(config->dir_out);
+    free(config->dir_tests);
     free(config->dir_dep);
     free(config->target);
 
@@ -225,19 +227,19 @@ Config *config_load(const char *config_path)
     {
         return NULL;
     }
-    
+
     char *project_root = strdup(abs_config_path);
-    char *last_sep = strrchr(project_root, '/');
+    char *last_sep     = strrchr(project_root, '/');
     if (last_sep)
     {
         *last_sep = '\0';
     }
-    
+
     Config *config = config_load_internal(abs_config_path, project_root, true);
-    
+
     free(abs_config_path);
     free(project_root);
-    
+
     return config;
 }
 
@@ -266,7 +268,7 @@ static Config *config_load_internal(const char *config_path, const char *project
 
     // parse project section
     toml_value_t *project_val = toml_table_get(root, "project");
-    toml_table_t *project = project_val && toml_value_is_table(project_val) ? project_val->as.table : root;
+    toml_table_t *project     = project_val && toml_value_is_table(project_val) ? project_val->as.table : root;
 
     toml_value_t *id = toml_table_get(project, "id");
     if (id && toml_value_is_string(id))
@@ -296,6 +298,12 @@ static Config *config_load_internal(const char *config_path, const char *project
     if (dir_out && toml_value_is_string(dir_out))
     {
         config->dir_out = strdup(dir_out->as.string);
+    }
+
+    toml_value_t *dir_tests = toml_table_get(project, "dir_tests");
+    if (dir_tests && toml_value_is_string(dir_tests))
+    {
+        config->dir_tests = strdup(dir_tests->as.string);
     }
 
     toml_value_t *dir_dep = toml_table_get(project, "dir_dep");
@@ -433,13 +441,11 @@ static Config *config_load_internal(const char *config_path, const char *project
             {
                 // construct path to dependency: project_root/dir_dep/dep_name/mach.toml
                 char dep_config_path[1024];
-                snprintf(dep_config_path, sizeof(dep_config_path), "%s/%s/%s/mach.toml", 
-                         project_root, config->dir_dep, dep->name);
-                
+                snprintf(dep_config_path, sizeof(dep_config_path), "%s/%s/%s/mach.toml", project_root, config->dir_dep, dep->name);
+
                 // construct dependency project root for recursive loading
                 char dep_project_root[1024];
-                snprintf(dep_project_root, sizeof(dep_project_root), "%s/%s/%s", 
-                         project_root, config->dir_dep, dep->name);
+                snprintf(dep_project_root, sizeof(dep_project_root), "%s/%s/%s", project_root, config->dir_dep, dep->name);
 
                 // dependency vendoring is allowed to lag behind config. only attempt to load
                 // the dependency config if it exists on disk.
@@ -489,6 +495,13 @@ static Config *config_load_internal(const char *config_path, const char *project
     if (!config->dir_out)
     {
         fprintf(stderr, "error: missing mandatory field 'dir_out' in [project]\n");
+        config_dnit(config);
+        free(config);
+        return NULL;
+    }
+    if (!config->dir_tests)
+    {
+        fprintf(stderr, "error: missing mandatory field 'dir_tests' in [project]\n");
         config_dnit(config);
         free(config);
         return NULL;
@@ -640,6 +653,10 @@ bool config_save(Config *config, const char *config_path)
     {
         fprintf(f, "dir_out = \"%s\"\n", config->dir_out);
     }
+    if (config->dir_tests)
+    {
+        fprintf(f, "dir_tests = \"%s\"\n", config->dir_tests);
+    }
     if (config->target)
     {
         fprintf(f, "target = \"%s\"\n", config->target);
@@ -743,14 +760,12 @@ ConfigTarget *config_get_target(Config *config, const char *name)
     if (strcmp(name, "native") == 0)
     {
         MasmTarget target = masm_target_native();
-        
+
         // match target to config target based on OS, ISA, and ABI
         for (int i = 0; i < config->target_count; i++)
         {
             ConfigTarget *cfg_target = config->targets[i];
-            if (cfg_target->os == target.os &&
-                cfg_target->isa == target.isa &&
-                cfg_target->abi == target.abi)
+            if (cfg_target->os == target.os && cfg_target->isa == target.isa && cfg_target->abi == target.abi)
             {
                 return cfg_target;
             }
@@ -758,7 +773,6 @@ ConfigTarget *config_get_target(Config *config, const char *name)
 
         return NULL;
     }
-
 
     for (int i = 0; i < config->target_count; i++)
     {

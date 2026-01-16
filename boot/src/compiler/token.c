@@ -96,6 +96,8 @@ char *token_kind_to_string(TokenKind kind)
         return "fin";
     case TOKEN_KW_MASM:
         return "masm";
+    case TOKEN_KW_TEST:
+        return "test";
 
     case TOKEN_L_PAREN:
         return "(";
@@ -261,6 +263,10 @@ TokenKind token_kind_from_identifier(const char *text, int len)
         if (strncmp(text, "masm", 4) == 0)
         {
             return TOKEN_KW_MASM;
+        }
+        if (strncmp(text, "test", 4) == 0)
+        {
+            return TOKEN_KW_TEST;
         }
     }
 

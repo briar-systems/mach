@@ -16,24 +16,25 @@ typedef enum TokenKind
     TOKEN_IDENTIFIER,
 
     // keywords
-    TOKEN_KW_USE, // use
-    TOKEN_KW_EXT, // ext
-    TOKEN_KW_DEF, // def
-    TOKEN_KW_PUB, // pub
-    TOKEN_KW_REC, // rec
-    TOKEN_KW_UNI, // uni
-    TOKEN_KW_VAL, // val
-    TOKEN_KW_VAR, // var
-    TOKEN_KW_FUN, // fun
-    TOKEN_KW_RET, // ret
-    TOKEN_KW_IF,  // if
-    TOKEN_KW_OR,  // or
-    TOKEN_KW_FOR, // for
-    TOKEN_KW_CNT, // cnt
-    TOKEN_KW_BRK, // brk
-    TOKEN_KW_NIL, // nil
-    TOKEN_KW_FIN, // fin
+    TOKEN_KW_USE,  // use
+    TOKEN_KW_EXT,  // ext
+    TOKEN_KW_DEF,  // def
+    TOKEN_KW_PUB,  // pub
+    TOKEN_KW_REC,  // rec
+    TOKEN_KW_UNI,  // uni
+    TOKEN_KW_VAL,  // val
+    TOKEN_KW_VAR,  // var
+    TOKEN_KW_FUN,  // fun
+    TOKEN_KW_RET,  // ret
+    TOKEN_KW_IF,   // if
+    TOKEN_KW_OR,   // or
+    TOKEN_KW_FOR,  // for
+    TOKEN_KW_CNT,  // cnt
+    TOKEN_KW_BRK,  // brk
+    TOKEN_KW_NIL,  // nil
+    TOKEN_KW_FIN,  // fin
     TOKEN_KW_MASM, // masm
+    TOKEN_KW_TEST, // test
 
     // punctuation
     TOKEN_L_PAREN,    // (

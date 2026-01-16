@@ -6,6 +6,7 @@
   - [`version`](#version)
   - [`dir_src`](#dir_src)
   - [`dir_out`](#dir_out)
+  - [`dir_tests`](#dir_tests)
   - [`dir_dep`](#dir_dep)
   - [`target`](#target)
 - [`[targets.<name>]` sections](#targetsname-sections)
@@ -34,6 +35,7 @@ name = "Mach Compiler"
 version = "0.7.1"
 dir_src = "src"
 dir_out = "out"
+dir_tests = "tests"
 dir_dep = "dep"
 target = "native"
 
@@ -105,6 +107,17 @@ Project module discovery and resolution are based on this root path.
 ### `dir_out`
 
 The directory where build output is written (per-target, under `dir_out/<artifacts>`).
+
+
+### `dir_tests`
+
+The directory under `dir_out/<artifacts>` where `mach test` writes test binaries.
+For example, with `dir_out = "out"`, `artifacts = "linux"`, and `dir_tests = "tests"`,
+test binaries are written under:
+
+```
+out/linux/tests/
+```
 
 
 ### `dir_dep`

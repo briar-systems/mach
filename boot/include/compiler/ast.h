@@ -21,6 +21,7 @@ typedef enum AstKind
     AST_STMT_VAL,
     AST_STMT_VAR,
     AST_STMT_FUN,
+    AST_STMT_TEST,
     AST_STMT_FIELD,
     AST_STMT_PARAM,
     AST_STMT_REC,
@@ -154,6 +155,14 @@ struct AstNode
             char    *method_receiver_name; // receiver identifier from '(name: Type)'
         } fun_stmt;
 
+        // test statement
+        struct
+        {
+            char    *name;
+            AstNode *body;
+            AstList *meta; // reserved for future metadata
+        } test_stmt;
+
         // record statement
         struct
         {
@@ -204,10 +213,16 @@ struct AstNode
         struct
         {
             AstNode *inner; // wrapped expression
-            
+
             // Evaluated compile-time value
-            enum { COMPTIME_UNEVALUATED, COMPTIME_INT, COMPTIME_STRING } value_kind;
-            union {
+            enum
+            {
+                COMPTIME_UNEVALUATED,
+                COMPTIME_INT,
+                COMPTIME_STRING
+            } value_kind;
+            union
+            {
                 int64_t int_value;
                 char   *string_value;
             };
