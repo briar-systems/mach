@@ -423,15 +423,40 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             }
             else
             {
-                emit_rex(buffer, &offset, size, sz == 8, false, false, dst >= 8);
-                emit_byte(buffer, &offset, size, (uint8_t)(0xB8 + reg_low(dst)));
-                if (sz == 8)
+                if (sz == 2) emit_byte(buffer, &offset, size, 0x66);
+
+                if (sz == 8 && (uint64_t)imm <= 0xFFFFFFFF)
                 {
-                    emit_imm64(buffer, &offset, size, imm);
+                    // Optimize: MOV r32, imm32 (zero extends to 64)
+                    emit_rex(buffer, &offset, size, false, false, false, dst >= 8);
+                    emit_byte(buffer, &offset, size, (uint8_t)(0xB8 + reg_low(dst)));
+                    emit_imm32(buffer, &offset, size, (int32_t)imm);
+                }
+                else if (sz == 8 && (imm >= -2147483648LL && imm <= 2147483647LL))
+                {
+                    // Optimize: MOV r/m64, imm32 (sign extends)
+                    emit_rex(buffer, &offset, size, true, false, false, dst >= 8);
+                    emit_byte(buffer, &offset, size, 0xC7);
+                    emit_byte(buffer, &offset, size, encode_modrm(0xC0, 0, reg_low(dst)));
+                    emit_imm32(buffer, &offset, size, (int32_t)imm);
                 }
                 else
                 {
-                    emit_imm32(buffer, &offset, size, (int32_t)imm);
+                    emit_rex(buffer, &offset, size, sz == 8, false, false, dst >= 8);
+                    emit_byte(buffer, &offset, size, (uint8_t)(0xB8 + reg_low(dst)));
+                    if (sz == 8)
+                    {
+                        emit_imm64(buffer, &offset, size, imm);
+                    }
+                    else if (sz == 2)
+                    {
+                        emit_byte(buffer, &offset, size, (uint8_t)imm);
+                        emit_byte(buffer, &offset, size, (uint8_t)(imm >> 8));
+                    }
+                    else
+                    {
+                        emit_imm32(buffer, &offset, size, (int32_t)imm);
+                    }
                 }
             }
         }

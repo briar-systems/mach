@@ -274,11 +274,28 @@ static void emit_binary_op(MasmSection *sec, CodeGenContext *ctx, MasmInstructio
     
     // Load a -> RAX
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
-    // Load b -> RCX
-    load_operand(sec, ctx, b, MASM_X86_RCX, 0);
-    
-    // OP RAX, RCX
-    emit_inst(sec, masm_inst_2(x86_opcode, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
+
+    // Optimize: OP RAX, IMM
+    bool use_imm = false;
+    if (b.kind == MASM_OPERAND_IMM && x86_opcode != MASM_OP_IMUL)
+    {
+        if (b.imm >= -2147483648LL && b.imm <= 2147483647LL)
+        {
+             use_imm = true;
+        }
+    }
+
+    if (use_imm)
+    {
+        emit_inst(sec, masm_inst_2(x86_opcode, masm_x86_reg(MASM_X86_RAX, size), b));
+    }
+    else
+    {
+        // Load b -> RCX
+        load_operand(sec, ctx, b, MASM_X86_RCX, 0);
+        // OP RAX, RCX
+        emit_inst(sec, masm_inst_2(x86_opcode, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
+    }
     
     // Store RAX -> dst
     if (dst.kind == MASM_OPERAND_REGISTER)
@@ -378,11 +395,18 @@ static void emit_shift(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
     // Load src -> RAX
     load_operand(sec, ctx, src, MASM_X86_RAX, 0);
 
-    // Load cnt -> RCX
-    load_operand(sec, ctx, cnt, MASM_X86_RCX, 0);
-
-    // SHL/SHR/SAR RAX, CL
-    emit_inst(sec, masm_inst_2(x86_opcode, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, 1)));
+    if (cnt.kind == MASM_OPERAND_IMM)
+    {
+        // SHL/SHR/SAR RAX, IMM
+        emit_inst(sec, masm_inst_2(x86_opcode, masm_x86_reg(MASM_X86_RAX, size), cnt));
+    }
+    else
+    {
+        // Load cnt -> RCX
+        load_operand(sec, ctx, cnt, MASM_X86_RCX, 0);
+        // SHL/SHR/SAR RAX, CL
+        emit_inst(sec, masm_inst_2(x86_opcode, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, 1)));
+    }
 
     if (dst.kind == MASM_OPERAND_REGISTER)
     {
@@ -518,6 +542,26 @@ static void emit_mov(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
     else if (dst.kind == MASM_OPERAND_MEMORY)
     {
         // Store to memory
+
+        // Optimize: MOV [mem], imm (if fits in 32-bit)
+        if (src.kind == MASM_OPERAND_IMM)
+        {
+            bool fits = true;
+            if (dst.mem.size == 8 && (src.imm < -2147483648LL || src.imm > 2147483647LL)) fits = false;
+
+            if (fits)
+            {
+                MasmOperand mem = dst;
+                if (mem.mem.base.id >= VREG_START)
+                {
+                     load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
+                     mem.mem.base.id = MASM_X86_RCX;
+                }
+                emit_inst(sec, masm_inst_2(MASM_OP_MOV, mem, src));
+                return;
+            }
+        }
+
         // Load src -> RAX
         load_operand(sec, ctx, src, MASM_X86_RAX, 0);
         
@@ -747,9 +791,16 @@ static void emit_cmp_branch(MasmSection *sec, CodeGenContext *ctx, MasmInstructi
     else if (b.kind == MASM_OPERAND_REGISTER) size = b.reg.size;
 
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
-    load_operand(sec, ctx, b, MASM_X86_RCX, 0);
-    
-    emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
+
+    if (b.kind == MASM_OPERAND_IMM && (b.imm >= -2147483648LL && b.imm <= 2147483647LL))
+    {
+        emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, size), b));
+    }
+    else
+    {
+        load_operand(sec, ctx, b, MASM_X86_RCX, 0);
+        emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
+    }
     emit_inst(sec, masm_inst_1(jcc_op, label));
 }
 
@@ -764,9 +815,16 @@ static void emit_setcc(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
     else if (b.kind == MASM_OPERAND_REGISTER) size = b.reg.size;
 
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
-    load_operand(sec, ctx, b, MASM_X86_RCX, 0);
-    
-    emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
+
+    if (b.kind == MASM_OPERAND_IMM && (b.imm >= -2147483648LL && b.imm <= 2147483647LL))
+    {
+        emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, size), b));
+    }
+    else
+    {
+        load_operand(sec, ctx, b, MASM_X86_RCX, 0);
+        emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
+    }
     
     MasmOperand al = masm_x86_reg(MASM_X86_RAX, 1);
     emit_inst(sec, masm_inst_1(setcc_op, al));
