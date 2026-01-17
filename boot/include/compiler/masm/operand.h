@@ -23,6 +23,8 @@ typedef struct MasmRegister
     uint8_t  size; // in bytes
 } MasmRegister;
 
+#define MASM_REG_FLOAT_FLAG 0x80000000
+
 // memory reference: [base + index * scale + disp]
 typedef struct MasmMemory
 {

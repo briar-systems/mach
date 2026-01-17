@@ -722,6 +722,10 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         {
             AstNode *arg = args->items[i];
             op_args[i] = ensure_in_reg(text, lower_expr(masm, text, arg, ctx), arg->type, ctx);
+            if (arg->type && type_is_float(arg->type))
+            {
+                op_args[i].reg.id |= MASM_REG_FLOAT_FLAG;
+            }
         }
     }
 

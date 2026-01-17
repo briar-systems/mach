@@ -681,41 +681,99 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
     MasmOperand tgt = inst->operands[1];
     int arg_count = inst->operand_count - 2;
     
-    // SysV ABI Regs: RDI, RSI, RDX, RCX, R8, R9
-    MasmX86Reg arg_regs[] = {MASM_X86_RDI, MASM_X86_RSI, MASM_X86_RDX, MASM_X86_RCX, MASM_X86_R8, MASM_X86_R9};
+    MasmX86Reg int_regs[] = {MASM_X86_RDI, MASM_X86_RSI, MASM_X86_RDX, MASM_X86_RCX, MASM_X86_R8, MASM_X86_R9};
+    int int_count = 6;
+    int xmm_count = 8;
+
+    struct ArgLoc {
+        bool is_stack;
+        bool is_float;
+        int  reg_idx;
+    };
     
-    // Stack alignment for call
-    // RSP must be 16-byte aligned before CALL (which pushes return address 8 bytes).
-    // Current RSP is aligned to 16 bytes (assuming stack frame setup correctly).
-    // Pushing args changes alignment.
-    // If we have stack args, we need to ensure (stack_arg_count * 8) % 16 == 0?
-    // No, we need (RSP_after_pushes) % 16 == 0.
-    // Since RSP_start % 16 == 0, if stack_arg_count is odd, we are misaligned.
-    // So if stack_arg_count % 2 != 0, we push padding.
-    
-    int stack_args = arg_count - 6;
-    if (stack_args > 0 && (stack_args % 2 != 0))
+    struct ArgLoc *locs = malloc(sizeof(struct ArgLoc) * arg_count);
+    int int_used = 0;
+    int xmm_used = 0;
+    int stack_count = 0;
+
+    // Classify args
+    for (int i = 0; i < arg_count; i++)
     {
+        MasmOperand op = inst->operands[2 + i];
+        bool is_float = (op.kind == MASM_OPERAND_REGISTER) && (op.reg.id & MASM_REG_FLOAT_FLAG);
+        locs[i].is_float = is_float;
+
+        if (is_float)
+        {
+            if (xmm_used < xmm_count) {
+                locs[i].is_stack = false;
+                locs[i].reg_idx = xmm_used++;
+            } else {
+                locs[i].is_stack = true;
+                stack_count++;
+            }
+        }
+        else
+        {
+            if (int_used < int_count) {
+                locs[i].is_stack = false;
+                locs[i].reg_idx = int_used++;
+            } else {
+                locs[i].is_stack = true;
+                stack_count++;
+            }
+        }
+    }
+
+    // Align stack
+    int pad = 0;
+    if (stack_count > 0 && (stack_count % 2 != 0))
+    {
+        pad = 8;
         emit_inst(sec, masm_inst_2(MASM_OP_SUB, masm_x86_reg(MASM_X86_RSP, 8), masm_operand_imm(8)));
     }
 
-    // Load args
+    // Push stack args (reverse order)
+    for (int i = arg_count - 1; i >= 0; i--)
+    {
+        if (locs[i].is_stack)
+        {
+            MasmOperand op = inst->operands[2 + i];
+            op.reg.id &= ~MASM_REG_FLOAT_FLAG;
+            load_operand(sec, ctx, op, MASM_X86_RAX, 0);
+            emit_inst(sec, masm_inst_1(MASM_OP_PUSH, masm_x86_reg(MASM_X86_RAX, 8)));
+        }
+    }
+
+    // Load register args
     for (int i = 0; i < arg_count; i++)
     {
-        if (i < 6)
+        if (!locs[i].is_stack)
         {
-            load_operand(sec, ctx, inst->operands[2 + i], arg_regs[i], 0);
+            MasmOperand op = inst->operands[2 + i];
+            op.reg.id &= ~MASM_REG_FLOAT_FLAG;
+
+            if (locs[i].is_float)
+            {
+                MasmOperand xmm_dest = masm_operand_register(locs[i].reg_idx, 16);
+                if (op.kind == MASM_OPERAND_REGISTER)
+                {
+                    int32_t off = get_vreg_offset(ctx, op.reg.id);
+                    MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+                    emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, xmm_dest, mem));
+                }
+            }
+            else
+            {
+                load_operand(sec, ctx, op, int_regs[locs[i].reg_idx], 0);
+            }
         }
     }
     
-    // Push stack args in reverse order
-    for (int i = arg_count - 1; i >= 6; i--)
-    {
-        load_operand(sec, ctx, inst->operands[2 + i], MASM_X86_RAX, 0);
-        emit_inst(sec, masm_inst_1(MASM_OP_PUSH, masm_x86_reg(MASM_X86_RAX, 8)));
-    }
-    
-    // Load target -> RAX if not label
+    // Set AL = vector regs count (for varargs)
+    emit_inst(sec, masm_inst_2(MASM_OP_MOV, masm_x86_reg(MASM_X86_RAX, 1), masm_operand_imm(xmm_used > 8 ? 8 : xmm_used)));
+
+    // Call
     if (tgt.kind == MASM_OPERAND_REGISTER || tgt.kind == MASM_OPERAND_MEMORY)
     {
         load_operand(sec, ctx, tgt, MASM_X86_RAX, 0);
@@ -725,12 +783,21 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
     {
         emit_inst(sec, masm_inst_1(MASM_OP_CALL, tgt));
     }
+
+    // Restore stack
+    int total_stack_bytes = (stack_count * 8) + pad;
+    if (total_stack_bytes > 0)
+    {
+        emit_inst(sec, masm_inst_2(MASM_OP_ADD, masm_x86_reg(MASM_X86_RSP, 8), masm_operand_imm(total_stack_bytes)));
+    }
     
     // Store result RAX -> dst
     if (dst.kind != MASM_OPERAND_NONE)
     {
         store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
     }
+    
+    free(locs);
 }
 
 static void emit_syscall(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
@@ -777,6 +844,90 @@ static void emit_syscall(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
     if (dst.kind != MASM_OPERAND_NONE)
     {
         store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+    }
+}
+
+static void emit_fconv(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
+{
+    MasmOperand dst = inst->operands[0];
+    MasmOperand src = inst->operands[1];
+    int64_t mode    = inst->operands[2].imm;
+
+    if (mode == 0) // int -> float
+    {
+        // Load integer src -> RAX
+        load_operand(sec, ctx, src, MASM_X86_RAX, 0);
+
+        uint32_t opcode = (dst.reg.size == 4) ? MASM_OP_X86_CVTSI2SS : MASM_OP_X86_CVTSI2SD;
+        uint8_t src_size = (src.kind == MASM_OPERAND_REGISTER) ? src.reg.size : 8;
+
+        // cvtsi2sx xmm0, rax
+        emit_inst(sec, masm_inst_2(opcode, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, src_size)));
+
+        // Store float result -> dst
+        if (dst.kind == MASM_OPERAND_REGISTER)
+        {
+            int32_t off = get_vreg_offset(ctx, dst.reg.id);
+            MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+            emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, mem, masm_operand_register(0, 16)));
+        }
+    }
+    else if (mode == 1) // float -> int
+    {
+        // Load float src -> XMM0
+        if (src.kind == MASM_OPERAND_REGISTER)
+        {
+            int32_t off = get_vreg_offset(ctx, src.reg.id);
+            MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+            emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
+        }
+        else if (src.kind == MASM_OPERAND_IMM)
+        {
+             emit_inst(sec, masm_inst_2(MASM_OP_MOV, masm_x86_reg(MASM_X86_RAX, 8), src));
+             emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, 8)));
+        }
+
+        uint8_t src_size = (src.kind == MASM_OPERAND_REGISTER) ? src.reg.size : 8;
+        uint32_t opcode = (src_size == 4) ? MASM_OP_X86_CVTTSS2SI : MASM_OP_X86_CVTTSD2SI;
+
+        // cvttsx2si rax, xmm0
+        emit_inst(sec, masm_inst_2(opcode, masm_x86_reg(MASM_X86_RAX, dst.reg.size), masm_operand_register(0, 16)));
+
+        // Store integer result -> dst
+        store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+    }
+    else // float -> float
+    {
+        // Load float src -> XMM0
+        if (src.kind == MASM_OPERAND_REGISTER)
+        {
+            int32_t off = get_vreg_offset(ctx, src.reg.id);
+            MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+            emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
+        }
+        else if (src.kind == MASM_OPERAND_IMM)
+        {
+             emit_inst(sec, masm_inst_2(MASM_OP_MOV, masm_x86_reg(MASM_X86_RAX, 8), src));
+             emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, 8)));
+        }
+        
+        uint8_t src_size = (src.kind == MASM_OPERAND_REGISTER) ? src.reg.size : 8;
+        uint32_t opcode = 0;
+        if (src_size == 4 && dst.reg.size == 8) opcode = MASM_OP_X86_CVTSS2SD;
+        else if (src_size == 8 && dst.reg.size == 4) opcode = MASM_OP_X86_CVTSD2SS;
+        
+        if (opcode != 0)
+        {
+            emit_inst(sec, masm_inst_2(opcode, masm_operand_register(0, 16), masm_operand_register(0, 16)));
+        }
+        
+        // Store float result -> dst
+        if (dst.kind == MASM_OPERAND_REGISTER)
+        {
+            int32_t off = get_vreg_offset(ctx, dst.reg.id);
+            MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+            emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, mem, masm_operand_register(0, 16)));
+        }
     }
 }
 
@@ -910,6 +1061,7 @@ static void x86_64_codegen(Masm *masm)
                 case MASM_IR_FMUL: emit_float_op(out, &ctx, inst, MASM_OP_X86_MULSD); break;
                 case MASM_IR_FDIV: emit_float_op(out, &ctx, inst, MASM_OP_X86_DIVSD); break;
                 case MASM_IR_FCMP: emit_float_cmp(out, &ctx, inst); break;
+                case MASM_IR_FCONV: emit_fconv(out, &ctx, inst); break;
 
                 case MASM_IR_SEQ: emit_setcc(out, &ctx, inst, MASM_OP_SETE); break;
                 case MASM_IR_SNE: emit_setcc(out, &ctx, inst, MASM_OP_SETNE); break;

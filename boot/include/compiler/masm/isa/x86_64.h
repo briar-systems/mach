@@ -22,6 +22,14 @@ typedef enum MasmX86Opcode
     MASM_OP_X86_SUBSD,  // subsd xmm1, xmm2/m64
     MASM_OP_X86_MULSD,  // mulsd xmm1, xmm2/m64
     MASM_OP_X86_DIVSD,  // divsd xmm1, xmm2/m64
+
+    // sse conversions
+    MASM_OP_X86_CVTSI2SD,  // cvtsi2sd xmm, r/m32|r/m64
+    MASM_OP_X86_CVTSI2SS,  // cvtsi2ss xmm, r/m32|r/m64
+    MASM_OP_X86_CVTTSD2SI, // cvttsd2si r32|r64, xmm/m64
+    MASM_OP_X86_CVTTSS2SI, // cvttss2si r32|r64, xmm/m32
+    MASM_OP_X86_CVTSD2SS,  // cvtsd2ss xmm1, xmm2/m64
+    MASM_OP_X86_CVTSS2SD,  // cvtss2sd xmm1, xmm2/m32
 } MasmX86Opcode;
 
 // x86_64 registers
