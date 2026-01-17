@@ -66,6 +66,7 @@ const char *masm_ir_name(MasmIrOpcode op)
         // Pseudo-Ops
         case MASM_IR_LABEL: return "label";
         case MASM_IR_DATA: return "data";
+        case MASM_IR_STACK_FRAME: return "stack_frame";
 
         default: return "unknown";
     }

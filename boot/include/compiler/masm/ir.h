@@ -71,6 +71,7 @@ typedef enum MasmIrOpcode
     // Pseudo-Ops
     MASM_IR_LABEL,
     MASM_IR_DATA,
+    MASM_IR_STACK_FRAME,
 
     MASM_IR_COUNT
 } MasmIrOpcode;
@@ -79,3 +80,4 @@ typedef enum MasmIrOpcode
 const char *masm_ir_name(MasmIrOpcode op);
 
 #endif // MASM_IR_H
+
