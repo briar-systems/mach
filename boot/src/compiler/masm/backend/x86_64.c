@@ -150,20 +150,11 @@ static void scan_function(CodeGenContext *ctx, MasmInstruction *insts, size_t co
 // Emitter Helpers
 // -----------------------------------------------------------------------------
 
-static void emit_bytes(MasmSection *section, void *data, size_t len)
-{
-    masm_section_append_data(section, data, len);
-}
+
 
 static void emit_inst(MasmSection *section, MasmInstruction inst)
 {
-    uint8_t buf[15];
-    int len = masm_x86_encode(inst, buf, sizeof(buf));
-    if (len > 0)
-    {
-        emit_bytes(section, buf, len);
-    }
-    masm_inst_destroy(inst);
+    masm_section_append_inst(section, inst);
 }
 
 // Load operand into physical register
@@ -251,7 +242,14 @@ static void load_operand(MasmSection *sec, CodeGenContext *ctx, MasmOperand op, 
 // Store physical register to vreg slot
 static void store_vreg(MasmSection *sec, CodeGenContext *ctx, uint32_t vreg_id, MasmX86Reg src_reg, uint8_t size)
 {
-    if (vreg_id < VREG_START) return; // Physical destination, assumed already there
+    if (vreg_id < VREG_START)
+    {
+        if (vreg_id != (uint32_t)src_reg)
+        {
+            emit_inst(sec, masm_inst_2(MASM_OP_MOV, masm_operand_register(vreg_id, size), masm_x86_reg(src_reg, size)));
+        }
+        return;
+    }
     
     int32_t off = get_vreg_offset(ctx, vreg_id);
     MasmOperand slot = masm_operand_memory_simple(MASM_X86_RBP, -off, size);
@@ -269,6 +267,10 @@ static void emit_binary_op(MasmSection *sec, CodeGenContext *ctx, MasmInstructio
     MasmOperand dst = inst->operands[0];
     MasmOperand a   = inst->operands[1];
     MasmOperand b   = inst->operands[2];
+
+    uint8_t size = 8;
+    if (dst.kind == MASM_OPERAND_REGISTER) size = dst.reg.size;
+    else if (a.kind == MASM_OPERAND_REGISTER) size = a.reg.size;
     
     // Load a -> RAX
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
@@ -276,9 +278,219 @@ static void emit_binary_op(MasmSection *sec, CodeGenContext *ctx, MasmInstructio
     load_operand(sec, ctx, b, MASM_X86_RCX, 0);
     
     // OP RAX, RCX
-    emit_inst(sec, masm_inst_2(x86_opcode, masm_x86_reg(MASM_X86_RAX, 8), masm_x86_reg(MASM_X86_RCX, 8)));
+    emit_inst(sec, masm_inst_2(x86_opcode, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
     
     // Store RAX -> dst
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+    }
+}
+
+static void emit_div_rem(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst, bool is_signed, bool is_rem)
+{
+    MasmOperand dst = inst->operands[0];
+    MasmOperand a   = inst->operands[1];
+    MasmOperand b   = inst->operands[2];
+
+    uint8_t size = 8;
+    if (dst.kind == MASM_OPERAND_REGISTER) size = dst.reg.size;
+    else if (a.kind == MASM_OPERAND_REGISTER) size = a.reg.size;
+
+    // Load a -> RAX
+    load_operand(sec, ctx, a, MASM_X86_RAX, 0);
+
+    // Prepare dividend
+    if (size == 1)
+    {
+        // 8-bit: Dividend is AX.
+        if (is_signed)
+            emit_inst(sec, masm_inst_0(MASM_OP_CBW)); // AL -> AX
+        else
+            emit_inst(sec, masm_inst_2(MASM_OP_AND, masm_x86_reg(MASM_X86_RAX, 8), masm_operand_imm(0xFF))); // Zero AH
+    }
+    else if (size == 2)
+    {
+        // 16-bit: Dividend is DX:AX
+        if (is_signed)
+            emit_inst(sec, masm_inst_0(MASM_OP_CWD)); // AX -> DX:AX
+        else
+            emit_inst(sec, masm_inst_2(MASM_OP_XOR, masm_x86_reg(MASM_X86_RDX, 2), masm_x86_reg(MASM_X86_RDX, 2))); // Zero DX
+    }
+    else if (size == 4)
+    {
+        // 32-bit: Dividend is EDX:EAX
+        if (is_signed)
+            emit_inst(sec, masm_inst_0(MASM_OP_CDQ)); // EAX -> EDX:EAX
+        else
+            emit_inst(sec, masm_inst_2(MASM_OP_XOR, masm_x86_reg(MASM_X86_RDX, 4), masm_x86_reg(MASM_X86_RDX, 4))); // Zero EDX
+    }
+    else
+    {
+        // 64-bit: Dividend is RDX:RAX
+        if (is_signed)
+            emit_inst(sec, masm_inst_0(MASM_OP_CQO)); // RAX -> RDX:RAX
+        else
+            emit_inst(sec, masm_inst_2(MASM_OP_XOR, masm_x86_reg(MASM_X86_RDX, 8), masm_x86_reg(MASM_X86_RDX, 8))); // Zero RDX
+    }
+
+    // Load b -> RCX
+    load_operand(sec, ctx, b, MASM_X86_RCX, 0);
+
+    // DIV/IDIV RCX
+    emit_inst(sec, masm_inst_1(is_signed ? MASM_OP_IDIV : MASM_OP_DIV, masm_x86_reg(MASM_X86_RCX, size)));
+
+    // Result in RAX (quotient) or RDX (remainder)
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        if (size == 1)
+        {
+            if (is_rem)
+            {
+                // Remainder is in AH. Shift right to get it into AL.
+                emit_inst(sec, masm_inst_2(MASM_OP_SHR, masm_x86_reg(MASM_X86_RAX, 2), masm_operand_imm(8)));
+                store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, 1);
+            }
+            else
+            {
+                // Quotient in AL
+                store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, 1);
+            }
+        }
+        else
+        {
+            MasmX86Reg res_reg = is_rem ? MASM_X86_RDX : MASM_X86_RAX;
+            store_vreg(sec, ctx, dst.reg.id, res_reg, dst.reg.size);
+        }
+    }
+}
+
+static void emit_shift(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst, uint32_t x86_opcode)
+{
+    MasmOperand dst = inst->operands[0];
+    MasmOperand src = inst->operands[1];
+    MasmOperand cnt = inst->operands[2];
+
+    uint8_t size = 8;
+    if (dst.kind == MASM_OPERAND_REGISTER) size = dst.reg.size;
+    else if (src.kind == MASM_OPERAND_REGISTER) size = src.reg.size;
+
+    // Load src -> RAX
+    load_operand(sec, ctx, src, MASM_X86_RAX, 0);
+
+    // Load cnt -> RCX
+    load_operand(sec, ctx, cnt, MASM_X86_RCX, 0);
+
+    // SHL/SHR/SAR RAX, CL
+    emit_inst(sec, masm_inst_2(x86_opcode, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, 1)));
+
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+    }
+}
+
+static void emit_float_op(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst, uint32_t x86_opcode)
+{
+    MasmOperand dst = inst->operands[0];
+    MasmOperand a   = inst->operands[1];
+    MasmOperand b   = inst->operands[2];
+
+    // Load a -> XMM0
+    if (a.kind == MASM_OPERAND_REGISTER)
+    {
+        int32_t off = get_vreg_offset(ctx, a.reg.id);
+        MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+        emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
+    }
+    else if (a.kind == MASM_OPERAND_IMM)
+    {
+        // Load imm -> XMM0 via stack/scratch
+        emit_inst(sec, masm_inst_2(MASM_OP_MOV, masm_x86_reg(MASM_X86_RAX, 8), a));
+        emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, 8)));
+    }
+
+    // Load b -> XMM1
+    if (b.kind == MASM_OPERAND_REGISTER)
+    {
+        int32_t off = get_vreg_offset(ctx, b.reg.id);
+        MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+        emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(1, 16), mem));
+    }
+    else if (b.kind == MASM_OPERAND_IMM)
+    {
+        // Load imm -> XMM1 via stack/scratch
+        emit_inst(sec, masm_inst_2(MASM_OP_MOV, masm_x86_reg(MASM_X86_RAX, 8), b));
+        emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(1, 16), masm_x86_reg(MASM_X86_RAX, 8)));
+    }
+
+    // Op XMM0, XMM1
+    emit_inst(sec, masm_inst_2(x86_opcode, masm_operand_register(0, 16), masm_operand_register(1, 16)));
+
+    // Store XMM0 -> dst
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        int32_t off = get_vreg_offset(ctx, dst.reg.id);
+        MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+        emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, mem, masm_operand_register(0, 16)));
+    }
+}
+
+static void emit_float_cmp(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
+{
+    MasmOperand dst  = inst->operands[0];
+    MasmOperand a    = inst->operands[1];
+    MasmOperand b    = inst->operands[2];
+    int64_t     cond = inst->operands[3].imm;
+
+    // Load a -> XMM0
+    if (a.kind == MASM_OPERAND_REGISTER)
+    {
+        int32_t off = get_vreg_offset(ctx, a.reg.id);
+        MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+        emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
+    }
+    else if (a.kind == MASM_OPERAND_IMM)
+    {
+        emit_inst(sec, masm_inst_2(MASM_OP_MOV, masm_x86_reg(MASM_X86_RAX, 8), a));
+        emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, 8)));
+    }
+
+    // Load b -> XMM1
+    if (b.kind == MASM_OPERAND_REGISTER)
+    {
+        int32_t off = get_vreg_offset(ctx, b.reg.id);
+        MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+        emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(1, 16), mem));
+    }
+    else if (b.kind == MASM_OPERAND_IMM)
+    {
+        emit_inst(sec, masm_inst_2(MASM_OP_MOV, masm_x86_reg(MASM_X86_RAX, 8), b));
+        emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(1, 16), masm_x86_reg(MASM_X86_RAX, 8)));
+    }
+
+    // UCOMISD XMM0, XMM1
+    emit_inst(sec, masm_inst_2(MASM_OP_X86_UCOMISD, masm_operand_register(0, 16), masm_operand_register(1, 16)));
+
+    MasmOpcode setcc_op;
+    switch (cond)
+    {
+        case MASM_IR_FCMP_EQ: setcc_op = MASM_OP_SETE; break;
+        case MASM_IR_FCMP_NE: setcc_op = MASM_OP_SETNE; break;
+        case MASM_IR_FCMP_LT: setcc_op = MASM_OP_SETB; break;
+        case MASM_IR_FCMP_LE: setcc_op = MASM_OP_SETBE; break;
+        case MASM_IR_FCMP_GT: setcc_op = MASM_OP_SETA; break;
+        case MASM_IR_FCMP_GE: setcc_op = MASM_OP_SETAE; break;
+        default: setcc_op = MASM_OP_SETE; break;
+    }
+
+    // SetCC -> AL
+    emit_inst(sec, masm_inst_1(setcc_op, masm_x86_reg(MASM_X86_RAX, 1)));
+    
+    // MOVZX RAX, AL
+    emit_inst(sec, masm_inst_2(MASM_OP_MOVZX, masm_x86_reg(MASM_X86_RAX, 8), masm_x86_reg(MASM_X86_RAX, 1)));
+
+    // Store -> dst
     if (dst.kind == MASM_OPERAND_REGISTER)
     {
         store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
@@ -289,13 +501,19 @@ static void emit_mov(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
 {
     MasmOperand dst = inst->operands[0];
     MasmOperand src = inst->operands[1];
-    
+
     if (dst.kind == MASM_OPERAND_REGISTER)
     {
-        // Load src -> RAX
-        load_operand(sec, ctx, src, MASM_X86_RAX, 0);
-        // Store RAX -> dst
-        store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+        MasmX86Reg scratch = MASM_X86_R11;
+        if (dst.reg.id < VREG_START)
+        {
+            scratch = (MasmX86Reg)dst.reg.id;
+        }
+
+        // Load src -> scratch
+        load_operand(sec, ctx, src, scratch, 0);
+        // Store scratch -> dst
+        store_vreg(sec, ctx, dst.reg.id, scratch, dst.reg.size);
     }
     else if (dst.kind == MASM_OPERAND_MEMORY)
     {
@@ -524,10 +742,14 @@ static void emit_cmp_branch(MasmSection *sec, CodeGenContext *ctx, MasmInstructi
     MasmOperand b = inst->operands[1];
     MasmOperand label = inst->operands[2];
     
+    uint8_t size = 8;
+    if (a.kind == MASM_OPERAND_REGISTER) size = a.reg.size;
+    else if (b.kind == MASM_OPERAND_REGISTER) size = b.reg.size;
+
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
     load_operand(sec, ctx, b, MASM_X86_RCX, 0);
     
-    emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, 8), masm_x86_reg(MASM_X86_RCX, 8)));
+    emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
     emit_inst(sec, masm_inst_1(jcc_op, label));
 }
 
@@ -537,10 +759,14 @@ static void emit_setcc(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
     MasmOperand a = inst->operands[1];
     MasmOperand b = inst->operands[2];
     
+    uint8_t size = 8;
+    if (a.kind == MASM_OPERAND_REGISTER) size = a.reg.size;
+    else if (b.kind == MASM_OPERAND_REGISTER) size = b.reg.size;
+
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
     load_operand(sec, ctx, b, MASM_X86_RCX, 0);
     
-    emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, 8), masm_x86_reg(MASM_X86_RCX, 8)));
+    emit_inst(sec, masm_inst_2(MASM_OP_CMP, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
     
     MasmOperand al = masm_x86_reg(MASM_X86_RAX, 1);
     emit_inst(sec, masm_inst_1(setcc_op, al));
@@ -563,106 +789,134 @@ static void x86_64_codegen(Masm *masm)
         MasmSection *section = masm->sections[i];
         if (section->kind != MASM_SECTION_TEXT) continue;
 
-        // Naive function boundary detection:
-        // We assume functions start with LABEL and have STACK_FRAME near start.
-        // We scan linearly. If we see STACK_FRAME, we reset context and scan ahead.
-        // Or we can just process instructions one by one, but we need to know STACK_FRAME size before emitting.
-        // Actually, scan_function logic relies on seeing the whole function.
-        // Let's identify ranges.
-        
+#ifdef MASM_DEBUG
+        fprintf(stderr, "[codegen] processing section %s (%zu insts)\n", section->name, section->inst_count);
+#endif
 
-        
+        MasmSection *out = masm_section_create(MASM_SECTION_TEXT, section->name);
+
         for (size_t j = 0; j < section->inst_count; j++)
         {
             MasmInstruction *inst = &section->instructions[j];
-            
+
+#ifdef MASM_DEBUG
+            fprintf(stderr, "[codegen] inst %zu: opcode=%d, ops=%d\n", j, inst->opcode, inst->operand_count);
+#endif
+
             if (inst->opcode == MASM_IR_STACK_FRAME)
             {
-                // Found a function body start. Scan from func_start (label) or here?
-                // Scan from here until next label or end.
+                ctx_reset(&ctx);
+
+                // Scan function body
                 size_t end = j + 1;
                 while (end < section->inst_count && section->instructions[end].opcode != MASM_IR_LABEL)
                 {
                     end++;
                 }
-                
-                // Scan this range
                 scan_function(&ctx, &section->instructions[j], end - j);
-                
-                // Now emit for this range (starting from current inst, which is STACK_FRAME)
-                // Wait, we need to emit the LABEL that came before STACK_FRAME too?
-                // The loop iterates j. The label was emitted in previous iterations.
-                // But the context was not ready then?
-                // Labels don't use vregs/stack, so they are fine to emit without context.
-                
-                emit_stack_frame(section, &ctx);
+
+                emit_stack_frame(out, &ctx);
             }
-            else if (inst->opcode == MASM_IR_LABEL)
+            else if (inst->opcode == MASM_IR_LABEL || inst->opcode == MASM_OP_LABEL)
             {
-                // Emit label
-                // Labels are pseudo-ops in encode? x86_encode doesn't handle LABEL op, 
-                // but the Section logic handles label binding if we add symbols.
-                // Actually `masm_x86_encode` returns 0 for LABEL.
-                // We just need to ensure the offset is recorded.
-                // `masm_section_append_inst` does not encode immediately.
-                // `masm_x86_encode` writes bytes.
-                // Labels are usually handled by `emit_object` resolving symbols to current data offset.
-                // We need to record that this label is at current section->data_size.
-                
-                // Find symbol for this label name and update offset
+                // Labels must be preserved
+                masm_section_append_inst(out, masm_inst_create(MASM_OP_LABEL, inst->operands, inst->operand_count));
+            }
+            else
+            {
+                switch (inst->opcode)
+                {
+                case MASM_IR_MOV: emit_mov(out, &ctx, inst); break;
+                case MASM_IR_LOAD: emit_load(out, &ctx, inst); break;
+                case MASM_IR_STORE: emit_store(out, &ctx, inst); break;
+                case MASM_IR_LEA: emit_lea(out, &ctx, inst); break;
+
+                case MASM_IR_ADD: emit_binary_op(out, &ctx, inst, MASM_OP_ADD); break;
+                case MASM_IR_SUB: emit_binary_op(out, &ctx, inst, MASM_OP_SUB); break;
+                case MASM_IR_MUL: emit_binary_op(out, &ctx, inst, MASM_OP_IMUL); break; // signed mul
+                case MASM_IR_AND: emit_binary_op(out, &ctx, inst, MASM_OP_AND); break;
+                case MASM_IR_OR: emit_binary_op(out, &ctx, inst, MASM_OP_OR); break;
+                case MASM_IR_XOR: emit_binary_op(out, &ctx, inst, MASM_OP_XOR); break;
+
+                case MASM_IR_DIV: emit_div_rem(out, &ctx, inst, true, false); break;
+                case MASM_IR_DIVU: emit_div_rem(out, &ctx, inst, false, false); break;
+                case MASM_IR_REM: emit_div_rem(out, &ctx, inst, true, true); break;
+                case MASM_IR_REMU: emit_div_rem(out, &ctx, inst, false, true); break;
+
+                case MASM_IR_SHL: emit_shift(out, &ctx, inst, MASM_OP_SHL); break;
+                case MASM_IR_SHR: emit_shift(out, &ctx, inst, MASM_OP_SHR); break;
+                case MASM_IR_SAR: emit_shift(out, &ctx, inst, MASM_OP_SAR); break;
+
+                case MASM_IR_FADD: emit_float_op(out, &ctx, inst, MASM_OP_X86_ADDSD); break;
+                case MASM_IR_FSUB: emit_float_op(out, &ctx, inst, MASM_OP_X86_SUBSD); break;
+                case MASM_IR_FMUL: emit_float_op(out, &ctx, inst, MASM_OP_X86_MULSD); break;
+                case MASM_IR_FDIV: emit_float_op(out, &ctx, inst, MASM_OP_X86_DIVSD); break;
+                case MASM_IR_FCMP: emit_float_cmp(out, &ctx, inst); break;
+
+                case MASM_IR_SEQ: emit_setcc(out, &ctx, inst, MASM_OP_SETE); break;
+                case MASM_IR_SNE: emit_setcc(out, &ctx, inst, MASM_OP_SETNE); break;
+                case MASM_IR_SLT: emit_setcc(out, &ctx, inst, MASM_OP_SETL); break;
+                case MASM_IR_SGT: emit_setcc(out, &ctx, inst, MASM_OP_SETG); break;
+                case MASM_IR_SLE: emit_setcc(out, &ctx, inst, MASM_OP_SETLE); break;
+                case MASM_IR_SGE: emit_setcc(out, &ctx, inst, MASM_OP_SETGE); break;
+
+                case MASM_IR_BEQ: emit_cmp_branch(out, &ctx, inst, MASM_OP_JE); break;
+                case MASM_IR_BNE: emit_cmp_branch(out, &ctx, inst, MASM_OP_JNE); break;
+                case MASM_IR_BLT: emit_cmp_branch(out, &ctx, inst, MASM_OP_JL); break;
+                case MASM_IR_BGE: emit_cmp_branch(out, &ctx, inst, MASM_OP_JGE); break;
+
+                case MASM_IR_JMP: emit_inst(out, masm_inst_1(MASM_OP_JMP, inst->operands[0])); break;
+                case MASM_IR_RET: emit_ret(out, &ctx, inst); break;
+                case MASM_IR_CALL: emit_call(out, &ctx, inst); break;
+                case MASM_IR_SYSCALL: emit_syscall(out, &ctx, inst); break;
+
+                default:
+                    // Preserve other instructions (e.g. from inline assembly)
+                    masm_section_append_inst(out, masm_inst_create(inst->opcode, inst->operands, inst->operand_count));
+                    break;
+                }
+            }
+        }
+
+        // Replace section instructions
+        for (size_t k = 0; k < section->inst_count; ++k)
+        {
+            masm_inst_destroy(section->instructions[k]);
+        }
+        free(section->instructions);
+        section->instructions = out->instructions;
+        section->inst_count   = out->inst_count;
+        section->inst_capacity = out->inst_capacity;
+        
+        // Prevent double free
+        out->instructions = NULL;
+        out->inst_count = 0;
+        masm_section_destroy(out);
+
+        // Update symbol offsets
+        size_t offset = 0;
+        for (size_t k = 0; k < section->inst_count; ++k)
+        {
+            MasmInstruction *inst = &section->instructions[k];
+            if (inst->opcode == MASM_OP_LABEL)
+            {
                 if (inst->operand_count > 0 && inst->operands[0].kind == MASM_OPERAND_LABEL)
                 {
                     MasmSymbol *sym = masm_get_symbol(masm, inst->operands[0].label);
                     if (sym)
                     {
-                        sym->offset = section->data_size;
-                        // If it's a function symbol, we might want to align?
+                        sym->offset = offset;
                     }
                 }
-                
-                // Update func_start
             }
             else
             {
-                // Emit instruction
-                switch (inst->opcode)
-                {
-                    case MASM_IR_MOV: emit_mov(section, &ctx, inst); break;
-                    case MASM_IR_LOAD: emit_load(section, &ctx, inst); break;
-                    case MASM_IR_STORE: emit_store(section, &ctx, inst); break;
-                    case MASM_IR_LEA: emit_lea(section, &ctx, inst); break;
-                    
-                    case MASM_IR_ADD: emit_binary_op(section, &ctx, inst, MASM_OP_ADD); break;
-                    case MASM_IR_SUB: emit_binary_op(section, &ctx, inst, MASM_OP_SUB); break;
-                    case MASM_IR_MUL: emit_binary_op(section, &ctx, inst, MASM_OP_IMUL); break; // signed mul
-                    case MASM_IR_AND: emit_binary_op(section, &ctx, inst, MASM_OP_AND); break;
-                    case MASM_IR_OR:  emit_binary_op(section, &ctx, inst, MASM_OP_OR); break;
-                    case MASM_IR_XOR: emit_binary_op(section, &ctx, inst, MASM_OP_XOR); break;
-                    
-                    case MASM_IR_SEQ: emit_setcc(section, &ctx, inst, MASM_OP_SETE); break;
-                    case MASM_IR_SNE: emit_setcc(section, &ctx, inst, MASM_OP_SETNE); break;
-                    case MASM_IR_SLT: emit_setcc(section, &ctx, inst, MASM_OP_SETL); break;
-                    case MASM_IR_SGT: emit_setcc(section, &ctx, inst, MASM_OP_SETG); break;
-                    case MASM_IR_SLE: emit_setcc(section, &ctx, inst, MASM_OP_SETLE); break;
-                    case MASM_IR_SGE: emit_setcc(section, &ctx, inst, MASM_OP_SETGE); break;
-                    
-                    case MASM_IR_BEQ: emit_cmp_branch(section, &ctx, inst, MASM_OP_JE); break;
-                    case MASM_IR_BNE: emit_cmp_branch(section, &ctx, inst, MASM_OP_JNE); break;
-                    case MASM_IR_BLT: emit_cmp_branch(section, &ctx, inst, MASM_OP_JL); break;
-                    case MASM_IR_BGE: emit_cmp_branch(section, &ctx, inst, MASM_OP_JGE); break;
-                    
-                    case MASM_IR_JMP: emit_inst(section, masm_inst_1(MASM_OP_JMP, inst->operands[0])); break;
-                    case MASM_IR_RET: emit_ret(section, &ctx, inst); break;
-                    case MASM_IR_CALL: emit_call(section, &ctx, inst); break;
-                    case MASM_IR_SYSCALL: emit_syscall(section, &ctx, inst); break;
-                    
-                    // Unhandled
-                    default: break;
-                }
+                offset += masm_x86_encode(*inst, NULL, 0);
             }
         }
+        section->data_size = offset;
     }
-    
+
     ctx_reset(&ctx);
 }
 

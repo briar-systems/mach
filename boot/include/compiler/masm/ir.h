@@ -76,6 +76,16 @@ typedef enum MasmIrOpcode
     MASM_IR_COUNT
 } MasmIrOpcode;
 
+typedef enum MasmIrFcmpCond
+{
+    MASM_IR_FCMP_EQ,
+    MASM_IR_FCMP_NE,
+    MASM_IR_FCMP_LT,
+    MASM_IR_FCMP_LE,
+    MASM_IR_FCMP_GT,
+    MASM_IR_FCMP_GE
+} MasmIrFcmpCond;
+
 // Helper to get string representation of IR opcode
 const char *masm_ir_name(MasmIrOpcode op);
 

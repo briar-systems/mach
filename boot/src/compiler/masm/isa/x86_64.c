@@ -142,6 +142,9 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
 
     switch (inst.opcode)
     {
+    case MASM_OP_LABEL:
+        break;
+
     case MASM_OP_RET:
         emit_byte(buffer, &offset, size, 0xC3);
         break;
@@ -267,6 +270,23 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
         }
         break;
 
+    case MASM_OP_CBW:
+        // AL -> AX
+        emit_byte(buffer, &offset, size, 0x66);
+        emit_byte(buffer, &offset, size, 0x98);
+        break;
+
+    case MASM_OP_CWD:
+        // AX -> DX:AX
+        emit_byte(buffer, &offset, size, 0x66);
+        emit_byte(buffer, &offset, size, 0x99);
+        break;
+
+    case MASM_OP_CDQ:
+        // EAX -> EDX:EAX
+        emit_byte(buffer, &offset, size, 0x99);
+        break;
+
     case MASM_OP_CQO:
         // sign-extend RAX into RDX:RAX
         emit_rex(buffer, &offset, size, true, false, false, false);
@@ -278,20 +298,29 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
         if (inst.operand_count == 1)
         {
             uint8_t subopcode = inst.opcode == MASM_OP_IDIV ? 7 : 6; // /7 for idiv, /6 for div
-            if (inst.operands[0].kind == MASM_OPERAND_REGISTER)
+            MasmOperand op = inst.operands[0];
+            uint8_t op_size = (op.kind == MASM_OPERAND_REGISTER) ? op.reg.size : op.mem.size;
+            bool byte = op_size == 1;
+            bool w = op_size == 8;
+            bool word = op_size == 2;
+
+            if (word) emit_byte(buffer, &offset, size, 0x66);
+
+            uint8_t opcode = byte ? 0xF6 : 0xF7;
+
+            if (op.kind == MASM_OPERAND_REGISTER)
             {
-                uint32_t rm = inst.operands[0].reg.id;
-                bool     w  = inst.operands[0].reg.size == 8;
-                emit_rex(buffer, &offset, size, w, false, false, rm >= 8);
-                emit_byte(buffer, &offset, size, 0xF7);
+                uint32_t rm = op.reg.id;
+                bool rex_force = byte && (rm >= 4 && rm <= 7);
+                emit_rex_force(buffer, &offset, size, rex_force, w, false, false, rm >= 8);
+                emit_byte(buffer, &offset, size, opcode);
                 emit_byte(buffer, &offset, size, encode_modrm(0xC0, subopcode, reg_low(rm)));
             }
-            else if (inst.operands[0].kind == MASM_OPERAND_MEMORY)
+            else if (op.kind == MASM_OPERAND_MEMORY)
             {
-                bool w = inst.operands[0].mem.size == 8;
-                emit_rex(buffer, &offset, size, w, false, inst.operands[0].mem.index.id >= 8, inst.operands[0].mem.base.id >= 8);
-                emit_byte(buffer, &offset, size, 0xF7);
-                emit_mem(buffer, &offset, size, inst.operands[0].mem.base.id, inst.operands[0].mem.index.id, inst.operands[0].mem.scale, (int32_t)inst.operands[0].mem.disp, subopcode);
+                emit_rex(buffer, &offset, size, w, false, op.mem.index.id >= 8, op.mem.base.id >= 8);
+                emit_byte(buffer, &offset, size, opcode);
+                emit_mem(buffer, &offset, size, op.mem.base.id, op.mem.index.id, op.mem.scale, (int32_t)op.mem.disp, subopcode);
             }
         }
         break;
@@ -406,6 +435,13 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 }
             }
         }
+        else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_LABEL)
+        {
+            uint32_t dst = inst.operands[0].reg.id;
+            emit_rex(buffer, &offset, size, true, false, false, dst >= 8);
+            emit_byte(buffer, &offset, size, (uint8_t)(0xB8 + reg_low(dst)));
+            emit_imm64(buffer, &offset, size, 0);
+        }
         else if (inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_REGISTER)
         {
             uint32_t dst = inst.operands[0].reg.id;
@@ -509,6 +545,110 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
 
         switch (inst.opcode)
         {
+        case MASM_OP_CALL:
+            if (inst.operand_count == 1)
+            {
+                if (inst.operands[0].kind == MASM_OPERAND_LABEL || inst.operands[0].kind == MASM_OPERAND_SYMBOL)
+                {
+                    emit_byte(buffer, &offset, size, 0xE8);
+                    emit_imm32(buffer, &offset, size, 0);
+                }
+                else if (inst.operands[0].kind == MASM_OPERAND_REGISTER)
+                {
+                    uint32_t rm = inst.operands[0].reg.id;
+                    emit_rex(buffer, &offset, size, false, false, false, rm >= 8);
+                    emit_byte(buffer, &offset, size, 0xFF);
+                    emit_byte(buffer, &offset, size, encode_modrm(0xC0, 2, reg_low(rm)));
+                }
+            }
+            break;
+
+        case MASM_OP_JMP:
+            if (inst.operand_count == 1 && inst.operands[0].kind == MASM_OPERAND_LABEL)
+            {
+                emit_byte(buffer, &offset, size, 0xE9);
+                emit_imm32(buffer, &offset, size, 0);
+            }
+            break;
+
+        case MASM_OP_JE:
+        case MASM_OP_JNE:
+        case MASM_OP_JL:
+        case MASM_OP_JLE:
+        case MASM_OP_JG:
+        case MASM_OP_JGE:
+            if (inst.operand_count == 1 && inst.operands[0].kind == MASM_OPERAND_LABEL)
+            {
+                uint8_t cc = 0x80;
+                switch(inst.opcode) {
+                    case MASM_OP_JE: cc = 0x84; break;
+                    case MASM_OP_JNE: cc = 0x85; break;
+                    case MASM_OP_JL: cc = 0x8C; break;
+                    case MASM_OP_JLE: cc = 0x8E; break;
+                    case MASM_OP_JG: cc = 0x8F; break;
+                    case MASM_OP_JGE: cc = 0x8D; break;
+                }
+                emit_byte(buffer, &offset, size, 0x0F);
+                emit_byte(buffer, &offset, size, cc);
+                emit_imm32(buffer, &offset, size, 0);
+            }
+            break;
+
+        case MASM_OP_CMP:
+            if (inst.operand_count == 2)
+            {
+                 MasmOperand a = inst.operands[0];
+                 MasmOperand b = inst.operands[1];
+                 if (a.kind == MASM_OPERAND_REGISTER && (b.kind == MASM_OPERAND_REGISTER || b.kind == MASM_OPERAND_MEMORY))
+                 {
+                     bool w = a.reg.size == 8;
+                     bool rex_r = a.reg.id >= 8;
+                     bool rex_b = (b.kind == MASM_OPERAND_REGISTER) ? b.reg.id >= 8 : b.mem.base.id >= 8;
+                     bool rex_x = (b.kind == MASM_OPERAND_MEMORY) ? b.mem.index.id >= 8 : false;
+                     emit_rex(buffer, &offset, size, w, rex_r, rex_x, rex_b);
+                     emit_byte(buffer, &offset, size, w ? 0x3B : 0x3A);
+                     if (b.kind == MASM_OPERAND_REGISTER)
+                         emit_byte(buffer, &offset, size, encode_modrm(0xC0, reg_low(a.reg.id), reg_low(b.reg.id)));
+                     else
+                         emit_mem(buffer, &offset, size, b.mem.base.id, b.mem.index.id, b.mem.scale, (int32_t)b.mem.disp, reg_low(a.reg.id));
+                 }
+            }
+            break;
+
+        case MASM_OP_SETE:
+        case MASM_OP_SETNE:
+        case MASM_OP_SETL:
+        case MASM_OP_SETG:
+        case MASM_OP_SETLE:
+        case MASM_OP_SETGE:
+        case MASM_OP_SETB:
+        case MASM_OP_SETA:
+        case MASM_OP_SETBE:
+        case MASM_OP_SETAE:
+            if (inst.operand_count == 1 && inst.operands[0].kind == MASM_OPERAND_REGISTER)
+            {
+                 uint8_t cc = 0x90;
+                 switch(inst.opcode) {
+                     case MASM_OP_SETE: cc = 0x94; break;
+                     case MASM_OP_SETNE: cc = 0x95; break;
+                     case MASM_OP_SETL: cc = 0x9C; break;
+                     case MASM_OP_SETLE: cc = 0x9E; break;
+                     case MASM_OP_SETG: cc = 0x9F; break;
+                     case MASM_OP_SETGE: cc = 0x9D; break;
+                     case MASM_OP_SETB: cc = 0x92; break;
+                     case MASM_OP_SETA: cc = 0x97; break;
+                     case MASM_OP_SETBE: cc = 0x96; break;
+                     case MASM_OP_SETAE: cc = 0x93; break;
+                 }
+                 uint32_t r = inst.operands[0].reg.id;
+                 bool rex = r >= 4;
+                 if (rex) emit_rex_force(buffer, &offset, size, true, false, false, false, r >= 8);
+                 emit_byte(buffer, &offset, size, 0x0F);
+                 emit_byte(buffer, &offset, size, cc);
+                 emit_byte(buffer, &offset, size, encode_modrm(0xC0, 0, reg_low(r)));
+            }
+            break;
+
         case MASM_OP_ADD:
             opcode_rm_reg_qw = 0x01;
             opcode_reg_rm_qw = 0x03;
@@ -639,11 +779,15 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                 dst_size = dst.mem.size;
 
             bool byte = dst_size == 1;
-            bool w    = (dst_size == 8) && !byte;
+            bool w    = dst_size == 8;
+            bool word = dst_size == 2;
+
+            if (word) emit_byte(buffer, &offset, size, 0x66);
 
             if (cnt.kind == MASM_OPERAND_IMM)
             {
                 uint8_t opcode = byte ? 0xC0 : 0xC1;
+                if (cnt.imm == 1) opcode = byte ? 0xD0 : 0xD1;
 
                 if (dst.kind == MASM_OPERAND_REGISTER)
                 {
@@ -653,7 +797,7 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                     emit_rex_force(buffer, &offset, size, rex_force, w, false, false, rex_b);
                     emit_byte(buffer, &offset, size, opcode);
                     emit_byte(buffer, &offset, size, encode_modrm(0xC0, subop, reg_low(rm)));
-                    emit_byte(buffer, &offset, size, (uint8_t)cnt.imm);
+                    if (cnt.imm != 1) emit_byte(buffer, &offset, size, (uint8_t)cnt.imm);
                 }
                 else if (dst.kind == MASM_OPERAND_MEMORY)
                 {
@@ -662,7 +806,7 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                     emit_rex(buffer, &offset, size, w, false, rex_x, rex_b);
                     emit_byte(buffer, &offset, size, opcode);
                     emit_mem(buffer, &offset, size, dst.mem.base.id, dst.mem.index.id, dst.mem.scale, (int32_t)dst.mem.disp, subop);
-                    emit_byte(buffer, &offset, size, (uint8_t)cnt.imm);
+                    if (cnt.imm != 1) emit_byte(buffer, &offset, size, (uint8_t)cnt.imm);
                 }
             }
             else if (cnt.kind == MASM_OPERAND_REGISTER)
@@ -905,9 +1049,6 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
                          (int32_t)inst.operands[1].mem.disp, dst);
             }
         }
-        break;
-
-    case MASM_OP_LABEL:
         break;
 
     default:

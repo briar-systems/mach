@@ -30,6 +30,9 @@ typedef enum MasmOpcode
     MASM_OP_SHL,
     MASM_OP_SHR,
     MASM_OP_SAR,
+    MASM_OP_CBW,
+    MASM_OP_CWD,
+    MASM_OP_CDQ,
     MASM_OP_CQO,
     
     // comparison and logical

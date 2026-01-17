@@ -433,32 +433,73 @@ static MasmOperand lower_binary_op(MasmSection *text, TokenKind op, MasmOperand 
     right = ensure_in_reg(text, right, operand_type, ctx);
 
     bool is_signed = operand_type ? type_is_signed(operand_type) : true;
+    bool is_float  = operand_type ? type_is_float(operand_type) : false;
     int  size      = result_type ? result_type->size : 8;
     if (size == 0)
         size = 8;
 
     MasmIrOpcode opcode;
-    switch (op)
+
+    if (is_float)
     {
-    case TOKEN_PLUS:          opcode = MASM_IR_ADD; break;
-    case TOKEN_MINUS:         opcode = MASM_IR_SUB; break;
-    case TOKEN_STAR:          opcode = MASM_IR_MUL; break;
-    case TOKEN_SLASH:         opcode = is_signed ? MASM_IR_DIV : MASM_IR_DIVU; break;
-    case TOKEN_PERCENT:       opcode = is_signed ? MASM_IR_REM : MASM_IR_REMU; break;
-    case TOKEN_AMPERSAND:     opcode = MASM_IR_AND; break;
-    case TOKEN_PIPE:          opcode = MASM_IR_OR; break;
-    case TOKEN_CARET:         opcode = MASM_IR_XOR; break;
-    case TOKEN_LESS_LESS:     opcode = MASM_IR_SHL; break;
-    case TOKEN_GREATER_GREATER: opcode = is_signed ? MASM_IR_SAR : MASM_IR_SHR; break;
-    case TOKEN_EQUAL_EQUAL:   opcode = MASM_IR_SEQ; break;
-    case TOKEN_BANG_EQUAL:    opcode = MASM_IR_SNE; break;
-    case TOKEN_LESS:          opcode = is_signed ? MASM_IR_SLT : MASM_IR_SLTU; break;
-    case TOKEN_LESS_EQUAL:    opcode = is_signed ? MASM_IR_SLE : MASM_IR_SLEU; break;
-    case TOKEN_GREATER:       opcode = is_signed ? MASM_IR_SGT : MASM_IR_SGTU; break;
-    case TOKEN_GREATER_EQUAL: opcode = is_signed ? MASM_IR_SGE : MASM_IR_SGEU; break;
-    default:
-        fprintf(stderr, "masm lower: unhandled binary op %d\n", op);
-        exit(1);
+        switch (op)
+        {
+        case TOKEN_PLUS:  opcode = MASM_IR_FADD; break;
+        case TOKEN_MINUS: opcode = MASM_IR_FSUB; break;
+        case TOKEN_STAR:  opcode = MASM_IR_FMUL; break;
+        case TOKEN_SLASH: opcode = MASM_IR_FDIV; break;
+        case TOKEN_EQUAL_EQUAL:
+        case TOKEN_BANG_EQUAL:
+        case TOKEN_LESS:
+        case TOKEN_LESS_EQUAL:
+        case TOKEN_GREATER:
+        case TOKEN_GREATER_EQUAL: {
+            MasmIrFcmpCond cond;
+            switch (op)
+            {
+            case TOKEN_EQUAL_EQUAL:   cond = MASM_IR_FCMP_EQ; break;
+            case TOKEN_BANG_EQUAL:    cond = MASM_IR_FCMP_NE; break;
+            case TOKEN_LESS:          cond = MASM_IR_FCMP_LT; break;
+            case TOKEN_LESS_EQUAL:    cond = MASM_IR_FCMP_LE; break;
+            case TOKEN_GREATER:       cond = MASM_IR_FCMP_GT; break;
+            case TOKEN_GREATER_EQUAL: cond = MASM_IR_FCMP_GE; break;
+            default:
+                fprintf(stderr, "masm lower: unhandled float comparison %d\n", op);
+                exit(1);
+            }
+            MasmOperand res = isa_result(ctx, size);
+            masm_section_append_inst(text, masm_inst_4(MASM_IR_FCMP, res, left, right, masm_operand_imm(cond)));
+            return res;
+        }
+        default:
+            fprintf(stderr, "masm lower: unhandled float binary op %d\n", op);
+            exit(1);
+        }
+    }
+    else
+    {
+        switch (op)
+        {
+        case TOKEN_PLUS:          opcode = MASM_IR_ADD; break;
+        case TOKEN_MINUS:         opcode = MASM_IR_SUB; break;
+        case TOKEN_STAR:          opcode = MASM_IR_MUL; break;
+        case TOKEN_SLASH:         opcode = is_signed ? MASM_IR_DIV : MASM_IR_DIVU; break;
+        case TOKEN_PERCENT:       opcode = is_signed ? MASM_IR_REM : MASM_IR_REMU; break;
+        case TOKEN_AMPERSAND:     opcode = MASM_IR_AND; break;
+        case TOKEN_PIPE:          opcode = MASM_IR_OR; break;
+        case TOKEN_CARET:         opcode = MASM_IR_XOR; break;
+        case TOKEN_LESS_LESS:     opcode = MASM_IR_SHL; break;
+        case TOKEN_GREATER_GREATER: opcode = is_signed ? MASM_IR_SAR : MASM_IR_SHR; break;
+        case TOKEN_EQUAL_EQUAL:   opcode = MASM_IR_SEQ; break;
+        case TOKEN_BANG_EQUAL:    opcode = MASM_IR_SNE; break;
+        case TOKEN_LESS:          opcode = is_signed ? MASM_IR_SLT : MASM_IR_SLTU; break;
+        case TOKEN_LESS_EQUAL:    opcode = is_signed ? MASM_IR_SLE : MASM_IR_SLEU; break;
+        case TOKEN_GREATER:       opcode = is_signed ? MASM_IR_SGT : MASM_IR_SGTU; break;
+        case TOKEN_GREATER_EQUAL: opcode = is_signed ? MASM_IR_SGE : MASM_IR_SGEU; break;
+        default:
+            fprintf(stderr, "masm lower: unhandled binary op %d\n", op);
+            exit(1);
+        }
     }
 
     MasmOperand res = isa_result(ctx, size);
@@ -1934,7 +1975,8 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 
         if (strncmp(token, "syscall", 7) == 0)
         {
-            masm_section_append_inst(text, masm_inst_0(MASM_IR_SYSCALL));
+            // SYSCALL dest(implicit), target(none)
+            masm_section_append_inst(text, masm_inst_1(MASM_IR_SYSCALL, masm_operand_none()));
         }
         else if (strncmp(token, "call ", 5) == 0)
         {
@@ -1952,11 +1994,11 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
             }
 
             MasmOperand target = masm_operand_label(strdup(label));
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_CALL, target));
+            masm_section_append_inst(text, masm_inst_2(MASM_IR_CALL, masm_operand_none(), target));
         }
         else if (strncmp(token, "ret", 3) == 0)
         {
-            masm_section_append_inst(text, masm_inst_0(MASM_OP_RET));
+            masm_section_append_inst(text, masm_inst_0(MASM_IR_RET));
         }
         else if (strncmp(token, "cmp ", 4) == 0)
         {
@@ -2007,18 +2049,8 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
 
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_XOR, dst_op, src_op));
+                masm_section_append_inst(text, masm_inst_3(MASM_IR_XOR, dst_op, dst_op, src_op));
             }
-        }
-        else if (strncmp(token, "sete ", 5) == 0)
-        {
-            char *reg = token + 5;
-            while (*reg == ' ')
-            {
-                reg++;
-            }
-            MasmOperand dst_op = parse_operand(reg, ctx);
-            masm_section_append_inst(text, masm_inst_1(MASM_OP_SETE, dst_op));
         }
         else if (strncmp(token, "lea ", 4) == 0)
         {
@@ -2042,7 +2074,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
 
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, dst_op, src_op));
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, dst_op, src_op));
             }
         }
         else if (strncmp(token, "and ", 4) == 0)
@@ -2066,13 +2098,12 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
-
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_AND, dst_op, src_op));
+                masm_section_append_inst(text, masm_inst_3(MASM_IR_AND, dst_op, dst_op, src_op));
             }
         }
-        else if (strncmp(token, "sub ", 4) == 0)
+        else if (strncmp(token, "movzx ", 6) == 0)
         {
-            char *operands = token + 4;
+            char *operands = token + 6;
             char *comma    = strchr(operands, ',');
             if (comma)
             {
@@ -2091,8 +2122,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
-
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_SUB, dst_op, src_op));
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, dst_op, src_op));
             }
         }
         else if (strncmp(token, "mov ", 4) == 0)
@@ -2120,7 +2150,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
 
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst_op, src_op));
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, dst_op, src_op));
             }
         }
         else if (strncmp(token, "movzx ", 6) == 0)
@@ -2281,7 +2311,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
 
     MasmSection *text = masm_get_or_create_section(masm, ".text", MASM_SECTION_TEXT);
 
-    masm_section_append_inst(text, masm_inst_1(MASM_OP_LABEL, masm_operand_label(strdup(func_name))));
+    masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(func_name))));
 #ifdef MASM_DEBUG
     fprintf(stderr, "[lower_function] starting %s, text=%p, inst_count=%zu\n", func_name, (void *)text, text->inst_count);
 #endif
