@@ -2084,6 +2084,8 @@ AstNode *parser_parse_stmt_cnt(Parser *parser)
     return node;
 }
 
+
+
 AstNode *parser_parse_stmt_ret(Parser *parser)
 {
     if (!parser_consume(parser, TOKEN_KW_RET, "expected 'ret' keyword"))

@@ -201,6 +201,8 @@ void ast_node_dnit(AstNode *node)
         }
         break;
 
+
+
     case AST_STMT_IF:
         if (node->cond_stmt.cond)
         {
@@ -699,6 +701,8 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->ret_stmt.expr = ast_clone_checked(node->ret_stmt.expr);
         break;
 
+
+
     case AST_STMT_IF:
     case AST_STMT_OR:
         clone->cond_stmt.cond    = ast_clone_checked(node->cond_stmt.cond);
@@ -1050,6 +1054,8 @@ void ast_print(AstNode *node, int indent)
         }
         break;
 
+
+
     case AST_STMT_IF:
         printf("IF\n");
         print_indent(indent + 1);
@@ -1376,6 +1382,7 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "COMPTIME";
     case AST_STMT_RET:
         return "RET";
+
     case AST_STMT_IF:
         return "IF";
     case AST_STMT_OR:
@@ -1606,6 +1613,8 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
             ast_print_to_file(node->ret_stmt.expr, file, indent + 1);
         }
         break;
+
+
     case AST_STMT_IF:
         fprintf(file, "IF\n");
         print_indent_to_file(file, indent + 1);

@@ -3826,6 +3826,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             masm_section_append_inst(text, masm_inst_1(MASM_OP_JMP, masm_operand_label(strdup(ctx->loop_start_label))));
         }
     }
+
     else if (stmt->kind == AST_STMT_EXPR)
     {
         lower_expr(masm, text, stmt->expr_stmt.expr, ctx);

@@ -99,6 +99,7 @@ char *token_kind_to_string(TokenKind kind)
     case TOKEN_KW_TEST:
         return "test";
 
+
     case TOKEN_L_PAREN:
         return "(";
     case TOKEN_R_PAREN:
@@ -268,6 +269,10 @@ TokenKind token_kind_from_identifier(const char *text, int len)
         {
             return TOKEN_KW_TEST;
         }
+    }
+    if (len == 6)
+    {
+
     }
 
     return TOKEN_IDENTIFIER;
