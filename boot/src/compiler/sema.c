@@ -756,6 +756,44 @@ static bool sema_check_untyped_numeric(Sema *sema, AstNode *node, const char *me
     }
 }
 
+// default any remaining untyped numeric literals in a condition expression to i64/f64
+static void sema_default_untyped_literals_in_condition(AstNode *node)
+{
+    if (!node)
+    {
+        return;
+    }
+
+    if (sema_is_untyped_numeric_literal(node))
+    {
+        Token *tok = node->token;
+        if (tok && tok->kind == TOKEN_LIT_FLOAT)
+        {
+            node->type = type_get_primitive(TYPE_F64);
+        }
+        else
+        {
+            node->type = type_get_primitive(TYPE_I64);
+        }
+        return;
+    }
+
+    switch (node->kind)
+    {
+    case AST_EXPR_UNARY:
+        sema_default_untyped_literals_in_condition(node->unary_expr.expr);
+        break;
+
+    case AST_EXPR_BINARY:
+        sema_default_untyped_literals_in_condition(node->binary_expr.left);
+        sema_default_untyped_literals_in_condition(node->binary_expr.right);
+        break;
+
+    default:
+        break;
+    }
+}
+
 static bool sema_try_infer_numeric_literal(AstNode *node, Type *target)
 {
     if (!target || !type_is_numeric(target))
@@ -2124,7 +2162,6 @@ static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
                 sema_error(sema, inner->token, arg->lit_expr.string_val);
                 return -1;
             }
-
         }
     }
 
@@ -2633,8 +2670,6 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         }
         return 0;
 
-
-
     case AST_STMT_EXPR:
     {
         if (sema_analyze_expr(sema, node->expr_stmt.expr) < 0)
@@ -2655,6 +2690,8 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         {
             return -1;
         }
+        // default any remaining untyped literals in condition to i64/f64
+        sema_default_untyped_literals_in_condition(node->cond_stmt.cond);
         if (!sema_check_untyped_numeric(sema, node->cond_stmt.cond, "could not infer type of numeric literal in condition"))
         {
             return -1;
@@ -2674,6 +2711,11 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         {
             return -1;
         }
+        // default any remaining untyped literals in condition to i64/f64
+        if (node->cond_stmt.cond)
+        {
+            sema_default_untyped_literals_in_condition(node->cond_stmt.cond);
+        }
         if (node->cond_stmt.cond && !sema_check_untyped_numeric(sema, node->cond_stmt.cond, "could not infer type of numeric literal in condition"))
         {
             return -1;
@@ -2692,6 +2734,11 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         if (node->for_stmt.cond && sema_analyze_expr(sema, node->for_stmt.cond) < 0)
         {
             return -1;
+        }
+        // default any remaining untyped literals in condition to i64/f64
+        if (node->for_stmt.cond)
+        {
+            sema_default_untyped_literals_in_condition(node->for_stmt.cond);
         }
         if (node->for_stmt.cond && !sema_check_untyped_numeric(sema, node->for_stmt.cond, "could not infer type of numeric literal in loop condition"))
         {
@@ -2886,11 +2933,11 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         // attempt to align untyped numeric literals with their counterpart
         if (type_is_numeric(node->binary_expr.left->type))
         {
-            sema_try_infer_numeric_literal(node->binary_expr.right, node->binary_expr.left->type);
+            sema_infer_numeric_expr(node->binary_expr.right, node->binary_expr.left->type);
         }
         if (type_is_numeric(node->binary_expr.right->type))
         {
-            sema_try_infer_numeric_literal(node->binary_expr.left, node->binary_expr.right->type);
+            sema_infer_numeric_expr(node->binary_expr.left, node->binary_expr.right->type);
         }
 
         // result type depends on operator
@@ -3865,8 +3912,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             sema_error(sema, node->token, "cast requires sized types");
             return -1;
         }
-
-
 
         // forbid dropping constness: &T -> *U (cast-away-const)
         if (from_type->kind == TYPE_POINTER && target_type->kind == TYPE_POINTER)

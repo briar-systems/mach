@@ -258,8 +258,7 @@ static inline bool type_is_signed(Type *t)
 
 static inline bool type_is_unsigned(Type *t)
 {
-    return t && (t->kind == TYPE_U8 || t->kind == TYPE_U16 || t->kind == TYPE_U32 || t->kind == TYPE_U64 ||
-                 t->kind == TYPE_PTR || t->kind == TYPE_POINTER);
+    return t && (t->kind == TYPE_U8 || t->kind == TYPE_U16 || t->kind == TYPE_U32 || t->kind == TYPE_U64 || t->kind == TYPE_PTR || t->kind == TYPE_POINTER);
 }
 
 static inline uint8_t type_fp_size(Type *t)
@@ -875,7 +874,9 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             // load min(src, dest) from memory
             uint8_t copy_size = (src_size < dest_size) ? src_size : dest_size;
             if (copy_size > 8)
+            {
                 copy_size = 8;
+            }
 
             MasmOperand dst = isa_result(ctx, (dest_size > 8) ? 8 : dest_size);
 
@@ -1020,7 +1021,9 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             if (var->size == 1 || var->size == 2)
             {
                 MasmOperand res = isa_result(ctx, 8);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, res, var_mem));
+                // use MOVSX for signed types to preserve sign, MOVZX for unsigned
+                uint32_t extend_op = type_is_signed(expr->type) ? MASM_OP_MOVSX : MASM_OP_MOVZX;
+                masm_section_append_inst(text, masm_inst_2(extend_op, res, var_mem));
                 return res;
             }
 
@@ -1465,8 +1468,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         // try to use register allocator to avoid PUSH/POP spilling
         // NOTE: if RHS contains a function call, we MUST use stack spill because
         // all scratch registers are caller-saved and will be clobbered by the call
-        bool     pushed           = false;
-        uint32_t left_save_reg    = UINT32_MAX;
+        bool     pushed            = false;
+        uint32_t left_save_reg     = UINT32_MAX;
         bool     rhs_contains_call = expr_contains_call(expr->binary_expr.right);
 
         if (left.kind == MASM_OPERAND_REGISTER && left.reg.id == isa_result_id(ctx))
@@ -1635,12 +1638,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         }
 
         // check if this is a floating-point arithmetic operation
-        Type *left_type = expr->binary_expr.left ? expr->binary_expr.left->type : NULL;
-        bool is_fp_arith = type_is_fp_class(left_type) &&
-                           (expr->binary_expr.op == TOKEN_PLUS ||
-                            expr->binary_expr.op == TOKEN_MINUS ||
-                            expr->binary_expr.op == TOKEN_STAR ||
-                            expr->binary_expr.op == TOKEN_SLASH);
+        Type *left_type   = expr->binary_expr.left ? expr->binary_expr.left->type : NULL;
+        bool  is_fp_arith = type_is_fp_class(left_type) && (expr->binary_expr.op == TOKEN_PLUS || expr->binary_expr.op == TOKEN_MINUS || expr->binary_expr.op == TOKEN_STAR || expr->binary_expr.op == TOKEN_SLASH);
 
         if (is_fp_arith)
         {
@@ -1671,11 +1670,20 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             uint32_t sse_op = MASM_OP_X86_ADDSD;
             switch (expr->binary_expr.op)
             {
-            case TOKEN_PLUS:  sse_op = MASM_OP_X86_ADDSD; break;
-            case TOKEN_MINUS: sse_op = MASM_OP_X86_SUBSD; break;
-            case TOKEN_STAR:  sse_op = MASM_OP_X86_MULSD; break;
-            case TOKEN_SLASH: sse_op = MASM_OP_X86_DIVSD; break;
-            default: break;
+            case TOKEN_PLUS:
+                sse_op = MASM_OP_X86_ADDSD;
+                break;
+            case TOKEN_MINUS:
+                sse_op = MASM_OP_X86_SUBSD;
+                break;
+            case TOKEN_STAR:
+                sse_op = MASM_OP_X86_MULSD;
+                break;
+            case TOKEN_SLASH:
+                sse_op = MASM_OP_X86_DIVSD;
+                break;
+            default:
+                break;
             }
             masm_section_append_inst(text, masm_inst_2(sse_op, xmm0, xmm1));
 
@@ -1779,51 +1787,51 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         {
             // use arithmetic shift (SAR) for signed types, logical shift (SHR) for unsigned
             Type *left_type = expr->binary_expr.left ? expr->binary_expr.left->type : NULL;
-            opcode = type_is_signed(left_type) ? MASM_OP_SAR : MASM_OP_SHR;
+            opcode          = type_is_signed(left_type) ? MASM_OP_SAR : MASM_OP_SHR;
         }
         else if (expr->binary_expr.op == TOKEN_EQUAL_EQUAL)
         {
             opcode        = MASM_OP_CMP;
-            setcc_opcode  = MASM_OP_SETE;  // equality is the same for signed/unsigned
+            setcc_opcode  = MASM_OP_SETE; // equality is the same for signed/unsigned
             is_comparison = true;
         }
         else if (expr->binary_expr.op == TOKEN_BANG_EQUAL)
         {
             opcode        = MASM_OP_CMP;
-            setcc_opcode  = MASM_OP_SETNE;  // inequality is the same for signed/unsigned
+            setcc_opcode  = MASM_OP_SETNE; // inequality is the same for signed/unsigned
             is_comparison = true;
         }
         else if (expr->binary_expr.op == TOKEN_LESS)
         {
-            opcode        = MASM_OP_CMP;
+            opcode = MASM_OP_CMP;
             // use unsigned comparison (SETB) for unsigned types, signed (SETL) for signed
             Type *left_type = expr->binary_expr.left ? expr->binary_expr.left->type : NULL;
-            setcc_opcode  = type_is_unsigned(left_type) ? MASM_OP_SETB : MASM_OP_SETL;
-            is_comparison = true;
+            setcc_opcode    = type_is_unsigned(left_type) ? MASM_OP_SETB : MASM_OP_SETL;
+            is_comparison   = true;
         }
         else if (expr->binary_expr.op == TOKEN_GREATER)
         {
-            opcode        = MASM_OP_CMP;
+            opcode = MASM_OP_CMP;
             // use unsigned comparison (SETA) for unsigned types, signed (SETG) for signed
             Type *left_type = expr->binary_expr.left ? expr->binary_expr.left->type : NULL;
-            setcc_opcode  = type_is_unsigned(left_type) ? MASM_OP_SETA : MASM_OP_SETG;
-            is_comparison = true;
+            setcc_opcode    = type_is_unsigned(left_type) ? MASM_OP_SETA : MASM_OP_SETG;
+            is_comparison   = true;
         }
         else if (expr->binary_expr.op == TOKEN_LESS_EQUAL)
         {
-            opcode        = MASM_OP_CMP;
+            opcode = MASM_OP_CMP;
             // use unsigned comparison (SETBE) for unsigned types, signed (SETLE) for signed
             Type *left_type = expr->binary_expr.left ? expr->binary_expr.left->type : NULL;
-            setcc_opcode  = type_is_unsigned(left_type) ? MASM_OP_SETBE : MASM_OP_SETLE;
-            is_comparison = true;
+            setcc_opcode    = type_is_unsigned(left_type) ? MASM_OP_SETBE : MASM_OP_SETLE;
+            is_comparison   = true;
         }
         else if (expr->binary_expr.op == TOKEN_GREATER_EQUAL)
         {
-            opcode        = MASM_OP_CMP;
+            opcode = MASM_OP_CMP;
             // use unsigned comparison (SETAE) for unsigned types, signed (SETGE) for signed
             Type *left_type = expr->binary_expr.left ? expr->binary_expr.left->type : NULL;
-            setcc_opcode  = type_is_unsigned(left_type) ? MASM_OP_SETAE : MASM_OP_SETGE;
-            is_comparison = true;
+            setcc_opcode    = type_is_unsigned(left_type) ? MASM_OP_SETAE : MASM_OP_SETGE;
+            is_comparison   = true;
         }
         else
         {
@@ -1851,7 +1859,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         {
             // check if this is a floating-point comparison
             Type *left_type = expr->binary_expr.left ? expr->binary_expr.left->type : NULL;
-            bool is_fp_cmp = type_is_fp_class(left_type);
+            bool  is_fp_cmp = type_is_fp_class(left_type);
 
             if (is_fp_cmp)
             {
@@ -1935,7 +1943,20 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             else
             {
                 // integer comparison: cmp left, right
-                masm_section_append_inst(text, masm_inst_2(opcode, result, right_op));
+                // x86-64 CMP r64, imm32 sign-extends the 32-bit immediate, so values
+                // outside the signed 32-bit range must be materialized into a register
+                MasmOperand cmp_right = right_op;
+                if (right_op.kind == MASM_OPERAND_IMM)
+                {
+                    int64_t imm = right_op.imm;
+                    if (imm < INT32_MIN || imm > INT32_MAX)
+                    {
+                        MasmOperand tmp = isa_tmp(ctx, result.reg.size);
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, right_op));
+                        cmp_right = tmp;
+                    }
+                }
+                masm_section_append_inst(text, masm_inst_2(opcode, result, cmp_right));
 
                 // set low byte based on condition
                 MasmOperand al = isa_result(ctx, 1);
@@ -3335,9 +3356,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                 // function calls (AST_EXPR_CALL) already return the value in the return register if lowered correctly,
                 // but `lower_expr(CALL)` was just updated to spill small aggregates to stack and return pointer,
                 // so we treat everything consistently as a pointer/address that needs loading.
-                bool is_small_agg = ctx->fn_ret_type &&
-                                    (ctx->fn_ret_type->kind == TYPE_STRUCT || ctx->fn_ret_type->kind == TYPE_UNION || ctx->fn_ret_type->kind == TYPE_ARRAY) &&
-                                    ctx->fn_ret_type->size <= 8;
+                bool is_small_agg = ctx->fn_ret_type && (ctx->fn_ret_type->kind == TYPE_STRUCT || ctx->fn_ret_type->kind == TYPE_UNION || ctx->fn_ret_type->kind == TYPE_ARRAY) && ctx->fn_ret_type->size <= 8;
 
                 if (is_small_agg)
                 {
@@ -3365,7 +3384,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                     }
                     else
                     {
-                         masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, isa_result(ctx, ctx->ptr_size), op));
+                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, isa_result(ctx, ctx->ptr_size), op));
                     }
                 }
                 else
@@ -3500,7 +3519,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                     masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, src_ptr, value));
                 }
 
-                MasmOperand dst_ptr = isa_tmp(ctx, ctx->ptr_size);
+                MasmOperand dst_ptr  = isa_tmp(ctx, ctx->ptr_size);
                 MasmOperand dst_addr = frame_mem(ctx, offset, ctx->ptr_size);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, dst_ptr, dst_addr));
 
@@ -4661,7 +4680,9 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
             size_t   write_size = size > 8 ? 8 : size;
             masm_section_append_data(section, &val, write_size);
             if (size > 8)
+            {
                 masm_section_append_zero(section, size - 8);
+            }
         }
         else if (expr->lit_expr.kind == TOKEN_LIT_CHAR)
         {
@@ -4669,7 +4690,9 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
             size_t   write_size = size > 8 ? 8 : size;
             masm_section_append_data(section, &val, write_size);
             if (size > 8)
+            {
                 masm_section_append_zero(section, size - 8);
+            }
         }
         else if (expr->lit_expr.kind == TOKEN_LIT_FLOAT)
         {
@@ -4680,7 +4703,9 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
             size_t write_size = size > 8 ? 8 : size;
             masm_section_append_data(section, &bits, write_size);
             if (size > 8)
+            {
                 masm_section_append_zero(section, size - 8);
+            }
         }
         else
         {
@@ -4764,12 +4789,12 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
     }
     else if (expr->kind == AST_EXPR_ARRAY)
     {
-        Type   *type           = expr->type;
-        Type   *elem_type      = type->array.elem_type;
-        size_t  elem_size      = elem_type->size;
+        Type    *type           = expr->type;
+        Type    *elem_type      = type->array.elem_type;
+        size_t   elem_size      = elem_type->size;
         AstList *elems          = expr->array_expr.elems;
-        size_t  count          = elems ? elems->count : 0;
-        size_t  expected_count = type->array.count;
+        size_t   count          = elems ? elems->count : 0;
+        size_t   expected_count = type->array.count;
 
         for (size_t i = 0; i < expected_count; i++)
         {
@@ -4793,7 +4818,9 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
         size_t write_size = size > 8 ? 8 : size;
         masm_section_append_data(section, &val, write_size);
         if (size > 8)
+        {
             masm_section_append_zero(section, size - 8);
+        }
     }
     else if (expr->kind == AST_EXPR_BINARY)
     {
@@ -4808,7 +4835,9 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
         size_t write_size = size > 8 ? 8 : size;
         masm_section_append_data(section, &val, write_size);
         if (size > 8)
+        {
             masm_section_append_zero(section, size - 8);
+        }
     }
     else
     {
