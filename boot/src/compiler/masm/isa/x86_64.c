@@ -378,24 +378,24 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
         }
         break;
 
-    case MASM_OP_CBW:
+    case MASM_OP_X86_CBW:
         // AL -> AX
         emit_byte(buffer, &offset, size, 0x66);
         emit_byte(buffer, &offset, size, 0x98);
         break;
 
-    case MASM_OP_CWD:
+    case MASM_OP_X86_CWD:
         // AX -> DX:AX
         emit_byte(buffer, &offset, size, 0x66);
         emit_byte(buffer, &offset, size, 0x99);
         break;
 
-    case MASM_OP_CDQ:
+    case MASM_OP_X86_CDQ:
         // EAX -> EDX:EAX
         emit_byte(buffer, &offset, size, 0x99);
         break;
 
-    case MASM_OP_CQO:
+    case MASM_OP_X86_CQO:
         // sign-extend RAX into RDX:RAX
         emit_rex(buffer, &offset, size, true, false, false, false);
         emit_byte(buffer, &offset, size, 0x99);

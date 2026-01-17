@@ -322,7 +322,7 @@ static void emit_div_rem(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
     {
         // 8-bit: Dividend is AX.
         if (is_signed)
-            emit_inst(sec, masm_inst_0(MASM_OP_CBW)); // AL -> AX
+            emit_inst(sec, masm_inst_0(MASM_OP_X86_CBW)); // AL -> AX
         else
             emit_inst(sec, masm_inst_2(MASM_OP_AND, masm_x86_reg(MASM_X86_RAX, 8), masm_operand_imm(0xFF))); // Zero AH
     }
@@ -330,7 +330,7 @@ static void emit_div_rem(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
     {
         // 16-bit: Dividend is DX:AX
         if (is_signed)
-            emit_inst(sec, masm_inst_0(MASM_OP_CWD)); // AX -> DX:AX
+            emit_inst(sec, masm_inst_0(MASM_OP_X86_CWD)); // AX -> DX:AX
         else
             emit_inst(sec, masm_inst_2(MASM_OP_XOR, masm_x86_reg(MASM_X86_RDX, 2), masm_x86_reg(MASM_X86_RDX, 2))); // Zero DX
     }
@@ -338,7 +338,7 @@ static void emit_div_rem(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
     {
         // 32-bit: Dividend is EDX:EAX
         if (is_signed)
-            emit_inst(sec, masm_inst_0(MASM_OP_CDQ)); // EAX -> EDX:EAX
+            emit_inst(sec, masm_inst_0(MASM_OP_X86_CDQ)); // EAX -> EDX:EAX
         else
             emit_inst(sec, masm_inst_2(MASM_OP_XOR, masm_x86_reg(MASM_X86_RDX, 4), masm_x86_reg(MASM_X86_RDX, 4))); // Zero EDX
     }
@@ -346,7 +346,7 @@ static void emit_div_rem(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
     {
         // 64-bit: Dividend is RDX:RAX
         if (is_signed)
-            emit_inst(sec, masm_inst_0(MASM_OP_CQO)); // RAX -> RDX:RAX
+            emit_inst(sec, masm_inst_0(MASM_OP_X86_CQO)); // RAX -> RDX:RAX
         else
             emit_inst(sec, masm_inst_2(MASM_OP_XOR, masm_x86_reg(MASM_X86_RDX, 8), masm_x86_reg(MASM_X86_RDX, 8))); // Zero RDX
     }
@@ -659,10 +659,27 @@ static void emit_stack_frame(MasmSection *sec, CodeGenContext *ctx)
 
 static void emit_ret(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
 {
-    // Optional: Load return value to RAX if present
+    // Optional: Load return value to RAX/XMM0 if present
     if (inst->operand_count > 0 && inst->operands[0].kind != MASM_OPERAND_NONE)
     {
-        load_operand(sec, ctx, inst->operands[0], MASM_X86_RAX, 0);
+        MasmOperand ret_op = inst->operands[0];
+        bool is_float = (ret_op.kind == MASM_OPERAND_REGISTER) && (ret_op.reg.id & MASM_REG_FLOAT_FLAG);
+
+        if (is_float)
+        {
+            ret_op.reg.id &= ~MASM_REG_FLOAT_FLAG;
+            // Load ret_op -> XMM0
+            if (ret_op.kind == MASM_OPERAND_REGISTER)
+            {
+                int32_t off = get_vreg_offset(ctx, ret_op.reg.id);
+                MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+                emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
+            }
+        }
+        else
+        {
+            load_operand(sec, ctx, ret_op, MASM_X86_RAX, 0);
+        }
     }
 
     // EPILOGUE
@@ -791,10 +808,23 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
         emit_inst(sec, masm_inst_2(MASM_OP_ADD, masm_x86_reg(MASM_X86_RSP, 8), masm_operand_imm(total_stack_bytes)));
     }
     
-    // Store result RAX -> dst
+    // Store result RAX/XMM0 -> dst
     if (dst.kind != MASM_OPERAND_NONE)
     {
-        store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+        bool is_float = (dst.kind == MASM_OPERAND_REGISTER) && (dst.reg.id & MASM_REG_FLOAT_FLAG);
+
+        if (is_float)
+        {
+            dst.reg.id &= ~MASM_REG_FLOAT_FLAG;
+            // Store XMM0 -> dst
+            int32_t off = get_vreg_offset(ctx, dst.reg.id);
+            MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+            emit_inst(sec, masm_inst_2(MASM_OP_X86_MOVQ, mem, masm_operand_register(0, 16)));
+        }
+        else
+        {
+            store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+        }
     }
     
     free(locs);

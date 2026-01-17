@@ -30,6 +30,12 @@ typedef enum MasmX86Opcode
     MASM_OP_X86_CVTTSS2SI, // cvttss2si r32|r64, xmm/m32
     MASM_OP_X86_CVTSD2SS,  // cvtsd2ss xmm1, xmm2/m64
     MASM_OP_X86_CVTSS2SD,  // cvtss2sd xmm1, xmm2/m32
+
+    // sign extension
+    MASM_OP_X86_CBW, // AL -> AX
+    MASM_OP_X86_CWD, // AX -> DX:AX
+    MASM_OP_X86_CDQ, // EAX -> EDX:EAX
+    MASM_OP_X86_CQO, // RAX -> RDX:RAX
 } MasmX86Opcode;
 
 // x86_64 registers

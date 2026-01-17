@@ -737,15 +737,22 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     }
 
     MasmOperand res = masm_operand_none();
+    MasmOperand res_in_inst = res;
+
     if (res_size > 0)
     {
         res = isa_result(ctx, res_size);
+        res_in_inst = res;
+        if (expr->type && type_is_float(expr->type))
+        {
+            res_in_inst.reg.id |= MASM_REG_FLOAT_FLAG;
+        }
     }
 
     // Emit MASM_IR_CALL dest, target, args...
     int total_ops = 2 + arg_count;
     MasmOperand *ops = malloc(sizeof(MasmOperand) * total_ops);
-    ops[0] = res;
+    ops[0] = res_in_inst;
     ops[1] = target;
     for (int i = 0; i < arg_count; ++i)
     {
@@ -1567,6 +1574,11 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             ret_val = lower_expr(masm, text, expr, ctx);
             ret_val = ensure_in_reg(text, ret_val, expr->type, ctx);
+
+            if (ctx->fn_ret_type && type_is_float(ctx->fn_ret_type))
+            {
+                ret_val.reg.id |= MASM_REG_FLOAT_FLAG;
+            }
         }
 
         // run all deferred statements before returning
