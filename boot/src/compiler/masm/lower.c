@@ -1550,6 +1550,57 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             }
         }
 
+        // check if this is a floating-point arithmetic operation
+        Type *left_type = expr->binary_expr.left ? expr->binary_expr.left->type : NULL;
+        bool is_fp_arith = type_is_fp_class(left_type) &&
+                           (expr->binary_expr.op == TOKEN_PLUS ||
+                            expr->binary_expr.op == TOKEN_MINUS ||
+                            expr->binary_expr.op == TOKEN_STAR ||
+                            expr->binary_expr.op == TOKEN_SLASH);
+
+        if (is_fp_arith)
+        {
+            // floating-point arithmetic using SSE instructions
+            // 1. move left operand (in result/RAX as bits) to XMM0
+            MasmOperand xmm0 = masm_xmm(0);
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, xmm0, result));
+
+            // 2. move right operand to XMM1
+            MasmOperand xmm1 = masm_xmm(1);
+            if (right_op.kind == MASM_OPERAND_REGISTER)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, xmm1, right_op));
+            }
+            else if (right_op.kind == MASM_OPERAND_IMM)
+            {
+                // load immediate to tmp register first, then to XMM
+                MasmOperand tmp = isa_tmp(ctx, 8);
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, right_op));
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, xmm1, tmp));
+            }
+            else
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, xmm1, right_op));
+            }
+
+            // 3. perform SSE arithmetic operation
+            uint32_t sse_op = MASM_OP_X86_ADDSD;
+            switch (expr->binary_expr.op)
+            {
+            case TOKEN_PLUS:  sse_op = MASM_OP_X86_ADDSD; break;
+            case TOKEN_MINUS: sse_op = MASM_OP_X86_SUBSD; break;
+            case TOKEN_STAR:  sse_op = MASM_OP_X86_MULSD; break;
+            case TOKEN_SLASH: sse_op = MASM_OP_X86_DIVSD; break;
+            default: break;
+            }
+            masm_section_append_inst(text, masm_inst_2(sse_op, xmm0, xmm1));
+
+            // 4. move result back to GPR (RAX) as bit pattern
+            masm_section_append_inst(text, masm_inst_2(MASM_OP_X86_MOVQ, result, xmm0));
+
+            return result;
+        }
+
         uint32_t opcode        = 0;
         uint32_t setcc_opcode  = 0;
         bool     is_comparison = false;
