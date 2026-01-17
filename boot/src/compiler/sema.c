@@ -3890,8 +3890,8 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
-        // casts are pure bit reinterpretation.
-        // require both types to be sized and identical size.
+        // casts are pure bit reinterpretation (or zero-extension/truncation).
+        // require both types to be sized.
         Type *from_type = node->cast_expr.expr->type;
         if (!from_type)
         {
@@ -3905,11 +3905,7 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
-        if (from_type->size != target_type->size)
-        {
-            sema_error(sema, node->token, "cast requires identical type sizes");
-            return -1;
-        }
+
 
         // forbid dropping constness: &T -> *U (cast-away-const)
         if (from_type->kind == TYPE_POINTER && target_type->kind == TYPE_POINTER)

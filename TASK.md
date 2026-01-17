@@ -47,6 +47,10 @@ Fix known compiler bugs in the Mach bootstrap compiler's MASM lowerer. The bugs 
 - [x] Task: Documentation updates
   - [x] Update `mach/doc/keywords.md` to clarify uninitialized variable behavior
   - [x] Create `mach/doc/proposals/type_conversions.md` for type widening/narrowing proposal
+- [x] Feature: Support type resizing in casts (`::`)
+  - [x] Modify `boot/src/compiler/sema.c` to allow casts between different sized types
+  - [x] Modify `boot/src/compiler/masm/lower.c` to implement ZEXT/Trunc logic for casts
+  - [x] Verify tests pass for widening (u8->u64, etc) and narrowing (u64->u8)
 - [x] Run full test suite and verify 0 failures
 
 # Summary
@@ -61,6 +65,7 @@ Key changes:
 6. Fixed register spill strategy to use stack when RHS contains function calls
 7. Fixed cross-module method resolution by using canonical method types
 8. Clarified variable initialization behavior in documentation
+9. Implemented type resizing (ZEXT/Trunc) in explicit casts (`::`)
 
 # Log
 
@@ -90,3 +95,4 @@ Key changes:
 - Fixed cross-module method resolution issue in `sema.c`
 - Updated documentation regarding variable initialization
 - Drafted proposal for type conversion rules
+- Implemented support for casts between types of different sizes (implicit ZEXT/Trunc) in `::` operator

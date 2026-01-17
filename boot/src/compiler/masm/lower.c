@@ -853,58 +853,142 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     }
     else if (expr->kind == AST_EXPR_CAST)
     {
-        MasmOperand inner = lower_expr(masm, text, expr->cast_expr.expr, ctx);
-        uint8_t     size  = (expr->type && expr->type->size) ? expr->type->size : 8;
-        if (size == 0)
+        uint8_t dest_size = (expr->type && expr->type->size) ? expr->type->size : 8;
+        if (dest_size == 0)
         {
-            size = ctx->ptr_size;
+            dest_size = ctx->ptr_size;
         }
 
-        Type *from_type = expr->cast_expr.expr ? expr->cast_expr.expr->type : NULL;
-        bool  from_agg  = from_type && (from_type->kind == TYPE_STRUCT || from_type->kind == TYPE_UNION || from_type->kind == TYPE_ARRAY);
+        Type   *from_type = expr->cast_expr.expr ? expr->cast_expr.expr->type : NULL;
+        uint8_t src_size  = (from_type && from_type->size) ? from_type->size : 8;
+        if (src_size == 0)
+        {
+            src_size = ctx->ptr_size;
+        }
+
+        MasmOperand inner = lower_expr(masm, text, expr->cast_expr.expr, ctx);
+
+        bool from_agg = from_type && (from_type->kind == TYPE_STRUCT || from_type->kind == TYPE_UNION || from_type->kind == TYPE_ARRAY);
 
         if (from_agg)
         {
-            uint8_t     load_size = size > 8 ? 8 : size;
-            MasmOperand dst       = isa_result(ctx, load_size);
+            // load min(src, dest) from memory
+            uint8_t copy_size = (src_size < dest_size) ? src_size : dest_size;
+            if (copy_size > 8)
+                copy_size = 8;
 
+            MasmOperand dst = isa_result(ctx, (dest_size > 8) ? 8 : dest_size);
+
+            MasmOperand src;
             if (inner.kind == MASM_OPERAND_REGISTER)
             {
-                MasmOperand src = masm_operand_memory_simple(inner.reg.id, 0, load_size);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
-                return dst;
+                src = masm_operand_memory_simple(inner.reg.id, 0, copy_size);
             }
             else if (inner.kind == MASM_OPERAND_MEMORY)
             {
-                MasmOperand src = inner;
-                src.mem.size    = load_size;
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
-                return dst;
+                src          = inner;
+                src.mem.size = copy_size;
             }
             else if (inner.kind == MASM_OPERAND_LABEL)
             {
                 MasmOperand addr = isa_tmp(ctx, ctx->ptr_size);
                 masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, addr, inner));
-                MasmOperand src = masm_operand_memory_simple(addr.reg.id, 0, load_size);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
-                return dst;
+                src = masm_operand_memory_simple(addr.reg.id, 0, copy_size);
             }
+            else
+            {
+                // unexpected operand type for aggregate
+                return inner;
+            }
+
+            // Perform load (with potential extension)
+            if (dest_size > src_size)
+            {
+                // Widening load
+                if (src_size == 1 || src_size == 2)
+                {
+                    // MOVZX
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, dst, src));
+                }
+                else if (src_size == 4)
+                {
+                    // MOV 32-bit (implicit ZEXT)
+                    MasmOperand dst32 = dst;
+                    dst32.reg.size    = 4;
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst32, src));
+                }
+                else
+                {
+                    // src >= 8 or odd size, just MOV
+                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, src));
+                }
+            }
+            else
+            {
+                // Narrowing or Equal load
+                MasmOperand dst_sized = dst;
+                dst_sized.reg.size    = copy_size;
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst_sized, src));
+            }
+            return dst;
         }
 
-        if (inner.kind == MASM_OPERAND_REGISTER)
+        // Scalar cast logic
+        if (dest_size > src_size)
         {
-            inner.reg.size = size;
-            return inner;
-        }
-        else if (inner.kind == MASM_OPERAND_IMM)
-        {
-            return inner; // keep immediate; size handled by consumers
-        }
-        else if (inner.kind == MASM_OPERAND_MEMORY)
-        {
-            MasmOperand dst = isa_result(ctx, size > 8 ? 8 : size);
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, inner));
+            // Widening (ZEXT)
+            MasmOperand dst = isa_result(ctx, dest_size);
+
+            // prepare source operand sized correctly
+            if (inner.kind == MASM_OPERAND_REGISTER)
+            {
+                inner.reg.size = src_size;
+            }
+            else if (inner.kind == MASM_OPERAND_MEMORY)
+            {
+                inner.mem.size = src_size;
+            }
+
+            if (src_size == 1 || src_size == 2)
+            {
+                // MOVZX
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, dst, inner));
+            }
+            else if (src_size == 4)
+            {
+                // MOV 32-bit (implicit ZEXT)
+                MasmOperand dst32 = dst;
+                dst32.reg.size    = 4;
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst32, inner));
+            }
+            else
+            {
+                // fallback for >= 8 or unsupported sizes
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, inner));
+            }
             return dst;
+        }
+        else
+        {
+            // Narrowing or Equal
+            if (inner.kind == MASM_OPERAND_REGISTER)
+            {
+                // Reuse register, just change interpretation size
+                inner.reg.size = dest_size;
+                return inner;
+            }
+            else if (inner.kind == MASM_OPERAND_IMM)
+            {
+                return inner; // Immediate fits
+            }
+            else if (inner.kind == MASM_OPERAND_MEMORY)
+            {
+                // Load from memory with dest size
+                MasmOperand dst = isa_result(ctx, dest_size > 8 ? 8 : dest_size);
+                inner.mem.size  = dest_size;
+                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, inner));
+                return dst;
+            }
         }
         return inner;
     }
