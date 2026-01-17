@@ -3140,7 +3140,11 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
             // check what the method expects
             Type *expected_receiver_type = NULL;
-            if (func_sym && func_sym->decl && func_sym->decl->fun_stmt.method_receiver)
+            if (func_sym && func_sym->type && func_sym->type->kind == TYPE_FUNCTION && func_sym->type->function.param_count > 0)
+            {
+                expected_receiver_type = func_sym->type->function.param_types[0];
+            }
+            else if (func_sym && func_sym->decl && func_sym->decl->fun_stmt.method_receiver)
             {
                 expected_receiver_type = sema_resolve_type(sema, func_sym->decl->fun_stmt.method_receiver);
             }
@@ -3411,6 +3415,27 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
         }
 
+        if (!method && sema->current_module)
+        {
+            for (ModuleAlias *al = sema->current_module->aliases; al; al = al->next)
+            {
+                if (!al->module || !al->module->table)
+                {
+                    continue;
+                }
+
+                Symbol *cand = symbol_table_lookup_local(al->module->table, node->field_expr.field);
+                if (!cand || cand->kind != SYMBOL_FUNCTION || !cand->is_public || !cand->decl || cand->decl->kind != AST_STMT_FUN || !cand->decl->fun_stmt.is_method)
+                {
+                    continue;
+                }
+
+                method        = cand;
+                method_origin = al->module;
+                break;
+            }
+        }
+
         // if the method exists but hasn't been analyzed yet, analyze it under its module context
         if (method && !method->type && method->decl)
         {
@@ -3673,7 +3698,19 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
 
             // non-generic method resolution
-            Type *method_receiver_type = sema_resolve_type(sema, method->decl->fun_stmt.method_receiver);
+            // use the already-resolved receiver type from the method's function type
+            // (first parameter) instead of re-resolving in caller's context, which
+            // would fail for cross-module methods where the type name is unqualified
+            Type *method_receiver_type = NULL;
+            if (method->type && method->type->kind == TYPE_FUNCTION && method->type->function.param_count > 0)
+            {
+                method_receiver_type = method->type->function.param_types[0];
+            }
+            else
+            {
+                // fallback to resolving from AST (may fail for cross-module)
+                method_receiver_type = sema_resolve_type(sema, method->decl->fun_stmt.method_receiver);
+            }
             if (method_receiver_type)
             {
                 // check if receiver type matches object type (including pointer coercion)

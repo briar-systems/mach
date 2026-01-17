@@ -157,9 +157,12 @@ The `var` keyword is used to declare a variable (mutable).
 It can optionally be marked as `pub` when used in the global scope.
 The value of a `var` can be changed after initialization.
 
+If an initializer expression is not provided, the variable's initial value is undefined.
+Variables are **not** automatically zero-initialized.
+
 ```mach
-var foo: i32;
-var bar: f32 = 0.0;
+var foo: i32;       # value is undefined
+var bar: f32 = 0.0; # value is 0.0
 ```
 
 
