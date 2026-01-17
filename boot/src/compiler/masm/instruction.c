@@ -56,6 +56,12 @@ MasmInstruction masm_inst_3(uint32_t opcode, MasmOperand op1, MasmOperand op2, M
     return masm_inst_create(opcode, ops, 3);
 }
 
+MasmInstruction masm_inst_4(uint32_t opcode, MasmOperand op1, MasmOperand op2, MasmOperand op3, MasmOperand op4)
+{
+    MasmOperand ops[] = {op1, op2, op3, op4};
+    return masm_inst_create(opcode, ops, 4);
+}
+
 void masm_inst_destroy(MasmInstruction inst)
 {
     if (inst.operands)

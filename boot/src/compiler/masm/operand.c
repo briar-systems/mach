@@ -73,3 +73,12 @@ MasmOperand masm_operand_memory_simple(uint32_t base_reg, int32_t disp, uint8_t 
     op.mem.size = size;
     return op;
 }
+
+MasmOperand masm_operand_type(MasmTypeKind type)
+{
+    MasmOperand op;
+    memset(&op, 0, sizeof(MasmOperand));
+    op.kind = MASM_OPERAND_TYPE;
+    op.type = type;
+    return op;
+}

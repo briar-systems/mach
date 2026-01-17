@@ -1,5 +1,6 @@
 #include "compiler/masm/lower.h"
 #include "compiler/masm/abi/spec.h"
+#include "compiler/masm/ir.h"
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/spec.h"
 #include "compiler/masm/isa/x86_64.h"
@@ -51,8 +52,8 @@ typedef struct LowerContext
     char *loop_start_label;
     char *loop_end_label;
 
-    // Register allocator
-    RegAlloc regalloc;
+    // Virtual register counter
+    uint32_t vreg_next;
 
     // current function return handling
     Type   *fn_ret_type;
@@ -73,17 +74,22 @@ static const MasmISASpec *lower_select_isa(MasmTarget target)
     return masm_isa_spec_select(target);
 }
 
+static MasmOperand alloc_vreg(LowerContext *ctx, uint8_t size)
+{
+    return masm_operand_register(ctx->vreg_next++, size);
+}
+
 static inline MasmOperand isa_result(LowerContext *ctx, uint8_t size)
 {
-    return ctx->isa->reg_result(size);
+    return alloc_vreg(ctx, size);
 }
 static inline MasmOperand isa_tmp(LowerContext *ctx, uint8_t size)
 {
-    return ctx->isa->reg_tmp0(size);
+    return alloc_vreg(ctx, size);
 }
 static inline __attribute__((unused)) MasmOperand isa_tmp2(LowerContext *ctx, uint8_t size)
 {
-    return ctx->isa->reg_tmp1(size);
+    return alloc_vreg(ctx, size);
 }
 static inline __attribute__((unused)) MasmOperand isa_div_hi(LowerContext *ctx, uint8_t size)
 {
@@ -111,11 +117,13 @@ static inline __attribute__((unused)) MasmOperand isa_fp(LowerContext *ctx, uint
 }
 static inline uint32_t isa_result_id(LowerContext *ctx)
 {
-    return isa_result(ctx, ctx->ptr_size).reg.id;
+    (void)ctx;
+    return UINT32_MAX;
 }
 static inline __attribute__((unused)) uint32_t isa_tmp_id(LowerContext *ctx)
 {
-    return isa_tmp(ctx, ctx->ptr_size).reg.id;
+    (void)ctx;
+    return UINT32_MAX;
 }
 
 static LowerContext *create_context(MasmTarget target)
@@ -161,7 +169,7 @@ static LowerContext *create_context(MasmTarget target)
     ctx->loop_defer_capacity = 8;
     ctx->loop_start_label    = NULL;
     ctx->loop_end_label      = NULL;
-    regalloc_init(&ctx->regalloc, ctx->isa, ctx->fp_reg, ctx->sp_reg, ctx->ptr_size);
+    ctx->vreg_next           = 1024;
 
     ctx->fn_ret_type          = NULL;
     ctx->fn_has_sret          = false;
@@ -732,6 +740,8 @@ static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, u
     ctx->var_count++;
 }
 
+static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx);
+
 static LocalVar *find_local_var(LowerContext *ctx, const char *name)
 {
     for (int i = 0; i < ctx->var_count; i++)
@@ -742,6 +752,211 @@ static LocalVar *find_local_var(LowerContext *ctx, const char *name)
         }
     }
     return NULL;
+}
+
+static MasmOperand ensure_in_reg(MasmSection *text, MasmOperand op, Type *type, LowerContext *ctx)
+{
+    if (op.kind != MASM_OPERAND_MEMORY)
+    {
+        return op;
+    }
+
+    uint8_t size = op.mem.size;
+    if (size == 0 && type) size = type->size;
+    if (size == 0) size = 8;
+
+    MasmOperand reg = alloc_vreg(ctx, size);
+
+    MasmTypeKind tk = MASM_TYPE_I64;
+    bool is_signed = type ? type_is_signed(type) : true;
+
+    if (type && type_is_fp_class(type))
+    {
+        if (size == 4) tk = MASM_TYPE_F32;
+        else tk = MASM_TYPE_F64;
+    }
+    else
+    {
+        switch (size)
+        {
+        case 1: tk = is_signed ? MASM_TYPE_I8 : MASM_TYPE_U8; break;
+        case 2: tk = is_signed ? MASM_TYPE_I16 : MASM_TYPE_U16; break;
+        case 4: tk = is_signed ? MASM_TYPE_I32 : MASM_TYPE_U32; break;
+        default: tk = is_signed ? MASM_TYPE_I64 : MASM_TYPE_U64; break;
+        }
+    }
+
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, reg, op, masm_operand_type(tk)));
+    return reg;
+}
+
+static MasmOperand lower_binary_op(MasmSection *text, TokenKind op, MasmOperand left, MasmOperand right, Type *result_type, Type *operand_type, LowerContext *ctx)
+{
+    left  = ensure_in_reg(text, left, operand_type, ctx);
+    right = ensure_in_reg(text, right, operand_type, ctx);
+
+    bool is_signed = operand_type ? type_is_signed(operand_type) : true;
+    int  size      = result_type ? result_type->size : 8;
+    if (size == 0)
+        size = 8;
+
+    MasmIrOpcode opcode;
+    switch (op)
+    {
+    case TOKEN_PLUS:          opcode = MASM_IR_ADD; break;
+    case TOKEN_MINUS:         opcode = MASM_IR_SUB; break;
+    case TOKEN_STAR:          opcode = MASM_IR_MUL; break;
+    case TOKEN_SLASH:         opcode = is_signed ? MASM_IR_DIV : MASM_IR_DIVU; break;
+    case TOKEN_PERCENT:       opcode = is_signed ? MASM_IR_REM : MASM_IR_REMU; break;
+    case TOKEN_AMPERSAND:     opcode = MASM_IR_AND; break;
+    case TOKEN_PIPE:          opcode = MASM_IR_OR; break;
+    case TOKEN_CARET:         opcode = MASM_IR_XOR; break;
+    case TOKEN_LEFT_SHIFT:    opcode = MASM_IR_SHL; break;
+    case TOKEN_RIGHT_SHIFT:   opcode = is_signed ? MASM_IR_SAR : MASM_IR_SHR; break;
+    case TOKEN_EQUAL_EQUAL:   opcode = MASM_IR_SEQ; break;
+    case TOKEN_BANG_EQUAL:    opcode = MASM_IR_SNE; break;
+    case TOKEN_LESS:          opcode = is_signed ? MASM_IR_SLT : MASM_IR_SLTU; break;
+    case TOKEN_LESS_EQUAL:    opcode = is_signed ? MASM_IR_SLE : MASM_IR_SLEU; break;
+    case TOKEN_GREATER:       opcode = is_signed ? MASM_IR_SGT : MASM_IR_SGTU; break;
+    case TOKEN_GREATER_EQUAL: opcode = is_signed ? MASM_IR_SGE : MASM_IR_SGEU; break;
+    default:
+        fprintf(stderr, "masm lower: unhandled binary op %d\n", op);
+        exit(1);
+    }
+
+    MasmOperand res = isa_result(ctx, size);
+    masm_section_append_inst(text, masm_inst_3(opcode, res, left, right));
+    return res;
+}
+
+static MasmOperand lower_short_circuit(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
+{
+    static int label_counter = 0;
+    char       label1[32];
+    char       label_end[32];
+    snprintf(label1, sizeof(label1), ".Lsc_%d", label_counter);
+    snprintf(label_end, sizeof(label_end), ".Lsc_end_%d", label_counter++);
+
+    bool is_and = (expr->binary_expr.op == TOKEN_AMPERSAND_AMPERSAND);
+
+    // Result register
+    MasmOperand res = isa_result(ctx, 8);
+
+    // Evaluate Left
+    MasmOperand left = lower_expr(masm, text, expr->binary_expr.left, ctx);
+
+    // Move left to result
+    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, res, left));
+
+    if (is_and)
+    {
+        // AND: if res == 0, jump to end (result is 0)
+        masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, res, masm_operand_imm(0), masm_operand_label(strdup(label_end))));
+    }
+    else
+    {
+        // OR: if res != 0, jump to label1 (set result to 1)
+        masm_section_append_inst(text, masm_inst_3(MASM_IR_BNE, res, masm_operand_imm(0), masm_operand_label(strdup(label1))));
+    }
+
+    // Evaluate Right
+    MasmOperand right = lower_expr(masm, text, expr->binary_expr.right, ctx);
+
+    // Result = (right != 0)
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_SNE, res, right, masm_operand_imm(0)));
+    masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(label_end))));
+
+    if (!is_and)
+    {
+        // Label True (for OR short-circuit)
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(label1))));
+        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, res, masm_operand_imm(1)));
+        masm_add_symbol(masm, masm_symbol_create(label1, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+    }
+
+    masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(label_end))));
+    masm_add_symbol(masm, masm_symbol_create(label_end, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+
+    return res;
+}
+
+static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
+{
+    AstNode *lhs = expr->binary_expr.left;
+    AstNode *rhs = expr->binary_expr.right;
+
+    // Handle dereference assignment: @ptr = val
+    if (lhs->kind == AST_EXPR_UNARY && lhs->unary_expr.op == TOKEN_AT)
+    {
+        MasmOperand ptr = lower_expr(masm, text, lhs->unary_expr.expr, ctx);
+        
+        // Ensure ptr is a register
+        if (ptr.kind != MASM_OPERAND_REGISTER)
+        {
+            MasmOperand new_ptr = isa_result(ctx, 8);
+            masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, new_ptr, ptr));
+            ptr = new_ptr;
+        }
+
+        MasmOperand val  = lower_expr(masm, text, rhs, ctx);
+        int         size = lhs->type ? lhs->type->size : 8;
+        if (size == 0) size = 8;
+
+        MasmOperand mem = masm_operand_memory_simple(ptr.reg.id, 0, size);
+        masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+        return val;
+    }
+    // Handle generic lvalue (index, field)
+    else if (lhs->kind == AST_EXPR_INDEX || lhs->kind == AST_EXPR_FIELD)
+    {
+        MasmOperand left_mem = lower_expr(masm, text, lhs, ctx);
+        
+        MasmOperand addr = isa_result(ctx, 8);
+        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, addr, left_mem));
+
+        MasmOperand val = lower_expr(masm, text, rhs, ctx);
+        
+        int         size = lhs->type ? lhs->type->size : 8;
+        if (size == 0) size = 8;
+        
+        MasmOperand mem = masm_operand_memory_simple(addr.reg.id, 0, size);
+        masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+        return val;
+    }
+    // Handle identifier assignment
+    else if (lhs->kind == AST_EXPR_IDENT)
+    {
+        LocalVar *var = find_local_var(ctx, lhs->ident_expr.name);
+        if (var)
+        {
+            MasmOperand val = lower_expr(masm, text, rhs, ctx);
+            MasmOperand dst = frame_mem(ctx, var->offset, var->size);
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, val, masm_operand_imm(var->size)));
+            return val;
+        }
+        else
+        {
+            // Global
+            MasmOperand sym_op = masm_operand_symbol(lhs->ident_expr.name);
+            if (lhs->symbol)
+            {
+                const char *link_name = symbol_get_linkage_name(lhs->symbol);
+                if (link_name) sym_op = masm_operand_symbol(link_name);
+            }
+            
+            MasmOperand addr = isa_result(ctx, ctx->ptr_size);
+            masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, addr, sym_op));
+            
+            MasmOperand val = lower_expr(masm, text, rhs, ctx);
+            
+            int size = lhs->type ? lhs->type->size : ctx->ptr_size;
+            MasmOperand mem = masm_operand_memory_simple(addr.reg.id, 0, size);
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+            return val;
+        }
+    }
+
+    return masm_operand_none();
 }
 
 static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
@@ -1012,23 +1227,31 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             {
                 MasmOperand result = isa_result(ctx, 8);
                 MasmOperand addr   = frame_mem(ctx, var->offset, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, result, addr));
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, result, addr));
                 return result;
             }
 
             // scalar: load value
             MasmOperand var_mem = frame_mem(ctx, var->offset, var->size);
-            if (var->size == 1 || var->size == 2)
+
+            MasmTypeKind tk = MASM_TYPE_I64;
+            bool is_signed = expr->type ? type_is_signed(expr->type) : true;
+            if (expr->type && type_is_fp_class(expr->type))
             {
-                MasmOperand res = isa_result(ctx, 8);
-                // use MOVSX for signed types to preserve sign, MOVZX for unsigned
-                uint32_t extend_op = type_is_signed(expr->type) ? MASM_OP_MOVSX : MASM_OP_MOVZX;
-                masm_section_append_inst(text, masm_inst_2(extend_op, res, var_mem));
-                return res;
+                tk = (var->size == 4) ? MASM_TYPE_F32 : MASM_TYPE_F64;
+            }
+            else
+            {
+                switch (var->size) {
+                    case 1: tk = is_signed ? MASM_TYPE_I8 : MASM_TYPE_U8; break;
+                    case 2: tk = is_signed ? MASM_TYPE_I16 : MASM_TYPE_U16; break;
+                    case 4: tk = is_signed ? MASM_TYPE_I32 : MASM_TYPE_U32; break;
+                    default: tk = is_signed ? MASM_TYPE_I64 : MASM_TYPE_U64; break;
+                }
             }
 
             MasmOperand result = isa_result(ctx, var->size);
-            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, var_mem));
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, result, var_mem, masm_operand_type(tk)));
             return result;
         }
         else
@@ -1037,10 +1260,10 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             MasmSymbol *sym = masm_get_symbol(masm, expr->ident_expr.name);
             if (sym)
             {
-                // For aggregates/arrays, return address in RAX
+                // For aggregates/arrays, return address in Register
                 MasmOperand addr     = isa_result(ctx, 8);
                 MasmOperand label_op = masm_operand_label(strdup(sym->name));
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, addr, label_op));
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, addr, label_op));
 
                 if (sym->size > 8)
                 {
@@ -1048,12 +1271,29 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 }
 
                 // scalar: load value from address
-                MasmOperand mem    = masm_operand_memory_simple(isa_result(ctx, ctx->ptr_size).reg.id, 0, sym->size > 8 ? 8 : sym->size);
+                MasmOperand mem    = masm_operand_memory_simple(addr.reg.id, 0, sym->size > 8 ? 8 : sym->size);
                 MasmOperand result = isa_result(ctx, sym->size > 8 ? 8 : sym->size);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, result, mem));
 
+                MasmTypeKind tk = MASM_TYPE_I64;
+                bool is_signed = expr->type ? type_is_signed(expr->type) : true;
+                if (expr->type && type_is_fp_class(expr->type))
+                {
+                    tk = (sym->size == 4) ? MASM_TYPE_F32 : MASM_TYPE_F64;
+                }
+                else
+                {
+                    switch (sym->size) {
+                        case 1: tk = is_signed ? MASM_TYPE_I8 : MASM_TYPE_U8; break;
+                        case 2: tk = is_signed ? MASM_TYPE_I16 : MASM_TYPE_U16; break;
+                        case 4: tk = is_signed ? MASM_TYPE_I32 : MASM_TYPE_U32; break;
+                        default: tk = is_signed ? MASM_TYPE_I64 : MASM_TYPE_U64; break;
+                    }
+                }
+
+                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, result, mem, masm_operand_type(tk)));
                 return result;
             }
+        }
 
             // fallback: use the resolved symbol linkage name even if the symbol is defined
             // in a different lowered module (e.g. `true`/`false` from std.types.bool).
@@ -1104,6 +1344,22 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         // if not found, fall through to return none
     }
     else if (expr->kind == AST_EXPR_BINARY)
+    {
+        if (expr->binary_expr.op == TOKEN_AMPERSAND_AMPERSAND || expr->binary_expr.op == TOKEN_PIPE_PIPE)
+        {
+            return lower_short_circuit(masm, text, expr, ctx);
+        }
+
+        if (expr->binary_expr.op == TOKEN_EQUAL)
+        {
+            return lower_assign(masm, text, expr, ctx);
+        }
+
+        MasmOperand left = lower_expr(masm, text, expr->binary_expr.left, ctx);
+        MasmOperand right = lower_expr(masm, text, expr->binary_expr.right, ctx);
+        return lower_binary_op(text, expr->binary_expr.op, left, right, expr->type, expr->binary_expr.left->type, ctx);
+    }
+    else if (0)
     {
         // Short-circuit operators
         if (expr->binary_expr.op == TOKEN_AMPERSAND_AMPERSAND)

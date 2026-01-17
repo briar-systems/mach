@@ -2,6 +2,7 @@
 #define MASM_INSTRUCTION_H
 
 #include "compiler/masm/operand.h"
+#include "compiler/masm/ir.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -81,6 +82,7 @@ MasmInstruction masm_inst_0(uint32_t opcode);
 MasmInstruction masm_inst_1(uint32_t opcode, MasmOperand op1);
 MasmInstruction masm_inst_2(uint32_t opcode, MasmOperand op1, MasmOperand op2);
 MasmInstruction masm_inst_3(uint32_t opcode, MasmOperand op1, MasmOperand op2, MasmOperand op3);
+MasmInstruction masm_inst_4(uint32_t opcode, MasmOperand op1, MasmOperand op2, MasmOperand op3, MasmOperand op4);
 void            masm_inst_destroy(MasmInstruction inst);
 
 #endif // MASM_INSTRUCTION_H

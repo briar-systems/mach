@@ -2,6 +2,7 @@
 #define MASM_OPERAND_H
 
 #include <stdint.h>
+#include "compiler/masm/type.h"
 
 // masm operand kinds
 typedef enum MasmOperandKind
@@ -11,7 +12,8 @@ typedef enum MasmOperandKind
     MASM_OPERAND_IMM,
     MASM_OPERAND_MEMORY,
     MASM_OPERAND_SYMBOL,
-    MASM_OPERAND_LABEL
+    MASM_OPERAND_LABEL,
+    MASM_OPERAND_TYPE
 } MasmOperandKind;
 
 // register definition
@@ -42,6 +44,7 @@ typedef struct MasmOperand
         MasmMemory   mem;       // MASM_OPERAND_MEMORY
         const char  *symbol;    // MASM_OPERAND_SYMBOL
         const char  *label;     // MASM_OPERAND_LABEL
+        MasmTypeKind type;      // MASM_OPERAND_TYPE
     };
 } MasmOperand;
 
@@ -53,5 +56,6 @@ MasmOperand masm_operand_memory(MasmRegister base, MasmRegister index, uint8_t s
 MasmOperand masm_operand_memory_simple(uint32_t base_reg, int32_t disp, uint8_t size);
 MasmOperand masm_operand_symbol(const char *name);
 MasmOperand masm_operand_label(const char *name);
+MasmOperand masm_operand_type(MasmTypeKind type);
 
 #endif // MASM_OPERAND_H
