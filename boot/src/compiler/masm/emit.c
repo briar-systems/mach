@@ -1,19 +1,21 @@
 #include "compiler/masm/emit.h"
+#include "compiler/masm/isa/spec.h"
 #include "compiler/masm/of/spec.h"
-#include "compiler/masm/opt/masm_opt.h"
-#include "compiler/masm/backend.h"
+#include "compiler/masm/opt/peephole.h"
 
 int masm_emit_object(Masm *masm, const char *filename)
 {
-    // run backend code generation
-    const MasmBackend *backend = masm_backend_get(masm->target.isa);
-    if (backend && backend->codegen)
+    // run instruction selection
+    const MasmISASpec *isa = masm_isa_spec_select(masm->target);
+    if (isa && isa->isel)
     {
-        backend->codegen(masm);
+        isa->isel(masm);
     }
 
-    // run optimizations before emitting
+    // run peephole optimization
     masm_opt_run(masm);
+
+    // write object file
     const MasmOFSpec *of_spec = masm_of_spec_select(masm->target.of);
     if (!of_spec || !of_spec->write_object)
     {

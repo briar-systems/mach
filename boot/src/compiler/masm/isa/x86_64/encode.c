@@ -1,4 +1,4 @@
-#include "compiler/masm/isa/x86_64.h"
+#include "compiler/masm/isa/x86_64/x86_64.h"
 #include "compiler/masm/isa/spec.h"
 #include "compiler/masm/abi/sysv64.h"
 #include <string.h>
@@ -607,6 +607,38 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
         }
         break;
 
+    case MASM_OP_X86_NEG_R: case MASM_OP_X86_NEG_M:
+    case MASM_OP_X86_NOT_R: case MASM_OP_X86_NOT_M:
+        if (inst.operand_count == 1)
+        {
+            uint8_t subopcode = 0;
+            if (inst.opcode == MASM_OP_X86_NOT_R || inst.opcode == MASM_OP_X86_NOT_M) subopcode = 2;
+            else subopcode = 3; // NEG
+
+            bool is_reg = (inst.operands[0].kind == MASM_OPERAND_REGISTER);
+            uint8_t sz = is_reg ? inst.operands[0].reg.size : inst.operands[0].mem.size;
+            bool byte = sz == 1;
+            bool w = sz == 8;
+            bool word = sz == 2;
+
+            if (word) emit_byte(buffer, &offset, size, 0x66);
+            uint8_t opcode = byte ? 0xF6 : 0xF7;
+
+            if (is_reg) {
+                uint32_t rm = inst.operands[0].reg.id;
+                bool rex_force = byte && (rm >= 4 && rm <= 7);
+                emit_rex_force(buffer, &offset, size, rex_force, w, false, false, rm >= 8);
+                emit_byte(buffer, &offset, size, opcode);
+                emit_byte(buffer, &offset, size, encode_modrm(0xC0, subopcode, reg_low(rm)));
+            } else {
+                emit_rex(buffer, &offset, size, w, false, inst.operands[0].mem.index.id >= 8, inst.operands[0].mem.base.id >= 8);
+                emit_byte(buffer, &offset, size, opcode);
+                emit_mem(buffer, &offset, size, inst.operands[0].mem.base.id, inst.operands[0].mem.index.id,
+                         inst.operands[0].mem.scale, (int32_t)inst.operands[0].mem.disp, subopcode);
+            }
+        }
+        break;
+
     case MASM_OP_X86_SHL_RI: case MASM_OP_X86_SHL_RC:
     case MASM_OP_X86_SHR_RI: case MASM_OP_X86_SHR_RC:
     case MASM_OP_X86_SAR_RI: case MASM_OP_X86_SAR_RC:
@@ -1155,21 +1187,23 @@ static MasmOperand x86_parse_reg(const char *name, uint8_t ptr_size)
 }
 
 static const MasmISASpec X86_64_SPEC = {
-    .reg_result = x86_reg_result,
-    .reg_tmp0   = x86_reg_tmp0,
-    .reg_tmp1   = x86_reg_tmp1,
-    .reg_div_hi = x86_reg_div_hi,
-    .reg_div_lo = x86_reg_div_lo,
-    .reg_arg    = x86_reg_arg,
-    .reg_sp     = x86_reg_sp,
-    .reg_fp     = x86_reg_fp,
-    .op_syscall = x86_op_syscall,
-    .parse_reg  = x86_parse_reg,
+    .reg_result     = x86_reg_result,
+    .reg_tmp0       = x86_reg_tmp0,
+    .reg_tmp1       = x86_reg_tmp1,
+    .reg_div_hi     = x86_reg_div_hi,
+    .reg_div_lo     = x86_reg_div_lo,
+    .reg_arg        = x86_reg_arg,
+    .reg_sp         = x86_reg_sp,
+    .reg_fp         = x86_reg_fp,
+    .op_syscall     = x86_op_syscall,
+    .parse_reg      = x86_parse_reg,
     .reg_count      = MASM_X86_REG_COUNT,
     .scratch_regs   = X86_SCRATCH,
     .scratch_count  = sizeof(X86_SCRATCH) / sizeof(X86_SCRATCH[0]),
     .reserved_regs  = X86_RESERVED,
     .reserved_count = sizeof(X86_RESERVED) / sizeof(X86_RESERVED[0]),
+    .isel           = masm_x86_isel,
+    .encode         = masm_x86_encode,
 };
 
 const MasmISASpec *masm_isa_spec_select(MasmTarget target)

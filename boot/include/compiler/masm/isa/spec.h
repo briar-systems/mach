@@ -4,8 +4,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "compiler/masm/instruction.h"
 #include "compiler/masm/operand.h"
 #include "compiler/masm/target.h"
+
+struct Masm;
 
 // ISA-level opcode provider for target-specific operations
 typedef struct MasmISASpec
@@ -29,10 +32,16 @@ typedef struct MasmISASpec
     uint8_t        reserved_count;
 
     // opcode hooks
-    uint32_t (*op_syscall)(); // trap/syscall instruction opcode for this ISA (or UINT32_MAX if unsupported)
+    uint32_t (*op_syscall)();
 
-    // inline asm / operand parsing hook: returns none if not recognized
+    // inline asm / operand parsing hook
     MasmOperand (*parse_reg)(const char *name, uint8_t ptr_size);
+
+    // instruction selection: lower IR to target-specific opcodes
+    void (*isel)(struct Masm *masm);
+
+    // encode instruction to bytes, returns byte count
+    int (*encode)(MasmInstruction inst, uint8_t *buffer, size_t size);
 }
 MasmISASpec;
 

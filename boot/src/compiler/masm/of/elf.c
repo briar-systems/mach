@@ -12,7 +12,7 @@
 // tools (cc/ld/ar), similar to a traditional toolchain.
 
 #include "compiler/masm/of/elf.h"
-#include "compiler/masm/isa/x86_64.h"
+#include "compiler/masm/isa/x86_64/x86_64.h"
 
 #include <limits.h>
 #include <stdbool.h>

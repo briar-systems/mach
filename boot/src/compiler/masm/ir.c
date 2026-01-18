@@ -9,6 +9,8 @@ const char *masm_ir_name(MasmIrOpcode op)
         case MASM_IR_LOAD: return "load";
         case MASM_IR_STORE: return "store";
         case MASM_IR_LEA: return "lea";
+        case MASM_IR_ZEXT: return "zext";
+        case MASM_IR_SEXT: return "sext";
 
         // Integer Arithmetic
         case MASM_IR_ADD: return "add";
@@ -30,6 +32,7 @@ const char *masm_ir_name(MasmIrOpcode op)
         case MASM_IR_SAR: return "sar";
 
         // Comparisons (Set-if)
+        case MASM_IR_CMP: return "cmp";
         case MASM_IR_SEQ: return "seq";
         case MASM_IR_SNE: return "sne";
         case MASM_IR_SLT: return "slt";

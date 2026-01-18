@@ -3,7 +3,7 @@
 #include "compiler/masm/ir.h"
 #include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/spec.h"
-#include "compiler/masm/isa/x86_64.h"
+#include "compiler/masm/isa/x86_64/x86_64.h"
 #include "compiler/masm/masm.h"
 #include "compiler/masm/regalloc.h"
 #include "compiler/symbol.h"
@@ -240,8 +240,8 @@ static inline void emit_aggregate_copy(MasmSection *text, LowerContext *ctx, Mas
         MasmOperand tmp = isa_tmp2(ctx, (uint32_t)chunk);
         MasmOperand src = masm_operand_memory_simple(src_ptr.reg.id, (int64_t)off, (size_t)chunk);
         MasmOperand dst = masm_operand_memory_simple(dst_ptr.reg.id, (int64_t)off, (size_t)chunk);
-        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, src));
-        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp));
+        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, tmp, src));
+        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, dst, tmp));
         off += chunk;
     }
 }
@@ -1101,7 +1101,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
                     MasmOperand addr     = isa_result(ctx, ctx->ptr_size);
                     MasmOperand label_op = masm_operand_label(strdup(link_name));
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, addr, label_op));
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, addr, label_op));
 
                     if (sym_size > 8)
                     {
@@ -1321,27 +1321,27 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                     {
                         if (val.reg.id != src_ptr.reg.id)
                         {
-                            masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, src_ptr, val));
+                            masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
                         }
                     }
                     else if (val.kind == MASM_OPERAND_MEMORY)
                     {
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, src_ptr, val));
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, src_ptr, val));
                     }
                     else if (val.kind == MASM_OPERAND_LABEL || val.kind == MASM_OPERAND_IMM)
                     {
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, src_ptr, val));
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
                     }
                     else
                     {
                         MasmOperand tmp = isa_tmp(ctx, ctx->ptr_size);
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, val));
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, src_ptr, tmp));
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, tmp, val));
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, tmp));
                     }
 
                     MasmOperand dst_ptr  = isa_tmp(ctx, ctx->ptr_size);
                     MasmOperand dst_addr = frame_mem(ctx, elem_offset, ctx->ptr_size);
-                    masm_section_append_inst(text, masm_inst_2(MASM_OP_LEA, dst_ptr, dst_addr));
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, dst_ptr, dst_addr));
 
                     emit_aggregate_copy(text, ctx, dst_ptr, src_ptr, (size_t)elem_size);
                 }
@@ -1349,18 +1349,18 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 {
                     if (val.kind == MASM_OPERAND_REGISTER)
                     {
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val));
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, dst, val));
                     }
                     else if (val.kind == MASM_OPERAND_IMM)
                     {
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, val));
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, dst, val));
                     }
                     else if (val.kind == MASM_OPERAND_MEMORY)
                     {
                         // mem to mem copy
                         MasmOperand tmp = isa_tmp(ctx, ctx->ptr_size);
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, tmp, val));
-                        masm_section_append_inst(text, masm_inst_2(MASM_OP_MOV, dst, tmp));
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, tmp, val));
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, dst, tmp));
                     }
                 }
             }
@@ -2078,7 +2078,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
 
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_CMP, dst_op, src_op));
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_CMP, dst_op, src_op));
             }
         }
         else if (strncmp(token, "xor ", 4) == 0)
@@ -2229,7 +2229,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVZX, dst_op, src_op));
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_ZEXT, dst_op, src_op));
             }
         }
         else if (strncmp(token, "movsx ", 6) == 0)
@@ -2253,7 +2253,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
-                masm_section_append_inst(text, masm_inst_2(MASM_OP_MOVSX, dst_op, src_op));
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_SEXT, dst_op, src_op));
             }
         }
 

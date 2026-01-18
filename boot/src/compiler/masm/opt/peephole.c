@@ -1,4 +1,4 @@
-#include "compiler/masm/opt/masm_opt.h"
+#include "compiler/masm/opt/peephole.h"
 #include "compiler/masm/instruction.h"
 #include <stdlib.h>
 #include <string.h>

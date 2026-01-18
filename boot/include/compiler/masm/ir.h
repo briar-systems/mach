@@ -13,6 +13,8 @@ typedef enum MasmIrOpcode
     MASM_IR_LOAD,
     MASM_IR_STORE,
     MASM_IR_LEA,
+    MASM_IR_ZEXT,
+    MASM_IR_SEXT,
 
     // Integer Arithmetic
     MASM_IR_ADD,
@@ -35,6 +37,7 @@ typedef enum MasmIrOpcode
 
     // Comparisons (Set-if)
     // Results are stored in destination register (1 or 0)
+    MASM_IR_CMP,
     MASM_IR_SEQ,
     MASM_IR_SNE,
     MASM_IR_SLT,
