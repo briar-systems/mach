@@ -44,13 +44,6 @@ void masm_section_append_inst(MasmSection *section, MasmInstruction inst)
         section->inst_capacity = new_capacity;
     }
     
-    #ifdef MASM_DEBUG
-    if (inst.opcode == MASM_OP_LABEL && inst.operand_count > 0 && inst.operands[0].label)
-    {
-        fprintf(stderr, "[append] label %s (sec=%s idx=%zu)\n", inst.operands[0].label, section->name, section->inst_count);
-    }
-    #endif
-
     section->instructions[section->inst_count++] = inst;
 }
 

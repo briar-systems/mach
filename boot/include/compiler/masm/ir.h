@@ -6,10 +6,13 @@
 // Portable MASM IR Opcodes
 // These opcodes represent the Three-Operand Form (TOF) instruction set
 // and are platform-independent.
+// IR opcodes start at 500 to avoid collision with generic MasmOpcode values
+#define MASM_IR_START 500
+
 typedef enum MasmIrOpcode
 {
     // Data Movement
-    MASM_IR_MOV,
+    MASM_IR_MOV = MASM_IR_START,
     MASM_IR_LOAD,
     MASM_IR_STORE,
     MASM_IR_LEA,
