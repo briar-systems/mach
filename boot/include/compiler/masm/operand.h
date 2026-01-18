@@ -16,14 +16,21 @@ typedef enum MasmOperandKind
     MASM_OPERAND_TYPE
 } MasmOperandKind;
 
+typedef enum MasmRegisterClass
+{
+    MASM_REG_CLASS_INT,
+    MASM_REG_CLASS_FLOAT
+} MasmRegisterClass;
+
 // register definition
 typedef struct MasmRegister
 {
-    uint32_t id;
-    uint8_t  size; // in bytes
+    uint32_t          id;
+    uint8_t           size; // in bytes
+    MasmRegisterClass class;
 } MasmRegister;
 
-#define MASM_REG_FLOAT_FLAG 0x80000000
+
 
 // memory reference: [base + index * scale + disp]
 typedef struct MasmMemory
@@ -53,6 +60,7 @@ typedef struct MasmOperand
 // operand builders
 MasmOperand masm_operand_none();
 MasmOperand masm_operand_register(uint32_t id, uint8_t size);
+MasmOperand masm_operand_register_fp(uint32_t id, uint8_t size);
 MasmOperand masm_operand_imm(int64_t value);
 MasmOperand masm_operand_memory(MasmRegister base, MasmRegister index, uint8_t scale, int64_t disp, uint8_t size);
 MasmOperand masm_operand_memory_simple(uint32_t base_reg, int32_t disp, uint8_t size);
@@ -61,3 +69,4 @@ MasmOperand masm_operand_label(const char *name);
 MasmOperand masm_operand_type(MasmTypeKind type);
 
 #endif // MASM_OPERAND_H
+

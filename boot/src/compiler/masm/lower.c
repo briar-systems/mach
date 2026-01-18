@@ -79,6 +79,11 @@ static MasmOperand alloc_vreg(LowerContext *ctx, uint8_t size)
     return masm_operand_register(ctx->vreg_next++, size);
 }
 
+static MasmOperand alloc_vreg_fp(LowerContext *ctx, uint8_t size)
+{
+    return masm_operand_register_fp(ctx->vreg_next++, size);
+}
+
 static inline MasmOperand isa_result(LowerContext *ctx, uint8_t size)
 {
     return alloc_vreg(ctx, size);
@@ -721,11 +726,29 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         for (int i = 0; i < arg_count; ++i)
         {
             AstNode *arg = args->items[i];
-            op_args[i] = ensure_in_reg(text, lower_expr(masm, text, arg, ctx), arg->type, ctx);
+            MasmOperand op = lower_expr(masm, text, arg, ctx);
             if (arg->type && type_is_float(arg->type))
             {
-                op_args[i].reg.id |= MASM_REG_FLOAT_FLAG;
+                if (op.kind != MASM_OPERAND_REGISTER)
+                {
+                    MasmOperand r = alloc_vreg_fp(ctx, arg->type->size ? arg->type->size : 8);
+                    if (op.kind == MASM_OPERAND_MEMORY)
+                    {
+                         masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, r, op, masm_operand_type(arg->type->size == 4 ? MASM_TYPE_F32 : MASM_TYPE_F64)));
+                    }
+                    else
+                    {
+                         masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, r, op));
+                    }
+                    op = r;
+                }
+                op.reg.class = MASM_REG_CLASS_FLOAT;
             }
+            else
+            {
+                op = ensure_in_reg(text, op, arg->type, ctx);
+            }
+            op_args[i] = op;
         }
     }
 
@@ -745,7 +768,7 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         res_in_inst = res;
         if (expr->type && type_is_float(expr->type))
         {
-            res_in_inst.reg.id |= MASM_REG_FLOAT_FLAG;
+            res_in_inst.reg.class = MASM_REG_CLASS_FLOAT;
         }
     }
 
@@ -1573,11 +1596,27 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         else if (expr)
         {
             ret_val = lower_expr(masm, text, expr, ctx);
-            ret_val = ensure_in_reg(text, ret_val, expr->type, ctx);
 
             if (ctx->fn_ret_type && type_is_float(ctx->fn_ret_type))
             {
-                ret_val.reg.id |= MASM_REG_FLOAT_FLAG;
+                if (ret_val.kind != MASM_OPERAND_REGISTER)
+                {
+                    MasmOperand r = alloc_vreg_fp(ctx, ctx->fn_ret_type->size);
+                    if (ret_val.kind == MASM_OPERAND_MEMORY)
+                    {
+                         masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, r, ret_val, masm_operand_type(ctx->fn_ret_type->size == 4 ? MASM_TYPE_F32 : MASM_TYPE_F64)));
+                    }
+                    else
+                    {
+                         masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, r, ret_val));
+                    }
+                    ret_val = r;
+                }
+                ret_val.reg.class = MASM_REG_CLASS_FLOAT;
+            }
+            else
+            {
+                ret_val = ensure_in_reg(text, ret_val, expr->type, ctx);
             }
         }
 
@@ -2466,7 +2505,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
                 if (fp_i < ctx->float_arg_count)
                 {
                     uint32_t xmm_id = ctx->abi->float_arg_regs[fp_i++];
-                    MasmOperand src = masm_operand_register(xmm_id, store_size);
+                    MasmOperand src = masm_operand_register_fp(xmm_id, store_size);
                     // store directly to stack
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, src, masm_operand_imm(store_size)));
                 }
@@ -2474,7 +2513,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
                 {
                     int32_t     stack_param_offset = (int32_t)(2 * ctx->ptr_size + (stack_i++ * ctx->ptr_size));
                     MasmOperand src_mem            = frame_mem(ctx, stack_param_offset, store_size);
-                    MasmOperand tmp                = alloc_vreg(ctx, store_size);
+                    MasmOperand tmp                = alloc_vreg_fp(ctx, store_size);
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src_mem, masm_operand_type(MASM_TYPE_F64)));
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, tmp, masm_operand_imm(store_size)));
                 }

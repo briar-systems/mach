@@ -16,6 +16,18 @@ MasmOperand masm_operand_register(uint32_t id, uint8_t size)
     op.kind = MASM_OPERAND_REGISTER;
     op.reg.id = id;
     op.reg.size = size;
+    op.reg.class = MASM_REG_CLASS_INT;
+    return op;
+}
+
+MasmOperand masm_operand_register_fp(uint32_t id, uint8_t size)
+{
+    MasmOperand op;
+    memset(&op, 0, sizeof(MasmOperand));
+    op.kind = MASM_OPERAND_REGISTER;
+    op.reg.id = id;
+    op.reg.size = size;
+    op.reg.class = MASM_REG_CLASS_FLOAT;
     return op;
 }
 
@@ -66,8 +78,10 @@ MasmOperand masm_operand_memory_simple(uint32_t base_reg, int32_t disp, uint8_t 
     op.kind = MASM_OPERAND_MEMORY;
     op.mem.base.id = base_reg;
     op.mem.base.size = 8;
+    op.mem.base.class = MASM_REG_CLASS_INT;
     op.mem.index.id = 0;
     op.mem.index.size = 0;
+    op.mem.index.class = MASM_REG_CLASS_INT;
     op.mem.scale = 0;
     op.mem.disp = disp;
     op.mem.size = size;
