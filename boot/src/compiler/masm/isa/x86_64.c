@@ -145,9 +145,7 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
     case MASM_OP_LABEL:
         break;
 
-    case MASM_OP_RET:
-        emit_byte(buffer, &offset, size, 0xC3);
-        break;
+
 
     case MASM_OP_X86_SYSCALL:
         emit_byte(buffer, &offset, size, 0x0F);
