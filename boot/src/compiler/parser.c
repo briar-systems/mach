@@ -551,6 +551,7 @@ void parser_synchronize(Parser *parser)
         case TOKEN_KW_VAL:
         case TOKEN_KW_VAR:
         case TOKEN_KW_FUN:
+        case TOKEN_KW_TEST:
         case TOKEN_DOLLAR:
             return;
         default:
@@ -1056,6 +1057,15 @@ AstNode *parser_parse_stmt_top(Parser *parser)
         break;
     case TOKEN_KW_FUN:
         result = parser_parse_stmt_fun(parser, is_public);
+        break;
+    case TOKEN_KW_TEST:
+        if (is_public)
+        {
+            parser_error_at_current(parser, "'pub' cannot precede test blocks");
+            parser_synchronize(parser);
+            return NULL;
+        }
+        result = parser_parse_stmt_test(parser);
         break;
     case TOKEN_KW_REC:
         result = parser_parse_stmt_rec(parser, is_public);
@@ -1718,6 +1728,48 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
     return node;
 }
 
+AstNode *parser_parse_stmt_test(Parser *parser)
+{
+    if (!parser_consume(parser, TOKEN_KW_TEST, "expected 'test' keyword"))
+    {
+        return NULL;
+    }
+
+    AstNode *node = parser_alloc_node(parser, AST_STMT_TEST, parser->previous);
+    if (!node)
+    {
+        return NULL;
+    }
+
+    if (!parser_consume(parser, TOKEN_LIT_STRING, "expected test name string"))
+    {
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    char *name = lexer_eval_lit_string(parser->lexer, parser->previous);
+    if (!name)
+    {
+        parser_report_alloc_failure(parser, "out of memory reading test name");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    node->test_stmt.name = name;
+    node->test_stmt.meta = NULL;
+    node->test_stmt.body = parser_parse_stmt_block(parser);
+    if (!node->test_stmt.body)
+    {
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    return node;
+}
+
 AstNode *parser_parse_stmt_rec(Parser *parser, bool is_public)
 {
     if (!parser_consume(parser, TOKEN_KW_REC, "expected 'rec' keyword"))
@@ -2032,6 +2084,8 @@ AstNode *parser_parse_stmt_cnt(Parser *parser)
     return node;
 }
 
+
+
 AstNode *parser_parse_stmt_ret(Parser *parser)
 {
     if (!parser_consume(parser, TOKEN_KW_RET, "expected 'ret' keyword"))
@@ -2067,31 +2121,21 @@ AstNode *parser_parse_stmt_ret(Parser *parser)
     return node;
 }
 
-AstNode *parser_parse_stmt_mir(Parser *parser)
+// helper: check if identifier matches a known ISA name
+static bool parser_is_isa_name(const char *name)
 {
-    if (!parser_consume(parser, TOKEN_KW_MASM, "expected 'mir' keyword"))
-    {
-        return NULL;
-    }
+    // extensible list of supported ISA names
+    return strcmp(name, "x86_64") == 0 ||
+           strcmp(name, "aarch64") == 0 ||
+           strcmp(name, "riscv64") == 0;
+}
 
-    AstNode *node = parser_alloc_node(parser, AST_STMT_MASM, parser->previous);
-    if (!node)
-    {
-        return NULL;
-    }
-
-    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' after 'mir'"))
-    {
-        ast_node_dnit(node);
-        free(node);
-        return NULL;
-    }
-
-    // capture starting position after '{' using character position in source
+// helper: extract content between braces, returns malloc'd string
+static char *parser_extract_brace_content(Parser *parser)
+{
     int start_pos   = parser->current->pos;
     int brace_depth = 1;
 
-    // scan until matching closing brace
     while (brace_depth > 0 && !parser_is_at_end(parser))
     {
         if (parser_check(parser, TOKEN_L_BRACE))
@@ -2109,22 +2153,101 @@ AstNode *parser_parse_stmt_mir(Parser *parser)
         parser_advance(parser);
     }
 
-    // calculate length of content between braces
-    int end_pos = parser->current->pos;
-    int len     = end_pos - start_pos;
+    int   end_pos = parser->current->pos;
+    int   len     = end_pos - start_pos;
+    char *content = (char *)malloc(len + 1);
+    if (content)
+    {
+        memcpy(content, parser->lexer->source + start_pos, len);
+        content[len] = '\0';
+    }
+    return content;
+}
 
-    // extract raw content
-    node->masm_stmt.content = (char *)malloc(len + 1);
+AstNode *parser_parse_stmt_mir(Parser *parser)
+{
+    if (!parser_consume(parser, TOKEN_KW_MASM, "expected 'mir' keyword"))
+    {
+        return NULL;
+    }
+
+    AstNode *node = parser_alloc_node(parser, AST_STMT_MASM, parser->previous);
+    if (!node)
+    {
+        return NULL;
+    }
+
+    node->masm_stmt.content     = NULL;
+    node->masm_stmt.isa_name    = NULL;
+    node->masm_stmt.isa_content = NULL;
+
+    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' after 'masm'"))
+    {
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
+    }
+
+    // check for ISA-specific block: identifier followed by '{'
+    // e.g., masm { x86_64 { ... } }
+    if (parser_check(parser, TOKEN_IDENTIFIER))
+    {
+        char *ident = lexer_raw_value(parser->lexer, parser->current);
+        if (parser_is_isa_name(ident))
+        {
+            // save ISA name
+            node->masm_stmt.isa_name = ident;
+            parser_advance(parser);
+
+            if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' after ISA name"))
+            {
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+
+            // extract ISA-specific content
+            node->masm_stmt.isa_content = parser_extract_brace_content(parser);
+            if (!node->masm_stmt.isa_content)
+            {
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+
+            if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after ISA block"))
+            {
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+
+            // consume outer closing brace
+            if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after masm block"))
+            {
+                ast_node_dnit(node);
+                free(node);
+                return NULL;
+            }
+
+            return node;
+        }
+        else
+        {
+            free(ident);
+        }
+    }
+
+    // no ISA block, extract portable asm content
+    node->masm_stmt.content = parser_extract_brace_content(parser);
     if (!node->masm_stmt.content)
     {
         ast_node_dnit(node);
         free(node);
         return NULL;
     }
-    memcpy(node->masm_stmt.content, parser->lexer->source + start_pos, len);
-    node->masm_stmt.content[len] = '\0';
 
-    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after mir block"))
+    if (!parser_consume(parser, TOKEN_R_BRACE, "expected '}' after masm block"))
     {
         ast_node_dnit(node);
         free(node);

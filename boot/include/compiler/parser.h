@@ -82,6 +82,7 @@ AstNode *parser_parse_stmt_def(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_val(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_var(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public);
+AstNode *parser_parse_stmt_test(Parser *parser);
 AstNode *parser_parse_stmt_rec(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_uni(Parser *parser, bool is_public);
 AstNode *parser_parse_stmt_if(Parser *parser);

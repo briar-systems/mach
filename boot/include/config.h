@@ -63,6 +63,7 @@ typedef struct ConfigTarget
     ConfigTargetMode *mode;       // build mode: executable|library
     char             *entrypoint; // main source file (relative to src_dir)
     char             *artifacts;  // artifacts directory (relative to out_dir)
+    char             *dir_tests;  // test output directory (under dir_out/<artifacts>)
     char             *binary;     // output binary path (relative to out_dir)
 } ConfigTarget;
 
@@ -80,13 +81,13 @@ typedef struct ConfigDep
 // project configuration
 typedef struct Config
 {
-    char *id;      // project id (used for module prefix and soft uniqueness)
-    char *name;    // project name (canonical, human-readable)
-    char *version; // project version
-    char *dir_src; // source files directory
-    char *dir_out; // output files directory
-    char *dir_dep; // dependencies directory
-    char *target;  // target name (or "native" to auto-detect)
+    char *id;        // project id (used for module prefix and soft uniqueness)
+    char *name;      // project name (canonical, human-readable)
+    char *version;   // project version
+    char *dir_src;   // source files directory
+    char *dir_out;   // output files directory
+    char *dir_dep;   // dependencies directory
+    char *target;    // target name (or "native" to auto-detect)
 
     ConfigTarget **targets;
     int            target_count;

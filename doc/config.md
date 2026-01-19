@@ -14,6 +14,7 @@
   - [`abi`](#abi)
   - [`entrypoint`](#entrypoint)
   - [`artifacts`](#artifacts)
+  - [`dir_tests`](#dir_tests)
   - [`binary`](#binary)
   - [`mode`](#mode)
 - [`[deps.<alias>]` sections](#depsalias-sections)
@@ -43,6 +44,7 @@ isa = "x86_64"
 abi = "sysv64"
 entrypoint = "main.mach"
 artifacts = "linux"
+dir_tests = "tests"
 binary = "linux/bin/mach"
 mode = "executable"
 
@@ -157,6 +159,17 @@ For example, with `dir_out = "out"` and `artifacts = "linux"`, intermediate and 
 
 ```
 out/linux/
+```
+
+
+### `dir_tests`
+
+The directory under `dir_out/<artifacts>` where `mach test` writes test binaries for the target.
+For example, with `dir_out = "out"`, `artifacts = "linux"`, and `dir_tests = "tests"`,
+test binaries are written under:
+
+```
+out/linux/tests/
 ```
 
 

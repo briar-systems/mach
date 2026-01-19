@@ -6,6 +6,7 @@
 #include "commands/cmd_help.h"
 #include "commands/cmd_init.h"
 #include "commands/cmd_run.h"
+#include "commands/cmd_test.h"
 
 int main(int argc, char **argv)
 {
@@ -28,6 +29,10 @@ int main(int argc, char **argv)
     else if (strcmp(command, "run") == 0)
     {
         return cmd_run_handle(argc, argv);
+    }
+    else if (strcmp(command, "test") == 0)
+    {
+        return cmd_test_handle(argc, argv);
     }
     else if (strcmp(command, "dep") == 0)
     {

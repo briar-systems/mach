@@ -112,6 +112,20 @@ void ast_node_dnit(AstNode *node)
         }
         break;
 
+    case AST_STMT_TEST:
+        free(node->test_stmt.name);
+        if (node->test_stmt.body)
+        {
+            ast_node_dnit(node->test_stmt.body);
+            free(node->test_stmt.body);
+        }
+        if (node->test_stmt.meta)
+        {
+            ast_list_dnit(node->test_stmt.meta);
+            free(node->test_stmt.meta);
+        }
+        break;
+
     case AST_STMT_REC:
         free(node->rec_stmt.name);
         if (node->rec_stmt.generics)
@@ -187,6 +201,8 @@ void ast_node_dnit(AstNode *node)
         }
         break;
 
+
+
     case AST_STMT_IF:
         if (node->cond_stmt.cond)
         {
@@ -261,6 +277,14 @@ void ast_node_dnit(AstNode *node)
         if (node->masm_stmt.content)
         {
             free(node->masm_stmt.content);
+        }
+        if (node->masm_stmt.isa_name)
+        {
+            free(node->masm_stmt.isa_name);
+        }
+        if (node->masm_stmt.isa_content)
+        {
+            free(node->masm_stmt.isa_content);
         }
         break;
 
@@ -638,6 +662,12 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->fun_stmt.method_receiver_name = ast_strdup(node->fun_stmt.method_receiver_name);
         break;
 
+    case AST_STMT_TEST:
+        clone->test_stmt.name = ast_strdup(node->test_stmt.name);
+        clone->test_stmt.body = ast_clone_checked(node->test_stmt.body);
+        clone->test_stmt.meta = ast_list_clone(node->test_stmt.meta);
+        break;
+
     case AST_STMT_REC:
         clone->rec_stmt.name      = ast_strdup(node->rec_stmt.name);
         clone->rec_stmt.generics  = ast_list_clone(node->rec_stmt.generics);
@@ -679,6 +709,8 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->ret_stmt.expr = ast_clone_checked(node->ret_stmt.expr);
         break;
 
+
+
     case AST_STMT_IF:
     case AST_STMT_OR:
         clone->cond_stmt.cond    = ast_clone_checked(node->cond_stmt.cond);
@@ -706,6 +738,14 @@ static AstNode *ast_clone_checked(const AstNode *node)
         if (node->masm_stmt.content)
         {
             clone->masm_stmt.content = strdup(node->masm_stmt.content);
+        }
+        if (node->masm_stmt.isa_name)
+        {
+            clone->masm_stmt.isa_name = strdup(node->masm_stmt.isa_name);
+        }
+        if (node->masm_stmt.isa_content)
+        {
+            clone->masm_stmt.isa_content = strdup(node->masm_stmt.isa_content);
         }
         break;
 
@@ -968,6 +1008,16 @@ void ast_print(AstNode *node, int indent)
         }
         break;
 
+    case AST_STMT_TEST:
+        printf("TEST %s\n", node->test_stmt.name ? node->test_stmt.name : "<unnamed>");
+        if (node->test_stmt.body)
+        {
+            print_indent(indent + 1);
+            printf("body:\n");
+            ast_print(node->test_stmt.body, indent + 2);
+        }
+        break;
+
     case AST_STMT_REC:
         printf("REC %s\n", node->rec_stmt.name);
         for (int i = 0; i < node->rec_stmt.fields->count; i++)
@@ -1019,6 +1069,8 @@ void ast_print(AstNode *node, int indent)
             ast_print(node->ret_stmt.expr, indent + 1);
         }
         break;
+
+
 
     case AST_STMT_IF:
         printf("IF\n");
@@ -1328,6 +1380,8 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "VAR";
     case AST_STMT_FUN:
         return "FUN";
+    case AST_STMT_TEST:
+        return "TEST";
     case AST_STMT_REC:
         return "REC";
     case AST_STMT_UNI:
@@ -1344,6 +1398,7 @@ const char *ast_node_kind_to_string(AstKind kind)
         return "COMPTIME";
     case AST_STMT_RET:
         return "RET";
+
     case AST_STMT_IF:
         return "IF";
     case AST_STMT_OR:
@@ -1515,6 +1570,16 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
         }
         break;
 
+    case AST_STMT_TEST:
+        fprintf(file, "TEST %s\n", node->test_stmt.name ? node->test_stmt.name : "<unnamed>");
+        if (node->test_stmt.body)
+        {
+            print_indent_to_file(file, indent + 1);
+            fprintf(file, "body:\n");
+            ast_print_to_file(node->test_stmt.body, file, indent + 2);
+        }
+        break;
+
     case AST_STMT_REC:
         fprintf(file, "REC %s\n", node->rec_stmt.name);
         for (int i = 0; i < node->rec_stmt.fields->count; i++)
@@ -1564,6 +1629,8 @@ static void ast_print_to_file(AstNode *node, FILE *file, int indent)
             ast_print_to_file(node->ret_stmt.expr, file, indent + 1);
         }
         break;
+
+
     case AST_STMT_IF:
         fprintf(file, "IF\n");
         print_indent_to_file(file, indent + 1);

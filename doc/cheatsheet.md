@@ -23,6 +23,7 @@ This page summarizes the syntax and tooling you are most likely to reach for whe
 | Build default target                         | `cmach build .`                                                      |
 | Build specific target                        | `cmach build . --target linux`                                       |
 | Run the most recent build (does not rebuild) | `cmach run .`                                                        |
+| Run all tests                                | `cmach test .`                                                       |
 | List dependencies                            | `cmach dep list`                                                     |
 | Add remote dependency                        | `cmach dep add https://github.com/org/pkg.git --version branch/main` |
 | Pull/update dependencies                     | `cmach dep pull`                                                     |
@@ -68,6 +69,7 @@ mach.toml                # project.id = "myapp"
 | `cnt`   | `cnt;`                                                                                                                                                   | Continue to the next iteration         |
 | `brk`   | `brk;`                                                                                                                                                   | Break out of a loop                    |
 | `masm`   | `masm { <assembly-instructions> }`                                                                                                                        | Inline masm (limited dialect)                        |
+| `test`   | `test "name" { <body> }`                                                                                                                                   | Top-level test block                  |
 
 
 ## Builtin Types

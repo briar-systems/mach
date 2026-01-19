@@ -756,6 +756,44 @@ static bool sema_check_untyped_numeric(Sema *sema, AstNode *node, const char *me
     }
 }
 
+// default any remaining untyped numeric literals in a condition expression to i64/f64
+static void sema_default_untyped_literals_in_condition(AstNode *node)
+{
+    if (!node)
+    {
+        return;
+    }
+
+    if (sema_is_untyped_numeric_literal(node))
+    {
+        Token *tok = node->token;
+        if (tok && tok->kind == TOKEN_LIT_FLOAT)
+        {
+            node->type = type_get_primitive(TYPE_F64);
+        }
+        else
+        {
+            node->type = type_get_primitive(TYPE_I64);
+        }
+        return;
+    }
+
+    switch (node->kind)
+    {
+    case AST_EXPR_UNARY:
+        sema_default_untyped_literals_in_condition(node->unary_expr.expr);
+        break;
+
+    case AST_EXPR_BINARY:
+        sema_default_untyped_literals_in_condition(node->binary_expr.left);
+        sema_default_untyped_literals_in_condition(node->binary_expr.right);
+        break;
+
+    default:
+        break;
+    }
+}
+
 static bool sema_try_infer_numeric_literal(AstNode *node, Type *target)
 {
     if (!target || !type_is_numeric(target))
@@ -1661,6 +1699,7 @@ static AstNode *sema_type_node_from_type(Type *t)
         return NULL;
     }
 
+    node->type = t;
     return node;
 }
 
@@ -2122,48 +2161,6 @@ static int sema_analyze_comptime_stmt(Sema *sema, AstNode *node)
 
                 sema_error(sema, inner->token, arg->lit_expr.string_val);
                 return -1;
-            }
-            else if (strcmp(name, "assert") == 0)
-            {
-                // $assert(cond, "message")
-                if (!inner->call_expr.args || inner->call_expr.args->count != 2)
-                {
-                    sema_error(sema, inner->token, "expected 2 arguments for $assert");
-                    return -1;
-                }
-
-                AstNode *cond = inner->call_expr.args->items[0];
-                AstNode *msg  = inner->call_expr.args->items[1];
-
-                if (sema_analyze_expr(sema, cond) < 0)
-                {
-                    return -1;
-                }
-                if (sema_analyze_expr(sema, msg) < 0)
-                {
-                    return -1;
-                }
-
-                int64_t val = 0;
-                if (!sema_eval_comptime_int(sema, cond, &val))
-                {
-                    sema_error(sema, cond->token, "condition is not a compile-time constant");
-                    return -1;
-                }
-
-                if (msg->kind != AST_EXPR_LIT || msg->lit_expr.kind != TOKEN_LIT_STRING)
-                {
-                    sema_error(sema, msg->token, "expected string literal for assertion message");
-                    return -1;
-                }
-
-                if (val == 0)
-                {
-                    sema_error(sema, inner->token, msg->lit_expr.string_val);
-                    return -1;
-                }
-
-                return 0;
             }
         }
     }
@@ -2693,6 +2690,8 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         {
             return -1;
         }
+        // default any remaining untyped literals in condition to i64/f64
+        sema_default_untyped_literals_in_condition(node->cond_stmt.cond);
         if (!sema_check_untyped_numeric(sema, node->cond_stmt.cond, "could not infer type of numeric literal in condition"))
         {
             return -1;
@@ -2712,6 +2711,11 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         {
             return -1;
         }
+        // default any remaining untyped literals in condition to i64/f64
+        if (node->cond_stmt.cond)
+        {
+            sema_default_untyped_literals_in_condition(node->cond_stmt.cond);
+        }
         if (node->cond_stmt.cond && !sema_check_untyped_numeric(sema, node->cond_stmt.cond, "could not infer type of numeric literal in condition"))
         {
             return -1;
@@ -2730,6 +2734,11 @@ static int sema_analyze_stmt(Sema *sema, AstNode *node)
         if (node->for_stmt.cond && sema_analyze_expr(sema, node->for_stmt.cond) < 0)
         {
             return -1;
+        }
+        // default any remaining untyped literals in condition to i64/f64
+        if (node->for_stmt.cond)
+        {
+            sema_default_untyped_literals_in_condition(node->for_stmt.cond);
         }
         if (node->for_stmt.cond && !sema_check_untyped_numeric(sema, node->for_stmt.cond, "could not infer type of numeric literal in loop condition"))
         {
@@ -2924,11 +2933,11 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         // attempt to align untyped numeric literals with their counterpart
         if (type_is_numeric(node->binary_expr.left->type))
         {
-            sema_try_infer_numeric_literal(node->binary_expr.right, node->binary_expr.left->type);
+            sema_infer_numeric_expr(node->binary_expr.right, node->binary_expr.left->type);
         }
         if (type_is_numeric(node->binary_expr.right->type))
         {
-            sema_try_infer_numeric_literal(node->binary_expr.left, node->binary_expr.right->type);
+            sema_infer_numeric_expr(node->binary_expr.left, node->binary_expr.right->type);
         }
 
         // result type depends on operator
@@ -3139,7 +3148,11 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
             // check what the method expects
             Type *expected_receiver_type = NULL;
-            if (func_sym && func_sym->decl && func_sym->decl->fun_stmt.method_receiver)
+            if (func_sym && func_sym->type && func_sym->type->kind == TYPE_FUNCTION && func_sym->type->function.param_count > 0)
+            {
+                expected_receiver_type = func_sym->type->function.param_types[0];
+            }
+            else if (func_sym && func_sym->decl && func_sym->decl->fun_stmt.method_receiver)
             {
                 expected_receiver_type = sema_resolve_type(sema, func_sym->decl->fun_stmt.method_receiver);
             }
@@ -3383,6 +3396,12 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         Symbol     *method        = symbol_table_lookup(sema->current_table, node->field_expr.field);
         SemaModule *method_origin = NULL;
 
+        // ignore non-method symbols that shadow method names
+        if (method && (method->kind != SYMBOL_FUNCTION || !method->decl || method->decl->kind != AST_STMT_FUN || !method->decl->fun_stmt.is_method))
+        {
+            method = NULL;
+        }
+
         if (!method && sema->current_module)
         {
             for (ModuleImport *imp = sema->current_module->imports; imp; imp = imp->next)
@@ -3393,13 +3412,34 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 }
 
                 Symbol *cand = symbol_table_lookup_local(imp->module->table, node->field_expr.field);
-                if (!cand || cand->kind != SYMBOL_FUNCTION || !cand->is_public)
+                if (!cand || cand->kind != SYMBOL_FUNCTION || !cand->is_public || !cand->decl || cand->decl->kind != AST_STMT_FUN || !cand->decl->fun_stmt.is_method)
                 {
                     continue;
                 }
 
                 method        = cand;
                 method_origin = imp->module;
+                break;
+            }
+        }
+
+        if (!method && sema->current_module)
+        {
+            for (ModuleAlias *al = sema->current_module->aliases; al; al = al->next)
+            {
+                if (!al->module || !al->module->table)
+                {
+                    continue;
+                }
+
+                Symbol *cand = symbol_table_lookup_local(al->module->table, node->field_expr.field);
+                if (!cand || cand->kind != SYMBOL_FUNCTION || !cand->is_public || !cand->decl || cand->decl->kind != AST_STMT_FUN || !cand->decl->fun_stmt.is_method)
+                {
+                    continue;
+                }
+
+                method        = cand;
+                method_origin = al->module;
                 break;
             }
         }
@@ -3666,7 +3706,19 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
 
             // non-generic method resolution
-            Type *method_receiver_type = sema_resolve_type(sema, method->decl->fun_stmt.method_receiver);
+            // use the already-resolved receiver type from the method's function type
+            // (first parameter) instead of re-resolving in caller's context, which
+            // would fail for cross-module methods where the type name is unqualified
+            Type *method_receiver_type = NULL;
+            if (method->type && method->type->kind == TYPE_FUNCTION && method->type->function.param_count > 0)
+            {
+                method_receiver_type = method->type->function.param_types[0];
+            }
+            else
+            {
+                // fallback to resolving from AST (may fail for cross-module)
+                method_receiver_type = sema_resolve_type(sema, method->decl->fun_stmt.method_receiver);
+            }
             if (method_receiver_type)
             {
                 // check if receiver type matches object type (including pointer coercion)
@@ -3846,8 +3898,8 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             return -1;
         }
 
-        // casts are pure bit reinterpretation.
-        // require both types to be sized and identical size.
+        // casts are pure bit reinterpretation (or zero-extension/truncation).
+        // require both types to be sized.
         Type *from_type = node->cast_expr.expr->type;
         if (!from_type)
         {
@@ -3858,12 +3910,6 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         if (from_type->size == 0 || target_type->size == 0)
         {
             sema_error(sema, node->token, "cast requires sized types");
-            return -1;
-        }
-
-        if (from_type->size != target_type->size)
-        {
-            sema_error(sema, node->token, "cast requires identical type sizes");
             return -1;
         }
 
@@ -4298,6 +4344,12 @@ static Type *sema_resolve_type(Sema *sema, AstNode *type_node)
     if (!type_node)
     {
         return NULL;
+    }
+
+    // if the node already carries a resolved type, reuse it
+    if (type_node->type)
+    {
+        return type_node->type;
     }
 
     switch (type_node->kind)

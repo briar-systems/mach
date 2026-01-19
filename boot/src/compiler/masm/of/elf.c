@@ -12,7 +12,7 @@
 // tools (cc/ld/ar), similar to a traditional toolchain.
 
 #include "compiler/masm/of/elf.h"
-#include "compiler/masm/isa/x86_64.h"
+#include "compiler/masm/isa/x86_64/x86_64.h"
 
 #include <limits.h>
 #include <stdbool.h>
@@ -329,7 +329,7 @@ int masm_elf_write(Masm *masm, const char *filename)
     {
         MasmInstruction *inst = &text->instructions[i];
 
-        if (inst->opcode == MASM_OP_LABEL)
+        if (inst->kind == MASM_OPCODE_IR && inst->opcode == MASM_IR_LABEL)
         {
             const char *lbl = inst->operands[0].label;
             if (lbl && strcmp(lbl, ".text") != 0)
@@ -347,19 +347,10 @@ int masm_elf_write(Masm *masm, const char *filename)
             continue;
         }
 
-        if (inst->opcode == MASM_OP_CALL && inst->operands[0].kind == MASM_OPERAND_LABEL)
-        {
-            text_off += 5;
-        }
-        else if (inst->opcode == MASM_OP_JMP && inst->operands[0].kind == MASM_OPERAND_LABEL)
-        {
-            text_off += 5;
-        }
-        else if (inst->opcode >= MASM_OP_JE && inst->opcode <= MASM_OP_JLE && inst->operands[0].kind == MASM_OPERAND_LABEL)
-        {
-            text_off += 6;
-        }
-        else if (inst->opcode == MASM_OP_MOV && inst->operand_count == 2 && inst->operands[0].kind == MASM_OPERAND_REGISTER && inst->operands[1].kind == MASM_OPERAND_LABEL)
+        // NOTE: CALL/JMP/Jcc special handling disabled - falling through to masm_x86_encode
+        // The original code's L2 opcode checks never matched (isel emits X86 opcodes),
+        // so everything was handled by encode.c. Replicating that behavior here.
+        if (inst->kind == MASM_OPCODE_X86 && inst->opcode == MASM_OP_X86_MOV_RI && inst->operand_count == 2 && inst->operands[0].kind == MASM_OPERAND_REGISTER && (inst->operands[1].kind == MASM_OPERAND_LABEL || inst->operands[1].kind == MASM_OPERAND_SYMBOL))
         {
             // mov r64, imm64 (rex + opcode + imm)
             uint32_t dst = inst->operands[0].reg.id;
@@ -372,7 +363,7 @@ int masm_elf_write(Masm *masm, const char *filename)
             else
             {
                 MasmOperand     imm_op   = masm_operand_imm(0);
-                MasmInstruction tmp_inst = masm_inst_2(MASM_OP_MOV, inst->operands[0], imm_op);
+                MasmInstruction tmp_inst = masm_x86_inst_2(MASM_OP_X86_MOV_RI, inst->operands[0], imm_op);
                 text_off += masm_x86_encode(tmp_inst, NULL, 0);
                 masm_inst_destroy(tmp_inst);
             }
@@ -507,98 +498,169 @@ int masm_elf_write(Masm *masm, const char *filename)
     for (size_t i = 0; i < text->inst_count; i++)
     {
         MasmInstruction inst = text->instructions[i];
-        if (inst.opcode == MASM_OP_LABEL)
+        if (inst.kind == MASM_OPCODE_IR && inst.opcode == MASM_IR_LABEL)
         {
             continue;
         }
 
         // check for MOV instructions specifically
-        if (inst.opcode == MASM_OP_MOV && inst.operand_count >= 2)
+        if (inst.kind == MASM_OPCODE_X86 && inst.opcode == MASM_OP_X86_MOV_RI && inst.operand_count >= 2)
         {
 #ifdef MASM_DEBUG
             fprintf(stderr, "[elf] MOV at %zu: op0 kind=%d, op1 kind=%d\n", i, inst.operands[0].kind, inst.operands[1].kind);
 #endif
         }
 
-        if ((inst.opcode == MASM_OP_CALL || inst.opcode == MASM_OP_JMP) && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        // handle CALL_REL with label operand
+        if (inst.kind == MASM_OPCODE_X86 && inst.opcode == MASM_OP_X86_CALL_REL && inst.operand_count >= 1 && inst.operands[0].kind == MASM_OPERAND_LABEL)
         {
             const char *name = inst.operands[0].label;
-            Elf64_Word  si   = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
+            MasmSymbol *sym  = masm_get_symbol(masm, name);
 
-            text_buf[off++]    = (inst.opcode == MASM_OP_CALL) ? 0xE8 : 0xE9;
-            Elf64_Addr rel_off = (Elf64_Addr)off;
-            text_buf[off++]    = 0;
-            text_buf[off++]    = 0;
-            text_buf[off++]    = 0;
-            text_buf[off++]    = 0;
+            // emit call opcode
+            text_buf[off++] = 0xE8;
 
-            if (rela_count >= rela_cap)
+            if (sym && sym->section_name && strcmp(sym->section_name, ".text") == 0)
             {
-                rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
-                rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                // local symbol: compute PC-relative offset
+                // displacement is relative to the end of the instruction (off + 4)
+                int32_t disp = (int32_t)(sym->offset - (off + 4));
+                text_buf[off++] = (uint8_t)(disp & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 8) & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 16) & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 24) & 0xFF);
             }
-            rela[rela_count].r_offset = rel_off;
-            rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
-            rela[rela_count].r_addend = -4;
-            rela_count++;
+            else
+            {
+                // external symbol: emit relocation
+                Elf64_Word si = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
+                Elf64_Addr rel_off = (Elf64_Addr)off;
+
+                for (int k = 0; k < 4; k++)
+                {
+                    text_buf[off++] = 0;
+                }
+
+                if (rela_count >= rela_cap)
+                {
+                    rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
+                    rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                }
+                rela[rela_count].r_offset = rel_off;
+                rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
+                rela[rela_count].r_addend = -4;
+                rela_count++;
+            }
             continue;
         }
 
-        if (inst.opcode >= MASM_OP_JE && inst.opcode <= MASM_OP_JLE && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        // handle JMP_REL with label operand
+        if (inst.kind == MASM_OPCODE_X86 && inst.opcode == MASM_OP_X86_JMP_REL && inst.operand_count >= 1 && inst.operands[0].kind == MASM_OPERAND_LABEL)
         {
             const char *name = inst.operands[0].label;
-            Elf64_Word  si   = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
+            MasmSymbol *sym  = masm_get_symbol(masm, name);
 
-            uint8_t cond = 0x84;
+            // emit jmp opcode
+            text_buf[off++] = 0xE9;
+
+            if (sym && sym->section_name && strcmp(sym->section_name, ".text") == 0)
+            {
+                // local symbol: compute PC-relative offset
+                int32_t disp = (int32_t)(sym->offset - (off + 4));
+                text_buf[off++] = (uint8_t)(disp & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 8) & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 16) & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 24) & 0xFF);
+            }
+            else
+            {
+                // external symbol: emit relocation
+                Elf64_Word si = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
+                Elf64_Addr rel_off = (Elf64_Addr)off;
+
+                for (int k = 0; k < 4; k++)
+                {
+                    text_buf[off++] = 0;
+                }
+
+                if (rela_count >= rela_cap)
+                {
+                    rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
+                    rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                }
+                rela[rela_count].r_offset = rel_off;
+                rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
+                rela[rela_count].r_addend = -4;
+                rela_count++;
+            }
+            continue;
+        }
+
+        // handle conditional jumps with label operand
+        if (inst.kind == MASM_OPCODE_X86 && inst.operand_count >= 1 && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            uint8_t cc = 0;
+            bool is_jcc = false;
             switch (inst.opcode)
             {
-            case MASM_OP_JE:
-                cond = 0x84;
-                break;
-            case MASM_OP_JNE:
-                cond = 0x85;
-                break;
-            case MASM_OP_JL:
-                cond = 0x8C;
-                break;
-            case MASM_OP_JLE:
-                cond = 0x8E;
-                break;
-            case MASM_OP_JG:
-                cond = 0x8F;
-                break;
-            case MASM_OP_JGE:
-                cond = 0x8D;
-                break;
-            default:
-                cond = 0x84;
-                break;
+            case MASM_OP_X86_JE:  cc = 0x84; is_jcc = true; break;
+            case MASM_OP_X86_JNE: cc = 0x85; is_jcc = true; break;
+            case MASM_OP_X86_JL:  cc = 0x8C; is_jcc = true; break;
+            case MASM_OP_X86_JG:  cc = 0x8F; is_jcc = true; break;
+            case MASM_OP_X86_JLE: cc = 0x8E; is_jcc = true; break;
+            case MASM_OP_X86_JGE: cc = 0x8D; is_jcc = true; break;
+            default: break;
             }
 
-            text_buf[off++]    = 0x0F;
-            text_buf[off++]    = cond;
-            Elf64_Addr rel_off = (Elf64_Addr)off;
-            text_buf[off++]    = 0;
-            text_buf[off++]    = 0;
-            text_buf[off++]    = 0;
-            text_buf[off++]    = 0;
-
-            if (rela_count >= rela_cap)
+            if (is_jcc)
             {
-                rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
-                rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                const char *name = inst.operands[0].label;
+                MasmSymbol *sym  = masm_get_symbol(masm, name);
+
+                // emit 2-byte jcc opcode (0F xx)
+                text_buf[off++] = 0x0F;
+                text_buf[off++] = cc;
+
+                if (sym && sym->section_name && strcmp(sym->section_name, ".text") == 0)
+                {
+                    // local symbol: compute PC-relative offset
+                    int32_t disp = (int32_t)(sym->offset - (off + 4));
+                    text_buf[off++] = (uint8_t)(disp & 0xFF);
+                    text_buf[off++] = (uint8_t)((disp >> 8) & 0xFF);
+                    text_buf[off++] = (uint8_t)((disp >> 16) & 0xFF);
+                    text_buf[off++] = (uint8_t)((disp >> 24) & 0xFF);
+                }
+                else
+                {
+                    // external symbol: emit relocation
+                    Elf64_Word si = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
+                    Elf64_Addr rel_off = (Elf64_Addr)off;
+
+                    for (int k = 0; k < 4; k++)
+                    {
+                        text_buf[off++] = 0;
+                    }
+
+                    if (rela_count >= rela_cap)
+                    {
+                        rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
+                        rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                    }
+                    rela[rela_count].r_offset = rel_off;
+                    rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
+                    rela[rela_count].r_addend = -4;
+                    rela_count++;
+                }
+                continue;
             }
-            rela[rela_count].r_offset = rel_off;
-            rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
-            rela[rela_count].r_addend = -4;
-            rela_count++;
-            continue;
         }
 
-        if (inst.opcode == MASM_OP_MOV && inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_LABEL)
+        if (inst.kind == MASM_OPCODE_X86 && inst.opcode == MASM_OP_X86_MOV_RI && inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && (inst.operands[1].kind == MASM_OPERAND_LABEL || inst.operands[1].kind == MASM_OPERAND_SYMBOL))
         {
+            // operands[1] can be either LABEL or SYMBOL - both use the same union field
+            const char *name = inst.operands[1].kind == MASM_OPERAND_LABEL ? inst.operands[1].label : inst.operands[1].symbol;
 #ifdef MASM_DEBUG
-            fprintf(stderr, "[elf] found MOV with label %s at inst %zu\n", inst.operands[1].label, i);
+            fprintf(stderr, "[elf] found MOV with label/symbol %s at inst %zu\n", name, i);
 #endif
             uint32_t dst = inst.operands[0].reg.id;
             uint8_t  sz  = inst.operands[0].reg.size;
@@ -611,13 +673,12 @@ int masm_elf_write(Masm *masm, const char *filename)
                 fprintf(stderr, "[elf] sz != 8, emitting zero\n");
 #endif
                 MasmOperand     imm_op   = masm_operand_imm(0);
-                MasmInstruction tmp_inst = masm_inst_2(MASM_OP_MOV, inst.operands[0], imm_op);
+                MasmInstruction tmp_inst = masm_x86_inst_2(MASM_OP_X86_MOV_RI, inst.operands[0], imm_op);
                 off += masm_x86_encode(tmp_inst, text_buf + off, text_size - off);
                 masm_inst_destroy(tmp_inst);
                 continue;
             }
 
-            const char *name = inst.operands[1].label;
             Elf64_Word  si   = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
 
             // rex.w + mov r64, imm64

@@ -74,30 +74,19 @@ Code that does not meet the compiletime conditions is completely omitted from th
 
 The Mach compiler provides several built-in symbols that can be used for compile-time introspection and conditional compilation.
 
-| Symbol                         | Description                                                                  |
-| ------------------------------ | ---------------------------------------------------------------------------- |
-| `$mach.build.target.os`        | Target operating system info (see `std.compiler.target.OSInfo`)             |
-| `$mach.build.target.arch`      | Target architecture info (`std.compiler.target.ArchitectureInfo`)           |
-| `$mach.build.target.abi`       | Target ABI descriptor (`std.compiler.target.ABIInfo`)                       |
-| `$mach.build.target.vendor`    | Target vendor descriptor (`std.compiler.target.VendorInfo`)                 |
-| `$mach.build.target.environment` | Target environment descriptor (`std.compiler.target.EnvironmentInfo`)      |
-| `$mach.build.target.object_format` | Target object format descriptor (`std.compiler.target.ObjectFormatInfo`) |
-| `$mach.build.target.endianness` | Target endianness descriptor (`std.compiler.target.EndiannessInfo`)        |
-| `$mach.build.target.backend`   | Target backend descriptor (`std.compiler.target.BackendKindInfo`)           |
-| `$mach.build.target.pointer_width` | Pointer width of the compilation target in bytes                          |
-| `$mach.build.target.triple`    | Target triple string used for code generation                               |
-| `$mach.build.debug`            | Non-zero when the current build is a debug build                            |
-| `$mach.build.version`          | User-provided build version string                                           |
-| `$mach.version`                | Compiler version string                                                      |
-| `$mach.os`                     | Namespace containing all supported operating system descriptors              |
-| `$mach.arch`                   | Namespace containing architecture descriptors                                |
-| `$mach.abi`                    | Namespace containing ABI descriptors                                         |
-| `$mach.vendor`                 | Namespace containing vendor descriptors                                      |
-| `$mach.environment`            | Namespace containing environment descriptors                                 |
-| `$mach.endianness`             | Namespace containing endianness descriptors                                  |
-| `$mach.object_format`          | Namespace containing object-format descriptors                               |
-| `$mach.backend`                | Namespace containing backend descriptors                                     |
-| `$mach.feature`                | Namespace containing architecture feature descriptors                        |
+### Currently Implemented
+
+| Symbol                           | Description                                      |
+| -------------------------------- | ------------------------------------------------ |
+| `$mach.compiler.version`         | Compiler version string (e.g., `"0.1.0"`)        |
+| `$mach.compiler.name`            | Compiler name (`"mach"`)                         |
+| `$mach.build.target.os`          | Target operating system name string              |
+| `$mach.build.target.os.id`       | Target operating system numeric ID               |
+| `$mach.build.target.arch`        | Target architecture name string                  |
+| `$mach.build.target.arch.id`     | Target architecture numeric ID                   |
+| `$mach.build.target.pointer_width` | Pointer width of the compilation target in bytes |
+| `$mach.os.<name>.id`             | Numeric ID for a specific OS (e.g., `$mach.os.linux.id`) |
+| `$mach.arch.<name>.id`           | Numeric ID for a specific architecture (e.g., `$mach.arch.x86_64.id`) |
 
 All compile-time identifiers must be explicitly qualified with `$`. Even inside `$if` blocks you must prefix every access, for example:
 
@@ -107,7 +96,7 @@ $if ($mach.build.target.os.id == $mach.os.linux.id) {
 }
 ```
 
-> These symbols are subject to change as the Mach language and compiler evolve. They will be documented in future releases and will eventually be stable.
+> The compiletime system is under active development. Additional symbols will be added in future releases.
 
 Example:
 ```mach

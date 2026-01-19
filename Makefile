@@ -40,7 +40,7 @@ BOOT_OBJECTS := $(BOOT_SOURCES:$(BOOT_SRC_DIR)/%.c=$(CMACH_OBJ_DIR)/%.o)
 BOOT_HEADERS := $(shell find $(BOOT_INC_DIR) -type f -name '*.h')
 
 # main targets
-.PHONY: help cmach-clean cmach-build cmach imach-clean imach-build imach mach-clean mach-build mach full clean regression
+.PHONY: help cmach-clean cmach-build cmach imach-clean imach-build imach mach-clean mach-build mach full clean test
 
 # default target: print help
 .DEFAULT_GOAL := help
@@ -65,7 +65,7 @@ help:
 	@echo ""
 	@echo "meta:"
 	@echo "  clean        - clean all build artifacts"
-	@echo "  regression   - run small regression test-suite"
+	@echo "  test         - run test suite"
 	@echo ""
 	@echo "note: target platform determined by mach.toml (target = \"native\")"
 	@echo "  imach        - clean and build imach"
@@ -88,9 +88,8 @@ cmach-build: $(CMACH)
 
 cmach: cmach-clean cmach-build
 
-regression: cmach-build
-	@echo "running regression tests"
-	@bash test/regression/run.sh
+test: cmach-build
+	@./out/bin/cmach test
 
 # intermediary compiler
 imach-clean:
