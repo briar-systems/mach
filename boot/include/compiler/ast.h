@@ -95,7 +95,9 @@ struct AstNode
         // masm block
         struct
         {
-            char *content;
+            char *content;      // portable asm content (IR-based)
+            char *isa_name;     // ISA-specific block name (e.g., "x86_64"), NULL if none
+            char *isa_content;  // ISA-specific asm content, NULL if none
         } masm_stmt;
 
         // module statement

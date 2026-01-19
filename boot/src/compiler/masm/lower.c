@@ -1786,9 +1786,17 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_MASM)
     {
-        if (stmt->masm_stmt.content)
+        if (stmt->masm_stmt.isa_name && stmt->masm_stmt.isa_content)
         {
-            // parse inline masm content and emit instructions
+            // ISA-specific block: delegate to ISA handler
+            if (ctx->isa && ctx->isa->parse_inline_asm)
+            {
+                ctx->isa->parse_inline_asm(text, stmt->masm_stmt.isa_content, ctx->ptr_size);
+            }
+        }
+        else if (stmt->masm_stmt.content)
+        {
+            // portable asm content: parse and emit IR instructions
             lower_inline_masm(masm, text, stmt->masm_stmt.content, ctx);
         }
     }
@@ -2054,32 +2062,6 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
         else if (strncmp(token, "ret", 3) == 0)
         {
             masm_section_append_inst(text, masm_inst_0(MASM_IR_RET));
-        }
-        else if (strncmp(token, "cmp ", 4) == 0)
-        {
-            // parse cmp instruction: "cmp rax, rcx"
-            char *operands = token + 4;
-            char *comma    = strchr(operands, ',');
-            if (comma)
-            {
-                *comma     = '\0';
-                char *dest = operands;
-                char *src  = comma + 1;
-
-                while (*dest == ' ')
-                {
-                    dest++;
-                }
-                while (*src == ' ')
-                {
-                    src++;
-                }
-
-                MasmOperand dst_op = parse_operand(dest, ctx);
-                MasmOperand src_op = parse_operand(src, ctx);
-
-                masm_section_append_inst(text, masm_inst_2(MASM_IR_CMP, dst_op, src_op));
-            }
         }
         else if (strncmp(token, "xor ", 4) == 0)
         {

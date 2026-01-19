@@ -50,8 +50,6 @@ typedef enum MasmIrOpcode
     MASM_IR_SGE,
     MASM_IR_SGEU,
 
-    // flag-setting comparison (for inline asm; sets flags, no dest register)
-    MASM_IR_CMP,
     // floating point
     MASM_IR_FADD,
     MASM_IR_FSUB,

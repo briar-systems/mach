@@ -1,4 +1,5 @@
 #include "compiler/masm/isa/x86_64/x86_64.h"
+#include "compiler/masm/isa/x86_64/asm.h"
 #include "compiler/masm/isa/spec.h"
 #include "compiler/masm/abi/sysv64.h"
 #include <string.h>
@@ -1207,8 +1208,9 @@ static const MasmISASpec X86_64_SPEC = {
     .reg_sp         = x86_reg_sp,
     .reg_fp         = x86_reg_fp,
     .op_syscall     = x86_op_syscall,
-    .parse_reg      = x86_parse_reg,
-    .reg_count      = MASM_X86_REG_COUNT,
+    .parse_reg        = x86_parse_reg,
+    .parse_inline_asm = masm_x86_parse_inline_asm,
+    .reg_count        = MASM_X86_REG_COUNT,
     .scratch_regs   = X86_SCRATCH,
     .scratch_count  = sizeof(X86_SCRATCH) / sizeof(X86_SCRATCH[0]),
     .reserved_regs  = X86_RESERVED,

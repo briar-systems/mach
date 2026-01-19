@@ -278,6 +278,14 @@ void ast_node_dnit(AstNode *node)
         {
             free(node->masm_stmt.content);
         }
+        if (node->masm_stmt.isa_name)
+        {
+            free(node->masm_stmt.isa_name);
+        }
+        if (node->masm_stmt.isa_content)
+        {
+            free(node->masm_stmt.isa_content);
+        }
         break;
 
     case AST_COMPTIME:
@@ -730,6 +738,14 @@ static AstNode *ast_clone_checked(const AstNode *node)
         if (node->masm_stmt.content)
         {
             clone->masm_stmt.content = strdup(node->masm_stmt.content);
+        }
+        if (node->masm_stmt.isa_name)
+        {
+            clone->masm_stmt.isa_name = strdup(node->masm_stmt.isa_name);
+        }
+        if (node->masm_stmt.isa_content)
+        {
+            clone->masm_stmt.isa_content = strdup(node->masm_stmt.isa_content);
         }
         break;
 
