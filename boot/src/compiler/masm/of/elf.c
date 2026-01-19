@@ -511,9 +511,149 @@ int masm_elf_write(Masm *masm, const char *filename)
 #endif
         }
 
-        // NOTE: CALL/JMP/Jcc special handling disabled - falling through to masm_x86_encode
-        // The original code's L2 opcode checks never matched (isel emits X86 opcodes),
-        // so everything was handled by encode.c. Replicating that behavior here.
+        // handle CALL_REL with label operand
+        if (inst.kind == MASM_OPCODE_X86 && inst.opcode == MASM_OP_X86_CALL_REL && inst.operand_count >= 1 && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            const char *name = inst.operands[0].label;
+            MasmSymbol *sym  = masm_get_symbol(masm, name);
+
+            // emit call opcode
+            text_buf[off++] = 0xE8;
+
+            if (sym && sym->section_name && strcmp(sym->section_name, ".text") == 0)
+            {
+                // local symbol: compute PC-relative offset
+                // displacement is relative to the end of the instruction (off + 4)
+                int32_t disp = (int32_t)(sym->offset - (off + 4));
+                text_buf[off++] = (uint8_t)(disp & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 8) & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 16) & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 24) & 0xFF);
+            }
+            else
+            {
+                // external symbol: emit relocation
+                Elf64_Word si = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
+                Elf64_Addr rel_off = (Elf64_Addr)off;
+
+                for (int k = 0; k < 4; k++)
+                {
+                    text_buf[off++] = 0;
+                }
+
+                if (rela_count >= rela_cap)
+                {
+                    rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
+                    rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                }
+                rela[rela_count].r_offset = rel_off;
+                rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
+                rela[rela_count].r_addend = -4;
+                rela_count++;
+            }
+            continue;
+        }
+
+        // handle JMP_REL with label operand
+        if (inst.kind == MASM_OPCODE_X86 && inst.opcode == MASM_OP_X86_JMP_REL && inst.operand_count >= 1 && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            const char *name = inst.operands[0].label;
+            MasmSymbol *sym  = masm_get_symbol(masm, name);
+
+            // emit jmp opcode
+            text_buf[off++] = 0xE9;
+
+            if (sym && sym->section_name && strcmp(sym->section_name, ".text") == 0)
+            {
+                // local symbol: compute PC-relative offset
+                int32_t disp = (int32_t)(sym->offset - (off + 4));
+                text_buf[off++] = (uint8_t)(disp & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 8) & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 16) & 0xFF);
+                text_buf[off++] = (uint8_t)((disp >> 24) & 0xFF);
+            }
+            else
+            {
+                // external symbol: emit relocation
+                Elf64_Word si = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
+                Elf64_Addr rel_off = (Elf64_Addr)off;
+
+                for (int k = 0; k < 4; k++)
+                {
+                    text_buf[off++] = 0;
+                }
+
+                if (rela_count >= rela_cap)
+                {
+                    rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
+                    rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                }
+                rela[rela_count].r_offset = rel_off;
+                rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
+                rela[rela_count].r_addend = -4;
+                rela_count++;
+            }
+            continue;
+        }
+
+        // handle conditional jumps with label operand
+        if (inst.kind == MASM_OPCODE_X86 && inst.operand_count >= 1 && inst.operands[0].kind == MASM_OPERAND_LABEL)
+        {
+            uint8_t cc = 0;
+            bool is_jcc = false;
+            switch (inst.opcode)
+            {
+            case MASM_OP_X86_JE:  cc = 0x84; is_jcc = true; break;
+            case MASM_OP_X86_JNE: cc = 0x85; is_jcc = true; break;
+            case MASM_OP_X86_JL:  cc = 0x8C; is_jcc = true; break;
+            case MASM_OP_X86_JG:  cc = 0x8F; is_jcc = true; break;
+            case MASM_OP_X86_JLE: cc = 0x8E; is_jcc = true; break;
+            case MASM_OP_X86_JGE: cc = 0x8D; is_jcc = true; break;
+            default: break;
+            }
+
+            if (is_jcc)
+            {
+                const char *name = inst.operands[0].label;
+                MasmSymbol *sym  = masm_get_symbol(masm, name);
+
+                // emit 2-byte jcc opcode (0F xx)
+                text_buf[off++] = 0x0F;
+                text_buf[off++] = cc;
+
+                if (sym && sym->section_name && strcmp(sym->section_name, ".text") == 0)
+                {
+                    // local symbol: compute PC-relative offset
+                    int32_t disp = (int32_t)(sym->offset - (off + 4));
+                    text_buf[off++] = (uint8_t)(disp & 0xFF);
+                    text_buf[off++] = (uint8_t)((disp >> 8) & 0xFF);
+                    text_buf[off++] = (uint8_t)((disp >> 16) & 0xFF);
+                    text_buf[off++] = (uint8_t)((disp >> 24) & 0xFF);
+                }
+                else
+                {
+                    // external symbol: emit relocation
+                    Elf64_Word si = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
+                    Elf64_Addr rel_off = (Elf64_Addr)off;
+
+                    for (int k = 0; k < 4; k++)
+                    {
+                        text_buf[off++] = 0;
+                    }
+
+                    if (rela_count >= rela_cap)
+                    {
+                        rela_cap = rela_cap == 0 ? 64 : rela_cap * 2;
+                        rela     = realloc(rela, sizeof(Elf64_Rela) * rela_cap);
+                    }
+                    rela[rela_count].r_offset = rel_off;
+                    rela[rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_PC32);
+                    rela[rela_count].r_addend = -4;
+                    rela_count++;
+                }
+                continue;
+            }
+        }
 
         if (inst.kind == MASM_OPCODE_X86 && inst.opcode == MASM_OP_X86_MOV_RI && inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_LABEL)
         {

@@ -352,21 +352,47 @@ fun example() {
 ## `masm`
 
 > `masm { <assembly-instructions> }`
+> `masm { <isa> { <assembly-instructions> } }`
 
-The `masm` keyword introduces an inline masm block.
-It allows embedding a limited, target-specific inline masm dialect; operands may reference local variables by name.
+The `masm` keyword introduces an inline assembly block.
+It allows embedding assembly instructions; operands may reference local variables by name.
+
+### portable syntax
+
+When no ISA block is specified, instructions are parsed as portable IR and go through instruction selection:
+
+```mach
+fun add_values(a: u64, b: u64) u64 {
+    var result: u64 = 0;
+    masm {
+        add result, a, b
+    }
+    ret result;
+}
+```
+
+### ISA-specific syntax
+
+For target-specific instructions, wrap the assembly in an ISA block (e.g., `x86_64`):
 
 ```mach
 fun call_sys(n: u64) u64 {
     var out: u64 = 0;
     masm {
-        mov rax, n
-        syscall
-        mov out, rax
+        x86_64 {
+            mov rax, n
+            syscall
+            mov out, rax
+        }
     }
     ret out;
 }
 ```
+
+ISA-specific blocks emit target instructions directly, bypassing instruction selection.
+This is required for instructions with target semantics like flags or specific register constraints.
+
+Supported ISA names: `x86_64` (more planned).
 
 `masm` is allowed at both global and function scope, but is currently only lowered inside function bodies.
 

@@ -64,11 +64,19 @@ typedef struct LowerContext
     int     va_named_fp;          // named fp regs consumed
     int     va_named_stack_slots; // named params passed on stack
 
-    // label generation counters (module-wide, persist across functions)
+    // label generation counters (pointers to module-wide counters)
+    int *str_counter;
+    int *label_counter;
+    int *loop_counter;
+} LowerContext;
+
+// module-level counters that persist across all function lowering
+typedef struct ModuleCounters
+{
     int str_counter;
     int label_counter;
     int loop_counter;
-} LowerContext;
+} ModuleCounters;
 
 // Select ISA spec via shared selector
 static const MasmISASpec *lower_select_isa(MasmTarget target)
@@ -129,7 +137,7 @@ static inline __attribute__((unused)) uint32_t isa_tmp_id(LowerContext *ctx)
     return UINT32_MAX;
 }
 
-static LowerContext *create_context(MasmTarget target)
+static LowerContext *create_context(MasmTarget target, ModuleCounters *counters)
 {
     LowerContext *ctx = malloc(sizeof(LowerContext));
     ctx->isa          = lower_select_isa(target);
@@ -183,10 +191,10 @@ static LowerContext *create_context(MasmTarget target)
     ctx->va_named_fp          = 0;
     ctx->va_named_stack_slots = 0;
 
-    // label generation counters
-    ctx->str_counter   = 0;
-    ctx->label_counter = 0;
-    ctx->loop_counter  = 0;
+    // label generation counters (point to module-level counters)
+    ctx->str_counter   = &counters->str_counter;
+    ctx->label_counter = &counters->label_counter;
+    ctx->loop_counter  = &counters->loop_counter;
     return ctx;
 }
 
@@ -523,8 +531,8 @@ static MasmOperand lower_short_circuit(Masm *masm, MasmSection *text, AstNode *e
 {
     char label1[32];
     char label_end[32];
-    snprintf(label1, sizeof(label1), ".Lsc_%d", ctx->label_counter);
-    snprintf(label_end, sizeof(label_end), ".Lsc_end_%d", ctx->label_counter++);
+    snprintf(label1, sizeof(label1), ".Lsc_%d", *ctx->label_counter);
+    snprintf(label_end, sizeof(label_end), ".Lsc_end_%d", (*ctx->label_counter)++);
 
     bool is_and = (expr->binary_expr.op == TOKEN_AMPERSAND_AMPERSAND);
 
@@ -681,13 +689,16 @@ static MasmOperand lower_unary_op(MasmSection *text, TokenKind op, MasmOperand o
 
 static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
 {
-    // Handle varargs builtins (stub for now, defer to backend or implement later)
+    // bootstrap limitation: varargs builtins (va_start, va_end, va_arg) are not
+    // implemented in the portable IR. variadic functions can be declared and
+    // called, but the varargs intrinsics are no-ops. this is acceptable because
+    // the bootstrap compiler itself does not use varargs internally. a full
+    // implementation would require ABI-specific register/stack save areas.
     if (ctx->fn_is_variadic && expr->call_expr.func && expr->call_expr.func->kind == AST_EXPR_IDENT)
     {
         const char *bname = expr->call_expr.func->ident_expr.name;
         if (bname && (!strcmp(bname, "va_start") || !strcmp(bname, "va_end") || !strcmp(bname, "va_arg")))
         {
-             // TODO: Implement portable varargs lowering
              return masm_operand_none();
         }
     }
@@ -911,7 +922,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             }
 
             char label[32];
-            snprintf(label, sizeof(label), ".Lstr_%d", ctx->str_counter++);
+            snprintf(label, sizeof(label), ".Lstr_%d", (*ctx->str_counter)++);
 
             MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
 
@@ -962,7 +973,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 #endif
             // Create unique label
             char label[32];
-            snprintf(label, sizeof(label), ".Lstr_%d", ctx->str_counter++);
+            snprintf(label, sizeof(label), ".Lstr_%d", (*ctx->str_counter)++);
 
             // Add to .rodata
             MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
@@ -1804,8 +1815,8 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     {
         char else_label[32];
         char end_label[32];
-        snprintf(else_label, sizeof(else_label), ".Lif_or_%d", ctx->label_counter);
-        snprintf(end_label, sizeof(end_label), ".Lif_end_%d", ctx->label_counter++);
+        snprintf(else_label, sizeof(else_label), ".Lif_or_%d", *ctx->label_counter);
+        snprintf(end_label, sizeof(end_label), ".Lif_end_%d", (*ctx->label_counter)++);
 
         // evaluate condition
         MasmOperand cond = lower_expr(masm, text, stmt->cond_stmt.cond, ctx);
@@ -1838,8 +1849,8 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     {
         char start_label[32];
         char end_label[32];
-        snprintf(start_label, sizeof(start_label), ".Lloop_start_%d", ctx->loop_counter);
-        snprintf(end_label, sizeof(end_label), ".Lloop_end_%d", ctx->loop_counter++);
+        snprintf(start_label, sizeof(start_label), ".Lloop_start_%d", *ctx->loop_counter);
+        snprintf(end_label, sizeof(end_label), ".Lloop_end_%d", (*ctx->loop_counter)++);
 
         int defer_mark = ctx->deferred_count;
         push_loop_defer_mark(ctx, defer_mark);
@@ -1890,8 +1901,8 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             // Same as IF
             char else_label[32];
             char end_label[32];
-            snprintf(else_label, sizeof(else_label), ".Lor_stmt_else_%d", ctx->label_counter);
-            snprintf(end_label, sizeof(end_label), ".Lor_stmt_end_%d", ctx->label_counter++);
+            snprintf(else_label, sizeof(else_label), ".Lor_stmt_else_%d", *ctx->label_counter);
+            snprintf(end_label, sizeof(end_label), ".Lor_stmt_end_%d", (*ctx->label_counter)++);
 
             // evaluate condition
             MasmOperand cond = lower_expr(masm, text, stmt->cond_stmt.cond, ctx);
@@ -1924,8 +1935,8 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     {
         char start_label[32];
         char end_label[32];
-        snprintf(start_label, sizeof(start_label), ".Lfor_start_%d", ctx->label_counter);
-        snprintf(end_label, sizeof(end_label), ".Lfor_end_%d", ctx->label_counter++);
+        snprintf(start_label, sizeof(start_label), ".Lfor_start_%d", *ctx->label_counter);
+        snprintf(end_label, sizeof(end_label), ".Lfor_end_%d", (*ctx->label_counter)++);
 
         int defer_mark = ctx->deferred_count;
         push_loop_defer_mark(ctx, defer_mark);
@@ -2312,7 +2323,7 @@ static MasmOperand parse_operand(const char *str, LowerContext *ctx)
     return masm_operand_none();
 }
 
-static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
+static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols, ModuleCounters *counters)
 {
     (void)symbols;
 
@@ -2354,7 +2365,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
 #endif
 
     // create context for this function
-    LowerContext *ctx = create_context(masm->target);
+    LowerContext *ctx = create_context(masm->target, counters);
 
     // determine whether this function returns an aggregate via an implicit sret pointer.
     // sema stores the function type on the symbol (node->type is not reliably populated for fun stmts).
@@ -2659,6 +2670,9 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
     MasmTarget target = masm_target_native();
     Masm      *masm   = masm_create(target);
 
+    // module-level counters that persist across all function lowering
+    ModuleCounters counters = {0, 0, 0};
+
     // track lowered function names to avoid duplicate emission when also lowering
     // instantiated generic functions that are not present in the original AST.
     char **lowered_names = NULL;
@@ -2696,7 +2710,7 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
                     continue;
                 }
 
-                lower_function(masm, decl, symbols);
+                lower_function(masm, decl, symbols, &counters);
                 lowered_name_add(&lowered_names, &lowered_count, &lowered_cap, decl->fun_stmt.name);
             }
         }
@@ -2724,7 +2738,7 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
                     continue;
                 }
 
-                lower_function(masm, fn, symbols);
+                lower_function(masm, fn, symbols, &counters);
                 lowered_name_add(&lowered_names, &lowered_count, &lowered_cap, fn->fun_stmt.name);
             }
         }

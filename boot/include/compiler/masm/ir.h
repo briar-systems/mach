@@ -5,6 +5,24 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// masm two-layer opcode architecture
+//
+// layer 1: portable IR (this file)
+//   - MasmIrOpcode enum defines platform-independent three-operand instructions
+//   - flag-free: comparisons produce values (set-if), not implicit flags
+//   - emitted by lower.c from AST
+//   - consumed by isel which lowers to target opcodes
+//
+// layer 2: target-specific opcodes (e.g., isa/x86_64/x86_64.h)
+//   - MasmX86Opcode (and future ARM64, RISCV, etc.)
+//   - machine-level instructions with target semantics (flags, register constraints)
+//   - emitted by isel and ISA-specific inline asm parsers
+//   - consumed by encode/elf for binary emission
+//
+// the MasmOpcodeKind discriminator on MasmInstruction indicates which layer
+// an instruction belongs to. this avoids magic numeric offsets and ensures
+// type-safe dispatch in the emit pipeline.
+
 // portable masm ir opcodes
 // these represent the three-operand form (tof) instruction set
 // and are platform-independent.
