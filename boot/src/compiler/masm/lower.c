@@ -729,6 +729,21 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             }
         }
     }
+    else if (func->kind == AST_EXPR_FIELD && func->field_expr.is_method && func->symbol)
+    {
+        // Method call: use symbol linkage name for direct call
+        const char *link = symbol_get_linkage_name(func->symbol);
+        if (link)
+        {
+            target = masm_operand_label(link);
+        }
+        else
+        {
+            // Fallback to indirect call if no linkage name
+            target = lower_expr(masm, text, func, ctx);
+            target = ensure_in_reg(text, target, func->type, ctx);
+        }
+    }
     else
     {
         target = lower_expr(masm, text, func, ctx);

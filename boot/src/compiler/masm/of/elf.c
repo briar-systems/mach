@@ -350,7 +350,7 @@ int masm_elf_write(Masm *masm, const char *filename)
         // NOTE: CALL/JMP/Jcc special handling disabled - falling through to masm_x86_encode
         // The original code's L2 opcode checks never matched (isel emits X86 opcodes),
         // so everything was handled by encode.c. Replicating that behavior here.
-        if (inst->kind == MASM_OPCODE_X86 && inst->opcode == MASM_OP_X86_MOV_RI && inst->operand_count == 2 && inst->operands[0].kind == MASM_OPERAND_REGISTER && inst->operands[1].kind == MASM_OPERAND_LABEL)
+        if (inst->kind == MASM_OPCODE_X86 && inst->opcode == MASM_OP_X86_MOV_RI && inst->operand_count == 2 && inst->operands[0].kind == MASM_OPERAND_REGISTER && (inst->operands[1].kind == MASM_OPERAND_LABEL || inst->operands[1].kind == MASM_OPERAND_SYMBOL))
         {
             // mov r64, imm64 (rex + opcode + imm)
             uint32_t dst = inst->operands[0].reg.id;
@@ -655,10 +655,12 @@ int masm_elf_write(Masm *masm, const char *filename)
             }
         }
 
-        if (inst.kind == MASM_OPCODE_X86 && inst.opcode == MASM_OP_X86_MOV_RI && inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && inst.operands[1].kind == MASM_OPERAND_LABEL)
+        if (inst.kind == MASM_OPCODE_X86 && inst.opcode == MASM_OP_X86_MOV_RI && inst.operand_count == 2 && inst.operands[0].kind == MASM_OPERAND_REGISTER && (inst.operands[1].kind == MASM_OPERAND_LABEL || inst.operands[1].kind == MASM_OPERAND_SYMBOL))
         {
+            // operands[1] can be either LABEL or SYMBOL - both use the same union field
+            const char *name = inst.operands[1].kind == MASM_OPERAND_LABEL ? inst.operands[1].label : inst.operands[1].symbol;
 #ifdef MASM_DEBUG
-            fprintf(stderr, "[elf] found MOV with label %s at inst %zu\n", inst.operands[1].label, i);
+            fprintf(stderr, "[elf] found MOV with label/symbol %s at inst %zu\n", name, i);
 #endif
             uint32_t dst = inst.operands[0].reg.id;
             uint8_t  sz  = inst.operands[0].reg.size;
@@ -677,7 +679,6 @@ int masm_elf_write(Masm *masm, const char *filename)
                 continue;
             }
 
-            const char *name = inst.operands[1].label;
             Elf64_Word  si   = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, name);
 
             // rex.w + mov r64, imm64

@@ -366,7 +366,7 @@ static void emit_binary_op_explicit(MasmSection *sec, CodeGenContext *ctx, MasmI
         switch (op) {
             case MASM_IR_ADD: opcode = MASM_OP_X86_ADD_RI; break;
             case MASM_IR_SUB: opcode = MASM_OP_X86_SUB_RI; break;
-            case MASM_IR_MUL: opcode = MASM_OP_X86_IMUL_RMI; break; // IMUL RAX, RAX, IMM
+            case MASM_IR_MUL: opcode = MASM_OP_X86_IMUL_RRI; break; // IMUL RAX, RAX, IMM
             case MASM_IR_AND: opcode = MASM_OP_X86_AND_RI; break;
             case MASM_IR_OR:  opcode = MASM_OP_X86_OR_RI; break;
             case MASM_IR_XOR: opcode = MASM_OP_X86_XOR_RI; break;
