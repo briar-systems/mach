@@ -883,6 +883,134 @@ static void emit_load(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
     }
 }
 
+static void emit_zext(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
+{
+    // ZEXT dst, src - zero-extend src to dst size
+    MasmOperand dst = inst->operands[0];
+    MasmOperand src = inst->operands[1];
+
+    uint8_t src_size = 8;
+    if (src.kind == MASM_OPERAND_REGISTER)
+    {
+        src_size = src.reg.size;
+    }
+
+    // Load source into RAX with appropriate extension
+    if (src.kind == MASM_OPERAND_REGISTER && src.reg.id >= VREG_START)
+    {
+        int32_t     off = get_vreg_offset(ctx, src.reg.id);
+        MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, src_size);
+
+        if (src_size == 1 || src_size == 2)
+        {
+            // Use MOVZX for 8/16-bit sources
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVZX_RM, masm_x86_reg(MASM_X86_RAX, 8), mem));
+        }
+        else if (src_size == 4)
+        {
+            // 32-bit MOV auto zero-extends to 64-bit on x86_64
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RM, masm_x86_reg(MASM_X86_RAX, 4), mem));
+        }
+        else
+        {
+            // 64-bit, just load
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RM, masm_x86_reg(MASM_X86_RAX, 8), mem));
+        }
+    }
+    else if (src.kind == MASM_OPERAND_REGISTER)
+    {
+        // Physical register
+        if (src_size == 1 || src_size == 2)
+        {
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVZX_RR, masm_x86_reg(MASM_X86_RAX, 8), masm_operand_register(src.reg.id, src_size)));
+        }
+        else if (src_size == 4)
+        {
+            // 32-bit MOV auto zero-extends
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RR, masm_x86_reg(MASM_X86_RAX, 4), masm_operand_register(src.reg.id, 4)));
+        }
+        else
+        {
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RR, masm_x86_reg(MASM_X86_RAX, 8), masm_operand_register(src.reg.id, 8)));
+        }
+    }
+    else if (src.kind == MASM_OPERAND_IMM)
+    {
+        emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RI, masm_x86_reg(MASM_X86_RAX, 8), src));
+    }
+
+    // Store to destination
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+    }
+}
+
+static void emit_sext(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
+{
+    // SEXT dst, src - sign-extend src to dst size
+    MasmOperand dst = inst->operands[0];
+    MasmOperand src = inst->operands[1];
+
+    uint8_t src_size = 8;
+    if (src.kind == MASM_OPERAND_REGISTER)
+    {
+        src_size = src.reg.size;
+    }
+
+    // Load source into RAX with sign extension
+    if (src.kind == MASM_OPERAND_REGISTER && src.reg.id >= VREG_START)
+    {
+        int32_t     off = get_vreg_offset(ctx, src.reg.id);
+        MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, src_size);
+
+        if (src_size == 1 || src_size == 2)
+        {
+            // Use MOVSX for 8/16-bit sources
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVSX_RM, masm_x86_reg(MASM_X86_RAX, 8), mem));
+        }
+        else if (src_size == 4)
+        {
+            // MOVSXD for 32-bit to 64-bit sign extension
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVSXD, masm_x86_reg(MASM_X86_RAX, 8), mem));
+        }
+        else
+        {
+            // 64-bit, just load
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RM, masm_x86_reg(MASM_X86_RAX, 8), mem));
+        }
+    }
+    else if (src.kind == MASM_OPERAND_REGISTER)
+    {
+        // Physical register
+        if (src_size == 1 || src_size == 2)
+        {
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVSX_RR, masm_x86_reg(MASM_X86_RAX, 8), masm_operand_register(src.reg.id, src_size)));
+        }
+        else if (src_size == 4)
+        {
+            // MOVSXD for 32-bit to 64-bit - need to load to memory first for RR form
+            // Actually use the RR variant of MOVSXD
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVSXD, masm_x86_reg(MASM_X86_RAX, 8), masm_operand_register(src.reg.id, 4)));
+        }
+        else
+        {
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RR, masm_x86_reg(MASM_X86_RAX, 8), masm_operand_register(src.reg.id, 8)));
+        }
+    }
+    else if (src.kind == MASM_OPERAND_IMM)
+    {
+        // For immediates, sign extension happens at load time with MOV_RI
+        emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RI, masm_x86_reg(MASM_X86_RAX, 8), src));
+    }
+
+    // Store to destination
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+    }
+}
+
 static void emit_store(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
 {
     // STORE mem, src, size
@@ -1445,6 +1573,13 @@ static void x86_64_codegen(Masm *masm)
                     break;
                 case MASM_IR_NOT:
                     emit_unary_op_explicit(out, &ctx, inst, MASM_IR_NOT);
+                    break;
+
+                case MASM_IR_ZEXT:
+                    emit_zext(out, &ctx, inst);
+                    break;
+                case MASM_IR_SEXT:
+                    emit_sext(out, &ctx, inst);
                     break;
 
                 case MASM_IR_SHL:

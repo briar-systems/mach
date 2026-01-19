@@ -3045,7 +3045,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
                 int32_t     off   = ctx->va_reg_save_off + (48 + i * 16);
                 MasmOperand dst   = frame_mem(ctx, off, 8);
                 uint32_t    xmmid = ctx->abi->float_arg_regs[i];
-                MasmOperand src   = masm_operand_register(xmmid, 8);
+                MasmOperand src   = masm_operand_register_fp(xmmid, 8);
                 masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, src, masm_operand_imm(8)));
             }
         }

@@ -44,6 +44,7 @@ typedef enum MasmX86Opcode
     MASM_OP_X86_MOVSX_RM,
     MASM_OP_X86_MOVZX_RR,
     MASM_OP_X86_MOVZX_RM,
+    MASM_OP_X86_MOVSXD,  // 32-to-64-bit sign extension
     MASM_OP_X86_LEA,
 
     // arithmetic
