@@ -39,7 +39,7 @@ Mach is NOT designed to prioritize:
 - **Features**: Batteries are not included. Ever.
 - **Flexibility**: Mach is rigid and opinionated. It should not be flexible or allow for many ways to do the same thing.
 - **Code Reduction**: Mach is explicit and verbose. More code is not worse code.
-- **Safety**: Safety is the responsibility of the programmer and is often project-specific. Mach does not hold your hand or put you on a leash when it does not need to.
+- **Hand-holding**: Mach provides tools for safety (like read-only pointers and deferred cleanup), but it will not stop you from doing dangerous things if you explicitly ask to. Safety is a partnership between the language and the programmer.
 
 
 # Getting Started
@@ -47,6 +47,7 @@ Mach is NOT designed to prioritize:
 We encourage you to not even install Mach until you have read the [language documentation](doc/README.md). The docs are written more like a pamphlet than a bible, and assume that you are familiar with basic programming concepts from other languages.
 
 The reason for this is that Mach may not be for you. If the language does not include some features you hope to use, includes things you despise, or if you just don't like the syntax, then you should look elsewhere. If you read the documentation and have decided that you like the language, then you will have learned the basics and should be capable of diving in.
+
 
 ## Building Mach
 
@@ -62,6 +63,7 @@ make cmach
 
 > NOTE: The above command builds the bootstrap compiler, `cmach`, which is written in C. Mach's fully self-hosted compiler, `mach`, is currently under heavy development and is not yet functional.
 
+
 ## Simple Examples
 
 The following examples are provided to give a sense of the language's syntax and structure.
@@ -74,13 +76,12 @@ The following examples are provided to give a sense of the language's syntax and
 ### Hello World
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
-use console: std.io.console;
+use          std.runtime;
+use print:   std.print;
 
 $main.symbol = "main";
-fun main(args: []str) i64 {
-    console.print("Hello, World!\n");
+fun main(argc: i64, argv: &&u8) i64 {
+    print.println("Hello, World!");
     ret 0;
 }
 ```
@@ -89,11 +90,10 @@ fun main(args: []str) i64 {
 ### Fibonacci
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
-use console: std.io.console;
+use          std.runtime;
+use print:   std.print;
 
-fun fibr(n: i64) i64 {
+fun fibr(n: u64) u64 {
     if (n < 2) {
         ret n;
     }
@@ -102,9 +102,13 @@ fun fibr(n: i64) i64 {
 }
 
 $main.symbol = "main";
-fun main(args: []str) i64 {
-    var max: i64 = 10;
-    console.print("fib(%d) = %d\n", max, fibr(max));
+fun main(argc: i64, argv: &&u8) i64 {
+    val max: u64 = 10;
+    print.print("fib(");
+    print.u64(max);
+    print.print(") = ");
+    print.u64(fibr(max));
+    print.println("");
     ret 0;
 }
 ```
@@ -113,11 +117,10 @@ fun main(args: []str) i64 {
 ### Factorial
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
-use console: std.io.console;
+use          std.runtime;
+use print:   std.print;
 
-fun fact(n: i64) i64 {
+fun fact(n: u64) u64 {
     if (n == 0) {
         ret 1;
     }
@@ -126,12 +129,17 @@ fun fact(n: i64) i64 {
 }
 
 $main.symbol = "main";
-fun main(args: []str) i64 {
-    var max: i64 = 10;
-    console.print("fact(%d) = %d\n", max, fact(max));
+fun main(argc: i64, argv: &&u8) i64 {
+    val max: u64 = 10;
+    print.print("fact(");
+    print.u64(max);
+    print.print(") = ");
+    print.u64(fact(max));
+    print.println("");
     ret 0;
 }
 ```
+
 
 # Credit
 
@@ -148,9 +156,11 @@ The original compiler would not have been written without the ability to referen
 
 Mach, at its core, stands on the shoulders of countles giants that have contributed to the development of these languages either directly or by proxy. It is out of respect for their work that Mach will always be fully open source. Thank you all.
 
+
 ## Contributing
 
 We welcome contributions to Mach! If you would like to contribute, please read our [contributing guidelines](CONTRIBUTING.md) first.
+
 
 # License
 

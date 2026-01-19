@@ -11,7 +11,7 @@ This section describes Mach's type system.
   - [Methods](#methods)
   - [Anonymous `rec` and `uni`](#anonymous-rec-and-uni)
   - [Arrays](#arrays)
-  - [Slices](#slices)
+  - [String Primitive](#string-primitive)
   - [Generics](#generics)
   - [Type Casting](#type-casting)
     - [Inference](#inference)
@@ -22,19 +22,20 @@ This section describes Mach's type system.
 
 Mach includes the following primitive types:
 
-| Type  | Description                                 |
-| ----- | ------------------------------------------- |
-| `u8`  | 8-bit unsigned integer                      |
-| `u16` | 16-bit unsigned integer                     |
-| `u32` | 32-bit unsigned integer                     |
-| `u64` | 64-bit unsigned integer                     |
-| `i8`  | 8-bit signed integer                        |
-| `i16` | 16-bit signed integer                       |
-| `i32` | 32-bit signed integer                       |
-| `i64` | 64-bit signed integer                       |
-| `f32` | 32-bit floating-point number                |
-| `f64` | 64-bit floating-point number                |
-| `ptr` | Untyped pointer (equivalent to C's `void*`) |
+| Type  | Description                                                      |
+| ----- | ---------------------------------------------------------------- |
+| `u8`  | 8-bit unsigned integer                                           |
+| `u16` | 16-bit unsigned integer                                          |
+| `u32` | 32-bit unsigned integer                                          |
+| `u64` | 64-bit unsigned integer                                          |
+| `i8`  | 8-bit signed integer                                             |
+| `i16` | 16-bit signed integer                                            |
+| `i32` | 32-bit signed integer                                            |
+| `i64` | 64-bit signed integer                                            |
+| `f32` | 32-bit floating-point number                                     |
+| `f64` | 64-bit floating-point number                                     |
+| `ptr` | Untyped pointer (equivalent to C's `void*`)                      |
+| `str` | String literal record `{ data: &u8, len: <pointer-sized-uint> }` |
 
 ## Type Aliases
 
@@ -53,7 +54,6 @@ Mach supports four primary compound types:
 - [Records](#records): Used to group related data fields together.
 - [Unions](#unions): Used to define a type that can hold one of several different types.
 - [Arrays](#arrays): Fixed-size collections of elements of the same type.
-- [Slices](#slices): Dynamically-sized collections of elements of the same type.
 
 
 ### Records
@@ -127,7 +127,10 @@ If the instance parameter is passed by value, modifications to its fields will n
 
 This behaviour is particularly similar to how methods work in Go, where the receiver can be either a value or a pointer.
 
-Calling a method on a value type will automatically pass a pointer to the instance if the method expects a pointer receiver, and vice versa.
+The compiler automatically converts between value and pointer types when calling methods.
+If a method has a pointer receiver but is called on a value, the address is taken automatically.
+If a method has a value receiver but is called on a pointer, the pointer is dereferenced automatically.
+This means `.` is used uniformly for both field access and method calls, regardless of whether the instance is a value or pointer.
 
 
 ## Anonymous `rec` and `uni`
@@ -158,26 +161,24 @@ Arrays have a fixed size that is determined at compile time and cannot be change
 
 On the backend, arrays are represented as a contiguous block of memory containing the elements in sequence.
 
-Arrays have two intrinsic fields:
-- `.data`: A pointer to the first element of the array.
-- `.len`: The length of the array (number of elements).
+Arrays expose no intrinsic fields. They behave like POD aggregates with a fixed number of elements known at compile time. If you need runtime-sized views into memory, use a record type from the standard library such as `std.types.Slice[T]` or `std.types.String`.
 
+## String Primitive
 
-## Slices
-
-Slices are dynamically-sized sets of contiguous elements. The size of a slice is not fixed at compile time and can change at runtime. Slices are defined using empty square brackets (`[]`) before the element type.
+`str` is the only compiler known composite type.
+It represents string literals embedded in the binary and is exposed as a simple record:
 
 ```mach
-val s: []u8;
+rec str {
+    data: &u8; # readonly pointer to UTF-8 data start
+    len:  u64; # pointer-sized unsigned integer (u32 on 32-bit targets)
+}
 ```
 
-Slices are represented as fat pointers, containing both a pointer to the data and the length of the slice.
-
-Like arrays, slices have two intrinsic fields:
-- `.data`: A pointer to the first element of the slice.
-- `.len`: The length of the slice (number of elements).
-
-While their syntax and usage are similar, slices and arrays are distinct types in Mach and are not interchangeable without explicit casting.
+The `len` field uses the pointer-sized unsigned integer for the current target (e.g., `u64` on 64-bit platforms).
+All string literals have type `str`, are UTF-8 encoded, and live in read-only memory.
+Access the data and length through the exposed fields just like any other record.
+For owned or mutable strings, prefer the standard library's `std.types.String` type.
 
 ## Generics
 
@@ -210,16 +211,13 @@ Mach does not support advanced generic features such as type constraints, varian
 
 ## Type Casting
 
-Mach requires explicit type casting between different types using the `::` operator:
+Mach provides an explicit cast operator, `::`.
 
-```mach
-val a: i32 = 42;
-val b: i64 = a::i64;
-```
+This cast is a **pure bit reinterpretation** of a value's in-memory representation. It has no conversion semantics (no sign/zero extension, no float/int conversion, etc).
 
-This cast operator is extremely literal and does not perform any implicit conversions or coercions. This is important to keep in mind when working with different types, as you must ensure that the cast is valid and makes sense in the context of your program and the underlying data representation.
+As a result, casts require **identical, known type sizes**.
 
-For example, this example will produce unusable results, as the bit patterns of `f32` and `i32` are not directly compatible:
+For example, reinterpreting the bit pattern of a `f32` as an `i32` is allowed (both are 4 bytes):
 
 ```mach
 val x: f32 = 3.14;
@@ -228,9 +226,9 @@ val y: i32 = x::i32; # This is NOT a valid conversion of the underlying bit patt
 
 The above example WILL compile and execute successfully, but the resulting value of `y` will not represent the integer equivalent of `3.14`. Instead, it will represent the raw bit pattern of the `f32` value interpreted as an `i32`, which is likely not what you want.
 
-This cast operator is extremely powerful, but it comes with the responsibility of ensuring that the conversions you perform are valid and meaningful.
+Numeric conversions (such as widening `u8` to `u64`, truncating `u64` to `u8`, etc) are provided by the standard library (for example, `std.types.int`).
 
-The compiler will warn you if you attempt to cast between incompatible types. Incompatible types are those that do not have identical sizes. This means that the cast operator DOES allow for casting between types of the same size but different representations. Here is a special example that demonstrates the power of such a system:
+Here is a special example that demonstrates the power of bit reinterpreting between types of the same size:
 
 ```mach
 rec Color {

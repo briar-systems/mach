@@ -2,10 +2,6 @@
 
 This is the comprehensive reference for the Mach programming language.
 
----
-
-## Table of Contents
-
 Overview:
 - [Getting Started](getting-started.md)
 - [Project Config Files](config.md)
@@ -21,6 +17,9 @@ Semantics:
 Advanced Features:
 - [Pointers and Memory Management](memory.md)
 - [Compiletime Systems](compiletime.md)
+
+Compiler Internals:
+- [MASM (Mach Assembly)](masm/README.md)
 
 Reference:
 - [Cheatsheet](cheatsheet.md)

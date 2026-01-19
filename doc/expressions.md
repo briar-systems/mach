@@ -17,7 +17,6 @@ This document describes the expression system in Mach, including operators, oper
 	- [Postfix Expressions](#postfix-expressions)
 		- [Function Calls](#function-calls)
 		- [Array Initialization](#array-initialization)
-		- [Slice Initialization](#slice-initialization)
 		- [Array Indexing](#array-indexing)
 		- [Field Access](#field-access)
 		- [Type Casting](#type-casting)
@@ -208,19 +207,6 @@ val arr:  [3]i32 = [3]i32{ 1, 2, 3 }; # initialize array
 ```
 
 
-### Slice Initialization
-
-Slices must be initialized using a typed literal syntax with both `data` and `len` components:
-
-```mach
-var arr:   [3]i32 = [3]i32{ 1, 2, 3 };           # initialize array
-val slice: []i32  = []i32{ data: ?arr, len: 3 }; # initialize slice from array
-```
-
-- `data` is a pointer to the first element and must be of type `*T` where `T` is the element type.
-- `len` is the number of elements in the slice and is not managed automatically.
-
-
 ### Array Indexing
 
 Array indexing accesses an element at a specific position.
@@ -232,10 +218,18 @@ val elem: i32    = arr[1];            # access second element
 
 See the [Types](types.md#arrays) documentation for details on arrays and indexing.
 
+Note that this syntax also works for pointers, as pointer arithmetic and indexing are supported uniformly:
+
+```mach
+val arr:  [3]i32 = [3]i32{ 1, 2, 3 }; # initialize array
+val p:    &i32   = ?arr;              # pointer to first element
+val elem: i32    = p[1];              # access second element via pointer
+```
+
 
 ### Field Access
 
-Field access retrieves a named field from a record or union.
+Field access retrieves a named field from a record or union using the `.` operator.
 
 ```mach
 rec Point {
@@ -245,6 +239,13 @@ rec Point {
 
 val p:       Point = Point{x: 1.0, y: 2.0};
 val x_coord: f32   = p.x;
+```
+
+The `.` operator works uniformly for both values and pointers. When accessing fields through a pointer, Mach automatically dereferences:
+
+```mach
+val ptr:     *Point = ?p;
+val y_coord: f32    = ptr.y;  # no special syntax needed
 ```
 
 Field access is also used to call methods on types:
@@ -257,16 +258,18 @@ fun (this: *Point) distance() f32 {
 val dist: f32 = p.distance();
 ```
 
+When calling methods, the compiler automatically converts between value and pointer types to match the receiver type declared in the method signature.
+
 See the [Types](types.md#methods) documentation for details on method syntax.
 
 
 ### Type Casting
 
-The `::` operator performs an explicit type cast.
+The `::` operator performs an explicit bit reinterpretation cast.
 
 ```mach
-val x: i32 = 42;
-val y: i64 = x::i64;  # cast i32 to i64
+val x: f32 = 3.14;
+val y: i32 = x::i32;  # reinterpret f32 bits as i32
 ```
 
 See the [Types](types.md#type-casting) documentation for details on casting rules and semantics.
@@ -315,7 +318,11 @@ See the [Types](types.md#anonymous-rec-and-uni) documentation for details on ano
 
 The `$` prefix marks an expression for compile-time evaluation. This is used for compile-time intrinsics, target information, and other compile-time operations.
 
+The snippet below imports `std.types.bool`, which provides the `bool`, `true`, and `false` symbols used for compile-time flags.
+
 ```mach
+use std.types.bool;
+
 val size:     u64  = $size_of(i32);
 val is_linux: bool = $OS_LINUX;
 ```

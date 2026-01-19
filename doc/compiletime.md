@@ -49,8 +49,12 @@ var t: $type_of(size);                # `t` will be `u64`
 
 Mach supports conditional compilation through the use of compile-time `if` statements. This allows you to include or exclude code based on compile-time conditions.
 
+The example below pulls in `std.types.bool`, which defines the `bool`, `true`, and `false` symbols used for the flag.
+
 Example:
 ```mach
+use std.types.bool;
+
 $if ($size_of(u64) == 8) {
     var is_64_bit: bool = true;
 }
@@ -70,38 +74,39 @@ Code that does not meet the compiletime conditions is completely omitted from th
 
 The Mach compiler provides several built-in symbols that can be used for compile-time introspection and conditional compilation.
 
-| Symbol                 | Description                                               |
-| ---------------------- | --------------------------------------------------------- |
-| `$OS_LINUX`            | Enum value representing the Linux operating system        |
-| `$OS_DARWIN`           | Enum value representing the macOS operating system        |
-| `$OS_WINDOWS`          | Enum value representing the Windows operating system      |
-| `$OS_BSD`              | Enum value representing the BSD operating system          |
-| `$ARCH_X86_64`         | Enum value representing the x86_64 architecture           |
-| `$ARCH_ARM64`          | Enum value representing the ARM64 architecture            |
-| `$ARCH_ARM`            | Enum value representing the ARM architecture              |
-| `$ARCH_RISCV64`        | Enum value representing the RISC-V architecture           |
-| `$target.os`           | Enum value of the target operating system                 |
-| `$target.arch`         | Enum value of the target architecture                     |
-| `$target.pointer_size` | Size of a pointer on the target platform in bytes         |
-| `$target.word_size`    | Size of a machine word on the target platform in bytes    |
-| `$target.triple`       | Target triple string (e.g., "x86_64-pc-linux-gnu")        |
-| `$build.debug`         | Integer exposing the `debug` config option (1 if enabled) |
-| `$build.version`       | String exposing the `version` config option               |
-| `$mach.version`        | String representing the Mach compiler version             |
+### Currently Implemented
 
-> These symbols are subject to change as the Mach language and compiler evolve. They will be documented in future releases and will eventually be stable.
+| Symbol                           | Description                                      |
+| -------------------------------- | ------------------------------------------------ |
+| `$mach.compiler.version`         | Compiler version string (e.g., `"0.1.0"`)        |
+| `$mach.compiler.name`            | Compiler name (`"mach"`)                         |
+| `$mach.build.target.os`          | Target operating system name string              |
+| `$mach.build.target.os.id`       | Target operating system numeric ID               |
+| `$mach.build.target.arch`        | Target architecture name string                  |
+| `$mach.build.target.arch.id`     | Target architecture numeric ID                   |
+| `$mach.build.target.pointer_width` | Pointer width of the compilation target in bytes |
+| `$mach.os.<name>.id`             | Numeric ID for a specific OS (e.g., `$mach.os.linux.id`) |
+| `$mach.arch.<name>.id`           | Numeric ID for a specific architecture (e.g., `$mach.arch.x86_64.id`) |
 
-Example:
+All compile-time identifiers must be explicitly qualified with `$`. Even inside `$if` blocks you must prefix every access, for example:
+
 ```mach
-$if (target.os == OS_LINUX) {
-    # Linux-specific code
-}
-or (target.os == OS_DARWIN) {
-    # macOS-specific code
+$if ($mach.build.target.os.id == $mach.os.linux.id) {
+    # linux-specific code
 }
 ```
 
-Note that at the moment, compiler constants like `$target.os` do not need the leading `$` when used in compile-time expressions. This behaviour is subject to change in future releases.
+> The compiletime system is under active development. Additional symbols will be added in future releases.
+
+Example:
+```mach
+$if ($mach.build.target.os.id == $mach.os.linux.id) {
+    # Linux-specific code
+}
+or ($mach.build.target.os.id == $mach.os.darwin.id) {
+    # macOS-specific code
+}
+```
 
 
 ## Symbol Attributes
@@ -116,7 +121,7 @@ Most notably, the `symbol` attribute is used in most Mach programs to remove nam
 
 ```mach
 $main.symbol = "main"
-fun main(args: []str) i64 {
+fun main(argc: i64, argv: &&u8) i64 {
     ret 0;
 }
 ```

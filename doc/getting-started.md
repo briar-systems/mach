@@ -8,7 +8,6 @@ This guide walks through the minimum setup required to build Mach from source.
   - [Prerequisites](#prerequisites)
     - [Git](#git)
     - [Make](#make)
-    - [LLVM Development Libraries (v19+)](#llvm-development-libraries-v19)
     - [C Compiler](#c-compiler)
   - [Building the Bootstrap Compiler](#building-the-bootstrap-compiler)
   - [Building the Self-hosted Compiler](#building-the-self-hosted-compiler)
@@ -33,22 +32,6 @@ Please install the appropriate package for your system if git is not found.
 ### Make
 
 The simplest way to build Mach is via the provided `Makefile`. This requires GNU Make or a compatible tool.
-
-### LLVM Development Libraries (v19+)
-
-Mach requires the LLVM development headers and libraries (version 19 or later). Ensure that `llvm-config` is visible on your `PATH` and that the development headers are installed before attempting to build the compiler.
-
-On Debian-based systems, you can install the required package with:
-
-```bash
-sudo apt install llvm-dev
-```
-
-Use the following command to verify that `llvm-config` is available and is the correct version:
-
-```bash
-llvm-config --version
-```
 
 ### C Compiler
 
@@ -122,13 +105,12 @@ The standard `mach init` command creates a simple "Hello, World!" application by
 The main source file is located at `src/main.mach`:
 
 ```mach
-use          std.system.runtime;
-use          std.types.string;
-use console: std.io.console;
+use          std.runtime;
+use print:   std.print;
 
 $main.symbol = "main"
-fun main(args: []str) i64 {
-    console.print("Hello, World!\n");
+fun main(argc: i64, argv: &&u8) i64 {
+    print.println("Hello, World!");
     ret 0;
 }
 ```

@@ -1,0 +1,72 @@
+#ifndef MASM_OPERAND_H
+#define MASM_OPERAND_H
+
+#include <stdint.h>
+#include "compiler/masm/type.h"
+
+// masm operand kinds
+typedef enum MasmOperandKind
+{
+    MASM_OPERAND_NONE,
+    MASM_OPERAND_REGISTER,
+    MASM_OPERAND_IMM,
+    MASM_OPERAND_MEMORY,
+    MASM_OPERAND_SYMBOL,
+    MASM_OPERAND_LABEL,
+    MASM_OPERAND_TYPE
+} MasmOperandKind;
+
+typedef enum MasmRegisterClass
+{
+    MASM_REG_CLASS_INT,
+    MASM_REG_CLASS_FLOAT
+} MasmRegisterClass;
+
+// register definition
+typedef struct MasmRegister
+{
+    uint32_t          id;
+    uint8_t           size; // in bytes
+    MasmRegisterClass class;
+} MasmRegister;
+
+
+
+// memory reference: [base + index * scale + disp]
+typedef struct MasmMemory
+{
+    MasmRegister base;
+    MasmRegister index;
+    uint8_t      scale; // 1, 2, 4, 8
+    int64_t      disp;
+    uint8_t      size;  // access size in bytes
+} MasmMemory;
+
+// masm operand
+typedef struct MasmOperand
+{
+    MasmOperandKind kind;
+    union
+    {
+        MasmRegister reg;       // MASM_OPERAND_REGISTER
+        int64_t      imm;       // MASM_OPERAND_IMM
+        MasmMemory   mem;       // MASM_OPERAND_MEMORY
+        const char  *symbol;    // MASM_OPERAND_SYMBOL
+        const char  *label;     // MASM_OPERAND_LABEL
+        MasmTypeKind type;      // MASM_OPERAND_TYPE
+    };
+} MasmOperand;
+
+// operand builders
+MasmOperand masm_operand_none();
+MasmOperand masm_operand_register(uint32_t id, uint8_t size);
+MasmOperand masm_operand_register_fp(uint32_t id, uint8_t size);
+MasmOperand masm_operand_imm(int64_t value);
+MasmOperand masm_operand_memory(MasmRegister base, MasmRegister index, uint8_t scale, int64_t disp, uint8_t size);
+MasmOperand masm_operand_memory_simple(uint32_t base_reg, int32_t disp, uint8_t size);
+MasmOperand masm_operand_symbol(const char *name);
+MasmOperand masm_operand_label(const char *name);
+MasmOperand masm_operand_type(MasmTypeKind type);
+
+#endif // MASM_OPERAND_H
+

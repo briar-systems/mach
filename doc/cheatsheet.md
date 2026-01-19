@@ -12,19 +12,21 @@ This page summarizes the syntax and tooling you are most likely to reach for whe
   - ["Complex" types](#complex-types)
   - [Expressions and operators](#expressions-and-operators)
   - [Control flow snippets](#control-flow-snippets)
+  - [Entry points](#entry-points)
 
 
 ## Project and toolchain
 
-| Task                      | Command                                                              |
-| ------------------------- | -------------------------------------------------------------------- |
-| Scaffold a project        | `cmach init my-app`                                                  |
-| Build default target      | `cmach build .`                                                      |
-| Build specific target     | `cmach build . --target linux`                                       |
-| Run the most recent build | `cmach run .`                                                        |
-| List dependencies         | `cmach dep list`                                                     |
-| Add remote dependency     | `cmach dep add https://github.com/org/pkg.git --version branch/main` |
-| Pull/update dependencies  | `cmach dep pull`                                                     |
+| Task                                         | Command                                                              |
+| -------------------------------------------- | -------------------------------------------------------------------- |
+| Scaffold a project                           | `cmach init my-app`                                                  |
+| Build default target                         | `cmach build .`                                                      |
+| Build specific target                        | `cmach build . --target linux`                                       |
+| Run the most recent build (does not rebuild) | `cmach run .`                                                        |
+| Run all tests                                | `cmach test .`                                                       |
+| List dependencies                            | `cmach dep list`                                                     |
+| Add remote dependency                        | `cmach dep add https://github.com/org/pkg.git --version branch/main` |
+| Pull/update dependencies                     | `cmach dep pull`                                                     |
 
 `mach.toml` is required for most situations.
 Keep `[project]`, `[targets.*]`, and `[deps.*]` in sync with the layout on disk.
@@ -33,8 +35,8 @@ See [config.md](config.md) and [dependencies.md](dependencies.md) for details.
 
 ## Module basics
 
-- Modules map one-to-one with `.mach` files under `[project].src` or the dependency’s source tree.
-- `use project.module;` makes the module’s public symbols available.
+- Modules map one-to-one with `.mach` files under `[project].dir_src` or the dependency's source tree.
+- `use project.module;` makes the module's public symbols available.
 - `use alias: project.module;` creates a local alias for easier access.
 
 Example project tree:
@@ -66,7 +68,8 @@ mach.toml                # project.id = "myapp"
 | `for`   | `for [(<condition>)] { <body> }`                                                                                                                         | Loop construct                         |
 | `cnt`   | `cnt;`                                                                                                                                                   | Continue to the next iteration         |
 | `brk`   | `brk;`                                                                                                                                                   | Break out of a loop                    |
-| `asm`   | `asm { <assembly-instructions> }`                                                                                                                        | Inline assembly                        |
+| `masm`   | `masm { <assembly-instructions> }`                                                                                                                        | Inline masm (limited dialect)                        |
+| `test`   | `test "name" { <body> }`                                                                                                                                   | Top-level test block                  |
 
 
 ## Builtin Types
@@ -84,6 +87,7 @@ mach.toml                # project.id = "myapp"
 | `f32` | 32-bit floating-point              |
 | `f64` | 64-bit floating-point              |
 | `ptr` | Untyped pointer (like C's `void*`) |
+| `str` | String literal record `{ data: *u8, len: pointer-sized-uint }` |
 
 
 ## Builtin Values
@@ -96,7 +100,7 @@ mach.toml                # project.id = "myapp"
 
 ```mach
 # aliased import
-use console: std.io.console;
+use print: std.print;
 
 val answer:  i32 = 42; # immutable binding
 var counter: i32 = 0;  # mutable binding
@@ -133,11 +137,10 @@ fun add(a: i32, b: i32) i32 {
 
 In addition to the builtin primitive types, Mach supports several native compound types:
 
-| Category              | Syntax                                      |
-| --------------------- | ------------------------------------------- |
-| Pointer               | `*T`                                        |
-| Array                 | `[N]T`                                      |
-| Slice                 | `[]T`                                       |
+| Category | Syntax |
+| -------- | ------ |
+| Pointer  | `*T`   |
+| Array    | `[N]T` |
 
 Records and unions can contain fields of any other type, including other generics.
 Anonymous `rec { ... }` and `uni { ... }` blocks are valid anywhere a type expression is allowed.
@@ -148,7 +151,7 @@ Anonymous `rec { ... }` and `uni { ... }` blocks are valid anywhere a type expre
 | Construct     | Example                                   | Notes                                        |
 | ------------- | ----------------------------------------- | -------------------------------------------- |
 | Field access  | `point.x`                                 | Works on records or module namespaces.       |
-| Indexing      | `buffer[i]`                               | Arrays, slices, or pointer-like values.      |
+| Indexing      | `buffer[i]`                               | Arrays or pointer-like values.               |
 | Call          | `func(arg1, arg2)`                        | Methods rewrite to calls with receivers.     |
 | Generic call  | `func[i32](value)`                        | Supply type arguments before parentheses.    |
 | Typed literal | `Pair[i32, f64]{ first: 1, second: 2.0 }` | Construct generic values directly.           |
@@ -191,3 +194,24 @@ for {
     brk; # exit manually
 }
 ```
+
+## Entry points
+
+The runtime included in the Mach standard library looks for a function returning `i64` with a C-like signature: `argc` and `argv`.
+This is not enforced by the compiler itself, but by convention outlined in `std.runtime`.
+
+Because of this, a minimal Mach program must use the standard library as a dependency.
+With that in place, a simple "Hello, World!" program looks like this:
+
+```mach
+use          std.runtime;
+use print:   std.print;
+
+$main.symbol = "main";
+fun main(argc: i64, argv: &&u8) i64 {
+    print.println("Hello, World!");
+    ret 0;
+}
+```
+
+Please refer to the [standard library](https://github.com/octalide/mach-std) for specific implementation details.

@@ -1,15 +1,21 @@
-# Style
-- Maintain existing coding style and conventions.
-- Keep comments prefferably single-line and `// lower case`.
-- Avoid overcommenting trivial code or changes. Focus comments on complex logic.
-- If the bootstrap compiler is modified, once all changes are complete, format the C code using `clang-format` if available on the host system.
+# hard rules (mach repo)
+- do not manually edit anything under `dep/`. use `cmach dep ...` in the consuming project instead.
+- if a change would affect mach language syntax, semantics, behavior, or other core language aspects, pause and discuss before proceeding.
 
-# Quality
-- Reference language documentation in `doc` for proper usage of language features.
-- Maintain clarity and simplicity in all code changes.
-- Avoid introducing compatibility shims. Prefer full implementations.
-- Fully remove any dead code or lost features if affected by a change. This includes replaced functionality.
+# code changes
+- maintain existing coding style and conventions.
+- keep comments lowercase and concise; avoid overcommenting trivial changes.
+- avoid compatibility shims; prefer full implementations.
+- remove dead code or replaced functionality when a change would otherwise strand it.
 
-# Documentation
-- If a change requires documentation, update any existing documentation files in `doc` that pertain to the change.
-- Maintain parity with the existing documentation style.
+# documentation
+- treat `doc/*` as the source of truth for language/tooling behavior.
+- if a change is user-visible, update the relevant `doc/*` pages and keep examples compiling.
+
+# formatting
+- if you modify bootstrap compiler c code under `boot/`, run `clang-format` when available.
+
+# reference skills
+- `.github/skills/mach-project-overview/SKILL.md`
+- `.github/skills/mach-compiler-commands/SKILL.md`
+- `.github/skills/mach-language/SKILL.md`
