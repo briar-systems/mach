@@ -1,11 +1,9 @@
 #include "compiler/masm/lower.h"
 #include "compiler/masm/abi/spec.h"
 #include "compiler/masm/ir.h"
-#include "compiler/masm/instruction.h"
 #include "compiler/masm/isa/spec.h"
 #include "compiler/masm/isa/x86_64/x86_64.h"
 #include "compiler/masm/masm.h"
-#include "compiler/masm/regalloc.h"
 #include "compiler/symbol.h"
 #include "compiler/type.h"
 #include <stdio.h>
@@ -791,11 +789,11 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     MasmInstruction inst;
     if (is_syscall)
     {
-         inst = masm_inst_create(MASM_IR_SYSCALL, ops, total_ops);
+         inst = masm_inst_create(MASM_OPCODE_IR, MASM_IR_SYSCALL, ops, total_ops);
     }
     else
     {
-         inst = masm_inst_create(MASM_IR_CALL, ops, total_ops);
+         inst = masm_inst_create(MASM_OPCODE_IR, MASM_IR_CALL, ops, total_ops);
     }
 
     masm_section_append_inst(text, inst);
@@ -2078,7 +2076,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
 
-                masm_section_append_inst(text, masm_inst_2(MASM_IR_CMP, dst_op, src_op));
+                masm_section_append_inst(text, masm_x86_inst_2(MASM_OP_X86_CMP_RR, dst_op, src_op));
             }
         }
         else if (strncmp(token, "xor ", 4) == 0)

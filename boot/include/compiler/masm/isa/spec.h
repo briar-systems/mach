@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include "compiler/masm/instruction.h"
+#include "compiler/masm/ir.h"
 #include "compiler/masm/operand.h"
 #include "compiler/masm/target.h"
 

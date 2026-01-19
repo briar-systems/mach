@@ -1,5 +1,6 @@
-#include "compiler/masm/opt/peephole.h"
-#include "compiler/masm/instruction.h"
+#include "compiler/masm/opt/x86_64/peephole.h"
+#include "compiler/masm/ir.h"
+#include "compiler/masm/isa/x86_64/x86_64.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,7 +23,24 @@ static bool mem_uses_reg(MasmOperand mem_op, uint32_t reg_id)
     return mem_op.mem.base.id == reg_id || mem_op.mem.index.id == reg_id;
 }
 
-// peephole optimization pass
+// check if instruction is an x86 mov (register-to-register)
+static bool is_x86_mov_rr(MasmInstruction *inst)
+{
+    return inst->kind == MASM_OPCODE_X86 && inst->opcode == MASM_OP_X86_MOV_RR;
+}
+
+// check if instruction is any x86 mov variant
+static bool is_x86_mov(MasmInstruction *inst)
+{
+    if (inst->kind != MASM_OPCODE_X86) return false;
+    return inst->opcode == MASM_OP_X86_MOV_RR ||
+           inst->opcode == MASM_OP_X86_MOV_RM ||
+           inst->opcode == MASM_OP_X86_MOV_MR ||
+           inst->opcode == MASM_OP_X86_MOV_RI ||
+           inst->opcode == MASM_OP_X86_MOV_MI;
+}
+
+// peephole optimization pass (x86_64-specific, runs post-isel)
 static void masm_opt_peephole(MasmSection *section)
 {
     if (!section || section->inst_count < 2)
@@ -41,14 +59,14 @@ static void masm_opt_peephole(MasmSection *section)
     {
         MasmInstruction *inst = &section->instructions[i];
 
-        // skip labels
-        if (inst->opcode == MASM_OP_LABEL)
+        // skip labels (IR pseudo-ops that survive isel)
+        if (inst->kind == MASM_OPCODE_IR && inst->opcode == MASM_IR_LABEL)
         {
             continue;
         }
 
-        // pattern 1: MOV reg, reg (same register) -> remove
-        if (inst->opcode == MASM_OP_MOV && inst->operand_count == 2)
+        // pattern 1: MOV_RR reg, reg (same register) -> remove
+        if (is_x86_mov_rr(inst) && inst->operand_count == 2)
         {
             if (same_register(inst->operands[0], inst->operands[1]))
             {
@@ -61,16 +79,16 @@ static void masm_opt_peephole(MasmSection *section)
         // only if no labels between them, X is not memory, and the next MOV does not
         // use the destination register as part of its source addressing (e.g.
         // `mov rax, label; mov rax, [rax]` is a load-from-address idiom and is not dead).
-        if (inst->opcode == MASM_OP_MOV && inst->operand_count == 2 && i + 1 < section->inst_count)
+        if (is_x86_mov(inst) && inst->operand_count == 2 && i + 1 < section->inst_count)
         {
             MasmInstruction *next = &section->instructions[i + 1];
-            if (next->opcode == MASM_OP_MOV && next->operand_count == 2)
+            if (is_x86_mov(next) && next->operand_count == 2)
             {
                 // same destination register, source is not memory
                 if (same_register(inst->operands[0], next->operands[0]) && inst->operands[1].kind != MASM_OPERAND_MEMORY)
                 {
                     uint32_t dst_reg = inst->operands[0].reg.id;
-                    
+
                     // check if next instruction reads the register (memory or register source)
                     bool next_reads_reg = mem_uses_reg(next->operands[1], dst_reg);
                     if (!next_reads_reg && next->operands[1].kind == MASM_OPERAND_REGISTER && next->operands[1].reg.id == dst_reg)
@@ -87,11 +105,11 @@ static void masm_opt_peephole(MasmSection *section)
             }
         }
 
-        // pattern 3: PUSH reg; POP reg -> remove both (no-op)
-        if (inst->opcode == MASM_OP_PUSH && inst->operand_count == 1 && inst->operands[0].kind == MASM_OPERAND_REGISTER && i + 1 < section->inst_count)
+        // pattern 3: PUSH_R reg; POP_R reg -> remove both (no-op)
+        if (inst->kind == MASM_OPCODE_X86 && inst->opcode == MASM_OP_X86_PUSH_R && inst->operand_count == 1 && inst->operands[0].kind == MASM_OPERAND_REGISTER && i + 1 < section->inst_count)
         {
             MasmInstruction *next = &section->instructions[i + 1];
-            if (next->opcode == MASM_OP_POP && next->operand_count == 1)
+            if (next->kind == MASM_OPCODE_X86 && next->opcode == MASM_OP_X86_POP_R && next->operand_count == 1)
             {
                 if (same_register(inst->operands[0], next->operands[0]))
                 {
@@ -127,7 +145,7 @@ static void masm_opt_peephole(MasmSection *section)
     free(remove);
 }
 
-void masm_opt_run(Masm *masm)
+void masm_opt_x86_run(Masm *masm)
 {
     if (!masm)
     {

@@ -1,7 +1,7 @@
 #ifndef MASM_SECTION_H
 #define MASM_SECTION_H
 
-#include "compiler/masm/instruction.h"
+#include "compiler/masm/ir.h"
 #include <stdint.h>
 #include <stddef.h>
 

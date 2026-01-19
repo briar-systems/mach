@@ -140,13 +140,24 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
 {
     size_t offset = 0;
 
+    // handle IR pseudo-ops that survive isel
+    if (inst.kind == MASM_OPCODE_IR)
+    {
+        switch (inst.opcode)
+        {
+        case MASM_IR_LABEL:
+            // no bytes emitted for labels
+            break;
+        default:
+            // unknown IR opcode in x86 encoder
+            break;
+        }
+        return (int)offset;
+    }
+
+    // handle x86 opcodes
     switch (inst.opcode)
     {
-    case MASM_OP_LABEL:
-        break;
-
-
-
     case MASM_OP_X86_SYSCALL:
         emit_byte(buffer, &offset, size, 0x0F);
         emit_byte(buffer, &offset, size, 0x05);

@@ -1,5 +1,5 @@
 #include "compiler/masm/masm.h"
-#include "compiler/masm/instruction.h"
+#include "compiler/masm/ir.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,14 +152,7 @@ void masm_merge(Masm *dest, Masm *src)
         {
             MasmInstruction *src_inst = &src_sec->instructions[j];
             // Create a copy of the instruction (allocates new operand array)
-            MasmInstruction new_inst = masm_inst_create(src_inst->opcode, src_inst->operands, src_inst->operand_count);
-            if (src_inst->opcode == MASM_OP_MOV && src_inst->operand_count >= 2 && src_inst->operands[1].kind == MASM_OPERAND_LABEL)
-            {
-#ifdef MASM_DEBUG
-                fprintf(stderr, "[masm_merge] copying MOV with label %s at inst %zu, dest will be %zu\n", src_inst->operands[1].label, j, dest_sec->inst_count);
-                fprintf(stderr, "[masm_merge] new_inst op0 kind=%d, op1 kind=%d\n", new_inst.operands[0].kind, new_inst.operands[1].kind);
-#endif
-            }
+            MasmInstruction new_inst = masm_inst_create(src_inst->kind, src_inst->opcode, src_inst->operands, src_inst->operand_count);
             masm_section_append_inst(dest_sec, new_inst);
         }
 #ifdef MASM_DEBUG

@@ -1,25 +1,24 @@
 #ifndef MASM_IR_H
 #define MASM_IR_H
 
+#include "compiler/masm/operand.h"
 #include <stdint.h>
+#include <stddef.h>
 
-// Portable MASM IR Opcodes
-// These opcodes represent the Three-Operand Form (TOF) instruction set
+// portable masm ir opcodes
+// these represent the three-operand form (tof) instruction set
 // and are platform-independent.
-// IR opcodes start at 500 to avoid collision with generic MasmOpcode values
-#define MASM_IR_START 500
-
 typedef enum MasmIrOpcode
 {
-    // Data Movement
-    MASM_IR_MOV = MASM_IR_START,
+    // data movement
+    MASM_IR_MOV = 1,
     MASM_IR_LOAD,
     MASM_IR_STORE,
     MASM_IR_LEA,
     MASM_IR_ZEXT,
     MASM_IR_SEXT,
 
-    // Integer Arithmetic
+    // integer arithmetic
     MASM_IR_ADD,
     MASM_IR_SUB,
     MASM_IR_MUL,
@@ -29,7 +28,7 @@ typedef enum MasmIrOpcode
     MASM_IR_REMU,
     MASM_IR_NEG,
 
-    // Bitwise Operations
+    // bitwise operations
     MASM_IR_AND,
     MASM_IR_OR,
     MASM_IR_XOR,
@@ -38,9 +37,8 @@ typedef enum MasmIrOpcode
     MASM_IR_SHR,
     MASM_IR_SAR,
 
-    // Comparisons (Set-if)
-    // Results are stored in destination register (1 or 0)
-    MASM_IR_CMP,
+    // comparisons (set-if)
+    // results are stored in destination register (1 or 0)
     MASM_IR_SEQ,
     MASM_IR_SNE,
     MASM_IR_SLT,
@@ -52,7 +50,7 @@ typedef enum MasmIrOpcode
     MASM_IR_SGE,
     MASM_IR_SGEU,
 
-    // Floating Point
+    // floating point
     MASM_IR_FADD,
     MASM_IR_FSUB,
     MASM_IR_FMUL,
@@ -60,7 +58,7 @@ typedef enum MasmIrOpcode
     MASM_IR_FCMP,
     MASM_IR_FCONV,
 
-    // Control Flow
+    // control flow
     MASM_IR_JMP,
     MASM_IR_BEQ,
     MASM_IR_BNE,
@@ -71,10 +69,10 @@ typedef enum MasmIrOpcode
     MASM_IR_CALL,
     MASM_IR_RET,
 
-    // System
+    // system
     MASM_IR_SYSCALL,
 
-    // Pseudo-Ops
+    // pseudo-ops
     MASM_IR_LABEL,
     MASM_IR_DATA,
     MASM_IR_STACK_FRAME,
@@ -92,8 +90,42 @@ typedef enum MasmIrFcmpCond
     MASM_IR_FCMP_GE
 } MasmIrFcmpCond;
 
-// Helper to get string representation of IR opcode
+// opcode namespace discriminator
+typedef enum MasmOpcodeKind
+{
+    MASM_OPCODE_IR = 0,   // portable IR opcodes (MasmIrOpcode)
+    MASM_OPCODE_X86,      // x86_64 target opcodes (MasmX86Opcode)
+    // future: MASM_OPCODE_ARM64, etc.
+} MasmOpcodeKind;
+
+// instruction structure
+// used for both IR instructions and target-specific instructions
+typedef struct MasmInstruction
+{
+    MasmOpcodeKind kind;          // which opcode namespace
+    uint32_t       opcode;        // interpretation depends on kind
+    MasmOperand   *operands;
+    uint8_t        operand_count;
+} MasmInstruction;
+
+// instruction builders (default to IR opcode kind)
+MasmInstruction masm_inst_create(MasmOpcodeKind kind, uint32_t opcode, MasmOperand *operands, uint8_t count);
+MasmInstruction masm_inst_0(uint32_t opcode);
+MasmInstruction masm_inst_1(uint32_t opcode, MasmOperand op1);
+MasmInstruction masm_inst_2(uint32_t opcode, MasmOperand op1, MasmOperand op2);
+MasmInstruction masm_inst_3(uint32_t opcode, MasmOperand op1, MasmOperand op2, MasmOperand op3);
+MasmInstruction masm_inst_4(uint32_t opcode, MasmOperand op1, MasmOperand op2, MasmOperand op3, MasmOperand op4);
+void            masm_inst_destroy(MasmInstruction inst);
+
+// target-specific instruction builders (for use by isel)
+MasmInstruction masm_inst_target_create(MasmOpcodeKind kind, uint32_t opcode, MasmOperand *operands, uint8_t count);
+MasmInstruction masm_inst_target_0(MasmOpcodeKind kind, uint32_t opcode);
+MasmInstruction masm_inst_target_1(MasmOpcodeKind kind, uint32_t opcode, MasmOperand op1);
+MasmInstruction masm_inst_target_2(MasmOpcodeKind kind, uint32_t opcode, MasmOperand op1, MasmOperand op2);
+MasmInstruction masm_inst_target_3(MasmOpcodeKind kind, uint32_t opcode, MasmOperand op1, MasmOperand op2, MasmOperand op3);
+MasmInstruction masm_inst_target_4(MasmOpcodeKind kind, uint32_t opcode, MasmOperand op1, MasmOperand op2, MasmOperand op3, MasmOperand op4);
+
+// helper to get string representation of ir opcode
 const char *masm_ir_name(MasmIrOpcode op);
 
 #endif // MASM_IR_H
-

@@ -2,7 +2,7 @@
 #define MASM_ISA_X86_64_H
 
 #include "compiler/masm/operand.h"
-#include "compiler/masm/instruction.h"
+#include "compiler/masm/ir.h"
 
 struct Masm;
 
@@ -28,10 +28,11 @@ typedef enum MasmX86Reg
     MASM_X86_REG_COUNT
 } MasmX86Reg;
 
-// x86_64-specific opcodes (target-specific range)
+// x86_64-specific opcodes
+// these are target-specific and distinguished from IR opcodes by MasmOpcodeKind
 typedef enum MasmX86Opcode
 {
-    MASM_OP_X86_SYSCALL = MASM_OP_TARGET_SPECIFIC_START,
+    MASM_OP_X86_SYSCALL = 0,
 
     // data movement
     MASM_OP_X86_MOV_RR,
@@ -108,6 +109,13 @@ typedef enum MasmX86Opcode
     MASM_OP_X86_CDQ,
     MASM_OP_X86_CQO,
 } MasmX86Opcode;
+
+// x86 instruction builder macros (convenience wrappers)
+#define masm_x86_inst_0(op)                 masm_inst_target_0(MASM_OPCODE_X86, (op))
+#define masm_x86_inst_1(op, a)              masm_inst_target_1(MASM_OPCODE_X86, (op), (a))
+#define masm_x86_inst_2(op, a, b)           masm_inst_target_2(MASM_OPCODE_X86, (op), (a), (b))
+#define masm_x86_inst_3(op, a, b, c)        masm_inst_target_3(MASM_OPCODE_X86, (op), (a), (b), (c))
+#define masm_x86_inst_4(op, a, b, c, d)     masm_inst_target_4(MASM_OPCODE_X86, (op), (a), (b), (c), (d))
 
 // register helper
 MasmOperand masm_x86_reg(MasmX86Reg reg, uint8_t size);
