@@ -1,5 +1,6 @@
 #include "compiler/masm/abi/spec.h"
 #include "compiler/masm/abi/sysv64.h"
+#include "compiler/masm/isa/x86_64/x86_64.h"
 
 // integer argument registers
 static const uint32_t SYSV64_INT_ARGS[] = {
@@ -48,16 +49,16 @@ const MasmABISpec *masm_abi_spec_select(MasmTarget target)
     }
 }
 
-MasmX86Reg masm_sysv64_arg_reg(int index)
+uint32_t masm_sysv64_arg_reg(int index)
 {
-    if (index >= 0 && index < 6) return (MasmX86Reg)SYSV64_INT_ARGS[index];
-    return MASM_X86_REG_COUNT;
+    if (index >= 0 && index < 6) return SYSV64_INT_ARGS[index];
+    return UINT32_MAX;
 }
 
-MasmX86Reg masm_sysv64_ret_reg(int index)
+uint32_t masm_sysv64_ret_reg(int index)
 {
-    if (index >= 0 && index < 2) return (MasmX86Reg)SYSV64_INT_RETS[index];
-    return MASM_X86_REG_COUNT;
+    if (index >= 0 && index < 2) return SYSV64_INT_RETS[index];
+    return UINT32_MAX;
 }
 
 uint8_t masm_abi_pointer_size(MasmTarget target)

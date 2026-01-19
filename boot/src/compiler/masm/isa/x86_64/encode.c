@@ -1143,7 +1143,7 @@ static MasmOperand x86_reg_div_lo(uint8_t size) { return masm_operand_register(M
 static MasmOperand x86_reg_arg(int index, uint8_t size)
 {
     uint32_t reg = masm_sysv64_arg_reg(index);
-    if (reg == (uint32_t)MASM_X86_REG_COUNT) return masm_operand_none();
+    if (reg == UINT32_MAX) return masm_operand_none();
     return masm_operand_register(reg, size);
 }
 static MasmOperand x86_reg_sp(uint8_t size) { return masm_operand_register(MASM_X86_RSP, size); }

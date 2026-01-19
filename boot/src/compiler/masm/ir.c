@@ -197,6 +197,10 @@ const char *masm_ir_name(MasmIrOpcode op)
     case MASM_IR_SGEU:
         return "sgeu";
 
+    // flag-setting comparison
+    case MASM_IR_CMP:
+        return "cmp";
+
     // floating point
     case MASM_IR_FADD:
         return "fadd";

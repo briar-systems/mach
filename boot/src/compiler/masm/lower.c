@@ -2,7 +2,6 @@
 #include "compiler/masm/abi/spec.h"
 #include "compiler/masm/ir.h"
 #include "compiler/masm/isa/spec.h"
-#include "compiler/masm/isa/x86_64/x86_64.h"
 #include "compiler/masm/masm.h"
 #include "compiler/symbol.h"
 #include "compiler/type.h"
@@ -64,6 +63,11 @@ typedef struct LowerContext
     int     va_named_gp;          // named gp regs consumed (excluding sret)
     int     va_named_fp;          // named fp regs consumed
     int     va_named_stack_slots; // named params passed on stack
+
+    // label generation counters (module-wide, persist across functions)
+    int str_counter;
+    int label_counter;
+    int loop_counter;
 } LowerContext;
 
 // Select ISA spec via shared selector
@@ -178,6 +182,11 @@ static LowerContext *create_context(MasmTarget target)
     ctx->va_named_gp          = 0;
     ctx->va_named_fp          = 0;
     ctx->va_named_stack_slots = 0;
+
+    // label generation counters
+    ctx->str_counter   = 0;
+    ctx->label_counter = 0;
+    ctx->loop_counter  = 0;
     return ctx;
 }
 
@@ -512,11 +521,10 @@ static MasmOperand lower_binary_op(MasmSection *text, TokenKind op, MasmOperand 
 
 static MasmOperand lower_short_circuit(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
 {
-    static int label_counter = 0;
-    char       label1[32];
-    char       label_end[32];
-    snprintf(label1, sizeof(label1), ".Lsc_%d", label_counter);
-    snprintf(label_end, sizeof(label_end), ".Lsc_end_%d", label_counter++);
+    char label1[32];
+    char label_end[32];
+    snprintf(label1, sizeof(label1), ".Lsc_%d", ctx->label_counter);
+    snprintf(label_end, sizeof(label_end), ".Lsc_end_%d", ctx->label_counter++);
 
     bool is_and = (expr->binary_expr.op == TOKEN_AMPERSAND_AMPERSAND);
 
@@ -532,12 +540,12 @@ static MasmOperand lower_short_circuit(Masm *masm, MasmSection *text, AstNode *e
     if (is_and)
     {
         // AND: if res == 0, jump to end (result is 0)
-        masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, res, masm_operand_imm(0), masm_operand_label(strdup(label_end))));
+        masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, res, masm_operand_imm(0), masm_operand_label(label_end)));
     }
     else
     {
         // OR: if res != 0, jump to label1 (set result to 1)
-        masm_section_append_inst(text, masm_inst_3(MASM_IR_BNE, res, masm_operand_imm(0), masm_operand_label(strdup(label1))));
+        masm_section_append_inst(text, masm_inst_3(MASM_IR_BNE, res, masm_operand_imm(0), masm_operand_label(label1)));
     }
 
     // Evaluate Right
@@ -545,17 +553,17 @@ static MasmOperand lower_short_circuit(Masm *masm, MasmSection *text, AstNode *e
 
     // Result = (right != 0)
     masm_section_append_inst(text, masm_inst_3(MASM_IR_SNE, res, right, masm_operand_imm(0)));
-    masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(label_end))));
+    masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(label_end)));
 
     if (!is_and)
     {
         // Label True (for OR short-circuit)
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(label1))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(label1)));
         masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, res, masm_operand_imm(1)));
         masm_add_symbol(masm, masm_symbol_create(label1, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
     }
 
-    masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(label_end))));
+    masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(label_end)));
     masm_add_symbol(masm, masm_symbol_create(label_end, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
 
     return res;
@@ -702,11 +710,11 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         else
         {
             // Symbol
-            target = masm_operand_label(strdup(func->ident_expr.name));
+            target = masm_operand_label(func->ident_expr.name);
             if (func->symbol)
             {
                 const char *link = symbol_get_linkage_name(func->symbol);
-                if (link) target = masm_operand_label(strdup(link));
+                if (link) target = masm_operand_label(link);
             }
         }
     }
@@ -902,9 +910,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 return masm_operand_none();
             }
 
-            static int str_counter = 0;
-            char       label[32];
-            snprintf(label, sizeof(label), ".Lstr_%d", str_counter++);
+            char label[32];
+            snprintf(label, sizeof(label), ".Lstr_%d", ctx->str_counter++);
 
             MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
 
@@ -920,7 +927,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             masm_section_append_data(rodata, &zero, 1);
 
             MasmOperand res = isa_result(ctx, 8);
-            MasmOperand src = masm_operand_label(strdup(label));
+            MasmOperand src = masm_operand_label(label);
             masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, res, src));
             return res;
         }
@@ -954,9 +961,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             fprintf(stderr, "[lower_expr] string literal '%s', text=%p, inst_count before=%zu\n", expr->lit_expr.string_val, (void *)text, text->inst_count);
 #endif
             // Create unique label
-            static int str_counter = 0;
-            char       label[32];
-            snprintf(label, sizeof(label), ".Lstr_%d", str_counter++);
+            char label[32];
+            snprintf(label, sizeof(label), ".Lstr_%d", ctx->str_counter++);
 
             // Add to .rodata
             MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
@@ -976,7 +982,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
             // MOV result, label (absolute address)
             MasmOperand res = isa_result(ctx, 8);
-            MasmOperand src = masm_operand_label(strdup(label));
+            MasmOperand src = masm_operand_label(label);
             masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, res, src));
 #ifdef MASM_DEBUG
             fprintf(stderr, "[lower_expr] string literal: emitted MOV, text section inst_count after=%zu\n", text->inst_count);
@@ -1042,7 +1048,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             {
                 // For aggregates/arrays, return address in Register
                 MasmOperand addr     = isa_result(ctx, 8);
-                MasmOperand label_op = masm_operand_label(strdup(sym->name));
+                MasmOperand label_op = masm_operand_label(sym->name);
                 masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, addr, label_op));
 
                 if (sym->size > 8)
@@ -1098,7 +1104,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                     }
 
                     MasmOperand addr     = isa_result(ctx, ctx->ptr_size);
-                    MasmOperand label_op = masm_operand_label(strdup(link_name));
+                    MasmOperand label_op = masm_operand_label(link_name);
                     masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, addr, label_op));
 
                     if (sym_size > 8)
@@ -1164,7 +1170,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 if (sym)
                 {
                     MasmOperand dst      = isa_result(ctx, ctx->ptr_size);
-                    MasmOperand label_op = masm_operand_label(strdup(sym->name));
+                    MasmOperand label_op = masm_operand_label(sym->name);
                     masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, dst, label_op));
                     return dst;
                 }
@@ -1766,7 +1772,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         emit_deferred_from(masm, text, ctx, defer_mark);
         if (ctx->loop_end_label)
         {
-            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(ctx->loop_end_label))));
+            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(ctx->loop_end_label)));
         }
     }
     else if (stmt->kind == AST_STMT_CNT)
@@ -1775,7 +1781,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         emit_deferred_from(masm, text, ctx, defer_mark);
         if (ctx->loop_start_label)
         {
-            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(ctx->loop_start_label))));
+            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(ctx->loop_start_label)));
         }
     }
     else if (stmt->kind == AST_STMT_MASM)
@@ -1788,27 +1794,26 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_IF)
     {
-        static int label_counter = 0;
-        char       else_label[32];
-        char       end_label[32];
-        snprintf(else_label, sizeof(else_label), ".Lif_or_%d", label_counter);
-        snprintf(end_label, sizeof(end_label), ".Lif_end_%d", label_counter++);
+        char else_label[32];
+        char end_label[32];
+        snprintf(else_label, sizeof(else_label), ".Lif_or_%d", ctx->label_counter);
+        snprintf(end_label, sizeof(end_label), ".Lif_end_%d", ctx->label_counter++);
 
         // evaluate condition
         MasmOperand cond = lower_expr(masm, text, stmt->cond_stmt.cond, ctx);
         cond = ensure_in_reg(text, cond, stmt->cond_stmt.cond->type, ctx);
 
         // jump to else/end if false (zero)
-        masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cond, masm_operand_imm(0), masm_operand_label(strdup(else_label))));
+        masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cond, masm_operand_imm(0), masm_operand_label(else_label)));
 
         // lower body
         lower_stmt(masm, text, stmt->cond_stmt.body, ctx);
 
         // jump to end (skip else)
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(end_label))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(end_label)));
 
         // else label
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(else_label))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(else_label)));
         masm_add_symbol(masm, masm_symbol_create(else_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
 
         // lower else block if exists
@@ -1818,16 +1823,15 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         }
 
         // end label
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(end_label))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(end_label)));
         masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
     }
     else if (stmt->kind == AST_STMT_FOR)
     {
-        static int loop_counter = 0;
-        char       start_label[32];
-        char       end_label[32];
-        snprintf(start_label, sizeof(start_label), ".Lloop_start_%d", loop_counter);
-        snprintf(end_label, sizeof(end_label), ".Lloop_end_%d", loop_counter++);
+        char start_label[32];
+        char end_label[32];
+        snprintf(start_label, sizeof(start_label), ".Lloop_start_%d", ctx->loop_counter);
+        snprintf(end_label, sizeof(end_label), ".Lloop_end_%d", ctx->loop_counter++);
 
         int defer_mark = ctx->deferred_count;
         push_loop_defer_mark(ctx, defer_mark);
@@ -1843,24 +1847,24 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         masm_add_symbol(masm, masm_symbol_create(ctx->loop_end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
 
         // Emit start label
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(ctx->loop_start_label))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(ctx->loop_start_label)));
 
         // Condition
         if (stmt->for_stmt.cond)
         {
             MasmOperand cond = lower_expr(masm, text, stmt->for_stmt.cond, ctx);
             cond = ensure_in_reg(text, cond, stmt->for_stmt.cond->type, ctx);
-            masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cond, masm_operand_imm(0), masm_operand_label(strdup(ctx->loop_end_label))));
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cond, masm_operand_imm(0), masm_operand_label(ctx->loop_end_label)));
         }
 
         // Body
         lower_stmt(masm, text, stmt->for_stmt.body, ctx);
 
         // Jump back to start
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(ctx->loop_start_label))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(ctx->loop_start_label)));
 
         // Emit end label
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(ctx->loop_end_label))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(ctx->loop_end_label)));
 
         // Restore previous loop labels
         free(ctx->loop_start_label);
@@ -1876,23 +1880,22 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         if (stmt->cond_stmt.cond)
         {
             // Same as IF
-            static int label_counter = 0;
-            char       else_label[32];
-            char       end_label[32];
-            snprintf(else_label, sizeof(else_label), ".Lor_stmt_else_%d", label_counter);
-            snprintf(end_label, sizeof(end_label), ".Lor_stmt_end_%d", label_counter++);
+            char else_label[32];
+            char end_label[32];
+            snprintf(else_label, sizeof(else_label), ".Lor_stmt_else_%d", ctx->label_counter);
+            snprintf(end_label, sizeof(end_label), ".Lor_stmt_end_%d", ctx->label_counter++);
 
             // evaluate condition
             MasmOperand cond = lower_expr(masm, text, stmt->cond_stmt.cond, ctx);
             cond = ensure_in_reg(text, cond, stmt->cond_stmt.cond->type, ctx);
 
-            masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cond, masm_operand_imm(0), masm_operand_label(strdup(else_label))));
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cond, masm_operand_imm(0), masm_operand_label(else_label)));
 
             lower_stmt(masm, text, stmt->cond_stmt.body, ctx);
 
-            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(end_label))));
+            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(end_label)));
 
-            masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(else_label))));
+            masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(else_label)));
             masm_add_symbol(masm, masm_symbol_create(else_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
 
             if (stmt->cond_stmt.stmt_or)
@@ -1900,7 +1903,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                 lower_stmt(masm, text, stmt->cond_stmt.stmt_or, ctx);
             }
 
-            masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(end_label))));
+            masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(end_label)));
             masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
         }
         else
@@ -1911,11 +1914,10 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
     }
     else if (stmt->kind == AST_STMT_FOR)
     {
-        static int label_counter = 0;
-        char       start_label[32];
-        char       end_label[32];
-        snprintf(start_label, sizeof(start_label), ".Lfor_start_%d", label_counter);
-        snprintf(end_label, sizeof(end_label), ".Lfor_end_%d", label_counter++);
+        char start_label[32];
+        char end_label[32];
+        snprintf(start_label, sizeof(start_label), ".Lfor_start_%d", ctx->label_counter);
+        snprintf(end_label, sizeof(end_label), ".Lfor_end_%d", ctx->label_counter++);
 
         int defer_mark = ctx->deferred_count;
         push_loop_defer_mark(ctx, defer_mark);
@@ -1931,7 +1933,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         ctx->loop_start_label = strdup(start_label);
         ctx->loop_end_label   = strdup(end_label);
 
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(start_label))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(start_label)));
         masm_add_symbol(masm, masm_symbol_create(start_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
 
         // check condition if exists
@@ -1939,17 +1941,17 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             MasmOperand cond = lower_expr(masm, text, stmt->for_stmt.cond, ctx);
             cond = ensure_in_reg(text, cond, stmt->for_stmt.cond->type, ctx);
-            masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cond, masm_operand_imm(0), masm_operand_label(strdup(end_label))));
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cond, masm_operand_imm(0), masm_operand_label(end_label)));
         }
 
         // lower body
         lower_stmt(masm, text, stmt->for_stmt.body, ctx);
 
         // jump back to start
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(start_label))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(start_label)));
 
         // end label
-        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(end_label))));
+        masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(end_label)));
         masm_add_symbol(masm, masm_symbol_create(end_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
 
         // restore previous loop labels
@@ -1968,7 +1970,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         emit_deferred_from(masm, text, ctx, defer_mark);
         if (ctx->loop_end_label)
         {
-            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(ctx->loop_end_label))));
+            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(ctx->loop_end_label)));
         }
     }
     else if (stmt->kind == AST_STMT_CNT)
@@ -1977,7 +1979,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         emit_deferred_from(masm, text, ctx, defer_mark);
         if (ctx->loop_start_label)
         {
-            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(strdup(ctx->loop_start_label))));
+            masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(ctx->loop_start_label)));
         }
     }
 
@@ -2046,7 +2048,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 label[--len] = '\0';
             }
 
-            MasmOperand target = masm_operand_label(strdup(label));
+            MasmOperand target = masm_operand_label(label);
             masm_section_append_inst(text, masm_inst_2(MASM_IR_CALL, masm_operand_none(), target));
         }
         else if (strncmp(token, "ret", 3) == 0)
@@ -2076,7 +2078,7 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                 MasmOperand dst_op = parse_operand(dest, ctx);
                 MasmOperand src_op = parse_operand(src, ctx);
 
-                masm_section_append_inst(text, masm_x86_inst_2(MASM_OP_X86_CMP_RR, dst_op, src_op));
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_CMP, dst_op, src_op));
             }
         }
         else if (strncmp(token, "xor ", 4) == 0)
@@ -2364,7 +2366,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols)
 
     MasmSection *text = masm_get_or_create_section(masm, ".text", MASM_SECTION_TEXT);
 
-    masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(strdup(func_name))));
+    masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(func_name)));
 #ifdef MASM_DEBUG
     fprintf(stderr, "[lower_function] starting %s, text=%p, inst_count=%zu\n", func_name, (void *)text, text->inst_count);
 #endif

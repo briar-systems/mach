@@ -1256,6 +1256,22 @@ static void x86_64_codegen(Masm *masm)
                 case MASM_IR_BLT: emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JL); break;
                 case MASM_IR_BGE: emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JGE); break;
 
+                case MASM_IR_CMP:
+                {
+                    // flag-setting comparison (for inline asm)
+                    MasmOperand lhs = inst->operands[0];
+                    MasmOperand rhs = inst->operands[1];
+                    if (rhs.kind == MASM_OPERAND_IMM)
+                    {
+                        emit_inst(out, masm_x86_inst_2(MASM_OP_X86_CMP_RI, lhs, rhs));
+                    }
+                    else
+                    {
+                        emit_inst(out, masm_x86_inst_2(MASM_OP_X86_CMP_RR, lhs, rhs));
+                    }
+                    break;
+                }
+
                 case MASM_IR_JMP: emit_inst(out, masm_x86_inst_1(MASM_OP_X86_JMP_REL, inst->operands[0])); break;
                 case MASM_IR_RET: emit_ret(out, &ctx, inst); break;
                 case MASM_IR_CALL: emit_call(out, &ctx, inst); break;
