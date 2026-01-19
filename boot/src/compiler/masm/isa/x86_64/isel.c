@@ -1,5 +1,5 @@
-#include "compiler/masm/isa/x86_64/x86_64.h"
 #include "compiler/masm/ir.h"
+#include "compiler/masm/isa/x86_64/x86_64.h"
 #include "compiler/masm/masm.h"
 #include "compiler/masm/section.h"
 #include "compiler/masm/symbol.h"
@@ -8,7 +8,6 @@
 #include <string.h>
 
 // instruction selection: lowers portable MASM IR to x86_64-specific opcodes
-
 
 #define VREG_START 1024
 
@@ -26,10 +25,10 @@ typedef struct CodeGenContext
 
 static void ctx_init(CodeGenContext *ctx)
 {
-    ctx->vreg_offsets    = NULL;
-    ctx->vreg_capacity   = 0;
-    ctx->max_vreg_index  = 0;
-    ctx->base_stack_size = 0;
+    ctx->vreg_offsets     = NULL;
+    ctx->vreg_capacity    = 0;
+    ctx->max_vreg_index   = 0;
+    ctx->base_stack_size  = 0;
     ctx->total_stack_size = 0;
 }
 
@@ -49,19 +48,28 @@ static void ctx_reset(CodeGenContext *ctx)
 // Assign stack slot to vreg if not already assigned
 static int32_t get_vreg_offset(CodeGenContext *ctx, uint32_t vreg_id)
 {
-    if (vreg_id < VREG_START) return 0; // Should not happen for vreg lookup
-    
+    if (vreg_id < VREG_START)
+    {
+        return 0; // Should not happen for vreg lookup
+    }
+
     size_t idx = vreg_id - VREG_START;
     if (idx >= ctx->vreg_capacity)
     {
         size_t new_cap = (idx + 1) * 2;
-        if (new_cap < 64) new_cap = 64;
+        if (new_cap < 64)
+        {
+            new_cap = 64;
+        }
         ctx->vreg_offsets = realloc(ctx->vreg_offsets, new_cap * sizeof(int32_t));
         // Initialize new slots to 0 (unassigned)
-        for (size_t i = ctx->vreg_capacity; i < new_cap; i++) ctx->vreg_offsets[i] = 0;
+        for (size_t i = ctx->vreg_capacity; i < new_cap; i++)
+        {
+            ctx->vreg_offsets[i] = 0;
+        }
         ctx->vreg_capacity = new_cap;
     }
-    
+
     if (ctx->vreg_offsets[idx] == 0)
     {
         // Allocate new slot
@@ -69,10 +77,10 @@ static int32_t get_vreg_offset(CodeGenContext *ctx, uint32_t vreg_id)
         // We calculate them relative to RBP.
         // Stack grows down. Local vars are at [rbp - base_size ... rbp].
         // Vregs will be at [rbp - total ... rbp - base_size].
-        // But we don't know total yet during scanning? 
+        // But we don't know total yet during scanning?
         // We just assign an index and finalize offsets later, or just assign dynamically.
         // Let's use a simple counter for now relative to the end of locals.
-        
+
         // Note: We need to know this during the pre-scan phase.
         // This function is intended to be called during code gen, relying on pre-calculated info?
         // Or we do it on the fly if we reserved enough space?
@@ -81,7 +89,7 @@ static int32_t get_vreg_offset(CodeGenContext *ctx, uint32_t vreg_id)
         // So [rbp - offset]
         ctx->vreg_offsets[idx] = ctx->base_stack_size + (int32_t)((idx + 1) * 8);
     }
-    
+
     return ctx->vreg_offsets[idx];
 }
 
@@ -89,20 +97,20 @@ static int32_t get_vreg_offset(CodeGenContext *ctx, uint32_t vreg_id)
 static void scan_function(CodeGenContext *ctx, MasmInstruction *insts, size_t count)
 {
     ctx->max_vreg_index = 0;
-    bool found = false;
-    
+    bool found          = false;
+
     for (size_t i = 0; i < count; i++)
     {
         MasmInstruction *inst = &insts[i];
         if (inst->kind == MASM_OPCODE_IR && inst->opcode == MASM_IR_STACK_FRAME)
         {
-             // Reset context for new function
-             // Note: This naive scan assumes we process one function at a time.
-             // But the section contains multiple. We'll handle that in the main loop.
-             if (inst->operand_count > 0 && inst->operands[0].kind == MASM_OPERAND_IMM)
-             {
-                 ctx->base_stack_size = (uint32_t)inst->operands[0].imm;
-             }
+            // Reset context for new function
+            // Note: This naive scan assumes we process one function at a time.
+            // But the section contains multiple. We'll handle that in the main loop.
+            if (inst->operand_count > 0 && inst->operands[0].kind == MASM_OPERAND_IMM)
+            {
+                ctx->base_stack_size = (uint32_t)inst->operands[0].imm;
+            }
         }
 
         for (int j = 0; j < inst->operand_count; j++)
@@ -114,7 +122,7 @@ static void scan_function(CodeGenContext *ctx, MasmInstruction *insts, size_t co
                 if (!found || idx > ctx->max_vreg_index)
                 {
                     ctx->max_vreg_index = idx;
-                    found = true;
+                    found               = true;
                 }
             }
             if (op->kind == MASM_OPERAND_MEMORY && op->mem.base.id >= VREG_START)
@@ -123,25 +131,25 @@ static void scan_function(CodeGenContext *ctx, MasmInstruction *insts, size_t co
                 if (!found || idx > ctx->max_vreg_index)
                 {
                     ctx->max_vreg_index = idx;
-                    found = true;
+                    found               = true;
                 }
             }
-             if (op->kind == MASM_OPERAND_MEMORY && op->mem.index.id >= VREG_START)
+            if (op->kind == MASM_OPERAND_MEMORY && op->mem.index.id >= VREG_START)
             {
                 size_t idx = op->mem.index.id - VREG_START;
                 if (!found || idx > ctx->max_vreg_index)
                 {
                     ctx->max_vreg_index = idx;
-                    found = true;
+                    found               = true;
                 }
             }
         }
     }
-    
+
     // Calculate total stack size
     // base + (max_index + 1) * 8
     // align to 16
-    uint32_t vreg_space = found ? (uint32_t)((ctx->max_vreg_index + 1) * 8) : 0;
+    uint32_t vreg_space   = found ? (uint32_t)((ctx->max_vreg_index + 1) * 8) : 0;
     ctx->total_stack_size = ctx->base_stack_size + vreg_space;
     if (ctx->total_stack_size % 16 != 0)
     {
@@ -153,14 +161,10 @@ static void scan_function(CodeGenContext *ctx, MasmInstruction *insts, size_t co
 // Emitter Helpers
 // -----------------------------------------------------------------------------
 
-
-
 static void emit_inst(MasmSection *section, MasmInstruction inst)
 {
     masm_section_append_inst(section, inst);
 }
-
-
 
 // Load operand into physical register
 // If op is IMM -> MOV reg, imm
@@ -171,23 +175,23 @@ static void emit_inst(MasmSection *section, MasmInstruction inst)
 static void load_operand(MasmSection *sec, CodeGenContext *ctx, MasmOperand op, MasmX86Reg dest_reg, int mode)
 {
     MasmOperand dest = masm_x86_reg(dest_reg, 8); // assume 64-bit scratch
-    
+
     if (op.kind == MASM_OPERAND_REGISTER)
     {
         if (op.reg.id >= VREG_START)
         {
-            int32_t off = get_vreg_offset(ctx, op.reg.id);
+            int32_t     off = get_vreg_offset(ctx, op.reg.id);
             MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, op.reg.size);
-            
-            // Sign-extend if loading small value into 64-bit reg? 
+
+            // Sign-extend if loading small value into 64-bit reg?
             // For now, use MOVZX for small, MOV for 32/64
             if (op.reg.size == 1 || op.reg.size == 2)
             {
-                 emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVZX_RM, dest, mem));
+                emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVZX_RM, dest, mem));
             }
             else
             {
-                 emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RM, dest, mem));
+                emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RM, dest, mem));
             }
         }
         else
@@ -211,12 +215,12 @@ static void load_operand(MasmSection *sec, CodeGenContext *ctx, MasmOperand op, 
         if (mem.mem.base.id >= VREG_START)
         {
             // Load base vreg into R11 (address scratch)
-            int32_t off = get_vreg_offset(ctx, mem.mem.base.id);
+            int32_t     off       = get_vreg_offset(ctx, mem.mem.base.id);
             MasmOperand base_slot = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RM, masm_x86_reg(MASM_X86_R11, 8), base_slot));
             mem.mem.base.id = MASM_X86_R11;
         }
-        
+
         // If mode == 1 (LEA), we want the address
         if (mode == 1)
         {
@@ -237,7 +241,7 @@ static void load_operand(MasmSection *sec, CodeGenContext *ctx, MasmOperand op, 
     }
     else if (op.kind == MASM_OPERAND_LABEL || op.kind == MASM_OPERAND_SYMBOL)
     {
-         emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RI, dest, op));
+        emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RI, dest, op));
     }
 }
 
@@ -252,19 +256,17 @@ static void store_vreg(MasmSection *sec, CodeGenContext *ctx, uint32_t vreg_id, 
         }
         return;
     }
-    
-    int32_t off = get_vreg_offset(ctx, vreg_id);
+
+    int32_t     off  = get_vreg_offset(ctx, vreg_id);
     MasmOperand slot = masm_operand_memory_simple(MASM_X86_RBP, -off, size);
-    MasmOperand src = masm_x86_reg(src_reg, size); // store partial reg if size < 8
-    
+    MasmOperand src  = masm_x86_reg(src_reg, size); // store partial reg if size < 8
+
     emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_MR, slot, src));
 }
 
 // -----------------------------------------------------------------------------
 // Translation Handlers
 // -----------------------------------------------------------------------------
-
-
 
 static void emit_div_rem(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst, bool is_signed, bool is_rem)
 {
@@ -273,8 +275,14 @@ static void emit_div_rem(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
     MasmOperand b   = inst->operands[2];
 
     uint8_t size = 8;
-    if (dst.kind == MASM_OPERAND_REGISTER) size = dst.reg.size;
-    else if (a.kind == MASM_OPERAND_REGISTER) size = a.reg.size;
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        size = dst.reg.size;
+    }
+    else if (a.kind == MASM_OPERAND_REGISTER)
+    {
+        size = a.reg.size;
+    }
 
     // Load a -> RAX
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
@@ -284,33 +292,49 @@ static void emit_div_rem(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
     {
         // 8-bit: Dividend is AX.
         if (is_signed)
+        {
             emit_inst(sec, masm_x86_inst_0(MASM_OP_X86_CBW)); // AL -> AX
+        }
         else
+        {
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_AND_RI, masm_x86_reg(MASM_X86_RAX, 8), masm_operand_imm(0xFF))); // Zero AH
+        }
     }
     else if (size == 2)
     {
         // 16-bit: Dividend is DX:AX
         if (is_signed)
+        {
             emit_inst(sec, masm_x86_inst_0(MASM_OP_X86_CWD)); // AX -> DX:AX
+        }
         else
+        {
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_XOR_RR, masm_x86_reg(MASM_X86_RDX, 2), masm_x86_reg(MASM_X86_RDX, 2))); // Zero DX
+        }
     }
     else if (size == 4)
     {
         // 32-bit: Dividend is EDX:EAX
         if (is_signed)
+        {
             emit_inst(sec, masm_x86_inst_0(MASM_OP_X86_CDQ)); // EAX -> EDX:EAX
+        }
         else
+        {
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_XOR_RR, masm_x86_reg(MASM_X86_RDX, 4), masm_x86_reg(MASM_X86_RDX, 4))); // Zero EDX
+        }
     }
     else
     {
         // 64-bit: Dividend is RDX:RAX
         if (is_signed)
+        {
             emit_inst(sec, masm_x86_inst_0(MASM_OP_X86_CQO)); // RAX -> RDX:RAX
+        }
         else
+        {
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_XOR_RR, masm_x86_reg(MASM_X86_RDX, 8), masm_x86_reg(MASM_X86_RDX, 8))); // Zero RDX
+        }
     }
 
     // Load b -> RCX
@@ -353,8 +377,14 @@ static void emit_binary_op_explicit(MasmSection *sec, CodeGenContext *ctx, MasmI
     MasmOperand b   = inst->operands[2];
 
     uint8_t size = 8;
-    if (dst.kind == MASM_OPERAND_REGISTER) size = dst.reg.size;
-    else if (a.kind == MASM_OPERAND_REGISTER) size = a.reg.size;
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        size = dst.reg.size;
+    }
+    else if (a.kind == MASM_OPERAND_REGISTER)
+    {
+        size = a.reg.size;
+    }
 
     // Load a -> RAX
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
@@ -363,21 +393,38 @@ static void emit_binary_op_explicit(MasmSection *sec, CodeGenContext *ctx, MasmI
     if (b.kind == MASM_OPERAND_IMM)
     {
         uint32_t opcode = 0;
-        switch (op) {
-            case MASM_IR_ADD: opcode = MASM_OP_X86_ADD_RI; break;
-            case MASM_IR_SUB: opcode = MASM_OP_X86_SUB_RI; break;
-            case MASM_IR_MUL: opcode = MASM_OP_X86_IMUL_RRI; break; // IMUL RAX, RAX, IMM
-            case MASM_IR_AND: opcode = MASM_OP_X86_AND_RI; break;
-            case MASM_IR_OR:  opcode = MASM_OP_X86_OR_RI; break;
-            case MASM_IR_XOR: opcode = MASM_OP_X86_XOR_RI; break;
-            default: break;
+        switch (op)
+        {
+        case MASM_IR_ADD:
+            opcode = MASM_OP_X86_ADD_RI;
+            break;
+        case MASM_IR_SUB:
+            opcode = MASM_OP_X86_SUB_RI;
+            break;
+        case MASM_IR_MUL:
+            opcode = MASM_OP_X86_IMUL_RRI;
+            break; // IMUL RAX, RAX, IMM
+        case MASM_IR_AND:
+            opcode = MASM_OP_X86_AND_RI;
+            break;
+        case MASM_IR_OR:
+            opcode = MASM_OP_X86_OR_RI;
+            break;
+        case MASM_IR_XOR:
+            opcode = MASM_OP_X86_XOR_RI;
+            break;
+        default:
+            break;
         }
-        
-        if (op == MASM_IR_MUL) {
+
+        if (op == MASM_IR_MUL)
+        {
             // IMUL 3-operand form: IMUL dst, src, imm
             // Here: IMUL RAX, RAX, imm
             emit_inst(sec, masm_x86_inst_3(opcode, rax, rax, b));
-        } else {
+        }
+        else
+        {
             emit_inst(sec, masm_x86_inst_2(opcode, rax, b));
         }
     }
@@ -386,22 +433,36 @@ static void emit_binary_op_explicit(MasmSection *sec, CodeGenContext *ctx, MasmI
         // If vreg, we might want to check if it's already in a physical reg?
         // load_operand puts it in a phys reg if needed.
         // But for explicit op selection, we can use ADD_RM if b is a vreg (memory).
-        
+
         if (b.reg.id >= VREG_START)
         {
             // Memory operand (vreg stack slot)
-            int32_t off = get_vreg_offset(ctx, b.reg.id);
+            int32_t     off = get_vreg_offset(ctx, b.reg.id);
             MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, b.reg.size);
-            
+
             uint32_t opcode = 0;
-            switch (op) {
-                case MASM_IR_ADD: opcode = MASM_OP_X86_ADD_RM; break;
-                case MASM_IR_SUB: opcode = MASM_OP_X86_SUB_RM; break;
-                case MASM_IR_MUL: opcode = MASM_OP_X86_IMUL_RM; break;
-                case MASM_IR_AND: opcode = MASM_OP_X86_AND_RM; break;
-                case MASM_IR_OR:  opcode = MASM_OP_X86_OR_RM; break;
-                case MASM_IR_XOR: opcode = MASM_OP_X86_XOR_RM; break;
-                default: break;
+            switch (op)
+            {
+            case MASM_IR_ADD:
+                opcode = MASM_OP_X86_ADD_RM;
+                break;
+            case MASM_IR_SUB:
+                opcode = MASM_OP_X86_SUB_RM;
+                break;
+            case MASM_IR_MUL:
+                opcode = MASM_OP_X86_IMUL_RM;
+                break;
+            case MASM_IR_AND:
+                opcode = MASM_OP_X86_AND_RM;
+                break;
+            case MASM_IR_OR:
+                opcode = MASM_OP_X86_OR_RM;
+                break;
+            case MASM_IR_XOR:
+                opcode = MASM_OP_X86_XOR_RM;
+                break;
+            default:
+                break;
             }
             emit_inst(sec, masm_x86_inst_2(opcode, rax, mem));
         }
@@ -409,14 +470,28 @@ static void emit_binary_op_explicit(MasmSection *sec, CodeGenContext *ctx, MasmI
         {
             // Physical register
             uint32_t opcode = 0;
-            switch (op) {
-                case MASM_IR_ADD: opcode = MASM_OP_X86_ADD_RR; break;
-                case MASM_IR_SUB: opcode = MASM_OP_X86_SUB_RR; break;
-                case MASM_IR_MUL: opcode = MASM_OP_X86_IMUL_RR; break;
-                case MASM_IR_AND: opcode = MASM_OP_X86_AND_RR; break;
-                case MASM_IR_OR:  opcode = MASM_OP_X86_OR_RR; break;
-                case MASM_IR_XOR: opcode = MASM_OP_X86_XOR_RR; break;
-                default: break;
+            switch (op)
+            {
+            case MASM_IR_ADD:
+                opcode = MASM_OP_X86_ADD_RR;
+                break;
+            case MASM_IR_SUB:
+                opcode = MASM_OP_X86_SUB_RR;
+                break;
+            case MASM_IR_MUL:
+                opcode = MASM_OP_X86_IMUL_RR;
+                break;
+            case MASM_IR_AND:
+                opcode = MASM_OP_X86_AND_RR;
+                break;
+            case MASM_IR_OR:
+                opcode = MASM_OP_X86_OR_RR;
+                break;
+            case MASM_IR_XOR:
+                opcode = MASM_OP_X86_XOR_RR;
+                break;
+            default:
+                break;
             }
             MasmOperand src = masm_x86_reg(b.reg.id, b.reg.size);
             emit_inst(sec, masm_x86_inst_2(opcode, rax, src));
@@ -429,19 +504,33 @@ static void emit_binary_op_explicit(MasmSection *sec, CodeGenContext *ctx, MasmI
         MasmOperand mem = b;
         if (mem.mem.base.id >= VREG_START)
         {
-             load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_R11, 0);
-             mem.mem.base.id = MASM_X86_R11;
+            load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_R11, 0);
+            mem.mem.base.id = MASM_X86_R11;
         }
 
         uint32_t opcode = 0;
-        switch (op) {
-            case MASM_IR_ADD: opcode = MASM_OP_X86_ADD_RM; break;
-            case MASM_IR_SUB: opcode = MASM_OP_X86_SUB_RM; break;
-            case MASM_IR_MUL: opcode = MASM_OP_X86_IMUL_RM; break;
-            case MASM_IR_AND: opcode = MASM_OP_X86_AND_RM; break;
-            case MASM_IR_OR:  opcode = MASM_OP_X86_OR_RM; break;
-            case MASM_IR_XOR: opcode = MASM_OP_X86_XOR_RM; break;
-            default: break;
+        switch (op)
+        {
+        case MASM_IR_ADD:
+            opcode = MASM_OP_X86_ADD_RM;
+            break;
+        case MASM_IR_SUB:
+            opcode = MASM_OP_X86_SUB_RM;
+            break;
+        case MASM_IR_MUL:
+            opcode = MASM_OP_X86_IMUL_RM;
+            break;
+        case MASM_IR_AND:
+            opcode = MASM_OP_X86_AND_RM;
+            break;
+        case MASM_IR_OR:
+            opcode = MASM_OP_X86_OR_RM;
+            break;
+        case MASM_IR_XOR:
+            opcode = MASM_OP_X86_XOR_RM;
+            break;
+        default:
+            break;
         }
         emit_inst(sec, masm_x86_inst_2(opcode, rax, mem));
     }
@@ -459,8 +548,14 @@ static void emit_shift_explicit(MasmSection *sec, CodeGenContext *ctx, MasmInstr
     MasmOperand b   = inst->operands[2];
 
     uint8_t size = 8;
-    if (dst.kind == MASM_OPERAND_REGISTER) size = dst.reg.size;
-    else if (a.kind == MASM_OPERAND_REGISTER) size = a.reg.size;
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        size = dst.reg.size;
+    }
+    else if (a.kind == MASM_OPERAND_REGISTER)
+    {
+        size = a.reg.size;
+    }
 
     // Load a -> RAX
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
@@ -480,21 +575,37 @@ static void emit_shift_explicit(MasmSection *sec, CodeGenContext *ctx, MasmInstr
     uint32_t opcode = 0;
     if (use_imm)
     {
-        switch (op) {
-            case MASM_IR_SHL: opcode = MASM_OP_X86_SHL_RI; break;
-            case MASM_IR_SHR: opcode = MASM_OP_X86_SHR_RI; break;
-            case MASM_IR_SAR: opcode = MASM_OP_X86_SAR_RI; break;
-            default: break;
+        switch (op)
+        {
+        case MASM_IR_SHL:
+            opcode = MASM_OP_X86_SHL_RI;
+            break;
+        case MASM_IR_SHR:
+            opcode = MASM_OP_X86_SHR_RI;
+            break;
+        case MASM_IR_SAR:
+            opcode = MASM_OP_X86_SAR_RI;
+            break;
+        default:
+            break;
         }
         emit_inst(sec, masm_x86_inst_2(opcode, masm_x86_reg(MASM_X86_RAX, size), b));
     }
     else
     {
-        switch (op) {
-            case MASM_IR_SHL: opcode = MASM_OP_X86_SHL_RC; break;
-            case MASM_IR_SHR: opcode = MASM_OP_X86_SHR_RC; break;
-            case MASM_IR_SAR: opcode = MASM_OP_X86_SAR_RC; break;
-            default: break;
+        switch (op)
+        {
+        case MASM_IR_SHL:
+            opcode = MASM_OP_X86_SHL_RC;
+            break;
+        case MASM_IR_SHR:
+            opcode = MASM_OP_X86_SHR_RC;
+            break;
+        case MASM_IR_SAR:
+            opcode = MASM_OP_X86_SAR_RC;
+            break;
+        default:
+            break;
         }
         emit_inst(sec, masm_x86_inst_2(opcode, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, 1)));
     }
@@ -511,16 +622,28 @@ static void emit_unary_op_explicit(MasmSection *sec, CodeGenContext *ctx, MasmIn
     MasmOperand src = inst->operands[1];
 
     uint8_t size = 8;
-    if (dst.kind == MASM_OPERAND_REGISTER) size = dst.reg.size;
-    else if (src.kind == MASM_OPERAND_REGISTER) size = src.reg.size;
+    if (dst.kind == MASM_OPERAND_REGISTER)
+    {
+        size = dst.reg.size;
+    }
+    else if (src.kind == MASM_OPERAND_REGISTER)
+    {
+        size = src.reg.size;
+    }
 
     // Load src -> RAX
     load_operand(sec, ctx, src, MASM_X86_RAX, 0);
     MasmOperand rax = masm_x86_reg(MASM_X86_RAX, size);
 
     uint32_t opcode = 0;
-    if (op == MASM_IR_NEG) opcode = MASM_OP_X86_NEG_R;
-    else if (op == MASM_IR_NOT) opcode = MASM_OP_X86_NOT_R;
+    if (op == MASM_IR_NEG)
+    {
+        opcode = MASM_OP_X86_NEG_R;
+    }
+    else if (op == MASM_IR_NOT)
+    {
+        opcode = MASM_OP_X86_NOT_R;
+    }
 
     emit_inst(sec, masm_x86_inst_1(opcode, rax));
 
@@ -539,7 +662,7 @@ static void emit_float_op(MasmSection *sec, CodeGenContext *ctx, MasmInstruction
     // Load a -> XMM0
     if (a.kind == MASM_OPERAND_REGISTER)
     {
-        int32_t off = get_vreg_offset(ctx, a.reg.id);
+        int32_t     off = get_vreg_offset(ctx, a.reg.id);
         MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
         emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
     }
@@ -553,7 +676,7 @@ static void emit_float_op(MasmSection *sec, CodeGenContext *ctx, MasmInstruction
     // Load b -> XMM1
     if (b.kind == MASM_OPERAND_REGISTER)
     {
-        int32_t off = get_vreg_offset(ctx, b.reg.id);
+        int32_t     off = get_vreg_offset(ctx, b.reg.id);
         MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
         emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(1, 16), mem));
     }
@@ -570,7 +693,7 @@ static void emit_float_op(MasmSection *sec, CodeGenContext *ctx, MasmInstruction
     // Store XMM0 -> dst
     if (dst.kind == MASM_OPERAND_REGISTER)
     {
-        int32_t off = get_vreg_offset(ctx, dst.reg.id);
+        int32_t     off = get_vreg_offset(ctx, dst.reg.id);
         MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
         emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, mem, masm_operand_register(0, 16)));
     }
@@ -586,7 +709,7 @@ static void emit_float_cmp(MasmSection *sec, CodeGenContext *ctx, MasmInstructio
     // Load a -> XMM0
     if (a.kind == MASM_OPERAND_REGISTER)
     {
-        int32_t off = get_vreg_offset(ctx, a.reg.id);
+        int32_t     off = get_vreg_offset(ctx, a.reg.id);
         MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
         emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
     }
@@ -599,7 +722,7 @@ static void emit_float_cmp(MasmSection *sec, CodeGenContext *ctx, MasmInstructio
     // Load b -> XMM1
     if (b.kind == MASM_OPERAND_REGISTER)
     {
-        int32_t off = get_vreg_offset(ctx, b.reg.id);
+        int32_t     off = get_vreg_offset(ctx, b.reg.id);
         MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
         emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(1, 16), mem));
     }
@@ -615,18 +738,32 @@ static void emit_float_cmp(MasmSection *sec, CodeGenContext *ctx, MasmInstructio
     MasmX86Opcode setcc_op;
     switch (cond)
     {
-        case MASM_IR_FCMP_EQ: setcc_op = MASM_OP_X86_SETE; break;
-        case MASM_IR_FCMP_NE: setcc_op = MASM_OP_X86_SETNE; break;
-        case MASM_IR_FCMP_LT: setcc_op = MASM_OP_X86_SETB; break;
-        case MASM_IR_FCMP_LE: setcc_op = MASM_OP_X86_SETBE; break;
-        case MASM_IR_FCMP_GT: setcc_op = MASM_OP_X86_SETA; break;
-        case MASM_IR_FCMP_GE: setcc_op = MASM_OP_X86_SETAE; break;
-        default: setcc_op = MASM_OP_X86_SETE; break;
+    case MASM_IR_FCMP_EQ:
+        setcc_op = MASM_OP_X86_SETE;
+        break;
+    case MASM_IR_FCMP_NE:
+        setcc_op = MASM_OP_X86_SETNE;
+        break;
+    case MASM_IR_FCMP_LT:
+        setcc_op = MASM_OP_X86_SETB;
+        break;
+    case MASM_IR_FCMP_LE:
+        setcc_op = MASM_OP_X86_SETBE;
+        break;
+    case MASM_IR_FCMP_GT:
+        setcc_op = MASM_OP_X86_SETA;
+        break;
+    case MASM_IR_FCMP_GE:
+        setcc_op = MASM_OP_X86_SETAE;
+        break;
+    default:
+        setcc_op = MASM_OP_X86_SETE;
+        break;
     }
 
     // SetCC -> AL
     emit_inst(sec, masm_x86_inst_1(setcc_op, masm_x86_reg(MASM_X86_RAX, 1)));
-    
+
     // MOVZX RAX, AL
     emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVZX_RR, masm_x86_reg(MASM_X86_RAX, 8), masm_x86_reg(MASM_X86_RAX, 1)));
 
@@ -663,15 +800,18 @@ static void emit_mov(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
         if (src.kind == MASM_OPERAND_IMM)
         {
             bool fits = true;
-            if (dst.mem.size == 8 && (src.imm < -2147483648LL || src.imm > 2147483647LL)) fits = false;
+            if (dst.mem.size == 8 && (src.imm < -2147483648LL || src.imm > 2147483647LL))
+            {
+                fits = false;
+            }
 
             if (fits)
             {
                 MasmOperand mem = dst;
                 if (mem.mem.base.id >= VREG_START)
                 {
-                     load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
-                     mem.mem.base.id = MASM_X86_RCX;
+                    load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
+                    mem.mem.base.id = MASM_X86_RCX;
                 }
                 emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_MI, mem, src));
                 return;
@@ -680,15 +820,15 @@ static void emit_mov(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
 
         // Load src -> RAX
         load_operand(sec, ctx, src, MASM_X86_RAX, 0);
-        
+
         // Resolve dst address -> RCX (if needed)
         MasmOperand mem = dst;
         if (mem.mem.base.id >= VREG_START)
         {
-             load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
-             mem.mem.base.id = MASM_X86_RCX;
+            load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
+            mem.mem.base.id = MASM_X86_RCX;
         }
-        
+
         // MOV [mem], RAX
         MasmOperand r = masm_x86_reg(MASM_X86_RAX, mem.mem.size);
         emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_MR, mem, r));
@@ -698,33 +838,47 @@ static void emit_mov(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
 static void emit_load(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
 {
     // LOAD dst, mem, type
-    MasmOperand dst = inst->operands[0];
-    MasmOperand mem = inst->operands[1];
+    MasmOperand dst     = inst->operands[0];
+    MasmOperand mem     = inst->operands[1];
     MasmOperand type_op = inst->operands[2]; // MASM_OPERAND_TYPE
-    
-    // Determine opcode based on type
-    uint32_t opcode = MASM_OP_X86_MOV_RM;
-    if (type_op.type == MASM_TYPE_I8 || type_op.type == MASM_TYPE_I16) opcode = MASM_OP_X86_MOVSX_RM;
-    else if (type_op.type == MASM_TYPE_U8 || type_op.type == MASM_TYPE_U16) opcode = MASM_OP_X86_MOVZX_RM;
-    
+
+    // Determine opcode and load size based on type
+    uint32_t opcode    = MASM_OP_X86_MOV_RM;
+    uint8_t  load_size = 8; // default to 64-bit
+    if (type_op.type == MASM_TYPE_I8 || type_op.type == MASM_TYPE_I16)
+    {
+        opcode = MASM_OP_X86_MOVSX_RM;
+    }
+    else if (type_op.type == MASM_TYPE_U8 || type_op.type == MASM_TYPE_U16)
+    {
+        opcode = MASM_OP_X86_MOVZX_RM;
+    }
+    else if (type_op.type == MASM_TYPE_I32 || type_op.type == MASM_TYPE_U32)
+    {
+        load_size = 4; // 32-bit MOV zero-extends on x86_64
+    }
+
     if (dst.kind == MASM_OPERAND_REGISTER)
     {
         MasmX86Reg scratch = MASM_X86_R11;
-        if (dst.reg.id < VREG_START) scratch = (MasmX86Reg)dst.reg.id;
-        
+        if (dst.reg.id < VREG_START)
+        {
+            scratch = (MasmX86Reg)dst.reg.id;
+        }
+
         // Resolve mem base
         if (mem.mem.base.id >= VREG_START)
         {
             load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
             mem.mem.base.id = MASM_X86_RCX;
         }
-        
-        MasmOperand r = masm_x86_reg(scratch, 8); // dest reg
-        
-        // MOV RAX, [mem]
+
+        MasmOperand r = masm_x86_reg(scratch, load_size); // dest reg with proper size
+
+        // MOV reg, [mem] - for 32-bit loads, this auto zero-extends to 64-bit on x86_64
         emit_inst(sec, masm_x86_inst_2(opcode, r, mem));
-        
-        // Store RAX -> dst
+
+        // Store reg -> dst
         store_vreg(sec, ctx, dst.reg.id, scratch, dst.reg.size);
     }
 }
@@ -732,10 +886,10 @@ static void emit_load(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
 static void emit_store(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
 {
     // STORE mem, src, size
-    MasmOperand mem = inst->operands[0];
-    MasmOperand src = inst->operands[1];
+    MasmOperand mem   = inst->operands[0];
+    MasmOperand src   = inst->operands[1];
     MasmOperand sz_op = inst->operands[2];
-    uint8_t size = (uint8_t)sz_op.imm;
+    uint8_t     size  = (uint8_t)sz_op.imm;
 
     if (src.kind == MASM_OPERAND_REGISTER && src.reg.class == MASM_REG_CLASS_FLOAT)
     {
@@ -744,7 +898,7 @@ static void emit_store(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
         if (src.reg.id >= VREG_START)
         {
             // Load vreg -> XMM0
-            int32_t off = get_vreg_offset(ctx, src.reg.id);
+            int32_t     off     = get_vreg_offset(ctx, src.reg.id);
             MasmOperand src_mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, xmm_src, src_mem));
         }
@@ -769,14 +923,14 @@ static void emit_store(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
 
     // Load src -> RAX
     load_operand(sec, ctx, src, MASM_X86_RAX, 0);
-    
+
     // Resolve mem base
     if (mem.mem.base.id >= VREG_START)
     {
         load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
         mem.mem.base.id = MASM_X86_RCX;
     }
-    
+
     // MOV [mem], RAX
     MasmOperand r = masm_x86_reg(MASM_X86_RAX, size);
     emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_MR, mem, r));
@@ -786,10 +940,10 @@ static void emit_lea(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
 {
     MasmOperand dst = inst->operands[0];
     MasmOperand src = inst->operands[1];
-    
+
     // Load effective address of src -> RAX
     load_operand(sec, ctx, src, MASM_X86_RAX, 1); // mode=1 for LEA
-    
+
     // Store RAX -> dst
     store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
 }
@@ -801,7 +955,7 @@ static void emit_stack_frame(MasmSection *sec, CodeGenContext *ctx)
     emit_inst(sec, masm_x86_inst_1(MASM_OP_X86_PUSH_R, masm_x86_reg(MASM_X86_RBP, 8)));
     // mov rbp, rsp
     emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RR, masm_x86_reg(MASM_X86_RBP, 8), masm_x86_reg(MASM_X86_RSP, 8)));
-    
+
     // sub rsp, total_size
     if (ctx->total_stack_size > 0)
     {
@@ -814,15 +968,15 @@ static void emit_ret(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
     // Optional: Load return value to RAX/XMM0 if present
     if (inst->operand_count > 0 && inst->operands[0].kind != MASM_OPERAND_NONE)
     {
-        MasmOperand ret_op = inst->operands[0];
-        bool is_float = (ret_op.kind == MASM_OPERAND_REGISTER) && (ret_op.reg.class == MASM_REG_CLASS_FLOAT);
+        MasmOperand ret_op   = inst->operands[0];
+        bool        is_float = (ret_op.kind == MASM_OPERAND_REGISTER) && (ret_op.reg.class == MASM_REG_CLASS_FLOAT);
 
         if (is_float)
         {
             // Load ret_op -> XMM0
             if (ret_op.kind == MASM_OPERAND_REGISTER)
             {
-                int32_t off = get_vreg_offset(ctx, ret_op.reg.id);
+                int32_t     off = get_vreg_offset(ctx, ret_op.reg.id);
                 MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
                 emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
             }
@@ -845,48 +999,55 @@ static void emit_ret(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
 static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
 {
     // CALL dest, target, args...
-    MasmOperand dst = inst->operands[0];
-    MasmOperand tgt = inst->operands[1];
-    int arg_count = inst->operand_count - 2;
-    
-    MasmX86Reg int_regs[] = {MASM_X86_RDI, MASM_X86_RSI, MASM_X86_RDX, MASM_X86_RCX, MASM_X86_R8, MASM_X86_R9};
-    int int_count = 6;
-    int xmm_count = 8;
+    MasmOperand dst       = inst->operands[0];
+    MasmOperand tgt       = inst->operands[1];
+    int         arg_count = inst->operand_count - 2;
 
-    struct ArgLoc {
+    MasmX86Reg int_regs[] = {MASM_X86_RDI, MASM_X86_RSI, MASM_X86_RDX, MASM_X86_RCX, MASM_X86_R8, MASM_X86_R9};
+    int        int_count  = 6;
+    int        xmm_count  = 8;
+
+    struct ArgLoc
+    {
         bool is_stack;
         bool is_float;
         int  reg_idx;
     };
-    
-    struct ArgLoc *locs = malloc(sizeof(struct ArgLoc) * arg_count);
-    int int_used = 0;
-    int xmm_used = 0;
-    int stack_count = 0;
+
+    struct ArgLoc *locs        = malloc(sizeof(struct ArgLoc) * arg_count);
+    int            int_used    = 0;
+    int            xmm_used    = 0;
+    int            stack_count = 0;
 
     // Classify args
     for (int i = 0; i < arg_count; i++)
     {
-        MasmOperand op = inst->operands[2 + i];
-        bool is_float = (op.kind == MASM_OPERAND_REGISTER) && (op.reg.class == MASM_REG_CLASS_FLOAT);
-        locs[i].is_float = is_float;
+        MasmOperand op       = inst->operands[2 + i];
+        bool        is_float = (op.kind == MASM_OPERAND_REGISTER) && (op.reg.class == MASM_REG_CLASS_FLOAT);
+        locs[i].is_float     = is_float;
 
         if (is_float)
         {
-            if (xmm_used < xmm_count) {
+            if (xmm_used < xmm_count)
+            {
                 locs[i].is_stack = false;
-                locs[i].reg_idx = xmm_used++;
-            } else {
+                locs[i].reg_idx  = xmm_used++;
+            }
+            else
+            {
                 locs[i].is_stack = true;
                 stack_count++;
             }
         }
         else
         {
-            if (int_used < int_count) {
+            if (int_used < int_count)
+            {
                 locs[i].is_stack = false;
-                locs[i].reg_idx = int_used++;
-            } else {
+                locs[i].reg_idx  = int_used++;
+            }
+            else
+            {
                 locs[i].is_stack = true;
                 stack_count++;
             }
@@ -924,7 +1085,7 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
                 MasmOperand xmm_dest = masm_operand_register(locs[i].reg_idx, 16);
                 if (op.kind == MASM_OPERAND_REGISTER)
                 {
-                    int32_t off = get_vreg_offset(ctx, op.reg.id);
+                    int32_t     off = get_vreg_offset(ctx, op.reg.id);
                     MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
                     emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, xmm_dest, mem));
                 }
@@ -935,7 +1096,7 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
             }
         }
     }
-    
+
     // Set AL = vector regs count (for varargs)
     emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RI, masm_x86_reg(MASM_X86_RAX, 1), masm_operand_imm(xmm_used > 8 ? 8 : xmm_used)));
 
@@ -956,7 +1117,7 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
     {
         emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_ADD_RI, masm_x86_reg(MASM_X86_RSP, 8), masm_operand_imm(total_stack_bytes)));
     }
-    
+
     // Store result RAX/XMM0 -> dst
     if (dst.kind != MASM_OPERAND_NONE)
     {
@@ -965,7 +1126,7 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
         if (is_float)
         {
             // Store XMM0 -> dst
-            int32_t off = get_vreg_offset(ctx, dst.reg.id);
+            int32_t     off = get_vreg_offset(ctx, dst.reg.id);
             MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, mem, masm_operand_register(0, 16)));
         }
@@ -974,7 +1135,7 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
             store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
         }
     }
-    
+
     free(locs);
 }
 
@@ -982,7 +1143,7 @@ static void emit_syscall(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
 {
     // SYSCALL dest, num, args...
     // Linux x86_64: RAX=sys_num, RDI, RSI, RDX, R10, R8, R9
-    // inst operands: dest, target(unused?), args... ? 
+    // inst operands: dest, target(unused?), args... ?
     // Wait, lower_call emits: dest, target(label "syscall"), args...
     // Actually lower_call for syscall emits: MASM_IR_SYSCALL dest, target, args...
     // But syscall number is usually an argument?
@@ -994,10 +1155,10 @@ static void emit_syscall(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
     // So operands[2] is first arg (syscall number?).
     // Let's assume: syscall(num, arg1, arg2...)
     // So arg[0] -> RAX, arg[1] -> RDI, etc.
-    
-    MasmOperand dst = (inst->operand_count > 0) ? inst->operands[0] : masm_operand_none();
-    int arg_count = (inst->operand_count >= 2) ? inst->operand_count - 2 : 0;
-    
+
+    MasmOperand dst       = (inst->operand_count > 0) ? inst->operands[0] : masm_operand_none();
+    int         arg_count = (inst->operand_count >= 2) ? inst->operand_count - 2 : 0;
+
     // Map args to Linux syscall ABI
     // Arg 0 (Syscall Num) -> RAX
     // Arg 1 -> RDI
@@ -1006,9 +1167,9 @@ static void emit_syscall(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
     // Arg 4 -> R10 (NOT RCX)
     // Arg 5 -> R8
     // Arg 6 -> R9
-    
+
     MasmX86Reg sys_regs[] = {MASM_X86_RAX, MASM_X86_RDI, MASM_X86_RSI, MASM_X86_RDX, MASM_X86_R10, MASM_X86_R8, MASM_X86_R9};
-    
+
     for (int i = 0; i < arg_count; i++)
     {
         if (i < 7)
@@ -1016,9 +1177,9 @@ static void emit_syscall(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
             load_operand(sec, ctx, inst->operands[2 + i], sys_regs[i], 0);
         }
     }
-    
+
     emit_inst(sec, masm_x86_inst_0(MASM_OP_X86_SYSCALL));
-    
+
     if (dst.kind != MASM_OPERAND_NONE)
     {
         store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
@@ -1027,17 +1188,17 @@ static void emit_syscall(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
 
 static void emit_fconv(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst)
 {
-    MasmOperand dst = inst->operands[0];
-    MasmOperand src = inst->operands[1];
-    int64_t mode    = inst->operands[2].imm;
+    MasmOperand dst  = inst->operands[0];
+    MasmOperand src  = inst->operands[1];
+    int64_t     mode = inst->operands[2].imm;
 
     if (mode == 0) // int -> float
     {
         // Load integer src -> RAX
         load_operand(sec, ctx, src, MASM_X86_RAX, 0);
 
-        uint32_t opcode = (dst.reg.size == 4) ? MASM_OP_X86_CVTSI2SS : MASM_OP_X86_CVTSI2SD;
-        uint8_t src_size = (src.kind == MASM_OPERAND_REGISTER) ? src.reg.size : 8;
+        uint32_t opcode   = (dst.reg.size == 4) ? MASM_OP_X86_CVTSI2SS : MASM_OP_X86_CVTSI2SD;
+        uint8_t  src_size = (src.kind == MASM_OPERAND_REGISTER) ? src.reg.size : 8;
 
         // cvtsi2sx xmm0, rax
         emit_inst(sec, masm_x86_inst_2(opcode, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, src_size)));
@@ -1045,7 +1206,7 @@ static void emit_fconv(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
         // Store float result -> dst
         if (dst.kind == MASM_OPERAND_REGISTER)
         {
-            int32_t off = get_vreg_offset(ctx, dst.reg.id);
+            int32_t     off = get_vreg_offset(ctx, dst.reg.id);
             MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, mem, masm_operand_register(0, 16)));
         }
@@ -1055,18 +1216,18 @@ static void emit_fconv(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
         // Load float src -> XMM0
         if (src.kind == MASM_OPERAND_REGISTER)
         {
-            int32_t off = get_vreg_offset(ctx, src.reg.id);
+            int32_t     off = get_vreg_offset(ctx, src.reg.id);
             MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
         }
         else if (src.kind == MASM_OPERAND_IMM)
         {
-             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RI, masm_x86_reg(MASM_X86_RAX, 8), src));
-             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, 8)));
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RI, masm_x86_reg(MASM_X86_RAX, 8), src));
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, 8)));
         }
 
-        uint8_t src_size = (src.kind == MASM_OPERAND_REGISTER) ? src.reg.size : 8;
-        uint32_t opcode = (src_size == 4) ? MASM_OP_X86_CVTTSS2SI : MASM_OP_X86_CVTTSD2SI;
+        uint8_t  src_size = (src.kind == MASM_OPERAND_REGISTER) ? src.reg.size : 8;
+        uint32_t opcode   = (src_size == 4) ? MASM_OP_X86_CVTTSS2SI : MASM_OP_X86_CVTTSD2SI;
 
         // cvttsx2si rax, xmm0
         emit_inst(sec, masm_x86_inst_2(opcode, masm_x86_reg(MASM_X86_RAX, dst.reg.size), masm_operand_register(0, 16)));
@@ -1079,30 +1240,36 @@ static void emit_fconv(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
         // Load float src -> XMM0
         if (src.kind == MASM_OPERAND_REGISTER)
         {
-            int32_t off = get_vreg_offset(ctx, src.reg.id);
+            int32_t     off = get_vreg_offset(ctx, src.reg.id);
             MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), mem));
         }
         else if (src.kind == MASM_OPERAND_IMM)
         {
-             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RI, masm_x86_reg(MASM_X86_RAX, 8), src));
-             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, 8)));
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RI, masm_x86_reg(MASM_X86_RAX, 8), src));
+            emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_operand_register(0, 16), masm_x86_reg(MASM_X86_RAX, 8)));
         }
-        
-        uint8_t src_size = (src.kind == MASM_OPERAND_REGISTER) ? src.reg.size : 8;
-        uint32_t opcode = 0;
-        if (src_size == 4 && dst.reg.size == 8) opcode = MASM_OP_X86_CVTSS2SD;
-        else if (src_size == 8 && dst.reg.size == 4) opcode = MASM_OP_X86_CVTSD2SS;
-        
+
+        uint8_t  src_size = (src.kind == MASM_OPERAND_REGISTER) ? src.reg.size : 8;
+        uint32_t opcode   = 0;
+        if (src_size == 4 && dst.reg.size == 8)
+        {
+            opcode = MASM_OP_X86_CVTSS2SD;
+        }
+        else if (src_size == 8 && dst.reg.size == 4)
+        {
+            opcode = MASM_OP_X86_CVTSD2SS;
+        }
+
         if (opcode != 0)
         {
             emit_inst(sec, masm_x86_inst_2(opcode, masm_operand_register(0, 16), masm_operand_register(0, 16)));
         }
-        
+
         // Store float result -> dst
         if (dst.kind == MASM_OPERAND_REGISTER)
         {
-            int32_t off = get_vreg_offset(ctx, dst.reg.id);
+            int32_t     off = get_vreg_offset(ctx, dst.reg.id);
             MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, mem, masm_operand_register(0, 16)));
         }
@@ -1111,13 +1278,19 @@ static void emit_fconv(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
 
 static void emit_cmp_branch(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst, uint32_t jcc_op)
 {
-    MasmOperand a = inst->operands[0];
-    MasmOperand b = inst->operands[1];
+    MasmOperand a     = inst->operands[0];
+    MasmOperand b     = inst->operands[1];
     MasmOperand label = inst->operands[2];
-    
+
     uint8_t size = 8;
-    if (a.kind == MASM_OPERAND_REGISTER) size = a.reg.size;
-    else if (b.kind == MASM_OPERAND_REGISTER) size = b.reg.size;
+    if (a.kind == MASM_OPERAND_REGISTER)
+    {
+        size = a.reg.size;
+    }
+    else if (b.kind == MASM_OPERAND_REGISTER)
+    {
+        size = b.reg.size;
+    }
 
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
 
@@ -1136,12 +1309,18 @@ static void emit_cmp_branch(MasmSection *sec, CodeGenContext *ctx, MasmInstructi
 static void emit_setcc(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *inst, uint32_t setcc_op)
 {
     MasmOperand dst = inst->operands[0];
-    MasmOperand a = inst->operands[1];
-    MasmOperand b = inst->operands[2];
-    
+    MasmOperand a   = inst->operands[1];
+    MasmOperand b   = inst->operands[2];
+
     uint8_t size = 8;
-    if (a.kind == MASM_OPERAND_REGISTER) size = a.reg.size;
-    else if (b.kind == MASM_OPERAND_REGISTER) size = b.reg.size;
+    if (a.kind == MASM_OPERAND_REGISTER)
+    {
+        size = a.reg.size;
+    }
+    else if (b.kind == MASM_OPERAND_REGISTER)
+    {
+        size = b.reg.size;
+    }
 
     load_operand(sec, ctx, a, MASM_X86_RAX, 0);
 
@@ -1154,11 +1333,11 @@ static void emit_setcc(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
         load_operand(sec, ctx, b, MASM_X86_RCX, 0);
         emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_CMP_RR, masm_x86_reg(MASM_X86_RAX, size), masm_x86_reg(MASM_X86_RCX, size)));
     }
-    
+
     MasmOperand al = masm_x86_reg(MASM_X86_RAX, 1);
     emit_inst(sec, masm_x86_inst_1(setcc_op, al));
     emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVZX_RR, masm_x86_reg(MASM_X86_RAX, 8), al)); // zero extend byte to 64
-    
+
     store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
 }
 
@@ -1174,7 +1353,10 @@ static void x86_64_codegen(Masm *masm)
     for (size_t i = 0; i < masm->section_count; ++i)
     {
         MasmSection *section = masm->sections[i];
-        if (section->kind != MASM_SECTION_TEXT) continue;
+        if (section->kind != MASM_SECTION_TEXT)
+        {
+            continue;
+        }
 
 #ifdef MASM_DEBUG
         fprintf(stderr, "[codegen] processing section %s (%zu insts)\n", section->name, section->inst_count);
@@ -1196,9 +1378,7 @@ static void x86_64_codegen(Masm *masm)
 
                 // Scan function body until next STACK_FRAME or end of section
                 size_t end = j + 1;
-                while (end < section->inst_count && 
-                       !(section->instructions[end].kind == MASM_OPCODE_IR && 
-                         section->instructions[end].opcode == MASM_IR_STACK_FRAME))
+                while (end < section->inst_count && !(section->instructions[end].kind == MASM_OPCODE_IR && section->instructions[end].opcode == MASM_IR_STACK_FRAME))
                 {
                     end++;
                 }
@@ -1215,57 +1395,143 @@ static void x86_64_codegen(Masm *masm)
             {
                 switch (inst->opcode)
                 {
-                case MASM_IR_MOV: emit_mov(out, &ctx, inst); break;
-                case MASM_IR_LOAD: emit_load(out, &ctx, inst); break;
-                case MASM_IR_STORE: emit_store(out, &ctx, inst); break;
-                case MASM_IR_LEA: emit_lea(out, &ctx, inst); break;
+                case MASM_IR_MOV:
+                    emit_mov(out, &ctx, inst);
+                    break;
+                case MASM_IR_LOAD:
+                    emit_load(out, &ctx, inst);
+                    break;
+                case MASM_IR_STORE:
+                    emit_store(out, &ctx, inst);
+                    break;
+                case MASM_IR_LEA:
+                    emit_lea(out, &ctx, inst);
+                    break;
 
-                case MASM_IR_ADD: emit_binary_op_explicit(out, &ctx, inst, MASM_IR_ADD); break;
-                case MASM_IR_SUB: emit_binary_op_explicit(out, &ctx, inst, MASM_IR_SUB); break;
-                case MASM_IR_MUL: emit_binary_op_explicit(out, &ctx, inst, MASM_IR_MUL); break;
-                case MASM_IR_AND: emit_binary_op_explicit(out, &ctx, inst, MASM_IR_AND); break;
-                case MASM_IR_OR: emit_binary_op_explicit(out, &ctx, inst, MASM_IR_OR); break;
-                case MASM_IR_XOR: emit_binary_op_explicit(out, &ctx, inst, MASM_IR_XOR); break;
+                case MASM_IR_ADD:
+                    emit_binary_op_explicit(out, &ctx, inst, MASM_IR_ADD);
+                    break;
+                case MASM_IR_SUB:
+                    emit_binary_op_explicit(out, &ctx, inst, MASM_IR_SUB);
+                    break;
+                case MASM_IR_MUL:
+                    emit_binary_op_explicit(out, &ctx, inst, MASM_IR_MUL);
+                    break;
+                case MASM_IR_AND:
+                    emit_binary_op_explicit(out, &ctx, inst, MASM_IR_AND);
+                    break;
+                case MASM_IR_OR:
+                    emit_binary_op_explicit(out, &ctx, inst, MASM_IR_OR);
+                    break;
+                case MASM_IR_XOR:
+                    emit_binary_op_explicit(out, &ctx, inst, MASM_IR_XOR);
+                    break;
 
-                case MASM_IR_DIV: emit_div_rem(out, &ctx, inst, true, false); break;
-                case MASM_IR_DIVU: emit_div_rem(out, &ctx, inst, false, false); break;
-                case MASM_IR_REM: emit_div_rem(out, &ctx, inst, true, true); break;
-                case MASM_IR_REMU: emit_div_rem(out, &ctx, inst, false, true); break;
+                case MASM_IR_DIV:
+                    emit_div_rem(out, &ctx, inst, true, false);
+                    break;
+                case MASM_IR_DIVU:
+                    emit_div_rem(out, &ctx, inst, false, false);
+                    break;
+                case MASM_IR_REM:
+                    emit_div_rem(out, &ctx, inst, true, true);
+                    break;
+                case MASM_IR_REMU:
+                    emit_div_rem(out, &ctx, inst, false, true);
+                    break;
 
-                case MASM_IR_NEG: emit_unary_op_explicit(out, &ctx, inst, MASM_IR_NEG); break;
-                case MASM_IR_NOT: emit_unary_op_explicit(out, &ctx, inst, MASM_IR_NOT); break;
+                case MASM_IR_NEG:
+                    emit_unary_op_explicit(out, &ctx, inst, MASM_IR_NEG);
+                    break;
+                case MASM_IR_NOT:
+                    emit_unary_op_explicit(out, &ctx, inst, MASM_IR_NOT);
+                    break;
 
-                case MASM_IR_SHL: emit_shift_explicit(out, &ctx, inst, MASM_IR_SHL); break;
-                case MASM_IR_SHR: emit_shift_explicit(out, &ctx, inst, MASM_IR_SHR); break;
-                case MASM_IR_SAR: emit_shift_explicit(out, &ctx, inst, MASM_IR_SAR); break;
+                case MASM_IR_SHL:
+                    emit_shift_explicit(out, &ctx, inst, MASM_IR_SHL);
+                    break;
+                case MASM_IR_SHR:
+                    emit_shift_explicit(out, &ctx, inst, MASM_IR_SHR);
+                    break;
+                case MASM_IR_SAR:
+                    emit_shift_explicit(out, &ctx, inst, MASM_IR_SAR);
+                    break;
 
-                case MASM_IR_FADD: emit_float_op(out, &ctx, inst, MASM_OP_X86_ADDSD); break;
-                case MASM_IR_FSUB: emit_float_op(out, &ctx, inst, MASM_OP_X86_SUBSD); break;
-                case MASM_IR_FMUL: emit_float_op(out, &ctx, inst, MASM_OP_X86_MULSD); break;
-                case MASM_IR_FDIV: emit_float_op(out, &ctx, inst, MASM_OP_X86_DIVSD); break;
-                case MASM_IR_FCMP: emit_float_cmp(out, &ctx, inst); break;
-                case MASM_IR_FCONV: emit_fconv(out, &ctx, inst); break;
+                case MASM_IR_FADD:
+                    emit_float_op(out, &ctx, inst, MASM_OP_X86_ADDSD);
+                    break;
+                case MASM_IR_FSUB:
+                    emit_float_op(out, &ctx, inst, MASM_OP_X86_SUBSD);
+                    break;
+                case MASM_IR_FMUL:
+                    emit_float_op(out, &ctx, inst, MASM_OP_X86_MULSD);
+                    break;
+                case MASM_IR_FDIV:
+                    emit_float_op(out, &ctx, inst, MASM_OP_X86_DIVSD);
+                    break;
+                case MASM_IR_FCMP:
+                    emit_float_cmp(out, &ctx, inst);
+                    break;
+                case MASM_IR_FCONV:
+                    emit_fconv(out, &ctx, inst);
+                    break;
 
-                case MASM_IR_SEQ: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETE); break;
-                case MASM_IR_SNE: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETNE); break;
-                case MASM_IR_SLT: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETL); break;
-                case MASM_IR_SGT: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETG); break;
-                case MASM_IR_SLE: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETLE); break;
-                case MASM_IR_SGE: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETGE); break;
-                case MASM_IR_SLTU: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETB); break;
-                case MASM_IR_SGTU: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETA); break;
-                case MASM_IR_SLEU: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETBE); break;
-                case MASM_IR_SGEU: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETAE); break;
+                case MASM_IR_SEQ:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETE);
+                    break;
+                case MASM_IR_SNE:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETNE);
+                    break;
+                case MASM_IR_SLT:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETL);
+                    break;
+                case MASM_IR_SGT:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETG);
+                    break;
+                case MASM_IR_SLE:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETLE);
+                    break;
+                case MASM_IR_SGE:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETGE);
+                    break;
+                case MASM_IR_SLTU:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETB);
+                    break;
+                case MASM_IR_SGTU:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETA);
+                    break;
+                case MASM_IR_SLEU:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETBE);
+                    break;
+                case MASM_IR_SGEU:
+                    emit_setcc(out, &ctx, inst, MASM_OP_X86_SETAE);
+                    break;
 
-                case MASM_IR_BEQ: emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JE); break;
-                case MASM_IR_BNE: emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JNE); break;
-                case MASM_IR_BLT: emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JL); break;
-                case MASM_IR_BGE: emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JGE); break;
+                case MASM_IR_BEQ:
+                    emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JE);
+                    break;
+                case MASM_IR_BNE:
+                    emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JNE);
+                    break;
+                case MASM_IR_BLT:
+                    emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JL);
+                    break;
+                case MASM_IR_BGE:
+                    emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JGE);
+                    break;
 
-                case MASM_IR_JMP: emit_inst(out, masm_x86_inst_1(MASM_OP_X86_JMP_REL, inst->operands[0])); break;
-                case MASM_IR_RET: emit_ret(out, &ctx, inst); break;
-                case MASM_IR_CALL: emit_call(out, &ctx, inst); break;
-                case MASM_IR_SYSCALL: emit_syscall(out, &ctx, inst); break;
+                case MASM_IR_JMP:
+                    emit_inst(out, masm_x86_inst_1(MASM_OP_X86_JMP_REL, inst->operands[0]));
+                    break;
+                case MASM_IR_RET:
+                    emit_ret(out, &ctx, inst);
+                    break;
+                case MASM_IR_CALL:
+                    emit_call(out, &ctx, inst);
+                    break;
+                case MASM_IR_SYSCALL:
+                    emit_syscall(out, &ctx, inst);
+                    break;
 
                 default:
                     // Unknown IR opcode - preserve as-is
@@ -1286,13 +1552,13 @@ static void x86_64_codegen(Masm *masm)
             masm_inst_destroy(section->instructions[k]);
         }
         free(section->instructions);
-        section->instructions = out->instructions;
-        section->inst_count   = out->inst_count;
+        section->instructions  = out->instructions;
+        section->inst_count    = out->inst_count;
         section->inst_capacity = out->inst_capacity;
-        
+
         // Prevent double free
         out->instructions = NULL;
-        out->inst_count = 0;
+        out->inst_count   = 0;
         masm_section_destroy(out);
 
         // Update symbol offsets
