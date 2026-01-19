@@ -672,7 +672,22 @@ static MasmOperand lower_unary_op(MasmSection *text, TokenKind op, MasmOperand o
     else if (op == TOKEN_MINUS)
     {
         // -x -> 0 - x (neg)
-        masm_section_append_inst(text, masm_inst_2(MASM_IR_NEG, res, operand));
+        bool is_float = type && type_is_fp_class(type);
+        if (is_float)
+        {
+            // float negation: 0.0 - x
+            MasmOperand zero = alloc_vreg_fp(ctx, size);
+            // Load 0.0 into zero register (bit pattern for 0.0 is all zeros)
+            masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, zero, masm_operand_imm(0)));
+            zero.reg.class = MASM_REG_CLASS_FLOAT;
+            operand.reg.class = MASM_REG_CLASS_FLOAT;
+            res.reg.class = MASM_REG_CLASS_FLOAT;
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_FSUB, res, zero, operand));
+        }
+        else
+        {
+            masm_section_append_inst(text, masm_inst_2(MASM_IR_NEG, res, operand));
+        }
     }
     else if (op == TOKEN_TILDE)
     {
@@ -706,6 +721,31 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     AstNode *func = expr->call_expr.func;
     AstList *args = expr->call_expr.args;
     int arg_count = args ? args->count : 0;
+
+    // Check if the callee returns a large aggregate requiring sret
+    bool caller_needs_sret = type_is_large_aggregate(expr->type, ctx->ptr_size);
+    int32_t sret_buf_offset = 0;
+    MasmOperand sret_ptr = masm_operand_none();
+
+    if (caller_needs_sret)
+    {
+        // Allocate stack space for the return value buffer in caller's frame
+        size_t ret_size = expr->type->size;
+        // Align to 8 bytes
+        ret_size = (ret_size + 7) & ~7;
+        ctx->stack_offset -= (int32_t)ret_size;
+        sret_buf_offset = ctx->stack_offset;
+
+        // Create the sret pointer (LEA of the buffer)
+        sret_ptr = alloc_vreg(ctx, ctx->ptr_size);
+        MasmOperand buf_mem = frame_mem(ctx, sret_buf_offset, ctx->ptr_size);
+        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, sret_ptr, buf_mem));
+
+#ifdef MASM_DEBUG
+        fprintf(stderr, "[lower_call] sret: allocated %zu bytes at rbp%+d for return type size=%zu\n",
+                ret_size, sret_buf_offset, expr->type->size);
+#endif
+    }
 
     // Resolve target
     MasmOperand target;
@@ -778,40 +818,74 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             }
             else
             {
-                op = ensure_in_reg(text, op, arg->type, ctx);
+                // For small aggregates (≤8 bytes), lower_expr returns an address (LEA).
+                // We need to load the actual value to pass it by value in a register.
+                bool is_small_aggregate = arg->type && 
+                    (arg->type->kind == TYPE_STRUCT || arg->type->kind == TYPE_UNION) &&
+                    arg->type->size > 0 && arg->type->size <= ctx->ptr_size;
+                
+                if (is_small_aggregate && op.kind == MASM_OPERAND_REGISTER)
+                {
+                    // op is a register holding the address; load the value from it
+                    MasmOperand addr_reg = op;
+                    MasmOperand val_reg = alloc_vreg(ctx, arg->type->size);
+                    MasmOperand mem = masm_operand_memory_simple(addr_reg.reg.id, 0, arg->type->size);
+                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(MASM_TYPE_U64)));
+                    op = val_reg;
+                }
+                else
+                {
+                    op = ensure_in_reg(text, op, arg->type, ctx);
+                }
             }
             op_args[i] = op;
         }
     }
 
-    // Result
-    int res_size = 0;
-    if (expr->type && expr->type->size > 0)
-    {
-        res_size = expr->type->size;
-    }
-
+    // Result handling
+    // For sret calls, the callee returns the sret pointer in RAX, but we already
+    // have our buffer address. We'll use a dummy result register and return our sret_ptr.
     MasmOperand res = masm_operand_none();
-    MasmOperand res_in_inst = res;
+    MasmOperand res_in_inst = masm_operand_none();
 
-    if (res_size > 0)
+    if (caller_needs_sret)
     {
+        // For sret, we use a dummy result (the callee returns sret ptr in RAX, but we ignore it)
+        res_in_inst = alloc_vreg(ctx, ctx->ptr_size);
+    }
+    else if (expr->type && expr->type->size > 0)
+    {
+        int res_size = expr->type->size;
         res = isa_result(ctx, res_size);
         res_in_inst = res;
-        if (expr->type && type_is_float(expr->type))
+        if (type_is_float(expr->type))
         {
             res_in_inst.reg.class = MASM_REG_CLASS_FLOAT;
         }
     }
 
-    // Emit MASM_IR_CALL dest, target, args...
-    int total_ops = 2 + arg_count;
+    // Build argument list: for sret, prepend sret pointer as arg0
+    int total_arg_count = caller_needs_sret ? (arg_count + 1) : arg_count;
+    int total_ops = 2 + total_arg_count;
     MasmOperand *ops = malloc(sizeof(MasmOperand) * total_ops);
     ops[0] = res_in_inst;
     ops[1] = target;
-    for (int i = 0; i < arg_count; ++i)
+
+    if (caller_needs_sret)
     {
-        ops[2 + i] = op_args[i];
+        // sret pointer is the first argument
+        ops[2] = sret_ptr;
+        for (int i = 0; i < arg_count; ++i)
+        {
+            ops[3 + i] = op_args[i];
+        }
+    }
+    else
+    {
+        for (int i = 0; i < arg_count; ++i)
+        {
+            ops[2 + i] = op_args[i];
+        }
     }
 
     bool is_syscall = false;
@@ -834,6 +908,12 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
     free(ops);
     if (op_args) free(op_args);
+
+    // For sret calls, return the buffer address (as a register containing the pointer)
+    if (caller_needs_sret)
+    {
+        return sret_ptr;
+    }
 
     return res;
 }
@@ -1646,7 +1726,25 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             }
             else
             {
-                ret_val = ensure_in_reg(text, ret_val, expr->type, ctx);
+                // For small aggregates (≤8 bytes), lower_expr returns an address (LEA).
+                // We need to load the actual value to return it in a register.
+                bool is_small_aggregate = expr->type && 
+                    (expr->type->kind == TYPE_STRUCT || expr->type->kind == TYPE_UNION) &&
+                    expr->type->size > 0 && expr->type->size <= ctx->ptr_size;
+                
+                if (is_small_aggregate && ret_val.kind == MASM_OPERAND_REGISTER)
+                {
+                    // ret_val is a register holding the address; load the value from it
+                    MasmOperand addr_reg = ret_val;
+                    MasmOperand val_reg = alloc_vreg(ctx, expr->type->size);
+                    MasmOperand mem = masm_operand_memory_simple(addr_reg.reg.id, 0, expr->type->size);
+                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(MASM_TYPE_U64)));
+                    ret_val = val_reg;
+                }
+                else
+                {
+                    ret_val = ensure_in_reg(text, ret_val, expr->type, ctx);
+                }
             }
         }
 
@@ -1741,17 +1839,20 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             MasmOperand value = lower_expr(masm, text, stmt->var_stmt.init, ctx);
 
-            bool is_aggregate = var_size > 8;
-            if (stmt->type && type_is_aggregate(stmt->type))
+            // Only use aggregate copy for LARGE aggregates (> 8 bytes).
+            // Small structs (≤8 bytes) are returned by value in a register,
+            // so we should store them directly like scalars.
+            bool is_large_aggregate = var_size > ctx->ptr_size;
+            if (stmt->type && type_is_large_aggregate(stmt->type, ctx->ptr_size))
             {
-                is_aggregate = true;
+                is_large_aggregate = true;
             }
-            else if (stmt->var_stmt.init->type && type_is_aggregate(stmt->var_stmt.init->type))
+            else if (stmt->var_stmt.init->type && type_is_large_aggregate(stmt->var_stmt.init->type, ctx->ptr_size))
             {
-                is_aggregate = true;
+                is_large_aggregate = true;
             }
 
-            if (is_aggregate)
+            if (is_large_aggregate)
             {
                 // Aggregate copy: normalize source to address, get dst address, copy bytes
                 MasmOperand src_ptr = isa_result(ctx, ctx->ptr_size);

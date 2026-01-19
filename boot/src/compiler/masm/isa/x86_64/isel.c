@@ -1194,9 +1194,11 @@ static void x86_64_codegen(Masm *masm)
             {
                 ctx_reset(&ctx);
 
-                // Scan function body
+                // Scan function body until next STACK_FRAME or end of section
                 size_t end = j + 1;
-                while (end < section->inst_count && !(section->instructions[end].kind == MASM_OPCODE_IR && section->instructions[end].opcode == MASM_IR_LABEL))
+                while (end < section->inst_count && 
+                       !(section->instructions[end].kind == MASM_OPCODE_IR && 
+                         section->instructions[end].opcode == MASM_IR_STACK_FRAME))
                 {
                     end++;
                 }
@@ -1250,6 +1252,10 @@ static void x86_64_codegen(Masm *masm)
                 case MASM_IR_SGT: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETG); break;
                 case MASM_IR_SLE: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETLE); break;
                 case MASM_IR_SGE: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETGE); break;
+                case MASM_IR_SLTU: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETB); break;
+                case MASM_IR_SGTU: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETA); break;
+                case MASM_IR_SLEU: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETBE); break;
+                case MASM_IR_SGEU: emit_setcc(out, &ctx, inst, MASM_OP_X86_SETAE); break;
 
                 case MASM_IR_BEQ: emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JE); break;
                 case MASM_IR_BNE: emit_cmp_branch(out, &ctx, inst, MASM_OP_X86_JNE); break;
