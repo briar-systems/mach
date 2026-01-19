@@ -396,6 +396,8 @@ Supported ISA names: `x86_64` (more planned).
 
 `masm` is allowed at both global and function scope, but is currently only lowered inside function bodies.
 
+See the [MASM documentation](masm/README.md) for a complete reference of portable IR opcodes and target-specific instruction sets.
+
 
 ## `test`
 

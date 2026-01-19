@@ -19,7 +19,7 @@ Advanced Features:
 - [Compiletime Systems](compiletime.md)
 
 Compiler Internals:
-- [MIR (Mid-level IR)](mir/README.md)
+- [MASM (Mach Assembly)](masm/README.md)
 
 Reference:
 - [Cheatsheet](cheatsheet.md)
