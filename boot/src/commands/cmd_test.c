@@ -921,10 +921,11 @@ int cmd_test_handle(int argc, char **argv)
         return 1;
     }
 
-    int  total_tests    = 0;
-    int  total_failures = 0;
-    int  total_modules  = 0;
-    bool had_error      = false;
+    int  total_tests      = 0;
+    int  total_failures   = 0;
+    int  total_modules    = 0;
+    int  compile_errors   = 0;
+    bool had_error        = false;
 
     for (int i = 0; files[i]; i++)
     {
@@ -978,6 +979,7 @@ int cmd_test_handle(int argc, char **argv)
             free(source);
             free(module_path);
             had_error = true;
+            compile_errors++;
             continue;
         }
 
@@ -998,11 +1000,9 @@ int cmd_test_handle(int argc, char **argv)
             free(source);
             free(module_path);
             had_error = true;
+            compile_errors++;
             continue;
         }
-
-        total_modules++;
-        total_tests += test_count;
 
         Sema *sema = sema_create(module_path);
         if (!sema)
@@ -1034,6 +1034,7 @@ int cmd_test_handle(int argc, char **argv)
             free(source);
             free(module_path);
             had_error = true;
+            compile_errors++;
             continue;
         }
 
@@ -1047,6 +1048,7 @@ int cmd_test_handle(int argc, char **argv)
             free(source);
             free(module_path);
             had_error = true;
+            compile_errors++;
             continue;
         }
 
@@ -1073,6 +1075,7 @@ int cmd_test_handle(int argc, char **argv)
             free(source);
             free(module_path);
             had_error = true;
+            compile_errors++;
             continue;
         }
 
@@ -1097,6 +1100,7 @@ int cmd_test_handle(int argc, char **argv)
             free(source);
             free(module_path);
             had_error = true;
+            compile_errors++;
             continue;
         }
 
@@ -1112,6 +1116,7 @@ int cmd_test_handle(int argc, char **argv)
             free(source);
             free(module_path);
             had_error = true;
+            compile_errors++;
             continue;
         }
 
@@ -1130,12 +1135,16 @@ int cmd_test_handle(int argc, char **argv)
             free(source);
             free(module_path);
             had_error = true;
+            compile_errors++;
             continue;
         }
 
         char chmod_cmd[4096];
         snprintf(chmod_cmd, sizeof(chmod_cmd), "chmod +x %s 2>/dev/null", output_path);
         (void)system(chmod_cmd);
+
+        total_modules++;
+        total_tests += test_count;
 
         printf("[test] %s (%d)\n", module_path, test_count);
         int exit_code = process_execute(output_path);
@@ -1186,8 +1195,15 @@ int cmd_test_handle(int argc, char **argv)
         return 0;
     }
 
-    printf("tests: %d, failures: %d\n", total_tests, total_failures);
-    if (total_failures != 0)
+    if (compile_errors > 0)
+    {
+        printf("tests: %d, failures: %d, compile errors: %d\n", total_tests, total_failures, compile_errors);
+    }
+    else
+    {
+        printf("tests: %d, failures: %d\n", total_tests, total_failures);
+    }
+    if (total_failures != 0 || compile_errors != 0)
     {
         return 1;
     }

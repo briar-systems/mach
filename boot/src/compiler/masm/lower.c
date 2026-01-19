@@ -337,6 +337,72 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 static void        lower_inline_masm(Masm *masm, MasmSection *text, const char *content, LowerContext *ctx);
 static MasmOperand parse_operand(const char *str, LowerContext *ctx);
 
+// helper for va_arg: emits the stack overflow path (shared between GP and FP)
+static void emit_va_arg_stack_path(MasmSection *text, LowerContext *ctx, MasmOperand ap, MasmOperand result, size_t arg_size, MasmTypeKind load_type)
+{
+    MasmOperand overflow     = alloc_vreg(ctx, ctx->ptr_size);
+    MasmOperand overflow_mem = masm_operand_memory_simple(ap.reg.id, 8, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, overflow, overflow_mem, masm_operand_type(MASM_TYPE_U64)));
+
+    MasmOperand stack_val_mem = masm_operand_memory_simple(overflow.reg.id, 0, arg_size);
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, result, stack_val_mem, masm_operand_type(load_type)));
+
+    // increment overflow_arg_area by 8
+    MasmOperand new_overflow = alloc_vreg(ctx, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_ADD, new_overflow, overflow, masm_operand_imm(8)));
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, overflow_mem, new_overflow, masm_operand_imm(ctx->ptr_size)));
+}
+
+// helper for va_arg: emits the full reg/stack branching logic
+// offset_field: 0 for gp_offset, 4 for fp_offset
+// threshold: 48 for GP (6*8), 176 for FP (48 + 8*16)
+// increment: 8 for GP, 16 for FP
+static void emit_va_arg_load(Masm *masm, MasmSection *text, LowerContext *ctx, MasmOperand ap, MasmOperand result, size_t arg_size, bool is_fp, const char *stack_label, const char *done_label)
+{
+    int          offset_field = is_fp ? 4 : 0;
+    int          threshold    = is_fp ? 176 : 48;
+    int          increment    = is_fp ? 16 : 8;
+    MasmTypeKind load_type    = is_fp ? (arg_size == 4 ? MASM_TYPE_F32 : MASM_TYPE_F64) : MASM_TYPE_U64;
+
+    // load offset value (32-bit, auto zero-extends to 64-bit on x86_64)
+    MasmOperand off_64  = alloc_vreg(ctx, ctx->ptr_size);
+    MasmOperand off_mem = masm_operand_memory_simple(ap.reg.id, offset_field, 4);
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, off_64, off_mem, masm_operand_type(MASM_TYPE_U32)));
+
+    // compare offset < threshold
+    MasmOperand cmp_result = alloc_vreg(ctx, 1);
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_SLTU, cmp_result, off_64, masm_operand_imm(threshold)));
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cmp_result, masm_operand_imm(0), masm_operand_label(stack_label)));
+
+    // reg path: load from reg_save_area + offset
+    MasmOperand regsave     = alloc_vreg(ctx, ctx->ptr_size);
+    MasmOperand regsave_mem = masm_operand_memory_simple(ap.reg.id, 16, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, regsave, regsave_mem, masm_operand_type(MASM_TYPE_U64)));
+
+    MasmOperand addr = alloc_vreg(ctx, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_ADD, addr, regsave, off_64));
+
+    MasmOperand val_mem = masm_operand_memory_simple(addr.reg.id, 0, arg_size);
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, result, val_mem, masm_operand_type(load_type)));
+
+    // increment offset
+    MasmOperand new_off = alloc_vreg(ctx, ctx->ptr_size);
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_ADD, new_off, off_64, masm_operand_imm(increment)));
+    masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, off_mem, new_off, masm_operand_imm(4)));
+
+    masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(done_label)));
+
+    // stack path
+    masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(stack_label)));
+    masm_add_symbol(masm, masm_symbol_create(stack_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+
+    emit_va_arg_stack_path(text, ctx, ap, result, arg_size, load_type);
+
+    // done label
+    masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(done_label)));
+    masm_add_symbol(masm, masm_symbol_create(done_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
+}
+
 static void push_deferred(LowerContext *ctx, AstNode *stmt)
 {
     if (ctx->deferred_count >= ctx->deferred_capacity)
@@ -874,108 +940,7 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
             MasmOperand result = is_fp ? alloc_vreg_fp(ctx, arg_size) : alloc_vreg(ctx, arg_size);
 
-            if (is_fp)
-            {
-                // FP path: check fp_offset < 176 (48 + 8*16)
-                // Load 32-bit value - on x86_64, 32-bit MOV auto zero-extends to 64-bit
-                MasmOperand fp_off_64  = alloc_vreg(ctx, ctx->ptr_size);
-                MasmOperand fp_off_mem = masm_operand_memory_simple(ap.reg.id, 4, 4);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, fp_off_64, fp_off_mem, masm_operand_type(MASM_TYPE_U32)));
-
-                // compare fp_offset < 176
-                MasmOperand cmp_result = alloc_vreg(ctx, 1);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_SLTU, cmp_result, fp_off_64, masm_operand_imm(176)));
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cmp_result, masm_operand_imm(0), masm_operand_label(stack_label)));
-
-                // reg path: load from reg_save_area + fp_offset
-                MasmOperand regsave     = alloc_vreg(ctx, ctx->ptr_size);
-                MasmOperand regsave_mem = masm_operand_memory_simple(ap.reg.id, 16, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, regsave, regsave_mem, masm_operand_type(MASM_TYPE_U64)));
-
-                MasmOperand addr = alloc_vreg(ctx, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_ADD, addr, regsave, fp_off_64));
-
-                MasmOperand val_mem = masm_operand_memory_simple(addr.reg.id, 0, arg_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, result, val_mem, masm_operand_type(arg_size == 4 ? MASM_TYPE_F32 : MASM_TYPE_F64)));
-
-                // increment fp_offset by 16
-                MasmOperand new_fp_off = alloc_vreg(ctx, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_ADD, new_fp_off, fp_off_64, masm_operand_imm(16)));
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, fp_off_mem, new_fp_off, masm_operand_imm(4)));
-
-                masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(done_label)));
-
-                // stack path
-                masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(stack_label)));
-                masm_add_symbol(masm, masm_symbol_create(stack_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
-
-                MasmOperand overflow     = alloc_vreg(ctx, ctx->ptr_size);
-                MasmOperand overflow_mem = masm_operand_memory_simple(ap.reg.id, 8, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, overflow, overflow_mem, masm_operand_type(MASM_TYPE_U64)));
-
-                MasmOperand stack_val_mem = masm_operand_memory_simple(overflow.reg.id, 0, arg_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, result, stack_val_mem, masm_operand_type(arg_size == 4 ? MASM_TYPE_F32 : MASM_TYPE_F64)));
-
-                // increment overflow_arg_area by 8
-                MasmOperand new_overflow = alloc_vreg(ctx, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_ADD, new_overflow, overflow, masm_operand_imm(8)));
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, overflow_mem, new_overflow, masm_operand_imm(ctx->ptr_size)));
-
-                // done label
-                masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(done_label)));
-                masm_add_symbol(masm, masm_symbol_create(done_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
-            }
-            else
-            {
-                // GP path: check gp_offset < 48 (6 * 8)
-                // Load 32-bit value - on x86_64, 32-bit MOV auto zero-extends to 64-bit
-                MasmOperand gp_off_64  = alloc_vreg(ctx, ctx->ptr_size);
-                MasmOperand gp_off_mem = masm_operand_memory_simple(ap.reg.id, 0, 4);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, gp_off_64, gp_off_mem, masm_operand_type(MASM_TYPE_U32)));
-
-                // compare gp_offset < 48
-                MasmOperand cmp_result = alloc_vreg(ctx, 1);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_SLTU, cmp_result, gp_off_64, masm_operand_imm(48)));
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_BEQ, cmp_result, masm_operand_imm(0), masm_operand_label(stack_label)));
-
-                // reg path: load from reg_save_area + gp_offset
-                MasmOperand regsave     = alloc_vreg(ctx, ctx->ptr_size);
-                MasmOperand regsave_mem = masm_operand_memory_simple(ap.reg.id, 16, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, regsave, regsave_mem, masm_operand_type(MASM_TYPE_U64)));
-
-                MasmOperand addr = alloc_vreg(ctx, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_ADD, addr, regsave, gp_off_64));
-
-                MasmOperand val_mem = masm_operand_memory_simple(addr.reg.id, 0, arg_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, result, val_mem, masm_operand_type(MASM_TYPE_U64)));
-
-                // increment gp_offset by 8
-                MasmOperand new_gp_off = alloc_vreg(ctx, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_ADD, new_gp_off, gp_off_64, masm_operand_imm(8)));
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, gp_off_mem, new_gp_off, masm_operand_imm(4)));
-
-                masm_section_append_inst(text, masm_inst_1(MASM_IR_JMP, masm_operand_label(done_label)));
-
-                // stack path
-                masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(stack_label)));
-                masm_add_symbol(masm, masm_symbol_create(stack_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
-
-                MasmOperand overflow     = alloc_vreg(ctx, ctx->ptr_size);
-                MasmOperand overflow_mem = masm_operand_memory_simple(ap.reg.id, 8, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, overflow, overflow_mem, masm_operand_type(MASM_TYPE_U64)));
-
-                MasmOperand stack_val_mem = masm_operand_memory_simple(overflow.reg.id, 0, arg_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, result, stack_val_mem, masm_operand_type(MASM_TYPE_U64)));
-
-                // increment overflow_arg_area by 8
-                MasmOperand new_overflow = alloc_vreg(ctx, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_ADD, new_overflow, overflow, masm_operand_imm(8)));
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, overflow_mem, new_overflow, masm_operand_imm(ctx->ptr_size)));
-
-                // done label
-                masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, masm_operand_label(done_label)));
-                masm_add_symbol(masm, masm_symbol_create(done_label, MASM_SYMBOL_LABEL, MASM_BIND_LOCAL));
-            }
+            emit_va_arg_load(masm, text, ctx, ap, result, arg_size, is_fp, stack_label, done_label);
 
 #ifdef MASM_DEBUG
             fprintf(stderr, "[va_arg] type_kind=%d, size=%zu, is_fp=%d\n", arg_type ? arg_type->kind : -1, arg_size, is_fp);
