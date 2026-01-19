@@ -2029,11 +2029,14 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             }
             else
             {
-                // For small aggregates (≤8 bytes), lower_expr returns an address (LEA).
-                // We need to load the actual value to return it in a register.
+                // For small aggregates (≤8 bytes), lower_expr returns an address (LEA)
+                // when the source is a local variable. We need to load the actual value
+                // to return it in a register.
+                // However, call expressions return the value directly in a register,
+                // so we must NOT dereference in that case.
                 bool is_small_aggregate = expr->type && (expr->type->kind == TYPE_STRUCT || expr->type->kind == TYPE_UNION) && expr->type->size > 0 && expr->type->size <= ctx->ptr_size;
 
-                if (is_small_aggregate && ret_val.kind == MASM_OPERAND_REGISTER)
+                if (is_small_aggregate && ret_val.kind == MASM_OPERAND_REGISTER && expr->kind != AST_EXPR_CALL)
                 {
                     // ret_val is a register holding the address; load the value from it
                     MasmOperand addr_reg = ret_val;
@@ -2042,10 +2045,11 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(MASM_TYPE_U64)));
                     ret_val = val_reg;
                 }
-                else
+                else if (!is_small_aggregate || ret_val.kind != MASM_OPERAND_REGISTER)
                 {
                     ret_val = ensure_in_reg(text, ret_val, expr->type, ctx);
                 }
+                // else: small aggregate from call expression - already a value in register, use as-is
             }
         }
 
@@ -3090,8 +3094,9 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
     MasmTarget target = masm_target_native();
     Masm      *masm   = masm_create(target);
 
-    // module-level counters that persist across all function lowering
-    ModuleCounters counters = {0, 0, 0};
+    // global counters that persist across all modules to avoid label collisions
+    // when multiple modules are merged together
+    static ModuleCounters counters = {0, 0, 0};
 
     // track lowered function names to avoid duplicate emission when also lowering
     // instantiated generic functions that are not present in the original AST.
