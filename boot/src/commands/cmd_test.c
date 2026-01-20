@@ -627,17 +627,21 @@ static int transform_tests(AstNode *program, const char *module_path, TestInfo *
         return 0;
     }
 
-    if (program_has_fun_name(program, "_start") || program_has_fun_name(program, "__mach_test_main") || program_has_fun_name(program, "__mach_test_write"))
-    {
-        fprintf(stderr, "error: test harness symbol name conflicts with existing function\n");
-        return -1;
-    }
-
+    // collect tests first - skip files with no tests before checking for conflicts
     TestInfo *tests      = NULL;
     int       test_count = collect_tests(program, &tests);
     if (test_count <= 0)
     {
         return 0;
+    }
+
+    // only check for harness-internal symbol conflicts if file actually has tests
+    // note: _start check removed since runtime modules legitimately define it
+    if (program_has_fun_name(program, "__mach_test_main") || program_has_fun_name(program, "__mach_test_write"))
+    {
+        fprintf(stderr, "error: test harness symbol name conflicts with existing function\n");
+        free(tests);
+        return -1;
     }
 
     AstList *new_stmts = make_list();
@@ -773,6 +777,19 @@ static char *build_test_output_path(const char *project_root, Config *config, Co
     {
         *dot = '\0';
     }
+
+    // append _test suffix to avoid collisions between files and directories
+    // e.g., allocator.mach -> allocator_test (won't conflict with allocator/ directory)
+    size_t rel_len  = strlen(rel_path);
+    char  *suffixed = malloc(rel_len + 6); // "_test" + null
+    if (!suffixed)
+    {
+        free(rel_path);
+        return NULL;
+    }
+    snprintf(suffixed, rel_len + 6, "%s_test", rel_path);
+    free(rel_path);
+    rel_path = suffixed;
 
     char *out_root   = path_join(project_root, config->dir_out);
     char *out_target = path_join(out_root, target->artifacts);
@@ -921,11 +938,11 @@ int cmd_test_handle(int argc, char **argv)
         return 1;
     }
 
-    int  total_tests      = 0;
-    int  total_failures   = 0;
-    int  total_modules    = 0;
-    int  compile_errors   = 0;
-    bool had_error        = false;
+    int  total_tests    = 0;
+    int  total_failures = 0;
+    int  total_modules  = 0;
+    int  compile_errors = 0;
+    bool had_error      = false;
 
     for (int i = 0; files[i]; i++)
     {

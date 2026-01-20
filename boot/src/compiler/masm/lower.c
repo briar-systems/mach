@@ -233,15 +233,15 @@ static inline void emit_aggregate_copy(MasmSection *text, LowerContext *ctx, Mas
     for (int32_t off = 0; off < (int32_t)size;)
     {
         int32_t chunk = (int32_t)size - off;
-        if (chunk > 8)
+        if (chunk >= 8)
         {
             chunk = 8;
         }
-        else if (chunk > 4)
+        else if (chunk >= 4)
         {
             chunk = 4;
         }
-        else if (chunk > 2)
+        else if (chunk >= 2)
         {
             chunk = 2;
         }
@@ -440,14 +440,14 @@ static void pop_loop_defer_mark(LowerContext *ctx)
     }
 }
 
-static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, uint8_t size)
+static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, int size)
 {
     if (ctx->var_count >= ctx->var_capacity)
     {
         ctx->var_capacity *= 2;
         ctx->vars = realloc(ctx->vars, sizeof(LocalVar) * ctx->var_capacity);
     }
-    ctx->vars[ctx->var_count].name   = strdup(name);
+    ctx->vars[ctx->var_count].name   = name;
     ctx->vars[ctx->var_count].offset = offset;
     ctx->vars[ctx->var_count].size   = size;
     ctx->var_count++;
@@ -457,7 +457,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
 static LocalVar *find_local_var(LowerContext *ctx, const char *name)
 {
-    for (int i = 0; i < ctx->var_count; i++)
+    // search from end to find most recent declaration (handles loop re-declarations)
+    for (int i = ctx->var_count - 1; i >= 0; i--)
     {
         if (strcmp(ctx->vars[i].name, name) == 0)
         {
@@ -793,8 +794,39 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
         if (var)
         {
             MasmOperand val = lower_expr(masm, text, rhs, ctx);
-            MasmOperand dst = frame_mem(ctx, var->offset, var->size);
-            masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, val, masm_operand_imm(var->size)));
+            
+            // For aggregate types (structs, unions, arrays), use memory copy
+            if (type_is_aggregate(lhs->type) || var->size > ctx->ptr_size)
+            {
+                MasmOperand dst_ptr = isa_result(ctx, ctx->ptr_size);
+                MasmOperand dst_addr = frame_mem(ctx, var->offset, ctx->ptr_size);
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, dst_ptr, dst_addr));
+                
+                MasmOperand src_ptr = isa_tmp(ctx, ctx->ptr_size);
+                if (val.kind == MASM_OPERAND_MEMORY)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, src_ptr, val));
+                }
+                else if (val.kind == MASM_OPERAND_REGISTER)
+                {
+                    // val is already a pointer in a register
+                    if (val.reg.id != src_ptr.reg.id)
+                    {
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+                    }
+                }
+                else
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+                }
+                
+                emit_aggregate_copy(text, ctx, dst_ptr, src_ptr, (size_t)var->size);
+            }
+            else
+            {
+                MasmOperand dst = frame_mem(ctx, var->offset, var->size);
+                masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, val, masm_operand_imm(var->size)));
+            }
             return val;
         }
         else
@@ -2229,6 +2261,12 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
 
             if (needs_aggregate_copy)
             {
+#ifdef MASM_DEBUG
+                fprintf(stderr, "[lower_stmt] VAR/VAL aggregate copy: var=%s, var_size=%zu, init_type=%p (size=%zu)\n",
+                        stmt->var_stmt.name, var_size,
+                        (void *)stmt->var_stmt.init->type,
+                        stmt->var_stmt.init->type ? stmt->var_stmt.init->type->size : 0);
+#endif
                 // Aggregate copy: normalize source to address, get dst address, copy bytes
                 MasmOperand src_ptr = isa_result(ctx, ctx->ptr_size);
                 if (value.kind == MASM_OPERAND_REGISTER)
@@ -3000,6 +3038,9 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
     }
 
     // handle parameters (skip for _start)
+    // Two-pass approach: first save all scalar/fp params from registers to frame slots,
+    // then do aggregate copies. This prevents aggregate copy loops from clobbering
+    // registers that still hold unsaved scalar parameters.
     if (!is_entry && func_node->fun_stmt.params)
     {
         int gp_i    = arg_shift;
@@ -3007,6 +3048,13 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
         int stack_i = 0;
 
         AstList *params = func_node->fun_stmt.params;
+
+        // First, compute offsets and allocate stack space for all parameters
+        int32_t *param_offsets = malloc(sizeof(int32_t) * params->count);
+        size_t  *param_sizes   = malloc(sizeof(size_t) * params->count);
+        bool    *param_byval   = malloc(sizeof(bool) * params->count);
+        bool    *param_fp      = malloc(sizeof(bool) * params->count);
+
         for (int i = 0; i < params->count; i++)
         {
             AstNode *param      = params->items[i];
@@ -3039,10 +3087,26 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
             ctx->stack_offset -= (int32_t)alloc_size;
             int32_t offset = ctx->stack_offset;
 
+            param_offsets[i] = offset;
+            param_sizes[i]   = param_size;
+            param_byval[i]   = byval_ptr;
+            param_fp[i]      = is_fp;
+
             // add to symbol table with its logical size
             add_local_var(ctx, param->param_stmt.name, offset, (int)param_size);
+        }
 
-            // load from ABI arg location
+        // Pass 1: Save all scalar and FP parameters from registers to frame slots FIRST
+        // This ensures argument registers are preserved before any aggregate copies
+        for (int i = 0; i < params->count; i++)
+        {
+            AstNode *param      = params->items[i];
+            Type    *ptype      = param ? param->type : NULL;
+            int32_t  offset     = param_offsets[i];
+            size_t   param_size = param_sizes[i];
+            bool     byval_ptr  = param_byval[i];
+            bool     is_fp      = param_fp[i];
+
             if (!byval_ptr && is_fp)
             {
                 uint8_t     store_size = type_fp_size(ptype);
@@ -3052,7 +3116,6 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
                 {
                     uint32_t    xmm_id = ctx->abi->float_arg_regs[fp_i++];
                     MasmOperand src    = masm_operand_register_fp(xmm_id, store_size);
-                    // store directly to stack
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, src, masm_operand_imm(store_size)));
                 }
                 else
@@ -3081,9 +3144,57 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
                     MasmOperand src_mem            = frame_mem(ctx, stack_param_offset, ctx->ptr_size);
                     MasmOperand tmp                = alloc_vreg(ctx, ctx->ptr_size);
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src_mem, masm_operand_type(MASM_TYPE_U64)));
-
-                    // We might need to truncate if store_size < ptr_size, IR STORE handles size
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, tmp, masm_operand_imm(store_size)));
+                }
+            }
+            else
+            {
+                // byval_ptr: just consume the register slot, actual copy done in pass 2
+                if (gp_i < ctx->int_arg_count)
+                {
+                    gp_i++;
+                }
+                else
+                {
+                    stack_i++;
+                }
+            }
+        }
+
+        // Pass 2: Now do aggregate copies - all scalar params are safely stored
+        gp_i    = arg_shift;
+        fp_i    = 0;
+        stack_i = 0;
+
+        for (int i = 0; i < params->count; i++)
+        {
+            int32_t  offset     = param_offsets[i];
+            size_t   param_size = param_sizes[i];
+            bool     byval_ptr  = param_byval[i];
+            bool     is_fp      = param_fp[i];
+
+            if (!byval_ptr && is_fp)
+            {
+                // already handled in pass 1, just advance register index
+                if (fp_i < ctx->float_arg_count)
+                {
+                    fp_i++;
+                }
+                else
+                {
+                    stack_i++;
+                }
+            }
+            else if (!byval_ptr)
+            {
+                // already handled in pass 1, just advance register index
+                if (gp_i < ctx->int_arg_count)
+                {
+                    gp_i++;
+                }
+                else
+                {
+                    stack_i++;
                 }
             }
             else
@@ -3123,6 +3234,11 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
                 }
             }
         }
+
+        free(param_offsets);
+        free(param_sizes);
+        free(param_byval);
+        free(param_fp);
 
         // if variadic, record named counts and save register-save area
         if (ctx->fn_is_variadic)
@@ -3185,7 +3301,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
     destroy_context(ctx);
 }
 
-static void lower_global_var(Masm *masm, AstNode *stmt);
+static void lower_global_var(Masm *masm, AstNode *stmt, ModuleCounters *counters);
 
 static bool lowered_name_has(char **names, int count, const char *name)
 {
@@ -3247,7 +3363,7 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
             AstNode *decl = stmts->items[i];
             if (decl->kind == AST_STMT_VAR || decl->kind == AST_STMT_VAL)
             {
-                lower_global_var(masm, decl);
+                lower_global_var(masm, decl, &counters);
             }
         }
 
@@ -3310,7 +3426,7 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
     return masm;
 }
 
-static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
+static void emit_global_data(Masm *masm, MasmSection *section, AstNode *expr, size_t size, ModuleCounters *counters)
 {
     if (!expr)
     {
@@ -3351,6 +3467,47 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
             if (size > 8)
             {
                 masm_section_append_zero(section, size - 8);
+            }
+        }
+        else if (expr->lit_expr.kind == TOKEN_LIT_STRING)
+        {
+            // String literal: emit the string to .rodata and store a pointer relocation
+            const char *str_val = expr->lit_expr.string_val;
+            size_t      str_len = strlen(str_val) + 1; // include null terminator
+
+            // Create unique label for the string
+            char label[64];
+            snprintf(label, sizeof(label), ".Lstr_%d", counters->str_counter++);
+
+            // Add string to .rodata
+            MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
+
+            // Create symbol for the string
+            MasmSymbol *sym   = masm_symbol_create(label, MASM_SYMBOL_DATA, MASM_BIND_LOCAL);
+            sym->section_name = strdup(".rodata");
+            sym->offset       = rodata->data_size;
+            sym->size         = str_len;
+            masm_add_symbol(masm, sym);
+
+            // Append string data to .rodata
+            masm_section_append_data(rodata, str_val, str_len - 1);
+            uint8_t zero = 0;
+            masm_section_append_data(rodata, &zero, 1);
+
+            // Record the relocation offset in the data section (before appending zeros)
+            size_t reloc_offset = section->data_size;
+
+            // Emit placeholder zeros for the pointer (8 bytes for 64-bit)
+            size_t ptr_size = 8;
+            masm_section_append_zero(section, ptr_size);
+
+            // Add relocation entry pointing to the string symbol
+            masm_section_append_reloc(section, reloc_offset, label, 0);
+
+            // If size > 8, pad the rest
+            if (size > ptr_size)
+            {
+                masm_section_append_zero(section, size - ptr_size);
             }
         }
         else
@@ -3398,7 +3555,7 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
                 }
 
                 size_t field_size = type->structure.fields[i].type->size;
-                emit_global_data(section, init_expr, field_size);
+                emit_global_data(masm, section, init_expr, field_size, counters);
                 current_offset += field_size;
             }
         }
@@ -3420,7 +3577,7 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
                     }
                 }
             }
-            emit_global_data(section, init_expr, field_size);
+            emit_global_data(masm, section, init_expr, field_size, counters);
             if (field_size < size)
             {
                 masm_section_append_zero(section, size - field_size);
@@ -3446,7 +3603,7 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
         {
             if (i < count)
             {
-                emit_global_data(section, elems->items[i], elem_size);
+                emit_global_data(masm, section, elems->items[i], elem_size, counters);
             }
             else
             {
@@ -3491,7 +3648,7 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
     }
 }
 
-static void lower_global_var(Masm *masm, AstNode *stmt)
+static void lower_global_var(Masm *masm, AstNode *stmt, ModuleCounters *counters)
 {
     const char *name = stmt->var_stmt.name;
     if (stmt->symbol)
@@ -3556,6 +3713,6 @@ static void lower_global_var(Masm *masm, AstNode *stmt)
     }
     else
     {
-        emit_global_data(section, stmt->var_stmt.init, size);
+        emit_global_data(masm, section, stmt->var_stmt.init, size, counters);
     }
 }

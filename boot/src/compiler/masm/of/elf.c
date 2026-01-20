@@ -385,15 +385,16 @@ int masm_elf_write(Masm *masm, const char *filename)
     strtab_init(&shstr);
     strtab_init(&str);
 
-    Elf64_Word sh_null    = 0;
-    Elf64_Word sh_text    = strtab_add(&shstr, ".text");
-    Elf64_Word sh_rodata  = strtab_add(&shstr, ".rodata");
-    Elf64_Word sh_data    = strtab_add(&shstr, ".data");
-    Elf64_Word sh_bss     = strtab_add(&shstr, ".bss");
-    Elf64_Word sh_relatex = strtab_add(&shstr, ".rela.text");
-    Elf64_Word sh_symtab  = strtab_add(&shstr, ".symtab");
-    Elf64_Word sh_strtab  = strtab_add(&shstr, ".strtab");
-    Elf64_Word sh_shstr   = strtab_add(&shstr, ".shstrtab");
+    Elf64_Word sh_null     = 0;
+    Elf64_Word sh_text     = strtab_add(&shstr, ".text");
+    Elf64_Word sh_rodata   = strtab_add(&shstr, ".rodata");
+    Elf64_Word sh_data     = strtab_add(&shstr, ".data");
+    Elf64_Word sh_bss      = strtab_add(&shstr, ".bss");
+    Elf64_Word sh_relatex  = strtab_add(&shstr, ".rela.text");
+    Elf64_Word sh_reladata = strtab_add(&shstr, ".rela.data");
+    Elf64_Word sh_symtab   = strtab_add(&shstr, ".symtab");
+    Elf64_Word sh_strtab   = strtab_add(&shstr, ".strtab");
+    Elf64_Word sh_shstr    = strtab_add(&shstr, ".shstrtab");
 
     // build symbol table
     Elf64_Sym *syms      = NULL;
@@ -711,6 +712,30 @@ int masm_elf_write(Masm *masm, const char *filename)
         text_size = off;
     }
 
+    // Build data section relocations
+    Elf64_Rela *data_rela       = NULL;
+    size_t      data_rela_count = 0;
+    size_t      data_rela_cap   = 0;
+
+    if (data && data->data_reloc_count > 0)
+    {
+        for (size_t i = 0; i < data->data_reloc_count; i++)
+        {
+            MasmDataReloc *dr = &data->data_relocs[i];
+            Elf64_Word si = sym_lookup_or_add(&str, &syms, &sym_count, &sym_cap, &sym_index, &idx_count, &idx_cap, dr->symbol_name);
+
+            if (data_rela_count >= data_rela_cap)
+            {
+                data_rela_cap = data_rela_cap == 0 ? 16 : data_rela_cap * 2;
+                data_rela = realloc(data_rela, sizeof(Elf64_Rela) * data_rela_cap);
+            }
+            data_rela[data_rela_count].r_offset = (Elf64_Addr)dr->offset;
+            data_rela[data_rela_count].r_info   = ELF64_R_INFO(si, R_X86_64_64);
+            data_rela[data_rela_count].r_addend = dr->addend;
+            data_rela_count++;
+        }
+    }
+
     // compute file layout
     size_t file_off = sizeof(Elf64_Ehdr);
 
@@ -727,6 +752,10 @@ int masm_elf_write(Masm *masm, const char *filename)
     size_t rela_size     = rela_count * sizeof(Elf64_Rela);
     file_off             = rela_file_off + rela_size;
 
+    size_t data_rela_file_off = align_up(file_off, 8);
+    size_t data_rela_size     = data_rela_count * sizeof(Elf64_Rela);
+    file_off                  = data_rela_file_off + data_rela_size;
+
     size_t symtab_file_off = align_up(file_off, 8);
     size_t symtab_size     = sym_count * sizeof(Elf64_Sym);
     file_off               = symtab_file_off + symtab_size;
@@ -741,7 +770,7 @@ int masm_elf_write(Masm *masm, const char *filename)
 
     size_t shoff = align_up(file_off, 8);
 
-    const int  shnum = 9;
+    const int  shnum = 10;
     Elf64_Shdr shdrs[shnum];
     memset(shdrs, 0, sizeof(shdrs));
 
@@ -781,34 +810,44 @@ int masm_elf_write(Masm *masm, const char *filename)
     shdrs[5].sh_flags     = 0;
     shdrs[5].sh_offset    = rela_file_off;
     shdrs[5].sh_size      = rela_size;
-    shdrs[5].sh_link      = 6;
-    shdrs[5].sh_info      = 1;
+    shdrs[5].sh_link      = 7;  // symtab index
+    shdrs[5].sh_info      = 1;  // .text section index
     shdrs[5].sh_addralign = 8;
     shdrs[5].sh_entsize   = sizeof(Elf64_Rela);
 
-    shdrs[6].sh_name      = sh_symtab;
-    shdrs[6].sh_type      = SHT_SYMTAB;
+    shdrs[6].sh_name      = sh_reladata;
+    shdrs[6].sh_type      = SHT_RELA;
     shdrs[6].sh_flags     = 0;
-    shdrs[6].sh_offset    = symtab_file_off;
-    shdrs[6].sh_size      = symtab_size;
-    shdrs[6].sh_link      = 7;
-    shdrs[6].sh_info      = local_count;
+    shdrs[6].sh_offset    = data_rela_file_off;
+    shdrs[6].sh_size      = data_rela_size;
+    shdrs[6].sh_link      = 7;  // symtab index
+    shdrs[6].sh_info      = 3;  // .data section index
     shdrs[6].sh_addralign = 8;
-    shdrs[6].sh_entsize   = sizeof(Elf64_Sym);
+    shdrs[6].sh_entsize   = sizeof(Elf64_Rela);
 
-    shdrs[7].sh_name      = sh_strtab;
-    shdrs[7].sh_type      = SHT_STRTAB;
+    shdrs[7].sh_name      = sh_symtab;
+    shdrs[7].sh_type      = SHT_SYMTAB;
     shdrs[7].sh_flags     = 0;
-    shdrs[7].sh_offset    = strtab_file_off;
-    shdrs[7].sh_size      = strtab_size;
-    shdrs[7].sh_addralign = 1;
+    shdrs[7].sh_offset    = symtab_file_off;
+    shdrs[7].sh_size      = symtab_size;
+    shdrs[7].sh_link      = 8;  // strtab index
+    shdrs[7].sh_info      = local_count;
+    shdrs[7].sh_addralign = 8;
+    shdrs[7].sh_entsize   = sizeof(Elf64_Sym);
 
-    shdrs[8].sh_name      = sh_shstr;
+    shdrs[8].sh_name      = sh_strtab;
     shdrs[8].sh_type      = SHT_STRTAB;
     shdrs[8].sh_flags     = 0;
-    shdrs[8].sh_offset    = shstr_file_off;
-    shdrs[8].sh_size      = shstr_size;
+    shdrs[8].sh_offset    = strtab_file_off;
+    shdrs[8].sh_size      = strtab_size;
     shdrs[8].sh_addralign = 1;
+
+    shdrs[9].sh_name      = sh_shstr;
+    shdrs[9].sh_type      = SHT_STRTAB;
+    shdrs[9].sh_flags     = 0;
+    shdrs[9].sh_offset    = shstr_file_off;
+    shdrs[9].sh_size      = shstr_size;
+    shdrs[9].sh_addralign = 1;
 
     Elf64_Ehdr ehdr;
     memset(&ehdr, 0, sizeof(ehdr));
@@ -826,7 +865,7 @@ int masm_elf_write(Masm *masm, const char *filename)
     ehdr.e_shoff             = (Elf64_Off)shoff;
     ehdr.e_shentsize         = sizeof(Elf64_Shdr);
     ehdr.e_shnum             = shnum;
-    ehdr.e_shstrndx          = 8;
+    ehdr.e_shstrndx          = 9;
 
     fwrite(&ehdr, 1, sizeof(ehdr), f);
 
@@ -872,6 +911,17 @@ int masm_elf_write(Masm *masm, const char *filename)
     }
 
     pos = ftell(f);
+    while ((size_t)pos < data_rela_file_off)
+    {
+        fputc(0, f);
+        pos++;
+    }
+    if (data_rela_size > 0)
+    {
+        fwrite(data_rela, 1, data_rela_size, f);
+    }
+
+    pos = ftell(f);
     while ((size_t)pos < symtab_file_off)
     {
         fputc(0, f);
@@ -907,6 +957,7 @@ int masm_elf_write(Masm *masm, const char *filename)
 
     free(text_buf);
     free(rela);
+    free(data_rela);
     for (size_t i = 0; i < idx_count; i++)
     {
         free(sym_index[i].name);
