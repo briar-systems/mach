@@ -35,7 +35,7 @@ A compact, actionable summary to help agents and contributors write correct Mach
 | `cnt` | continue to next loop iteration | `cnt;` |
 | `brk` | break out of the nearest loop | `brk;` |
 | `fin` | deferred statement (runs when scope exits) | `fin cleanup();` |
-| `masm` | inline masm block (backend/target-specific) | `masm { ... }` |
+| `asm` | inline assembly block (backend/target-specific) | `asm { ... }` |
 
 ---
 

@@ -1073,10 +1073,10 @@ AstNode *parser_parse_stmt_top(Parser *parser)
     case TOKEN_KW_UNI:
         result = parser_parse_stmt_uni(parser, is_public);
         break;
-    case TOKEN_KW_MASM:
+    case TOKEN_KW_ASM:
         if (is_public)
         {
-            parser_error_at_current(parser, "'pub' cannot precede 'mir' block");
+            parser_error_at_current(parser, "'pub' cannot precede 'asm' block");
         }
         result = parser_parse_stmt_mir(parser);
         break;
@@ -1119,7 +1119,7 @@ AstNode *parser_parse_stmt(Parser *parser)
         return parser_parse_stmt_brk(parser);
     case TOKEN_KW_CNT:
         return parser_parse_stmt_cnt(parser);
-    case TOKEN_KW_MASM:
+    case TOKEN_KW_ASM:
         return parser_parse_stmt_mir(parser);
     case TOKEN_KW_RET:
         return parser_parse_stmt_ret(parser);
@@ -2166,7 +2166,7 @@ static char *parser_extract_brace_content(Parser *parser)
 
 AstNode *parser_parse_stmt_mir(Parser *parser)
 {
-    if (!parser_consume(parser, TOKEN_KW_MASM, "expected 'mir' keyword"))
+    if (!parser_consume(parser, TOKEN_KW_ASM, "expected 'asm' keyword"))
     {
         return NULL;
     }
@@ -2181,7 +2181,7 @@ AstNode *parser_parse_stmt_mir(Parser *parser)
     node->masm_stmt.isa_name    = NULL;
     node->masm_stmt.isa_content = NULL;
 
-    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' after 'masm'"))
+    if (!parser_consume(parser, TOKEN_L_BRACE, "expected '{' after 'asm'"))
     {
         ast_node_dnit(node);
         free(node);

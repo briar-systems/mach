@@ -22,7 +22,7 @@ This reference lists the reserved keywords and token symbols in the Mach languag
   - [`cnt`](#cnt)
   - [`brk`](#brk)
   - [`fin`](#fin)
-  - [`masm`](#masm)
+  - [`asm`](#asm)
     - [`test`](#test)
 
 
@@ -349,12 +349,12 @@ fun example() {
 ```
 
 
-## `masm`
+## `asm`
 
-> `masm { <assembly-instructions> }`
-> `masm { <isa> { <assembly-instructions> } }`
+> `asm { <assembly-instructions> }`
+> `asm { <isa> { <assembly-instructions> } }`
 
-The `masm` keyword introduces an inline assembly block.
+The `asm` keyword introduces an inline assembly block.
 It allows embedding assembly instructions; operands may reference local variables by name.
 
 ### portable syntax
@@ -364,7 +364,7 @@ When no ISA block is specified, instructions are parsed as portable IR and go th
 ```mach
 fun add_values(a: u64, b: u64) u64 {
     var result: u64 = 0;
-    masm {
+    asm {
         add result, a, b
     }
     ret result;
@@ -378,7 +378,7 @@ For target-specific instructions, wrap the assembly in an ISA block (e.g., `x86_
 ```mach
 fun call_sys(n: u64) u64 {
     var out: u64 = 0;
-    masm {
+    asm {
         x86_64 {
             mov rax, n
             syscall
@@ -394,7 +394,7 @@ This is required for instructions with target semantics like flags or specific r
 
 Supported ISA names: `x86_64` (more planned).
 
-`masm` is allowed at both global and function scope, but is currently only lowered inside function bodies.
+`asm` is allowed at both global and function scope, but is currently only lowered inside function bodies.
 
 See the [MASM documentation](masm/README.md) for a complete reference of portable IR opcodes and target-specific instruction sets.
 
@@ -409,4 +409,4 @@ Tests are only run when invoking `mach test`.
 Return a non-zero integer to signal failure.
 The bootstrap test runner currently targets Linux x86_64 syscalls.
 
-> Note: this is a limited inline `masm` dialect. Operands may reference local variables by name; it is not intended as a full inline-asm facility with rich interpolation or explicit clobber lists.
+> Note: this is a limited inline `asm` dialect. Operands may reference local variables by name; it is not intended as a full inline-asm facility with rich interpolation or explicit clobber lists.

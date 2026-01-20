@@ -167,7 +167,7 @@ Invoked with the `syscall` instruction. Return value is placed in RAX.
 
 ```mach
 # exit(42)
-masm {
+asm {
     mov rax, 60    ; SYS_exit
     mov rdi, 42    ; exit code
     syscall

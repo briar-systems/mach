@@ -284,14 +284,14 @@ int masm_emit_object(Masm *masm, const char *filename);
 
 ## Inline Assembly
 
-Inline `masm` blocks can contain portable IR or target-specific instructions.
+Inline `asm` blocks can contain portable IR or target-specific instructions.
 
 ### Portable Syntax
 
 ```mach
 fun add_values(a: u64, b: u64) u64 {
     var result: u64 = 0;
-    masm {
+    asm {
         add result, a, b
     }
     ret result;
@@ -304,7 +304,7 @@ Parsed and lowered through normal isel.
 
 ```mach
 fun syscall_exit(code: u64) {
-    masm {
+    asm {
         x86_64 {
             mov rax, 60
             mov rdi, code

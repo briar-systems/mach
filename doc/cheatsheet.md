@@ -68,7 +68,7 @@ mach.toml                # project.id = "myapp"
 | `for`   | `for [(<condition>)] { <body> }`                                                                                                                         | Loop construct                         |
 | `cnt`   | `cnt;`                                                                                                                                                   | Continue to the next iteration         |
 | `brk`   | `brk;`                                                                                                                                                   | Break out of a loop                    |
-| `masm`   | `masm { <assembly-instructions> }`                                                                                                                        | Inline masm (limited dialect)                        |
+| `asm`   | `asm { <assembly-instructions> }`                                                                                                                        | Inline assembly (limited dialect)                        |
 | `test`   | `test "name" { <body> }`                                                                                                                                   | Top-level test block                  |
 
 
