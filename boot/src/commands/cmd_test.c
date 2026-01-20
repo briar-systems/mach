@@ -508,13 +508,13 @@ static AstNode *build_test_main_fn(TestInfo *tests, int test_count)
         AstNode *result_decl = make_var_stmt(result_name, make_type_name("i64"), call_test, false);
         ast_list_append(body->block_stmt.stmts, result_decl);
 
-        AstNode *cond = make_binary(TOKEN_EQUAL_EQUAL, make_ident(result_name), make_lit_int(0));
+        AstNode *cond = make_binary(TOKEN_BANG_EQUAL, make_ident(result_name), make_lit_int(0));
 
-        // then block: ok prefix
-        AstNode *then_block = make_block();
-        AstNode *ok_args[]  = {make_lit_string("ok: "), make_lit_int(4)};
-        AstNode *ok_call    = make_call("__mach_test_write", ok_args, 2);
-        ast_list_append(then_block->block_stmt.stmts, make_stmt_expr(ok_call));
+        // then block: pass prefix
+        AstNode *then_block  = make_block();
+        AstNode *pass_args[] = {make_lit_string("pass: "), make_lit_int(6)};
+        AstNode *pass_call   = make_call("__mach_test_write", pass_args, 2);
+        ast_list_append(then_block->block_stmt.stmts, make_stmt_expr(pass_call));
 
         // else block: fail prefix + failures++
         AstNode *else_block  = make_block();
@@ -627,17 +627,21 @@ static int transform_tests(AstNode *program, const char *module_path, TestInfo *
         return 0;
     }
 
-    if (program_has_fun_name(program, "_start") || program_has_fun_name(program, "__mach_test_main") || program_has_fun_name(program, "__mach_test_write"))
-    {
-        fprintf(stderr, "error: test harness symbol name conflicts with existing function\n");
-        return -1;
-    }
-
+    // collect tests first - skip files with no tests before checking for conflicts
     TestInfo *tests      = NULL;
     int       test_count = collect_tests(program, &tests);
     if (test_count <= 0)
     {
         return 0;
+    }
+
+    // only check for harness-internal symbol conflicts if file actually has tests
+    // note: _start check removed since runtime modules legitimately define it
+    if (program_has_fun_name(program, "__mach_test_main") || program_has_fun_name(program, "__mach_test_write"))
+    {
+        fprintf(stderr, "error: test harness symbol name conflicts with existing function\n");
+        free(tests);
+        return -1;
     }
 
     AstList *new_stmts = make_list();
@@ -669,7 +673,7 @@ static int transform_tests(AstNode *program, const char *module_path, TestInfo *
         AstNode *body = tests[i].body;
         if (body && body->kind == AST_STMT_BLOCK && body->block_stmt.stmts)
         {
-            ast_list_append(body->block_stmt.stmts, make_ret_stmt(make_lit_int(0)));
+            ast_list_append(body->block_stmt.stmts, make_ret_stmt(make_lit_int(1)));
         }
 
         AstNode *test_fn = make_fun(tests[i].fn_name, make_list(), make_type_name("i64"), body);
@@ -773,6 +777,19 @@ static char *build_test_output_path(const char *project_root, Config *config, Co
     {
         *dot = '\0';
     }
+
+    // append _test suffix to avoid collisions between files and directories
+    // e.g., allocator.mach -> allocator_test (won't conflict with allocator/ directory)
+    size_t rel_len  = strlen(rel_path);
+    char  *suffixed = malloc(rel_len + 6); // "_test" + null
+    if (!suffixed)
+    {
+        free(rel_path);
+        return NULL;
+    }
+    snprintf(suffixed, rel_len + 6, "%s_test", rel_path);
+    free(rel_path);
+    rel_path = suffixed;
 
     char *out_root   = path_join(project_root, config->dir_out);
     char *out_target = path_join(out_root, target->artifacts);
@@ -921,11 +938,12 @@ int cmd_test_handle(int argc, char **argv)
         return 1;
     }
 
-    int  total_tests      = 0;
-    int  total_failures   = 0;
-    int  total_modules    = 0;
-    int  compile_errors   = 0;
-    bool had_error        = false;
+    int  total_modules  = 0;
+    int  total_tests    = 0;
+    int  total_failures = 0;
+    int  total_crashes  = 0;
+    int  compile_errors = 0;
+    bool had_error      = false;
 
     for (int i = 0; files[i]; i++)
     {
@@ -1148,14 +1166,21 @@ int cmd_test_handle(int argc, char **argv)
 
         printf("[test] %s (%d)\n", module_path, test_count);
         int exit_code = process_execute(output_path);
-        if (exit_code != 0)
+        if (exit_code > 128)
         {
-            printf("[fail] %s (%d)\n", module_path, exit_code);
-            total_failures += exit_code > 0 ? exit_code : 1;
+            // process was killed by signal (crash)
+            int signal_num = exit_code - 128;
+            printf("[crash] %s (signal %d)\n", module_path, signal_num);
+            total_crashes++;
+        }
+        else if (exit_code != 0)
+        {
+            printf("[fail] %s (%d failed)\n", module_path, exit_code);
+            total_failures += exit_code;
         }
         else
         {
-            printf("[ok] %s\n", module_path);
+            printf("[pass] %s\n", module_path);
         }
 
         free(output_path);
@@ -1195,15 +1220,16 @@ int cmd_test_handle(int argc, char **argv)
         return 0;
     }
 
-    if (compile_errors > 0)
+    int total_passed = total_tests - total_failures;
+    if (compile_errors > 0 || total_crashes > 0)
     {
-        printf("tests: %d, failures: %d, compile errors: %d\n", total_tests, total_failures, compile_errors);
+        printf("tests: %d, passed: %d, failed: %d, crashed: %d, compile errors: %d\n", total_tests, total_passed, total_failures, total_crashes, compile_errors);
     }
     else
     {
-        printf("tests: %d, failures: %d\n", total_tests, total_failures);
+        printf("tests: %d, passed: %d, failed: %d\n", total_tests, total_passed, total_failures);
     }
-    if (total_failures != 0 || compile_errors != 0)
+    if (total_failures != 0 || total_crashes != 0 || compile_errors != 0)
     {
         return 1;
     }

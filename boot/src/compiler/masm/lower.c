@@ -233,15 +233,15 @@ static inline void emit_aggregate_copy(MasmSection *text, LowerContext *ctx, Mas
     for (int32_t off = 0; off < (int32_t)size;)
     {
         int32_t chunk = (int32_t)size - off;
-        if (chunk > 8)
+        if (chunk >= 8)
         {
             chunk = 8;
         }
-        else if (chunk > 4)
+        else if (chunk >= 4)
         {
             chunk = 4;
         }
-        else if (chunk > 2)
+        else if (chunk >= 2)
         {
             chunk = 2;
         }
@@ -440,14 +440,14 @@ static void pop_loop_defer_mark(LowerContext *ctx)
     }
 }
 
-static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, uint8_t size)
+static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, int size)
 {
     if (ctx->var_count >= ctx->var_capacity)
     {
         ctx->var_capacity *= 2;
         ctx->vars = realloc(ctx->vars, sizeof(LocalVar) * ctx->var_capacity);
     }
-    ctx->vars[ctx->var_count].name   = strdup(name);
+    ctx->vars[ctx->var_count].name   = name;
     ctx->vars[ctx->var_count].offset = offset;
     ctx->vars[ctx->var_count].size   = size;
     ctx->var_count++;
@@ -457,7 +457,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
 static LocalVar *find_local_var(LowerContext *ctx, const char *name)
 {
-    for (int i = 0; i < ctx->var_count; i++)
+    // search from end to find most recent declaration (handles loop re-declarations)
+    for (int i = ctx->var_count - 1; i >= 0; i--)
     {
         if (strcmp(ctx->vars[i].name, name) == 0)
         {
@@ -742,8 +743,8 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
     {
         MasmOperand left_mem = lower_expr(masm, text, lhs, ctx);
 
-        MasmOperand addr = isa_result(ctx, 8);
-        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, addr, left_mem));
+        MasmOperand dst_ptr = isa_result(ctx, ctx->ptr_size);
+        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, dst_ptr, left_mem));
 
         MasmOperand val = lower_expr(masm, text, rhs, ctx);
 
@@ -753,8 +754,37 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
             size = 8;
         }
 
-        MasmOperand mem = masm_operand_memory_simple(addr.reg.id, 0, size);
-        masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+        // For aggregate types (structs, unions, arrays), use memory copy
+        if (type_is_aggregate(lhs->type))
+        {
+            // val is a memory operand for aggregates; get its address
+            MasmOperand src_ptr = isa_tmp(ctx, ctx->ptr_size);
+            if (val.kind == MASM_OPERAND_MEMORY)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, src_ptr, val));
+            }
+            else if (val.kind == MASM_OPERAND_REGISTER)
+            {
+                // val is already a pointer in a register
+                if (val.reg.id != src_ptr.reg.id)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+                }
+            }
+            else
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+            }
+
+            emit_aggregate_copy(text, ctx, dst_ptr, src_ptr, (size_t)size);
+        }
+        else
+        {
+            // Scalar: use simple store
+            val = ensure_in_reg(text, val, lhs->type, ctx);
+            MasmOperand mem = masm_operand_memory_simple(dst_ptr.reg.id, 0, size);
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+        }
         return val;
     }
     // Handle identifier assignment
@@ -764,8 +794,39 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
         if (var)
         {
             MasmOperand val = lower_expr(masm, text, rhs, ctx);
-            MasmOperand dst = frame_mem(ctx, var->offset, var->size);
-            masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, val, masm_operand_imm(var->size)));
+            
+            // For aggregate types (structs, unions, arrays), use memory copy
+            if (type_is_aggregate(lhs->type) || var->size > ctx->ptr_size)
+            {
+                MasmOperand dst_ptr = isa_result(ctx, ctx->ptr_size);
+                MasmOperand dst_addr = frame_mem(ctx, var->offset, ctx->ptr_size);
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, dst_ptr, dst_addr));
+                
+                MasmOperand src_ptr = isa_tmp(ctx, ctx->ptr_size);
+                if (val.kind == MASM_OPERAND_MEMORY)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, src_ptr, val));
+                }
+                else if (val.kind == MASM_OPERAND_REGISTER)
+                {
+                    // val is already a pointer in a register
+                    if (val.reg.id != src_ptr.reg.id)
+                    {
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+                    }
+                }
+                else
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+                }
+                
+                emit_aggregate_copy(text, ctx, dst_ptr, src_ptr, (size_t)var->size);
+            }
+            else
+            {
+                MasmOperand dst = frame_mem(ctx, var->offset, var->size);
+                masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, val, masm_operand_imm(var->size)));
+            }
             return val;
         }
         else
@@ -1477,6 +1538,16 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
             if (link_name)
             {
+                // For functions, just return the address - don't dereference it.
+                // Function values ARE addresses (pointers to code).
+                if (expr->symbol->kind == SYMBOL_FUNCTION || (expr->type && expr->type->kind == TYPE_FUNCTION))
+                {
+                    MasmOperand addr     = isa_result(ctx, ctx->ptr_size);
+                    MasmOperand label_op = masm_operand_label(link_name);
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, addr, label_op));
+                    return addr;
+                }
+
                 size_t sym_size = ctx->ptr_size;
                 if (expr->type && expr->type->size)
                 {
@@ -1769,18 +1840,30 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         idx             = ensure_in_reg(text, idx, expr->index_expr.index->type, ctx);
 
         MasmOperand arr = lower_expr(masm, text, expr->index_expr.array, ctx);
+        Type *arr_type = expr->index_expr.array->type;
+
         if (arr.kind == MASM_OPERAND_MEMORY)
         {
             MasmOperand arr_reg = alloc_vreg(ctx, ctx->ptr_size);
-            masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, arr_reg, arr));
+            // For pointer types, we need to LOAD the pointer value from memory.
+            // For array types, we need LEA to get the address of the array.
+            if (arr_type && arr_type->kind == TYPE_POINTER)
+            {
+                // Load the pointer value stored in memory
+                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, arr_reg, arr, masm_operand_type(MASM_TYPE_U64)));
+            }
+            else
+            {
+                // Array: get address of the array itself
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, arr_reg, arr));
+            }
             arr = arr_reg;
         }
         else
         {
-            arr = ensure_in_reg(text, arr, expr->index_expr.array->type, ctx);
+            arr = ensure_in_reg(text, arr, arr_type, ctx);
         }
 
-        Type *arr_type = expr->index_expr.array->type;
         if (!arr_type)
         {
             return masm_operand_none();
@@ -2144,21 +2227,46 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             MasmOperand value = lower_expr(masm, text, stmt->var_stmt.init, ctx);
 
-            // Only use aggregate copy for LARGE aggregates (> 8 bytes).
-            // Small structs (≤8 bytes) are returned by value in a register,
-            // so we should store them directly like scalars.
-            bool is_large_aggregate = var_size > ctx->ptr_size;
+            // Use aggregate copy for:
+            // 1. Large aggregates (> 8 bytes)
+            // 2. Any aggregate with non-power-of-2 size (5, 6, 7 bytes)
+            //    because x86 MOV instructions only support 1, 2, 4, 8 byte sizes
+            bool is_aggregate = false;
+            bool needs_aggregate_copy = var_size > ctx->ptr_size;
+            
+            // Check if type is an aggregate
+            if (stmt->type && (stmt->type->kind == TYPE_STRUCT || stmt->type->kind == TYPE_UNION || stmt->type->kind == TYPE_ARRAY))
+            {
+                is_aggregate = true;
+            }
+            else if (stmt->var_stmt.init->type && (stmt->var_stmt.init->type->kind == TYPE_STRUCT || stmt->var_stmt.init->type->kind == TYPE_UNION || stmt->var_stmt.init->type->kind == TYPE_ARRAY))
+            {
+                is_aggregate = true;
+            }
+            
+            // For aggregates, use aggregate copy if size is not a power of 2 (1, 2, 4, 8)
+            if (is_aggregate && var_size != 1 && var_size != 2 && var_size != 4 && var_size != 8)
+            {
+                needs_aggregate_copy = true;
+            }
+            
             if (stmt->type && type_is_large_aggregate(stmt->type, ctx->ptr_size))
             {
-                is_large_aggregate = true;
+                needs_aggregate_copy = true;
             }
             else if (stmt->var_stmt.init->type && type_is_large_aggregate(stmt->var_stmt.init->type, ctx->ptr_size))
             {
-                is_large_aggregate = true;
+                needs_aggregate_copy = true;
             }
 
-            if (is_large_aggregate)
+            if (needs_aggregate_copy)
             {
+#ifdef MASM_DEBUG
+                fprintf(stderr, "[lower_stmt] VAR/VAL aggregate copy: var=%s, var_size=%zu, init_type=%p (size=%zu)\n",
+                        stmt->var_stmt.name, var_size,
+                        (void *)stmt->var_stmt.init->type,
+                        stmt->var_stmt.init->type ? stmt->var_stmt.init->type->size : 0);
+#endif
                 // Aggregate copy: normalize source to address, get dst address, copy bytes
                 MasmOperand src_ptr = isa_result(ctx, ctx->ptr_size);
                 if (value.kind == MASM_OPERAND_REGISTER)
@@ -2470,8 +2578,70 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 
         if (strncmp(token, "syscall", 7) == 0)
         {
-            // SYSCALL dest(implicit), target(none)
-            masm_section_append_inst(text, masm_inst_1(MASM_IR_SYSCALL, masm_operand_none()));
+            // Parse syscall with operands: "syscall out, n, a0, a1, ..."
+            // Format: syscall dest, syscall_num, arg0, arg1, arg2, arg3, arg4, arg5
+            char *operands = token + 7;
+            while (*operands == ' ' || *operands == '\t')
+            {
+                operands++;
+            }
+
+            if (*operands == '\0')
+            {
+                // bare syscall with no operands
+                masm_section_append_inst(text, masm_inst_1(MASM_IR_SYSCALL, masm_operand_none()));
+            }
+            else
+            {
+                // parse comma-separated operands
+                MasmOperand ops[10]; // dest, target(none), then up to 8 args
+                int op_count = 0;
+
+                // Make a copy to avoid interfering with outer strtok_r
+                char *operands_copy = strdup(operands);
+                char *op_saveptr = NULL;
+                char *op_str = strtok_r(operands_copy, ",", &op_saveptr);
+                while (op_str && op_count < 10)
+                {
+                    // trim whitespace
+                    while (*op_str == ' ' || *op_str == '\t')
+                    {
+                        op_str++;
+                    }
+                    size_t olen = strlen(op_str);
+                    while (olen > 0 && (op_str[olen - 1] == ' ' || op_str[olen - 1] == '\t'))
+                    {
+                        op_str[--olen] = '\0';
+                    }
+
+                    if (*op_str != '\0')
+                    {
+                        ops[op_count++] = parse_operand(op_str, ctx);
+                    }
+                    op_str = strtok_r(NULL, ",", &op_saveptr);
+                }
+
+                if (op_count > 0)
+                {
+                    // Build instruction: dest, target(none), args...
+                    // ops[0] = dest, ops[1..] = syscall args
+                    MasmOperand *inst_ops = malloc(sizeof(MasmOperand) * (op_count + 1));
+                    inst_ops[0] = ops[0]; // dest
+                    inst_ops[1] = masm_operand_none(); // target (unused for syscall)
+                    for (int i = 1; i < op_count; i++)
+                    {
+                        inst_ops[i + 1] = ops[i];
+                    }
+                    MasmInstruction inst = masm_inst_create(MASM_OPCODE_IR, MASM_IR_SYSCALL, inst_ops, op_count + 1);
+                    masm_section_append_inst(text, inst);
+                    free(inst_ops);
+                }
+                else
+                {
+                    masm_section_append_inst(text, masm_inst_1(MASM_IR_SYSCALL, masm_operand_none()));
+                }
+                free(operands_copy);
+            }
         }
         else if (strncmp(token, "call ", 5) == 0)
         {
@@ -2868,6 +3038,9 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
     }
 
     // handle parameters (skip for _start)
+    // Two-pass approach: first save all scalar/fp params from registers to frame slots,
+    // then do aggregate copies. This prevents aggregate copy loops from clobbering
+    // registers that still hold unsaved scalar parameters.
     if (!is_entry && func_node->fun_stmt.params)
     {
         int gp_i    = arg_shift;
@@ -2875,6 +3048,13 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
         int stack_i = 0;
 
         AstList *params = func_node->fun_stmt.params;
+
+        // First, compute offsets and allocate stack space for all parameters
+        int32_t *param_offsets = malloc(sizeof(int32_t) * params->count);
+        size_t  *param_sizes   = malloc(sizeof(size_t) * params->count);
+        bool    *param_byval   = malloc(sizeof(bool) * params->count);
+        bool    *param_fp      = malloc(sizeof(bool) * params->count);
+
         for (int i = 0; i < params->count; i++)
         {
             AstNode *param      = params->items[i];
@@ -2907,10 +3087,26 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
             ctx->stack_offset -= (int32_t)alloc_size;
             int32_t offset = ctx->stack_offset;
 
+            param_offsets[i] = offset;
+            param_sizes[i]   = param_size;
+            param_byval[i]   = byval_ptr;
+            param_fp[i]      = is_fp;
+
             // add to symbol table with its logical size
             add_local_var(ctx, param->param_stmt.name, offset, (int)param_size);
+        }
 
-            // load from ABI arg location
+        // Pass 1: Save all scalar and FP parameters from registers to frame slots FIRST
+        // This ensures argument registers are preserved before any aggregate copies
+        for (int i = 0; i < params->count; i++)
+        {
+            AstNode *param      = params->items[i];
+            Type    *ptype      = param ? param->type : NULL;
+            int32_t  offset     = param_offsets[i];
+            size_t   param_size = param_sizes[i];
+            bool     byval_ptr  = param_byval[i];
+            bool     is_fp      = param_fp[i];
+
             if (!byval_ptr && is_fp)
             {
                 uint8_t     store_size = type_fp_size(ptype);
@@ -2920,7 +3116,6 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
                 {
                     uint32_t    xmm_id = ctx->abi->float_arg_regs[fp_i++];
                     MasmOperand src    = masm_operand_register_fp(xmm_id, store_size);
-                    // store directly to stack
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, src, masm_operand_imm(store_size)));
                 }
                 else
@@ -2949,9 +3144,57 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
                     MasmOperand src_mem            = frame_mem(ctx, stack_param_offset, ctx->ptr_size);
                     MasmOperand tmp                = alloc_vreg(ctx, ctx->ptr_size);
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src_mem, masm_operand_type(MASM_TYPE_U64)));
-
-                    // We might need to truncate if store_size < ptr_size, IR STORE handles size
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, tmp, masm_operand_imm(store_size)));
+                }
+            }
+            else
+            {
+                // byval_ptr: just consume the register slot, actual copy done in pass 2
+                if (gp_i < ctx->int_arg_count)
+                {
+                    gp_i++;
+                }
+                else
+                {
+                    stack_i++;
+                }
+            }
+        }
+
+        // Pass 2: Now do aggregate copies - all scalar params are safely stored
+        gp_i    = arg_shift;
+        fp_i    = 0;
+        stack_i = 0;
+
+        for (int i = 0; i < params->count; i++)
+        {
+            int32_t  offset     = param_offsets[i];
+            size_t   param_size = param_sizes[i];
+            bool     byval_ptr  = param_byval[i];
+            bool     is_fp      = param_fp[i];
+
+            if (!byval_ptr && is_fp)
+            {
+                // already handled in pass 1, just advance register index
+                if (fp_i < ctx->float_arg_count)
+                {
+                    fp_i++;
+                }
+                else
+                {
+                    stack_i++;
+                }
+            }
+            else if (!byval_ptr)
+            {
+                // already handled in pass 1, just advance register index
+                if (gp_i < ctx->int_arg_count)
+                {
+                    gp_i++;
+                }
+                else
+                {
+                    stack_i++;
                 }
             }
             else
@@ -2991,6 +3234,11 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
                 }
             }
         }
+
+        free(param_offsets);
+        free(param_sizes);
+        free(param_byval);
+        free(param_fp);
 
         // if variadic, record named counts and save register-save area
         if (ctx->fn_is_variadic)
@@ -3053,7 +3301,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
     destroy_context(ctx);
 }
 
-static void lower_global_var(Masm *masm, AstNode *stmt);
+static void lower_global_var(Masm *masm, AstNode *stmt, ModuleCounters *counters);
 
 static bool lowered_name_has(char **names, int count, const char *name)
 {
@@ -3115,7 +3363,7 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
             AstNode *decl = stmts->items[i];
             if (decl->kind == AST_STMT_VAR || decl->kind == AST_STMT_VAL)
             {
-                lower_global_var(masm, decl);
+                lower_global_var(masm, decl, &counters);
             }
         }
 
@@ -3178,7 +3426,7 @@ Masm *masm_lower_module(AstNode *ast, SymbolTable *symbols)
     return masm;
 }
 
-static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
+static void emit_global_data(Masm *masm, MasmSection *section, AstNode *expr, size_t size, ModuleCounters *counters)
 {
     if (!expr)
     {
@@ -3219,6 +3467,47 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
             if (size > 8)
             {
                 masm_section_append_zero(section, size - 8);
+            }
+        }
+        else if (expr->lit_expr.kind == TOKEN_LIT_STRING)
+        {
+            // String literal: emit the string to .rodata and store a pointer relocation
+            const char *str_val = expr->lit_expr.string_val;
+            size_t      str_len = strlen(str_val) + 1; // include null terminator
+
+            // Create unique label for the string
+            char label[64];
+            snprintf(label, sizeof(label), ".Lstr_%d", counters->str_counter++);
+
+            // Add string to .rodata
+            MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
+
+            // Create symbol for the string
+            MasmSymbol *sym   = masm_symbol_create(label, MASM_SYMBOL_DATA, MASM_BIND_LOCAL);
+            sym->section_name = strdup(".rodata");
+            sym->offset       = rodata->data_size;
+            sym->size         = str_len;
+            masm_add_symbol(masm, sym);
+
+            // Append string data to .rodata
+            masm_section_append_data(rodata, str_val, str_len - 1);
+            uint8_t zero = 0;
+            masm_section_append_data(rodata, &zero, 1);
+
+            // Record the relocation offset in the data section (before appending zeros)
+            size_t reloc_offset = section->data_size;
+
+            // Emit placeholder zeros for the pointer (8 bytes for 64-bit)
+            size_t ptr_size = 8;
+            masm_section_append_zero(section, ptr_size);
+
+            // Add relocation entry pointing to the string symbol
+            masm_section_append_reloc(section, reloc_offset, label, 0);
+
+            // If size > 8, pad the rest
+            if (size > ptr_size)
+            {
+                masm_section_append_zero(section, size - ptr_size);
             }
         }
         else
@@ -3266,7 +3555,7 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
                 }
 
                 size_t field_size = type->structure.fields[i].type->size;
-                emit_global_data(section, init_expr, field_size);
+                emit_global_data(masm, section, init_expr, field_size, counters);
                 current_offset += field_size;
             }
         }
@@ -3288,7 +3577,7 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
                     }
                 }
             }
-            emit_global_data(section, init_expr, field_size);
+            emit_global_data(masm, section, init_expr, field_size, counters);
             if (field_size < size)
             {
                 masm_section_append_zero(section, size - field_size);
@@ -3314,7 +3603,7 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
         {
             if (i < count)
             {
-                emit_global_data(section, elems->items[i], elem_size);
+                emit_global_data(masm, section, elems->items[i], elem_size, counters);
             }
             else
             {
@@ -3359,7 +3648,7 @@ static void emit_global_data(MasmSection *section, AstNode *expr, size_t size)
     }
 }
 
-static void lower_global_var(Masm *masm, AstNode *stmt)
+static void lower_global_var(Masm *masm, AstNode *stmt, ModuleCounters *counters)
 {
     const char *name = stmt->var_stmt.name;
     if (stmt->symbol)
@@ -3424,6 +3713,6 @@ static void lower_global_var(Masm *masm, AstNode *stmt)
     }
     else
     {
-        emit_global_data(section, stmt->var_stmt.init, size);
+        emit_global_data(masm, section, stmt->var_stmt.init, size, counters);
     }
 }

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 
+
 MasmSection *masm_section_create(MasmSectionKind kind, const char *name)
 {
     MasmSection *section = malloc(sizeof(MasmSection));
@@ -31,6 +32,18 @@ void masm_section_destroy(MasmSection *section)
     }
     
     if (section->data) free(section->data);
+    
+    if (section->data_relocs)
+    {
+        for (size_t i = 0; i < section->data_reloc_count; i++)
+        {
+            if (section->data_relocs[i].symbol_name)
+            {
+                free((void *)section->data_relocs[i].symbol_name);
+            }
+        }
+        free(section->data_relocs);
+    }
     
     free(section);
 }
@@ -75,4 +88,19 @@ void masm_section_append_zero(MasmSection *section, size_t size)
     
     memset(section->data + section->data_size, 0, size);
     section->data_size += size;
+}
+
+void masm_section_append_reloc(MasmSection *section, size_t offset, const char *symbol_name, int64_t addend)
+{
+    if (section->data_reloc_count >= section->data_reloc_capacity)
+    {
+        size_t new_capacity = section->data_reloc_capacity == 0 ? 16 : section->data_reloc_capacity * 2;
+        section->data_relocs = realloc(section->data_relocs, sizeof(MasmDataReloc) * new_capacity);
+        section->data_reloc_capacity = new_capacity;
+    }
+    
+    section->data_relocs[section->data_reloc_count].offset = offset;
+    section->data_relocs[section->data_reloc_count].symbol_name = strdup(symbol_name);
+    section->data_relocs[section->data_reloc_count].addend = addend;
+    section->data_reloc_count++;
 }
