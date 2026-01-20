@@ -742,8 +742,8 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
     {
         MasmOperand left_mem = lower_expr(masm, text, lhs, ctx);
 
-        MasmOperand addr = isa_result(ctx, 8);
-        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, addr, left_mem));
+        MasmOperand dst_ptr = isa_result(ctx, ctx->ptr_size);
+        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, dst_ptr, left_mem));
 
         MasmOperand val = lower_expr(masm, text, rhs, ctx);
 
@@ -753,8 +753,37 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
             size = 8;
         }
 
-        MasmOperand mem = masm_operand_memory_simple(addr.reg.id, 0, size);
-        masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+        // For aggregate types (structs, unions, arrays), use memory copy
+        if (type_is_aggregate(lhs->type))
+        {
+            // val is a memory operand for aggregates; get its address
+            MasmOperand src_ptr = isa_tmp(ctx, ctx->ptr_size);
+            if (val.kind == MASM_OPERAND_MEMORY)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, src_ptr, val));
+            }
+            else if (val.kind == MASM_OPERAND_REGISTER)
+            {
+                // val is already a pointer in a register
+                if (val.reg.id != src_ptr.reg.id)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+                }
+            }
+            else
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+            }
+
+            emit_aggregate_copy(text, ctx, dst_ptr, src_ptr, (size_t)size);
+        }
+        else
+        {
+            // Scalar: use simple store
+            val = ensure_in_reg(text, val, lhs->type, ctx);
+            MasmOperand mem = masm_operand_memory_simple(dst_ptr.reg.id, 0, size);
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+        }
         return val;
     }
     // Handle identifier assignment
@@ -1477,6 +1506,16 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
             if (link_name)
             {
+                // For functions, just return the address - don't dereference it.
+                // Function values ARE addresses (pointers to code).
+                if (expr->symbol->kind == SYMBOL_FUNCTION || (expr->type && expr->type->kind == TYPE_FUNCTION))
+                {
+                    MasmOperand addr     = isa_result(ctx, ctx->ptr_size);
+                    MasmOperand label_op = masm_operand_label(link_name);
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, addr, label_op));
+                    return addr;
+                }
+
                 size_t sym_size = ctx->ptr_size;
                 if (expr->type && expr->type->size)
                 {
@@ -1769,18 +1808,30 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         idx             = ensure_in_reg(text, idx, expr->index_expr.index->type, ctx);
 
         MasmOperand arr = lower_expr(masm, text, expr->index_expr.array, ctx);
+        Type *arr_type = expr->index_expr.array->type;
+
         if (arr.kind == MASM_OPERAND_MEMORY)
         {
             MasmOperand arr_reg = alloc_vreg(ctx, ctx->ptr_size);
-            masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, arr_reg, arr));
+            // For pointer types, we need to LOAD the pointer value from memory.
+            // For array types, we need LEA to get the address of the array.
+            if (arr_type && arr_type->kind == TYPE_POINTER)
+            {
+                // Load the pointer value stored in memory
+                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, arr_reg, arr, masm_operand_type(MASM_TYPE_U64)));
+            }
+            else
+            {
+                // Array: get address of the array itself
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, arr_reg, arr));
+            }
             arr = arr_reg;
         }
         else
         {
-            arr = ensure_in_reg(text, arr, expr->index_expr.array->type, ctx);
+            arr = ensure_in_reg(text, arr, arr_type, ctx);
         }
 
-        Type *arr_type = expr->index_expr.array->type;
         if (!arr_type)
         {
             return masm_operand_none();
@@ -2144,20 +2195,39 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             MasmOperand value = lower_expr(masm, text, stmt->var_stmt.init, ctx);
 
-            // Only use aggregate copy for LARGE aggregates (> 8 bytes).
-            // Small structs (≤8 bytes) are returned by value in a register,
-            // so we should store them directly like scalars.
-            bool is_large_aggregate = var_size > ctx->ptr_size;
+            // Use aggregate copy for:
+            // 1. Large aggregates (> 8 bytes)
+            // 2. Any aggregate with non-power-of-2 size (5, 6, 7 bytes)
+            //    because x86 MOV instructions only support 1, 2, 4, 8 byte sizes
+            bool is_aggregate = false;
+            bool needs_aggregate_copy = var_size > ctx->ptr_size;
+            
+            // Check if type is an aggregate
+            if (stmt->type && (stmt->type->kind == TYPE_STRUCT || stmt->type->kind == TYPE_UNION || stmt->type->kind == TYPE_ARRAY))
+            {
+                is_aggregate = true;
+            }
+            else if (stmt->var_stmt.init->type && (stmt->var_stmt.init->type->kind == TYPE_STRUCT || stmt->var_stmt.init->type->kind == TYPE_UNION || stmt->var_stmt.init->type->kind == TYPE_ARRAY))
+            {
+                is_aggregate = true;
+            }
+            
+            // For aggregates, use aggregate copy if size is not a power of 2 (1, 2, 4, 8)
+            if (is_aggregate && var_size != 1 && var_size != 2 && var_size != 4 && var_size != 8)
+            {
+                needs_aggregate_copy = true;
+            }
+            
             if (stmt->type && type_is_large_aggregate(stmt->type, ctx->ptr_size))
             {
-                is_large_aggregate = true;
+                needs_aggregate_copy = true;
             }
             else if (stmt->var_stmt.init->type && type_is_large_aggregate(stmt->var_stmt.init->type, ctx->ptr_size))
             {
-                is_large_aggregate = true;
+                needs_aggregate_copy = true;
             }
 
-            if (is_large_aggregate)
+            if (needs_aggregate_copy)
             {
                 // Aggregate copy: normalize source to address, get dst address, copy bytes
                 MasmOperand src_ptr = isa_result(ctx, ctx->ptr_size);
@@ -2470,8 +2540,70 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 
         if (strncmp(token, "syscall", 7) == 0)
         {
-            // SYSCALL dest(implicit), target(none)
-            masm_section_append_inst(text, masm_inst_1(MASM_IR_SYSCALL, masm_operand_none()));
+            // Parse syscall with operands: "syscall out, n, a0, a1, ..."
+            // Format: syscall dest, syscall_num, arg0, arg1, arg2, arg3, arg4, arg5
+            char *operands = token + 7;
+            while (*operands == ' ' || *operands == '\t')
+            {
+                operands++;
+            }
+
+            if (*operands == '\0')
+            {
+                // bare syscall with no operands
+                masm_section_append_inst(text, masm_inst_1(MASM_IR_SYSCALL, masm_operand_none()));
+            }
+            else
+            {
+                // parse comma-separated operands
+                MasmOperand ops[10]; // dest, target(none), then up to 8 args
+                int op_count = 0;
+
+                // Make a copy to avoid interfering with outer strtok_r
+                char *operands_copy = strdup(operands);
+                char *op_saveptr = NULL;
+                char *op_str = strtok_r(operands_copy, ",", &op_saveptr);
+                while (op_str && op_count < 10)
+                {
+                    // trim whitespace
+                    while (*op_str == ' ' || *op_str == '\t')
+                    {
+                        op_str++;
+                    }
+                    size_t olen = strlen(op_str);
+                    while (olen > 0 && (op_str[olen - 1] == ' ' || op_str[olen - 1] == '\t'))
+                    {
+                        op_str[--olen] = '\0';
+                    }
+
+                    if (*op_str != '\0')
+                    {
+                        ops[op_count++] = parse_operand(op_str, ctx);
+                    }
+                    op_str = strtok_r(NULL, ",", &op_saveptr);
+                }
+
+                if (op_count > 0)
+                {
+                    // Build instruction: dest, target(none), args...
+                    // ops[0] = dest, ops[1..] = syscall args
+                    MasmOperand *inst_ops = malloc(sizeof(MasmOperand) * (op_count + 1));
+                    inst_ops[0] = ops[0]; // dest
+                    inst_ops[1] = masm_operand_none(); // target (unused for syscall)
+                    for (int i = 1; i < op_count; i++)
+                    {
+                        inst_ops[i + 1] = ops[i];
+                    }
+                    MasmInstruction inst = masm_inst_create(MASM_OPCODE_IR, MASM_IR_SYSCALL, inst_ops, op_count + 1);
+                    masm_section_append_inst(text, inst);
+                    free(inst_ops);
+                }
+                else
+                {
+                    masm_section_append_inst(text, masm_inst_1(MASM_IR_SYSCALL, masm_operand_none()));
+                }
+                free(operands_copy);
+            }
         }
         else if (strncmp(token, "call ", 5) == 0)
         {

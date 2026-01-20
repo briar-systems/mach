@@ -957,6 +957,48 @@ static int  sema_collect_symbols(Sema *sema, AstNode *node);
 static int  sema_analyze_use(Sema *sema, AstNode *node);
 static void sema_maybe_analyze_symbol_decl_in_module(Sema *sema, SemaModule *mod, Symbol *sym);
 
+// helper: extract base type name from a type AST node (unwraps pointers)
+static const char *sema_get_receiver_type_name(AstNode *receiver_type)
+{
+    if (!receiver_type)
+    {
+        return NULL;
+    }
+
+    // unwrap pointer types to get base type
+    AstNode *base = receiver_type;
+    while (base && base->kind == AST_TYPE_PTR)
+    {
+        base = base->type_ptr.base;
+    }
+
+    if (base && base->kind == AST_TYPE_NAME)
+    {
+        return base->type_name.name;
+    }
+
+    return NULL;
+}
+
+// helper: build qualified method name "ReceiverType.methodName"
+static char *sema_build_method_symbol_name(const char *receiver_type_name, const char *method_name)
+{
+    if (!receiver_type_name || !method_name)
+    {
+        return NULL;
+    }
+
+    size_t len = strlen(receiver_type_name) + 1 + strlen(method_name) + 1;
+    char  *buf = malloc(len);
+    if (!buf)
+    {
+        return NULL;
+    }
+
+    snprintf(buf, len, "%s.%s", receiver_type_name, method_name);
+    return buf;
+}
+
 // collect symbols from a statement (first pass - no body analysis)
 static int sema_collect_fun_symbol(Sema *sema, AstNode *node)
 {
@@ -965,17 +1007,39 @@ static int sema_collect_fun_symbol(Sema *sema, AstNode *node)
         return -1;
     }
 
+    // for methods, use qualified name "ReceiverType.methodName" to allow
+    // same-named methods on different types
+    const char *symbol_key  = node->fun_stmt.name;
+    char       *method_key  = NULL;
+    bool        is_method   = node->fun_stmt.is_method && node->fun_stmt.method_receiver;
+
+    if (is_method)
+    {
+        const char *receiver_name = sema_get_receiver_type_name(node->fun_stmt.method_receiver);
+        if (receiver_name)
+        {
+            method_key = sema_build_method_symbol_name(receiver_name, node->fun_stmt.name);
+            if (method_key)
+            {
+                symbol_key = method_key;
+            }
+        }
+    }
+
     // check if symbol already exists (from forward declaration or previous pass)
-    Symbol *existing = symbol_table_lookup_local(sema->current_table, node->fun_stmt.name);
+    Symbol *existing = symbol_table_lookup_local(sema->current_table, symbol_key);
     if (existing)
     {
         // symbol already collected, just link it
         node->symbol = existing;
+        free(method_key);
         return 0;
     }
 
-    // create symbol for function
-    Symbol *sym = symbol_create(node->fun_stmt.name, SYMBOL_FUNCTION, sema->module_path);
+    // create symbol for function - use qualified name for methods as internal key
+    // but keep original name for display/export
+    Symbol *sym = symbol_create(symbol_key, SYMBOL_FUNCTION, sema->module_path);
+    free(method_key); // symbol_create copies the name
     if (!sym)
     {
         return -1;
@@ -3154,7 +3218,34 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
             else if (func_sym && func_sym->decl && func_sym->decl->fun_stmt.method_receiver)
             {
-                expected_receiver_type = sema_resolve_type(sema, func_sym->decl->fun_stmt.method_receiver);
+                // For cross-module methods, resolve the receiver type in the method's module context
+                SemaModule *method_origin = sema_find_module(sema, func_sym->module_path);
+                if (method_origin && method_origin != sema->current_module)
+                {
+                    SemaModule  *saved_module      = sema->current_module;
+                    SymbolTable *saved_table       = sema->current_table;
+                    const char  *saved_module_path = sema->module_path;
+                    char        *saved_file_path   = sema->current_file_path;
+                    char        *saved_source      = sema->current_source;
+
+                    sema->current_module    = method_origin;
+                    sema->current_table     = method_origin->table;
+                    sema->module_path       = method_origin->module_path;
+                    sema->current_file_path = method_origin->file_path;
+                    sema->current_source    = method_origin->source;
+
+                    expected_receiver_type = sema_resolve_type(sema, func_sym->decl->fun_stmt.method_receiver);
+
+                    sema->current_module    = saved_module;
+                    sema->current_table     = saved_table;
+                    sema->module_path       = saved_module_path;
+                    sema->current_file_path = saved_file_path;
+                    sema->current_source    = saved_source;
+                }
+                else
+                {
+                    expected_receiver_type = sema_resolve_type(sema, func_sym->decl->fun_stmt.method_receiver);
+                }
             }
 
             // auto-ref: if method expects pointer but receiver is value, wrap in address-of
@@ -3392,14 +3483,162 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         }
 
         // look for method - methods can be defined on any type including pointers.
-        // local lookup first, then search unaliased imports (same as identifier resolution).
-        Symbol     *method        = symbol_table_lookup(sema->current_table, node->field_expr.field);
+        // methods are stored with qualified names "ReceiverType.methodName" to allow
+        // same-named methods on different types.
+        Symbol     *method        = NULL;
         SemaModule *method_origin = NULL;
+
+        // get the base type name for the object to build qualified method name
+        const char *obj_type_name = NULL;
+        const char *generic_base_name = NULL; // for instantiated generic types like OptionIi64E -> Option
+        Type       *base_type     = obj_type;
+        if (base_type->kind == TYPE_POINTER)
+        {
+            base_type = base_type->pointer.base;
+        }
+        if (base_type->kind == TYPE_STRUCT && base_type->structure.name)
+        {
+            obj_type_name = base_type->structure.name;
+            // check if this is an instantiated generic type (has generic_args)
+            // if so, extract base name by finding 'I' separator in mangled name
+            if (base_type->structure.generic_arg_count > 0)
+            {
+                const char *i_pos = strchr(base_type->structure.name, 'I');
+                if (i_pos && i_pos != base_type->structure.name)
+                {
+                    // extract base name (e.g., "Option" from "OptionIi64E")
+                    static char generic_base_buf[256];
+                    size_t len = i_pos - base_type->structure.name;
+                    if (len < sizeof(generic_base_buf))
+                    {
+                        strncpy(generic_base_buf, base_type->structure.name, len);
+                        generic_base_buf[len] = '\0';
+                        generic_base_name = generic_base_buf;
+                    }
+                }
+            }
+        }
+        else if (base_type->kind == TYPE_UNION && base_type->union_type.name)
+        {
+            obj_type_name = base_type->union_type.name;
+            // check if this is an instantiated generic type
+            if (base_type->union_type.generic_arg_count > 0)
+            {
+                const char *i_pos = strchr(base_type->union_type.name, 'I');
+                if (i_pos && i_pos != base_type->union_type.name)
+                {
+                    static char generic_base_buf[256];
+                    size_t len = i_pos - base_type->union_type.name;
+                    if (len < sizeof(generic_base_buf))
+                    {
+                        strncpy(generic_base_buf, base_type->union_type.name, len);
+                        generic_base_buf[len] = '\0';
+                        generic_base_name = generic_base_buf;
+                    }
+                }
+            }
+        }
+
+        // try qualified lookup first (ReceiverType.methodName) - works for structs/unions
+        char *qualified_name = NULL;
+        char *generic_qualified_name = NULL;
+        if (obj_type_name)
+        {
+            qualified_name = sema_build_method_symbol_name(obj_type_name, node->field_expr.field);
+            if (qualified_name)
+            {
+                method = symbol_table_lookup(sema->current_table, qualified_name);
+            }
+        }
+        // for instantiated generic types, also try with base generic name
+        if (!method && generic_base_name)
+        {
+            generic_qualified_name = sema_build_method_symbol_name(generic_base_name, node->field_expr.field);
+            if (generic_qualified_name)
+            {
+                method = symbol_table_lookup(sema->current_table, generic_qualified_name);
+            }
+        }
 
         // ignore non-method symbols that shadow method names
         if (method && (method->kind != SYMBOL_FUNCTION || !method->decl || method->decl->kind != AST_STMT_FUN || !method->decl->fun_stmt.is_method))
         {
             method = NULL;
+        }
+
+        // if qualified lookup failed (e.g., for type aliases like str), iterate through
+        // all methods with matching name suffix and check receiver type compatibility
+        // search through all scopes (current and parents)
+        if (!method)
+        {
+            for (SymbolTable *scope = sema->current_table; scope && !method; scope = scope->parent)
+            {
+                Symbol *cand = NULL;
+                while ((cand = symbol_table_lookup_method_next(scope, node->field_expr.field, cand)) != NULL)
+                {
+                    if (cand->kind != SYMBOL_FUNCTION || !cand->decl || cand->decl->kind != AST_STMT_FUN || !cand->decl->fun_stmt.is_method)
+                    {
+                        continue;
+                    }
+
+                    // check if receiver type matches - need to analyze the method first if not done
+                    if (!cand->type && cand->decl)
+                    {
+                        SemaModule *cand_origin = sema_find_module(sema, cand->module_path);
+                        sema_maybe_analyze_symbol_decl_in_module(sema, cand_origin, cand);
+                    }
+
+                    // get receiver type from method's function type
+                    Type *cand_receiver_type = NULL;
+                    if (cand->type && cand->type->kind == TYPE_FUNCTION && cand->type->function.param_count > 0)
+                    {
+                        cand_receiver_type = cand->type->function.param_types[0];
+                    }
+                    else
+                    {
+                        cand_receiver_type = sema_resolve_type(sema, cand->decl->fun_stmt.method_receiver);
+                    }
+
+                    if (cand_receiver_type)
+                    {
+                        // check if receiver type matches object type
+                        if (type_can_assign_to(obj_type, cand_receiver_type))
+                        {
+                            method = cand;
+                            break;
+                        }
+
+                        // also check base types for pointer receivers (auto-ref/deref)
+                        Type *cand_base = cand_receiver_type;
+                        if (cand_base->kind == TYPE_POINTER)
+                        {
+                            cand_base = cand_base->pointer.base;
+                        }
+
+                        Type *obj_base = obj_type;
+                        if (obj_base->kind == TYPE_POINTER)
+                        {
+                            obj_base = obj_base->pointer.base;
+                        }
+
+                        if (type_equals(cand_base, obj_base))
+                        {
+                            method = cand;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // fallback to unqualified lookup for backwards compatibility (non-method functions, etc.)
+        if (!method)
+        {
+            method = symbol_table_lookup(sema->current_table, node->field_expr.field);
+            if (method && (method->kind != SYMBOL_FUNCTION || !method->decl || method->decl->kind != AST_STMT_FUN || !method->decl->fun_stmt.is_method))
+            {
+                method = NULL;
+            }
         }
 
         if (!method && sema->current_module)
@@ -3411,7 +3650,70 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                     continue;
                 }
 
-                Symbol *cand = symbol_table_lookup_local(imp->module->table, node->field_expr.field);
+                // try qualified lookup in imported module
+                Symbol *cand = NULL;
+                if (qualified_name)
+                {
+                    cand = symbol_table_lookup_local(imp->module->table, qualified_name);
+                }
+                // for instantiated generic types, also try with base generic name
+                if (!cand && generic_qualified_name)
+                {
+                    cand = symbol_table_lookup_local(imp->module->table, generic_qualified_name);
+                }
+                // if qualified lookup failed, iterate through method candidates
+                if (!cand)
+                {
+                    Symbol *iter = NULL;
+                    while ((iter = symbol_table_lookup_method_next(imp->module->table, node->field_expr.field, iter)) != NULL)
+                    {
+                        if (iter->kind != SYMBOL_FUNCTION || !iter->is_public || !iter->decl || iter->decl->kind != AST_STMT_FUN || !iter->decl->fun_stmt.is_method)
+                        {
+                            continue;
+                        }
+
+                        // analyze if needed
+                        if (!iter->type && iter->decl)
+                        {
+                            sema_maybe_analyze_symbol_decl_in_module(sema, imp->module, iter);
+                        }
+
+                        Type *iter_receiver_type = NULL;
+                        if (iter->type && iter->type->kind == TYPE_FUNCTION && iter->type->function.param_count > 0)
+                        {
+                            iter_receiver_type = iter->type->function.param_types[0];
+                        }
+
+                        if (iter_receiver_type)
+                        {
+                            if (type_can_assign_to(obj_type, iter_receiver_type))
+                            {
+                                cand = iter;
+                                break;
+                            }
+
+                            Type *iter_base = iter_receiver_type;
+                            if (iter_base->kind == TYPE_POINTER)
+                            {
+                                iter_base = iter_base->pointer.base;
+                            }
+                            Type *obj_base = obj_type;
+                            if (obj_base->kind == TYPE_POINTER)
+                            {
+                                obj_base = obj_base->pointer.base;
+                            }
+                            if (type_equals(iter_base, obj_base))
+                            {
+                                cand = iter;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!cand)
+                {
+                    cand = symbol_table_lookup_local(imp->module->table, node->field_expr.field);
+                }
                 if (!cand || cand->kind != SYMBOL_FUNCTION || !cand->is_public || !cand->decl || cand->decl->kind != AST_STMT_FUN || !cand->decl->fun_stmt.is_method)
                 {
                     continue;
@@ -3432,7 +3734,70 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                     continue;
                 }
 
-                Symbol *cand = symbol_table_lookup_local(al->module->table, node->field_expr.field);
+                // try qualified lookup in aliased module
+                Symbol *cand = NULL;
+                if (qualified_name)
+                {
+                    cand = symbol_table_lookup_local(al->module->table, qualified_name);
+                }
+                // for instantiated generic types, also try with base generic name
+                if (!cand && generic_qualified_name)
+                {
+                    cand = symbol_table_lookup_local(al->module->table, generic_qualified_name);
+                }
+                // if qualified lookup failed, iterate through method candidates
+                if (!cand)
+                {
+                    Symbol *iter = NULL;
+                    while ((iter = symbol_table_lookup_method_next(al->module->table, node->field_expr.field, iter)) != NULL)
+                    {
+                        if (iter->kind != SYMBOL_FUNCTION || !iter->is_public || !iter->decl || iter->decl->kind != AST_STMT_FUN || !iter->decl->fun_stmt.is_method)
+                        {
+                            continue;
+                        }
+
+                        // analyze if needed
+                        if (!iter->type && iter->decl)
+                        {
+                            sema_maybe_analyze_symbol_decl_in_module(sema, al->module, iter);
+                        }
+
+                        Type *iter_receiver_type = NULL;
+                        if (iter->type && iter->type->kind == TYPE_FUNCTION && iter->type->function.param_count > 0)
+                        {
+                            iter_receiver_type = iter->type->function.param_types[0];
+                        }
+
+                        if (iter_receiver_type)
+                        {
+                            if (type_can_assign_to(obj_type, iter_receiver_type))
+                            {
+                                cand = iter;
+                                break;
+                            }
+
+                            Type *iter_base = iter_receiver_type;
+                            if (iter_base->kind == TYPE_POINTER)
+                            {
+                                iter_base = iter_base->pointer.base;
+                            }
+                            Type *obj_base = obj_type;
+                            if (obj_base->kind == TYPE_POINTER)
+                            {
+                                obj_base = obj_base->pointer.base;
+                            }
+                            if (type_equals(iter_base, obj_base))
+                            {
+                                cand = iter;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!cand)
+                {
+                    cand = symbol_table_lookup_local(al->module->table, node->field_expr.field);
+                }
                 if (!cand || cand->kind != SYMBOL_FUNCTION || !cand->is_public || !cand->decl || cand->decl->kind != AST_STMT_FUN || !cand->decl->fun_stmt.is_method)
                 {
                     continue;
@@ -3443,6 +3808,9 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 break;
             }
         }
+
+        free(qualified_name);
+        free(generic_qualified_name);
 
         // if the method exists but hasn't been analyzed yet, analyze it under its module context
         if (method && !method->type && method->decl)
@@ -3587,117 +3955,83 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
 
                             if (formal_params)
                             {
-                                // create type args from the instantiated type's fields
-                                // for now, extract from the mangled name or use the object's type directly
-                                // since we stored the instantiated type in check_type, we can match field types
+                                // use the stored generic_args from the instantiated type
+                                Type **stored_args     = NULL;
+                                int    stored_arg_count = 0;
 
-                                // create synthetic type_args list from the object's actual type
-                                AstList *type_args = malloc(sizeof(AstList));
-                                if (type_args)
+                                if (check_type->kind == TYPE_STRUCT)
                                 {
-                                    ast_list_init(type_args);
+                                    stored_args      = check_type->structure.generic_args;
+                                    stored_arg_count = check_type->structure.generic_arg_count;
+                                }
+                                else if (check_type->kind == TYPE_UNION)
+                                {
+                                    stored_args      = check_type->union_type.generic_args;
+                                    stored_arg_count = check_type->union_type.generic_arg_count;
+                                }
 
-                                    // for each formal param, find the corresponding actual type from the instantiated record
-                                    for (int i = 0; i < formal_params->count && i < receiver_ast->type_name.generic_args->count; i++)
+                                if (stored_args && stored_arg_count > 0 && stored_arg_count == formal_params->count)
+                                {
+                                    // create synthetic type_args list from stored generic args
+                                    AstList *type_args = malloc(sizeof(AstList));
+                                    if (type_args)
                                     {
-                                        // get the field at the same index to infer type
-                                        // (this is a simplification - proper impl would parse the mangled name or store type args)
-                                        if (check_type->kind == TYPE_STRUCT && check_type->structure.field_count > 0)
+                                        ast_list_init(type_args);
+
+                                        for (int i = 0; i < stored_arg_count; i++)
                                         {
-                                            // find a field that uses the type parameter and get its actual type
-                                            Type *actual_type = NULL;
-
-                                            // look for the 'value' field which should have type T
-                                            for (int j = 0; j < check_type->structure.field_count; j++)
-                                            {
-                                                if (strcmp(check_type->structure.fields[j].name, "value") == 0)
-                                                {
-                                                    actual_type = check_type->structure.fields[j].type;
-                                                    break;
-                                                }
-                                            }
-
+                                            Type *actual_type = stored_args[i];
                                             if (actual_type)
                                             {
-                                                // create a type node for the actual type
-                                                AstNode *type_node = malloc(sizeof(AstNode));
+                                                // create a type node from the stored type using sema_type_node_from_type
+                                                AstNode *type_node = sema_type_node_from_type(actual_type);
                                                 if (type_node)
                                                 {
-                                                    memset(type_node, 0, sizeof(AstNode));
-                                                    type_node->kind = AST_TYPE_NAME;
-                                                    type_node->type = actual_type;
-
-                                                    // set the name based on type kind
-                                                    if (actual_type->kind == TYPE_I64)
-                                                    {
-                                                        type_node->type_name.name = strdup("i64");
-                                                    }
-                                                    else if (actual_type->kind == TYPE_I32)
-                                                    {
-                                                        type_node->type_name.name = strdup("i32");
-                                                    }
-                                                    else if (actual_type->kind == TYPE_U8)
-                                                    {
-                                                        type_node->type_name.name = strdup("u8");
-                                                    }
-                                                    else if (actual_type->kind == TYPE_U64)
-                                                    {
-                                                        type_node->type_name.name = strdup("u64");
-                                                    }
-                                                    else if (actual_type->kind == TYPE_PTR)
-                                                    {
-                                                        type_node->type_name.name = strdup("ptr");
-                                                    }
-                                                    else
-                                                    {
-                                                        type_node->type_name.name = strdup("i64"); // fallback
-                                                    }
-
                                                     ast_list_append(type_args, type_node);
                                                 }
                                             }
                                         }
-                                    }
 
-                                    if (type_args->count > 0)
-                                    {
-                                        // instantiate the method with these type args
-                                        Symbol *inst_method = sema_instantiate_generic(sema, method, type_args);
-                                        if (inst_method)
+                                        if (type_args->count == stored_arg_count)
                                         {
-                                            node->field_expr.is_method = true;
-                                            node->symbol               = inst_method;
-                                            node->type                 = inst_method->type;
-
-                                            // cleanup type_args
-                                            for (int i = 0; i < type_args->count; i++)
+                                            // instantiate the method with these type args
+                                            Symbol *inst_method = sema_instantiate_generic(sema, method, type_args);
+                                            if (inst_method)
                                             {
-                                                AstNode *tn = type_args->items[i];
-                                                if (tn->type_name.name)
+                                                node->field_expr.is_method = true;
+                                                node->symbol               = inst_method;
+                                                node->type                 = inst_method->type;
+
+                                                // cleanup type_args
+                                                for (int i = 0; i < type_args->count; i++)
                                                 {
-                                                    free(tn->type_name.name);
+                                                    AstNode *tn = type_args->items[i];
+                                                    if (tn->kind == AST_TYPE_NAME && tn->type_name.name)
+                                                    {
+                                                        free(tn->type_name.name);
+                                                    }
+                                                    free(tn);
                                                 }
-                                                free(tn);
+                                                free(type_args->items);
+                                                free(type_args);
+
+                                                return 0;
                                             }
-                                            free(type_args->items);
-                                            free(type_args);
-
-                                            return 0;
                                         }
-                                    }
 
-                                    // cleanup on failure
-                                    for (int i = 0; i < type_args->count; i++)
-                                    {
-                                        AstNode *tn = type_args->items[i];
-                                        if (tn->type_name.name)
+                                        // cleanup on failure
+                                        for (int i = 0; i < type_args->count; i++)
                                         {
-                                            free(tn->type_name.name);
+                                            AstNode *tn = type_args->items[i];
+                                            if (tn->kind == AST_TYPE_NAME && tn->type_name.name)
+                                            {
+                                                free(tn->type_name.name);
+                                            }
+                                            free(tn);
                                         }
-                                        free(tn);
+                                        free(type_args->items);
+                                        free(type_args);
                                     }
-                                    free(type_args->items);
-                                    free(type_args);
                                 }
                             }
                         }
@@ -3705,7 +4039,9 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
                 }
             }
 
-            // non-generic method resolution
+
+
+            // non-generic method resolution (also handles generic methods where instantiation is deferred)
             // use the already-resolved receiver type from the method's function type
             // (first parameter) instead of re-resolving in caller's context, which
             // would fail for cross-module methods where the type name is unqualified
@@ -3716,8 +4052,30 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
             }
             else
             {
-                // fallback to resolving from AST (may fail for cross-module)
+                // fallback to resolving from AST - must do this in the method's module context
+                // to properly resolve type names like "Allocator" that are local to that module
+                SemaModule  *saved_module      = sema->current_module;
+                SymbolTable *saved_table       = sema->current_table;
+                const char  *saved_module_path = sema->module_path;
+                char        *saved_file_path   = sema->current_file_path;
+                char        *saved_source      = sema->current_source;
+
+                if (method_origin)
+                {
+                    sema->current_module    = method_origin;
+                    sema->current_table     = method_origin->table;
+                    sema->module_path       = method_origin->module_path;
+                    sema->current_file_path = method_origin->file_path;
+                    sema->current_source    = method_origin->source;
+                }
+
                 method_receiver_type = sema_resolve_type(sema, method->decl->fun_stmt.method_receiver);
+
+                sema->current_module    = saved_module;
+                sema->current_table     = saved_table;
+                sema->module_path       = saved_module_path;
+                sema->current_file_path = saved_file_path;
+                sema->current_source    = saved_source;
             }
             if (method_receiver_type)
             {

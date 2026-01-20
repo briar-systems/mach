@@ -831,7 +831,8 @@ static AstNode *ast_clone_checked(const AstNode *node)
         break;
 
     case AST_TYPE_PTR:
-        clone->type_ptr.base = ast_clone_checked(node->type_ptr.base);
+        clone->type_ptr.base         = ast_clone_checked(node->type_ptr.base);
+        clone->type_ptr.is_read_only = node->type_ptr.is_read_only;
         break;
 
     case AST_TYPE_ARRAY:

@@ -1308,9 +1308,16 @@ static void emit_syscall(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
 
     emit_inst(sec, masm_x86_inst_0(MASM_OP_X86_SYSCALL));
 
-    if (dst.kind != MASM_OPERAND_NONE)
+    if (dst.kind == MASM_OPERAND_REGISTER)
     {
         store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+    }
+    else if (dst.kind == MASM_OPERAND_MEMORY)
+    {
+        // For inline masm with local variables, dst is a memory operand
+        // Store RAX directly to the memory location
+        uint8_t size = dst.mem.size ? dst.mem.size : 8;
+        emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_MR, dst, masm_x86_reg(MASM_X86_RAX, size)));
     }
 }
 
