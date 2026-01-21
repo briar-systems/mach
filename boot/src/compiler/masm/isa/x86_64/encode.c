@@ -169,11 +169,17 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
         {
             uint32_t dst       = inst.operands[0].reg.id;
             uint32_t src       = inst.operands[1].reg.id;
-            bool     byte      = inst.operands[0].reg.size == 1;
-            bool     w         = inst.operands[0].reg.size == 8 && !byte;
+            uint8_t  sz        = inst.operands[0].reg.size;
+            bool     byte      = sz == 1;
+            bool     word      = sz == 2;
+            bool     w         = sz == 8 && !byte;
             bool     rex_r     = src >= 8;
             bool     rex_b     = dst >= 8;
             bool     rex_force = byte && ((src >= 4 && src <= 7) || (dst >= 4 && dst <= 7));
+            if (word)
+            {
+                emit_byte(buffer, &offset, size, 0x66);
+            }
             emit_rex_force(buffer, &offset, size, rex_force, w, rex_r, false, rex_b);
             emit_byte(buffer, &offset, size, byte ? 0x88 : 0x89);
             emit_byte(buffer, &offset, size, encode_modrm(0xC0, reg_low(src), reg_low(dst)));
@@ -186,9 +192,14 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             uint32_t dst       = inst.operands[0].reg.id;
             uint8_t  sz        = inst.operands[0].reg.size;
             bool     w         = sz == 8;
+            bool     word      = sz == 2;
             uint8_t  opcode    = (sz == 1) ? 0x8A : 0x8B;
             bool     rex_r     = dst >= 8;
             bool     rex_force = (sz == 1) && (dst >= 4 && dst <= 7);
+            if (word)
+            {
+                emit_byte(buffer, &offset, size, 0x66);
+            }
             emit_rex_force(buffer, &offset, size, rex_force, w, rex_r, inst.operands[1].mem.index.id >= 8, inst.operands[1].mem.base.id >= 8);
             emit_byte(buffer, &offset, size, opcode);
             emit_mem(buffer, &offset, size, inst.operands[1].mem.base.id, inst.operands[1].mem.index.id, inst.operands[1].mem.scale, (int32_t)inst.operands[1].mem.disp, dst);
@@ -201,11 +212,16 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             uint32_t src       = inst.operands[1].reg.id;
             uint8_t  sz        = inst.operands[1].reg.size;
             bool     w         = sz == 8;
+            bool     word      = sz == 2;
             uint8_t  opcode    = (sz == 1) ? 0x88 : 0x89;
             bool     rex_r     = src >= 8;
             bool     rex_force = (sz == 1) && (src >= 4 && src <= 7);
             bool     rex_x     = inst.operands[0].mem.index.id >= 8;
             bool     rex_b     = inst.operands[0].mem.base.id >= 8;
+            if (word)
+            {
+                emit_byte(buffer, &offset, size, 0x66);
+            }
             emit_rex_force(buffer, &offset, size, rex_force, w, rex_r, rex_x, rex_b);
             emit_byte(buffer, &offset, size, opcode);
             emit_mem(buffer, &offset, size, inst.operands[0].mem.base.id, inst.operands[0].mem.index.id, inst.operands[0].mem.scale, (int32_t)inst.operands[0].mem.disp, src);
@@ -288,8 +304,14 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             int32_t  disp  = (int32_t)inst.operands[0].mem.disp;
             int64_t  imm   = inst.operands[1].imm;
             bool     w     = sz == 8;
+            bool     word  = sz == 2;
 
-            if (sz == 8 || sz == 4)
+            if (word)
+            {
+                emit_byte(buffer, &offset, size, 0x66);
+            }
+
+            if (sz == 8 || sz == 4 || sz == 2)
             {
                 emit_rex(buffer, &offset, size, w, false, index >= 8, base >= 8);
                 emit_byte(buffer, &offset, size, 0xC7);
@@ -305,6 +327,11 @@ int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size)
             if (sz == 1)
             {
                 emit_byte(buffer, &offset, size, (int8_t)imm);
+            }
+            else if (sz == 2)
+            {
+                emit_byte(buffer, &offset, size, (uint8_t)imm);
+                emit_byte(buffer, &offset, size, (uint8_t)(imm >> 8));
             }
             else
             {
