@@ -694,7 +694,8 @@ static AstNode *ast_clone_checked(const AstNode *node)
         break;
 
     case AST_STMT_BLOCK:
-        clone->block_stmt.stmts = ast_list_clone(node->block_stmt.stmts);
+        clone->block_stmt.stmts          = ast_list_clone(node->block_stmt.stmts);
+        clone->block_stmt.deferred_stmts = ast_list_clone(node->block_stmt.deferred_stmts);
         break;
 
     case AST_STMT_EXPR:
