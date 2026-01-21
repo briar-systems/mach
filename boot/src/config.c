@@ -123,7 +123,6 @@ void target_config_init(ConfigTarget *target)
     target->mode       = NULL;
     target->entrypoint = NULL;
     target->artifacts  = NULL;
-    target->dir_tests  = NULL;
     target->binary     = NULL;
 }
 
@@ -136,7 +135,6 @@ void target_config_dnit(ConfigTarget *target)
     free(target->name);
     free(target->entrypoint);
     free(target->artifacts);
-    free(target->dir_tests);
     free(target->binary);
 }
 
@@ -300,8 +298,6 @@ static Config *config_load_internal(const char *config_path, const char *project
         config->dir_out = strdup(dir_out->as.string);
     }
 
-
-
     toml_value_t *dir_dep = toml_table_get(project, "dir_dep");
     if (dir_dep && toml_value_is_string(dir_dep))
     {
@@ -368,12 +364,6 @@ static Config *config_load_internal(const char *config_path, const char *project
                 if (artifacts && toml_value_is_string(artifacts))
                 {
                     config->targets[i]->artifacts = strdup(artifacts->as.string);
-                }
-
-                toml_value_t *dir_tests = toml_table_get(target_table, "dir_tests");
-                if (dir_tests && toml_value_is_string(dir_tests))
-                {
-                    config->targets[i]->dir_tests = strdup(dir_tests->as.string);
                 }
 
                 toml_value_t *binary = toml_table_get(target_table, "binary");
@@ -686,10 +676,6 @@ bool config_save(Config *config, const char *config_path)
             if (target->artifacts)
             {
                 fprintf(f, "artifacts = \"%s\"\n", target->artifacts);
-            }
-            if (target->dir_tests)
-            {
-                fprintf(f, "dir_tests = \"%s\"\n", target->dir_tests);
             }
             if (target->binary)
             {
