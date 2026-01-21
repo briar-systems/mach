@@ -781,7 +781,7 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
         else
         {
             // Scalar: use simple store
-            val = ensure_in_reg(text, val, lhs->type, ctx);
+            val             = ensure_in_reg(text, val, lhs->type, ctx);
             MasmOperand mem = masm_operand_memory_simple(dst_ptr.reg.id, 0, size);
             masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
         }
@@ -794,14 +794,14 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
         if (var)
         {
             MasmOperand val = lower_expr(masm, text, rhs, ctx);
-            
+
             // For aggregate types (structs, unions, arrays), use memory copy
             if (type_is_aggregate(lhs->type) || var->size > ctx->ptr_size)
             {
-                MasmOperand dst_ptr = isa_result(ctx, ctx->ptr_size);
+                MasmOperand dst_ptr  = isa_result(ctx, ctx->ptr_size);
                 MasmOperand dst_addr = frame_mem(ctx, var->offset, ctx->ptr_size);
                 masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, dst_ptr, dst_addr));
-                
+
                 MasmOperand src_ptr = isa_tmp(ctx, ctx->ptr_size);
                 if (val.kind == MASM_OPERAND_MEMORY)
                 {
@@ -819,7 +819,7 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
                 {
                     masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
                 }
-                
+
                 emit_aggregate_copy(text, ctx, dst_ptr, src_ptr, (size_t)var->size);
             }
             else
@@ -906,7 +906,17 @@ static MasmOperand lower_unary_op(MasmSection *text, TokenKind op, MasmOperand o
     return res;
 }
 
+// Forward declaration for lower_call with optional sret buffer
+static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx, MasmOperand *provided_sret);
+
 static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx)
+{
+    return lower_call_with_sret(masm, text, expr, ctx, NULL);
+}
+
+// lower_call_with_sret: like lower_call but allows passing a pre-allocated sret buffer
+// If provided_sret is non-NULL, use it instead of allocating a new buffer
+static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx, MasmOperand *provided_sret)
 {
     // handle variadic builtins: va_start, va_end, va_arg
     if (ctx->fn_is_variadic && expr->call_expr.func && expr->call_expr.func->kind == AST_EXPR_IDENT)
@@ -1021,21 +1031,38 @@ static MasmOperand lower_call(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
     if (caller_needs_sret)
     {
-        // Allocate stack space for the return value buffer in caller's frame
-        size_t ret_size = expr->type->size;
-        // Align to 8 bytes
-        ret_size = (ret_size + 7) & ~7;
-        ctx->stack_offset -= (int32_t)ret_size;
-        sret_buf_offset = ctx->stack_offset;
+        if (provided_sret && provided_sret->kind != MASM_OPERAND_NONE)
+        {
+            // Use the provided sret buffer instead of allocating a new one
+            sret_ptr = *provided_sret;
+#ifdef MASM_DEBUG
+            fprintf(stderr, "[lower_call] sret: using provided buffer (vreg %u)\n", sret_ptr.reg.id);
+#endif
+        }
+        else
+        {
+            // Allocate stack space for the return value buffer in caller's frame
+            size_t ret_size = expr->type->size;
+            // Align to 16 bytes to ensure safe stack layout
+            ret_size = (ret_size + 15) & ~15;
+            ctx->stack_offset -= (int32_t)ret_size;
 
-        // Create the sret pointer (LEA of the buffer)
-        sret_ptr            = alloc_vreg(ctx, ctx->ptr_size);
-        MasmOperand buf_mem = frame_mem(ctx, sret_buf_offset, ctx->ptr_size);
-        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, sret_ptr, buf_mem));
+            // Ensure buffer alignment
+            if ((abs(ctx->stack_offset) % 16) != 0)
+            {
+                ctx->stack_offset -= (16 - (abs(ctx->stack_offset) % 16));
+            }
+            sret_buf_offset = ctx->stack_offset;
+
+            // Create the sret pointer (LEA of the buffer)
+            sret_ptr            = alloc_vreg(ctx, ctx->ptr_size);
+            MasmOperand buf_mem = frame_mem(ctx, sret_buf_offset, ctx->ptr_size);
+            masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, sret_ptr, buf_mem));
 
 #ifdef MASM_DEBUG
-        fprintf(stderr, "[lower_call] sret: allocated %zu bytes at rbp%+d for return type size=%zu\n", ret_size, sret_buf_offset, expr->type->size);
+            fprintf(stderr, "[lower_call] sret: allocated %zu bytes at rbp%+d for return type size=%zu\n", ret_size, sret_buf_offset, expr->type->size);
 #endif
+        }
     }
 
     // Resolve target
@@ -1839,8 +1866,26 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         MasmOperand idx = lower_expr(masm, text, expr->index_expr.index, ctx);
         idx             = ensure_in_reg(text, idx, expr->index_expr.index->type, ctx);
 
-        MasmOperand arr = lower_expr(masm, text, expr->index_expr.array, ctx);
-        Type *arr_type = expr->index_expr.array->type;
+        // Extend index to pointer size if it's smaller (e.g., i32 index on 64-bit)
+        // This is critical: when the index vreg is spilled, only its declared size
+        // is stored, but ADD reads 8 bytes. Without extension, upper bytes are garbage.
+        Type *idx_type = expr->index_expr.index->type;
+        if (idx_type && idx_type->size < ctx->ptr_size)
+        {
+            MasmOperand ext_idx = alloc_vreg(ctx, ctx->ptr_size);
+            if (type_is_signed(idx_type))
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_SEXT, ext_idx, idx));
+            }
+            else
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_ZEXT, ext_idx, idx));
+            }
+            idx = ext_idx;
+        }
+
+        MasmOperand arr      = lower_expr(masm, text, expr->index_expr.array, ctx);
+        Type       *arr_type = expr->index_expr.array->type;
 
         if (arr.kind == MASM_OPERAND_MEMORY)
         {
@@ -2046,47 +2091,65 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             if (expr)
             {
-                // return aggregate: copy into sret buffer stored in frame
-                MasmOperand src_val = lower_expr(masm, text, expr, ctx);
-                MasmOperand src_ptr;
-
-                // normalize src_val into an address
-                if (src_val.kind == MASM_OPERAND_MEMORY)
+                // Optimization: if returning a call expression that also uses sret,
+                // pass our sret buffer directly to avoid an intermediate copy
+                if (expr->kind == AST_EXPR_CALL && type_is_large_aggregate(expr->type, ctx->ptr_size))
                 {
-                    src_ptr = alloc_vreg(ctx, ctx->ptr_size);
-                    masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, src_ptr, src_val));
+                    // Load our sret pointer from frame slot
+                    MasmOperand dst_ptr  = alloc_vreg(ctx, ctx->ptr_size);
+                    MasmOperand dst_slot = frame_mem(ctx, ctx->sret_offset, ctx->ptr_size);
+                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, dst_ptr, dst_slot, masm_operand_type(MASM_TYPE_U64)));
+
+                    // Call the function with our sret buffer directly
+                    lower_call_with_sret(masm, text, expr, ctx, &dst_ptr);
+
+                    // The callee filled our buffer directly, just return the pointer
+                    ret_val = dst_ptr;
                 }
                 else
                 {
-                    src_ptr = src_val;
-                }
-                src_ptr = ensure_in_reg(text, src_ptr, NULL, ctx);
+                    // General case: copy from source to sret buffer
+                    MasmOperand src_val = lower_expr(masm, text, expr, ctx);
+                    MasmOperand src_ptr;
 
-                // load dst sret pointer from frame slot
-                MasmOperand dst_ptr  = alloc_vreg(ctx, ctx->ptr_size);
-                MasmOperand dst_slot = frame_mem(ctx, ctx->sret_offset, ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, dst_ptr, dst_slot, masm_operand_type(MASM_TYPE_U64)));
-
-                // Copy
-                int32_t size  = (int32_t)ctx->fn_ret_type->size;
-                int     chunk = 8;
-                for (int32_t off = 0; off < size; off += chunk)
-                {
-                    if (size - off < 8)
+                    // normalize src_val into an address
+                    if (src_val.kind == MASM_OPERAND_MEMORY)
                     {
-                        chunk = 1; // Simplify copy loop
+                        src_ptr = alloc_vreg(ctx, ctx->ptr_size);
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, src_ptr, src_val));
+                    }
+                    else
+                    {
+                        src_ptr = src_val;
+                    }
+                    src_ptr = ensure_in_reg(text, src_ptr, NULL, ctx);
+
+                    // load dst sret pointer from frame slot
+                    MasmOperand dst_ptr  = alloc_vreg(ctx, ctx->ptr_size);
+                    MasmOperand dst_slot = frame_mem(ctx, ctx->sret_offset, ctx->ptr_size);
+                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, dst_ptr, dst_slot, masm_operand_type(MASM_TYPE_U64)));
+
+                    // Copy
+                    int32_t size  = (int32_t)ctx->fn_ret_type->size;
+                    int     chunk = 8;
+                    for (int32_t off = 0; off < size; off += chunk)
+                    {
+                        if (size - off < 8)
+                        {
+                            chunk = 1; // Simplify copy loop
+                        }
+
+                        MasmOperand tmp = alloc_vreg(ctx, chunk);
+                        MasmOperand src = masm_operand_memory_simple(src_ptr.reg.id, (int64_t)off, (size_t)chunk);
+                        MasmOperand dst = masm_operand_memory_simple(dst_ptr.reg.id, (int64_t)off, (size_t)chunk);
+
+                        masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src, masm_operand_type(MASM_TYPE_U64)));
+                        masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, tmp, masm_operand_imm(chunk)));
                     }
 
-                    MasmOperand tmp = alloc_vreg(ctx, chunk);
-                    MasmOperand src = masm_operand_memory_simple(src_ptr.reg.id, (int64_t)off, (size_t)chunk);
-                    MasmOperand dst = masm_operand_memory_simple(dst_ptr.reg.id, (int64_t)off, (size_t)chunk);
-
-                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src, masm_operand_type(MASM_TYPE_U64)));
-                    masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, tmp, masm_operand_imm(chunk)));
+                    // return sret pointer
+                    ret_val = dst_ptr;
                 }
-
-                // return sret pointer
-                ret_val = dst_ptr;
             }
         }
         else if (expr)
@@ -2211,12 +2274,37 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         // allocate aligned stack space but keep the declared size for loads/stores
         size_t alloc_size = var_size;
         size_t align      = ctx->ptr_size ? ctx->ptr_size : 1;
+
+        // enforce 16-byte alignment for aggregate types (structs, unions, arrays)
+        // to match sret buffer alignment and prevent stack corruption
+        bool var_is_aggregate = false;
+        if (stmt->type && (stmt->type->kind == TYPE_STRUCT || stmt->type->kind == TYPE_UNION || stmt->type->kind == TYPE_ARRAY))
+        {
+            var_is_aggregate = true;
+        }
+        else if (stmt->var_stmt.init && stmt->var_stmt.init->type && (stmt->var_stmt.init->type->kind == TYPE_STRUCT || stmt->var_stmt.init->type->kind == TYPE_UNION || stmt->var_stmt.init->type->kind == TYPE_ARRAY))
+        {
+            var_is_aggregate = true;
+        }
+
+        if (var_is_aggregate)
+        {
+            align = 16;
+        }
+
         if (align > 1 && (alloc_size % align) != 0)
         {
             alloc_size += (align - (alloc_size % align));
         }
 
         ctx->stack_offset -= alloc_size;
+
+        // for aggregates, also ensure the offset itself is 16-byte aligned
+        if (var_is_aggregate && (abs(ctx->stack_offset) % 16) != 0)
+        {
+            ctx->stack_offset -= (16 - (abs(ctx->stack_offset) % 16));
+        }
+
         int32_t offset = ctx->stack_offset;
 
         // add to symbol table with the logical size (so later loads use correct width)
@@ -2231,9 +2319,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             // 1. Large aggregates (> 8 bytes)
             // 2. Any aggregate with non-power-of-2 size (5, 6, 7 bytes)
             //    because x86 MOV instructions only support 1, 2, 4, 8 byte sizes
-            bool is_aggregate = false;
+            bool is_aggregate         = false;
             bool needs_aggregate_copy = var_size > ctx->ptr_size;
-            
+
             // Check if type is an aggregate
             if (stmt->type && (stmt->type->kind == TYPE_STRUCT || stmt->type->kind == TYPE_UNION || stmt->type->kind == TYPE_ARRAY))
             {
@@ -2243,13 +2331,13 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             {
                 is_aggregate = true;
             }
-            
+
             // For aggregates, use aggregate copy if size is not a power of 2 (1, 2, 4, 8)
             if (is_aggregate && var_size != 1 && var_size != 2 && var_size != 4 && var_size != 8)
             {
                 needs_aggregate_copy = true;
             }
-            
+
             if (stmt->type && type_is_large_aggregate(stmt->type, ctx->ptr_size))
             {
                 needs_aggregate_copy = true;
@@ -2262,10 +2350,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             if (needs_aggregate_copy)
             {
 #ifdef MASM_DEBUG
-                fprintf(stderr, "[lower_stmt] VAR/VAL aggregate copy: var=%s, var_size=%zu, init_type=%p (size=%zu)\n",
-                        stmt->var_stmt.name, var_size,
-                        (void *)stmt->var_stmt.init->type,
-                        stmt->var_stmt.init->type ? stmt->var_stmt.init->type->size : 0);
+                fprintf(stderr, "[lower_stmt] VAR/VAL aggregate copy: var=%s, var_size=%zu, init_type=%p (size=%zu)\n", stmt->var_stmt.name, var_size, (void *)stmt->var_stmt.init->type, stmt->var_stmt.init->type ? stmt->var_stmt.init->type->size : 0);
 #endif
                 // Aggregate copy: normalize source to address, get dst address, copy bytes
                 MasmOperand src_ptr = isa_result(ctx, ctx->ptr_size);
@@ -2595,12 +2680,12 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
             {
                 // parse comma-separated operands
                 MasmOperand ops[10]; // dest, target(none), then up to 8 args
-                int op_count = 0;
+                int         op_count = 0;
 
                 // Make a copy to avoid interfering with outer strtok_r
                 char *operands_copy = strdup(operands);
-                char *op_saveptr = NULL;
-                char *op_str = strtok_r(operands_copy, ",", &op_saveptr);
+                char *op_saveptr    = NULL;
+                char *op_str        = strtok_r(operands_copy, ",", &op_saveptr);
                 while (op_str && op_count < 10)
                 {
                     // trim whitespace
@@ -2626,8 +2711,8 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
                     // Build instruction: dest, target(none), args...
                     // ops[0] = dest, ops[1..] = syscall args
                     MasmOperand *inst_ops = malloc(sizeof(MasmOperand) * (op_count + 1));
-                    inst_ops[0] = ops[0]; // dest
-                    inst_ops[1] = masm_operand_none(); // target (unused for syscall)
+                    inst_ops[0]           = ops[0];              // dest
+                    inst_ops[1]           = masm_operand_none(); // target (unused for syscall)
                     for (int i = 1; i < op_count; i++)
                     {
                         inst_ops[i + 1] = ops[i];
@@ -3168,10 +3253,10 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
 
         for (int i = 0; i < params->count; i++)
         {
-            int32_t  offset     = param_offsets[i];
-            size_t   param_size = param_sizes[i];
-            bool     byval_ptr  = param_byval[i];
-            bool     is_fp      = param_fp[i];
+            int32_t offset     = param_offsets[i];
+            size_t  param_size = param_sizes[i];
+            bool    byval_ptr  = param_byval[i];
+            bool    is_fp      = param_fp[i];
 
             if (!byval_ptr && is_fp)
             {

@@ -72,22 +72,17 @@ static int32_t get_vreg_offset(CodeGenContext *ctx, uint32_t vreg_id)
 
     if (ctx->vreg_offsets[idx] == 0)
     {
-        // Allocate new slot
-        // Slots start after base_stack_size.
-        // We calculate them relative to RBP.
-        // Stack grows down. Local vars are at [rbp - base_size ... rbp].
-        // Vregs will be at [rbp - total ... rbp - base_size].
-        // But we don't know total yet during scanning?
-        // We just assign an index and finalize offsets later, or just assign dynamically.
-        // Let's use a simple counter for now relative to the end of locals.
-
-        // Note: We need to know this during the pre-scan phase.
-        // This function is intended to be called during code gen, relying on pre-calculated info?
-        // Or we do it on the fly if we reserved enough space?
-        // Let's assume we scanned max_vreg_index and calculated offsets.
-        // But simply: offset = base_stack_size + (idx + 1) * 8
-        // So [rbp - offset]
         ctx->vreg_offsets[idx] = ctx->base_stack_size + (int32_t)((idx + 1) * 8);
+#ifdef MASM_DEBUG
+        fprintf(stderr, "[get_vreg_offset] vreg %u (idx %zu) -> offset %d (base=%u, total=%u)\n",
+                vreg_id, idx, ctx->vreg_offsets[idx], ctx->base_stack_size, ctx->total_stack_size);
+        // Validate: vreg offset should be within total stack size
+        if ((uint32_t)ctx->vreg_offsets[idx] > ctx->total_stack_size)
+        {
+            fprintf(stderr, "[get_vreg_offset] WARNING: vreg %u offset %d exceeds total_stack_size %u!\n",
+                    vreg_id, ctx->vreg_offsets[idx], ctx->total_stack_size);
+        }
+#endif
     }
 
     return ctx->vreg_offsets[idx];
@@ -183,8 +178,16 @@ static void load_operand(MasmSection *sec, CodeGenContext *ctx, MasmOperand op, 
             int32_t     off = get_vreg_offset(ctx, op.reg.id);
             MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -off, op.reg.size);
 
-            // Sign-extend if loading small value into 64-bit reg?
-            // For now, use MOVZX for small, MOV for 32/64
+#ifdef MASM_DEBUG
+            fprintf(stderr, "[load_operand] LOAD vreg %u (-> [RBP-%d]) to %s\n",
+                    op.reg.id, off,
+                    dest_reg == MASM_X86_RAX ? "RAX" :
+                    dest_reg == MASM_X86_RCX ? "RCX" :
+                    dest_reg == MASM_X86_RDI ? "RDI" :
+                    dest_reg == MASM_X86_RSI ? "RSI" :
+                    dest_reg == MASM_X86_R11 ? "R11" : "other");
+#endif
+
             if (op.reg.size == 1 || op.reg.size == 2)
             {
                 emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVZX_RM, dest, mem));
@@ -217,6 +220,10 @@ static void load_operand(MasmSection *sec, CodeGenContext *ctx, MasmOperand op, 
             // Load base vreg into R11 (address scratch)
             int32_t     off       = get_vreg_offset(ctx, mem.mem.base.id);
             MasmOperand base_slot = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+#ifdef MASM_DEBUG
+            fprintf(stderr, "[load_operand] Resolving mem base vreg %u from [RBP-%d] to R11\n",
+                    mem.mem.base.id, off);
+#endif
             emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_RM, masm_x86_reg(MASM_X86_R11, 8), base_slot));
             mem.mem.base.id = MASM_X86_R11;
         }
@@ -842,6 +849,29 @@ static void emit_load(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
     MasmOperand mem     = inst->operands[1];
     MasmOperand type_op = inst->operands[2]; // MASM_OPERAND_TYPE
 
+#ifdef MASM_DEBUG
+    if (dst.kind == MASM_OPERAND_REGISTER && dst.reg.id >= VREG_START)
+    {
+        int32_t dst_off = get_vreg_offset(ctx, dst.reg.id);
+        fprintf(stderr, "[emit_load] LOAD vreg %u (-> [RBP-%d]) from ", dst.reg.id, dst_off);
+        if (mem.kind == MASM_OPERAND_MEMORY)
+        {
+            if (mem.mem.base.id >= VREG_START)
+            {
+                fprintf(stderr, "[vreg_%u + %ld]\n", mem.mem.base.id, mem.mem.disp);
+            }
+            else
+            {
+                fprintf(stderr, "[reg_%u + %ld] (likely [RBP%+ld])\n", mem.mem.base.id, mem.mem.disp, mem.mem.disp);
+            }
+        }
+        else
+        {
+            fprintf(stderr, "kind=%d\n", mem.kind);
+        }
+    }
+#endif
+
     // Determine opcode and load size based on type
     uint32_t opcode    = MASM_OP_X86_MOV_RM;
     uint8_t  load_size = 8; // default to 64-bit
@@ -1019,6 +1049,35 @@ static void emit_store(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
     MasmOperand sz_op = inst->operands[2];
     uint8_t     size  = (uint8_t)sz_op.imm;
 
+#ifdef MASM_DEBUG
+    if (mem.kind == MASM_OPERAND_MEMORY)
+    {
+        if (mem.mem.base.id >= VREG_START)
+        {
+            fprintf(stderr, "[emit_store] STORE [vreg_%u + %ld] <- ", mem.mem.base.id, mem.mem.disp);
+        }
+        else
+        {
+            fprintf(stderr, "[emit_store] STORE [reg_%u + %ld] (likely [RBP%+ld]) <- ", mem.mem.base.id, mem.mem.disp, mem.mem.disp);
+        }
+        if (src.kind == MASM_OPERAND_REGISTER)
+        {
+            if (src.reg.id >= VREG_START)
+            {
+                fprintf(stderr, "vreg_%u\n", src.reg.id);
+            }
+            else
+            {
+                fprintf(stderr, "reg_%u (phys)\n", src.reg.id);
+            }
+        }
+        else
+        {
+            fprintf(stderr, "kind=%d\n", src.kind);
+        }
+    }
+#endif
+
     if (src.kind == MASM_OPERAND_REGISTER && src.reg.class == MASM_REG_CLASS_FLOAT)
     {
         MasmOperand xmm_src = masm_operand_register(0, 16); // Default to XMM0
@@ -1078,6 +1137,22 @@ static void emit_lea(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
 
 static void emit_stack_frame(MasmSection *sec, CodeGenContext *ctx)
 {
+#ifdef MASM_DEBUG
+    fprintf(stderr, "[emit_stack_frame] base_stack_size=%u, max_vreg_index=%zu, total_stack_size=%u\n",
+            ctx->base_stack_size, ctx->max_vreg_index, ctx->total_stack_size);
+    // Compute expected vreg region: from base_stack_size+8 to base_stack_size+(max_vreg_index+1)*8
+    if (ctx->max_vreg_index > 0)
+    {
+        uint32_t vreg_start = ctx->base_stack_size + 8;
+        uint32_t vreg_end = ctx->base_stack_size + (uint32_t)((ctx->max_vreg_index + 1) * 8);
+        fprintf(stderr, "[emit_stack_frame] Locals region: [RBP-1] to [RBP-%u]\n", ctx->base_stack_size);
+        fprintf(stderr, "[emit_stack_frame] Vregs region: [RBP-%u] to [RBP-%u]\n", vreg_start, vreg_end);
+        if (vreg_end > ctx->total_stack_size)
+        {
+            fprintf(stderr, "[emit_stack_frame] ERROR: vreg region exceeds allocated stack!\n");
+        }
+    }
+#endif
     // PROLOGUE
     // push rbp
     emit_inst(sec, masm_x86_inst_1(MASM_OP_X86_PUSH_R, masm_x86_reg(MASM_X86_RBP, 8)));
@@ -1130,6 +1205,36 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
     MasmOperand dst       = inst->operands[0];
     MasmOperand tgt       = inst->operands[1];
     int         arg_count = inst->operand_count - 2;
+
+#ifdef MASM_DEBUG
+    fprintf(stderr, "[emit_call] target=%s, arg_count=%d, dst_kind=%d\n",
+            tgt.kind == MASM_OPERAND_LABEL ? tgt.label : "(indirect)",
+            arg_count, dst.kind);
+    for (int i = 0; i < arg_count; i++)
+    {
+        MasmOperand arg = inst->operands[2 + i];
+        if (arg.kind == MASM_OPERAND_REGISTER)
+        {
+            int32_t off = arg.reg.id >= VREG_START ? get_vreg_offset(ctx, arg.reg.id) : 0;
+            fprintf(stderr, "[emit_call]   arg%d: vreg %u (offset %d, [RBP-%d])\n", i, arg.reg.id, off, off);
+        }
+        else
+        {
+            fprintf(stderr, "[emit_call]   arg%d: kind=%d\n", i, arg.kind);
+        }
+    }
+    // Check if this looks like an sret call (first arg is a vreg that holds a pointer)
+    if (arg_count >= 1 && inst->operands[2].kind == MASM_OPERAND_REGISTER)
+    {
+        MasmOperand sret_arg = inst->operands[2];
+        if (sret_arg.reg.id >= VREG_START)
+        {
+            int32_t sret_off = get_vreg_offset(ctx, sret_arg.reg.id);
+            fprintf(stderr, "[emit_call] SRET DEBUG: arg0 vreg %u at [RBP-%d], base_stack=%u, total_stack=%u\n",
+                    sret_arg.reg.id, sret_off, ctx->base_stack_size, ctx->total_stack_size);
+        }
+    }
+#endif
 
     MasmX86Reg int_regs[] = {MASM_X86_RDI, MASM_X86_RSI, MASM_X86_RDX, MASM_X86_RCX, MASM_X86_R8, MASM_X86_R9};
     int        int_count  = 6;
@@ -1220,6 +1325,14 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
             }
             else
             {
+#ifdef MASM_DEBUG
+                if (i == 0 && op.kind == MASM_OPERAND_REGISTER && op.reg.id >= VREG_START)
+                {
+                    int32_t off = get_vreg_offset(ctx, op.reg.id);
+                    fprintf(stderr, "[emit_call] Loading sret ptr: MOV %s, [RBP-%d]\n",
+                            int_regs[locs[i].reg_idx] == MASM_X86_RDI ? "RDI" : "other", off);
+                }
+#endif
                 load_operand(sec, ctx, op, int_regs[locs[i].reg_idx], 0);
             }
         }
