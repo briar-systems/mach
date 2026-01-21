@@ -350,13 +350,16 @@ Type *type_create_union(const char *name, TypeField *fields, int field_count)
     for (int i = 0; i < field_count; i++)
     {
         Type *field_type = fields[i].type;
-        if (field_type->size > size)
+        if (field_type)
         {
-            size = field_type->size;
-        }
-        if (field_type->alignment > alignment)
-        {
-            alignment = field_type->alignment;
+            if (field_type->size > size)
+            {
+                size = field_type->size;
+            }
+            if (field_type->alignment > alignment)
+            {
+                alignment = field_type->alignment;
+            }
         }
     }
 

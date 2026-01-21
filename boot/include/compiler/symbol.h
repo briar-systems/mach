@@ -30,6 +30,7 @@ typedef struct Symbol
     bool           is_mutable;         // false for val, true for var
     bool           is_generic;         // true if this is a generic template
     bool           is_generic_param;   // true if this is a type parameter binding
+    bool           is_being_analyzed;  // true during analysis to prevent recursion
     char          *generic_param_name; // formal parameter name for generic type params
     struct Symbol *next;               // for linked list in scope
 } Symbol;

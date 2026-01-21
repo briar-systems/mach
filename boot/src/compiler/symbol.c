@@ -22,6 +22,7 @@ Symbol *symbol_create(const char *name, SymbolKind kind, const char *module_path
     symbol->is_mutable         = false;
     symbol->is_generic         = false;
     symbol->is_generic_param   = false;
+    symbol->is_being_analyzed  = false;
     symbol->generic_param_name = NULL;
     symbol->next               = NULL;
 

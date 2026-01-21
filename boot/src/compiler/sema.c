@@ -1800,6 +1800,13 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
         node->symbol = sym;
     }
 
+    // if type already resolved, skip (handles re-entry during recursive type resolution)
+    if (sym->type)
+    {
+        node->type = sym->type;
+        return 0;
+    }
+
     // check for generics - if present, defer field resolution until instantiation
     if (node->rec_stmt.generics && node->rec_stmt.generics->count > 0)
     {
@@ -1819,6 +1826,7 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
             return -1;
         }
 
+        // initialize field names first
         for (int i = 0; i < field_count; i++)
         {
             AstNode *field_node = node->rec_stmt.fields->items[i];
@@ -1827,25 +1835,13 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
                 free(fields);
                 return -1;
             }
-
             fields[i].name   = strdup(field_node->field_stmt.name);
-            fields[i].type   = sema_resolve_type(sema, field_node->field_stmt.type);
-            fields[i].offset = 0; // calculated in type_create_struct
-
-            if (!fields[i].type)
-            {
-                sema_error(sema, field_node->token, "failed to resolve field type");
-                for (int j = 0; j <= i; j++)
-                {
-                    free(fields[j].name);
-                }
-                free(fields);
-                return -1;
-            }
+            fields[i].type   = NULL;
+            fields[i].offset = 0;
         }
     }
 
-    // create record type
+    // create record type FIRST (with NULL field types) so recursive references can find it
     Type *rec_type = type_create_struct(node->rec_stmt.name, fields, field_count);
     if (!rec_type)
     {
@@ -1860,8 +1856,61 @@ static int sema_analyze_rec(Sema *sema, AstNode *node)
         return -1;
     }
 
+    // assign type to symbol BEFORE resolving field types (enables recursive types)
     sym->type  = rec_type;
     node->type = rec_type;
+
+    // NOW resolve field types (recursive references will find sym->type)
+    if (field_count > 0)
+    {
+        for (int i = 0; i < field_count; i++)
+        {
+            AstNode *field_node = node->rec_stmt.fields->items[i];
+            Type    *field_type = sema_resolve_type(sema, field_node->field_stmt.type);
+
+            if (!field_type)
+            {
+                sema_error(sema, field_node->token, "failed to resolve field type");
+                // don't free - type is already assigned and may be in use
+                return -1;
+            }
+
+            rec_type->structure.fields[i].type = field_type;
+        }
+
+        // recalculate size and alignment now that field types are resolved
+        size_t offset    = 0;
+        size_t max_align = 1;
+        for (int i = 0; i < field_count; i++)
+        {
+            Type  *ft    = rec_type->structure.fields[i].type;
+            size_t align = ft ? ft->alignment : 1;
+            size_t size  = ft ? ft->size : 0;
+
+            if (align > max_align)
+            {
+                max_align = align;
+            }
+
+            // align offset
+            if (align > 0)
+            {
+                offset = (offset + align - 1) & ~(align - 1);
+            }
+
+            rec_type->structure.fields[i].offset = offset;
+            offset += size;
+        }
+
+        // final padding
+        if (max_align > 0)
+        {
+            offset = (offset + max_align - 1) & ~(max_align - 1);
+        }
+
+        rec_type->size  = offset;
+        rec_type->alignment = max_align;
+    }
 
     return 0;
 }
@@ -1898,6 +1947,13 @@ static int sema_analyze_uni(Sema *sema, AstNode *node)
         node->symbol = sym;
     }
 
+    // if type already resolved, skip (handles re-entry during recursive type resolution)
+    if (sym->type)
+    {
+        node->type = sym->type;
+        return 0;
+    }
+
     // check for generics - if present, defer field resolution until instantiation
     if (node->uni_stmt.generics && node->uni_stmt.generics->count > 0)
     {
@@ -1917,6 +1973,7 @@ static int sema_analyze_uni(Sema *sema, AstNode *node)
             return -1;
         }
 
+        // initialize field names first
         for (int i = 0; i < field_count; i++)
         {
             AstNode *field_node = node->uni_stmt.fields->items[i];
@@ -1925,25 +1982,13 @@ static int sema_analyze_uni(Sema *sema, AstNode *node)
                 free(fields);
                 return -1;
             }
-
             fields[i].name   = strdup(field_node->field_stmt.name);
-            fields[i].type   = sema_resolve_type(sema, field_node->field_stmt.type);
-            fields[i].offset = 0; // unused for unions
-
-            if (!fields[i].type)
-            {
-                sema_error(sema, field_node->token, "failed to resolve field type");
-                for (int j = 0; j <= i; j++)
-                {
-                    free(fields[j].name);
-                }
-                free(fields);
-                return -1;
-            }
+            fields[i].type   = NULL;
+            fields[i].offset = 0;
         }
     }
 
-    // create union type
+    // create union type FIRST (with NULL field types) so recursive references can find it
     Type *uni_type = type_create_union(node->uni_stmt.name, fields, field_count);
     if (!uni_type)
     {
@@ -1958,8 +2003,48 @@ static int sema_analyze_uni(Sema *sema, AstNode *node)
         return -1;
     }
 
+    // assign type to symbol BEFORE resolving field types (enables recursive types)
     sym->type  = uni_type;
     node->type = uni_type;
+
+    // NOW resolve field types (recursive references will find sym->type)
+    if (field_count > 0)
+    {
+        size_t max_size  = 0;
+        size_t max_align = 1;
+
+        for (int i = 0; i < field_count; i++)
+        {
+            AstNode *field_node = node->uni_stmt.fields->items[i];
+            Type    *field_type = sema_resolve_type(sema, field_node->field_stmt.type);
+
+            if (!field_type)
+            {
+                sema_error(sema, field_node->token, "failed to resolve field type");
+                return -1;
+            }
+
+            uni_type->union_type.fields[i].type = field_type;
+
+            if (field_type->size > max_size)
+            {
+                max_size = field_type->size;
+            }
+            if (field_type->alignment > max_align)
+            {
+                max_align = field_type->alignment;
+            }
+        }
+
+        // union size is size of largest field, aligned
+        if (max_align > 0)
+        {
+            max_size = (max_size + max_align - 1) & ~(max_align - 1);
+        }
+
+        uni_type->size  = max_size + 8; // +8 for tag
+        uni_type->alignment = max_align > 8 ? max_align : 8;
+    }
 
     return 0;
 }
@@ -4598,6 +4683,13 @@ static void sema_maybe_analyze_symbol_decl_in_module(Sema *sema, SemaModule *mod
         return;
     }
 
+    // prevent infinite recursion for recursive types (e.g., rec Node { child: *Node; })
+    if (sym->is_being_analyzed)
+    {
+        return;
+    }
+    sym->is_being_analyzed = true;
+
     SemaModule  *saved_module      = sema->current_module;
     SymbolTable *saved_table       = sema->current_table;
     const char  *saved_module_path = sema->module_path;
@@ -4615,6 +4707,8 @@ static void sema_maybe_analyze_symbol_decl_in_module(Sema *sema, SemaModule *mod
     }
 
     (void)sema_analyze_stmt(sema, sym->decl);
+
+    sym->is_being_analyzed = false;
 
     sema->current_module               = saved_module;
     sema->current_table                = saved_table;
