@@ -120,10 +120,10 @@ Continue development of the self-hosted Mach compiler (`imach`). The compiler in
   - [ ] `dep tidy`
 
 ## Documentation & Housekeeping
-- [ ] Document the bootstrap test runner system (external runner architecture)
-  - [ ] Update `doc/testing.md` with new architecture details
-  - [ ] Document per-test isolation and crash detection
-  - [ ] Document `std.runtime` integration for portable tests
+- [x] Document the bootstrap test runner system (external runner architecture)
+  - [x] Update `doc/testing.md` with new architecture details
+  - [x] Document per-test isolation and crash detection
+  - [x] Document `std.runtime` integration for portable tests
 - [ ] Add any user-specified items below
 
 ## User-Added Items
@@ -204,3 +204,14 @@ Continue development of the self-hosted Mach compiler (`imach`). The compiler in
   - Build works correctly for imach binary
   - Issue appears to be bootstrap compiler limitation with large modules in test context
   - Parser correctness to be verified via integration testing when build command is implemented
+
+## 2026-01-22T02:00 UTC
+- Updated `doc/testing.md` with new external test runner architecture
+- Key documentation changes:
+  - Added `--filter`, `-m`, `-h` command-line options
+  - Documented per-test isolation (each test runs in own process)
+  - Documented crash detection (exit codes, signal handling)
+  - Documented platform portability via `std.runtime`
+  - Updated "How it works" section with new per-test compilation flow
+  - Documented test binary location (`.tests` hidden directory)
+  - Removed outdated `dir_tests` configuration section (now hardcoded to `.tests`)

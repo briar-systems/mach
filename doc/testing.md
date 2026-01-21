@@ -10,8 +10,12 @@ Tests are defined using the `test` keyword and executed via the `cmach test` com
   - [Using helper functions](#using-helper-functions)
 - [Running tests](#running-tests)
   - [Command syntax](#command-syntax)
+  - [Filtering tests](#filtering-tests)
   - [Output format](#output-format)
-- [Configuration](#configuration)
+- [Architecture](#architecture)
+  - [Per-test isolation](#per-test-isolation)
+  - [Crash detection](#crash-detection)
+  - [Platform portability](#platform-portability)
 - [How it works](#how-it-works)
 
 
@@ -22,9 +26,9 @@ When you run `cmach test`, the compiler:
 
 1. Scans all `.mach` files in the project's source directory
 2. Collects all `test` blocks from each file
-3. Transforms them into executable test functions
-4. Builds and runs each module's tests as a separate binary
-5. Reports results per-module and in aggregate
+3. Compiles each test as a separate executable
+4. Runs each test individually in its own process
+5. Reports results per-test and in aggregate
 
 
 ## Writing tests
@@ -95,13 +99,16 @@ test "factorial of 0" {
 ### Command syntax
 
 ```
-cmach test [--target <name>] [path]
+cmach test [options] [path]
 ```
 
-| Option             | Description                                           |
-|--------------------|-------------------------------------------------------|
-| `--target <name>`  | Select a specific target from `mach.toml`             |
-| `path`             | Project directory (defaults to current directory)     |
+| Option               | Description                                           |
+|----------------------|-------------------------------------------------------|
+| `--target <name>`    | Select a specific target from `mach.toml`             |
+| `--filter <pattern>` | Only run tests whose name or module path matches      |
+| `-m`, `--modules`    | Show module-level progress during execution           |
+| `-h`, `--help`       | Show help message                                     |
+| `path`               | Project directory (defaults to current directory)     |
 
 Examples:
 
@@ -111,90 +118,139 @@ cmach test .
 
 # run tests for a specific target
 cmach test --target linux .
+
+# run only tests matching a pattern
+cmach test --filter "lexer" .
+
+# show module progress
+cmach test -m .
+```
+
+
+### Filtering tests
+
+The `--filter` option matches against both module paths and test names.
+A test runs if the pattern appears anywhere in either:
+
+```sh
+# runs tests in modules containing "parser"
+cmach test --filter parser .
+
+# runs tests with "edge case" in their name
+cmach test --filter "edge case" .
 ```
 
 
 ### Output format
 
-The test runner outputs results per-module, then a final summary:
+By default, the test runner shows only failures.
+Passing tests are silent unless you use verbose options.
+
+For each failing test:
 
 ```
-[test] mach.tests.example (3)
-pass: example: first test
-pass: example: second test
-fail: example: broken test
-[fail] mach.tests.example (1 failed)
-[test] mach.tests.other (2)
-pass: other: test one
-pass: other: test two
-[pass] mach.tests.other
-tests: 5, passed: 4, failed: 1
+fail: module_name: test name here
 ```
 
-Each line shows:
-- `pass:` or `fail:` prefix indicating the test result
-- The test name as defined in the source
-
-Module-level status:
-- `[pass]` — all tests in the module passed
-- `[fail]` — one or more tests failed (shows count)
-- `[crash]` — the test process terminated due to a signal (e.g., segfault)
-
-The final summary shows total counts:
-- `tests` — total number of tests across all modules
-- `passed` — tests that returned non-zero
-- `failed` — tests that returned zero
-- `crashed` — modules that terminated via signal (only shown if > 0)
-- `compile errors` — modules that failed to compile (only shown if > 0)
-
-
-## Configuration
-
-Tests require the `dir_tests` field in your target configuration.
-This specifies where test binaries are written:
-
-```toml
-[project]
-id = "myapp"
-dir_src = "src"
-dir_out = "out"
-
-[targets.linux]
-os = "linux"
-isa = "x86_64"
-abi = "sysv64"
-dir_tests = "tests"
-# ...
-```
-
-With this configuration, test binaries are placed under:
+For crashed tests:
 
 ```
-out/linux/tests/
+crash: module_name: test name here
 ```
 
-See [config.md](config.md#dir_tests) for more details.
+The final summary shows aggregate counts:
+
+```
+--- results ---
+passed:  145
+failed:  3
+crashed: 1
+total:   149
+```
+
+With `-m` (modules), you also see progress per module:
+
+```
+[test] mach.tests.lexer (15)
+[test] mach.tests.parser (23)
+fail: parser: unexpected token handling
+[test] mach.tests.sema (8)
+```
+
+
+## Architecture
+
+### Per-test isolation
+
+Each test runs in its own process.
+The test runner compiles each test block into a separate executable, then executes them one at a time.
+
+Benefits:
+- A crash in one test doesn't prevent other tests from running
+- Test output is naturally isolated
+- Side effects from one test can't affect others
+- Exact identification of which test crashed
+
+The previous architecture bundled all tests in a module into a single executable.
+If any test crashed (e.g., null pointer dereference), the entire module failed and remaining tests were skipped.
+The new architecture eliminates this problem.
+
+
+### Crash detection
+
+When a test process terminates abnormally (signal on Unix, exception on Windows), the test runner detects it and reports a crash:
+
+| Exit code   | Meaning                                |
+|-------------|----------------------------------------|
+| 0           | Test passed (returned non-zero)        |
+| 1           | Test failed (returned zero)            |
+| > 128       | Test crashed (signal number = code-128)|
+
+On Unix, `SIGSEGV` (11) results in exit code 139.
+The runner continues to the next test after any crash.
+
+
+### Platform portability
+
+Test executables use `std.runtime` for their entry point.
+This module provides a portable `_start` that:
+1. Calls the test's `main` function
+2. Exits with the return code
+
+Because `std.runtime` handles platform-specific details, tests work across all supported targets without inline assembly in the test harness.
+
+Adding support for a new platform requires only updating `std.runtime` — the test runner itself requires no changes.
 
 
 ## How it works
 
-The test harness performs these steps for each module containing tests:
+The test harness performs these steps:
 
-1. **Parse** the source file and identify all `test` blocks
-2. **Transform** each test block into a named function that returns `i64`
-3. **Generate** a `__mach_test_main` function that:
-   - Calls each test function
-   - Checks if the return value is non-zero (pass) or zero (fail)
-   - Prints the result with the test name
-   - Tracks total failures
-4. **Generate** a `_start` entrypoint that calls `__mach_test_main` and exits with the failure count
-5. **Compile** the transformed module to an object file
-6. **Link** the object file into a standalone executable (using `cc -nostdlib`)
-7. **Execute** the binary and capture the exit code
-8. **Report** results based on the exit code:
-   - Exit code 0 means all tests passed
-   - Exit code 1-128 indicates the number of failed tests
-   - Exit code > 128 indicates the process was killed by a signal
+1. **Scan** all `.mach` files in the project's source directory
+2. **Parse** each file and identify `test` blocks
+3. **For each test:**
+   a. Clone the original AST, excluding other tests
+   b. Add `use std.runtime;` for portable entry point
+   c. Transform the test body into a named function returning `i64`
+   d. Generate a `main` function that:
+      - Calls the test function
+      - Returns 0 if test passed (non-zero return)
+      - Returns 1 if test failed (zero return)
+   e. Compile to a standalone executable
+   f. Execute the binary
+   g. Record the result based on exit code
+4. **Report** aggregate results
 
-Each module's tests run in isolation as a separate process.
-This ensures that a crash in one module doesn't prevent other modules from being tested.
+Test binaries are placed in a hidden `.tests` directory under the output path:
+
+```
+out/<target>/.tests/<module>/<test_name>
+```
+
+For example, a test named `"lexer: simple identifier"` in module `mach.compiler.lexer` might produce:
+
+```
+out/linux/.tests/mach_compiler_lexer/lexer__simple_identifier
+```
+
+The test runner cleans up old test binaries before each run.
