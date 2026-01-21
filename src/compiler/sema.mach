@@ -9,6 +9,7 @@ use allocator: std.allocator;
 use ast:    mach.compiler.ast;
 use symbol: mach.compiler.symbol;
 use ty:     mach.compiler.type;
+use token:  mach.compiler.token;
 
 # mach.compiler.sema: semantic analysis.
 # ---
@@ -16,32 +17,41 @@ use ty:     mach.compiler.type;
 
 # SemaError: a semantic analysis error.
 # ---
-# node:    AST node where error occurred
+# pos:     position in source where error occurred
 # message: error description
 pub rec SemaError {
-    node:    *ast.Node;
+    pos:     i32;
+    line:    i32;
+    col:     i32;
     message: str;
 }
 
 # Sema: semantic analyzer context.
 # ---
-# alloc:        allocator for analysis
-# symbols:      symbol table
-# types:        type context
-# module_path:  current module path
-# errors:       list of errors
-# error_count:  number of errors
-# error_cap:    allocated capacity
+# alloc:          allocator for analysis
+# symbols:        symbol table
+# types:          type context
+# module_path:    current module path
+# file_path:      path to current file
+# source:         source text for error reporting
+# errors:         list of errors
+# error_count:    number of errors
+# error_cap:      allocated capacity
+# current_fn:     current function being analyzed (for return type checking)
+# loop_depth:     nesting depth of loops (for break/continue checking)
 pub rec Sema {
-    alloc:       *allocator.Allocator;
-    symbols:     symbol.Table;
-    types:       ty.TypeContext;
-    module_path: str;
-    file_path:   str;
-    source:      str;
-    errors:      *SemaError;
-    error_count: i32;
-    error_cap:   i32;
+    alloc:          *allocator.Allocator;
+    symbols:        symbol.Table;
+    types:          ty.TypeContext;
+    module_path:    str;
+    file_path:      str;
+    source:         str;
+    errors:         *SemaError;
+    error_count:    i32;
+    error_cap:      i32;
+    current_fn:     *symbol.Symbol;
+    current_fn_ret: *ty.Type;
+    loop_depth:     i32;
 }
 
 # init: create a new semantic analyzer.
@@ -74,6 +84,9 @@ pub fun init(alloc: *allocator.Allocator, module_path: str) Result[Sema, str] {
     sema.errors = nil;
     sema.error_count = 0;
     sema.error_cap = 0;
+    sema.current_fn = nil;
+    sema.current_fn_ret = nil;
+    sema.loop_depth = 0;
 
     ret ok[Sema, str](sema);
 }
@@ -81,7 +94,6 @@ pub fun init(alloc: *allocator.Allocator, module_path: str) Result[Sema, str] {
 # deinit: free all resources associated with the analyzer.
 # ---
 # sema: analyzer to clean up
-# ret:  none
 pub fun deinit(sema: *Sema) {
     if (sema == nil) {
         ret;
@@ -100,7 +112,6 @@ pub fun deinit(sema: *Sema) {
 # sema:      analyzer
 # file_path: path to the file being analyzed
 # source:    source text of the file
-# ret:       none
 pub fun set_file_context(sema: *Sema, file_path: str, source: str) {
     if (sema == nil) {
         ret;
@@ -110,10 +121,1284 @@ pub fun set_file_context(sema: *Sema, file_path: str, source: str) {
     sema.source = source;
 }
 
+# --- error reporting ---
+
+# report_error: record a semantic error at a token position.
+fun report_error(sema: *Sema, tok: token.Token, message: str) {
+    if (sema == nil) {
+        ret;
+    }
+
+    # grow errors array if needed
+    if (sema.error_count >= sema.error_cap) {
+        var new_cap: i32 = 8;
+        if (sema.error_cap > 0) {
+            new_cap = sema.error_cap * 2;
+        }
+
+        val r: Result[*SemaError, allocator.AllocError] = sema.alloc.resize[SemaError](
+            sema.errors,
+            sema.error_cap::usize,
+            new_cap::usize
+        );
+
+        if (r.is_err()) {
+            ret;
+        }
+
+        sema.errors = r.unwrap_ok();
+        sema.error_cap = new_cap;
+    }
+
+    val idx: i32 = sema.error_count;
+    sema.errors[idx].pos = tok.pos;
+    sema.errors[idx].line = tok.line;
+    sema.errors[idx].col = tok.col;
+    sema.errors[idx].message = message;
+    sema.error_count = sema.error_count + 1;
+}
+
+# report_error_node: record a semantic error at a node's token.
+fun report_error_node(sema: *Sema, node: *ast.Node, message: str) {
+    if (node == nil) {
+        ret;
+    }
+    report_error(sema, node.tok, message);
+}
+
+# get_error_count: get the number of semantic errors.
+pub fun get_error_count(sema: *Sema) i32 {
+    if (sema == nil) {
+        ret 0;
+    }
+    ret sema.error_count;
+}
+
+# has_errors: check if any errors occurred.
+pub fun has_errors(sema: *Sema) bool {
+    ret get_error_count(sema) > 0;
+}
+
+# get_symbol_table: get the symbol table.
+pub fun get_symbol_table(sema: *Sema) *symbol.Table {
+    if (sema == nil) {
+        ret nil;
+    }
+    ret ?sema.symbols;
+}
+
+# get_type_context: get the type context.
+pub fun get_type_context(sema: *Sema) *ty.TypeContext {
+    if (sema == nil) {
+        ret nil;
+    }
+    ret ?sema.types;
+}
+
+# --- type resolution ---
+
+# resolve_type: resolve an AST type node to a Type.
+# ---
+# sema:      analyzer
+# type_node: AST node representing a type
+# ret:       resolved Type or nil on failure
+pub fun resolve_type(sema: *Sema, type_node: *ast.Node) *ty.Type {
+    if (sema == nil || type_node == nil) {
+        ret nil;
+    }
+
+    val ctx: *ty.TypeContext = ?sema.types;
+    val kind: ast.NodeKind = type_node.kind;
+
+    # type_name: primitive or user-defined type
+    if (kind == ast.NODE_TYPE_NAME) {
+        ret resolve_type_name(sema, type_node);
+    }
+
+    # type_ptr: *T (mutable pointer)
+    if (kind == ast.NODE_TYPE_PTR) {
+        val inner: *ty.Type = resolve_type(sema, type_node.children);
+        if (inner == nil) {
+            ret nil;
+        }
+        val res: Result[*ty.Type, str] = ty.pointer_type(ctx, inner, true);
+        if (res.is_err()) {
+            report_error_node(sema, type_node, "failed to create pointer type");
+            ret nil;
+        }
+        ret res.unwrap_ok();
+    }
+
+    # type_ref: &T (immutable pointer)
+    if (kind == ast.NODE_TYPE_REF) {
+        val inner: *ty.Type = resolve_type(sema, type_node.children);
+        if (inner == nil) {
+            ret nil;
+        }
+        val res: Result[*ty.Type, str] = ty.pointer_type(ctx, inner, false);
+        if (res.is_err()) {
+            report_error_node(sema, type_node, "failed to create ref type");
+            ret nil;
+        }
+        ret res.unwrap_ok();
+    }
+
+    # type_array: [N]T
+    if (kind == ast.NODE_TYPE_ARRAY) {
+        val elem_type: *ty.Type = resolve_type(sema, type_node.children);
+        if (elem_type == nil) {
+            ret nil;
+        }
+        # array length stored in data as integer
+        val len: usize = type_node.data::usize;
+        val res: Result[*ty.Type, str] = ty.array_type(ctx, elem_type, len);
+        if (res.is_err()) {
+            report_error_node(sema, type_node, "failed to create array type");
+            ret nil;
+        }
+        ret res.unwrap_ok();
+    }
+
+    # type_fun: fun(...) T
+    if (kind == ast.NODE_TYPE_FUN) {
+        ret resolve_function_type(sema, type_node);
+    }
+
+    report_error_node(sema, type_node, "unsupported type syntax");
+    ret nil;
+}
+
+# resolve_type_name: resolve a named type (primitive or user-defined).
+fun resolve_type_name(sema: *Sema, type_node: *ast.Node) *ty.Type {
+    val name: str = ast.get_name(type_node);
+    if (name == nil) {
+        report_error_node(sema, type_node, "type name is nil");
+        ret nil;
+    }
+
+    val ctx: *ty.TypeContext = ?sema.types;
+
+    # check for primitive type
+    val prim_opt: Option[ty.TypeKind] = ty.primitive_kind_from_name(name);
+    if (prim_opt.is_some()) {
+        val prim_kind: ty.TypeKind = prim_opt.unwrap();
+        val res: Result[*ty.Type, str] = ty.primitive_type(ctx, prim_kind);
+        if (res.is_err()) {
+            report_error_node(sema, type_node, "failed to get primitive type");
+            ret nil;
+        }
+        ret res.unwrap_ok();
+    }
+
+    # look up user-defined type in symbol table
+    val sym_opt: Option[*symbol.Symbol] = symbol.lookup(?sema.symbols, name);
+    if (sym_opt.is_none()) {
+        report_error_node(sema, type_node, "undefined type");
+        ret nil;
+    }
+
+    val sym: *symbol.Symbol = sym_opt.unwrap();
+    if (!symbol.is_type_symbol(sym)) {
+        report_error_node(sema, type_node, "not a type");
+        ret nil;
+    }
+
+    if (sym.resolved_type == nil) {
+        report_error_node(sema, type_node, "type not yet resolved");
+        ret nil;
+    }
+
+    ret sym.resolved_type;
+}
+
+# resolve_function_type: resolve a function type signature.
+fun resolve_function_type(sema: *Sema, type_node: *ast.Node) *ty.Type {
+    # function type nodes store params in children and return type in extra
+    val ctx: *ty.TypeContext = ?sema.types;
+
+    # resolve return type
+    var ret_type: *ty.Type = nil;
+    if (type_node.extra != nil) {
+        ret_type = resolve_type(sema, type_node.extra::*ast.Node);
+    }
+    if (ret_type == nil) {
+        # default to void
+        val res: Result[*ty.Type, str] = ty.primitive_type(ctx, ty.TY_VOID);
+        if (res.is_ok()) {
+            ret_type = res.unwrap_ok();
+        }
+    }
+
+    # resolve parameters - for now simplified, just return function type with void
+    val res: Result[*ty.Type, str] = ty.function_type(ctx, nil, 0, ret_type);
+    if (res.is_err()) {
+        report_error_node(sema, type_node, "failed to create function type");
+        ret nil;
+    }
+
+    ret res.unwrap_ok();
+}
+
+# --- expression type checking ---
+
+# check_expr: type-check an expression and return its type.
+# ---
+# sema: analyzer
+# expr: expression AST node
+# ret:  type of expression or nil on error
+pub fun check_expr(sema: *Sema, expr: *ast.Node) *ty.Type {
+    if (sema == nil || expr == nil) {
+        ret nil;
+    }
+
+    val kind: ast.NodeKind = expr.kind;
+    val ctx: *ty.TypeContext = ?sema.types;
+
+    # literals
+    if (kind == ast.NODE_EXPR_LIT_INT) {
+        # default to i64 for integer literals
+        val res: Result[*ty.Type, str] = ty.primitive_type(ctx, ty.TY_I64);
+        if (res.is_ok()) {
+            ret res.unwrap_ok();
+        }
+        ret nil;
+    }
+
+    if (kind == ast.NODE_EXPR_LIT_FLOAT) {
+        val res: Result[*ty.Type, str] = ty.primitive_type(ctx, ty.TY_F64);
+        if (res.is_ok()) {
+            ret res.unwrap_ok();
+        }
+        ret nil;
+    }
+
+    if (kind == ast.NODE_EXPR_LIT_CHAR) {
+        val res: Result[*ty.Type, str] = ty.primitive_type(ctx, ty.TY_U8);
+        if (res.is_ok()) {
+            ret res.unwrap_ok();
+        }
+        ret nil;
+    }
+
+    if (kind == ast.NODE_EXPR_LIT_STR) {
+        val res: Result[*ty.Type, str] = ty.primitive_type(ctx, ty.TY_STR);
+        if (res.is_ok()) {
+            ret res.unwrap_ok();
+        }
+        ret nil;
+    }
+
+    if (kind == ast.NODE_EXPR_LIT_NIL) {
+        val res: Result[*ty.Type, str] = ty.primitive_type(ctx, ty.TY_NIL);
+        if (res.is_ok()) {
+            ret res.unwrap_ok();
+        }
+        ret nil;
+    }
+
+    if (kind == ast.NODE_EXPR_LIT_BOOL) {
+        val res: Result[*ty.Type, str] = ty.primitive_type(ctx, ty.TY_BOOL);
+        if (res.is_ok()) {
+            ret res.unwrap_ok();
+        }
+        ret nil;
+    }
+
+    # identifier
+    if (kind == ast.NODE_EXPR_IDENT) {
+        ret check_ident(sema, expr);
+    }
+
+    # binary expression
+    if (kind == ast.NODE_EXPR_BINARY) {
+        ret check_binary(sema, expr);
+    }
+
+    # unary expression
+    if (kind == ast.NODE_EXPR_UNARY) {
+        ret check_unary(sema, expr);
+    }
+
+    # function call
+    if (kind == ast.NODE_EXPR_CALL) {
+        ret check_call(sema, expr);
+    }
+
+    # field access
+    if (kind == ast.NODE_EXPR_FIELD) {
+        ret check_field(sema, expr);
+    }
+
+    # index
+    if (kind == ast.NODE_EXPR_INDEX) {
+        ret check_index(sema, expr);
+    }
+
+    # cast
+    if (kind == ast.NODE_EXPR_CAST) {
+        ret check_cast(sema, expr);
+    }
+
+    # address-of
+    if (kind == ast.NODE_EXPR_ADDR) {
+        ret check_addr(sema, expr);
+    }
+
+    # dereference
+    if (kind == ast.NODE_EXPR_DEREF) {
+        ret check_deref(sema, expr);
+    }
+
+    # parenthesized expression
+    if (kind == ast.NODE_EXPR_PAREN) {
+        ret check_expr(sema, expr.children);
+    }
+
+    report_error_node(sema, expr, "unsupported expression");
+    ret nil;
+}
+
+# check_ident: type-check an identifier expression.
+fun check_ident(sema: *Sema, expr: *ast.Node) *ty.Type {
+    val name: str = ast.get_name(expr);
+    if (name == nil) {
+        report_error_node(sema, expr, "identifier has no name");
+        ret nil;
+    }
+
+    val sym_opt: Option[*symbol.Symbol] = symbol.lookup(?sema.symbols, name);
+    if (sym_opt.is_none()) {
+        report_error_node(sema, expr, "undefined identifier");
+        ret nil;
+    }
+
+    val sym: *symbol.Symbol = sym_opt.unwrap();
+    if (sym.resolved_type == nil) {
+        report_error_node(sema, expr, "identifier type not resolved");
+        ret nil;
+    }
+
+    ret sym.resolved_type;
+}
+
+# check_binary: type-check a binary expression.
+fun check_binary(sema: *Sema, expr: *ast.Node) *ty.Type {
+    val ctx: *ty.TypeContext = ?sema.types;
+
+    # binary expression has two children: left and right
+    val left: *ast.Node = ast.get_child(expr, 0);
+    val right: *ast.Node = ast.get_child(expr, 1);
+
+    if (left == nil || right == nil) {
+        report_error_node(sema, expr, "binary expression missing operand");
+        ret nil;
+    }
+
+    val left_type: *ty.Type = check_expr(sema, left);
+    val right_type: *ty.Type = check_expr(sema, right);
+
+    if (left_type == nil || right_type == nil) {
+        ret nil;
+    }
+
+    # operator is stored in data as token tag
+    val op: u8 = expr.data::u8;
+
+    # arithmetic operators: +, -, *, /, %
+    if (op == token.TAG_PLUS || op == token.TAG_MINUS ||
+        op == token.TAG_STAR || op == token.TAG_SLASH || op == token.TAG_PERCENT) {
+        if (!ty.is_numeric(left_type) || !ty.is_numeric(right_type)) {
+            report_error_node(sema, expr, "arithmetic requires numeric operands");
+            ret nil;
+        }
+        # result is the wider type (simplified: just use left)
+        ret left_type;
+    }
+
+    # comparison operators: ==, !=, <, >, <=, >=
+    if (op == token.TAG_EQ_EQ || op == token.TAG_BANG_EQ ||
+        op == token.TAG_LESS || op == token.TAG_GREATER ||
+        op == token.TAG_LESS_EQ || op == token.TAG_GREATER_EQ) {
+        # comparison always returns bool
+        val res: Result[*ty.Type, str] = ty.primitive_type(ctx, ty.TY_BOOL);
+        if (res.is_ok()) {
+            ret res.unwrap_ok();
+        }
+        ret nil;
+    }
+
+    # logical operators: &&, ||
+    if (op == token.TAG_AMP_AMP || op == token.TAG_PIPE_PIPE) {
+        if (!ty.is_bool(left_type) || !ty.is_bool(right_type)) {
+            report_error_node(sema, expr, "logical operators require bool operands");
+            ret nil;
+        }
+        ret left_type;
+    }
+
+    # bitwise operators: &, |, ^, <<, >>
+    if (op == token.TAG_AMP || op == token.TAG_PIPE || op == token.TAG_CARET ||
+        op == token.TAG_LESS_LESS || op == token.TAG_GREATER_GREATER) {
+        if (!ty.is_integer(left_type) || !ty.is_integer(right_type)) {
+            report_error_node(sema, expr, "bitwise operators require integer operands");
+            ret nil;
+        }
+        ret left_type;
+    }
+
+    # assignment operator: =
+    if (op == token.TAG_EQ) {
+        if (!ty.can_assign(right_type, left_type)) {
+            report_error_node(sema, expr, "type mismatch in assignment");
+            ret nil;
+        }
+        ret left_type;
+    }
+
+    report_error_node(sema, expr, "unknown binary operator");
+    ret nil;
+}
+
+# check_unary: type-check a unary expression.
+fun check_unary(sema: *Sema, expr: *ast.Node) *ty.Type {
+    val ctx: *ty.TypeContext = ?sema.types;
+
+    val operand: *ast.Node = expr.children;
+    if (operand == nil) {
+        report_error_node(sema, expr, "unary expression missing operand");
+        ret nil;
+    }
+
+    val operand_type: *ty.Type = check_expr(sema, operand);
+    if (operand_type == nil) {
+        ret nil;
+    }
+
+    # operator stored in data
+    val op: u8 = expr.data::u8;
+
+    # negation: -
+    if (op == token.TAG_MINUS) {
+        if (!ty.is_numeric(operand_type)) {
+            report_error_node(sema, expr, "negation requires numeric operand");
+            ret nil;
+        }
+        ret operand_type;
+    }
+
+    # logical not: !
+    if (op == token.TAG_BANG) {
+        if (!ty.is_bool(operand_type)) {
+            report_error_node(sema, expr, "logical not requires bool operand");
+            ret nil;
+        }
+        ret operand_type;
+    }
+
+    # bitwise not: ~
+    if (op == token.TAG_TILDE) {
+        if (!ty.is_integer(operand_type)) {
+            report_error_node(sema, expr, "bitwise not requires integer operand");
+            ret nil;
+        }
+        ret operand_type;
+    }
+
+    # dereference: * (as prefix)
+    if (op == token.TAG_STAR) {
+        if (!ty.is_pointer(operand_type)) {
+            report_error_node(sema, expr, "dereference requires pointer operand");
+            ret nil;
+        }
+        ret ty.get_element_type(operand_type);
+    }
+
+    # address-of: @ or &
+    if (op == token.TAG_AT || op == token.TAG_AMP) {
+        val res: Result[*ty.Type, str] = ty.pointer_type(ctx, operand_type, op == token.TAG_AT);
+        if (res.is_ok()) {
+            ret res.unwrap_ok();
+        }
+        ret nil;
+    }
+
+    report_error_node(sema, expr, "unknown unary operator");
+    ret nil;
+}
+
+# check_call: type-check a function call.
+fun check_call(sema: *Sema, expr: *ast.Node) *ty.Type {
+    # callee is first child, arguments follow
+    val callee: *ast.Node = ast.get_child(expr, 0);
+    if (callee == nil) {
+        report_error_node(sema, expr, "call missing callee");
+        ret nil;
+    }
+
+    val callee_type: *ty.Type = check_expr(sema, callee);
+    if (callee_type == nil) {
+        ret nil;
+    }
+
+    if (!ty.is_function(callee_type)) {
+        report_error_node(sema, expr, "cannot call non-function");
+        ret nil;
+    }
+
+    # TODO: check argument types match parameters
+
+    ret callee_type.ret_type;
+}
+
+# check_field: type-check field access (expr.field).
+fun check_field(sema: *Sema, expr: *ast.Node) *ty.Type {
+    val base: *ast.Node = ast.get_child(expr, 0);
+    if (base == nil) {
+        report_error_node(sema, expr, "field access missing base");
+        ret nil;
+    }
+
+    val base_type: *ty.Type = check_expr(sema, base);
+    if (base_type == nil) {
+        ret nil;
+    }
+
+    # auto-dereference pointers for field access
+    var target_type: *ty.Type = base_type;
+    if (ty.is_pointer(base_type)) {
+        target_type = ty.get_element_type(base_type);
+    }
+
+    if (!ty.is_record(target_type) && !ty.is_union(target_type)) {
+        report_error_node(sema, expr, "field access requires record or union type");
+        ret nil;
+    }
+
+    val field_name: str = ast.get_name(expr);
+    if (field_name == nil) {
+        report_error_node(sema, expr, "field name missing");
+        ret nil;
+    }
+
+    val field_opt: Option[*ty.Field] = ty.get_field(target_type, field_name);
+    if (field_opt.is_none()) {
+        report_error_node(sema, expr, "undefined field");
+        ret nil;
+    }
+
+    ret field_opt.unwrap().ty;
+}
+
+# check_index: type-check array/pointer indexing.
+fun check_index(sema: *Sema, expr: *ast.Node) *ty.Type {
+    val base: *ast.Node = ast.get_child(expr, 0);
+    val index: *ast.Node = ast.get_child(expr, 1);
+
+    if (base == nil || index == nil) {
+        report_error_node(sema, expr, "index expression missing operand");
+        ret nil;
+    }
+
+    val base_type: *ty.Type = check_expr(sema, base);
+    val index_type: *ty.Type = check_expr(sema, index);
+
+    if (base_type == nil || index_type == nil) {
+        ret nil;
+    }
+
+    if (!ty.is_array(base_type) && !ty.is_pointer(base_type)) {
+        report_error_node(sema, expr, "cannot index non-array/pointer type");
+        ret nil;
+    }
+
+    if (!ty.is_integer(index_type)) {
+        report_error_node(sema, expr, "index must be integer");
+        ret nil;
+    }
+
+    ret ty.get_element_type(base_type);
+}
+
+# check_cast: type-check a type cast (expr::Type).
+fun check_cast(sema: *Sema, expr: *ast.Node) *ty.Type {
+    val operand: *ast.Node = ast.get_child(expr, 0);
+    val target_type_node: *ast.Node = expr.extra::*ast.Node;
+
+    if (operand == nil) {
+        report_error_node(sema, expr, "cast missing operand");
+        ret nil;
+    }
+
+    if (target_type_node == nil) {
+        report_error_node(sema, expr, "cast missing target type");
+        ret nil;
+    }
+
+    val operand_type: *ty.Type = check_expr(sema, operand);
+    if (operand_type == nil) {
+        ret nil;
+    }
+
+    val target_type: *ty.Type = resolve_type(sema, target_type_node);
+    if (target_type == nil) {
+        ret nil;
+    }
+
+    if (!ty.can_cast(operand_type, target_type)) {
+        report_error_node(sema, expr, "invalid cast");
+        ret nil;
+    }
+
+    ret target_type;
+}
+
+# check_addr: type-check address-of expression.
+fun check_addr(sema: *Sema, expr: *ast.Node) *ty.Type {
+    val ctx: *ty.TypeContext = ?sema.types;
+
+    val operand: *ast.Node = expr.children;
+    if (operand == nil) {
+        report_error_node(sema, expr, "address-of missing operand");
+        ret nil;
+    }
+
+    val operand_type: *ty.Type = check_expr(sema, operand);
+    if (operand_type == nil) {
+        ret nil;
+    }
+
+    # TODO: check operand is lvalue
+
+    val res: Result[*ty.Type, str] = ty.pointer_type(ctx, operand_type, true);
+    if (res.is_ok()) {
+        ret res.unwrap_ok();
+    }
+
+    report_error_node(sema, expr, "failed to create pointer type");
+    ret nil;
+}
+
+# check_deref: type-check dereference expression.
+fun check_deref(sema: *Sema, expr: *ast.Node) *ty.Type {
+    val operand: *ast.Node = expr.children;
+    if (operand == nil) {
+        report_error_node(sema, expr, "dereference missing operand");
+        ret nil;
+    }
+
+    val operand_type: *ty.Type = check_expr(sema, operand);
+    if (operand_type == nil) {
+        ret nil;
+    }
+
+    if (!ty.is_pointer(operand_type)) {
+        report_error_node(sema, expr, "cannot dereference non-pointer");
+        ret nil;
+    }
+
+    ret ty.get_element_type(operand_type);
+}
+
+# --- statement checking ---
+
+# check_stmt: type-check a statement.
+# ---
+# sema: analyzer
+# stmt: statement AST node
+# ret:  true on success, false on error
+pub fun check_stmt(sema: *Sema, stmt: *ast.Node) bool {
+    if (sema == nil || stmt == nil) {
+        ret false;
+    }
+
+    val kind: ast.NodeKind = stmt.kind;
+
+    # variable declarations
+    if (kind == ast.NODE_DECL_VAL || kind == ast.NODE_DECL_VAR) {
+        ret check_var_decl(sema, stmt);
+    }
+
+    # expression statement
+    if (kind == ast.NODE_STMT_EXPR) {
+        val expr_type: *ty.Type = check_expr(sema, stmt.children);
+        ret expr_type != nil;
+    }
+
+    # block statement
+    if (kind == ast.NODE_STMT_BLOCK) {
+        ret check_block(sema, stmt);
+    }
+
+    # if statement
+    if (kind == ast.NODE_STMT_IF) {
+        ret check_if(sema, stmt);
+    }
+
+    # for loop
+    if (kind == ast.NODE_STMT_FOR) {
+        ret check_for(sema, stmt);
+    }
+
+    # return statement
+    if (kind == ast.NODE_STMT_RET) {
+        ret check_return(sema, stmt);
+    }
+
+    # break statement
+    if (kind == ast.NODE_STMT_BRK) {
+        if (sema.loop_depth <= 0) {
+            report_error_node(sema, stmt, "break outside of loop");
+            ret false;
+        }
+        ret true;
+    }
+
+    # continue statement
+    if (kind == ast.NODE_STMT_CNT) {
+        if (sema.loop_depth <= 0) {
+            report_error_node(sema, stmt, "continue outside of loop");
+            ret false;
+        }
+        ret true;
+    }
+
+    # defer statement
+    if (kind == ast.NODE_STMT_FIN) {
+        ret check_stmt(sema, stmt.children);
+    }
+
+    # inline assembly - skip type checking
+    if (kind == ast.NODE_STMT_MASM) {
+        ret true;
+    }
+
+    # declarations at statement level
+    if (kind == ast.NODE_DECL_FUN) {
+        ret check_function(sema, stmt);
+    }
+
+    if (kind == ast.NODE_DECL_REC || kind == ast.NODE_DECL_UNI) {
+        # type declarations are handled in collection pass
+        ret true;
+    }
+
+    report_error_node(sema, stmt, "unsupported statement");
+    ret false;
+}
+
+# check_var_decl: check a val/var declaration.
+fun check_var_decl(sema: *Sema, stmt: *ast.Node) bool {
+    val name: str = ast.get_name(stmt);
+    if (name == nil) {
+        report_error_node(sema, stmt, "declaration missing name");
+        ret false;
+    }
+
+    val is_mutable: bool = stmt.kind == ast.NODE_DECL_VAR;
+    val sym_kind: symbol.SymbolKind = symbol.SYM_VAL;
+    if (is_mutable) {
+        # SymbolKind constant
+    }
+
+    # define symbol
+    val def_res: Result[*symbol.Symbol, str] = symbol.define(
+        ?sema.symbols,
+        name,
+        sym_kind
+    );
+
+    if (def_res.is_err()) {
+        report_error_node(sema, stmt, "redefinition of symbol");
+        ret false;
+    }
+
+    val sym: *symbol.Symbol = def_res.unwrap_ok();
+    sym.decl_node = stmt;
+    sym.is_mutable = is_mutable;
+
+    # resolve declared type if present
+    var declared_type: *ty.Type = nil;
+    if (stmt.extra != nil) {
+        declared_type = resolve_type(sema, stmt.extra::*ast.Node);
+    }
+
+    # check initializer if present
+    var init_type: *ty.Type = nil;
+    if (stmt.children != nil) {
+        init_type = check_expr(sema, stmt.children);
+    }
+
+    # determine symbol type
+    if (declared_type != nil) {
+        sym.resolved_type = declared_type;
+        if (init_type != nil && !ty.can_assign(init_type, declared_type)) {
+            report_error_node(sema, stmt, "initializer type mismatch");
+            ret false;
+        }
+    } or {
+        if (init_type != nil) {
+            sym.resolved_type = init_type;
+        } or {
+            report_error_node(sema, stmt, "cannot infer type without initializer");
+            ret false;
+        }
+    }
+
+    ret true;
+}
+
+# check_block: check a block statement.
+fun check_block(sema: *Sema, stmt: *ast.Node) bool {
+    # push new scope
+    val push_res: Result[bool, str] = symbol.push_scope(?sema.symbols);
+    if (push_res.is_err()) {
+        report_error_node(sema, stmt, "failed to push scope");
+        ret false;
+    }
+
+    var success: bool = true;
+
+    # check each statement in block
+    val list: *ast.List = ast.get_list(stmt);
+    if (list != nil) {
+        var i: i32 = 0;
+        for (i < list.count) {
+            if (!check_stmt(sema, list.nodes[i])) {
+                success = false;
+            }
+            i = i + 1;
+        }
+    }
+
+    # pop scope
+    val pop_res: Result[bool, str] = symbol.pop_scope(?sema.symbols);
+    if (pop_res.is_err()) {
+        # this shouldn't happen
+    }
+
+    ret success;
+}
+
+# check_if: check an if statement.
+fun check_if(sema: *Sema, stmt: *ast.Node) bool {
+    # condition is first child
+    val cond: *ast.Node = ast.get_child(stmt, 0);
+    if (cond != nil) {
+        val cond_type: *ty.Type = check_expr(sema, cond);
+        if (cond_type != nil && !ty.is_bool(cond_type)) {
+            report_error_node(sema, cond, "if condition must be bool");
+        }
+    }
+
+    # then branch is second child
+    val then_branch: *ast.Node = ast.get_child(stmt, 1);
+    if (then_branch != nil) {
+        check_stmt(sema, then_branch);
+    }
+
+    # else/or branch is third child (if present)
+    val else_branch: *ast.Node = ast.get_child(stmt, 2);
+    if (else_branch != nil) {
+        check_stmt(sema, else_branch);
+    }
+
+    ret true;
+}
+
+# check_for: check a for loop.
+fun check_for(sema: *Sema, stmt: *ast.Node) bool {
+    sema.loop_depth = sema.loop_depth + 1;
+
+    # condition is first child (may be nil for infinite loop)
+    val cond: *ast.Node = ast.get_child(stmt, 0);
+    if (cond != nil) {
+        val cond_type: *ty.Type = check_expr(sema, cond);
+        if (cond_type != nil && !ty.is_bool(cond_type)) {
+            report_error_node(sema, cond, "for condition must be bool");
+        }
+    }
+
+    # body is second child
+    val body: *ast.Node = ast.get_child(stmt, 1);
+    if (body != nil) {
+        check_stmt(sema, body);
+    }
+
+    sema.loop_depth = sema.loop_depth - 1;
+    ret true;
+}
+
+# check_return: check a return statement.
+fun check_return(sema: *Sema, stmt: *ast.Node) bool {
+    var ret_type: *ty.Type = nil;
+
+    if (stmt.children != nil) {
+        ret_type = check_expr(sema, stmt.children);
+    }
+
+    # check against current function's return type
+    if (sema.current_fn_ret != nil) {
+        if (ret_type == nil) {
+            if (!ty.is_void(sema.current_fn_ret)) {
+                report_error_node(sema, stmt, "missing return value");
+                ret false;
+            }
+        } or {
+            if (!ty.can_assign(ret_type, sema.current_fn_ret)) {
+                report_error_node(sema, stmt, "return type mismatch");
+                ret false;
+            }
+        }
+    }
+
+    ret true;
+}
+
+# check_function: check a function declaration.
+fun check_function(sema: *Sema, stmt: *ast.Node) bool {
+    val name: str = ast.get_name(stmt);
+    if (name == nil) {
+        report_error_node(sema, stmt, "function missing name");
+        ret false;
+    }
+
+    # lookup or define symbol
+    var sym: *symbol.Symbol = nil;
+    val sym_opt: Option[*symbol.Symbol] = symbol.lookup(?sema.symbols, name);
+    if (sym_opt.is_some()) {
+        sym = sym_opt.unwrap();
+    } or {
+        val def_res: Result[*symbol.Symbol, str] = symbol.define(
+            ?sema.symbols,
+            name,
+            symbol.SYM_FUN
+        );
+        if (def_res.is_err()) {
+            report_error_node(sema, stmt, "failed to define function");
+            ret false;
+        }
+        sym = def_res.unwrap_ok();
+    }
+
+    sym.decl_node = stmt;
+
+    # save previous function context
+    val prev_fn: *symbol.Symbol = sema.current_fn;
+    val prev_ret: *ty.Type = sema.current_fn_ret;
+
+    sema.current_fn = sym;
+
+    # resolve return type if specified
+    if (stmt.extra != nil) {
+        sema.current_fn_ret = resolve_type(sema, stmt.extra::*ast.Node);
+    } or {
+        # default void return
+        val res: Result[*ty.Type, str] = ty.primitive_type(?sema.types, ty.TY_VOID);
+        if (res.is_ok()) {
+            sema.current_fn_ret = res.unwrap_ok();
+        }
+    }
+
+    sym.resolved_type = sema.current_fn_ret;
+
+    # push function scope for parameters and body
+    val push_res: Result[bool, str] = symbol.push_scope(?sema.symbols);
+    if (push_res.is_err()) {
+        ret false;
+    }
+
+    # TODO: define parameters in scope
+
+    # check function body (last child is typically the block)
+    var body: *ast.Node = nil;
+    if (stmt.count > 0) {
+        body = ast.get_child(stmt, stmt.count - 1);
+    }
+
+    if (body != nil && body.kind == ast.NODE_STMT_BLOCK) {
+        check_block(sema, body);
+    }
+
+    # pop function scope
+    val pop_res: Result[bool, str] = symbol.pop_scope(?sema.symbols);
+
+    # restore previous function context
+    sema.current_fn = prev_fn;
+    sema.current_fn_ret = prev_ret;
+
+    ret true;
+}
+
+# --- multi-pass analysis ---
+
+# collect_declarations: first pass - collect all top-level declarations.
+fun collect_declarations(sema: *Sema, program: *ast.Node) bool {
+    if (program == nil || program.kind != ast.NODE_PROGRAM) {
+        ret false;
+    }
+
+    val list: *ast.List = ast.get_list(program);
+    if (list == nil) {
+        ret true;
+    }
+
+    var success: bool = true;
+
+    var i: i32 = 0;
+    for (i < list.count) {
+        val decl: *ast.Node = list.nodes[i];
+        if (decl == nil) {
+            i = i + 1;
+            cnt;
+        }
+
+        val kind: ast.NodeKind = decl.kind;
+        var name: str = ast.get_name(decl);
+        var sym_kind: symbol.SymbolKind = symbol.SYM_VAL;
+
+        if (kind == ast.NODE_DECL_VAL) {
+            sym_kind = symbol.SYM_VAL;
+        } or {
+            if (kind == ast.NODE_DECL_VAR) {
+                sym_kind = symbol.SYM_VAR;
+            } or {
+                if (kind == ast.NODE_DECL_FUN) {
+                    sym_kind = symbol.SYM_FUN;
+                } or {
+                    if (kind == ast.NODE_DECL_REC) {
+                        sym_kind = symbol.SYM_REC;
+                    } or {
+                        if (kind == ast.NODE_DECL_UNI) {
+                            sym_kind = symbol.SYM_UNI;
+                        } or {
+                            if (kind == ast.NODE_DECL_DEF) {
+                                sym_kind = symbol.SYM_TYPE;
+                            } or {
+                                if (kind == ast.NODE_DECL_EXT) {
+                                    sym_kind = symbol.SYM_EXT;
+                                } or {
+                                    # skip use, test, etc.
+                                    i = i + 1;
+                                    cnt;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (name != nil) {
+            val def_res: Result[*symbol.Symbol, str] = symbol.define(
+                ?sema.symbols,
+                name,
+                sym_kind
+            );
+
+            if (def_res.is_ok()) {
+                val sym: *symbol.Symbol = def_res.unwrap_ok();
+                sym.decl_node = decl;
+            } or {
+                report_error_node(sema, decl, "duplicate definition");
+                success = false;
+            }
+        }
+
+        i = i + 1;
+    }
+
+    ret success;
+}
+
+# resolve_types: second pass - resolve all type references.
+fun resolve_types(sema: *Sema, program: *ast.Node) bool {
+    if (program == nil || program.kind != ast.NODE_PROGRAM) {
+        ret false;
+    }
+
+    val list: *ast.List = ast.get_list(program);
+    if (list == nil) {
+        ret true;
+    }
+
+    var success: bool = true;
+
+    var i: i32 = 0;
+    for (i < list.count) {
+        val decl: *ast.Node = list.nodes[i];
+        if (decl == nil) {
+            i = i + 1;
+            cnt;
+        }
+
+        val kind: ast.NodeKind = decl.kind;
+
+        # resolve record types
+        if (kind == ast.NODE_DECL_REC) {
+            if (!resolve_record_type(sema, decl)) {
+                success = false;
+            }
+        }
+
+        # resolve union types
+        if (kind == ast.NODE_DECL_UNI) {
+            if (!resolve_union_type(sema, decl)) {
+                success = false;
+            }
+        }
+
+        i = i + 1;
+    }
+
+    ret success;
+}
+
+# resolve_record_type: resolve a record type declaration.
+fun resolve_record_type(sema: *Sema, decl: *ast.Node) bool {
+    val name: str = ast.get_name(decl);
+    if (name == nil) {
+        ret false;
+    }
+
+    val sym_opt: Option[*symbol.Symbol] = symbol.lookup(?sema.symbols, name);
+    if (sym_opt.is_none()) {
+        ret false;
+    }
+
+    val sym: *symbol.Symbol = sym_opt.unwrap();
+
+    # create type first to allow self-references
+    val ctx: *ty.TypeContext = ?sema.types;
+    val res: Result[*ty.Type, str] = ty.record_type(ctx, name, nil, 0);
+    if (res.is_err()) {
+        report_error_node(sema, decl, "failed to create record type");
+        ret false;
+    }
+
+    sym.resolved_type = res.unwrap_ok();
+
+    # TODO: resolve field types
+
+    ret true;
+}
+
+# resolve_union_type: resolve a union type declaration.
+fun resolve_union_type(sema: *Sema, decl: *ast.Node) bool {
+    val name: str = ast.get_name(decl);
+    if (name == nil) {
+        ret false;
+    }
+
+    val sym_opt: Option[*symbol.Symbol] = symbol.lookup(?sema.symbols, name);
+    if (sym_opt.is_none()) {
+        ret false;
+    }
+
+    val sym: *symbol.Symbol = sym_opt.unwrap();
+
+    # create type first to allow self-references
+    val ctx: *ty.TypeContext = ?sema.types;
+    val res: Result[*ty.Type, str] = ty.union_type(ctx, name, nil, 0);
+    if (res.is_err()) {
+        report_error_node(sema, decl, "failed to create union type");
+        ret false;
+    }
+
+    sym.resolved_type = res.unwrap_ok();
+
+    # TODO: resolve variant types
+
+    ret true;
+}
+
+# check_declarations: third pass - type-check all declarations.
+fun check_declarations(sema: *Sema, program: *ast.Node) bool {
+    if (program == nil || program.kind != ast.NODE_PROGRAM) {
+        ret false;
+    }
+
+    val list: *ast.List = ast.get_list(program);
+    if (list == nil) {
+        ret true;
+    }
+
+    var success: bool = true;
+
+    var i: i32 = 0;
+    for (i < list.count) {
+        val decl: *ast.Node = list.nodes[i];
+        if (decl == nil) {
+            i = i + 1;
+            cnt;
+        }
+
+        val kind: ast.NodeKind = decl.kind;
+
+        # check functions
+        if (kind == ast.NODE_DECL_FUN) {
+            if (!check_function(sema, decl)) {
+                success = false;
+            }
+        }
+
+        # check values
+        if (kind == ast.NODE_DECL_VAL || kind == ast.NODE_DECL_VAR) {
+            if (!check_var_decl(sema, decl)) {
+                success = false;
+            }
+        }
+
+        # check test blocks (similar to functions)
+        if (kind == ast.NODE_DECL_TEST) {
+            if (!check_test(sema, decl)) {
+                success = false;
+            }
+        }
+
+        i = i + 1;
+    }
+
+    ret success;
+}
+
+# check_test: check a test block.
+fun check_test(sema: *Sema, decl: *ast.Node) bool {
+    # test blocks are like void functions
+    val prev_fn: *symbol.Symbol = sema.current_fn;
+    val prev_ret: *ty.Type = sema.current_fn_ret;
+
+    sema.current_fn = nil;
+
+    val res: Result[*ty.Type, str] = ty.primitive_type(?sema.types, ty.TY_VOID);
+    if (res.is_ok()) {
+        sema.current_fn_ret = res.unwrap_ok();
+    }
+
+    val push_res: Result[bool, str] = symbol.push_scope(?sema.symbols);
+    if (push_res.is_err()) {
+        ret false;
+    }
+
+    # check test body
+    val body: *ast.Node = decl.children;
+    if (body != nil) {
+        check_stmt(sema, body);
+    }
+
+    val pop_res: Result[bool, str] = symbol.pop_scope(?sema.symbols);
+
+    sema.current_fn = prev_fn;
+    sema.current_fn_ret = prev_ret;
+
+    ret true;
+}
+
+# --- main entry point ---
+
 # analyze: perform semantic analysis on an AST.
 # ---
 # sema: analyzer context
-# ast:  AST to analyze (program node)
+# root: AST root (program node)
 # ret:  Ok(true) on success (may have errors), Err(str) on fatal error
 pub fun analyze(sema: *Sema, root: *ast.Node) Result[bool, str] {
     if (sema == nil) {
@@ -124,159 +1409,27 @@ pub fun analyze(sema: *Sema, root: *ast.Node) Result[bool, str] {
         ret err[bool, str]("AST is nil");
     }
 
-    # TODO: implement semantic analysis passes
-    # pass 1: collect top-level declarations (types, functions)
+    # pass 1: collect top-level declarations
+    collect_declarations(sema, root);
+
     # pass 2: resolve type references
+    resolve_types(sema, root);
+
     # pass 3: type-check expressions and statements
-    # pass 4: check for unresolved symbols
-    # pass 5: validate control flow (returns, breaks)
+    check_declarations(sema, root);
 
-    ret ok[bool, str](true);
+    # pass 4: control flow validation (TODO)
+
+    ret ok[bool, str](!has_errors(sema));
 }
 
-# report_error: record a semantic error.
-# ---
-# sema:    analyzer
-# node:    node where error occurred
-# message: error description
-# ret:     none
-pub fun report_error(sema: *Sema, node: *ast.Node, message: str) {
-    if (sema == nil) {
-        ret;
-    }
-
-    sema.error_count = sema.error_count + 1;
-
-    # TODO: grow and append to errors array
-}
-
-# get_error_count: get the number of semantic errors.
-# ---
-# sema: analyzer
-# ret:  error count
-pub fun get_error_count(sema: *Sema) i32 {
-    if (sema == nil) {
-        ret 0;
-    }
-    ret sema.error_count;
-}
-
-# has_errors: check if any errors occurred.
-# ---
-# sema: analyzer
-# ret:  true if errors occurred
-pub fun has_errors(sema: *Sema) bool {
-    ret get_error_count(sema) > 0;
-}
-
-# get_symbol_table: get the symbol table.
-# ---
-# sema: analyzer
-# ret:  pointer to symbol table
-pub fun get_symbol_table(sema: *Sema) *symbol.Table {
-    if (sema == nil) {
-        ret nil;
-    }
-    ret ?sema.symbols;
-}
-
-# get_type_context: get the type context.
-# ---
-# sema: analyzer
-# ret:  pointer to type context
-pub fun get_type_context(sema: *Sema) *ty.TypeContext {
-    if (sema == nil) {
-        ret nil;
-    }
-    ret ?sema.types;
-}
-
-# resolve_type: resolve an AST type node to a Type.
-# ---
-# sema:      analyzer
-# type_node: AST node representing a type
-# ret:       Ok(*Type) on success, Err(str) on failure
-pub fun resolve_type(sema: *Sema, type_node: *ast.Node) Result[*ty.Type, str] {
-    if (sema == nil) {
-        ret err[*ty.Type, str]("sema is nil");
-    }
-
-    if (type_node == nil) {
-        ret err[*ty.Type, str]("type node is nil");
-    }
-
-    # TODO: implement type resolution based on node kind
-    # - type_name: look up in symbol table
-    # - type_ptr/type_ref: resolve inner and wrap
-    # - type_array: resolve inner and create array type
-    # - type_fun: resolve params and return type
-    # - type_rec/type_uni: create anonymous record/union type
-
-    ret err[*ty.Type, str]("resolve_type not yet implemented");
-}
-
-# check_expr: type-check an expression.
-# ---
-# sema: analyzer
-# expr: expression AST node
-# ret:  Ok(*Type) with expression type, Err(str) on failure
-pub fun check_expr(sema: *Sema, expr: *ast.Node) Result[*ty.Type, str] {
-    if (sema == nil) {
-        ret err[*ty.Type, str]("sema is nil");
-    }
-
-    if (expr == nil) {
-        ret err[*ty.Type, str]("expression is nil");
-    }
-
-    # TODO: implement expression type checking based on node kind
-    # - literals: return appropriate primitive type
-    # - identifiers: look up in symbol table
-    # - binary ops: check operand types, determine result type
-    # - unary ops: check operand type, determine result type
-    # - calls: resolve function, check argument types
-    # - field access: check base type has field
-    # - index: check base is array/pointer, return element type
-    # - cast: validate cast is allowed
-    # - address-of: return pointer to operand type
-    # - deref: check operand is pointer, return inner type
-
-    ret err[*ty.Type, str]("check_expr not yet implemented");
-}
-
-# check_stmt: type-check a statement.
-# ---
-# sema: analyzer
-# stmt: statement AST node
-# ret:  Ok(true) on success, Err(str) on failure
-pub fun check_stmt(sema: *Sema, stmt: *ast.Node) Result[bool, str] {
-    if (sema == nil) {
-        ret err[bool, str]("sema is nil");
-    }
-
-    if (stmt == nil) {
-        ret err[bool, str]("statement is nil");
-    }
-
-    # TODO: implement statement checking based on node kind
-    # - val/var: check initializer type matches declared type
-    # - if: check condition is bool, check branches
-    # - for: check condition is bool, check body
-    # - ret: check return value matches function return type
-    # - block: check each statement in block
-    # - expr: check expression
-
-    ret err[bool, str]("check_stmt not yet implemented");
-}
+# --- utilities ---
 
 # print_errors: print all errors to stderr.
-# ---
-# sema: analyzer
-# ret:  none
 pub fun print_errors(sema: *Sema) {
-    if (sema == nil) {
+    if (sema == nil || sema.errors == nil) {
         ret;
     }
 
-    # TODO: iterate errors and print with source location
+    # TODO: implement error printing
 }

@@ -48,31 +48,131 @@ Continue development of the self-hosted Mach compiler (`imach`). The compiler in
   - [x] Parse anonymous rec/uni
 
 ## Phase 2: Semantic Analysis
-- [ ] Implement type resolution (`resolve_type`)
-  - [ ] Resolve primitive types
-  - [ ] Resolve pointer/array types
-  - [ ] Resolve named types via symbol table
-  - [ ] Handle generic type instantiation
-- [ ] Implement expression type checking (`check_expr`)
-  - [ ] Check literal types
-  - [ ] Check identifier lookup
-  - [ ] Check binary operator types
-  - [ ] Check unary operator types
-  - [ ] Check function calls
-  - [ ] Check field access
-  - [ ] Check indexing
-  - [ ] Check casts
-  - [ ] Check address-of and dereference
-- [ ] Implement statement checking (`check_stmt`)
-  - [ ] Check variable declarations (type inference, initializer match)
-  - [ ] Check if/for conditions (must be bool)
-  - [ ] Check return types match function signature
-  - [ ] Check control flow (break/continue in loops)
-- [ ] Implement `analyze()` multi-pass analysis
-  - [ ] Pass 1: Collect top-level declarations
-  - [ ] Pass 2: Resolve type references
-  - [ ] Pass 3: Type-check expressions and statements
-  - [ ] Pass 4: Validate control flow
+
+### 2.1 Foundation - Type System Enhancements
+- [x] Enhance `type.mach` with complete type checking utilities
+  - [x] Implement `is_integer()` - check TypeKind against integer variants
+  - [x] Implement `is_float()` - check TypeKind against f32/f64
+  - [x] Implement `is_pointer()` - check for ty_pointer and ty_ptr
+  - [x] Implement `types_equal()` - structural type comparison
+  - [x] Implement `can_assign()` - check if source type assignable to target
+  - [x] Add primitive type caching (singleton types for u8, i32, etc.)
+  - [x] Add size/alignment calculation for each TypeKind
+  - [x] Add `def TypeKind: u8` type alias for cleaner code
+  - [x] Add `can_cast()` for cast validation
+  - [x] Add `is_bool()`, `is_void()`, `is_array()`, `is_record()`, `is_union()`, etc.
+  - [x] Add `get_field()` for field lookup in records/unions
+  - [x] Add `kind_name()` and `primitive_kind_from_name()` utilities
+
+### 2.2 Type Resolution (`resolve_type`)
+- [x] Implement `resolve_type` in `sema.mach`
+  - [x] Handle `type_name` nodes - lookup in symbol table
+    - [x] Check for primitive type names (u8, i32, bool, str, etc.)
+    - [x] Look up user-defined types in symbol table
+    - [ ] Handle qualified names (module.Type) - deferred
+  - [x] Handle `type_ptr` nodes - resolve inner, wrap as mutable pointer
+  - [x] Handle `type_ref` nodes - resolve inner, wrap as immutable pointer
+  - [x] Handle `type_array` nodes - resolve element type, create array type
+  - [x] Handle `type_fun` nodes - resolve params and return type
+  - [ ] Handle `type_rec` nodes (anonymous records) - deferred
+  - [ ] Handle `type_uni` nodes (anonymous unions) - deferred
+  - [ ] Handle generic type instantiation (T[U, V]) - deferred
+  - [ ] Cache resolved types to avoid duplication - deferred
+
+### 2.3 Symbol Collection (Pass 1)
+- [x] Implement `collect_declarations()` for first pass
+  - [ ] Handle `decl_use` - register imported modules - deferred
+  - [x] Handle `decl_def` - register type aliases
+  - [x] Handle `decl_rec` - register record types
+  - [x] Handle `decl_uni` - register union types
+  - [x] Handle `decl_val` - register constants
+  - [x] Handle `decl_var` - register global variables
+  - [x] Handle `decl_fun` - register functions
+  - [x] Handle `decl_ext` - register external symbols
+  - [ ] Handle `decl_test` - register test blocks - skipped (not symbols)
+  - [ ] Track public visibility from `decl_pub` - deferred
+  - [x] Add `def SymbolKind: u8` type alias
+  - [x] Add `is_type_symbol()`, `is_value_symbol()`, `is_callable()` helpers
+
+### 2.4 Type Resolution Pass (Pass 2)
+- [x] Implement `resolve_types()` for second pass
+  - [x] Resolve record types (basic, without fields)
+  - [x] Resolve union types (basic, without fields)
+  - [ ] Resolve field types in records/unions - deferred
+  - [ ] Resolve function parameter and return types - deferred
+  - [ ] Resolve variable/constant types - deferred
+  - [ ] Resolve type alias definitions - deferred
+  - [ ] Detect and report circular type dependencies - deferred
+
+### 2.5 Expression Type Checking (`check_expr`)
+- [x] Implement `check_expr` in `sema.mach`
+  - [x] `expr_lit_int` - return i64
+  - [x] `expr_lit_float` - return f64
+  - [x] `expr_lit_char` - return u8
+  - [x] `expr_lit_string` - return str
+  - [x] `expr_lit_nil` - return nil type
+  - [x] `expr_lit_bool` - return bool
+  - [x] `expr_ident` - lookup in symbol table, return symbol's type
+  - [x] `expr_binary` - check operand types, determine result type
+    - [x] Arithmetic: +, -, *, /, % (numeric operands)
+    - [x] Comparison: ==, !=, <, >, <=, >= (return bool)
+    - [x] Logical: &&, || (bool operands, return bool)
+    - [x] Bitwise: &, |, ^, <<, >> (integer operands)
+    - [x] Assignment: = (type compatibility check)
+  - [x] `expr_unary` - check operand, determine result type
+    - [x] Negation: - (numeric)
+    - [x] Logical not: ! (bool)
+    - [x] Bitwise not: ~ (integer)
+    - [ ] Try: ? (unwrap Result/Option) - deferred
+    - [x] Address-of: @ (create pointer to lvalue)
+    - [x] Dereference: * (as prefix operator)
+  - [x] `expr_call` - resolve function, check return type
+  - [x] `expr_field` - check base has field, return field type
+  - [x] `expr_index` - check base is array/pointer, return element type
+  - [x] `expr_cast` - validate cast legality, return target type
+  - [x] `expr_addr` - check operand, return pointer type
+  - [x] `expr_deref` - check operand is pointer, return inner type
+  - [x] `expr_paren` - check inner expression
+  - [ ] `expr_array_lit` - deferred
+  - [ ] `expr_struct_lit` - deferred
+
+### 2.6 Statement Type Checking (`check_stmt`)
+- [x] Implement `check_stmt` in `sema.mach`
+  - [x] `decl_val` - check initializer type matches declared type
+  - [x] `decl_var` - check initializer type, allow type inference
+  - [x] `stmt_if` - check condition is bool, check branches
+  - [x] `stmt_for` - check condition is bool (if present), check body
+  - [x] `stmt_ret` - check return value matches enclosing function's return type
+  - [x] `stmt_brk` - verify inside loop
+  - [x] `stmt_cnt` - verify inside loop
+  - [x] `stmt_fin` - check deferred statement
+  - [x] `stmt_block` - push scope, check statements, pop scope
+  - [x] `stmt_expr` - check expression
+  - [x] `stmt_masm` - skip (no type checking for inline asm)
+
+### 2.7 Control Flow Validation (Pass 4)
+- [x] Implement control flow analysis (partial)
+  - [x] Track loop nesting for break/continue validation
+  - [x] Track function return type for return validation
+  - [ ] Detect missing returns in non-void functions - deferred
+  - [ ] Detect unreachable code after return/break/continue - deferred
+
+### 2.8 Multi-Pass Analysis Entry Point
+- [x] Implement `analyze()` orchestration
+  - [x] Pass 1: Call `collect_declarations()` on program
+  - [x] Pass 2: Call `resolve_types()`
+  - [x] Pass 3: Call `check_declarations()` on each declaration body
+  - [ ] Pass 4: Full control flow validation - deferred
+  - [x] Collect errors with position info
+  - [ ] Error printing with source context - deferred
+
+### 2.9 AST Enhancements
+- [x] Add `def NodeKind: u8` type alias
+- [x] Add NODE_* constants for all node kinds
+- [x] Add `is_decl()`, `is_stmt()`, `is_expr()`, `is_type()`, `is_literal()` helpers
+- [x] Add `get_name()`, `get_list()`, `get_child()` accessor functions
+- [x] Add `get_int_value()`, `get_float_value()`, `get_bool_value()` accessors
+- [x] Add `kind_name()` for debugging
 
 ## Phase 3: Code Generation (MASM)
 - [ ] Implement AST to IR lowering (`lower.mach`)
@@ -215,3 +315,60 @@ Continue development of the self-hosted Mach compiler (`imach`). The compiler in
   - Updated "How it works" section with new per-test compilation flow
   - Documented test binary location (`.tests` hidden directory)
   - Removed outdated `dir_tests` configuration section (now hardcoded to `.tests`)
+
+## 2026-01-22T03:00 UTC
+- Fixed segfault when analyzing modules with recursive type definitions
+- Root cause: `sema_analyze_rec`/`sema_analyze_uni` would re-enter analysis for the same symbol when resolving recursive field types
+- Fix implemented in bootstrap compiler:
+  - Added `is_being_analyzed` flag to Symbol struct (symbol.h, symbol.c)
+  - Modified `sema_maybe_analyze_symbol_decl_in_module` to check/set flag and prevent re-entry
+  - Refactored `sema_analyze_rec` and `sema_analyze_uni`:
+    - Create Type object first with placeholder NULL field types
+    - Assign `sym->type` before resolving field types
+    - Resolve field types afterwards (recursive refs find sym->type already set)
+    - Recalculate size/alignment after all fields resolved
+  - Fixed `type_create_union` to handle NULL field types during initial creation
+- Added regression tests in `src/tests/parser_tests.mach`:
+  - Self-referential record (TestNode with *TestNode child)
+  - Mutually recursive types (TypeA <-> TypeB)
+  - Doubly-linked list (LinkedList with *LinkedList next/prev)
+- All 481 tests pass (478 original + 3 new recursive type tests)
+- Committed fix to feat/sh branch: b4977b8
+
+## 2026-01-22T04:00 UTC
+- Started Phase 2: Semantic Analysis implementation
+- Enhanced type system (`type.mach`):
+  - Added `def TypeKind: u8` type alias for cleaner code
+  - Implemented all type checking utilities: is_integer, is_float, is_pointer, is_bool, etc.
+  - Implemented types_equal() with structural comparison
+  - Implemented can_assign() for assignment compatibility
+  - Implemented can_cast() for cast validation
+  - Added primitive type caching in TypeContext
+  - Added Field record for record/union fields
+  - Added get_field() for field lookup
+  - Added record_type(), union_type(), function_type(), generic_type() constructors
+  - Added kind_name() and primitive_kind_from_name() utilities
+- Enhanced symbol table (`symbol.mach`):
+  - Added `def SymbolKind: u8` type alias
+  - Added resolved_type and is_mutable fields to Symbol
+  - Added kind_name(), is_type_symbol(), is_value_symbol(), is_callable() helpers
+- Enhanced AST module (`ast.mach`):
+  - Added `def NodeKind: u8` type alias
+  - Added NODE_* constants for all 50 node kinds
+  - Added classification helpers: is_decl, is_stmt, is_expr, is_type, is_literal
+  - Added data accessors: get_name, get_list, get_child
+  - Added literal accessors: get_int_value, get_float_value, get_bool_value
+  - Added kind_name() for debugging
+- Implemented semantic analyzer (`sema.mach`):
+  - Multi-pass analysis: collect_declarations -> resolve_types -> check_declarations
+  - Type resolution for primitives, pointers, refs, arrays, function types
+  - Expression type checking for all literal types
+  - Expression type checking for identifiers, binary, unary operators
+  - Expression type checking for calls, field access, indexing, casts
+  - Statement checking for val/var declarations with type inference
+  - Statement checking for if/for/ret/brk/cnt/fin/block
+  - Function and test block checking with return type validation
+  - Loop depth tracking for break/continue validation
+  - Error reporting with source positions
+- All 481 tests still pass
+- Build succeeds for imach binary
