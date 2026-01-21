@@ -806,22 +806,58 @@ static char *build_test_output_path(const char *project_root, Config *config, Co
 
 void cmd_test_help(FILE *stream)
 {
-    fprintf(stream, "usage: mach test [--target <name>] [path]\n");
+    fprintf(stream, "usage: mach test [options] [path]\n");
     fprintf(stream, "\n");
     fprintf(stream, "build and run all tests in a Mach project\n");
     fprintf(stream, "\n");
     fprintf(stream, "options:\n");
     fprintf(stream, "  --target <name>      select target from mach.toml (default: project target)\n");
+    fprintf(stream, "  --filter <pattern>   only run tests matching pattern (substring match)\n");
+    fprintf(stream, "  -v, --verbose        show all test results (pass and fail)\n");
+    fprintf(stream, "  -m, --modules        show module-level progress\n");
     fprintf(stream, "  path                 project directory (default: current directory)\n");
 }
 
 int cmd_test_handle(int argc, char **argv)
 {
-    const char *target_name  = NULL;
-    const char *project_path = NULL;
+    const char *target_name    = NULL;
+    const char *project_path   = NULL;
+    const char *filter_pattern = NULL;
+    bool        verbose        __attribute__((unused)) = false;
+    bool        show_modules   = false;
 
     for (int i = 2; i < argc; i++)
     {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
+        {
+            cmd_test_help(stdout);
+            return 0;
+        }
+        if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0)
+        {
+            verbose = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--modules") == 0 || strcmp(argv[i], "-m") == 0)
+        {
+            show_modules = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--filter") == 0)
+        {
+            if (i + 1 < argc)
+            {
+                filter_pattern = argv[++i];
+                continue;
+            }
+            fprintf(stderr, "error: --filter requires a pattern\n");
+            return 1;
+        }
+        else if (strncmp(argv[i], "--filter=", 9) == 0)
+        {
+            filter_pattern = argv[i] + 9;
+            continue;
+        }
         if (strcmp(argv[i], "--target") == 0)
         {
             if (i + 1 < argc)
@@ -1011,6 +1047,36 @@ int cmd_test_handle(int argc, char **argv)
             free(module_path);
             continue;
         }
+
+        // apply filter if specified
+        if (filter_pattern)
+        {
+            bool module_matches = strstr(module_path, filter_pattern) != NULL;
+            bool any_test_matches = false;
+            for (int t = 0; t < test_count; t++)
+            {
+                if (tests[t].name && strstr(tests[t].name, filter_pattern) != NULL)
+                {
+                    any_test_matches = true;
+                    break;
+                }
+            }
+            if (!module_matches && !any_test_matches)
+            {
+                for (int t = 0; t < test_count; t++)
+                {
+                    free(tests[t].name);
+                    free(tests[t].fn_name);
+                }
+                free(tests);
+                parser_dnit(&parser);
+                lexer_dnit(&lexer);
+                free(source);
+                free(module_path);
+                continue;
+            }
+        }
+
         if (test_count < 0)
         {
             parser_dnit(&parser);
@@ -1164,23 +1230,36 @@ int cmd_test_handle(int argc, char **argv)
         total_modules++;
         total_tests += test_count;
 
-        printf("[test] %s (%d)\n", module_path, test_count);
+        if (show_modules)
+        {
+            printf("[test] %s (%d)\n", module_path, test_count);
+        }
+
         int exit_code = process_execute(output_path);
+
         if (exit_code > 128)
         {
             // process was killed by signal (crash)
+            // all tests in this module count as failed
             int signal_num = exit_code - 128;
-            printf("[crash] %s (signal %d)\n", module_path, signal_num);
+            printf("CRASH: %s (signal %d, %d tests)\n", module_path, signal_num, test_count);
             total_crashes++;
+            total_failures += test_count;
         }
         else if (exit_code != 0)
         {
-            printf("[fail] %s (%d failed)\n", module_path, exit_code);
+            if (show_modules)
+            {
+                printf("[fail] %s (%d)\n", module_path, exit_code);
+            }
             total_failures += exit_code;
         }
         else
         {
-            printf("[pass] %s\n", module_path);
+            if (show_modules)
+            {
+                printf("[pass] %s\n", module_path);
+            }
         }
 
         free(output_path);
@@ -1221,13 +1300,20 @@ int cmd_test_handle(int argc, char **argv)
     }
 
     int total_passed = total_tests - total_failures;
-    if (compile_errors > 0 || total_crashes > 0)
+
+    printf("\n");
+    printf("passed: %d\n", total_passed);
+    if (total_failures > 0 || compile_errors > 0)
     {
-        printf("tests: %d, passed: %d, failed: %d, crashed: %d, compile errors: %d\n", total_tests, total_passed, total_failures, total_crashes, compile_errors);
-    }
-    else
-    {
-        printf("tests: %d, passed: %d, failed: %d\n", total_tests, total_passed, total_failures);
+        printf("failed: %d\n", total_failures);
+        if (total_crashes > 0)
+        {
+            printf("  crash:   %d module%s\n", total_crashes, total_crashes == 1 ? "" : "s");
+        }
+        if (compile_errors > 0)
+        {
+            printf("  compile: %d\n", compile_errors);
+        }
     }
     if (total_failures != 0 || total_crashes != 0 || compile_errors != 0)
     {
