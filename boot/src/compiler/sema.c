@@ -1030,10 +1030,17 @@ static int sema_collect_fun_symbol(Sema *sema, AstNode *node)
     Symbol *existing = symbol_table_lookup_local(sema->current_table, symbol_key);
     if (existing)
     {
-        // symbol already collected, just link it
-        node->symbol = existing;
+        // if same node, already collected (multi-pass) - just link it
+        if (existing->decl == node)
+        {
+            node->symbol = existing;
+            free(method_key);
+            return 0;
+        }
+        // different declaration with same name - duplicate error
+        sema_error(sema, node->token, "duplicate function declaration");
         free(method_key);
-        return 0;
+        return -1;
     }
 
     // create symbol for function - use qualified name for methods as internal key
@@ -1076,8 +1083,15 @@ static int sema_collect_rec_symbol(Sema *sema, AstNode *node)
     Symbol *existing = symbol_table_lookup_local(sema->current_table, node->rec_stmt.name);
     if (existing)
     {
-        node->symbol = existing;
-        return 0;
+        // if same node, already collected (multi-pass) - just link it
+        if (existing->decl == node)
+        {
+            node->symbol = existing;
+            return 0;
+        }
+        // different declaration with same name - duplicate error
+        sema_error(sema, node->token, "duplicate type definition");
+        return -1;
     }
 
     Symbol *sym = symbol_create(node->rec_stmt.name, SYMBOL_TYPE, sema->module_path);
@@ -1115,8 +1129,15 @@ static int sema_collect_uni_symbol(Sema *sema, AstNode *node)
     Symbol *existing = symbol_table_lookup_local(sema->current_table, node->uni_stmt.name);
     if (existing)
     {
-        node->symbol = existing;
-        return 0;
+        // if same node, already collected (multi-pass) - just link it
+        if (existing->decl == node)
+        {
+            node->symbol = existing;
+            return 0;
+        }
+        // different declaration with same name - duplicate error
+        sema_error(sema, node->token, "duplicate type definition");
+        return -1;
     }
 
     Symbol *sym = symbol_create(node->uni_stmt.name, SYMBOL_TYPE, sema->module_path);
@@ -1154,8 +1175,15 @@ static int sema_collect_def_symbol(Sema *sema, AstNode *node)
     Symbol *existing = symbol_table_lookup_local(sema->current_table, node->def_stmt.name);
     if (existing)
     {
-        node->symbol = existing;
-        return 0;
+        // if same node, already collected (multi-pass) - just link it
+        if (existing->decl == node)
+        {
+            node->symbol = existing;
+            return 0;
+        }
+        // different declaration with same name - duplicate error
+        sema_error(sema, node->token, "duplicate type definition");
+        return -1;
     }
 
     Symbol *sym = symbol_create(node->def_stmt.name, SYMBOL_TYPE, sema->module_path);
@@ -1188,8 +1216,15 @@ static int sema_collect_var_symbol(Sema *sema, AstNode *node)
     Symbol *existing = symbol_table_lookup_local(sema->current_table, node->var_stmt.name);
     if (existing)
     {
-        node->symbol = existing;
-        return 0;
+        // if same node, already collected (multi-pass) - just link it
+        if (existing->decl == node)
+        {
+            node->symbol = existing;
+            return 0;
+        }
+        // different declaration with same name - duplicate error
+        sema_error(sema, node->token, "duplicate variable declaration");
+        return -1;
     }
 
     Symbol *sym = symbol_create(node->var_stmt.name, SYMBOL_VARIABLE, sema->module_path);
@@ -1223,8 +1258,15 @@ static int sema_collect_ext_symbol(Sema *sema, AstNode *node)
     Symbol *existing = symbol_table_lookup_local(sema->current_table, node->ext_stmt.name);
     if (existing)
     {
-        node->symbol = existing;
-        return 0;
+        // if same node, already collected (multi-pass) - just link it
+        if (existing->decl == node)
+        {
+            node->symbol = existing;
+            return 0;
+        }
+        // different declaration with same name - duplicate error
+        sema_error(sema, node->token, "duplicate external declaration");
+        return -1;
     }
 
     Symbol *sym = symbol_create(node->ext_stmt.name, SYMBOL_FUNCTION, sema->module_path);
