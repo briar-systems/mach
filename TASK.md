@@ -337,17 +337,16 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
   - [ ] Handle register spills to stack
   - [ ] Respect ABI calling convention
 
-### 3.8 Linking
-- [x] Implement `link_objects()`:
-  - [x] Build linker command line (cc as driver)
-  - [x] Include runtime startup if needed
-  - [x] Execute linker subprocess (via libc system())
-  - [x] Check exit status
-  - [x] Report linker errors
-- [x] Implement `emit_executable()`:
-  - [x] Emit object to temporary file
-  - [x] Invoke `link_objects()`
-  - [x] Clean up temporary file
+### 3.8 Linking / Executable Emission
+- [x] Implement `emit_executable()` - direct ELF executable emission (no external linker):
+  - [x] Write ELF header with ET_EXEC type
+  - [x] Write program headers (PT_LOAD segments)
+  - [x] Assign virtual addresses to sections
+  - [x] Resolve and apply relocations internally
+  - [x] Find and set entry point (_start symbol)
+  - [x] Write section data with relocations applied
+  - [x] Zero external dependencies (no libc, no cc, no ld)
+- [x] Removed `link_objects()` - no longer needed with direct emission
 
 ## Phase 4: Build Command Integration
 - [ ] Implement `build` command
@@ -663,10 +662,22 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
     - `convert_reloc_type()`: Map section reloc types to ELF types
     - `find_symbol_index()`: Look up symbol index by name
     - Proper section header ordering with rela sections
-  - **Linking (`emit.mach`)**: Implemented linker functionality:
-    - `link_objects()`: Build and execute linker command via `cc`
-    - `emit_executable()`: Emit object, link, clean up temp file
-    - External C function `system()` for process execution
+- All 481 tests pass
+
+## 2026-01-22T02:00 UTC
+- Removed external linker dependency - now emits executables directly:
+  - **ELF emitter (`of/elf.mach`)**: Added direct executable emission:
+    - `emit_executable()`: Produces fully-linked ELF executable (ET_EXEC)
+    - `write_program_header()`: Write PT_LOAD segment headers
+    - `write_executable_elf_header()`: ELF header with entry point
+    - `find_entry_symbol()`: Locate _start symbol for entry point
+    - `apply_relocations()`: Resolve and patch all relocations internally
+    - Assigns virtual addresses (base 0x400000, page-aligned sections)
+  - **Emit module (`emit.mach`)**: Simplified:
+    - Removed `link_objects()` - no longer needed
+    - Removed libc `system()` dependency
+    - `emit_executable()` now delegates directly to `elf.emit_executable()`
+  - **Zero external dependencies**: No libc, no cc, no ld required
 - All 481 tests pass
 
 ## 2026-01-22T04:00 UTC
