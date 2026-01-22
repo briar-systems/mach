@@ -208,6 +208,13 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
   - [x] `find_local_var()` - lookup local by name
   - [x] `ensure_in_reg()` - ensure value is in a register (load if memory)
   - [x] `frame_mem()` - create memory operand relative to frame pointer
+  - [x] `type_size()` - compute size of a type in bytes
+  - [x] `type_align_of()` - compute alignment of a type
+  - [x] `get_field_offset()` - get offset of field within record type
+  - [x] `get_field_size()` - get size of a field by name
+  - [x] `emit_aggregate_copy()` - copy aggregate data between addresses
+  - [x] `emit_setcc()` - emit conditional set instructions
+  - [x] `emit_frame_setup()` / `emit_frame_teardown()` - stack frame handling
 
 ### 3.2 Module and Function Lowering
 - [x] Implement `lower_module()`:
@@ -221,12 +228,12 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
   - [x] Create function symbol (global binding)
   - [x] Emit function label
   - [x] Create entry basic block
-  - [ ] Emit stack frame instruction (placeholder for frame size)
-  - [ ] Handle hidden sret pointer for aggregate returns
-  - [ ] Handle variadic register save area
-  - [ ] Lower parameters (copy from arg registers to local slots)
+  - [x] Emit stack frame instruction (placeholder for frame size)
+  - [x] Handle hidden sret pointer for aggregate returns
+  - [ ] Handle variadic register save area (deferred - low priority)
+  - [x] Lower parameters (copy from arg registers to local slots)
   - [x] Lower function body statements
-  - [ ] Patch frame size after body lowering
+  - [x] Patch frame size after body lowering
   - [x] Emit function epilogue
 - [x] Implement `lower_global_var()`:
   - [x] Add symbol to MASM context
@@ -244,7 +251,7 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
   - [x] `NODE_STMT_BRK` - emit deferred statements, jump to loop end
   - [x] `NODE_STMT_CNT` - emit deferred statements, jump to loop start
   - [x] `NODE_STMT_FIN` - push statement to deferred stack
-  - [ ] `NODE_STMT_MASM` - parse inline assembly, emit instructions (stub only)
+  - [ ] `NODE_STMT_MASM` - parse inline assembly, emit instructions (stub only, deferred)
 
 ### 3.4 Expression Lowering (`lower_expr`)
 - [x] Implement literal expressions:
@@ -273,21 +280,22 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
 - [x] Implement call expression (`lower_call`):
   - [x] Evaluate callee (function or method)
   - [x] Evaluate arguments
-  - [ ] Handle aggregate return via sret
+  - [x] Handle aggregate return via sret
   - [x] Place arguments per ABI (registers then stack)
   - [x] Emit CALL instruction
   - [x] Return result from return register
 - [x] Implement cast expression (`lower_cast`):
-  - [ ] Integer widening/narrowing (stub - passthrough)
-  - [ ] Float to int / int to float (stub - passthrough)
-  - [ ] Pointer conversions (stub - passthrough)
+  - [x] Integer widening/narrowing (zext/sext/trunc)
+  - [x] Float to int / int to float (ftoi/itof)
+  - [x] Pointer conversions (no-op at machine level)
+  - [x] Float extension/truncation (f32<->f64)
 - [x] Implement field access:
   - [x] Compute base address
-  - [ ] Add field offset (TODO: type lookup)
+  - [x] Add field offset (type lookup implemented)
   - [x] Return memory operand
 - [x] Implement index expression:
   - [x] Lower base and index
-  - [ ] Compute element size (TODO: type lookup)
+  - [x] Compute element size (type lookup implemented)
   - [x] Emit address calculation
 - [x] Implement array/struct literals:
   - [x] Allocate stack space
@@ -312,7 +320,7 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
   - [x] Write ELF header (with placeholder shoff)
   - [x] Write section data (.text, .data, .rodata, .bss)
   - [x] Build and write symbol table (.symtab)
-  - [ ] Build and write relocation sections (.rela.text, etc.)
+  - [x] Build and write relocation sections (.rela.text, etc.)
   - [x] Write section headers
   - [x] Patch shoff in ELF header
   - [x] Write to output file via file I/O
@@ -330,16 +338,16 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
   - [ ] Respect ABI calling convention
 
 ### 3.8 Linking
-- [ ] Implement `link_objects()`:
-  - [ ] Build linker command line (ld or cc)
-  - [ ] Include runtime startup if needed
-  - [ ] Execute linker subprocess
-  - [ ] Check exit status
-  - [ ] Report linker errors
-- [ ] Implement `emit_executable()`:
-  - [ ] Emit object to temporary file
-  - [ ] Invoke `link_objects()`
-  - [ ] Clean up temporary file
+- [x] Implement `link_objects()`:
+  - [x] Build linker command line (cc as driver)
+  - [x] Include runtime startup if needed
+  - [x] Execute linker subprocess (via libc system())
+  - [x] Check exit status
+  - [x] Report linker errors
+- [x] Implement `emit_executable()`:
+  - [x] Emit object to temporary file
+  - [x] Invoke `link_objects()`
+  - [x] Clean up temporary file
 
 ## Phase 4: Build Command Integration
 - [ ] Implement `build` command
@@ -370,6 +378,26 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
   - [ ] `dep del`
   - [ ] `dep pull`
   - [ ] `dep tidy`
+
+## Phase 6: Machification Pass (LAST - after working compiler)
+- [ ] Review entire self-hosted codebase for idiomatic Mach patterns
+- [ ] Convert appropriate patterns to use generics:
+  - [ ] Identify repeated code that differs only by type
+  - [ ] Replace with generic functions/types where beneficial
+  - [ ] Ensure generic instantiation works correctly
+- [ ] Convert appropriate patterns to use methods:
+  - [ ] Identify functions that operate on a primary type (e.g., `foo_bar(foo: *Foo, ...)`)
+  - [ ] Convert to method syntax (`fun Foo.bar(self, ...)`)
+  - [ ] Update call sites to use method call syntax
+- [ ] Review and clean up:
+  - [ ] Remove redundant helper functions
+  - [ ] Consolidate duplicate utility code
+  - [ ] Improve naming consistency
+  - [ ] Ensure documentation comments are complete
+- [ ] Final testing:
+  - [ ] Ensure all tests pass after machification
+  - [ ] Verify bootstrap compiler still works
+  - [ ] Verify self-hosted compiler can compile itself
 
 ## Documentation & Housekeeping
 - [x] Document the bootstrap test runner system (external runner architecture)
@@ -589,6 +617,57 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
   - Doubly-linked list (LinkedList with *LinkedList next/prev)
 - All 481 tests pass (478 original + 3 new recursive type tests)
 - Committed fix to feat/sh branch: b4977b8
+
+## 2026-01-22T00:23 UTC
+- User requested proceeding with Phase 3 implementation
+- Added Phase 6 "Machification Pass" to the outline as the final stage
+- Phase 6 will involve using generics and methods where relevant throughout the codebase
+- This phase is explicitly marked as LAST - only to be done after we have a working self-hosted compiler
+
+## 2026-01-22T01:30 UTC
+- Implemented major Phase 3 enhancements:
+  - **IR module (`ir.mach`)**: Added new IR opcodes:
+    - Stack frame: `ir_frame`, `ir_unframe`
+    - Conditional sets: `ir_sete`, `ir_setne`, `ir_setl`, `ir_setle`, `ir_setg`, `ir_setge`, `ir_setb`, `ir_setbe`, `ir_seta`, `ir_setae`
+    - Conversions: `ir_zext`, `ir_sext`, `ir_trunc`, `ir_itof`, `ir_ftoi`, `ir_fext`, `ir_ftrunc`
+  - **Lowering (`lower.mach`)**: Added type-aware helpers:
+    - `type_size()`: Compute size of any type including arrays, records, unions
+    - `type_align_of()`: Compute alignment of types
+    - `get_field_offset()`: Get field offset within record types
+    - `get_field_size()`: Get field size by name
+    - `emit_aggregate_copy()`: Copy aggregate data between addresses (8-byte chunks + remainder)
+    - `emit_setcc()`: Emit conditional set instructions for comparisons
+    - `emit_frame_setup()` / `emit_frame_teardown()`: Stack frame prologue/epilogue
+    - `type_is_signed()`: Check if type is signed integer
+  - **Function lowering**: Proper parameter handling:
+    - Detect `_start` entry point (no frame setup)
+    - Handle hidden sret pointer for large aggregate returns
+    - Copy parameters from ABI registers to local stack slots
+    - Handle float vs integer parameter classification
+    - Patch frame size after body lowering with 16-byte alignment
+  - **Expression lowering improvements**:
+    - Comparison operators now emit proper setcc instructions with signed/unsigned distinction
+    - Field access uses actual type offsets via `get_field_offset()`
+    - Index expressions use actual element sizes from type information
+    - Cast expressions handle integer widening/narrowing, float conversions
+    - Local declarations use proper type sizes
+  - **Section module (`section.mach`)**: Added relocation support:
+    - `Relocation` record: offset, symbol_name, rtype, addend
+    - Relocation type constants: `RELOC_64`, `RELOC_PC32`, `RELOC_PLT32`, `RELOC_32`, `RELOC_32S`
+    - `add_relocation()`: Add relocation entry to section
+    - `has_relocations()`, `get_relocation()`: Query relocations
+    - `patch_i32()`, `patch_i64()`: Patch values in section data
+  - **ELF emitter (`of/elf.mach`)**: Relocation section generation:
+    - Generate `.rela.<section>` sections for sections with relocations
+    - `write_relocation()`: Write ELF64 rela entries
+    - `convert_reloc_type()`: Map section reloc types to ELF types
+    - `find_symbol_index()`: Look up symbol index by name
+    - Proper section header ordering with rela sections
+  - **Linking (`emit.mach`)**: Implemented linker functionality:
+    - `link_objects()`: Build and execute linker command via `cc`
+    - `emit_executable()`: Emit object, link, clean up temp file
+    - External C function `system()` for process execution
+- All 481 tests pass
 
 ## 2026-01-22T04:00 UTC
 - Started Phase 2: Semantic Analysis implementation
