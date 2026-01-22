@@ -8,32 +8,109 @@ use allocator: std.allocator;
 use ast:    mach.compiler.ast;
 use symbol: mach.compiler.symbol;
 use ty:     mach.compiler.type;
+use token:  mach.compiler.token;
 
-use ir:     mach.compiler.masm.ir;
-use masm:   mach.compiler.masm.masm;
-use target: mach.compiler.masm.target;
+use ir:      mach.compiler.masm.ir;
+use masm:    mach.compiler.masm.masm;
+use operand: mach.compiler.masm.operand;
+use section: mach.compiler.masm.section;
+use sym:     mach.compiler.masm.symbol;
+use target:  mach.compiler.masm.target;
+use abi:     mach.compiler.masm.abi.spec;
+use sysv64:  mach.compiler.masm.abi.sysv64;
 
 # mach.compiler.masm.lower: AST to IR lowering.
 # ---
 # converts the typed AST into MASM intermediate representation.
 
+# LocalVar: tracking info for a local variable.
+# ---
+# name:   variable name
+# offset: stack offset from frame pointer (negative for locals)
+# size:   size in bytes
+pub rec LocalVar {
+    name:   str;
+    offset: i32;
+    size:   usize;
+}
+
 # LowerContext: context for lowering AST to IR.
 # ---
-# alloc:       allocator for IR allocations
-# symbols:     symbol table for lookups
-# types:       type context
-# target:      target configuration
-# current_fn:  current function being lowered
-# label_count: counter for generating unique labels
-# temp_count:  counter for generating temporary registers
+# alloc:            allocator for IR allocations
+# symbols:          symbol table for lookups
+# types:            type context
+# tgt:              target configuration
+# abi:              ABI specification for calling convention
+# current_fn:       current function being lowered
+# current_block:    current basic block
+# ptr_size:         pointer size in bytes
+# stack_align:      stack alignment in bytes
+#
+# local_vars:       array of local variables
+# local_count:      number of locals
+# local_cap:        allocated capacity
+# stack_offset:     current stack offset (grows negative)
+#
+# deferred:         array of deferred statement nodes (fin)
+# deferred_count:   number of deferred statements
+# deferred_cap:     allocated capacity
+#
+# loop_defer_marks: stack of indices into deferred array at loop entry
+# loop_mark_count:  number of loop marks
+# loop_mark_cap:    allocated capacity
+#
+# loop_start_label: label for loop start (for cnt)
+# loop_end_label:   label for loop end (for brk)
+#
+# vreg_next:        next virtual register number
+# label_counter:    counter for unique labels
+# str_counter:      counter for string literals
+# loop_counter:     counter for loops
+#
+# fn_ret_type:      return type of current function
+# fn_has_sret:      true if function returns aggregate via hidden pointer
+# sret_offset:      stack offset of hidden sret pointer
 pub rec LowerContext {
-    alloc:       *allocator.Allocator;
-    symbols:     *symbol.Table;
-    types:       *ty.TypeContext;
-    tgt:         target.Target;
-    current_fn:  *ir.IRFunction;
-    label_count: i32;
-    temp_count:  i32;
+    alloc:            *allocator.Allocator;
+    symbols:          *symbol.Table;
+    types:            *ty.TypeContext;
+    tgt:              target.Target;
+    abi:              abi.ABI;
+    current_fn:       *ir.IRFunction;
+    current_block:    *ir.IRBlock;
+    ptr_size:         usize;
+    stack_align:      usize;
+
+    local_vars:       *LocalVar;
+    local_count:      i32;
+    local_cap:        i32;
+    stack_offset:     i32;
+
+    deferred:         **ast.Node;
+    deferred_count:   i32;
+    deferred_cap:     i32;
+
+    loop_defer_marks: *i32;
+    loop_mark_count:  i32;
+    loop_mark_cap:    i32;
+
+    loop_start_label: str;
+    loop_end_label:   str;
+
+    vreg_next:        i32;
+    label_counter:    i32;
+    str_counter:      i32;
+    loop_counter:     i32;
+
+    fn_ret_type:      *ty.Type;
+    fn_has_sret:      bool;
+    sret_offset:      i32;
+
+    # module-level masm context
+    m:                *masm.Masm;
+
+    # current text section
+    text:             *section.Section;
 }
 
 # init: create a new lowering context.
@@ -49,11 +126,92 @@ pub fun init(alloc: *allocator.Allocator, symbols: *symbol.Table, types: *ty.Typ
     ctx.symbols = symbols;
     ctx.types = types;
     ctx.tgt = tgt;
+    ctx.abi = sysv64.get();
     ctx.current_fn = nil;
-    ctx.label_count = 0;
-    ctx.temp_count = 0;
+    ctx.current_block = nil;
+    ctx.ptr_size = tgt.ptr_size;
+    ctx.stack_align = 16;
+
+    ctx.local_vars = nil;
+    ctx.local_count = 0;
+    ctx.local_cap = 0;
+    ctx.stack_offset = 0;
+
+    ctx.deferred = nil;
+    ctx.deferred_count = 0;
+    ctx.deferred_cap = 0;
+
+    ctx.loop_defer_marks = nil;
+    ctx.loop_mark_count = 0;
+    ctx.loop_mark_cap = 0;
+
+    ctx.loop_start_label = nil;
+    ctx.loop_end_label = nil;
+
+    ctx.vreg_next = 0;
+    ctx.label_counter = 0;
+    ctx.str_counter = 0;
+    ctx.loop_counter = 0;
+
+    ctx.fn_ret_type = nil;
+    ctx.fn_has_sret = false;
+    ctx.sret_offset = 0;
+
+    ctx.m = nil;
+    ctx.text = nil;
+
     ret ctx;
 }
+
+# deinit: clean up lowering context.
+# ---
+# ctx: context to clean up
+# ret: none
+pub fun deinit(ctx: *LowerContext) {
+    if (ctx == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    if (ctx.local_vars != nil) {
+        ctx.alloc.free[LocalVar](ctx.local_vars, ctx.local_cap::usize);
+        ctx.local_vars = nil;
+    }
+
+    if (ctx.deferred != nil) {
+        ctx.alloc.free[*ast.Node](ctx.deferred, ctx.deferred_cap::usize);
+        ctx.deferred = nil;
+    }
+
+    if (ctx.loop_defer_marks != nil) {
+        ctx.alloc.free[i32](ctx.loop_defer_marks, ctx.loop_mark_cap::usize);
+        ctx.loop_defer_marks = nil;
+    }
+}
+
+# reset_function_state: reset per-function state before lowering a new function.
+# ---
+# ctx: lowering context
+# ret: none
+pub fun reset_function_state(ctx: *LowerContext) {
+    if (ctx == nil) {
+        ret;
+    }
+
+    ctx.local_count = 0;
+    ctx.stack_offset = 0;
+    ctx.deferred_count = 0;
+    ctx.loop_mark_count = 0;
+    ctx.loop_start_label = nil;
+    ctx.loop_end_label = nil;
+    ctx.vreg_next = 0;
+    ctx.fn_ret_type = nil;
+    ctx.fn_has_sret = false;
+    ctx.sret_offset = 0;
+    ctx.current_fn = nil;
+    ctx.current_block = nil;
+}
+
+# --- helper functions ---
 
 # new_label: generate a unique label name.
 # ---
@@ -61,18 +219,82 @@ pub fun init(alloc: *allocator.Allocator, symbols: *symbol.Table, types: *ty.Typ
 # prefix: label prefix (e.g. "if", "for", "end")
 # ret:    unique label string
 pub fun new_label(ctx: *LowerContext, prefix: str) str {
-    if (ctx == nil) {
+    if (ctx == nil || ctx.alloc == nil) {
         ret ".L0";
     }
 
-    ctx.label_count = ctx.label_count + 1;
+    ctx.label_counter = ctx.label_counter + 1;
 
-    # TODO: format label with counter
-    # for now return placeholder
-    ret ".L";
+    # allocate buffer for label
+    val buf_size: usize = 64;
+    val r: Result[*u8, allocator.AllocError] = ctx.alloc.alloc[u8](buf_size);
+    if (r.is_err()) {
+        ret ".L0";
+    }
+
+    val buf: *u8 = r.unwrap_ok();
+
+    # format: .L<prefix>_<counter>
+    var i: usize = 0;
+    buf[i] = 46;  # '.'
+    i = i + 1;
+    buf[i] = 76;  # 'L'
+    i = i + 1;
+
+    # copy prefix
+    if (prefix != nil) {
+        var j: usize = 0;
+        for (j < prefix.len() && i < buf_size - 16) {
+            buf[i] = prefix[j];
+            i = i + 1;
+            j = j + 1;
+        }
+    }
+
+    buf[i] = 95;  # '_'
+    i = i + 1;
+
+    # write counter digits
+    var num: i32 = ctx.label_counter;
+    var digits: [16]u8;
+    var d: i32 = 0;
+    if (num == 0) {
+        digits[0] = 48;  # '0'
+        d = 1;
+    } or {
+        for (num > 0 && d < 16) {
+            digits[d] = ((num % 10) + 48)::u8;
+            num = num / 10;
+            d = d + 1;
+        }
+    }
+
+    # reverse and copy digits
+    for (d > 0 && i < buf_size - 1) {
+        d = d - 1;
+        buf[i] = digits[d];
+        i = i + 1;
+    }
+
+    buf[i] = 0;  # null terminator
+
+    ret buf::str;
 }
 
-# new_temp: allocate a new temporary register.
+# new_string_label: generate a unique label for a string literal.
+# ---
+# ctx: lowering context
+# ret: unique label string
+pub fun new_string_label(ctx: *LowerContext) str {
+    if (ctx == nil) {
+        ret ".Lstr_0";
+    }
+
+    ctx.str_counter = ctx.str_counter + 1;
+    ret new_label(ctx, "str");
+}
+
+# new_temp: allocate a new virtual register.
 # ---
 # ctx: lowering context
 # ret: register number
@@ -81,10 +303,1923 @@ pub fun new_temp(ctx: *LowerContext) i32 {
         ret 0;
     }
 
-    val reg: i32 = ctx.temp_count;
-    ctx.temp_count = ctx.temp_count + 1;
+    val reg: i32 = ctx.vreg_next;
+    ctx.vreg_next = ctx.vreg_next + 1;
     ret reg;
 }
+
+# add_local_var: track a local variable on the stack.
+# ---
+# ctx:    lowering context
+# name:   variable name
+# size:   size in bytes
+# ret:    stack offset (negative from frame pointer)
+pub fun add_local_var(ctx: *LowerContext, name: str, size: usize) i32 {
+    if (ctx == nil || ctx.alloc == nil) {
+        ret 0;
+    }
+
+    # align size to 8 bytes minimum
+    var aligned_size: usize = size;
+    if (aligned_size < 8) {
+        aligned_size = 8;
+    }
+    val mask: usize = 7;
+    aligned_size = (aligned_size + mask) & ~mask;
+
+    # grow locals array if needed
+    if (ctx.local_count >= ctx.local_cap) {
+        var new_cap: i32 = 16;
+        if (ctx.local_cap > 0) {
+            new_cap = ctx.local_cap * 2;
+        }
+
+        val r: Result[*LocalVar, allocator.AllocError] = ctx.alloc.resize[LocalVar](
+            ctx.local_vars, ctx.local_cap::usize, new_cap::usize
+        );
+        if (r.is_err()) {
+            ret 0;
+        }
+
+        ctx.local_vars = r.unwrap_ok();
+        ctx.local_cap = new_cap;
+    }
+
+    # allocate stack space
+    ctx.stack_offset = ctx.stack_offset - aligned_size::i32;
+    val offset: i32 = ctx.stack_offset;
+
+    # record local
+    val idx: i32 = ctx.local_count;
+    ctx.local_vars[idx].name = name;
+    ctx.local_vars[idx].offset = offset;
+    ctx.local_vars[idx].size = size;
+    ctx.local_count = ctx.local_count + 1;
+
+    ret offset;
+}
+
+# find_local_var: look up a local variable by name.
+# ---
+# ctx:  lowering context
+# name: variable name
+# ret:  pointer to LocalVar or nil if not found
+pub fun find_local_var(ctx: *LowerContext, name: str) *LocalVar {
+    if (ctx == nil || name == nil || ctx.local_vars == nil) {
+        ret nil;
+    }
+
+    var i: i32 = ctx.local_count - 1;
+    for (i >= 0) {
+        val lv: *LocalVar = ?ctx.local_vars[i];
+        if (lv.name != nil && lv.name.equals(name)) {
+            ret lv;
+        }
+        i = i - 1;
+    }
+
+    ret nil;
+}
+
+# frame_mem: create a memory operand relative to frame pointer.
+# ---
+# ctx:    lowering context
+# offset: offset from frame pointer
+# size:   operand size in bytes
+# ret:    IRValue for the memory operand
+pub fun frame_mem(ctx: *LowerContext, offset: i32, size: usize) ir.IRValue {
+    var v: ir.IRValue;
+    v.kind = ir.IRValueKind { val_mem: 0 };
+    v.base_reg = sysv64.RBP;
+    v.offset = offset::i64;
+    v.size = size;
+    v.reg = 0;
+    v.imm = 0;
+    v.index_reg = -1;
+    v.scale = 1;
+    v.label = nil;
+    ret v;
+}
+
+# ensure_in_reg: ensure a value is in a register, loading if needed.
+# ---
+# ctx:       lowering context
+# src_value: value to ensure is in register
+# size:      operand size
+# ret:       IRValue in a register
+pub fun ensure_in_reg(ctx: *LowerContext, src_value: ir.IRValue, size: usize) ir.IRValue {
+    # if already a register, return as-is
+    # TODO: proper union tag checking
+    # for now check if reg field is meaningful
+
+    # allocate a new temp register
+    val reg: i32 = new_temp(ctx);
+    var result: ir.IRValue = ir.make_reg(reg, size);
+
+    # emit load or move instruction
+    var instr: ir.IRInstr;
+    instr.cond = 0;
+    instr.dst = result;
+    instr.src1 = src_value;
+
+    # use MOV for registers/immediates, LOAD for memory
+    # TODO: proper kind checking
+    instr.op = ir.IROp { ir_mov: 0 };
+
+    if (ctx.current_block != nil && ctx.alloc != nil) {
+        ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+    }
+
+    ret result;
+}
+
+# push_deferred: push a deferred statement (fin).
+# ---
+# ctx:  lowering context
+# node: statement node to defer
+# ret:  none
+pub fun push_deferred(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    if (ctx.deferred_count >= ctx.deferred_cap) {
+        var new_cap: i32 = 8;
+        if (ctx.deferred_cap > 0) {
+            new_cap = ctx.deferred_cap * 2;
+        }
+
+        val r: Result[**ast.Node, allocator.AllocError] = ctx.alloc.resize[*ast.Node](
+            ctx.deferred, ctx.deferred_cap::usize, new_cap::usize
+        );
+        if (r.is_err()) {
+            ret;
+        }
+
+        ctx.deferred = r.unwrap_ok();
+        ctx.deferred_cap = new_cap;
+    }
+
+    ctx.deferred[ctx.deferred_count] = node;
+    ctx.deferred_count = ctx.deferred_count + 1;
+}
+
+# emit_deferred_from: emit deferred statements from given index to current.
+# ---
+# ctx:        lowering context
+# from_index: starting index in deferred stack
+# ret:        none
+pub fun emit_deferred_from(ctx: *LowerContext, from_index: i32) {
+    if (ctx == nil || ctx.deferred == nil) {
+        ret;
+    }
+
+    # emit in reverse order (LIFO)
+    var i: i32 = ctx.deferred_count - 1;
+    for (i >= from_index) {
+        val node: *ast.Node = ctx.deferred[i];
+        if (node != nil) {
+            lower_stmt(ctx, node);
+        }
+        i = i - 1;
+    }
+}
+
+# push_loop_defer_mark: mark current deferred stack depth when entering a loop.
+# ---
+# ctx: lowering context
+# ret: none
+pub fun push_loop_defer_mark(ctx: *LowerContext) {
+    if (ctx == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    if (ctx.loop_mark_count >= ctx.loop_mark_cap) {
+        var new_cap: i32 = 8;
+        if (ctx.loop_mark_cap > 0) {
+            new_cap = ctx.loop_mark_cap * 2;
+        }
+
+        val r: Result[*i32, allocator.AllocError] = ctx.alloc.resize[i32](
+            ctx.loop_defer_marks, ctx.loop_mark_cap::usize, new_cap::usize
+        );
+        if (r.is_err()) {
+            ret;
+        }
+
+        ctx.loop_defer_marks = r.unwrap_ok();
+        ctx.loop_mark_cap = new_cap;
+    }
+
+    ctx.loop_defer_marks[ctx.loop_mark_count] = ctx.deferred_count;
+    ctx.loop_mark_count = ctx.loop_mark_count + 1;
+}
+
+# pop_loop_defer_mark: pop loop defer mark when exiting a loop.
+# ---
+# ctx: lowering context
+# ret: the mark value (deferred count at loop entry)
+pub fun pop_loop_defer_mark(ctx: *LowerContext) i32 {
+    if (ctx == nil || ctx.loop_mark_count <= 0) {
+        ret 0;
+    }
+
+    ctx.loop_mark_count = ctx.loop_mark_count - 1;
+    ret ctx.loop_defer_marks[ctx.loop_mark_count];
+}
+
+# get_current_loop_defer_mark: get current loop's defer mark without popping.
+# ---
+# ctx: lowering context
+# ret: mark value or 0 if not in a loop
+pub fun get_current_loop_defer_mark(ctx: *LowerContext) i32 {
+    if (ctx == nil || ctx.loop_mark_count <= 0) {
+        ret 0;
+    }
+    ret ctx.loop_defer_marks[ctx.loop_mark_count - 1];
+}
+
+# type_size: get the size of a type in bytes.
+# ---
+# t:        type to measure
+# ptr_size: pointer size
+# ret:      size in bytes
+pub fun type_size(t: *ty.Type, ptr_size: usize) usize {
+    if (t == nil) {
+        ret ptr_size;  # default to pointer size
+    }
+
+    # TODO: implement proper type size calculation based on type kind
+    # for now use the size field if available
+
+    ret ptr_size;  # placeholder
+}
+
+# type_is_aggregate: check if type is an aggregate (struct/union/array).
+# ---
+# t: type to check
+# ret: true if aggregate
+pub fun type_is_aggregate(t: *ty.Type) bool {
+    if (t == nil) {
+        ret false;
+    }
+
+    # TODO: proper kind checking
+    ret false;
+}
+
+# type_is_large_aggregate: check if type is an aggregate larger than a register.
+# ---
+# t:        type to check
+# ptr_size: pointer/register size
+# ret:      true if large aggregate
+pub fun type_is_large_aggregate(t: *ty.Type, ptr_size: usize) bool {
+    if (!type_is_aggregate(t)) {
+        ret false;
+    }
+
+    ret type_size(t, ptr_size) > ptr_size;
+}
+
+# type_is_float: check if type is floating point.
+# ---
+# t: type to check
+# ret: true if float
+pub fun type_is_float(t: *ty.Type) bool {
+    if (t == nil) {
+        ret false;
+    }
+
+    # TODO: proper kind checking
+    ret false;
+}
+
+# --- IR emission helpers ---
+
+# emit_label: emit a label instruction.
+# ---
+# ctx:   lowering context
+# label: label name
+# ret:   none
+pub fun emit_label(ctx: *LowerContext, label: str) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_label: 0 };
+    instr.dst = ir.make_label(label);
+    instr.src1.kind = ir.IRValueKind { val_none: 0 };
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_jmp: emit an unconditional jump.
+# ---
+# ctx:   lowering context
+# label: target label
+# ret:   none
+pub fun emit_jmp(ctx: *LowerContext, label: str) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_jmp: 0 };
+    instr.dst = ir.make_label(label);
+    instr.src1.kind = ir.IRValueKind { val_none: 0 };
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_jcc: emit a conditional jump.
+# ---
+# ctx:   lowering context
+# cond:  condition code
+# label: target label
+# ret:   none
+pub fun emit_jcc(ctx: *LowerContext, cond: i32, label: str) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_jcc: 0 };
+    instr.dst = ir.make_label(label);
+    instr.src1.kind = ir.IRValueKind { val_none: 0 };
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = cond;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_ret: emit a return instruction.
+# ---
+# ctx:       lowering context
+# ret_value: return value (or none)
+# ret:       none
+pub fun emit_ret(ctx: *LowerContext, ret_value: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_ret: 0 };
+    instr.dst.kind = ir.IRValueKind { val_none: 0 };
+    instr.src1 = ret_value;
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_mov: emit a move instruction.
+# ---
+# ctx: lowering context
+# dst: destination
+# src: source
+# ret: none
+pub fun emit_mov(ctx: *LowerContext, dst: ir.IRValue, src: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_mov: 0 };
+    instr.dst = dst;
+    instr.src1 = src;
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_load: emit a load from memory.
+# ---
+# ctx:  lowering context
+# dst:  destination register
+# addr: memory address
+# ret:  none
+pub fun emit_load(ctx: *LowerContext, dst: ir.IRValue, addr: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_load: 0 };
+    instr.dst = dst;
+    instr.src1 = addr;
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_store: emit a store to memory.
+# ---
+# ctx:        lowering context
+# addr:       memory address
+# store_val:  value to store
+# ret:        none
+pub fun emit_store(ctx: *LowerContext, addr: ir.IRValue, store_val: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_store: 0 };
+    instr.dst = addr;
+    instr.src1 = store_val;
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_lea: emit load effective address.
+# ---
+# ctx:  lowering context
+# dst:  destination register
+# addr: memory address
+# ret:  none
+pub fun emit_lea(ctx: *LowerContext, dst: ir.IRValue, addr: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_lea: 0 };
+    instr.dst = dst;
+    instr.src1 = addr;
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_binop: emit a binary operation.
+# ---
+# ctx: lowering context
+# op:  operation (ir_add, ir_sub, etc.)
+# dst: destination
+# lhs: left operand
+# rhs: right operand
+# ret: none
+pub fun emit_binop(ctx: *LowerContext, op: ir.IROp, dst: ir.IRValue, lhs: ir.IRValue, rhs: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = op;
+    instr.dst = dst;
+    instr.src1 = lhs;
+    instr.src2 = rhs;
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_unaryop: emit a unary operation.
+# ---
+# ctx: lowering context
+# op:  operation (ir_neg, ir_not)
+# dst: destination
+# src: source operand
+# ret: none
+pub fun emit_unaryop(ctx: *LowerContext, op: ir.IROp, dst: ir.IRValue, src: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = op;
+    instr.dst = dst;
+    instr.src1 = src;
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_cmp: emit a comparison instruction.
+# ---
+# ctx: lowering context
+# lhs: left operand
+# rhs: right operand
+# ret: none
+pub fun emit_cmp(ctx: *LowerContext, lhs: ir.IRValue, rhs: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_cmp: 0 };
+    instr.dst.kind = ir.IRValueKind { val_none: 0 };
+    instr.src1 = lhs;
+    instr.src2 = rhs;
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_call: emit a call instruction.
+# ---
+# ctx:    lowering context
+# target: function to call (label or register)
+# ret:    none
+pub fun emit_call(ctx: *LowerContext, target: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_call: 0 };
+    instr.dst.kind = ir.IRValueKind { val_none: 0 };
+    instr.src1 = target;
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_push: emit a push instruction.
+# ---
+# ctx:      lowering context
+# push_val: value to push
+# ret:      none
+pub fun emit_push(ctx: *LowerContext, push_val: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_push: 0 };
+    instr.dst.kind = ir.IRValueKind { val_none: 0 };
+    instr.src1 = push_val;
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# emit_pop: emit a pop instruction.
+# ---
+# ctx: lowering context
+# dst: destination register
+# ret: none
+pub fun emit_pop(ctx: *LowerContext, dst: ir.IRValue) {
+    if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    var instr: ir.IRInstr;
+    instr.op = ir.IROp { ir_pop: 0 };
+    instr.dst = dst;
+    instr.src1.kind = ir.IRValueKind { val_none: 0 };
+    instr.src2.kind = ir.IRValueKind { val_none: 0 };
+    instr.cond = 0;
+
+    ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+}
+
+# --- expression lowering ---
+
+# lower_expr: lower an expression to IR.
+# ---
+# ctx:  lowering context
+# node: expression AST node
+# ret:  IRValue with result
+pub fun lower_expr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+    none_val.reg = 0;
+    none_val.imm = 0;
+    none_val.offset = 0;
+    none_val.base_reg = -1;
+    none_val.index_reg = -1;
+    none_val.scale = 1;
+    none_val.label = nil;
+    none_val.size = 0;
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    val kind: ast.NodeKind = node.kind;
+
+    # integer literal
+    if (kind == ast.NODE_EXPR_LIT_INT) {
+        val int_val: i64 = ast.get_int_value(node);
+        ret ir.make_imm(int_val, 8);
+    }
+
+    # float literal
+    if (kind == ast.NODE_EXPR_LIT_FLOAT) {
+        val float_val: f64 = ast.get_float_value(node);
+        # store float bits as i64 for now
+        # TODO: proper float handling
+        ret ir.make_imm(0, 8);
+    }
+
+    # char literal
+    if (kind == ast.NODE_EXPR_LIT_CHAR) {
+        val char_val: i64 = ast.get_int_value(node);
+        ret ir.make_imm(char_val, 1);
+    }
+
+    # bool literal
+    if (kind == ast.NODE_EXPR_LIT_BOOL) {
+        val bool_val: bool = ast.get_bool_value(node);
+        if (bool_val) {
+            ret ir.make_imm(1, 1);
+        }
+        ret ir.make_imm(0, 1);
+    }
+
+    # nil literal
+    if (kind == ast.NODE_EXPR_LIT_NIL) {
+        ret ir.make_imm(0, ctx.ptr_size);
+    }
+
+    # string literal
+    if (kind == ast.NODE_EXPR_LIT_STR) {
+        val str_val: str = ast.get_name(node);
+        val label: str = new_string_label(ctx);
+
+        # add string to .rodata section
+        if (ctx.m != nil) {
+            val rodata_res: Result[*section.Section, str] = masm.get_or_create_section(
+                ctx.m, ".rodata", section.SectionKind { sec_rodata: 0 }
+            );
+            if (rodata_res.is_ok()) {
+                val rodata: *section.Section = rodata_res.unwrap_ok();
+                val offset: usize = rodata.size;
+
+                # emit string bytes
+                if (str_val != nil && ctx.alloc != nil) {
+                    var i: usize = 0;
+                    for (i < str_val.len()) {
+                        section.emit_byte(ctx.alloc, rodata, str_val[i]);
+                        i = i + 1;
+                    }
+                    section.emit_byte(ctx.alloc, rodata, 0);  # null terminator
+                }
+
+                # create symbol for the string
+                val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, label);
+                if (sym_res.is_ok()) {
+                    val s: *sym.Symbol = sym_res.unwrap_ok();
+                    sym.define(s, rodata, offset, str_val.len() + 1);
+                    sym.set_binding(s, sym.SymbolBinding { bind_local: 0 });
+                    sym.set_type(s, sym.SymbolType { sym_object: 0 });
+                    masm.add_symbol(ctx.m, s);
+                }
+            }
+        }
+
+        # emit LEA to load string address
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+        val src: ir.IRValue = ir.make_label(label);
+        emit_lea(ctx, dst, src);
+
+        ret dst;
+    }
+
+    # identifier
+    if (kind == ast.NODE_EXPR_IDENT) {
+        val name: str = ast.get_name(node);
+
+        # check local variables first
+        val lv: *LocalVar = find_local_var(ctx, name);
+        if (lv != nil) {
+            ret frame_mem(ctx, lv.offset, lv.size);
+        }
+
+        # check symbol table for globals
+        if (ctx.symbols != nil) {
+            val sym: *symbol.Symbol = symbol.lookup(ctx.symbols, name);
+            if (sym != nil) {
+                # return label for global
+                ret ir.make_label(name);
+            }
+        }
+
+        ret none_val;
+    }
+
+    # parenthesized expression
+    if (kind == ast.NODE_EXPR_PAREN) {
+        val inner: *ast.Node = ast.get_child(node, 0);
+        ret lower_expr(ctx, inner);
+    }
+
+    # binary expression
+    if (kind == ast.NODE_EXPR_BINARY) {
+        ret lower_binary(ctx, node);
+    }
+
+    # unary expression
+    if (kind == ast.NODE_EXPR_UNARY) {
+        ret lower_unary(ctx, node);
+    }
+
+    # call expression
+    if (kind == ast.NODE_EXPR_CALL) {
+        ret lower_call(ctx, node);
+    }
+
+    # field access
+    if (kind == ast.NODE_EXPR_FIELD) {
+        ret lower_field(ctx, node);
+    }
+
+    # index expression
+    if (kind == ast.NODE_EXPR_INDEX) {
+        ret lower_index(ctx, node);
+    }
+
+    # cast expression
+    if (kind == ast.NODE_EXPR_CAST) {
+        ret lower_cast(ctx, node);
+    }
+
+    # address-of
+    if (kind == ast.NODE_EXPR_ADDR) {
+        ret lower_addr(ctx, node);
+    }
+
+    # dereference
+    if (kind == ast.NODE_EXPR_DEREF) {
+        ret lower_deref(ctx, node);
+    }
+
+    # array literal
+    if (kind == ast.NODE_EXPR_ARRAY_LIT) {
+        ret lower_array_lit(ctx, node);
+    }
+
+    # struct literal
+    if (kind == ast.NODE_EXPR_STRUCT_LIT) {
+        ret lower_struct_lit(ctx, node);
+    }
+
+    ret none_val;
+}
+
+# lower_binary: lower a binary expression.
+# ---
+# ctx:  lowering context
+# node: binary expression node
+# ret:  IRValue with result
+pub fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    # get operator from token
+    val op: u8 = node.tok.kind.tag;
+
+    # get left and right operands from children
+    val lhs_node: *ast.Node = ast.get_child(node, 0);
+    val rhs_node: *ast.Node = ast.get_child(node, 1);
+
+    # check for assignment
+    if (op == token.TAG_EQ) {
+        ret lower_assign(ctx, lhs_node, rhs_node);
+    }
+
+    # check for short-circuit operators
+    if (op == token.TAG_AMP_AMP || op == token.TAG_PIPE_PIPE) {
+        ret lower_short_circuit(ctx, node, op);
+    }
+
+    # lower operands
+    var lhs: ir.IRValue = lower_expr(ctx, lhs_node);
+    var rhs: ir.IRValue = lower_expr(ctx, rhs_node);
+
+    # ensure operands are in registers
+    lhs = ensure_in_reg(ctx, lhs, ctx.ptr_size);
+    rhs = ensure_in_reg(ctx, rhs, ctx.ptr_size);
+
+    # allocate result register
+    val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+
+    # select IR operation
+    var ir_op: ir.IROp;
+    ir_op = ir.IROp { ir_add: 0 };  # default
+
+    if (op == token.TAG_PLUS) {
+        ir_op = ir.IROp { ir_add: 0 };
+    } or (op == token.TAG_MINUS) {
+        ir_op = ir.IROp { ir_sub: 0 };
+    } or (op == token.TAG_STAR) {
+        ir_op = ir.IROp { ir_mul: 0 };
+    } or (op == token.TAG_SLASH) {
+        ir_op = ir.IROp { ir_div: 0 };
+    } or (op == token.TAG_PERCENT) {
+        ir_op = ir.IROp { ir_mod: 0 };
+    } or (op == token.TAG_AMP) {
+        ir_op = ir.IROp { ir_and: 0 };
+    } or (op == token.TAG_PIPE) {
+        ir_op = ir.IROp { ir_or: 0 };
+    } or (op == token.TAG_CARET) {
+        ir_op = ir.IROp { ir_xor: 0 };
+    } or (op == token.TAG_LT_LT) {
+        ir_op = ir.IROp { ir_shl: 0 };
+    } or (op == token.TAG_GT_GT) {
+        ir_op = ir.IROp { ir_shr: 0 };
+    } or (op == token.TAG_EQ_EQ || op == token.TAG_BANG_EQ ||
+          op == token.TAG_LT || op == token.TAG_LT_EQ ||
+          op == token.TAG_GT || op == token.TAG_GT_EQ) {
+        # comparison: emit CMP then set result based on condition
+        emit_cmp(ctx, lhs, rhs);
+
+        # TODO: emit setcc for the comparison result
+        # for now just return a placeholder
+
+        ret dst;
+    }
+
+    emit_binop(ctx, ir_op, dst, lhs, rhs);
+
+    ret dst;
+}
+
+# lower_unary: lower a unary expression.
+# ---
+# ctx:  lowering context
+# node: unary expression node
+# ret:  IRValue with result
+pub fun lower_unary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    val op: u8 = node.tok.kind.tag;
+    val operand_node: *ast.Node = ast.get_child(node, 0);
+
+    if (op == token.TAG_MINUS) {
+        # negation
+        var operand: ir.IRValue = lower_expr(ctx, operand_node);
+        operand = ensure_in_reg(ctx, operand, ctx.ptr_size);
+
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+        emit_unaryop(ctx, ir.IROp { ir_neg: 0 }, dst, operand);
+        ret dst;
+    }
+
+    if (op == token.TAG_BANG) {
+        # logical not
+        var operand: ir.IRValue = lower_expr(ctx, operand_node);
+        operand = ensure_in_reg(ctx, operand, ctx.ptr_size);
+
+        # compare to 0 and set opposite
+        emit_cmp(ctx, operand, ir.make_imm(0, ctx.ptr_size));
+
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), 1);
+        # TODO: emit sete (set if equal to zero)
+        ret dst;
+    }
+
+    if (op == token.TAG_TILDE) {
+        # bitwise not
+        var operand: ir.IRValue = lower_expr(ctx, operand_node);
+        operand = ensure_in_reg(ctx, operand, ctx.ptr_size);
+
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+        emit_unaryop(ctx, ir.IROp { ir_not: 0 }, dst, operand);
+        ret dst;
+    }
+
+    ret none_val;
+}
+
+# lower_assign: lower an assignment expression.
+# ---
+# ctx: lowering context
+# lhs: left-hand side node
+# rhs: right-hand side node
+# ret: IRValue with result (the assigned value)
+pub fun lower_assign(ctx: *LowerContext, lhs: *ast.Node, rhs: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || lhs == nil || rhs == nil) {
+        ret none_val;
+    }
+
+    # lower the RHS value
+    var rhs_val: ir.IRValue = lower_expr(ctx, rhs);
+    rhs_val = ensure_in_reg(ctx, rhs_val, ctx.ptr_size);
+
+    # lower the LHS as an lvalue (get address)
+    val lhs_addr: ir.IRValue = lower_lvalue(ctx, lhs);
+
+    # store RHS to LHS address
+    emit_store(ctx, lhs_addr, rhs_val);
+
+    ret rhs_val;
+}
+
+# lower_short_circuit: lower a short-circuit logical expression (&&, ||).
+# ---
+# ctx:  lowering context
+# node: binary expression node
+# op:   operator (TAG_AMP_AMP or TAG_PIPE_PIPE)
+# ret:  IRValue with result
+pub fun lower_short_circuit(ctx: *LowerContext, node: *ast.Node, op: u8) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    val lhs_node: *ast.Node = ast.get_child(node, 0);
+    val rhs_node: *ast.Node = ast.get_child(node, 1);
+
+    val end_label: str = new_label(ctx, "scend");
+    val result_reg: i32 = new_temp(ctx);
+    val dst: ir.IRValue = ir.make_reg(result_reg, 1);
+
+    # evaluate LHS
+    var lhs: ir.IRValue = lower_expr(ctx, lhs_node);
+    lhs = ensure_in_reg(ctx, lhs, ctx.ptr_size);
+
+    # test LHS
+    emit_cmp(ctx, lhs, ir.make_imm(0, ctx.ptr_size));
+
+    if (op == token.TAG_AMP_AMP) {
+        # for &&: if LHS is false (0), short-circuit to end with 0
+        emit_mov(ctx, dst, ir.make_imm(0, 1));
+        emit_jcc(ctx, 0, end_label);  # JE (jump if equal to 0)
+    } or {
+        # for ||: if LHS is true (non-0), short-circuit to end with 1
+        emit_mov(ctx, dst, ir.make_imm(1, 1));
+        emit_jcc(ctx, 1, end_label);  # JNE (jump if not equal to 0)
+    }
+
+    # evaluate RHS
+    var rhs: ir.IRValue = lower_expr(ctx, rhs_node);
+    rhs = ensure_in_reg(ctx, rhs, ctx.ptr_size);
+
+    # convert RHS to bool (compare to 0)
+    emit_cmp(ctx, rhs, ir.make_imm(0, ctx.ptr_size));
+    # TODO: emit setne to set result
+
+    emit_label(ctx, end_label);
+
+    ret dst;
+}
+
+# lower_call: lower a function call expression.
+# ---
+# ctx:  lowering context
+# node: call expression node
+# ret:  IRValue with result
+pub fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    # get callee (first child)
+    val callee_node: *ast.Node = ast.get_child(node, 0);
+
+    # get arguments from node.data (should be a List)
+    val args: *ast.List = ast.get_list(node);
+
+    # lower callee to get function address
+    val callee: ir.IRValue = lower_expr(ctx, callee_node);
+
+    # lower and place arguments
+    var int_arg_idx: i32 = 0;
+    var float_arg_idx: i32 = 0;
+    var stack_arg_count: i32 = 0;
+
+    if (args != nil) {
+        var i: i32 = 0;
+        for (i < args.count) {
+            val arg_node: *ast.Node = args.nodes[i];
+            var arg_val: ir.IRValue = lower_expr(ctx, arg_node);
+            arg_val = ensure_in_reg(ctx, arg_val, ctx.ptr_size);
+
+            # determine if float or int argument
+            val is_float: bool = false;  # TODO: check arg type
+
+            if (is_float && float_arg_idx < 8) {
+                # place in float register
+                val reg: i32 = sysv64.get_float_arg_reg(float_arg_idx);
+                emit_mov(ctx, ir.make_reg(reg, ctx.ptr_size), arg_val);
+                float_arg_idx = float_arg_idx + 1;
+            } or (int_arg_idx < 6) {
+                # place in integer register
+                val reg: i32 = sysv64.get_arg_reg(int_arg_idx);
+                emit_mov(ctx, ir.make_reg(reg, ctx.ptr_size), arg_val);
+                int_arg_idx = int_arg_idx + 1;
+            } or {
+                # push to stack
+                emit_push(ctx, arg_val);
+                stack_arg_count = stack_arg_count + 1;
+            }
+
+            i = i + 1;
+        }
+    }
+
+    # emit call
+    emit_call(ctx, callee);
+
+    # clean up stack arguments if any
+    if (stack_arg_count > 0) {
+        # add rsp, stack_arg_count * 8
+        # TODO: emit stack cleanup
+    }
+
+    # return value is in RAX
+    val result: ir.IRValue = ir.make_reg(sysv64.RAX, ctx.ptr_size);
+
+    ret result;
+}
+
+# lower_field: lower a field access expression.
+# ---
+# ctx:  lowering context
+# node: field access node
+# ret:  IRValue with result
+pub fun lower_field(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    # get base expression (first child)
+    val base_node: *ast.Node = ast.get_child(node, 0);
+
+    # get field name from data
+    val field_name: str = ast.get_name(node);
+
+    # lower base to get struct address
+    var base: ir.IRValue = lower_expr(ctx, base_node);
+    base = ensure_in_reg(ctx, base, ctx.ptr_size);
+
+    # TODO: look up field offset in type
+    val field_offset: i64 = 0;
+    val field_size: usize = ctx.ptr_size;
+
+    # create memory operand for field
+    var mem: ir.IRValue;
+    mem.kind = ir.IRValueKind { val_mem: 0 };
+    mem.base_reg = base.reg;
+    mem.offset = field_offset;
+    mem.size = field_size;
+    mem.reg = 0;
+    mem.imm = 0;
+    mem.index_reg = -1;
+    mem.scale = 1;
+    mem.label = nil;
+
+    ret mem;
+}
+
+# lower_index: lower an index expression.
+# ---
+# ctx:  lowering context
+# node: index expression node
+# ret:  IRValue with result
+pub fun lower_index(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    # get base and index (children)
+    val base_node: *ast.Node = ast.get_child(node, 0);
+    val index_node: *ast.Node = ast.get_child(node, 1);
+
+    # lower base
+    var base: ir.IRValue = lower_expr(ctx, base_node);
+    base = ensure_in_reg(ctx, base, ctx.ptr_size);
+
+    # lower index
+    var idx: ir.IRValue = lower_expr(ctx, index_node);
+    idx = ensure_in_reg(ctx, idx, ctx.ptr_size);
+
+    # TODO: get element size from type
+    val elem_size: usize = ctx.ptr_size;
+
+    # compute address: base + index * elem_size
+    var mem: ir.IRValue;
+    mem.kind = ir.IRValueKind { val_mem: 0 };
+    mem.base_reg = base.reg;
+    mem.index_reg = idx.reg;
+    mem.scale = elem_size::i32;
+    mem.offset = 0;
+    mem.size = elem_size;
+    mem.reg = 0;
+    mem.imm = 0;
+    mem.label = nil;
+
+    ret mem;
+}
+
+# lower_cast: lower a cast expression.
+# ---
+# ctx:  lowering context
+# node: cast expression node
+# ret:  IRValue with result
+pub fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    # get expression to cast (first child)
+    val expr_node: *ast.Node = ast.get_child(node, 0);
+
+    # lower expression
+    var result: ir.IRValue = lower_expr(ctx, expr_node);
+    result = ensure_in_reg(ctx, result, ctx.ptr_size);
+
+    # TODO: emit actual conversion instructions based on source/target types
+    # for now just return the value (many casts are no-ops at IR level)
+
+    ret result;
+}
+
+# lower_addr: lower an address-of expression (?).
+# ---
+# ctx:  lowering context
+# node: address-of expression node
+# ret:  IRValue with result (address)
+pub fun lower_addr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    val operand_node: *ast.Node = ast.get_child(node, 0);
+
+    # lower operand as lvalue to get its address
+    val addr: ir.IRValue = lower_lvalue(ctx, operand_node);
+
+    # emit LEA to get address into a register
+    val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+    emit_lea(ctx, dst, addr);
+
+    ret dst;
+}
+
+# lower_deref: lower a dereference expression (@).
+# ---
+# ctx:  lowering context
+# node: dereference expression node
+# ret:  IRValue with result
+pub fun lower_deref(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    val ptr_node: *ast.Node = ast.get_child(node, 0);
+
+    # lower pointer expression
+    var ptr: ir.IRValue = lower_expr(ctx, ptr_node);
+    ptr = ensure_in_reg(ctx, ptr, ctx.ptr_size);
+
+    # create memory operand for dereferencing
+    var mem: ir.IRValue;
+    mem.kind = ir.IRValueKind { val_mem: 0 };
+    mem.base_reg = ptr.reg;
+    mem.offset = 0;
+    mem.size = ctx.ptr_size;  # TODO: get size from pointed-to type
+    mem.reg = 0;
+    mem.imm = 0;
+    mem.index_reg = -1;
+    mem.scale = 1;
+    mem.label = nil;
+
+    ret mem;
+}
+
+# lower_array_lit: lower an array literal expression.
+# ---
+# ctx:  lowering context
+# node: array literal node
+# ret:  IRValue with address of array
+pub fun lower_array_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    val elements: *ast.List = ast.get_list(node);
+    if (elements == nil || elements.count == 0) {
+        ret none_val;
+    }
+
+    # TODO: get element size from type
+    val elem_size: usize = ctx.ptr_size;
+    val total_size: usize = elem_size * elements.count::usize;
+
+    # allocate stack space
+    val offset: i32 = add_local_var(ctx, nil, total_size);
+    val base_addr: ir.IRValue = frame_mem(ctx, offset, total_size);
+
+    # initialize each element
+    var i: i32 = 0;
+    for (i < elements.count) {
+        val elem_node: *ast.Node = elements.nodes[i];
+        var elem_val: ir.IRValue = lower_expr(ctx, elem_node);
+        elem_val = ensure_in_reg(ctx, elem_val, elem_size);
+
+        # compute element address
+        var elem_addr: ir.IRValue;
+        elem_addr.kind = ir.IRValueKind { val_mem: 0 };
+        elem_addr.base_reg = sysv64.RBP;
+        elem_addr.offset = offset::i64 + (i::i64 * elem_size::i64);
+        elem_addr.size = elem_size;
+        elem_addr.reg = 0;
+        elem_addr.imm = 0;
+        elem_addr.index_reg = -1;
+        elem_addr.scale = 1;
+        elem_addr.label = nil;
+
+        emit_store(ctx, elem_addr, elem_val);
+
+        i = i + 1;
+    }
+
+    # return address of array
+    val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+    emit_lea(ctx, dst, base_addr);
+
+    ret dst;
+}
+
+# lower_struct_lit: lower a struct literal expression.
+# ---
+# ctx:  lowering context
+# node: struct literal node
+# ret:  IRValue with address of struct
+pub fun lower_struct_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    # TODO: implement struct literal lowering
+    # - get struct type and size
+    # - allocate stack space
+    # - initialize each field
+
+    ret none_val;
+}
+
+# --- lvalue lowering ---
+
+# lower_lvalue: lower an expression as an lvalue (for assignment targets).
+# ---
+# ctx:  lowering context
+# node: expression AST node
+# ret:  IRValue with address
+pub fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (ctx == nil || node == nil) {
+        ret none_val;
+    }
+
+    val kind: ast.NodeKind = node.kind;
+
+    # identifier
+    if (kind == ast.NODE_EXPR_IDENT) {
+        val name: str = ast.get_name(node);
+
+        # check local variables
+        val lv: *LocalVar = find_local_var(ctx, name);
+        if (lv != nil) {
+            ret frame_mem(ctx, lv.offset, lv.size);
+        }
+
+        # global variable - return label
+        ret ir.make_label(name);
+    }
+
+    # field access
+    if (kind == ast.NODE_EXPR_FIELD) {
+        val base_node: *ast.Node = ast.get_child(node, 0);
+        val field_name: str = ast.get_name(node);
+
+        # lower base as lvalue
+        var base_addr: ir.IRValue = lower_lvalue(ctx, base_node);
+        base_addr = ensure_in_reg(ctx, base_addr, ctx.ptr_size);
+
+        # TODO: look up field offset
+        val field_offset: i64 = 0;
+        val field_size: usize = ctx.ptr_size;
+
+        var mem: ir.IRValue;
+        mem.kind = ir.IRValueKind { val_mem: 0 };
+        mem.base_reg = base_addr.reg;
+        mem.offset = field_offset;
+        mem.size = field_size;
+        mem.reg = 0;
+        mem.imm = 0;
+        mem.index_reg = -1;
+        mem.scale = 1;
+        mem.label = nil;
+
+        ret mem;
+    }
+
+    # index expression
+    if (kind == ast.NODE_EXPR_INDEX) {
+        val base_node: *ast.Node = ast.get_child(node, 0);
+        val index_node: *ast.Node = ast.get_child(node, 1);
+
+        var base: ir.IRValue = lower_lvalue(ctx, base_node);
+        base = ensure_in_reg(ctx, base, ctx.ptr_size);
+
+        var idx: ir.IRValue = lower_expr(ctx, index_node);
+        idx = ensure_in_reg(ctx, idx, ctx.ptr_size);
+
+        val elem_size: usize = ctx.ptr_size;  # TODO: get from type
+
+        var mem: ir.IRValue;
+        mem.kind = ir.IRValueKind { val_mem: 0 };
+        mem.base_reg = base.reg;
+        mem.index_reg = idx.reg;
+        mem.scale = elem_size::i32;
+        mem.offset = 0;
+        mem.size = elem_size;
+        mem.reg = 0;
+        mem.imm = 0;
+        mem.label = nil;
+
+        ret mem;
+    }
+
+    # dereference
+    if (kind == ast.NODE_EXPR_DEREF) {
+        val ptr_node: *ast.Node = ast.get_child(node, 0);
+
+        var ptr: ir.IRValue = lower_expr(ctx, ptr_node);
+        ptr = ensure_in_reg(ctx, ptr, ctx.ptr_size);
+
+        var mem: ir.IRValue;
+        mem.kind = ir.IRValueKind { val_mem: 0 };
+        mem.base_reg = ptr.reg;
+        mem.offset = 0;
+        mem.size = ctx.ptr_size;
+        mem.reg = 0;
+        mem.imm = 0;
+        mem.index_reg = -1;
+        mem.scale = 1;
+        mem.label = nil;
+
+        ret mem;
+    }
+
+    ret none_val;
+}
+
+# --- statement lowering ---
+
+# lower_stmt: lower a statement to IR.
+# ---
+# ctx:  lowering context
+# node: statement AST node
+# ret:  none
+pub fun lower_stmt(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    val kind: ast.NodeKind = node.kind;
+
+    # block statement
+    if (kind == ast.NODE_STMT_BLOCK) {
+        lower_block(ctx, node);
+        ret;
+    }
+
+    # expression statement
+    if (kind == ast.NODE_STMT_EXPR) {
+        val expr: *ast.Node = ast.get_child(node, 0);
+        lower_expr(ctx, expr);  # discard result
+        ret;
+    }
+
+    # local val declaration
+    if (kind == ast.NODE_DECL_VAL) {
+        lower_local_decl(ctx, node, false);
+        ret;
+    }
+
+    # local var declaration
+    if (kind == ast.NODE_DECL_VAR) {
+        lower_local_decl(ctx, node, true);
+        ret;
+    }
+
+    # return statement
+    if (kind == ast.NODE_STMT_RET) {
+        lower_return(ctx, node);
+        ret;
+    }
+
+    # if statement
+    if (kind == ast.NODE_STMT_IF) {
+        lower_if(ctx, node);
+        ret;
+    }
+
+    # for statement
+    if (kind == ast.NODE_STMT_FOR) {
+        lower_for(ctx, node);
+        ret;
+    }
+
+    # break statement
+    if (kind == ast.NODE_STMT_BRK) {
+        lower_break(ctx);
+        ret;
+    }
+
+    # continue statement
+    if (kind == ast.NODE_STMT_CNT) {
+        lower_continue(ctx);
+        ret;
+    }
+
+    # defer statement
+    if (kind == ast.NODE_STMT_FIN) {
+        lower_defer(ctx, node);
+        ret;
+    }
+
+    # inline assembly
+    if (kind == ast.NODE_STMT_MASM) {
+        lower_inline_asm(ctx, node);
+        ret;
+    }
+}
+
+# lower_block: lower a block statement.
+# ---
+# ctx:  lowering context
+# node: block node
+# ret:  none
+pub fun lower_block(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    val stmts: *ast.List = ast.get_list(node);
+    if (stmts == nil) {
+        ret;
+    }
+
+    var i: i32 = 0;
+    for (i < stmts.count) {
+        val stmt: *ast.Node = stmts.nodes[i];
+        lower_stmt(ctx, stmt);
+        i = i + 1;
+    }
+}
+
+# lower_local_decl: lower a local variable declaration.
+# ---
+# ctx:     lowering context
+# node:    declaration node
+# mutable: true for var, false for val
+# ret:     none
+pub fun lower_local_decl(ctx: *LowerContext, node: *ast.Node, mutable: bool) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    val name: str = ast.get_name(node);
+    val init_node: *ast.Node = node.extra::*ast.Node;
+
+    # TODO: get size from type
+    val size: usize = ctx.ptr_size;
+
+    # allocate stack space
+    val offset: i32 = add_local_var(ctx, name, size);
+    val addr: ir.IRValue = frame_mem(ctx, offset, size);
+
+    # lower initializer if present
+    if (init_node != nil) {
+        var init_val: ir.IRValue = lower_expr(ctx, init_node);
+        init_val = ensure_in_reg(ctx, init_val, size);
+        emit_store(ctx, addr, init_val);
+    }
+}
+
+# lower_return: lower a return statement.
+# ---
+# ctx:  lowering context
+# node: return node
+# ret:  none
+pub fun lower_return(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    # emit all deferred statements
+    emit_deferred_from(ctx, 0);
+
+    val expr: *ast.Node = ast.get_child(node, 0);
+
+    var ret_val: ir.IRValue;
+    ret_val.kind = ir.IRValueKind { val_none: 0 };
+
+    if (expr != nil) {
+        ret_val = lower_expr(ctx, expr);
+        ret_val = ensure_in_reg(ctx, ret_val, ctx.ptr_size);
+
+        # move return value to RAX
+        emit_mov(ctx, ir.make_reg(sysv64.RAX, ctx.ptr_size), ret_val);
+    }
+
+    emit_ret(ctx, ret_val);
+}
+
+# lower_if: lower an if statement.
+# ---
+# ctx:  lowering context
+# node: if node
+# ret:  none
+pub fun lower_if(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    # children: condition, then-body, else-body (optional)
+    val cond_node: *ast.Node = ast.get_child(node, 0);
+    val then_node: *ast.Node = ast.get_child(node, 1);
+    val else_node: *ast.Node = ast.get_child(node, 2);
+
+    val else_label: str = new_label(ctx, "else");
+    val end_label: str = new_label(ctx, "endif");
+
+    # lower condition
+    var cond: ir.IRValue = lower_expr(ctx, cond_node);
+    cond = ensure_in_reg(ctx, cond, ctx.ptr_size);
+
+    # test condition
+    emit_cmp(ctx, cond, ir.make_imm(0, ctx.ptr_size));
+
+    # jump to else if condition is false
+    if (else_node != nil) {
+        emit_jcc(ctx, 0, else_label);  # JE
+    } or {
+        emit_jcc(ctx, 0, end_label);   # JE
+    }
+
+    # lower then branch
+    lower_stmt(ctx, then_node);
+
+    if (else_node != nil) {
+        # jump to end after then branch
+        emit_jmp(ctx, end_label);
+
+        # else branch
+        emit_label(ctx, else_label);
+        lower_stmt(ctx, else_node);
+    }
+
+    emit_label(ctx, end_label);
+}
+
+# lower_for: lower a for loop.
+# ---
+# ctx:  lowering context
+# node: for node
+# ret:  none
+pub fun lower_for(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    val cond_node: *ast.Node = ast.get_child(node, 0);
+    val body_node: *ast.Node = ast.get_child(node, 1);
+
+    val start_label: str = new_label(ctx, "for");
+    val end_label: str = new_label(ctx, "endfor");
+
+    # save loop labels for break/continue
+    val prev_start: str = ctx.loop_start_label;
+    val prev_end: str = ctx.loop_end_label;
+    ctx.loop_start_label = start_label;
+    ctx.loop_end_label = end_label;
+
+    # push defer mark for loop
+    push_loop_defer_mark(ctx);
+
+    # loop start
+    emit_label(ctx, start_label);
+
+    # condition (if present)
+    if (cond_node != nil) {
+        var cond: ir.IRValue = lower_expr(ctx, cond_node);
+        cond = ensure_in_reg(ctx, cond, ctx.ptr_size);
+
+        emit_cmp(ctx, cond, ir.make_imm(0, ctx.ptr_size));
+        emit_jcc(ctx, 0, end_label);  # JE - exit if false
+    }
+
+    # loop body
+    lower_stmt(ctx, body_node);
+
+    # jump back to start
+    emit_jmp(ctx, start_label);
+
+    # loop end
+    emit_label(ctx, end_label);
+
+    # pop defer mark
+    pop_loop_defer_mark(ctx);
+
+    # restore loop labels
+    ctx.loop_start_label = prev_start;
+    ctx.loop_end_label = prev_end;
+}
+
+# lower_break: lower a break statement.
+# ---
+# ctx: lowering context
+# ret: none
+pub fun lower_break(ctx: *LowerContext) {
+    if (ctx == nil || ctx.loop_end_label == nil) {
+        ret;
+    }
+
+    # emit deferred statements for current loop
+    val mark: i32 = get_current_loop_defer_mark(ctx);
+    emit_deferred_from(ctx, mark);
+
+    # jump to loop end
+    emit_jmp(ctx, ctx.loop_end_label);
+}
+
+# lower_continue: lower a continue statement.
+# ---
+# ctx: lowering context
+# ret: none
+pub fun lower_continue(ctx: *LowerContext) {
+    if (ctx == nil || ctx.loop_start_label == nil) {
+        ret;
+    }
+
+    # emit deferred statements for current loop
+    val mark: i32 = get_current_loop_defer_mark(ctx);
+    emit_deferred_from(ctx, mark);
+
+    # jump to loop start
+    emit_jmp(ctx, ctx.loop_start_label);
+}
+
+# lower_defer: lower a defer statement.
+# ---
+# ctx:  lowering context
+# node: defer node
+# ret:  none
+pub fun lower_defer(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    # get the statement to defer (first child)
+    val stmt: *ast.Node = ast.get_child(node, 0);
+    if (stmt != nil) {
+        push_deferred(ctx, stmt);
+    }
+}
+
+# lower_inline_asm: lower an inline assembly block.
+# ---
+# ctx:  lowering context
+# node: asm node
+# ret:  none
+pub fun lower_inline_asm(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    # TODO: parse and emit inline assembly
+    # for now this is a no-op
+}
+
+# --- function lowering ---
+
+# lower_function: lower a function declaration to IR.
+# ---
+# ctx:  lowering context
+# node: function AST node
+# ret:  Ok(*IRFunction) on success, Err(str) on failure
+pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunction, str] {
+    if (ctx == nil) {
+        ret err[*ir.IRFunction, str]("context is nil");
+    }
+
+    if (node == nil) {
+        ret err[*ir.IRFunction, str]("node is nil");
+    }
+
+    # reset per-function state
+    reset_function_state(ctx);
+
+    val name: str = ast.get_name(node);
+    if (name == nil) {
+        ret err[*ir.IRFunction, str]("function has no name");
+    }
+
+    # create IR function
+    val fn_res: Result[*ir.IRFunction, str] = ir.create_function(ctx.alloc, name);
+    if (fn_res.is_err()) {
+        ret fn_res;
+    }
+
+    val func: *ir.IRFunction = fn_res.unwrap_ok();
+    ctx.current_fn = func;
+
+    # create entry block
+    val entry_label: str = new_label(ctx, "entry");
+    val block_res: Result[*ir.IRBlock, str] = ir.create_block(ctx.alloc, entry_label);
+    if (block_res.is_err()) {
+        ret err[*ir.IRFunction, str](block_res.unwrap_err());
+    }
+
+    val entry_block: *ir.IRBlock = block_res.unwrap_ok();
+    ctx.current_block = entry_block;
+
+    # add block to function
+    if (func.block_count >= func.block_cap) {
+        var new_cap: i32 = 8;
+        if (func.block_cap > 0) {
+            new_cap = func.block_cap * 2;
+        }
+
+        val r: Result[**ir.IRBlock, allocator.AllocError] = ctx.alloc.resize[*ir.IRBlock](
+            func.blocks, func.block_cap::usize, new_cap::usize
+        );
+        if (r.is_err()) {
+            ret err[*ir.IRFunction, str](r.unwrap_err());
+        }
+
+        func.blocks = r.unwrap_ok();
+        func.block_cap = new_cap;
+    }
+
+    func.blocks[func.block_count] = entry_block;
+    func.block_count = func.block_count + 1;
+
+    # emit function label
+    emit_label(ctx, name);
+
+    # create MASM symbol for function
+    if (ctx.m != nil) {
+        val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, name);
+        if (sym_res.is_ok()) {
+            val s: *sym.Symbol = sym_res.unwrap_ok();
+            sym.set_binding(s, sym.SymbolBinding { bind_global: 0 });
+            sym.set_type(s, sym.SymbolType { sym_func: 0 });
+            # offset will be set when we emit to section
+            masm.add_symbol(ctx.m, s);
+        }
+    }
+
+    # TODO: determine if function needs sret for aggregate returns
+    # TODO: lower parameters
+
+    # lower function body
+    val body: *ast.Node = node.extra::*ast.Node;
+    if (body != nil) {
+        lower_stmt(ctx, body);
+    }
+
+    # emit implicit return if no explicit return at end
+    var none_val: ir.IRValue;
+    none_val.kind = ir.IRValueKind { val_none: 0 };
+    emit_deferred_from(ctx, 0);
+    emit_ret(ctx, none_val);
+
+    # record frame size
+    if (ctx.stack_offset < 0) {
+        func.local_size = (-ctx.stack_offset)::usize;
+    }
+
+    ret ok[*ir.IRFunction, str](func);
+}
+
+# --- global variable lowering ---
+
+# lower_global_var: lower a global variable declaration.
+# ---
+# ctx:  lowering context
+# node: variable declaration node
+# ret:  none
+pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil || ctx.m == nil) {
+        ret;
+    }
+
+    val name: str = ast.get_name(node);
+    if (name == nil) {
+        ret;
+    }
+
+    val init_node: *ast.Node = node.extra::*ast.Node;
+
+    # determine section (.data for mutable, .rodata for immutable)
+    var sec_kind: section.SectionKind;
+    var sec_name: str;
+
+    if (node.kind == ast.NODE_DECL_VAL) {
+        sec_kind = section.SectionKind { sec_rodata: 0 };
+        sec_name = ".rodata";
+    } or {
+        sec_kind = section.SectionKind { sec_data: 0 };
+        sec_name = ".data";
+    }
+
+    val sec_res: Result[*section.Section, str] = masm.get_or_create_section(ctx.m, sec_name, sec_kind);
+    if (sec_res.is_err()) {
+        ret;
+    }
+
+    val sec: *section.Section = sec_res.unwrap_ok();
+    val offset: usize = sec.size;
+
+    # create symbol
+    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, name);
+    if (sym_res.is_ok()) {
+        val s: *sym.Symbol = sym_res.unwrap_ok();
+        sym.set_binding(s, sym.SymbolBinding { bind_global: 0 });
+        sym.set_type(s, sym.SymbolType { sym_object: 0 });
+        s.section = sec;
+        s.offset = offset;
+        masm.add_symbol(ctx.m, s);
+    }
+
+    # emit initializer data
+    if (init_node != nil) {
+        # TODO: handle different literal types
+        if (init_node.kind == ast.NODE_EXPR_LIT_INT) {
+            val int_val: i64 = ast.get_int_value(init_node);
+            section.emit_u64(ctx.alloc, sec, int_val::u64);
+        } or (init_node.kind == ast.NODE_EXPR_LIT_STR) {
+            val str_val: str = ast.get_name(init_node);
+            if (str_val != nil) {
+                var i: usize = 0;
+                for (i < str_val.len()) {
+                    section.emit_byte(ctx.alloc, sec, str_val[i]);
+                    i = i + 1;
+                }
+                section.emit_byte(ctx.alloc, sec, 0);
+            }
+        } or {
+            # zero-initialize
+            section.emit_u64(ctx.alloc, sec, 0);
+        }
+    } or {
+        # zero-initialize
+        section.emit_u64(ctx.alloc, sec, 0);
+    }
+}
+
+# --- module lowering ---
 
 # lower_module: lower an entire module AST to a MASM context.
 # ---
@@ -93,7 +2228,7 @@ pub fun new_temp(ctx: *LowerContext) i32 {
 # types:   type context
 # alloc:   allocator
 # tgt:     target configuration
-# ret:     Ok(*masm.Masm) on success, Err(str) on failure
+# ret:     Ok(*Masm) on success, Err(str) on failure
 pub fun lower_module(root: *ast.Node, symbols: *symbol.Table, types: *ty.TypeContext, alloc: *allocator.Allocator, tgt: target.Target) Result[*masm.Masm, str] {
     if (root == nil) {
         ret err[*masm.Masm, str]("AST is nil");
@@ -109,115 +2244,73 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table, types: *ty.TypeCon
         ret err[*masm.Masm, str](masm_res.unwrap_err());
     }
 
-    # TODO: allocate and return pointer to masm context
-    # TODO: iterate top-level declarations
-    # TODO: lower each function to IR
-    # TODO: lower each global variable
-
-    ret err[*masm.Masm, str]("lower_module not yet implemented");
-}
-
-# lower_function: lower a function declaration to IR.
-# ---
-# ctx:  lowering context
-# node: function AST node
-# ret:  Ok(*ir.IRFunction) on success, Err(str) on failure
-pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunction, str] {
-    if (ctx == nil) {
-        ret err[*ir.IRFunction, str]("context is nil");
+    # allocate pointer to masm context
+    val m_alloc_res: Result[*masm.Masm, allocator.AllocError] = alloc.alloc[masm.Masm](1);
+    if (m_alloc_res.is_err()) {
+        ret err[*masm.Masm, str](m_alloc_res.unwrap_err());
     }
 
-    if (node == nil) {
-        ret err[*ir.IRFunction, str]("node is nil");
+    val m: *masm.Masm = m_alloc_res.unwrap_ok();
+    @m = masm_res.unwrap_ok();
+
+    # create lowering context
+    var ctx: LowerContext = init(alloc, symbols, types, tgt);
+    ctx.m = m;
+
+    # create .text section
+    val text_res: Result[*section.Section, str] = masm.get_or_create_section(
+        m, ".text", section.SectionKind { sec_text: 0 }
+    );
+    if (text_res.is_err()) {
+        ret err[*masm.Masm, str](text_res.unwrap_err());
+    }
+    ctx.text = text_res.unwrap_ok();
+
+    # iterate top-level declarations
+    val decls: *ast.List = ast.get_list(root);
+    if (decls == nil) {
+        ret ok[*masm.Masm, str](m);
     }
 
-    # TODO: extract function name
-    # TODO: create IR function
-    # TODO: create entry block
-    # TODO: lower parameters
-    # TODO: lower function body
-    # TODO: handle return
+    var i: i32 = 0;
+    for (i < decls.count) {
+        val decl: *ast.Node = decls.nodes[i];
+        if (decl == nil) {
+            i = i + 1;
+            cnt;
+        }
 
-    ret err[*ir.IRFunction, str]("lower_function not yet implemented");
-}
+        val kind: ast.NodeKind = decl.kind;
 
-# lower_stmt: lower a statement to IR.
-# ---
-# ctx:   lowering context
-# block: current basic block
-# node:  statement AST node
-# ret:   Ok(true) on success, Err(str) on failure
-pub fun lower_stmt(ctx: *LowerContext, block: *ir.IRBlock, node: *ast.Node) Result[bool, str] {
-    if (ctx == nil) {
-        ret err[bool, str]("context is nil");
+        # lower functions
+        if (kind == ast.NODE_DECL_FUN) {
+            val fn_res: Result[*ir.IRFunction, str] = lower_function(?ctx, decl);
+            if (fn_res.is_err()) {
+                # TODO: collect errors instead of failing
+            }
+        }
+        # lower global values
+        or (kind == ast.NODE_DECL_VAL || kind == ast.NODE_DECL_VAR) {
+            lower_global_var(?ctx, decl);
+        }
+        # handle pub wrapper
+        or (kind == ast.NODE_DECL_PUB) {
+            val inner: *ast.Node = ast.get_child(decl, 0);
+            if (inner != nil) {
+                if (inner.kind == ast.NODE_DECL_FUN) {
+                    lower_function(?ctx, inner);
+                } or (inner.kind == ast.NODE_DECL_VAL || inner.kind == ast.NODE_DECL_VAR) {
+                    lower_global_var(?ctx, inner);
+                }
+            }
+        }
+        # skip type declarations, use statements, tests, etc.
+
+        i = i + 1;
     }
 
-    if (node == nil) {
-        ret err[bool, str]("node is nil");
-    }
+    # clean up context
+    deinit(?ctx);
 
-    # TODO: dispatch based on node kind
-    # - val/var: allocate stack space, lower initializer
-    # - if: lower condition, emit conditional jump, lower branches
-    # - for: lower condition, emit loop structure
-    # - ret: lower return value, emit return
-    # - block: lower each statement
-    # - expr: lower expression, discard result
-
-    ret err[bool, str]("lower_stmt not yet implemented");
-}
-
-# lower_expr: lower an expression to IR.
-# ---
-# ctx:   lowering context
-# block: current basic block
-# node:  expression AST node
-# ret:   Ok(ir.IRValue) with result value, Err(str) on failure
-pub fun lower_expr(ctx: *LowerContext, block: *ir.IRBlock, node: *ast.Node) Result[ir.IRValue, str] {
-    if (ctx == nil) {
-        ret err[ir.IRValue, str]("context is nil");
-    }
-
-    if (node == nil) {
-        ret err[ir.IRValue, str]("node is nil");
-    }
-
-    # TODO: dispatch based on node kind
-    # - lit_int: return immediate value
-    # - lit_string: emit string constant, return label
-    # - ident: look up variable, return location
-    # - binary: lower operands, emit operation
-    # - unary: lower operand, emit operation
-    # - call: lower arguments, emit call
-    # - field: lower base, compute offset
-    # - index: lower base and index, compute address
-    # - cast: lower operand, emit conversion if needed
-    # - addr: lower operand, take address
-    # - deref: lower operand, emit load
-
-    ret err[ir.IRValue, str]("lower_expr not yet implemented");
-}
-
-# lower_lvalue: lower an expression as an lvalue (for assignment).
-# ---
-# ctx:   lowering context
-# block: current basic block
-# node:  expression AST node
-# ret:   Ok(ir.IRValue) with address, Err(str) on failure
-pub fun lower_lvalue(ctx: *LowerContext, block: *ir.IRBlock, node: *ast.Node) Result[ir.IRValue, str] {
-    if (ctx == nil) {
-        ret err[ir.IRValue, str]("context is nil");
-    }
-
-    if (node == nil) {
-        ret err[ir.IRValue, str]("node is nil");
-    }
-
-    # TODO: compute address of lvalue
-    # - ident: look up variable address
-    # - field: compute field address
-    # - index: compute element address
-    # - deref: lower pointer expression
-
-    ret err[ir.IRValue, str]("lower_lvalue not yet implemented");
+    ret ok[*masm.Masm, str](m);
 }
