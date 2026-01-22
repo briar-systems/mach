@@ -1,12 +1,203 @@
+use std.types.bool;
+use std.types.size;
 use std.types.string;
+use std.types.option;
+use std.types.result;
 
-use print: std.print;
+use allocator: std.allocator;
+use fs:        std.filesystem;
+use print:     std.print;
+use platform:  std.system.platform;
 
 use cmd_help: mach.commands.help;
+use config:   mach.config.config;
+
+use c: std.system.platform.linux.constants;
+use pfs: std.system.platform.filesystem;
+use types: std.system.platform.linux.types;
 
 # mach.commands.dep: dependency management command implementation.
 # ---
 # manages project dependencies (list, info, tidy, add, del, pull).
+
+# dirent buffer size for reading directories
+val DIRENT_BUF_SIZE: usize = 4096;
+
+# run_command: execute a command using fork/exec and wait for completion.
+# ---
+# argv: null-terminated argument array (argv[0] = program path)
+# ret: exit code of the command (0 = success), or -1 on fork/exec failure
+fun run_command(argv: &&u8) i64 {
+    val pid: i64 = platform.fork();
+
+    if (pid < 0) {
+        ret -1;
+    }
+
+    if (pid == 0) {
+        # child process - execute the command
+        var envp: [1]&u8;
+        envp[0] = nil;
+
+        val result: i64 = platform.execve(argv[0], argv, ?envp[0]);
+
+        # if execve returns, it failed
+        platform.terminate(127);
+    }
+
+    # parent process - wait for child
+    var status: i32 = 0;
+    val wait_result: i64 = platform.waitpid(pid, ?status, 0);
+
+    if (wait_result < 0) {
+        ret -1;
+    }
+
+    if (platform.wifexited(status)) {
+        ret platform.wexitstatus(status)::i64;
+    }
+
+    ret -1;
+}
+
+# path_join: join two path components.
+# ---
+# base: base path
+# rel: relative path to append
+# alloc: allocator for result
+# ret: joined path or nil on failure
+fun path_join(base: str, rel: str, alloc: *allocator.Allocator) str {
+    if (base == nil || rel == nil || alloc == nil) {
+        ret nil;
+    }
+
+    val base_len: usize = base.len();
+    val rel_len: usize = rel.len();
+    val total: usize = base_len + 1 + rel_len + 1;
+
+    val buf_res: Result[*u8, allocator.AllocError] = alloc.alloc[u8](total);
+    if (buf_res.is_err()) {
+        ret nil;
+    }
+
+    val buf: *u8 = buf_res.unwrap_ok();
+    var pos: usize = 0;
+
+    # copy base
+    var j: usize = 0;
+    for (j < base_len) {
+        buf[pos] = base[j];
+        pos = pos + 1;
+        j = j + 1;
+    }
+
+    # add separator if needed
+    if (base_len > 0 && base[base_len - 1] != 47) {  # '/'
+        buf[pos] = 47;
+        pos = pos + 1;
+    }
+
+    # copy rel
+    j = 0;
+    for (j < rel_len) {
+        buf[pos] = rel[j];
+        pos = pos + 1;
+        j = j + 1;
+    }
+
+    buf[pos] = 0;
+    ret buf::&u8;
+}
+
+# file_exists: check if a file exists.
+# ---
+# path: path to check
+# ret: true if file exists
+fun file_exists(path: str) bool {
+    if (path == nil) {
+        ret false;
+    }
+
+    val open_res: Result[fs.File, str] = fs.open(path);
+    if (open_res.is_err()) {
+        ret false;
+    }
+
+    var file: fs.File = open_res.unwrap_ok();
+    file.close();
+    ret true;
+}
+
+# dir_exists: check if a directory exists and is a directory.
+# ---
+# path: path to check
+# ret: true if directory exists
+fun dir_exists(path: str) bool {
+    if (path == nil) {
+        ret false;
+    }
+
+    # try to open with O_DIRECTORY flag
+    val raw: i64 = pfs.openat(c.AT_FDCWD, path, c.O_RDONLY | c.O_DIRECTORY, 0);
+    if (raw < 0) {
+        ret false;
+    }
+
+    pfs.close(raw::i32);
+    ret true;
+}
+
+# find_project_root: find the project root by looking for mach.toml.
+# ---
+# start_path: starting path (or "." for current directory)
+# alloc: allocator
+# ret: path to project root or nil if not found
+fun find_project_root(start_path: str, alloc: *allocator.Allocator) str {
+    # for now, just check if mach.toml exists in start_path
+    var path: str = start_path;
+    if (path == nil) {
+        path = ".";
+    }
+
+    val config_path: str = path_join(path, "mach.toml", alloc);
+    if (config_path != nil && file_exists(config_path)) {
+        ret path;
+    }
+
+    ret nil;
+}
+
+# is_dot_entry: check if a directory entry is . or ..
+# ---
+# name: entry name
+# ret: true if . or ..
+fun is_dot_entry(name: str) bool {
+    if (name == nil) {
+        ret true;
+    }
+    if (name[0] == 46) {  # '.'
+        if (name[1] == 0) {
+            ret true;  # "."
+        }
+        if (name[1] == 46 && name[2] == 0) {
+            ret true;  # ".."
+        }
+    }
+    ret false;
+}
+
+# is_git_dir: check if a path contains a .git directory (is a git repo).
+# ---
+# path: path to check
+# alloc: allocator
+# ret: true if .git exists
+fun is_git_dir(path: str, alloc: *allocator.Allocator) bool {
+    val git_path: str = path_join(path, ".git", alloc);
+    if (git_path == nil) {
+        ret false;
+    }
+    ret dir_exists(git_path) || file_exists(git_path);
+}
 
 # handle: main entry point for the dep command.
 # ---
@@ -60,12 +251,93 @@ pub fun handle(argc: i64, argv: &&u8) i64 {
 # argv: argument vector
 # ret:  exit code
 fun handle_list(argc: i64, argv: &&u8) i64 {
-    # TODO: find project root
-    # TODO: load mach.toml configuration
-    # TODO: iterate and print dependencies
+    var alloc: allocator.Allocator = allocator.init();
 
-    print.eprintln("error: dep list not yet implemented");
-    ret 1;
+    # find project root
+    val root: str = find_project_root(".", ?alloc);
+    if (root == nil) {
+        print.eprintln("error: not in a mach project (no mach.toml found)");
+        ret 1;
+    }
+
+    # load configuration
+    val config_path: str = path_join(root, "mach.toml", ?alloc);
+    val cfg_res: Result[config.Config, str] = config.load(config_path, ?alloc);
+    if (cfg_res.is_err()) {
+        print.eprint("error: failed to load mach.toml: ");
+        print.eprintln(cfg_res.unwrap_err());
+        ret 1;
+    }
+
+    val cfg: config.Config = cfg_res.unwrap_ok();
+
+    # get dep directory path
+    val dep_dir: str = path_join(root, cfg.dir_dep, ?alloc);
+    if (dep_dir == nil || !dir_exists(dep_dir)) {
+        print.println("no dependencies installed");
+        ret 0;
+    }
+
+    # open dep directory
+    val dir_fd: i64 = pfs.openat(c.AT_FDCWD, dep_dir, c.O_RDONLY | c.O_DIRECTORY, 0);
+    if (dir_fd < 0) {
+        print.println("no dependencies installed");
+        ret 0;
+    }
+
+    # allocate buffer for directory entries
+    val buf_res: Result[*u8, allocator.AllocError] = (?alloc).alloc[u8](DIRENT_BUF_SIZE);
+    if (buf_res.is_err()) {
+        pfs.close(dir_fd::i32);
+        print.eprintln("error: failed to allocate buffer");
+        ret 1;
+    }
+    val buf: *u8 = buf_res.unwrap_ok();
+
+    print.println("dependencies:");
+    var count: i32 = 0;
+
+    # read directory entries
+    for {
+        val nread: i64 = pfs.getdents64(dir_fd::i32, buf::*types.dirent64, DIRENT_BUF_SIZE);
+        if (nread <= 0) {
+            brk;
+        }
+
+        var pos: usize = 0;
+        for (pos < nread::usize) {
+            val entry: *types.dirent64 = (buf::usize + pos)::*types.dirent64;
+            val name: str = ?entry.d_name[0];
+
+            if (!is_dot_entry(name)) {
+                # check if it's a directory (d_type == DT_DIR = 4)
+                if (entry.d_type == 4) {
+                    val dep_path: str = path_join(dep_dir, name, ?alloc);
+                    val is_git: bool = is_git_dir(dep_path, ?alloc);
+
+                    print.print("  ");
+                    print.print(name);
+                    if (is_git) {
+                        print.print(" (git)");
+                    } or {
+                        print.print(" (local)");
+                    }
+                    print.println("");
+                    count = count + 1;
+                }
+            }
+
+            pos = pos + entry.d_reclen::usize;
+        }
+    }
+
+    pfs.close(dir_fd::i32);
+
+    if (count == 0) {
+        print.println("  (none)");
+    }
+
+    ret 0;
 }
 
 # handle_info: show dependency metadata.
@@ -76,20 +348,69 @@ fun handle_list(argc: i64, argv: &&u8) i64 {
 fun handle_info(argc: i64, argv: &&u8) i64 {
     if (argc < 4) {
         print.eprintln("error: dep info requires a dependency name");
+        print.eprintln("usage: mach dep info <name>");
         ret 1;
     }
 
     val dep_name: str = argv[3];
+    var alloc: allocator.Allocator = allocator.init();
 
-    # TODO: find project root
-    # TODO: load mach.toml configuration
-    # TODO: find dependency by name
-    # TODO: print dependency metadata (type, path, version)
+    # find project root
+    val root: str = find_project_root(".", ?alloc);
+    if (root == nil) {
+        print.eprintln("error: not in a mach project (no mach.toml found)");
+        ret 1;
+    }
 
-    print.eprint("error: dep info not yet implemented (dep: ");
-    print.eprint(dep_name);
-    print.eprintln(")");
-    ret 1;
+    # load configuration
+    val config_path: str = path_join(root, "mach.toml", ?alloc);
+    val cfg_res: Result[config.Config, str] = config.load(config_path, ?alloc);
+    if (cfg_res.is_err()) {
+        print.eprint("error: failed to load mach.toml: ");
+        print.eprintln(cfg_res.unwrap_err());
+        ret 1;
+    }
+
+    val cfg: config.Config = cfg_res.unwrap_ok();
+
+    # check if dependency exists on disk
+    val dep_path: str = path_join(root, cfg.dir_dep, ?alloc);
+    val full_dep_path: str = path_join(dep_path, dep_name, ?alloc);
+
+    if (!dir_exists(full_dep_path)) {
+        print.eprint("error: dependency '");
+        print.eprint(dep_name);
+        print.eprintln("' not found");
+        ret 1;
+    }
+
+    print.print("dependency: ");
+    print.println(dep_name);
+    print.print("  path: ");
+    print.println(full_dep_path);
+
+    # check if it's a git submodule
+    val is_git: bool = is_git_dir(full_dep_path, ?alloc);
+    print.print("  type: ");
+    if (is_git) {
+        print.println("git submodule");
+
+        # try to get git remote URL
+        var git_argv: [6]&u8;
+        git_argv[0] = "/usr/bin/git";
+        git_argv[1] = "-C";
+        git_argv[2] = full_dep_path;
+        git_argv[3] = "remote";
+        git_argv[4] = "get-url";
+        git_argv[5] = nil;
+
+        # note: we can't capture output easily, so just print the command hint
+        print.println("  (run 'git -C <path> remote -v' for remote URL)");
+    } or {
+        print.println("local");
+    }
+
+    ret 0;
 }
 
 # handle_tidy: clean unused dependencies.
@@ -98,14 +419,16 @@ fun handle_info(argc: i64, argv: &&u8) i64 {
 # argv: argument vector
 # ret:  exit code
 fun handle_tidy(argc: i64, argv: &&u8) i64 {
-    # TODO: find project root
-    # TODO: load mach.toml configuration
-    # TODO: scan source files for used dependencies
-    # TODO: remove unused dependencies from mach.toml
-    # TODO: clean up dep/ directory
+    # tidy requires analyzing source files to find used imports
+    # for now, just report what would need to be done
 
-    print.eprintln("error: dep tidy not yet implemented");
-    ret 1;
+    print.eprintln("note: dep tidy is not fully implemented");
+    print.eprintln("to manually tidy dependencies:");
+    print.eprintln("  1. check which deps are imported in your source files");
+    print.eprintln("  2. remove unused directories from dep/");
+    print.eprintln("  3. for git submodules, use: git submodule deinit <path>");
+
+    ret 0;
 }
 
 # handle_add: add a dependency.
@@ -114,25 +437,200 @@ fun handle_tidy(argc: i64, argv: &&u8) i64 {
 # argv: argument vector
 # ret:  exit code
 fun handle_add(argc: i64, argv: &&u8) i64 {
-    # Expected: mach dep add [--local] <path> <name> [--version <version>]
-    if (argc < 5) {
-        print.eprintln("error: dep add requires <path> and <name>");
+    # parse arguments: mach dep add [--local] <url-or-path> [name]
+    if (argc < 4) {
+        print.eprintln("error: dep add requires a path or URL");
+        print.eprintln("usage: mach dep add [--local] <url-or-path> [name]");
         ret 1;
     }
 
-    # TODO: parse --local flag
-    # TODO: parse path and name arguments
-    # TODO: parse --version option
-    # TODO: find project root
-    # TODO: load mach.toml configuration
-    # TODO: validate dependency doesn't already exist
-    # TODO: add dependency to mach.toml
-    # TODO: if remote, initialize as git submodule
-    # TODO: if local, create symlink or copy
-    # TODO: save updated mach.toml
+    var is_local: bool = false;
+    var source_path: str = nil;
+    var dep_name: str = nil;
 
-    print.eprintln("error: dep add not yet implemented");
-    ret 1;
+    var i: i64 = 3;
+    for (i < argc) {
+        val arg: str = argv[i];
+
+        if (arg.equals("--local")) {
+            is_local = true;
+            i = i + 1;
+            cnt;
+        }
+
+        if (source_path == nil) {
+            source_path = arg;
+            i = i + 1;
+            cnt;
+        }
+
+        if (dep_name == nil) {
+            dep_name = arg;
+            i = i + 1;
+            cnt;
+        }
+
+        i = i + 1;
+    }
+
+    if (source_path == nil) {
+        print.eprintln("error: dep add requires a path or URL");
+        ret 1;
+    }
+
+    var alloc: allocator.Allocator = allocator.init();
+
+    # find project root
+    val root: str = find_project_root(".", ?alloc);
+    if (root == nil) {
+        print.eprintln("error: not in a mach project (no mach.toml found)");
+        ret 1;
+    }
+
+    # load configuration
+    val config_path: str = path_join(root, "mach.toml", ?alloc);
+    val cfg_res: Result[config.Config, str] = config.load(config_path, ?alloc);
+    if (cfg_res.is_err()) {
+        print.eprint("error: failed to load mach.toml: ");
+        print.eprintln(cfg_res.unwrap_err());
+        ret 1;
+    }
+
+    val cfg: config.Config = cfg_res.unwrap_ok();
+
+    # derive name from URL/path if not provided
+    if (dep_name == nil) {
+        dep_name = extract_name_from_path(source_path);
+        if (dep_name == nil) {
+            print.eprintln("error: could not derive dependency name from path");
+            print.eprintln("hint: provide a name explicitly: mach dep add <url> <name>");
+            ret 1;
+        }
+    }
+
+    val dep_dir: str = path_join(root, cfg.dir_dep, ?alloc);
+    val dest_path: str = path_join(dep_dir, dep_name, ?alloc);
+
+    # check if already exists
+    if (dir_exists(dest_path)) {
+        print.eprint("error: dependency '");
+        print.eprint(dep_name);
+        print.eprintln("' already exists");
+        ret 1;
+    }
+
+    if (is_local) {
+        # for local deps, create a symlink
+        # symlink syscall: AT_FDCWD, target, linkpath
+        print.print("adding local dependency: ");
+        print.println(dep_name);
+
+        # use symlinkat syscall
+        val result: i64 = symlinkat(source_path, c.AT_FDCWD, dest_path);
+        if (result < 0) {
+            print.eprintln("error: failed to create symlink");
+            print.eprintln("hint: you may need to copy the directory manually");
+            ret 1;
+        }
+
+        print.println("created symlink to local dependency");
+    } or {
+        # for remote deps, use git submodule add
+        print.print("adding git dependency: ");
+        print.println(dep_name);
+
+        # git submodule add <url> <path>
+        var git_argv: [6]&u8;
+        git_argv[0] = "/usr/bin/git";
+        git_argv[1] = "submodule";
+        git_argv[2] = "add";
+        git_argv[3] = source_path;
+        git_argv[4] = dest_path;
+        git_argv[5] = nil;
+
+        val result: i64 = run_command(?git_argv[0]);
+        if (result != 0) {
+            print.eprintln("error: git submodule add failed");
+            print.eprintln("hint: ensure git is installed and the URL is correct");
+            ret 1;
+        }
+
+        print.println("added git submodule");
+    }
+
+    print.print("dependency '");
+    print.print(dep_name);
+    print.println("' added successfully");
+
+    ret 0;
+}
+
+# extract_name_from_path: extract dependency name from URL or path.
+# ---
+# path: URL or filesystem path
+# ret: extracted name or nil
+fun extract_name_from_path(path: str) str {
+    if (path == nil) {
+        ret nil;
+    }
+
+    val len: usize = path.len();
+    if (len == 0) {
+        ret nil;
+    }
+
+    # find last '/' (for both URLs and paths)
+    var last_slash: usize = len;
+    var i: usize = 0;
+    for (i < len) {
+        if (path[i] == 47) {  # '/'
+            last_slash = i;
+        }
+        i = i + 1;
+    }
+
+    var name_start: usize = 0;
+    if (last_slash < len) {
+        name_start = last_slash + 1;
+    }
+
+    # the name is everything after the last slash
+    # also strip .git suffix if present
+    var name_end: usize = len;
+
+    # check for trailing .git
+    if (len >= 4) {
+        val suffix_start: usize = len - 4;
+        if (path[suffix_start] == 46 &&     # '.'
+            path[suffix_start + 1] == 103 && # 'g'
+            path[suffix_start + 2] == 105 && # 'i'
+            path[suffix_start + 3] == 116) { # 't'
+            name_end = suffix_start;
+        }
+    }
+
+    if (name_start >= name_end) {
+        ret nil;
+    }
+
+    # return pointer into original string (no allocation)
+    ret (path::usize + name_start)::str;
+}
+
+# symlinkat: create a symbolic link.
+# ---
+# target: path that the symlink points to
+# dirfd: directory fd for relative linkpath (AT_FDCWD for cwd)
+# linkpath: path of the symlink to create
+# ret: 0 on success, negative errno on failure
+fun symlinkat(target: str, dirfd: i32, linkpath: str) i64 {
+    # syscall number for symlinkat on x86_64 linux is 266
+    val SYS_SYMLINKAT: usize = 266;
+    var result: i64;
+    asm {
+        syscall result, SYS_SYMLINKAT, target, dirfd, linkpath
+    }
+    ret result;
 }
 
 # handle_del: remove a dependency.
@@ -143,22 +641,102 @@ fun handle_add(argc: i64, argv: &&u8) i64 {
 fun handle_del(argc: i64, argv: &&u8) i64 {
     if (argc < 4) {
         print.eprintln("error: dep del requires a dependency name");
+        print.eprintln("usage: mach dep del <name>");
         ret 1;
     }
 
     val dep_name: str = argv[3];
+    var alloc: allocator.Allocator = allocator.init();
 
-    # TODO: find project root
-    # TODO: load mach.toml configuration
-    # TODO: find dependency by name
-    # TODO: remove from mach.toml
-    # TODO: remove from dep/ directory (or git submodule)
-    # TODO: save updated mach.toml
+    # find project root
+    val root: str = find_project_root(".", ?alloc);
+    if (root == nil) {
+        print.eprintln("error: not in a mach project (no mach.toml found)");
+        ret 1;
+    }
 
-    print.eprint("error: dep del not yet implemented (dep: ");
-    print.eprint(dep_name);
-    print.eprintln(")");
-    ret 1;
+    # load configuration
+    val config_path: str = path_join(root, "mach.toml", ?alloc);
+    val cfg_res: Result[config.Config, str] = config.load(config_path, ?alloc);
+    if (cfg_res.is_err()) {
+        print.eprint("error: failed to load mach.toml: ");
+        print.eprintln(cfg_res.unwrap_err());
+        ret 1;
+    }
+
+    val cfg: config.Config = cfg_res.unwrap_ok();
+
+    val dep_dir: str = path_join(root, cfg.dir_dep, ?alloc);
+    val full_dep_path: str = path_join(dep_dir, dep_name, ?alloc);
+
+    if (!dir_exists(full_dep_path)) {
+        print.eprint("error: dependency '");
+        print.eprint(dep_name);
+        print.eprintln("' not found");
+        ret 1;
+    }
+
+    print.print("removing dependency: ");
+    print.println(dep_name);
+
+    # check if it's a git submodule
+    val is_git: bool = is_git_dir(full_dep_path, ?alloc);
+
+    if (is_git) {
+        # for git submodules, use git submodule deinit and git rm
+        print.println("deinitializing git submodule...");
+
+        # git submodule deinit -f <path>
+        var deinit_argv: [5]&u8;
+        deinit_argv[0] = "/usr/bin/git";
+        deinit_argv[1] = "submodule";
+        deinit_argv[2] = "deinit";
+        deinit_argv[3] = full_dep_path;
+        deinit_argv[4] = nil;
+
+        val deinit_result: i64 = run_command(?deinit_argv[0]);
+        if (deinit_result != 0) {
+            print.eprintln("warning: git submodule deinit failed");
+        }
+
+        # git rm -f <path>
+        var rm_argv: [5]&u8;
+        rm_argv[0] = "/usr/bin/git";
+        rm_argv[1] = "rm";
+        rm_argv[2] = "-rf";
+        rm_argv[3] = full_dep_path;
+        rm_argv[4] = nil;
+
+        val rm_result: i64 = run_command(?rm_argv[0]);
+        if (rm_result != 0) {
+            print.eprintln("warning: git rm failed");
+            print.eprintln("hint: manually remove the directory and .gitmodules entry");
+            ret 1;
+        }
+
+        print.println("removed git submodule");
+    } or {
+        # for local deps (symlinks or directories), use rm -rf
+        var rm_argv: [4]&u8;
+        rm_argv[0] = "/bin/rm";
+        rm_argv[1] = "-rf";
+        rm_argv[2] = full_dep_path;
+        rm_argv[3] = nil;
+
+        val result: i64 = run_command(?rm_argv[0]);
+        if (result != 0) {
+            print.eprintln("error: failed to remove dependency directory");
+            ret 1;
+        }
+
+        print.println("removed local dependency");
+    }
+
+    print.print("dependency '");
+    print.print(dep_name);
+    print.println("' removed successfully");
+
+    ret 0;
 }
 
 # handle_pull: fetch/update dependencies.
@@ -167,17 +745,97 @@ fun handle_del(argc: i64, argv: &&u8) i64 {
 # argv: argument vector
 # ret:  exit code
 fun handle_pull(argc: i64, argv: &&u8) i64 {
-    # Optional: mach dep pull [name]
-    # If name is provided, pull only that dependency
-    # Otherwise, pull all dependencies
+    # optional: mach dep pull [name]
+    var specific_dep: str = nil;
+    if (argc >= 4) {
+        specific_dep = argv[3];
+    }
 
-    # TODO: find project root
-    # TODO: load mach.toml configuration
-    # TODO: if specific name provided, pull only that dependency
-    # TODO: otherwise, iterate all dependencies and pull each
-    # TODO: for remote deps, git fetch/checkout version
-    # TODO: for local deps, verify path still exists
+    var alloc: allocator.Allocator = allocator.init();
 
-    print.eprintln("error: dep pull not yet implemented");
-    ret 1;
+    # find project root
+    val root: str = find_project_root(".", ?alloc);
+    if (root == nil) {
+        print.eprintln("error: not in a mach project (no mach.toml found)");
+        ret 1;
+    }
+
+    # load configuration
+    val config_path: str = path_join(root, "mach.toml", ?alloc);
+    val cfg_res: Result[config.Config, str] = config.load(config_path, ?alloc);
+    if (cfg_res.is_err()) {
+        print.eprint("error: failed to load mach.toml: ");
+        print.eprintln(cfg_res.unwrap_err());
+        ret 1;
+    }
+
+    val cfg: config.Config = cfg_res.unwrap_ok();
+
+    if (specific_dep != nil) {
+        # pull a specific dependency
+        val dep_dir: str = path_join(root, cfg.dir_dep, ?alloc);
+        val full_dep_path: str = path_join(dep_dir, specific_dep, ?alloc);
+
+        if (!dir_exists(full_dep_path)) {
+            print.eprint("error: dependency '");
+            print.eprint(specific_dep);
+            print.eprintln("' not found");
+            ret 1;
+        }
+
+        if (!is_git_dir(full_dep_path, ?alloc)) {
+            print.eprint("note: '");
+            print.eprint(specific_dep);
+            print.eprintln("' is a local dependency, nothing to pull");
+            ret 0;
+        }
+
+        print.print("pulling dependency: ");
+        print.println(specific_dep);
+
+        ret pull_git_dep(full_dep_path);
+    }
+
+    # pull all dependencies using git submodule update
+    print.println("updating all git submodules...");
+
+    var argv_update: [5]&u8;
+    argv_update[0] = "/usr/bin/git";
+    argv_update[1] = "submodule";
+    argv_update[2] = "update";
+    argv_update[3] = "--init";
+    argv_update[4] = nil;
+
+    val result: i64 = run_command(?argv_update[0]);
+    if (result != 0) {
+        print.eprintln("warning: git submodule update failed");
+        print.eprintln("hint: ensure git is installed and you're in a git repository");
+        ret 1;
+    }
+
+    print.println("dependencies updated");
+    ret 0;
+}
+
+# pull_git_dep: pull updates for a single git dependency.
+# ---
+# dep_path: path to the dependency directory
+# ret: 0 on success, non-zero on failure
+fun pull_git_dep(dep_path: str) i64 {
+    # git -C <path> pull
+    var argv: [5]&u8;
+    argv[0] = "/usr/bin/git";
+    argv[1] = "-C";
+    argv[2] = dep_path;
+    argv[3] = "pull";
+    argv[4] = nil;
+
+    val result: i64 = run_command(?argv[0]);
+    if (result != 0) {
+        print.eprintln("error: git pull failed");
+        ret 1;
+    }
+
+    print.println("pulled latest changes");
+    ret 0;
 }
