@@ -349,26 +349,26 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
 - [x] Removed `link_objects()` - no longer needed with direct emission
 
 ## Phase 4: Build Command Integration
-- [ ] Implement `build` command
-  - [ ] Parse command-line options (-o, -m, -I, --target)
-  - [ ] Detect project vs single file input
-  - [ ] Load mach.toml configuration
-  - [ ] Invoke full compiler pipeline
-  - [ ] Report errors with source locations
-- [ ] Implement `run` command
-  - [ ] Parse --target flag
-  - [ ] Resolve binary path
-  - [ ] Execute with arguments
-- [ ] Implement `test` command
-  - [ ] Parse options (--target, --filter)
-  - [ ] Find and compile test files
-  - [ ] Run tests and report results
+- [x] Implement `build` command
+  - [x] Parse command-line options (-o, -m, -I, --target)
+  - [x] Detect project vs single file input
+  - [x] Load mach.toml configuration
+  - [x] Invoke full compiler pipeline
+  - [x] Report errors with source locations
+- [x] Implement `run` command
+  - [x] Parse --target flag
+  - [x] Resolve binary path
+  - [x] Execute with arguments
+- [x] Implement `test` command
+  - [x] Parse options (--target, --filter)
+  - [x] Find and compile test files
+  - [x] Run tests and report results
 
 ## Phase 5: Project Management Commands
-- [ ] Implement `init` command
-  - [ ] Create directory structure
-  - [ ] Generate mach.toml
-  - [ ] Generate main.mach template
+- [x] Implement `init` command
+  - [x] Create directory structure
+  - [x] Generate mach.toml
+  - [x] Generate main.mach template
   - [ ] Initialize git repo
 - [ ] Implement `dep` subcommands
   - [ ] `dep list`
@@ -679,6 +679,40 @@ Note: Qualified name resolution (module.Type) has a stub implementation; full mo
     - `emit_executable()` now delegates directly to `elf.emit_executable()`
   - **Zero external dependencies**: No libc, no cc, no ld required
 - All 481 tests pass
+
+## 2026-01-22T00:53 UTC
+- Beginning Phase 4: Build Command Integration
+- Implemented full `build` command in `mach/src/commands/build.mach`:
+  - Parse CLI options (-o, -m, --target)
+  - Detect project vs single file input using stat() to check for directory
+  - Load mach.toml configuration for project mode
+  - Full compiler pipeline: parser -> sema -> lower -> emit
+  - Report parser and sema errors with line numbers
+- Added process spawning syscalls to stdlib:
+  - `mach-std/src/system/platform/linux/process.mach`: fork, vfork, execve, wait4, waitpid
+  - Added WIFEXITED, WEXITSTATUS, WIFSIGNALED, WTERMSIG, etc. macros
+  - Exported via `mach-std/src/system/platform.mach`
+- Implemented `run` command in `mach/src/commands/run.mach`:
+  - Parse --target flag and project path
+  - Load mach.toml and resolve target binary path
+  - Fork/exec/wait to run the built executable
+  - Pass remaining arguments to the executable
+- Implemented `test` command in `mach/src/commands/testing.mach`:
+  - Parse --target and --filter options
+  - Load project configuration
+  - Execute test binary and report results
+  - Basic test harness that runs compiled test binary
+- Implemented `init` command in `mach/src/commands/init.mach`:
+  - Validate project ID (1-127 chars, alphanumeric + underscore/hyphen)
+  - Create project directory structure (src/, out/, dep/)
+  - Generate mach.toml with project configuration
+  - Generate src/main.mach with hello world template
+  - Generate .gitignore
+- Fixed issues:
+  - Replaced `val` variable names that conflicted with keyword
+  - Replaced multi-line string concatenation with procedural template generation
+  - Added missing imports for symbol and type modules
+- All tests pass: 481 self-hosted, 254 stdlib
 
 ## 2026-01-22T04:00 UTC
 - Started Phase 2: Semantic Analysis implementation

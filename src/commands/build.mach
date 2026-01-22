@@ -1,12 +1,423 @@
+use std.types.bool;
+use std.types.size;
 use std.types.string;
+use std.types.option;
+use std.types.result;
 
-use print: std.print;
+use allocator: std.allocator;
+use fs:        std.filesystem;
+use print:     std.print;
 
+use args:     mach.cli.args;
 use cmd_help: mach.commands.help;
+use config:   mach.config.config;
+
+use ast:      mach.compiler.ast;
+use lexer:    mach.compiler.lexer;
+use parser:   mach.compiler.parser;
+use sema:     mach.compiler.sema;
+use symbol:   mach.compiler.symbol;
+use ty:       mach.compiler.type;
+
+use emit:     mach.compiler.masm.emit;
+use lower:    mach.compiler.masm.lower;
+use masm:     mach.compiler.masm.masm;
+use target:   mach.compiler.masm.target;
 
 # mach.commands.build: build command implementation.
 # ---
 # compiles a Mach project or single source file.
+
+# BuildOptions: parsed command-line options for build.
+rec BuildOptions {
+    input_path:   str;
+    output_path:  str;
+    module_path:  str;
+    target_name:  str;
+    is_project:   bool;
+}
+
+# parse_options: parse command-line arguments for build command.
+# ---
+# a: args wrapper
+# ret: parsed BuildOptions
+fun parse_options(a: args.Args) BuildOptions {
+    var opts: BuildOptions;
+    opts.input_path = nil;
+    opts.output_path = nil;
+    opts.module_path = nil;
+    opts.target_name = nil;
+    opts.is_project = false;
+
+    # argv[0] = "mach", argv[1] = "build", argv[2+] = options/input
+    if (!a.has(2)) {
+        ret opts;
+    }
+
+    # first positional argument is the input path
+    var i: i64 = 2;
+    for (i < a.count()) {
+        val arg_opt: Option[str] = a.get(i);
+        if (arg_opt.is_none()) {
+            i = i + 1;
+            cnt;
+        }
+
+        val arg: str = arg_opt.unwrap();
+
+        # check for flags
+        if (arg.equals("-o")) {
+            i = i + 1;
+            val val_opt: Option[str] = a.get(i);
+            if (val_opt.is_some()) {
+                opts.output_path = val_opt.unwrap();
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        if (arg.equals("-m")) {
+            i = i + 1;
+            val val_opt: Option[str] = a.get(i);
+            if (val_opt.is_some()) {
+                opts.module_path = val_opt.unwrap();
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        if (arg.equals("--target")) {
+            i = i + 1;
+            val val_opt: Option[str] = a.get(i);
+            if (val_opt.is_some()) {
+                opts.target_name = val_opt.unwrap();
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        # first non-flag is input path
+        if (opts.input_path == nil && !arg.starts_with("-")) {
+            opts.input_path = arg;
+        }
+
+        i = i + 1;
+    }
+
+    ret opts;
+}
+
+# is_directory: check if a path is a directory.
+# ---
+# path: path to check
+# ret: true if directory, false otherwise
+fun is_directory(path: str) bool {
+    if (path == nil) {
+        ret false;
+    }
+
+    # try to open as directory using O_DIRECTORY flag
+    # alternatively check via stat
+    val open_res: Result[fs.File, str] = fs.open(path);
+    if (open_res.is_err()) {
+        ret false;
+    }
+
+    var file: fs.File = open_res.unwrap_ok();
+    val stat_res: Result[fs.Stat, str] = file.stat();
+    file.close();
+
+    if (stat_res.is_err()) {
+        ret false;
+    }
+
+    val st: fs.Stat = stat_res.unwrap_ok();
+
+    # check S_IFDIR bit (0o040000 = 16384)
+    val mode: u32 = st.st_mode;
+    val is_dir: bool = (mode & 0o170000) == 0o040000;
+    ret is_dir;
+}
+
+# file_exists: check if a file exists.
+# ---
+# path: path to check
+# ret: true if file exists
+fun file_exists(path: str) bool {
+    if (path == nil) {
+        ret false;
+    }
+
+    val open_res: Result[fs.File, str] = fs.open(path);
+    if (open_res.is_err()) {
+        ret false;
+    }
+
+    var file: fs.File = open_res.unwrap_ok();
+    file.close();
+    ret true;
+}
+
+# read_file_contents: read entire file into a buffer.
+# ---
+# path: path to file
+# alloc: allocator to use
+# ret: Ok(str) with file contents, Err(str) on failure
+fun read_file_contents(path: str, alloc: *allocator.Allocator) Result[str, str] {
+    val open_res: Result[fs.File, str] = fs.open(path);
+    if (open_res.is_err()) {
+        ret err[str, str](open_res.unwrap_err());
+    }
+
+    var file: fs.File = open_res.unwrap_ok();
+
+    val stat_res: Result[fs.Stat, str] = file.stat();
+    if (stat_res.is_err()) {
+        file.close();
+        ret err[str, str](stat_res.unwrap_err());
+    }
+
+    val st: fs.Stat = stat_res.unwrap_ok();
+    val file_size: usize = st.st_size::usize;
+
+    # allocate buffer with null terminator space
+    val buf_res: Result[*u8, allocator.AllocError] = alloc.alloc[u8](file_size + 1);
+    if (buf_res.is_err()) {
+        file.close();
+        ret err[str, str](buf_res.unwrap_err());
+    }
+
+    val buf: *u8 = buf_res.unwrap_ok();
+
+    val read_res: Result[usize, str] = file.read(buf, file_size);
+    if (read_res.is_err()) {
+        alloc.free[u8](buf, file_size + 1);
+        file.close();
+        ret err[str, str](read_res.unwrap_err());
+    }
+
+    # null terminate
+    buf[file_size] = 0;
+    file.close();
+
+    ret ok[str, str](buf::&u8);
+}
+
+# path_join: join two path components.
+# ---
+# base: base path
+# rel: relative path to append
+# alloc: allocator for result
+# ret: joined path or nil on failure
+fun path_join(base: str, rel: str, alloc: *allocator.Allocator) str {
+    if (base == nil || rel == nil || alloc == nil) {
+        ret nil;
+    }
+
+    val base_len: usize = base.len();
+    val rel_len: usize = rel.len();
+    val total: usize = base_len + 1 + rel_len + 1;
+
+    val buf_res: Result[*u8, allocator.AllocError] = alloc.alloc[u8](total);
+    if (buf_res.is_err()) {
+        ret nil;
+    }
+
+    val buf: *u8 = buf_res.unwrap_ok();
+    var pos: usize = 0;
+
+    # copy base
+    var i: usize = 0;
+    for (i < base_len) {
+        buf[pos] = base[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+
+    # add separator if needed
+    if (base_len > 0 && base[base_len - 1] != 47) {  # '/'
+        buf[pos] = 47;
+        pos = pos + 1;
+    }
+
+    # copy rel
+    i = 0;
+    for (i < rel_len) {
+        buf[pos] = rel[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+
+    buf[pos] = 0;
+    ret buf::&u8;
+}
+
+# compile_source: compile a source file through the full pipeline.
+# ---
+# source: source text to compile
+# module_path: module path for the source
+# output_path: path for output executable
+# alloc: allocator to use
+# ret: 0 on success, non-zero on error
+fun compile_source(source: str, module_path: str, output_path: str, alloc: *allocator.Allocator) i64 {
+    # initialize parser
+    var p: parser.Parser = parser.init(source, alloc);
+
+    # parse source to AST
+    val parse_res: Result[*ast.Node, str] = p.parse_program();
+    if (parse_res.is_err()) {
+        print.eprint("error: parsing failed: ");
+        print.eprintln(parse_res.unwrap_err());
+        print_parser_errors(?p);
+        p.deinit();
+        ret 1;
+    }
+
+    val root: *ast.Node = parse_res.unwrap_ok();
+
+    if (p.had_error) {
+        print.eprintln("error: parsing failed with errors");
+        print_parser_errors(?p);
+        p.deinit();
+        ret 1;
+    }
+
+    # initialize semantic analyzer
+    val sema_res: Result[sema.Sema, str] = sema.init(alloc, module_path);
+    if (sema_res.is_err()) {
+        print.eprint("error: failed to create semantic analyzer: ");
+        print.eprintln(sema_res.unwrap_err());
+        p.deinit();
+        ret 1;
+    }
+
+    var sem: sema.Sema = sema_res.unwrap_ok();
+
+    # run semantic analysis
+    val analyze_res: Result[bool, str] = sema.analyze(?sem, root);
+    if (analyze_res.is_err()) {
+        print.eprint("error: semantic analysis failed: ");
+        print.eprintln(analyze_res.unwrap_err());
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+
+    if (sema.has_errors(?sem)) {
+        print.eprintln("error: semantic analysis found errors");
+        print_sema_errors(?sem);
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+
+    # get symbol table and type context for lowering
+    val symbols: *symbol.Table = sema.get_symbol_table(?sem);
+    val types: *ty.TypeContext = sema.get_type_context(?sem);
+
+    # create target configuration (default: linux x86_64 sysv64)
+    val tgt: target.Target = target.default_target();
+
+    # lower AST to MASM IR
+    val lower_res: Result[*masm.Masm, str] = lower.lower_module(root, symbols, types, alloc, tgt);
+    if (lower_res.is_err()) {
+        print.eprint("error: lowering failed: ");
+        print.eprintln(lower_res.unwrap_err());
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+
+    val m: *masm.Masm = lower_res.unwrap_ok();
+
+    # emit executable
+    val emit_res: Result[bool, str] = emit.emit_executable(m, output_path, alloc);
+    if (emit_res.is_err()) {
+        print.eprint("error: code emission failed: ");
+        print.eprintln(emit_res.unwrap_err());
+        masm.destroy(m);
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+
+    # clean up
+    masm.destroy(m);
+    sema.deinit(?sem);
+    p.deinit();
+
+    print.print("compiled: ");
+    print.println(output_path);
+
+    ret 0;
+}
+
+# print_parser_errors: print parser errors to stderr.
+fun print_parser_errors(p: *parser.Parser) {
+    if (p == nil) {
+        ret;
+    }
+
+    var i: i32 = 0;
+    for (i < p.error_count) {
+        val err: *parser.ParserError = ?p.errors[i];
+        print.eprint("  ");
+        print.eprint("line ");
+        print_i32(err.tok.line);
+        print.eprint(": ");
+        print.eprintln(err.message);
+        i = i + 1;
+    }
+}
+
+# print_sema_errors: print semantic analysis errors to stderr.
+fun print_sema_errors(sem: *sema.Sema) {
+    if (sem == nil) {
+        ret;
+    }
+
+    var i: i32 = 0;
+    for (i < sem.error_count) {
+        val err: *sema.SemaError = ?sem.errors[i];
+        print.eprint("  ");
+        print.eprint("line ");
+        print_i32(err.line);
+        print.eprint(": ");
+        print.eprintln(err.message);
+        i = i + 1;
+    }
+}
+
+# print_i32: print an i32 value to stderr.
+fun print_i32(n: i32) {
+    if (n < 0) {
+        print.eprint("-");
+        print_i32(-n);
+        ret;
+    }
+
+    if (n == 0) {
+        print.eprint("0");
+        ret;
+    }
+
+    var buf: [16]u8;
+    var pos: i32 = 15;
+    var num: i32 = n;
+
+    for (num > 0 && pos >= 0) {
+        buf[pos] = (num % 10)::u8 + 48;
+        num = num / 10;
+        pos = pos - 1;
+    }
+
+    pos = pos + 1;
+    buf[15] = 0;  # null terminate
+
+    # print from pos to end
+    var s: str = ?buf[pos];
+    print.eprint(s);
+}
 
 # handle: main entry point for the build command.
 # ---
@@ -14,22 +425,88 @@ use cmd_help: mach.commands.help;
 # argv: argument vector
 # ret:  exit code (0 = success, non-zero = error)
 pub fun handle(argc: i64, argv: &&u8) i64 {
-    # argv[0] = "mach", argv[1] = "build", argv[2] = input path
-    if (argc < 3) {
+    # parse arguments
+    val a: args.Args = args.init(argc, argv);
+    val opts: BuildOptions = parse_options(a);
+
+    if (opts.input_path == nil) {
         print.eprintln("error: no input file specified");
         cmd_help.print_build();
         ret 1;
     }
 
-    val input_path: str = argv[2];
+    # create allocator
+    var alloc: allocator.Allocator = allocator.init();
 
-    # TODO: parse options (-o, -m, -I, --target)
-    # TODO: detect if input is a directory (project) or file
-    # TODO: if project, load mach.toml and resolve target
-    # TODO: invoke compiler pipeline (lexer -> parser -> sema -> masm -> emit)
+    # check if input is a project directory or single file
+    val is_proj: bool = is_directory(opts.input_path);
 
-    print.eprint("error: build command not yet implemented (input: ");
-    print.eprint(input_path);
-    print.eprintln(")");
-    ret 1;
+    var source_path: str = nil;
+    var output_path: str = opts.output_path;
+    var module_path: str = opts.module_path;
+
+    if (is_proj) {
+        # project mode: load mach.toml
+        val config_path: str = path_join(opts.input_path, "mach.toml", ?alloc);
+        if (config_path == nil || !file_exists(config_path)) {
+            print.eprintln("error: directory does not contain mach.toml");
+            ret 1;
+        }
+
+        val cfg_res: Result[config.Config, str] = config.load(config_path, ?alloc);
+        if (cfg_res.is_err()) {
+            print.eprint("error: failed to load config: ");
+            print.eprintln(cfg_res.unwrap_err());
+            ret 1;
+        }
+
+        val cfg: config.Config = cfg_res.unwrap_ok();
+
+        # construct source path from entrypoint
+        # TODO: look up target from config.targets if --target specified
+        # for now, use defaults
+        val src_dir: str = path_join(opts.input_path, cfg.dir_src, ?alloc);
+        source_path = path_join(src_dir, "main.mach", ?alloc);
+
+        if (module_path == nil) {
+            module_path = cfg.id;
+            if (module_path == nil) {
+                module_path = "main";
+            }
+        }
+
+        if (output_path == nil) {
+            # default output: out/<binary>
+            val out_dir: str = path_join(opts.input_path, cfg.dir_out, ?alloc);
+            output_path = path_join(out_dir, "output", ?alloc);
+        }
+    } or {
+        # single file mode
+        source_path = opts.input_path;
+
+        if (module_path == nil) {
+            module_path = "main";
+        }
+
+        if (output_path == nil) {
+            output_path = "output";
+        }
+    }
+
+    # read source file
+    val read_res: Result[str, str] = read_file_contents(source_path, ?alloc);
+    if (read_res.is_err()) {
+        print.eprint("error: could not read file '");
+        print.eprint(source_path);
+        print.eprint("': ");
+        print.eprintln(read_res.unwrap_err());
+        ret 1;
+    }
+
+    val source: str = read_res.unwrap_ok();
+
+    # compile
+    val exit_code: i64 = compile_source(source, module_path, output_path, ?alloc);
+
+    ret exit_code;
 }
