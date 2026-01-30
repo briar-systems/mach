@@ -35,7 +35,8 @@ Phase 7: Machification Pass - Review and refactor the self-hosted compiler and s
 - [x] Final testing:
   - [x] Ensure all tests pass after machification
   - [x] Verify bootstrap compiler still works
-  - [ ] Verify self-hosted compiler can compile itself (blocked by pre-existing imach issues)
+  - [x] Verify self-hosted compiler (imach) builds successfully
+  - [ ] Verify self-hosted compiler can compile itself (blocked - segfault in incomplete scaffolding)
 - [ ] Apply the above to the standard library as well (future work - requires mach-std changes)
 
 # Log
@@ -106,6 +107,15 @@ Phase 7 Machification Pass is now largely complete. Key changes:
 3. **Call Site Updates**: Updated all call sites across sema.mach, comptime.mach, lower.mach, parser.mach, and x86_64.mach to use the new method syntax.
 
 4. **Testing**: All 481 tests pass with clean build.
+
+5. **Self-Hosted Compiler**: imach now builds successfully after updating mach-std submodule.
+
+## Phase 7 Status: Complete (compiler machification done)
+- All compiler modules have been reviewed and converted to idiomatic Mach patterns
+- Readonly pointers (`&T`) used for all pure-accessor methods
+- Standalone functions converted to methods where appropriate
+- Standard library machification deferred (requires changes to mach-std repo)
+- Self-compilation (imach→mach) blocked by pre-existing segfault issue
 
 ## 2026-01-30 (Phase 7 Continued - Additional Parser Readonly Conversions)
 - Converted additional parser methods to use `&Parser` readonly receiver:
