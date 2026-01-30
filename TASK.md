@@ -127,6 +127,38 @@ Phase 7 Machification Pass is now largely complete. Key changes:
 - Fixed parser.mach: reverted `should_parse_type_args` to `*Parser` (calls `advance()`)
 - All 481 tests pass, imach builds successfully
 
+## 2026-01-30 (Self-Hosted Compiler Segfault Investigation)
+- Investigated segfault in `make mach` (imach compiling itself)
+- Crash location: `_M4mach6config6configN15get_entry_value`
+
+### Root Causes Found and Fixed:
+
+1. **Union tag size bug in cmach (FIXED)**
+   - File: `boot/src/compiler/sema.c` line 2103
+   - Bug: `uni_type->size = max_size + 8; // +8 for tag`
+   - Fix: `uni_type->size = max_size; // no tag - Mach unions are untagged`
+   - This was adding 8 bytes to every union, making Value 24 bytes instead of 16
+
+2. **TY_STR size bug in self-hosted lower.mach (FIXED)**
+   - File: `src/compiler/masm/lower.mach` line 581
+   - Bug: `if (kind == ty.TY_STR) { ret ptr_size * 2; } # ptr + len`
+   - Fix: `if (kind == ty.TY_STR) { ret ptr_size; } # str is &char (pointer)`
+   - Note: The self-hosted compiler treats `str` as builtin TY_STR, but stdlib defines `str` as `&char` (8 bytes)
+
+### Debugging Steps Taken:
+- Used gdb to trace crash in `get_entry_value` function
+- Found Entry struct stride was 0x20 (32) instead of 0x18 (24)
+- Added debug output to `type_create_struct` and `sema_analyze_rec` in cmach
+- Traced Entry size: key=8 (correct), value=24 (wrong - should be 16)
+- Found union size calculation adding +8 for non-existent tag
+
+### Current Status:
+- Both fixes applied
+- All 481 tests pass
+- imach builds successfully
+- `make mach` still segfaults - requires further investigation
+- The Entry stride is now correct (0x18), but there may be other struct/union layout issues
+
 ## Phase 7 Status: Complete (compiler machification done)
 - All compiler modules have been reviewed and converted to idiomatic Mach patterns
 - Readonly pointers (`&T`) used for all pure-accessor methods

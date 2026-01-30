@@ -2084,8 +2084,8 @@ static int sema_analyze_uni(Sema *sema, AstNode *node)
             max_size = (max_size + max_align - 1) & ~(max_align - 1);
         }
 
-        uni_type->size  = max_size + 8; // +8 for tag
-        uni_type->alignment = max_align > 8 ? max_align : 8;
+        uni_type->size  = max_size; // no tag - Mach unions are untagged
+        uni_type->alignment = max_align;
     }
 
     return 0;
