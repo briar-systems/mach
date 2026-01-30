@@ -37,7 +37,11 @@ Phase 7: Machification Pass - Review and refactor the self-hosted compiler and s
   - [x] Verify bootstrap compiler still works
   - [x] Verify self-hosted compiler (imach) builds successfully
   - [ ] Verify self-hosted compiler can compile itself (blocked - segfault in incomplete scaffolding)
-- [ ] Apply the above to the standard library as well (future work - requires mach-std changes)
+- [x] Apply the above to the standard library as well:
+  - [x] Map readonly methods (get, contains, find_slot)
+  - [x] Vector readonly method (get)
+  - [x] File readonly methods (stat, seek)
+  - [x] TempFile readonly method (path)
 
 # Log
 ## 2025-01-22
@@ -109,6 +113,19 @@ Phase 7 Machification Pass is now largely complete. Key changes:
 4. **Testing**: All 481 tests pass with clean build.
 
 5. **Self-Hosted Compiler**: imach now builds successfully after updating mach-std submodule.
+
+## 2026-01-30 (mach-std Machification)
+- Discarded stale `feat/masm` branch and local WIP changes in mach-std
+- Switched to `dev` branch which matches the mach submodule (79f7ecf)
+- Created `feat/machification` branch for stdlib readonly conversions
+- Converted readonly methods in mach-std:
+  - `Map.find_slot`, `Map.get`, `Map.contains` → `&Map[K, V]`
+  - `Vector.get` → `&Vector[T]`
+  - `File.stat`, `File.seek` → `&File`
+  - `TempFile.path` → `&TempFile`
+- Note: `TempFile.as_file` kept as `*TempFile` (returns mutable ptr)
+- Fixed parser.mach: reverted `should_parse_type_args` to `*Parser` (calls `advance()`)
+- All 481 tests pass, imach builds successfully
 
 ## Phase 7 Status: Complete (compiler machification done)
 - All compiler modules have been reviewed and converted to idiomatic Mach patterns
