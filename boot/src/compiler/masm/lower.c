@@ -755,7 +755,11 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
         }
 
         // For aggregate types (structs, unions, arrays), use memory copy
-        if (type_is_aggregate(lhs->type))
+        // Exception: small aggregates (size <= ptr_size) from call expressions are
+        // returned by value in a register, not by pointer
+        bool is_small_agg_from_call = type_is_aggregate(lhs->type) && size <= (int)ctx->ptr_size && rhs->kind == AST_EXPR_CALL;
+
+        if (type_is_aggregate(lhs->type) && !is_small_agg_from_call)
         {
             // val is a memory operand for aggregates; get its address
             MasmOperand src_ptr = isa_tmp(ctx, ctx->ptr_size);
@@ -796,7 +800,11 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
             MasmOperand val = lower_expr(masm, text, rhs, ctx);
 
             // For aggregate types (structs, unions, arrays), use memory copy
-            if (type_is_aggregate(lhs->type) || var->size > ctx->ptr_size)
+            // Exception: small aggregates (size <= ptr_size) from call expressions are
+            // returned by value in a register, not by pointer
+            bool is_small_agg_from_call_var = type_is_aggregate(lhs->type) && var->size <= ctx->ptr_size && rhs->kind == AST_EXPR_CALL;
+
+            if ((type_is_aggregate(lhs->type) || var->size > ctx->ptr_size) && !is_small_agg_from_call_var)
             {
                 MasmOperand dst_ptr  = isa_result(ctx, ctx->ptr_size);
                 MasmOperand dst_addr = frame_mem(ctx, var->offset, ctx->ptr_size);
@@ -1143,7 +1151,21 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
                 // We need to load the actual value to pass it by value in a register.
                 bool is_small_aggregate = arg->type && (arg->type->kind == TYPE_STRUCT || arg->type->kind == TYPE_UNION) && arg->type->size > 0 && arg->type->size <= ctx->ptr_size;
 
-                if (is_small_aggregate && op.kind == MASM_OPERAND_REGISTER)
+                // For large aggregates (>8 bytes), we pass by reference - need the address
+                bool is_large_aggregate = arg->type && (arg->type->kind == TYPE_STRUCT || arg->type->kind == TYPE_UNION) && arg->type->size > ctx->ptr_size;
+
+                if (is_large_aggregate)
+                {
+                    // Large aggregates are passed by reference; we need the address in a register
+                    if (op.kind == MASM_OPERAND_MEMORY)
+                    {
+                        MasmOperand addr_reg = alloc_vreg(ctx, ctx->ptr_size);
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, addr_reg, op));
+                        op = addr_reg;
+                    }
+                    // else op is already a register holding the address
+                }
+                else if (is_small_aggregate && op.kind == MASM_OPERAND_REGISTER)
                 {
                     // op is a register holding the address; load the value from it
                     MasmOperand addr_reg = op;
@@ -1175,6 +1197,14 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
     else if (expr->type && expr->type->size > 0)
     {
         int res_size = expr->type->size;
+
+        // Reserve extra vregs for large results so isel stack slot allocation doesn't overlap
+        if (res_size > 8)
+        {
+            int extra_slots = (res_size + 7) / 8 - 1;
+            ctx->vreg_next += extra_slots;
+        }
+
         res          = isa_result(ctx, res_size);
         res_in_inst  = res;
         if (type_is_float(expr->type))
@@ -1236,6 +1266,10 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
     {
         return sret_ptr;
     }
+
+    // For small aggregates (<= ptr_size), the value is returned directly in RAX.
+    // Do NOT spill to stack here - callers expect the value, not an address.
+    // This differs from local variable expressions which return addresses via LEA.
 
     return res;
 }
@@ -1333,8 +1367,19 @@ static MasmOperand lower_cast(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     }
     else
     {
-        // Integer cast
-        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, dst, src));
+        // Integer cast - handle widening with zero extension (bitcast semantics)
+        if (src_size < dst_size)
+        {
+            // Widening cast - always zero-extend for bitcast semantics
+            // Mach's '::' operator is a bitcast/reinterpret, not a semantic conversion.
+            // If the user wants sign extension, they should use a specific conversion function.
+            masm_section_append_inst(text, masm_inst_2(MASM_IR_ZEXT, dst, src));
+        }
+        else
+        {
+            // Same size or narrowing - simple move
+            masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, dst, src));
+        }
     }
 
     return dst;
@@ -1754,22 +1799,35 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
 
             if (field)
             {
-                // note: for large aggregates, lower_expr(AST_EXPR_IDENT) returns a register
-                // containing the address of the object (LEA). treat that like pointer access.
-                if (is_pointer || obj.kind == MASM_OPERAND_REGISTER)
+                uint8_t size = field->type && field->type->size ? (uint8_t)field->type->size : ctx->ptr_size;
+
+                if (is_pointer)
                 {
-                    uint8_t size = field->type && field->type->size ? (uint8_t)field->type->size : ctx->ptr_size;
+                    // Pointer field access: need to load the pointer value first
+                    if (obj.kind == MASM_OPERAND_REGISTER)
+                    {
+                        // obj is already a register containing the pointer value
+                        return masm_operand_memory_simple(obj.reg.id, offset, size);
+                    }
+                    else if (obj.kind == MASM_OPERAND_MEMORY)
+                    {
+                        // obj is a memory operand (e.g., this.current where current is a pointer)
+                        // We need to LOAD the pointer value into a register first, then use
+                        // that register as the base for field access.
+                        MasmOperand tmp = alloc_vreg(ctx, ctx->ptr_size);
+                        masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, obj, masm_operand_type(MASM_TYPE_U64)));
+                        return masm_operand_memory_simple(tmp.reg.id, offset, size);
+                    }
+                }
+                else if (obj.kind == MASM_OPERAND_REGISTER)
+                {
+                    // obj is a register containing the address of a struct (LEA result)
                     return masm_operand_memory_simple(obj.reg.id, offset, size);
                 }
-                else
+                else if (obj.kind == MASM_OPERAND_MEMORY)
                 {
-                    // obj is a memory operand (struct on stack)
-                    if (obj.kind == MASM_OPERAND_MEMORY)
-                    {
-                        // Adjust displacement
-                        uint8_t size = field->type && field->type->size ? (uint8_t)field->type->size : ctx->ptr_size;
-                        return masm_operand_memory_simple(obj.mem.base.id, obj.mem.disp + offset, size);
-                    }
+                    // obj is a memory operand (struct on stack) - adjust displacement
+                    return masm_operand_memory_simple(obj.mem.base.id, obj.mem.disp + offset, size);
                 }
             }
         }

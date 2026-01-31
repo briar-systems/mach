@@ -1108,6 +1108,34 @@ static void emit_store(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
         return;
     }
 
+    if (size == 16 && src.kind == MASM_OPERAND_REGISTER)
+    {
+        // Resolve mem base
+        if (mem.mem.base.id >= VREG_START)
+        {
+            load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
+            mem.mem.base.id = MASM_X86_RCX;
+        }
+
+        // Src vreg location
+        int32_t src_off = get_vreg_offset(ctx, src.reg.id);
+
+        // Copy low 8 bytes
+        MasmOperand src_low = masm_operand_memory_simple(MASM_X86_RBP, -src_off, 8);
+        emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_x86_reg(MASM_X86_RAX, 8), src_low));
+
+        mem.mem.size = 8;
+        emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, mem, masm_x86_reg(MASM_X86_RAX, 8)));
+
+        // Copy high 8 bytes
+        MasmOperand src_high = masm_operand_memory_simple(MASM_X86_RBP, -src_off + 8, 8);
+        emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, masm_x86_reg(MASM_X86_RAX, 8), src_high));
+
+        mem.mem.disp += 8;
+        emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, mem, masm_x86_reg(MASM_X86_RAX, 8)));
+        return;
+    }
+
     // Load src -> RAX
     load_operand(sec, ctx, src, MASM_X86_RAX, 0);
 
@@ -1373,7 +1401,22 @@ static void emit_call(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
         }
         else
         {
-            store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+            if (dst.kind == MASM_OPERAND_REGISTER && dst.reg.size == 16)
+            {
+                // Store 16-byte result (RAX:RDX) to stack slot
+                int32_t     off  = get_vreg_offset(ctx, dst.reg.id);
+                MasmOperand low  = masm_operand_memory_simple(MASM_X86_RBP, -off, 8);
+                MasmOperand high = masm_operand_memory_simple(MASM_X86_RBP, -off + 8, 8);
+
+                // Low 64-bits in RAX
+                emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, low, masm_x86_reg(MASM_X86_RAX, 8)));
+                // High 64-bits in RDX
+                emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOVQ, high, masm_x86_reg(MASM_X86_RDX, 8)));
+            }
+            else
+            {
+                store_vreg(sec, ctx, dst.reg.id, MASM_X86_RAX, dst.reg.size);
+            }
         }
     }
 
@@ -1384,18 +1427,6 @@ static void emit_syscall(MasmSection *sec, CodeGenContext *ctx, MasmInstruction 
 {
     // SYSCALL dest, num, args...
     // Linux x86_64: RAX=sys_num, RDI, RSI, RDX, R10, R8, R9
-    // inst operands: dest, target(unused?), args... ?
-    // Wait, lower_call emits: dest, target(label "syscall"), args...
-    // Actually lower_call for syscall emits: MASM_IR_SYSCALL dest, target, args...
-    // But syscall number is usually an argument?
-    // In `lower.c`, `lower_call` puts args in order.
-    // If target is "syscall", it's a generic call.
-    // The syscall number is usually the first argument in Mach/MASM convention for portable syscalls?
-    // Or does `lower_call` handle it?
-    // `lower.c` `lower_call` does NOT treat syscall specially regarding arguments, just opcode.
-    // So operands[2] is first arg (syscall number?).
-    // Let's assume: syscall(num, arg1, arg2...)
-    // So arg[0] -> RAX, arg[1] -> RDI, etc.
 
     MasmOperand dst       = (inst->operand_count > 0) ? inst->operands[0] : masm_operand_none();
     int         arg_count = (inst->operand_count >= 2) ? inst->operand_count - 2 : 0;

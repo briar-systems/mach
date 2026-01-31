@@ -2871,9 +2871,7 @@ AstNode *parser_parse_expr_atom(Parser *parser)
             return NULL;
         }
         lit->lit_expr.kind    = TOKEN_LIT_INT;
-        char *raw             = lexer_raw_value(parser->lexer, parser->current);
-        lit->lit_expr.int_val = strtoull(raw, NULL, 0);
-        free(raw);
+        lit->lit_expr.int_val = lexer_eval_lit_int(parser->lexer, parser->current);
         parser_advance(parser);
         return lit;
     }
