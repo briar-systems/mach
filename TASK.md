@@ -134,3 +134,6 @@ This task advances the `GAMEPLAN.md` milestone "mach can compile itself (full bo
 ## 2026-02-02 19:43
 - confirmed next steps: verify odd-size aggregate handling is complete in bootstrap, then mirror fixes to self-hosted isel/lowering and add self-hosted tests.
 - clarified testing note: bootstrap has no unit tests; use the self-hosted test framework for new coverage.
+## 2026-02-02 20:12
+- added `PARITY_CHECKLIST.md` mapping bootstrap C files to self-hosted Mach equivalents with gap notes.
+- bumped `src/commands/build.mach` loaded module cap from 64 → 256 (parity with bootstrap fix for `_start`).
