@@ -8,10 +8,30 @@ use allocator: std.allocator;
 use fs:        std.filesystem;
 use print:     std.print;
 use platform:  std.system.platform;
+use path:      std.types.path;
 
 use args:     mach.cli.args;
 use cmd_help: mach.commands.help;
 use config:   mach.config.config;
+use utilfs:   mach.util.filesystem;
+
+use ast:      mach.compiler.ast;
+use lexer:    mach.compiler.lexer;
+use parser:   mach.compiler.parser;
+use sema:     mach.compiler.sema;
+use symbol:   mach.compiler.symbol;
+use ty:       mach.compiler.type;
+
+use emit:     mach.compiler.masm.emit;
+use lower:    mach.compiler.masm.lower;
+use masm:     mach.compiler.masm.masm;
+use target:   mach.compiler.masm.target;
+
+use tok:      mach.compiler.token;
+
+use c:        std.system.platform.linux.constants;
+use pfs:      std.system.platform.filesystem;
+use types:    std.system.platform.linux.types;
 
 # mach.commands.testing: test command implementation.
 # ---
@@ -24,11 +44,25 @@ rec TestOptions {
     filter:       str;
 }
 
-# TestResult: result of running a single test.
-rec TestResult {
+# TestInfo: test metadata collected from AST.
+rec TestInfo {
     name:    str;
-    passed:  bool;
-    exit_code: i32;
+    fn_name: str;
+    body:    *ast.Node;
+}
+
+# TestList: dynamic list of tests.
+rec TestList {
+    items: *TestInfo;
+    count: i32;
+    cap:   i32;
+}
+
+# StringList: dynamic list of strings.
+rec StringList {
+    items: **u8;
+    count: i32;
+    cap:   i32;
 }
 
 # parse_options: parse command-line arguments for test command.
@@ -141,23 +175,867 @@ fun path_join(base: str, rel: str, alloc: *allocator.Allocator) str {
     ret buf::&u8;
 }
 
-# file_exists: check if a file exists.
-# ---
-# path: path to check
-# ret: true if file exists
-fun file_exists(path: str) bool {
-    if (path == nil) {
+# is_dot_entry: check if a directory entry is . or ..
+fun is_dot_entry(name: str) bool {
+    if (name == nil) {
+        ret true;
+    }
+    if (name[0] == 46) {  # '.'
+        if (name[1] == 0) {
+            ret true;
+        }
+        if (name[1] == 46 && name[2] == 0) {
+            ret true;
+        }
+    }
+    ret false;
+}
+
+# string_list_init: create an empty StringList.
+fun string_list_init() StringList {
+    var list: StringList;
+    list.items = nil;
+    list.count = 0;
+    list.cap = 0;
+    ret list;
+}
+
+# string_list_append: append a string to the list (stores pointer).
+fun string_list_append(list: *StringList, alloc: *allocator.Allocator, s: str) bool {
+    if (list == nil || alloc == nil || s == nil) {
         ret false;
     }
 
-    val open_res: Result[fs.File, str] = fs.open(path);
-    if (open_res.is_err()) {
-        ret false;
+    if (list.cap == 0) {
+        val r: Result[**u8, allocator.AllocError] = alloc.alloc[*u8](32);
+        if (r.is_err()) {
+            ret false;
+        }
+        list.items = r.unwrap_ok();
+        list.cap = 32;
+    } or (list.count >= list.cap) {
+        val new_cap: i32 = list.cap * 2;
+        val r2: Result[**u8, allocator.AllocError] = alloc.resize[*u8](list.items, list.cap::usize, new_cap::usize);
+        if (r2.is_err()) {
+            ret false;
+        }
+        list.items = r2.unwrap_ok();
+        list.cap = new_cap;
     }
 
-    var file: fs.File = open_res.unwrap_ok();
-    file.close();
+    list.items[list.count] = s::&u8;
+    list.count = list.count + 1;
     ret true;
+}
+
+# list_files_recursive: collect all files under root directory.
+fun list_files_recursive(root: str, alloc: *allocator.Allocator, out: *StringList) bool {
+    if (root == nil || alloc == nil || out == nil) {
+        ret false;
+    }
+
+    val dir_fd: i64 = pfs.openat(c.AT_FDCWD, root, c.O_RDONLY | c.O_DIRECTORY, 0);
+    if (dir_fd < 0) {
+        ret false;
+    }
+
+    # allocate buffer for directory entries
+    val buf_res: Result[*u8, allocator.AllocError] = alloc.alloc[u8](4096);
+    if (buf_res.is_err()) {
+        pfs.close(dir_fd::i32);
+        ret false;
+    }
+    val buf: *u8 = buf_res.unwrap_ok();
+
+    for {
+        val nread: i64 = pfs.getdents64(dir_fd::i32, buf::*types.dirent64, 4096);
+        if (nread <= 0) {
+            brk;
+        }
+
+        var pos: usize = 0;
+        for (pos < nread::usize) {
+            val entry: *types.dirent64 = (buf::usize + pos)::*types.dirent64;
+            val name: str = ?entry.d_name[0];
+
+            if (!is_dot_entry(name)) {
+                val full_path: str = path_join(root, name, alloc);
+                if (full_path != nil) {
+                    if (entry.d_type == 4) {  # DT_DIR
+                        list_files_recursive(full_path, alloc, out);
+                    } or {
+                        string_list_append(out, alloc, full_path);
+                    }
+                }
+            }
+
+            pos = pos + entry.d_reclen::usize;
+        }
+    }
+
+    pfs.close(dir_fd::i32);
+    ret true;
+}
+
+# test_list_init: create an empty TestList.
+fun test_list_init() TestList {
+    var list: TestList;
+    list.items = nil;
+    list.count = 0;
+    list.cap = 0;
+    ret list;
+}
+
+# test_list_append: append a test to the list.
+fun test_list_append(list: *TestList, alloc: *allocator.Allocator, name: str, fn_name: str, body: *ast.Node) bool {
+    if (list == nil || alloc == nil) {
+        ret false;
+    }
+
+    if (list.cap == 0) {
+        val r: Result[*TestInfo, allocator.AllocError] = alloc.alloc[TestInfo](16);
+        if (r.is_err()) {
+            ret false;
+        }
+        list.items = r.unwrap_ok();
+        list.cap = 16;
+    } or (list.count >= list.cap) {
+        val new_cap: i32 = list.cap * 2;
+        val r2: Result[*TestInfo, allocator.AllocError] = alloc.resize[TestInfo](list.items, list.cap::usize, new_cap::usize);
+        if (r2.is_err()) {
+            ret false;
+        }
+        list.items = r2.unwrap_ok();
+        list.cap = new_cap;
+    }
+
+    val idx: i32 = list.count;
+    list.items[idx].name = name;
+    list.items[idx].fn_name = fn_name;
+    list.items[idx].body = body;
+    list.count = list.count + 1;
+    ret true;
+}
+
+# make_token helpers
+fun make_tok_ident() tok.Token { ret tok.create_ident(0, 0); }
+fun make_tok_int() tok.Token { ret tok.create_int(0, 0); }
+fun make_tok_string() tok.Token { ret tok.create_string(0, 0); }
+fun make_tok_op(tag: u8) tok.Token { ret tok.create(tok.TokenKind { error: 0 }, tag, 0, 0); }
+
+# make_node: allocate a node of the given kind.
+fun make_node(alloc: *allocator.Allocator, kind: ast.NodeKind) *ast.Node {
+    val r: Result[*ast.Node, str] = ast.create_node(alloc, kind, tok.create_error(0, 0));
+    if (r.is_err()) {
+        ret nil;
+    }
+    ret r.unwrap_ok();
+}
+
+# make_list: allocate a list.
+fun make_list(alloc: *allocator.Allocator) *ast.List {
+    val r: Result[*ast.List, str] = ast.create_list(alloc);
+    if (r.is_err()) {
+        ret nil;
+    }
+    ret r.unwrap_ok();
+}
+
+# make_type_name: create a type name node.
+fun make_type_name(alloc: *allocator.Allocator, name: str) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_TYPE_NAME);
+    if (n == nil) { ret nil; }
+    n.data = name::ptr;
+    ret n;
+}
+
+# make_ptr_type: create a pointer/ref type node.
+fun make_ptr_type(alloc: *allocator.Allocator, base: *ast.Node, is_mutable: bool) *ast.Node {
+    val kind: ast.NodeKind = is_mutable ? ast.NODE_TYPE_PTR : ast.NODE_TYPE_REF;
+    val n: *ast.Node = make_node(alloc, kind);
+    if (n == nil) { ret nil; }
+    n.children = base;
+    n.count = 1;
+    ret n;
+}
+
+# make_ident: create identifier expression.
+fun make_ident(alloc: *allocator.Allocator, name: str) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_EXPR_IDENT);
+    if (n == nil) { ret nil; }
+    n.data = name::ptr;
+    ret n;
+}
+
+# make_lit_int: create integer literal node with string content.
+fun make_lit_int(alloc: *allocator.Allocator, value: i64) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_EXPR_LIT_INT);
+    if (n == nil) { ret nil; }
+
+    # convert to string
+    var buf: [32]u8;
+    var pos: i32 = 31;
+    var v: i64 = value;
+    var neg: bool = false;
+    if (v < 0) {
+        neg = true;
+        v = -v;
+    }
+    if (v == 0) {
+        buf[pos] = 48;
+        pos = pos - 1;
+    }
+    for (v > 0 && pos >= 0) {
+        val digit: i64 = v % 10;
+        buf[pos] = (digit::u8 + 48);
+        v = v / 10;
+        pos = pos - 1;
+    }
+    if (neg && pos >= 0) {
+        buf[pos] = 45; # '-'
+        pos = pos - 1;
+    }
+    val start: i32 = pos + 1;
+    buf[31] = 0;
+    val s: str = ?buf[start];
+    n.data = s::ptr;
+    ret n;
+}
+
+# make_lit_string: create string literal node (data should include quotes).
+fun make_lit_string(alloc: *allocator.Allocator, literal: str) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_EXPR_LIT_STR);
+    if (n == nil) { ret nil; }
+    n.data = literal::ptr;
+    ret n;
+}
+
+# make_binary: create binary expression node.
+fun make_binary(alloc: *allocator.Allocator, op_tag: u8, left: *ast.Node, right: *ast.Node) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_EXPR_BINARY);
+    if (n == nil) { ret nil; }
+    n.data = op_tag::ptr;
+    val list: *ast.List = make_list(alloc);
+    if (list == nil) { ret n; }
+    list.append(alloc, left);
+    list.append(alloc, right);
+    n.children = list::*ast.Node;
+    ret n;
+}
+
+# make_call: create call expression node.
+fun make_call(alloc: *allocator.Allocator, name: str, args: *ast.List) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_EXPR_CALL);
+    if (n == nil) { ret nil; }
+    val callee: *ast.Node = make_ident(alloc, name);
+    n.children = callee;
+    n.count = 1;
+    n.data = args::ptr;
+    ret n;
+}
+
+# make_stmt_expr: create expression statement.
+fun make_stmt_expr(alloc: *allocator.Allocator, expr: *ast.Node) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_STMT_EXPR);
+    if (n == nil) { ret nil; }
+    n.children = expr;
+    n.count = 1;
+    ret n;
+}
+
+# make_var_stmt: create var declaration (with optional type + init).
+fun make_var_stmt(alloc: *allocator.Allocator, name: str, typ: *ast.Node, init: *ast.Node, is_val: bool) *ast.Node {
+    val kind: ast.NodeKind = is_val ? ast.NODE_DECL_VAL : ast.NODE_DECL_VAR;
+    val n: *ast.Node = make_node(alloc, kind);
+    if (n == nil) { ret nil; }
+    n.data = name::ptr;
+    if (typ != nil) {
+        n.extra = typ::ptr;
+    }
+    if (init != nil) {
+        n.children = init;
+    }
+    ret n;
+}
+
+# make_ret_stmt: create return statement.
+fun make_ret_stmt(alloc: *allocator.Allocator, expr: *ast.Node) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_STMT_RET);
+    if (n == nil) { ret nil; }
+    n.children = expr;
+    n.count = 1;
+    ret n;
+}
+
+# make_block: create block with statements list.
+fun make_block(alloc: *allocator.Allocator) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_STMT_BLOCK);
+    if (n == nil) { ret nil; }
+    val list: *ast.List = make_list(alloc);
+    if (list == nil) { ret n; }
+    n.data = list::ptr;
+    ret n;
+}
+
+# block_append: append stmt to block.
+fun block_append(alloc: *allocator.Allocator, block: *ast.Node, stmt: *ast.Node) {
+    if (block == nil || stmt == nil) { ret; }
+    val list: *ast.List = block.data::*ast.List;
+    if (list == nil) { ret; }
+    list.append(alloc, stmt);
+}
+
+# make_param: create a parameter node.
+fun make_param(alloc: *allocator.Allocator, name: str, typ: *ast.Node) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_PARAM);
+    if (n == nil) { ret nil; }
+    n.data = name::ptr;
+    n.children = typ;
+    n.count = 1;
+    ret n;
+}
+
+# make_fun: create function node.
+fun make_fun(alloc: *allocator.Allocator, name: str, params: *ast.List, ret_type: *ast.Node, body: *ast.Node) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_DECL_FUN);
+    if (n == nil) { ret nil; }
+    n.data = name::ptr;
+    n.extra = params::ptr;
+    n.ret_type = ret_type;
+    n.children = body;
+    n.count = 1;
+    ret n;
+}
+
+# make_if_stmt: create if with optional else block.
+fun make_if_stmt(alloc: *allocator.Allocator, cond: *ast.Node, then_block: *ast.Node, else_block: *ast.Node) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_STMT_IF);
+    if (n == nil) { ret nil; }
+    val list: *ast.List = make_list(alloc);
+    if (list == nil) { ret n; }
+    list.append(alloc, cond);
+    list.append(alloc, then_block);
+    if (else_block != nil) {
+        val or_node: *ast.Node = make_node(alloc, ast.NODE_STMT_OR);
+        if (or_node != nil) {
+            or_node.data = else_block::ptr;
+            list.append(alloc, or_node);
+        }
+    }
+    n.children = list::*ast.Node;
+    ret n;
+}
+
+# make_masm_stmt: create inline asm statement.
+fun make_masm_stmt(alloc: *allocator.Allocator, content: str) *ast.Node {
+    val n: *ast.Node = make_node(alloc, ast.NODE_STMT_MASM);
+    if (n == nil) { ret nil; }
+    n.data = content::ptr;
+    ret n;
+}
+
+# sanitize_module_path: replace .,/,\ with _
+fun sanitize_module_path(module_path: str, alloc: *allocator.Allocator) str {
+    if (module_path == nil || alloc == nil) {
+        ret "module";
+    }
+    val len: usize = module_path.len();
+    val r: Result[*u8, allocator.AllocError] = alloc.alloc[u8](len + 1);
+    if (r.is_err()) { ret "module"; }
+    val buf: *u8 = r.unwrap_ok();
+    var i: usize = 0;
+    for (i < len) {
+        val c: u8 = module_path[i];
+        if (c == 46 || c == 47 || c == 92) {
+            buf[i] = 95; # '_'
+        } or {
+            buf[i] = c;
+        }
+        i = i + 1;
+    }
+    buf[len] = 0;
+    ret buf::&u8;
+}
+
+# make_test_fn_name: build __mach_test_<module>_<index>
+fun make_test_fn_name(module_path: str, index: i32, alloc: *allocator.Allocator) str {
+    val sanitized: str = sanitize_module_path(module_path, alloc);
+    # build index string
+    var buf: [16]u8;
+    var pos: i32 = 15;
+    var v: i32 = index;
+    if (v == 0) {
+        buf[pos] = 48;
+        pos = pos - 1;
+    }
+    for (v > 0 && pos >= 0) {
+        val digit: i32 = v % 10;
+        buf[pos] = (digit::u8 + 48);
+        v = v / 10;
+        pos = pos - 1;
+    }
+    val start: i32 = pos + 1;
+    buf[15] = 0;
+    val idx_str: str = ?buf[start];
+
+    # allocate output string
+    val prefix: str = "__mach_test_";
+    val total: usize = prefix.len() + sanitized.len() + 1 + idx_str.len() + 1;
+    val r: Result[*u8, allocator.AllocError] = alloc.alloc[u8](total);
+    if (r.is_err()) {
+        ret "__mach_test";
+    }
+    val out: *u8 = r.unwrap_ok();
+
+    var p: usize = 0;
+    var i: usize = 0;
+    for (i < prefix.len()) { out[p] = prefix[i]; p = p + 1; i = i + 1; }
+    i = 0;
+    for (i < sanitized.len()) { out[p] = sanitized[i]; p = p + 1; i = i + 1; }
+    out[p] = 95; p = p + 1; # '_'
+    i = 0;
+    for (i < idx_str.len()) { out[p] = idx_str[i]; p = p + 1; i = i + 1; }
+    out[p] = 0;
+    ret out::&u8;
+}
+
+# build_mangled_symbol: build _M<path>N<name> mangled symbol for entry.
+fun build_mangled_symbol(module_path: str, name: str, alloc: *allocator.Allocator) str {
+    if (module_path == nil) { module_path = "main"; }
+    if (name == nil) { ret nil; }
+
+    # compute encoded length
+    var encoded_len: usize = 0;
+    var i: usize = 0;
+    var seg_start: usize = 0;
+    val mp_len: usize = module_path.len();
+    for (i <= mp_len) {
+        if (i == mp_len || module_path[i] == 46) {
+            val seg_len: usize = i - seg_start;
+            # length digits
+            var tmp: usize = seg_len;
+            var digits: usize = 1;
+            for (tmp >= 10) { tmp = tmp / 10; digits = digits + 1; }
+            encoded_len = encoded_len + digits + seg_len;
+            seg_start = i + 1;
+        }
+        i = i + 1;
+    }
+
+    # name length digits
+    var name_digits: usize = 1;
+    var tmp2: usize = name.len();
+    for (tmp2 >= 10) { tmp2 = tmp2 / 10; name_digits = name_digits + 1; }
+
+    val total: usize = 2 + encoded_len + 1 + name_digits + name.len() + 1;
+    val r: Result[*u8, allocator.AllocError] = alloc.alloc[u8](total);
+    if (r.is_err()) { ret nil; }
+    val out: *u8 = r.unwrap_ok();
+
+    var p: usize = 0;
+    out[p] = 95; p = p + 1; # '_'
+    out[p] = 77; p = p + 1; # 'M'
+
+    # append path segments
+    i = 0; seg_start = 0;
+    for (i <= mp_len) {
+        if (i == mp_len || module_path[i] == 46) {
+            val seg_len: usize = i - seg_start;
+            # write length
+            var tmp: usize = seg_len;
+            var digits: [16]u8; var dpos: i32 = 0;
+            if (tmp == 0) { digits[dpos] = 48; dpos = dpos + 1; }
+            for (tmp > 0) {
+                digits[dpos] = ((tmp % 10)::u8 + 48); dpos = dpos + 1; tmp = tmp / 10; }
+            # reverse digits
+            var j: i32 = dpos - 1;
+            for (j >= 0) { out[p] = digits[j]; p = p + 1; j = j - 1; }
+            # write segment
+            var k: usize = 0;
+            for (k < seg_len) { out[p] = module_path[seg_start + k]; p = p + 1; k = k + 1; }
+            seg_start = i + 1;
+        }
+        i = i + 1;
+    }
+
+    out[p] = 78; p = p + 1; # 'N'
+
+    # name length
+    tmp2 = name.len();
+    var digits2: [16]u8; var dpos2: i32 = 0;
+    if (tmp2 == 0) { digits2[dpos2] = 48; dpos2 = dpos2 + 1; }
+    for (tmp2 > 0) { digits2[dpos2] = ((tmp2 % 10)::u8 + 48); dpos2 = dpos2 + 1; tmp2 = tmp2 / 10; }
+    var j2: i32 = dpos2 - 1;
+    for (j2 >= 0) { out[p] = digits2[j2]; p = p + 1; j2 = j2 - 1; }
+
+    # name
+    var n: usize = 0;
+    for (n < name.len()) { out[p] = name[n]; p = p + 1; n = n + 1; }
+
+    out[p] = 0;
+    ret out::&u8;
+}
+
+# program_has_fun_name: check for function name conflicts in program decls.
+fun program_has_fun_name(program: *ast.Node, name: str) bool {
+    if (program == nil || program.kind != ast.NODE_PROGRAM) {
+        ret false;
+    }
+    val decls: *ast.List = program.data::*ast.List;
+    if (decls == nil) { ret false; }
+    var i: i32 = 0;
+    for (i < decls.count) {
+        val node: *ast.Node = decls.nodes[i];
+        if (node != nil && node.kind == ast.NODE_DECL_FUN) {
+            val n: str = node.data::str;
+            if (n != nil && n.equals(name)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# build_test_write_fn: __mach_test_write(ptr: *u8, len: i64)
+fun build_test_write_fn(alloc: *allocator.Allocator) *ast.Node {
+    val params: *ast.List = make_list(alloc);
+    if (params == nil) { ret nil; }
+
+    val u8_type: *ast.Node = make_type_name(alloc, "u8");
+    val ptr_type: *ast.Node = make_ptr_type(alloc, u8_type, true);
+    val len_type: *ast.Node = make_type_name(alloc, "i64");
+
+    val param_ptr: *ast.Node = make_param(alloc, "ptr", ptr_type);
+    val param_len: *ast.Node = make_param(alloc, "len", len_type);
+    params.append(alloc, param_ptr);
+    params.append(alloc, param_len);
+
+    val body: *ast.Node = make_block(alloc);
+    val masm_stmt: *ast.Node = make_masm_stmt(alloc,
+        "mov rax, 1\n"
+        "mov rdi, 1\n"
+        "mov rsi, ptr\n"
+        "mov rdx, len\n"
+        "syscall\n"
+    );
+    block_append(alloc, body, masm_stmt);
+
+    ret make_fun(alloc, "__mach_test_write", params, nil, body);
+}
+
+# build_test_main_fn: __mach_test_main() -> i64
+fun build_test_main_fn(alloc: *allocator.Allocator, tests: *TestInfo, test_count: i32) *ast.Node {
+    val body: *ast.Node = make_block(alloc);
+
+    # var failures: i64 = 0;
+    val failures_decl: *ast.Node = make_var_stmt(alloc, "failures", make_type_name(alloc, "i64"), make_lit_int(alloc, 0), false);
+    block_append(alloc, body, failures_decl);
+
+    var i: i32 = 0;
+    for (i < test_count) {
+        val info: *TestInfo = ?tests[i];
+
+        # result = __mach_test_...()
+        var result_name_buf: [64]u8;
+        var pos: i32 = 0;
+        val prefix: str = "__mach_test_result_";
+        var k: usize = 0;
+        for (k < prefix.len()) { result_name_buf[pos] = prefix[k]; pos = pos + 1; k = k + 1; }
+        # append index
+        var v: i32 = i;
+        var digits: [16]u8; var dpos: i32 = 0;
+        if (v == 0) { digits[dpos] = 48; dpos = dpos + 1; }
+        for (v > 0) { digits[dpos] = ((v % 10)::u8 + 48); dpos = dpos + 1; v = v / 10; }
+        var j: i32 = dpos - 1;
+        for (j >= 0) { result_name_buf[pos] = digits[j]; pos = pos + 1; j = j - 1; }
+        result_name_buf[pos] = 0;
+        val result_name: str = ?result_name_buf[0];
+
+        val call_test: *ast.Node = make_call(alloc, info.fn_name, make_list(alloc));
+        val result_decl: *ast.Node = make_var_stmt(alloc, result_name, make_type_name(alloc, "i64"), call_test, false);
+        block_append(alloc, body, result_decl);
+
+        # if (result == 0) { ok } or { fail }
+        val cond: *ast.Node = make_binary(alloc, tok.TAG_EQ_EQ, make_ident(alloc, result_name), make_lit_int(alloc, 0));
+
+        # then block
+        val then_block: *ast.Node = make_block(alloc);
+        val ok_args: *ast.List = make_list(alloc);
+        ok_args.append(alloc, make_lit_string(alloc, "\"ok: \""));
+        ok_args.append(alloc, make_lit_int(alloc, 4));
+        val ok_call: *ast.Node = make_call(alloc, "__mach_test_write", ok_args);
+        block_append(alloc, then_block, make_stmt_expr(alloc, ok_call));
+
+        # else block
+        val else_block: *ast.Node = make_block(alloc);
+        val fail_args: *ast.List = make_list(alloc);
+        fail_args.append(alloc, make_lit_string(alloc, "\"fail: \""));
+        fail_args.append(alloc, make_lit_int(alloc, 6));
+        val fail_call: *ast.Node = make_call(alloc, "__mach_test_write", fail_args);
+        block_append(alloc, else_block, make_stmt_expr(alloc, fail_call));
+
+        # failures = failures + 1
+        val fail_plus: *ast.Node = make_binary(alloc, tok.TAG_PLUS, make_ident(alloc, "failures"), make_lit_int(alloc, 1));
+        val fail_assign: *ast.Node = make_binary(alloc, tok.TAG_EQ, make_ident(alloc, "failures"), fail_plus);
+        block_append(alloc, else_block, make_stmt_expr(alloc, fail_assign));
+
+        val if_stmt: *ast.Node = make_if_stmt(alloc, cond, then_block, else_block);
+        block_append(alloc, body, if_stmt);
+
+        # write test name + newline
+        val name_literal: str = info.name;
+        val name_len: i64 = literal_string_len(name_literal);
+        val name_args: *ast.List = make_list(alloc);
+        name_args.append(alloc, make_lit_string(alloc, name_literal));
+        name_args.append(alloc, make_lit_int(alloc, name_len));
+        val name_call: *ast.Node = make_call(alloc, "__mach_test_write", name_args);
+        block_append(alloc, body, make_stmt_expr(alloc, name_call));
+
+        val nl_args: *ast.List = make_list(alloc);
+        nl_args.append(alloc, make_lit_string(alloc, "\"\\n\""));
+        nl_args.append(alloc, make_lit_int(alloc, 1));
+        val nl_call: *ast.Node = make_call(alloc, "__mach_test_write", nl_args);
+        block_append(alloc, body, make_stmt_expr(alloc, nl_call));
+
+        i = i + 1;
+    }
+
+    # return failures
+    block_append(alloc, body, make_ret_stmt(alloc, make_ident(alloc, "failures")));
+
+    ret make_fun(alloc, "__mach_test_main", make_list(alloc), make_type_name(alloc, "i64"), body);
+}
+
+# build_test_start_fn: _start
+fun build_test_start_fn(alloc: *allocator.Allocator) *ast.Node {
+    val body: *ast.Node = make_block(alloc);
+    val call_main: *ast.Node = make_call(alloc, "__mach_test_main", make_list(alloc));
+    block_append(alloc, body, make_stmt_expr(alloc, call_main));
+    val exit_masm: *ast.Node = make_masm_stmt(alloc,
+        "mov rdi, rax\n"
+        "mov rax, 60\n"
+        "syscall\n"
+    );
+    block_append(alloc, body, exit_masm);
+
+    val fun_node: *ast.Node = make_fun(alloc, "_start", make_list(alloc), nil, body);
+
+    # wrap in pub
+    val pub_node: *ast.Node = make_node(alloc, ast.NODE_DECL_PUB);
+    if (pub_node != nil) {
+        pub_node.children = fun_node;
+        pub_node.count = 1;
+        ret pub_node;
+    }
+
+    ret fun_node;
+}
+
+# literal_string_len: compute length of a string literal (strip quotes).
+fun literal_string_len(lit: str) i64 {
+    if (lit == nil) { ret 0; }
+    val len: usize = lit.len();
+    if (len >= 2 && lit[0] == 34 && lit[len - 1] == 34) { # '"'
+        ret (len - 2)::i64;
+    }
+    ret len::i64;
+}
+
+# collect_tests: collect test declarations from program.
+fun collect_tests(program: *ast.Node, module_path: str, alloc: *allocator.Allocator) TestList {
+    var list: TestList = test_list_init();
+    if (program == nil || program.kind != ast.NODE_PROGRAM) {
+        ret list;
+    }
+    val decls: *ast.List = program.data::*ast.List;
+    if (decls == nil) { ret list; }
+
+    var i: i32 = 0;
+    for (i < decls.count) {
+        val stmt: *ast.Node = decls.nodes[i];
+        if (stmt != nil && stmt.kind == ast.NODE_DECL_TEST) {
+            val name: str = stmt.data::str;
+            val body: *ast.Node = stmt.children;
+            val fn_name: str = make_test_fn_name(module_path, list.count, alloc);
+            test_list_append(?list, alloc, name, fn_name, body);
+        }
+        i = i + 1;
+    }
+
+    ret list;
+}
+
+# transform_tests: convert tests to functions + harness.
+fun transform_tests(program: *ast.Node, module_path: str, alloc: *allocator.Allocator) i32 {
+    if (program == nil || program.kind != ast.NODE_PROGRAM) {
+        ret 0;
+    }
+
+    if (program_has_fun_name(program, "_start") ||
+        program_has_fun_name(program, "__mach_test_main") ||
+        program_has_fun_name(program, "__mach_test_write")) {
+        print.eprintln("error: test harness symbol name conflicts with existing function");
+        ret -1;
+    }
+
+    var tests: TestList = collect_tests(program, module_path, alloc);
+    if (tests.count <= 0) {
+        ret 0;
+    }
+
+    # build new declaration list: keep non-test decls, append test fns + harness
+    val new_list: *ast.List = make_list(alloc);
+    if (new_list == nil) { ret -1; }
+
+    val decls: *ast.List = program.data::*ast.List;
+    var i: i32 = 0;
+    for (i < decls.count) {
+        val stmt: *ast.Node = decls.nodes[i];
+        if (stmt != nil && stmt.kind == ast.NODE_DECL_TEST) {
+            i = i + 1;
+            cnt;
+        }
+        new_list.append(alloc, stmt);
+        i = i + 1;
+    }
+
+    # add test functions
+    var t: i32 = 0;
+    for (t < tests.count) {
+        val info: *TestInfo = ?tests.items[t];
+
+        # append ret 0 to body
+        val body: *ast.Node = info.body;
+        if (body != nil && body.kind == ast.NODE_STMT_BLOCK) {
+            val stmts: *ast.List = body.data::*ast.List;
+            if (stmts != nil) {
+                stmts.append(alloc, make_ret_stmt(alloc, make_lit_int(alloc, 0)));
+            }
+        }
+
+        val fn: *ast.Node = make_fun(alloc, info.fn_name, make_list(alloc), make_type_name(alloc, "i64"), body);
+        new_list.append(alloc, fn);
+        t = t + 1;
+    }
+
+    # add harness fns
+    new_list.append(alloc, build_test_write_fn(alloc));
+    new_list.append(alloc, build_test_main_fn(alloc, tests.items, tests.count));
+    new_list.append(alloc, build_test_start_fn(alloc));
+
+    program.data = new_list::ptr;
+    ret tests.count;
+}
+
+# derive_module_path: compute module path from file path.
+fun derive_module_path(project_root: str, cfg: *config.Config, file_path: str, alloc: *allocator.Allocator) str {
+    if (project_root == nil || cfg == nil || file_path == nil) { ret nil; }
+    if (cfg.id == nil) { ret nil; }
+
+    val src_dir: str = path_join(project_root, cfg.dir_src, alloc);
+    if (src_dir == nil) { ret nil; }
+
+    if (!file_path.starts_with(src_dir)) {
+        ret nil;
+    }
+
+    var rel: str = (file_path::usize + src_dir.len())::str;
+    if (rel[0] == 47) { rel = (rel::usize + 1)::str; }
+
+    # strip extension
+    val rel_len: usize = rel.len();
+    var end: usize = rel_len;
+    if (rel_len >= 5 && rel.ends_with(".mach")) {
+        end = rel_len - 5;
+    }
+
+    # build rel_no_ext with path separators -> '.'
+    val r: Result[*u8, allocator.AllocError] = alloc.alloc[u8](end + 1);
+    if (r.is_err()) { ret nil; }
+    val buf: *u8 = r.unwrap_ok();
+    var i: usize = 0;
+    for (i < end) {
+        val c: u8 = rel[i];
+        if (c == 47 || c == 92) { buf[i] = 46; } else { buf[i] = c; }
+        i = i + 1;
+    }
+    buf[end] = 0;
+    val rel_no_ext: str = buf::&u8;
+
+    # module_path = cfg.id + "." + rel_no_ext
+    val total: usize = cfg.id.len() + 1 + rel_no_ext.len() + 1;
+    val r2: Result[*u8, allocator.AllocError] = alloc.alloc[u8](total);
+    if (r2.is_err()) { ret nil; }
+    val out: *u8 = r2.unwrap_ok();
+    var p: usize = 0;
+    var k: usize = 0;
+    for (k < cfg.id.len()) { out[p] = cfg.id[k]; p = p + 1; k = k + 1; }
+    out[p] = 46; p = p + 1;
+    k = 0;
+    for (k < rel_no_ext.len()) { out[p] = rel_no_ext[k]; p = p + 1; k = k + 1; }
+    out[p] = 0;
+    ret out::&u8;
+}
+
+# build_test_output_path: compute output path for test binary.
+fun build_test_output_path(project_root: str, cfg: *config.Config, target_cfg: *config.Target, file_path: str, alloc: *allocator.Allocator) str {
+    if (project_root == nil || cfg == nil || target_cfg == nil || file_path == nil) {
+        ret nil;
+    }
+
+    val src_root: str = path_join(project_root, cfg.dir_src, alloc);
+    if (src_root == nil) { ret nil; }
+
+    if (!file_path.starts_with(src_root)) { ret nil; }
+    var rel: str = (file_path::usize + src_root.len())::str;
+    if (rel[0] == 47) { rel = (rel::usize + 1)::str; }
+
+    # strip extension
+    val rel_len: usize = rel.len();
+    var end: usize = rel_len;
+    if (rel_len >= 5 && rel.ends_with(".mach")) {
+        end = rel_len - 5;
+    }
+
+    val out_root: str = path_join(project_root, cfg.dir_out, alloc);
+    val artifacts: str = (target_cfg.artifacts != nil) ? target_cfg.artifacts : "linux";
+    val out_target: str = path_join(out_root, artifacts, alloc);
+    val tests_root: str = path_join(out_target, "tests", alloc);
+
+    # append rel path (without extension)
+    val r: Result[*u8, allocator.AllocError] = alloc.alloc[u8](tests_root.len() + 1 + end + 1);
+    if (r.is_err()) { ret nil; }
+    val buf: *u8 = r.unwrap_ok();
+    var p: usize = 0;
+    var i: usize = 0;
+    for (i < tests_root.len()) { buf[p] = tests_root[i]; p = p + 1; i = i + 1; }
+    buf[p] = 47; p = p + 1;
+    i = 0;
+    for (i < end) { buf[p] = rel[i]; p = p + 1; i = i + 1; }
+    buf[p] = 0;
+    ret buf::&u8;
+}
+
+# ensure_dir: mkdir -p via /bin/mkdir.
+fun ensure_dir(path_str: str) bool {
+    if (path_str == nil) { ret false; }
+    var argv: [4]&u8;
+    argv[0] = "/bin/mkdir";
+    argv[1] = "-p";
+    argv[2] = path_str;
+    argv[3] = nil;
+
+    val pid: i64 = platform.fork();
+    if (pid < 0) { ret false; }
+    if (pid == 0) {
+        var envp: [1]&u8; envp[0] = nil;
+        platform.execve(argv[0], ?argv[0], ?envp[0]);
+        platform.terminate(127);
+    }
+    var status: i32 = 0;
+    val wait_result: i64 = platform.waitpid(pid, ?status, 0);
+    if (wait_result < 0) { ret false; }
+    if (platform.wifexited(status)) { ret platform.wexitstatus(status) == 0; }
+    ret false;
 }
 
 # execute_test_binary: execute a test binary and capture result.
@@ -229,39 +1107,6 @@ fun print_u32(n: u32) {
     print.print(s);
 }
 
-# run_tests_from_binary: run the test binary and report results.
-# ---
-# binary_path: path to the compiled test binary
-# ret: number of failures
-fun run_tests_from_binary(binary_path: str) i32 {
-    # the test binary is expected to:
-    # - run all tests internally
-    # - exit 0 if all pass, non-zero otherwise
-    #
-    # for a more detailed approach, the test harness would:
-    # - enumerate test functions
-    # - fork for each test
-    # - collect individual results
-
-    print.print("running tests from: ");
-    print.println(binary_path);
-
-    val exit_code: i32 = execute_test_binary(binary_path);
-
-    if (exit_code == 0) {
-        print.println("  all tests passed");
-        ret 0;
-    } or (exit_code == 127) {
-        print.println("  error: could not execute test binary");
-        ret 1;
-    } or {
-        print.print("  tests failed with exit code: ");
-        print_u32(exit_code::u32);
-        print.println("");
-        ret 1;
-    }
-}
-
 # handle: main entry point for the test command.
 # ---
 # argc: argument count
@@ -273,72 +1118,231 @@ pub fun handle(argc: i64, argv: &&u8) i64 {
     # create allocator
     var alloc: allocator.Allocator = allocator.default();
 
-    # check for mach.toml in project directory
-    val config_path: str = path_join(opts.project_path, "mach.toml", ?alloc);
-    if (config_path == nil || !file_exists(config_path)) {
+    # find project root
+    val root_res: Result[str, str] = utilfs.find_project_root(opts.project_path, ?alloc);
+    if (root_res.is_err()) {
         print.eprintln("error: failed to find project root (no mach.toml)");
         ret 1;
     }
+    val project_root: str = root_res.unwrap_ok();
 
     # load configuration
+    val config_path: str = path_join(project_root, "mach.toml", ?alloc);
     val cfg_res: Result[config.Config, str] = config.load(config_path, ?alloc);
     if (cfg_res.is_err()) {
         print.eprint("error: failed to load mach.toml: ");
         print.eprintln(cfg_res.unwrap_err());
         ret 1;
     }
-
     val cfg: config.Config = cfg_res.unwrap_ok();
 
-    # for now, the self-hosted compiler's test command relies on:
-    # 1. tests being compiled into the main binary
-    # 2. or a separate test binary being built
-    #
-    # a full implementation would:
-    # - scan source files for `test` declarations
-    # - generate a test harness
-    # - compile and run the harness
-    #
-    # for now, we look for a test binary in the output directory
-
-    val out_dir: str = path_join(opts.project_path, cfg.dir_out, ?alloc);
-    var test_binary: str = path_join(out_dir, "test", ?alloc);
-
-    # also try <out_dir>/tests or <out_dir>/<project>_test
-    if (!file_exists(test_binary)) {
-        test_binary = path_join(out_dir, "tests", ?alloc);
+    # resolve target
+    var target_cfg: *config.Target = nil;
+    if (opts.target_name != nil) {
+        val t_opt: Option[*config.Target] = config.get_target(?cfg, opts.target_name);
+        if (t_opt.is_some()) { target_cfg = t_opt.unwrap(); }
     }
-
-    if (!file_exists(test_binary)) {
-        # try to use the main binary if it contains tests
-        test_binary = path_join(out_dir, "output", ?alloc);
+    if (target_cfg == nil && cfg.target != nil && !cfg.target.equals("native")) {
+        val t_opt2: Option[*config.Target] = config.get_target(?cfg, cfg.target);
+        if (t_opt2.is_some()) { target_cfg = t_opt2.unwrap(); }
     }
-
-    if (test_binary == nil || !file_exists(test_binary)) {
-        print.eprintln("error: no test binary found");
-        print.eprintln("hint: build tests with 'mach build' first");
-        print.eprintln("      or ensure a test binary exists in the output directory");
+    if (target_cfg == nil && cfg.targets != nil && cfg.target_count > 0) {
+        target_cfg = ?cfg.targets[0];
+    }
+    if (target_cfg == nil) {
+        print.eprintln("error: no targets found in mach.toml");
         ret 1;
     }
 
-    # apply filter if specified
-    if (opts.filter != nil) {
-        print.print("filter: ");
-        print.println(opts.filter);
+    # list source files
+    val src_root: str = path_join(project_root, cfg.dir_src, ?alloc);
+    if (src_root == nil) { ret 1; }
+    var files: StringList = string_list_init();
+    list_files_recursive(src_root, ?alloc, ?files);
+
+    var total_tests: i32 = 0;
+    var total_failures: i32 = 0;
+    var compile_errors: i32 = 0;
+    var had_error: bool = false;
+
+    var i: i32 = 0;
+    for (i < files.count) {
+        val file_path: str = files.items[i]::str;
+        if (!utilfs.is_mach_file(file_path)) {
+            i = i + 1;
+            cnt;
+        }
+
+        val module_path: str = derive_module_path(project_root, ?cfg, file_path, ?alloc);
+        if (module_path == nil) {
+            i = i + 1;
+            cnt;
+        }
+
+        val source_res: Result[str, str] = utilfs.read_file(file_path, ?alloc);
+        if (source_res.is_err()) {
+            print.eprint("error: failed to read file: ");
+            print.eprintln(file_path);
+            had_error = true;
+            compile_errors = compile_errors + 1;
+            i = i + 1;
+            cnt;
+        }
+        val source: str = source_res.unwrap_ok();
+
+        var p: parser.Parser = parser.init(source, ?alloc);
+        val parse_res: Result[*ast.Node, str] = p.parse_program();
+        if (parse_res.is_err() || p.had_error) {
+            print.eprint("error: parsing failed for '");
+            print.eprint(file_path);
+            print.eprintln("'");
+            p.deinit();
+            had_error = true;
+            compile_errors = compile_errors + 1;
+            i = i + 1;
+            cnt;
+        }
+        val program: *ast.Node = parse_res.unwrap_ok();
+
+        val test_count: i32 = transform_tests(program, module_path, ?alloc);
+        if (test_count == 0) {
+            p.deinit();
+            i = i + 1;
+            cnt;
+        }
+        if (test_count < 0) {
+            p.deinit();
+            had_error = true;
+            compile_errors = compile_errors + 1;
+            i = i + 1;
+            cnt;
+        }
+
+        val sema_res: Result[sema.Sema, str] = sema.init(?alloc, module_path);
+        if (sema_res.is_err()) {
+            print.eprintln("error: failed to create semantic analyzer");
+            p.deinit();
+            had_error = true;
+            compile_errors = compile_errors + 1;
+            i = i + 1;
+            cnt;
+        }
+        var sem: sema.Sema = sema_res.unwrap_ok();
+
+        val analyze_res: Result[bool, str] = sema.analyze(?sem, program);
+        if (analyze_res.is_err() || sema.has_errors(?sem)) {
+            print.eprintln("error: semantic analysis failed");
+            sema.deinit(?sem);
+            p.deinit();
+            had_error = true;
+            compile_errors = compile_errors + 1;
+            i = i + 1;
+            cnt;
+        }
+
+        val symbols: *symbol.Table = sema.get_symbol_table(?sem);
+        val types_ctx: *ty.TypeContext = sema.get_type_context(?sem);
+        val tgt: target.Target = target.default_target();
+
+        var loaded_mods: [256]sema.LoadedModule;
+        val load_count: i32 = sema.get_loaded_modules(?sem, ?loaded_mods[0], 256);
+
+        val lower_res: Result[*masm.Masm, str] = lower.lower_all_modules(program, symbols, types_ctx, ?alloc, tgt, ?loaded_mods[0], load_count);
+        if (lower_res.is_err()) {
+            print.eprintln("error: lowering failed");
+            sema.deinit(?sem);
+            p.deinit();
+            had_error = true;
+            compile_errors = compile_errors + 1;
+            i = i + 1;
+            cnt;
+        }
+        val m: *masm.Masm = lower_res.unwrap_ok();
+
+        val output_path: str = build_test_output_path(project_root, ?cfg, target_cfg, file_path, ?alloc);
+        if (output_path == nil) {
+            print.eprintln("error: failed to compute output path");
+            masm.destroy(m);
+            sema.deinit(?sem);
+            p.deinit();
+            had_error = true;
+            compile_errors = compile_errors + 1;
+            i = i + 1;
+            cnt;
+        }
+
+        # ensure output directory exists
+        val out_dir_res: Result[str, str] = utilfs.get_dirname(output_path, ?alloc);
+        if (out_dir_res.is_ok()) {
+            ensure_dir(out_dir_res.unwrap_ok());
+        }
+
+        val emit_res: Result[bool, str] = emit.emit_executable(m, output_path, ?alloc);
+        if (emit_res.is_err()) {
+            print.eprintln("error: failed to emit test binary");
+            masm.destroy(m);
+            sema.deinit(?sem);
+            p.deinit();
+            had_error = true;
+            compile_errors = compile_errors + 1;
+            i = i + 1;
+            cnt;
+        }
+
+        # run test binary
+        print.print("[test] ");
+        print.print(module_path);
+        print.print(" (");
+        print_u32(test_count::u32);
+        print.println(")");
+
+        val exit_code: i32 = execute_test_binary(output_path);
+        if (exit_code != 0) {
+            print.print("[fail] ");
+            print.print(module_path);
+            print.print(" (");
+            print_u32(exit_code::u32);
+            print.println(")");
+            total_failures = total_failures + 1;
+        } or {
+            print.print("[ok] ");
+            print.println(module_path);
+        }
+
+        total_tests = total_tests + test_count;
+
+        masm.destroy(m);
+        sema.deinit(?sem);
+        p.deinit();
+
+        i = i + 1;
     }
 
-    # run the tests
-    val failures: i32 = run_tests_from_binary(test_binary);
-
-    if (failures == 0) {
-        print.println("");
-        print.println("test result: ok");
+    if (total_tests == 0) {
+        if (had_error) { ret 1; }
+        print.println("no tests found");
         ret 0;
     }
 
-    print.println("");
-    print.print("test result: FAILED (");
-    print_u32(failures::u32);
-    print.println(" failures)");
-    ret 1;
+    if (compile_errors > 0) {
+        print.print("tests: ");
+        print_u32(total_tests::u32);
+        print.print(", failures: ");
+        print_u32(total_failures::u32);
+        print.print(", compile errors: ");
+        print_u32(compile_errors::u32);
+        print.println("");
+    } or {
+        print.print("tests: ");
+        print_u32(total_tests::u32);
+        print.print(", failures: ");
+        print_u32(total_failures::u32);
+        print.println("");
+    }
+
+    if (total_failures != 0 || compile_errors != 0) {
+        ret 1;
+    }
+
+    ret had_error ? 1 : 0;
 }
