@@ -651,13 +651,9 @@ static void emit_binary_op_explicit(MasmSection *sec, CodeGenContext *ctx, MasmI
     else if (b.kind == MASM_OPERAND_MEMORY)
     {
         // Explicit memory operand
-        // Need to resolve base if it's a vreg
+        // Resolve base/index if it's a vreg
         MasmOperand mem = b;
-        if (mem.mem.base.id >= VREG_START)
-        {
-            load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_R11, 0);
-            mem.mem.base.id = MASM_X86_R11;
-        }
+        mem = resolve_mem_vregs(sec, ctx, mem, MASM_X86_R11, MASM_X86_RCX);
 
         uint32_t opcode = 0;
         switch (op)
@@ -959,11 +955,7 @@ static void emit_mov(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
             if (fits && !needs_chunked_move(dst.mem.size))
             {
                 MasmOperand mem = dst;
-                if (mem.mem.base.id >= VREG_START)
-                {
-                    load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
-                    mem.mem.base.id = MASM_X86_RCX;
-                }
+                mem = resolve_mem_vregs(sec, ctx, mem, MASM_X86_RCX, MASM_X86_RAX);
                 emit_inst(sec, masm_x86_inst_2(MASM_OP_X86_MOV_MI, mem, src));
                 return;
             }
@@ -972,13 +964,9 @@ static void emit_mov(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *ins
         // Load src -> RAX
         load_operand(sec, ctx, src, MASM_X86_RAX, 0);
 
-        // Resolve dst address -> RCX (if needed)
+        // Resolve dst address -> RCX/RAX (if needed)
         MasmOperand mem = dst;
-        if (mem.mem.base.id >= VREG_START)
-        {
-            load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
-            mem.mem.base.id = MASM_X86_RCX;
-        }
+        mem = resolve_mem_vregs(sec, ctx, mem, MASM_X86_RCX, MASM_X86_RAX);
 
         if (needs_chunked_move(mem.mem.size))
         {
@@ -1046,12 +1034,8 @@ static void emit_load(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *in
             scratch = (MasmX86Reg)dst.reg.id;
         }
 
-        // Resolve mem base
-        if (mem.mem.base.id >= VREG_START)
-        {
-            load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
-            mem.mem.base.id = MASM_X86_RCX;
-        }
+        // Resolve mem base/index (may use vregs)
+        mem = resolve_mem_vregs(sec, ctx, mem, scratch, MASM_X86_RCX);
 
         MasmOperand r = masm_x86_reg(scratch, load_size); // dest reg with proper size
 
@@ -1245,12 +1229,8 @@ static void emit_store(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
             xmm_src = masm_operand_register(src.reg.id, 16);
         }
 
-        // Resolve mem base
-        if (mem.mem.base.id >= VREG_START)
-        {
-            load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
-            mem.mem.base.id = MASM_X86_RCX;
-        }
+        // Resolve mem base/index
+        mem = resolve_mem_vregs(sec, ctx, mem, MASM_X86_RCX, MASM_X86_RAX);
 
         // Store XMM -> [mem]
         mem.mem.size = size;
@@ -1260,12 +1240,8 @@ static void emit_store(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
 
     if (size == 16 && src.kind == MASM_OPERAND_REGISTER)
     {
-        // Resolve mem base
-        if (mem.mem.base.id >= VREG_START)
-        {
-            load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
-            mem.mem.base.id = MASM_X86_RCX;
-        }
+        // Resolve mem base/index
+        mem = resolve_mem_vregs(sec, ctx, mem, MASM_X86_RCX, MASM_X86_RAX);
 
         // Src vreg location
         int32_t src_off = get_vreg_offset(ctx, src.reg.id);
@@ -1289,12 +1265,8 @@ static void emit_store(MasmSection *sec, CodeGenContext *ctx, MasmInstruction *i
     // Load src -> RAX
     load_operand(sec, ctx, src, MASM_X86_RAX, 0);
 
-    // Resolve mem base
-    if (mem.mem.base.id >= VREG_START)
-    {
-        load_operand(sec, ctx, masm_operand_register(mem.mem.base.id, 8), MASM_X86_RCX, 0);
-        mem.mem.base.id = MASM_X86_RCX;
-    }
+    // Resolve mem base/index
+    mem = resolve_mem_vregs(sec, ctx, mem, MASM_X86_RCX, MASM_X86_RAX);
 
     if (needs_chunked_move(size))
     {

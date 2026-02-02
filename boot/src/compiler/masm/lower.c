@@ -1281,13 +1281,6 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
     {
         int res_size = expr->type->size;
 
-        // Reserve extra vregs for large results so isel stack slot allocation doesn't overlap
-        if (res_size > 8)
-        {
-            int extra_slots = (res_size + 7) / 8 - 1;
-            ctx->vreg_next += extra_slots;
-        }
-
         res          = isa_result(ctx, res_size);
         res_in_inst  = res;
         if (type_is_float(expr->type))
