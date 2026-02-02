@@ -137,3 +137,25 @@ This task advances the `GAMEPLAN.md` milestone "mach can compile itself (full bo
 ## 2026-02-02 20:12
 - added `PARITY_CHECKLIST.md` mapping bootstrap C files to self-hosted Mach equivalents with gap notes.
 - bumped `src/commands/build.mach` loaded module cap from 64 → 256 (parity with bootstrap fix for `_start`).
+
+## 2026-02-02 20:16
+- replaced `src/commands/testing.mach` with full test harness (port of bootstrap cmd_test.c): AST transform for `test` blocks, harness generation, per-file compile + run.
+- uses recursive file discovery under src/ and emits test binaries under out/<artifacts>/tests/.
+
+## 2026-02-02 20:48
+- implemented target-aware build in `src/commands/build.mach` (entrypoint + output path + module_path derived from entry file).
+- run command now treats `target = "native"` as auto-select first target.
+
+## 2026-02-02 20:52
+- fixed self-hosted vreg slot allocation in `src/compiler/masm/isel.mach`: multi-slot vregs now reserve contiguous stack slots during scan; stack size derived from allocated slots.
+
+## 2026-02-02 21:02
+- added base/index vreg handling in `src/compiler/masm/isel.mach`: compute effective addresses via RCX/RAX with scale+offset; updated LOAD/STORE/LEA to use it.
+
+## 2026-02-02 21:07
+- implemented size-aware loads/stores in `src/compiler/masm/isel.mach` (vreg stack loads and mem load/store now emit byte/word/dword/qword ops).
+- this enables odd-size aggregate copies to use byte-wise moves without corrupting higher bytes.
+
+## 2026-02-02 23:52
+- bootstrap x86_64 isel: resolve both base+index vregs for explicit mem operands (emit_mov/load/store/binary op), matching self-hosted fix.
+- bootstrap lower: removed manual vreg bump for large return values; rely on alloc_vreg multi-slot sizing for platform-agnostic behavior.

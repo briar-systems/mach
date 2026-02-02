@@ -16,6 +16,7 @@ use token:  mach.compiler.token;
 use lexer:  mach.compiler.lexer;
 use parser: mach.compiler.parser;
 use comptime: mach.compiler.comptime;
+use config: mach.config.config;
 
 # mach.compiler.sema: semantic analysis.
 # ---
@@ -98,6 +99,11 @@ var anon_type_counter: i32 = 0;
 # current_module: current module being analyzed
 # modules:        linked list of all loaded modules
 # project_root:   root directory of the project (for resolving module paths)
+# project_id:     project id (module prefix for main project)
+# src_root:       path to src directory
+# dep_root:       path to dep directory
+# deps:           dependency list from config
+# dep_count:      number of deps
 pub rec Sema {
     alloc:          *allocator.Allocator;
     symbols:        symbol.Table;
@@ -114,6 +120,11 @@ pub rec Sema {
     current_module: *SemaModule;
     modules:        *SemaModule;
     project_root:   str;
+    project_id:     str;
+    src_root:       str;
+    dep_root:       str;
+    deps:           *config.Dep;
+    dep_count:      i32;
     current_table:  *symbol.Table;  # module-scoped symbol table (switched per-module)
 }
 
@@ -153,6 +164,11 @@ pub fun init(alloc: *allocator.Allocator, module_path: str) Result[Sema, str] {
     sema.current_module = nil;
     sema.modules = nil;
     sema.project_root = nil;
+    sema.project_id = nil;
+    sema.src_root = nil;
+    sema.dep_root = nil;
+    sema.deps = nil;
+    sema.dep_count = 0;
     sema.current_table = nil;  # will be set to ?sema.symbols for main module
 
     ret ok[Sema, str](sema);
@@ -4708,6 +4724,24 @@ fun check_test(sema: *Sema, decl: *ast.Node) bool {
 
 # --- module system ---
 
+# set_module_roots: configure module resolution for the project.
+# ---
+# project_id: project id (module prefix)
+# src_root:   absolute (or project-relative) src directory
+# dep_root:   absolute (or project-relative) dep directory
+# deps:       config deps array
+# dep_count:  number of deps
+pub fun set_module_roots(sema: *Sema, project_id: str, src_root: str, dep_root: str, deps: *config.Dep, dep_count: i32) {
+    if (sema == nil) {
+        ret;
+    }
+    sema.project_id = project_id;
+    sema.src_root = src_root;
+    sema.dep_root = dep_root;
+    sema.deps = deps;
+    sema.dep_count = dep_count;
+}
+
 # find_module: look up a module by path in the loaded modules list.
 # ---
 # sema:        analyzer context
@@ -4728,6 +4762,58 @@ fun find_module(sema: *Sema, module_path: str) *SemaModule {
     ret nil;
 }
 
+# build_module_path: build file path from base + module_path rest.
+# ---
+# base: base directory
+# module_path: full module path
+# rest_start: index in module_path after prefix (e.g., after "mach.")
+fun build_module_path(sema: *Sema, base: str, module_path: str, rest_start: usize) Result[str, str] {
+    if (sema == nil || base == nil || module_path == nil) {
+        ret err[str, str]("invalid arguments");
+    }
+
+    val path_len: usize = module_path.len();
+    if (path_len <= rest_start) {
+        ret err[str, str]("invalid module path");
+    }
+
+    val rest_len: usize = path_len - rest_start;
+    val suffix: str = ".mach";
+    val out_len: usize = base.len() + rest_len + suffix.len();
+    val alloc_res: Result[*u8, allocator.AllocError] = sema.alloc.alloc[u8](out_len + 1);
+    if (alloc_res.is_err()) {
+        ret err[str, str]("allocation failed");
+    }
+
+    val buf: *u8 = alloc_res.unwrap_ok();
+    var pos: usize = 0;
+
+    # copy base (ensure it ends with '/')
+    var i: usize = 0;
+    for (i < base.len()) {
+        buf[pos] = base[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    if (pos > 0 && buf[pos - 1] != 47) {
+        buf[pos] = 47; pos = pos + 1;
+    }
+
+    # copy rest, replacing dots with '/'
+    i = rest_start;
+    for (i < path_len) {
+        if (module_path[i] == 46) { buf[pos] = 47; } else { buf[pos] = module_path[i]; }
+        pos = pos + 1;
+        i = i + 1;
+    }
+
+    # suffix
+    i = 0;
+    for (i < suffix.len()) { buf[pos] = suffix[i]; pos = pos + 1; i = i + 1; }
+    buf[pos] = 0;
+    ret ok[str, str](buf::str);
+}
+
 # resolve_module_path: convert a module path to a file system path.
 # ---
 # sema:        analyzer context
@@ -4738,123 +4824,101 @@ fun resolve_module_path(sema: *Sema, module_path: str) Result[str, str] {
         ret err[str, str]("invalid arguments");
     }
 
-    # for now, use simple convention:
-    # - "mach.*" -> project_root/src/*.mach (replace dots with /)
-    # - "std.*" -> project_root/dep/mach-std/src/*.mach
-
     val path_len: usize = module_path.len();
     if (path_len == 0) {
         ret err[str, str]("empty module path");
     }
 
-    # check for std.* prefix
-    if (path_len >= 4 && module_path[0] == 115 && module_path[1] == 116 &&
-        module_path[2] == 100 && module_path[3] == 46) {
-        # "std." prefix (s=115, t=116, d=100, .=46)
-        # convert to dep/mach-std/src/rest.mach
-        val rest_start: usize = 4;
-        val rest_len: usize = path_len - rest_start;
-
-        # calculate output path length: dep/mach-std/src/ + rest + .mach + null
-        # rest has dots replaced with /
-        val prefix: str = "dep/mach-std/src/";
-        val prefix_len: usize = prefix.len();
-        val suffix: str = ".mach";
-        val suffix_len: usize = suffix.len();
-
-        val out_len: usize = prefix_len + rest_len + suffix_len;
-        val alloc_res: Result[*u8, allocator.AllocError] = sema.alloc.alloc[u8](out_len + 1);
-        if (alloc_res.is_err()) {
-            ret err[str, str]("allocation failed");
+    # 1) std.* => dep_root/mach-std/src
+    if (path_len >= 4 && module_path[0] == 115 && module_path[1] == 116 && module_path[2] == 100 && module_path[3] == 46) {
+        var base: str = "dep/mach-std/src";
+        if (sema.dep_root != nil) {
+            val total: usize = sema.dep_root.len() + 1 + 9 + 1 + 3; # /mach-std/src
+            val r: Result[*u8, allocator.AllocError] = sema.alloc.alloc[u8](total + 1);
+            if (r.is_err()) { ret err[str, str]("allocation failed"); }
+            val buf: *u8 = r.unwrap_ok();
+            var p: usize = 0;
+            var i: usize = 0;
+            for (i < sema.dep_root.len()) { buf[p] = sema.dep_root[i]; p = p + 1; i = i + 1; }
+            buf[p] = 47; p = p + 1; # '/'
+            # mach-std
+            buf[p] = 109; p = p + 1; buf[p] = 97; p = p + 1; buf[p] = 99; p = p + 1; buf[p] = 104; p = p + 1;
+            buf[p] = 45; p = p + 1; buf[p] = 115; p = p + 1; buf[p] = 116; p = p + 1; buf[p] = 100; p = p + 1;
+            buf[p] = 47; p = p + 1; # '/'
+            buf[p] = 115; p = p + 1; buf[p] = 114; p = p + 1; buf[p] = 99; p = p + 1;
+            buf[p] = 0;
+            base = buf::str;
         }
-
-        val buf: *u8 = alloc_res.unwrap_ok();
-        var pos: usize = 0;
-
-        # copy prefix
-        var i: usize = 0;
-        for (i < prefix_len) {
-            buf[pos] = prefix[i];
-            pos = pos + 1;
-            i = i + 1;
-        }
-
-        # copy rest, replacing dots with /
-        i = rest_start;
-        for (i < path_len) {
-            if (module_path[i] == 46) {
-                buf[pos] = 47;  # '/'
-            } or {
-                buf[pos] = module_path[i];
-            }
-            pos = pos + 1;
-            i = i + 1;
-        }
-
-        # copy suffix
-        i = 0;
-        for (i < suffix_len) {
-            buf[pos] = suffix[i];
-            pos = pos + 1;
-            i = i + 1;
-        }
-
-        buf[pos] = 0;
-        ret ok[str, str](buf::str);
+        ret build_module_path(sema, base, module_path, 4);
     }
 
-    # check for mach.* prefix (project code)
-    if (path_len >= 5 && module_path[0] == 109 && module_path[1] == 97 &&
-        module_path[2] == 99 && module_path[3] == 104 && module_path[4] == 46) {
-        # "mach." prefix (m=109, a=97, c=99, h=104, .=46)
-        # convert to src/rest.mach
-        val rest_start: usize = 5;
-        val rest_len: usize = path_len - rest_start;
-
-        val prefix: str = "src/";
-        val prefix_len: usize = prefix.len();
-        val suffix: str = ".mach";
-        val suffix_len: usize = suffix.len();
-
-        val out_len: usize = prefix_len + rest_len + suffix_len;
-        val alloc_res: Result[*u8, allocator.AllocError] = sema.alloc.alloc[u8](out_len + 1);
-        if (alloc_res.is_err()) {
-            ret err[str, str]("allocation failed");
-        }
-
-        val buf: *u8 = alloc_res.unwrap_ok();
-        var pos: usize = 0;
-
-        # copy prefix
-        var i: usize = 0;
-        for (i < prefix_len) {
-            buf[pos] = prefix[i];
-            pos = pos + 1;
-            i = i + 1;
-        }
-
-        # copy rest, replacing dots with /
-        i = rest_start;
-        for (i < path_len) {
-            if (module_path[i] == 46) {
-                buf[pos] = 47;  # '/'
-            } or {
-                buf[pos] = module_path[i];
+    # 2) project_id.* => src_root
+    if (sema.project_id != nil) {
+        # build prefix = project_id + "."
+        val prefix_len: usize = sema.project_id.len() + 1;
+        if (path_len >= prefix_len) {
+            var matches: bool = true;
+            var i: usize = 0;
+            for (i < sema.project_id.len()) {
+                if (module_path[i] != sema.project_id[i]) { matches = false; brk; }
+                i = i + 1;
             }
-            pos = pos + 1;
-            i = i + 1;
+            if (matches && module_path[sema.project_id.len()] == 46) {
+                val base2: str = (sema.src_root != nil) ? sema.src_root : "src";
+                ret build_module_path(sema, base2, module_path, prefix_len);
+            }
         }
+    }
 
-        # copy suffix
-        i = 0;
-        for (i < suffix_len) {
-            buf[pos] = suffix[i];
-            pos = pos + 1;
-            i = i + 1;
+    # 3) deps: <alias>.* => dep_root/<alias>/src
+    if (sema.deps != nil && sema.dep_count > 0) {
+        var d: i32 = 0;
+        for (d < sema.dep_count) {
+            val dep: *config.Dep = ?sema.deps[d];
+            if (dep != nil && dep.name != nil) {
+                val prefix_len: usize = dep.name.len() + 1;
+                if (path_len >= prefix_len) {
+                    var matches: bool = true;
+                    var i2: usize = 0;
+                    for (i2 < dep.name.len()) {
+                        if (module_path[i2] != dep.name[i2]) { matches = false; brk; }
+                        i2 = i2 + 1;
+                    }
+                    if (matches && module_path[dep.name.len()] == 46) {
+                        var dep_base: str = "dep";
+                        if (sema.dep_root != nil) {
+                            dep_base = sema.dep_root;
+                        }
+                        # build base: dep_root/<alias>/src
+                        val total: usize = dep_base.len() + 1 + dep.name.len() + 4;
+                        val r: Result[*u8, allocator.AllocError] = sema.alloc.alloc[u8](total + 1);
+                        if (r.is_err()) { ret err[str, str]("allocation failed"); }
+                        val buf: *u8 = r.unwrap_ok();
+                        var p: usize = 0;
+                        var j: usize = 0;
+                        for (j < dep_base.len()) { buf[p] = dep_base[j]; p = p + 1; j = j + 1; }
+                        buf[p] = 47; p = p + 1;
+                        j = 0;
+                        for (j < dep.name.len()) { buf[p] = dep.name[j]; p = p + 1; j = j + 1; }
+                        # append /src
+                        buf[p] = 47; p = p + 1; buf[p] = 115; p = p + 1; buf[p] = 114; p = p + 1; buf[p] = 99; p = p + 1;
+                        buf[p] = 0;
+                        val base3: str = buf::str;
+                        ret build_module_path(sema, base3, module_path, prefix_len);
+                    }
+                }
+            }
+            d = d + 1;
         }
+    }
 
-        buf[pos] = 0;
-        ret ok[str, str](buf::str);
+    # 4) fallback for mach.* => src
+    if (path_len >= 5 && module_path[0] == 109 && module_path[1] == 97 && module_path[2] == 99 && module_path[3] == 104 && module_path[4] == 46) {
+        var base4: str = "src";
+        if (sema.src_root != nil) {
+            base4 = sema.src_root;
+        }
+        ret build_module_path(sema, base4, module_path, 5);
     }
 
     ret err[str, str]("unknown module prefix");
