@@ -427,8 +427,8 @@ int cmd_build_handle(int argc, char **argv)
     }
 
     // lower all imported modules
-    SemaLoadedModule loaded[64];
-    int              loaded_count = sema_get_loaded_modules(sema, loaded, 64);
+    SemaLoadedModule loaded[256];
+    int              loaded_count = sema_get_loaded_modules(sema, loaded, 256);
     for (int i = 0; i < loaded_count; i++)
     {
         Masm *imported_masm = masm_lower_module(loaded[i].ast, loaded[i].table);

@@ -1,0 +1,1929 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use print:     std.print;
+
+use ir:      mach.compiler.masm.ir;
+use section: mach.compiler.masm.section;
+use masm:    mach.compiler.masm.masm;
+use x86:     mach.compiler.masm.isa.x86_64;
+use operand: mach.compiler.masm.operand;
+use spec:    mach.compiler.masm.isa.spec;
+use sym:     mach.compiler.masm.symbol;
+use abi:     mach.compiler.masm.abi.sysv64;
+
+# mach.compiler.masm.isel: instruction selection.
+# ---
+# converts IR instructions to x86_64 machine code bytes in sections.
+
+# virtual register threshold - registers >= this are virtual
+pub val VREG_START: i32 = 1024;
+
+# ISelContext: context for instruction selection.
+# ---
+# alloc:            allocator for memory allocation
+# text:             text section to emit to
+# vreg_offsets:     map vreg_id -> stack offset (rbp - offset)
+# vreg_cap:         capacity of vreg_offsets array
+# max_vreg_index:   highest vreg index seen in current function
+# base_stack_size:  stack size from STACK_FRAME instruction
+# total_stack_size: total stack size including vregs
+# ptr_size:         pointer size (8 for x86_64)
+pub rec ISelContext {
+    alloc:            *allocator.Allocator;
+    text:             *section.Section;
+    vreg_offsets:     *i32;
+    vreg_cap:         usize;
+    max_vreg_index:   usize;
+    base_stack_size:  usize;
+    total_stack_size: usize;
+    ptr_size:         usize;
+    m:                *masm.Masm;
+}
+
+# init: create a new instruction selection context.
+# ---
+# alloc: allocator to use
+# text:  text section to emit to
+# m:     masm context
+# ret:   initialized ISelContext
+pub fun init(alloc: *allocator.Allocator, text: *section.Section, m: *masm.Masm) ISelContext {
+    var ctx: ISelContext;
+    ctx.alloc = alloc;
+    ctx.text = text;
+    ctx.vreg_offsets = nil;
+    ctx.vreg_cap = 0;
+    ctx.max_vreg_index = 0;
+    ctx.base_stack_size = 0;
+    ctx.total_stack_size = 0;
+    ctx.ptr_size = 8;
+    ctx.m = m;
+    ret ctx;
+}
+
+# reset: reset context for a new function.
+# ---
+# ctx: context to reset
+pub fun reset(ctx: *ISelContext) {
+    if (ctx == nil) {
+        ret;
+    }
+    # don't free vreg_offsets - reuse the buffer
+    # just zero out the values
+    if (ctx.vreg_offsets != nil) {
+        var i: usize = 0;
+        for (i < ctx.vreg_cap) {
+            ctx.vreg_offsets[i] = 0;
+            i = i + 1;
+        }
+    }
+    ctx.max_vreg_index = 0;
+    ctx.base_stack_size = 0;
+    ctx.total_stack_size = 0;
+}
+
+# get_vreg_offset: get or assign stack offset for a virtual register.
+# ---
+# ctx:     isel context
+# vreg_id: virtual register id
+# ret:     stack offset from rbp (positive value, used as rbp - offset)
+pub fun get_vreg_offset(ctx: *ISelContext, vreg_id: i32) i32 {
+    if (ctx == nil) {
+        ret 0;
+    }
+    if (vreg_id < VREG_START) {
+        ret 0;
+    }
+
+    val idx: usize = (vreg_id - VREG_START)::usize;
+
+    # grow array if needed
+    if (idx >= ctx.vreg_cap) {
+        var new_cap: usize = (idx + 1) * 2;
+        if (new_cap < 64) {
+            new_cap = 64;
+        }
+
+        val r: Result[*i32, allocator.AllocError] = ctx.alloc.resize[i32](
+            ctx.vreg_offsets, ctx.vreg_cap, new_cap
+        );
+        if (r.is_err()) {
+            ret 0;
+        }
+
+        val new_buf: *i32 = r.unwrap_ok();
+        # zero new slots
+        var i: usize = ctx.vreg_cap;
+        for (i < new_cap) {
+            new_buf[i] = 0;
+            i = i + 1;
+        }
+        ctx.vreg_offsets = new_buf;
+        ctx.vreg_cap = new_cap;
+    }
+
+    # assign offset if not yet assigned
+    if (ctx.vreg_offsets[idx] == 0) {
+        ctx.vreg_offsets[idx] = (ctx.base_stack_size + (idx + 1) * 8)::i32;
+    }
+
+    ret ctx.vreg_offsets[idx];
+}
+
+# scan_function: pre-scan function to find max vreg and compute stack size.
+# ---
+# ctx:  isel context
+# func: IR function to scan
+pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
+    if (ctx == nil || func == nil) {
+        ret;
+    }
+
+    ctx.max_vreg_index = 0;
+    var found: bool = false;
+
+    # scan all blocks
+    var bi: i32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.IRBlock = func.blocks[bi];
+        if (block == nil) {
+            bi = bi + 1;
+            cnt;
+        }
+
+        # scan all instructions
+        var ii: i32 = 0;
+        for (ii < block.instr_count) {
+            val instr: *ir.IRInstr = ?block.instrs[ii];
+
+            # check dst
+            if (instr.dst.kind.tag == ir.VAL_REG && instr.dst.reg >= VREG_START) {
+                val idx: usize = (instr.dst.reg - VREG_START)::usize;
+                var slots: usize = 1;
+                if (instr.dst.size > 8) {
+                    slots = ((instr.dst.size + 7) / 8)::usize;
+                }
+                val last_idx: usize = idx + (slots - 1);
+                if (!found || last_idx > ctx.max_vreg_index) {
+                    ctx.max_vreg_index = last_idx;
+                    found = true;
+                }
+            }
+
+            # check src1
+            if (instr.src1.kind.tag == ir.VAL_REG && instr.src1.reg >= VREG_START) {
+                val idx: usize = (instr.src1.reg - VREG_START)::usize;
+                var slots: usize = 1;
+                if (instr.src1.size > 8) {
+                    slots = ((instr.src1.size + 7) / 8)::usize;
+                }
+                val last_idx: usize = idx + (slots - 1);
+                if (!found || last_idx > ctx.max_vreg_index) {
+                    ctx.max_vreg_index = last_idx;
+                    found = true;
+                }
+            }
+
+            # check src2
+            if (instr.src2.kind.tag == ir.VAL_REG && instr.src2.reg >= VREG_START) {
+                val idx: usize = (instr.src2.reg - VREG_START)::usize;
+                var slots: usize = 1;
+                if (instr.src2.size > 8) {
+                    slots = ((instr.src2.size + 7) / 8)::usize;
+                }
+                val last_idx: usize = idx + (slots - 1);
+                if (!found || last_idx > ctx.max_vreg_index) {
+                    ctx.max_vreg_index = last_idx;
+                    found = true;
+                }
+            }
+
+            # check memory operands
+            if (instr.dst.kind.tag == ir.VAL_MEM && instr.dst.base_reg >= VREG_START) {
+                val idx: usize = (instr.dst.base_reg - VREG_START)::usize;
+                if (!found || idx > ctx.max_vreg_index) {
+                    ctx.max_vreg_index = idx;
+                    found = true;
+                }
+            }
+            if (instr.dst.kind.tag == ir.VAL_MEM && instr.dst.index_reg >= VREG_START) {
+                val idx: usize = (instr.dst.index_reg - VREG_START)::usize;
+                if (!found || idx > ctx.max_vreg_index) {
+                    ctx.max_vreg_index = idx;
+                    found = true;
+                }
+            }
+            if (instr.src1.kind.tag == ir.VAL_MEM && instr.src1.base_reg >= VREG_START) {
+                val idx: usize = (instr.src1.base_reg - VREG_START)::usize;
+                if (!found || idx > ctx.max_vreg_index) {
+                    ctx.max_vreg_index = idx;
+                    found = true;
+                }
+            }
+            if (instr.src1.kind.tag == ir.VAL_MEM && instr.src1.index_reg >= VREG_START) {
+                val idx: usize = (instr.src1.index_reg - VREG_START)::usize;
+                if (!found || idx > ctx.max_vreg_index) {
+                    ctx.max_vreg_index = idx;
+                    found = true;
+                }
+            }
+
+            ii = ii + 1;
+        }
+
+        bi = bi + 1;
+    }
+
+    # calculate total stack size
+    var vreg_space: usize = 0;
+    if (found) {
+        vreg_space = (ctx.max_vreg_index + 1) * 8;
+    }
+    ctx.total_stack_size = ctx.base_stack_size + vreg_space;
+
+    # align to 16 bytes
+    if (ctx.total_stack_size % 16 != 0) {
+        ctx.total_stack_size = ctx.total_stack_size + (16 - (ctx.total_stack_size % 16));
+    }
+}
+
+# load_vreg_to_rax: load a virtual register's value into RAX.
+# ---
+# ctx:     isel context
+# vreg_id: virtual register id
+# size:    operand size
+pub fun load_vreg_to_rax(ctx: *ISelContext, vreg_id: i32, size: usize) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    val off: i32 = get_vreg_offset(ctx, vreg_id);
+
+    # MOV RAX, [RBP - off]
+    # REX.W + 8B /r with ModR/M for [RBP + disp32]
+    section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+    section.emit_byte(ctx.alloc, ctx.text, 139); # 0x8B = MOV r64, r/m64
+    section.emit_byte(ctx.alloc, ctx.text, 133); # ModR/M: mod=10 reg=0(RAX) rm=5(RBP+disp32)
+    # emit displacement as 32-bit signed
+    val disp: i32 = -off;
+    section.emit_byte(ctx.alloc, ctx.text, (disp & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((disp >> 8) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((disp >> 16) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((disp >> 24) & 255)::u8);
+}
+
+# store_rax_to_vreg: store RAX value to a virtual register's stack slot.
+# ---
+# ctx:     isel context
+# vreg_id: virtual register id
+# size:    operand size
+pub fun store_rax_to_vreg(ctx: *ISelContext, vreg_id: i32, size: usize) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    val off: i32 = get_vreg_offset(ctx, vreg_id);
+
+    # MOV [RBP - off], RAX
+    # REX.W + 89 /r with ModR/M for [RBP + disp32]
+    section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+    section.emit_byte(ctx.alloc, ctx.text, 137); # 0x89 = MOV r/m64, r64
+    section.emit_byte(ctx.alloc, ctx.text, 133); # ModR/M: mod=10 reg=0(RAX) rm=5(RBP+disp32)
+    # emit displacement as 32-bit signed
+    val disp: i32 = -off;
+    section.emit_byte(ctx.alloc, ctx.text, (disp & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((disp >> 8) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((disp >> 16) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((disp >> 24) & 255)::u8);
+}
+
+# load_vreg_to_rcx: load a virtual register's value into RCX.
+# ---
+# ctx:     isel context
+# vreg_id: virtual register id
+# size:    operand size
+pub fun load_vreg_to_rcx(ctx: *ISelContext, vreg_id: i32, size: usize) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    val off: i32 = get_vreg_offset(ctx, vreg_id);
+
+    # MOV RCX, [RBP - off]
+    section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+    section.emit_byte(ctx.alloc, ctx.text, 139); # 0x8B = MOV r64, r/m64
+    section.emit_byte(ctx.alloc, ctx.text, 141); # ModR/M: mod=10 reg=1(RCX) rm=5(RBP+disp32)
+    val disp: i32 = -off;
+    section.emit_byte(ctx.alloc, ctx.text, (disp & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((disp >> 8) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((disp >> 16) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((disp >> 24) & 255)::u8);
+}
+
+# emit_push_rbp: emit PUSH RBP.
+# ---
+# ctx: isel context
+pub fun emit_push_rbp(ctx: *ISelContext) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    # PUSH RBP = 0x55
+    section.emit_byte(ctx.alloc, ctx.text, 85);
+}
+
+# emit_mov_rbp_rsp: emit MOV RBP, RSP.
+# ---
+# ctx: isel context
+pub fun emit_mov_rbp_rsp(ctx: *ISelContext) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    # MOV RBP, RSP = 48 89 E5
+    section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+    section.emit_byte(ctx.alloc, ctx.text, 137); # MOV r/m64, r64
+    section.emit_byte(ctx.alloc, ctx.text, 229); # ModR/M: mod=11 reg=4(RSP) rm=5(RBP)
+}
+
+# emit_sub_rsp_imm: emit SUB RSP, imm32.
+# ---
+# ctx:  isel context
+# size: stack size to subtract
+pub fun emit_sub_rsp_imm(ctx: *ISelContext, size: usize) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    if (size == 0) {
+        ret;
+    }
+
+    # SUB RSP, imm32 = 48 81 EC imm32
+    section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+    section.emit_byte(ctx.alloc, ctx.text, 129); # 0x81 = arithmetic imm32
+    section.emit_byte(ctx.alloc, ctx.text, 236); # ModR/M: mod=11 reg=5(SUB) rm=4(RSP)
+    val imm: i32 = size::i32;
+    section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+}
+
+# emit_add_rsp_imm: emit ADD RSP, imm32.
+# ---
+# ctx:  isel context
+# size: stack size to add
+pub fun emit_add_rsp_imm(ctx: *ISelContext, size: usize) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    if (size == 0) {
+        ret;
+    }
+
+    # ADD RSP, imm32 = 48 81 C4 imm32
+    section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+    section.emit_byte(ctx.alloc, ctx.text, 129); # 0x81 = arithmetic imm32
+    section.emit_byte(ctx.alloc, ctx.text, 196); # ModR/M: mod=11 reg=0(ADD) rm=4(RSP)
+    val imm: i32 = size::i32;
+    section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+}
+
+# emit_pop_rbp: emit POP RBP.
+# ---
+# ctx: isel context
+pub fun emit_pop_rbp(ctx: *ISelContext) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    # POP RBP = 0x5D
+    section.emit_byte(ctx.alloc, ctx.text, 93);
+}
+
+# emit_ret: emit RET.
+# ---
+# ctx: isel context
+pub fun emit_ret(ctx: *ISelContext) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    # RET = 0xC3
+    section.emit_byte(ctx.alloc, ctx.text, 195);
+}
+
+# emit_mov_rax_imm64: emit MOV RAX, imm64.
+# ---
+# ctx: isel context
+# imm: immediate value
+pub fun emit_mov_rax_imm64(ctx: *ISelContext, imm: i64) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    # MOV RAX, imm64 = 48 B8 imm64
+    section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+    section.emit_byte(ctx.alloc, ctx.text, 184); # 0xB8 + 0 = MOV RAX, imm64
+    section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 32) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 40) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 48) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 56) & 255)::u8);
+}
+
+# emit_mov_rax_imm32: emit MOV EAX, imm32 (zero-extends to RAX).
+# ---
+# ctx: isel context
+# imm: immediate value
+pub fun emit_mov_rax_imm32(ctx: *ISelContext, imm: i32) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+
+    # MOV EAX, imm32 = B8 imm32 (no REX needed, zero-extends)
+    section.emit_byte(ctx.alloc, ctx.text, 184); # 0xB8 = MOV EAX, imm32
+    section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+    section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+}
+
+# emit_syscall: emit SYSCALL instruction.
+# ---
+# ctx: isel context
+pub fun emit_syscall(ctx: *ISelContext) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    # SYSCALL = 0F 05
+    section.emit_byte(ctx.alloc, ctx.text, 15);
+    section.emit_byte(ctx.alloc, ctx.text, 5);
+}
+
+# emit_call_rel32: emit CALL rel32 with relocation.
+# ---
+# ctx:    isel context
+# target: target label name
+pub fun emit_call_rel32(ctx: *ISelContext, target: str) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil || target == nil) {
+        ret;
+    }
+
+    # CALL rel32 = E8 rel32
+    section.emit_byte(ctx.alloc, ctx.text, 232);
+
+    # add relocation for the 32-bit displacement
+    val reloc_offset: usize = ctx.text.size;
+    section.add_relocation(ctx.alloc, ctx.text, reloc_offset, target, 2, -4); # R_X86_64_PC32, addend -4
+
+    # emit placeholder for rel32
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+}
+
+# emit_jmp_rel32: emit JMP rel32 with relocation.
+# ---
+# ctx:    isel context
+# target: target label name
+pub fun emit_jmp_rel32(ctx: *ISelContext, target: str) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil || target == nil) {
+        ret;
+    }
+
+    # JMP rel32 = E9 rel32
+    section.emit_byte(ctx.alloc, ctx.text, 233);
+
+    val reloc_offset: usize = ctx.text.size;
+    section.add_relocation(ctx.alloc, ctx.text, reloc_offset, target, 2, -4);
+
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+}
+
+# emit_jcc_rel32: emit conditional jump with relocation.
+# ---
+# ctx:       isel context
+# cc_opcode: second byte of 0F xx (e.g., 0x84 for JE)
+# target:    target label name
+pub fun emit_jcc_rel32(ctx: *ISelContext, cc_opcode: u8, target: str) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil || target == nil) {
+        ret;
+    }
+
+    # Jcc rel32 = 0F xx rel32
+    section.emit_byte(ctx.alloc, ctx.text, 15);
+    section.emit_byte(ctx.alloc, ctx.text, cc_opcode);
+
+    val reloc_offset: usize = ctx.text.size;
+    section.add_relocation(ctx.alloc, ctx.text, reloc_offset, target, 2, -4);
+
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+    section.emit_byte(ctx.alloc, ctx.text, 0);
+}
+
+# emit_nop: emit NOP instruction.
+# ---
+# ctx: isel context
+pub fun emit_nop(ctx: *ISelContext) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    # NOP = 0x90
+    section.emit_byte(ctx.alloc, ctx.text, 144);
+}
+
+# select_mov: handle MOV instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_mov(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val src: ir.IRValue = instr.src1;
+
+    # handle immediate source
+    if (src.kind.tag == ir.VAL_IMM) {
+        # MOV dst, imm
+        emit_mov_rax_imm64(ctx, src.imm);
+        if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+            store_rax_to_vreg(ctx, dst.reg, dst.size);
+        }
+        # else: result stays in RAX (for physical register destination like RAX)
+        ret;
+    }
+
+    # handle register source
+    if (src.kind.tag == ir.VAL_REG) {
+        if (src.reg >= VREG_START) {
+            # load vreg to RAX
+            load_vreg_to_rax(ctx, src.reg, src.size);
+        } or {
+            # physical register source - if not RAX, move to RAX
+            if (src.reg != 0) {  # 0 = RAX
+                # MOV RAX, src_reg - emit based on which register
+                # For simplicity, handle common cases
+                emit_mov_reg_to_rax(ctx, src.reg);
+            }
+        }
+
+        if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+            store_rax_to_vreg(ctx, dst.reg, dst.size);
+        } or (dst.kind.tag == ir.VAL_REG && dst.reg < VREG_START) {
+            # physical register destination
+            if (dst.reg != 0) {  # not RAX
+                emit_mov_rax_to_reg(ctx, dst.reg);
+            }
+            # else: already in RAX, nothing to do
+        }
+    }
+}
+
+# emit_mov_reg_to_rax: move a physical register to RAX.
+# ---
+# ctx: isel context
+# reg: source register id
+pub fun emit_mov_reg_to_rax(ctx: *ISelContext, reg: i32) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    # MOV RAX, reg = 48 89 xx (where xx encodes the source reg)
+    # ModR/M for MOV r64, r/m64: mod=11 reg=src rm=0(RAX)
+    section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+    section.emit_byte(ctx.alloc, ctx.text, 137); # 0x89 = MOV r/m64, r64
+    # ModR/M: mod=11 reg=reg rm=0(RAX)
+    val modrm: u8 = (192 + (reg::u8 << 3))::u8;  # 11 000 rrr -> C0 + (reg<<3)
+    section.emit_byte(ctx.alloc, ctx.text, modrm);
+}
+
+# emit_mov_rax_to_reg: move RAX to a physical register.
+# ---
+# ctx: isel context
+# reg: destination register id
+pub fun emit_mov_rax_to_reg(ctx: *ISelContext, reg: i32) {
+    if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
+        ret;
+    }
+    # MOV reg, RAX = 48 89 C0+reg (actually 48 89 xx where xx has RAX as source)
+    # Actually: MOV r64, r64 uses 0x8B for dst, r/m or 0x89 for r/m, r
+    # Let's use: REX.W + 89 /r with ModR/M: mod=11 reg=0(RAX) rm=dst
+    section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+    section.emit_byte(ctx.alloc, ctx.text, 137); # 0x89 = MOV r/m64, r64
+    # ModR/M: mod=11 reg=0(RAX) rm=dst_reg
+    val modrm: u8 = (192 + reg::u8)::u8;  # 11 000 rrr -> C0 + reg
+    section.emit_byte(ctx.alloc, ctx.text, modrm);
+}
+
+# select_load: handle LOAD instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_load(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val src: ir.IRValue = instr.src1;
+
+    # handle memory source
+    if (src.kind.tag == ir.VAL_MEM) {
+        # if base is vreg, load base address first
+        if (src.base_reg >= VREG_START) {
+            load_vreg_to_rax(ctx, src.base_reg, 8);
+            # now RAX has the base address
+            # load from [RAX + offset]
+            # MOV RAX, [RAX + offset]
+            section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+            section.emit_byte(ctx.alloc, ctx.text, 139); # MOV r64, r/m64
+            if (src.offset == 0) {
+                section.emit_byte(ctx.alloc, ctx.text, 0); # ModR/M: mod=00 reg=0(RAX) rm=0(RAX)
+            } or (src.offset >= -128 && src.offset <= 127) {
+                section.emit_byte(ctx.alloc, ctx.text, 64); # ModR/M: mod=01 reg=0(RAX) rm=0(RAX)
+                section.emit_byte(ctx.alloc, ctx.text, src.offset::u8);
+            } or {
+                section.emit_byte(ctx.alloc, ctx.text, 128); # ModR/M: mod=10 reg=0(RAX) rm=0(RAX)
+                val off32: i32 = src.offset::i32;
+                section.emit_byte(ctx.alloc, ctx.text, (off32 & 255)::u8);
+                section.emit_byte(ctx.alloc, ctx.text, ((off32 >> 8) & 255)::u8);
+                section.emit_byte(ctx.alloc, ctx.text, ((off32 >> 16) & 255)::u8);
+                section.emit_byte(ctx.alloc, ctx.text, ((off32 >> 24) & 255)::u8);
+            }
+        }
+    }
+
+    # store result
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_store: handle STORE instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_store(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val addr: ir.IRValue = instr.dst;   # destination address
+    val value: ir.IRValue = instr.src1; # value to store
+
+    # load value into RAX
+    if (value.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, value.imm);
+    } or (value.kind.tag == ir.VAL_REG && value.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, value.reg, value.size);
+    }
+
+    # load address into RCX
+    if (addr.kind.tag == ir.VAL_REG && addr.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, addr.reg, 8);
+        # MOV [RCX], RAX
+        section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+        section.emit_byte(ctx.alloc, ctx.text, 137); # MOV r/m64, r64
+        section.emit_byte(ctx.alloc, ctx.text, 1);   # ModR/M: mod=00 reg=0(RAX) rm=1(RCX)
+    } or (addr.kind.tag == ir.VAL_MEM) {
+        if (addr.base_reg >= VREG_START) {
+            load_vreg_to_rcx(ctx, addr.base_reg, 8);
+            # MOV [RCX + offset], RAX
+            section.emit_byte(ctx.alloc, ctx.text, 72);
+            section.emit_byte(ctx.alloc, ctx.text, 137);
+            if (addr.offset == 0) {
+                section.emit_byte(ctx.alloc, ctx.text, 1); # ModR/M: [RCX]
+            } or (addr.offset >= -128 && addr.offset <= 127) {
+                section.emit_byte(ctx.alloc, ctx.text, 65); # ModR/M: [RCX + disp8]
+                section.emit_byte(ctx.alloc, ctx.text, addr.offset::u8);
+            } or {
+                section.emit_byte(ctx.alloc, ctx.text, 129); # ModR/M: [RCX + disp32]
+                val off32: i32 = addr.offset::i32;
+                section.emit_byte(ctx.alloc, ctx.text, (off32 & 255)::u8);
+                section.emit_byte(ctx.alloc, ctx.text, ((off32 >> 8) & 255)::u8);
+                section.emit_byte(ctx.alloc, ctx.text, ((off32 >> 16) & 255)::u8);
+                section.emit_byte(ctx.alloc, ctx.text, ((off32 >> 24) & 255)::u8);
+            }
+        }
+    }
+}
+
+# select_add: handle ADD instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_add(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    # load lhs into RAX
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    # add rhs
+    if (rhs.kind.tag == ir.VAL_IMM) {
+        # ADD RAX, imm32 = 48 05 imm32 (or 48 81 C0 imm32)
+        section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+        section.emit_byte(ctx.alloc, ctx.text, 5);   # ADD RAX, imm32
+        val imm: i32 = rhs.imm::i32;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+    } or (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        # load rhs into RCX
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        # ADD RAX, RCX = 48 01 C8
+        section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+        section.emit_byte(ctx.alloc, ctx.text, 1);   # ADD r/m64, r64
+        section.emit_byte(ctx.alloc, ctx.text, 200); # ModR/M: mod=11 reg=1(RCX) rm=0(RAX)
+    }
+
+    # store result
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_sub: handle SUB instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_sub(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    # load lhs into RAX
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    # sub rhs
+    if (rhs.kind.tag == ir.VAL_IMM) {
+        # SUB RAX, imm32 = 48 2D imm32
+        section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+        section.emit_byte(ctx.alloc, ctx.text, 45);  # SUB RAX, imm32
+        val imm: i32 = rhs.imm::i32;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+    } or (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        # SUB RAX, RCX = 48 29 C8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 41);  # SUB r/m64, r64
+        section.emit_byte(ctx.alloc, ctx.text, 200); # ModR/M
+    }
+
+    # store result
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_lea: handle LEA instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_lea(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val src: ir.IRValue = instr.src1;
+
+    # LEA loads an address, not the value at that address
+    if (src.kind.tag == ir.VAL_MEM) {
+        if (src.base_reg >= VREG_START) {
+            # load base into RAX
+            load_vreg_to_rax(ctx, src.base_reg, 8);
+            # add offset if any
+            if (src.offset != 0) {
+                # ADD RAX, imm32
+                section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+                section.emit_byte(ctx.alloc, ctx.text, 5);   # ADD RAX, imm32
+                val imm: i32 = src.offset::i32;
+                section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+                section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+                section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+                section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+            }
+        }
+    }
+
+    # store result
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_mul: handle MUL instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_mul(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    # load lhs into RAX
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    # IMUL RAX, RCX = 48 0F AF C1
+    if (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+        section.emit_byte(ctx.alloc, ctx.text, 15);  # 0F
+        section.emit_byte(ctx.alloc, ctx.text, 175); # AF = IMUL r64, r/m64
+        section.emit_byte(ctx.alloc, ctx.text, 193); # ModR/M: mod=11 reg=0(RAX) rm=1(RCX)
+    } or (rhs.kind.tag == ir.VAL_IMM) {
+        # IMUL RAX, RAX, imm32 = 48 69 C0 imm32
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 105); # 69 = IMUL r64, r/m64, imm32
+        section.emit_byte(ctx.alloc, ctx.text, 192); # ModR/M: mod=11 reg=0(RAX) rm=0(RAX)
+        val imm: i32 = rhs.imm::i32;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+    }
+
+    # store result
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_div: handle DIV instruction (signed).
+# ---
+# ctx:    isel context
+# instr:  IR instruction
+# signed: true for IDIV, false for DIV
+pub fun select_div(ctx: *ISelContext, instr: *ir.IRInstr, signed: bool) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    # load dividend into RAX
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    # sign-extend RAX into RDX:RAX with CQO
+    # CQO = 48 99
+    section.emit_byte(ctx.alloc, ctx.text, 72);
+    section.emit_byte(ctx.alloc, ctx.text, 153);
+
+    # load divisor into RCX
+    if (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+    } or (rhs.kind.tag == ir.VAL_IMM) {
+        # MOV RCX, imm64
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 185); # B9 = MOV RCX, imm64
+        val imm: i64 = rhs.imm;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 32) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 40) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 48) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 56) & 255)::u8);
+    }
+
+    # IDIV RCX = 48 F7 F9 (signed) or DIV RCX = 48 F7 F1 (unsigned)
+    section.emit_byte(ctx.alloc, ctx.text, 72);
+    section.emit_byte(ctx.alloc, ctx.text, 247);
+    if (signed) {
+        section.emit_byte(ctx.alloc, ctx.text, 249); # /7 = IDIV
+    } or {
+        section.emit_byte(ctx.alloc, ctx.text, 241); # /6 = DIV
+    }
+
+    # quotient is in RAX
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_mod: handle MOD instruction.
+# ---
+# ctx:    isel context
+# instr:  IR instruction
+# signed: true for signed mod
+pub fun select_mod(ctx: *ISelContext, instr: *ir.IRInstr, signed: bool) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    # load dividend into RAX
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    # CQO
+    section.emit_byte(ctx.alloc, ctx.text, 72);
+    section.emit_byte(ctx.alloc, ctx.text, 153);
+
+    # load divisor into RCX
+    if (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+    } or (rhs.kind.tag == ir.VAL_IMM) {
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 185);
+        val imm: i64 = rhs.imm;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 32) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 40) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 48) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 56) & 255)::u8);
+    }
+
+    # IDIV/DIV RCX
+    section.emit_byte(ctx.alloc, ctx.text, 72);
+    section.emit_byte(ctx.alloc, ctx.text, 247);
+    if (signed) {
+        section.emit_byte(ctx.alloc, ctx.text, 249);
+    } or {
+        section.emit_byte(ctx.alloc, ctx.text, 241);
+    }
+
+    # remainder is in RDX - move to RAX
+    # MOV RAX, RDX = 48 89 D0
+    section.emit_byte(ctx.alloc, ctx.text, 72);
+    section.emit_byte(ctx.alloc, ctx.text, 137);
+    section.emit_byte(ctx.alloc, ctx.text, 208);
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_neg: handle NEG instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_neg(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val src: ir.IRValue = instr.src1;
+
+    if (src.kind.tag == ir.VAL_REG && src.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, src.reg, src.size);
+    } or (src.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, src.imm);
+    }
+
+    # NEG RAX = 48 F7 D8
+    section.emit_byte(ctx.alloc, ctx.text, 72);
+    section.emit_byte(ctx.alloc, ctx.text, 247);
+    section.emit_byte(ctx.alloc, ctx.text, 216);
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_and: handle AND instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_and(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    if (rhs.kind.tag == ir.VAL_IMM) {
+        # AND RAX, imm32 = 48 25 imm32
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 37);
+        val imm: i32 = rhs.imm::i32;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+    } or (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        # AND RAX, RCX = 48 21 C8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 33);
+        section.emit_byte(ctx.alloc, ctx.text, 200);
+    }
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_or: handle OR instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_or(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    if (rhs.kind.tag == ir.VAL_IMM) {
+        # OR RAX, imm32 = 48 0D imm32
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 13);
+        val imm: i32 = rhs.imm::i32;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+    } or (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        # OR RAX, RCX = 48 09 C8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 9);
+        section.emit_byte(ctx.alloc, ctx.text, 200);
+    }
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_xor: handle XOR instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_xor(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    if (rhs.kind.tag == ir.VAL_IMM) {
+        # XOR RAX, imm32 = 48 35 imm32
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 53);
+        val imm: i32 = rhs.imm::i32;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+    } or (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        # XOR RAX, RCX = 48 31 C8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 49);
+        section.emit_byte(ctx.alloc, ctx.text, 200);
+    }
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_not: handle NOT instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_not(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val src: ir.IRValue = instr.src1;
+
+    if (src.kind.tag == ir.VAL_REG && src.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, src.reg, src.size);
+    } or (src.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, src.imm);
+    }
+
+    # NOT RAX = 48 F7 D0
+    section.emit_byte(ctx.alloc, ctx.text, 72);
+    section.emit_byte(ctx.alloc, ctx.text, 247);
+    section.emit_byte(ctx.alloc, ctx.text, 208);
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_shl: handle SHL instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_shl(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    if (rhs.kind.tag == ir.VAL_IMM) {
+        # SHL RAX, imm8 = 48 C1 E0 imm8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 193);
+        section.emit_byte(ctx.alloc, ctx.text, 224);
+        section.emit_byte(ctx.alloc, ctx.text, (rhs.imm & 63)::u8);
+    } or (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        # shift amount must be in CL
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        # SHL RAX, CL = 48 D3 E0
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 211);
+        section.emit_byte(ctx.alloc, ctx.text, 224);
+    }
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_shr: handle SHR instruction (logical).
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_shr(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    if (rhs.kind.tag == ir.VAL_IMM) {
+        # SHR RAX, imm8 = 48 C1 E8 imm8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 193);
+        section.emit_byte(ctx.alloc, ctx.text, 232);
+        section.emit_byte(ctx.alloc, ctx.text, (rhs.imm & 63)::u8);
+    } or (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        # SHR RAX, CL = 48 D3 E8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 211);
+        section.emit_byte(ctx.alloc, ctx.text, 232);
+    }
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_sar: handle SAR instruction (arithmetic).
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_sar(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    if (rhs.kind.tag == ir.VAL_IMM) {
+        # SAR RAX, imm8 = 48 C1 F8 imm8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 193);
+        section.emit_byte(ctx.alloc, ctx.text, 248);
+        section.emit_byte(ctx.alloc, ctx.text, (rhs.imm & 63)::u8);
+    } or (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        # SAR RAX, CL = 48 D3 F8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 211);
+        section.emit_byte(ctx.alloc, ctx.text, 248);
+    }
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_jmp: handle JMP instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_jmp(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    # target is in dst or src1 as label
+    var target: str = nil;
+    if (instr.dst.kind.tag == ir.VAL_LABEL) {
+        target = instr.dst.label;
+    } or (instr.src1.kind.tag == ir.VAL_LABEL) {
+        target = instr.src1.label;
+    }
+
+    if (target != nil) {
+        emit_jmp_rel32(ctx, target);
+    }
+}
+
+# select_jcc: handle conditional jump instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_jcc(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    # target label
+    var target: str = nil;
+    if (instr.dst.kind.tag == ir.VAL_LABEL) {
+        target = instr.dst.label;
+    }
+
+    if (target == nil) {
+        ret;
+    }
+
+    # condition code is in instr.cond
+    # map condition to x86 Jcc opcode second byte
+    var cc_opcode: u8 = 132; # JE by default
+
+    val cond: i32 = instr.cond;
+    # 0=E, 1=NE, 2=L, 3=LE, 4=G, 5=GE, 6=B, 7=BE, 8=A, 9=AE
+    if (cond == 0) {
+        cc_opcode = 132; # JE = 0F 84
+    } or (cond == 1) {
+        cc_opcode = 133; # JNE = 0F 85
+    } or (cond == 2) {
+        cc_opcode = 140; # JL = 0F 8C
+    } or (cond == 3) {
+        cc_opcode = 142; # JLE = 0F 8E
+    } or (cond == 4) {
+        cc_opcode = 143; # JG = 0F 8F
+    } or (cond == 5) {
+        cc_opcode = 141; # JGE = 0F 8D
+    } or (cond == 6) {
+        cc_opcode = 130; # JB = 0F 82
+    } or (cond == 7) {
+        cc_opcode = 134; # JBE = 0F 86
+    } or (cond == 8) {
+        cc_opcode = 135; # JA = 0F 87
+    } or (cond == 9) {
+        cc_opcode = 131; # JAE = 0F 83
+    }
+
+    emit_jcc_rel32(ctx, cc_opcode, target);
+}
+
+# select_call: handle CALL instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_call(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    # target is typically a label
+    var target: str = nil;
+    if (instr.src1.kind.tag == ir.VAL_LABEL) {
+        target = instr.src1.label;
+    } or (instr.dst.kind.tag == ir.VAL_LABEL) {
+        target = instr.dst.label;
+    }
+
+    if (target != nil) {
+        emit_call_rel32(ctx, target);
+    } or {
+        # indirect call through register
+        if (instr.src1.kind.tag == ir.VAL_REG && instr.src1.reg >= VREG_START) {
+            load_vreg_to_rax(ctx, instr.src1.reg, 8);
+            # CALL RAX = FF D0
+            section.emit_byte(ctx.alloc, ctx.text, 255);
+            section.emit_byte(ctx.alloc, ctx.text, 208);
+        }
+    }
+}
+
+# select_push: handle PUSH instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_push(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val src: ir.IRValue = instr.src1;
+
+    if (src.kind.tag == ir.VAL_REG && src.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, src.reg, 8);
+        # PUSH RAX = 50
+        section.emit_byte(ctx.alloc, ctx.text, 80);
+    } or (src.kind.tag == ir.VAL_IMM) {
+        # PUSH imm32 = 68 imm32
+        section.emit_byte(ctx.alloc, ctx.text, 104);
+        val imm: i32 = src.imm::i32;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+    }
+}
+
+# select_pop: handle POP instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_pop(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+
+    # POP RAX = 58
+    section.emit_byte(ctx.alloc, ctx.text, 88);
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_setcc: handle SETcc instruction.
+# ---
+# ctx:      isel context
+# instr:    IR instruction
+# cc_opcode: second byte of 0F xx (e.g., 0x94 for SETE)
+pub fun select_setcc(ctx: *ISelContext, instr: *ir.IRInstr, cc_opcode: u8) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+
+    # SETcc AL = 0F xx C0
+    section.emit_byte(ctx.alloc, ctx.text, 15);
+    section.emit_byte(ctx.alloc, ctx.text, cc_opcode);
+    section.emit_byte(ctx.alloc, ctx.text, 192); # ModR/M: mod=11 reg=0 rm=0(AL)
+
+    # MOVZX RAX, AL = 48 0F B6 C0
+    section.emit_byte(ctx.alloc, ctx.text, 72);
+    section.emit_byte(ctx.alloc, ctx.text, 15);
+    section.emit_byte(ctx.alloc, ctx.text, 182);
+    section.emit_byte(ctx.alloc, ctx.text, 192);
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_zext: handle zero extension.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_zext(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val src: ir.IRValue = instr.src1;
+
+    # load source
+    if (src.kind.tag == ir.VAL_REG && src.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, src.reg, src.size);
+    } or (src.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, src.imm);
+    }
+
+    # mask to source size bits
+    if (src.size == 1) {
+        # AND RAX, 0xFF
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 37);
+        section.emit_byte(ctx.alloc, ctx.text, 255);
+        section.emit_byte(ctx.alloc, ctx.text, 0);
+        section.emit_byte(ctx.alloc, ctx.text, 0);
+        section.emit_byte(ctx.alloc, ctx.text, 0);
+    } or (src.size == 2) {
+        # AND RAX, 0xFFFF
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 37);
+        section.emit_byte(ctx.alloc, ctx.text, 255);
+        section.emit_byte(ctx.alloc, ctx.text, 255);
+        section.emit_byte(ctx.alloc, ctx.text, 0);
+        section.emit_byte(ctx.alloc, ctx.text, 0);
+    } or (src.size == 4) {
+        # MOV EAX, EAX (zero-extends to 64-bit)
+        section.emit_byte(ctx.alloc, ctx.text, 137);
+        section.emit_byte(ctx.alloc, ctx.text, 192);
+    }
+    # 8-byte source needs no masking
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_sext: handle sign extension.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_sext(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val src: ir.IRValue = instr.src1;
+
+    if (src.kind.tag == ir.VAL_REG && src.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, src.reg, src.size);
+    } or (src.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, src.imm);
+    }
+
+    # sign extend based on source size
+    if (src.size == 1) {
+        # MOVSX RAX, AL = 48 0F BE C0
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 15);
+        section.emit_byte(ctx.alloc, ctx.text, 190);
+        section.emit_byte(ctx.alloc, ctx.text, 192);
+    } or (src.size == 2) {
+        # MOVSX RAX, AX = 48 0F BF C0
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 15);
+        section.emit_byte(ctx.alloc, ctx.text, 191);
+        section.emit_byte(ctx.alloc, ctx.text, 192);
+    } or (src.size == 4) {
+        # MOVSXD RAX, EAX = 48 63 C0
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 99);
+        section.emit_byte(ctx.alloc, ctx.text, 192);
+    }
+
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_trunc: handle truncation.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_trunc(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val dst: ir.IRValue = instr.dst;
+    val src: ir.IRValue = instr.src1;
+
+    # load source (truncation is just using the lower bits)
+    if (src.kind.tag == ir.VAL_REG && src.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, src.reg, src.size);
+    } or (src.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, src.imm);
+    }
+
+    # no masking needed - just store to smaller destination
+    if (dst.kind.tag == ir.VAL_REG && dst.reg >= VREG_START) {
+        store_rax_to_vreg(ctx, dst.reg, dst.size);
+    }
+}
+
+# select_cmp: handle CMP instruction.
+# ---
+# ctx:   isel context
+# instr: IR instruction
+pub fun select_cmp(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    val lhs: ir.IRValue = instr.src1;
+    val rhs: ir.IRValue = instr.src2;
+
+    # load lhs into RAX
+    if (lhs.kind.tag == ir.VAL_REG && lhs.reg >= VREG_START) {
+        load_vreg_to_rax(ctx, lhs.reg, lhs.size);
+    } or (lhs.kind.tag == ir.VAL_IMM) {
+        emit_mov_rax_imm64(ctx, lhs.imm);
+    }
+
+    # cmp with rhs
+    if (rhs.kind.tag == ir.VAL_IMM) {
+        # CMP RAX, imm32 = 48 3D imm32
+        section.emit_byte(ctx.alloc, ctx.text, 72);  # REX.W
+        section.emit_byte(ctx.alloc, ctx.text, 61);  # CMP RAX, imm32
+        val imm: i32 = rhs.imm::i32;
+        section.emit_byte(ctx.alloc, ctx.text, (imm & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 8) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 16) & 255)::u8);
+        section.emit_byte(ctx.alloc, ctx.text, ((imm >> 24) & 255)::u8);
+    } or (rhs.kind.tag == ir.VAL_REG && rhs.reg >= VREG_START) {
+        load_vreg_to_rcx(ctx, rhs.reg, rhs.size);
+        # CMP RAX, RCX = 48 39 C8
+        section.emit_byte(ctx.alloc, ctx.text, 72);
+        section.emit_byte(ctx.alloc, ctx.text, 57);  # CMP r/m64, r64
+        section.emit_byte(ctx.alloc, ctx.text, 200); # ModR/M
+    }
+}
+
+# select_instr: convert a single IR instruction to machine code.
+# ---
+# ctx:   isel context
+# instr: IR instruction to convert
+pub fun select_instr(ctx: *ISelContext, instr: *ir.IRInstr) {
+    if (ctx == nil || instr == nil) {
+        ret;
+    }
+
+    # get opcode tag from union
+    val op_tag: u8 = ir.get_op_tag(?instr.op);
+
+    # dispatch based on opcode
+    if (op_tag == ir.OP_LABEL) {
+        # label pseudo-instruction - record current offset as symbol
+        if (instr.dst.kind.tag == ir.VAL_LABEL && instr.dst.label != nil) {
+            val label_name: str = instr.dst.label;
+            if (ctx.m != nil) {
+                val existing: *sym.Symbol = masm.get_symbol(ctx.m, label_name);
+                if (existing != nil) {
+                    existing.offset = ctx.text.size;
+                } or {
+                    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, label_name);
+                    if (sym_res.is_ok()) {
+                        val s: *sym.Symbol = sym_res.unwrap_ok();
+                        s.offset = ctx.text.size;
+                        sym.set_binding(s, sym.bind_local());
+                        sym.set_type(s, sym.sym_none());
+                        masm.add_symbol(ctx.m, s);
+                    }
+                }
+            }
+        }
+    }
+    or (op_tag == ir.OP_NOP) {
+        emit_nop(ctx);
+    }
+    or (op_tag == ir.OP_MOV) {
+        select_mov(ctx, instr);
+    }
+    or (op_tag == ir.OP_LOAD) {
+        select_load(ctx, instr);
+    }
+    or (op_tag == ir.OP_STORE) {
+        select_store(ctx, instr);
+    }
+    or (op_tag == ir.OP_LEA) {
+        select_lea(ctx, instr);
+    }
+    or (op_tag == ir.OP_ADD) {
+        select_add(ctx, instr);
+    }
+    or (op_tag == ir.OP_SUB) {
+        select_sub(ctx, instr);
+    }
+    or (op_tag == ir.OP_MUL) {
+        select_mul(ctx, instr);
+    }
+    or (op_tag == ir.OP_DIV) {
+        select_div(ctx, instr, true);  # signed
+    }
+    or (op_tag == ir.OP_MOD) {
+        select_mod(ctx, instr, true);  # signed
+    }
+    or (op_tag == ir.OP_NEG) {
+        select_neg(ctx, instr);
+    }
+    or (op_tag == ir.OP_AND) {
+        select_and(ctx, instr);
+    }
+    or (op_tag == ir.OP_OR) {
+        select_or(ctx, instr);
+    }
+    or (op_tag == ir.OP_XOR) {
+        select_xor(ctx, instr);
+    }
+    or (op_tag == ir.OP_NOT) {
+        select_not(ctx, instr);
+    }
+    or (op_tag == ir.OP_SHL) {
+        select_shl(ctx, instr);
+    }
+    or (op_tag == ir.OP_SHR) {
+        select_shr(ctx, instr);
+    }
+    or (op_tag == ir.OP_SAR) {
+        select_sar(ctx, instr);
+    }
+    or (op_tag == ir.OP_CMP) {
+        select_cmp(ctx, instr);
+    }
+    or (op_tag == ir.OP_JMP) {
+        select_jmp(ctx, instr);
+    }
+    or (op_tag == ir.OP_JCC) {
+        select_jcc(ctx, instr);
+    }
+    or (op_tag == ir.OP_CALL) {
+        select_call(ctx, instr);
+    }
+    or (op_tag == ir.OP_RET) {
+        # ret is handled by epilogue, but if explicit, emit nothing
+    }
+    or (op_tag == ir.OP_PUSH) {
+        select_push(ctx, instr);
+    }
+    or (op_tag == ir.OP_POP) {
+        select_pop(ctx, instr);
+    }
+    or (op_tag == ir.OP_SETE) {
+        select_setcc(ctx, instr, 148);  # 0x94 = SETE
+    }
+    or (op_tag == ir.OP_SETNE) {
+        select_setcc(ctx, instr, 149);  # 0x95 = SETNE
+    }
+    or (op_tag == ir.OP_SETL) {
+        select_setcc(ctx, instr, 156);  # 0x9C = SETL
+    }
+    or (op_tag == ir.OP_SETLE) {
+        select_setcc(ctx, instr, 158);  # 0x9E = SETLE
+    }
+    or (op_tag == ir.OP_SETG) {
+        select_setcc(ctx, instr, 159);  # 0x9F = SETG
+    }
+    or (op_tag == ir.OP_SETGE) {
+        select_setcc(ctx, instr, 157);  # 0x9D = SETGE
+    }
+    or (op_tag == ir.OP_SETB) {
+        select_setcc(ctx, instr, 146);  # 0x92 = SETB
+    }
+    or (op_tag == ir.OP_SETBE) {
+        select_setcc(ctx, instr, 150);  # 0x96 = SETBE
+    }
+    or (op_tag == ir.OP_SETA) {
+        select_setcc(ctx, instr, 151);  # 0x97 = SETA
+    }
+    or (op_tag == ir.OP_SETAE) {
+        select_setcc(ctx, instr, 147);  # 0x93 = SETAE
+    }
+    or (op_tag == ir.OP_ZEXT) {
+        select_zext(ctx, instr);
+    }
+    or (op_tag == ir.OP_SEXT) {
+        select_sext(ctx, instr);
+    }
+    or (op_tag == ir.OP_TRUNC) {
+        select_trunc(ctx, instr);
+    }
+    or {
+        # unhandled opcode - emit NOP as placeholder
+        emit_nop(ctx);
+    }
+}
+
+# select_block: convert a basic block to machine code.
+# ---
+# ctx:   isel context
+# block: IR block to convert
+pub fun select_block(ctx: *ISelContext, block: *ir.IRBlock) {
+    if (ctx == nil || block == nil) {
+        ret;
+    }
+
+    # emit block label if present
+    if (block.label != nil && ctx.m != nil) {
+        val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, block.label);
+        if (sym_res.is_ok()) {
+            val s: *sym.Symbol = sym_res.unwrap_ok();
+            s.offset = ctx.text.size;
+            sym.set_binding(s, sym.bind_local());
+            sym.set_type(s, sym.sym_none());
+            masm.add_symbol(ctx.m, s);
+        }
+    }
+
+    # process each instruction
+    var i: i32 = 0;
+    for (i < block.instr_count) {
+        select_instr(ctx, ?block.instrs[i]);
+        i = i + 1;
+    }
+}
+
+# select_function: convert an IR function to machine code.
+# ---
+# ctx:  isel context
+# func: IR function to convert
+# ret:  Ok(true) on success, Err(str) on failure
+pub fun select_function(ctx: *ISelContext, func: *ir.IRFunction) Result[bool, str] {
+    if (ctx == nil) {
+        ret err[bool, str]("isel context is nil");
+    }
+    if (func == nil) {
+        ret err[bool, str]("function is nil");
+    }
+    if (ctx.text == nil) {
+        ret err[bool, str]("text section is nil");
+    }
+
+    # reset context for new function
+    reset(ctx);
+
+    # record function symbol offset
+    if (func.name != nil && ctx.m != nil) {
+        val existing: *sym.Symbol = masm.get_symbol(ctx.m, func.name);
+        if (existing != nil) {
+            existing.offset = ctx.text.size;
+        }
+    }
+
+    # scan function to compute stack requirements
+    ctx.base_stack_size = func.local_size;
+    scan_function(ctx, func);
+
+    # check if this is entry point
+    var is_entry: bool = false;
+    if (func.name != nil && func.name.equals("_start")) {
+        is_entry = true;
+    }
+
+    # emit prologue (unless entry point)
+    if (!is_entry) {
+        emit_push_rbp(ctx);
+        emit_mov_rbp_rsp(ctx);
+        if (ctx.total_stack_size > 0) {
+            emit_sub_rsp_imm(ctx, ctx.total_stack_size);
+        }
+    }
+
+    # process each block
+    var bi: i32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.IRBlock = func.blocks[bi];
+        if (block != nil) {
+            select_block(ctx, block);
+        }
+        bi = bi + 1;
+    }
+
+    # emit epilogue (unless entry point - _start should exit via syscall)
+    if (!is_entry) {
+        if (ctx.total_stack_size > 0) {
+            emit_add_rsp_imm(ctx, ctx.total_stack_size);
+        }
+        emit_pop_rbp(ctx);
+        emit_ret(ctx);
+    }
+
+    ret ok[bool, str](true);
+}
+
+# run_isel: run instruction selection on all functions in Masm context.
+# ---
+# m:     masm context
+# funcs: array of IR functions
+# count: number of functions
+# alloc: allocator
+# ret:   Ok(true) on success, Err(str) on failure
+pub fun run_isel(m: *masm.Masm, funcs: **ir.IRFunction, count: i32, alloc: *allocator.Allocator) Result[bool, str] {
+    if (m == nil) {
+        ret err[bool, str]("masm context is nil");
+    }
+    if (alloc == nil) {
+        ret err[bool, str]("allocator is nil");
+    }
+
+    # get or create text section
+    val text_res: Result[*section.Section, str] = masm.get_or_create_section(m, ".text", section.section_text());
+    if (text_res.is_err()) {
+        ret err[bool, str](text_res.unwrap_err());
+    }
+    val text: *section.Section = text_res.unwrap_ok();
+
+    # create isel context
+    var ctx: ISelContext = init(alloc, text, m);
+
+    # process each function
+    var i: i32 = 0;
+    for (i < count) {
+        val func: *ir.IRFunction = funcs[i];
+        if (func != nil) {
+            val res: Result[bool, str] = select_function(?ctx, func);
+            if (res.is_err()) {
+                ret res;
+            }
+        }
+        i = i + 1;
+    }
+
+    ret ok[bool, str](true);
+}

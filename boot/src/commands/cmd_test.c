@@ -666,8 +666,8 @@ compile_and_run_single_test(AstNode *original_ast, int test_index, const char *m
     }
 
     // merge imported modules (including std.runtime)
-    SemaLoadedModule loaded[64];
-    int              loaded_count = sema_get_loaded_modules(sema, loaded, 64);
+    SemaLoadedModule loaded[256];
+    int              loaded_count = sema_get_loaded_modules(sema, loaded, 256);
     for (int m = 0; m < loaded_count; m++)
     {
         Masm *imported_masm = masm_lower_module(loaded[m].ast, loaded[m].table);

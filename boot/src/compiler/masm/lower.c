@@ -86,12 +86,18 @@ static const MasmISASpec *lower_select_isa(MasmTarget target)
 
 static MasmOperand alloc_vreg(LowerContext *ctx, uint8_t size)
 {
-    return masm_operand_register(ctx->vreg_next++, size);
+    uint32_t slots = (size > 8) ? (uint32_t)((size + 7) / 8) : 1;
+    uint32_t id    = ctx->vreg_next;
+    ctx->vreg_next += slots;
+    return masm_operand_register(id, size);
 }
 
 static MasmOperand alloc_vreg_fp(LowerContext *ctx, uint8_t size)
 {
-    return masm_operand_register_fp(ctx->vreg_next++, size);
+    uint32_t slots = (size > 8) ? (uint32_t)((size + 7) / 8) : 1;
+    uint32_t id    = ctx->vreg_next;
+    ctx->vreg_next += slots;
+    return masm_operand_register_fp(id, size);
 }
 
 static inline MasmOperand isa_result(LowerContext *ctx, uint8_t size)
@@ -276,6 +282,21 @@ static inline uint8_t type_fp_size(Type *t)
         return 8;
     }
     return (t->kind == TYPE_F32) ? 4 : 8;
+}
+
+static inline MasmTypeKind masm_type_for_chunk(int chunk)
+{
+    switch (chunk)
+    {
+    case 1:
+        return MASM_TYPE_U8;
+    case 2:
+        return MASM_TYPE_U16;
+    case 4:
+        return MASM_TYPE_U32;
+    default:
+        return MASM_TYPE_U64;
+    }
 }
 
 static Type *infer_ret_type_from_stmt(AstNode *stmt)
@@ -734,8 +755,38 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
             size = 8;
         }
 
-        MasmOperand mem = masm_operand_memory_simple(ptr.reg.id, 0, size);
-        masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+        // For aggregate types (structs, unions, arrays), use memory copy
+        // Exception: small aggregates (size <= ptr_size) from call expressions are
+        // returned by value in a register, not by pointer
+        bool is_small_agg_from_call = type_is_aggregate(lhs->type) && size <= (int)ctx->ptr_size && rhs->kind == AST_EXPR_CALL;
+
+        if (type_is_aggregate(lhs->type) && !is_small_agg_from_call)
+        {
+            MasmOperand src_ptr = isa_tmp(ctx, ctx->ptr_size);
+            if (val.kind == MASM_OPERAND_MEMORY)
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, src_ptr, val));
+            }
+            else if (val.kind == MASM_OPERAND_REGISTER)
+            {
+                if (val.reg.id != src_ptr.reg.id)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+                }
+            }
+            else
+            {
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+            }
+
+            MasmOperand dst_ptr = ptr;
+            emit_aggregate_copy(text, ctx, dst_ptr, src_ptr, (size_t)size);
+        }
+        else
+        {
+            MasmOperand mem = masm_operand_memory_simple(ptr.reg.id, 0, size);
+            masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+        }
         return val;
     }
     // Handle generic lvalue (index, field)
@@ -855,9 +906,41 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
 
             MasmOperand val = lower_expr(masm, text, rhs, ctx);
 
-            int         size = lhs->type ? lhs->type->size : ctx->ptr_size;
-            MasmOperand mem  = masm_operand_memory_simple(addr.reg.id, 0, size);
-            masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+            int size = lhs->type ? lhs->type->size : ctx->ptr_size;
+            if (size == 0)
+            {
+                size = ctx->ptr_size;
+            }
+
+            bool is_small_agg_from_call = type_is_aggregate(lhs->type) && size <= (int)ctx->ptr_size && rhs->kind == AST_EXPR_CALL;
+
+            if (type_is_aggregate(lhs->type) && !is_small_agg_from_call)
+            {
+                MasmOperand src_ptr = isa_tmp(ctx, ctx->ptr_size);
+                if (val.kind == MASM_OPERAND_MEMORY)
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, src_ptr, val));
+                }
+                else if (val.kind == MASM_OPERAND_REGISTER)
+                {
+                    if (val.reg.id != src_ptr.reg.id)
+                    {
+                        masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+                    }
+                }
+                else
+                {
+                    masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, src_ptr, val));
+                }
+
+                MasmOperand dst_ptr = addr;
+                emit_aggregate_copy(text, ctx, dst_ptr, src_ptr, (size_t)size);
+            }
+            else
+            {
+                MasmOperand mem = masm_operand_memory_simple(addr.reg.id, 0, size);
+                masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, mem, val, masm_operand_imm(size)));
+            }
             return val;
         }
     }
@@ -1149,10 +1232,10 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
             {
                 // For small aggregates (≤8 bytes), lower_expr returns an address (LEA).
                 // We need to load the actual value to pass it by value in a register.
-                bool is_small_aggregate = arg->type && (arg->type->kind == TYPE_STRUCT || arg->type->kind == TYPE_UNION) && arg->type->size > 0 && arg->type->size <= ctx->ptr_size;
+                bool is_small_aggregate = arg->type && (arg->type->kind == TYPE_STRUCT || arg->type->kind == TYPE_UNION || arg->type->kind == TYPE_ARRAY) && arg->type->size > 0 && arg->type->size <= ctx->ptr_size;
 
                 // For large aggregates (>8 bytes), we pass by reference - need the address
-                bool is_large_aggregate = arg->type && (arg->type->kind == TYPE_STRUCT || arg->type->kind == TYPE_UNION) && arg->type->size > ctx->ptr_size;
+                bool is_large_aggregate = arg->type && (arg->type->kind == TYPE_STRUCT || arg->type->kind == TYPE_UNION || arg->type->kind == TYPE_ARRAY) && arg->type->size > ctx->ptr_size;
 
                 if (is_large_aggregate)
                 {
@@ -1165,13 +1248,13 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
                     }
                     // else op is already a register holding the address
                 }
-                else if (is_small_aggregate && op.kind == MASM_OPERAND_REGISTER)
+                else if (is_small_aggregate && op.kind == MASM_OPERAND_REGISTER && arg->kind != AST_EXPR_CALL)
                 {
                     // op is a register holding the address; load the value from it
                     MasmOperand addr_reg = op;
                     MasmOperand val_reg  = alloc_vreg(ctx, arg->type->size);
                     MasmOperand mem      = masm_operand_memory_simple(addr_reg.reg.id, 0, arg->type->size);
-                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(MASM_TYPE_U64)));
+                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(masm_type_for_chunk(arg->type->size))));
                     op = val_reg;
                 }
                 else
@@ -1318,22 +1401,7 @@ static MasmOperand lower_cast(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         MasmOperand mem = masm_operand_memory_simple(ptr.reg.id, 0, copy_size);
 
         // Treat as unsigned load (raw bits) unless we have better info
-        MasmTypeKind tk = MASM_TYPE_U64;
-        switch (copy_size)
-        {
-        case 1:
-            tk = MASM_TYPE_U8;
-            break;
-        case 2:
-            tk = MASM_TYPE_U16;
-            break;
-        case 4:
-            tk = MASM_TYPE_U32;
-            break;
-        default:
-            tk = MASM_TYPE_U64;
-            break;
-        }
+        MasmTypeKind tk = masm_type_for_chunk(copy_size);
 
         masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, dst, mem, masm_operand_type(tk)));
         return dst;
@@ -1554,12 +1622,14 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             MasmSymbol *sym = masm_get_symbol(masm, expr->ident_expr.name);
             if (sym)
             {
-                // For aggregates/arrays, return address in Register
+                // for aggregates/arrays, return address in register
+                bool is_aggregate = expr->type && (expr->type->kind == TYPE_ARRAY || expr->type->kind == TYPE_STRUCT || expr->type->kind == TYPE_UNION);
+
                 MasmOperand addr     = isa_result(ctx, 8);
                 MasmOperand label_op = masm_operand_label(sym->name);
                 masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, addr, label_op));
 
-                if (sym->size > 8)
+                if (is_aggregate || sym->size > 8)
                 {
                     return addr;
                 }
@@ -1634,22 +1704,18 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 MasmOperand label_op = masm_operand_label(link_name);
                 masm_section_append_inst(text, masm_inst_2(MASM_IR_MOV, addr, label_op));
 
-                if (sym_size > 8)
+                bool is_aggregate = expr->type && (expr->type->kind == TYPE_ARRAY || expr->type->kind == TYPE_STRUCT || expr->type->kind == TYPE_UNION);
+                if (is_aggregate || sym_size > 8)
                 {
                     return addr;
                 }
 
                 MasmOperand mem = masm_operand_memory_simple(addr.reg.id, 0, sym_size ? sym_size : 1);
 
-                if (sym_size == 1 || sym_size == 2)
-                {
-                    MasmOperand res = isa_result(ctx, 8);
-                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, res, mem, masm_operand_type(MASM_TYPE_U8)));
-                    return res;
-                }
-
-                MasmOperand res = isa_result(ctx, sym_size ? (uint8_t)sym_size : ctx->ptr_size);
-                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, res, mem, masm_operand_type(MASM_TYPE_U64)));
+                uint8_t      load_size = sym_size ? (uint8_t)sym_size : ctx->ptr_size;
+                MasmOperand  res       = isa_result(ctx, load_size);
+                MasmTypeKind tk        = masm_type_for_chunk((int)load_size);
+                masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, res, mem, masm_operand_type(tk)));
                 return res;
             }
         }
@@ -1864,7 +1930,9 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 MasmOperand dst         = frame_mem(ctx, elem_offset, elem_size);
 
                 bool elem_is_agg = type_is_aggregate(elem_type);
-                if (elem_is_agg)
+                bool elem_is_small_agg_from_call = elem_is_agg && elem_size > 0 && elem_size <= (int)ctx->ptr_size &&
+                                                   elems->items[i]->kind == AST_EXPR_CALL;
+                if (elem_is_agg && !elem_is_small_agg_from_call)
                 {
                     MasmOperand src_ptr = isa_result(ctx, ctx->ptr_size);
                     if (val.kind == MASM_OPERAND_REGISTER)
@@ -1894,6 +1962,11 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                     masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, dst_ptr, dst_addr));
 
                     emit_aggregate_copy(text, ctx, dst_ptr, src_ptr, (size_t)elem_size);
+                }
+                else if (elem_is_agg)
+                {
+                    val = ensure_in_reg(text, val, elem_type, ctx);
+                    masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, val, masm_operand_imm(elem_size)));
                 }
                 else
                 {
@@ -2078,7 +2151,9 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                 int32_t dest_disp = base_offset + (int32_t)offset;
 
                 bool is_agg_field = field_type && (field_type->kind == TYPE_STRUCT || field_type->kind == TYPE_UNION || field_type->kind == TYPE_ARRAY);
-                if (is_agg_field || field_type->size > 8)
+                bool is_small_agg_from_call = is_agg_field && field_type->size > 0 && field_type->size <= ctx->ptr_size &&
+                                              init_expr->kind == AST_EXPR_CALL;
+                if ((is_agg_field || field_type->size > 8) && !is_small_agg_from_call)
                 {
                     size_t fsize = field_type->size;
                     if (fsize == 0)
@@ -2112,7 +2187,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
                         MasmOperand val = alloc_vreg(ctx, chunk);
                         MasmOperand s   = masm_operand_memory_simple(src_ptr.reg.id, k, chunk);
                         MasmOperand d   = masm_operand_memory_simple(dst_ptr.reg.id, k, chunk);
-                        masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val, s, masm_operand_type(MASM_TYPE_I64)));
+                        masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val, s, masm_operand_type(masm_type_for_chunk(chunk))));
                         masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, d, val, masm_operand_imm(chunk)));
                     }
                 }
@@ -2201,7 +2276,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                         MasmOperand src = masm_operand_memory_simple(src_ptr.reg.id, (int64_t)off, (size_t)chunk);
                         MasmOperand dst = masm_operand_memory_simple(dst_ptr.reg.id, (int64_t)off, (size_t)chunk);
 
-                        masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src, masm_operand_type(MASM_TYPE_U64)));
+                        masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src, masm_operand_type(masm_type_for_chunk(chunk))));
                         masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, tmp, masm_operand_imm(chunk)));
                     }
 
@@ -2238,7 +2313,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                 // to return it in a register.
                 // However, call expressions return the value directly in a register,
                 // so we must NOT dereference in that case.
-                bool is_small_aggregate = expr->type && (expr->type->kind == TYPE_STRUCT || expr->type->kind == TYPE_UNION) && expr->type->size > 0 && expr->type->size <= ctx->ptr_size;
+                bool is_small_aggregate = expr->type && (expr->type->kind == TYPE_STRUCT || expr->type->kind == TYPE_UNION || expr->type->kind == TYPE_ARRAY) && expr->type->size > 0 && expr->type->size <= ctx->ptr_size;
 
                 if (is_small_aggregate && ret_val.kind == MASM_OPERAND_REGISTER && expr->kind != AST_EXPR_CALL)
                 {
@@ -2246,7 +2321,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
                     MasmOperand addr_reg = ret_val;
                     MasmOperand val_reg  = alloc_vreg(ctx, expr->type->size);
                     MasmOperand mem      = masm_operand_memory_simple(addr_reg.reg.id, 0, expr->type->size);
-                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(MASM_TYPE_U64)));
+                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(masm_type_for_chunk(expr->type->size))));
                     ret_val = val_reg;
                 }
                 else if (!is_small_aggregate || ret_val.kind != MASM_OPERAND_REGISTER)
@@ -2373,12 +2448,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         {
             MasmOperand value = lower_expr(masm, text, stmt->var_stmt.init, ctx);
 
-            // Use aggregate copy for:
-            // 1. Large aggregates (> 8 bytes)
-            // 2. Any aggregate with non-power-of-2 size (5, 6, 7 bytes)
-            //    because x86 MOV instructions only support 1, 2, 4, 8 byte sizes
-            bool is_aggregate         = false;
-            bool needs_aggregate_copy = var_size > ctx->ptr_size;
+            // use aggregate copy for aggregates (except small aggregates returned from calls)
+            // and for non-power-of-2 sizes (5, 6, 7 bytes) to avoid invalid mov widths
+            bool is_aggregate = false;
 
             // Check if type is an aggregate
             if (stmt->type && (stmt->type->kind == TYPE_STRUCT || stmt->type->kind == TYPE_UNION || stmt->type->kind == TYPE_ARRAY))
@@ -2389,6 +2461,9 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
             {
                 is_aggregate = true;
             }
+
+            bool is_small_agg_from_call = is_aggregate && var_size > 0 && var_size <= ctx->ptr_size && stmt->var_stmt.init->kind == AST_EXPR_CALL;
+            bool needs_aggregate_copy   = is_aggregate && !is_small_agg_from_call;
 
             // For aggregates, use aggregate copy if size is not a power of 2 (1, 2, 4, 8)
             if (is_aggregate && var_size != 1 && var_size != 2 && var_size != 4 && var_size != 8)
@@ -3266,7 +3341,8 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
                     int32_t     stack_param_offset = (int32_t)(2 * ctx->ptr_size + (stack_i++ * ctx->ptr_size));
                     MasmOperand src_mem            = frame_mem(ctx, stack_param_offset, store_size);
                     MasmOperand tmp                = alloc_vreg_fp(ctx, store_size);
-                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src_mem, masm_operand_type(MASM_TYPE_F64)));
+                    MasmTypeKind load_type         = (store_size == 4) ? MASM_TYPE_F32 : MASM_TYPE_F64;
+                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src_mem, masm_operand_type(load_type)));
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, tmp, masm_operand_imm(store_size)));
                 }
             }
@@ -3372,7 +3448,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
                     MasmOperand tmp = alloc_vreg(ctx, chunk);
                     MasmOperand src = masm_operand_memory_simple(src_ptr.reg.id, (int64_t)off, (size_t)chunk);
                     MasmOperand dst = masm_operand_memory_simple(dst_ptr.reg.id, (int64_t)off, (size_t)chunk);
-                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src, masm_operand_type(MASM_TYPE_U64)));
+                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, tmp, src, masm_operand_type(masm_type_for_chunk(chunk))));
                     masm_section_append_inst(text, masm_inst_3(MASM_IR_STORE, dst, tmp, masm_operand_imm(chunk)));
                 }
             }

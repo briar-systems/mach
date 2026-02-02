@@ -258,6 +258,8 @@ Returned in registers:
 | 1-8 bytes | RAX |
 | 9-16 bytes | RAX + RDX |
 
+For small aggregates that are not 1/2/4/8 bytes (e.g., 3/5/6/7), MASM still treats them as by-value in registers to match the C ABI. The backend is responsible for safe byte-accurate moves, typically by chunking loads/stores into 4/2/1 byte pieces without over-reading or over-writing memory.
+
 
 ### Large Structs (>16 bytes)
 

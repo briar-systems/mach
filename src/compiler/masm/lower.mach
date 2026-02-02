@@ -5,8 +5,10 @@ use std.types.result;
 use std.types.option;
 
 use allocator: std.allocator;
+use print: std.print;
 
-use ast:    mach.compiler.ast;
+use ast:     mach.compiler.ast;
+use isel:    mach.compiler.masm.isel;
 use symbol: mach.compiler.symbol;
 use ty:     mach.compiler.type;
 use token:  mach.compiler.token;
@@ -19,6 +21,8 @@ use sym:     mach.compiler.masm.symbol;
 use target:  mach.compiler.masm.target;
 use abi:     mach.compiler.masm.abi.spec;
 use sysv64:  mach.compiler.masm.abi.sysv64;
+use sema:    mach.compiler.sema;
+use x86asm:  mach.compiler.masm.isa.x86asm;
 
 # mach.compiler.masm.lower: AST to IR lowering.
 # ---
@@ -112,6 +116,11 @@ pub rec LowerContext {
 
     # current text section
     text:             *section.Section;
+
+    # collected IR functions for isel
+    ir_funcs:         **ir.IRFunction;
+    ir_func_count:    i32;
+    ir_func_cap:      i32;
 }
 
 # init: create a new lowering context.
@@ -161,7 +170,48 @@ pub fun init(alloc: *allocator.Allocator, symbols: *symbol.Table, types: *ty.Typ
     ctx.m = nil;
     ctx.text = nil;
 
+    ctx.ir_funcs = nil;
+    ctx.ir_func_count = 0;
+    ctx.ir_func_cap = 0;
+
     ret ctx;
+}
+
+# add_ir_function: add an IR function to the context for later isel.
+# ---
+# ctx:  lowering context
+# func: IR function to add
+# ret:  Ok(true) on success, Err(str) on failure
+pub fun add_ir_function(ctx: *LowerContext, func: *ir.IRFunction) Result[bool, str] {
+    if (ctx == nil) {
+        ret err[bool, str]("context is nil");
+    }
+    if (func == nil) {
+        ret err[bool, str]("function is nil");
+    }
+
+    # grow array if needed
+    if (ctx.ir_func_count >= ctx.ir_func_cap) {
+        var new_cap: i32 = 16;
+        if (ctx.ir_func_cap > 0) {
+            new_cap = ctx.ir_func_cap * 2;
+        }
+
+        val r: Result[**ir.IRFunction, allocator.AllocError] = ctx.alloc.resize[*ir.IRFunction](
+            ctx.ir_funcs, ctx.ir_func_cap::usize, new_cap::usize
+        );
+        if (r.is_err()) {
+            ret err[bool, str](r.unwrap_err());
+        }
+
+        ctx.ir_funcs = r.unwrap_ok();
+        ctx.ir_func_cap = new_cap;
+    }
+
+    ctx.ir_funcs[ctx.ir_func_count] = func;
+    ctx.ir_func_count = ctx.ir_func_count + 1;
+
+    ret ok[bool, str](true);
 }
 
 # deinit: clean up lowering context.
@@ -299,13 +349,18 @@ pub fun new_string_label(ctx: *LowerContext) str {
 # ---
 # ctx: lowering context
 # ret: register number
-pub fun new_temp(ctx: *LowerContext) i32 {
+pub fun new_temp(ctx: *LowerContext, size: usize) i32 {
     if (ctx == nil) {
         ret 0;
     }
 
+    var slots: i32 = 1;
+    if (size > 8) {
+        slots = ((size + 7) / 8)::i32;
+    }
+
     val reg: i32 = ctx.vreg_next;
-    ctx.vreg_next = ctx.vreg_next + 1;
+    ctx.vreg_next = ctx.vreg_next + slots;
     ret reg;
 }
 
@@ -415,7 +470,7 @@ pub fun ensure_in_reg(ctx: *LowerContext, src_value: ir.IRValue, size: usize) ir
     }
 
     # allocate a new temp register
-    val reg: i32 = new_temp(ctx);
+    val reg: i32 = new_temp(ctx, size);
     var result: ir.IRValue = ir.make_reg(reg, size);
 
     # emit load or move instruction
@@ -475,19 +530,30 @@ pub fun push_deferred(ctx: *LowerContext, node: *ast.Node) {
 # from_index: starting index in deferred stack
 # ret:        none
 pub fun emit_deferred_from(ctx: *LowerContext, from_index: i32) {
-    if (ctx == nil || ctx.deferred == nil) {
+    print.eprintln("[emit_deferred_from] entered");
+    if (ctx == nil) {
+        print.eprintln("[emit_deferred_from] ctx is nil, returning");
         ret;
     }
+    print.eprintln("[emit_deferred_from] ctx is valid");
+    if (ctx.deferred == nil) {
+        print.eprintln("[emit_deferred_from] ctx.deferred is nil, returning");
+        ret;
+    }
+    print.eprintln("[emit_deferred_from] ctx.deferred is valid");
 
     # emit in reverse order (LIFO)
+    print.eprintln("[emit_deferred_from] starting loop");
     var i: i32 = ctx.deferred_count - 1;
     for (i >= from_index) {
+        print.eprintln("[emit_deferred_from] processing deferred item");
         val node: *ast.Node = ctx.deferred[i];
         if (node != nil) {
             lower_stmt(ctx, node);
         }
         i = i - 1;
     }
+    print.eprintln("[emit_deferred_from] done");
 }
 
 # push_loop_defer_mark: mark current deferred stack depth when entering a loop.
@@ -840,7 +906,7 @@ pub fun emit_aggregate_copy(ctx: *LowerContext, dst: ir.IRValue, src: ir.IRValue
     }
 
     # get destination address into a register
-    val dst_ptr: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+    val dst_ptr: ir.IRValue = ir.make_reg(new_temp(ctx, ctx.ptr_size), ctx.ptr_size);
     emit_lea(ctx, dst_ptr, dst);
 
     # ensure source is in a register
@@ -852,7 +918,7 @@ pub fun emit_aggregate_copy(ctx: *LowerContext, dst: ir.IRValue, src: ir.IRValue
     # copy in 8-byte chunks, then remaining bytes
     var offset: usize = 0;
     for (offset + 8 <= size) {
-        val tmp: ir.IRValue = ir.make_reg(new_temp(ctx), 8);
+        val tmp: ir.IRValue = ir.make_reg(new_temp(ctx, 8), 8);
 
         # create source memory operand
         var src_mem: ir.IRValue;
@@ -886,7 +952,7 @@ pub fun emit_aggregate_copy(ctx: *LowerContext, dst: ir.IRValue, src: ir.IRValue
 
     # copy remaining bytes one at a time
     for (offset < size) {
-        val tmp: ir.IRValue = ir.make_reg(new_temp(ctx), 1);
+        val tmp: ir.IRValue = ir.make_reg(new_temp(ctx, 1), 1);
 
         var src_mem: ir.IRValue;
         src_mem.kind = ir.val_mem();
@@ -958,18 +1024,30 @@ pub fun emit_setcc(ctx: *LowerContext, cond: i32, dst: ir.IRValue) {
 # label: label name
 # ret:   none
 pub fun emit_label(ctx: *LowerContext, label: str) {
+    print.eprintln("[emit_label] entered");
     if (ctx == nil || ctx.current_block == nil || ctx.alloc == nil) {
+        print.eprintln("[emit_label] early return due to nil");
         ret;
     }
+    print.eprintln("[emit_label] ctx checks passed");
 
+    print.eprintln("[emit_label] creating instr...");
     var instr: ir.IRInstr;
+    print.eprintln("[emit_label] setting op...");
     instr.op = ir.IROp { ir_label: 0 };
+    print.eprintln("[emit_label] setting dst...");
     instr.dst = ir.make_label(label);
-    instr.src1.kind = ir.val_none();
-    instr.src2.kind = ir.val_none();
+    print.eprintln("[emit_label] setting src1...");
+    instr.src1 = ir.make_none();
+    print.eprintln("[emit_label] setting src2...");
+    instr.src2 = ir.make_none();
+    print.eprintln("[emit_label] setting cond...");
     instr.cond = 0;
+    print.eprintln("[emit_label] instr fully initialized");
 
+    print.eprintln("[emit_label] calling ir.emit_instr...");
     ir.emit_instr(ctx.alloc, ctx.current_block, instr);
+    print.eprintln("[emit_label] ir.emit_instr returned");
 }
 
 # emit_jmp: emit an unconditional jump.
@@ -1339,7 +1417,7 @@ pub fun lower_expr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         }
 
         # emit LEA to load string address
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, ctx.ptr_size), ctx.ptr_size);
         val src: ir.IRValue = ir.make_label(label);
         emit_lea(ctx, dst, src);
 
@@ -1466,7 +1544,7 @@ pub fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     rhs = ensure_in_reg(ctx, rhs, ctx.ptr_size);
 
     # allocate result register
-    val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+    val dst: ir.IRValue = ir.make_reg(new_temp(ctx, ctx.ptr_size), ctx.ptr_size);
 
     # select IR operation
     var ir_op: ir.IROp;
@@ -1522,7 +1600,7 @@ pub fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         }
 
         # emit setcc to set result byte
-        val result_byte: ir.IRValue = ir.make_reg(new_temp(ctx), 1);
+        val result_byte: ir.IRValue = ir.make_reg(new_temp(ctx, 1), 1);
         emit_setcc(ctx, cond, result_byte);
 
         # zero-extend to full register size
@@ -1557,7 +1635,7 @@ pub fun lower_unary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         var operand: ir.IRValue = lower_expr(ctx, operand_node);
         operand = ensure_in_reg(ctx, operand, ctx.ptr_size);
 
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, ctx.ptr_size), ctx.ptr_size);
         emit_unaryop(ctx, ir.IROp { ir_neg: 0 }, dst, operand);
         ret dst;
     }
@@ -1570,7 +1648,7 @@ pub fun lower_unary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         # compare to 0 and set opposite
         emit_cmp(ctx, operand, ir.make_imm(0, ctx.ptr_size));
 
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), 1);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, 1), 1);
         # TODO: emit sete (set if equal to zero)
         ret dst;
     }
@@ -1580,7 +1658,7 @@ pub fun lower_unary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         var operand: ir.IRValue = lower_expr(ctx, operand_node);
         operand = ensure_in_reg(ctx, operand, ctx.ptr_size);
 
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, ctx.ptr_size), ctx.ptr_size);
         emit_unaryop(ctx, ir.IROp { ir_not: 0 }, dst, operand);
         ret dst;
     }
@@ -1602,12 +1680,41 @@ pub fun lower_assign(ctx: *LowerContext, lhs: *ast.Node, rhs: *ast.Node) ir.IRVa
         ret none_val;
     }
 
-    # lower the RHS value
-    var rhs_val: ir.IRValue = lower_expr(ctx, rhs);
-    rhs_val = ensure_in_reg(ctx, rhs_val, ctx.ptr_size);
+    # get the LHS type to determine if this is an aggregate assignment
+    val lhs_type: *ty.Type = lhs.ty;
+    val is_aggregate: bool = type_is_aggregate(lhs_type);
+    var size: usize = ctx.ptr_size;
+    if (lhs_type != nil) {
+        size = lhs_type.size;
+        if (size == 0) {
+            size = ctx.ptr_size;
+        }
+    }
+
+    # check if RHS is a call expression returning a small aggregate
+    # small aggregates (<= ptr_size) are returned by value in a register, not by pointer
+    val rhs_is_call: bool = rhs != nil && rhs.kind == ast.NODE_EXPR_CALL;
+    val is_small_agg_from_call: bool = is_aggregate && size <= ctx.ptr_size && rhs_is_call;
 
     # lower the LHS as an lvalue (get address)
-    val lhs_addr: ir.IRValue = lower_lvalue(ctx, lhs);
+    var lhs_addr: ir.IRValue = lower_lvalue(ctx, lhs);
+    lhs_addr = ensure_in_reg(ctx, lhs_addr, ctx.ptr_size);
+
+    # for aggregate types (except small ones from calls), use memory copy
+    if (is_aggregate && !is_small_agg_from_call) {
+        # lower RHS - for aggregates, this returns a pointer to the data
+        var rhs_val: ir.IRValue = lower_expr(ctx, rhs);
+        rhs_val = ensure_in_reg(ctx, rhs_val, ctx.ptr_size);
+
+        # copy the aggregate from src to dst
+        emit_aggregate_copy(ctx, lhs_addr, rhs_val, size);
+
+        ret rhs_val;
+    }
+
+    # scalar or small aggregate from call: use simple store
+    var rhs_val: ir.IRValue = lower_expr(ctx, rhs);
+    rhs_val = ensure_in_reg(ctx, rhs_val, ctx.ptr_size);
 
     # store RHS to LHS address
     emit_store(ctx, lhs_addr, rhs_val);
@@ -1633,7 +1740,7 @@ pub fun lower_short_circuit(ctx: *LowerContext, node: *ast.Node, op: u8) ir.IRVa
     val rhs_node: *ast.Node = node.get_child(1);
 
     val end_label: str = new_label(ctx, "scend");
-    val result_reg: i32 = new_temp(ctx);
+    val result_reg: i32 = new_temp(ctx, 1);
     val dst: ir.IRValue = ir.make_reg(result_reg, 1);
 
     # evaluate LHS
@@ -1901,7 +2008,7 @@ pub fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # integer widening
     if (src_type.is_integer() && dst_type.is_integer() && dst_size > src_size) {
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), dst_size);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, dst_size), dst_size);
         var instr: ir.IRInstr;
 
         if (type_is_signed(src_type)) {
@@ -1924,7 +2031,7 @@ pub fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # integer narrowing (truncate)
     if (src_type.is_integer() && dst_type.is_integer() && dst_size < src_size) {
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), dst_size);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, dst_size), dst_size);
         var instr: ir.IRInstr;
         instr.op = ir.IROp { ir_trunc: 0 };
         instr.dst = dst;
@@ -1941,7 +2048,7 @@ pub fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # float to int
     if (type_is_float(src_type) && dst_type.is_integer()) {
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), dst_size);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, dst_size), dst_size);
         var instr: ir.IRInstr;
         instr.op = ir.IROp { ir_ftoi: 0 };
         instr.dst = dst;
@@ -1958,7 +2065,7 @@ pub fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # int to float
     if (src_type.is_integer() && type_is_float(dst_type)) {
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), dst_size);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, dst_size), dst_size);
         var instr: ir.IRInstr;
         instr.op = ir.IROp { ir_itof: 0 };
         instr.dst = dst;
@@ -1975,7 +2082,7 @@ pub fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # float extension (f32 -> f64)
     if (src_type.kind == ty.TY_F32 && dst_type.kind == ty.TY_F64) {
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), 8);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, 8), 8);
         var instr: ir.IRInstr;
         instr.op = ir.IROp { ir_fext: 0 };
         instr.dst = dst;
@@ -1992,7 +2099,7 @@ pub fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # float truncation (f64 -> f32)
     if (src_type.kind == ty.TY_F64 && dst_type.kind == ty.TY_F32) {
-        val dst: ir.IRValue = ir.make_reg(new_temp(ctx), 4);
+        val dst: ir.IRValue = ir.make_reg(new_temp(ctx, 4), 4);
         var instr: ir.IRInstr;
         instr.op = ir.IROp { ir_ftrunc: 0 };
         instr.dst = dst;
@@ -2030,7 +2137,7 @@ pub fun lower_addr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     val addr: ir.IRValue = lower_lvalue(ctx, operand_node);
 
     # emit LEA to get address into a register
-    val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+    val dst: ir.IRValue = ir.make_reg(new_temp(ctx, ctx.ptr_size), ctx.ptr_size);
     emit_lea(ctx, dst, addr);
 
     ret dst;
@@ -2121,7 +2228,7 @@ pub fun lower_array_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     }
 
     # return address of array
-    val dst: ir.IRValue = ir.make_reg(new_temp(ctx), ctx.ptr_size);
+    val dst: ir.IRValue = ir.make_reg(new_temp(ctx, ctx.ptr_size), ctx.ptr_size);
     emit_lea(ctx, dst, base_addr);
 
     ret dst;
@@ -2593,12 +2700,75 @@ pub fun lower_defer(ctx: *LowerContext, node: *ast.Node) {
 # node: asm node
 # ret:  none
 pub fun lower_inline_asm(ctx: *LowerContext, node: *ast.Node) {
-    if (ctx == nil || node == nil) {
+    if (ctx == nil || node == nil || ctx.m == nil || ctx.text == nil) {
         ret;
     }
 
-    # TODO: parse and emit inline assembly
-    # for now this is a no-op
+    # get asm content from node.data
+    val content: str = node.data::str;
+    if (content == nil) {
+        ret;
+    }
+
+    # check for ISA-specific block: "x86_64 { ... }"
+    # the parser stores the full content including any ISA prefix
+    var asm_content: str = content;
+    var i: usize = 0;
+
+    # skip leading whitespace
+    for (content[i] == ' ' || content[i] == '\t' || content[i] == '\n' || content[i] == '\r') {
+        i = i + 1;
+    }
+
+    # check for "x86_64" prefix
+    if (content[i] == 'x' && content[i+1] == '8' && content[i+2] == '6' &&
+        content[i+3] == '_' && content[i+4] == '6' && content[i+5] == '4') {
+        i = i + 6;
+
+        # skip whitespace
+        for (content[i] == ' ' || content[i] == '\t' || content[i] == '\n' || content[i] == '\r') {
+            i = i + 1;
+        }
+
+        # expect '{'
+        if (content[i] == '{') {
+            i = i + 1;
+
+            # find matching '}'
+            var depth: i32 = 1;
+            val start: usize = i;
+            for (depth > 0 && content[i] != 0) {
+                if (content[i] == '{') {
+                    depth = depth + 1;
+                }
+                if (content[i] == '}') {
+                    depth = depth - 1;
+                }
+                if (depth > 0) {
+                    i = i + 1;
+                }
+            }
+
+            # extract inner content
+            val inner_len: usize = i - start;
+            if (inner_len > 0) {
+                val alloc_res: Result[*u8, allocator.AllocError] = ctx.alloc.alloc[u8](inner_len + 1);
+                if (alloc_res.is_ok()) {
+                    val buf: *u8 = alloc_res.unwrap_ok();
+                    var j: usize = 0;
+                    for (j < inner_len) {
+                        buf[j] = content[start + j];
+                        j = j + 1;
+                    }
+                    buf[inner_len] = 0;
+                    asm_content = buf::str;
+                }
+            }
+        }
+    }
+
+    # parse and emit the x86_64 asm
+    x86asm.parse_x86_64_asm(asm_content, ctx.text, ctx.m, ctx.alloc);
 }
 
 # --- function lowering ---
@@ -2609,43 +2779,70 @@ pub fun lower_inline_asm(ctx: *LowerContext, node: *ast.Node) {
 # node: function AST node
 # ret:  Ok(*IRFunction) on success, Err(str) on failure
 pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunction, str] {
+    print.eprintln("[lower_function] entered");
+
     if (ctx == nil) {
         ret err[*ir.IRFunction, str]("context is nil");
     }
+    print.eprintln("[lower_function] ctx ok");
 
     if (node == nil) {
         ret err[*ir.IRFunction, str]("node is nil");
     }
+    print.eprintln("[lower_function] node ok");
 
     # reset per-function state
+    print.eprintln("[lower_function] calling reset_function_state...");
     reset_function_state(ctx);
+    print.eprintln("[lower_function] reset_function_state done");
 
+    print.eprintln("[lower_function] calling node.get_name()...");
     val name: str = node.get_name();
+    print.eprintln("[lower_function] get_name returned");
     if (name == nil) {
         ret err[*ir.IRFunction, str]("function has no name");
     }
+    print.eprint("[lower_function] name = ");
+    print.eprintln(name);
 
     # create IR function
+    print.eprintln("[lower_function] creating IR function...");
     val fn_res: Result[*ir.IRFunction, str] = ir.create_function(ctx.alloc, name);
+    print.eprintln("[lower_function] ir.create_function returned");
     if (fn_res.is_err()) {
+        print.eprintln("[lower_function] ir.create_function failed");
         ret fn_res;
     }
+    print.eprintln("[lower_function] ir.create_function succeeded");
 
     val func: *ir.IRFunction = fn_res.unwrap_ok();
+    print.eprintln("[lower_function] unwrap_ok done");
     ctx.current_fn = func;
+    print.eprintln("[lower_function] ctx.current_fn assigned");
 
     # create entry block
+    print.eprintln("[lower_function] calling new_label...");
     val entry_label: str = new_label(ctx, "entry");
+    print.eprintln("[lower_function] new_label returned");
+    print.eprintln("[lower_function] calling ir.create_block...");
     val block_res: Result[*ir.IRBlock, str] = ir.create_block(ctx.alloc, entry_label);
+    print.eprintln("[lower_function] ir.create_block returned");
     if (block_res.is_err()) {
+        print.eprintln("[lower_function] ir.create_block failed");
         ret err[*ir.IRFunction, str](block_res.unwrap_err());
     }
+    print.eprintln("[lower_function] ir.create_block succeeded");
 
+    print.eprintln("[lower_function] calling block_res.unwrap_ok()...");
     val entry_block: *ir.IRBlock = block_res.unwrap_ok();
+    print.eprintln("[lower_function] entry_block obtained");
     ctx.current_block = entry_block;
+    print.eprintln("[lower_function] ctx.current_block assigned");
 
     # add block to function
+    print.eprintln("[lower_function] checking block capacity...");
     if (func.block_count >= func.block_cap) {
+        print.eprintln("[lower_function] need to grow blocks array");
         var new_cap: i32 = 8;
         if (func.block_cap > 0) {
             new_cap = func.block_cap * 2;
@@ -2660,50 +2857,98 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
 
         func.blocks = r.unwrap_ok();
         func.block_cap = new_cap;
+        print.eprintln("[lower_function] blocks array grown");
     }
 
+    print.eprintln("[lower_function] assigning entry_block to func.blocks...");
     func.blocks[func.block_count] = entry_block;
+    print.eprintln("[lower_function] entry_block assigned");
+    print.eprintln("[lower_function] incrementing block_count...");
     func.block_count = func.block_count + 1;
+    print.eprintln("[lower_function] block_count incremented");
 
     # emit function label
+    print.eprintln("[lower_function] calling emit_label...");
     emit_label(ctx, name);
+    print.eprintln("[lower_function] emit_label returned");
 
     # create MASM symbol for function
+    print.eprintln("[lower_function] creating MASM symbol...");
     if (ctx.m != nil) {
+        print.eprintln("[lower_function] ctx.m is not nil");
+        print.eprintln("[lower_function] calling sym.create...");
         val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, name);
+        print.eprintln("[lower_function] sym.create returned");
         if (sym_res.is_ok()) {
+            print.eprintln("[lower_function] sym_res is ok, unwrapping...");
             val s: *sym.Symbol = sym_res.unwrap_ok();
-            sym.set_binding(s, sym.bind_global());
-            sym.set_type(s, sym.sym_func());
+            print.eprintln("[lower_function] setting binding directly...");
+            # inline binding/type assignment to avoid struct copy bugs
+            s.binding.tag = sym.BIND_GLOBAL;
+            print.eprintln("[lower_function] setting type directly...");
+            s.sym_type.tag = sym.SYM_FUNC;
+            print.eprintln("[lower_function] adding symbol...");
             # offset will be set when we emit to section
             masm.add_symbol(ctx.m, s);
+            print.eprintln("[lower_function] symbol added");
         }
+    } or {
+        print.eprintln("[lower_function] ctx.m is nil, skipping symbol creation");
     }
+    print.eprintln("[lower_function] MASM symbol created");
 
     # check if this is the entry point (_start)
+    print.eprintln("[lower_function] checking is_entry...");
     val is_entry: bool = name != nil && name.equals("_start");
 
+    print.eprintln("[lower_function] is_entry check done");
+
     # determine function return type and whether we need sret
-    if (node.ty != nil && node.ty.kind == ty.TY_FUN && node.ty.ret_type != nil) {
-        ctx.fn_ret_type = node.ty.ret_type;
-        if (type_is_large_aggregate(ctx.fn_ret_type, ctx.ptr_size)) {
-            ctx.fn_has_sret = true;
+    print.eprintln("[lower_function] checking return type...");
+    print.eprintln("[lower_function] checking node.ty...");
+    if (node.ty != nil) {
+        print.eprintln("[lower_function] node.ty is not nil");
+        print.eprintln("[lower_function] checking node.ty.kind...");
+        if (node.ty.kind == ty.TY_FUN) {
+            print.eprintln("[lower_function] node.ty.kind is TY_FUN");
+            print.eprintln("[lower_function] checking node.ty.ret_type...");
+            if (node.ty.ret_type != nil) {
+                print.eprintln("[lower_function] node.ty.ret_type is not nil");
+                ctx.fn_ret_type = node.ty.ret_type;
+                print.eprintln("[lower_function] checking large aggregate...");
+                if (type_is_large_aggregate(ctx.fn_ret_type, ctx.ptr_size)) {
+                    ctx.fn_has_sret = true;
+                }
+                print.eprintln("[lower_function] large aggregate check done");
+            }
         }
+    } or {
+        print.eprintln("[lower_function] node.ty is nil");
     }
+    print.eprintln("[lower_function] return type check complete");
 
     # emit stack frame setup placeholder (will be patched after we know frame size)
     # for entry point, no frame setup
+    print.eprintln("[lower_function] getting frame_instr_idx...");
     val frame_instr_idx: i32 = ctx.current_block.instr_count;
+    print.eprintln("[lower_function] frame_instr_idx obtained");
     if (!is_entry) {
+        print.eprintln("[lower_function] calling emit_frame_setup...");
         emit_frame_setup(ctx, 0);  # placeholder with size 0
+        print.eprintln("[lower_function] emit_frame_setup done");
     }
 
     # track argument register usage
+    print.eprintln("[lower_function] initializing arg indices...");
     var int_arg_idx: i32 = 0;
     var float_arg_idx: i32 = 0;
+    print.eprintln("[lower_function] arg indices initialized");
 
     # handle hidden sret pointer for large aggregate returns
+    print.eprintln("[lower_function] checking sret...");
+    print.eprintln("[lower_function] is_entry and fn_has_sret checked");
     if (!is_entry && ctx.fn_has_sret) {
+        print.eprintln("[lower_function] has sret, processing...");
         # sret pointer is passed in first integer arg register
         ctx.stack_offset = ctx.stack_offset - ctx.ptr_size::i32;
         ctx.sret_offset = ctx.stack_offset;
@@ -2713,13 +2958,27 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
         val sret_reg: i32 = sysv64.get_arg_reg(0);
         val sret_addr: ir.IRValue = frame_mem(ctx, ctx.sret_offset, ctx.ptr_size);
         emit_store(ctx, sret_addr, ir.make_reg(sret_reg, ctx.ptr_size));
+        print.eprintln("[lower_function] sret processed");
     }
+    print.eprintln("[lower_function] sret check complete");
 
     # lower parameters - get param list from AST
-    val params: *ast.List = node.data::*ast.List;
+    print.eprintln("[lower_function] getting params from node.extra...");
+    # params are stored in node.extra (not node.data) by the parser
+    print.eprintln("[lower_function] checking if node.extra is nil...");
+    if (node.extra == nil) {
+        print.eprintln("[lower_function] node.extra is nil, skipping params");
+    } or {
+        print.eprintln("[lower_function] node.extra is not nil");
+    }
+    val params: *ast.List = node.extra::*ast.List;
+    print.eprintln("[lower_function] params cast done");
+    print.eprintln("[lower_function] checking is_entry and params...");
     if (!is_entry && params != nil) {
+        print.eprintln("[lower_function] processing params loop");
         var i: i32 = 0;
         for (i < params.count) {
+            print.eprintln("[lower_function] processing param");
             val param: *ast.Node = params.nodes[i];
             if (param == nil) {
                 i = i + 1;
@@ -2781,42 +3040,75 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
             i = i + 1;
         }
 
+        print.eprintln("[lower_function] params loop complete");
         func.param_count = params.count;
+        print.eprintln("[lower_function] param_count set");
     }
+    print.eprintln("[lower_function] params processing complete");
 
     # lower function body
-    val body: *ast.Node = node.extra::*ast.Node;
+    print.eprintln("[lower_function] getting function body...");
+    val body: *ast.Node = node.children;
+    print.eprintln("[lower_function] body obtained");
     if (body != nil) {
+        print.eprintln("[lower_function] lowering body...");
         lower_stmt(ctx, body);
+        print.eprintln("[lower_function] body lowered");
+    } or {
+        print.eprintln("[lower_function] body is nil, skipping");
     }
 
     # emit remaining deferred statements
+    print.eprintln("[lower_function] emitting deferred stmts...");
     emit_deferred_from(ctx, 0);
+    print.eprintln("[lower_function] deferred stmts emitted");
 
     # emit implicit return if no explicit return at end
+    print.eprintln("[lower_function] creating none_val...");
     var none_val: ir.IRValue;
+    print.eprintln("[lower_function] setting none_val.kind...");
     none_val.kind = ir.val_none();
+    print.eprintln("[lower_function] calling emit_ret...");
     emit_ret(ctx, none_val);
+    print.eprintln("[lower_function] emit_ret done");
 
     # record frame size and align to 16 bytes
+    print.eprintln("[lower_function] calculating frame size...");
     var frame_size: usize = 0;
     if (ctx.stack_offset < 0) {
         frame_size = (-ctx.stack_offset)::usize;
     }
+    print.eprintln("[lower_function] frame size calculated");
 
     # align frame size to stack alignment (16 bytes for sysv64)
+    print.eprintln("[lower_function] aligning frame size...");
     if (frame_size > 0 && frame_size % 16 != 0) {
         frame_size = (frame_size + 15) & ~15::usize;
     }
+    print.eprintln("[lower_function] frame size aligned");
 
+    print.eprintln("[lower_function] setting func.local_size...");
     func.local_size = frame_size;
+    print.eprintln("[lower_function] func.local_size set");
 
     # patch stack frame size in the frame setup instruction
+    print.eprintln("[lower_function] patching frame setup instruction...");
     if (!is_entry && ctx.current_block != nil && frame_instr_idx < ctx.current_block.instr_count) {
+        print.eprintln("[lower_function] patching instr dst.imm...");
         ctx.current_block.instrs[frame_instr_idx].dst.imm = frame_size::i64;
+        print.eprintln("[lower_function] instr patched");
     }
+    print.eprintln("[lower_function] frame setup patched");
 
-    ret ok[*ir.IRFunction, str](func);
+    print.eprintln("[lower_function] returning func...");
+    # workaround: create result in local variable to avoid return value corruption
+    # fully initialize all fields to avoid garbage
+    var result: Result[*ir.IRFunction, str];
+    result.tag = true;  # is_ok
+    result.value.ok = func;
+    result.value.err = nil;  # zero out the err side too
+    print.eprintln("[lower_function] result created, returning...");
+    ret result;
 }
 
 # --- global variable lowering ---
@@ -2897,6 +3189,81 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
 
 # --- module lowering ---
 
+# lower_decls_into: lower declarations from an AST into an existing lowering context.
+# ---
+# ctx:     lowering context (with m and text already set)
+# root:    program AST node
+# symbols: symbol table for this module
+# ret:     Ok(true) on success, Err(str) on failure
+pub fun lower_decls_into(ctx: *LowerContext, root: *ast.Node, symbols: *symbol.Table) Result[bool, str] {
+    if (ctx == nil) {
+        ret err[bool, str]("context is nil");
+    }
+    if (root == nil) {
+        ret err[bool, str]("root is nil");
+    }
+    if (symbols == nil) {
+        ret ok[bool, str](true);
+    }
+
+    # temporarily update symbols for this module
+    val saved_symbols: *symbol.Table = ctx.symbols;
+    ctx.symbols = symbols;
+
+    # iterate top-level declarations
+    val decls: *ast.List = root.get_list();
+    if (decls == nil) {
+        ctx.symbols = saved_symbols;
+        ret ok[bool, str](true);
+    }
+
+    var i: i32 = 0;
+    for (i < decls.count) {
+        val decl: *ast.Node = decls.nodes[i];
+        if (decl == nil) {
+            i = i + 1;
+            cnt;
+        }
+
+        val kind: ast.NodeKind = decl.kind;
+
+        # lower functions
+        if (kind == ast.NODE_DECL_FUN) {
+            val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, decl);
+            if (fn_res.is_err()) {
+                # TODO: collect errors instead of failing
+            } or {
+                # store IR function for later isel
+                add_ir_function(ctx, fn_res.unwrap_ok());
+            }
+        }
+        # lower global values
+        or (kind == ast.NODE_DECL_VAL || kind == ast.NODE_DECL_VAR) {
+            lower_global_var(ctx, decl);
+        }
+        # handle pub wrapper
+        or (kind == ast.NODE_DECL_PUB) {
+            val inner: *ast.Node = decl.get_child(0);
+            if (inner != nil) {
+                if (inner.kind == ast.NODE_DECL_FUN) {
+                    val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, inner);
+                    if (fn_res.is_ok()) {
+                        add_ir_function(ctx, fn_res.unwrap_ok());
+                    }
+                } or (inner.kind == ast.NODE_DECL_VAL || inner.kind == ast.NODE_DECL_VAR) {
+                    lower_global_var(ctx, inner);
+                }
+            }
+        }
+        # skip type declarations, use statements, tests, etc.
+
+        i = i + 1;
+    }
+
+    ctx.symbols = saved_symbols;
+    ret ok[bool, str](true);
+}
+
 # lower_module: lower an entire module AST to a MASM context.
 # ---
 # root:    program AST node
@@ -2907,7 +3274,15 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
 # ret:     Ok(*Masm) on success, Err(str) on failure
 pub fun lower_module(root: *ast.Node, symbols: *symbol.Table, types: *ty.TypeContext, alloc: *allocator.Allocator, tgt: target.Target) Result[*masm.Masm, str] {
     if (root == nil) {
-        ret err[*masm.Masm, str]("AST is nil");
+        ret err[*masm.Masm, str]("root is nil");
+    }
+
+    if (symbols == nil) {
+        ret err[*masm.Masm, str]("symbol table is nil");
+    }
+
+    if (types == nil) {
+        ret err[*masm.Masm, str]("type registry is nil");
     }
 
     if (alloc == nil) {
@@ -2934,59 +3309,121 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table, types: *ty.TypeCon
     ctx.m = m;
 
     # create .text section
+    val sec_kind: section.SectionKind = section.section_text();
     val text_res: Result[*section.Section, str] = masm.get_or_create_section(
-        m, ".text", section.section_text()
+        m, ".text", sec_kind
     );
     if (text_res.is_err()) {
         ret err[*masm.Masm, str](text_res.unwrap_err());
     }
     ctx.text = text_res.unwrap_ok();
 
-    # iterate top-level declarations
-    val decls: *ast.List = root.get_list();
-    if (decls == nil) {
-        ret ok[*masm.Masm, str](m);
+    # lower declarations from main module
+    val lower_res: Result[bool, str] = lower_decls_into(?ctx, root, symbols);
+    if (lower_res.is_err()) {
+        ret err[*masm.Masm, str](lower_res.unwrap_err());
     }
 
-    var i: i32 = 0;
-    for (i < decls.count) {
-        val decl: *ast.Node = decls.nodes[i];
-        if (decl == nil) {
-            i = i + 1;
-            cnt;
+    # run instruction selection on all collected IR functions
+    if (ctx.ir_func_count > 0) {
+        val isel_res: Result[bool, str] = isel.run_isel(m, ctx.ir_funcs, ctx.ir_func_count, alloc);
+        if (isel_res.is_err()) {
+            ret err[*masm.Masm, str](isel_res.unwrap_err());
         }
+    }
 
-        val kind: ast.NodeKind = decl.kind;
+    ret ok[*masm.Masm, str](m);
+}
 
-        # lower functions
-        if (kind == ast.NODE_DECL_FUN) {
-            val fn_res: Result[*ir.IRFunction, str] = lower_function(?ctx, decl);
-            if (fn_res.is_err()) {
-                # TODO: collect errors instead of failing
-            }
-        }
-        # lower global values
-        or (kind == ast.NODE_DECL_VAL || kind == ast.NODE_DECL_VAR) {
-            lower_global_var(?ctx, decl);
-        }
-        # handle pub wrapper
-        or (kind == ast.NODE_DECL_PUB) {
-            val inner: *ast.Node = decl.get_child(0);
-            if (inner != nil) {
-                if (inner.kind == ast.NODE_DECL_FUN) {
-                    lower_function(?ctx, inner);
-                } or (inner.kind == ast.NODE_DECL_VAL || inner.kind == ast.NODE_DECL_VAR) {
-                    lower_global_var(?ctx, inner);
+# lower_all_modules: lower main module plus all imported modules.
+# ---
+# root:       main module AST
+# symbols:    main module symbol table
+# types:      type context
+# alloc:      allocator
+# tgt:        target configuration
+# loaded:     array of loaded modules (from sema.get_loaded_modules)
+# load_count: number of loaded modules
+# ret:        Ok(*Masm) on success, Err(str) on failure
+pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.TypeContext, alloc: *allocator.Allocator, tgt: target.Target, loaded: *sema.LoadedModule, load_count: i32) Result[*masm.Masm, str] {
+    if (root == nil) {
+        ret err[*masm.Masm, str]("root is nil");
+    }
+
+    if (symbols == nil) {
+        ret err[*masm.Masm, str]("symbol table is nil");
+    }
+
+    if (types == nil) {
+        ret err[*masm.Masm, str]("type registry is nil");
+    }
+
+    if (alloc == nil) {
+        ret err[*masm.Masm, str]("allocator is nil");
+    }
+
+    # allocate masm context directly and initialize fields
+    # (avoid struct copy via @m = result.unwrap_ok() which has a codegen bug)
+    val m_alloc_res: Result[*masm.Masm, allocator.AllocError] = alloc.zalloc[masm.Masm](1);
+    if (m_alloc_res.is_err()) {
+        ret err[*masm.Masm, str](m_alloc_res.unwrap_err());
+    }
+
+    val m: *masm.Masm = m_alloc_res.unwrap_ok();
+
+    # initialize masm fields directly instead of copying from result
+    m.alloc = alloc;
+    m.tgt = tgt;
+    m.sections = nil;
+    m.section_count = 0;
+    m.section_cap = 0;
+    m.symbols = nil;
+    m.symbol_count = 0;
+    m.symbol_cap = 0;
+
+    # create lowering context
+    var ctx: LowerContext = init(alloc, symbols, types, tgt);
+    ctx.m = m;
+
+    # create .text section
+    val sec_kind: section.SectionKind = section.section_text();
+    val text_res: Result[*section.Section, str] = masm.get_or_create_section(
+        m, ".text", sec_kind
+    );
+    if (text_res.is_err()) {
+        ret err[*masm.Masm, str](text_res.unwrap_err());
+    }
+    ctx.text = text_res.unwrap_ok();
+
+    # lower main module first
+    val main_res: Result[bool, str] = lower_decls_into(?ctx, root, symbols);
+    if (main_res.is_err()) {
+        ret err[*masm.Masm, str](main_res.unwrap_err());
+    }
+
+    # lower all imported modules
+    if (loaded != nil && load_count > 0) {
+        var i: i32 = 0;
+        for (i < load_count) {
+            val mod_ast: *ast.Node = loaded[i].ast;
+            val mod_table: *symbol.Table = loaded[i].table;
+            if (mod_ast != nil && mod_table != nil) {
+                val mod_res: Result[bool, str] = lower_decls_into(?ctx, mod_ast, mod_table);
+                if (mod_res.is_err()) {
+                    # log but continue - don't fail entire build for one module
                 }
             }
+            i = i + 1;
         }
-        # skip type declarations, use statements, tests, etc.
-
-        i = i + 1;
     }
 
-    # clean up context
-    deinit(?ctx);
+    # run instruction selection on all collected IR functions
+    if (ctx.ir_func_count > 0) {
+        val isel_res: Result[bool, str] = isel.run_isel(m, ctx.ir_funcs, ctx.ir_func_count, alloc);
+        if (isel_res.is_err()) {
+            ret err[*masm.Masm, str](isel_res.unwrap_err());
+        }
+    }
 
     ret ok[*masm.Masm, str](m);
 }
