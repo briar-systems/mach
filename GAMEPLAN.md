@@ -44,6 +44,12 @@ Key compiler components (must be parity-matched):
 - [ ] mach can compile itself (full bootstrap)
 - [ ] Test suite passes on mach-compiled mach
 
+# Current Blockers
+
+- **Odd-size small aggregates crash at runtime** (3/5/6/7 byte structs/arrays): return-by-value, by-value args, and aggregate stores from calls all crash in self-hosted `mach`.
+  - Tests: `src/lang_test/odd_small_aggregates.mach` (10 crashes).
+  - Focus areas: `masm` lowering + isel load/store chunking, return/arg ABI handling, and aggregate copy paths.
+
 # Recent Fixes (Session 18)
 
 - **Fixed `_start` symbol missing**: Module buffer in `cmd_build.c` was limited to 64 entries, but project has 66+ modules
@@ -59,6 +65,13 @@ Key compiler components (must be parity-matched):
 - Added `lower_all_modules()` and `lower_decls_into()` to `lower.mach`
 - Fixed function params retrieval: `node.extra` not `node.data` (parser stores params in extra)
 - Text section grew from 18 bytes to 184KB
+
+# Session 19 Fixes (2026-02-03)
+
+- **Bootstrap isel parity:** resolve base+index vregs in x86_64 isel for explicit mem operands.
+- **Lowering cleanup:** removed manual vreg bump for large return values (rely on multi-slot vregs).
+- **Syntax normalization:** removed ternaries and invalid inline blocks in `build.mach`, `testing.mach`, `dep.mach`, `init.mach`, `sema.mach`, `isel.mach` to restore self-hosted parsing.
+- **Added tests:** `odd_small_aggregates.mach` covers 3/5/6/7-byte aggregates (returns, args, array index, globals).
 
 # Session 16 Fixes
 

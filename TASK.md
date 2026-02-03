@@ -159,3 +159,8 @@ This task advances the `GAMEPLAN.md` milestone "mach can compile itself (full bo
 ## 2026-02-02 23:52
 - bootstrap x86_64 isel: resolve both base+index vregs for explicit mem operands (emit_mov/load/store/binary op), matching self-hosted fix.
 - bootstrap lower: removed manual vreg bump for large return values; rely on alloc_vreg multi-slot sizing for platform-agnostic behavior.
+
+## 2026-02-03 00:10
+- normalized Mach syntax in tooling/helpers (removed ternaries + invalid inline blocks) across build/testing/dep/init/sema/isel.
+- added `src/lang_test/odd_small_aggregates.mach` and updated helpers; tests compile but **all 10 cases crash at runtime**.
+- next focus: odd-size small aggregate return/arg/copy paths in self-hosted masm lowering + isel (chunked load/store + ABI).

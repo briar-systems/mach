@@ -1250,12 +1250,16 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
                 }
                 else if (is_small_aggregate && op.kind == MASM_OPERAND_REGISTER && arg->kind != AST_EXPR_CALL)
                 {
-                    // op is a register holding the address; load the value from it
-                    MasmOperand addr_reg = op;
-                    MasmOperand val_reg  = alloc_vreg(ctx, arg->type->size);
-                    MasmOperand mem      = masm_operand_memory_simple(addr_reg.reg.id, 0, arg->type->size);
-                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(masm_type_for_chunk(arg->type->size))));
-                    op = val_reg;
+                    bool odd_size = (arg->type->size != 1 && arg->type->size != 2 && arg->type->size != 4 && arg->type->size != 8);
+                    if (!odd_size)
+                    {
+                        // op is a register holding the address; load the value from it
+                        MasmOperand addr_reg = op;
+                        MasmOperand val_reg  = alloc_vreg(ctx, arg->type->size);
+                        MasmOperand mem      = masm_operand_memory_simple(addr_reg.reg.id, 0, arg->type->size);
+                        masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(masm_type_for_chunk(arg->type->size))));
+                        op = val_reg;
+                    }
                 }
                 else
                 {
@@ -1569,7 +1573,8 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             // arrays and structs need LEA regardless of size because
             // indexing/field access expects a pointer base
             bool is_aggregate = expr->type && (expr->type->kind == TYPE_ARRAY || expr->type->kind == TYPE_STRUCT || expr->type->kind == TYPE_UNION);
-            if (var->size > 8 || is_aggregate)
+            bool is_odd_size  = (var->size != 1 && var->size != 2 && var->size != 4 && var->size != 8);
+            if (var->size > 8 || is_aggregate || is_odd_size)
             {
                 MasmOperand result = isa_result(ctx, 8);
                 MasmOperand addr   = frame_mem(ctx, var->offset, ctx->ptr_size);
@@ -1617,12 +1622,13 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
             {
                 // for aggregates/arrays, return address in register
                 bool is_aggregate = expr->type && (expr->type->kind == TYPE_ARRAY || expr->type->kind == TYPE_STRUCT || expr->type->kind == TYPE_UNION);
+                bool is_odd_size  = (sym->size != 1 && sym->size != 2 && sym->size != 4 && sym->size != 8);
 
                 MasmOperand addr     = isa_result(ctx, 8);
                 MasmOperand label_op = masm_operand_label(sym->name);
                 masm_section_append_inst(text, masm_inst_2(MASM_IR_LEA, addr, label_op));
 
-                if (is_aggregate || sym->size > 8)
+                if (is_aggregate || sym->size > 8 || is_odd_size)
                 {
                     return addr;
                 }
@@ -2310,12 +2316,16 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
 
                 if (is_small_aggregate && ret_val.kind == MASM_OPERAND_REGISTER && expr->kind != AST_EXPR_CALL)
                 {
-                    // ret_val is a register holding the address; load the value from it
-                    MasmOperand addr_reg = ret_val;
-                    MasmOperand val_reg  = alloc_vreg(ctx, expr->type->size);
-                    MasmOperand mem      = masm_operand_memory_simple(addr_reg.reg.id, 0, expr->type->size);
-                    masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(masm_type_for_chunk(expr->type->size))));
-                    ret_val = val_reg;
+                    bool odd_size = (expr->type->size != 1 && expr->type->size != 2 && expr->type->size != 4 && expr->type->size != 8);
+                    if (!odd_size)
+                    {
+                        // ret_val is a register holding the address; load the value from it
+                        MasmOperand addr_reg = ret_val;
+                        MasmOperand val_reg  = alloc_vreg(ctx, expr->type->size);
+                        MasmOperand mem      = masm_operand_memory_simple(addr_reg.reg.id, 0, expr->type->size);
+                        masm_section_append_inst(text, masm_inst_3(MASM_IR_LOAD, val_reg, mem, masm_operand_type(masm_type_for_chunk(expr->type->size))));
+                        ret_val = val_reg;
+                    }
                 }
                 else if (!is_small_aggregate || ret_val.kind != MASM_OPERAND_REGISTER)
                 {
