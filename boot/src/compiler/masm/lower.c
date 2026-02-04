@@ -3136,10 +3136,22 @@ static void lower_inline_masm(Masm *masm, MasmSection *text, const char *content
 
 static MasmOperand parse_operand(const char *str, LowerContext *ctx)
 {
+    if (!str)
+    {
+        return masm_operand_none();
+    }
+
+    const char *base = str;
+    const char *dot  = strrchr(str, '.');
+    if (dot && dot[1] != '\0')
+    {
+        base = dot + 1;
+    }
+
     // ISA-provided register parse
     if (ctx && ctx->isa && ctx->isa->parse_reg)
     {
-        MasmOperand reg = ctx->isa->parse_reg(str, ctx->ptr_size);
+        MasmOperand reg = ctx->isa->parse_reg(base, ctx->ptr_size);
         if (reg.kind != MASM_OPERAND_NONE)
         {
             return reg;
@@ -3147,14 +3159,14 @@ static MasmOperand parse_operand(const char *str, LowerContext *ctx)
     }
 
     // parse simple memory operands: [reg] or [reg+imm]
-    if (str[0] == '[')
+    if (base[0] == '[')
     {
-        size_t len = strlen(str);
+        size_t len = strlen(base);
         if (len >= 3 && str[len - 1] == ']')
         {
             char   inner[64];
             size_t copy_len = len - 2 < sizeof(inner) - 1 ? len - 2 : sizeof(inner) - 1;
-            memcpy(inner, str + 1, copy_len);
+            memcpy(inner, base + 1, copy_len);
             inner[copy_len] = '\0';
 
             // split on '+' if present
@@ -3167,23 +3179,23 @@ static MasmOperand parse_operand(const char *str, LowerContext *ctx)
                 off_str = plus + 1;
             }
 
-            MasmOperand base = parse_operand(reg_str, ctx);
-            if (base.kind == MASM_OPERAND_REGISTER)
+            MasmOperand base_reg = parse_operand(reg_str, ctx);
+            if (base_reg.kind == MASM_OPERAND_REGISTER)
             {
                 int64_t disp = 0;
                 if (off_str)
                 {
                     disp = strtoll(off_str, NULL, 0);
                 }
-                return masm_operand_memory_simple(base.reg.id, (int32_t)disp, 8);
+                return masm_operand_memory_simple(base_reg.reg.id, (int32_t)disp, 8);
             }
         }
     }
 
     // parse immediate (number)
     char *end;
-    long  val = strtol(str, &end, 10);
-    if (str != end && *end == '\0')
+    long  val = strtol(base, &end, 10);
+    if (base != end && *end == '\0')
     {
         return masm_operand_imm(val);
     }
@@ -3191,7 +3203,7 @@ static MasmOperand parse_operand(const char *str, LowerContext *ctx)
     // parse variable
     if (ctx)
     {
-        LocalVar *var = find_local_var(ctx, str);
+        LocalVar *var = find_local_var(ctx, base);
         if (var)
         {
             return frame_mem(ctx, var->offset, var->size);
