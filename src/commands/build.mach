@@ -7,7 +7,6 @@ use std.types.result;
 use allocator: std.allocator;
 use fs:        std.filesystem;
 use print:     std.print;
-use platform:  std.system.platform.linux.process;
 
 use args:     mach.cli.args;
 use cmd_help: mach.commands.help;
@@ -19,6 +18,7 @@ use parser:   mach.compiler.parser;
 use sema:     mach.compiler.sema;
 use symbol:   mach.compiler.symbol;
 use ty:       mach.compiler.type;
+use comptime: mach.compiler.comptime;
 
 use emit:     mach.compiler.masm.emit;
 use lower:    mach.compiler.masm.lower;
@@ -28,43 +28,6 @@ use target:   mach.compiler.masm.target;
 # mach.commands.build: build command implementation.
 # ---
 # compiles a Mach project or single source file.
-
-# run_command: execute a command using fork/exec and wait for completion.
-# ---
-# argv: null-terminated argument array (argv[0] = program path)
-# ret: exit code of the command (0 = success), or -1 on fork/exec failure
-fun run_command(argv: &&u8) i64 {
-    val pid: i64 = platform.fork();
-
-    if (pid < 0) {
-        ret -1;
-    }
-
-    if (pid == 0) {
-        # child process - execute the command
-        var envp: [1]&u8;
-        envp[0] = nil;
-
-        val result: i64 = platform.execve(argv[0], argv, ?envp[0]);
-
-        # if execve returns, it failed
-        platform.terminate(127);
-    }
-
-    # parent process - wait for child
-    var status: i32 = 0;
-    val wait_result: i64 = platform.waitpid(pid, ?status, 0);
-
-    if (wait_result < 0) {
-        ret -1;
-    }
-
-    if (platform.wifexited(status)) {
-        ret platform.wexitstatus(status)::i64;
-    }
-
-    ret -1;
-}
 
 # BuildOptions: parsed command-line options for build.
 rec BuildOptions {
@@ -389,8 +352,43 @@ fun compile_source(source: str, module_path: str, output_path: str, alloc: *allo
         sema.set_module_roots(?sem, project_id, src_root, dep_root, deps, dep_count);
     }
 
+    # ensure symbol table exists before creating comptime context
+    if (sem.symbols == nil) {
+        val table_res: Result[symbol.Table, str] = symbol.init(alloc);
+        if (table_res.is_err()) {
+            print.eprint("error: failed to create symbol table: ");
+            print.eprintln(table_res.unwrap_err());
+            sema.deinit(?sem);
+            p.deinit();
+            ret 1;
+        }
+
+        val table_ptr_res: Result[*symbol.Table, allocator.AllocError] = alloc.alloc[symbol.Table](1);
+        if (table_ptr_res.is_err()) {
+            print.eprintln("error: failed to allocate symbol table");
+            sema.deinit(?sem);
+            p.deinit();
+            ret 1;
+        }
+        val table_ptr: *symbol.Table = table_ptr_res.unwrap_ok();
+        @table_ptr = table_res.unwrap_ok();
+        sem.symbols = table_ptr;
+    }
+
+    # create comptime context
+    val cctx_init: comptime.ComptimeContext = comptime.init(alloc, sem.symbols, sem.types);
+    val cctx_ptr_res: Result[*comptime.ComptimeContext, allocator.AllocError] = alloc.alloc[comptime.ComptimeContext](1);
+    if (cctx_ptr_res.is_err()) {
+        print.eprintln("error: failed to allocate comptime context");
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+    val cctx_ptr: *comptime.ComptimeContext = cctx_ptr_res.unwrap_ok();
+    @cctx_ptr = cctx_init;
+
     # run semantic analysis
-    val analyze_res: Result[bool, str] = sema.analyze(?sem, root, module_path, source, nil);
+    val analyze_res: Result[bool, str] = sema.analyze(?sem, root, module_path, source, cctx_ptr);
     if (analyze_res.is_err()) {
         print.eprint("error: semantic analysis failed: ");
         print.eprintln(analyze_res.unwrap_err());
@@ -430,53 +428,11 @@ fun compile_source(source: str, module_path: str, output_path: str, alloc: *allo
 
     val m: *masm.Masm = lower_res.unwrap_ok();
 
-    # create object file path (output_path + ".o")
-    val out_len: usize = output_path.len();
-    val obj_path_res: Result[*u8, allocator.AllocError] = alloc.alloc[u8](out_len + 3);
-    if (obj_path_res.is_err()) {
-        print.eprintln("error: failed to allocate object path");
-        masm.destroy(m);
-        sema.deinit(?sem);
-        p.deinit();
-        ret 1;
-    }
-    val obj_buf: *u8 = obj_path_res.unwrap_ok();
-    var oi: usize = 0;
-    for (oi < out_len) {
-        obj_buf[oi] = output_path[oi];
-        oi = oi + 1;
-    }
-    obj_buf[out_len] = 46;      # '.'
-    obj_buf[out_len + 1] = 111; # 'o'
-    obj_buf[out_len + 2] = 0;
-    val obj_path: str = obj_buf::&u8;
-
-    # emit relocatable object file
-    val emit_res: Result[bool, str] = emit.emit_object(m, obj_path, alloc);
+    # emit executable directly (no external linker needed)
+    val emit_res: Result[bool, str] = emit.emit_executable(m, output_path, alloc);
     if (emit_res.is_err()) {
         print.eprint("error: code emission failed: ");
         print.eprintln(emit_res.unwrap_err());
-        masm.destroy(m);
-        sema.deinit(?sem);
-        p.deinit();
-        ret 1;
-    }
-
-    # link with cc to produce executable
-    # cc -nostdlib -no-pie -Wl,-e,_start -o <output> <obj>
-    var link_argv: [8]&u8;
-    link_argv[0] = "/usr/bin/cc";
-    link_argv[1] = "-nostdlib";
-    link_argv[2] = "-no-pie";
-    link_argv[3] = "-Wl,-e,_start";
-    link_argv[4] = "-o";
-    link_argv[5] = output_path;
-    link_argv[6] = obj_path;
-    link_argv[7] = nil;
-
-    val link_rc: i64 = run_command(?link_argv[0]);
-    if (link_rc != 0) {
-        print.eprintln("error: linking failed");
         masm.destroy(m);
         sema.deinit(?sem);
         p.deinit();
@@ -600,8 +556,7 @@ fun print_i32(n: i32) {
 
     buf[len] = 0;  # null terminator after digits
 
-    var s: str = ?buf[0];
-    print.eprint(s);
+    print.eprint((?buf[0])::str);
 }
 
 # handle: main entry point for the build command.

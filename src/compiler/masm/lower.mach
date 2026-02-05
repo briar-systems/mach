@@ -1335,8 +1335,7 @@ fun lower_string_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         val s: *sym.Symbol = sym_res.unwrap_ok();
         sym.set_binding(s, sym.bind_local());
         sym.set_type(s, sym.sym_object());
-        s.section = sec;
-        s.offset = sec.size;
+        sym.define(s, sec, sec.size, 0);
         masm.add_symbol(ctx.m, s);
     }
 
@@ -1776,12 +1775,21 @@ fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val operand: *ast.Node = node.get_child(0);
-    if (operand == nil) {
+    val op_node: *ast.Node = node.get_child(0);
+    if (op_node == nil) {
         ret make_none();
     }
 
-    val value: ir.IRValue = lower_expr(ctx, operand);
+    val src_ty: *ty.Type = op_node.ty;
+    val dst_ty: *ty.Type = node.ty;
+
+    # array to pointer/str casts should use the array address
+    if (src_ty != nil && src_ty.kind == ty.TY_ARRAY &&
+        dst_ty != nil && (dst_ty.kind == ty.TY_POINTER || dst_ty.kind == ty.TY_STR)) {
+        ret lower_lvalue(ctx, op_node);
+    }
+
+    val value: ir.IRValue = lower_expr(ctx, op_node);
 
     # determine target size
     var target_size: usize = 8;
@@ -2794,9 +2802,9 @@ pub fun lower_inline_asm(ctx: *LowerContext, node: *ast.Node) {
                 val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, label_name);
                 if (sym_res.is_ok()) {
                     val s: *sym.Symbol = sym_res.unwrap_ok();
-                    s.offset = text_sec.size;
                     sym.set_binding(s, sym.bind_global());
                     sym.set_type(s, sym.sym_func());
+                    sym.define(s, text_sec, text_sec.size, 0);
                     masm.add_symbol(ctx.m, s);
                 }
             }
@@ -2862,6 +2870,9 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     # emit function label
     emit_label(ctx, name);
 
+    # check if this is the entry point (_start)
+    val is_entry: bool = name != nil && name.equals("_start");
+
     # create MASM symbol for function
     if (ctx.m != nil) {
         val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, name);
@@ -2869,12 +2880,20 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
             val s: *sym.Symbol = sym_res.unwrap_ok();
             s.binding.tag = sym.BIND_GLOBAL;
             s.sym_type.tag = sym.SYM_FUNC;
+            
+            # for entry point functions, define symbol now at current .text offset
+            # because their code is emitted directly via inline asm, not through isel
+            if (is_entry) {
+                val text_res: Result[*section.Section, str] = masm.get_or_create_section(ctx.m, ".text", section.section_text());
+                if (text_res.is_ok()) {
+                    val text_sec: *section.Section = text_res.unwrap_ok();
+                    sym.define(s, text_sec, text_sec.size, 0);
+                }
+            }
+            
             masm.add_symbol(ctx.m, s);
         }
     }
-
-    # check if this is the entry point (_start)
-    val is_entry: bool = name != nil && name.equals("_start");
 
     # determine function return type and whether we need sret
     if (node.ty != nil) {
@@ -2985,7 +3004,11 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     # stack frame setup/teardown is handled by isel, not emitted as IR
 
     # add function to IR function list for code generation
-    add_ir_function(ctx, func);
+    # skip entry point functions - their code is emitted directly via inline asm
+    # and shouldn't go through isel which would add unwanted prologue/epilogue
+    if (!is_entry) {
+        add_ir_function(ctx, func);
+    }
 
     # workaround: create result in local variable to avoid return value corruption
     # fully initialize all fields to avoid garbage
@@ -3041,8 +3064,7 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
         val s: *sym.Symbol = sym_res.unwrap_ok();
         sym.set_binding(s, sym.bind_global());
         sym.set_type(s, sym.sym_object());
-        s.section = sec;
-        s.offset = offset;
+        sym.define(s, sec, offset, 0);
         masm.add_symbol(ctx.m, s);
     }
 
@@ -3166,82 +3188,174 @@ pub fun lower_module(ctx: *LowerContext, module: *ast.Node) i32 {
             }
         }
 
+        # comptime if - lower functions from taken branch
+        if (node.kind == ast.NODE_COMPTIME_IF) {
+            count = count + lower_comptime_if_functions(ctx, node);
+        }
+
         i = i + 1;
     }
 
     ret count;
 }
 
-# lower_entry_point: lower the program entry point (_start).
+# lower_comptime_if_functions: lower functions from a $if taken branch.
 # ---
-# ctx:       lowering context
-# main_name: name of the main function to call
-# ret:       Ok(*IRFunction) on success, Err(str) on failure
-pub fun lower_entry_point(ctx: *LowerContext, main_name: str) Result[*ir.IRFunction, str] {
-    if (ctx == nil || main_name == nil) {
-        ret err[*ir.IRFunction, str]("invalid arguments");
+# ctx:  lowering context
+# node: comptime_if node
+# ret:  number of functions lowered
+fun lower_comptime_if_functions(ctx: *LowerContext, node: *ast.Node) i32 {
+    if (ctx == nil || node == nil) {
+        ret 0;
     }
 
-    # create _start function
-    val fn_res: Result[*ir.IRFunction, str] = ir.create_function(ctx.alloc, "_start");
-    if (fn_res.is_err()) {
-        ret fn_res;
+    # get taken branch (stored in extra by sema)
+    val taken: *ast.Node = node.extra::*ast.Node;
+    if (taken == nil) {
+        ret 0;
     }
 
-    val func: *ir.IRFunction = fn_res.unwrap_ok();
-    ctx.current_fn = func;
+    var count: i32 = 0;
 
-    # create entry block
-    val entry_label: str = new_label(ctx, "entry");
-    val block_res: Result[*ir.IRBlock, str] = ir.create_block(ctx.alloc, entry_label);
-    if (block_res.is_err()) {
-        ret err[*ir.IRFunction, str](block_res.unwrap_err());
-    }
-
-    val entry_block: *ir.IRBlock = block_res.unwrap_ok();
-    ctx.current_block = entry_block;
-
-    # add block to function
-    if (ir.add_block(ctx.alloc, func, entry_block) < 0) {
-        ret err[*ir.IRFunction, str]("failed to add entry block");
-    }
-
-    # emit _start label
-    emit_label(ctx, "_start");
-
-    # create MASM symbol for _start
-    if (ctx.m != nil) {
-        val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, "_start");
-        if (sym_res.is_ok()) {
-            val s: *sym.Symbol = sym_res.unwrap_ok();
-            s.binding.tag = sym.BIND_GLOBAL;
-            s.sym_type.tag = sym.SYM_FUNC;
-            masm.add_symbol(ctx.m, s);
+    # taken might be a block with multiple declarations
+    if (taken.kind == ast.NODE_STMT_BLOCK) {
+        val decls: *ast.List = taken.extra::*ast.List;
+        if (decls != nil) {
+            var i: i32 = 0;
+            for (i < decls.count) {
+                val decl: *ast.Node = decls.nodes[i];
+                if (decl != nil) {
+                    if (decl.kind == ast.NODE_DECL_FUN) {
+                        val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, decl);
+                        if (fn_res.is_ok()) {
+                            val func: *ir.IRFunction = fn_res.unwrap_ok();
+                            add_ir_function(ctx, func);
+                            count = count + 1;
+                        }
+                    }
+                    if (decl.kind == ast.NODE_COMPTIME_IF) {
+                        count = count + lower_comptime_if_functions(ctx, decl);
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    } or {
+        # single declaration
+        if (taken.kind == ast.NODE_DECL_FUN) {
+            val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, taken);
+            if (fn_res.is_ok()) {
+                val func: *ir.IRFunction = fn_res.unwrap_ok();
+                add_ir_function(ctx, func);
+                count = count + 1;
+            }
+        }
+        if (taken.kind == ast.NODE_COMPTIME_IF) {
+            count = count + lower_comptime_if_functions(ctx, taken);
         }
     }
 
-    # call main function
-    val main_args: Result[*ir.IRValue, allocator.AllocError] = ctx.alloc.alloc[ir.IRValue](0);
-    if (main_args.is_ok()) {
-        val call_result: ir.IRValue = emit_call(ctx, main_name, main_args.unwrap_ok(), 0, 8);
-        ctx.alloc.free[ir.IRValue](main_args.unwrap_ok(), 0);
+    ret count;
+}
 
-        # exit with main's return value
-        # syscall exit(rax)
-        var exit_args: [1]ir.IRValue;
-        exit_args[0] = call_result;
-        emit_syscall(ctx, 60, ?exit_args[0], 1);  # SYS_exit = 60
+# lower_entry_point: lower the program entry point (_start).
+# emits x86_64 linux entry point code directly to .text section.
+# ---
+# ctx:       lowering context
+# main_name: name of the main function to call
+# ret:       Ok(true) on success, Err(str) on failure
+pub fun lower_entry_point(ctx: *LowerContext, main_name: str) Result[bool, str] {
+    if (ctx == nil || ctx.m == nil || main_name == nil) {
+        ret err[bool, str]("invalid arguments");
     }
 
-    # add entry point function to IR function list
-    add_ir_function(ctx, func);
+    # get .text section
+    val text_res: Result[*section.Section, str] = masm.get_or_create_section(ctx.m, ".text", section.section_text());
+    if (text_res.is_err()) {
+        ret err[bool, str]("failed to get .text section");
+    }
+    val text: *section.Section = text_res.unwrap_ok();
 
-    # workaround: create result in local variable
-    var result: Result[*ir.IRFunction, str];
-    result.tag = true;  # is_ok
-    result.value.ok = func;
-    result.value.err = nil;
-    ret result;
+    # create and define _start symbol at current .text offset
+    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, "_start");
+    if (sym_res.is_err()) {
+        ret err[bool, str]("failed to create _start symbol");
+    }
+    val s: *sym.Symbol = sym_res.unwrap_ok();
+    s.binding.tag = sym.BIND_GLOBAL;
+    s.sym_type.tag = sym.SYM_FUNC;
+    sym.define(s, text, text.size, 0);
+    masm.add_symbol(ctx.m, s);
+
+    # emit x86_64 linux entry point code:
+    #   mov rax, rsp          ; rax = initial stack pointer
+    #   mov rdi, [rax]        ; argc -> rdi (1st argument)
+    #   lea rsi, [rax+8]      ; argv -> rsi (2nd argument)
+    #   and rsp, -16          ; align stack to 16 bytes
+    #   sub rsp, 8            ; adjust for CALL (pushes 8-byte return address)
+    #   call main
+    #   mov rdi, rax          ; exit code from main -> rdi (1st syscall arg)
+    #   mov rax, 60           ; SYS_exit
+    #   syscall
+
+    # mov rax, rsp (48 89 e0)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x89);
+    section.emit_byte(ctx.alloc, text, 0xe0);
+
+    # mov rdi, [rax] (48 8b 38)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x8b);
+    section.emit_byte(ctx.alloc, text, 0x38);
+
+    # lea rsi, [rax+8] (48 8d 70 08)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x8d);
+    section.emit_byte(ctx.alloc, text, 0x70);
+    section.emit_byte(ctx.alloc, text, 0x08);
+
+    # and rsp, -16 (48 83 e4 f0)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x83);
+    section.emit_byte(ctx.alloc, text, 0xe4);
+    section.emit_byte(ctx.alloc, text, 0xf0);
+
+    # sub rsp, 8 (48 83 ec 08)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x83);
+    section.emit_byte(ctx.alloc, text, 0xec);
+    section.emit_byte(ctx.alloc, text, 0x08);
+
+    # call main (e8 xx xx xx xx) - relative call, needs relocation
+    # record offset of displacement for relocation
+    section.emit_byte(ctx.alloc, text, 0xe8);
+    val call_offset: usize = text.size;
+    # placeholder for 32-bit relative displacement (will be patched by relocation)
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+
+    # add relocation for call main
+    section.add_relocation(ctx.alloc, text, call_offset, main_name, section.RELOC_PC32, -4);
+
+    # mov rdi, rax (48 89 c7)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x89);
+    section.emit_byte(ctx.alloc, text, 0xc7);
+
+    # mov eax, 60 (b8 3c 00 00 00)
+    section.emit_byte(ctx.alloc, text, 0xb8);
+    section.emit_byte(ctx.alloc, text, 0x3c);
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+
+    # syscall (0f 05)
+    section.emit_byte(ctx.alloc, text, 0x0f);
+    section.emit_byte(ctx.alloc, text, 0x05);
+
+    ret ok[bool, str](true);
 }
 
 # lower_all_modules: lower main module and all imported modules to MASM.
@@ -3278,6 +3392,12 @@ pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.Ty
     # create lower context
     var ctx: LowerContext = init(alloc, symbols, types, tgt, m_ptr, nil);
     
+    # pre-create sections in the correct order for ELF output
+    # .text must come first so it gets section index 1
+    val text_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".text", section.section_text());
+    val rodata_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".rodata", section.section_rodata());
+    val data_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".data", section.section_data());
+    
     # lower main module
     val main_count: i32 = lower_module(?ctx, root);
     if (main_count < 0) {
@@ -3297,17 +3417,24 @@ pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.Ty
         i = i + 1;
     }
     
-    # create entry point (_start) that calls main
-    val entry_res: Result[*ir.IRFunction, str] = lower_entry_point(?ctx, "main");
-    if (entry_res.is_err()) {
-        ret err[*masm.Masm, str]("failed to create entry point");
-    }
-
-    # run instruction selection to generate machine code
+    # run instruction selection to generate machine code for all IR functions
     if (ctx.ir_func_count > 0) {
         val isel_res: Result[bool, str] = isel.run_isel(m_ptr, ctx.ir_funcs, ctx.ir_func_count, alloc);
         if (isel_res.is_err()) {
             ret err[*masm.Masm, str](isel_res.unwrap_err());
+        }
+    }
+
+    # create entry point (_start) if not already present
+    # check if _start symbol already exists (e.g., from std.runtime via $if)
+    val existing_start: *sym.Symbol = masm.get_symbol(m_ptr, "_start");
+    if (existing_start == nil) {
+        # synthesize _start that sets up argc/argv and calls main
+        # note: std.runtime would provide this via $if conditional, but the
+        # self-hosted compiler doesn't yet support $if, so we synthesize it here
+        val entry_res: Result[bool, str] = lower_entry_point(?ctx, "main");
+        if (entry_res.is_err()) {
+            ret err[*masm.Masm, str]("failed to create entry point");
         }
     }
 
