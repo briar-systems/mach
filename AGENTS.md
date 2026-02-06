@@ -225,3 +225,39 @@ The compiler uses a two-layer backend called MASM:
 - `doc/testing.md` (test runner, filtering, output semantics)
 - `doc/cheatsheet.md` (syntax and toolchain commands)
 - `doc/getting-started.md` (build setup and prerequisites)
+
+## Self-Hosting Status (Current)
+
+### Build Chain
+```
+cmach (C bootstrap) → imach (Mach compiled by C) → mach (Mach compiled by Mach)
+      ↓ works              ↓ works                    ↓ CRASHES (SIGILL)
+```
+
+### Current Issue: Code Corruption
+The final `mach` binary crashes with "Illegal instruction" - malformed machine code.
+- Crash shows zeroed bytes (`00 00 00 00`) where instructions should be
+- Likely cause: instruction encoding or ELF section writing bugs
+
+### AST Field Mappings (Critical Reference)
+Parser stores data in these fields - mismatches cause silent bugs:
+
+| Node Type | `data` | `extra` | `children` |
+|-----------|--------|---------|------------|
+| VAR/VAL decl | name (str) | type node | initializer |
+| CALL expr | arguments (*List) | type args | callee |
+| FIELD access | field name (str) | - | base expr |
+
+### Key Files for Debugging
+- `src/compiler/masm/isa/x86_64/encode.mach` - instruction encoding
+- `src/compiler/masm/isel.mach` - instruction selection
+- `src/compiler/masm/of/elf.mach` - ELF output
+- `src/compiler/masm/lower.mach` - IR lowering
+
+### Comparison Commands
+```bash
+# Compare working (imach) vs broken (mach)
+objdump -d ./out/bin/imach > /tmp/imach.asm
+objdump -d ./out/linux/bin/mach > /tmp/mach.asm
+diff /tmp/imach.asm /tmp/mach.asm | head -200
+```

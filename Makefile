@@ -6,7 +6,7 @@
 #
 # directory structure:
 #   out/
-#     bin/         # final binaries (cmach, imach, mach)
+#     bin/         # final binaries (cmach, imach)
 #     cmach/       # cmach artifacts (obj/)
 #     imach/<target>/  # imach artifacts (ast/, ir/, asm/, obj/)
 #     mach/<target>/   # mach artifacts (ast/, ir/, asm/, obj/)
@@ -32,7 +32,7 @@ CMACH_OBJ_DIR := $(OUT_DIR)/cmach/obj
 # final executables
 CMACH := $(BIN_DIR)/cmach
 IMACH := $(BIN_DIR)/imach
-MACH := $(BIN_DIR)/mach
+MACH := $(OUT_DIR)/linux/bin/mach
 
 # bootstrap compiler sources
 BOOT_SOURCES := $(shell find $(BOOT_SRC_DIR) -type f -name '*.c')
@@ -61,7 +61,7 @@ help:
 	@echo "final (compiled with imach):"
 	@echo "  mach-clean   - clean mach build artifacts"
 	@echo "  mach-build   - build mach"
-	@echo "  mach         - clean and build mach"
+	@echo "  mach         - clean and build mach (output per mach.toml)"
 	@echo ""
 	@echo "meta:"
 	@echo "  clean        - clean all build artifacts"
@@ -148,8 +148,5 @@ $(MACH): $(IMACH)
 	@echo "  cleaning artifacts for mach build"
 	@rm -rf $(OUT_DIR)/mach
 	@echo "  imach -> mach"
-	@echo ""
-	@echo "  NOTE: This stage of the pipeline is incomplete and included for scaffolding purposes"
-	@echo ""
 	@$(IMACH) build .
 	@echo "final compiler ready: $@"

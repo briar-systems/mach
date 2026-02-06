@@ -15,6 +15,7 @@ typedef struct LocalVar
     const char *name;
     int32_t     offset; // offset from RBP (negative for locals)
     uint8_t     size;
+    Type       *type;   // resolved type (for method call detection)
 } LocalVar;
 
 typedef struct LowerContext
@@ -68,6 +69,9 @@ typedef struct LowerContext
     int *str_counter;
     int *label_counter;
     int *loop_counter;
+
+    // symbol table for method call resolution
+    SymbolTable *symbols;
 } LowerContext;
 
 // module-level counters that persist across all function lowering
@@ -201,6 +205,8 @@ static LowerContext *create_context(MasmTarget target, ModuleCounters *counters)
     ctx->str_counter   = &counters->str_counter;
     ctx->label_counter = &counters->label_counter;
     ctx->loop_counter  = &counters->loop_counter;
+
+    ctx->symbols = NULL; // set later by lower_function
     return ctx;
 }
 
@@ -461,7 +467,7 @@ static void pop_loop_defer_mark(LowerContext *ctx)
     }
 }
 
-static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, int size)
+static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, int size, Type *type)
 {
     if (ctx->var_count >= ctx->var_capacity)
     {
@@ -471,6 +477,7 @@ static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, i
     ctx->vars[ctx->var_count].name   = name;
     ctx->vars[ctx->var_count].offset = offset;
     ctx->vars[ctx->var_count].size   = size;
+    ctx->vars[ctx->var_count].type   = type;
     ctx->var_count++;
 }
 
@@ -924,7 +931,7 @@ static MasmOperand lower_assign(Masm *masm, MasmSection *text, AstNode *expr, Lo
             MasmOperand sym_op = masm_operand_symbol(lhs->ident_expr.name);
             if (lhs->symbol)
             {
-                const char *link_name = symbol_get_linkage_name(lhs->symbol);
+                const char *link_name = symbol_linkage_name(lhs->symbol);
                 if (link_name)
                 {
                     sym_op = masm_operand_symbol(link_name);
@@ -1213,7 +1220,7 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
             target = masm_operand_label(func->ident_expr.name);
             if (func->symbol)
             {
-                const char *link = symbol_get_linkage_name(func->symbol);
+                const char *link = symbol_linkage_name(func->symbol);
                 if (link)
                 {
                     target = masm_operand_label(link);
@@ -1224,7 +1231,7 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
     else if (func->kind == AST_EXPR_FIELD && func->field_expr.is_method && func->symbol)
     {
         // Method call: use symbol linkage name for direct call
-        const char *link = symbol_get_linkage_name(func->symbol);
+        const char *link = symbol_linkage_name(func->symbol);
         if (link)
         {
             target = masm_operand_label(link);
@@ -1232,6 +1239,97 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
         else
         {
             // Fallback to indirect call if no linkage name
+            target = lower_expr(masm, text, func, ctx);
+            target = ensure_in_reg(text, target, func->type, ctx);
+        }
+    }
+    else if (func->kind == AST_EXPR_FIELD)
+    {
+        // FIELD callee without sema-resolved is_method/symbol.
+        // This happens for imported modules where sema pass 3 didn't run.
+        // Detect method calls by checking local variable types and symbol tables.
+        const char *method_name = func->field_expr.field;
+        AstNode    *base        = func->field_expr.object;
+        bool        is_module_qualified  = false;
+        const char *receiver_type_name   = NULL;
+
+        if (base && base->kind == AST_EXPR_IDENT)
+        {
+            // Check if base is a local variable (method call) or module alias
+            LocalVar *lvar = find_local_var(ctx, base->ident_expr.name);
+            if (lvar)
+            {
+                // It's a local variable - get type for method qualification
+                Type *base_type = lvar->type;
+                while (base_type && base_type->kind == TYPE_POINTER)
+                    base_type = base_type->pointer.base;
+
+                if (base_type && base_type->kind == TYPE_STRUCT && base_type->structure.name)
+                    receiver_type_name = base_type->structure.name;
+                else if (base_type && base_type->kind == TYPE_UNION && base_type->union_type.name)
+                    receiver_type_name = base_type->union_type.name;
+                // else: type is nil or primitive - will fall through to symbol search
+            }
+            else
+            {
+                // Not a local variable - assume module-qualified call
+                is_module_qualified = true;
+            }
+        }
+        // else: base is not an identifier (chained call) - always a method call
+
+        // If no type found and not module-qualified, search symbol tables
+        if (!is_module_qualified && !receiver_type_name && method_name && ctx->symbols)
+        {
+            Symbol *method_sym = symbol_table_lookup_method_local(ctx->symbols, method_name);
+            if (method_sym && method_sym->name)
+            {
+                const char *dot = strrchr(method_sym->name, '.');
+                if (dot)
+                {
+                    size_t prefix_len = (size_t)(dot - method_sym->name);
+                    char  *prefix     = malloc(prefix_len + 1);
+                    memcpy(prefix, method_sym->name, prefix_len);
+                    prefix[prefix_len] = '\0';
+                    receiver_type_name = prefix;
+                }
+            }
+        }
+
+        if (!is_module_qualified && receiver_type_name && method_name)
+        {
+            // Build qualified name "ReceiverType.methodName" and verify it exists
+            size_t rlen      = strlen(receiver_type_name);
+            size_t mlen      = strlen(method_name);
+            char  *qualified = malloc(rlen + 1 + mlen + 1);
+            memcpy(qualified, receiver_type_name, rlen);
+            qualified[rlen] = '.';
+            memcpy(qualified + rlen + 1, method_name, mlen);
+            qualified[rlen + 1 + mlen] = '\0';
+
+            // Verify the qualified method exists in the symbol table
+            Symbol *verified = ctx->symbols ? symbol_table_lookup(ctx->symbols, qualified) : NULL;
+            if (verified)
+            {
+                const char *link = symbol_linkage_name(verified);
+                target = masm_operand_label(link ? link : qualified);
+            }
+            else
+            {
+                // Not a method - it's a field access (function pointer call)
+                free(qualified);
+                target = lower_expr(masm, text, func, ctx);
+                target = ensure_in_reg(text, target, func->type, ctx);
+            }
+        }
+        else if (is_module_qualified)
+        {
+            // Module-qualified call - use bare method name as label
+            target = masm_operand_label(method_name);
+        }
+        else
+        {
+            // Unresolved - fall back to indirect call
             target = lower_expr(masm, text, func, ctx);
             target = ensure_in_reg(text, target, func->type, ctx);
         }
@@ -1720,7 +1818,7 @@ static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, Lowe
         // in a different lowered module (e.g. `true`/`false` from std.types.bool).
         if (expr->symbol)
         {
-            const char *link_name = symbol_get_linkage_name(expr->symbol);
+            const char *link_name = symbol_linkage_name(expr->symbol);
             if (!link_name)
             {
                 link_name = expr->symbol->name;
@@ -2500,7 +2598,7 @@ static void lower_stmt(Masm *masm, MasmSection *text, AstNode *stmt, LowerContex
         int32_t offset = ctx->stack_offset;
 
         // add to symbol table with the logical size (so later loads use correct width)
-        add_local_var(ctx, stmt->var_stmt.name, offset, (int)var_size);
+        add_local_var(ctx, stmt->var_stmt.name, offset, (int)var_size, stmt->type);
 
         // if there's an initializer, evaluate and store it
         if (stmt->var_stmt.init)
@@ -3215,7 +3313,6 @@ static MasmOperand parse_operand(const char *str, LowerContext *ctx)
 
 static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols, ModuleCounters *counters)
 {
-    (void)symbols;
 
     // guard: this lowering path is currently x86_64-only. fail fast on other ISAs
     if (masm->target.isa != MASM_ISA_X86_64)
@@ -3230,7 +3327,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
 
     if (func_node->symbol)
     {
-        const char *link_name = symbol_get_linkage_name(func_node->symbol);
+        const char *link_name = symbol_linkage_name(func_node->symbol);
         if (link_name)
         {
             func_name = link_name;
@@ -3256,6 +3353,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
 
     // create context for this function
     LowerContext *ctx = create_context(masm->target, counters);
+    ctx->symbols = symbols;
 
     // determine whether this function returns an aggregate via an implicit sret pointer.
     // sema stores the function type on the symbol (node->type is not reliably populated for fun stmts).
@@ -3392,7 +3490,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
             param_fp[i]      = is_fp;
 
             // add to symbol table with its logical size
-            add_local_var(ctx, param->param_stmt.name, offset, (int)param_size);
+            add_local_var(ctx, param->param_stmt.name, offset, (int)param_size, param ? param->type : NULL);
         }
 
         // Pass 1: Save all scalar and FP parameters from registers to frame slots FIRST
@@ -3953,7 +4051,7 @@ static void lower_global_var(Masm *masm, AstNode *stmt, ModuleCounters *counters
     const char *name = stmt->var_stmt.name;
     if (stmt->symbol)
     {
-        const char *link_name = symbol_get_linkage_name(stmt->symbol);
+        const char *link_name = symbol_linkage_name(stmt->symbol);
         if (link_name)
         {
             name = link_name;

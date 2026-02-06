@@ -122,7 +122,7 @@ void symbol_mangle(Symbol *symbol)
     sprintf(ptr, "N%zu%s", name_len, symbol->name);
 }
 
-const char *symbol_get_linkage_name(Symbol *symbol)
+const char *symbol_linkage_name(Symbol *symbol)
 {
     if (!symbol)
     {

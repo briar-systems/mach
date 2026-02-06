@@ -47,7 +47,7 @@ typedef struct SymbolTable
 Symbol     *symbol_create(const char *name, SymbolKind kind, const char *module_path);
 void        symbol_destroy(Symbol *symbol);
 void        symbol_mangle(Symbol *symbol);
-const char *symbol_get_linkage_name(Symbol *symbol);
+const char *symbol_linkage_name(Symbol *symbol);
 
 // symbol table operations
 SymbolTable *symbol_table_create(SymbolTable *parent);

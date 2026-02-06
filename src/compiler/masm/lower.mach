@@ -205,6 +205,7 @@ pub rec LocalVar {
     name:   str;
     offset: i32;
     size:   usize;
+    ty:     *ty.Type;
 }
 
 # LowerContext: context for lowering AST to IR.
@@ -296,6 +297,27 @@ pub rec LowerContext {
     ir_funcs:         **ir.IRFunction;
     ir_func_count:    i32;
     ir_func_cap:      i32;
+
+    # imported modules for cross-module symbol lookup
+    loaded_mods:      **sema.SemaModule;
+    loaded_mod_count: i32;
+
+    # current module being lowered (for alias/import resolution)
+    current_sema_mod: *sema.SemaModule;
+
+    # type bindings for generic method instantiation
+    # when lowering an instantiated generic method body, these map
+    # generic param names (e.g., "T", "E") to concrete types
+    type_binding_names:  *str;
+    type_binding_types:  **ty.Type;
+    type_binding_count:  i32;
+
+    # override for function name when lowering instantiations
+    func_name_override:  str;
+    # override for receiver type
+    recv_type_override:  *ty.Type;
+    # override for return type
+    ret_type_override:   *ty.Type;
 }
 
 # init: initialize a lowering context.
@@ -347,7 +369,168 @@ pub fun init(alloc: *allocator.Allocator, symbols: *symbol.Table, types: *ty.Typ
     # initialize ABI
     ctx.abi = sysv64.get();
 
+    # imported modules (set later by lower_all_modules)
+    ctx.loaded_mods = nil;
+    ctx.loaded_mod_count = 0;
+
+    # type bindings (for generic instantiation lowering)
+    ctx.type_binding_names = nil;
+    ctx.type_binding_types = nil;
+    ctx.type_binding_count = 0;
+    ctx.func_name_override = nil;
+    ctx.recv_type_override = nil;
+    ctx.ret_type_override = nil;
+
     ret ctx;
+}
+
+# find_method_type_name: search symbol tables for a method and return its type prefix.
+# ---
+# for a method name like "equals", searches for symbols named "*.equals" and
+# returns the type prefix (e.g., "str" from "str.equals").
+# ctx:  lowering context
+# method_name: method name to search for
+# ret:  type name prefix or nil
+fun find_method_type_name(ctx: *LowerContext, method_name: str) str {
+    if (ctx == nil || method_name == nil) {
+        ret nil;
+    }
+
+    val method_len: usize = method_name.len();
+
+    # search current module's symbol table
+    if (ctx.symbols != nil) {
+        val found: str = search_scope_for_method(ctx, ctx.symbols.root_scope(), method_name, method_len);
+        if (found != nil) {
+            ret found;
+        }
+    }
+
+    # search imported modules
+    if (ctx.loaded_mods != nil) {
+        var k: i32 = 0;
+        for (k < ctx.loaded_mod_count) {
+            val smod: *sema.SemaModule = ctx.loaded_mods[k];
+            if (smod != nil && smod.table != nil) {
+                val found: str = search_scope_for_method(ctx, smod.table.root_scope(), method_name, method_len);
+                if (found != nil) {
+                    ret found;
+                }
+            }
+            k = k + 1;
+        }
+    }
+
+    ret nil;
+}
+
+# search_scope_for_method: search a scope for a symbol ending in ".methodName".
+fun search_scope_for_method(ctx: *LowerContext, root: *symbol.Scope, method_name: str, method_len: usize) str {
+    if (root == nil) {
+        ret nil;
+    }
+
+    var i: i32 = 0;
+    for (i < root.symbol_count) {
+        val found_sym: *symbol.Symbol = ?root.symbols[i];
+        if (found_sym != nil && found_sym.name != nil) {
+            val slen: usize = found_sym.name.len();
+            if (slen > method_len + 1) {
+                val dot_pos: usize = slen - method_len - 1;
+                if (found_sym.name[dot_pos] == '.') {
+                    val suffix: str = (found_sym.name::usize + dot_pos + 1)::str;
+                    if (suffix.equals(method_name)) {
+                        val buf_res: Result[*u8, allocator.AllocError] = ctx.alloc.alloc[u8](dot_pos + 1);
+                        if (buf_res.is_ok()) {
+                            val buf: *u8 = buf_res.unwrap_ok();
+                            var j: usize = 0;
+                            for (j < dot_pos) {
+                                buf[j] = found_sym.name[j];
+                                j = j + 1;
+                            }
+                            buf[dot_pos] = 0;
+                            ret buf::str;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    ret nil;
+}
+
+# is_module_alias: check if a name is a module alias (not a local variable or value symbol).
+# ---
+# called when base_name is not found in local_vars and has no type.
+# checks the current symbol table for a value symbol with this name.
+# if no value symbol is found, the name is assumed to be a module alias.
+# ctx:  lowering context
+# name: name to check
+# ret:  true if name is likely a module alias
+fun is_module_alias(ctx: *LowerContext, name: str) bool {
+    if (ctx == nil || name == nil) {
+        ret false;
+    }
+
+    # check if name is a known value/function symbol in the current module's scope
+    if (ctx.symbols != nil) {
+        val result: Option[*symbol.Symbol] = ctx.symbols.lookup(name);
+        if (result.is_some()) {
+            val s: *symbol.Symbol = result.unwrap();
+            # if it's a value, parameter, or function - it's not a module alias
+            if (s.is_value_symbol() || s.is_callable()) {
+                ret false;
+            }
+        }
+    }
+
+    # check the current module's aliases list directly
+    if (ctx.current_sema_mod != nil) {
+        var alias: *sema.ModuleAlias = ctx.current_sema_mod.aliases;
+        for (alias != nil) {
+            if (alias.alias != nil && alias.alias.equals(name)) {
+                ret true;
+            }
+            alias = alias.next;
+        }
+    }
+
+    # not found as a value symbol in current scope - likely a module alias
+    # (module aliases are stored in SemaModule, not in the symbol table)
+    ret true;
+}
+
+# lookup_symbol_in_imports: search imported modules for a symbol by name.
+# ---
+# ctx:  lowering context
+# name: symbol name to find
+# ret:  pointer to symbol if found, nil otherwise
+fun lookup_symbol_in_imports(ctx: *LowerContext, name: str) *symbol.Symbol {
+    if (ctx == nil || name == nil || ctx.loaded_mods == nil) {
+        ret nil;
+    }
+
+    var i: i32 = 0;
+    for (i < ctx.loaded_mod_count) {
+        val smod: *sema.SemaModule = ctx.loaded_mods[i];
+        if (smod != nil && smod.table != nil) {
+            val root: *symbol.Scope = smod.table.root_scope();
+            if (root != nil) {
+                val found_opt: Option[*symbol.Symbol] = root.lookup_local(name);
+                if (found_opt.is_some()) {
+                    val found: *symbol.Symbol = found_opt.unwrap();
+                    if (found.is_public) {
+                        ret found;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    ret nil;
 }
 
 # reset_function_state: reset per-function state for a new function.
@@ -426,7 +609,7 @@ fun add_ir_function(ctx: *LowerContext, func: *ir.IRFunction) bool {
 # name:  variable name
 # size:  size in bytes
 # ret:   stack offset for the variable
-fun add_local_var(ctx: *LowerContext, name: str, size: usize) i32 {
+fun add_local_var(ctx: *LowerContext, name: str, size: usize, var_ty: *ty.Type) i32 {
     if (ctx == nil || ctx.alloc == nil) {
         ret 0;
     }
@@ -463,6 +646,7 @@ fun add_local_var(ctx: *LowerContext, name: str, size: usize) i32 {
     ctx.local_vars[idx].name = name;
     ctx.local_vars[idx].offset = ctx.stack_offset;
     ctx.local_vars[idx].size = size;
+    ctx.local_vars[idx].ty = var_ty;
     ctx.local_count = ctx.local_count + 1;
 
     ret ctx.stack_offset;
@@ -685,6 +869,288 @@ pub fun new_label(ctx: *LowerContext, prefix: str) str {
     ret buf::str;
 }
 
+# find_instantiated_type: search all types in the context for an instantiated type
+# matching the given base name and generic arguments.
+# ---
+# ctx:       lowering context
+# base_name: name of the generic type (e.g., "Result")
+# args:      array of resolved concrete type arguments
+# arg_count: number of arguments
+# ret:       matching instantiated Type, or nil
+fun find_instantiated_type(ctx: *LowerContext, base_name: str, args: **ty.Type, arg_count: i32) *ty.Type {
+    if (ctx == nil || ctx.types == nil || base_name == nil || args == nil || arg_count <= 0) {
+        ret nil;
+    }
+
+    # iterate all types in the context to find a matching instantiation
+    var ti: i32 = 0;
+    for (ti < ctx.types.type_count) {
+        val t: *ty.Type = ctx.types.types[ti];
+        if (t != nil && t.name != nil && t.name.equals(base_name)) {
+            if (t.generic_arg_count == arg_count && t.generic_args != nil) {
+                # check if all generic args match
+                var all_match: bool = true;
+                var ai: i32 = 0;
+                for (ai < arg_count) {
+                    if (t.generic_args[ai] != args[ai]) {
+                        all_match = false;
+                    }
+                    ai = ai + 1;
+                }
+                if (all_match) {
+                    ret t;
+                }
+            }
+        }
+        ti = ti + 1;
+    }
+
+    ret nil;
+}
+
+# resolve_type_annotation: resolve a type from an AST type annotation node.
+# ---
+# ctx:       lowering context
+# type_node: type annotation AST node (NODE_TYPE_NAME, NODE_TYPE_PTR, etc.)
+# ret:       resolved Type or nil
+fun resolve_type_annotation(ctx: *LowerContext, type_node: *ast.Node) *ty.Type {
+    if (ctx == nil || type_node == nil) {
+        ret nil;
+    }
+
+    if (type_node.kind == ast.NODE_TYPE_NAME) {
+        val type_name: str = type_node.get_name();
+        if (type_name == nil) {
+            ret nil;
+        }
+
+        # check type bindings first (for generic instantiation lowering)
+        if (ctx.type_binding_count > 0 && ctx.type_binding_names != nil) {
+            var tbi: i32 = 0;
+            for (tbi < ctx.type_binding_count) {
+                if (ctx.type_binding_names[tbi] != nil && ctx.type_binding_names[tbi].equals(type_name)) {
+                    ret ctx.type_binding_types[tbi];
+                }
+                tbi = tbi + 1;
+            }
+        }
+
+        # handle primitive type names that may not be in the symbol table
+        # or may be aliased (e.g., "str" is defined as &u8 but we need TY_STR)
+        if (ctx.types != nil) {
+            var prim_kind: i32 = -1;
+            if (type_name.equals("u8"))    { prim_kind = ty.TY_U8::i32; }
+            if (type_name.equals("u16"))   { prim_kind = ty.TY_U16::i32; }
+            if (type_name.equals("u32"))   { prim_kind = ty.TY_U32::i32; }
+            if (type_name.equals("u64"))   { prim_kind = ty.TY_U64::i32; }
+            if (type_name.equals("i8"))    { prim_kind = ty.TY_I8::i32; }
+            if (type_name.equals("i16"))   { prim_kind = ty.TY_I16::i32; }
+            if (type_name.equals("i32"))   { prim_kind = ty.TY_I32::i32; }
+            if (type_name.equals("i64"))   { prim_kind = ty.TY_I64::i32; }
+            if (type_name.equals("f32"))   { prim_kind = ty.TY_F32::i32; }
+            if (type_name.equals("f64"))   { prim_kind = ty.TY_F64::i32; }
+            if (type_name.equals("bool"))  { prim_kind = ty.TY_BOOL::i32; }
+            if (type_name.equals("usize")) { prim_kind = ty.TY_USIZE::i32; }
+            if (type_name.equals("isize")) { prim_kind = ty.TY_ISIZE::i32; }
+            if (type_name.equals("str"))   { prim_kind = ty.TY_STR::i32; }
+            if (type_name.equals("ptr"))   { prim_kind = ty.TY_PTR::i32; }
+            if (prim_kind >= 0) {
+                var pti: i32 = 0;
+                for (pti < ctx.types.type_count) {
+                    val pt: *ty.Type = ctx.types.types[pti];
+                    if (pt != nil && pt.kind == prim_kind::u8) {
+                        ret pt;
+                    }
+                    pti = pti + 1;
+                }
+            }
+        }
+
+        # check for module-qualified type name (e.g., "ir.IRFunction")
+        if (ctx.current_sema_mod != nil) {
+            var dot_pos: usize = 0;
+            var has_dot: bool = false;
+            var di: usize = 0;
+            val name_len: usize = type_name.len();
+            for (di < name_len) {
+                if (type_name[di] == '.') {
+                    dot_pos = di;
+                    has_dot = true;
+                    brk;
+                }
+                di = di + 1;
+            }
+            if (has_dot && dot_pos > 0) {
+                # split: alias = type_name[0..dot_pos], local_name = type_name[dot_pos+1..]
+                var alias_entry: *sema.ModuleAlias = ctx.current_sema_mod.aliases;
+                for (alias_entry != nil) {
+                    if (alias_entry.alias != nil) {
+                        val alias_len: usize = alias_entry.alias.len();
+                        if (alias_len == dot_pos) {
+                            var amatch: bool = true;
+                            var ai: usize = 0;
+                            for (ai < dot_pos) {
+                                if (type_name[ai] != alias_entry.alias[ai]) {
+                                    amatch = false;
+                                    brk;
+                                }
+                                ai = ai + 1;
+                            }
+                            if (amatch && alias_entry.module != nil && alias_entry.module.table != nil) {
+                                val local_start: usize = dot_pos + 1;
+                                val local_len: usize = name_len - local_start;
+                                val root: *symbol.Scope = alias_entry.module.table.root_scope();
+                                if (root != nil) {
+                                    var si: i32 = 0;
+                                    for (si < root.symbol_count) {
+                                        val ts: *symbol.Symbol = ?root.symbols[si::usize];
+                                        if (ts != nil && ts.name != nil) {
+                                            val ts_len: usize = ts.name.len();
+                                            if (ts_len == local_len) {
+                                                var tmatch: bool = true;
+                                                var ti: usize = 0;
+                                                for (ti < local_len) {
+                                                    if (type_name[local_start + ti] != ts.name[ti]) {
+                                                        tmatch = false;
+                                                        brk;
+                                                    }
+                                                    ti = ti + 1;
+                                                }
+                                                if (tmatch && (ts.kind == symbol.SYM_TYPE ||
+                                                               ts.kind == symbol.SYM_REC ||
+                                                               ts.kind == symbol.SYM_UNI)) {
+                                                    if (ts.resolved_type != nil) {
+                                                        ret ts.resolved_type;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        si = si + 1;
+                                    }
+                                }
+                                brk; # found matching alias, stop searching
+                            }
+                        }
+                    }
+                    alias_entry = alias_entry.next;
+                }
+            }
+        }
+
+        # check if this type name has generic args (e.g., Result[T, E])
+        val generic_args_node: *ast.Node = type_node.children;
+        if (generic_args_node != nil && generic_args_node.kind == ast.NODE_GENERIC) {
+            # resolve each generic arg (they might be bound type params)
+            val gargs_list: *ast.List = generic_args_node.children::*ast.List;
+            if (gargs_list != nil && gargs_list.count > 0) {
+                # first resolve all args
+                var resolved_args: [8]*ty.Type;
+                var all_resolved: bool = true;
+                var gi: i32 = 0;
+                for (gi < gargs_list.count && gi < 8) {
+                    val garg: *ast.Node = gargs_list.nodes[gi];
+                    if (garg != nil) {
+                        resolved_args[gi] = resolve_type_annotation(ctx, garg);
+                        if (resolved_args[gi] == nil) {
+                            all_resolved = false;
+                        }
+                    } or {
+                        all_resolved = false;
+                    }
+                    gi = gi + 1;
+                }
+
+                # if all args resolved, instantiate the generic type
+                if (all_resolved) {
+                    # look up the base type symbol
+                    var base_sym: *symbol.Symbol = nil;
+                    if (ctx.symbols != nil) {
+                        val bs_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(type_name);
+                        if (bs_opt.is_some()) {
+                            base_sym = bs_opt.unwrap();
+                        }
+                    }
+                    if (base_sym == nil) {
+                        base_sym = lookup_symbol_in_imports(ctx, type_name);
+                    }
+                    if (base_sym != nil && base_sym.is_generic && base_sym.decl_node != nil) {
+                        # use sema's instantiate_generic_type by creating a temporary binding scope
+                        # For now, look for a cached instantiation in the type context
+                        # that matches these args
+                        # Simpler approach: look for a type with matching name and generic_args
+                        val inst_ty: *ty.Type = find_instantiated_type(ctx, type_name, ?resolved_args[0], gargs_list.count);
+                        if (inst_ty != nil) {
+                            ret inst_ty;
+                        }
+                    }
+                }
+            }
+        }
+
+        # look up in current module's symbol table
+        if (ctx.symbols != nil) {
+            val rta_sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(type_name);
+            if (rta_sym_opt.is_some()) {
+                val rta_sym: *symbol.Symbol = rta_sym_opt.unwrap();
+                if (rta_sym.resolved_type != nil) {
+                    ret rta_sym.resolved_type;
+                }
+            }
+        }
+
+        # look up in imported modules
+        val rta_imp_sym: *symbol.Symbol = lookup_symbol_in_imports(ctx, type_name);
+        if (rta_imp_sym != nil && rta_imp_sym.resolved_type != nil) {
+            ret rta_imp_sym.resolved_type;
+        }
+
+        ret nil;
+    }
+
+    if (type_node.kind == ast.NODE_TYPE_PTR || type_node.kind == ast.NODE_TYPE_REF) {
+        val inner_node: *ast.Node = type_node.get_child(0);
+        if (inner_node != nil) {
+            val inner_ty: *ty.Type = resolve_type_annotation(ctx, inner_node);
+            if (inner_ty != nil && ctx.types != nil) {
+                val ptr_res: Result[*ty.Type, str] = ty.pointer_type(ctx.types, inner_ty, true);
+                if (ptr_res.is_ok()) {
+                    ret ptr_res.unwrap_ok();
+                }
+            }
+        }
+        ret nil;
+    }
+
+    ret nil;
+}
+
+# get_receiver_type_name: extract base type name from method receiver.
+# ---
+# receiver: receiver parameter node
+# ret:      base type name (e.g., "Writer") or nil
+fun get_receiver_type_name(receiver: *ast.Node) str {
+    if (receiver == nil) {
+        ret nil;
+    }
+
+    # receiver is NODE_PARAM, its type is in children
+    var recv_type: *ast.Node = receiver.children;
+    if (recv_type == nil) {
+        ret nil;
+    }
+
+    # unwrap pointer/ref types
+    for (recv_type != nil && (recv_type.kind == ast.NODE_TYPE_PTR || recv_type.kind == ast.NODE_TYPE_REF)) {
+        recv_type = recv_type.get_child(0);
+    }
+
+    if (recv_type != nil && recv_type.kind == ast.NODE_TYPE_NAME) {
+        ret recv_type.get_name();
+    }
+
+    ret nil;
+}
+
 # frame_mem: create a memory operand for a stack slot.
 # ---
 # ctx:    lowering context
@@ -798,6 +1264,23 @@ fun emit_load(ctx: *LowerContext, addr: ir.IRValue, size: usize) ir.IRValue {
     ret dst;
 }
 
+# emit_load_signed: load a value with sign-extension for small types (i8, i16).
+# passes a flag via src2 to tell isel to use MOVSX instead of MOVZX.
+fun emit_load_signed(ctx: *LowerContext, addr: ir.IRValue, size: usize) ir.IRValue {
+    if (ctx == nil) {
+        ret ir.make_none();
+    }
+
+    val dst_reg: i32 = new_vreg(ctx, size);
+    val dst: ir.IRValue = ir.make_reg(dst_reg, size);
+
+    # src2 = imm(1) signals signed load to isel
+    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                  dst, addr, ir.make_imm(1, 1), ir.CC_NONE);
+
+    ret dst;
+}
+
 # load_ptr_if_needed: for pointer/str types, load the pointer value from the address.
 # ---
 # ctx:    lowering context
@@ -819,6 +1302,64 @@ fun load_ptr_if_needed(ctx: *LowerContext, addr: ir.IRValue, base_ty: *ty.Type) 
 # ret:    none
 fun emit_store(ctx: *LowerContext, addr: ir.IRValue, src: ir.IRValue) {
     if (ctx == nil) {
+        ret;
+    }
+
+    # for memory-to-memory copies, emit chunked load/store operations
+    # (x86 cannot do direct mem-to-mem moves)
+    if (src.kind == ir.VAL_MEM && addr.kind == ir.VAL_MEM && src.size > 0) {
+        # LEA source address
+        val src_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+        val src_ptr: ir.IRValue = ir.make_reg(src_reg, ctx.ptr_size);
+        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                      src_ptr, src, ir.make_none(), ir.CC_NONE);
+
+        # LEA destination address
+        val dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+        val dst_ptr: ir.IRValue = ir.make_reg(dst_reg, ctx.ptr_size);
+        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                      dst_ptr, addr, ir.make_none(), ir.CC_NONE);
+
+        # copy in 8-byte chunks
+        val total: i32 = src.size::i32;
+        var off: i32 = 0;
+        for (off < total) {
+            var chunk: usize = 8;
+            if ((total - off)::usize < 8) {
+                chunk = (total - off)::usize;
+            }
+            val tmp_reg: i32 = new_vreg(ctx, chunk);
+            val tmp: ir.IRValue = ir.make_reg(tmp_reg, chunk);
+
+            var s_mem: ir.IRValue;
+            s_mem.kind = ir.VAL_MEM;
+            s_mem.base_reg = src_reg;
+            s_mem.offset = off::i64;
+            s_mem.size = chunk;
+            s_mem.reg = 0;
+            s_mem.imm = 0;
+            s_mem.index_reg = -1;
+            s_mem.scale = 1;
+            s_mem.label = nil;
+
+            var d_mem: ir.IRValue;
+            d_mem.kind = ir.VAL_MEM;
+            d_mem.base_reg = dst_reg;
+            d_mem.offset = off::i64;
+            d_mem.size = chunk;
+            d_mem.reg = 0;
+            d_mem.imm = 0;
+            d_mem.index_reg = -1;
+            d_mem.scale = 1;
+            d_mem.label = nil;
+
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                          tmp, s_mem, ir.make_none(), ir.CC_NONE);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                          d_mem, tmp, ir.make_none(), ir.CC_NONE);
+
+            off = off + chunk::i32;
+        }
         ret;
     }
 
@@ -1073,11 +1614,79 @@ fun emit_call(ctx: *LowerContext, callee: str, args: *ir.IRValue, arg_count: i32
             ir.make_imm(stack_space::i64, 8), 0);
     }
 
-    # return value is in rax
+    # always save RAX to vreg after call - subsequent expressions may clobber RAX,
+    # and return type may not be resolved for calls in imported module functions
+    var ret_sz: usize = 8;
     if (ret_size > 0) {
-        ret ir.make_reg(ir.RAX, ret_size);
+        ret_sz = ret_size;
     }
-    ret ir.make_none();
+    val result_reg: i32 = new_vreg(ctx, ret_sz);
+    val result: ir.IRValue = ir.make_reg(result_reg, ret_sz);
+    emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, result, ir.make_reg(ir.RAX, ret_sz), ir.make_none(), 0);
+    ret result;
+}
+
+# emit_indirect_call: emit an indirect function call through a register.
+# ---
+# ctx:       lowering context
+# fn_ptr:    IRValue containing the function pointer (typically a vreg)
+# args:      pointer to array of argument IRValues
+# arg_count: number of arguments
+# ret_size:  size of return value (0 for void)
+# ret:       IRValue containing return value (RAX) or none
+fun emit_indirect_call(ctx: *LowerContext, fn_ptr: ir.IRValue, args: *ir.IRValue, arg_count: i32, ret_size: usize) ir.IRValue {
+    if (ctx == nil) {
+        ret ir.make_none();
+    }
+
+    # calculate stack arguments count
+    val stack_arg_count: i32 = arg_count - 6;
+    var stack_space: i32 = 0;
+    if (stack_arg_count > 0) {
+        stack_space = stack_arg_count * 8;
+        if ((stack_space % 16) != 0) {
+            stack_space = stack_space + (16 - (stack_space % 16));
+        }
+    }
+
+    # push stack arguments in reverse order (right to left)
+    if (stack_arg_count > 0) {
+        var k: i32 = arg_count - 1;
+        for (k >= 6) {
+            emit_instr(ctx, ir.IROp{ir_push: ir.OP_PUSH}, ir.make_none(), args[k], ir.make_none(), 0);
+            k = k - 1;
+        }
+    }
+
+    # emit register argument moves
+    var i: i32 = 0;
+    for (i < arg_count && i < 6) {
+        val arg_reg: i32 = sysv64.get_arg_reg(i);
+        emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, ir.make_reg(arg_reg, ctx.ptr_size), args[i], ir.make_none(), 0);
+        i = i + 1;
+    }
+
+    # emit indirect call instruction (src1 = fn_ptr register)
+    emit_instr(ctx, ir.IROp{ir_call: ir.OP_CALL}, ir.make_none(), fn_ptr, ir.make_none(), 0);
+
+    # clean up stack after call
+    if (stack_arg_count > 0) {
+        emit_instr(ctx, ir.IROp{ir_add: ir.OP_ADD},
+            ir.make_reg(ir.RSP, ctx.ptr_size),
+            ir.make_reg(ir.RSP, ctx.ptr_size),
+            ir.make_imm(stack_space::i64, 8), 0);
+    }
+
+    # always save RAX to vreg after call - subsequent expressions may clobber RAX,
+    # and return type may not be resolved for calls in imported module functions
+    var ic_ret_sz: usize = 8;
+    if (ret_size > 0) {
+        ic_ret_sz = ret_size;
+    }
+    val ic_result_reg: i32 = new_vreg(ctx, ic_ret_sz);
+    val ic_result: ir.IRValue = ir.make_reg(ic_result_reg, ic_ret_sz);
+    emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, ic_result, ir.make_reg(ir.RAX, ic_ret_sz), ir.make_none(), 0);
+    ret ic_result;
 }
 
 # emit_sycall: emit a system call instruction.
@@ -1146,8 +1755,11 @@ fun emit_syscall(ctx: *LowerContext, num: i64, args: *ir.IRValue, arg_count: i32
     syscall_instr.cond = ir.CC_NONE;
     emit_instr(ctx, syscall_instr.op, syscall_instr.dst, syscall_instr.src1, syscall_instr.src2, 0);
 
-    # return value in rax
-    ret ir.make_reg(ir.RAX, 8);
+    # return value in rax - copy to vreg
+    val sc_result_reg: i32 = new_vreg(ctx, 8);
+    val sc_result: ir.IRValue = ir.make_reg(sc_result_reg, 8);
+    emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, sc_result, ir.make_reg(ir.RAX, 8), ir.make_none(), 0);
+    ret sc_result;
 }
 
 fun emit_syscall_value(ctx: *LowerContext, num_val: ir.IRValue, args: *ir.IRValue, arg_count: i32) ir.IRValue {
@@ -1200,7 +1812,10 @@ fun emit_syscall_value(ctx: *LowerContext, num_val: ir.IRValue, args: *ir.IRValu
     syscall_instr.cond = ir.CC_NONE;
     emit_instr(ctx, syscall_instr.op, syscall_instr.dst, syscall_instr.src1, syscall_instr.src2, 0);
 
-    ret ir.make_reg(ir.RAX, 8);
+    val sc2_result_reg: i32 = new_vreg(ctx, 8);
+    val sc2_result: ir.IRValue = ir.make_reg(sc2_result_reg, 8);
+    emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, sc2_result, ir.make_reg(ir.RAX, 8), ir.make_none(), 0);
+    ret sc2_result;
 }
 
 # emit_va_start: emit code to initialize a va_list (SysV x86_64 ABI).
@@ -1386,7 +2001,7 @@ fun type_is_large_aggregate(t: *ty.Type, ptr_size: usize) bool {
 
     # records and unions can be large
     if (t.kind == ty.TY_RECORD || t.kind == ty.TY_UNION) {
-        if (t.size > 16) {
+        if (t.size > ptr_size) {
             ret true;
         }
     }
@@ -1497,6 +2112,15 @@ pub fun lower_expr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret ir.make_imm(0, ctx.ptr_size);
     }
 
+    # parenthesized expression: unwrap and lower inner expression
+    if (node.kind == ast.NODE_EXPR_PAREN) {
+        val inner: *ast.Node = node.get_child(0);
+        if (inner != nil) {
+            ret lower_expr(ctx, inner);
+        }
+        ret make_none();
+    }
+
     # default: return none
     ret make_none();
 }
@@ -1537,11 +2161,55 @@ fun lower_string_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         masm.add_symbol(ctx.m, s);
     }
 
-    # emit string bytes
-    var i: usize = 0;
-    for (i < str_val.len()) {
-        section.emit_byte(ctx.alloc, sec, str_val[i]);
-        i = i + 1;
+    # emit string bytes - strip surrounding quotes and process escape sequences
+    val slen: usize = str_val.len();
+    var start: usize = 0;
+    var end: usize = slen;
+
+    # strip surrounding quotes if present
+    if (slen >= 2 && str_val[0] == 34) {
+        start = 1;
+        if (str_val[slen - 1] == 34) {
+            end = slen - 1;
+        }
+    }
+
+    var i: usize = start;
+    for (i < end) {
+        val c: u8 = str_val[i];
+        if (c == 92 && i + 1 < end) {
+            # backslash escape
+            val e: u8 = str_val[i + 1];
+            if (e == 110) {
+                # \n → newline
+                section.emit_byte(ctx.alloc, sec, 10);
+            } or (e == 116) {
+                # \t → tab
+                section.emit_byte(ctx.alloc, sec, 9);
+            } or (e == 114) {
+                # \r → carriage return
+                section.emit_byte(ctx.alloc, sec, 13);
+            } or (e == 48) {
+                # \0 → null
+                section.emit_byte(ctx.alloc, sec, 0);
+            } or (e == 92) {
+                # \\ → backslash
+                section.emit_byte(ctx.alloc, sec, 92);
+            } or (e == 34) {
+                # \" → double quote
+                section.emit_byte(ctx.alloc, sec, 34);
+            } or (e == 39) {
+                # \' → single quote
+                section.emit_byte(ctx.alloc, sec, 39);
+            } or {
+                # unknown escape: emit the escaped char as-is
+                section.emit_byte(ctx.alloc, sec, e);
+            }
+            i = i + 2;
+        } or {
+            section.emit_byte(ctx.alloc, sec, c);
+            i = i + 1;
+        }
     }
     # null terminator
     section.emit_byte(ctx.alloc, sec, 0);
@@ -1585,7 +2253,11 @@ fun lower_identifier(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
         # aggregates (structs, unions, arrays) and large types: return address with LEA
         # because field/index access expects a pointer base, not a loaded value
-        val var_ty: *ty.Type = node.ty;
+        # try node.ty first, fall back to local_vars type table
+        var var_ty: *ty.Type = node.ty;
+        if (var_ty == nil) {
+            var_ty = ctx.local_vars[local_idx].ty;
+        }
         val is_aggregate: bool = var_ty != nil && (var_ty.kind == ty.TY_RECORD ||
                                                     var_ty.kind == ty.TY_UNION ||
                                                     var_ty.kind == ty.TY_ARRAY);
@@ -1600,13 +2272,45 @@ fun lower_identifier(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
             ret result;
         }
 
-        # scalar: load value
+        # scalar: load value (sign-extend for signed i8/i16)
+        if (var_ty != nil && var_ty.is_signed() && (size == 1 || size == 2)) {
+            ret emit_load_signed(ctx, addr, size);
+        }
         ret emit_load(ctx, addr, size);
     }
 
     # check if it's a parameter
     # parameters are handled during function lowering
     # for now, assume it's a global
+
+    # look up symbol for linkage name and function detection
+    var global_label: str = name;
+    var is_func_sym: bool = false;
+    if (ctx.symbols != nil) {
+        val id_sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(name);
+        if (id_sym_opt.is_some()) {
+            val id_sym: *symbol.Symbol = id_sym_opt.unwrap();
+            if (id_sym.kind == symbol.SYM_FUN) {
+                is_func_sym = true;
+            }
+            val link: str = symbol.linkage_name(id_sym, ctx.alloc);
+            if (link != nil) {
+                global_label = link;
+            }
+        }
+        if (!is_func_sym) {
+            val id_imp_sym: *symbol.Symbol = lookup_symbol_in_imports(ctx, name);
+            if (id_imp_sym != nil) {
+                if (id_imp_sym.kind == symbol.SYM_FUN) {
+                    is_func_sym = true;
+                }
+                val imp_link: str = symbol.linkage_name(id_imp_sym, ctx.alloc);
+                if (imp_link != nil) {
+                    global_label = imp_link;
+                }
+            }
+        }
+    }
 
     # create symbol reference (for global)
     var v: ir.IRValue;
@@ -1617,7 +2321,7 @@ fun lower_identifier(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     v.base_reg = 0;
     v.index_reg = -1;
     v.scale = 1;
-    v.label = name;
+    v.label = global_label;
     v.size = ctx.ptr_size;
 
     # for aggregates, return address in register
@@ -1631,13 +2335,74 @@ fun lower_identifier(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
                   addr, v, ir.make_none(), ir.CC_NONE);
 
-    if (is_aggregate) {
+    if (is_aggregate || is_func_sym) {
         ret addr;
     }
 
     # scalar: load value from address
     val mem: ir.IRValue = ir.make_mem(addr_reg, -1, 1, 0, ctx.ptr_size);
     ret emit_load(ctx, mem, ctx.ptr_size);
+}
+
+# lower_short_circuit: lower && and || with short-circuit evaluation.
+# ---
+# ctx:    lowering context
+# node:   binary expression node (TAG_AMP_AMP or TAG_PIPE_PIPE)
+# is_and: true for &&, false for ||
+# ret:    IRValue containing boolean result (0 or 1)
+fun lower_short_circuit(ctx: *LowerContext, node: *ast.Node, is_and: bool) ir.IRValue {
+    if (ctx == nil || node == nil) {
+        ret make_none();
+    }
+
+    val lhs: *ast.Node = node.get_child(0);
+    val rhs: *ast.Node = node.get_child(1);
+
+    if (lhs == nil || rhs == nil) {
+        ret make_none();
+    }
+
+    val end_label: str = new_label(ctx, "sc_end");
+    val true_label: str = new_label(ctx, "sc_true");
+
+    # allocate result vreg
+    val dst_reg: i32 = new_vreg(ctx, 8);
+    val dst: ir.IRValue = ir.make_reg(dst_reg, 8);
+    val zero: ir.IRValue = ir.make_imm(0, 8);
+
+    # evaluate left operand
+    val left_value: ir.IRValue = lower_expr(ctx, lhs);
+
+    # move left result to dst
+    emit_mov(ctx, dst, left_value, 8);
+
+    # compare with 0
+    emit_cmp(ctx, dst, zero, 8);
+
+    if (is_and) {
+        # AND: if left is 0, short-circuit to end (result stays 0)
+        emit_cond_br(ctx, ir.CC_EQ::i32, end_label);
+    } or {
+        # OR: if left is non-zero, short-circuit to true (result = 1)
+        emit_cond_br(ctx, ir.CC_NE::i32, true_label);
+    }
+
+    # evaluate right operand
+    val right_value: ir.IRValue = lower_expr(ctx, rhs);
+
+    # result = (right != 0)
+    emit_cmp(ctx, right_value, zero, 8);
+    emit_instr(ctx, ir.IROp{ir_setne: ir.OP_SETNE}, dst, ir.make_none(), ir.make_none(), 0);
+    emit_br(ctx, end_label);
+
+    if (!is_and) {
+        # OR: true label - set result to 1
+        emit_label(ctx, true_label);
+        emit_mov(ctx, dst, ir.make_imm(1, 8), 8);
+    }
+
+    emit_label(ctx, end_label);
+    ret dst;
 }
 
 # lower_binary: lower a binary expression.
@@ -1656,6 +2421,14 @@ fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     if (lhs == nil || rhs == nil) {
         ret make_none();
+    }
+
+    # handle short-circuit logical operators
+    if (op == token.TAG_AMP_AMP) {
+        ret lower_short_circuit(ctx, node, true);
+    }
+    if (op == token.TAG_PIPE_PIPE) {
+        ret lower_short_circuit(ctx, node, false);
     }
 
     # handle assignment separately - left side needs lvalue, not rvalue
@@ -1694,10 +2467,18 @@ fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ir_op = ir.IROp{ir_mul: ir.OP_MUL};
     }
     if (op == token.TAG_SLASH) {
-        ir_op = ir.IROp{ir_div: ir.OP_DIV};
+        if (node.ty != nil && node.ty.is_unsigned()) {
+            ir_op = ir.IROp{ir_div: ir.OP_DIVU};
+        } or {
+            ir_op = ir.IROp{ir_div: ir.OP_DIV};
+        }
     }
     if (op == token.TAG_PERCENT) {
-        ir_op = ir.IROp{ir_mod: ir.OP_MOD};
+        if (node.ty != nil && node.ty.is_unsigned()) {
+            ir_op = ir.IROp{ir_mod: ir.OP_MODU};
+        } or {
+            ir_op = ir.IROp{ir_mod: ir.OP_MOD};
+        }
     }
 
     # bitwise
@@ -1834,6 +2615,242 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
+    # check if this is a module-qualified call (e.g., fs.write) or a method call (e.g., arg.equals())
+    var is_module_qualified: bool = false;
+    var is_method_call: bool = false;
+    var method_receiver_type_name: str = nil;
+    var method_recv_base_ty: *ty.Type = nil;
+    var module_alias_name: str = nil;
+    if (callee.kind == ast.NODE_EXPR_FIELD) {
+        val callee_base: *ast.Node = callee.get_child(0);
+        if (callee_base != nil) {
+            # get base type, trying local vars first if base.ty is nil
+            var base_ty: *ty.Type = callee_base.ty;
+
+            if (base_ty == nil && callee_base.kind == ast.NODE_EXPR_IDENT) {
+                # try to get type from local variable table
+                val base_name: str = callee_base.get_name();
+                var found_in_locals: bool = false;
+                if (base_name != nil) {
+                    val local_idx: i32 = find_local_var(ctx, base_name);
+                    if (local_idx >= 0) {
+                        found_in_locals = true;
+                        base_ty = ctx.local_vars[local_idx].ty;
+                    }
+                }
+
+                # check if base is a module alias (only if NOT a local variable)
+                if (!found_in_locals && base_ty == nil && base_name != nil) {
+                    val is_alias: bool = is_module_alias(ctx, base_name);
+                    if (is_alias) {
+                        is_module_qualified = true;
+                        module_alias_name = base_name;
+                    }
+                }
+            }
+
+            # if not module-qualified, try to detect method call
+            if (!is_module_qualified) {
+                if (base_ty != nil) {
+                    # handle str type directly (str is alias for &char = &u8,
+                    # but methods are registered under "str" not "u8")
+                    if (base_ty.kind == ty.TY_STR) {
+                        is_method_call = true;
+                        method_receiver_type_name = ty.kind_name(base_ty.kind);
+                        method_recv_base_ty = base_ty;
+                    } or {
+                        # unwrap pointers to get base type name
+                        for (base_ty != nil && base_ty.kind == ty.TY_POINTER) {
+                            base_ty = base_ty.inner;
+                        }
+                        if (base_ty != nil) {
+                            # &u8 is the expanded form of str (str = &char = &u8),
+                            # methods are registered under "str" not "u8"
+                            if (base_ty.kind == ty.TY_U8) {
+                                is_method_call = true;
+                                method_receiver_type_name = ty.kind_name(ty.TY_STR);
+                                method_recv_base_ty = base_ty;
+                            } or (base_ty.name != nil) {
+                                is_method_call = true;
+                                method_receiver_type_name = base_ty.name;
+                                method_recv_base_ty = base_ty;
+                            } or {
+                                val kind_nm: str = ty.kind_name(base_ty.kind);
+                                if (kind_nm != nil) {
+                                    is_method_call = true;
+                                    method_receiver_type_name = kind_nm;
+                                    method_recv_base_ty = base_ty;
+                                }
+                            }
+                        }
+                    }
+                } or {
+                    # no type available - search symbol tables for method
+                    method_receiver_type_name = find_method_type_name(ctx, func_name);
+                    if (method_receiver_type_name != nil) {
+                        is_method_call = true;
+                    }
+                }
+            }
+        }
+    }
+
+    # for method calls, build qualified name "ReceiverType.methodName"
+    # and mangle with type args if the receiver is a generic instantiation
+    if (is_method_call && method_receiver_type_name != nil) {
+        val recv_len: usize = method_receiver_type_name.len();
+        val name_len: usize = func_name.len();
+
+        # check if the method call itself has type args (e.g., alloc.alloc[u8](count))
+        # this is distinct from methods on generic types (receiver has generic_args)
+        val mc_type_args: *ast.Node = node.generics;
+        var mc_has_call_type_args: bool = false;
+        if (mc_type_args != nil) {
+            val mc_ta_list: *ast.List = mc_type_args.children::*ast.List;
+            if (mc_ta_list != nil && mc_ta_list.count > 0) {
+                mc_has_call_type_args = true;
+            }
+        }
+
+        if (mc_has_call_type_args) {
+            # generic method with own type args: "ReceiverType.methodName" + "I" + mangle(call type args) + "E"
+            val mc_ta_list2: *ast.List = mc_type_args.children::*ast.List;
+            var mg_buf: [512]u8;
+            var mg_pos: i32 = 0;
+
+            # write "ReceiverType."
+            var mg_ri: usize = 0;
+            for (mg_ri < recv_len && mg_pos < 480) {
+                mg_buf[mg_pos::usize] = method_receiver_type_name[mg_ri];
+                mg_pos = mg_pos + 1;
+                mg_ri = mg_ri + 1;
+            }
+            mg_buf[mg_pos::usize] = '.';
+            mg_pos = mg_pos + 1;
+
+            # write "methodName"
+            var mg_ni: usize = 0;
+            for (mg_ni < name_len && mg_pos < 480) {
+                mg_buf[mg_pos::usize] = func_name[mg_ni];
+                mg_pos = mg_pos + 1;
+                mg_ni = mg_ni + 1;
+            }
+
+            # write "I"
+            mg_buf[mg_pos::usize] = 'I';
+            mg_pos = mg_pos + 1;
+
+            # mangle each call-site type arg
+            var mg_ai: i32 = 0;
+            for (mg_ai < mc_ta_list2.count && mg_pos < 500) {
+                val mg_arg_node: *ast.Node = mc_ta_list2.nodes[mg_ai];
+                if (mg_arg_node != nil) {
+                    val mg_arg_ty: *ty.Type = resolve_type_annotation(ctx, mg_arg_node);
+                    if (mg_arg_ty != nil) {
+                        val mg_written: i32 = ty.type_mangle(mg_arg_ty, ?mg_buf[mg_pos::usize], (512 - mg_pos)::usize);
+                        mg_pos = mg_pos + mg_written;
+                    }
+                }
+                mg_ai = mg_ai + 1;
+            }
+
+            # write "E\0"
+            mg_buf[mg_pos::usize] = 'E';
+            mg_pos = mg_pos + 1;
+            mg_buf[mg_pos::usize] = 0;
+
+            # allocate persistent copy
+            val mg_alloc_res: Result[*u8, allocator.AllocError] = ctx.alloc.alloc[u8]((mg_pos + 1)::usize);
+            if (mg_alloc_res.is_ok()) {
+                val mg_dest: *u8 = mg_alloc_res.unwrap_ok();
+                var mg_ci: i32 = 0;
+                for (mg_ci <= mg_pos) {
+                    mg_dest[mg_ci::usize] = mg_buf[mg_ci::usize];
+                    mg_ci = mg_ci + 1;
+                }
+                func_name = mg_dest::str;
+            }
+        } or (method_recv_base_ty != nil && method_recv_base_ty.generic_args != nil && method_recv_base_ty.generic_arg_count > 0) {
+            # receiver is a generic instantiation (e.g., Result[usize, str])
+            # build "ReceiverType.methodNameI<type_args>E"
+            var rg_buf: [512]u8;
+            var rg_pos: i32 = 0;
+
+            # write "ReceiverType."
+            var rg_ri: usize = 0;
+            for (rg_ri < recv_len && rg_pos < 480) {
+                rg_buf[rg_pos::usize] = method_receiver_type_name[rg_ri];
+                rg_pos = rg_pos + 1;
+                rg_ri = rg_ri + 1;
+            }
+            rg_buf[rg_pos::usize] = '.';
+            rg_pos = rg_pos + 1;
+
+            # write "methodName"
+            var rg_ni: usize = 0;
+            for (rg_ni < name_len && rg_pos < 480) {
+                rg_buf[rg_pos::usize] = func_name[rg_ni];
+                rg_pos = rg_pos + 1;
+                rg_ni = rg_ni + 1;
+            }
+
+            # write "I"
+            rg_buf[rg_pos::usize] = 'I';
+            rg_pos = rg_pos + 1;
+
+            # mangle each receiver type arg
+            var rg_ai: i32 = 0;
+            for (rg_ai < method_recv_base_ty.generic_arg_count && rg_pos < 500) {
+                val rg_arg_ty: *ty.Type = method_recv_base_ty.generic_args[rg_ai];
+                if (rg_arg_ty != nil) {
+                    val rg_written: i32 = ty.type_mangle(rg_arg_ty, ?rg_buf[rg_pos::usize], (512 - rg_pos)::usize);
+                    rg_pos = rg_pos + rg_written;
+                }
+                rg_ai = rg_ai + 1;
+            }
+
+            # write "E\0"
+            rg_buf[rg_pos::usize] = 'E';
+            rg_pos = rg_pos + 1;
+            rg_buf[rg_pos::usize] = 0;
+
+            # allocate persistent copy
+            val rg_alloc_res: Result[*u8, allocator.AllocError] = ctx.alloc.alloc[u8]((rg_pos + 1)::usize);
+            if (rg_alloc_res.is_ok()) {
+                val rg_dest: *u8 = rg_alloc_res.unwrap_ok();
+                var rg_ci: i32 = 0;
+                for (rg_ci <= rg_pos) {
+                    rg_dest[rg_ci::usize] = rg_buf[rg_ci::usize];
+                    rg_ci = rg_ci + 1;
+                }
+                func_name = rg_dest::str;
+            }
+        } or {
+            # non-generic method: just build "ReceiverType.methodName"
+            val total_len: usize = recv_len + 1 + name_len + 1;
+
+            val alloc_res: Result[*u8, allocator.AllocError] = ctx.alloc.alloc[u8](total_len);
+            if (alloc_res.is_ok()) {
+                val buf: *u8 = alloc_res.unwrap_ok();
+                var i: usize = 0;
+                for (i < recv_len) {
+                    buf[i] = method_receiver_type_name[i];
+                    i = i + 1;
+                }
+                buf[i] = '.';
+                i = i + 1;
+                var j: usize = 0;
+                for (j < name_len) {
+                    buf[i] = func_name[j];
+                    i = i + 1;
+                    j = j + 1;
+                }
+                buf[i] = 0;
+                func_name = buf::str;
+            }
+        }
+    }
+
     # handle variadic builtins: va_start, va_end, va_arg
     if (ctx.fn_is_variadic && callee.kind == ast.NODE_EXPR_IDENT) {
         # va_start(ap): initialize va_list fields
@@ -1852,14 +2869,114 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         }
     }
 
-    # resolve linkage name for direct calls
-    if (ctx.symbols != nil) {
+    # for generic function calls (e.g., ok[*Section, str](val)), compute mangled name
+    if (!is_method_call && !is_module_qualified && node.generics != nil) {
+        val type_args_node: *ast.Node = node.generics;
+        if (type_args_node != nil) {
+            val gf_args_list: *ast.List = type_args_node.children::*ast.List;
+            if (gf_args_list != nil && gf_args_list.count > 0) {
+                var gf_buf: [512]u8;
+                var gf_pos: i32 = 0;
+
+                # write base function name
+                val gf_name_len: usize = func_name.len();
+                var gf_ni: usize = 0;
+                for (gf_ni < gf_name_len && gf_pos < 480) {
+                    gf_buf[gf_pos::usize] = func_name[gf_ni];
+                    gf_pos = gf_pos + 1;
+                    gf_ni = gf_ni + 1;
+                }
+
+                # write "I"
+                gf_buf[gf_pos::usize] = 'I';
+                gf_pos = gf_pos + 1;
+
+                # resolve and mangle each type arg
+                var gf_ai: i32 = 0;
+                for (gf_ai < gf_args_list.count && gf_pos < 500) {
+                    val gf_arg: *ast.Node = gf_args_list.nodes[gf_ai];
+                    if (gf_arg != nil) {
+                        val gf_arg_ty: *ty.Type = resolve_type_annotation(ctx, gf_arg);
+                        if (gf_arg_ty != nil) {
+                            val gf_written: i32 = ty.type_mangle(gf_arg_ty, ?gf_buf[gf_pos::usize], (512 - gf_pos)::usize);
+                            gf_pos = gf_pos + gf_written;
+                        }
+                    }
+                    gf_ai = gf_ai + 1;
+                }
+
+                # write "E\0"
+                gf_buf[gf_pos::usize] = 'E';
+                gf_pos = gf_pos + 1;
+                gf_buf[gf_pos::usize] = 0;
+
+                # allocate persistent copy
+                val gf_alloc_res: Result[*u8, allocator.AllocError] = ctx.alloc.alloc[u8]((gf_pos + 1)::usize);
+                if (gf_alloc_res.is_ok()) {
+                    val gf_dest: *u8 = gf_alloc_res.unwrap_ok();
+                    var gf_ci: i32 = 0;
+                    for (gf_ci <= gf_pos) {
+                        gf_dest[gf_ci::usize] = gf_buf[gf_ci::usize];
+                        gf_ci = gf_ci + 1;
+                    }
+                    func_name = gf_dest::str;
+                }
+            }
+        }
+    }
+
+    # resolve linkage name for all calls (direct, module-qualified, and method calls)
+    var call_sym: *symbol.Symbol = nil;
+    var found_via: i32 = 0;
+
+    # for module-qualified calls, look up in the specific aliased module first
+    if (is_module_qualified && module_alias_name != nil && ctx.current_sema_mod != nil) {
+        var ma: *sema.ModuleAlias = ctx.current_sema_mod.aliases;
+        for (ma != nil) {
+            if (ma.alias != nil && ma.alias.equals(module_alias_name)) {
+                if (ma.module != nil && ma.module.table != nil) {
+                    val mod_root: *symbol.Scope = ma.module.table.root_scope();
+                    if (mod_root != nil) {
+                        val mod_sym_opt: Option[*symbol.Symbol] = mod_root.lookup_local(func_name);
+                        if (mod_sym_opt.is_some()) {
+                            call_sym = mod_sym_opt.unwrap();
+                            found_via = 1;
+                        }
+                    }
+                }
+            }
+            ma = ma.next;
+        }
+    }
+
+    # try current module's symbol table
+    if (call_sym == nil && ctx.symbols != nil) {
         val sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(func_name);
         if (sym_opt.is_some()) {
-            val link: str = symbol.linkage_name(sym_opt.unwrap());
-            if (link != nil) {
-                func_name = link;
-            }
+            call_sym = sym_opt.unwrap();
+            found_via = 2;
+        }
+    }
+
+    # if not found, search imported modules
+    if (call_sym == nil) {
+        call_sym = lookup_symbol_in_imports(ctx, func_name);
+        if (call_sym != nil) {
+            found_via = 3;
+        }
+    }
+
+    # use linkage name if symbol was found
+    var is_indirect_call: bool = false;
+    if (call_sym != nil) {
+        val link: str = symbol.linkage_name(call_sym, ctx.alloc);
+        if (link != nil) {
+            func_name = link;
+        }
+    } or {
+        # no symbol found — field access callee might be a function pointer
+        if (callee.kind == ast.NODE_EXPR_FIELD) {
+            is_indirect_call = true;
         }
     }
 
@@ -1869,33 +2986,216 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         arg_count = args.count;
     }
 
-    # allocate array for argument values
-    val args_r: Result[*ir.IRValue, allocator.AllocError] = ctx.alloc.alloc[ir.IRValue](arg_count::usize);
+    # determine return type and if we need sret
+    var ret_size: usize = 0;
+    var needs_sret: bool = false;
+    var ret_ty: *ty.Type = node.ty;
+
+    # if node type not resolved (e.g., calls in unanalyzed imported module functions),
+    # try to get return type from the called function's symbol
+    if (ret_ty == nil && call_sym != nil && call_sym.resolved_type != nil) {
+        if (call_sym.resolved_type.kind == ty.TY_FUN && call_sym.resolved_type.ret_type != nil) {
+            ret_ty = call_sym.resolved_type.ret_type;
+        }
+    }
+
+    # resolve TY_GENERIC_PARAM return types through receiver's generic args
+    # e.g., unwrap_ok() returns T, resolve T -> Stat via Result[Stat, str]
+    if (ret_ty != nil && ret_ty.kind == ty.TY_GENERIC_PARAM && ret_ty.name != nil &&
+        method_recv_base_ty != nil && method_recv_base_ty.generic_arg_count > 0 &&
+        method_recv_base_ty.generic_args != nil) {
+        val base_gen: *ty.Type = method_recv_base_ty.base_generic;
+        if (base_gen != nil && base_gen.generic_param_count > 0) {
+            var gpi: i32 = 0;
+            var gp_resolved: bool = false;
+            for (gpi < base_gen.generic_param_count) {
+                val pname: str = ty.get_generic_param_name(base_gen, gpi);
+                if (!gp_resolved && pname != nil && pname.equals(ret_ty.name) &&
+                    gpi < method_recv_base_ty.generic_arg_count) {
+                    ret_ty = method_recv_base_ty.generic_args[gpi];
+                    gp_resolved = true;
+                }
+                gpi = gpi + 1;
+            }
+        }
+    }
+
+    if (ret_ty != nil) {
+        ret_size = ret_ty.size;
+        # sret is needed for large aggregates (must match callee-side detection)
+        if (type_is_large_aggregate(ret_ty, ctx.ptr_size)) {
+            needs_sret = true;
+        }
+
+        # handle generic return types (e.g., Result[T, E], Option[T])
+        # generic types are typically Result or Option which are aggregates > 8 bytes.
+        # always assume sret for generic return types to match callee-side detection.
+        if (ret_ty.kind == ty.TY_GENERIC) {
+            ret_size = 24;  # conservative estimate for Result[T, E] or Option[T]
+            needs_sret = true;
+        }
+    } or {
+        # fallback: if type is unknown but call has type args, assume generic return
+        # this handles cases where imported module function bodies weren't analyzed
+        if (node.generics != nil) {
+            ret_size = 24;  # conservative estimate for Result[T, E] or Option[T]
+            needs_sret = true;
+        }
+    }
+
+    # allocate space for sret buffer if needed
+    var sret_offset: i32 = 0;
+    var sret_ptr: ir.IRValue = ir.make_none();
+    if (needs_sret) {
+        ctx.stack_offset = ctx.stack_offset - ret_size::i32;
+        if (ctx.stack_offset % 8 != 0) {
+            ctx.stack_offset = ctx.stack_offset - (8 - ((-ctx.stack_offset) % 8));
+        }
+        sret_offset = ctx.stack_offset;
+        # LEA address of sret buffer into a register
+        val sret_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+        sret_ptr = ir.make_reg(sret_reg, ctx.ptr_size);
+        val sret_mem: ir.IRValue = frame_mem(ctx, sret_offset, ctx.ptr_size);
+        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                      sret_ptr, sret_mem, ir.make_none(), ir.CC_NONE);
+    }
+
+    # allocate array for argument values (+ 1 for sret if needed)
+    var total_args: i32 = arg_count;
+    if (needs_sret) {
+        total_args = total_args + 1;
+    }
+    val args_r: Result[*ir.IRValue, allocator.AllocError] = ctx.alloc.alloc[ir.IRValue](total_args::usize);
     if (args_r.is_err()) {
         ret make_none();
     }
 
     val arg_vals: *ir.IRValue = args_r.unwrap_ok();
 
+    # first argument is sret pointer if needed
+    var arg_offset: i32 = 0;
+    if (needs_sret) {
+        arg_vals[0] = sret_ptr;
+        arg_offset = 1;
+    }
+
     var i: i32 = 0;
     for (i < arg_count) {
-        arg_vals[i] = lower_expr(ctx, args.nodes[i]);
+        arg_vals[arg_offset + i] = lower_expr(ctx, args.nodes[i]);
         i = i + 1;
     }
 
-    # determine return size
-    var ret_size: usize = 0;
-    if (node.ty != nil) {
-        ret_size = node.ty.size;
+    # emit call - for sret, pass 0 ret_size since return is via pointer
+    var call_ret_size: usize = 0;
+    if (!needs_sret) {
+        call_ret_size = ret_size;
+    }
+    var result: ir.IRValue = ir.make_none();
+    if (is_indirect_call) {
+        # load function pointer from field access
+        val fn_ptr: ir.IRValue = lower_expr(ctx, callee);
+        # ensure it's in a register
+        val fn_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+        val fn_val: ir.IRValue = ir.make_reg(fn_reg, ctx.ptr_size);
+        emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, fn_val, fn_ptr, ir.make_none(), 0);
+        result = emit_indirect_call(ctx, fn_val, arg_vals, total_args, call_ret_size);
+    } or {
+        result = emit_call(ctx, func_name, arg_vals, total_args, call_ret_size);
     }
 
-    # emit call
-    val result: ir.IRValue = emit_call(ctx, func_name, arg_vals, arg_count, ret_size);
-
     # clean up argument array
-    ctx.alloc.free[ir.IRValue](arg_vals, arg_count::usize);
+    ctx.alloc.free[ir.IRValue](arg_vals, total_args::usize);
+
+    # for sret, return memory reference to the buffer
+    if (needs_sret) {
+        ret frame_mem(ctx, sret_offset, ret_size);
+    }
 
     ret result;
+}
+
+# resolve_node_type: recursively resolve the type of an expression node.
+# ---
+# ctx:  lowering context
+# node: expression node
+# ret:  resolved type or nil
+fun resolve_node_type(ctx: *LowerContext, node: *ast.Node) *ty.Type {
+    if (ctx == nil || node == nil) {
+        ret nil;
+    }
+
+    # if the node already has a type, use it
+    if (node.ty != nil) {
+        ret node.ty;
+    }
+
+    # IDENT: look up local variable type
+    if (node.kind == ast.NODE_EXPR_IDENT) {
+        val name: str = node.get_name();
+        if (name != nil) {
+            val idx: i32 = find_local_var(ctx, name);
+            if (idx >= 0) {
+                ret ctx.local_vars[idx].ty;
+            }
+        }
+        ret nil;
+    }
+
+    # FIELD: resolve base type, then look up field
+    if (node.kind == ast.NODE_EXPR_FIELD) {
+        val inner_base: *ast.Node = node.get_child(0);
+        val inner_field: str = node.get_name();
+        if (inner_base == nil || inner_field == nil) {
+            ret nil;
+        }
+        val inner_base_ty: *ty.Type = resolve_node_type(ctx, inner_base);
+        if (inner_base_ty == nil) {
+            ret nil;
+        }
+        # auto-dereference pointer
+        var struct_ty: *ty.Type = inner_base_ty;
+        if (struct_ty.kind == ty.TY_POINTER && struct_ty.inner != nil) {
+            struct_ty = struct_ty.inner;
+        }
+        if (struct_ty.kind == ty.TY_RECORD || struct_ty.kind == ty.TY_UNION) {
+            val field_opt: Option[*ty.Field] = ty.get_field(struct_ty, inner_field);
+            if (field_opt.is_some()) {
+                val resolved_field: *ty.Field = field_opt.unwrap();
+                ret resolved_field.ty;
+            }
+        }
+        ret nil;
+    }
+
+    # INDEX: resolve base type, get element type
+    if (node.kind == ast.NODE_EXPR_INDEX) {
+        val index_base: *ast.Node = node.get_child(0);
+        if (index_base == nil) {
+            ret nil;
+        }
+        val index_base_ty: *ty.Type = resolve_node_type(ctx, index_base);
+        if (index_base_ty == nil) {
+            ret nil;
+        }
+        if (index_base_ty.kind == ty.TY_POINTER && index_base_ty.inner != nil) {
+            ret index_base_ty.inner;
+        }
+        if (index_base_ty.kind == ty.TY_ARRAY && index_base_ty.inner != nil) {
+            ret index_base_ty.inner;
+        }
+        ret nil;
+    }
+
+    # CAST: resolve target type
+    if (node.kind == ast.NODE_EXPR_CAST) {
+        val cast_children: *ast.List = node.children::*ast.List;
+        if (cast_children != nil && cast_children.count >= 2) {
+            ret resolve_node_type(ctx, cast_children.nodes[1]);
+        }
+        ret nil;
+    }
+
+    ret nil;
 }
 
 # lower_field_access: lower a field access expression.
@@ -1916,10 +3216,99 @@ fun lower_field_access(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     }
 
     # get the base expression's type FIRST to check if this is a module-qualified access
-    val base_ty: *ty.Type = base.ty;
+    var base_ty: *ty.Type = base.ty;
+
+    # check if base is a local variable that may have nil type due to sema issues
+    # if so, look up the type from the local variable table
+    var base_is_local: bool = false;
+    if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
+        val base_name: str = base.get_name();
+        if (base_name != nil) {
+            val local_idx: i32 = find_local_var(ctx, base_name);
+            if (local_idx >= 0) {
+                # found a local variable - use its type
+                base_ty = ctx.local_vars[local_idx].ty;
+                base_is_local = true;
+            }
+        }
+    }
+
+    # for non-IDENT bases (FIELD, INDEX, CAST, etc.), recursively resolve the type
+    if (base_ty == nil && base.kind != ast.NODE_EXPR_IDENT) {
+        base_ty = resolve_node_type(ctx, base);
+    }
+
     if (base_ty == nil) {
-        # base has no type - this might be a module alias access like c.STDERR_FILENO
-        # In this case, treat field_name as a global symbol reference
+        # if base is a local variable with nil type, this is an error - return none
+        if (base_is_local) {
+            ret make_none();
+        }
+
+        # base has no type and is not a local - this might be a module alias access
+        # like c.STDERR_FILENO. Treat field_name as a global symbol reference.
+
+        # look up symbol for linkage name and function detection
+        var global_label: str = field_name;
+        var is_func_sym: bool = false;
+
+        # for module alias access, look up in the specific aliased module first
+        var fa_found: bool = false;
+        if (base.kind == ast.NODE_EXPR_IDENT && ctx.current_sema_mod != nil) {
+            val alias_name: str = base.get_name();
+            if (alias_name != nil) {
+                var fa_ma: *sema.ModuleAlias = ctx.current_sema_mod.aliases;
+                for (fa_ma != nil) {
+                    if (fa_ma.alias != nil && fa_ma.alias.equals(alias_name)) {
+                        if (fa_ma.module != nil && fa_ma.module.table != nil) {
+                            val fa_mod_root: *symbol.Scope = fa_ma.module.table.root_scope();
+                            if (fa_mod_root != nil) {
+                                val fa_mod_sym_opt: Option[*symbol.Symbol] = fa_mod_root.lookup_local(field_name);
+                                if (fa_mod_sym_opt.is_some()) {
+                                    val fa_mod_sym: *symbol.Symbol = fa_mod_sym_opt.unwrap();
+                                    if (fa_mod_sym.kind == symbol.SYM_FUN) {
+                                        is_func_sym = true;
+                                    }
+                                    val fa_mod_link: str = symbol.linkage_name(fa_mod_sym, ctx.alloc);
+                                    if (fa_mod_link != nil) {
+                                        global_label = fa_mod_link;
+                                    }
+                                    fa_found = true;
+                                }
+                            }
+                        }
+                    }
+                    fa_ma = fa_ma.next;
+                }
+            }
+        }
+
+        # fallback: search current module and imports
+        if (!fa_found && ctx.symbols != nil) {
+            val fa_sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(field_name);
+            if (fa_sym_opt.is_some()) {
+                val fa_sym: *symbol.Symbol = fa_sym_opt.unwrap();
+                if (fa_sym.kind == symbol.SYM_FUN) {
+                    is_func_sym = true;
+                }
+                val fa_link: str = symbol.linkage_name(fa_sym, ctx.alloc);
+                if (fa_link != nil) {
+                    global_label = fa_link;
+                }
+            }
+            if (global_label == field_name) {
+                val fa_imp_sym: *symbol.Symbol = lookup_symbol_in_imports(ctx, field_name);
+                if (fa_imp_sym != nil) {
+                    if (fa_imp_sym.kind == symbol.SYM_FUN) {
+                        is_func_sym = true;
+                    }
+                    val fa_imp_link: str = symbol.linkage_name(fa_imp_sym, ctx.alloc);
+                    if (fa_imp_link != nil) {
+                        global_label = fa_imp_link;
+                    }
+                }
+            }
+        }
+
         var v: ir.IRValue;
         v.kind = ir.VAL_LABEL;
         v.reg = 0;
@@ -1928,7 +3317,7 @@ fun lower_field_access(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         v.base_reg = 0;
         v.index_reg = -1;
         v.scale = 1;
-        v.label = field_name;
+        v.label = global_label;
         v.size = ctx.ptr_size;
 
         # determine size from node type if available
@@ -1943,12 +3332,12 @@ fun lower_field_access(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
                       addr, v, ir.make_none(), ir.CC_NONE);
 
-        # check if this is an aggregate type
+        # check if this is an aggregate type or function
         val var_ty: *ty.Type = node.ty;
         val is_aggregate: bool = var_ty != nil && (var_ty.kind == ty.TY_RECORD ||
                                                     var_ty.kind == ty.TY_UNION ||
                                                     var_ty.kind == ty.TY_ARRAY);
-        if (is_aggregate || sym_size > 8) {
+        if (is_aggregate || is_func_sym || sym_size > 8) {
             ret addr;
         }
 
@@ -1962,8 +3351,10 @@ fun lower_field_access(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # if pointer, dereference to get struct type
     var struct_ty: *ty.Type = base_ty;
+    var is_pointer: bool = false;
     if (base_ty.kind == ty.TY_POINTER && base_ty.inner != nil) {
         struct_ty = base_ty.inner;
+        is_pointer = true;
     }
 
     # look up field by name
@@ -1974,13 +3365,86 @@ fun lower_field_access(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     val field: *ty.Field = field_opt.unwrap();
 
     # get field offset and size from type system
-    val field_offset: usize = field.offset;
+    val field_offset: i32 = field.offset::i32;
     var field_size: usize = ctx.ptr_size;
-    if (field.ty != nil) {
-        field_size = field.ty.size;
+    var effective_field_ty: *ty.Type = field.ty;
+    # resolve generic parameter types through type bindings (e.g., T -> File)
+    if (effective_field_ty != nil && effective_field_ty.kind == ty.TY_GENERIC_PARAM &&
+        ctx.type_binding_count > 0 && ctx.type_binding_names != nil && effective_field_ty.name != nil) {
+        val gp_name: str = effective_field_ty.name;
+        var tbi: i32 = 0;
+        var resolved_binding: bool = false;
+        for (tbi < ctx.type_binding_count) {
+            if (!resolved_binding && ctx.type_binding_names[tbi] != nil && ctx.type_binding_names[tbi].equals(gp_name)) {
+                effective_field_ty = ctx.type_binding_types[tbi];
+                resolved_binding = true;
+            }
+            tbi = tbi + 1;
+        }
+    }
+    # fallback: use AST node type when field type is nil (common in monomorphized generics)
+    if (effective_field_ty == nil && node.ty != nil) {
+        effective_field_ty = node.ty;
+    }
+    if (effective_field_ty != nil && effective_field_ty.size > 0) {
+        field_size = effective_field_ty.size;
     }
 
-    # add offset to base address
+    # For aggregate fields (record/union/array), or when field type is unknown
+    # (common in monomorphized generics), return the memory operand directly
+    # so the caller can use it as an address for further field access or copying.
+    # For scalar fields with known type, load the value into a register.
+    val field_is_aggregate: bool = effective_field_ty == nil ||
+        effective_field_ty.kind == ty.TY_GENERIC_PARAM ||
+        (effective_field_ty.kind == ty.TY_RECORD || effective_field_ty.kind == ty.TY_UNION ||
+         effective_field_ty.kind == ty.TY_ARRAY);
+
+    # compute field address based on base_value kind and pointer vs direct access
+    if (is_pointer) {
+        # pointer field access: need the pointer value as base
+        if (base_value.kind == ir.VAL_REG) {
+            # base_value is already a register containing the pointer value
+            val mem: ir.IRValue = ir.make_mem(base_value.reg, -1, 1, field_offset::i64, field_size);
+            if (field_is_aggregate) {
+                ret mem;
+            }
+            ret emit_load(ctx, mem, field_size);
+        } or {
+            if (base_value.kind == ir.VAL_MEM) {
+                # base_value is memory operand - load the pointer value first
+                val ptr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+                val ptr_val: ir.IRValue = ir.make_reg(ptr_reg, ctx.ptr_size);
+                emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, ptr_val, base_value, ir.make_none(), 0);
+                val mem: ir.IRValue = ir.make_mem(ptr_reg, -1, 1, field_offset::i64, field_size);
+                if (field_is_aggregate) {
+                    ret mem;
+                }
+                ret emit_load(ctx, mem, field_size);
+            }
+        }
+    } or {
+        # direct struct access (not through pointer)
+        if (base_value.kind == ir.VAL_REG) {
+            # base_value is register containing address of struct (LEA result)
+            val mem: ir.IRValue = ir.make_mem(base_value.reg, -1, 1, field_offset::i64, field_size);
+            if (field_is_aggregate) {
+                ret mem;
+            }
+            ret emit_load(ctx, mem, field_size);
+        } or {
+            if (base_value.kind == ir.VAL_MEM) {
+                # base_value is memory operand (struct on stack) - adjust displacement
+                val mem: ir.IRValue = ir.make_mem(base_value.base_reg, base_value.index_reg,
+                                                   base_value.scale, base_value.offset + field_offset::i64, field_size);
+                if (field_is_aggregate) {
+                    ret mem;
+                }
+                ret emit_load(ctx, mem, field_size);
+            }
+        }
+    }
+
+    # fallback: use ADD (shouldn't normally reach here)
     val offset_value: ir.IRValue = ir.make_imm(field_offset::i64, ctx.ptr_size);
     val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
     val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
@@ -2024,7 +3488,19 @@ fun lower_index(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # lower base
     var base_value: ir.IRValue = lower_expr(ctx, base);
-    val base_ty: *ty.Type = base.ty;
+    var base_ty: *ty.Type = base.ty;
+
+    # fall back to local_vars type table if node type is nil
+    if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
+        val idx_base_name: str = base.get_name();
+        if (idx_base_name != nil) {
+            val idx_local: i32 = find_local_var(ctx, idx_base_name);
+            if (idx_local >= 0) {
+                base_ty = ctx.local_vars[idx_local].ty;
+            }
+        }
+    }
+
     if (base_value.kind == ir.VAL_MEM) {
         if (base_ty != nil && (base_ty.kind == ty.TY_POINTER || base_ty.kind == ty.TY_STR)) {
             # load pointer value from memory (str is also a pointer type)
@@ -2082,8 +3558,19 @@ fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val src_ty: *ty.Type = op_node.ty;
+    var src_ty: *ty.Type = op_node.ty;
     val dst_ty: *ty.Type = node.ty;
+
+    # resolve source type from local vars if not set on the node
+    if (src_ty == nil && op_node.kind == ast.NODE_EXPR_IDENT) {
+        val src_name: str = op_node.get_name();
+        if (src_name != nil) {
+            val src_idx: i32 = find_local_var(ctx, src_name);
+            if (src_idx >= 0) {
+                src_ty = ctx.local_vars[src_idx].ty;
+            }
+        }
+    }
 
     # array to pointer/str casts should use the array address
     if (src_ty != nil && src_ty.kind == ty.TY_ARRAY &&
@@ -2097,6 +3584,23 @@ fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     var target_size: usize = 8;
     if (node.ty != nil) {
         target_size = node.ty.size;
+    }
+
+    # aggregate-to-scalar cast: load the value from the aggregate address
+    if (src_ty != nil && (src_ty.kind == ty.TY_RECORD || src_ty.kind == ty.TY_UNION)) {
+        if (dst_ty == nil || (dst_ty.kind != ty.TY_RECORD && dst_ty.kind != ty.TY_UNION)) {
+            if (value.kind == ir.VAL_REG) {
+                # value is an address (from LEA); load the scalar value from it
+                val agg_mem: ir.IRValue = ir.make_mem(value.reg, -1, 1, 0, target_size);
+                ret emit_load(ctx, agg_mem, target_size);
+            }
+            if (value.kind == ir.VAL_MEM) {
+                # value is already a memory reference; load from it with target size
+                var load_mem: ir.IRValue = value;
+                load_mem.size = target_size;
+                ret emit_load(ctx, load_mem, target_size);
+            }
+        }
     }
 
     # for now, just move to a register of the right size
@@ -2124,8 +3628,20 @@ fun lower_addr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret ir.make_imm(0, ctx.ptr_size);
     }
 
-    # get lvalue address
-    ret lower_lvalue(ctx, operand);
+    # get lvalue memory reference
+    val mem: ir.IRValue = lower_lvalue(ctx, operand);
+
+    # if lvalue is a memory reference, emit LEA to compute the address as a value
+    if (mem.kind == ir.VAL_MEM) {
+        val result_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+        val result: ir.IRValue = ir.make_reg(result_reg, ctx.ptr_size);
+        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                      result, mem, ir.make_none(), ir.CC_NONE);
+        ret result;
+    }
+
+    # for labels or other kinds, return as-is (address is the label itself)
+    ret mem;
 }
 
 # lower_deref: lower a dereference expression.
@@ -2257,8 +3773,30 @@ fun lower_struct_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    # get struct type
-    val struct_ty: *ty.Type = node.ty;
+    # get struct type - try node.ty first, fall back to type annotation in node.extra
+    var struct_ty: *ty.Type = node.ty;
+    if (struct_ty == nil) {
+        val slit_type_node: *ast.Node = node.extra::*ast.Node;
+        if (slit_type_node != nil) {
+            val type_name: str = slit_type_node.get_name();
+            if (type_name != nil) {
+                # look up in current module symbols
+                var type_sym: *symbol.Symbol = nil;
+                if (ctx.symbols != nil) {
+                    val sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(type_name);
+                    if (sym_opt.is_some()) {
+                        type_sym = sym_opt.unwrap();
+                    }
+                }
+                if (type_sym == nil) {
+                    type_sym = lookup_symbol_in_imports(ctx, type_name);
+                }
+                if (type_sym != nil && type_sym.resolved_type != nil) {
+                    struct_ty = type_sym.resolved_type;
+                }
+            }
+        }
+    }
     if (struct_ty == nil) {
         ret make_none();
     }
@@ -2437,7 +3975,28 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
             ret frame_mem(ctx, offset, size);
         }
 
-        # global variable - return symbol reference
+        # global variable - look up symbol for linkage name
+        var lv_label: str = name;
+        if (ctx.symbols != nil) {
+            val lv_sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(name);
+            if (lv_sym_opt.is_some()) {
+                val lv_sym: *symbol.Symbol = lv_sym_opt.unwrap();
+                val lv_link: str = symbol.linkage_name(lv_sym, ctx.alloc);
+                if (lv_link != nil) {
+                    lv_label = lv_link;
+                }
+            }
+            if (lv_label == name) {
+                val lv_imp_sym: *symbol.Symbol = lookup_symbol_in_imports(ctx, name);
+                if (lv_imp_sym != nil) {
+                    val lv_imp_link: str = symbol.linkage_name(lv_imp_sym, ctx.alloc);
+                    if (lv_imp_link != nil) {
+                        lv_label = lv_imp_link;
+                    }
+                }
+            }
+        }
+
         var v: ir.IRValue;
         v.kind = ir.VAL_LABEL;
         v.reg = 0;
@@ -2446,7 +4005,7 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         v.base_reg = 0;
         v.index_reg = -1;
         v.scale = 1;
-        v.label = name;
+        v.label = lv_label;
         v.size = ctx.ptr_size;
         ret v;
     }
@@ -2462,27 +4021,99 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
         val base_addr: ir.IRValue = lower_lvalue(ctx, base);
 
-        # look up field offset from type
+        # look up field offset and size from type
         var field_offset: usize = 0;
-        val base_ty: *ty.Type = base.ty;
+        var field_size: usize = ctx.ptr_size;
+        # try base.ty first, fall back to local_vars type table
+        var base_ty: *ty.Type = base.ty;
+        if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
+            val base_name: str = base.get_name();
+            if (base_name != nil) {
+                val local_idx: i32 = find_local_var(ctx, base_name);
+                if (local_idx >= 0) {
+                    base_ty = ctx.local_vars[local_idx].ty;
+                }
+            }
+        }
+        # for non-IDENT bases (FIELD, INDEX, etc.), recursively resolve
+        if (base_ty == nil && base.kind != ast.NODE_EXPR_IDENT) {
+            base_ty = resolve_node_type(ctx, base);
+        }
+        var is_pointer: bool = false;
         if (base_ty != nil) {
             var struct_ty: *ty.Type = base_ty;
             if (base_ty.kind == ty.TY_POINTER && base_ty.inner != nil) {
                 struct_ty = base_ty.inner;
+                is_pointer = true;
             }
             val field_opt: Option[*ty.Field] = ty.get_field(struct_ty, field_name);
             if (field_opt.is_some()) {
                 val field: *ty.Field = field_opt.unwrap();
                 field_offset = field.offset;
+                if (field.ty != nil) {
+                    field_size = field.ty.size;
+                }
             }
         }
 
-        # add offset to base address
-        val offset_value: ir.IRValue = ir.make_imm(field_offset::i64, ctx.ptr_size);
+        # handle pointer field access - need to load pointer value first
+        if (is_pointer) {
+            # load the pointer value into a register
+            val ptr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+            val ptr_val: ir.IRValue = ir.make_reg(ptr_reg, ctx.ptr_size);
+            var load_instr: ir.Instr;
+            load_instr.op = ir.IROp{ir_load: ir.OP_LOAD};
+            load_instr.dst = ptr_val;
+            load_instr.src1 = base_addr;
+            load_instr.src2 = ir.make_none();
+            load_instr.cond = ir.CC_NONE;
+            emit_instr(ctx, load_instr.op, load_instr.dst, load_instr.src1, load_instr.src2, 0);
+
+            # return memory operand: [ptr_reg + field_offset]
+            var result: ir.IRValue;
+            result.kind = ir.VAL_MEM;
+            result.reg = 0;
+            result.imm = 0;
+            result.offset = field_offset::i64;
+            result.base_reg = ptr_reg;
+            result.index_reg = -1;
+            result.scale = 1;
+            result.label = nil;
+            result.size = field_size;
+            ret result;
+        }
+
+        # for non-pointer: check if base_addr is a memory operand (local struct)
+        if (base_addr.kind == ir.VAL_MEM) {
+            # just adjust the displacement - no ADD instruction needed
+            var result: ir.IRValue = base_addr;
+            result.offset = base_addr.offset + field_offset::i64;
+            result.size = field_size;
+            ret result;
+        }
+
+        # for register or label operands, use LEA to compute address
+        if (base_addr.kind == ir.VAL_REG) {
+            # base is in a register, return memory operand with offset
+            var result: ir.IRValue;
+            result.kind = ir.VAL_MEM;
+            result.reg = 0;
+            result.imm = 0;
+            result.offset = field_offset::i64;
+            result.base_reg = base_addr.reg;
+            result.index_reg = -1;
+            result.scale = 1;
+            result.label = nil;
+            result.size = field_size;
+            ret result;
+        }
+
+        # fallback: use LEA for other cases (e.g., globals)
         val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
         val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-        emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, base_addr, offset_value, ctx.ptr_size);
-
+        var mem: ir.IRValue = base_addr;
+        mem.offset = mem.offset + field_offset::i64;
+        emit_instr(ctx, ir.IROp{ir_lea: ir.OP_LEA}, addr, mem, ir.make_none(), 0);
         ret addr;
     }
 
@@ -2500,7 +4131,17 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
         # get element size from type
         var elem_size: usize = ctx.ptr_size;
-        val base_ty: *ty.Type = base.ty;
+        var base_ty: *ty.Type = base.ty;
+        # fall back to local_vars type table if node type is nil
+        if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
+            val lv_idx_name: str = base.get_name();
+            if (lv_idx_name != nil) {
+                val lv_idx_local: i32 = find_local_var(ctx, lv_idx_name);
+                if (lv_idx_local >= 0) {
+                    base_ty = ctx.local_vars[lv_idx_local].ty;
+                }
+            }
+        }
         if (base_ty != nil) {
             if (base_ty.kind == ty.TY_ARRAY && base_ty.inner != nil) {
                 elem_size = base_ty.inner.size;
@@ -2534,6 +4175,15 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
             ret ir.make_imm(0, ctx.ptr_size);
         }
         ret lower_expr(ctx, operand);
+    }
+
+    # parenthesized expression: unwrap and lower inner lvalue
+    if (node.kind == ast.NODE_EXPR_PAREN) {
+        val inner: *ast.Node = node.get_child(0);
+        if (inner != nil) {
+            ret lower_lvalue(ctx, inner);
+        }
+        ret ir.make_imm(0, ctx.ptr_size);
     }
 
     ret ir.make_imm(0, ctx.ptr_size);
@@ -2651,17 +4301,42 @@ fun lower_var_decl(ctx: *LowerContext, node: *ast.Node) {
         ret;
     }
 
+    # get type - try node.ty first, fall back to type annotation resolution
+    var var_ty: *ty.Type = node.ty;
+    if (var_ty == nil) {
+        # try to resolve type from type annotation (stored in extra)
+        val type_ann: *ast.Node = node.extra::*ast.Node;
+        if (type_ann != nil && type_ann.kind == ast.NODE_TYPE_NAME) {
+            val type_name: str = type_ann.get_name();
+            if (type_name != nil) {
+                var type_sym: *symbol.Symbol = nil;
+                if (ctx.symbols != nil) {
+                    val sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(type_name);
+                    if (sym_opt.is_some()) {
+                        type_sym = sym_opt.unwrap();
+                    }
+                }
+                if (type_sym == nil) {
+                    type_sym = lookup_symbol_in_imports(ctx, type_name);
+                }
+                if (type_sym != nil && type_sym.resolved_type != nil) {
+                    var_ty = type_sym.resolved_type;
+                }
+            }
+        }
+    }
+
     # get type size
     var size: usize = ctx.ptr_size;
-    if (node.ty != nil) {
-        size = node.ty.size;
+    if (var_ty != nil) {
+        size = var_ty.size;
     }
 
     # get initializer (stored in children, not extra - extra is the type annotation)
     val init_node: *ast.Node = node.children;
 
     # allocate stack space
-    val offset: i32 = add_local_var(ctx, name, size);
+    val offset: i32 = add_local_var(ctx, name, size, var_ty);
 
     if (init_node != nil) {
         val init_value: ir.IRValue = lower_expr(ctx, init_node);
@@ -2721,6 +4396,152 @@ fun lower_return(ctx: *LowerContext, node: *ast.Node) {
     var ret_value: ir.IRValue = make_none();
     if (expr != nil) {
         ret_value = lower_expr(ctx, expr);
+    }
+
+    # for sret returns, copy value into the sret buffer and return the pointer
+    if (ctx.fn_has_sret && ctx.fn_ret_type != nil && ctx.fn_ret_type.size > ctx.ptr_size && expr != nil) {
+        # load sret pointer from its stack slot
+        val sret_slot: ir.IRValue = frame_mem(ctx, ctx.sret_offset, ctx.ptr_size);
+        val dst_ptr: ir.IRValue = emit_load(ctx, sret_slot, ctx.ptr_size);
+        val dst_reg: i32 = dst_ptr.reg;
+
+        # copy return value into sret buffer
+        if (ret_value.kind == ir.VAL_MEM) {
+            # source is a memory operand - get its address for a chunked copy
+            val src_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+            val src_ptr: ir.IRValue = ir.make_reg(src_reg, ctx.ptr_size);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                          src_ptr, ret_value, ir.make_none(), ir.CC_NONE);
+
+            # chunked copy: 8 bytes at a time
+            val total_size: i32 = ctx.fn_ret_type.size::i32;
+            var off: i32 = 0;
+            for (off < total_size) {
+                var chunk: usize = 8;
+                if ((total_size - off)::usize < 8) {
+                    chunk = (total_size - off)::usize;
+                }
+                val tmp_reg: i32 = new_vreg(ctx, chunk);
+                val tmp: ir.IRValue = ir.make_reg(tmp_reg, chunk);
+
+                # load from source + offset
+                var src_mem: ir.IRValue;
+                src_mem.kind = ir.VAL_MEM;
+                src_mem.base_reg = src_reg;
+                src_mem.offset = off::i64;
+                src_mem.size = chunk;
+                src_mem.reg = 0;
+                src_mem.imm = 0;
+                src_mem.index_reg = -1;
+                src_mem.scale = 1;
+                src_mem.label = nil;
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                              tmp, src_mem, ir.make_none(), ir.CC_NONE);
+
+                # store to sret buffer + offset
+                var dst_mem: ir.IRValue;
+                dst_mem.kind = ir.VAL_MEM;
+                dst_mem.base_reg = dst_reg;
+                dst_mem.offset = off::i64;
+                dst_mem.size = chunk;
+                dst_mem.reg = 0;
+                dst_mem.imm = 0;
+                dst_mem.index_reg = -1;
+                dst_mem.scale = 1;
+                dst_mem.label = nil;
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                              dst_mem, tmp, ir.make_none(), ir.CC_NONE);
+
+                off = off + chunk::i32;
+            }
+        } or (ret_value.kind == ir.VAL_REG) {
+            # source is a register containing an address (LEA result for aggregate)
+            # chunk-copy from that address to the sret buffer
+            val src_reg: i32 = ret_value.reg;
+            val total_size: i32 = ctx.fn_ret_type.size::i32;
+            var off: i32 = 0;
+            for (off < total_size) {
+                var chunk: usize = 8;
+                if ((total_size - off)::usize < 8) {
+                    chunk = (total_size - off)::usize;
+                }
+                val tmp_reg: i32 = new_vreg(ctx, chunk);
+                val tmp: ir.IRValue = ir.make_reg(tmp_reg, chunk);
+
+                # load from source address + offset
+                var src_mem: ir.IRValue;
+                src_mem.kind = ir.VAL_MEM;
+                src_mem.base_reg = src_reg;
+                src_mem.offset = off::i64;
+                src_mem.size = chunk;
+                src_mem.reg = 0;
+                src_mem.imm = 0;
+                src_mem.index_reg = -1;
+                src_mem.scale = 1;
+                src_mem.label = nil;
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                              tmp, src_mem, ir.make_none(), ir.CC_NONE);
+
+                # store to sret buffer + offset
+                var dst_mem: ir.IRValue;
+                dst_mem.kind = ir.VAL_MEM;
+                dst_mem.base_reg = dst_reg;
+                dst_mem.offset = off::i64;
+                dst_mem.size = chunk;
+                dst_mem.reg = 0;
+                dst_mem.imm = 0;
+                dst_mem.index_reg = -1;
+                dst_mem.scale = 1;
+                dst_mem.label = nil;
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                              dst_mem, tmp, ir.make_none(), ir.CC_NONE);
+
+                off = off + chunk::i32;
+            }
+        }
+
+        # return the sret pointer
+        emit_ret(ctx, dst_ptr);
+        ret;
+    }
+
+    # small aggregate return (size <= ptr_size): lower_expr returns an address (LEA)
+    # for local variables, or a memory operand for field accesses.
+    # we need to return the actual value in a register.
+    # call expressions already return the value directly in a register.
+    if (expr != nil && ctx.fn_ret_type != nil &&
+        (ctx.fn_ret_type.kind == ty.TY_RECORD ||
+         ctx.fn_ret_type.kind == ty.TY_UNION ||
+         ctx.fn_ret_type.kind == ty.TY_ARRAY) &&
+        ctx.fn_ret_type.size > 0 && ctx.fn_ret_type.size <= ctx.ptr_size &&
+        expr.kind != ast.NODE_EXPR_CALL) {
+        if (ret_value.kind == ir.VAL_REG) {
+            # ret_value register holds an address (LEA result) — load the value from it
+            var agg_src_mem: ir.IRValue;
+            agg_src_mem.kind = ir.VAL_MEM;
+            agg_src_mem.base_reg = ret_value.reg;
+            agg_src_mem.offset = 0;
+            agg_src_mem.size = ctx.fn_ret_type.size;
+            agg_src_mem.reg = 0;
+            agg_src_mem.imm = 0;
+            agg_src_mem.index_reg = -1;
+            agg_src_mem.scale = 1;
+            agg_src_mem.label = nil;
+            val agg_val_reg: i32 = new_vreg(ctx, ctx.fn_ret_type.size);
+            val agg_val: ir.IRValue = ir.make_reg(agg_val_reg, ctx.fn_ret_type.size);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                          agg_val, agg_src_mem, ir.make_none(), ir.CC_NONE);
+            ret_value = agg_val;
+        } or (ret_value.kind == ir.VAL_MEM) {
+            # ret_value is a memory operand (from field access) — override size
+            # with the return type's actual size and load into register
+            ret_value.size = ctx.fn_ret_type.size;
+            val agg_val_reg: i32 = new_vreg(ctx, ctx.fn_ret_type.size);
+            val agg_val: ir.IRValue = ir.make_reg(agg_val_reg, ctx.fn_ret_type.size);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                          agg_val, ret_value, ir.make_none(), ir.CC_NONE);
+            ret_value = agg_val;
+        }
     }
 
     # emit return instruction
@@ -3167,12 +4988,104 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
         ret err[*ir.IRFunction, str]("function has no name");
     }
 
+    # for methods, build qualified name "ReceiverType.methodName" to look up symbol
+    var symbol_key: str = name;
+    if (node.receiver != nil) {
+        val recv_type_name: str = get_receiver_type_name(node.receiver);
+        if (recv_type_name != nil) {
+            # build "ReceiverType.methodName"
+            val recv_len: usize = recv_type_name.len();
+            val name_len: usize = name.len();
+            val total_len: usize = recv_len + 1 + name_len + 1;
+
+            val alloc_res: Result[*u8, allocator.AllocError] = ctx.alloc.alloc[u8](total_len);
+            if (alloc_res.is_ok()) {
+                val buf: *u8 = alloc_res.unwrap_ok();
+                var i: usize = 0;
+                # copy receiver type name
+                for (i < recv_len) {
+                    buf[i] = recv_type_name[i];
+                    i = i + 1;
+                }
+                buf[i] = '.';
+                i = i + 1;
+                # copy method name
+                var j: usize = 0;
+                for (j < name_len) {
+                    buf[i] = name[j];
+                    i = i + 1;
+                    j = j + 1;
+                }
+                buf[i] = 0;
+                symbol_key = buf::str;
+            }
+        }
+    }
+
+    # skip generic functions/methods in regular lowering pass (they get lowered
+    # per-instantiation in a separate pass with type bindings)
+    if (ctx.func_name_override == nil) {
+        # skip generic free functions (have node.generics)
+        if (node.generics != nil) {
+            ret err[*ir.IRFunction, str]("skipped generic function");
+        }
+
+        # skip generic methods (receiver has generic type args)
+        if (node.receiver != nil) {
+            var skip_recv_type: *ast.Node = node.receiver.children;
+            for (skip_recv_type != nil && (skip_recv_type.kind == ast.NODE_TYPE_PTR || skip_recv_type.kind == ast.NODE_TYPE_REF)) {
+                skip_recv_type = skip_recv_type.get_child(0);
+            }
+            if (skip_recv_type != nil && skip_recv_type.kind == ast.NODE_TYPE_NAME) {
+                val skip_generic_args: *ast.Node = skip_recv_type.children;
+                if (skip_generic_args != nil && skip_generic_args.kind == ast.NODE_GENERIC) {
+                    ret err[*ir.IRFunction, str]("skipped generic method");
+                }
+            }
+        }
+    }
+
     # resolve linkage name (e.g., $main.symbol override)
-    var func_name: str = name;
-    if (ctx.symbols != nil) {
-        val sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(name);
-        if (sym_opt.is_some()) {
-            val link: str = symbol.linkage_name(sym_opt.unwrap());
+    var func_name: str = symbol_key;
+    var sym: *symbol.Symbol = nil;
+
+    # if we have a function name override (instantiation lowering), use it
+    if (ctx.func_name_override != nil) {
+        func_name = ctx.func_name_override;
+        # look up the instantiated symbol
+        if (ctx.symbols != nil) {
+            val sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(ctx.func_name_override);
+            if (sym_opt.is_some()) {
+                sym = sym_opt.unwrap();
+            }
+        }
+        if (sym == nil) {
+            sym = lookup_symbol_in_imports(ctx, ctx.func_name_override);
+        }
+        # compute linkage name for the instantiated symbol
+        if (sym != nil) {
+            val link: str = symbol.linkage_name(sym, ctx.alloc);
+            if (link != nil) {
+                func_name = link;
+            }
+        }
+    } or {
+        # first try current module's symbol table
+        if (ctx.symbols != nil) {
+            val sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(symbol_key);
+            if (sym_opt.is_some()) {
+                sym = sym_opt.unwrap();
+            }
+        }
+
+        # if not found, search imported modules
+        if (sym == nil) {
+            sym = lookup_symbol_in_imports(ctx, symbol_key);
+        }
+
+        # use linkage name if symbol was found
+        if (sym != nil) {
+            val link: str = symbol.linkage_name(sym, ctx.alloc);
             if (link != nil) {
                 func_name = link;
             }
@@ -3232,7 +5145,13 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     }
 
     # determine function return type and whether we need sret
-    if (node.ty != nil) {
+    # use return type override if available (for generic instantiation)
+    if (ctx.ret_type_override != nil) {
+        ctx.fn_ret_type = ctx.ret_type_override;
+        if (type_is_large_aggregate(ctx.fn_ret_type, ctx.ptr_size)) {
+            ctx.fn_has_sret = true;
+        }
+    } or (node.ty != nil) {
         if (node.ty.kind == ty.TY_FUN) {
             if (node.ty.ret_type != nil) {
                 ctx.fn_ret_type = node.ty.ret_type;
@@ -3270,19 +5189,106 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     val receiver: *ast.Node = node.receiver;
     if (!is_entry && receiver != nil) {
         val recv_name: str = receiver.get_name();
-        val recv_type: *ty.Type = receiver.ty;
+        var recv_type: *ty.Type = nil;
+
+        # use receiver type override if set (for generic instantiation lowering)
+        if (ctx.recv_type_override != nil) {
+            recv_type = ctx.recv_type_override;
+        } or {
+            recv_type = receiver.ty;
+            # if sema didn't set the type, resolve from the type annotation
+            if (recv_type == nil) {
+                val recv_ann_inner: *ast.Node = receiver.children;
+                if (recv_ann_inner != nil) {
+                    recv_type = resolve_type_annotation(ctx, recv_ann_inner);
+                }
+            }
+        }
+
         var recv_size: usize = ctx.ptr_size;
-        if (recv_type != nil) {
+        # check if receiver type annotation is a pointer or reference
+        # the AST node for the receiver's type annotation tells us if it's &T or *T
+        val recv_ann: *ast.Node = receiver.children;
+        val recv_is_ptr: bool = recv_ann != nil &&
+            (recv_ann.kind == ast.NODE_TYPE_PTR || recv_ann.kind == ast.NODE_TYPE_REF);
+
+        if (recv_is_ptr) {
+            # references and pointers are always pointer-sized at ABI level
+            recv_size = ctx.ptr_size;
+        } or (recv_type != nil) {
             recv_size = recv_type.size;
         }
 
-        # allocate stack space for receiver
-        val recv_offset: i32 = add_local_var(ctx, recv_name, recv_size);
+        # large aggregate receivers are passed as hidden pointers by the caller
+        # (matching SysV AMD64 ABI for structs > ptr_size)
+        # we copy the struct from the pointer into our local stack slot
+        val recv_is_large_agg: bool = !recv_is_ptr && recv_type != nil &&
+            (recv_type.kind == ty.TY_RECORD ||
+             recv_type.kind == ty.TY_UNION ||
+             recv_type.kind == ty.TY_ARRAY) &&
+            recv_type.size > ctx.ptr_size;
 
-        # store receiver from first arg register to stack
-        val recv_reg: i32 = sysv64.get_arg_reg(int_arg_idx);
-        val recv_addr: ir.IRValue = frame_mem(ctx, recv_offset, recv_size);
-        emit_store(ctx, recv_addr, ir.make_reg(recv_reg, recv_size));
+        # allocate stack space for receiver (full struct size, not pointer)
+        val recv_offset: i32 = add_local_var(ctx, recv_name, recv_size, recv_type);
+
+        # store receiver from arg register to stack
+        val recv_reg_idx: i32 = sysv64.get_arg_reg(int_arg_idx);
+        if (recv_is_large_agg) {
+            # caller passed a pointer — copy the struct into our local slot
+            val rsrc_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+            val rsrc_ptr: ir.IRValue = ir.make_reg(rsrc_reg, ctx.ptr_size);
+            emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, rsrc_ptr,
+                       ir.make_reg(recv_reg_idx, ctx.ptr_size), ir.make_none(), 0);
+
+            val rdst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+            val rdst_ptr: ir.IRValue = ir.make_reg(rdst_reg, ctx.ptr_size);
+            val rdst_mem: ir.IRValue = frame_mem(ctx, recv_offset, ctx.ptr_size);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                          rdst_ptr, rdst_mem, ir.make_none(), ir.CC_NONE);
+
+            val rtotal: i32 = recv_size::i32;
+            var roff: i32 = 0;
+            for (roff < rtotal) {
+                var rchunk: usize = 8;
+                if ((rtotal - roff)::usize < 8) {
+                    rchunk = (rtotal - roff)::usize;
+                }
+                val rtmp_reg: i32 = new_vreg(ctx, rchunk);
+                val rtmp: ir.IRValue = ir.make_reg(rtmp_reg, rchunk);
+
+                var rs_mem: ir.IRValue;
+                rs_mem.kind = ir.VAL_MEM;
+                rs_mem.base_reg = rsrc_reg;
+                rs_mem.offset = roff::i64;
+                rs_mem.size = rchunk;
+                rs_mem.reg = 0;
+                rs_mem.imm = 0;
+                rs_mem.index_reg = -1;
+                rs_mem.scale = 1;
+                rs_mem.label = nil;
+
+                var rd_mem: ir.IRValue;
+                rd_mem.kind = ir.VAL_MEM;
+                rd_mem.base_reg = rdst_reg;
+                rd_mem.offset = roff::i64;
+                rd_mem.size = rchunk;
+                rd_mem.reg = 0;
+                rd_mem.imm = 0;
+                rd_mem.index_reg = -1;
+                rd_mem.scale = 1;
+                rd_mem.label = nil;
+
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                              rtmp, rs_mem, ir.make_none(), ir.CC_NONE);
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                              rd_mem, rtmp, ir.make_none(), ir.CC_NONE);
+
+                roff = roff + rchunk::i32;
+            }
+        } or {
+            val recv_addr: ir.IRValue = frame_mem(ctx, recv_offset, recv_size);
+            emit_store(ctx, recv_addr, ir.make_reg(recv_reg_idx, recv_size));
+        }
         int_arg_idx = int_arg_idx + 1;
     }
 
@@ -3310,42 +5316,182 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     }
 
     if (!is_entry && params != nil) {
-        var i: i32 = 0;
-        for (i < params.count) {
-            val param: *ast.Node = params.nodes[i];
-            if (param == nil) {
-                i = i + 1;
-                cnt;
-            }
+        # Two-pass approach: save scalar params from registers first, then copy aggregates.
+        # This prevents aggregate copy loops from clobbering unsaved argument registers.
 
-            # skip variadic marker nodes
-            if (param.kind == ast.NODE_VARIADIC) {
+        # Pre-pass: allocate stack space and record metadata for all params
+        var param_offsets: [32]i32;
+        var param_sizes:   [32]usize;
+        var param_byval:   [32]bool;
+        var param_count: i32 = params.count;
+        if (param_count > 32) { param_count = 32; }
+
+        var i: i32 = 0;
+        for (i < param_count) {
+            val param: *ast.Node = params.nodes[i];
+            if (param == nil || param.kind == ast.NODE_VARIADIC) {
+                param_offsets[i] = 0;
+                param_sizes[i] = 0;
+                param_byval[i] = false;
                 i = i + 1;
                 cnt;
             }
 
             val param_name: str = param.get_name();
-            val param_type: *ty.Type = param.ty;
+            var param_type: *ty.Type = param.ty;
+            if (param_type == nil) {
+                val param_ann: *ast.Node = param.children;
+                if (param_ann != nil) {
+                    param_type = resolve_type_annotation(ctx, param_ann);
+                }
+            }
 
-            # determine parameter size
             var param_size: usize = ctx.ptr_size;
-            if (param_type != nil) {
+            if (param_type != nil && param_type.size > 0) {
                 param_size = param_type.size;
             }
 
-            # allocate stack space for parameter
-            val param_offset: i32 = add_local_var(ctx, param_name, param_size);
+            val is_large_agg: bool = param_type != nil &&
+                (param_type.kind == ty.TY_RECORD ||
+                 param_type.kind == ty.TY_UNION ||
+                 param_type.kind == ty.TY_ARRAY) &&
+                param_type.size > ctx.ptr_size;
 
-            # store parameter from register to stack
-            if (int_arg_idx < 6) {
-                val arg_reg: i32 = sysv64.get_arg_reg(int_arg_idx);
-                val param_addr: ir.IRValue = frame_mem(ctx, param_offset, param_size);
-                emit_store(ctx, param_addr, ir.make_reg(arg_reg, param_size));
-                int_arg_idx = int_arg_idx + 1;
-            }
-
+            val p_offset: i32 = add_local_var(ctx, param_name, param_size, param_type);
+            param_offsets[i] = p_offset;
+            param_sizes[i] = param_size;
+            param_byval[i] = is_large_agg;
             i = i + 1;
         }
+
+        # Pass 1: Save all scalar params from registers to stack slots
+        var gp_idx: i32 = int_arg_idx;
+        var stack_idx: i32 = 0;
+
+        i = 0;
+        for (i < param_count) {
+            if (param_sizes[i] == 0) {
+                i = i + 1;
+                cnt;
+            }
+
+            if (!param_byval[i]) {
+                # scalar/pointer param
+                if (gp_idx < 6) {
+                    val arg_reg: i32 = sysv64.get_arg_reg(gp_idx);
+                    val dst: ir.IRValue = frame_mem(ctx, param_offsets[i], param_sizes[i]);
+                    emit_store(ctx, dst, ir.make_reg(arg_reg, param_sizes[i]));
+                    gp_idx = gp_idx + 1;
+                } or {
+                    # stack param (7+ args): load from caller's stack frame
+                    val stack_off: i32 = 16 + (stack_idx * ctx.ptr_size::i32);
+                    val src_mem: ir.IRValue = frame_mem(ctx, stack_off, ctx.ptr_size);
+                    val tmp_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+                    val tmp: ir.IRValue = ir.make_reg(tmp_reg, ctx.ptr_size);
+                    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                                  tmp, src_mem, ir.make_none(), ir.CC_NONE);
+                    val dst: ir.IRValue = frame_mem(ctx, param_offsets[i], param_sizes[i]);
+                    emit_store(ctx, dst, tmp);
+                    stack_idx = stack_idx + 1;
+                }
+            } or {
+                # byval large aggregate — just consume register slot, copy in pass 2
+                if (gp_idx < 6) {
+                    gp_idx = gp_idx + 1;
+                } or {
+                    stack_idx = stack_idx + 1;
+                }
+            }
+            i = i + 1;
+        }
+
+        # Pass 2: Copy large aggregates (scalar registers are safely saved now)
+        gp_idx = int_arg_idx;
+        stack_idx = 0;
+
+        i = 0;
+        for (i < param_count) {
+            if (param_sizes[i] == 0) {
+                i = i + 1;
+                cnt;
+            }
+
+            if (!param_byval[i]) {
+                # scalar — already handled, just advance register index
+                if (gp_idx < 6) {
+                    gp_idx = gp_idx + 1;
+                } or {
+                    stack_idx = stack_idx + 1;
+                }
+            } or {
+                # large aggregate passed by hidden pointer — copy into local slot
+                val src_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+                val src_ptr: ir.IRValue = ir.make_reg(src_reg, ctx.ptr_size);
+
+                if (gp_idx < 6) {
+                    val arg_reg: i32 = sysv64.get_arg_reg(gp_idx);
+                    emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, src_ptr,
+                               ir.make_reg(arg_reg, ctx.ptr_size), ir.make_none(), 0);
+                    gp_idx = gp_idx + 1;
+                } or {
+                    val stack_off: i32 = 16 + (stack_idx * ctx.ptr_size::i32);
+                    val src_mem: ir.IRValue = frame_mem(ctx, stack_off, ctx.ptr_size);
+                    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                                  src_ptr, src_mem, ir.make_none(), ir.CC_NONE);
+                    stack_idx = stack_idx + 1;
+                }
+
+                val dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+                val dst_ptr: ir.IRValue = ir.make_reg(dst_reg, ctx.ptr_size);
+                val dst_mem: ir.IRValue = frame_mem(ctx, param_offsets[i], ctx.ptr_size);
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                              dst_ptr, dst_mem, ir.make_none(), ir.CC_NONE);
+
+                val total: i32 = param_sizes[i]::i32;
+                var off: i32 = 0;
+                for (off < total) {
+                    var chunk: usize = 8;
+                    if ((total - off)::usize < 8) {
+                        chunk = (total - off)::usize;
+                    }
+                    val cp_tmp_reg: i32 = new_vreg(ctx, chunk);
+                    val cp_tmp: ir.IRValue = ir.make_reg(cp_tmp_reg, chunk);
+
+                    var s_mem: ir.IRValue;
+                    s_mem.kind = ir.VAL_MEM;
+                    s_mem.base_reg = src_reg;
+                    s_mem.offset = off::i64;
+                    s_mem.size = chunk;
+                    s_mem.reg = 0;
+                    s_mem.imm = 0;
+                    s_mem.index_reg = -1;
+                    s_mem.scale = 1;
+                    s_mem.label = nil;
+
+                    var d_mem: ir.IRValue;
+                    d_mem.kind = ir.VAL_MEM;
+                    d_mem.base_reg = dst_reg;
+                    d_mem.offset = off::i64;
+                    d_mem.size = chunk;
+                    d_mem.reg = 0;
+                    d_mem.imm = 0;
+                    d_mem.index_reg = -1;
+                    d_mem.scale = 1;
+                    d_mem.label = nil;
+
+                    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                                  cp_tmp, s_mem, ir.make_none(), ir.CC_NONE);
+                    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                                  d_mem, cp_tmp, ir.make_none(), ir.CC_NONE);
+
+                    off = off + chunk::i32;
+                }
+            }
+            i = i + 1;
+        }
+
+        # update int_arg_idx for variadic handling
+        int_arg_idx = gp_idx;
         func.param_count = params.count;
 
         # for variadic functions, record named param counts and save all registers
@@ -3473,8 +5619,29 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
     val sec: *section.Section = sec_res.unwrap_ok();
     val offset: usize = sec.size;
 
-    # create symbol
-    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, name);
+    # look up sema symbol for mangled linkage name
+    var global_name: str = name;
+    if (ctx.symbols != nil) {
+        val gv_sym_opt: Option[*symbol.Symbol] = ctx.symbols.lookup(name);
+        if (gv_sym_opt.is_some()) {
+            val gv_link: str = symbol.linkage_name(gv_sym_opt.unwrap(), ctx.alloc);
+            if (gv_link != nil) {
+                global_name = gv_link;
+            }
+        }
+        if (global_name == name) {
+            val gv_imp: *symbol.Symbol = lookup_symbol_in_imports(ctx, name);
+            if (gv_imp != nil) {
+                val gv_imp_link: str = symbol.linkage_name(gv_imp, ctx.alloc);
+                if (gv_imp_link != nil) {
+                    global_name = gv_imp_link;
+                }
+            }
+        }
+    }
+
+    # create symbol with mangled name
+    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, global_name);
     if (sym_res.is_ok()) {
         val s: *sym.Symbol = sym_res.unwrap_ok();
         sym.set_binding(s, sym.bind_global());
@@ -3483,21 +5650,66 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
         masm.add_symbol(ctx.m, s);
     }
 
+    # determine declared type size
+    var var_size: usize = 8;
+    if (node.ty != nil) {
+        var_size = node.ty.size;
+    }
+    if (var_size == 0) {
+        var_size = 8;
+    }
+
     # emit initializer data
+    var emitted: bool = false;
     if (init_node != nil) {
         if (init_node.kind == ast.NODE_EXPR_LIT_INT) {
             val int_val: i64 = init_node.get_int_value();
-            section.emit_u64(ctx.alloc, sec, int_val::u64);
+            emit_global_int(ctx, sec, int_val, var_size);
+            emitted = true;
+        }
+        if (!emitted && init_node.kind == ast.NODE_EXPR_UNARY) {
+            # handle unary negate: -100, -4, etc.
+            var unary_child: *ast.Node = init_node.children::*ast.Node;
+            if (unary_child != nil && unary_child.kind == ast.NODE_EXPR_LIT_INT && init_node.tok.tag == token.TAG_MINUS) {
+                val pos_val: i64 = unary_child.get_int_value();
+                emit_global_int(ctx, sec, -pos_val, var_size);
+                emitted = true;
+            }
         } or (init_node.kind == ast.NODE_EXPR_LIT_STR) {
             val str_val: str = init_node.get_name();
             if (str_val != nil) {
-                var i: usize = 0;
-                for (i < str_val.len()) {
-                    section.emit_byte(ctx.alloc, sec, str_val[i]);
-                    i = i + 1;
+                val gslen: usize = str_val.len();
+                var gstart: usize = 0;
+                var gend: usize = gslen;
+                # strip surrounding quotes
+                if (gslen >= 2 && str_val[0] == 34) {
+                    gstart = 1;
+                    if (str_val[gslen - 1] == 34) {
+                        gend = gslen - 1;
+                    }
+                }
+                var gi: usize = gstart;
+                for (gi < gend) {
+                    val gc: u8 = str_val[gi];
+                    if (gc == 92 && gi + 1 < gend) {
+                        val ge: u8 = str_val[gi + 1];
+                        if (ge == 110) { section.emit_byte(ctx.alloc, sec, 10); }
+                        or (ge == 116) { section.emit_byte(ctx.alloc, sec, 9); }
+                        or (ge == 114) { section.emit_byte(ctx.alloc, sec, 13); }
+                        or (ge == 48) { section.emit_byte(ctx.alloc, sec, 0); }
+                        or (ge == 92) { section.emit_byte(ctx.alloc, sec, 92); }
+                        or (ge == 34) { section.emit_byte(ctx.alloc, sec, 34); }
+                        or (ge == 39) { section.emit_byte(ctx.alloc, sec, 39); }
+                        or { section.emit_byte(ctx.alloc, sec, ge); }
+                        gi = gi + 2;
+                    } or {
+                        section.emit_byte(ctx.alloc, sec, gc);
+                        gi = gi + 1;
+                    }
                 }
                 # null terminator
                 section.emit_byte(ctx.alloc, sec, 0);
+                emitted = true;
             }
         } or (init_node.kind == ast.NODE_EXPR_LIT_BOOL) {
             val bool_val: bool = init_node.get_bool_value();
@@ -3506,20 +5718,49 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
             } or {
                 section.emit_byte(ctx.alloc, sec, 0);
             }
+            emitted = true;
         } or (init_node.kind == ast.NODE_EXPR_LIT_CHAR) {
             # char literal stored as int
             val char_val: i64 = init_node.get_int_value();
             section.emit_byte(ctx.alloc, sec, char_val::u8);
+            emitted = true;
         } or (init_node.kind == ast.NODE_EXPR_LIT_NIL) {
             # nil is a null pointer (8 bytes of zeros)
             section.emit_u64(ctx.alloc, sec, 0);
+            emitted = true;
         } or (init_node.kind == ast.NODE_EXPR_LIT_FLOAT) {
             # float literal - reinterpret f64 bits as u64
             var float_val: f64 = init_node.get_float_value();
             val float_ptr: *f64 = ?float_val;
             val bits_ptr: *u64 = float_ptr::*u64;
             section.emit_u64(ctx.alloc, sec, @bits_ptr);
+            emitted = true;
+        } or (init_node.kind == ast.NODE_EXPR_BINARY) {
+            # handle binary expressions (e.g., constant OR/AND for flag combinations)
+            # for now, emit zeros and let runtime handle it
         }
+    }
+
+    # fallback: emit zeros if nothing was emitted (unrecognized initializer or no init)
+    if (!emitted) {
+        var zi: usize = 0;
+        for (zi < var_size) {
+            section.emit_byte(ctx.alloc, sec, 0);
+            zi = zi + 1;
+        }
+    }
+}
+
+# emit_global_int: emit an integer value to a section with the correct size.
+fun emit_global_int(ctx: *LowerContext, sec: *section.Section, v: i64, size: usize) {
+    if (size <= 1) {
+        section.emit_byte(ctx.alloc, sec, v::u8);
+    } or (size <= 2) {
+        section.emit_u16(ctx.alloc, sec, v::u16);
+    } or (size <= 4) {
+        section.emit_u32(ctx.alloc, sec, v::u32);
+    } or {
+        section.emit_u64(ctx.alloc, sec, v::u64);
     }
 }
 
@@ -3634,37 +5875,44 @@ fun lower_comptime_if_functions(ctx: *LowerContext, node: *ast.Node) i32 {
 
     # taken might be a block with multiple declarations
     if (taken.kind == ast.NODE_STMT_BLOCK) {
-        val decls: *ast.List = taken.extra::*ast.List;
+        val decls: *ast.List = taken.data::*ast.List;
         if (decls != nil) {
             var i: i32 = 0;
             for (i < decls.count) {
                 val decl: *ast.Node = decls.nodes[i];
                 if (decl != nil) {
-                    if (decl.kind == ast.NODE_DECL_FUN) {
-                        val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, decl);
+                    var fn_node: *ast.Node = decl;
+                    # unwrap pub wrapper
+                    if (fn_node.kind == ast.NODE_DECL_PUB && fn_node.children != nil) {
+                        fn_node = fn_node.children;
+                    }
+                    if (fn_node.kind == ast.NODE_DECL_FUN) {
+                        val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, fn_node);
                         if (fn_res.is_ok()) {
-                            # note: lower_function already adds non-entry functions to ir_funcs
                             count = count + 1;
                         }
                     }
-                    if (decl.kind == ast.NODE_COMPTIME_IF) {
-                        count = count + lower_comptime_if_functions(ctx, decl);
+                    if (fn_node.kind == ast.NODE_COMPTIME_IF || fn_node.kind == ast.NODE_COMPTIME_OR) {
+                        count = count + lower_comptime_if_functions(ctx, fn_node);
                     }
                 }
                 i = i + 1;
             }
         }
     } or {
-        # single declaration
-        if (taken.kind == ast.NODE_DECL_FUN) {
-            val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, taken);
+        # single declaration - unwrap pub wrapper
+        var single: *ast.Node = taken;
+        if (single.kind == ast.NODE_DECL_PUB && single.children != nil) {
+            single = single.children;
+        }
+        if (single.kind == ast.NODE_DECL_FUN) {
+            val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, single);
             if (fn_res.is_ok()) {
-                # note: lower_function already adds non-entry functions to ir_funcs
                 count = count + 1;
             }
         }
-        if (taken.kind == ast.NODE_COMPTIME_IF) {
-            count = count + lower_comptime_if_functions(ctx, taken);
+        if (single.kind == ast.NODE_COMPTIME_IF || single.kind == ast.NODE_COMPTIME_OR) {
+            count = count + lower_comptime_if_functions(ctx, single);
         }
     }
 
@@ -3773,16 +6021,18 @@ pub fun lower_entry_point(ctx: *LowerContext, main_name: str) Result[bool, str] 
 
 # lower_all_modules: lower main module and all imported modules to MASM.
 # ---
-# root:        root AST node of main module
-# symbols:     symbol table
-# types:       type context
-# alloc:       allocator
-# tgt:         target configuration
-# loaded_mods: array of loaded sema modules
-# mod_count:   number of loaded modules
-# ret:         Ok(*Masm) on success, Err(str) on failure
+# root:         root AST node of main module
+# symbols:      symbol table
+# types:        type context
+# alloc:        allocator
+# tgt:          target configuration
+# loaded_mods:  array of loaded sema modules
+# mod_count:    number of loaded modules
+# method_insts: linked list of generic method instantiations from sema
+# ret:          Ok(*Masm) on success, Err(str) on failure
 pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.TypeContext,
-    alloc: *allocator.Allocator, tgt: target.Target, loaded_mods: **sema.SemaModule, mod_count: i32) Result[*masm.Masm, str] {
+    alloc: *allocator.Allocator, tgt: target.Target, loaded_mods: **sema.SemaModule, mod_count: i32,
+    method_insts: *sema.MethodInstantiation, func_insts: *sema.FunctionInstantiation) Result[*masm.Masm, str] {
     
     if (root == nil || alloc == nil) {
         ret err[*masm.Masm, str]("invalid arguments");
@@ -3804,24 +6054,39 @@ pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.Ty
     
     # create lower context
     var ctx: LowerContext = init(alloc, symbols, types, tgt, m_ptr, nil);
-    
+
+    # store imported modules for cross-module symbol lookup
+    ctx.loaded_mods = loaded_mods;
+    ctx.loaded_mod_count = mod_count;
+
     # pre-create sections in the correct order for ELF output
     # .text must come first so it gets section index 1
     val text_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".text", section.section_text());
     val rodata_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".rodata", section.section_rodata());
     val data_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".data", section.section_data());
+
+    # set section alignments (matching C bootstrap: 16 for all data sections)
+    if (text_res.is_ok()) { section.set_align(text_res.unwrap_ok(), 16); }
+    if (rodata_res.is_ok()) { section.set_align(rodata_res.unwrap_ok(), 16); }
+    if (data_res.is_ok()) { section.set_align(data_res.unwrap_ok(), 16); }
     
-    # lower main module
+    # lower main module (current_sema_mod is nil for main - fallback heuristic works)
+    ctx.current_sema_mod = nil;
     val main_count: i32 = lower_module(?ctx, root);
     if (main_count < 0) {
         ret err[*masm.Masm, str]("failed to lower main module");
     }
-    
+
     # lower imported modules
     var i: i32 = 0;
     for (i < mod_count) {
         val smod: *sema.SemaModule = loaded_mods[i];
         if (smod != nil && smod.ast != nil) {
+            # switch to imported module's symbol table and sema module for correct resolution
+            if (smod.table != nil) {
+                ctx.symbols = smod.table;
+            }
+            ctx.current_sema_mod = smod;
             val mod_count2: i32 = lower_module(?ctx, smod.ast);
             if (mod_count2 < 0) {
                 ret err[*masm.Masm, str]("failed to lower imported module");
@@ -3829,7 +6094,98 @@ pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.Ty
         }
         i = i + 1;
     }
-    
+    # restore main module's symbol table
+    ctx.symbols = symbols;
+
+    # --- Phase: lower generic method instantiations ---
+    # each MethodInstantiation carries the original AST, mangled name,
+    # concrete type bindings (T -> *Section, E -> str, etc.), and
+    # the module where the generic method was defined.
+    var inst: *sema.MethodInstantiation = method_insts;
+    for (inst != nil) {
+        if (inst.func_ast != nil && inst.mangled_name != nil && inst.param_count > 0) {
+            # set up type bindings for this instantiation
+            ctx.type_binding_names = inst.param_names;
+            ctx.type_binding_types = inst.param_types;
+            ctx.type_binding_count = inst.param_count;
+
+            # set override names/types so lower_function uses the mangled name
+            ctx.func_name_override = inst.mangled_name;
+            ctx.recv_type_override = inst.receiver_type;
+            if (inst.func_type != nil && inst.func_type.kind == ty.TY_FUN) {
+                ctx.ret_type_override = inst.func_type.ret_type;
+            } or {
+                ctx.ret_type_override = nil;
+            }
+
+            # switch to origin module's symbol table for correct resolution
+            if (inst.origin_module != nil && inst.origin_module.table != nil) {
+                ctx.symbols = inst.origin_module.table;
+                ctx.current_sema_mod = inst.origin_module;
+            } or {
+                ctx.symbols = symbols;
+                ctx.current_sema_mod = nil;
+            }
+
+            # lower the function with bindings (reuses the generic AST)
+            val inst_fn_res: Result[*ir.IRFunction, str] = lower_function(?ctx, inst.func_ast);
+            if (inst_fn_res.is_ok()) {
+                val inst_fn: *ir.IRFunction = inst_fn_res.unwrap_ok();
+                add_ir_function(?ctx, inst_fn);
+            }
+        }
+        inst = inst.next;
+    }
+
+    # --- Phase: lower generic function instantiations ---
+    # each FunctionInstantiation carries the original AST, mangled name,
+    # and concrete type bindings (T -> *Section, E -> str, etc.)
+    var finst: *sema.FunctionInstantiation = func_insts;
+    for (finst != nil) {
+        if (finst.func_ast != nil && finst.mangled_name != nil && finst.param_count > 0) {
+            # set up type bindings for this instantiation
+            ctx.type_binding_names = finst.param_names;
+            ctx.type_binding_types = finst.param_types;
+            ctx.type_binding_count = finst.param_count;
+
+            # set override name (no receiver for free functions)
+            ctx.func_name_override = finst.mangled_name;
+            ctx.recv_type_override = nil;
+            if (finst.func_type != nil && finst.func_type.kind == ty.TY_FUN) {
+                ctx.ret_type_override = finst.func_type.ret_type;
+            } or {
+                ctx.ret_type_override = nil;
+            }
+
+            # switch to origin module's symbol table for correct resolution
+            if (finst.origin_module != nil && finst.origin_module.table != nil) {
+                ctx.symbols = finst.origin_module.table;
+                ctx.current_sema_mod = finst.origin_module;
+            } or {
+                ctx.symbols = symbols;
+                ctx.current_sema_mod = nil;
+            }
+
+            # lower the function with bindings (reuses the generic AST)
+            val finst_fn_res: Result[*ir.IRFunction, str] = lower_function(?ctx, finst.func_ast);
+            if (finst_fn_res.is_ok()) {
+                val finst_fn: *ir.IRFunction = finst_fn_res.unwrap_ok();
+                add_ir_function(?ctx, finst_fn);
+            }
+        }
+        finst = finst.next;
+    }
+
+    # clear type bindings and overrides
+    ctx.type_binding_names = nil;
+    ctx.type_binding_types = nil;
+    ctx.type_binding_count = 0;
+    ctx.func_name_override = nil;
+    ctx.recv_type_override = nil;
+    ctx.ret_type_override = nil;
+    ctx.symbols = symbols;
+    ctx.current_sema_mod = nil;
+
     # run instruction selection to generate machine code for all IR functions
     if (ctx.ir_func_count > 0) {
         val isel_res: Result[bool, str] = isel.run_isel(m_ptr, ctx.ir_funcs, ctx.ir_func_count, alloc);

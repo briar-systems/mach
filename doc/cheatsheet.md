@@ -199,6 +199,7 @@ for {
 
 The runtime included in the Mach standard library looks for a function returning `i64` with a C-like signature: `argc` and `argv`.
 This is not enforced by the compiler itself, but by convention outlined in `std.runtime`.
+Executable builds require a defined `_start` symbol, which is typically provided by `std.runtime` or by user code.
 
 Because of this, a minimal Mach program must use the standard library as a dependency.
 With that in place, a simple "Hello, World!" program looks like this:
