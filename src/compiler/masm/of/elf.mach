@@ -1879,24 +1879,427 @@ pub fun emit_object_to_writer(m: *masm.Masm, writer: *spec.Writer, alloc: *alloc
         ret err[bool, str]("nil argument to emit_object_to_writer");
     }
 
-    # delegate to the existing emit_object but capture into writer
-    # for now, emit_object writes to a file, so we use a temporary approach:
-    # build the ELF .o content into an internal ElfContext, then copy the bytes out
+    # build ELF .o content into an internal ElfContext, then copy bytes to caller's writer
     var ctx: ElfContext = init(alloc);
 
-    # count sections for header
-    var sec_count: i32 = 0;
-    var si: i32 = 0;
-    for (si < m.section_count) {
-        if (m.sections[si] != nil && m.sections[si].size > 0) {
-            sec_count = sec_count + 1;
-        }
-        si = si + 1;
+    # build section header string table (.shstrtab)
+    add_shstrtab_string(?ctx, "");
+
+    val shstrtab_idx: u32 = add_shstrtab_string(?ctx, ".shstrtab")::u32;
+    val strtab_name_idx: u32 = add_shstrtab_string(?ctx, ".strtab")::u32;
+    val symtab_name_idx: u32 = add_shstrtab_string(?ctx, ".symtab")::u32;
+
+    # track section info for headers
+    # section 0 is always null
+    var section_name_offsets: [24]u32;
+    var section_offsets: [24]u64;
+    var section_sizes: [24]u64;
+    var section_types: [24]u32;
+    var section_flags: [24]u64;
+    var section_aligns: [24]u64;
+    var section_links: [24]u32;
+    var section_infos: [24]u32;
+    var section_entsizes: [24]u64;
+    var section_count: i32 = 1;  # start with null section
+
+    # track which MASM section each ELF section corresponds to
+    var masm_section_map: [24]i32;
+    var k: i32 = 0;
+    for (k < 24) {
+        masm_section_map[k] = -1;
+        section_links[k] = 0;
+        section_infos[k] = 0;
+        section_entsizes[k] = 0;
+        k = k + 1;
     }
 
-    # for a relocatable .o, we just reuse the existing emit_object logic
-    # by writing to a temp file then reading back... but that's wasteful.
-    # Instead, just mark this as a stub that needs the real emit_object refactored.
-    # For now, return ok - archive builder will call emit_object per file instead.
+    # add section names from MASM context
+    var i: i32 = 0;
+    var data_section_start: i32 = section_count;
+    for (i < m.section_count && section_count < 16) {
+        val sec: *section.Section = m.sections[i];
+        if (sec != nil && sec.name != nil && sec.size > 0) {
+            section_name_offsets[section_count] = add_shstrtab_string(?ctx, sec.name)::u32;
+            section_sizes[section_count] = sec.size;
+            section_aligns[section_count] = sec.align;
+            masm_section_map[section_count] = i;
+
+            # determine type and flags
+            val kind_tag: u8 = section.get_kind_tag(sec.kind);
+            if (kind_tag == section.SEC_TEXT) {
+                section_types[section_count] = SHT_PROGBITS;
+                section_flags[section_count] = SHF_ALLOC | SHF_EXECINSTR;
+            } or (kind_tag == section.SEC_DATA) {
+                section_types[section_count] = SHT_PROGBITS;
+                section_flags[section_count] = SHF_ALLOC | SHF_WRITE;
+            } or (kind_tag == section.SEC_RODATA) {
+                section_types[section_count] = SHT_PROGBITS;
+                section_flags[section_count] = SHF_ALLOC;
+            } or (kind_tag == section.SEC_BSS) {
+                section_types[section_count] = SHT_NOBITS;
+                section_flags[section_count] = SHF_ALLOC | SHF_WRITE;
+            } or {
+                section_types[section_count] = SHT_PROGBITS;
+                section_flags[section_count] = SHF_ALLOC;
+            }
+
+            section_count = section_count + 1;
+        }
+        i = i + 1;
+    }
+
+    val data_section_end: i32 = section_count;
+
+    # add relocation sections for sections that have relocations
+    var rela_section_indices: [8]i32;
+    var rela_count: i32 = 0;
+    i = data_section_start;
+    for (i < data_section_end && rela_count < 8) {
+        val masm_idx: i32 = masm_section_map[i];
+        if (masm_idx >= 0 && masm_idx < m.section_count) {
+            val sec: *section.Section = m.sections[masm_idx];
+            if (sec != nil && section.has_relocations(sec)) {
+                # create .rela.<name> section
+                var rela_name_buf: [32]u8;
+                rela_name_buf[0] = 46;   # '.'
+                rela_name_buf[1] = 114;  # 'r'
+                rela_name_buf[2] = 101;  # 'e'
+                rela_name_buf[3] = 108;  # 'l'
+                rela_name_buf[4] = 97;   # 'a'
+
+                # copy original section name (include leading dot)
+                var src_idx: usize = 0;
+                if (sec.name[0] == 46) {
+                    src_idx = 0;
+                }
+                var dst_idx: usize = 5;
+                for (src_idx < sec.name.len() && dst_idx < 31) {
+                    rela_name_buf[dst_idx] = sec.name[src_idx];
+                    src_idx = src_idx + 1;
+                    dst_idx = dst_idx + 1;
+                }
+                rela_name_buf[dst_idx] = 0;
+
+                val rela_name: str = (?rela_name_buf[0])::str;
+                section_name_offsets[section_count] = add_shstrtab_string(?ctx, rela_name)::u32;
+                section_sizes[section_count] = (sec.reloc_count::u64) * ELF64_RELA_SIZE;
+                section_aligns[section_count] = 8;
+                section_types[section_count] = SHT_RELA;
+                section_flags[section_count] = SHF_INFO_LINK;
+                section_infos[section_count] = i::u32;  # section being relocated
+                section_entsizes[section_count] = ELF64_RELA_SIZE;
+
+                rela_section_indices[rela_count] = section_count;
+                rela_count = rela_count + 1;
+                section_count = section_count + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    # reserve indices for symtab, strtab, shstrtab
+    val symtab_idx: i32 = section_count;
+    section_name_offsets[symtab_idx] = symtab_name_idx;
+    section_types[symtab_idx] = SHT_SYMTAB;
+    section_flags[symtab_idx] = 0;
+    section_aligns[symtab_idx] = 8;
+    section_entsizes[symtab_idx] = ELF64_SYM_SIZE;
+    section_count = section_count + 1;
+
+    val strtab_idx: i32 = section_count;
+    section_name_offsets[strtab_idx] = strtab_name_idx;
+    section_types[strtab_idx] = SHT_STRTAB;
+    section_flags[strtab_idx] = 0;
+    section_aligns[strtab_idx] = 1;
+    section_count = section_count + 1;
+
+    val shstrtab_section_idx: i32 = section_count;
+    section_name_offsets[shstrtab_section_idx] = shstrtab_idx;
+    section_types[shstrtab_section_idx] = SHT_STRTAB;
+    section_flags[shstrtab_section_idx] = 0;
+    section_aligns[shstrtab_section_idx] = 1;
+    section_count = section_count + 1;
+
+    # set symtab link for all rela sections
+    var r: i32 = 0;
+    for (r < rela_count) {
+        section_links[rela_section_indices[r]] = symtab_idx::u32;
+        r = r + 1;
+    }
+
+    # build symbol string table (skip SYM_NONE branch labels)
+    add_strtab_string(?ctx, "");  # null entry
+
+    var j: i32 = 0;
+    for (j < m.symbol_count) {
+        val s: *sym.Symbol = m.symbols[j];
+        if (s != nil && s.name != nil && s.sym_type.tag != sym.SYM_NONE) {
+            add_strtab_string(?ctx, s.name);
+        }
+        j = j + 1;
+    }
+
+    # build symbol mapping (locals before globals) - must be done before relocs
+    val local_sym_count: i32 = build_symbol_mapping(?ctx, m);
+
+    # compute file layout
+    var current_offset: u64 = ELF64_EHDR_SIZE;
+
+    # section data offsets (only data sections, not rela/symtab/strtab)
+    i = 1;  # skip null section
+    for (i < data_section_end) {
+        val align: u64 = section_aligns[i];
+        if (align > 1) {
+            val mask: u64 = align - 1;
+            current_offset = (current_offset + mask) & ~mask;
+        }
+        section_offsets[i] = current_offset;
+        current_offset = current_offset + section_sizes[i];
+        i = i + 1;
+    }
+
+    # relocation section offsets
+    r = 0;
+    for (r < rela_count) {
+        val rela_idx: i32 = rela_section_indices[r];
+        val align: u64 = section_aligns[rela_idx];
+        if (align > 1) {
+            val mask: u64 = align - 1;
+            current_offset = (current_offset + mask) & ~mask;
+        }
+        section_offsets[rela_idx] = current_offset;
+        current_offset = current_offset + section_sizes[rela_idx];
+        r = r + 1;
+    }
+
+    # symtab offset and size
+    val symtab_offset: u64 = current_offset;
+    val sym_count: i32 = ctx.symbol_count + 1;  # +1 for null symbol
+    val symtab_size: u64 = (sym_count::u64) * ELF64_SYM_SIZE;
+    section_offsets[symtab_idx] = symtab_offset;
+    section_sizes[symtab_idx] = symtab_size;
+    current_offset = current_offset + symtab_size;
+
+    # strtab offset and size
+    val strtab_offset: u64 = current_offset;
+    section_offsets[strtab_idx] = strtab_offset;
+    section_sizes[strtab_idx] = ctx.strtab_size;
+    current_offset = current_offset + ctx.strtab_size;
+
+    # shstrtab offset and size
+    val shstrtab_offset: u64 = current_offset;
+    section_offsets[shstrtab_section_idx] = shstrtab_offset;
+    section_sizes[shstrtab_section_idx] = ctx.shstrtab_size;
+    current_offset = current_offset + ctx.shstrtab_size;
+
+    # section headers offset
+    val shoff: u64 = current_offset;
+
+    # write ELF header
+    write_elf_header(?ctx, section_count::u16, shstrtab_section_idx::u16);
+
+    # patch shoff in header (offset 40)
+    patch_u64_at(?ctx, 40, shoff);
+
+    # write section data (only data sections)
+    i = 1;
+    for (i < data_section_end) {
+        align_writer_to(?ctx, section_offsets[i]);
+
+        val masm_idx: i32 = masm_section_map[i];
+        if (masm_idx >= 0 && masm_idx < m.section_count) {
+            val sec: *section.Section = m.sections[masm_idx];
+            if (sec != nil && sec.data != nil && sec.size > 0) {
+                write_section_data(?ctx, sec);
+            }
+        }
+        i = i + 1;
+    }
+
+    # write relocation sections
+    r = 0;
+    for (r < rela_count) {
+        val rela_idx: i32 = rela_section_indices[r];
+        align_writer_to(?ctx, section_offsets[rela_idx]);
+
+        val target_sec_idx: i32 = section_infos[rela_idx]::i32;
+        val masm_idx: i32 = masm_section_map[target_sec_idx];
+        if (masm_idx >= 0 && masm_idx < m.section_count) {
+            val sec: *section.Section = m.sections[masm_idx];
+            if (sec != nil && sec.relocs != nil) {
+                var ri: i32 = 0;
+                for (ri < sec.reloc_count) {
+                    val reloc: *section.Relocation = section.get_relocation(sec, ri);
+                    if (reloc != nil) {
+                        val sym_idx: u32 = find_symbol_elf_index(?ctx, m, reloc.symbol_name);
+                        val elf_rtype: u32 = convert_reloc_type(reloc.rtype);
+                        write_relocation(?ctx, reloc.offset, sym_idx, elf_rtype, reloc.addend);
+                    }
+                    ri = ri + 1;
+                }
+            }
+        }
+        r = r + 1;
+    }
+
+    # write symbol table (two passes: locals first, then globals)
+    align_writer_to(?ctx, symtab_offset);
+    write_null_symbol(?ctx);
+
+    var pass: i32 = 0;
+    for (pass < 2) {
+        j = 0;
+        for (j < m.symbol_count) {
+            val s: *sym.Symbol = m.symbols[j];
+            if (s != nil && s.name != nil && s.sym_type.tag != sym.SYM_NONE) {
+                val is_global_sym: bool = sym.is_global(s);
+
+                if ((pass == 0 && !is_global_sym) || (pass == 1 && is_global_sym)) {
+                    val strtab_off: u32 = ctx.sym_strtab_offs[j];
+
+                    var binding: u8 = STB_LOCAL;
+                    if (is_global_sym) {
+                        binding = STB_GLOBAL;
+                    }
+
+                    var stype: u8 = STT_NOTYPE;
+                    if (sym.is_function(s)) {
+                        stype = STT_FUNC;
+                    } or (s.sym_type.tag == sym.SYM_OBJECT) {
+                        stype = STT_OBJECT;
+                    }
+
+                    val info: u8 = make_symbol_info(binding, stype);
+
+                    # find actual section index by matching symbol's section pointer
+                    var shndx: u16 = SHN_UNDEF;
+                    if (sym.is_defined(s) && s.section != nil) {
+                        var si: i32 = 1;
+                        for (si < data_section_end) {
+                            val mi: i32 = masm_section_map[si];
+                            if (mi >= 0 && mi < m.section_count) {
+                                if (m.sections[mi] == s.section) {
+                                    shndx = si::u16;
+                                }
+                            }
+                            si = si + 1;
+                        }
+                        # fallback to 1 if section not found but symbol is defined
+                        if (shndx == SHN_UNDEF) {
+                            shndx = 1;
+                        }
+                    }
+
+                    write_symbol(?ctx, strtab_off, info, 0, shndx, s.offset, s.size);
+                }
+            }
+            j = j + 1;
+        }
+        pass = pass + 1;
+    }
+
+    # write string table
+    align_writer_to(?ctx, strtab_offset);
+    write_strtab(?ctx);
+
+    # write section header string table
+    align_writer_to(?ctx, shstrtab_offset);
+    write_shstrtab(?ctx);
+
+    # write section headers
+    align_writer_to(?ctx, shoff);
+
+    # null section header
+    write_section_header(?ctx, 0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    # data section headers
+    i = 1;
+    for (i < data_section_end) {
+        write_section_header(?ctx,
+            section_name_offsets[i],
+            section_types[i],
+            section_flags[i],
+            0,  # addr
+            section_offsets[i],
+            section_sizes[i],
+            section_links[i],
+            section_infos[i],
+            section_aligns[i],
+            section_entsizes[i]
+        );
+        i = i + 1;
+    }
+
+    # relocation section headers
+    r = 0;
+    for (r < rela_count) {
+        val rela_idx: i32 = rela_section_indices[r];
+        write_section_header(?ctx,
+            section_name_offsets[rela_idx],
+            section_types[rela_idx],
+            section_flags[rela_idx],
+            0,  # addr
+            section_offsets[rela_idx],
+            section_sizes[rela_idx],
+            section_links[rela_idx],
+            section_infos[rela_idx],
+            section_aligns[rela_idx],
+            section_entsizes[rela_idx]
+        );
+        r = r + 1;
+    }
+
+    # symtab section header (link = strtab index, info = first global symbol)
+    write_section_header(?ctx,
+        section_name_offsets[symtab_idx],
+        section_types[symtab_idx],
+        section_flags[symtab_idx],
+        0,
+        section_offsets[symtab_idx],
+        section_sizes[symtab_idx],
+        strtab_idx::u32,
+        local_sym_count::u32,
+        section_aligns[symtab_idx],
+        section_entsizes[symtab_idx]
+    );
+
+    # strtab section header
+    write_section_header(?ctx,
+        section_name_offsets[strtab_idx],
+        section_types[strtab_idx],
+        section_flags[strtab_idx],
+        0,
+        section_offsets[strtab_idx],
+        section_sizes[strtab_idx],
+        0,
+        0,
+        section_aligns[strtab_idx],
+        0
+    );
+
+    # shstrtab section header
+    write_section_header(?ctx,
+        section_name_offsets[shstrtab_section_idx],
+        section_types[shstrtab_section_idx],
+        section_flags[shstrtab_section_idx],
+        0,
+        section_offsets[shstrtab_section_idx],
+        section_sizes[shstrtab_section_idx],
+        0,
+        0,
+        section_aligns[shstrtab_section_idx],
+        0
+    );
+
+    # copy assembled ELF bytes to caller's writer
+    if (ctx.writer.size > 0 && ctx.writer.data != nil) {
+        val write_res: Result[usize, str] = spec.write_bytes(writer, ctx.writer.data::&u8, ctx.writer.size);
+        if (write_res.is_err()) {
+            deinit(?ctx);
+            ret err[bool, str](write_res.unwrap_err());
+        }
+    }
+
+    deinit(?ctx);
     ret ok[bool, str](true);
 }
