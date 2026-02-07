@@ -383,6 +383,11 @@ pub rec LowerContext {
     local_cap:        i32;
     stack_offset:     i32;
 
+    # hash table for fast local variable lookup by name
+    # stores indices into local_vars; -1 means empty slot
+    local_hash:       *i32;
+    local_hash_cap:   i32;
+
     deferred:         **ast.Node;
     deferred_count:   i32;
     deferred_cap:     i32;
@@ -469,6 +474,8 @@ pub fun init(alloc: *allocator.Allocator, symbols: *symbol.Table, types: *ty.Typ
     ctx.local_count   = 0;
     ctx.local_cap     = 0;
     ctx.stack_offset  = 0;
+    ctx.local_hash    = nil;
+    ctx.local_hash_cap = 0;
     ctx.deferred      = nil;
     ctx.deferred_count = 0;
     ctx.deferred_cap  = 0;
@@ -713,6 +720,7 @@ fun reset_function_state(ctx: *LowerContext) {
     # reset local variables
     ctx.local_count = 0;
     ctx.stack_offset = 0;
+    local_hash_clear(ctx);
 
     # reset deferred statements
     ctx.deferred_count = 0;
@@ -771,6 +779,100 @@ fun add_ir_function(ctx: *LowerContext, func: *ir.IRFunction) bool {
     ret true;
 }
 
+# hash_name: FNV-1a hash of a null-terminated string.
+# ---
+# name: string to hash
+# ret:  32-bit hash value
+fun hash_name(name: str) u32 {
+    var h: u32 = 2166136261;
+    var i: usize = 0;
+    for (name[i] != 0) {
+        h = h ^ name[i]::u32;
+        h = h * 16777619;
+        i = i + 1;
+    }
+    ret h;
+}
+
+# local_hash_insert: insert a local variable index into the hash table.
+# ---
+# ctx: lowering context
+# name: variable name
+# idx:  index in local_vars array
+fun local_hash_insert(ctx: *LowerContext, name: str, idx: i32) {
+    if (ctx.local_hash == nil || ctx.local_hash_cap == 0) {
+        ret;
+    }
+
+    val mask: u32 = (ctx.local_hash_cap - 1)::u32;
+    var slot: u32 = hash_name(name) & mask;
+
+    for (true) {
+        val entry: i32 = ctx.local_hash[slot::usize];
+        if (entry < 0) {
+            # empty slot — insert here
+            ctx.local_hash[slot::usize] = idx;
+            ret;
+        }
+        # if existing entry has the same name, overwrite (re-declaration)
+        if (ctx.local_vars[entry::usize].name != nil && ctx.local_vars[entry::usize].name.equals(name)) {
+            ctx.local_hash[slot::usize] = idx;
+            ret;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+# local_hash_grow: grow and rehash the local variable hash table.
+# ---
+# ctx: lowering context
+fun local_hash_grow(ctx: *LowerContext) {
+    var new_cap: i32 = 16;
+    if (ctx.local_hash_cap > 0) {
+        new_cap = ctx.local_hash_cap * 2;
+    }
+
+    val r: Result[*i32, allocator.AllocError] = ctx.alloc.resize[i32](
+        nil, 0, new_cap::usize
+    );
+    if (r.is_err()) {
+        ret;
+    }
+
+    val old_hash: *i32 = ctx.local_hash;
+    val old_cap: i32 = ctx.local_hash_cap;
+
+    ctx.local_hash = r.unwrap_ok();
+    ctx.local_hash_cap = new_cap;
+
+    # fill with -1 (empty)
+    var j: i32 = 0;
+    for (j < new_cap) {
+        ctx.local_hash[j::usize] = -1;
+        j = j + 1;
+    }
+
+    # rehash existing entries
+    var k: i32 = 0;
+    for (k < ctx.local_count) {
+        if (ctx.local_vars[k::usize].name != nil) {
+            local_hash_insert(ctx, ctx.local_vars[k::usize].name, k);
+        }
+        k = k + 1;
+    }
+}
+
+# local_hash_clear: reset the hash table for a new function.
+# ---
+# ctx: lowering context
+fun local_hash_clear(ctx: *LowerContext) {
+    var j: i32 = 0;
+    for (j < ctx.local_hash_cap) {
+        ctx.local_hash[j::usize] = -1;
+        j = j + 1;
+    }
+}
+
 # add_local_var: add a local variable to the context.
 # ---
 # ctx:   lowering context
@@ -809,6 +911,11 @@ fun add_local_var(ctx: *LowerContext, name: str, size: usize, var_ty: *ty.Type) 
     # allocate stack space (stack grows down)
     ctx.stack_offset = ctx.stack_offset - aligned_size::i32;
 
+    # grow hash table if load factor > 50%
+    if (ctx.local_count * 2 >= ctx.local_hash_cap) {
+        local_hash_grow(ctx);
+    }
+
     # add to locals array
     val idx: i32 = ctx.local_count;
     ctx.local_vars[idx].name = name;
@@ -816,6 +923,9 @@ fun add_local_var(ctx: *LowerContext, name: str, size: usize, var_ty: *ty.Type) 
     ctx.local_vars[idx].size = size;
     ctx.local_vars[idx].ty = var_ty;
     ctx.local_count = ctx.local_count + 1;
+
+    # insert into hash table
+    local_hash_insert(ctx, name, idx);
 
     ret ctx.stack_offset;
 }
@@ -830,7 +940,24 @@ fun find_local_var(ctx: *LowerContext, name: str) i32 {
         ret -1;
     }
 
-    # search from end to find most recent declaration (handles re-declarations)
+    # use hash table for O(1) average lookup
+    if (ctx.local_hash != nil && ctx.local_hash_cap > 0) {
+        val mask: u32 = (ctx.local_hash_cap - 1)::u32;
+        var slot: u32 = hash_name(name) & mask;
+
+        for (true) {
+            val entry: i32 = ctx.local_hash[slot::usize];
+            if (entry < 0) {
+                ret -1;
+            }
+            if (ctx.local_vars[entry::usize].name != nil && ctx.local_vars[entry::usize].name.equals(name)) {
+                ret entry;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    # fallback: linear scan (should not reach here after first add)
     var i: i32 = ctx.local_count - 1;
     for (i >= 0) {
         if (ctx.local_vars[i].name != nil && ctx.local_vars[i].name.equals(name)) {

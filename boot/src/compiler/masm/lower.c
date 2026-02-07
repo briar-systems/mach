@@ -36,6 +36,11 @@ typedef struct LowerContext
     int32_t   stack_offset;
     AstList  *local_vars; // List of LocalVar
 
+    // hash table for fast local variable lookup by name
+    // stores indices into vars; -1 means empty slot
+    int      *var_hash;
+    int       var_hash_cap;
+
     // deferred statements (fin)
     AstNode **deferred;
     int       deferred_count;
@@ -178,6 +183,8 @@ static LowerContext *create_context(MasmTarget target, ModuleCounters *counters)
     ctx->var_count    = 0;
     ctx->var_capacity = 16;
     ctx->stack_offset = 0;
+    ctx->var_hash     = NULL;
+    ctx->var_hash_cap = 0;
     ctx->local_vars   = malloc(sizeof(AstList));
     ast_list_init(ctx->local_vars);
 
@@ -215,6 +222,7 @@ static void destroy_context(LowerContext *ctx)
     if (ctx)
     {
         free(ctx->vars);
+        free(ctx->var_hash);
         free(ctx->deferred);
         free(ctx->loop_defer_stack);
         free(ctx->local_vars);
@@ -467,6 +475,66 @@ static void pop_loop_defer_mark(LowerContext *ctx)
     }
 }
 
+// hash_name: FNV-1a hash of a null-terminated string.
+static uint32_t hash_name(const char *name)
+{
+    uint32_t h = 2166136261u;
+    for (const char *p = name; *p; p++)
+    {
+        h ^= (uint8_t)*p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+// var_hash_insert: insert a local variable index into the hash table.
+static void var_hash_insert(LowerContext *ctx, const char *name, int idx)
+{
+    if (!ctx->var_hash || ctx->var_hash_cap == 0)
+        return;
+
+    uint32_t mask = (uint32_t)(ctx->var_hash_cap - 1);
+    uint32_t slot = hash_name(name) & mask;
+
+    for (;;)
+    {
+        int entry = ctx->var_hash[slot];
+        if (entry < 0)
+        {
+            ctx->var_hash[slot] = idx;
+            return;
+        }
+        // if existing entry has the same name, overwrite (re-declaration)
+        if (strcmp(ctx->vars[entry].name, name) == 0)
+        {
+            ctx->var_hash[slot] = idx;
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+// var_hash_grow: grow and rehash the local variable hash table.
+static void var_hash_grow(LowerContext *ctx)
+{
+    int new_cap = ctx->var_hash_cap > 0 ? ctx->var_hash_cap * 2 : 16;
+    int *new_hash = malloc(sizeof(int) * new_cap);
+
+    for (int j = 0; j < new_cap; j++)
+        new_hash[j] = -1;
+
+    free(ctx->var_hash);
+    ctx->var_hash     = new_hash;
+    ctx->var_hash_cap = new_cap;
+
+    // rehash existing entries
+    for (int k = 0; k < ctx->var_count; k++)
+    {
+        if (ctx->vars[k].name)
+            var_hash_insert(ctx, ctx->vars[k].name, k);
+    }
+}
+
 static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, int size, Type *type)
 {
     if (ctx->var_count >= ctx->var_capacity)
@@ -474,18 +542,44 @@ static void add_local_var(LowerContext *ctx, const char *name, int32_t offset, i
         ctx->var_capacity *= 2;
         ctx->vars = realloc(ctx->vars, sizeof(LocalVar) * ctx->var_capacity);
     }
-    ctx->vars[ctx->var_count].name   = name;
-    ctx->vars[ctx->var_count].offset = offset;
-    ctx->vars[ctx->var_count].size   = size;
-    ctx->vars[ctx->var_count].type   = type;
+
+    // grow hash table if load factor > 50%
+    if (ctx->var_count * 2 >= ctx->var_hash_cap)
+        var_hash_grow(ctx);
+
+    int idx = ctx->var_count;
+    ctx->vars[idx].name   = name;
+    ctx->vars[idx].offset = offset;
+    ctx->vars[idx].size   = size;
+    ctx->vars[idx].type   = type;
     ctx->var_count++;
+
+    // insert into hash table
+    var_hash_insert(ctx, name, idx);
 }
 
 static MasmOperand lower_expr(Masm *masm, MasmSection *text, AstNode *expr, LowerContext *ctx);
 
 static LocalVar *find_local_var(LowerContext *ctx, const char *name)
 {
-    // search from end to find most recent declaration (handles loop re-declarations)
+    // use hash table for O(1) average lookup
+    if (ctx->var_hash && ctx->var_hash_cap > 0)
+    {
+        uint32_t mask = (uint32_t)(ctx->var_hash_cap - 1);
+        uint32_t slot = hash_name(name) & mask;
+
+        for (;;)
+        {
+            int entry = ctx->var_hash[slot];
+            if (entry < 0)
+                return NULL;
+            if (strcmp(ctx->vars[entry].name, name) == 0)
+                return &ctx->vars[entry];
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    // fallback: linear scan
     for (int i = ctx->var_count - 1; i >= 0; i--)
     {
         if (strcmp(ctx->vars[i].name, name) == 0)
