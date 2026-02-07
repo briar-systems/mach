@@ -26,9 +26,11 @@ use comptime: mach.compiler.comptime;
 
 use archive:  mach.compiler.masm.archive;
 use emit:     mach.compiler.masm.emit;
+use isel:     mach.compiler.masm.isa.dispatch;
 use link:     mach.compiler.masm.link;
 use lower:    mach.compiler.masm.lower;
 use masm:     mach.compiler.masm.masm;
+use section:  mach.compiler.masm.section;
 use target:   mach.compiler.masm.target;
 
 # mach.commands.build: build command implementation.
@@ -564,45 +566,134 @@ fun compile_source(source: str, file_path: str, module_path: str, output_path: s
         ret 1;
     }
 
-    # emit per-module .o files (if obj_dir is set)
+    # create output masm for incremental merge
+    val out_res: Result[masm.Masm, str] = masm.create(alloc, tgt);
+    if (out_res.is_err()) {
+        print.eprintln("error: failed to create output masm");
+        symbols.deinit();
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+    val out_heap_res: Result[*masm.Masm, allocator.AllocError] = alloc.alloc[masm.Masm](1);
+    if (out_heap_res.is_err()) {
+        print.eprintln("error: out of memory");
+        symbols.deinit();
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+    val output: *masm.Masm = out_heap_res.unwrap_ok();
+    @output = out_res.unwrap_ok();
+
+    # pre-create standard sections with 16-byte alignment
+    masm.get_or_create_section(output, ".text", section.section_text());
+    masm.get_or_create_section(output, ".rodata", section.section_rodata());
+    masm.get_or_create_section(output, ".data", section.section_data());
+    masm.get_or_create_section(output, ".bss", section.section_bss());
+    val text_sec: *section.Section = masm.get_section(output, ".text");
+    val rodata_sec: *section.Section = masm.get_section(output, ".rodata");
+    val data_sec: *section.Section = masm.get_section(output, ".data");
+    val bss_sec: *section.Section = masm.get_section(output, ".bss");
+    if (text_sec != nil) { section.set_align(text_sec, 16); }
+    if (rodata_sec != nil) { section.set_align(rodata_sec, 16); }
+    if (data_sec != nil) { section.set_align(data_sec, 16); }
+    if (bss_sec != nil) { section.set_align(bss_sec, 16); }
+
     if (obj_dir != nil) {
         ensure_dir(obj_dir, alloc);
-        var oi: i32 = 0;
-        for (oi < module_count) {
-            val obj_path: str = make_obj_path(obj_dir, module_masms[oi].mod_name, alloc);
-            if (obj_path != nil) {
-                emit.emit_object(module_masms[oi].m, obj_path, alloc);
-            }
-            oi = oi + 1;
-        }
     }
 
-    # link in-memory
-    var link_inputs: [256]link.LinkInput;
-    var li: i32 = 0;
-    for (li < module_count) {
-        link_inputs[li].m = module_masms[li].m;
-        link_inputs[li].mod_name = module_masms[li].mod_name;
-        li = li + 1;
+    # per-module: ISel → emit .o → merge → free arena
+    var mi: i32 = 0;
+    for (mi < module_count) {
+        if (module_masms[mi].ir_func_count > 0) {
+            # create per-module arena for ISel temporaries
+            var isel_backing: allocator.Allocator = allocator.default();
+            val isel_ar_res: Result[arena.Arena, allocator.AllocError] = arena.init(isel_backing, 4194304);
+            if (isel_ar_res.is_err()) {
+                print.eprintln("error: failed to create isel arena");
+                masm.destroy(output);
+                symbols.deinit();
+                sema.deinit(?sem);
+                p.deinit();
+                ret 1;
+            }
+            var isel_ar: arena.Arena = isel_ar_res.unwrap_ok();
+            var isel_alloc: allocator.Allocator = isel_ar.allocator();
+
+            val isel_res: Result[bool, str] = isel.run_isel(
+                module_masms[mi].m, module_masms[mi].ir_funcs,
+                module_masms[mi].ir_func_count, ?isel_alloc
+            );
+            if (isel_res.is_err()) {
+                print.eprint("error: isel failed: ");
+                print.eprintln(isel_res.unwrap_err());
+                isel_ar.deinit();
+                masm.destroy(output);
+                symbols.deinit();
+                sema.deinit(?sem);
+                p.deinit();
+                ret 1;
+            }
+
+            # emit .o before freeing arena (section data must still be live)
+            if (obj_dir != nil) {
+                val obj_path: str = make_obj_path(obj_dir, module_masms[mi].mod_name, alloc);
+                if (obj_path != nil) {
+                    emit.emit_object(module_masms[mi].m, obj_path, ?isel_alloc);
+                }
+            }
+
+            # merge into output (copies section data by value)
+            val merge_res: Result[bool, str] = masm.merge(output, module_masms[mi].m);
+            if (merge_res.is_err()) {
+                print.eprint("error: merge failed: ");
+                print.eprintln(merge_res.unwrap_err());
+                isel_ar.deinit();
+                masm.destroy(output);
+                symbols.deinit();
+                sema.deinit(?sem);
+                p.deinit();
+                ret 1;
+            }
+
+            # free per-module arena — section buffers reclaimed
+            isel_ar.deinit();
+        } or {
+            # no IR functions — still merge (may have data sections)
+            val merge_res: Result[bool, str] = masm.merge(output, module_masms[mi].m);
+            if (merge_res.is_err()) {
+                print.eprint("error: merge failed: ");
+                print.eprintln(merge_res.unwrap_err());
+                masm.destroy(output);
+                symbols.deinit();
+                sema.deinit(?sem);
+                p.deinit();
+                ret 1;
+            }
+        }
+        mi = mi + 1;
     }
-    val linked_res: Result[*masm.Masm, str] = link.link(?link_inputs[0], module_count, alloc, tgt);
-    if (linked_res.is_err()) {
+
+    # check for unresolved symbols
+    val check_res: Result[bool, str] = link.check_unresolved(output);
+    if (check_res.is_err()) {
         print.eprint("error: linking failed: ");
-        print.eprintln(linked_res.unwrap_err());
+        print.eprintln(check_res.unwrap_err());
+        masm.destroy(output);
         symbols.deinit();
         sema.deinit(?sem);
         p.deinit();
         ret 1;
     }
 
-    val linked: *masm.Masm = linked_res.unwrap_ok();
-
     # emit executable
-    val emit_res: Result[bool, str] = emit.emit_executable(linked, output_path, alloc);
+    val emit_res: Result[bool, str] = emit.emit_executable(output, output_path, alloc);
     if (emit_res.is_err()) {
         print.eprint("error: code emission failed: ");
         print.eprintln(emit_res.unwrap_err());
-        masm.destroy(linked);
+        masm.destroy(output);
         symbols.deinit();
         sema.deinit(?sem);
         p.deinit();
@@ -610,7 +701,7 @@ fun compile_source(source: str, file_path: str, module_path: str, output_path: s
     }
 
     # clean up
-    masm.destroy(linked);
+    masm.destroy(output);
     symbols.deinit();
     sema.deinit(?sem);
     p.deinit();
@@ -775,41 +866,86 @@ fun compile_library(source: str, file_path: str, module_path: str, output_path: 
         ret 1;
     }
 
-    # emit per-module .o files and build ArMember array
-    if (obj_dir != nil) {
-        ensure_dir(obj_dir, alloc);
-    }
+    # per-module ISel → emit .o → build archive members
+    var lib_obj_dir: str = obj_dir;
+    if (lib_obj_dir == nil) { lib_obj_dir = "."; }
+    ensure_dir(lib_obj_dir, alloc);
 
     var ar_members: [256]archive.ArMember;
     var oi: i32 = 0;
-    var lib_obj_dir: str = obj_dir;
-    if (lib_obj_dir == nil) { lib_obj_dir = "."; }
     for (oi < module_count) {
-        val obj_path: str = make_obj_path(
-            lib_obj_dir,
-            module_masms[oi].mod_name, alloc
-        );
+        # run ISel with per-module arena
+        if (module_masms[oi].ir_func_count > 0) {
+            var isel_backing: allocator.Allocator = allocator.default();
+            val isel_ar_res: Result[arena.Arena, allocator.AllocError] = arena.init(isel_backing, 4194304);
+            if (isel_ar_res.is_err()) {
+                print.eprintln("error: failed to create isel arena");
+                symbols.deinit();
+                sema.deinit(?sem);
+                p.deinit();
+                ret 1;
+            }
+            var isel_ar: arena.Arena = isel_ar_res.unwrap_ok();
+            var isel_alloc: allocator.Allocator = isel_ar.allocator();
 
-        # emit .o file
-        if (obj_path != nil) {
-            emit.emit_object(module_masms[oi].m, obj_path, alloc);
-        }
+            val isel_res: Result[bool, str] = isel.run_isel(
+                module_masms[oi].m, module_masms[oi].ir_funcs,
+                module_masms[oi].ir_func_count, ?isel_alloc
+            );
+            if (isel_res.is_err()) {
+                print.eprint("error: isel failed: ");
+                print.eprintln(isel_res.unwrap_err());
+                isel_ar.deinit();
+                symbols.deinit();
+                sema.deinit(?sem);
+                p.deinit();
+                ret 1;
+            }
 
-        # read back .o bytes for archive member
-        if (obj_path != nil) {
-            val read_obj_res: Result[str, str] = read_file_contents(obj_path, alloc);
-            if (read_obj_res.is_ok()) {
-                val obj_data: str = read_obj_res.unwrap_ok();
-                val obj_len: usize = obj_data.len();
-                var member_name: str = module_masms[oi].mod_name;
-                if (member_name == nil) { member_name = "module"; }
-                ar_members[oi].name = make_obj_path("", member_name, alloc);
-                ar_members[oi].data = obj_data::ptr::*u8;
-                ar_members[oi].size = obj_len;
-            } or {
-                ar_members[oi].name = nil;
-                ar_members[oi].data = nil;
-                ar_members[oi].size = 0;
+            # emit .o file before freeing arena
+            val obj_path: str = make_obj_path(lib_obj_dir, module_masms[oi].mod_name, alloc);
+            if (obj_path != nil) {
+                emit.emit_object(module_masms[oi].m, obj_path, ?isel_alloc);
+            }
+
+            isel_ar.deinit();
+
+            # read back .o bytes for archive member
+            if (obj_path != nil) {
+                val read_obj_res: Result[str, str] = read_file_contents(obj_path, alloc);
+                if (read_obj_res.is_ok()) {
+                    val obj_data: str = read_obj_res.unwrap_ok();
+                    val obj_len: usize = obj_data.len();
+                    var member_name: str = module_masms[oi].mod_name;
+                    if (member_name == nil) { member_name = "module"; }
+                    ar_members[oi].name = make_obj_path("", member_name, alloc);
+                    ar_members[oi].data = obj_data::ptr::*u8;
+                    ar_members[oi].size = obj_len;
+                } or {
+                    ar_members[oi].name = nil;
+                    ar_members[oi].data = nil;
+                    ar_members[oi].size = 0;
+                }
+            }
+        } or {
+            # no IR functions — emit .o without ISel
+            val obj_path: str = make_obj_path(lib_obj_dir, module_masms[oi].mod_name, alloc);
+            if (obj_path != nil) {
+                emit.emit_object(module_masms[oi].m, obj_path, alloc);
+                val read_obj_res: Result[str, str] = read_file_contents(obj_path, alloc);
+                if (read_obj_res.is_ok()) {
+                    val obj_data: str = read_obj_res.unwrap_ok();
+                    val obj_len: usize = obj_data.len();
+                    var member_name: str = module_masms[oi].mod_name;
+                    if (member_name == nil) { member_name = "module"; }
+                    ar_members[oi].name = make_obj_path("", member_name, alloc);
+                    ar_members[oi].data = obj_data::ptr::*u8;
+                    ar_members[oi].size = obj_len;
+                } or {
+                    ar_members[oi].name = nil;
+                    ar_members[oi].data = nil;
+                    ar_members[oi].size = 0;
+                }
             }
         }
         oi = oi + 1;
@@ -1023,7 +1159,7 @@ pub fun handle(argc: i64, argv: &&u8) i64 {
 
     # create arena-backed allocator for bulk allocation/deallocation
     var backing: allocator.Allocator = allocator.default();
-    val arena_res: Result[arena.Arena, allocator.AllocError] = arena.init(backing, 67108864);
+    val arena_res: Result[arena.Arena, allocator.AllocError] = arena.init(backing, 268435456);
     if (arena_res.is_err()) {
         print.eprintln("error: failed to create arena allocator");
         ret 1;
