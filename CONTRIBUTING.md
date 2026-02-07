@@ -41,12 +41,20 @@ make test     # runs unit tests via cmach
 
 ---
 
-## Branch Workflow
+## Branching Strategy
 
 We use a two-branch model:
 
-- **`main`** — Stable branch. Production-ready code only.
-- **`dev`** — Development branch. Integration point for features.
+- **`main`** — Stable branch. Tagged releases only.
+- **`dev`** — Development branch. Integration point for features and fixes.
+
+All work happens on feature branches off `dev`. When `dev` reaches a stable milestone, it is merged into `main` and tagged.
+
+### Branch Naming
+
+- `feat/<name>` — New features
+- `fix/<name>` — Bug fixes
+- `doc/<name>` — Documentation changes
 
 ### Contributing Changes
 
@@ -76,6 +84,24 @@ We use a two-branch model:
 - Link related issues
 - Ensure code builds with `make cmach imach`
 - Follow coding standards
+
+## Versioning
+
+Mach uses [Semantic Versioning](https://semver.org/) (`vMAJOR.MINOR.PATCH`):
+
+- **MAJOR** — Breaking changes to the language or standard library
+- **MINOR** — New features, backward-compatible additions
+- **PATCH** — Bug fixes, documentation, internal improvements
+
+Tags are created on `main` after merging from `dev`. The current pre-1.0 convention treats minor bumps as potentially breaking while the language stabilizes.
+
+### Release Flow
+
+```
+dev (ongoing work)
+ └─► merge to main
+      └─► tag vX.Y.Z on main
+```
 
 ---
 
