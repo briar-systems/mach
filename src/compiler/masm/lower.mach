@@ -5,7 +5,6 @@ use std.types.result;
 use std.types.option;
 
 use allocator: std.allocator;
-use print: std.print;
 
 use ast:     mach.compiler.ast;
 use isel:    mach.compiler.masm.isel;
@@ -26,6 +25,23 @@ use spec:      mach.compiler.masm.isa.spec;
 use x86parse:  mach.compiler.masm.isa.x86_64.parse;
 use x86encode: mach.compiler.masm.isa.x86_64.encode;
 use x86opcode: mach.compiler.masm.isa.x86_64.opcode;
+
+# ModuleMasm: per-module MASM context for split lowering.
+# ---
+# m:              masm context for this module
+# mod_name:       module name (e.g. "mach.compiler.ast")
+# file_path:      source file path
+# ir_funcs:       IR functions belonging to this module
+# ir_func_count:  number of IR functions
+# ir_func_cap:    capacity of ir_funcs array
+pub rec ModuleMasm {
+    m:              *masm.Masm;
+    mod_name:       str;
+    file_path:      str;
+    ir_funcs:       **ir.IRFunction;
+    ir_func_count:  i32;
+    ir_func_cap:    i32;
+}
 
 fun is_space_u8(c: u8) bool {
     ret c == 32 || c == 9 || c == 10 || c == 13;
@@ -52,9 +68,45 @@ fun parse_int_str(s: str) i64 {
     }
 
     var value: i64 = 0;
-    for (s[i] != 0 && is_digit_u8(s[i])) {
-        value = value * 10 + (s[i] - 48)::i64;
-        i = i + 1;
+
+    # hex: 0x...
+    if (s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        i = i + 2;
+        for (s[i] != 0) {
+            if (is_digit_u8(s[i])) {
+                value = value * 16 + (s[i] - '0')::i64;
+            } or (s[i] >= 'a' && s[i] <= 'f') {
+                value = value * 16 + (s[i] - 'a' + 10)::i64;
+            } or (s[i] >= 'A' && s[i] <= 'F') {
+                value = value * 16 + (s[i] - 'A' + 10)::i64;
+            } or {
+                brk;
+            }
+            i = i + 1;
+        }
+    }
+    # octal: 0o...
+    or (s[i] == '0' && (s[i + 1] == 'o' || s[i + 1] == 'O')) {
+        i = i + 2;
+        for (s[i] != 0 && s[i] >= '0' && s[i] <= '7') {
+            value = value * 8 + (s[i] - '0')::i64;
+            i = i + 1;
+        }
+    }
+    # binary: 0b...
+    or (s[i] == '0' && (s[i + 1] == 'b' || s[i + 1] == 'B')) {
+        i = i + 2;
+        for (s[i] != 0 && (s[i] == '0' || s[i] == '1')) {
+            value = value * 2 + (s[i] - '0')::i64;
+            i = i + 1;
+        }
+    }
+    # decimal
+    or {
+        for (s[i] != 0 && is_digit_u8(s[i])) {
+            value = value * 10 + (s[i] - 48)::i64;
+            i = i + 1;
+        }
     }
 
     if (neg) {
@@ -318,6 +370,9 @@ pub rec LowerContext {
     recv_type_override:  *ty.Type;
     # override for return type
     ret_type_override:   *ty.Type;
+
+    # debug info: current source file index for DWARF (1-based)
+    current_file_idx:    u16;
 }
 
 # init: initialize a lowering context.
@@ -380,8 +435,50 @@ pub fun init(alloc: *allocator.Allocator, symbols: *symbol.Table, types: *ty.Typ
     ctx.func_name_override = nil;
     ctx.recv_type_override = nil;
     ctx.ret_type_override = nil;
+    ctx.current_file_idx = 0;
 
     ret ctx;
+}
+
+# line_for_pos: compute 1-based line number from byte offset in source text.
+# ---
+# text: source text
+# pos:  byte offset
+# ret:  1-based line number (0 if text is nil or pos < 0)
+fun line_for_pos(text: str, pos: i32) i32 {
+    if (text == nil || pos <= 0) {
+        ret 1;
+    }
+
+    var line: i32 = 1;
+    var i: i32 = 0;
+    for (i < pos) {
+        if (text[i::usize] == 10) {
+            line = line + 1;
+        }
+        i = i + 1;
+    }
+    ret line;
+}
+
+# annotate_instr: set source location on an IR instruction from an AST node.
+# ---
+# ctx:   lowering context
+# block: IR block containing the instruction
+# idx:   instruction index in block
+# node:  AST node providing source location
+fun annotate_instr(ctx: *LowerContext, block: *ir.IRBlock, idx: i32, node: *ast.Node) {
+    if (ctx == nil || block == nil || idx < 0 || idx >= block.instr_count || node == nil) {
+        ret;
+    }
+    if (ctx.text == nil || ctx.current_file_idx == 0) {
+        ret;
+    }
+    val line: i32 = line_for_pos(ctx.text, node.tok.pos);
+    if (line > 0) {
+        block.instrs[idx].src_line = line;
+        block.instrs[idx].src_file = ctx.current_file_idx;
+    }
 }
 
 # find_method_type_name: search symbol tables for a method and return its type prefix.
@@ -662,12 +759,13 @@ fun find_local_var(ctx: *LowerContext, name: str) i32 {
         ret -1;
     }
 
-    var i: i32 = 0;
-    for (i < ctx.local_count) {
+    # search from end to find most recent declaration (handles re-declarations)
+    var i: i32 = ctx.local_count - 1;
+    for (i >= 0) {
         if (ctx.local_vars[i].name != nil && ctx.local_vars[i].name.equals(name)) {
             ret i;
         }
-        i = i + 1;
+        i = i - 1;
     }
 
     ret -1;
@@ -869,6 +967,36 @@ pub fun new_label(ctx: *LowerContext, prefix: str) str {
     ret buf::str;
 }
 
+# types_match: compare two types for logical equality.
+# Uses pointer equality first, then falls back to structural comparison.
+fun types_match(a: *ty.Type, b: *ty.Type) bool {
+    if (a == b) { ret true; }
+    if (a == nil || b == nil) { ret false; }
+    if (a.kind != b.kind) { ret false; }
+
+    # for pointer/ref types, compare inner types recursively
+    if (a.kind == ty.TY_PTR || a.kind == ty.TY_POINTER) {
+        ret types_match(a.inner, b.inner);
+    }
+
+    # for named types (records, unions, enums), compare by name
+    if (a.name != nil && b.name != nil) {
+        ret a.name.equals(b.name);
+    }
+
+    # if one has name and other doesn't, not a match
+    if (a.name != nil || b.name != nil) {
+        ret false;
+    }
+
+    # both unnamed: primitives with same kind are equal,
+    # but anonymous composites need size match too
+    if (a.kind == ty.TY_RECORD || a.kind == ty.TY_UNION) {
+        ret a.size == b.size;
+    }
+    ret true;
+}
+
 # find_instantiated_type: search all types in the context for an instantiated type
 # matching the given base name and generic arguments.
 # ---
@@ -892,7 +1020,7 @@ fun find_instantiated_type(ctx: *LowerContext, base_name: str, args: **ty.Type, 
                 var all_match: bool = true;
                 var ai: i32 = 0;
                 for (ai < arg_count) {
-                    if (t.generic_args[ai] != args[ai]) {
+                    if (!types_match(t.generic_args[ai], args[ai])) {
                         all_match = false;
                     }
                     ai = ai + 1;
@@ -919,7 +1047,7 @@ fun resolve_type_annotation(ctx: *LowerContext, type_node: *ast.Node) *ty.Type {
     }
 
     if (type_node.kind == ast.NODE_TYPE_NAME) {
-        val type_name: str = type_node.get_name();
+        val type_name: str = type_node.info.type_name.path;
         if (type_name == nil) {
             ret nil;
         }
@@ -932,6 +1060,39 @@ fun resolve_type_annotation(ctx: *LowerContext, type_node: *ast.Node) *ty.Type {
                     ret ctx.type_binding_types[tbi];
                 }
                 tbi = tbi + 1;
+            }
+        }
+
+        # handle parameterized types like Result[T, E] — resolve args through
+        # type bindings and find the matching instantiated type
+        val rta_args_node: *ast.Node = type_node.info.type_name.args;
+        if (rta_args_node != nil && ctx.type_binding_count > 0 &&
+            rta_args_node.kind == ast.NODE_GENERIC) {
+            val rta_args_list: *ast.List = rta_args_node.info.generic_node.args;
+            if (rta_args_list != nil && rta_args_list.count > 0) {
+                var rta_resolved: [8]*ty.Type;
+                var rta_count: i32 = 0;
+                var rta_ok: bool = true;
+                var rta_i: i32 = 0;
+                for (rta_i < rta_args_list.count && rta_i < 8) {
+                    val rta_arg: *ast.Node = rta_args_list.nodes[rta_i];
+                    if (rta_arg != nil) {
+                        val rta_rt: *ty.Type = resolve_type_annotation(ctx, rta_arg);
+                        if (rta_rt != nil) {
+                            rta_resolved[rta_count] = rta_rt;
+                            rta_count = rta_count + 1;
+                        } or {
+                            rta_ok = false;
+                        }
+                    }
+                    rta_i = rta_i + 1;
+                }
+                if (rta_ok && rta_count > 0) {
+                    val rta_found: *ty.Type = find_instantiated_type(ctx, type_name, ?rta_resolved[0], rta_count);
+                    if (rta_found != nil) {
+                        ret rta_found;
+                    }
+                }
             }
         }
 
@@ -1038,10 +1199,10 @@ fun resolve_type_annotation(ctx: *LowerContext, type_node: *ast.Node) *ty.Type {
         }
 
         # check if this type name has generic args (e.g., Result[T, E])
-        val generic_args_node: *ast.Node = type_node.children;
+        val generic_args_node: *ast.Node = type_node.info.type_name.args;
         if (generic_args_node != nil && generic_args_node.kind == ast.NODE_GENERIC) {
             # resolve each generic arg (they might be bound type params)
-            val gargs_list: *ast.List = generic_args_node.children::*ast.List;
+            val gargs_list: *ast.List = generic_args_node.info.generic_node.args;
             if (gargs_list != nil && gargs_list.count > 0) {
                 # first resolve all args
                 var resolved_args: [8]*ty.Type;
@@ -1074,10 +1235,6 @@ fun resolve_type_annotation(ctx: *LowerContext, type_node: *ast.Node) *ty.Type {
                         base_sym = lookup_symbol_in_imports(ctx, type_name);
                     }
                     if (base_sym != nil && base_sym.is_generic && base_sym.decl_node != nil) {
-                        # use sema's instantiate_generic_type by creating a temporary binding scope
-                        # For now, look for a cached instantiation in the type context
-                        # that matches these args
-                        # Simpler approach: look for a type with matching name and generic_args
                         val inst_ty: *ty.Type = find_instantiated_type(ctx, type_name, ?resolved_args[0], gargs_list.count);
                         if (inst_ty != nil) {
                             ret inst_ty;
@@ -1108,7 +1265,7 @@ fun resolve_type_annotation(ctx: *LowerContext, type_node: *ast.Node) *ty.Type {
     }
 
     if (type_node.kind == ast.NODE_TYPE_PTR || type_node.kind == ast.NODE_TYPE_REF) {
-        val inner_node: *ast.Node = type_node.get_child(0);
+        val inner_node: *ast.Node = type_node.info.type_ptr.inner;
         if (inner_node != nil) {
             val inner_ty: *ty.Type = resolve_type_annotation(ctx, inner_node);
             if (inner_ty != nil && ctx.types != nil) {
@@ -1133,19 +1290,19 @@ fun get_receiver_type_name(receiver: *ast.Node) str {
         ret nil;
     }
 
-    # receiver is NODE_PARAM, its type is in children
-    var recv_type: *ast.Node = receiver.children;
+    # receiver is NODE_PARAM, its type is in field_decl.type_node
+    var recv_type: *ast.Node = receiver.info.field_decl.type_node;
     if (recv_type == nil) {
         ret nil;
     }
 
     # unwrap pointer/ref types
     for (recv_type != nil && (recv_type.kind == ast.NODE_TYPE_PTR || recv_type.kind == ast.NODE_TYPE_REF)) {
-        recv_type = recv_type.get_child(0);
+        recv_type = recv_type.info.type_ptr.inner;
     }
 
     if (recv_type != nil && recv_type.kind == ast.NODE_TYPE_NAME) {
-        ret recv_type.get_name();
+        ret recv_type.info.type_name.path;
     }
 
     ret nil;
@@ -1302,6 +1459,57 @@ fun load_ptr_if_needed(ctx: *LowerContext, addr: ir.IRValue, base_ty: *ty.Type) 
 # ret:    none
 fun emit_store(ctx: *LowerContext, addr: ir.IRValue, src: ir.IRValue) {
     if (ctx == nil) {
+        ret;
+    }
+
+    # aggregate store: source is a register holding a pointer to aggregate data,
+    # destination is a memory operand with size > ptr_size. Copy addr.size bytes.
+    if (src.kind == ir.VAL_REG && addr.kind == ir.VAL_MEM && addr.size > ctx.ptr_size) {
+        val agg_dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+        val agg_dst_ptr: ir.IRValue = ir.make_reg(agg_dst_reg, ctx.ptr_size);
+        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                      agg_dst_ptr, addr, ir.make_none(), ir.CC_NONE);
+
+        val agg_src_reg: i32 = src.reg;
+        val agg_total: i32 = addr.size::i32;
+        var agg_off: i32 = 0;
+        for (agg_off < agg_total) {
+            var agg_chunk: usize = 8;
+            if ((agg_total - agg_off)::usize < 8) {
+                agg_chunk = (agg_total - agg_off)::usize;
+            }
+            val agg_tmp_reg: i32 = new_vreg(ctx, agg_chunk);
+            val agg_tmp: ir.IRValue = ir.make_reg(agg_tmp_reg, agg_chunk);
+
+            var agg_s: ir.IRValue;
+            agg_s.kind = ir.VAL_MEM;
+            agg_s.base_reg = agg_src_reg;
+            agg_s.offset = agg_off::i64;
+            agg_s.size = agg_chunk;
+            agg_s.reg = 0;
+            agg_s.imm = 0;
+            agg_s.index_reg = -1;
+            agg_s.scale = 1;
+            agg_s.label = nil;
+
+            var agg_d: ir.IRValue;
+            agg_d.kind = ir.VAL_MEM;
+            agg_d.base_reg = agg_dst_reg;
+            agg_d.offset = agg_off::i64;
+            agg_d.size = agg_chunk;
+            agg_d.reg = 0;
+            agg_d.imm = 0;
+            agg_d.index_reg = -1;
+            agg_d.scale = 1;
+            agg_d.label = nil;
+
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                          agg_tmp, agg_s, ir.make_none(), ir.CC_NONE);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                          agg_d, agg_tmp, ir.make_none(), ir.CC_NONE);
+
+            agg_off = agg_off + agg_chunk::i32;
+        }
         ret;
     }
 
@@ -1924,8 +2132,8 @@ fun emit_va_arg(ctx: *LowerContext, args: *ast.List, arg_type: *ty.Type) ir.IRVa
     val result: ir.IRValue = ir.make_reg(result_reg, arg_size);
 
     # generate unique labels for branching
-    val stack_label: str = new_label(ctx, "va_stack");
-    val done_label: str = new_label(ctx, "va_done");
+    val stack_label: str = new_label(ctx, ".Lva_stack");
+    val done_label: str = new_label(ctx, ".Lva_done");
 
     # load gp_offset (32-bit)
     val off_reg: i32 = new_vreg(ctx, ctx.ptr_size);
@@ -2056,8 +2264,32 @@ pub fun lower_expr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # dispatch based on node kind
     if (node.kind == ast.NODE_EXPR_LIT_INT) {
-        val int_val: i64 = node.get_int_value();
+        val int_val: i64 = parse_int_str(node.info.lit_expr.text);
         ret ir.make_imm(int_val, 8);
+    }
+
+    if (node.kind == ast.NODE_EXPR_LIT_CHAR) {
+        val char_text: str = node.info.lit_expr.text;
+        var char_val: i64 = 0;
+        if (char_text != nil) {
+            # text is the raw token text including quotes, e.g. 'A' or '\n'
+            # char_text[0] is the opening quote, char_text[1] is the char or backslash
+            if (char_text[1] == '\\') {
+                # escape sequence
+                val esc: u8 = char_text[2];
+                if (esc == 'n') { char_val = 10; }
+                or (esc == 't') { char_val = 9; }
+                or (esc == 'r') { char_val = 13; }
+                or (esc == '0') { char_val = 0; }
+                or (esc == '\\') { char_val = 92; }
+                or (esc == '\'') { char_val = 39; }
+                or (esc == '"') { char_val = 34; }
+                or { char_val = esc::i64; }
+            } or {
+                char_val = char_text[1]::i64;
+            }
+        }
+        ret ir.make_imm(char_val, 8);
     }
 
     if (node.kind == ast.NODE_EXPR_LIT_STR) {
@@ -2077,6 +2309,58 @@ pub fun lower_expr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     }
 
     if (node.kind == ast.NODE_EXPR_CALL) {
+        # check for comptime call: $size_of(T), $align_of(T)
+        val ct_callee: *ast.Node = node.info.call_expr.callee;
+        if (ct_callee != nil && ct_callee.kind == ast.NODE_COMPTIME) {
+            val ct_ident: *ast.Node = ct_callee.info.wrapper.inner;
+            val ct_args: *ast.List = node.info.call_expr.args;
+            if (ct_ident != nil && ct_ident.kind == ast.NODE_EXPR_IDENT &&
+                ct_args != nil && ct_args.count > 0) {
+                val ct_name: str = ct_ident.info.ident_expr.name;
+                val ct_arg: *ast.Node = ct_args.nodes[0];
+                if (ct_name != nil && ct_arg != nil) {
+                    var ct_type: *ty.Type = nil;
+
+                    # try resolve_type_annotation (handles NODE_TYPE_NAME)
+                    ct_type = resolve_type_annotation(ctx, ct_arg);
+
+                    # fallback: if arg is NODE_EXPR_IDENT, check type bindings
+                    if (ct_type == nil && ct_arg.kind == ast.NODE_EXPR_IDENT) {
+                        val ct_type_name: str = ct_arg.info.ident_expr.name;
+                        if (ct_type_name != nil && ctx.type_binding_count > 0 &&
+                            ctx.type_binding_names != nil) {
+                            var tbi: i32 = 0;
+                            for (tbi < ctx.type_binding_count) {
+                                if (ctx.type_binding_names[tbi] != nil &&
+                                    ctx.type_binding_names[tbi].equals(ct_type_name)) {
+                                    ct_type = ctx.type_binding_types[tbi];
+                                }
+                                tbi = tbi + 1;
+                            }
+                        }
+                    }
+
+                    # pointer types always have size/align 8
+                    if (ct_type == nil && ct_arg.kind == ast.NODE_TYPE_PTR) {
+                        if (ct_name.equals("size_of") || ct_name.equals("align_of")) {
+                            ret ir.make_imm(8, 8);
+                        }
+                    }
+
+                    if (ct_type != nil) {
+                        if (ct_name.equals("size_of")) {
+                            ret ir.make_imm(ct_type.size::i64, 8);
+                        }
+                        if (ct_name.equals("align_of")) {
+                            var ct_align: usize = ct_type.size;
+                            if (ct_align > 8) { ct_align = 8; }
+                            if (ct_align == 0) { ct_align = 1; }
+                            ret ir.make_imm(ct_align::i64, 8);
+                        }
+                    }
+                }
+            }
+        }
         ret lower_call(ctx, node);
     }
 
@@ -2108,15 +2392,86 @@ pub fun lower_expr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret lower_struct_lit(ctx, node);
     }
 
+    if (node.kind == ast.NODE_EXPR_LIT_BOOL) {
+        val bool_text: str = node.info.lit_expr.text;
+        if (bool_text != nil && bool_text.equals("true")) {
+            ret ir.make_imm(1, 1);
+        }
+        ret ir.make_imm(0, 1);
+    }
+
     if (node.kind == ast.NODE_EXPR_LIT_NIL) {
         ret ir.make_imm(0, ctx.ptr_size);
     }
 
     # parenthesized expression: unwrap and lower inner expression
     if (node.kind == ast.NODE_EXPR_PAREN) {
-        val inner: *ast.Node = node.get_child(0);
+        val inner: *ast.Node = node.info.wrapper.inner;
         if (inner != nil) {
             ret lower_expr(ctx, inner);
+        }
+        ret make_none();
+    }
+
+    # comptime expression: $size_of(T), $align_of(T), etc.
+    if (node.kind == ast.NODE_COMPTIME) {
+        val ct_inner: *ast.Node = node.info.wrapper.inner;
+        if (ct_inner != nil && ct_inner.kind == ast.NODE_EXPR_CALL) {
+            val ct_callee: *ast.Node = ct_inner.info.call_expr.callee;
+            val ct_args: *ast.List = ct_inner.info.call_expr.args;
+            if (ct_callee != nil && ct_callee.kind == ast.NODE_EXPR_IDENT &&
+                ct_args != nil && ct_args.count > 0) {
+                val ct_name: str = ct_callee.info.ident_expr.name;
+                val ct_arg: *ast.Node = ct_args.nodes[0];
+                if (ct_name != nil && ct_arg != nil) {
+                    # resolve the type argument
+                    var ct_type: *ty.Type = nil;
+
+                    # try resolve_type_annotation (handles NODE_TYPE_NAME with bindings)
+                    ct_type = resolve_type_annotation(ctx, ct_arg);
+
+                    # fallback: if arg is NODE_EXPR_IDENT, look up type bindings and primitives
+                    if (ct_type == nil && ct_arg.kind == ast.NODE_EXPR_IDENT) {
+                        val ct_type_name: str = ct_arg.info.ident_expr.name;
+                        if (ct_type_name != nil) {
+                            # check type bindings (for generic params like T)
+                            if (ctx.type_binding_count > 0 && ctx.type_binding_names != nil) {
+                                var tbi: i32 = 0;
+                                for (tbi < ctx.type_binding_count) {
+                                    if (ctx.type_binding_names[tbi] != nil &&
+                                        ctx.type_binding_names[tbi].equals(ct_type_name)) {
+                                        ct_type = ctx.type_binding_types[tbi];
+                                    }
+                                    tbi = tbi + 1;
+                                }
+                            }
+                        }
+                    }
+
+                    # if arg is a pointer type, size/align is always 8
+                    if (ct_type == nil && ct_arg.kind == ast.NODE_TYPE_PTR) {
+                        if (ct_name.equals("size_of") || ct_name.equals("align_of")) {
+                            ret ir.make_imm(8, 8);
+                        }
+                    }
+
+                    if (ct_type != nil) {
+                        if (ct_name.equals("size_of")) {
+                            ret ir.make_imm(ct_type.size::i64, 8);
+                        }
+                        if (ct_name.equals("align_of")) {
+                            var ct_align: usize = ct_type.size;
+                            if (ct_align > 8) { ct_align = 8; }
+                            if (ct_align == 0) { ct_align = 1; }
+                            ret ir.make_imm(ct_align::i64, 8);
+                        }
+                    }
+                }
+            }
+        }
+        # fallback: try lowering inner expression
+        if (ct_inner != nil) {
+            ret lower_expr(ctx, ct_inner);
         }
         ret make_none();
     }
@@ -2135,13 +2490,13 @@ fun lower_string_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret ir.make_imm(0, ctx.ptr_size);
     }
 
-    val str_val: str = node.get_name();
+    val str_val: str = node.info.lit_expr.text;
     if (str_val == nil) {
         ret ir.make_imm(0, ctx.ptr_size);
     }
 
     # create a unique label for the string
-    val label: str = new_label(ctx, "str");
+    val label: str = new_label(ctx, ".Lstr");
 
     # emit string data to rodata section
     val sec_res: Result[*section.Section, str] = masm.get_or_create_section(ctx.m, ".rodata", section.section_rodata());
@@ -2239,7 +2594,7 @@ fun lower_identifier(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val name: str = node.get_name();
+    val name: str = node.info.ident_expr.name;
     if (name == nil) {
         ret make_none();
     }
@@ -2355,15 +2710,15 @@ fun lower_short_circuit(ctx: *LowerContext, node: *ast.Node, is_and: bool) ir.IR
         ret make_none();
     }
 
-    val lhs: *ast.Node = node.get_child(0);
-    val rhs: *ast.Node = node.get_child(1);
+    val lhs: *ast.Node = node.info.binary_expr.left;
+    val rhs: *ast.Node = node.info.binary_expr.right;
 
     if (lhs == nil || rhs == nil) {
         ret make_none();
     }
 
-    val end_label: str = new_label(ctx, "sc_end");
-    val true_label: str = new_label(ctx, "sc_true");
+    val end_label: str = new_label(ctx, ".Lsc_end");
+    val true_label: str = new_label(ctx, ".Lsc_true");
 
     # allocate result vreg
     val dst_reg: i32 = new_vreg(ctx, 8);
@@ -2415,8 +2770,8 @@ fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val lhs: *ast.Node = node.get_child(0);
-    val rhs: *ast.Node = node.get_child(1);
+    val lhs: *ast.Node = node.info.binary_expr.left;
+    val rhs: *ast.Node = node.info.binary_expr.right;
     val op: u8 = node.tok.tag;
 
     if (lhs == nil || rhs == nil) {
@@ -2435,6 +2790,147 @@ fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     if (op == token.TAG_EQ) {
         val left_addr: ir.IRValue = lower_lvalue(ctx, lhs);
         val right_value: ir.IRValue = lower_expr(ctx, rhs);
+
+        # aggregate assignment: when RHS is a large local variable, lower_identifier
+        # returns VAL_REG (via LEA) containing the address. Detect this by checking
+        # the local variable's size and do a chunked copy instead of a scalar store.
+        if (right_value.kind == ir.VAL_REG && rhs.kind == ast.NODE_EXPR_IDENT) {
+            val asg_rhs_name: str = rhs.info.ident_expr.name;
+            if (asg_rhs_name != nil) {
+                val asg_rhs_idx: i32 = find_local_var(ctx, asg_rhs_name);
+                if (asg_rhs_idx >= 0) {
+                    val asg_rhs_size: usize = ctx.local_vars[asg_rhs_idx].size;
+                    if (asg_rhs_size > ctx.ptr_size) {
+                        # LEA destination address
+                        val asg_dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+                        val asg_dst: ir.IRValue = ir.make_reg(asg_dst_reg, ctx.ptr_size);
+                        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                                      asg_dst, left_addr, ir.make_none(), ir.CC_NONE);
+
+                        # source: right_value.reg already holds the aggregate address
+                        val asg_src_reg: i32 = right_value.reg;
+
+                        # chunked copy
+                        val asg_total: i32 = asg_rhs_size::i32;
+                        var asg_off: i32 = 0;
+                        for (asg_off < asg_total) {
+                            var asg_chunk: usize = 8;
+                            if ((asg_total - asg_off)::usize < 8) {
+                                asg_chunk = (asg_total - asg_off)::usize;
+                            }
+                            val asg_tmp_reg: i32 = new_vreg(ctx, asg_chunk);
+                            val asg_tmp: ir.IRValue = ir.make_reg(asg_tmp_reg, asg_chunk);
+
+                            var asg_s: ir.IRValue;
+                            asg_s.kind = ir.VAL_MEM;
+                            asg_s.base_reg = asg_src_reg;
+                            asg_s.offset = asg_off::i64;
+                            asg_s.size = asg_chunk;
+                            asg_s.reg = 0;
+                            asg_s.imm = 0;
+                            asg_s.index_reg = -1;
+                            asg_s.scale = 1;
+                            asg_s.label = nil;
+
+                            var asg_d: ir.IRValue;
+                            asg_d.kind = ir.VAL_MEM;
+                            asg_d.base_reg = asg_dst_reg;
+                            asg_d.offset = asg_off::i64;
+                            asg_d.size = asg_chunk;
+                            asg_d.reg = 0;
+                            asg_d.imm = 0;
+                            asg_d.index_reg = -1;
+                            asg_d.scale = 1;
+                            asg_d.label = nil;
+
+                            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                                          asg_tmp, asg_s, ir.make_none(), ir.CC_NONE);
+                            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                                          asg_d, asg_tmp, ir.make_none(), ir.CC_NONE);
+
+                            asg_off = asg_off + asg_chunk::i32;
+                        }
+                        ret right_value;
+                    }
+                }
+            }
+        }
+
+        # general aggregate assignment: when RHS is a large aggregate (returned from
+        # function call via sret as VAL_MEM, or from a register address as VAL_REG),
+        # do a chunked copy to the destination.
+        var agg_copy_size: usize = 0;
+        if (right_value.kind == ir.VAL_MEM && right_value.size > ctx.ptr_size) {
+            agg_copy_size = right_value.size;
+        } or (right_value.kind == ir.VAL_REG && rhs.ty != nil && rhs.ty.size > ctx.ptr_size) {
+            agg_copy_size = rhs.ty.size;
+        }
+
+        if (agg_copy_size > 0) {
+            # get destination register
+            var agg_dst_reg: i32 = 0;
+            if (left_addr.kind == ir.VAL_REG) {
+                agg_dst_reg = left_addr.reg;
+            } or {
+                agg_dst_reg = new_vreg(ctx, ctx.ptr_size);
+                val agg_dst: ir.IRValue = ir.make_reg(agg_dst_reg, ctx.ptr_size);
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                              agg_dst, left_addr, ir.make_none(), ir.CC_NONE);
+            }
+
+            # get source register: for VAL_MEM, LEA to get address; for VAL_REG, use directly
+            var agg_src_reg: i32 = 0;
+            if (right_value.kind == ir.VAL_MEM) {
+                agg_src_reg = new_vreg(ctx, ctx.ptr_size);
+                val agg_src: ir.IRValue = ir.make_reg(agg_src_reg, ctx.ptr_size);
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                              agg_src, right_value, ir.make_none(), ir.CC_NONE);
+            } or {
+                agg_src_reg = right_value.reg;
+            }
+
+            val agg_total: i32 = agg_copy_size::i32;
+            var agg_off: i32 = 0;
+            for (agg_off < agg_total) {
+                var agg_chunk: usize = 8;
+                if ((agg_total - agg_off)::usize < 8) {
+                    agg_chunk = (agg_total - agg_off)::usize;
+                }
+                val agg_tmp_reg: i32 = new_vreg(ctx, agg_chunk);
+                val agg_tmp: ir.IRValue = ir.make_reg(agg_tmp_reg, agg_chunk);
+
+                var agg_s: ir.IRValue;
+                agg_s.kind = ir.VAL_MEM;
+                agg_s.base_reg = agg_src_reg;
+                agg_s.offset = agg_off::i64;
+                agg_s.size = agg_chunk;
+                agg_s.reg = 0;
+                agg_s.imm = 0;
+                agg_s.index_reg = -1;
+                agg_s.scale = 1;
+                agg_s.label = nil;
+
+                var agg_d: ir.IRValue;
+                agg_d.kind = ir.VAL_MEM;
+                agg_d.base_reg = agg_dst_reg;
+                agg_d.offset = agg_off::i64;
+                agg_d.size = agg_chunk;
+                agg_d.reg = 0;
+                agg_d.imm = 0;
+                agg_d.index_reg = -1;
+                agg_d.scale = 1;
+                agg_d.label = nil;
+
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                              agg_tmp, agg_s, ir.make_none(), ir.CC_NONE);
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                              agg_d, agg_tmp, ir.make_none(), ir.CC_NONE);
+
+                agg_off = agg_off + agg_chunk::i32;
+            }
+            ret right_value;
+        }
+
         emit_store(ctx, left_addr, right_value);
         ret right_value;
     }
@@ -2499,6 +2995,12 @@ fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     }
 
     # comparison (set result to 0 or 1 based on condition)
+    # check if operand type is unsigned to select correct comparison opcodes
+    var cmp_unsigned: bool = false;
+    if (lhs != nil && lhs.ty != nil && lhs.ty.is_unsigned()) {
+        cmp_unsigned = true;
+    }
+
     if (op == token.TAG_EQ_EQ) {
         emit_cmp(ctx, left_value, right_value, size);
         emit_instr(ctx, ir.IROp{ir_sete: ir.OP_SETE}, dst, ir.make_none(), ir.make_none(), 0);
@@ -2511,22 +3013,38 @@ fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     }
     if (op == token.TAG_LT) {
         emit_cmp(ctx, left_value, right_value, size);
-        emit_instr(ctx, ir.IROp{ir_setl: ir.OP_SETL}, dst, ir.make_none(), ir.make_none(), 0);
+        if (cmp_unsigned) {
+            emit_instr(ctx, ir.IROp{ir_setb: ir.OP_SETB}, dst, ir.make_none(), ir.make_none(), 0);
+        } or {
+            emit_instr(ctx, ir.IROp{ir_setl: ir.OP_SETL}, dst, ir.make_none(), ir.make_none(), 0);
+        }
         ret dst;
     }
     if (op == token.TAG_GT) {
         emit_cmp(ctx, left_value, right_value, size);
-        emit_instr(ctx, ir.IROp{ir_setg: ir.OP_SETG}, dst, ir.make_none(), ir.make_none(), 0);
+        if (cmp_unsigned) {
+            emit_instr(ctx, ir.IROp{ir_seta: ir.OP_SETA}, dst, ir.make_none(), ir.make_none(), 0);
+        } or {
+            emit_instr(ctx, ir.IROp{ir_setg: ir.OP_SETG}, dst, ir.make_none(), ir.make_none(), 0);
+        }
         ret dst;
     }
     if (op == token.TAG_LT_EQ) {
         emit_cmp(ctx, left_value, right_value, size);
-        emit_instr(ctx, ir.IROp{ir_setle: ir.OP_SETLE}, dst, ir.make_none(), ir.make_none(), 0);
+        if (cmp_unsigned) {
+            emit_instr(ctx, ir.IROp{ir_setbe: ir.OP_SETBE}, dst, ir.make_none(), ir.make_none(), 0);
+        } or {
+            emit_instr(ctx, ir.IROp{ir_setle: ir.OP_SETLE}, dst, ir.make_none(), ir.make_none(), 0);
+        }
         ret dst;
     }
     if (op == token.TAG_GT_EQ) {
         emit_cmp(ctx, left_value, right_value, size);
-        emit_instr(ctx, ir.IROp{ir_setge: ir.OP_SETGE}, dst, ir.make_none(), ir.make_none(), 0);
+        if (cmp_unsigned) {
+            emit_instr(ctx, ir.IROp{ir_setae: ir.OP_SETAE}, dst, ir.make_none(), ir.make_none(), 0);
+        } or {
+            emit_instr(ctx, ir.IROp{ir_setge: ir.OP_SETGE}, dst, ir.make_none(), ir.make_none(), 0);
+        }
         ret dst;
     }
 
@@ -2544,7 +3062,7 @@ fun lower_unary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val operand: *ast.Node = node.get_child(0);  # unary uses lhs for operand
+    val operand: *ast.Node = node.info.unary_expr.expr;  # unary uses expr for operand
     val op: u8 = node.tok.tag;
 
     if (operand == nil) {
@@ -2601,16 +3119,20 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val callee: *ast.Node = node.get_child(0);
-    # args are stored in data, not extra (extra is type args for generic calls)
-    val args: *ast.List = node.data::*ast.List;
+    val callee: *ast.Node = node.info.call_expr.callee;
+    val args: *ast.List = node.info.call_expr.args;
 
     if (callee == nil) {
         ret make_none();
     }
 
     # get function name
-    var func_name: str = callee.get_name();
+    var func_name: str = nil;
+    if (callee.kind == ast.NODE_EXPR_IDENT) {
+        func_name = callee.info.ident_expr.name;
+    } or (callee.kind == ast.NODE_EXPR_FIELD) {
+        func_name = callee.info.field_expr.field;
+    }
     if (func_name == nil) {
         ret make_none();
     }
@@ -2622,14 +3144,14 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     var method_recv_base_ty: *ty.Type = nil;
     var module_alias_name: str = nil;
     if (callee.kind == ast.NODE_EXPR_FIELD) {
-        val callee_base: *ast.Node = callee.get_child(0);
+        val callee_base: *ast.Node = callee.info.field_expr.object;
         if (callee_base != nil) {
             # get base type, trying local vars first if base.ty is nil
             var base_ty: *ty.Type = callee_base.ty;
 
             if (base_ty == nil && callee_base.kind == ast.NODE_EXPR_IDENT) {
                 # try to get type from local variable table
-                val base_name: str = callee_base.get_name();
+                val base_name: str = callee_base.info.ident_expr.name;
                 var found_in_locals: bool = false;
                 if (base_name != nil) {
                     val local_idx: i32 = find_local_var(ctx, base_name);
@@ -2703,10 +3225,10 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
         # check if the method call itself has type args (e.g., alloc.alloc[u8](count))
         # this is distinct from methods on generic types (receiver has generic_args)
-        val mc_type_args: *ast.Node = node.generics;
+        val mc_type_args: *ast.Node = node.info.call_expr.type_args;
         var mc_has_call_type_args: bool = false;
         if (mc_type_args != nil) {
-            val mc_ta_list: *ast.List = mc_type_args.children::*ast.List;
+            val mc_ta_list: *ast.List = mc_type_args.info.generic_node.args;
             if (mc_ta_list != nil && mc_ta_list.count > 0) {
                 mc_has_call_type_args = true;
             }
@@ -2714,7 +3236,7 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
         if (mc_has_call_type_args) {
             # generic method with own type args: "ReceiverType.methodName" + "I" + mangle(call type args) + "E"
-            val mc_ta_list2: *ast.List = mc_type_args.children::*ast.List;
+            val mc_ta_list2: *ast.List = mc_type_args.info.generic_node.args;
             var mg_buf: [512]u8;
             var mg_pos: i32 = 0;
 
@@ -2870,10 +3392,10 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     }
 
     # for generic function calls (e.g., ok[*Section, str](val)), compute mangled name
-    if (!is_method_call && !is_module_qualified && node.generics != nil) {
-        val type_args_node: *ast.Node = node.generics;
+    if (!is_method_call && !is_module_qualified && node.info.call_expr.type_args != nil) {
+        val type_args_node: *ast.Node = node.info.call_expr.type_args;
         if (type_args_node != nil) {
-            val gf_args_list: *ast.List = type_args_node.children::*ast.List;
+            val gf_args_list: *ast.List = type_args_node.info.generic_node.args;
             if (gf_args_list != nil && gf_args_list.count > 0) {
                 var gf_buf: [512]u8;
                 var gf_pos: i32 = 0;
@@ -3031,15 +3553,46 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         # generic types are typically Result or Option which are aggregates > 8 bytes.
         # always assume sret for generic return types to match callee-side detection.
         if (ret_ty.kind == ty.TY_GENERIC) {
-            ret_size = 24;  # conservative estimate for Result[T, E] or Option[T]
             needs_sret = true;
+            # try to get actual size from call symbol's concrete return type
+            if (call_sym != nil && call_sym.resolved_type != nil &&
+                call_sym.resolved_type.kind == ty.TY_FUN &&
+                call_sym.resolved_type.ret_type != nil &&
+                call_sym.resolved_type.ret_type.size > 0) {
+                ret_size = call_sym.resolved_type.ret_type.size;
+                ret_ty = call_sym.resolved_type.ret_type;
+            } or {
+                if (ret_size == 0) {
+                    ret_size = 24;  # conservative estimate as last resort
+                }
+            }
+        }
+
+        # fallback: if ret_ty is unresolved (generic param/small), cross-check with call_sym
+        if (!needs_sret && call_sym != nil && call_sym.resolved_type != nil) {
+            if (call_sym.resolved_type.kind == ty.TY_FUN && call_sym.resolved_type.ret_type != nil) {
+                val sym_ret: *ty.Type = call_sym.resolved_type.ret_type;
+                if (type_is_large_aggregate(sym_ret, ctx.ptr_size)) {
+                    needs_sret = true;
+                    ret_ty = sym_ret;
+                    ret_size = sym_ret.size;
+                }
+            }
         }
     } or {
         # fallback: if type is unknown but call has type args, assume generic return
         # this handles cases where imported module function bodies weren't analyzed
-        if (node.generics != nil) {
-            ret_size = 24;  # conservative estimate for Result[T, E] or Option[T]
+        if (node.info.call_expr.type_args != nil) {
             needs_sret = true;
+            # try to get actual size from call symbol's concrete return type
+            if (call_sym != nil && call_sym.resolved_type != nil &&
+                call_sym.resolved_type.kind == ty.TY_FUN &&
+                call_sym.resolved_type.ret_type != nil &&
+                call_sym.resolved_type.ret_type.size > 0) {
+                ret_size = call_sym.resolved_type.ret_type.size;
+            } or {
+                ret_size = 24;  # conservative estimate as last resort
+            }
         }
     }
 
@@ -3082,6 +3635,18 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     var i: i32 = 0;
     for (i < arg_count) {
         arg_vals[arg_offset + i] = lower_expr(ctx, args.nodes[i]);
+
+        # large aggregates (records/arrays > ptr_size) are passed by hidden pointer:
+        # take the address of the stack slot instead of loading the value
+        val av: ir.IRValue = arg_vals[arg_offset + i];
+        if (av.kind == ir.VAL_MEM && av.size > ctx.ptr_size) {
+            val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+            val addr_val: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                          addr_val, av, ir.make_none(), ir.CC_NONE);
+            arg_vals[arg_offset + i] = addr_val;
+        }
+
         i = i + 1;
     }
 
@@ -3124,14 +3689,16 @@ fun resolve_node_type(ctx: *LowerContext, node: *ast.Node) *ty.Type {
         ret nil;
     }
 
-    # if the node already has a type, use it
-    if (node.ty != nil) {
+    # in generic instantiations, skip node.ty shortcut — it holds
+    # the uninstantiated type from the shared AST. Instead, resolve
+    # through local_vars and field chains to get concrete types.
+    if (node.ty != nil && ctx.type_binding_count == 0) {
         ret node.ty;
     }
 
     # IDENT: look up local variable type
     if (node.kind == ast.NODE_EXPR_IDENT) {
-        val name: str = node.get_name();
+        val name: str = node.info.ident_expr.name;
         if (name != nil) {
             val idx: i32 = find_local_var(ctx, name);
             if (idx >= 0) {
@@ -3143,8 +3710,8 @@ fun resolve_node_type(ctx: *LowerContext, node: *ast.Node) *ty.Type {
 
     # FIELD: resolve base type, then look up field
     if (node.kind == ast.NODE_EXPR_FIELD) {
-        val inner_base: *ast.Node = node.get_child(0);
-        val inner_field: str = node.get_name();
+        val inner_base: *ast.Node = node.info.field_expr.object;
+        val inner_field: str = node.info.field_expr.field;
         if (inner_base == nil || inner_field == nil) {
             ret nil;
         }
@@ -3161,7 +3728,20 @@ fun resolve_node_type(ctx: *LowerContext, node: *ast.Node) *ty.Type {
             val field_opt: Option[*ty.Field] = ty.get_field(struct_ty, inner_field);
             if (field_opt.is_some()) {
                 val resolved_field: *ty.Field = field_opt.unwrap();
-                ret resolved_field.ty;
+                var rnt_ft: *ty.Type = resolved_field.ty;
+                # resolve generic parameter types through type bindings
+                if (rnt_ft != nil && rnt_ft.kind == ty.TY_GENERIC_PARAM &&
+                    ctx.type_binding_count > 0 && ctx.type_binding_names != nil && rnt_ft.name != nil) {
+                    val rnt_gp: str = rnt_ft.name;
+                    var rnt_i: i32 = 0;
+                    for (rnt_i < ctx.type_binding_count) {
+                        if (ctx.type_binding_names[rnt_i] != nil && ctx.type_binding_names[rnt_i].equals(rnt_gp)) {
+                            rnt_ft = ctx.type_binding_types[rnt_i];
+                        }
+                        rnt_i = rnt_i + 1;
+                    }
+                }
+                ret rnt_ft;
             }
         }
         ret nil;
@@ -3169,7 +3749,7 @@ fun resolve_node_type(ctx: *LowerContext, node: *ast.Node) *ty.Type {
 
     # INDEX: resolve base type, get element type
     if (node.kind == ast.NODE_EXPR_INDEX) {
-        val index_base: *ast.Node = node.get_child(0);
+        val index_base: *ast.Node = node.info.index_expr.base;
         if (index_base == nil) {
             ret nil;
         }
@@ -3188,9 +3768,9 @@ fun resolve_node_type(ctx: *LowerContext, node: *ast.Node) *ty.Type {
 
     # CAST: resolve target type
     if (node.kind == ast.NODE_EXPR_CAST) {
-        val cast_children: *ast.List = node.children::*ast.List;
-        if (cast_children != nil && cast_children.count >= 2) {
-            ret resolve_node_type(ctx, cast_children.nodes[1]);
+        val cast_type_node: *ast.Node = node.info.cast_expr.type_node;
+        if (cast_type_node != nil) {
+            ret resolve_type_annotation(ctx, cast_type_node);
         }
         ret nil;
     }
@@ -3208,8 +3788,8 @@ fun lower_field_access(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val base: *ast.Node = node.get_child(0);
-    val field_name: str = node.get_name();
+    val base: *ast.Node = node.info.field_expr.object;
+    val field_name: str = node.info.field_expr.field;
 
     if (base == nil || field_name == nil) {
         ret make_none();
@@ -3219,23 +3799,30 @@ fun lower_field_access(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
     var base_ty: *ty.Type = base.ty;
 
     # check if base is a local variable that may have nil type due to sema issues
-    # if so, look up the type from the local variable table
+    # or wrong type due to shared AST in generic instantiation.
+    # Prefer local_vars resolved type when type bindings exist.
     var base_is_local: bool = false;
-    if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
-        val base_name: str = base.get_name();
+    if ((base_ty == nil || ctx.type_binding_count > 0) && base.kind == ast.NODE_EXPR_IDENT) {
+        val base_name: str = base.info.ident_expr.name;
         if (base_name != nil) {
             val local_idx: i32 = find_local_var(ctx, base_name);
             if (local_idx >= 0) {
-                # found a local variable - use its type
-                base_ty = ctx.local_vars[local_idx].ty;
+                # found a local variable - use its resolved type
+                val resolved_bt: *ty.Type = ctx.local_vars[local_idx].ty;
+                if (resolved_bt != nil) {
+                    base_ty = resolved_bt;
+                }
                 base_is_local = true;
             }
         }
     }
 
     # for non-IDENT bases (FIELD, INDEX, CAST, etc.), recursively resolve the type
-    if (base_ty == nil && base.kind != ast.NODE_EXPR_IDENT) {
-        base_ty = resolve_node_type(ctx, base);
+    if ((base_ty == nil || ctx.type_binding_count > 0) && base.kind != ast.NODE_EXPR_IDENT) {
+        val resolved_nidt: *ty.Type = resolve_node_type(ctx, base);
+        if (resolved_nidt != nil) {
+            base_ty = resolved_nidt;
+        }
     }
 
     if (base_ty == nil) {
@@ -3254,7 +3841,7 @@ fun lower_field_access(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         # for module alias access, look up in the specific aliased module first
         var fa_found: bool = false;
         if (base.kind == ast.NODE_EXPR_IDENT && ctx.current_sema_mod != nil) {
-            val alias_name: str = base.get_name();
+            val alias_name: str = base.info.ident_expr.name;
             if (alias_name != nil) {
                 var fa_ma: *sema.ModuleAlias = ctx.current_sema_mod.aliases;
                 for (fa_ma != nil) {
@@ -3464,8 +4051,8 @@ fun lower_index(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val base: *ast.Node = node.get_child(0);
-    val index: *ast.Node = node.get_child(1);
+    val base: *ast.Node = node.info.index_expr.base;
+    val index: *ast.Node = node.info.index_expr.index;
 
     if (base == nil || index == nil) {
         ret make_none();
@@ -3492,7 +4079,7 @@ fun lower_index(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # fall back to local_vars type table if node type is nil
     if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
-        val idx_base_name: str = base.get_name();
+        val idx_base_name: str = base.info.ident_expr.name;
         if (idx_base_name != nil) {
             val idx_local: i32 = find_local_var(ctx, idx_base_name);
             if (idx_local >= 0) {
@@ -3511,23 +4098,48 @@ fun lower_index(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # calculate element address: base + index * elem_size
     var elem_size: usize = ctx.ptr_size;
+    var elem_type: *ty.Type = nil;
     if (base_ty != nil) {
         if (base_ty.kind == ty.TY_ARRAY && base_ty.inner != nil) {
+            elem_type = base_ty.inner;
             elem_size = base_ty.inner.size;
         } or (base_ty.kind == ty.TY_POINTER && base_ty.inner != nil) {
+            elem_type = base_ty.inner;
             elem_size = base_ty.inner.size;
         } or (base_ty.kind == ty.TY_STR) {
             elem_size = 1;  # str is &u8, element size is 1
         }
     }
 
+    # check if element type is aggregate (record/union/array) — return address, not value
+    val elem_is_aggregate: bool = elem_type != nil &&
+        (elem_type.kind == ty.TY_RECORD || elem_type.kind == ty.TY_UNION ||
+         elem_type.kind == ty.TY_ARRAY);
+
     if (index_value.kind == ir.VAL_IMM) {
-        val offset: i64 = index_value.imm * elem_size::i64;
-        var addr: ir.IRValue = base_value;
-        addr.kind = ir.VAL_MEM;
-        addr.offset = addr.offset + offset;
-        addr.size = elem_size;
+        val idx_offset: i64 = index_value.imm * elem_size::i64;
+        var addr: ir.IRValue;
+        if (base_value.kind == ir.VAL_MEM) {
+            addr = ir.make_mem(base_value.base_reg, base_value.index_reg,
+                               base_value.scale, base_value.offset + idx_offset, elem_size);
+        } or {
+            # VAL_REG: register contains pointer/address
+            addr = ir.make_mem(base_value.reg, -1, 1, idx_offset, elem_size);
+        }
+        if (elem_is_aggregate) {
+            ret addr;
+        }
         ret emit_load(ctx, addr, elem_size);
+    }
+
+    # ensure base_value is in a register (LEA for VAL_MEM arrays)
+    val idx_needs_lea: bool = base_value.kind == ir.VAL_MEM;
+    var idx_lea_reg: i32 = 0;
+    if (idx_needs_lea) {
+        idx_lea_reg = new_vreg(ctx, ctx.ptr_size);
+        val idx_lea_dst: ir.IRValue = ir.make_reg(idx_lea_reg, ctx.ptr_size);
+        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                      idx_lea_dst, base_value, ir.make_none(), ir.CC_NONE);
     }
 
     val elem_size_value: ir.IRValue = ir.make_imm(elem_size::i64, ctx.ptr_size);
@@ -3537,9 +4149,19 @@ fun lower_index(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
     val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-    emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, base_value, offset, ctx.ptr_size);
+    if (idx_needs_lea) {
+        val idx_lea_src: ir.IRValue = ir.make_reg(idx_lea_reg, ctx.ptr_size);
+        emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, idx_lea_src, offset, ctx.ptr_size);
+    } or {
+        emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, base_value, offset, ctx.ptr_size);
+    }
 
-    # load element
+    # aggregate elements: return memory operand (address) for further field access
+    if (elem_is_aggregate) {
+        ret ir.make_mem(addr_reg, -1, 1, 0, elem_size);
+    }
+
+    # scalar elements: load value
     ret emit_load(ctx, addr, elem_size);
 }
 
@@ -3553,7 +4175,7 @@ fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val op_node: *ast.Node = node.get_child(0);
+    val op_node: *ast.Node = node.info.cast_expr.expr;
     if (op_node == nil) {
         ret make_none();
     }
@@ -3563,7 +4185,7 @@ fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # resolve source type from local vars if not set on the node
     if (src_ty == nil && op_node.kind == ast.NODE_EXPR_IDENT) {
-        val src_name: str = op_node.get_name();
+        val src_name: str = op_node.info.ident_expr.name;
         if (src_name != nil) {
             val src_idx: i32 = find_local_var(ctx, src_name);
             if (src_idx >= 0) {
@@ -3623,7 +4245,7 @@ fun lower_addr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret ir.make_imm(0, ctx.ptr_size);
     }
 
-    val operand: *ast.Node = node.get_child(0);
+    val operand: *ast.Node = node.info.unary_expr.expr;
     if (operand == nil) {
         ret ir.make_imm(0, ctx.ptr_size);
     }
@@ -3654,7 +4276,7 @@ fun lower_deref(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val op_node: *ast.Node = node.get_child(0);
+    val op_node: *ast.Node = node.info.unary_expr.expr;
     if (op_node == nil) {
         ret make_none();
     }
@@ -3688,7 +4310,7 @@ fun lower_try(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    val operand: *ast.Node = node.get_child(0);
+    val operand: *ast.Node = node.info.unary_expr.expr;
     if (operand == nil) {
         ret make_none();
     }
@@ -3712,8 +4334,8 @@ fun lower_array_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret ir.make_imm(0, ctx.ptr_size);
     }
 
-    # elements are stored in children (parser stores elements list there)
-    val elements: *ast.List = node.children::*ast.List;
+    # elements are stored in array_lit.elements
+    val elements: *ast.List = node.info.array_lit.elements;
     if (elements == nil) {
         ret ir.make_imm(0, ctx.ptr_size);
     }
@@ -3773,12 +4395,12 @@ fun lower_struct_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         ret make_none();
     }
 
-    # get struct type - try node.ty first, fall back to type annotation in node.extra
+    # get struct type - try node.ty first, fall back to type annotation in struct_lit.type_node
     var struct_ty: *ty.Type = node.ty;
     if (struct_ty == nil) {
-        val slit_type_node: *ast.Node = node.extra::*ast.Node;
+        val slit_type_node: *ast.Node = node.info.struct_lit.type_node;
         if (slit_type_node != nil) {
-            val type_name: str = slit_type_node.get_name();
+            val type_name: str = slit_type_node.info.type_name.path;
             if (type_name != nil) {
                 # look up in current module symbols
                 var type_sym: *symbol.Symbol = nil;
@@ -3819,8 +4441,8 @@ fun lower_struct_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     val base_offset: i32 = ctx.stack_offset;
 
-    # get field initializers from children (as *ast.List)
-    val fields: *ast.List = node.children::*ast.List;
+    # get field initializers from struct_lit.fields
+    val fields: *ast.List = node.info.struct_lit.fields;
     if (fields != nil && fields.count > 0) {
         var i: i32 = 0;
         for (i < fields.count) {
@@ -3830,9 +4452,9 @@ fun lower_struct_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
                 cnt;
             }
 
-            # field name from data, init expr from children
-            val field_name: str = field_node.get_name();
-            val init_expr: *ast.Node = field_node.get_child(0);
+            # field name from field_decl.name, init expr from field_decl.type_node
+            val field_name: str = field_node.info.field_decl.name;
+            val init_expr: *ast.Node = field_node.info.field_decl.type_node;
 
             if (field_name == nil || init_expr == nil) {
                 i = i + 1;
@@ -3944,7 +4566,7 @@ fun lower_struct_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # return frame memory reference for the struct
     var ret_size: usize = struct_ty.size;
-    if (ret_size == 0 || ret_size > ctx.ptr_size) {
+    if (ret_size == 0) {
         ret_size = ctx.ptr_size;
     }
     ret frame_mem(ctx, base_offset, ret_size);
@@ -3962,7 +4584,7 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # identifier - local or global variable
     if (node.kind == ast.NODE_EXPR_IDENT) {
-        val name: str = node.get_name();
+        val name: str = node.info.ident_expr.name;
         if (name == nil) {
             ret ir.make_imm(0, ctx.ptr_size);
         }
@@ -4012,32 +4634,34 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # field access - base address + field offset
     if (node.kind == ast.NODE_EXPR_FIELD) {
-        val base: *ast.Node = node.get_child(0);
-        val field_name: str = node.get_name();
+        val base: *ast.Node = node.info.field_expr.object;
+        val field_name: str = node.info.field_expr.field;
 
         if (base == nil || field_name == nil) {
             ret ir.make_imm(0, ctx.ptr_size);
         }
 
-        val base_addr: ir.IRValue = lower_lvalue(ctx, base);
-
-        # look up field offset and size from type
+        # resolve type and field info FIRST (before deciding lvalue vs expr)
         var field_offset: usize = 0;
         var field_size: usize = ctx.ptr_size;
-        # try base.ty first, fall back to local_vars type table
         var base_ty: *ty.Type = base.ty;
-        if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
-            val base_name: str = base.get_name();
+        if ((base_ty == nil || ctx.type_binding_count > 0) && base.kind == ast.NODE_EXPR_IDENT) {
+            val base_name: str = base.info.ident_expr.name;
             if (base_name != nil) {
                 val local_idx: i32 = find_local_var(ctx, base_name);
                 if (local_idx >= 0) {
-                    base_ty = ctx.local_vars[local_idx].ty;
+                    val resolved_bt: *ty.Type = ctx.local_vars[local_idx].ty;
+                    if (resolved_bt != nil) {
+                        base_ty = resolved_bt;
+                    }
                 }
             }
         }
-        # for non-IDENT bases (FIELD, INDEX, etc.), recursively resolve
-        if (base_ty == nil && base.kind != ast.NODE_EXPR_IDENT) {
-            base_ty = resolve_node_type(ctx, base);
+        if ((base_ty == nil || ctx.type_binding_count > 0) && base.kind != ast.NODE_EXPR_IDENT) {
+            val resolved_bt2: *ty.Type = resolve_node_type(ctx, base);
+            if (resolved_bt2 != nil) {
+                base_ty = resolved_bt2;
+            }
         }
         var is_pointer: bool = false;
         if (base_ty != nil) {
@@ -4050,11 +4674,41 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
             if (field_opt.is_some()) {
                 val field: *ty.Field = field_opt.unwrap();
                 field_offset = field.offset;
-                if (field.ty != nil) {
-                    field_size = field.ty.size;
+                var lv_eff_ft: *ty.Type = field.ty;
+                if (lv_eff_ft != nil && lv_eff_ft.kind == ty.TY_GENERIC_PARAM &&
+                    ctx.type_binding_count > 0 && ctx.type_binding_names != nil && lv_eff_ft.name != nil) {
+                    val lv_gp_name: str = lv_eff_ft.name;
+                    var lv_tbi: i32 = 0;
+                    for (lv_tbi < ctx.type_binding_count) {
+                        if (ctx.type_binding_names[lv_tbi] != nil && ctx.type_binding_names[lv_tbi].equals(lv_gp_name)) {
+                            lv_eff_ft = ctx.type_binding_types[lv_tbi];
+                        }
+                        lv_tbi = lv_tbi + 1;
+                    }
+                }
+                if (lv_eff_ft != nil && lv_eff_ft.size > 0) {
+                    field_size = lv_eff_ft.size;
                 }
             }
         }
+
+        # for non-lvalue base expressions (CALL, CAST) returning pointer types,
+        # use lower_expr to get the pointer value directly — lower_lvalue would
+        # return imm(0) since CALL nodes don't have addressable storage
+        if (base.kind == ast.NODE_EXPR_CALL && is_pointer) {
+            val base_val: ir.IRValue = lower_expr(ctx, base);
+            if (base_val.kind == ir.VAL_REG) {
+                ret ir.make_mem(base_val.reg, -1, 1, field_offset::i64, field_size);
+            }
+            if (base_val.kind == ir.VAL_MEM) {
+                val lv_ptr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+                val lv_ptr_val: ir.IRValue = ir.make_reg(lv_ptr_reg, ctx.ptr_size);
+                emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, lv_ptr_val, base_val, ir.make_none(), 0);
+                ret ir.make_mem(lv_ptr_reg, -1, 1, field_offset::i64, field_size);
+            }
+        }
+
+        val base_addr: ir.IRValue = lower_lvalue(ctx, base);
 
         # handle pointer field access - need to load pointer value first
         if (is_pointer) {
@@ -4069,18 +4723,7 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
             load_instr.cond = ir.CC_NONE;
             emit_instr(ctx, load_instr.op, load_instr.dst, load_instr.src1, load_instr.src2, 0);
 
-            # return memory operand: [ptr_reg + field_offset]
-            var result: ir.IRValue;
-            result.kind = ir.VAL_MEM;
-            result.reg = 0;
-            result.imm = 0;
-            result.offset = field_offset::i64;
-            result.base_reg = ptr_reg;
-            result.index_reg = -1;
-            result.scale = 1;
-            result.label = nil;
-            result.size = field_size;
-            ret result;
+            ret ir.make_mem(ptr_reg, -1, 1, field_offset::i64, field_size);
         }
 
         # for non-pointer: check if base_addr is a memory operand (local struct)
@@ -4094,18 +4737,7 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
         # for register or label operands, use LEA to compute address
         if (base_addr.kind == ir.VAL_REG) {
-            # base is in a register, return memory operand with offset
-            var result: ir.IRValue;
-            result.kind = ir.VAL_MEM;
-            result.reg = 0;
-            result.imm = 0;
-            result.offset = field_offset::i64;
-            result.base_reg = base_addr.reg;
-            result.index_reg = -1;
-            result.scale = 1;
-            result.label = nil;
-            result.size = field_size;
-            ret result;
+            ret ir.make_mem(base_addr.reg, -1, 1, field_offset::i64, field_size);
         }
 
         # fallback: use LEA for other cases (e.g., globals)
@@ -4119,8 +4751,8 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # array index - base + index * elem_size
     if (node.kind == ast.NODE_EXPR_INDEX) {
-        val base: *ast.Node = node.get_child(0);
-        val index: *ast.Node = node.get_child(1);
+        val base: *ast.Node = node.info.index_expr.base;
+        val index: *ast.Node = node.info.index_expr.index;
 
         if (base == nil || index == nil) {
             ret ir.make_imm(0, ctx.ptr_size);
@@ -4134,7 +4766,7 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         var base_ty: *ty.Type = base.ty;
         # fall back to local_vars type table if node type is nil
         if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
-            val lv_idx_name: str = base.get_name();
+            val lv_idx_name: str = base.info.ident_expr.name;
             if (lv_idx_name != nil) {
                 val lv_idx_local: i32 = find_local_var(ctx, lv_idx_name);
                 if (lv_idx_local >= 0) {
@@ -4152,7 +4784,19 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
             }
         }
         # for pointer/str types, load the pointer value from the address
-        val base_addr: ir.IRValue = load_ptr_if_needed(ctx, raw_base_addr, base_ty);
+        val lv_ptr_base: ir.IRValue = load_ptr_if_needed(ctx, raw_base_addr, base_ty);
+
+        # for array types (VAL_MEM), LEA the address into a register
+        # so that select_add can operate on it
+        val lv_needs_lea: bool = lv_ptr_base.kind == ir.VAL_MEM;
+        var lv_lea_reg: i32 = 0;
+        if (lv_needs_lea) {
+            lv_lea_reg = new_vreg(ctx, ctx.ptr_size);
+            val lv_lea_dst: ir.IRValue = ir.make_reg(lv_lea_reg, ctx.ptr_size);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                          lv_lea_dst, lv_ptr_base, ir.make_none(), ir.CC_NONE);
+        }
+
         val elem_size_value: ir.IRValue = ir.make_imm(elem_size::i64, ctx.ptr_size);
 
         # multiply index by element size
@@ -4163,14 +4807,19 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
         # add to base
         val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
         val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-        emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, base_addr, offset, ctx.ptr_size);
+        if (lv_needs_lea) {
+            val lv_lea_src: ir.IRValue = ir.make_reg(lv_lea_reg, ctx.ptr_size);
+            emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, lv_lea_src, offset, ctx.ptr_size);
+        } or {
+            emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, lv_ptr_base, offset, ctx.ptr_size);
+        }
 
         ret addr;
     }
 
     # dereference - just return the pointer value
     if (node.kind == ast.NODE_EXPR_DEREF) {
-        val operand: *ast.Node = node.get_child(0);
+        val operand: *ast.Node = node.info.unary_expr.expr;
         if (operand == nil) {
             ret ir.make_imm(0, ctx.ptr_size);
         }
@@ -4179,7 +4828,7 @@ fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
 
     # parenthesized expression: unwrap and lower inner lvalue
     if (node.kind == ast.NODE_EXPR_PAREN) {
-        val inner: *ast.Node = node.get_child(0);
+        val inner: *ast.Node = node.info.wrapper.inner;
         if (inner != nil) {
             ret lower_lvalue(ctx, inner);
         }
@@ -4201,24 +4850,33 @@ pub fun lower_stmt(ctx: *LowerContext, node: *ast.Node) {
         ret;
     }
 
+    # record pre-emission instruction count for debug annotation
+    var pre_count: i32 = 0;
+    if (ctx.current_block != nil) {
+        pre_count = ctx.current_block.instr_count;
+    }
+
+    lower_stmt_inner(ctx, node);
+
+    # annotate first new instruction with source location
+    if (ctx.current_block != nil && ctx.current_block.instr_count > pre_count) {
+        annotate_instr(ctx, ctx.current_block, pre_count, node);
+    }
+}
+
+fun lower_stmt_inner(ctx: *LowerContext, node: *ast.Node) {
     # variable declaration
     if (node.kind == ast.NODE_DECL_VAR || node.kind == ast.NODE_DECL_VAL) {
         lower_var_decl(ctx, node);
         ret;
     }
 
-    # expression statement
+    # expression statement (includes assignments: binary expr with op == '=')
     if (node.kind == ast.NODE_STMT_EXPR) {
-        val expr: *ast.Node = node.get_child(0);
+        val expr: *ast.Node = node.info.wrapper.inner;
         if (expr != nil) {
             lower_expr(ctx, expr);
         }
-        ret;
-    }
-
-    # assignment
-    if (node.kind == ast.NODE_STMT_EXPR) {
-        lower_assign(ctx, node);
         ret;
     }
 
@@ -4231,6 +4889,23 @@ pub fun lower_stmt(ctx: *LowerContext, node: *ast.Node) {
     # if statement
     if (node.kind == ast.NODE_STMT_IF) {
         lower_if(ctx, node);
+        ret;
+    }
+
+    # or block (else clause of if/or chain)
+    if (node.kind == ast.NODE_STMT_OR) {
+        val or_cond: *ast.Node = node.info.cond_stmt.cond;
+        val or_body: *ast.Node = node.info.cond_stmt.body;
+
+        if (or_cond != nil) {
+            # conditional or: or (cond) { ... } — treat as if
+            lower_if(ctx, node);
+        } or {
+            # unconditional or: or { ... } — just lower the body
+            if (or_body != nil) {
+                lower_stmt(ctx, or_body);
+            }
+        }
         ret;
     }
 
@@ -4268,7 +4943,7 @@ pub fun lower_stmt(ctx: *LowerContext, node: *ast.Node) {
 
     # defer statement
     if (node.kind == ast.NODE_STMT_FIN) {
-        val stmt: *ast.Node = node.get_child(0);
+        val stmt: *ast.Node = node.info.wrapper.inner;
         defer_statement(ctx, stmt);
         ret;
     }
@@ -4296,18 +4971,34 @@ fun lower_var_decl(ctx: *LowerContext, node: *ast.Node) {
         ret;
     }
 
-    val name: str = node.get_name();
+    val name: str = node.info.var_decl.name;
     if (name == nil) {
         ret;
     }
 
     # get type - try node.ty first, fall back to type annotation resolution
     var var_ty: *ty.Type = node.ty;
+    # when type bindings exist (generic instantiation), resolve via annotation
+    # to get the concrete type (e.g., Result[T, E] -> Result[stat_t, str])
+    if (ctx.type_binding_count > 0) {
+        val type_ann_g: *ast.Node = node.info.var_decl.type_node;
+        if (type_ann_g != nil) {
+            val resolved_vt: *ty.Type = resolve_type_annotation(ctx, type_ann_g);
+            if (resolved_vt != nil) {
+                # only override if the resolved type has a larger or equal size
+                # (avoids replacing a correct instantiated type from node.ty
+                #  with a smaller generic type from symbol lookup)
+                if (var_ty == nil || resolved_vt.size >= var_ty.size) {
+                    var_ty = resolved_vt;
+                }
+            }
+        }
+    }
     if (var_ty == nil) {
         # try to resolve type from type annotation (stored in extra)
-        val type_ann: *ast.Node = node.extra::*ast.Node;
+        val type_ann: *ast.Node = node.info.var_decl.type_node;
         if (type_ann != nil && type_ann.kind == ast.NODE_TYPE_NAME) {
-            val type_name: str = type_ann.get_name();
+            val type_name: str = type_ann.info.type_name.path;
             if (type_name != nil) {
                 var type_sym: *symbol.Symbol = nil;
                 if (ctx.symbols != nil) {
@@ -4332,8 +5023,8 @@ fun lower_var_decl(ctx: *LowerContext, node: *ast.Node) {
         size = var_ty.size;
     }
 
-    # get initializer (stored in children, not extra - extra is the type annotation)
-    val init_node: *ast.Node = node.children;
+    # get initializer from var_decl.init
+    val init_node: *ast.Node = node.info.var_decl.init;
 
     # allocate stack space
     val offset: i32 = add_local_var(ctx, name, size, var_ty);
@@ -4355,8 +5046,8 @@ fun lower_assign(ctx: *LowerContext, node: *ast.Node) {
         ret;
     }
 
-    val lhs: *ast.Node = node.get_child(0);
-    val rhs: *ast.Node = node.get_child(1);
+    val lhs: *ast.Node = node.info.binary_expr.left;
+    val rhs: *ast.Node = node.info.binary_expr.right;
 
     if (lhs == nil || rhs == nil) {
         ret;
@@ -4368,13 +5059,76 @@ fun lower_assign(ctx: *LowerContext, node: *ast.Node) {
     # lower right-hand side
     val value: ir.IRValue = lower_expr(ctx, rhs);
 
-    # determine size
-    var size: usize = ctx.ptr_size;
-    if (lhs.ty != nil) {
-        size = lhs.ty.size;
+    # aggregate assignment: when RHS is a large local variable, lower_identifier
+    # returns a register with the address (via LEA). Detect this and do a
+    # chunked copy using the local variable's known size.
+    var agg_size: usize = 0;
+    if (value.kind == ir.VAL_REG && rhs.kind == ast.NODE_EXPR_IDENT) {
+        val rhs_name: str = rhs.info.ident_expr.name;
+        if (rhs_name != nil) {
+            val rhs_idx: i32 = find_local_var(ctx, rhs_name);
+            if (rhs_idx >= 0) {
+                val rhs_local_size: usize = ctx.local_vars[rhs_idx].size;
+                if (rhs_local_size > ctx.ptr_size) {
+                    agg_size = rhs_local_size;
+                }
+            }
+        }
+    }
+    if (agg_size > ctx.ptr_size) {
+        # destination: LEA from addr (which is a memory operand)
+        val dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+        val dst_ptr: ir.IRValue = ir.make_reg(dst_reg, ctx.ptr_size);
+        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                      dst_ptr, addr, ir.make_none(), ir.CC_NONE);
+
+        # source: value register already contains the address of the aggregate
+        val src_reg: i32 = value.reg;
+
+        # chunked copy in 8-byte increments
+        val total: i32 = agg_size::i32;
+        var off: i32 = 0;
+        for (off < total) {
+            var chunk: usize = 8;
+            if ((total - off)::usize < 8) {
+                chunk = (total - off)::usize;
+            }
+            val tmp_reg: i32 = new_vreg(ctx, chunk);
+            val tmp: ir.IRValue = ir.make_reg(tmp_reg, chunk);
+
+            var s_mem: ir.IRValue;
+            s_mem.kind = ir.VAL_MEM;
+            s_mem.base_reg = src_reg;
+            s_mem.offset = off::i64;
+            s_mem.size = chunk;
+            s_mem.reg = 0;
+            s_mem.imm = 0;
+            s_mem.index_reg = -1;
+            s_mem.scale = 1;
+            s_mem.label = nil;
+
+            var d_mem: ir.IRValue;
+            d_mem.kind = ir.VAL_MEM;
+            d_mem.base_reg = dst_reg;
+            d_mem.offset = off::i64;
+            d_mem.size = chunk;
+            d_mem.reg = 0;
+            d_mem.imm = 0;
+            d_mem.index_reg = -1;
+            d_mem.scale = 1;
+            d_mem.label = nil;
+
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                          tmp, s_mem, ir.make_none(), ir.CC_NONE);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                          d_mem, tmp, ir.make_none(), ir.CC_NONE);
+
+            off = off + chunk::i32;
+        }
+        ret;
     }
 
-    # emit store
+    # scalar or mem-to-mem store
     emit_store(ctx, addr, value);
 }
 
@@ -4392,7 +5146,7 @@ fun lower_return(ctx: *LowerContext, node: *ast.Node) {
     emit_deferred_from(ctx, 0);
 
     # lower return value if present
-    val expr: *ast.Node = node.get_child(0);
+    val expr: *ast.Node = node.info.wrapper.inner;
     var ret_value: ir.IRValue = make_none();
     if (expr != nil) {
         ret_value = lower_expr(ctx, expr);
@@ -4558,9 +5312,9 @@ fun lower_if(ctx: *LowerContext, node: *ast.Node) {
         ret;
     }
 
-    val cond: *ast.Node = node.get_child(0);
-    val then_stmt: *ast.Node = node.get_child(1);
-    val else_stmt: *ast.Node = node.extra::*ast.Node;
+    val cond: *ast.Node = node.info.cond_stmt.cond;
+    val then_stmt: *ast.Node = node.info.cond_stmt.body;
+    val else_stmt: *ast.Node = node.info.cond_stmt.or_branch;
 
     if (cond == nil) {
         ret;
@@ -4570,9 +5324,9 @@ fun lower_if(ctx: *LowerContext, node: *ast.Node) {
     val cond_value: ir.IRValue = lower_expr(ctx, cond);
 
     # create labels
-    val then_label: str = new_label(ctx, "then");
-    val else_label: str = new_label(ctx, "else");
-    val end_label: str = new_label(ctx, "endif");
+    val then_label: str = new_label(ctx, ".Lif_then");
+    val else_label: str = new_label(ctx, ".Lif_or");
+    val end_label: str = new_label(ctx, ".Lif_end");
 
     # emit conditional branch
     # compare condition with 0
@@ -4613,8 +5367,8 @@ fun lower_loop(ctx: *LowerContext, node: *ast.Node) {
     }
 
     # create labels
-    val start_label: str = new_label(ctx, "loop");
-    val end_label: str = new_label(ctx, "endloop");
+    val start_label: str = new_label(ctx, ".Lfor_start");
+    val end_label: str = new_label(ctx, ".Lfor_end");
 
     # save previous loop labels
     val prev_start: str = ctx.loop_start_label;
@@ -4627,24 +5381,11 @@ fun lower_loop(ctx: *LowerContext, node: *ast.Node) {
     # mark defer stack for this loop
     push_loop_defer_mark(ctx);
 
-    # for loop: emit init, then condition check
-    if (node.kind == ast.NODE_STMT_FOR) {
-        # node.data contains the for loop components
-        val for_data: *ast.Node = node.data::*ast.Node;
-        if (for_data != nil) {
-            # for_data.get_child(0) is the init statement
-            val init_stmt: *ast.Node = for_data.get_child(0);
-            if (init_stmt != nil) {
-                lower_stmt(ctx, init_stmt);
-            }
-        }
-    }
-
     # loop start
     emit_label(ctx, start_label);
 
     # condition check (if present)
-    val cond: *ast.Node = node.get_child(0);
+    val cond: *ast.Node = node.info.for_stmt.cond;
     if (cond != nil) {
         val cond_value: ir.IRValue = lower_expr(ctx, cond);
         val zero: ir.IRValue = ir.make_imm(0, 8);
@@ -4653,25 +5394,9 @@ fun lower_loop(ctx: *LowerContext, node: *ast.Node) {
     }
 
     # loop body
-    val body: *ast.Node = node.get_child(1);
+    val body: *ast.Node = node.info.for_stmt.body;
     if (body != nil) {
         lower_stmt(ctx, body);
-    }
-
-    # for loop: emit increment
-    if (node.kind == ast.NODE_STMT_FOR) {
-        val for_data: *ast.Node = node.data::*ast.Node;
-        if (for_data != nil) {
-            # for_data.get_child(1) contains the condition and increment
-            val cond_incr: *ast.Node = for_data.get_child(1);
-            if (cond_incr != nil) {
-                # cond_incr.get_child(1) is the increment expression
-                val incr: *ast.Node = cond_incr.get_child(1);
-                if (incr != nil) {
-                    lower_expr(ctx, incr);
-                }
-            }
-        }
     }
 
     # branch back to start
@@ -4699,8 +5424,7 @@ fun lower_block(ctx: *LowerContext, node: *ast.Node) {
         ret;
     }
 
-    # note: parse_block stores stmts in node.data, not node.extra
-    val stmts: *ast.List = node.data::*ast.List;
+    val stmts: *ast.List = node.info.block_stmt.stmts;
     if (stmts == nil) {
         ret;
     }
@@ -4723,8 +5447,8 @@ pub fun lower_inline_asm(ctx: *LowerContext, node: *ast.Node) {
         ret;
     }
 
-    # get asm content from node.data
-    val content: str = node.data::str;
+    # get asm content from masm_stmt.content
+    val content: str = node.info.masm_stmt.content;
     if (content == nil) {
         ret;
     }
@@ -4947,8 +5671,8 @@ pub fun lower_inline_asm(ctx: *LowerContext, node: *ast.Node) {
                 val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, label_name);
                 if (sym_res.is_ok()) {
                     val s: *sym.Symbol = sym_res.unwrap_ok();
-                    sym.set_binding(s, sym.bind_global());
-                    sym.set_type(s, sym.sym_func());
+                    sym.set_binding(s, sym.bind_local());
+                    sym.set_type(s, sym.sym_none());
                     sym.define(s, text_sec, text_sec.size, 0);
                     masm.add_symbol(ctx.m, s);
                 }
@@ -4983,15 +5707,15 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     # reset per-function state
     reset_function_state(ctx);
 
-    val name: str = node.get_name();
+    val name: str = node.info.fun_decl.name;
     if (name == nil) {
         ret err[*ir.IRFunction, str]("function has no name");
     }
 
     # for methods, build qualified name "ReceiverType.methodName" to look up symbol
     var symbol_key: str = name;
-    if (node.receiver != nil) {
-        val recv_type_name: str = get_receiver_type_name(node.receiver);
+    if (node.info.fun_decl.receiver != nil) {
+        val recv_type_name: str = get_receiver_type_name(node.info.fun_decl.receiver);
         if (recv_type_name != nil) {
             # build "ReceiverType.methodName"
             val recv_len: usize = recv_type_name.len();
@@ -5025,19 +5749,19 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     # skip generic functions/methods in regular lowering pass (they get lowered
     # per-instantiation in a separate pass with type bindings)
     if (ctx.func_name_override == nil) {
-        # skip generic free functions (have node.generics)
-        if (node.generics != nil) {
+        # skip generic free functions (have fun_decl.generics)
+        if (node.info.fun_decl.generics != nil) {
             ret err[*ir.IRFunction, str]("skipped generic function");
         }
 
         # skip generic methods (receiver has generic type args)
-        if (node.receiver != nil) {
-            var skip_recv_type: *ast.Node = node.receiver.children;
+        if (node.info.fun_decl.receiver != nil) {
+            var skip_recv_type: *ast.Node = node.info.fun_decl.receiver.info.field_decl.type_node;
             for (skip_recv_type != nil && (skip_recv_type.kind == ast.NODE_TYPE_PTR || skip_recv_type.kind == ast.NODE_TYPE_REF)) {
-                skip_recv_type = skip_recv_type.get_child(0);
+                skip_recv_type = skip_recv_type.info.type_ptr.inner;
             }
             if (skip_recv_type != nil && skip_recv_type.kind == ast.NODE_TYPE_NAME) {
-                val skip_generic_args: *ast.Node = skip_recv_type.children;
+                val skip_generic_args: *ast.Node = skip_recv_type.info.type_name.args;
                 if (skip_generic_args != nil && skip_generic_args.kind == ast.NODE_GENERIC) {
                     ret err[*ir.IRFunction, str]("skipped generic method");
                 }
@@ -5102,7 +5826,7 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     ctx.current_fn = func;
 
     # create entry block
-    val entry_label: str = new_label(ctx, "entry");
+    val entry_label: str = new_label(ctx, ".Lentry");
     val block_res: Result[*ir.IRBlock, str] = ir.create_block(ctx.alloc, entry_label);
     if (block_res.is_err()) {
         ret err[*ir.IRFunction, str](block_res.unwrap_err());
@@ -5129,7 +5853,15 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
             val s: *sym.Symbol = sym_res.unwrap_ok();
             s.binding.tag = sym.BIND_GLOBAL;
             s.sym_type.tag = sym.SYM_FUNC;
-            
+
+            # set source location for DWARF debug info
+            if (ctx.text != nil && node.tok.pos > 0) {
+                s.src_line = line_for_pos(ctx.text, node.tok.pos);
+            }
+            if (ctx.current_sema_mod != nil && ctx.current_sema_mod.file_path != nil) {
+                s.src_file = ctx.current_sema_mod.file_path;
+            }
+
             # for entry point functions, define symbol now at current .text offset
             # because their code is emitted directly via inline asm, not through isel
             if (is_entry) {
@@ -5181,14 +5913,13 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     }
 
     # lower parameters - get param list from AST
-    # params are stored in node.extra (not node.data) by the parser
-    val params: *ast.List = node.extra::*ast.List;
+    val params: *ast.List = node.info.fun_decl.params;
 
     # handle method receiver first - it's passed as the first argument (rdi)
-    # but stored separately in node.receiver, not in the params list
-    val receiver: *ast.Node = node.receiver;
+    # but stored separately in fun_decl.receiver, not in the params list
+    val receiver: *ast.Node = node.info.fun_decl.receiver;
     if (!is_entry && receiver != nil) {
-        val recv_name: str = receiver.get_name();
+        val recv_name: str = receiver.info.field_decl.name;
         var recv_type: *ty.Type = nil;
 
         # use receiver type override if set (for generic instantiation lowering)
@@ -5198,7 +5929,7 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
             recv_type = receiver.ty;
             # if sema didn't set the type, resolve from the type annotation
             if (recv_type == nil) {
-                val recv_ann_inner: *ast.Node = receiver.children;
+                val recv_ann_inner: *ast.Node = receiver.info.field_decl.type_node;
                 if (recv_ann_inner != nil) {
                     recv_type = resolve_type_annotation(ctx, recv_ann_inner);
                 }
@@ -5208,7 +5939,7 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
         var recv_size: usize = ctx.ptr_size;
         # check if receiver type annotation is a pointer or reference
         # the AST node for the receiver's type annotation tells us if it's &T or *T
-        val recv_ann: *ast.Node = receiver.children;
+        val recv_ann: *ast.Node = receiver.info.field_decl.type_node;
         val recv_is_ptr: bool = recv_ann != nil &&
             (recv_ann.kind == ast.NODE_TYPE_PTR || recv_ann.kind == ast.NODE_TYPE_REF);
 
@@ -5337,12 +6068,15 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
                 cnt;
             }
 
-            val param_name: str = param.get_name();
+            val param_name: str = param.info.field_decl.name;
             var param_type: *ty.Type = param.ty;
-            if (param_type == nil) {
-                val param_ann: *ast.Node = param.children;
+            if (param_type == nil || ctx.type_binding_count > 0) {
+                val param_ann: *ast.Node = param.info.field_decl.type_node;
                 if (param_ann != nil) {
-                    param_type = resolve_type_annotation(ctx, param_ann);
+                    val resolved_pt: *ty.Type = resolve_type_annotation(ctx, param_ann);
+                    if (resolved_pt != nil) {
+                        param_type = resolved_pt;
+                    }
                 }
             }
 
@@ -5523,9 +6257,7 @@ pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunctio
     }
 
     # get function body and lower it
-    # note: for NODE_DECL_FUN, body is stored in node.children with count=1
-    # so get_child(0) returns the body
-    val body: *ast.Node = node.get_child(0);
+    val body: *ast.Node = node.info.fun_decl.body;
     if (body != nil) {
         lower_stmt(ctx, body);
     }
@@ -5591,13 +6323,13 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
         ret;
     }
 
-    val name: str = node.get_name();
+    val name: str = node.info.var_decl.name;
     if (name == nil) {
         ret;
     }
 
-    # get initializer (stored in children, not extra - extra is the type annotation)
-    val init_node: *ast.Node = node.children;
+    # get initializer from var_decl.init
+    val init_node: *ast.Node = node.info.var_decl.init;
 
     # determine section (.data for mutable, .rodata for immutable)
     var sec_kind: section.SectionKind;
@@ -5663,20 +6395,20 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
     var emitted: bool = false;
     if (init_node != nil) {
         if (init_node.kind == ast.NODE_EXPR_LIT_INT) {
-            val int_val: i64 = init_node.get_int_value();
+            val int_val: i64 = parse_int_str(init_node.info.lit_expr.text);
             emit_global_int(ctx, sec, int_val, var_size);
             emitted = true;
         }
         if (!emitted && init_node.kind == ast.NODE_EXPR_UNARY) {
             # handle unary negate: -100, -4, etc.
-            var unary_child: *ast.Node = init_node.children::*ast.Node;
+            var unary_child: *ast.Node = init_node.info.unary_expr.expr;
             if (unary_child != nil && unary_child.kind == ast.NODE_EXPR_LIT_INT && init_node.tok.tag == token.TAG_MINUS) {
-                val pos_val: i64 = unary_child.get_int_value();
+                val pos_val: i64 = parse_int_str(unary_child.info.lit_expr.text);
                 emit_global_int(ctx, sec, -pos_val, var_size);
                 emitted = true;
             }
         } or (init_node.kind == ast.NODE_EXPR_LIT_STR) {
-            val str_val: str = init_node.get_name();
+            val str_val: str = init_node.info.lit_expr.text;
             if (str_val != nil) {
                 val gslen: usize = str_val.len();
                 var gstart: usize = 0;
@@ -5712,8 +6444,8 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
                 emitted = true;
             }
         } or (init_node.kind == ast.NODE_EXPR_LIT_BOOL) {
-            val bool_val: bool = init_node.get_bool_value();
-            if (bool_val) {
+            val bool_text: str = init_node.info.lit_expr.text;
+            if (bool_text != nil && bool_text.equals("true")) {
                 section.emit_byte(ctx.alloc, sec, 1);
             } or {
                 section.emit_byte(ctx.alloc, sec, 0);
@@ -5721,7 +6453,7 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
             emitted = true;
         } or (init_node.kind == ast.NODE_EXPR_LIT_CHAR) {
             # char literal stored as int
-            val char_val: i64 = init_node.get_int_value();
+            val char_val: i64 = parse_int_str(init_node.info.lit_expr.text);
             section.emit_byte(ctx.alloc, sec, char_val::u8);
             emitted = true;
         } or (init_node.kind == ast.NODE_EXPR_LIT_NIL) {
@@ -5730,7 +6462,8 @@ pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
             emitted = true;
         } or (init_node.kind == ast.NODE_EXPR_LIT_FLOAT) {
             # float literal - reinterpret f64 bits as u64
-            var float_val: f64 = init_node.get_float_value();
+            var float_val: f64 = 0.0;
+            # TODO: parse float from init_node.info.lit_expr.text
             val float_ptr: *f64 = ?float_val;
             val bits_ptr: *u64 = float_ptr::*u64;
             section.emit_u64(ctx.alloc, sec, @bits_ptr);
@@ -5778,8 +6511,8 @@ pub fun lower_module(ctx: *LowerContext, module: *ast.Node) i32 {
 
     var count: i32 = 0;
 
-    # get declarations from module (program node stores them in data, not extra)
-    val decls: *ast.List = module.data::*ast.List;
+    # get declarations from module (program node stores them in block_stmt.stmts)
+    val decls: *ast.List = module.info.block_stmt.stmts;
     if (decls == nil) {
         ret count;
     }
@@ -5797,8 +6530,8 @@ pub fun lower_module(ctx: *LowerContext, module: *ast.Node) i32 {
 
         # unwrap pub declarations
         if (node.kind == ast.NODE_DECL_PUB) {
-            if (node.count > 0) {
-                node = node.get_child(0);
+            if (node.info.wrapper.inner != nil) {
+                node = node.info.wrapper.inner;
             } or {
                 i = i + 1;
                 cnt;
@@ -5826,8 +6559,8 @@ pub fun lower_module(ctx: *LowerContext, module: *ast.Node) i32 {
 
         # unwrap pub declarations
         if (node.kind == ast.NODE_DECL_PUB) {
-            if (node.count > 0) {
-                node = node.get_child(0);
+            if (node.info.wrapper.inner != nil) {
+                node = node.info.wrapper.inner;
             } or {
                 i = i + 1;
                 cnt;
@@ -5865,8 +6598,8 @@ fun lower_comptime_if_functions(ctx: *LowerContext, node: *ast.Node) i32 {
         ret 0;
     }
 
-    # get taken branch (stored in extra by sema)
-    val taken: *ast.Node = node.extra::*ast.Node;
+    # get taken branch (stored in cond_stmt.body by sema)
+    val taken: *ast.Node = node.info.cond_stmt.body;
     if (taken == nil) {
         ret 0;
     }
@@ -5875,7 +6608,7 @@ fun lower_comptime_if_functions(ctx: *LowerContext, node: *ast.Node) i32 {
 
     # taken might be a block with multiple declarations
     if (taken.kind == ast.NODE_STMT_BLOCK) {
-        val decls: *ast.List = taken.data::*ast.List;
+        val decls: *ast.List = taken.info.block_stmt.stmts;
         if (decls != nil) {
             var i: i32 = 0;
             for (i < decls.count) {
@@ -5883,8 +6616,8 @@ fun lower_comptime_if_functions(ctx: *LowerContext, node: *ast.Node) i32 {
                 if (decl != nil) {
                     var fn_node: *ast.Node = decl;
                     # unwrap pub wrapper
-                    if (fn_node.kind == ast.NODE_DECL_PUB && fn_node.children != nil) {
-                        fn_node = fn_node.children;
+                    if (fn_node.kind == ast.NODE_DECL_PUB && fn_node.info.wrapper.inner != nil) {
+                        fn_node = fn_node.info.wrapper.inner;
                     }
                     if (fn_node.kind == ast.NODE_DECL_FUN) {
                         val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, fn_node);
@@ -5902,8 +6635,8 @@ fun lower_comptime_if_functions(ctx: *LowerContext, node: *ast.Node) i32 {
     } or {
         # single declaration - unwrap pub wrapper
         var single: *ast.Node = taken;
-        if (single.kind == ast.NODE_DECL_PUB && single.children != nil) {
-            single = single.children;
+        if (single.kind == ast.NODE_DECL_PUB && single.info.wrapper.inner != nil) {
+            single = single.info.wrapper.inner;
         }
         if (single.kind == ast.NODE_DECL_FUN) {
             val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, single);
@@ -6019,97 +6752,207 @@ pub fun lower_entry_point(ctx: *LowerContext, main_name: str) Result[bool, str] 
     ret ok[bool, str](true);
 }
 
-# lower_all_modules: lower main module and all imported modules to MASM.
+# find_module_index: find the output module index for a sema module.
 # ---
-# root:         root AST node of main module
-# symbols:      symbol table
-# types:        type context
-# alloc:        allocator
-# tgt:          target configuration
-# loaded_mods:  array of loaded sema modules
-# mod_count:    number of loaded modules
-# method_insts: linked list of generic method instantiations from sema
-# ret:          Ok(*Masm) on success, Err(str) on failure
-pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.TypeContext,
-    alloc: *allocator.Allocator, tgt: target.Target, loaded_mods: **sema.SemaModule, mod_count: i32,
-    method_insts: *sema.MethodInstantiation, func_insts: *sema.FunctionInstantiation) Result[*masm.Masm, str] {
-    
-    if (root == nil || alloc == nil) {
-        ret err[*masm.Masm, str]("invalid arguments");
+# origin:      sema module pointer (nil = main module)
+# loaded_mods: array of loaded sema modules
+# mod_count:   number of loaded modules
+# ret:         index into out_modules (0 = main, 1..N = imports)
+fun find_module_index(origin: *sema.SemaModule, loaded_mods: **sema.SemaModule, mod_count: i32) i32 {
+    if (origin == nil) {
+        ret 0;
     }
-    
-    # create masm instance
+    var i: i32 = 0;
+    for (i < mod_count) {
+        if (loaded_mods[i] == origin) {
+            ret i + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# init_module_masm: initialize a ModuleMasm with a fresh Masm context.
+fun init_module_masm(mod_out: *ModuleMasm, name: str, path: str, alloc: *allocator.Allocator, tgt: target.Target) Result[bool, str] {
     val m_res: Result[masm.Masm, str] = masm.create(alloc, tgt);
     if (m_res.is_err()) {
-        ret err[*masm.Masm, str]("failed to create masm");
+        ret err[bool, str]("failed to create masm for module");
     }
-    
-    # allocate space for masm on heap and copy result there
+
     val m_heap_res: Result[*masm.Masm, allocator.AllocError] = alloc.alloc[masm.Masm](1);
     if (m_heap_res.is_err()) {
-        ret err[*masm.Masm, str]("out of memory");
+        ret err[bool, str]("out of memory for module masm");
     }
     val m_ptr: *masm.Masm = m_heap_res.unwrap_ok();
     @m_ptr = m_res.unwrap_ok();
-    
-    # create lower context
-    var ctx: LowerContext = init(alloc, symbols, types, tgt, m_ptr, nil);
 
-    # store imported modules for cross-module symbol lookup
-    ctx.loaded_mods = loaded_mods;
-    ctx.loaded_mod_count = mod_count;
-
-    # pre-create sections in the correct order for ELF output
-    # .text must come first so it gets section index 1
     val text_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".text", section.section_text());
     val rodata_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".rodata", section.section_rodata());
     val data_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".data", section.section_data());
 
-    # set section alignments (matching C bootstrap: 16 for all data sections)
     if (text_res.is_ok()) { section.set_align(text_res.unwrap_ok(), 16); }
     if (rodata_res.is_ok()) { section.set_align(rodata_res.unwrap_ok(), 16); }
     if (data_res.is_ok()) { section.set_align(data_res.unwrap_ok(), 16); }
-    
-    # lower main module (current_sema_mod is nil for main - fallback heuristic works)
-    ctx.current_sema_mod = nil;
-    val main_count: i32 = lower_module(?ctx, root);
-    if (main_count < 0) {
-        ret err[*masm.Masm, str]("failed to lower main module");
+
+    mod_out.m = m_ptr;
+    mod_out.mod_name = name;
+    mod_out.file_path = path;
+    mod_out.ir_funcs = nil;
+    mod_out.ir_func_count = 0;
+    mod_out.ir_func_cap = 0;
+
+    ret ok[bool, str](true);
+}
+
+# lower_all_modules_split: lower all modules into separate per-module MASM contexts.
+# ---
+# root:            root AST node of main module
+# symbols:         symbol table
+# types:           type context
+# alloc:           allocator
+# tgt:             target configuration
+# loaded_mods:     array of loaded sema modules
+# mod_count:       number of loaded modules
+# method_insts:    linked list of generic method instantiations
+# func_insts:      linked list of generic function instantiations
+# main_file_path:  path to main source file
+# main_source:     main module source text
+# out_modules:     output array of ModuleMasm (caller-allocated)
+# out_count:       output: number of modules written
+# max_modules:     capacity of out_modules array
+# ret:             Ok(true) on success, Err(str) on failure
+pub fun lower_all_modules_split(
+    root: *ast.Node, symbols: *symbol.Table, types: *ty.TypeContext,
+    alloc: *allocator.Allocator, tgt: target.Target,
+    loaded_mods: **sema.SemaModule, mod_count: i32,
+    method_insts: *sema.MethodInstantiation,
+    func_insts: *sema.FunctionInstantiation,
+    main_file_path: str, main_source: str,
+    out_modules: *ModuleMasm, out_count: *i32, max_modules: i32
+) Result[bool, str] {
+
+    if (root == nil || alloc == nil || out_modules == nil || out_count == nil) {
+        ret err[bool, str]("invalid arguments");
     }
 
-    # lower imported modules
+    var total: i32 = 0;
+
+    # --- Initialize main module ---
+    val main_init: Result[bool, str] = init_module_masm(?out_modules[0], "main", main_file_path, alloc, tgt);
+    if (main_init.is_err()) {
+        ret err[bool, str]("failed to init main module masm");
+    }
+    total = 1;
+
+    # --- Initialize imported modules ---
     var i: i32 = 0;
-    for (i < mod_count) {
+    for (i < mod_count && total < max_modules) {
         val smod: *sema.SemaModule = loaded_mods[i];
         if (smod != nil && smod.ast != nil) {
-            # switch to imported module's symbol table and sema module for correct resolution
+            var mod_name: str = "module";
+            if (smod.path != nil) {
+                mod_name = smod.path;
+            }
+            var mod_path: str = nil;
+            if (smod.file_path != nil) {
+                mod_path = smod.file_path;
+            }
+            val mod_init: Result[bool, str] = init_module_masm(?out_modules[total], mod_name, mod_path, alloc, tgt);
+            if (mod_init.is_err()) {
+                ret err[bool, str]("failed to init module masm");
+            }
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+
+    # --- Create lower context (starts with main module) ---
+    var ctx: LowerContext = init(alloc, symbols, types, tgt, out_modules[0].m, main_source);
+    ctx.loaded_mods = loaded_mods;
+    ctx.loaded_mod_count = mod_count;
+
+    # --- Lower main module ---
+    if (main_file_path != nil) {
+        ctx.current_file_idx = masm.add_debug_file(out_modules[0].m, main_file_path);
+    }
+    ctx.current_sema_mod = nil;
+    val main_lower_count: i32 = lower_module(?ctx, root);
+    if (main_lower_count < 0) {
+        ret err[bool, str]("failed to lower main module");
+    }
+    # save main module IR functions
+    out_modules[0].ir_funcs = ctx.ir_funcs;
+    out_modules[0].ir_func_count = ctx.ir_func_count;
+    out_modules[0].ir_func_cap = ctx.ir_func_cap;
+
+    # --- Lower imported modules ---
+    i = 0;
+    var mod_idx: i32 = 1;
+    for (i < mod_count) {
+        val smod: *sema.SemaModule = loaded_mods[i];
+        if (smod != nil && smod.ast != nil && mod_idx < total) {
+            # reset ctx IR function storage for this module
+            ctx.ir_funcs = nil;
+            ctx.ir_func_count = 0;
+            ctx.ir_func_cap = 0;
+            ctx.m = out_modules[mod_idx].m;
+
             if (smod.table != nil) {
                 ctx.symbols = smod.table;
             }
             ctx.current_sema_mod = smod;
-            val mod_count2: i32 = lower_module(?ctx, smod.ast);
-            if (mod_count2 < 0) {
-                ret err[*masm.Masm, str]("failed to lower imported module");
+
+            if (smod.file_path != nil) {
+                ctx.current_file_idx = masm.add_debug_file(out_modules[mod_idx].m, smod.file_path);
+            } or {
+                ctx.current_file_idx = 0;
             }
+            if (smod.source != nil) {
+                ctx.text = smod.source;
+            } or {
+                ctx.text = nil;
+            }
+
+            val mod_lower_count: i32 = lower_module(?ctx, smod.ast);
+            if (mod_lower_count < 0) {
+                ret err[bool, str]("failed to lower imported module");
+            }
+
+            # save this module's IR functions
+            out_modules[mod_idx].ir_funcs = ctx.ir_funcs;
+            out_modules[mod_idx].ir_func_count = ctx.ir_func_count;
+            out_modules[mod_idx].ir_func_cap = ctx.ir_func_cap;
+
+            mod_idx = mod_idx + 1;
         }
         i = i + 1;
     }
-    # restore main module's symbol table
-    ctx.symbols = symbols;
 
-    # --- Phase: lower generic method instantiations ---
-    # each MethodInstantiation carries the original AST, mangled name,
-    # concrete type bindings (T -> *Section, E -> str, etc.), and
-    # the module where the generic method was defined.
+    # restore main module context
+    ctx.symbols = symbols;
+    ctx.text = main_source;
+    ctx.current_sema_mod = nil;
+    if (main_file_path != nil) {
+        ctx.current_file_idx = masm.add_debug_file(out_modules[0].m, main_file_path);
+    } or {
+        ctx.current_file_idx = 0;
+    }
+
+    # --- Lower generic method instantiations ---
     var inst: *sema.MethodInstantiation = method_insts;
     for (inst != nil) {
         if (inst.func_ast != nil && inst.mangled_name != nil && inst.param_count > 0) {
-            # set up type bindings for this instantiation
+            val target_idx: i32 = find_module_index(inst.origin_module, loaded_mods, mod_count);
+
+            # swap ctx to target module's IR storage
+            ctx.ir_funcs = out_modules[target_idx].ir_funcs;
+            ctx.ir_func_count = out_modules[target_idx].ir_func_count;
+            ctx.ir_func_cap = out_modules[target_idx].ir_func_cap;
+            ctx.m = out_modules[target_idx].m;
+
             ctx.type_binding_names = inst.param_names;
             ctx.type_binding_types = inst.param_types;
             ctx.type_binding_count = inst.param_count;
-
-            # set override names/types so lower_function uses the mangled name
             ctx.func_name_override = inst.mangled_name;
             ctx.recv_type_override = inst.receiver_type;
             if (inst.func_type != nil && inst.func_type.kind == ty.TY_FUN) {
@@ -6118,37 +6961,47 @@ pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.Ty
                 ctx.ret_type_override = nil;
             }
 
-            # switch to origin module's symbol table for correct resolution
             if (inst.origin_module != nil && inst.origin_module.table != nil) {
                 ctx.symbols = inst.origin_module.table;
                 ctx.current_sema_mod = inst.origin_module;
+                if (inst.origin_module.source != nil) {
+                    ctx.text = inst.origin_module.source;
+                }
+                if (inst.origin_module.file_path != nil) {
+                    ctx.current_file_idx = masm.add_debug_file(out_modules[target_idx].m, inst.origin_module.file_path);
+                }
             } or {
                 ctx.symbols = symbols;
                 ctx.current_sema_mod = nil;
             }
 
-            # lower the function with bindings (reuses the generic AST)
             val inst_fn_res: Result[*ir.IRFunction, str] = lower_function(?ctx, inst.func_ast);
             if (inst_fn_res.is_ok()) {
-                val inst_fn: *ir.IRFunction = inst_fn_res.unwrap_ok();
-                add_ir_function(?ctx, inst_fn);
+                add_ir_function(?ctx, inst_fn_res.unwrap_ok());
             }
+
+            # save back to target module
+            out_modules[target_idx].ir_funcs = ctx.ir_funcs;
+            out_modules[target_idx].ir_func_count = ctx.ir_func_count;
+            out_modules[target_idx].ir_func_cap = ctx.ir_func_cap;
         }
         inst = inst.next;
     }
 
-    # --- Phase: lower generic function instantiations ---
-    # each FunctionInstantiation carries the original AST, mangled name,
-    # and concrete type bindings (T -> *Section, E -> str, etc.)
+    # --- Lower generic function instantiations ---
     var finst: *sema.FunctionInstantiation = func_insts;
     for (finst != nil) {
         if (finst.func_ast != nil && finst.mangled_name != nil && finst.param_count > 0) {
-            # set up type bindings for this instantiation
+            val target_idx2: i32 = find_module_index(finst.origin_module, loaded_mods, mod_count);
+
+            ctx.ir_funcs = out_modules[target_idx2].ir_funcs;
+            ctx.ir_func_count = out_modules[target_idx2].ir_func_count;
+            ctx.ir_func_cap = out_modules[target_idx2].ir_func_cap;
+            ctx.m = out_modules[target_idx2].m;
+
             ctx.type_binding_names = finst.param_names;
             ctx.type_binding_types = finst.param_types;
             ctx.type_binding_count = finst.param_count;
-
-            # set override name (no receiver for free functions)
             ctx.func_name_override = finst.mangled_name;
             ctx.recv_type_override = nil;
             if (finst.func_type != nil && finst.func_type.kind == ty.TY_FUN) {
@@ -6157,21 +7010,28 @@ pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.Ty
                 ctx.ret_type_override = nil;
             }
 
-            # switch to origin module's symbol table for correct resolution
             if (finst.origin_module != nil && finst.origin_module.table != nil) {
                 ctx.symbols = finst.origin_module.table;
                 ctx.current_sema_mod = finst.origin_module;
+                if (finst.origin_module.source != nil) {
+                    ctx.text = finst.origin_module.source;
+                }
+                if (finst.origin_module.file_path != nil) {
+                    ctx.current_file_idx = masm.add_debug_file(out_modules[target_idx2].m, finst.origin_module.file_path);
+                }
             } or {
                 ctx.symbols = symbols;
                 ctx.current_sema_mod = nil;
             }
 
-            # lower the function with bindings (reuses the generic AST)
             val finst_fn_res: Result[*ir.IRFunction, str] = lower_function(?ctx, finst.func_ast);
             if (finst_fn_res.is_ok()) {
-                val finst_fn: *ir.IRFunction = finst_fn_res.unwrap_ok();
-                add_ir_function(?ctx, finst_fn);
+                add_ir_function(?ctx, finst_fn_res.unwrap_ok());
             }
+
+            out_modules[target_idx2].ir_funcs = ctx.ir_funcs;
+            out_modules[target_idx2].ir_func_count = ctx.ir_func_count;
+            out_modules[target_idx2].ir_func_cap = ctx.ir_func_cap;
         }
         finst = finst.next;
     }
@@ -6183,15 +7043,62 @@ pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.Ty
     ctx.func_name_override = nil;
     ctx.recv_type_override = nil;
     ctx.ret_type_override = nil;
-    ctx.symbols = symbols;
-    ctx.current_sema_mod = nil;
 
-    # run instruction selection to generate machine code for all IR functions
-    if (ctx.ir_func_count > 0) {
-        val isel_res: Result[bool, str] = isel.run_isel(m_ptr, ctx.ir_funcs, ctx.ir_func_count, alloc);
-        if (isel_res.is_err()) {
-            ret err[*masm.Masm, str](isel_res.unwrap_err());
+    # --- Run isel per module ---
+    i = 0;
+    for (i < total) {
+        if (out_modules[i].ir_func_count > 0) {
+            val isel_res: Result[bool, str] = isel.run_isel(out_modules[i].m, out_modules[i].ir_funcs, out_modules[i].ir_func_count, alloc);
+            if (isel_res.is_err()) {
+                ret err[bool, str](isel_res.unwrap_err());
+            }
         }
+        i = i + 1;
+    }
+
+    @out_count = total;
+    ret ok[bool, str](true);
+}
+
+# lower_all_modules: lower main module and all imported modules to MASM.
+# ---
+# delegates to lower_all_modules_split, then merges all per-module MASMs into one.
+# preserves backward compatibility for callers like testing.mach.
+pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *ty.TypeContext,
+    alloc: *allocator.Allocator, tgt: target.Target, loaded_mods: **sema.SemaModule, mod_count: i32,
+    method_insts: *sema.MethodInstantiation, func_insts: *sema.FunctionInstantiation,
+    main_file_path: str, main_source: str) Result[*masm.Masm, str] {
+
+    if (root == nil || alloc == nil) {
+        ret err[*masm.Masm, str]("invalid arguments");
+    }
+
+    var module_masms: [256]ModuleMasm;
+    var module_count: i32 = 0;
+
+    val split_res: Result[bool, str] = lower_all_modules_split(
+        root, symbols, types, alloc, tgt,
+        loaded_mods, mod_count, method_insts, func_insts,
+        main_file_path, main_source,
+        ?module_masms[0], ?module_count, 256
+    );
+    if (split_res.is_err()) {
+        ret err[*masm.Masm, str](split_res.unwrap_err());
+    }
+
+    if (module_count == 0) {
+        ret err[*masm.Masm, str]("no modules lowered");
+    }
+
+    # use first module (main) as base, merge remaining modules into it
+    val m_ptr: *masm.Masm = module_masms[0].m;
+    var i: i32 = 1;
+    for (i < module_count) {
+        val merge_res: Result[bool, str] = masm.merge(m_ptr, module_masms[i].m);
+        if (merge_res.is_err()) {
+            ret err[*masm.Masm, str](merge_res.unwrap_err());
+        }
+        i = i + 1;
     }
 
     ret ok[*masm.Masm, str](m_ptr);

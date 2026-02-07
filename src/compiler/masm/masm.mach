@@ -12,6 +12,17 @@ use sym:     mach.compiler.masm.symbol;
 # ---
 # provides the top-level context for machine code generation.
 
+# DebugLineEntry: a single source-level line mapping for DWARF .debug_line.
+# ---
+# code_offset: byte offset within .text section
+# file_idx:    1-based index into debug file table
+# line:        1-based source line number
+pub rec DebugLineEntry {
+    code_offset: usize;
+    file_idx:    u16;
+    line:        i32;
+}
+
 # Masm: the main MASM context.
 # ---
 # alloc:         allocator for all masm allocations
@@ -31,6 +42,14 @@ pub rec Masm {
     symbols:       **sym.Symbol;
     symbol_count:  i32;
     symbol_cap:    i32;
+
+    # debug info for DWARF generation
+    debug_lines:      *DebugLineEntry;
+    debug_line_count: i32;
+    debug_line_cap:   i32;
+    debug_files:      *str;
+    debug_file_count: i32;
+    debug_file_cap:   i32;
 }
 
 # create: create a new MASM context.
@@ -53,6 +72,13 @@ pub fun create(alloc: *allocator.Allocator, tgt: target.Target) Result[Masm, str
     m.symbol_count = 0;
     m.symbol_cap = 0;
 
+    m.debug_lines = nil;
+    m.debug_line_count = 0;
+    m.debug_line_cap = 0;
+    m.debug_files = nil;
+    m.debug_file_count = 0;
+    m.debug_file_cap = 0;
+
     ret ok[Masm, str](m);
 }
 
@@ -74,6 +100,14 @@ pub fun destroy(m: *Masm) {
 
     if (m.symbols != nil) {
         m.alloc.free[*sym.Symbol](m.symbols, m.symbol_cap::usize);
+    }
+
+    if (m.debug_lines != nil) {
+        m.alloc.free[DebugLineEntry](m.debug_lines, m.debug_line_cap::usize);
+    }
+
+    if (m.debug_files != nil) {
+        m.alloc.free[str](m.debug_files, m.debug_file_cap::usize);
     }
 }
 
@@ -231,8 +265,183 @@ pub fun merge(dest: *Masm, src: *Masm) Result[bool, str] {
         ret ok[bool, str](true);
     }
 
-    # TODO: merge sections (combine same-named sections)
-    # TODO: merge symbols (check for conflicts)
+    # merge each section from src into dest
+    var si: i32 = 0;
+    for (si < src.section_count) {
+        val src_sec: *section.Section = src.sections[si];
+        if (src_sec == nil || src_sec.name == nil) {
+            si = si + 1;
+            cnt;
+        }
 
-    ret err[bool, str]("merge not yet implemented");
+        # find or create matching section in dest
+        val dest_sec_res: Result[*section.Section, str] = get_or_create_section(dest, src_sec.name, src_sec.kind);
+        if (dest_sec_res.is_err()) {
+            ret err[bool, str]("failed to get/create section during merge");
+        }
+        val dest_sec: *section.Section = dest_sec_res.unwrap_ok();
+
+        # pad dest section to src section's alignment
+        if (src_sec.align > 1 && dest_sec.size > 0) {
+            val mask: usize = src_sec.align - 1;
+            val aligned: usize = (dest_sec.size + mask) & ~mask;
+            var pad: usize = aligned - dest_sec.size;
+            for (pad > 0) {
+                section.emit_byte(dest.alloc, dest_sec, 0);
+                pad = pad - 1;
+            }
+        }
+
+        val base_offset: usize = dest_sec.size;
+
+        # append src section data to dest section
+        if (src_sec.data != nil && src_sec.size > 0) {
+            val emit_res: Result[usize, str] = section.emit_bytes(dest.alloc, dest_sec, src_sec.data::&u8, src_sec.size);
+            if (emit_res.is_err()) {
+                ret err[bool, str]("failed to append section data during merge");
+            }
+        }
+
+        # copy relocations, adjusting offsets
+        var ri: i32 = 0;
+        for (ri < src_sec.reloc_count) {
+            val reloc: *section.Relocation = section.get_relocation(src_sec, ri);
+            if (reloc != nil) {
+                val adj_offset: usize = reloc.offset + base_offset;
+                section.add_relocation(dest.alloc, dest_sec, adj_offset, reloc.symbol_name, reloc.rtype, reloc.addend);
+            }
+            ri = ri + 1;
+        }
+
+        # update symbols that reference this src section
+        var symi: i32 = 0;
+        for (symi < src.symbol_count) {
+            val s: *sym.Symbol = src.symbols[symi];
+            if (s != nil && s.section == src_sec) {
+                s.offset = s.offset + base_offset;
+                s.section = dest_sec;
+            }
+            symi = symi + 1;
+        }
+
+        si = si + 1;
+    }
+
+    # merge symbols into dest
+    var symi2: i32 = 0;
+    for (symi2 < src.symbol_count) {
+        val s: *sym.Symbol = src.symbols[symi2];
+        if (s != nil) {
+            add_symbol(dest, s);
+        }
+        symi2 = symi2 + 1;
+    }
+
+    # merge debug lines (adjust code_offset for .text base offset)
+    var text_base: usize = 0;
+    val dest_text: *section.Section = get_section(dest, ".text");
+    val src_text: *section.Section = get_section(src, ".text");
+    if (dest_text != nil && src_text != nil) {
+        # text_base was the dest .text size before merge, but we already merged
+        # so we need to subtract src .text size to get the base
+        if (dest_text.size >= src_text.size) {
+            text_base = dest_text.size - src_text.size;
+        }
+    }
+
+    var di: i32 = 0;
+    for (di < src.debug_line_count) {
+        val entry: *DebugLineEntry = ?src.debug_lines[di];
+        if (entry != nil) {
+            # remap file_idx: add src debug file to dest and get new index
+            var new_file_idx: u16 = entry.file_idx;
+            if (entry.file_idx > 0 && entry.file_idx::i32 <= src.debug_file_count) {
+                val src_file: str = src.debug_files[(entry.file_idx - 1)::i32];
+                if (src_file != nil) {
+                    new_file_idx = add_debug_file(dest, src_file);
+                }
+            }
+            add_debug_line(dest, entry.code_offset + text_base, new_file_idx, entry.line);
+        }
+        di = di + 1;
+    }
+
+    ret ok[bool, str](true);
+}
+
+# add_debug_file: register a source file for debug info.
+# ---
+# m:    masm context
+# path: file path to register
+# ret:  1-based file index (0 on error)
+# deduplicates: if the same path is already registered, returns existing index.
+pub fun add_debug_file(m: *Masm, path: str) u16 {
+    if (m == nil || path == nil || m.alloc == nil) {
+        ret 0;
+    }
+
+    # check for existing entry
+    var i: i32 = 0;
+    for (i < m.debug_file_count) {
+        if (m.debug_files[i] != nil && m.debug_files[i].equals(path)) {
+            ret (i + 1)::u16;
+        }
+        i = i + 1;
+    }
+
+    # grow array if needed
+    if (m.debug_file_count >= m.debug_file_cap) {
+        var new_cap: i32 = 8;
+        if (m.debug_file_cap > 0) {
+            new_cap = m.debug_file_cap * 2;
+        }
+        val r: Result[*str, allocator.AllocError] = m.alloc.resize[str](
+            m.debug_files, m.debug_file_cap::usize, new_cap::usize
+        );
+        if (r.is_err()) {
+            ret 0;
+        }
+        m.debug_files = r.unwrap_ok();
+        m.debug_file_cap = new_cap;
+    }
+
+    val idx: i32 = m.debug_file_count;
+    m.debug_files[idx] = path;
+    m.debug_file_count = m.debug_file_count + 1;
+
+    ret (idx + 1)::u16;
+}
+
+# add_debug_line: record a debug line entry mapping code offset to source location.
+# ---
+# m:           masm context
+# code_offset: byte offset within .text section
+# file_idx:    1-based file index from add_debug_file
+# line:        1-based source line number
+pub fun add_debug_line(m: *Masm, code_offset: usize, file_idx: u16, line: i32) {
+    if (m == nil || m.alloc == nil || file_idx == 0 || line <= 0) {
+        ret;
+    }
+
+    # grow array if needed
+    if (m.debug_line_count >= m.debug_line_cap) {
+        var new_cap: i32 = 64;
+        if (m.debug_line_cap > 0) {
+            new_cap = m.debug_line_cap * 2;
+        }
+        val r: Result[*DebugLineEntry, allocator.AllocError] = m.alloc.resize[DebugLineEntry](
+            m.debug_lines, m.debug_line_cap::usize, new_cap::usize
+        );
+        if (r.is_err()) {
+            ret;
+        }
+        m.debug_lines = r.unwrap_ok();
+        m.debug_line_cap = new_cap;
+    }
+
+    val idx: i32 = m.debug_line_count;
+    m.debug_lines[idx].code_offset = code_offset;
+    m.debug_lines[idx].file_idx = file_idx;
+    m.debug_lines[idx].line = line;
+    m.debug_line_count = m.debug_line_count + 1;
 }

@@ -23,7 +23,9 @@ use symbol:   mach.compiler.symbol;
 use ty:       mach.compiler.type;
 use comptime: mach.compiler.comptime;
 
+use archive:  mach.compiler.masm.archive;
 use emit:     mach.compiler.masm.emit;
+use link:     mach.compiler.masm.link;
 use lower:    mach.compiler.masm.lower;
 use masm:     mach.compiler.masm.masm;
 use target:   mach.compiler.masm.target;
@@ -120,27 +122,34 @@ fun is_directory(path: str) bool {
         ret false;
     }
 
-    # try to open as directory using O_DIRECTORY flag
-    # alternatively check via stat
+    # directly read st_mode from raw buffer at offset 24
     val open_res: Result[fs.File, str] = fs.open(path);
     if (open_res.is_err()) {
         ret false;
     }
 
     var file: fs.File = open_res.unwrap_ok();
-    val stat_res: Result[fs.Stat, str] = file.stat();
+
+    var st: fs.Stat;
+    val raw: i64 = pfs.fstat(file.fd, ?st);
     file.close();
 
-    if (stat_res.is_err()) {
+    if (raw < 0) {
         ret false;
     }
 
-    val st: fs.Stat = stat_res.unwrap_ok();
-
-    # check S_IFDIR bit (0o040000 = 16384)
+    # read st_mode through struct field access
     val mode: u32 = st.st_mode;
-    val is_dir: bool = (mode & 0o170000) == 0o040000;
-    ret is_dir;
+
+    # also read from raw bytes at offset 24 for comparison
+    val buf: *u8 = (?st)::*u8;
+    val raw_mode: u32 = buf[24]::u32 | (buf[25]::u32 << 8) | (buf[26]::u32 << 16) | (buf[27]::u32 << 24);
+
+    # test both
+    val field_dir: bool = (mode & 0o170000) == 0o040000;
+    val raw_dir: bool = (raw_mode & 0o170000) == 0o040000;
+
+    ret raw_dir;
 }
 
 # file_exists: check if a file exists.
@@ -444,7 +453,8 @@ fun to_compiler_target(cfg_target: *config.Target) target.Target {
 # ret: 0 on success, non-zero on error
 fun compile_source(source: str, file_path: str, module_path: str, output_path: str, alloc: *allocator.Allocator,
     tgt: target.Target,
-    project_id: str, src_root: str, dep_root: str, deps: *config.Dep, dep_count: i32) i64 {
+    project_id: str, src_root: str, dep_root: str, deps: *config.Dep, dep_count: i32,
+    obj_dir: str) i64 {
     # initialize parser
     var p: parser.Parser = parser.init(source, alloc);
 
@@ -534,35 +544,285 @@ fun compile_source(source: str, file_path: str, module_path: str, output_path: s
     var loaded_mods: [256]*sema.SemaModule;
     val load_count: i32 = sema.get_loaded_modules(?sem, ?loaded_mods[0], 256);
 
-    # lower AST to MASM IR (main module + all imports)
-    val lower_res: Result[*masm.Masm, str] = lower.lower_all_modules(root, symbols, types, alloc, tgt, ?loaded_mods[0], load_count, sem.method_insts, sem.func_insts);
-    if (lower_res.is_err()) {
+    # lower per-module
+    var module_masms: [256]lower.ModuleMasm;
+    var module_count: i32 = 0;
+    val split_res: Result[bool, str] = lower.lower_all_modules_split(
+        root, symbols, types, alloc, tgt,
+        ?loaded_mods[0], load_count,
+        sem.method_insts, sem.func_insts,
+        file_path, source,
+        ?module_masms[0], ?module_count, 256
+    );
+    if (split_res.is_err()) {
         print.eprint("error: lowering failed: ");
-        print.eprintln(lower_res.unwrap_err());
+        print.eprintln(split_res.unwrap_err());
         sema.deinit(?sem);
         p.deinit();
         ret 1;
     }
 
-    val m: *masm.Masm = lower_res.unwrap_ok();
+    # emit per-module .o files (if obj_dir is set)
+    if (obj_dir != nil) {
+        ensure_dir(obj_dir, alloc);
+        var oi: i32 = 0;
+        for (oi < module_count) {
+            val obj_path: str = make_obj_path(obj_dir, module_masms[oi].mod_name, alloc);
+            if (obj_path != nil) {
+                emit.emit_object(module_masms[oi].m, obj_path, alloc);
+            }
+            oi = oi + 1;
+        }
+    }
 
-    # emit executable directly (no external linker needed)
-    val emit_res: Result[bool, str] = emit.emit_executable(m, output_path, alloc);
+    # link in-memory
+    var link_inputs: [256]link.LinkInput;
+    var li: i32 = 0;
+    for (li < module_count) {
+        link_inputs[li].m = module_masms[li].m;
+        link_inputs[li].mod_name = module_masms[li].mod_name;
+        li = li + 1;
+    }
+    val linked_res: Result[*masm.Masm, str] = link.link(?link_inputs[0], module_count, alloc, tgt);
+    if (linked_res.is_err()) {
+        print.eprint("error: linking failed: ");
+        print.eprintln(linked_res.unwrap_err());
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+
+    val linked: *masm.Masm = linked_res.unwrap_ok();
+
+    # emit executable
+    val emit_res: Result[bool, str] = emit.emit_executable(linked, output_path, alloc);
     if (emit_res.is_err()) {
         print.eprint("error: code emission failed: ");
         print.eprintln(emit_res.unwrap_err());
-        masm.destroy(m);
+        masm.destroy(linked);
         sema.deinit(?sem);
         p.deinit();
         ret 1;
     }
 
     # clean up
-    masm.destroy(m);
+    masm.destroy(linked);
     sema.deinit(?sem);
     p.deinit();
 
     print.print("compiled: ");
+    print.println(output_path);
+
+    ret 0;
+}
+
+# make_obj_path: build an object file path from obj_dir and module name.
+# ---
+# obj_dir:  object file output directory
+# mod_name: module name (e.g. "main", "mach.compiler.ast")
+# alloc:    allocator
+# ret:      path like "<obj_dir>/mach.compiler.ast.o"
+fun make_obj_path(obj_dir: str, mod_name: str, alloc: *allocator.Allocator) str {
+    if (obj_dir == nil || mod_name == nil || alloc == nil) {
+        ret nil;
+    }
+
+    val dir_len: usize = obj_dir.len();
+    val name_len: usize = mod_name.len();
+    # dir + "/" + name + ".o" + null
+    val total: usize = dir_len + 1 + name_len + 2 + 1;
+
+    val buf_res: Result[*u8, allocator.AllocError] = alloc.alloc[u8](total);
+    if (buf_res.is_err()) {
+        ret nil;
+    }
+    val buf: *u8 = buf_res.unwrap_ok();
+
+    var pos: usize = 0;
+    # copy dir
+    var i: usize = 0;
+    for (i < dir_len) {
+        buf[pos] = obj_dir[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    # slash
+    buf[pos] = 47;
+    pos = pos + 1;
+    # copy name
+    i = 0;
+    for (i < name_len) {
+        buf[pos] = mod_name[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    # ".o"
+    buf[pos] = 46; pos = pos + 1;
+    buf[pos] = 111; pos = pos + 1;
+    buf[pos] = 0;
+
+    ret buf::str;
+}
+
+# compile_library: compile source into a static archive (.a).
+fun compile_library(source: str, file_path: str, module_path: str, output_path: str, alloc: *allocator.Allocator,
+    tgt: target.Target,
+    project_id: str, src_root: str, dep_root: str, deps: *config.Dep, dep_count: i32,
+    obj_dir: str) i64 {
+    # initialize parser
+    var p: parser.Parser = parser.init(source, alloc);
+
+    val parse_res: Result[*ast.Node, str] = p.parse_program();
+    if (parse_res.is_err()) {
+        print.eprint("error: parsing failed: ");
+        print.eprintln(parse_res.unwrap_err());
+        print_parser_errors(?p, file_path);
+        p.deinit();
+        ret 1;
+    }
+
+    val root: *ast.Node = parse_res.unwrap_ok();
+
+    if (p.had_error) {
+        print.eprintln("error: parsing failed with errors");
+        print_parser_errors(?p, file_path);
+        p.deinit();
+        ret 1;
+    }
+
+    var sem: sema.Sema = sema.init(alloc);
+
+    if (project_id != nil && src_root != nil) {
+        sema.set_module_roots(?sem, project_id, src_root, dep_root, deps, dep_count);
+    }
+
+    if (sem.symbols == nil) {
+        val table_res: Result[symbol.Table, str] = symbol.init(alloc);
+        if (table_res.is_err()) {
+            print.eprint("error: failed to create symbol table: ");
+            print.eprintln(table_res.unwrap_err());
+            sema.deinit(?sem);
+            p.deinit();
+            ret 1;
+        }
+
+        val table_ptr_res: Result[*symbol.Table, allocator.AllocError] = alloc.alloc[symbol.Table](1);
+        if (table_ptr_res.is_err()) {
+            print.eprintln("error: failed to allocate symbol table");
+            sema.deinit(?sem);
+            p.deinit();
+            ret 1;
+        }
+        val table_ptr: *symbol.Table = table_ptr_res.unwrap_ok();
+        @table_ptr = table_res.unwrap_ok();
+        sem.symbols = table_ptr;
+    }
+
+    val cctx_init: comptime.ComptimeContext = comptime.init(alloc, sem.symbols, sem.types);
+    val cctx_ptr_res: Result[*comptime.ComptimeContext, allocator.AllocError] = alloc.alloc[comptime.ComptimeContext](1);
+    if (cctx_ptr_res.is_err()) {
+        print.eprintln("error: failed to allocate comptime context");
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+    val cctx_ptr: *comptime.ComptimeContext = cctx_ptr_res.unwrap_ok();
+    @cctx_ptr = cctx_init;
+
+    val analyze_res: Result[bool, str] = sema.analyze(?sem, root, file_path, source, cctx_ptr);
+    if (analyze_res.is_err()) {
+        print.eprint("error: semantic analysis failed: ");
+        print.eprintln(analyze_res.unwrap_err());
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+
+    if (sema.has_errors(?sem)) {
+        print_sema_errors(?sem);
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+
+    val symbols: *symbol.Table = sema.get_symbol_table(?sem);
+    val types: *ty.TypeContext = sema.get_type_context(?sem);
+
+    var loaded_mods: [256]*sema.SemaModule;
+    val load_count: i32 = sema.get_loaded_modules(?sem, ?loaded_mods[0], 256);
+
+    # lower per-module
+    var module_masms: [256]lower.ModuleMasm;
+    var module_count: i32 = 0;
+    val split_res: Result[bool, str] = lower.lower_all_modules_split(
+        root, symbols, types, alloc, tgt,
+        ?loaded_mods[0], load_count,
+        sem.method_insts, sem.func_insts,
+        file_path, source,
+        ?module_masms[0], ?module_count, 256
+    );
+    if (split_res.is_err()) {
+        print.eprint("error: lowering failed: ");
+        print.eprintln(split_res.unwrap_err());
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+
+    # emit per-module .o files and build ArMember array
+    if (obj_dir != nil) {
+        ensure_dir(obj_dir, alloc);
+    }
+
+    var ar_members: [256]archive.ArMember;
+    var oi: i32 = 0;
+    var lib_obj_dir: str = obj_dir;
+    if (lib_obj_dir == nil) { lib_obj_dir = "."; }
+    for (oi < module_count) {
+        val obj_path: str = make_obj_path(
+            lib_obj_dir,
+            module_masms[oi].mod_name, alloc
+        );
+
+        # emit .o file
+        if (obj_path != nil) {
+            emit.emit_object(module_masms[oi].m, obj_path, alloc);
+        }
+
+        # read back .o bytes for archive member
+        if (obj_path != nil) {
+            val read_obj_res: Result[str, str] = read_file_contents(obj_path, alloc);
+            if (read_obj_res.is_ok()) {
+                val obj_data: str = read_obj_res.unwrap_ok();
+                val obj_len: usize = obj_data.len();
+                var member_name: str = module_masms[oi].mod_name;
+                if (member_name == nil) { member_name = "module"; }
+                ar_members[oi].name = make_obj_path("", member_name, alloc);
+                ar_members[oi].data = obj_data::ptr::*u8;
+                ar_members[oi].size = obj_len;
+            } or {
+                ar_members[oi].name = nil;
+                ar_members[oi].data = nil;
+                ar_members[oi].size = 0;
+            }
+        }
+        oi = oi + 1;
+    }
+
+    # emit archive
+    val ar_res: Result[bool, str] = archive.emit_archive(?ar_members[0], module_count, output_path, alloc);
+    if (ar_res.is_err()) {
+        print.eprint("error: archive creation failed: ");
+        print.eprintln(ar_res.unwrap_err());
+        sema.deinit(?sem);
+        p.deinit();
+        ret 1;
+    }
+
+    sema.deinit(?sem);
+    p.deinit();
+
+    print.print("archived: ");
     print.println(output_path);
 
     ret 0;
@@ -824,10 +1084,10 @@ pub fun handle(argc: i64, argv: &&u8) i64 {
             ret 1;
         }
 
-        if (target_cfg.mode.tag != ctarget.TMODE_EXECUTABLE) {
+        if (target_cfg.mode.tag != ctarget.TMODE_EXECUTABLE && target_cfg.mode.tag != ctarget.TMODE_LIBRARY) {
             print.eprint("error: target '");
             print.eprint(target_cfg.name);
-            print.eprintln("' is not an executable target");
+            print.eprintln("' is not an executable or library target");
             ret 1;
         }
 
@@ -837,8 +1097,8 @@ pub fun handle(argc: i64, argv: &&u8) i64 {
             print.eprintln("' has no entrypoint");
             ret 1;
         }
-        val entry: str = target_cfg.entrypoint;
-        source_path = path_join(src_dir, entry, ?alloc);
+        val entry_src: str = target_cfg.entrypoint;
+        source_path = path_join(src_dir, entry_src, ?alloc);
 
         if (module_path == nil) {
             module_path = derive_module_path(opts.input_path, ?cfg, source_path, ?alloc);
@@ -899,14 +1159,31 @@ pub fun handle(argc: i64, argv: &&u8) i64 {
 
     val source: str = read_res.unwrap_ok();
 
+    # compute obj_dir from output path (sibling "obj" directory)
+    var obj_dir: str = nil;
+    if (is_proj) {
+        val out_dir: str = get_output_dir(output_path, ?alloc);
+        if (out_dir != nil) {
+            obj_dir = path_join(out_dir, "obj", ?alloc);
+        }
+    }
+
     # compile
     var tgt: target.Target = target.default_target();
     if (is_proj && target_cfg != nil) {
         tgt = to_compiler_target(target_cfg);
     }
 
-    val exit_code: i64 = compile_source(source, source_path, module_path, output_path, ?alloc,
-        tgt, project_id, src_root, dep_root, deps, dep_count);
+    var exit_code: i64 = 0;
+
+    # dispatch based on target mode
+    if (is_proj && target_cfg != nil && target_cfg.mode.tag == ctarget.TMODE_LIBRARY) {
+        exit_code = compile_library(source, source_path, module_path, output_path, ?alloc,
+            tgt, project_id, src_root, dep_root, deps, dep_count, obj_dir);
+    } or {
+        exit_code = compile_source(source, source_path, module_path, output_path, ?alloc,
+            tgt, project_id, src_root, dep_root, deps, dep_count, obj_dir);
+    }
 
     ret exit_code;
 }

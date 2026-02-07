@@ -426,12 +426,13 @@ int masm_elf_write(Masm *masm, const char *filename)
     syms[sym_count++] = sec;
 
     // add defined masm symbols (locals first, then globals/weak)
+    // skip MASM_SYMBOL_LABEL (internal branch labels) — they don't belong in ELF
     for (size_t pass = 0; pass < 2; pass++)
     {
         for (size_t i = 0; i < masm->symbol_count; i++)
         {
             MasmSymbol *ms = masm->symbols[i];
-            if (!ms || !ms->name)
+            if (!ms || !ms->name || ms->kind == MASM_SYMBOL_LABEL)
             {
                 continue;
             }

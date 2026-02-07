@@ -487,7 +487,7 @@ pub fun emit_cdq(ctx: *ISelContext) {
 # size: operand size
 pub fun emit_div_reg(ctx: *ISelContext, r: i32, size: usize) {
     val src: operand.Operand = operand.reg(r, size);
-    val instr: spec.Instruction = make_instruction(x86.DIV, operand.none(), src, operand.none(), size);
+    val instr: spec.Instruction = make_instruction(x86.DIV, src, operand.none(), operand.none(), size);
     emit_instr(ctx, instr);
 }
 
@@ -693,7 +693,7 @@ pub fun emit_imul_reg_imm(ctx: *ISelContext, r: i32, v: i64, size: usize) {
 # size: operand size
 pub fun emit_idiv_reg(ctx: *ISelContext, r: i32, size: usize) {
     val src: operand.Operand = operand.reg(r, size);
-    val instr: spec.Instruction = make_instruction(x86.IDIV, operand.none(), src, operand.none(), size);
+    val instr: spec.Instruction = make_instruction(x86.IDIV, src, operand.none(), operand.none(), size);
     emit_instr(ctx, instr);
 }
 
@@ -736,8 +736,8 @@ pub fun emit_call_label(ctx: *ISelContext, target: str) {
 # ctx: isel context
 # r:   register containing function address
 pub fun emit_call_reg(ctx: *ISelContext, r: i32) {
-    val src: operand.Operand = operand.reg(r, 8);
-    var instr: spec.Instruction = make_instruction(x86.CALL, operand.none(), src, operand.none(), 8);
+    val dst: operand.Operand = operand.reg(r, 8);
+    var instr: spec.Instruction = make_instruction(x86.CALL, dst, operand.none(), operand.none(), 8);
     instr.flags = instr.flags | spec.FLAG_INDIRECT;
     emit_instr(ctx, instr);
 }
@@ -1212,6 +1212,56 @@ pub fun select_load(ctx: *ISelContext, instr: *ir.Instr) {
     val dst: ir.IRValue = instr.dst;
     val src: ir.IRValue = instr.src1;
 
+    # load from [RAX] with appropriate size
+    var load_size: usize = dst.size;
+    if (src.kind == ir.VAL_MEM && src.size > 0) {
+        load_size = src.size;
+    }
+
+    # large aggregate load (> 8 bytes): direct memory-to-memory copy
+    # can't fit in a single register, so copy 8-byte chunks from source to dest
+    if (load_size > 8 && dst.kind == ir.VAL_REG && dst.reg >= VREG_START) {
+        # source address into RCX
+        if (src.kind == ir.VAL_MEM) {
+            compute_addr_rcx(ctx, src);
+        } or {
+            load_operand(ctx, src, x86.RCX);
+        }
+
+        # destination address: LEA of vreg stack slot into RDX
+        val dst_off: i32 = get_vreg_offset(ctx, dst.reg, load_size);
+        val dst_disp: i64 = -dst_off::i64;
+        emit_lea(ctx, x86.RDX, x86.RBP, dst_disp, 8);
+
+        # copy 8 bytes at a time
+        var copy_off: usize = 0;
+        for (copy_off < load_size) {
+            var chunk: usize = 8;
+            if (load_size - copy_off < 8) {
+                chunk = load_size - copy_off;
+            }
+            if (chunk >= 4) {
+                emit_mov_reg_mem(ctx, x86.RAX, x86.RCX, copy_off::i64, chunk);
+                emit_mov_mem_reg(ctx, x86.RDX, copy_off::i64, x86.RAX, chunk);
+                if (chunk > 4 && chunk < 8) {
+                    # handle 5-7 byte chunks as 4+remainder
+                    copy_off = copy_off + 4;
+                    val rem: usize = chunk - 4;
+                    emit_mov_reg_mem(ctx, x86.RAX, x86.RCX, copy_off::i64, rem);
+                    emit_mov_mem_reg(ctx, x86.RDX, copy_off::i64, x86.RAX, rem);
+                }
+            } or (chunk >= 2) {
+                emit_movzx_reg_mem(ctx, x86.RAX, x86.RCX, copy_off::i64, chunk, 8);
+                emit_mov_mem_reg(ctx, x86.RDX, copy_off::i64, x86.RAX, chunk);
+            } or {
+                emit_movzx_reg_mem(ctx, x86.RAX, x86.RCX, copy_off::i64, 1, 8);
+                emit_mov_mem_reg(ctx, x86.RDX, copy_off::i64, x86.RAX, 1);
+            }
+            copy_off = copy_off + chunk;
+        }
+        ret;
+    }
+
     # get address into RAX
     if (src.kind == ir.VAL_MEM) {
         # memory operand: compute the effective address (LEA)
@@ -1221,16 +1271,10 @@ pub fun select_load(ctx: *ISelContext, instr: *ir.Instr) {
         load_operand(ctx, src, x86.RAX);
     }
 
-    # load from [RAX] with appropriate size
-    var load_size: usize = dst.size;
-    if (src.kind == ir.VAL_MEM) {
-        load_size = src.size;
-    }
-
     # check sign flag: src2 imm == 1 means signed (use MOVSX)
     val is_signed: bool = instr.src2.kind == ir.VAL_IMM && instr.src2.imm == 1;
 
-    if (needs_chunked_move(load_size)) {
+    if (needs_chunked_move(load_size) && load_size <= 8) {
         if (src.kind == ir.VAL_MEM) {
             compute_addr_rcx(ctx, src);
             emit_load_mem_chunked(ctx, x86.RCX, 0, load_size, x86.RAX);
@@ -1272,6 +1316,67 @@ pub fun select_store(ctx: *ISelContext, instr: *ir.Instr) {
 
     val addr: ir.IRValue = instr.dst;   # destination address
     val value: ir.IRValue = instr.src1; # value to store
+
+    # large aggregate store (> 8 bytes): direct memory-to-memory copy
+    if (value.size > 8) {
+        # get source address into RCX
+        if (value.kind == ir.VAL_MEM) {
+            if (value.base_reg >= 0 && value.base_reg < VREG_START && value.index_reg < 0) {
+                emit_lea(ctx, x86.RCX, value.base_reg, value.offset, 8);
+            } or {
+                compute_addr_rcx(ctx, value);
+            }
+        } or (value.kind == ir.VAL_REG && value.reg >= VREG_START) {
+            val v_off: i32 = get_vreg_offset(ctx, value.reg, value.size);
+            emit_lea(ctx, x86.RCX, x86.RBP, -v_off::i64, 8);
+        } or {
+            load_operand(ctx, value, x86.RCX);
+        }
+
+        # get destination address into RDX
+        if (addr.kind == ir.VAL_MEM) {
+            if (addr.base_reg >= 0 && addr.base_reg < VREG_START && addr.index_reg < 0) {
+                emit_lea(ctx, x86.RDX, addr.base_reg, addr.offset, 8);
+            } or {
+                compute_addr_rax(ctx, addr);
+                emit_mov_reg_reg(ctx, x86.RDX, x86.RAX, 8);
+            }
+        } or (addr.kind == ir.VAL_REG && addr.reg >= VREG_START) {
+            val a_off: i32 = get_vreg_offset(ctx, addr.reg, 8);
+            emit_mov_reg_mem(ctx, x86.RDX, x86.RBP, -a_off::i64, 8);
+        } or (addr.kind == ir.VAL_REG && addr.reg < VREG_START) {
+            emit_mov_reg_reg(ctx, x86.RDX, addr.reg, 8);
+        } or {
+            load_operand(ctx, addr, x86.RDX);
+        }
+
+        # copy 8 bytes at a time using RAX as scratch
+        var s_off: usize = 0;
+        for (s_off < value.size) {
+            var s_chunk: usize = 8;
+            if (value.size - s_off < 8) {
+                s_chunk = value.size - s_off;
+            }
+            if (s_chunk >= 4) {
+                emit_mov_reg_mem(ctx, x86.RAX, x86.RCX, s_off::i64, s_chunk);
+                emit_mov_mem_reg(ctx, x86.RDX, s_off::i64, x86.RAX, s_chunk);
+                if (s_chunk > 4 && s_chunk < 8) {
+                    s_off = s_off + 4;
+                    val s_rem: usize = s_chunk - 4;
+                    emit_mov_reg_mem(ctx, x86.RAX, x86.RCX, s_off::i64, s_rem);
+                    emit_mov_mem_reg(ctx, x86.RDX, s_off::i64, x86.RAX, s_rem);
+                }
+            } or (s_chunk >= 2) {
+                emit_movzx_reg_mem(ctx, x86.RAX, x86.RCX, s_off::i64, s_chunk, 8);
+                emit_mov_mem_reg(ctx, x86.RDX, s_off::i64, x86.RAX, s_chunk);
+            } or {
+                emit_movzx_reg_mem(ctx, x86.RAX, x86.RCX, s_off::i64, 1, 8);
+                emit_mov_mem_reg(ctx, x86.RDX, s_off::i64, x86.RAX, 1);
+            }
+            s_off = s_off + s_chunk;
+        }
+        ret;
+    }
 
     # load value into RAX (handles all source kinds)
     load_operand(ctx, value, x86.RAX);
@@ -1429,6 +1534,9 @@ pub fun select_lea(ctx: *ISelContext, instr: *ir.Instr) {
     } or (src.kind == ir.VAL_LABEL) {
         # load label address into RAX - for labels, LEA is effectively a MOV of the address
         emit_mov_reg_label(ctx, x86.RAX, src.label, 8);
+    } or (src.kind == ir.VAL_REG) {
+        # LEA from a register: the register already contains the address, just MOV it
+        load_operand(ctx, src, x86.RAX);
     }
 
     # store result
@@ -2004,12 +2112,19 @@ pub fun select_cmp(ctx: *ISelContext, instr: *ir.Instr) {
     val lhs: ir.IRValue = instr.src1;
     val rhs: ir.IRValue = instr.src2;
 
+    # use actual operand size for comparison (critical for signed i32 values:
+    # zero-extended i32 in 64-bit RAX loses sign bit, breaking signed comparisons)
+    var cmp_size: usize = 8;
+    if (lhs.size > 0 && lhs.size < 8) {
+        cmp_size = lhs.size;
+    }
+
     # load lhs into RAX (handles all source kinds)
     load_operand(ctx, lhs, x86.RAX);
 
     # cmp with rhs
     if (rhs.kind == ir.VAL_IMM) {
-        emit_cmp_reg_imm(ctx, x86.RAX, rhs.imm, 8);
+        emit_cmp_reg_imm(ctx, x86.RAX, rhs.imm, cmp_size);
     } or {
         # load rhs into RCX - for VAL_MEM, save RAX first
         if (rhs.kind == ir.VAL_MEM) {
@@ -2019,7 +2134,7 @@ pub fun select_cmp(ctx: *ISelContext, instr: *ir.Instr) {
         } or {
             load_operand(ctx, rhs, x86.RCX);
         }
-        emit_cmp_reg_reg(ctx, x86.RAX, x86.RCX, 8);
+        emit_cmp_reg_reg(ctx, x86.RAX, x86.RCX, cmp_size);
     }
 }
 
@@ -2220,6 +2335,14 @@ pub fun select_block(ctx: *ISelContext, block: *ir.IRBlock) {
     # process each instruction
     var i: i32 = 0;
     for (i < block.instr_count) {
+        # record debug line entry if instruction has source location
+        if (block.instrs[i].src_line > 0 && block.instrs[i].src_file > 0 && ctx.m != nil) {
+            masm.add_debug_line(ctx.m,
+                section.current_offset(ctx.text),
+                block.instrs[i].src_file,
+                block.instrs[i].src_line
+            );
+        }
         select_instr(ctx, ?block.instrs[i]);
         i = i + 1;
     }
@@ -2268,11 +2391,14 @@ pub fun select_function(ctx: *ISelContext, func: *ir.IRFunction) Result[bool, st
     # reset context for new function
     reset(ctx);
 
+    # record function start offset and symbol
+    val func_start_offset: usize = section.current_offset(ctx.text);
+
     # record function symbol offset and mark as defined
     if (func.name != nil && ctx.m != nil) {
         val existing: *sym.Symbol = masm.get_symbol(ctx.m, func.name);
         if (existing != nil) {
-            sym.define(existing, ctx.text, section.current_offset(ctx.text), 0);
+            sym.define(existing, ctx.text, func_start_offset, 0);
         }
     }
 
@@ -2304,6 +2430,16 @@ pub fun select_function(ctx: *ISelContext, func: *ir.IRFunction) Result[bool, st
     # emit epilogue (unless entry point - _start should exit via syscall)
     if (!is_entry) {
         emit_epilogue(ctx, ctx.total_stack_size);
+    }
+
+    # compute and set function size on symbol
+    val func_end_offset: usize = section.current_offset(ctx.text);
+    val func_size: usize = func_end_offset - func_start_offset;
+    if (func.name != nil && ctx.m != nil) {
+        val size_sym: *sym.Symbol = masm.get_symbol(ctx.m, func.name);
+        if (size_sym != nil) {
+            size_sym.size = func_size;
+        }
     }
 
     ret ok[bool, str](true);

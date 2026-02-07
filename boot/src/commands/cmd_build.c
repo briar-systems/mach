@@ -441,13 +441,31 @@ int cmd_build_handle(int argc, char **argv)
 
     // emit object (ET_REL) first.
     // - single-file mode: output is the object at `-o` (or default "output")
-    // - project mode: emit an intermediate `<final_output>.o`, then link/archive
+    // - project mode: emit to <out_dir>/obj/main.o, then link/archive
     const char *final_output = output_file;
     const char *obj_output   = output_file;
     char        obj_path[2048];
     if (is_project)
     {
-        snprintf(obj_path, sizeof(obj_path), "%s.o", final_output);
+        // derive obj dir as sibling "obj" directory next to the binary
+        char *out_dir = strdup(output_file);
+        char *last_sep2 = strrchr(out_dir, '/');
+        if (last_sep2)
+        {
+            *last_sep2 = '\0';
+            char obj_dir[2048];
+            snprintf(obj_dir, sizeof(obj_dir), "%s/obj", out_dir);
+            // create obj directory
+            char mkdir_obj[2560];
+            snprintf(mkdir_obj, sizeof(mkdir_obj), "mkdir -p %s 2>/dev/null", obj_dir);
+            system(mkdir_obj);
+            snprintf(obj_path, sizeof(obj_path), "%s/main.o", obj_dir);
+        }
+        else
+        {
+            snprintf(obj_path, sizeof(obj_path), "%s.o", final_output);
+        }
+        free(out_dir);
         obj_output = obj_path;
     }
 
