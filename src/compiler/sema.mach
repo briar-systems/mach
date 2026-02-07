@@ -135,6 +135,28 @@ pub rec MethodInstantiation {
     next:          *MethodInstantiation;
 }
 
+# InstMapEntry: a single entry in the instantiation dedup hash table.
+# ---
+# key:  mangled name string (nil if slot is empty)
+# val:  persistent mangled name pointer (returned on dedup hit)
+pub rec InstMapEntry {
+    key: str;
+    value: str;
+}
+
+# INST_MAP_SIZE: number of buckets in the instantiation hash table.
+# must be a power of two for fast masking.
+val INST_MAP_SIZE: i32 = 256;
+
+# InstMap: open-addressing hash table for O(1) instantiation dedup.
+# ---
+# entries: flat array of INST_MAP_SIZE buckets
+# count:   number of occupied slots
+pub rec InstMap {
+    entries: *InstMapEntry;
+    count:   i32;
+}
+
 # SemaModule: represents a loaded module during semantic analysis.
 # ---
 # path:        the module path (e.g., "mach.cli.main")
@@ -230,6 +252,8 @@ pub rec Sema {
     method_inst_count: i32;
     func_insts:      *FunctionInstantiation;  # linked list of generic function instantiations
     func_inst_count: i32;
+    func_inst_map:   InstMap;                 # hash table for O(1) function instantiation dedup
+    method_inst_map: InstMap;                 # hash table for O(1) method instantiation dedup
 }
 
 # --- initialization and cleanup ---
@@ -287,7 +311,83 @@ pub fun init(alloc: *allocator.Allocator) Sema {
     sema.method_inst_count = 0;
     sema.func_insts = nil;
     sema.func_inst_count = 0;
+    sema.func_inst_map.entries = nil;
+    sema.func_inst_map.count = 0;
+    sema.method_inst_map.entries = nil;
+    sema.method_inst_map.count = 0;
     ret sema;
+}
+
+# --- instantiation hash table helpers ---
+
+# inst_map_hash: FNV-1a hash of a string, returning a bucket index.
+fun inst_map_hash(s: str) i32 {
+    if (s == nil) {
+        ret 0;
+    }
+    var h: u64 = 14695981039346656037;  # FNV offset basis
+    val len: usize = s.len();
+    var i: usize = 0;
+    for (i < len) {
+        h = h ^ s[i]::u64;
+        h = h * 1099511628211;  # FNV prime
+        i = i + 1;
+    }
+    ret (h & (INST_MAP_SIZE - 1)::u64)::i32;
+}
+
+# inst_map_get: look up a mangled name in the hash table.
+# returns the persistent name if found, nil otherwise.
+fun inst_map_get(m: *InstMap, key: str) str {
+    if (m == nil || m.entries == nil || key == nil) {
+        ret nil;
+    }
+    var idx: i32 = inst_map_hash(key);
+    var probes: i32 = 0;
+    for (probes < INST_MAP_SIZE) {
+        val e: *InstMapEntry = ?m.entries[idx];
+        if (e.key == nil) {
+            ret nil;
+        }
+        if (e.key.equals(key)) {
+            ret e.value;
+        }
+        idx = (idx + 1) & (INST_MAP_SIZE - 1);
+        probes = probes + 1;
+    }
+    ret nil;
+}
+
+# inst_map_put: insert a mangled name into the hash table.
+# allocates the backing array on first use.
+fun inst_map_put(m: *InstMap, alloc: *allocator.Allocator, key: str, val_name: str) {
+    if (m == nil || alloc == nil || key == nil) {
+        ret;
+    }
+    # lazy-allocate the entries array
+    if (m.entries == nil) {
+        val res: Result[*InstMapEntry, allocator.AllocError] = alloc.zalloc[InstMapEntry](INST_MAP_SIZE::usize);
+        if (res.is_err()) {
+            ret;
+        }
+        m.entries = res.unwrap_ok();
+    }
+    var idx: i32 = inst_map_hash(key);
+    var probes: i32 = 0;
+    for (probes < INST_MAP_SIZE) {
+        val e: *InstMapEntry = ?m.entries[idx];
+        if (e.key == nil) {
+            e.key = key;
+            e.value = val_name;
+            m.count = m.count + 1;
+            ret;
+        }
+        if (e.key.equals(key)) {
+            ret;  # already present
+        }
+        idx = (idx + 1) & (INST_MAP_SIZE - 1);
+        probes = probes + 1;
+    }
 }
 
 # --- helper functions ---
@@ -3240,13 +3340,10 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
 
     val mangled_name: str = (?mangled_buf[0])::str;
 
-    # check if this instantiation already exists
-    var existing: *FunctionInstantiation = sema.func_insts;
-    for (existing != nil) {
-        if (existing.mangled_name != nil && existing.mangled_name.equals(mangled_name)) {
-            ret existing.mangled_name;
-        }
-        existing = existing.next;
+    # check if this instantiation already exists (O(1) hash lookup)
+    val existing_name: str = inst_map_get(?sema.func_inst_map, mangled_name);
+    if (existing_name != nil) {
+        ret existing_name;
     }
 
     # get generic param names
@@ -3390,6 +3487,7 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
     finst.next = sema.func_insts;
     sema.func_insts = finst;
     sema.func_inst_count = sema.func_inst_count + 1;
+    inst_map_put(?sema.func_inst_map, sema.alloc, pname, pname);
 
     # create a symbol for the instantiated function
     val inst_sym_res: Result[*symbol.Symbol, str] = sema.symbols.define(pname, symbol.SYM_FUN);
@@ -3470,14 +3568,10 @@ pub fun instantiate_generic_method(sema: *Sema, method_sym: *symbol.Symbol, recv
 
     val mangled_name: str = (?mangled_buf[0])::str;
 
-    # check if this instantiation already exists
-    var existing: *MethodInstantiation = sema.method_insts;
-    for (existing != nil) {
-        if (existing.mangled_name != nil && existing.mangled_name.equals(mangled_name)) {
-            # already instantiated - return existing name
-            ret existing.mangled_name;
-        }
-        existing = existing.next;
+    # check if this instantiation already exists (O(1) hash lookup)
+    val existing_name: str = inst_map_get(?sema.method_inst_map, mangled_name);
+    if (existing_name != nil) {
+        ret existing_name;
     }
 
     # get generic param names from the receiver type's declaration
@@ -3657,6 +3751,7 @@ pub fun instantiate_generic_method(sema: *Sema, method_sym: *symbol.Symbol, recv
     inst.next = sema.method_insts;
     sema.method_insts = inst;
     sema.method_inst_count = sema.method_inst_count + 1;
+    inst_map_put(?sema.method_inst_map, sema.alloc, pname, pname);
 
     # define symbol in root scope (not current function-local scope)
     # this ensures the symbol persists after function analysis completes
@@ -3931,13 +4026,10 @@ pub fun instantiate_generic_own_method(sema: *Sema, method_sym: *symbol.Symbol,
 
     val mangled_name: str = (?mangled_buf[0])::str;
 
-    # check for existing instantiation
-    var existing: *MethodInstantiation = sema.method_insts;
-    for (existing != nil) {
-        if (existing.mangled_name != nil && existing.mangled_name.equals(mangled_name)) {
-            ret existing.mangled_name;
-        }
-        existing = existing.next;
+    # check for existing instantiation (O(1) hash lookup)
+    val existing_name: str = inst_map_get(?sema.method_inst_map, mangled_name);
+    if (existing_name != nil) {
+        ret existing_name;
     }
 
     # get param names
@@ -4086,6 +4178,7 @@ pub fun instantiate_generic_own_method(sema: *Sema, method_sym: *symbol.Symbol,
     inst.next = sema.method_insts;
     sema.method_insts = inst;
     sema.method_inst_count = sema.method_inst_count + 1;
+    inst_map_put(?sema.method_inst_map, sema.alloc, pname, pname);
 
     # define symbol in root scope (not current function-local scope)
     val own_saved_scope: *symbol.Scope = sema.symbols.current;
