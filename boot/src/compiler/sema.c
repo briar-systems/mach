@@ -3263,6 +3263,12 @@ int sema_analyze_expr(Sema *sema, AstNode *node)
         Type *obj_type   = node->field_expr.object->type;
         Type *deref_type = obj_type;
 
+        if (obj_type == NULL)
+        {
+            sema_error(sema, node->field_expr.object->token, "cannot access field on expression with unknown type");
+            return -1;
+        }
+
         // auto-dereference pointer to record/union for field access
         if (obj_type->kind == TYPE_POINTER && (obj_type->pointer.base->kind == TYPE_STRUCT || obj_type->pointer.base->kind == TYPE_UNION))
         {
