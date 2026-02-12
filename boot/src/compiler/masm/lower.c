@@ -1324,8 +1324,14 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
     }
     else if (func->kind == AST_EXPR_FIELD)
     {
-        // Module-qualified call (e.g., module.func()) or function pointer field
-        if (func->symbol)
+        // Function pointer field on a struct (e.g., h.hash_fn(...))
+        if (func->type && func->type->kind == TYPE_FUNCTION)
+        {
+            target = lower_expr(masm, text, func, ctx);
+            target = ensure_in_reg(text, target, func->type, ctx);
+        }
+        // Module-qualified call (e.g., module.func())
+        else if (func->symbol)
         {
             const char *link = symbol_linkage_name(func->symbol);
             target = link ? masm_operand_label(link) : masm_operand_label(func->field_expr.field);
