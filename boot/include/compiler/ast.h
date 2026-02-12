@@ -152,9 +152,6 @@ struct AstNode
             AstNode *body;        // null for external functions
             bool     is_variadic; // true if function has variadic arguments
             bool     is_public;
-            bool     is_method;            // deprecated: will be removed with sema method cleanup
-            AstNode *method_receiver;      // deprecated: will be removed with sema method cleanup
-            char    *method_receiver_name; // deprecated: will be removed with sema method cleanup
         } fun_stmt;
 
         // test statement
@@ -281,7 +278,6 @@ struct AstNode
             AstNode *func;
             AstList *args;
             AstList *type_args;
-            bool     is_method_call; // true when callee is a method
         } call_expr;
 
         // array indexing
@@ -296,7 +292,6 @@ struct AstNode
         {
             AstNode *object;
             char    *field;
-            bool     is_method; // true when referring to a method symbol
         } field_expr;
 
         // type cast

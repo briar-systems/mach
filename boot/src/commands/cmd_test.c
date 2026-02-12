@@ -196,7 +196,6 @@ static AstNode *make_call(const char *name, AstNode **args, int arg_count)
     node->call_expr.func           = make_ident(name);
     node->call_expr.args           = make_list();
     node->call_expr.type_args      = NULL;
-    node->call_expr.is_method_call = false;
 
     if (!node->call_expr.func || !node->call_expr.args)
     {

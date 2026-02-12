@@ -56,8 +56,4 @@ int          symbol_table_insert(SymbolTable *table, Symbol *symbol);
 Symbol      *symbol_table_lookup(SymbolTable *table, const char *name);
 Symbol      *symbol_table_lookup_local(SymbolTable *table, const char *name);
 
-// method lookup - finds methods stored with qualified names "TypeName.methodName"
-Symbol      *symbol_table_lookup_method_local(SymbolTable *table, const char *method_name);
-Symbol      *symbol_table_lookup_method_next(SymbolTable *table, const char *method_name, Symbol *after);
-
 #endif
