@@ -264,9 +264,6 @@ static AstNode *make_fun(const char *name, AstList *params, AstNode *return_type
     node->fun_stmt.body                 = body;
     node->fun_stmt.is_variadic          = false;
     node->fun_stmt.is_public            = false;
-    node->fun_stmt.is_method            = false;
-    node->fun_stmt.method_receiver      = NULL;
-    node->fun_stmt.method_receiver_name = NULL;
     return node;
 }
 

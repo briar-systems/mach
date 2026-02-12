@@ -1506,68 +1506,13 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
         return NULL;
     }
 
-    if (parser_check(parser, TOKEN_L_PAREN))
+    node->fun_stmt.name = parser_parse_identifier(parser);
+    if (!node->fun_stmt.name)
     {
-        parser_advance(parser); // consume '('
-
-        char *receiver_name = parser_parse_identifier(parser);
-        if (!receiver_name)
-        {
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-
-        if (!parser_consume(parser, TOKEN_COLON, "expected ':' after method receiver name"))
-        {
-            free(receiver_name);
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-
-        AstNode *receiver_type = parser_parse_type(parser);
-        if (!receiver_type)
-        {
-            free(receiver_name);
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-
-        if (!parser_consume(parser, TOKEN_R_PAREN, "expected ')' after method receiver"))
-        {
-            free(receiver_name);
-            ast_node_dnit(receiver_type);
-            free(receiver_type);
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-
-        node->fun_stmt.is_method            = true;
-        node->fun_stmt.method_receiver      = receiver_type;
-        node->fun_stmt.method_receiver_name = receiver_name;
-
-        node->fun_stmt.name = parser_parse_identifier(parser);
-        if (!node->fun_stmt.name)
-        {
-            parser_error_at_current(parser, "expected method name after receiver");
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-    }
-    else
-    {
-        node->fun_stmt.name = parser_parse_identifier(parser);
-        if (!node->fun_stmt.name)
-        {
-            parser_error_at_current(parser, "expected identifier after 'fun'");
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
+        parser_error_at_current(parser, "expected identifier after 'fun'");
+        ast_node_dnit(node);
+        free(node);
+        return NULL;
     }
 
     if (parser_match(parser, TOKEN_L_BRACKET))
@@ -1596,40 +1541,6 @@ AstNode *parser_parse_stmt_fun(Parser *parser, bool is_public)
         ast_node_dnit(node);
         free(node);
         return NULL;
-    }
-
-    if (node->fun_stmt.is_method)
-    {
-        AstNode *receiver_param = parser_alloc_node(parser, AST_STMT_PARAM, parser->current);
-        if (!receiver_param)
-        {
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-
-        receiver_param->param_stmt.is_variadic = false;
-        receiver_param->param_stmt.name        = strdup(node->fun_stmt.method_receiver_name ? node->fun_stmt.method_receiver_name : "");
-        if (!receiver_param->param_stmt.name)
-        {
-            ast_node_dnit(receiver_param);
-            free(receiver_param);
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-
-        receiver_param->param_stmt.type = ast_clone(node->fun_stmt.method_receiver);
-        if (!receiver_param->param_stmt.type)
-        {
-            ast_node_dnit(receiver_param);
-            free(receiver_param);
-            ast_node_dnit(node);
-            free(node);
-            return NULL;
-        }
-
-        ast_list_prepend(node->fun_stmt.params, receiver_param);
     }
 
     if (!parser_check(parser, TOKEN_R_PAREN))
