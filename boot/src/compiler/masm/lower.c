@@ -1322,110 +1322,17 @@ static MasmOperand lower_call_with_sret(Masm *masm, MasmSection *text, AstNode *
             }
         }
     }
-    else if (func->kind == AST_EXPR_FIELD && func->field_expr.is_method && func->symbol)
-    {
-        // Method call: use symbol linkage name for direct call
-        const char *link = symbol_linkage_name(func->symbol);
-        if (link)
-        {
-            target = masm_operand_label(link);
-        }
-        else
-        {
-            // Fallback to indirect call if no linkage name
-            target = lower_expr(masm, text, func, ctx);
-            target = ensure_in_reg(text, target, func->type, ctx);
-        }
-    }
     else if (func->kind == AST_EXPR_FIELD)
     {
-        // FIELD callee without sema-resolved is_method/symbol.
-        // This happens for imported modules where sema pass 3 didn't run.
-        // Detect method calls by checking local variable types and symbol tables.
-        const char *method_name = func->field_expr.field;
-        AstNode    *base        = func->field_expr.object;
-        bool        is_module_qualified  = false;
-        const char *receiver_type_name   = NULL;
-
-        if (base && base->kind == AST_EXPR_IDENT)
+        // Module-qualified call (e.g., module.func()) or function pointer field
+        if (func->symbol)
         {
-            // Check if base is a local variable (method call) or module alias
-            LocalVar *lvar = find_local_var(ctx, base->ident_expr.name);
-            if (lvar)
-            {
-                // It's a local variable - get type for method qualification
-                Type *base_type = lvar->type;
-                while (base_type && base_type->kind == TYPE_POINTER)
-                    base_type = base_type->pointer.base;
-
-                if (base_type && base_type->kind == TYPE_STRUCT && base_type->structure.name)
-                    receiver_type_name = base_type->structure.name;
-                else if (base_type && base_type->kind == TYPE_UNION && base_type->union_type.name)
-                    receiver_type_name = base_type->union_type.name;
-                // else: type is nil or primitive - will fall through to symbol search
-            }
-            else
-            {
-                // Not a local variable - assume module-qualified call
-                is_module_qualified = true;
-            }
-        }
-        // else: base is not an identifier (chained call) - always a method call
-
-        // If no type found and not module-qualified, search symbol tables
-        if (!is_module_qualified && !receiver_type_name && method_name && ctx->symbols)
-        {
-            Symbol *method_sym = symbol_table_lookup_method_local(ctx->symbols, method_name);
-            if (method_sym && method_sym->name)
-            {
-                const char *dot = strrchr(method_sym->name, '.');
-                if (dot)
-                {
-                    size_t prefix_len = (size_t)(dot - method_sym->name);
-                    char  *prefix     = malloc(prefix_len + 1);
-                    memcpy(prefix, method_sym->name, prefix_len);
-                    prefix[prefix_len] = '\0';
-                    receiver_type_name = prefix;
-                }
-            }
-        }
-
-        if (!is_module_qualified && receiver_type_name && method_name)
-        {
-            // Build qualified name "ReceiverType.methodName" and verify it exists
-            size_t rlen      = strlen(receiver_type_name);
-            size_t mlen      = strlen(method_name);
-            char  *qualified = malloc(rlen + 1 + mlen + 1);
-            memcpy(qualified, receiver_type_name, rlen);
-            qualified[rlen] = '.';
-            memcpy(qualified + rlen + 1, method_name, mlen);
-            qualified[rlen + 1 + mlen] = '\0';
-
-            // Verify the qualified method exists in the symbol table
-            Symbol *verified = ctx->symbols ? symbol_table_lookup(ctx->symbols, qualified) : NULL;
-            if (verified)
-            {
-                const char *link = symbol_linkage_name(verified);
-                target = masm_operand_label(link ? link : qualified);
-            }
-            else
-            {
-                // Not a method - it's a field access (function pointer call)
-                free(qualified);
-                target = lower_expr(masm, text, func, ctx);
-                target = ensure_in_reg(text, target, func->type, ctx);
-            }
-        }
-        else if (is_module_qualified)
-        {
-            // Module-qualified call - use bare method name as label
-            target = masm_operand_label(method_name);
+            const char *link = symbol_linkage_name(func->symbol);
+            target = link ? masm_operand_label(link) : masm_operand_label(func->field_expr.field);
         }
         else
         {
-            // Unresolved - fall back to indirect call
-            target = lower_expr(masm, text, func, ctx);
-            target = ensure_in_reg(text, target, func->type, ctx);
+            target = masm_operand_label(func->field_expr.field);
         }
     }
     else
