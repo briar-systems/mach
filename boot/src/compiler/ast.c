@@ -94,12 +94,6 @@ void ast_node_dnit(AstNode *node)
             ast_list_dnit(node->fun_stmt.generics);
             free(node->fun_stmt.generics);
         }
-        if (node->fun_stmt.method_receiver)
-        {
-            ast_node_dnit(node->fun_stmt.method_receiver);
-            free(node->fun_stmt.method_receiver);
-        }
-        free(node->fun_stmt.method_receiver_name);
         if (node->fun_stmt.return_type)
         {
             ast_node_dnit(node->fun_stmt.return_type);
@@ -628,8 +622,6 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->ext_stmt.name            = ast_strdup(node->ext_stmt.name);
         clone->ext_stmt.convention      = ast_strdup(node->ext_stmt.convention);
         clone->ext_stmt.symbol          = ast_strdup(node->ext_stmt.symbol);
-        clone->fun_stmt.is_method       = node->fun_stmt.is_method;
-        clone->fun_stmt.method_receiver = ast_clone_checked(node->fun_stmt.method_receiver);
         clone->ext_stmt.type            = ast_clone_checked(node->ext_stmt.type);
         clone->ext_stmt.is_public       = node->ext_stmt.is_public;
         break;
@@ -657,9 +649,6 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->fun_stmt.body                 = ast_clone_checked(node->fun_stmt.body);
         clone->fun_stmt.is_variadic          = node->fun_stmt.is_variadic;
         clone->fun_stmt.is_public            = node->fun_stmt.is_public;
-        clone->fun_stmt.is_method            = node->fun_stmt.is_method;
-        clone->fun_stmt.method_receiver      = ast_clone_checked(node->fun_stmt.method_receiver);
-        clone->fun_stmt.method_receiver_name = ast_strdup(node->fun_stmt.method_receiver_name);
         break;
 
     case AST_STMT_TEST:
@@ -765,7 +754,6 @@ static AstNode *ast_clone_checked(const AstNode *node)
         clone->call_expr.func           = ast_clone_checked(node->call_expr.func);
         clone->call_expr.args           = ast_list_clone(node->call_expr.args);
         clone->call_expr.type_args      = ast_list_clone(node->call_expr.type_args);
-        clone->call_expr.is_method_call = node->call_expr.is_method_call;
         break;
 
     case AST_EXPR_INDEX:
@@ -776,7 +764,6 @@ static AstNode *ast_clone_checked(const AstNode *node)
     case AST_EXPR_FIELD:
         clone->field_expr.object    = ast_clone_checked(node->field_expr.object);
         clone->field_expr.field     = ast_strdup(node->field_expr.field);
-        clone->field_expr.is_method = node->field_expr.is_method;
         break;
 
     case AST_EXPR_CAST:
