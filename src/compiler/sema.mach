@@ -119,17 +119,18 @@ pub rec InstMapEntry {
     value: str;
 }
 
-# INST_MAP_SIZE: number of buckets in the instantiation hash table.
-# must be a power of two for fast masking.
-val INST_MAP_SIZE: i32 = 256;
+# INST_MAP_INIT_CAP: initial number of buckets (must be power of two).
+val INST_MAP_INIT_CAP: i32 = 64;
 
 # InstMap: open-addressing hash table for O(1) instantiation dedup.
 # ---
-# entries: flat array of INST_MAP_SIZE buckets
-# count:   number of occupied slots
+# entries:  flat array of `capacity` buckets
+# count:    number of occupied slots
+# capacity: current bucket count (always a power of two)
 pub rec InstMap {
-    entries: *InstMapEntry;
-    count:   i32;
+    entries:  *InstMapEntry;
+    count:    i32;
+    capacity: i32;
 }
 
 # SemaModule: represents a loaded module during semantic analysis.
@@ -283,13 +284,14 @@ pub fun init(alloc: *allocator.Allocator) Sema {
     sema.func_inst_count = 0;
     sema.func_inst_map.entries = nil;
     sema.func_inst_map.count = 0;
+    sema.func_inst_map.capacity = 0;
     ret sema;
 }
 
 # --- instantiation hash table helpers ---
 
 # inst_map_hash: FNV-1a hash of a string, returning a bucket index.
-fun inst_map_hash(s: str) i32 {
+fun inst_map_hash(s: str, cap: i32) i32 {
     if (s == nil) {
         ret 0;
     }
@@ -301,48 +303,39 @@ fun inst_map_hash(s: str) i32 {
         h = h * 1099511628211;  # FNV prime
         i = i + 1;
     }
-    ret (h & (INST_MAP_SIZE - 1)::u64)::i32;
+    ret (h & (cap - 1)::u64)::i32;
 }
 
-# inst_map_get: look up a mangled name in the hash table.
-# returns the persistent name if found, nil otherwise.
-fun inst_map_get(m: *InstMap, key: str) str {
-    if (m == nil || m.entries == nil || key == nil) {
-        ret nil;
-    }
-    var idx: i32 = inst_map_hash(key);
-    var probes: i32 = 0;
-    for (probes < INST_MAP_SIZE) {
-        val e: *InstMapEntry = ?m.entries[idx];
-        if (e.key == nil) {
-            ret nil;
-        }
-        if (str_equals(e.key, key)) {
-            ret e.value;
-        }
-        idx = (idx + 1) & (INST_MAP_SIZE - 1);
-        probes = probes + 1;
-    }
-    ret nil;
-}
+# inst_map_grow: double the capacity and rehash all entries.
+fun inst_map_grow(m: *InstMap, alloc: *allocator.Allocator) {
+    val old_entries: *InstMapEntry = m.entries;
+    val old_cap: i32 = m.capacity;
+    val new_cap: i32 = old_cap * 2;
 
-# inst_map_put: insert a mangled name into the hash table.
-# allocates the backing array on first use.
-fun inst_map_put(m: *InstMap, alloc: *allocator.Allocator, key: str, val_name: str) {
-    if (m == nil || alloc == nil || key == nil) {
+    val res: Result[*InstMapEntry, allocator.AllocError] = allocator.allocator_zalloc[InstMapEntry](alloc, new_cap::usize);
+    if (result_is_err[*InstMapEntry, allocator.AllocError](res)) {
         ret;
     }
-    # lazy-allocate the entries array
-    if (m.entries == nil) {
-        val res: Result[*InstMapEntry, allocator.AllocError] = allocator.allocator_zalloc[InstMapEntry](alloc, INST_MAP_SIZE::usize);
-        if (result_is_err[*InstMapEntry, allocator.AllocError](res)) {
-            ret;
+    m.entries = result_unwrap_ok[*InstMapEntry, allocator.AllocError](res);
+    m.capacity = new_cap;
+    m.count = 0;
+
+    var i: i32 = 0;
+    for (i < old_cap) {
+        val e: *InstMapEntry = ?old_entries[i];
+        if (e.key != nil) {
+            inst_map_put_inner(m, e.key, e.value);
         }
-        m.entries = result_unwrap_ok[*InstMapEntry, allocator.AllocError](res);
+        i = i + 1;
     }
-    var idx: i32 = inst_map_hash(key);
+    allocator.allocator_free[InstMapEntry](alloc, old_entries, old_cap::usize);
+}
+
+# inst_map_put_inner: insert without grow check (used by grow and put).
+fun inst_map_put_inner(m: *InstMap, key: str, val_name: str) {
+    var idx: i32 = inst_map_hash(key, m.capacity);
     var probes: i32 = 0;
-    for (probes < INST_MAP_SIZE) {
+    for (probes < m.capacity) {
         val e: *InstMapEntry = ?m.entries[idx];
         if (e.key == nil) {
             e.key = key;
@@ -353,9 +346,54 @@ fun inst_map_put(m: *InstMap, alloc: *allocator.Allocator, key: str, val_name: s
         if (str_equals(e.key, key)) {
             ret;  # already present
         }
-        idx = (idx + 1) & (INST_MAP_SIZE - 1);
+        idx = (idx + 1) & (m.capacity - 1);
         probes = probes + 1;
     }
+}
+
+# inst_map_get: look up a mangled name in the hash table.
+# returns the persistent name if found, nil otherwise.
+pub fun inst_map_get(m: *InstMap, key: str) str {
+    if (m == nil || m.entries == nil || key == nil) {
+        ret nil;
+    }
+    var idx: i32 = inst_map_hash(key, m.capacity);
+    var probes: i32 = 0;
+    for (probes < m.capacity) {
+        val e: *InstMapEntry = ?m.entries[idx];
+        if (e.key == nil) {
+            ret nil;
+        }
+        if (str_equals(e.key, key)) {
+            ret e.value;
+        }
+        idx = (idx + 1) & (m.capacity - 1);
+        probes = probes + 1;
+    }
+    ret nil;
+}
+
+# inst_map_put: insert a mangled name into the hash table.
+# lazily allocates and grows as needed (75% load factor).
+pub fun inst_map_put(m: *InstMap, alloc: *allocator.Allocator, key: str, val_name: str) {
+    if (m == nil || alloc == nil || key == nil) {
+        ret;
+    }
+    # lazy-allocate the entries array
+    if (m.entries == nil) {
+        val cap: i32 = INST_MAP_INIT_CAP;
+        val res: Result[*InstMapEntry, allocator.AllocError] = allocator.allocator_zalloc[InstMapEntry](alloc, cap::usize);
+        if (result_is_err[*InstMapEntry, allocator.AllocError](res)) {
+            ret;
+        }
+        m.entries = result_unwrap_ok[*InstMapEntry, allocator.AllocError](res);
+        m.capacity = cap;
+    }
+    # grow at 75% load factor
+    if (m.count * 4 >= m.capacity * 3) {
+        inst_map_grow(m, alloc);
+    }
+    inst_map_put_inner(m, key, val_name);
 }
 
 # --- helper functions ---
@@ -3208,6 +3246,21 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
     # check if this instantiation already exists (O(1) hash lookup)
     val existing_name: str = inst_map_get(?sema.func_inst_map, mangled_name);
     if (existing_name != nil) {
+        # ensure the symbol is also visible in the caller's root scope
+        # so resolve_call can attach node.symbol
+        val cur_opt: Option[*symbol.Symbol] = symbol.table_lookup(sema.symbols, existing_name);
+        if (!option_is_some[*symbol.Symbol](cur_opt)) {
+            val sc: *symbol.Scope = sema.symbols.current;
+            sema.symbols.current = sema.symbols.root;
+            val alias_res: Result[*symbol.Symbol, str] = symbol.table_define(sema.symbols, existing_name, symbol.SYM_FUN);
+            if (result_is_ok[*symbol.Symbol, str](alias_res)) {
+                val alias_sym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](alias_res);
+                alias_sym.module_path = func_sym.module_path;
+                alias_sym.is_public = func_sym.is_public;
+                alias_sym.decl_node = func_sym.decl_node;
+            }
+            sema.symbols.current = sc;
+        }
         ret existing_name;
     }
 
@@ -3231,6 +3284,7 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
     # resolve in the correct module context
     val saved_mod: *SemaModule = sema.current_module;
     val saved_symbols: *symbol.Table = sema.symbols;
+    var origin_table: *symbol.Table = sema.symbols;
     if (func_sym.module_path != nil) {
         var origin_mod: *SemaModule = sema.modules;
         for (origin_mod != nil) {
@@ -3238,6 +3292,7 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
                 sema.current_module = origin_mod;
                 if (origin_mod.table != nil) {
                     sema.symbols = origin_mod.table;
+                    origin_table = origin_mod.table;
                 }
             }
             origin_mod = origin_mod.next;
@@ -3289,6 +3344,13 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
             }
             pi = pi + 1;
         }
+    }
+
+    # walk the function body to instantiate nested generic calls
+    # (e.g., allocator_alloc[T] calls result_is_err[*T, AllocError])
+    # while type bindings are active so T resolves to the concrete type
+    if (func_decl.info.fun_decl.body != nil) {
+        instantiate_nested_generic_calls(sema, func_decl.info.fun_decl.body);
     }
 
     symbol.table_pop_scope(sema.symbols);
@@ -3354,14 +3416,33 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
     sema.func_inst_count = sema.func_inst_count + 1;
     inst_map_put(?sema.func_inst_map, sema.alloc, pname, pname);
 
-    # create a symbol for the instantiated function
-    val inst_sym_res: Result[*symbol.Symbol, str] = symbol.table_define(sema.symbols, pname, symbol.SYM_FUN);
+    # create a symbol for the instantiated function in the ORIGIN module's ROOT scope
+    # (not the current scope, which may be a temporary scope that gets popped)
+    val saved_current: *symbol.Scope = origin_table.current;
+    origin_table.current = origin_table.root;
+    val inst_sym_res: Result[*symbol.Symbol, str] = symbol.table_define(origin_table, pname, symbol.SYM_FUN);
     if (result_is_ok[*symbol.Symbol, str](inst_sym_res)) {
         val inst_sym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](inst_sym_res);
         inst_sym.resolved_type = inst_func_type;
         inst_sym.decl_node = func_decl;
         inst_sym.module_path = func_sym.module_path;
         inst_sym.is_public = func_sym.is_public;
+    }
+    origin_table.current = saved_current;
+
+    # also register in the caller's root scope so resolve_call can attach node.symbol
+    if (saved_symbols != origin_table) {
+        val saved_caller_current: *symbol.Scope = saved_symbols.current;
+        saved_symbols.current = saved_symbols.root;
+        val caller_sym_res: Result[*symbol.Symbol, str] = symbol.table_define(saved_symbols, pname, symbol.SYM_FUN);
+        if (result_is_ok[*symbol.Symbol, str](caller_sym_res)) {
+            val caller_sym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](caller_sym_res);
+            caller_sym.resolved_type = inst_func_type;
+            caller_sym.decl_node = func_decl;
+            caller_sym.module_path = func_sym.module_path;
+            caller_sym.is_public = func_sym.is_public;
+        }
+        saved_symbols.current = saved_caller_current;
     }
 
     ret pname;
