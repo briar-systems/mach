@@ -26,7 +26,7 @@ GENERIC_FUNCS = {
     "option_is_none": (1, "T"),
     "option_is_some": (1, "T"),
     # Vector[T] functions
-    "vector_deinit": (1, "T"),
+    "vector_dnit": (1, "T"),
     "vector_is_empty": (1, "T"),
     "vector_length": (1, "T"),
     "vector_capacity": (1, "T"),
