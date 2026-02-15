@@ -1,0 +1,684 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+use std.types.option;
+
+use allocator: std.allocator;
+
+use ast:     mach.compiler.ast;
+use symbol:  mach.compiler.symbol;
+use ty:      mach.compiler.type;
+use token:   mach.compiler.token;
+
+use ir:      mach.compiler.masm.ir;
+use isel:    mach.compiler.masm.isa.dispatch;
+use masm:    mach.compiler.masm.masm;
+use section: mach.compiler.masm.section;
+
+use mach.compiler.masm.lower.lower;
+use lexpr: mach.compiler.masm.lower.expr;
+use call: mach.compiler.masm.lower.call;
+
+# emit_deferred_from: emit deferred statements from given index to current.
+# ---
+# ctx:        lowering context
+# from_index: starting index in deferred stack
+# ret:        none
+pub fun emit_deferred_from(ctx: *LowerContext, from_index: i32) {
+    if (ctx == nil || ctx.deferred == nil) {
+        ret;
+    }
+
+    # emit in reverse order (LIFO)
+    var i: i32 = ctx.deferred_count - 1;
+    for (i >= from_index) {
+        val node: *ast.Node = ctx.deferred[i];
+        if (node != nil) {
+            lower_stmt(ctx, node);
+        }
+        i = i - 1;
+    }
+}
+
+# --- statement lowering ---
+
+# lower_stmt: lower a statement node to IR.
+# ---
+# ctx:  lowering context
+# node: statement AST node
+# ret:  none
+pub fun lower_stmt(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    # record pre-emission instruction count for debug annotation
+    var pre_count: i32 = 0;
+    if (ctx.current_block != nil) {
+        pre_count = ctx.current_block.instr_count;
+    }
+
+    lower_stmt_inner(ctx, node);
+
+    # annotate first new instruction with source location
+    if (ctx.current_block != nil && ctx.current_block.instr_count > pre_count) {
+        annotate_instr(ctx, ctx.current_block, pre_count, node);
+    }
+}
+
+fun lower_stmt_inner(ctx: *LowerContext, node: *ast.Node) {
+    # variable declaration
+    if (node.kind == ast.NODE_DECL_VAR || node.kind == ast.NODE_DECL_VAL) {
+        lower_var_decl(ctx, node);
+        ret;
+    }
+
+    # expression statement (includes assignments: binary expr with op == '=')
+    if (node.kind == ast.NODE_STMT_EXPR) {
+        val expr: *ast.Node = node.info.wrapper.inner;
+        if (expr != nil) {
+            lexpr.lower_expr(ctx, expr);
+        }
+        ret;
+    }
+
+    # return statement
+    if (node.kind == ast.NODE_STMT_RET) {
+        lower_return(ctx, node);
+        ret;
+    }
+
+    # if statement
+    if (node.kind == ast.NODE_STMT_IF) {
+        lower_if(ctx, node);
+        ret;
+    }
+
+    # or block (else clause of if/or chain)
+    if (node.kind == ast.NODE_STMT_OR) {
+        val or_cond: *ast.Node = node.info.cond_stmt.cond;
+        val or_body: *ast.Node = node.info.cond_stmt.body;
+
+        if (or_cond != nil) {
+            # conditional or: or (cond) { ... } — treat as if
+            lower_if(ctx, node);
+        } or {
+            # unconditional or: or { ... } — just lower the body
+            if (or_body != nil) {
+                lower_stmt(ctx, or_body);
+            }
+        }
+        ret;
+    }
+
+    # while/for loop
+    if (node.kind == ast.NODE_STMT_FOR) {
+        lower_loop(ctx, node);
+        ret;
+    }
+
+    # break statement
+    if (node.kind == ast.NODE_STMT_BRK) {
+        # emit deferred statements up to loop mark
+        val mark: i32 = pop_loop_defer_mark(ctx);
+        emit_deferred_from(ctx, mark);
+
+        # branch to loop end label
+        if (ctx.loop_end_label != nil) {
+            emit_br(ctx, ctx.loop_end_label);
+        }
+        ret;
+    }
+
+    # continue statement
+    if (node.kind == ast.NODE_STMT_CNT) {
+        # emit deferred statements up to loop mark
+        val mark: i32 = pop_loop_defer_mark(ctx);
+        emit_deferred_from(ctx, mark);
+
+        # branch to loop start label
+        if (ctx.loop_start_label != nil) {
+            emit_br(ctx, ctx.loop_start_label);
+        }
+        ret;
+    }
+
+    # defer statement
+    if (node.kind == ast.NODE_STMT_FIN) {
+        val stmt: *ast.Node = node.info.wrapper.inner;
+        defer_statement(ctx, stmt);
+        ret;
+    }
+
+    # block statement
+    if (node.kind == ast.NODE_STMT_BLOCK) {
+        lower_block(ctx, node);
+        ret;
+    }
+
+    # inline assembly
+    if (node.kind == ast.NODE_STMT_MASM) {
+        lower_inline_asm(ctx, node);
+        ret;
+    }
+}
+
+# lower_var_decl: lower a variable declaration.
+# ---
+# ctx:  lowering context
+# node: variable declaration node
+# ret:  none
+fun lower_var_decl(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    val name: str = node.info.var_decl.name;
+    if (name == nil) {
+        ret;
+    }
+
+    # get type - try node.ty first, fall back to type annotation resolution
+    var var_ty: *ty.Type = node.ty;
+    # when type bindings exist (generic instantiation), resolve via annotation
+    # to get the concrete type (e.g., Result[T, E] -> Result[stat_t, str])
+    if (ctx.type_binding_count > 0) {
+        val type_ann_g: *ast.Node = node.info.var_decl.type_node;
+        if (type_ann_g != nil) {
+            val resolved_vt: *ty.Type = resolve_type_annotation(ctx, type_ann_g);
+            if (resolved_vt != nil) {
+                # only override if the resolved type has a larger or equal size
+                # (avoids replacing a correct instantiated type from node.ty
+                #  with a smaller generic type from symbol lookup)
+                if (var_ty == nil || resolved_vt.size >= var_ty.size) {
+                    var_ty = resolved_vt;
+                }
+            }
+        }
+    }
+    if (var_ty == nil) {
+        # try to resolve type from type annotation (stored in extra)
+        val type_ann: *ast.Node = node.info.var_decl.type_node;
+        if (type_ann != nil && type_ann.kind == ast.NODE_TYPE_NAME) {
+            val type_name: str = type_ann.info.type_name.path;
+            if (type_name != nil) {
+                var type_sym: *symbol.Symbol = nil;
+                if (ctx.symbols != nil) {
+                    val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, type_name);
+                    if (option_is_some[*symbol.Symbol](sym_opt)) {
+                        type_sym = option_unwrap[*symbol.Symbol](sym_opt);
+                    }
+                }
+                if (type_sym == nil) {
+                    type_sym = lookup_symbol_in_imports(ctx, type_name);
+                }
+                if (type_sym != nil && type_sym.resolved_type != nil) {
+                    var_ty = type_sym.resolved_type;
+                }
+            }
+        }
+    }
+
+    # get type size
+    var size: usize = ctx.ptr_size;
+    if (var_ty != nil) {
+        size = var_ty.size;
+    }
+
+    # get initializer from var_decl.init
+    val init_node: *ast.Node = node.info.var_decl.init;
+
+    # allocate stack space
+    val offset: i32 = add_local_var(ctx, name, size, var_ty);
+
+    if (init_node != nil) {
+        val init_value: ir.IRValue = lexpr.lower_expr(ctx, init_node);
+        val addr: ir.IRValue = frame_mem(ctx, offset, size);
+        emit_store(ctx, addr, init_value);
+    }
+}
+
+# lower_return: lower a return statement.
+# ---
+# ctx:  lowering context
+# node: return statement node
+# ret:  none
+fun lower_return(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    # emit all deferred statements in LIFO order
+    emit_deferred_from(ctx, 0);
+
+    # lower return value if present
+    val expr: *ast.Node = node.info.wrapper.inner;
+    var ret_value: ir.IRValue = make_none();
+    if (expr != nil) {
+        ret_value = lexpr.lower_expr(ctx, expr);
+    }
+
+    # for sret returns, copy value into the sret buffer and return the pointer
+    if (ctx.fn_has_sret && ctx.fn_ret_type != nil && ctx.fn_ret_type.size > ctx.ptr_size && expr != nil) {
+        # load sret pointer from its stack slot
+        val sret_slot: ir.IRValue = frame_mem(ctx, ctx.sret_offset, ctx.ptr_size);
+        val dst_ptr: ir.IRValue = emit_load(ctx, sret_slot, ctx.ptr_size);
+        val dst_reg: i32 = dst_ptr.reg;
+
+        # copy return value into sret buffer
+        if (ret_value.kind == ir.VAL_MEM) {
+            # source is a memory operand - get its address for a chunked copy
+            val src_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+            val src_ptr: ir.IRValue = ir.make_reg(src_reg, ctx.ptr_size);
+            emit_instr(ctx, ir.IROp{ir_lea: ir.OP_LEA}, src_ptr, ret_value, ir.make_none(), 0);
+
+            emit_aggregate_copy(ctx, dst_reg, src_reg, ctx.fn_ret_type.size);
+        } or (ret_value.kind == ir.VAL_REG) {
+            # source is a register containing an address (LEA result for aggregate)
+            emit_aggregate_copy(ctx, dst_reg, ret_value.reg, ctx.fn_ret_type.size);
+        }
+
+        # return the sret pointer
+        emit_ret(ctx, dst_ptr);
+        ret;
+    }
+
+    # small aggregate return (size <= ptr_size): lower_expr returns an address (LEA)
+    # for local variables, or a memory operand for field accesses.
+    # we need to return the actual value in a register.
+    # call expressions already return the value directly in a register.
+    if (expr != nil && ctx.fn_ret_type != nil &&
+        (ctx.fn_ret_type.kind == ty.TY_RECORD ||
+         ctx.fn_ret_type.kind == ty.TY_UNION ||
+         ctx.fn_ret_type.kind == ty.TY_ARRAY) &&
+        ctx.fn_ret_type.size > 0 && ctx.fn_ret_type.size <= ctx.ptr_size &&
+        expr.kind != ast.NODE_EXPR_CALL) {
+        if (ret_value.kind == ir.VAL_REG) {
+            # ret_value register holds an address (LEA result) — load the value from it
+            var agg_src_mem: ir.IRValue;
+            agg_src_mem.kind = ir.VAL_MEM;
+            agg_src_mem.base_reg = ret_value.reg;
+            agg_src_mem.offset = 0;
+            agg_src_mem.size = ctx.fn_ret_type.size;
+            agg_src_mem.reg = 0;
+            agg_src_mem.imm = 0;
+            agg_src_mem.index_reg = -1;
+            agg_src_mem.scale = 1;
+            agg_src_mem.label = nil;
+            val agg_val_reg: i32 = new_vreg(ctx, ctx.fn_ret_type.size);
+            val agg_val: ir.IRValue = ir.make_reg(agg_val_reg, ctx.fn_ret_type.size);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                          agg_val, agg_src_mem, ir.make_none(), ir.CC_NONE);
+            ret_value = agg_val;
+        } or (ret_value.kind == ir.VAL_MEM) {
+            # ret_value is a memory operand (from field access) — override size
+            # with the return type's actual size and load into register
+            ret_value.size = ctx.fn_ret_type.size;
+            val agg_val_reg: i32 = new_vreg(ctx, ctx.fn_ret_type.size);
+            val agg_val: ir.IRValue = ir.make_reg(agg_val_reg, ctx.fn_ret_type.size);
+            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                          agg_val, ret_value, ir.make_none(), ir.CC_NONE);
+            ret_value = agg_val;
+        }
+    }
+
+    # emit return instruction
+    emit_ret(ctx, ret_value);
+}
+
+# lower_if: lower an if statement.
+# ---
+# ctx:  lowering context
+# node: if statement node
+# ret:  none
+fun lower_if(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    val cond: *ast.Node = node.info.cond_stmt.cond;
+    val then_stmt: *ast.Node = node.info.cond_stmt.body;
+    val else_stmt: *ast.Node = node.info.cond_stmt.or_branch;
+
+    if (cond == nil) {
+        ret;
+    }
+
+    # lower condition
+    val cond_value: ir.IRValue = lexpr.lower_expr(ctx, cond);
+
+    # create labels
+    val then_label: str = new_label(ctx, ".Lif_then");
+    val else_label: str = new_label(ctx, ".Lif_or");
+    val end_label: str = new_label(ctx, ".Lif_end");
+
+    # emit conditional branch
+    # compare condition with 0
+    val zero: ir.IRValue = ir.make_imm(0, 8);
+    emit_cmp(ctx, cond_value, zero, 8);
+
+    # branch to else if condition is false (equal to 0)
+    if (else_stmt != nil) {
+        emit_cond_br(ctx, ir.CC_EQ::i32, else_label);
+    } or {
+        emit_cond_br(ctx, ir.CC_EQ::i32, end_label);
+    }
+
+    # then block (fall through - no JMP needed)
+    if (then_stmt != nil) {
+        lower_stmt(ctx, then_stmt);
+    }
+    emit_br(ctx, end_label);
+
+    # else block
+    if (else_stmt != nil) {
+        emit_label(ctx, else_label);
+        lower_stmt(ctx, else_stmt);
+    }
+
+    # end
+    emit_label(ctx, end_label);
+}
+
+# lower_loop: lower a while or for loop.
+# ---
+# ctx:  lowering context
+# node: loop statement node
+# ret:  none
+fun lower_loop(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    # create labels
+    val start_label: str = new_label(ctx, ".Lfor_start");
+    val end_label: str = new_label(ctx, ".Lfor_end");
+
+    # save previous loop labels
+    val prev_start: str = ctx.loop_start_label;
+    val prev_end: str = ctx.loop_end_label;
+
+    # set new loop labels
+    ctx.loop_start_label = start_label;
+    ctx.loop_end_label = end_label;
+
+    # mark defer stack for this loop
+    push_loop_defer_mark(ctx);
+
+    # loop start
+    emit_label(ctx, start_label);
+
+    # condition check (if present)
+    val cond: *ast.Node = node.info.for_stmt.cond;
+    if (cond != nil) {
+        val cond_value: ir.IRValue = lexpr.lower_expr(ctx, cond);
+        val zero: ir.IRValue = ir.make_imm(0, 8);
+        emit_cmp(ctx, cond_value, zero, 8);
+        emit_cond_br(ctx, ir.CC_EQ::i32, end_label);
+    }
+
+    # loop body
+    val body: *ast.Node = node.info.for_stmt.body;
+    if (body != nil) {
+        lower_stmt(ctx, body);
+    }
+
+    # branch back to start
+    emit_br(ctx, start_label);
+
+    # loop end
+    emit_label(ctx, end_label);
+
+    # emit deferred statements for normal loop exit
+    val mark: i32 = pop_loop_defer_mark(ctx);
+    emit_deferred_from(ctx, mark);
+
+    # restore previous loop labels
+    ctx.loop_start_label = prev_start;
+    ctx.loop_end_label = prev_end;
+}
+
+# lower_block: lower a block statement.
+# ---
+# ctx:  lowering context
+# node: block node
+# ret:  none
+fun lower_block(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) {
+        ret;
+    }
+
+    val stmts: *ast.List = node.info.block_stmt.stmts;
+    if (stmts == nil) {
+        ret;
+    }
+
+    var i: i32 = 0;
+    for (i < stmts.count) {
+        lower_stmt(ctx, stmts.nodes[i]);
+        i = i + 1;
+    }
+}
+
+
+# lower_inline_asm: lower an inline assembly block.
+# ---
+# ctx:  lowering context
+# node: asm node
+# ret:  none
+pub fun lower_inline_asm(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil || ctx.m == nil) {
+        ret;
+    }
+
+    # get asm content from masm_stmt.content
+    val content: str = node.info.masm_stmt.content;
+    if (content == nil) {
+        ret;
+    }
+
+    # check for ISA-specific block: "x86_64 { ... }"
+    # the parser stores the full content including any ISA prefix
+    var asm_content: str = content;
+    var i: usize = 0;
+
+    # skip leading whitespace
+    for (content[i] == ' ' || content[i] == '\t' || content[i] == '\n' || content[i] == '\r') {
+        i = i + 1;
+    }
+
+    # check for "x86_64" prefix
+    if (content[i] == 'x' && content[i+1] == '8' && content[i+2] == '6' &&
+        content[i+3] == '_' && content[i+4] == '6' && content[i+5] == '4') {
+        i = i + 6;
+
+        # skip whitespace
+        for (content[i] == ' ' || content[i] == '\t' || content[i] == '\n' || content[i] == '\r') {
+            i = i + 1;
+        }
+
+        # expect '{'
+        if (content[i] == '{') {
+            i = i + 1;
+
+            # find matching '}'
+            var depth: i32 = 1;
+            val start: usize = i;
+            for (depth > 0 && content[i] != 0) {
+                if (content[i] == '{') {
+                    depth = depth + 1;
+                }
+                if (content[i] == '}') {
+                    depth = depth - 1;
+                }
+                if (depth > 0) {
+                    i = i + 1;
+                }
+            }
+
+            # extract inner content
+            val inner_len: usize = i - start;
+            if (inner_len > 0) {
+                val alloc_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](ctx.alloc, inner_len + 1);
+                if (result_is_ok[*u8, allocator.AllocError](alloc_res)) {
+                    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](alloc_res);
+                    var j: usize = 0;
+                    for (j < inner_len) {
+                        buf[j] = content[start + j];
+                        j = j + 1;
+                    }
+                    buf[inner_len] = 0;
+                    asm_content = buf::str;
+                }
+            }
+        }
+    }
+
+    # handle syscall DSL: "syscall result, num, arg0, ..."
+    var scan_idx: usize = 0;
+    for (asm_content[scan_idx] != 0) {
+        for (is_space_u8(asm_content[scan_idx])) {
+            scan_idx = scan_idx + 1;
+        }
+
+        if (asm_content[scan_idx] == 0) {
+            brk;
+        }
+
+        # skip line comments
+        if (asm_content[scan_idx] == '#') {
+            for (asm_content[scan_idx] != 0 && asm_content[scan_idx] != '\n') {
+                scan_idx = scan_idx + 1;
+            }
+            cnt;
+        }
+
+        var line_end: usize = scan_idx;
+        for (asm_content[line_end] != 0 && asm_content[line_end] != '\n' && asm_content[line_end] != ';' && asm_content[line_end] != '#') {
+            line_end = line_end + 1;
+        }
+
+        var syscall_pos: i32 = -1;
+        var search_idx: usize = scan_idx;
+        for (search_idx + 7 <= line_end) {
+            if (asm_content[search_idx] == 's' && asm_content[search_idx + 1] == 'y' && asm_content[search_idx + 2] == 's' &&
+                asm_content[search_idx + 3] == 'c' && asm_content[search_idx + 4] == 'a' && asm_content[search_idx + 5] == 'l' &&
+                asm_content[search_idx + 6] == 'l') {
+                val before_ok: bool = search_idx == scan_idx || is_space_u8(asm_content[search_idx - 1]);
+                val after_ok: bool = search_idx + 7 == line_end || is_space_u8(asm_content[search_idx + 7]);
+                if (before_ok && after_ok) {
+                    syscall_pos = search_idx::i32;
+                    brk;
+                }
+            }
+            search_idx = search_idx + 1;
+        }
+
+        if (syscall_pos < 0) {
+            scan_idx = line_end;
+            for (asm_content[scan_idx] == '\n' || asm_content[scan_idx] == ';' || asm_content[scan_idx] == '#') {
+                scan_idx = scan_idx + 1;
+            }
+            cnt;
+        }
+
+        var idx: usize = syscall_pos::usize + 7;
+        val dst_tok: str = extract_token(ctx, asm_content, idx, ?idx);
+        if (dst_tok == nil) {
+            # standalone syscall instruction, not DSL format - skip and let x86 parser handle it
+            scan_idx = line_end;
+            for (asm_content[scan_idx] == '\n' || asm_content[scan_idx] == ';' || asm_content[scan_idx] == '#') {
+                scan_idx = scan_idx + 1;
+            }
+            cnt;
+        }
+
+        for (idx < line_end && (asm_content[idx] == ',' || is_space_u8(asm_content[idx]))) {
+            idx = idx + 1;
+        }
+
+        if (idx >= line_end) {
+            # no more tokens after dst - not valid DSL format, skip
+            scan_idx = line_end;
+            for (asm_content[scan_idx] == '\n' || asm_content[scan_idx] == ';' || asm_content[scan_idx] == '#') {
+                scan_idx = scan_idx + 1;
+            }
+            cnt;
+        }
+
+        # skip comma
+        for (asm_content[idx] == ',' || is_space_u8(asm_content[idx])) {
+            idx = idx + 1;
+        }
+
+        if (idx >= line_end) {
+            # no syscall number - not valid DSL format, skip
+            scan_idx = line_end;
+            for (asm_content[scan_idx] == '\n' || asm_content[scan_idx] == ';' || asm_content[scan_idx] == '#') {
+                scan_idx = scan_idx + 1;
+            }
+            cnt;
+        }
+
+        val num_tok: str = extract_token(ctx, asm_content, idx, ?idx);
+        if (num_tok == nil) {
+            # no syscall number - not valid DSL format, skip
+            scan_idx = line_end;
+            for (asm_content[scan_idx] == '\n' || asm_content[scan_idx] == ';' || asm_content[scan_idx] == '#') {
+                scan_idx = scan_idx + 1;
+            }
+            cnt;
+        }
+
+        val num_val: ir.IRValue = resolve_value_token(ctx, num_tok);
+
+        var arg_vals: [6]ir.IRValue;
+        var arg_count: i32 = 0;
+        for (arg_count < 6) {
+            for (asm_content[idx] == ',' || is_space_u8(asm_content[idx])) {
+                idx = idx + 1;
+            }
+
+            if (idx >= line_end || asm_content[idx] == 0 || asm_content[idx] == '\n' || asm_content[idx] == ';' || asm_content[idx] == '#') {
+                brk;
+            }
+
+            val arg_tok: str = extract_token(ctx, asm_content, idx, ?idx);
+            if (arg_tok == nil) {
+                brk;
+            }
+
+            arg_vals[arg_count] = resolve_value_token(ctx, arg_tok);
+            arg_count = arg_count + 1;
+        }
+
+        var ret_val: ir.IRValue = ir.make_none();
+        if (arg_count > 0) {
+            ret_val = call.emit_syscall_value(ctx, num_val, ?arg_vals[0], arg_count);
+        } or {
+            ret_val = call.emit_syscall_value(ctx, num_val, nil, 0);
+        }
+
+        val dst_addr: ir.IRValue = resolve_lvalue_token(ctx, dst_tok);
+        if (dst_addr.kind == ir.VAL_NONE || (dst_addr.kind == ir.VAL_IMM && dst_addr.imm == 0)) {
+            # no destination; ignore syscall result
+            ret;
+        }
+        emit_store(ctx, dst_addr, ret_val);
+        ret;
+    }
+
+    # dispatch inline assembly to ISA-specific backend
+    val text_res: Result[*section.Section, str] = masm.get_or_create_section(ctx.m, ".text", section.section_text());
+    if (result_is_err[*section.Section, str](text_res)) {
+        report_lower_error(ctx, node.tok, "failed to get .text section for inline asm");
+        ret;
+    }
+    val text_sec: *section.Section = result_unwrap_ok[*section.Section, str](text_res);
+    val asm_res: Result[usize, str] = isel.assemble(?ctx.tgt, asm_content, text_sec, ctx.m, ctx.alloc);
+    if (result_is_err[usize, str](asm_res)) {
+        report_lower_error(ctx, node.tok, result_unwrap_err[usize, str](asm_res));
+        ret;
+    }
+}
