@@ -1,0 +1,1243 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+use std.types.option;
+
+use allocator: std.allocator;
+
+use ast:     mach.compiler.ast;
+use symbol:  mach.compiler.symbol;
+use ty:      mach.compiler.type;
+use tyctx:   mach.compiler.type_context;
+use token:   mach.compiler.token;
+
+use ir:      mach.compiler.masm.ir;
+use masm:    mach.compiler.masm.masm;
+use section: mach.compiler.masm.section;
+use sym:     mach.compiler.masm.symbol;
+use mangle:  mach.compiler.masm.mangle;
+use target:  mach.compiler.masm.target;
+use abi:     mach.compiler.masm.abi.spec;
+use sema:    mach.compiler.sema.sema;
+use print:   std.print;
+
+use mach.compiler.masm.lower.lower;
+use stmt: mach.compiler.masm.lower.stmt;
+
+# --- function lowering ---
+
+# lower_function: lower a function declaration to IR.
+# ---
+# ctx:  lowering context
+# node: function AST node
+# ret:  Ok(*IRFunction) on success, Err(str) on failure
+pub fun lower_function(ctx: *LowerContext, node: *ast.Node) Result[*ir.IRFunction, str] {
+    if (ctx == nil) {
+        ret err[*ir.IRFunction, str]("context is nil");
+    }
+
+    if (node == nil) {
+        ret err[*ir.IRFunction, str]("node is nil");
+    }
+
+    # reset per-function state
+    reset_function_state(ctx);
+
+    val name: str = node.info.fun_decl.name;
+    if (name == nil) {
+        ret err[*ir.IRFunction, str]("function has no name");
+    }
+
+    val symbol_key: str = name;
+
+    # skip generic functions in regular lowering pass (they get lowered
+    # per-instantiation in a separate pass with type bindings)
+    if (ctx.func_name_override == nil) {
+        if (node.info.fun_decl.generics != nil) {
+            ret err[*ir.IRFunction, str]("skipped generic function");
+        }
+    }
+
+    # resolve linkage name (e.g., $main.symbol override)
+    var func_name: str = symbol_key;
+    var sym: *symbol.Symbol = nil;
+
+    # if we have a function name override (instantiation lowering), use it
+    if (ctx.func_name_override != nil) {
+        func_name = ctx.func_name_override;
+        # look up the instantiated symbol
+        if (ctx.symbols != nil) {
+            val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, ctx.func_name_override);
+            if (option_is_some[*symbol.Symbol](sym_opt)) {
+                sym = option_unwrap[*symbol.Symbol](sym_opt);
+            }
+        }
+        if (sym == nil) {
+            sym = lookup_symbol_in_imports(ctx, ctx.func_name_override);
+        }
+        # compute linkage name for the instantiated symbol
+        if (sym != nil) {
+            val link: str = mangle.linkage_name(sym, ctx.alloc);
+            if (link != nil) {
+                func_name = link;
+            }
+        }
+    } or {
+        # first try current module's symbol table
+        if (ctx.symbols != nil) {
+            val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, symbol_key);
+            if (option_is_some[*symbol.Symbol](sym_opt)) {
+                sym = option_unwrap[*symbol.Symbol](sym_opt);
+            }
+        }
+
+        # if not found, search imported modules
+        if (sym == nil) {
+            sym = lookup_symbol_in_imports(ctx, symbol_key);
+        }
+
+        # use linkage name if symbol was found
+        if (sym != nil) {
+            val link: str = mangle.linkage_name(sym, ctx.alloc);
+            if (link != nil) {
+                func_name = link;
+            }
+        }
+    }
+
+    # create IR function
+    val fn_res: Result[*ir.IRFunction, str] = ir.create_function(ctx.alloc, func_name);
+    if (result_is_err[*ir.IRFunction, str](fn_res)) {
+        ret fn_res;
+    }
+
+    val func: *ir.IRFunction = result_unwrap_ok[*ir.IRFunction, str](fn_res);
+    ctx.current_fn = func;
+
+    # create entry block
+    val entry_label: str = new_label(ctx, ".Lentry");
+    val block_res: Result[*ir.IRBlock, str] = ir.create_block(ctx.alloc, entry_label);
+    if (result_is_err[*ir.IRBlock, str](block_res)) {
+        ret err[*ir.IRFunction, str](result_unwrap_err[*ir.IRBlock, str](block_res));
+    }
+
+    val entry_block: *ir.IRBlock = result_unwrap_ok[*ir.IRBlock, str](block_res);
+    ctx.current_block = entry_block;
+
+    # add block to function
+    if (ir.add_block(ctx.alloc, func, entry_block) < 0) {
+        ret err[*ir.IRFunction, str]("failed to add entry block");
+    }
+
+    # emit function label
+    emit_label(ctx, func_name);
+
+    # check if this is the entry point (_start)
+    val is_entry: bool = func_name != nil && str_equals(func_name, "_start");
+
+    # create MASM symbol for function
+    if (ctx.m != nil) {
+        val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, func_name);
+        if (result_is_ok[*sym.Symbol, str](sym_res)) {
+            val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_res);
+            s.binding.tag = sym.BIND_GLOBAL;
+            s.sym_type.tag = sym.SYM_FUNC;
+
+            # set source location for DWARF debug info
+            if (ctx.text != nil && node.tok.pos > 0) {
+                s.src_line = line_for_pos(ctx.text, node.tok.pos);
+            }
+            if (ctx.current_sema_mod != nil && ctx.current_sema_mod.file_path != nil) {
+                s.src_file = ctx.current_sema_mod.file_path;
+            }
+
+            # for entry point functions, define symbol now at current .text offset
+            # because their code is emitted directly via inline asm, not through isel
+            if (is_entry) {
+                val text_res: Result[*section.Section, str] = masm.get_or_create_section(ctx.m, ".text", section.section_text());
+                if (result_is_ok[*section.Section, str](text_res)) {
+                    val text_sec: *section.Section = result_unwrap_ok[*section.Section, str](text_res);
+                    sym.define(s, text_sec, text_sec.size, 0);
+                }
+            }
+
+            masm.add_symbol(ctx.m, s);
+        }
+    }
+
+    # determine function return type and whether we need sret
+    # use return type override if available (for generic instantiation)
+    if (ctx.ret_type_override != nil) {
+        ctx.fn_ret_type = ctx.ret_type_override;
+        if (type_is_large_aggregate(ctx.fn_ret_type, ctx.ptr_size)) {
+            ctx.fn_has_sret = true;
+        }
+    } or (node.ty != nil) {
+        if (node.ty.kind == ty.TY_FUN) {
+            if (node.ty.ret_type != nil) {
+                ctx.fn_ret_type = node.ty.ret_type;
+                if (type_is_large_aggregate(ctx.fn_ret_type, ctx.ptr_size)) {
+                    ctx.fn_has_sret = true;
+                }
+            }
+        }
+    }
+
+    # track argument register usage
+    # note: stack frame setup is handled by isel prologue, not emitted as IR
+    var int_arg_idx: i32 = 0;
+    var float_arg_idx: i32 = 0;
+
+    # handle hidden sret pointer for large aggregate returns
+    if (!is_entry && ctx.fn_has_sret) {
+        # sret pointer is passed in first integer arg register
+        ctx.stack_offset = ctx.stack_offset - ctx.ptr_size::i32;
+        ctx.sret_offset = ctx.stack_offset;
+        int_arg_idx = 1;  # skip first arg reg since it holds sret
+
+        # store sret pointer to stack slot
+        val sret_reg: i32 = abi.get_arg_reg(?ctx.abi, 0);
+        val sret_addr: ir.IRValue = frame_mem(ctx, ctx.sret_offset, ctx.ptr_size);
+        emit_store(ctx, sret_addr, ir.make_reg(sret_reg, ctx.ptr_size));
+    }
+
+    # lower parameters - get param list from AST
+    val params: *ast.List = node.info.fun_decl.params;
+
+    # detect variadic functions: check if any parameter is NODE_VARIADIC
+    if (!is_entry && params != nil) {
+        var vi: i32 = 0;
+        for (vi < params.count) {
+            val vparam: *ast.Node = params.nodes[vi];
+            if (vparam != nil && vparam.kind == ast.NODE_VARIADIC) {
+                ctx.fn_is_variadic = true;
+                brk;
+            }
+            vi = vi + 1;
+        }
+    }
+
+    # allocate register save area for variadic functions (176 bytes: 6 GP + 8 XMM)
+    if (!is_entry && ctx.fn_is_variadic) {
+        ctx.stack_offset = ctx.stack_offset - 176;
+        # align to 16 bytes
+        if (ctx.stack_offset % 16 != 0) {
+            ctx.stack_offset = ctx.stack_offset - (16 - ((-ctx.stack_offset) % 16));
+        }
+        ctx.va_reg_save_off = ctx.stack_offset;
+    }
+
+    if (!is_entry && params != nil) {
+        # Two-pass approach: save scalar params from registers first, then copy aggregates.
+        # This prevents aggregate copy loops from clobbering unsaved argument registers.
+
+        # Pre-pass: allocate stack space and record metadata for all params
+        var param_offsets: [32]i32;
+        var param_sizes:   [32]usize;
+        var param_byval:   [32]bool;
+        var param_count: i32 = params.count;
+        if (param_count > 32) { param_count = 32; }
+
+        var i: i32 = 0;
+        for (i < param_count) {
+            val param: *ast.Node = params.nodes[i];
+            if (param == nil || param.kind == ast.NODE_VARIADIC) {
+                param_offsets[i] = 0;
+                param_sizes[i] = 0;
+                param_byval[i] = false;
+                i = i + 1;
+                cnt;
+            }
+
+            val param_name: str = param.info.field_decl.name;
+            var param_type: *ty.Type = param.ty;
+            if (param_type == nil || ctx.type_binding_count > 0) {
+                val param_ann: *ast.Node = param.info.field_decl.type_node;
+                if (param_ann != nil) {
+                    val resolved_pt: *ty.Type = resolve_type_annotation(ctx, param_ann);
+                    if (resolved_pt != nil) {
+                        param_type = resolved_pt;
+                    }
+                }
+            }
+
+            var param_size: usize = ctx.ptr_size;
+            if (param_type != nil && param_type.size > 0) {
+                param_size = param_type.size;
+            }
+
+            val is_large_agg: bool = param_type != nil &&
+                (param_type.kind == ty.TY_RECORD ||
+                 param_type.kind == ty.TY_UNION ||
+                 param_type.kind == ty.TY_ARRAY) &&
+                param_type.size > ctx.ptr_size;
+
+            val p_offset: i32 = add_local_var(ctx, param_name, param_size, param_type);
+            param_offsets[i] = p_offset;
+            param_sizes[i] = param_size;
+            param_byval[i] = is_large_agg;
+            i = i + 1;
+        }
+
+        # Pass 1: Save all scalar params from registers to stack slots
+        var gp_idx: i32 = int_arg_idx;
+        var stack_idx: i32 = 0;
+
+        i = 0;
+        for (i < param_count) {
+            if (param_sizes[i] == 0) {
+                i = i + 1;
+                cnt;
+            }
+
+            if (!param_byval[i]) {
+                # scalar/pointer param
+                if (gp_idx < ctx.abi.arg_reg_count) {
+                    val arg_reg: i32 = abi.get_arg_reg(?ctx.abi, gp_idx);
+                    val dst: ir.IRValue = frame_mem(ctx, param_offsets[i], param_sizes[i]);
+                    emit_store(ctx, dst, ir.make_reg(arg_reg, param_sizes[i]));
+                    gp_idx = gp_idx + 1;
+                } or {
+                    # stack param (7+ args): load from caller's stack frame
+                    val stack_off: i32 = 16 + (stack_idx * ctx.ptr_size::i32);
+                    val src_mem: ir.IRValue = frame_mem(ctx, stack_off, ctx.ptr_size);
+                    val tmp_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+                    val tmp: ir.IRValue = ir.make_reg(tmp_reg, ctx.ptr_size);
+                    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                                  tmp, src_mem, ir.make_none(), ir.CC_NONE);
+                    val dst: ir.IRValue = frame_mem(ctx, param_offsets[i], param_sizes[i]);
+                    emit_store(ctx, dst, tmp);
+                    stack_idx = stack_idx + 1;
+                }
+            } or {
+                # byval large aggregate — just consume register slot, copy in pass 2
+                if (gp_idx < ctx.abi.arg_reg_count) {
+                    gp_idx = gp_idx + 1;
+                } or {
+                    stack_idx = stack_idx + 1;
+                }
+            }
+            i = i + 1;
+        }
+
+        # Pass 2: Copy large aggregates (scalar registers are safely saved now)
+        gp_idx = int_arg_idx;
+        stack_idx = 0;
+
+        i = 0;
+        for (i < param_count) {
+            if (param_sizes[i] == 0) {
+                i = i + 1;
+                cnt;
+            }
+
+            if (!param_byval[i]) {
+                # scalar — already handled, just advance register index
+                if (gp_idx < ctx.abi.arg_reg_count) {
+                    gp_idx = gp_idx + 1;
+                } or {
+                    stack_idx = stack_idx + 1;
+                }
+            } or {
+                # large aggregate passed by hidden pointer — copy into local slot
+                val src_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+                val src_ptr: ir.IRValue = ir.make_reg(src_reg, ctx.ptr_size);
+
+                if (gp_idx < ctx.abi.arg_reg_count) {
+                    val arg_reg: i32 = abi.get_arg_reg(?ctx.abi, gp_idx);
+                    emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, src_ptr,
+                               ir.make_reg(arg_reg, ctx.ptr_size), ir.make_none(), 0);
+                    gp_idx = gp_idx + 1;
+                } or {
+                    val stack_off: i32 = 16 + (stack_idx * ctx.ptr_size::i32);
+                    val src_mem: ir.IRValue = frame_mem(ctx, stack_off, ctx.ptr_size);
+                    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                                  src_ptr, src_mem, ir.make_none(), ir.CC_NONE);
+                    stack_idx = stack_idx + 1;
+                }
+
+                val dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
+                val dst_ptr: ir.IRValue = ir.make_reg(dst_reg, ctx.ptr_size);
+                val dst_mem: ir.IRValue = frame_mem(ctx, param_offsets[i], ctx.ptr_size);
+                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
+                              dst_ptr, dst_mem, ir.make_none(), ir.CC_NONE);
+
+                val total: i32 = param_sizes[i]::i32;
+                var off: i32 = 0;
+                for (off < total) {
+                    var chunk: usize = 8;
+                    if ((total - off)::usize < 8) {
+                        chunk = (total - off)::usize;
+                    }
+                    val cp_tmp_reg: i32 = new_vreg(ctx, chunk);
+                    val cp_tmp: ir.IRValue = ir.make_reg(cp_tmp_reg, chunk);
+
+                    var s_mem: ir.IRValue;
+                    s_mem.kind = ir.VAL_MEM;
+                    s_mem.base_reg = src_reg;
+                    s_mem.offset = off::i64;
+                    s_mem.size = chunk;
+                    s_mem.reg = 0;
+                    s_mem.imm = 0;
+                    s_mem.index_reg = -1;
+                    s_mem.scale = 1;
+                    s_mem.label = nil;
+
+                    var d_mem: ir.IRValue;
+                    d_mem.kind = ir.VAL_MEM;
+                    d_mem.base_reg = dst_reg;
+                    d_mem.offset = off::i64;
+                    d_mem.size = chunk;
+                    d_mem.reg = 0;
+                    d_mem.imm = 0;
+                    d_mem.index_reg = -1;
+                    d_mem.scale = 1;
+                    d_mem.label = nil;
+
+                    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
+                                  cp_tmp, s_mem, ir.make_none(), ir.CC_NONE);
+                    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
+                                  d_mem, cp_tmp, ir.make_none(), ir.CC_NONE);
+
+                    off = off + chunk::i32;
+                }
+            }
+            i = i + 1;
+        }
+
+        # update int_arg_idx for variadic handling
+        int_arg_idx = gp_idx;
+        func.param_count = params.count;
+
+        # for variadic functions, record named param counts and save all registers
+        if (ctx.fn_is_variadic) {
+            # count named params: int_arg_idx tracks GP regs used (minus sret adjustment)
+            val arg_shift: i32 = 0;
+            if (ctx.fn_has_sret) {
+                ctx.va_named_gp = int_arg_idx - 1;
+            } or {
+                ctx.va_named_gp = int_arg_idx;
+            }
+            ctx.va_named_fp = float_arg_idx;
+            ctx.va_named_stack_slots = 0;  # TODO: track stack params
+
+            # save all GP arg registers to reg_save_area
+            var gi: i32 = 0;
+            for (gi < ctx.abi.arg_reg_count) {
+                val reg_off: i32 = ctx.va_reg_save_off + (gi * ctx.ptr_size::i32);
+                val reg_dst: ir.IRValue = frame_mem(ctx, reg_off, ctx.ptr_size);
+                val reg_src: ir.IRValue = ir.make_reg(abi.get_arg_reg(?ctx.abi, gi), ctx.ptr_size);
+                emit_store(ctx, reg_dst, reg_src);
+                gi = gi + 1;
+            }
+
+            # save XMM0-XMM7 to reg_save_area (offsets 48 + i*16)
+            # note: we don't track FP arg regs in current sysv64 module, skip for now
+            # this is safe because va_arg for FP types will fall back to stack path
+        }
+    }
+
+    # get function body and lower it
+    val body: *ast.Node = node.info.fun_decl.body;
+    if (body != nil) {
+        stmt.lower_stmt(ctx, body);
+    }
+
+    # emit deferred statements from any remaining defer stack entries
+    stmt.emit_deferred_from(ctx, 0);
+
+    # if no explicit return, emit one
+    if (ctx.current_block != nil && ctx.current_block.instr_count > 0) {
+        val last_instr: ir.Instr = ctx.current_block.instrs[ctx.current_block.instr_count - 1];
+        if (last_instr.op != ir.IROp{ir_ret: ir.OP_RET}) {
+            # create none value for void return
+            val none_value: ir.IRValue = make_none();
+            emit_ret(ctx, none_value);
+        }
+    } or {
+        # empty function, emit return
+        val none_value: ir.IRValue = make_none();
+        emit_ret(ctx, none_value);
+    }
+
+    # calculate frame size from local variables
+    var frame_size: usize = 0;
+    if (ctx.stack_offset < 0) {
+        frame_size = (-ctx.stack_offset)::usize;
+    }
+
+    # align frame size to stack alignment (16 bytes for sysv64)
+    if (frame_size > 0 && frame_size % 16 != 0) {
+        frame_size = (frame_size + 15) & ~15::usize;
+    }
+
+    func.local_size = frame_size;
+
+    # note: frame size is used by isel for stack allocation
+    # stack frame setup/teardown is handled by isel, not emitted as IR
+
+    # add function to IR function list for code generation
+    # skip entry point functions - their code is emitted directly via inline asm
+    # and shouldn't go through isel which would add unwanted prologue/epilogue
+    if (!is_entry) {
+        add_ir_function(ctx, func);
+    }
+
+    # workaround: create result in local variable to avoid return value corruption
+    # fully initialize all fields to avoid garbage
+    var result: Result[*ir.IRFunction, str];
+    result.tag = true;  # is_ok
+    result.value.ok = func;
+    result.value.err = nil;  # zero out the err side too
+    ret result;
+}
+
+# --- global variable lowering ---
+
+# lower_global_var: lower a global variable declaration.
+# ---
+# ctx:  lowering context
+# node: variable declaration node
+# ret:  none
+pub fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil || ctx.m == nil) {
+        ret;
+    }
+
+    val name: str = node.info.var_decl.name;
+    if (name == nil) {
+        ret;
+    }
+
+    # get initializer from var_decl.init
+    val init_node: *ast.Node = node.info.var_decl.init;
+
+    # determine section (.data for mutable, .rodata for immutable)
+    var sec_kind: section.SectionKind;
+    var sec_name: str;
+
+    if (node.kind == ast.NODE_DECL_VAL) {
+        sec_kind = section.section_rodata();
+        sec_name = ".rodata";
+    } or {
+        sec_kind = section.section_data();
+        sec_name = ".data";
+    }
+
+    val sec_res: Result[*section.Section, str] = masm.get_or_create_section(ctx.m, sec_name, sec_kind);
+    if (result_is_err[*section.Section, str](sec_res)) {
+        ret;
+    }
+
+    val sec: *section.Section = result_unwrap_ok[*section.Section, str](sec_res);
+    val offset: usize = sec.size;
+
+    # look up sema symbol for mangled linkage name
+    var global_name: str = name;
+    if (ctx.symbols != nil) {
+        val gv_sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, name);
+        if (option_is_some[*symbol.Symbol](gv_sym_opt)) {
+            val gv_link: str = mangle.linkage_name(option_unwrap[*symbol.Symbol](gv_sym_opt), ctx.alloc);
+            if (gv_link != nil) {
+                global_name = gv_link;
+            }
+        }
+        if (global_name == name) {
+            val gv_imp: *symbol.Symbol = lookup_symbol_in_imports(ctx, name);
+            if (gv_imp != nil) {
+                val gv_imp_link: str = mangle.linkage_name(gv_imp, ctx.alloc);
+                if (gv_imp_link != nil) {
+                    global_name = gv_imp_link;
+                }
+            }
+        }
+    }
+
+    # create symbol with mangled name
+    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, global_name);
+    if (result_is_ok[*sym.Symbol, str](sym_res)) {
+        val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_res);
+        sym.set_binding(s, sym.bind_global());
+        sym.set_type(s, sym.sym_object());
+        sym.define(s, sec, offset, 0);
+        masm.add_symbol(ctx.m, s);
+    }
+
+    # determine declared type size
+    var var_size: usize = 8;
+    if (node.ty != nil) {
+        var_size = node.ty.size;
+    }
+    if (var_size == 0) {
+        var_size = 8;
+    }
+
+    # emit initializer data
+    var emitted: bool = false;
+    if (init_node != nil) {
+        if (init_node.kind == ast.NODE_EXPR_LIT_INT) {
+            val int_val: i64 = parse_int_str(init_node.info.lit_expr.text);
+            emit_global_int(ctx, sec, int_val, var_size);
+            emitted = true;
+        }
+        if (!emitted && init_node.kind == ast.NODE_EXPR_UNARY) {
+            # handle unary negate: -100, -4, etc.
+            var unary_child: *ast.Node = init_node.info.unary_expr.expr;
+            if (unary_child != nil && unary_child.kind == ast.NODE_EXPR_LIT_INT && init_node.tok.tag == token.TAG_MINUS) {
+                val pos_val: i64 = parse_int_str(unary_child.info.lit_expr.text);
+                emit_global_int(ctx, sec, -pos_val, var_size);
+                emitted = true;
+            }
+        } or (init_node.kind == ast.NODE_EXPR_LIT_STR) {
+            val str_val: str = init_node.info.lit_expr.text;
+            if (str_val != nil) {
+                val gslen: usize = str_len(str_val);
+                var gstart: usize = 0;
+                var gend: usize = gslen;
+                # strip surrounding quotes
+                if (gslen >= 2 && str_val[0] == 34) {
+                    gstart = 1;
+                    if (str_val[gslen - 1] == 34) {
+                        gend = gslen - 1;
+                    }
+                }
+                var gi: usize = gstart;
+                for (gi < gend) {
+                    val gc: u8 = str_val[gi];
+                    if (gc == 92 && gi + 1 < gend) {
+                        val ge: u8 = str_val[gi + 1];
+                        if (ge == 110) { section.emit_byte(ctx.alloc, sec, 10); }
+                        or (ge == 116) { section.emit_byte(ctx.alloc, sec, 9); }
+                        or (ge == 114) { section.emit_byte(ctx.alloc, sec, 13); }
+                        or (ge == 48) { section.emit_byte(ctx.alloc, sec, 0); }
+                        or (ge == 92) { section.emit_byte(ctx.alloc, sec, 92); }
+                        or (ge == 34) { section.emit_byte(ctx.alloc, sec, 34); }
+                        or (ge == 39) { section.emit_byte(ctx.alloc, sec, 39); }
+                        or { section.emit_byte(ctx.alloc, sec, ge); }
+                        gi = gi + 2;
+                    } or {
+                        section.emit_byte(ctx.alloc, sec, gc);
+                        gi = gi + 1;
+                    }
+                }
+                # null terminator
+                section.emit_byte(ctx.alloc, sec, 0);
+                emitted = true;
+            }
+        } or (init_node.kind == ast.NODE_EXPR_LIT_BOOL) {
+            val bool_text: str = init_node.info.lit_expr.text;
+            if (bool_text != nil && str_equals(bool_text, "true")) {
+                section.emit_byte(ctx.alloc, sec, 1);
+            } or {
+                section.emit_byte(ctx.alloc, sec, 0);
+            }
+            emitted = true;
+        } or (init_node.kind == ast.NODE_EXPR_LIT_CHAR) {
+            # char literal stored as int
+            val char_val: i64 = parse_int_str(init_node.info.lit_expr.text);
+            section.emit_byte(ctx.alloc, sec, char_val::u8);
+            emitted = true;
+        } or (init_node.kind == ast.NODE_EXPR_LIT_NIL) {
+            # nil is a null pointer (8 bytes of zeros)
+            section.emit_u64(ctx.alloc, sec, 0);
+            emitted = true;
+        } or (init_node.kind == ast.NODE_EXPR_LIT_FLOAT) {
+            # float literal - reinterpret f64 bits as u64
+            var float_val: f64 = parse_float(init_node.info.lit_expr.text);
+            val float_ptr: *f64 = ?float_val;
+            val bits_ptr: *u64 = float_ptr::*u64;
+            section.emit_u64(ctx.alloc, sec, @bits_ptr);
+            emitted = true;
+        } or (init_node.kind == ast.NODE_EXPR_BINARY) {
+            # handle binary expressions (e.g., constant OR/AND for flag combinations)
+            # for now, emit zeros and let runtime handle it
+        }
+    }
+
+    # fallback: emit zeros if nothing was emitted (unrecognized initializer or no init)
+    if (!emitted) {
+        var zi: usize = 0;
+        for (zi < var_size) {
+            section.emit_byte(ctx.alloc, sec, 0);
+            zi = zi + 1;
+        }
+    }
+}
+
+# emit_global_int: emit an integer value to a section with the correct size.
+fun emit_global_int(ctx: *LowerContext, sec: *section.Section, v: i64, size: usize) {
+    if (size <= 1) {
+        section.emit_byte(ctx.alloc, sec, v::u8);
+    } or (size <= 2) {
+        section.emit_u16(ctx.alloc, sec, v::u16);
+    } or (size <= 4) {
+        section.emit_u32(ctx.alloc, sec, v::u32);
+    } or {
+        section.emit_u64(ctx.alloc, sec, v::u64);
+    }
+}
+
+# --- module lowering ---
+
+# lower_module: lower all functions in a module.
+# ---
+# ctx:    lowering context
+# module: module root node
+# ret:    number of functions lowered
+pub fun lower_module(ctx: *LowerContext, module: *ast.Node) i32 {
+    if (ctx == nil || module == nil) {
+        ret 0;
+    }
+
+    var count: i32 = 0;
+
+    # get declarations from module (program node stores them in block_stmt.stmts)
+    val decls: *ast.List = module.info.block_stmt.stmts;
+    if (decls == nil) {
+        ret count;
+    }
+
+    # first pass: collect global variables and function declarations
+    var i: i32 = 0;
+    for (i < decls.count) {
+        val decl: *ast.Node = decls.nodes[i];
+        if (decl == nil) {
+            i = i + 1;
+            cnt;
+        }
+
+        var node: *ast.Node = decl;
+
+        # unwrap pub declarations
+        if (node.kind == ast.NODE_DECL_PUB) {
+            if (node.info.wrapper.inner != nil) {
+                node = node.info.wrapper.inner;
+            } or {
+                i = i + 1;
+                cnt;
+            }
+        }
+
+        # global variable declaration
+        if (node.kind == ast.NODE_DECL_VAR || node.kind == ast.NODE_DECL_VAL) {
+            lower_global_var(ctx, node);
+        }
+
+        i = i + 1;
+    }
+
+    # second pass: lower function bodies
+    i = 0;
+    for (i < decls.count) {
+        val decl: *ast.Node = decls.nodes[i];
+        if (decl == nil) {
+            i = i + 1;
+            cnt;
+        }
+
+        var node: *ast.Node = decl;
+
+        # unwrap pub declarations
+        if (node.kind == ast.NODE_DECL_PUB) {
+            if (node.info.wrapper.inner != nil) {
+                node = node.info.wrapper.inner;
+            } or {
+                i = i + 1;
+                cnt;
+            }
+        }
+
+        # function declaration
+        if (node.kind == ast.NODE_DECL_FUN) {
+            val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, node);
+            if (result_is_ok[*ir.IRFunction, str](fn_res)) {
+                # note: lower_function already adds non-entry functions to ir_funcs
+                # entry functions emit their code directly via inline asm
+                count = count + 1;
+            }
+        }
+
+        # comptime if - lower functions from taken branch
+        if (node.kind == ast.NODE_COMPTIME_IF) {
+            count = count + lower_comptime_if_functions(ctx, node);
+        }
+
+        i = i + 1;
+    }
+
+    ret count;
+}
+
+# lower_comptime_if_functions: lower functions from a $if taken branch.
+# ---
+# ctx:  lowering context
+# node: comptime_if node
+# ret:  number of functions lowered
+fun lower_comptime_if_functions(ctx: *LowerContext, node: *ast.Node) i32 {
+    if (ctx == nil || node == nil) {
+        ret 0;
+    }
+
+    # get taken branch (stored in cond_stmt.body by sema)
+    val taken: *ast.Node = node.info.cond_stmt.body;
+    if (taken == nil) {
+        ret 0;
+    }
+
+    var count: i32 = 0;
+
+    # taken might be a block with multiple declarations
+    if (taken.kind == ast.NODE_STMT_BLOCK) {
+        val decls: *ast.List = taken.info.block_stmt.stmts;
+        if (decls != nil) {
+            var i: i32 = 0;
+            for (i < decls.count) {
+                val decl: *ast.Node = decls.nodes[i];
+                if (decl != nil) {
+                    var fn_node: *ast.Node = decl;
+                    # unwrap pub wrapper
+                    if (fn_node.kind == ast.NODE_DECL_PUB && fn_node.info.wrapper.inner != nil) {
+                        fn_node = fn_node.info.wrapper.inner;
+                    }
+                    if (fn_node.kind == ast.NODE_DECL_FUN) {
+                        val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, fn_node);
+                        if (result_is_ok[*ir.IRFunction, str](fn_res)) {
+                            count = count + 1;
+                        }
+                    }
+                    if (fn_node.kind == ast.NODE_COMPTIME_IF || fn_node.kind == ast.NODE_COMPTIME_OR) {
+                        count = count + lower_comptime_if_functions(ctx, fn_node);
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    } or {
+        # single declaration - unwrap pub wrapper
+        var single: *ast.Node = taken;
+        if (single.kind == ast.NODE_DECL_PUB && single.info.wrapper.inner != nil) {
+            single = single.info.wrapper.inner;
+        }
+        if (single.kind == ast.NODE_DECL_FUN) {
+            val fn_res: Result[*ir.IRFunction, str] = lower_function(ctx, single);
+            if (result_is_ok[*ir.IRFunction, str](fn_res)) {
+                count = count + 1;
+            }
+        }
+        if (single.kind == ast.NODE_COMPTIME_IF || single.kind == ast.NODE_COMPTIME_OR) {
+            count = count + lower_comptime_if_functions(ctx, single);
+        }
+    }
+
+    ret count;
+}
+
+# lower_entry_point: lower the program entry point (_start).
+# emits x86_64 linux entry point code directly to .text section.
+# ---
+# ctx:       lowering context
+# main_name: name of the main function to call
+# ret:       Ok(true) on success, Err(str) on failure
+pub fun lower_entry_point(ctx: *LowerContext, main_name: str) Result[bool, str] {
+    if (ctx == nil || ctx.m == nil || main_name == nil) {
+        ret err[bool, str]("invalid arguments");
+    }
+
+    # get .text section
+    val text_res: Result[*section.Section, str] = masm.get_or_create_section(ctx.m, ".text", section.section_text());
+    if (result_is_err[*section.Section, str](text_res)) {
+        ret err[bool, str]("failed to get .text section");
+    }
+    val text: *section.Section = result_unwrap_ok[*section.Section, str](text_res);
+
+    # create and define _start symbol at current .text offset
+    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, "_start");
+    if (result_is_err[*sym.Symbol, str](sym_res)) {
+        ret err[bool, str]("failed to create _start symbol");
+    }
+    val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_res);
+    s.binding.tag = sym.BIND_GLOBAL;
+    s.sym_type.tag = sym.SYM_FUNC;
+    sym.define(s, text, text.size, 0);
+    masm.add_symbol(ctx.m, s);
+
+    # emit x86_64 linux entry point code:
+    #   mov rax, rsp          ; rax = initial stack pointer
+    #   mov rdi, [rax]        ; argc -> rdi (1st argument)
+    #   lea rsi, [rax+8]      ; argv -> rsi (2nd argument)
+    #   and rsp, -16          ; align stack to 16 bytes
+    #   sub rsp, 8            ; adjust for CALL (pushes 8-byte return address)
+    #   call main
+    #   mov rdi, rax          ; exit code from main -> rdi (1st syscall arg)
+    #   mov rax, 60           ; SYS_exit
+    #   syscall
+
+    # mov rax, rsp (48 89 e0)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x89);
+    section.emit_byte(ctx.alloc, text, 0xe0);
+
+    # mov rdi, [rax] (48 8b 38)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x8b);
+    section.emit_byte(ctx.alloc, text, 0x38);
+
+    # lea rsi, [rax+8] (48 8d 70 08)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x8d);
+    section.emit_byte(ctx.alloc, text, 0x70);
+    section.emit_byte(ctx.alloc, text, 0x08);
+
+    # and rsp, -16 (48 83 e4 f0)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x83);
+    section.emit_byte(ctx.alloc, text, 0xe4);
+    section.emit_byte(ctx.alloc, text, 0xf0);
+
+    # sub rsp, 8 (48 83 ec 08)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x83);
+    section.emit_byte(ctx.alloc, text, 0xec);
+    section.emit_byte(ctx.alloc, text, 0x08);
+
+    # call main (e8 xx xx xx xx) - relative call, needs relocation
+    # record offset of displacement for relocation
+    section.emit_byte(ctx.alloc, text, 0xe8);
+    val call_offset: usize = text.size;
+    # placeholder for 32-bit relative displacement (will be patched by relocation)
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+
+    # add relocation for call main
+    section.add_relocation(ctx.alloc, text, call_offset, main_name, section.RELOC_PC32, -4);
+
+    # mov rdi, rax (48 89 c7)
+    section.emit_byte(ctx.alloc, text, 0x48);
+    section.emit_byte(ctx.alloc, text, 0x89);
+    section.emit_byte(ctx.alloc, text, 0xc7);
+
+    # mov eax, 60 (b8 3c 00 00 00)
+    section.emit_byte(ctx.alloc, text, 0xb8);
+    section.emit_byte(ctx.alloc, text, 0x3c);
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+    section.emit_byte(ctx.alloc, text, 0x00);
+
+    # syscall (0f 05)
+    section.emit_byte(ctx.alloc, text, 0x0f);
+    section.emit_byte(ctx.alloc, text, 0x05);
+
+    ret ok[bool, str](true);
+}
+
+# find_module_index: find the output module index for a sema module.
+# ---
+# origin:      sema module pointer (nil = main module)
+# loaded_mods: array of loaded sema modules
+# mod_count:   number of loaded modules
+# ret:         index into out_modules (0 = main, 1..N = imports)
+fun find_module_index(origin: *sema.SemaModule, loaded_mods: **sema.SemaModule, mod_count: i32) i32 {
+    if (origin == nil) {
+        ret 0;
+    }
+    var i: i32 = 0;
+    for (i < mod_count) {
+        if (loaded_mods[i] == origin) {
+            ret i + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# init_module_masm: initialize a ModuleMasm with a fresh Masm context.
+fun init_module_masm(mod_out: *ModuleMasm, name: str, path: str, alloc: *allocator.Allocator, tgt: target.Target) Result[bool, str] {
+    val m_res: Result[masm.Masm, str] = masm.create(alloc, tgt);
+    if (result_is_err[masm.Masm, str](m_res)) {
+        ret err[bool, str]("failed to create masm for module");
+    }
+
+    val m_heap_res: Result[*masm.Masm, allocator.AllocError] = allocator.allocator_alloc[masm.Masm](alloc, 1);
+    if (result_is_err[*masm.Masm, allocator.AllocError](m_heap_res)) {
+        ret err[bool, str]("out of memory for module masm");
+    }
+    val m_ptr: *masm.Masm = result_unwrap_ok[*masm.Masm, allocator.AllocError](m_heap_res);
+    @m_ptr = result_unwrap_ok[masm.Masm, str](m_res);
+
+    val text_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".text", section.section_text());
+    val rodata_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".rodata", section.section_rodata());
+    val data_res: Result[*section.Section, str] = masm.get_or_create_section(m_ptr, ".data", section.section_data());
+
+    if (result_is_ok[*section.Section, str](text_res)) { section.set_align(result_unwrap_ok[*section.Section, str](text_res), 16); }
+    if (result_is_ok[*section.Section, str](rodata_res)) { section.set_align(result_unwrap_ok[*section.Section, str](rodata_res), 16); }
+    if (result_is_ok[*section.Section, str](data_res)) { section.set_align(result_unwrap_ok[*section.Section, str](data_res), 16); }
+
+    mod_out.m = m_ptr;
+    mod_out.mod_name = name;
+    mod_out.file_path = path;
+    mod_out.ir_funcs = nil;
+    mod_out.ir_func_count = 0;
+    mod_out.ir_func_cap = 0;
+
+    ret ok[bool, str](true);
+}
+
+# lower_all_modules_split: lower all modules into separate per-module MASM contexts.
+# ---
+# root:            root AST node of main module
+# symbols:         symbol table
+# types:           type context
+# alloc:           allocator
+# tgt:             target configuration
+# loaded_mods:     array of loaded sema modules
+# mod_count:       number of loaded modules
+# func_insts:      linked list of generic function instantiations
+# main_file_path:  path to main source file
+# main_source:     main module source text
+# out_modules:     output array of ModuleMasm (caller-allocated)
+# out_count:       output: number of modules written
+# max_modules:     capacity of out_modules array
+# ret:             Ok(true) on success, Err(str) on failure
+pub fun lower_all_modules_split(
+    root: *ast.Node, symbols: *symbol.Table, types: *tyctx.TypeContext,
+    alloc: *allocator.Allocator, tgt: target.Target,
+    loaded_mods: **sema.SemaModule, mod_count: i32,
+    func_insts: *sema.FunctionInstantiation,
+    main_file_path: str, main_source: str,
+    out_modules: *ModuleMasm, out_count: *i32, max_modules: i32
+) Result[bool, str] {
+
+    if (root == nil || alloc == nil || out_modules == nil || out_count == nil) {
+        ret err[bool, str]("invalid arguments");
+    }
+
+    var total: i32 = 0;
+
+    # --- Initialize main module ---
+    val main_init: Result[bool, str] = init_module_masm(?out_modules[0], "main", main_file_path, alloc, tgt);
+    if (result_is_err[bool, str](main_init)) {
+        ret err[bool, str]("failed to init main module masm");
+    }
+    total = 1;
+
+    # --- Initialize imported modules ---
+    var i: i32 = 0;
+    for (i < mod_count && total < max_modules) {
+        val smod: *sema.SemaModule = loaded_mods[i];
+        if (smod != nil && smod.ast != nil) {
+            var mod_name: str = "module";
+            if (smod.path != nil) {
+                mod_name = smod.path;
+            }
+            var mod_path: str = nil;
+            if (smod.file_path != nil) {
+                mod_path = smod.file_path;
+            }
+            val mod_init: Result[bool, str] = init_module_masm(?out_modules[total], mod_name, mod_path, alloc, tgt);
+            if (result_is_err[bool, str](mod_init)) {
+                ret err[bool, str]("failed to init module masm");
+            }
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+
+    # --- Create lower context (starts with main module) ---
+    var ctx: LowerContext = init(alloc, symbols, types, tgt, out_modules[0].m, main_source);
+    ctx.loaded_mods = loaded_mods;
+    ctx.loaded_mod_count = mod_count;
+
+    # --- Lower main module ---
+    if (main_file_path != nil) {
+        ctx.current_file_idx = masm.add_debug_file(out_modules[0].m, main_file_path);
+    }
+    ctx.current_sema_mod = nil;
+    val main_lower_count: i32 = lower_module(?ctx, root);
+    if (main_lower_count < 0) {
+        ret err[bool, str]("failed to lower main module");
+    }
+    # save main module IR functions
+    out_modules[0].ir_funcs = ctx.ir_funcs;
+    out_modules[0].ir_func_count = ctx.ir_func_count;
+    out_modules[0].ir_func_cap = ctx.ir_func_cap;
+
+    # --- Lower imported modules ---
+    i = 0;
+    var mod_idx: i32 = 1;
+    for (i < mod_count) {
+        val smod: *sema.SemaModule = loaded_mods[i];
+        if (smod != nil && smod.ast != nil && mod_idx < total) {
+            # reset ctx IR function storage for this module
+            ctx.ir_funcs = nil;
+            ctx.ir_func_count = 0;
+            ctx.ir_func_cap = 0;
+            ctx.m = out_modules[mod_idx].m;
+
+            if (smod.table != nil) {
+                ctx.symbols = smod.table;
+            }
+            ctx.current_sema_mod = smod;
+
+            if (smod.file_path != nil) {
+                ctx.current_file_idx = masm.add_debug_file(out_modules[mod_idx].m, smod.file_path);
+            } or {
+                ctx.current_file_idx = 0;
+            }
+            if (smod.source != nil) {
+                ctx.text = smod.source;
+            } or {
+                ctx.text = nil;
+            }
+
+            val mod_lower_count: i32 = lower_module(?ctx, smod.ast);
+            if (mod_lower_count < 0) {
+                ret err[bool, str]("failed to lower imported module");
+            }
+
+            # save this module's IR functions
+            out_modules[mod_idx].ir_funcs = ctx.ir_funcs;
+            out_modules[mod_idx].ir_func_count = ctx.ir_func_count;
+            out_modules[mod_idx].ir_func_cap = ctx.ir_func_cap;
+
+            mod_idx = mod_idx + 1;
+        }
+        i = i + 1;
+    }
+
+    # restore main module context
+    ctx.symbols = symbols;
+    ctx.text = main_source;
+    ctx.current_sema_mod = nil;
+    if (main_file_path != nil) {
+        ctx.current_file_idx = masm.add_debug_file(out_modules[0].m, main_file_path);
+    } or {
+        ctx.current_file_idx = 0;
+    }
+
+    # --- Lower generic function instantiations ---
+    # use a hash set to deduplicate (the linked list may contain duplicates
+    # if the sema inst_map overflowed its capacity)
+    var lowered_set: sema.InstMap;
+    lowered_set.entries = nil;
+    lowered_set.count = 0;
+    lowered_set.capacity = 0;
+
+    var finst: *sema.FunctionInstantiation = func_insts;
+    for (finst != nil) {
+        if (finst.func_ast != nil && finst.mangled_name != nil && finst.param_count > 0) {
+            # skip if already lowered
+            val already: str = sema.inst_map_get(?lowered_set, finst.mangled_name);
+            if (already != nil) {
+                finst = finst.next;
+                cnt;
+            }
+            sema.inst_map_put(?lowered_set, alloc, finst.mangled_name, finst.mangled_name);
+
+            val target_idx2: i32 = find_module_index(finst.origin_module, loaded_mods, mod_count);
+
+            ctx.ir_funcs = out_modules[target_idx2].ir_funcs;
+            ctx.ir_func_count = out_modules[target_idx2].ir_func_count;
+            ctx.ir_func_cap = out_modules[target_idx2].ir_func_cap;
+            ctx.m = out_modules[target_idx2].m;
+
+            ctx.type_binding_names = finst.param_names;
+            ctx.type_binding_types = finst.param_types;
+            ctx.type_binding_count = finst.param_count;
+            ctx.func_name_override = finst.mangled_name;
+            if (finst.func_type != nil && finst.func_type.kind == ty.TY_FUN) {
+                ctx.ret_type_override = finst.func_type.ret_type;
+            } or {
+                ctx.ret_type_override = nil;
+            }
+
+            if (finst.origin_module != nil && finst.origin_module.table != nil) {
+                ctx.symbols = finst.origin_module.table;
+                ctx.current_sema_mod = finst.origin_module;
+                if (finst.origin_module.source != nil) {
+                    ctx.text = finst.origin_module.source;
+                }
+                if (finst.origin_module.file_path != nil) {
+                    ctx.current_file_idx = masm.add_debug_file(out_modules[target_idx2].m, finst.origin_module.file_path);
+                }
+            } or {
+                ctx.symbols = symbols;
+                ctx.current_sema_mod = nil;
+            }
+
+            val finst_fn_res: Result[*ir.IRFunction, str] = lower_function(?ctx, finst.func_ast);
+            if (result_is_ok[*ir.IRFunction, str](finst_fn_res)) {
+                add_ir_function(?ctx, result_unwrap_ok[*ir.IRFunction, str](finst_fn_res));
+            }
+
+            out_modules[target_idx2].ir_funcs = ctx.ir_funcs;
+            out_modules[target_idx2].ir_func_count = ctx.ir_func_count;
+            out_modules[target_idx2].ir_func_cap = ctx.ir_func_cap;
+        }
+        finst = finst.next;
+    }
+    # clear type bindings and overrides
+    ctx.type_binding_names = nil;
+    ctx.type_binding_types = nil;
+    ctx.type_binding_count = 0;
+    ctx.func_name_override = nil;
+    ctx.ret_type_override = nil;
+
+    # note: ISel is not run here — caller must run isel per module after lowering
+    # so that per-module arenas can be used and freed incrementally.
+
+    # print collected lowering errors and bail if any occurred
+    if (ctx.had_error) {
+        print_lower_errors(?ctx);
+        ret err[bool, str]("lowering failed with errors");
+    }
+
+    @out_count = total;
+    ret ok[bool, str](true);
+}
+
+# lower_all_modules: lower main module and all imported modules to MASM.
+# ---
+# delegates to lower_all_modules_split, then merges all per-module MASMs into one.
+# preserves backward compatibility for callers like testing.mach.
+pub fun lower_all_modules(root: *ast.Node, symbols: *symbol.Table, types: *tyctx.TypeContext,
+    alloc: *allocator.Allocator, tgt: target.Target, loaded_mods: **sema.SemaModule, mod_count: i32,
+    func_insts: *sema.FunctionInstantiation,
+    main_file_path: str, main_source: str) Result[*masm.Masm, str] {
+
+    if (root == nil || alloc == nil) {
+        ret err[*masm.Masm, str]("invalid arguments");
+    }
+
+    var module_masms: [256]ModuleMasm;
+    var module_count: i32 = 0;
+
+    val split_res: Result[bool, str] = lower_all_modules_split(
+        root, symbols, types, alloc, tgt,
+        loaded_mods, mod_count, func_insts,
+        main_file_path, main_source,
+        ?module_masms[0], ?module_count, 256
+    );
+    if (result_is_err[bool, str](split_res)) {
+        ret err[*masm.Masm, str](result_unwrap_err[bool, str](split_res));
+    }
+
+    if (module_count == 0) {
+        ret err[*masm.Masm, str]("no modules lowered");
+    }
+
+    # use first module (main) as base, merge remaining modules into it
+    val m_ptr: *masm.Masm = module_masms[0].m;
+    var i: i32 = 1;
+    for (i < module_count) {
+        val merge_res: Result[bool, str] = masm.merge(m_ptr, module_masms[i].m);
+        if (result_is_err[bool, str](merge_res)) {
+            ret err[*masm.Masm, str](result_unwrap_err[bool, str](merge_res));
+        }
+        i = i + 1;
+    }
+
+    ret ok[*masm.Masm, str](m_ptr);
+}
