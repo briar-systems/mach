@@ -1,0 +1,395 @@
+# pipeline.mach: encapsulates the full compiler pipeline (parse → sema → lower → ISel → merge).
+# ---
+# Provides two entry points:
+#   compile()     — from source text
+#   compile_ast() — from a pre-parsed AST (e.g. after test transforms)
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use arena:     std.allocator.arena;
+use print:     std.print;
+
+use config:   mach.config.config;
+use ast:      mach.compiler.ast;
+use parser:   mach.compiler.parser;
+use sema:     mach.compiler.sema.sema;
+use sema_a:   mach.compiler.sema.analyze;
+use sema_e:   mach.compiler.sema.errors;
+use symbol:   mach.compiler.symbol;
+use ty:       mach.compiler.type;
+use tyctx:    mach.compiler.type_context;
+use comptime: mach.compiler.comptime;
+use isel:     mach.compiler.masm.isa.dispatch;
+use ldecl:    mach.compiler.masm.lower.decl;
+use lower:    mach.compiler.masm.lower.lower;
+use masm_mod: mach.compiler.masm.masm;
+use section:  mach.compiler.masm.section;
+use target:   mach.compiler.masm.target;
+
+# CompileOptions: configuration for a compilation run.
+pub rec CompileOptions {
+    target:          target.Target;
+    alloc:           *allocator.Allocator;
+    project_id:      str;    # nil for single-file mode
+    src_root:        str;    # nil for single-file mode
+    dep_root:        str;
+    deps:            *config.Dep;
+    dep_count:       i32;
+    enable_comptime: bool;
+}
+
+# CompileResult: output of a successful compilation.
+pub rec CompileResult {
+    masm:         *masm_mod.Masm;     # merged output
+    modules:      *lower.ModuleMasm;  # per-module results (ISel done)
+    module_count: i32;
+}
+
+# compile: run the full pipeline from source text.
+# ---
+# source:      source text to compile
+# file_path:   path to the source file (for error reporting)
+# module_path: module path for the source
+# opts:        compilation options
+# ret: CompileResult on success, error string on failure
+pub fun compile(source: str, file_path: str, module_path: str,
+    opts: CompileOptions) Result[CompileResult, str] {
+
+    if (source == nil) {
+        ret err[CompileResult, str]("source is nil");
+    }
+    if (opts.alloc == nil) {
+        ret err[CompileResult, str]("allocator is nil");
+    }
+
+    # parse source to AST
+    var p: parser.Parser = parser.init(source, opts.alloc);
+
+    val parse_res: Result[*ast.Node, str] = parser.parser_parse_program(?p);
+    if (result_is_err[*ast.Node, str](parse_res)) {
+        print.eprint("error: parsing failed: ");
+        print.eprintln(result_unwrap_err[*ast.Node, str](parse_res));
+        print_parser_errors(?p, file_path);
+        parser.parser_dnit(?p);
+        ret err[CompileResult, str]("parsing failed");
+    }
+
+    val root: *ast.Node = result_unwrap_ok[*ast.Node, str](parse_res);
+
+    if (p.had_error) {
+        print.eprintln("error: parsing failed with errors");
+        print_parser_errors(?p, file_path);
+        parser.parser_dnit(?p);
+        ret err[CompileResult, str]("parsing failed with errors");
+    }
+
+    # delegate to compile_ast
+    val res: Result[CompileResult, str] = compile_ast(root, file_path, module_path, source, opts);
+
+    # clean up parser
+    parser.parser_dnit(?p);
+
+    ret res;
+}
+
+# compile_ast: run the pipeline from a pre-parsed AST.
+# ---
+# root:        root AST node (program)
+# file_path:   path to the source file (for error reporting)
+# module_path: module path for the source
+# source:      original source text (for error reporting)
+# opts:        compilation options
+# ret: CompileResult on success, error string on failure
+pub fun compile_ast(root: *ast.Node, file_path: str, module_path: str,
+    source: str, opts: CompileOptions) Result[CompileResult, str] {
+
+    if (root == nil) {
+        ret err[CompileResult, str]("root AST node is nil");
+    }
+    if (opts.alloc == nil) {
+        ret err[CompileResult, str]("allocator is nil");
+    }
+
+    # --- Stage 1: Semantic Analysis ---
+
+    var sem: sema.Sema = sema.init(opts.alloc);
+
+    # set module roots for project mode
+    if (opts.project_id != nil && opts.src_root != nil) {
+        sema.set_module_roots(?sem, opts.project_id, opts.src_root, opts.dep_root,
+            opts.deps, opts.dep_count);
+    }
+
+    # ensure symbol table exists before creating comptime context
+    if (sem.symbols == nil) {
+        val table_res: Result[symbol.Table, str] = symbol.init(opts.alloc);
+        if (result_is_err[symbol.Table, str](table_res)) {
+            print.eprint("error: failed to create symbol table: ");
+            print.eprintln(result_unwrap_err[symbol.Table, str](table_res));
+            sema.dnit(?sem);
+            ret err[CompileResult, str]("failed to create symbol table");
+        }
+
+        val table_ptr_res: Result[*symbol.Table, allocator.AllocError] = allocator.allocator_alloc[symbol.Table](opts.alloc, 1);
+        if (result_is_err[*symbol.Table, allocator.AllocError](table_ptr_res)) {
+            sema.dnit(?sem);
+            ret err[CompileResult, str]("failed to allocate symbol table");
+        }
+        val table_ptr: *symbol.Table = result_unwrap_ok[*symbol.Table, allocator.AllocError](table_ptr_res);
+        @table_ptr = result_unwrap_ok[symbol.Table, str](table_res);
+        sem.symbols = table_ptr;
+    }
+
+    # optionally create comptime context
+    var cctx_ptr: *comptime.ComptimeContext = nil;
+    if (opts.enable_comptime) {
+        val cctx_init: comptime.ComptimeContext = comptime.init(opts.alloc, sem.symbols, sem.types);
+        val cctx_alloc_res: Result[*comptime.ComptimeContext, allocator.AllocError] = allocator.allocator_alloc[comptime.ComptimeContext](opts.alloc, 1);
+        if (result_is_err[*comptime.ComptimeContext, allocator.AllocError](cctx_alloc_res)) {
+            sema.dnit(?sem);
+            ret err[CompileResult, str]("failed to allocate comptime context");
+        }
+        cctx_ptr = result_unwrap_ok[*comptime.ComptimeContext, allocator.AllocError](cctx_alloc_res);
+        @cctx_ptr = cctx_init;
+    }
+
+    # run semantic analysis
+    val analyze_res: Result[bool, str] = sema_a.analyze(?sem, root, file_path, source, cctx_ptr);
+    if (result_is_err[bool, str](analyze_res)) {
+        print.eprint("error: semantic analysis failed: ");
+        print.eprintln(result_unwrap_err[bool, str](analyze_res));
+        sema.dnit(?sem);
+        ret err[CompileResult, str]("semantic analysis failed");
+    }
+
+    if (sema_e.has_errors(?sem)) {
+        sema_e.print_errors(?sem);
+        sema.dnit(?sem);
+        ret err[CompileResult, str]("semantic analysis produced errors");
+    }
+
+    # extract sema results
+    val symbols: *symbol.Table = sema.get_symbol_table(?sem);
+    val types: *tyctx.TypeContext = sema.get_type_context(?sem);
+
+    var loaded_mods: [256]*sema.SemaModule;
+    val load_count: i32 = sema.get_loaded_modules(?sem, ?loaded_mods[0], 256);
+
+    # --- Stage 2: Lower ---
+
+    # allocate per-module output array
+    val mod_arr_res: Result[*lower.ModuleMasm, allocator.AllocError] = allocator.allocator_alloc[lower.ModuleMasm](opts.alloc, 256);
+    if (result_is_err[*lower.ModuleMasm, allocator.AllocError](mod_arr_res)) {
+        sema.dnit(?sem);
+        ret err[CompileResult, str]("failed to allocate module array");
+    }
+    val module_masms: *lower.ModuleMasm = result_unwrap_ok[*lower.ModuleMasm, allocator.AllocError](mod_arr_res);
+    var module_count: i32 = 0;
+
+    val split_res: Result[bool, str] = ldecl.lower_all_modules_split(
+        root, symbols, types, opts.alloc, opts.target,
+        ?loaded_mods[0], load_count,
+        sem.func_insts,
+        file_path, source,
+        module_masms, ?module_count, 256
+    );
+    if (result_is_err[bool, str](split_res)) {
+        print.eprint("error: lowering failed: ");
+        print.eprintln(result_unwrap_err[bool, str](split_res));
+        sema.dnit(?sem);
+        ret err[CompileResult, str]("lowering failed");
+    }
+
+    # sema is no longer needed
+    sema.dnit(?sem);
+
+    # --- Stage 3: ISel + Merge ---
+
+    # create output masm
+    val out_res: Result[masm_mod.Masm, str] = masm_mod.create(opts.alloc, opts.target);
+    if (result_is_err[masm_mod.Masm, str](out_res)) {
+        ret err[CompileResult, str]("failed to create output masm");
+    }
+    val out_heap_res: Result[*masm_mod.Masm, allocator.AllocError] = allocator.allocator_alloc[masm_mod.Masm](opts.alloc, 1);
+    if (result_is_err[*masm_mod.Masm, allocator.AllocError](out_heap_res)) {
+        ret err[CompileResult, str]("out of memory");
+    }
+    val output: *masm_mod.Masm = result_unwrap_ok[*masm_mod.Masm, allocator.AllocError](out_heap_res);
+    @output = result_unwrap_ok[masm_mod.Masm, str](out_res);
+
+    # initialize standard sections
+    init_sections(output);
+
+    # per-module: ISel → merge
+    var mi: i32 = 0;
+    for (mi < module_count) {
+        if (module_masms[mi].ir_func_count > 0) {
+            # create per-module arena for ISel temporaries (4MB)
+            var isel_backing: allocator.Allocator = allocator.default();
+            val isel_ar_res: Result[arena.Arena, allocator.AllocError] = arena.init(isel_backing, 4194304);
+            if (result_is_err[arena.Arena, allocator.AllocError](isel_ar_res)) {
+                masm_mod.destroy(output);
+                ret err[CompileResult, str]("failed to create isel arena");
+            }
+            var isel_ar: arena.Arena = result_unwrap_ok[arena.Arena, allocator.AllocError](isel_ar_res);
+            var isel_alloc: allocator.Allocator = arena.arena_allocator(?isel_ar);
+
+            val isel_res: Result[bool, str] = isel.run_isel(
+                module_masms[mi].m, module_masms[mi].ir_funcs,
+                module_masms[mi].ir_func_count, ?isel_alloc
+            );
+            if (result_is_err[bool, str](isel_res)) {
+                print.eprint("error: isel failed: ");
+                print.eprintln(result_unwrap_err[bool, str](isel_res));
+                arena.arena_dnit(?isel_ar);
+                masm_mod.destroy(output);
+                ret err[CompileResult, str]("instruction selection failed");
+            }
+
+            # merge into output (copies section data)
+            val merge_res: Result[bool, str] = masm_mod.merge(output, module_masms[mi].m);
+            if (result_is_err[bool, str](merge_res)) {
+                print.eprint("error: merge failed: ");
+                print.eprintln(result_unwrap_err[bool, str](merge_res));
+                arena.arena_dnit(?isel_ar);
+                masm_mod.destroy(output);
+                ret err[CompileResult, str]("merge failed");
+            }
+
+            # free per-module arena
+            arena.arena_dnit(?isel_ar);
+        } or {
+            # no IR functions — still merge (may have data sections)
+            val merge_res: Result[bool, str] = masm_mod.merge(output, module_masms[mi].m);
+            if (result_is_err[bool, str](merge_res)) {
+                print.eprint("error: merge failed: ");
+                print.eprintln(result_unwrap_err[bool, str](merge_res));
+                masm_mod.destroy(output);
+                ret err[CompileResult, str]("merge failed");
+            }
+        }
+        mi = mi + 1;
+    }
+
+    val result: CompileResult = CompileResult{masm: output, modules: module_masms, module_count: module_count};
+    ret ok[CompileResult, str](result);
+}
+
+# init_sections: pre-create standard ELF sections with 16-byte alignment.
+fun init_sections(m: *masm_mod.Masm) {
+    masm_mod.get_or_create_section(m, ".text", section.section_text());
+    masm_mod.get_or_create_section(m, ".rodata", section.section_rodata());
+    masm_mod.get_or_create_section(m, ".data", section.section_data());
+    masm_mod.get_or_create_section(m, ".bss", section.section_bss());
+
+    val text_sec: *section.Section = masm_mod.get_section(m, ".text");
+    val rodata_sec: *section.Section = masm_mod.get_section(m, ".rodata");
+    val data_sec: *section.Section = masm_mod.get_section(m, ".data");
+    val bss_sec: *section.Section = masm_mod.get_section(m, ".bss");
+
+    if (text_sec != nil) { section.set_align(text_sec, 16); }
+    if (rodata_sec != nil) { section.set_align(rodata_sec, 16); }
+    if (data_sec != nil) { section.set_align(data_sec, 16); }
+    if (bss_sec != nil) { section.set_align(bss_sec, 16); }
+}
+
+# print_parser_errors: print parser errors to stderr.
+fun print_parser_errors(p: *parser.Parser, file_path: str) {
+    if (p == nil) {
+        ret;
+    }
+
+    var i: i32 = 0;
+    for (i < p.error_count) {
+        val e: *parser.ParserError = ?p.errors[i];
+        val line: i32 = pos_to_line(p.source, e.tok.pos);
+        val col: i32 = pos_to_col(p.source, e.tok.pos);
+
+        print.eprint("  ");
+        if (file_path != nil) {
+            print.eprint(file_path);
+            print.eprint(":");
+        }
+        print_i32(line);
+        print.eprint(":");
+        print_i32(col);
+        print.eprint(": ");
+        print.eprintln(e.message);
+        i = i + 1;
+    }
+}
+
+# pos_to_line: convert byte offset to 1-based line number.
+fun pos_to_line(source: str, pos: i32) i32 {
+    if (source == nil || pos <= 0) {
+        ret 1;
+    }
+    var line: i32 = 1;
+    var i: i32 = 0;
+    for (i < pos) {
+        if (source[i] == 10) {
+            line = line + 1;
+        }
+        i = i + 1;
+    }
+    ret line;
+}
+
+# pos_to_col: convert byte offset to 1-based column number.
+fun pos_to_col(source: str, pos: i32) i32 {
+    if (source == nil || pos <= 0) {
+        ret 1;
+    }
+    var col: i32 = 1;
+    var i: i32 = pos - 1;
+    for (i >= 0) {
+        if (source[i] == 10) {
+            ret col;
+        }
+        col = col + 1;
+        i = i - 1;
+    }
+    ret col;
+}
+
+# print_i32: print an i32 to stderr.
+fun print_i32(n: i32) {
+    if (n < 0) {
+        print.eprint("-");
+        print_i32(-n);
+        ret;
+    }
+
+    if (n == 0) {
+        print.eprint("0");
+        ret;
+    }
+
+    var buf: [16]u8;
+    var len: i32 = 0;
+    var num: i32 = n;
+
+    for (num > 0) {
+        buf[len] = (num % 10)::u8 + 48;
+        num = num / 10;
+        len = len + 1;
+    }
+
+    var i: i32 = 0;
+    var j: i32 = len - 1;
+    for (i < j) {
+        val tmp: u8 = buf[i];
+        buf[i] = buf[j];
+        buf[j] = tmp;
+        i = i + 1;
+        j = j - 1;
+    }
+
+    buf[len] = 0;
+
+    print.eprint((?buf[0])::str);
+}
