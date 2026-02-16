@@ -3648,7 +3648,7 @@ static void lower_function(Masm *masm, AstNode *func_node, SymbolTable *symbols,
         // if variadic, record named counts and save register-save area
         if (ctx->fn_is_variadic)
         {
-            ctx->va_named_gp          = gp_i - arg_shift;
+            ctx->va_named_gp          = gp_i;
             ctx->va_named_fp          = fp_i;
             ctx->va_named_stack_slots = stack_i;
 
