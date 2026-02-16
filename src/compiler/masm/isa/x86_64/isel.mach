@@ -9,6 +9,8 @@ use section: mach.compiler.masm.section;
 use masm:    mach.compiler.masm.masm;
 use x86:     mach.compiler.masm.isa.x86_64.opcode;
 use x86_enc: mach.compiler.masm.isa.x86_64.encode;
+use x86_buf: mach.compiler.masm.isa.x86_64.buf;
+use x86_opt: mach.compiler.masm.isa.x86_64.opt;
 use operand: mach.compiler.masm.operand;
 use spec:    mach.compiler.masm.isa.spec;
 use sym:     mach.compiler.masm.symbol;
@@ -43,6 +45,7 @@ pub rec ISelContext {
     total_stack_size: usize;
     ptr_size:         usize;
     m:                *masm.Masm;
+    instr_buf:        x86_buf.InstrBuffer;
 }
 
 # init: create a new instruction selection context.
@@ -63,6 +66,7 @@ pub fun init(alloc: *allocator.Allocator, text: *section.Section, m: *masm.Masm)
     ctx.total_stack_size = 0;
     ctx.ptr_size = 8;
     ctx.m = m;
+    ctx.instr_buf = x86_buf.buf_init(alloc);
     ret ctx;
 }
 
@@ -299,18 +303,88 @@ pub fun make_instruction(opcode: i32, dst: operand.Operand, src1: operand.Operan
     ret instr;
 }
 
-# emit_instr: encode and emit an instruction to the text section.
+# emit_instr: buffer an instruction for deferred encoding.
 # ---
 # ctx:   isel context
 # instr: instruction to emit
 pub fun emit_instr(ctx: *ISelContext, instr: spec.Instruction) {
+    if (ctx == nil || ctx.alloc == nil) {
+        ret;
+    }
+    x86_buf.buf_append(?ctx.instr_buf, instr);
+}
+
+# flush_buffer: run x86 peephole optimization, then encode all buffered
+# instructions to the text section. label markers are resolved to symbol
+# definitions at the current section offset during encoding.
+pub fun flush_buffer(ctx: *ISelContext) {
     if (ctx == nil || ctx.text == nil || ctx.alloc == nil) {
         ret;
     }
-    # use local var to get mutable pointer for encoder
-    var local_instr: spec.Instruction = instr;
-    # dispatch through x86_64 encode module
-    x86_enc.encode_instruction(?local_instr, ctx.text, ctx.alloc);
+
+    # run x86 peephole optimization on the buffer
+    var opt_ctx: x86_opt.X86OptContext = x86_opt.opt_init(ctx.alloc);
+    x86_opt.optimize_buffer(?opt_ctx, ?ctx.instr_buf);
+
+    # encode all instructions in order
+    var i: i32 = 0;
+    for (i < ctx.instr_buf.count) {
+        val instr: *spec.Instruction = x86_buf.buf_get(?ctx.instr_buf, i);
+        if (instr == nil) {
+            i = i + 1;
+            cnt;
+        }
+
+        # handle debug line markers: record debug line at current section offset
+        if (instr.opcode == x86_buf.DEBUG_LINE_MARKER) {
+            if (ctx.m != nil) {
+                masm.add_debug_line(ctx.m,
+                    section.current_offset(ctx.text),
+                    instr.dst.imm::u16,
+                    instr.src1.imm::i32
+                );
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        # handle label markers: define symbol at current section offset
+        if (instr.opcode == x86_buf.LABEL_MARKER) {
+            val label_name: str = instr.dst.label;
+            if (label_name != nil && ctx.m != nil) {
+                val existing: *sym.Symbol = masm.get_symbol(ctx.m, label_name);
+                if (existing != nil) {
+                    if (existing.sym_type.tag != sym.SYM_FUNC) {
+                        sym.define(existing, ctx.text, section.current_offset(ctx.text), 0);
+                    }
+                } or {
+                    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.m.alloc, label_name);
+                    if (result_is_ok[*sym.Symbol, str](sym_res)) {
+                        val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_res);
+                        sym.set_binding(s, sym.bind_local());
+                        sym.set_type(s, sym.sym_none());
+                        sym.define(s, ctx.text, section.current_offset(ctx.text), 0);
+                        masm.add_symbol(ctx.m, s);
+                    }
+                }
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        # skip NOPs with size 0 (eliminated by peephole)
+        if (instr.opcode == 0 && instr.size == 0 && instr.dst.kind.tag == operand.OP_NONE) {
+            i = i + 1;
+            cnt;
+        }
+
+        # encode instruction to text section
+        x86_enc.encode_instruction(instr, ctx.text, ctx.alloc);
+        i = i + 1;
+    }
+
+    # clear buffer for next function
+    x86_buf.buf_clear(?ctx.instr_buf);
 }
 
 # emit_mov_reg_imm: emit MOV reg, imm instruction.
@@ -2207,26 +2281,9 @@ pub fun select_instr(ctx: *ISelContext, instr: *ir.Instr) Result[bool, str] {
     val op_tag: u8 = ir.get_op_tag(?instr.op);
 
     if (op_tag == ir.OP_LABEL) {
-        # label pseudo-instruction - record current offset as symbol
+        # defer label into instruction buffer for resolution at encode time
         if (instr.dst.kind == ir.VAL_LABEL && instr.dst.label != nil) {
-            val label_name: str = instr.dst.label;
-            if (ctx.m != nil) {
-                val existing: *sym.Symbol = masm.get_symbol(ctx.m, label_name);
-                if (existing != nil) {
-                    if (existing.sym_type.tag != sym.SYM_FUNC) {
-                        sym.define(existing, ctx.text, section.current_offset(ctx.text), 0);
-                    }
-                } or {
-                    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.m.alloc, label_name);
-                    if (result_is_ok[*sym.Symbol, str](sym_res)) {
-                        val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_res);
-                        sym.set_binding(s, sym.bind_local());
-                        sym.set_type(s, sym.sym_none());
-                        sym.define(s, ctx.text, section.current_offset(ctx.text), 0);
-                        masm.add_symbol(ctx.m, s);
-                    }
-                }
-            }
+            x86_buf.buf_append_label(?ctx.instr_buf, instr.dst.label);
         }
     }
     or (op_tag == ir.OP_NOP) {
@@ -2377,25 +2434,17 @@ pub fun select_block(ctx: *ISelContext, block: *ir.IRBlock) Result[bool, str] {
         ret ok[bool, str](true);
     }
 
-    # emit block label if present
-    if (block.label != nil && ctx.m != nil) {
-        val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.m.alloc, block.label);
-        if (result_is_ok[*sym.Symbol, str](sym_res)) {
-            val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_res);
-            sym.set_binding(s, sym.bind_local());
-            sym.set_type(s, sym.sym_none());
-            sym.define(s, ctx.text, section.current_offset(ctx.text), 0);
-            masm.add_symbol(ctx.m, s);
-        }
+    # defer block label into instruction buffer for resolution at encode time
+    if (block.label != nil) {
+        x86_buf.buf_append_label(?ctx.instr_buf, block.label);
     }
 
     # process each instruction
     var i: i32 = 0;
     for (i < block.instr_count) {
-        # record debug line entry if instruction has source location
-        if (block.instrs[i].src_line > 0 && block.instrs[i].src_file > 0 && ctx.m != nil) {
-            masm.add_debug_line(ctx.m,
-                section.current_offset(ctx.text),
+        # defer debug line entry into instruction buffer
+        if (block.instrs[i].src_line > 0 && block.instrs[i].src_file > 0) {
+            x86_buf.buf_append_debug_line(?ctx.instr_buf,
                 block.instrs[i].src_file,
                 block.instrs[i].src_line
             );
@@ -2496,6 +2545,9 @@ pub fun select_function(ctx: *ISelContext, func: *ir.IRFunction) Result[bool, st
     if (!is_entry) {
         emit_epilogue(ctx, ctx.total_stack_size);
     }
+
+    # flush instruction buffer: run x86 peephole, then encode to text section
+    flush_buffer(ctx);
 
     # compute and set function size on symbol
     val func_end_offset: usize = section.current_offset(ctx.text);
