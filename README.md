@@ -1,6 +1,7 @@
 MACH
 ===
 
+![CI](https://github.com/octalide/mach/actions/workflows/ci.yml/badge.svg?branch=dev)
 ![License](https://img.shields.io/github/license/octalide/mach)
 ![Code Size](https://img.shields.io/github/languages/code-size/octalide/mach)
 ![Last Commit](https://img.shields.io/github/last-commit/octalide/mach)
