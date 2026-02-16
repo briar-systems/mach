@@ -1,132 +1,106 @@
 # Getting Started
 
-This guide walks through the minimum setup required to build Mach from source.
+This guide covers the minimum setup required to build Mach from source and create a project.
 
-> Mach is currently only being tested on Linux platforms. While it may build and run on other operating systems, there is no guarantee of support or functionality outside of Linux at this time.
-
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-    - [Git](#git)
-    - [Make](#make)
-    - [C Compiler](#c-compiler)
-  - [Building the Bootstrap Compiler](#building-the-bootstrap-compiler)
-  - [Building the Self-hosted Compiler](#building-the-self-hosted-compiler)
-  - [Making a New Project](#making-a-new-project)
-  - [Hello, World!](#hello-world)
+> Mach is currently only tested on Linux (x86_64). It may build on other platforms but there is no guarantee.
 
 
 ## Prerequisites
 
 ### Git
 
-Git is required for cloning the Mach repository as well as management of dependencies through the mach toolchain.
-
-You can ensure git is installed with:
+Required for cloning the repository and managing dependencies.
 
 ```bash
 git --version
 ```
 
-Please install the appropriate package for your system if git is not found.
-
 ### Make
 
-The simplest way to build Mach is via the provided `Makefile`. This requires GNU Make or a compatible tool.
+GNU Make or a compatible tool for driving the build.
 
 ### C Compiler
 
-Mach's bootstrap compiler is written in C and requires a C compiler to build. The existing build system has a preference for `clang`, but similar tools like `gcc` may also work.
-
-To ensure `clang` is installed on a Debian-based system, run:
+The bootstrap compiler is written in C and requires a C23-capable compiler. Clang is preferred:
 
 ```bash
 sudo apt install clang
 clang --version
 ```
 
-## Building the Bootstrap Compiler
+GCC also works if it supports `-std=c23`.
+
+
+## Building the Compiler
 
 ```bash
 git clone https://github.com/octalide/mach.git
 cd mach
-make cmach
+make full
 ```
 
-This produces the bootstrap compiler at `<repo_root>/out/bin/cmach`.
+This runs the 4-stage bootstrap:
 
-## Building the Self-hosted Compiler
+| Stage | Command | Description |
+|-------|---------|-------------|
+| 1 | `make cmach` | C bootstrap compiler (`boot/src/` -> `out/bin/cmach`) |
+| 2 | `make imach` | Intermediate compiler (cmach compiles `src/` -> `out/bin/imach`) |
+| 3 | `make smach` | Self-hosted compiler (imach compiles `src/` -> `out/bin/smach`) |
+| 4 | `make mach`  | Final compiler (smach compiles `src/` -> `out/linux/bin/mach`) |
 
-The commands `make imach` and `make mach` build the intermediate and final self-hosted compilers, respectively.
+`make full` runs all four stages. `make cmach` builds only the bootstrap if you need a quick start.
 
-These stages of the toolchain are incomplete. Failure to compile these stages, especially `make mach`, is expected at this time.
-
-Once complete, the production compiler can be built like so:
+To run the test suite (492 tests):
 
 ```bash
-git clone https://github.com/octalide/mach.git
-cd mach
-make mach
+make test
 ```
 
-## Making a New Project
 
-To create a new Mach project, the `mach init` tool is suggested. This tool will scaffold a new project structure with sensible defaults:
+## Creating a Project
+
+Use `mach init` to scaffold a new project:
 
 ```bash
-cmach init mach-project
-cd mach-project
+mach init my-project
+cd my-project
 ```
 
-Do note that this command will automatically add the standard library (located at https://github.com/octalide/mach-std) as a vendored dependency.
+This creates:
+- `mach.toml` -- project configuration
+- `src/main.mach` -- entrypoint with a hello world program
+- `dep/` -- dependency directory
+- `.gitignore` -- standard ignores
 
-From here, you can build your Mach project with:
+The standard library is automatically added as a git submodule dependency.
+
+Build and run:
 
 ```bash
-cmach build .
+mach build .
+mach run .
 ```
 
-This will compile your new Mach project according to the configuration specified in the `mach.toml` file located in the project root.
 
-You can execute the compiled binary with either:
+## Hello World
 
-```bash
-cmach run .
-```
-
-or directly with:
-
-```bash
-./out/bin/mach-project
-```
-
-## Hello, World!
-
-The standard `mach init` command creates a simple "Hello, World!" application by default.
-The main source file is located at `src/main.mach`:
+The generated `src/main.mach`:
 
 ```mach
 use          std.runtime;
 use print:   std.print;
 
-$main.symbol = "main"
+$main.symbol = "main";
 fun main(argc: i64, argv: &&u8) i64 {
     print.println("Hello, World!");
     ret 0;
 }
 ```
 
-You can use the `mach build .` and `mach run .` commands as described above to build and run this application.
+Key points:
+- `use std.runtime;` imports the runtime startup code (required for executables).
+- `$main.symbol = "main";` sets the linker symbol name for the function below it.
+- `fun main(argc: i64, argv: &&u8) i64` is the program entrypoint with C-compatible signature.
+- `ret 0;` returns the exit code.
 
-> At the time of writing, the only functional compiler is the bootstrap compiler (`cmach`).
-> Please use `cmach` in place of `mach` until the self-hosted compiler is complete.
-
-Note that this example uses the standard library, which is not delivered as a part of the Mach compiler itself.
-The [standard library](https://github.com/octalide/mach-std) can be added to your project as a dependency using:
-
-```bash
-cmach dep add https://github.com/octalide/mach-std --version branch/main
-```
-
-See [dependencies.md](dependencies.md) for more information about including dependencies in your Mach projects.
-
-For information as to why `$main.symbol` and explicit runtime imports are necessary, see the runtime entry in the [quirks file](quirks.md#runtime).
+See [modules.md](modules.md) for how `use` statements work and [config.md](config.md) for project configuration.
