@@ -1,15 +1,17 @@
 # mach unified build system
 # builds:
-#   1. bootstrap c compiler (boot/ -> out/bin/cmach)
-#   2. intermediary compiler with cmach (src/ -> out/bin/imach)
-#   3. final compiler with imach (src/ -> out/bin/mach)
+#   1. bootstrap c compiler    (boot/ -> out/bin/cmach)
+#   2. intermediary compiler   (cmach builds src/ -> out/bin/imach)
+#   3. self-hosted compiler    (imach builds src/ -> out/bin/smach)
+#   4. final compiler          (smach builds src/ -> out/linux/bin/mach)
 #
 # directory structure:
 #   out/
-#     bin/         # final binaries (cmach, imach)
-#     cmach/       # cmach artifacts (obj/)
-#     imach/<target>/  # imach artifacts (ast/, ir/, asm/, obj/)
-#     mach/<target>/   # mach artifacts (ast/, ir/, asm/, obj/)
+#     bin/              # stage binaries (cmach, imach, smach)
+#     cmach/            # cmach artifacts (obj/)
+#     imach/<target>/   # imach artifacts (ast/, ir/, asm/, obj/)
+#     smach/<target>/   # smach artifacts (ast/, ir/, asm/, obj/)
+#     mach/<target>/    # mach artifacts (ast/, ir/, asm/, obj/)
 
 # compiler and flags
 CC := clang
@@ -29,9 +31,10 @@ BOOT_SRC_DIR := $(BOOT_DIR)/src
 BOOT_INC_DIR := $(BOOT_DIR)/include
 CMACH_OBJ_DIR := $(OUT_DIR)/cmach/obj
 
-# final executables
+# executables
 CMACH := $(BIN_DIR)/cmach
 IMACH := $(BIN_DIR)/imach
+SMACH := $(BIN_DIR)/smach
 MACH := $(OUT_DIR)/linux/bin/mach
 
 # bootstrap compiler sources
@@ -40,7 +43,7 @@ BOOT_OBJECTS := $(BOOT_SOURCES:$(BOOT_SRC_DIR)/%.c=$(CMACH_OBJ_DIR)/%.o)
 BOOT_HEADERS := $(shell find $(BOOT_INC_DIR) -type f -name '*.h')
 
 # main targets
-.PHONY: help cmach-clean cmach-build cmach imach-clean imach-build imach mach-clean mach-build mach full clean test
+.PHONY: help cmach-clean cmach-build cmach imach-clean imach-build imach smach-clean smach-build smach mach-clean mach-build mach full clean test
 
 # default target: print help
 .DEFAULT_GOAL := help
@@ -48,35 +51,21 @@ BOOT_HEADERS := $(shell find $(BOOT_INC_DIR) -type f -name '*.h')
 help:
 	@echo "mach compiler build system"
 	@echo ""
-	@echo "bootstrap (c compiler):"
-	@echo "  cmach-clean  - clean cmach build artifacts"
-	@echo "  cmach-build  - build cmach"
-	@echo "  cmach        - clean and build cmach"
+	@echo "stages:"
+	@echo "  cmach        - bootstrap compiler (C)"
+	@echo "  imach        - intermediary compiler (built by cmach)"
+	@echo "  smach        - self-hosted compiler (built by imach)"
+	@echo "  mach         - final compiler (built by smach, output per mach.toml)"
+	@echo "  full         - build all stages"
 	@echo ""
-	@echo "intermediary (compiled with cmach):"
-	@echo "  imach-clean  - clean imach build artifacts"
-	@echo "  imach-build  - build imach"
-	@echo "  imach        - clean and build imach"
-	@echo ""
-	@echo "final (compiled with imach):"
-	@echo "  mach-clean   - clean mach build artifacts"
-	@echo "  mach-build   - build mach"
-	@echo "  mach         - clean and build mach (output per mach.toml)"
+	@echo "each stage supports -clean and -build suffixes:"
+	@echo "  <stage>-clean  - clean build artifacts"
+	@echo "  <stage>-build  - build without cleaning"
+	@echo "  <stage>        - clean and build"
 	@echo ""
 	@echo "meta:"
 	@echo "  clean        - clean all build artifacts"
 	@echo "  test         - run test suite"
-	@echo ""
-	@echo "note: target platform determined by mach.toml (target = \"native\")"
-	@echo "  imach        - clean and build imach"
-	@echo ""
-	@echo "final (compiled with imach):"
-	@echo "  mach-clean   - clean mach build artifacts"
-	@echo "  mach-build   - build mach"
-	@echo "  mach         - clean and build mach"
-	@echo ""
-	@echo "meta:"
-	@echo "  clean        - clean all build artifacts"
 
 # bootstrap compiler
 cmach-clean:
@@ -101,6 +90,16 @@ imach-build: $(IMACH)
 
 imach: imach-clean imach-build
 
+# self-hosted compiler
+smach-clean:
+	@echo "cleaning smach"
+	@rm -rf $(OUT_DIR)/smach
+	@rm -f $(SMACH)
+
+smach-build: $(SMACH)
+
+smach: smach-clean smach-build
+
 # final compiler
 mach-clean:
 	@echo "cleaning mach"
@@ -110,6 +109,9 @@ mach-clean:
 mach-build: $(MACH)
 
 mach: mach-clean mach-build
+
+# full build: all 4 stages
+full: cmach imach smach mach
 
 # clean everything
 clean:
@@ -134,7 +136,6 @@ $(CMACH): $(BOOT_OBJECTS) | $(BIN_DIR)
 	@echo "bootstrap compiler ready: $@"
 
 # intermediary compiler build (using cmach)
-# mach.toml determines target and output paths
 $(IMACH): $(CMACH) | $(BIN_DIR)
 	@echo "  cleaning artifacts for imach build"
 	@rm -rf $(OUT_DIR)/imach
@@ -142,11 +143,19 @@ $(IMACH): $(CMACH) | $(BIN_DIR)
 	@$(CMACH) build . -o $(IMACH)
 	@echo "intermediary compiler ready: $@"
 
-# final compiler build (using imach)
-# mach.toml determines target and output paths
-$(MACH): $(IMACH)
+# self-hosted compiler build (using imach)
+$(SMACH): $(IMACH) | $(BIN_DIR)
+	@echo "  cleaning artifacts for smach build"
+	@rm -rf $(OUT_DIR)/smach
+	@echo "  imach -> smach"
+	@$(IMACH) build . -o $(SMACH)
+	@echo "self-hosted compiler ready: $@"
+
+# final compiler build (using smach)
+# smach is a different binary from the output, so no ETXTBSY
+$(MACH): $(SMACH)
 	@echo "  cleaning artifacts for mach build"
 	@rm -rf $(OUT_DIR)/mach
-	@echo "  imach -> mach"
-	@$(IMACH) build .
+	@echo "  smach -> mach"
+	@$(SMACH) build .
 	@echo "final compiler ready: $@"
