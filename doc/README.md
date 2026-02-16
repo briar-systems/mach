@@ -1,26 +1,33 @@
-# Mach Language Reference
+# Mach Language Documentation
 
-This is the comprehensive reference for the Mach programming language.
+## Getting Started
 
-Overview:
-- [Getting Started](getting-started.md)
-- [Project Config Files](config.md)
-- [Module Resolution](modules.md)
-- [Dependencies](dependencies.md)
+- [Getting Started](getting-started.md) -- prerequisites, building, creating a project
 
-Semantics:
-- [Keywords](keywords.md)
-- [Literals](literals.md)
-- [Types](types.md)
-- [Expressions](expressions.md)
+## Language Reference
 
-Advanced Features:
-- [Pointers and Memory Management](memory.md)
-- [Compiletime Systems](compiletime.md)
+- [Types](types.md) -- primitives, records, unions, arrays, pointers, generics
+- [Declarations](declarations.md) -- functions, records, unions, variables, type aliases, external bindings
+- [Expressions](expressions.md) -- operators, literals, casts, field access, indexing
+- [Control Flow](control-flow.md) -- if/or, for loops, ret/brk/cnt, fin (defer)
+- [Modules](modules.md) -- imports, module resolution, project structure
+- [Memory](memory.md) -- pointers, address-of, dereference, mutability
+- [Generics](generics.md) -- generic types and functions, monomorphization
+- [Compile-Time](comptime.md) -- $if, $size_of, symbol attributes, compiler constants
+- [Variadic Functions](variadic.md) -- va_list, va_start, va_arg, va_end
+- [Testing](testing.md) -- test blocks, test runner, assertions
+- [Inline Assembly](asm.md) -- asm blocks
 
-Compiler Internals:
-- [MASM (Mach Assembly)](masm/README.md)
+## Tooling
 
-Reference:
-- [Cheatsheet](cheatsheet.md)
-- [Quirks](quirks.md)
+- [Project Configuration](config.md) -- mach.toml reference
+- [Dependencies](dependencies.md) -- adding, removing, managing dependencies
+- [Cheatsheet](cheatsheet.md) -- quick reference card
+
+## Compiler Internals
+
+- [MASM Backend](masm/README.md) -- intermediate representation and code generation
+
+## Proposals
+
+- [Type Conversions](proposals/type_conversions.md) -- implicit widening proposal

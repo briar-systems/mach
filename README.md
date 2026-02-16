@@ -14,17 +14,11 @@ We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
 
 # Overview
 
-- [MACH](#mach)
-- [Overview](#overview)
-  - [Core Philosophy](#core-philosophy)
+- [Core Philosophy](#core-philosophy)
 - [Getting Started](#getting-started)
-  - [Building Mach](#building-mach)
-  - [Simple Examples](#simple-examples)
-    - [Hello World](#hello-world)
-    - [Fibonacci](#fibonacci)
-    - [Factorial](#factorial)
+- [Examples](#examples)
+- [Documentation](#documentation)
 - [Credit](#credit)
-  - [Contributing](#contributing)
 - [License](#license)
 
 
@@ -44,36 +38,34 @@ Mach is NOT designed to prioritize:
 
 # Getting Started
 
-We encourage you to not even install Mach until you have read the [language documentation](doc/README.md). The docs are written more like a pamphlet than a bible, and assume that you are familiar with basic programming concepts from other languages.
-
-The reason for this is that Mach may not be for you. If the language does not include some features you hope to use, includes things you despise, or if you just don't like the syntax, then you should look elsewhere. If you read the documentation and have decided that you like the language, then you will have learned the basics and should be capable of diving in.
+Read the [language documentation](doc/README.md) before installing. The docs are written more like a pamphlet than a bible and assume familiarity with basic programming concepts from other languages.
 
 
 ## Building Mach
 
-Before compiling the toolchain, follow the [getting started checklist](doc/getting-started.md) to ensure that your system is capable of building Mach from source.
-
-Once everything is set up, building a usable mach compiler is as simple as:
+Prerequisites: git, make, clang (or gcc with C23 support). See [getting started](doc/getting-started.md) for details.
 
 ```bash
 git clone https://github.com/octalide/mach
 cd mach
-make cmach
+make full
 ```
 
-> NOTE: The above command builds the bootstrap compiler, `cmach`, which is written in C. Mach's fully self-hosted compiler, `mach`, is currently under heavy development and is not yet functional.
+This runs the 4-stage bootstrap:
+1. **cmach** -- C bootstrap compiler (compiles from `boot/src/`)
+2. **imach** -- intermediate compiler (cmach compiles the Mach source)
+3. **smach** -- self-hosted compiler (imach compiles the Mach source)
+4. **mach** -- final compiler (smach compiles the Mach source)
+
+The final binary is at `out/linux/bin/mach`. To build only the bootstrap compiler: `make cmach`.
 
 
-## Simple Examples
+# Examples
 
-The following examples are provided to give a sense of the language's syntax and structure.
-
-> The examples are functional, but they expect the standard library to be included as a dependency during compilation. This is NOT default behaviour and must be explicitly specified to the compiler.
->
-> For a fully working out-of-the-box example, please refer to the [Mach Sieve](https://github.com/octalide/mach-sieve) project.
+The following examples require the standard library as a dependency. For a standalone project, see the [getting started guide](doc/getting-started.md) or the [Mach Sieve](https://github.com/octalide/mach-sieve) project.
 
 
-### Hello World
+## Hello World
 
 ```mach
 use          std.runtime;
@@ -87,7 +79,7 @@ fun main(argc: i64, argv: &&u8) i64 {
 ```
 
 
-### Fibonacci
+## Fibonacci
 
 ```mach
 use          std.runtime;
@@ -97,24 +89,18 @@ fun fibr(n: u64) u64 {
     if (n < 2) {
         ret n;
     }
-
     ret fibr(n - 1) + fibr(n - 2);
 }
 
 $main.symbol = "main";
 fun main(argc: i64, argv: &&u8) i64 {
-    val max: u64 = 10;
-    print.print("fib(");
-    print.u64(max);
-    print.print(") = ");
-    print.u64(fibr(max));
-    print.println("");
+    print.printf("fib(%d) = %d\n", 10::i64, fibr(10));
     ret 0;
 }
 ```
 
 
-### Factorial
+## Factorial
 
 ```mach
 use          std.runtime;
@@ -124,37 +110,34 @@ fun fact(n: u64) u64 {
     if (n == 0) {
         ret 1;
     }
-
     ret n * fact(n - 1);
 }
 
 $main.symbol = "main";
 fun main(argc: i64, argv: &&u8) i64 {
-    val max: u64 = 10;
-    print.print("fact(");
-    print.u64(max);
-    print.print(") = ");
-    print.u64(fact(max));
-    print.println("");
+    print.printf("fact(%d) = %d\n", 10::i64, fact(10));
     ret 0;
 }
 ```
+
+
+# Documentation
+
+The full language and tooling documentation is in [`doc/`](doc/README.md).
 
 
 # Credit
 
 The inspiration for Mach comes from too many languages to count. Almost every language has problems that Mach attempts to elegantly resolve (most often by the process of reductive simplification).
 
-Direct inspiration for the compiler, however, comes from a few more specific sources, the most notable of which are listed below:
+Direct inspiration for the compiler comes from a few specific sources:
 
 - [Golang](https://golang.org/)
 - [Vlang](https://vlang.org/)
 - [Zig](https://ziglang.org/)
 - [Rust](https://www.rust-lang.org/)
 
-The original compiler would not have been written without the ability to reference the source code of these languages.
-
-Mach, at its core, stands on the shoulders of countles giants that have contributed to the development of these languages either directly or by proxy. It is out of respect for their work that Mach will always be fully open source. Thank you all.
+Mach, at its core, stands on the shoulders of countless giants that have contributed to the development of these languages either directly or by proxy. It is out of respect for their work that Mach will always be fully open source. Thank you all.
 
 
 ## Contributing
