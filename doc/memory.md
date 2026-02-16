@@ -1,176 +1,88 @@
-# Pointers and Memory Management
+# Pointers and Memory
 
-This document covers pointer types, memory operations, and memory management semantics in Mach.
-
-- [Pointers and Memory Management](#pointers-and-memory-management)
-  - [Overview](#overview)
-  - [Pointer Types](#pointer-types)
-  - [Creating Pointers](#creating-pointers)
-  - [Dereferencing Pointers](#dereferencing-pointers)
-  - [Null Pointers](#null-pointers)
-  - [Pointer Arithmetic](#pointer-arithmetic)
-  - [Memory Safety](#memory-safety)
-
-
-## Overview
-
-Mach provides low-level pointer operations for direct memory manipulation. Pointers in Mach are explicit and require manual management - there is no garbage collection or automatic memory management in the language itself.
-
-The language provides two primary operators for working with pointers:
-- `?` - address-of operator (creates a pointer to a value)
-- `@` - dereference operator (accesses the value a pointer points to)
+Mach provides direct pointer operations with no garbage collection or automatic memory management.
 
 
 ## Pointer Types
 
-Pointer types are denoted with a `*` prefix for mutable pointers and `&` for read-only pointers:
+- `*T` -- mutable pointer to T
+- `&T` -- read-only pointer to T
+- `ptr` -- untyped raw pointer (like C `void*`)
+
+Mutable pointers (`*T`) can be implicitly used where a read-only pointer (`&T`) is expected, but not the reverse.
+
+
+## Address-of (?)
+
+The `?` operator takes the address of a value:
 
 ```mach
-val int_ptr:   *i32 = nil;  # mutable pointer to i32
-val read_only: &i32 = nil;  # read-only pointer to i32
-val float_ptr: *f64 = nil;  # pointer to f64
-val ptr_ptr:   **u8 = nil;  # pointer to pointer to u8
+var x: i32 = 42;
+val p: *i32 = ?x;   # mutable pointer (x is var)
+
+val y: i32 = 100;
+val q: &i32 = ?y;   # read-only pointer (y is val)
 ```
 
-The special `ptr` type represents an untyped pointer, similar to C's `void*`:
+
+## Dereference (@)
+
+The `@` operator reads or writes through a pointer:
 
 ```mach
-val raw_ptr: ptr = nil;  # untyped pointer
-```
-
-See the [Types](types.md#primitives) documentation for details on primitive types.
-
-
-## Creating Pointers
-
-The `?` operator takes the address of a variable, creating a pointer to it.
-The resulting pointer type depends on the mutability of the source variable:
-
-- Taking the address of a `var` yields a mutable pointer `*T`.
-- Taking the address of a `val` yields a read-only pointer `&T`.
-
-```mach
-var x: i32  = 42;
-val p: *i32 = ?x;  # p is *i32 because x is mutable
-
-val y: i32  = 100;
-val q: &i32 = ?y;  # q is &i32 because y is immutable
-```
-
-Mutable pointers (`*T`) can be implicitly cast to read-only pointers (`&T`), but the reverse is not allowed.
-
-
-## Dereferencing Pointers
-
-The `@` operator dereferences a pointer, accessing the value it points to:
-
-```mach
-var x: i32  = 42;
+var x: i32 = 42;
 var p: *i32 = ?x;
 
-val value: i32 = @p;  # read the value (42)
-@p = 100;             # write through the pointer (x is now 100)
+val value: i32 = @p;   # read: 42
+@p = 100;               # write: x is now 100
 ```
 
-Dereferencing a read-only pointer (`&T`) yields a value that cannot be assigned to.
-
-```mach
-val y: i32  = 100;
-val q: &i32 = ?y;
-
-val v: i32 = @q; # OK: reading is allowed
-# @q = 200;      # ERROR: cannot assign to read-only location
-```
-
-Dereferencing a null pointer or an invalid pointer results in undefined behavior.
+Dereferencing a read-only pointer yields a value that cannot be assigned to. Dereferencing a null or invalid pointer is undefined behavior.
 
 
 ## Null Pointers
 
-The `nil` keyword represents a null pointer value. It can be assigned to any pointer type:
+`nil` represents a null pointer and can be assigned to any pointer type:
 
 ```mach
-val p1: *i32 = nil;
-val p2: *u8  = nil;
-val p3: ptr  = nil;
+val p: *i32 = nil;
+val s: str = nil;
 ```
 
-See the [Keywords](keywords.md) documentation for more details on `nil`.
 
+## Field Access Through Pointers
 
-## Pointer Arithmetic
-
-Mach does not provide built-in pointer arithmetic operators. Pointer manipulation must be done through explicit casting and offset calculations when necessary.
-
-For array element access, use array indexing syntax instead:
+The `.` operator works uniformly on both values and pointers:
 
 ```mach
-val arr:  [5]i32 = [5]i32{1, 2, 3, 4, 5};
-val elem: i32    = arr[2]; # preferred over pointer arithmetic
+rec Point { x: f32; y: f32; }
+
+var p: Point = Point{x: 1.0, y: 2.0};
+var ptr: *Point = ?p;
+val x: f32 = ptr.x;   # automatic dereference
 ```
 
-See the [Types](types.md#arrays) documentation for details on arrays and indexing.
+
+## Array Indexing
+
+Both arrays and pointers support `[]` indexing:
+
+```mach
+val arr: [5]i32 = [5]i32{10, 20, 30, 40, 50};
+val elem: i32 = arr[2];   # 30
+
+val p: &i32 = ?arr[0];
+val same: i32 = p[2];     # also 30
+```
 
 
 ## Memory Safety
 
-Mach does not enforce memory safety at compile time or runtime.
-It is the programmer's responsibility to:
+Mach does not enforce memory safety at compile time or runtime. The programmer is responsible for:
 
-- Ensure pointers are valid before dereferencing
-- Avoid use-after-free bugs
-- Prevent buffer overflows
-- Manage memory allocation and deallocation properly
-- Avoid dangling pointers
+- Checking pointers before dereferencing
+- Avoiding use-after-free
+- Preventing buffer overflows
+- Managing allocation and deallocation
 
-Patterns such as Zig's allocator model or other stylizations can be employed to help manage memory safely in Mach programs, but this decision is ultimately left to the developer.
-
-The [standard library](https://github.com/octalide/mach-std) provides some utilities for memory management. Here's a simple example of allocating and freeing memory using the standard library's utilities:
-
-```mach
-use          std.runtime;
-use          std.types.option;
-use print:   std.print;
-
-# memory utilities are found in the `std.system.memory` module
-use mem: std.system.memory;
-
-$main.symbol = "main"
-fun main(argc: i64, argv: &&u8) i64 {
-    # allocate memory for 10 i32 values
-    var opt_alloc: Option[*i32] = mem.allocate[i32](10);
-    if (opt_alloc.is_none()) {
-        print.println("Memory allocation failed");
-        ret 1;
-    }
-
-    var p: *i32 = opt_alloc.unwrap();
-    # `p` now points to the first byte of the allocated memory
-
-    print.println("Memory allocation succeeded");
-
-    # use the allocated memory
-    var i: i32 = 0;
-    for (i < 10) {
-        @(p + i) = i * 10;
-        i = i + 1;
-    }
-
-    # verify the values
-    i = 0;
-    for (i < 10) {
-        val value: i32 = @(p + i);
-        if (value != i * 10) {
-            print.println("unexpected value");
-            mem.deallocate[i32](p, 10);
-            ret 1;
-        }
-        i = i + 1;
-    }
-
-    # free the allocated memory
-    mem.deallocate[i32](p, 10);
-
-    ret 0;
-}
-```
+The standard library provides allocator types (arena, heap) for structured memory management.
