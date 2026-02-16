@@ -60,6 +60,7 @@ fun optimize_block(ctx: *IROptContext, block: *ir.IRBlock) {
         if (rule_constant_fold(block)) { changed = true; }
         if (rule_redundant_store_load(block)) { changed = true; }
         if (rule_cmp_branch_fusion(block)) { changed = true; }
+        if (rule_memset_loop(block)) { changed = true; }
     }
 
     compact_block(block);
@@ -377,6 +378,211 @@ fun rule_cmp_branch_fusion(block: *ir.IRBlock) bool {
             }
         }
         i = i + 1;
+    }
+    ret changed;
+}
+
+# next_non_nop: find next instruction index that isn't a NOP, starting from pos.
+# returns -1 if no non-NOP found.
+fun next_non_nop(block: *ir.IRBlock, pos: i32) i32 {
+    var j: i32 = pos;
+    for (j < block.instr_count) {
+        val tag: u8 = ir.get_op_tag(?block.instrs[j].op);
+        if (tag != ir.OP_NOP) {
+            ret j;
+        }
+        j = j + 1;
+    }
+    ret -1;
+}
+
+# same_mem: check if two IRValues refer to the same memory location.
+fun same_mem(a: ir.IRValue, b: ir.IRValue) bool {
+    if (a.kind != ir.VAL_MEM || b.kind != ir.VAL_MEM) {
+        ret false;
+    }
+    ret a.base_reg == b.base_reg && a.offset == b.offset &&
+        a.index_reg == b.index_reg && a.scale == b.scale;
+}
+
+# rule_memset_loop: detect sequential constant-fill loops and replace with memset.
+# pattern (skipping NOPs from earlier passes):
+#   LABEL   .Lstart
+#   LOAD    vreg_ctr, [mem_ctr]          # counter
+#   CMP     _, vreg_ctr, imm(N)          # bound check
+#   JCC     .Lend, CC_GE                 # exit if >= N
+#   LOAD    vreg_i2, [mem_ctr]           # counter for indexing
+#   LEA     vreg_base, [mem_arr]         # array base
+#   MOV     vreg_off, vreg_i2            # identity (was MUL by 1)
+#   ADD     vreg_addr, vreg_base, vreg_off
+#   STORE   [vreg_addr], imm(V)          # constant byte store
+#   LOAD    vreg_i3, [mem_ctr]           # counter for increment
+#   ADD     vreg_inc, vreg_i3, imm(1)    # i + 1
+#   STORE   [mem_ctr], vreg_inc          # write back
+#   JMP     .Lstart
+#   LABEL   .Lend
+# replacement:
+#   MEMSET  [mem_arr], imm(V), imm(N)
+#   STORE   [mem_ctr], imm(N)
+#   ... NOPs ...
+#   LABEL   .Lend
+fun rule_memset_loop(block: *ir.IRBlock) bool {
+    var changed: bool = false;
+    var i: i32 = 0;
+    for (i < block.instr_count - 10) {
+        # [0] LABEL .Lstart
+        val t0: u8 = ir.get_op_tag(?block.instrs[i].op);
+        if (t0 != ir.OP_LABEL) {
+            i = i + 1;
+            cnt;
+        }
+        val p0: i32 = i;
+        val start_label: str = block.instrs[p0].dst.label;
+
+        # [1] LOAD vreg_ctr, [mem_ctr]
+        val p1: i32 = next_non_nop(block, p0 + 1);
+        if (p1 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p1].op) != ir.OP_LOAD) { i = i + 1; cnt; }
+        val ctr_mem: ir.IRValue = block.instrs[p1].src1;
+        if (ctr_mem.kind != ir.VAL_MEM) { i = i + 1; cnt; }
+        val ctr_dst: ir.IRValue = block.instrs[p1].dst;
+        if (ctr_dst.kind != ir.VAL_REG) { i = i + 1; cnt; }
+        val ctr_reg: i32 = ctr_dst.reg;
+
+        # [2] CMP _, vreg_ctr, imm(N)
+        val p2: i32 = next_non_nop(block, p1 + 1);
+        if (p2 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p2].op) != ir.OP_CMP) { i = i + 1; cnt; }
+        val cmp_s1: ir.IRValue = block.instrs[p2].src1;
+        val cmp_s2: ir.IRValue = block.instrs[p2].src2;
+        if (cmp_s1.kind != ir.VAL_REG || cmp_s1.reg != ctr_reg) { i = i + 1; cnt; }
+        if (cmp_s2.kind != ir.VAL_IMM) { i = i + 1; cnt; }
+        val bound: i64 = cmp_s2.imm;
+        if (bound <= 0) { i = i + 1; cnt; }
+
+        # [3] JCC .Lend, CC_GE
+        val p3: i32 = next_non_nop(block, p2 + 1);
+        if (p3 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p3].op) != ir.OP_JCC) { i = i + 1; cnt; }
+        if (block.instrs[p3].cond != ir.CC_GE) { i = i + 1; cnt; }
+        val end_label: str = block.instrs[p3].dst.label;
+
+        # [4] LOAD vreg_i2, [mem_ctr]  (counter for indexing)
+        val p4: i32 = next_non_nop(block, p3 + 1);
+        if (p4 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p4].op) != ir.OP_LOAD) { i = i + 1; cnt; }
+        if (!same_mem(block.instrs[p4].src1, ctr_mem)) { i = i + 1; cnt; }
+        val i2_dst: ir.IRValue = block.instrs[p4].dst;
+        if (i2_dst.kind != ir.VAL_REG) { i = i + 1; cnt; }
+        val i2_reg: i32 = i2_dst.reg;
+
+        # [5] LEA vreg_base, [mem_arr]
+        val p5: i32 = next_non_nop(block, p4 + 1);
+        if (p5 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p5].op) != ir.OP_LEA) { i = i + 1; cnt; }
+        val arr_mem: ir.IRValue = block.instrs[p5].src1;
+        if (arr_mem.kind != ir.VAL_MEM) { i = i + 1; cnt; }
+        val base_dst: ir.IRValue = block.instrs[p5].dst;
+        if (base_dst.kind != ir.VAL_REG) { i = i + 1; cnt; }
+        val base_reg: i32 = base_dst.reg;
+
+        # [6] MOV vreg_off, vreg_i2  (was MUL by 1 — element size 1)
+        val p6: i32 = next_non_nop(block, p5 + 1);
+        if (p6 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p6].op) != ir.OP_MOV) { i = i + 1; cnt; }
+        val mov_s1: ir.IRValue = block.instrs[p6].src1;
+        if (mov_s1.kind != ir.VAL_REG || mov_s1.reg != i2_reg) { i = i + 1; cnt; }
+        val off_dst: ir.IRValue = block.instrs[p6].dst;
+        if (off_dst.kind != ir.VAL_REG) { i = i + 1; cnt; }
+        val off_reg: i32 = off_dst.reg;
+
+        # [7] ADD vreg_addr, vreg_base, vreg_off
+        val p7: i32 = next_non_nop(block, p6 + 1);
+        if (p7 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p7].op) != ir.OP_ADD) { i = i + 1; cnt; }
+        val add_s1: ir.IRValue = block.instrs[p7].src1;
+        val add_s2: ir.IRValue = block.instrs[p7].src2;
+        if (add_s1.kind != ir.VAL_REG || add_s1.reg != base_reg) { i = i + 1; cnt; }
+        if (add_s2.kind != ir.VAL_REG || add_s2.reg != off_reg) { i = i + 1; cnt; }
+
+        # [8] STORE [vreg_addr], imm(V)
+        val p8: i32 = next_non_nop(block, p7 + 1);
+        if (p8 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p8].op) != ir.OP_STORE) { i = i + 1; cnt; }
+        val st_dst: ir.IRValue = block.instrs[p8].dst;
+        val st_src: ir.IRValue = block.instrs[p8].src1;
+        if (st_dst.kind != ir.VAL_MEM) { i = i + 1; cnt; }
+        if (st_src.kind != ir.VAL_IMM) { i = i + 1; cnt; }
+        if (st_dst.size != 1) { i = i + 1; cnt; }
+        val fill_val: i64 = st_src.imm;
+
+        # [9] LOAD vreg_i3, [mem_ctr]  (same counter)
+        val p9: i32 = next_non_nop(block, p8 + 1);
+        if (p9 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p9].op) != ir.OP_LOAD) { i = i + 1; cnt; }
+        if (!same_mem(block.instrs[p9].src1, ctr_mem)) { i = i + 1; cnt; }
+        val i3_dst: ir.IRValue = block.instrs[p9].dst;
+        if (i3_dst.kind != ir.VAL_REG) { i = i + 1; cnt; }
+        val i3_reg: i32 = i3_dst.reg;
+
+        # [10] ADD vreg_inc, vreg_i3, imm(1)
+        val p10: i32 = next_non_nop(block, p9 + 1);
+        if (p10 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p10].op) != ir.OP_ADD) { i = i + 1; cnt; }
+        val inc_s1: ir.IRValue = block.instrs[p10].src1;
+        val inc_s2: ir.IRValue = block.instrs[p10].src2;
+        if (inc_s1.kind != ir.VAL_REG || inc_s1.reg != i3_reg) { i = i + 1; cnt; }
+        if (inc_s2.kind != ir.VAL_IMM || inc_s2.imm != 1) { i = i + 1; cnt; }
+        val inc_dst: ir.IRValue = block.instrs[p10].dst;
+        if (inc_dst.kind != ir.VAL_REG) { i = i + 1; cnt; }
+        val inc_reg: i32 = inc_dst.reg;
+
+        # [11] STORE [mem_ctr], vreg_inc
+        val p11: i32 = next_non_nop(block, p10 + 1);
+        if (p11 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p11].op) != ir.OP_STORE) { i = i + 1; cnt; }
+        if (!same_mem(block.instrs[p11].dst, ctr_mem)) { i = i + 1; cnt; }
+        val wb_src: ir.IRValue = block.instrs[p11].src1;
+        if (wb_src.kind != ir.VAL_REG || wb_src.reg != inc_reg) { i = i + 1; cnt; }
+
+        # [12] JMP .Lstart
+        val p12: i32 = next_non_nop(block, p11 + 1);
+        if (p12 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p12].op) != ir.OP_JMP) { i = i + 1; cnt; }
+        if (block.instrs[p12].dst.label != start_label) { i = i + 1; cnt; }
+
+        # [13] LABEL .Lend
+        val p13: i32 = next_non_nop(block, p12 + 1);
+        if (p13 < 0) { i = i + 1; cnt; }
+        if (ir.get_op_tag(?block.instrs[p13].op) != ir.OP_LABEL) { i = i + 1; cnt; }
+        if (block.instrs[p13].dst.label != end_label) { i = i + 1; cnt; }
+
+        # === pattern matched — replace with MEMSET ===
+
+        # slot p0: MEMSET [mem_arr], imm(V), imm(N)
+        block.instrs[p0].op = ir.IROp{ir_memset: ir.OP_MEMSET};
+        block.instrs[p0].dst = arr_mem;
+        block.instrs[p0].src1 = ir.make_imm(fill_val, 1);
+        block.instrs[p0].src2 = ir.make_imm(bound, 8);
+        block.instrs[p0].cond = ir.CC_NONE;
+
+        # slot p1: STORE [mem_ctr], imm(N) — update counter to final value
+        block.instrs[p1].op = ir.IROp{ir_store: ir.OP_STORE};
+        block.instrs[p1].dst = ctr_mem;
+        block.instrs[p1].src1 = ir.make_imm(bound, ctr_mem.size);
+        block.instrs[p1].src2 = ir.make_none();
+        block.instrs[p1].cond = ir.CC_NONE;
+
+        # NOP out everything between p1 and p13 (keep end label)
+        var k: i32 = p1 + 1;
+        for (k < p13) {
+            mark_nop(block, k);
+            k = k + 1;
+        }
+
+        changed = true;
+        i = p13 + 1;
+        cnt;
     }
     ret changed;
 }
