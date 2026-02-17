@@ -44,21 +44,21 @@ Read the [language documentation](doc/README.md) before installing. The docs are
 
 ## Building Mach
 
-Prerequisites: git, make, clang (or gcc with C23 support). See [getting started](doc/getting-started.md) for details.
+Prerequisites: git, make, curl. See [getting started](doc/getting-started.md) for details.
 
 ```bash
 git clone https://github.com/octalide/mach
 cd mach
-make full
+make
 ```
 
 This runs the 4-stage bootstrap:
-1. **cmach** -- C bootstrap compiler (compiles from `boot/src/`)
+1. **cmach** -- bootstrap compiler (auto-downloaded from [mach-boot](https://github.com/octalide/mach-boot))
 2. **imach** -- intermediate compiler (cmach compiles the Mach source)
 3. **smach** -- self-hosted compiler (imach compiles the Mach source)
 4. **mach** -- final compiler (smach compiles the Mach source)
 
-The final binary is at `out/linux/bin/mach`. To build only the bootstrap compiler: `make cmach`.
+The final binary is at `out/linux/bin/mach`. To use a custom cmach build: `CMACH=/path/to/cmach make`.
 
 
 # Examples

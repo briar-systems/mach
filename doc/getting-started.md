@@ -19,16 +19,13 @@ git --version
 
 GNU Make or a compatible tool for driving the build.
 
-### C Compiler
+### curl
 
-The bootstrap compiler is written in C and requires a C23-capable compiler. Clang is preferred:
+Required for auto-downloading the bootstrap compiler. Most systems have this pre-installed.
 
 ```bash
-sudo apt install clang
-clang --version
+curl --version
 ```
-
-GCC also works if it supports `-std=c23`.
 
 
 ## Building the Compiler
@@ -36,24 +33,22 @@ GCC also works if it supports `-std=c23`.
 ```bash
 git clone https://github.com/octalide/mach.git
 cd mach
-make full
+make
 ```
 
 This runs the 4-stage bootstrap:
 
-| Stage | Command | Description |
-|-------|---------|-------------|
-| 1 | `make cmach` | C bootstrap compiler (`boot/src/` -> `out/bin/cmach`) |
-| 2 | `make imach` | Intermediate compiler (cmach compiles `src/` -> `out/bin/imach`) |
-| 3 | `make smach` | Self-hosted compiler (imach compiles `src/` -> `out/bin/smach`) |
-| 4 | `make mach`  | Final compiler (smach compiles `src/` -> `out/linux/bin/mach`) |
+| Stage | Description |
+|-------|-------------|
+| 1 | Acquire cmach (auto-downloaded from [mach-boot](https://github.com/octalide/mach-boot)) |
+| 2 | Intermediate compiler (cmach compiles `src/` -> `out/bin/imach`) |
+| 3 | Self-hosted compiler (imach compiles `src/` -> `out/bin/smach`) |
+| 4 | Final compiler (smach compiles `src/` -> `out/linux/bin/mach`) |
 
-`make full` runs all four stages. `make cmach` builds only the bootstrap if you need a quick start.
-
-To run the test suite (492 tests):
+`make` runs all four stages. If you have a custom cmach build, you can skip the download:
 
 ```bash
-make test
+CMACH=/path/to/cmach make
 ```
 
 

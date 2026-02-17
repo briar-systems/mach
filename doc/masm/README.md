@@ -126,4 +126,4 @@ The `MasmOpcodeKind` discriminator on each instruction indicates which layer it 
 | System V ABI | `masm/abi/sysv64.c` |
 | ELF Format | `masm/of/elf.c` |
 
-All paths are relative to `boot/include/compiler/` (headers) and `boot/src/compiler/` (implementation).
+All paths are relative to `src/compiler/`.
