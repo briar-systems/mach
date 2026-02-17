@@ -23,8 +23,6 @@
 | `i8` `i16` `i32` `i64` | Signed integers |
 | `f32` `f64` | Floating-point |
 | `ptr` | Untyped pointer (`void*`) |
-| `str` | String literal (`&u8`, null-terminated) |
-| `bool` | Boolean (`u8` alias from `std.types.bool`) |
 | `*T` | Mutable pointer to T |
 | `&T` | Read-only pointer to T |
 | `[N]T` | Fixed-size array of N elements of type T |
