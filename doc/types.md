@@ -19,13 +19,7 @@ Mach is statically typed with no type inference. Every binding requires an expli
 | `f64`   | 8 bytes | 64-bit floating point |
 | `usize` | ptr     | Pointer-sized unsigned integer |
 | `isize` | ptr     | Pointer-sized signed integer |
-| `bool`  | 1 byte  | Boolean (stored as `u8`: 0 = false, nonzero = true) |
-| `str`   | ptr     | Read-only pointer to null-terminated UTF-8 data (alias for `&u8`) |
 | `ptr`   | ptr     | Untyped raw pointer (equivalent to C `void*`) |
-
-`bool` is an alias for `u8`. The identifiers `true` and `false` are provided by the standard library (`std.types.bool`), not as language keywords.
-
-`str` is an alias for `&u8` (read-only pointer to bytes). String literals produce null-terminated data in read-only memory.
 
 
 ## Pointer Types
