@@ -17,8 +17,6 @@ Mach is statically typed with no type inference. Every binding requires an expli
 | `i64`   | 8 bytes | Signed 64-bit integer |
 | `f32`   | 4 bytes | 32-bit floating point |
 | `f64`   | 8 bytes | 64-bit floating point |
-| `usize` | ptr     | Pointer-sized unsigned integer |
-| `isize` | ptr     | Pointer-sized signed integer |
 | `ptr`   | ptr     | Untyped raw pointer (equivalent to C `void*`) |
 
 
