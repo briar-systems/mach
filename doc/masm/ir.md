@@ -11,7 +11,7 @@ MASM IR is a platform-independent instruction set using three-operand form (TOF)
 - **RISC-like** - Maps cleanly to RISC architectures; x86 lowering handles the differences
 - **Typed** - Instructions carry type information for correct code generation
 
-IR opcodes are defined in `boot/include/compiler/masm/ir.h`.
+IR opcodes are defined in `src/compiler/masm/ir.mach`.
 
 
 ## Opcode Categories

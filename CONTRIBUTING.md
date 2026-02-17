@@ -13,30 +13,29 @@ Be respectful, constructive, and professional. Treat Mach like a passion project
 ## Getting Started
 
 ### Prerequisites
-- C compiler: `clang` with C23 support
 - GNU Make
 - Git
+- curl (for auto-downloading the bootstrap compiler)
 
 ### Building
 
-Mach uses a three-stage bootstrap build chain:
+Mach uses a 4-stage bootstrap build chain. The bootstrap compiler (`cmach`) is automatically downloaded from [mach-boot](https://github.com/octalide/mach-boot) releases.
 
-1. **cmach** — Bootstrap compiler written in C (`boot/`)
+1. **cmach** — Bootstrap compiler (pre-built, auto-downloaded)
 2. **imach** — Intermediate compiler: Mach source compiled by cmach
-3. **mach** — Final compiler: Mach source compiled by imach (self-hosting)
+3. **smach** — Self-hosted compiler: Mach source compiled by imach
+4. **mach** — Final compiler: Mach source compiled by smach
 
 ```bash
 git clone --recurse-submodules https://github.com/octalide/mach.git
 cd mach
-make cmach    # build the C bootstrap compiler
-make imach    # build the intermediate compiler
-make mach     # build the self-hosting compiler
+make    # downloads cmach and builds all stages
 ```
 
-To run the test suite:
+To use a custom cmach build:
 
 ```bash
-make test     # runs unit tests via cmach
+CMACH=/path/to/cmach make
 ```
 
 ---
@@ -82,7 +81,7 @@ All work happens on feature branches off `dev`. When `dev` reaches a stable mile
 - Target `dev` branch (not `main`)
 - Provide clear description of changes
 - Link related issues
-- Ensure code builds with `make cmach imach`
+- Ensure code builds with `make`
 - Follow coding standards
 
 ## Versioning
@@ -122,29 +121,6 @@ dev (ongoing work)
 
 ## Coding Standards
 
-### C Code (Bootstrap Compiler in `boot/`)
-
-**Standards:**
-- Target C23 using `clang`
-- Only use C standard library
-
-**Naming:**
-- Functions: `lowercase_with_underscores`
-- Structs: `PascalCase`
-
-**Memory Management:**
-```c
-// structs use init/dnit pattern
-void ast_node_init(ASTNode *node);  // initialize fields, don't allocate struct
-void ast_node_dnit(ASTNode *node);  // clean up internals, don't free struct
-
-// usage
-ASTNode node;
-ast_node_init(&node);
-// use node
-ast_node_dnit(&node);
-```
-
 ### Mach Code (in `src/` and `dep/mach-std/`)
 
 Mach coding standards are in flux while syntax stabilizes and the userbase grows. Follow existing patterns and refer to the [language specification](doc/language-spec.md) for language features.
@@ -155,16 +131,17 @@ Mach coding standards are in flux while syntax stabilizes and the userbase grows
 
 ```
 mach/
-├── boot/              # bootstrap C compiler (stage 1)
 ├── dep/
 │   └── mach-std/      # standard library (git submodule)
 ├── doc/               # documentation
-├── src/               # self-hosting mach compiler (stages 2 & 3)
-├── Makefile           # build system
+├── src/               # self-hosting mach compiler
+├── Makefile           # build system (auto-downloads cmach)
 └── mach.toml          # project configuration
 ```
 
 The standard library lives in a separate repository ([mach-std](https://github.com/octalide/mach-std)) and is included as a git submodule under `dep/mach-std/`.
+
+The bootstrap compiler lives in a separate repository ([mach-boot](https://github.com/octalide/mach-boot)) and is automatically downloaded during the build.
 
 ---
 
