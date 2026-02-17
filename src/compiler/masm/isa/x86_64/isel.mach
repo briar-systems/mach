@@ -23,6 +23,14 @@ use sym:     mach.compiler.masm.symbol;
 # virtual register threshold - registers >= this are virtual
 pub val VREG_START: i32 = 1024;
 
+# liveness array layout: 5 i32 fields per vreg, interleaved
+val LV_STRIDE:    usize = 5;
+val LV_FIRST_DEF: usize = 0;
+val LV_LAST_USE:  usize = 1;
+val LV_BLOCK_MIN: usize = 2;
+val LV_BLOCK_MAX: usize = 3;
+val LV_SIZES:     usize = 4;
+
 # ISelContext: context for instruction selection.
 # ---
 # alloc:            allocator for memory allocation
@@ -34,6 +42,14 @@ pub val VREG_START: i32 = 1024;
 # base_stack_size:  stack size from STACK_FRAME instruction
 # total_stack_size: total stack size including vregs
 # ptr_size:         pointer size (8 for x86_64)
+# liveness:         interleaved liveness data (5 i32s per vreg)
+# liveness_cap:     capacity in vreg count (array has liveness_cap * LV_STRIDE elements)
+# used_vregs:       indices of vregs touched in current function (for targeted reset)
+# used_count:       number of entries in used_vregs
+# used_cap:         capacity of used_vregs array
+# free_offsets:     LIFO stack of reusable stack offsets
+# free_count:       entries in free stack
+# free_cap:         capacity of free stack
 pub rec ISelContext {
     alloc:            *allocator.Allocator;
     text:             *section.Section;
@@ -46,6 +62,14 @@ pub rec ISelContext {
     ptr_size:         usize;
     m:                *masm.Masm;
     instr_buf:        x86_buf.InstrBuffer;
+    liveness:         *i32;
+    liveness_cap:     usize;
+    used_vregs:       *i32;
+    used_count:       i32;
+    used_cap:         i32;
+    free_offsets:     *i32;
+    free_count:       i32;
+    free_cap:         i32;
 }
 
 # init: create a new instruction selection context.
@@ -67,6 +91,14 @@ pub fun init(alloc: *allocator.Allocator, text: *section.Section, m: *masm.Masm)
     ctx.ptr_size = 8;
     ctx.m = m;
     ctx.instr_buf = x86_buf.buf_init(alloc);
+    ctx.liveness = nil;
+    ctx.liveness_cap = 0;
+    ctx.used_vregs = nil;
+    ctx.used_count = 0;
+    ctx.used_cap = 0;
+    ctx.free_offsets = nil;
+    ctx.free_count = 0;
+    ctx.free_cap = 0;
     ret ctx;
 }
 
@@ -78,19 +110,12 @@ pub fun reset(ctx: *ISelContext) {
         ret;
     }
     # don't free vreg_offsets - reuse the buffer
-    # only zero slots that were actually used (up to max_vreg_index)
-    if (ctx.vreg_offsets != nil && ctx.max_vreg_index > 0) {
-        val clear_count: usize = ctx.max_vreg_index + 1;
-        var i: usize = 0;
-        for (i < clear_count) {
-            ctx.vreg_offsets[i] = 0;
-            i = i + 1;
-        }
-    }
+    # vreg_offsets and liveness clearing handled by scan_function using used_vregs list
     ctx.max_vreg_index = 0;
     ctx.next_vreg_slot = 0;
     ctx.base_stack_size = 0;
     ctx.total_stack_size = 0;
+    ctx.free_count = 0;
 }
 
 # imm_fits_i32: check if an i64 value fits in a sign-extended 32-bit immediate.
@@ -155,6 +180,107 @@ pub fun get_vreg_offset(ctx: *ISelContext, vreg_id: i32, size: usize) i32 {
     ret ctx.vreg_offsets[idx];
 }
 
+# ensure_liveness_cap: grow interleaved liveness array to accommodate idx.
+fun ensure_liveness_cap(ctx: *ISelContext, idx: usize) {
+    if (idx < ctx.liveness_cap) {
+        ret;
+    }
+    var new_cap: usize = (idx + 1) * 2;
+    if (new_cap < 64) {
+        new_cap = 64;
+    }
+
+    val old_elems: usize = ctx.liveness_cap * LV_STRIDE;
+    val new_elems: usize = new_cap * LV_STRIDE;
+
+    val r: Result[*i32, allocator.AllocError] = allocator.allocator_resize[i32](
+        ctx.alloc, ctx.liveness, old_elems, new_elems
+    );
+    if (result_is_err[*i32, allocator.AllocError](r)) { ret; }
+    ctx.liveness = result_unwrap_ok[*i32, allocator.AllocError](r);
+
+    # init new slots to -1
+    var i: usize = old_elems;
+    for (i < new_elems) {
+        ctx.liveness[i] = -1;
+        i = i + 1;
+    }
+    ctx.liveness_cap = new_cap;
+}
+
+# record_vreg_ref: record a vreg reference for liveness tracking.
+fun record_vreg_ref(ctx: *ISelContext, vreg_id: i32, size: usize, pos: i32, block_idx: i32) {
+    if (vreg_id < VREG_START) {
+        ret;
+    }
+    val idx: usize = (vreg_id - VREG_START)::usize;
+    ensure_liveness_cap(ctx, idx);
+
+    if (idx > ctx.max_vreg_index) {
+        ctx.max_vreg_index = idx;
+    }
+
+    val base: usize = idx * LV_STRIDE;
+    if (ctx.liveness[base + LV_FIRST_DEF] == -1) {
+        ctx.liveness[base + LV_FIRST_DEF] = pos;
+        ctx.liveness[base + LV_BLOCK_MIN] = block_idx;
+
+        # track this vreg for targeted reset
+        if (ctx.used_count >= ctx.used_cap) {
+            var new_ucap: i32 = ctx.used_cap * 2;
+            if (new_ucap < 64) {
+                new_ucap = 64;
+            }
+            val ur: Result[*i32, allocator.AllocError] = allocator.allocator_resize[i32](
+                ctx.alloc, ctx.used_vregs, ctx.used_cap::usize, new_ucap::usize
+            );
+            if (result_is_err[*i32, allocator.AllocError](ur)) { ret; }
+            ctx.used_vregs = result_unwrap_ok[*i32, allocator.AllocError](ur);
+            ctx.used_cap = new_ucap;
+        }
+        ctx.used_vregs[ctx.used_count] = idx::i32;
+        ctx.used_count = ctx.used_count + 1;
+    }
+    ctx.liveness[base + LV_LAST_USE] = pos;
+    ctx.liveness[base + LV_BLOCK_MAX] = block_idx;
+
+    var slots: i32 = 1;
+    if (size > 8) {
+        slots = ((size + 7) / 8)::i32;
+    }
+    if (slots > ctx.liveness[base + LV_SIZES]) {
+        ctx.liveness[base + LV_SIZES] = slots;
+    }
+}
+
+# push_free_slot: push a reusable stack offset onto the free list.
+fun push_free_slot(ctx: *ISelContext, offset: i32) {
+    if (ctx.free_count >= ctx.free_cap) {
+        var new_cap: i32 = ctx.free_cap * 2;
+        if (new_cap < 64) {
+            new_cap = 64;
+        }
+        val r: Result[*i32, allocator.AllocError] = allocator.allocator_resize[i32](
+            ctx.alloc, ctx.free_offsets, ctx.free_cap::usize, new_cap::usize
+        );
+        if (result_is_err[*i32, allocator.AllocError](r)) { ret; }
+        ctx.free_offsets = result_unwrap_ok[*i32, allocator.AllocError](r);
+        ctx.free_cap = new_cap;
+    }
+    ctx.free_offsets[ctx.free_count] = offset;
+    ctx.free_count = ctx.free_count + 1;
+}
+
+# pop_free_slot: pop a reusable stack offset from the free list.
+# ret: stack offset or -1 if empty.
+fun pop_free_slot(ctx: *ISelContext) i32 {
+    if (ctx.free_count <= 0) {
+        ret -1;
+    }
+    ctx.free_count = ctx.free_count - 1;
+    ret ctx.free_offsets[ctx.free_count];
+}
+
 # scan_function: pre-scan function to find max vreg and compute stack size.
 # ---
 # ctx:  isel context
@@ -164,11 +290,27 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
         ret;
     }
 
+    # clear liveness + vreg_offsets from previous function (targeted, not full sweep)
+    var ci: i32 = 0;
+    for (ci < ctx.used_count) {
+        val ui: usize = ctx.used_vregs[ci]::usize;
+        val cb: usize = ui * LV_STRIDE;
+        ctx.liveness[cb + LV_FIRST_DEF] = -1;
+        ctx.liveness[cb + LV_LAST_USE] = -1;
+        ctx.liveness[cb + LV_BLOCK_MIN] = -1;
+        ctx.liveness[cb + LV_BLOCK_MAX] = -1;
+        ctx.liveness[cb + LV_SIZES] = -1;
+        if (ui < ctx.vreg_cap) {
+            ctx.vreg_offsets[ui] = 0;
+        }
+        ci = ci + 1;
+    }
+    ctx.used_count = 0;
     ctx.max_vreg_index = 0;
     ctx.next_vreg_slot = 0;
-    var found: bool = false;
 
-    # scan all blocks
+    # --- pass 1: compute liveness ---
+    var pos: i32 = 0;
     var bi: i32 = 0;
     for (bi < func.block_count) {
         val block: *ir.IRBlock = func.blocks[bi];
@@ -177,94 +319,140 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
             cnt;
         }
 
-        # scan all instructions
         var ii: i32 = 0;
         for (ii < block.instr_count) {
             val instr: *ir.Instr = ?block.instrs[ii];
 
-            # check dst
+            # check dst reg
             if (instr.dst.kind == ir.VAL_REG && instr.dst.reg >= VREG_START) {
-                val idx: usize = (instr.dst.reg - VREG_START)::usize;
-                var slots: usize = 1;
-                if (instr.dst.size > 8) {
-                    slots = ((instr.dst.size + 7) / 8)::usize;
-                }
-                val last_idx: usize = idx + (slots - 1);
-                if (!found || last_idx > ctx.max_vreg_index) {
-                    ctx.max_vreg_index = last_idx;
-                    found = true;
-                }
-                get_vreg_offset(ctx, instr.dst.reg, instr.dst.size);
+                record_vreg_ref(ctx, instr.dst.reg, instr.dst.size, pos, bi);
             }
-
-            # check src1
+            # check src1 reg
             if (instr.src1.kind == ir.VAL_REG && instr.src1.reg >= VREG_START) {
-                val idx: usize = (instr.src1.reg - VREG_START)::usize;
-                var slots: usize = 1;
-                if (instr.src1.size > 8) {
-                    slots = ((instr.src1.size + 7) / 8)::usize;
-                }
-                val last_idx: usize = idx + (slots - 1);
-                if (!found || last_idx > ctx.max_vreg_index) {
-                    ctx.max_vreg_index = last_idx;
-                    found = true;
-                }
-                get_vreg_offset(ctx, instr.src1.reg, instr.src1.size);
+                record_vreg_ref(ctx, instr.src1.reg, instr.src1.size, pos, bi);
             }
-
-            # check src2
+            # check src2 reg
             if (instr.src2.kind == ir.VAL_REG && instr.src2.reg >= VREG_START) {
-                val idx: usize = (instr.src2.reg - VREG_START)::usize;
-                var slots: usize = 1;
-                if (instr.src2.size > 8) {
-                    slots = ((instr.src2.size + 7) / 8)::usize;
-                }
-                val last_idx: usize = idx + (slots - 1);
-                if (!found || last_idx > ctx.max_vreg_index) {
-                    ctx.max_vreg_index = last_idx;
-                    found = true;
-                }
-                get_vreg_offset(ctx, instr.src2.reg, instr.src2.size);
+                record_vreg_ref(ctx, instr.src2.reg, instr.src2.size, pos, bi);
             }
-
             # check memory operands (use pointer size)
             if (instr.dst.kind == ir.VAL_MEM && instr.dst.base_reg >= VREG_START) {
-                val idx: usize = (instr.dst.base_reg - VREG_START)::usize;
-                if (!found || idx > ctx.max_vreg_index) {
-                    ctx.max_vreg_index = idx;
-                    found = true;
-                }
-                get_vreg_offset(ctx, instr.dst.base_reg, ctx.ptr_size);
+                record_vreg_ref(ctx, instr.dst.base_reg, ctx.ptr_size, pos, bi);
             }
             if (instr.dst.kind == ir.VAL_MEM && instr.dst.index_reg >= VREG_START) {
-                val idx: usize = (instr.dst.index_reg - VREG_START)::usize;
-                if (!found || idx > ctx.max_vreg_index) {
-                    ctx.max_vreg_index = idx;
-                    found = true;
-                }
-                get_vreg_offset(ctx, instr.dst.index_reg, ctx.ptr_size);
+                record_vreg_ref(ctx, instr.dst.index_reg, ctx.ptr_size, pos, bi);
             }
             if (instr.src1.kind == ir.VAL_MEM && instr.src1.base_reg >= VREG_START) {
-                val idx: usize = (instr.src1.base_reg - VREG_START)::usize;
-                if (!found || idx > ctx.max_vreg_index) {
-                    ctx.max_vreg_index = idx;
-                    found = true;
-                }
-                get_vreg_offset(ctx, instr.src1.base_reg, ctx.ptr_size);
+                record_vreg_ref(ctx, instr.src1.base_reg, ctx.ptr_size, pos, bi);
             }
             if (instr.src1.kind == ir.VAL_MEM && instr.src1.index_reg >= VREG_START) {
-                val idx: usize = (instr.src1.index_reg - VREG_START)::usize;
-                if (!found || idx > ctx.max_vreg_index) {
-                    ctx.max_vreg_index = idx;
-                    found = true;
-                }
-                get_vreg_offset(ctx, instr.src1.index_reg, ctx.ptr_size);
+                record_vreg_ref(ctx, instr.src1.index_reg, ctx.ptr_size, pos, bi);
             }
 
+            pos = pos + 1;
             ii = ii + 1;
         }
 
         bi = bi + 1;
+    }
+
+    val total_instr_count: i32 = pos;
+
+    # conservative cross-block extension: if a vreg spans multiple blocks,
+    # extend its last_use to end of function (handles loops/control flow safely)
+    var vi: usize = 0;
+    for (vi <= ctx.max_vreg_index) {
+        val vb: usize = vi * LV_STRIDE;
+        if (ctx.liveness[vb + LV_FIRST_DEF] >= 0 && ctx.liveness[vb + LV_BLOCK_MIN] != ctx.liveness[vb + LV_BLOCK_MAX]) {
+            ctx.liveness[vb + LV_LAST_USE] = total_instr_count;
+        }
+        vi = vi + 1;
+    }
+
+    # grow vreg_offsets to accommodate max_vreg_index
+    if (ctx.max_vreg_index >= ctx.vreg_cap) {
+        var new_cap: usize = (ctx.max_vreg_index + 1) * 2;
+        if (new_cap < 64) {
+            new_cap = 64;
+        }
+        val r: Result[*i32, allocator.AllocError] = allocator.allocator_resize[i32](
+            ctx.alloc, ctx.vreg_offsets, ctx.vreg_cap, new_cap
+        );
+        if (result_is_err[*i32, allocator.AllocError](r)) { ret; }
+        val new_buf: *i32 = result_unwrap_ok[*i32, allocator.AllocError](r);
+        var zi: usize = ctx.vreg_cap;
+        for (zi < new_cap) {
+            new_buf[zi] = 0;
+            zi = zi + 1;
+        }
+        ctx.vreg_offsets = new_buf;
+        ctx.vreg_cap = new_cap;
+    }
+
+    # --- pass 2: allocate with reuse ---
+    # active set: array of vreg indices currently holding a slot
+    var active: *i32 = nil;
+    var active_count: i32 = 0;
+    var active_cap: i32 = 0;
+
+    # iterate used_vregs (in first-def order) for correct linear scan
+    ci = 0;
+    for (ci < ctx.used_count) {
+        vi = ctx.used_vregs[ci]::usize;
+        val vb2: usize = vi * LV_STRIDE;
+        val cur_def: i32 = ctx.liveness[vb2 + LV_FIRST_DEF];
+
+        # expire: free slots from vregs whose last_use < cur_def
+        var ai: i32 = 0;
+        for (ai < active_count) {
+            val av: i32 = active[ai];
+            if (ctx.liveness[av::usize * LV_STRIDE + LV_LAST_USE] < cur_def) {
+                push_free_slot(ctx, ctx.vreg_offsets[av::usize]);
+                # remove from active by swapping with last
+                active_count = active_count - 1;
+                active[ai] = active[active_count];
+                # don't increment ai - re-check swapped element
+            } or {
+                ai = ai + 1;
+            }
+        }
+
+        # allocate slot for this vreg
+        if (ctx.liveness[vb2 + LV_SIZES] == 1) {
+            val reused: i32 = pop_free_slot(ctx);
+            if (reused >= 0) {
+                ctx.vreg_offsets[vi] = reused;
+            } or {
+                ctx.vreg_offsets[vi] = (ctx.base_stack_size + (ctx.next_vreg_slot + 1) * 8)::i32;
+                ctx.next_vreg_slot = ctx.next_vreg_slot + 1;
+            }
+        } or {
+            # multi-slot: always allocate fresh
+            val slots: usize = ctx.liveness[vb2 + LV_SIZES]::usize;
+            ctx.vreg_offsets[vi] = (ctx.base_stack_size + (ctx.next_vreg_slot + 1) * 8)::i32;
+            ctx.next_vreg_slot = ctx.next_vreg_slot + slots;
+        }
+
+        # add to active set (grow if needed)
+        if (active_count >= active_cap) {
+            var new_acap: i32 = active_cap * 2;
+            if (new_acap < 64) {
+                new_acap = 64;
+            }
+            val ar: Result[*i32, allocator.AllocError] = allocator.allocator_resize[i32](
+                ctx.alloc, active, active_cap::usize, new_acap::usize
+            );
+            if (!result_is_err[*i32, allocator.AllocError](ar)) {
+                active = result_unwrap_ok[*i32, allocator.AllocError](ar);
+                active_cap = new_acap;
+            }
+        }
+        if (active_count < active_cap) {
+            active[active_count] = vi::i32;
+            active_count = active_count + 1;
+        }
+
+        ci = ci + 1;
     }
 
     # calculate total stack size based on allocated vreg slots
