@@ -1586,13 +1586,23 @@ static MasmOperand lower_cast(Masm *masm, MasmSection *text, AstNode *expr, Lowe
     }
     else
     {
-        // Integer cast - handle widening with zero extension (bitcast semantics)
+        // Integer cast - widening extension based on signedness
         if (src_size < dst_size)
         {
-            // Widening cast - always zero-extend for bitcast semantics
-            // Mach's '::' operator is a bitcast/reinterpret, not a semantic conversion.
-            // If the user wants sign extension, they should use a specific conversion function.
-            masm_section_append_inst(text, masm_inst_2(MASM_IR_ZEXT, dst, src));
+            bool src_signed = src_type && (src_type->kind == TYPE_I8 || src_type->kind == TYPE_I16 ||
+                                           src_type->kind == TYPE_I32 || src_type->kind == TYPE_I64);
+            bool dst_signed = dst_type && (dst_type->kind == TYPE_I8 || dst_type->kind == TYPE_I16 ||
+                                           dst_type->kind == TYPE_I32 || dst_type->kind == TYPE_I64);
+            if (src_signed && dst_signed)
+            {
+                // signed -> signed: sign-extend to preserve numeric value
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_SEXT, dst, src));
+            }
+            else
+            {
+                // all other cases: zero-extend (bitcast semantics)
+                masm_section_append_inst(text, masm_inst_2(MASM_IR_ZEXT, dst, src));
+            }
         }
         else
         {
