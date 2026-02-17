@@ -413,6 +413,25 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
                 record_vreg_ref(ctx, instr.src1.index_reg, ctx.ptr_size, pos, bi);
             }
 
+            # flag vregs in float instructions (excluded from GPR allocation)
+            val op_scan: u8 = ir.get_op_tag(?instr.op);
+            if (op_scan == ir.OP_FADD || op_scan == ir.OP_FSUB || op_scan == ir.OP_FMUL ||
+                op_scan == ir.OP_FDIV || op_scan == ir.OP_FCMP || op_scan == ir.OP_ITOF ||
+                op_scan == ir.OP_FTOI || op_scan == ir.OP_FEXT || op_scan == ir.OP_FTRUNC) {
+                if (instr.dst.kind == ir.VAL_REG && instr.dst.reg >= VREG_START) {
+                    val fi: usize = (instr.dst.reg - VREG_START)::usize;
+                    ctx.liveness[fi * LV_STRIDE + LV_SIZES] = ctx.liveness[fi * LV_STRIDE + LV_SIZES] | LV_FLOAT_BIT;
+                }
+                if (instr.src1.kind == ir.VAL_REG && instr.src1.reg >= VREG_START) {
+                    val fi: usize = (instr.src1.reg - VREG_START)::usize;
+                    ctx.liveness[fi * LV_STRIDE + LV_SIZES] = ctx.liveness[fi * LV_STRIDE + LV_SIZES] | LV_FLOAT_BIT;
+                }
+                if (instr.src2.kind == ir.VAL_REG && instr.src2.reg >= VREG_START) {
+                    val fi: usize = (instr.src2.reg - VREG_START)::usize;
+                    ctx.liveness[fi * LV_STRIDE + LV_SIZES] = ctx.liveness[fi * LV_STRIDE + LV_SIZES] | LV_FLOAT_BIT;
+                }
+            }
+
             pos = pos + 1;
             ii = ii + 1;
         }
@@ -456,8 +475,17 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
             ctx.vreg_cap = new_cap;
         }
 
-        # --- pass 2: allocate with reuse ---
-        # active set: array of vreg indices currently holding a slot
+        # --- pass 2: register allocation + stack slot allocation ---
+        # ensure vreg_phys_reg can hold all vregs
+        ensure_phys_reg_cap(ctx, ctx.max_vreg_index);
+
+        # register allocation state
+        var reg_free_mask: i32 = 31; # bits 0-4: pool regs 0-4 free (0x1F)
+        var reg_active: *i32 = nil;
+        var reg_active_count: i32 = 0;
+        var reg_active_cap: i32 = 0;
+
+        # stack slot active set
         var active: *i32 = nil;
         var active_count: i32 = 0;
         var active_cap: i32 = 0;
@@ -468,24 +496,106 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
             vi = ctx.used_vregs[ci]::usize;
             val vb2: usize = vi * LV_STRIDE;
             val cur_def: i32 = ctx.liveness[vb2 + LV_FIRST_DEF];
+            val raw_sizes: i32 = ctx.liveness[vb2 + LV_SIZES];
+            val is_float: bool = (raw_sizes & LV_FLOAT_BIT) != 0;
+            val slot_count: i32 = raw_sizes & 0x3FFFFFFF;
 
-            # expire: free slots from vregs whose last_use < cur_def
+            # expire registers: free regs from vregs whose last_use < cur_def
+            var ri: i32 = 0;
+            for (ri < reg_active_count) {
+                val rv: i32 = reg_active[ri];
+                if (ctx.liveness[rv::usize * LV_STRIDE + LV_LAST_USE] < cur_def) {
+                    val freed_reg: i32 = ctx.vreg_phys_reg[rv::usize];
+                    var pi: i32 = 0;
+                    for (pi < REG_POOL_SIZE) {
+                        if (reg_pool_at(pi) == freed_reg) {
+                            reg_free_mask = reg_free_mask | (1 << pi::usize);
+                            pi = REG_POOL_SIZE;
+                        }
+                        pi = pi + 1;
+                    }
+                    reg_active_count = reg_active_count - 1;
+                    reg_active[ri] = reg_active[reg_active_count];
+                } or {
+                    ri = ri + 1;
+                }
+            }
+
+            # expire stack slots: free slots from vregs whose last_use < cur_def
             var ai: i32 = 0;
             for (ai < active_count) {
                 val av: i32 = active[ai];
                 if (ctx.liveness[av::usize * LV_STRIDE + LV_LAST_USE] < cur_def) {
                     push_free_slot(ctx, ctx.vreg_offsets[av::usize]);
-                    # remove from active by swapping with last
                     active_count = active_count - 1;
                     active[ai] = active[active_count];
-                    # don't increment ai - re-check swapped element
                 } or {
                     ai = ai + 1;
                 }
             }
 
-            # allocate slot for this vreg
-            if (ctx.liveness[vb2 + LV_SIZES] == 1) {
+            # try register allocation for eligible vregs (1-slot, not float)
+            if (slot_count == 1 && !is_float) {
+                if (reg_free_mask != 0) {
+                    # find lowest free register in pool
+                    var pi: i32 = 0;
+                    for (pi < REG_POOL_SIZE) {
+                        if ((reg_free_mask & (1 << pi::usize)) != 0) {
+                            ctx.vreg_phys_reg[vi] = reg_pool_at(pi);
+                            reg_free_mask = reg_free_mask ^ (1 << pi::usize);
+                            pi = REG_POOL_SIZE;
+                        }
+                        pi = pi + 1;
+                    }
+                } or {
+                    # spill: evict the active vreg with furthest last_use
+                    var evict_idx: i32 = -1;
+                    var evict_last: i32 = -1;
+                    ri = 0;
+                    for (ri < reg_active_count) {
+                        val rv2: i32 = reg_active[ri];
+                        val rv_last: i32 = ctx.liveness[rv2::usize * LV_STRIDE + LV_LAST_USE];
+                        if (rv_last > evict_last) {
+                            evict_last = rv_last;
+                            evict_idx = ri;
+                        }
+                        ri = ri + 1;
+                    }
+                    val cur_last: i32 = ctx.liveness[vb2 + LV_LAST_USE];
+                    if (evict_idx >= 0 && evict_last > cur_last) {
+                        val evicted: i32 = reg_active[evict_idx];
+                        val stolen_reg: i32 = ctx.vreg_phys_reg[evicted::usize];
+                        ctx.vreg_phys_reg[evicted::usize] = -1;
+                        ctx.vreg_phys_reg[vi] = stolen_reg;
+                        reg_active_count = reg_active_count - 1;
+                        reg_active[evict_idx] = reg_active[reg_active_count];
+                    }
+                }
+            }
+
+            # add to reg_active if assigned a register
+            if (ctx.vreg_phys_reg[vi] >= 0) {
+                if (reg_active_count >= reg_active_cap) {
+                    var new_racap: i32 = reg_active_cap * 2;
+                    if (new_racap < 16) {
+                        new_racap = 16;
+                    }
+                    val rar: Result[*i32, allocator.AllocError] = allocator.allocator_resize[i32](
+                        ctx.alloc, reg_active, reg_active_cap::usize, new_racap::usize
+                    );
+                    if (!result_is_err[*i32, allocator.AllocError](rar)) {
+                        reg_active = result_unwrap_ok[*i32, allocator.AllocError](rar);
+                        reg_active_cap = new_racap;
+                    }
+                }
+                if (reg_active_count < reg_active_cap) {
+                    reg_active[reg_active_count] = vi::i32;
+                    reg_active_count = reg_active_count + 1;
+                }
+            }
+
+            # stack slot allocation (transition safety: all vregs get a stack slot)
+            if (slot_count == 1) {
                 val reused: i32 = pop_free_slot(ctx);
                 if (reused >= 0) {
                     ctx.vreg_offsets[vi] = reused;
@@ -494,13 +604,12 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
                     ctx.next_vreg_slot = ctx.next_vreg_slot + 1;
                 }
             } or {
-                # multi-slot: always allocate fresh
-                val slots: usize = ctx.liveness[vb2 + LV_SIZES]::usize;
+                val slots: usize = slot_count::usize;
                 ctx.vreg_offsets[vi] = (ctx.base_stack_size + (ctx.next_vreg_slot + 1) * 8)::i32;
                 ctx.next_vreg_slot = ctx.next_vreg_slot + slots;
             }
 
-            # add to active set (grow if needed)
+            # add to stack active set
             if (active_count >= active_cap) {
                 var new_acap: i32 = active_cap * 2;
                 if (new_acap < 64) {
@@ -521,14 +630,39 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
 
             ci = ci + 1;
         }
+
+        # compute callee_saved_mask and callee_saved_count from assigned registers
+        ci = 0;
+        for (ci < ctx.used_count) {
+            vi = ctx.used_vregs[ci]::usize;
+            if (vi < ctx.vreg_phys_cap) {
+                val phys: i32 = ctx.vreg_phys_reg[vi];
+                if (phys >= 0) {
+                    if ((ctx.callee_saved_mask & (1 << phys::usize)) == 0) {
+                        ctx.callee_saved_mask = ctx.callee_saved_mask | (1 << phys::usize);
+                        ctx.callee_saved_count = ctx.callee_saved_count + 1;
+                    }
+                }
+            }
+            ci = ci + 1;
+        }
     }
 
     # calculate total stack size based on allocated vreg slots
     ctx.total_stack_size = ctx.base_stack_size + (ctx.next_vreg_slot * 8);
 
-    # align to 16 bytes
-    if (ctx.total_stack_size % 16 != 0) {
-        ctx.total_stack_size = ctx.total_stack_size + (16 - (ctx.total_stack_size % 16));
+    # align to 16 bytes, accounting for callee-saved pushes
+    # after call (ret addr) + push rbp + N callee pushes: (2+N) pushes total
+    # if N is odd: RSP is 8-misaligned, need total_stack_size % 16 == 8
+    # if N is even: RSP is 16-aligned, need total_stack_size % 16 == 0
+    if ((ctx.callee_saved_count % 2) != 0) {
+        if (ctx.total_stack_size % 16 == 0) {
+            ctx.total_stack_size = ctx.total_stack_size + 8;
+        }
+    } or {
+        if (ctx.total_stack_size % 16 != 0) {
+            ctx.total_stack_size = ctx.total_stack_size + (16 - (ctx.total_stack_size % 16));
+        }
     }
 }
 
