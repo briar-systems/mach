@@ -1489,12 +1489,24 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
         }
     }
 
-    # walk the function body to instantiate nested generic calls
-    # (e.g., allocator_alloc[T] calls result_is_err[*T, AllocError])
-    # while type bindings are active so T resolves to the concrete type
-    if (func_decl.info.fun_decl.body != nil) {
-        instantiate_nested_generic_calls(sema, func_decl.info.fun_decl.body);
+    # clone the function AST for this instantiation so each instantiation
+    # gets its own nodes with concrete types (not shared TY_GENERIC_PARAM)
+    val clone_res: Result[*ast.Node, str] = ast.clone_node(sema.alloc, func_decl);
+    if (result_is_err[*ast.Node, str](clone_res)) {
+        symbol.table_pop_scope(sema.symbols);
+        sema.symbols = saved_symbols;
+        sema.current_module = saved_mod;
+        ret nil;
     }
+    val cloned_func: *ast.Node = result_unwrap_ok[*ast.Node, str](clone_res);
+
+    # walk CLONED body for nested generic calls (sets symbols on clone, not shared AST)
+    if (cloned_func.info.fun_decl.body != nil) {
+        instantiate_nested_generic_calls(sema, cloned_func.info.fun_decl.body);
+    }
+
+    # walk CLONED body to set concrete types on all nodes
+    substitute_types_in_body(sema, cloned_func);
 
     symbol.table_pop_scope(sema.symbols);
 
@@ -1547,7 +1559,7 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
     }
 
     val finst: *FunctionInstantiation = result_unwrap_ok[*FunctionInstantiation, allocator.AllocError](inst_res);
-    finst.func_ast = func_decl;
+    finst.func_ast = cloned_func;
     finst.mangled_name = pname;
     finst.func_type = inst_func_type;
     finst.param_names = param_names;
@@ -1567,7 +1579,7 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
     if (result_is_ok[*symbol.Symbol, str](inst_sym_res)) {
         val inst_sym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](inst_sym_res);
         inst_sym.resolved_type = inst_func_type;
-        inst_sym.decl_node = func_decl;
+        inst_sym.decl_node = finst.func_ast;
         inst_sym.module_path = func_sym.module_path;
         inst_sym.is_public = func_sym.is_public;
     }
@@ -1581,7 +1593,7 @@ pub fun instantiate_generic_function(sema: *Sema, func_sym: *symbol.Symbol, type
         if (result_is_ok[*symbol.Symbol, str](caller_sym_res)) {
             val caller_sym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](caller_sym_res);
             caller_sym.resolved_type = inst_func_type;
-            caller_sym.decl_node = func_decl;
+            caller_sym.decl_node = finst.func_ast;
             caller_sym.module_path = func_sym.module_path;
             caller_sym.is_public = func_sym.is_public;
         }
@@ -1719,6 +1731,353 @@ fun instantiate_nested_generic_calls(sema: *Sema, node: *ast.Node) {
         instantiate_nested_generic_calls(sema, node.info.cast_expr.expr);
         ret;
     }
+}
+
+# resolve_concrete_type: resolve a type that may contain TY_GENERIC_PARAM references
+# using the active scope bindings.
+# ---
+# sema: analyzer context (must have type bindings in scope)
+# t:    type to resolve
+# ret:  concrete type with generic params substituted, or t unchanged
+fun resolve_concrete_type(sema: *Sema, t: *ty.Type) *ty.Type {
+    if (sema == nil || t == nil) {
+        ret nil;
+    }
+
+    # direct generic param: look up binding in scope
+    if (t.kind == ty.TY_GENERIC_PARAM) {
+        if (t.name != nil) {
+            val opt: Option[*symbol.Symbol] = symbol.table_lookup(sema.symbols, t.name);
+            if (option_is_some[*symbol.Symbol](opt)) {
+                val sym: *symbol.Symbol = option_unwrap[*symbol.Symbol](opt);
+                if (sym.resolved_type != nil) {
+                    ret sym.resolved_type;
+                }
+            }
+        }
+        ret t;
+    }
+
+    # pointer to possibly-generic inner type
+    if (t.kind == ty.TY_POINTER) {
+        val resolved_inner: *ty.Type = resolve_concrete_type(sema, t.inner);
+        if (resolved_inner != t.inner && resolved_inner != nil) {
+            val ptr_res: Result[*ty.Type, str] = tyctx.pointer_type(sema.types, resolved_inner, t.is_mutable);
+            if (result_is_ok[*ty.Type, str](ptr_res)) {
+                ret result_unwrap_ok[*ty.Type, str](ptr_res);
+            }
+        }
+        ret t;
+    }
+
+    # array of possibly-generic element type
+    if (t.kind == ty.TY_ARRAY) {
+        val resolved_inner: *ty.Type = resolve_concrete_type(sema, t.inner);
+        if (resolved_inner != t.inner && resolved_inner != nil) {
+            val arr_res: Result[*ty.Type, str] = tyctx.array_type(sema.types, resolved_inner, t.array_len);
+            if (result_is_ok[*ty.Type, str](arr_res)) {
+                ret result_unwrap_ok[*ty.Type, str](arr_res);
+            }
+        }
+        ret t;
+    }
+
+    # function type with possibly-generic param/return types
+    if (t.kind == ty.TY_FUN) {
+        var any_changed: bool = false;
+        var resolved_params: [16]*ty.Type;
+        var pi: i32 = 0;
+        for (pi < t.param_count && pi < 16) {
+            resolved_params[pi] = resolve_concrete_type(sema, t.params[pi]);
+            if (resolved_params[pi] != t.params[pi]) {
+                any_changed = true;
+            }
+            pi = pi + 1;
+        }
+        val resolved_ret: *ty.Type = resolve_concrete_type(sema, t.ret_type);
+        if (resolved_ret != t.ret_type) {
+            any_changed = true;
+        }
+        if (any_changed) {
+            # allocate persistent param array
+            var new_params: **ty.Type = nil;
+            if (t.param_count > 0) {
+                val pp_res: Result[**ty.Type, allocator.AllocError] = allocator.allocator_alloc[*ty.Type](sema.alloc, t.param_count::usize);
+                if (result_is_ok[**ty.Type, allocator.AllocError](pp_res)) {
+                    new_params = result_unwrap_ok[**ty.Type, allocator.AllocError](pp_res);
+                    var ci: i32 = 0;
+                    for (ci < t.param_count && ci < 16) {
+                        new_params[ci] = resolved_params[ci];
+                        ci = ci + 1;
+                    }
+                }
+            }
+            val fun_res: Result[*ty.Type, str] = tyctx.function_type(sema.types, new_params, t.param_count, resolved_ret);
+            if (result_is_ok[*ty.Type, str](fun_res)) {
+                ret result_unwrap_ok[*ty.Type, str](fun_res);
+            }
+        }
+        ret t;
+    }
+
+    # generic record/union instantiation with possibly-generic args
+    if ((t.kind == ty.TY_RECORD || t.kind == ty.TY_UNION) &&
+        t.base_generic != nil && t.generic_arg_count > 0) {
+        var any_changed: bool = false;
+        var resolved_args: [8]*ty.Type;
+        var ai: i32 = 0;
+        for (ai < t.generic_arg_count && ai < 8) {
+            resolved_args[ai] = resolve_concrete_type(sema, t.generic_args[ai]);
+            if (resolved_args[ai] != t.generic_args[ai]) {
+                any_changed = true;
+            }
+            ai = ai + 1;
+        }
+        if (any_changed) {
+            # search cached instantiations for a match
+            var cached: *CachedInstantiation = sema.generic_cache;
+            for (cached != nil) {
+                if (cached.arg_count == t.generic_arg_count && cached.result_type != nil &&
+                    cached.result_type.base_generic == t.base_generic) {
+                    var match: bool = true;
+                    var ci: i32 = 0;
+                    for (ci < cached.arg_count && ci < 8) {
+                        if (cached.generic_args[ci] != resolved_args[ci]) {
+                            match = false;
+                        }
+                        ci = ci + 1;
+                    }
+                    if (match) {
+                        ret cached.result_type;
+                    }
+                }
+                cached = cached.next;
+            }
+        }
+        ret t;
+    }
+
+    ret t;
+}
+
+# substitute_types_in_body: walk a cloned AST and set concrete types on all nodes.
+# ---
+# sema: analyzer context (must have type bindings in scope)
+# node: cloned AST node to substitute types in
+#
+# for nodes with type_node children, re-resolves the full type expression.
+# for all other nodes, performs direct TY_GENERIC_PARAM substitution.
+fun substitute_types_in_body(sema: *Sema, node: *ast.Node) {
+    if (sema == nil || node == nil) {
+        ret;
+    }
+
+    # resolve this node's type (substitutes TY_GENERIC_PARAM → concrete)
+    node.ty = resolve_concrete_type(sema, node.ty);
+
+    val k: ast.NodeKind = node.kind;
+
+    # recurse into children by kind
+
+    if (k == ast.NODE_DECL_VAL || k == ast.NODE_DECL_VAR) {
+        substitute_types_in_body(sema, node.info.var_decl.type_node);
+        substitute_types_in_body(sema, node.info.var_decl.init);
+        ret;
+    }
+
+    if (k == ast.NODE_PARAM || k == ast.NODE_FIELD) {
+        substitute_types_in_body(sema, node.info.field_decl.type_node);
+        ret;
+    }
+
+    if (k == ast.NODE_EXPR_CAST) {
+        substitute_types_in_body(sema, node.info.cast_expr.expr);
+        substitute_types_in_body(sema, node.info.cast_expr.type_node);
+        ret;
+    }
+
+    if (k == ast.NODE_EXPR_ARRAY_LIT) {
+        substitute_types_in_body(sema, node.info.array_lit.size);
+        substitute_types_in_body(sema, node.info.array_lit.type_node);
+        val elems: *ast.List = node.info.array_lit.elements;
+        if (elems != nil) {
+            var i: i32 = 0;
+            for (i < elems.count) {
+                substitute_types_in_body(sema, elems.nodes[i]);
+                i = i + 1;
+            }
+        }
+        ret;
+    }
+
+    if (k == ast.NODE_EXPR_STRUCT_LIT) {
+        substitute_types_in_body(sema, node.info.struct_lit.type_node);
+        val fields: *ast.List = node.info.struct_lit.fields;
+        if (fields != nil) {
+            var i: i32 = 0;
+            for (i < fields.count) {
+                substitute_types_in_body(sema, fields.nodes[i]);
+                i = i + 1;
+            }
+        }
+        ret;
+    }
+
+    if (k == ast.NODE_PROGRAM || k == ast.NODE_STMT_LIST || k == ast.NODE_STMT_BLOCK) {
+        val sl: *ast.List = node.info.block_stmt.stmts;
+        if (sl != nil) {
+            var i: i32 = 0;
+            for (i < sl.count) {
+                substitute_types_in_body(sema, sl.nodes[i]);
+                i = i + 1;
+            }
+        }
+        ret;
+    }
+
+    if (k == ast.NODE_DECL_PUB || k == ast.NODE_STMT_EXPR || k == ast.NODE_STMT_RET ||
+        k == ast.NODE_EXPR_PAREN || k == ast.NODE_COMPTIME || k == ast.NODE_STMT_FIN) {
+        substitute_types_in_body(sema, node.info.wrapper.inner);
+        ret;
+    }
+
+    if (k == ast.NODE_DECL_EXT) {
+        substitute_types_in_body(sema, node.info.ext_decl.inner);
+        ret;
+    }
+
+    if (k == ast.NODE_DECL_DEF) {
+        substitute_types_in_body(sema, node.info.def_decl.type_node);
+        substitute_types_in_body(sema, node.info.def_decl.generics);
+        ret;
+    }
+
+    if (k == ast.NODE_DECL_FUN) {
+        val params: *ast.List = node.info.fun_decl.params;
+        if (params != nil) {
+            var i: i32 = 0;
+            for (i < params.count) {
+                substitute_types_in_body(sema, params.nodes[i]);
+                i = i + 1;
+            }
+        }
+        substitute_types_in_body(sema, node.info.fun_decl.body);
+        substitute_types_in_body(sema, node.info.fun_decl.generics);
+        substitute_types_in_body(sema, node.info.fun_decl.ret_type);
+        ret;
+    }
+
+    if (k == ast.NODE_DECL_TEST) {
+        substitute_types_in_body(sema, node.info.test_decl.body);
+        ret;
+    }
+
+    if (k == ast.NODE_DECL_REC || k == ast.NODE_DECL_UNI) {
+        val fields: *ast.List = node.info.type_decl.fields;
+        if (fields != nil) {
+            var i: i32 = 0;
+            for (i < fields.count) {
+                substitute_types_in_body(sema, fields.nodes[i]);
+                i = i + 1;
+            }
+        }
+        substitute_types_in_body(sema, node.info.type_decl.generics);
+        ret;
+    }
+
+    if (k == ast.NODE_STMT_IF || k == ast.NODE_STMT_OR || k == ast.NODE_COMPTIME_IF ||
+        k == ast.NODE_COMPTIME_OR || k == ast.NODE_OR_BRANCH) {
+        substitute_types_in_body(sema, node.info.cond_stmt.cond);
+        substitute_types_in_body(sema, node.info.cond_stmt.body);
+        substitute_types_in_body(sema, node.info.cond_stmt.or_branch);
+        ret;
+    }
+
+    if (k == ast.NODE_STMT_FOR) {
+        substitute_types_in_body(sema, node.info.for_stmt.cond);
+        substitute_types_in_body(sema, node.info.for_stmt.body);
+        ret;
+    }
+
+    if (k == ast.NODE_EXPR_BINARY) {
+        substitute_types_in_body(sema, node.info.binary_expr.left);
+        substitute_types_in_body(sema, node.info.binary_expr.right);
+        ret;
+    }
+
+    if (k == ast.NODE_EXPR_UNARY || k == ast.NODE_EXPR_ADDR || k == ast.NODE_EXPR_DEREF) {
+        substitute_types_in_body(sema, node.info.unary_expr.expr);
+        ret;
+    }
+
+    if (k == ast.NODE_EXPR_CALL) {
+        substitute_types_in_body(sema, node.info.call_expr.callee);
+        val args: *ast.List = node.info.call_expr.args;
+        if (args != nil) {
+            var i: i32 = 0;
+            for (i < args.count) {
+                substitute_types_in_body(sema, args.nodes[i]);
+                i = i + 1;
+            }
+        }
+        substitute_types_in_body(sema, node.info.call_expr.type_args);
+        ret;
+    }
+
+    if (k == ast.NODE_EXPR_INDEX) {
+        substitute_types_in_body(sema, node.info.index_expr.base);
+        substitute_types_in_body(sema, node.info.index_expr.index);
+        ret;
+    }
+
+    if (k == ast.NODE_EXPR_FIELD) {
+        substitute_types_in_body(sema, node.info.field_expr.object);
+        ret;
+    }
+
+    if (k == ast.NODE_TYPE_NAME) {
+        substitute_types_in_body(sema, node.info.type_name.args);
+        ret;
+    }
+
+    if (k == ast.NODE_TYPE_PTR || k == ast.NODE_TYPE_REF) {
+        substitute_types_in_body(sema, node.info.type_ptr.inner);
+        ret;
+    }
+
+    if (k == ast.NODE_TYPE_ARRAY) {
+        substitute_types_in_body(sema, node.info.type_array.elem_type);
+        substitute_types_in_body(sema, node.info.type_array.size);
+        ret;
+    }
+
+    if (k == ast.NODE_TYPE_FUN) {
+        val params: *ast.List = node.info.type_fun.params;
+        if (params != nil) {
+            var i: i32 = 0;
+            for (i < params.count) {
+                substitute_types_in_body(sema, params.nodes[i]);
+                i = i + 1;
+            }
+        }
+        substitute_types_in_body(sema, node.info.type_fun.ret_type);
+        ret;
+    }
+
+    if (k == ast.NODE_GENERIC) {
+        val args: *ast.List = node.info.generic_node.args;
+        if (args != nil) {
+            var i: i32 = 0;
+            for (i < args.count) {
+                substitute_types_in_body(sema, args.nodes[i]);
+                i = i + 1;
+            }
+        }
+        ret;
+    }
+
+    # leaf nodes: NODE_DECL_USE, NODE_STMT_BRK, NODE_STMT_CNT, NODE_STMT_MASM,
+    # NODE_VARIADIC, NODE_EXPR_IDENT, NODE_EXPR_LIT_*: no children to recurse
 }
 
 # resolve_expr_type: infer the type of an expression.
