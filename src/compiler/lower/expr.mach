@@ -6,2252 +6,929 @@ use std.types.option;
 
 use allocator: std.allocator;
 
-use ast:     mach.compiler.ast;
-use symbol:  mach.compiler.symbol;
-use ty:      mach.compiler.type;
-use token:   mach.compiler.token;
-
-use ir:      mach.compiler.masm.ir;
-use masm:    mach.compiler.masm.masm;
+use ast:    mach.compiler.ast;
+use ty:     mach.compiler.type;
+use token:  mach.compiler.token;
+use symbol: mach.compiler.symbol;
+use ir:     mach.compiler.masm.ir;
+use masm:   mach.compiler.masm;
 use section: mach.compiler.masm.section;
-use sym:     mach.compiler.masm.symbol;
-use mangle:  mach.compiler.masm.mangle;
-use sema:    mach.compiler.sema.sema;
-use tyctx:   mach.compiler.type_context;
+use mangle: mach.compiler.masm.mangle;
+use lcall:  mach.compiler.lower.call;
 
-use abi:  mach.compiler.masm.abi.spec;
-use mach.compiler.masm.lower.lower;
-use call: mach.compiler.masm.lower.call;
+use mach.compiler.lower;
 
-# emit_va_start: emit code to initialize a va_list (SysV x86_64 ABI).
+# mach.compiler.lower.expr: expression lowering.
 # ---
-# ctx:  lowering context
-# args: argument list (first arg is pointer to va_list)
-# ret:  IRValue (none)
-fun emit_va_start(ctx: *LowerContext, args: *ast.List) ir.IRValue {
-    if (ctx == nil || args == nil || args.count < 1) {
-        ret make_none();
+# translates expression AST nodes into MASM IR operands.
+# each lower_* function returns an ir.Operand representing
+# the value of the expression (register, immediate, memory, etc.).
+
+# lower_expr: dispatch on expression kind, return value operand.
+pub fun lower_expr(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    if (ctx == nil || node == nil) { ret ir.make_none(); }
+
+    if (node.kind == ast.NODE_EXPR_LIT_INT) {
+        ret lower_int_lit(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_LIT_FLOAT) {
+        ret lower_float_lit(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_LIT_BOOL) {
+        ret lower_bool_lit(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_LIT_CHAR) {
+        ret lower_char_lit(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_LIT_STR) {
+        ret lower_string_lit(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_LIT_NIL) {
+        ret lower_nil_lit(ctx);
+    } or (node.kind == ast.NODE_EXPR_IDENT) {
+        ret lower_ident(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_BINARY) {
+        ret lower_binary(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_UNARY) {
+        ret lower_unary(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_ADDR) {
+        ret lower_addr(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_DEREF) {
+        ret lower_deref(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_CALL) {
+        ret lower_call(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_FIELD) {
+        ret lower_field(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_INDEX) {
+        ret lower_index(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_CAST) {
+        ret lower_cast(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_PAREN) {
+        ret lower_expr(ctx, node.info.wrapper.inner);
+    } or (node.kind == ast.NODE_EXPR_STRUCT_LIT) {
+        ret lower_struct_lit(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_ARRAY_LIT) {
+        ret lower_array_lit(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_ASSIGN) {
+        ret lower_assign_expr(ctx, node);
     }
 
-    # ap is a pointer to va_list, passed as first argument
-    val ap_arg: *ast.Node = args.nodes[0];
-    if (ap_arg == nil) {
-        ret make_none();
-    }
-
-    # lower the ap argument to get a register holding the va_list pointer
-    var ap: ir.IRValue = lower_expr(ctx, ap_arg);
-    if (ap.kind != ir.VAL_REG) {
-        # ensure it's in a register
-        val ap_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        emit_mov(ctx, ir.make_reg(ap_reg, ctx.ptr_size), ap, ctx.ptr_size);
-        ap = ir.make_reg(ap_reg, ctx.ptr_size);
-    }
-
-    # va_list layout (SysV x86_64):
-    #   offset 0:  u32 gp_offset
-    #   offset 4:  u32 fp_offset
-    #   offset 8:  ptr overflow_arg_area
-    #   offset 16: ptr reg_save_area
-
-    # gp_offset = va_named_gp * 8
-    val gp_off_val: i32 = ctx.va_named_gp * 8;
-    val gp_off_mem: ir.IRValue = ir.make_mem(ap.reg, -1, 1, 0, 4);
-    emit_store(ctx, gp_off_mem, ir.make_imm(gp_off_val::i64, 4));
-
-    # fp_offset = 48 + va_named_fp * 16
-    val fp_off_val: i32 = 48 + ctx.va_named_fp * 16;
-    val fp_off_mem: ir.IRValue = ir.make_mem(ap.reg, -1, 1, 4, 4);
-    emit_store(ctx, fp_off_mem, ir.make_imm(fp_off_val::i64, 4));
-
-    # overflow_arg_area = RBP + 16 + va_named_stack_slots * 8
-    # (RBP+0 is saved RBP, RBP+8 is return address, RBP+16 is first stack arg)
-    val overflow_off: i32 = 16 + ctx.va_named_stack_slots * 8;
-    val overflow_ptr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val overflow_ptr: ir.IRValue = ir.make_reg(overflow_ptr_reg, ctx.ptr_size);
-    val overflow_src: ir.IRValue = frame_mem(ctx, overflow_off, ctx.ptr_size);
-    lower_emit_instr(ctx, ir.IROp{ir_lea: ir.OP_LEA}, overflow_ptr, overflow_src, ir.make_none(), 0);
-    val overflow_mem: ir.IRValue = ir.make_mem(ap.reg, -1, 1, 8, ctx.ptr_size);
-    emit_store(ctx, overflow_mem, overflow_ptr);
-
-    # reg_save_area = RBP + va_reg_save_off
-    val regsave_ptr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val regsave_ptr: ir.IRValue = ir.make_reg(regsave_ptr_reg, ctx.ptr_size);
-    val regsave_src: ir.IRValue = frame_mem(ctx, ctx.va_reg_save_off, ctx.ptr_size);
-    lower_emit_instr(ctx, ir.IROp{ir_lea: ir.OP_LEA}, regsave_ptr, regsave_src, ir.make_none(), 0);
-    val regsave_mem: ir.IRValue = ir.make_mem(ap.reg, -1, 1, 16, ctx.ptr_size);
-    emit_store(ctx, regsave_mem, regsave_ptr);
-
-    ret make_none();
+    ret ir.make_none();
 }
 
-# emit_va_arg: emit code to fetch the next argument from a va_list.
-# ---
-# ctx:      lowering context
-# args:     argument list (first arg is pointer to va_list)
-# arg_type: type of the argument to fetch
-# ret:      IRValue containing the fetched argument
-fun emit_va_arg(ctx: *LowerContext, args: *ast.List, arg_type: *ty.Type) ir.IRValue {
-    if (ctx == nil || args == nil || args.count < 1) {
-        ret make_none();
+# lower_lvalue: compute the address of an lvalue expression.
+# returns a memory operand suitable as a STORE destination.
+pub fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    if (ctx == nil || node == nil) { ret ir.make_none(); }
+
+    if (node.kind == ast.NODE_EXPR_IDENT) {
+        ret lower_ident_lvalue(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_DEREF) {
+        ret lower_deref_lvalue(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_FIELD) {
+        ret lower_field_lvalue(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_INDEX) {
+        ret lower_index_lvalue(ctx, node);
+    } or (node.kind == ast.NODE_EXPR_PAREN) {
+        ret lower_lvalue(ctx, node.info.wrapper.inner);
     }
 
-    val ap_arg: *ast.Node = args.nodes[0];
-    if (ap_arg == nil) {
-        ret make_none();
+    ret ir.make_none();
+}
+
+# --- literals ---
+
+fun lower_int_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val text: str = node.info.lit_expr.text;
+    val value: i64 = parse_int_str(text);
+    val size: u8 = expr_size(ctx, node);
+    ret ir.make_imm(value, size);
+}
+
+fun lower_float_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val text: str = node.info.lit_expr.text;
+    val value: f64 = parse_float(text);
+    val size: u8 = expr_size(ctx, node);
+
+    # float literals must go through .rodata — store bits and load
+    val sec_r: Result[*section.Section, str] = masm.get_or_create_section(
+        ctx.mctx, ".rodata", section.SEC_RODATA);
+    if (result_is_err[*section.Section, str](sec_r)) {
+        ret ir.make_none();
     }
 
-    # lower the ap argument
-    var ap: ir.IRValue = lower_expr(ctx, ap_arg);
-    if (ap.kind != ir.VAL_REG) {
-        val ap_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        emit_mov(ctx, ir.make_reg(ap_reg, ctx.ptr_size), ap, ctx.ptr_size);
-        ap = ir.make_reg(ap_reg, ctx.ptr_size);
+    val sec: *section.Section = result_unwrap_ok[*section.Section, str](sec_r);
+    val offset: usize = section.current_offset(sec);
+
+    if (size == 4) {
+        val f32_val: f32 = value::f32;
+        val bits: u32 = f32_val::u32;
+        section.emit_u32(ctx.alloc, sec, bits);
+    } or {
+        val bits: u64 = value::u64;
+        section.emit_u64(ctx.alloc, sec, bits);
     }
 
-    # determine argument size (promote to at least 8 bytes)
-    var arg_size: usize = ctx.ptr_size;
-    if (arg_type != nil && arg_type.size > 0) {
-        arg_size = arg_type.size;
-    }
-    if (arg_size < ctx.ptr_size) {
-        arg_size = ctx.ptr_size;
-    }
+    # create a label for the float constant
+    ctx.str_counter = ctx.str_counter + 1;
+    val label: ir.Operand = ir.make_sym(".Lfloat", offset::i64);
 
-    # for now, assume all types are GP (not floating-point)
-    # threshold for GP is 48 (6 registers * 8 bytes)
-    val threshold: i32 = 48;
-    val increment: i32 = 8;
-    val offset_field: i32 = 0;  # gp_offset at offset 0
-
-    # allocate result register
-    val result_reg: i32 = new_vreg(ctx, arg_size);
-    val result: ir.IRValue = ir.make_reg(result_reg, arg_size);
-
-    # generate unique labels for branching
-    val stack_label: str = new_label(ctx, ".Lva_stack");
-    val done_label: str = new_label(ctx, ".Lva_done");
-
-    # load gp_offset (32-bit)
-    val off_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val off_64: ir.IRValue = ir.make_reg(off_reg, ctx.ptr_size);
-    val off_mem: ir.IRValue = ir.make_mem(ap.reg, -1, 1, offset_field::i64, 4);
-    lower_emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, off_64, off_mem, ir.make_imm(4, 1), 0);
-
-    # jump to stack path if offset >= threshold
-    val va_cmp: ir.IRValue = emit_icmp(ctx, off_64, ir.make_imm(threshold::i64, ctx.ptr_size), ir.CC_AE, ctx.ptr_size);
-    emit_brcond(ctx, va_cmp, stack_label);
-
-    # --- register path ---
-    # load reg_save_area pointer
-    val regsave_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val regsave: ir.IRValue = ir.make_reg(regsave_reg, ctx.ptr_size);
-    val regsave_mem: ir.IRValue = ir.make_mem(ap.reg, -1, 1, 16, ctx.ptr_size);
-    lower_emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, regsave, regsave_mem, ir.make_imm(ctx.ptr_size::i64, 1), 0);
-
-    # compute address = reg_save_area + offset
-    val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-    emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, regsave, off_64, ctx.ptr_size);
-
-    # load value from computed address
-    val val_mem: ir.IRValue = ir.make_mem(addr_reg, -1, 1, 0, arg_size);
-    lower_emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, result, val_mem, ir.make_imm(arg_size::i64, 1), 0);
-
-    # increment offset
-    val new_off_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val new_off: ir.IRValue = ir.make_reg(new_off_reg, ctx.ptr_size);
-    emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, new_off, off_64, ir.make_imm(increment::i64, ctx.ptr_size), ctx.ptr_size);
-    # store back (truncate to 32-bit)
-    emit_store(ctx, off_mem, new_off);
-
-    # jump to done
-    emit_br(ctx, done_label);
-
-    # --- stack path ---
-    emit_label(ctx, stack_label);
-
-    # load overflow_arg_area pointer
-    val overflow_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val overflow: ir.IRValue = ir.make_reg(overflow_reg, ctx.ptr_size);
-    val overflow_mem: ir.IRValue = ir.make_mem(ap.reg, -1, 1, 8, ctx.ptr_size);
-    lower_emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, overflow, overflow_mem, ir.make_imm(ctx.ptr_size::i64, 1), 0);
-
-    # load value from overflow_arg_area
-    val stack_val_mem: ir.IRValue = ir.make_mem(overflow_reg, -1, 1, 0, arg_size);
-    lower_emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, result, stack_val_mem, ir.make_imm(arg_size::i64, 1), 0);
-
-    # increment overflow_arg_area by 8
-    val new_overflow_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val new_overflow: ir.IRValue = ir.make_reg(new_overflow_reg, ctx.ptr_size);
-    emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, new_overflow, overflow, ir.make_imm(8, ctx.ptr_size), ctx.ptr_size);
-    emit_store(ctx, overflow_mem, new_overflow);
-
-    # --- done ---
-    emit_label(ctx, done_label);
-
+    # load the float from memory
+    val result: ir.Operand = new_vreg(ctx, size);
+    emit(ctx, ir.OP_LOAD, result, label, ir.make_none(), ir.CC_NONE);
     ret result;
 }
 
-# --- expression lowering ---
-
-# lower_expr: lower an expression node to IR.
-# ---
-# ctx:  lowering context
-# node: expression AST node
-# ret:  IRValue representing the expression result
-pub fun lower_expr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
+fun lower_bool_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val text: str = node.info.lit_expr.text;
+    var value: i64 = 0;
+    if (text != nil && text[0] == 116) { # 't' for true
+        value = 1;
     }
-
-    # dispatch based on node kind
-    if (node.kind == ast.NODE_EXPR_LIT_INT) {
-        val int_val: i64 = parse_int_str(node.info.lit_expr.text);
-        ret ir.make_imm(int_val, 8);
-    }
-
-    if (node.kind == ast.NODE_EXPR_LIT_CHAR) {
-        val char_text: str = node.info.lit_expr.text;
-        var char_val: i64 = 0;
-        if (char_text != nil) {
-            # text is the raw token text including quotes, e.g. 'A' or '\n'
-            # char_text[0] is the opening quote, char_text[1] is the char or backslash
-            if (char_text[1] == '\\') {
-                # escape sequence
-                val esc: u8 = char_text[2];
-                if (esc == 'n') { char_val = 10; }
-                or (esc == 't') { char_val = 9; }
-                or (esc == 'r') { char_val = 13; }
-                or (esc == '0') { char_val = 0; }
-                or (esc == '\\') { char_val = 92; }
-                or (esc == '\'') { char_val = 39; }
-                or (esc == '"') { char_val = 34; }
-                or { char_val = esc::i64; }
-            } or {
-                char_val = char_text[1]::i64;
-            }
-        }
-        ret ir.make_imm(char_val, 8);
-    }
-
-    if (node.kind == ast.NODE_EXPR_LIT_FLOAT) {
-        var float_val: f64 = parse_float(node.info.lit_expr.text);
-        val float_ptr: *f64 = ?float_val;
-        val bits_ptr: *u64 = float_ptr::*u64;
-        val bits: i64 = (@bits_ptr)::i64;
-        ret ir.make_imm(bits, 8);
-    }
-
-    if (node.kind == ast.NODE_EXPR_LIT_STR) {
-        ret lower_string_lit(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_IDENT) {
-        ret lower_identifier(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_BINARY) {
-        ret lower_binary(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_UNARY) {
-        ret lower_unary(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_CALL) {
-        # check for comptime call: $size_of(T), $align_of(T)
-        val ct_callee: *ast.Node = node.info.call_expr.callee;
-        if (ct_callee != nil && ct_callee.kind == ast.NODE_COMPTIME) {
-            val ct_ident: *ast.Node = ct_callee.info.wrapper.inner;
-            val ct_args: *ast.List = node.info.call_expr.args;
-            if (ct_ident != nil && ct_ident.kind == ast.NODE_EXPR_IDENT &&
-                ct_args != nil && ct_args.count > 0) {
-                val ct_name: str = ct_ident.info.ident_expr.name;
-                val ct_arg: *ast.Node = ct_args.nodes[0];
-                if (ct_name != nil && ct_arg != nil) {
-                    var ct_type: *ty.Type = ct_arg.ty;
-
-                    # pointer types always have size/align 8
-                    if (ct_type == nil && ct_arg.kind == ast.NODE_TYPE_PTR) {
-                        if (str_equals(ct_name, "size_of") || str_equals(ct_name, "align_of")) {
-                            ret ir.make_imm(8, 8);
-                        }
-                    }
-
-                    if (ct_type != nil) {
-                        if (str_equals(ct_name, "size_of")) {
-                            ret ir.make_imm(ct_type.size::i64, 8);
-                        }
-                        if (str_equals(ct_name, "align_of")) {
-                            var ct_align: usize = ct_type.align;
-                            if (ct_align > 8) { ct_align = 8; }
-                            if (ct_align == 0) { ct_align = 1; }
-                            ret ir.make_imm(ct_align::i64, 8);
-                        }
-                    }
-                }
-            }
-        }
-        ret lower_call(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_FIELD) {
-        ret lower_field_access(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_INDEX) {
-        ret lower_index(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_CAST) {
-        ret lower_cast(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_ADDR) {
-        ret lower_addr(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_DEREF) {
-        ret lower_deref(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_ARRAY_LIT) {
-        ret lower_array_lit(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_STRUCT_LIT) {
-        ret lower_struct_lit(ctx, node);
-    }
-
-    if (node.kind == ast.NODE_EXPR_LIT_BOOL) {
-        val bool_text: str = node.info.lit_expr.text;
-        if (bool_text != nil && str_equals(bool_text, "true")) {
-            ret ir.make_imm(1, 1);
-        }
-        ret ir.make_imm(0, 1);
-    }
-
-    if (node.kind == ast.NODE_EXPR_LIT_NIL) {
-        ret ir.make_imm(0, ctx.ptr_size);
-    }
-
-    # parenthesized expression: unwrap and lower inner expression
-    if (node.kind == ast.NODE_EXPR_PAREN) {
-        val inner: *ast.Node = node.info.wrapper.inner;
-        if (inner != nil) {
-            ret lower_expr(ctx, inner);
-        }
-        ret make_none();
-    }
-
-    # comptime expression: $size_of(T), $align_of(T), etc.
-    if (node.kind == ast.NODE_COMPTIME) {
-        val ct_inner: *ast.Node = node.info.wrapper.inner;
-        if (ct_inner != nil && ct_inner.kind == ast.NODE_EXPR_CALL) {
-            val ct_callee: *ast.Node = ct_inner.info.call_expr.callee;
-            val ct_args: *ast.List = ct_inner.info.call_expr.args;
-            if (ct_callee != nil && ct_callee.kind == ast.NODE_EXPR_IDENT &&
-                ct_args != nil && ct_args.count > 0) {
-                val ct_name: str = ct_callee.info.ident_expr.name;
-                val ct_arg: *ast.Node = ct_args.nodes[0];
-                if (ct_name != nil && ct_arg != nil) {
-                    var ct_type: *ty.Type = ct_arg.ty;
-
-                    # if arg is a pointer type, size/align is always 8
-                    if (ct_type == nil && ct_arg.kind == ast.NODE_TYPE_PTR) {
-                        if (str_equals(ct_name, "size_of") || str_equals(ct_name, "align_of")) {
-                            ret ir.make_imm(8, 8);
-                        }
-                    }
-
-                    if (ct_type != nil) {
-                        if (str_equals(ct_name, "size_of")) {
-                            ret ir.make_imm(ct_type.size::i64, 8);
-                        }
-                        if (str_equals(ct_name, "align_of")) {
-                            var ct_align: usize = ct_type.align;
-                            if (ct_align > 8) { ct_align = 8; }
-                            if (ct_align == 0) { ct_align = 1; }
-                            ret ir.make_imm(ct_align::i64, 8);
-                        }
-                    }
-                }
-            }
-        }
-        # fallback: try lowering inner expression
-        if (ct_inner != nil) {
-            ret lower_expr(ctx, ct_inner);
-        }
-        ret make_none();
-    }
-
-    # default: return none
-    ret make_none();
+    ret ir.make_imm(value, 1);
 }
 
-# lower_string_lit: lower a string literal.
-# ---
-# ctx:  lowering context
-# node: string literal node
-# ret:  IRValue containing string address
-fun lower_string_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil || ctx.m == nil) {
-        ret ir.make_imm(0, ctx.ptr_size);
+fun lower_char_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val text: str = node.info.lit_expr.text;
+    if (text == nil) { ret ir.make_imm(0, 1); }
+
+    var value: i64 = 0;
+    if (text[0] == 92) { # backslash — escape sequence
+        if (text[1] == 110) { value = 10; }       # \n
+        or (text[1] == 116) { value = 9; }        # \t
+        or (text[1] == 114) { value = 13; }       # \r
+        or (text[1] == 48) { value = 0; }         # \0
+        or (text[1] == 92) { value = 92; }        # \\
+        or (text[1] == 39) { value = 39; }        # \'
+        or { value = text[1]::i64; }
+    } or {
+        value = text[0]::i64;
+    }
+    ret ir.make_imm(value, 1);
+}
+
+fun lower_string_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val text: str = node.info.lit_expr.text;
+    val psz: u8 = ctx.ptr_size;
+
+    # emit the string data to .rodata
+    val sec_r: Result[*section.Section, str] = masm.get_or_create_section(
+        ctx.mctx, ".rodata", section.SEC_RODATA);
+    if (result_is_err[*section.Section, str](sec_r)) {
+        ret ir.make_none();
     }
 
-    val str_val: str = node.info.lit_expr.text;
-    if (str_val == nil) {
-        ret ir.make_imm(0, ctx.ptr_size);
-    }
+    val sec: *section.Section = result_unwrap_ok[*section.Section, str](sec_r);
+    val offset: usize = section.current_offset(sec);
 
-    # create a unique label for the string
-    val label: str = new_label(ctx, ".Lstr");
-
-    # emit string data to rodata section
-    val sec_res: Result[*section.Section, str] = masm.get_or_create_section(ctx.m, ".rodata", section.section_rodata());
-    if (result_is_err[*section.Section, str](sec_res)) {
-        ret ir.make_imm(0, ctx.ptr_size);
-    }
-
-    val sec: *section.Section = result_unwrap_ok[*section.Section, str](sec_res);
-
-    # create symbol for the string
-    val sym_res: Result[*sym.Symbol, str] = sym.create(ctx.alloc, label);
-    if (result_is_ok[*sym.Symbol, str](sym_res)) {
-        val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_res);
-        sym.set_binding(s, sym.bind_local());
-        sym.set_type(s, sym.sym_object());
-        sym.define(s, sec, sec.size, 0);
-        masm.add_symbol(ctx.m, s);
-    }
-
-    # emit string bytes - strip surrounding quotes and process escape sequences
-    val slen: usize = str_len(str_val);
-    var start: usize = 0;
-    var end: usize = slen;
-
-    # strip surrounding quotes if present
-    if (slen >= 2 && str_val[0] == 34) {
-        start = 1;
-        if (str_val[slen - 1] == 34) {
-            end = slen - 1;
-        }
-    }
-
-    var i: usize = start;
-    for (i < end) {
-        val c: u8 = str_val[i];
-        if (c == 92 && i + 1 < end) {
-            # backslash escape
-            val e: u8 = str_val[i + 1];
-            if (e == 110) {
-                # \n → newline
-                section.emit_byte(ctx.alloc, sec, 10);
-            } or (e == 116) {
-                # \t → tab
-                section.emit_byte(ctx.alloc, sec, 9);
-            } or (e == 114) {
-                # \r → carriage return
-                section.emit_byte(ctx.alloc, sec, 13);
-            } or (e == 48) {
-                # \0 → null
-                section.emit_byte(ctx.alloc, sec, 0);
-            } or (e == 92) {
-                # \\ → backslash
-                section.emit_byte(ctx.alloc, sec, 92);
-            } or (e == 34) {
-                # \" → double quote
-                section.emit_byte(ctx.alloc, sec, 34);
-            } or (e == 39) {
-                # \' → single quote
-                section.emit_byte(ctx.alloc, sec, 39);
-            } or {
-                # unknown escape: emit the escaped char as-is
-                section.emit_byte(ctx.alloc, sec, e);
-            }
-            i = i + 2;
-        } or {
-            section.emit_byte(ctx.alloc, sec, c);
+    # write the string bytes (text is already the raw content without quotes)
+    if (text != nil) {
+        var i: usize = 0;
+        for (text[i] != 0) {
+            section.emit_byte(ctx.alloc, sec, text[i]);
             i = i + 1;
         }
     }
     # null terminator
     section.emit_byte(ctx.alloc, sec, 0);
 
-    # return symbol reference as immediate
-    var v: ir.IRValue = ir.make_label(label);
-    v.size = ctx.ptr_size;
+    ctx.str_counter = ctx.str_counter + 1;
 
-    ret v;
+    # return a symbol operand referencing the string data
+    val result: ir.Operand = new_vreg(ctx, psz);
+    val sym: ir.Operand = ir.make_sym(".Lstr", offset::i64);
+    emit(ctx, ir.OP_ADDR, result, sym, ir.make_none(), ir.CC_NONE);
+    ret result;
 }
 
-# lower_identifier: lower an identifier reference.
-# ---
-# ctx:  lowering context
-# node: identifier node
-# ret:  IRValue containing the identifier's value
-fun lower_identifier(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
+fun lower_nil_lit(ctx: *LowerContext) ir.Operand {
+    ret ir.make_imm(0, ctx.ptr_size);
+}
 
+# --- identifiers ---
+
+fun lower_ident(ctx: *LowerContext, node: *ast.Node) ir.Operand {
     val name: str = node.info.ident_expr.name;
-    if (name == nil) {
-        ret make_none();
+    if (name == nil) { ret ir.make_none(); }
+
+    # try local variable first
+    val lv: *LocalVar = local_lookup(ctx, name);
+    if (lv != nil) {
+        val mem: ir.Operand = local_operand(lv, ctx.ptr_size);
+        val size: u8 = lv.size::u8;
+        val result: ir.Operand = new_vreg(ctx, size);
+        emit_load(ctx, result, mem);
+        ret result;
     }
 
-    # check if it's a local variable
-    val local_idx: i32 = find_local_var(ctx, name);
-    if (local_idx >= 0) {
-        val offset: i32 = get_local_var_offset(ctx, local_idx);
-        val size: usize = ctx.local_vars[local_idx].size;
-        val addr: ir.IRValue = frame_mem(ctx, offset, size);
-
-        # aggregates (structs, arrays) and large types: return address with LEA
-        # because field/index access expects a pointer base, not a loaded value.
-        # small unions (size 1,2,4,8) are loaded by value like scalars —
-        # large/odd unions are caught by size > 8 || is_odd_size below.
-        # try node.ty first, fall back to local_vars type table
-        var var_ty: *ty.Type = node.ty;
-        if (var_ty == nil) {
-            var_ty = ctx.local_vars[local_idx].ty;
-        }
-        val is_aggregate: bool = var_ty != nil && (var_ty.kind == ty.TY_RECORD ||
-                                                    var_ty.kind == ty.TY_ARRAY ||
-                                                    var_ty.kind == ty.TY_UNION);
-        val is_odd_size: bool = size != 1 && size != 2 && size != 4 && size != 8;
-
-        if (size > 8 || is_aggregate || is_odd_size) {
-            # LEA: load effective address into register
-            val result_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-            val result: ir.IRValue = ir.make_reg(result_reg, ctx.ptr_size);
-            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                          result, addr, ir.make_none(), ir.CC_NONE);
-            ret result;
-        }
-
-        # scalar: load value (sign-extend for signed i8/i16)
-        if (var_ty != nil && ty.type_is_signed(var_ty) && (size == 1 || size == 2)) {
-            ret emit_load_signed(ctx, addr, size);
-        }
-        ret emit_load(ctx, addr, size);
+    # global variable or function reference — use mangled name
+    val sym: *symbol.Symbol = resolve_symbol(ctx, name);
+    if (sym != nil) {
+        val mangled: str = get_mangled_name(ctx, sym);
+        val size: u8 = expr_size(ctx, node);
+        val result: ir.Operand = new_vreg(ctx, size);
+        val label: ir.Operand = ir.make_label(mangled);
+        emit(ctx, ir.OP_LOAD, result, label, ir.make_none(), ir.CC_NONE);
+        ret result;
     }
 
-    # check if it's a parameter
-    # parameters are handled during function lowering
-    # for now, assume it's a global
-
-    # look up symbol for linkage name and function detection
-    var global_label: str = name;
-    var is_func_sym: bool = false;
-    if (ctx.symbols != nil) {
-        val id_sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, name);
-        if (option_is_some[*symbol.Symbol](id_sym_opt)) {
-            val id_sym: *symbol.Symbol = option_unwrap[*symbol.Symbol](id_sym_opt);
-            if (id_sym.kind == symbol.SYM_FUN) {
-                is_func_sym = true;
-            }
-            val link: str = mangle.linkage_name(id_sym, ctx.alloc);
-            if (link != nil) {
-                global_label = link;
-            }
-        }
-        if (!is_func_sym) {
-            val id_imp_sym: *symbol.Symbol = lookup_symbol_in_imports(ctx, name);
-            if (id_imp_sym != nil) {
-                if (id_imp_sym.kind == symbol.SYM_FUN) {
-                    is_func_sym = true;
-                }
-                val imp_link: str = mangle.linkage_name(id_imp_sym, ctx.alloc);
-                if (imp_link != nil) {
-                    global_label = imp_link;
-                }
-            }
-        }
-    }
-
-    # create symbol reference (for global)
-    var v: ir.IRValue = ir.make_label(global_label);
-    v.size = ctx.ptr_size;
-
-    # for aggregates, return address in register
-    val var_ty: *ty.Type = node.ty;
-    val is_aggregate: bool = var_ty != nil && (var_ty.kind == ty.TY_RECORD ||
-                                                var_ty.kind == ty.TY_ARRAY);
-    # load address into register
-    val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                  addr, v, ir.make_none(), ir.CC_NONE);
-
-    if (is_aggregate || is_func_sym) {
-        ret addr;
-    }
-
-    # scalar: load value from address using actual type size
-    var load_size: usize = ctx.ptr_size;
-    if (var_ty != nil && var_ty.size > 0) {
-        load_size = var_ty.size;
-    }
-    val mem: ir.IRValue = ir.make_mem(addr_reg, -1, 1, 0, load_size);
-    if (var_ty != nil && ty.type_is_signed(var_ty) && (load_size == 1 || load_size == 2)) {
-        ret emit_load_signed(ctx, mem, load_size);
-    }
-    ret emit_load(ctx, mem, load_size);
+    ret ir.make_none();
 }
 
-# lower_short_circuit: lower && and || with short-circuit evaluation.
-# ---
-# ctx:    lowering context
-# node:   binary expression node (TAG_AMP_AMP or TAG_PIPE_PIPE)
-# is_and: true for &&, false for ||
-# ret:    IRValue containing boolean result (0 or 1)
-fun lower_short_circuit(ctx: *LowerContext, node: *ast.Node, is_and: bool) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
+fun lower_ident_lvalue(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val name: str = node.info.ident_expr.name;
+    if (name == nil) { ret ir.make_none(); }
+
+    # try local variable first
+    val lv: *LocalVar = local_lookup(ctx, name);
+    if (lv != nil) {
+        ret local_operand(lv, ctx.ptr_size);
     }
 
+    # global variable
+    val sym: *symbol.Symbol = resolve_symbol(ctx, name);
+    if (sym != nil) {
+        val mangled: str = get_mangled_name(ctx, sym);
+        ret ir.make_label(mangled);
+    }
+
+    ret ir.make_none();
+}
+
+# --- binary operations ---
+
+fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val op: u8 = node.info.binary_expr.op;
     val lhs: *ast.Node = node.info.binary_expr.left;
     val rhs: *ast.Node = node.info.binary_expr.right;
+    if (lhs == nil || rhs == nil) { ret ir.make_none(); }
 
-    if (lhs == nil || rhs == nil) {
-        ret make_none();
+    # short-circuit logical AND/OR
+    if (op == token.TAG_AMP_AMP) { ret lower_logical_and(ctx, lhs, rhs); }
+    if (op == token.TAG_PIPE_PIPE) { ret lower_logical_or(ctx, lhs, rhs); }
+
+    val left: ir.Operand = lower_expr(ctx, lhs);
+    val right: ir.Operand = lower_expr(ctx, rhs);
+    if (left.kind == ir.OPK_NONE || right.kind == ir.OPK_NONE) {
+        ret ir.make_none();
     }
 
-    val end_label: str = new_label(ctx, ".Lsc_end");
-    val true_label: str = new_label(ctx, ".Lsc_true");
+    val size: u8 = expr_size(ctx, node);
+    val result: ir.Operand = new_vreg(ctx, size);
 
-    # allocate result vreg
-    val dst_reg: i32 = new_vreg(ctx, 8);
-    val dst: ir.IRValue = ir.make_reg(dst_reg, 8);
-    val zero: ir.IRValue = ir.make_imm(0, 8);
+    # determine if this is a float operation
+    val ltype: *ty.Type = lhs.ty;
+    val is_float: bool = ltype != nil && ty.type_is_float(ltype);
 
-    # evaluate left operand
-    val left_value: ir.IRValue = lower_expr(ctx, lhs);
-
-    # move left result to dst
-    emit_mov(ctx, dst, left_value, 8);
-
-    # check if left is zero/nonzero for short-circuit
-    if (is_and) {
-        # AND: if left is 0, short-circuit to end (result stays 0)
-        val sc_eq: ir.IRValue = emit_icmp(ctx, dst, zero, ir.CC_EQ, 8);
-        emit_brcond(ctx, sc_eq, end_label);
-    } or {
-        # OR: if left is non-zero, short-circuit to true (result = 1)
-        val sc_ne: ir.IRValue = emit_icmp(ctx, dst, zero, ir.CC_NE, 8);
-        emit_brcond(ctx, sc_ne, true_label);
+    # comparison operators
+    if (op == token.TAG_EQ_EQ || op == token.TAG_BANG_EQ ||
+        op == token.TAG_LT || op == token.TAG_LT_EQ ||
+        op == token.TAG_GT || op == token.TAG_GT_EQ) {
+        ret lower_comparison(ctx, op, left, right, ltype, size);
     }
 
-    # evaluate right operand
-    val right_value: ir.IRValue = lower_expr(ctx, rhs);
+    # arithmetic / bitwise operators
+    val ir_op: ir.Operator = map_binop(op, is_float, ltype);
+    emit(ctx, ir_op, result, left, right, ir.CC_NONE);
+    ret result;
+}
 
-    # result = (right != 0)
-    val sc_right: ir.IRValue = emit_icmp(ctx, right_value, zero, ir.CC_NE, 8);
-    emit_mov(ctx, dst, sc_right, 8);
-    emit_br(ctx, end_label);
+fun lower_comparison(ctx: *LowerContext, op: u8,
+                     left: ir.Operand, right: ir.Operand,
+                     ltype: *ty.Type, size: u8) ir.Operand {
+    val is_float: bool = ltype != nil && ty.type_is_float(ltype);
+    val is_unsigned: bool = ltype != nil && ty.type_is_unsigned(ltype);
 
-    if (!is_and) {
-        # OR: true label - set result to 1
-        emit_label(ctx, true_label);
-        emit_mov(ctx, dst, ir.make_imm(1, 8), 8);
-    }
+    var cmp_op: ir.Operator = ir.OP_ICMP;
+    if (is_float) { cmp_op = ir.OP_FCMP; }
+
+    val cc: ir.Cond = map_cond(op, is_unsigned);
+    val result: ir.Operand = new_vreg(ctx, 1);
+    emit(ctx, cmp_op, result, left, right, cc);
+    ret result;
+}
+
+fun lower_logical_and(ctx: *LowerContext, lhs: *ast.Node, rhs: *ast.Node) ir.Operand {
+    val result: ir.Operand = new_vreg(ctx, 1);
+    val skip_label: str = ".L_and_skip";
+    val end_label: str = ".L_and_end";
+
+    val left: ir.Operand = lower_expr(ctx, lhs);
+    emit_mov(ctx, result, left);
+    emit_brcond(ctx, left, skip_label, ir.CC_EQ);
+
+    val right: ir.Operand = lower_expr(ctx, rhs);
+    emit_mov(ctx, result, right);
+    emit_jmp(ctx, end_label);
+
+    emit_label(ctx, skip_label);
+    emit_mov(ctx, result, ir.make_imm(0, 1));
 
     emit_label(ctx, end_label);
-    ret dst;
+    ret result;
 }
 
-# lower_binary: lower a binary expression.
-# ---
-# ctx:  lowering context
-# node: binary expression node
-# ret:  IRValue containing result
-fun lower_binary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
+fun lower_logical_or(ctx: *LowerContext, lhs: *ast.Node, rhs: *ast.Node) ir.Operand {
+    val result: ir.Operand = new_vreg(ctx, 1);
+    val skip_label: str = ".L_or_skip";
+    val end_label: str = ".L_or_end";
 
-    val lhs: *ast.Node = node.info.binary_expr.left;
-    val rhs: *ast.Node = node.info.binary_expr.right;
-    val op: u8 = node.tok.tag;
+    val left: ir.Operand = lower_expr(ctx, lhs);
+    emit_mov(ctx, result, left);
+    emit_brcond(ctx, left, skip_label, ir.CC_NE);
 
-    if (lhs == nil || rhs == nil) {
-        ret make_none();
-    }
+    val right: ir.Operand = lower_expr(ctx, rhs);
+    emit_mov(ctx, result, right);
+    emit_jmp(ctx, end_label);
 
-    # handle short-circuit logical operators
-    if (op == token.TAG_AMP_AMP) {
-        ret lower_short_circuit(ctx, node, true);
-    }
-    if (op == token.TAG_PIPE_PIPE) {
-        ret lower_short_circuit(ctx, node, false);
-    }
+    emit_label(ctx, skip_label);
+    emit_mov(ctx, result, ir.make_imm(1, 1));
 
-    # handle assignment separately - left side needs lvalue, not rvalue
-    if (op == token.TAG_EQ) {
-        val left_addr: ir.IRValue = lower_lvalue(ctx, lhs);
-        val right_value: ir.IRValue = lower_expr(ctx, rhs);
+    emit_label(ctx, end_label);
+    ret result;
+}
 
-        # aggregate assignment: when RHS is a large local variable, lower_identifier
-        # returns VAL_REG (via LEA) containing the address. Detect this by checking
-        # the local variable's size and do a chunked copy instead of a scalar store.
-        if (right_value.kind == ir.VAL_REG && rhs.kind == ast.NODE_EXPR_IDENT) {
-            val asg_rhs_name: str = rhs.info.ident_expr.name;
-            if (asg_rhs_name != nil) {
-                val asg_rhs_idx: i32 = find_local_var(ctx, asg_rhs_name);
-                if (asg_rhs_idx >= 0) {
-                    val asg_rhs_size: usize = ctx.local_vars[asg_rhs_idx].size;
-                    if (asg_rhs_size > ctx.ptr_size) {
-                        # LEA destination address
-                        val asg_dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-                        val asg_dst: ir.IRValue = ir.make_reg(asg_dst_reg, ctx.ptr_size);
-                        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                                      asg_dst, left_addr, ir.make_none(), ir.CC_NONE);
+# --- unary operations ---
 
-                        # source: right_value.reg already holds the aggregate address
-                        val asg_src_reg: i32 = right_value.reg;
+fun lower_unary(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val inner: *ast.Node = node.info.unary_expr.expr;
+    if (inner == nil) { ret ir.make_none(); }
 
-                        # chunked copy
-                        val asg_total: i32 = asg_rhs_size::i32;
-                        var asg_off: i32 = 0;
-                        for (asg_off < asg_total) {
-                            var asg_chunk: usize = 8;
-                            if ((asg_total - asg_off)::usize < 8) {
-                                asg_chunk = (asg_total - asg_off)::usize;
-                            }
-                            val asg_tmp_reg: i32 = new_vreg(ctx, asg_chunk);
-                            val asg_tmp: ir.IRValue = ir.make_reg(asg_tmp_reg, asg_chunk);
+    val op: u8 = node.info.unary_expr.op;
+    val value: ir.Operand = lower_expr(ctx, inner);
+    if (value.kind == ir.OPK_NONE) { ret ir.make_none(); }
 
-                            val asg_s: ir.IRValue = ir.make_mem(asg_src_reg, -1, 1, asg_off::i64, asg_chunk);
-                            val asg_d: ir.IRValue = ir.make_mem(asg_dst_reg, -1, 1, asg_off::i64, asg_chunk);
+    val size: u8 = expr_size(ctx, node);
+    val result: ir.Operand = new_vreg(ctx, size);
 
-                            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
-                                          asg_tmp, asg_s, ir.make_none(), ir.CC_NONE);
-                            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
-                                          asg_d, asg_tmp, ir.make_none(), ir.CC_NONE);
-
-                            asg_off = asg_off + asg_chunk::i32;
-                        }
-                        ret right_value;
-                    }
-                }
-            }
-        }
-
-        # general aggregate assignment: when RHS is a large aggregate (returned from
-        # function call via sret as VAL_MEM, or from a register address as VAL_REG),
-        # do a chunked copy to the destination.
-        var agg_copy_size: usize = 0;
-        if (right_value.kind == ir.VAL_MEM && right_value.size > ctx.ptr_size) {
-            agg_copy_size = right_value.size;
-        } or (right_value.kind == ir.VAL_REG && rhs.ty != nil && rhs.ty.size > ctx.ptr_size) {
-            agg_copy_size = rhs.ty.size;
-        }
-
-        if (agg_copy_size > 0) {
-            # get destination register
-            var agg_dst_reg: i32 = 0;
-            if (left_addr.kind == ir.VAL_REG) {
-                agg_dst_reg = left_addr.reg;
-            } or {
-                agg_dst_reg = new_vreg(ctx, ctx.ptr_size);
-                val agg_dst: ir.IRValue = ir.make_reg(agg_dst_reg, ctx.ptr_size);
-                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                              agg_dst, left_addr, ir.make_none(), ir.CC_NONE);
-            }
-
-            # get source register: for VAL_MEM, LEA to get address; for VAL_REG, use directly
-            var agg_src_reg: i32 = 0;
-            if (right_value.kind == ir.VAL_MEM) {
-                agg_src_reg = new_vreg(ctx, ctx.ptr_size);
-                val agg_src: ir.IRValue = ir.make_reg(agg_src_reg, ctx.ptr_size);
-                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                              agg_src, right_value, ir.make_none(), ir.CC_NONE);
-            } or {
-                agg_src_reg = right_value.reg;
-            }
-
-            val agg_total: i32 = agg_copy_size::i32;
-            var agg_off: i32 = 0;
-            for (agg_off < agg_total) {
-                var agg_chunk: usize = 8;
-                if ((agg_total - agg_off)::usize < 8) {
-                    agg_chunk = (agg_total - agg_off)::usize;
-                }
-                val agg_tmp_reg: i32 = new_vreg(ctx, agg_chunk);
-                val agg_tmp: ir.IRValue = ir.make_reg(agg_tmp_reg, agg_chunk);
-
-                val agg_s: ir.IRValue = ir.make_mem(agg_src_reg, -1, 1, agg_off::i64, agg_chunk);
-                val agg_d: ir.IRValue = ir.make_mem(agg_dst_reg, -1, 1, agg_off::i64, agg_chunk);
-
-                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
-                              agg_tmp, agg_s, ir.make_none(), ir.CC_NONE);
-                ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
-                              agg_d, agg_tmp, ir.make_none(), ir.CC_NONE);
-
-                agg_off = agg_off + agg_chunk::i32;
-            }
-            ret right_value;
-        }
-
-        emit_store(ctx, left_addr, right_value);
-        ret right_value;
-    }
-
-    # lower operands (for non-assignment operators)
-    val left_value: ir.IRValue = lower_expr(ctx, lhs);
-    val right_value: ir.IRValue = lower_expr(ctx, rhs);
-
-    # determine size from node type or default to 8
-    var size: usize = 8;
-    if (node.ty != nil) {
-        size = node.ty.size;
-    }
-
-    # allocate result register
-    val dst_reg: i32 = new_vreg(ctx, size);
-    val dst: ir.IRValue = ir.make_reg(dst_reg, size);
-
-    # map token kind to IR opcode
-    var ir_op: ir.IROp = ir.IROp{ir_mov: ir.OP_MOV};
-
-    # check if this is a float operation
-    var is_float: bool = false;
-    if (node.ty != nil && ty.type_is_float(node.ty)) {
-        is_float = true;
-    }
-
-    # arithmetic
-    if (op == token.TAG_PLUS) {
-        if (is_float) {
-            ir_op = ir.IROp{ir_fadd: ir.OP_FADD};
-        } or {
-            ir_op = ir.IROp{ir_add: ir.OP_ADD};
-        }
-    }
     if (op == token.TAG_MINUS) {
+        # negation: 0 - value
+        val is_float: bool = inner.ty != nil && ty.type_is_float(inner.ty);
         if (is_float) {
-            ir_op = ir.IROp{ir_fsub: ir.OP_FSUB};
+            val zero: ir.Operand = ir.make_imm(0, size);
+            emit(ctx, ir.OP_FSUB, result, zero, value, ir.CC_NONE);
         } or {
-            ir_op = ir.IROp{ir_sub: ir.OP_SUB};
+            val zero: ir.Operand = ir.make_imm(0, size);
+            emit(ctx, ir.OP_SUB, result, zero, value, ir.CC_NONE);
         }
-    }
-    if (op == token.TAG_STAR) {
-        if (is_float) {
-            ir_op = ir.IROp{ir_fmul: ir.OP_FMUL};
-        } or {
-            ir_op = ir.IROp{ir_mul: ir.OP_MUL};
-        }
-    }
-    if (op == token.TAG_SLASH) {
-        if (is_float) {
-            ir_op = ir.IROp{ir_fdiv: ir.OP_FDIV};
-        } or {
-            if (node.ty != nil && ty.type_is_unsigned(node.ty)) {
-                ir_op = ir.IROp{ir_div: ir.OP_DIVU};
-            } or {
-                ir_op = ir.IROp{ir_div: ir.OP_DIV};
-            }
-        }
-    }
-    if (op == token.TAG_PERCENT) {
-        if (node.ty != nil && ty.type_is_unsigned(node.ty)) {
-            ir_op = ir.IROp{ir_mod: ir.OP_MODU};
-        } or {
-            ir_op = ir.IROp{ir_mod: ir.OP_MOD};
-        }
-    }
-
-    # bitwise
-    if (op == token.TAG_AMP) {
-        ir_op = ir.IROp{ir_and: ir.OP_AND};
-    }
-    if (op == token.TAG_PIPE) {
-        ir_op = ir.IROp{ir_or: ir.OP_OR};
-    }
-    if (op == token.TAG_CARET) {
-        ir_op = ir.IROp{ir_xor: ir.OP_XOR};
-    }
-    if (op == token.TAG_LT_LT) {
-        ir_op = ir.IROp{ir_shl: ir.OP_SHL};
-    }
-    if (op == token.TAG_GT_GT) {
-        if (node.ty != nil && ty.type_is_unsigned(node.ty)) {
-            ir_op = ir.IROp{ir_shr: ir.OP_SHR};
-        } or {
-            ir_op = ir.IROp{ir_sar: ir.OP_SAR};
-        }
-    }
-
-    # comparison (produces 0/1 value via ICMP or FCMP)
-    var cmp_unsigned: bool = false;
-    var cmp_float: bool = false;
-    if (lhs != nil && lhs.ty != nil && ty.type_is_unsigned(lhs.ty)) {
-        cmp_unsigned = true;
-    }
-    if (lhs != nil && lhs.ty != nil && ty.type_is_float(lhs.ty)) {
-        cmp_float = true;
-    }
-
-    if (op == token.TAG_EQ_EQ) {
-        if (cmp_float) {
-            lower_emit_instr(ctx, ir.IROp{ir_fcmp: ir.OP_FCMP}, dst, left_value, right_value, ir.CC_EQ::i32);
-        } or {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_EQ::i32);
-        }
-        ret dst;
-    }
-    if (op == token.TAG_BANG_EQ) {
-        if (cmp_float) {
-            lower_emit_instr(ctx, ir.IROp{ir_fcmp: ir.OP_FCMP}, dst, left_value, right_value, ir.CC_NE::i32);
-        } or {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_NE::i32);
-        }
-        ret dst;
-    }
-    if (op == token.TAG_LT) {
-        if (cmp_float) {
-            lower_emit_instr(ctx, ir.IROp{ir_fcmp: ir.OP_FCMP}, dst, left_value, right_value, ir.CC_B::i32);
-        } or (cmp_unsigned) {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_B::i32);
-        } or {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_LT::i32);
-        }
-        ret dst;
-    }
-    if (op == token.TAG_GT) {
-        if (cmp_float) {
-            lower_emit_instr(ctx, ir.IROp{ir_fcmp: ir.OP_FCMP}, dst, left_value, right_value, ir.CC_A::i32);
-        } or (cmp_unsigned) {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_A::i32);
-        } or {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_GT::i32);
-        }
-        ret dst;
-    }
-    if (op == token.TAG_LT_EQ) {
-        if (cmp_float) {
-            lower_emit_instr(ctx, ir.IROp{ir_fcmp: ir.OP_FCMP}, dst, left_value, right_value, ir.CC_BE::i32);
-        } or (cmp_unsigned) {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_BE::i32);
-        } or {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_LE::i32);
-        }
-        ret dst;
-    }
-    if (op == token.TAG_GT_EQ) {
-        if (cmp_float) {
-            lower_emit_instr(ctx, ir.IROp{ir_fcmp: ir.OP_FCMP}, dst, left_value, right_value, ir.CC_AE::i32);
-        } or (cmp_unsigned) {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_AE::i32);
-        } or {
-            lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, left_value, right_value, ir.CC_GE::i32);
-        }
-        ret dst;
-    }
-
-    # emit ALU instruction
-    ret emit_alu(ctx, ir_op, dst, left_value, right_value, size);
-}
-
-# lower_unary: lower a unary expression.
-# ---
-# ctx:  lowering context
-# node: unary expression node
-# ret:  IRValue containing result
-fun lower_unary(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
-
-    val operand: *ast.Node = node.info.unary_expr.expr;  # unary uses expr for operand
-    val op: u8 = node.tok.tag;
-
-    if (operand == nil) {
-        ret make_none();
-    }
-
-    val value: ir.IRValue = lower_expr(ctx, operand);
-
-    # determine size
-    var size: usize = 8;
-    if (node.ty != nil) {
-        size = node.ty.size;
-    }
-
-    # negation
-    if (op == token.TAG_MINUS) {
-        val zero: ir.IRValue = ir.make_imm(0, size);
-        val dst_reg: i32 = new_vreg(ctx, size);
-        val dst: ir.IRValue = ir.make_reg(dst_reg, size);
-        ret emit_alu(ctx, ir.IROp{ir_sub: ir.OP_SUB}, dst, zero, value, size);
-    }
-
-    # bitwise not
-    if (op == token.TAG_TILDE) {
-        val dst_reg: i32 = new_vreg(ctx, size);
-        val dst: ir.IRValue = ir.make_reg(dst_reg, size);
-        # xor with all 1s to get complement
-        val all_ones: ir.IRValue = ir.make_imm(-1, size);
-        ret emit_alu(ctx, ir.IROp{ir_xor: ir.OP_XOR}, dst, value, all_ones, size);
-    }
-
-    # logical not
-    if (op == token.TAG_BANG) {
-        # icmp: 1 if equal to 0, 0 otherwise
-        val zero: ir.IRValue = ir.make_imm(0, size);
-        ret emit_icmp(ctx, value, zero, ir.CC_EQ, size);
-    }
-
-    ret value;
-}
-
-# lower_call: lower a function call expression.
-# ---
-# ctx:  lowering context
-# node: call expression node
-# ret:  IRValue containing return value
-fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
-
-    val callee: *ast.Node = node.info.call_expr.callee;
-    val args: *ast.List = node.info.call_expr.args;
-
-    if (callee == nil) {
-        ret make_none();
-    }
-
-    # get function name
-    var func_name: str = nil;
-    if (callee.kind == ast.NODE_EXPR_IDENT) {
-        func_name = callee.info.ident_expr.name;
-    } or (callee.kind == ast.NODE_EXPR_FIELD) {
-        func_name = callee.info.field_expr.field;
-    }
-    if (func_name == nil) {
-        ret make_none();
-    }
-
-    # handle variadic builtins: va_start, va_end, va_arg
-    if (ctx.fn_is_variadic && callee.kind == ast.NODE_EXPR_IDENT) {
-        # va_start(ap): initialize va_list fields
-        if (str_equals(func_name, "va_start")) {
-            ret emit_va_start(ctx, args);
-        }
-
-        # va_end(ap): no-op on SysV x86_64
-        if (str_equals(func_name, "va_end")) {
-            ret make_none();
-        }
-
-        # va_arg[T](ap): fetch next argument of type T from va_list
-        if (str_equals(func_name, "va_arg")) {
-            ret emit_va_arg(ctx, args, node.ty);
-        }
-    }
-
-    # resolve call symbol from sema-attached symbol
-    var call_sym: *symbol.Symbol = nil;
-    if (node.symbol != nil) {
-        call_sym = node.symbol::*symbol.Symbol;
-    }
-
-    # fallback: try current module's symbol table
-    if (call_sym == nil && ctx.symbols != nil) {
-        val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, func_name);
-        if (option_is_some[*symbol.Symbol](sym_opt)) {
-            call_sym = option_unwrap[*symbol.Symbol](sym_opt);
-        }
-    }
-
-    # fallback: search imported modules
-    if (call_sym == nil) {
-        call_sym = lookup_symbol_in_imports(ctx, func_name);
-    }
-
-    # use linkage name if symbol was found
-    var is_indirect_call: bool = false;
-    if (call_sym != nil) {
-        val link: str = mangle.linkage_name(call_sym, ctx.alloc);
-        if (link != nil) {
-            func_name = link;
-        }
+    } or (op == token.TAG_BANG) {
+        # logical not: compare with 0
+        emit(ctx, ir.OP_ICMP, result, value, ir.make_imm(0, size), ir.CC_EQ);
+    } or (op == token.TAG_TILDE) {
+        # bitwise not: XOR with all ones
+        emit(ctx, ir.OP_XOR, result, value, ir.make_imm(-1, size), ir.CC_NONE);
     } or {
-        # no symbol found — field access callee might be a function pointer
-        if (callee.kind == ast.NODE_EXPR_FIELD) {
-            is_indirect_call = true;
-        }
-    }
-
-    # lower arguments
-    var arg_count: i32 = 0;
-    if (args != nil) {
-        arg_count = args.count;
-    }
-
-    # determine return type and if we need sret
-    var ret_size: usize = 0;
-    var needs_sret: bool = false;
-    var ret_ty: *ty.Type = node.ty;
-
-    # if node type not resolved (e.g., calls in unanalyzed imported module functions),
-    # try to get return type from the called function's symbol
-    if (ret_ty == nil && call_sym != nil && call_sym.resolved_type != nil) {
-        if (call_sym.resolved_type.kind == ty.TY_FUN && call_sym.resolved_type.ret_type != nil) {
-            ret_ty = call_sym.resolved_type.ret_type;
-        }
-    }
-
-    if (ret_ty != nil) {
-        ret_size = ret_ty.size;
-        if (abi.is_sret_type(?ctx.abi, ret_ty)) {
-            needs_sret = true;
-        }
-    }
-
-    # allocate space for sret buffer if needed
-    var sret_offset: i32 = 0;
-    var sret_ptr: ir.IRValue = ir.make_none();
-    if (needs_sret) {
-        ctx.stack_offset = ctx.stack_offset - ret_size::i32;
-        if (ctx.stack_offset % 8 != 0) {
-            ctx.stack_offset = ctx.stack_offset - (8 - ((-ctx.stack_offset) % 8));
-        }
-        sret_offset = ctx.stack_offset;
-        # LEA address of sret buffer into a register
-        val sret_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        sret_ptr = ir.make_reg(sret_reg, ctx.ptr_size);
-        val sret_mem: ir.IRValue = frame_mem(ctx, sret_offset, ctx.ptr_size);
-        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                      sret_ptr, sret_mem, ir.make_none(), ir.CC_NONE);
-    }
-
-    # allocate array for argument values (+ 1 for sret if needed)
-    var total_args: i32 = arg_count;
-    if (needs_sret) {
-        total_args = total_args + 1;
-    }
-    val args_r: Result[*ir.IRValue, allocator.AllocError] = allocator.allocator_alloc[ir.IRValue](ctx.alloc, total_args::usize);
-    if (result_is_err[*ir.IRValue, allocator.AllocError](args_r)) {
-        ret make_none();
-    }
-
-    val arg_vals: *ir.IRValue = result_unwrap_ok[*ir.IRValue, allocator.AllocError](args_r);
-
-    # first argument is sret pointer if needed
-    var arg_offset: i32 = 0;
-    if (needs_sret) {
-        arg_vals[0] = sret_ptr;
-        arg_offset = 1;
-    }
-
-    var i: i32 = 0;
-    for (i < arg_count) {
-        arg_vals[arg_offset + i] = lower_expr(ctx, args.nodes[i]);
-
-        # large aggregates (records/arrays > ptr_size) are passed by hidden pointer:
-        # take the address of the stack slot instead of loading the value
-        val av: ir.IRValue = arg_vals[arg_offset + i];
-        if (av.kind == ir.VAL_MEM && av.size > ctx.ptr_size) {
-            val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-            val addr_val: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                          addr_val, av, ir.make_none(), ir.CC_NONE);
-            arg_vals[arg_offset + i] = addr_val;
-        }
-
-        i = i + 1;
-    }
-
-    # emit call - for sret, pass 0 ret_size since return is via pointer
-    var call_ret_size: usize = 0;
-    if (!needs_sret) {
-        call_ret_size = ret_size;
-    }
-    var result: ir.IRValue = ir.make_none();
-    if (is_indirect_call) {
-        # load function pointer from field access
-        val fn_ptr: ir.IRValue = lower_expr(ctx, callee);
-        # ensure it's in a register
-        val fn_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val fn_val: ir.IRValue = ir.make_reg(fn_reg, ctx.ptr_size);
-        lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, fn_val, fn_ptr, ir.make_none(), 0);
-        result = call.emit_indirect_call(ctx, fn_val, arg_vals, total_args, call_ret_size);
-    } or {
-        result = call.emit_call(ctx, func_name, arg_vals, total_args, call_ret_size);
-    }
-
-    # clean up argument array
-    allocator.allocator_free[ir.IRValue](ctx.alloc, arg_vals, total_args::usize);
-
-    # for sret, return memory reference to the buffer
-    if (needs_sret) {
-        ret frame_mem(ctx, sret_offset, ret_size);
+        emit_mov(ctx, result, value);
     }
 
     ret result;
 }
 
-# lower_field_access: lower a field access expression.
-# ---
-# ctx:  lowering context
-# node: field access node
-# ret:  IRValue containing field value
-fun lower_field_access(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
+# --- address-of and dereference ---
 
-    val base: *ast.Node = node.info.field_expr.object;
-    val field_name: str = node.info.field_expr.field;
+fun lower_addr(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val inner: *ast.Node = node.info.unary_expr.expr;
+    if (inner == nil) { ret ir.make_none(); }
 
-    if (base == nil || field_name == nil) {
-        ret make_none();
-    }
+    val psz: u8 = ctx.ptr_size;
 
-    # get the base expression's type
-    var base_ty: *ty.Type = base.ty;
+    # compute the address of the inner expression
+    val mem: ir.Operand = lower_lvalue(ctx, inner);
+    if (mem.kind == ir.OPK_NONE) { ret ir.make_none(); }
 
-    # check if base is a local variable — use its lowered type if available
-    var base_is_local: bool = false;
-    if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
-        val base_name: str = base.info.ident_expr.name;
-        if (base_name != nil) {
-            val local_idx: i32 = find_local_var(ctx, base_name);
-            if (local_idx >= 0) {
-                val resolved_bt: *ty.Type = ctx.local_vars[local_idx].ty;
-                if (resolved_bt != nil) {
-                    base_ty = resolved_bt;
-                }
-                base_is_local = true;
-            }
-        }
-    }
-
-    if (base_ty == nil) {
-        if (base_is_local) {
-            ret make_none();
-        }
-
-        # base has no type and is not a local - this might be a module alias access
-        # like c.STDERR_FILENO. Treat field_name as a global symbol reference.
-
-        # look up symbol for linkage name and function detection
-        var global_label: str = field_name;
-        var is_func_sym: bool = false;
-
-        # for module alias access, look up in the specific aliased module first
-        var fa_found: bool = false;
-        if (base.kind == ast.NODE_EXPR_IDENT && ctx.current_sema_mod != nil) {
-            val alias_name: str = base.info.ident_expr.name;
-            if (alias_name != nil) {
-                var fa_ma: *sema.ModuleAlias = ctx.current_sema_mod.aliases;
-                for (fa_ma != nil) {
-                    if (fa_ma.alias != nil && str_equals(fa_ma.alias, alias_name)) {
-                        if (fa_ma.module != nil && fa_ma.module.table != nil) {
-                            val fa_mod_root: *symbol.Scope = symbol.table_root_scope(fa_ma.module.table);
-                            if (fa_mod_root != nil) {
-                                val fa_mod_sym_opt: Option[*symbol.Symbol] = symbol.scope_lookup_local(fa_mod_root, field_name);
-                                if (option_is_some[*symbol.Symbol](fa_mod_sym_opt)) {
-                                    val fa_mod_sym: *symbol.Symbol = option_unwrap[*symbol.Symbol](fa_mod_sym_opt);
-                                    if (fa_mod_sym.kind == symbol.SYM_FUN) {
-                                        is_func_sym = true;
-                                    }
-                                    val fa_mod_link: str = mangle.linkage_name(fa_mod_sym, ctx.alloc);
-                                    if (fa_mod_link != nil) {
-                                        global_label = fa_mod_link;
-                                    }
-                                    fa_found = true;
-                                }
-                            }
-                        }
-                    }
-                    fa_ma = fa_ma.next;
-                }
-            }
-        }
-
-        # search current module and imports
-        if (!fa_found && ctx.symbols != nil) {
-            val fa_sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, field_name);
-            if (option_is_some[*symbol.Symbol](fa_sym_opt)) {
-                val fa_sym: *symbol.Symbol = option_unwrap[*symbol.Symbol](fa_sym_opt);
-                if (fa_sym.kind == symbol.SYM_FUN) {
-                    is_func_sym = true;
-                }
-                val fa_link: str = mangle.linkage_name(fa_sym, ctx.alloc);
-                if (fa_link != nil) {
-                    global_label = fa_link;
-                    fa_found = true;
-                }
-            }
-            if (!fa_found) {
-                val fa_imp_sym: *symbol.Symbol = lookup_symbol_in_imports(ctx, field_name);
-                if (fa_imp_sym != nil) {
-                    if (fa_imp_sym.kind == symbol.SYM_FUN) {
-                        is_func_sym = true;
-                    }
-                    val fa_imp_link: str = mangle.linkage_name(fa_imp_sym, ctx.alloc);
-                    if (fa_imp_link != nil) {
-                        global_label = fa_imp_link;
-                        fa_found = true;
-                    }
-                }
-            }
-        }
-
-        # if no symbol was found, this is an unresolved field access — report error
-        if (!fa_found) {
-            report_lower_error(ctx, node.tok, field_name);
-            ret make_none();
-        }
-
-        var v: ir.IRValue = ir.make_label(global_label);
-        v.size = ctx.ptr_size;
-
-        # determine size from node type if available
-        var sym_size: usize = ctx.ptr_size;
-        if (node.ty != nil) {
-            sym_size = node.ty.size;
-        }
-
-        # load address into register
-        val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                      addr, v, ir.make_none(), ir.CC_NONE);
-
-        # check if this is an aggregate type or function
-        val var_ty: *ty.Type = node.ty;
-        val is_aggregate: bool = var_ty != nil && (var_ty.kind == ty.TY_RECORD ||
-                                                    var_ty.kind == ty.TY_ARRAY ||
-                                                    var_ty.kind == ty.TY_UNION);
-        if (is_aggregate || is_func_sym || sym_size > 8) {
-            ret addr;
-        }
-
-        # scalar: load value from address
-        val mem: ir.IRValue = ir.make_mem(addr_reg, -1, 1, 0, sym_size);
-        ret emit_load(ctx, mem, sym_size);
-    }
-
-    # if pointer, dereference to get struct type
-    var struct_ty: *ty.Type = base_ty;
-    var is_pointer: bool = false;
-    if (base_ty.kind == ty.TY_POINTER && base_ty.inner != nil) {
-        struct_ty = base_ty.inner;
-        is_pointer = true;
-    }
-
-    var base_value: ir.IRValue = lower_expr(ctx, base);
-
-    # look up field by name
-    val field_opt: Option[*ty.Field] = ty.get_field(struct_ty, field_name);
-    if (option_is_none[*ty.Field](field_opt)) {
-        ret make_none();
-    }
-    val field: *ty.Field = option_unwrap[*ty.Field](field_opt);
-
-    # get field offset and size from type system
-    val field_offset: i32 = field.offset::i32;
-    var field_size: usize = ctx.ptr_size;
-    var effective_field_ty: *ty.Type = field.ty;
-    if (effective_field_ty != nil && effective_field_ty.size > 0) {
-        field_size = effective_field_ty.size;
-    }
-
-    var field_is_aggregate: bool = effective_field_ty != nil &&
-        (effective_field_ty.kind == ty.TY_RECORD || effective_field_ty.kind == ty.TY_UNION ||
-         effective_field_ty.kind == ty.TY_ARRAY);
-
-    # compute field address based on base_value kind and pointer vs direct access
-    if (is_pointer) {
-        # pointer field access: need the pointer value as base
-        if (base_value.kind == ir.VAL_REG) {
-            # base_value is already a register containing the pointer value
-            val mem: ir.IRValue = ir.make_mem(base_value.reg, -1, 1, field_offset::i64, field_size);
-            if (field_is_aggregate) {
-                ret mem;
-            }
-            ret emit_load(ctx, mem, field_size);
-        } or {
-            if (base_value.kind == ir.VAL_MEM) {
-                # base_value is memory operand - load the pointer value first
-                val ptr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-                val ptr_val: ir.IRValue = ir.make_reg(ptr_reg, ctx.ptr_size);
-                lower_emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, ptr_val, base_value, ir.make_none(), 0);
-                val mem: ir.IRValue = ir.make_mem(ptr_reg, -1, 1, field_offset::i64, field_size);
-                if (field_is_aggregate) {
-                    ret mem;
-                }
-                ret emit_load(ctx, mem, field_size);
-            }
-        }
-    } or {
-        # direct struct access (not through pointer)
-        if (base_value.kind == ir.VAL_REG) {
-            # base_value is register containing address of struct (LEA result)
-            val mem: ir.IRValue = ir.make_mem(base_value.reg, -1, 1, field_offset::i64, field_size);
-            if (field_is_aggregate) {
-                ret mem;
-            }
-            ret emit_load(ctx, mem, field_size);
-        } or {
-            if (base_value.kind == ir.VAL_MEM) {
-                # base_value is memory operand (struct on stack) - adjust displacement
-                val mem: ir.IRValue = ir.make_mem(base_value.base_reg, base_value.index_reg,
-                                                   base_value.scale, base_value.offset + field_offset::i64, field_size);
-                if (field_is_aggregate) {
-                    ret mem;
-                }
-                ret emit_load(ctx, mem, field_size);
-            }
-        }
-    }
-
-    report_lower_error(ctx, node.tok, field_name);
-    ret make_none();
+    val result: ir.Operand = new_vreg(ctx, psz);
+    emit(ctx, ir.OP_ADDR, result, mem, ir.make_none(), ir.CC_NONE);
+    ret result;
 }
 
-# lower_index: lower an array index expression.
-# ---
-# ctx:  lowering context
-# node: index expression node
-# ret:  IRValue containing element value
-fun lower_index(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
+fun lower_deref(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val inner: *ast.Node = node.info.unary_expr.expr;
+    if (inner == nil) { ret ir.make_none(); }
 
-    val base: *ast.Node = node.info.index_expr.base;
-    val index: *ast.Node = node.info.index_expr.index;
+    val ptr: ir.Operand = lower_expr(ctx, inner);
+    if (ptr.kind == ir.OPK_NONE) { ret ir.make_none(); }
 
-    if (base == nil || index == nil) {
-        ret make_none();
-    }
-
-    # lower index and extend to pointer size if needed
-    val raw_index: ir.IRValue = lower_expr(ctx, index);
-    var index_value: ir.IRValue = raw_index;
-    val index_ty: *ty.Type = index.ty;
-    if (index_ty != nil && index_ty.size < ctx.ptr_size) {
-        val ext_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val ext_val: ir.IRValue = ir.make_reg(ext_reg, ctx.ptr_size);
-        if (ty.type_is_signed(index_ty)) {
-            lower_emit_instr(ctx, ir.IROp{ir_sext: ir.OP_SEXT}, ext_val, raw_index, ir.make_none(), 0);
-        } or {
-            lower_emit_instr(ctx, ir.IROp{ir_zext: ir.OP_ZEXT}, ext_val, raw_index, ir.make_none(), 0);
-        }
-        index_value = ext_val;
-    }
-
-    # lower base
-    var base_value: ir.IRValue = lower_expr(ctx, base);
-    var base_ty: *ty.Type = base.ty;
-
-    # fall back to local_vars type table if node type is nil
-    if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
-        val idx_base_name: str = base.info.ident_expr.name;
-        if (idx_base_name != nil) {
-            val idx_local: i32 = find_local_var(ctx, idx_base_name);
-            if (idx_local >= 0) {
-                base_ty = ctx.local_vars[idx_local].ty;
-            }
-            # fall back to symbol table for global variables
-            if (base_ty == nil && ctx.symbols != nil) {
-                val idx_sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, idx_base_name);
-                if (option_is_some[*symbol.Symbol](idx_sym_opt)) {
-                    val idx_sym: *symbol.Symbol = option_unwrap[*symbol.Symbol](idx_sym_opt);
-                    if (idx_sym.resolved_type != nil) {
-                        base_ty = idx_sym.resolved_type;
-                    }
-                }
-                if (base_ty == nil) {
-                    val idx_imp_sym: *symbol.Symbol = lookup_symbol_in_imports(ctx, idx_base_name);
-                    if (idx_imp_sym != nil && idx_imp_sym.resolved_type != nil) {
-                        base_ty = idx_imp_sym.resolved_type;
-                    }
-                }
-            }
-        }
-    }
-
-    if (base_value.kind == ir.VAL_MEM) {
-        if (base_ty != nil && base_ty.kind == ty.TY_POINTER) {
-            # load pointer value from memory
-            base_value = emit_load(ctx, base_value, ctx.ptr_size);
-        }
-    }
-
-    # calculate element address: base + index * elem_size
-    var elem_size: usize = ctx.ptr_size;
-    var elem_type: *ty.Type = nil;
-    if (base_ty != nil) {
-        if (base_ty.kind == ty.TY_ARRAY && base_ty.inner != nil) {
-            elem_type = base_ty.inner;
-            elem_size = base_ty.inner.size;
-        } or (base_ty.kind == ty.TY_POINTER && base_ty.inner != nil) {
-            elem_type = base_ty.inner;
-            elem_size = base_ty.inner.size;
-        }
-    }
-
-    # check if element type is aggregate (record/union/array) — return address, not value
-    val elem_is_aggregate: bool = elem_type != nil &&
-        (elem_type.kind == ty.TY_RECORD || elem_type.kind == ty.TY_UNION ||
-         elem_type.kind == ty.TY_ARRAY);
-
-    if (index_value.kind == ir.VAL_IMM) {
-        val idx_offset: i64 = index_value.imm * elem_size::i64;
-        var addr: ir.IRValue;
-        if (base_value.kind == ir.VAL_MEM) {
-            addr = ir.make_mem(base_value.base_reg, base_value.index_reg,
-                               base_value.scale, base_value.offset + idx_offset, elem_size);
-        } or {
-            # VAL_REG: register contains pointer/address
-            addr = ir.make_mem(base_value.reg, -1, 1, idx_offset, elem_size);
-        }
-        if (elem_is_aggregate) {
-            ret addr;
-        }
-        ret emit_load(ctx, addr, elem_size);
-    }
-
-    # ensure base_value is in a register (LEA for VAL_MEM arrays)
-    val idx_needs_lea: bool = base_value.kind == ir.VAL_MEM;
-    var idx_lea_reg: i32 = 0;
-    if (idx_needs_lea) {
-        idx_lea_reg = new_vreg(ctx, ctx.ptr_size);
-        val idx_lea_dst: ir.IRValue = ir.make_reg(idx_lea_reg, ctx.ptr_size);
-        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                      idx_lea_dst, base_value, ir.make_none(), ir.CC_NONE);
-    }
-
-    val elem_size_value: ir.IRValue = ir.make_imm(elem_size::i64, ctx.ptr_size);
-    val offset_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val offset: ir.IRValue = ir.make_reg(offset_reg, ctx.ptr_size);
-    emit_alu(ctx, ir.IROp{ir_mul: ir.OP_MUL}, offset, index_value, elem_size_value, ctx.ptr_size);
-
-    val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-    if (idx_needs_lea) {
-        val idx_lea_src: ir.IRValue = ir.make_reg(idx_lea_reg, ctx.ptr_size);
-        emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, idx_lea_src, offset, ctx.ptr_size);
-    } or {
-        emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, base_value, offset, ctx.ptr_size);
-    }
-
-    # aggregate elements: return memory operand (address) for further field access
-    if (elem_is_aggregate) {
-        ret ir.make_mem(addr_reg, -1, 1, 0, elem_size);
-    }
-
-    # scalar elements: load value
-    ret emit_load(ctx, addr, elem_size);
+    val size: u8 = expr_size(ctx, node);
+    val result: ir.Operand = new_vreg(ctx, size);
+    emit_load(ctx, result, ptr);
+    ret result;
 }
 
-# lower_cast: lower a type cast expression.
-# ---
-# ctx:  lowering context
-# node: cast expression node
-# ret:  IRValue containing casted value
-fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
+fun lower_deref_lvalue(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val inner: *ast.Node = node.info.unary_expr.expr;
+    if (inner == nil) { ret ir.make_none(); }
 
-    val op_node: *ast.Node = node.info.cast_expr.expr;
-    if (op_node == nil) {
-        ret make_none();
-    }
-
-    var src_ty: *ty.Type = op_node.ty;
-    val dst_ty: *ty.Type = node.ty;
-
-    # resolve source type from local vars if not set on the node
-    if (src_ty == nil && op_node.kind == ast.NODE_EXPR_IDENT) {
-        val src_name: str = op_node.info.ident_expr.name;
-        if (src_name != nil) {
-            val src_idx: i32 = find_local_var(ctx, src_name);
-            if (src_idx >= 0) {
-                src_ty = ctx.local_vars[src_idx].ty;
-            }
-        }
-    }
-
-    # array to pointer casts should use the array address
-    if (src_ty != nil && src_ty.kind == ty.TY_ARRAY &&
-        dst_ty != nil && dst_ty.kind == ty.TY_POINTER) {
-        ret lower_lvalue(ctx, op_node);
-    }
-
-    val value: ir.IRValue = lower_expr(ctx, op_node);
-
-    # determine target size
-    var target_size: usize = 8;
-    if (node.ty != nil) {
-        target_size = node.ty.size;
-    }
-
-    # aggregate-to-scalar cast: load the value from the aggregate address
-    if (src_ty != nil && (src_ty.kind == ty.TY_RECORD || src_ty.kind == ty.TY_UNION)) {
-        if (dst_ty == nil || (dst_ty.kind != ty.TY_RECORD && dst_ty.kind != ty.TY_UNION)) {
-            if (value.kind == ir.VAL_REG) {
-                # value is an address (from LEA); load the scalar value from it
-                val agg_mem: ir.IRValue = ir.make_mem(value.reg, -1, 1, 0, target_size);
-                ret emit_load(ctx, agg_mem, target_size);
-            }
-            if (value.kind == ir.VAL_MEM) {
-                # value is already a memory reference; load from it with target size
-                var load_mem: ir.IRValue = value;
-                load_mem.size = target_size;
-                ret emit_load(ctx, load_mem, target_size);
-            }
-        }
-    }
-
-    val dst_reg: i32 = new_vreg(ctx, target_size);
-    val dst: ir.IRValue = ir.make_reg(dst_reg, target_size);
-
-    # float conversion: handle before integer widening/narrowing
-    val src_is_float: bool = src_ty != nil && ty.type_is_float(src_ty);
-    val dst_is_float: bool = dst_ty != nil && ty.type_is_float(dst_ty);
-
-    if (src_is_float && dst_is_float) {
-        # float-to-float: extend or truncate
-        if (src_ty.size < dst_ty.size) {
-            lower_emit_instr(ctx, ir.IROp{ir_fext: ir.OP_FEXT}, dst, value, ir.make_none(), 0);
-        } or {
-            lower_emit_instr(ctx, ir.IROp{ir_ftrunc: ir.OP_FTRUNC}, dst, value, ir.make_none(), 0);
-        }
-        ret dst;
-    }
-    if (!src_is_float && dst_is_float) {
-        # int-to-float
-        lower_emit_instr(ctx, ir.IROp{ir_itof: ir.OP_ITOF}, dst, value, ir.make_none(), 0);
-        ret dst;
-    }
-    if (src_is_float && !dst_is_float) {
-        # float-to-int
-        lower_emit_instr(ctx, ir.IROp{ir_ftoi: ir.OP_FTOI}, dst, value, ir.make_none(), 0);
-        ret dst;
-    }
-
-    # determine source size
-    var src_size: usize = 8;
-    if (src_ty != nil && src_ty.size > 0) {
-        src_size = src_ty.size;
-    }
-
-    if (src_size < target_size && src_ty != nil && dst_ty != nil
-        && ty.type_is_signed(src_ty) && ty.type_is_signed(dst_ty)) {
-        # signed -> signed widening: sign-extend to preserve numeric value
-        lower_emit_instr(ctx, ir.IROp{ir_sext: ir.OP_SEXT}, dst, value, ir.make_none(), 0);
-    } or (src_size < target_size) {
-        # all other widening: zero-extend (bitcast semantics)
-        lower_emit_instr(ctx, ir.IROp{ir_zext: ir.OP_ZEXT}, dst, value, ir.make_none(), 0);
-    } or {
-        # same size or narrowing: move
-        emit_mov(ctx, dst, value, target_size);
-    }
-
-    ret dst;
+    # the pointer value IS the address of the lvalue
+    ret lower_expr(ctx, inner);
 }
 
-# lower_addr: lower an address-of expression.
-# ---
-# ctx:  lowering context
-# node: address-of node
-# ret:  IRValue containing address
-fun lower_addr(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret ir.make_imm(0, ctx.ptr_size);
-    }
+# --- function calls ---
 
-    val operand: *ast.Node = node.info.unary_expr.expr;
-    if (operand == nil) {
-        ret ir.make_imm(0, ctx.ptr_size);
-    }
+fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val callee: *ast.Node = node.info.call_expr.callee;
+    val arg_list: *ast.List = node.info.call_expr.args;
+    if (callee == nil) { ret ir.make_none(); }
 
-    # get lvalue memory reference
-    val mem: ir.IRValue = lower_lvalue(ctx, operand);
+    # resolve callee name
+    val callee_name: str = resolve_callee_name(ctx, callee, node);
+    if (callee_name == nil) { ret ir.make_none(); }
 
-    # if lvalue is a memory reference, emit LEA to compute the address as a value
-    if (mem.kind == ir.VAL_MEM) {
-        val result_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val result: ir.IRValue = ir.make_reg(result_reg, ctx.ptr_size);
-        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                      result, mem, ir.make_none(), ir.CC_NONE);
-        ret result;
-    }
+    # determine argument count
+    var arg_count: i32 = 0;
+    if (arg_list != nil) { arg_count = arg_list.count; }
 
-    # for labels or other kinds, return as-is (address is the label itself)
-    ret mem;
-}
+    # lower arguments
+    var args: *ir.Operand = nil;
+    var arg_types: **ty.Type = nil;
 
-# lower_deref: lower a dereference expression.
-# ---
-# ctx:  lowering context
-# node: dereference node
-# ret:  IRValue containing dereferenced value
-fun lower_deref(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
-
-    val op_node: *ast.Node = node.info.unary_expr.expr;
-    if (op_node == nil) {
-        ret make_none();
-    }
-
-    # lower operand to get pointer
-    val ptr: ir.IRValue = lower_expr(ctx, op_node);
-
-    # load from pointer
-    # determine size from result type or pointed-to type
-    var size: usize = ctx.ptr_size;
-    if (node.ty != nil) {
-        size = node.ty.size;
-    } or {
-        # fallback: get from operand's pointed-to type
-        var ptr_ty: *ty.Type = op_node.ty;
-        # if operand type is nil, try local variable lookup
-        if (ptr_ty == nil && op_node.kind == ast.NODE_EXPR_IDENT) {
-            val deref_name: str = op_node.info.ident_expr.name;
-            if (deref_name != nil) {
-                val deref_idx: i32 = find_local_var(ctx, deref_name);
-                if (deref_idx >= 0) {
-                    ptr_ty = ctx.local_vars[deref_idx].ty;
-                }
-            }
+    if (arg_count > 0) {
+        val args_r: Result[*ir.Operand, allocator.AllocError] =
+            allocator.allocator_zalloc[ir.Operand](ctx.alloc, arg_count::usize);
+        if (result_is_err[*ir.Operand, allocator.AllocError](args_r)) {
+            ret ir.make_none();
         }
-        if (ptr_ty != nil && ptr_ty.kind == ty.TY_POINTER && ptr_ty.inner != nil) {
-            size = ptr_ty.inner.size;
+        args = result_unwrap_ok[*ir.Operand, allocator.AllocError](args_r);
+
+        val types_r: Result[**ty.Type, allocator.AllocError] =
+            allocator.allocator_zalloc[*ty.Type](ctx.alloc, arg_count::usize);
+        if (result_is_err[**ty.Type, allocator.AllocError](types_r)) {
+            ret ir.make_none();
         }
-    }
+        arg_types = result_unwrap_ok[**ty.Type, allocator.AllocError](types_r);
 
-    ret emit_load(ctx, ptr, size);
-}
-
-# lower_try: lower a try expression (unwrap Result/Option).
-# ---
-# ctx:  lowering context
-# node: try expression node
-# ret:  IRValue containing unwrapped value or error return
-fun lower_try(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
-
-    val operand: *ast.Node = node.info.unary_expr.expr;
-    if (operand == nil) {
-        ret make_none();
-    }
-
-    # lower the operand
-    val value: ir.IRValue = lower_expr(ctx, operand);
-
-    # TODO: check if result is error, and if so, return early
-    # this requires type information about the Result/Option
-
-    ret value;
-}
-
-# lower_array_lit: lower an array literal expression.
-# ---
-# ctx:  lowering context
-# node: array literal node
-# ret:  IRValue containing array address
-fun lower_array_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret ir.make_imm(0, ctx.ptr_size);
-    }
-
-    # elements are stored in array_lit.elements
-    val elements: *ast.List = node.info.array_lit.elements;
-    if (elements == nil) {
-        ret ir.make_imm(0, ctx.ptr_size);
-    }
-
-    val elem_count: i32 = elements.count;
-    if (elem_count == 0) {
-        ret ir.make_imm(0, ctx.ptr_size);
-    }
-
-    # allocate stack space for array
-    var elem_size: usize = ctx.ptr_size;
-    val arr_ty: *ty.Type = node.ty;
-    if (arr_ty != nil && arr_ty.kind == ty.TY_ARRAY && arr_ty.inner != nil) {
-        elem_size = arr_ty.inner.size;
-    }
-    val array_size: usize = elem_count::usize * elem_size;
-
-    # allocate stack space
-    ctx.stack_offset = ctx.stack_offset - array_size::i32;
-    val array_offset: i32 = ctx.stack_offset;
-
-    # emit initializers
-    var i: i32 = 0;
-    for (i < elem_count) {
-        val elem_value: ir.IRValue = lower_expr(ctx, elements.nodes[i]);
-        val elem_addr: ir.IRValue = frame_mem(ctx, array_offset + i::i32 * elem_size::i32, elem_size);
-        emit_store(ctx, elem_addr, elem_value);
-        i = i + 1;
-    }
-
-    # return address of array
-    val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-
-    # compute array address from frame pointer
-    var instr: ir.Instr;
-    instr.op = ir.IROp{ir_lea: ir.OP_LEA};
-    instr.dst = addr;
-    # frame_mem gives us an address relative to FP
-    val fp_addr: ir.IRValue = frame_mem(ctx, array_offset, ctx.ptr_size);
-    instr.src1 = fp_addr;
-    instr.src2 = ir.make_none();
-    instr.cond = ir.CC_NONE;
-
-    ir.emit_instr(ctx.alloc, ctx.current_block, instr.op, instr.dst, instr.src1, instr.src2, instr.cond);
-
-    ret addr;
-}
-
-# lower_struct_lit: lower a struct literal expression.
-# ---
-# ctx:  lowering context
-# node: struct literal node
-# ret:  IRValue containing struct address (for large structs) or value
-fun lower_struct_lit(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret make_none();
-    }
-
-    # get struct type - try node.ty first, fall back to type annotation in struct_lit.type_node
-    var struct_ty: *ty.Type = node.ty;
-    if (struct_ty == nil) {
-        val slit_type_node: *ast.Node = node.info.struct_lit.type_node;
-        if (slit_type_node != nil) {
-            val type_name: str = slit_type_node.info.type_name.path;
-            if (type_name != nil) {
-                # look up in current module symbols
-                var type_sym: *symbol.Symbol = nil;
-                if (ctx.symbols != nil) {
-                    val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, type_name);
-                    if (option_is_some[*symbol.Symbol](sym_opt)) {
-                        type_sym = option_unwrap[*symbol.Symbol](sym_opt);
-                    }
-                }
-                if (type_sym == nil) {
-                    type_sym = lookup_symbol_in_imports(ctx, type_name);
-                }
-                if (type_sym != nil && type_sym.resolved_type != nil) {
-                    struct_ty = type_sym.resolved_type;
-                }
-            }
-        }
-    }
-    if (struct_ty == nil) {
-        ret make_none();
-    }
-    if (struct_ty.kind != ty.TY_RECORD && struct_ty.kind != ty.TY_UNION) {
-        ret make_none();
-    }
-
-    # allocate stack space for struct
-    ctx.stack_offset = ctx.stack_offset - struct_ty.size::i32;
-
-    # align to pointer size
-    val align: i32 = ctx.ptr_size::i32;
-    if (align > 1) {
-        val abs_offset: i32 = -ctx.stack_offset;
-        val remainder: i32 = abs_offset % align;
-        if (remainder != 0) {
-            ctx.stack_offset = ctx.stack_offset - (align - remainder);
-        }
-    }
-
-    val base_offset: i32 = ctx.stack_offset;
-
-    # get field initializers from struct_lit.fields
-    val fields: *ast.List = node.info.struct_lit.fields;
-    if (fields != nil && fields.count > 0) {
         var i: i32 = 0;
-        for (i < fields.count) {
-            val field_node: *ast.Node = fields.nodes[i];
-            if (field_node == nil) {
-                i = i + 1;
-                cnt;
+        for (i < arg_count) {
+            val arg: *ast.Node = arg_list.nodes[i];
+            if (arg != nil) {
+                args[i] = lower_expr(ctx, arg);
+                arg_types[i] = arg.ty;
             }
-
-            # field name from field_decl.name, init expr from field_decl.type_node
-            val field_name: str = field_node.info.field_decl.name;
-            val init_expr: *ast.Node = field_node.info.field_decl.type_node;
-
-            if (field_name == nil || init_expr == nil) {
-                i = i + 1;
-                cnt;
-            }
-
-            # look up field info from type
-            var field_offset: usize = 0;
-            var field_ty: *ty.Type = nil;
-
-            if (struct_ty.kind == ty.TY_RECORD) {
-                val field_opt: Option[*ty.Field] = ty.get_field(struct_ty, field_name);
-                if (option_is_some[*ty.Field](field_opt)) {
-                    val field: *ty.Field = option_unwrap[*ty.Field](field_opt);
-                    field_offset = field.offset;
-                    field_ty = field.ty;
-                }
-            } or {
-                # union: all variants at offset 0
-                val field_opt: Option[*ty.Field] = ty.get_field(struct_ty, field_name);
-                if (option_is_some[*ty.Field](field_opt)) {
-                    val field: *ty.Field = option_unwrap[*ty.Field](field_opt);
-                    field_ty = field.ty;
-                }
-                field_offset = 0;
-            }
-
-            if (field_ty == nil) {
-                i = i + 1;
-                cnt;
-            }
-
-            # lower init expression
-            val init_value: ir.IRValue = lower_expr(ctx, init_expr);
-
-            # compute destination address
-            val dest_disp: i32 = base_offset + field_offset::i32;
-
-            # check if aggregate field needing memcpy
-            val is_agg: bool = field_ty.kind == ty.TY_RECORD ||
-                               field_ty.kind == ty.TY_UNION ||
-                               field_ty.kind == ty.TY_ARRAY;
-
-            if (is_agg && field_ty.size > ctx.ptr_size) {
-                # aggregate copy: load source address, copy bytes
-                val fsize: usize = field_ty.size;
-                if (fsize > 0) {
-                    # get source pointer
-                    var src_ptr: ir.IRValue;
-                    if (init_value.kind == ir.VAL_MEM) {
-                        # LEA to get address
-                        val src_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-                        src_ptr = ir.make_reg(src_reg, ctx.ptr_size);
-                        lower_emit_instr(ctx, ir.IROp{ir_lea: ir.OP_LEA}, src_ptr, init_value, ir.make_none(), 0);
-                    } or {
-                        src_ptr = init_value;
-                    }
-
-                    # get dest pointer
-                    val dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-                    val dst_ptr: ir.IRValue = ir.make_reg(dst_reg, ctx.ptr_size);
-                    val dst_addr: ir.IRValue = frame_mem(ctx, dest_disp, ctx.ptr_size);
-                    lower_emit_instr(ctx, ir.IROp{ir_lea: ir.OP_LEA}, dst_ptr, dst_addr, ir.make_none(), 0);
-
-                    emit_aggregate_copy(ctx, dst_ptr.reg, src_ptr.reg, fsize);
-                }
-            } or {
-                # simple scalar store
-                val dest: ir.IRValue = frame_mem(ctx, dest_disp, field_ty.size);
-                emit_store(ctx, dest, init_value);
-            }
-
             i = i + 1;
         }
     }
 
-    ret frame_mem(ctx, base_offset, struct_ty.size);
+    # determine return type and variadic status
+    val ret_type: *ty.Type = node.ty;
+    var is_variadic: bool = false;
+
+    # check if callee is variadic via its type
+    val callee_type: *ty.Type = callee.ty;
+    if (callee_type != nil && ty.type_is_function(callee_type)) {
+        # function type — check variadic flag via the callee's symbol
+        val sym: *symbol.Symbol = node.symbol::*symbol.Symbol;
+        if (sym != nil && sym.decl_node != nil) {
+            if (sym.decl_node.kind == ast.NODE_DECL_FUN) {
+                is_variadic = sym.decl_node.info.fun_decl.is_variadic;
+            }
+        }
+    }
+
+    ret lcall.emit_call(ctx, callee_name, args, arg_types,
+                        arg_count, ret_type, is_variadic);
 }
 
-# lower_lvalue: get the address of an lvalue expression.
-# ---
-# ctx:  lowering context
-# node: lvalue node (identifier, field access, index, deref)
-# ret:  IRValue containing address
-pub fun lower_lvalue(ctx: *LowerContext, node: *ast.Node) ir.IRValue {
-    if (ctx == nil || node == nil) {
-        ret ir.make_imm(0, ctx.ptr_size);
+# --- field access ---
+
+fun lower_field(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val obj: *ast.Node = node.info.field_expr.object;
+    val field_name: str = node.info.field_expr.field;
+    if (obj == nil || field_name == nil) { ret ir.make_none(); }
+
+    val mem: ir.Operand = lower_field_lvalue(ctx, node);
+    if (mem.kind == ir.OPK_NONE) { ret ir.make_none(); }
+
+    val size: u8 = expr_size(ctx, node);
+    val result: ir.Operand = new_vreg(ctx, size);
+    emit_load(ctx, result, mem);
+    ret result;
+}
+
+fun lower_field_lvalue(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val obj: *ast.Node = node.info.field_expr.object;
+    val field_name: str = node.info.field_expr.field;
+    if (obj == nil || field_name == nil) { ret ir.make_none(); }
+
+    val psz: u8 = ctx.ptr_size;
+
+    # get the object type
+    val obj_type: *ty.Type = obj.ty;
+    if (obj_type == nil) { ret ir.make_none(); }
+
+    # if the object is a pointer, we need to dereference it first
+    var struct_type: *ty.Type = obj_type;
+    var is_ptr: bool = false;
+    if (ty.type_is_pointer(obj_type) || obj_type.kind == ty.TY_PTR) {
+        struct_type = ty.get_element_type(obj_type);
+        is_ptr = true;
     }
 
-    # identifier - local or global variable
-    if (node.kind == ast.NODE_EXPR_IDENT) {
-        val name: str = node.info.ident_expr.name;
-        if (name == nil) {
-            ret ir.make_imm(0, ctx.ptr_size);
-        }
+    if (struct_type == nil) { ret ir.make_none(); }
 
-        # check locals
-        val local_idx: i32 = find_local_var(ctx, name);
-        if (local_idx >= 0) {
-            val offset: i32 = get_local_var_offset(ctx, local_idx);
-            val size: usize = ctx.local_vars[local_idx].size;
-            ret frame_mem(ctx, offset, size);
-        }
+    # look up field offset
+    val field_opt: Option[*ty.Field] = ty.get_field(struct_type, field_name);
+    if (!option_is_some[*ty.Field](field_opt)) { ret ir.make_none(); }
+    val field: *ty.Field = option_unwrap[*ty.Field](field_opt);
 
-        # global variable - look up symbol for linkage name
-        var lv_label: str = name;
-        if (ctx.symbols != nil) {
-            val lv_sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, name);
-            if (option_is_some[*symbol.Symbol](lv_sym_opt)) {
-                val lv_sym: *symbol.Symbol = option_unwrap[*symbol.Symbol](lv_sym_opt);
-                val lv_link: str = mangle.linkage_name(lv_sym, ctx.alloc);
-                if (lv_link != nil) {
-                    lv_label = lv_link;
-                }
-            }
-            if (lv_label == name) {
-                val lv_imp_sym: *symbol.Symbol = lookup_symbol_in_imports(ctx, name);
-                if (lv_imp_sym != nil) {
-                    val lv_imp_link: str = mangle.linkage_name(lv_imp_sym, ctx.alloc);
-                    if (lv_imp_link != nil) {
-                        lv_label = lv_imp_link;
-                    }
-                }
-            }
-        }
+    val field_offset: i64 = field.offset::i64;
+    val field_size: u8 = ty.type_size(field.ty)::u8;
 
-        var v: ir.IRValue = ir.make_label(lv_label);
-        v.size = ctx.ptr_size;
-        ret v;
-    }
+    if (is_ptr) {
+        # pointer to struct: load pointer, then add field offset
+        val base: ir.Operand = lower_expr(ctx, obj);
+        if (base.kind == ir.OPK_NONE) { ret ir.make_none(); }
 
-    # field access - base address + field offset
-    if (node.kind == ast.NODE_EXPR_FIELD) {
-        val base: *ast.Node = node.info.field_expr.object;
-        val field_name: str = node.info.field_expr.field;
-
-        if (base == nil || field_name == nil) {
-            ret ir.make_imm(0, ctx.ptr_size);
-        }
-
-        # resolve type and field info FIRST (before deciding lvalue vs expr)
-        var field_offset: usize = 0;
-        var field_size: usize = ctx.ptr_size;
-        var base_ty: *ty.Type = base.ty;
-        if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
-            val base_name: str = base.info.ident_expr.name;
-            if (base_name != nil) {
-                val local_idx: i32 = find_local_var(ctx, base_name);
-                if (local_idx >= 0) {
-                    val resolved_bt: *ty.Type = ctx.local_vars[local_idx].ty;
-                    if (resolved_bt != nil) {
-                        base_ty = resolved_bt;
-                    }
-                }
-            }
-        }
-        var is_pointer: bool = false;
-        if (base_ty != nil) {
-            var struct_ty: *ty.Type = base_ty;
-            if (base_ty.kind == ty.TY_POINTER && base_ty.inner != nil) {
-                struct_ty = base_ty.inner;
-                is_pointer = true;
-            }
-            val field_opt: Option[*ty.Field] = ty.get_field(struct_ty, field_name);
-            if (option_is_some[*ty.Field](field_opt)) {
-                val field: *ty.Field = option_unwrap[*ty.Field](field_opt);
-                field_offset = field.offset;
-                var lv_eff_ft: *ty.Type = field.ty;
-                if (lv_eff_ft == nil && node.ty != nil) {
-                    lv_eff_ft = node.ty;
-                }
-                if (lv_eff_ft != nil && lv_eff_ft.size > 0) {
-                    field_size = lv_eff_ft.size;
-                }
-            }
-        }
-
-        # for non-lvalue base expressions (CALL, CAST) returning pointer types,
-        # use lower_expr to get the pointer value directly — lower_lvalue would
-        # return imm(0) since CALL nodes don't have addressable storage
-        if (base.kind == ast.NODE_EXPR_CALL && is_pointer) {
-            val base_val: ir.IRValue = lower_expr(ctx, base);
-            if (base_val.kind == ir.VAL_REG) {
-                ret ir.make_mem(base_val.reg, -1, 1, field_offset::i64, field_size);
-            }
-            if (base_val.kind == ir.VAL_MEM) {
-                val lv_ptr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-                val lv_ptr_val: ir.IRValue = ir.make_reg(lv_ptr_reg, ctx.ptr_size);
-                lower_emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, lv_ptr_val, base_val, ir.make_none(), 0);
-                ret ir.make_mem(lv_ptr_reg, -1, 1, field_offset::i64, field_size);
-            }
-        }
-
-        val base_addr: ir.IRValue = lower_lvalue(ctx, base);
-
-        # handle pointer field access - need to load pointer value first
-        if (is_pointer) {
-            # load the pointer value into a register
-            val ptr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-            val ptr_val: ir.IRValue = ir.make_reg(ptr_reg, ctx.ptr_size);
-            var load_instr: ir.Instr;
-            load_instr.op = ir.IROp{ir_load: ir.OP_LOAD};
-            load_instr.dst = ptr_val;
-            load_instr.src1 = base_addr;
-            load_instr.src2 = ir.make_none();
-            load_instr.cond = ir.CC_NONE;
-            lower_emit_instr(ctx, load_instr.op, load_instr.dst, load_instr.src1, load_instr.src2, 0);
-
-            ret ir.make_mem(ptr_reg, -1, 1, field_offset::i64, field_size);
-        }
-
-        # for non-pointer: check if base_addr is a memory operand (local struct)
-        if (base_addr.kind == ir.VAL_MEM) {
-            # just adjust the displacement - no ADD instruction needed
-            var result: ir.IRValue = base_addr;
-            result.offset = base_addr.offset + field_offset::i64;
-            result.size = field_size;
-            ret result;
-        }
-
-        # for register or label operands, use LEA to compute address
-        if (base_addr.kind == ir.VAL_REG) {
-            ret ir.make_mem(base_addr.reg, -1, 1, field_offset::i64, field_size);
-        }
-
-        # fallback: use LEA for other cases (e.g., globals)
-        val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-        var mem: ir.IRValue = base_addr;
-        mem.offset = mem.offset + field_offset::i64;
-        lower_emit_instr(ctx, ir.IROp{ir_lea: ir.OP_LEA}, addr, mem, ir.make_none(), 0);
-        ret addr;
-    }
-
-    # array index - base + index * elem_size
-    if (node.kind == ast.NODE_EXPR_INDEX) {
-        val base: *ast.Node = node.info.index_expr.base;
-        val index: *ast.Node = node.info.index_expr.index;
-
-        if (base == nil || index == nil) {
-            ret ir.make_imm(0, ctx.ptr_size);
-        }
-
-        val raw_base_addr: ir.IRValue = lower_lvalue(ctx, base);
-        val lv_raw_index: ir.IRValue = lower_expr(ctx, index);
-
-        # extend index to pointer size if needed (mirrors lower_index)
-        var index_value: ir.IRValue = lv_raw_index;
-        val lv_index_ty: *ty.Type = index.ty;
-        if (lv_index_ty != nil && lv_index_ty.size < ctx.ptr_size) {
-            val lv_ext_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-            val lv_ext_val: ir.IRValue = ir.make_reg(lv_ext_reg, ctx.ptr_size);
-            if (ty.type_is_signed(lv_index_ty)) {
-                lower_emit_instr(ctx, ir.IROp{ir_sext: ir.OP_SEXT}, lv_ext_val, lv_raw_index, ir.make_none(), 0);
-            } or {
-                lower_emit_instr(ctx, ir.IROp{ir_zext: ir.OP_ZEXT}, lv_ext_val, lv_raw_index, ir.make_none(), 0);
-            }
-            index_value = lv_ext_val;
-        }
-
-        # get element size from type
-        var elem_size: usize = ctx.ptr_size;
-        var base_ty: *ty.Type = base.ty;
-        # fall back to local_vars type table if node type is nil
-        if (base_ty == nil && base.kind == ast.NODE_EXPR_IDENT) {
-            val lv_idx_name: str = base.info.ident_expr.name;
-            if (lv_idx_name != nil) {
-                val lv_idx_local: i32 = find_local_var(ctx, lv_idx_name);
-                if (lv_idx_local >= 0) {
-                    base_ty = ctx.local_vars[lv_idx_local].ty;
-                }
-                # fall back to symbol table for global variables
-                if (base_ty == nil && ctx.symbols != nil) {
-                    val lv_idx_sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, lv_idx_name);
-                    if (option_is_some[*symbol.Symbol](lv_idx_sym_opt)) {
-                        val lv_idx_sym: *symbol.Symbol = option_unwrap[*symbol.Symbol](lv_idx_sym_opt);
-                        if (lv_idx_sym.resolved_type != nil) {
-                            base_ty = lv_idx_sym.resolved_type;
-                        }
-                    }
-                    if (base_ty == nil) {
-                        val lv_idx_imp_sym: *symbol.Symbol = lookup_symbol_in_imports(ctx, lv_idx_name);
-                        if (lv_idx_imp_sym != nil && lv_idx_imp_sym.resolved_type != nil) {
-                            base_ty = lv_idx_imp_sym.resolved_type;
-                        }
-                    }
-                }
-            }
-        }
-        if (base_ty != nil) {
-            if (base_ty.kind == ty.TY_ARRAY && base_ty.inner != nil) {
-                elem_size = base_ty.inner.size;
-            } or (base_ty.kind == ty.TY_POINTER && base_ty.inner != nil) {
-                elem_size = base_ty.inner.size;
-            }
-        }
-        # for pointer/str types, load the pointer value from the address
-        val lv_ptr_base: ir.IRValue = load_ptr_if_needed(ctx, raw_base_addr, base_ty);
-
-        # for array types (VAL_MEM), LEA the address into a register
-        # so that select_add can operate on it
-        val lv_needs_lea: bool = lv_ptr_base.kind == ir.VAL_MEM;
-        var lv_lea_reg: i32 = 0;
-        if (lv_needs_lea) {
-            lv_lea_reg = new_vreg(ctx, ctx.ptr_size);
-            val lv_lea_dst: ir.IRValue = ir.make_reg(lv_lea_reg, ctx.ptr_size);
-            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                          lv_lea_dst, lv_ptr_base, ir.make_none(), ir.CC_NONE);
-        }
-
-        val elem_size_value: ir.IRValue = ir.make_imm(elem_size::i64, ctx.ptr_size);
-
-        # multiply index by element size
-        val offset_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val offset: ir.IRValue = ir.make_reg(offset_reg, ctx.ptr_size);
-        emit_alu(ctx, ir.IROp{ir_mul: ir.OP_MUL}, offset, index_value, elem_size_value, ctx.ptr_size);
-
-        # add to base
-        val addr_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val addr: ir.IRValue = ir.make_reg(addr_reg, ctx.ptr_size);
-        if (lv_needs_lea) {
-            val lv_lea_src: ir.IRValue = ir.make_reg(lv_lea_reg, ctx.ptr_size);
-            emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, lv_lea_src, offset, ctx.ptr_size);
+        val addr: ir.Operand = new_vreg(ctx, psz);
+        if (field_offset != 0) {
+            emit(ctx, ir.OP_ADD, addr, base, ir.make_imm(field_offset, psz),
+                 ir.CC_NONE);
         } or {
-            emit_alu(ctx, ir.IROp{ir_add: ir.OP_ADD}, addr, lv_ptr_base, offset, ctx.ptr_size);
+            emit_mov(ctx, addr, base);
+        }
+        ret ir.make_mem(addr.reg, -1, 1, 0, field_size);
+    } or {
+        # value struct: compute field address from object lvalue
+        val base: ir.Operand = lower_lvalue(ctx, obj);
+        if (base.kind == ir.OPK_NONE) { ret ir.make_none(); }
+
+        # adjust the memory operand's displacement
+        if (base.kind == ir.OPK_MEM) {
+            ret ir.make_mem(base.base, base.index, base.scale,
+                           base.disp + field_offset, field_size);
         }
 
-        ret ir.make_mem(addr_reg, -1, 1, 0, elem_size);
+        # fallback: compute address
+        val addr: ir.Operand = new_vreg(ctx, psz);
+        emit(ctx, ir.OP_ADDR, addr, base, ir.make_none(), ir.CC_NONE);
+        if (field_offset != 0) {
+            val adjusted: ir.Operand = new_vreg(ctx, psz);
+            emit(ctx, ir.OP_ADD, adjusted, addr, ir.make_imm(field_offset, psz),
+                 ir.CC_NONE);
+            ret ir.make_mem(adjusted.reg, -1, 1, 0, field_size);
+        }
+        ret ir.make_mem(addr.reg, -1, 1, 0, field_size);
+    }
+}
+
+# --- array indexing ---
+
+fun lower_index(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val mem: ir.Operand = lower_index_lvalue(ctx, node);
+    if (mem.kind == ir.OPK_NONE) { ret ir.make_none(); }
+
+    val size: u8 = expr_size(ctx, node);
+    val result: ir.Operand = new_vreg(ctx, size);
+    emit_load(ctx, result, mem);
+    ret result;
+}
+
+fun lower_index_lvalue(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val base_node: *ast.Node = node.info.index_expr.base;
+    val index_node: *ast.Node = node.info.index_expr.index;
+    if (base_node == nil || index_node == nil) { ret ir.make_none(); }
+
+    val psz: u8 = ctx.ptr_size;
+
+    # get element type and size
+    val base_type: *ty.Type = base_node.ty;
+    if (base_type == nil) { ret ir.make_none(); }
+
+    var elem_type: *ty.Type = ty.get_element_type(base_type);
+    if (elem_type == nil) { ret ir.make_none(); }
+
+    val elem_size: usize = type_size(ctx, elem_type);
+    val result_size: u8 = elem_size::u8;
+
+    # compute base address
+    val base: ir.Operand = lower_expr(ctx, base_node);
+    if (base.kind == ir.OPK_NONE) { ret ir.make_none(); }
+
+    # compute index
+    val index: ir.Operand = lower_expr(ctx, index_node);
+    if (index.kind == ir.OPK_NONE) { ret ir.make_none(); }
+
+    # compute offset: index * element_size
+    val offset: ir.Operand = new_vreg(ctx, psz);
+    if (elem_size == 1) {
+        emit_mov(ctx, offset, index);
+    } or (elem_size == 2 || elem_size == 4 || elem_size == 8) {
+        emit(ctx, ir.OP_MUL, offset, index, ir.make_imm(elem_size::i64, psz),
+             ir.CC_NONE);
+    } or {
+        emit(ctx, ir.OP_MUL, offset, index, ir.make_imm(elem_size::i64, psz),
+             ir.CC_NONE);
     }
 
-    # dereference - return memory operand with pointed-to type size
-    if (node.kind == ast.NODE_EXPR_DEREF) {
-        val operand: *ast.Node = node.info.unary_expr.expr;
-        if (operand == nil) {
-            ret ir.make_imm(0, ctx.ptr_size);
-        }
-        val deref_ptr: ir.IRValue = lower_expr(ctx, operand);
-        var deref_size: usize = ctx.ptr_size;
-        if (node.ty != nil) {
-            deref_size = node.ty.size;
-        }
-        if (deref_ptr.kind == ir.VAL_REG) {
-            ret ir.make_mem(deref_ptr.reg, -1, 1, 0, deref_size);
-        }
-        if (deref_ptr.kind == ir.VAL_MEM) {
-            val deref_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-            val deref_dst: ir.IRValue = ir.make_reg(deref_reg, ctx.ptr_size);
-            lower_emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, deref_dst, deref_ptr, ir.make_none(), 0);
-            ret ir.make_mem(deref_reg, -1, 1, 0, deref_size);
-        }
-        ret deref_ptr;
+    # compute final address: base + offset
+    val addr: ir.Operand = new_vreg(ctx, psz);
+    emit(ctx, ir.OP_ADD, addr, base, offset, ir.CC_NONE);
+
+    ret ir.make_mem(addr.reg, -1, 1, 0, result_size);
+}
+
+# --- type casts ---
+
+fun lower_cast(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val inner: *ast.Node = node.info.cast_expr.expr;
+    if (inner == nil) { ret ir.make_none(); }
+
+    val value: ir.Operand = lower_expr(ctx, inner);
+    if (value.kind == ir.OPK_NONE) { ret ir.make_none(); }
+
+    val src_type: *ty.Type = inner.ty;
+    val dst_type: *ty.Type = node.ty;
+    if (src_type == nil || dst_type == nil) { ret value; }
+
+    val src_size: usize = type_size(ctx, src_type);
+    val dst_size: usize = type_size(ctx, dst_type);
+    val dst_sz: u8 = dst_size::u8;
+
+    val src_float: bool = ty.type_is_float(src_type);
+    val dst_float: bool = ty.type_is_float(dst_type);
+    val src_ptr: bool = ty.type_is_pointer(src_type) || src_type.kind == ty.TY_PTR;
+    val dst_ptr: bool = ty.type_is_pointer(dst_type) || dst_type.kind == ty.TY_PTR;
+
+    # same size, same class — just mov
+    if (src_size == dst_size && src_float == dst_float) {
+        val result: ir.Operand = new_vreg(ctx, dst_sz);
+        emit_mov(ctx, result, value);
+        ret result;
     }
 
-    # parenthesized expression: unwrap and lower inner lvalue
-    if (node.kind == ast.NODE_EXPR_PAREN) {
-        val inner: *ast.Node = node.info.wrapper.inner;
-        if (inner != nil) {
-            ret lower_lvalue(ctx, inner);
-        }
-        ret ir.make_imm(0, ctx.ptr_size);
+    # float <-> integer conversions
+    if (src_float && !dst_float) {
+        val result: ir.Operand = new_vreg(ctx, dst_sz);
+        emit(ctx, ir.OP_FTOI, result, value, ir.make_none(), ir.CC_NONE);
+        ret result;
+    }
+    if (!src_float && dst_float) {
+        val result: ir.Operand = new_vreg(ctx, dst_sz);
+        emit(ctx, ir.OP_ITOF, result, value, ir.make_none(), ir.CC_NONE);
+        ret result;
     }
 
-    ret ir.make_imm(0, ctx.ptr_size);
+    # float <-> float conversions
+    if (src_float && dst_float) {
+        val result: ir.Operand = new_vreg(ctx, dst_sz);
+        if (dst_size > src_size) {
+            emit(ctx, ir.OP_FEXT, result, value, ir.make_none(), ir.CC_NONE);
+        } or {
+            emit(ctx, ir.OP_FTRUNC, result, value, ir.make_none(), ir.CC_NONE);
+        }
+        ret result;
+    }
+
+    # pointer casts — just reinterpret
+    if (src_ptr || dst_ptr) {
+        val result: ir.Operand = new_vreg(ctx, dst_sz);
+        emit_mov(ctx, result, value);
+        ret result;
+    }
+
+    # integer size conversions
+    if (dst_size > src_size) {
+        val result: ir.Operand = new_vreg(ctx, dst_sz);
+        if (ty.type_is_signed(src_type)) {
+            emit(ctx, ir.OP_SEXT, result, value, ir.make_none(), ir.CC_NONE);
+        } or {
+            emit(ctx, ir.OP_ZEXT, result, value, ir.make_none(), ir.CC_NONE);
+        }
+        ret result;
+    }
+
+    if (dst_size < src_size) {
+        val result: ir.Operand = new_vreg(ctx, dst_sz);
+        emit(ctx, ir.OP_TRUNC, result, value, ir.make_none(), ir.CC_NONE);
+        ret result;
+    }
+
+    # same size integer cast
+    val result: ir.Operand = new_vreg(ctx, dst_sz);
+    emit_mov(ctx, result, value);
+    ret result;
+}
+
+# --- struct and array literals ---
+
+fun lower_struct_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val stype: *ty.Type = node.ty;
+    if (stype == nil) { ret ir.make_none(); }
+
+    val ssize: usize = type_size(ctx, stype);
+    val psz: u8 = ctx.ptr_size;
+
+    # allocate stack space for the struct
+    val lv: *LocalVar = local_add(ctx, ".struct_tmp", stype, ssize);
+    if (lv == nil) { ret ir.make_none(); }
+    val base: ir.Operand = local_operand(lv, psz);
+
+    # zero-initialize
+    if (ssize > 0 && ssize <= 8) {
+        emit_store(ctx, base, ir.make_imm(0, ssize::u8));
+    }
+
+    # lower field initializers
+    val fields: *ast.List = node.info.struct_lit.fields;
+    if (fields != nil) {
+        var i: i32 = 0;
+        for (i < fields.count) {
+            val field_node: *ast.Node = fields.nodes[i];
+            if (field_node != nil && field_node.kind == ast.NODE_DECL_VAR) {
+                val fname: str = field_node.info.var_decl.name;
+                val init: *ast.Node = field_node.info.var_decl.init;
+
+                if (fname != nil && init != nil) {
+                    val field_opt: Option[*ty.Field] = ty.get_field(stype, fname);
+                    if (option_is_some[*ty.Field](field_opt)) {
+                        val field: *ty.Field = option_unwrap[*ty.Field](field_opt);
+                        val field_offset: i64 = field.offset::i64;
+                        val field_size: u8 = ty.type_size(field.ty)::u8;
+
+                        val value: ir.Operand = lower_expr(ctx, init);
+                        if (value.kind != ir.OPK_NONE) {
+                            val dst: ir.Operand = ir.make_mem(
+                                base.base, base.index, base.scale,
+                                base.disp + field_offset, field_size);
+                            emit_store(ctx, dst, value);
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    ret base;
+}
+
+fun lower_array_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val atype: *ty.Type = node.ty;
+    if (atype == nil) { ret ir.make_none(); }
+
+    val asize: usize = type_size(ctx, atype);
+    val psz: u8 = ctx.ptr_size;
+
+    # allocate stack space for the array
+    val lv: *LocalVar = local_add(ctx, ".array_tmp", atype, asize);
+    if (lv == nil) { ret ir.make_none(); }
+    val base: ir.Operand = local_operand(lv, psz);
+
+    val elements: *ast.List = node.info.array_lit.elements;
+    if (elements == nil) { ret base; }
+
+    val elem_type: *ty.Type = ty.get_element_type(atype);
+    if (elem_type == nil) { ret base; }
+    val elem_size: usize = type_size(ctx, elem_type);
+
+    var i: i32 = 0;
+    for (i < elements.count) {
+        val elem: *ast.Node = elements.nodes[i];
+        if (elem != nil) {
+            val value: ir.Operand = lower_expr(ctx, elem);
+            if (value.kind != ir.OPK_NONE) {
+                val offset: i64 = i::i64 * elem_size::i64;
+                val dst: ir.Operand = ir.make_mem(
+                    base.base, base.index, base.scale,
+                    base.disp + offset, elem_size::u8);
+                emit_store(ctx, dst, value);
+            }
+        }
+        i = i + 1;
+    }
+
+    ret base;
+}
+
+# --- assignment expression (returns value) ---
+
+fun lower_assign_expr(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val lhs: *ast.Node = node.info.binary_expr.left;
+    val rhs: *ast.Node = node.info.binary_expr.right;
+    if (lhs == nil || rhs == nil) { ret ir.make_none(); }
+
+    val value: ir.Operand = lower_expr(ctx, rhs);
+    val dst: ir.Operand = lower_lvalue(ctx, lhs);
+    if (dst.kind != ir.OPK_NONE && value.kind != ir.OPK_NONE) {
+        emit_store(ctx, dst, value);
+    }
+    ret value;
+}
+
+# --- helpers ---
+
+# expr_size: get the operand size for an expression.
+fun expr_size(ctx: *LowerContext, node: *ast.Node) u8 {
+    if (node == nil || node.ty == nil) { ret ctx.ptr_size; }
+    ret type_size_u8(ctx, node.ty);
+}
+
+# map_binop: map token tag to IR operator.
+fun map_binop(op: u8, is_float: bool, ltype: *ty.Type) ir.Operator {
+    if (is_float) {
+        if (op == token.TAG_PLUS)    { ret ir.OP_FADD; }
+        if (op == token.TAG_MINUS)   { ret ir.OP_FSUB; }
+        if (op == token.TAG_STAR)    { ret ir.OP_FMUL; }
+        if (op == token.TAG_SLASH)   { ret ir.OP_FDIV; }
+        ret ir.OP_FADD;
+    }
+
+    if (op == token.TAG_PLUS)    { ret ir.OP_ADD; }
+    if (op == token.TAG_MINUS)   { ret ir.OP_SUB; }
+    if (op == token.TAG_STAR)    { ret ir.OP_MUL; }
+    if (op == token.TAG_SLASH) {
+        if (ltype != nil && ty.type_is_unsigned(ltype)) { ret ir.OP_DIVU; }
+        ret ir.OP_DIV;
+    }
+    if (op == token.TAG_PERCENT) {
+        if (ltype != nil && ty.type_is_unsigned(ltype)) { ret ir.OP_MODU; }
+        ret ir.OP_MOD;
+    }
+    if (op == token.TAG_AMP)     { ret ir.OP_AND; }
+    if (op == token.TAG_PIPE)    { ret ir.OP_OR; }
+    if (op == token.TAG_CARET)   { ret ir.OP_XOR; }
+    if (op == token.TAG_LT_LT)  { ret ir.OP_SHL; }
+    if (op == token.TAG_GT_GT) {
+        if (ltype != nil && ty.type_is_unsigned(ltype)) { ret ir.OP_SHR; }
+        ret ir.OP_SAR;
+    }
+
+    ret ir.OP_ADD;
+}
+
+# map_cond: map comparison token to IR condition code.
+fun map_cond(op: u8, is_unsigned: bool) ir.Cond {
+    if (op == token.TAG_EQ_EQ)   { ret ir.CC_EQ; }
+    if (op == token.TAG_BANG_EQ) { ret ir.CC_NE; }
+    if (op == token.TAG_LT) {
+        if (is_unsigned) { ret ir.CC_B; }
+        ret ir.CC_LT;
+    }
+    if (op == token.TAG_LT_EQ) {
+        if (is_unsigned) { ret ir.CC_BE; }
+        ret ir.CC_LE;
+    }
+    if (op == token.TAG_GT) {
+        if (is_unsigned) { ret ir.CC_A; }
+        ret ir.CC_GT;
+    }
+    if (op == token.TAG_GT_EQ) {
+        if (is_unsigned) { ret ir.CC_AE; }
+        ret ir.CC_GE;
+    }
+    ret ir.CC_EQ;
+}
+
+# resolve_callee_name: extract and mangle the function name from a callee node.
+fun resolve_callee_name(ctx: *LowerContext, callee: *ast.Node,
+                        call_node: *ast.Node) str {
+    # try to get the symbol from the call node
+    val sym: *symbol.Symbol = call_node.symbol::*symbol.Symbol;
+    if (sym != nil) {
+        ret get_mangled_name(ctx, sym);
+    }
+
+    # fallback: extract name from identifier
+    if (callee.kind == ast.NODE_EXPR_IDENT) {
+        val name: str = callee.info.ident_expr.name;
+        # try symbol lookup for mangling
+        val resolved: *symbol.Symbol = resolve_symbol(ctx, name);
+        if (resolved != nil) {
+            ret get_mangled_name(ctx, resolved);
+        }
+        ret name;
+    }
+
+    # field access: module.function
+    if (callee.kind == ast.NODE_EXPR_FIELD) {
+        val field_name: str = callee.info.field_expr.field;
+        val obj: *ast.Node = callee.info.field_expr.object;
+        if (obj != nil && obj.kind == ast.NODE_EXPR_IDENT) {
+            val mod_name: str = obj.info.ident_expr.name;
+            # look up the symbol for module-qualified call
+            val resolved: *symbol.Symbol = resolve_symbol(ctx, field_name);
+            if (resolved != nil) {
+                ret get_mangled_name(ctx, resolved);
+            }
+        }
+        ret field_name;
+    }
+
+    ret nil;
+}
+
+# resolve_symbol: look up a symbol in the symbol table.
+fun resolve_symbol(ctx: *LowerContext, name: str) *symbol.Symbol {
+    if (ctx.symbols == nil || name == nil) { ret nil; }
+    val opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, name);
+    if (option_is_some[*symbol.Symbol](opt)) {
+        ret option_unwrap[*symbol.Symbol](opt);
+    }
+    ret nil;
+}
+
+# get_mangled_name: get the mangled name for a symbol.
+fun get_mangled_name(ctx: *LowerContext, sym: *symbol.Symbol) str {
+    if (sym == nil) { ret nil; }
+
+    # use export_name if available
+    if (sym.export_name != nil) {
+        ret sym.export_name;
+    }
+
+    # mangle using module_path + name
+    ret mangle.mangle(ctx.alloc, sym.module_path, sym.name);
 }

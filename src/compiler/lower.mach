@@ -2,44 +2,352 @@ use std.types.bool;
 use std.types.size;
 use std.types.string;
 use std.types.result;
-use std.types.option;
 
 use allocator: std.allocator;
+use print:     std.print;
 
 use ast:     mach.compiler.ast;
-use isel:    mach.compiler.masm.isa.dispatch;
-use abi_dispatch: mach.compiler.masm.abi.dispatch;
-use symbol: mach.compiler.symbol;
-use ty:     mach.compiler.type;
-use tyctx:  mach.compiler.type_context;
-use token:  mach.compiler.token;
-
+use symbol:  mach.compiler.symbol;
+use ty:      mach.compiler.type;
+use target:  mach.compiler.target;
 use ir:      mach.compiler.masm.ir;
-use masm:    mach.compiler.masm.masm;
+use masm:    mach.compiler.masm;
 use section: mach.compiler.masm.section;
 use sym:     mach.compiler.masm.symbol;
 use mangle:  mach.compiler.masm.mangle;
-use target:  mach.compiler.masm.target;
-use abi:     mach.compiler.masm.abi.spec;
-use sema:      mach.compiler.sema.sema;
-use print:     std.print;
+use abi:     mach.compiler.abi;
+use sema:    mach.compiler.sema;
+use ldecl:   mach.compiler.lower.decl;
 
-# ModuleMasm: per-module MASM context for split lowering.
+# mach.compiler.lower: AST → MASM IR lowering.
 # ---
-# m:              masm context for this module
-# mod_name:       module name (e.g. "mach.compiler.ast")
-# file_path:      source file path
-# ir_funcs:       IR functions belonging to this module
-# ir_func_count:  number of IR functions
-# ir_func_cap:    capacity of ir_funcs array
-pub rec ModuleMasm {
-    m:              *masm.Masm;
-    mod_name:       str;
-    file_path:      str;
-    ir_funcs:       **ir.IRFunction;
-    ir_func_count:  i32;
-    ir_func_cap:    i32;
+# transforms typed AST (sema output) into target-independent MASM IR.
+# all target-dependent decisions go through *target.Target interfaces.
+# lowering NEVER produces ISA-specific instructions — ISel does that.
+
+# --- local variable tracking ---
+
+pub rec LocalVar {
+    name:     str;
+    ty:       *ty.Type;
+    offset:   i64;       # stack offset from frame pointer
+    is_param: bool;
+    size:     usize;
 }
+
+val INITIAL_LOCAL_CAP: i32 = 32;
+val INITIAL_DEFER_CAP: i32 = 8;
+
+# --- lowering context ---
+
+pub rec LowerContext {
+    alloc:          *allocator.Allocator;
+    target:         *target.Target;
+    mctx:           *masm.Context;
+
+    # input
+    symbols:        *symbol.Table;
+    sema_mod:       *sema.Module;
+
+    # current function state
+    current_fn:     *ir.Function;
+    current_block:  *ir.Block;
+
+    # virtual register allocation
+    vreg_next:      i32;
+
+    # counters
+    label_counter:  i32;
+    str_counter:    i32;
+
+    # local variables
+    local_vars:     *LocalVar;
+    local_count:    i32;
+    local_cap:      i32;
+    stack_offset:   i64;
+
+    # function return state
+    fn_ret_type:    *ty.Type;
+    fn_has_sret:    bool;
+    sret_slot:      ir.Operand;
+    fn_is_variadic: bool;
+
+    # loop state
+    loop_start:     str;
+    loop_end:       str;
+
+    # deferred statements
+    deferred:       **ast.Node;
+    deferred_count: i32;
+    deferred_cap:   i32;
+    defer_mark:     i32;
+
+    # debug info
+    current_file:   u16;
+    current_line:   i32;
+
+    # pointer size cache (from target)
+    ptr_size:       u8;
+}
+
+# --- context lifecycle ---
+
+pub fun create(alloc: *allocator.Allocator, tgt: *target.Target,
+               mctx: *masm.Context, symbols: *symbol.Table,
+               smod: *sema.Module) Result[LowerContext, str] {
+    if (alloc == nil || tgt == nil || mctx == nil) {
+        ret err[LowerContext, str]("invalid arguments");
+    }
+
+    var ctx: LowerContext;
+    ctx.alloc = alloc;
+    ctx.target = tgt;
+    ctx.mctx = mctx;
+    ctx.symbols = symbols;
+    ctx.sema_mod = smod;
+    ctx.current_fn = nil;
+    ctx.current_block = nil;
+    ctx.vreg_next = ir.VREG_START;
+    ctx.label_counter = 0;
+    ctx.str_counter = 0;
+    ctx.stack_offset = 0;
+    ctx.fn_ret_type = nil;
+    ctx.fn_has_sret = false;
+    ctx.fn_is_variadic = false;
+    ctx.loop_start = nil;
+    ctx.loop_end = nil;
+    ctx.deferred_count = 0;
+    ctx.defer_mark = 0;
+    ctx.current_file = 0;
+    ctx.current_line = 0;
+    ctx.ptr_size = tgt.ptr_size::u8;
+
+    # allocate local vars array
+    val lv_r: Result[*LocalVar, allocator.AllocError] =
+        allocator.allocator_zalloc[LocalVar](alloc, INITIAL_LOCAL_CAP::usize);
+    if (result_is_err[*LocalVar, allocator.AllocError](lv_r)) {
+        ret err[LowerContext, str]("out of memory");
+    }
+    ctx.local_vars = result_unwrap_ok[*LocalVar, allocator.AllocError](lv_r);
+    ctx.local_count = 0;
+    ctx.local_cap = INITIAL_LOCAL_CAP;
+
+    # allocate deferred array
+    val df_r: Result[**ast.Node, allocator.AllocError] =
+        allocator.allocator_zalloc[*ast.Node](alloc, INITIAL_DEFER_CAP::usize);
+    if (result_is_err[**ast.Node, allocator.AllocError](df_r)) {
+        ret err[LowerContext, str]("out of memory");
+    }
+    ctx.deferred = result_unwrap_ok[**ast.Node, allocator.AllocError](df_r);
+    ctx.deferred_cap = INITIAL_DEFER_CAP;
+
+    ret ok[LowerContext, str](ctx);
+}
+
+# --- virtual register allocation ---
+
+pub fun new_vreg(ctx: *LowerContext, size: u8) ir.Operand {
+    val id: i32 = ctx.vreg_next;
+    ctx.vreg_next = ctx.vreg_next + 1;
+    ret ir.make_reg(id, size);
+}
+
+# --- label generation ---
+
+pub fun new_label(ctx: *LowerContext, prefix: str) str {
+    ctx.label_counter = ctx.label_counter + 1;
+    # labels are unique via counter; prefix aids readability
+    # in practice the compiler generates formatted labels
+    ret prefix;
+}
+
+pub fun new_label_id(ctx: *LowerContext) i32 {
+    ctx.label_counter = ctx.label_counter + 1;
+    ret ctx.label_counter;
+}
+
+# --- instruction emission ---
+
+# emit: append an instruction to the current block.
+pub fun emit(ctx: *LowerContext, op: ir.Operator, dst: ir.Operand,
+             src1: ir.Operand, src2: ir.Operand, cc: ir.Cond) {
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+    val idx: i32 = ir.block_append(ctx.alloc, ctx.current_block,
+                                    op, dst, src1, src2, cc);
+    if (idx >= 0 && ctx.current_line > 0) {
+        ctx.current_block.insts[idx].src_line = ctx.current_line;
+        ctx.current_block.insts[idx].src_file = ctx.current_file;
+    }
+}
+
+# emit_mov: emit a MOV instruction.
+pub fun emit_mov(ctx: *LowerContext, dst: ir.Operand, src: ir.Operand) {
+    emit(ctx, ir.OP_MOV, dst, src, ir.make_none(), ir.CC_NONE);
+}
+
+# emit_store: emit a STORE instruction.
+pub fun emit_store(ctx: *LowerContext, dst: ir.Operand, src: ir.Operand) {
+    emit(ctx, ir.OP_STORE, dst, src, ir.make_none(), ir.CC_NONE);
+}
+
+# emit_load: emit a LOAD instruction.
+pub fun emit_load(ctx: *LowerContext, dst: ir.Operand, src: ir.Operand) {
+    emit(ctx, ir.OP_LOAD, dst, src, ir.make_none(), ir.CC_NONE);
+}
+
+# emit_label: emit a label pseudo-instruction.
+pub fun emit_label(ctx: *LowerContext, label: str) {
+    emit(ctx, ir.OP_LABEL, ir.make_label(label), ir.make_none(),
+         ir.make_none(), ir.CC_NONE);
+}
+
+# emit_jmp: emit an unconditional jump.
+pub fun emit_jmp(ctx: *LowerContext, label: str) {
+    emit(ctx, ir.OP_JMP, ir.make_label(label), ir.make_none(),
+         ir.make_none(), ir.CC_NONE);
+}
+
+# emit_brcond: emit a conditional branch.
+pub fun emit_brcond(ctx: *LowerContext, cond: ir.Operand, label: str, cc: ir.Cond) {
+    emit(ctx, ir.OP_BRCOND, ir.make_label(label), cond,
+         ir.make_none(), cc);
+}
+
+# emit_ret: emit a return instruction.
+pub fun emit_ret(ctx: *LowerContext) {
+    emit(ctx, ir.OP_RET, ir.make_none(), ir.make_none(),
+         ir.make_none(), ir.CC_NONE);
+}
+
+# --- basic block management ---
+
+# start_block: create and switch to a new basic block.
+pub fun start_block(ctx: *LowerContext, label: str) {
+    if (ctx == nil || ctx.current_fn == nil) { ret; }
+
+    val r: Result[*ir.Block, str] = ir.create_block(ctx.alloc, label);
+    if (result_is_err[*ir.Block, str](r)) { ret; }
+
+    val block: *ir.Block = result_unwrap_ok[*ir.Block, str](r);
+    ir.func_add_block(ctx.alloc, ctx.current_fn, block);
+    ctx.current_block = block;
+}
+
+# --- local variable management ---
+
+pub fun local_add(ctx: *LowerContext, name: str, t: *ty.Type, size: usize) *LocalVar {
+    if (ctx == nil) { ret nil; }
+
+    # grow if needed
+    if (ctx.local_count >= ctx.local_cap) {
+        val new_cap: i32 = ctx.local_cap * 2;
+        val r: Result[*LocalVar, allocator.AllocError] =
+            allocator.allocator_resize[LocalVar](ctx.alloc, ctx.local_vars,
+                ctx.local_cap::usize, new_cap::usize);
+        if (result_is_err[*LocalVar, allocator.AllocError](r)) { ret nil; }
+        ctx.local_vars = result_unwrap_ok[*LocalVar, allocator.AllocError](r);
+        ctx.local_cap = new_cap;
+    }
+
+    # align and allocate stack space
+    var align: usize = ty.type_align(t);
+    if (align < 1) { align = 1; }
+    val mask: i64 = align::i64 - 1;
+    ctx.stack_offset = (ctx.stack_offset + size::i64 + mask) & ~mask;
+
+    val idx: i32 = ctx.local_count;
+    ctx.local_vars[idx].name = name;
+    ctx.local_vars[idx].ty = t;
+    ctx.local_vars[idx].offset = -ctx.stack_offset;
+    ctx.local_vars[idx].is_param = false;
+    ctx.local_vars[idx].size = size;
+    ctx.local_count = ctx.local_count + 1;
+
+    ret ?ctx.local_vars[idx];
+}
+
+pub fun local_lookup(ctx: *LowerContext, name: str) *LocalVar {
+    if (ctx == nil || name == nil) { ret nil; }
+    var i: i32 = ctx.local_count - 1;
+    for (i >= 0) {
+        if (str_equals(ctx.local_vars[i].name, name)) {
+            ret ?ctx.local_vars[i];
+        }
+        i = i - 1;
+    }
+    ret nil;
+}
+
+# local_operand: get a memory operand for a local variable.
+pub fun local_operand(lv: *LocalVar, ptr_size: u8) ir.Operand {
+    if (lv == nil) { ret ir.make_none(); }
+    # frame pointer-relative addressing
+    # base register is virtual — will be resolved to physical frame pointer
+    ret ir.make_mem(ir.VREG_START - 1, -1, 1, lv.offset, lv.size::u8);
+}
+
+# --- function state management ---
+
+pub fun reset_function_state(ctx: *LowerContext) {
+    ctx.current_fn = nil;
+    ctx.current_block = nil;
+    ctx.vreg_next = ir.VREG_START;
+    ctx.local_count = 0;
+    ctx.stack_offset = 0;
+    ctx.fn_ret_type = nil;
+    ctx.fn_has_sret = false;
+    ctx.fn_is_variadic = false;
+    ctx.loop_start = nil;
+    ctx.loop_end = nil;
+    ctx.deferred_count = 0;
+    ctx.defer_mark = 0;
+}
+
+# --- deferred statement management ---
+
+pub fun defer_push(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil) { ret; }
+
+    if (ctx.deferred_count >= ctx.deferred_cap) {
+        val new_cap: i32 = ctx.deferred_cap * 2;
+        val r: Result[**ast.Node, allocator.AllocError] =
+            allocator.allocator_resize[*ast.Node](ctx.alloc, ctx.deferred,
+                ctx.deferred_cap::usize, new_cap::usize);
+        if (result_is_err[**ast.Node, allocator.AllocError](r)) { ret; }
+        ctx.deferred = result_unwrap_ok[**ast.Node, allocator.AllocError](r);
+        ctx.deferred_cap = new_cap;
+    }
+
+    ctx.deferred[ctx.deferred_count] = node;
+    ctx.deferred_count = ctx.deferred_count + 1;
+}
+
+pub fun defer_mark(ctx: *LowerContext) i32 {
+    ret ctx.deferred_count;
+}
+
+# --- type size helpers ---
+
+pub fun type_size(ctx: *LowerContext, t: *ty.Type) usize {
+    if (t == nil) { ret 0; }
+    if (ty.type_is_pointer(t) || t.kind == ty.TY_PTR) {
+        ret ctx.target.ptr_size;
+    }
+    ret ty.type_size(t);
+}
+
+pub fun type_size_u8(ctx: *LowerContext, t: *ty.Type) u8 {
+    ret type_size(ctx, t)::u8;
+}
+
+# --- float detection ---
+
+pub fun is_float_type(t: *ty.Type) bool {
+    if (t == nil) { ret false; }
+    ret ty.type_is_float(t);
+}
+
+# --- string helpers ---
 
 pub fun is_space_u8(c: u8) bool {
     ret c == 32 || c == 9 || c == 10 || c == 13;
@@ -49,1775 +357,73 @@ pub fun is_digit_u8(c: u8) bool {
     ret c >= 48 && c <= 57;
 }
 
-pub fun parse_float(s: str) f64 {
-    if (s == nil) {
-        ret 0.0;
-    }
-
+pub fun parse_int_str(s: str) i64 {
+    if (s == nil) { ret 0; }
     var i: usize = 0;
-    for (is_space_u8(s[i])) {
-        i = i + 1;
-    }
+    for (is_space_u8(s[i])) { i = i + 1; }
 
     var neg: bool = false;
-    if (s[i] == '-') {
-        neg = true;
+    if (s[i] == 45) { neg = true; i = i + 1; }
+
+    var base: i64 = 10;
+    if (s[i] == 48 && (s[i+1] == 120 || s[i+1] == 88)) {
+        base = 16; i = i + 2;
+    } or (s[i] == 48 && (s[i+1] == 98 || s[i+1] == 66)) {
+        base = 2; i = i + 2;
+    } or (s[i] == 48 && (s[i+1] == 111 || s[i+1] == 79)) {
+        base = 8; i = i + 2;
+    }
+
+    var val: i64 = 0;
+    for (s[i] != 0) {
+        if (s[i] == 95) { i = i + 1; cnt; } # skip underscores
+        var digit: i64 = -1;
+        if (s[i] >= 48 && s[i] <= 57) { digit = (s[i] - 48)::i64; }
+        or (s[i] >= 97 && s[i] <= 102) { digit = (s[i] - 87)::i64; }
+        or (s[i] >= 65 && s[i] <= 70) { digit = (s[i] - 55)::i64; }
+        if (digit < 0 || digit >= base) { brk; }
+        val = val * base + digit;
         i = i + 1;
     }
 
-    # integer part
+    if (neg) { val = -val; }
+    ret val;
+}
+
+pub fun parse_float(s: str) f64 {
+    if (s == nil) { ret 0.0; }
+    var i: usize = 0;
+    for (is_space_u8(s[i])) { i = i + 1; }
+
+    var neg: bool = false;
+    if (s[i] == 45) { neg = true; i = i + 1; }
+
     var value: f64 = 0.0;
     for (s[i] != 0 && is_digit_u8(s[i])) {
-        value = value * 10.0 + (s[i] - '0')::f64;
+        value = value * 10.0 + (s[i] - 48)::f64;
         i = i + 1;
     }
 
-    # fractional part
-    if (s[i] == '.') {
+    if (s[i] == 46) {
         i = i + 1;
         var frac: f64 = 0.0;
-        var divisor: f64 = 1.0;
+        var div: f64 = 1.0;
         for (s[i] != 0 && is_digit_u8(s[i])) {
-            frac = frac * 10.0 + (s[i] - '0')::f64;
-            divisor = divisor * 10.0;
+            frac = frac * 10.0 + (s[i] - 48)::f64;
+            div = div * 10.0;
             i = i + 1;
         }
-        value = value + frac / divisor;
+        value = value + frac / div;
     }
 
-    # exponent part
-    if (s[i] == 'e' || s[i] == 'E') {
-        i = i + 1;
-        var exp_neg: bool = false;
-        if (s[i] == '-') {
-            exp_neg = true;
-            i = i + 1;
-        } or (s[i] == '+') {
-            i = i + 1;
-        }
-        var exp: i64 = 0;
-        for (s[i] != 0 && is_digit_u8(s[i])) {
-            exp = exp * 10 + (s[i] - '0')::i64;
-            i = i + 1;
-        }
-        var mult: f64 = 1.0;
-        var ei: i64 = 0;
-        for (ei < exp) {
-            mult = mult * 10.0;
-            ei = ei + 1;
-        }
-        if (exp_neg) {
-            value = value / mult;
-        } or {
-            value = value * mult;
-        }
-    }
-
-    if (neg) {
-        ret 0.0 - value;
-    }
+    if (neg) { value = -value; }
     ret value;
 }
 
-pub fun parse_int_str(s: str) i64 {
-    if (s == nil) {
-        ret 0;
-    }
-
-    var i: usize = 0;
-    for (is_space_u8(s[i])) {
-        i = i + 1;
-    }
-
-    var neg: bool = false;
-    if (s[i] == 45) {
-        neg = true;
-        i = i + 1;
-    }
-
-    var value: i64 = 0;
-
-    # hex: 0x...
-    if (s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
-        i = i + 2;
-        for (s[i] != 0) {
-            if (is_digit_u8(s[i])) {
-                value = value * 16 + (s[i] - '0')::i64;
-            } or (s[i] >= 'a' && s[i] <= 'f') {
-                value = value * 16 + (s[i] - 'a' + 10)::i64;
-            } or (s[i] >= 'A' && s[i] <= 'F') {
-                value = value * 16 + (s[i] - 'A' + 10)::i64;
-            } or {
-                brk;
-            }
-            i = i + 1;
-        }
-    }
-    # octal: 0o...
-    or (s[i] == '0' && (s[i + 1] == 'o' || s[i + 1] == 'O')) {
-        i = i + 2;
-        for (s[i] != 0 && s[i] >= '0' && s[i] <= '7') {
-            value = value * 8 + (s[i] - '0')::i64;
-            i = i + 1;
-        }
-    }
-    # binary: 0b...
-    or (s[i] == '0' && (s[i + 1] == 'b' || s[i + 1] == 'B')) {
-        i = i + 2;
-        for (s[i] != 0 && (s[i] == '0' || s[i] == '1')) {
-            value = value * 2 + (s[i] - '0')::i64;
-            i = i + 1;
-        }
-    }
-    # decimal
-    or {
-        for (s[i] != 0 && is_digit_u8(s[i])) {
-            value = value * 10 + (s[i] - 48)::i64;
-            i = i + 1;
-        }
-    }
-
-    if (neg) {
-        ret -value;
-    }
-    ret value;
-}
-
-pub fun extract_token(ctx: *LowerContext, s: str, start: usize, end: *usize) str {
-    if (s == nil || ctx == nil || ctx.alloc == nil || end == nil) {
-        ret nil;
-    }
-
-    var i: usize = start;
-    for (is_space_u8(s[i])) {
-        i = i + 1;
-    }
-
-    var j: usize = i;
-    for (s[j] != 0 && s[j] != ',' && !is_space_u8(s[j])) {
-        j = j + 1;
-    }
-
-    if (j <= i) {
-        @end = j;
-        ret nil;
-    }
-
-    val len: usize = j - i;
-    val alloc_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](ctx.alloc, len + 1);
-    if (result_is_err[*u8, allocator.AllocError](alloc_res)) {
-        @end = j;
-        ret nil;
-    }
-
-    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](alloc_res);
-    var k: usize = 0;
-    for (k < len) {
-        buf[k] = s[i + k];
-        k = k + 1;
-    }
-    buf[len] = 0;
-    @end = j;
-    ret buf::str;
-}
-
-pub fun resolve_value_token(ctx: *LowerContext, name: str) ir.IRValue {
-    if (ctx == nil || name == nil) {
-        ret make_none();
-    }
-
-    var base: str = name;
-    var last_dot: i32 = -1;
-    var i: usize = 0;
-    for (name[i] != 0) {
-        if (name[i] == '.') {
-            last_dot = i::i32;
-        }
-        i = i + 1;
-    }
-    if (last_dot >= 0 && name[(last_dot + 1)::usize] != 0) {
-        base = (name::usize + (last_dot + 1)::usize)::str;
-    }
-
-    if (str_equals(base, "nil")) { ret ir.make_imm(0, ctx.ptr_size); }
-
-    if (str_equals(base, "SYS_WAIT4")) { ret ir.make_imm(61, ctx.ptr_size); }
-    if (str_equals(base, "SYS_FORK")) { ret ir.make_imm(57, ctx.ptr_size); }
-    if (str_equals(base, "SYS_VFORK")) { ret ir.make_imm(58, ctx.ptr_size); }
-    if (str_equals(base, "SYS_EXECVE")) { ret ir.make_imm(59, ctx.ptr_size); }
-    if (str_equals(base, "SYS_EXIT")) { ret ir.make_imm(60, ctx.ptr_size); }
-
-    if (is_digit_u8(base[0]) || (base[0] == 45 && is_digit_u8(base[1]))) {
-        ret ir.make_imm(parse_int_str(base), ctx.ptr_size);
-    }
-
-    # local variable
-    val local_idx: i32 = find_local_var(ctx, base);
-    if (local_idx >= 0) {
-        val offset: i32 = get_local_var_offset(ctx, local_idx);
-        val size: usize = ctx.local_vars[local_idx].size;
-        val addr: ir.IRValue = frame_mem(ctx, offset, size);
-        ret emit_load(ctx, addr, size);
-    }
-
-    # global symbol
-    var v: ir.IRValue = ir.make_label(base);
-    v.size = ctx.ptr_size;
-    ret emit_load(ctx, v, ctx.ptr_size);
-}
-
-pub fun resolve_lvalue_token(ctx: *LowerContext, name: str) ir.IRValue {
-    if (ctx == nil || name == nil) {
-        ret ir.make_imm(0, ctx.ptr_size);
-    }
-
-    var base: str = name;
-    var last_dot: i32 = -1;
-    var i: usize = 0;
-    for (name[i] != 0) {
-        if (name[i] == '.') {
-            last_dot = i::i32;
-        }
-        i = i + 1;
-    }
-    if (last_dot >= 0 && name[(last_dot + 1)::usize] != 0) {
-        base = (name::usize + (last_dot + 1)::usize)::str;
-    }
-
-    val local_idx: i32 = find_local_var(ctx, base);
-    if (local_idx >= 0) {
-        val offset: i32 = get_local_var_offset(ctx, local_idx);
-        val size: usize = ctx.local_vars[local_idx].size;
-        ret frame_mem(ctx, offset, size);
-    }
-
-    var v: ir.IRValue = ir.make_label(base);
-    v.size = ctx.ptr_size;
-    ret v;
-}
-
-# mach.compiler.masm.lower: AST to IR lowering.
-# ---
-# converts the typed AST into MASM intermediate representation.
-
-# LocalVar: tracking info for a local variable.
-# ---
-# name:   variable name
-# offset: stack offset from frame pointer (negative for locals)
-# size:   size in bytes
-pub rec LocalVar {
-    name:   str;
-    offset: i32;
-    size:   usize;
-    ty:     *ty.Type;
-}
-
-# LowerError: a lowering error with source location.
-# ---
-# pos:       byte position in source
-# line:      1-based line number
-# col:       1-based column number
-# file_path: path to the source file
-# message:   error description
-# source:    source text (for printing error lines)
-pub rec LowerError {
-    pos:       i32;
-    line:      i32;
-    col:       i32;
-    file_path: str;
-    message:   str;
-    source:    str;
-}
-
-# LowerContext: context for lowering AST to IR.
-# ---
-# alloc:            allocator for IR allocations
-# symbols:          symbol table for lookups
-# types:            type context
-# tgt:              target configuration
-# abi:              ABI specification for calling convention
-# current_fn:       current function being lowered
-# current_block:    current basic block
-# ptr_size:         pointer size in bytes
-# stack_align:      stack alignment in bytes
-#
-# local_vars:       array of local variables
-# local_count:      number of locals
-# local_cap:        allocated capacity
-# stack_offset:     current stack offset (grows negative)
-#
-# deferred:         array of deferred statement nodes (fin)
-# deferred_count:   number of deferred statements
-# deferred_cap:     allocated capacity
-#
-# loop_defer_marks: stack of indices into deferred array at loop entry
-# loop_mark_count:  number of loop marks
-# loop_mark_cap:    allocated capacity
-#
-# loop_start_label: label for loop start (for cnt)
-# loop_end_label:   label for loop end (for brk)
-#
-# vreg_next:        next virtual register number
-# label_counter:    counter for unique labels
-# str_counter:      counter for string literals
-# loop_counter:     counter for loops
-#
-# fn_ret_type:      return type of current function
-# fn_has_sret:      true if function returns aggregate via hidden pointer
-# sret_offset:      stack offset of hidden sret pointer
-pub rec LowerContext {
-    alloc:            *allocator.Allocator;
-    symbols:          *symbol.Table;
-    types:            *tyctx.TypeContext;
-    tgt:              target.Target;
-    abi:              abi.ABI;
-    current_fn:       *ir.IRFunction;
-    current_block:    *ir.IRBlock;
-    ptr_size:         usize;
-    stack_align:      usize;
-
-    local_vars:       *LocalVar;
-    local_count:      i32;
-    local_cap:        i32;
-    stack_offset:     i32;
-
-    # hash table for fast local variable lookup by name
-    # stores indices into local_vars; -1 means empty slot
-    local_hash:       *i32;
-    local_hash_cap:   i32;
-
-    deferred:         **ast.Node;
-    deferred_count:   i32;
-    deferred_cap:     i32;
-
-    loop_defer_marks: *i32;
-    loop_mark_count:  i32;
-    loop_mark_cap:    i32;
-
-    loop_start_label: str;
-    loop_end_label:   str;
-
-    vreg_next:        i32;
-    label_counter:    i32;
-    str_counter:      i32;
-    loop_counter:     i32;
-
-    fn_ret_type:      *ty.Type;
-    fn_has_sret:      bool;
-    sret_offset:      i32;
-
-    # variadic function lowering state
-    fn_is_variadic:       bool;
-    va_reg_save_off:      i32;   # rbp-relative base offset for reg_save_area
-    va_named_gp:          i32;   # named gp regs consumed (excluding sret)
-    va_named_fp:          i32;   # named fp regs consumed
-    va_named_stack_slots: i32;   # named params passed on stack
-
-    # MASM context for symbol registration
-    m:                *masm.Masm;
-
-    # source text for error messages
-    text:             str;
-
-    # IR functions for code generation
-    ir_funcs:         **ir.IRFunction;
-    ir_func_count:    i32;
-    ir_func_cap:      i32;
-
-    # imported modules for cross-module symbol lookup
-    loaded_mods:      **sema.SemaModule;
-    loaded_mod_count: i32;
-
-    # current module being lowered (for alias/import resolution)
-    current_sema_mod: *sema.SemaModule;
-
-    # override for function name when lowering instantiations
-    func_name_override:  str;
-    # override for return type
-    ret_type_override:   *ty.Type;
-
-    # debug info: current source file index for DWARF (1-based)
-    current_file_idx:    u16;
-
-    # pre-computed line offset table for O(log n) line_for_pos
-    line_offsets:        *i32;
-    line_offset_count:   i32;
-    line_offset_cap:     i32;
-
-    # error tracking for lowering diagnostics
-    had_error:    bool;
-    errors:       *LowerError;
-    error_count:  i32;
-    error_cap:    i32;
-}
-
-# init: initialize a lowering context.
-# ---
-# alloc:   allocator for IR allocations
-# symbols: symbol table for lookups
-# types:   type context
-# tgt:     target configuration
-# m:       masm context for symbol registration
-# text:    source text for error messages
-# ret:     initialized context
-pub fun init_lower_ctx(alloc: *allocator.Allocator, symbols: *symbol.Table, types: *tyctx.TypeContext, tgt: target.Target, m: *masm.Masm, text: str) LowerContext {
-    var ctx: LowerContext;
-    ctx.alloc         = alloc;
-    ctx.symbols       = symbols;
-    ctx.types         = types;
-    ctx.tgt           = tgt;
-    ctx.current_fn    = nil;
-    ctx.current_block = nil;
-    ctx.local_vars    = nil;
-    ctx.local_count   = 0;
-    ctx.local_cap     = 0;
-    ctx.stack_offset  = 0;
-    ctx.local_hash    = nil;
-    ctx.local_hash_cap = 0;
-    ctx.deferred      = nil;
-    ctx.deferred_count = 0;
-    ctx.deferred_cap  = 0;
-    ctx.loop_defer_marks = nil;
-    ctx.loop_mark_count = 0;
-    ctx.loop_mark_cap = 0;
-    ctx.loop_start_label = nil;
-    ctx.loop_end_label = nil;
-    ctx.vreg_next     = ir.VREG_START;
-    ctx.label_counter = 0;
-    ctx.str_counter   = 0;
-    ctx.loop_counter  = 0;
-    ctx.fn_ret_type   = nil;
-    ctx.fn_has_sret   = false;
-    ctx.sret_offset   = 0;
-    ctx.m             = m;
-    ctx.text          = text;
-
-    # initialize IR function storage
-    ctx.ir_funcs      = nil;
-    ctx.ir_func_count = 0;
-    ctx.ir_func_cap   = 0;
-
-    # initialize ABI before reading ptr_size/stack_align from it
-    ctx.abi = abi_dispatch.for_target(?ctx.tgt);
-    ctx.ptr_size      = tgt.ptr_size;
-    ctx.stack_align   = ctx.abi.stack_align;
-
-    # imported modules (set later by lower_all_modules)
-    ctx.loaded_mods = nil;
-    ctx.loaded_mod_count = 0;
-
-    ctx.func_name_override = nil;
-    ctx.ret_type_override = nil;
-    ctx.current_file_idx = 0;
-
-    # line offset table
-    ctx.line_offsets = nil;
-    ctx.line_offset_count = 0;
-    ctx.line_offset_cap = 0;
-
-    # build line table for the initial text
-    build_line_table(?ctx);
-
-    # error tracking
-    ctx.had_error    = false;
-    ctx.errors       = nil;
-    ctx.error_count  = 0;
-    ctx.error_cap    = 0;
-
-    ret ctx;
-}
-
-# build_line_table: pre-compute line start offsets for the current source text.
-# ---
-# stores byte offsets of each line start for O(log n) line_for_pos.
-pub fun build_line_table(ctx: *LowerContext) {
-    # free previous table
-    if (ctx.line_offsets != nil && ctx.alloc != nil) {
-        allocator.allocator_free[i32](ctx.alloc, ctx.line_offsets, ctx.line_offset_cap::usize);
-        ctx.line_offsets = nil;
-        ctx.line_offset_count = 0;
-        ctx.line_offset_cap = 0;
-    }
-
-    if (ctx.text == nil || ctx.alloc == nil) {
-        ret;
-    }
-
-    # count lines to pre-allocate
-    var line_count: i32 = 1;
-    var i: i32 = 0;
-    for (ctx.text[i::usize] != 0) {
-        if (ctx.text[i::usize] == 10) {
-            line_count = line_count + 1;
-        }
-        i = i + 1;
-    }
-
-    val cap: i32 = line_count;
-    val r: Result[*i32, allocator.AllocError] = allocator.allocator_alloc[i32](ctx.alloc, cap::usize);
-    if (result_is_err[*i32, allocator.AllocError](r)) {
-        ret;
-    }
-
-    ctx.line_offsets = result_unwrap_ok[*i32, allocator.AllocError](r);
-    ctx.line_offset_cap = cap;
-
-    # line 1 starts at offset 0
-    ctx.line_offsets[0] = 0;
-    ctx.line_offset_count = 1;
-
-    i = 0;
-    for (ctx.text[i::usize] != 0) {
-        if (ctx.text[i::usize] == 10 && ctx.line_offset_count < cap) {
-            ctx.line_offsets[ctx.line_offset_count] = i + 1;
-            ctx.line_offset_count = ctx.line_offset_count + 1;
-        }
-        i = i + 1;
-    }
-}
-
-# set_source_text: update source text and rebuild line table.
-pub fun set_source_text(ctx: *LowerContext, text: str) {
-    ctx.text = text;
-    build_line_table(ctx);
-}
-
-# line_for_pos: compute 1-based line number from byte offset using binary search.
-# ---
-# text: source text (unused when line table available, kept for fallback)
-# pos:  byte offset
-# ret:  1-based line number
-pub fun line_for_pos(text: str, pos: i32) i32 {
-    if (text == nil || pos <= 0) {
-        ret 1;
-    }
-
-    # fallback: linear scan (should not be reached with line table)
-    var line: i32 = 1;
-    var i: i32 = 0;
-    for (i < pos) {
-        if (text[i::usize] == 10) {
-            line = line + 1;
-        }
-        i = i + 1;
-    }
-    ret line;
-}
-
-# line_for_pos_ctx: compute 1-based line number using the context's line table.
-# ---
-# uses binary search on pre-computed line offsets for O(log n) performance.
-pub fun line_for_pos_ctx(ctx: *LowerContext, pos: i32) i32 {
-    if (ctx == nil || pos <= 0) {
-        ret 1;
-    }
-
-    # use line table if available
-    if (ctx.line_offsets != nil && ctx.line_offset_count > 0) {
-        # binary search: find the largest line whose offset <= pos
-        var lo: i32 = 0;
-        var hi: i32 = ctx.line_offset_count - 1;
-        for (lo <= hi) {
-            val mid: i32 = lo + (hi - lo) / 2;
-            if (ctx.line_offsets[mid] <= pos) {
-                lo = mid + 1;
-            } or {
-                hi = mid - 1;
-            }
-        }
-        ret hi + 1;  # 1-based
-    }
-
-    # fallback to linear scan
-    ret line_for_pos(ctx.text, pos);
-}
-
-# col_for_pos: compute 1-based column number from byte offset in source text.
-# ---
-# text: source text
-# pos:  byte offset
-# ret:  1-based column number
-pub fun col_for_pos(text: str, pos: i32) i32 {
-    if (text == nil || pos <= 0) {
-        ret 1;
-    }
-
-    var col: i32 = 1;
-    var i: i32 = 0;
-    val len: i32 = str_len(text)::i32;
-
-    for (i < pos && i < len) {
-        if (text[i::usize] == 10) {
-            col = 1;
-        } or {
-            col = col + 1;
-        }
-        i = i + 1;
-    }
-    ret col;
-}
-
-# report_lower_error: record a lowering error at a token position.
-# ---
-# ctx:     lowering context
-# tok:     token where error occurred
-# message: error message
-pub fun report_lower_error(ctx: *LowerContext, tok: token.Token, message: str) {
-    if (ctx == nil) {
-        ret;
-    }
-
-    ctx.had_error = true;
-
-    if (ctx.error_count >= 20) {
-        ret;
-    }
-
-    if (ctx.error_count >= ctx.error_cap) {
-        var new_cap: i32 = 8;
-        if (ctx.error_cap > 0) {
-            new_cap = ctx.error_cap * 2;
-        }
-
-        val r: Result[*LowerError, allocator.AllocError] = allocator.allocator_resize[LowerError](
-            ctx.alloc,
-            ctx.errors,
-            ctx.error_cap::u64,
-            new_cap::u64
-        );
-
-        if (result_is_err[*LowerError, allocator.AllocError](r)) {
-            ret;
-        }
-
-        ctx.errors = result_unwrap_ok[*LowerError, allocator.AllocError](r);
-        ctx.error_cap = new_cap;
-    }
-
-    val idx: i32 = ctx.error_count;
-    ctx.errors[idx].pos = tok.pos;
-    ctx.errors[idx].line = line_for_pos_ctx(ctx, tok.pos);
-    ctx.errors[idx].col = col_for_pos(ctx.text, tok.pos);
-    ctx.errors[idx].source = ctx.text;
-
-    if (ctx.current_sema_mod != nil && ctx.current_sema_mod.file_path != nil) {
-        ctx.errors[idx].file_path = ctx.current_sema_mod.file_path;
-    } or {
-        ctx.errors[idx].file_path = "<main>";
-    }
-
-    ctx.errors[idx].message = message;
-    ctx.error_count = ctx.error_count + 1;
-}
-
-# report_lower_error_str: record a lowering error without a specific token.
-# ---
-# ctx:     lowering context
-# message: error message
-pub fun report_lower_error_str(ctx: *LowerContext, message: str) {
-    if (ctx == nil) {
-        ret;
-    }
-
-    var tok: token.Token;
-    tok.pos = 0;
-    tok.len = 0;
-    tok.tag = 0;
-    report_lower_error(ctx, tok, message);
-}
-
-# lower_print_i32: print an i32 value to stderr.
-# ---
-# n: number to print
-fun lower_print_i32(n: i32) {
-    if (n < 0) {
-        print.eprint("-");
-        lower_print_i32(-n);
-        ret;
-    }
-
-    if (n == 0) {
-        print.eprint("0");
-        ret;
-    }
-
-    var buf: [16]u8;
-    var len: i32 = 0;
-    var num: i32 = n;
-
-    for (num > 0) {
-        buf[len] = (num % 10)::u8 + 48;
-        num = num / 10;
-        len = len + 1;
-    }
-
-    # print in forward order
-    var j: i32 = len - 1;
-    for (j >= 0) {
-        var ch: [2]u8;
-        ch[0] = buf[j];
-        ch[1] = 0;
-        print.eprint((?ch[0])::str);
-        j = j - 1;
-    }
-}
-
-# lower_print_error_line: print a source line with a caret at the column.
-# ---
-# source: full source text
-# line:   1-based line number
-# col:    1-based column number
-fun lower_print_error_line(source: str, line: i32, col: i32) {
-    if (source == nil || line < 1) {
-        ret;
-    }
-
-    var current_line: i32 = 1;
-    var line_start: i32 = 0;
-    var i: i32 = 0;
-    val len: i32 = str_len(source)::i32;
-
-    for (i < len && current_line < line) {
-        if (source[i::usize] == 10) {
-            current_line = current_line + 1;
-            line_start = i + 1;
-        }
-        i = i + 1;
-    }
-
-    if (current_line != line) {
-        ret;
-    }
-
-    var line_end: i32 = line_start;
-    for (line_end < len && source[line_end::usize] != 10) {
-        line_end = line_end + 1;
-    }
-
-    # print line number and content
-    print.eprint("  ");
-    lower_print_i32(line);
-    print.eprint(" | ");
-    i = line_start;
-    for (i < line_end) {
-        var ch: [2]u8;
-        ch[0] = source[i::usize];
-        ch[1] = 0;
-        print.eprint((?ch[0])::str);
-        i = i + 1;
-    }
-    print.eprintln("");
-
-    # caret line — align prefix width with line number
-    print.eprint("  ");
-    var digits: i32 = line;
-    for (digits > 0) {
-        print.eprint(" ");
-        digits = digits / 10;
-    }
-    print.eprint(" | ");
-    var c: i32 = 1;
-    for (c < col) {
-        print.eprint(" ");
-        c = c + 1;
-    }
-    print.eprintln("^");
-}
-
-# print_lower_errors: print all collected lowering errors to stderr.
-# ---
-# ctx: lowering context
-pub fun print_lower_errors(ctx: *LowerContext) {
-    if (ctx == nil || ctx.errors == nil || ctx.error_count == 0) {
-        ret;
-    }
-
-    var i: i32 = 0;
-    for (i < ctx.error_count) {
-        val e: *LowerError = ?ctx.errors[i];
-
-        print.eprint("error: ");
-        if (e.message != nil) {
-            print.eprintln(e.message);
-        } or {
-            print.eprintln("(null message)");
-        }
-
-        if (e.file_path != nil) {
-            print.eprint(e.file_path);
-            print.eprint(":");
-        } or {
-            print.eprint("<unknown>:");
-        }
-
-        lower_print_i32(e.line);
-        print.eprint(":");
-        lower_print_i32(e.col);
-        print.eprintln("");
-
-        lower_print_error_line(e.source, e.line, e.col);
-        i = i + 1;
-    }
-
-    lower_print_i32(ctx.error_count);
-    print.eprint(" lowering error(s) found");
-    if (ctx.error_count >= 20) {
-        print.eprintln(" (error limit reached)");
-    } or {
-        print.eprintln("");
-    }
-}
-
-# has_lower_errors: check if the lowering context has recorded any errors.
-# ---
-# ctx: lowering context
-# ret: true if errors were recorded
-pub fun has_lower_errors(ctx: *LowerContext) bool {
-    if (ctx == nil) {
-        ret false;
-    }
-    ret ctx.error_count > 0;
-}
-
-# annotate_instr: set source location on an IR instruction from an AST node.
-# ---
-# ctx:   lowering context
-# block: IR block containing the instruction
-# idx:   instruction index in block
-# node:  AST node providing source location
-pub fun annotate_instr(ctx: *LowerContext, block: *ir.IRBlock, idx: i32, node: *ast.Node) {
-    if (ctx == nil || block == nil || idx < 0 || idx >= block.instr_count || node == nil) {
-        ret;
-    }
-    if (ctx.text == nil || ctx.current_file_idx == 0) {
-        ret;
-    }
-    val line: i32 = line_for_pos_ctx(ctx, node.tok.pos);
-    if (line > 0) {
-        block.instrs[idx].src_line = line;
-        block.instrs[idx].src_file = ctx.current_file_idx;
-    }
-}
-
-# lookup_symbol_in_imports: search imported modules for a symbol by name.
-# ---
-# when current_sema_mod is set, searches only the modules that the current
-# module explicitly imports (aliases + direct imports). falls back to the
-# flat loaded_mods scan when current_sema_mod is nil (main module case).
-# ctx:  lowering context
-# name: symbol name to find
-# ret:  pointer to symbol if found, nil otherwise
-pub fun lookup_symbol_in_imports(ctx: *LowerContext, name: str) *symbol.Symbol {
-    if (ctx == nil || name == nil) {
-        ret nil;
-    }
-
-    # prefer targeted search via current module's imports
-    if (ctx.current_sema_mod != nil) {
-        # search aliased modules (use alias: module.path)
-        var alias: *sema.ModuleAlias = ctx.current_sema_mod.aliases;
-        for (alias != nil) {
-            if (alias.module != nil && alias.module.table != nil) {
-                val root: *symbol.Scope = symbol.table_root_scope(alias.module.table);
-                if (root != nil) {
-                    val found_opt: Option[*symbol.Symbol] = symbol.scope_lookup_local(root, name);
-                    if (option_is_some[*symbol.Symbol](found_opt)) {
-                        val found: *symbol.Symbol = option_unwrap[*symbol.Symbol](found_opt);
-                        if (found.is_public) { ret found; }
-                    }
-                }
-            }
-            alias = alias.next;
-        }
-
-        # search direct imports (use module.path)
-        var imp: *sema.ModuleImport = ctx.current_sema_mod.imports;
-        for (imp != nil) {
-            if (imp.module != nil && imp.module.table != nil) {
-                val root: *symbol.Scope = symbol.table_root_scope(imp.module.table);
-                if (root != nil) {
-                    val found_opt: Option[*symbol.Symbol] = symbol.scope_lookup_local(root, name);
-                    if (option_is_some[*symbol.Symbol](found_opt)) {
-                        val found: *symbol.Symbol = option_unwrap[*symbol.Symbol](found_opt);
-                        if (found.is_public) { ret found; }
-                    }
-                }
-            }
-            imp = imp.next;
-        }
-
-        ret nil;
-    }
-
-    # fallback: scan all loaded modules (main module has no current_sema_mod yet)
-    if (ctx.loaded_mods == nil) {
-        ret nil;
-    }
-    var i: i32 = 0;
-    for (i < ctx.loaded_mod_count) {
-        val smod: *sema.SemaModule = ctx.loaded_mods[i];
-        if (smod != nil && smod.table != nil) {
-            val root: *symbol.Scope = symbol.table_root_scope(smod.table);
-            if (root != nil) {
-                val found_opt: Option[*symbol.Symbol] = symbol.scope_lookup_local(root, name);
-                if (option_is_some[*symbol.Symbol](found_opt)) {
-                    val found: *symbol.Symbol = option_unwrap[*symbol.Symbol](found_opt);
-                    if (found.is_public) {
-                        ret found;
-                    }
-                }
-            }
-        }
-        i = i + 1;
-    }
-
-    ret nil;
-}
-
-# reset_function_state: reset per-function state for a new function.
-# ---
-# ctx: lowering context
-# ret: none
-pub fun reset_function_state(ctx: *LowerContext) {
-    if (ctx == nil) {
-        ret;
-    }
-
-    # reset local variables
-    ctx.local_count = 0;
-    ctx.stack_offset = 0;
-    local_hash_clear(ctx);
-
-    # reset deferred statements
-    ctx.deferred_count = 0;
-    ctx.loop_mark_count = 0;
-
-    # reset loop labels
-    ctx.loop_start_label = nil;
-    ctx.loop_end_label = nil;
-
-    # reset function-specific state
-    ctx.fn_ret_type = nil;
-    ctx.fn_has_sret = false;
-    ctx.sret_offset = 0;
-
-    # reset variadic state
-    ctx.fn_is_variadic = false;
-    ctx.va_reg_save_off = 0;
-    ctx.va_named_gp = 0;
-    ctx.va_named_fp = 0;
-    ctx.va_named_stack_slots = 0;
-
-    # note: we don't reset vreg_next so registers are unique across functions
-}
-
-# add_ir_function: add an IR function to the context storage.
-# ---
-# ctx:  lowering context
-# func: IR function to add
-# ret:  true on success, false on failure
-pub fun add_ir_function(ctx: *LowerContext, func: *ir.IRFunction) bool {
-    if (ctx == nil || func == nil) {
-        ret false;
-    }
-
-    # grow array if needed
-    if (ctx.ir_func_count >= ctx.ir_func_cap) {
-        var new_cap: i32 = 16;
-        if (ctx.ir_func_cap > 0) {
-            new_cap = ctx.ir_func_cap * 2;
-        }
-
-        val r: Result[**ir.IRFunction, allocator.AllocError] = allocator.allocator_resize[*ir.IRFunction](
-            ctx.alloc, ctx.ir_funcs, ctx.ir_func_cap::usize, new_cap::usize
-        );
-        if (result_is_err[**ir.IRFunction, allocator.AllocError](r)) {
-            ret false;
-        }
-
-        ctx.ir_funcs = result_unwrap_ok[**ir.IRFunction, allocator.AllocError](r);
-        ctx.ir_func_cap = new_cap;
-    }
-
-    ctx.ir_funcs[ctx.ir_func_count] = func;
-    ctx.ir_func_count = ctx.ir_func_count + 1;
-
-    ret true;
-}
-
-# hash_name: FNV-1a hash of a null-terminated string.
-# ---
-# name: string to hash
-# ret:  32-bit hash value
-fun hash_name(name: str) u32 {
-    var h: u32 = 2166136261;
-    var i: usize = 0;
-    for (name[i] != 0) {
-        h = h ^ name[i]::u32;
-        h = h * 16777619;
-        i = i + 1;
-    }
-    ret h;
-}
-
-# local_hash_insert: insert a local variable index into the hash table.
-# ---
-# ctx: lowering context
-# name: variable name
-# idx:  index in local_vars array
-fun local_hash_insert(ctx: *LowerContext, name: str, idx: i32) {
-    if (ctx.local_hash == nil || ctx.local_hash_cap == 0) {
-        ret;
-    }
-
-    val mask: u32 = (ctx.local_hash_cap - 1)::u32;
-    var slot: u32 = hash_name(name) & mask;
-
-    for (true) {
-        val entry: i32 = ctx.local_hash[slot::usize];
-        if (entry < 0) {
-            # empty slot — insert here
-            ctx.local_hash[slot::usize] = idx;
-            ret;
-        }
-        # if existing entry has the same name, overwrite (re-declaration)
-        if (ctx.local_vars[entry::usize].name != nil && str_equals(ctx.local_vars[entry::usize].name, name)) {
-            ctx.local_hash[slot::usize] = idx;
-            ret;
-        }
-        slot = (slot + 1) & mask;
-    }
-}
-
-# local_hash_grow: grow and rehash the local variable hash table.
-# ---
-# ctx: lowering context
-fun local_hash_grow(ctx: *LowerContext) {
-    var new_cap: i32 = 16;
-    if (ctx.local_hash_cap > 0) {
-        new_cap = ctx.local_hash_cap * 2;
-    }
-
-    val r: Result[*i32, allocator.AllocError] = allocator.allocator_resize[i32](
-        ctx.alloc, nil, 0, new_cap::usize
-    );
-    if (result_is_err[*i32, allocator.AllocError](r)) {
-        ret;
-    }
-
-    val old_hash: *i32 = ctx.local_hash;
-    val old_cap: i32 = ctx.local_hash_cap;
-
-    ctx.local_hash = result_unwrap_ok[*i32, allocator.AllocError](r);
-    ctx.local_hash_cap = new_cap;
-
-    # fill with -1 (empty)
-    var j: i32 = 0;
-    for (j < new_cap) {
-        ctx.local_hash[j::usize] = -1;
-        j = j + 1;
-    }
-
-    # rehash existing entries
-    var k: i32 = 0;
-    for (k < ctx.local_count) {
-        if (ctx.local_vars[k::usize].name != nil) {
-            local_hash_insert(ctx, ctx.local_vars[k::usize].name, k);
-        }
-        k = k + 1;
-    }
-}
-
-# local_hash_clear: reset the hash table for a new function.
-# ---
-# ctx: lowering context
-fun local_hash_clear(ctx: *LowerContext) {
-    var j: i32 = 0;
-    for (j < ctx.local_hash_cap) {
-        ctx.local_hash[j::usize] = -1;
-        j = j + 1;
-    }
-}
-
-# add_local_var: add a local variable to the context.
-# ---
-# ctx:   lowering context
-# name:  variable name
-# size:  size in bytes
-# ret:   stack offset for the variable
-pub fun add_local_var(ctx: *LowerContext, name: str, size: usize, var_ty: *ty.Type) i32 {
-    if (ctx == nil || ctx.alloc == nil) {
-        ret 0;
-    }
-
-    # align size to stack alignment
-    var aligned_size: usize = size;
-    if (aligned_size % ctx.stack_align != 0) {
-        aligned_size = aligned_size + (ctx.stack_align - (aligned_size % ctx.stack_align));
-    }
-
-    # grow array if needed
-    if (ctx.local_count >= ctx.local_cap) {
-        var new_cap: i32 = 8;
-        if (ctx.local_cap > 0) {
-            new_cap = ctx.local_cap * 2;
-        }
-
-        val r: Result[*LocalVar, allocator.AllocError] = allocator.allocator_resize[LocalVar](
-            ctx.alloc, ctx.local_vars, ctx.local_cap::usize, new_cap::usize
-        );
-        if (result_is_err[*LocalVar, allocator.AllocError](r)) {
-            ret 0;
-        }
-
-        ctx.local_vars = result_unwrap_ok[*LocalVar, allocator.AllocError](r);
-        ctx.local_cap = new_cap;
-    }
-
-    # allocate stack space (stack grows down)
-    ctx.stack_offset = ctx.stack_offset - aligned_size::i32;
-
-    # grow hash table if load factor > 50%
-    if (ctx.local_count * 2 >= ctx.local_hash_cap) {
-        local_hash_grow(ctx);
-    }
-
-    # add to locals array
-    val idx: i32 = ctx.local_count;
-    ctx.local_vars[idx].name = name;
-    ctx.local_vars[idx].offset = ctx.stack_offset;
-    ctx.local_vars[idx].size = size;
-    ctx.local_vars[idx].ty = var_ty;
-    ctx.local_count = ctx.local_count + 1;
-
-    # insert into hash table
-    local_hash_insert(ctx, name, idx);
-
-    ret ctx.stack_offset;
-}
-
-# find_local_var: find a local variable by name.
-# ---
-# ctx:  lowering context
-# name: variable name to find
-# ret:  index in local_vars array, or -1 if not found
-pub fun find_local_var(ctx: *LowerContext, name: str) i32 {
-    if (ctx == nil || ctx.local_vars == nil || name == nil) {
-        ret -1;
-    }
-
-    # use hash table for O(1) average lookup
-    if (ctx.local_hash != nil && ctx.local_hash_cap > 0) {
-        val mask: u32 = (ctx.local_hash_cap - 1)::u32;
-        var slot: u32 = hash_name(name) & mask;
-
-        for (true) {
-            val entry: i32 = ctx.local_hash[slot::usize];
-            if (entry < 0) {
-                ret -1;
-            }
-            if (ctx.local_vars[entry::usize].name != nil && str_equals(ctx.local_vars[entry::usize].name, name)) {
-                ret entry;
-            }
-            slot = (slot + 1) & mask;
-        }
-    }
-
-    # fallback: linear scan (should not reach here after first add)
-    var i: i32 = ctx.local_count - 1;
-    for (i >= 0) {
-        if (ctx.local_vars[i].name != nil && str_equals(ctx.local_vars[i].name, name)) {
-            ret i;
-        }
-        i = i - 1;
-    }
-
-    ret -1;
-}
-
-# get_local_var_offset: get the stack offset for a local variable.
-# ---
-# ctx:  lowering context
-# idx:  index from find_local_var
-# ret:  stack offset (negative for locals)
-pub fun get_local_var_offset(ctx: *LowerContext, idx: i32) i32 {
-    if (ctx == nil || idx < 0 || idx >= ctx.local_count) {
-        ret 0;
-    }
-    ret ctx.local_vars[idx].offset;
-}
-
-# defer_statement: add a statement to the deferred list.
-# ---
-# ctx:  lowering context
-# stmt: statement to defer (typically a fin statement)
-# ret:  none
-pub fun defer_statement(ctx: *LowerContext, stmt: *ast.Node) {
-    if (ctx == nil || ctx.alloc == nil || stmt == nil) {
-        ret;
-    }
-
-    # grow array if needed
-    if (ctx.deferred_count >= ctx.deferred_cap) {
-        var new_cap: i32 = 8;
-        if (ctx.deferred_cap > 0) {
-            new_cap = ctx.deferred_cap * 2;
-        }
-
-        val r: Result[**ast.Node, allocator.AllocError] = allocator.allocator_resize[*ast.Node](
-            ctx.alloc, ctx.deferred, ctx.deferred_cap::usize, new_cap::usize
-        );
-        if (result_is_err[**ast.Node, allocator.AllocError](r)) {
-            ret;
-        }
-
-        ctx.deferred = result_unwrap_ok[**ast.Node, allocator.AllocError](r);
-        ctx.deferred_cap = new_cap;
-    }
-
-    # add to deferred array
-    ctx.deferred[ctx.deferred_count] = stmt;
-    ctx.deferred_count = ctx.deferred_count + 1;
-}
-
-# push_loop_defer_mark: mark current deferred stack depth when entering a loop.
-# ---
-# ctx: lowering context
-# ret: none
-pub fun push_loop_defer_mark(ctx: *LowerContext) {
-    if (ctx == nil || ctx.alloc == nil) {
-        ret;
-    }
-
-    if (ctx.loop_mark_count >= ctx.loop_mark_cap) {
-        var new_cap: i32 = 8;
-        if (ctx.loop_mark_cap > 0) {
-            new_cap = ctx.loop_mark_cap * 2;
-        }
-
-        val r: Result[*i32, allocator.AllocError] = allocator.allocator_resize[i32](
-            ctx.alloc, ctx.loop_defer_marks, ctx.loop_mark_cap::usize, new_cap::usize
-        );
-        if (result_is_err[*i32, allocator.AllocError](r)) {
-            ret;
-        }
-
-        ctx.loop_defer_marks = result_unwrap_ok[*i32, allocator.AllocError](r);
-        ctx.loop_mark_cap = new_cap;
-    }
-
-    ctx.loop_defer_marks[ctx.loop_mark_count] = ctx.deferred_count;
-    ctx.loop_mark_count = ctx.loop_mark_count + 1;
-}
-
-# pop_loop_defer_mark: pop the defer mark stack when leaving a loop.
-# ---
-# ctx: lowering context
-# ret: the deferred count at loop entry (for emit_deferred_from)
-pub fun pop_loop_defer_mark(ctx: *LowerContext) i32 {
-    if (ctx == nil || ctx.loop_mark_count <= 0) {
-        ret 0;
-    }
-
-    ctx.loop_mark_count = ctx.loop_mark_count - 1;
-    ret ctx.loop_defer_marks[ctx.loop_mark_count];
-}
-
-# new_vreg: allocate a new virtual register.
-# ---
-# ctx:  lowering context
-# size: register size in bytes
-# ret:  new virtual register number
-pub fun new_vreg(ctx: *LowerContext, size: usize) i32 {
-    if (ctx == nil) {
-        ret 0;
-    }
-
-    val reg: i32 = ctx.vreg_next;
-    ctx.vreg_next = ctx.vreg_next + 1;
-    ret reg;
-}
-
-# new_label: create a new unique label.
-# ---
-# ctx:    lowering context
-# prefix: label prefix string
-# ret:    new label string
-pub fun new_label(ctx: *LowerContext, prefix: str) str {
-    if (ctx == nil || ctx.alloc == nil) {
-        ret nil;
-    }
-
-    # create label name: prefix + counter
-    # for now, use a simple numbered scheme
-    ctx.label_counter = ctx.label_counter + 1;
-
-    # allocate buffer for label name
-    # format: prefix + "." + number (estimate 16 chars max for number)
-    var prefix_len: usize = 0;
-    if (prefix != nil) {
-        prefix_len = str_len(prefix);
-    }
-    val buf_size: usize = prefix_len + 20;  # prefix + "." + number + null
-
-    val r: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](ctx.alloc, buf_size);
-    if (result_is_err[*u8, allocator.AllocError](r)) {
-        ret nil;
-    }
-
-    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](r);
-
-    # copy prefix
-    var i: usize = 0;
-    for (i < prefix_len) {
-        buf[i] = prefix[i];
-        i = i + 1;
-    }
-
-    # add "."
-    if (prefix_len > 0) {
-        buf[prefix_len] = '.';
-        i = prefix_len + 1;
-    }
-
-    # convert counter to string (manual itoa)
-    val num: i32 = ctx.label_counter;
-    var n: i32 = num;
-    var digits: i32 = 0;
-
-    # count digits
-    if (n == 0) {
-        digits = 1;
-    }
-    for (n > 0) {
-        digits = digits + 1;
-        n = n / 10;
-    }
-
-    # write digits in reverse order
-    n = num;
-    var j: i32 = digits - 1;
-    for (j >= 0) {
-        val digit: u8 = (n % 10)::u8 + '0'::u8;
-        buf[i + j::usize] = digit;
-        n = n / 10;
-        j = j - 1;
-    }
-
-    # add null terminator
-    buf[i + digits::usize] = 0;
-
-    ret buf::str;
-}
-
-# frame_mem: create a memory operand for a stack slot.
-# ---
-# ctx:    lowering context
-# offset: stack offset from frame pointer
-# size:   size in bytes
-# ret:    memory operand as IRValue
-pub fun frame_mem(ctx: *LowerContext, offset: i32, size: usize) ir.IRValue {
-    ret ir.make_mem(ctx.abi.frame_reg, -1, 1, offset::i64, size);
-}
-
-# emit_instr: emit an instruction to the current block.
-# ---
-# ctx:   lowering context
-# op:    operation code
-# dst:   destination operand
-# src1:  first source operand
-# src2:  second source operand
-# cond:  condition code (for conditional ops)
-# ret:   index of emitted instruction
-pub fun lower_emit_instr(ctx: *LowerContext, op: ir.IROp, dst: ir.IRValue, src1: ir.IRValue, src2: ir.IRValue, cond: i32) i32 {
-    if (ctx == nil || ctx.current_block == nil) {
-        ret -1;
-    }
-
-    var instr: ir.Instr;
-    instr.op = op;
-    instr.dst = dst;
-    instr.src1 = src1;
-    instr.src2 = src2;
-    instr.cond = cond::u8;
-
-    ir.emit_instr(ctx.alloc, ctx.current_block, instr.op, instr.dst, instr.src1, instr.src2, instr.cond);
-    ret ctx.current_block.instr_count - 1;
-}
-
-# emit_aggregate_copy: emit a chunked memory copy from src to dst.
-# ---
-# copies total_size bytes using 8-byte loads/stores where possible,
-# falling back to 1-byte for the remainder.
-# ctx:        lowering context
-# dst_reg:    register holding destination address
-# src_reg:    register holding source address
-# total_size: number of bytes to copy
-pub fun emit_aggregate_copy(ctx: *LowerContext, dst_reg: i32, src_reg: i32, total_size: usize) {
-    var off: usize = 0;
-    for (off < total_size) {
-        var chunk: usize = 8;
-        if (total_size - off < 8) {
-            chunk = 1;
-        }
-        val tmp_reg: i32 = new_vreg(ctx, chunk);
-        val tmp: ir.IRValue = ir.make_reg(tmp_reg, chunk);
-
-        # load from src + offset
-        val src_mem: ir.IRValue = ir.make_mem(src_reg, -1, 1, off::i64, chunk);
-        lower_emit_instr(ctx, ir.IROp{ir_load: ir.OP_LOAD}, tmp, src_mem, ir.make_none(), 0);
-
-        # store to dst + offset
-        val dst_mem: ir.IRValue = ir.make_mem(dst_reg, -1, 1, off::i64, chunk);
-        lower_emit_instr(ctx, ir.IROp{ir_store: ir.OP_STORE}, dst_mem, tmp, ir.make_none(), 0);
-
-        off = off + chunk;
-    }
-}
-
-# emit_label: emit a label instruction.
-# ---
-# ctx:   lowering context
-# label: label name
-# ret:   none
-pub fun emit_label(ctx: *LowerContext, label: str) {
-    if (ctx == nil || ctx.current_block == nil) {
-        ret;
-    }
-
-    var instr: ir.Instr;
-    instr.op = ir.IROp{ir_label: ir.OP_LABEL};
-    instr.dst = ir.make_label(label);
-    instr.src1 = ir.make_none();
-    instr.src2 = ir.make_none();
-    instr.cond = ir.CC_NONE;
-
-    lower_emit_instr(ctx, instr.op, instr.dst, instr.src1, instr.src2, 0);
-}
-
-# emit_mov: emit a move instruction.
-# ---
-# ctx:  lowering context
-# dst:  destination
-# src:  source
-# size: size in bytes
-# ret:  none
-pub fun emit_mov(ctx: *LowerContext, dst: ir.IRValue, src: ir.IRValue, size: usize) {
-    if (ctx == nil) {
-        ret;
-    }
-
-    var instr: ir.Instr;
-    instr.op = ir.IROp{ir_mov: ir.OP_MOV};
-    instr.dst = dst;
-    instr.src1 = src;
-    instr.src2 = ir.make_none();
-    instr.cond = ir.CC_NONE;
-
-    lower_emit_instr(ctx, instr.op, instr.dst, instr.src1, instr.src2, 0);
-}
-
-# emit_load: emit a load instruction.
-# ---
-# ctx:    lowering context
-# addr:   memory address to load from
-# size:   size in bytes
-# ret:    destination register value
-pub fun emit_load(ctx: *LowerContext, addr: ir.IRValue, size: usize) ir.IRValue {
-    if (ctx == nil) {
-        ret ir.make_none();
-    }
-
-    val dst_reg: i32 = new_vreg(ctx, size);
-    val dst: ir.IRValue = ir.make_reg(dst_reg, size);
-
-    var instr: ir.Instr;
-    instr.op = ir.IROp{ir_load: ir.OP_LOAD};
-    instr.dst = dst;
-    instr.src1 = addr;
-    instr.src2 = ir.make_none();
-    instr.cond = ir.CC_NONE;
-
-    lower_emit_instr(ctx, instr.op, instr.dst, instr.src1, instr.src2, 0);
-
-    ret dst;
-}
-
-# emit_load_signed: load a value with sign-extension for small types (i8, i16).
-# passes a flag via src2 to tell isel to use MOVSX instead of MOVZX.
-pub fun emit_load_signed(ctx: *LowerContext, addr: ir.IRValue, size: usize) ir.IRValue {
-    if (ctx == nil) {
-        ret ir.make_none();
-    }
-
-    val dst_reg: i32 = new_vreg(ctx, size);
-    val dst: ir.IRValue = ir.make_reg(dst_reg, size);
-
-    # src2 = imm(1) signals signed load to isel
-    ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
-                  dst, addr, ir.make_imm(1, 1), ir.CC_NONE);
-
-    ret dst;
-}
-
-# load_ptr_if_needed: for pointer types, load the pointer value from the address.
-# ---
-# ctx:    lowering context
-# addr:   address operand (may be memory or register)
-# base_ty: type of the base expression
-# ret:    loaded pointer value if pointer type, otherwise the original addr
-pub fun load_ptr_if_needed(ctx: *LowerContext, addr: ir.IRValue, base_ty: *ty.Type) ir.IRValue {
-    if (base_ty != nil && base_ty.kind == ty.TY_POINTER) {
-        ret emit_load(ctx, addr, ctx.ptr_size);
-    }
-    ret addr;
-}
-
-# emit_store: emit a store instruction.
-# ---
-# ctx:    lowering context
-# addr:   memory address to store to
-# src:    value to store
-# ret:    none
-pub fun emit_store(ctx: *LowerContext, addr: ir.IRValue, src: ir.IRValue) {
-    if (ctx == nil) {
-        ret;
-    }
-
-    # aggregate store: source is a register holding a pointer to aggregate data,
-    # destination is a memory operand with size > ptr_size. Copy addr.size bytes.
-    if (src.kind == ir.VAL_REG && addr.kind == ir.VAL_MEM && addr.size > ctx.ptr_size) {
-        val agg_dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val agg_dst_ptr: ir.IRValue = ir.make_reg(agg_dst_reg, ctx.ptr_size);
-        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                      agg_dst_ptr, addr, ir.make_none(), ir.CC_NONE);
-
-        val agg_src_reg: i32 = src.reg;
-        val agg_total: i32 = addr.size::i32;
-        var agg_off: i32 = 0;
-        for (agg_off < agg_total) {
-            var agg_chunk: usize = 8;
-            if ((agg_total - agg_off)::usize < 8) {
-                agg_chunk = (agg_total - agg_off)::usize;
-            }
-            val agg_tmp_reg: i32 = new_vreg(ctx, agg_chunk);
-            val agg_tmp: ir.IRValue = ir.make_reg(agg_tmp_reg, agg_chunk);
-
-            val agg_s: ir.IRValue = ir.make_mem(agg_src_reg, -1, 1, agg_off::i64, agg_chunk);
-            val agg_d: ir.IRValue = ir.make_mem(agg_dst_reg, -1, 1, agg_off::i64, agg_chunk);
-
-            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
-                          agg_tmp, agg_s, ir.make_none(), ir.CC_NONE);
-            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
-                          agg_d, agg_tmp, ir.make_none(), ir.CC_NONE);
-
-            agg_off = agg_off + agg_chunk::i32;
-        }
-        ret;
-    }
-
-    # for memory-to-memory copies, emit chunked load/store operations
-    # (x86 cannot do direct mem-to-mem moves)
-    if (src.kind == ir.VAL_MEM && addr.kind == ir.VAL_MEM && src.size > 0) {
-        # LEA source address
-        val src_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val src_ptr: ir.IRValue = ir.make_reg(src_reg, ctx.ptr_size);
-        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                      src_ptr, src, ir.make_none(), ir.CC_NONE);
-
-        # LEA destination address
-        val dst_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-        val dst_ptr: ir.IRValue = ir.make_reg(dst_reg, ctx.ptr_size);
-        ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_lea: ir.OP_LEA},
-                      dst_ptr, addr, ir.make_none(), ir.CC_NONE);
-
-        # copy in 8-byte chunks
-        val total: i32 = src.size::i32;
-        var off: i32 = 0;
-        for (off < total) {
-            var chunk: usize = 8;
-            if ((total - off)::usize < 8) {
-                chunk = (total - off)::usize;
-            }
-            val tmp_reg: i32 = new_vreg(ctx, chunk);
-            val tmp: ir.IRValue = ir.make_reg(tmp_reg, chunk);
-
-            val s_mem: ir.IRValue = ir.make_mem(src_reg, -1, 1, off::i64, chunk);
-            val d_mem: ir.IRValue = ir.make_mem(dst_reg, -1, 1, off::i64, chunk);
-
-            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_load: ir.OP_LOAD},
-                          tmp, s_mem, ir.make_none(), ir.CC_NONE);
-            ir.emit_instr(ctx.alloc, ctx.current_block, ir.IROp{ir_store: ir.OP_STORE},
-                          d_mem, tmp, ir.make_none(), ir.CC_NONE);
-
-            off = off + chunk::i32;
-        }
-        ret;
-    }
-
-    var instr: ir.Instr;
-    instr.op = ir.IROp{ir_store: ir.OP_STORE};
-    instr.dst = addr;  # store uses dst as address
-    instr.src1 = src;
-    instr.src2 = ir.make_none();
-    instr.cond = ir.CC_NONE;
-
-    lower_emit_instr(ctx, instr.op, instr.dst, instr.src1, instr.src2, 0);
-}
-
-# emit_ret: emit a return instruction.
-# ---
-# ctx: lowering context
-# val: value to return (can be none)
-# ret: none
-pub fun emit_ret(ctx: *LowerContext, value: ir.IRValue) {
-    if (ctx == nil) {
-        ret;
-    }
-
-    # frame teardown is handled by isel epilogue, just emit ret with value
-    var instr: ir.Instr;
-    instr.op = ir.IROp{ir_ret: ir.OP_RET};
-    instr.dst = value;
-    instr.src1 = ir.make_none();
-    instr.src2 = ir.make_none();
-    instr.cond = ir.CC_NONE;
-
-    lower_emit_instr(ctx, instr.op, instr.dst, instr.src1, instr.src2, 0);
-}
-
-# emit_br: emit an unconditional branch.
-# ---
-# ctx:   lowering context
-# label: target label
-# ret:   none
-pub fun emit_br(ctx: *LowerContext, label: str) {
-    if (ctx == nil) {
-        ret;
-    }
-
-    var instr: ir.Instr;
-    instr.op = ir.IROp{ir_jmp: ir.OP_JMP};
-    instr.dst = ir.make_label(label);
-    instr.src1 = ir.make_none();
-    instr.src2 = ir.make_none();
-    instr.cond = ir.CC_NONE;
-
-    lower_emit_instr(ctx, instr.op, instr.dst, instr.src1, instr.src2, 0);
-}
-
-# emit_brcond: emit a conditional branch (branch if cond_val is nonzero).
-# ---
-# ctx:       lowering context
-# cond_val:  value to test (branches if nonzero)
-# label:     target label
-# ret:       none
-pub fun emit_brcond(ctx: *LowerContext, cond_val: ir.IRValue, label: str) {
-    if (ctx == nil) {
-        ret;
-    }
-
-    lower_emit_instr(ctx, ir.IROp{ir_brcond: ir.OP_BRCOND}, ir.make_label(label), cond_val, ir.make_none(), 0);
-}
-
-# emit_alu: emit an ALU (arithmetic/logic) instruction.
-# ---
-# ctx:  lowering context
-# op:   operation code (add, sub, mul, etc.)
-# dst:  destination register
-# src1: first source
-# src2: second source
-# size: operand size
-# ret:  destination value
-pub fun emit_alu(ctx: *LowerContext, op: ir.IROp, dst: ir.IRValue, src1: ir.IRValue, src2: ir.IRValue, size: usize) ir.IRValue {
-    if (ctx == nil) {
-        ret ir.make_none();
-    }
-
-    var instr: ir.Instr;
-    instr.op = op;
-    instr.dst = dst;
-    instr.src1 = src1;
-    instr.src2 = src2;
-    instr.cond = ir.CC_NONE;
-
-    lower_emit_instr(ctx, instr.op, instr.dst, instr.src1, instr.src2, 0);
-
-    ret dst;
-}
-
-# emit_icmp: emit an integer comparison that produces a 0/1 value.
-# ---
-# ctx:  lowering context
-# src1: first operand
-# src2: second operand
-# cond: condition code (CC_EQ, CC_NE, CC_LT, etc.)
-# size: operand size
-# ret:  IRValue containing 0 or 1 result
-pub fun emit_icmp(ctx: *LowerContext, src1: ir.IRValue, src2: ir.IRValue, cond: u8, size: usize) ir.IRValue {
-    if (ctx == nil) {
-        ret ir.make_none();
-    }
-
-    val dst_reg: i32 = new_vreg(ctx, size);
-    val dst: ir.IRValue = ir.make_reg(dst_reg, size);
-    lower_emit_instr(ctx, ir.IROp{ir_icmp: ir.OP_ICMP}, dst, src1, src2, cond::i32);
-    ret dst;
-}
-
-# LowerModuleCtx: saved per-module fields of LowerContext for save/restore across modules.
-# ---
-# symbols:          active symbol table for the module being lowered
-# m:                masm output context for the module being lowered
-# current_sema_mod: sema module being lowered (nil for main module)
-# text:             source text for error messages
-# current_file_idx: DWARF source file index for debug info
-pub rec LowerModuleCtx {
-    symbols:          *symbol.Table;
-    m:                *masm.Masm;
-    current_sema_mod: *sema.SemaModule;
-    text:             str;
-    current_file_idx: u16;
-}
-
-# save_module_ctx: snapshot the module-specific fields of a LowerContext.
-# ---
-# ctx: lowering context to snapshot
-# out: destination for the saved fields
-pub fun save_module_ctx(ctx: *LowerContext, out: *LowerModuleCtx) {
-    out.symbols          = ctx.symbols;
-    out.m                = ctx.m;
-    out.current_sema_mod = ctx.current_sema_mod;
-    out.text             = ctx.text;
-    out.current_file_idx = ctx.current_file_idx;
-}
-
-# restore_module_ctx: restore previously saved module context into a LowerContext.
-# ---
-# ctx:   lowering context to restore into
-# saved: previously saved module context
-pub fun restore_module_ctx(ctx: *LowerContext, saved: *LowerModuleCtx) {
-    ctx.symbols          = saved.symbols;
-    ctx.m                = saved.m;
-    ctx.current_sema_mod = saved.current_sema_mod;
-    ctx.text             = saved.text;
-    ctx.current_file_idx = saved.current_file_idx;
-}
-
-# --- value and operand helpers ---
-
-# make_lit_int: create an integer literal value.
-# ---
-# alloc: allocator
-# val:   integer value
-# ret:   IRValue
-pub fun make_lit_int(alloc: *allocator.Allocator, value: i64) ir.IRValue {
-    ret ir.make_imm(value, 8);
-}
-
-# make_none: create a "none" value.
-# ---
-# ret: IRValue representing none
-pub fun make_none() ir.IRValue {
-    ret ir.make_none();
+# --- entry point ---
+
+# lower: lower a typed AST module into MASM IR.
+pub fun lower(ctx: *LowerContext, module: *ast.Node) {
+    if (ctx == nil || module == nil) { ret; }
+    ldecl.lower_module(ctx, module);
 }
