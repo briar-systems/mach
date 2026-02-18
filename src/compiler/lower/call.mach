@@ -2,242 +2,143 @@ use std.types.bool;
 use std.types.size;
 use std.types.string;
 
-use allocator: std.allocator;
-
 use ast:    mach.compiler.ast;
 use ty:     mach.compiler.type;
 use ir:     mach.compiler.masm.ir;
-use abi:    mach.compiler.masm.abi.spec;
+use abi:    mach.compiler.abi;
 
-use mach.compiler.masm.lower.lower;
+use mach.compiler.lower;
 
-# emit_call: emit a function call.
+# mach.compiler.lower.call: ABI-driven call lowering.
 # ---
-# ctx:        lowering context
-# callee:     function name or address
-# args:       argument values
-# arg_count:  number of arguments
-# ret_size:   return value size (0 for void)
-# ret:        return value register (or none)
-pub fun emit_call(ctx: *LowerContext, callee: str, args: *ir.IRValue, arg_count: i32, ret_size: usize) ir.IRValue {
-    if (ctx == nil) {
-        ret ir.make_none();
-    }
+# translates function call AST nodes into IR instructions.
+# argument classification and placement is entirely driven by
+# target.abi — no hardcoded registers or stack layout.
 
-    # calculate stack arguments count
-    val stack_arg_count: i32 = arg_count - ctx.abi.arg_reg_count;
-    val slot_sz: i32 = ctx.abi.slot_size::i32;
-    val align: i32 = ctx.abi.stack_align::i32;
-    var stack_space: i32 = 0;
-    if (stack_arg_count > 0) {
-        stack_space = stack_arg_count * slot_sz;
-        if ((stack_space % align) != 0) {
-            stack_space = stack_space + (align - (stack_space % align));
-        }
-    }
-
-    # allocate stack space and store stack arguments (forward order)
-    if (stack_arg_count > 0) {
-        lower_emit_instr(ctx, ir.IROp{ir_sub: ir.OP_SUB},
-            ir.make_reg(ctx.abi.stack_reg, ctx.ptr_size),
-            ir.make_reg(ctx.abi.stack_reg, ctx.ptr_size),
-            ir.make_imm(stack_space::i64, ctx.ptr_size), 0);
-
-        var k: i32 = 0;
-        for (k < stack_arg_count) {
-            val arg_idx: i32 = ctx.abi.arg_reg_count + k;
-            val st_offset: i64 = k::i64 * ctx.abi.slot_size::i64;
-            lower_emit_instr(ctx, ir.IROp{ir_store: ir.OP_STORE},
-                ir.make_mem(ctx.abi.stack_reg, -1, 1, st_offset, ctx.abi.slot_size),
-                args[arg_idx], ir.make_none(), 0);
-            k = k + 1;
-        }
-    }
-
-    # emit register argument moves
-    var i: i32 = 0;
-    for (i < arg_count && i < ctx.abi.arg_reg_count) {
-        val arg_reg: i32 = abi.get_arg_reg(?ctx.abi, i);
-        var mov_instr: ir.Instr;
-        mov_instr.op = ir.IROp{ir_mov: ir.OP_MOV};
-        mov_instr.dst = ir.make_reg(arg_reg, ctx.ptr_size);
-        mov_instr.src1 = args[i];
-        mov_instr.src2 = ir.make_none();
-        mov_instr.cond = ir.CC_NONE;
-        lower_emit_instr(ctx, mov_instr.op, mov_instr.dst, mov_instr.src1, mov_instr.src2, 0);
-        i = i + 1;
-    }
-
-    # emit call instruction
-    var call_instr: ir.Instr;
-    call_instr.op = ir.IROp{ir_call: ir.OP_CALL};
-    call_instr.dst = ir.make_label(callee);
-    call_instr.src1 = ir.make_none();
-    call_instr.src2 = ir.make_none();
-    call_instr.cond = ir.CC_NONE;
-    lower_emit_instr(ctx, call_instr.op, call_instr.dst, call_instr.src1, call_instr.src2, 0);
-
-    # clean up stack after call (caller cleans up)
-    if (stack_arg_count > 0) {
-        lower_emit_instr(ctx, ir.IROp{ir_add: ir.OP_ADD},
-            ir.make_reg(ctx.abi.stack_reg, ctx.ptr_size),
-            ir.make_reg(ctx.abi.stack_reg, ctx.ptr_size),
-            ir.make_imm(stack_space::i64, ctx.ptr_size), 0);
-    }
-
-    # save return register to vreg after call - subsequent expressions may clobber it,
-    # and return type may not be resolved for calls in imported module functions
-    var ret_sz: usize = ctx.abi.slot_size;
-    if (ret_size > 0) {
-        ret_sz = ret_size;
-    }
-    val result_reg: i32 = new_vreg(ctx, ret_sz);
-    val result: ir.IRValue = ir.make_reg(result_reg, ret_sz);
-    lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, result, ir.make_reg(ctx.abi.ret_reg, ret_sz), ir.make_none(), 0);
-    ret result;
-}
-
-# emit_indirect_call: emit an indirect function call through a register.
-# ---
-# ctx:       lowering context
-# fn_ptr:    IRValue containing the function pointer (typically a vreg)
-# args:      pointer to array of argument IRValues
+# emit_call: lower a function call.
+# callee_name: function name/label
+# args: array of already-lowered argument operands
+# arg_types: corresponding types for each argument
 # arg_count: number of arguments
-# ret_size:  size of return value (0 for void)
-# ret:       IRValue containing return value (RAX) or none
-pub fun emit_indirect_call(ctx: *LowerContext, fn_ptr: ir.IRValue, args: *ir.IRValue, arg_count: i32, ret_size: usize) ir.IRValue {
-    if (ctx == nil) {
-        ret ir.make_none();
-    }
+# ret_type: return type (nil for void)
+# is_variadic: true if the callee is variadic
+pub fun emit_call(ctx: *LowerContext, callee_name: str,
+                  args: *ir.Operand, arg_types: **ty.Type,
+                  arg_count: i32, ret_type: *ty.Type,
+                  is_variadic: bool) ir.Operand {
+    if (ctx == nil) { ret ir.make_none(); }
 
-    # calculate stack arguments count
-    val stack_arg_count: i32 = arg_count - ctx.abi.arg_reg_count;
-    val ic_slot_sz: i32 = ctx.abi.slot_size::i32;
-    val ic_align: i32 = ctx.abi.stack_align::i32;
-    var stack_space: i32 = 0;
-    if (stack_arg_count > 0) {
-        stack_space = stack_arg_count * ic_slot_sz;
-        if ((stack_space % ic_align) != 0) {
-            stack_space = stack_space + (ic_align - (stack_space % ic_align));
+    val a: *abi.ABI = ?ctx.target.abi;
+    val psz: u8 = ctx.ptr_size;
+
+    # --- classify return value ---
+    var sret_ptr: ir.Operand = ir.make_none();
+    var has_sret: bool = false;
+    var ret_slot: abi.ParamSlot;
+
+    if (ret_type != nil && !ty.type_is_void(ret_type)) {
+        val ret_size: usize = type_size(ctx, ret_type);
+        val ret_align: usize = ty.type_align(ret_type);
+        val is_float: bool = is_float_type(ret_type);
+        val is_agg: bool = ty.type_is_record(ret_type) || ty.type_is_union(ret_type);
+
+        ret_slot = a.classify_return(a.ctx, ret_size, ret_align, is_float, is_agg);
+
+        if (ret_slot.class == abi.CLASS_SRET) {
+            # allocate stack space for struct return
+            val lv: *LocalVar = local_add(ctx, ".sret_tmp", ret_type, ret_size);
+            if (lv != nil) {
+                sret_ptr = new_vreg(ctx, psz);
+                val mem: ir.Operand = local_operand(lv, psz);
+                emit(ctx, ir.OP_ADDR, sret_ptr, mem, ir.make_none(), ir.CC_NONE);
+                has_sret = true;
+            }
         }
     }
 
-    # allocate stack space and store stack arguments (forward order)
-    if (stack_arg_count > 0) {
-        lower_emit_instr(ctx, ir.IROp{ir_sub: ir.OP_SUB},
-            ir.make_reg(ctx.abi.stack_reg, ctx.ptr_size),
-            ir.make_reg(ctx.abi.stack_reg, ctx.ptr_size),
-            ir.make_imm(stack_space::i64, ctx.ptr_size), 0);
+    # --- classify and place arguments ---
+    var gp_used: i32 = 0;
+    var fp_used: i32 = 0;
 
-        var k: i32 = 0;
-        for (k < stack_arg_count) {
-            val ic_arg_idx: i32 = ctx.abi.arg_reg_count + k;
-            val ic_st_offset: i64 = k::i64 * ctx.abi.slot_size::i64;
-            lower_emit_instr(ctx, ir.IROp{ir_store: ir.OP_STORE},
-                ir.make_mem(ctx.abi.stack_reg, -1, 1, ic_st_offset, ctx.abi.slot_size),
-                args[ic_arg_idx], ir.make_none(), 0);
-            k = k + 1;
+    # if sret, the hidden pointer consumes the first GP register
+    if (has_sret) { gp_used = 1; }
+
+    # first pass: classify all arguments
+    var i: i32 = 0;
+    for (i < arg_count) {
+        val arg_type: *ty.Type = arg_types[i];
+        val arg_size: usize = type_size(ctx, arg_type);
+        val arg_align: usize = ty.type_align(arg_type);
+        val is_float: bool = is_float_type(arg_type);
+        val is_agg: bool = ty.type_is_record(arg_type) || ty.type_is_union(arg_type);
+
+        val slot: abi.ParamSlot = a.classify_param(a.ctx, i, arg_size, arg_align,
+                                                    is_float, is_agg,
+                                                    gp_used, fp_used);
+
+        if (slot.class == abi.CLASS_GP || slot.class == abi.CLASS_BYREF) {
+            # move argument to the designated GP register
+            val dst: ir.Operand = ir.make_reg(slot.reg.id, psz);
+            if (slot.class == abi.CLASS_BYREF) {
+                # pass address of the argument
+                val addr: ir.Operand = new_vreg(ctx, psz);
+                emit(ctx, ir.OP_ADDR, addr, args[i], ir.make_none(), ir.CC_NONE);
+                emit_mov(ctx, dst, addr);
+            } or {
+                emit_mov(ctx, dst, args[i]);
+            }
+            gp_used = gp_used + 1;
+        } or (slot.class == abi.CLASS_FP) {
+            val dst: ir.Operand = ir.make_reg(slot.reg.id, arg_size::u8);
+            emit_mov(ctx, dst, args[i]);
+            fp_used = fp_used + 1;
+        } or (slot.class == abi.CLASS_STACK) {
+            # push argument onto the stack at the correct offset
+            val stack_dst: ir.Operand = ir.make_mem(ir.VREG_START - 1, -1, 1,
+                                                     slot.offset, arg_size::u8);
+            emit_store(ctx, stack_dst, args[i]);
+        }
+
+        i = i + 1;
+    }
+
+    # --- sret hidden pointer ---
+    if (has_sret) {
+        val gp_regs: abi.ParamSlot = a.classify_param(a.ctx, 0, ctx.target.ptr_size,
+            ctx.target.ptr_size, false, false, 0, 0);
+        val sret_dst: ir.Operand = ir.make_reg(gp_regs.reg.id, psz);
+        emit_mov(ctx, sret_dst, sret_ptr);
+    }
+
+    # --- variadic: set FP count register ---
+    if (is_variadic) {
+        val vinfo: abi.VariadicInfo = a.variadic_info(a.ctx);
+        if (vinfo.needs_fp_count) {
+            val fp_count_dst: ir.Operand = ir.make_reg(vinfo.fp_count_reg.id,
+                                                        vinfo.fp_count_reg.width);
+            val fp_count_val: ir.Operand = ir.make_imm(fp_used::i64,
+                                                        vinfo.fp_count_reg.width);
+            emit_mov(ctx, fp_count_dst, fp_count_val);
         }
     }
 
-    # emit register argument moves
-    var i: i32 = 0;
-    for (i < arg_count && i < ctx.abi.arg_reg_count) {
-        val arg_reg: i32 = abi.get_arg_reg(?ctx.abi, i);
-        lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, ir.make_reg(arg_reg, ctx.ptr_size), args[i], ir.make_none(), 0);
-        i = i + 1;
-    }
+    # --- emit call instruction ---
+    emit(ctx, ir.OP_CALL, ir.make_label(callee_name), ir.make_none(),
+         ir.make_none(), ir.CC_NONE);
 
-    # emit indirect call instruction (src1 = fn_ptr register)
-    lower_emit_instr(ctx, ir.IROp{ir_call: ir.OP_CALL}, ir.make_none(), fn_ptr, ir.make_none(), 0);
-
-    # clean up stack after call
-    if (stack_arg_count > 0) {
-        lower_emit_instr(ctx, ir.IROp{ir_add: ir.OP_ADD},
-            ir.make_reg(ctx.abi.stack_reg, ctx.ptr_size),
-            ir.make_reg(ctx.abi.stack_reg, ctx.ptr_size),
-            ir.make_imm(stack_space::i64, ctx.ptr_size), 0);
-    }
-
-    # save return register to vreg after call
-    var ic_ret_sz: usize = ctx.abi.slot_size;
-    if (ret_size > 0) {
-        ic_ret_sz = ret_size;
-    }
-    val ic_result_reg: i32 = new_vreg(ctx, ic_ret_sz);
-    val ic_result: ir.IRValue = ir.make_reg(ic_result_reg, ic_ret_sz);
-    lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, ic_result, ir.make_reg(ctx.abi.ret_reg, ic_ret_sz), ir.make_none(), 0);
-    ret ic_result;
-}
-
-# emit_sycall: emit a system call instruction.
-# ---
-# ctx:  lowering context
-# num:  syscall number
-# args: syscall arguments (up to 6)
-# ret:  return value in rax
-pub fun emit_syscall(ctx: *LowerContext, num: i64, args: *ir.IRValue, arg_count: i32) ir.IRValue {
-    if (ctx == nil) {
+    # --- handle return value ---
+    if (ret_type == nil || ty.type_is_void(ret_type)) {
         ret ir.make_none();
     }
 
-    # emit argument moves to syscall registers
-    var i: i32 = 0;
-    for (i < arg_count && i < ctx.abi.syscall_reg_count) {
-        val syscall_reg: i32 = ctx.abi.syscall_regs[i];
-        lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV},
-            ir.make_reg(syscall_reg, ctx.ptr_size), args[i], ir.make_none(), 0);
-        i = i + 1;
+    if (has_sret) {
+        # return value is in the sret buffer — load it
+        ret sret_ptr;
     }
 
-    # move syscall number to syscall number register
-    lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV},
-        ir.make_reg(ctx.abi.syscall_num_reg, ctx.ptr_size),
-        ir.make_imm(num, ctx.ptr_size), ir.make_none(), 0);
-
-    # emit syscall instruction
-    lower_emit_instr(ctx, ir.IROp{ir_syscall: ir.OP_SYSCALL},
-        ir.make_none(), ir.make_none(), ir.make_none(), 0);
-
-    # copy return value to vreg
-    val sc_result_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val sc_result: ir.IRValue = ir.make_reg(sc_result_reg, ctx.ptr_size);
-    lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, sc_result,
-        ir.make_reg(ctx.abi.ret_reg, ctx.ptr_size), ir.make_none(), 0);
-    ret sc_result;
-}
-
-pub fun emit_syscall_value(ctx: *LowerContext, num_val: ir.IRValue, args: *ir.IRValue, arg_count: i32) ir.IRValue {
-    if (ctx == nil) {
-        ret ir.make_none();
-    }
-
-    # emit argument moves to syscall registers
-    var i: i32 = 0;
-    for (i < arg_count && i < ctx.abi.syscall_reg_count) {
-        val syscall_reg: i32 = ctx.abi.syscall_regs[i];
-        lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV},
-            ir.make_reg(syscall_reg, ctx.ptr_size), args[i], ir.make_none(), 0);
-        i = i + 1;
-    }
-
-    # move syscall number into syscall number register
-    if (num_val.kind == ir.VAL_IMM) {
-        lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV},
-            ir.make_reg(ctx.abi.syscall_num_reg, ctx.ptr_size),
-            num_val, ir.make_none(), 0);
-    } or {
-        emit_mov(ctx, ir.make_reg(ctx.abi.syscall_num_reg, ctx.ptr_size), num_val, ctx.ptr_size);
-    }
-
-    # emit syscall instruction
-    lower_emit_instr(ctx, ir.IROp{ir_syscall: ir.OP_SYSCALL},
-        ir.make_none(), ir.make_none(), ir.make_none(), 0);
-
-    # copy return value to vreg
-    val sc2_result_reg: i32 = new_vreg(ctx, ctx.ptr_size);
-    val sc2_result: ir.IRValue = ir.make_reg(sc2_result_reg, ctx.ptr_size);
-    lower_emit_instr(ctx, ir.IROp{ir_mov: ir.OP_MOV}, sc2_result,
-        ir.make_reg(ctx.abi.ret_reg, ctx.ptr_size), ir.make_none(), 0);
-    ret sc2_result;
+    # move return value from the ABI-specified location
+    val result: ir.Operand = new_vreg(ctx, type_size_u8(ctx, ret_type));
+    val ret_reg: ir.Operand = ir.make_reg(ret_slot.reg.id, type_size_u8(ctx, ret_type));
+    emit_mov(ctx, result, ret_reg);
+    ret result;
 }
