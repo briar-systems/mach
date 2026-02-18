@@ -12,9 +12,12 @@ use x86_enc: mach.compiler.masm.isa.x86_64.encode;
 use x86_buf: mach.compiler.masm.isa.x86_64.buf;
 use x86_opt: mach.compiler.masm.isa.x86_64.opt;
 use operand: mach.compiler.masm.operand;
-use spec:    mach.compiler.masm.isa.spec;
-use sym:     mach.compiler.masm.symbol;
-use print:   std.print;
+use spec:      mach.compiler.masm.isa.spec;
+use sym:       mach.compiler.masm.symbol;
+use abi_spec:  mach.compiler.masm.abi.spec;
+use abi_dispatch: mach.compiler.masm.abi.dispatch;
+use target:    mach.compiler.masm.target;
+use print:     std.print;
 
 # mach.compiler.masm.isa.x86_64.isel: x86_64 instruction selection.
 # ---
@@ -33,15 +36,16 @@ val LV_BLOCK_MAX: usize = 3;
 val LV_SIZES:     usize = 4;
 val LV_FLOAT_BIT: i32 = 0x40000000; # high bit flag in LV_SIZES for float vregs
 
-# register pool: callee-saved registers available for allocation
-val REG_POOL_SIZE: i32 = 5;
-
-fun reg_pool_at(idx: i32) i32 {
-    if (idx == 0) { ret 3; }  # RBX
-    if (idx == 1) { ret 12; } # R12
-    if (idx == 2) { ret 13; } # R13
-    if (idx == 3) { ret 14; } # R14
-    ret 15;                    # R15
+# callee_saved_at: get the callee-saved register at the given pool index.
+# ---
+# ctx: isel context (provides ABI callee-saved array)
+# idx: pool index
+# ret: physical register number
+fun callee_saved_at(ctx: *ISelContext, idx: i32) i32 {
+    if (ctx == nil || ctx.abi.callee_saved == nil || idx < 0 || idx >= ctx.abi.callee_saved_count) {
+        ret -1;
+    }
+    ret ctx.abi.callee_saved[idx];
 }
 
 # ISelContext: context for instruction selection.
@@ -87,6 +91,7 @@ pub rec ISelContext {
     vreg_phys_cap:    usize;
     callee_saved_mask:  i32;
     callee_saved_count: i32;
+    abi:              abi_spec.ABI;
     func_name:        str;
     current_block:    *ir.IRBlock;
     current_instr_idx: i32;
@@ -98,7 +103,7 @@ pub rec ISelContext {
 # text:  text section to emit to
 # m:     masm context
 # ret:   initialized ISelContext
-pub fun init(alloc: *allocator.Allocator, text: *section.Section, m: *masm.Masm) ISelContext {
+pub fun init(alloc: *allocator.Allocator, text: *section.Section, m: *masm.Masm, a: abi_spec.ABI) ISelContext {
     var ctx: ISelContext;
     ctx.alloc = alloc;
     ctx.text = text;
@@ -108,8 +113,9 @@ pub fun init(alloc: *allocator.Allocator, text: *section.Section, m: *masm.Masm)
     ctx.next_vreg_slot = 0;
     ctx.base_stack_size = 0;
     ctx.total_stack_size = 0;
-    ctx.ptr_size = 8;
+    ctx.ptr_size = m.tgt.ptr_size;
     ctx.m = m;
+    ctx.abi = a;
     ctx.instr_buf = x86_buf.buf_init(alloc);
     ctx.liveness = nil;
     ctx.liveness_cap = 0;
@@ -196,16 +202,17 @@ pub fun get_vreg_offset(ctx: *ISelContext, vreg_id: i32, size: usize) i32 {
 
     # assign offset if not yet assigned
     if (ctx.vreg_offsets[idx] == 0) {
+        val ss: usize = ctx.abi.slot_size;
         var slots: usize = 1;
-        if (size > 8) {
-            slots = ((size + 7) / 8)::usize;
+        if (size > ss) {
+            slots = ((size + ss - 1) / ss)::usize;
         }
-        ctx.vreg_offsets[idx] = (ctx.base_stack_size + (ctx.next_vreg_slot + 1) * 8)::i32;
+        ctx.vreg_offsets[idx] = (ctx.base_stack_size + (ctx.next_vreg_slot + 1) * ss)::i32;
         ctx.next_vreg_slot = ctx.next_vreg_slot + slots;
     }
 
-    # shift past callee-saved push area (pushes occupy [rbp-8..rbp-N*8])
-    val callee_push_adj: i32 = ctx.callee_saved_count * 8;
+    # shift past callee-saved push area
+    val callee_push_adj: i32 = ctx.callee_saved_count * ctx.abi.slot_size::i32;
     ret ctx.vreg_offsets[idx] + callee_push_adj;
 }
 
@@ -511,10 +518,10 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
                 if (ctx.liveness[rv::usize * LV_STRIDE + LV_LAST_USE] < cur_def) {
                     val freed_reg: i32 = ctx.vreg_phys_reg[rv::usize];
                     var pi: i32 = 0;
-                    for (pi < REG_POOL_SIZE) {
-                        if (reg_pool_at(pi) == freed_reg) {
+                    for (pi < ctx.abi.callee_saved_count) {
+                        if (callee_saved_at(ctx, pi) == freed_reg) {
                             reg_free_mask = reg_free_mask | (1 << pi::usize);
-                            pi = REG_POOL_SIZE;
+                            pi = ctx.abi.callee_saved_count;
                         }
                         pi = pi + 1;
                     }
@@ -543,11 +550,11 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
                 if (reg_free_mask != 0) {
                     # find lowest free register in pool
                     var pi: i32 = 0;
-                    for (pi < REG_POOL_SIZE) {
+                    for (pi < ctx.abi.callee_saved_count) {
                         if ((reg_free_mask & (1 << pi::usize)) != 0) {
-                            ctx.vreg_phys_reg[vi] = reg_pool_at(pi);
+                            ctx.vreg_phys_reg[vi] = callee_saved_at(ctx, pi);
                             reg_free_mask = reg_free_mask ^ (1 << pi::usize);
-                            pi = REG_POOL_SIZE;
+                            pi = ctx.abi.callee_saved_count;
                         }
                         pi = pi + 1;
                     }
@@ -683,19 +690,21 @@ pub fun scan_function(ctx: *ISelContext, func: *ir.IRFunction) {
 
     # calculate total stack size: locals + vregs only
     # callee-saved regs are saved via push after frame setup (not in sub rsp)
-    ctx.total_stack_size = ctx.base_stack_size + (ctx.next_vreg_slot * 8);
+    val slot_sz: usize = ctx.abi.slot_size;
+    val stack_al: usize = ctx.abi.stack_align;
+    ctx.total_stack_size = ctx.base_stack_size + (ctx.next_vreg_slot * slot_sz);
 
-    # align to 16 bytes, accounting for callee-saved pushes
-    # after call (ret addr) + push rbp + N callee pushes: (2+N) pushes total
-    # if N is odd: RSP is 8-misaligned before sub rsp, need total_stack_size % 16 == 8
-    # if N is even: RSP is 16-aligned before sub rsp, need total_stack_size % 16 == 0
+    # align to stack_align, accounting for callee-saved pushes
+    # after call (ret addr) + push frame_reg + N callee pushes: (2+N) pushes total
+    # if N is odd: RSP is half-aligned before sub rsp, need total_stack_size % stack_align == slot_size
+    # if N is even: RSP is aligned before sub rsp, need total_stack_size % stack_align == 0
     if ((ctx.callee_saved_count % 2) != 0) {
-        if (ctx.total_stack_size % 16 == 0) {
-            ctx.total_stack_size = ctx.total_stack_size + 8;
+        if (ctx.total_stack_size % stack_al == 0) {
+            ctx.total_stack_size = ctx.total_stack_size + slot_sz;
         }
     } or {
-        if (ctx.total_stack_size % 16 != 0) {
-            ctx.total_stack_size = ctx.total_stack_size + (16 - (ctx.total_stack_size % 16));
+        if (ctx.total_stack_size % stack_al != 0) {
+            ctx.total_stack_size = ctx.total_stack_size + (stack_al - (ctx.total_stack_size % stack_al));
         }
     }
 }
@@ -3077,22 +3086,22 @@ pub fun select_instr(ctx: *ISelContext, instr: *ir.Instr) Result[bool, str] {
         }
 
         # point RSP at the callee-saved push area, then pop in reverse
-        val callee_push_bytes: i64 = ctx.callee_saved_count::i64 * 8;
+        val callee_push_bytes: i64 = ctx.callee_saved_count::i64 * ctx.abi.slot_size::i64;
         if (callee_push_bytes > 0) {
-            emit_mov_reg_reg(ctx, x86.RSP, x86.RBP, 8);
-            emit_sub_reg_imm(ctx, x86.RSP, callee_push_bytes, 8);
+            emit_mov_reg_reg(ctx, ctx.abi.stack_reg, ctx.abi.frame_reg, ctx.ptr_size);
+            emit_sub_reg_imm(ctx, ctx.abi.stack_reg, callee_push_bytes, ctx.ptr_size);
         } or {
-            emit_mov_reg_reg(ctx, x86.RSP, x86.RBP, 8);
+            emit_mov_reg_reg(ctx, ctx.abi.stack_reg, ctx.abi.frame_reg, ctx.ptr_size);
         }
 
-        var epi: i32 = REG_POOL_SIZE - 1;
+        var epi: i32 = ctx.abi.callee_saved_count - 1;
         for (epi >= 0) {
-            if ((ctx.callee_saved_mask & (1 << reg_pool_at(epi)::usize)) != 0) {
-                emit_pop_reg(ctx, reg_pool_at(epi));
+            if ((ctx.callee_saved_mask & (1 << callee_saved_at(ctx, epi)::usize)) != 0) {
+                emit_pop_reg(ctx, callee_saved_at(ctx, epi));
             }
             epi = epi - 1;
         }
-        emit_pop_reg(ctx, x86.RBP);
+        emit_pop_reg(ctx, ctx.abi.frame_reg);
         emit_ret(ctx);
     }
     or (op_tag == ir.OP_ZEXT) {
@@ -3231,20 +3240,20 @@ fun fixup_frame_offsets(ctx: *ISelContext, func: *ir.IRFunction) {
 # ctx:       isel context
 # stack_size: total stack size to allocate
 pub fun emit_prologue(ctx: *ISelContext, stack_size: usize) {
-    emit_push_reg(ctx, x86.RBP);
-    emit_mov_reg_reg(ctx, x86.RBP, x86.RSP, 8);
+    emit_push_reg(ctx, ctx.abi.frame_reg);
+    emit_mov_reg_reg(ctx, ctx.abi.frame_reg, ctx.abi.stack_reg, ctx.ptr_size);
 
     # push callee-saved registers after frame setup
     var pi: i32 = 0;
-    for (pi < REG_POOL_SIZE) {
-        if ((ctx.callee_saved_mask & (1 << reg_pool_at(pi)::usize)) != 0) {
-            emit_push_reg(ctx, reg_pool_at(pi));
+    for (pi < ctx.abi.callee_saved_count) {
+        if ((ctx.callee_saved_mask & (1 << callee_saved_at(ctx, pi)::usize)) != 0) {
+            emit_push_reg(ctx, callee_saved_at(ctx, pi));
         }
         pi = pi + 1;
     }
 
     if (stack_size > 0) {
-        emit_sub_reg_imm(ctx, x86.RSP, stack_size::i64, 8);
+        emit_sub_reg_imm(ctx, ctx.abi.stack_reg, stack_size::i64, ctx.ptr_size);
     }
 }
 
@@ -3254,19 +3263,19 @@ pub fun emit_prologue(ctx: *ISelContext, stack_size: usize) {
 # stack_size: total stack size to deallocate
 pub fun emit_epilogue(ctx: *ISelContext, stack_size: usize) {
     if (stack_size > 0) {
-        emit_add_reg_imm(ctx, x86.RSP, stack_size::i64, 8);
+        emit_add_reg_imm(ctx, ctx.abi.stack_reg, stack_size::i64, ctx.ptr_size);
     }
 
     # pop callee-saved registers in reverse order
-    var pi: i32 = REG_POOL_SIZE - 1;
+    var pi: i32 = ctx.abi.callee_saved_count - 1;
     for (pi >= 0) {
-        if ((ctx.callee_saved_mask & (1 << reg_pool_at(pi)::usize)) != 0) {
-            emit_pop_reg(ctx, reg_pool_at(pi));
+        if ((ctx.callee_saved_mask & (1 << callee_saved_at(ctx, pi)::usize)) != 0) {
+            emit_pop_reg(ctx, callee_saved_at(ctx, pi));
         }
         pi = pi - 1;
     }
 
-    emit_pop_reg(ctx, x86.RBP);
+    emit_pop_reg(ctx, ctx.abi.frame_reg);
     emit_ret(ctx);
 }
 
@@ -3377,8 +3386,9 @@ pub fun run_isel(m: *masm.Masm, funcs: **ir.IRFunction, count: i32, alloc: *allo
     }
     val text: *section.Section = result_unwrap_ok[*section.Section, str](text_res);
 
-    # create isel context
-    var ctx: ISelContext = init(alloc, text, m);
+    # create isel context with ABI from target
+    val a: abi_spec.ABI = abi_dispatch.for_target(?m.tgt);
+    var ctx: ISelContext = init(alloc, text, m, a);
 
     # process each function
     var i: i32 = 0;
