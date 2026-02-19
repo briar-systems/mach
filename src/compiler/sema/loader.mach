@@ -1,0 +1,304 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.option;
+use std.types.result;
+
+use allocator: std.allocator;
+
+use ast:      mach.compiler.ast;
+use symbol:   mach.compiler.symbol;
+use parser:   mach.compiler.parser;
+use config:   mach.config.config;
+use utilfs:   mach.util.filesystem;
+
+use mach.compiler.sema;
+use scollect: mach.compiler.sema.collect;
+use sresolve: mach.compiler.sema.resolve;
+use scheck:   mach.compiler.sema.check;
+
+# mach.compiler.sema.loader: module path resolution, file loading, recursive analysis.
+
+# load: load and analyze a module, binding its symbols into the current scope.
+pub fun load(s: *sema.Sema, mod_path: str, is_aliased: bool, alias: str) *sema.Module {
+    if (s == nil || mod_path == nil) { ret nil; }
+
+    # skip if module resolution not configured (single-file mode)
+    if (!sema.has_module_resolution(s)) { ret nil; }
+
+    # check if already loaded
+    val existing: *sema.Module = sema.find_module(s, mod_path);
+    if (existing != nil) {
+        bind_module(s, existing, is_aliased, alias);
+        ret existing;
+    }
+
+    # resolve to file path
+    val file_path: str = resolve_module_path(s, mod_path);
+    if (file_path == nil) {
+        ret nil;
+    }
+
+    # read source
+    val source_res: Result[str, str] = utilfs.read_file(file_path, s.alloc);
+    if (result_is_err[str, str](source_res)) {
+        ret nil;
+    }
+    val source: str = result_unwrap_ok[str, str](source_res);
+
+    # parse
+    var p: parser.Parser = parser.init(source, s.alloc);
+    val parse_res: Result[*ast.Node, str] = parser.parser_parse_program(?p);
+    if (result_is_err[*ast.Node, str](parse_res) || p.had_error) {
+        parser.parser_dnit(?p);
+        ret nil;
+    }
+    val mod_ast: *ast.Node = result_unwrap_ok[*ast.Node, str](parse_res);
+    parser.parser_dnit(?p);
+
+    if (mod_ast == nil) { ret nil; }
+
+    # register module
+    val mod: *sema.Module = sema.register_module(s, mod_path, file_path, source, mod_ast);
+    if (mod == nil) { ret nil; }
+
+    # save current context
+    val saved: *sema.Module = s.current;
+
+    # switch to new module
+    s.current = mod;
+
+    # run all three passes
+    scollect.run(s, mod_ast);
+    if (!s.had_error) { sresolve.run(s, mod_ast); }
+    if (!s.had_error) { scheck.run(s, mod_ast); }
+
+    mod.analyzed = true;
+
+    # restore context
+    s.current = saved;
+
+    # bind into caller's scope
+    bind_module(s, mod, is_aliased, alias);
+
+    ret mod;
+}
+
+# bind_module: bind a loaded module's symbols into the current scope.
+fun bind_module(s: *sema.Sema, mod: *sema.Module, is_aliased: bool, alias: str) {
+    if (s == nil || mod == nil || s.current == nil) { ret; }
+
+    if (is_aliased) {
+        # aliased import: define SYM_MODULE with name = alias
+        val name: str = alias;
+        if (name == nil) { ret; }
+        val def_res: Result[*symbol.Symbol, str] = sema.define(s, name, symbol.SYM_MODULE);
+        if (result_is_ok[*symbol.Symbol, str](def_res)) {
+            val sym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](def_res);
+            sym.scope = symbol.table_root_scope(?mod.table);
+            sym.module_path = mod.path;
+        }
+    } or {
+        # bare import: copy all public symbols from module's root scope
+        val root: *symbol.Scope = symbol.table_root_scope(?mod.table);
+        if (root == nil) { ret; }
+        var i: i32 = 0;
+        for (i < root.symbol_count) {
+            val src_sym: *symbol.Symbol = ?root.symbols[i];
+            if (src_sym != nil && src_sym.is_public && src_sym.name != nil) {
+                val def_res: Result[*symbol.Symbol, str] = sema.define(s, src_sym.name, src_sym.kind);
+                if (result_is_ok[*symbol.Symbol, str](def_res)) {
+                    val dst: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](def_res);
+                    dst.resolved_type = src_sym.resolved_type;
+                    dst.decl_node = src_sym.decl_node;
+                    dst.type_node = src_sym.type_node;
+                    dst.is_public = src_sym.is_public;
+                    dst.is_mutable = src_sym.is_mutable;
+                    dst.is_generic = src_sym.is_generic;
+                    dst.generic_node = src_sym.generic_node;
+                    dst.module_path = src_sym.module_path;
+                    dst.export_name = src_sym.export_name;
+                    dst.scope = src_sym.scope;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+# --- path resolution ---
+
+fun resolve_module_path(s: *sema.Sema, module_path: str) str {
+    if (s == nil || module_path == nil) { ret nil; }
+
+    val mod_len: usize = str_len(module_path);
+    if (mod_len == 0) { ret nil; }
+
+    # 1) project_id → src_root
+    if (s.project_id != nil && s.src_root != nil) {
+        val id_len: usize = str_len(s.project_id);
+        if (str_starts_with(module_path, s.project_id)) {
+            if (mod_len == id_len || (mod_len > id_len && module_path[id_len] == 46)) {
+                var rest: str = nil;
+                if (mod_len > id_len) {
+                    rest = (module_path::usize + id_len + 1)::str;
+                }
+                ret build_file_path(s, s.src_root, rest);
+            }
+        }
+    }
+
+    # 2) include paths
+    if (s.includes != nil && s.include_count > 0) {
+        var ii: i32 = 0;
+        for (ii < s.include_count) {
+            val inc_prefix: str = s.includes[ii].prefix;
+            if (inc_prefix == nil) { ii = ii + 1; cnt; }
+            val prefix_len: usize = str_len(inc_prefix);
+            if (str_starts_with(module_path, inc_prefix)) {
+                if (mod_len == prefix_len || (mod_len > prefix_len && module_path[prefix_len] == 46)) {
+                    var rest: str = nil;
+                    if (mod_len > prefix_len) {
+                        rest = (module_path::usize + prefix_len + 1)::str;
+                    }
+                    ret build_file_path(s, s.includes[ii].dir, rest);
+                }
+            }
+            ii = ii + 1;
+        }
+    }
+
+    # 3) dependencies
+    if (s.deps != nil && s.dep_count > 0 && s.dep_root != nil) {
+        var i: i32 = 0;
+        for (i < s.dep_count) {
+            val dep_name: str = s.deps[i].name;
+            if (dep_name == nil) { i = i + 1; cnt; }
+
+            val dep_project_id: str = load_dep_project_id(s, dep_name);
+            if (dep_project_id == nil) { i = i + 1; cnt; }
+
+            val dep_id_len: usize = str_len(dep_project_id);
+            if (str_starts_with(module_path, dep_project_id)) {
+                if (mod_len == dep_id_len || (mod_len > dep_id_len && module_path[dep_id_len] == 46)) {
+                    var rest: str = nil;
+                    if (mod_len > dep_id_len) {
+                        rest = (module_path::usize + dep_id_len + 1)::str;
+                    }
+                    val base_dir: str = build_dep_src_dir(s, dep_name);
+                    if (base_dir != nil) {
+                        ret build_file_path(s, base_dir, rest);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    ret nil;
+}
+
+# build_file_path: construct "base_dir/rest.mach" with dots→slashes in rest.
+fun build_file_path(s: *sema.Sema, base_dir: str, rest: str) str {
+    if (s == nil || base_dir == nil) { ret nil; }
+    if (rest == nil || str_len(rest) == 0) { ret nil; }
+
+    val base_len: usize = str_len(base_dir);
+    val rest_len: usize = str_len(rest);
+    val total: usize = base_len + 1 + rest_len + 5 + 1; # base + / + rest + .mach + \0
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](s.alloc, total);
+    if (result_is_err[*u8, allocator.AllocError](buf_res)) { ret nil; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](buf_res);
+    var pos: usize = 0;
+
+    var i: usize = 0;
+    for (i < base_len) { buf[pos] = base_dir[i]; pos = pos + 1; i = i + 1; }
+    buf[pos] = 47; pos = pos + 1;
+
+    i = 0;
+    for (i < rest_len) {
+        val c: u8 = rest[i];
+        if (c == 46) { buf[pos] = 47; } or { buf[pos] = c; }
+        pos = pos + 1;
+        i = i + 1;
+    }
+
+    buf[pos] = 46; pos = pos + 1;   # '.'
+    buf[pos] = 109; pos = pos + 1;  # 'm'
+    buf[pos] = 97; pos = pos + 1;   # 'a'
+    buf[pos] = 99; pos = pos + 1;   # 'c'
+    buf[pos] = 104; pos = pos + 1;  # 'h'
+    buf[pos] = 0;
+
+    ret buf::&u8;
+}
+
+# build_dep_src_dir: construct "dep_root/dep_name/src".
+fun build_dep_src_dir(s: *sema.Sema, dep_name: str) str {
+    if (s == nil || s.dep_root == nil || dep_name == nil) { ret nil; }
+
+    val root_len: usize = str_len(s.dep_root);
+    val name_len: usize = str_len(dep_name);
+    val total: usize = root_len + 1 + name_len + 4 + 1; # root + / + name + /src + \0
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](s.alloc, total);
+    if (result_is_err[*u8, allocator.AllocError](buf_res)) { ret nil; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](buf_res);
+    var pos: usize = 0;
+
+    var i: usize = 0;
+    for (i < root_len) { buf[pos] = s.dep_root[i]; pos = pos + 1; i = i + 1; }
+    buf[pos] = 47; pos = pos + 1;
+
+    i = 0;
+    for (i < name_len) { buf[pos] = dep_name[i]; pos = pos + 1; i = i + 1; }
+
+    buf[pos] = 47; pos = pos + 1;   # '/'
+    buf[pos] = 115; pos = pos + 1;  # 's'
+    buf[pos] = 114; pos = pos + 1;  # 'r'
+    buf[pos] = 99; pos = pos + 1;   # 'c'
+    buf[pos] = 0;
+
+    ret buf::&u8;
+}
+
+# load_dep_project_id: read project id from dep_root/dep_name/mach.toml.
+fun load_dep_project_id(s: *sema.Sema, dep_name: str) str {
+    if (s == nil || s.dep_root == nil || dep_name == nil) { ret nil; }
+
+    val root_len: usize = str_len(s.dep_root);
+    val name_len: usize = str_len(dep_name);
+    val total: usize = root_len + 1 + name_len + 10 + 1; # root + / + name + /mach.toml + \0
+
+    val buf_res: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](s.alloc, total);
+    if (result_is_err[*u8, allocator.AllocError](buf_res)) { ret nil; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](buf_res);
+    var pos: usize = 0;
+
+    var i: usize = 0;
+    for (i < root_len) { buf[pos] = s.dep_root[i]; pos = pos + 1; i = i + 1; }
+    buf[pos] = 47; pos = pos + 1;
+
+    i = 0;
+    for (i < name_len) { buf[pos] = dep_name[i]; pos = pos + 1; i = i + 1; }
+
+    # "/mach.toml"
+    buf[pos] = 47; pos = pos + 1;
+    buf[pos] = 109; pos = pos + 1;  # 'm'
+    buf[pos] = 97; pos = pos + 1;   # 'a'
+    buf[pos] = 99; pos = pos + 1;   # 'c'
+    buf[pos] = 104; pos = pos + 1;  # 'h'
+    buf[pos] = 46; pos = pos + 1;   # '.'
+    buf[pos] = 116; pos = pos + 1;  # 't'
+    buf[pos] = 111; pos = pos + 1;  # 'o'
+    buf[pos] = 109; pos = pos + 1;  # 'm'
+    buf[pos] = 108; pos = pos + 1;  # 'l'
+    buf[pos] = 0;
+
+    val config_path: str = buf::&u8;
+    val cfg_res: Result[config.Config, str] = config.load(config_path, s.alloc);
+    if (result_is_err[config.Config, str](cfg_res)) { ret nil; }
+    val cfg: config.Config = result_unwrap_ok[config.Config, str](cfg_res);
+    ret cfg.id;
+}
