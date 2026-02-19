@@ -1,4 +1,5 @@
 use std.types.bool;
+use std.types.option;
 use std.types.size;
 use std.types.string;
 use std.types.result;
@@ -58,9 +59,67 @@ fun lower_decl(ctx: *LowerContext, node: *ast.Node) {
         if (node.info.wrapper.inner != nil) {
             lower_decl(ctx, node.info.wrapper.inner);
         }
-    } or (node.kind == ast.NODE_STMT_IF) {
-        # comptime if — lower the taken branch
+    } or (node.kind == ast.NODE_COMPTIME_IF) {
+        # comptime if — lower the taken branch (dead branches trimmed by sema)
         lower_comptime_if(ctx, node);
+    }
+}
+
+# lower_func_inst: lower a generic function instantiation.
+# the cloned AST has concrete types but still has the generics field set,
+# so we bypass the generics check and use the pre-computed mangled name.
+pub fun lower_func_inst(ctx: *LowerContext, node: *ast.Node,
+                        mangled: str, sema_sym: *symbol.Symbol) {
+    if (ctx == nil || node == nil || mangled == nil) { ret; }
+    if (node.kind != ast.NODE_DECL_FUN) { ret; }
+
+    val fn_type: *type.Type = node.type;
+    if (fn_type == nil) { ret; }
+
+    reset_function_state(ctx);
+
+    val fn_r: Result[*ir.Function, str] = ir.create_function(ctx.alloc, mangled);
+    if (result_is_err[*ir.Function, str](fn_r)) { ret; }
+    ctx.current_fn = result_unwrap_ok[*ir.Function, str](fn_r);
+
+    ctx.fn_ret_type = fn_type.ret_type;
+    ctx.fn_is_variadic = node.info.fun_decl.is_variadic;
+
+    if (ctx.fn_ret_type != nil && !type.type_is_void(ctx.fn_ret_type)) {
+        val ret_size: usize = type_size(ctx, ctx.fn_ret_type);
+        val ret_align: usize = type.type_align(ctx.fn_ret_type);
+        val is_float: bool = is_float_type(ctx.fn_ret_type);
+        val is_agg: bool = type.type_is_record(ctx.fn_ret_type) ||
+                           type.type_is_union(ctx.fn_ret_type);
+
+        val a: *abi.ABI = ?ctx.target.abi;
+        val ret_slot: abi.ParamSlot = a.classify_return(a.ctx, ret_size, ret_align,
+                                                         is_float, is_agg);
+        if (ret_slot.class == abi.CLASS_SRET) {
+            ctx.fn_has_sret = true;
+        }
+    }
+
+    start_block(ctx, mangled);
+    lower_params(ctx, node);
+
+    val body: *ast.Node = node.info.fun_decl.body;
+    if (body != nil) {
+        lstmt.lower_stmt(ctx, body);
+    }
+
+    if (ctx.fn_ret_type == nil || type.type_is_void(ctx.fn_ret_type)) {
+        emit_ret(ctx);
+    }
+
+    if (ctx.current_fn != nil) {
+        ctx.current_fn.local_size = ctx.stack_offset::usize;
+    }
+
+    register_function_symbol(ctx, mangled, sema_sym);
+
+    if (ctx.current_fn != nil) {
+        masm.add_ir_function(ctx.mctx, ctx.current_fn);
     }
 }
 
@@ -76,14 +135,21 @@ fun lower_function(ctx: *LowerContext, node: *ast.Node) {
 
     # get the mangled function name via symbol
     var mangled: str = name;
+    var fn_sym: *symbol.Symbol = nil;
     if (node.symbol != nil) {
-        val fn_sym: *symbol.Symbol = node.symbol::*symbol.Symbol;
-        if (fn_sym != nil) {
-            if (fn_sym.export_name != nil) {
-                mangled = fn_sym.export_name;
-            } or {
-                mangled = mangle.mangle(ctx.alloc, fn_sym.module_path, fn_sym.name);
-            }
+        fn_sym = node.symbol::*symbol.Symbol;
+    }
+    if (fn_sym == nil && ctx.symbols != nil) {
+        val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, name);
+        if (option_is_some[*symbol.Symbol](sym_opt)) {
+            fn_sym = option_unwrap[*symbol.Symbol](sym_opt);
+        }
+    }
+    if (fn_sym != nil) {
+        if (fn_sym.export_name != nil) {
+            mangled = fn_sym.export_name;
+        } or {
+            mangled = mangle.mangle(ctx.alloc, fn_sym.module_path, fn_sym.name);
         }
     }
 
@@ -141,7 +207,7 @@ fun lower_function(ctx: *LowerContext, node: *ast.Node) {
     }
 
     # register the function as a symbol in MASM
-    register_function_symbol(ctx, mangled, node);
+    register_function_symbol(ctx, mangled, fn_sym);
 
     # register the IR function for ISel/encode
     if (ctx.current_fn != nil) {
@@ -232,14 +298,21 @@ fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
     if (name == nil || vtype == nil) { ret; }
 
     var mangled: str = name;
+    var var_sym: *symbol.Symbol = nil;
     if (node.symbol != nil) {
-        val var_sym: *symbol.Symbol = node.symbol::*symbol.Symbol;
-        if (var_sym != nil) {
-            if (var_sym.export_name != nil) {
-                mangled = var_sym.export_name;
-            } or {
-                mangled = mangle.mangle(ctx.alloc, var_sym.module_path, var_sym.name);
-            }
+        var_sym = node.symbol::*symbol.Symbol;
+    }
+    if (var_sym == nil && ctx.symbols != nil) {
+        val sym_opt: Option[*symbol.Symbol] = symbol.table_lookup(ctx.symbols, name);
+        if (option_is_some[*symbol.Symbol](sym_opt)) {
+            var_sym = option_unwrap[*symbol.Symbol](sym_opt);
+        }
+    }
+    if (var_sym != nil) {
+        if (var_sym.export_name != nil) {
+            mangled = var_sym.export_name;
+        } or {
+            mangled = mangle.mangle(ctx.alloc, var_sym.module_path, var_sym.name);
         }
     }
     val vsize: usize = type_size(ctx, vtype);
@@ -254,7 +327,7 @@ fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
             val sec: *section.Section = result_unwrap_ok[*section.Section, str](sec_r);
             val offset: usize = section.current_offset(sec);
             emit_int_to_section(ctx.alloc, sec, value, vsize);
-            register_data_symbol(ctx, mangled, ".data", offset, vsize, node);
+            register_data_symbol(ctx, mangled, ".data", offset, vsize, var_sym);
         }
     } or (init != nil && init.kind == ast.NODE_EXPR_LIT_STR) {
         # string literal: emit string to .rodata, pointer+relocation in .data
@@ -313,7 +386,7 @@ fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
 
         # 5. register global as data symbol
         register_data_symbol(ctx, mangled, ".data", reloc_offset,
-            ctx.target.ptr_size, node);
+            ctx.target.ptr_size, var_sym);
     } or (init == nil) {
         # uninitialized — goes to .bss
         val sec_r: Result[*section.Section, str] = masm.get_or_create_section(
@@ -322,7 +395,7 @@ fun lower_global_var(ctx: *LowerContext, node: *ast.Node) {
             val sec: *section.Section = result_unwrap_ok[*section.Section, str](sec_r);
             val offset: usize = section.current_offset(sec);
             sec.size = sec.size + vsize;
-            register_data_symbol(ctx, mangled, ".bss", offset, vsize, node);
+            register_data_symbol(ctx, mangled, ".bss", offset, vsize, var_sym);
         }
     }
 }
@@ -391,12 +464,15 @@ fun emit_int_to_section(alloc: *allocator.Allocator, sec: *section.Section,
     or (size == 8) { section.emit_u64(alloc, sec, value::u64); }
 }
 
-fun register_function_symbol(ctx: *LowerContext, name: str, node: *ast.Node) {
+fun register_function_symbol(ctx: *LowerContext, name: str, sema_sym: *symbol.Symbol) {
     val sym_r: Result[*sym.Symbol, str] = sym.create(ctx.alloc, name);
     if (result_is_err[*sym.Symbol, str](sym_r)) { ret; }
 
     val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_r);
-    s.binding = sym.BIND_GLOBAL;
+    s.binding = sym.BIND_LOCAL;
+    if (sema_sym != nil && (sema_sym.is_public || sema_sym.export_name != nil)) {
+        s.binding = sym.BIND_GLOBAL;
+    }
     s.sym_type = sym.SYM_FUNC;
     s.defined = true;
 
@@ -404,12 +480,15 @@ fun register_function_symbol(ctx: *LowerContext, name: str, node: *ast.Node) {
 }
 
 fun register_data_symbol(ctx: *LowerContext, name: str, sec_name: str,
-                         offset: usize, size: usize, node: *ast.Node) {
+                         offset: usize, size: usize, sema_sym: *symbol.Symbol) {
     val sym_r: Result[*sym.Symbol, str] = sym.create(ctx.alloc, name);
     if (result_is_err[*sym.Symbol, str](sym_r)) { ret; }
 
     val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_r);
-    s.binding = sym.BIND_GLOBAL;
+    s.binding = sym.BIND_LOCAL;
+    if (sema_sym != nil && sema_sym.is_public) {
+        s.binding = sym.BIND_GLOBAL;
+    }
     s.sym_type = sym.SYM_OBJECT;
     s.offset = offset;
     s.size = size;

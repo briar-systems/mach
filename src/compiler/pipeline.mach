@@ -1,4 +1,5 @@
 use std.types.bool;
+use std.types.option;
 use std.types.size;
 use std.types.string;
 use std.types.result;
@@ -27,6 +28,8 @@ use ldecl:    mach.compiler.lower.decl;
 use ldecl:    mach.compiler.lower.decl;
 use cemit:    mach.compiler.emit;
 use linker:   mach.compiler.linker;
+use mangle:   mach.compiler.masm.mangle;
+use utilfs:   mach.util.filesystem;
 
 # mach.compiler.pipeline: compiler orchestrator.
 # ---
@@ -61,6 +64,7 @@ pub rec CompileOptions {
     emit_debug:      bool;
     output_path:     str;   # final executable/library path
     obj_path:        str;   # optional: write .o artifact here for inspection
+    obj_dir:         str;   # per-module .o directory (nil = monolithic mode)
 }
 
 # --- result types ---
@@ -274,6 +278,12 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
         # record function start offset for symbol fixup
         val func_start: usize = section.current_offset(text_sec);
 
+        # emit prologue when the function has a stack frame
+        val has_frame: bool = func.local_size > 0;
+        if (has_frame) {
+            i.prologue(i.ctx, func.local_size, text_sec, alloc);
+        }
+
         var bi: i32 = 0;
         for (bi < func.block_count) {
             val block: *ir.Block = func.blocks[bi];
@@ -281,6 +291,31 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
 
             var ii: i32 = 0;
             for (ii < block.inst_count) {
+                # register label pseudo-instructions as local symbols in .text
+                if (block.insts[ii].op == ir.OP_LABEL && block.insts[ii].dst.label != nil) {
+                    val lbl_sym_r: Result[*sym.Symbol, str] =
+                        sym.create(alloc, block.insts[ii].dst.label);
+                    if (result_is_ok[*sym.Symbol, str](lbl_sym_r)) {
+                        val lbl_sym: *sym.Symbol =
+                            result_unwrap_ok[*sym.Symbol, str](lbl_sym_r);
+                        lbl_sym.binding = sym.BIND_LOCAL;
+                        lbl_sym.sym_type = sym.SYM_NONE;
+                        val text_idx: i32 = masm.get_section_index(mctx, ".text");
+                        if (text_idx >= 0) {
+                            sym.define(lbl_sym, text_idx::u64,
+                                section.current_offset(text_sec), 0);
+                        }
+                        masm.add_symbol(mctx, lbl_sym);
+                    }
+                    ii = ii + 1;
+                    cnt;
+                }
+
+                # emit epilogue before each OP_RET when function has a frame
+                if (block.insts[ii].op == ir.OP_RET && has_frame) {
+                    i.epilogue(i.ctx, text_sec, alloc);
+                }
+
                 isa.buf_clear(?mach_buf);
 
                 # instruction selection: IR inst → MachInst(s)
@@ -304,8 +339,9 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
             bi = bi + 1;
         }
 
-        # update symbol offset to the function's start in .text
-        fixup_symbol_offset(mctx, func.name, func_start);
+        # update symbol offset and section to match position in .text
+        val text_idx: i32 = masm.get_section_index(mctx, ".text");
+        fixup_symbol_offset(mctx, func.name, func_start, text_idx);
 
         fi = fi + 1;
     }
@@ -314,12 +350,313 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
     ret true;
 }
 
-# fixup_symbol_offset: update a symbol's offset to match its position in .text.
-fun fixup_symbol_offset(mctx: *masm.Context, name: str, offset: usize) {
+# fixup_symbol_offset: update a symbol's offset and section to match its
+# position in .text.
+fun fixup_symbol_offset(mctx: *masm.Context, name: str, offset: usize,
+                         text_idx: i32) {
     val s: *sym.Symbol = masm.get_symbol(mctx, name);
     if (s != nil) {
         s.offset = offset;
+        if (text_idx >= 0) {
+            s.section = text_idx::u64;
+        }
     }
+}
+
+# --- per-module compilation ---
+
+# resolve_externs: add undefined symbols for cross-module references.
+# scans all section relocations; for any relocation referencing a symbol name
+# not in the MASM context, adds an undefined global symbol.
+fun resolve_externs(mctx: *masm.Context, alloc: *allocator.Allocator) {
+    if (mctx == nil || alloc == nil) { ret; }
+
+    var si: i32 = 0;
+    for (si < mctx.section_count) {
+        val sec: *section.Section = mctx.sections[si];
+        if (sec == nil || sec.reloc_count == 0) {
+            si = si + 1;
+            cnt;
+        }
+
+        var ri: i32 = 0;
+        for (ri < sec.reloc_count) {
+            val name: str = sec.relocs[ri].symbol_name;
+            if (name != nil && masm.get_symbol(mctx, name) == nil) {
+                # symbol not in this module — add as undefined external
+                val s_r: Result[*sym.Symbol, str] = sym.create(alloc, name);
+                if (result_is_ok[*sym.Symbol, str](s_r)) {
+                    val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](s_r);
+                    s.binding = sym.BIND_GLOBAL;
+                    s.sym_type = sym.SYM_NONE;
+                    s.defined = false;
+                    masm.add_symbol(mctx, s);
+                }
+            }
+            ri = ri + 1;
+        }
+        si = si + 1;
+    }
+}
+
+# module_path_to_obj_path: convert a module path to an artifact .o file path.
+# strips project_id prefix if present, replaces dots with '/', appends ".o",
+# prepends obj_dir.
+# e.g. (project_id="mach", obj_dir="out/obj"):
+#   "mach.cli.args" → "out/obj/cli/args.o"
+#   "std.runtime"   → "out/obj/std/runtime.o"
+fun module_path_to_obj_path(mod_path: str, project_id: str, obj_dir: str,
+                            alloc: *allocator.Allocator) str {
+    if (mod_path == nil || obj_dir == nil || alloc == nil) { ret nil; }
+
+    # determine the relative part (strip project_id prefix if present)
+    var rel: str = mod_path;
+    if (project_id != nil) {
+        val pid_len: usize = str_len(project_id);
+        val mp_len: usize = str_len(mod_path);
+        if (mp_len > pid_len + 1 && str_starts_with(mod_path, project_id)
+            && mod_path[pid_len] == '.') {
+            rel = (mod_path::usize + pid_len + 1)::str;
+        }
+    }
+
+    # compute output: obj_dir + "/" + rel (dots→slashes) + ".o"
+    val rel_len: usize = str_len(rel);
+    val dir_len: usize = str_len(obj_dir);
+    val total: usize = dir_len + 1 + rel_len + 2 + 1;
+
+    val r: Result[*u8, allocator.AllocError] =
+        allocator.allocator_alloc[u8](alloc, total);
+    if (result_is_err[*u8, allocator.AllocError](r)) { ret nil; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](r);
+
+    var p: usize = 0;
+
+    # copy obj_dir
+    var i: usize = 0;
+    for (i < dir_len) {
+        buf[p] = obj_dir[i];
+        p = p + 1;
+        i = i + 1;
+    }
+
+    # separator
+    if (dir_len > 0 && obj_dir[dir_len - 1] != '/') {
+        buf[p] = '/';
+        p = p + 1;
+    }
+
+    # copy rel, replacing dots with slashes
+    i = 0;
+    for (i < rel_len) {
+        if (rel[i] == '.') {
+            buf[p] = '/';
+        } or {
+            buf[p] = rel[i];
+        }
+        p = p + 1;
+        i = i + 1;
+    }
+
+    # append ".o"
+    buf[p] = '.';
+    p = p + 1;
+    buf[p] = 'o';
+    p = p + 1;
+    buf[p] = 0;
+
+    ret buf::&u8;
+}
+
+# compile_module: compile a single module into a .o file.
+# creates a fresh MASM context, lowers the module, runs peephole + codegen,
+# resolves external references, and emits a .o file.
+# returns true if a .o was emitted, false if module was type-only or failed.
+# smod: the SemaModule for this module (used to match generic instantiations)
+# func_insts: linked list of all generic function instantiations from sema
+fun compile_module(root: *ast.Node, symbols: *symbol.Table,
+                   tgt: *target.Target, alloc: *allocator.Allocator,
+                   obj_path: str, smod: *sema.SemaModule,
+                   func_insts: *sema.FunctionInstantiation) bool {
+    if (root == nil || tgt == nil || alloc == nil || obj_path == nil) { ret false; }
+
+    # 1. create fresh MASM context
+    val mctx_res: Result[masm.Context, str] = masm.create(alloc, @tgt);
+    if (result_is_err[masm.Context, str](mctx_res)) { ret false; }
+
+    val mctx_ptr_res: Result[*masm.Context, allocator.AllocError] =
+        allocator.allocator_alloc[masm.Context](alloc, 1);
+    if (result_is_err[*masm.Context, allocator.AllocError](mctx_ptr_res)) { ret false; }
+    val mctx: *masm.Context =
+        result_unwrap_ok[*masm.Context, allocator.AllocError](mctx_ptr_res);
+    @mctx = result_unwrap_ok[masm.Context, str](mctx_res);
+
+    # 2. lower this module
+    val lctx_res: Result[lower.LowerContext, str] =
+        lower.create(alloc, tgt, mctx, symbols, nil);
+    if (result_is_err[lower.LowerContext, str](lctx_res)) { ret false; }
+
+    var lctx: lower.LowerContext =
+        result_unwrap_ok[lower.LowerContext, str](lctx_res);
+    ldecl.lower_module(?lctx, root);
+
+    # 2b. lower generic function instantiations that belong to this module
+    var finst: *sema.FunctionInstantiation = func_insts;
+    for (finst != nil) {
+        if (finst.origin_module == smod && finst.func_ast != nil) {
+            # look up the instantiation's symbol in the module's table
+            var inst_sym: *symbol.Symbol = nil;
+            if (symbols != nil) {
+                val sym_opt: Option[*symbol.Symbol] =
+                    symbol.table_lookup(symbols, finst.mangled_name);
+                if (option_is_some[*symbol.Symbol](sym_opt)) {
+                    inst_sym = option_unwrap[*symbol.Symbol](sym_opt);
+                }
+            }
+
+            # compute full mangled name (module prefix + short mangled name)
+            var full_name: str = finst.mangled_name;
+            if (inst_sym != nil && inst_sym.module_path != nil) {
+                full_name = mangle.mangle(alloc, inst_sym.module_path, finst.mangled_name);
+            }
+
+            ldecl.lower_func_inst(?lctx, finst.func_ast, full_name, inst_sym);
+        }
+        finst = finst.next;
+    }
+
+    # 3. check if type-only (no IR functions and no section data)
+    if (mctx.ir_func_count == 0) {
+        var has_data: bool = false;
+        var si: i32 = 0;
+        for (si < mctx.section_count) {
+            if (mctx.sections[si] != nil && mctx.sections[si].size > 0) {
+                has_data = true;
+                brk;
+            }
+            si = si + 1;
+        }
+        if (!has_data) { ret false; }
+    }
+
+    # 4. peephole optimization
+    var opt_ctx: ir_peep.OptContext = ir_peep.init(alloc);
+    var oi: i32 = 0;
+    for (oi < mctx.ir_func_count) {
+        val func: *ir.Function = mctx.ir_funcs[oi];
+        if (func != nil) {
+            ir_peep.optimize_function(?opt_ctx, func);
+        }
+        oi = oi + 1;
+    }
+
+    # 5. codegen (ISel + encode)
+    if (!codegen(mctx, tgt, alloc)) { ret false; }
+
+    # 6. resolve external references
+    resolve_externs(mctx, alloc);
+
+    # 7. emit .o file
+    val emit_res: i64 = cemit.emit(mctx, tgt, obj_path, alloc);
+    if (emit_res != 0) { ret false; }
+
+    ret true;
+}
+
+# compile_per_module: per-module compilation and linking.
+# compiles each module to its own .o, then links them into the final executable.
+fun compile_per_module(root: *ast.Node, symbols: *symbol.Table,
+                       sem: *sema.Sema, module_path: str,
+                       opts: *CompileOptions) Result[CompileResult, str] {
+    val alloc: *allocator.Allocator = opts.alloc;
+    val tgt: *target.Target = ?opts.target;
+
+    # get generic function instantiations
+    val func_insts: *sema.FunctionInstantiation = sema.get_func_insts(sem);
+
+    # get entry module's SemaModule (for matching instantiations)
+    val entry_smod: *sema.SemaModule = sem.current_module;
+
+    # collect imported modules
+    val max_mods: i32 = 512;
+    val mods_r: Result[**sema.SemaModule, allocator.AllocError] =
+        allocator.allocator_alloc[*sema.SemaModule](alloc, max_mods::usize);
+    if (result_is_err[**sema.SemaModule, allocator.AllocError](mods_r)) {
+        sema.dnit(sem);
+        ret err[CompileResult, str]("out of memory");
+    }
+    val mods: **sema.SemaModule =
+        result_unwrap_ok[**sema.SemaModule, allocator.AllocError](mods_r);
+    val mod_count: i32 = sema.get_loaded_modules(sem, mods, max_mods);
+
+    # allocate array for .o paths (entry + imports)
+    val max_obj: i32 = 1 + mod_count;
+    val paths_r: Result[*str, allocator.AllocError] =
+        allocator.allocator_zalloc[str](alloc, max_obj::usize);
+    if (result_is_err[*str, allocator.AllocError](paths_r)) {
+        sema.dnit(sem);
+        ret err[CompileResult, str]("out of memory");
+    }
+    val obj_paths: *str = result_unwrap_ok[*str, allocator.AllocError](paths_r);
+    var obj_count: i32 = 0;
+
+    # compile entry module
+    val entry_obj: str = module_path_to_obj_path(module_path, opts.project_id,
+        opts.obj_dir, alloc);
+    if (entry_obj != nil) {
+        val entry_dir: str = utilfs.get_output_dir(entry_obj, alloc);
+        if (entry_dir != nil) {
+            utilfs.ensure_dir(entry_dir, alloc);
+        }
+        if (compile_module(root, symbols, tgt, alloc, entry_obj,
+                           entry_smod, func_insts)) {
+            obj_paths[obj_count] = entry_obj;
+            obj_count = obj_count + 1;
+        }
+    }
+
+    # compile imported modules
+    var mi: i32 = 0;
+    for (mi < mod_count) {
+        val m: *sema.SemaModule = mods[mi];
+        if (m != nil && m.ast != nil && m.is_analyzed) {
+            val mobj: str = module_path_to_obj_path(m.path, opts.project_id,
+                opts.obj_dir, alloc);
+            if (mobj != nil) {
+                val mdir: str = utilfs.get_output_dir(mobj, alloc);
+                if (mdir != nil) {
+                    utilfs.ensure_dir(mdir, alloc);
+                }
+                if (compile_module(m.ast, m.table, tgt, alloc, mobj,
+                                   m, func_insts)) {
+                    obj_paths[obj_count] = mobj;
+                    obj_count = obj_count + 1;
+                }
+            }
+        }
+        mi = mi + 1;
+    }
+
+    sema.dnit(sem);
+
+    if (opts.stop_after == PHASE_EMIT) {
+        val r: CompileResult = CompileResult{mctx: nil, output_path: opts.obj_dir, ok: true};
+        ret ok[CompileResult, str](r);
+    }
+
+    # link all .o files into the final executable
+    if (opts.output_path == nil) {
+        ret err[CompileResult, str]("output path is nil");
+    }
+
+    val link_res: i64 = linker.link_objects(obj_paths, obj_count, tgt,
+        opts.output_path, alloc);
+    if (link_res != 0) {
+        ret err[CompileResult, str]("linking failed");
+    }
+
+    val r: CompileResult = CompileResult{mctx: nil, output_path: opts.output_path, ok: true};
+    ret ok[CompileResult, str](r);
 }
 
 # --- full compilation ---
@@ -360,7 +697,13 @@ pub fun compile(source: str, file_path: str, module_path: str,
         ret ok[CompileResult, str](r);
     }
 
-    # --- Phase 3: Lower ---
+    # --- Phase 3+: Per-module or monolithic ---
+
+    if (opts.obj_dir != nil) {
+        ret compile_per_module(sr.root, sr.symbols, ?sr.sema, module_path, opts);
+    }
+
+    # --- Monolithic fallback (no obj_dir set) ---
 
     val lr: LowerResult = lower_module(sr.root, sr.symbols, ?opts.target, opts.alloc, ?sr.sema);
     sema.dnit(?sr.sema);
@@ -374,8 +717,6 @@ pub fun compile(source: str, file_path: str, module_path: str,
         ret ok[CompileResult, str](r);
     }
 
-    # --- Phase 3.5: IR Peephole Optimization ---
-
     var opt_ctx: ir_peep.OptContext = ir_peep.init(opts.alloc);
     var oi: i32 = 0;
     for (oi < lr.mctx.ir_func_count) {
@@ -386,13 +727,9 @@ pub fun compile(source: str, file_path: str, module_path: str,
         oi = oi + 1;
     }
 
-    # --- Phase 4: ISel + Encode ---
-
     if (!codegen(lr.mctx, ?opts.target, opts.alloc)) {
         ret err[CompileResult, str]("code generation failed");
     }
-
-    # --- Phase 5: Emit (.o artifact) ---
 
     if (opts.obj_path != nil) {
         val emit_res: i64 = cemit.emit(lr.mctx, ?opts.target, opts.obj_path, opts.alloc);
@@ -407,8 +744,6 @@ pub fun compile(source: str, file_path: str, module_path: str,
         val r: CompileResult = CompileResult{mctx: lr.mctx, output_path: out, ok: true};
         ret ok[CompileResult, str](r);
     }
-
-    # --- Phase 6: Link ---
 
     if (opts.output_path == nil) {
         ret err[CompileResult, str]("output path is nil");
@@ -447,7 +782,13 @@ pub fun compile_ast(root: *ast.Node, file_path: str, module_path: str,
         ret ok[CompileResult, str](r);
     }
 
-    # --- Phase 3: Lower ---
+    # --- Phase 3+: Per-module or monolithic ---
+
+    if (opts.obj_dir != nil) {
+        ret compile_per_module(sr.root, sr.symbols, ?sr.sema, module_path, opts);
+    }
+
+    # --- Monolithic fallback (no obj_dir set) ---
 
     val lr: LowerResult = lower_module(sr.root, sr.symbols, ?opts.target, opts.alloc, ?sr.sema);
     sema.dnit(?sr.sema);
@@ -461,8 +802,6 @@ pub fun compile_ast(root: *ast.Node, file_path: str, module_path: str,
         ret ok[CompileResult, str](r);
     }
 
-    # --- Phase 3.5: IR Peephole Optimization ---
-
     var opt_ctx: ir_peep.OptContext = ir_peep.init(opts.alloc);
     var oi: i32 = 0;
     for (oi < lr.mctx.ir_func_count) {
@@ -473,13 +812,9 @@ pub fun compile_ast(root: *ast.Node, file_path: str, module_path: str,
         oi = oi + 1;
     }
 
-    # --- Phase 4: ISel + Encode ---
-
     if (!codegen(lr.mctx, ?opts.target, opts.alloc)) {
         ret err[CompileResult, str]("code generation failed");
     }
-
-    # --- Phase 5: Emit (.o artifact) ---
 
     if (opts.obj_path != nil) {
         val emit_res: i64 = cemit.emit(lr.mctx, ?opts.target, opts.obj_path, opts.alloc);
@@ -494,8 +829,6 @@ pub fun compile_ast(root: *ast.Node, file_path: str, module_path: str,
         val r: CompileResult = CompileResult{mctx: lr.mctx, output_path: out, ok: true};
         ret ok[CompileResult, str](r);
     }
-
-    # --- Phase 6: Link ---
 
     if (opts.output_path == nil) {
         ret err[CompileResult, str]("output path is nil");
