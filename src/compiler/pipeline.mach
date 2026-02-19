@@ -22,10 +22,12 @@ use ir:       mach.compiler.masm.ir;
 use section:  mach.compiler.masm.section;
 use sym:      mach.compiler.masm.symbol;
 use isa:      mach.compiler.isa;
+use abi:      mach.compiler.abi;
 use ir_peep:  mach.compiler.masm.opt.peephole;
 use lower:    mach.compiler.lower;
 use ldecl:    mach.compiler.lower.decl;
 use ldecl:    mach.compiler.lower.decl;
+use regalloc: mach.compiler.regalloc;
 use cemit:    mach.compiler.emit;
 use linker:   mach.compiler.linker;
 use mangle:   mach.compiler.masm.mangle;
@@ -252,15 +254,17 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
     ret result;
 }
 
-# --- codegen: ISel + encode ---
+# --- codegen: ISel + regalloc + encode ---
 
-# codegen: run instruction selection and encoding on IR functions.
+# codegen: run instruction selection, register allocation, and encoding.
+# processes each function as a unit: ISel all → regalloc → encode all.
 # populates the .text section with encoded machine code.
 fun codegen(mctx: *masm.Context, tgt: *target.Target,
             alloc: *allocator.Allocator) bool {
     if (mctx == nil || tgt == nil || alloc == nil) { ret false; }
 
     val i: *isa.ISA = ?tgt.isa;
+    val a: *abi.ABI = ?tgt.abi;
 
     # ensure .text section exists
     val text_res: Result[*section.Section, str] = masm.get_or_create_section(
@@ -268,21 +272,18 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
     if (result_is_err[*section.Section, str](text_res)) { ret false; }
     val text_sec: *section.Section = result_unwrap_ok[*section.Section, str](text_res);
 
-    var mach_buf: isa.MachInstBuf = isa.buf_create(alloc);
+    val text_idx: i32 = masm.get_section_index(mctx, ".text");
+
+    var inst_buf: isa.MachInstBuf = isa.buf_create(alloc);
+    var func_buf: isa.MachInstBuf = isa.buf_create(alloc);
 
     var fi: i32 = 0;
     for (fi < mctx.ir_func_count) {
         val func: *ir.Function = mctx.ir_funcs[fi];
         if (func == nil) { fi = fi + 1; cnt; }
 
-        # record function start offset for symbol fixup
-        val func_start: usize = section.current_offset(text_sec);
-
-        # emit prologue when the function has a stack frame
-        val has_frame: bool = func.local_size > 0;
-        if (has_frame) {
-            i.prologue(i.ctx, func.local_size, text_sec, alloc);
-        }
+        # === Phase A: ISel entire function → func_buf ===
+        isa.buf_clear(?func_buf);
 
         var bi: i32 = 0;
         for (bi < func.block_count) {
@@ -291,47 +292,30 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
 
             var ii: i32 = 0;
             for (ii < block.inst_count) {
-                # register label pseudo-instructions as local symbols in .text
-                if (block.insts[ii].op == ir.OP_LABEL && block.insts[ii].dst.label != nil) {
-                    val lbl_sym_r: Result[*sym.Symbol, str] =
-                        sym.create(alloc, block.insts[ii].dst.label);
-                    if (result_is_ok[*sym.Symbol, str](lbl_sym_r)) {
-                        val lbl_sym: *sym.Symbol =
-                            result_unwrap_ok[*sym.Symbol, str](lbl_sym_r);
-                        lbl_sym.binding = sym.BIND_LOCAL;
-                        lbl_sym.sym_type = sym.SYM_NONE;
-                        val text_idx: i32 = masm.get_section_index(mctx, ".text");
-                        if (text_idx >= 0) {
-                            sym.define(lbl_sym, text_idx::u64,
-                                section.current_offset(text_sec), 0);
+                val ir_inst: *ir.Inst = ?block.insts[ii];
+
+                if (ir_inst.op == ir.OP_LABEL) {
+                    # insert MACHINST_LABEL marker into func_buf
+                    var label_mi: isa.MachInst;
+                    label_mi.opcode = isa.MACHINST_LABEL;
+                    label_mi.dst = ir_inst.dst; # carries the label operand
+                    label_mi.size = 0;
+                    label_mi.flags = 0;
+                    isa.buf_append(?func_buf, label_mi);
+                } or {
+                    # ISel → per-inst buf → peephole → append to func_buf
+                    isa.buf_clear(?inst_buf);
+                    i.isel(i.ctx, ir_inst, ?inst_buf);
+                    i.peephole(i.ctx, ?inst_buf);
+
+                    var mi: i32 = 0;
+                    for (mi < inst_buf.count) {
+                        val minst: *isa.MachInst = isa.buf_get(?inst_buf, mi);
+                        if (minst != nil) {
+                            isa.buf_append(?func_buf, @minst);
                         }
-                        masm.add_symbol(mctx, lbl_sym);
+                        mi = mi + 1;
                     }
-                    ii = ii + 1;
-                    cnt;
-                }
-
-                # emit epilogue before each OP_RET when function has a frame
-                if (block.insts[ii].op == ir.OP_RET && has_frame) {
-                    i.epilogue(i.ctx, text_sec, alloc);
-                }
-
-                isa.buf_clear(?mach_buf);
-
-                # instruction selection: IR inst → MachInst(s)
-                i.isel(i.ctx, ?block.insts[ii], ?mach_buf);
-
-                # ISA-level peephole on the selected instructions
-                i.peephole(i.ctx, ?mach_buf);
-
-                # encode each MachInst to the text section
-                var mi: i32 = 0;
-                for (mi < mach_buf.count) {
-                    val minst: *isa.MachInst = isa.buf_get(?mach_buf, mi);
-                    if (minst != nil) {
-                        i.encode(i.ctx, minst, text_sec, alloc);
-                    }
-                    mi = mi + 1;
                 }
 
                 ii = ii + 1;
@@ -339,21 +323,54 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
             bi = bi + 1;
         }
 
-        # update symbol offset and section to match position in .text
-        val text_idx: i32 = masm.get_section_index(mctx, ".text");
+        # === Phase B: Register allocation ===
+        var ra: regalloc.RegAllocResult = regalloc.alloc_function(
+            alloc, i, a, ?func_buf, func.local_size);
+
+        if (!ra.ok) { fi = fi + 1; cnt; }
+
+        # === Phase C: Compute frame, emit prologue ===
+        val total_frame: usize = func.local_size + ra.spill_size;
+        val has_frame: bool = total_frame > 0;
+        val func_start: usize = section.current_offset(text_sec);
+
+        if (has_frame) {
+            i.prologue(i.ctx, total_frame, text_sec, alloc);
+        }
+
+        # === Phase D: Encode regalloc output ===
+        var ei: i32 = 0;
+        for (ei < ra.out.count) {
+            val minst: *isa.MachInst = isa.buf_get(?ra.out, ei);
+            if (minst == nil) { ei = ei + 1; cnt; }
+
+            if (minst.opcode == isa.MACHINST_LABEL) {
+                # register label symbol at current section offset
+                register_label_symbol(mctx, minst, text_sec, text_idx, alloc);
+            } or (i.is_ret(i.ctx, minst) && has_frame) {
+                # emit epilogue (includes ret) instead of bare ret
+                i.epilogue(i.ctx, text_sec, alloc);
+            } or {
+                i.encode(i.ctx, minst, text_sec, alloc);
+            }
+
+            ei = ei + 1;
+        }
+
+        # === Phase E: Symbol fixup ===
         fixup_symbol_offset(mctx, func.name, func_start, text_idx);
 
+        isa.buf_destroy(?ra.out);
         fi = fi + 1;
     }
 
-    isa.buf_destroy(?mach_buf);
+    isa.buf_destroy(?inst_buf);
+    isa.buf_destroy(?func_buf);
     ret true;
 }
 
-# fixup_symbol_offset: update a symbol's offset and section to match its
-# position in .text.
-fun fixup_symbol_offset(mctx: *masm.Context, name: str, offset: usize,
-                         text_idx: i32) {
+# fixup_symbol_offset: update a symbol's offset and section to match its position in .text.
+fun fixup_symbol_offset(mctx: *masm.Context, name: str, offset: usize, text_idx: i32) {
     val s: *sym.Symbol = masm.get_symbol(mctx, name);
     if (s != nil) {
         s.offset = offset;
@@ -361,6 +378,41 @@ fun fixup_symbol_offset(mctx: *masm.Context, name: str, offset: usize,
             s.section = text_idx::u64;
         }
     }
+}
+
+# register_label_symbol: register a label at the current section offset.
+fun register_label_symbol(mctx: *masm.Context, inst: *isa.MachInst,
+                          sec: *section.Section, text_idx: i32,
+                          alloc: *allocator.Allocator) {
+    if (inst == nil || inst.dst.label == nil) { ret; }
+
+    val offset: usize = section.current_offset(sec);
+    val name: str = inst.dst.label;
+
+    # check if symbol already exists (from lowering)
+    val existing: *sym.Symbol = masm.get_symbol(mctx, name);
+    if (existing != nil) {
+        existing.offset = offset;
+        if (text_idx >= 0) {
+            existing.section = text_idx::u64;
+        }
+        ret;
+    }
+
+    # create a new local symbol for this label
+    val sym_r: Result[*sym.Symbol, str] = sym.create(alloc, name);
+    if (result_is_err[*sym.Symbol, str](sym_r)) { ret; }
+
+    val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_r);
+    s.binding = sym.BIND_LOCAL;
+    s.sym_type = sym.SYM_FUNC;
+    s.offset = offset;
+    s.defined = true;
+    if (text_idx >= 0) {
+        s.section = text_idx::u64;
+    }
+
+    masm.add_symbol(mctx, s);
 }
 
 # --- per-module compilation ---
