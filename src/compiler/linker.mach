@@ -31,6 +31,39 @@ use fs:      std.filesystem;
 
 # how many sections we support in a single link
 val MAX_SECTIONS: i32 = 32;
+val MAX_MERGED_SECS:  i32 = 32;
+val INITIAL_MSYM_CAP: i32 = 1024;
+val INITIAL_MREL_CAP: i32 = 4096;
+
+# --- internal records for multi-.o linking ---
+
+rec MergedSection {
+    name:     str;
+    kind:     u8;
+    flags:    u32;
+    data:     *u8;
+    size:     usize;
+    capacity: usize;
+    align:    usize;
+}
+
+rec MergedSymbol {
+    name:    str;
+    binding: u8;
+    kind:    u8;
+    section: i32;
+    offset:  usize;
+    size:    usize;
+    defined: bool;
+}
+
+rec MergedReloc {
+    section:     i32;
+    offset:      usize;
+    symbol_name: str;
+    rtype:       u8;
+    addend:      i64;
+}
 
 # --- public API ---
 
@@ -303,7 +336,501 @@ pub fun link(mctx: *masm.Context, tgt: *target.Target,
     ret 0;
 }
 
+# --- multi-.o linker ---
+
+# link_objects: link multiple .o files into an executable.
+# reads .o files via the target's ObjectReader, merges sections/symbols/relocs,
+# lays out virtual addresses, resolves relocations, and emits via ExecFormat.
+# returns 0 on success, nonzero on failure.
+pub fun link_objects(obj_paths: *str, obj_count: i32, tgt: *target.Target,
+                     output: str, alloc: *allocator.Allocator) i64 {
+    if (obj_paths == nil || obj_count == 0 || tgt == nil || output == nil || alloc == nil) {
+        ret 1;
+    }
+
+    val reader: *of.ObjectReader = ?tgt.obj_reader;
+    val o: *os.OS = ?tgt.os;
+    val entry_name: str = o.entry_point(o.ctx);
+    val base: u64 = o.base_addr(o.ctx);
+    val page: usize = o.page_size(o.ctx);
+    val iface: *isa.ISA = ?tgt.isa;
+
+    # --- 1. allocate merge state ---
+
+    val msecs_r: Result[*MergedSection, allocator.AllocError] =
+        allocator.allocator_zalloc[MergedSection](alloc, MAX_MERGED_SECS::usize);
+    if (result_is_err[*MergedSection, allocator.AllocError](msecs_r)) { ret 2; }
+    val msecs: *MergedSection =
+        result_unwrap_ok[*MergedSection, allocator.AllocError](msecs_r);
+    var msec_count: i32 = 0;
+
+    var msym_cap: i32 = INITIAL_MSYM_CAP;
+    val msyms_r: Result[*MergedSymbol, allocator.AllocError] =
+        allocator.allocator_zalloc[MergedSymbol](alloc, msym_cap::usize);
+    if (result_is_err[*MergedSymbol, allocator.AllocError](msyms_r)) { ret 2; }
+    var msyms: *MergedSymbol =
+        result_unwrap_ok[*MergedSymbol, allocator.AllocError](msyms_r);
+    var msym_count: i32 = 0;
+
+    var mrel_cap: i32 = INITIAL_MREL_CAP;
+    val mrels_r: Result[*MergedReloc, allocator.AllocError] =
+        allocator.allocator_zalloc[MergedReloc](alloc, mrel_cap::usize);
+    if (result_is_err[*MergedReloc, allocator.AllocError](mrels_r)) { ret 2; }
+    var mrels: *MergedReloc =
+        result_unwrap_ok[*MergedReloc, allocator.AllocError](mrels_r);
+    var mrel_count: i32 = 0;
+
+    # --- 2. load and merge .o files ---
+
+    var fi: i32 = 0;
+    for (fi < obj_count) {
+        val obj: *of.ObjFile = reader.read(reader.ctx, obj_paths[fi], alloc);
+        if (obj == nil) {
+            print.eprintlnf("linker: failed to read: %s", obj_paths[fi]);
+            ret 3;
+        }
+
+        # per-obj section map and base offsets
+        var obj_sec_map: *i32 = nil;
+        var obj_sec_base: *usize = nil;
+
+        if (obj.sec_count > 0) {
+            val osm_r: Result[*i32, allocator.AllocError] =
+                allocator.allocator_alloc[i32](alloc, obj.sec_count::usize);
+            if (result_is_err[*i32, allocator.AllocError](osm_r)) { ret 2; }
+            obj_sec_map = result_unwrap_ok[*i32, allocator.AllocError](osm_r);
+
+            val osb_r: Result[*usize, allocator.AllocError] =
+                allocator.allocator_zalloc[usize](alloc, obj.sec_count::usize);
+            if (result_is_err[*usize, allocator.AllocError](osb_r)) { ret 2; }
+            obj_sec_base = result_unwrap_ok[*usize, allocator.AllocError](osb_r);
+        }
+
+        # merge sections
+        var osi: i32 = 0;
+        for (osi < obj.sec_count) {
+            val osec: *of.ObjSection = ?obj.sections[osi];
+            if ((osec.flags & section.FLAG_ALLOC) == 0) {
+                obj_sec_map[osi] = -1;
+                osi = osi + 1;
+                cnt;
+            }
+
+            # find or create merged section by name
+            var mi: i32 = find_merged_section(msecs, msec_count, osec.name);
+            if (mi < 0 && msec_count < MAX_MERGED_SECS) {
+                mi = msec_count;
+                msecs[mi].name = osec.name;
+                msecs[mi].kind = osec.kind;
+                msecs[mi].flags = osec.flags;
+                msecs[mi].data = nil;
+                msecs[mi].size = 0;
+                msecs[mi].capacity = 0;
+                msecs[mi].align = osec.align;
+                msec_count = msec_count + 1;
+            }
+
+            if (mi >= 0) {
+                if (osec.align > msecs[mi].align) {
+                    msecs[mi].align = osec.align;
+                }
+
+                val sec_base: usize = align_up_usize(msecs[mi].size, osec.align);
+                obj_sec_base[osi] = sec_base;
+                obj_sec_map[osi] = mi;
+
+                if (osec.data != nil && osec.size > 0) {
+                    msec_append(alloc, ?msecs[mi], sec_base, osec.data, osec.size);
+                } or (osec.size > 0) {
+                    # BSS-like: extend size
+                    val new_end: usize = sec_base + osec.size;
+                    if (new_end > msecs[mi].size) {
+                        msecs[mi].size = new_end;
+                    }
+                }
+            } or {
+                obj_sec_map[osi] = -1;
+            }
+
+            osi = osi + 1;
+        }
+
+        # merge symbols
+        var syi: i32 = 0;
+        for (syi < obj.sym_count) {
+            val osym: *of.ObjSymbol = ?obj.symbols[syi];
+
+            # skip section and file symbols
+            if (osym.kind == sym.SYM_SECTION || osym.kind == sym.SYM_FILE) {
+                syi = syi + 1;
+                cnt;
+            }
+            if (osym.name == nil || str_len(osym.name) == 0) {
+                syi = syi + 1;
+                cnt;
+            }
+
+            # grow symbols array if needed
+            if (msym_count >= msym_cap) {
+                val new_cap: i32 = msym_cap * 2;
+                val gr: Result[*MergedSymbol, allocator.AllocError] =
+                    allocator.allocator_resize[MergedSymbol](alloc, msyms,
+                        msym_cap::usize, new_cap::usize);
+                if (result_is_err[*MergedSymbol, allocator.AllocError](gr)) { ret 2; }
+                msyms = result_unwrap_ok[*MergedSymbol, allocator.AllocError](gr);
+                msym_cap = new_cap;
+            }
+
+            if (osym.defined && osym.section >= 0) {
+                var ms: i32 = -1;
+                var moff: usize = osym.offset;
+                if (obj_sec_map != nil) {
+                    ms = obj_sec_map[osym.section];
+                    moff = obj_sec_base[osym.section] + osym.offset;
+                }
+
+                # check for duplicate global definitions
+                if (osym.binding == sym.BIND_GLOBAL) {
+                    val existing: i32 = find_merged_symbol(msyms, msym_count, osym.name);
+                    if (existing >= 0 && msyms[existing].defined) {
+                        print.eprintlnf("linker: duplicate symbol: %s", osym.name);
+                        ret 4;
+                    }
+                    if (existing >= 0) {
+                        # was undefined, now define it
+                        msyms[existing].section = ms;
+                        msyms[existing].offset = moff;
+                        msyms[existing].size = osym.size;
+                        msyms[existing].defined = true;
+                        msyms[existing].binding = osym.binding;
+                        msyms[existing].kind = osym.kind;
+                        syi = syi + 1;
+                        cnt;
+                    }
+                }
+
+                msyms[msym_count].name = osym.name;
+                msyms[msym_count].binding = osym.binding;
+                msyms[msym_count].kind = osym.kind;
+                msyms[msym_count].section = ms;
+                msyms[msym_count].offset = moff;
+                msyms[msym_count].size = osym.size;
+                msyms[msym_count].defined = true;
+                msym_count = msym_count + 1;
+            } or {
+                # undefined symbol — only add if global and not already tracked
+                if (osym.binding == sym.BIND_GLOBAL) {
+                    val existing: i32 = find_merged_symbol(msyms, msym_count, osym.name);
+                    if (existing < 0) {
+                        msyms[msym_count].name = osym.name;
+                        msyms[msym_count].binding = osym.binding;
+                        msyms[msym_count].kind = osym.kind;
+                        msyms[msym_count].section = -1;
+                        msyms[msym_count].offset = 0;
+                        msyms[msym_count].size = 0;
+                        msyms[msym_count].defined = false;
+                        msym_count = msym_count + 1;
+                    }
+                }
+            }
+
+            syi = syi + 1;
+        }
+
+        # merge relocations
+        var rli: i32 = 0;
+        for (rli < obj.reloc_count) {
+            val orel: *of.ObjReloc = ?obj.relocs[rli];
+
+            # grow relocs array if needed
+            if (mrel_count >= mrel_cap) {
+                val new_cap: i32 = mrel_cap * 2;
+                val gr: Result[*MergedReloc, allocator.AllocError] =
+                    allocator.allocator_resize[MergedReloc](alloc, mrels,
+                        mrel_cap::usize, new_cap::usize);
+                if (result_is_err[*MergedReloc, allocator.AllocError](gr)) { ret 2; }
+                mrels = result_unwrap_ok[*MergedReloc, allocator.AllocError](gr);
+                mrel_cap = new_cap;
+            }
+
+            var ms: i32 = -1;
+            var moff: usize = orel.offset;
+            if (orel.section >= 0 && orel.section < obj.sec_count && obj_sec_map != nil) {
+                ms = obj_sec_map[orel.section];
+                moff = obj_sec_base[orel.section] + orel.offset;
+            }
+
+            mrels[mrel_count].section = ms;
+            mrels[mrel_count].offset = moff;
+            mrels[mrel_count].symbol_name = orel.symbol_name;
+            mrels[mrel_count].rtype = orel.rtype;
+            mrels[mrel_count].addend = orel.addend;
+            mrel_count = mrel_count + 1;
+
+            rli = rli + 1;
+        }
+
+        fi = fi + 1;
+    }
+
+    # --- 3. layout: assign virtual addresses ---
+
+    var load_count: i32 = 0;
+    var si: i32 = 0;
+    for (si < msec_count) {
+        if (msecs[si].size > 0 && (msecs[si].flags & section.FLAG_ALLOC) != 0) {
+            load_count = load_count + 1;
+        }
+        si = si + 1;
+    }
+
+    if (load_count == 0) {
+        print.eprint("linker: no loadable sections\n");
+        ret 5;
+    }
+
+    val esec_r: Result[*of.ExecSection, allocator.AllocError] =
+        allocator.allocator_zalloc[of.ExecSection](alloc, load_count::usize);
+    if (result_is_err[*of.ExecSection, allocator.AllocError](esec_r)) { ret 2; }
+    val esecs: *of.ExecSection =
+        result_unwrap_ok[*of.ExecSection, allocator.AllocError](esec_r);
+
+    val msm_r: Result[*i32, allocator.AllocError] =
+        allocator.allocator_alloc[i32](alloc, msec_count::usize);
+    if (result_is_err[*i32, allocator.AllocError](msm_r)) { ret 2; }
+    val msec_map: *i32 = result_unwrap_ok[*i32, allocator.AllocError](msm_r);
+
+    si = 0;
+    for (si < msec_count) {
+        msec_map[si] = -1;
+        si = si + 1;
+    }
+
+    val header_size: usize = 64 + (load_count::usize * 56);
+    var cursor: u64 = base + header_size::u64;
+    var ei: i32 = 0;
+
+    # pass 1: exec sections (.text)
+    si = 0;
+    for (si < msec_count) {
+        if (msecs[si].size > 0 && (msecs[si].flags & section.FLAG_ALLOC) != 0
+            && (msecs[si].flags & section.FLAG_EXEC) != 0) {
+            cursor = align_up(cursor, msecs[si].align::u64);
+            esecs[ei].data = msecs[si].data;
+            esecs[ei].size = msecs[si].size;
+            esecs[ei].vaddr = cursor;
+            esecs[ei].flags = msecs[si].flags;
+            esecs[ei].align = msecs[si].align;
+            msec_map[si] = ei;
+            cursor = cursor + msecs[si].size::u64;
+            ei = ei + 1;
+        }
+        si = si + 1;
+    }
+
+    # pass 2: read-only (.rodata)
+    si = 0;
+    for (si < msec_count) {
+        if (msecs[si].size > 0 && (msecs[si].flags & section.FLAG_ALLOC) != 0
+            && (msecs[si].flags & section.FLAG_EXEC) == 0
+            && (msecs[si].flags & section.FLAG_WRITE) == 0) {
+            cursor = align_up(cursor, msecs[si].align::u64);
+            esecs[ei].data = msecs[si].data;
+            esecs[ei].size = msecs[si].size;
+            esecs[ei].vaddr = cursor;
+            esecs[ei].flags = msecs[si].flags;
+            esecs[ei].align = msecs[si].align;
+            msec_map[si] = ei;
+            cursor = cursor + msecs[si].size::u64;
+            ei = ei + 1;
+        }
+        si = si + 1;
+    }
+
+    # page-align before writable
+    cursor = align_up(cursor, page::u64);
+
+    # pass 3: .data (writable, not BSS)
+    si = 0;
+    for (si < msec_count) {
+        if (msecs[si].size > 0 && (msecs[si].flags & section.FLAG_ALLOC) != 0
+            && (msecs[si].flags & section.FLAG_WRITE) != 0
+            && msecs[si].kind != section.SEC_BSS) {
+            cursor = align_up(cursor, msecs[si].align::u64);
+            esecs[ei].data = msecs[si].data;
+            esecs[ei].size = msecs[si].size;
+            esecs[ei].vaddr = cursor;
+            esecs[ei].flags = msecs[si].flags;
+            esecs[ei].align = msecs[si].align;
+            msec_map[si] = ei;
+            cursor = cursor + msecs[si].size::u64;
+            ei = ei + 1;
+        }
+        si = si + 1;
+    }
+
+    # pass 4: .bss
+    si = 0;
+    for (si < msec_count) {
+        if (msecs[si].size > 0 && (msecs[si].flags & section.FLAG_ALLOC) != 0
+            && msecs[si].kind == section.SEC_BSS) {
+            cursor = align_up(cursor, msecs[si].align::u64);
+            esecs[ei].data = nil;
+            esecs[ei].size = msecs[si].size;
+            esecs[ei].vaddr = cursor;
+            esecs[ei].flags = msecs[si].flags;
+            esecs[ei].align = msecs[si].align;
+            msec_map[si] = ei;
+            cursor = cursor + msecs[si].size::u64;
+            ei = ei + 1;
+        }
+        si = si + 1;
+    }
+
+    # --- 4. resolve + relocate ---
+
+    var rli: i32 = 0;
+    for (rli < mrel_count) {
+        val rel: *MergedReloc = ?mrels[rli];
+        if (rel.section < 0 || rel.symbol_name == nil) {
+            rli = rli + 1;
+            cnt;
+        }
+
+        # look up target symbol
+        val sym_idx: i32 = find_merged_symbol(msyms, msym_count, rel.symbol_name);
+        if (sym_idx < 0 || !msyms[sym_idx].defined) {
+            print.eprintlnf("linker: undefined symbol: %s", rel.symbol_name);
+            ret 6;
+        }
+
+        val sym_esec: i32 = msec_map[msyms[sym_idx].section];
+        if (sym_esec < 0) {
+            print.eprintlnf("linker: symbol in non-loadable section: %s", rel.symbol_name);
+            ret 7;
+        }
+        val sym_vaddr: u64 = esecs[sym_esec].vaddr + msyms[sym_idx].offset::u64;
+
+        val rel_esec: i32 = msec_map[rel.section];
+        if (rel_esec < 0) {
+            rli = rli + 1;
+            cnt;
+        }
+        val rel_vaddr: u64 = esecs[rel_esec].vaddr + rel.offset::u64;
+
+        val dest: *u8 = ?msecs[rel.section].data[rel.offset];
+        val written: i32 = iface.resolve_reloc(iface.ctx, rel.rtype, sym_vaddr,
+            rel_vaddr, rel.addend, dest);
+        if (written == 0) {
+            print.eprintlnf("linker: failed to resolve relocation for: %s", rel.symbol_name);
+            ret 8;
+        }
+
+        rli = rli + 1;
+    }
+
+    # --- 5. entry point ---
+
+    val entry_idx: i32 = find_merged_symbol(msyms, msym_count, entry_name);
+    if (entry_idx < 0 || !msyms[entry_idx].defined) {
+        print.eprintlnf("linker: undefined entry point: %s", entry_name);
+        ret 9;
+    }
+    val entry_esec: i32 = msec_map[msyms[entry_idx].section];
+    if (entry_esec < 0) {
+        print.eprint("linker: entry point in non-loadable section\n");
+        ret 10;
+    }
+    val entry_vaddr: u64 = esecs[entry_esec].vaddr + msyms[entry_idx].offset::u64;
+
+    # --- 6. emit executable ---
+
+    val ef: *of.ExecFormat = ?tgt.ef;
+
+    var buf: of.OutputBuffer;
+    of.buf_init(?buf, alloc);
+
+    ef.emit(ef.ctx, esecs, load_count, entry_vaddr, ?buf);
+
+    val write_res: i64 = write_output(?buf, output);
+
+    of.buf_destroy(?buf);
+
+    if (write_res != 0) {
+        print.eprint("linker: failed to write output\n");
+        ret 11;
+    }
+
+    ret 0;
+}
+
 # --- helpers ---
+
+fun find_merged_section(msecs: *MergedSection, count: i32, name: str) i32 {
+    if (msecs == nil || name == nil) { ret -1; }
+    var i: i32 = 0;
+    for (i < count) {
+        if (msecs[i].name != nil && str_equals(msecs[i].name, name)) {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun find_merged_symbol(msyms: *MergedSymbol, count: i32, name: str) i32 {
+    if (msyms == nil || name == nil) { ret -1; }
+    var i: i32 = 0;
+    for (i < count) {
+        if (msyms[i].name != nil && str_equals(msyms[i].name, name)) {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun msec_append(alloc: *allocator.Allocator, msec: *MergedSection,
+                base: usize, data: *u8, len: usize) {
+    if (msec == nil || data == nil || len == 0) { ret; }
+
+    val needed: usize = base + len;
+    if (needed > msec.capacity) {
+        var new_cap: usize = 4096;
+        if (msec.capacity > 0) { new_cap = msec.capacity * 2; }
+        for (new_cap < needed) { new_cap = new_cap * 2; }
+
+        val r: Result[*u8, allocator.AllocError] =
+            allocator.allocator_resize[u8](alloc, msec.data, msec.capacity, new_cap);
+        if (result_is_err[*u8, allocator.AllocError](r)) { ret; }
+        msec.data = result_unwrap_ok[*u8, allocator.AllocError](r);
+        msec.capacity = new_cap;
+    }
+
+    # zero-fill gap between old size and base (alignment padding)
+    var gi: usize = msec.size;
+    for (gi < base) {
+        msec.data[gi] = 0;
+        gi = gi + 1;
+    }
+
+    # copy data
+    var i: usize = 0;
+    for (i < len) {
+        msec.data[base + i] = data[i];
+        i = i + 1;
+    }
+
+    if (needed > msec.size) {
+        msec.size = needed;
+    }
+}
+
+fun align_up_usize(v: usize, align: usize) usize {
+    if (align <= 1) { ret v; }
+    val mask: usize = align - 1;
+    ret (v + mask) & ~mask;
+}
 
 fun align_up(v: u64, align: u64) u64 {
     if (align <= 1) { ret v; }
