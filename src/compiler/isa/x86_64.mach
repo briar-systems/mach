@@ -20,13 +20,15 @@ use xiasm:     mach.compiler.isa.x86_64.iasm;
 
 # X86Context: internal state for the x86_64 ISA.
 rec X86Context {
-    alloc:     *allocator.Allocator;
-    gp_regs:   *isa.Register;
-    gp_count:  i32;
-    fp_regs:   *isa.Register;
-    fp_count:  i32;
-    gp_file:   isa.RegisterFile;
-    fp_file:   isa.RegisterFile;
+    alloc:         *allocator.Allocator;
+    gp_regs:       *isa.Register;
+    gp_count:      i32;
+    fp_regs:       *isa.Register;
+    fp_count:      i32;
+    gp_file:       isa.RegisterFile;
+    fp_file:       isa.RegisterFile;
+    reserved_regs: *isa.Register;
+    reserved_file: isa.RegisterFile;
 }
 
 # create: construct the x86_64 ISA.
@@ -99,6 +101,17 @@ pub fun create(alloc: *allocator.Allocator) Result[isa.ISA, str] {
     ctx.fp_file.regs = ctx.fp_regs;
     ctx.fp_file.count = ctx.fp_count;
 
+    # allocate and populate reserved registers (RSP, R15)
+    val res_r: Result[*isa.Register, allocator.AllocError] = allocator.allocator_alloc[isa.Register](alloc, 2);
+    if (result_is_err[*isa.Register, allocator.AllocError](res_r)) {
+        ret err[isa.ISA, str]("out of memory");
+    }
+    ctx.reserved_regs = result_unwrap_ok[*isa.Register, allocator.AllocError](res_r);
+    set_reg(?ctx.reserved_regs[0], opcode.RSP, "rsp", isa.REG_GP, 8);
+    set_reg(?ctx.reserved_regs[1], opcode.R15, "r15", isa.REG_GP, 8);
+    ctx.reserved_file.regs = ctx.reserved_regs;
+    ctx.reserved_file.count = 2;
+
     # construct ISA interface
     var i: isa.ISA;
     i.ctx = ctx::ptr;
@@ -108,6 +121,13 @@ pub fun create(alloc: *allocator.Allocator) Result[isa.ISA, str] {
     i.encode = x86_encode;
     i.encode_nop = x86_encode_nop;
     i.peephole = x86_peephole;
+    i.frame_reg = x86_frame_reg;
+    i.reserved_regs = x86_reserved_regs;
+    i.is_ret = x86_is_ret;
+    i.emit_spill = x86_emit_spill;
+    i.emit_reload = x86_emit_reload;
+    i.prologue = x86_prologue;
+    i.epilogue = x86_epilogue;
     i.reloc_size = x86_reloc_size;
     i.resolve_reloc = x86_resolve_reloc;
     i.prologue = x86_prologue;
@@ -168,6 +188,126 @@ fun x86_encode_nop(ctx: ptr, size: i32, sec: *section.Section,
 fun x86_peephole(ctx: ptr, buf: *isa.MachInstBuf) {
     peephole.optimize(buf);
 }
+
+# --- register allocation support ---
+
+fun x86_frame_reg(ctx: ptr) i32 {
+    ret opcode.R15;
+}
+
+fun x86_reserved_regs(ctx: ptr) isa.RegisterFile {
+    val x: *X86Context = ctx::*X86Context;
+    if (x == nil) {
+        var empty: isa.RegisterFile;
+        empty.regs = nil;
+        empty.count = 0;
+        ret empty;
+    }
+    ret x.reserved_file;
+}
+
+fun x86_is_ret(ctx: ptr, inst: *isa.MachInst) bool {
+    if (inst == nil) { ret false; }
+    ret inst.opcode == opcode.RET;
+}
+
+fun x86_emit_spill(ctx: ptr, buf: *isa.MachInstBuf, preg: i32,
+                   offset: i64, size: u8, fp_reg: i32) i32 {
+    # MOV [fp_reg + offset], preg
+    var mi: isa.MachInst;
+    mi.opcode = opcode.OP_MOV;
+    mi.dst = ir.make_mem(fp_reg, -1, 1, offset, size);
+    mi.src1 = ir.make_reg(preg, size);
+    mi.size = size;
+    mi.flags = 0;
+    if (size == 8) { mi.flags = opcode.FLAG_REX_W; }
+    if (isa.buf_append(buf, mi)) { ret 1; }
+    ret 0;
+}
+
+fun x86_emit_reload(ctx: ptr, buf: *isa.MachInstBuf, preg: i32,
+                    offset: i64, size: u8, fp_reg: i32) i32 {
+    # MOV preg, [fp_reg + offset]
+    var mi: isa.MachInst;
+    mi.opcode = opcode.OP_MOV;
+    mi.dst = ir.make_reg(preg, size);
+    mi.src1 = ir.make_mem(fp_reg, -1, 1, offset, size);
+    mi.size = size;
+    mi.flags = 0;
+    if (size == 8) { mi.flags = opcode.FLAG_REX_W; }
+    if (isa.buf_append(buf, mi)) { ret 1; }
+    ret 0;
+}
+
+# --- frame management ---
+
+fun x86_prologue(ctx: ptr, frame_size: usize, sec: *section.Section,
+                 alloc: *allocator.Allocator) i32 {
+    var n: i32 = 0;
+
+    # push r15
+    var push_inst: isa.MachInst;
+    push_inst.opcode = opcode.PUSH;
+    push_inst.dst = ir.make_reg(opcode.R15, 8);
+    push_inst.size = 8;
+    push_inst.flags = 0;
+    n = n + encode.encode_instruction(?push_inst, sec, alloc);
+
+    # mov r15, rsp
+    var mov_inst: isa.MachInst;
+    mov_inst.opcode = opcode.OP_MOV;
+    mov_inst.dst = ir.make_reg(opcode.R15, 8);
+    mov_inst.src1 = ir.make_reg(opcode.RSP, 8);
+    mov_inst.size = 8;
+    mov_inst.flags = opcode.FLAG_REX_W;
+    n = n + encode.encode_instruction(?mov_inst, sec, alloc);
+
+    # sub rsp, frame_size
+    if (frame_size > 0) {
+        var sub_inst: isa.MachInst;
+        sub_inst.opcode = opcode.SUB;
+        sub_inst.dst = ir.make_reg(opcode.RSP, 8);
+        sub_inst.src1 = ir.make_imm(frame_size::i64, 8);
+        sub_inst.size = 8;
+        sub_inst.flags = opcode.FLAG_REX_W;
+        n = n + encode.encode_instruction(?sub_inst, sec, alloc);
+    }
+
+    ret n;
+}
+
+fun x86_epilogue(ctx: ptr, sec: *section.Section,
+                 alloc: *allocator.Allocator) i32 {
+    var n: i32 = 0;
+
+    # mov rsp, r15
+    var mov_inst: isa.MachInst;
+    mov_inst.opcode = opcode.OP_MOV;
+    mov_inst.dst = ir.make_reg(opcode.RSP, 8);
+    mov_inst.src1 = ir.make_reg(opcode.R15, 8);
+    mov_inst.size = 8;
+    mov_inst.flags = opcode.FLAG_REX_W;
+    n = n + encode.encode_instruction(?mov_inst, sec, alloc);
+
+    # pop r15
+    var pop_inst: isa.MachInst;
+    pop_inst.opcode = opcode.POP;
+    pop_inst.dst = ir.make_reg(opcode.R15, 8);
+    pop_inst.size = 8;
+    pop_inst.flags = 0;
+    n = n + encode.encode_instruction(?pop_inst, sec, alloc);
+
+    # ret
+    var ret_inst: isa.MachInst;
+    ret_inst.opcode = opcode.RET;
+    ret_inst.size = 0;
+    ret_inst.flags = 0;
+    n = n + encode.encode_instruction(?ret_inst, sec, alloc);
+
+    ret n;
+}
+
+# --- relocation ---
 
 fun x86_reloc_size(ctx: ptr, rtype: section.RelocKind) u8 {
     if (rtype == section.RELOC_ABS64)  { ret 8; }
