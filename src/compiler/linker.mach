@@ -1,0 +1,326 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use print:     std.print;
+
+use masm:    mach.compiler.masm;
+use section: mach.compiler.masm.section;
+use sym:     mach.compiler.masm.symbol;
+use target:  mach.compiler.target;
+use of:      mach.compiler.of;
+use os:      mach.compiler.os;
+use isa:     mach.compiler.isa;
+use fs:      std.filesystem;
+
+# mach.compiler.linker: built-in static linker.
+# ---
+# operates on the MASM context directly — no external tools.
+# format-agnostic: delegates executable emission to ExecFormat.
+# ISA-agnostic: delegates relocation resolution to ISA.
+#
+# workflow:
+#   1. layout   — assign virtual addresses to sections
+#   2. resolve  — map symbols to virtual addresses
+#   3. relocate — apply relocations using ISA dispatch
+#   4. emit     — produce executable via ExecFormat
+
+# --- constants ---
+
+# how many sections we support in a single link
+val MAX_SECTIONS: i32 = 32;
+
+# --- public API ---
+
+# link: link a MASM context into an executable.
+# mctx: the merged MASM context (all modules combined)
+# tgt: the compilation target
+# output: output file path
+# alloc: allocator
+# returns 0 on success, nonzero on failure.
+pub fun link(mctx: *masm.Context, tgt: *target.Target,
+             output: str, alloc: *allocator.Allocator) i64 {
+    if (mctx == nil || tgt == nil || output == nil || alloc == nil) {
+        ret 1;
+    }
+
+    val o: *os.OS = ?tgt.os;
+    val entry_name: str = o.entry_point(o.ctx);
+    val base: u64 = o.base_addr(o.ctx);
+    val page: usize = o.page_size(o.ctx);
+
+    # --- 1. layout: assign virtual addresses ---
+
+    # count loadable sections
+    var load_count: i32 = 0;
+    var si: i32 = 0;
+    for (si < mctx.section_count) {
+        val sec: *section.Section = mctx.sections[si];
+        if (sec != nil && sec.size > 0 && (sec.flags & section.FLAG_ALLOC) != 0) {
+            load_count = load_count + 1;
+        }
+        si = si + 1;
+    }
+
+    if (load_count == 0) {
+        print.eprint("linker: no loadable sections\n");
+        ret 2;
+    }
+    if (load_count > MAX_SECTIONS) {
+        print.eprint("linker: too many sections\n");
+        ret 3;
+    }
+
+    # allocate ExecSection array and vaddr tracking
+    val esec_r: Result[*of.ExecSection, allocator.AllocError] =
+        allocator.allocator_zalloc[of.ExecSection](alloc, load_count::usize);
+    if (result_is_err[*of.ExecSection, allocator.AllocError](esec_r)) {
+        print.eprint("linker: out of memory\n");
+        ret 4;
+    }
+    val esecs: *of.ExecSection = result_unwrap_ok[*of.ExecSection, allocator.AllocError](esec_r);
+
+    # allocate section index map: masm section index → esecs index (-1 if not loaded)
+    val map_r: Result[*i32, allocator.AllocError] =
+        allocator.allocator_alloc[i32](alloc, mctx.section_count::usize);
+    if (result_is_err[*i32, allocator.AllocError](map_r)) {
+        print.eprint("linker: out of memory\n");
+        ret 4;
+    }
+    val sec_map: *i32 = result_unwrap_ok[*i32, allocator.AllocError](map_r);
+
+    # initialize map to -1
+    si = 0;
+    for (si < mctx.section_count) {
+        sec_map[si] = -1;
+        si = si + 1;
+    }
+
+    # headers occupy the first part of the file at base vaddr.
+    # sections start after headers, aligned to their requirements.
+    val header_size: usize = 64 + (load_count::usize * 56); # EHDR + PHDRs
+    var cursor: u64 = base + header_size::u64;
+
+    # lay out sections in order: .text first, then .rodata, then .data, then .bss
+    # this ensures proper ordering for the executable.
+    var ei: i32 = 0;
+
+    # pass 1: .text (exec sections)
+    si = 0;
+    for (si < mctx.section_count) {
+        val sec: *section.Section = mctx.sections[si];
+        if (sec != nil && sec.size > 0 && (sec.flags & section.FLAG_ALLOC) != 0
+            && (sec.flags & section.FLAG_EXEC) != 0) {
+            cursor = align_up(cursor, sec.align::u64);
+            esecs[ei].data = sec.data;
+            esecs[ei].size = sec.size;
+            esecs[ei].vaddr = cursor;
+            esecs[ei].flags = sec.flags;
+            esecs[ei].align = sec.align;
+            sec_map[si] = ei;
+            cursor = cursor + sec.size::u64;
+            ei = ei + 1;
+        }
+        si = si + 1;
+    }
+
+    # pass 2: .rodata (alloc, not exec, not write)
+    si = 0;
+    for (si < mctx.section_count) {
+        val sec: *section.Section = mctx.sections[si];
+        if (sec != nil && sec.size > 0 && (sec.flags & section.FLAG_ALLOC) != 0
+            && (sec.flags & section.FLAG_EXEC) == 0 && (sec.flags & section.FLAG_WRITE) == 0) {
+            cursor = align_up(cursor, sec.align::u64);
+            esecs[ei].data = sec.data;
+            esecs[ei].size = sec.size;
+            esecs[ei].vaddr = cursor;
+            esecs[ei].flags = sec.flags;
+            esecs[ei].align = sec.align;
+            sec_map[si] = ei;
+            cursor = cursor + sec.size::u64;
+            ei = ei + 1;
+        }
+        si = si + 1;
+    }
+
+    # page-align before writable sections
+    cursor = align_up(cursor, page::u64);
+
+    # pass 3: .data (alloc + write, not bss)
+    si = 0;
+    for (si < mctx.section_count) {
+        val sec: *section.Section = mctx.sections[si];
+        if (sec != nil && sec.size > 0 && (sec.flags & section.FLAG_ALLOC) != 0
+            && (sec.flags & section.FLAG_WRITE) != 0 && sec.kind != section.SEC_BSS) {
+            cursor = align_up(cursor, sec.align::u64);
+            esecs[ei].data = sec.data;
+            esecs[ei].size = sec.size;
+            esecs[ei].vaddr = cursor;
+            esecs[ei].flags = sec.flags;
+            esecs[ei].align = sec.align;
+            sec_map[si] = ei;
+            cursor = cursor + sec.size::u64;
+            ei = ei + 1;
+        }
+        si = si + 1;
+    }
+
+    # pass 4: .bss (alloc + write + bss)
+    si = 0;
+    for (si < mctx.section_count) {
+        val sec: *section.Section = mctx.sections[si];
+        if (sec != nil && sec.size > 0 && (sec.flags & section.FLAG_ALLOC) != 0
+            && sec.kind == section.SEC_BSS) {
+            cursor = align_up(cursor, sec.align::u64);
+            esecs[ei].data = nil;
+            esecs[ei].size = sec.size;
+            esecs[ei].vaddr = cursor;
+            esecs[ei].flags = sec.flags;
+            esecs[ei].align = sec.align;
+            sec_map[si] = ei;
+            cursor = cursor + sec.size::u64;
+            ei = ei + 1;
+        }
+        si = si + 1;
+    }
+
+    # --- 2. resolve: map symbols to virtual addresses ---
+
+    # for relocation resolution, we need to look up a symbol name
+    # and get its virtual address. we use the MASM context's symbol hash map
+    # and compute vaddr = esecs[sec_map[sym.section]].vaddr + sym.offset.
+
+    # --- 3. relocate: apply all relocations ---
+
+    val i: *isa.ISA = ?tgt.isa;
+
+    si = 0;
+    for (si < mctx.section_count) {
+        val sec: *section.Section = mctx.sections[si];
+        if (sec == nil || sec.reloc_count == 0) {
+            si = si + 1;
+            cnt;
+        }
+
+        # this section's vaddr (needed for PC-relative relocs)
+        val sec_ei: i32 = sec_map[si];
+        if (sec_ei < 0) {
+            si = si + 1;
+            cnt;
+        }
+        val sec_vaddr: u64 = esecs[sec_ei].vaddr;
+
+        var ri: i32 = 0;
+        for (ri < sec.reloc_count) {
+            val reloc: *section.Relocation = ?sec.relocs[ri];
+
+            # look up target symbol
+            val target_sym: *sym.Symbol = masm.get_symbol(mctx, reloc.symbol_name);
+            if (target_sym == nil || !target_sym.defined) {
+                print.eprint("linker: undefined symbol: ");
+                print.eprint(reloc.symbol_name);
+                print.eprint("\n");
+                allocator.allocator_free[of.ExecSection](alloc, esecs, load_count::usize);
+                allocator.allocator_free[i32](alloc, sec_map, mctx.section_count::usize);
+                ret 5;
+            }
+
+            # compute symbol's virtual address
+            val sym_sec_ei: i32 = sec_map[target_sym.section::i32];
+            if (sym_sec_ei < 0) {
+                print.eprint("linker: symbol in non-loadable section: ");
+                print.eprint(reloc.symbol_name);
+                print.eprint("\n");
+                allocator.allocator_free[of.ExecSection](alloc, esecs, load_count::usize);
+                allocator.allocator_free[i32](alloc, sec_map, mctx.section_count::usize);
+                ret 6;
+            }
+            val sym_vaddr: u64 = esecs[sym_sec_ei].vaddr + target_sym.offset::u64;
+
+            # compute relocation site virtual address
+            val reloc_vaddr: u64 = sec_vaddr + reloc.offset::u64;
+
+            # apply relocation via ISA
+            val dest: *u8 = ?sec.data[reloc.offset];
+            val written: i32 = i.resolve_reloc(i.ctx, reloc.rtype, sym_vaddr,
+                reloc_vaddr, reloc.addend, dest);
+            if (written == 0) {
+                print.eprint("linker: failed to resolve relocation\n");
+                allocator.allocator_free[of.ExecSection](alloc, esecs, load_count::usize);
+                allocator.allocator_free[i32](alloc, sec_map, mctx.section_count::usize);
+                ret 7;
+            }
+
+            ri = ri + 1;
+        }
+        si = si + 1;
+    }
+
+    # --- 4. resolve entry point ---
+
+    val entry_sym: *sym.Symbol = masm.get_symbol(mctx, entry_name);
+    if (entry_sym == nil || !entry_sym.defined) {
+        print.eprint("linker: undefined entry point: ");
+        print.eprint(entry_name);
+        print.eprint("\n");
+        allocator.allocator_free[of.ExecSection](alloc, esecs, load_count::usize);
+        allocator.allocator_free[i32](alloc, sec_map, mctx.section_count::usize);
+        ret 8;
+    }
+    val entry_sec_ei: i32 = sec_map[entry_sym.section::i32];
+    if (entry_sec_ei < 0) {
+        print.eprint("linker: entry point in non-loadable section\n");
+        allocator.allocator_free[of.ExecSection](alloc, esecs, load_count::usize);
+        allocator.allocator_free[i32](alloc, sec_map, mctx.section_count::usize);
+        ret 9;
+    }
+    val entry_vaddr: u64 = esecs[entry_sec_ei].vaddr + entry_sym.offset::u64;
+
+    # --- 5. emit executable ---
+
+    val ef: *of.ExecFormat = ?tgt.ef;
+
+    var buf: of.OutputBuffer;
+    of.buf_init(?buf, alloc);
+
+    ef.emit(ef.ctx, esecs, load_count, entry_vaddr, ?buf);
+
+    # write to file
+    val write_res: i64 = write_output(?buf, output);
+
+    # cleanup
+    of.buf_destroy(?buf);
+    allocator.allocator_free[of.ExecSection](alloc, esecs, load_count::usize);
+    allocator.allocator_free[i32](alloc, sec_map, mctx.section_count::usize);
+
+    if (write_res != 0) {
+        print.eprint("linker: failed to write output\n");
+        ret 10;
+    }
+
+    ret 0;
+}
+
+# --- helpers ---
+
+fun align_up(v: u64, align: u64) u64 {
+    if (align <= 1) { ret v; }
+    val mask: u64 = align - 1;
+    ret (v + mask) & ~mask;
+}
+
+fun write_output(buf: *of.OutputBuffer, path: str) i64 {
+    if (buf == nil || buf.data == nil || buf.size == 0) { ret 1; }
+
+    val file_r: Result[fs.File, str] = fs.create(path, 493); # 0755
+    if (result_is_err[fs.File, str](file_r)) { ret 2; }
+
+    var file: fs.File = result_unwrap_ok[fs.File, str](file_r);
+    val write_r: Result[usize, str] = fs.file_write(?file, buf.data, buf.size);
+    fs.file_close(?file);
+
+    if (result_is_err[usize, str](write_r)) { ret 3; }
+    ret 0;
+}
