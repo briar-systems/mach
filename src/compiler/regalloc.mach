@@ -1,0 +1,492 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use ir:        mach.compiler.masm.ir;
+use isa:       mach.compiler.isa;
+use abi:       mach.compiler.abi;
+
+# mach.compiler.regalloc: target-agnostic linear scan register allocator.
+# ---
+# sits between ISel and encoding. rewrites virtual register operands
+# to physical registers, inserting spills/reloads as needed.
+# imports only isa.mach (abstract interface) and masm/ir.mach (operand types).
+
+# --- constants ---
+
+val MAX_LIVE_RANGES: i32 = 4096;
+val MAX_POOL_REGS:   i32 = 16;
+val ALIGN:           i64 = 8;
+
+# --- records ---
+
+rec LiveRange {
+    vreg:      i32;    # virtual register ID
+    start:     i32;    # first instruction index (def)
+    end_pos:   i32;    # last instruction index (use)
+    size:      u8;     # operand size in bytes
+    preg:      i32;    # assigned physical register (-1 = unassigned)
+    spill_off: i64;    # spill slot frame offset (negative, 0 = not spilled)
+    spilled:   bool;
+}
+
+pub rec RegAllocResult {
+    out:        isa.MachInstBuf;   # rewritten instructions (vregs → physical)
+    spill_size: usize;             # total spill frame bytes needed
+    ok:         bool;
+}
+
+# --- public API ---
+
+pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
+                       insts: *isa.MachInstBuf, local_size: usize) RegAllocResult {
+    var result: RegAllocResult;
+    result.out = isa.buf_create(alloc);
+    result.spill_size = 0;
+    result.ok = false;
+
+    if (alloc == nil || i == nil || a == nil || insts == nil) { ret result; }
+    if (insts.count == 0) {
+        result.ok = true;
+        ret result;
+    }
+
+    # --- build allocable register pool ---
+    val gp: isa.RegisterFile = i.gp_regs(i.ctx);
+    val reserved: isa.RegisterFile = i.reserved_regs(i.ctx);
+    val callee: isa.RegisterFile = a.callee_saved(a.ctx);
+
+    # allocate pool array
+    val pool_r: Result[*i32, allocator.AllocError] =
+        allocator.allocator_zalloc[i32](alloc, MAX_POOL_REGS::usize);
+    if (result_is_err[*i32, allocator.AllocError](pool_r)) { ret result; }
+    val pool: *i32 = result_unwrap_ok[*i32, allocator.AllocError](pool_r);
+    var pool_count: i32 = 0;
+
+    var gi: i32 = 0;
+    for (gi < gp.count) {
+        val rid: i32 = gp.regs[gi].id;
+        if (!is_in_file(rid, ?reserved) && !is_in_file(rid, ?callee)) {
+            if (pool_count < MAX_POOL_REGS) {
+                pool[pool_count] = rid;
+                pool_count = pool_count + 1;
+            }
+        }
+        gi = gi + 1;
+    }
+
+    # --- Pass 1: build live ranges ---
+
+    val ranges_r: Result[*LiveRange, allocator.AllocError] =
+        allocator.allocator_zalloc[LiveRange](alloc, MAX_LIVE_RANGES::usize);
+    if (result_is_err[*LiveRange, allocator.AllocError](ranges_r)) { ret result; }
+    val ranges: *LiveRange = result_unwrap_ok[*LiveRange, allocator.AllocError](ranges_r);
+    var range_count: i32 = 0;
+
+    var idx: i32 = 0;
+    for (idx < insts.count) {
+        val inst: *isa.MachInst = isa.buf_get(insts, idx);
+        if (inst == nil) { idx = idx + 1; cnt; }
+
+        # skip label pseudo-instructions
+        if (inst.opcode == isa.MACHINST_LABEL) { idx = idx + 1; cnt; }
+
+        scan_operand(?inst.dst,  idx, ranges, ?range_count);
+        scan_operand(?inst.src1, idx, ranges, ?range_count);
+        scan_operand(?inst.src2, idx, ranges, ?range_count);
+        idx = idx + 1;
+    }
+
+    # sort by start ascending (insertion sort)
+    sort_ranges(ranges, range_count);
+
+    # --- Pass 2: linear scan allocation ---
+
+    # track which pool registers are free
+    val free_r: Result[*bool, allocator.AllocError] =
+        allocator.allocator_alloc[bool](alloc, pool_count::usize);
+    if (result_is_err[*bool, allocator.AllocError](free_r)) { ret result; }
+    val reg_free: *bool = result_unwrap_ok[*bool, allocator.AllocError](free_r);
+    var fi: i32 = 0;
+    for (fi < pool_count) { reg_free[fi] = true; fi = fi + 1; }
+
+    # active list: indices into ranges[] of currently active (non-spilled) intervals
+    val active_r: Result[*i32, allocator.AllocError] =
+        allocator.allocator_zalloc[i32](alloc, MAX_LIVE_RANGES::usize);
+    if (result_is_err[*i32, allocator.AllocError](active_r)) { ret result; }
+    val active: *i32 = result_unwrap_ok[*i32, allocator.AllocError](active_r);
+    var active_count: i32 = 0;
+
+    var spill_offset: i64 = -(local_size::i64);
+
+    var ri: i32 = 0;
+    for (ri < range_count) {
+        val cur: *LiveRange = ?ranges[ri];
+
+        # expire old intervals
+        var ai: i32 = 0;
+        for (ai < active_count) {
+            val act: *LiveRange = ?ranges[active[ai]];
+            if (act.end_pos < cur.start) {
+                # free the register
+                free_pool_reg(reg_free, pool, pool_count, act.preg);
+                # remove from active by swapping with last
+                active_count = active_count - 1;
+                if (ai < active_count) {
+                    active[ai] = active[active_count];
+                }
+                cnt; # re-check at same index
+            }
+            ai = ai + 1;
+        }
+
+        # try to allocate a free register
+        val free_idx: i32 = find_free_reg(reg_free, pool_count);
+        if (free_idx >= 0) {
+            cur.preg = pool[free_idx];
+            reg_free[free_idx] = false;
+            active[active_count] = ri;
+            active_count = active_count + 1;
+        } or {
+            # spill: evict the active interval with farthest end_pos,
+            # or spill current if it ends latest
+            var victim_ai: i32 = -1;
+            var victim_end: i32 = -1;
+            var vi: i32 = 0;
+            for (vi < active_count) {
+                val act: *LiveRange = ?ranges[active[vi]];
+                if (act.end_pos > victim_end) {
+                    victim_end = act.end_pos;
+                    victim_ai = vi;
+                }
+                vi = vi + 1;
+            }
+
+            if (victim_ai >= 0 && victim_end > cur.end_pos) {
+                # evict victim, give its register to current
+                val victim: *LiveRange = ?ranges[active[victim_ai]];
+                cur.preg = victim.preg;
+                victim.spilled = true;
+                spill_offset = spill_offset - ALIGN;
+                victim.spill_off = spill_offset;
+
+                # replace victim in active list with current
+                active[victim_ai] = ri;
+            } or {
+                # spill current
+                cur.spilled = true;
+                spill_offset = spill_offset - ALIGN;
+                cur.spill_off = spill_offset;
+                # current needs a preg for reload/spill - assigned during rewrite
+                cur.preg = -1;
+            }
+        }
+
+        ri = ri + 1;
+    }
+
+    result.spill_size = (-(spill_offset + local_size::i64))::usize;
+
+    # --- Pass 3: rewrite ---
+
+    val fp_reg: i32 = i.frame_reg(i.ctx);
+
+    idx = 0;
+    for (idx < insts.count) {
+        val inst: *isa.MachInst = isa.buf_get(insts, idx);
+        if (inst == nil) { idx = idx + 1; cnt; }
+
+        # label pseudo-instructions pass through unchanged
+        if (inst.opcode == isa.MACHINST_LABEL) {
+            isa.buf_append(?result.out, @inst);
+            idx = idx + 1;
+            cnt;
+        }
+
+        # determine which physical registers are occupied at this instruction
+        # and find temp registers for spilled operands
+        var dst_range:  *LiveRange = find_range_for_operand(?inst.dst,  ranges, range_count);
+        var src1_range: *LiveRange = find_range_for_operand(?inst.src1, ranges, range_count);
+        var src2_range: *LiveRange = find_range_for_operand(?inst.src2, ranges, range_count);
+
+        # also check memory base/index for spilled ranges
+        var dst_base_range:  *LiveRange = find_mem_base_range(?inst.dst,  ranges, range_count);
+        var dst_idx_range:   *LiveRange = find_mem_idx_range(?inst.dst,   ranges, range_count);
+        var src1_base_range: *LiveRange = find_mem_base_range(?inst.src1, ranges, range_count);
+        var src1_idx_range:  *LiveRange = find_mem_idx_range(?inst.src1,  ranges, range_count);
+        var src2_base_range: *LiveRange = find_mem_base_range(?inst.src2, ranges, range_count);
+        var src2_idx_range:  *LiveRange = find_mem_idx_range(?inst.src2,  ranges, range_count);
+
+        # assign temp registers to spilled operands that need one
+        assign_spill_temps(ranges, range_count, idx, pool, pool_count,
+                           dst_range, src1_range, src2_range,
+                           dst_base_range, dst_idx_range,
+                           src1_base_range, src1_idx_range,
+                           src2_base_range, src2_idx_range);
+
+        # emit reloads for spilled sources
+        emit_reload_if_spilled(i, ?result.out, src1_range, fp_reg);
+        emit_reload_if_spilled(i, ?result.out, src2_range, fp_reg);
+        emit_reload_if_spilled(i, ?result.out, src1_base_range, fp_reg);
+        emit_reload_if_spilled(i, ?result.out, src1_idx_range, fp_reg);
+        emit_reload_if_spilled(i, ?result.out, src2_base_range, fp_reg);
+        emit_reload_if_spilled(i, ?result.out, src2_idx_range, fp_reg);
+        # reload dst memory base/index (for stores: mov [vreg+disp], src)
+        emit_reload_if_spilled(i, ?result.out, dst_base_range, fp_reg);
+        emit_reload_if_spilled(i, ?result.out, dst_idx_range, fp_reg);
+
+        # rewrite the instruction operands
+        var rewritten: isa.MachInst = @inst;
+        rewrite_operand(?rewritten.dst,  ranges, range_count, fp_reg);
+        rewrite_operand(?rewritten.src1, ranges, range_count, fp_reg);
+        rewrite_operand(?rewritten.src2, ranges, range_count, fp_reg);
+        isa.buf_append(?result.out, rewritten);
+
+        # emit spills for spilled dests
+        emit_spill_if_spilled(i, ?result.out, dst_range, fp_reg);
+
+        idx = idx + 1;
+    }
+
+    result.ok = true;
+    ret result;
+}
+
+# --- internal helpers ---
+
+# is_in_file: check if a register ID is in a register file.
+fun is_in_file(reg_id: i32, file: *isa.RegisterFile) bool {
+    if (file == nil || file.regs == nil) { ret false; }
+    var i: i32 = 0;
+    for (i < file.count) {
+        if (file.regs[i].id == reg_id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# scan_operand: record/extend live range for virtual registers in an operand.
+fun scan_operand(op: *ir.Operand, idx: i32, ranges: *LiveRange, count: *i32) {
+    if (op == nil) { ret; }
+
+    if (op.kind == ir.OPK_REG) {
+        if (ir.is_vreg(op.reg)) {
+            record_use(op.reg, idx, op.size, ranges, count);
+        }
+    } or (op.kind == ir.OPK_MEM) {
+        if (ir.is_vreg(op.base)) {
+            record_use(op.base, idx, 8, ranges, count);
+        }
+        if (op.index >= 0 && ir.is_vreg(op.index)) {
+            record_use(op.index, idx, 8, ranges, count);
+        }
+    }
+}
+
+# record_use: create or extend a live range for a virtual register.
+fun record_use(vreg: i32, idx: i32, size: u8, ranges: *LiveRange, count: *i32) {
+    # search for existing range
+    var i: i32 = 0;
+    for (i < @count) {
+        if (ranges[i].vreg == vreg) {
+            if (idx < ranges[i].start) { ranges[i].start = idx; }
+            if (idx > ranges[i].end_pos) { ranges[i].end_pos = idx; }
+            if (size > ranges[i].size) { ranges[i].size = size; }
+            ret;
+        }
+        i = i + 1;
+    }
+
+    # create new range
+    if (@count < MAX_LIVE_RANGES) {
+        val n: i32 = @count;
+        ranges[n].vreg = vreg;
+        ranges[n].start = idx;
+        ranges[n].end_pos = idx;
+        ranges[n].size = size;
+        ranges[n].preg = -1;
+        ranges[n].spill_off = 0;
+        ranges[n].spilled = false;
+        @count = n + 1;
+    }
+}
+
+# sort_ranges: insertion sort by start ascending.
+fun sort_ranges(ranges: *LiveRange, count: i32) {
+    var i: i32 = 1;
+    for (i < count) {
+        var tmp: LiveRange = ranges[i];
+        var j: i32 = i - 1;
+        for (j >= 0 && ranges[j].start > tmp.start) {
+            ranges[j + 1] = ranges[j];
+            j = j - 1;
+        }
+        ranges[j + 1] = tmp;
+        i = i + 1;
+    }
+}
+
+# find_free_reg: find index of first free register in pool.
+fun find_free_reg(reg_free: *bool, pool_count: i32) i32 {
+    var i: i32 = 0;
+    for (i < pool_count) {
+        if (reg_free[i]) { ret i; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# free_pool_reg: mark a physical register as free in the pool.
+fun free_pool_reg(reg_free: *bool, pool: *i32, pool_count: i32, preg: i32) {
+    var i: i32 = 0;
+    for (i < pool_count) {
+        if (pool[i] == preg) { reg_free[i] = true; ret; }
+        i = i + 1;
+    }
+}
+
+# find_range: find the live range for a given virtual register.
+fun find_range(vreg: i32, ranges: *LiveRange, count: i32) *LiveRange {
+    var i: i32 = 0;
+    for (i < count) {
+        if (ranges[i].vreg == vreg) { ret ?ranges[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# find_range_for_operand: find live range for the register in an OPK_REG operand.
+fun find_range_for_operand(op: *ir.Operand, ranges: *LiveRange, count: i32) *LiveRange {
+    if (op == nil) { ret nil; }
+    if (op.kind == ir.OPK_REG && ir.is_vreg(op.reg)) {
+        ret find_range(op.reg, ranges, count);
+    }
+    ret nil;
+}
+
+# find_mem_base_range: find live range for a memory operand's base register.
+fun find_mem_base_range(op: *ir.Operand, ranges: *LiveRange, count: i32) *LiveRange {
+    if (op == nil) { ret nil; }
+    if (op.kind == ir.OPK_MEM && ir.is_vreg(op.base)) {
+        ret find_range(op.base, ranges, count);
+    }
+    ret nil;
+}
+
+# find_mem_idx_range: find live range for a memory operand's index register.
+fun find_mem_idx_range(op: *ir.Operand, ranges: *LiveRange, count: i32) *LiveRange {
+    if (op == nil) { ret nil; }
+    if (op.kind == ir.OPK_MEM && op.index >= 0 && ir.is_vreg(op.index)) {
+        ret find_range(op.index, ranges, count);
+    }
+    ret nil;
+}
+
+# assign_spill_temps: assign temporary physical registers to spilled operands.
+# finds registers not occupied by any non-spilled interval at this instruction.
+fun assign_spill_temps(ranges: *LiveRange, range_count: i32, idx: i32,
+                       pool: *i32, pool_count: i32,
+                       dst_r: *LiveRange, src1_r: *LiveRange, src2_r: *LiveRange,
+                       dst_base_r: *LiveRange, dst_idx_r: *LiveRange,
+                       src1_base_r: *LiveRange, src1_idx_r: *LiveRange,
+                       src2_base_r: *LiveRange, src2_idx_r: *LiveRange) {
+    # collect all spilled ranges that need a temp at this instruction
+    # (max ~8 operand slots, but in practice 1-2)
+
+    # build occupancy bitmap for pool registers at this instruction
+    # a register is occupied if a non-spilled interval with that preg is live here
+    var occupied: i32 = 0; # bitmask, bit i = pool[i] is occupied
+    var ri: i32 = 0;
+    for (ri < range_count) {
+        if (!ranges[ri].spilled && ranges[ri].preg >= 0 &&
+            ranges[ri].start <= idx && ranges[ri].end_pos >= idx) {
+            # mark this preg as occupied
+            var pi: i32 = 0;
+            for (pi < pool_count) {
+                if (pool[pi] == ranges[ri].preg) {
+                    occupied = occupied | (1 << pi);
+                }
+                pi = pi + 1;
+            }
+        }
+        ri = ri + 1;
+    }
+
+    # assign temps to each spilled range from unoccupied pool regs
+    assign_one_temp(src1_r,      idx, pool, pool_count, ?occupied);
+    assign_one_temp(src2_r,      idx, pool, pool_count, ?occupied);
+    assign_one_temp(src1_base_r, idx, pool, pool_count, ?occupied);
+    assign_one_temp(src1_idx_r,  idx, pool, pool_count, ?occupied);
+    assign_one_temp(src2_base_r, idx, pool, pool_count, ?occupied);
+    assign_one_temp(src2_idx_r,  idx, pool, pool_count, ?occupied);
+    assign_one_temp(dst_base_r,  idx, pool, pool_count, ?occupied);
+    assign_one_temp(dst_idx_r,   idx, pool, pool_count, ?occupied);
+    assign_one_temp(dst_r,       idx, pool, pool_count, ?occupied);
+}
+
+# assign_one_temp: assign a temp register to a single spilled range if needed.
+fun assign_one_temp(lr: *LiveRange, idx: i32, pool: *i32, pool_count: i32,
+                    occupied: *i32) {
+    if (lr == nil || !lr.spilled) { ret; }
+
+    # find first unoccupied pool register
+    var pi: i32 = 0;
+    for (pi < pool_count) {
+        if ((@occupied & (1 << pi)) == 0) {
+            lr.preg = pool[pi];
+            @occupied = @occupied | (1 << pi);
+            ret;
+        }
+        pi = pi + 1;
+    }
+    # all occupied — use last pool register as emergency scratch
+    if (pool_count > 0) {
+        lr.preg = pool[pool_count - 1];
+    }
+}
+
+# emit_reload_if_spilled: emit a reload for a spilled live range.
+fun emit_reload_if_spilled(i: *isa.ISA, out: *isa.MachInstBuf,
+                           lr: *LiveRange, fp_reg: i32) {
+    if (lr == nil || !lr.spilled || lr.preg < 0) { ret; }
+    i.emit_reload(i.ctx, out, lr.preg, lr.spill_off, lr.size, fp_reg);
+}
+
+# emit_spill_if_spilled: emit a spill for a spilled live range.
+fun emit_spill_if_spilled(i: *isa.ISA, out: *isa.MachInstBuf,
+                          lr: *LiveRange, fp_reg: i32) {
+    if (lr == nil || !lr.spilled || lr.preg < 0) { ret; }
+    i.emit_spill(i.ctx, out, lr.preg, lr.spill_off, lr.size, fp_reg);
+}
+
+# rewrite_operand: replace virtual registers with physical registers.
+fun rewrite_operand(op: *ir.Operand, ranges: *LiveRange, count: i32, fp_reg: i32) {
+    if (op == nil) { ret; }
+
+    if (op.kind == ir.OPK_REG) {
+        if (ir.is_vreg(op.reg)) {
+            val lr: *LiveRange = find_range(op.reg, ranges, count);
+            if (lr != nil && lr.preg >= 0) {
+                op.reg = lr.preg;
+            }
+        }
+    } or (op.kind == ir.OPK_MEM) {
+        # resolve virtual frame pointer (VREG_START - 1)
+        if (op.base == ir.VREG_START - 1) {
+            op.base = fp_reg;
+        } or (ir.is_vreg(op.base)) {
+            val lr: *LiveRange = find_range(op.base, ranges, count);
+            if (lr != nil && lr.preg >= 0) {
+                op.base = lr.preg;
+            }
+        }
+        if (op.index >= 0 && ir.is_vreg(op.index)) {
+            val lr: *LiveRange = find_range(op.index, ranges, count);
+            if (lr != nil && lr.preg >= 0) {
+                op.index = lr.preg;
+            }
+        }
+    }
+}
