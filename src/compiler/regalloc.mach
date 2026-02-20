@@ -4,6 +4,7 @@ use std.types.string;
 use std.types.result;
 
 use allocator: std.allocator;
+use dbg:       std.print;
 use ir:        mach.compiler.masm.ir;
 use isa:       mach.compiler.isa;
 use abi:       mach.compiler.abi;
@@ -18,6 +19,7 @@ use abi:       mach.compiler.abi;
 
 val MAX_LIVE_RANGES: i32 = 4096;
 val MAX_POOL_REGS:   i32 = 16;
+val MAX_CALLS:       i32 = 4096;
 val ALIGN:           i64 = 8;
 
 # --- records ---
@@ -33,9 +35,10 @@ rec LiveRange {
 }
 
 pub rec RegAllocResult {
-    out:        isa.MachInstBuf;   # rewritten instructions (vregs → physical)
-    spill_size: usize;             # total spill frame bytes needed
-    ok:         bool;
+    out:         isa.MachInstBuf;   # rewritten instructions (vregs → physical)
+    spill_size:  usize;             # total spill frame bytes needed
+    callee_mask: u32;               # bitmask of callee-saved regs used (bit N = reg ID N)
+    ok:          bool;
 }
 
 # --- public API ---
@@ -45,6 +48,7 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
     var result: RegAllocResult;
     result.out = isa.buf_create(alloc);
     result.spill_size = 0;
+    result.callee_mask = 0;
     result.ok = false;
 
     if (alloc == nil || i == nil || a == nil || insts == nil) { ret result; }
@@ -65,6 +69,7 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
     val pool: *i32 = result_unwrap_ok[*i32, allocator.AllocError](pool_r);
     var pool_count: i32 = 0;
 
+    # first: caller-saved registers (not reserved AND not callee-saved)
     var gi: i32 = 0;
     for (gi < gp.count) {
         val rid: i32 = gp.regs[gi].id;
@@ -76,6 +81,50 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
         }
         gi = gi + 1;
     }
+    val caller_count: i32 = pool_count;
+
+    # then: callee-saved registers (not reserved AND in callee-saved file)
+    gi = 0;
+    for (gi < gp.count) {
+        val rid: i32 = gp.regs[gi].id;
+        if (!is_in_file(rid, ?reserved) && is_in_file(rid, ?callee)) {
+            if (pool_count < MAX_POOL_REGS) {
+                pool[pool_count] = rid;
+                pool_count = pool_count + 1;
+            }
+        }
+        gi = gi + 1;
+    }
+
+    # --- collect call instruction positions ---
+
+    val calls_r: Result[*i32, allocator.AllocError] =
+        allocator.allocator_zalloc[i32](alloc, MAX_CALLS::usize);
+    if (result_is_err[*i32, allocator.AllocError](calls_r)) { ret result; }
+    val calls: *i32 = result_unwrap_ok[*i32, allocator.AllocError](calls_r);
+    var call_count: i32 = 0;
+
+    var ci: i32 = 0;
+    for (ci < insts.count) {
+        val cinst: *isa.MachInst = isa.buf_get(insts, ci);
+        if (cinst != nil && i.is_call(i.ctx, cinst)) {
+            if (call_count < MAX_CALLS) {
+                calls[call_count] = ci;
+                call_count = call_count + 1;
+            }
+        }
+        ci = ci + 1;
+    }
+
+    dbg.eprint("[ra] pool=");
+    dbg.eu64(pool_count::u64);
+    dbg.eprint(" caller=");
+    dbg.eu64(caller_count::u64);
+    dbg.eprint(" calls=");
+    dbg.eu64(call_count::u64);
+    dbg.eprint(" insts=");
+    dbg.eu64(insts.count::u64);
+    dbg.eprint("\n");
 
     # --- Pass 1: build live ranges ---
 
@@ -120,6 +169,7 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
     var active_count: i32 = 0;
 
     var spill_offset: i64 = -(local_size::i64);
+    var callee_mask: u32 = 0;
 
     var ri: i32 = 0;
     for (ri < range_count) {
@@ -142,52 +192,113 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
             ai = ai + 1;
         }
 
-        # try to allocate a free register
-        val free_idx: i32 = find_free_reg(reg_free, pool_count);
-        if (free_idx >= 0) {
-            cur.preg = pool[free_idx];
-            reg_free[free_idx] = false;
-            active[active_count] = ri;
-            active_count = active_count + 1;
-        } or {
-            # spill: evict the active interval with farthest end_pos,
-            # or spill current if it ends latest
-            var victim_ai: i32 = -1;
-            var victim_end: i32 = -1;
-            var vi: i32 = 0;
-            for (vi < active_count) {
-                val act: *LiveRange = ?ranges[active[vi]];
-                if (act.end_pos > victim_end) {
-                    victim_end = act.end_pos;
-                    victim_ai = vi;
-                }
-                vi = vi + 1;
-            }
+        val cross_call: bool = spans_call(cur.start, cur.end_pos,
+                                          calls, call_count);
 
-            if (victim_ai >= 0 && victim_end > cur.end_pos) {
-                # evict victim, give its register to current
-                val victim: *LiveRange = ?ranges[active[victim_ai]];
-                cur.preg = victim.preg;
-                victim.spilled = true;
-                spill_offset = spill_offset - ALIGN;
-                victim.spill_off = spill_offset;
-
-                # replace victim in active list with current
-                active[victim_ai] = ri;
+        if (cross_call) {
+            # range spans a call: must use callee-saved register or spill.
+            # caller-saved registers would be clobbered by the call.
+            val callee_idx: i32 = find_free_reg_range(reg_free,
+                                                      caller_count, pool_count);
+            if (callee_idx >= 0) {
+                cur.preg = pool[callee_idx];
+                reg_free[callee_idx] = false;
+                callee_mask = callee_mask | (1::u32 << pool[callee_idx]::u32);
+                active[active_count] = ri;
+                active_count = active_count + 1;
             } or {
-                # spill current
-                cur.spilled = true;
-                spill_offset = spill_offset - ALIGN;
-                cur.spill_off = spill_offset;
-                # current needs a preg for reload/spill - assigned during rewrite
-                cur.preg = -1;
+                # no free callee-saved: try evicting a non-call-spanning range
+                # from a callee-saved register (it can be spilled safely)
+                var victim_ai: i32 = -1;
+                var victim_end: i32 = -1;
+                var vi: i32 = 0;
+                for (vi < active_count) {
+                    val act: *LiveRange = ?ranges[active[vi]];
+                    if (is_in_pool_range(act.preg, pool,
+                                         caller_count, pool_count) &&
+                        act.end_pos > victim_end) {
+                        victim_end = act.end_pos;
+                        victim_ai = vi;
+                    }
+                    vi = vi + 1;
+                }
+
+                if (victim_ai >= 0 && victim_end > cur.end_pos) {
+                    val victim: *LiveRange = ?ranges[active[victim_ai]];
+                    cur.preg = victim.preg;
+                    callee_mask = callee_mask | (1::u32 << cur.preg::u32);
+                    victim.spilled = true;
+                    spill_offset = spill_offset - ALIGN;
+                    victim.spill_off = spill_offset;
+                    active[victim_ai] = ri;
+                } or {
+                    # spill current range
+                    cur.spilled = true;
+                    spill_offset = spill_offset - ALIGN;
+                    cur.spill_off = spill_offset;
+                    cur.preg = -1;
+                }
+            }
+        } or {
+            # range does not span a call: use any free register
+            val free_idx: i32 = find_free_reg(reg_free, pool_count);
+            if (free_idx >= 0) {
+                cur.preg = pool[free_idx];
+                reg_free[free_idx] = false;
+                if (free_idx >= caller_count) {
+                    callee_mask = callee_mask | (1::u32 << pool[free_idx]::u32);
+                }
+                active[active_count] = ri;
+                active_count = active_count + 1;
+            } or {
+                # spill: evict the active interval with farthest end_pos,
+                # or spill current if it ends latest
+                var victim_ai: i32 = -1;
+                var victim_end: i32 = -1;
+                var vi: i32 = 0;
+                for (vi < active_count) {
+                    val act: *LiveRange = ?ranges[active[vi]];
+                    if (act.end_pos > victim_end) {
+                        victim_end = act.end_pos;
+                        victim_ai = vi;
+                    }
+                    vi = vi + 1;
+                }
+
+                if (victim_ai >= 0 && victim_end > cur.end_pos) {
+                    val victim: *LiveRange = ?ranges[active[victim_ai]];
+                    cur.preg = victim.preg;
+                    if (is_in_pool_range(cur.preg, pool,
+                                         caller_count, pool_count)) {
+                        callee_mask = callee_mask | (1::u32 << cur.preg::u32);
+                    }
+                    victim.spilled = true;
+                    spill_offset = spill_offset - ALIGN;
+                    victim.spill_off = spill_offset;
+                    active[victim_ai] = ri;
+                } or {
+                    # spill current
+                    cur.spilled = true;
+                    spill_offset = spill_offset - ALIGN;
+                    cur.spill_off = spill_offset;
+                    cur.preg = -1;
+                }
             }
         }
 
         ri = ri + 1;
     }
 
+    result.callee_mask = callee_mask;
     result.spill_size = (-(spill_offset + local_size::i64))::usize;
+
+    if (callee_mask != 0) {
+        dbg.eprint("[ra] callee_mask=");
+        dbg.eu64(callee_mask::u64);
+        dbg.eprint(" spill=");
+        dbg.eu64(result.spill_size::u64);
+        dbg.eprint("\n");
+    }
 
     # --- Pass 3: rewrite ---
 
@@ -338,6 +449,40 @@ fun find_free_reg(reg_free: *bool, pool_count: i32) i32 {
     ret -1;
 }
 
+# find_free_reg_range: find first free register in pool[from..to).
+fun find_free_reg_range(reg_free: *bool, from: i32, to: i32) i32 {
+    var i: i32 = from;
+    for (i < to) {
+        if (reg_free[i]) { ret i; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# is_in_pool_range: check if preg is in pool[from..to).
+fun is_in_pool_range(preg: i32, pool: *i32, from: i32, to: i32) bool {
+    var i: i32 = from;
+    for (i < to) {
+        if (pool[i] == preg) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# spans_call: check if a live range [start, end_pos] spans any call instruction.
+# returns true if any call occurs strictly between start and end_pos.
+fun spans_call(start: i32, end_pos: i32, calls: *i32, call_count: i32) bool {
+    if (calls == nil || call_count == 0) { ret false; }
+    var i: i32 = 0;
+    for (i < call_count) {
+        if (calls[i] > start && calls[i] < end_pos) { ret true; }
+        # calls are in order; if past end_pos, no need to continue
+        if (calls[i] >= end_pos) { ret false; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # free_pool_reg: mark a physical register as free in the pool.
 fun free_pool_reg(reg_free: *bool, pool: *i32, pool_count: i32, preg: i32) {
     var i: i32 = 0;
@@ -473,9 +618,11 @@ fun rewrite_operand(op: *ir.Operand, ranges: *LiveRange, count: i32, fp_reg: i32
             }
         }
     } or (op.kind == ir.OPK_MEM) {
-        # resolve virtual frame pointer (VREG_START - 1)
-        if (op.base == ir.VREG_START - 1) {
+        # resolve virtual frame pointer
+        if (op.base == ir.VREG_FP) {
             op.base = fp_reg;
+        } or (op.base == ir.VREG_SP) {
+            # leave VREG_SP unchanged — pipeline resolves after total_frame is known
         } or (ir.is_vreg(op.base)) {
             val lr: *LiveRange = find_range(op.base, ranges, count);
             if (lr != nil && lr.preg >= 0) {
