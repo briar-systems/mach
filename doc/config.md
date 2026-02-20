@@ -54,7 +54,6 @@ Each target describes a build configuration for one platform/ABI combination. Th
 | `entrypoint` | Root module path relative to `dir_src` (e.g. `main.mach`). Required even for libraries to establish the module graph. |
 | `artifacts` | Per-target subdirectory under `dir_out`. |
 | `binary` | Output binary path relative to `dir_out`. |
-| `dir_tests` | Test output subdirectory under `dir_out/<artifacts>`. |
 
 
 ## `[deps.<alias>]`

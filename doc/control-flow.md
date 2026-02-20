@@ -20,7 +20,7 @@ if (x > 0) {
 
 ## Loops (for)
 
-The `for` keyword is the only loop construct. It takes a condition expression:
+The `for` keyword is the only loop construct. It takes an optional condition expression:
 
 ```mach
 var i: i32 = 0;
@@ -30,10 +30,10 @@ for (i < 10) {
 }
 ```
 
-An infinite loop uses `for` with a true condition:
+An infinite loop uses `for` with no condition:
 
 ```mach
-for (1 == 1) {
+for {
     # runs forever (or until brk)
 }
 ```

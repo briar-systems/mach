@@ -61,8 +61,9 @@ mach test [options] [path]
 | Option | Description |
 |--------|-------------|
 | `--target <name>` | Select a specific target from `mach.toml` |
-| `--filter <pattern>` | Only run tests matching the pattern |
-| `-m`, `--modules` | Show module-level progress |
+| `--test <pattern>` | Only run tests whose name contains the pattern |
+| `--module <pattern>` | Only run tests in modules matching the pattern |
+| `-v`, `--verbose` | Show passing tests in output (default: failures only) |
 | `path` | Project directory (default: `.`) |
 
 Examples:
@@ -70,13 +71,14 @@ Examples:
 ```sh
 mach test .
 mach test --target linux .
-mach test --filter "lexer" .
+mach test --test "lexer" .
+mach test --module "parser" .
 ```
 
 
 ## Output
 
-Passing tests are silent by default. Failures and crashes are reported:
+Passing tests are silent by default (use `-v` to show them). Failures and crashes are reported:
 
 ```
 fail: module_name: test name here
@@ -91,13 +93,6 @@ passed:  145
 failed:  3
 crashed: 1
 total:   149
-```
-
-With `-m`, module progress is also shown:
-
-```
-[test] mach.tests.lexer (15)
-[test] mach.tests.parser (23)
 ```
 
 

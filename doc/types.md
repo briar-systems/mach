@@ -106,8 +106,8 @@ rec Container {
 The `def` keyword creates a type alias:
 
 ```mach
-def Byte = u8;
-def Offset = i32;
+def Byte: u8;
+def Offset: i32;
 ```
 
 Aliases are interchangeable with their underlying type. Two aliases with the same underlying type are also interchangeable:
@@ -175,14 +175,14 @@ The receiver can be by value or by pointer. The compiler automatically takes the
 
 ## Type Casting
 
-The `::` operator performs a bit reinterpretation cast. Both types must have the same size:
+The `::` operator casts a value to a different type. For same-sized types, this is a bit reinterpretation. For different-sized integer types, the compiler generates appropriate widening (zero-extend or sign-extend) or truncation instructions:
 
 ```mach
 val x: f32 = 3.14;
 val y: i32 = x::i32;   # reinterpret f32 bits as i32 (NOT a numeric conversion)
 ```
 
-This is useful for reinterpreting between same-sized types:
+Reinterpreting between same-sized types:
 
 ```mach
 rec Color { r: u8; g: u8; b: u8; a: u8; }
@@ -191,7 +191,16 @@ val c: Color = Color{r: 255, g: 0, b: 128, a: 255};
 val packed: u32 = c::u32;
 ```
 
-For numeric conversions (widening, truncating, sign changes), use the standard library utilities.
+Widening and truncation between integer types:
+
+```mach
+val a: u8 = 42;
+val b: u64 = a::u64;   # zero-extend u8 to u64
+val c: i16 = -5;
+val d: i64 = c::i64;   # sign-extend i16 to i64
+val e: i64 = 1000;
+val f: u8  = e::u8;    # truncate i64 to u8
+```
 
 
 ## Literal Coercion
@@ -203,9 +212,9 @@ val x: u8 = 42;       # 42 coerced to u8
 val y: f32 = 3.14;    # 3.14 coerced to f32
 ```
 
-Coercion only happens for literals. Variables require explicit casting:
+Coercion only happens for literals. Variables of different types require an explicit cast:
 
 ```mach
 val a: u8 = 42;
-val b: u16 = a::u16;   # explicit cast required
+val b: u16 = a::u16;   # explicit cast required (u8 to u16)
 ```

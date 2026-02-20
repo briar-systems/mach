@@ -110,8 +110,8 @@ The size of a union equals its largest field.
 ## Type Aliases
 
 ```mach
-def Byte = u8;
-def NodePtr = *Node;
+def Byte: u8;
+def NodePtr: *Node;
 ```
 
 Aliases are fully interchangeable with the underlying type.
