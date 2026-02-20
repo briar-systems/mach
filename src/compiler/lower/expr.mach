@@ -16,6 +16,7 @@ use section: mach.compiler.masm.section;
 use mangle: mach.compiler.masm.mangle;
 use lcall:  mach.compiler.lower.call;
 use msym:   mach.compiler.masm.symbol;
+use abi:    mach.compiler.abi;
 
 use mach.compiler.lower;
 use dbg: std.print;
@@ -486,6 +487,22 @@ fun lower_call(ctx: *LowerContext, node: *ast.Node) ir.Operand {
     val arg_list: *ast.List = node.info.call_expr.args;
     if (callee == nil) { ret ir.make_none(); }
 
+    # handle variadic builtins: va_start, va_end, va_arg
+    if (callee.kind == ast.NODE_EXPR_IDENT) {
+        val va_name: str = callee.info.ident_expr.name;
+        if (va_name != nil) {
+            if (str_equals(va_name, "va_start")) {
+                ret lower_va_start(ctx, arg_list);
+            }
+            if (str_equals(va_name, "va_end")) {
+                ret ir.make_none();
+            }
+            if (str_equals(va_name, "va_arg")) {
+                ret lower_va_arg(ctx, arg_list, node.type);
+            }
+        }
+    }
+
     # resolve call target: direct (label) or indirect (register)
     var call_target: ir.Operand = ir.make_none();
     val call_sym: *symbol.Symbol = node.symbol::*symbol.Symbol;
@@ -881,6 +898,176 @@ fun lower_array_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
     }
 
     ret base;
+}
+
+# --- variadic builtins ---
+
+# lower_va_start: initialize a va_list using ABI-provided layout.
+# arg_list contains one argument: pointer to va_list.
+fun lower_va_start(ctx: *LowerContext, arg_list: *ast.List) ir.Operand {
+    if (arg_list == nil || arg_list.count < 1) { ret ir.make_none(); }
+
+    val ap_arg: *ast.Node = arg_list.nodes[0];
+    if (ap_arg == nil) { ret ir.make_none(); }
+
+    val psz: u8 = ctx.ptr_size;
+    val a: *abi.ABI = ?ctx.target.abi;
+    val layout: abi.VarargLayout = a.vararg_layout(a.ctx);
+
+    # lower the argument to get a pointer to va_list
+    var ap: ir.Operand = lower_expr(ctx, ap_arg);
+    if (ap.kind == ir.OPK_NONE) { ret ir.make_none(); }
+
+    # ensure ap is in a register
+    if (ap.kind != ir.OPK_REG) {
+        val ap_reg: ir.Operand = new_vreg(ctx, psz);
+        emit_mov(ctx, ap_reg, ap);
+        ap = ap_reg;
+    }
+
+    # gp_offset = va_named_gp * gp_slot_size
+    val gp_off_val: i64 = ctx.va_named_gp::i64 * layout.gp_slot_size;
+    val gp_off_mem: ir.Operand = ir.make_mem(ap.reg, -1, 1,
+                                              layout.gp_offset_off,
+                                              layout.gp_offset_size);
+    emit_store(ctx, gp_off_mem, ir.make_imm(gp_off_val, layout.gp_offset_size));
+
+    # fp_offset = fp_area_base + va_named_fp * fp_slot_size
+    val fp_off_val: i64 = layout.fp_area_base
+                          + ctx.va_named_fp::i64 * layout.fp_slot_size;
+    val fp_off_mem: ir.Operand = ir.make_mem(ap.reg, -1, 1,
+                                              layout.fp_offset_off,
+                                              layout.fp_offset_size);
+    emit_store(ctx, fp_off_mem, ir.make_imm(fp_off_val, layout.fp_offset_size));
+
+    # overflow_arg_area = FP + stack_args_base + va_named_stack * stack_slot_size
+    val overflow_off: i64 = layout.stack_args_base
+                            + ctx.va_named_stack::i64 * layout.stack_slot_size;
+    val overflow_src: ir.Operand = ir.make_mem(ir.VREG_START - 1, -1, 1,
+                                               overflow_off, psz);
+    val overflow_ptr: ir.Operand = new_vreg(ctx, psz);
+    emit(ctx, ir.OP_ADDR, overflow_ptr, overflow_src, ir.make_none(), ir.CC_NONE);
+    val overflow_dst: ir.Operand = ir.make_mem(ap.reg, -1, 1,
+                                               layout.overflow_area_off, psz);
+    emit_store(ctx, overflow_dst, overflow_ptr);
+
+    # reg_save_area = FP + va_reg_save_off
+    val regsave_src: ir.Operand = ir.make_mem(ir.VREG_START - 1, -1, 1,
+                                               ctx.va_reg_save_off, psz);
+    val regsave_ptr: ir.Operand = new_vreg(ctx, psz);
+    emit(ctx, ir.OP_ADDR, regsave_ptr, regsave_src, ir.make_none(), ir.CC_NONE);
+    val regsave_dst: ir.Operand = ir.make_mem(ap.reg, -1, 1,
+                                               layout.reg_save_area_off, psz);
+    emit_store(ctx, regsave_dst, regsave_ptr);
+
+    ret ir.make_none();
+}
+
+# lower_va_arg: fetch the next argument from a va_list using ABI layout.
+# arg_list contains one argument: pointer to va_list.
+# arg_type: the type of the argument to fetch (from va_arg[T]).
+fun lower_va_arg(ctx: *LowerContext, arg_list: *ast.List,
+                 arg_type: *type.Type) ir.Operand {
+    if (arg_list == nil || arg_list.count < 1) { ret ir.make_none(); }
+
+    val ap_arg: *ast.Node = arg_list.nodes[0];
+    if (ap_arg == nil) { ret ir.make_none(); }
+
+    val psz: u8 = ctx.ptr_size;
+    val a: *abi.ABI = ?ctx.target.abi;
+    val layout: abi.VarargLayout = a.vararg_layout(a.ctx);
+
+    # lower the argument to get a pointer to va_list
+    var ap: ir.Operand = lower_expr(ctx, ap_arg);
+    if (ap.kind == ir.OPK_NONE) { ret ir.make_none(); }
+
+    # ensure ap is in a register
+    if (ap.kind != ir.OPK_REG) {
+        val ap_reg: ir.Operand = new_vreg(ctx, psz);
+        emit_mov(ctx, ap_reg, ap);
+        ap = ap_reg;
+    }
+
+    # determine argument size (promote to at least pointer size for GP)
+    var arg_size: u8 = psz;
+    if (arg_type != nil && arg_type.size > 0) {
+        arg_size = arg_type.size::u8;
+    }
+    if (arg_size < psz) {
+        arg_size = psz;
+    }
+
+    # allocate result register
+    val result: ir.Operand = new_vreg(ctx, arg_size);
+
+    # generate unique labels
+    val stack_label: str = new_label(ctx, ".L_va_stack");
+    val done_label: str = new_label(ctx, ".L_va_done");
+
+    # load gp_offset and zero-extend to pointer width
+    val off_mem: ir.Operand = ir.make_mem(ap.reg, -1, 1,
+                                           layout.gp_offset_off,
+                                           layout.gp_offset_size);
+    val off_narrow: ir.Operand = new_vreg(ctx, layout.gp_offset_size);
+    emit_load(ctx, off_narrow, off_mem);
+    val off_wide: ir.Operand = new_vreg(ctx, psz);
+    emit(ctx, ir.OP_ZEXT, off_wide, off_narrow, ir.make_none(), ir.CC_NONE);
+
+    # compare offset >= threshold -> go to stack path
+    val cmp: ir.Operand = new_vreg(ctx, 1);
+    emit(ctx, ir.OP_ICMP, cmp, off_wide,
+         ir.make_imm(layout.gp_threshold, psz), ir.CC_AE);
+    emit_brcond(ctx, cmp, stack_label, ir.CC_NE);
+
+    # --- register path ---
+    # load reg_save_area pointer
+    val regsave_mem: ir.Operand = ir.make_mem(ap.reg, -1, 1,
+                                               layout.reg_save_area_off, psz);
+    val regsave: ir.Operand = new_vreg(ctx, psz);
+    emit_load(ctx, regsave, regsave_mem);
+
+    # compute address = reg_save_area + gp_offset
+    val addr: ir.Operand = new_vreg(ctx, psz);
+    emit(ctx, ir.OP_ADD, addr, regsave, off_wide, ir.CC_NONE);
+
+    # load value from computed address
+    val val_mem: ir.Operand = ir.make_mem(addr.reg, -1, 1, 0, arg_size);
+    emit_load(ctx, result, val_mem);
+
+    # increment gp_offset and store back
+    val new_off: ir.Operand = new_vreg(ctx, psz);
+    emit(ctx, ir.OP_ADD, new_off, off_wide,
+         ir.make_imm(layout.gp_increment, psz), ir.CC_NONE);
+    val new_off_narrow: ir.Operand = new_vreg(ctx, layout.gp_offset_size);
+    emit(ctx, ir.OP_TRUNC, new_off_narrow, new_off, ir.make_none(), ir.CC_NONE);
+    emit_store(ctx, off_mem, new_off_narrow);
+
+    # jump to done
+    emit_jmp(ctx, done_label);
+
+    # --- stack path ---
+    emit_label(ctx, stack_label);
+
+    # load overflow_arg_area pointer
+    val overflow_mem: ir.Operand = ir.make_mem(ap.reg, -1, 1,
+                                               layout.overflow_area_off, psz);
+    val overflow: ir.Operand = new_vreg(ctx, psz);
+    emit_load(ctx, overflow, overflow_mem);
+
+    # load value from overflow_arg_area
+    val stack_val_mem: ir.Operand = ir.make_mem(overflow.reg, -1, 1, 0, arg_size);
+    emit_load(ctx, result, stack_val_mem);
+
+    # increment overflow_arg_area
+    val new_overflow: ir.Operand = new_vreg(ctx, psz);
+    emit(ctx, ir.OP_ADD, new_overflow, overflow,
+         ir.make_imm(layout.stack_slot_size, psz), ir.CC_NONE);
+    emit_store(ctx, overflow_mem, new_overflow);
+
+    # --- done ---
+    emit_label(ctx, done_label);
+
+    ret result;
 }
 
 # --- assignment expression (returns value) ---
