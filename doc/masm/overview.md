@@ -15,118 +15,98 @@ MASM is a portable, low-level intermediate representation designed to sit betwee
 
 1. **Two-Layer Architecture** - Separate portable IR from target-specific instructions
 2. **Flag-Free Comparisons** - Comparisons produce values, not implicit condition flags
-3. **Three-Operand Form** - Avoids destructive two-operand semantics
+3. **Fixed Three-Operand Form** - Every instruction has exactly `dst`, `src1`, `src2` (unused slots zeroed)
 4. **Explicit Control Flow** - All branches use explicit labels
-5. **Type-Aware** - Instructions carry type information for correct code generation
+5. **Type-Aware** - Instructions carry size information for correct code generation
 
 ## Architecture
 
 ### Compilation Pipeline
 
 ```
-┌─────────────────────┐
-│     Mach Source     │
-└──────────┬──────────┘
-           │ parse
-           ▼
-┌─────────────────────┐
-│        AST          │
-└──────────┬──────────┘
-           │ lower.c
-           ▼
-┌─────────────────────┐
-│      MASM IR        │  Portable three-operand instructions
-└──────────┬──────────┘
-           │ isel (instruction selection)
-           ▼
-┌─────────────────────┐
-│  Target Instructions│  x86_64, ARM64, etc.
-└──────────┬──────────┘
-           │ encode
-           ▼
-┌─────────────────────┐
-│   Machine Code      │  Raw bytes
-└──────────┬──────────┘
-           │ emit (ELF, PE, etc.)
-           ▼
-┌─────────────────────┐
-│    Object File      │
-└─────────────────────┘
++-----------------------+
+|     Mach Source        |
++----------+------------+
+           | parse
+           v
++-----------------------+
+|        AST            |
++----------+------------+
+           | lower.mach
+           v
++-----------------------+
+|      MASM IR          |  Portable three-operand instructions
++----------+------------+
+           | isel (instruction selection)
+           v
++-----------------------+
+|  Target Instructions  |  x86_64, ARM64, etc.
++----------+------------+
+           | encode
+           v
++-----------------------+
+|   Machine Code        |  Raw bytes
++----------+------------+
+           | emit (ELF, PE, etc.)
+           v
++-----------------------+
+|    Object File        |
++-----------------------+
 ```
 
 ### Two-Layer Opcode Architecture
 
-MASM uses a discriminated two-layer opcode system to cleanly separate portable and target-specific instructions:
+MASM uses a two-layer opcode system to cleanly separate portable and target-specific instructions.
 
-**Layer 1: Portable IR (`MASM_OPCODE_IR`)**
+**Layer 1: Portable IR**
 
-Platform-independent instructions using three-operand form:
+Platform-independent instructions using fixed three-operand form:
 
-```c
-typedef enum MasmIrOpcode {
-    MASM_IR_MOV,
-    MASM_IR_ADD,
-    MASM_IR_SUB,
-    // ... more IR opcodes
-} MasmIrOpcode;
+```mach
+# defined in src/compiler/masm/ir.mach
+pub def Operator: u16;
+
+pub val OP_MOV:   Operator = 0;
+pub val OP_ADD:   Operator = 4;
+pub val OP_SUB:   Operator = 5;
+pub val OP_ICMP:  Operator = 17;
+pub val OP_BRCOND: Operator = 20;
+# ... more IR opcodes
 ```
 
-- Emitted by the lowering phase (`lower.c`)
+- Emitted by the lowering phase (`lower.mach`)
 - No implicit flags or register constraints
-- Comparisons use set-if semantics (produce 0 or 1)
+- Comparisons use `OP_ICMP`/`OP_FCMP` with a condition code field
 
-**Layer 2: Target-Specific (`MASM_OPCODE_X86`, etc.)**
+**Layer 2: Target-Specific**
 
-Machine-level instructions with full target semantics:
-
-```c
-typedef enum MasmX86Opcode {
-    MASM_OP_X86_MOV_RR,
-    MASM_OP_X86_ADD_RI,
-    MASM_OP_X86_SYSCALL,
-    // ... more x86 opcodes
-} MasmX86Opcode;
-```
+Machine-level instructions with full target semantics. These are ISA-specific opcodes defined by each backend (e.g., x86_64 backend defines MOV_RR, ADD_RI, SYSCALL, etc.).
 
 - Emitted by instruction selection (isel)
 - Includes register/memory addressing variants
 - Consumed by the encoder for binary emission
 
-The `MasmOpcodeKind` discriminator on each instruction indicates which layer it belongs to:
-
-```c
-typedef enum MasmOpcodeKind {
-    MASM_OPCODE_IR = 0,   // portable IR
-    MASM_OPCODE_X86,      // x86_64 target
-    // future: MASM_OPCODE_ARM64, etc.
-} MasmOpcodeKind;
-```
-
 ### Core Components
 
 | Component | Purpose |
 |-----------|---------|
-| `Masm` | Top-level container holding sections, symbols, and target info |
-| `MasmSection` | Code (`.text`) or data (`.data`, `.rodata`, `.bss`) segment |
-| `MasmSymbol` | Named location in a section (function, label, data) |
-| `MasmInstruction` | Single operation with opcode and operands |
-| `MasmOperand` | Instruction input: register, immediate, memory, symbol, or label |
-| `MasmTarget` | Platform configuration (ISA + ABI + OS + OF) |
+| `Inst` | Single IR instruction with op, dst, src1, src2, cc, size |
+| `Operand` | Instruction operand: register, immediate, memory, symbol, or label |
+| `Block` | Basic block: label + linear sequence of instructions |
+| `Function` | Ordered list of basic blocks |
 
 ### Target Configuration
 
-MASM supports modular target configuration through four independent components:
+MASM supports modular target configuration through four independent components, specified via `mach.toml`:
 
-```c
-typedef struct MasmTarget {
-    MasmTargetISA isa;  // x86_64, arm64, riscv, ...
-    MasmTargetABI abi;  // sysv64, win64, aapcs, ...
-    MasmTargetOS  os;   // linux, windows, macos, ...
-    MasmTargetOF  of;   // elf, pe, mach-o, ...
-} MasmTarget;
+```toml
+[targets.linux]
+os  = "linux"
+isa = "x86_64"
+abi = "sysv64"
 ```
 
-Each component has its own specification interface (`MasmISASpec`, `MasmABISpec`, `MasmOFSpec`) that provides the necessary hooks for that layer.
+Each component (ISA, ABI, OS, Object Format) has its own specification interface that provides the necessary hooks for that layer.
 
 ## Example
 
@@ -141,10 +121,7 @@ pub fun add(a: i64, b: i64) i64 {
 ### MASM IR (after lowering)
 
 ```
-section .text
-
 add:
-    stack_frame 0
     ; a is in first arg register, b is in second
     add %result, %arg0, %arg1
     ret %result
@@ -166,18 +143,16 @@ add:
 
 To add support for a new target (e.g., ARM64/Linux/ELF):
 
-1. **ISA Implementation** - Create `masm/isa/arm64/arm64.h` and `arm64.c`:
-   - Define `MasmArm64Opcode` enum
-   - Implement `MasmISASpec` interface (register roles, isel, encode)
+1. **ISA Implementation** - Create a new ISA module under `src/compiler/`:
+   - Define target-specific opcode values
+   - Implement ISA spec interface (register roles, isel, encode)
 
-2. **ABI Implementation** - Create `masm/abi/aapcs.c`:
-   - Implement `MasmABISpec` interface (argument registers, calling convention)
+2. **ABI Implementation** - Implement the ABI spec interface:
+   - Define argument registers and calling convention
 
-3. **Register Targets** - Add new enums to `masm/target.h`:
-   - `MASM_ISA_ARM64` to `MasmTargetISA`
-   - `MASM_OPCODE_ARM64` to `MasmOpcodeKind`
+3. **Register Targets** - Add new enum values for ISA and opcode kind
 
-No changes are needed to the lowering phase, IR definitions, or emit infrastructure - they are platform-independent.
+No changes are needed to the lowering phase, IR definitions, or emit infrastructure -- they are platform-independent.
 
 ## See Also
 

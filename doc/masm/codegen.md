@@ -6,69 +6,63 @@ This document describes how MASM IR is lowered to machine code.
 
 Code generation transforms portable MASM IR into target-specific machine code through several phases:
 
-1. **Instruction Selection (isel)** - IR → target-specific opcodes
-2. **Register Allocation** - Virtual registers → physical registers
-3. **Encoding** - Opcodes → machine code bytes
-4. **Object Emission** - Sections → ELF/PE/Mach-O file
+1. **Instruction Selection (isel)** - IR opcodes to target-specific opcodes
+2. **Register Allocation** - Virtual registers to physical registers
+3. **Encoding** - Opcodes to machine code bytes
+4. **Object Emission** - Sections to ELF/PE/Mach-O file
 
 
 ## Pipeline
 
 ```
-MASM IR Instructions
-        │
-        ▼
-┌───────────────────┐
-│  Instruction      │  Lower IR opcodes to target-specific opcodes
-│  Selection (isel) │  e.g., MASM_IR_ADD → MASM_OP_X86_ADD_RR
-└─────────┬─────────┘
-          │
-          ▼
-┌───────────────────┐
-│  Register         │  Map values to physical registers
-│  Allocation       │  Handle spills to stack
-└─────────┬─────────┘
-          │
-          ▼
-┌───────────────────┐
-│  Encoding         │  Generate machine code bytes
-│                   │  e.g., ADD → 0x48 0x01 ...
-└─────────┬─────────┘
-          │
-          ▼
-┌───────────────────┐
-│  Object Emission  │  Write ELF file with sections,
-│                   │  symbols, and relocations
-└───────────────────┘
+MASM IR Instructions (Inst records)
+        |
+        v
++---------------------+
+|  Instruction         |  Lower IR opcodes to target-specific opcodes
+|  Selection (isel)    |  e.g., OP_ADD -> x86 ADD_RR
++----------+-----------+
+           |
+           v
++---------------------+
+|  Register            |  Map virtual registers to physical registers
+|  Allocation          |  Handle spills to stack
++----------+-----------+
+           |
+           v
++---------------------+
+|  Encoding            |  Generate machine code bytes
+|                      |  e.g., ADD -> 0x48 0x01 ...
++----------+-----------+
+           |
+           v
++---------------------+
+|  Object Emission     |  Write ELF file with sections,
+|                      |  symbols, and relocations
++---------------------+
 ```
 
 
 ## Instruction Selection
 
-Instruction selection (isel) transforms platform-independent IR into target-specific opcodes.
-
-### Entry Point
-
-```c
-void masm_x86_isel(struct Masm *masm);
-```
+Instruction selection (isel) transforms platform-independent IR into target-specific opcodes. The ISA spec interface provides the isel hook.
 
 ### IR to x86_64 Mapping
 
-| IR Opcode | x86_64 Opcode(s) |
-|-----------|------------------|
-| `MASM_IR_MOV` | `MASM_OP_X86_MOV_RR`, `MASM_OP_X86_MOV_RI` |
-| `MASM_IR_ADD` | `MASM_OP_X86_ADD_RR`, `MASM_OP_X86_ADD_RI` |
-| `MASM_IR_SUB` | `MASM_OP_X86_SUB_RR`, `MASM_OP_X86_SUB_RI` |
-| `MASM_IR_MUL` | `MASM_OP_X86_IMUL_RR` |
-| `MASM_IR_DIV` | `MASM_OP_X86_CQO` + `MASM_OP_X86_IDIV` |
-| `MASM_IR_LOAD` | `MASM_OP_X86_MOV_RM`, `MASM_OP_X86_MOVQ` |
-| `MASM_IR_STORE` | `MASM_OP_X86_MOV_MR` |
-| `MASM_IR_SEQ` | `MASM_OP_X86_CMP_RR` + `MASM_OP_X86_SETE` |
-| `MASM_IR_BEQ` | `MASM_OP_X86_CMP_RR` + `MASM_OP_X86_JE` |
-| `MASM_IR_CALL` | `MASM_OP_X86_CALL_REL` |
-| `MASM_IR_RET` | `MASM_OP_X86_RET` |
-| `MASM_IR_SYSCALL` | `MASM_OP_X86_SYSCALL` |
+| IR Opcode | x86_64 Output |
+|-----------|---------------|
+| `OP_MOV` | MOV_RR, MOV_RI |
+| `OP_ADD` | ADD_RR, ADD_RI |
+| `OP_SUB` | SUB_RR, SUB_RI |
+| `OP_MUL` | IMUL_RR |
+| `OP_DIV` | CQO + IDIV |
+| `OP_LOAD` | MOV_RM, MOVQ (float) |
+| `OP_STORE` | MOV_MR |
+| `OP_ICMP` | CMP_RR + SETcc |
+| `OP_BRCOND` | CMP + Jcc |
+| `OP_CALL` | CALL_REL |
+| `OP_RET` | RET |
+| `OP_SYSCALL` | SYSCALL |
 
 ### Operand Variants
 
@@ -109,77 +103,51 @@ The current allocator uses a simple strategy:
 
 ### x86_64 Register Classes
 
-**Integer Registers**:
-```c
-static uint32_t scratch_regs[] = {
-    MASM_X86_RAX, MASM_X86_RCX, MASM_X86_RDX,
-    MASM_X86_R8, MASM_X86_R9, MASM_X86_R10, MASM_X86_R11
-};
-```
+**Scratch Registers** (caller-saved, available for allocation):
+RAX, RCX, RDX, R8, R9, R10, R11
 
-**Reserved Registers**:
-```c
-static uint32_t reserved_regs[] = {
-    MASM_X86_RSP, MASM_X86_RBP,  // stack/frame pointers
-    MASM_X86_RBX, MASM_X86_R12,  // callee-saved
-    MASM_X86_R13, MASM_X86_R14, MASM_X86_R15
-};
-```
+**Reserved Registers** (not available for general allocation):
+RSP, RBP (stack/frame pointers), RBX, R12, R13, R14, R15 (callee-saved)
 
 ### Register Role Helpers
 
 The ISA spec provides role-based register access:
 
-```c
-MasmOperand (*reg_result)(uint8_t size);   // return value register
-MasmOperand (*reg_tmp0)(uint8_t size);     // first temporary
-MasmOperand (*reg_tmp1)(uint8_t size);     // second temporary
-MasmOperand (*reg_arg)(int index, uint8_t size);  // argument register
-MasmOperand (*reg_sp)(uint8_t size);       // stack pointer
-MasmOperand (*reg_fp)(uint8_t size);       // frame pointer
-```
+| Role | Description |
+|------|-------------|
+| `reg_result` | Return value register |
+| `reg_tmp0` | First temporary |
+| `reg_tmp1` | Second temporary |
+| `reg_arg(index)` | Argument register by index |
+| `reg_sp` | Stack pointer |
+| `reg_fp` | Frame pointer |
 
 
 ## Encoding
 
 Encoding transforms target-specific opcodes into machine code bytes.
 
-### Entry Point
-
-```c
-int masm_x86_encode(MasmInstruction inst, uint8_t *buffer, size_t size);
-```
-
-Returns the number of bytes written.
-
 ### x86_64 Instruction Format
 
 ```
-┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
-│ Prefix  │   REX   │ Opcode  │ ModR/M  │   SIB   │ Disp/Imm│
-│ (opt)   │ (opt)   │ 1-3 B   │ (opt)   │ (opt)   │ (opt)   │
-└─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
++---------+---------+---------+---------+---------+---------+
+| Prefix  |   REX   | Opcode  | ModR/M  |   SIB   | Disp/Imm|
+| (opt)   | (opt)   | 1-3 B   | (opt)   | (opt)   | (opt)   |
++---------+---------+---------+---------+---------+---------+
 ```
 
 ### REX Prefix
 
 For 64-bit operands and extended registers (R8-R15):
 
-```c
-uint8_t rex = 0x40;
-rex |= 0x08;  // REX.W - 64-bit operand
-rex |= 0x04;  // REX.R - extend ModR/M reg field
-rex |= 0x02;  // REX.X - extend SIB index field
-rex |= 0x01;  // REX.B - extend ModR/M r/m or SIB base
-```
+| Bit | Name | Purpose |
+|-----|------|---------|
+| 0x08 | REX.W | 64-bit operand size |
+| 0x04 | REX.R | Extend ModR/M reg field |
+| 0x02 | REX.X | Extend SIB index field |
+| 0x01 | REX.B | Extend ModR/M r/m or SIB base |
 
 ### ModR/M Byte
-
-```c
-uint8_t modrm(uint8_t mod, uint8_t reg, uint8_t rm) {
-    return (mod << 6) | ((reg & 7) << 3) | (rm & 7);
-}
-```
 
 | Mod | Description |
 |-----|-------------|
@@ -187,15 +155,6 @@ uint8_t modrm(uint8_t mod, uint8_t reg, uint8_t rm) {
 | 01 | Memory, 8-bit displacement |
 | 10 | Memory, 32-bit displacement |
 | 11 | Register direct |
-
-### Example: `add rax, rbx`
-
-```c
-// add r64, r/m64: REX.W + 03 /r
-emit_byte(0x48);  // REX.W
-emit_byte(0x03);  // ADD opcode
-emit_byte(0xC3);  // ModR/M: mod=11, reg=rax, rm=rbx
-```
 
 
 ## Floating-Point Operations
@@ -206,22 +165,12 @@ Floating-point uses SSE instructions with XMM registers.
 
 | IR | x86_64 | Encoding |
 |----|--------|----------|
-| `fadd` | `addsd` | `F2 0F 58 /r` |
-| `fsub` | `subsd` | `F2 0F 5C /r` |
-| `fmul` | `mulsd` | `F2 0F 59 /r` |
-| `fdiv` | `divsd` | `F2 0F 5E /r` |
-| `load` (f64) | `movsd` | `F2 0F 10 /r` |
-| `store` (f64) | `movsd` | `F2 0F 11 /r` |
-
-### Type-Directed Selection
-
-```c
-if (is_float_type(operand_type)) {
-    emit_sse_instruction(inst);
-} else {
-    emit_integer_instruction(inst);
-}
-```
+| `OP_FADD` | `addsd` | `F2 0F 58 /r` |
+| `OP_FSUB` | `subsd` | `F2 0F 5C /r` |
+| `OP_FMUL` | `mulsd` | `F2 0F 59 /r` |
+| `OP_FDIV` | `divsd` | `F2 0F 5E /r` |
+| `OP_LOAD` (f64) | `movsd` | `F2 0F 10 /r` |
+| `OP_STORE` (f64) | `movsd` | `F2 0F 11 /r` |
 
 
 ## Relocations
@@ -237,15 +186,6 @@ References to symbols generate relocations in the object file.
 | `R_X86_64_32` | 32-bit absolute |
 | `R_X86_64_64` | 64-bit absolute |
 
-### Example: Function Call
-
-```c
-// emit call with relocation
-emit_byte(0xE8);  // CALL rel32
-emit_relocation(current_offset, symbol_name, R_X86_64_PLT32, -4);
-emit_dword(0);    // placeholder, filled by linker
-```
-
 
 ## Object Emission
 
@@ -254,31 +194,25 @@ Final output is an ELF object file.
 ### ELF Structure
 
 ```
-┌──────────────────┐
-│    ELF Header    │
-├──────────────────┤
-│  Section: .text  │ ← Encoded machine code
-├──────────────────┤
-│ Section: .rodata │ ← Constants, strings
-├──────────────────┤
-│  Section: .data  │ ← Initialized globals
-├──────────────────┤
-│  Section: .bss   │ ← Uninitialized globals
-├──────────────────┤
-│    .rela.text    │ ← Relocations for .text
-├──────────────────┤
-│     .symtab      │ ← Symbol table
-├──────────────────┤
-│     .strtab      │ ← String table
-├──────────────────┤
-│  Section Headers │
-└──────────────────┘
-```
-
-### Entry Point
-
-```c
-int masm_emit_object(Masm *masm, const char *filename);
++--------------------+
+|    ELF Header      |
++--------------------+
+|  Section: .text    |  <-- Encoded machine code
++--------------------+
+| Section: .rodata   |  <-- Constants, strings
++--------------------+
+|  Section: .data    |  <-- Initialized globals
++--------------------+
+|  Section: .bss     |  <-- Uninitialized globals
++--------------------+
+|    .rela.text      |  <-- Relocations for .text
++--------------------+
+|     .symtab        |  <-- Symbol table
++--------------------+
+|     .strtab        |  <-- String table
++--------------------+
+|  Section Headers   |
++--------------------+
 ```
 
 
@@ -317,36 +251,18 @@ fun syscall_exit(code: u64) {
 Parsed by ISA-specific parser, emits target opcodes directly.
 
 
-## Implementation Files
+## Implementation
 
-| Component | Location |
-|-----------|----------|
-| ISA Spec Interface | `masm/isa/spec.h` |
-| x86_64 Opcodes | `masm/isa/x86_64/x86_64.h` |
-| x86_64 Isel | `masm/isa/x86_64/` |
-| x86_64 Inline Asm | `masm/isa/x86_64/asm.h` |
-| ELF Emission | `masm/of/elf.c` |
-| Object Format Spec | `masm/of/spec.h` |
+The code generation components are organized under `src/compiler/`:
 
-
-## Adding a New Backend
-
-To add a new ISA (e.g., ARM64):
-
-1. **Create opcode definitions** - `masm/isa/arm64/arm64.h`
-   - Define `MasmArm64Opcode` enum
-   - Add register definitions
-
-2. **Implement ISA spec** - `masm/isa/arm64/arm64.c`
-   - Register role functions
-   - Instruction selection
-   - Encoding
-
-3. **Add opcode kind** - `masm/ir.h`
-   - `MASM_OPCODE_ARM64` to `MasmOpcodeKind`
-
-4. **Register ISA** - `masm/isa/spec.c`
-   - Update `masm_isa_spec_select()`
+| Component | Description |
+|-----------|-------------|
+| `masm/ir.mach` | IR opcode definitions, Inst/Operand/Block/Function records |
+| `lower.mach` | AST to MASM IR lowering |
+| `isa.mach` | ISA spec interface |
+| `abi.mach` | ABI spec interface |
+| `of.mach` | Object format spec interface |
+| `of/elf/` | ELF emission |
 
 
 ## See Also
