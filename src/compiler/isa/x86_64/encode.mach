@@ -39,6 +39,21 @@ fun sib(scale: u8, index: u8, base: u8) u8 {
 fun fits_i8(v: i64) bool { ret v >= -128 && v <= 127; }
 fun fits_i32(v: i64) bool { ret v >= -2147483648 && v <= 2147483647; }
 
+# emit_rex_for_byte: emit REX prefix for byte-operand instructions.
+# in x86-64, registers 4-7 need REX to access SPL/BPL/SIL/DIL
+# (without REX, 4-7 map to AH/CH/DH/BH which is never what we want).
+fun emit_rex_for_byte(alloc: *allocator.Allocator, sec: *section.Section,
+                      reg: i32, rm: i32) i32 {
+    var rex: u8 = REX_BASE;
+    if (hi1(reg)) { rex = rex | 0x04; }
+    if (hi1(rm))  { rex = rex | 0x01; }
+    if (reg >= 4 || rm >= 4 || rex != REX_BASE) {
+        section.emit_byte(alloc, sec, rex);
+        ret 1;
+    }
+    ret 0;
+}
+
 # emit_rex: emit REX prefix if needed.
 # w = 64-bit operand size, reg/rm are register numbers.
 fun emit_rex(alloc: *allocator.Allocator, sec: *section.Section,
@@ -209,17 +224,50 @@ fun encode_alu(alloc: *allocator.Allocator, sec: *section.Section,
                inst: *isa.MachInst) i32 {
     val opext: u8 = alu_ext(inst.opcode);
     val base: u8 = alu_base(inst.opcode);
+    val byte_op: bool = inst.size == 1;
 
     if (inst.dst.kind == ir.OPK_REG && inst.src1.kind == ir.OPK_REG) {
+        if (byte_op) {
+            # ALU r/m8, r8: base | 0
+            var n: i32 = emit_rex_for_byte(alloc, sec, inst.src1.reg, inst.dst.reg);
+            section.emit_byte(alloc, sec, base);
+            section.emit_byte(alloc, sec,
+                modrm(MOD_DIRECT, lo3(inst.src1.reg), lo3(inst.dst.reg)));
+            ret n + 2;
+        }
         ret encode_rr(alloc, sec, base | 1, inst);
     }
     if (inst.dst.kind == ir.OPK_REG && inst.src1.kind == ir.OPK_IMM) {
+        if (byte_op) {
+            # ALU r/m8, imm8: 0x80 /digit
+            var n: i32 = emit_rex_for_byte(alloc, sec, 0, inst.dst.reg);
+            section.emit_byte(alloc, sec, 0x80);
+            section.emit_byte(alloc, sec, modrm(MOD_DIRECT, opext, lo3(inst.dst.reg)));
+            section.emit_byte(alloc, sec, inst.src1.imm::u8);
+            ret n + 3;
+        }
         ret encode_ri(alloc, sec, opext, inst);
     }
     if (inst.dst.kind == ir.OPK_REG && inst.src1.kind == ir.OPK_MEM) {
+        if (byte_op) {
+            # ALU r8, [mem8]: base | 2
+            var n: i32 = emit_rex_for_byte(alloc, sec, inst.dst.reg, inst.src1.base);
+            section.emit_byte(alloc, sec, base | 2);
+            n = n + 1;
+            n = n + emit_mem(alloc, sec, lo3(inst.dst.reg), ?inst.src1);
+            ret n;
+        }
         ret encode_rm(alloc, sec, base | 3, inst);
     }
     if (inst.dst.kind == ir.OPK_MEM && inst.src1.kind == ir.OPK_REG) {
+        if (byte_op) {
+            # ALU [mem8], r8: base | 0
+            var n: i32 = emit_rex_for_byte(alloc, sec, inst.src1.reg, inst.dst.base);
+            section.emit_byte(alloc, sec, base);
+            n = n + 1;
+            n = n + emit_mem(alloc, sec, lo3(inst.src1.reg), ?inst.dst);
+            ret n;
+        }
         ret encode_mr(alloc, sec, base | 1, inst);
     }
     ret -1;
@@ -229,15 +277,33 @@ fun encode_alu(alloc: *allocator.Allocator, sec: *section.Section,
 fun encode_mov(alloc: *allocator.Allocator, sec: *section.Section,
                inst: *isa.MachInst) i32 {
     val w: bool = inst.size == 8;
+    val byte_op: bool = inst.size == 1;
 
     # mov reg, reg
     if (inst.dst.kind == ir.OPK_REG && inst.src1.kind == ir.OPK_REG) {
+        if (byte_op) {
+            # use MOVZX r32, r/m8 (0x0F B6) to avoid partial-register stalls
+            var n: i32 = emit_rex_for_byte(alloc, sec, inst.dst.reg, inst.src1.reg);
+            section.emit_byte(alloc, sec, 0x0F);
+            section.emit_byte(alloc, sec, 0xB6);
+            section.emit_byte(alloc, sec,
+                modrm(MOD_DIRECT, lo3(inst.dst.reg), lo3(inst.src1.reg)));
+            ret n + 3;
+        }
         ret encode_rr(alloc, sec, 0x89, inst);
     }
 
     # mov reg, imm
     if (inst.dst.kind == ir.OPK_REG && inst.src1.kind == ir.OPK_IMM) {
         val imm: i64 = inst.src1.imm;
+        if (byte_op) {
+            # mov r/m8, imm8 (0xC6 /0)
+            var n: i32 = emit_rex_for_byte(alloc, sec, 0, inst.dst.reg);
+            section.emit_byte(alloc, sec, 0xC6);
+            section.emit_byte(alloc, sec, modrm(MOD_DIRECT, 0, lo3(inst.dst.reg)));
+            section.emit_byte(alloc, sec, imm::u8);
+            ret n + 3;
+        }
         # 64-bit movabs for large values
         if (w && !fits_i32(imm)) {
             var n: i32 = emit_rex(alloc, sec, true, 0, inst.dst.reg);
@@ -253,18 +319,57 @@ fun encode_mov(alloc: *allocator.Allocator, sec: *section.Section,
         ret n + 6;
     }
 
+    # mov reg, label → movabs with ABS64 relocation
+    if (inst.dst.kind == ir.OPK_REG && inst.src1.kind == ir.OPK_LABEL) {
+        var n: i32 = emit_rex(alloc, sec, true, 0, inst.dst.reg);
+        section.emit_byte(alloc, sec, 0xB8 + lo3(inst.dst.reg));
+        val reloc_offset: usize = section.current_offset(sec);
+        section.emit_u64(alloc, sec, 0);
+        if (inst.src1.label != nil) {
+            section.add_relocation(alloc, sec, reloc_offset, inst.src1.label,
+                section.RELOC_ABS64, 0);
+        }
+        ret n + 9;
+    }
+
     # mov reg, [mem]
     if (inst.dst.kind == ir.OPK_REG && inst.src1.kind == ir.OPK_MEM) {
+        if (byte_op) {
+            # MOVZX r32, [mem8] (0x0F B6 /r) — zero-extend byte load
+            var n: i32 = emit_rex(alloc, sec, false, inst.dst.reg, inst.src1.base);
+            section.emit_byte(alloc, sec, 0x0F);
+            section.emit_byte(alloc, sec, 0xB6);
+            n = n + 2;
+            n = n + emit_mem(alloc, sec, lo3(inst.dst.reg), ?inst.src1);
+            ret n;
+        }
         ret encode_rm(alloc, sec, 0x8B, inst);
     }
 
     # mov [mem], reg
     if (inst.dst.kind == ir.OPK_MEM && inst.src1.kind == ir.OPK_REG) {
+        if (byte_op) {
+            # MOV [mem8], r8 (0x88 /r)
+            var n: i32 = emit_rex_for_byte(alloc, sec, inst.src1.reg, inst.dst.base);
+            section.emit_byte(alloc, sec, 0x88);
+            n = n + 1;
+            n = n + emit_mem(alloc, sec, lo3(inst.src1.reg), ?inst.dst);
+            ret n;
+        }
         ret encode_mr(alloc, sec, 0x89, inst);
     }
 
-    # mov [mem], imm32
+    # mov [mem], imm
     if (inst.dst.kind == ir.OPK_MEM && inst.src1.kind == ir.OPK_IMM) {
+        if (byte_op) {
+            # MOV [mem8], imm8 (0xC6 /0)
+            var n: i32 = emit_rex(alloc, sec, false, 0, inst.dst.base);
+            section.emit_byte(alloc, sec, 0xC6);
+            n = n + 1;
+            n = n + emit_mem(alloc, sec, 0, ?inst.dst);
+            section.emit_byte(alloc, sec, inst.src1.imm::u8);
+            ret n + 1;
+        }
         var n: i32 = emit_rex(alloc, sec, w, 0, inst.dst.base);
         section.emit_byte(alloc, sec, 0xC7);
         n = n + 1;
@@ -399,8 +504,17 @@ fun encode_lea(alloc: *allocator.Allocator, sec: *section.Section,
 fun encode_test(alloc: *allocator.Allocator, sec: *section.Section,
                 inst: *isa.MachInst) i32 {
     val w: bool = inst.size == 8;
+    val byte_op: bool = inst.size == 1;
 
     if (inst.dst.kind == ir.OPK_REG && inst.src1.kind == ir.OPK_REG) {
+        if (byte_op) {
+            # TEST r/m8, r8 (0x84)
+            var n: i32 = emit_rex_for_byte(alloc, sec, inst.src1.reg, inst.dst.reg);
+            section.emit_byte(alloc, sec, 0x84);
+            section.emit_byte(alloc, sec,
+                modrm(MOD_DIRECT, lo3(inst.src1.reg), lo3(inst.dst.reg)));
+            ret n + 2;
+        }
         var n: i32 = emit_rex(alloc, sec, w, inst.src1.reg, inst.dst.reg);
         section.emit_byte(alloc, sec, 0x85);
         section.emit_byte(alloc, sec, modrm(MOD_DIRECT, lo3(inst.src1.reg), lo3(inst.dst.reg)));
@@ -408,6 +522,19 @@ fun encode_test(alloc: *allocator.Allocator, sec: *section.Section,
     }
 
     if (inst.dst.kind == ir.OPK_REG && inst.src1.kind == ir.OPK_IMM) {
+        if (byte_op) {
+            # TEST r/m8, imm8 (0xF6 /0)
+            var n: i32 = emit_rex_for_byte(alloc, sec, 0, inst.dst.reg);
+            if (inst.dst.reg == op.RAX) {
+                section.emit_byte(alloc, sec, 0xA8);
+                section.emit_byte(alloc, sec, inst.src1.imm::u8);
+                ret n + 2;
+            }
+            section.emit_byte(alloc, sec, 0xF6);
+            section.emit_byte(alloc, sec, modrm(MOD_DIRECT, 0, lo3(inst.dst.reg)));
+            section.emit_byte(alloc, sec, inst.src1.imm::u8);
+            ret n + 3;
+        }
         var n: i32 = emit_rex(alloc, sec, w, 0, inst.dst.reg);
         if (inst.dst.reg == op.RAX) {
             section.emit_byte(alloc, sec, 0xA9);
@@ -584,16 +711,25 @@ fun encode_movsx(alloc: *allocator.Allocator, sec: *section.Section,
 
     # movsx (8→16/32/64): 0F BE /r
     # movsx (16→32/64): 0F BF /r
+    val be: bool = inst.src1.size == 1;
     if (inst.src1.kind == ir.OPK_REG) {
         var n: i32 = emit_rex(alloc, sec, w, inst.dst.reg, inst.src1.reg);
         section.emit_byte(alloc, sec, 0x0F);
-        if (inst.src1.size == 1) {
-            section.emit_byte(alloc, sec, 0xBE);
-        } or {
-            section.emit_byte(alloc, sec, 0xBF);
-        }
+        if (be) { section.emit_byte(alloc, sec, 0xBE); }
+        or      { section.emit_byte(alloc, sec, 0xBF); }
         section.emit_byte(alloc, sec, modrm(MOD_DIRECT, lo3(inst.dst.reg), lo3(inst.src1.reg)));
         ret n + 3;
+    }
+
+    # movsx reg, [mem]
+    if (inst.src1.kind == ir.OPK_MEM) {
+        var n: i32 = emit_rex(alloc, sec, w, inst.dst.reg, inst.src1.base);
+        section.emit_byte(alloc, sec, 0x0F);
+        if (be) { section.emit_byte(alloc, sec, 0xBE); }
+        or      { section.emit_byte(alloc, sec, 0xBF); }
+        n = n + 2;
+        n = n + emit_mem(alloc, sec, lo3(inst.dst.reg), ?inst.src1);
+        ret n;
     }
 
     ret -1;
@@ -602,17 +738,33 @@ fun encode_movsx(alloc: *allocator.Allocator, sec: *section.Section,
 # encode_movzx: encode MOVZX.
 fun encode_movzx(alloc: *allocator.Allocator, sec: *section.Section,
                  inst: *isa.MachInst) i32 {
-    if (inst.dst.kind != ir.OPK_REG || inst.src1.kind != ir.OPK_REG) { ret -1; }
+    if (inst.dst.kind != ir.OPK_REG) { ret -1; }
     val w: bool = inst.size == 8;
-    var n: i32 = emit_rex(alloc, sec, w, inst.dst.reg, inst.src1.reg);
-    section.emit_byte(alloc, sec, 0x0F);
-    if (inst.src1.size == 1) {
-        section.emit_byte(alloc, sec, 0xB6);
-    } or {
-        section.emit_byte(alloc, sec, 0xB7);
+    val b6: bool = inst.src1.size == 1;
+
+    # MOVZX reg, reg
+    if (inst.src1.kind == ir.OPK_REG) {
+        var n: i32 = emit_rex(alloc, sec, w, inst.dst.reg, inst.src1.reg);
+        section.emit_byte(alloc, sec, 0x0F);
+        if (b6) { section.emit_byte(alloc, sec, 0xB6); }
+        or      { section.emit_byte(alloc, sec, 0xB7); }
+        section.emit_byte(alloc, sec,
+            modrm(MOD_DIRECT, lo3(inst.dst.reg), lo3(inst.src1.reg)));
+        ret n + 3;
     }
-    section.emit_byte(alloc, sec, modrm(MOD_DIRECT, lo3(inst.dst.reg), lo3(inst.src1.reg)));
-    ret n + 3;
+
+    # MOVZX reg, [mem]
+    if (inst.src1.kind == ir.OPK_MEM) {
+        var n: i32 = emit_rex(alloc, sec, w, inst.dst.reg, inst.src1.base);
+        section.emit_byte(alloc, sec, 0x0F);
+        if (b6) { section.emit_byte(alloc, sec, 0xB6); }
+        or      { section.emit_byte(alloc, sec, 0xB7); }
+        n = n + 2;
+        n = n + emit_mem(alloc, sec, lo3(inst.dst.reg), ?inst.src1);
+        ret n;
+    }
+
+    ret -1;
 }
 
 # encode_imul_2op: encode two-operand IMUL (dst = dst * src).

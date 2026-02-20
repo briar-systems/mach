@@ -34,15 +34,15 @@ $(BIN)/cmach:
 $(IMACH): $(CMACH) | $(BIN)
 	@rm -rf $(OUT)/imach
 	@echo "  cmach -> imach"
-	@$(CMACH) build . -o $@
+	@$(CMACH) build . -o $@ --artifacts imach/linux
 
 $(SMACH): $(IMACH) | $(BIN)
 	@rm -rf $(OUT)/smach
 	@echo "  imach -> smach"
-	@$(IMACH) build . -o $@
+	@$(IMACH) build . -o $@ --artifacts smach/linux
 
 $(MACH): $(SMACH)
-	@rm -rf $(OUT)/mach
+	@rm -rf $(OUT)/linux
 	@echo "  smach -> mach"
 	@$(SMACH) build .
 
