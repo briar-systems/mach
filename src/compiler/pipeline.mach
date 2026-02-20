@@ -6,6 +6,7 @@ use std.types.result;
 
 use allocator: std.allocator;
 use print:     std.print;
+use stream:    std.stream;
 
 use config:   mach.config.config;
 use ast:      mach.compiler.ast;
@@ -28,6 +29,8 @@ use lower:    mach.compiler.lower;
 use ldecl:    mach.compiler.lower.decl;
 use regalloc: mach.compiler.regalloc;
 use cemit:    mach.compiler.emit;
+use emasm:    mach.compiler.emit_asm;
+use emmasm:   mach.compiler.emit_masm;
 use linker:   mach.compiler.linker;
 use mangle:   mach.compiler.masm.mangle;
 use utilfs:   mach.util.filesystem;
@@ -67,6 +70,8 @@ pub rec CompileOptions {
     output_path:     str;   # final executable/library path
     obj_path:        str;   # optional: write .o artifact here for inspection
     obj_dir:         str;   # per-module .o directory (nil = monolithic mode)
+    masm_dir:        str;   # per-module .masm directory (nil = disabled)
+    asm_dir:         str;   # per-module .s directory (nil = disabled)
 }
 
 # --- result types ---
@@ -301,8 +306,10 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
 # codegen: run instruction selection, register allocation, and encoding.
 # processes each function as a unit: ISel all → regalloc → encode all.
 # populates the .text section with encoded machine code.
+# asm_w: optional stream writer for assembly text output (nil = disabled).
 fun codegen(mctx: *masm.Context, tgt: *target.Target,
-            alloc: *allocator.Allocator, verbose: bool) bool {
+            alloc: *allocator.Allocator, verbose: bool,
+            asm_w: *emasm.AsmWriter) bool {
     if (mctx == nil || tgt == nil || alloc == nil) { ret false; }
 
     val i: *isa.ISA = ?tgt.isa;
@@ -461,6 +468,14 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
             i.prologue(i.ctx, total_frame, ra.callee_mask, text_sec, alloc);
         }
 
+        # ASM: function header + prologue comment
+        if (asm_w != nil) {
+            emasm.emit_func_header(asm_w, func.name);
+            if (has_frame) {
+                emasm.emit_prologue_comment(asm_w, total_frame, ra.callee_mask);
+            }
+        }
+
         # === Phase D: Encode regalloc output ===
         var encode_fails: i32 = 0;
         var encode_ok: i32 = 0;
@@ -472,10 +487,16 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
             if (minst.opcode == isa.MACHINST_LABEL) {
                 # register label symbol at current section offset
                 register_label_symbol(mctx, minst, text_sec, text_idx, alloc);
+                if (asm_w != nil && minst.dst.label != nil) {
+                    emasm.emit_label(asm_w, minst.dst.label);
+                }
             } or (i.is_ret(i.ctx, minst) && has_frame) {
                 # emit epilogue (includes ret) instead of bare ret
                 i.epilogue(i.ctx, ra.callee_mask, text_sec, alloc);
                 encode_ok = encode_ok + 1;
+                if (asm_w != nil) {
+                    emasm.emit_epilogue_comment(asm_w, ra.callee_mask);
+                }
             } or {
                 val enc_r: i32 = i.encode(i.ctx, minst, text_sec, alloc);
                 if (enc_r < 0) {
@@ -486,6 +507,9 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
                     encode_fails = encode_fails + 1;
                 } or {
                     encode_ok = encode_ok + 1;
+                }
+                if (asm_w != nil) {
+                    i.format_inst(i.ctx, minst, ?asm_w.w);
                 }
             }
 
@@ -511,6 +535,10 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
         if (verbose) {
             print.eprintf("[verbose] codegen:   symbol '%s' offset=%d size=%d\n",
                 func.name, func_start::i64, (func_end - func_start)::i64);
+        }
+
+        if (asm_w != nil) {
+            emasm.emit_newline(asm_w);
         }
 
         isa.buf_destroy(?ra.out);
@@ -630,15 +658,15 @@ fun resolve_externs(mctx: *masm.Context, alloc: *allocator.Allocator) {
     }
 }
 
-# module_path_to_obj_path: convert a module path to an artifact .o file path.
-# strips project_id prefix if present, replaces dots with '/', appends ".o",
-# prepends obj_dir.
-# e.g. (project_id="mach", obj_dir="out/obj"):
+# module_path_to_artifact_path: convert a module path to an artifact file path.
+# strips project_id prefix if present, replaces dots with '/', appends suffix,
+# prepends base_dir.
+# e.g. (project_id="mach", base_dir="out/obj", suffix=".o"):
 #   "mach.cli.args" → "out/obj/cli/args.o"
 #   "std.runtime"   → "out/obj/std/runtime.o"
-fun module_path_to_obj_path(mod_path: str, project_id: str, obj_dir: str,
-                            alloc: *allocator.Allocator) str {
-    if (mod_path == nil || obj_dir == nil || alloc == nil) { ret nil; }
+fun module_path_to_artifact_path(mod_path: str, project_id: str, base_dir: str,
+                                 suffix: str, alloc: *allocator.Allocator) str {
+    if (mod_path == nil || base_dir == nil || alloc == nil || suffix == nil) { ret nil; }
 
     # determine the relative part (strip project_id prefix if present)
     var rel: str = mod_path;
@@ -651,10 +679,11 @@ fun module_path_to_obj_path(mod_path: str, project_id: str, obj_dir: str,
         }
     }
 
-    # compute output: obj_dir + "/" + rel (dots→slashes) + ".o"
+    # compute output: base_dir + "/" + rel (dots→slashes) + suffix
     val rel_len: usize = str_len(rel);
-    val dir_len: usize = str_len(obj_dir);
-    val total: usize = dir_len + 1 + rel_len + 2 + 1;
+    val dir_len: usize = str_len(base_dir);
+    val sfx_len: usize = str_len(suffix);
+    val total: usize = dir_len + 1 + rel_len + sfx_len + 1;
 
     val r: Result[*u8, allocator.AllocError] =
         allocator.allocator_alloc[u8](alloc, total);
@@ -663,16 +692,16 @@ fun module_path_to_obj_path(mod_path: str, project_id: str, obj_dir: str,
 
     var p: usize = 0;
 
-    # copy obj_dir
+    # copy base_dir
     var i: usize = 0;
     for (i < dir_len) {
-        buf[p] = obj_dir[i];
+        buf[p] = base_dir[i];
         p = p + 1;
         i = i + 1;
     }
 
     # separator
-    if (dir_len > 0 && obj_dir[dir_len - 1] != '/') {
+    if (dir_len > 0 && base_dir[dir_len - 1] != '/') {
         buf[p] = '/';
         p = p + 1;
     }
@@ -689,11 +718,13 @@ fun module_path_to_obj_path(mod_path: str, project_id: str, obj_dir: str,
         i = i + 1;
     }
 
-    # append ".o"
-    buf[p] = '.';
-    p = p + 1;
-    buf[p] = 'o';
-    p = p + 1;
+    # append suffix
+    i = 0;
+    for (i < sfx_len) {
+        buf[p] = suffix[i];
+        p = p + 1;
+        i = i + 1;
+    }
     buf[p] = 0;
 
     ret buf::&u8;
@@ -707,7 +738,8 @@ fun module_path_to_obj_path(mod_path: str, project_id: str, obj_dir: str,
 # func_insts: linked list of all generic function instantiations from sema
 fun compile_module(root: *ast.Node, symbols: *symbol.Table,
                    tgt: *target.Target, alloc: *allocator.Allocator,
-                   obj_path: str, smod: *sema.SemaModule,
+                   obj_path: str, masm_path: str, asm_path: str,
+                   smod: *sema.SemaModule,
                    func_insts: *sema.FunctionInstantiation,
                    verbose: bool) bool {
     if (root == nil || tgt == nil || alloc == nil || obj_path == nil) { ret false; }
@@ -803,8 +835,27 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         oi = oi + 1;
     }
 
+    # 4b. emit MASM IR text
+    if (masm_path != nil) {
+        val masm_dir: str = utilfs.get_output_dir(masm_path, alloc);
+        if (masm_dir != nil) { utilfs.ensure_dir(masm_dir, alloc); }
+        emmasm.emit(mctx, masm_path);
+    }
+
     # 5. codegen (ISel + encode)
-    if (!codegen(mctx, tgt, alloc, verbose)) { ret false; }
+    var asm_w_ptr: *emasm.AsmWriter = nil;
+    if (asm_path != nil) {
+        val asm_dir: str = utilfs.get_output_dir(asm_path, alloc);
+        if (asm_dir != nil) { utilfs.ensure_dir(asm_dir, alloc); }
+        asm_w_ptr = emasm.open(asm_path, alloc);
+    }
+
+    if (!codegen(mctx, tgt, alloc, verbose, asm_w_ptr)) {
+        if (asm_w_ptr != nil) { emasm.close(asm_w_ptr); }
+        ret false;
+    }
+
+    if (asm_w_ptr != nil) { emasm.close(asm_w_ptr); }
 
     # 6. resolve external references
     resolve_externs(mctx, alloc);
@@ -869,14 +920,25 @@ fun compile_per_module(root: *ast.Node, symbols: *symbol.Table,
     }
 
     # compile entry module
-    val entry_obj: str = module_path_to_obj_path(module_path, opts.project_id,
-        opts.obj_dir, alloc);
+    val entry_obj: str = module_path_to_artifact_path(module_path, opts.project_id,
+        opts.obj_dir, ".o", alloc);
+    var entry_masm: str = nil;
+    if (opts.masm_dir != nil) {
+        entry_masm = module_path_to_artifact_path(module_path, opts.project_id,
+            opts.masm_dir, ".masm", alloc);
+    }
+    var entry_asm: str = nil;
+    if (opts.asm_dir != nil) {
+        entry_asm = module_path_to_artifact_path(module_path, opts.project_id,
+            opts.asm_dir, ".s", alloc);
+    }
     if (entry_obj != nil) {
         val entry_dir: str = utilfs.get_output_dir(entry_obj, alloc);
         if (entry_dir != nil) {
             utilfs.ensure_dir(entry_dir, alloc);
         }
         if (compile_module(root, symbols, tgt, alloc, entry_obj,
+                           entry_masm, entry_asm,
                            entry_smod, func_insts, verbose)) {
             obj_paths[obj_count] = entry_obj;
             obj_count = obj_count + 1;
@@ -888,14 +950,25 @@ fun compile_per_module(root: *ast.Node, symbols: *symbol.Table,
     for (mi < mod_count) {
         val m: *sema.SemaModule = mods[mi];
         if (m != nil && m.ast != nil && m.is_analyzed) {
-            val mobj: str = module_path_to_obj_path(m.path, opts.project_id,
-                opts.obj_dir, alloc);
+            val mobj: str = module_path_to_artifact_path(m.path, opts.project_id,
+                opts.obj_dir, ".o", alloc);
+            var m_masm: str = nil;
+            if (opts.masm_dir != nil) {
+                m_masm = module_path_to_artifact_path(m.path, opts.project_id,
+                    opts.masm_dir, ".masm", alloc);
+            }
+            var m_asm: str = nil;
+            if (opts.asm_dir != nil) {
+                m_asm = module_path_to_artifact_path(m.path, opts.project_id,
+                    opts.asm_dir, ".s", alloc);
+            }
             if (mobj != nil) {
                 val mdir: str = utilfs.get_output_dir(mobj, alloc);
                 if (mdir != nil) {
                     utilfs.ensure_dir(mdir, alloc);
                 }
                 if (compile_module(m.ast, m.table, tgt, alloc, mobj,
+                                   m_masm, m_asm,
                                    m, func_insts, verbose)) {
                     obj_paths[obj_count] = mobj;
                     obj_count = obj_count + 1;
@@ -985,7 +1058,7 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
         oi = oi + 1;
     }
 
-    if (!codegen(lr.mctx, ?opts.target, opts.alloc, opts.verbose)) {
+    if (!codegen(lr.mctx, ?opts.target, opts.alloc, opts.verbose, nil)) {
         ret err[CompileResult, str]("code generation failed");
     }
 
