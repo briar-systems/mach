@@ -175,52 +175,20 @@ asm {
 ```
 
 
-## ABI Specification Interface
+## ABI Interface
 
-```c
-typedef struct MasmABISpec {
-    uint8_t  pointer_size;      // 8 for 64-bit
-    uint8_t  stack_align;       // 16 for sysv64
-    bool     has_red_zone;      // true for sysv64
-    
-    // integer calling convention
-    const uint32_t *int_arg_regs;
-    uint8_t        int_arg_count;
-    const uint32_t *int_ret_regs;
-    uint8_t        int_ret_count;
-    
-    // floating-point calling convention
-    const uint32_t *float_arg_regs;
-    uint8_t        float_arg_count;
-    const uint32_t *float_ret_regs;
-    uint8_t        float_ret_count;
-} MasmABISpec;
-```
+The `abi.ABI` record (defined in `src/compiler/abi.mach`) provides:
+
+- Integer and float argument register lists
+- Return register specification
+- Stack alignment, pointer size, and red zone flag
+
+The ABI is selected automatically by `target.select()` based on the ISA and OS components of the target triple. Downstream code receives a composed `Target` record and queries it directly — there is no manual ABI selection.
 
 
-### Helper Functions
+## Red Zone
 
-```c
-// get abi spec for target
-const MasmABISpec *masm_abi_spec_select(MasmTarget target);
-
-// query abi properties
-uint8_t  masm_abi_pointer_size(MasmTarget target);
-uint8_t  masm_abi_stack_align(MasmTarget target);
-bool     masm_abi_has_red_zone(MasmTarget target);
-
-// integer registers
-uint8_t  masm_abi_int_arg_count(MasmTarget target);
-uint32_t masm_abi_int_arg_reg(MasmTarget target, int index);
-uint8_t  masm_abi_int_ret_count(MasmTarget target);
-uint32_t masm_abi_int_ret_reg(MasmTarget target, int index);
-
-// float registers
-uint8_t  masm_abi_float_arg_count(MasmTarget target);
-uint32_t masm_abi_float_arg_reg(MasmTarget target, int index);
-uint8_t  masm_abi_float_ret_count(MasmTarget target);
-uint32_t masm_abi_float_ret_reg(MasmTarget target, int index);
-```
+The System V AMD64 ABI defines a 128-byte "red zone" below RSP that is guaranteed not to be clobbered by signal handlers or interrupts. Leaf functions can use this space without adjusting RSP.
 
 
 ## Caller vs. Callee Saved
@@ -236,15 +204,6 @@ Caller must save these if needed across calls:
 
 Callee must preserve these before using:
 - RBX, RBP, RSP, R12-R15
-
-
-## Red Zone
-
-The System V AMD64 ABI defines a 128-byte "red zone" below RSP that is guaranteed not to be clobbered by signal handlers or interrupts. Leaf functions can use this space without adjusting RSP.
-
-```c
-bool has_red_zone = masm_abi_has_red_zone(target);
-```
 
 
 ## Struct Return
@@ -278,29 +237,15 @@ For variadic functions (`...`), the caller must:
 1. Pass the number of XMM registers used in AL (lower 8 bits of RAX)
 2. Pass arguments normally through registers and stack
 
-```c
-// calling printf("x=%d, y=%f\n", 42, 3.14)
-// AL = 1 (one XMM register used for 3.14)
 ```
-
-
-## Implementation Files
-
-| Component | Location |
-|-----------|----------|
-| ABI Spec Interface | `masm/abi/spec.h` |
-| System V AMD64 | `masm/abi/sysv64.c` |
+# calling printf("x=%d, y=%f\n", 42, 3.14)
+# AL = 1  (one XMM register used for 3.14)
+```
 
 
 ## Adding a New ABI
 
-1. Create `masm/abi/<name>.c`:
-   - Define argument/return register arrays
-   - Populate `MasmABISpec` structure
-
-2. Add enum value to `MasmTargetABI` in `masm/target.h`
-
-3. Register in `masm_abi_spec_select()` in `masm/abi/spec.c`
+To add a new ABI, implement the `abi.ABI` interface in a new module under `src/compiler/abi/` and register recognition in `target.select()`. See [Target Configuration](target.md) for the full extension workflow.
 
 
 ## See Also

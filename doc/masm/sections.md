@@ -6,131 +6,204 @@ This document describes section management in MASM.
 
 Sections are containers for code and data within a MASM module. They correspond to segments in the final object file and determine memory placement, permissions, and linker behavior.
 
+Section management is defined in `src/compiler/masm/section.mach`.
+
 
 ## Section Kinds
 
-| Kind | Name | Purpose | Permissions |
-|------|------|---------|-------------|
-| `MASM_SECTION_TEXT` | `.text` | Executable code | Read + Execute |
-| `MASM_SECTION_DATA` | `.data` | Initialized mutable data | Read + Write |
-| `MASM_SECTION_RODATA` | `.rodata` | Read-only data (constants) | Read |
-| `MASM_SECTION_BSS` | `.bss` | Uninitialized data | Read + Write |
-| `MASM_SECTION_CUSTOM` | User-defined | Custom sections | Varies |
+| Kind | Value | Default Flags | Purpose |
+|------|-------|---------------|---------|
+| `SEC_TEXT` | 0 | `FLAG_ALLOC \| FLAG_EXEC` | Executable code |
+| `SEC_DATA` | 1 | `FLAG_ALLOC \| FLAG_WRITE` | Initialized mutable data |
+| `SEC_RODATA` | 2 | `FLAG_ALLOC` | Read-only data (constants) |
+| `SEC_BSS` | 3 | `FLAG_ALLOC \| FLAG_WRITE` | Uninitialized data |
+| `SEC_CUSTOM` | 4 | `FLAG_ALLOC` | User-defined sections |
+
+
+## Section Flags
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| `FLAG_WRITE` | 1 | Writable at runtime |
+| `FLAG_EXEC` | 2 | Executable |
+| `FLAG_ALLOC` | 4 | Occupies memory at runtime |
 
 
 ## Section Structure
 
-```c
-typedef struct MasmSection {
-    MasmSectionKind kind;
-    char           *name;
-    
-    // for text sections (code)
-    MasmInstruction *instructions;
-    size_t           inst_count;
-    size_t           inst_capacity;
-    
-    // for data sections
-    uint8_t        *data;
-    size_t          data_size;
-    size_t          data_capacity;
-} MasmSection;
+```mach
+pub rec Section {
+    name:        str;
+    kind:        SectionKind;
+    data:        *u8;         # raw byte buffer
+    size:        usize;       # bytes written
+    capacity:    usize;       # allocated capacity
+    align:       usize;       # alignment requirement
+    flags:       SectionFlags;
+    relocs:      *Relocation;
+    reloc_count: i32;
+    reloc_cap:   i32;
+}
 ```
-
-Sections contain either:
-- **Instructions** - For `.text` sections
-- **Raw data** - For `.data`, `.rodata`, and `.bss` sections
 
 
 ## Creating Sections
 
-```c
-MasmSection *section = masm_section_create(MASM_SECTION_TEXT, ".text");
+```mach
+use section: mach.compiler.masm.section;
+
+val r: Result[*section.Section, str] = section.create(alloc, ".text", section.SEC_TEXT);
 ```
 
 ### Getting or Creating Sections
 
-Within a MASM module, use these helpers:
+Within a MASM context (`masm.mach`), use the context helpers:
 
-```c
-// get existing section (returns NULL if not found)
-MasmSection *text = masm_get_section(masm, ".text");
+```mach
+use masm: mach.compiler.masm;
 
-// get or create section
-MasmSection *data = masm_get_or_create_section(masm, ".data", MASM_SECTION_DATA);
+# get existing section (returns nil if not found)
+val text: *section.Section = masm.get_section(m, ".text");
+
+# get or create section
+val r: Result[*section.Section, str] =
+    masm.get_or_create_section(m, ".data", section.SEC_DATA);
 ```
 
 
-## Text Sections
+## Emitting Data
 
-Text sections contain executable instructions.
+All sections use the same byte-oriented emit API.
 
-### Adding Instructions
+### Byte Emission Functions
 
-```c
-MasmSection *text = masm_get_or_create_section(masm, ".text", MASM_SECTION_TEXT);
+```mach
+# append raw bytes
+section.emit_bytes(alloc, sec, bytes_ptr, len)  Result[usize, str]
 
-MasmInstruction add = masm_inst_3(MASM_IR_ADD, dst, src1, src2);
-masm_section_append_inst(text, add);
+# single byte
+section.emit_byte(alloc, sec, b)                Result[usize, str]
 
-MasmInstruction ret = masm_inst_0(MASM_IR_RET);
-masm_section_append_inst(text, ret);
+# little-endian integers
+section.emit_u16(alloc, sec, v)                 Result[usize, str]
+section.emit_u32(alloc, sec, v)                 Result[usize, str]
+section.emit_u64(alloc, sec, v)                 Result[usize, str]
 ```
 
-### Instruction Storage
+All emit functions return the byte offset at which the data was written (for use with relocations and symbol offsets).
 
-Instructions are stored in a dynamic array that grows as needed:
+### Example: String Literal in .rodata
 
-```c
-void masm_section_append_inst(MasmSection *section, MasmInstruction inst);
+```mach
+val rodata_r: Result[*section.Section, str] =
+    masm.get_or_create_section(m, ".rodata", section.SEC_RODATA);
+val rodata: *section.Section = result_unwrap_ok[*section.Section, str](rodata_r);
+
+# record offset before writing
+val offset: usize = section.current_offset(rodata);
+
+# write string bytes
+val msg: str = "Hello";
+section.emit_bytes(alloc, rodata, msg::*u8, 6);  # includes null terminator
+```
+
+### Example: Global Variable in .data
+
+```mach
+val data_r: Result[*section.Section, str] =
+    masm.get_or_create_section(m, ".data", section.SEC_DATA);
+val data: *section.Section = result_unwrap_ok[*section.Section, str](data_r);
+
+val offset: usize = section.current_offset(data);
+section.emit_u64(alloc, data, 42);
 ```
 
 
-## Data Sections
+## Alignment
 
-Data sections contain raw bytes.
+### Section Alignment
 
-### `.data` - Initialized Mutable Data
+Set the required alignment for a section:
 
-Global variables with initial values:
-
-```c
-MasmSection *data = masm_get_or_create_section(masm, ".data", MASM_SECTION_DATA);
-
-int64_t counter = 0;
-masm_section_append_data(data, &counter, sizeof(counter));
+```mach
+section.set_align(sec, 16);   # 16-byte alignment
 ```
 
-### `.rodata` - Read-Only Data
+### Common Alignments
 
-Constants, string literals, float literals:
+| Type | Alignment |
+|------|-----------|
+| `u8`, `i8` | 1 byte |
+| `u16`, `i16` | 2 bytes |
+| `u32`, `i32`, `f32` | 4 bytes |
+| `u64`, `i64`, `f64`, `ptr` | 8 bytes |
 
-```c
-MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
 
-const char *msg = "Hello, World!";
-masm_section_append_data(rodata, msg, strlen(msg) + 1);
+## Relocations
+
+Relocation entries track symbol references that must be resolved at link time.
+
+### Relocation Types
+
+| Type | Value | Description |
+|------|-------|-------------|
+| `RELOC_NONE` | 0 | No relocation |
+| `RELOC_ABS64` | 1 | 64-bit absolute address |
+| `RELOC_REL32` | 2 | 32-bit PC-relative |
+| `RELOC_CALL32` | 3 | 32-bit call (maps to PLT/stub) |
+| `RELOC_ABS32` | 4 | 32-bit absolute (zero-extended) |
+| `RELOC_ABS32S` | 5 | 32-bit absolute (sign-extended) |
+
+### Relocation Structure
+
+```mach
+pub rec Relocation {
+    offset:      usize;     # byte offset within section
+    symbol_name: str;       # name of the referenced symbol
+    rtype:       RelocKind;
+    addend:      i64;
+}
 ```
 
-### `.bss` - Uninitialized Data
+### Adding Relocations
 
-Zero-initialized variables (doesn't occupy file space):
-
-```c
-MasmSection *bss = masm_get_or_create_section(masm, ".bss", MASM_SECTION_BSS);
-
-// reserve 1024 bytes
-masm_section_append_zero(bss, 1024);
+```mach
+section.add_relocation(alloc, sec, offset, symbol_name, section.RELOC_REL32, addend)
 ```
 
-### Data Manipulation Functions
+### Querying Relocations
 
-```c
-// append raw bytes
-void masm_section_append_data(MasmSection *section, const void *data, size_t size);
+```mach
+section.has_relocations(sec)          bool
+section.get_relocation(sec, index)    *Relocation
+```
 
-// append zero bytes (for .bss or alignment)
-void masm_section_append_zero(MasmSection *section, size_t size);
+
+## Patching
+
+Overwrite a previously written value (e.g., to back-patch a branch target or call offset):
+
+```mach
+section.patch_i32(sec, offset, value)    # overwrite 4 bytes at offset
+section.patch_i64(sec, offset, value)    # overwrite 8 bytes at offset
+```
+
+
+## Query Helpers
+
+```mach
+section.current_offset(sec)    usize   # bytes written so far
+section.is_text(sec)           bool
+section.is_data(sec)           bool
+section.is_rodata(sec)         bool
+section.is_bss(sec)            bool
+```
+
+
+## Cleanup
+
+```mach
+section.destroy(alloc, sec)
 ```
 
 
@@ -158,109 +231,6 @@ During object file emission, sections are laid out in a standard order:
 ├──────────────────┤
 │  Section Headers │
 └──────────────────┘
-```
-
-
-## Common Patterns
-
-### Function Definition
-
-```c
-MasmSection *text = masm_get_or_create_section(masm, ".text", MASM_SECTION_TEXT);
-
-// function label
-masm_section_append_inst(text, masm_inst_1(MASM_IR_LABEL, 
-    masm_operand_symbol("my_function")));
-
-// prologue
-masm_section_append_inst(text, masm_inst_1(MASM_IR_STACK_FRAME, 
-    masm_operand_imm(16)));
-
-// body
-// ...
-
-// return
-masm_section_append_inst(text, masm_inst_1(MASM_IR_RET, result));
-```
-
-### String Literal
-
-```c
-MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
-
-// add string data
-size_t offset = rodata->data_size;
-const char *str = "Hello";
-masm_section_append_data(rodata, str, strlen(str) + 1);
-
-// create symbol pointing to string
-MasmSymbol *sym = masm_symbol_create("__str_0", MASM_SYMBOL_DATA, MASM_BIND_LOCAL);
-sym->section_name = strdup(".rodata");
-sym->offset = offset;
-sym->size = strlen(str) + 1;
-masm_add_symbol(masm, sym);
-```
-
-### Global Variable
-
-```c
-MasmSection *data = masm_get_or_create_section(masm, ".data", MASM_SECTION_DATA);
-
-// add initial value
-size_t offset = data->data_size;
-int64_t value = 42;
-masm_section_append_data(data, &value, sizeof(value));
-
-// create symbol
-MasmSymbol *sym = masm_symbol_create("global_var", MASM_SYMBOL_DATA, MASM_BIND_GLOBAL);
-sym->section_name = strdup(".data");
-sym->offset = offset;
-sym->size = sizeof(value);
-masm_add_symbol(masm, sym);
-```
-
-### Float Literal
-
-Float literals cannot be immediate operands on most architectures, so they are stored in `.rodata`:
-
-```c
-MasmSection *rodata = masm_get_or_create_section(masm, ".rodata", MASM_SECTION_RODATA);
-
-// emit float value
-size_t offset = rodata->data_size;
-double value = 3.14159;
-masm_section_append_data(rodata, &value, sizeof(value));
-
-// create synthetic symbol
-MasmSymbol *sym = masm_symbol_create("__float_0", MASM_SYMBOL_DATA, MASM_BIND_LOCAL);
-sym->section_name = strdup(".rodata");
-sym->offset = offset;
-sym->size = sizeof(value);
-masm_add_symbol(masm, sym);
-```
-
-
-## Alignment
-
-Data sections should maintain proper alignment for their contents:
-
-| Type | Alignment |
-|------|-----------|
-| `u8`, `i8` | 1 byte |
-| `u16`, `i16` | 2 bytes |
-| `u32`, `i32`, `f32` | 4 bytes |
-| `u64`, `i64`, `f64`, `ptr` | 8 bytes |
-
-Padding can be added with `masm_section_append_zero()`:
-
-```c
-// ensure 8-byte alignment
-size_t align = 8;
-size_t current = section->data_size;
-size_t padding = (align - (current % align)) % align;
-if (padding > 0) {
-    masm_section_append_zero(section, padding);
-}
 ```
 
 

@@ -5,11 +5,11 @@
 
 ### Binary Operators
 
-All binary operators are left-associative, listed from lowest to highest precedence:
+All binary operators are left-associative **except assignment** (`=`), which is right-associative. Listed from lowest to highest precedence:
 
 | Precedence | Operators | Description |
 |------------|-----------|-------------|
-| 1 | `=` | Assignment |
+| 1 | `=` | Assignment (right-associative) |
 | 2 | `\|\|` | Logical OR |
 | 3 | `&&` | Logical AND |
 | 4 | `\|` | Bitwise OR |

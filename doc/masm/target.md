@@ -15,103 +15,84 @@ A MASM target is a combination of four independent components:
 
 Each component can be extended independently, allowing for flexible platform support.
 
+Target configuration is defined in `src/compiler/target.mach`.
+
 
 ## Target Structure
 
-```c
-typedef struct MasmTarget {
-    MasmTargetISA isa;
-    MasmTargetABI abi;
-    MasmTargetOS  os;
-    MasmTargetOF  of;
-} MasmTarget;
+```mach
+pub rec Target {
+    name:       str;              # full triple: "x86_64-linux-elf"
+    arch:       str;              # architecture component
+    os_name:    str;              # OS component
+    format:     str;              # object format component
+    isa:        isa.ISA;          # instruction set interface
+    abi:        abi.ABI;          # calling convention interface
+    of:         of.ObjectFormat;  # object format interface (relocatable .o)
+    ef:         of.ExecFormat;    # executable format interface (linked binary)
+    obj_reader: of.ObjectReader;  # object reader interface (.o → ObjFile)
+    os:         os.OS;            # operating system interface
+    di:         di.DebugInfo;     # debug information interface
+    ptr_size:   usize;            # pointer size in bytes
+    ptr_align:  usize;            # pointer alignment in bytes
+    endian:     u8;               # 0 = little, 1 = big
+}
 ```
 
-### Creating Targets
+### Creating a Target
 
-**Native Target** - Detect host platform automatically:
+Targets are created by parsing a target triple of the form `"<arch>-<os>-<format>"`:
 
-```c
-MasmTarget target = masm_target_native();
+```mach
+use target: mach.compiler.target;
+
+val r: Result[target.Target, str] = target.select("x86_64-linux-elf", alloc);
 ```
 
-**Explicit Target** - Specify all components:
+This selects and composes all four interface implementations (ISA, ABI, OF, OS) automatically.
 
-```c
-MasmTarget target = masm_target_create(
-    MASM_ISA_X86_64,
-    MASM_ABI_SYSV64,
-    MASM_OS_LINUX,
-    MASM_OF_ELF
-);
-```
+
+## Target Triples
+
+The triple format is `"<arch>-<os>-<format>"`.
+
+| Component | Supported Values |
+|-----------|-----------------|
+| arch | `x86_64` |
+| os | `linux` |
+| format | `elf` |
+
+**Example**: `"x86_64-linux-elf"`
 
 
 ## ISA (Instruction Set Architecture)
 
 The ISA defines the register set, instruction encoding, and machine-level operations.
+It is selected automatically based on the `arch` component of the triple.
 
-### Supported ISAs
+### ISA Interface
 
-| Enum | Description |
-|------|-------------|
-| `MASM_ISA_X86_64` | AMD64 / Intel 64 |
+The `isa.ISA` record (defined in `src/compiler/isa.mach`) provides hooks for:
 
-### ISA Specification Interface
-
-Each ISA provides a `MasmISASpec` with the following hooks:
-
-```c
-typedef struct MasmISASpec {
-    // register role providers
-    MasmOperand (*reg_result)(uint8_t size);
-    MasmOperand (*reg_tmp0)(uint8_t size);
-    MasmOperand (*reg_tmp1)(uint8_t size);
-    MasmOperand (*reg_div_hi)(uint8_t size);
-    MasmOperand (*reg_div_lo)(uint8_t size);
-    MasmOperand (*reg_arg)(int index, uint8_t size);
-    MasmOperand (*reg_sp)(uint8_t size);
-    MasmOperand (*reg_fp)(uint8_t size);
-    
-    // register metadata
-    uint32_t       reg_count;
-    const uint32_t *scratch_regs;
-    uint8_t        scratch_count;
-    const uint32_t *reserved_regs;
-    uint8_t        reserved_count;
-    
-    // opcode hooks
-    uint32_t (*op_syscall)();
-    
-    // inline asm parsing
-    MasmOperand (*parse_reg)(const char *name, uint8_t ptr_size);
-    void (*parse_inline_asm)(struct MasmSection *section, 
-                             const char *content, 
-                             uint8_t ptr_size);
-    
-    // instruction selection
-    void (*isel)(struct Masm *masm);
-    
-    // binary encoding
-    int (*encode)(MasmInstruction inst, uint8_t *buffer, size_t size);
-} MasmISASpec;
-```
+- Register role providers (`reg_result`, `reg_arg`, `reg_fp`, `reg_sp`, etc.)
+- Register metadata (scratch registers, reserved registers)
+- Instruction selection (`isel`)
+- Binary encoding (`encode`)
+- Inline assembly parsing
 
 ### x86_64 Registers
 
-The x86_64 ISA defines 16 general-purpose registers:
-
-| Register | ID | Purpose |
-|----------|-----|---------|
-| RAX | 0 | Return value, accumulator |
-| RCX | 1 | 4th integer argument |
-| RDX | 2 | 3rd integer argument |
-| RBX | 3 | Callee-saved |
-| RSP | 4 | Stack pointer |
-| RBP | 5 | Frame pointer |
-| RSI | 6 | 2nd integer argument |
-| RDI | 7 | 1st integer argument |
-| R8-R15 | 8-15 | Additional registers |
+| ID | 64-bit | 32-bit | 16-bit | 8-bit |
+|----|--------|--------|--------|-------|
+| 0 | RAX | EAX | AX | AL |
+| 1 | RCX | ECX | CX | CL |
+| 2 | RDX | EDX | DX | DL |
+| 3 | RBX | EBX | BX | BL |
+| 4 | RSP | ESP | SP | SPL |
+| 5 | RBP | EBP | BP | BPL |
+| 6 | RSI | ESI | SI | SIL |
+| 7 | RDI | EDI | DI | DIL |
+| 8-15 | R8-R15 | R8D-R15D | R8W-R15W | R8B-R15B |
 
 Plus XMM0-XMM15 for floating-point operations.
 
@@ -119,57 +100,29 @@ Plus XMM0-XMM15 for floating-point operations.
 ## ABI (Application Binary Interface)
 
 The ABI defines calling conventions, parameter passing, and register usage rules.
+It is selected automatically based on the ISA and OS.
 
-### Supported ABIs
+### ABI Interface
 
-| Enum | Description |
-|------|-------------|
-| `MASM_ABI_SYSV64` | System V AMD64 (Linux, macOS, BSD) |
+The `abi.ABI` record (defined in `src/compiler/abi.mach`) provides:
 
-### ABI Specification Interface
-
-```c
-typedef struct MasmABISpec {
-    uint8_t pointer_size;
-    uint8_t stack_align;
-    bool    has_red_zone;
-    
-    // integer argument registers
-    const uint32_t *int_arg_regs;
-    uint8_t        int_arg_count;
-    
-    // integer return registers
-    const uint32_t *int_ret_regs;
-    uint8_t        int_ret_count;
-    
-    // floating-point argument registers
-    const uint32_t *float_arg_regs;
-    uint8_t        float_arg_count;
-    
-    // floating-point return registers
-    const uint32_t *float_ret_regs;
-    uint8_t        float_ret_count;
-} MasmABISpec;
-```
+- Integer and float argument register lists
+- Return register specification
+- Stack alignment and pointer size
 
 ### System V AMD64 Convention
 
-**Integer Parameters** (in order):
-1. RDI
-2. RSI
-3. RDX
-4. RCX
-5. R8
-6. R9
-7. Stack (right-to-left)
+| Parameters | Registers |
+|-----------|-----------|
+| Integer (1st–6th) | RDI, RSI, RDX, RCX, R8, R9 |
+| Integer (7th+) | Stack (right-to-left) |
+| Float (1st–8th) | XMM0–XMM7 |
+| Float (9th+) | Stack |
 
-**Float Parameters** (in order):
-1. XMM0-XMM7
-2. Stack
-
-**Return Values**:
-- Integer: RAX (+ RDX for 128-bit)
-- Float: XMM0
+| Return | Register |
+|--------|----------|
+| Integer / Pointer | RAX |
+| Float | XMM0 |
 
 See [ABI](abi.md) for complete calling convention details.
 
@@ -177,40 +130,29 @@ See [ABI](abi.md) for complete calling convention details.
 ## OS (Operating System)
 
 The OS component defines system call conventions and platform-specific behaviors.
+It is selected automatically based on the `os` component of the triple.
 
-### Supported Operating Systems
+### Linux Syscall Convention (x86_64)
 
-| Enum | Description |
-|------|-------------|
-| `MASM_OS_LINUX` | Linux kernel |
+| Role | Register |
+|------|----------|
+| Syscall number | RAX |
+| 1st arg | RDI |
+| 2nd arg | RSI |
+| 3rd arg | RDX |
+| 4th arg | R10 |
+| 5th arg | R8 |
+| 6th arg | R9 |
 
-### Linux Syscall Convention
-
-Syscalls on Linux x86_64 use:
-- RAX: syscall number
-- RDI, RSI, RDX, R10, R8, R9: arguments
-- Invoke with `syscall` instruction
-- Return value in RAX
+Invoked with the `syscall` instruction. Return value in RAX.
 
 
 ## OF (Object Format)
 
 The object format defines the binary container structure for compiled code.
+It is selected automatically based on the `format` component of the triple.
 
-### Supported Object Formats
-
-| Enum | Description |
-|------|-------------|
-| `MASM_OF_ELF` | Executable and Linkable Format |
-
-### Object Format Specification Interface
-
-```c
-typedef struct MasmOFSpec {
-    const char *name;
-    int (*write_object)(Masm *masm, const char *filename);
-} MasmOFSpec;
-```
+The `of.ObjectFormat` and `of.ExecFormat` interfaces are defined in `src/compiler/of.mach`.
 
 ### ELF Sections
 
@@ -224,63 +166,19 @@ The ELF backend generates standard sections:
 | `.bss` | Uninitialized data |
 
 
-## String Conversions
+## Adding Platform Support
 
-Utility functions for target component names:
+To add support for a new target (e.g., ARM64/Linux/ELF):
 
-```c
-// to string
-const char *masm_target_isa_name(MasmTargetISA isa);
-const char *masm_target_abi_name(MasmTargetABI abi);
-const char *masm_target_os_name(MasmTargetOS os);
-const char *masm_target_of_name(MasmTargetOF of);
+1. **ISA Implementation** — Create a new module under `src/compiler/isa/`:
+   - Implement the `isa.ISA` interface (register roles, isel, encode)
 
-// from string
-MasmTargetISA masm_target_isa_from_name(const char *name);
-MasmTargetABI masm_target_abi_from_name(const char *name);
-MasmTargetOS  masm_target_os_from_name(const char *name);
-MasmTargetOF  masm_target_of_from_name(const char *name);
-```
+2. **ABI Implementation** — Create a new module under `src/compiler/abi/`:
+   - Implement the `abi.ABI` interface (argument registers, return registers)
 
+3. **Register** — Add recognition in `target.select()` for the new arch/os/format strings
 
-## Adding a New Target Component
-
-### New ISA
-
-1. Create header `masm/isa/<name>/<name>.h`:
-   - Define opcode enum (`MasmXxxOpcode`)
-   - Declare register helpers and encode function
-
-2. Create implementation `masm/isa/<name>/<name>.c`:
-   - Implement `MasmISASpec` interface
-   - Provide isel (IR → target opcodes)
-   - Provide encode (instruction → bytes)
-
-3. Add enum value to `MasmTargetISA` in `masm/target.h`
-
-4. Add opcode kind to `MasmOpcodeKind` in `masm/ir.h`
-
-5. Register in `masm_isa_spec_select()` in `masm/isa/spec.c`
-
-### New ABI
-
-1. Create `masm/abi/<name>.c`:
-   - Define argument/return register arrays
-   - Implement `MasmABISpec` structure
-
-2. Add enum value to `MasmTargetABI` in `masm/target.h`
-
-3. Register in `masm_abi_spec_select()` in `masm/abi/spec.c`
-
-### New Object Format
-
-1. Create `masm/of/<name>.c`:
-   - Implement `write_object()` function
-   - Define `MasmOFSpec` structure
-
-2. Add enum value to `MasmTargetOF` in `masm/target.h`
-
-3. Register in `masm_of_spec_select()` in `masm/of/spec.c`
+No changes are needed to the lowering phase, IR definitions, or MASM context — they are platform-independent.
 
 
 ## See Also

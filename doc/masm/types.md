@@ -1,230 +1,118 @@
 # Types
 
-This document describes the type system used in MASM.
+This document describes the machine-level type system used in MASM.
 
 ## Overview
 
 MASM carries type information throughout the compilation pipeline to enable correct instruction selection, register allocation, and memory layout computation.
 
+The MASM type system is defined in `src/compiler/masm/type.mach`. It is a minimal machine-level representation: each type records only its size, alignment, and kind. There are no recursive nested types — compound types (arrays, structs) store their total size and element alignment directly.
+
 
 ## Type Kinds
 
-| Kind | Size | Description |
-|------|------|-------------|
-| `MASM_TYPE_VOID` | 0 | No type / void return |
-| `MASM_TYPE_I8` | 1 | Signed 8-bit integer |
-| `MASM_TYPE_U8` | 1 | Unsigned 8-bit integer |
-| `MASM_TYPE_I16` | 2 | Signed 16-bit integer |
-| `MASM_TYPE_U16` | 2 | Unsigned 16-bit integer |
-| `MASM_TYPE_I32` | 4 | Signed 32-bit integer |
-| `MASM_TYPE_U32` | 4 | Unsigned 32-bit integer |
-| `MASM_TYPE_I64` | 8 | Signed 64-bit integer |
-| `MASM_TYPE_U64` | 8 | Unsigned 64-bit integer |
-| `MASM_TYPE_F32` | 4 | 32-bit IEEE 754 float |
-| `MASM_TYPE_F64` | 8 | 64-bit IEEE 754 double |
-| `MASM_TYPE_PTR` | 8 | Pointer (64-bit on x86_64) |
-| `MASM_TYPE_ARRAY` | varies | Fixed-size array |
-| `MASM_TYPE_RECORD` | varies | Record (struct) |
-| `MASM_TYPE_FUNCTION` | N/A | Function signature |
+| Kind | Value | Description |
+|------|-------|-------------|
+| `TK_VOID` | 0 | No type / void return |
+| `TK_INT` | 1 | Integer (signed or unsigned) |
+| `TK_FLOAT` | 2 | IEEE 754 floating-point |
+| `TK_PTR` | 3 | Pointer |
+| `TK_ARRAY` | 4 | Fixed-size array |
+| `TK_STRUCT` | 5 | Record (struct) |
 
 
 ## Type Structure
 
-```c
-typedef struct MasmType {
-    MasmTypeKind kind;
-    size_t       size;      // size in bytes
-    size_t       align;     // alignment in bytes
-    
-    // for arrays
-    MasmType *elem_type;
-    size_t    elem_count;
-    
-    // for records
-    struct {
-        MasmType **fields;
-        size_t     count;
-        size_t    *offsets;
-    } record;
-    
-    // for functions
-    struct {
-        MasmType  *ret_type;
-        MasmType **params;
-        size_t     param_count;
-        bool       is_variadic;
-    } function;
-} MasmType;
+```mach
+pub rec Type {
+    size:  usize;     # size in bytes
+    align: usize;     # alignment in bytes
+    kind:  TypeKind;
+}
+```
+
+All compound type information (element type, field offsets, etc.) lives in the semantic layer. At the MASM level, only `size`, `align`, and `kind` matter for code generation.
+
+
+## Constructors
+
+```mach
+type.void_type()                                    # size 0, align 1
+type.int_type(size: usize)                          # TK_INT
+type.float_type(size: usize)                        # TK_FLOAT
+type.ptr_type(ptr_size: usize)                      # TK_PTR
+type.array_type(elem_size, elem_align, count)        # TK_ARRAY
+type.struct_type(size: usize, align: usize)          # TK_STRUCT
+```
+
+### Convenience Constructors
+
+```mach
+type.i8()     # int_type(1)
+type.i16()    # int_type(2)
+type.i32()    # int_type(4)
+type.i64()    # int_type(8)
+type.f32()    # float_type(4)
+type.f64()    # float_type(8)
 ```
 
 
 ## Primitive Types
 
-Primitive types have fixed sizes and alignments:
-
-| Type | Size | Alignment | Register Class |
-|------|------|-----------|----------------|
-| `i8`, `u8` | 1 | 1 | Integer |
-| `i16`, `u16` | 2 | 2 | Integer |
-| `i32`, `u32` | 4 | 4 | Integer |
-| `i64`, `u64` | 8 | 8 | Integer |
-| `f32` | 4 | 4 | Float (XMM) |
-| `f64` | 8 | 8 | Float (XMM) |
-| `ptr` | 8 | 8 | Integer |
-
-### Creating Primitives
-
-```c
-MasmType *t = masm_type_create(MASM_TYPE_I64);
-```
-
-Primitive type sizes and alignments are set automatically.
+| Type | Size | Alignment | Kind | Register Class |
+|------|------|-----------|------|----------------|
+| `i8`, `u8` | 1 | 1 | `TK_INT` | Integer |
+| `i16`, `u16` | 2 | 2 | `TK_INT` | Integer |
+| `i32`, `u32` | 4 | 4 | `TK_INT` | Integer |
+| `i64`, `u64` | 8 | 8 | `TK_INT` | Integer |
+| `f32` | 4 | 4 | `TK_FLOAT` | Float (XMM) |
+| `f64` | 8 | 8 | `TK_FLOAT` | Float (XMM) |
+| `ptr` | 8 | 8 | `TK_PTR` | Integer |
 
 
 ## Array Types
 
-Arrays are fixed-size sequences of elements.
-
-### Structure
-
-- `elem_type` - Type of each element
-- `elem_count` - Number of elements
-- `size` - `elem_type->size * elem_count`
-- `align` - Same as `elem_type->align`
-
-### Creating Arrays
-
-```c
-MasmType *elem = masm_type_create(MASM_TYPE_I32);
-MasmType *arr = masm_type_create_array(elem, 10);
-// arr->size == 40 (10 * 4)
-// arr->align == 4
-```
-
-### Example
-
-Mach code:
-```mach
-val data: [4]u64 = [4]u64{ 1, 2, 3, 4 };
-```
-
-MASM type:
-```c
-elem_type: MASM_TYPE_U64
-elem_count: 4
-size: 32
-align: 8
-```
-
-
-## Record Types
-
-Records (structs) are collections of named fields.
-
-### Structure
-
-- `record.fields` - Array of field types
-- `record.count` - Number of fields
-- `record.offsets` - Byte offset of each field
-- `size` - Total size including padding
-- `align` - Maximum alignment of any field
-
-### Creating Records
-
-```c
-MasmType *fields[2];
-fields[0] = masm_type_create(MASM_TYPE_I32);  // x
-fields[1] = masm_type_create(MASM_TYPE_I32);  // y
-MasmType *point = masm_type_create_record(fields, 2);
-// point->size == 8
-// point->align == 4
-// point->record.offsets == [0, 4]
-```
-
-### Layout Rules
-
-Fields are laid out sequentially with padding for alignment:
+Arrays store total size and element alignment.
 
 ```mach
-rec Example {
-    a: u8;   # offset 0, size 1
-    # padding: 7 bytes for alignment
-    b: u64;  # offset 8, size 8
-    c: u8;   # offset 16, size 1
-    # padding: 7 bytes for struct alignment
-}
-# total size: 24, alignment: 8
-```
-
-### Example
-
-Mach code:
-```mach
-rec Point {
-    x: f64;
-    y: f64;
-}
-```
-
-MASM type:
-```c
-record.fields: [f64, f64]
-record.count: 2
-record.offsets: [0, 8]
-size: 16
-align: 8
+# [4]u64 → total size 32, align 8
+val t: type.Type = type.array_type(8, 8, 4);
+# t.size  == 32
+# t.align == 8
+# t.kind  == TK_ARRAY
 ```
 
 
-## Function Types
+## Struct Types
 
-Function types describe callable signatures.
-
-### Structure
-
-- `function.ret_type` - Return type (or void)
-- `function.params` - Array of parameter types
-- `function.param_count` - Number of parameters
-- `function.is_variadic` - True if function accepts `...`
-
-### Creating Functions
-
-```c
-MasmType *params[2];
-params[0] = masm_type_create(MASM_TYPE_I64);
-params[1] = masm_type_create(MASM_TYPE_I64);
-MasmType *ret = masm_type_create(MASM_TYPE_I64);
-
-MasmType *fn = masm_type_create_function(ret, params, 2, false);
-```
-
-### Example
-
-Mach code:
-```mach
-fun add(a: i64, b: i64) i64;
-```
-
-MASM type:
-```c
-function.ret_type: i64
-function.params: [i64, i64]
-function.param_count: 2
-function.is_variadic: false
-```
-
-### Variadic Functions
+Struct types are created from the final computed size and alignment (after layout by the semantic layer):
 
 ```mach
-ext "C:printf" printf: fun(fmt: *u8, ...) i32;
+# rec Point { x: f64; y: f64; }  →  size 16, align 8
+val t: type.Type = type.struct_type(16, 8);
 ```
 
-MASM type:
-```c
-function.ret_type: i32
-function.params: [ptr]
-function.param_count: 1
-function.is_variadic: true
+
+## Utilities
+
+### Alignment Padding
+
+```mach
+type.align_to(size: usize, align: usize) usize
+```
+
+Rounds `size` up to the nearest multiple of `align` (must be a power of 2).
+
+```mach
+type.align_to(3, 4)   # → 4
+type.align_to(9, 8)   # → 16
+```
+
+### Type Predicates
+
+```mach
+type.is_float(t: *Type) bool       # TK_FLOAT
+type.is_aggregate(t: *Type) bool   # TK_STRUCT or TK_ARRAY
 ```
 
 
@@ -234,51 +122,32 @@ Types influence instruction selection:
 
 ### Register Class
 
-```c
-if (type->kind == MASM_TYPE_F32 || type->kind == MASM_TYPE_F64) {
-    // use XMM registers
-    reg = allocate_float_reg();
-} else {
-    // use general-purpose registers
-    reg = allocate_int_reg();
-}
+```mach
+if (type.is_float(?t)) {
+    # use XMM registers (SSE instructions)
+} # else: general-purpose registers
 ```
 
 ### Instruction Selection
 
-```c
-// addition
-if (is_float_type(type)) {
-    emit(MASM_OP_X86_ADDSD, dst, src);  // SSE
-} else {
-    emit(MASM_OP_X86_ADD_RR, dst, src);  // integer
-}
+```mach
+# integer add
+ir.block_append(alloc, block, ir.OP_ADD, dst, src1, src2, ir.CC_NONE);
+
+# float add
+ir.block_append(alloc, block, ir.OP_FADD, dst, src1, src2, ir.CC_NONE);
 ```
 
-### Memory Operations
+### Size Field
 
-```c
-// load
-if (type->kind == MASM_TYPE_F64) {
-    emit(MASM_OP_X86_MOVQ, dst, mem);   // movsd for f64
-} else if (type->size == 8) {
-    emit(MASM_OP_X86_MOV_RM, dst, mem); // mov for i64/ptr
-} else if (type->size == 4) {
-    emit(MASM_OP_X86_MOV_RM, dst, mem); // mov for i32
-}
+Each `Inst` carries a `size` field (in bytes) that the encoder uses to select the correct instruction variant:
+
+```mach
+block.insts[idx].size = t.size::u8;
 ```
 
 
-## Size and Alignment
-
-### Querying
-
-```c
-size_t size = type->size;
-size_t align = type->align;
-```
-
-### Common Values
+## Common Size/Alignment Values
 
 | Type | Size | Alignment |
 |------|------|-----------|
@@ -287,30 +156,9 @@ size_t align = type->align;
 | `u32` / `i32` / `f32` | 4 | 4 |
 | `u64` / `i64` / `f64` / `ptr` | 8 | 8 |
 
-### Computing Padded Size
-
-For arrays and stack allocation:
-
-```c
-size_t aligned_size(size_t size, size_t align) {
-    return (size + align - 1) & ~(align - 1);
-}
-```
-
-
-## Cleanup
-
-Types should be destroyed when no longer needed:
-
-```c
-void masm_type_destroy(MasmType *type);
-```
-
-This recursively frees nested types (array elements, record fields, function parameters).
-
 
 ## See Also
 
-- [Operands](operands.md) - Type operands in instructions
+- [Operands](operands.md) - How types affect operand size fields
 - [ABI](abi.md) - How types affect calling conventions
 - [Code Generation](codegen.md) - Type-directed instruction selection

@@ -82,18 +82,18 @@ mach run .
 The generated `src/main.mach`:
 
 ```mach
-use          std.runtime;
-use print:   std.print;
+use print: std.print;
 
+# main: program entry point.
 $main.symbol = "main";
 fun main(argc: i64, argv: &&u8) i64 {
-    print.println("Hello, World!");
+    print.println("Hello, Mach!");
     ret 0;
 }
 ```
 
 Key points:
-- `use std.runtime;` imports the runtime startup code (required for executables).
+- `use print: std.print;` imports the print module under the `print` alias.
 - `$main.symbol = "main";` sets the linker symbol name for the function below it.
 - `fun main(argc: i64, argv: &&u8) i64` is the program entrypoint with C-compatible signature.
 - `ret 0;` returns the exit code.

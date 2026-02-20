@@ -6,123 +6,108 @@ This document describes symbol management in MASM.
 
 Symbols are named locations within a MASM module. They associate names with positions in sections, enabling linking, function calls, and global variable access.
 
+Symbol management is defined in `src/compiler/masm/symbol.mach`.
 
-## Symbol Kinds
 
-| Kind | Description | Example |
-|------|-------------|---------|
-| `MASM_SYMBOL_LABEL` | Code label within a function | `.loop_start` |
-| `MASM_SYMBOL_FUNCTION` | Function entry point | `main`, `add` |
-| `MASM_SYMBOL_DATA` | Data location | `global_counter`, `__str_0` |
+## Symbol Structure
+
+```mach
+pub rec Symbol {
+    name:     str;
+    binding:  SymBinding;
+    sym_type: SymKind;
+    section:  u64;       # section index (not a pointer)
+    offset:   usize;     # byte offset within section
+    size:     usize;
+    defined:  bool;      # true = defined here, false = external reference
+    src_file: str;       # source file path (for debug info)
+    src_line: i32;       # source line number (for debug info)
+}
+```
 
 
 ## Symbol Binding
 
 Binding determines symbol visibility during linking:
 
-| Binding | Description | Use Case |
-|---------|-------------|----------|
-| `MASM_BIND_LOCAL` | Visible only within this module | Internal helpers, string literals |
-| `MASM_BIND_GLOBAL` | Visible to linker, exported | Public functions, `pub` declarations |
-| `MASM_BIND_WEAK` | Can be overridden by another definition | Default implementations |
+| Constant | Value | Description | Use Case |
+|----------|-------|-------------|----------|
+| `BIND_LOCAL` | 0 | Visible only within this module | Internal helpers, string literals |
+| `BIND_GLOBAL` | 1 | Visible to linker, exported | Public functions, `pub` declarations |
+| `BIND_WEAK` | 2 | Can be overridden by another definition | Default implementations |
 
 
-## Symbol Structure
+## Symbol Kinds
 
-```c
-typedef struct MasmSymbol {
-    char          *name;         // symbol name
-    MasmSymbolKind kind;         // label, function, or data
-    MasmSymbolBind bind;         // local, global, or weak
-    
-    // location within the module
-    char    *section_name;       // section containing this symbol
-    uint64_t offset;             // byte offset within section
-    size_t   size;               // size in bytes (0 for labels)
-} MasmSymbol;
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `SYM_NONE` | 0 | Unspecified |
+| `SYM_FUNC` | 1 | Function entry point |
+| `SYM_OBJECT` | 2 | Data object (global variable, string literal) |
+| `SYM_SECTION` | 3 | Section symbol |
+| `SYM_FILE` | 4 | Source file name |
+
+
+## Symbol Operations
+
+### Creating a Symbol
+
+```mach
+use sym: mach.compiler.masm.symbol;
+
+val r: Result[*sym.Symbol, str] = sym.create(alloc, "my_function");
+val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](r);
+s.binding = sym.BIND_GLOBAL;
+s.sym_type = sym.SYM_FUNC;
+```
+
+### Defining a Symbol
+
+```mach
+# mark as defined at section[0] offset 0, size 0
+sym.define(s, 0, 0, 0);
+```
+
+### Adding to a Context
+
+```mach
+use masm: mach.compiler.masm;
+
+masm.add_symbol(m, s);
+```
+
+### Looking Up a Symbol
+
+```mach
+val found: *sym.Symbol = masm.get_symbol(m, "my_function");
+```
+
+The context maintains an O(1) hash map for symbol lookup by name.
+
+### Query Helpers
+
+```mach
+sym.is_defined(s)    bool   # s.defined
+sym.is_global(s)     bool   # s.binding == BIND_GLOBAL
+sym.is_function(s)   bool   # s.sym_type == SYM_FUNC
 ```
 
 
-## Creating Symbols
+## Symbol Table
 
-```c
-MasmSymbol *sym = masm_symbol_create(
-    "my_function",          // name
-    MASM_SYMBOL_FUNCTION,   // kind
-    MASM_BIND_GLOBAL        // binding
-);
+For standalone symbol table use (outside a MASM context):
 
-// set location
-sym->section_name = strdup(".text");
-sym->offset = 0;
-sym->size = 42;  // function size in bytes
-```
-
-
-## Managing Symbols
-
-### Adding to Module
-
-```c
-masm_add_symbol(masm, symbol);
-```
-
-### Looking Up
-
-```c
-MasmSymbol *sym = masm_get_symbol(masm, "my_function");
-if (sym != NULL) {
-    // symbol exists
+```mach
+pub rec SymbolTable {
+    symbols: *Symbol;
+    count:   i32;
+    cap:     i32;
 }
-```
 
-
-## Symbol Types
-
-### Function Symbols
-
-Function symbols mark the entry points of callable functions:
-
-```c
-MasmSymbol *fn = masm_symbol_create("add", MASM_SYMBOL_FUNCTION, MASM_BIND_GLOBAL);
-fn->section_name = strdup(".text");
-fn->offset = text_section->data_size;  // current position in .text
-fn->size = 0;  // filled in after function is emitted
-```
-
-After emitting the function body, update the size:
-
-```c
-fn->size = text_section->data_size - fn->offset;
-```
-
-### Data Symbols
-
-Data symbols reference global variables and constants:
-
-```c
-// global variable
-MasmSymbol *var = masm_symbol_create("counter", MASM_SYMBOL_DATA, MASM_BIND_GLOBAL);
-var->section_name = strdup(".data");
-var->offset = data_section->data_size;
-var->size = 8;  // i64
-
-// string literal (internal)
-MasmSymbol *str = masm_symbol_create("__str_0", MASM_SYMBOL_DATA, MASM_BIND_LOCAL);
-str->section_name = strdup(".rodata");
-str->offset = rodata_section->data_size;
-str->size = 14;  // "Hello, World!\0"
-```
-
-### Label Symbols
-
-Labels mark positions within functions for control flow:
-
-```c
-MasmSymbol *label = masm_symbol_create(".loop_body", MASM_SYMBOL_LABEL, MASM_BIND_LOCAL);
-label->section_name = strdup(".text");
-label->offset = current_offset;
-label->size = 0;  // labels have no size
+sym.table_create(alloc)                  Result[*SymbolTable, str]
+sym.table_add(alloc, tbl, sym_value)     i32          # returns index or -1
+sym.table_get(tbl, index)               *Symbol
+sym.table_destroy(alloc, tbl)
 ```
 
 
@@ -130,7 +115,7 @@ label->size = 0;  // labels have no size
 
 ### User-Defined Symbols
 
-- Function names: Match Mach identifier (may be mangled)
+- Function names: Match Mach identifier (may be mangled for generics)
 - Global variables: Match Mach identifier
 
 ### Compiler-Generated Symbols
@@ -149,7 +134,6 @@ Labels within functions use a dot prefix:
 
 | Pattern | Description |
 |---------|-------------|
-| `.L_N` | Generic label N |
 | `.if_then_N` | If-then branch |
 | `.if_else_N` | If-else branch |
 | `.if_end_N` | End of if statement |
@@ -162,21 +146,13 @@ Labels within functions use a dot prefix:
 
 During linking, symbols are resolved in this order:
 
-1. **Local symbols** - Resolved within the same module
-2. **Global symbols** - Matched across modules by name
-3. **External symbols** - Provided by libraries or system
+1. **Local symbols** — Resolved within the same module
+2. **Global symbols** — Matched across modules by name
+3. **External symbols** — Provided by libraries or system
 
 ### Relocations
 
-When code references a symbol, a relocation entry is created:
-
-```c
-// in code generation
-emit_call_relocation(ctx, "target_function", R_X86_64_PLT32);
-emit_data_relocation(ctx, "global_var", R_X86_64_PC32);
-```
-
-The linker fills in the actual addresses based on final layout.
+When code references a symbol, a relocation entry is created in the containing section. The linker fills in the actual addresses based on final layout. See [Sections](sections.md) for relocation types.
 
 
 ## External Symbols
@@ -184,10 +160,10 @@ The linker fills in the actual addresses based on final layout.
 External symbols reference functions or data provided by other modules or libraries:
 
 ```mach
-ext "C:printf" printf: fun(fmt: *u8, ...) i32;
+ext fun memcpy(dst: ptr, src: ptr, n: usize) ptr;
 ```
 
-These create undefined symbols that must be resolved at link time.
+These create undefined symbols (`defined = false`) that must be resolved at link time.
 
 
 ## ELF Symbol Table
@@ -195,74 +171,25 @@ These create undefined symbols that must be resolved at link time.
 When emitting ELF, symbols are written to the `.symtab` section:
 
 ```
-┌─────────────────────────────────┐
-│  Index 0: NULL symbol           │
-├─────────────────────────────────┤
-│  Local symbols (STB_LOCAL)      │
-│    - __str_0                    │
-│    - __float_0                  │
-│    - .loop_start                │
-├─────────────────────────────────┤
-│  Global symbols (STB_GLOBAL)    │
-│    - main                       │
-│    - add                        │
-│    - global_counter             │
-├─────────────────────────────────┤
-│  Undefined symbols              │
-│    - printf                     │
-│    - malloc                     │
-└─────────────────────────────────┘
++----------------------------------+
+|  Index 0: NULL symbol            |
++----------------------------------+
+|  Local symbols (STB_LOCAL)       |
+|    - __str_0                     |
+|    - __float_0                   |
++----------------------------------+
+|  Global symbols (STB_GLOBAL)     |
+|    - main                        |
+|    - add                         |
+|    - global_counter              |
++----------------------------------+
+|  Undefined symbols               |
+|    - printf                      |
+|    - malloc                      |
++----------------------------------+
 ```
 
 Local symbols must come before global symbols in ELF.
-
-
-## Common Patterns
-
-### Defining a Public Function
-
-```c
-// create symbol
-MasmSymbol *fn = masm_symbol_create("add", MASM_SYMBOL_FUNCTION, MASM_BIND_GLOBAL);
-fn->section_name = strdup(".text");
-fn->offset = text->data_size;
-
-// add to module
-masm_add_symbol(masm, fn);
-
-// emit function body
-// ...
-
-// update size
-fn->size = text->data_size - fn->offset;
-```
-
-### Defining an Internal Helper
-
-```c
-MasmSymbol *helper = masm_symbol_create("__helper", MASM_SYMBOL_FUNCTION, MASM_BIND_LOCAL);
-helper->section_name = strdup(".text");
-helper->offset = text->data_size;
-masm_add_symbol(masm, helper);
-```
-
-### Referencing a Symbol
-
-In IR, symbols are referenced via operands:
-
-```c
-MasmOperand target = masm_operand_symbol("printf");
-MasmInstruction call = masm_inst_2(MASM_IR_CALL, target, args);
-```
-
-
-## Cleanup
-
-```c
-void masm_symbol_destroy(MasmSymbol *symbol);
-```
-
-Symbols are typically owned by the MASM module and destroyed when the module is destroyed.
 
 
 ## See Also

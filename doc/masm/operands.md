@@ -9,46 +9,66 @@ Operands are the inputs and outputs of MASM instructions. Each operand has a kin
 
 ## Operand Kinds
 
-| Kind | Description | Example |
-|------|-------------|---------|
-| `MASM_OPERAND_NONE` | No operand (placeholder) | - |
-| `MASM_OPERAND_REGISTER` | Physical or virtual register | `%rax`, `%xmm0` |
-| `MASM_OPERAND_IMM` | Immediate constant | `42`, `-1` |
-| `MASM_OPERAND_MEMORY` | Memory reference | `[rbp - 8]` |
-| `MASM_OPERAND_SYMBOL` | Global symbol reference | `@global_var` |
-| `MASM_OPERAND_LABEL` | Code label reference | `.loop_start` |
-| `MASM_OPERAND_TYPE` | Type descriptor | `i64`, `f32` |
+| Kind | Value | Description | Example |
+|------|-------|-------------|---------|
+| `OPK_NONE` | 0 | No operand (unused slot) | - |
+| `OPK_REG` | 1 | Physical or virtual register | `%rax`, `%v42` |
+| `OPK_IMM` | 2 | Immediate constant | `42`, `-1` |
+| `OPK_MEM` | 3 | Memory reference | `[FP - 8]` |
+| `OPK_LABEL` | 4 | Code label reference | `.loop_start` |
+| `OPK_SYM` | 5 | Symbol reference (by index) | `@my_function` |
+
+
+## Operand Structure
+
+Operands are flat records with a kind discriminant. Fields are interpreted based on `kind`:
+
+```mach
+pub rec Operand {
+    kind:   ValueKind;    # discriminant (OPK_NONE, OPK_REG, etc.)
+    size:   u8;           # operand size in bytes
+    reg:    i32;          # register id (OPK_REG)
+    imm:    i64;          # immediate value (OPK_IMM)
+    base:   i32;          # base register for memory (OPK_MEM)
+    index:  i32;          # index register for memory (-1 = none)
+    scale:  i32;          # scale factor for memory (1, 2, 4, 8)
+    disp:   i64;          # displacement for memory
+    sym_id: u64;          # symbol index (OPK_SYM)
+    label:  str;          # label name (OPK_LABEL)
+}
+```
+
+Field interpretation by kind:
+
+| Kind | Fields used |
+|------|-------------|
+| `OPK_REG` | `reg`, `size` |
+| `OPK_IMM` | `imm`, `size` |
+| `OPK_MEM` | `base`, `index`, `scale`, `disp`, `size` |
+| `OPK_LABEL` | `label` |
+| `OPK_SYM` | `sym_id` |
 
 
 ## Register Operands
 
 Registers represent storage locations for values during execution.
 
-### Register Structure
+### Physical vs. Virtual Registers
 
-```c
-typedef struct MasmRegister {
-    uint32_t          id;     // register identifier
-    uint8_t           size;   // size in bytes (1, 2, 4, 8, 16)
-    MasmRegisterClass class;  // int or float
-} MasmRegister;
-```
+Register IDs below `VREG_START` (1024) are physical registers with ISA-specific numbering. IDs at or above `VREG_START` are virtual registers assigned by the lowering phase and resolved to physical registers during register allocation.
 
-### Register Classes
+Two special virtual registers are defined:
 
-| Class | Description | x86_64 Examples |
-|-------|-------------|-----------------|
-| `MASM_REG_CLASS_INT` | General-purpose integer | RAX, RBX, RCX, ... |
-| `MASM_REG_CLASS_FLOAT` | Floating-point / SIMD | XMM0, XMM1, ... |
+| Register | Value | Description |
+|----------|-------|-------------|
+| `VREG_FP` | `VREG_START - 1` | Virtual frame pointer, resolved to physical FP by regalloc |
+| `VREG_SP` | `VREG_START - 2` | Virtual stack pointer, resolved after frame size is known |
 
 ### Creating Register Operands
 
-```c
-// integer register
-MasmOperand reg = masm_operand_register(MASM_X86_RAX, 8);
-
-// floating-point register
-MasmOperand xmm = masm_operand_register_fp(0, 16);  // XMM0
+```mach
+val reg: Operand = ir.make_reg(MASM_X86_RAX, 8);    # physical register
+val vreg: Operand = ir.make_reg(vreg_id, 8);         # virtual register
 ```
 
 ### x86_64 Register IDs
@@ -74,69 +94,55 @@ Immediate operands represent constant values embedded directly in instructions.
 
 ### Creating Immediate Operands
 
-```c
-MasmOperand imm = masm_operand_imm(42);
-MasmOperand neg = masm_operand_imm(-1);
+```mach
+val imm: Operand = ir.make_imm(42, 8);     # 64-bit immediate
+val neg: Operand = ir.make_imm(-1, 4);     # 32-bit immediate
 ```
 
 ### Immediate Range
 
-Immediates are stored as `int64_t` and may be constrained by the target instruction encoding:
+Immediates are stored as `i64` and may be constrained by the target instruction encoding:
 - x86_64 most instructions: 32-bit sign-extended
 - x86_64 `mov` to 64-bit register: full 64-bit immediate
 
 
 ## Memory Operands
 
-Memory operands reference values in memory using base, index, scale, and displacement.
-
-### Memory Structure
-
-```c
-typedef struct MasmMemory {
-    MasmRegister base;   // base register
-    MasmRegister index;  // index register (optional)
-    uint8_t      scale;  // index scale: 1, 2, 4, or 8
-    int64_t      disp;   // displacement offset
-    uint8_t      size;   // access size in bytes
-} MasmMemory;
-```
+Memory operands reference values in memory using base register, optional index register, scale, and displacement.
 
 ### Addressing Modes
 
 **Simple**: `[base + disp]`
-```c
-MasmOperand mem = masm_operand_memory_simple(MASM_X86_RBP, -8, 8);
-// equivalent to: [rbp - 8]
+```mach
+val mem: Operand = ir.make_mem(VREG_FP, -1, 1, -8, 8);
+# equivalent to: [FP - 8]
 ```
 
 **Full**: `[base + index * scale + disp]`
-```c
-MasmRegister base = { MASM_X86_RBP, 8, MASM_REG_CLASS_INT };
-MasmRegister index = { MASM_X86_RCX, 8, MASM_REG_CLASS_INT };
-MasmOperand mem = masm_operand_memory(base, index, 4, 0, 8);
-// equivalent to: [rbp + rcx * 4]
+```mach
+val mem: Operand = ir.make_mem(base_reg, index_reg, 4, 0, 8);
+# equivalent to: [base + index * 4]
 ```
+
+An `index` of `-1` means no index register (simple addressing).
 
 ### Common Patterns
 
 | Pattern | Description | Example |
 |---------|-------------|---------|
-| `[rbp - N]` | Local variable | Stack-allocated locals |
-| `[rsp + N]` | Stack argument | Parameters beyond 6th |
-| `[rip + sym]` | Global access | RIP-relative addressing |
+| `[FP - N]` | Local variable | Stack-allocated locals |
+| `[SP + N]` | Stack argument | Outgoing call arguments |
 | `[base + idx*scale]` | Array access | Indexed array element |
 
 
 ## Symbol Operands
 
-Symbol operands reference named locations in the program (functions, global variables, string literals).
+Symbol operands reference named locations in the program (functions, global variables, string literals) by index into the symbol table.
 
 ### Creating Symbol Operands
 
-```c
-MasmOperand sym = masm_operand_symbol("my_function");
-MasmOperand global = masm_operand_symbol("global_counter");
+```mach
+val sym: Operand = ir.make_sym(symbol_index);
 ```
 
 ### Usage
@@ -152,110 +158,52 @@ Label operands reference code locations within the current function for control 
 
 ### Creating Label Operands
 
-```c
-MasmOperand label = masm_operand_label(".loop_start");
-MasmOperand exit = masm_operand_label(".func_end");
+```mach
+val lbl: Operand = ir.make_label(".loop_start");
+val exit: Operand = ir.make_label(".func_end");
 ```
 
 ### Label Naming
 
 Labels are function-local. By convention:
 - Start with `.` to indicate local scope
-- Use descriptive names: `.loop_body`, `.if_else`, `.return`
+- Use descriptive names: `.for_body_N`, `.if_then_N`, `.return`
 
 
-## Type Operands
+## Operand Constructors
 
-Type operands carry type information for instructions that need it (conversions, sized operations).
-
-### Creating Type Operands
-
-```c
-MasmOperand t = masm_operand_type(MASM_TYPE_I64);
-```
-
-### Type Kinds
-
-| Kind | Size | Description |
-|------|------|-------------|
-| `MASM_TYPE_VOID` | 0 | No type / void |
-| `MASM_TYPE_I8` | 1 | Signed 8-bit integer |
-| `MASM_TYPE_U8` | 1 | Unsigned 8-bit integer |
-| `MASM_TYPE_I16` | 2 | Signed 16-bit integer |
-| `MASM_TYPE_U16` | 2 | Unsigned 16-bit integer |
-| `MASM_TYPE_I32` | 4 | Signed 32-bit integer |
-| `MASM_TYPE_U32` | 4 | Unsigned 32-bit integer |
-| `MASM_TYPE_I64` | 8 | Signed 64-bit integer |
-| `MASM_TYPE_U64` | 8 | Unsigned 64-bit integer |
-| `MASM_TYPE_F32` | 4 | 32-bit float |
-| `MASM_TYPE_F64` | 8 | 64-bit float |
-| `MASM_TYPE_PTR` | 8 | Pointer (64-bit) |
-
-
-## Operand Structure
-
-The complete operand representation:
-
-```c
-typedef struct MasmOperand {
-    MasmOperandKind kind;
-    union {
-        MasmRegister reg;       // MASM_OPERAND_REGISTER
-        int64_t      imm;       // MASM_OPERAND_IMM
-        MasmMemory   mem;       // MASM_OPERAND_MEMORY
-        const char  *symbol;    // MASM_OPERAND_SYMBOL
-        const char  *label;     // MASM_OPERAND_LABEL
-        MasmTypeKind type;      // MASM_OPERAND_TYPE
-    };
-} MasmOperand;
-```
-
-
-## Builder Functions
-
-### Summary
-
-| Function | Description |
-|----------|-------------|
-| `masm_operand_none()` | Create empty operand |
-| `masm_operand_register(id, size)` | Integer register |
-| `masm_operand_register_fp(id, size)` | Float register |
-| `masm_operand_imm(value)` | Immediate constant |
-| `masm_operand_memory(base, index, scale, disp, size)` | Full memory reference |
-| `masm_operand_memory_simple(base_reg, disp, size)` | Simple memory reference |
-| `masm_operand_symbol(name)` | Global symbol |
-| `masm_operand_label(name)` | Code label |
-| `masm_operand_type(kind)` | Type descriptor |
+| Constructor | Description |
+|-------------|-------------|
+| `ir.make_none()` | Create empty operand |
+| `ir.make_reg(reg, size)` | Register (physical or virtual) |
+| `ir.make_imm(imm, size)` | Immediate constant |
+| `ir.make_mem(base, index, scale, disp, size)` | Memory reference |
+| `ir.make_label(label)` | Code label |
+| `ir.make_sym(sym_id)` | Symbol reference |
 
 
 ## Examples
 
 ### Load from Local Variable
 
-```c
-// load value from [rbp - 16]
-MasmOperand dst = masm_operand_register(MASM_X86_RAX, 8);
-MasmOperand src = masm_operand_memory_simple(MASM_X86_RBP, -16, 8);
-MasmInstruction inst = masm_inst_2(MASM_IR_LOAD, dst, src);
-```
-
-### Store to Global
-
-```c
-// store %rax to global "counter"
-MasmOperand dst = masm_operand_symbol("counter");
-MasmOperand src = masm_operand_register(MASM_X86_RAX, 8);
-MasmInstruction inst = masm_inst_2(MASM_IR_STORE, dst, src);
+```mach
+# load value from [FP - 16]
+val dst: Operand = ir.make_reg(vreg_id, 8);
+val src: Operand = ir.make_mem(ir.VREG_FP, -1, 1, -16, 8);
+ir.block_append(alloc, block, ir.OP_LOAD, dst, src, ir.make_none(), ir.CC_NONE);
 ```
 
 ### Conditional Branch
 
-```c
-// branch to .loop if %rcx != 0
-MasmOperand a = masm_operand_register(MASM_X86_RCX, 8);
-MasmOperand b = masm_operand_imm(0);
-MasmOperand target = masm_operand_label(".loop");
-MasmInstruction inst = masm_inst_3(MASM_IR_BNE, a, b, target);
+```mach
+# compare and branch: if %a < %b goto .loop
+val a: Operand = ir.make_reg(vreg_a, 8);
+val b: Operand = ir.make_reg(vreg_b, 8);
+val cond: Operand = ir.make_reg(vreg_cond, 1);
+val target: Operand = ir.make_label(".loop");
+
+ir.block_append(alloc, block, ir.OP_ICMP, cond, a, b, ir.CC_LT);
+ir.block_append(alloc, block, ir.OP_BRCOND, target, cond, ir.make_none(), ir.CC_NONE);
 ```
 
 
