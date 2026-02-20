@@ -175,23 +175,9 @@ The receiver can be by value or by pointer. The compiler automatically takes the
 
 ## Type Casting
 
-The `::` operator casts a value to a different type. For same-sized types, this is a bit reinterpretation. For different-sized integer types, the compiler generates appropriate widening (zero-extend or sign-extend) or truncation instructions:
+The `::` operator has dual behavior depending on the types involved:
 
-```mach
-val x: f32 = 3.14;
-val y: i32 = x::i32;   # reinterpret f32 bits as i32 (NOT a numeric conversion)
-```
-
-Reinterpreting between same-sized types:
-
-```mach
-rec Color { r: u8; g: u8; b: u8; a: u8; }
-
-val c: Color = Color{r: 255, g: 0, b: 128, a: 255};
-val packed: u32 = c::u32;
-```
-
-Widening and truncation between integer types:
+**Primitive numeric types** (int, float): `::` performs a proper conversion. The compiler emits the correct machine instruction — sign extension, zero extension, truncation, or int↔float conversion:
 
 ```mach
 val a: u8 = 42;
@@ -200,6 +186,17 @@ val c: i16 = -5;
 val d: i64 = c::i64;   # sign-extend i16 to i64
 val e: i64 = 1000;
 val f: u8  = e::u8;    # truncate i64 to u8
+val g: i32 = 7;
+val h: f64 = g::f64;   # int-to-float conversion
+```
+
+**Non-primitive types** (records, pointers): `::` is a flat bit reinterpretation. Both types must have the same size:
+
+```mach
+rec Color { r: u8; g: u8; b: u8; a: u8; }
+
+val c: Color = Color{r: 255, g: 0, b: 128, a: 255};
+val packed: u32 = c::u32;   # reinterpret 4-byte record as u32
 ```
 
 
