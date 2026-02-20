@@ -1,0 +1,623 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use di:        mach.compiler.di;
+use of:        mach.compiler.of;
+
+# mach.compiler.di.dwarf: DWARF v4 debug information implementation.
+# ---
+# produces three ELF sections:
+#   .debug_abbrev — fixed abbreviation table (CU + subprogram tags)
+#   .debug_info   — compilation unit DIE + subprogram DIEs
+#   .debug_line   — line number program (file/line → address mapping)
+#
+# follows the DebugInfo interface from mach.compiler.di.
+
+# --- DWARF constants ---
+
+# tags
+val DW_TAG_compile_unit: u8 = 0x11;
+val DW_TAG_subprogram:   u8 = 0x2e;
+
+# attributes
+val DW_AT_name:      u8 = 0x03;
+val DW_AT_stmt_list: u8 = 0x10;
+val DW_AT_low_pc:    u8 = 0x11;
+val DW_AT_high_pc:   u8 = 0x12;
+val DW_AT_language:  u8 = 0x13;
+val DW_AT_producer:  u8 = 0x25;
+val DW_AT_comp_dir:  u8 = 0x1b;
+val DW_AT_decl_file: u8 = 0x3a;
+val DW_AT_decl_line: u8 = 0x3b;
+
+# forms
+val DW_FORM_addr:       u8 = 0x01;
+val DW_FORM_data2:      u8 = 0x05;
+val DW_FORM_data4:      u8 = 0x06;
+val DW_FORM_string:     u8 = 0x08;
+val DW_FORM_data1:      u8 = 0x0b;
+val DW_FORM_sec_offset: u8 = 0x17;
+
+# children
+val DW_CHILDREN_yes: u8 = 1;
+val DW_CHILDREN_no:  u8 = 0;
+
+# language
+val DW_LANG_lo_user: u16 = 0x8000;
+
+# line number program opcodes
+val DW_LNS_copy:             u8 = 1;
+val DW_LNS_advance_pc:       u8 = 2;
+val DW_LNS_advance_line:     u8 = 3;
+val DW_LNS_set_file:         u8 = 4;
+val DW_LNS_set_column:       u8 = 5;
+val DW_LNS_negate_stmt:      u8 = 6;
+
+# extended opcodes
+val DW_LNE_end_sequence:     u8 = 1;
+val DW_LNE_set_address:      u8 = 2;
+
+# initial capacities
+val INITIAL_FILE_CAP:   i32 = 16;
+val INITIAL_SUB_CAP:    i32 = 256;
+val INITIAL_LINE_CAP:   i32 = 1024;
+val MAX_DEBUG_SECTIONS:  i32 = 3;
+
+# --- internal records ---
+
+rec DWARFFile {
+    path: str;
+    dir:  str;
+}
+
+rec DWARFContext {
+    alloc:     *allocator.Allocator;
+
+    files:     *DWARFFile;
+    file_count: i32;
+    file_cap:   i32;
+
+    subs:      *di.DISubprogram;
+    sub_count: i32;
+    sub_cap:   i32;
+
+    lines:     *di.DILineEntry;
+    line_count: i32;
+    line_cap:   i32;
+
+    # finalized output
+    sections:   [3]di.DebugSection;
+    sec_count:  i32;
+
+    # serialized buffers
+    abbrev_buf: of.OutputBuffer;
+    info_buf:   of.OutputBuffer;
+    line_buf:   of.OutputBuffer;
+}
+
+# create: construct a DWARF v4 DebugInfo implementation.
+pub fun create(alloc: *allocator.Allocator) Result[di.DebugInfo, str] {
+    if (alloc == nil) {
+        ret err[di.DebugInfo, str]("allocator is nil");
+    }
+
+    val ctx_r: Result[*DWARFContext, allocator.AllocError] =
+        allocator.allocator_zalloc[DWARFContext](alloc, 1);
+    if (result_is_err[*DWARFContext, allocator.AllocError](ctx_r)) {
+        ret err[di.DebugInfo, str]("out of memory");
+    }
+    val ctx: *DWARFContext =
+        result_unwrap_ok[*DWARFContext, allocator.AllocError](ctx_r);
+    ctx.alloc = alloc;
+
+    # pre-allocate arrays
+    val fr: Result[*DWARFFile, allocator.AllocError] =
+        allocator.allocator_zalloc[DWARFFile](alloc, INITIAL_FILE_CAP::usize);
+    if (result_is_err[*DWARFFile, allocator.AllocError](fr)) {
+        ret err[di.DebugInfo, str]("out of memory");
+    }
+    ctx.files = result_unwrap_ok[*DWARFFile, allocator.AllocError](fr);
+    ctx.file_cap = INITIAL_FILE_CAP;
+
+    val sr: Result[*di.DISubprogram, allocator.AllocError] =
+        allocator.allocator_zalloc[di.DISubprogram](alloc, INITIAL_SUB_CAP::usize);
+    if (result_is_err[*di.DISubprogram, allocator.AllocError](sr)) {
+        ret err[di.DebugInfo, str]("out of memory");
+    }
+    ctx.subs = result_unwrap_ok[*di.DISubprogram, allocator.AllocError](sr);
+    ctx.sub_cap = INITIAL_SUB_CAP;
+
+    val lr: Result[*di.DILineEntry, allocator.AllocError] =
+        allocator.allocator_zalloc[di.DILineEntry](alloc, INITIAL_LINE_CAP::usize);
+    if (result_is_err[*di.DILineEntry, allocator.AllocError](lr)) {
+        ret err[di.DebugInfo, str]("out of memory");
+    }
+    ctx.lines = result_unwrap_ok[*di.DILineEntry, allocator.AllocError](lr);
+    ctx.line_cap = INITIAL_LINE_CAP;
+
+    var d: di.DebugInfo;
+    d.ctx = ctx::ptr;
+    d.add_file = dwarf_add_file;
+    d.add_subprogram = dwarf_add_subprogram;
+    d.add_line = dwarf_add_line;
+    d.finalize = dwarf_finalize;
+    d.get_sections = dwarf_get_sections;
+    d.destroy = dwarf_destroy;
+
+    ret ok[di.DebugInfo, str](d);
+}
+
+# --- interface implementations ---
+
+fun dwarf_add_file(ctx: ptr, path: str, dir: str) u16 {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || path == nil) { ret 0; }
+
+    # deduplicate
+    var i: i32 = 0;
+    for (i < d.file_count) {
+        if (d.files[i].path != nil && str_equals(d.files[i].path, path)) {
+            ret (i + 1)::u16;
+        }
+        i = i + 1;
+    }
+
+    # grow if needed
+    if (d.file_count >= d.file_cap) {
+        val new_cap: i32 = d.file_cap * 2;
+        val r: Result[*DWARFFile, allocator.AllocError] =
+            allocator.allocator_resize[DWARFFile](d.alloc, d.files,
+                d.file_cap::usize, new_cap::usize);
+        if (result_is_err[*DWARFFile, allocator.AllocError](r)) { ret 0; }
+        d.files = result_unwrap_ok[*DWARFFile, allocator.AllocError](r);
+        d.file_cap = new_cap;
+    }
+
+    val idx: i32 = d.file_count;
+    d.files[idx].path = path;
+    d.files[idx].dir = dir;
+    d.file_count = d.file_count + 1;
+    ret (idx + 1)::u16;
+}
+
+fun dwarf_add_subprogram(ctx: ptr, sub: *di.DISubprogram) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || sub == nil) { ret; }
+
+    # grow if needed
+    if (d.sub_count >= d.sub_cap) {
+        val new_cap: i32 = d.sub_cap * 2;
+        val r: Result[*di.DISubprogram, allocator.AllocError] =
+            allocator.allocator_resize[di.DISubprogram](d.alloc, d.subs,
+                d.sub_cap::usize, new_cap::usize);
+        if (result_is_err[*di.DISubprogram, allocator.AllocError](r)) { ret; }
+        d.subs = result_unwrap_ok[*di.DISubprogram, allocator.AllocError](r);
+        d.sub_cap = new_cap;
+    }
+
+    val idx: i32 = d.sub_count;
+    d.subs[idx].name = sub.name;
+    d.subs[idx].file_idx = sub.file_idx;
+    d.subs[idx].line = sub.line;
+    d.subs[idx].low_pc = sub.low_pc;
+    d.subs[idx].high_pc = sub.high_pc;
+    d.sub_count = d.sub_count + 1;
+}
+
+fun dwarf_add_line(ctx: ptr, entry: *di.DILineEntry) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || entry == nil) { ret; }
+
+    # grow if needed
+    if (d.line_count >= d.line_cap) {
+        val new_cap: i32 = d.line_cap * 2;
+        val r: Result[*di.DILineEntry, allocator.AllocError] =
+            allocator.allocator_resize[di.DILineEntry](d.alloc, d.lines,
+                d.line_cap::usize, new_cap::usize);
+        if (result_is_err[*di.DILineEntry, allocator.AllocError](r)) { ret; }
+        d.lines = result_unwrap_ok[*di.DILineEntry, allocator.AllocError](r);
+        d.line_cap = new_cap;
+    }
+
+    val idx: i32 = d.line_count;
+    d.lines[idx].address = entry.address;
+    d.lines[idx].file_idx = entry.file_idx;
+    d.lines[idx].line = entry.line;
+    d.line_count = d.line_count + 1;
+}
+
+fun dwarf_destroy(ctx: ptr) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || d.alloc == nil) { ret; }
+
+    if (d.files != nil) {
+        allocator.allocator_free[DWARFFile](d.alloc, d.files, d.file_cap::usize);
+    }
+    if (d.subs != nil) {
+        allocator.allocator_free[di.DISubprogram](d.alloc, d.subs, d.sub_cap::usize);
+    }
+    if (d.lines != nil) {
+        allocator.allocator_free[di.DILineEntry](d.alloc, d.lines, d.line_cap::usize);
+    }
+    of.buf_destroy(?d.abbrev_buf);
+    of.buf_destroy(?d.info_buf);
+    of.buf_destroy(?d.line_buf);
+    allocator.allocator_free[DWARFContext](d.alloc, d, 1);
+}
+
+fun dwarf_get_sections(ctx: ptr, count: *i32) *di.DebugSection {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || count == nil) { ret nil; }
+    @count = d.sec_count;
+    ret ?d.sections[0];
+}
+
+# --- finalize: serialize DWARF binary format ---
+
+fun dwarf_finalize(ctx: ptr, alloc: *allocator.Allocator) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || alloc == nil) { ret; }
+
+    of.buf_init(?d.abbrev_buf, alloc);
+    of.buf_init(?d.info_buf, alloc);
+    of.buf_init(?d.line_buf, alloc);
+
+    emit_abbrev(d);
+    emit_info(d);
+    emit_line(d);
+
+    d.sec_count = 0;
+
+    if (d.abbrev_buf.size > 0) {
+        d.sections[d.sec_count].name = ".debug_abbrev";
+        d.sections[d.sec_count].data = d.abbrev_buf.data;
+        d.sections[d.sec_count].size = d.abbrev_buf.size;
+        d.sec_count = d.sec_count + 1;
+    }
+
+    if (d.info_buf.size > 0) {
+        d.sections[d.sec_count].name = ".debug_info";
+        d.sections[d.sec_count].data = d.info_buf.data;
+        d.sections[d.sec_count].size = d.info_buf.size;
+        d.sec_count = d.sec_count + 1;
+    }
+
+    if (d.line_buf.size > 0) {
+        d.sections[d.sec_count].name = ".debug_line";
+        d.sections[d.sec_count].data = d.line_buf.data;
+        d.sections[d.sec_count].size = d.line_buf.size;
+        d.sec_count = d.sec_count + 1;
+    }
+}
+
+# --- .debug_abbrev ---
+#
+# abbreviation table defining two tags:
+#   1: DW_TAG_compile_unit (has children)
+#      - DW_AT_producer  (DW_FORM_string)
+#      - DW_AT_language  (DW_FORM_data2)
+#      - DW_AT_name      (DW_FORM_string)
+#      - DW_AT_comp_dir  (DW_FORM_string)
+#      - DW_AT_low_pc    (DW_FORM_addr)
+#      - DW_AT_high_pc   (DW_FORM_addr)
+#      - DW_AT_stmt_list (DW_FORM_sec_offset)
+#   2: DW_TAG_subprogram (no children)
+#      - DW_AT_name      (DW_FORM_string)
+#      - DW_AT_decl_file (DW_FORM_data2)
+#      - DW_AT_decl_line (DW_FORM_data4)
+#      - DW_AT_low_pc    (DW_FORM_addr)
+#      - DW_AT_high_pc   (DW_FORM_addr)
+
+fun emit_abbrev(d: *DWARFContext) {
+    val out: *of.OutputBuffer = ?d.abbrev_buf;
+
+    # abbrev 1: compile_unit
+    write_uleb128(out, 1);                       # abbrev code
+    write_uleb128(out, DW_TAG_compile_unit::u64); # tag
+    of.buf_write_u8(out, DW_CHILDREN_yes);       # has children
+
+    write_uleb128(out, DW_AT_producer::u64);
+    write_uleb128(out, DW_FORM_string::u64);
+    write_uleb128(out, DW_AT_language::u64);
+    write_uleb128(out, DW_FORM_data2::u64);
+    write_uleb128(out, DW_AT_name::u64);
+    write_uleb128(out, DW_FORM_string::u64);
+    write_uleb128(out, DW_AT_comp_dir::u64);
+    write_uleb128(out, DW_FORM_string::u64);
+    write_uleb128(out, DW_AT_low_pc::u64);
+    write_uleb128(out, DW_FORM_addr::u64);
+    write_uleb128(out, DW_AT_high_pc::u64);
+    write_uleb128(out, DW_FORM_addr::u64);
+    write_uleb128(out, DW_AT_stmt_list::u64);
+    write_uleb128(out, DW_FORM_sec_offset::u64);
+    write_uleb128(out, 0); # attr terminator
+    write_uleb128(out, 0); # form terminator
+
+    # abbrev 2: subprogram
+    write_uleb128(out, 2);                       # abbrev code
+    write_uleb128(out, DW_TAG_subprogram::u64);  # tag
+    of.buf_write_u8(out, DW_CHILDREN_no);        # no children
+
+    write_uleb128(out, DW_AT_name::u64);
+    write_uleb128(out, DW_FORM_string::u64);
+    write_uleb128(out, DW_AT_decl_file::u64);
+    write_uleb128(out, DW_FORM_data2::u64);
+    write_uleb128(out, DW_AT_decl_line::u64);
+    write_uleb128(out, DW_FORM_data4::u64);
+    write_uleb128(out, DW_AT_low_pc::u64);
+    write_uleb128(out, DW_FORM_addr::u64);
+    write_uleb128(out, DW_AT_high_pc::u64);
+    write_uleb128(out, DW_FORM_addr::u64);
+    write_uleb128(out, 0); # attr terminator
+    write_uleb128(out, 0); # form terminator
+
+    # end of abbreviation table
+    write_uleb128(out, 0);
+}
+
+# --- .debug_info ---
+#
+# DWARF v4 compilation unit:
+#   unit_length (4 bytes, excludes self)
+#   version     (2 bytes = 4)
+#   debug_abbrev_offset (4 bytes = 0)
+#   address_size (1 byte = 8)
+#   [CU DIE]
+#   [subprogram DIEs...]
+#   [null terminator]
+
+fun emit_info(d: *DWARFContext) {
+    val out: *of.OutputBuffer = ?d.info_buf;
+
+    # unit header (11 bytes: 4 + 2 + 4 + 1)
+    val header_off: usize = out.size;
+    of.buf_write_u32(out, 0);       # unit_length placeholder
+    of.buf_write_u16(out, 4);       # version = DWARF 4
+    of.buf_write_u32(out, 0);       # debug_abbrev_offset = 0
+    of.buf_write_u8(out, 8);        # address_size = 8
+
+    # CU DIE (abbrev 1)
+    write_uleb128(out, 1);          # abbrev code
+
+    # DW_AT_producer: inline string
+    write_string(out, "mach compiler");
+
+    # DW_AT_language: DW_LANG_lo_user (mach is a custom language)
+    of.buf_write_u16(out, DW_LANG_lo_user);
+
+    # DW_AT_name: compilation unit name
+    write_string(out, "<mach>");
+
+    # DW_AT_comp_dir: compilation directory
+    write_string(out, ".");
+
+    # DW_AT_low_pc: lowest address in CU
+    var cu_low: u64 = 0;
+    var cu_high: u64 = 0;
+    if (d.sub_count > 0) {
+        cu_low = d.subs[0].low_pc;
+        cu_high = d.subs[0].high_pc;
+        var si: i32 = 1;
+        for (si < d.sub_count) {
+            if (d.subs[si].low_pc < cu_low) {
+                cu_low = d.subs[si].low_pc;
+            }
+            if (d.subs[si].high_pc > cu_high) {
+                cu_high = d.subs[si].high_pc;
+            }
+            si = si + 1;
+        }
+    }
+    of.buf_write_u64(out, cu_low);
+
+    # DW_AT_high_pc: highest address in CU
+    of.buf_write_u64(out, cu_high);
+
+    # DW_AT_stmt_list: offset into .debug_line (always 0)
+    of.buf_write_u32(out, 0);
+
+    # subprogram DIEs (abbrev 2)
+    var si: i32 = 0;
+    for (si < d.sub_count) {
+        write_uleb128(out, 2);      # abbrev code
+
+        # DW_AT_name
+        if (d.subs[si].name != nil) {
+            write_string(out, d.subs[si].name);
+        } or {
+            write_string(out, "<unknown>");
+        }
+
+        # DW_AT_decl_file
+        of.buf_write_u16(out, d.subs[si].file_idx);
+
+        # DW_AT_decl_line
+        of.buf_write_u32(out, d.subs[si].line::u32);
+
+        # DW_AT_low_pc
+        of.buf_write_u64(out, d.subs[si].low_pc);
+
+        # DW_AT_high_pc
+        of.buf_write_u64(out, d.subs[si].high_pc);
+
+        si = si + 1;
+    }
+
+    # null terminator (end of CU children)
+    of.buf_write_u8(out, 0);
+
+    # patch unit_length
+    val unit_len: u32 = (out.size - header_off - 4)::u32;
+    of.buf_patch_u32(out, header_off, unit_len);
+}
+
+# --- .debug_line ---
+#
+# minimal DWARF v4 line number program.
+# if no line entries exist, emits a valid but empty program.
+
+fun emit_line(d: *DWARFContext) {
+    val out: *of.OutputBuffer = ?d.line_buf;
+
+    # unit header
+    val header_off: usize = out.size;
+    of.buf_write_u32(out, 0);      # unit_length placeholder
+    of.buf_write_u16(out, 4);      # version = DWARF 4
+
+    val prologue_off: usize = out.size;
+    of.buf_write_u32(out, 0);      # header_length placeholder
+
+    # line number program parameters
+    of.buf_write_u8(out, 1);       # minimum_instruction_length
+    of.buf_write_u8(out, 1);       # maximum_operations_per_instruction
+    of.buf_write_u8(out, 1);       # default_is_stmt
+    of.buf_write_u8(out, 0xf6::u8); # line_base = -10 (signed)
+    of.buf_write_u8(out, 245);     # line_range = 245
+    of.buf_write_u8(out, 13);      # opcode_base
+    # standard_opcode_lengths (12 entries for opcodes 1..12)
+    of.buf_write_u8(out, 0);       # DW_LNS_copy
+    of.buf_write_u8(out, 1);       # DW_LNS_advance_pc
+    of.buf_write_u8(out, 1);       # DW_LNS_advance_line
+    of.buf_write_u8(out, 1);       # DW_LNS_set_file
+    of.buf_write_u8(out, 1);       # DW_LNS_set_column
+    of.buf_write_u8(out, 0);       # DW_LNS_negate_stmt
+    of.buf_write_u8(out, 0);       # DW_LNS_set_basic_block
+    of.buf_write_u8(out, 0);       # DW_LNS_const_add_pc
+    of.buf_write_u8(out, 1);       # DW_LNS_fixed_advance_pc
+    of.buf_write_u8(out, 0);       # DW_LNS_set_prologue_end
+    of.buf_write_u8(out, 0);       # DW_LNS_set_epilogue_begin
+    of.buf_write_u8(out, 1);       # DW_LNS_set_isa
+
+    # include_directories (null-terminated list)
+    of.buf_write_u8(out, 0);       # no include directories
+
+    # file_names (null-terminated list of entries)
+    var fi: i32 = 0;
+    for (fi < d.file_count) {
+        if (d.files[fi].path != nil) {
+            write_string(out, d.files[fi].path);  # file name
+        } or {
+            write_string(out, "<unknown>");
+        }
+        write_uleb128(out, 0);     # directory index (0 = current)
+        write_uleb128(out, 0);     # last modification time
+        write_uleb128(out, 0);     # file size
+        fi = fi + 1;
+    }
+    of.buf_write_u8(out, 0);       # end of file_names list
+
+    # patch header_length
+    val header_len: u32 = (out.size - prologue_off - 4)::u32;
+    of.buf_patch_u32(out, prologue_off, header_len);
+
+    # line number program instructions
+    if (d.line_count > 0) {
+        var cur_addr: u64 = 0;
+        var cur_file: u16 = 1;
+        var cur_line: i32 = 1;
+
+        var li: i32 = 0;
+        for (li < d.line_count) {
+            val entry: *di.DILineEntry = ?d.lines[li];
+
+            # set file if changed
+            if (entry.file_idx != cur_file && entry.file_idx > 0) {
+                of.buf_write_u8(out, DW_LNS_set_file);
+                write_uleb128(out, entry.file_idx::u64);
+                cur_file = entry.file_idx;
+            }
+
+            # advance line if changed
+            if (entry.line != cur_line) {
+                of.buf_write_u8(out, DW_LNS_advance_line);
+                write_sleb128(out, (entry.line - cur_line)::i64);
+                cur_line = entry.line;
+            }
+
+            # advance PC
+            if (entry.address > cur_addr) {
+                of.buf_write_u8(out, DW_LNS_advance_pc);
+                write_uleb128(out, entry.address - cur_addr);
+                cur_addr = entry.address;
+            } or (entry.address != cur_addr) {
+                # address went backwards — use set_address
+                of.buf_write_u8(out, 0);         # extended opcode marker
+                write_uleb128(out, 9);            # length: 1 + 8
+                of.buf_write_u8(out, DW_LNE_set_address);
+                of.buf_write_u64(out, entry.address);
+                cur_addr = entry.address;
+            }
+
+            # emit row
+            of.buf_write_u8(out, DW_LNS_copy);
+
+            li = li + 1;
+        }
+    }
+
+    # end sequence (extended opcode)
+    of.buf_write_u8(out, 0);                 # extended opcode marker
+    write_uleb128(out, 1);                   # length = 1
+    of.buf_write_u8(out, DW_LNE_end_sequence);
+
+    # patch unit_length
+    val unit_len: u32 = (out.size - header_off - 4)::u32;
+    of.buf_patch_u32(out, header_off, unit_len);
+}
+
+# --- encoding helpers ---
+
+# write_uleb128: encode an unsigned LEB128 value.
+fun write_uleb128(out: *of.OutputBuffer, value: u64) {
+    var v: u64 = value;
+    for (v >= 128) {
+        of.buf_write_u8(out, ((v & 0x7f) | 0x80)::u8);
+        v = v >> 7;
+    }
+    of.buf_write_u8(out, (v & 0x7f)::u8);
+}
+
+# write_sleb128: encode a signed LEB128 value.
+fun write_sleb128(out: *of.OutputBuffer, value: i64) {
+    var v: i64 = value;
+    var more: bool = true;
+    for (more) {
+        var b: u8 = (v & 0x7f)::u8;
+        v = v >> 7;
+        if ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) {
+            more = false;
+        } or {
+            b = b | 0x80;
+        }
+        of.buf_write_u8(out, b);
+    }
+}
+
+# write_string: write a null-terminated string.
+fun write_string(out: *of.OutputBuffer, s: str) {
+    if (s == nil) {
+        of.buf_write_u8(out, 0);
+        ret;
+    }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        of.buf_write_u8(out, s[i]);
+        i = i + 1;
+    }
+    of.buf_write_u8(out, 0);
+}
+
+# str_equals: compare two null-terminated strings.
+fun str_equals(a: str, b: str) bool {
+    if (a == nil && b == nil) { ret true; }
+    if (a == nil || b == nil) { ret false; }
+    var i: usize = 0;
+    for (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret a[i] == b[i];
+}
