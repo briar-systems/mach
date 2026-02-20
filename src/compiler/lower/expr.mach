@@ -156,12 +156,11 @@ fun lower_int_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
     ret ir.make_imm(value, size);
 }
 
-fun lower_float_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
-    val text: str = node.info.lit_expr.text;
-    val value: f64 = parse_float(text);
-    val size: u8 = expr_size(ctx, node);
-
-    # float literals must go through .rodata — store bits and load
+# emit_float_const: emit a float constant to .rodata and load it into a register.
+# float values cannot be used as immediates in the IR — they must be placed in
+# .rodata and loaded via a label reference so the backend can encode them as
+# memory operands.
+fun emit_float_const(ctx: *LowerContext, fval: f64, size: u8) ir.Operand {
     val sec_r: Result[*section.Section, str] = masm.get_or_create_section(
         ctx.mctx, ".rodata", section.SEC_RODATA);
     if (result_is_err[*section.Section, str](sec_r)) {
@@ -172,15 +171,14 @@ fun lower_float_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
     val offset: usize = section.current_offset(sec);
 
     if (size == 4) {
-        val f32_val: f32 = value::f32;
+        val f32_val: f32 = fval::f32;
         val bits: u32 = f32_val::u32;
         section.emit_u32(ctx.alloc, sec, bits);
     } or {
-        val bits: u64 = value::u64;
+        val bits: u64 = fval::u64;
         section.emit_u64(ctx.alloc, sec, bits);
     }
 
-    # create a named symbol for the float constant in .rodata
     val float_label: str = make_str_label(ctx.alloc, ctx.str_counter);
     ctx.str_counter = ctx.str_counter + 1;
     if (float_label != nil) {
@@ -197,11 +195,17 @@ fun lower_float_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
         }
     }
 
-    # load the float from memory via the named symbol
     val result: ir.Operand = new_vreg(ctx, size);
     val label: ir.Operand = ir.make_label(float_label);
     emit(ctx, ir.OP_LOAD, result, label, ir.make_none(), ir.CC_NONE);
     ret result;
+}
+
+fun lower_float_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
+    val text: str = node.info.lit_expr.text;
+    val value: f64 = parse_float(text);
+    val size: u8 = expr_size(ctx, node);
+    ret emit_float_const(ctx, value, size);
 }
 
 fun lower_char_lit(ctx: *LowerContext, node: *ast.Node) ir.Operand {
@@ -487,7 +491,8 @@ fun lower_unary(ctx: *LowerContext, node: *ast.Node) ir.Operand {
         # negation: 0 - value
         val is_float: bool = inner.type != nil && type.type_is_float(inner.type);
         if (is_float) {
-            val zero: ir.Operand = ir.make_imm(0, size);
+            val zero: ir.Operand = emit_float_const(ctx, 0.0, size);
+            if (zero.kind == ir.OPK_NONE) { ret ir.make_none(); }
             emit(ctx, ir.OP_FSUB, result, zero, value, ir.CC_NONE);
         } or {
             val zero: ir.Operand = ir.make_imm(0, size);
@@ -732,24 +737,44 @@ fun lower_field_lvalue(ctx: *LowerContext, node: *ast.Node) ir.Operand {
     } or {
         # value struct: compute field address from object lvalue
         val base: ir.Operand = lower_lvalue(ctx, obj);
-        if (base.kind == ir.OPK_NONE) { ret ir.make_none(); }
 
-        # adjust the memory operand's displacement
         if (base.kind == ir.OPK_MEM) {
+            # adjust the memory operand's displacement
             ret ir.make_mem(base.base, base.index, base.scale,
                            base.disp + field_offset, field_size);
         }
 
-        # fallback: compute address
-        val addr: ir.Operand = new_vreg(ctx, psz);
-        emit(ctx, ir.OP_ADDR, addr, base, ir.make_none(), ir.CC_NONE);
-        if (field_offset != 0) {
-            val adjusted: ir.Operand = new_vreg(ctx, psz);
-            emit(ctx, ir.OP_ADD, adjusted, addr, ir.make_imm(field_offset, psz),
-                 ir.CC_NONE);
-            ret ir.make_mem(adjusted.reg, -1, 1, 0, field_size);
+        if (base.kind != ir.OPK_NONE) {
+            # fallback: compute address
+            val addr: ir.Operand = new_vreg(ctx, psz);
+            emit(ctx, ir.OP_ADDR, addr, base, ir.make_none(), ir.CC_NONE);
+            if (field_offset != 0) {
+                val adjusted: ir.Operand = new_vreg(ctx, psz);
+                emit(ctx, ir.OP_ADD, adjusted, addr, ir.make_imm(field_offset, psz),
+                     ir.CC_NONE);
+                ret ir.make_mem(adjusted.reg, -1, 1, 0, field_size);
+            }
+            ret ir.make_mem(addr.reg, -1, 1, 0, field_size);
         }
-        ret ir.make_mem(addr.reg, -1, 1, 0, field_size);
+
+        # object is not an lvalue (e.g. function call return) — evaluate as rvalue
+        val rval: ir.Operand = lower_expr(ctx, obj);
+        if (rval.kind == ir.OPK_NONE) { ret ir.make_none(); }
+
+        if (rval.kind == ir.OPK_MEM) {
+            # sret or stack-allocated return: adjust displacement for field
+            ret ir.make_mem(rval.base, rval.index, rval.scale,
+                           rval.disp + field_offset, field_size);
+        }
+
+        # small struct in register: spill to stack, then access field
+        val obj_size: usize = type_size(ctx, obj_type);
+        val lv: *LocalVar = local_add(ctx, ".field_tmp", obj_type, obj_size);
+        if (lv == nil) { ret ir.make_none(); }
+        val dst: ir.Operand = local_operand(lv, psz);
+        emit_store(ctx, dst, rval);
+        ret ir.make_mem(ir.VREG_FP, -1, 1,
+                       lv.offset + field_offset, field_size);
     }
 }
 
