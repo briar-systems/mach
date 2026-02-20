@@ -78,7 +78,7 @@ MASM uses a two-layer opcode system:
 - Emitted by isel and inline asm parsers
 - Consumed by encoder for binary emission
 
-The `MasmOpcodeKind` discriminator on each instruction indicates which layer it belongs to, enabling type-safe dispatch through the emit pipeline.
+The `op` field on each `Inst` record holds a portable `Operator` value during lowering. After instruction selection, the ISA backend replaces these with target-specific opcode values.
 
 ## Quick Reference
 
@@ -86,14 +86,16 @@ The `MasmOpcodeKind` discriminator on each instruction indicates which layer it 
 
 | Category | Operations |
 |----------|------------|
-| **Data Movement** | `mov`, `load`, `store`, `lea`, `zext`, `sext` |
-| **Arithmetic** | `add`, `sub`, `mul`, `div`, `divu`, `rem`, `remu`, `neg` |
-| **Bitwise** | `and`, `or`, `xor`, `not`, `shl`, `shr`, `sar` |
-| **Comparison** | `seq`, `sne`, `slt`, `sltu`, `sle`, `sleu`, `sgt`, `sgtu`, `sge`, `sgeu` |
-| **Floating Point** | `fadd`, `fsub`, `fmul`, `fdiv`, `fcmp`, `fconv` |
-| **Control Flow** | `jmp`, `beq`, `bne`, `blt`, `bltu`, `bge`, `bgeu`, `call`, `ret` |
+| **Data Movement** | `mov`, `load`, `store`, `addr` |
+| **Integer Arithmetic** | `add`, `sub`, `mul`, `div`, `mod`, `divu`, `modu` |
+| **Bitwise** | `and`, `or`, `xor`, `shl`, `shr`, `sar` |
+| **Comparison** | `icmp` (with cc: `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `b`, `be`, `a`, `ae`) |
+| **Conversions** | `zext`, `sext`, `trunc`, `itof`, `ftoi`, `fext`, `ftrunc` |
+| **Floating Point** | `fadd`, `fsub`, `fmul`, `fdiv`, `fcmp` |
+| **Control Flow** | `jmp`, `brcond`, `call`, `ret` |
 | **System** | `syscall` |
-| **Pseudo-ops** | `label`, `data`, `stack_frame` |
+| **Pseudo-ops** | `label` |
+| **Internal** | `nop`, `memset` |
 
 ### Type System
 
@@ -104,26 +106,18 @@ The `MasmOpcodeKind` discriminator on each instruction indicates which layer it 
 
 ## Implementation Files
 
-**Core Infrastructure:**
+All paths are relative to `src/compiler/`:
 
-| Component | Header | Implementation |
-|-----------|--------|----------------|
-| Container | `masm/masm.h` | `masm/masm.c` |
-| IR Opcodes | `masm/ir.h` | `masm/ir.c` |
-| Target | `masm/target.h` | `masm/target.c` |
-| Operands | `masm/operand.h` | `masm/operand.c` |
-| Sections | `masm/section.h` | `masm/section.c` |
-| Symbols | `masm/symbol.h` | `masm/symbol.c` |
-| Types | `masm/type.h` | `masm/type.c` |
-| Lowering | `masm/lower.h` | `masm/lower.c` |
-| Emission | `masm/emit.h` | `masm/emit.c` |
-
-**Platform-Specific Backends:**
-
-| Component | Location |
-|-----------|----------|
-| x86_64 ISA | `masm/isa/x86_64/` |
-| System V ABI | `masm/abi/sysv64.c` |
-| ELF Format | `masm/of/elf.c` |
-
-All paths are relative to `src/compiler/`.
+| Module | Path | Description |
+|--------|------|-------------|
+| Context | `masm.mach` | MASM context, section/symbol management |
+| IR | `masm/ir.mach` | IR opcodes, Inst/Operand/Block/Function records |
+| Sections | `masm/section.mach` | Section kinds, byte emission, relocations |
+| Symbols | `masm/symbol.mach` | Symbol binding, kinds, symbol table |
+| Types | `masm/type.mach` | Machine-level type representation |
+| Target | `target.mach` | Target triple parsing and interface composition |
+| Object Format | `of.mach` | ObjectFormat/ExecFormat/OutputBuffer interfaces |
+| Lowering | `lower.mach` | AST → MASM IR |
+| ISA | `isa/x86_64/` | x86_64 isel, encoding |
+| ABI | `abi/sysv64.mach` | System V AMD64 calling convention |
+| ELF | `of/elf/` | ELF object and executable emission |

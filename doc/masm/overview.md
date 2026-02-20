@@ -80,7 +80,7 @@ pub val OP_BRCOND: Operator = 20;
 
 **Layer 2: Target-Specific**
 
-Machine-level instructions with full target semantics. These are ISA-specific opcodes defined by each backend (e.g., x86_64 backend defines MOV_RR, ADD_RI, SYSCALL, etc.).
+Machine-level instructions with full target semantics. These are ISA-specific opcode values defined by each backend (e.g., the x86_64 backend defines MOV_RR, ADD_RI, SYSCALL, etc.) and stored in the same `Inst.op` field.
 
 - Emitted by instruction selection (isel)
 - Includes register/memory addressing variants
