@@ -28,6 +28,7 @@ use ir_peep:  mach.compiler.masm.opt.peephole;
 use lower:    mach.compiler.lower;
 use ldecl:    mach.compiler.lower.decl;
 use regalloc: mach.compiler.regalloc;
+use di:       mach.compiler.di;
 use cemit:    mach.compiler.emit;
 use emasm:    mach.compiler.emit_asm;
 use emmasm:   mach.compiler.emit_masm;
@@ -244,7 +245,13 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
 
     # lower entry module
     if (verbose) { print.eprint("[verbose] lower: lowering entry module\n"); }
-    val lctx_res: Result[lower.LowerContext, str] = lower.create(alloc, tgt, mctx, symbols, nil);
+    var entry_file: str = nil;
+    var entry_source: str = nil;
+    if (sem != nil) {
+        entry_file = sem.file_path;
+        entry_source = sem.source;
+    }
+    val lctx_res: Result[lower.LowerContext, str] = lower.create(alloc, tgt, mctx, symbols, nil, entry_file, entry_source);
     if (result_is_err[lower.LowerContext, str](lctx_res)) { ret result; }
 
     var lctx: lower.LowerContext = result_unwrap_ok[lower.LowerContext, str](lctx_res);
@@ -279,7 +286,7 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
                             mi::i64, m.path);
                     }
                     val mlctx_res: Result[lower.LowerContext, str] =
-                        lower.create(alloc, tgt, mctx, m.table, nil);
+                        lower.create(alloc, tgt, mctx, m.table, nil, m.file_path, m.source);
                     if (result_is_ok[lower.LowerContext, str](mlctx_res)) {
                         var mlctx: lower.LowerContext =
                             result_unwrap_ok[lower.LowerContext, str](mlctx_res);
@@ -362,6 +369,8 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
                     label_mi.dst = ir_inst.dst; # carries the label operand
                     label_mi.size = 0;
                     label_mi.flags = 0;
+                    label_mi.src_line = ir_inst.src_line;
+                    label_mi.src_file = ir_inst.src_file;
                     isa.buf_append(?func_buf, label_mi);
                 } or {
                     # ISel → per-inst buf → peephole → append to func_buf
@@ -369,10 +378,13 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
                     i.isel(i.ctx, ir_inst, ?inst_buf);
                     i.peephole(i.ctx, ?inst_buf);
 
+                    # propagate source location from IR to all generated MachInsts
                     var mi: i32 = 0;
                     for (mi < inst_buf.count) {
                         val minst: *isa.MachInst = isa.buf_get(?inst_buf, mi);
                         if (minst != nil) {
+                            minst.src_line = ir_inst.src_line;
+                            minst.src_file = ir_inst.src_file;
                             isa.buf_append(?func_buf, @minst);
                         }
                         mi = mi + 1;
@@ -482,10 +494,18 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
         # === Phase D: Encode regalloc output ===
         var encode_fails: i32 = 0;
         var encode_ok: i32 = 0;
+        var last_debug_line: i32 = 0;
         var ei: i32 = 0;
         for (ei < ra.out.count) {
             val minst: *isa.MachInst = isa.buf_get(?ra.out, ei);
             if (minst == nil) { ei = ei + 1; cnt; }
+
+            # emit debug line entry on line transitions
+            if (minst.src_line > 0 && minst.src_line != last_debug_line) {
+                val dbg_off: usize = section.current_offset(text_sec);
+                masm.add_debug_line(mctx, dbg_off, minst.src_file, minst.src_line);
+                last_debug_line = minst.src_line;
+            }
 
             if (minst.opcode == isa.MACHINST_LABEL) {
                 # register label symbol at current section offset
@@ -661,6 +681,88 @@ fun resolve_externs(mctx: *masm.Context, alloc: *allocator.Allocator) {
     }
 }
 
+# emit_debug_sections: generate debug sections from MASM context and add them as sections.
+# ---
+# uses the target's debug info format (DWARF for ELF/Mach-O, CodeView for COFF, etc.)
+# to serialize function and line data into .debug_* sections that get included in .o files.
+fun emit_debug_sections(mctx: *masm.Context, tgt: *target.Target,
+                        alloc: *allocator.Allocator) {
+    if (mctx == nil || tgt == nil || alloc == nil) { ret; }
+    if (mctx.debug_file_count == 0 && mctx.debug_line_count == 0) { ret; }
+
+    # create a fresh DebugInfo for this compilation unit
+    val di_r: Result[di.DebugInfo, str] = target.create_debug_info(tgt, alloc);
+    if (result_is_err[di.DebugInfo, str](di_r)) { ret; }
+    var di_info: di.DebugInfo = result_unwrap_ok[di.DebugInfo, str](di_r);
+
+    # register debug files
+    var fi: i32 = 0;
+    for (fi < mctx.debug_file_count) {
+        if (mctx.debug_files[fi] != nil) {
+            di_info.add_file(di_info.ctx, mctx.debug_files[fi], ".");
+        }
+        fi = fi + 1;
+    }
+
+    # register subprograms from function symbols
+    var si: i32 = 0;
+    for (si < mctx.symbol_count) {
+        val s: *sym.Symbol = mctx.symbols[si];
+        if (s != nil && s.defined && s.sym_type == sym.SYM_FUNC && s.size > 0) {
+            var sub: di.DISubprogram;
+            sub.name = s.name;
+            sub.low_pc = s.offset::u64;
+            sub.high_pc = (s.offset + s.size)::u64;
+            sub.line = s.src_line;
+
+            # resolve file index via the DebugInfo interface (deduplicates)
+            sub.file_idx = 0;
+            if (s.src_file != nil) {
+                sub.file_idx = di_info.add_file(di_info.ctx, s.src_file, ".");
+            }
+
+            di_info.add_subprogram(di_info.ctx, ?sub);
+        }
+        si = si + 1;
+    }
+
+    # register line entries
+    var li: i32 = 0;
+    for (li < mctx.debug_line_count) {
+        var entry: di.DILineEntry;
+        entry.address = mctx.debug_lines[li].code_offset::u64;
+        entry.file_idx = mctx.debug_lines[li].file_idx;
+        entry.line = mctx.debug_lines[li].line;
+        di_info.add_line(di_info.ctx, ?entry);
+        li = li + 1;
+    }
+
+    # finalize and add resulting sections to MASM context
+    di_info.finalize(di_info.ctx, alloc);
+
+    var sec_count: i32 = 0;
+    val dbg_secs: *di.DebugSection = di_info.get_sections(di_info.ctx, ?sec_count);
+
+    var dsi: i32 = 0;
+    for (dsi < sec_count) {
+        if (dbg_secs[dsi].data != nil && dbg_secs[dsi].size > 0) {
+            val sec_r: Result[*section.Section, str] = masm.get_or_create_section(
+                mctx, dbg_secs[dsi].name, section.SEC_CUSTOM);
+            if (result_is_ok[*section.Section, str](sec_r)) {
+                val sec: *section.Section =
+                    result_unwrap_ok[*section.Section, str](sec_r);
+                # debug sections are not allocatable
+                sec.flags = 0;
+                section.emit_bytes(alloc, sec, dbg_secs[dsi].data::&u8,
+                                   dbg_secs[dsi].size);
+            }
+        }
+        dsi = dsi + 1;
+    }
+
+    di_info.destroy(di_info.ctx);
+}
+
 # module_path_to_artifact_path: convert a module path to an artifact file path.
 # strips project_id prefix if present, replaces dots with '/', appends suffix,
 # prepends base_dir.
@@ -763,8 +865,14 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
     @mctx = result_unwrap_ok[masm.Context, str](mctx_res);
 
     # 2. lower this module
+    var mod_file: str = nil;
+    var mod_source: str = nil;
+    if (smod != nil) {
+        mod_file = smod.file_path;
+        mod_source = smod.source;
+    }
     val lctx_res: Result[lower.LowerContext, str] =
-        lower.create(alloc, tgt, mctx, symbols, nil);
+        lower.create(alloc, tgt, mctx, symbols, nil, mod_file, mod_source);
     if (result_is_err[lower.LowerContext, str](lctx_res)) { ret false; }
 
     var lctx: lower.LowerContext =
@@ -862,6 +970,9 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
 
     # 6. resolve external references
     resolve_externs(mctx, alloc);
+
+    # 6b. generate debug sections
+    emit_debug_sections(mctx, tgt, alloc);
 
     # 7. emit .o file
     if (verbose) {
@@ -1064,6 +1175,9 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
     if (!codegen(lr.mctx, ?opts.target, opts.alloc, opts.verbose, nil)) {
         ret err[CompileResult, str]("code generation failed");
     }
+
+    # generate debug sections for the monolithic .o
+    emit_debug_sections(lr.mctx, ?opts.target, opts.alloc);
 
     if (opts.obj_path != nil) {
         if (opts.verbose) {
