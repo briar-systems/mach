@@ -9,14 +9,16 @@ use mach.compiler.lower;
 
 # mach.compiler.lower.iasm: inline assembly lowering.
 # ---
-# dispatches inline asm blocks to the target ISA's parser.
-# fully target-agnostic — all ISA-specific parsing (mnemonics,
-# registers, operand syntax) lives in isa/<arch>/iasm.mach.
+# parses MASM IR text syntax (the compiler's target-independent IR)
+# as the primary mode for `asm { ... }` blocks. ISA-specific blocks
+# like `x86_64 { ... }` are an escape hatch delegated to the ISA parser.
 #
-# asm content format (as stored by parser):
-#   "<isa_name> {\n    <isa-specific instructions>\n  }"
+# MASM text syntax: one instruction per line, `#` comments.
+# mnemonics match IR opcode names exactly (mov, load, store, add, ...).
+# operands resolve to variables (local_lookup), immediates, or labels.
 #
-# anything outside an ISA-specific block is MASM IR (future).
+# the `syscall` instruction is variadic and expands to register loads
+# via the ISA's syscall_regs interface + OP_SYSCALL + result store.
 
 # lower_asm: parse and lower an inline asm block.
 pub fun lower_asm(ctx: *LowerContext, content: str) {
@@ -67,18 +69,358 @@ pub fun lower_asm(ctx: *LowerContext, content: str) {
         }
 
         isa.asm_buf_destroy(?buf);
+        ret;
     }
-    # else: bare content without ISA prefix → MASM IR (not yet implemented)
+
+    # bare content without ISA prefix → MASM IR
+    val len: usize = str_len(content);
+    parse_masm_block(ctx, content, 0, len);
 }
 
-# --- string helpers ---
+# --- MASM IR block parser ---
+
+# parse_masm_block: parse MASM IR text, one instruction per line.
+fun parse_masm_block(ctx: *LowerContext, s: str, start: usize, end: usize) {
+    var pos: usize = start;
+    for (pos < end) {
+        pos = skip_ws(s, pos);
+        if (pos >= end) { brk; }
+
+        # find end of line
+        var line_end: usize = pos;
+        for (line_end < end && s[line_end] != '\n') {
+            line_end = line_end + 1;
+        }
+
+        # strip inline comments starting with '#'
+        var trimmed_end: usize = line_end;
+        var ci: usize = pos;
+        for (ci < trimmed_end) {
+            if (s[ci] == '#') {
+                trimmed_end = ci;
+                brk;
+            }
+            ci = ci + 1;
+        }
+
+        # strip trailing whitespace
+        for (trimmed_end > pos && is_ws(s[trimmed_end - 1])) {
+            trimmed_end = trimmed_end - 1;
+        }
+
+        if (trimmed_end > pos) {
+            parse_masm_instruction(ctx, s, pos, trimmed_end);
+        }
+
+        pos = line_end + 1;
+    }
+}
+
+# parse_masm_instruction: parse a single MASM IR instruction line.
+fun parse_masm_instruction(ctx: *LowerContext, s: str, start: usize, end: usize) {
+    var pos: usize = start;
+    val psz: u8 = ctx.ptr_size;
+
+    # extract mnemonic (may contain '.cc' suffix)
+    val mnem_start: usize = pos;
+    for (pos < end && !is_ws(s[pos]) && s[pos] != ',') {
+        pos = pos + 1;
+    }
+    val mnem_end: usize = pos;
+    val mnem_len: usize = mnem_end - mnem_start;
+
+    # split mnemonic at '.' for condition code suffix
+    var base_end: usize = mnem_start;
+    for (base_end < mnem_end && s[base_end] != '.') {
+        base_end = base_end + 1;
+    }
+    val base_len: usize = base_end - mnem_start;
+
+    var cc: ir.Cond = ir.CC_NONE;
+    if (base_end < mnem_end) {
+        cc = parse_cc(s, base_end + 1, mnem_end);
+    }
+
+    pos = skip_ws(s, pos);
+
+    # --- syscall (special variadic form) ---
+    if (region_eq(s, mnem_start, base_len, "syscall")) {
+        lower_masm_syscall(ctx, s, pos, end);
+        ret;
+    }
+
+    # --- zero-operand instructions ---
+    if (region_eq(s, mnem_start, base_len, "ret")) {
+        emit(ctx, ir.OP_RET, ir.make_none(), ir.make_none(), ir.make_none(), ir.CC_NONE);
+        ret;
+    }
+    if (region_eq(s, mnem_start, base_len, "nop")) {
+        emit(ctx, ir.OP_NOP, ir.make_none(), ir.make_none(), ir.make_none(), ir.CC_NONE);
+        ret;
+    }
+
+    # --- single-operand instructions ---
+    if (region_eq(s, mnem_start, base_len, "jmp")) {
+        val op1: ir.Operand = resolve_operand(ctx, s, pos, end);
+        emit(ctx, ir.OP_JMP, op1, ir.make_none(), ir.make_none(), ir.CC_NONE);
+        ret;
+    }
+    if (region_eq(s, mnem_start, base_len, "call")) {
+        val op1: ir.Operand = resolve_operand(ctx, s, pos, end);
+        emit(ctx, ir.OP_CALL, op1, ir.make_none(), ir.make_none(), ir.CC_NONE);
+        ret;
+    }
+    if (region_eq(s, mnem_start, base_len, "label")) {
+        val op1: ir.Operand = resolve_operand(ctx, s, pos, end);
+        emit(ctx, ir.OP_LABEL, op1, ir.make_none(), ir.make_none(), ir.CC_NONE);
+        ret;
+    }
+
+    # --- two-operand instructions (dst, src) ---
+    if (region_eq(s, mnem_start, base_len, "mov") ||
+        region_eq(s, mnem_start, base_len, "load") ||
+        region_eq(s, mnem_start, base_len, "store") ||
+        region_eq(s, mnem_start, base_len, "addr") ||
+        region_eq(s, mnem_start, base_len, "zext") ||
+        region_eq(s, mnem_start, base_len, "sext") ||
+        region_eq(s, mnem_start, base_len, "trunc") ||
+        region_eq(s, mnem_start, base_len, "itof") ||
+        region_eq(s, mnem_start, base_len, "ftoi") ||
+        region_eq(s, mnem_start, base_len, "fext") ||
+        region_eq(s, mnem_start, base_len, "ftrunc")) {
+
+        val op: ir.Operator = match_opcode_2(s, mnem_start, base_len);
+        if (op == 255::ir.Operator) { ret; }
+
+        var dst: ir.Operand = ir.make_none();
+        var src: ir.Operand = ir.make_none();
+        pos = parse_next_operand(ctx, s, pos, end, ?dst);
+        pos = parse_next_operand(ctx, s, pos, end, ?src);
+        emit(ctx, op, dst, src, ir.make_none(), cc);
+        ret;
+    }
+
+    # --- two-operand with condition code: brcond.cc cond, label ---
+    if (region_eq(s, mnem_start, base_len, "brcond")) {
+        var cond_op: ir.Operand = ir.make_none();
+        var label_op: ir.Operand = ir.make_none();
+        pos = parse_next_operand(ctx, s, pos, end, ?cond_op);
+        pos = parse_next_operand(ctx, s, pos, end, ?label_op);
+        emit(ctx, ir.OP_BRCOND, label_op, cond_op, ir.make_none(), cc);
+        ret;
+    }
+
+    # --- three-operand instructions (dst, src1, src2) ---
+    val op3: ir.Operator = match_opcode_3(s, mnem_start, base_len);
+    if (op3 != 255::ir.Operator) {
+        var dst: ir.Operand = ir.make_none();
+        var src1: ir.Operand = ir.make_none();
+        var src2: ir.Operand = ir.make_none();
+        pos = parse_next_operand(ctx, s, pos, end, ?dst);
+        pos = parse_next_operand(ctx, s, pos, end, ?src1);
+        pos = parse_next_operand(ctx, s, pos, end, ?src2);
+        emit(ctx, op3, dst, src1, src2, cc);
+        ret;
+    }
+}
+
+# --- opcode matching ---
+
+fun match_opcode_2(s: str, start: usize, len: usize) ir.Operator {
+    if (region_eq(s, start, len, "mov"))    { ret ir.OP_MOV; }
+    if (region_eq(s, start, len, "load"))   { ret ir.OP_LOAD; }
+    if (region_eq(s, start, len, "store"))  { ret ir.OP_STORE; }
+    if (region_eq(s, start, len, "addr"))   { ret ir.OP_ADDR; }
+    if (region_eq(s, start, len, "zext"))   { ret ir.OP_ZEXT; }
+    if (region_eq(s, start, len, "sext"))   { ret ir.OP_SEXT; }
+    if (region_eq(s, start, len, "trunc"))  { ret ir.OP_TRUNC; }
+    if (region_eq(s, start, len, "itof"))   { ret ir.OP_ITOF; }
+    if (region_eq(s, start, len, "ftoi"))   { ret ir.OP_FTOI; }
+    if (region_eq(s, start, len, "fext"))   { ret ir.OP_FEXT; }
+    if (region_eq(s, start, len, "ftrunc")) { ret ir.OP_FTRUNC; }
+    ret 255::ir.Operator;
+}
+
+fun match_opcode_3(s: str, start: usize, len: usize) ir.Operator {
+    if (region_eq(s, start, len, "add"))  { ret ir.OP_ADD; }
+    if (region_eq(s, start, len, "sub"))  { ret ir.OP_SUB; }
+    if (region_eq(s, start, len, "mul"))  { ret ir.OP_MUL; }
+    if (region_eq(s, start, len, "div"))  { ret ir.OP_DIV; }
+    if (region_eq(s, start, len, "mod"))  { ret ir.OP_MOD; }
+    if (region_eq(s, start, len, "divu")) { ret ir.OP_DIVU; }
+    if (region_eq(s, start, len, "modu")) { ret ir.OP_MODU; }
+    if (region_eq(s, start, len, "and"))  { ret ir.OP_AND; }
+    if (region_eq(s, start, len, "or"))   { ret ir.OP_OR; }
+    if (region_eq(s, start, len, "xor"))  { ret ir.OP_XOR; }
+    if (region_eq(s, start, len, "shl"))  { ret ir.OP_SHL; }
+    if (region_eq(s, start, len, "shr"))  { ret ir.OP_SHR; }
+    if (region_eq(s, start, len, "sar"))  { ret ir.OP_SAR; }
+    if (region_eq(s, start, len, "icmp")) { ret ir.OP_ICMP; }
+    if (region_eq(s, start, len, "fcmp")) { ret ir.OP_FCMP; }
+    if (region_eq(s, start, len, "fadd")) { ret ir.OP_FADD; }
+    if (region_eq(s, start, len, "fsub")) { ret ir.OP_FSUB; }
+    if (region_eq(s, start, len, "fmul")) { ret ir.OP_FMUL; }
+    if (region_eq(s, start, len, "fdiv")) { ret ir.OP_FDIV; }
+    ret 255::ir.Operator;
+}
+
+# --- condition code parsing ---
+
+fun parse_cc(s: str, start: usize, end: usize) ir.Cond {
+    val len: usize = end - start;
+    if (region_eq(s, start, len, "eq"))  { ret ir.CC_EQ; }
+    if (region_eq(s, start, len, "ne"))  { ret ir.CC_NE; }
+    if (region_eq(s, start, len, "lt"))  { ret ir.CC_LT; }
+    if (region_eq(s, start, len, "le"))  { ret ir.CC_LE; }
+    if (region_eq(s, start, len, "gt"))  { ret ir.CC_GT; }
+    if (region_eq(s, start, len, "ge"))  { ret ir.CC_GE; }
+    if (region_eq(s, start, len, "ult")) { ret ir.CC_ULT; }
+    if (region_eq(s, start, len, "ule")) { ret ir.CC_ULE; }
+    if (region_eq(s, start, len, "ugt")) { ret ir.CC_UGT; }
+    if (region_eq(s, start, len, "uge")) { ret ir.CC_UGE; }
+    ret ir.CC_NONE;
+}
+
+# --- syscall expansion ---
+
+# lower_masm_syscall: expand `syscall out, num [, a0..a5]`
+#
+# generates:
+#   LOAD phys_reg[0], [FP + num.offset]    # syscall number
+#   LOAD phys_reg[1], [FP + a0.offset]     # arg0
+#   ...
+#   SYSCALL
+#   STORE [FP + out.offset], ret_reg        # result
+fun lower_masm_syscall(ctx: *LowerContext, s: str, start: usize, end: usize) {
+    val psz: u8 = ctx.ptr_size;
+    val i: *isa.ISA = ?ctx.target.isa;
+    val sc_file: isa.RegisterFile = i.syscall_regs(i.ctx);
+    val sc_ret: isa.Register = i.syscall_ret_reg(i.ctx);
+
+    # collect operand tokens: out, num, a0, a1, ...
+    # max 8 operands (out + num + 6 args)
+    var ops: [8]ir.Operand;
+    var op_count: i32 = 0;
+    var pos: usize = start;
+
+    for (pos < end && op_count < 8) {
+        pos = skip_ws(s, pos);
+        if (pos >= end) { brk; }
+
+        var op: ir.Operand = ir.make_none();
+        pos = parse_next_operand(ctx, s, pos, end, ?op);
+        ops[op_count] = op;
+        op_count = op_count + 1;
+    }
+
+    # need at least 2 operands: out and num
+    if (op_count < 2) { ret; }
+
+    val out_op: ir.Operand = ops[0];
+
+    # load syscall number into phys register [0] (e.g. RAX)
+    if (sc_file.count > 0) {
+        val num_reg: ir.Operand = ir.make_reg(sc_file.regs[0].id, psz);
+        emit_load(ctx, num_reg, ops[1]);
+    }
+
+    # load arguments into phys registers [1..N]
+    var ai: i32 = 2;
+    for (ai < op_count) {
+        val reg_idx: i32 = ai - 1;
+        if (reg_idx >= sc_file.count) { brk; }
+        val arg_reg: ir.Operand = ir.make_reg(sc_file.regs[reg_idx].id, psz);
+        emit_load(ctx, arg_reg, ops[ai]);
+        ai = ai + 1;
+    }
+
+    # emit SYSCALL
+    emit(ctx, ir.OP_SYSCALL, ir.make_none(), ir.make_none(),
+         ir.make_none(), ir.CC_NONE);
+
+    # store result register into out
+    val ret_reg: ir.Operand = ir.make_reg(sc_ret.id, psz);
+    emit_store(ctx, out_op, ret_reg);
+}
+
+# --- operand resolution ---
+
+# parse_next_operand: extract the next comma-separated operand token,
+# resolve it, and advance pos past the comma.
+fun parse_next_operand(ctx: *LowerContext, s: str, start: usize, end: usize,
+                       out: *ir.Operand) usize {
+    var pos: usize = start;
+    pos = skip_ws(s, pos);
+
+    # find token end (comma or end of range)
+    val tok_start: usize = pos;
+    for (pos < end && s[pos] != ',') {
+        pos = pos + 1;
+    }
+
+    # strip trailing whitespace from token
+    var tok_end: usize = pos;
+    for (tok_end > tok_start && is_ws(s[tok_end - 1])) {
+        tok_end = tok_end - 1;
+    }
+
+    @out = resolve_operand(ctx, s, tok_start, tok_end);
+
+    # skip comma
+    if (pos < end && s[pos] == ',') {
+        pos = pos + 1;
+    }
+    ret pos;
+}
+
+# resolve_operand: resolve a single operand token.
+#   starts with digit or '-'+digit → immediate
+#   starts with '.'               → label reference
+#   otherwise                     → variable name (local_lookup → frame memory)
+fun resolve_operand(ctx: *LowerContext, s: str, start: usize, end: usize) ir.Operand {
+    val psz: u8 = ctx.ptr_size;
+    if (start >= end) { ret ir.make_none(); }
+
+    val c: u8 = s[start];
+
+    # immediate: starts with digit or negative sign followed by digit
+    if (is_digit(c) || (c == '-' && start + 1 < end && is_digit(s[start + 1]))) {
+        val v: i64 = parse_int(s, start, end);
+        ret ir.make_imm(v, psz);
+    }
+
+    # label: starts with '.'
+    if (c == '.') {
+        val label: str = extract_str(ctx, s, start, end);
+        ret ir.make_label(label);
+    }
+
+    # variable name → local lookup
+    val name: str = extract_str(ctx, s, start, end);
+    if (name == nil) { ret ir.make_none(); }
+
+    val lv: *LocalVar = local_lookup(ctx, name);
+    if (lv == nil) { ret ir.make_none(); }
+
+    ret local_operand(lv, psz);
+}
+
+# --- string/parsing helpers ---
 
 fun skip_ws(s: str, pos: usize) usize {
     var p: usize = pos;
-    for (s[p] != 0 && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r')) {
+    for (s[p] != 0 && is_ws(s[p])) {
         p = p + 1;
     }
     ret p;
+}
+
+fun is_ws(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+fun is_digit(c: u8) bool {
+    ret c >= '0' && c <= '9';
 }
 
 fun match_str(s: str, pos: usize, pattern: str) bool {
@@ -88,4 +430,83 @@ fun match_str(s: str, pos: usize, pattern: str) bool {
         i = i + 1;
     }
     ret true;
+}
+
+# region_eq: compare s[start..start+len] against a null-terminated literal.
+fun region_eq(s: str, start: usize, len: usize, lit: str) bool {
+    var li: usize = 0;
+    for (lit[li] != 0) {
+        li = li + 1;
+    }
+    if (li != len) { ret false; }
+
+    var i: usize = 0;
+    for (i < len) {
+        if (s[start + i] != lit[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# extract_str: allocate a copy of s[start..end] as a null-terminated string.
+fun extract_str(ctx: *LowerContext, s: str, start: usize, end: usize) str {
+    val len: usize = end - start;
+    if (len == 0) { ret nil; }
+
+    # try to use a stack buffer for short names to avoid allocation
+    # for names that match locals, the lifetime only matters through local_lookup
+    # but labels need to persist, so always allocate
+    use allocator: std.allocator;
+    val r: Result[*u8, allocator.AllocError] =
+        allocator.allocator_alloc[u8](ctx.alloc, len + 1);
+    if (result_is_err[*u8, allocator.AllocError](r)) { ret nil; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](r);
+
+    var i: usize = 0;
+    for (i < len) {
+        buf[i] = s[start + i];
+        i = i + 1;
+    }
+    buf[len] = 0;
+    ret buf::str;
+}
+
+# parse_int: parse a decimal or hex integer from s[start..end].
+fun parse_int(s: str, start: usize, end: usize) i64 {
+    var pos: usize = start;
+    var neg: bool = false;
+
+    if (pos < end && s[pos] == '-') {
+        neg = true;
+        pos = pos + 1;
+    }
+
+    var base: i64 = 10;
+    if (pos + 1 < end && s[pos] == '0' && (s[pos + 1] == 'x' || s[pos + 1] == 'X')) {
+        base = 16;
+        pos = pos + 2;
+    }
+
+    var value: i64 = 0;
+    for (pos < end) {
+        val c: u8 = s[pos];
+        var digit: i64 = -1;
+        if (c >= '0' && c <= '9') { digit = (c - '0')::i64; }
+        or (c >= 'a' && c <= 'f') { digit = (c - 'a' + 10)::i64; }
+        or (c >= 'A' && c <= 'F') { digit = (c - 'A' + 10)::i64; }
+        if (digit < 0 || digit >= base) { brk; }
+        value = value * base + digit;
+        pos = pos + 1;
+    }
+
+    if (neg) { value = -value; }
+    ret value;
+}
+
+# str_len: get the length of a null-terminated string.
+fun str_len(s: str) usize {
+    if (s == nil) { ret 0; }
+    var i: usize = 0;
+    for (s[i] != 0) { i = i + 1; }
+    ret i;
 }
