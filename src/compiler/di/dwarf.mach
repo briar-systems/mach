@@ -94,6 +94,10 @@ rec DWARFContext {
     sections:   [3]di.DebugSection;
     sec_count:  i32;
 
+    # per-.o file index mapping (set by read_line, used by read_info)
+    last_file_map:       *u16;
+    last_file_map_count: i32;
+
     # serialized buffers
     abbrev_buf: of.OutputBuffer;
     info_buf:   of.OutputBuffer;
@@ -149,6 +153,8 @@ pub fun create(alloc: *allocator.Allocator, ptr_size: usize, endian: u8) Result[
     d.add_file = dwarf_add_file;
     d.add_subprogram = dwarf_add_subprogram;
     d.add_line = dwarf_add_line;
+    d.read_info = dwarf_read_info;
+    d.read_line = dwarf_read_line;
     d.finalize = dwarf_finalize;
     d.get_sections = dwarf_get_sections;
     d.destroy = dwarf_destroy;
@@ -235,6 +241,298 @@ fun dwarf_add_line(ctx: ptr, entry: *di.DILineEntry) {
     d.line_count = d.line_count + 1;
 }
 
+# --- .debug_info reader ---
+#
+# parses a .debug_info section produced by our DWARF emitter.
+# extracts subprogram entries (abbrev code 2) with adjusted addresses.
+# format (known because we control the emitter):
+#   [unit header: 4B length, 2B version, 4B abbrev_off, 1B addr_size]
+#   [CU DIE (abbrev 1): producer string, language u16, name string,
+#    comp_dir string, low_pc addr, high_pc addr, stmt_list u32]
+#   [subprogram DIEs (abbrev 2): name string, file_idx u16,
+#    line u32, low_pc addr, high_pc addr]*
+#   [0 terminator]
+
+fun dwarf_read_info(ctx: ptr, data: *u8, size: usize, addr_offset: u64,
+                    alloc: *allocator.Allocator) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || data == nil || size < 11 || alloc == nil) { ret; }
+
+    val addr_sz: usize = d.ptr_size;
+    var pos: usize = 0;
+
+    # skip unit header (11 bytes)
+    pos = 11;
+    if (pos >= size) { ret; }
+
+    # read CU DIE abbrev code — must be 1
+    val cu_abbrev: u64 = read_uleb128_r(data, size, ?pos);
+    if (cu_abbrev != 1) { ret; }
+
+    # skip CU DIE fields:
+    #   producer (string), language (u16), name (string), comp_dir (string)
+    skip_string(data, size, ?pos);    # producer
+    pos = pos + 2;                    # language
+    skip_string(data, size, ?pos);    # name
+    skip_string(data, size, ?pos);    # comp_dir
+    #   low_pc (addr), high_pc (addr), stmt_list (u32)
+    pos = pos + addr_sz + addr_sz + 4;
+
+    if (pos >= size) { ret; }
+
+    # read subprogram DIEs until null terminator
+    for (pos < size) {
+        val abbrev: u64 = read_uleb128_r(data, size, ?pos);
+        if (abbrev == 0) { brk; }   # null terminator
+        if (abbrev != 2) { brk; }   # unexpected abbrev — stop
+
+        if (pos >= size) { brk; }
+
+        # name (null-terminated string)
+        val name: str = (data::usize + pos)::str;
+        skip_string(data, size, ?pos);
+
+        # file_idx (u16)
+        if (pos + 2 > size) { brk; }
+        val file_idx: u16 = read_u16_le_r(data, pos);
+        pos = pos + 2;
+
+        # line (u32)
+        if (pos + 4 > size) { brk; }
+        val line: u32 = read_u32_le_r(data, pos);
+        pos = pos + 4;
+
+        # low_pc (addr)
+        if (pos + addr_sz > size) { brk; }
+        val low_pc: u64 = read_addr_le_r(data, pos, addr_sz) + addr_offset;
+        pos = pos + addr_sz;
+
+        # high_pc (addr)
+        if (pos + addr_sz > size) { brk; }
+        val high_pc: u64 = read_addr_le_r(data, pos, addr_sz) + addr_offset;
+        pos = pos + addr_sz;
+
+        # remap file index using the map built by dwarf_read_line
+        var sub: di.DISubprogram;
+        sub.name = name;
+        sub.file_idx = map_file_idx(d.last_file_map, d.last_file_map_count, file_idx);
+        sub.line = line::i32;
+        sub.low_pc = low_pc;
+        sub.high_pc = high_pc;
+        dwarf_add_subprogram(ctx, ?sub);
+    }
+}
+
+# --- .debug_line reader ---
+#
+# parses a .debug_line section produced by our DWARF emitter.
+# extracts file entries and line mappings with adjusted addresses.
+# format (known because we control the emitter):
+#   [unit header: 4B length, 2B version, 4B header_length]
+#   [prologue params: min_inst_len, max_ops, default_stmt,
+#    line_base, line_range, opcode_base, 12 opcode lengths]
+#   [include directories: 0 terminator]
+#   [file entries: (name string, dir uleb128, mtime uleb128, size uleb128)*, 0]
+#   [line program opcodes]
+
+fun dwarf_read_line(ctx: ptr, data: *u8, size: usize, addr_offset: u64,
+                    alloc: *allocator.Allocator) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || data == nil || size < 10 || alloc == nil) { ret; }
+
+    val addr_sz: usize = d.ptr_size;
+    var pos: usize = 0;
+
+    # unit header
+    pos = 4;                              # skip unit_length
+    val version: u16 = read_u16_le_r(data, pos);
+    pos = pos + 2;
+    if (version != 4) { ret; }
+
+    val header_length: u32 = read_u32_le_r(data, pos);
+    pos = pos + 4;
+
+    val program_start: usize = pos + header_length::usize;
+
+    # skip prologue params (1+1+1+1+1+1 + 12 = 18 bytes)
+    pos = pos + 18;
+    if (pos >= size) { ret; }
+
+    # skip include directories (null-terminated list, we have 0 = none)
+    if (data[pos] == 0) {
+        pos = pos + 1;
+    } or {
+        for (pos < size && data[pos] != 0) {
+            skip_string(data, size, ?pos);
+        }
+        if (pos < size) { pos = pos + 1; }
+    }
+
+    # read file entries: (name, dir_idx, mtime, size), terminated by 0
+    # build a file index map: .o file_idx → merged file_idx
+    val max_files: i32 = 128;
+    val fidx_r: Result[*u16, allocator.AllocError] =
+        allocator.allocator_zalloc[u16](alloc, max_files::usize);
+    if (result_is_err[*u16, allocator.AllocError](fidx_r)) { ret; }
+    val file_map: *u16 = result_unwrap_ok[*u16, allocator.AllocError](fidx_r);
+    var file_count: i32 = 0;
+
+    for (pos < size && data[pos] != 0) {
+        val file_name: str = (data::usize + pos)::str;
+        skip_string(data, size, ?pos);
+        read_uleb128_r(data, size, ?pos);  # dir_idx
+        read_uleb128_r(data, size, ?pos);  # mtime
+        read_uleb128_r(data, size, ?pos);  # file_size
+
+        # register file in the merged DebugInfo (1-based indexing)
+        if (file_count < max_files) {
+            val merged_idx: u16 = dwarf_add_file(ctx, file_name, ".");
+            file_map[file_count] = merged_idx;
+            file_count = file_count + 1;
+        }
+    }
+    if (pos < size) { pos = pos + 1; } # skip terminating 0
+
+    # advance to program start
+    if (program_start > pos) { pos = program_start; }
+
+    # store file map in context for dwarf_read_info to remap file indices
+    d.last_file_map = file_map;
+    d.last_file_map_count = file_count;
+
+    # execute the line number program
+    # addresses in .o are section-relative; start from addr_offset
+    var cur_addr: u64 = addr_offset;
+    var cur_file: u16 = 1;
+    var cur_line: i32 = 1;
+
+    for (pos < size) {
+        val opcode: u8 = data[pos];
+        pos = pos + 1;
+
+        if (opcode == 0) {
+            # extended opcode
+            val ext_len: u64 = read_uleb128_r(data, size, ?pos);
+            if (pos >= size) { brk; }
+            val ext_op: u8 = data[pos];
+            pos = pos + 1;
+
+            if (ext_op == DW_LNE_end_sequence) {
+                brk;
+            } or (ext_op == DW_LNE_set_address) {
+                if (pos + addr_sz > size) { brk; }
+                cur_addr = read_addr_le_r(data, pos, addr_sz) + addr_offset;
+                pos = pos + addr_sz;
+            } or {
+                # skip unknown extended opcode
+                if (ext_len > 1) {
+                    pos = pos + (ext_len - 1)::usize;
+                }
+            }
+        } or (opcode == DW_LNS_copy) {
+            # emit a row
+            val mapped_file: u16 = map_file_idx(file_map, file_count, cur_file);
+            var entry: di.DILineEntry;
+            entry.address = cur_addr;
+            entry.file_idx = mapped_file;
+            entry.line = cur_line;
+            dwarf_add_line(ctx, ?entry);
+        } or (opcode == DW_LNS_advance_pc) {
+            val adv: u64 = read_uleb128_r(data, size, ?pos);
+            cur_addr = cur_addr + adv;
+        } or (opcode == DW_LNS_advance_line) {
+            val adv: i64 = read_sleb128_r(data, size, ?pos);
+            cur_line = cur_line + adv::i32;
+        } or (opcode == DW_LNS_set_file) {
+            val fi: u64 = read_uleb128_r(data, size, ?pos);
+            cur_file = fi::u16;
+        } or (opcode == DW_LNS_set_column) {
+            read_uleb128_r(data, size, ?pos); # skip column
+        } or (opcode == DW_LNS_negate_stmt) {
+            # skip
+        } or (opcode >= 13) {
+            # special opcode — skip (we don't emit these, but handle gracefully)
+        } or {
+            # other standard opcodes (7-12): skip their arguments
+            # opcodes 7,8,10,11 have 0 args; 9,12 have 1 arg
+            if (opcode == 9 || opcode == 12) {
+                read_uleb128_r(data, size, ?pos);
+            }
+        }
+    }
+
+    # file_map is kept alive in d.last_file_map for dwarf_read_info
+}
+
+# --- reader helpers ---
+
+fun read_u16_le_r(data: *u8, pos: usize) u16 {
+    ret data[pos]::u16 | (data[pos + 1]::u16 << 8);
+}
+
+fun read_u32_le_r(data: *u8, pos: usize) u32 {
+    ret data[pos]::u32 | (data[pos + 1]::u32 << 8)
+        | (data[pos + 2]::u32 << 16) | (data[pos + 3]::u32 << 24);
+}
+
+fun read_u64_le_r(data: *u8, pos: usize) u64 {
+    ret data[pos]::u64 | (data[pos + 1]::u64 << 8)
+        | (data[pos + 2]::u64 << 16) | (data[pos + 3]::u64 << 24)
+        | (data[pos + 4]::u64 << 32) | (data[pos + 5]::u64 << 40)
+        | (data[pos + 6]::u64 << 48) | (data[pos + 7]::u64 << 56);
+}
+
+fun read_addr_le_r(data: *u8, pos: usize, addr_sz: usize) u64 {
+    if (addr_sz == 4) { ret read_u32_le_r(data, pos)::u64; }
+    ret read_u64_le_r(data, pos);
+}
+
+fun read_uleb128_r(data: *u8, size: usize, pos: *usize) u64 {
+    var result: u64 = 0;
+    var shift: u64 = 0;
+    for (@pos < size) {
+        val b: u8 = data[@pos];
+        @pos = @pos + 1;
+        result = result | ((b & 0x7f)::u64 << shift);
+        if ((b & 0x80) == 0) { brk; }
+        shift = shift + 7;
+    }
+    ret result;
+}
+
+fun read_sleb128_r(data: *u8, size: usize, pos: *usize) i64 {
+    var result: i64 = 0;
+    var shift: i64 = 0;
+    var b: u8 = 0;
+    for (@pos < size) {
+        b = data[@pos];
+        @pos = @pos + 1;
+        result = result | ((b & 0x7f)::i64 << shift);
+        shift = shift + 7;
+        if ((b & 0x80) == 0) { brk; }
+    }
+    if (shift < 64 && (b & 0x40) != 0) {
+        result = result | ((-1::i64) << shift);
+    }
+    ret result;
+}
+
+fun skip_string(data: *u8, size: usize, pos: *usize) {
+    for (@pos < size && data[@pos] != 0) {
+        @pos = @pos + 1;
+    }
+    if (@pos < size) { @pos = @pos + 1; } # skip null terminator
+}
+
+fun map_file_idx(file_map: *u16, count: i32, idx: u16) u16 {
+    # DWARF file indices are 1-based; file_map is 0-based
+    val i: i32 = idx::i32 - 1;
+    if (i >= 0 && i < count && file_map != nil) {
+        ret file_map[i];
+    }
+    ret idx;
+}
+
 fun dwarf_destroy(ctx: ptr) {
     val d: *DWARFContext = ctx::*DWARFContext;
     if (d == nil || d.alloc == nil) { ret; }
@@ -247,6 +545,9 @@ fun dwarf_destroy(ctx: ptr) {
     }
     if (d.lines != nil) {
         allocator.allocator_free[di.DILineEntry](d.alloc, d.lines, d.line_cap::usize);
+    }
+    if (d.last_file_map != nil) {
+        allocator.allocator_free[u16](d.alloc, d.last_file_map, 128);
     }
     of.buf_destroy(?d.abbrev_buf);
     of.buf_destroy(?d.info_buf);
