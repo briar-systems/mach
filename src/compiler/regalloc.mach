@@ -22,8 +22,14 @@ val MAX_POOL_REGS:   i32 = 16;
 val MAX_CALLS:       i32 = 4096;
 val ALIGN:           i64 = 8;
 val SCRATCH_RESERVE: i32 = 2;  # pool registers reserved for spill scratch in rewrite pass
+val MAX_PHYS_WRITES: i32 = 8192;
 
 # --- records ---
+
+rec PhysWrite {
+    pos: i32;   # instruction index
+    reg: i32;   # physical register ID
+}
 
 rec LiveRange {
     vreg:      i32;    # virtual register ID
@@ -121,6 +127,14 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
         ci = ci + 1;
     }
 
+    # --- allocate physical write tracking ---
+
+    val pw_r: Result[*PhysWrite, allocator.AllocError] =
+        allocator.allocator_zalloc[PhysWrite](alloc, MAX_PHYS_WRITES::usize);
+    if (result_is_err[*PhysWrite, allocator.AllocError](pw_r)) { ret result; }
+    val phys_writes: *PhysWrite = result_unwrap_ok[*PhysWrite, allocator.AllocError](pw_r);
+    var pw_count: i32 = 0;
+
     # --- Pass 1: build live ranges ---
 
     val ranges_r: Result[*LiveRange, allocator.AllocError] =
@@ -140,6 +154,15 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
         scan_operand(?inst.dst,  idx, ranges, ?range_count);
         scan_operand(?inst.src1, idx, ranges, ?range_count);
         scan_operand(?inst.src2, idx, ranges, ?range_count);
+
+        # collect explicit physical register writes for interference checking
+        if (inst.dst.kind == ir.OPK_REG && !ir.is_vreg(inst.dst.reg) &&
+            inst.dst.reg >= 0 && pw_count < MAX_PHYS_WRITES) {
+            phys_writes[pw_count].pos = idx;
+            phys_writes[pw_count].reg = inst.dst.reg;
+            pw_count = pw_count + 1;
+        }
+
         idx = idx + 1;
     }
 
@@ -197,8 +220,9 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
             # range spans a call: must use callee-saved register or spill.
             # caller-saved registers would be clobbered by the call.
             # (reserve SCRATCH_RESERVE pool registers for spill scratch in rewrite)
-            val callee_idx: i32 = find_free_reg_range(reg_free,
-                                                      caller_count, pool_count);
+            val callee_idx: i32 = find_free_reg_range_excl(reg_free,
+                caller_count, pool_count, pool,
+                cur.start, cur.end_pos, phys_writes, pw_count);
             if (callee_idx >= 0 && active_count < pool_count - SCRATCH_RESERVE) {
                 cur.preg = pool[callee_idx];
                 reg_free[callee_idx] = false;
@@ -215,7 +239,9 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
                     val act: *LiveRange = ?ranges[active[vi]];
                     if (is_in_pool_range(act.preg, pool,
                                          caller_count, pool_count) &&
-                        act.end_pos > victim_end) {
+                        act.end_pos > victim_end &&
+                        !is_phys_excluded(act.preg, cur.start, cur.end_pos,
+                                          phys_writes, pw_count)) {
                         victim_end = act.end_pos;
                         victim_ai = vi;
                     }
@@ -241,7 +267,8 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
         } or {
             # range does not span a call: use any free register
             # (reserve SCRATCH_RESERVE pool registers for spill scratch in rewrite)
-            val free_idx: i32 = find_free_reg(reg_free, pool_count);
+            val free_idx: i32 = find_free_reg_excl(reg_free, pool, pool_count,
+                cur.start, cur.end_pos, phys_writes, pw_count);
             if (free_idx >= 0 && active_count < pool_count - SCRATCH_RESERVE) {
                 cur.preg = pool[free_idx];
                 reg_free[free_idx] = false;
@@ -258,7 +285,9 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
                 var vi: i32 = 0;
                 for (vi < active_count) {
                     val act: *LiveRange = ?ranges[active[vi]];
-                    if (act.end_pos > victim_end) {
+                    if (act.end_pos > victim_end &&
+                        !is_phys_excluded(act.preg, cur.start, cur.end_pos,
+                                          phys_writes, pw_count)) {
                         victim_end = act.end_pos;
                         victim_ai = vi;
                     }
@@ -468,6 +497,54 @@ fun is_in_pool_range(preg: i32, pool: *i32, from: i32, to: i32) bool {
         i = i + 1;
     }
     ret false;
+}
+
+# is_phys_excluded: check if assigning preg to a live range [start, end_pos]
+# would conflict with an explicit physical register write.
+# returns true if preg is written at any position strictly between start and end_pos.
+fun is_phys_excluded(preg: i32, start: i32, end_pos: i32,
+                     pw: *PhysWrite, pw_count: i32) bool {
+    if (pw == nil || pw_count == 0) { ret false; }
+    var i: i32 = 0;
+    for (i < pw_count) {
+        if (pw[i].reg == preg &&
+            pw[i].pos > start && pw[i].pos < end_pos) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# find_free_reg_excl: find first free register not physically excluded.
+fun find_free_reg_excl(reg_free: *bool, pool: *i32, pool_count: i32,
+                       start: i32, end_pos: i32,
+                       pw: *PhysWrite, pw_count: i32) i32 {
+    var i: i32 = 0;
+    for (i < pool_count) {
+        if (reg_free[i] &&
+            !is_phys_excluded(pool[i], start, end_pos, pw, pw_count)) {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# find_free_reg_range_excl: find first free register in pool[from..to)
+# not physically excluded.
+fun find_free_reg_range_excl(reg_free: *bool, from: i32, to: i32,
+                             pool: *i32, start: i32, end_pos: i32,
+                             pw: *PhysWrite, pw_count: i32) i32 {
+    var i: i32 = from;
+    for (i < to) {
+        if (reg_free[i] &&
+            !is_phys_excluded(pool[i], start, end_pos, pw, pw_count)) {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret -1;
 }
 
 # spans_call: check if a live range [start, end_pos] spans any call instruction.
