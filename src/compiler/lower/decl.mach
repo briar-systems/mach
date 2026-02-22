@@ -17,7 +17,6 @@ use section: mach.compiler.masm.section;
 use sym:     mach.compiler.masm.symbol;
 use mangle:  mach.compiler.masm.mangle;
 use abi:     mach.compiler.abi;
-use isa:     mach.compiler.isa;
 use lstmt:   mach.compiler.lower.stmt;
 use lexpr:   mach.compiler.lower.expr;
 
@@ -224,6 +223,8 @@ fun lower_function(ctx: *LowerContext, node: *ast.Node) {
 }
 
 # lower_params: lower function parameters using ABI classification.
+# emits OP_PARAM for each parameter; the ABI lowering pass expands
+# these to MOVs from physical registers or stack locations.
 fun lower_params(ctx: *LowerContext, node: *ast.Node) {
     val params: *ast.List = node.info.fun_decl.params;
     if (params == nil) { ret; }
@@ -234,26 +235,17 @@ fun lower_params(ctx: *LowerContext, node: *ast.Node) {
     val a: *abi.ABI = ?ctx.target.abi;
     val psz: u8 = ctx.ptr_size;
 
-    # reset ABI stack offset for incoming param classification
-    a.reset_stack(a.ctx);
-
-    var gp_used: i32 = 0;
-    var fp_used: i32 = 0;
-    var stack_count: i32 = 0;
-
-    # if sret, the hidden pointer arrives in the first GP register;
-    # save it to a vreg so it survives across the function body
+    # if sret, emit OP_PARAM(index=-1) for the hidden pointer
     if (ctx.fn_has_sret) {
-        val sret_slot: abi.ParamSlot = a.classify_param(a.ctx, 0,
-            ctx.target.ptr_size, ctx.target.ptr_size, false, false, 0, 0);
-        val sret_src: ir.Operand = ir.make_reg(sret_slot.reg.id, psz);
         val sret_vreg: ir.Operand = new_vreg(ctx, psz);
-        emit_mov(ctx, sret_vreg, sret_src);
+        emit(ctx, ir.OP_PARAM,
+             ir.make_imm(psz::i64, psz),
+             ir.make_imm(-1, 0),
+             sret_vreg, ir.CC_NONE);
         ctx.sret_slot = ir.make_mem(sret_vreg.reg, -1, 1, 0, psz);
-        gp_used = 1;
     }
 
-    # variadic prologue: allocate register save area and save GP regs
+    # variadic prologue: allocate register save area
     if (ctx.fn_is_variadic) {
         val layout: abi.VarargLayout = a.vararg_layout(a.ctx);
 
@@ -263,19 +255,22 @@ fun lower_params(ctx: *LowerContext, node: *ast.Node) {
                             + align_mask) & ~align_mask;
         ctx.va_reg_save_off = -ctx.stack_offset;
 
-        # save all GP argument registers to the save area
-        val gp_file: isa.RegisterFile = a.gp_param_regs(a.ctx);
-        var gi: i32 = 0;
-        for (gi < gp_file.count) {
-            val reg_off: i64 = ctx.va_reg_save_off
-                               + (gi::i64 * layout.gp_slot_size);
-            val dst: ir.Operand = ir.make_mem(ir.VREG_FP, -1, 1,
-                                               reg_off, psz);
-            val src: ir.Operand = ir.make_reg(gp_file.regs[gi].id, psz);
-            emit_store(ctx, dst, src);
-            gi = gi + 1;
-        }
+        # emit OP_PARAM(index=-2) for variadic register save
+        # the ABI pass expands this to stores of all GP arg registers
+        val save_base: ir.Operand = ir.make_mem(ir.VREG_FP, -1, 1,
+                                                  ctx.va_reg_save_off, psz);
+        emit(ctx, ir.OP_PARAM,
+             ir.make_imm(layout.save_area_size::i64, layout.save_area_align::u8),
+             ir.make_imm(-2, 0),
+             save_base, ir.CC_NONE);
     }
+
+    # classify params to track GP/FP/stack counts (needed for va_start)
+    a.reset_stack(a.ctx);
+    var gp_used: i32 = 0;
+    var fp_used: i32 = 0;
+    var stack_count: i32 = 0;
+    if (ctx.fn_has_sret) { gp_used = 1; }
 
     var i: i32 = 0;
     for (i < params.count) {
@@ -291,9 +286,19 @@ fun lower_params(ctx: *LowerContext, node: *ast.Node) {
         val is_float: bool = is_float_type(ptype);
         val is_agg: bool = type.type_is_record(ptype) || type.type_is_union(ptype);
 
+        # classify to track register usage counts
         val slot: abi.ParamSlot = a.classify_param(a.ctx, i, psize, palign,
                                                     is_float, is_agg,
                                                     gp_used, fp_used);
+        if (slot.class == abi.CLASS_GP || slot.class == abi.CLASS_BYREF) {
+            gp_used = gp_used + 1;
+        } or (slot.class == abi.CLASS_GP2) {
+            gp_used = gp_used + 2;
+        } or (slot.class == abi.CLASS_FP) {
+            fp_used = fp_used + 1;
+        } or (slot.class == abi.CLASS_STACK) {
+            stack_count = stack_count + 1;
+        }
 
         # allocate local variable for the parameter
         val lv: *LocalVar = local_add(ctx, pname, ptype, psize);
@@ -302,48 +307,15 @@ fun lower_params(ctx: *LowerContext, node: *ast.Node) {
 
         val dst: ir.Operand = local_operand(lv, psz);
 
-        # move parameter from its ABI location to the local slot
-        if (slot.class == abi.CLASS_GP) {
-            val src: ir.Operand = ir.make_reg(slot.reg.id, psize::u8);
-            emit_store(ctx, dst, src);
-            gp_used = gp_used + 1;
-        } or (slot.class == abi.CLASS_GP2) {
-            # 2-register aggregate: store both halves to local
-            val half2: u8 = (psize - psz::usize)::u8;
-            val src1: ir.Operand = ir.make_reg(slot.reg.id, psz);
-            val src2: ir.Operand = ir.make_reg(slot.reg2.id, half2);
-            val lo_dst: ir.Operand = ir.make_mem(ir.VREG_FP, -1, 1,
-                                                   lv.offset, psz);
-            val hi_dst: ir.Operand = ir.make_mem(ir.VREG_FP, -1, 1,
-                                                   lv.offset + psz::i64, half2);
-            emit_store(ctx, lo_dst, src1);
-            emit_store(ctx, hi_dst, src2);
-            gp_used = gp_used + 2;
-        } or (slot.class == abi.CLASS_BYREF) {
-            # register holds a pointer to the aggregate; copy to local slot
-            val ptr_vreg: ir.Operand = new_vreg(ctx, psz);
-            val ptr_src: ir.Operand = ir.make_reg(slot.reg.id, psz);
-            emit_mov(ctx, ptr_vreg, ptr_src);
+        var flags: u8 = 0;
+        if (is_float) { flags = flags | ir.ABI_FLAG_FLOAT; }
+        if (is_agg)   { flags = flags | ir.ABI_FLAG_AGG; }
 
-            lstmt.emit_memcpy(ctx,
-                ir.make_mem(ir.VREG_FP, -1, 1, lv.offset, psz),
-                ir.make_mem(ptr_vreg.reg, -1, 1, 0, psz),
-                psize);
-            gp_used = gp_used + 1;
-        } or (slot.class == abi.CLASS_FP) {
-            val src: ir.Operand = ir.make_reg(slot.reg.id, psize::u8);
-            emit_store(ctx, dst, src);
-            fp_used = fp_used + 1;
-        } or (slot.class == abi.CLASS_STACK) {
-            # parameter is on the stack — copy from caller's frame
-            val frame_hdr: i64 = a.frame_header_size(a.ctx);
-            val src: ir.Operand = ir.make_mem(ir.VREG_FP, -1, 1,
-                                               slot.offset + frame_hdr, psize::u8);
-            val tmp: ir.Operand = new_vreg(ctx, psize::u8);
-            emit_load(ctx, tmp, src);
-            emit_store(ctx, dst, tmp);
-            stack_count = stack_count + 1;
-        }
+        # emit abstract parameter receive
+        emit(ctx, ir.OP_PARAM,
+             ir.make_imm(psize::i64, palign::u8),
+             ir.make_imm(i::i64, flags),
+             dst, ir.CC_NONE);
 
         if (ctx.current_fn != nil) {
             ctx.current_fn.param_count = ctx.current_fn.param_count + 1;
