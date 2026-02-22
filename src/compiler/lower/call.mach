@@ -12,8 +12,8 @@ use mach.compiler.lower;
 # mach.compiler.lower.call: ABI-driven call lowering.
 # ---
 # translates function call AST nodes into IR instructions.
-# argument classification and placement is entirely driven by
-# target.abi — no hardcoded registers or stack layout.
+# emits OP_ARG for each argument and an extended OP_CALL with return type
+# metadata. the ABI lowering pass expands these to physical register MOVs.
 
 # emit_call: lower a function call.
 # callee: call target operand (label for direct calls, register for indirect)
@@ -31,174 +31,90 @@ pub fun emit_call(ctx: *LowerContext, callee: ir.Operand,
     val a: *abi.ABI = ?ctx.target.abi;
     val psz: u8 = ctx.ptr_size;
 
-    # --- classify return value ---
-    var sret_ptr: ir.Operand = ir.make_none();
+    # --- classify return value (sret detection only) ---
     var sret_mem: ir.Operand = ir.make_none();
     var has_sret: bool = false;
-    var ret_slot: abi.ParamSlot;
+    var ret_size: usize = 0;
+    var ret_align: usize = 0;
+    var ret_is_float: bool = false;
+    var ret_is_agg: bool = false;
 
     if (ret_type != nil && !type.type_is_void(ret_type)) {
-        val ret_size: usize = type_size(ctx, ret_type);
-        val ret_align: usize = type.type_align(ret_type);
-        val is_float: bool = is_float_type(ret_type);
-        val is_agg: bool = type.type_is_record(ret_type) || type.type_is_union(ret_type);
+        ret_size = type_size(ctx, ret_type);
+        ret_align = type.type_align(ret_type);
+        ret_is_float = is_float_type(ret_type);
+        ret_is_agg = type.type_is_record(ret_type) || type.type_is_union(ret_type);
 
-        ret_slot = a.classify_return(a.ctx, ret_size, ret_align, is_float, is_agg);
+        val ret_slot: abi.ParamSlot = a.classify_return(a.ctx, ret_size, ret_align,
+                                                          ret_is_float, ret_is_agg);
 
         if (ret_slot.class == abi.CLASS_SRET) {
             # allocate stack space for struct return
             val lv: *LocalVar = local_add(ctx, ".sret_tmp", ret_type, ret_size);
             if (lv != nil) {
                 sret_mem = local_operand(lv, psz);
-                sret_ptr = new_vreg(ctx, psz);
+                val sret_ptr: ir.Operand = new_vreg(ctx, psz);
                 emit(ctx, ir.OP_ADDR, sret_ptr, sret_mem, ir.make_none(), ir.CC_NONE);
+
+                # emit sret as hidden argument at index -1
+                emit(ctx, ir.OP_ARG,
+                     ir.make_imm(psz::i64, psz),
+                     ir.make_imm(-1, 0),
+                     sret_ptr, ir.CC_NONE);
+
                 has_sret = true;
             }
         }
     }
 
-    # --- classify and place arguments ---
-    var gp_used: i32 = 0;
-    var fp_used: i32 = 0;
-
-    # if sret, the hidden pointer consumes the first GP register
-    if (has_sret) { gp_used = 1; }
-
-    # reset ABI stack offset for this call
-    a.reset_stack(a.ctx);
-
-    var call_stack_bytes: i64 = 0;
-
-    # first pass: classify all arguments
+    # --- emit OP_ARG for each argument ---
     var i: i32 = 0;
     for (i < arg_count) {
         val arg_type: *type.Type = arg_types[i];
         val arg_size: usize = type_size(ctx, arg_type);
         val arg_align: usize = type.type_align(arg_type);
-        val is_float: bool = is_float_type(arg_type);
-        val is_agg: bool = type.type_is_record(arg_type) || type.type_is_union(arg_type);
+        val af: bool = is_float_type(arg_type);
+        val aa: bool = type.type_is_record(arg_type) || type.type_is_union(arg_type);
 
-        val slot: abi.ParamSlot = a.classify_param(a.ctx, i, arg_size, arg_align,
-                                                    is_float, is_agg,
-                                                    gp_used, fp_used);
+        var flags: u8 = 0;
+        if (af) { flags = flags | ir.ABI_FLAG_FLOAT; }
+        if (aa) { flags = flags | ir.ABI_FLAG_AGG; }
 
-        if (slot.class == abi.CLASS_GP || slot.class == abi.CLASS_BYREF) {
-            # move argument to the designated GP register
-            val dst: ir.Operand = ir.make_reg(slot.reg.id, psz);
-            if (slot.class == abi.CLASS_BYREF) {
-                if (args[i].kind == ir.OPK_MEM) {
-                    # memory operand: take address for by-reference passing
-                    val addr: ir.Operand = new_vreg(ctx, psz);
-                    emit(ctx, ir.OP_ADDR, addr, args[i], ir.make_none(), ir.CC_NONE);
-                    emit_mov(ctx, dst, addr);
-                } or {
-                    # register: already holds a pointer to the aggregate
-                    emit_mov(ctx, dst, args[i]);
-                }
-            } or {
-                emit_mov(ctx, dst, args[i]);
-            }
-            gp_used = gp_used + 1;
-        } or (slot.class == abi.CLASS_GP2) {
-            # 2-register aggregate: load two halves into consecutive GP regs
-            val dst1: ir.Operand = ir.make_reg(slot.reg.id, psz);
-            val dst2: ir.Operand = ir.make_reg(slot.reg2.id, psz);
-            if (args[i].kind == ir.OPK_MEM) {
-                val half2: u8 = (arg_size - psz::usize)::u8;
-                val lo: ir.Operand = ir.make_mem(args[i].base, args[i].index,
-                                                   args[i].scale, args[i].disp, psz);
-                val hi: ir.Operand = ir.make_mem(args[i].base, args[i].index,
-                                                   args[i].scale,
-                                                   args[i].disp + psz::i64, half2);
-                emit_load(ctx, dst1, lo);
-                emit_load(ctx, dst2, hi);
-            } or {
-                # shouldn't happen for aggregates, but treat as low half only
-                emit_mov(ctx, dst1, args[i]);
-                emit_mov(ctx, dst2, ir.make_imm(0, psz));
-            }
-            gp_used = gp_used + 2;
-        } or (slot.class == abi.CLASS_FP) {
-            val dst: ir.Operand = ir.make_reg(slot.reg.id, arg_size::u8);
-            emit_mov(ctx, dst, args[i]);
-            fp_used = fp_used + 1;
-        } or (slot.class == abi.CLASS_STACK) {
-            # place argument in the outgoing call area (RSP-relative)
-            val stack_dst: ir.Operand = ir.make_mem(ir.VREG_SP, -1, 1,
-                                                     slot.offset, arg_size::u8);
-            emit_store(ctx, stack_dst, args[i]);
-
-            val end: i64 = slot.offset + arg_size::i64;
-            if (end > call_stack_bytes) {
-                call_stack_bytes = end;
-            }
-        }
+        emit(ctx, ir.OP_ARG,
+             ir.make_imm(arg_size::i64, arg_align::u8),
+             ir.make_imm(i::i64, flags),
+             args[i], ir.CC_NONE);
 
         i = i + 1;
     }
 
-    # update max call area size for this function
-    if (call_stack_bytes > ctx.max_call_arg_bytes) {
-        ctx.max_call_arg_bytes = call_stack_bytes;
-    }
+    # --- emit OP_CALL ---
+    var call_flags: u8 = 0;
+    if (is_variadic) { call_flags = call_flags | ir.CALL_VARIADIC; }
 
-    # --- sret hidden pointer ---
-    if (has_sret) {
-        val gp_regs: abi.ParamSlot = a.classify_param(a.ctx, 0, ctx.target.ptr_size,
-            ctx.target.ptr_size, false, false, 0, 0);
-        val sret_dst: ir.Operand = ir.make_reg(gp_regs.reg.id, psz);
-        emit_mov(ctx, sret_dst, sret_ptr);
-    }
-
-    # --- variadic: set FP count register ---
-    if (is_variadic) {
-        val vinfo: abi.VariadicInfo = a.variadic_info(a.ctx);
-        if (vinfo.needs_fp_count) {
-            val fp_count_dst: ir.Operand = ir.make_reg(vinfo.fp_count_reg.id,
-                                                        vinfo.fp_count_reg.width);
-            val fp_count_val: ir.Operand = ir.make_imm(fp_used::i64,
-                                                        vinfo.fp_count_reg.width);
-            emit_mov(ctx, fp_count_dst, fp_count_val);
-        }
-    }
-
-    # --- emit call instruction ---
-    emit(ctx, ir.OP_CALL, callee, ir.make_none(),
-         ir.make_none(), ir.CC_NONE);
-
-    # --- handle return value ---
-    if (ret_type == nil || type.type_is_void(ret_type)) {
+    # void or sret return: no return value to extract
+    if (ret_type == nil || type.type_is_void(ret_type) || has_sret) {
+        emit(ctx, ir.OP_CALL, callee, ir.make_none(), ir.make_none(), call_flags);
+        if (has_sret) { ret sret_mem; }
         ret ir.make_none();
     }
 
-    if (has_sret) {
-        # return the sret buffer as a memory operand so callers can
-        # copy aggregate data or take its address for by-reference passing
-        ret sret_mem;
-    }
+    # encode return type info for ABI pass
+    if (ret_is_float) { call_flags = call_flags | ir.CALL_RET_FLOAT; }
+    if (ret_is_agg)   { call_flags = call_flags | ir.CALL_RET_AGG; }
+    val ret_info: ir.Operand = ir.make_imm(ret_size::i64, ret_align::u8);
 
-    if (ret_slot.class == abi.CLASS_GP2) {
-        # 2-register aggregate return: store RAX and RDX to a local
-        val ret_size: usize = type_size(ctx, ret_type);
-        val lv: *LocalVar = local_add(ctx, ".gp2_ret", ret_type, ret_size);
+    if (ret_is_agg) {
+        # aggregate return: allocate local for ABI pass to store into
+        val lv: *LocalVar = local_add(ctx, ".agg_ret", ret_type, ret_size);
         if (lv == nil) { ret ir.make_none(); }
         val dst_mem: ir.Operand = local_operand(lv, psz);
-        val half2: u8 = (ret_size - psz::usize)::u8;
-
-        val lo_dst: ir.Operand = ir.make_mem(ir.VREG_FP, -1, 1,
-                                               lv.offset, psz);
-        val hi_dst: ir.Operand = ir.make_mem(ir.VREG_FP, -1, 1,
-                                               lv.offset + psz::i64, half2);
-        val lo_src: ir.Operand = ir.make_reg(ret_slot.reg.id, psz);
-        val hi_src: ir.Operand = ir.make_reg(ret_slot.reg2.id, half2);
-        emit_store(ctx, lo_dst, lo_src);
-        emit_store(ctx, hi_dst, hi_src);
+        emit(ctx, ir.OP_CALL, callee, ret_info, dst_mem, call_flags);
         ret dst_mem;
     }
 
-    # move return value from the ABI-specified location
+    # scalar/float return: allocate vreg
     val result: ir.Operand = new_vreg(ctx, type_size_u8(ctx, ret_type));
-    val ret_reg: ir.Operand = ir.make_reg(ret_slot.reg.id, type_size_u8(ctx, ret_type));
-    emit_mov(ctx, result, ret_reg);
+    emit(ctx, ir.OP_CALL, callee, ret_info, result, call_flags);
     ret result;
 }
