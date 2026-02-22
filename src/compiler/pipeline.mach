@@ -20,6 +20,7 @@ use comptime: mach.compiler.comptime;
 use target:   mach.compiler.target;
 use masm:     mach.compiler.masm;
 use ir:       mach.compiler.masm.ir;
+use module:   mach.compiler.masm.module;
 use section:  mach.compiler.masm.section;
 use sym:      mach.compiler.masm.symbol;
 use isa:      mach.compiler.isa;
@@ -94,6 +95,7 @@ pub rec SemaResult {
 
 pub rec LowerResult {
     mctx: *masm.Context;
+    mod:  *module.Module;
     ok:   bool;
 }
 
@@ -223,19 +225,22 @@ pub fun analyze(root: *ast.Node, file_path: str, source: str,
 }
 
 # lower_module: lower a typed AST into MASM IR.
-# lowers the entry module and all imported modules into a single MASM context.
+# lowers the entry module and all imported modules, producing an
+# immutable Module (ir_funcs + data_decls + debug_files) and a
+# mutable Context (sections + symbols + debug_lines).
 pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
                      tgt: *target.Target, alloc: *allocator.Allocator,
                      sem: *sema.Sema, verbose: bool) LowerResult {
     var result: LowerResult;
     result.mctx = nil;
+    result.mod = nil;
     result.ok = false;
 
     if (root == nil || tgt == nil || alloc == nil) { ret result; }
 
     if (verbose) { print.eprint("[verbose] lower: creating MASM context\n"); }
 
-    # create MASM context
+    # create MASM context (codegen-local mutable state)
     val mctx_res: Result[masm.Context, str] = masm.create(alloc, @tgt);
     if (result_is_err[masm.Context, str](mctx_res)) { ret result; }
 
@@ -245,6 +250,14 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
     val mctx: *masm.Context = result_unwrap_ok[*masm.Context, allocator.AllocError](mctx_ptr_res);
     @mctx = result_unwrap_ok[masm.Context, str](mctx_res);
 
+    # create ModuleBuilder (lowering fills this, then we freeze into Module)
+    val builder_ptr_res: Result[*module.ModuleBuilder, allocator.AllocError] =
+        allocator.allocator_alloc[module.ModuleBuilder](alloc, 1);
+    if (result_is_err[*module.ModuleBuilder, allocator.AllocError](builder_ptr_res)) { ret result; }
+    val builder: *module.ModuleBuilder =
+        result_unwrap_ok[*module.ModuleBuilder, allocator.AllocError](builder_ptr_res);
+    @builder = module.builder_init(alloc);
+
     # lower entry module
     if (verbose) { print.eprint("[verbose] lower: lowering entry module\n"); }
     var entry_file: str = nil;
@@ -253,13 +266,13 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
         entry_file = sem.file_path;
         entry_source = sem.source;
     }
-    val lctx_res: Result[lower.LowerContext, str] = lower.create(alloc, tgt, mctx, symbols, nil, entry_file, entry_source);
+    val lctx_res: Result[lower.LowerContext, str] = lower.create(alloc, tgt, builder, symbols, nil, entry_file, entry_source);
     if (result_is_err[lower.LowerContext, str](lctx_res)) { ret result; }
 
     var lctx: lower.LowerContext = result_unwrap_ok[lower.LowerContext, str](lctx_res);
     ldecl.lower_module(?lctx, root);
 
-    # lower imported modules into the same MASM context
+    # lower imported modules into the same builder
     if (sem != nil) {
         val max_mods: i32 = 512;
         val mods_r: Result[**sema.SemaModule, allocator.AllocError] =
@@ -288,7 +301,7 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
                             mi::i64, m.path);
                     }
                     val mlctx_res: Result[lower.LowerContext, str] =
-                        lower.create(alloc, tgt, mctx, m.table, nil, m.file_path, m.source);
+                        lower.create(alloc, tgt, builder, m.table, nil, m.file_path, m.source);
                     if (result_is_ok[lower.LowerContext, str](mlctx_res)) {
                         var mlctx: lower.LowerContext =
                             result_unwrap_ok[lower.LowerContext, str](mlctx_res);
@@ -300,12 +313,21 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
         }
     }
 
+    # freeze builder into immutable Module
+    val mod_ptr_res: Result[*module.Module, allocator.AllocError] =
+        allocator.allocator_alloc[module.Module](alloc, 1);
+    if (result_is_err[*module.Module, allocator.AllocError](mod_ptr_res)) { ret result; }
+    val mod_ptr: *module.Module =
+        result_unwrap_ok[*module.Module, allocator.AllocError](mod_ptr_res);
+    @mod_ptr = module.build(builder);
+
     if (verbose) {
         print.eprintf("[verbose] lower: complete (%d IR functions)\n",
-            mctx.ir_func_count::i64);
+            mod_ptr.func_count::i64);
     }
 
     result.mctx = mctx;
+    result.mod = mod_ptr;
     result.ok = true;
     ret result;
 }
@@ -564,17 +586,17 @@ fun encode_function(mctx: *masm.Context, i: *isa.ISA,
 # codegen: run the full codegen pipeline for all functions.
 # isel → regalloc → peephole → compute_frame → fixup → encode.
 # returns false if any function fails.
-fun codegen(mctx: *masm.Context, tgt: *target.Target,
+fun codegen(mod: *module.Module, mctx: *masm.Context, tgt: *target.Target,
             alloc: *allocator.Allocator, verbose: bool,
             asm_w: *emasm.AsmWriter) bool {
-    if (mctx == nil || tgt == nil || alloc == nil) { ret false; }
+    if (mod == nil || mctx == nil || tgt == nil || alloc == nil) { ret false; }
 
     val i: *isa.ISA = ?tgt.isa;
     val a: *abi.ABI = ?tgt.abi;
 
     if (verbose) {
         print.eprintf("[verbose] codegen: starting (%d IR functions)\n",
-            mctx.ir_func_count::i64);
+            mod.func_count::i64);
     }
 
     val text_res: Result[*section.Section, str] = masm.get_or_create_section(
@@ -588,8 +610,8 @@ fun codegen(mctx: *masm.Context, tgt: *target.Target,
     var ok: bool = true;
 
     var fi: i32 = 0;
-    for (fi < mctx.ir_func_count) {
-        val func: *ir.Function = mctx.ir_funcs[fi];
+    for (fi < mod.func_count) {
+        val func: *ir.Function = mod.functions[fi];
         if (func == nil) { fi = fi + 1; cnt; }
 
         if (verbose) {
@@ -737,10 +759,10 @@ fun resolve_externs(mctx: *masm.Context, alloc: *allocator.Allocator) {
 # ---
 # uses the target's debug info format (DWARF for ELF/Mach-O, CodeView for COFF, etc.)
 # to serialize function and line data into .debug_* sections that get included in .o files.
-fun emit_debug_sections(mctx: *masm.Context, tgt: *target.Target,
-                        alloc: *allocator.Allocator) {
-    if (mctx == nil || tgt == nil || alloc == nil) { ret; }
-    if (mctx.debug_file_count == 0 && mctx.debug_line_count == 0) { ret; }
+fun emit_debug_sections(mod: *module.Module, mctx: *masm.Context,
+                        tgt: *target.Target, alloc: *allocator.Allocator) {
+    if (mod == nil || mctx == nil || tgt == nil || alloc == nil) { ret; }
+    if (mod.debug_file_count == 0 && mctx.debug_line_count == 0) { ret; }
 
     # create a fresh DebugInfo for this compilation unit
     val di_r: Result[di.DebugInfo, str] = target.create_debug_info(tgt, alloc);
@@ -749,9 +771,9 @@ fun emit_debug_sections(mctx: *masm.Context, tgt: *target.Target,
 
     # register debug files
     var fi: i32 = 0;
-    for (fi < mctx.debug_file_count) {
-        if (mctx.debug_files[fi] != nil) {
-            di_info.add_file(di_info.ctx, mctx.debug_files[fi], ".");
+    for (fi < mod.debug_file_count) {
+        if (mod.debug_files[fi] != nil) {
+            di_info.add_file(di_info.ctx, mod.debug_files[fi], ".");
         }
         fi = fi + 1;
     }
@@ -905,7 +927,7 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         print.eprintf("[verbose] compile_module: '%s'\n", obj_path);
     }
 
-    # 1. create fresh MASM context
+    # 1. create fresh MASM context and ModuleBuilder
     val mctx_res: Result[masm.Context, str] = masm.create(alloc, @tgt);
     if (result_is_err[masm.Context, str](mctx_res)) { ret false; }
 
@@ -916,6 +938,13 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         result_unwrap_ok[*masm.Context, allocator.AllocError](mctx_ptr_res);
     @mctx = result_unwrap_ok[masm.Context, str](mctx_res);
 
+    val builder_ptr_res: Result[*module.ModuleBuilder, allocator.AllocError] =
+        allocator.allocator_alloc[module.ModuleBuilder](alloc, 1);
+    if (result_is_err[*module.ModuleBuilder, allocator.AllocError](builder_ptr_res)) { ret false; }
+    val builder: *module.ModuleBuilder =
+        result_unwrap_ok[*module.ModuleBuilder, allocator.AllocError](builder_ptr_res);
+    @builder = module.builder_init(alloc);
+
     # 2. lower this module
     var mod_file: str = nil;
     var mod_source: str = nil;
@@ -924,7 +953,7 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         mod_source = smod.source;
     }
     val lctx_res: Result[lower.LowerContext, str] =
-        lower.create(alloc, tgt, mctx, symbols, nil, mod_file, mod_source);
+        lower.create(alloc, tgt, builder, symbols, nil, mod_file, mod_source);
     if (result_is_err[lower.LowerContext, str](lctx_res)) { ret false; }
 
     var lctx: lower.LowerContext =
@@ -963,11 +992,19 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
             inst_count::i64);
     }
 
-    # 2c. materialize data declarations into sections
-    data_em.emit_data_decls(mctx, alloc);
+    # 2c. freeze builder into immutable Module
+    val mod_ptr_res: Result[*module.Module, allocator.AllocError] =
+        allocator.allocator_alloc[module.Module](alloc, 1);
+    if (result_is_err[*module.Module, allocator.AllocError](mod_ptr_res)) { ret false; }
+    val mod_ptr: *module.Module =
+        result_unwrap_ok[*module.Module, allocator.AllocError](mod_ptr_res);
+    @mod_ptr = module.build(builder);
+
+    # 2d. materialize data declarations into sections
+    data_em.emit_data_decls(?mod_ptr.data_decls, mctx, alloc);
 
     # 3. check if type-only (no IR functions and no section data)
-    if (mctx.ir_func_count == 0) {
+    if (mod_ptr.func_count == 0) {
         var has_data: bool = false;
         var si: i32 = 0;
         for (si < mctx.section_count) {
@@ -987,14 +1024,14 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
 
     if (verbose) {
         print.eprintf("[verbose] compile_module:   %d IR functions\n",
-            mctx.ir_func_count::i64);
+            mod_ptr.func_count::i64);
     }
 
     # 4. ABI lowering (expand OP_ARG/OP_PARAM/OP_RETVAL/OP_SCARG → MOVs)
     {
         var ai: i32 = 0;
-        for (ai < mctx.ir_func_count) {
-            val func: *ir.Function = mctx.ir_funcs[ai];
+        for (ai < mod_ptr.func_count) {
+            val func: *ir.Function = mod_ptr.functions[ai];
             if (func != nil) {
                 abi_low.lower_function(alloc, func, ?tgt.abi, ?tgt.isa, tgt.ptr_size::u8);
             }
@@ -1005,8 +1042,8 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
     # 4b. peephole optimization
     var opt_ctx: ir_peep.OptContext = ir_peep.init(alloc);
     var oi: i32 = 0;
-    for (oi < mctx.ir_func_count) {
-        val func: *ir.Function = mctx.ir_funcs[oi];
+    for (oi < mod_ptr.func_count) {
+        val func: *ir.Function = mod_ptr.functions[oi];
         if (func != nil) {
             ir_peep.optimize_function(?opt_ctx, func);
         }
@@ -1017,7 +1054,7 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
     if (masm_path != nil) {
         val masm_dir: str = utilfs.get_output_dir(masm_path, alloc);
         if (masm_dir != nil) { utilfs.ensure_dir(masm_dir, alloc); }
-        emmasm.emit(mctx, masm_path);
+        emmasm.emit(mod_ptr, masm_path);
     }
 
     # 5. codegen (ISel + encode)
@@ -1028,7 +1065,7 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         asm_w_ptr = emasm.open(asm_path, alloc);
     }
 
-    if (!codegen(mctx, tgt, alloc, verbose, asm_w_ptr)) {
+    if (!codegen(mod_ptr, mctx, tgt, alloc, verbose, asm_w_ptr)) {
         if (asm_w_ptr != nil) { emasm.close(asm_w_ptr); }
         ret false;
     }
@@ -1039,7 +1076,7 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
     resolve_externs(mctx, alloc);
 
     # 6b. generate debug sections
-    emit_debug_sections(mctx, tgt, alloc);
+    emit_debug_sections(mod_ptr, mctx, tgt, alloc);
 
     # 7. emit .o file
     if (verbose) {
@@ -1224,7 +1261,7 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
     }
 
     # materialize data declarations into sections
-    data_em.emit_data_decls(lr.mctx, opts.alloc);
+    data_em.emit_data_decls(?lr.mod.data_decls, lr.mctx, opts.alloc);
 
     if (opts.stop_after == PHASE_LOWER) {
         val r: CompileResult = CompileResult{mctx: lr.mctx, output_path: nil, ok: true};
@@ -1235,8 +1272,8 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
     if (opts.verbose) { print.eprint("[verbose] abi_lower: expanding abstract opcodes\n"); }
     {
         var ai: i32 = 0;
-        for (ai < lr.mctx.ir_func_count) {
-            val func: *ir.Function = lr.mctx.ir_funcs[ai];
+        for (ai < lr.mod.func_count) {
+            val func: *ir.Function = lr.mod.functions[ai];
             if (func != nil) {
                 abi_low.lower_function(opts.alloc, func, ?opts.target.abi,
                                        ?opts.target.isa, opts.target.ptr_size::u8);
@@ -1248,20 +1285,20 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
     if (opts.verbose) { print.eprint("[verbose] peephole: optimizing IR\n"); }
     var opt_ctx: ir_peep.OptContext = ir_peep.init(opts.alloc);
     var oi: i32 = 0;
-    for (oi < lr.mctx.ir_func_count) {
-        val func: *ir.Function = lr.mctx.ir_funcs[oi];
+    for (oi < lr.mod.func_count) {
+        val func: *ir.Function = lr.mod.functions[oi];
         if (func != nil) {
             ir_peep.optimize_function(?opt_ctx, func);
         }
         oi = oi + 1;
     }
 
-    if (!codegen(lr.mctx, ?opts.target, opts.alloc, opts.verbose, nil)) {
+    if (!codegen(lr.mod, lr.mctx, ?opts.target, opts.alloc, opts.verbose, nil)) {
         ret err[CompileResult, str]("code generation failed");
     }
 
     # generate debug sections for the monolithic .o
-    emit_debug_sections(lr.mctx, ?opts.target, opts.alloc);
+    emit_debug_sections(lr.mod, lr.mctx, ?opts.target, opts.alloc);
 
     if (opts.obj_path != nil) {
         if (opts.verbose) {
@@ -1287,7 +1324,7 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
     if (opts.verbose) {
         print.eprintf("[verbose] link: linking -> '%s'\n", opts.output_path);
     }
-    val link_res: i64 = linker.link(lr.mctx, ?opts.target, opts.output_path, opts.alloc);
+    val link_res: i64 = linker.link(lr.mod, lr.mctx, ?opts.target, opts.output_path, opts.alloc);
     if (link_res != 0) {
         ret err[CompileResult, str]("linking failed");
     }
