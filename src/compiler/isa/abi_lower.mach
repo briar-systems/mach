@@ -1,0 +1,568 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+
+use ir:  mach.compiler.masm.ir;
+use abi: mach.compiler.abi;
+use isa: mach.compiler.isa;
+
+# mach.compiler.isa.abi_lower: ABI lowering pass.
+# ---
+# expands ABI-abstract IR opcodes (OP_ARG, OP_PARAM, OP_RETVAL, OP_SCARG)
+# into concrete MOVs to/from physical registers. runs after IR lowering
+# and before IR peephole/ISel.
+#
+# encoding convention (all four opcodes):
+#   dst  = imm(byte_size, alignment)   — type metadata
+#   src1 = imm(index, flags)           — positional index, type flags
+#   src2 = value or destination        — payload operand
+#
+# OP_CALL extended encoding:
+#   dst  = callee, src1 = imm(ret_size, ret_align), src2 = result
+#   cc   = flags: bit0=variadic, bit1=ret_float, bit2=ret_agg
+
+# --- instruction buffer ---
+
+rec InstBuf {
+    insts: *ir.Inst;
+    count: i32;
+    cap:   i32;
+    alloc: *allocator.Allocator;
+}
+
+fun buf_init(alloc: *allocator.Allocator, cap: i32) InstBuf {
+    var b: InstBuf;
+    b.count = 0;
+    b.cap = cap;
+    b.alloc = alloc;
+    val r: Result[*ir.Inst, allocator.AllocError] =
+        allocator.allocator_zalloc[ir.Inst](alloc, cap::usize);
+    if (result_is_ok[*ir.Inst, allocator.AllocError](r)) {
+        b.insts = result_unwrap_ok[*ir.Inst, allocator.AllocError](r);
+    } or {
+        b.insts = nil;
+        b.cap = 0;
+    }
+    ret b;
+}
+
+fun buf_append(buf: *InstBuf, inst: ir.Inst) {
+    if (buf.count >= buf.cap) {
+        var new_cap: i32 = buf.cap * 2;
+        if (new_cap < 16) { new_cap = 16; }
+        val r: Result[*ir.Inst, allocator.AllocError] =
+            allocator.allocator_resize[ir.Inst](
+                buf.alloc, buf.insts, buf.cap::usize, new_cap::usize);
+        if (result_is_err[*ir.Inst, allocator.AllocError](r)) { ret; }
+        buf.insts = result_unwrap_ok[*ir.Inst, allocator.AllocError](r);
+        buf.cap = new_cap;
+    }
+    buf.insts[buf.count] = inst;
+    buf.count = buf.count + 1;
+}
+
+fun buf_emit(buf: *InstBuf, op: ir.Operator, dst: ir.Operand,
+             src1: ir.Operand, src2: ir.Operand, cc: ir.Cond,
+             src_line: i32, src_file: u16) {
+    var inst: ir.Inst;
+    inst.op = op;
+    inst.dst = dst;
+    inst.src1 = src1;
+    inst.src2 = src2;
+    inst.cc = cc;
+    inst.size = 0;
+    inst.src_line = src_line;
+    inst.src_file = src_file;
+    buf_append(buf, inst);
+}
+
+# --- virtual register allocation ---
+
+fun find_next_vreg(func: *ir.Function) i32 {
+    var max_id: i32 = ir.VREG_START - 1;
+    var bi: i32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = func.blocks[bi];
+        if (block == nil) { bi = bi + 1; cnt; }
+        var ii: i32 = 0;
+        for (ii < block.inst_count) {
+            val inst: *ir.Inst = ?block.insts[ii];
+            max_vreg_in_op(?inst.dst, ?max_id);
+            max_vreg_in_op(?inst.src1, ?max_id);
+            max_vreg_in_op(?inst.src2, ?max_id);
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret max_id + 1;
+}
+
+fun max_vreg_in_op(op: *ir.Operand, max_id: *i32) {
+    if (op.kind == ir.OPK_REG && op.reg >= ir.VREG_START) {
+        if (op.reg > @max_id) { @max_id = op.reg; }
+    }
+    if (op.kind == ir.OPK_MEM && op.base >= ir.VREG_START) {
+        if (op.base > @max_id) { @max_id = op.base; }
+    }
+    if (op.kind == ir.OPK_MEM && op.index >= ir.VREG_START) {
+        if (op.index > @max_id) { @max_id = op.index; }
+    }
+}
+
+fun alloc_vreg(next_vreg: *i32, size: u8) ir.Operand {
+    val id: i32 = @next_vreg;
+    @next_vreg = id + 1;
+    ret ir.make_reg(id, size);
+}
+
+# --- main entry ---
+
+# lower_function: expand all ABI-abstract opcodes in a function.
+pub fun lower_function(alloc: *allocator.Allocator, func: *ir.Function,
+                       a: *abi.ABI, i: *isa.ISA, ptr_size: u8) {
+    if (func == nil || a == nil || alloc == nil) { ret; }
+
+    var next_vreg: i32 = find_next_vreg(func);
+
+    var bi: i32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = func.blocks[bi];
+        if (block != nil) {
+            lower_block(alloc, block, a, i, ptr_size, func, ?next_vreg);
+        }
+        bi = bi + 1;
+    }
+}
+
+# lower_block: expand ABI-abstract opcodes in a single block.
+fun lower_block(alloc: *allocator.Allocator, block: *ir.Block,
+                a: *abi.ABI, i: *isa.ISA, psz: u8,
+                func: *ir.Function, next_vreg: *i32) {
+    # quick scan: does this block contain any ABI-abstract opcodes?
+    var has_abstract: bool = false;
+    var ii: i32 = 0;
+    for (ii < block.inst_count) {
+        val op: ir.Operator = block.insts[ii].op;
+        if (op == ir.OP_ARG || op == ir.OP_PARAM ||
+            op == ir.OP_RETVAL || op == ir.OP_SCARG) {
+            has_abstract = true;
+            brk;
+        }
+        # extended OP_CALL: src1 != NONE means it carries return metadata
+        if (op == ir.OP_CALL && block.insts[ii].src1.kind != ir.OPK_NONE) {
+            has_abstract = true;
+            brk;
+        }
+        ii = ii + 1;
+    }
+    if (!has_abstract) { ret; }
+
+    # build replacement instruction sequence
+    var buf: InstBuf = buf_init(alloc, block.inst_count * 2);
+    if (buf.insts == nil) { ret; }
+
+    # parameter classification state (reset once per block that has OP_PARAMs)
+    a.reset_stack(a.ctx);
+    var param_gp: i32 = 0;
+    var param_fp: i32 = 0;
+
+    # arg/scarg buffer for collecting before CALL/SYSCALL
+    var arg_buf: [32]ir.Inst;
+    var arg_count: i32 = 0;
+
+    ii = 0;
+    for (ii < block.inst_count) {
+        val inst: *ir.Inst = ?block.insts[ii];
+
+        if (inst.op == ir.OP_PARAM) {
+            expand_param(?buf, inst, a, i, psz, ?param_gp, ?param_fp, next_vreg);
+        } or (inst.op == ir.OP_ARG || inst.op == ir.OP_SCARG) {
+            if (arg_count < 32) {
+                arg_buf[arg_count] = @inst;
+                arg_count = arg_count + 1;
+            }
+        } or (inst.op == ir.OP_CALL) {
+            expand_call(?buf, inst, ?arg_buf, arg_count, a, psz, func, next_vreg);
+            arg_count = 0;
+        } or (inst.op == ir.OP_SYSCALL) {
+            expand_syscall(?buf, inst, ?arg_buf, arg_count, i, psz, next_vreg);
+            arg_count = 0;
+        } or (inst.op == ir.OP_RETVAL) {
+            expand_retval(?buf, inst, a, psz, next_vreg);
+        } or {
+            # regular instruction: copy
+            buf_append(?buf, @inst);
+        }
+
+        ii = ii + 1;
+    }
+
+    # replace block contents
+    block.insts = buf.insts;
+    block.inst_count = buf.count;
+    block.inst_cap = buf.cap;
+}
+
+# --- OP_PARAM expansion ---
+
+fun expand_param(buf: *InstBuf, inst: *ir.Inst,
+                 a: *abi.ABI, i: *isa.ISA, psz: u8,
+                 gp_used: *i32, fp_used: *i32, next_vreg: *i32) {
+    val index: i64 = inst.src1.imm;
+    val line: i32 = inst.src_line;
+    val file: u16 = inst.src_file;
+
+    if (index == -1) {
+        # sret hidden pointer: arrives in first GP param register
+        val sret_dst: ir.Operand = inst.src2;
+        val slot: abi.ParamSlot = a.classify_param(a.ctx, 0,
+            psz::usize, psz::usize, false, false, 0, 0);
+        val src: ir.Operand = ir.make_reg(slot.reg.id, psz);
+        buf_emit(buf, ir.OP_MOV, sret_dst, src, ir.make_none(),
+                 ir.CC_NONE, line, file);
+        @gp_used = @gp_used + 1;
+    } or (index == -2) {
+        # variadic save area: save all GP argument registers
+        val save_mem: ir.Operand = inst.src2;
+        val gp_file: isa.RegisterFile = a.gp_param_regs(a.ctx);
+        val layout: abi.VarargLayout = a.vararg_layout(a.ctx);
+        var gi: i32 = 0;
+        for (gi < gp_file.count) {
+            val reg_off: i64 = save_mem.disp + (gi::i64 * layout.gp_slot_size);
+            val dst: ir.Operand = ir.make_mem(save_mem.base, -1, 1, reg_off, psz);
+            val src: ir.Operand = ir.make_reg(gp_file.regs[gi].id, psz);
+            buf_emit(buf, ir.OP_STORE, dst, src, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            gi = gi + 1;
+        }
+    } or {
+        # named parameter: classify and receive from ABI location
+        val param_size: usize = inst.dst.imm::usize;
+        val param_align: usize = inst.dst.size::usize;
+        val flags: u8 = inst.src1.size;
+        val is_float: bool = (flags & ir.ABI_FLAG_FLOAT) != 0;
+        val is_agg: bool = (flags & ir.ABI_FLAG_AGG) != 0;
+        val dst: ir.Operand = inst.src2;
+
+        val slot: abi.ParamSlot = a.classify_param(a.ctx, index::i32,
+            param_size, param_align, is_float, is_agg, @gp_used, @fp_used);
+
+        if (slot.class == abi.CLASS_GP) {
+            val src: ir.Operand = ir.make_reg(slot.reg.id, param_size::u8);
+            buf_emit(buf, ir.OP_STORE, dst, src, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            @gp_used = @gp_used + 1;
+        } or (slot.class == abi.CLASS_GP2) {
+            # 2-register aggregate: store both halves to local
+            val half2: u8 = (param_size - psz::usize)::u8;
+            val src1: ir.Operand = ir.make_reg(slot.reg.id, psz);
+            val src2: ir.Operand = ir.make_reg(slot.reg2.id, half2);
+            val lo_dst: ir.Operand = ir.make_mem(dst.base, dst.index,
+                                                   dst.scale, dst.disp, psz);
+            val hi_dst: ir.Operand = ir.make_mem(dst.base, dst.index,
+                                                   dst.scale,
+                                                   dst.disp + psz::i64, half2);
+            buf_emit(buf, ir.OP_STORE, lo_dst, src1, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            buf_emit(buf, ir.OP_STORE, hi_dst, src2, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            @gp_used = @gp_used + 2;
+        } or (slot.class == abi.CLASS_BYREF) {
+            # register holds a pointer to the aggregate; copy to local slot
+            val ptr_vreg: ir.Operand = alloc_vreg(next_vreg, psz);
+            val ptr_src: ir.Operand = ir.make_reg(slot.reg.id, psz);
+            buf_emit(buf, ir.OP_MOV, ptr_vreg, ptr_src, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            # word-by-word copy from pointed-to memory to local
+            val word: usize = psz::usize;
+            var off: usize = 0;
+            for (off < param_size) {
+                var chunk: u8 = psz;
+                if (off + word > param_size) { chunk = (param_size - off)::u8; }
+                val s: ir.Operand = ir.make_mem(ptr_vreg.reg, -1, 1,
+                                                  off::i64, chunk);
+                val tmp: ir.Operand = alloc_vreg(next_vreg, chunk);
+                buf_emit(buf, ir.OP_LOAD, tmp, s, ir.make_none(),
+                         ir.CC_NONE, line, file);
+                val d: ir.Operand = ir.make_mem(dst.base, dst.index,
+                                                  dst.scale,
+                                                  dst.disp + off::i64, chunk);
+                buf_emit(buf, ir.OP_STORE, d, tmp, ir.make_none(),
+                         ir.CC_NONE, line, file);
+                off = off + word;
+            }
+            @gp_used = @gp_used + 1;
+        } or (slot.class == abi.CLASS_FP) {
+            val src: ir.Operand = ir.make_reg(slot.reg.id, param_size::u8);
+            buf_emit(buf, ir.OP_STORE, dst, src, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            @fp_used = @fp_used + 1;
+        } or (slot.class == abi.CLASS_STACK) {
+            # parameter is on the stack in caller's frame
+            val frame_hdr: i64 = a.frame_header_size(a.ctx);
+            val src: ir.Operand = ir.make_mem(ir.VREG_FP, -1, 1,
+                                               slot.offset + frame_hdr,
+                                               param_size::u8);
+            val tmp: ir.Operand = alloc_vreg(next_vreg, param_size::u8);
+            buf_emit(buf, ir.OP_LOAD, tmp, src, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            buf_emit(buf, ir.OP_STORE, dst, tmp, ir.make_none(),
+                     ir.CC_NONE, line, file);
+        }
+    }
+}
+
+# --- OP_ARG + OP_CALL expansion ---
+
+fun expand_call(buf: *InstBuf, call_inst: *ir.Inst,
+                arg_buf: *ir.Inst, arg_count: i32,
+                a: *abi.ABI, psz: u8,
+                func: *ir.Function, next_vreg: *i32) {
+    val line: i32 = call_inst.src_line;
+    val file: u16 = call_inst.src_file;
+    val call_flags: u8 = call_inst.cc;
+
+    a.reset_stack(a.ctx);
+
+    var gp_used: i32 = 0;
+    var fp_used: i32 = 0;
+    var call_stack_bytes: i64 = 0;
+
+    # check for sret hidden pointer (index=-1)
+    var j: i32 = 0;
+    for (j < arg_count) {
+        if (arg_buf[j].src1.imm == -1) {
+            gp_used = 1;
+            brk;
+        }
+        j = j + 1;
+    }
+
+    # place each argument
+    j = 0;
+    for (j < arg_count) {
+        val arg: *ir.Inst = ?arg_buf[j];
+        val arg_line: i32 = arg.src_line;
+        val arg_file: u16 = arg.src_file;
+        val arg_index: i64 = arg.src1.imm;
+        val value: ir.Operand = arg.src2;
+
+        if (arg_index == -1) {
+            # sret hidden pointer → first GP register
+            val slot: abi.ParamSlot = a.classify_param(a.ctx, 0,
+                psz::usize, psz::usize, false, false, 0, 0);
+            val dst: ir.Operand = ir.make_reg(slot.reg.id, psz);
+            buf_emit(buf, ir.OP_MOV, dst, value, ir.make_none(),
+                     ir.CC_NONE, arg_line, arg_file);
+        } or {
+            # regular argument
+            val arg_size: usize = arg.dst.imm::usize;
+            val arg_align: usize = arg.dst.size::usize;
+            val flags: u8 = arg.src1.size;
+            val is_float: bool = (flags & ir.ABI_FLAG_FLOAT) != 0;
+            val is_agg: bool = (flags & ir.ABI_FLAG_AGG) != 0;
+
+            val slot: abi.ParamSlot = a.classify_param(a.ctx, arg_index::i32,
+                arg_size, arg_align, is_float, is_agg, gp_used, fp_used);
+
+            if (slot.class == abi.CLASS_GP) {
+                val dst: ir.Operand = ir.make_reg(slot.reg.id, psz);
+                buf_emit(buf, ir.OP_MOV, dst, value, ir.make_none(),
+                         ir.CC_NONE, arg_line, arg_file);
+                gp_used = gp_used + 1;
+            } or (slot.class == abi.CLASS_BYREF) {
+                val dst: ir.Operand = ir.make_reg(slot.reg.id, psz);
+                if (value.kind == ir.OPK_MEM) {
+                    # take address of memory operand
+                    val addr: ir.Operand = alloc_vreg(next_vreg, psz);
+                    buf_emit(buf, ir.OP_ADDR, addr, value, ir.make_none(),
+                             ir.CC_NONE, arg_line, arg_file);
+                    buf_emit(buf, ir.OP_MOV, dst, addr, ir.make_none(),
+                             ir.CC_NONE, arg_line, arg_file);
+                } or {
+                    # already a pointer
+                    buf_emit(buf, ir.OP_MOV, dst, value, ir.make_none(),
+                             ir.CC_NONE, arg_line, arg_file);
+                }
+                gp_used = gp_used + 1;
+            } or (slot.class == abi.CLASS_GP2) {
+                # 2-register aggregate
+                val dst1: ir.Operand = ir.make_reg(slot.reg.id, psz);
+                val dst2: ir.Operand = ir.make_reg(slot.reg2.id, psz);
+                if (value.kind == ir.OPK_MEM) {
+                    val half2: u8 = (arg_size - psz::usize)::u8;
+                    val lo: ir.Operand = ir.make_mem(value.base, value.index,
+                        value.scale, value.disp, psz);
+                    val hi: ir.Operand = ir.make_mem(value.base, value.index,
+                        value.scale, value.disp + psz::i64, half2);
+                    buf_emit(buf, ir.OP_LOAD, dst1, lo, ir.make_none(),
+                             ir.CC_NONE, arg_line, arg_file);
+                    buf_emit(buf, ir.OP_LOAD, dst2, hi, ir.make_none(),
+                             ir.CC_NONE, arg_line, arg_file);
+                } or {
+                    buf_emit(buf, ir.OP_MOV, dst1, value, ir.make_none(),
+                             ir.CC_NONE, arg_line, arg_file);
+                    buf_emit(buf, ir.OP_MOV, dst2, ir.make_imm(0, psz),
+                             ir.make_none(), ir.CC_NONE, arg_line, arg_file);
+                }
+                gp_used = gp_used + 2;
+            } or (slot.class == abi.CLASS_FP) {
+                val dst: ir.Operand = ir.make_reg(slot.reg.id, arg_size::u8);
+                buf_emit(buf, ir.OP_MOV, dst, value, ir.make_none(),
+                         ir.CC_NONE, arg_line, arg_file);
+                fp_used = fp_used + 1;
+            } or (slot.class == abi.CLASS_STACK) {
+                val stack_dst: ir.Operand = ir.make_mem(ir.VREG_SP, -1, 1,
+                    slot.offset, arg_size::u8);
+                buf_emit(buf, ir.OP_STORE, stack_dst, value, ir.make_none(),
+                         ir.CC_NONE, arg_line, arg_file);
+                val end: i64 = slot.offset + arg_size::i64;
+                if (end > call_stack_bytes) {
+                    call_stack_bytes = end;
+                }
+            }
+        }
+
+        j = j + 1;
+    }
+
+    # update max call area size
+    if (func != nil && call_stack_bytes > func.call_area_size::i64) {
+        func.call_area_size = call_stack_bytes::usize;
+    }
+
+    # variadic: emit FP count register
+    if ((call_flags & ir.CALL_VARIADIC) != 0) {
+        val vinfo: abi.VariadicInfo = a.variadic_info(a.ctx);
+        if (vinfo.needs_fp_count) {
+            val dst: ir.Operand = ir.make_reg(vinfo.fp_count_reg.id,
+                                               vinfo.fp_count_reg.width);
+            val fp_val: ir.Operand = ir.make_imm(fp_used::i64,
+                                                   vinfo.fp_count_reg.width);
+            buf_emit(buf, ir.OP_MOV, dst, fp_val, ir.make_none(),
+                     ir.CC_NONE, line, file);
+        }
+    }
+
+    # emit simplified CALL (no return metadata)
+    buf_emit(buf, ir.OP_CALL, call_inst.dst, ir.make_none(),
+             ir.make_none(), ir.CC_NONE, line, file);
+
+    # extract return value
+    if (call_inst.src2.kind != ir.OPK_NONE && call_inst.src1.kind != ir.OPK_NONE) {
+        val ret_size: usize = call_inst.src1.imm::usize;
+        val ret_align: usize = call_inst.src1.size::usize;
+        val ret_is_float: bool = (call_flags & ir.CALL_RET_FLOAT) != 0;
+        val ret_is_agg: bool = (call_flags & ir.CALL_RET_AGG) != 0;
+
+        val ret_slot: abi.ParamSlot = a.classify_return(a.ctx, ret_size,
+            ret_align, ret_is_float, ret_is_agg);
+        val result: ir.Operand = call_inst.src2;
+
+        if (ret_slot.class == abi.CLASS_GP2) {
+            val half2: u8 = (ret_size - psz::usize)::u8;
+            val lo_src: ir.Operand = ir.make_reg(ret_slot.reg.id, psz);
+            val hi_src: ir.Operand = ir.make_reg(ret_slot.reg2.id, half2);
+            val lo_dst: ir.Operand = ir.make_mem(result.base, result.index,
+                result.scale, result.disp, psz);
+            val hi_dst: ir.Operand = ir.make_mem(result.base, result.index,
+                result.scale, result.disp + psz::i64, half2);
+            buf_emit(buf, ir.OP_STORE, lo_dst, lo_src, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            buf_emit(buf, ir.OP_STORE, hi_dst, hi_src, ir.make_none(),
+                     ir.CC_NONE, line, file);
+        } or {
+            # CLASS_GP or CLASS_FP: single register return
+            val src: ir.Operand = ir.make_reg(ret_slot.reg.id, ret_size::u8);
+            buf_emit(buf, ir.OP_MOV, result, src, ir.make_none(),
+                     ir.CC_NONE, line, file);
+        }
+    }
+}
+
+# --- OP_RETVAL expansion ---
+
+fun expand_retval(buf: *InstBuf, inst: *ir.Inst,
+                  a: *abi.ABI, psz: u8, next_vreg: *i32) {
+    val ret_size: usize = inst.dst.imm::usize;
+    val ret_align: usize = inst.dst.size::usize;
+    val flags: u8 = inst.src1.size;
+    val is_float: bool = (flags & ir.ABI_FLAG_FLOAT) != 0;
+    val is_agg: bool = (flags & ir.ABI_FLAG_AGG) != 0;
+    val value: ir.Operand = inst.src2;
+    val line: i32 = inst.src_line;
+    val file: u16 = inst.src_file;
+
+    val ret_slot: abi.ParamSlot = a.classify_return(a.ctx, ret_size,
+        ret_align, is_float, is_agg);
+
+    if (ret_slot.class == abi.CLASS_GP2) {
+        val half2: u8 = (ret_size - psz::usize)::u8;
+        val dst1: ir.Operand = ir.make_reg(ret_slot.reg.id, psz);
+        val dst2: ir.Operand = ir.make_reg(ret_slot.reg2.id, half2);
+        if (value.kind == ir.OPK_MEM) {
+            val lo: ir.Operand = ir.make_mem(value.base, value.index,
+                value.scale, value.disp, psz);
+            val hi: ir.Operand = ir.make_mem(value.base, value.index,
+                value.scale, value.disp + psz::i64, half2);
+            buf_emit(buf, ir.OP_LOAD, dst1, lo, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            buf_emit(buf, ir.OP_LOAD, dst2, hi, ir.make_none(),
+                     ir.CC_NONE, line, file);
+        } or {
+            # scalar-sized value: put in first reg, zero second
+            buf_emit(buf, ir.OP_MOV, dst1, value, ir.make_none(),
+                     ir.CC_NONE, line, file);
+            buf_emit(buf, ir.OP_MOV, dst2, ir.make_imm(0, half2),
+                     ir.make_none(), ir.CC_NONE, line, file);
+        }
+    } or {
+        # CLASS_GP or CLASS_FP: single register
+        val dst: ir.Operand = ir.make_reg(ret_slot.reg.id, ret_size::u8);
+        buf_emit(buf, ir.OP_MOV, dst, value, ir.make_none(),
+                 ir.CC_NONE, line, file);
+    }
+}
+
+# --- OP_SCARG + OP_SYSCALL expansion ---
+
+fun expand_syscall(buf: *InstBuf, sc_inst: *ir.Inst,
+                   arg_buf: *ir.Inst, arg_count: i32,
+                   i: *isa.ISA, psz: u8, next_vreg: *i32) {
+    if (i == nil) { ret; }
+
+    val sc_file: isa.RegisterFile = i.syscall_regs(i.ctx);
+    val sc_ret: isa.Register = i.syscall_ret_reg(i.ctx);
+    val line: i32 = sc_inst.src_line;
+    val file: u16 = sc_inst.src_file;
+
+    # load each argument into its syscall register
+    var j: i32 = 0;
+    for (j < arg_count) {
+        val arg: *ir.Inst = ?arg_buf[j];
+        val idx: i32 = arg.src1.imm::i32;
+        val value: ir.Operand = arg.src2;
+
+        if (idx >= 0 && idx < sc_file.count) {
+            val dst: ir.Operand = ir.make_reg(sc_file.regs[idx].id, psz);
+            buf_emit(buf, ir.OP_LOAD, dst, value, ir.make_none(),
+                     ir.CC_NONE, arg.src_line, arg.src_file);
+        }
+        j = j + 1;
+    }
+
+    # emit SYSCALL (no operands needed after expansion)
+    buf_emit(buf, ir.OP_SYSCALL, ir.make_none(), ir.make_none(),
+             ir.make_none(), ir.CC_NONE, line, file);
+
+    # store result register to output
+    val out_op: ir.Operand = sc_inst.dst;
+    if (out_op.kind != ir.OPK_NONE) {
+        val ret_reg: ir.Operand = ir.make_reg(sc_ret.id, psz);
+        buf_emit(buf, ir.OP_STORE, out_op, ret_reg, ir.make_none(),
+                 ir.CC_NONE, line, file);
+    }
+}
