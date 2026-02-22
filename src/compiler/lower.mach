@@ -227,16 +227,284 @@ pub fun new_label_id(ctx: *LowerContext) i32 {
 
 # --- instruction emission ---
 
-# emit: append an instruction to the current block.
+# emit_inst: append a pre-built compact instruction to the current block.
+pub fun emit_inst(ctx: *LowerContext, inst: ir.Inst) {
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+    val idx: i32 = ir.block_append(ctx.alloc, ctx.current_block, inst);
+    if (idx >= 0 && ctx.current_line > 0) {
+        ir.block_set_debug(ctx.current_block, idx,
+                           ctx.current_line, ctx.current_file);
+    }
+}
+
+# intern_label: intern a label string in the current function's label table.
+pub fun intern_label(ctx: *LowerContext, name: str) i32 {
+    if (ctx == nil || ctx.current_fn == nil) { ret -1; }
+    ret ir.label_intern(ctx.alloc, ?ctx.current_fn.labels, name);
+}
+
+# intern_const: intern an i64 value in the current function's constant pool.
+pub fun intern_const(ctx: *LowerContext, value: i64) i32 {
+    if (ctx == nil || ctx.current_fn == nil) { ret -1; }
+    ret ir.const_intern(ctx.alloc, ?ctx.current_fn.const_pool, value);
+}
+
+# --- Operand→compact Inst conversion ---
+# lowering files continue to use Operand-based interface; conversion
+# to compact 8-byte Inst happens here at the emit boundary.
+
+# operand_to_reg: extract u8 register ID from an Operand.
+fun operand_to_reg(op: *ir.Operand) u8 {
+    if (op.kind == ir.OPK_REG) { ret op.reg::u8; }
+    ret 0;
+}
+
+# emit_mem_inst: emit a memory instruction (LOAD, STORE, ADDR) from Operands.
+fun emit_mem_inst(ctx: *LowerContext, op: u8, reg: u8,
+                  mem: *ir.Operand, size: u8) {
+    var inst: ir.Inst;
+    if (mem.index >= 0) {
+        # indexed mode
+        if (op == ir.OP_STORE) {
+            inst = ir.mk_store_idx(reg, mem.base::u8, mem.index::u8,
+                                   mem.scale::u8, mem.disp::i16, size);
+        } or (op == ir.OP_ADDR) {
+            inst = ir.mk_addr_idx(reg, mem.base::u8, mem.index::u8,
+                                  mem.scale::u8, mem.disp::i16, size);
+        } or {
+            inst = ir.mk_load_idx(reg, mem.base::u8, mem.index::u8,
+                                  mem.scale::u8, mem.disp::i16, size);
+        }
+    } or {
+        # simple base+disp
+        if (op == ir.OP_STORE) {
+            inst = ir.mk_store(reg, mem.base::u8, mem.disp::i32, size);
+        } or (op == ir.OP_ADDR) {
+            inst = ir.mk_addr(reg, mem.base::u8, mem.disp::i32, size);
+        } or {
+            inst = ir.mk_load(reg, mem.base::u8, mem.disp::i32, size);
+        }
+    }
+    emit_inst(ctx, inst);
+}
+
+# emit: Operand-based emit — converts to compact Inst at the boundary.
+# this is the main entry point for lowering files.
 pub fun emit(ctx: *LowerContext, op: ir.Operator, dst: ir.Operand,
              src1: ir.Operand, src2: ir.Operand, cc: ir.Cond) {
     if (ctx == nil || ctx.current_block == nil) { ret; }
-    val idx: i32 = ir.block_append(ctx.alloc, ctx.current_block,
-                                    op, dst, src1, src2, cc);
-    if (idx >= 0 && ctx.current_line > 0) {
-        ctx.current_block.insts[idx].src_line = ctx.current_line;
-        ctx.current_block.insts[idx].src_file = ctx.current_file;
+
+    # determine effective size
+    var sz: u8 = dst.size;
+    if (sz == 0) { sz = src1.size; }
+    if (sz == 0) { sz = src2.size; }
+
+    # --- control flow ---
+    if (op == ir.OP_LABEL) {
+        val li: i32 = intern_label(ctx, dst.label);
+        emit_inst(ctx, ir.mk_label_inst(li));
+        ret;
     }
+    if (op == ir.OP_JMP) {
+        val li: i32 = intern_label(ctx, dst.label);
+        emit_inst(ctx, ir.mk_jmp(li));
+        ret;
+    }
+    if (op == ir.OP_BRCOND) {
+        val li: i32 = intern_label(ctx, dst.label);
+        emit_inst(ctx, ir.mk_brcond(operand_to_reg(?src1), li, cc));
+        ret;
+    }
+    if (op == ir.OP_RET) {
+        emit_inst(ctx, ir.mk_ret());
+        ret;
+    }
+    if (op == ir.OP_SYSCALL) {
+        var result_reg: u8 = 0;
+        if (dst.kind == ir.OPK_MEM) {
+            # syscall result goes to memory — encode with base reg
+            result_reg = dst.base::u8;
+        } or (dst.kind == ir.OPK_REG) {
+            result_reg = dst.reg::u8;
+        }
+        emit_inst(ctx, ir.mk_syscall(result_reg));
+        ret;
+    }
+    if (op == ir.OP_NOP) {
+        emit_inst(ctx, ir.mk_nop());
+        ret;
+    }
+
+    # --- CALL ---
+    if (op == ir.OP_CALL) {
+        # pre-ABI CALL: dst=callee (label/reg), src1=ret_meta, src2=result
+        if (dst.kind == ir.OPK_LABEL) {
+            val li: i32 = intern_label(ctx, dst.label);
+            var result_reg: u8 = 0;
+            if (src2.kind == ir.OPK_REG) { result_reg = src2.reg::u8; }
+            or (src2.kind == ir.OPK_MEM) { result_reg = src2.base::u8; }
+            var ret_meta: u8 = 0;
+            if (src1.kind != ir.OPK_NONE) {
+                val ret_sz: u8 = src1.imm::u8;
+                val ret_al: u8 = src1.size;
+                val ret_fl: bool = (cc & ir.CALL_RET_FLOAT) != 0;
+                val ret_ag: bool = (cc & ir.CALL_RET_AGG) != 0;
+                ret_meta = ir.make_abi_meta(ret_sz, ret_al, ret_ag, ret_fl);
+            }
+            emit_inst(ctx, ir.mk_call(result_reg, ret_meta, li, cc, sz));
+        } or (dst.kind == ir.OPK_REG) {
+            # indirect call
+            var result_reg: u8 = 0;
+            if (src2.kind == ir.OPK_REG) { result_reg = src2.reg::u8; }
+            or (src2.kind == ir.OPK_MEM) { result_reg = src2.base::u8; }
+            var ret_size: i32 = 0;
+            var ret_flags: u8 = 0;
+            var ret_align: u8 = 0;
+            if (src1.kind != ir.OPK_NONE) {
+                ret_size = src1.imm::i32;
+                ret_align = src1.size;
+                if ((cc & ir.CALL_RET_FLOAT) != 0) { ret_flags = ret_flags | ir.ABI_FLAG_FLOAT; }
+                if ((cc & ir.CALL_RET_AGG) != 0) { ret_flags = ret_flags | ir.ABI_FLAG_AGG; }
+            }
+            emit_inst(ctx, ir.mk_call_indirect(result_reg, dst.reg::u8,
+                                               ret_size, ret_flags, ret_align, cc, sz));
+        }
+        ret;
+    }
+
+    # --- ABI-abstract ops ---
+    if (op == ir.OP_ARG) {
+        val arg_idx: u8 = src1.imm::u8;
+        var value_reg: u8 = 0;
+        if (src2.kind == ir.OPK_REG) { value_reg = src2.reg::u8; }
+        or (src2.kind == ir.OPK_MEM) { value_reg = src2.base::u8; }
+        val byte_size: i32 = dst.imm::i32;
+        val flags: u8 = src1.size;
+        val align: u8 = dst.size;
+        emit_inst(ctx, ir.mk_arg(arg_idx, value_reg, byte_size, flags, align, sz));
+        ret;
+    }
+    if (op == ir.OP_PARAM) {
+        var param_idx: u8 = src1.imm::u8;
+        if (src1.imm == -1) { param_idx = ir.PARAM_SRET; }
+        or (src1.imm == -2) { param_idx = ir.PARAM_VARARGS; }
+        val byte_size: u8 = dst.imm::u8;
+        val align: u8 = dst.size;
+        val flags: u8 = src1.size;
+        val is_float: bool = (flags & ir.ABI_FLAG_FLOAT) != 0;
+        val is_agg: bool = (flags & ir.ABI_FLAG_AGG) != 0;
+        var displacement: i32 = 0;
+        if (src2.kind == ir.OPK_MEM) { displacement = src2.disp::i32; }
+        emit_inst(ctx, ir.mk_param(param_idx, byte_size, align,
+                                   is_agg, is_float, displacement));
+        ret;
+    }
+    if (op == ir.OP_RETVAL) {
+        var value_reg: u8 = 0;
+        if (src2.kind == ir.OPK_REG) { value_reg = src2.reg::u8; }
+        or (src2.kind == ir.OPK_MEM) { value_reg = src2.base::u8; }
+        val byte_size: i32 = dst.imm::i32;
+        val flags: u8 = src1.size;
+        val align: u8 = dst.size;
+        emit_inst(ctx, ir.mk_retval(value_reg, byte_size, flags, align, sz));
+        ret;
+    }
+    if (op == ir.OP_SCARG) {
+        val arg_idx: u8 = src1.imm::u8;
+        var value_reg: u8 = 0;
+        if (src2.kind == ir.OPK_REG) { value_reg = src2.reg::u8; }
+        or (src2.kind == ir.OPK_MEM) { value_reg = src2.base::u8; }
+        emit_inst(ctx, ir.mk_scarg(arg_idx, value_reg, sz));
+        ret;
+    }
+
+    # --- LOAD ---
+    if (op == ir.OP_LOAD) {
+        if (src1.kind == ir.OPK_MEM) {
+            emit_mem_inst(ctx, ir.OP_LOAD, operand_to_reg(?dst), ?src1, sz);
+        } or {
+            # fallback: reg-reg MOV (shouldn't happen for LOAD but safety)
+            emit_inst(ctx, ir.mk_unary(ir.OP_MOV, operand_to_reg(?dst),
+                                       operand_to_reg(?src1), sz));
+        }
+        ret;
+    }
+
+    # --- STORE ---
+    if (op == ir.OP_STORE) {
+        if (dst.kind == ir.OPK_MEM) {
+            emit_mem_inst(ctx, ir.OP_STORE, operand_to_reg(?src1), ?dst, sz);
+        }
+        ret;
+    }
+
+    # --- ADDR ---
+    if (op == ir.OP_ADDR) {
+        if (src1.kind == ir.OPK_MEM) {
+            emit_mem_inst(ctx, ir.OP_ADDR, operand_to_reg(?dst), ?src1, sz);
+        } or (src1.kind == ir.OPK_LABEL) {
+            val li: i32 = intern_label(ctx, src1.label);
+            emit_inst(ctx, ir.mk_addr_label(operand_to_reg(?dst), li, sz));
+        }
+        ret;
+    }
+
+    # --- MOV ---
+    if (op == ir.OP_MOV) {
+        val dr: u8 = operand_to_reg(?dst);
+        if (src1.kind == ir.OPK_REG) {
+            emit_inst(ctx, ir.mk_unary(ir.OP_MOV, dr, src1.reg::u8, sz));
+        } or (src1.kind == ir.OPK_IMM) {
+            if (src1.imm >= -2147483648 && src1.imm <= 2147483647) {
+                emit_inst(ctx, ir.mk_mov_imm(dr, src1.imm::i32, sz));
+            } or {
+                val ci: i32 = intern_const(ctx, src1.imm);
+                emit_inst(ctx, ir.mk_mov_const(dr, ci, sz));
+            }
+        } or (src1.kind == ir.OPK_MEM) {
+            # MOV from memory = LOAD
+            emit_mem_inst(ctx, ir.OP_LOAD, dr, ?src1, sz);
+        } or (src1.kind == ir.OPK_LABEL) {
+            val li: i32 = intern_label(ctx, src1.label);
+            emit_inst(ctx, ir.mk_addr_label(dr, li, sz));
+        }
+        ret;
+    }
+
+    # --- compare ---
+    if (op == ir.OP_ICMP || op == ir.OP_FCMP) {
+        # use source operand size (comparison width), not dst (always 1-byte bool)
+        var cmp_sz: u8 = src1.size;
+        if (cmp_sz == 0) { cmp_sz = src2.size; }
+        if (cmp_sz == 0) { cmp_sz = sz; }
+        emit_inst(ctx, ir.mk_cmp(op, operand_to_reg(?dst),
+                                 operand_to_reg(?src1),
+                                 operand_to_reg(?src2), cc, cmp_sz));
+        ret;
+    }
+
+    # --- FTOI: needs source float size preserved ---
+    if (op == ir.OP_FTOI) {
+        emit_inst(ctx, ir.mk_ftoi(operand_to_reg(?dst),
+                                  operand_to_reg(?src1), sz, src1.size));
+        ret;
+    }
+
+    # --- unary conversions ---
+    if (op == ir.OP_ZEXT || op == ir.OP_SEXT || op == ir.OP_TRUNC ||
+        op == ir.OP_ITOF || op == ir.OP_FEXT ||
+        op == ir.OP_FTRUNC) {
+        emit_inst(ctx, ir.mk_unary(op, operand_to_reg(?dst),
+                                   operand_to_reg(?src1), sz));
+        ret;
+    }
+
+    # --- 3-register ALU ops ---
+    # ADD, SUB, MUL, DIV, MOD, DIVU, MODU, AND, OR, XOR, SHL, SHR, SAR,
+    # FADD, FSUB, FMUL, FDIV, MEMSET
+    emit_inst(ctx, ir.mk_alu(op, operand_to_reg(?dst),
+                             operand_to_reg(?src1),
+                             operand_to_reg(?src2), sz));
 }
 
 # emit_mov: emit a MOV instruction.
@@ -278,26 +546,28 @@ pub fun emit_load(ctx: *LowerContext, dst: ir.Operand, src: ir.Operand) {
 
 # emit_label: emit a label pseudo-instruction.
 pub fun emit_label(ctx: *LowerContext, label: str) {
-    emit(ctx, ir.OP_LABEL, ir.make_label(label), ir.make_none(),
-         ir.make_none(), ir.CC_NONE);
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+    val li: i32 = intern_label(ctx, label);
+    emit_inst(ctx, ir.mk_label_inst(li));
 }
 
 # emit_jmp: emit an unconditional jump.
 pub fun emit_jmp(ctx: *LowerContext, label: str) {
-    emit(ctx, ir.OP_JMP, ir.make_label(label), ir.make_none(),
-         ir.make_none(), ir.CC_NONE);
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+    val li: i32 = intern_label(ctx, label);
+    emit_inst(ctx, ir.mk_jmp(li));
 }
 
 # emit_brcond: emit a conditional branch.
 pub fun emit_brcond(ctx: *LowerContext, cond: ir.Operand, label: str, cc: ir.Cond) {
-    emit(ctx, ir.OP_BRCOND, ir.make_label(label), cond,
-         ir.make_none(), cc);
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+    val li: i32 = intern_label(ctx, label);
+    emit_inst(ctx, ir.mk_brcond(operand_to_reg(?cond), li, cc));
 }
 
 # emit_ret: emit a return instruction.
 pub fun emit_ret(ctx: *LowerContext) {
-    emit(ctx, ir.OP_RET, ir.make_none(), ir.make_none(),
-         ir.make_none(), ir.CC_NONE);
+    emit_inst(ctx, ir.mk_ret());
 }
 
 # --- basic block management ---
