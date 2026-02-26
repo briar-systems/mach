@@ -1,0 +1,834 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use print:     std.print;
+
+use ast:     mach.compiler.frontend.ast;
+use symbol:  mach.compiler.frontend.symbol;
+use type:      mach.compiler.frontend.type;
+use target:  mach.compiler.target;
+use ir:      mach.compiler.masm.ir;
+use module:  mach.compiler.masm.module;
+use section: mach.compiler.masm.section;
+use sym:     mach.compiler.masm.symbol;
+use mangle:  mach.compiler.masm.mangle;
+use abi:     mach.compiler.target.abi;
+
+# mach.compiler.codegen.lower: AST → MASM IR lowering.
+# ---
+# transforms typed AST (sema output) into target-independent MASM IR.
+# all target-dependent decisions go through *target.Target interfaces.
+# lowering NEVER produces ISA-specific instructions — ISel does that.
+
+# --- local variable tracking ---
+
+pub rec LocalVar {
+    name:     str;
+    type:       *type.Type;
+    offset:   i64;       # stack offset from frame pointer
+    is_param: bool;
+    size:     usize;
+}
+
+val INITIAL_LOCAL_CAP: i32 = 32;
+val INITIAL_DEFER_CAP: i32 = 8;
+
+# --- lowering context ---
+
+pub rec LowerContext {
+    alloc:          *allocator.Allocator;
+    target:         *target.Target;
+    builder:        *module.ModuleBuilder;
+
+    # input
+    symbols:        *symbol.Table;
+
+    # current function state
+    current_fn:     *ir.Function;
+    current_block:  *ir.Block;
+
+    # virtual register allocation
+    vreg_next:      i32;
+
+    # counters
+    label_counter:  i32;
+    str_counter:    i32;
+
+    # local variables
+    local_vars:     *LocalVar;
+    local_count:    i32;
+    local_cap:      i32;
+    stack_offset:   i64;
+
+    # function return state
+    fn_ret_type:    *type.Type;
+    fn_has_sret:    bool;
+    sret_slot:      ir.Operand;
+    fn_is_variadic: bool;
+    va_reg_save_off: i64;   # RBP-relative offset for register save area
+    va_named_gp:     i32;   # GP arg registers consumed (for gp_offset init)
+    va_named_fp:     i32;   # FP arg registers consumed (for fp_offset init)
+    va_named_stack:  i32;   # named params on stack (for overflow_arg_area)
+
+    # loop state
+    loop_start:     str;
+    loop_end:       str;
+
+    # deferred statements
+    deferred:       **ast.Node;
+    deferred_count: i32;
+    deferred_cap:   i32;
+    defer_mark:     i32;
+
+    # outgoing call stack area
+    max_call_arg_bytes: i64;   # max stack bytes needed across all calls
+
+    # debug info
+    current_file:   u16;
+    current_line:   i32;
+    debug_file_path: str;
+    debug_source:    str;
+
+    # pointer size cache (from target)
+    ptr_size:       u8;
+}
+
+# --- context lifecycle ---
+
+pub fun create(alloc: *allocator.Allocator, tgt: *target.Target,
+               builder: *module.ModuleBuilder, symbols: *symbol.Table,
+               file_path: str,
+               source: str) Result[LowerContext, str] {
+    if (alloc == nil || tgt == nil || builder == nil) {
+        ret err[LowerContext, str]("invalid arguments");
+    }
+
+    var ctx: LowerContext;
+    ctx.alloc = alloc;
+    ctx.target = tgt;
+    ctx.builder = builder;
+    ctx.symbols = symbols;
+    ctx.current_fn = nil;
+    ctx.current_block = nil;
+    ctx.vreg_next = ir.VREG_START;
+    ctx.label_counter = 0;
+    ctx.str_counter = 0;
+    ctx.stack_offset = 0;
+    ctx.fn_ret_type = nil;
+    ctx.fn_has_sret = false;
+    ctx.fn_is_variadic = false;
+    ctx.va_reg_save_off = 0;
+    ctx.va_named_gp = 0;
+    ctx.va_named_fp = 0;
+    ctx.va_named_stack = 0;
+    ctx.loop_start = nil;
+    ctx.loop_end = nil;
+    ctx.deferred_count = 0;
+    ctx.defer_mark = 0;
+    ctx.current_file = 0;
+    ctx.current_line = 0;
+    ctx.debug_file_path = file_path;
+    ctx.debug_source = source;
+    ctx.ptr_size = tgt.isa.ptr_size::u8;
+
+    # register debug file with module builder
+    if (file_path != nil) {
+        ctx.current_file = module.builder_add_debug_file(builder, file_path);
+    }
+
+    # allocate local vars array
+    val lv_r: Result[*LocalVar, allocator.AllocError] =
+        allocator.allocator_zalloc[LocalVar](alloc, INITIAL_LOCAL_CAP::usize);
+    if (result_is_err[*LocalVar, allocator.AllocError](lv_r)) {
+        ret err[LowerContext, str]("out of memory");
+    }
+    ctx.local_vars = result_unwrap_ok[*LocalVar, allocator.AllocError](lv_r);
+    ctx.local_count = 0;
+    ctx.local_cap = INITIAL_LOCAL_CAP;
+
+    # allocate deferred array
+    val df_r: Result[**ast.Node, allocator.AllocError] =
+        allocator.allocator_zalloc[*ast.Node](alloc, INITIAL_DEFER_CAP::usize);
+    if (result_is_err[**ast.Node, allocator.AllocError](df_r)) {
+        ret err[LowerContext, str]("out of memory");
+    }
+    ctx.deferred = result_unwrap_ok[**ast.Node, allocator.AllocError](df_r);
+    ctx.deferred_cap = INITIAL_DEFER_CAP;
+
+    ret ok[LowerContext, str](ctx);
+}
+
+# --- virtual register allocation ---
+
+pub fun new_vreg(ctx: *LowerContext, size: u8) ir.Operand {
+    val id: i32 = ctx.vreg_next;
+    ctx.vreg_next = ctx.vreg_next + 1;
+    ret ir.make_reg(id, size);
+}
+
+# --- label generation ---
+
+pub fun new_label(ctx: *LowerContext, prefix: str) str {
+    ctx.label_counter = ctx.label_counter + 1;
+    # format: "<prefix>_<counter>" — unique per lowering context
+    val buf_r: Result[*u8, allocator.AllocError] =
+        allocator.allocator_alloc[u8](ctx.alloc, 64);
+    if (result_is_err[*u8, allocator.AllocError](buf_r)) { ret prefix; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](buf_r);
+
+    # copy prefix
+    var pos: usize = 0;
+    if (prefix != nil) {
+        var pi: usize = 0;
+        for (prefix[pi] != 0 && pos < 50) {
+            buf[pos] = prefix[pi];
+            pos = pos + 1;
+            pi = pi + 1;
+        }
+    }
+
+    # append underscore separator
+    buf[pos] = '_';
+    pos = pos + 1;
+
+    # append counter digits
+    val counter: i32 = ctx.label_counter;
+    if (counter == 0) {
+        buf[pos] = '0';
+        pos = pos + 1;
+    } or {
+        var dlen: usize = 0;
+        var tmp: i32 = counter;
+        for (tmp > 0) { dlen = dlen + 1; tmp = tmp / 10; }
+        var i: usize = pos + dlen;
+        tmp = counter;
+        for (tmp > 0) {
+            i = i - 1;
+            buf[i] = (tmp % 10)::u8 + '0';
+            tmp = tmp / 10;
+        }
+        pos = pos + dlen;
+    }
+
+    buf[pos] = 0;
+    ret buf::str;
+}
+
+pub fun new_label_id(ctx: *LowerContext) i32 {
+    ctx.label_counter = ctx.label_counter + 1;
+    ret ctx.label_counter;
+}
+
+# --- instruction emission ---
+
+# emit_inst: append a pre-built compact instruction to the current block.
+pub fun emit_inst(ctx: *LowerContext, inst: ir.Inst) {
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+    val idx: i32 = ir.block_append(ctx.alloc, ctx.current_block, inst);
+    if (idx >= 0 && ctx.current_line > 0) {
+        ir.block_set_debug(ctx.current_block, idx,
+                           ctx.current_line, ctx.current_file);
+    }
+}
+
+# intern_label: intern a label string in the current function's label table.
+pub fun intern_label(ctx: *LowerContext, name: str) i32 {
+    if (ctx == nil || ctx.current_fn == nil) { ret -1; }
+    ret ir.label_intern(ctx.alloc, ?ctx.current_fn.labels, name);
+}
+
+# intern_const: intern an i64 value in the current function's constant pool.
+pub fun intern_const(ctx: *LowerContext, value: i64) i32 {
+    if (ctx == nil || ctx.current_fn == nil) { ret -1; }
+    ret ir.const_intern(ctx.alloc, ?ctx.current_fn.const_pool, value);
+}
+
+# --- Operand→compact Inst conversion ---
+# lowering files continue to use Operand-based interface; conversion
+# to compact 8-byte Inst happens here at the emit boundary.
+
+# operand_to_reg: extract u8 register ID from an Operand.
+fun operand_to_reg(op: &ir.Operand) u8 {
+    if (op.kind == ir.OPK_REG) { ret op.reg::u8; }
+    ret 0;
+}
+
+# emit_mem_inst: emit a memory instruction (LOAD, STORE, ADDR) from Operands.
+fun emit_mem_inst(ctx: *LowerContext, op: u8, reg: u8,
+                  mem: &ir.Operand, size: u8) {
+    var inst: ir.Inst;
+    if (mem.index >= 0) {
+        # indexed mode
+        if (op == ir.OP_STORE) {
+            inst = ir.mk_store_idx(reg, mem.base::u8, mem.index::u8,
+                                   mem.scale::u8, mem.disp::i16, size);
+        } or (op == ir.OP_ADDR) {
+            inst = ir.mk_addr_idx(reg, mem.base::u8, mem.index::u8,
+                                  mem.scale::u8, mem.disp::i16, size);
+        } or {
+            inst = ir.mk_load_idx(reg, mem.base::u8, mem.index::u8,
+                                  mem.scale::u8, mem.disp::i16, size);
+        }
+    } or {
+        # simple base+disp
+        if (op == ir.OP_STORE) {
+            inst = ir.mk_store(reg, mem.base::u8, mem.disp::i32, size);
+        } or (op == ir.OP_ADDR) {
+            inst = ir.mk_addr(reg, mem.base::u8, mem.disp::i32, size);
+        } or {
+            inst = ir.mk_load(reg, mem.base::u8, mem.disp::i32, size);
+        }
+    }
+    emit_inst(ctx, inst);
+}
+
+# emit: Operand-based emit — converts to compact Inst at the boundary.
+# this is the main entry point for lowering files.
+pub fun emit(ctx: *LowerContext, op: ir.Operator, dst: ir.Operand,
+             src1: ir.Operand, src2: ir.Operand, cc: ir.Cond) {
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+
+    # determine effective size
+    var sz: u8 = dst.size;
+    if (sz == 0) { sz = src1.size; }
+    if (sz == 0) { sz = src2.size; }
+
+    # --- control flow ---
+    if (op == ir.OP_LABEL) {
+        val li: i32 = intern_label(ctx, dst.label);
+        emit_inst(ctx, ir.mk_label_inst(li));
+        ret;
+    }
+    if (op == ir.OP_JMP) {
+        val li: i32 = intern_label(ctx, dst.label);
+        emit_inst(ctx, ir.mk_jmp(li));
+        ret;
+    }
+    if (op == ir.OP_BRCOND) {
+        val li: i32 = intern_label(ctx, dst.label);
+        emit_inst(ctx, ir.mk_brcond(operand_to_reg(?src1), li, cc));
+        ret;
+    }
+    if (op == ir.OP_RET) {
+        emit_inst(ctx, ir.mk_ret());
+        ret;
+    }
+    if (op == ir.OP_SYSCALL) {
+        var result_reg: u8 = 0;
+        if (dst.kind == ir.OPK_MEM) {
+            # syscall result goes to memory — encode with base reg
+            result_reg = dst.base::u8;
+        } or (dst.kind == ir.OPK_REG) {
+            result_reg = dst.reg::u8;
+        }
+        emit_inst(ctx, ir.mk_syscall(result_reg));
+        ret;
+    }
+    if (op == ir.OP_NOP) {
+        emit_inst(ctx, ir.mk_nop());
+        ret;
+    }
+
+    # --- CALL ---
+    if (op == ir.OP_CALL) {
+        # pre-ABI CALL: dst=callee (label/reg), src1=ret_meta, src2=result
+        if (dst.kind == ir.OPK_LABEL) {
+            val li: i32 = intern_label(ctx, dst.label);
+            var result_reg: u8 = 0;
+            if (src2.kind == ir.OPK_REG) { result_reg = src2.reg::u8; }
+            or (src2.kind == ir.OPK_MEM) { result_reg = src2.base::u8; }
+            var ret_meta: u8 = 0;
+            if (src1.kind != ir.OPK_NONE) {
+                val ret_sz: u8 = src1.imm::u8;
+                val ret_al: u8 = src1.size;
+                val ret_fl: bool = (cc & ir.CALL_RET_FLOAT) != 0;
+                val ret_ag: bool = (cc & ir.CALL_RET_AGG) != 0;
+                ret_meta = ir.make_abi_meta(ret_sz, ret_al, ret_ag, ret_fl);
+            }
+            emit_inst(ctx, ir.mk_call(result_reg, ret_meta, li, cc, sz));
+        } or (dst.kind == ir.OPK_REG) {
+            # indirect call
+            var result_reg: u8 = 0;
+            if (src2.kind == ir.OPK_REG) { result_reg = src2.reg::u8; }
+            or (src2.kind == ir.OPK_MEM) { result_reg = src2.base::u8; }
+            var ret_size: i32 = 0;
+            var ret_flags: u8 = 0;
+            var ret_align: u8 = 0;
+            if (src1.kind != ir.OPK_NONE) {
+                ret_size = src1.imm::i32;
+                ret_align = src1.size;
+                if ((cc & ir.CALL_RET_FLOAT) != 0) { ret_flags = ret_flags | ir.ABI_FLAG_FLOAT; }
+                if ((cc & ir.CALL_RET_AGG) != 0) { ret_flags = ret_flags | ir.ABI_FLAG_AGG; }
+            }
+            emit_inst(ctx, ir.mk_call_indirect(result_reg, dst.reg::u8,
+                                               ret_size, ret_flags, ret_align, cc, sz));
+        }
+        ret;
+    }
+
+    # --- ABI-abstract ops ---
+    if (op == ir.OP_ARG) {
+        val arg_idx: u8 = src1.imm::u8;
+        var value_reg: u8 = 0;
+        if (src2.kind == ir.OPK_REG) { value_reg = src2.reg::u8; }
+        or (src2.kind == ir.OPK_MEM) { value_reg = src2.base::u8; }
+        val byte_size: i32 = dst.imm::i32;
+        val flags: u8 = src1.size;
+        val align: u8 = dst.size;
+        emit_inst(ctx, ir.mk_arg(arg_idx, value_reg, byte_size, flags, align, sz));
+        ret;
+    }
+    if (op == ir.OP_PARAM) {
+        var param_idx: u8 = src1.imm::u8;
+        if (src1.imm == -1) { param_idx = ir.PARAM_SRET; }
+        or (src1.imm == -2) { param_idx = ir.PARAM_VARARGS; }
+        val byte_size: u8 = dst.imm::u8;
+        val align: u8 = dst.size;
+        val flags: u8 = src1.size;
+        val is_float: bool = (flags & ir.ABI_FLAG_FLOAT) != 0;
+        val is_agg: bool = (flags & ir.ABI_FLAG_AGG) != 0;
+        var displacement: i32 = 0;
+        if (src2.kind == ir.OPK_MEM) { displacement = src2.disp::i32; }
+        emit_inst(ctx, ir.mk_param(param_idx, byte_size, align,
+                                   is_agg, is_float, displacement));
+        ret;
+    }
+    if (op == ir.OP_RETVAL) {
+        var value_reg: u8 = 0;
+        if (src2.kind == ir.OPK_REG) { value_reg = src2.reg::u8; }
+        or (src2.kind == ir.OPK_MEM) { value_reg = src2.base::u8; }
+        val byte_size: i32 = dst.imm::i32;
+        val flags: u8 = src1.size;
+        val align: u8 = dst.size;
+        emit_inst(ctx, ir.mk_retval(value_reg, byte_size, flags, align, sz));
+        ret;
+    }
+    if (op == ir.OP_SCARG) {
+        val arg_idx: u8 = src1.imm::u8;
+        var value_reg: u8 = 0;
+        if (src2.kind == ir.OPK_REG) { value_reg = src2.reg::u8; }
+        or (src2.kind == ir.OPK_MEM) { value_reg = src2.base::u8; }
+        emit_inst(ctx, ir.mk_scarg(arg_idx, value_reg, sz));
+        ret;
+    }
+
+    # --- LOAD ---
+    if (op == ir.OP_LOAD) {
+        if (src1.kind == ir.OPK_MEM) {
+            emit_mem_inst(ctx, ir.OP_LOAD, operand_to_reg(?dst), ?src1, sz);
+        } or {
+            # fallback: reg-reg MOV (shouldn't happen for LOAD but safety)
+            emit_inst(ctx, ir.mk_unary(ir.OP_MOV, operand_to_reg(?dst),
+                                       operand_to_reg(?src1), sz));
+        }
+        ret;
+    }
+
+    # --- STORE ---
+    if (op == ir.OP_STORE) {
+        if (dst.kind == ir.OPK_MEM) {
+            emit_mem_inst(ctx, ir.OP_STORE, operand_to_reg(?src1), ?dst, sz);
+        }
+        ret;
+    }
+
+    # --- ADDR ---
+    if (op == ir.OP_ADDR) {
+        if (src1.kind == ir.OPK_MEM) {
+            emit_mem_inst(ctx, ir.OP_ADDR, operand_to_reg(?dst), ?src1, sz);
+        } or (src1.kind == ir.OPK_LABEL) {
+            val li: i32 = intern_label(ctx, src1.label);
+            emit_inst(ctx, ir.mk_addr_label(operand_to_reg(?dst), li, sz));
+        }
+        ret;
+    }
+
+    # --- MOV ---
+    if (op == ir.OP_MOV) {
+        val dr: u8 = operand_to_reg(?dst);
+        if (src1.kind == ir.OPK_REG) {
+            emit_inst(ctx, ir.mk_unary(ir.OP_MOV, dr, src1.reg::u8, sz));
+        } or (src1.kind == ir.OPK_IMM) {
+            if (src1.imm >= -2147483648 && src1.imm <= 2147483647) {
+                emit_inst(ctx, ir.mk_mov_imm(dr, src1.imm::i32, sz));
+            } or {
+                val ci: i32 = intern_const(ctx, src1.imm);
+                emit_inst(ctx, ir.mk_mov_const(dr, ci, sz));
+            }
+        } or (src1.kind == ir.OPK_MEM) {
+            # MOV from memory = LOAD
+            emit_mem_inst(ctx, ir.OP_LOAD, dr, ?src1, sz);
+        } or (src1.kind == ir.OPK_LABEL) {
+            val li: i32 = intern_label(ctx, src1.label);
+            emit_inst(ctx, ir.mk_addr_label(dr, li, sz));
+        }
+        ret;
+    }
+
+    # --- compare ---
+    if (op == ir.OP_ICMP || op == ir.OP_FCMP) {
+        # use source operand size (comparison width), not dst (always 1-byte bool)
+        var cmp_sz: u8 = src1.size;
+        if (cmp_sz == 0) { cmp_sz = src2.size; }
+        if (cmp_sz == 0) { cmp_sz = sz; }
+        emit_inst(ctx, ir.mk_cmp(op, operand_to_reg(?dst),
+                                 operand_to_reg(?src1),
+                                 operand_to_reg(?src2), cc, cmp_sz));
+        ret;
+    }
+
+    # --- FTOI: needs source float size preserved ---
+    if (op == ir.OP_FTOI) {
+        emit_inst(ctx, ir.mk_ftoi(operand_to_reg(?dst),
+                                  operand_to_reg(?src1), sz, src1.size));
+        ret;
+    }
+
+    # --- unary conversions ---
+    if (op == ir.OP_ZEXT || op == ir.OP_SEXT || op == ir.OP_TRUNC ||
+        op == ir.OP_ITOF || op == ir.OP_FEXT ||
+        op == ir.OP_FTRUNC) {
+        emit_inst(ctx, ir.mk_unary(op, operand_to_reg(?dst),
+                                   operand_to_reg(?src1), sz));
+        ret;
+    }
+
+    # --- 3-register ALU ops ---
+    # ADD, SUB, MUL, DIV, MOD, DIVU, MODU, AND, OR, XOR, SHL, SHR, SAR,
+    # FADD, FSUB, FMUL, FDIV, MEMSET
+    emit_inst(ctx, ir.mk_alu(op, operand_to_reg(?dst),
+                             operand_to_reg(?src1),
+                             operand_to_reg(?src2), sz));
+}
+
+# emit_mov: emit a MOV instruction.
+pub fun emit_mov(ctx: *LowerContext, dst: ir.Operand, src: ir.Operand) {
+    emit(ctx, ir.OP_MOV, dst, src, ir.make_none(), ir.CC_NONE);
+}
+
+# emit_store: emit a STORE instruction.
+# for mem-to-mem copies wider than a register, automatically splits into
+# word-by-word loads+stores so that all bytes are transferred.
+pub fun emit_store(ctx: *LowerContext, dst: ir.Operand, src: ir.Operand) {
+    val psz: u8 = ctx.ptr_size;
+    if (dst.kind == ir.OPK_MEM && src.kind == ir.OPK_MEM
+        && dst.size > psz && src.size <= dst.size) {
+        val total: usize = dst.size::usize;
+        val word: usize = psz::usize;
+        var off: usize = 0;
+        for (off < total) {
+            var chunk: u8 = psz;
+            if (off + word > total) { chunk = (total - off)::u8; }
+            val s: ir.Operand = ir.make_mem(src.base, src.index, src.scale,
+                                              src.disp + off::i64, chunk);
+            val tmp: ir.Operand = new_vreg(ctx, chunk);
+            emit_load(ctx, tmp, s);
+            val d: ir.Operand = ir.make_mem(dst.base, dst.index, dst.scale,
+                                              dst.disp + off::i64, chunk);
+            emit(ctx, ir.OP_STORE, d, tmp, ir.make_none(), ir.CC_NONE);
+            off = off + word;
+        }
+        ret;
+    }
+    emit(ctx, ir.OP_STORE, dst, src, ir.make_none(), ir.CC_NONE);
+}
+
+# emit_load: emit a LOAD instruction.
+pub fun emit_load(ctx: *LowerContext, dst: ir.Operand, src: ir.Operand) {
+    emit(ctx, ir.OP_LOAD, dst, src, ir.make_none(), ir.CC_NONE);
+}
+
+# emit_label: emit a label pseudo-instruction.
+pub fun emit_label(ctx: *LowerContext, label: str) {
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+    val li: i32 = intern_label(ctx, label);
+    emit_inst(ctx, ir.mk_label_inst(li));
+}
+
+# emit_jmp: emit an unconditional jump.
+pub fun emit_jmp(ctx: *LowerContext, label: str) {
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+    val li: i32 = intern_label(ctx, label);
+    emit_inst(ctx, ir.mk_jmp(li));
+}
+
+# emit_brcond: emit a conditional branch.
+pub fun emit_brcond(ctx: *LowerContext, cond: ir.Operand, label: str, cc: ir.Cond) {
+    if (ctx == nil || ctx.current_block == nil) { ret; }
+    val li: i32 = intern_label(ctx, label);
+    emit_inst(ctx, ir.mk_brcond(operand_to_reg(?cond), li, cc));
+}
+
+# emit_ret: emit a return instruction.
+pub fun emit_ret(ctx: *LowerContext) {
+    emit_inst(ctx, ir.mk_ret());
+}
+
+# --- basic block management ---
+
+# start_block: create and switch to a new basic block.
+pub fun start_block(ctx: *LowerContext, label: str) {
+    if (ctx == nil || ctx.current_fn == nil) { ret; }
+
+    val r: Result[*ir.Block, str] = ir.create_block(ctx.alloc, label);
+    if (result_is_err[*ir.Block, str](r)) { ret; }
+
+    val block: *ir.Block = result_unwrap_ok[*ir.Block, str](r);
+    ir.func_add_block(ctx.alloc, ctx.current_fn, block);
+    ctx.current_block = block;
+}
+
+# --- local variable management ---
+
+pub fun local_add(ctx: *LowerContext, name: str, t: *type.Type, size: usize) *LocalVar {
+    if (ctx == nil) { ret nil; }
+
+    # grow if needed
+    if (ctx.local_count >= ctx.local_cap) {
+        val new_cap: i32 = ctx.local_cap * 2;
+        val r: Result[*LocalVar, allocator.AllocError] =
+            allocator.allocator_resize[LocalVar](ctx.alloc, ctx.local_vars,
+                ctx.local_cap::usize, new_cap::usize);
+        if (result_is_err[*LocalVar, allocator.AllocError](r)) { ret nil; }
+        ctx.local_vars = result_unwrap_ok[*LocalVar, allocator.AllocError](r);
+        ctx.local_cap = new_cap;
+    }
+
+    # align and allocate stack space
+    var align: usize = type.type_align(t);
+    if (align < 1) { align = 1; }
+    val mask: i64 = align::i64 - 1;
+    ctx.stack_offset = (ctx.stack_offset + size::i64 + mask) & ~mask;
+
+    val idx: i32 = ctx.local_count;
+    ctx.local_vars[idx].name = name;
+    ctx.local_vars[idx].type = t;
+    ctx.local_vars[idx].offset = -ctx.stack_offset;
+    ctx.local_vars[idx].is_param = false;
+    ctx.local_vars[idx].size = size;
+    ctx.local_count = ctx.local_count + 1;
+
+    ret ?ctx.local_vars[idx];
+}
+
+pub fun local_lookup(ctx: *LowerContext, name: str) *LocalVar {
+    if (ctx == nil || name == nil) { ret nil; }
+    var i: i32 = ctx.local_count - 1;
+    for (i >= 0) {
+        if (str_equals(ctx.local_vars[i].name, name)) {
+            ret ?ctx.local_vars[i];
+        }
+        i = i - 1;
+    }
+    ret nil;
+}
+
+# local_operand: get a memory operand for a local variable.
+pub fun local_operand(lv: *LocalVar, ptr_size: u8) ir.Operand {
+    if (lv == nil) { ret ir.make_none(); }
+    # frame pointer-relative addressing
+    # base register is virtual — will be resolved to physical frame pointer
+    ret ir.make_mem(ir.VREG_FP, -1, 1, lv.offset, lv.size::u8);
+}
+
+# --- function state management ---
+
+pub fun reset_function_state(ctx: *LowerContext) {
+    ctx.current_fn = nil;
+    ctx.current_block = nil;
+    ctx.vreg_next = ir.VREG_START;
+    ctx.local_count = 0;
+    ctx.stack_offset = 0;
+    ctx.fn_ret_type = nil;
+    ctx.fn_has_sret = false;
+    ctx.fn_is_variadic = false;
+    ctx.va_reg_save_off = 0;
+    ctx.va_named_gp = 0;
+    ctx.va_named_fp = 0;
+    ctx.va_named_stack = 0;
+    ctx.loop_start = nil;
+    ctx.loop_end = nil;
+    ctx.deferred_count = 0;
+    ctx.defer_mark = 0;
+    ctx.max_call_arg_bytes = 0;
+}
+
+# --- deferred statement management ---
+
+pub fun defer_push(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil) { ret; }
+
+    if (ctx.deferred_count >= ctx.deferred_cap) {
+        val new_cap: i32 = ctx.deferred_cap * 2;
+        val r: Result[**ast.Node, allocator.AllocError] =
+            allocator.allocator_resize[*ast.Node](ctx.alloc, ctx.deferred,
+                ctx.deferred_cap::usize, new_cap::usize);
+        if (result_is_err[**ast.Node, allocator.AllocError](r)) { ret; }
+        ctx.deferred = result_unwrap_ok[**ast.Node, allocator.AllocError](r);
+        ctx.deferred_cap = new_cap;
+    }
+
+    ctx.deferred[ctx.deferred_count] = node;
+    ctx.deferred_count = ctx.deferred_count + 1;
+}
+
+pub fun defer_mark(ctx: *LowerContext) i32 {
+    ret ctx.deferred_count;
+}
+
+# --- type size helpers ---
+
+pub fun type_size(ctx: *LowerContext, t: *type.Type) usize {
+    if (t == nil) { ret 0; }
+    if (type.type_is_pointer(t) || t.kind == type.TYPE_PTR) {
+        ret ctx.target.isa.ptr_size;
+    }
+    ret type.type_size(t);
+}
+
+pub fun type_size_u8(ctx: *LowerContext, t: *type.Type) u8 {
+    ret type_size(ctx, t)::u8;
+}
+
+# --- debug info helpers ---
+
+# pos_to_line: convert byte offset to 1-based line number.
+pub fun pos_to_line(source: str, pos: i32) i32 {
+    if (source == nil || pos <= 0) { ret 1; }
+    var line: i32 = 1;
+    var i: i32 = 0;
+    for (i < pos) {
+        if (source[i] == '\n') { line = line + 1; }
+        i = i + 1;
+    }
+    ret line;
+}
+
+# update_source_loc: set current_line from an AST node's token position.
+pub fun update_source_loc(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) { ret; }
+    if (ctx.debug_source == nil) { ret; }
+    val pos: i32 = node.tok.pos;
+    if (pos > 0) {
+        ctx.current_line = pos_to_line(ctx.debug_source, pos);
+    }
+}
+
+# --- float detection ---
+
+pub fun is_float_type(t: *type.Type) bool {
+    if (t == nil) { ret false; }
+    ret type.type_is_float(t);
+}
+
+# --- string label generation ---
+
+pub fun make_str_label(alloc: *allocator.Allocator, counter: i32) str {
+    # build ".Ls<counter>" label (max 14 bytes: ".Ls" + 10 digits + null)
+    val buf_r: Result[*u8, allocator.AllocError] =
+        allocator.allocator_alloc[u8](alloc, 14);
+    if (result_is_err[*u8, allocator.AllocError](buf_r)) { ret nil; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](buf_r);
+
+    buf[0] = '.';
+    buf[1] = 'L';
+    buf[2] = 's';
+    var pos: usize = 3;
+
+    if (counter == 0) {
+        buf[pos] = '0';
+        pos = pos + 1;
+    } or {
+        var dlen: usize = 0;
+        var tmp: i32 = counter;
+        for (tmp > 0) { dlen = dlen + 1; tmp = tmp / 10; }
+        var i: usize = pos + dlen;
+        tmp = counter;
+        for (tmp > 0) {
+            i = i - 1;
+            buf[i] = (tmp % 10)::u8 + '0';
+            tmp = tmp / 10;
+        }
+        pos = pos + dlen;
+    }
+
+    buf[pos] = 0;
+    ret buf::str;
+}
+
+# --- string helpers ---
+
+pub fun is_space_u8(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+pub fun is_digit_u8(c: u8) bool {
+    ret c >= '0' && c <= '9';
+}
+
+pub fun parse_int_str(s: str) i64 {
+    if (s == nil) { ret 0; }
+    var i: usize = 0;
+    for (is_space_u8(s[i])) { i = i + 1; }
+
+    var neg: bool = false;
+    if (s[i] == '-') { neg = true; i = i + 1; }
+
+    var base: i64 = 10;
+    if (s[i] == '0' && (s[i+1] == 'x' || s[i+1] == 'X')) {
+        base = 16; i = i + 2;
+    } or (s[i] == '0' && (s[i+1] == 'b' || s[i+1] == 'B')) {
+        base = 2; i = i + 2;
+    } or (s[i] == '0' && (s[i+1] == 'o' || s[i+1] == 'O')) {
+        base = 8; i = i + 2;
+    }
+
+    var value: i64 = 0;
+    for (s[i] != 0) {
+        if (s[i] == '_') { i = i + 1; cnt; } # skip underscores
+        var digit: i64 = -1;
+        if (s[i] >= '0' && s[i] <= '9') { digit = (s[i] - '0')::i64; }
+        or (s[i] >= 'a' && s[i] <= 'f') { digit = (s[i] - 'a' + 10)::i64; }
+        or (s[i] >= 'A' && s[i] <= 'F') { digit = (s[i] - 'A' + 10)::i64; }
+        if (digit < 0 || digit >= base) { brk; }
+        value = value * base + digit;
+        i = i + 1;
+    }
+
+    if (neg) { value = -value; }
+    ret value;
+}
+
+pub fun parse_float(s: str) f64 {
+    if (s == nil) { ret 0.0; }
+    var i: usize = 0;
+    for (is_space_u8(s[i])) { i = i + 1; }
+
+    var neg: bool = false;
+    if (s[i] == '-') { neg = true; i = i + 1; }
+
+    var value: f64 = 0.0;
+    for (s[i] != 0 && is_digit_u8(s[i])) {
+        value = value * 10.0 + (s[i] - '0')::f64;
+        i = i + 1;
+    }
+
+    if (s[i] == '.') {
+        i = i + 1;
+        var frac: f64 = 0.0;
+        var div: f64 = 1.0;
+        for (s[i] != 0 && is_digit_u8(s[i])) {
+            frac = frac * 10.0 + (s[i] - '0')::f64;
+            div = div * 10.0;
+            i = i + 1;
+        }
+        value = value + frac / div;
+    }
+
+    if (neg) { value = -value; }
+    ret value;
+}
+

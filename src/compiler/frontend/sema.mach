@@ -1,0 +1,751 @@
+# mach.compiler.frontend.sema.sema: core types, initialization, scope management, and utilities.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.option;
+use std.types.result;
+
+use allocator: std.allocator;
+use print:     std.print;
+
+use ast:     mach.compiler.frontend.ast;
+use symbol:  mach.compiler.frontend.symbol;
+use type:      mach.compiler.frontend.type;
+use comptime: mach.compiler.frontend.comptime;
+use target:  mach.compiler.target;
+use abi:     mach.compiler.target.abi;
+use config:  mach.config.config;
+
+# SemaError: a semantic analysis error.
+# ---
+# pos:       position in source where error occurred
+# line:      1-based line number
+# col:       1-based column number
+# file_path: path to the source file
+# message:   error description
+pub rec SemaError {
+    pos:       i32;
+    line:      i32;
+    col:       i32;
+    file_path: str;
+    message:   str;
+}
+
+# ModuleAlias: tracks an aliased import (use alias: module.path;)
+# ---
+# alias:  the alias name (e.g., "cli" from "use cli: mach.cli.main;")
+# module: pointer to the loaded module
+# next:   linked list of aliases
+pub rec ModuleAlias {
+    alias:  str;
+    module: *SemaModule;
+    next:   *ModuleAlias;
+}
+
+# ModuleImport: tracks a direct import (use module.path;)
+# ---
+# path:   the module path (e.g., "mach.cli.main")
+# module: pointer to the loaded module
+# next:   linked list of imports
+pub rec ModuleImport {
+    path:   str;
+    module: *SemaModule;
+    next:   *ModuleImport;
+}
+
+# CachedInstantiation: tracks a previously instantiated generic type.
+# ---
+# generic_args: array of type arguments
+# arg_count:    number of type arguments
+# result_type:  the instantiated concrete type
+# next:         linked list of cached instantiations
+pub rec CachedInstantiation {
+    generic_args: **type.Type;
+    arg_count:    i32;
+    result_type:  *type.Type;
+    next:         *CachedInstantiation;
+}
+
+# GenericInstance: tracks a generic type with its parameter bindings.
+# ---
+# generic_type:  the generic type being instantiated
+# param_names:   array of parameter names
+# param_count:   number of parameters
+# bindings:      array of bound types
+# binding_count: number of bindings
+# instantiated_type: the resulting concrete type
+pub rec GenericInstance {
+    generic_type:      *type.Type;
+    param_names:       *str;
+    param_count:       i32;
+    bindings:          **type.Type;
+    binding_count:     i32;
+    instantiated_type: *type.Type;
+}
+# FunctionInstantiation: tracks a concrete instantiation of a generic free function.
+# ---
+# func_ast:       original function AST node (shared across instantiations)
+# mangled_name:   unique mangled name for this instantiation
+# func_type:      instantiated function type (concrete param/return types)
+# param_names:    generic param names (e.g., ["T", "E"])
+# param_types:    concrete types bound to params (e.g., [*Section, str])
+# param_count:    number of type parameters
+# origin_module:  module where the function is defined
+# next:           linked list of instantiations
+pub rec FunctionInstantiation {
+    func_ast:      *ast.Node;
+    mangled_name:  str;
+    func_type:     *type.Type;
+    param_names:   *str;
+    param_types:   **type.Type;
+    param_count:   i32;
+    origin_module: *SemaModule;
+    next:          *FunctionInstantiation;
+}
+# InstMapEntry: a single entry in the instantiation dedup hash table.
+# ---
+# key:  mangled name string (nil if slot is empty)
+# val:  persistent mangled name pointer (returned on dedup hit)
+pub rec InstMapEntry {
+    key: str;
+    value: str;
+}
+
+# INST_MAP_INIT_CAP: initial number of buckets (must be power of two).
+val INST_MAP_INIT_CAP: i32 = 64;
+
+# InstMap: open-addressing hash table for O(1) instantiation dedup.
+# ---
+# entries:  flat array of `capacity` buckets
+# count:    number of occupied slots
+# capacity: current bucket count (always a power of two)
+pub rec InstMap {
+    entries:  *InstMapEntry;
+    count:    i32;
+    capacity: i32;
+}
+
+# SavedContext: snapshot of module context for safe save/restore.
+# ---
+# used during cross-module generic instantiation to temporarily switch
+# sema to the origin module's context and restore it on every exit path.
+pub rec SavedContext {
+    module:      *SemaModule;
+    module_path: str;
+    file_path:   str;
+    source:      str;
+    symbols:     *symbol.Table;
+}
+
+# SemaModule: represents a loaded module during semantic analysis.
+# ---
+# path:        the module path (e.g., "mach.cli.main")
+# file_path:   the file system path to the source file
+# source:      source text for the module
+# ast:         the module's AST
+# is_analyzed: whether this module has been fully analyzed
+# next:        linked list of modules
+# aliases:     list of aliases for this module
+# imports:     list of imports from this module
+# table:       symbol table for this module
+pub rec SemaModule {
+    path:        str;
+    file_path:   str;
+    source:      str;
+    ast:         *ast.Node;
+    is_analyzed: bool;
+    next:        *SemaModule;
+    aliases:     *ModuleAlias;
+    imports:     *ModuleImport;
+    table:       *symbol.Table;
+}
+
+# Scope: represents a lexical scope during semantic analysis.
+# ---
+# symbols: symbol table for this scope
+# parent:  parent scope (nil for global scope)
+# depth:   nesting depth (0 for global)
+pub rec Scope {
+    table:  *symbol.Table;
+    parent: *Scope;
+    depth:  i32;
+}
+
+# Sema: the semantic analyzer.
+# ---
+# alloc:           allocator for all sema allocations
+# types:           type context for creating types
+# symbols:         global symbol table
+# current_scope:   current lexical scope
+# root_scope:      root (global) scope
+# current_fn:      current function being analyzed
+# current_fn_ret:  current function's return type
+# modules:         list of loaded modules
+# module_count:    number of modules loaded
+# module_roots:    array of module root paths for lookup
+# root_count:      number of module roots
+# project_id:      project identifier for module path prefix
+# src_root:        source root directory path
+# dep_root:        dependency root directory path
+# deps:            array of dependency configurations
+# dep_count:       number of dependencies
+# generic_cache:   cache of generic instantiations
+# generic_stack:   stack of currently resolving generics (for cycle detection)
+# errors:          array of semantic errors
+# error_count:     number of errors
+# error_cap:       capacity of errors array
+# had_error:       whether any error occurred
+# current_module:  currently analyzing module
+# file_path:       path to current file
+# source:          source text for error messages
+# comptime_ctx:    compile-time context for comptime evaluation
+pub rec Sema {
+    alloc:           *allocator.Allocator;
+    types:           *type.TypeCache;
+    symbols:         *symbol.Table;
+    current_scope:   *Scope;
+    root_scope:      *Scope;
+    current_fn:      *ast.Node;
+    current_fn_ret:  *type.Type;
+    modules:         *SemaModule;
+    module_count:    i32;
+    module_roots:    *str;
+    root_count:      i32;
+    project_id:      str;
+    src_root:        str;
+    dep_root:        str;
+    deps:            *config.Dep;
+    dep_count:       i32;
+    includes:        *config.IncludePath;
+    include_count:   i32;
+    generic_cache:   *CachedInstantiation;
+    generic_stack:   *GenericInstance;
+    generic_stack_count: i32;
+    errors:          *SemaError;
+    error_count:     i32;
+    error_cap:       i32;
+    had_error:       bool;
+    current_module:  *SemaModule;
+    module_path:     str;   # current module's dot-separated path (for symbol mangling)
+    file_path:       str;
+    source:          str;
+    comptime_ctx:    *comptime.ComptimeContext;
+    func_insts:      *FunctionInstantiation;  # linked list of generic function instantiations
+    func_inst_count: i32;
+    func_inst_map:   InstMap;                 # hash table for O(1) function instantiation dedup
+
+    # ABI-specific va_list type dimensions (set from target during init)
+    va_list_size:    usize;
+    va_list_align:   usize;
+}
+
+# --- initialization and cleanup ---
+
+# init: initialize a new semantic analyzer.
+# ---
+# alloc: allocator for sema allocations
+# tgt:   target configuration
+# ret:   initialized sema context
+pub fun init(alloc: *allocator.Allocator, tgt: target.Target) Sema {
+    var sema: Sema;
+    sema.alloc = alloc;
+
+    # create type cache
+    val types_res: Result[type.TypeCache, str] = type.init_cache(alloc, tgt.isa.ptr_size, tgt.isa.ptr_align);
+    if (result_is_ok[type.TypeCache, str](types_res)) {
+        val ctx_res: Result[*type.TypeCache, allocator.AllocError] = allocator.allocator_alloc[type.TypeCache](alloc, 1);
+        if (result_is_ok[*type.TypeCache, allocator.AllocError](ctx_res)) {
+            sema.types = result_unwrap_ok[*type.TypeCache, allocator.AllocError](ctx_res);
+            @sema.types = result_unwrap_ok[type.TypeCache, str](types_res);
+        } or {
+            sema.types = nil;
+        }
+    } or {
+        sema.types = nil;
+    }
+
+    sema.symbols = nil;
+    sema.current_scope = nil;
+    sema.root_scope = nil;
+    sema.current_fn = nil;
+    sema.current_fn_ret = nil;
+    sema.modules = nil;
+    sema.module_count = 0;
+    sema.module_roots = nil;
+    sema.root_count = 0;
+    sema.project_id = nil;
+    sema.src_root = nil;
+    sema.dep_root = nil;
+    sema.deps = nil;
+    sema.dep_count = 0;
+    sema.includes = nil;
+    sema.include_count = 0;
+    sema.generic_cache = nil;
+    sema.generic_stack = nil;
+    sema.generic_stack_count = 0;
+    sema.errors = nil;
+    sema.error_count = 0;
+    sema.error_cap = 0;
+    sema.had_error = false;
+    sema.current_module = nil;
+    sema.module_path = nil;
+    sema.file_path = nil;
+    sema.source = nil;
+    sema.comptime_ctx = nil;
+    sema.func_insts = nil;
+    sema.func_inst_count = 0;
+    sema.func_inst_map.entries = nil;
+    sema.func_inst_map.count = 0;
+    sema.func_inst_map.capacity = 0;
+
+    # extract va_list dimensions from the target ABI
+    var target_abi: abi.ABI = tgt.abi;
+    val va_layout: abi.VarargLayout = target_abi.vararg_layout(target_abi.ctx);
+    sema.va_list_size = va_layout.va_list_size;
+    sema.va_list_align = va_layout.va_list_align;
+
+    ret sema;
+}
+
+# dnit: cleanup sema resources.
+# ---
+# sema: analyzer context
+# ret:  none
+pub fun dnit(sema: *Sema) {
+    if (sema == nil) {
+        ret;
+    }
+
+    # cleanup scopes
+    for (sema.current_scope != nil) {
+        pop_scope(sema);
+    }
+
+    # note: full cleanup would free all allocated resources
+    # but we use arena allocation, so it's not strictly necessary
+}
+
+# --- instantiation hash table helpers ---
+
+# inst_map_hash: FNV-1a hash of a string, returning a bucket index.
+fun inst_map_hash(s: str, cap: i32) i32 {
+    if (s == nil) {
+        ret 0;
+    }
+    var h: u64 = 14695981039346656037;  # FNV offset basis
+    val len: usize = str_len(s);
+    var i: usize = 0;
+    for (i < len) {
+        h = h ^ s[i]::u64;
+        h = h * 1099511628211;  # FNV prime
+        i = i + 1;
+    }
+    ret (h & (cap - 1)::u64)::i32;
+}
+
+# inst_map_grow: double the capacity and rehash all entries.
+# returns true on success, false on OOM (caller must not insert after false).
+fun inst_map_grow(m: *InstMap, alloc: *allocator.Allocator) bool {
+    val old_entries: *InstMapEntry = m.entries;
+    val old_cap: i32 = m.capacity;
+    val new_cap: i32 = old_cap * 2;
+
+    val res: Result[*InstMapEntry, allocator.AllocError] = allocator.allocator_zalloc[InstMapEntry](alloc, new_cap::usize);
+    if (result_is_err[*InstMapEntry, allocator.AllocError](res)) {
+        print.eprint("sema: error: failed to grow instantiation map (out of memory)\n");
+        ret false;
+    }
+    m.entries = result_unwrap_ok[*InstMapEntry, allocator.AllocError](res);
+    m.capacity = new_cap;
+    m.count = 0;
+
+    var i: i32 = 0;
+    for (i < old_cap) {
+        val e: *InstMapEntry = ?old_entries[i];
+        if (e.key != nil) {
+            inst_map_put_inner(m, e.key, e.value);
+        }
+        i = i + 1;
+    }
+    allocator.allocator_free[InstMapEntry](alloc, old_entries, old_cap::usize);
+    ret true;
+}
+
+# inst_map_put_inner: insert without grow check (used by grow and put).
+fun inst_map_put_inner(m: *InstMap, key: str, val_name: str) {
+    var idx: i32 = inst_map_hash(key, m.capacity);
+    var probes: i32 = 0;
+    for (probes < m.capacity) {
+        val e: *InstMapEntry = ?m.entries[idx];
+        if (e.key == nil) {
+            e.key = key;
+            e.value = val_name;
+            m.count = m.count + 1;
+            ret;
+        }
+        if (str_equals(e.key, key)) {
+            ret;  # already present
+        }
+        idx = (idx + 1) & (m.capacity - 1);
+        probes = probes + 1;
+    }
+}
+
+# inst_map_get: look up a mangled name in the hash table.
+# returns the persistent name if found, nil otherwise.
+pub fun inst_map_get(m: *InstMap, key: str) str {
+    if (m == nil || m.entries == nil || key == nil) {
+        ret nil;
+    }
+    var idx: i32 = inst_map_hash(key, m.capacity);
+    var probes: i32 = 0;
+    for (probes < m.capacity) {
+        val e: *InstMapEntry = ?m.entries[idx];
+        if (e.key == nil) {
+            ret nil;
+        }
+        if (str_equals(e.key, key)) {
+            ret e.value;
+        }
+        idx = (idx + 1) & (m.capacity - 1);
+        probes = probes + 1;
+    }
+    ret nil;
+}
+
+# inst_map_put: insert a mangled name into the hash table.
+# lazily allocates and grows as needed (75% load factor).
+pub fun inst_map_put(m: *InstMap, alloc: *allocator.Allocator, key: str, val_name: str) {
+    if (m == nil || alloc == nil || key == nil) {
+        ret;
+    }
+    # lazy-allocate the entries array
+    if (m.entries == nil) {
+        val cap: i32 = INST_MAP_INIT_CAP;
+        val res: Result[*InstMapEntry, allocator.AllocError] = allocator.allocator_zalloc[InstMapEntry](alloc, cap::usize);
+        if (result_is_err[*InstMapEntry, allocator.AllocError](res)) {
+            ret;
+        }
+        m.entries = result_unwrap_ok[*InstMapEntry, allocator.AllocError](res);
+        m.capacity = cap;
+    }
+    # grow at 75% load factor; abort insert if grow fails (OOM)
+    if (m.count * 4 >= m.capacity * 3) {
+        if (!inst_map_grow(m, alloc)) { ret; }
+    }
+    inst_map_put_inner(m, key, val_name);
+}
+
+# --- module context helpers ---
+
+# save_context: snapshot the current module context.
+pub fun save_context(sema: *Sema) SavedContext {
+    var ctx: SavedContext;
+    ctx.module = sema.current_module;
+    ctx.module_path = sema.module_path;
+    ctx.file_path = sema.file_path;
+    ctx.source = sema.source;
+    ctx.symbols = sema.symbols;
+    ret ctx;
+}
+
+# restore_context: restore a previously saved module context.
+pub fun restore_context(sema: *Sema, saved: &SavedContext) {
+    sema.current_module = saved.module;
+    sema.module_path = saved.module_path;
+    sema.file_path = saved.file_path;
+    sema.source = saved.source;
+    sema.symbols = saved.symbols;
+}
+
+# find_module: find a loaded module by its dot-separated path.
+# returns nil if not found.
+pub fun find_module(sema: *Sema, path: str) *SemaModule {
+    if (sema == nil || path == nil) {
+        ret nil;
+    }
+    var mod: *SemaModule = sema.modules;
+    for (mod != nil) {
+        if (mod.path != nil && str_equals(mod.path, path)) {
+            ret mod;
+        }
+        mod = mod.next;
+    }
+    ret nil;
+}
+
+# switch_to_module: save current context, look up origin module, and switch to it.
+# returns the saved context. caller must call restore_context when done.
+# if module_path is nil or not found, context is unchanged.
+pub fun switch_to_module(sema: *Sema, module_path: str) SavedContext {
+    val saved: SavedContext = save_context(sema);
+    if (module_path != nil) {
+        val origin: *SemaModule = find_module(sema, module_path);
+        if (origin != nil) {
+            sema.current_module = origin;
+            sema.module_path = origin.path;
+            sema.file_path = origin.file_path;
+            sema.source = origin.source;
+            if (origin.table != nil) {
+                sema.symbols = origin.table;
+            }
+        }
+    }
+    ret saved;
+}
+
+# --- scope management ---
+
+# push_scope: create and enter a new lexical scope.
+# ---
+# sema: analyzer context
+# ret:  Ok(true) on success, Err(str) on failure
+pub fun push_scope(sema: *Sema) Result[bool, str] {
+    if (sema == nil || sema.alloc == nil) {
+        ret err[bool, str]("invalid sema context");
+    }
+
+    val scope_res: Result[*Scope, allocator.AllocError] = allocator.allocator_alloc[Scope](sema.alloc, 1);
+    if (result_is_err[*Scope, allocator.AllocError](scope_res)) {
+        ret err[bool, str]("out of memory");
+    }
+
+    val scope: *Scope = result_unwrap_ok[*Scope, allocator.AllocError](scope_res);
+    scope.parent = sema.current_scope;
+    if (sema.current_scope != nil) {
+        scope.depth = sema.current_scope.depth + 1;
+    } or {
+        scope.depth = 0;
+    }
+
+    # create symbol table for this scope
+    val table_res: Result[*symbol.Table, allocator.AllocError] = allocator.allocator_alloc[symbol.Table](sema.alloc, 1);
+    if (result_is_err[*symbol.Table, allocator.AllocError](table_res)) {
+        allocator.allocator_free[Scope](sema.alloc, scope, 1);
+        ret err[bool, str]("out of memory");
+    }
+
+    scope.table = result_unwrap_ok[*symbol.Table, allocator.AllocError](table_res);
+    # table is a symbol.Table which has alloc, current, and root fields
+    # the table was already initialized by alloc, so we just need to set up scope linkage
+    if (sema.current_scope != nil) {
+        scope.table.current = sema.current_scope.table.current;
+    }
+
+    sema.current_scope = scope;
+
+    # if this is the first scope, it's the root
+    if (sema.root_scope == nil) {
+        sema.root_scope = scope;
+    }
+
+    ret ok[bool, str](true);
+}
+
+# pop_scope: exit the current lexical scope.
+# ---
+# sema: analyzer context
+# ret:  none
+pub fun pop_scope(sema: *Sema) {
+    if (sema == nil || sema.current_scope == nil) {
+        ret;
+    }
+
+    val scope: *Scope = sema.current_scope;
+    sema.current_scope = scope.parent;
+
+    # note: we don't free the scope - it may still be referenced
+    # a full implementation would use an arena or reference counting
+}
+
+# current_scope_depth: get the current scope nesting depth.
+# ---
+# sema: analyzer context
+# ret:  scope depth (0 = global)
+pub fun current_scope_depth(sema: *Sema) i32 {
+    if (sema == nil || sema.current_scope == nil) {
+        ret 0;
+    }
+    ret sema.current_scope.depth;
+}
+
+# get_current_scope: get the current scope.
+# ---
+# sema: analyzer context
+# ret:  current scope or nil
+pub fun get_current_scope(sema: *Sema) *Scope {
+    if (sema == nil) {
+        ret nil;
+    }
+    ret sema.current_scope;
+}
+
+# get_root_scope: get the root (global) scope.
+# ---
+# sema: analyzer context
+# ret:  root scope or nil
+pub fun get_root_scope(sema: *Sema) *Scope {
+    if (sema == nil) {
+        ret nil;
+    }
+    ret sema.root_scope;
+}
+
+# get_symbol_table: get the global symbol table.
+# ---
+# sema: analyzer context
+# ret:  symbol table or nil
+pub fun get_symbol_table(sema: *Sema) *symbol.Table {
+    if (sema == nil) {
+        ret nil;
+    }
+    ret sema.symbols;
+}
+
+# get_type_cache: get the type cache.
+# ---
+# sema: analyzer context
+# ret:  type cache or nil
+pub fun get_type_cache(sema: *Sema) *type.TypeCache {
+    if (sema == nil) {
+        ret nil;
+    }
+    ret sema.types;
+}
+
+# get_loaded_modules: get all loaded modules.
+# ---
+# sema:      analyzer context
+# out_mods:  array to fill with module pointers (array of *SemaModule)
+# max_count: maximum number of modules to return
+# ret:       number of modules written to out_mods
+pub fun get_loaded_modules(sema: *Sema, out_mods: **SemaModule, max_count: i32) i32 {
+    if (sema == nil || out_mods == nil || max_count <= 0) {
+        ret 0;
+    }
+
+    var count: i32 = 0;
+    var mod: *SemaModule = sema.modules;
+    for (mod != nil && count < max_count) {
+        # write pointer to array slot
+        out_mods[count] = mod;
+        count = count + 1;
+        mod = mod.next;
+    }
+
+    ret count;
+}
+
+# get_func_insts: return the head of the generic function instantiation linked list.
+pub fun get_func_insts(sema: *Sema) *FunctionInstantiation {
+    if (sema == nil) { ret nil; }
+    ret sema.func_insts;
+}
+
+# --- module resolution helpers ---
+
+# has_module_resolution: check if module resolution is configured.
+# ---
+# sema: analyzer context
+# ret:  true if module roots are configured
+pub fun has_module_resolution(sema: *Sema) bool {
+    if (sema == nil) {
+        ret false;
+    }
+    # have project mapping
+    if (sema.project_id != nil && sema.src_root != nil) {
+        ret true;
+    }
+    # have dependencies
+    if (sema.deps != nil && sema.dep_count > 0 && sema.dep_root != nil) {
+        ret true;
+    }
+    # have include mappings
+    if (sema.includes != nil && sema.include_count > 0) {
+        ret true;
+    }
+    ret false;
+}
+
+# set_module_roots: set project context for module import resolution.
+# ---
+# sema:       analyzer context
+# project_id: project identifier for module path prefix
+# src_root:   source root directory path
+# dep_root:   dependency root directory path
+# deps:       array of dependency configurations
+# dep_count:  number of dependencies
+# ret:        none
+pub fun set_module_roots(sema: *Sema, project_id: str, src_root: str, dep_root: str, deps: *config.Dep, dep_count: i32) {
+    if (sema == nil) {
+        ret;
+    }
+    sema.project_id = project_id;
+    sema.src_root = src_root;
+    sema.dep_root = dep_root;
+    sema.deps = deps;
+    sema.dep_count = dep_count;
+}
+
+# set_includes: set include path mappings for -I flag resolution.
+pub fun set_includes(sema: *Sema, includes: *config.IncludePath, include_count: i32) {
+    if (sema == nil) {
+        ret;
+    }
+    sema.includes = includes;
+    sema.include_count = include_count;
+}
+
+# lookup_module_alias: lookup an aliased import.
+# ---
+# sema:  analyzer context
+# alias: alias name
+# ret:   module or nil
+pub fun lookup_module_alias(sema: *Sema, alias: str) *SemaModule {
+    if (sema == nil || alias == nil) {
+        ret nil;
+    }
+
+    var mod: *SemaModule = sema.modules;
+    for (mod != nil) {
+        var ma: *ModuleAlias = mod.aliases;
+        for (ma != nil) {
+            if (ma.alias != nil && str_equals(ma.alias, alias)) {
+                ret ma.module;
+            }
+            ma = ma.next;
+        }
+        mod = mod.next;
+    }
+
+    ret nil;
+}
+
+# eval_comptime_cond: evaluate a compile-time condition node.
+# ---
+# sema: analyzer context
+# node: NODE_COMPTIME_IF or NODE_COMPTIME_OR node
+# ret:  Ok(bool) with condition result, or Err on evaluation failure
+pub fun eval_comptime_cond(sema: *Sema, node: *ast.Node) Result[bool, str] {
+    if (sema == nil || node == nil) {
+        ret err[bool, str]("invalid arguments");
+    }
+
+    if (node.kind != ast.NODE_COMPTIME_IF && node.kind != ast.NODE_COMPTIME_OR) {
+        ret err[bool, str]("not a comptime conditional");
+    }
+
+    val cond: *ast.Node = node.info.cond_stmt.cond;
+
+    if (cond != nil && sema.comptime_ctx != nil) {
+        ret comptime.eval_condition(sema.comptime_ctx, cond);
+    }
+
+    if (cond == nil && node.kind == ast.NODE_COMPTIME_OR) {
+        # $or without condition - always true (else branch)
+        ret ok[bool, str](true);
+    }
+
+    ret ok[bool, str](false);
+}

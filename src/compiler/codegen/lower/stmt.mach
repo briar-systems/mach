@@ -1,0 +1,381 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+
+use ast:    mach.compiler.frontend.ast;
+use type:     mach.compiler.frontend.type;
+use ir:     mach.compiler.masm.ir;
+use lexpr:  mach.compiler.codegen.lower.expr;
+use lasm:   mach.compiler.codegen.lower.iasm;
+
+use mach.compiler.codegen.lower;
+
+# mach.compiler.codegen.lower.stmt: statement lowering.
+# ---
+# handles variable declarations, assignments, control flow (if/or, for),
+# return, break, continue, defer, and block statements.
+
+# block_terminated: check if the current block ends with a terminator.
+fun block_terminated(ctx: *LowerContext) bool {
+    val block: *ir.Block = ctx.current_block;
+    if (block == nil || block.inst_count <= 0) { ret false; }
+    val op: ir.Operator = block.insts[block.inst_count - 1].op;
+    ret op == ir.OP_RET || op == ir.OP_JMP;
+}
+
+# lower_stmt: dispatch on statement kind.
+pub fun lower_stmt(ctx: *LowerContext, node: *ast.Node) {
+    if (ctx == nil || node == nil) { ret; }
+
+    update_source_loc(ctx, node);
+
+    if (node.kind == ast.NODE_STMT_BLOCK) {
+        lower_block(ctx, node);
+    } or (node.kind == ast.NODE_DECL_VAR || node.kind == ast.NODE_DECL_VAL) {
+        lower_var_decl(ctx, node);
+    } or (node.kind == ast.NODE_STMT_RET) {
+        lower_return(ctx, node);
+    } or (node.kind == ast.NODE_STMT_IF) {
+        lower_if(ctx, node);
+    } or (node.kind == ast.NODE_STMT_FOR) {
+        lower_for(ctx, node);
+    } or (node.kind == ast.NODE_STMT_BRK) {
+        lower_break(ctx);
+    } or (node.kind == ast.NODE_STMT_CNT) {
+        lower_continue(ctx);
+    } or (node.kind == ast.NODE_STMT_FIN) {
+        lower_defer(ctx, node);
+    } or (node.kind == ast.NODE_STMT_MASM) {
+        lasm.lower_asm(ctx, node.info.masm_stmt.content);
+    } or (node.kind == ast.NODE_STMT_EXPR) {
+        # expression statement — unwrap and evaluate inner expression
+        if (node.info.wrapper.inner != nil) {
+            lower_stmt(ctx, node.info.wrapper.inner);
+        }
+    } or {
+        # bare expression — evaluate for side effects
+        lexpr.lower_expr(ctx, node);
+    }
+}
+
+# lower_block: lower a block statement.
+fun lower_block(ctx: *LowerContext, node: *ast.Node) {
+    val stmts: *ast.List = node.info.block_stmt.stmts;
+    if (stmts == nil) { ret; }
+
+    val saved_local_count: i32 = ctx.local_count;
+    val saved_defer_mark: i32 = defer_mark(ctx);
+
+    var i: i32 = 0;
+    for (i < stmts.count) {
+        if (stmts.nodes[i] != nil) {
+            lower_stmt(ctx, stmts.nodes[i]);
+        }
+        i = i + 1;
+    }
+
+    # emit deferred statements in reverse order
+    emit_deferred(ctx, saved_defer_mark);
+
+    # restore scope
+    ctx.local_count = saved_local_count;
+}
+
+# emit_memcpy: emit a word-by-word memory copy from src to dst for size bytes.
+# ---
+# ctx:  lowering context
+# dst:  destination memory base operand
+# src:  source memory base operand
+# size: total bytes to copy
+pub fun emit_memcpy(ctx: *LowerContext, dst: ir.Operand, src: ir.Operand, size: usize) {
+    val psz: u8 = ctx.ptr_size;
+    val word: usize = psz::usize;
+    var off: usize = 0;
+    for (off < size) {
+        var chunk: u8 = psz;
+        if (off + word > size) { chunk = (size - off)::u8; }
+        val s: ir.Operand = ir.make_mem(src.base, src.index, src.scale,
+                                          src.disp + off::i64, chunk);
+        val tmp: ir.Operand = new_vreg(ctx, chunk);
+        emit_load(ctx, tmp, s);
+        val d: ir.Operand = ir.make_mem(dst.base, dst.index, dst.scale,
+                                          dst.disp + off::i64, chunk);
+        emit_store(ctx, d, tmp);
+        off = off + word;
+    }
+}
+
+# lower_var_decl: lower a local variable declaration.
+fun lower_var_decl(ctx: *LowerContext, node: *ast.Node) {
+    val name: str = node.info.var_decl.name;
+    val vtype: *type.Type = node.type;
+    if (name == nil || vtype == nil) { ret; }
+
+    val vsize: usize = type_size(ctx, vtype);
+    val lv: *LocalVar = local_add(ctx, name, vtype, vsize);
+    if (lv == nil) { ret; }
+
+    # lower initializer
+    val init: *ast.Node = node.info.var_decl.init;
+    if (init != nil) {
+        val psz: u8 = ctx.ptr_size;
+        if (vsize > psz::usize) {
+            # aggregate type: try lvalue first for direct memory copy
+            val src: ir.Operand = lexpr.lower_lvalue(ctx, init);
+            if (src.kind == ir.OPK_MEM) {
+                emit_memcpy(ctx, ir.make_mem(ir.VREG_FP, -1, 1, lv.offset, psz),
+                              src, vsize);
+            } or {
+                # fallback: lower_expr may return OPK_MEM (e.g. sret call)
+                val value: ir.Operand = lexpr.lower_expr(ctx, init);
+                if (value.kind != ir.OPK_NONE) {
+                    if (value.kind == ir.OPK_MEM) {
+                        emit_memcpy(ctx, ir.make_mem(ir.VREG_FP, -1, 1, lv.offset, psz),
+                                      value, vsize);
+                    } or {
+                        val dst: ir.Operand = local_operand(lv, psz);
+                        emit_store(ctx, dst, value);
+                    }
+                }
+            }
+        } or {
+            val value: ir.Operand = lexpr.lower_expr(ctx, init);
+            if (value.kind != ir.OPK_NONE) {
+                val dst: ir.Operand = local_operand(lv, psz);
+                emit_store(ctx, dst, value);
+            }
+        }
+    } or {
+        # zero-initialize uninitialized variables
+        val psz: u8 = ctx.ptr_size;
+        val word: usize = psz::usize;
+        if (vsize > 0) {
+            var off: usize = 0;
+            for (off < vsize) {
+                var chunk: u8 = psz;
+                if (off + word > vsize) { chunk = (vsize - off)::u8; }
+                val d: ir.Operand = ir.make_mem(ir.VREG_FP, -1, 1,
+                                                  lv.offset + off::i64, chunk);
+                emit_store(ctx, d, ir.make_imm(0, chunk));
+                off = off + word;
+            }
+        }
+    }
+}
+
+# lower_return: lower a return statement.
+# emits OP_RETVAL for non-sret returns; the ABI lowering pass expands
+# to MOVs to physical return registers.
+fun lower_return(ctx: *LowerContext, node: *ast.Node) {
+    # emit deferred statements before returning
+    emit_deferred(ctx, 0);
+
+    val expr: *ast.Node = node.info.wrapper.inner;
+    if (expr != nil && ctx.fn_ret_type != nil && !type.type_is_void(ctx.fn_ret_type)) {
+        if (ctx.fn_has_sret) {
+            # copy return value to sret buffer (no physical registers needed)
+            val ret_size: usize = type_size(ctx, ctx.fn_ret_type);
+            val psz: u8 = ctx.ptr_size;
+            if (ret_size > psz::usize) {
+                # large aggregate: try lvalue first for direct memory operand
+                var mem: ir.Operand = lexpr.lower_lvalue(ctx, expr);
+                if (mem.kind != ir.OPK_MEM) {
+                    mem = lexpr.lower_expr(ctx, expr);
+                }
+                if (mem.kind == ir.OPK_MEM) {
+                    emit_memcpy(ctx, ctx.sret_slot, mem, ret_size);
+                } or {
+                    emit_store(ctx, ctx.sret_slot, mem);
+                }
+            } or {
+                val value: ir.Operand = lexpr.lower_expr(ctx, expr);
+                emit_store(ctx, ctx.sret_slot, value);
+            }
+        } or {
+            # emit OP_RETVAL — ABI pass places into return register(s)
+            val ret_size: usize = type_size(ctx, ctx.fn_ret_type);
+            val ret_align: usize = type.type_align(ctx.fn_ret_type);
+            val is_float: bool = is_float_type(ctx.fn_ret_type);
+            val is_agg: bool = type.type_is_record(ctx.fn_ret_type) ||
+                               type.type_is_union(ctx.fn_ret_type);
+
+            var flags: u8 = 0;
+            if (is_float) { flags = flags | ir.ABI_FLAG_FLOAT; }
+            if (is_agg)   { flags = flags | ir.ABI_FLAG_AGG; }
+
+            if (is_agg) {
+                # aggregate: try lvalue first for direct memory operand
+                var agg_val: ir.Operand = lexpr.lower_lvalue(ctx, expr);
+                if (agg_val.kind != ir.OPK_MEM) {
+                    agg_val = lexpr.lower_expr(ctx, expr);
+                }
+                emit(ctx, ir.OP_RETVAL,
+                     ir.make_imm(ret_size::i64, ret_align::u8),
+                     ir.make_imm(0, flags),
+                     agg_val, ir.CC_NONE);
+            } or {
+                val value: ir.Operand = lexpr.lower_expr(ctx, expr);
+                emit(ctx, ir.OP_RETVAL,
+                     ir.make_imm(ret_size::i64, ret_align::u8),
+                     ir.make_imm(0, flags),
+                     value, ir.CC_NONE);
+            }
+        }
+    }
+
+    emit_ret(ctx);
+}
+
+# lower_if: lower an if/or chain.
+fun lower_if(ctx: *LowerContext, node: *ast.Node) {
+    val cond: *ast.Node = node.info.cond_stmt.cond;
+    val body: *ast.Node = node.info.cond_stmt.body;
+    val or_branch: *ast.Node = node.info.cond_stmt.or_branch;
+
+    val label_id: i32 = new_label_id(ctx);
+
+    # for/while loop: cond is the loop condition
+    # if statement: cond is the condition expression
+
+    if (cond != nil) {
+        val cond_val: ir.Operand = lexpr.lower_expr(ctx, cond);
+
+        if (or_branch != nil) {
+            # if/or: branch to else on false
+            val else_label: str = new_label(ctx, ".L_else");
+            val end_label: str = new_label(ctx, ".L_end_if");
+
+            emit_brcond(ctx, cond_val, else_label, ir.CC_EQ);
+
+            # then block
+            if (body != nil) { lower_stmt(ctx, body); }
+            if (!block_terminated(ctx)) {
+                emit_jmp(ctx, end_label);
+            }
+
+            # else block
+            emit_label(ctx, else_label);
+            lower_or_chain(ctx, or_branch, end_label);
+
+            emit_label(ctx, end_label);
+        } or {
+            # simple if: branch past body on false
+            val end_label: str = new_label(ctx, ".L_end_if");
+            emit_brcond(ctx, cond_val, end_label, ir.CC_EQ);
+
+            if (body != nil) { lower_stmt(ctx, body); }
+            emit_label(ctx, end_label);
+        }
+    } or {
+        # unconditional body (shouldn't normally happen)
+        if (body != nil) { lower_stmt(ctx, body); }
+    }
+}
+
+# lower_or_chain: lower an or (else-if) chain.
+# end_label is the shared label from the parent if statement.
+fun lower_or_chain(ctx: *LowerContext, node: *ast.Node, end_label: str) {
+    if (node == nil) { ret; }
+
+    if (node.kind == ast.NODE_STMT_IF || node.kind == ast.NODE_STMT_OR) {
+        # or (condition) { ... }
+        val cond: *ast.Node = node.info.cond_stmt.cond;
+        val body: *ast.Node = node.info.cond_stmt.body;
+        val next: *ast.Node = node.info.cond_stmt.or_branch;
+
+        if (cond != nil) {
+            val cond_val: ir.Operand = lexpr.lower_expr(ctx, cond);
+            val skip_label: str = new_label(ctx, ".L_or_skip");
+            emit_brcond(ctx, cond_val, skip_label, ir.CC_EQ);
+
+            if (body != nil) { lower_stmt(ctx, body); }
+
+            if (next != nil) {
+                if (!block_terminated(ctx)) {
+                    emit_jmp(ctx, end_label);
+                }
+                emit_label(ctx, skip_label);
+                lower_or_chain(ctx, next, end_label);
+            } or {
+                emit_label(ctx, skip_label);
+            }
+        } or {
+            # bare or { ... } — unconditional else
+            if (body != nil) { lower_stmt(ctx, body); }
+        }
+    } or {
+        # bare or block
+        lower_stmt(ctx, node);
+    }
+}
+
+# lower_for: lower a for loop.
+fun lower_for(ctx: *LowerContext, node: *ast.Node) {
+    val cond: *ast.Node = node.info.for_stmt.cond;
+    val body: *ast.Node = node.info.for_stmt.body;
+
+    val loop_start: str = new_label(ctx, ".L_loop_start");
+    val loop_end: str = new_label(ctx, ".L_loop_end");
+
+    # save loop state
+    val saved_start: str = ctx.loop_start;
+    val saved_end: str = ctx.loop_end;
+    ctx.loop_start = loop_start;
+    ctx.loop_end = loop_end;
+
+    # loop header
+    emit_label(ctx, loop_start);
+
+    # loop condition
+    if (cond != nil) {
+        val cond_val: ir.Operand = lexpr.lower_expr(ctx, cond);
+        emit_brcond(ctx, cond_val, loop_end, ir.CC_EQ);
+    }
+
+    # loop body
+    if (body != nil) { lower_stmt(ctx, body); }
+
+    # loop back
+    emit_jmp(ctx, loop_start);
+    emit_label(ctx, loop_end);
+
+    # restore loop state
+    ctx.loop_start = saved_start;
+    ctx.loop_end = saved_end;
+}
+
+# lower_break: emit a jump to the loop end.
+fun lower_break(ctx: *LowerContext) {
+    if (ctx.loop_end != nil) {
+        emit_deferred(ctx, ctx.defer_mark);
+        emit_jmp(ctx, ctx.loop_end);
+    }
+}
+
+# lower_continue: emit a jump to the loop start.
+fun lower_continue(ctx: *LowerContext) {
+    if (ctx.loop_start != nil) {
+        emit_deferred(ctx, ctx.defer_mark);
+        emit_jmp(ctx, ctx.loop_start);
+    }
+}
+
+# lower_defer: push a deferred statement.
+fun lower_defer(ctx: *LowerContext, node: *ast.Node) {
+    val stmt: *ast.Node = node.info.wrapper.inner;
+    if (stmt != nil) {
+        defer_push(ctx, stmt);
+    }
+}
+
+# emit_deferred: emit deferred statements in reverse order from mark.
+fun emit_deferred(ctx: *LowerContext, mark: i32) {
+    var i: i32 = ctx.deferred_count - 1;
+    for (i >= mark) {
+        if (ctx.deferred[i] != nil) {
+            lower_stmt(ctx, ctx.deferred[i]);
+        }
+        i = i - 1;
+    }
+    ctx.deferred_count = mark;
+}

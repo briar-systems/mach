@@ -9,32 +9,33 @@ use print:     std.print;
 use stream:    std.stream;
 
 use config:   mach.config.config;
-use ast:      mach.compiler.ast;
-use parser:   mach.compiler.parser;
-use sema:     mach.compiler.sema;
-use sema_a:   mach.compiler.sema.analyze;
-use sema_e:   mach.compiler.sema.errors;
-use symbol:   mach.compiler.symbol;
-use type:       mach.compiler.type;
-use comptime: mach.compiler.comptime;
+use ast:      mach.compiler.frontend.ast;
+use parser:   mach.compiler.frontend.parser;
+use sema:     mach.compiler.frontend.sema;
+use sema_a:   mach.compiler.frontend.sema.analyze;
+use sema_e:   mach.compiler.frontend.sema.errors;
+use symbol:   mach.compiler.frontend.symbol;
+use type:       mach.compiler.frontend.type;
+use comptime: mach.compiler.frontend.comptime;
 use target:   mach.compiler.target;
 use masm:     mach.compiler.masm;
 use ir:       mach.compiler.masm.ir;
 use module:   mach.compiler.masm.module;
 use section:  mach.compiler.masm.section;
 use sym:      mach.compiler.masm.symbol;
-use isa:      mach.compiler.isa;
-use abi:      mach.compiler.abi;
+use isa:      mach.compiler.target.isa;
+use abi:      mach.compiler.target.abi;
 use ir_peep:  mach.compiler.masm.opt.peephole;
-use abi_low:  mach.compiler.isa.abi_lower;
+use abi_low:  mach.compiler.target.isa.abi_lower;
 use data_em:  mach.compiler.masm.data_emit;
-use lower:    mach.compiler.lower;
-use ldecl:    mach.compiler.lower.decl;
-use regalloc: mach.compiler.regalloc;
-use di:       mach.compiler.di;
-use cemit:    mach.compiler.emit;
-use emasm:    mach.compiler.emit_asm;
-use emmasm:   mach.compiler.emit_masm;
+use lower:    mach.compiler.codegen.lower;
+use ldecl:    mach.compiler.codegen.lower.decl;
+use regalloc: mach.compiler.codegen.regalloc;
+use of:       mach.compiler.target.of;
+use cemit:    mach.compiler.codegen.emit;
+use emasm:    mach.compiler.codegen.emit_asm;
+use emmasm:   mach.compiler.codegen.emit_masm;
+use cg:       mach.compiler.codegen;
 use linker:   mach.compiler.linker;
 use mangle:   mach.compiler.masm.mangle;
 use utilfs:   mach.util.filesystem;
@@ -80,10 +81,7 @@ pub rec CompileOptions {
 
 # --- result types ---
 
-pub rec ParseResult {
-    root: *ast.Node;
-    ok:   bool;
-}
+pub def ParseResult: parser.ParseResult;
 
 pub rec SemaResult {
     root:    *ast.Node;
@@ -109,27 +107,18 @@ pub rec CompileResult {
 
 # parse_source: lex and parse source text into an AST.
 pub fun parse_source(source: str, alloc: *allocator.Allocator, verbose: bool) ParseResult {
-    var result: ParseResult;
-    result.root = nil;
-    result.ok = false;
-
-    if (source == nil || alloc == nil) { ret result; }
-
     if (verbose) { print.eprint("[verbose] parse: starting\n"); }
 
-    var p: parser.Parser = parser.init(source, alloc);
-    val parse_res: Result[*ast.Node, str] = parser.parser_parse_program(?p);
+    val result: ParseResult = parser.parse(source, alloc);
 
-    if (result_is_err[*ast.Node, str](parse_res) || p.had_error) {
-        if (verbose) { print.eprint("[verbose] parse: failed\n"); }
-        parser.parser_dnit(?p);
-        ret result;
+    if (verbose) {
+        if (result.ok) {
+            print.eprint("[verbose] parse: complete\n");
+        } or {
+            print.eprint("[verbose] parse: failed\n");
+        }
     }
 
-    result.root = result_unwrap_ok[*ast.Node, str](parse_res);
-    result.ok = true;
-    if (verbose) { print.eprint("[verbose] parse: complete\n"); }
-    parser.parser_dnit(?p);
     ret result;
 }
 
@@ -266,7 +255,7 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
         entry_file = sem.file_path;
         entry_source = sem.source;
     }
-    val lctx_res: Result[lower.LowerContext, str] = lower.create(alloc, tgt, builder, symbols, nil, entry_file, entry_source);
+    val lctx_res: Result[lower.LowerContext, str] = lower.create(alloc, tgt, builder, symbols, entry_file, entry_source);
     if (result_is_err[lower.LowerContext, str](lctx_res)) { ret result; }
 
     var lctx: lower.LowerContext = result_unwrap_ok[lower.LowerContext, str](lctx_res);
@@ -301,7 +290,7 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
                             mi::i64, m.path);
                     }
                     val mlctx_res: Result[lower.LowerContext, str] =
-                        lower.create(alloc, tgt, builder, m.table, nil, m.file_path, m.source);
+                        lower.create(alloc, tgt, builder, m.table, m.file_path, m.source);
                     if (result_is_ok[lower.LowerContext, str](mlctx_res)) {
                         var mlctx: lower.LowerContext =
                             result_unwrap_ok[lower.LowerContext, str](mlctx_res);
@@ -330,393 +319,6 @@ pub fun lower_module(root: *ast.Node, symbols: *symbol.Table,
     result.mod = mod_ptr;
     result.ok = true;
     ret result;
-}
-
-# --- codegen: ISel + regalloc + frame + encode ---
-
-# FrameLayout: computed stack frame geometry for a function.
-# produced by compute_frame(), consumed by fixup_operands(), prologue, epilogue.
-rec FrameLayout {
-    local_size:      usize;   # from lowering
-    spill_size:      usize;   # from regalloc
-    call_area_size:  usize;   # from lowering (max outgoing stack args)
-    total_frame:     usize;   # local + spill + call_area (aligned)
-    callee_mask:     u32;     # bitmask of callee-saved regs used
-    callee_push_count: i32;   # popcount of callee_mask
-    callee_save_size:  usize; # callee_push_count * 8
-    frame_reg:       i32;     # physical frame pointer register
-    has_frame:       bool;    # true if prologue/epilogue needed
-}
-
-# --- pass: instruction selection ---
-
-# isel_function: lower all IR instructions in a function to machine instructions.
-# walks blocks in order, converts OP_LABEL to MACHINST_LABEL markers,
-# runs per-instruction ISel + machine peephole, propagates source locations.
-fun isel_function(i: *isa.ISA, func: *ir.Function,
-                  out: *isa.MachInstBuf, tmp: *isa.MachInstBuf) i32 {
-    isa.buf_clear(out);
-    var ir_count: i32 = 0;
-
-    var bi: i32 = 0;
-    for (bi < func.block_count) {
-        val block: *ir.Block = func.blocks[bi];
-        if (block == nil) { bi = bi + 1; cnt; }
-
-        var ii: i32 = 0;
-        for (ii < block.inst_count) {
-            val ir_inst: *ir.Inst = ?block.insts[ii];
-            ir_count = ir_count + 1;
-
-            # read debug info from parallel DebugLoc array
-            var dbg_line: i32 = 0;
-            var dbg_file: u16 = 0;
-            if (block.debug_locs != nil) {
-                dbg_line = block.debug_locs[ii].src_line;
-                dbg_file = block.debug_locs[ii].src_file;
-            }
-
-            if (ir_inst.op == ir.OP_LABEL) {
-                # reconstruct label Operand from compact label index
-                val lbl_name: str = ir.label_get(?func.labels, ir_inst.f2);
-                var label_mi: isa.MachInst;
-                label_mi.opcode = isa.MACHINST_LABEL;
-                label_mi.dst = ir.make_label(lbl_name);
-                label_mi.size = 0;
-                label_mi.flags = 0;
-                label_mi.src_line = dbg_line;
-                label_mi.src_file = dbg_file;
-                isa.buf_append(out, label_mi);
-            } or {
-                isa.buf_clear(tmp);
-                i.isel(i.ctx, ir_inst, func, tmp);
-                i.peephole(i.ctx, tmp);
-
-                var mi: i32 = 0;
-                for (mi < tmp.count) {
-                    val minst: *isa.MachInst = isa.buf_get(tmp, mi);
-                    if (minst != nil) {
-                        minst.src_line = dbg_line;
-                        minst.src_file = dbg_file;
-                        isa.buf_append(out, @minst);
-                    }
-                    mi = mi + 1;
-                }
-            }
-
-            ii = ii + 1;
-        }
-        bi = bi + 1;
-    }
-
-    ret ir_count;
-}
-
-# --- pass: frame computation ---
-
-# compute_frame: calculate stack frame geometry from function metadata and regalloc results.
-fun compute_frame(func: *ir.Function, ra: *regalloc.RegAllocResult,
-                  a: *abi.ABI, i: *isa.ISA) FrameLayout {
-    var f: FrameLayout;
-    f.local_size = func.local_size;
-    f.spill_size = ra.spill_size;
-    f.call_area_size = func.call_area_size;
-    f.callee_mask = ra.callee_mask;
-    f.frame_reg = i.frame_reg(i.ctx);
-
-    # count callee-saved registers
-    f.callee_push_count = 0;
-    var cmask_tmp: u32 = ra.callee_mask;
-    for (cmask_tmp != 0) {
-        f.callee_push_count = f.callee_push_count + (cmask_tmp & 1)::i32;
-        cmask_tmp = cmask_tmp >> 1;
-    }
-    f.callee_save_size = f.callee_push_count::usize * 8;
-
-    # compute total frame with alignment
-    f.total_frame = f.local_size + f.spill_size + f.call_area_size;
-    # align: return addr + push rbp + N callee pushes + frame ≡ 0 (mod stack_align)
-    val pushed_bytes: usize = (2 + f.callee_push_count::usize) * 8;
-    val stack_al: usize = a.stack_align(a.ctx);
-    val al_mask: usize = stack_al - 1;
-    val align_rem: usize = (pushed_bytes + f.total_frame) & al_mask;
-    if (align_rem != 0) {
-        f.total_frame = f.total_frame + (stack_al - align_rem);
-    }
-
-    f.has_frame = f.total_frame > 0 || ra.callee_mask != 0;
-    ret f;
-}
-
-# --- pass: operand fixup ---
-
-# fixup_operands: resolve VREG_SP and shift FP-relative offsets past callee-save area.
-# merges the two formerly separate loops into a single pass.
-fun fixup_operands(buf: *isa.MachInstBuf, frame: &FrameLayout) {
-    var si: i32 = 0;
-    for (si < buf.count) {
-        val sinst: *isa.MachInst = isa.buf_get(buf, si);
-        if (sinst != nil) {
-            fixup_operand(?sinst.dst,  frame);
-            fixup_operand(?sinst.src1, frame);
-            fixup_operand(?sinst.src2, frame);
-        }
-        si = si + 1;
-    }
-}
-
-# fixup_operand: resolve a single operand's virtual base registers.
-fun fixup_operand(op: *ir.Operand, frame: &FrameLayout) {
-    if (op == nil || op.kind != ir.OPK_MEM) { ret; }
-
-    # VREG_SP → FP-relative: [VREG_SP + offset] → [fp_reg + (offset - total_frame)]
-    if (op.base == ir.VREG_SP) {
-        op.base = frame.frame_reg;
-        op.disp = op.disp - frame.total_frame::i64;
-    }
-
-    # shift FP-relative negative displacements past callee-save area
-    if (op.base == frame.frame_reg && op.disp < 0) {
-        op.disp = op.disp - frame.callee_save_size::i64;
-    }
-}
-
-# --- pass: encode ---
-
-# encode_function: encode machine instructions to .text, emit prologue/epilogue,
-# register label symbols, and record debug lines.
-# returns false if any instruction fails to encode.
-fun encode_function(mctx: *masm.Context, i: *isa.ISA,
-                    buf: *isa.MachInstBuf, frame: &FrameLayout,
-                    func_name: str, text_sec: *section.Section, text_idx: i32,
-                    alloc: *allocator.Allocator,
-                    asm_w: *emasm.AsmWriter, verbose: bool) bool {
-    val func_start: usize = section.current_offset(text_sec);
-
-    # emit prologue
-    if (frame.has_frame) {
-        i.prologue(i.ctx, frame.total_frame, frame.callee_mask, text_sec, alloc);
-    }
-
-    # ASM: function header + prologue
-    if (asm_w != nil) {
-        emasm.emit_func_header(asm_w, func_name);
-        if (frame.has_frame) {
-            i.format_prologue(i.ctx, frame.total_frame, frame.callee_mask, ?asm_w.w);
-        }
-    }
-
-    # encode instructions
-    var encode_fails: i32 = 0;
-    var encode_ok: i32 = 0;
-    var last_debug_line: i32 = 0;
-    var ei: i32 = 0;
-    for (ei < buf.count) {
-        val minst: *isa.MachInst = isa.buf_get(buf, ei);
-        if (minst == nil) { ei = ei + 1; cnt; }
-
-        # debug line entry on line transitions
-        if (minst.src_line > 0 && minst.src_line != last_debug_line) {
-            val dbg_off: usize = section.current_offset(text_sec);
-            masm.add_debug_line(mctx, dbg_off, minst.src_file, minst.src_line);
-            last_debug_line = minst.src_line;
-        }
-
-        if (minst.opcode == isa.MACHINST_LABEL) {
-            register_label_symbol(mctx, minst, text_sec, text_idx, alloc);
-            if (asm_w != nil && minst.dst.label != nil) {
-                emasm.emit_label(asm_w, minst.dst.label);
-            }
-        } or (i.is_ret(i.ctx, minst) && frame.has_frame) {
-            i.epilogue(i.ctx, frame.callee_mask, text_sec, alloc);
-            encode_ok = encode_ok + 1;
-            if (asm_w != nil) {
-                i.format_epilogue(i.ctx, frame.callee_mask, ?asm_w.w);
-            }
-        } or {
-            val enc_r: i32 = i.encode(i.ctx, minst, text_sec, alloc);
-            if (enc_r < 0) {
-                print.eprintf("  ENCODE FAIL '%s' #%d opc=%d dst.k=%d s1.k=%d s2.k=%d sz=%d\n",
-                    func_name, ei::i64, minst.opcode::i64,
-                    minst.dst.kind::i64, minst.src1.kind::i64,
-                    minst.src2.kind::i64, minst.size::i64);
-                encode_fails = encode_fails + 1;
-            } or {
-                encode_ok = encode_ok + 1;
-            }
-            if (asm_w != nil) {
-                i.format_inst(i.ctx, minst, ?asm_w.w);
-            }
-        }
-
-        ei = ei + 1;
-    }
-
-    if (encode_fails > 0) {
-        print.eprintf("  TOTAL ENCODE FAILS for '%s': %d\n",
-            func_name, encode_fails::i64);
-    }
-    if (verbose) {
-        print.eprintf("[verbose] codegen:   encode: %d/%d ok",
-            encode_ok::i64, buf.count::i64);
-        if (encode_fails > 0) {
-            print.eprintf(", %d FAILED", encode_fails::i64);
-        }
-        print.eprint("\n");
-    }
-
-    # symbol fixup
-    val func_end: usize = section.current_offset(text_sec);
-    fixup_symbol_offset(mctx, func_name, func_start, func_end - func_start, text_idx);
-
-    if (verbose) {
-        print.eprintf("[verbose] codegen:   symbol '%s' offset=%d size=%d\n",
-            func_name, func_start::i64, (func_end - func_start)::i64);
-    }
-
-    if (asm_w != nil) {
-        emasm.emit_newline(asm_w);
-    }
-
-    ret encode_fails == 0;
-}
-
-# --- codegen orchestrator ---
-
-# codegen: run the full codegen pipeline for all functions.
-# isel → regalloc → peephole → compute_frame → fixup → encode.
-# returns false if any function fails.
-fun codegen(mod: *module.Module, mctx: *masm.Context, tgt: *target.Target,
-            alloc: *allocator.Allocator, verbose: bool,
-            asm_w: *emasm.AsmWriter) bool {
-    if (mod == nil || mctx == nil || tgt == nil || alloc == nil) { ret false; }
-
-    val i: *isa.ISA = ?tgt.isa;
-    val a: *abi.ABI = ?tgt.abi;
-
-    if (verbose) {
-        print.eprintf("[verbose] codegen: starting (%d IR functions)\n",
-            mod.func_count::i64);
-    }
-
-    val text_res: Result[*section.Section, str] = masm.get_or_create_section(
-        mctx, ".text", section.SEC_TEXT);
-    if (result_is_err[*section.Section, str](text_res)) { ret false; }
-    val text_sec: *section.Section = result_unwrap_ok[*section.Section, str](text_res);
-    val text_idx: i32 = masm.get_section_index(mctx, ".text");
-
-    var inst_buf: isa.MachInstBuf = isa.buf_create(alloc);
-    var func_buf: isa.MachInstBuf = isa.buf_create(alloc);
-    var ok: bool = true;
-
-    var fi: i32 = 0;
-    for (fi < mod.func_count) {
-        val func: *ir.Function = mod.functions[fi];
-        if (func == nil) { fi = fi + 1; cnt; }
-
-        if (verbose) {
-            print.eprintf("[verbose] codegen: func[%d] '%s'\n", fi::i64, func.name);
-        }
-
-        # 1. ISel
-        val ir_count: i32 = isel_function(i, func, ?func_buf, ?inst_buf);
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   ISel: %d IR -> %d MachInst\n",
-                ir_count::i64, func_buf.count::i64);
-        }
-
-        # 2. register allocation
-        var ra: regalloc.RegAllocResult = regalloc.alloc_function(
-            alloc, i, a, ?func_buf, func.local_size);
-        if (!ra.ok) {
-            if (verbose) {
-                print.eprintf("[verbose] codegen:   regalloc FAILED for '%s'\n", func.name);
-            }
-            ok = false;
-            fi = fi + 1;
-            cnt;
-        }
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   regalloc: out=%d spill=%d callee_mask=0x%x\n",
-                ra.out.count::i64, ra.spill_size::i64, ra.callee_mask::i64);
-        }
-
-        # 3. post-regalloc peephole (eliminate identity moves)
-        i.peephole(i.ctx, ?ra.out);
-
-        # 4. compute frame
-        val frame: FrameLayout = compute_frame(func, ?ra, a, i);
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   frame: locals=%d spill=%d call_area=%d total=%d\n",
-                frame.local_size::i64, frame.spill_size::i64,
-                frame.call_area_size::i64, frame.total_frame::i64);
-        }
-
-        # 5. fixup operands (VREG_SP + callee-save offset, single pass)
-        fixup_operands(?ra.out, ?frame);
-
-        # 6. encode (prologue + instructions + epilogue + symbol fixup)
-        if (!encode_function(mctx, i, ?ra.out, ?frame, func.name,
-                             text_sec, text_idx, alloc, asm_w, verbose)) {
-            ok = false;
-        }
-
-        isa.buf_destroy(?ra.out);
-        fi = fi + 1;
-    }
-
-    if (verbose) { print.eprint("[verbose] codegen: complete\n"); }
-
-    isa.buf_destroy(?inst_buf);
-    isa.buf_destroy(?func_buf);
-    ret ok;
-}
-
-# --- codegen helpers ---
-
-# fixup_symbol_offset: update a symbol's offset, size, and section to match its position in .text.
-fun fixup_symbol_offset(mctx: *masm.Context, name: str, offset: usize, size: usize, text_idx: i32) {
-    val s: *sym.Symbol = masm.get_symbol(mctx, name);
-    if (s != nil) {
-        s.offset = offset;
-        s.size = size;
-        if (text_idx >= 0) {
-            s.section = text_idx::u64;
-        }
-    }
-}
-
-# register_label_symbol: register a label at the current section offset.
-fun register_label_symbol(mctx: *masm.Context, inst: *isa.MachInst,
-                          sec: *section.Section, text_idx: i32,
-                          alloc: *allocator.Allocator) {
-    if (inst == nil || inst.dst.label == nil) { ret; }
-
-    val offset: usize = section.current_offset(sec);
-    val name: str = inst.dst.label;
-
-    val existing: *sym.Symbol = masm.get_symbol(mctx, name);
-    if (existing != nil) {
-        existing.offset = offset;
-        if (text_idx >= 0) {
-            existing.section = text_idx::u64;
-        }
-        ret;
-    }
-
-    val sym_r: Result[*sym.Symbol, str] = sym.create(alloc, name);
-    if (result_is_err[*sym.Symbol, str](sym_r)) { ret; }
-
-    val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_r);
-    s.binding = sym.BIND_LOCAL;
-    s.sym_type = sym.SYM_FUNC;
-    s.offset = offset;
-    s.defined = true;
-    if (text_idx >= 0) {
-        s.section = text_idx::u64;
-    }
-
-    masm.add_symbol(mctx, s);
 }
 
 # --- per-module compilation ---
@@ -765,9 +367,9 @@ fun emit_debug_sections(mod: *module.Module, mctx: *masm.Context,
     if (mod.debug_file_count == 0 && mctx.debug_line_count == 0) { ret; }
 
     # create a fresh DebugInfo for this compilation unit
-    val di_r: Result[di.DebugInfo, str] = target.create_debug_info(tgt, alloc);
-    if (result_is_err[di.DebugInfo, str](di_r)) { ret; }
-    var di_info: di.DebugInfo = result_unwrap_ok[di.DebugInfo, str](di_r);
+    val di_r: Result[of.DebugInfo, str] = target.create_debug_info(tgt, alloc);
+    if (result_is_err[of.DebugInfo, str](di_r)) { ret; }
+    var di_info: of.DebugInfo = result_unwrap_ok[of.DebugInfo, str](di_r);
 
     # register debug files
     var fi: i32 = 0;
@@ -783,7 +385,7 @@ fun emit_debug_sections(mod: *module.Module, mctx: *masm.Context,
     for (si < mctx.symbol_count) {
         val s: *sym.Symbol = mctx.symbols[si];
         if (s != nil && s.defined && s.sym_type == sym.SYM_FUNC && s.size > 0) {
-            var sub: di.DISubprogram;
+            var sub: of.DISubprogram;
             sub.name = s.name;
             sub.low_pc = s.offset::u64;
             sub.high_pc = (s.offset + s.size)::u64;
@@ -803,7 +405,7 @@ fun emit_debug_sections(mod: *module.Module, mctx: *masm.Context,
     # register line entries
     var li: i32 = 0;
     for (li < mctx.debug_line_count) {
-        var entry: di.DILineEntry;
+        var entry: of.DILineEntry;
         entry.address = mctx.debug_lines[li].code_offset::u64;
         entry.file_idx = mctx.debug_lines[li].file_idx;
         entry.line = mctx.debug_lines[li].line;
@@ -815,7 +417,7 @@ fun emit_debug_sections(mod: *module.Module, mctx: *masm.Context,
     di_info.finalize(di_info.ctx, alloc);
 
     var sec_count: i32 = 0;
-    val dbg_secs: *di.DebugSection = di_info.get_sections(di_info.ctx, ?sec_count);
+    val dbg_secs: *of.DebugSection = di_info.get_sections(di_info.ctx, ?sec_count);
 
     var dsi: i32 = 0;
     for (dsi < sec_count) {
@@ -953,7 +555,7 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         mod_source = smod.source;
     }
     val lctx_res: Result[lower.LowerContext, str] =
-        lower.create(alloc, tgt, builder, symbols, nil, mod_file, mod_source);
+        lower.create(alloc, tgt, builder, symbols, mod_file, mod_source);
     if (result_is_err[lower.LowerContext, str](lctx_res)) { ret false; }
 
     var lctx: lower.LowerContext =
@@ -1033,7 +635,7 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         for (ai < mod_ptr.func_count) {
             val func: *ir.Function = mod_ptr.functions[ai];
             if (func != nil) {
-                abi_low.lower_function(alloc, func, ?tgt.abi, ?tgt.isa, tgt.ptr_size::u8);
+                abi_low.lower_function(alloc, func, ?tgt.abi, ?tgt.isa, tgt.isa.ptr_size::u8);
             }
             ai = ai + 1;
         }
@@ -1065,7 +667,7 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         asm_w_ptr = emasm.open(asm_path, alloc);
     }
 
-    if (!codegen(mod_ptr, mctx, tgt, alloc, verbose, asm_w_ptr)) {
+    if (!cg.codegen(mod_ptr, mctx, tgt, alloc, verbose, asm_w_ptr)) {
         if (asm_w_ptr != nil) { emasm.close(asm_w_ptr); }
         ret false;
     }
@@ -1276,7 +878,7 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
             val func: *ir.Function = lr.mod.functions[ai];
             if (func != nil) {
                 abi_low.lower_function(opts.alloc, func, ?opts.target.abi,
-                                       ?opts.target.isa, opts.target.ptr_size::u8);
+                                       ?opts.target.isa, opts.target.isa.ptr_size::u8);
             }
             ai = ai + 1;
         }
@@ -1293,7 +895,7 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
         oi = oi + 1;
     }
 
-    if (!codegen(lr.mod, lr.mctx, ?opts.target, opts.alloc, opts.verbose, nil)) {
+    if (!cg.codegen(lr.mod, lr.mctx, ?opts.target, opts.alloc, opts.verbose, nil)) {
         ret err[CompileResult, str]("code generation failed");
     }
 

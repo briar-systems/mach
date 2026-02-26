@@ -1,0 +1,181 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use fs:        std.filesystem;
+
+use masm:    mach.compiler.masm;
+use section: mach.compiler.masm.section;
+use sym:     mach.compiler.masm.symbol;
+use target:  mach.compiler.target;
+use of:      mach.compiler.target.of;
+use obuf:    mach.compiler.target.of.buf;
+
+# mach.compiler.codegen.emit: MASM context → object file emission.
+# ---
+# bridges MASM's internal representation to the ObjectFormat interface.
+# no format-specific code — all abstracted through target.of.
+
+# emit: write a MASM context to an object file.
+# returns 0 on success, nonzero on failure.
+pub fun emit(mctx: *masm.Context, tgt: *target.Target,
+             output_path: str, alloc: *allocator.Allocator) i64 {
+    if (mctx == nil || tgt == nil || output_path == nil || alloc == nil) {
+        ret 1;
+    }
+
+    # create a fresh ObjectFormat for each emission (safe for per-module use)
+    val fmt_r: Result[of.ObjWriter, str] = target.create_object_format(tgt, alloc);
+    if (result_is_err[of.ObjWriter, str](fmt_r)) { ret 1; }
+    var fmt_val: of.ObjWriter = result_unwrap_ok[of.ObjWriter, str](fmt_r);
+    val fmt: *of.ObjWriter = ?fmt_val;
+
+    # --- 1. add sections ---
+    # track OF section indices for symbol/reloc mapping
+    var sec_indices: *u64 = nil;
+    if (mctx.section_count > 0) {
+        val r: Result[*u64, allocator.AllocError] =
+            allocator.allocator_zalloc[u64](alloc, mctx.section_count::usize);
+        if (result_is_err[*u64, allocator.AllocError](r)) { ret 2; }
+        sec_indices = result_unwrap_ok[*u64, allocator.AllocError](r);
+    }
+
+    var si: i32 = 0;
+    for (si < mctx.section_count) {
+        val sec: *section.Section = mctx.sections[si];
+        if (sec != nil) {
+            val idx: u64 = fmt.add_section(fmt.ctx, sec.name,
+                sec.kind, sec.flags, sec.align);
+            sec_indices[si] = idx;
+
+            # write section data
+            if (sec.data != nil && sec.size > 0) {
+                fmt.write(fmt.ctx, idx, sec.data, sec.size);
+            } or (sec.size > 0) {
+                # BSS-like: set size without data
+                fmt.set_size(fmt.ctx, idx, sec.size);
+            }
+        }
+        si = si + 1;
+    }
+
+    # --- 2. add symbols ---
+    # track OF symbol indices for relocation mapping
+    var sym_indices: *u64 = nil;
+    if (mctx.symbol_count > 0) {
+        val r: Result[*u64, allocator.AllocError] =
+            allocator.allocator_zalloc[u64](alloc, mctx.symbol_count::usize);
+        if (result_is_err[*u64, allocator.AllocError](r)) { ret 3; }
+        sym_indices = result_unwrap_ok[*u64, allocator.AllocError](r);
+    }
+
+    var syi: i32 = 0;
+    for (syi < mctx.symbol_count) {
+        val s: *sym.Symbol = mctx.symbols[syi];
+        if (s != nil) {
+            var of_sym: of.OFSymbol;
+            of_sym.name = s.name;
+            of_sym.binding = s.binding;
+            of_sym.kind = s.sym_type;
+            of_sym.offset = s.offset;
+            of_sym.size = s.size;
+
+            # map section index
+            if (s.defined && s.section < mctx.section_count::u64 && sec_indices != nil) {
+                of_sym.section = sec_indices[s.section];
+            } or {
+                of_sym.section = 0;
+            }
+
+            val idx: u64 = fmt.add_symbol(fmt.ctx, ?of_sym);
+            sym_indices[syi] = idx;
+        }
+        syi = syi + 1;
+    }
+
+    # --- 3. add relocations ---
+    var ri: i32 = 0;
+    for (ri < mctx.section_count) {
+        val sec: *section.Section = mctx.sections[ri];
+        if (sec != nil && sec.reloc_count > 0) {
+            val of_sec_idx: u64 = sec_indices[ri];
+
+            var rj: i32 = 0;
+            for (rj < sec.reloc_count) {
+                var of_reloc: of.OFReloc;
+                of_reloc.section = of_sec_idx;
+                of_reloc.offset = sec.relocs[rj].offset;
+                of_reloc.rtype = sec.relocs[rj].rtype::u32;
+                of_reloc.addend = sec.relocs[rj].addend;
+
+                # resolve symbol name to OF symbol index
+                of_reloc.symbol = resolve_sym_index(mctx, sym_indices,
+                    sec.relocs[rj].symbol_name);
+
+                fmt.add_reloc(fmt.ctx, ?of_reloc);
+                rj = rj + 1;
+            }
+        }
+        ri = ri + 1;
+    }
+
+    # --- 4. finalize ---
+    var buf: obuf.OutputBuffer;
+    obuf.buf_init(?buf, alloc, tgt.isa.endian);
+
+    fmt.finalize(fmt.ctx, ?buf);
+
+    # --- 5. write to file ---
+    val result: i64 = write_output(?buf, output_path);
+
+    # cleanup
+    obuf.buf_destroy(?buf);
+    fmt.destroy(fmt.ctx);
+
+    if (sec_indices != nil) {
+        allocator.allocator_free[u64](alloc, sec_indices, mctx.section_count::usize);
+    }
+    if (sym_indices != nil) {
+        allocator.allocator_free[u64](alloc, sym_indices, mctx.symbol_count::usize);
+    }
+
+    ret result;
+}
+
+# resolve_sym_index: find the OF symbol index for a MASM symbol by name.
+# uses the MASM hash map for O(1) lookup, then scans the symbol array
+# only to find the matching index (needed to map into sym_indices).
+fun resolve_sym_index(mctx: *masm.Context, sym_indices: *u64, name: str) u64 {
+    if (mctx == nil || sym_indices == nil || name == nil) { ret 0; }
+
+    # O(1) hash map lookup to verify symbol exists
+    val found: *sym.Symbol = masm.get_symbol(mctx, name);
+    if (found == nil) { ret 0; }
+
+    # find the index of this symbol pointer in the array
+    var i: i32 = 0;
+    for (i < mctx.symbol_count) {
+        if (mctx.symbols[i] == found) {
+            ret sym_indices[i];
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# write_output: write an output buffer to a file.
+fun write_output(buf: *obuf.OutputBuffer, path: str) i64 {
+    if (buf == nil || buf.data == nil || buf.size == 0) { ret 1; }
+
+    val file_r: Result[fs.File, str] = fs.create(path, 420); # 0644
+    if (result_is_err[fs.File, str](file_r)) { ret 2; }
+
+    var file: fs.File = result_unwrap_ok[fs.File, str](file_r);
+    val write_r: Result[usize, str] = fs.file_write(?file, buf.data, buf.size);
+    fs.file_close(?file);
+
+    if (result_is_err[usize, str](write_r)) { ret 3; }
+    ret 0;
+}

@@ -1,0 +1,984 @@
+# mach.compiler.target.of.dwarf: DWARF v4 debug information implementation.
+# ---
+# produces three ELF sections:
+#   .debug_abbrev — fixed abbreviation table (CU + subprogram tags)
+#   .debug_info   — compilation unit DIE + subprogram DIEs
+#   .debug_line   — line number program (file/line → address mapping)
+#
+# implements the DebugInfo interface from mach.compiler.target.of.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use of:        mach.compiler.target.of;
+use buf:       mach.compiler.target.of.buf;
+
+# tags
+val DW_TAG_compile_unit: u8 = 0x11;
+val DW_TAG_subprogram:   u8 = 0x2e;
+
+# attributes
+val DW_AT_name:      u8 = 0x03;
+val DW_AT_stmt_list: u8 = 0x10;
+val DW_AT_low_pc:    u8 = 0x11;
+val DW_AT_high_pc:   u8 = 0x12;
+val DW_AT_language:  u8 = 0x13;
+val DW_AT_producer:  u8 = 0x25;
+val DW_AT_comp_dir:  u8 = 0x1b;
+val DW_AT_decl_file: u8 = 0x3a;
+val DW_AT_decl_line: u8 = 0x3b;
+
+# forms
+val DW_FORM_addr:       u8 = 0x01;
+val DW_FORM_data2:      u8 = 0x05;
+val DW_FORM_data4:      u8 = 0x06;
+val DW_FORM_string:     u8 = 0x08;
+val DW_FORM_data1:      u8 = 0x0b;
+val DW_FORM_sec_offset: u8 = 0x17;
+
+# children
+val DW_CHILDREN_yes: u8 = 1;
+val DW_CHILDREN_no:  u8 = 0;
+
+# language
+val DW_LANG_lo_user: u16 = 0x8000;
+
+# line number program opcodes
+val DW_LNS_copy:             u8 = 1;
+val DW_LNS_advance_pc:       u8 = 2;
+val DW_LNS_advance_line:     u8 = 3;
+val DW_LNS_set_file:         u8 = 4;
+val DW_LNS_set_column:       u8 = 5;
+val DW_LNS_negate_stmt:      u8 = 6;
+
+# extended opcodes
+val DW_LNE_end_sequence:     u8 = 1;
+val DW_LNE_set_address:      u8 = 2;
+
+# initial capacities
+val INITIAL_FILE_CAP:   i32 = 16;
+val INITIAL_SUB_CAP:    i32 = 256;
+val INITIAL_LINE_CAP:   i32 = 1024;
+val MAX_DEBUG_SECTIONS:  i32 = 3;
+
+# internal context for DWARF generation and parsing
+# ---
+# path: file path (e.g. "src/main.mach")
+# dir:  file directory (e.g. "src")
+rec DWARFFile {
+    path: str;
+    dir:  str;
+}
+
+# DWARFContext holds all data needed to build and parse DWARF sections.
+# ---
+# alloc:               allocator for dynamic memory management (arrays, buffers).
+# ptr_size:            target pointer size in bytes (4 or 8).
+# endian:              target endianness (ENDIAN_LITTLE or ENDIAN_BIG).
+# files:               array of file entries (path + dir) for .debug_line and .debug_info.
+# subs:                array of subprogram entries (name, file_idx, line, low_pc, high_pc).
+# lines:               array of line entries (address, file_idx, line) for .debug_line.
+# sections:            finalized debug sections after dwarf_finalize (name, data, size).
+# last_file_map:       per-.o file index → merged file index map built by dwarf_read_line
+# last_file_map_count: number of entries in last_file_map
+# abbrev_buf:          buffer for .debug_abbrev section (finalized in dwarf_finalize)
+# info_buf:            buffer for .debug_info section (finalized in dwarf_finalize)
+# line_buf:            buffer for .debug_line section (finalized in dwarf_finalize)
+rec DWARFContext {
+    alloc:     *allocator.Allocator;
+    ptr_size:  usize;
+    endian:    u8;
+
+    files:     *DWARFFile;
+    file_count: i32;
+    file_cap:   i32;
+
+    subs:      *of.DISubprogram;
+    sub_count: i32;
+    sub_cap:   i32;
+
+    lines:     *of.DILineEntry;
+    line_count: i32;
+    line_cap:   i32;
+
+    # finalized output
+    sections:   [3]of.DebugSection;
+    sec_count:  i32;
+
+    # per-.o file index mapping (set by read_line, used by read_info)
+    last_file_map:       *u16;
+    last_file_map_count: i32;
+
+    # serialized buffers
+    abbrev_buf: buf.OutputBuffer;
+    info_buf:   buf.OutputBuffer;
+    line_buf:   buf.OutputBuffer;
+}
+
+# construct a DWARF v4 DebugInfo implementation
+# ---
+# alloc:    allocator for dynamic memory management (arrays, buffers).
+# ptr_size: target pointer size in bytes (4 or 8).
+# endian:   target endianness (ENDIAN_LITTLE or ENDIAN_BIG).
+# ret:      ok(DebugInfo) on success, err(string) on failure (e.g. OOM).
+pub fun create(alloc: *allocator.Allocator, ptr_size: usize, endian: u8) Result[of.DebugInfo, str] {
+    if (alloc == nil) {
+        ret err[of.DebugInfo, str]("allocator is nil");
+    }
+
+    val ctx_r: Result[*DWARFContext, allocator.AllocError] =
+        allocator.allocator_zalloc[DWARFContext](alloc, 1);
+    if (result_is_err[*DWARFContext, allocator.AllocError](ctx_r)) {
+        ret err[of.DebugInfo, str]("out of memory");
+    }
+    val ctx: *DWARFContext =
+        result_unwrap_ok[*DWARFContext, allocator.AllocError](ctx_r);
+    ctx.alloc = alloc;
+    ctx.ptr_size = ptr_size;
+    ctx.endian = endian;
+
+    # pre-allocate arrays
+    val fr: Result[*DWARFFile, allocator.AllocError] =
+        allocator.allocator_zalloc[DWARFFile](alloc, INITIAL_FILE_CAP::usize);
+    if (result_is_err[*DWARFFile, allocator.AllocError](fr)) {
+        ret err[of.DebugInfo, str]("out of memory");
+    }
+    ctx.files = result_unwrap_ok[*DWARFFile, allocator.AllocError](fr);
+    ctx.file_cap = INITIAL_FILE_CAP;
+
+    val sr: Result[*of.DISubprogram, allocator.AllocError] =
+        allocator.allocator_zalloc[of.DISubprogram](alloc, INITIAL_SUB_CAP::usize);
+    if (result_is_err[*of.DISubprogram, allocator.AllocError](sr)) {
+        ret err[of.DebugInfo, str]("out of memory");
+    }
+    ctx.subs = result_unwrap_ok[*of.DISubprogram, allocator.AllocError](sr);
+    ctx.sub_cap = INITIAL_SUB_CAP;
+
+    val lr: Result[*of.DILineEntry, allocator.AllocError] =
+        allocator.allocator_zalloc[of.DILineEntry](alloc, INITIAL_LINE_CAP::usize);
+    if (result_is_err[*of.DILineEntry, allocator.AllocError](lr)) {
+        ret err[of.DebugInfo, str]("out of memory");
+    }
+    ctx.lines = result_unwrap_ok[*of.DILineEntry, allocator.AllocError](lr);
+    ctx.line_cap = INITIAL_LINE_CAP;
+
+    var d: of.DebugInfo;
+    d.ctx = ctx::ptr;
+    d.add_file = dwarf_add_file;
+    d.add_subprogram = dwarf_add_subprogram;
+    d.add_line = dwarf_add_line;
+    d.read_info = dwarf_read_info;
+    d.read_line = dwarf_read_line;
+    d.finalize = dwarf_finalize;
+    d.get_sections = dwarf_get_sections;
+    d.destroy = dwarf_destroy;
+
+    ret ok[of.DebugInfo, str](d);
+}
+
+# add a file entry to the context
+# ---
+# ctx:  context pointer
+# path: file path (e.g. "src/main.mach")
+# dir:  file directory (e.g. "src")
+# ret:  1-based file index for DWARF, or 0 on failure (e.g. OOM)
+fun dwarf_add_file(ctx: ptr, path: str, dir: str) u16 {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || path == nil) { ret 0; }
+
+    # deduplicate
+    var i: i32 = 0;
+    for (i < d.file_count) {
+        if (d.files[i].path != nil && str_equals(d.files[i].path, path)) {
+            ret (i + 1)::u16;
+        }
+        i = i + 1;
+    }
+
+    # grow if needed
+    if (d.file_count >= d.file_cap) {
+        val new_cap: i32 = d.file_cap * 2;
+        val r: Result[*DWARFFile, allocator.AllocError] =
+            allocator.allocator_resize[DWARFFile](d.alloc, d.files,
+                d.file_cap::usize, new_cap::usize);
+        if (result_is_err[*DWARFFile, allocator.AllocError](r)) { ret 0; }
+        d.files = result_unwrap_ok[*DWARFFile, allocator.AllocError](r);
+        d.file_cap = new_cap;
+    }
+
+    val idx: i32 = d.file_count;
+    d.files[idx].path = path;
+    d.files[idx].dir = dir;
+    d.file_count = d.file_count + 1;
+    ret (idx + 1)::u16;
+}
+
+# add a subprogram entry to the context
+# ---
+# ctx: context pointer
+# sub: subprogram info (name, file_idx, line, low_pc, high_pc)
+fun dwarf_add_subprogram(ctx: ptr, sub: *of.DISubprogram) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || sub == nil) { ret; }
+
+    # grow if needed
+    if (d.sub_count >= d.sub_cap) {
+        val new_cap: i32 = d.sub_cap * 2;
+        val r: Result[*of.DISubprogram, allocator.AllocError] =
+            allocator.allocator_resize[of.DISubprogram](d.alloc, d.subs,
+                d.sub_cap::usize, new_cap::usize);
+        if (result_is_err[*of.DISubprogram, allocator.AllocError](r)) { ret; }
+        d.subs = result_unwrap_ok[*of.DISubprogram, allocator.AllocError](r);
+        d.sub_cap = new_cap;
+    }
+
+    val idx: i32 = d.sub_count;
+    d.subs[idx].name = sub.name;
+    d.subs[idx].file_idx = sub.file_idx;
+    d.subs[idx].line = sub.line;
+    d.subs[idx].low_pc = sub.low_pc;
+    d.subs[idx].high_pc = sub.high_pc;
+    d.sub_count = d.sub_count + 1;
+}
+
+# add a line entry to the context
+# ---
+# ctx:   context pointer
+# entry: line entry info (address, file_idx, line)
+fun dwarf_add_line(ctx: ptr, entry: *of.DILineEntry) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || entry == nil) { ret; }
+
+    # grow if needed
+    if (d.line_count >= d.line_cap) {
+        val new_cap: i32 = d.line_cap * 2;
+        val r: Result[*of.DILineEntry, allocator.AllocError] =
+            allocator.allocator_resize[of.DILineEntry](d.alloc, d.lines,
+                d.line_cap::usize, new_cap::usize);
+        if (result_is_err[*of.DILineEntry, allocator.AllocError](r)) { ret; }
+        d.lines = result_unwrap_ok[*of.DILineEntry, allocator.AllocError](r);
+        d.line_cap = new_cap;
+    }
+
+    val idx: i32 = d.line_count;
+    d.lines[idx].address = entry.address;
+    d.lines[idx].file_idx = entry.file_idx;
+    d.lines[idx].line = entry.line;
+    d.line_count = d.line_count + 1;
+}
+
+# parse a .debug_info section produced by our DWARF emitter
+# ---
+# ctx:         context pointer
+# data:        pointer to .debug_info section data
+# size:        size of .debug_info section data
+# addr_offset: address offset to apply to all addresses in the section (e.g. section load address)
+# alloc:       allocator for dynamic memory management (e.g. for file index map)
+fun dwarf_read_info(ctx: ptr, data: *u8, size: usize, addr_offset: u64,
+                    alloc: *allocator.Allocator) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || data == nil || size < 11 || alloc == nil) { ret; }
+
+    val addr_sz: usize = d.ptr_size;
+    var pos: usize = 0;
+
+    # skip unit header (11 bytes)
+    pos = 11;
+    if (pos >= size) { ret; }
+
+    # read CU DIE abbrev code — must be 1
+    val cu_abbrev: u64 = read_uleb128_r(data, size, ?pos);
+    if (cu_abbrev != 1) { ret; }
+
+    # skip CU DIE fields:
+    #   producer (string), language (u16), name (string), comp_dir (string)
+    skip_string(data, size, ?pos);    # producer
+    pos = pos + 2;                    # language
+    skip_string(data, size, ?pos);    # name
+    skip_string(data, size, ?pos);    # comp_dir
+    #   low_pc (addr), high_pc (addr), stmt_list (u32)
+    pos = pos + addr_sz + addr_sz + 4;
+
+    if (pos >= size) { ret; }
+
+    # read subprogram DIEs until null terminator
+    for (pos < size) {
+        val abbrev: u64 = read_uleb128_r(data, size, ?pos);
+        if (abbrev == 0) { brk; }   # null terminator
+        if (abbrev != 2) { brk; }   # unexpected abbrev — stop
+
+        if (pos >= size) { brk; }
+
+        # name (null-terminated string)
+        val name: str = (data::usize + pos)::str;
+        skip_string(data, size, ?pos);
+
+        # file_idx (u16)
+        if (pos + 2 > size) { brk; }
+        val file_idx: u16 = read_u16_le_r(data, pos);
+        pos = pos + 2;
+
+        # line (u32)
+        if (pos + 4 > size) { brk; }
+        val line: u32 = read_u32_le_r(data, pos);
+        pos = pos + 4;
+
+        # low_pc (addr)
+        if (pos + addr_sz > size) { brk; }
+        val low_pc: u64 = read_addr_le_r(data, pos, addr_sz) + addr_offset;
+        pos = pos + addr_sz;
+
+        # high_pc (addr)
+        if (pos + addr_sz > size) { brk; }
+        val high_pc: u64 = read_addr_le_r(data, pos, addr_sz) + addr_offset;
+        pos = pos + addr_sz;
+
+        # remap file index using the map built by dwarf_read_line
+        var sub: of.DISubprogram;
+        sub.name = name;
+        sub.file_idx = map_file_idx(d.last_file_map, d.last_file_map_count, file_idx);
+        sub.line = line::i32;
+        sub.low_pc = low_pc;
+        sub.high_pc = high_pc;
+        dwarf_add_subprogram(ctx, ?sub);
+    }
+}
+
+# parse a .debug_line section produced by our DWARF emitter
+# ---
+# ctx:         context pointer
+# data:        pointer to .debug_line section data
+# size:        size of .debug_line section data
+# addr_offset: address offset to apply to all addresses in the section (e.g. section load address)
+# alloc:       allocator for dynamic memory management (e.g. for file index map)
+fun dwarf_read_line(ctx: ptr, data: *u8, size: usize, addr_offset: u64,
+                    alloc: *allocator.Allocator) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || data == nil || size < 10 || alloc == nil) { ret; }
+
+    val addr_sz: usize = d.ptr_size;
+    var pos: usize = 0;
+
+    # unit header
+    pos = 4;                              # skip unit_length
+    val version: u16 = read_u16_le_r(data, pos);
+    pos = pos + 2;
+    if (version != 4) { ret; }
+
+    val header_length: u32 = read_u32_le_r(data, pos);
+    pos = pos + 4;
+
+    val program_start: usize = pos + header_length::usize;
+
+    # skip prologue params (1+1+1+1+1+1 + 12 = 18 bytes)
+    pos = pos + 18;
+    if (pos >= size) { ret; }
+
+    # skip include directories (null-terminated list, we have 0 = none)
+    if (data[pos] == 0) {
+        pos = pos + 1;
+    } or {
+        for (pos < size && data[pos] != 0) {
+            skip_string(data, size, ?pos);
+        }
+        if (pos < size) { pos = pos + 1; }
+    }
+
+    # read file entries: (name, dir_idx, mtime, size), terminated by 0
+    # build a file index map: .o file_idx → merged file_idx
+    val max_files: i32 = 128;
+    val fidx_r: Result[*u16, allocator.AllocError] =
+        allocator.allocator_zalloc[u16](alloc, max_files::usize);
+    if (result_is_err[*u16, allocator.AllocError](fidx_r)) { ret; }
+    val file_map: *u16 = result_unwrap_ok[*u16, allocator.AllocError](fidx_r);
+    var file_count: i32 = 0;
+
+    for (pos < size && data[pos] != 0) {
+        val file_name: str = (data::usize + pos)::str;
+        skip_string(data, size, ?pos);
+        read_uleb128_r(data, size, ?pos);  # dir_idx
+        read_uleb128_r(data, size, ?pos);  # mtime
+        read_uleb128_r(data, size, ?pos);  # file_size
+
+        # register file in the merged DebugInfo (1-based indexing)
+        if (file_count < max_files) {
+            val merged_idx: u16 = dwarf_add_file(ctx, file_name, ".");
+            file_map[file_count] = merged_idx;
+            file_count = file_count + 1;
+        }
+    }
+    if (pos < size) { pos = pos + 1; } # skip terminating 0
+
+    # advance to program start
+    if (program_start > pos) { pos = program_start; }
+
+    # store file map in context for dwarf_read_info to remap file indices
+    d.last_file_map = file_map;
+    d.last_file_map_count = file_count;
+
+    # execute the line number program
+    # addresses in .o are section-relative; start from addr_offset
+    var cur_addr: u64 = addr_offset;
+    var cur_file: u16 = 1;
+    var cur_line: i32 = 1;
+
+    for (pos < size) {
+        val opcode: u8 = data[pos];
+        pos = pos + 1;
+
+        if (opcode == 0) {
+            # extended opcode
+            val ext_len: u64 = read_uleb128_r(data, size, ?pos);
+            if (pos >= size) { brk; }
+            val ext_op: u8 = data[pos];
+            pos = pos + 1;
+
+            if (ext_op == DW_LNE_end_sequence) {
+                brk;
+            } or (ext_op == DW_LNE_set_address) {
+                if (pos + addr_sz > size) { brk; }
+                cur_addr = read_addr_le_r(data, pos, addr_sz) + addr_offset;
+                pos = pos + addr_sz;
+            } or {
+                # skip unknown extended opcode
+                if (ext_len > 1) {
+                    pos = pos + (ext_len - 1)::usize;
+                }
+            }
+        } or (opcode == DW_LNS_copy) {
+            # emit a row
+            val mapped_file: u16 = map_file_idx(file_map, file_count, cur_file);
+            var entry: of.DILineEntry;
+            entry.address = cur_addr;
+            entry.file_idx = mapped_file;
+            entry.line = cur_line;
+            dwarf_add_line(ctx, ?entry);
+        } or (opcode == DW_LNS_advance_pc) {
+            val adv: u64 = read_uleb128_r(data, size, ?pos);
+            cur_addr = cur_addr + adv;
+        } or (opcode == DW_LNS_advance_line) {
+            val adv: i64 = read_sleb128_r(data, size, ?pos);
+            cur_line = cur_line + adv::i32;
+        } or (opcode == DW_LNS_set_file) {
+            val fi: u64 = read_uleb128_r(data, size, ?pos);
+            cur_file = fi::u16;
+        } or (opcode == DW_LNS_set_column) {
+            read_uleb128_r(data, size, ?pos); # skip column
+        } or (opcode == DW_LNS_negate_stmt) {
+            # skip
+        } or (opcode >= 13) {
+            # special opcode — skip (we don't emit these, but handle gracefully)
+        } or {
+            # other standard opcodes (7-12): skip their arguments
+            # opcodes 7,8,10,11 have 0 args; 9,12 have 1 arg
+            if (opcode == 9 || opcode == 12) {
+                read_uleb128_r(data, size, ?pos);
+            }
+        }
+    }
+
+    # file_map is kept alive in d.last_file_map for dwarf_read_info
+}
+
+# read little-endian integers from a byte buffer at a given position as u16
+# ---
+# data: byte buffer pointer
+# pos:  position in the buffer
+# ret:  the integer value read from the buffer
+fun read_u16_le_r(data: *u8, pos: usize) u16 {
+    ret data[pos]::u16 | (data[pos + 1]::u16 << 8);
+}
+
+# read little-endian integers from a byte buffer at a given position as u32
+# ---
+# data: byte buffer pointer
+# pos:  position in the buffer
+# ret:  the integer value read from the buffer
+fun read_u32_le_r(data: *u8, pos: usize) u32 {
+    ret data[pos]::u32 | (data[pos + 1]::u32 << 8)
+        | (data[pos + 2]::u32 << 16) | (data[pos + 3]::u32 << 24);
+}
+
+# read little-endian integers from a byte buffer at a given position as u64
+# ---
+# data: byte buffer pointer
+# pos:  position in the buffer
+# ret:  the integer value read from the buffer
+fun read_u64_le_r(data: *u8, pos: usize) u64 {
+    ret data[pos]::u64 | (data[pos + 1]::u64 << 8)
+        | (data[pos + 2]::u64 << 16) | (data[pos + 3]::u64 << 24)
+        | (data[pos + 4]::u64 << 32) | (data[pos + 5]::u64 << 40)
+        | (data[pos + 6]::u64 << 48) | (data[pos + 7]::u64 << 56);
+}
+
+# read little-endian integers from a byte buffer at a given position as u64, with variable size (4 or 8)
+# ---
+# data:    byte buffer pointer
+# pos:     position in the buffer
+# addr_sz: size of the address in bytes (4 or 8)
+# ret:     the integer value read from the buffer
+fun read_addr_le_r(data: *u8, pos: usize, addr_sz: usize) u64 {
+    if (addr_sz == 4) { ret read_u32_le_r(data, pos)::u64; }
+    ret read_u64_le_r(data, pos);
+}
+
+# read an unsigned LEB128 integer from a byte buffer at a given position
+# ---
+# data: byte buffer pointer
+# size: size of the byte buffer
+# pos:  pointer to the position in the buffer (updated to new position after reading)
+# ret:  the integer value read from the buffer
+fun read_uleb128_r(data: *u8, size: usize, pos: *usize) u64 {
+    var result: u64 = 0;
+    var shift: u64 = 0;
+    for (@pos < size) {
+        val b: u8 = data[@pos];
+        @pos = @pos + 1;
+        result = result | ((b & 0x7f)::u64 << shift);
+        if ((b & 0x80) == 0) { brk; }
+        shift = shift + 7;
+    }
+    ret result;
+}
+
+# read a signed LEB128 integer from a byte buffer at a given position
+# ---
+# data: byte buffer pointer
+# size: size of the byte buffer
+# pos:  pointer to the position in the buffer (updated to new position after reading)
+# ret:  the integer value read from the buffer
+fun read_sleb128_r(data: *u8, size: usize, pos: *usize) i64 {
+    var result: i64 = 0;
+    var shift: i64 = 0;
+    var b: u8 = 0;
+    for (@pos < size) {
+        b = data[@pos];
+        @pos = @pos + 1;
+        result = result | ((b & 0x7f)::i64 << shift);
+        shift = shift + 7;
+        if ((b & 0x80) == 0) { brk; }
+    }
+    if (shift < 64 && (b & 0x40) != 0) {
+        result = result | ((-1::i64) << shift);
+    }
+    ret result;
+}
+
+# skip a null-terminated string in a byte buffer at a given position
+# ---
+# data: byte buffer pointer
+# size: size of the byte buffer
+# pos:  pointer to the position in the buffer (updated to new position after skipping)
+fun skip_string(data: *u8, size: usize, pos: *usize) {
+    for (@pos < size && data[@pos] != 0) {
+        @pos = @pos + 1;
+    }
+    if (@pos < size) { @pos = @pos + 1; } # skip null terminator
+}
+
+# map a .o file index to a merged file index using the file_map built by dwarf_read_line
+# ---
+# file_map: array of merged file indices (1-based) indexed by .o file index (0-based)
+# count:    number of entries in file_map
+# idx:      1-based file index from .debug_info to map
+# ret:      mapped 1-based file index for the merged DebugInfo, or idx if out of bounds
+fun map_file_idx(file_map: *u16, count: i32, idx: u16) u16 {
+    # DWARF file indices are 1-based; file_map is 0-based
+    val i: i32 = idx::i32 - 1;
+    if (i >= 0 && i < count && file_map != nil) {
+        ret file_map[i];
+    }
+    ret idx;
+}
+
+# destroy the context and free all associated memory
+# ---
+# ctx: context pointer
+fun dwarf_destroy(ctx: ptr) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || d.alloc == nil) { ret; }
+
+    if (d.files != nil) {
+        allocator.allocator_free[DWARFFile](d.alloc, d.files, d.file_cap::usize);
+    }
+    if (d.subs != nil) {
+        allocator.allocator_free[of.DISubprogram](d.alloc, d.subs, d.sub_cap::usize);
+    }
+    if (d.lines != nil) {
+        allocator.allocator_free[of.DILineEntry](d.alloc, d.lines, d.line_cap::usize);
+    }
+    if (d.last_file_map != nil) {
+        allocator.allocator_free[u16](d.alloc, d.last_file_map, 128);
+    }
+    buf.buf_destroy(?d.abbrev_buf);
+    buf.buf_destroy(?d.info_buf);
+    buf.buf_destroy(?d.line_buf);
+    allocator.allocator_free[DWARFContext](d.alloc, d, 1);
+}
+
+# get the finalized debug sections after dwarf_finalize
+# ---
+# ctx:   context pointer
+# count: pointer to store the number of sections returned
+# ret:   pointer to the first section in the sections array, or nil if ctx or count is nil
+fun dwarf_get_sections(ctx: ptr, count: *i32) *of.DebugSection {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || count == nil) { ret nil; }
+    @count = d.sec_count;
+    ret ?d.sections[0];
+}
+
+# finalize the DWARF sections by serializing the context data into the buffers and setting up the sections array
+# ---
+# ctx:   context pointer
+# alloc: allocator for dynamic memory management (e.g. for buffers)
+fun dwarf_finalize(ctx: ptr, alloc: *allocator.Allocator) {
+    val d: *DWARFContext = ctx::*DWARFContext;
+    if (d == nil || alloc == nil) { ret; }
+
+    buf.buf_init(?d.abbrev_buf, alloc, d.endian);
+    buf.buf_init(?d.info_buf, alloc, d.endian);
+    buf.buf_init(?d.line_buf, alloc, d.endian);
+
+    emit_abbrev(d);
+    emit_info(d);
+    emit_line(d);
+
+    d.sec_count = 0;
+
+    if (d.abbrev_buf.size > 0) {
+        d.sections[d.sec_count].name = ".debug_abbrev";
+        d.sections[d.sec_count].data = d.abbrev_buf.data;
+        d.sections[d.sec_count].size = d.abbrev_buf.size;
+        d.sec_count = d.sec_count + 1;
+    }
+
+    if (d.info_buf.size > 0) {
+        d.sections[d.sec_count].name = ".debug_info";
+        d.sections[d.sec_count].data = d.info_buf.data;
+        d.sections[d.sec_count].size = d.info_buf.size;
+        d.sec_count = d.sec_count + 1;
+    }
+
+    if (d.line_buf.size > 0) {
+        d.sections[d.sec_count].name = ".debug_line";
+        d.sections[d.sec_count].data = d.line_buf.data;
+        d.sections[d.sec_count].size = d.line_buf.size;
+        d.sec_count = d.sec_count + 1;
+    }
+}
+
+# emit the .debug_abbrev section based on the context data
+# ---
+# d: context pointer
+fun emit_abbrev(d: *DWARFContext) {
+    val out: *buf.OutputBuffer = ?d.abbrev_buf;
+
+    # abbrev 1: compile_unit
+    write_uleb128(out, 1);                       # abbrev code
+    write_uleb128(out, DW_TAG_compile_unit::u64); # tag
+    buf.buf_write_u8(out, DW_CHILDREN_yes);       # has children
+
+    write_uleb128(out, DW_AT_producer::u64);
+    write_uleb128(out, DW_FORM_string::u64);
+    write_uleb128(out, DW_AT_language::u64);
+    write_uleb128(out, DW_FORM_data2::u64);
+    write_uleb128(out, DW_AT_name::u64);
+    write_uleb128(out, DW_FORM_string::u64);
+    write_uleb128(out, DW_AT_comp_dir::u64);
+    write_uleb128(out, DW_FORM_string::u64);
+    write_uleb128(out, DW_AT_low_pc::u64);
+    write_uleb128(out, DW_FORM_addr::u64);
+    write_uleb128(out, DW_AT_high_pc::u64);
+    write_uleb128(out, DW_FORM_addr::u64);
+    write_uleb128(out, DW_AT_stmt_list::u64);
+    write_uleb128(out, DW_FORM_sec_offset::u64);
+    write_uleb128(out, 0); # attr terminator
+    write_uleb128(out, 0); # form terminator
+
+    # abbrev 2: subprogram
+    write_uleb128(out, 2);                       # abbrev code
+    write_uleb128(out, DW_TAG_subprogram::u64);  # tag
+    buf.buf_write_u8(out, DW_CHILDREN_no);        # no children
+
+    write_uleb128(out, DW_AT_name::u64);
+    write_uleb128(out, DW_FORM_string::u64);
+    write_uleb128(out, DW_AT_decl_file::u64);
+    write_uleb128(out, DW_FORM_data2::u64);
+    write_uleb128(out, DW_AT_decl_line::u64);
+    write_uleb128(out, DW_FORM_data4::u64);
+    write_uleb128(out, DW_AT_low_pc::u64);
+    write_uleb128(out, DW_FORM_addr::u64);
+    write_uleb128(out, DW_AT_high_pc::u64);
+    write_uleb128(out, DW_FORM_addr::u64);
+    write_uleb128(out, 0); # attr terminator
+    write_uleb128(out, 0); # form terminator
+
+    # end of abbreviation table
+    write_uleb128(out, 0);
+}
+
+# emit the .debug_info section based on the context data
+# ---
+# d: context pointer
+fun emit_info(d: *DWARFContext) {
+    val out: *buf.OutputBuffer = ?d.info_buf;
+
+    # unit header (11 bytes: 4 + 2 + 4 + 1)
+    val header_off: usize = out.size;
+    buf.buf_write_u32(out, 0);       # unit_length placeholder
+    buf.buf_write_u16(out, 4);       # version = DWARF 4
+    buf.buf_write_u32(out, 0);       # debug_abbrev_offset = 0
+    buf.buf_write_u8(out, d.ptr_size::u8); # address_size
+
+    # CU DIE (abbrev 1)
+    write_uleb128(out, 1);          # abbrev code
+
+    # DW_AT_producer: inline string
+    write_string(out, "mach compiler");
+
+    # DW_AT_language: DW_LANG_lo_user (mach is a custom language)
+    buf.buf_write_u16(out, DW_LANG_lo_user);
+
+    # DW_AT_name: compilation unit name
+    write_string(out, "<mach>");
+
+    # DW_AT_comp_dir: compilation directory
+    write_string(out, ".");
+
+    # DW_AT_low_pc: lowest address in CU
+    var cu_low: u64 = 0;
+    var cu_high: u64 = 0;
+    if (d.sub_count > 0) {
+        cu_low = d.subs[0].low_pc;
+        cu_high = d.subs[0].high_pc;
+        var si: i32 = 1;
+        for (si < d.sub_count) {
+            if (d.subs[si].low_pc < cu_low) {
+                cu_low = d.subs[si].low_pc;
+            }
+            if (d.subs[si].high_pc > cu_high) {
+                cu_high = d.subs[si].high_pc;
+            }
+            si = si + 1;
+        }
+    }
+    write_addr(out, cu_low, d.ptr_size);
+
+    # DW_AT_high_pc: highest address in CU
+    write_addr(out, cu_high, d.ptr_size);
+
+    # DW_AT_stmt_list: offset into .debug_line (always 0)
+    buf.buf_write_u32(out, 0);
+
+    # subprogram DIEs (abbrev 2)
+    var si: i32 = 0;
+    for (si < d.sub_count) {
+        write_uleb128(out, 2);      # abbrev code
+
+        # DW_AT_name
+        if (d.subs[si].name != nil) {
+            write_string(out, d.subs[si].name);
+        } or {
+            write_string(out, "<unknown>");
+        }
+
+        # DW_AT_decl_file
+        buf.buf_write_u16(out, d.subs[si].file_idx);
+
+        # DW_AT_decl_line
+        buf.buf_write_u32(out, d.subs[si].line::u32);
+
+        # DW_AT_low_pc
+        write_addr(out, d.subs[si].low_pc, d.ptr_size);
+
+        # DW_AT_high_pc
+        write_addr(out, d.subs[si].high_pc, d.ptr_size);
+
+        si = si + 1;
+    }
+
+    # null terminator (end of CU children)
+    buf.buf_write_u8(out, 0);
+
+    # patch unit_length
+    val unit_len: u32 = (out.size - header_off - 4)::u32;
+    buf.buf_patch_u32(out, header_off, unit_len);
+}
+
+# emit the .debug_line section based on the context data
+# ---
+# d: context pointer
+fun emit_line(d: *DWARFContext) {
+    val out: *buf.OutputBuffer = ?d.line_buf;
+
+    # unit header
+    val header_off: usize = out.size;
+    buf.buf_write_u32(out, 0);      # unit_length placeholder
+    buf.buf_write_u16(out, 4);      # version = DWARF 4
+
+    val prologue_off: usize = out.size;
+    buf.buf_write_u32(out, 0);      # header_length placeholder
+
+    # line number program parameters
+    buf.buf_write_u8(out, 1);       # minimum_instruction_length
+    buf.buf_write_u8(out, 1);       # maximum_operations_per_instruction
+    buf.buf_write_u8(out, 1);       # default_is_stmt
+    buf.buf_write_u8(out, 0xf6::u8); # line_base = -10 (signed)
+    buf.buf_write_u8(out, 245);     # line_range = 245
+    buf.buf_write_u8(out, 13);      # opcode_base
+    # standard_opcode_lengths (12 entries for opcodes 1..12)
+    buf.buf_write_u8(out, 0);       # DW_LNS_copy
+    buf.buf_write_u8(out, 1);       # DW_LNS_advance_pc
+    buf.buf_write_u8(out, 1);       # DW_LNS_advance_line
+    buf.buf_write_u8(out, 1);       # DW_LNS_set_file
+    buf.buf_write_u8(out, 1);       # DW_LNS_set_column
+    buf.buf_write_u8(out, 0);       # DW_LNS_negate_stmt
+    buf.buf_write_u8(out, 0);       # DW_LNS_set_basic_block
+    buf.buf_write_u8(out, 0);       # DW_LNS_const_add_pc
+    buf.buf_write_u8(out, 1);       # DW_LNS_fixed_advance_pc
+    buf.buf_write_u8(out, 0);       # DW_LNS_set_prologue_end
+    buf.buf_write_u8(out, 0);       # DW_LNS_set_epilogue_begin
+    buf.buf_write_u8(out, 1);       # DW_LNS_set_isa
+
+    # include_directories (null-terminated list)
+    buf.buf_write_u8(out, 0);       # no include directories
+
+    # file_names (null-terminated list of entries)
+    var fi: i32 = 0;
+    for (fi < d.file_count) {
+        if (d.files[fi].path != nil) {
+            write_string(out, d.files[fi].path);  # file name
+        } or {
+            write_string(out, "<unknown>");
+        }
+        write_uleb128(out, 0);     # directory index (0 = current)
+        write_uleb128(out, 0);     # last modification time
+        write_uleb128(out, 0);     # file size
+        fi = fi + 1;
+    }
+    buf.buf_write_u8(out, 0);       # end of file_names list
+
+    # patch header_length
+    val header_len: u32 = (out.size - prologue_off - 4)::u32;
+    buf.buf_patch_u32(out, prologue_off, header_len);
+
+    # line number program instructions
+    if (d.line_count > 0) {
+        var cur_addr: u64 = 0;
+        var cur_file: u16 = 1;
+        var cur_line: i32 = 1;
+
+        var li: i32 = 0;
+        for (li < d.line_count) {
+            val entry: *of.DILineEntry = ?d.lines[li];
+
+            # set file if changed
+            if (entry.file_idx != cur_file && entry.file_idx > 0) {
+                buf.buf_write_u8(out, DW_LNS_set_file);
+                write_uleb128(out, entry.file_idx::u64);
+                cur_file = entry.file_idx;
+            }
+
+            # advance line if changed
+            if (entry.line != cur_line) {
+                buf.buf_write_u8(out, DW_LNS_advance_line);
+                write_sleb128(out, (entry.line - cur_line)::i64);
+                cur_line = entry.line;
+            }
+
+            # advance PC
+            if (entry.address > cur_addr) {
+                buf.buf_write_u8(out, DW_LNS_advance_pc);
+                write_uleb128(out, entry.address - cur_addr);
+                cur_addr = entry.address;
+            } or (entry.address != cur_addr) {
+                # address went backwards — use set_address
+                buf.buf_write_u8(out, 0);         # extended opcode marker
+                write_uleb128(out, (1 + d.ptr_size)::u64); # length: 1 + ptr_size
+                buf.buf_write_u8(out, DW_LNE_set_address);
+                write_addr(out, entry.address, d.ptr_size);
+                cur_addr = entry.address;
+            }
+
+            # emit row
+            buf.buf_write_u8(out, DW_LNS_copy);
+
+            li = li + 1;
+        }
+    }
+
+    # end sequence (extended opcode)
+    buf.buf_write_u8(out, 0);                 # extended opcode marker
+    write_uleb128(out, 1);                   # length = 1
+    buf.buf_write_u8(out, DW_LNE_end_sequence);
+
+    # patch unit_length
+    val unit_len: u32 = (out.size - header_off - 4)::u32;
+    buf.buf_patch_u32(out, header_off, unit_len);
+}
+
+# write an address using the target's pointer size
+# ---
+# out:      output buffer to write to
+# addr:     address value to write
+# ptr_size: size of the address in bytes (4 or 8)
+fun write_addr(out: *buf.OutputBuffer, addr: u64, ptr_size: usize) {
+    if (ptr_size == 4) {
+        buf.buf_write_u32(out, addr::u32);
+    } or {
+        buf.buf_write_u64(out, addr);
+    }
+}
+
+# encode an unsigned LEB128 value
+# ---
+# out:   output buffer to write to
+# value: unsigned integer value to encode
+fun write_uleb128(out: *buf.OutputBuffer, value: u64) {
+    var v: u64 = value;
+    for (v >= 128) {
+        buf.buf_write_u8(out, ((v & 0x7f) | 0x80)::u8);
+        v = v >> 7;
+    }
+    buf.buf_write_u8(out, (v & 0x7f)::u8);
+}
+
+# encode a signed LEB128 value
+# ---
+# out:   output buffer to write to
+# value: signed integer value to encode
+fun write_sleb128(out: *buf.OutputBuffer, value: i64) {
+    var v: i64 = value;
+    var more: bool = true;
+    for (more) {
+        var b: u8 = (v & 0x7f)::u8;
+        v = v >> 7;
+        if ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) {
+            more = false;
+        } or {
+            b = b | 0x80;
+        }
+        buf.buf_write_u8(out, b);
+    }
+}
+
+# write a null-terminated string to the output buffer
+# ---
+# out: output buffer to write to
+# s:   string to write (must be null-terminated or nil)
+fun write_string(out: *buf.OutputBuffer, s: str) {
+    if (s == nil) {
+        buf.buf_write_u8(out, 0);
+        ret;
+    }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        buf.buf_write_u8(out, s[i]);
+        i = i + 1;
+    }
+    buf.buf_write_u8(out, 0);
+}
