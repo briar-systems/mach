@@ -423,11 +423,20 @@ fun resolve_for_stmt(sema: *Sema, mod: *SemaModule, node: *ast.Node, fn_ctx: *Fn
 # resolve a comptime attribute assignment ($name.attr = value)
 fun resolve_comptime_attr(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
     if (node == nil) { ret; }
-    # comptime attribute nodes wrap an assignment expression
     val inner: *ast.Node = node.info.wrapper.inner;
     if (inner == nil) { ret; }
 
-    # resolve the assignment to bind symbols
+    # comptime attributes wrap an assignment (binary =).
+    # the LHS is a comptime attribute path (e.g., _start.symbol) — skip type resolution.
+    # only resolve the RHS value.
+    if (inner.kind == ast.NODE_EXPR_BINARY && inner.info.binary_expr.op == token.TAG_EQ) {
+        val rhs: *ast.Node = inner.info.binary_expr.right;
+        if (rhs != nil) {
+            resolve_expr(sema, mod, rhs, nil);
+        }
+        ret;
+    }
+
     resolve_expr(sema, mod, inner, nil);
 }
 
@@ -673,6 +682,171 @@ fun resolve_unary(sema: *Sema, mod: *SemaModule, node: *ast.Node, expected: *typ
     ret t;
 }
 
+# convert a usize value to a heap-allocated decimal string
+fun usize_to_str(sema: *Sema, value: usize) str {
+    var buf: [21]u8;
+    var pos: i32 = 20;
+    buf[20] = 0;
+
+    if (value == 0) {
+        pos = 19;
+        buf[19] = '0';
+    } or {
+        var v: usize = value;
+        for (v > 0) {
+            pos = pos - 1;
+            buf[pos::usize] = '0'::u8 + (v % 10)::u8;
+            v = v / 10;
+        }
+    }
+
+    val len: usize = (21 - pos)::usize;
+    val r: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](sema.alloc, len);
+    if (result_is_err[*u8, allocator.AllocError](r)) { ret nil; }
+    val dst: *u8 = result_unwrap_ok[*u8, allocator.AllocError](r);
+    var i: usize = 0;
+    for (i < len) {
+        dst[i] = buf[(pos::usize) + i];
+        i = i + 1;
+    }
+    ret dst::str;
+}
+
+# fold a comptime intrinsic call to an integer literal node
+fun fold_to_int_literal(sema: *Sema, node: *ast.Node, value: usize) *type.Type {
+    val text: str = usize_to_str(sema, value);
+    if (text == nil) { ret nil; }
+
+    node.kind = ast.NODE_EXPR_LIT_INT;
+    node.info.lit_expr.text = text;
+    val usize_t: *type.Type = type.get_primitive(sema.types, type.TYPE_U64);
+    node.type = usize_t;
+    ret usize_t;
+}
+
+# resolve a type from an expression node (for comptime intrinsic args)
+fun resolve_type_from_expr(sema: *Sema, mod: *SemaModule, expr: *ast.Node) *type.Type {
+    if (expr == nil) { ret nil; }
+
+    # if the node already has a resolved type (e.g., from generic substitution)
+    if (expr.type != nil) { ret expr.type; }
+
+    # if the expression is an identifier, look it up as a type name
+    if (expr.kind == ast.NODE_EXPR_IDENT) {
+        val name: str = expr.info.ident_expr.name;
+        if (name != nil) {
+            val prim_opt: Option[type.TypeKind] = type.primitive_kind_from_name(name);
+            if (option_is_some[type.TypeKind](prim_opt)) {
+                ret type.get_primitive(sema.types, option_unwrap[type.TypeKind](prim_opt));
+            }
+            # check type aliases
+            if (str_equals(name, "str")) {
+                val u8_type: *type.Type = type.get_primitive(sema.types, type.TYPE_U8);
+                val r: Result[*type.Type, str] = type.make_pointer(sema.types, u8_type, false);
+                if (result_is_ok[*type.Type, str](r)) {
+                    ret result_unwrap_ok[*type.Type, str](r);
+                }
+                ret nil;
+            }
+            if (str_equals(name, "bool")) {
+                ret type.get_primitive(sema.types, type.TYPE_U8);
+            }
+            if (str_equals(name, "usize")) {
+                ret type.get_primitive(sema.types, type.TYPE_U64);
+            }
+            val sym: *symbol.Symbol = lookup_symbol(sema, mod, name);
+            if (sym != nil) {
+                resolve.ensure_type_resolved(sema, mod, sym);
+                ret sym.resolved_type;
+            }
+        }
+    }
+
+    # if it's a type node (e.g., *T, [N]T), resolve directly
+    if (expr.kind == ast.NODE_TYPE_PTR || expr.kind == ast.NODE_TYPE_REF
+        || expr.kind == ast.NODE_TYPE_ARRAY || expr.kind == ast.NODE_TYPE_NAME) {
+        ret resolve.resolve_type_expr(sema, mod, expr);
+    }
+
+    # handle &T / *T parsed as unary expression in comptime intrinsic args
+    # (e.g., $size_of(&u8) parses &u8 as NODE_EXPR_UNARY with op TAG_AMP)
+    if (expr.kind == ast.NODE_EXPR_UNARY) {
+        val op: u8 = expr.info.unary_expr.op;
+        if (op == token.TAG_AMP || op == token.TAG_STAR) {
+            val inner: *ast.Node = expr.info.unary_expr.expr;
+            val inner_type: *type.Type = resolve_type_from_expr(sema, mod, inner);
+            if (inner_type != nil) {
+                val is_mut: bool = (op == token.TAG_STAR);
+                val r: Result[*type.Type, str] = type.make_pointer(sema.types, inner_type, is_mut);
+                if (result_is_ok[*type.Type, str](r)) {
+                    ret result_unwrap_ok[*type.Type, str](r);
+                }
+            }
+        }
+    }
+
+    ret nil;
+}
+
+# resolve $size_of(T) — fold to integer literal
+fun resolve_comptime_size_of(sema: *Sema, mod: *SemaModule,
+    node: *ast.Node, args: *ast.List) *type.Type {
+    if (args == nil || args.count != 1) {
+        report_error_node(sema, mod, node, "$size_of requires exactly 1 type argument");
+        ret nil;
+    }
+    val resolved: *type.Type = resolve_type_from_expr(sema, mod, args.nodes[0]);
+    if (resolved == nil) {
+        report_error_node(sema, mod, node, "could not resolve type in $size_of");
+        ret nil;
+    }
+    ret fold_to_int_literal(sema, node, resolved.size);
+}
+
+# resolve $align_of(T) — fold to integer literal
+fun resolve_comptime_align_of(sema: *Sema, mod: *SemaModule,
+    node: *ast.Node, args: *ast.List) *type.Type {
+    if (args == nil || args.count != 1) {
+        report_error_node(sema, mod, node, "$align_of requires exactly 1 type argument");
+        ret nil;
+    }
+    val resolved: *type.Type = resolve_type_from_expr(sema, mod, args.nodes[0]);
+    if (resolved == nil) {
+        report_error_node(sema, mod, node, "could not resolve type in $align_of");
+        ret nil;
+    }
+    ret fold_to_int_literal(sema, node, resolved.align);
+}
+
+# resolve $offset_of(Type, field) — fold to integer literal
+fun resolve_comptime_offset_of(sema: *Sema, mod: *SemaModule,
+    node: *ast.Node, args: *ast.List) *type.Type {
+    if (args == nil || args.count != 2) {
+        report_error_node(sema, mod, node, "$offset_of requires 2 arguments: type and field name");
+        ret nil;
+    }
+    val resolved: *type.Type = resolve_type_from_expr(sema, mod, args.nodes[0]);
+    if (resolved == nil || (resolved.kind != type.TYPE_RECORD && resolved.kind != type.TYPE_UNION)) {
+        report_error_node(sema, mod, node, "$offset_of requires a record or union type");
+        ret nil;
+    }
+    val field_arg: *ast.Node = args.nodes[1];
+    if (field_arg == nil || field_arg.kind != ast.NODE_EXPR_IDENT) {
+        report_error_node(sema, mod, node, "$offset_of field must be an identifier");
+        ret nil;
+    }
+    val fname: str = field_arg.info.ident_expr.name;
+    var fi: i32 = 0;
+    for (fi < resolved.field_count) {
+        if (resolved.fields != nil && str_equals(resolved.fields[fi].name, fname)) {
+            ret fold_to_int_literal(sema, node, resolved.fields[fi].offset);
+        }
+        fi = fi + 1;
+    }
+    report_error_node(sema, mod, node, "field not found in type for $offset_of");
+    ret nil;
+}
+
 # resolve a varargs builtin call (va_start, va_end, va_arg)
 fun resolve_va_builtin(sema: *Sema, mod: *SemaModule, node: *ast.Node,
     args: *ast.List, type_args: *ast.Node, name: str) *type.Type {
@@ -725,6 +899,25 @@ fun resolve_call(sema: *Sema, mod: *SemaModule, node: *ast.Node) *type.Type {
             if (str_equals(bname, "va_start") || str_equals(bname, "va_end")
                 || str_equals(bname, "va_arg")) {
                 ret resolve_va_builtin(sema, mod, node, args, type_args, bname);
+            }
+        }
+    }
+
+    # check for comptime intrinsic calls: $size_of(T), $align_of(T), $offset_of(T, f)
+    if (callee != nil && callee.kind == ast.NODE_COMPTIME) {
+        val inner: *ast.Node = callee.info.wrapper.inner;
+        if (inner != nil && inner.kind == ast.NODE_EXPR_IDENT) {
+            val cname: str = inner.info.ident_expr.name;
+            if (cname != nil) {
+                if (str_equals(cname, "size_of")) {
+                    ret resolve_comptime_size_of(sema, mod, node, args);
+                }
+                if (str_equals(cname, "align_of")) {
+                    ret resolve_comptime_align_of(sema, mod, node, args);
+                }
+                if (str_equals(cname, "offset_of")) {
+                    ret resolve_comptime_offset_of(sema, mod, node, args);
+                }
             }
         }
     }
