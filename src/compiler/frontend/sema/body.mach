@@ -54,6 +54,58 @@ pub fun resolve_module_bodies(sema: *Sema, mod: *SemaModule) {
     mod.phase = PHASE_BODIES;
 }
 
+# resolve function bodies of all generic instantiations.
+# runs after phase 3 to handle instantiations created during body resolution.
+# uses a fixpoint loop since resolving an instantiation body may trigger
+# new instantiations (e.g., a generic function calling another generic function).
+pub fun resolve_instantiation_bodies(sema: *Sema) {
+    if (sema == nil) { ret; }
+
+    var prev_count: i32 = 0;
+    for (prev_count != sema.func_inst_count) {
+        prev_count = sema.func_inst_count;
+
+        var inst: *FunctionInstantiation = sema.func_insts;
+        for (inst != nil) {
+            if (inst.func_ast != nil && inst.origin_module != nil && !inst.body_resolved) {
+                inst.body_resolved = true;
+                resolve_inst_body(sema, inst);
+            }
+            inst = inst.next;
+        }
+    }
+}
+
+# resolve a single instantiation's body with generic type params in scope
+fun resolve_inst_body(sema: *Sema, inst: *FunctionInstantiation) {
+    if (inst == nil || inst.func_ast == nil || inst.origin_module == nil) { ret; }
+
+    val mod: *SemaModule = inst.origin_module;
+
+    # push a temporary scope with the generic type parameters defined as type symbols.
+    # resolve_function_body pushes another child scope for params, so T/E/etc. are
+    # visible from the function body via scope chain lookup.
+    symbol.table_push_scope(mod.table);
+
+    var pi: i32 = 0;
+    for (pi < inst.param_count) {
+        if (inst.param_names != nil && inst.param_names[pi] != nil
+            && inst.param_types != nil && inst.param_types[pi] != nil) {
+            val def_res: Result[*symbol.Symbol, str] =
+                symbol.table_define(mod.table, inst.param_names[pi], symbol.SYM_TYPE);
+            if (result_is_ok[*symbol.Symbol, str](def_res)) {
+                val tsym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](def_res);
+                tsym.resolved_type = inst.param_types[pi];
+            }
+        }
+        pi = pi + 1;
+    }
+
+    resolve_function_body(sema, mod, inst.func_ast);
+
+    symbol.table_pop_scope(mod.table);
+}
+
 # dispatch top-level declarations for body resolution
 fun resolve_top_level_body(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
     if (node == nil) { ret; }
@@ -427,17 +479,82 @@ fun resolve_comptime_attr(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
     if (inner == nil) { ret; }
 
     # comptime attributes wrap an assignment (binary =).
-    # the LHS is a comptime attribute path (e.g., _start.symbol) — skip type resolution.
-    # only resolve the RHS value.
+    # the LHS is a comptime attribute path (e.g., main.symbol) — skip type resolution.
+    # apply known attributes (e.g., .symbol sets export_name).
     if (inner.kind == ast.NODE_EXPR_BINARY && inner.info.binary_expr.op == token.TAG_EQ) {
+        val lhs: *ast.Node = inner.info.binary_expr.left;
         val rhs: *ast.Node = inner.info.binary_expr.right;
         if (rhs != nil) {
             resolve_expr(sema, mod, rhs, nil);
         }
+        apply_comptime_attr(sema, mod, lhs, rhs);
         ret;
     }
 
     resolve_expr(sema, mod, inner, nil);
+}
+
+# apply a comptime attribute assignment (e.g., $main.symbol = "main")
+fun apply_comptime_attr(sema: *Sema, mod: *SemaModule, lhs: *ast.Node, rhs: *ast.Node) {
+    if (lhs == nil || rhs == nil) { ret; }
+
+    # expect LHS to be a field access: target.attribute
+    if (lhs.kind != ast.NODE_EXPR_FIELD) { ret; }
+
+    val target_node: *ast.Node = lhs.info.field_expr.object;
+    val attr_name: str = lhs.info.field_expr.field;
+    if (target_node == nil || attr_name == nil) { ret; }
+
+    # get the target symbol name
+    if (target_node.kind != ast.NODE_EXPR_IDENT) { ret; }
+    val target_name: str = target_node.info.ident_expr.name;
+    if (target_name == nil) { ret; }
+
+    # look up the target symbol
+    val sym: *symbol.Symbol = lookup_symbol(sema, mod, target_name);
+    if (sym == nil) { ret; }
+
+    # apply known attributes
+    if (str_equals(attr_name, "symbol")) {
+        # .symbol sets export_name (linkage name override)
+        if (rhs.kind == ast.NODE_EXPR_LIT_STR) {
+            val raw: str = rhs.info.lit_expr.text;
+            if (raw != nil) {
+                # strip surrounding quotes from string literal text
+                sym.export_name = strip_string_quotes(sema, raw);
+            }
+        }
+    }
+}
+
+# strip surrounding quote characters from a string literal's text
+fun strip_string_quotes(sema: *Sema, raw: str) str {
+    if (raw == nil) { ret nil; }
+    val len: usize = str_len(raw);
+    if (len < 2 || raw[0] != '"') { ret raw; }
+
+    # find the inner length (between opening and closing quote)
+    var inner_len: usize = 0;
+    var i: usize = 1;
+    for (i < len && raw[i] != '"') {
+        inner_len = inner_len + 1;
+        i = i + 1;
+    }
+
+    val r: Result[*u8, allocator.AllocError] =
+        allocator.allocator_alloc[u8](sema.alloc, inner_len + 1);
+    if (result_is_err[*u8, allocator.AllocError](r)) { ret raw; }
+
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](r);
+    var j: usize = 0;
+    i = 1;
+    for (j < inner_len) {
+        buf[j] = raw[i];
+        i = i + 1;
+        j = j + 1;
+    }
+    buf[inner_len] = 0;
+    ret buf::str;
 }
 
 # resolve an expression and return its type
@@ -932,6 +1049,9 @@ fun resolve_call(sema: *Sema, mod: *SemaModule, node: *ast.Node) *type.Type {
             val inst_type: *type.Type = generic.instantiate_generic_function(
                 sema, mod, callee_sym, type_args, node);
             if (inst_type != nil) {
+                # propagate instantiated symbol to call node for codegen
+                node.symbol = callee.symbol;
+
                 # resolve args with the instantiated function's param types
                 resolve_call_args(sema, mod, args, inst_type);
                 var ret_t: *type.Type = inst_type.ret_type;
