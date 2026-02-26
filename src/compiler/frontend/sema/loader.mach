@@ -1,0 +1,451 @@
+# module graph construction
+#
+# recursively discovers all imports, reads source files, parses modules,
+# and builds the SemaModule linked list in dependency order.
+# no analysis is performed — just loading and graph construction.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.option;
+use std.types.result;
+
+use allocator: std.allocator;
+use print:     std.print;
+
+use ast:    mach.compiler.frontend.ast;
+use parser: mach.compiler.frontend.parser;
+use symbol: mach.compiler.frontend.symbol;
+use config: mach.config.config;
+use utilfs: mach.util.filesystem;
+
+use mach.compiler.frontend.sema;
+
+# load all modules reachable from root_mod via imports
+#
+# walks use declarations in the root module's AST, recursively loading
+# each imported module. builds the module linked list with dependencies
+# prepended (so iterating from head gives dependency-first order).
+# also builds reverse dependency links for invalidation.
+# ---
+# sema:     analyzer context
+# root_mod: the root module (already has AST and table set)
+pub fun load_module_graph(sema: *Sema, root_mod: *SemaModule) {
+    if (sema == nil || root_mod == nil || root_mod.ast == nil) { ret; }
+
+    if (!has_module_resolution(sema)) { ret; }
+
+    discover_imports(sema, root_mod);
+}
+
+# walk a module's AST to find all use declarations and load them
+fun discover_imports(sema: *Sema, mod: *SemaModule) {
+    if (mod == nil || mod.ast == nil) { ret; }
+
+    val program: *ast.Node = mod.ast;
+    if (program.kind != ast.NODE_PROGRAM && program.kind != ast.NODE_STMT_LIST) { ret; }
+
+    val stmts: *ast.List = program.info.block_stmt.stmts;
+    if (stmts == nil) { ret; }
+
+    var i: i32 = 0;
+    for (i < stmts.count) {
+        val node: *ast.Node = stmts.nodes[i];
+        if (node != nil) {
+            process_use_node(sema, mod, node);
+        }
+        i = i + 1;
+    }
+}
+
+# process a top-level node looking for use declarations
+fun process_use_node(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
+    if (node == nil) { ret; }
+
+    if (node.kind == ast.NODE_DECL_USE) {
+        load_use_decl(sema, mod, node);
+        ret;
+    }
+
+    # pub wraps an inner declaration
+    if (node.kind == ast.NODE_DECL_PUB) {
+        val inner: *ast.Node = node.info.wrapper.inner;
+        if (inner != nil && inner.kind == ast.NODE_DECL_USE) {
+            load_use_decl(sema, mod, inner);
+        }
+        ret;
+    }
+
+    # comptime conditionals may contain use declarations
+    if (node.kind == ast.NODE_COMPTIME_IF || node.kind == ast.NODE_COMPTIME_OR) {
+        process_comptime_use(sema, mod, node);
+        ret;
+    }
+}
+
+# evaluate a comptime conditional and process use declarations in the taken branch
+fun process_comptime_use(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
+    if (node == nil) { ret; }
+    if (node.kind != ast.NODE_COMPTIME_IF && node.kind != ast.NODE_COMPTIME_OR) { ret; }
+
+    val eval_res: Result[bool, str] = eval_comptime_cond(sema, node);
+    if (result_is_err[bool, str](eval_res)) { ret; }
+
+    val cond_true: bool = result_unwrap_ok[bool, str](eval_res);
+    if (cond_true) {
+        # process the body of the taken branch
+        val body: *ast.Node = node.info.cond_stmt.body;
+        if (body != nil) {
+            process_comptime_body_uses(sema, mod, body);
+        }
+        # trim dead else branch
+        node.info.cond_stmt.or_branch = nil;
+    } or {
+        # condition false: null the body, try the else branch
+        node.info.cond_stmt.body = nil;
+        val or_branch: *ast.Node = node.info.cond_stmt.or_branch;
+        if (or_branch != nil) {
+            process_comptime_use(sema, mod, or_branch);
+            # pull the taken body up
+            node.info.cond_stmt.body = or_branch.info.cond_stmt.body;
+        }
+    }
+}
+
+# process use declarations inside a comptime body
+fun process_comptime_body_uses(sema: *Sema, mod: *SemaModule, body: *ast.Node) {
+    if (body == nil) { ret; }
+
+    if (body.kind == ast.NODE_STMT_BLOCK || body.kind == ast.NODE_STMT_LIST) {
+        val stmts: *ast.List = body.info.block_stmt.stmts;
+        if (stmts == nil) { ret; }
+        var i: i32 = 0;
+        for (i < stmts.count) {
+            val node: *ast.Node = stmts.nodes[i];
+            if (node != nil) {
+                process_use_node(sema, mod, node);
+            }
+            i = i + 1;
+        }
+        ret;
+    }
+
+    # single declaration
+    process_use_node(sema, mod, body);
+}
+
+# load a module referenced by a use declaration
+fun load_use_decl(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
+    if (node == nil || node.kind != ast.NODE_DECL_USE) { ret; }
+
+    val module_path: str = node.info.use_decl.path;
+    val alias: str = node.info.use_decl.alias;
+
+    if (module_path == nil) {
+        report_error_node(sema, mod, node, "use statement has null module path");
+        ret;
+    }
+
+    # load or find the target module
+    val target_mod: *SemaModule = load_module(sema, mod, module_path, node);
+    if (target_mod == nil) { ret; }
+
+    # register the import relationship
+    if (alias != nil) {
+        add_alias(sema, mod, alias, target_mod);
+    } or {
+        add_import(sema, mod, module_path, target_mod);
+    }
+
+    # register reverse dependency
+    add_dependent(sema, target_mod, mod);
+}
+
+# load a module by its dot-separated path, or return cached if already loaded
+fun load_module(sema: *Sema, requester: *SemaModule, mod_path: str, use_node: *ast.Node) *SemaModule {
+    if (sema == nil || mod_path == nil) { ret nil; }
+
+    # check if already loaded
+    val existing: *SemaModule = find_module(sema, mod_path);
+    if (existing != nil) { ret existing; }
+
+    # resolve to file path
+    val file_path: str = resolve_module_path(sema, mod_path);
+    if (file_path == nil) {
+        report_error_node(sema, requester, use_node, "failed to resolve module path");
+        ret nil;
+    }
+
+    # read file
+    val read_res: Result[str, str] = utilfs.read_file(file_path, sema.alloc);
+    if (result_is_err[str, str](read_res)) {
+        report_error_node(sema, requester, use_node, "failed to read module file");
+        ret nil;
+    }
+    val source: str = result_unwrap_ok[str, str](read_res);
+
+    # parse
+    val parse_res: parser.ParseResult = parser.parse(source, sema.alloc);
+    if (!parse_res.ok) {
+        report_error_node(sema, requester, use_node, "failed to parse module");
+        ret nil;
+    }
+
+    # create module
+    val new_mod: *SemaModule = create_module(sema, mod_path, file_path, source, parse_res.root);
+    if (new_mod == nil) {
+        report_error_node(sema, requester, use_node, "failed to create module record");
+        ret nil;
+    }
+
+    # create symbol table for this module
+    val table_res: Result[symbol.Table, str] = symbol.init(sema.alloc);
+    if (result_is_err[symbol.Table, str](table_res)) {
+        report_error_node(sema, requester, use_node, "failed to create module symbol table");
+        ret nil;
+    }
+    val table_ptr_res: Result[*symbol.Table, allocator.AllocError] =
+        allocator.allocator_alloc[symbol.Table](sema.alloc, 1);
+    if (result_is_err[*symbol.Table, allocator.AllocError](table_ptr_res)) {
+        ret nil;
+    }
+    val table_ptr: *symbol.Table = result_unwrap_ok[*symbol.Table, allocator.AllocError](table_ptr_res);
+    @table_ptr = result_unwrap_ok[symbol.Table, str](table_res);
+    new_mod.table = table_ptr;
+
+    # add to graph (prepend — dependency-first order)
+    add_module(sema, new_mod);
+
+    # recursively discover imports in the new module
+    discover_imports(sema, new_mod);
+
+    ret new_mod;
+}
+
+# resolve a dot-separated module path to a filesystem path
+#
+# checks in order: project source, include paths, dependencies.
+# first match wins.
+# ---
+# sema:        analyzer context
+# module_path: dot-separated module path
+# ret:         filesystem path or nil if not found
+fun resolve_module_path(sema: *Sema, module_path: str) str {
+    if (sema == nil || module_path == nil) { ret nil; }
+
+    val mp_len: usize = str_len(module_path);
+
+    # tier 1: project source mapping
+    if (sema.project_id != nil && sema.src_root != nil) {
+        val pid_len: usize = str_len(sema.project_id);
+        if (mp_len > pid_len && str_starts_with(module_path, sema.project_id)
+            && module_path[pid_len] == '.') {
+            val rest: str = (module_path::usize + pid_len + 1)::str;
+            val path: str = build_file_path(sema, sema.src_root, rest);
+            if (path != nil) { ret path; }
+        }
+        # exact match (just the project_id itself)
+        if (mp_len == pid_len && str_equals(module_path, sema.project_id)) {
+            val path: str = build_file_path(sema, sema.src_root, "");
+            if (path != nil) { ret path; }
+        }
+    }
+
+    # tier 2: include path mappings
+    if (sema.includes != nil) {
+        var ii: i32 = 0;
+        for (ii < sema.include_count) {
+            val inc: *config.IncludePath = ?sema.includes[ii];
+            if (inc.prefix != nil && inc.dir != nil) {
+                val pfx_len: usize = str_len(inc.prefix);
+                if (mp_len > pfx_len && str_starts_with(module_path, inc.prefix)
+                    && module_path[pfx_len] == '.') {
+                    val rest: str = (module_path::usize + pfx_len + 1)::str;
+                    val path: str = build_file_path(sema, inc.dir, rest);
+                    if (path != nil) { ret path; }
+                }
+            }
+            ii = ii + 1;
+        }
+    }
+
+    # tier 3: dependency resolution
+    if (sema.deps != nil && sema.dep_root != nil) {
+        var di: i32 = 0;
+        for (di < sema.dep_count) {
+            val dep: *config.Dep = ?sema.deps[di];
+            if (dep.name != nil) {
+                val dep_pid: str = load_dep_project_id(sema, dep.name);
+                if (dep_pid != nil) {
+                    val dpid_len: usize = str_len(dep_pid);
+                    if (mp_len > dpid_len && str_starts_with(module_path, dep_pid)
+                        && module_path[dpid_len] == '.') {
+                        val rest: str = (module_path::usize + dpid_len + 1)::str;
+                        val base_dir: str = build_dep_src_dir(sema, dep.name);
+                        if (base_dir != nil) {
+                            val path: str = build_file_path(sema, base_dir, rest);
+                            if (path != nil) { ret path; }
+                        }
+                    }
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    ret nil;
+}
+
+# build a file path from a base directory and a dot-separated rest path
+# converts dots to slashes and appends ".mach"
+# ---
+# sema:     analyzer context
+# base_dir: root directory
+# rest:     dot-separated remaining path (may be empty)
+# ret:      filesystem path or nil on failure
+fun build_file_path(sema: *Sema, base_dir: str, rest: str) str {
+    if (sema == nil || base_dir == nil) { ret nil; }
+
+    val dir_len: usize = str_len(base_dir);
+    var rest_len: usize = 0;
+    if (rest != nil) { rest_len = str_len(rest); }
+
+    # base_dir + "/" + rest(dots→slashes) + ".mach" + NUL
+    val total: usize = dir_len + 1 + rest_len + 5 + 1;
+
+    val r: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](sema.alloc, total);
+    if (result_is_err[*u8, allocator.AllocError](r)) { ret nil; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](r);
+
+    var p: usize = 0;
+
+    # copy base_dir
+    var i: usize = 0;
+    for (i < dir_len) {
+        buf[p] = base_dir[i];
+        p = p + 1;
+        i = i + 1;
+    }
+
+    # separator
+    if (dir_len > 0 && base_dir[dir_len - 1] != '/') {
+        buf[p] = '/';
+        p = p + 1;
+    }
+
+    # copy rest, replacing dots with slashes
+    if (rest != nil && rest_len > 0) {
+        i = 0;
+        for (i < rest_len) {
+            if (rest[i] == '.') {
+                buf[p] = '/';
+            } or {
+                buf[p] = rest[i];
+            }
+            p = p + 1;
+            i = i + 1;
+        }
+    }
+
+    # append ".mach"
+    buf[p] = '.'; p = p + 1;
+    buf[p] = 'm'; p = p + 1;
+    buf[p] = 'a'; p = p + 1;
+    buf[p] = 'c'; p = p + 1;
+    buf[p] = 'h'; p = p + 1;
+    buf[p] = 0;
+
+    ret (buf::&u8)::str;
+}
+
+# build the src directory for a dependency: {dep_root}/{dep_name}/src
+fun build_dep_src_dir(sema: *Sema, dep_name: str) str {
+    if (sema == nil || sema.dep_root == nil || dep_name == nil) { ret nil; }
+
+    val root_len: usize = str_len(sema.dep_root);
+    val name_len: usize = str_len(dep_name);
+    val total: usize = root_len + 1 + name_len + 4 + 1; # "/src\0"
+
+    val r: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](sema.alloc, total);
+    if (result_is_err[*u8, allocator.AllocError](r)) { ret nil; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](r);
+
+    var p: usize = 0;
+
+    var i: usize = 0;
+    for (i < root_len) {
+        buf[p] = sema.dep_root[i];
+        p = p + 1;
+        i = i + 1;
+    }
+
+    if (root_len > 0 && sema.dep_root[root_len - 1] != '/') {
+        buf[p] = '/';
+        p = p + 1;
+    }
+
+    i = 0;
+    for (i < name_len) {
+        buf[p] = dep_name[i];
+        p = p + 1;
+        i = i + 1;
+    }
+
+    buf[p] = '/'; p = p + 1;
+    buf[p] = 's'; p = p + 1;
+    buf[p] = 'r'; p = p + 1;
+    buf[p] = 'c'; p = p + 1;
+    buf[p] = 0;
+
+    ret (buf::&u8)::str;
+}
+
+# load a dependency's project ID from its mach.toml
+fun load_dep_project_id(sema: *Sema, dep_name: str) str {
+    if (sema == nil || sema.dep_root == nil || dep_name == nil) { ret nil; }
+
+    # build path: {dep_root}/{dep_name}/mach.toml
+    val root_len: usize = str_len(sema.dep_root);
+    val name_len: usize = str_len(dep_name);
+    val total: usize = root_len + 1 + name_len + 10 + 1; # "/mach.toml\0"
+
+    val r: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](sema.alloc, total);
+    if (result_is_err[*u8, allocator.AllocError](r)) { ret nil; }
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](r);
+
+    var p: usize = 0;
+    var i: usize = 0;
+    for (i < root_len) {
+        buf[p] = sema.dep_root[i];
+        p = p + 1;
+        i = i + 1;
+    }
+    if (root_len > 0 && sema.dep_root[root_len - 1] != '/') {
+        buf[p] = '/';
+        p = p + 1;
+    }
+    i = 0;
+    for (i < name_len) {
+        buf[p] = dep_name[i];
+        p = p + 1;
+        i = i + 1;
+    }
+    buf[p] = '/'; p = p + 1;
+    buf[p] = 'm'; p = p + 1;
+    buf[p] = 'a'; p = p + 1;
+    buf[p] = 'c'; p = p + 1;
+    buf[p] = 'h'; p = p + 1;
+    buf[p] = '.'; p = p + 1;
+    buf[p] = 't'; p = p + 1;
+    buf[p] = 'o'; p = p + 1;
+    buf[p] = 'm'; p = p + 1;
+    buf[p] = 'l'; p = p + 1;
+    buf[p] = 0;
+
+    val config_path: str = (buf::&u8)::str;
+    val cfg_res: Result[config.Config, str] = config.load(config_path, sema.alloc);
+    if (result_is_err[config.Config, str](cfg_res)) { ret nil; }
+
+    val cfg: config.Config = result_unwrap_ok[config.Config, str](cfg_res);
+    ret cfg.id;
+}

@@ -1,0 +1,1310 @@
+# semantic analyzer: type resolution, symbol binding, and validation.
+#
+# provides a phased analysis pipeline that processes modules in dependency
+# order. designed for both batch compilation (analyze) and incremental
+# re-analysis (update_module) for LSP usage.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.option;
+use std.types.result;
+
+use allocator: std.allocator;
+use print:     std.print;
+
+use ast:      mach.compiler.frontend.ast;
+use symbol:   mach.compiler.frontend.symbol;
+use token:    mach.compiler.frontend.token;
+use type:     mach.compiler.frontend.type;
+use comptime: mach.compiler.frontend.comptime;
+use target:   mach.compiler.target;
+use abi:      mach.compiler.target.abi;
+use config:   mach.config.config;
+
+use mach.compiler.frontend.sema.loader;
+use mach.compiler.frontend.sema.collect;
+use mach.compiler.frontend.sema.resolve;
+use mach.compiler.frontend.sema.body;
+use mach.compiler.frontend.sema.check;
+
+# analysis phase constants
+pub val PHASE_LOADED:   i32 = 0;
+pub val PHASE_COLLECTED: i32 = 1;
+pub val PHASE_RESOLVED: i32 = 2;
+pub val PHASE_BODIES:   i32 = 3;
+pub val PHASE_CHECKED:  i32 = 4;
+
+# a semantic analysis error
+# ---
+# pos:       byte position in source
+# line:      1-based line number
+# col:       1-based column number
+# file_path: path to source file
+# message:   error description
+pub rec SemaError {
+    pos:       i32;
+    line:      i32;
+    col:       i32;
+    file_path: str;
+    message:   str;
+}
+
+# tracks an aliased import (use alias: module.path;)
+# ---
+# alias:  the alias name
+# module: pointer to the loaded module
+# next:   linked list pointer
+pub rec ModuleAlias {
+    alias:  str;
+    module: *SemaModule;
+    next:   *ModuleAlias;
+}
+
+# tracks a bare import (use module.path;)
+# ---
+# path:   the module path
+# module: pointer to the loaded module
+# next:   linked list pointer
+pub rec ModuleImport {
+    path:   str;
+    module: *SemaModule;
+    next:   *ModuleImport;
+}
+
+# reverse dependency link for invalidation
+# ---
+# module: a module that imports the owning module
+# next:   linked list pointer
+pub rec ModuleDependent {
+    module: *SemaModule;
+    next:   *ModuleDependent;
+}
+
+# a loaded module in the analysis graph
+# ---
+# path:            dot-separated module path
+# file_path:       filesystem path to source
+# source:          source text
+# ast:             parsed AST root
+# table:           module-local symbol table
+# is_analyzed:     true when all phases complete
+# phase:           highest completed analysis phase (PHASE_*)
+# next:            linked list of all modules
+# aliases:         aliased imports from this module
+# alias_count:     number of aliases
+# imports:         bare imports from this module
+# import_count:    number of bare imports
+# dependents:      modules that import this one
+# dependent_count: number of dependents
+pub rec SemaModule {
+    path:            str;
+    file_path:       str;
+    source:          str;
+    ast:             *ast.Node;
+    table:           *symbol.Table;
+    is_analyzed:     bool;
+    next:            *SemaModule;
+    aliases:         *ModuleAlias;
+    alias_count:     i32;
+    imports:         *ModuleImport;
+    import_count:    i32;
+    dependents:      *ModuleDependent;
+    dependent_count: i32;
+    phase:           i32;
+}
+
+# cached generic type instantiation
+# ---
+# generic_args: array of type arguments
+# arg_count:    number of type arguments
+# result_type:  the instantiated concrete type
+# next:         linked list pointer
+pub rec CachedInstantiation {
+    generic_args: **type.Type;
+    arg_count:    i32;
+    result_type:  *type.Type;
+    next:         *CachedInstantiation;
+}
+
+# concrete instantiation of a generic function
+# ---
+# func_ast:      original function AST node
+# mangled_name:  unique name for this instantiation
+# func_type:     instantiated function type
+# param_names:   generic param names
+# param_types:   concrete types bound to params
+# param_count:   number of type parameters
+# origin_module: module where the function is defined
+# next:          linked list pointer
+pub rec FunctionInstantiation {
+    func_ast:      *ast.Node;
+    mangled_name:  str;
+    func_type:     *type.Type;
+    param_names:   *str;
+    param_types:   **type.Type;
+    param_count:   i32;
+    origin_module: *SemaModule;
+    next:          *FunctionInstantiation;
+}
+
+# a single entry in the instantiation dedup hash table
+# ---
+# key:   mangled name string (nil if slot is empty)
+# value: persistent mangled name pointer
+pub rec InstMapEntry {
+    key:   str;
+    value: str;
+}
+
+val INST_MAP_INIT_CAP: i32 = 64;
+
+# open-addressing hash table for O(1) instantiation dedup
+# ---
+# entries:  flat array of buckets
+# count:    number of occupied slots
+# capacity: current bucket count (power of two)
+pub rec InstMap {
+    entries:  *InstMapEntry;
+    count:    i32;
+    capacity: i32;
+}
+
+# function context passed through body resolution and checking
+# ---
+# func_node: the function declaration node
+# ret_type:  the function's return type
+pub rec FnContext {
+    func_node: *ast.Node;
+    ret_type:  *type.Type;
+}
+
+# the semantic analyzer
+# ---
+# alloc:           allocator for all sema allocations
+# types:           type cache for creating types
+# modules:         linked list of loaded modules (dependency order)
+# module_count:    number of modules loaded
+# project_id:      project identifier for module path prefix
+# src_root:        source root directory path
+# dep_root:        dependency root directory path
+# deps:            dependency configurations
+# dep_count:       number of dependencies
+# includes:        include path mappings
+# include_count:   number of includes
+# generic_cache:   cache of generic type instantiations
+# func_insts:      linked list of generic function instantiations
+# func_inst_count: number of function instantiations
+# func_inst_map:   hash table for instantiation dedup
+# errors:          array of semantic errors
+# error_count:     number of errors
+# error_cap:       capacity of errors array
+# had_error:       whether any error occurred
+# va_list_size:    ABI-specific va_list size
+# va_list_align:   ABI-specific va_list alignment
+# comptime_ctx:    compile-time evaluation context
+# current_module:  set after analysis for pipeline compatibility
+# file_path:       set after analysis for pipeline compatibility
+# source:          set after analysis for pipeline compatibility
+# symbols:         set after analysis for pipeline compatibility
+pub rec Sema {
+    alloc:           *allocator.Allocator;
+    types:           *type.TypeCache;
+
+    modules:         *SemaModule;
+    module_count:    i32;
+
+    project_id:      str;
+    src_root:        str;
+    dep_root:        str;
+    deps:            *config.Dep;
+    dep_count:       i32;
+    includes:        *config.IncludePath;
+    include_count:   i32;
+
+    generic_cache:   *CachedInstantiation;
+    func_insts:      *FunctionInstantiation;
+    func_inst_count: i32;
+    func_inst_map:   InstMap;
+
+    errors:          *SemaError;
+    error_count:     i32;
+    error_cap:       i32;
+    had_error:       bool;
+
+    va_list_size:    usize;
+    va_list_align:   usize;
+
+    comptime_ctx:    *comptime.ComptimeContext;
+
+    # pipeline compatibility fields (set once after analysis)
+    current_module:  *SemaModule;
+    file_path:       str;
+    source:          str;
+    symbols:         *symbol.Table;
+}
+
+# initialize a new semantic analyzer
+# ---
+# alloc: allocator for sema allocations
+# tgt:   target configuration
+# ret:   initialized sema context
+pub fun init(alloc: *allocator.Allocator, tgt: target.Target) Sema {
+    var sema: Sema;
+    sema.alloc = alloc;
+
+    # create type cache
+    val types_res: Result[type.TypeCache, str] = type.init_cache(alloc, tgt.isa.ptr_size, tgt.isa.ptr_align);
+    if (result_is_ok[type.TypeCache, str](types_res)) {
+        val ctx_res: Result[*type.TypeCache, allocator.AllocError] = allocator.allocator_alloc[type.TypeCache](alloc, 1);
+        if (result_is_ok[*type.TypeCache, allocator.AllocError](ctx_res)) {
+            sema.types = result_unwrap_ok[*type.TypeCache, allocator.AllocError](ctx_res);
+            @sema.types = result_unwrap_ok[type.TypeCache, str](types_res);
+        } or {
+            sema.types = nil;
+        }
+    } or {
+        sema.types = nil;
+    }
+
+    sema.symbols = nil;
+    sema.modules = nil;
+    sema.module_count = 0;
+    sema.project_id = nil;
+    sema.src_root = nil;
+    sema.dep_root = nil;
+    sema.deps = nil;
+    sema.dep_count = 0;
+    sema.includes = nil;
+    sema.include_count = 0;
+    sema.generic_cache = nil;
+    sema.func_insts = nil;
+    sema.func_inst_count = 0;
+    sema.func_inst_map.entries = nil;
+    sema.func_inst_map.count = 0;
+    sema.func_inst_map.capacity = 0;
+    sema.errors = nil;
+    sema.error_count = 0;
+    sema.error_cap = 0;
+    sema.had_error = false;
+    sema.current_module = nil;
+    sema.file_path = nil;
+    sema.source = nil;
+    sema.comptime_ctx = nil;
+
+    # extract va_list dimensions from the target ABI
+    var target_abi: abi.ABI = tgt.abi;
+    val va_layout: abi.VarargLayout = target_abi.vararg_layout(target_abi.ctx);
+    sema.va_list_size = va_layout.va_list_size;
+    sema.va_list_align = va_layout.va_list_align;
+
+    ret sema;
+}
+
+# cleanup sema resources
+pub fun dnit(sema: *Sema) {
+    if (sema == nil) {
+        ret;
+    }
+    # arena allocation — no per-object cleanup needed
+}
+
+# set project context for module import resolution
+# ---
+# sema:       analyzer context
+# project_id: project identifier for module path prefix
+# src_root:   source root directory path
+# dep_root:   dependency root directory path
+# deps:       dependency configurations
+# dep_count:  number of dependencies
+pub fun set_module_roots(sema: *Sema, project_id: str, src_root: str, dep_root: str, deps: *config.Dep, dep_count: i32) {
+    if (sema == nil) { ret; }
+    sema.project_id = project_id;
+    sema.src_root = src_root;
+    sema.dep_root = dep_root;
+    sema.deps = deps;
+    sema.dep_count = dep_count;
+}
+
+# set include path mappings for -I flag resolution
+# ---
+# sema:          analyzer context
+# includes:      include path mappings
+# include_count: number of includes
+pub fun set_includes(sema: *Sema, includes: *config.IncludePath, include_count: i32) {
+    if (sema == nil) { ret; }
+    sema.includes = includes;
+    sema.include_count = include_count;
+}
+
+# check if module resolution is configured
+# ---
+# sema: analyzer context
+# ret:  true if module roots are configured
+pub fun has_module_resolution(sema: *Sema) bool {
+    if (sema == nil) { ret false; }
+    if (sema.project_id != nil && sema.src_root != nil) { ret true; }
+    if (sema.deps != nil && sema.dep_count > 0 && sema.dep_root != nil) { ret true; }
+    if (sema.includes != nil && sema.include_count > 0) { ret true; }
+    ret false;
+}
+
+# run full semantic analysis on a parsed AST
+#
+# creates the module graph, then runs all analysis phases in order.
+# sets pipeline compatibility fields on completion.
+# ---
+# sema:   analyzer context
+# module: module root AST node
+# file:   source file path
+# src:    source text
+# cctx:   compile-time context (or nil)
+# ret:    Ok(true) on success, Err(str) on failure
+pub fun analyze(sema: *Sema, module: *ast.Node, file: str, src: str, cctx: *comptime.ComptimeContext) Result[bool, str] {
+    if (sema == nil || module == nil) {
+        ret err[bool, str]("invalid arguments");
+    }
+
+    sema.comptime_ctx = cctx;
+
+    # reset error state
+    sema.error_count = 0;
+    sema.had_error = false;
+
+    # determine module path
+    var mod_path: str = "main";
+    if (sema.project_id != nil) {
+        mod_path = sema.project_id;
+    }
+
+    # create root module
+    val root_mod: *SemaModule = create_module(sema, mod_path, file, src, module);
+    if (root_mod == nil) {
+        ret err[bool, str]("failed to create root module");
+    }
+
+    # create symbol table for root module
+    val table_res: Result[symbol.Table, str] = symbol.init(sema.alloc);
+    if (result_is_err[symbol.Table, str](table_res)) {
+        ret err[bool, str]("failed to create symbol table");
+    }
+    val table_ptr_res: Result[*symbol.Table, allocator.AllocError] =
+        allocator.allocator_alloc[symbol.Table](sema.alloc, 1);
+    if (result_is_err[*symbol.Table, allocator.AllocError](table_ptr_res)) {
+        ret err[bool, str]("failed to allocate symbol table");
+    }
+    val table_ptr: *symbol.Table = result_unwrap_ok[*symbol.Table, allocator.AllocError](table_ptr_res);
+    @table_ptr = result_unwrap_ok[symbol.Table, str](table_res);
+    root_mod.table = table_ptr;
+
+    # phase 0: load module graph (discover all imports, parse all modules)
+    load_module_graph(sema, root_mod);
+    if (sema.had_error) {
+        print_errors(sema);
+        ret err[bool, str]("module loading failed");
+    }
+
+    # phase 1: collect declarations for all modules
+    collect_all_modules(sema);
+    if (sema.had_error) {
+        print_errors(sema);
+        ret err[bool, str]("declaration collection failed");
+    }
+
+    # phase 2: resolve types for all modules
+    resolve_all_modules(sema);
+    if (sema.had_error) {
+        print_errors(sema);
+        ret err[bool, str]("type resolution failed");
+    }
+
+    # phase 3: resolve function bodies for all modules
+    resolve_all_bodies(sema);
+    if (sema.had_error) {
+        print_errors(sema);
+        ret err[bool, str]("body resolution failed");
+    }
+
+    # phase 4: validate all modules
+    check_all_modules(sema);
+    if (sema.had_error) {
+        print_errors(sema);
+        ret err[bool, str]("validation failed");
+    }
+
+    # set pipeline compatibility fields
+    sema.current_module = root_mod;
+    sema.file_path = file;
+    sema.source = src;
+    sema.symbols = root_mod.table;
+
+    ret ok[bool, str](true);
+}
+
+# get the global symbol table (root module's table)
+# ---
+# sema: analyzer context
+# ret:  symbol table or nil
+pub fun get_symbol_table(sema: *Sema) *symbol.Table {
+    if (sema == nil) { ret nil; }
+    ret sema.symbols;
+}
+
+# get the type cache
+# ---
+# sema: analyzer context
+# ret:  type cache or nil
+pub fun get_type_cache(sema: *Sema) *type.TypeCache {
+    if (sema == nil) { ret nil; }
+    ret sema.types;
+}
+
+# get all loaded modules (excluding root)
+# ---
+# sema:      analyzer context
+# out_mods:  array to fill with module pointers
+# max_count: maximum number of modules to return
+# ret:       number of modules written
+pub fun get_loaded_modules(sema: *Sema, out_mods: **SemaModule, max_count: i32) i32 {
+    if (sema == nil || out_mods == nil || max_count <= 0) { ret 0; }
+
+    var count: i32 = 0;
+    var mod: *SemaModule = sema.modules;
+    for (mod != nil && count < max_count) {
+        out_mods[count] = mod;
+        count = count + 1;
+        mod = mod.next;
+    }
+
+    ret count;
+}
+
+# get the head of the generic function instantiation list
+# ---
+# sema: analyzer context
+# ret:  first instantiation or nil
+pub fun get_func_insts(sema: *Sema) *FunctionInstantiation {
+    if (sema == nil) { ret nil; }
+    ret sema.func_insts;
+}
+
+# allocate and initialize a SemaModule
+# ---
+# sema:      analyzer context
+# path:      dot-separated module path
+# file_path: filesystem path to source
+# source:    source text
+# root:      parsed AST root
+# ret:       allocated module or nil on failure
+pub fun create_module(sema: *Sema, path: str, file_path: str, source: str, root: *ast.Node) *SemaModule {
+    if (sema == nil) { ret nil; }
+
+    val res: Result[*SemaModule, allocator.AllocError] =
+        allocator.allocator_zalloc[SemaModule](sema.alloc, 1);
+    if (result_is_err[*SemaModule, allocator.AllocError](res)) { ret nil; }
+
+    val mod: *SemaModule = result_unwrap_ok[*SemaModule, allocator.AllocError](res);
+    mod.path = path;
+    mod.file_path = file_path;
+    mod.source = source;
+    mod.ast = root;
+    mod.is_analyzed = false;
+    mod.phase = PHASE_LOADED;
+    mod.next = nil;
+    mod.aliases = nil;
+    mod.alias_count = 0;
+    mod.imports = nil;
+    mod.import_count = 0;
+    mod.dependents = nil;
+    mod.dependent_count = 0;
+    mod.table = nil;
+
+    ret mod;
+}
+
+# add a module to the graph (prepend — gives dependency-first iteration)
+# ---
+# sema: analyzer context
+# mod:  module to add
+pub fun add_module(sema: *Sema, mod: *SemaModule) {
+    if (sema == nil || mod == nil) { ret; }
+    mod.next = sema.modules;
+    sema.modules = mod;
+    sema.module_count = sema.module_count + 1;
+}
+
+# find a loaded module by its dot-separated path
+# ---
+# sema: analyzer context
+# path: module path to find
+# ret:  module or nil
+pub fun find_module(sema: *Sema, path: str) *SemaModule {
+    if (sema == nil || path == nil) { ret nil; }
+    var mod: *SemaModule = sema.modules;
+    for (mod != nil) {
+        if (mod.path != nil && str_equals(mod.path, path)) { ret mod; }
+        mod = mod.next;
+    }
+    ret nil;
+}
+
+# add a reverse dependency link
+# ---
+# sema:      analyzer context
+# provider:  the module being imported
+# dependent: the module that imports provider
+pub fun add_dependent(sema: *Sema, provider: *SemaModule, dependent: *SemaModule) {
+    if (sema == nil || provider == nil || dependent == nil) { ret; }
+
+    val res: Result[*ModuleDependent, allocator.AllocError] =
+        allocator.allocator_zalloc[ModuleDependent](sema.alloc, 1);
+    if (result_is_err[*ModuleDependent, allocator.AllocError](res)) { ret; }
+
+    val dep: *ModuleDependent = result_unwrap_ok[*ModuleDependent, allocator.AllocError](res);
+    dep.module = dependent;
+    dep.next = provider.dependents;
+    provider.dependents = dep;
+    provider.dependent_count = provider.dependent_count + 1;
+}
+
+# register an aliased import on a module
+# ---
+# sema:       analyzer context
+# on_module:  the module that has the import
+# alias:      alias name
+# target_mod: the imported module
+pub fun add_alias(sema: *Sema, on_module: *SemaModule, alias: str, target_mod: *SemaModule) {
+    if (sema == nil || on_module == nil || alias == nil || target_mod == nil) { ret; }
+
+    val res: Result[*ModuleAlias, allocator.AllocError] =
+        allocator.allocator_zalloc[ModuleAlias](sema.alloc, 1);
+    if (result_is_err[*ModuleAlias, allocator.AllocError](res)) { ret; }
+
+    val ma: *ModuleAlias = result_unwrap_ok[*ModuleAlias, allocator.AllocError](res);
+    ma.alias = alias;
+    ma.module = target_mod;
+    ma.next = on_module.aliases;
+    on_module.aliases = ma;
+    on_module.alias_count = on_module.alias_count + 1;
+}
+
+# register a bare import on a module
+# ---
+# sema:       analyzer context
+# on_module:  the module that has the import
+# path:       module path
+# target_mod: the imported module
+pub fun add_import(sema: *Sema, on_module: *SemaModule, path: str, target_mod: *SemaModule) {
+    if (sema == nil || on_module == nil || path == nil || target_mod == nil) { ret; }
+
+    val res: Result[*ModuleImport, allocator.AllocError] =
+        allocator.allocator_zalloc[ModuleImport](sema.alloc, 1);
+    if (result_is_err[*ModuleImport, allocator.AllocError](res)) { ret; }
+
+    val mi: *ModuleImport = result_unwrap_ok[*ModuleImport, allocator.AllocError](res);
+    mi.path = path;
+    mi.module = target_mod;
+    mi.next = on_module.imports;
+    on_module.imports = mi;
+    on_module.import_count = on_module.import_count + 1;
+}
+
+# unified symbol lookup
+#
+# searches for a symbol by name in the context of a module:
+# first checks for dotted path (alias.Name), then local scope chain,
+# then bare imports (public symbols only).
+# ---
+# sema: analyzer context
+# mod:  module context for the lookup
+# name: symbol name to find
+# ret:  symbol or nil
+pub fun lookup_symbol(sema: *Sema, mod: *SemaModule, name: str) *symbol.Symbol {
+    if (sema == nil || mod == nil || name == nil) { ret nil; }
+
+    # check for dotted path (alias.member)
+    val dot: i32 = str_index_of(name, '.');
+    if (dot > 0) {
+        val alias_len: usize = dot::usize;
+        val alias_buf: [256]u8;
+        if (alias_len < 255) {
+            var i: usize = 0;
+            for (i < alias_len) {
+                alias_buf[i] = name[i];
+                i = i + 1;
+            }
+            alias_buf[alias_len] = 0;
+            val alias_name: str = (?alias_buf[0])::str;
+            val target_mod: *SemaModule = lookup_alias(mod, alias_name);
+            if (target_mod != nil && target_mod.table != nil) {
+                val member_name: str = (name::usize + alias_len + 1)::str;
+                val member_opt: Option[*symbol.Symbol] =
+                    symbol.table_lookup(target_mod.table, member_name);
+                if (option_is_some[*symbol.Symbol](member_opt)) {
+                    val sym: *symbol.Symbol = option_unwrap[*symbol.Symbol](member_opt);
+                    if (sym.is_public) { ret sym; }
+                }
+            }
+        }
+        ret nil;
+    }
+
+    # check local symbol table (walks scope chain)
+    if (mod.table != nil) {
+        val local_opt: Option[*symbol.Symbol] = symbol.table_lookup(mod.table, name);
+        if (option_is_some[*symbol.Symbol](local_opt)) {
+            ret option_unwrap[*symbol.Symbol](local_opt);
+        }
+    }
+
+    # check bare imports (public symbols only)
+    var imp: *ModuleImport = mod.imports;
+    for (imp != nil) {
+        if (imp.module != nil && imp.module.table != nil) {
+            val imp_opt: Option[*symbol.Symbol] =
+                symbol.table_lookup(imp.module.table, name);
+            if (option_is_some[*symbol.Symbol](imp_opt)) {
+                val sym: *symbol.Symbol = option_unwrap[*symbol.Symbol](imp_opt);
+                if (sym.is_public) { ret sym; }
+            }
+        }
+        imp = imp.next;
+    }
+
+    ret nil;
+}
+
+# look up an aliased import on a module
+# ---
+# mod:   module to search
+# alias: alias name
+# ret:   target module or nil
+pub fun lookup_alias(mod: *SemaModule, alias: str) *SemaModule {
+    if (mod == nil || alias == nil) { ret nil; }
+    var ma: *ModuleAlias = mod.aliases;
+    for (ma != nil) {
+        if (ma.alias != nil && str_equals(ma.alias, alias)) { ret ma.module; }
+        ma = ma.next;
+    }
+    ret nil;
+}
+
+# evaluate a compile-time condition node
+# ---
+# sema: analyzer context
+# node: NODE_COMPTIME_IF or NODE_COMPTIME_OR node
+# ret:  Ok(bool) with condition result, or Err on failure
+pub fun eval_comptime_cond(sema: *Sema, node: *ast.Node) Result[bool, str] {
+    if (sema == nil || node == nil) {
+        ret err[bool, str]("invalid arguments");
+    }
+    if (node.kind != ast.NODE_COMPTIME_IF && node.kind != ast.NODE_COMPTIME_OR) {
+        ret err[bool, str]("not a comptime conditional");
+    }
+
+    val cond: *ast.Node = node.info.cond_stmt.cond;
+    if (cond != nil && sema.comptime_ctx != nil) {
+        ret comptime.eval_condition(sema.comptime_ctx, cond);
+    }
+
+    # $or without condition is always true (else branch)
+    if (cond == nil && node.kind == ast.NODE_COMPTIME_OR) {
+        ret ok[bool, str](true);
+    }
+
+    ret ok[bool, str](false);
+}
+
+# find the position of a character in a string
+# ---
+# s: string to search
+# c: character to find
+# ret: index of first occurrence, or -1 if not found
+fun str_index_of(s: str, c: u8) i32 {
+    if (s == nil) { ret -1; }
+    val len: usize = str_len(s);
+    var i: usize = 0;
+    for (i < len) {
+        if (s[i] == c) { ret i::i32; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# convert a byte position to a 1-based line number
+# ---
+# source: full source text
+# pos:    byte position (0-based)
+# ret:    1-based line number
+fun pos_to_line(source: str, pos: i32) i32 {
+    if (source == nil || pos < 0) { ret 1; }
+    var line: i32 = 1;
+    var i: i32 = 0;
+    val len: i32 = str_len(source)::i32;
+    for (i < pos && i < len) {
+        if (source[i] == '\n') { line = line + 1; }
+        i = i + 1;
+    }
+    ret line;
+}
+
+# convert a byte position to a 1-based column number
+# ---
+# source: full source text
+# pos:    byte position (0-based)
+# ret:    1-based column number
+fun pos_to_col(source: str, pos: i32) i32 {
+    if (source == nil || pos < 0) { ret 1; }
+    var col: i32 = 1;
+    var i: i32 = 0;
+    val len: i32 = str_len(source)::i32;
+    for (i < pos && i < len) {
+        if (source[i] == '\n') {
+            col = 1;
+        } or {
+            col = col + 1;
+        }
+        i = i + 1;
+    }
+    ret col;
+}
+
+# record a semantic error at a token position
+# ---
+# sema:     analyzer context
+# mod:      module where the error occurred
+# tok:      token where error occurred
+# message:  error message
+pub fun report_error(sema: *Sema, mod: *SemaModule, tok: token.Token, message: str) {
+    if (sema == nil) { ret; }
+
+    sema.had_error = true;
+
+    # cap at 20 errors
+    if (sema.error_count >= 20) { ret; }
+
+    # grow errors array if needed
+    if (sema.error_count >= sema.error_cap) {
+        var new_cap: i32 = 8;
+        if (sema.error_cap > 0) { new_cap = sema.error_cap * 2; }
+
+        val r: Result[*SemaError, allocator.AllocError] = allocator.allocator_resize[SemaError](
+            sema.alloc, sema.errors, sema.error_cap::u64, new_cap::u64);
+        if (result_is_err[*SemaError, allocator.AllocError](r)) { ret; }
+
+        sema.errors = result_unwrap_ok[*SemaError, allocator.AllocError](r);
+        sema.error_cap = new_cap;
+    }
+
+    var src: str = nil;
+    var fp: str = nil;
+    if (mod != nil) {
+        src = mod.source;
+        fp = mod.file_path;
+    }
+
+    val idx: i32 = sema.error_count;
+    sema.errors[idx].pos = tok.pos;
+    sema.errors[idx].line = pos_to_line(src, tok.pos);
+    sema.errors[idx].col = pos_to_col(src, tok.pos);
+    sema.errors[idx].file_path = fp;
+    sema.errors[idx].message = message;
+    sema.error_count = sema.error_count + 1;
+}
+
+# record a semantic error at a node's token
+# ---
+# sema:    analyzer context
+# mod:     module where the error occurred
+# node:    node where error occurred
+# message: error message
+pub fun report_error_node(sema: *Sema, mod: *SemaModule, node: *ast.Node, message: str) {
+    if (node == nil) { ret; }
+    report_error(sema, mod, node.tok, message);
+}
+
+# check if there are any semantic errors
+# ---
+# sema: analyzer context
+# ret:  true if errors exist
+pub fun has_errors(sema: *Sema) bool {
+    if (sema == nil) { ret false; }
+    ret sema.error_count > 0;
+}
+
+# print a source line with a caret at the error column
+fun print_error_line(source: str, line: i32, col: i32) {
+    if (source == nil || line < 1) { ret; }
+
+    # find line start
+    var current_line: i32 = 1;
+    var line_start: i32 = 0;
+    var i: i32 = 0;
+    val len: i32 = str_len(source)::i32;
+
+    for (i < len && current_line < line) {
+        if (source[i] == '\n') {
+            current_line = current_line + 1;
+            line_start = i + 1;
+        }
+        i = i + 1;
+    }
+
+    if (current_line != line) { ret; }
+
+    # find line end
+    var line_end: i32 = line_start;
+    for (line_end < len && source[line_end] != '\n') {
+        line_end = line_end + 1;
+    }
+
+    # print line content
+    print.eprintf("  %d | ", line::i64);
+    i = line_start;
+    for (i < line_end) {
+        var ch: [2]u8;
+        ch[0] = source[i];
+        ch[1] = 0;
+        print.eprint((?ch[0])::str);
+        i = i + 1;
+    }
+    print.eprintln("");
+
+    # print caret
+    var digits: i32 = 1;
+    var tmp: i32 = line;
+    for (tmp >= 10) {
+        digits = digits + 1;
+        tmp = tmp / 10;
+    }
+    var pad: i32 = 0;
+    for (pad < digits + 2) {
+        print.eprint(" ");
+        pad = pad + 1;
+    }
+    print.eprint(" | ");
+    var c: i32 = 1;
+    for (c < col) {
+        print.eprint(" ");
+        c = c + 1;
+    }
+    print.eprintln("^");
+}
+
+# print all errors to stderr
+# ---
+# sema: analyzer context
+pub fun print_errors(sema: *Sema) {
+    if (sema == nil || sema.errors == nil || sema.error_count == 0) { ret; }
+
+    var i: i32 = 0;
+    for (i < sema.error_count) {
+        val e: *SemaError = ?sema.errors[i];
+
+        print.eprint("error: ");
+        if (e.message != nil) {
+            print.eprintln(e.message);
+        } or {
+            print.eprintln("(null message)");
+        }
+
+        if (e.file_path != nil) {
+            print.eprintlnf("%s:%d:%d", e.file_path, e.line::i64, e.col::i64);
+        } or {
+            print.eprintlnf("<unknown>:%d:%d", e.line::i64, e.col::i64);
+        }
+
+        # find the source for this error
+        var src: str = nil;
+        var mod: *SemaModule = sema.modules;
+        for (mod != nil) {
+            if (mod.file_path != nil && e.file_path != nil && str_equals(mod.file_path, e.file_path)) {
+                src = mod.source;
+                brk;
+            }
+            mod = mod.next;
+        }
+        if (src == nil && sema.current_module != nil) {
+            src = sema.current_module.source;
+        }
+
+        print_error_line(src, e.line, e.col);
+        i = i + 1;
+    }
+
+    if (sema.error_count >= 20) {
+        print.eprintlnf("%d semantic error(s) found (error limit reached)", sema.error_count::i64);
+    } or {
+        print.eprintlnf("%d semantic error(s) found", sema.error_count::i64);
+    }
+}
+
+# get errors for a specific module
+# ---
+# sema:       analyzer context
+# mod:        module to get errors for
+# out_errors: array to fill with error pointers
+# max_count:  maximum number of errors to return
+# ret:        number of errors written
+pub fun get_module_errors(sema: *Sema, mod: *SemaModule, out_errors: **SemaError, max_count: i32) i32 {
+    if (sema == nil || mod == nil || out_errors == nil || max_count <= 0) { ret 0; }
+
+    var count: i32 = 0;
+    var i: i32 = 0;
+    for (i < sema.error_count && count < max_count) {
+        val e: *SemaError = ?sema.errors[i];
+        if (e.file_path != nil && mod.file_path != nil && str_equals(e.file_path, mod.file_path)) {
+            out_errors[count] = e;
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+
+    ret count;
+}
+
+# invalidate a module back to a target phase, propagating to dependents
+# ---
+# sema:     analyzer context
+# mod:      module to invalidate
+# to_phase: target phase to reset to
+pub fun invalidate_module(sema: *Sema, mod: *SemaModule, to_phase: i32) {
+    if (sema == nil || mod == nil) { ret; }
+    if (mod.phase <= to_phase) { ret; }
+
+    mod.phase = to_phase;
+    mod.is_analyzed = false;
+
+    # propagate to dependents
+    var dep: *ModuleDependent = mod.dependents;
+    for (dep != nil) {
+        if (dep.module != nil && dep.module.phase > to_phase) {
+            # dependents need at least their types re-resolved
+            var dep_phase: i32 = to_phase;
+            if (dep_phase < PHASE_COLLECTED) {
+                dep_phase = PHASE_COLLECTED;
+            }
+            invalidate_module(sema, dep.module, dep_phase);
+        }
+        dep = dep.next;
+    }
+}
+
+# update a single module's source and re-analyze it and dependents
+# ---
+# sema:       analyzer context
+# mod_path:   module path to update
+# new_source: new source text
+# ret:        Ok(true) on success, Err(str) on failure
+pub fun update_module(sema: *Sema, mod_path: str, new_source: str) Result[bool, str] {
+    if (sema == nil || mod_path == nil || new_source == nil) {
+        ret err[bool, str]("invalid arguments");
+    }
+
+    val mod: *SemaModule = find_module(sema, mod_path);
+    if (mod == nil) {
+        ret err[bool, str]("module not found");
+    }
+
+    # replace source and re-parse
+    mod.source = new_source;
+
+    val parse_res: Result[*ast.Node, str] = parse_module_source(sema, new_source);
+    if (result_is_err[*ast.Node, str](parse_res)) {
+        ret err[bool, str]("parse failed");
+    }
+    mod.ast = result_unwrap_ok[*ast.Node, str](parse_res);
+
+    # invalidate this module and dependents
+    invalidate_module(sema, mod, PHASE_LOADED);
+
+    # clear errors for this module
+    clear_module_errors(sema, mod);
+
+    # re-run phases on invalidated modules in dependency order
+    run_phases_on_invalidated(sema);
+
+    if (sema.had_error) {
+        ret err[bool, str]("analysis errors");
+    }
+
+    ret ok[bool, str](true);
+}
+
+# re-parse a module's source text
+fun parse_module_source(sema: *Sema, source: str) Result[*ast.Node, str] {
+    if (sema == nil || source == nil) {
+        ret err[*ast.Node, str]("invalid arguments");
+    }
+
+    use parser: mach.compiler.frontend.parser;
+    val pr: parser.ParseResult = parser.parse(source, sema.alloc);
+    if (!pr.ok) {
+        ret err[*ast.Node, str]("parse failed");
+    }
+
+    ret ok[*ast.Node, str](pr.root);
+}
+
+# clear errors associated with a specific module
+fun clear_module_errors(sema: *Sema, mod: *SemaModule) {
+    if (sema == nil || mod == nil || sema.errors == nil) { ret; }
+
+    # compact errors array, removing entries for this module
+    var write: i32 = 0;
+    var read: i32 = 0;
+    for (read < sema.error_count) {
+        val e: *SemaError = ?sema.errors[read];
+        val keep: bool = e.file_path == nil || mod.file_path == nil ||
+            !str_equals(e.file_path, mod.file_path);
+        if (keep) {
+            if (write != read) {
+                sema.errors[write] = sema.errors[read];
+            }
+            write = write + 1;
+        }
+        read = read + 1;
+    }
+    sema.error_count = write;
+    sema.had_error = sema.error_count > 0;
+}
+
+# re-run analysis phases on all modules that need it
+fun run_phases_on_invalidated(sema: *Sema) {
+    if (sema == nil) { ret; }
+
+    # collect modules that need re-analysis, then run each phase
+    var mod: *SemaModule = sema.modules;
+    for (mod != nil) {
+        if (mod.phase < PHASE_COLLECTED) {
+            collect_module(sema, mod);
+        }
+        mod = mod.next;
+    }
+    if (sema.had_error) { ret; }
+
+    mod = sema.modules;
+    for (mod != nil) {
+        if (mod.phase < PHASE_RESOLVED) {
+            resolve_module(sema, mod);
+        }
+        mod = mod.next;
+    }
+    if (sema.had_error) { ret; }
+
+    mod = sema.modules;
+    for (mod != nil) {
+        if (mod.phase < PHASE_BODIES) {
+            resolve_module_bodies(sema, mod);
+        }
+        mod = mod.next;
+    }
+    if (sema.had_error) { ret; }
+
+    mod = sema.modules;
+    for (mod != nil) {
+        if (mod.phase < PHASE_CHECKED) {
+            check_module(sema, mod);
+        }
+        mod = mod.next;
+    }
+}
+
+# instantiation hash table: FNV-1a hash
+fun inst_map_hash(s: str, cap: i32) i32 {
+    if (s == nil) { ret 0; }
+    var h: u64 = 14695981039346656037;
+    val len: usize = str_len(s);
+    var i: usize = 0;
+    for (i < len) {
+        h = h ^ s[i]::u64;
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    ret (h & (cap - 1)::u64)::i32;
+}
+
+fun inst_map_grow(m: *InstMap, alloc: *allocator.Allocator) bool {
+    val old_entries: *InstMapEntry = m.entries;
+    val old_cap: i32 = m.capacity;
+    val new_cap: i32 = old_cap * 2;
+
+    val res: Result[*InstMapEntry, allocator.AllocError] =
+        allocator.allocator_zalloc[InstMapEntry](alloc, new_cap::usize);
+    if (result_is_err[*InstMapEntry, allocator.AllocError](res)) { ret false; }
+
+    m.entries = result_unwrap_ok[*InstMapEntry, allocator.AllocError](res);
+    m.capacity = new_cap;
+    m.count = 0;
+
+    var i: i32 = 0;
+    for (i < old_cap) {
+        val e: *InstMapEntry = ?old_entries[i];
+        if (e.key != nil) {
+            inst_map_put_inner(m, e.key, e.value);
+        }
+        i = i + 1;
+    }
+    allocator.allocator_free[InstMapEntry](alloc, old_entries, old_cap::usize);
+    ret true;
+}
+
+fun inst_map_put_inner(m: *InstMap, key: str, val_name: str) {
+    var idx: i32 = inst_map_hash(key, m.capacity);
+    var probes: i32 = 0;
+    for (probes < m.capacity) {
+        val e: *InstMapEntry = ?m.entries[idx];
+        if (e.key == nil) {
+            e.key = key;
+            e.value = val_name;
+            m.count = m.count + 1;
+            ret;
+        }
+        if (str_equals(e.key, key)) { ret; }
+        idx = (idx + 1) & (m.capacity - 1);
+        probes = probes + 1;
+    }
+}
+
+# look up a mangled name in the instantiation hash table
+# ---
+# m:   hash table
+# key: mangled name to find
+# ret: persistent name if found, nil otherwise
+pub fun inst_map_get(m: *InstMap, key: str) str {
+    if (m == nil || m.entries == nil || key == nil) { ret nil; }
+    var idx: i32 = inst_map_hash(key, m.capacity);
+    var probes: i32 = 0;
+    for (probes < m.capacity) {
+        val e: *InstMapEntry = ?m.entries[idx];
+        if (e.key == nil) { ret nil; }
+        if (str_equals(e.key, key)) { ret e.value; }
+        idx = (idx + 1) & (m.capacity - 1);
+        probes = probes + 1;
+    }
+    ret nil;
+}
+
+# insert a mangled name into the instantiation hash table
+# ---
+# m:        hash table
+# alloc:    allocator
+# key:      mangled name
+# val_name: persistent name
+pub fun inst_map_put(m: *InstMap, alloc: *allocator.Allocator, key: str, val_name: str) {
+    if (m == nil || alloc == nil || key == nil) { ret; }
+    if (m.entries == nil) {
+        val cap: i32 = INST_MAP_INIT_CAP;
+        val res: Result[*InstMapEntry, allocator.AllocError] =
+            allocator.allocator_zalloc[InstMapEntry](alloc, cap::usize);
+        if (result_is_err[*InstMapEntry, allocator.AllocError](res)) { ret; }
+        m.entries = result_unwrap_ok[*InstMapEntry, allocator.AllocError](res);
+        m.capacity = cap;
+    }
+    if (m.count * 4 >= m.capacity * 3) {
+        if (!inst_map_grow(m, alloc)) { ret; }
+    }
+    inst_map_put_inner(m, key, val_name);
+}
+
+# write a compact Itanium-style type encoding into a buffer
+#
+# produces type codes compatible with the Itanium C++ ABI name mangling
+# scheme. used for generic instantiation dedup and linker symbol names.
+# ---
+# t:   type to encode
+# buf: output buffer
+# cap: buffer capacity in bytes
+# ret: number of bytes written
+pub fun type_mangle(t: *type.Type, buf: *u8, cap: usize) i32 {
+    if (t == nil || buf == nil || cap == 0) { ret 0; }
+
+    # primitive type codes (Itanium ABI)
+    if (t.kind == type.TYPE_VOID) { buf[0] = 'v'; ret 1; }
+    if (t.kind == type.TYPE_U8)   { buf[0] = 'h'; ret 1; }
+    if (t.kind == type.TYPE_U16)  { buf[0] = 't'; ret 1; }
+    if (t.kind == type.TYPE_U32)  { buf[0] = 'j'; ret 1; }
+    if (t.kind == type.TYPE_U64)  { buf[0] = 'm'; ret 1; }
+    if (t.kind == type.TYPE_I8)   { buf[0] = 'a'; ret 1; }
+    if (t.kind == type.TYPE_I16)  { buf[0] = 's'; ret 1; }
+    if (t.kind == type.TYPE_I32)  { buf[0] = 'i'; ret 1; }
+    if (t.kind == type.TYPE_I64)  { buf[0] = 'x'; ret 1; }
+    if (t.kind == type.TYPE_F32)  { buf[0] = 'f'; ret 1; }
+    if (t.kind == type.TYPE_F64)  { buf[0] = 'd'; ret 1; }
+    if (t.kind == type.TYPE_NIL)  { buf[0] = 'n'; ret 1; }
+
+    # raw pointer
+    if (t.kind == type.TYPE_PTR) {
+        buf[0] = 'p';
+        ret 1;
+    }
+
+    # typed pointer *T / &T
+    if (t.kind == type.TYPE_POINTER) {
+        if (cap < 2) { ret 0; }
+        buf[0] = 'P';
+        val inner_written: i32 = type_mangle(t.inner, ?buf[1], cap - 1);
+        ret 1 + inner_written;
+    }
+
+    # array [N]T
+    if (t.kind == type.TYPE_ARRAY) {
+        if (cap < 3) { ret 0; }
+        buf[0] = 'A';
+        var pos: i32 = 1;
+        val elem_sz: usize = 0;
+        if (t.inner != nil) { elem_sz = t.inner.size; }
+        var arr_count: usize = 0;
+        if (elem_sz > 0) { arr_count = t.size / elem_sz; }
+        pos = pos + mangle_write_digits(buf, pos::usize, arr_count, cap);
+        if (pos::usize < cap) {
+            buf[pos::usize] = '_';
+            pos = pos + 1;
+        }
+        val elem_written: i32 = type_mangle(t.inner, ?buf[pos::usize], cap - pos::usize);
+        ret pos + elem_written;
+    }
+
+    # named types — length-prefixed name
+    if (t.name != nil) {
+        val nlen: usize = str_len(t.name);
+        var pos: i32 = 0;
+        pos = pos + mangle_write_digits(buf, pos::usize, nlen, cap);
+        var ni: usize = 0;
+        for (ni < nlen && pos::usize < cap) {
+            buf[pos::usize] = t.name[ni];
+            pos = pos + 1;
+            ni = ni + 1;
+        }
+        ret pos;
+    }
+
+    buf[0] = '?';
+    ret 1;
+}
+
+# write a decimal number into a mangle buffer
+# ---
+# buf: output buffer
+# pos: write position in buffer
+# n:   number to write
+# cap: buffer capacity
+# ret: number of bytes written
+pub fun mangle_write_digits(buf: *u8, pos: usize, n: usize, cap: usize) i32 {
+    if (n == 0) {
+        if (pos < cap) { buf[pos] = '0'; ret 1; }
+        ret 0;
+    }
+    var dlen: i32 = 0;
+    var v: usize = n;
+    for (v > 0) { dlen = dlen + 1; v = v / 10; }
+    if (pos + dlen::usize > cap) { ret 0; }
+    var i: i32 = dlen - 1;
+    v = n;
+    for (v > 0) {
+        buf[pos + i::usize] = (v % 10)::u8 + 48;
+        v = v / 10;
+        i = i - 1;
+    }
+    ret dlen;
+}

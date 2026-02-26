@@ -1,0 +1,1037 @@
+# function body resolution (phase 3).
+#
+# walks every function body in each module, resolving expression types,
+# binding identifiers to symbols, and triggering generic instantiation
+# for calls with type arguments.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.option;
+use std.types.result;
+
+use allocator: std.allocator;
+
+use ast:    mach.compiler.frontend.ast;
+use symbol: mach.compiler.frontend.symbol;
+use token:  mach.compiler.frontend.token;
+use type:   mach.compiler.frontend.type;
+
+use resolve: mach.compiler.frontend.sema.resolve;
+use generic: mach.compiler.frontend.sema.generic;
+
+use mach.compiler.frontend.sema;
+
+# run phase 3 on all modules in dependency order
+pub fun resolve_all_bodies(sema: *Sema) {
+    if (sema == nil) { ret; }
+
+    var mod: *SemaModule = sema.modules;
+    for (mod != nil) {
+        if (mod.phase < PHASE_BODIES) {
+            resolve_module_bodies(sema, mod);
+        }
+        mod = mod.next;
+    }
+}
+
+# run phase 3 on a single module
+pub fun resolve_module_bodies(sema: *Sema, mod: *SemaModule) {
+    if (sema == nil || mod == nil || mod.ast == nil || mod.table == nil) { ret; }
+
+    val stmts: *ast.List = mod.ast.info.block_stmt.stmts;
+    if (stmts == nil) { ret; }
+
+    var i: i32 = 0;
+    for (i < stmts.count) {
+        val node: *ast.Node = stmts.nodes[i];
+        if (node != nil) {
+            resolve_top_level_body(sema, mod, node);
+        }
+        i = i + 1;
+    }
+
+    mod.phase = PHASE_BODIES;
+}
+
+# dispatch top-level declarations for body resolution
+fun resolve_top_level_body(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
+    if (node == nil) { ret; }
+
+    if (node.kind == ast.NODE_DECL_FUN) {
+        resolve_function_body(sema, mod, node);
+        ret;
+    }
+
+    if (node.kind == ast.NODE_DECL_VAL || node.kind == ast.NODE_DECL_VAR) {
+        resolve_var_init(sema, mod, node);
+        ret;
+    }
+
+    if (node.kind == ast.NODE_DECL_PUB) {
+        val inner: *ast.Node = node.info.wrapper.inner;
+        if (inner != nil) { resolve_top_level_body(sema, mod, inner); }
+        ret;
+    }
+
+    if (node.kind == ast.NODE_COMPTIME_IF || node.kind == ast.NODE_COMPTIME_OR) {
+        val body: *ast.Node = node.info.cond_stmt.body;
+        if (body != nil) {
+            resolve_comptime_body(sema, mod, body);
+        }
+        ret;
+    }
+
+    if (node.kind == ast.NODE_COMPTIME) {
+        resolve_comptime_attr(sema, mod, node);
+        ret;
+    }
+}
+
+fun resolve_comptime_body(sema: *Sema, mod: *SemaModule, body: *ast.Node) {
+    if (body == nil) { ret; }
+
+    if (body.kind == ast.NODE_STMT_BLOCK || body.kind == ast.NODE_STMT_LIST) {
+        val stmts: *ast.List = body.info.block_stmt.stmts;
+        if (stmts == nil) { ret; }
+        var i: i32 = 0;
+        for (i < stmts.count) {
+            if (stmts.nodes[i] != nil) {
+                resolve_top_level_body(sema, mod, stmts.nodes[i]);
+            }
+            i = i + 1;
+        }
+        ret;
+    }
+
+    resolve_top_level_body(sema, mod, body);
+}
+
+# resolve a variable/constant initializer expression
+fun resolve_var_init(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
+    if (node == nil) { ret; }
+
+    val init: *ast.Node = node.info.var_decl.init;
+    if (init == nil) { ret; }
+
+    val sym: *symbol.Symbol = node.symbol::*symbol.Symbol;
+    val expected: *type.Type = nil;
+    if (sym != nil) { expected = sym.resolved_type; }
+
+    val init_type: *type.Type = resolve_expr(sema, mod, init, expected);
+
+    # infer type from initializer when no annotation
+    if (sym != nil && sym.resolved_type == nil && init_type != nil) {
+        sym.resolved_type = init_type;
+        node.type = init_type;
+    }
+}
+
+# resolve a function body
+fun resolve_function_body(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
+    if (node == nil) { ret; }
+
+    val sym: *symbol.Symbol = node.symbol::*symbol.Symbol;
+    if (sym == nil) { ret; }
+    if (sym.is_generic) { ret; }
+
+    val decl: *ast.FunDecl = ?node.info.fun_decl;
+    val body: *ast.Node = decl.body;
+    if (body == nil) { ret; }
+
+    # determine return type
+    var ret_type: *type.Type = type.get_primitive(sema.types, type.TYPE_VOID);
+    if (sym.resolved_type != nil && sym.resolved_type.ret_type != nil) {
+        ret_type = sym.resolved_type.ret_type;
+    }
+
+    var fn_ctx: FnContext;
+    fn_ctx.func_node = node;
+    fn_ctx.ret_type = ret_type;
+
+    # push function scope
+    symbol.table_push_scope(mod.table);
+
+    # add parameters to scope
+    if (decl.params != nil) {
+        var pi: i32 = 0;
+        for (pi < decl.params.count) {
+            val param: *ast.Node = decl.params.nodes[pi];
+            if (param != nil && param.kind == ast.NODE_PARAM) {
+                val pname: str = param.info.var_decl.name;
+                if (pname != nil) {
+                    val ps_res: Result[*symbol.Symbol, str] = symbol.table_define(mod.table, pname, symbol.SYM_PARAM);
+                    if (result_is_ok[*symbol.Symbol, str](ps_res)) {
+                        val psym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](ps_res);
+                        psym.decl_node = param;
+
+                        # resolve parameter type
+                        val pt_node: *ast.Node = param.info.var_decl.type_node;
+                        if (pt_node != nil) {
+                            psym.resolved_type = resolve.resolve_type_expr(sema, mod, pt_node);
+                        }
+
+                        # use the function type's param type if available
+                        if (psym.resolved_type == nil && sym.resolved_type != nil) {
+                            if (pi < sym.resolved_type.param_count && sym.resolved_type.params != nil) {
+                                psym.resolved_type = sym.resolved_type.params[pi];
+                            }
+                        }
+
+                        param.type = psym.resolved_type;
+                        param.symbol = psym::ptr;
+                    }
+                }
+            }
+            # handle variadic parameters
+            if (param != nil && param.kind == ast.NODE_VARIADIC) {
+                # create a va_list parameter
+                val va_name: str = "...";
+                val va_res: Result[*symbol.Symbol, str] = symbol.table_define(mod.table, va_name, symbol.SYM_PARAM);
+                if (result_is_ok[*symbol.Symbol, str](va_res)) {
+                    val vasym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](va_res);
+                    vasym.decl_node = param;
+                    # va_list is an opaque array type
+                    val va_u8: *type.Type = type.get_primitive(sema.types, type.TYPE_U8);
+                    val va_res2: Result[*type.Type, str] = type.make_array(sema.types, va_u8, sema.va_list_size);
+                    if (result_is_ok[*type.Type, str](va_res2)) {
+                        vasym.resolved_type = result_unwrap_ok[*type.Type, str](va_res2);
+                    }
+                    param.symbol = vasym::ptr;
+                }
+            }
+            pi = pi + 1;
+        }
+    }
+
+    # resolve body statements
+    resolve_block(sema, mod, body, ?fn_ctx);
+
+    # pop function scope
+    symbol.table_pop_scope(mod.table);
+}
+
+# resolve a block of statements
+fun resolve_block(sema: *Sema, mod: *SemaModule, block: *ast.Node, fn_ctx: *FnContext) {
+    if (block == nil) { ret; }
+
+    val stmts: *ast.List = block.info.block_stmt.stmts;
+    if (stmts == nil) { ret; }
+
+    var i: i32 = 0;
+    for (i < stmts.count) {
+        val stmt: *ast.Node = stmts.nodes[i];
+        if (stmt != nil) {
+            resolve_stmt(sema, mod, stmt, fn_ctx);
+        }
+        i = i + 1;
+    }
+}
+
+# resolve a single statement
+fun resolve_stmt(sema: *Sema, mod: *SemaModule, node: *ast.Node, fn_ctx: *FnContext) {
+    if (node == nil) { ret; }
+
+    if (node.kind == ast.NODE_STMT_EXPR) {
+        val inner: *ast.Node = node.info.wrapper.inner;
+        if (inner != nil) {
+            resolve_expr(sema, mod, inner, nil);
+        }
+        ret;
+    }
+
+    if (node.kind == ast.NODE_STMT_BLOCK) {
+        symbol.table_push_scope(mod.table);
+        resolve_block(sema, mod, node, fn_ctx);
+        symbol.table_pop_scope(mod.table);
+        ret;
+    }
+
+    if (node.kind == ast.NODE_DECL_VAL || node.kind == ast.NODE_DECL_VAR) {
+        resolve_local_var(sema, mod, node);
+        ret;
+    }
+
+    if (node.kind == ast.NODE_STMT_IF) {
+        resolve_if_stmt(sema, mod, node, fn_ctx);
+        ret;
+    }
+
+    if (node.kind == ast.NODE_STMT_FOR) {
+        resolve_for_stmt(sema, mod, node, fn_ctx);
+        ret;
+    }
+
+    if (node.kind == ast.NODE_STMT_RET) {
+        val inner: *ast.Node = node.info.wrapper.inner;
+        if (inner != nil && fn_ctx != nil) {
+            resolve_expr(sema, mod, inner, fn_ctx.ret_type);
+        }
+        ret;
+    }
+
+    if (node.kind == ast.NODE_STMT_BRK || node.kind == ast.NODE_STMT_CNT) {
+        ret;
+    }
+
+    if (node.kind == ast.NODE_STMT_FIN) {
+        val inner: *ast.Node = node.info.wrapper.inner;
+        if (inner != nil) {
+            resolve_stmt(sema, mod, inner, fn_ctx);
+        }
+        ret;
+    }
+
+    if (node.kind == ast.NODE_STMT_MASM) {
+        ret;
+    }
+
+    if (node.kind == ast.NODE_COMPTIME) {
+        resolve_comptime_attr(sema, mod, node);
+        ret;
+    }
+
+    if (node.kind == ast.NODE_COMPTIME_IF || node.kind == ast.NODE_COMPTIME_OR) {
+        # comptime conditionals in function bodies
+        val eval_res: Result[bool, str] = eval_comptime_cond(sema, node);
+        if (result_is_ok[bool, str](eval_res) && result_unwrap_ok[bool, str](eval_res)) {
+            val body: *ast.Node = node.info.cond_stmt.body;
+            if (body != nil) {
+                resolve_stmt(sema, mod, body, fn_ctx);
+            }
+        } or {
+            val or_branch: *ast.Node = node.info.cond_stmt.or_branch;
+            if (or_branch != nil) {
+                resolve_stmt(sema, mod, or_branch, fn_ctx);
+            }
+        }
+        ret;
+    }
+}
+
+# resolve a local variable declaration
+fun resolve_local_var(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
+    if (node == nil) { ret; }
+
+    val name: str = node.info.var_decl.name;
+    if (name == nil) { ret; }
+
+    var kind: symbol.SymbolKind = symbol.SYM_VAL;
+    if (node.kind == ast.NODE_DECL_VAR) { kind = symbol.SYM_VAR; }
+
+    val def_res: Result[*symbol.Symbol, str] = symbol.table_define(mod.table, name, kind);
+    if (result_is_err[*symbol.Symbol, str](def_res)) {
+        report_error_node(sema, mod, node, "duplicate local declaration");
+        ret;
+    }
+
+    val sym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](def_res);
+    sym.decl_node = node;
+    node.symbol = sym::ptr;
+
+    # resolve type annotation
+    val type_node: *ast.Node = node.info.var_decl.type_node;
+    if (type_node != nil) {
+        sym.resolved_type = resolve.resolve_type_expr(sema, mod, type_node);
+        node.type = sym.resolved_type;
+    }
+
+    # resolve initializer
+    val init: *ast.Node = node.info.var_decl.init;
+    if (init != nil) {
+        val init_type: *type.Type = resolve_expr(sema, mod, init, sym.resolved_type);
+
+        # infer type from initializer
+        if (sym.resolved_type == nil && init_type != nil) {
+            sym.resolved_type = init_type;
+            node.type = init_type;
+        }
+    }
+}
+
+# resolve an if/or chain
+fun resolve_if_stmt(sema: *Sema, mod: *SemaModule, node: *ast.Node, fn_ctx: *FnContext) {
+    if (node == nil) { ret; }
+
+    val cond: *ast.Node = node.info.cond_stmt.cond;
+    if (cond != nil) {
+        resolve_expr(sema, mod, cond, nil);
+    }
+
+    val body: *ast.Node = node.info.cond_stmt.body;
+    if (body != nil) {
+        symbol.table_push_scope(mod.table);
+        resolve_stmt(sema, mod, body, fn_ctx);
+        symbol.table_pop_scope(mod.table);
+    }
+
+    val or_branch: *ast.Node = node.info.cond_stmt.or_branch;
+    if (or_branch != nil) {
+        resolve_or_branch(sema, mod, or_branch, fn_ctx);
+    }
+}
+
+fun resolve_or_branch(sema: *Sema, mod: *SemaModule, node: *ast.Node, fn_ctx: *FnContext) {
+    if (node == nil) { ret; }
+
+    # or with condition (or (cond) { ... })
+    if (node.kind == ast.NODE_STMT_OR || node.kind == ast.NODE_OR_BRANCH) {
+        val cond: *ast.Node = node.info.cond_stmt.cond;
+        if (cond != nil) {
+            resolve_expr(sema, mod, cond, nil);
+        }
+
+        val body: *ast.Node = node.info.cond_stmt.body;
+        if (body != nil) {
+            symbol.table_push_scope(mod.table);
+            resolve_stmt(sema, mod, body, fn_ctx);
+            symbol.table_pop_scope(mod.table);
+        }
+
+        val or_branch: *ast.Node = node.info.cond_stmt.or_branch;
+        if (or_branch != nil) {
+            resolve_or_branch(sema, mod, or_branch, fn_ctx);
+        }
+        ret;
+    }
+
+    # bare or block (else)
+    symbol.table_push_scope(mod.table);
+    resolve_stmt(sema, mod, node, fn_ctx);
+    symbol.table_pop_scope(mod.table);
+}
+
+# resolve a for loop
+fun resolve_for_stmt(sema: *Sema, mod: *SemaModule, node: *ast.Node, fn_ctx: *FnContext) {
+    if (node == nil) { ret; }
+
+    symbol.table_push_scope(mod.table);
+
+    val cond: *ast.Node = node.info.for_stmt.cond;
+    if (cond != nil) {
+        resolve_expr(sema, mod, cond, nil);
+    }
+
+    val body: *ast.Node = node.info.for_stmt.body;
+    if (body != nil) {
+        resolve_stmt(sema, mod, body, fn_ctx);
+    }
+
+    symbol.table_pop_scope(mod.table);
+}
+
+# resolve a comptime attribute assignment ($name.attr = value)
+fun resolve_comptime_attr(sema: *Sema, mod: *SemaModule, node: *ast.Node) {
+    if (node == nil) { ret; }
+    # comptime attribute nodes wrap an assignment expression
+    val inner: *ast.Node = node.info.wrapper.inner;
+    if (inner == nil) { ret; }
+
+    # resolve the assignment to bind symbols
+    resolve_expr(sema, mod, inner, nil);
+}
+
+# resolve an expression and return its type
+#
+# sets node.type and node.symbol on the expression node.
+# expected is used for literal type coercion (may be nil).
+# ---
+# sema:     analyzer context
+# mod:      module context
+# node:     expression node
+# expected: expected type for coercion (or nil)
+# ret:      resolved type or nil
+fun resolve_expr(sema: *Sema, mod: *SemaModule, node: *ast.Node, expected: *type.Type) *type.Type {
+    if (sema == nil || mod == nil || node == nil) { ret nil; }
+
+    if (node.kind == ast.NODE_EXPR_IDENT) {
+        ret resolve_ident(sema, mod, node);
+    }
+
+    if (node.kind == ast.NODE_EXPR_LIT_INT) {
+        ret resolve_int_lit(sema, mod, node, expected);
+    }
+
+    if (node.kind == ast.NODE_EXPR_LIT_FLOAT) {
+        ret resolve_float_lit(sema, mod, node, expected);
+    }
+
+    if (node.kind == ast.NODE_EXPR_LIT_CHAR) {
+        val t: *type.Type = type.get_primitive(sema.types, type.TYPE_U8);
+        node.type = t;
+        ret t;
+    }
+
+    if (node.kind == ast.NODE_EXPR_LIT_STR) {
+        val u8t: *type.Type = type.get_primitive(sema.types, type.TYPE_U8);
+        val r: Result[*type.Type, str] = type.make_pointer(sema.types, u8t, false);
+        if (result_is_ok[*type.Type, str](r)) {
+            val t: *type.Type = result_unwrap_ok[*type.Type, str](r);
+            t.name = "str";
+            node.type = t;
+            ret t;
+        }
+        ret nil;
+    }
+
+    if (node.kind == ast.NODE_EXPR_LIT_NIL) {
+        val t: *type.Type = type.get_primitive(sema.types, type.TYPE_NIL);
+        node.type = t;
+        ret t;
+    }
+
+    if (node.kind == ast.NODE_EXPR_LIT_BOOL) {
+        val t: *type.Type = type.get_primitive(sema.types, type.TYPE_U8);
+        node.type = t;
+        ret t;
+    }
+
+    if (node.kind == ast.NODE_EXPR_BINARY) {
+        ret resolve_binary(sema, mod, node, expected);
+    }
+
+    if (node.kind == ast.NODE_EXPR_UNARY) {
+        ret resolve_unary(sema, mod, node, expected);
+    }
+
+    if (node.kind == ast.NODE_EXPR_CALL) {
+        ret resolve_call(sema, mod, node);
+    }
+
+    if (node.kind == ast.NODE_EXPR_INDEX) {
+        ret resolve_index(sema, mod, node);
+    }
+
+    if (node.kind == ast.NODE_EXPR_FIELD) {
+        ret resolve_field_access(sema, mod, node);
+    }
+
+    if (node.kind == ast.NODE_EXPR_CAST) {
+        ret resolve_cast(sema, mod, node);
+    }
+
+    if (node.kind == ast.NODE_EXPR_ADDR) {
+        ret resolve_addr(sema, mod, node);
+    }
+
+    if (node.kind == ast.NODE_EXPR_DEREF) {
+        ret resolve_deref(sema, mod, node);
+    }
+
+    if (node.kind == ast.NODE_EXPR_PAREN) {
+        val inner: *ast.Node = node.info.wrapper.inner;
+        if (inner != nil) {
+            val t: *type.Type = resolve_expr(sema, mod, inner, expected);
+            node.type = t;
+            ret t;
+        }
+        ret nil;
+    }
+
+    if (node.kind == ast.NODE_EXPR_ARRAY_LIT) {
+        ret resolve_array_lit(sema, mod, node, expected);
+    }
+
+    if (node.kind == ast.NODE_EXPR_STRUCT_LIT) {
+        ret resolve_struct_lit(sema, mod, node, expected);
+    }
+
+    ret nil;
+}
+
+# resolve an identifier expression
+fun resolve_ident(sema: *Sema, mod: *SemaModule, node: *ast.Node) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val name: str = node.info.ident_expr.name;
+    if (name == nil) { ret nil; }
+
+    val sym: *symbol.Symbol = lookup_symbol(sema, mod, name);
+    if (sym == nil) {
+        report_error_node(sema, mod, node, "undefined identifier");
+        ret nil;
+    }
+
+    resolve.ensure_type_resolved(sema, mod, sym);
+
+    node.symbol = sym::ptr;
+    node.type = sym.resolved_type;
+    ret sym.resolved_type;
+}
+
+# resolve an integer literal, coercing to expected type if numeric
+fun resolve_int_lit(sema: *Sema, mod: *SemaModule, node: *ast.Node, expected: *type.Type) *type.Type {
+    if (node == nil) { ret nil; }
+
+    # check for suffix
+    val text: str = node.info.lit_expr.text;
+    val suffix_type: *type.Type = resolve_int_suffix(sema, text);
+    if (suffix_type != nil) {
+        node.type = suffix_type;
+        ret suffix_type;
+    }
+
+    # coerce to expected type if it's numeric
+    if (expected != nil && type.type_is_integer(expected)) {
+        node.type = expected;
+        ret expected;
+    }
+
+    # default to i64
+    val t: *type.Type = type.get_primitive(sema.types, type.TYPE_I64);
+    node.type = t;
+    ret t;
+}
+
+# resolve a float literal, coercing to expected type if float
+fun resolve_float_lit(sema: *Sema, mod: *SemaModule, node: *ast.Node, expected: *type.Type) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val text: str = node.info.lit_expr.text;
+    val suffix_type: *type.Type = resolve_float_suffix(sema, text);
+    if (suffix_type != nil) {
+        node.type = suffix_type;
+        ret suffix_type;
+    }
+
+    if (expected != nil && type.type_is_float(expected)) {
+        node.type = expected;
+        ret expected;
+    }
+
+    val t: *type.Type = type.get_primitive(sema.types, type.TYPE_F64);
+    node.type = t;
+    ret t;
+}
+
+# resolve a binary expression
+fun resolve_binary(sema: *Sema, mod: *SemaModule, node: *ast.Node, expected: *type.Type) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val op: u8 = node.info.binary_expr.op;
+    val left: *ast.Node = node.info.binary_expr.left;
+    val right: *ast.Node = node.info.binary_expr.right;
+
+    # assignment
+    if (op == token.TAG_EQ) {
+        val ltype: *type.Type = resolve_expr(sema, mod, left, nil);
+        resolve_expr(sema, mod, right, ltype);
+        node.type = ltype;
+        ret ltype;
+    }
+
+    # comparison and logical operators yield bool (u8)
+    if (op == token.TAG_EQ_EQ || op == token.TAG_BANG_EQ ||
+        op == token.TAG_LT || op == token.TAG_LT_EQ ||
+        op == token.TAG_GT || op == token.TAG_GT_EQ ||
+        op == token.TAG_AMP_AMP || op == token.TAG_PIPE_PIPE) {
+
+        val ltype: *type.Type = resolve_expr(sema, mod, left, nil);
+        resolve_expr(sema, mod, right, ltype);
+        val bool_type: *type.Type = type.get_primitive(sema.types, type.TYPE_U8);
+        node.type = bool_type;
+        ret bool_type;
+    }
+
+    # arithmetic and bitwise operators
+    val ltype: *type.Type = resolve_expr(sema, mod, left, expected);
+    val rtype: *type.Type = resolve_expr(sema, mod, right, ltype);
+
+    # use left type as the result
+    if (ltype != nil) {
+        node.type = ltype;
+        ret ltype;
+    }
+    if (rtype != nil) {
+        node.type = rtype;
+        ret rtype;
+    }
+
+    ret nil;
+}
+
+# resolve a unary expression
+fun resolve_unary(sema: *Sema, mod: *SemaModule, node: *ast.Node, expected: *type.Type) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val inner: *ast.Node = node.info.unary_expr.expr;
+    if (inner == nil) { ret nil; }
+
+    val op: u8 = node.info.unary_expr.op;
+
+    # logical not yields bool
+    if (op == token.TAG_BANG) {
+        resolve_expr(sema, mod, inner, nil);
+        val t: *type.Type = type.get_primitive(sema.types, type.TYPE_U8);
+        node.type = t;
+        ret t;
+    }
+
+    # negation and bitwise not preserve the operand type
+    val t: *type.Type = resolve_expr(sema, mod, inner, expected);
+    node.type = t;
+    ret t;
+}
+
+# resolve a function call expression
+fun resolve_call(sema: *Sema, mod: *SemaModule, node: *ast.Node) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val callee: *ast.Node = node.info.call_expr.callee;
+    val args: *ast.List = node.info.call_expr.args;
+    val type_args: *ast.Node = node.info.call_expr.type_args;
+
+    # resolve callee
+    val callee_type: *type.Type = resolve_expr(sema, mod, callee, nil);
+
+    # handle generic function calls
+    if (type_args != nil && callee != nil) {
+        val callee_sym: *symbol.Symbol = callee.symbol::*symbol.Symbol;
+        if (callee_sym != nil && callee_sym.is_generic) {
+            val inst_type: *type.Type = generic.instantiate_generic_function(
+                sema, mod, callee_sym, type_args, node);
+            if (inst_type != nil) {
+                # resolve args with the instantiated function's param types
+                resolve_call_args(sema, mod, args, inst_type);
+                val ret_t: *type.Type = inst_type.ret_type;
+                if (ret_t == nil) { ret_t = type.get_primitive(sema.types, type.TYPE_VOID); }
+                node.type = ret_t;
+                ret ret_t;
+            }
+        }
+    }
+
+    # resolve arguments
+    resolve_call_args(sema, mod, args, callee_type);
+
+    # determine return type
+    if (callee_type != nil && callee_type.kind == type.TYPE_FUN) {
+        val ret_t: *type.Type = callee_type.ret_type;
+        if (ret_t == nil) { ret_t = type.get_primitive(sema.types, type.TYPE_VOID); }
+        node.type = ret_t;
+        ret ret_t;
+    }
+
+    ret nil;
+}
+
+# resolve call arguments, using parameter types for coercion
+fun resolve_call_args(sema: *Sema, mod: *SemaModule, args: *ast.List, func_type: *type.Type) {
+    if (args == nil) { ret; }
+
+    var i: i32 = 0;
+    for (i < args.count) {
+        val arg: *ast.Node = args.nodes[i];
+        if (arg != nil) {
+            var param_type: *type.Type = nil;
+            if (func_type != nil && i < func_type.param_count && func_type.params != nil) {
+                param_type = func_type.params[i];
+            }
+            resolve_expr(sema, mod, arg, param_type);
+        }
+        i = i + 1;
+    }
+}
+
+# resolve an index expression (base[index])
+fun resolve_index(sema: *Sema, mod: *SemaModule, node: *ast.Node) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val base: *ast.Node = node.info.index_expr.base;
+    val index: *ast.Node = node.info.index_expr.index;
+
+    val base_type: *type.Type = resolve_expr(sema, mod, base, nil);
+
+    # resolve index as integer
+    if (index != nil) {
+        val idx_type: *type.Type = type.get_primitive(sema.types, type.TYPE_I64);
+        resolve_expr(sema, mod, index, idx_type);
+    }
+
+    if (base_type == nil) { ret nil; }
+
+    # array indexing yields element type
+    if (base_type.kind == type.TYPE_ARRAY) {
+        val elem: *type.Type = base_type.inner;
+        node.type = elem;
+        ret elem;
+    }
+
+    # pointer indexing yields pointed-to type
+    if (type.type_is_pointer(base_type)) {
+        val elem: *type.Type = base_type.inner;
+        node.type = elem;
+        ret elem;
+    }
+
+    report_error_node(sema, mod, node, "indexing requires array or pointer type");
+    ret nil;
+}
+
+# resolve a field access expression (object.field)
+fun resolve_field_access(sema: *Sema, mod: *SemaModule, node: *ast.Node) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val object: *ast.Node = node.info.field_expr.object;
+    val field_name: str = node.info.field_expr.field;
+
+    val obj_type: *type.Type = resolve_expr(sema, mod, object, nil);
+    if (obj_type == nil || field_name == nil) { ret nil; }
+
+    # auto-deref pointers to records/unions
+    var target_type: *type.Type = obj_type;
+    if (type.type_is_pointer(obj_type) && obj_type.inner != nil) {
+        target_type = obj_type.inner;
+    }
+
+    if (target_type.kind == type.TYPE_RECORD || target_type.kind == type.TYPE_UNION) {
+        val field_opt: Option[*type.Field] = type.get_field(target_type, field_name);
+        if (option_is_some[*type.Field](field_opt)) {
+            val field: *type.Field = option_unwrap[*type.Field](field_opt);
+            node.type = field.type;
+            ret field.type;
+        }
+        report_error_node(sema, mod, node, "no such field");
+        ret nil;
+    }
+
+    report_error_node(sema, mod, node, "field access requires record or union type");
+    ret nil;
+}
+
+# resolve a cast expression (expr::type)
+fun resolve_cast(sema: *Sema, mod: *SemaModule, node: *ast.Node) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val expr: *ast.Node = node.info.cast_expr.expr;
+    val type_node: *ast.Node = node.info.cast_expr.type_node;
+
+    if (expr != nil) {
+        resolve_expr(sema, mod, expr, nil);
+    }
+
+    if (type_node != nil) {
+        val t: *type.Type = resolve.resolve_type_expr(sema, mod, type_node);
+        node.type = t;
+        ret t;
+    }
+
+    ret nil;
+}
+
+# resolve an address-of expression (?expr)
+fun resolve_addr(sema: *Sema, mod: *SemaModule, node: *ast.Node) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val inner: *ast.Node = node.info.unary_expr.expr;
+    if (inner == nil) { ret nil; }
+
+    val inner_type: *type.Type = resolve_expr(sema, mod, inner, nil);
+    if (inner_type == nil) { ret nil; }
+
+    val r: Result[*type.Type, str] = type.make_pointer(sema.types, inner_type, true);
+    if (result_is_err[*type.Type, str](r)) { ret nil; }
+
+    val t: *type.Type = result_unwrap_ok[*type.Type, str](r);
+    node.type = t;
+    ret t;
+}
+
+# resolve a dereference expression (@expr)
+fun resolve_deref(sema: *Sema, mod: *SemaModule, node: *ast.Node) *type.Type {
+    if (node == nil) { ret nil; }
+
+    val inner: *ast.Node = node.info.unary_expr.expr;
+    if (inner == nil) { ret nil; }
+
+    val inner_type: *type.Type = resolve_expr(sema, mod, inner, nil);
+    if (inner_type == nil) { ret nil; }
+
+    if (type.type_is_pointer(inner_type)) {
+        val elem: *type.Type = inner_type.inner;
+        node.type = elem;
+        ret elem;
+    }
+
+    report_error_node(sema, mod, node, "dereference requires pointer type");
+    ret nil;
+}
+
+# resolve an array literal
+fun resolve_array_lit(sema: *Sema, mod: *SemaModule, node: *ast.Node, expected: *type.Type) *type.Type {
+    if (node == nil) { ret nil; }
+
+    # resolve element type from type annotation
+    var elem_type: *type.Type = nil;
+    val type_node: *ast.Node = node.info.array_lit.type_node;
+    if (type_node != nil) {
+        elem_type = resolve.resolve_type_expr(sema, mod, type_node);
+    }
+
+    # infer from expected type
+    if (elem_type == nil && expected != nil && expected.kind == type.TYPE_ARRAY) {
+        elem_type = expected.inner;
+    }
+
+    # resolve elements
+    val elems: *ast.List = node.info.array_lit.elements;
+    if (elems != nil) {
+        var i: i32 = 0;
+        for (i < elems.count) {
+            val elem: *ast.Node = elems.nodes[i];
+            if (elem != nil) {
+                val et: *type.Type = resolve_expr(sema, mod, elem, elem_type);
+                if (elem_type == nil && et != nil) {
+                    elem_type = et;
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    # determine array length
+    var len: usize = 0;
+    val size_node: *ast.Node = node.info.array_lit.size;
+    if (size_node != nil) {
+        len = ast.node_get_int_value(size_node)::usize;
+    } or {
+        if (elems != nil) {
+            len = elems.count::usize;
+        }
+    }
+
+    if (elem_type != nil) {
+        val r: Result[*type.Type, str] = type.make_array(sema.types, elem_type, len);
+        if (result_is_ok[*type.Type, str](r)) {
+            val t: *type.Type = result_unwrap_ok[*type.Type, str](r);
+            node.type = t;
+            ret t;
+        }
+    }
+
+    ret nil;
+}
+
+# resolve a struct literal
+fun resolve_struct_lit(sema: *Sema, mod: *SemaModule, node: *ast.Node, expected: *type.Type) *type.Type {
+    if (node == nil) { ret nil; }
+
+    # resolve the struct type
+    var struct_type: *type.Type = nil;
+    val type_node: *ast.Node = node.info.struct_lit.type_node;
+    if (type_node != nil) {
+        struct_type = resolve.resolve_type_expr(sema, mod, type_node);
+    }
+
+    if (struct_type == nil && expected != nil) {
+        if (expected.kind == type.TYPE_RECORD || expected.kind == type.TYPE_UNION) {
+            struct_type = expected;
+        }
+    }
+
+    # resolve field initializers
+    val fields: *ast.List = node.info.struct_lit.fields;
+    if (fields != nil && struct_type != nil) {
+        var i: i32 = 0;
+        for (i < fields.count) {
+            val field_node: *ast.Node = fields.nodes[i];
+            if (field_node != nil && field_node.kind == ast.NODE_FIELD) {
+                val fname: str = field_node.info.field_decl.name;
+                var field_type: *type.Type = nil;
+                if (fname != nil) {
+                    val fopt: Option[*type.Field] = type.get_field(struct_type, fname);
+                    if (option_is_some[*type.Field](fopt)) {
+                        field_type = option_unwrap[*type.Field](fopt).type;
+                    }
+                }
+                # the field's "type_node" in a struct literal is actually the value expression
+                val val_node: *ast.Node = field_node.info.field_decl.type_node;
+                if (val_node != nil) {
+                    resolve_expr(sema, mod, val_node, field_type);
+                }
+                field_node.type = field_type;
+            }
+            i = i + 1;
+        }
+    }
+
+    node.type = struct_type;
+    ret struct_type;
+}
+
+# check for an integer type suffix in a literal text
+fun resolve_int_suffix(sema: *Sema, text: str) *type.Type {
+    if (text == nil) { ret nil; }
+
+    val len: usize = str_len(text);
+    if (len < 2) { ret nil; }
+
+    # find where digits end and suffix begins
+    var suffix_start: usize = 0;
+    var i: usize = 0;
+
+    # skip optional sign
+    if (text[0] == '-' || text[0] == '+') { i = 1; }
+
+    # skip prefix (0x, 0b, 0o)
+    if (i + 1 < len && text[i] == '0') {
+        val p: u8 = text[i + 1];
+        if (p == 'x' || p == 'X' || p == 'b' || p == 'B' || p == 'o' || p == 'O') {
+            i = i + 2;
+        }
+    }
+
+    # walk digits and underscores
+    for (i < len) {
+        val c: u8 = text[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '_') {
+            i = i + 1;
+        } or {
+            brk;
+        }
+    }
+
+    suffix_start = i;
+    if (suffix_start >= len) { ret nil; }
+
+    val suffix: str = (text::usize + suffix_start)::str;
+
+    if (str_equals(suffix, "u8"))  { ret type.get_primitive(sema.types, type.TYPE_U8); }
+    if (str_equals(suffix, "u16")) { ret type.get_primitive(sema.types, type.TYPE_U16); }
+    if (str_equals(suffix, "u32")) { ret type.get_primitive(sema.types, type.TYPE_U32); }
+    if (str_equals(suffix, "u64")) { ret type.get_primitive(sema.types, type.TYPE_U64); }
+    if (str_equals(suffix, "i8"))  { ret type.get_primitive(sema.types, type.TYPE_I8); }
+    if (str_equals(suffix, "i16")) { ret type.get_primitive(sema.types, type.TYPE_I16); }
+    if (str_equals(suffix, "i32")) { ret type.get_primitive(sema.types, type.TYPE_I32); }
+    if (str_equals(suffix, "i64")) { ret type.get_primitive(sema.types, type.TYPE_I64); }
+
+    ret nil;
+}
+
+# check for a float type suffix in a literal text
+fun resolve_float_suffix(sema: *Sema, text: str) *type.Type {
+    if (text == nil) { ret nil; }
+
+    val len: usize = str_len(text);
+    if (len < 2) { ret nil; }
+
+    # find suffix
+    var i: usize = 0;
+    for (i < len) {
+        val c: u8 = text[i];
+        if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E' || c == '_') {
+            i = i + 1;
+        } or {
+            brk;
+        }
+    }
+
+    if (i >= len) { ret nil; }
+
+    val suffix: str = (text::usize + i)::str;
+
+    if (str_equals(suffix, "f32")) { ret type.get_primitive(sema.types, type.TYPE_F32); }
+    if (str_equals(suffix, "f64")) { ret type.get_primitive(sema.types, type.TYPE_F64); }
+
+    ret nil;
+}

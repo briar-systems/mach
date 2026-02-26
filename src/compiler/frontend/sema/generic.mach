@@ -1,0 +1,616 @@
+# generic type and function instantiation.
+#
+# handles monomorphization of generic types (rec/uni) and functions.
+# produces concrete instantiations with Itanium-style mangled names
+# for deduplication and linkage.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.option;
+use std.types.result;
+
+use allocator: std.allocator;
+
+use ast:     mach.compiler.frontend.ast;
+use symbol:  mach.compiler.frontend.symbol;
+use type:    mach.compiler.frontend.type;
+use resolve: mach.compiler.frontend.sema.resolve;
+
+use mach.compiler.frontend.sema;
+
+# instantiate a generic type with concrete type arguments
+#
+# resolves type arguments, checks the instantiation cache, and creates
+# a concrete type with fields substituted if not already cached.
+# ---
+# sema:      analyzer context
+# mod:       module where the instantiation occurs
+# sym:       symbol of the generic type declaration
+# type_args: NODE_GENERIC node with type argument list
+# ret:       concrete instantiated type or nil
+pub fun instantiate_generic_type(sema: *Sema, mod: *SemaModule, sym: *symbol.Symbol, type_args: *ast.Node) *type.Type {
+    if (sema == nil || mod == nil || sym == nil || type_args == nil) { ret nil; }
+    if (sym.decl_node == nil) { ret nil; }
+
+    val generic_node: *ast.Node = sym.generic_node;
+    if (generic_node == nil) { ret nil; }
+
+    val generic_params: *ast.List = generic_node.info.generic_node.args;
+    if (generic_params == nil) { ret nil; }
+
+    val args_list: *ast.List = type_args.info.generic_node.args;
+    if (args_list == nil) { ret nil; }
+
+    val param_count: i32 = generic_params.count;
+    if (args_list.count != param_count) {
+        report_error_node(sema, mod, type_args, "wrong number of type arguments");
+        ret nil;
+    }
+
+    # resolve each type argument
+    var resolved_args: [16]*type.Type;
+    if (param_count > 16) {
+        report_error_node(sema, mod, type_args, "too many type arguments");
+        ret nil;
+    }
+
+    var ai: i32 = 0;
+    for (ai < param_count) {
+        val arg_node: *ast.Node = args_list.nodes[ai];
+        if (arg_node != nil) {
+            resolved_args[ai] = resolve.resolve_type_expr(sema, mod, arg_node);
+        }
+        ai = ai + 1;
+    }
+
+    # check cache
+    val cached: *type.Type = lookup_type_cache(sema, sym, ?resolved_args[0], param_count);
+    if (cached != nil) { ret cached; }
+
+    # create the concrete type
+    val decl: *ast.Node = sym.decl_node;
+    var concrete: *type.Type = nil;
+
+    if (decl.kind == ast.NODE_DECL_REC) {
+        val r: Result[*type.Type, str] = type.make_record(sema.types, sym.name, nil, 0);
+        if (result_is_err[*type.Type, str](r)) { ret nil; }
+        concrete = result_unwrap_ok[*type.Type, str](r);
+    }
+    if (decl.kind == ast.NODE_DECL_UNI) {
+        val r: Result[*type.Type, str] = type.make_union(sema.types, sym.name, nil, 0);
+        if (result_is_err[*type.Type, str](r)) { ret nil; }
+        concrete = result_unwrap_ok[*type.Type, str](r);
+    }
+
+    if (concrete == nil) { ret nil; }
+
+    # set generic args on the concrete type
+    type.set_generic_args(sema.types, concrete, ?resolved_args[0], param_count);
+    if (sym.resolved_type != nil) {
+        type.set_base_generic(concrete, sym.resolved_type);
+    }
+
+    # store in cache before resolving fields (handles recursive types)
+    store_type_cache(sema, sym, ?resolved_args[0], param_count, concrete);
+
+    # resolve fields with substitution
+    val field_list: *ast.List = decl.info.type_decl.fields;
+    if (field_list != nil && field_list.count > 0) {
+        val count: i32 = field_list.count;
+        val f_res: Result[*type.Field, str] = type.alloc_fields(sema.types, count);
+        if (result_is_err[*type.Field, str](f_res)) { ret concrete; }
+
+        val fields: *type.Field = result_unwrap_ok[*type.Field, str](f_res);
+
+        var fi: i32 = 0;
+        for (fi < count) {
+            val fnode: *ast.Node = field_list.nodes[fi];
+            if (fnode != nil && fnode.kind == ast.NODE_FIELD) {
+                fields[fi].name = fnode.info.field_decl.name;
+                val ft_node: *ast.Node = fnode.info.field_decl.type_node;
+                if (ft_node != nil) {
+                    val ft: *type.Type = resolve_type_with_substitution(
+                        sema, mod, ft_node, generic_params, ?resolved_args[0], param_count);
+                    fields[fi].type = ft;
+                }
+            }
+            fi = fi + 1;
+        }
+
+        concrete.fields = fields;
+        concrete.field_count = count;
+
+        if (decl.kind == ast.NODE_DECL_REC) {
+            type.compute_record_layout(concrete, fields, count);
+        } or {
+            type.compute_union_layout(concrete, fields, count);
+        }
+    }
+
+    ret concrete;
+}
+
+# instantiate a generic function with concrete type arguments
+#
+# builds a mangled name, checks for existing instantiation, clones the
+# AST, substitutes types, resolves the body, and registers the result.
+# ---
+# sema:      analyzer context
+# mod:       module where the call occurs
+# func_sym:  symbol of the generic function
+# type_args: NODE_GENERIC node with type argument list
+# call_node: the call expression node (for error reporting)
+# ret:       the instantiated function type or nil
+pub fun instantiate_generic_function(sema: *Sema, mod: *SemaModule, func_sym: *symbol.Symbol, type_args: *ast.Node, call_node: *ast.Node) *type.Type {
+    if (sema == nil || mod == nil || func_sym == nil || type_args == nil) { ret nil; }
+    if (func_sym.decl_node == nil) { ret nil; }
+
+    val generic_node: *ast.Node = func_sym.generic_node;
+    if (generic_node == nil) { ret nil; }
+
+    val generic_params: *ast.List = generic_node.info.generic_node.args;
+    if (generic_params == nil) { ret nil; }
+
+    val args_list: *ast.List = type_args.info.generic_node.args;
+    if (args_list == nil) { ret nil; }
+
+    val param_count: i32 = generic_params.count;
+    if (args_list.count != param_count) {
+        report_error_node(sema, mod, call_node, "wrong number of type arguments");
+        ret nil;
+    }
+
+    # resolve type arguments
+    var resolved_args: [16]*type.Type;
+    if (param_count > 16) {
+        report_error_node(sema, mod, call_node, "too many type arguments");
+        ret nil;
+    }
+
+    var ai: i32 = 0;
+    for (ai < param_count) {
+        val arg_node: *ast.Node = args_list.nodes[ai];
+        if (arg_node != nil) {
+            resolved_args[ai] = resolve.resolve_type_expr(sema, mod, arg_node);
+        }
+        ai = ai + 1;
+    }
+
+    # build mangled name
+    val mangled: str = build_mangled_name(sema, func_sym.name, ?resolved_args[0], param_count);
+    if (mangled == nil) { ret nil; }
+
+    # check dedup map
+    val existing: str = inst_map_get(?sema.func_inst_map, mangled);
+    if (existing != nil) {
+        # already instantiated, look up the function type
+        val exist_sym: *symbol.Symbol = lookup_instantiated_func(sema, existing);
+        if (exist_sym != nil) {
+            # register alias in caller's module so it can be found
+            register_alias_in_module(sema, mod, existing, exist_sym);
+            ret exist_sym.resolved_type;
+        }
+        ret nil;
+    }
+
+    # find origin module (where the generic function is defined)
+    var origin_mod: *SemaModule = mod;
+    if (func_sym.module_path != nil) {
+        val found: *SemaModule = find_module(sema, func_sym.module_path);
+        if (found != nil) { origin_mod = found; }
+    }
+
+    # clone the function AST
+    val clone_res: Result[*ast.Node, str] = ast.clone_node(sema.alloc, func_sym.decl_node);
+    if (result_is_err[*ast.Node, str](clone_res)) { ret nil; }
+
+    val cloned: *ast.Node = result_unwrap_ok[*ast.Node, str](clone_res);
+    if (cloned == nil) { ret nil; }
+
+    # set the mangled name on the clone
+    cloned.info.fun_decl.name = mangled;
+    cloned.info.fun_decl.generics = nil;
+
+    # persist the mangled name
+    val pname: str = persist_string(sema, mangled);
+    if (pname == nil) { ret nil; }
+
+    # substitute type parameters in the cloned signature
+    substitute_fun_signature(sema, origin_mod, cloned, generic_params, ?resolved_args[0], param_count);
+
+    # resolve the cloned function's signature to get a concrete type
+    resolve.resolve_function_signature(sema, origin_mod, cloned);
+
+    val cloned_sym: *symbol.Symbol = cloned.symbol::*symbol.Symbol;
+    var func_type: *type.Type = nil;
+    if (cloned_sym != nil) {
+        func_type = cloned_sym.resolved_type;
+    }
+    if (func_type == nil) { func_type = cloned.type; }
+
+    # register the instantiation
+    register_func_instantiation(sema, origin_mod, cloned, pname, func_type,
+        generic_params, ?resolved_args[0], param_count);
+
+    # register in dedup map
+    inst_map_put(?sema.func_inst_map, sema.alloc, pname, pname);
+
+    # define symbol in origin module and register alias in caller module
+    define_instantiated_func(sema, origin_mod, cloned, pname);
+    if (origin_mod != mod) {
+        val def_sym: *symbol.Symbol = lookup_instantiated_func(sema, pname);
+        if (def_sym != nil) {
+            register_alias_in_module(sema, mod, pname, def_sym);
+        }
+    }
+
+    ret func_type;
+}
+
+# build an Itanium-style mangled name for a generic instantiation
+#
+# format: <base_name> "I" <mangled_type_args...> "E"
+# ---
+# sema:       analyzer context
+# base_name:  function name
+# args:       resolved type arguments
+# arg_count:  number of arguments
+# ret:        mangled name string (stack-backed, caller must persist)
+fun build_mangled_name(sema: *Sema, base_name: str, args: **type.Type, arg_count: i32) str {
+    if (base_name == nil) { ret nil; }
+
+    var buf: [512]u8;
+    var pos: i32 = 0;
+
+    # write base name
+    val base_len: usize = str_len(base_name);
+    var ci: usize = 0;
+    for (ci < base_len && pos + 4 <= 512) {
+        buf[pos::usize] = base_name[ci];
+        pos = pos + 1;
+        ci = ci + 1;
+    }
+    if (ci < base_len) { ret nil; }
+
+    # write "I"
+    if (pos + 3 > 512) { ret nil; }
+    buf[pos::usize] = 'I';
+    pos = pos + 1;
+
+    # write each type arg
+    var ai: i32 = 0;
+    for (ai < arg_count) {
+        if (args[ai] != nil) {
+            if (pos + 2 >= 512) { ret nil; }
+            val remaining: i32 = 510 - pos;
+            val written: i32 = type_mangle(args[ai], ?buf[pos::usize], remaining::usize);
+            pos = pos + written;
+            if (pos + 2 > 512) { ret nil; }
+        }
+        ai = ai + 1;
+    }
+
+    # write "E" and null terminator
+    if (pos + 2 > 512) { ret nil; }
+    buf[pos::usize] = 'E';
+    pos = pos + 1;
+    buf[pos::usize] = 0;
+
+    ret (?buf[0])::str;
+}
+
+# resolve a type expression, substituting generic parameters with concrete types
+fun resolve_type_with_substitution(sema: *Sema, mod: *SemaModule, type_node: *ast.Node,
+    generic_params: *ast.List, args: **type.Type, arg_count: i32) *type.Type {
+    if (type_node == nil) { ret nil; }
+
+    # check if this is a type name that matches a generic parameter
+    if (type_node.kind == ast.NODE_TYPE_NAME) {
+        val name: str = type_node.info.type_name.path;
+        if (name != nil) {
+            val idx: i32 = find_generic_param_index(generic_params, name);
+            if (idx >= 0 && idx < arg_count) {
+                val t: *type.Type = args[idx];
+                type_node.type = t;
+                ret t;
+            }
+        }
+    }
+
+    # for pointer types, substitute inner
+    if (type_node.kind == ast.NODE_TYPE_PTR || type_node.kind == ast.NODE_TYPE_REF) {
+        val inner: *type.Type = resolve_type_with_substitution(
+            sema, mod, type_node.info.type_ptr.inner, generic_params, args, arg_count);
+        if (inner == nil) { ret nil; }
+        val is_mut: bool = type_node.kind == ast.NODE_TYPE_PTR;
+        val r: Result[*type.Type, str] = type.make_pointer(sema.types, inner, is_mut);
+        if (result_is_err[*type.Type, str](r)) { ret nil; }
+        val t: *type.Type = result_unwrap_ok[*type.Type, str](r);
+        type_node.type = t;
+        ret t;
+    }
+
+    # for array types, substitute element
+    if (type_node.kind == ast.NODE_TYPE_ARRAY) {
+        val elem: *type.Type = resolve_type_with_substitution(
+            sema, mod, type_node.info.type_array.elem_type, generic_params, args, arg_count);
+        if (elem == nil) { ret nil; }
+        var len: usize = 0;
+        val size_node: *ast.Node = type_node.info.type_array.size;
+        if (size_node != nil) {
+            len = ast.node_get_int_value(size_node)::usize;
+        }
+        val r: Result[*type.Type, str] = type.make_array(sema.types, elem, len);
+        if (result_is_err[*type.Type, str](r)) { ret nil; }
+        val t: *type.Type = result_unwrap_ok[*type.Type, str](r);
+        type_node.type = t;
+        ret t;
+    }
+
+    # fall back to normal resolution
+    ret resolve.resolve_type_expr(sema, mod, type_node);
+}
+
+# find the index of a generic parameter by name
+fun find_generic_param_index(params: *ast.List, name: str) i32 {
+    if (params == nil || name == nil) { ret -1; }
+
+    var i: i32 = 0;
+    for (i < params.count) {
+        val pnode: *ast.Node = params.nodes[i];
+        if (pnode != nil) {
+            # generic param nodes store their name in type_name.path
+            if (pnode.kind == ast.NODE_TYPE_NAME) {
+                val pname: str = pnode.info.type_name.path;
+                if (pname != nil && str_equals(pname, name)) { ret i; }
+            }
+            # also check ident_expr for param names
+            if (pnode.kind == ast.NODE_EXPR_IDENT) {
+                val pname: str = pnode.info.ident_expr.name;
+                if (pname != nil && str_equals(pname, name)) { ret i; }
+            }
+        }
+        i = i + 1;
+    }
+
+    ret -1;
+}
+
+# substitute generic parameters in a cloned function's signature
+fun substitute_fun_signature(sema: *Sema, mod: *SemaModule, cloned: *ast.Node,
+    generic_params: *ast.List, args: **type.Type, arg_count: i32) {
+    if (cloned == nil) { ret; }
+
+    val decl: *ast.FunDecl = ?cloned.info.fun_decl;
+
+    # substitute parameter types
+    if (decl.params != nil) {
+        var i: i32 = 0;
+        for (i < decl.params.count) {
+            val param: *ast.Node = decl.params.nodes[i];
+            if (param != nil && param.kind == ast.NODE_PARAM) {
+                val pt_node: *ast.Node = param.info.var_decl.type_node;
+                if (pt_node != nil) {
+                    resolve_type_with_substitution(sema, mod, pt_node, generic_params, args, arg_count);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    # substitute return type
+    if (decl.ret_type != nil) {
+        resolve_type_with_substitution(sema, mod, decl.ret_type, generic_params, args, arg_count);
+    }
+}
+
+# register a function instantiation record
+fun register_func_instantiation(sema: *Sema, origin_mod: *SemaModule, cloned: *ast.Node,
+    mangled_name: str, func_type: *type.Type,
+    generic_params: *ast.List, args: **type.Type, arg_count: i32) {
+    if (sema == nil) { ret; }
+
+    val r: Result[*FunctionInstantiation, allocator.AllocError] =
+        allocator.allocator_zalloc[FunctionInstantiation](sema.alloc, 1);
+    if (result_is_err[*FunctionInstantiation, allocator.AllocError](r)) { ret; }
+
+    val inst: *FunctionInstantiation = result_unwrap_ok[*FunctionInstantiation, allocator.AllocError](r);
+    inst.func_ast = cloned;
+    inst.mangled_name = mangled_name;
+    inst.func_type = func_type;
+    inst.origin_module = origin_mod;
+    inst.param_count = arg_count;
+
+    # copy param names
+    if (arg_count > 0 && generic_params != nil) {
+        val names_res: Result[*str, allocator.AllocError] =
+            allocator.allocator_alloc[str](sema.alloc, arg_count::usize);
+        if (result_is_ok[*str, allocator.AllocError](names_res)) {
+            inst.param_names = result_unwrap_ok[*str, allocator.AllocError](names_res);
+            var i: i32 = 0;
+            for (i < arg_count && i < generic_params.count) {
+                val pnode: *ast.Node = generic_params.nodes[i];
+                if (pnode != nil && pnode.kind == ast.NODE_TYPE_NAME) {
+                    inst.param_names[i] = pnode.info.type_name.path;
+                }
+                if (pnode != nil && pnode.kind == ast.NODE_EXPR_IDENT) {
+                    inst.param_names[i] = pnode.info.ident_expr.name;
+                }
+                i = i + 1;
+            }
+        }
+
+        # copy type pointers
+        val types_res: Result[**type.Type, allocator.AllocError] =
+            allocator.allocator_alloc[*type.Type](sema.alloc, arg_count::usize);
+        if (result_is_ok[**type.Type, allocator.AllocError](types_res)) {
+            inst.param_types = result_unwrap_ok[**type.Type, allocator.AllocError](types_res);
+            var i: i32 = 0;
+            for (i < arg_count) {
+                inst.param_types[i] = args[i];
+                i = i + 1;
+            }
+        }
+    }
+
+    # prepend to instantiation list
+    inst.next = sema.func_insts;
+    sema.func_insts = inst;
+    sema.func_inst_count = sema.func_inst_count + 1;
+}
+
+# define the instantiated function symbol in a module's root scope
+fun define_instantiated_func(sema: *Sema, mod: *SemaModule, cloned: *ast.Node, name: str) {
+    if (sema == nil || mod == nil || mod.table == nil || cloned == nil || name == nil) { ret; }
+
+    # check if already defined
+    val existing: Option[*symbol.Symbol] = symbol.scope_lookup_local(
+        symbol.table_root_scope(mod.table), name);
+    if (option_is_some[*symbol.Symbol](existing)) { ret; }
+
+    # temporarily set current scope to root for definition
+    val saved_scope: *symbol.Scope = symbol.table_current_scope(mod.table);
+    mod.table.current = symbol.table_root_scope(mod.table);
+
+    val def_res: Result[*symbol.Symbol, str] = symbol.table_define(mod.table, name, symbol.SYM_FUN);
+    if (result_is_ok[*symbol.Symbol, str](def_res)) {
+        val sym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](def_res);
+        sym.decl_node = cloned;
+        sym.is_public = true;
+        sym.module_path = mod.path;
+
+        val cloned_sym: *symbol.Symbol = cloned.symbol::*symbol.Symbol;
+        if (cloned_sym != nil) {
+            sym.resolved_type = cloned_sym.resolved_type;
+        }
+        if (sym.resolved_type == nil) {
+            sym.resolved_type = cloned.type;
+        }
+
+        cloned.symbol = sym::ptr;
+    }
+
+    mod.table.current = saved_scope;
+}
+
+# register a symbol alias so a caller module can find the instantiated function
+fun register_alias_in_module(sema: *Sema, mod: *SemaModule, name: str, sym: *symbol.Symbol) {
+    if (sema == nil || mod == nil || mod.table == nil || name == nil || sym == nil) { ret; }
+
+    # check if already exists in root scope
+    val existing: Option[*symbol.Symbol] = symbol.scope_lookup_local(
+        symbol.table_root_scope(mod.table), name);
+    if (option_is_some[*symbol.Symbol](existing)) { ret; }
+
+    val saved_scope: *symbol.Scope = symbol.table_current_scope(mod.table);
+    mod.table.current = symbol.table_root_scope(mod.table);
+
+    val def_res: Result[*symbol.Symbol, str] = symbol.table_define(mod.table, name, symbol.SYM_FUN);
+    if (result_is_ok[*symbol.Symbol, str](def_res)) {
+        val alias_sym: *symbol.Symbol = result_unwrap_ok[*symbol.Symbol, str](def_res);
+        alias_sym.decl_node = sym.decl_node;
+        alias_sym.resolved_type = sym.resolved_type;
+        alias_sym.is_public = true;
+        alias_sym.module_path = sym.module_path;
+    }
+
+    mod.table.current = saved_scope;
+}
+
+# look up an instantiated function by its mangled name across all modules
+fun lookup_instantiated_func(sema: *Sema, name: str) *symbol.Symbol {
+    if (sema == nil || name == nil) { ret nil; }
+
+    var mod: *SemaModule = sema.modules;
+    for (mod != nil) {
+        if (mod.table != nil) {
+            val opt: Option[*symbol.Symbol] = symbol.scope_lookup_local(
+                symbol.table_root_scope(mod.table), name);
+            if (option_is_some[*symbol.Symbol](opt)) {
+                ret option_unwrap[*symbol.Symbol](opt);
+            }
+        }
+        mod = mod.next;
+    }
+
+    ret nil;
+}
+
+# copy a string to heap for persistent storage
+fun persist_string(sema: *Sema, s: str) str {
+    if (sema == nil || s == nil) { ret nil; }
+
+    val len: usize = str_len(s);
+    val r: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](sema.alloc, len + 1);
+    if (result_is_err[*u8, allocator.AllocError](r)) { ret nil; }
+
+    val buf: *u8 = result_unwrap_ok[*u8, allocator.AllocError](r);
+    var i: usize = 0;
+    for (i < len) {
+        buf[i] = s[i];
+        i = i + 1;
+    }
+    buf[len] = 0;
+
+    ret buf::str;
+}
+
+# look up a cached generic type instantiation
+fun lookup_type_cache(sema: *Sema, sym: *symbol.Symbol, args: **type.Type, arg_count: i32) *type.Type {
+    if (sema == nil || sym == nil) { ret nil; }
+
+    var entry: *CachedInstantiation = sema.generic_cache;
+    for (entry != nil) {
+        if (entry.arg_count == arg_count && entry.generic_args != nil) {
+            var match: bool = true;
+            var i: i32 = 0;
+            for (i < arg_count) {
+                if (!type.types_equal(entry.generic_args[i], args[i])) {
+                    match = false;
+                    brk;
+                }
+                i = i + 1;
+            }
+            if (match && entry.result_type != nil) {
+                # verify it belongs to the same generic by checking base_generic
+                if (sym.resolved_type != nil && entry.result_type.base_generic == sym.resolved_type) {
+                    ret entry.result_type;
+                }
+            }
+        }
+        entry = entry.next;
+    }
+
+    ret nil;
+}
+
+# store a generic type instantiation in the cache
+fun store_type_cache(sema: *Sema, sym: *symbol.Symbol, args: **type.Type, arg_count: i32, result: *type.Type) {
+    if (sema == nil) { ret; }
+
+    val r: Result[*CachedInstantiation, allocator.AllocError] =
+        allocator.allocator_zalloc[CachedInstantiation](sema.alloc, 1);
+    if (result_is_err[*CachedInstantiation, allocator.AllocError](r)) { ret; }
+
+    val entry: *CachedInstantiation = result_unwrap_ok[*CachedInstantiation, allocator.AllocError](r);
+    entry.arg_count = arg_count;
+    entry.result_type = result;
+
+    # copy arg pointers
+    if (arg_count > 0) {
+        val a_res: Result[**type.Type, allocator.AllocError] =
+            allocator.allocator_alloc[*type.Type](sema.alloc, arg_count::usize);
+        if (result_is_ok[**type.Type, allocator.AllocError](a_res)) {
+            entry.generic_args = result_unwrap_ok[**type.Type, allocator.AllocError](a_res);
+            var i: i32 = 0;
+            for (i < arg_count) {
+                entry.generic_args[i] = args[i];
+                i = i + 1;
+            }
+        }
+    }
+
+    entry.next = sema.generic_cache;
+    sema.generic_cache = entry;
+}
