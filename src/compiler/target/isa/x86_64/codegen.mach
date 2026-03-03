@@ -1,0 +1,782 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use dbg:       std.print;
+use stream:    std.stream;
+use fmt:       std.fmt;
+
+use inst:      masm.inst;
+use op:        masm.op;
+use fn:        masm.function;
+use pool:      masm.pool;
+use msym:      masm.symbol;
+
+use isa:       mach.compiler.target.isa;
+use abi:       mach.compiler.target.abi;
+use section:   mach.compiler.target.of.section;
+use objstate:  mach.compiler.codegen.objstate;
+use inst_buf:  mach.compiler.codegen.inst_buf;
+use emasm:     mach.compiler.codegen.emit_asm;
+
+use xi:        mach.compiler.target.isa.x86_64.inst;
+use opcode:    mach.compiler.target.isa.x86_64.opcode;
+use isel:      mach.compiler.target.isa.x86_64.isel;
+use regalloc:  mach.compiler.target.isa.x86_64.regalloc;
+use peephole:  mach.compiler.target.isa.x86_64.opt.peephole;
+use encode:    mach.compiler.target.isa.x86_64.encode;
+
+# mach.compiler.target.isa.x86_64.codegen: x86_64 backend pipeline.
+# ---
+# single entry point from the orchestrator. runs the complete backend
+# pipeline for one function: ISel -> regalloc -> peephole -> frame ->
+# fixup -> encode. returns BackendResult with metrics.
+
+pub rec CodegenRequest {
+    func:      *fn.Function;
+    text_sec:  *section.Section;
+    text_idx:  i32;
+    obj:       *objstate.ObjState;
+    abi:       *abi.ABI;
+    isa:       *isa.ISA;
+    alloc:     *allocator.Allocator;
+    asm_w:     *emasm.AsmWriter;
+    verbose:   bool;
+}
+
+rec FrameLayout {
+    local_size:        usize;
+    spill_size:        usize;
+    call_area_size:    usize;
+    total_frame:       usize;
+    callee_mask:       u32;
+    callee_push_count: i32;
+    callee_save_size:  usize;
+    frame_reg:         i32;
+    has_frame:         bool;
+}
+
+pub fun codegen_function(ctx: ptr, request: ptr) isa.BackendResult {
+    var r: isa.BackendResult;
+    r.ok = false;
+    r.ir_count = 0;
+    r.inst_count = 0;
+    r.spill_count = 0;
+    r.frame_size = 0;
+    r.callee_mask = 0;
+
+    val req: *CodegenRequest = request::*CodegenRequest;
+    if (req == nil || req.func == nil || req.alloc == nil) { ret r; }
+
+    val func: *fn.Function = req.func;
+    val alloc: *allocator.Allocator = req.alloc;
+
+    var func_buf: inst_buf.InstructionBuffer[xi.MachInst] = xi.buf_create(alloc);
+    var tmp_buf: inst_buf.InstructionBuffer[xi.MachInst] = xi.buf_create(alloc);
+
+    r.ir_count = isel_function(req.isa, func, ?func_buf, ?tmp_buf);
+    xi.buf_destroy(?tmp_buf);
+
+    if (req.verbose) {
+        dbg.eprintf("[verbose] x86_64:   ISel: %d IR -> %d MachInst\n",
+            r.ir_count::i64, func_buf.count::i64);
+    }
+
+    var ra: regalloc.RegAllocResult = regalloc.alloc_function(
+        alloc, req.isa, req.abi, ?func_buf, compute_local_size(func));
+    xi.buf_destroy(?func_buf);
+
+    if (!ra.ok) {
+        if (req.verbose) {
+            dbg.eprintf("[verbose] x86_64:   regalloc FAILED for '%s'\n", func.name);
+        }
+        ret r;
+    }
+
+    if (req.verbose) {
+        dbg.eprintf("[verbose] x86_64:   regalloc: out=%d spill=%d callee_mask=0x%x\n",
+            ra.out.count::i64, ra.spill_size::i64, ra.callee_mask::i64);
+    }
+
+    val pre_peep: i32 = ra.out.count;
+    peephole.optimize(?ra.out);
+
+    if (req.verbose) {
+        dbg.eprintf("[verbose] x86_64:   peephole: %d -> %d MachInst\n",
+            pre_peep::i64, ra.out.count::i64);
+    }
+
+    val frame: FrameLayout = compute_frame(func, ?ra, req.abi, req.isa);
+
+    if (req.verbose) {
+        dbg.eprintf("[verbose] x86_64:   frame: locals=%d spill=%d call_area=%d total=%d\n",
+            frame.local_size::i64, frame.spill_size::i64,
+            frame.call_area_size::i64, frame.total_frame::i64);
+    }
+
+    fixup_operands(?ra.out, ?frame);
+
+    if (!encode_function(req.obj, ?ra.out, ?frame, func.name,
+                         req.text_sec, req.text_idx, alloc,
+                         req.asm_w, req.verbose)) {
+        xi.buf_destroy(?ra.out);
+        ret r;
+    }
+
+    r.ok = true;
+    r.inst_count = ra.out.count;
+    r.spill_count = ra.spill_size::i32;
+    r.frame_size = frame.total_frame;
+    r.callee_mask = ra.callee_mask;
+
+    xi.buf_destroy(?ra.out);
+    ret r;
+}
+
+fun isel_function(i: *isa.ISA, func: *fn.Function,
+                  out: *inst_buf.InstructionBuffer[xi.MachInst],
+                  tmp: *inst_buf.InstructionBuffer[xi.MachInst]) i32 {
+    xi.buf_clear(out);
+    var ir_count: i32 = 0;
+
+    var bi: i32 = 0;
+    for (bi < func.blocks.len::i32) {
+        val block: *fn.Block = func.blocks.data[bi];
+        if (block == nil) { bi = bi + 1; cnt; }
+
+        var ii: i32 = 0;
+        for (ii < block.inst_count) {
+            val ir_inst: *inst.Instruction = ?block.insts[ii];
+            ir_count = ir_count + 1;
+
+            var dbg_line: i32 = 0;
+            var dbg_file: u16 = 0;
+            if (block.debug_locs != nil) {
+                dbg_line = block.debug_locs[ii].src_line;
+                dbg_file = block.debug_locs[ii].src_file;
+            }
+
+            if (ir_inst.op == op.OP_LABEL) {
+                val lbl_name: str = pool.label_get(?func.labels, ir_inst.f2::i32);
+                var label_mi: xi.MachInst;
+                label_mi.opcode = xi.LABEL;
+                label_mi.dst = xi.make_label(lbl_name);
+                label_mi.src1 = xi.make_none();
+                label_mi.src2 = xi.make_none();
+                label_mi.size = 0;
+                label_mi.flags = 0;
+                label_mi.src_line = dbg_line;
+                label_mi.src_file = dbg_file;
+                xi.buf_append(out, label_mi);
+            } or {
+                xi.buf_clear(tmp);
+                isel.select(ir_inst, func, tmp);
+                peephole.optimize(tmp);
+
+                var mi: i32 = 0;
+                for (mi < tmp.count) {
+                    val minst: *xi.MachInst = xi.buf_get(tmp, mi);
+                    if (minst != nil) {
+                        minst.src_line = dbg_line;
+                        minst.src_file = dbg_file;
+                        xi.buf_append(out, @minst);
+                    }
+                    mi = mi + 1;
+                }
+            }
+
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    ret ir_count;
+}
+
+fun compute_local_size(func: *fn.Function) usize {
+    if (func == nil) { ret 0; }
+    var min_disp: i64 = 0;
+
+    var bi: i32 = 0;
+    for (bi < func.blocks.len::i32) {
+        val block: *fn.Block = func.blocks.data[bi];
+        if (block == nil) { bi = bi + 1; cnt; }
+
+        var ii: i32 = 0;
+        for (ii < block.inst_count) {
+            val ir: *inst.Instruction = ?block.insts[ii];
+            val o: u8 = ir.op;
+            if (o == op.OP_LOAD || o == op.OP_STORE || o == op.OP_ADDR) {
+                val dst_op: xi.Operand = xi.inst_to_dst_operand(ir, func);
+                val src1_op: xi.Operand = xi.inst_to_src1_operand(ir, func);
+                if (dst_op.kind == xi.OPK_MEM && dst_op.base == inst.VREG_FP) {
+                    if (dst_op.disp < min_disp) { min_disp = dst_op.disp; }
+                }
+                if (src1_op.kind == xi.OPK_MEM && src1_op.base == inst.VREG_FP) {
+                    if (src1_op.disp < min_disp) { min_disp = src1_op.disp; }
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    if (min_disp >= 0) { ret 0; }
+    ret (-min_disp)::usize;
+}
+
+fun compute_call_area_size(func: *fn.Function) usize {
+    if (func == nil) { ret 0; }
+    var max_end: i64 = 0;
+
+    var bi: i32 = 0;
+    for (bi < func.blocks.len::i32) {
+        val block: *fn.Block = func.blocks.data[bi];
+        if (block == nil) { bi = bi + 1; cnt; }
+
+        var ii: i32 = 0;
+        for (ii < block.inst_count) {
+            val ir: *inst.Instruction = ?block.insts[ii];
+            if (ir.op == op.OP_STORE) {
+                val dst_op: xi.Operand = xi.inst_to_dst_operand(ir, func);
+                if (dst_op.kind == xi.OPK_MEM && dst_op.base == inst.VREG_SP) {
+                    val end: i64 = dst_op.disp + inst.size(ir)::i64;
+                    if (end > max_end) { max_end = end; }
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    ret max_end::usize;
+}
+
+fun compute_frame(func: *fn.Function, ra: *regalloc.RegAllocResult,
+                  a: *abi.ABI, i: *isa.ISA) FrameLayout {
+    var f: FrameLayout;
+    f.local_size = compute_local_size(func);
+    f.spill_size = ra.spill_size;
+    f.call_area_size = compute_call_area_size(func);
+    f.callee_mask = ra.callee_mask;
+    f.frame_reg = i.frame_reg(i.ctx);
+
+    f.callee_push_count = 0;
+    var cmask_tmp: u32 = ra.callee_mask;
+    for (cmask_tmp != 0) {
+        f.callee_push_count = f.callee_push_count + (cmask_tmp & 1)::i32;
+        cmask_tmp = cmask_tmp >> 1;
+    }
+    f.callee_save_size = f.callee_push_count::usize * 8;
+
+    f.total_frame = f.local_size + f.spill_size + f.call_area_size;
+    val pushed_bytes: usize = (2 + f.callee_push_count::usize) * 8;
+    val stack_al: usize = a.stack_align(a.ctx);
+    val al_mask: usize = stack_al - 1;
+    val align_rem: usize = (pushed_bytes + f.total_frame) & al_mask;
+    if (align_rem != 0) {
+        f.total_frame = f.total_frame + (stack_al - align_rem);
+    }
+
+    f.has_frame = f.total_frame > 0 || ra.callee_mask != 0;
+    ret f;
+}
+
+fun fixup_operands(buf: *inst_buf.InstructionBuffer[xi.MachInst], frame: *FrameLayout) {
+    var si: i32 = 0;
+    for (si < buf.count) {
+        val sinst: *xi.MachInst = xi.buf_get(buf, si);
+        if (sinst != nil) {
+            fixup_operand(?sinst.dst,  frame);
+            fixup_operand(?sinst.src1, frame);
+            fixup_operand(?sinst.src2, frame);
+        }
+        si = si + 1;
+    }
+}
+
+fun fixup_operand(opr: *xi.Operand, frame: *FrameLayout) {
+    if (opr == nil || opr.kind != xi.OPK_MEM) { ret; }
+
+    if (opr.base == inst.VREG_SP) {
+        opr.base = frame.frame_reg;
+        opr.disp = opr.disp - frame.total_frame::i64;
+    }
+
+    if (opr.base == frame.frame_reg && opr.disp < 0) {
+        opr.disp = opr.disp - frame.callee_save_size::i64;
+    }
+}
+
+fun emit_prologue(out: *inst_buf.InstructionBuffer[xi.MachInst],
+                  total_frame: usize, callee_mask: u32) {
+    var mi: xi.MachInst;
+    mi.src2 = xi.make_none();
+    mi.src_line = 0;
+    mi.src_file = 0;
+
+    mi.opcode = opcode.PUSH;
+    mi.dst = xi.make_reg(opcode.RBP, 8);
+    mi.src1 = xi.make_none();
+    mi.size = 8;
+    mi.flags = opcode.FLAG_REX_W;
+    xi.buf_append(out, mi);
+
+    mi.opcode = opcode.OP_MOV;
+    mi.dst = xi.make_reg(opcode.RBP, 8);
+    mi.src1 = xi.make_reg(opcode.RSP, 8);
+    mi.size = 8;
+    mi.flags = opcode.FLAG_REX_W;
+    xi.buf_append(out, mi);
+
+    var cmask: u32 = callee_mask;
+    var bit: i32 = 0;
+    for (bit < 16) {
+        if ((cmask & (1::u32 << bit::u32)) != 0) {
+            mi.opcode = opcode.PUSH;
+            mi.dst = xi.make_reg(bit, 8);
+            mi.src1 = xi.make_none();
+            mi.size = 8;
+            mi.flags = opcode.FLAG_REX_W;
+            xi.buf_append(out, mi);
+        }
+        bit = bit + 1;
+    }
+
+    if (total_frame > 0) {
+        mi.opcode = opcode.SUB;
+        mi.dst = xi.make_reg(opcode.RSP, 8);
+        mi.src1 = xi.make_imm(total_frame::i64, 8);
+        mi.size = 8;
+        mi.flags = opcode.FLAG_REX_W;
+        xi.buf_append(out, mi);
+    }
+}
+
+fun emit_epilogue(out: *inst_buf.InstructionBuffer[xi.MachInst],
+                  callee_mask: u32) {
+    var mi: xi.MachInst;
+    mi.src2 = xi.make_none();
+    mi.src_line = 0;
+    mi.src_file = 0;
+
+    mi.opcode = opcode.OP_MOV;
+    mi.dst = xi.make_reg(opcode.RSP, 8);
+    mi.src1 = xi.make_reg(opcode.RBP, 8);
+    mi.size = 8;
+    mi.flags = opcode.FLAG_REX_W;
+    xi.buf_append(out, mi);
+
+    var bit: i32 = 15;
+    for (bit >= 0) {
+        if ((callee_mask & (1::u32 << bit::u32)) != 0) {
+            mi.opcode = opcode.POP;
+            mi.dst = xi.make_reg(bit, 8);
+            mi.src1 = xi.make_none();
+            mi.size = 8;
+            mi.flags = opcode.FLAG_REX_W;
+            xi.buf_append(out, mi);
+        }
+        bit = bit - 1;
+    }
+
+    mi.opcode = opcode.POP;
+    mi.dst = xi.make_reg(opcode.RBP, 8);
+    mi.src1 = xi.make_none();
+    mi.size = 8;
+    mi.flags = opcode.FLAG_REX_W;
+    xi.buf_append(out, mi);
+
+    mi.opcode = opcode.RET;
+    mi.dst = xi.make_none();
+    mi.src1 = xi.make_none();
+    mi.size = 0;
+    mi.flags = 0;
+    xi.buf_append(out, mi);
+}
+
+fun encode_buf_insts(buf: *inst_buf.InstructionBuffer[xi.MachInst],
+                     sec: *section.Section, alloc: *allocator.Allocator,
+                     asm_w: *emasm.AsmWriter) {
+    var bi: i32 = 0;
+    for (bi < buf.count) {
+        val minst: *xi.MachInst = xi.buf_get(buf, bi);
+        if (minst != nil) {
+            encode.encode_instruction(minst, sec, alloc);
+            if (asm_w != nil) {
+                format_inst(minst, ?asm_w.w);
+            }
+        }
+        bi = bi + 1;
+    }
+}
+
+fun encode_function(obj: *objstate.ObjState,
+                    buf: *inst_buf.InstructionBuffer[xi.MachInst],
+                    frame: *FrameLayout, func_name: str,
+                    text_sec: *section.Section, text_idx: i32,
+                    alloc: *allocator.Allocator,
+                    asm_w: *emasm.AsmWriter, verbose: bool) bool {
+    val func_start: usize = section.current_offset(text_sec);
+
+    var pro_buf: inst_buf.InstructionBuffer[xi.MachInst] = xi.buf_create(alloc);
+    if (frame.has_frame) {
+        emit_prologue(?pro_buf, frame.total_frame, frame.callee_mask);
+    }
+
+    if (asm_w != nil) {
+        emasm.emit_func_header(asm_w, func_name);
+    }
+
+    encode_buf_insts(?pro_buf, text_sec, alloc, asm_w);
+    xi.buf_destroy(?pro_buf);
+
+    var encode_fails: i32 = 0;
+    var encode_ok: i32 = 0;
+    var last_debug_line: i32 = 0;
+    var ei: i32 = 0;
+    for (ei < buf.count) {
+        val minst: *xi.MachInst = xi.buf_get(buf, ei);
+        if (minst == nil) { ei = ei + 1; cnt; }
+
+        if (minst.src_line > 0 && minst.src_line != last_debug_line) {
+            val dbg_off: usize = section.current_offset(text_sec);
+            objstate.add_debug_line(obj, dbg_off, minst.src_file, minst.src_line);
+            last_debug_line = minst.src_line;
+        }
+
+        if (minst.opcode == xi.LABEL) {
+            register_label_symbol(obj, minst, text_sec, text_idx, alloc);
+            if (asm_w != nil && minst.dst.label != nil) {
+                emasm.emit_label(asm_w, minst.dst.label);
+            }
+        } or (minst.opcode == opcode.RET && frame.has_frame) {
+            var epi_buf: inst_buf.InstructionBuffer[xi.MachInst] = xi.buf_create(alloc);
+            emit_epilogue(?epi_buf, frame.callee_mask);
+            encode_buf_insts(?epi_buf, text_sec, alloc, asm_w);
+            xi.buf_destroy(?epi_buf);
+            encode_ok = encode_ok + 1;
+        } or {
+            val enc_r: i32 = encode.encode_instruction(minst, text_sec, alloc);
+            if (enc_r < 0) {
+                dbg.eprintf("  ENCODE FAIL '%s' #%d opc=%d dst.k=%d s1.k=%d s2.k=%d sz=%d\n",
+                    func_name, ei::i64, minst.opcode::i64,
+                    minst.dst.kind::i64, minst.src1.kind::i64,
+                    minst.src2.kind::i64, minst.size::i64);
+                encode_fails = encode_fails + 1;
+            } or {
+                encode_ok = encode_ok + 1;
+            }
+            if (asm_w != nil) {
+                format_inst(minst, ?asm_w.w);
+            }
+        }
+
+        ei = ei + 1;
+    }
+
+    if (encode_fails > 0) {
+        dbg.eprintf("  TOTAL ENCODE FAILS for '%s': %d\n",
+            func_name, encode_fails::i64);
+    }
+    if (verbose) {
+        dbg.eprintf("[verbose] x86_64:   encode: %d/%d ok",
+            encode_ok::i64, buf.count::i64);
+        if (encode_fails > 0) {
+            dbg.eprintf(", %d FAILED", encode_fails::i64);
+        }
+        dbg.eprint("\n");
+    }
+
+    val func_end: usize = section.current_offset(text_sec);
+    fixup_symbol_offset(obj, func_name, func_start, func_end - func_start, text_idx);
+
+    if (verbose) {
+        dbg.eprintf("[verbose] x86_64:   symbol '%s' offset=%d size=%d\n",
+            func_name, func_start::i64, (func_end - func_start)::i64);
+    }
+
+    if (asm_w != nil) {
+        emasm.emit_newline(asm_w);
+    }
+
+    ret encode_fails == 0;
+}
+
+fun fixup_symbol_offset(obj: *objstate.ObjState, name: str, offset: usize, size: usize, text_idx: i32) {
+    val s: *msym.Symbol = objstate.get_symbol(obj, name);
+    if (s != nil) {
+        s.offset = offset;
+        s.size = size;
+        if (text_idx >= 0) {
+            s.section = text_idx::u64;
+        }
+    }
+}
+
+fun register_label_symbol(obj: *objstate.ObjState, minst: *xi.MachInst,
+                          sec: *section.Section, text_idx: i32,
+                          alloc: *allocator.Allocator) {
+    if (minst == nil || minst.dst.label == nil) { ret; }
+
+    val offset: usize = section.current_offset(sec);
+    val name: str = minst.dst.label;
+
+    val existing: *msym.Symbol = objstate.get_symbol(obj, name);
+    if (existing != nil) {
+        existing.offset = offset;
+        if (text_idx >= 0) {
+            existing.section = text_idx::u64;
+        }
+        ret;
+    }
+
+    val alloc_r: Result[*msym.Symbol, allocator.AllocError] =
+        allocator.allocator_alloc[msym.Symbol](alloc, 1);
+    if (result_is_err[*msym.Symbol, allocator.AllocError](alloc_r)) { ret; }
+
+    val s: *msym.Symbol = result_unwrap_ok[*msym.Symbol, allocator.AllocError](alloc_r);
+    @s = msym.init(name);
+    s.binding = msym.BIND_LOCAL;
+    s.sym_type = msym.SYM_FUNC;
+    s.offset = offset;
+    s.defined = true;
+    if (text_idx >= 0) {
+        s.section = text_idx::u64;
+    }
+
+    objstate.add_symbol(obj, s);
+}
+
+val ASM_MNEM_TAB: i32 = 8;
+
+fun format_inst(mi: *xi.MachInst, w: *stream.Writer) {
+    if (mi == nil || w == nil) { ret; }
+    if (mi.opcode == xi.LABEL) { ret; }
+    if (mi.opcode == xi.NOP) { ret; }
+
+    val mnem: str = opcode.get_name(mi.opcode);
+    if (mnem == nil) { ret; }
+
+    fmt.write_str(w, "    ");
+    fmt.write_str(w, mnem);
+
+    val mlen: i32 = str_len(mnem)::i32;
+    asm_write_padding(w, ASM_MNEM_TAB - mlen);
+
+    var has_ops: bool = false;
+
+    if (!xi.is_none(?mi.dst)) {
+        format_operand(?mi.dst, mi, w, true);
+        has_ops = true;
+    }
+
+    if (!xi.is_none(?mi.src1)) {
+        if (has_ops) { fmt.write_str(w, ", "); }
+        format_operand(?mi.src1, mi, w, false);
+        has_ops = true;
+    }
+
+    if (!xi.is_none(?mi.src2)) {
+        if (has_ops) { fmt.write_str(w, ", "); }
+        format_operand(?mi.src2, mi, w, false);
+    }
+
+    fmt.write_newline(w);
+}
+
+fun format_operand(op: *xi.Operand, mi: *xi.MachInst, w: *stream.Writer, is_dst: bool) {
+    if (op == nil || w == nil) { ret; }
+
+    if (op.kind == xi.OPK_REG) {
+        format_reg_operand(op, mi, w, is_dst);
+    } or (op.kind == xi.OPK_IMM) {
+        fmt.write_str(w, "$");
+        fmt.write_i64(w, op.imm);
+    } or (op.kind == xi.OPK_MEM) {
+        format_mem_operand(op, w);
+    } or (op.kind == xi.OPK_LABEL) {
+        if (op.label != nil) { fmt.write_str(w, op.label); }
+    } or (op.kind == xi.OPK_SYM) {
+        fmt.write_str(w, "<sym:");
+        fmt.write_u64(w, op.sym_id);
+        fmt.write_str(w, ">");
+    }
+}
+
+fun format_reg_operand(op: *xi.Operand, mi: *xi.MachInst, w: *stream.Writer, is_dst: bool) {
+    val rid: i32 = op.reg;
+    var sz: u8 = op.size;
+    if (sz == 0) { sz = mi.size; }
+
+    if (rid >= opcode.XMM0 && rid <= opcode.XMM15) {
+        fmt.write_str(w, "%");
+        fmt.write_str(w, fp_reg_name(rid));
+        ret;
+    }
+
+    if (is_dst && is_fp_conversion_dst_gp(mi.opcode)) {
+        fmt.write_str(w, "%");
+        fmt.write_str(w, gp_reg_name_sized(rid, sz));
+        ret;
+    }
+    if (!is_dst && is_fp_conversion_src_gp(mi.opcode)) {
+        fmt.write_str(w, "%");
+        fmt.write_str(w, gp_reg_name_sized(rid, sz));
+        ret;
+    }
+
+    val is_fp_op: bool = mi.opcode >= opcode.MOVSS && mi.opcode <= opcode.CVTTSD2SI;
+    if (is_fp_op && !is_fp_conversion_dst_gp(mi.opcode) && !is_fp_conversion_src_gp(mi.opcode)) {
+        fmt.write_str(w, "%");
+        fmt.write_str(w, fp_reg_name(rid));
+        ret;
+    }
+
+    fmt.write_str(w, "%");
+    fmt.write_str(w, gp_reg_name_sized(rid, sz));
+}
+
+fun format_mem_operand(op: *xi.Operand, w: *stream.Writer) {
+    val sz: u8 = op.size;
+    val prefix: str = mem_size_prefix(sz);
+    if (prefix != nil) {
+        fmt.write_str(w, prefix);
+        fmt.write_str(w, " ");
+    }
+
+    if (op.disp != 0) {
+        fmt.write_i64(w, op.disp);
+    }
+    fmt.write_str(w, "(");
+    fmt.write_str(w, "%");
+    fmt.write_str(w, gp_reg_name_sized(op.base, 8));
+
+    if (op.index >= 0) {
+        fmt.write_str(w, ", %");
+        fmt.write_str(w, gp_reg_name_sized(op.index, 8));
+        fmt.write_str(w, ", ");
+        fmt.write_i64(w, op.scale::i64);
+    }
+    fmt.write_str(w, ")");
+}
+
+fun gp_reg_name_sized(id: i32, size: u8) str {
+    if (size == 1) {
+        if (id == opcode.RAX) { ret "al"; }
+        if (id == opcode.RCX) { ret "cl"; }
+        if (id == opcode.RDX) { ret "dl"; }
+        if (id == opcode.RBX) { ret "bl"; }
+        if (id == opcode.RSP) { ret "spl"; }
+        if (id == opcode.RBP) { ret "bpl"; }
+        if (id == opcode.RSI) { ret "sil"; }
+        if (id == opcode.RDI) { ret "dil"; }
+        if (id == opcode.R8)  { ret "r8b"; }
+        if (id == opcode.R9)  { ret "r9b"; }
+        if (id == opcode.R10) { ret "r10b"; }
+        if (id == opcode.R11) { ret "r11b"; }
+        if (id == opcode.R12) { ret "r12b"; }
+        if (id == opcode.R13) { ret "r13b"; }
+        if (id == opcode.R14) { ret "r14b"; }
+        if (id == opcode.R15) { ret "r15b"; }
+    }
+    if (size == 2) {
+        if (id == opcode.RAX) { ret "ax"; }
+        if (id == opcode.RCX) { ret "cx"; }
+        if (id == opcode.RDX) { ret "dx"; }
+        if (id == opcode.RBX) { ret "bx"; }
+        if (id == opcode.RSP) { ret "sp"; }
+        if (id == opcode.RBP) { ret "bp"; }
+        if (id == opcode.RSI) { ret "si"; }
+        if (id == opcode.RDI) { ret "di"; }
+        if (id == opcode.R8)  { ret "r8w"; }
+        if (id == opcode.R9)  { ret "r9w"; }
+        if (id == opcode.R10) { ret "r10w"; }
+        if (id == opcode.R11) { ret "r11w"; }
+        if (id == opcode.R12) { ret "r12w"; }
+        if (id == opcode.R13) { ret "r13w"; }
+        if (id == opcode.R14) { ret "r14w"; }
+        if (id == opcode.R15) { ret "r15w"; }
+    }
+    if (size == 4) {
+        if (id == opcode.RAX) { ret "eax"; }
+        if (id == opcode.RCX) { ret "ecx"; }
+        if (id == opcode.RDX) { ret "edx"; }
+        if (id == opcode.RBX) { ret "ebx"; }
+        if (id == opcode.RSP) { ret "esp"; }
+        if (id == opcode.RBP) { ret "ebp"; }
+        if (id == opcode.RSI) { ret "esi"; }
+        if (id == opcode.RDI) { ret "edi"; }
+        if (id == opcode.R8)  { ret "r8d"; }
+        if (id == opcode.R9)  { ret "r9d"; }
+        if (id == opcode.R10) { ret "r10d"; }
+        if (id == opcode.R11) { ret "r11d"; }
+        if (id == opcode.R12) { ret "r12d"; }
+        if (id == opcode.R13) { ret "r13d"; }
+        if (id == opcode.R14) { ret "r14d"; }
+        if (id == opcode.R15) { ret "r15d"; }
+    }
+    if (id == opcode.RAX) { ret "rax"; }
+    if (id == opcode.RCX) { ret "rcx"; }
+    if (id == opcode.RDX) { ret "rdx"; }
+    if (id == opcode.RBX) { ret "rbx"; }
+    if (id == opcode.RSP) { ret "rsp"; }
+    if (id == opcode.RBP) { ret "rbp"; }
+    if (id == opcode.RSI) { ret "rsi"; }
+    if (id == opcode.RDI) { ret "rdi"; }
+    if (id == opcode.R8)  { ret "r8"; }
+    if (id == opcode.R9)  { ret "r9"; }
+    if (id == opcode.R10) { ret "r10"; }
+    if (id == opcode.R11) { ret "r11"; }
+    if (id == opcode.R12) { ret "r12"; }
+    if (id == opcode.R13) { ret "r13"; }
+    if (id == opcode.R14) { ret "r14"; }
+    if (id == opcode.R15) { ret "r15"; }
+    ret "???";
+}
+
+fun fp_reg_name(id: i32) str {
+    if (id == opcode.XMM0)  { ret "xmm0"; }
+    if (id == opcode.XMM1)  { ret "xmm1"; }
+    if (id == opcode.XMM2)  { ret "xmm2"; }
+    if (id == opcode.XMM3)  { ret "xmm3"; }
+    if (id == opcode.XMM4)  { ret "xmm4"; }
+    if (id == opcode.XMM5)  { ret "xmm5"; }
+    if (id == opcode.XMM6)  { ret "xmm6"; }
+    if (id == opcode.XMM7)  { ret "xmm7"; }
+    if (id == opcode.XMM8)  { ret "xmm8"; }
+    if (id == opcode.XMM9)  { ret "xmm9"; }
+    if (id == opcode.XMM10) { ret "xmm10"; }
+    if (id == opcode.XMM11) { ret "xmm11"; }
+    if (id == opcode.XMM12) { ret "xmm12"; }
+    if (id == opcode.XMM13) { ret "xmm13"; }
+    if (id == opcode.XMM14) { ret "xmm14"; }
+    if (id == opcode.XMM15) { ret "xmm15"; }
+    ret "xmm?";
+}
+
+fun mem_size_prefix(size: u8) str {
+    if (size == 1) { ret "BYTE PTR"; }
+    if (size == 2) { ret "WORD PTR"; }
+    if (size == 4) { ret "DWORD PTR"; }
+    if (size == 8) { ret "QWORD PTR"; }
+    ret nil;
+}
+
+fun is_fp_conversion_dst_gp(opc: i32) bool {
+    ret opc == opcode.CVTTSS2SI || opc == opcode.CVTTSD2SI;
+}
+
+fun is_fp_conversion_src_gp(opc: i32) bool {
+    ret opc == opcode.CVTSI2SS || opc == opcode.CVTSI2SD;
+}
+
+fun asm_write_padding(w: *stream.Writer, n: i32) {
+    var i: i32 = 0;
+    for (i < n) {
+        fmt.write_str(w, " ");
+        i = i + 1;
+    }
+}
