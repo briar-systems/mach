@@ -1,0 +1,418 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use dbg:       std.print;
+use mem:       std.memory;
+use msym:      masm.symbol;
+use target:    mach.compiler.target;
+use section:   mach.compiler.target.of.section;
+
+# mach.compiler.codegen.objstate: codegen state.
+# ---
+# manages sections, symbols (with O(1) hash map lookup), and debug line
+# mappings produced during code generation. immutable program data
+# (IR functions, data declarations, debug file paths) lives in
+# masm.module.Module.
+
+val INITIAL_SECTION_CAP:    i32 = 8;
+val INITIAL_SYMBOL_CAP:     i32 = 8;
+val INITIAL_DEBUG_LINE_CAP: i32 = 64;
+
+val SYMMAP_INITIAL_CAP: i32 = 256;
+val SYMMAP_EMPTY:       u8 = 0;
+val SYMMAP_OCCUPIED:    u8 = 1;
+val SYMMAP_TOMBSTONE:   u8 = 2;
+val SYMMAP_LOAD_PCT:    i32 = 70;
+
+rec SymMap {
+    keys:   *str;
+    vals:   **msym.Symbol;
+    states: *u8;
+    len:    i32;
+    cap:    i32;
+    alloc:  *allocator.Allocator;
+}
+
+pub rec DebugLineEntry {
+    code_offset: usize;
+    file_idx:    u16;
+    line:        i32;
+}
+
+pub rec ObjState {
+    alloc:         *allocator.Allocator;
+    tgt:           target.Target;
+    sections:      **section.Section;
+    section_count: i32;
+    section_cap:   i32;
+    symbols:       **msym.Symbol;
+    symbol_count:  i32;
+    symbol_cap:    i32;
+    sym_map:       SymMap;
+    debug_lines:      *DebugLineEntry;
+    debug_line_count: i32;
+    debug_line_cap:   i32;
+}
+
+pub fun create(alloc: *allocator.Allocator, tgt: target.Target) Result[ObjState, str] {
+    if (alloc == nil) {
+        ret err[ObjState, str]("allocator is nil");
+    }
+
+    var obj: ObjState;
+    obj.alloc = alloc;
+    obj.tgt = tgt;
+    obj.sections = nil;
+    obj.section_count = 0;
+    obj.section_cap = 0;
+    obj.symbols = nil;
+    obj.symbol_count = 0;
+    obj.symbol_cap = 0;
+    obj.sym_map = symmap_init(alloc);
+    obj.debug_lines = nil;
+    obj.debug_line_count = 0;
+    obj.debug_line_cap = 0;
+
+    ret ok[ObjState, str](obj);
+}
+
+pub fun destroy(obj: *ObjState) {
+    if (obj == nil || obj.alloc == nil) {
+        ret;
+    }
+
+    var si: i32 = 0;
+    for (si < obj.section_count) {
+        section.destroy(obj.alloc, obj.sections[si]);
+        si = si + 1;
+    }
+
+    if (obj.sections != nil) {
+        allocator.allocator_free[*section.Section](obj.alloc, obj.sections, obj.section_cap::usize);
+    }
+
+    if (obj.symbols != nil) {
+        allocator.allocator_free[*msym.Symbol](obj.alloc, obj.symbols, obj.symbol_cap::usize);
+    }
+
+    symmap_dnit(?obj.sym_map);
+
+    if (obj.debug_lines != nil) {
+        allocator.allocator_free[DebugLineEntry](obj.alloc, obj.debug_lines, obj.debug_line_cap::usize);
+    }
+}
+
+pub fun get_section(obj: *ObjState, name: str) *section.Section {
+    if (obj == nil || obj.sections == nil || name == nil) {
+        ret nil;
+    }
+
+    var i: i32 = 0;
+    for (i < obj.section_count) {
+        val s: *section.Section = obj.sections[i];
+        if (s != nil && s.name != nil && str_equals(s.name, name)) {
+            ret s;
+        }
+        i = i + 1;
+    }
+
+    ret nil;
+}
+
+pub fun get_section_index(obj: *ObjState, name: str) i32 {
+    if (obj == nil || obj.sections == nil || name == nil) {
+        ret -1;
+    }
+
+    var i: i32 = 0;
+    for (i < obj.section_count) {
+        val s: *section.Section = obj.sections[i];
+        if (s != nil && s.name != nil && str_equals(s.name, name)) {
+            ret i;
+        }
+        i = i + 1;
+    }
+
+    ret -1;
+}
+
+pub fun get_or_create_section(obj: *ObjState, name: str, kind: msym.SectionKind) Result[*section.Section, str] {
+    if (obj == nil) {
+        ret err[*section.Section, str]("objstate is nil");
+    }
+
+    val existing: *section.Section = get_section(obj, name);
+    if (existing != nil) {
+        ret ok[*section.Section, str](existing);
+    }
+
+    if (obj.alloc == nil) {
+        ret err[*section.Section, str]("allocator is nil");
+    }
+
+    val sec_res: Result[*section.Section, str] = section.create(obj.alloc, name, kind, obj.tgt.isa.endian);
+    if (result_is_err[*section.Section, str](sec_res)) {
+        ret sec_res;
+    }
+
+    val sec: *section.Section = result_unwrap_ok[*section.Section, str](sec_res);
+
+    if (obj.section_count >= obj.section_cap) {
+        var new_cap: i32 = INITIAL_SECTION_CAP;
+        if (obj.section_cap > 0) {
+            new_cap = obj.section_cap * 2;
+        }
+
+        val r: Result[**section.Section, allocator.AllocError] = allocator.allocator_resize[*section.Section](
+            obj.alloc, obj.sections, obj.section_cap::usize, new_cap::usize
+        );
+        if (result_is_err[**section.Section, allocator.AllocError](r)) {
+            ret err[*section.Section, str](result_unwrap_err[**section.Section, allocator.AllocError](r));
+        }
+
+        obj.sections = result_unwrap_ok[**section.Section, allocator.AllocError](r);
+        obj.section_cap = new_cap;
+    }
+
+    obj.sections[obj.section_count] = sec;
+    obj.section_count = obj.section_count + 1;
+
+    ret ok[*section.Section, str](sec);
+}
+
+pub fun get_symbol(obj: *ObjState, name: str) *msym.Symbol {
+    if (obj == nil || name == nil) {
+        ret nil;
+    }
+
+    ret symmap_get(?obj.sym_map, name);
+}
+
+pub fun add_symbol(obj: *ObjState, s: *msym.Symbol) Result[bool, str] {
+    if (obj == nil) {
+        ret err[bool, str]("objstate is nil");
+    }
+    if (s == nil) {
+        ret err[bool, str]("symbol is nil");
+    }
+
+    if (s.name != nil) {
+        if (symmap_get(?obj.sym_map, s.name) != nil) {
+            ret ok[bool, str](true);
+        }
+    }
+
+    if (obj.symbol_count >= obj.symbol_cap) {
+        var new_cap: i32 = INITIAL_SYMBOL_CAP;
+        if (obj.symbol_cap > 0) {
+            new_cap = obj.symbol_cap * 2;
+        }
+
+        val r: Result[**msym.Symbol, allocator.AllocError] = allocator.allocator_resize[*msym.Symbol](
+            obj.alloc, obj.symbols, obj.symbol_cap::usize, new_cap::usize
+        );
+        if (result_is_err[**msym.Symbol, allocator.AllocError](r)) {
+            ret err[bool, str](result_unwrap_err[**msym.Symbol, allocator.AllocError](r));
+        }
+
+        obj.symbols = result_unwrap_ok[**msym.Symbol, allocator.AllocError](r);
+        obj.symbol_cap = new_cap;
+    }
+
+    obj.symbols[obj.symbol_count] = s;
+    obj.symbol_count = obj.symbol_count + 1;
+
+    if (s.name != nil) {
+        symmap_put(?obj.sym_map, s.name, s);
+    }
+
+    ret ok[bool, str](true);
+}
+
+pub fun add_debug_line(obj: *ObjState, code_offset: usize, file_idx: u16, line: i32) {
+    if (obj == nil || obj.alloc == nil || file_idx == 0 || line <= 0) {
+        ret;
+    }
+
+    if (obj.debug_line_count >= obj.debug_line_cap) {
+        var new_cap: i32 = INITIAL_DEBUG_LINE_CAP;
+        if (obj.debug_line_cap > 0) {
+            new_cap = obj.debug_line_cap * 2;
+        }
+        val r: Result[*DebugLineEntry, allocator.AllocError] = allocator.allocator_resize[DebugLineEntry](
+            obj.alloc, obj.debug_lines, obj.debug_line_cap::usize, new_cap::usize
+        );
+        if (result_is_err[*DebugLineEntry, allocator.AllocError](r)) {
+            ret;
+        }
+        obj.debug_lines = result_unwrap_ok[*DebugLineEntry, allocator.AllocError](r);
+        obj.debug_line_cap = new_cap;
+    }
+
+    val idx: i32 = obj.debug_line_count;
+    obj.debug_lines[idx].code_offset = code_offset;
+    obj.debug_lines[idx].file_idx = file_idx;
+    obj.debug_lines[idx].line = line;
+    obj.debug_line_count = obj.debug_line_count + 1;
+}
+
+fun fnv1a_str(s: str) u64 {
+    var h: u64 = 14695981039346656037;
+    if (s == nil) {
+        ret h;
+    }
+    var i: i32 = 0;
+    for (s[i] != 0) {
+        h = h ^ s[i]::u64;
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    ret h;
+}
+
+fun symmap_init(alloc: *allocator.Allocator) SymMap {
+    var m: SymMap;
+    m.alloc = alloc;
+    m.keys = nil;
+    m.vals = nil;
+    m.states = nil;
+    m.len = 0;
+    m.cap = 0;
+    ret m;
+}
+
+fun symmap_dnit(m: *SymMap) {
+    if (m == nil || m.alloc == nil) {
+        ret;
+    }
+    if (m.keys != nil) {
+        allocator.allocator_free[str](m.alloc, m.keys, m.cap::usize);
+    }
+    if (m.vals != nil) {
+        allocator.allocator_free[*msym.Symbol](m.alloc, m.vals, m.cap::usize);
+    }
+    if (m.states != nil) {
+        allocator.allocator_free[u8](m.alloc, m.states, m.cap::usize);
+    }
+    m.keys = nil;
+    m.vals = nil;
+    m.states = nil;
+    m.len = 0;
+    m.cap = 0;
+}
+
+fun symmap_get(m: *SymMap, key: str) *msym.Symbol {
+    if (m == nil || m.cap == 0 || key == nil) {
+        ret nil;
+    }
+    val h: u64 = fnv1a_str(key);
+    var idx: i32 = (h % m.cap::u64)::i32;
+    var probes: i32 = 0;
+    for (probes < m.cap) {
+        if (m.states[idx] == SYMMAP_EMPTY) {
+            ret nil;
+        }
+        if (m.states[idx] == SYMMAP_OCCUPIED && str_equals(m.keys[idx], key)) {
+            ret m.vals[idx];
+        }
+        idx = idx + 1;
+        if (idx >= m.cap) {
+            idx = 0;
+        }
+        probes = probes + 1;
+    }
+    ret nil;
+}
+
+fun symmap_put(m: *SymMap, key: str, value: *msym.Symbol) {
+    if (m == nil || key == nil) {
+        ret;
+    }
+
+    if (m.cap == 0 || (m.len + 1) * 100 > m.cap * SYMMAP_LOAD_PCT) {
+        symmap_grow(m);
+    }
+    if (m.cap == 0) {
+        ret;
+    }
+
+    val h: u64 = fnv1a_str(key);
+    var idx: i32 = (h % m.cap::u64)::i32;
+    var probes: i32 = 0;
+    for (probes < m.cap) {
+        if (m.states[idx] == SYMMAP_EMPTY || m.states[idx] == SYMMAP_TOMBSTONE) {
+            m.keys[idx] = key;
+            m.vals[idx] = value;
+            m.states[idx] = SYMMAP_OCCUPIED;
+            m.len = m.len + 1;
+            ret;
+        }
+        if (m.states[idx] == SYMMAP_OCCUPIED && str_equals(m.keys[idx], key)) {
+            m.vals[idx] = value;
+            ret;
+        }
+        idx = idx + 1;
+        if (idx >= m.cap) {
+            idx = 0;
+        }
+        probes = probes + 1;
+    }
+}
+
+fun symmap_grow(m: *SymMap) {
+    var new_cap: i32 = SYMMAP_INITIAL_CAP;
+    if (m.cap > 0) {
+        new_cap = m.cap * 2;
+    }
+
+    val kr: Result[*str, allocator.AllocError] = allocator.allocator_alloc[str](m.alloc, new_cap::usize);
+    if (result_is_err[*str, allocator.AllocError](kr)) {
+        ret;
+    }
+    val new_keys: *str = result_unwrap_ok[*str, allocator.AllocError](kr);
+
+    val vr: Result[**msym.Symbol, allocator.AllocError] = allocator.allocator_alloc[*msym.Symbol](m.alloc, new_cap::usize);
+    if (result_is_err[**msym.Symbol, allocator.AllocError](vr)) {
+        allocator.allocator_free[str](m.alloc, new_keys, new_cap::usize);
+        ret;
+    }
+    val new_vals: **msym.Symbol = result_unwrap_ok[**msym.Symbol, allocator.AllocError](vr);
+
+    val sr: Result[*u8, allocator.AllocError] = allocator.allocator_alloc[u8](m.alloc, new_cap::usize);
+    if (result_is_err[*u8, allocator.AllocError](sr)) {
+        allocator.allocator_free[str](m.alloc, new_keys, new_cap::usize);
+        allocator.allocator_free[*msym.Symbol](m.alloc, new_vals, new_cap::usize);
+        ret;
+    }
+    val new_states: *u8 = result_unwrap_ok[*u8, allocator.AllocError](sr);
+
+    mem.raw_zero(new_states::ptr, new_cap::usize);
+
+    val old_keys: *str = m.keys;
+    val old_vals: **msym.Symbol = m.vals;
+    val old_states: *u8 = m.states;
+    val old_cap: i32 = m.cap;
+
+    m.keys = new_keys;
+    m.vals = new_vals;
+    m.states = new_states;
+    m.cap = new_cap;
+    m.len = 0;
+
+    if (old_keys != nil) {
+        var i: i32 = 0;
+        for (i < old_cap) {
+            if (old_states[i] == SYMMAP_OCCUPIED) {
+                symmap_put(m, old_keys[i], old_vals[i]);
+            }
+            i = i + 1;
+        }
+
+        allocator.allocator_free[str](m.alloc, old_keys, old_cap::usize);
+        allocator.allocator_free[*msym.Symbol](m.alloc, old_vals, old_cap::usize);
+        allocator.allocator_free[u8](m.alloc, old_states, old_cap::usize);
+    }
+}
