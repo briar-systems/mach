@@ -1,7 +1,8 @@
-# mach.compiler.codegen: codegen passes.
+# mach.compiler.codegen: thin codegen dispatcher.
 # ---
-# ISel, register allocation, frame computation, operand fixup, and encoding.
-# produces machine code for all functions in a module.
+# delegates per-function code generation to the ISA backend via the
+# opaque codegen_function entry point. the orchestrator never touches
+# machine instruction internals.
 
 use std.types.bool;
 use std.types.size;
@@ -11,378 +12,37 @@ use std.types.result;
 use allocator: std.allocator;
 use print:     std.print;
 
-use target:   mach.compiler.target;
-use masm:     mach.compiler.masm;
-use inst:     masm.inst;
-use op:       masm.op;
-use fn:       masm.function;
-use pool:     masm.pool;
-use operand:  mach.compiler.masm.operand;
-use module:   masm.module;
-use section:  mach.compiler.masm.section;
-use sym:      mach.compiler.masm.symbol;
-use msym:     masm.symbol;
-use isa:      mach.compiler.target.isa;
-use abi:      mach.compiler.target.abi;
-use regalloc: mach.compiler.codegen.regalloc;
-use emasm:    mach.compiler.codegen.emit_asm;
+use target:    mach.compiler.target;
+use fn:        masm.function;
+use module:    masm.module;
+use msym:      masm.symbol;
+use isa:       mach.compiler.target.isa;
+use abi:       mach.compiler.target.abi;
+use section:   mach.compiler.target.of.section;
+use objstate:  mach.compiler.codegen.objstate;
+use emasm:     mach.compiler.codegen.emit_asm;
+use xcg:       mach.compiler.target.isa.x86_64.codegen;
 
-# FrameLayout: computed stack frame geometry for a function.
-# produced by compute_frame(), consumed by fixup_operands(), prologue, epilogue.
-rec FrameLayout {
-    local_size:      usize;   # from lowering
-    spill_size:      usize;   # from regalloc
-    call_area_size:  usize;   # from lowering (max outgoing stack args)
-    total_frame:     usize;   # local + spill + call_area (aligned)
-    callee_mask:     u32;     # bitmask of callee-saved regs used
-    callee_push_count: i32;   # popcount of callee_mask
-    callee_save_size:  usize; # callee_push_count * 8
-    frame_reg:       i32;     # physical frame pointer register
-    has_frame:       bool;    # true if prologue/epilogue needed
-}
-
-# --- pass: instruction selection ---
-
-# isel_function: lower all IR instructions in a function to machine instructions.
-# walks blocks in order, converts OP_LABEL to MACHINST_LABEL markers,
-# runs per-instruction ISel + machine peephole, propagates source locations.
-fun isel_function(i: *isa.ISA, func: *fn.Function,
-                  out: *isa.MachInstBuf, tmp: *isa.MachInstBuf) i32 {
-    isa.buf_clear(out);
-    var ir_count: i32 = 0;
-
-    var bi: i32 = 0;
-    for (bi < func.blocks.len::i32) {
-        val block: *fn.Block = func.blocks.data[bi];
-        if (block == nil) { bi = bi + 1; cnt; }
-
-        var ii: i32 = 0;
-        for (ii < block.inst_count) {
-            val ir_inst: *inst.Instruction = ?block.insts[ii];
-            ir_count = ir_count + 1;
-
-            # read debug info from parallel DebugLoc array
-            var dbg_line: i32 = 0;
-            var dbg_file: u16 = 0;
-            if (block.debug_locs != nil) {
-                dbg_line = block.debug_locs[ii].src_line;
-                dbg_file = block.debug_locs[ii].src_file;
-            }
-
-            if (ir_inst.op == op.OP_LABEL) {
-                # reconstruct label Operand from compact label index
-                val lbl_name: str = pool.label_get(?func.labels, ir_inst.f2::i32);
-                var label_mi: isa.MachInst;
-                label_mi.opcode = isa.MACHINST_LABEL;
-                label_mi.dst = operand.make_label(lbl_name);
-                label_mi.size = 0;
-                label_mi.flags = 0;
-                label_mi.src_line = dbg_line;
-                label_mi.src_file = dbg_file;
-                isa.buf_append(out, label_mi);
-            } or {
-                isa.buf_clear(tmp);
-                i.isel(i.ctx, ir_inst, func, tmp);
-                i.peephole(i.ctx, tmp);
-
-                var mi: i32 = 0;
-                for (mi < tmp.count) {
-                    val minst: *isa.MachInst = isa.buf_get(tmp, mi);
-                    if (minst != nil) {
-                        minst.src_line = dbg_line;
-                        minst.src_file = dbg_file;
-                        isa.buf_append(out, @minst);
-                    }
-                    mi = mi + 1;
-                }
-            }
-
-            ii = ii + 1;
-        }
-        bi = bi + 1;
-    }
-
-    ret ir_count;
-}
-
-# --- pass: frame computation ---
-
-# compute_local_size: scan IR for the minimum VREG_FP displacement.
-# the most negative displacement from FP is the local area extent.
-fun compute_local_size(func: *fn.Function) usize {
-    if (func == nil) { ret 0; }
-    var min_disp: i64 = 0;
-
-    var bi: i32 = 0;
-    for (bi < func.blocks.len::i32) {
-        val block: *fn.Block = func.blocks.data[bi];
-        if (block == nil) { bi = bi + 1; cnt; }
-
-        var ii: i32 = 0;
-        for (ii < block.inst_count) {
-            val ir: *inst.Instruction = ?block.insts[ii];
-            val o: u8 = ir.op;
-            if (o == op.OP_LOAD || o == op.OP_STORE || o == op.OP_ADDR) {
-                val dst_op: operand.Operand = operand.inst_to_dst_operand(ir, func);
-                val src1_op: operand.Operand = operand.inst_to_src1_operand(ir, func);
-                if (dst_op.kind == operand.OPK_MEM && dst_op.base == inst.VREG_FP) {
-                    if (dst_op.disp < min_disp) { min_disp = dst_op.disp; }
-                }
-                if (src1_op.kind == operand.OPK_MEM && src1_op.base == inst.VREG_FP) {
-                    if (src1_op.disp < min_disp) { min_disp = src1_op.disp; }
-                }
-            }
-            ii = ii + 1;
-        }
-        bi = bi + 1;
-    }
-
-    if (min_disp >= 0) { ret 0; }
-    ret (-min_disp)::usize;
-}
-
-# compute_call_area_size: scan IR for the maximum VREG_SP displacement.
-# this gives the outgoing stack argument area after ABI lowering.
-fun compute_call_area_size(func: *fn.Function) usize {
-    if (func == nil) { ret 0; }
-    var max_end: i64 = 0;
-
-    var bi: i32 = 0;
-    for (bi < func.blocks.len::i32) {
-        val block: *fn.Block = func.blocks.data[bi];
-        if (block == nil) { bi = bi + 1; cnt; }
-
-        var ii: i32 = 0;
-        for (ii < block.inst_count) {
-            val ir: *inst.Instruction = ?block.insts[ii];
-            if (ir.op == op.OP_STORE) {
-                val dst_op: operand.Operand = operand.inst_to_dst_operand(ir, func);
-                if (dst_op.kind == operand.OPK_MEM && dst_op.base == inst.VREG_SP) {
-                    val end: i64 = dst_op.disp + inst.size(ir)::i64;
-                    if (end > max_end) { max_end = end; }
-                }
-            }
-            ii = ii + 1;
-        }
-        bi = bi + 1;
-    }
-
-    ret max_end::usize;
-}
-
-# compute_frame: calculate stack frame geometry from function metadata and regalloc results.
-fun compute_frame(func: *fn.Function, ra: *regalloc.RegAllocResult,
-                  a: *abi.ABI, i: *isa.ISA) FrameLayout {
-    var f: FrameLayout;
-    f.local_size = compute_local_size(func);
-    f.spill_size = ra.spill_size;
-    f.call_area_size = compute_call_area_size(func);
-    f.callee_mask = ra.callee_mask;
-    f.frame_reg = i.frame_reg(i.ctx);
-
-    # count callee-saved registers
-    f.callee_push_count = 0;
-    var cmask_tmp: u32 = ra.callee_mask;
-    for (cmask_tmp != 0) {
-        f.callee_push_count = f.callee_push_count + (cmask_tmp & 1)::i32;
-        cmask_tmp = cmask_tmp >> 1;
-    }
-    f.callee_save_size = f.callee_push_count::usize * 8;
-
-    # compute total frame with alignment
-    f.total_frame = f.local_size + f.spill_size + f.call_area_size;
-    # align: return addr + push rbp + N callee pushes + frame ≡ 0 (mod stack_align)
-    val pushed_bytes: usize = (2 + f.callee_push_count::usize) * 8;
-    val stack_al: usize = a.stack_align(a.ctx);
-    val al_mask: usize = stack_al - 1;
-    val align_rem: usize = (pushed_bytes + f.total_frame) & al_mask;
-    if (align_rem != 0) {
-        f.total_frame = f.total_frame + (stack_al - align_rem);
-    }
-
-    f.has_frame = f.total_frame > 0 || ra.callee_mask != 0;
-    ret f;
-}
-
-# --- pass: operand fixup ---
-
-# fixup_operands: resolve VREG_SP and shift FP-relative offsets past callee-save area.
-# merges the two formerly separate loops into a single pass.
-fun fixup_operands(buf: *isa.MachInstBuf, frame: &FrameLayout) {
-    var si: i32 = 0;
-    for (si < buf.count) {
-        val sinst: *isa.MachInst = isa.buf_get(buf, si);
-        if (sinst != nil) {
-            fixup_operand(?sinst.dst,  frame);
-            fixup_operand(?sinst.src1, frame);
-            fixup_operand(?sinst.src2, frame);
-        }
-        si = si + 1;
-    }
-}
-
-# fixup_operand: resolve a single operand's virtual base registers.
-fun fixup_operand(opr: *operand.Operand, frame: &FrameLayout) {
-    if (opr == nil || opr.kind != operand.OPK_MEM) { ret; }
-
-    # VREG_SP → FP-relative: [VREG_SP + offset] → [fp_reg + (offset - total_frame)]
-    if (opr.base == inst.VREG_SP) {
-        opr.base = frame.frame_reg;
-        opr.disp = opr.disp - frame.total_frame::i64;
-    }
-
-    if (opr.base == frame.frame_reg && opr.disp < 0) {
-        opr.disp = opr.disp - frame.callee_save_size::i64;
-    }
-}
-
-# --- pass: encode ---
-
-# encode_buf_insts: encode all MachInsts in a buffer to a section.
-# used for prologue/epilogue sequences that go through the normal encode path.
-fun encode_buf_insts(i: *isa.ISA, buf: *isa.MachInstBuf,
-                     sec: *section.Section, alloc: *allocator.Allocator,
-                     asm_w: *emasm.AsmWriter) {
-    var bi: i32 = 0;
-    for (bi < buf.count) {
-        val minst: *isa.MachInst = isa.buf_get(buf, bi);
-        if (minst != nil) {
-            i.encode(i.ctx, minst, sec, alloc);
-            if (asm_w != nil) {
-                i.format_inst(i.ctx, minst, ?asm_w.w);
-            }
-        }
-        bi = bi + 1;
-    }
-}
-
-# encode_function: encode machine instructions to .text, emit prologue/epilogue,
-# register label symbols, and record debug lines.
-# returns false if any instruction fails to encode.
-fun encode_function(mctx: *masm.Context, i: *isa.ISA,
-                    buf: *isa.MachInstBuf, frame: &FrameLayout,
-                    func_name: str, text_sec: *section.Section, text_idx: i32,
-                    alloc: *allocator.Allocator,
-                    asm_w: *emasm.AsmWriter, verbose: bool) bool {
-    val func_start: usize = section.current_offset(text_sec);
-
-    # emit prologue as MachInsts through the normal encode path
-    var pro_buf: isa.MachInstBuf = isa.buf_create(alloc);
-    if (frame.has_frame) {
-        i.prologue(i.ctx, frame.total_frame, frame.callee_mask, ?pro_buf);
-    }
-
-    # ASM: function header
-    if (asm_w != nil) {
-        emasm.emit_func_header(asm_w, func_name);
-    }
-
-    # encode prologue instructions
-    encode_buf_insts(i, ?pro_buf, text_sec, alloc, asm_w);
-    isa.buf_destroy(?pro_buf);
-
-    # encode instructions
-    var encode_fails: i32 = 0;
-    var encode_ok: i32 = 0;
-    var last_debug_line: i32 = 0;
-    var ei: i32 = 0;
-    for (ei < buf.count) {
-        val minst: *isa.MachInst = isa.buf_get(buf, ei);
-        if (minst == nil) { ei = ei + 1; cnt; }
-
-        # debug line entry on line transitions
-        if (minst.src_line > 0 && minst.src_line != last_debug_line) {
-            val dbg_off: usize = section.current_offset(text_sec);
-            masm.add_debug_line(mctx, dbg_off, minst.src_file, minst.src_line);
-            last_debug_line = minst.src_line;
-        }
-
-        if (minst.opcode == isa.MACHINST_LABEL) {
-            register_label_symbol(mctx, minst, text_sec, text_idx, alloc);
-            if (asm_w != nil && minst.dst.label != nil) {
-                emasm.emit_label(asm_w, minst.dst.label);
-            }
-        } or (i.is_ret(i.ctx, minst) && frame.has_frame) {
-            # expand RET into full epilogue sequence
-            var epi_buf: isa.MachInstBuf = isa.buf_create(alloc);
-            i.epilogue(i.ctx, frame.callee_mask, ?epi_buf);
-            encode_buf_insts(i, ?epi_buf, text_sec, alloc, asm_w);
-            isa.buf_destroy(?epi_buf);
-            encode_ok = encode_ok + 1;
-        } or {
-            val enc_r: i32 = i.encode(i.ctx, minst, text_sec, alloc);
-            if (enc_r < 0) {
-                print.eprintf("  ENCODE FAIL '%s' #%d opc=%d dst.k=%d s1.k=%d s2.k=%d sz=%d\n",
-                    func_name, ei::i64, minst.opcode::i64,
-                    minst.dst.kind::i64, minst.src1.kind::i64,
-                    minst.src2.kind::i64, minst.size::i64);
-                encode_fails = encode_fails + 1;
-            } or {
-                encode_ok = encode_ok + 1;
-            }
-            if (asm_w != nil) {
-                i.format_inst(i.ctx, minst, ?asm_w.w);
-            }
-        }
-
-        ei = ei + 1;
-    }
-
-    if (encode_fails > 0) {
-        print.eprintf("  TOTAL ENCODE FAILS for '%s': %d\n",
-            func_name, encode_fails::i64);
-    }
-    if (verbose) {
-        print.eprintf("[verbose] codegen:   encode: %d/%d ok",
-            encode_ok::i64, buf.count::i64);
-        if (encode_fails > 0) {
-            print.eprintf(", %d FAILED", encode_fails::i64);
-        }
-        print.eprint("\n");
-    }
-
-    # symbol fixup
-    val func_end: usize = section.current_offset(text_sec);
-    fixup_symbol_offset(mctx, func_name, func_start, func_end - func_start, text_idx);
-
-    if (verbose) {
-        print.eprintf("[verbose] codegen:   symbol '%s' offset=%d size=%d\n",
-            func_name, func_start::i64, (func_end - func_start)::i64);
-    }
-
-    if (asm_w != nil) {
-        emasm.emit_newline(asm_w);
-    }
-
-    ret encode_fails == 0;
-}
-
-# --- codegen orchestrator ---
-
-# codegen: run the full codegen pipeline for all functions.
-# isel → regalloc → peephole → compute_frame → fixup → encode.
-# returns false if any function fails.
-pub fun codegen(mod: *module.Module, mctx: *masm.Context, tgt: *target.Target,
+# codegen: run the backend pipeline for all functions in a module.
+# dispatches each function to the ISA backend. returns false if any fail.
+pub fun codegen(mod: *module.Module, obj: *objstate.ObjState, tgt: *target.Target,
             alloc: *allocator.Allocator, verbose: bool,
             asm_w: *emasm.AsmWriter) bool {
-    if (mod == nil || mctx == nil || tgt == nil || alloc == nil) { ret false; }
+    if (mod == nil || obj == nil || tgt == nil || alloc == nil) { ret false; }
 
     val i: *isa.ISA = ?tgt.isa;
-    val a: *abi.ABI = ?tgt.abi;
 
     if (verbose) {
         print.eprintf("[verbose] codegen: starting (%d IR functions)\n",
             mod.functions.len::i64);
     }
 
-    val text_res: Result[*section.Section, str] = masm.get_or_create_section(
-        mctx, ".text", msym.SEC_TEXT);
+    val text_res: Result[*section.Section, str] = objstate.get_or_create_section(
+        obj, ".text", msym.SEC_TEXT);
     if (result_is_err[*section.Section, str](text_res)) { ret false; }
     val text_sec: *section.Section = result_unwrap_ok[*section.Section, str](text_res);
-    val text_idx: i32 = masm.get_section_index(mctx, ".text");
+    val text_idx: i32 = objstate.get_section_index(obj, ".text");
 
-    var inst_buf: isa.MachInstBuf = isa.buf_create(alloc);
-    var func_buf: isa.MachInstBuf = isa.buf_create(alloc);
     var ok: bool = true;
 
     var fi: i32 = 0;
@@ -394,124 +54,35 @@ pub fun codegen(mod: *module.Module, mctx: *masm.Context, tgt: *target.Target,
             print.eprintf("[verbose] codegen: func[%d] '%s'\n", fi::i64, func.name);
         }
 
-        # 1. ISel
-        val ir_count: i32 = isel_function(i, func, ?func_buf, ?inst_buf);
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   ISel: %d IR -> %d MachInst\n",
-                ir_count::i64, func_buf.count::i64);
-        }
+        var req: xcg.CodegenRequest;
+        req.func = func;
+        req.text_sec = text_sec;
+        req.text_idx = text_idx;
+        req.obj = obj;
+        req.abi = ?tgt.abi;
+        req.isa = i;
+        req.alloc = alloc;
+        req.asm_w = asm_w;
+        req.verbose = verbose;
 
-        # 2. register allocation
-        var ra: regalloc.RegAllocResult = regalloc.alloc_function(
-            alloc, i, a, ?func_buf, compute_local_size(func));
-        if (!ra.ok) {
-            if (verbose) {
-                print.eprintf("[verbose] codegen:   regalloc FAILED for '%s'\n", func.name);
-            }
+        val result: isa.BackendResult = i.codegen_function(i.ctx, ?req::ptr);
+
+        if (!result.ok) {
+            print.eprintf("[verbose] codegen:   backend FAILED for '%s'\n", func.name);
             ok = false;
             fi = fi + 1;
             cnt;
         }
+
         if (verbose) {
-            print.eprintf("[verbose] codegen:   regalloc: out=%d spill=%d callee_mask=0x%x\n",
-                ra.out.count::i64, ra.spill_size::i64, ra.callee_mask::i64);
+            print.eprintf("[verbose] codegen:   backend: ir=%d inst=%d spill=%d frame=%d\n",
+                result.ir_count::i64, result.inst_count::i64,
+                result.spill_count::i64, result.frame_size::i64);
         }
 
-        # 3. post-regalloc peephole (eliminate identity moves)
-        val pre_peep: i32 = ra.out.count;
-        i.peephole(i.ctx, ?ra.out);
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   peephole: %d -> %d MachInst\n",
-                pre_peep::i64, ra.out.count::i64);
-        }
-
-        # 4. compute frame
-        val frame: FrameLayout = compute_frame(func, ?ra, a, i);
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   frame: locals=%d spill=%d call_area=%d total=%d\n",
-                frame.local_size::i64, frame.spill_size::i64,
-                frame.call_area_size::i64, frame.total_frame::i64);
-        }
-
-        # 5. fixup operands (VREG_SP + callee-save offset, single pass)
-        fixup_operands(?ra.out, ?frame);
-
-        # dump MachInsts before encoding
-        if (verbose) {
-            var di: i32 = 0;
-            for (di < ra.out.count) {
-                val dinst: *isa.MachInst = isa.buf_get(?ra.out, di);
-                if (dinst != nil) {
-                    print.eprintf("[verbose]     [%d] opc=%d dst(k=%d,r=%d) s1(k=%d,r=%d,imm=%d) sz=%d\n",
-                        di::i64, dinst.opcode::i64,
-                        dinst.dst.kind::i64, dinst.dst.reg::i64,
-                        dinst.src1.kind::i64, dinst.src1.reg::i64, dinst.src1.imm,
-                        dinst.size::i64);
-                }
-                di = di + 1;
-            }
-        }
-
-        # 6. encode (prologue + instructions + epilogue + symbol fixup)
-        if (!encode_function(mctx, i, ?ra.out, ?frame, func.name,
-                             text_sec, text_idx, alloc, asm_w, verbose)) {
-            ok = false;
-        }
-
-        isa.buf_destroy(?ra.out);
         fi = fi + 1;
     }
 
     if (verbose) { print.eprint("[verbose] codegen: complete\n"); }
-
-    isa.buf_destroy(?inst_buf);
-    isa.buf_destroy(?func_buf);
     ret ok;
-}
-
-# --- codegen helpers ---
-
-# fixup_symbol_offset: update a symbol's offset, size, and section to match its position in .text.
-fun fixup_symbol_offset(mctx: *masm.Context, name: str, offset: usize, size: usize, text_idx: i32) {
-    val s: *sym.Symbol = masm.get_symbol(mctx, name);
-    if (s != nil) {
-        s.offset = offset;
-        s.size = size;
-        if (text_idx >= 0) {
-            s.section = text_idx::u64;
-        }
-    }
-}
-
-# register_label_symbol: register a label at the current section offset.
-fun register_label_symbol(mctx: *masm.Context, minst: *isa.MachInst,
-                          sec: *section.Section, text_idx: i32,
-                          alloc: *allocator.Allocator) {
-    if (minst == nil || minst.dst.label == nil) { ret; }
-
-    val offset: usize = section.current_offset(sec);
-    val name: str = minst.dst.label;
-
-    val existing: *sym.Symbol = masm.get_symbol(mctx, name);
-    if (existing != nil) {
-        existing.offset = offset;
-        if (text_idx >= 0) {
-            existing.section = text_idx::u64;
-        }
-        ret;
-    }
-
-    val sym_r: Result[*sym.Symbol, str] = sym.create(alloc, name);
-    if (result_is_err[*sym.Symbol, str](sym_r)) { ret; }
-
-    val s: *sym.Symbol = result_unwrap_ok[*sym.Symbol, str](sym_r);
-    s.binding = msym.BIND_LOCAL;
-    s.sym_type = msym.SYM_FUNC;
-    s.offset = offset;
-    s.defined = true;
-    if (text_idx >= 0) {
-        s.section = text_idx::u64;
-    }
-
-    masm.add_symbol(mctx, s);
 }
