@@ -42,6 +42,47 @@ rec FrameLayout {
     has_frame:       bool;    # true if prologue/epilogue needed
 }
 
+# DebugLoc: source location mapping for a code offset within a function.
+# ---
+# code_offset: byte offset from function start
+# file_idx:    1-based index into module debug file table
+# line:        1-based source line number
+pub rec DebugLoc {
+    code_offset: usize;
+    file_idx:    u16;
+    line:        i32;
+}
+
+# FunctionObject: self-contained codegen output for one function.
+# produced by compile_function, consumed by assemble.
+# all offsets are relative to the start of the function.
+# ---
+# name:        function name (symbol name)
+# code:        encoded machine code bytes
+# code_len:    length of code in bytes
+# relocs:      relocations within code
+# reloc_count: number of relocations
+# symbols:     symbols defined by this function (labels)
+# sym_count:   number of symbols
+# lines:       debug source location entries
+# line_count:  number of debug entries
+# ok:          true if encoding succeeded without errors
+pub rec FunctionObject {
+    name:        str;
+    code:        *u8;
+    code_len:    usize;
+    relocs:      *section.Relocation;
+    reloc_count: i32;
+    symbols:     *sym.Symbol;
+    sym_count:   i32;
+    lines:       *DebugLoc;
+    line_count:  i32;
+    ok:          bool;
+}
+
+val INITIAL_SYM_CAP:  i32 = 8;
+val INITIAL_LINE_CAP: i32 = 32;
+
 # --- pass: instruction selection ---
 
 # isel_function: lower all IR instructions in a function to machine instructions.
@@ -295,6 +336,168 @@ fun encode_function(mctx: *masm.Context, i: *isa.ISA,
     }
 
     ret encode_fails == 0;
+}
+
+# encode_to_object: encode machine instructions into a self-contained FunctionObject.
+# all offsets are function-relative (starting from 0).
+pub fun encode_to_object(i: *isa.ISA, buf: *isa.MachInstBuf, frame: &FrameLayout,
+                         func_name: str, alloc: *allocator.Allocator) FunctionObject {
+    var fo: FunctionObject;
+    fo.name = func_name;
+    fo.code = nil;
+    fo.code_len = 0;
+    fo.relocs = nil;
+    fo.reloc_count = 0;
+    fo.symbols = nil;
+    fo.sym_count = 0;
+    fo.lines = nil;
+    fo.line_count = 0;
+    fo.ok = false;
+
+    val sec_r: Result[*section.Section, str] =
+        section.create(alloc, ".text", sym.SEC_TEXT, sym.ENDIAN_LITTLE);
+    if (!sec_r.tag) { ret fo; }
+    val sec: *section.Section = sec_r.value.ok;
+
+    # allocate symbol and debug line arrays
+    var sym_cap: i32 = INITIAL_SYM_CAP;
+    val sym_r: Result[*sym.Symbol, allocator.AllocError] =
+        allocator.allocator_zalloc[sym.Symbol](alloc, sym_cap::usize);
+    if (!sym_r.tag) { section.destroy(alloc, sec); ret fo; }
+    var syms: *sym.Symbol = sym_r.value.ok;
+    var sym_count: i32 = 0;
+
+    var line_cap: i32 = INITIAL_LINE_CAP;
+    val line_r: Result[*DebugLoc, allocator.AllocError] =
+        allocator.allocator_zalloc[DebugLoc](alloc, line_cap::usize);
+    if (!line_r.tag) {
+        allocator.allocator_free[sym.Symbol](alloc, syms, sym_cap::usize);
+        section.destroy(alloc, sec);
+        ret fo;
+    }
+    var lines: *DebugLoc = line_r.value.ok;
+    var line_count: i32 = 0;
+
+    # encode prologue
+    var pro_buf: isa.MachInstBuf = isa.buf_create(alloc);
+    if (frame.has_frame) {
+        i.prologue(i.ctx, frame.total_frame, frame.callee_mask, ?pro_buf);
+    }
+    encode_buf_insts(i, ?pro_buf, sec, alloc, nil);
+    isa.buf_destroy(?pro_buf);
+
+    # encode body
+    var encode_fails: i32 = 0;
+    var last_debug_line: i32 = 0;
+    var ei: i32 = 0;
+    for (ei < buf.count) {
+        val minst: *isa.MachInst = isa.buf_get(buf, ei);
+        if (minst == nil) { ei = ei + 1; cnt; }
+
+        # debug line entry
+        if (minst.src_line > 0 && minst.src_line != last_debug_line) {
+            if (line_count >= line_cap) {
+                val new_cap: i32 = line_cap * 2;
+                val lr: Result[*DebugLoc, allocator.AllocError] =
+                    allocator.allocator_resize[DebugLoc](alloc, lines, line_cap::usize, new_cap::usize);
+                if (lr.tag) { lines = lr.value.ok; line_cap = new_cap; }
+            }
+            if (line_count < line_cap) {
+                lines[line_count].code_offset = section.current_offset(sec);
+                lines[line_count].file_idx = minst.src_file;
+                lines[line_count].line = minst.src_line;
+                line_count = line_count + 1;
+            }
+            last_debug_line = minst.src_line;
+        }
+
+        if (minst.opcode == isa.MACHINST_LABEL) {
+            if (minst.dst.label != nil) {
+                if (sym_count >= sym_cap) {
+                    val new_cap: i32 = sym_cap * 2;
+                    val sr: Result[*sym.Symbol, allocator.AllocError] =
+                        allocator.allocator_resize[sym.Symbol](alloc, syms, sym_cap::usize, new_cap::usize);
+                    if (sr.tag) { syms = sr.value.ok; sym_cap = new_cap; }
+                }
+                if (sym_count < sym_cap) {
+                    syms[sym_count] = sym.init(minst.dst.label);
+                    syms[sym_count].binding = sym.BIND_LOCAL;
+                    syms[sym_count].sym_type = sym.SYM_FUNC;
+                    syms[sym_count].offset = section.current_offset(sec);
+                    syms[sym_count].defined = true;
+                    sym_count = sym_count + 1;
+                }
+            }
+        } or (i.is_ret(i.ctx, minst) && frame.has_frame) {
+            var epi_buf: isa.MachInstBuf = isa.buf_create(alloc);
+            i.epilogue(i.ctx, frame.callee_mask, ?epi_buf);
+            encode_buf_insts(i, ?epi_buf, sec, alloc, nil);
+            isa.buf_destroy(?epi_buf);
+        } or {
+            val enc_r: i32 = i.encode(i.ctx, minst, sec, alloc);
+            if (enc_r < 0) {
+                encode_fails = encode_fails + 1;
+            }
+        }
+
+        ei = ei + 1;
+    }
+
+    # build function symbol
+    val func_size: usize = section.current_offset(sec);
+    if (sym_count >= sym_cap) {
+        val new_cap: i32 = sym_cap + 1;
+        val sr: Result[*sym.Symbol, allocator.AllocError] =
+            allocator.allocator_resize[sym.Symbol](alloc, syms, sym_cap::usize, new_cap::usize);
+        if (sr.tag) { syms = sr.value.ok; sym_cap = new_cap; }
+    }
+    if (sym_count < sym_cap) {
+        syms[sym_count] = sym.init(func_name);
+        syms[sym_count].binding = sym.BIND_GLOBAL;
+        syms[sym_count].sym_type = sym.SYM_FUNC;
+        syms[sym_count].offset = 0;
+        syms[sym_count].size = func_size;
+        syms[sym_count].defined = true;
+        sym_count = sym_count + 1;
+    }
+
+    # transfer ownership from section to FunctionObject
+    fo.code = sec.data;
+    fo.code_len = sec.size;
+    fo.relocs = sec.relocs;
+    fo.reloc_count = sec.reloc_count;
+    fo.symbols = syms;
+    fo.sym_count = sym_count;
+    fo.lines = lines;
+    fo.line_count = line_count;
+    fo.ok = encode_fails == 0;
+
+    # null out section pointers before destroy (we took ownership)
+    sec.data = nil;
+    sec.size = 0;
+    sec.capacity = 0;
+    sec.relocs = nil;
+    sec.reloc_count = 0;
+    allocator.allocator_free[section.Section](alloc, sec, 1);
+
+    ret fo;
+}
+
+# func_object_dnit: free all memory owned by a FunctionObject.
+pub fun func_object_dnit(alloc: *allocator.Allocator, fo: *FunctionObject) {
+    if (alloc == nil || fo == nil) { ret; }
+    if (fo.code != nil) {
+        allocator.allocator_free[u8](alloc, fo.code, fo.code_len);
+    }
+    if (fo.relocs != nil) {
+        allocator.allocator_free[section.Relocation](alloc, fo.relocs, fo.reloc_count::usize);
+    }
+    if (fo.symbols != nil) {
+        allocator.allocator_free[sym.Symbol](alloc, fo.symbols, fo.sym_count::usize);
+    }
+    if (fo.lines != nil) {
+        allocator.allocator_free[DebugLoc](alloc, fo.lines, fo.line_count::usize);
+    }
 }
 
 # --- codegen orchestrator ---
