@@ -37,6 +37,7 @@ use cemit:    mach.compiler.codegen.emit;
 use emasm:    mach.compiler.codegen.emit_asm;
 use emmasm:   mach.compiler.codegen.emit_masm;
 use cg:       mach.compiler.codegen;
+use asm:      mach.compiler.codegen.assemble;
 use linker:   mach.compiler.linker;
 use mangle:   mach.compiler.masm.mangle;
 use utilfs:   mach.util.filesystem;
@@ -607,26 +608,12 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         }
     }
 
-    # 2d. materialize data declarations into sections
-    data_em.emit_data_decls(?mod_ptr.data_decls, mctx, alloc);
-
-    # 3. check if type-only (no IR functions and no section data)
-    if (mod_ptr.func_count == 0) {
-        var has_data: bool = false;
-        var si: i32 = 0;
-        for (si < mctx.section_count) {
-            if (mctx.sections[si] != nil && mctx.sections[si].size > 0) {
-                has_data = true;
-                brk;
-            }
-            si = si + 1;
+    # 3. check if type-only (no IR functions and no data declarations)
+    if (mod_ptr.func_count == 0 && mod_ptr.data_decls.count == 0) {
+        if (verbose) {
+            print.eprintf("[verbose] compile_module:   type-only, skipping\n");
         }
-        if (!has_data) {
-            if (verbose) {
-                print.eprintf("[verbose] compile_module:   type-only, skipping\n");
-            }
-            ret false;
-        }
+        ret false;
     }
 
     if (verbose) {
@@ -664,20 +651,31 @@ fun compile_module(root: *ast.Node, symbols: *symbol.Table,
         emmasm.emit(mod_ptr, masm_path);
     }
 
-    # 5. codegen (ISel + encode)
-    var asm_w_ptr: *emasm.AsmWriter = nil;
-    if (asm_path != nil) {
-        val asm_dir: str = utilfs.get_output_dir(asm_path, alloc);
-        if (asm_dir != nil) { utilfs.ensure_dir(asm_dir, alloc); }
-        asm_w_ptr = emasm.open(asm_path, alloc);
-    }
-
-    if (!cg.codegen(mod_ptr, mctx, tgt, alloc, mod_lsizes, verbose, asm_w_ptr)) {
-        if (asm_w_ptr != nil) { emasm.close(asm_w_ptr); }
+    # 5. per-function compilation → FunctionObjects
+    var func_objs: *cg.FunctionObject = nil;
+    var func_obj_count: i32 = 0;
+    if (!compile_functions(mod_ptr, mod_lsizes, tgt, alloc, verbose,
+                           ?func_objs, ?func_obj_count)) {
         ret false;
     }
 
-    if (asm_w_ptr != nil) { emasm.close(asm_w_ptr); }
+    # 5b. assemble FunctionObjects + data declarations → ObjectFile
+    var obj: asm.ObjectFile = asm.assemble(func_objs, func_obj_count,
+        ?mod_ptr.data_decls, alloc);
+
+    # 5c. bridge ObjectFile → mctx for emit/linker compatibility
+    populate_mctx_from_object(mctx, ?obj, alloc);
+
+    # 5d. clean up FunctionObjects and ObjectFile
+    var cfi: i32 = 0;
+    for (cfi < func_obj_count) {
+        cg.func_object_dnit(alloc, ?func_objs[cfi]);
+        cfi = cfi + 1;
+    }
+    if (func_objs != nil) {
+        allocator.allocator_free[cg.FunctionObject](alloc, func_objs, func_obj_count::usize);
+    }
+    asm.object_dnit(alloc, ?obj);
 
     # 6. resolve external references
     resolve_externs(mctx, alloc);
@@ -836,6 +834,122 @@ fun compile_per_module(root: *ast.Node, symbols: *symbol.Table,
     ret ok[CompileResult, str](r);
 }
 
+# populate_mctx_from_object: bridge ObjectFile data into mctx.
+# temporary compatibility shim until emit/linker accept ObjectFile directly.
+fun populate_mctx_from_object(mctx: *masm.Context, obj: *asm.ObjectFile,
+                               alloc: *allocator.Allocator) {
+    if (mctx == nil || obj == nil || alloc == nil) { ret; }
+
+    # copy sections
+    var si: i32 = 0;
+    for (si < obj.section_count) {
+        val src: *section.Section = obj.sections[si];
+        if (src == nil) { si = si + 1; cnt; }
+
+        val dst_r: Result[*section.Section, str] =
+            masm.get_or_create_section(mctx, src.name, src.kind);
+        if (dst_r.tag) {
+            val dst: *section.Section = dst_r.value.ok;
+            if (src.data != nil && src.size > 0) {
+                section.emit_bytes(alloc, dst, src.data::&u8, src.size);
+            }
+            var ri: i32 = 0;
+            for (ri < src.reloc_count) {
+                section.add_relocation(alloc, dst,
+                    src.relocs[ri].offset, src.relocs[ri].symbol_name,
+                    src.relocs[ri].rtype, src.relocs[ri].addend);
+                ri = ri + 1;
+            }
+        }
+        si = si + 1;
+    }
+
+    # copy symbols
+    var syi: i32 = 0;
+    for (syi < obj.sym_count) {
+        val s: *sym.Symbol = obj.symbols[syi];
+        if (s != nil) {
+            val existing: *sym.Symbol = masm.get_symbol(mctx, s.name);
+            if (existing != nil) {
+                existing.offset = s.offset;
+                existing.size = s.size;
+                existing.section = s.section;
+            } or {
+                val sr: Result[*sym.Symbol, str] = sym.create(alloc, s.name);
+                if (sr.tag) {
+                    val ns: *sym.Symbol = sr.value.ok;
+                    ns.binding = s.binding;
+                    ns.sym_type = s.sym_type;
+                    ns.offset = s.offset;
+                    ns.size = s.size;
+                    ns.defined = s.defined;
+                    ns.section = s.section;
+                    ns.src_file = s.src_file;
+                    ns.src_line = s.src_line;
+                    masm.add_symbol(mctx, ns);
+                }
+            }
+        }
+        syi = syi + 1;
+    }
+
+    # copy debug lines
+    var li: i32 = 0;
+    for (li < obj.line_count) {
+        masm.add_debug_line(mctx,
+            obj.debug_lines[li].code_offset,
+            obj.debug_lines[li].file_idx,
+            obj.debug_lines[li].line);
+        li = li + 1;
+    }
+}
+
+# compile_functions: run compile_function for each function in a module.
+# returns allocated array of FunctionObjects and count via out params.
+fun compile_functions(mod: *module.Module, local_sizes: *usize,
+                      tgt: *target.Target, alloc: *allocator.Allocator,
+                      verbose: bool,
+                      out_funcs: **cg.FunctionObject, out_count: *i32) bool {
+    if (mod == nil || tgt == nil || alloc == nil) { ret false; }
+
+    val fc: i32 = mod.func_count;
+    @out_count = 0;
+    @out_funcs = nil;
+    if (fc == 0) { ret true; }
+
+    val r: Result[*cg.FunctionObject, allocator.AllocError] =
+        allocator.allocator_zalloc[cg.FunctionObject](alloc, fc::usize);
+    if (!r.tag) { ret false; }
+    val funcs: *cg.FunctionObject = r.value.ok;
+
+    var ok: bool = true;
+    var fi: i32 = 0;
+    for (fi < fc) {
+        val func: *fn.Function = mod.functions[fi];
+        if (func == nil) { fi = fi + 1; cnt; }
+
+        var ls: usize = 0;
+        if (local_sizes != nil) { ls = local_sizes[fi]; }
+
+        if (verbose) {
+            print.eprintf("[verbose] compile_function: func[%d] '%s'\n", fi::i64, func.name);
+        }
+
+        funcs[fi] = cg.compile_function(func, ls, tgt, alloc);
+        if (!funcs[fi].ok) {
+            if (verbose) {
+                print.eprintf("[verbose] compile_function:   FAILED for '%s'\n", func.name);
+            }
+            ok = false;
+        }
+        fi = fi + 1;
+    }
+
+    @out_funcs = funcs;
+    @out_count = fc;
+    ret ok;
+}
+
 # --- full compilation ---
 
 # compile_from_sema: run phases 3+ (lower, optimize, codegen, link) from a sema result.
@@ -867,10 +981,8 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
         ret err[CompileResult, str]("lowering failed");
     }
 
-    # materialize data declarations into sections
-    data_em.emit_data_decls(?lr.mod.data_decls, lr.mctx, opts.alloc);
-
     if (opts.stop_after == PHASE_LOWER) {
+        data_em.emit_data_decls(?lr.mod.data_decls, lr.mctx, opts.alloc);
         val r: CompileResult = CompileResult{mctx: lr.mctx, output_path: nil, ok: true};
         ret ok[CompileResult, str](r);
     }
@@ -901,9 +1013,31 @@ fun compile_from_sema(root: *ast.Node, symbols: *symbol.Table, sem: *sema.Sema,
         oi = oi + 1;
     }
 
-    if (!cg.codegen(lr.mod, lr.mctx, ?opts.target, opts.alloc, lr.local_sizes, opts.verbose, nil)) {
+    # per-function compilation → FunctionObjects
+    var func_objs: *cg.FunctionObject = nil;
+    var func_obj_count: i32 = 0;
+    if (!compile_functions(lr.mod, lr.local_sizes, ?opts.target, opts.alloc,
+                           opts.verbose, ?func_objs, ?func_obj_count)) {
         ret err[CompileResult, str]("code generation failed");
     }
+
+    # assemble FunctionObjects + data declarations → ObjectFile
+    var obj: asm.ObjectFile = asm.assemble(func_objs, func_obj_count,
+        ?lr.mod.data_decls, opts.alloc);
+
+    # bridge ObjectFile → mctx for emit/linker compatibility
+    populate_mctx_from_object(lr.mctx, ?obj, opts.alloc);
+
+    # clean up FunctionObjects
+    var cfi: i32 = 0;
+    for (cfi < func_obj_count) {
+        cg.func_object_dnit(opts.alloc, ?func_objs[cfi]);
+        cfi = cfi + 1;
+    }
+    if (func_objs != nil) {
+        allocator.allocator_free[cg.FunctionObject](opts.alloc, func_objs, func_obj_count::usize);
+    }
+    asm.object_dnit(opts.alloc, ?obj);
 
     # generate debug sections for the monolithic .o
     emit_debug_sections(lr.mod, lr.mctx, ?opts.target, opts.alloc);
