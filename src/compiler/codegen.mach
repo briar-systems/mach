@@ -500,10 +500,64 @@ pub fun func_object_dnit(alloc: *allocator.Allocator, fo: *FunctionObject) {
     }
 }
 
+# --- per-function compilation ---
+
+# compile_function: run the full codegen pipeline for a single function.
+# build_cfg → isel → regalloc → peephole → frame → fixup → encode → FunctionObject.
+# ---
+# func:       IR function to compile
+# local_size: stack frame local variable area size
+# tgt:        target configuration
+# alloc:      allocator
+# ret:        self-contained function object (ok=false on failure)
+pub fun compile_function(func: *fn.Function, local_size: usize,
+                         tgt: *target.Target,
+                         alloc: *allocator.Allocator) FunctionObject {
+    var fo: FunctionObject;
+    fo.ok = false;
+    if (func == nil || tgt == nil || alloc == nil) { ret fo; }
+
+    val i: *isa.ISA = ?tgt.isa;
+    val a: *abi.ABI = ?tgt.abi;
+
+    # 0. build CFG + liveness on IR (before ISel transforms instructions)
+    var ir_cfg: cfg_mod.CFG = cfg_mod.build_cfg(alloc, func);
+    var live_sets: cfg_mod.LiveSets = cfg_mod.compute_liveness(alloc, ?ir_cfg, func);
+
+    # 1. ISel
+    var inst_buf: isa.MachInstBuf = isa.buf_create(alloc);
+    var func_buf: isa.MachInstBuf = isa.buf_create(alloc);
+    isel_function(i, func, ?func_buf, ?inst_buf);
+    isa.buf_destroy(?inst_buf);
+
+    # 2. register allocation (with CFG liveness)
+    var ra: regalloc.RegAllocResult = regalloc.alloc_function(
+        alloc, i, a, ?func_buf, local_size, ?ir_cfg, ?live_sets);
+    cfg_mod.live_dnit(alloc, ?live_sets);
+    cfg_mod.cfg_dnit(alloc, ?ir_cfg);
+    if (!ra.ok) { isa.buf_destroy(?func_buf); ret fo; }
+
+    # 3. post-regalloc peephole (eliminate identity moves)
+    i.peephole(i.ctx, ?ra.out);
+
+    # 4. compute frame
+    val frame: FrameLayout = compute_frame(func, local_size, ?ra, a, i);
+
+    # 5. fixup operands (VREG_SP + callee-save offset, single pass)
+    fixup_operands(?ra.out, ?frame);
+
+    # 6. encode into FunctionObject
+    fo = encode_to_object(i, ?ra.out, ?frame, func.name, alloc);
+
+    isa.buf_destroy(?ra.out);
+    isa.buf_destroy(?func_buf);
+    ret fo;
+}
+
 # --- codegen orchestrator ---
 
 # codegen: run the full codegen pipeline for all functions.
-# isel → regalloc → peephole → compute_frame → fixup → encode.
+# calls compile_function for each, then writes results to mctx.
 # returns false if any function fails.
 pub fun codegen(mod: *module.Module, mctx: *masm.Context, tgt: *target.Target,
             alloc: *allocator.Allocator, local_sizes: *usize,
@@ -524,8 +578,6 @@ pub fun codegen(mod: *module.Module, mctx: *masm.Context, tgt: *target.Target,
     val text_sec: *section.Section = text_res.value.ok;
     val text_idx: i32 = masm.get_section_index(mctx, ".text");
 
-    var inst_buf: isa.MachInstBuf = isa.buf_create(alloc);
-    var func_buf: isa.MachInstBuf = isa.buf_create(alloc);
     var ok: bool = true;
 
     var fi: i32 = 0;
@@ -537,88 +589,87 @@ pub fun codegen(mod: *module.Module, mctx: *masm.Context, tgt: *target.Target,
             print.eprintf("[verbose] codegen: func[%d] '%s'\n", fi::i64, func.name);
         }
 
-        # 0. build CFG + liveness on IR (before ISel transforms instructions)
-        var ir_cfg: cfg_mod.CFG = cfg_mod.build_cfg(alloc, func);
-        var live_sets: cfg_mod.LiveSets = cfg_mod.compute_liveness(alloc, ?ir_cfg, func);
-
-        # 1. ISel
-        val ir_count: i32 = isel_function(i, func, ?func_buf, ?inst_buf);
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   ISel: %d IR -> %d MachInst\n",
-                ir_count::i64, func_buf.count::i64);
-        }
-
-        # 2. register allocation (with CFG liveness)
         var ls: usize = 0;
         if (local_sizes != nil) { ls = local_sizes[fi]; }
-        var ra: regalloc.RegAllocResult = regalloc.alloc_function(
-            alloc, i, a, ?func_buf, ls, ?ir_cfg, ?live_sets);
-        if (!ra.ok) {
+
+        val fo: FunctionObject = compile_function(func, ls, tgt, alloc);
+        if (!fo.ok) {
             if (verbose) {
-                print.eprintf("[verbose] codegen:   regalloc FAILED for '%s'\n", func.name);
+                print.eprintf("[verbose] codegen:   compile_function FAILED for '%s'\n", func.name);
             }
-            cfg_mod.live_dnit(alloc, ?live_sets);
-            cfg_mod.cfg_dnit(alloc, ?ir_cfg);
             ok = false;
             fi = fi + 1;
             cnt;
         }
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   regalloc: out=%d spill=%d callee_mask=0x%x\n",
-                ra.out.count::i64, ra.spill_size::i64, ra.callee_mask::i64);
+
+        # write FunctionObject code into mctx .text section
+        val func_start: usize = section.current_offset(text_sec);
+        if (fo.code != nil && fo.code_len > 0) {
+            section.emit_bytes(alloc, text_sec, fo.code::&u8, fo.code_len);
         }
 
-        # 3. post-regalloc peephole (eliminate identity moves)
-        val pre_peep: i32 = ra.out.count;
-        i.peephole(i.ctx, ?ra.out);
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   peephole: %d -> %d MachInst\n",
-                pre_peep::i64, ra.out.count::i64);
+        # merge relocations (adjust offsets by func_start)
+        var ri: i32 = 0;
+        for (ri < fo.reloc_count) {
+            section.add_relocation(alloc, text_sec,
+                fo.relocs[ri].offset + func_start,
+                fo.relocs[ri].symbol_name,
+                fo.relocs[ri].rtype, fo.relocs[ri].addend);
+            ri = ri + 1;
         }
 
-        # 4. compute frame
-        val frame: FrameLayout = compute_frame(func, ls, ?ra, a, i);
-        if (verbose) {
-            print.eprintf("[verbose] codegen:   frame: locals=%d spill=%d call_area=%d total=%d\n",
-                frame.local_size::i64, frame.spill_size::i64,
-                frame.call_area_size::i64, frame.total_frame::i64);
-        }
+        # merge symbols (adjust offsets by func_start)
+        var si: i32 = 0;
+        for (si < fo.sym_count) {
+            val s: *sym.Symbol = ?fo.symbols[si];
+            val adjusted_offset: usize = s.offset + func_start;
 
-        # 5. fixup operands (VREG_SP + callee-save offset, single pass)
-        fixup_operands(?ra.out, ?frame);
-
-        # dump MachInsts before encoding
-        if (verbose) {
-            var di: i32 = 0;
-            for (di < ra.out.count) {
-                val dinst: *isa.MachInst = isa.buf_get(?ra.out, di);
-                if (dinst != nil) {
-                    print.eprintf("[verbose]     [%d] opc=%d dst(k=%d,r=%d) s1(k=%d,r=%d,imm=%d) sz=%d\n",
-                        di::i64, dinst.opcode::i64,
-                        dinst.dst.kind::i64, dinst.dst.reg::i64,
-                        dinst.src1.kind::i64, dinst.src1.reg::i64, dinst.src1.imm,
-                        dinst.size::i64);
+            val existing: *sym.Symbol = masm.get_symbol(mctx, s.name);
+            if (existing != nil) {
+                existing.offset = adjusted_offset;
+                existing.size = s.size;
+                if (text_idx >= 0) { existing.section = text_idx::u64; }
+            } or {
+                val sym_r: Result[*sym.Symbol, str] = sym.create(alloc, s.name);
+                if (sym_r.tag) {
+                    val ns: *sym.Symbol = sym_r.value.ok;
+                    ns.binding = s.binding;
+                    ns.sym_type = s.sym_type;
+                    ns.offset = adjusted_offset;
+                    ns.size = s.size;
+                    ns.defined = s.defined;
+                    if (text_idx >= 0) { ns.section = text_idx::u64; }
+                    masm.add_symbol(mctx, ns);
                 }
-                di = di + 1;
             }
+            si = si + 1;
         }
 
-        # 6. encode (prologue + instructions + epilogue + symbol fixup)
-        if (!encode_function(mctx, i, ?ra.out, ?frame, func.name,
-                             text_sec, text_idx, alloc, asm_w, verbose)) {
-            ok = false;
+        # merge debug lines (adjust offsets by func_start)
+        var li: i32 = 0;
+        for (li < fo.line_count) {
+            masm.add_debug_line(mctx,
+                fo.lines[li].code_offset + func_start,
+                fo.lines[li].file_idx, fo.lines[li].line);
+            li = li + 1;
         }
 
-        isa.buf_destroy(?ra.out);
-        cfg_mod.live_dnit(alloc, ?live_sets);
-        cfg_mod.cfg_dnit(alloc, ?ir_cfg);
+        if (verbose) {
+            print.eprintf("[verbose] codegen:   encoded '%s' %d bytes at offset %d\n",
+                func.name, fo.code_len::i64, func_start::i64);
+        }
+
+        # emit ASM if requested
+        if (asm_w != nil) {
+            emasm.emit_func_header(asm_w, func.name);
+            emasm.emit_newline(asm_w);
+        }
+
+        func_object_dnit(alloc, ?fo);
         fi = fi + 1;
     }
 
     if (verbose) { print.eprint("[verbose] codegen: complete\n"); }
-
-    isa.buf_destroy(?inst_buf);
-    isa.buf_destroy(?func_buf);
     ret ok;
 }
 
