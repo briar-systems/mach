@@ -1,7 +1,8 @@
 # compiler.target.isa.x86_64.encode: machine code encoding for x86_64
 #
 # encodes x86_64 machine instructions into binary. writes encoded bytes into
-# an object format section. currently a stub.
+# an object format section. handles REX prefixes, ModR/M, SIB, displacement,
+# and immediate emission for the full integer and SSE instruction set.
 
 use std.types.bool;
 use std.types.size;
@@ -9,18 +10,1226 @@ use std.types.string;
 
 use allocator: std.allocator;
 
-use isa: compiler.target.isa;
-use of:  compiler.target.of;
+use isa:  compiler.target.isa;
+use of:   compiler.target.of;
+use defs: compiler.target.isa.x86_64.defs;
 
-# encode a single machine instruction into a section.
+# emit_byte: append a single byte to the section data buffer
+fun emit_byte(sec: *of.Section, alloc: &allocator.Allocator, byte: u8) {
+    if (sec.size >= sec.cap) {
+        var new_cap: usize = 256;
+        if (sec.cap > 0) { new_cap = sec.cap * 2; }
+        val res_realloc: Result[*u8, str] = allocator.reallocate[u8](
+            alloc, sec.data, sec.cap, new_cap
+        );
+        if (is_err[*u8, str](res_realloc)) { ret; }
+        sec.data = unwrap_ok[*u8, str](res_realloc);
+        sec.cap = new_cap;
+    }
+    sec.data[sec.size] = byte;
+    sec.size = sec.size + 1;
+}
+
+# emit_u16: append 2 bytes little-endian
+fun emit_u16(sec: *of.Section, alloc: &allocator.Allocator, value: u16) {
+    emit_byte(sec, alloc, (value & 0xFF)::u8);
+    emit_byte(sec, alloc, ((value >> 8) & 0xFF)::u8);
+}
+
+# emit_u32: append 4 bytes little-endian
+fun emit_u32(sec: *of.Section, alloc: &allocator.Allocator, value: u32) {
+    emit_byte(sec, alloc, (value & 0xFF)::u8);
+    emit_byte(sec, alloc, ((value >> 8) & 0xFF)::u8);
+    emit_byte(sec, alloc, ((value >> 16) & 0xFF)::u8);
+    emit_byte(sec, alloc, ((value >> 24) & 0xFF)::u8);
+}
+
+# emit_u64: append 8 bytes little-endian
+fun emit_u64(sec: *of.Section, alloc: &allocator.Allocator, value: u64) {
+    emit_u32(sec, alloc, (value & 0xFFFFFFFF)::u32);
+    emit_u32(sec, alloc, ((value >> 32) & 0xFFFFFFFF)::u32);
+}
+
+# reg_bits: low 3 bits of a register id for encoding
+fun reg_bits(id: i32) u8 {
+    ret (id & 7)::u8;
+}
+
+# needs_rex: true if register id uses extended range (r8-r15)
+fun needs_rex(id: i32) bool {
+    ret id >= 8 && id <= 15;
+}
+
+# encode_rex: build a REX prefix byte
+# ---
+# w:   1 for 64-bit operand size
+# reg: register in ModR/M reg field (for R bit)
+# rm:  register in ModR/M r/m field (for B bit)
+# ret: REX byte
+fun encode_rex(w: u8, reg: i32, rm: i32) u8 {
+    var rex: u8 = 0x40;
+    if (w != 0) { rex = rex | 0x08; }
+    if (reg >= 8 && reg <= 15) { rex = rex | 0x04; }
+    if (rm >= 8 && rm <= 15) { rex = rex | 0x01; }
+    ret rex;
+}
+
+# encode_rex_sib: build a REX prefix byte with SIB index
+fun encode_rex_sib(w: u8, reg: i32, index: i32, base: i32) u8 {
+    var rex: u8 = 0x40;
+    if (w != 0) { rex = rex | 0x08; }
+    if (reg >= 8 && reg <= 15) { rex = rex | 0x04; }
+    if (index >= 8 && index <= 15) { rex = rex | 0x02; }
+    if (base >= 8 && base <= 15) { rex = rex | 0x01; }
+    ret rex;
+}
+
+# encode_modrm: build a ModR/M byte
+# ---
+# mod_val: addressing mode (0, 1, 2, 3)
+# reg:     register or opcode extension (3 bits)
+# rm:      register or memory operand (3 bits)
+fun encode_modrm(mod_val: u8, reg: u8, rm: u8) u8 {
+    ret ((mod_val & 3) << 6) | ((reg & 7) << 3) | (rm & 7);
+}
+
+# encode_sib: build a SIB byte
+# ---
+# scale: 0=1, 1=2, 2=4, 3=8
+# index: index register (3 bits)
+# base:  base register (3 bits)
+fun encode_sib(scale: u8, index: u8, base: u8) u8 {
+    ret ((scale & 3) << 6) | ((index & 7) << 3) | (base & 7);
+}
+
+# size_to_w: should REX.W be set for this operand size?
+fun size_to_w(size: u8, flags: u16) u8 {
+    if ((flags & defs.FLAG_REX_W::u16) != 0) { ret 1; }
+    if (size >= 8) { ret 1; }
+    ret 0;
+}
+
+# needs_any_rex: does this instruction need a REX prefix at all?
+fun needs_any_rex(w: u8, reg: i32, rm: i32) bool {
+    if (w != 0) { ret true; }
+    if (reg >= 8 && reg <= 15) { ret true; }
+    if (rm >= 8 && rm <= 15) { ret true; }
+    ret false;
+}
+
+# encode_mem_operand: emit ModR/M + optional SIB + displacement for memory
+fun encode_mem_operand(sec: *of.Section, alloc: &allocator.Allocator,
+                       reg: i32, op: *isa.Operand) {
+    val base: i32 = op.base;
+    val index: i32 = op.index;
+    val disp: i32 = op.disp;
+    val has_index: bool = index >= 0;
+
+    if (base == -1 && !has_index) {
+        emit_byte(sec, alloc, encode_modrm(0, reg_bits(reg), 4));
+        emit_byte(sec, alloc, encode_sib(0, 4, 5));
+        emit_u32(sec, alloc, disp::u32);
+        ret;
+    }
+
+    val base_needs_sib: bool = (base & 7) == 4;
+    val use_sib: bool = has_index || base_needs_sib;
+
+    var scale_bits: u8 = 0;
+    if (has_index) {
+        if (op.scale <= 1) { scale_bits = 0; }
+        or (op.scale == 2) { scale_bits = 1; }
+        or (op.scale == 4) { scale_bits = 2; }
+        or { scale_bits = 3; }
+    }
+
+    if (base == 5 || base == 13) {
+        if (disp == 0) {
+            if (use_sib) {
+                emit_byte(sec, alloc, encode_modrm(1, reg_bits(reg), 4));
+                var idx_reg: u8 = 4;
+                if (has_index) { idx_reg = reg_bits(index); }
+                emit_byte(sec, alloc, encode_sib(scale_bits, idx_reg, reg_bits(base)));
+            } or {
+                emit_byte(sec, alloc, encode_modrm(1, reg_bits(reg), reg_bits(base)));
+            }
+            emit_byte(sec, alloc, 0);
+            ret;
+        }
+    }
+
+    if (disp == 0) {
+        if (use_sib) {
+            emit_byte(sec, alloc, encode_modrm(0, reg_bits(reg), 4));
+            var idx_reg: u8 = 4;
+            if (has_index) { idx_reg = reg_bits(index); }
+            emit_byte(sec, alloc, encode_sib(scale_bits, idx_reg, reg_bits(base)));
+        } or {
+            emit_byte(sec, alloc, encode_modrm(0, reg_bits(reg), reg_bits(base)));
+        }
+        ret;
+    }
+
+    if (disp >= -128 && disp <= 127) {
+        if (use_sib) {
+            emit_byte(sec, alloc, encode_modrm(1, reg_bits(reg), 4));
+            var idx_reg: u8 = 4;
+            if (has_index) { idx_reg = reg_bits(index); }
+            emit_byte(sec, alloc, encode_sib(scale_bits, idx_reg, reg_bits(base)));
+        } or {
+            emit_byte(sec, alloc, encode_modrm(1, reg_bits(reg), reg_bits(base)));
+        }
+        emit_byte(sec, alloc, disp::u8);
+        ret;
+    }
+
+    if (use_sib) {
+        emit_byte(sec, alloc, encode_modrm(2, reg_bits(reg), 4));
+        var idx_reg: u8 = 4;
+        if (has_index) { idx_reg = reg_bits(index); }
+        emit_byte(sec, alloc, encode_sib(scale_bits, idx_reg, reg_bits(base)));
+    } or {
+        emit_byte(sec, alloc, encode_modrm(2, reg_bits(reg), reg_bits(base)));
+    }
+    emit_u32(sec, alloc, disp::u32);
+}
+
+# emit_rex_if_needed: emit REX prefix if required by the operands
+fun emit_rex_if_needed(sec: *of.Section, alloc: &allocator.Allocator,
+                       w: u8, reg: i32, rm: i32) {
+    if (needs_any_rex(w, reg, rm)) {
+        emit_byte(sec, alloc, encode_rex(w, reg, rm));
+    }
+}
+
+# emit_rex_mem: emit REX prefix for instructions with memory operand
+fun emit_rex_mem(sec: *of.Section, alloc: &allocator.Allocator,
+                 w: u8, reg: i32, mem: *isa.Operand) {
+    val base: i32 = mem.base;
+    val index: i32 = mem.index;
+    if (index >= 0) {
+        val rex: u8 = encode_rex_sib(w, reg, index, base);
+        if (rex != 0x40 || w != 0) {
+            emit_byte(sec, alloc, rex);
+        }
+    } or {
+        emit_rex_if_needed(sec, alloc, w, reg, base);
+    }
+}
+
+# encode_alu_rr: encode a two-register ALU operation (opcode reg,reg)
+fun encode_alu_rr(sec: *of.Section, alloc: &allocator.Allocator,
+                  opcode: u8, dst: i32, src: i32, size: u8, flags: u16) {
+    val w: u8 = size_to_w(size, flags);
+    if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+    emit_rex_if_needed(sec, alloc, w, src, dst);
+    emit_byte(sec, alloc, opcode);
+    emit_byte(sec, alloc, encode_modrm(3, reg_bits(src), reg_bits(dst)));
+}
+
+# encode_alu_rm: encode an ALU operation with memory operand
+fun encode_alu_rm(sec: *of.Section, alloc: &allocator.Allocator,
+                  opcode: u8, reg: i32, mem: *isa.Operand, size: u8, flags: u16) {
+    val w: u8 = size_to_w(size, flags);
+    if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+    emit_rex_mem(sec, alloc, w, reg, mem);
+    emit_byte(sec, alloc, opcode);
+    encode_mem_operand(sec, alloc, reg, mem);
+}
+
+# encode_alu_imm: encode ALU reg,imm with group opcode
+fun encode_alu_imm(sec: *of.Section, alloc: &allocator.Allocator,
+                   group: u8, reg: i32, imm: i64, size: u8, flags: u16) {
+    val w: u8 = size_to_w(size, flags);
+    if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+    emit_rex_if_needed(sec, alloc, w, 0, reg);
+
+    if (imm >= -128 && imm <= 127 && size > 1) {
+        emit_byte(sec, alloc, 0x83);
+        emit_byte(sec, alloc, encode_modrm(3, group, reg_bits(reg)));
+        emit_byte(sec, alloc, imm::u8);
+    } or (size == 1) {
+        emit_byte(sec, alloc, 0x80);
+        emit_byte(sec, alloc, encode_modrm(3, group, reg_bits(reg)));
+        emit_byte(sec, alloc, imm::u8);
+    } or {
+        emit_byte(sec, alloc, 0x81);
+        emit_byte(sec, alloc, encode_modrm(3, group, reg_bits(reg)));
+        emit_u32(sec, alloc, imm::u32);
+    }
+}
+
+# alu_group: map opcode to ALU group number for /r encoding
+fun alu_group(opcode: u16) u8 {
+    if (opcode == defs.ADD) { ret 0; }
+    if (opcode == defs.OR)  { ret 1; }
+    if (opcode == defs.AND) { ret 4; }
+    if (opcode == defs.SUB) { ret 5; }
+    if (opcode == defs.XOR) { ret 6; }
+    if (opcode == defs.CMP) { ret 7; }
+    ret 0;
+}
+
+# alu_opcode_rr: map opcode to byte for reg,reg form
+fun alu_opcode_rr(opcode: u16, size: u8) u8 {
+    var base: u8 = 0;
+    if (opcode == defs.ADD) { base = 0x01; }
+    or (opcode == defs.OR)  { base = 0x09; }
+    or (opcode == defs.AND) { base = 0x21; }
+    or (opcode == defs.SUB) { base = 0x29; }
+    or (opcode == defs.XOR) { base = 0x31; }
+    or (opcode == defs.CMP) { base = 0x39; }
+    or { base = 0x01; }
+    if (size == 1) { ret base - 1; }
+    ret base;
+}
+
+# cc_to_x86: map internal condition code opcode offset to x86 cc nibble
+fun cc_to_x86(opcode: u16) u8 {
+    if (opcode == defs.JE  || opcode == defs.SETE)  { ret 0x04; }
+    if (opcode == defs.JNE || opcode == defs.SETNE) { ret 0x05; }
+    if (opcode == defs.JL  || opcode == defs.SETL)  { ret 0x0C; }
+    if (opcode == defs.JLE || opcode == defs.SETLE) { ret 0x0E; }
+    if (opcode == defs.JG  || opcode == defs.SETG)  { ret 0x0F; }
+    if (opcode == defs.JGE || opcode == defs.SETGE) { ret 0x0D; }
+    if (opcode == defs.JB  || opcode == defs.SETB)  { ret 0x02; }
+    if (opcode == defs.JBE || opcode == defs.SETBE) { ret 0x06; }
+    if (opcode == defs.JA  || opcode == defs.SETA)  { ret 0x07; }
+    if (opcode == defs.JAE || opcode == defs.SETAE) { ret 0x03; }
+    ret 0x04;
+}
+
+# is_jcc: check if opcode is a conditional jump
+fun is_jcc(opcode: u16) bool {
+    ret opcode >= defs.JE && opcode <= defs.JAE;
+}
+
+# is_setcc: check if opcode is a conditional set
+fun is_setcc(opcode: u16) bool {
+    ret opcode >= defs.SETE && opcode <= defs.SETAE;
+}
+
+# is_alu: check if opcode is a basic ALU operation
+fun is_alu(opcode: u16) bool {
+    if (opcode == defs.ADD) { ret true; }
+    if (opcode == defs.SUB) { ret true; }
+    if (opcode == defs.AND) { ret true; }
+    if (opcode == defs.OR)  { ret true; }
+    if (opcode == defs.XOR) { ret true; }
+    if (opcode == defs.CMP) { ret true; }
+    ret false;
+}
+
+# is_sse_mov: check if opcode is an SSE move
+fun is_sse_mov(opcode: u16) bool {
+    ret opcode == defs.MOVSS || opcode == defs.MOVSD;
+}
+
+# is_sse_alu: check if opcode is an SSE arithmetic
+fun is_sse_alu(opcode: u16) bool {
+    ret opcode >= defs.ADDSS && opcode <= defs.DIVSD;
+}
+
+# encode_mov: encode MOV instruction in all its forms
+fun encode_mov(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val size: u8 = mi.size;
+    val flags: u16 = mi.flags;
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        val w: u8 = size_to_w(size, flags);
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_if_needed(sec, alloc, w, src1.reg, dst.reg);
+        if (size == 1) {
+            emit_byte(sec, alloc, 0x88);
+        } or {
+            emit_byte(sec, alloc, 0x89);
+        }
+        emit_byte(sec, alloc, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_IMM) {
+        val w: u8 = size_to_w(size, flags);
+        val imm: i64 = src1.imm;
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        if (size == 1) {
+            if (needs_rex(dst.reg)) {
+                emit_byte(sec, alloc, encode_rex(0, 0, dst.reg));
+            }
+            emit_byte(sec, alloc, 0xB0 + reg_bits(dst.reg));
+            emit_byte(sec, alloc, imm::u8);
+        } or (size == 2) {
+            emit_rex_if_needed(sec, alloc, 0, 0, dst.reg);
+            emit_byte(sec, alloc, 0xB8 + reg_bits(dst.reg));
+            emit_u16(sec, alloc, imm::u16);
+        } or (size == 4) {
+            emit_rex_if_needed(sec, alloc, 0, 0, dst.reg);
+            emit_byte(sec, alloc, 0xB8 + reg_bits(dst.reg));
+            emit_u32(sec, alloc, imm::u32);
+        } or {
+            if (imm >= -2147483648 && imm <= 2147483647) {
+                emit_rex_if_needed(sec, alloc, w, 0, dst.reg);
+                emit_byte(sec, alloc, 0xC7);
+                emit_byte(sec, alloc, encode_modrm(3, 0, reg_bits(dst.reg)));
+                emit_u32(sec, alloc, imm::u32);
+            } or {
+                emit_byte(sec, alloc, encode_rex(1, 0, dst.reg));
+                emit_byte(sec, alloc, 0xB8 + reg_bits(dst.reg));
+                emit_u64(sec, alloc, imm::u64);
+            }
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        val w: u8 = size_to_w(size, flags);
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_mem(sec, alloc, w, dst.reg, src1);
+        if (size == 1) {
+            emit_byte(sec, alloc, 0x8A);
+        } or {
+            emit_byte(sec, alloc, 0x8B);
+        }
+        encode_mem_operand(sec, alloc, dst.reg, src1);
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
+        val w: u8 = size_to_w(size, flags);
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_mem(sec, alloc, w, src1.reg, dst);
+        if (size == 1) {
+            emit_byte(sec, alloc, 0x88);
+        } or {
+            emit_byte(sec, alloc, 0x89);
+        }
+        encode_mem_operand(sec, alloc, src1.reg, dst);
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_IMM) {
+        val w: u8 = size_to_w(size, flags);
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_mem(sec, alloc, w, 0, dst);
+        if (size == 1) {
+            emit_byte(sec, alloc, 0xC6);
+        } or {
+            emit_byte(sec, alloc, 0xC7);
+        }
+        encode_mem_operand(sec, alloc, 0, dst);
+        if (size == 1) {
+            emit_byte(sec, alloc, src1.imm::u8);
+        } or (size == 2) {
+            emit_u16(sec, alloc, src1.imm::u16);
+        } or {
+            emit_u32(sec, alloc, src1.imm::u32);
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_lea: encode LEA instruction
+fun encode_lea(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    if (dst.kind != isa.OPK_REG || src1.kind != isa.OPK_MEM) { ret 0; }
+    val w: u8 = size_to_w(mi.size, mi.flags);
+    emit_rex_mem(sec, alloc, w, dst.reg, src1);
+    emit_byte(sec, alloc, 0x8D);
+    encode_mem_operand(sec, alloc, dst.reg, src1);
+    ret (sec.size - start)::i32;
+}
+
+# encode_push: encode PUSH instruction
+fun encode_push(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val src: *isa.Operand = ?mi.dst;
+    if (src.kind == isa.OPK_REG) {
+        if (needs_rex(src.reg)) {
+            emit_byte(sec, alloc, encode_rex(0, 0, src.reg));
+        }
+        emit_byte(sec, alloc, 0x50 + reg_bits(src.reg));
+    } or (src.kind == isa.OPK_IMM) {
+        val imm: i64 = src.imm;
+        if (imm >= -128 && imm <= 127) {
+            emit_byte(sec, alloc, 0x6A);
+            emit_byte(sec, alloc, imm::u8);
+        } or {
+            emit_byte(sec, alloc, 0x68);
+            emit_u32(sec, alloc, imm::u32);
+        }
+    }
+    ret (sec.size - start)::i32;
+}
+
+# encode_pop: encode POP instruction
+fun encode_pop(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    if (dst.kind != isa.OPK_REG) { ret 0; }
+    if (needs_rex(dst.reg)) {
+        emit_byte(sec, alloc, encode_rex(0, 0, dst.reg));
+    }
+    emit_byte(sec, alloc, 0x58 + reg_bits(dst.reg));
+    ret (sec.size - start)::i32;
+}
+
+# encode_alu: encode ADD/SUB/AND/OR/XOR/CMP in all forms
+fun encode_alu(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val size: u8 = mi.size;
+    val flags: u16 = mi.flags;
+    val opcode: u16 = mi.opcode;
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        val opc: u8 = alu_opcode_rr(opcode, size);
+        encode_alu_rr(sec, alloc, opc, dst.reg, src1.reg, size, flags);
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_IMM) {
+        val grp: u8 = alu_group(opcode);
+        encode_alu_imm(sec, alloc, grp, dst.reg, src1.imm, size, flags);
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        val opc: u8 = alu_opcode_rr(opcode, size) + 2;
+        encode_alu_rm(sec, alloc, opc, dst.reg, src1, size, flags);
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
+        val opc: u8 = alu_opcode_rr(opcode, size);
+        encode_alu_rm(sec, alloc, opc, src1.reg, dst, size, flags);
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_IMM) {
+        val grp: u8 = alu_group(opcode);
+        val w: u8 = size_to_w(size, flags);
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_mem(sec, alloc, w, grp::i32, dst);
+        val imm: i64 = src1.imm;
+        if (imm >= -128 && imm <= 127 && size > 1) {
+            emit_byte(sec, alloc, 0x83);
+            encode_mem_operand(sec, alloc, grp::i32, dst);
+            emit_byte(sec, alloc, imm::u8);
+        } or (size == 1) {
+            emit_byte(sec, alloc, 0x80);
+            encode_mem_operand(sec, alloc, grp::i32, dst);
+            emit_byte(sec, alloc, imm::u8);
+        } or {
+            emit_byte(sec, alloc, 0x81);
+            encode_mem_operand(sec, alloc, grp::i32, dst);
+            emit_u32(sec, alloc, imm::u32);
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_test: encode TEST instruction
+fun encode_test(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val size: u8 = mi.size;
+    val flags: u16 = mi.flags;
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        val w: u8 = size_to_w(size, flags);
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_if_needed(sec, alloc, w, src1.reg, dst.reg);
+        if (size == 1) {
+            emit_byte(sec, alloc, 0x84);
+        } or {
+            emit_byte(sec, alloc, 0x85);
+        }
+        emit_byte(sec, alloc, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_IMM) {
+        val w: u8 = size_to_w(size, flags);
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_if_needed(sec, alloc, w, 0, dst.reg);
+        if (size == 1) {
+            emit_byte(sec, alloc, 0xF6);
+            emit_byte(sec, alloc, encode_modrm(3, 0, reg_bits(dst.reg)));
+            emit_byte(sec, alloc, src1.imm::u8);
+        } or {
+            emit_byte(sec, alloc, 0xF7);
+            emit_byte(sec, alloc, encode_modrm(3, 0, reg_bits(dst.reg)));
+            emit_u32(sec, alloc, src1.imm::u32);
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_imul: encode IMUL instruction
+fun encode_imul(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val size: u8 = mi.size;
+    val flags: u16 = mi.flags;
+    val w: u8 = size_to_w(size, flags);
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_if_needed(sec, alloc, w, dst.reg, src1.reg);
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0xAF);
+        emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_mem(sec, alloc, w, dst.reg, src1);
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0xAF);
+        encode_mem_operand(sec, alloc, dst.reg, src1);
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_IMM) {
+        val imm: i64 = src1.imm;
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_if_needed(sec, alloc, w, dst.reg, dst.reg);
+        if (imm >= -128 && imm <= 127) {
+            emit_byte(sec, alloc, 0x6B);
+            emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(dst.reg)));
+            emit_byte(sec, alloc, imm::u8);
+        } or {
+            emit_byte(sec, alloc, 0x69);
+            emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(dst.reg)));
+            emit_u32(sec, alloc, imm::u32);
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_div: encode DIV or IDIV instruction
+fun encode_div(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator, is_signed: bool) i32 {
+    val start: usize = sec.size;
+    val src: *isa.Operand = ?mi.src1;
+    val size: u8 = mi.size;
+    val flags: u16 = mi.flags;
+    val w: u8 = size_to_w(size, flags);
+    var ext: u8 = 6;
+    if (is_signed) { ext = 7; }
+
+    if (src.kind == isa.OPK_REG) {
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_if_needed(sec, alloc, w, 0, src.reg);
+        if (size == 1) {
+            emit_byte(sec, alloc, 0xF6);
+        } or {
+            emit_byte(sec, alloc, 0xF7);
+        }
+        emit_byte(sec, alloc, encode_modrm(3, ext, reg_bits(src.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (src.kind == isa.OPK_MEM) {
+        if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+        emit_rex_mem(sec, alloc, w, ext::i32, src);
+        if (size == 1) {
+            emit_byte(sec, alloc, 0xF6);
+        } or {
+            emit_byte(sec, alloc, 0xF7);
+        }
+        encode_mem_operand(sec, alloc, ext::i32, src);
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_shift: encode SHL/SHR/SAR
+fun encode_shift(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val size: u8 = mi.size;
+    val flags: u16 = mi.flags;
+    val w: u8 = size_to_w(size, flags);
+    val opcode: u16 = mi.opcode;
+    var ext: u8 = 4;
+    if (opcode == defs.SHR) { ext = 5; }
+    if (opcode == defs.SAR) { ext = 7; }
+
+    if ((flags & defs.FLAG_16BIT::u16) != 0) { emit_byte(sec, alloc, 0x66); }
+
+    if (src1.kind == isa.OPK_REG) {
+        emit_rex_if_needed(sec, alloc, w, 0, dst.reg);
+        if (size == 1) {
+            emit_byte(sec, alloc, 0xD2);
+        } or {
+            emit_byte(sec, alloc, 0xD3);
+        }
+        emit_byte(sec, alloc, encode_modrm(3, ext, reg_bits(dst.reg)));
+    } or (src1.kind == isa.OPK_IMM) {
+        val imm: i64 = src1.imm;
+        emit_rex_if_needed(sec, alloc, w, 0, dst.reg);
+        if (imm == 1) {
+            if (size == 1) {
+                emit_byte(sec, alloc, 0xD0);
+            } or {
+                emit_byte(sec, alloc, 0xD1);
+            }
+            emit_byte(sec, alloc, encode_modrm(3, ext, reg_bits(dst.reg)));
+        } or {
+            if (size == 1) {
+                emit_byte(sec, alloc, 0xC0);
+            } or {
+                emit_byte(sec, alloc, 0xC1);
+            }
+            emit_byte(sec, alloc, encode_modrm(3, ext, reg_bits(dst.reg)));
+            emit_byte(sec, alloc, imm::u8);
+        }
+    }
+
+    ret (sec.size - start)::i32;
+}
+
+# encode_cdq_cqo: encode CDQ or CQO sign extension
+fun encode_cdq_cqo(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    if (mi.opcode == defs.CQO) {
+        emit_byte(sec, alloc, 0x48);
+        emit_byte(sec, alloc, 0x99);
+    } or {
+        emit_byte(sec, alloc, 0x99);
+    }
+    ret (sec.size - start)::i32;
+}
+
+# encode_jcc: encode conditional jump
+fun encode_jcc(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val cc: u8 = cc_to_x86(mi.opcode);
+    emit_byte(sec, alloc, 0x0F);
+    emit_byte(sec, alloc, 0x80 + cc);
+    emit_u32(sec, alloc, 0);
+    ret (sec.size - start)::i32;
+}
+
+# encode_jmp: encode unconditional jump
+fun encode_jmp(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+
+    if ((mi.flags & defs.FLAG_INDIRECT::u16) != 0 && dst.kind == isa.OPK_REG) {
+        emit_rex_if_needed(sec, alloc, 0, 0, dst.reg);
+        emit_byte(sec, alloc, 0xFF);
+        emit_byte(sec, alloc, encode_modrm(3, 4, reg_bits(dst.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    emit_byte(sec, alloc, 0xE9);
+    emit_u32(sec, alloc, 0);
+    ret (sec.size - start)::i32;
+}
+
+# encode_call: encode CALL instruction
+fun encode_call(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+
+    if ((mi.flags & defs.FLAG_INDIRECT::u16) != 0) {
+        if (dst.kind == isa.OPK_REG) {
+            emit_rex_if_needed(sec, alloc, 0, 0, dst.reg);
+            emit_byte(sec, alloc, 0xFF);
+            emit_byte(sec, alloc, encode_modrm(3, 2, reg_bits(dst.reg)));
+        } or (dst.kind == isa.OPK_MEM) {
+            emit_rex_mem(sec, alloc, 0, 2, dst);
+            emit_byte(sec, alloc, 0xFF);
+            encode_mem_operand(sec, alloc, 2, dst);
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    emit_byte(sec, alloc, 0xE8);
+    emit_u32(sec, alloc, 0);
+    ret (sec.size - start)::i32;
+}
+
+# encode_ret: encode RET instruction
+fun encode_ret(sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    emit_byte(sec, alloc, 0xC3);
+    ret 1;
+}
+
+# encode_setcc: encode SETcc instruction
+fun encode_setcc(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val cc: u8 = cc_to_x86(mi.opcode);
+
+    if (dst.kind == isa.OPK_REG) {
+        if (needs_rex(dst.reg) || dst.reg == 4 || dst.reg == 5 || dst.reg == 6 || dst.reg == 7) {
+            emit_byte(sec, alloc, encode_rex(0, 0, dst.reg));
+        }
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0x90 + cc);
+        emit_byte(sec, alloc, encode_modrm(3, 0, reg_bits(dst.reg)));
+    }
+    ret (sec.size - start)::i32;
+}
+
+# encode_movzx: encode MOVZX instruction
+fun encode_movzx(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val src_size: u8 = src1.size;
+    val w: u8 = size_to_w(mi.size, mi.flags);
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        emit_rex_if_needed(sec, alloc, w, dst.reg, src1.reg);
+        emit_byte(sec, alloc, 0x0F);
+        if (src_size == 1) {
+            emit_byte(sec, alloc, 0xB6);
+        } or {
+            emit_byte(sec, alloc, 0xB7);
+        }
+        emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_rex_mem(sec, alloc, w, dst.reg, src1);
+        emit_byte(sec, alloc, 0x0F);
+        if (src_size == 1) {
+            emit_byte(sec, alloc, 0xB6);
+        } or {
+            emit_byte(sec, alloc, 0xB7);
+        }
+        encode_mem_operand(sec, alloc, dst.reg, src1);
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_movsx: encode MOVSX instruction
+fun encode_movsx(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val src_size: u8 = src1.size;
+    val w: u8 = size_to_w(mi.size, mi.flags);
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        emit_rex_if_needed(sec, alloc, w, dst.reg, src1.reg);
+        emit_byte(sec, alloc, 0x0F);
+        if (src_size == 1) {
+            emit_byte(sec, alloc, 0xBE);
+        } or {
+            emit_byte(sec, alloc, 0xBF);
+        }
+        emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_rex_mem(sec, alloc, w, dst.reg, src1);
+        emit_byte(sec, alloc, 0x0F);
+        if (src_size == 1) {
+            emit_byte(sec, alloc, 0xBE);
+        } or {
+            emit_byte(sec, alloc, 0xBF);
+        }
+        encode_mem_operand(sec, alloc, dst.reg, src1);
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_movsxd: encode MOVSXD instruction (32->64 sign extension)
+fun encode_movsxd(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        emit_byte(sec, alloc, encode_rex(1, dst.reg, src1.reg));
+        emit_byte(sec, alloc, 0x63);
+        emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_rex_mem(sec, alloc, 1, dst.reg, src1);
+        emit_byte(sec, alloc, 0x63);
+        encode_mem_operand(sec, alloc, dst.reg, src1);
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_movabs: encode MOVABS (64-bit immediate load)
+fun encode_movabs(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    if (dst.kind != isa.OPK_REG) { ret 0; }
+    emit_byte(sec, alloc, encode_rex(1, 0, dst.reg));
+    emit_byte(sec, alloc, 0xB8 + reg_bits(dst.reg));
+    if (src1.kind == isa.OPK_IMM) {
+        emit_u64(sec, alloc, src1.imm::u64);
+    } or (src1.kind == isa.OPK_SYM || src1.kind == isa.OPK_LABEL) {
+        emit_u64(sec, alloc, 0);
+    } or {
+        emit_u64(sec, alloc, 0);
+    }
+    ret (sec.size - start)::i32;
+}
+
+# encode_sse_mov: encode MOVSS/MOVSD
+fun encode_sse_mov(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val opcode: u16 = mi.opcode;
+
+    var prefix: u8 = 0xF3;
+    if (opcode == defs.MOVSD) { prefix = 0xF2; }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        emit_byte(sec, alloc, prefix);
+        emit_rex_if_needed(sec, alloc, 0, dst.reg, src1.reg);
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0x10);
+        emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_byte(sec, alloc, prefix);
+        emit_rex_mem(sec, alloc, 0, dst.reg, src1);
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0x10);
+        encode_mem_operand(sec, alloc, dst.reg, src1);
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
+        emit_byte(sec, alloc, prefix);
+        emit_rex_mem(sec, alloc, 0, src1.reg, dst);
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0x11);
+        encode_mem_operand(sec, alloc, src1.reg, dst);
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# sse_alu_opcode: map opcode to SSE ALU secondary byte
+fun sse_alu_opcode(opcode: u16) u8 {
+    if (opcode == defs.ADDSS || opcode == defs.ADDSD) { ret 0x58; }
+    if (opcode == defs.SUBSS || opcode == defs.SUBSD) { ret 0x5C; }
+    if (opcode == defs.MULSS || opcode == defs.MULSD) { ret 0x59; }
+    if (opcode == defs.DIVSS || opcode == defs.DIVSD) { ret 0x5E; }
+    ret 0x58;
+}
+
+# sse_alu_prefix: map opcode to SSE prefix byte
+fun sse_alu_prefix(opcode: u16) u8 {
+    if (opcode == defs.ADDSD || opcode == defs.SUBSD || opcode == defs.MULSD || opcode == defs.DIVSD) {
+        ret 0xF2;
+    }
+    ret 0xF3;
+}
+
+# encode_sse_alu: encode SSE arithmetic (ADDSS/SD, SUBSS/SD, MULSS/SD, DIVSS/SD)
+fun encode_sse_alu(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val prefix: u8 = sse_alu_prefix(mi.opcode);
+    val opc: u8 = sse_alu_opcode(mi.opcode);
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        emit_byte(sec, alloc, prefix);
+        emit_rex_if_needed(sec, alloc, 0, dst.reg, src1.reg);
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, opc);
+        emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_byte(sec, alloc, prefix);
+        emit_rex_mem(sec, alloc, 0, dst.reg, src1);
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, opc);
+        encode_mem_operand(sec, alloc, dst.reg, src1);
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_ucomiss: encode UCOMISS/UCOMISD
+fun encode_ucomiss(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+
+    if (mi.opcode == defs.UCOMISD) {
+        emit_byte(sec, alloc, 0x66);
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+        emit_rex_if_needed(sec, alloc, 0, dst.reg, src1.reg);
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0x2E);
+        emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (sec.size - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_rex_mem(sec, alloc, 0, dst.reg, src1);
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0x2E);
+        encode_mem_operand(sec, alloc, dst.reg, src1);
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_cvt: encode conversion instructions (CVTSI2SS/SD, CVTSS2SD, etc.)
+fun encode_cvt(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    val start: usize = sec.size;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    val opcode: u16 = mi.opcode;
+
+    if (opcode == defs.CVTSI2SS) {
+        emit_byte(sec, alloc, 0xF3);
+        val w: u8 = size_to_w(mi.size, mi.flags);
+        if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+            emit_rex_if_needed(sec, alloc, w, dst.reg, src1.reg);
+            emit_byte(sec, alloc, 0x0F);
+            emit_byte(sec, alloc, 0x2A);
+            emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    if (opcode == defs.CVTSI2SD) {
+        emit_byte(sec, alloc, 0xF2);
+        val w: u8 = size_to_w(mi.size, mi.flags);
+        if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+            emit_rex_if_needed(sec, alloc, w, dst.reg, src1.reg);
+            emit_byte(sec, alloc, 0x0F);
+            emit_byte(sec, alloc, 0x2A);
+            emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    if (opcode == defs.CVTTSS2SI) {
+        emit_byte(sec, alloc, 0xF3);
+        val w: u8 = size_to_w(mi.size, mi.flags);
+        if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+            emit_rex_if_needed(sec, alloc, w, dst.reg, src1.reg);
+            emit_byte(sec, alloc, 0x0F);
+            emit_byte(sec, alloc, 0x2C);
+            emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    if (opcode == defs.CVTTSD2SI) {
+        emit_byte(sec, alloc, 0xF2);
+        val w: u8 = size_to_w(mi.size, mi.flags);
+        if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+            emit_rex_if_needed(sec, alloc, w, dst.reg, src1.reg);
+            emit_byte(sec, alloc, 0x0F);
+            emit_byte(sec, alloc, 0x2C);
+            emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    if (opcode == defs.CVTSS2SD) {
+        emit_byte(sec, alloc, 0xF3);
+        if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+            emit_rex_if_needed(sec, alloc, 0, dst.reg, src1.reg);
+            emit_byte(sec, alloc, 0x0F);
+            emit_byte(sec, alloc, 0x5A);
+            emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    if (opcode == defs.CVTSD2SS) {
+        emit_byte(sec, alloc, 0xF2);
+        if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+            emit_rex_if_needed(sec, alloc, 0, dst.reg, src1.reg);
+            emit_byte(sec, alloc, 0x0F);
+            emit_byte(sec, alloc, 0x5A);
+            emit_byte(sec, alloc, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (sec.size - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_inst: encode a single machine instruction into a section
 #
-# writes the binary encoding of the instruction into the section's data buffer
-# and returns the number of bytes emitted.
+# dispatches to the appropriate encoding function based on the opcode.
+# returns the number of bytes emitted or 0 on failure.
 # ---
 # mi:    pointer to the machine instruction to encode
 # sec:   pointer to the output section
 # alloc: allocator for any temporary storage
 # ret:   number of bytes emitted (0 on failure)
 pub fun encode_inst(mi: *isa.Inst, sec: *of.Section, alloc: &allocator.Allocator) i32 {
+    if (mi == nil || sec == nil) { ret 0; }
+    val opcode: u16 = mi.opcode;
+
+    if (opcode == defs.NOP) {
+        emit_byte(sec, alloc, 0x90);
+        ret 1;
+    }
+
+    if (opcode == defs.MOV) {
+        ret encode_mov(mi, sec, alloc);
+    }
+
+    if (opcode == defs.LEA) {
+        ret encode_lea(mi, sec, alloc);
+    }
+
+    if (opcode == defs.PUSH) {
+        ret encode_push(mi, sec, alloc);
+    }
+
+    if (opcode == defs.POP) {
+        ret encode_pop(mi, sec, alloc);
+    }
+
+    if (is_alu(opcode)) {
+        ret encode_alu(mi, sec, alloc);
+    }
+
+    if (opcode == defs.TEST) {
+        ret encode_test(mi, sec, alloc);
+    }
+
+    if (opcode == defs.IMUL) {
+        ret encode_imul(mi, sec, alloc);
+    }
+
+    if (opcode == defs.IDIV) {
+        ret encode_div(mi, sec, alloc, true);
+    }
+
+    if (opcode == defs.DIV) {
+        ret encode_div(mi, sec, alloc, false);
+    }
+
+    if (opcode == defs.SHL || opcode == defs.SHR || opcode == defs.SAR) {
+        ret encode_shift(mi, sec, alloc);
+    }
+
+    if (opcode == defs.CDQ || opcode == defs.CQO) {
+        ret encode_cdq_cqo(mi, sec, alloc);
+    }
+
+    if (is_jcc(opcode)) {
+        ret encode_jcc(mi, sec, alloc);
+    }
+
+    if (opcode == defs.JMP) {
+        ret encode_jmp(mi, sec, alloc);
+    }
+
+    if (opcode == defs.CALL) {
+        ret encode_call(mi, sec, alloc);
+    }
+
+    if (opcode == defs.RET) {
+        ret encode_ret(sec, alloc);
+    }
+
+    if (is_setcc(opcode)) {
+        ret encode_setcc(mi, sec, alloc);
+    }
+
+    if (opcode == defs.MOVZX) {
+        ret encode_movzx(mi, sec, alloc);
+    }
+
+    if (opcode == defs.MOVSX) {
+        ret encode_movsx(mi, sec, alloc);
+    }
+
+    if (opcode == defs.MOVSXD) {
+        ret encode_movsxd(mi, sec, alloc);
+    }
+
+    if (opcode == defs.MOVABS) {
+        ret encode_movabs(mi, sec, alloc);
+    }
+
+    if (is_sse_mov(opcode)) {
+        ret encode_sse_mov(mi, sec, alloc);
+    }
+
+    if (is_sse_alu(opcode)) {
+        ret encode_sse_alu(mi, sec, alloc);
+    }
+
+    if (opcode == defs.UCOMISS || opcode == defs.UCOMISD) {
+        ret encode_ucomiss(mi, sec, alloc);
+    }
+
+    if (opcode >= defs.CVTSI2SS && opcode <= defs.CVTTSD2SI) {
+        ret encode_cvt(mi, sec, alloc);
+    }
+
+    if (opcode == defs.SYSCALL) {
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0x05);
+        ret 2;
+    }
+
+    if (opcode == defs.UD2) {
+        emit_byte(sec, alloc, 0x0F);
+        emit_byte(sec, alloc, 0x0B);
+        ret 2;
+    }
+
+    if (opcode == defs.PAUSE) {
+        emit_byte(sec, alloc, 0xF3);
+        emit_byte(sec, alloc, 0x90);
+        ret 2;
+    }
+
     ret 0;
 }
