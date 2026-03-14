@@ -1,8 +1,9 @@
 # compiler.session: compilation session and shared state
 #
-# owns the string pool, compile options, and result tracking. the string pool
-# interns strings by pointer with dedup via hash map, so repeated lookups
-# return the same pointer without additional allocation.
+# owns all compilation state: diagnostics, module table, symbol table, type
+# table, monomorphization cache, and target. the string pool interns strings
+# by pointer with dedup via hash map, so repeated lookups return the same
+# pointer without additional allocation.
 
 use std.types.bool;
 use std.types.size;
@@ -12,6 +13,21 @@ use std.types.result;
 use allocator: std.allocator;
 use map:       std.collections.map;
 use page:      std.allocator.page;
+
+use diag:    compiler.diag;
+use module:  compiler.sema.module;
+use scope:   compiler.sema.scope;
+use type:    compiler.sema.type;
+use mono:    compiler.sema.mono;
+use sema:    compiler.sema.sema;
+use check:   compiler.sema.check;
+use ast:     compiler.parse.ast;
+use lower:   compiler.lower.lower;
+use codegen: compiler.codegen;
+use linker:  compiler.linker;
+use target:  compiler.target.target;
+use pass:    compiler.opt.pass;
+use masm_mod: masm.module;
 
 # options controlling compilation behavior
 # ---
@@ -64,28 +80,48 @@ pub rec StringPool {
 # ---
 # alloc:   backing allocator
 # strings: shared string pool
+# diag:    diagnostic list
+# modules: module table
+# symbols: symbol table
+# types:   type table
+# mono:    monomorphization cache
+# target:  resolved compilation target
 # opts:    compilation options
 pub rec Session {
     alloc:   &allocator.Allocator;
     strings: StringPool;
+    diag:    diag.DiagList;
+    modules: module.ModuleTable;
+    symbols: scope.SymbolTable;
+    types:   type.TypeTable;
+    mono:    mono.MonoCache;
+    target:  *target.Target;
     opts:    CompileOpts;
 }
 
 # init: create a new compilation session.
 # ---
-# alloc: allocator for all session-owned storage
-# opts:  compilation options
-# ret:   initialized Session
-pub fun init(alloc: &allocator.Allocator, opts: CompileOpts) Session {
+# alloc:    allocator for all session-owned storage
+# opts:     compilation options
+# ptr_size: pointer size in bytes for the target
+# ret:      initialized Session
+pub fun init(alloc: &allocator.Allocator, opts: CompileOpts, ptr_size: u32) Session {
     var s: Session;
-    s.alloc = alloc;
-    s.opts = opts;
+    s.alloc  = alloc;
+    s.opts   = opts;
+    s.target = nil;
 
     s.strings.alloc   = alloc;
     s.strings.strings = nil;
     s.strings.count   = 0;
     s.strings.cap     = 0;
     s.strings.dedup   = map.init[str, u32](alloc, map.hash_str, map.eq_str);
+
+    s.diag    = diag.init(alloc::*allocator.Allocator);
+    s.modules = module.init(alloc);
+    s.symbols = scope.init(alloc);
+    s.types   = type.init(alloc, ptr_size, ptr_size);
+    s.mono    = mono.init(alloc);
 
     ret s;
 }
@@ -95,6 +131,12 @@ pub fun init(alloc: &allocator.Allocator, opts: CompileOpts) Session {
 # s: session to destroy
 pub fun dnit(s: *Session) {
     if (s == nil) { ret; }
+
+    mono.dnit(?s.mono);
+    scope.dnit(?s.symbols);
+    type.dnit(?s.types);
+    module.dnit(?s.modules);
+    diag.dnit(?s.diag);
 
     if (s.strings.strings != nil && s.strings.cap > 0) {
         allocator.deallocate[str](s.strings.alloc, s.strings.strings, s.strings.cap::usize);
@@ -166,11 +208,155 @@ pub fun default_opts() CompileOpts {
     ret opts;
 }
 
+# load: load a root module and its dependency graph into the session.
+# ---
+# s:          session
+# root_path:  dot-separated module path for the root
+# file_path:  filesystem path to the root source file
+# source:     source text of the root file
+# src_dir:    source root directory
+# dep_dir:    dependency root directory
+# project_id: project identifier string
+pub fun load(s: *Session, root_path: str, file_path: str, source: str,
+             src_dir: str, dep_dir: str, project_id: str) {
+    val root_id: module.ModuleId = module.create(?s.modules, root_path, file_path, source);
+    if (root_id::u32 == module.MOD_NIL::u32) { ret; }
+    module.load_graph(?s.modules, root_id, src_dir, dep_dir, project_id);
+}
+
+# analyze: run all four semantic analysis phases.
+# ---
+# s: session
+pub fun analyze(s: *Session) {
+    var sa: sema.Sema;
+    sa.alloc   = s.alloc;
+    sa.modules = ?s.modules;
+    sa.symbols = ?s.symbols;
+    sa.types   = ?s.types;
+    sa.mono    = ?s.mono;
+    sa.diag    = ?s.diag;
+    sa.strings = ?s.strings;
+    sema.analyze(?sa);
+}
+
+# lower_all: lower all modules in topological order into MASM IR.
+# ---
+# s:       session
+# builder: masm module builder to populate
+pub fun lower_all(s: *Session, builder: *masm_mod.ModuleBuilder) {
+    var sa: sema.Sema;
+    sa.alloc   = s.alloc;
+    sa.modules = ?s.modules;
+    sa.symbols = ?s.symbols;
+    sa.types   = ?s.types;
+    sa.mono    = ?s.mono;
+    sa.diag    = ?s.diag;
+    sa.strings = ?s.strings;
+
+    val res_lower: Result[lower.LowerContext, str] = lower.init(
+        s.alloc::*allocator.Allocator, s.target::ptr, builder, ?sa
+    );
+    if (is_err[lower.LowerContext, str](res_lower)) { ret; }
+    var lctx: lower.LowerContext = unwrap_ok[lower.LowerContext, str](res_lower);
+
+    var i: u32 = 0;
+    for (i < module.order_count(?s.modules)) {
+        val mod_id: module.ModuleId = module.order_at(?s.modules, i);
+        lower.lower_module(?lctx, mod_id);
+        i = i + 1;
+    }
+
+    lower.dnit(?lctx);
+}
+
+# compile: compile all functions in an IR module through the backend.
+# ---
+# s:         session
+# ir_module: masm module containing lowered functions
+# ret:       compilation result
+pub fun compile(s: *Session, ir_module: *masm_mod.Module) CompileResult {
+    var result: CompileResult;
+    result.ok        = false;
+    result.obj_paths = nil;
+    result.obj_count = 0;
+    result.binary    = nil;
+
+    if (s.target == nil) { ret result; }
+
+    var pipeline: pass.PassPipeline = pass.default_pipeline(s.alloc, s.opts.opt_level);
+
+    var fi: usize = 0;
+    for (fi < ir_module.functions.len) {
+        val fn_ptr: ptr = ir_module.functions.data[fi]::ptr;
+        if (fn_ptr != nil) {
+            val cg_result: codegen.CodegenResult = codegen.compile_function(
+                ir_module.functions.data[fi], 0, s.target, ?pipeline, s.alloc, ?s.target.of.obj
+            );
+            if (!cg_result.ok) {
+                result.ok = false;
+            }
+        }
+        fi = fi + 1;
+    }
+
+    pass.dnit(?pipeline);
+    result.ok = true;
+    ret result;
+}
+
+# link_all: link object files into a final binary.
+# ---
+# s:           session
+# obj_paths:   array of object file paths
+# obj_count:   number of object files
+# output_path: path for the output binary
+# ret:         link result
+pub fun link_all(s: *Session, obj_paths: *str, obj_count: i32, output_path: str) linker.LinkResult {
+    ret linker.link(s.alloc, obj_paths, obj_count, output_path, s.target);
+}
+
+# diagnostics: return a read-only reference to the session's diagnostic list.
+# ---
+# s:   session
+# ret: reference to the diagnostic list
+pub fun diagnostics(s: &Session) &diag.DiagList {
+    ret ?s.diag;
+}
+
+# get_type: look up a type by id.
+# ---
+# s:  session
+# id: type id
+# ret: reference to the type
+pub fun get_type(s: &Session, id: type.TypeId) &type.Type {
+    ret type.get(?s.types, id);
+}
+
+# get_symbol: look up a symbol by id.
+# ---
+# s:  session
+# id: symbol id
+# ret: reference to the symbol
+pub fun get_symbol(s: &Session, id: scope.SymbolId) &scope.Symbol {
+    ret scope.get_sym(?s.symbols, id);
+}
+
+# node_type: get the resolved type for an AST node in a module.
+# ---
+# s:       session
+# mod_id:  module containing the node
+# node_id: AST node id
+# ret:     resolved TypeId, or TYPE_NIL if not set
+pub fun node_type(s: &Session, mod_id: module.ModuleId, node_id: ast.NodeId) type.TypeId {
+    val m: &module.Module = module.get(?s.modules, mod_id);
+    ret check.get_type(?m.expr_types, node_id);
+}
+
 test "session: pool_intern deduplicates strings" {
     var a: allocator.Allocator;
     page.make(?a);
 
-    var s: Session = init(?a, default_opts());
+    var s: Session = init(?a, default_opts(), 8);
 
     val first:  str = pool_intern(?s.strings, "hello");
     val second: str = pool_intern(?s.strings, "hello");
