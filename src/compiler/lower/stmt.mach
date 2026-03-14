@@ -1,0 +1,265 @@
+# compiler.lower.stmt: statement lowering
+#
+# translates statement AST nodes into MASM IR. dispatches on node kind
+# and delegates expression evaluation to expr.mach. handles control flow
+# (if/or, for), local declarations, return, break, continue, and defer.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+
+use op:   masm.op;
+use inst: masm.inst;
+use pool: masm.pool;
+
+use ast:  compiler.parse.ast;
+use type: compiler.sema.type;
+
+use lower: compiler.lower.lower;
+use expr:  compiler.lower.expr;
+
+# dispatch on statement node kind
+# ---
+# ctx:     lowering context
+# node_id: AST node to lower
+# store:   AST node store
+pub fun lower_stmt(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                   store: &ast.NodeStore) {
+    if (ctx == nil) { ret; }
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val node: &ast.Node = ast.get(store, node_id);
+
+    if (node.kind == ast.NK_STMT_BLOCK) {
+        lower_block(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_DECL_VAL || node.kind == ast.NK_DECL_VAR) {
+        lower_var_decl(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_IF) {
+        lower_if(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_FOR) {
+        lower_for(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_RET) {
+        lower_return(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_BRK) {
+        lower_break(ctx);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_CNT) {
+        lower_continue(ctx);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_FIN) {
+        lower_defer(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_EXPR) {
+        lower_expr_stmt(ctx, node_id, store);
+        ret;
+    }
+
+    if (ast.is_expr(node.kind)) {
+        expr.lower_expr(ctx, node_id, store);
+        ret;
+    }
+}
+
+# lower a block statement — iterate children, emit deferred at scope exit
+fun lower_block(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                store: &ast.NodeStore) {
+    val stmts: ast.NodeSpan = ast.block_stmts(store, node_id);
+
+    val saved_local_count: i32 = ctx.local_count;
+    val saved_defer_mark: i32 = lower.defer_get_mark(ctx);
+
+    var i: u32 = 0;
+    for (i < stmts.len) {
+        val child_id: ast.NodeId = ast.get_extra(store, stmts.start + i)::ast.NodeId;
+        if (child_id::u32 != ast.NODE_NIL::u32) {
+            lower_stmt(ctx, child_id, store);
+        }
+        i = i + 1;
+    }
+
+    emit_deferred(ctx, saved_defer_mark, store);
+    ctx.local_count = saved_local_count;
+}
+
+# lower a local variable declaration
+fun lower_var_decl(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                   store: &ast.NodeStore) {
+    val name_sid: ast.StrId = ast.var_name(store, node_id);
+    val name: str = ast.get_str(store, name_sid);
+    if (name == nil) { ret; }
+
+    val sz: usize = ctx.ptr_size::usize;
+    val offset: i64 = lower.push_local(ctx, name, type.TYPE_NIL, sz, sz);
+
+    val init_id: ast.NodeId = ast.var_init(store, node_id);
+    if (init_id::u32 != ast.NODE_NIL::u32) {
+        val init_vreg: u16 = expr.lower_expr(ctx, init_id, store);
+        val disp: u16 = lower.intern_disp(ctx, offset::i32);
+        lower.emit(ctx, inst.make_store(init_vreg, inst.VREG_FP::u16, disp, sz::u8));
+    }
+}
+
+# lower an if/or-chain
+fun lower_if(ctx: *lower.LowerContext, node_id: ast.NodeId,
+             store: &ast.NodeStore) {
+    val end_label: u16 = lower.alloc_label(ctx, "if_end");
+    lower_if_chain(ctx, node_id, end_label, store);
+    lower.new_block(ctx, end_label);
+}
+
+# recursive helper for if/or chains
+fun lower_if_chain(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                   end_label: u16, store: &ast.NodeStore) {
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val node: &ast.Node = ast.get(store, node_id);
+    val cond_id: ast.NodeId = ast.cond_expr(store, node_id);
+    val body_id: ast.NodeId = ast.cond_body(store, node_id);
+    val or_id: ast.NodeId = ast.cond_or_chain(store, node_id);
+
+    if (cond_id::u32 == ast.NODE_NIL::u32) {
+        if (body_id::u32 != ast.NODE_NIL::u32) {
+            lower_stmt(ctx, body_id, store);
+        }
+        ret;
+    }
+
+    val cond_vreg: u16 = expr.lower_expr(ctx, cond_id, store);
+    val then_label: u16 = lower.alloc_label(ctx, "if_then");
+    val else_label: u16 = lower.alloc_label(ctx, "if_else");
+
+    lower.emit(ctx, inst.make_branch(cond_vreg, then_label, op.CC_NE));
+    lower.emit(ctx, inst.make_jmp(else_label));
+
+    lower.new_block(ctx, then_label);
+    if (body_id::u32 != ast.NODE_NIL::u32) {
+        lower_stmt(ctx, body_id, store);
+    }
+    if (!lower.block_terminated(ctx)) {
+        lower.emit(ctx, inst.make_jmp(end_label));
+    }
+
+    lower.new_block(ctx, else_label);
+    if (or_id::u32 != ast.NODE_NIL::u32) {
+        val or_node: &ast.Node = ast.get(store, or_id);
+        if (or_node.kind == ast.NK_STMT_OR) {
+            lower_if_chain(ctx, or_id, end_label, store);
+        } or {
+            lower_stmt(ctx, or_id, store);
+        }
+    }
+}
+
+# lower a for-loop
+fun lower_for(ctx: *lower.LowerContext, node_id: ast.NodeId,
+              store: &ast.NodeStore) {
+    val node: &ast.Node = ast.get(store, node_id);
+    val cond_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    val body_id: ast.NodeId = ast.get_extra(store, node.payload + 1)::ast.NodeId;
+
+    val cond_label: u16 = lower.alloc_label(ctx, "for_cond");
+    val body_label: u16 = lower.alloc_label(ctx, "for_body");
+    val end_label: u16 = lower.alloc_label(ctx, "for_end");
+
+    val saved_ls: lower.LoopState = ctx.ls;
+    ctx.ls.brk_label = lower.label_name(ctx, end_label);
+    ctx.ls.cnt_label = lower.label_name(ctx, cond_label);
+
+    lower.emit(ctx, inst.make_jmp(cond_label));
+    lower.new_block(ctx, cond_label);
+
+    if (cond_id::u32 != ast.NODE_NIL::u32) {
+        val cond_vreg: u16 = expr.lower_expr(ctx, cond_id, store);
+        lower.emit(ctx, inst.make_branch(cond_vreg, body_label, op.CC_NE));
+        lower.emit(ctx, inst.make_jmp(end_label));
+    }
+
+    lower.new_block(ctx, body_label);
+    if (body_id::u32 != ast.NODE_NIL::u32) {
+        lower_stmt(ctx, body_id, store);
+    }
+    if (!lower.block_terminated(ctx)) {
+        lower.emit(ctx, inst.make_jmp(cond_label));
+    }
+
+    lower.new_block(ctx, end_label);
+    ctx.ls = saved_ls;
+}
+
+# lower a return statement
+fun lower_return(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                 store: &ast.NodeStore) {
+    val node: &ast.Node = ast.get(store, node_id);
+    val value_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+
+    if (value_id::u32 != ast.NODE_NIL::u32) {
+        val value_vreg: u16 = expr.lower_expr(ctx, value_id, store);
+        val td: u16 = 0xFFFF;
+        lower.emit(ctx, inst.make_ret_value(value_vreg, td, ctx.ptr_size));
+    } or {
+        lower.emit(ctx, inst.make_ret());
+    }
+}
+
+# lower a break statement — emit jump to loop break label
+fun lower_break(ctx: *lower.LowerContext) {
+    if (ctx.ls.brk_label == nil) { ret; }
+    val li: i32 = pool.label_intern(ctx.alloc, ?ctx.func.labels, ctx.ls.brk_label);
+    if (li >= 0) {
+        lower.emit(ctx, inst.make_jmp(li::u16));
+    }
+}
+
+# lower a continue statement — emit jump to loop continue label
+fun lower_continue(ctx: *lower.LowerContext) {
+    if (ctx.ls.cnt_label == nil) { ret; }
+    val li: i32 = pool.label_intern(ctx.alloc, ?ctx.func.labels, ctx.ls.cnt_label);
+    if (li >= 0) {
+        lower.emit(ctx, inst.make_jmp(li::u16));
+    }
+}
+
+# lower a defer statement — store the node for emission at scope exit
+fun lower_defer(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                store: &ast.NodeStore) {
+    val node: &ast.Node = ast.get(store, node_id);
+    val body_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    lower.defer_push(ctx, body_id);
+}
+
+# lower an expression statement — evaluate and discard result
+fun lower_expr_stmt(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                    store: &ast.NodeStore) {
+    val node: &ast.Node = ast.get(store, node_id);
+    val inner_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    if (inner_id::u32 != ast.NODE_NIL::u32) {
+        expr.lower_expr(ctx, inner_id, store);
+    }
+}
+
+# emit deferred statements in reverse order from mark to current count
+fun emit_deferred(ctx: *lower.LowerContext, mark: i32,
+                  store: &ast.NodeStore) {
+    var i: i32 = ctx.ds.count - 1;
+    for (i >= mark) {
+        val deferred_id: ast.NodeId = ctx.ds.nodes[i];
+        if (deferred_id::u32 != ast.NODE_NIL::u32) {
+            lower_stmt(ctx, deferred_id, store);
+        }
+        i = i - 1;
+    }
+    ctx.ds.count = mark;
+}

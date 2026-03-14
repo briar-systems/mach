@@ -1,0 +1,581 @@
+# compiler.lower: AST to MASM IR lowering context and driver
+#
+# transforms typed AST (sema output) into target-independent MASM IR.
+# owns per-function state and dispatches to expr, stmt, and data sub-modules.
+# all target-dependent decisions route through target interfaces — lowering
+# never produces ISA-specific instructions.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+
+use op:       masm.op;
+use inst:     masm.inst;
+use pool:     masm.pool;
+use fn:       masm.function;
+use module:   masm.module;
+use typedesc: masm.typedesc;
+
+use sema:     compiler.sema.sema;
+use type:     compiler.sema.type;
+use smod:     compiler.sema.module;
+use ast:      compiler.parse.ast;
+
+use data_mod: compiler.lower.data;
+use stmt_mod: compiler.lower.stmt;
+
+val INITIAL_LOCAL_CAP: i32 = 64;
+val INITIAL_DEFER_CAP: i32 = 8;
+
+# per-function local variable record
+# ---
+# name:    variable name
+# type_id: type of this variable
+# offset:  stack offset from frame pointer
+# size:    size in bytes
+# align:   alignment in bytes
+pub rec LocalVar {
+    name:    str;
+    type_id: type.TypeId;
+    offset:  i64;
+    size:    usize;
+    align:   usize;
+}
+
+# loop context for break/continue label resolution
+# ---
+# brk_label: label to jump to on break
+# cnt_label: label to jump to on continue
+pub rec LoopState {
+    brk_label: str;
+    cnt_label: str;
+}
+
+# deferred statement tracking
+# ---
+# nodes: array of node ids to emit at scope exit
+# count: number of stored nodes
+# cap:   allocated capacity
+# mark:  scope boundary marker for nested defer
+pub rec DeferState {
+    nodes: *ast.NodeId;
+    count: i32;
+    cap:   i32;
+    mark:  i32;
+}
+
+# return type context for the current function
+# ---
+# ret_type:  return type id
+# has_sret:  true if returning via hidden struct-return pointer
+# sret_vreg: virtual register holding the sret pointer
+pub rec ReturnState {
+    ret_type:  type.TypeId;
+    has_sret:  bool;
+    sret_vreg: u16;
+}
+
+# lowering context owning all per-function mutable state
+# ---
+# alloc:         backing allocator
+# target:        target descriptor (ptr until target module exists)
+# builder:       masm module builder
+# sema:          semantic analysis context
+# func:          current masm function being built
+# block:         current basic block
+# vreg_next:     next virtual register id to allocate
+# label_counter: monotonic counter for unique label names
+# str_counter:   monotonic counter for string constant labels
+# locals:        array of local variable records
+# local_count:   number of locals in current function
+# local_cap:     allocated capacity
+# stack_offset:  current stack frame offset
+# rs:            return state
+# ls:            loop state
+# ds:            defer state
+# current_file:  debug file index
+# current_line:  current source line number
+# ptr_size:      pointer size in bytes (from target)
+pub rec LowerContext {
+    alloc:         *allocator.Allocator;
+    target:        ptr;
+    builder:       *module.ModuleBuilder;
+    sema:          *sema.Sema;
+    func:          *fn.Function;
+    block:         *fn.Block;
+    vreg_next:     i32;
+    label_counter: i32;
+    str_counter:   i32;
+    locals:        *LocalVar;
+    local_count:   i32;
+    local_cap:     i32;
+    stack_offset:  i64;
+    rs:            ReturnState;
+    ls:            LoopState;
+    ds:            DeferState;
+    current_file:  u16;
+    current_line:  i32;
+    ptr_size:      u8;
+}
+
+# initialize a lowering context
+# ---
+# alloc:   allocator for all internal storage
+# target:  target descriptor pointer
+# builder: masm module builder to populate
+# sa:      semantic analysis context
+# ret:     initialized context or error string
+pub fun init(alloc: *allocator.Allocator, target: ptr,
+             builder: *module.ModuleBuilder, sa: *sema.Sema) Result[LowerContext, str] {
+    if (builder == nil || sa == nil) {
+        ret err[LowerContext, str]("nil builder or sema");
+    }
+
+    var ctx: LowerContext;
+    ctx.alloc         = alloc;
+    ctx.target        = target;
+    ctx.builder       = builder;
+    ctx.sema          = sa;
+    ctx.func          = nil;
+    ctx.block         = nil;
+    ctx.vreg_next     = inst.VREG_START;
+    ctx.label_counter = 0;
+    ctx.str_counter   = 0;
+    ctx.local_count   = 0;
+    ctx.stack_offset  = 0;
+    ctx.rs.ret_type   = type.TYPE_NIL;
+    ctx.rs.has_sret   = false;
+    ctx.rs.sret_vreg  = 0;
+    ctx.ls.brk_label  = nil;
+    ctx.ls.cnt_label  = nil;
+    ctx.ds.nodes      = nil;
+    ctx.ds.count      = 0;
+    ctx.ds.cap        = 0;
+    ctx.ds.mark       = 0;
+    ctx.current_file  = 0;
+    ctx.current_line  = 0;
+    ctx.ptr_size      = 8;
+
+    val lv_r: Result[*LocalVar, str] =
+        allocator.allocate[LocalVar](alloc, INITIAL_LOCAL_CAP::usize);
+    if (!lv_r.tag) {
+        ret err[LowerContext, str]("out of memory");
+    }
+    ctx.locals    = lv_r.value.ok;
+    ctx.local_cap = INITIAL_LOCAL_CAP;
+
+    val df_r: Result[*ast.NodeId, str] =
+        allocator.allocate[ast.NodeId](alloc, INITIAL_DEFER_CAP::usize);
+    if (!df_r.tag) {
+        ret err[LowerContext, str]("out of memory");
+    }
+    ctx.ds.nodes = df_r.value.ok;
+    ctx.ds.cap   = INITIAL_DEFER_CAP;
+
+    ret ok[LowerContext, str](ctx);
+}
+
+# tear down a lowering context, freeing all internal storage
+# ---
+# ctx: context to destroy
+pub fun dnit(ctx: *LowerContext) {
+    if (ctx == nil) { ret; }
+    if (ctx.locals != nil && ctx.local_cap > 0) {
+        allocator.deallocate[LocalVar](ctx.alloc, ctx.locals, ctx.local_cap::usize);
+        ctx.locals = nil;
+    }
+    if (ctx.ds.nodes != nil && ctx.ds.cap > 0) {
+        allocator.deallocate[ast.NodeId](ctx.alloc, ctx.ds.nodes, ctx.ds.cap::usize);
+        ctx.ds.nodes = nil;
+    }
+}
+
+# lower all top-level declarations in a module
+# ---
+# ctx:    lowering context
+# mod_id: module to lower
+pub fun lower_module(ctx: *LowerContext, mod_id: smod.ModuleId) {
+    if (ctx == nil || ctx.sema == nil) { ret; }
+
+    val m: &smod.Module = smod.get(ctx.sema.modules, mod_id);
+    val store: &ast.NodeStore = ?m.store;
+    val root: ast.NodeId = m.root;
+    if (root::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val root_node: &ast.Node = ast.get(store, root);
+    if (root_node.kind != ast.NK_PROGRAM && root_node.kind != ast.NK_STMT_BLOCK) { ret; }
+
+    val stmts: ast.NodeSpan = ast.block_stmts(store, root);
+    var i: u32 = 0;
+    for (i < stmts.len) {
+        val child_id: ast.NodeId = ast.get_extra(store, stmts.start + i)::ast.NodeId;
+        if (child_id::u32 == ast.NODE_NIL::u32) {
+            i = i + 1;
+            cnt;
+        }
+
+        val child: &ast.Node = ast.get(store, child_id);
+        if (child.kind == ast.NK_DECL_FUN) {
+            lower_function(ctx, child_id, store);
+        } or (child.kind == ast.NK_DECL_VAL || child.kind == ast.NK_DECL_VAR) {
+            data_mod.lower_global_var(ctx, child_id);
+        } or (child.kind == ast.NK_DECL_PUB) {
+            val inner_id: ast.NodeId = ast.get_extra(store, child.payload)::ast.NodeId;
+            if (inner_id::u32 != ast.NODE_NIL::u32) {
+                val inner: &ast.Node = ast.get(store, inner_id);
+                if (inner.kind == ast.NK_DECL_FUN) {
+                    lower_function(ctx, inner_id, store);
+                } or (inner.kind == ast.NK_DECL_VAL || inner.kind == ast.NK_DECL_VAR) {
+                    data_mod.lower_global_var(ctx, inner_id);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# lower a single function declaration into MASM IR
+# ---
+# ctx:     lowering context
+# node_id: AST node id for the NK_DECL_FUN node
+# store:   AST node store
+pub fun lower_function(ctx: *LowerContext, node_id: ast.NodeId, store: &ast.NodeStore) {
+    if (ctx == nil) { ret; }
+
+    val name_sid: ast.StrId = ast.fun_name(store, node_id);
+    val name: str = ast.get_str(store, name_sid);
+    if (name == nil) { ret; }
+
+    val generics: ast.NodeId = ast.fun_generics(store, node_id);
+    if (generics::u32 != ast.NODE_NIL::u32) { ret; }
+
+    val fr: Result[*fn.Function, str] =
+        allocator.allocate[fn.Function](ctx.alloc, 1);
+    if (!fr.tag) { ret; }
+    val func: *fn.Function = fr.value.ok;
+    @func = fn.func_init(ctx.alloc, name);
+    ctx.func = func;
+
+    ctx.vreg_next     = inst.VREG_START;
+    ctx.local_count   = 0;
+    ctx.stack_offset  = 0;
+    ctx.label_counter = 0;
+    ctx.ds.count      = 0;
+    ctx.ds.mark       = 0;
+
+    val entry_br: Result[*fn.Block, str] =
+        allocator.allocate[fn.Block](ctx.alloc, 1);
+    if (!entry_br.tag) { ret; }
+    val entry_block: *fn.Block = entry_br.value.ok;
+    @entry_block = fn.block_init("entry");
+    fn.func_add_block(func, entry_block);
+    ctx.block = entry_block;
+
+    val params: ast.NodeSpan = ast.fun_params(store, node_id);
+    var pi: u32 = 0;
+    for (pi < params.len) {
+        val param_nid: ast.NodeId = ast.get_extra(store, params.start + pi)::ast.NodeId;
+        if (param_nid::u32 != ast.NODE_NIL::u32) {
+            val pnode: &ast.Node = ast.get(store, param_nid);
+            val p_payload: u32 = pnode.payload;
+            val pname_sid: ast.StrId = ast.get_extra(store, p_payload)::ast.StrId;
+            val pname: str = ast.get_str(store, pname_sid);
+
+            val td_idx: u16 = 0;
+            emit(ctx, inst.make_param(pi::u8, 8, td_idx));
+
+            if (pname != nil) {
+                push_local(ctx, pname, type.TYPE_NIL, 8, 8);
+            }
+        }
+        pi = pi + 1;
+    }
+
+    val ret_type_node: ast.NodeId = ast.fun_ret_type(store, node_id);
+    if (ret_type_node::u32 != ast.NODE_NIL::u32) {
+        ctx.rs.ret_type = type.TYPE_NIL;
+    } or {
+        ctx.rs.ret_type = 0::type.TypeId;
+    }
+
+    val body: ast.NodeId = ast.fun_body(store, node_id);
+    if (body::u32 != ast.NODE_NIL::u32) {
+        stmt_mod.lower_stmt(ctx, body, store);
+    }
+
+    if (ctx.block != nil) {
+        val bc: i32 = ctx.block.inst_count;
+        var needs_ret: bool = true;
+        if (bc > 0) {
+            val last_op: u8 = ctx.block.insts[bc - 1].op;
+            if (last_op == op.OP_RET || last_op == op.OP_JMP) {
+                needs_ret = false;
+            }
+        }
+        if (needs_ret) {
+            emit(ctx, inst.make_ret());
+        }
+    }
+
+    func.param_count = params.len::i32;
+    module.builder_add_function(ctx.builder, func);
+}
+
+# allocate a new virtual register
+# ---
+# ctx: lowering context
+# ret: vreg id
+pub fun alloc_vreg(ctx: *LowerContext) u16 {
+    val id: i32 = ctx.vreg_next;
+    ctx.vreg_next = ctx.vreg_next + 1;
+    ret id::u16;
+}
+
+# allocate a unique label name and intern it
+# ---
+# ctx:    lowering context
+# prefix: label name prefix
+# ret:    label table index as u16
+pub fun alloc_label(ctx: *LowerContext, prefix: str) u16 {
+    ctx.label_counter = ctx.label_counter + 1;
+
+    val buf_r: Result[*u8, str] = allocator.allocate[u8](ctx.alloc, 64);
+    if (!buf_r.tag) {
+        val li: i32 = pool.label_intern(ctx.alloc, ?ctx.func.labels, prefix);
+        if (li < 0) { ret 0; }
+        ret li::u16;
+    }
+    val buf: *u8 = buf_r.value.ok;
+
+    var pos: usize = 0;
+    if (prefix != nil) {
+        var pi: usize = 0;
+        for (prefix[pi] != 0 && pos < 50) {
+            buf[pos] = prefix[pi];
+            pos = pos + 1;
+            pi = pi + 1;
+        }
+    }
+    buf[pos] = '_';
+    pos = pos + 1;
+
+    val counter: i32 = ctx.label_counter;
+    if (counter == 0) {
+        buf[pos] = '0';
+        pos = pos + 1;
+    } or {
+        var dlen: usize = 0;
+        var tmp: i32 = counter;
+        for (tmp > 0) { dlen = dlen + 1; tmp = tmp / 10; }
+        var di: usize = pos + dlen;
+        tmp = counter;
+        for (tmp > 0) {
+            di = di - 1;
+            buf[di] = (tmp % 10)::u8 + '0';
+            tmp = tmp / 10;
+        }
+        pos = pos + dlen;
+    }
+    buf[pos] = 0;
+
+    val lname: str = buf::str;
+    val li: i32 = pool.label_intern(ctx.alloc, ?ctx.func.labels, lname);
+    if (li < 0) { ret 0; }
+    ret li::u16;
+}
+
+# get the label name string from a label table index
+# ---
+# ctx: lowering context
+# idx: label table index
+# ret: label name string
+pub fun label_name(ctx: *LowerContext, idx: u16) str {
+    ret pool.label_get(?ctx.func.labels, idx::i32);
+}
+
+# emit a pre-built instruction to the current block
+# ---
+# ctx: lowering context
+# i:   instruction to append
+pub fun emit(ctx: *LowerContext, i: inst.Instruction) {
+    if (ctx == nil || ctx.block == nil) { ret; }
+    val idx: i32 = fn.block_append(ctx.alloc, ctx.block, i);
+    if (idx >= 0 && ctx.current_line > 0) {
+        fn.block_set_debug(ctx.block, idx, ctx.current_line, ctx.current_file);
+    }
+}
+
+# create a new basic block with the given label and switch to it
+# ---
+# ctx:   lowering context
+# label: label table index for the new block
+pub fun new_block(ctx: *LowerContext, label: u16) {
+    if (ctx == nil || ctx.func == nil) { ret; }
+    val lname: str = pool.label_get(?ctx.func.labels, label::i32);
+
+    val br: Result[*fn.Block, str] =
+        allocator.allocate[fn.Block](ctx.alloc, 1);
+    if (!br.tag) { ret; }
+    val blk: *fn.Block = br.value.ok;
+    @blk = fn.block_init(lname);
+    fn.func_add_block(ctx.func, blk);
+    ctx.block = blk;
+
+    emit(ctx, inst.make_label(label));
+}
+
+# register a local variable and advance the stack offset
+# ---
+# ctx:     lowering context
+# name:    variable name
+# type_id: type of the variable
+# size:    size in bytes
+# align:   alignment in bytes
+# ret:     stack offset of the new local
+pub fun push_local(ctx: *LowerContext, name: str, type_id: type.TypeId,
+                   size: usize, align: usize) i64 {
+    if (ctx.local_count >= ctx.local_cap) {
+        val new_cap: i32 = ctx.local_cap * 2;
+        val r: Result[*LocalVar, str] = allocator.reallocate[LocalVar](
+            ctx.alloc, ctx.locals, ctx.local_cap::usize, new_cap::usize
+        );
+        if (!r.tag) { ret ctx.stack_offset; }
+        ctx.locals    = r.value.ok;
+        ctx.local_cap = new_cap;
+    }
+
+    if (align > 0) {
+        val a: i64 = align::i64;
+        ctx.stack_offset = (ctx.stack_offset + a - 1) & ~(a - 1);
+    }
+    ctx.stack_offset = ctx.stack_offset + size::i64;
+
+    val idx: i32 = ctx.local_count;
+    ctx.locals[idx].name    = name;
+    ctx.locals[idx].type_id = type_id;
+    ctx.locals[idx].offset  = -(ctx.stack_offset);
+    ctx.locals[idx].size    = size;
+    ctx.locals[idx].align   = align;
+    ctx.local_count = ctx.local_count + 1;
+
+    ret ctx.locals[idx].offset;
+}
+
+# find a local variable by name
+# ---
+# ctx:  lowering context
+# name: variable name
+# ret:  pointer to the local, or nil if not found
+pub fun find_local(ctx: *LowerContext, name: str) *LocalVar {
+    if (ctx == nil || name == nil) { ret nil; }
+    var i: i32 = ctx.local_count - 1;
+    for (i >= 0) {
+        if (ctx.locals[i].name != nil && str_equals(ctx.locals[i].name, name)) {
+            ret ?ctx.locals[i];
+        }
+        i = i - 1;
+    }
+    ret nil;
+}
+
+# intern a 64-bit constant in the current function's constant pool
+# ---
+# ctx:   lowering context
+# value: value to intern
+# ret:   pool index as u16
+pub fun intern_const(ctx: *LowerContext, value: u64) u16 {
+    if (ctx == nil || ctx.func == nil) { ret 0; }
+    val idx: i32 = pool.const_intern(ctx.alloc, ?ctx.func.const_pool, value);
+    if (idx < 0) { ret 0; }
+    ret idx::u16;
+}
+
+# intern an i32 displacement in the current function's data pool
+# ---
+# ctx:   lowering context
+# value: displacement value
+# ret:   data pool byte offset as u16
+pub fun intern_disp(ctx: *LowerContext, value: i32) u16 {
+    if (ctx == nil || ctx.func == nil) { ret 0; }
+    val off: i32 = pool.data_intern_i32(ctx.alloc, ?ctx.func.data_pool, value);
+    if (off < 0) { ret 0; }
+    ret off::u16;
+}
+
+# build a type descriptor from a sema type and intern it
+# ---
+# ctx:     lowering context
+# type_id: sema type to describe
+# ret:     type descriptor table index
+pub fun make_type_desc(ctx: *LowerContext, type_id: type.TypeId) u16 {
+    if (ctx == nil || ctx.func == nil || ctx.sema == nil) { ret 0xFFFF; }
+    if (type_id::u32 == type.TYPE_NIL::u32) { ret 0xFFFF; }
+
+    val t: &type.Type = type.get(ctx.sema.types, type_id);
+    var desc: typedesc.TypeDesc;
+
+    if (type.is_float(ctx.sema.types, type_id)) {
+        desc = typedesc.make_float(t.size::u16, t.align::u8);
+    } or (type.is_aggregate(ctx.sema.types, type_id)) {
+        desc = typedesc.make_agg(t.size::u16, t.align::u8, nil, 0);
+    } or {
+        desc = typedesc.make_int(t.size::u16, t.align::u8);
+    }
+
+    val idx: i32 = typedesc.intern(?ctx.func.type_descs, desc);
+    if (idx < 0) { ret 0xFFFF; }
+    ret idx::u16;
+}
+
+# get the defer scope mark for saving/restoring
+# ---
+# ctx: lowering context
+# ret: current defer count
+pub fun defer_get_mark(ctx: *LowerContext) i32 {
+    ret ctx.ds.count;
+}
+
+# push a deferred node id
+# ---
+# ctx:     lowering context
+# node_id: node to defer
+pub fun defer_push(ctx: *LowerContext, node_id: ast.NodeId) {
+    if (ctx.ds.count >= ctx.ds.cap) {
+        val new_cap: i32 = ctx.ds.cap * 2;
+        if (new_cap < INITIAL_DEFER_CAP) { ret; }
+        val r: Result[*ast.NodeId, str] = allocator.reallocate[ast.NodeId](
+            ctx.alloc, ctx.ds.nodes, ctx.ds.cap::usize, new_cap::usize
+        );
+        if (!r.tag) { ret; }
+        ctx.ds.nodes = r.value.ok;
+        ctx.ds.cap   = new_cap;
+    }
+    ctx.ds.nodes[ctx.ds.count] = node_id;
+    ctx.ds.count = ctx.ds.count + 1;
+}
+
+# check if the current block is terminated by a ret or jmp
+# ---
+# ctx: lowering context
+# ret: true if terminated
+pub fun block_terminated(ctx: *LowerContext) bool {
+    if (ctx == nil || ctx.block == nil || ctx.block.inst_count <= 0) { ret false; }
+    val last_op: u8 = ctx.block.insts[ctx.block.inst_count - 1].op;
+    ret last_op == op.OP_RET || last_op == op.OP_JMP;
+}
+
+# compute the size in bytes for a sema type
+# ---
+# ctx:     lowering context
+# type_id: type to measure
+# ret:     size in bytes, or ptr_size as fallback
+pub fun type_size(ctx: *LowerContext, type_id: type.TypeId) u8 {
+    if (ctx == nil || ctx.sema == nil) { ret ctx.ptr_size; }
+    if (type_id::u32 == type.TYPE_NIL::u32) { ret ctx.ptr_size; }
+    val t: &type.Type = type.get(ctx.sema.types, type_id);
+    if (t.size == 0) { ret ctx.ptr_size; }
+    ret t.size::u8;
+}
