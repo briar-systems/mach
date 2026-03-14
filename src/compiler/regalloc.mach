@@ -4,8 +4,6 @@
 # builds sorted live ranges, walks them in order, and assigns physical
 # registers from the target's register file, spilling to the stack when
 # the register file is exhausted.
-#
-# stub -- the pipeline flows end-to-end but register rewriting is pending.
 
 use std.types.bool;
 use std.types.size;
@@ -13,10 +11,17 @@ use std.types.string;
 use std.types.result;
 
 use allocator: std.allocator;
+use mem:       std.memory;
 
 use masm_cfg: masm.cfg;
 use isa:      compiler.target.isa;
 use abi:      compiler.target.abi;
+
+val VREG_START: i32 = 32;
+val MAX_RANGES: i32 = 4096;
+val MAX_ACTIVE: i32 = 64;
+val REG_CLASS_GP: u8 = 0;
+val REG_CLASS_FP: u8 = 1;
 
 # live range for a single virtual register
 # ---
@@ -54,10 +59,345 @@ pub rec RegAllocResult {
     ok:          bool;
 }
 
-# alloc_function: allocate physical registers for a function's instruction buffer.
+# active range entry for the linear scan loop
+# ---
+# range_idx: index into the sorted ranges array
+# preg:      assigned physical register
+# end_pos:   end position of the range
+rec ActiveEntry {
+    range_idx: i32;
+    preg:      i32;
+    end_pos:   i32;
+}
+
+fun init_range() LiveRange {
+    var r: LiveRange;
+    r.vreg      = -1;
+    r.start     = 0x7FFFFFFF;
+    r.end_pos   = -1;
+    r.use_count = 0;
+    r.size      = 8;
+    r.reg_class = REG_CLASS_GP;
+    r.preg      = -1;
+    r.spill_off = -1;
+    r.spilled   = false;
+    ret r;
+}
+
+# classify_operand: determine reg_class from instruction context
+fun classify_operand(inst: *isa.Inst) u8 {
+    val op: u16 = inst.opcode;
+    if (op >= 41 && op <= 50) { ret REG_CLASS_FP; }
+    if (op >= 60 && op <= 67) { ret REG_CLASS_FP; }
+    ret REG_CLASS_GP;
+}
+
+# is_vreg: check if a register id is virtual
+fun is_vreg(id: i32) bool {
+    ret id >= VREG_START;
+}
+
+# find_range: find or create a range entry for a virtual register
+fun find_range(ranges: *LiveRange, count: *i32, vreg: i32) *LiveRange {
+    var idx: i32 = 0;
+    for (idx < @count) {
+        if (ranges[idx].vreg == vreg) {
+            ret ?ranges[idx];
+        }
+        idx = idx + 1;
+    }
+    if (@count >= MAX_RANGES) { ret nil; }
+    val new_idx: i32 = @count;
+    @count = @count + 1;
+    ranges[new_idx] = init_range();
+    ranges[new_idx].vreg = vreg;
+    ret ?ranges[new_idx];
+}
+
+# scan_operand_reg: extract register id from an operand
+fun scan_operand_reg(op: *isa.Operand) i32 {
+    if (op.kind == isa.OPK_REG) { ret op.reg; }
+    ret -1;
+}
+
+# build_ranges: scan instructions and build live ranges for all virtual registers
+fun build_ranges(alloc: &allocator.Allocator, insts: *isa.InstBuf,
+                 ranges: *LiveRange, range_count: *i32) {
+    var pos: i32 = 0;
+    for (pos < insts.count) {
+        val inst: *isa.Inst = ?insts.insts[pos];
+        val rc: u8 = classify_operand(inst);
+
+        val dst_id: i32 = scan_operand_reg(?inst.dst);
+        if (is_vreg(dst_id)) {
+            val r: *LiveRange = find_range(ranges, range_count, dst_id);
+            if (r != nil) {
+                if (pos < r.start) { r.start = pos; }
+                if (pos > r.end_pos) { r.end_pos = pos; }
+                r.use_count = r.use_count + 1;
+                r.size = inst.dst.size;
+                r.reg_class = rc;
+            }
+        }
+
+        val s1_id: i32 = scan_operand_reg(?inst.src1);
+        if (is_vreg(s1_id)) {
+            val r: *LiveRange = find_range(ranges, range_count, s1_id);
+            if (r != nil) {
+                if (pos < r.start) { r.start = pos; }
+                if (pos > r.end_pos) { r.end_pos = pos; }
+                r.use_count = r.use_count + 1;
+                if (r.size == 0) { r.size = inst.src1.size; }
+            }
+        }
+
+        val s2_id: i32 = scan_operand_reg(?inst.src2);
+        if (is_vreg(s2_id)) {
+            val r: *LiveRange = find_range(ranges, range_count, s2_id);
+            if (r != nil) {
+                if (pos < r.start) { r.start = pos; }
+                if (pos > r.end_pos) { r.end_pos = pos; }
+                r.use_count = r.use_count + 1;
+                if (r.size == 0) { r.size = inst.src2.size; }
+            }
+        }
+
+        val base_id: i32 = inst.dst.base;
+        if (inst.dst.kind == isa.OPK_MEM && is_vreg(base_id)) {
+            val r: *LiveRange = find_range(ranges, range_count, base_id);
+            if (r != nil) {
+                if (pos < r.start) { r.start = pos; }
+                if (pos > r.end_pos) { r.end_pos = pos; }
+                r.use_count = r.use_count + 1;
+            }
+        }
+        val s1b_id: i32 = inst.src1.base;
+        if (inst.src1.kind == isa.OPK_MEM && is_vreg(s1b_id)) {
+            val r: *LiveRange = find_range(ranges, range_count, s1b_id);
+            if (r != nil) {
+                if (pos < r.start) { r.start = pos; }
+                if (pos > r.end_pos) { r.end_pos = pos; }
+                r.use_count = r.use_count + 1;
+            }
+        }
+        val s2b_id: i32 = inst.src2.base;
+        if (inst.src2.kind == isa.OPK_MEM && is_vreg(s2b_id)) {
+            val r: *LiveRange = find_range(ranges, range_count, s2b_id);
+            if (r != nil) {
+                if (pos < r.start) { r.start = pos; }
+                if (pos > r.end_pos) { r.end_pos = pos; }
+                r.use_count = r.use_count + 1;
+            }
+        }
+
+        val idx1_id: i32 = inst.dst.index;
+        if (inst.dst.kind == isa.OPK_MEM && is_vreg(idx1_id)) {
+            val r: *LiveRange = find_range(ranges, range_count, idx1_id);
+            if (r != nil) {
+                if (pos < r.start) { r.start = pos; }
+                if (pos > r.end_pos) { r.end_pos = pos; }
+                r.use_count = r.use_count + 1;
+            }
+        }
+        val idx2_id: i32 = inst.src1.index;
+        if (inst.src1.kind == isa.OPK_MEM && is_vreg(idx2_id)) {
+            val r: *LiveRange = find_range(ranges, range_count, idx2_id);
+            if (r != nil) {
+                if (pos < r.start) { r.start = pos; }
+                if (pos > r.end_pos) { r.end_pos = pos; }
+                r.use_count = r.use_count + 1;
+            }
+        }
+
+        pos = pos + 1;
+    }
+}
+
+# sort_ranges_by_start: insertion sort ranges by start position
+fun sort_ranges_by_start(ranges: *LiveRange, count: i32) {
+    var i: i32 = 1;
+    for (i < count) {
+        var key: LiveRange = ranges[i];
+        var j: i32 = i - 1;
+        for (j >= 0 && ranges[j].start > key.start) {
+            ranges[j + 1] = ranges[j];
+            j = j - 1;
+        }
+        ranges[j + 1] = key;
+        i = i + 1;
+    }
+}
+
+# is_callee_saved: check if a physical register is callee-saved
+fun is_callee_saved(a: *abi.ABI, preg: i32) bool {
+    if (a == nil || a.callee_saved == nil) { ret false; }
+    val cs: isa.RegisterFile = a.callee_saved(a.ctx);
+    if (cs.regs == nil) { ret false; }
+    var ci: i32 = 0;
+    for (ci < cs.count) {
+        if (cs.regs[ci].id == preg) { ret true; }
+        ci = ci + 1;
+    }
+    ret false;
+}
+
+# is_reserved: check if a register should not be allocated (RSP, RBP)
+fun is_reserved(preg: i32) bool {
+    if (preg == 4) { ret true; }
+    if (preg == 5) { ret true; }
+    ret false;
+}
+
+# expire_old: remove ranges from active list whose end_pos < current start
+fun expire_old(active: *ActiveEntry, active_count: *i32,
+               gp_free: *bool, fp_free: *bool,
+               current_start: i32) {
+    var write: i32 = 0;
+    var read: i32 = 0;
+    for (read < @active_count) {
+        if (active[read].end_pos >= current_start) {
+            if (write != read) {
+                active[write] = active[read];
+            }
+            write = write + 1;
+        } or {
+            val freed: i32 = active[read].preg;
+            if (freed >= 0 && freed < 16) {
+                gp_free[freed] = true;
+            }
+            if (freed >= 0 && freed < 16) {
+                fp_free[freed] = true;
+            }
+        }
+        read = read + 1;
+    }
+    @active_count = write;
+}
+
+# try_alloc_reg: try to allocate a free register, preferring caller-saved
+fun try_alloc_reg(gp_free: *bool, fp_free: *bool, reg_class: u8,
+                  a: *abi.ABI) i32 {
+    if (reg_class == REG_CLASS_FP) {
+        var fi: i32 = 0;
+        for (fi < 16) {
+            if (fp_free[fi]) {
+                fp_free[fi] = false;
+                ret fi;
+            }
+            fi = fi + 1;
+        }
+        ret -1;
+    }
+
+    var ci: i32 = 0;
+    for (ci < 16) {
+        if (gp_free[ci] && !is_reserved(ci) && !is_callee_saved(a, ci)) {
+            gp_free[ci] = false;
+            ret ci;
+        }
+        ci = ci + 1;
+    }
+    ci = 0;
+    for (ci < 16) {
+        if (gp_free[ci] && !is_reserved(ci)) {
+            gp_free[ci] = false;
+            ret ci;
+        }
+        ci = ci + 1;
+    }
+    ret -1;
+}
+
+# find_spill_candidate: find the active range with lowest use density
+fun find_spill_candidate(active: *ActiveEntry, active_count: i32,
+                         ranges: *LiveRange) i32 {
+    var best: i32 = -1;
+    var best_density: i64 = 0x7FFFFFFFFFFFFFFF;
+    var ai: i32 = 0;
+    for (ai < active_count) {
+        val ri: i32 = active[ai].range_idx;
+        val span: i32 = ranges[ri].end_pos - ranges[ri].start;
+        var density: i64 = 0;
+        if (span > 0) {
+            density = (ranges[ri].use_count::i64 * 1000) / span::i64;
+        } or {
+            density = ranges[ri].use_count::i64 * 1000;
+        }
+        if (density < best_density) {
+            best_density = density;
+            best = ai;
+        }
+        ai = ai + 1;
+    }
+    ret best;
+}
+
+# add_active: insert into active list
+fun add_active(active: *ActiveEntry, active_count: *i32,
+               range_idx: i32, preg: i32, end_pos: i32) {
+    if (@active_count >= MAX_ACTIVE) { ret; }
+    val idx: i32 = @active_count;
+    active[idx].range_idx = range_idx;
+    active[idx].preg = preg;
+    active[idx].end_pos = end_pos;
+    @active_count = @active_count + 1;
+}
+
+# remove_active: remove an entry from the active list by index
+fun remove_active(active: *ActiveEntry, active_count: *i32, idx: i32) {
+    var mi: i32 = idx;
+    for (mi < @active_count - 1) {
+        active[mi] = active[mi + 1];
+        mi = mi + 1;
+    }
+    @active_count = @active_count - 1;
+}
+
+# rewrite_operand: replace virtual register ids with physical ones
+fun rewrite_operand(op: *isa.Operand, ranges: *LiveRange, range_count: i32) {
+    if (op.kind == isa.OPK_REG && is_vreg(op.reg)) {
+        var ri: i32 = 0;
+        for (ri < range_count) {
+            if (ranges[ri].vreg == op.reg && ranges[ri].preg >= 0) {
+                op.reg = ranges[ri].preg;
+                ret;
+            }
+            ri = ri + 1;
+        }
+    }
+    if (op.kind == isa.OPK_MEM && is_vreg(op.base)) {
+        var ri: i32 = 0;
+        for (ri < range_count) {
+            if (ranges[ri].vreg == op.base && ranges[ri].preg >= 0) {
+                op.base = ranges[ri].preg;
+                ret;
+            }
+            ri = ri + 1;
+        }
+    }
+    if (op.kind == isa.OPK_MEM && is_vreg(op.index)) {
+        var ri: i32 = 0;
+        for (ri < range_count) {
+            if (ranges[ri].vreg == op.index && ranges[ri].preg >= 0) {
+                op.index = ranges[ri].preg;
+                ret;
+            }
+            ri = ri + 1;
+        }
+    }
+}
+
+# align_up: align a value up to the given alignment
+fun align_up(value: usize, alignment: usize) usize {
+    if (alignment == 0) { ret value; }
+    ret (value + alignment - 1) & ~(alignment - 1);
+}
+
+# alloc_function: allocate physical registers for a function's instruction buffer
 #
-# requires a valid CFG and liveness data from masm.cfg. currently a stub
-# that copies the input buffer through unmodified.
+# builds live ranges from the instruction buffer, sorts them by start
+# position, and performs linear scan allocation. spilled ranges get
+# stack slots; the output buffer has all virtual registers replaced.
 # ---
 # alloc:      backing allocator
 # i:          ISA interface (register files, encoding)
@@ -86,14 +426,237 @@ pub fun alloc_function(alloc: &allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
         ret result;
     }
 
-    var out: isa.InstBuf = isa.buf_init(alloc);
-    var idx: i32 = 0;
-    for (idx < insts.count) {
-        isa.buf_append(?out, insts.insts[idx]);
-        idx = idx + 1;
+    val res_ranges: Result[*LiveRange, str] = allocator.allocate[LiveRange](alloc, MAX_RANGES::usize);
+    if (is_err[*LiveRange, str](res_ranges)) {
+        result.out = isa.buf_init(alloc);
+        ret result;
+    }
+    var ranges: *LiveRange = unwrap_ok[*LiveRange, str](res_ranges);
+    var range_count: i32 = 0;
+
+    build_ranges(alloc, insts, ranges, ?range_count);
+
+    if (range_count == 0) {
+        var out: isa.InstBuf = isa.buf_init(alloc);
+        var ci: i32 = 0;
+        for (ci < insts.count) {
+            isa.buf_append(?out, insts.insts[ci]);
+            ci = ci + 1;
+        }
+        allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
+        result.out = out;
+        result.ok  = true;
+        ret result;
     }
 
-    result.out = out;
-    result.ok  = true;
+    sort_ranges_by_start(ranges, range_count);
+
+    val res_active: Result[*ActiveEntry, str] = allocator.allocate[ActiveEntry](alloc, MAX_ACTIVE::usize);
+    if (is_err[*ActiveEntry, str](res_active)) {
+        allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
+        result.out = isa.buf_init(alloc);
+        ret result;
+    }
+    var active: *ActiveEntry = unwrap_ok[*ActiveEntry, str](res_active);
+    var active_count: i32 = 0;
+
+    var gp_free: *bool = nil;
+    var fp_free: *bool = nil;
+    val res_gp: Result[*bool, str] = allocator.allocate[bool](alloc, 16);
+    val res_fp: Result[*bool, str] = allocator.allocate[bool](alloc, 16);
+    if (is_err[*bool, str](res_gp) || is_err[*bool, str](res_fp)) {
+        allocator.deallocate[ActiveEntry](alloc, active, MAX_ACTIVE::usize);
+        allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
+        result.out = isa.buf_init(alloc);
+        ret result;
+    }
+    gp_free = unwrap_ok[*bool, str](res_gp);
+    fp_free = unwrap_ok[*bool, str](res_fp);
+
+    var gi: i32 = 0;
+    for (gi < 16) {
+        gp_free[gi] = true;
+        fp_free[gi] = true;
+        gi = gi + 1;
+    }
+    gp_free[4] = false;
+    gp_free[5] = false;
+
+    var callee_mask: u32 = 0;
+    var spill_offset: usize = 0;
+
+    var ri: i32 = 0;
+    for (ri < range_count) {
+        expire_old(active, ?active_count, gp_free, fp_free, ranges[ri].start);
+
+        val preg: i32 = try_alloc_reg(gp_free, fp_free, ranges[ri].reg_class, a);
+        if (preg >= 0) {
+            ranges[ri].preg = preg;
+            add_active(active, ?active_count, ri, preg, ranges[ri].end_pos);
+            if (is_callee_saved(a, preg)) {
+                callee_mask = callee_mask | (1 << (preg::u32));
+            }
+        } or {
+            val spill_idx: i32 = find_spill_candidate(active, active_count, ranges);
+            if (spill_idx >= 0) {
+                val spilled_ri: i32 = active[spill_idx].range_idx;
+                val freed_preg: i32 = active[spill_idx].preg;
+
+                var slot_size: usize = ranges[spilled_ri].size::usize;
+                if (slot_size < 8) { slot_size = 8; }
+                spill_offset = align_up(spill_offset + slot_size, 8);
+                ranges[spilled_ri].spilled = true;
+                ranges[spilled_ri].spill_off = spill_offset::i64;
+                ranges[spilled_ri].preg = -1;
+
+                if (ranges[spilled_ri].reg_class == REG_CLASS_GP) {
+                    gp_free[freed_preg] = true;
+                } or {
+                    fp_free[freed_preg] = true;
+                }
+                remove_active(active, ?active_count, spill_idx);
+
+                val new_preg: i32 = try_alloc_reg(gp_free, fp_free, ranges[ri].reg_class, a);
+                if (new_preg >= 0) {
+                    ranges[ri].preg = new_preg;
+                    add_active(active, ?active_count, ri, new_preg, ranges[ri].end_pos);
+                    if (is_callee_saved(a, new_preg)) {
+                        callee_mask = callee_mask | (1 << (new_preg::u32));
+                    }
+                } or {
+                    var slot_size2: usize = ranges[ri].size::usize;
+                    if (slot_size2 < 8) { slot_size2 = 8; }
+                    spill_offset = align_up(spill_offset + slot_size2, 8);
+                    ranges[ri].spilled = true;
+                    ranges[ri].spill_off = spill_offset::i64;
+                }
+            } or {
+                var slot_size3: usize = ranges[ri].size::usize;
+                if (slot_size3 < 8) { slot_size3 = 8; }
+                spill_offset = align_up(spill_offset + slot_size3, 8);
+                ranges[ri].spilled = true;
+                ranges[ri].spill_off = spill_offset::i64;
+            }
+        }
+
+        ri = ri + 1;
+    }
+
+    var out: isa.InstBuf = isa.buf_init(alloc);
+    var pi: i32 = 0;
+    for (pi < insts.count) {
+        var inst: isa.Inst = insts.insts[pi];
+
+        var has_spill_dst: bool = false;
+        var spill_dst_off: i64 = 0;
+        var spill_dst_size: u8 = 8;
+        var spill_dst_preg: i32 = -1;
+        var has_spill_s1: bool = false;
+        var spill_s1_off: i64 = 0;
+        var spill_s1_size: u8 = 8;
+        var spill_s1_preg: i32 = -1;
+        var has_spill_s2: bool = false;
+        var spill_s2_off: i64 = 0;
+        var spill_s2_size: u8 = 8;
+        var spill_s2_preg: i32 = -1;
+
+        if (inst.dst.kind == isa.OPK_REG && is_vreg(inst.dst.reg)) {
+            var si: i32 = 0;
+            for (si < range_count) {
+                if (ranges[si].vreg == inst.dst.reg && ranges[si].spilled) {
+                    has_spill_dst = true;
+                    spill_dst_off = ranges[si].spill_off;
+                    spill_dst_size = ranges[si].size;
+                    spill_dst_preg = 0;
+                    si = range_count;
+                }
+                si = si + 1;
+            }
+        }
+        if (inst.src1.kind == isa.OPK_REG && is_vreg(inst.src1.reg)) {
+            var si: i32 = 0;
+            for (si < range_count) {
+                if (ranges[si].vreg == inst.src1.reg && ranges[si].spilled) {
+                    has_spill_s1 = true;
+                    spill_s1_off = ranges[si].spill_off;
+                    spill_s1_size = ranges[si].size;
+                    spill_s1_preg = 0;
+                    si = range_count;
+                }
+                si = si + 1;
+            }
+        }
+        if (inst.src2.kind == isa.OPK_REG && is_vreg(inst.src2.reg)) {
+            var si: i32 = 0;
+            for (si < range_count) {
+                if (ranges[si].vreg == inst.src2.reg && ranges[si].spilled) {
+                    has_spill_s2 = true;
+                    spill_s2_off = ranges[si].spill_off;
+                    spill_s2_size = ranges[si].size;
+                    spill_s2_preg = 0;
+                    si = range_count;
+                }
+                si = si + 1;
+            }
+        }
+
+        if (has_spill_s1) {
+            var reload: isa.Inst;
+            reload.opcode = 1;
+            reload.dst = isa.make_reg(spill_s1_preg, spill_s1_size);
+            reload.src1 = isa.make_mem(5, (-(spill_s1_off::i32))::i32, -1, 0, spill_s1_size);
+            reload.src2 = isa.make_reg(-1, 0);
+            reload.size = spill_s1_size;
+            reload.flags = 0;
+            reload.src_line = inst.src_line;
+            reload.src_file = inst.src_file;
+            isa.buf_append(?out, reload);
+            inst.src1 = isa.make_reg(spill_s1_preg, spill_s1_size);
+        }
+        if (has_spill_s2) {
+            val s2_preg: i32 = 11;
+            var reload: isa.Inst;
+            reload.opcode = 1;
+            reload.dst = isa.make_reg(s2_preg, spill_s2_size);
+            reload.src1 = isa.make_mem(5, (-(spill_s2_off::i32))::i32, -1, 0, spill_s2_size);
+            reload.src2 = isa.make_reg(-1, 0);
+            reload.size = spill_s2_size;
+            reload.flags = 0;
+            reload.src_line = inst.src_line;
+            reload.src_file = inst.src_file;
+            isa.buf_append(?out, reload);
+            inst.src2 = isa.make_reg(s2_preg, spill_s2_size);
+        }
+
+        rewrite_operand(?inst.dst, ranges, range_count);
+        rewrite_operand(?inst.src1, ranges, range_count);
+        rewrite_operand(?inst.src2, ranges, range_count);
+        isa.buf_append(?out, inst);
+
+        if (has_spill_dst) {
+            var spill: isa.Inst;
+            spill.opcode = 1;
+            spill.dst = isa.make_mem(5, (-(spill_dst_off::i32))::i32, -1, 0, spill_dst_size);
+            spill.src1 = inst.dst;
+            spill.src2 = isa.make_reg(-1, 0);
+            spill.size = spill_dst_size;
+            spill.flags = 0;
+            spill.src_line = inst.src_line;
+            spill.src_file = inst.src_file;
+            isa.buf_append(?out, spill);
+        }
+
+        pi = pi + 1;
+    }
+
+    allocator.deallocate[bool](alloc, fp_free, 16);
+    allocator.deallocate[bool](alloc, gp_free, 16);
+    allocator.deallocate[ActiveEntry](alloc, active, MAX_ACTIVE::usize);
+    allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
+
+    result.out         = out;
+    result.spill_size  = align_up(spill_offset, 16);
+    result.callee_mask = callee_mask;
+    result.ok          = true;
     ret result;
 }
