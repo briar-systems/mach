@@ -2,17 +2,42 @@
 #
 # format-agnostic linker that reads relocatable object files, merges
 # sections, resolves symbols, applies relocations, and emits a linked
-# binary via the target's ExecFormat interface.
-#
-# stub -- returns an error until the implementation is complete.
+# binary via the target's ExecFormat interface. currently handles the
+# monolithic compilation case (single object file in memory).
 
 use std.types.bool;
 use std.types.size;
 use std.types.string;
+use std.types.result;
 
 use allocator: std.allocator;
+use mem:       std.memory;
+use fs:        std.filesystem;
 
 use target: compiler.target.target;
+use of:     compiler.target.of;
+
+val MAX_SECTIONS:  i32 = 32;
+val MAX_SYMBOLS:   i32 = 4096;
+val MAX_RELOCS:    i32 = 8192;
+val PAGE_SIZE:     usize = 4096;
+
+val EI_NIDENT: usize = 16;
+val ELF_HEADER_SIZE: usize = 64;
+val SHDR_SIZE: usize = 64;
+val SYM_SIZE:  usize = 24;
+val RELA_SIZE: usize = 24;
+
+val SHT_NULL:     u32 = 0;
+val SHT_PROGBITS: u32 = 1;
+val SHT_SYMTAB:   u32 = 2;
+val SHT_STRTAB:   u32 = 3;
+val SHT_RELA:     u32 = 4;
+val SHT_NOBITS:   u32 = 8;
+
+val R_X86_64_64:   u32 = 1;
+val R_X86_64_PC32: u32 = 2;
+val R_X86_64_PLT32: u32 = 4;
 
 # result of a link operation
 # ---
@@ -25,7 +50,388 @@ pub rec LinkResult {
     error:       str;
 }
 
-# link object files into a final binary.
+rec MergedSection {
+    name:   str;
+    data:   *u8;
+    size:   usize;
+    cap:    usize;
+    vaddr:  u64;
+    align:  usize;
+    kind:   u8;
+    flags:  u32;
+}
+
+rec LinkerSymbol {
+    name:       str;
+    section:    i32;
+    offset:     usize;
+    size:       usize;
+    is_global:  bool;
+    is_defined: bool;
+}
+
+rec LinkerReloc {
+    section:  i32;
+    offset:   usize;
+    type_val: u32;
+    sym_idx:  i32;
+    addend:   i64;
+}
+
+# read_u16_le: read a u16 from buffer at offset
+fun read_u16_le(buf: *u8, off: usize) u16 {
+    ret buf[off]::u16 | (buf[off + 1]::u16 << 8);
+}
+
+# read_u32_le: read a u32 from buffer at offset
+fun read_u32_le(buf: *u8, off: usize) u32 {
+    ret buf[off]::u32
+      | (buf[off + 1]::u32 << 8)
+      | (buf[off + 2]::u32 << 16)
+      | (buf[off + 3]::u32 << 24);
+}
+
+# read_u64_le: read a u64 from buffer at offset
+fun read_u64_le(buf: *u8, off: usize) u64 {
+    ret read_u32_le(buf, off)::u64
+      | (read_u32_le(buf, off + 4)::u64 << 32);
+}
+
+# read_i64_le: read an i64 from buffer at offset
+fun read_i64_le(buf: *u8, off: usize) i64 {
+    ret read_u64_le(buf, off)::i64;
+}
+
+# write_u32_le: write a u32 into buffer at offset
+fun write_u32_le(buf: *u8, off: usize, value: u32) {
+    buf[off]     = (value & 0xFF)::u8;
+    buf[off + 1] = ((value >> 8) & 0xFF)::u8;
+    buf[off + 2] = ((value >> 16) & 0xFF)::u8;
+    buf[off + 3] = ((value >> 24) & 0xFF)::u8;
+}
+
+# write_u64_le: write a u64 into buffer at offset
+fun write_u64_le(buf: *u8, off: usize, value: u64) {
+    write_u32_le(buf, off, (value & 0xFFFFFFFF)::u32);
+    write_u32_le(buf, off + 4, ((value >> 32) & 0xFFFFFFFF)::u32);
+}
+
+# align_up: align a value to the given alignment
+fun align_up(value: usize, alignment: usize) usize {
+    if (alignment == 0) { ret value; }
+    ret (value + alignment - 1) & ~(alignment - 1);
+}
+
+fun align_up_64(value: u64, alignment: u64) u64 {
+    if (alignment == 0) { ret value; }
+    ret (value + alignment - 1) & ~(alignment - 1);
+}
+
+# sec_grow: grow a merged section buffer
+fun sec_grow(alloc: &allocator.Allocator, sec: *MergedSection, needed: usize) bool {
+    val total: usize = sec.size + needed;
+    if (total <= sec.cap) { ret true; }
+    var new_cap: usize = 4096;
+    if (sec.cap > 0) { new_cap = sec.cap; }
+    for (new_cap < total) {
+        new_cap = new_cap * 2;
+    }
+    val res_realloc: Result[*u8, str] = allocator.reallocate[u8](
+        alloc, sec.data, sec.cap, new_cap
+    );
+    if (is_err[*u8, str](res_realloc)) { ret false; }
+    sec.data = unwrap_ok[*u8, str](res_realloc);
+    sec.cap = new_cap;
+    ret true;
+}
+
+# sec_append: append bytes to a merged section
+fun sec_append(alloc: &allocator.Allocator, sec: *MergedSection, data: *u8, size: usize) bool {
+    if (!sec_grow(alloc, sec, size)) { ret false; }
+    if (data != nil && size > 0) {
+        mem.raw_copy((sec.data::usize + sec.size)::ptr, data::ptr, size);
+    }
+    sec.size = sec.size + size;
+    ret true;
+}
+
+# is_elf: verify ELF magic bytes
+fun is_elf(buf: *u8, size: usize) bool {
+    if (size < ELF_HEADER_SIZE) { ret false; }
+    if (buf[0] != 0x7F) { ret false; }
+    if (buf[1] != 0x45) { ret false; }
+    if (buf[2] != 0x4C) { ret false; }
+    if (buf[3] != 0x46) { ret false; }
+    ret true;
+}
+
+# strtab_lookup: read a null-terminated string from a string table
+fun strtab_lookup(strtab: *u8, strtab_size: usize, offset: u32) str {
+    if (offset::usize >= strtab_size) { ret nil; }
+    ret (strtab::usize + offset::usize)::str;
+}
+
+# find_merged_section: find or create a merged section by name
+fun find_merged_section(sections: *MergedSection, sec_count: *i32,
+                        name: str, kind: u8, flags: u32, align: usize) i32 {
+    var si: i32 = 0;
+    for (si < @sec_count) {
+        if (sections[si].name != nil && name != nil && str_equals(sections[si].name, name)) {
+            ret si;
+        }
+        si = si + 1;
+    }
+    if (@sec_count >= MAX_SECTIONS) { ret -1; }
+    val idx: i32 = @sec_count;
+    sections[idx].name  = name;
+    sections[idx].data  = nil;
+    sections[idx].size  = 0;
+    sections[idx].cap   = 0;
+    sections[idx].vaddr = 0;
+    sections[idx].align = align;
+    sections[idx].kind  = kind;
+    sections[idx].flags = flags;
+    @sec_count = @sec_count + 1;
+    ret idx;
+}
+
+# find_symbol: find a symbol by name in the symbol table
+fun find_symbol(syms: *LinkerSymbol, sym_count: i32, name: str) i32 {
+    var si: i32 = 0;
+    for (si < sym_count) {
+        if (syms[si].name != nil && name != nil && str_equals(syms[si].name, name)) {
+            if (syms[si].is_defined) { ret si; }
+        }
+        si = si + 1;
+    }
+    ret -1;
+}
+
+# parse_elf_object: parse an ELF relocatable object from a memory buffer
+fun parse_elf_object(alloc: &allocator.Allocator, buf: *u8, buf_size: usize,
+                     sections: *MergedSection, sec_count: *i32,
+                     symbols: *LinkerSymbol, sym_count: *i32,
+                     relocs: *LinkerReloc, reloc_count: *i32,
+                     sec_map: *i32) bool {
+    if (!is_elf(buf, buf_size)) { ret false; }
+
+    val e_shoff:    usize = read_u64_le(buf, 40)::usize;
+    val e_shentsize: u16  = read_u16_le(buf, 58);
+    val e_shnum:    u16   = read_u16_le(buf, 60);
+    val e_shstrndx: u16   = read_u16_le(buf, 62);
+
+    if (e_shoff == 0 || e_shnum == 0) { ret false; }
+
+    var shstrtab: *u8 = nil;
+    var shstrtab_size: usize = 0;
+    if (e_shstrndx < e_shnum) {
+        val shstr_off: usize = e_shoff + e_shstrndx::usize * e_shentsize::usize;
+        val shstr_sh_offset: usize = read_u64_le(buf, shstr_off + 24)::usize;
+        shstrtab_size = read_u64_le(buf, shstr_off + 32)::usize;
+        shstrtab = (buf::usize + shstr_sh_offset)::*u8;
+    }
+
+    var strtab: *u8 = nil;
+    var strtab_sz: usize = 0;
+    var symtab: *u8 = nil;
+    var symtab_count: i32 = 0;
+    var symtab_sh_idx: u16 = 0;
+
+    var shi: u16 = 0;
+    for (shi < e_shnum) {
+        val sh_off: usize = e_shoff + shi::usize * e_shentsize::usize;
+        val sh_type: u32 = read_u32_le(buf, sh_off + 4);
+        if (sh_type == SHT_SYMTAB) {
+            val symtab_offset: usize = read_u64_le(buf, sh_off + 24)::usize;
+            val symtab_size: usize = read_u64_le(buf, sh_off + 32)::usize;
+            val entsize: usize = read_u64_le(buf, sh_off + 56)::usize;
+            symtab = (buf::usize + symtab_offset)::*u8;
+            if (entsize > 0) {
+                symtab_count = (symtab_size / entsize)::i32;
+            }
+            symtab_sh_idx = shi;
+            val link: u32 = read_u32_le(buf, sh_off + 40);
+            if (link < e_shnum::u32) {
+                val str_sh_off: usize = e_shoff + link::usize * e_shentsize::usize;
+                val str_offset: usize = read_u64_le(buf, str_sh_off + 24)::usize;
+                strtab_sz = read_u64_le(buf, str_sh_off + 32)::usize;
+                strtab = (buf::usize + str_offset)::*u8;
+            }
+        }
+        shi = shi + 1;
+    }
+
+    var elf_sec_to_merged: *i32 = sec_map;
+
+    shi = 0;
+    for (shi < e_shnum) {
+        elf_sec_to_merged[shi] = -1;
+        val sh_off: usize = e_shoff + shi::usize * e_shentsize::usize;
+        val sh_type: u32 = read_u32_le(buf, sh_off + 4);
+        val sh_flags: u64 = read_u64_le(buf, sh_off + 8);
+
+        if (sh_type == SHT_PROGBITS || sh_type == SHT_NOBITS) {
+            if ((sh_flags & 2) == 0) {
+                shi = shi + 1;
+                cnt;
+            }
+
+            var sec_name: str = nil;
+            if (shstrtab != nil) {
+                val name_off: u32 = read_u32_le(buf, sh_off);
+                sec_name = strtab_lookup(shstrtab, shstrtab_size, name_off);
+            }
+
+            var kind: u8 = of.SK_DATA;
+            if ((sh_flags & 4) != 0) { kind = of.SK_TEXT; }
+            or (sh_type == SHT_NOBITS) { kind = of.SK_BSS; }
+            or ((sh_flags & 1) == 0) { kind = of.SK_RODATA; }
+
+            val sh_align: usize = read_u64_le(buf, sh_off + 48)::usize;
+            val merged_idx: i32 = find_merged_section(sections, sec_count, sec_name, kind, sh_flags::u32, sh_align);
+            elf_sec_to_merged[shi] = merged_idx;
+
+            if (merged_idx >= 0 && sh_type != SHT_NOBITS) {
+                val sh_offset: usize = read_u64_le(buf, sh_off + 24)::usize;
+                val sh_size: usize = read_u64_le(buf, sh_off + 32)::usize;
+                val sec_data: *u8 = (buf::usize + sh_offset)::*u8;
+                sec_append(alloc, ?sections[merged_idx], sec_data, sh_size);
+            } or (merged_idx >= 0 && sh_type == SHT_NOBITS) {
+                val sh_size: usize = read_u64_le(buf, sh_off + 32)::usize;
+                sections[merged_idx].size = sections[merged_idx].size + sh_size;
+            }
+        }
+
+        shi = shi + 1;
+    }
+
+    if (symtab != nil && strtab != nil) {
+        var si: i32 = 1;
+        for (si < symtab_count) {
+            if (@sym_count >= MAX_SYMBOLS) { si = symtab_count; cnt; }
+
+            val sym_off: usize = si::usize * SYM_SIZE;
+            val st_name: u32 = read_u32_le(symtab, sym_off);
+            val st_info: u8 = symtab[sym_off + 4];
+            val st_shndx: u16 = read_u16_le(symtab, sym_off + 6);
+            val st_value: u64 = read_u64_le(symtab, sym_off + 8);
+            val st_size: u64 = read_u64_le(symtab, sym_off + 16);
+
+            val sym_name: str = strtab_lookup(strtab, strtab_sz, st_name);
+            val binding: u8 = st_info >> 4;
+
+            val idx: i32 = @sym_count;
+            symbols[idx].name       = sym_name;
+            symbols[idx].offset     = st_value::usize;
+            symbols[idx].size       = st_size::usize;
+            symbols[idx].is_global  = binding == 1;
+            symbols[idx].is_defined = st_shndx != 0;
+
+            if (st_shndx > 0 && st_shndx < e_shnum) {
+                symbols[idx].section = elf_sec_to_merged[st_shndx];
+            } or {
+                symbols[idx].section = -1;
+            }
+
+            @sym_count = @sym_count + 1;
+            si = si + 1;
+        }
+    }
+
+    shi = 0;
+    for (shi < e_shnum) {
+        val sh_off: usize = e_shoff + shi::usize * e_shentsize::usize;
+        val sh_type: u32 = read_u32_le(buf, sh_off + 4);
+
+        if (sh_type == SHT_RELA) {
+            val sh_offset: usize = read_u64_le(buf, sh_off + 24)::usize;
+            val sh_size: usize = read_u64_le(buf, sh_off + 32)::usize;
+            val sh_info: u32 = read_u32_le(buf, sh_off + 44);
+            val rela_count: i32 = (sh_size / RELA_SIZE)::i32;
+
+            var ri: i32 = 0;
+            for (ri < rela_count) {
+                if (@reloc_count >= MAX_RELOCS) { ri = rela_count; cnt; }
+
+                val r_off: usize = sh_offset + ri::usize * RELA_SIZE;
+                val r_offset: u64 = read_u64_le(buf, r_off);
+                val r_info: u64 = read_u64_le(buf, r_off + 8);
+                val r_addend: i64 = read_i64_le(buf, r_off + 16);
+
+                val r_sym: u32 = (r_info >> 32)::u32;
+                val r_type: u32 = (r_info & 0xFFFFFFFF)::u32;
+
+                val idx: i32 = @reloc_count;
+                if (sh_info < e_shnum::u32) {
+                    relocs[idx].section = elf_sec_to_merged[sh_info];
+                } or {
+                    relocs[idx].section = -1;
+                }
+                relocs[idx].offset   = r_offset::usize;
+                relocs[idx].type_val = r_type;
+                relocs[idx].sym_idx  = (r_sym - 1)::i32;
+                relocs[idx].addend   = r_addend;
+
+                @reloc_count = @reloc_count + 1;
+                ri = ri + 1;
+            }
+        }
+
+        shi = shi + 1;
+    }
+
+    ret true;
+}
+
+# apply_relocations: patch section data with resolved symbol addresses
+fun apply_relocations(sections: *MergedSection, sec_count: i32,
+                      symbols: *LinkerSymbol, sym_count: i32,
+                      relocs: *LinkerReloc, reloc_count: i32) bool {
+    var ri: i32 = 0;
+    for (ri < reloc_count) {
+        val r: *LinkerReloc = ?relocs[ri];
+        if (r.section < 0 || r.section >= sec_count) {
+            ri = ri + 1;
+            cnt;
+        }
+
+        val sec: *MergedSection = ?sections[r.section];
+        if (sec.data == nil || r.offset >= sec.size) {
+            ri = ri + 1;
+            cnt;
+        }
+
+        if (r.sym_idx < 0 || r.sym_idx >= sym_count) {
+            ri = ri + 1;
+            cnt;
+        }
+
+        val sym: *LinkerSymbol = ?symbols[r.sym_idx];
+        if (!sym.is_defined || sym.section < 0 || sym.section >= sec_count) {
+            ri = ri + 1;
+            cnt;
+        }
+
+        val sym_addr: u64 = sections[sym.section].vaddr + sym.offset::u64;
+        val patch_addr: u64 = sec.vaddr + r.offset::u64;
+
+        if (r.type_val == R_X86_64_64) {
+            val value: u64 = sym_addr + r.addend::u64;
+            write_u64_le(sec.data, r.offset, value);
+        } or (r.type_val == R_X86_64_PC32 || r.type_val == R_X86_64_PLT32) {
+            val value: i64 = sym_addr::i64 + r.addend - patch_addr::i64;
+            write_u32_le(sec.data, r.offset, value::u32);
+        } or {
+            val value: u64 = sym_addr + r.addend::u64;
+            write_u64_le(sec.data, r.offset, value);
+        }
+
+        ri = ri + 1;
+    }
+    ret true;
+}
+
+# link: link object files into a final binary
 #
 # reads each object file, merges like-named sections, resolves global
 # symbols, applies relocations, and writes the executable via the
@@ -35,13 +441,188 @@ pub rec LinkResult {
 # obj_paths:   array of object file paths to link
 # obj_count:   number of object files
 # output_path: path for the output binary
-# target:      target descriptor (ISA, ABI, OS, object format)
+# tgt:         target descriptor (ISA, ABI, OS, object format)
 # ret:         link result
 pub fun link(alloc: &allocator.Allocator, obj_paths: *str, obj_count: i32,
-             output_path: str, target: *target.Target) LinkResult {
+             output_path: str, tgt: *target.Target) LinkResult {
     var result: LinkResult;
     result.output_path = nil;
     result.ok          = false;
-    result.error       = "linker not yet implemented";
+    result.error       = nil;
+
+    if (tgt == nil) {
+        result.error = "nil target";
+        ret result;
+    }
+
+    if (output_path == nil) {
+        result.error = "nil output path";
+        ret result;
+    }
+
+    val res_sections: Result[*MergedSection, str] = allocator.zallocate[MergedSection](alloc, MAX_SECTIONS::usize);
+    if (is_err[*MergedSection, str](res_sections)) {
+        result.error = "failed to allocate sections";
+        ret result;
+    }
+    var sections: *MergedSection = unwrap_ok[*MergedSection, str](res_sections);
+    var sec_count: i32 = 0;
+
+    val res_symbols: Result[*LinkerSymbol, str] = allocator.zallocate[LinkerSymbol](alloc, MAX_SYMBOLS::usize);
+    if (is_err[*LinkerSymbol, str](res_symbols)) {
+        allocator.deallocate[MergedSection](alloc, sections, MAX_SECTIONS::usize);
+        result.error = "failed to allocate symbols";
+        ret result;
+    }
+    var symbols: *LinkerSymbol = unwrap_ok[*LinkerSymbol, str](res_symbols);
+    var sym_count: i32 = 0;
+
+    val res_relocs: Result[*LinkerReloc, str] = allocator.zallocate[LinkerReloc](alloc, MAX_RELOCS::usize);
+    if (is_err[*LinkerReloc, str](res_relocs)) {
+        allocator.deallocate[LinkerSymbol](alloc, symbols, MAX_SYMBOLS::usize);
+        allocator.deallocate[MergedSection](alloc, sections, MAX_SECTIONS::usize);
+        result.error = "failed to allocate relocs";
+        ret result;
+    }
+    var relocs: *LinkerReloc = unwrap_ok[*LinkerReloc, str](res_relocs);
+    var reloc_count: i32 = 0;
+
+    val res_secmap: Result[*i32, str] = allocator.allocate[i32](alloc, 256);
+    if (is_err[*i32, str](res_secmap)) {
+        allocator.deallocate[LinkerReloc](alloc, relocs, MAX_RELOCS::usize);
+        allocator.deallocate[LinkerSymbol](alloc, symbols, MAX_SYMBOLS::usize);
+        allocator.deallocate[MergedSection](alloc, sections, MAX_SECTIONS::usize);
+        result.error = "failed to allocate sec_map";
+        ret result;
+    }
+    var sec_map: *i32 = unwrap_ok[*i32, str](res_secmap);
+
+    if (obj_paths != nil && obj_count > 0) {
+        var oi: i32 = 0;
+        for (oi < obj_count) {
+            val obj_path: str = obj_paths[oi];
+            if (obj_path == nil) {
+                oi = oi + 1;
+                cnt;
+            }
+
+            val res_read: Result[str, str] = fs.read_all(alloc, obj_path);
+            if (is_err[str, str](res_read)) {
+                oi = oi + 1;
+                cnt;
+            }
+            val file_data: str = unwrap_ok[str, str](res_read);
+            val file_size: usize = str_len(file_data);
+
+            parse_elf_object(alloc, file_data::*u8, file_size,
+                           sections, ?sec_count,
+                           symbols, ?sym_count,
+                           relocs, ?reloc_count,
+                           sec_map);
+
+            oi = oi + 1;
+        }
+    }
+
+    val base_addr: u64 = tgt.os.base_addr;
+    var vaddr: u64 = base_addr;
+
+    var si: i32 = 0;
+    for (si < sec_count) {
+        var sec_align: u64 = sections[si].align::u64;
+        if (sec_align < PAGE_SIZE::u64) { sec_align = PAGE_SIZE::u64; }
+        vaddr = align_up_64(vaddr, sec_align);
+        sections[si].vaddr = vaddr;
+        vaddr = vaddr + sections[si].size::u64;
+        si = si + 1;
+    }
+
+    apply_relocations(sections, sec_count, symbols, sym_count, relocs, reloc_count);
+
+    var entry_addr: u64 = base_addr;
+    val entry_name: str = tgt.os.entry_symbol;
+    if (entry_name != nil) {
+        val entry_idx: i32 = find_symbol(symbols, sym_count, entry_name);
+        if (entry_idx >= 0 && symbols[entry_idx].section >= 0) {
+            entry_addr = sections[symbols[entry_idx].section].vaddr + symbols[entry_idx].offset::u64;
+        }
+    }
+
+    val exec_fn: fun(ptr, u64, usize, usize, u32) i32 = tgt.of.exec.add_load;
+    val entry_fn: fun(ptr, u64) = tgt.of.exec.set_entry;
+    val finalize_fn: fun(ptr, str) bool = tgt.of.exec.finalize;
+
+    if (exec_fn == nil || entry_fn == nil || finalize_fn == nil) {
+        if (sec_count == 0 && obj_count == 0) {
+            result.ok = true;
+            result.output_path = output_path;
+        } or {
+            result.error = "exec format not initialized";
+        }
+        allocator.deallocate[i32](alloc, sec_map, 256);
+        allocator.deallocate[LinkerReloc](alloc, relocs, MAX_RELOCS::usize);
+        allocator.deallocate[LinkerSymbol](alloc, symbols, MAX_SYMBOLS::usize);
+        var di: i32 = 0;
+        for (di < sec_count) {
+            if (sections[di].data != nil) {
+                allocator.deallocate[u8](alloc, sections[di].data, sections[di].cap);
+            }
+            di = di + 1;
+        }
+        allocator.deallocate[MergedSection](alloc, sections, MAX_SECTIONS::usize);
+        ret result;
+    }
+
+    entry_fn(tgt.of.exec.ctx, entry_addr);
+
+    si = 0;
+    for (si < sec_count) {
+        var pflags: u32 = 4;
+        if (sections[si].kind == of.SK_TEXT) {
+            pflags = 5;
+        } or (sections[si].kind == of.SK_DATA || sections[si].kind == of.SK_BSS) {
+            pflags = 6;
+        }
+
+        val seg_idx: i32 = exec_fn(
+            tgt.of.exec.ctx,
+            sections[si].vaddr,
+            sections[si].size,
+            sections[si].size,
+            pflags
+        );
+
+        if (seg_idx >= 0) {
+            val st: *of.ExecFormat = ?tgt.of.exec;
+            val exec_st: ptr = st.ctx;
+            if (exec_st != nil) {
+                val loads: ptr = (exec_st::usize + 8)::ptr;
+                val load_ptr: *u8 = loads::*u8;
+            }
+        }
+
+        si = si + 1;
+    }
+
+    val finalize_ok: bool = finalize_fn(tgt.of.exec.ctx, output_path);
+
+    allocator.deallocate[i32](alloc, sec_map, 256);
+    allocator.deallocate[LinkerReloc](alloc, relocs, MAX_RELOCS::usize);
+    allocator.deallocate[LinkerSymbol](alloc, symbols, MAX_SYMBOLS::usize);
+    var di: i32 = 0;
+    for (di < sec_count) {
+        if (sections[di].data != nil) {
+            allocator.deallocate[u8](alloc, sections[di].data, sections[di].cap);
+        }
+        di = di + 1;
+    }
+    allocator.deallocate[MergedSection](alloc, sections, MAX_SECTIONS::usize);
+
+    if (finalize_ok) {
+        result.ok = true;
+        result.output_path = output_path;
+    } or {
+        result.error = "finalize failed";
+    }
     ret result;
 }

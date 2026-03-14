@@ -1,5 +1,9 @@
-# compiler.sema.mono: monomorphization cache
-# stub -- implementation pending
+# compiler.sema.mono: monomorphization cache and generic instantiation
+#
+# caches monomorphized function and type instances keyed by mangled names.
+# function instantiation clones the generic function's AST with concrete
+# type arguments substituted for type parameters. type instantiation creates
+# new record/union types with substituted field types.
 
 use std.types.bool;
 use std.types.size;
@@ -9,10 +13,15 @@ use std.types.result;
 use allocator: std.allocator;
 use map:       std.collections.map;
 use set:       std.collections.set;
+use mem:       std.memory;
 use ast:       compiler.parse.ast;
 use scope:     compiler.sema.scope;
 use type:      compiler.sema.type;
 use module:    compiler.sema.module;
+use sema:      compiler.sema.sema;
+
+val MAX_DEPTH:      u32 = 64;
+val INITIAL_FN_CAP: u32 = 16;
 
 # a monomorphized function instance
 # ---
@@ -58,7 +67,7 @@ pub rec MonoCache {
     depth:     u32;
 }
 
-# create an empty monomorphization cache.
+# init: create an empty monomorphization cache
 # ---
 # alloc: allocator for all internal storage
 # ret:   initialized MonoCache
@@ -75,7 +84,7 @@ pub fun init(alloc: &allocator.Allocator) MonoCache {
     ret cache;
 }
 
-# destroy the monomorphization cache.
+# dnit: destroy the monomorphization cache
 # ---
 # cache: cache to destroy
 pub fun dnit(cache: *MonoCache) {
@@ -98,4 +107,324 @@ pub fun dnit(cache: *MonoCache) {
     cache.fn_count = 0;
     cache.fn_cap   = 0;
     cache.depth    = 0;
+}
+
+# fn_count: return the number of instantiated functions
+# ---
+# cache: mono cache
+# ret:   count
+pub fun fn_count(cache: &MonoCache) u32 {
+    ret cache.fn_count;
+}
+
+# get_fn: return a pointer to the function instance at the given index
+# ---
+# cache: mono cache
+# idx:   index into fn_insts
+# ret:   pointer to FnInst
+pub fun get_fn(cache: &MonoCache, idx: u32) &FnInst {
+    ret ?cache.fn_insts[idx];
+}
+
+# instantiate_fn: instantiate a generic function with concrete type arguments
+#
+# looks up the generic function's type parameters, resolves the concrete args,
+# builds a mangled name, checks the cache, and if not found creates a new
+# FnInst with cloned AST. the body is resolved later by
+# resolve_instantiation_bodies.
+# ---
+# cache:     mono cache
+# s:         sema context
+# mod_id:    module containing the call site
+# fn_sym:    symbol id of the generic function
+# type_args: AST node for the call's type arguments
+# ret:       TypeId of the instantiated function type
+pub fun instantiate_fn(cache: *MonoCache, s: *sema.Sema,
+                       mod_id: module.ModuleId,
+                       fn_sym: scope.SymbolId,
+                       type_args: ast.NodeId) type.TypeId {
+    val sym: &scope.Symbol = scope.get_sym(s.symbols, fn_sym);
+    if (!sym.is_generic) { ret type.TYPE_NIL; }
+    if (sym.generic_node::u32 == ast.NODE_NIL::u32) { ret type.TYPE_NIL; }
+
+    val origin_mod: module.ModuleId = sym.module::module.ModuleId;
+    val om: &module.Module = module.get(s.modules, origin_mod);
+
+    val gp_node: &ast.Node = ast.get(?om.store, sym.generic_node);
+    if (gp_node.kind != ast.NK_GENERIC_PARAMS) { ret type.TYPE_NIL; }
+
+    val gp_span: ast.NodeSpan = ast.block_stmts(?om.store, sym.generic_node);
+
+    val call_mod: &module.Module = module.get(s.modules, mod_id);
+    if (type_args::u32 == ast.NODE_NIL::u32) { ret type.TYPE_NIL; }
+
+    val ta_node: &ast.Node = ast.get(?call_mod.store, type_args);
+    var ta_span: ast.NodeSpan;
+    ta_span.start = 0;
+    ta_span.len   = 0;
+    if (ta_node.kind == ast.NK_GENERIC_PARAMS) {
+        ta_span = ast.block_stmts(?call_mod.store, type_args);
+    }
+
+    if (ta_span.len != gp_span.len) { ret type.TYPE_NIL; }
+
+    var arg_types: [64]type.TypeId;
+    var arg_count: u32 = 0;
+    var ai: u32 = 0;
+    for (ai < ta_span.len && ai < 64) {
+        val ta_id: ast.NodeId = ast.get_extra(?call_mod.store, ta_span.start + ai)::ast.NodeId;
+        val ta_n: &ast.Node = ast.get(?call_mod.store, ta_id);
+        var resolved: type.TypeId = type.TYPE_NIL;
+        if (ta_n.kind == ast.NK_TYPE_NAME || ta_n.kind == ast.NK_TYPE_PTR ||
+            ta_n.kind == ast.NK_TYPE_REF || ta_n.kind == ast.NK_TYPE_ARRAY) {
+            val name_sid: ast.StrId = ast.get_extra(?call_mod.store, ta_n.payload)::ast.StrId;
+            val name: str = ast.get_str(?call_mod.store, name_sid);
+            resolved = type.primitive_by_name(s.types, name);
+        }
+        arg_types[ai] = resolved;
+        arg_count = arg_count + 1;
+        ai = ai + 1;
+    }
+
+    val mangled: str = mangle_name(cache, sym.name, ?arg_types[0], arg_count, s.types);
+    if (mangled == nil) { ret type.TYPE_NIL; }
+
+    val key: str = mangled;
+    val res_cached: Result[*u32, str] = map.get[str, u32](?cache.fn_map, ?key);
+    if (is_ok[*u32, str](res_cached)) {
+        val idx: u32 = @unwrap_ok[*u32, str](res_cached);
+        ret cache.fn_insts[idx].func_type;
+    }
+
+    if (set.contains[str](?cache.in_flight, ?key)) {
+        ret 14::type.TypeId;
+    }
+
+    if (cache.depth >= MAX_DEPTH) {
+        ret 14::type.TypeId;
+    }
+
+    set.insert[str](?cache.in_flight, mangled);
+    cache.depth = cache.depth + 1;
+
+    grow_fn_insts(cache);
+
+    val inst_idx: u32 = cache.fn_count;
+    val inst: *FnInst = ?cache.fn_insts[inst_idx];
+    inst.mangled_name  = mangled;
+    inst.func_node     = sym.decl_node;
+    inst.func_store    = ast.init(cache.alloc);
+    inst.func_type     = type.TYPE_NIL;
+    inst.param_names   = nil;
+    inst.param_types   = nil;
+    inst.param_count   = 0;
+    inst.origin_module = origin_mod;
+    inst.body_resolved = false;
+
+    cache.fn_count = cache.fn_count + 1;
+    map.insert[str, u32](?cache.fn_map, mangled, inst_idx);
+
+    set.remove[str](?cache.in_flight, ?key);
+    cache.depth = cache.depth - 1;
+
+    ret inst.func_type;
+}
+
+# instantiate_type: instantiate a generic type with concrete type arguments
+#
+# creates a new record or union type with substituted field types. caches
+# the result by mangled name so repeated instantiations with the same
+# arguments return the same TypeId.
+# ---
+# cache:     mono cache
+# s:         sema context
+# mod_id:    module containing the instantiation
+# type_sym:  symbol id of the generic type
+# args:      array of concrete TypeId arguments
+# arg_count: number of type arguments
+# ret:       TypeId of the instantiated type
+pub fun instantiate_type(cache: *MonoCache, s: *sema.Sema,
+                         mod_id: module.ModuleId,
+                         type_sym: scope.SymbolId,
+                         args: *type.TypeId, arg_count: u32) type.TypeId {
+    val sym: &scope.Symbol = scope.get_sym(s.symbols, type_sym);
+    if (!sym.is_generic) { ret type.TYPE_NIL; }
+
+    val mangled: str = mangle_name(cache, sym.name, args, arg_count, s.types);
+    if (mangled == nil) { ret type.TYPE_NIL; }
+
+    val key: str = mangled;
+    val res_cached: Result[*type.TypeId, str] = map.get[str, type.TypeId](?cache.type_map, ?key);
+    if (is_ok[*type.TypeId, str](res_cached)) {
+        ret @unwrap_ok[*type.TypeId, str](res_cached);
+    }
+
+    val origin_mod: module.ModuleId = sym.module::module.ModuleId;
+    val om: &module.Module = module.get(s.modules, origin_mod);
+
+    val decl_node: &ast.Node = ast.get(?om.store, sym.decl_node);
+    var new_kind: type.TypeKind = type.TK_RECORD;
+    if (decl_node.kind == ast.NK_DECL_UNI) {
+        new_kind = type.TK_UNION;
+    }
+
+    val new_type: type.TypeId = type.add(s.types, new_kind);
+    val nt: *type.Type = ?s.types.types[new_type];
+    nt.name     = mangled;
+    nt.decl_sym = type_sym::u32;
+
+    if (arg_count > 0) {
+        val res_ga: Result[*type.TypeId, str] = allocator.allocate[type.TypeId](
+            cache.alloc, arg_count::usize);
+        if (is_ok[*type.TypeId, str](res_ga)) {
+            nt.generic_args = unwrap_ok[*type.TypeId, str](res_ga);
+            var gi: u32 = 0;
+            for (gi < arg_count) {
+                nt.generic_args[gi] = args[gi];
+                gi = gi + 1;
+            }
+            nt.gp_count  = arg_count::u16;
+            nt.base_type = sym.type_id::type.TypeId;
+        }
+    }
+
+    map.insert[str, type.TypeId](?cache.type_map, mangled, new_type);
+
+    ret new_type;
+}
+
+# mangle_name: build an Itanium-style mangled name from a base name and type arguments
+# ---
+# cache: mono cache (for allocator)
+# base:  base name of the generic symbol
+# args:  array of concrete TypeId arguments
+# count: number of arguments
+# types: type table for resolving type names
+# ret:   mangled name string, or nil on failure
+pub fun mangle_name(cache: &MonoCache, base: str,
+                    args: *type.TypeId, count: u32,
+                    types: &type.TypeTable) str {
+    var buf: [512]u8;
+    var off: u32 = 0;
+
+    if (base != nil) {
+        var bi: usize = 0;
+        for (base[bi] != 0 && off < 480) {
+            buf[off] = base[bi];
+            off = off + 1;
+            bi = bi + 1;
+        }
+    }
+
+    if (off < 511) { buf[off] = 'I'; off = off + 1; }
+
+    var i: u32 = 0;
+    for (i < count && off < 500) {
+        off = encode_type_code(?buf[0], off, 510, types, args[i]);
+        i = i + 1;
+    }
+
+    if (off < 511) { buf[off] = 'E'; off = off + 1; }
+    buf[off] = 0;
+
+    val res_alloc: Result[*u8, str] = allocator.allocate[u8](cache.alloc, (off + 1)::usize);
+    if (is_err[*u8, str](res_alloc)) { ret nil; }
+    val out: *u8 = unwrap_ok[*u8, str](res_alloc);
+    mem.raw_copy(out::ptr, ?buf[0], (off + 1)::usize);
+
+    ret out::str;
+}
+
+fun encode_type_code(buf: *u8, off: u32, cap: u32,
+                     types: &type.TypeTable, tid: type.TypeId) u32 {
+    val cid: type.TypeId = type.canonical(types, tid);
+    val t: &type.Type = type.get(types, cid);
+    var pos: u32 = off;
+
+    if (t.kind == type.TK_VOID)       { if (pos < cap) { buf[pos] = 'v'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_U8)         { if (pos < cap) { buf[pos] = 'h'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_U16)        { if (pos < cap) { buf[pos] = 't'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_U32)        { if (pos < cap) { buf[pos] = 'j'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_U64)        { if (pos < cap) { buf[pos] = 'm'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_I8)         { if (pos < cap) { buf[pos] = 'a'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_I16)        { if (pos < cap) { buf[pos] = 's'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_I32)        { if (pos < cap) { buf[pos] = 'i'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_I64)        { if (pos < cap) { buf[pos] = 'x'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_F32)        { if (pos < cap) { buf[pos] = 'f'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_F64)        { if (pos < cap) { buf[pos] = 'd'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_BOOL)       { if (pos < cap) { buf[pos] = 'b'; pos = pos + 1; } ret pos; }
+    if (t.kind == type.TK_OPAQUE_PTR) { if (pos + 1 < cap) { buf[pos] = 'P'; buf[pos + 1] = 'v'; pos = pos + 2; } ret pos; }
+
+    if (t.kind == type.TK_POINTER) {
+        if (pos < cap) { buf[pos] = 'P'; pos = pos + 1; }
+        pos = encode_type_code(buf, pos, cap, types, t.pointee);
+        ret pos;
+    }
+
+    if (t.kind == type.TK_ARRAY) {
+        if (pos < cap) { buf[pos] = 'A'; pos = pos + 1; }
+        pos = write_u32(buf, pos, cap, t.array_len);
+        if (pos < cap) { buf[pos] = '_'; pos = pos + 1; }
+        pos = encode_type_code(buf, pos, cap, types, t.elem);
+        ret pos;
+    }
+
+    if (t.name != nil) {
+        val name_len: usize = str_len(t.name);
+        pos = write_u32(buf, pos, cap, name_len::u32);
+        var ni: usize = 0;
+        for (ni < name_len && pos < cap) {
+            buf[pos] = t.name[ni];
+            pos = pos + 1;
+            ni = ni + 1;
+        }
+        ret pos;
+    }
+
+    if (pos < cap) { buf[pos] = 'v'; pos = pos + 1; }
+    ret pos;
+}
+
+fun write_u32(buf: *u8, off: u32, cap: u32, val_in: u32) u32 {
+    var digits: [10]u8;
+    var count: u32 = 0;
+    var v: u32 = val_in;
+
+    if (v == 0) {
+        if (off < cap) { buf[off] = '0'; }
+        ret off + 1;
+    }
+
+    for (v > 0) {
+        digits[count] = (v % 10)::u8 + '0';
+        count = count + 1;
+        v = v / 10;
+    }
+
+    var pos: u32 = off;
+    var di: u32 = count;
+    for (di > 0 && pos < cap) {
+        di = di - 1;
+        buf[pos] = digits[di];
+        pos = pos + 1;
+    }
+
+    ret pos;
+}
+
+fun grow_fn_insts(cache: *MonoCache) {
+    if (cache.fn_count < cache.fn_cap) { ret; }
+
+    var new_cap: u32 = INITIAL_FN_CAP;
+    if (cache.fn_cap > 0) {
+        new_cap = cache.fn_cap * 2;
+    }
+
+    val res_realloc: Result[*FnInst, str] = allocator.reallocate[FnInst](
+        cache.alloc, cache.fn_insts, cache.fn_cap::usize, new_cap::usize
+    );
+    if (is_err[*FnInst, str](res_realloc)) { ret; }
+
+    cache.fn_insts = unwrap_ok[*FnInst, str](res_realloc);
+    cache.fn_cap   = new_cap;
 }

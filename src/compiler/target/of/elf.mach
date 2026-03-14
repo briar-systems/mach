@@ -1,23 +1,712 @@
 # compiler.target.of.elf: ELF object format implementation
 #
-# stub implementation of the ELF object writer and executable linker. provides
-# init functions that return zeroed interface records.
+# implements the ELF64 object writer and executable emitter. the object
+# writer accumulates sections, symbols, and relocations then serializes
+# a relocatable .o file. the executable emitter takes merged sections
+# and produces a statically linked ELF binary with program headers.
 
 use std.types.bool;
 use std.types.size;
 use std.types.string;
+use std.types.result;
 
 use allocator: std.allocator;
+use mem:       std.memory;
+use fs:        std.filesystem;
 
 use of: compiler.target.of;
 
-# initialize a stub ELF object writer.
+val EI_NIDENT:     usize = 16;
+val ELFCLASS64:    u8 = 2;
+val ELFDATA2LSB:   u8 = 1;
+val EV_CURRENT:    u8 = 1;
+val ELFOSABI_NONE: u8 = 0;
+
+val ET_REL:  u16 = 1;
+val ET_EXEC: u16 = 2;
+
+val EM_X86_64: u16 = 62;
+
+val SHT_NULL:     u32 = 0;
+val SHT_PROGBITS: u32 = 1;
+val SHT_SYMTAB:   u32 = 2;
+val SHT_STRTAB:   u32 = 3;
+val SHT_RELA:     u32 = 4;
+val SHT_NOBITS:   u32 = 8;
+
+val SHF_WRITE:     u64 = 1;
+val SHF_ALLOC:     u64 = 2;
+val SHF_EXECINSTR: u64 = 4;
+
+val STB_LOCAL:  u8 = 0;
+val STB_GLOBAL: u8 = 1;
+val STT_NOTYPE:  u8 = 0;
+val STT_FUNC:    u8 = 2;
+val STT_SECTION: u8 = 3;
+val STT_FILE:    u8 = 4;
+
+val R_X86_64_64:   u32 = 1;
+val R_X86_64_PC32: u32 = 2;
+val R_X86_64_PLT32: u32 = 4;
+val R_X86_64_GOTPCREL: u32 = 9;
+
+val PT_LOAD: u32 = 1;
+val PF_X: u32 = 1;
+val PF_W: u32 = 2;
+val PF_R: u32 = 4;
+
+val ELF_HEADER_SIZE: usize = 64;
+val SHDR_SIZE:       usize = 64;
+val PHDR_SIZE:       usize = 56;
+val SYM_SIZE:        usize = 24;
+val RELA_SIZE:       usize = 24;
+
+val INIT_SEC_CAP: i32 = 16;
+val INIT_SYM_CAP: i32 = 64;
+val INIT_REL_CAP: i32 = 128;
+val INIT_BUF_CAP: usize = 4096;
+
+rec ElfSection {
+    name:  str;
+    kind:  u8;
+    flags: u32;
+    data:  *u8;
+    size:  usize;
+    cap:   usize;
+    align: usize;
+}
+
+rec ElfSymbol {
+    name:       str;
+    section:    i32;
+    offset:     usize;
+    size:       usize;
+    is_global:  bool;
+    sym_type:   u8;
+}
+
+rec ElfReloc {
+    section: i32;
+    offset:  usize;
+    kind:    u8;
+    sym_id:  u32;
+    addend:  i64;
+}
+
+rec ElfWriter {
+    alloc:       &allocator.Allocator;
+    sections:    *ElfSection;
+    sec_count:   i32;
+    sec_cap:     i32;
+    symbols:     *ElfSymbol;
+    sym_count:   i32;
+    sym_cap:     i32;
+    relocs:      *ElfReloc;
+    reloc_count: i32;
+    reloc_cap:   i32;
+}
+
+rec ExecState {
+    alloc:     &allocator.Allocator;
+    loads:     *LoadEntry;
+    load_count: i32;
+    load_cap:  i32;
+    entry:     u64;
+}
+
+rec LoadEntry {
+    vaddr:  u64;
+    filesz: usize;
+    memsz:  usize;
+    flags:  u32;
+    data:   *u8;
+    offset: usize;
+}
+
+# strtab_size: compute the size of a string table
+fun strtab_size(syms: *ElfSymbol, count: i32) usize {
+    var total: usize = 1;
+    var i: i32 = 0;
+    for (i < count) {
+        if (syms[i].name != nil) {
+            total = total + str_len(syms[i].name) + 1;
+        } or {
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    ret total;
+}
+
+# shstrtab_size: compute section name string table size
+fun shstrtab_size(secs: *ElfSection, count: i32) usize {
+    var total: usize = 1;
+    total = total + 10;
+    total = total + 8;
+    total = total + 10;
+
+    var i: i32 = 0;
+    for (i < count) {
+        if (secs[i].name != nil) {
+            total = total + str_len(secs[i].name) + 1;
+        } or {
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+
+    var ri: i32 = 0;
+    for (ri < count) {
+        total = total + 6 + str_len(secs[ri].name) + 1;
+        ri = ri + 1;
+    }
+
+    ret total;
+}
+
+# write_u8: write a byte into a buffer at offset
+fun write_u8(buf: *u8, offset: usize, value: u8) {
+    buf[offset] = value;
+}
+
+# write_u16_le: write a u16 little-endian into a buffer
+fun write_u16_le(buf: *u8, offset: usize, value: u16) {
+    buf[offset]     = (value & 0xFF)::u8;
+    buf[offset + 1] = ((value >> 8) & 0xFF)::u8;
+}
+
+# write_u32_le: write a u32 little-endian into a buffer
+fun write_u32_le(buf: *u8, offset: usize, value: u32) {
+    buf[offset]     = (value & 0xFF)::u8;
+    buf[offset + 1] = ((value >> 8) & 0xFF)::u8;
+    buf[offset + 2] = ((value >> 16) & 0xFF)::u8;
+    buf[offset + 3] = ((value >> 24) & 0xFF)::u8;
+}
+
+# write_u64_le: write a u64 little-endian into a buffer
+fun write_u64_le(buf: *u8, offset: usize, value: u64) {
+    write_u32_le(buf, offset, (value & 0xFFFFFFFF)::u32);
+    write_u32_le(buf, offset + 4, ((value >> 32) & 0xFFFFFFFF)::u32);
+}
+
+# write_str: write a null-terminated string into buffer, return bytes written
+fun write_str(buf: *u8, offset: usize, s: str) usize {
+    if (s == nil) {
+        buf[offset] = 0;
+        ret 1;
+    }
+    val len: usize = str_len(s);
+    var i: usize = 0;
+    for (i < len) {
+        buf[offset + i] = s[i];
+        i = i + 1;
+    }
+    buf[offset + len] = 0;
+    ret len + 1;
+}
+
+# align_up: align a value to the given alignment
+fun align_up(value: usize, alignment: usize) usize {
+    if (alignment == 0) { ret value; }
+    ret (value + alignment - 1) & ~(alignment - 1);
+}
+
+fun align_up_64(value: u64, alignment: u64) u64 {
+    if (alignment == 0) { ret value; }
+    ret (value + alignment - 1) & ~(alignment - 1);
+}
+
+# elf_add_section: add a section to the ELF writer
+fun elf_add_section(ctx: ptr, name: str, kind: u8, flags: u32, align: usize) i32 {
+    val w: *ElfWriter = ctx::*ElfWriter;
+    if (w.sec_count >= w.sec_cap) {
+        val new_cap: i32 = w.sec_cap * 2;
+        val res_realloc: Result[*ElfSection, str] = allocator.reallocate[ElfSection](
+            w.alloc, w.sections, w.sec_cap::usize, new_cap::usize
+        );
+        if (is_err[*ElfSection, str](res_realloc)) { ret -1; }
+        w.sections = unwrap_ok[*ElfSection, str](res_realloc);
+        w.sec_cap = new_cap;
+    }
+    val idx: i32 = w.sec_count;
+    w.sections[idx].name  = name;
+    w.sections[idx].kind  = kind;
+    w.sections[idx].flags = flags;
+    w.sections[idx].data  = nil;
+    w.sections[idx].size  = 0;
+    w.sections[idx].cap   = 0;
+    w.sections[idx].align = align;
+    w.sec_count = w.sec_count + 1;
+    ret idx;
+}
+
+# elf_get_section: get an of.Section pointer from an ELF section
+fun elf_get_section(ctx: ptr, idx: i32) *of.Section {
+    ret nil;
+}
+
+# sec_grow: ensure section has room for n more bytes
+fun sec_grow(alloc: &allocator.Allocator, sec: *ElfSection, needed: usize) bool {
+    val total: usize = sec.size + needed;
+    if (total <= sec.cap) { ret true; }
+    var new_cap: usize = INIT_BUF_CAP;
+    if (sec.cap > 0) { new_cap = sec.cap; }
+    for (new_cap < total) {
+        new_cap = new_cap * 2;
+    }
+    val res_realloc: Result[*u8, str] = allocator.reallocate[u8](
+        alloc, sec.data, sec.cap, new_cap
+    );
+    if (is_err[*u8, str](res_realloc)) { ret false; }
+    sec.data = unwrap_ok[*u8, str](res_realloc);
+    sec.cap = new_cap;
+    ret true;
+}
+
+# elf_emit_bytes: append raw bytes to a section
+fun elf_emit_bytes(ctx: ptr, sec_id: i32, data: *u8, size: usize) bool {
+    val w: *ElfWriter = ctx::*ElfWriter;
+    if (sec_id < 0 || sec_id >= w.sec_count) { ret false; }
+    val sec: *ElfSection = ?w.sections[sec_id];
+    if (!sec_grow(w.alloc, sec, size)) { ret false; }
+    mem.raw_copy((sec.data::usize + sec.size)::ptr, data::ptr, size);
+    sec.size = sec.size + size;
+    ret true;
+}
+
+# elf_add_symbol: define a symbol
+fun elf_add_symbol(ctx: ptr, name: str, section: i32, offset: usize, size: usize, is_global: bool) u32 {
+    val w: *ElfWriter = ctx::*ElfWriter;
+    if (w.sym_count >= w.sym_cap) {
+        val new_cap: i32 = w.sym_cap * 2;
+        val res_realloc: Result[*ElfSymbol, str] = allocator.reallocate[ElfSymbol](
+            w.alloc, w.symbols, w.sym_cap::usize, new_cap::usize
+        );
+        if (is_err[*ElfSymbol, str](res_realloc)) { ret 0; }
+        w.symbols = unwrap_ok[*ElfSymbol, str](res_realloc);
+        w.sym_cap = new_cap;
+    }
+    val idx: i32 = w.sym_count;
+    w.symbols[idx].name      = name;
+    w.symbols[idx].section   = section;
+    w.symbols[idx].offset    = offset;
+    w.symbols[idx].size      = size;
+    w.symbols[idx].is_global = is_global;
+    w.symbols[idx].sym_type  = STT_NOTYPE;
+    if (section >= 0) { w.symbols[idx].sym_type = STT_FUNC; }
+    w.sym_count = w.sym_count + 1;
+    ret idx::u32;
+}
+
+# elf_add_reloc: record a relocation
+fun elf_add_reloc(ctx: ptr, section: i32, offset: usize, kind: u8, sym_id: u32, addend: i64) bool {
+    val w: *ElfWriter = ctx::*ElfWriter;
+    if (w.reloc_count >= w.reloc_cap) {
+        val new_cap: i32 = w.reloc_cap * 2;
+        val res_realloc: Result[*ElfReloc, str] = allocator.reallocate[ElfReloc](
+            w.alloc, w.relocs, w.reloc_cap::usize, new_cap::usize
+        );
+        if (is_err[*ElfReloc, str](res_realloc)) { ret false; }
+        w.relocs = unwrap_ok[*ElfReloc, str](res_realloc);
+        w.reloc_cap = new_cap;
+    }
+    val idx: i32 = w.reloc_count;
+    w.relocs[idx].section = section;
+    w.relocs[idx].offset  = offset;
+    w.relocs[idx].kind    = kind;
+    w.relocs[idx].sym_id  = sym_id;
+    w.relocs[idx].addend  = addend;
+    w.reloc_count = w.reloc_count + 1;
+    ret true;
+}
+
+# reloc_type_to_elf: convert of.RelocKind to ELF relocation type
+fun reloc_type_to_elf(kind: u8) u32 {
+    if (kind == of.RK_ABS64)    { ret R_X86_64_64; }
+    if (kind == of.RK_PC32)     { ret R_X86_64_PC32; }
+    if (kind == of.RK_PLT32)    { ret R_X86_64_PLT32; }
+    if (kind == of.RK_GOTPCREL) { ret R_X86_64_GOTPCREL; }
+    ret R_X86_64_64;
+}
+
+# count_relocs_for_section: count relocations targeting a given section
+fun count_relocs_for_section(relocs: *ElfReloc, reloc_count: i32, sec_id: i32) i32 {
+    var count: i32 = 0;
+    var i: i32 = 0;
+    for (i < reloc_count) {
+        if (relocs[i].section == sec_id) {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+# sections_with_relocs: count how many sections have at least one relocation
+fun sections_with_relocs(relocs: *ElfReloc, reloc_count: i32, sec_count: i32) i32 {
+    var count: i32 = 0;
+    var si: i32 = 0;
+    for (si < sec_count) {
+        if (count_relocs_for_section(relocs, reloc_count, si) > 0) {
+            count = count + 1;
+        }
+        si = si + 1;
+    }
+    ret count;
+}
+
+# section_flags_to_elf: convert of section flags to ELF SHF flags
+fun section_flags_to_elf(kind: u8, flags: u32) u64 {
+    var f: u64 = SHF_ALLOC;
+    if (kind == of.SK_TEXT) { f = f | SHF_EXECINSTR; }
+    if (kind == of.SK_DATA) { f = f | SHF_WRITE; }
+    if (kind == of.SK_BSS) { f = f | SHF_WRITE; }
+    if ((flags & 1) != 0) { f = f | SHF_WRITE; }
+    ret f;
+}
+
+# section_type_to_elf: convert of section kind to ELF section type
+fun section_type_to_elf(kind: u8) u32 {
+    if (kind == of.SK_BSS) { ret SHT_NOBITS; }
+    ret SHT_PROGBITS;
+}
+
+# elf_finalize: serialize the ELF object to disk
+fun elf_finalize(ctx: ptr, path: str) bool {
+    val w: *ElfWriter = ctx::*ElfWriter;
+    if (w == nil || path == nil) { ret false; }
+
+    val num_secs: i32 = w.sec_count;
+    val num_syms: i32 = w.sym_count;
+    val num_rels: i32 = w.reloc_count;
+    val num_rela_secs: i32 = sections_with_relocs(w.relocs, num_rels, num_secs);
+
+    val strtab_sz: usize = strtab_size(w.symbols, num_syms);
+
+    var shstrtab_off: usize = 1;
+    val res_shstrtab: Result[*u8, str] = allocator.allocate[u8](w.alloc, 4096);
+    if (is_err[*u8, str](res_shstrtab)) { ret false; }
+    var shstrtab: *u8 = unwrap_ok[*u8, str](res_shstrtab);
+    shstrtab[0] = 0;
+
+    var name_offsets: *u32 = nil;
+    val res_no: Result[*u32, str] = allocator.allocate[u32](w.alloc, (num_secs + num_rela_secs + 4)::usize);
+    if (is_err[*u32, str](res_no)) {
+        allocator.deallocate[u8](w.alloc, shstrtab, 4096);
+        ret false;
+    }
+    name_offsets = unwrap_ok[*u32, str](res_no);
+
+    var si: i32 = 0;
+    for (si < num_secs) {
+        name_offsets[si] = shstrtab_off::u32;
+        shstrtab_off = shstrtab_off + write_str(shstrtab, shstrtab_off, w.sections[si].name);
+        si = si + 1;
+    }
+
+    val symtab_name_off: u32 = shstrtab_off::u32;
+    shstrtab_off = shstrtab_off + write_str(shstrtab, shstrtab_off, ".symtab");
+
+    val strtab_name_off: u32 = shstrtab_off::u32;
+    shstrtab_off = shstrtab_off + write_str(shstrtab, shstrtab_off, ".strtab");
+
+    val shstrtab_name_off: u32 = shstrtab_off::u32;
+    shstrtab_off = shstrtab_off + write_str(shstrtab, shstrtab_off, ".shstrtab");
+
+    var rela_name_offsets: *u32 = nil;
+    val res_rno: Result[*u32, str] = allocator.allocate[u32](w.alloc, (num_secs + 1)::usize);
+    if (is_ok[*u32, str](res_rno)) {
+        rela_name_offsets = unwrap_ok[*u32, str](res_rno);
+    }
+
+    var rsi: i32 = 0;
+    for (rsi < num_secs) {
+        if (count_relocs_for_section(w.relocs, num_rels, rsi) > 0) {
+            if (rela_name_offsets != nil) {
+                rela_name_offsets[rsi] = shstrtab_off::u32;
+            }
+            shstrtab_off = shstrtab_off + write_str(shstrtab, shstrtab_off, ".rela");
+            if (w.sections[rsi].name != nil) {
+                val nlen: usize = str_len(w.sections[rsi].name);
+                var ni: usize = 0;
+                for (ni < nlen) {
+                    shstrtab[shstrtab_off] = w.sections[rsi].name[ni];
+                    shstrtab_off = shstrtab_off + 1;
+                    ni = ni + 1;
+                }
+                shstrtab[shstrtab_off] = 0;
+                shstrtab_off = shstrtab_off + 1;
+            }
+        }
+        rsi = rsi + 1;
+    }
+
+    val shstrtab_len: usize = shstrtab_off;
+
+    val total_shdr: i32 = 1 + num_secs + 1 + 1 + 1 + num_rela_secs;
+    val shdr_table_size: usize = total_shdr::usize * SHDR_SIZE;
+
+    var data_offset: usize = ELF_HEADER_SIZE;
+
+    si = 0;
+    for (si < num_secs) {
+        data_offset = align_up(data_offset, w.sections[si].align);
+        data_offset = data_offset + w.sections[si].size;
+        si = si + 1;
+    }
+
+    val symtab_offset: usize = align_up(data_offset, 8);
+    val symtab_size: usize = (num_syms + 1)::usize * SYM_SIZE;
+    val strtab_offset: usize = symtab_offset + symtab_size;
+    val shstrtab_offset: usize = strtab_offset + strtab_sz;
+
+    var rela_offsets: *usize = nil;
+    val res_ro: Result[*usize, str] = allocator.allocate[usize](w.alloc, (num_secs + 1)::usize);
+    if (is_ok[*usize, str](res_ro)) {
+        rela_offsets = unwrap_ok[*usize, str](res_ro);
+    }
+
+    var rela_offset: usize = shstrtab_offset + shstrtab_len;
+    rsi = 0;
+    for (rsi < num_secs) {
+        val rc: i32 = count_relocs_for_section(w.relocs, num_rels, rsi);
+        if (rc > 0) {
+            rela_offset = align_up(rela_offset, 8);
+            if (rela_offsets != nil) {
+                rela_offsets[rsi] = rela_offset;
+            }
+            rela_offset = rela_offset + rc::usize * RELA_SIZE;
+        }
+        rsi = rsi + 1;
+    }
+
+    val shdr_offset: usize = align_up(rela_offset, 8);
+    val total_file_size: usize = shdr_offset + shdr_table_size;
+
+    val res_buf: Result[*u8, str] = allocator.zallocate[u8](w.alloc, total_file_size);
+    if (is_err[*u8, str](res_buf)) {
+        allocator.deallocate[u8](w.alloc, shstrtab, 4096);
+        allocator.deallocate[u32](w.alloc, name_offsets, (num_secs + num_rela_secs + 4)::usize);
+        if (rela_name_offsets != nil) { allocator.deallocate[u32](w.alloc, rela_name_offsets, (num_secs + 1)::usize); }
+        if (rela_offsets != nil) { allocator.deallocate[usize](w.alloc, rela_offsets, (num_secs + 1)::usize); }
+        ret false;
+    }
+    var buf: *u8 = unwrap_ok[*u8, str](res_buf);
+
+    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
+    buf[4] = ELFCLASS64;
+    buf[5] = ELFDATA2LSB;
+    buf[6] = EV_CURRENT;
+    buf[7] = ELFOSABI_NONE;
+
+    write_u16_le(buf, 16, ET_REL);
+    write_u16_le(buf, 18, EM_X86_64);
+    write_u32_le(buf, 20, 1);
+    write_u64_le(buf, 24, 0);
+    write_u64_le(buf, 32, 0);
+    write_u64_le(buf, 40, shdr_offset::u64);
+    write_u32_le(buf, 48, 0);
+    write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
+    write_u16_le(buf, 54, 0);
+    write_u16_le(buf, 56, 0);
+    write_u16_le(buf, 58, SHDR_SIZE::u16);
+    write_u16_le(buf, 60, total_shdr::u16);
+
+    val shstrtab_idx: u16 = (1 + num_secs + 2)::u16;
+    write_u16_le(buf, 62, shstrtab_idx);
+
+    var sec_offset: usize = ELF_HEADER_SIZE;
+    si = 0;
+    for (si < num_secs) {
+        sec_offset = align_up(sec_offset, w.sections[si].align);
+        if (w.sections[si].data != nil && w.sections[si].size > 0) {
+            mem.raw_copy((buf::usize + sec_offset)::ptr, w.sections[si].data::ptr, w.sections[si].size);
+        }
+        sec_offset = sec_offset + w.sections[si].size;
+        si = si + 1;
+    }
+
+    var sym_off: usize = symtab_offset + SYM_SIZE;
+    var str_off: usize = strtab_offset;
+    buf[str_off] = 0;
+    var str_pos: usize = 1;
+
+    var first_global: i32 = num_syms + 1;
+    var symi: i32 = 0;
+    for (symi < num_syms) {
+        val name_pos: usize = str_pos;
+        str_pos = str_pos + write_str(buf, str_off + str_pos, w.symbols[symi].name);
+
+        write_u32_le(buf, sym_off, name_pos::u32);
+
+        var info: u8 = 0;
+        if (w.symbols[symi].is_global) {
+            info = (STB_GLOBAL << 4) | (w.symbols[symi].sym_type & 0xF);
+            if (symi + 1 < first_global) { first_global = symi + 1; }
+        } or {
+            info = (STB_LOCAL << 4) | (w.symbols[symi].sym_type & 0xF);
+        }
+        buf[sym_off + 4] = info;
+        buf[sym_off + 5] = 0;
+
+        var sec_idx: u16 = 0;
+        if (w.symbols[symi].section >= 0) {
+            sec_idx = (w.symbols[symi].section + 1)::u16;
+        }
+        write_u16_le(buf, sym_off + 6, sec_idx);
+        write_u64_le(buf, sym_off + 8, w.symbols[symi].offset::u64);
+        write_u64_le(buf, sym_off + 16, w.symbols[symi].size::u64);
+
+        sym_off = sym_off + SYM_SIZE;
+        symi = symi + 1;
+    }
+
+    mem.raw_copy((buf::usize + shstrtab_offset)::ptr, shstrtab::ptr, shstrtab_len);
+
+    rsi = 0;
+    for (rsi < num_secs) {
+        val rc: i32 = count_relocs_for_section(w.relocs, num_rels, rsi);
+        if (rc > 0 && rela_offsets != nil) {
+            var ro: usize = rela_offsets[rsi];
+            var ri: i32 = 0;
+            for (ri < num_rels) {
+                if (w.relocs[ri].section == rsi) {
+                    write_u64_le(buf, ro, w.relocs[ri].offset::u64);
+                    val elf_type: u32 = reloc_type_to_elf(w.relocs[ri].kind);
+                    val r_info: u64 = ((w.relocs[ri].sym_id + 1)::u64 << 32) | elf_type::u64;
+                    write_u64_le(buf, ro + 8, r_info);
+                    write_u64_le(buf, ro + 16, w.relocs[ri].addend::u64);
+                    ro = ro + RELA_SIZE;
+                }
+                ri = ri + 1;
+            }
+        }
+        rsi = rsi + 1;
+    }
+
+    var shdr_pos: usize = shdr_offset;
+    mem.raw_zero((buf::usize + shdr_pos)::ptr, SHDR_SIZE);
+    shdr_pos = shdr_pos + SHDR_SIZE;
+
+    sec_offset = ELF_HEADER_SIZE;
+    si = 0;
+    for (si < num_secs) {
+        sec_offset = align_up(sec_offset, w.sections[si].align);
+        write_u32_le(buf, shdr_pos, name_offsets[si]);
+        write_u32_le(buf, shdr_pos + 4, section_type_to_elf(w.sections[si].kind));
+        write_u64_le(buf, shdr_pos + 8, section_flags_to_elf(w.sections[si].kind, w.sections[si].flags));
+        write_u64_le(buf, shdr_pos + 16, 0);
+        if (w.sections[si].kind == of.SK_BSS) {
+            write_u64_le(buf, shdr_pos + 24, 0);
+        } or {
+            write_u64_le(buf, shdr_pos + 24, sec_offset::u64);
+        }
+        write_u64_le(buf, shdr_pos + 32, w.sections[si].size::u64);
+        write_u32_le(buf, shdr_pos + 40, 0);
+        write_u32_le(buf, shdr_pos + 44, 0);
+        var sec_align: usize = w.sections[si].align;
+        if (sec_align == 0) { sec_align = 1; }
+        write_u64_le(buf, shdr_pos + 48, sec_align::u64);
+        write_u64_le(buf, shdr_pos + 56, 0);
+        shdr_pos = shdr_pos + SHDR_SIZE;
+        sec_offset = sec_offset + w.sections[si].size;
+        si = si + 1;
+    }
+
+    val symtab_shidx: i32 = 1 + num_secs;
+    write_u32_le(buf, shdr_pos, symtab_name_off);
+    write_u32_le(buf, shdr_pos + 4, SHT_SYMTAB);
+    write_u64_le(buf, shdr_pos + 8, 0);
+    write_u64_le(buf, shdr_pos + 16, 0);
+    write_u64_le(buf, shdr_pos + 24, symtab_offset::u64);
+    write_u64_le(buf, shdr_pos + 32, symtab_size::u64);
+    write_u32_le(buf, shdr_pos + 40, (symtab_shidx + 1)::u32);
+    if (first_global <= num_syms) {
+        write_u32_le(buf, shdr_pos + 44, first_global::u32);
+    } or {
+        write_u32_le(buf, shdr_pos + 44, (num_syms + 1)::u32);
+    }
+    write_u64_le(buf, shdr_pos + 48, 8);
+    write_u64_le(buf, shdr_pos + 56, SYM_SIZE::u64);
+    shdr_pos = shdr_pos + SHDR_SIZE;
+
+    write_u32_le(buf, shdr_pos, strtab_name_off);
+    write_u32_le(buf, shdr_pos + 4, SHT_STRTAB);
+    write_u64_le(buf, shdr_pos + 8, 0);
+    write_u64_le(buf, shdr_pos + 16, 0);
+    write_u64_le(buf, shdr_pos + 24, strtab_offset::u64);
+    write_u64_le(buf, shdr_pos + 32, strtab_sz::u64);
+    write_u32_le(buf, shdr_pos + 40, 0);
+    write_u32_le(buf, shdr_pos + 44, 0);
+    write_u64_le(buf, shdr_pos + 48, 1);
+    write_u64_le(buf, shdr_pos + 56, 0);
+    shdr_pos = shdr_pos + SHDR_SIZE;
+
+    write_u32_le(buf, shdr_pos, shstrtab_name_off);
+    write_u32_le(buf, shdr_pos + 4, SHT_STRTAB);
+    write_u64_le(buf, shdr_pos + 8, 0);
+    write_u64_le(buf, shdr_pos + 16, 0);
+    write_u64_le(buf, shdr_pos + 24, shstrtab_offset::u64);
+    write_u64_le(buf, shdr_pos + 32, shstrtab_len::u64);
+    write_u32_le(buf, shdr_pos + 40, 0);
+    write_u32_le(buf, shdr_pos + 44, 0);
+    write_u64_le(buf, shdr_pos + 48, 1);
+    write_u64_le(buf, shdr_pos + 56, 0);
+    shdr_pos = shdr_pos + SHDR_SIZE;
+
+    rsi = 0;
+    for (rsi < num_secs) {
+        val rc: i32 = count_relocs_for_section(w.relocs, num_rels, rsi);
+        if (rc > 0) {
+            var rname_off: u32 = 0;
+            if (rela_name_offsets != nil) { rname_off = rela_name_offsets[rsi]; }
+            write_u32_le(buf, shdr_pos, rname_off);
+            write_u32_le(buf, shdr_pos + 4, SHT_RELA);
+            write_u64_le(buf, shdr_pos + 8, 0);
+            write_u64_le(buf, shdr_pos + 16, 0);
+            var r_off: usize = 0;
+            if (rela_offsets != nil) { r_off = rela_offsets[rsi]; }
+            write_u64_le(buf, shdr_pos + 24, r_off::u64);
+            write_u64_le(buf, shdr_pos + 32, (rc::usize * RELA_SIZE)::u64);
+            write_u32_le(buf, shdr_pos + 40, symtab_shidx::u32);
+            write_u32_le(buf, shdr_pos + 44, (rsi + 1)::u32);
+            write_u64_le(buf, shdr_pos + 48, 8);
+            write_u64_le(buf, shdr_pos + 56, RELA_SIZE::u64);
+            shdr_pos = shdr_pos + SHDR_SIZE;
+        }
+        rsi = rsi + 1;
+    }
+
+    val res_file: Result[fs.File, str] = fs.create(path, 0o644);
+    if (is_err[fs.File, str](res_file)) {
+        allocator.deallocate[u8](w.alloc, buf, total_file_size);
+        allocator.deallocate[u8](w.alloc, shstrtab, 4096);
+        allocator.deallocate[u32](w.alloc, name_offsets, (num_secs + num_rela_secs + 4)::usize);
+        if (rela_name_offsets != nil) { allocator.deallocate[u32](w.alloc, rela_name_offsets, (num_secs + 1)::usize); }
+        if (rela_offsets != nil) { allocator.deallocate[usize](w.alloc, rela_offsets, (num_secs + 1)::usize); }
+        ret false;
+    }
+    var f: fs.File = unwrap_ok[fs.File, str](res_file);
+
+    val res_write: Result[usize, str] = fs.write(?f, buf, total_file_size);
+    fs.close(?f);
+
+    allocator.deallocate[u8](w.alloc, buf, total_file_size);
+    allocator.deallocate[u8](w.alloc, shstrtab, 4096);
+    allocator.deallocate[u32](w.alloc, name_offsets, (num_secs + num_rela_secs + 4)::usize);
+    if (rela_name_offsets != nil) { allocator.deallocate[u32](w.alloc, rela_name_offsets, (num_secs + 1)::usize); }
+    if (rela_offsets != nil) { allocator.deallocate[usize](w.alloc, rela_offsets, (num_secs + 1)::usize); }
+
+    if (is_err[usize, str](res_write)) { ret false; }
+    ret true;
+}
+
+# init_writer: initialize an ELF object writer
 # ---
 # alloc: allocator for internal state
-# ret:   ObjWriter with nil function pointers
+# ret:   ObjWriter with function pointers wired to ELF backend
 pub fun init_writer(alloc: &allocator.Allocator) of.ObjWriter {
     var w: of.ObjWriter;
-    w.ctx         = nil;
     w.name        = "elf";
     w.add_section = nil;
     w.get_section = nil;
@@ -25,18 +714,194 @@ pub fun init_writer(alloc: &allocator.Allocator) of.ObjWriter {
     w.add_symbol  = nil;
     w.add_reloc   = nil;
     w.finalize    = nil;
+
+    val res_ctx: Result[*ElfWriter, str] = allocator.allocate[ElfWriter](alloc, 1);
+    if (is_err[*ElfWriter, str](res_ctx)) {
+        w.ctx = nil;
+        ret w;
+    }
+    val ctx: *ElfWriter = unwrap_ok[*ElfWriter, str](res_ctx);
+    ctx.alloc = alloc;
+
+    val res_secs: Result[*ElfSection, str] = allocator.allocate[ElfSection](alloc, INIT_SEC_CAP::usize);
+    if (is_err[*ElfSection, str](res_secs)) {
+        w.ctx = nil;
+        ret w;
+    }
+    ctx.sections  = unwrap_ok[*ElfSection, str](res_secs);
+    ctx.sec_count = 0;
+    ctx.sec_cap   = INIT_SEC_CAP;
+
+    val res_syms: Result[*ElfSymbol, str] = allocator.allocate[ElfSymbol](alloc, INIT_SYM_CAP::usize);
+    if (is_err[*ElfSymbol, str](res_syms)) {
+        w.ctx = nil;
+        ret w;
+    }
+    ctx.symbols   = unwrap_ok[*ElfSymbol, str](res_syms);
+    ctx.sym_count = 0;
+    ctx.sym_cap   = INIT_SYM_CAP;
+
+    val res_rels: Result[*ElfReloc, str] = allocator.allocate[ElfReloc](alloc, INIT_REL_CAP::usize);
+    if (is_err[*ElfReloc, str](res_rels)) {
+        w.ctx = nil;
+        ret w;
+    }
+    ctx.relocs      = unwrap_ok[*ElfReloc, str](res_rels);
+    ctx.reloc_count = 0;
+    ctx.reloc_cap   = INIT_REL_CAP;
+
+    w.ctx         = ctx::ptr;
+    w.add_section = elf_add_section;
+    w.get_section = elf_get_section;
+    w.emit_bytes  = elf_emit_bytes;
+    w.add_symbol  = elf_add_symbol;
+    w.add_reloc   = elf_add_reloc;
+    w.finalize    = elf_finalize;
     ret w;
 }
 
-# initialize a stub ELF executable writer.
+# exec_add_load: add a loadable segment
+fun exec_add_load(ctx: ptr, vaddr: u64, filesz: usize, memsz: usize, flags: u32) i32 {
+    val st: *ExecState = ctx::*ExecState;
+    if (st.load_count >= st.load_cap) {
+        val new_cap: i32 = st.load_cap * 2;
+        val res_realloc: Result[*LoadEntry, str] = allocator.reallocate[LoadEntry](
+            st.alloc, st.loads, st.load_cap::usize, new_cap::usize
+        );
+        if (is_err[*LoadEntry, str](res_realloc)) { ret -1; }
+        st.loads = unwrap_ok[*LoadEntry, str](res_realloc);
+        st.load_cap = new_cap;
+    }
+    val idx: i32 = st.load_count;
+    st.loads[idx].vaddr  = vaddr;
+    st.loads[idx].filesz = filesz;
+    st.loads[idx].memsz  = memsz;
+    st.loads[idx].flags  = flags;
+    st.loads[idx].data   = nil;
+    st.loads[idx].offset = 0;
+    st.load_count = st.load_count + 1;
+    ret idx;
+}
+
+# exec_set_entry: set entry point address
+fun exec_set_entry(ctx: ptr, addr: u64) {
+    val st: *ExecState = ctx::*ExecState;
+    st.entry = addr;
+}
+
+# exec_finalize: write the ELF executable to disk
+fun exec_finalize(ctx: ptr, path: str) bool {
+    val st: *ExecState = ctx::*ExecState;
+    if (st == nil || path == nil) { ret false; }
+
+    val num_loads: i32 = st.load_count;
+    val phdr_offset: usize = ELF_HEADER_SIZE;
+    val phdr_table_size: usize = num_loads::usize * PHDR_SIZE;
+    var data_start: usize = align_up(phdr_offset + phdr_table_size, 4096);
+
+    var total_size: usize = data_start;
+    var li: i32 = 0;
+    for (li < num_loads) {
+        total_size = align_up(total_size, 4096);
+        st.loads[li].offset = total_size;
+        total_size = total_size + st.loads[li].filesz;
+        li = li + 1;
+    }
+
+    val res_buf: Result[*u8, str] = allocator.zallocate[u8](st.alloc, total_size);
+    if (is_err[*u8, str](res_buf)) { ret false; }
+    var buf: *u8 = unwrap_ok[*u8, str](res_buf);
+
+    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
+    buf[4] = ELFCLASS64;
+    buf[5] = ELFDATA2LSB;
+    buf[6] = EV_CURRENT;
+    buf[7] = ELFOSABI_NONE;
+
+    write_u16_le(buf, 16, ET_EXEC);
+    write_u16_le(buf, 18, EM_X86_64);
+    write_u32_le(buf, 20, 1);
+    write_u64_le(buf, 24, st.entry);
+    write_u64_le(buf, 32, phdr_offset::u64);
+    write_u64_le(buf, 40, 0);
+    write_u32_le(buf, 48, 0);
+    write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
+    write_u16_le(buf, 54, PHDR_SIZE::u16);
+    write_u16_le(buf, 56, num_loads::u16);
+    write_u16_le(buf, 58, 0);
+    write_u16_le(buf, 60, 0);
+    write_u16_le(buf, 62, 0);
+
+    var phdr_pos: usize = phdr_offset;
+    li = 0;
+    for (li < num_loads) {
+        write_u32_le(buf, phdr_pos, PT_LOAD);
+        write_u32_le(buf, phdr_pos + 4, st.loads[li].flags);
+        write_u64_le(buf, phdr_pos + 8, st.loads[li].offset::u64);
+        write_u64_le(buf, phdr_pos + 16, st.loads[li].vaddr);
+        write_u64_le(buf, phdr_pos + 24, st.loads[li].vaddr);
+        write_u64_le(buf, phdr_pos + 32, st.loads[li].filesz::u64);
+        write_u64_le(buf, phdr_pos + 40, st.loads[li].memsz::u64);
+        write_u64_le(buf, phdr_pos + 48, 4096);
+        phdr_pos = phdr_pos + PHDR_SIZE;
+
+        if (st.loads[li].data != nil && st.loads[li].filesz > 0) {
+            mem.raw_copy(
+                (buf::usize + st.loads[li].offset)::ptr,
+                st.loads[li].data::ptr,
+                st.loads[li].filesz
+            );
+        }
+
+        li = li + 1;
+    }
+
+    val res_file: Result[fs.File, str] = fs.create(path, 0o755);
+    if (is_err[fs.File, str](res_file)) {
+        allocator.deallocate[u8](st.alloc, buf, total_size);
+        ret false;
+    }
+    var f: fs.File = unwrap_ok[fs.File, str](res_file);
+
+    val res_write: Result[usize, str] = fs.write(?f, buf, total_size);
+    fs.close(?f);
+    allocator.deallocate[u8](st.alloc, buf, total_size);
+
+    if (is_err[usize, str](res_write)) { ret false; }
+    ret true;
+}
+
+# init_exec: initialize an ELF executable writer
 # ---
 # alloc: allocator for internal state
-# ret:   ExecFormat with nil function pointers
+# ret:   ExecFormat with function pointers wired to ELF backend
 pub fun init_exec(alloc: &allocator.Allocator) of.ExecFormat {
     var e: of.ExecFormat;
-    e.ctx       = nil;
     e.add_load  = nil;
     e.set_entry = nil;
     e.finalize  = nil;
+
+    val res_ctx: Result[*ExecState, str] = allocator.allocate[ExecState](alloc, 1);
+    if (is_err[*ExecState, str](res_ctx)) {
+        e.ctx = nil;
+        ret e;
+    }
+    val st: *ExecState = unwrap_ok[*ExecState, str](res_ctx);
+    st.alloc = alloc;
+    st.entry = 0;
+    st.load_count = 0;
+
+    val res_loads: Result[*LoadEntry, str] = allocator.allocate[LoadEntry](alloc, 8);
+    if (is_err[*LoadEntry, str](res_loads)) {
+        e.ctx = nil;
+        ret e;
+    }
+    st.loads    = unwrap_ok[*LoadEntry, str](res_loads);
+    st.load_cap = 8;
+
+    e.ctx       = st::ptr;
+    e.add_load  = exec_add_load;
+    e.set_entry = exec_set_entry;
+    e.finalize  = exec_finalize;
     ret e;
 }
