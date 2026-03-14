@@ -1,43 +1,117 @@
 # compiler.sema.resolve: name and type resolution (phases 1-2)
-# stub -- implementation pending
+#
+# phase 1 (collect) walks each module's top-level declarations and registers
+# forward-declaration symbols in the module scope. phase 2 (resolve) revisits
+# every declaration to resolve type expressions, build compound types, and
+# compute layouts. together they produce a fully populated symbol table and
+# type table that downstream passes (check, codegen) can consume.
 
 use std.types.bool;
 use std.types.size;
 use std.types.string;
+use std.types.result;
 
-use ast:    compiler.parse.ast;
-use module: compiler.sema.module;
-use scope:  compiler.sema.scope;
-use type:   compiler.sema.type;
-use sema:   compiler.sema.sema;
+use allocator: std.allocator;
 
-# collect_all: collect all forward declarations from every module
+use ast:      compiler.parse.ast;
+use diag:     compiler.diag;
+use lexer:    compiler.lex.lexer;
+use module:   compiler.sema.module;
+use scope:    compiler.sema.scope;
+use type:     compiler.sema.type;
+use sema:     compiler.sema.sema;
+use comptime: compiler.sema.comptime;
+
+val TYPE_ERROR: type.TypeId = 14;
+
+# collect_all: collect forward declarations from every module in topo order
 # ---
 # s: sema context
 pub fun collect_all(s: *sema.Sema) {
+    var i: u32 = 0;
+    for (i < module.order_count(s.modules)) {
+        val mod_id: module.ModuleId = module.order_at(s.modules, i);
+        collect_module(s, mod_id);
+        i = i + 1;
+    }
 }
 
 # collect_module: collect forward declarations from a single module
+#
+# pushes a new scope for the module, walks NK_PROGRAM children, and registers
+# a symbol for each top-level declaration. generic parameters are noted but
+# not resolved until phase 2.
 # ---
 # s:      sema context
 # mod_id: module to collect from
 pub fun collect_module(s: *sema.Sema, mod_id: module.ModuleId) {
+    val m: *module.Module = module.get_mut(s.modules, mod_id);
+    if (m.phase::u8 >= module.PHASE_COLLECTED::u8) { ret; }
+
+    val mod_scope: scope.ScopeId = scope.push_scope(s.symbols);
+    m.scope = mod_scope;
+
+    if (m.root::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val root: &ast.Node = ast.get(?m.store, m.root);
+    if (root.kind != ast.NK_PROGRAM) { ret; }
+
+    val stmts: ast.NodeSpan = ast.block_stmts(?m.store, m.root);
+    var i: u32 = 0;
+    for (i < stmts.len) {
+        val child_id: ast.NodeId = ast.get_extra(?m.store, stmts.start + i)::ast.NodeId;
+        collect_decl(s, mod_id, child_id, false);
+        i = i + 1;
+    }
+
+    m.phase = module.PHASE_COLLECTED;
 }
 
-# resolve_all: resolve names and types in every module
+# resolve_all: resolve names and types in every module in topo order
 # ---
 # s: sema context
 pub fun resolve_all(s: *sema.Sema) {
+    var i: u32 = 0;
+    for (i < module.order_count(s.modules)) {
+        val mod_id: module.ModuleId = module.order_at(s.modules, i);
+        resolve_module(s, mod_id);
+        i = i + 1;
+    }
 }
 
 # resolve_module: resolve names and types in a single module
+#
+# walks top-level declarations a second time to resolve type annotations,
+# build function/record/union/alias types, and compute layouts.
 # ---
 # s:      sema context
 # mod_id: module to resolve
 pub fun resolve_module(s: *sema.Sema, mod_id: module.ModuleId) {
+    val m: *module.Module = module.get_mut(s.modules, mod_id);
+    if (m.phase::u8 >= module.PHASE_RESOLVED::u8) { ret; }
+    if (m.phase::u8 < module.PHASE_COLLECTED::u8) {
+        collect_module(s, mod_id);
+    }
+
+    set_current_scope(s, m.scope);
+
+    if (m.root::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val stmts: ast.NodeSpan = ast.block_stmts(?m.store, m.root);
+    var i: u32 = 0;
+    for (i < stmts.len) {
+        val child_id: ast.NodeId = ast.get_extra(?m.store, stmts.start + i)::ast.NodeId;
+        resolve_decl(s, mod_id, child_id);
+        i = i + 1;
+    }
+
+    m.phase = module.PHASE_RESOLVED;
 }
 
 # resolve_type_expr: resolve a type expression AST node to a TypeId
+#
+# handles named types (including built-in aliases and primitives), pointer,
+# reference, array, and function types.
 # ---
 # s:       sema context
 # mod_id:  module containing the expression
@@ -45,16 +119,1096 @@ pub fun resolve_module(s: *sema.Sema, mod_id: module.ModuleId) {
 # ret:     resolved TypeId, or TYPE_NIL on failure
 pub fun resolve_type_expr(s: *sema.Sema, mod_id: module.ModuleId,
                           node_id: ast.NodeId) type.TypeId {
-    ret type.TYPE_NIL;
+    if (node_id::u32 == ast.NODE_NIL::u32) {
+        ret type.TYPE_NIL;
+    }
+
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+
+    if (node.kind == ast.NK_TYPE_NAME) {
+        ret resolve_type_name(s, mod_id, node_id);
+    }
+
+    if (node.kind == ast.NK_TYPE_PTR) {
+        val inner_id: ast.NodeId = ast.get_extra(?m.store, node.payload)::ast.NodeId;
+        val inner_type: type.TypeId = resolve_type_expr(s, mod_id, inner_id);
+        if (inner_type::u32 == type.TYPE_NIL::u32) {
+            ret TYPE_ERROR;
+        }
+        ret type.make_pointer(s.types, inner_type, true);
+    }
+
+    if (node.kind == ast.NK_TYPE_REF) {
+        val inner_id: ast.NodeId = ast.get_extra(?m.store, node.payload)::ast.NodeId;
+        val inner_type: type.TypeId = resolve_type_expr(s, mod_id, inner_id);
+        if (inner_type::u32 == type.TYPE_NIL::u32) {
+            ret TYPE_ERROR;
+        }
+        ret type.make_pointer(s.types, inner_type, false);
+    }
+
+    if (node.kind == ast.NK_TYPE_ARRAY) {
+        ret resolve_type_array(s, mod_id, node_id);
+    }
+
+    if (node.kind == ast.NK_TYPE_FUN) {
+        ret resolve_type_fun(s, mod_id, node_id);
+    }
+
+    emit_error(s, mod_id, node_id, "unexpected node in type expression");
+    ret TYPE_ERROR;
 }
 
 # lookup_symbol: look up a symbol by name in the context of a module
+#
+# handles dotted paths (alias.name), scope chain lookup, and bare imports.
 # ---
 # s:      sema context
 # mod_id: module to search from
-# name:   symbol name
+# name:   symbol name (may be dotted)
 # ret:    SymbolId if found, SYM_NIL otherwise
 pub fun lookup_symbol(s: *sema.Sema, mod_id: module.ModuleId,
                       name: str) scope.SymbolId {
+    if (name == nil) { ret scope.SYM_NIL; }
+
+    if (str_contains_char(name, '.')) {
+        ret lookup_dotted(s, mod_id, name);
+    }
+
+    val m: &module.Module = module.get(s.modules, mod_id);
+    set_current_scope(s, m.scope);
+    val found: scope.SymbolId = scope.lookup(s.symbols, name);
+    if (found::u32 != scope.SYM_NIL::u32) {
+        ret found;
+    }
+
+    ret lookup_in_imports(s, mod_id, name);
+}
+
+fun collect_decl(s: *sema.Sema, mod_id: module.ModuleId,
+                 node_id: ast.NodeId, is_public: bool) {
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+
+    if (node.kind == ast.NK_DECL_PUB) {
+        val inner_id: ast.NodeId = ast.get_extra(?m.store, node.payload)::ast.NodeId;
+        collect_decl(s, mod_id, inner_id, true);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_FUN) {
+        collect_fun(s, mod_id, node_id, is_public);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_REC) {
+        collect_type_decl(s, mod_id, node_id, is_public);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_UNI) {
+        collect_type_decl(s, mod_id, node_id, is_public);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_VAL) {
+        collect_var(s, mod_id, node_id, is_public, false);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_VAR) {
+        collect_var(s, mod_id, node_id, is_public, true);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_DEF) {
+        collect_def(s, mod_id, node_id, is_public);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_EXT) {
+        collect_ext(s, mod_id, node_id, is_public);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_FWD) {
+        collect_fwd(s, mod_id, node_id, is_public);
+        ret;
+    }
+
+    if (node.kind == ast.NK_COMPTIME_IF) {
+        collect_comptime_if(s, mod_id, node_id, is_public);
+        ret;
+    }
+}
+
+fun collect_fun(s: *sema.Sema, mod_id: module.ModuleId,
+                node_id: ast.NodeId, is_public: bool) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val name_str_id: ast.StrId = ast.fun_name(?m.store, node_id);
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    val sym_id: scope.SymbolId = scope.define(s.symbols, name, scope.SK_FUN);
+    if (sym_id::u32 == scope.SYM_NIL::u32) {
+        emit_error(s, mod_id, node_id, "duplicate symbol");
+        ret;
+    }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    sym.decl_node = node_id;
+    sym.is_public = is_public;
+    sym.module    = mod_id::u32;
+
+    val generics: ast.NodeId = ast.fun_generics(?m.store, node_id);
+    if (generics::u32 != ast.NODE_NIL::u32) {
+        sym.is_generic   = true;
+        sym.generic_node = generics;
+    }
+}
+
+fun collect_type_decl(s: *sema.Sema, mod_id: module.ModuleId,
+                      node_id: ast.NodeId, is_public: bool) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val name_str_id: ast.StrId = ast.type_decl_name(?m.store, node_id);
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    val sym_id: scope.SymbolId = scope.define(s.symbols, name, scope.SK_TYPE);
+    if (sym_id::u32 == scope.SYM_NIL::u32) {
+        emit_error(s, mod_id, node_id, "duplicate type name");
+        ret;
+    }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    sym.decl_node = node_id;
+    sym.is_public = is_public;
+    sym.module    = mod_id::u32;
+
+    val generics: ast.NodeId = ast.type_decl_generics(?m.store, node_id);
+    if (generics::u32 != ast.NODE_NIL::u32) {
+        sym.is_generic   = true;
+        sym.generic_node = generics;
+    }
+}
+
+fun collect_var(s: *sema.Sema, mod_id: module.ModuleId,
+                node_id: ast.NodeId, is_public: bool, is_mutable: bool) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val name_str_id: ast.StrId = ast.var_name(?m.store, node_id);
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    var sk: scope.SymbolKind = scope.SK_VAL;
+    if (is_mutable) {
+        sk = scope.SK_VAR;
+    }
+
+    val sym_id: scope.SymbolId = scope.define(s.symbols, name, sk);
+    if (sym_id::u32 == scope.SYM_NIL::u32) {
+        emit_error(s, mod_id, node_id, "duplicate symbol");
+        ret;
+    }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    sym.decl_node  = node_id;
+    sym.is_public  = is_public;
+    sym.is_mutable = is_mutable;
+    sym.module     = mod_id::u32;
+}
+
+fun collect_def(s: *sema.Sema, mod_id: module.ModuleId,
+                node_id: ast.NodeId, is_public: bool) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+    val name_str_id: ast.StrId = ast.get_extra(?m.store, node.payload)::ast.StrId;
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    val sym_id: scope.SymbolId = scope.define(s.symbols, name, scope.SK_TYPE);
+    if (sym_id::u32 == scope.SYM_NIL::u32) {
+        emit_error(s, mod_id, node_id, "duplicate type alias");
+        ret;
+    }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    sym.decl_node = node_id;
+    sym.is_public = is_public;
+    sym.module    = mod_id::u32;
+}
+
+fun collect_ext(s: *sema.Sema, mod_id: module.ModuleId,
+                node_id: ast.NodeId, is_public: bool) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+    val name_str_id: ast.StrId = ast.get_extra(?m.store, node.payload + 1)::ast.StrId;
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    val sym_id: scope.SymbolId = scope.define(s.symbols, name, scope.SK_EXT);
+    if (sym_id::u32 == scope.SYM_NIL::u32) {
+        emit_error(s, mod_id, node_id, "duplicate external symbol");
+        ret;
+    }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    sym.decl_node   = node_id;
+    sym.is_public   = is_public;
+    sym.module      = mod_id::u32;
+    sym.export_name = name;
+}
+
+fun collect_fwd(s: *sema.Sema, mod_id: module.ModuleId,
+                node_id: ast.NodeId, is_public: bool) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+    val name_str_id: ast.StrId = ast.get_extra(?m.store, node.payload)::ast.StrId;
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    val sym_id: scope.SymbolId = scope.define(s.symbols, name, scope.SK_FUN);
+    if (sym_id::u32 == scope.SYM_NIL::u32) {
+        emit_error(s, mod_id, node_id, "duplicate forward declaration");
+        ret;
+    }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    sym.decl_node   = node_id;
+    sym.is_public   = is_public;
+    sym.module      = mod_id::u32;
+    sym.export_name = name;
+}
+
+fun collect_comptime_if(s: *sema.Sema, mod_id: module.ModuleId,
+                        node_id: ast.NodeId, is_public: bool) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+
+    val body_id: ast.NodeId = ast.cond_body(?m.store, node_id);
+    if (body_id::u32 != ast.NODE_NIL::u32) {
+        val body_node: &ast.Node = ast.get(?m.store, body_id);
+        if (body_node.kind == ast.NK_STMT_BLOCK) {
+            val body_stmts: ast.NodeSpan = ast.block_stmts(?m.store, body_id);
+            var i: u32 = 0;
+            for (i < body_stmts.len) {
+                val child_id: ast.NodeId = ast.get_extra(?m.store, body_stmts.start + i)::ast.NodeId;
+                collect_decl(s, mod_id, child_id, is_public);
+                i = i + 1;
+            }
+        }
+    }
+
+    val or_chain: ast.NodeId = ast.cond_or_chain(?m.store, node_id);
+    if (or_chain::u32 != ast.NODE_NIL::u32) {
+        collect_comptime_or(s, mod_id, or_chain, is_public);
+    }
+}
+
+fun collect_comptime_or(s: *sema.Sema, mod_id: module.ModuleId,
+                        node_id: ast.NodeId, is_public: bool) {
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+    if (node.kind != ast.NK_COMPTIME_OR) { ret; }
+
+    val body_id: ast.NodeId = ast.cond_body(?m.store, node_id);
+    if (body_id::u32 != ast.NODE_NIL::u32) {
+        val body_node: &ast.Node = ast.get(?m.store, body_id);
+        if (body_node.kind == ast.NK_STMT_BLOCK) {
+            val body_stmts: ast.NodeSpan = ast.block_stmts(?m.store, body_id);
+            var i: u32 = 0;
+            for (i < body_stmts.len) {
+                val child_id: ast.NodeId = ast.get_extra(?m.store, body_stmts.start + i)::ast.NodeId;
+                collect_decl(s, mod_id, child_id, is_public);
+                i = i + 1;
+            }
+        }
+    }
+
+    val or_chain: ast.NodeId = ast.cond_or_chain(?m.store, node_id);
+    if (or_chain::u32 != ast.NODE_NIL::u32) {
+        collect_comptime_or(s, mod_id, or_chain, is_public);
+    }
+}
+
+fun resolve_decl(s: *sema.Sema, mod_id: module.ModuleId,
+                 node_id: ast.NodeId) {
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+
+    if (node.kind == ast.NK_DECL_PUB) {
+        val inner_id: ast.NodeId = ast.get_extra(?m.store, node.payload)::ast.NodeId;
+        resolve_decl(s, mod_id, inner_id);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_FUN) {
+        resolve_fun_decl(s, mod_id, node_id);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_REC) {
+        resolve_rec_decl(s, mod_id, node_id);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_UNI) {
+        resolve_uni_decl(s, mod_id, node_id);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_DEF) {
+        resolve_def_decl(s, mod_id, node_id);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_VAL || node.kind == ast.NK_DECL_VAR) {
+        resolve_var_decl(s, mod_id, node_id);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_EXT) {
+        resolve_ext_decl(s, mod_id, node_id);
+        ret;
+    }
+
+    if (node.kind == ast.NK_DECL_FWD) {
+        ret;
+    }
+
+    if (node.kind == ast.NK_COMPTIME_IF) {
+        resolve_comptime_if(s, mod_id, node_id);
+        ret;
+    }
+}
+
+fun resolve_fun_decl(s: *sema.Sema, mod_id: module.ModuleId,
+                     node_id: ast.NodeId) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val name_str_id: ast.StrId = ast.fun_name(?m.store, node_id);
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    set_current_scope(s, m.scope);
+    val sym_id: scope.SymbolId = scope.lookup(s.symbols, name);
+    if (sym_id::u32 == scope.SYM_NIL::u32) { ret; }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    if (sym.type_id != 0xFFFFFFFF) { ret; }
+    if (sym.is_resolving) {
+        emit_error(s, mod_id, node_id, "circular type reference");
+        sym.type_id = TYPE_ERROR::u32;
+        ret;
+    }
+    sym.is_resolving = true;
+
+    if (sym.is_generic) {
+        sym.is_resolving = false;
+        ret;
+    }
+
+    val params_span: ast.NodeSpan = ast.fun_params(?m.store, node_id);
+    var param_count: u16 = 0;
+    var is_variadic: bool = false;
+    var param_types: *type.TypeId = nil;
+
+    if (params_span.len > 0) {
+        val res_alloc: Result[*type.TypeId, str] = allocator.allocate[type.TypeId](
+            s.alloc, params_span.len::usize);
+        if (is_ok[*type.TypeId, str](res_alloc)) {
+            param_types = unwrap_ok[*type.TypeId, str](res_alloc);
+        }
+
+        var pi: u32 = 0;
+        for (pi < params_span.len) {
+            val param_node_id: ast.NodeId = ast.get_extra(?m.store, params_span.start + pi)::ast.NodeId;
+            val param_node: &ast.Node = ast.get(?m.store, param_node_id);
+
+            val pname_str_id: ast.StrId = ast.get_extra(?m.store, param_node.payload)::ast.StrId;
+            val pname: str = ast.get_str(?m.store, pname_str_id);
+
+            if (str_equals(pname, "...")) {
+                is_variadic = true;
+                pi = pi + 1;
+                cnt;
+            }
+
+            val ptype_node: ast.NodeId = ast.get_extra(?m.store, param_node.payload + 1)::ast.NodeId;
+            val ptype: type.TypeId = resolve_type_expr(s, mod_id, ptype_node);
+
+            if (param_types != nil) {
+                param_types[param_count::u32] = ptype;
+            }
+            param_count = param_count + 1;
+            pi = pi + 1;
+        }
+    }
+
+    val ret_node: ast.NodeId = ast.fun_ret_type(?m.store, node_id);
+    var ret_type: type.TypeId = type.primitive(s.types, type.TK_VOID);
+    if (ret_node::u32 != ast.NODE_NIL::u32) {
+        ret_type = resolve_type_expr(s, mod_id, ret_node);
+    }
+
+    val fun_type: type.TypeId = type.make_function(s.types, param_types, param_count,
+                                                   ret_type, is_variadic);
+    val ft: *type.Type = ?s.types.types[fun_type];
+    ft.name = name;
+
+    sym.type_id = fun_type::u32;
+    sym.is_resolving = false;
+}
+
+fun resolve_rec_decl(s: *sema.Sema, mod_id: module.ModuleId,
+                     node_id: ast.NodeId) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val name_str_id: ast.StrId = ast.type_decl_name(?m.store, node_id);
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    set_current_scope(s, m.scope);
+    val sym_id: scope.SymbolId = scope.lookup(s.symbols, name);
+    if (sym_id::u32 == scope.SYM_NIL::u32) { ret; }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    if (sym.type_id != 0xFFFFFFFF) { ret; }
+    if (sym.is_resolving) {
+        emit_error(s, mod_id, node_id, "circular type reference");
+        sym.type_id = TYPE_ERROR::u32;
+        ret;
+    }
+
+    if (sym.is_generic) { ret; }
+
+    sym.is_resolving = true;
+
+    val rec_type: type.TypeId = type.add(s.types, type.TK_RECORD);
+    val rt: *type.Type = ?s.types.types[rec_type];
+    rt.name     = name;
+    rt.decl_sym = sym_id::u32;
+    sym.type_id = rec_type::u32;
+
+    val fields_span: ast.NodeSpan = ast.type_decl_fields(?m.store, node_id);
+    if (fields_span.len > 0) {
+        val res_alloc: Result[*type.TypeField, str] = allocator.allocate[type.TypeField](
+            s.alloc, fields_span.len::usize);
+        if (is_ok[*type.TypeField, str](res_alloc)) {
+            val fields: *type.TypeField = unwrap_ok[*type.TypeField, str](res_alloc);
+
+            var fi: u32 = 0;
+            for (fi < fields_span.len) {
+                val field_node_id: ast.NodeId = ast.get_extra(?m.store, fields_span.start + fi)::ast.NodeId;
+                val field_node: &ast.Node = ast.get(?m.store, field_node_id);
+
+                val fname_str_id: ast.StrId = ast.get_extra(?m.store, field_node.payload)::ast.StrId;
+                val fname: str = ast.get_str(?m.store, fname_str_id);
+                val ftype_node: ast.NodeId = ast.get_extra(?m.store, field_node.payload + 1)::ast.NodeId;
+                val ftype: type.TypeId = resolve_type_expr(s, mod_id, ftype_node);
+
+                fields[fi].name    = fname;
+                fields[fi].type_id = ftype;
+                fields[fi].offset  = 0;
+                fi = fi + 1;
+            }
+
+            val rt2: *type.Type = ?s.types.types[rec_type];
+            rt2.fields      = fields;
+            rt2.field_count = fields_span.len::u16;
+        }
+    }
+
+    type.compute_record_layout(s.types, rec_type);
+    sym.is_resolving = false;
+}
+
+fun resolve_uni_decl(s: *sema.Sema, mod_id: module.ModuleId,
+                     node_id: ast.NodeId) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val name_str_id: ast.StrId = ast.type_decl_name(?m.store, node_id);
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    set_current_scope(s, m.scope);
+    val sym_id: scope.SymbolId = scope.lookup(s.symbols, name);
+    if (sym_id::u32 == scope.SYM_NIL::u32) { ret; }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    if (sym.type_id != 0xFFFFFFFF) { ret; }
+    if (sym.is_resolving) {
+        emit_error(s, mod_id, node_id, "circular type reference");
+        sym.type_id = TYPE_ERROR::u32;
+        ret;
+    }
+
+    if (sym.is_generic) { ret; }
+
+    sym.is_resolving = true;
+
+    val uni_type: type.TypeId = type.add(s.types, type.TK_UNION);
+    val ut: *type.Type = ?s.types.types[uni_type];
+    ut.name     = name;
+    ut.decl_sym = sym_id::u32;
+    sym.type_id = uni_type::u32;
+
+    val fields_span: ast.NodeSpan = ast.type_decl_fields(?m.store, node_id);
+    if (fields_span.len > 0) {
+        val res_alloc: Result[*type.TypeField, str] = allocator.allocate[type.TypeField](
+            s.alloc, fields_span.len::usize);
+        if (is_ok[*type.TypeField, str](res_alloc)) {
+            val fields: *type.TypeField = unwrap_ok[*type.TypeField, str](res_alloc);
+
+            var fi: u32 = 0;
+            for (fi < fields_span.len) {
+                val field_node_id: ast.NodeId = ast.get_extra(?m.store, fields_span.start + fi)::ast.NodeId;
+                val field_node: &ast.Node = ast.get(?m.store, field_node_id);
+
+                val fname_str_id: ast.StrId = ast.get_extra(?m.store, field_node.payload)::ast.StrId;
+                val fname: str = ast.get_str(?m.store, fname_str_id);
+                val ftype_node: ast.NodeId = ast.get_extra(?m.store, field_node.payload + 1)::ast.NodeId;
+                val ftype: type.TypeId = resolve_type_expr(s, mod_id, ftype_node);
+
+                fields[fi].name    = fname;
+                fields[fi].type_id = ftype;
+                fields[fi].offset  = 0;
+                fi = fi + 1;
+            }
+
+            val ut2: *type.Type = ?s.types.types[uni_type];
+            ut2.fields      = fields;
+            ut2.field_count = fields_span.len::u16;
+        }
+    }
+
+    type.compute_union_layout(s.types, uni_type);
+    sym.is_resolving = false;
+}
+
+fun resolve_def_decl(s: *sema.Sema, mod_id: module.ModuleId,
+                     node_id: ast.NodeId) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+    val name_str_id: ast.StrId = ast.get_extra(?m.store, node.payload)::ast.StrId;
+    val name: str = ast.get_str(?m.store, name_str_id);
+    val target_node: ast.NodeId = ast.get_extra(?m.store, node.payload + 1)::ast.NodeId;
+
+    set_current_scope(s, m.scope);
+    val sym_id: scope.SymbolId = scope.lookup(s.symbols, name);
+    if (sym_id::u32 == scope.SYM_NIL::u32) { ret; }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    if (sym.type_id != 0xFFFFFFFF) { ret; }
+    if (sym.is_resolving) {
+        emit_error(s, mod_id, node_id, "circular type alias");
+        sym.type_id = TYPE_ERROR::u32;
+        ret;
+    }
+    sym.is_resolving = true;
+
+    val target_type: type.TypeId = resolve_type_expr(s, mod_id, target_node);
+    val alias_type: type.TypeId = type.make_alias(s.types, name, target_type);
+    val at: *type.Type = ?s.types.types[alias_type];
+    at.decl_sym = sym_id::u32;
+
+    sym.type_id = alias_type::u32;
+    sym.is_resolving = false;
+}
+
+fun resolve_var_decl(s: *sema.Sema, mod_id: module.ModuleId,
+                     node_id: ast.NodeId) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val name_str_id: ast.StrId = ast.var_name(?m.store, node_id);
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    set_current_scope(s, m.scope);
+    val sym_id: scope.SymbolId = scope.lookup(s.symbols, name);
+    if (sym_id::u32 == scope.SYM_NIL::u32) { ret; }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    if (sym.type_id != 0xFFFFFFFF) { ret; }
+
+    val type_node: ast.NodeId = ast.var_type_node(?m.store, node_id);
+    if (type_node::u32 != ast.NODE_NIL::u32) {
+        val resolved: type.TypeId = resolve_type_expr(s, mod_id, type_node);
+        sym.type_id = resolved::u32;
+    }
+}
+
+fun resolve_ext_decl(s: *sema.Sema, mod_id: module.ModuleId,
+                     node_id: ast.NodeId) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+
+    val name_str_id: ast.StrId = ast.get_extra(?m.store, node.payload + 1)::ast.StrId;
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    set_current_scope(s, m.scope);
+    val sym_id: scope.SymbolId = scope.lookup(s.symbols, name);
+    if (sym_id::u32 == scope.SYM_NIL::u32) { ret; }
+
+    val sym: *scope.Symbol = scope.get_sym_mut(s.symbols, sym_id);
+    if (sym.type_id != 0xFFFFFFFF) { ret; }
+    if (sym.is_resolving) {
+        emit_error(s, mod_id, node_id, "circular type reference in ext");
+        sym.type_id = TYPE_ERROR::u32;
+        ret;
+    }
+    sym.is_resolving = true;
+
+    val params_start: u32 = ast.get_extra(?m.store, node.payload + 2);
+    val params_len: u32   = ast.get_extra(?m.store, node.payload + 3);
+    val ret_node: ast.NodeId = ast.get_extra(?m.store, node.payload + 4)::ast.NodeId;
+
+    var param_count: u16 = 0;
+    var is_variadic: bool = false;
+    var param_types: *type.TypeId = nil;
+
+    if (params_len > 0) {
+        val res_alloc: Result[*type.TypeId, str] = allocator.allocate[type.TypeId](
+            s.alloc, params_len::usize);
+        if (is_ok[*type.TypeId, str](res_alloc)) {
+            param_types = unwrap_ok[*type.TypeId, str](res_alloc);
+        }
+
+        var pi: u32 = 0;
+        for (pi < params_len) {
+            val param_node_id: ast.NodeId = ast.get_extra(?m.store, params_start + pi)::ast.NodeId;
+            val param_node: &ast.Node = ast.get(?m.store, param_node_id);
+
+            val pname_str_id: ast.StrId = ast.get_extra(?m.store, param_node.payload)::ast.StrId;
+            val pname: str = ast.get_str(?m.store, pname_str_id);
+
+            if (str_equals(pname, "...")) {
+                is_variadic = true;
+                pi = pi + 1;
+                cnt;
+            }
+
+            val ptype_node: ast.NodeId = ast.get_extra(?m.store, param_node.payload + 1)::ast.NodeId;
+            val ptype: type.TypeId = resolve_type_expr(s, mod_id, ptype_node);
+
+            if (param_types != nil) {
+                param_types[param_count::u32] = ptype;
+            }
+            param_count = param_count + 1;
+            pi = pi + 1;
+        }
+    }
+
+    var ret_type: type.TypeId = type.primitive(s.types, type.TK_VOID);
+    if (ret_node::u32 != ast.NODE_NIL::u32) {
+        ret_type = resolve_type_expr(s, mod_id, ret_node);
+    }
+
+    val fun_type: type.TypeId = type.make_function(s.types, param_types, param_count,
+                                                   ret_type, is_variadic);
+    val ft: *type.Type = ?s.types.types[fun_type];
+    ft.name = name;
+
+    sym.type_id = fun_type::u32;
+    sym.is_resolving = false;
+}
+
+fun resolve_comptime_if(s: *sema.Sema, mod_id: module.ModuleId,
+                        node_id: ast.NodeId) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+
+    val body_id: ast.NodeId = ast.cond_body(?m.store, node_id);
+    if (body_id::u32 != ast.NODE_NIL::u32) {
+        val body_node: &ast.Node = ast.get(?m.store, body_id);
+        if (body_node.kind == ast.NK_STMT_BLOCK) {
+            val stmts: ast.NodeSpan = ast.block_stmts(?m.store, body_id);
+            var i: u32 = 0;
+            for (i < stmts.len) {
+                val child_id: ast.NodeId = ast.get_extra(?m.store, stmts.start + i)::ast.NodeId;
+                resolve_decl(s, mod_id, child_id);
+                i = i + 1;
+            }
+        }
+    }
+
+    val or_chain: ast.NodeId = ast.cond_or_chain(?m.store, node_id);
+    if (or_chain::u32 != ast.NODE_NIL::u32) {
+        resolve_comptime_or(s, mod_id, or_chain);
+    }
+}
+
+fun resolve_comptime_or(s: *sema.Sema, mod_id: module.ModuleId,
+                        node_id: ast.NodeId) {
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+    if (node.kind != ast.NK_COMPTIME_OR) { ret; }
+
+    val body_id: ast.NodeId = ast.cond_body(?m.store, node_id);
+    if (body_id::u32 != ast.NODE_NIL::u32) {
+        val body_node: &ast.Node = ast.get(?m.store, body_id);
+        if (body_node.kind == ast.NK_STMT_BLOCK) {
+            val stmts: ast.NodeSpan = ast.block_stmts(?m.store, body_id);
+            var i: u32 = 0;
+            for (i < stmts.len) {
+                val child_id: ast.NodeId = ast.get_extra(?m.store, stmts.start + i)::ast.NodeId;
+                resolve_decl(s, mod_id, child_id);
+                i = i + 1;
+            }
+        }
+    }
+
+    val or_chain: ast.NodeId = ast.cond_or_chain(?m.store, node_id);
+    if (or_chain::u32 != ast.NODE_NIL::u32) {
+        resolve_comptime_or(s, mod_id, or_chain);
+    }
+}
+
+fun resolve_type_name(s: *sema.Sema, mod_id: module.ModuleId,
+                      node_id: ast.NodeId) type.TypeId {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+
+    val name_str_id: ast.StrId = ast.get_extra(?m.store, node.payload)::ast.StrId;
+    val name: str = ast.get_str(?m.store, name_str_id);
+
+    if (name == nil) {
+        ret TYPE_ERROR;
+    }
+
+    if (str_equals(name, "str")) {
+        val u8_type: type.TypeId = type.primitive_by_name(s.types, "u8");
+        ret type.make_pointer(s.types, u8_type, false);
+    }
+    if (str_equals(name, "char")) {
+        ret type.primitive_by_name(s.types, "u8");
+    }
+    if (str_equals(name, "usize")) {
+        ret type.primitive_by_name(s.types, "u64");
+    }
+    if (str_equals(name, "isize")) {
+        ret type.primitive_by_name(s.types, "i64");
+    }
+
+    val prim: type.TypeId = type.primitive_by_name(s.types, name);
+    if (prim::u32 != type.TYPE_NIL::u32) {
+        ret prim;
+    }
+
+    val sym_id: scope.SymbolId = lookup_symbol(s, mod_id, name);
+    if (sym_id::u32 == scope.SYM_NIL::u32) {
+        emit_error(s, mod_id, node_id, "unknown type");
+        ret TYPE_ERROR;
+    }
+
+    val sym: &scope.Symbol = scope.get_sym(s.symbols, sym_id);
+
+    if (sym.type_id == 0xFFFFFFFF) {
+        ensure_symbol_resolved(s, sym_id);
+    }
+
+    val sym2: &scope.Symbol = scope.get_sym(s.symbols, sym_id);
+    if (sym2.type_id == 0xFFFFFFFF || sym2.type_id == TYPE_ERROR::u32) {
+        ret TYPE_ERROR;
+    }
+
+    ret sym2.type_id::type.TypeId;
+}
+
+fun resolve_type_array(s: *sema.Sema, mod_id: module.ModuleId,
+                       node_id: ast.NodeId) type.TypeId {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+
+    val count_node: ast.NodeId = ast.get_extra(?m.store, node.payload)::ast.NodeId;
+    val elem_node: ast.NodeId  = ast.get_extra(?m.store, node.payload + 1)::ast.NodeId;
+
+    val elem_type: type.TypeId = resolve_type_expr(s, mod_id, elem_node);
+    if (elem_type::u32 == type.TYPE_NIL::u32 || elem_type::u32 == TYPE_ERROR::u32) {
+        ret TYPE_ERROR;
+    }
+
+    var array_len: u32 = 0;
+    if (count_node::u32 != ast.NODE_NIL::u32) {
+        val count_nd: &ast.Node = ast.get(?m.store, count_node);
+        if (count_nd.kind == ast.NK_EXPR_LIT_INT) {
+            val text_str_id: ast.StrId = ast.get_extra(?m.store, count_nd.payload)::ast.StrId;
+            val text: str = ast.get_str(?m.store, text_str_id);
+            array_len = parse_u32_literal(text);
+        } or {
+            val res_eval: Result[i64, str] = comptime.eval_int(s, mod_id, count_node);
+            if (is_ok[i64, str](res_eval)) {
+                val v: i64 = unwrap_ok[i64, str](res_eval);
+                if (v >= 0) {
+                    array_len = v::u32;
+                }
+            } or {
+                emit_error(s, mod_id, count_node, "array size must be a compile-time integer");
+                ret TYPE_ERROR;
+            }
+        }
+    }
+
+    ret type.make_array(s.types, elem_type, array_len);
+}
+
+fun resolve_type_fun(s: *sema.Sema, mod_id: module.ModuleId,
+                     node_id: ast.NodeId) type.TypeId {
+    val m: &module.Module = module.get(s.modules, mod_id);
+    val node: &ast.Node = ast.get(?m.store, node_id);
+
+    val params_start: u32 = ast.get_extra(?m.store, node.payload);
+    val params_len: u32   = ast.get_extra(?m.store, node.payload + 1);
+    val ret_node: ast.NodeId = ast.get_extra(?m.store, node.payload + 2)::ast.NodeId;
+
+    var param_count: u16 = 0;
+    var is_variadic: bool = false;
+    var param_types: *type.TypeId = nil;
+
+    if (params_len > 0) {
+        val res_alloc: Result[*type.TypeId, str] = allocator.allocate[type.TypeId](
+            s.alloc, params_len::usize);
+        if (is_ok[*type.TypeId, str](res_alloc)) {
+            param_types = unwrap_ok[*type.TypeId, str](res_alloc);
+        }
+
+        var pi: u32 = 0;
+        for (pi < params_len) {
+            val param_node_id: ast.NodeId = ast.get_extra(?m.store, params_start + pi)::ast.NodeId;
+            val param_node: &ast.Node = ast.get(?m.store, param_node_id);
+
+            val pname_str_id: ast.StrId = ast.get_extra(?m.store, param_node.payload)::ast.StrId;
+            val pname: str = ast.get_str(?m.store, pname_str_id);
+
+            if (str_equals(pname, "...")) {
+                is_variadic = true;
+                pi = pi + 1;
+                cnt;
+            }
+
+            val ptype_node: ast.NodeId = ast.get_extra(?m.store, param_node.payload + 1)::ast.NodeId;
+            val ptype: type.TypeId = resolve_type_expr(s, mod_id, ptype_node);
+
+            if (param_types != nil) {
+                param_types[param_count::u32] = ptype;
+            }
+            param_count = param_count + 1;
+            pi = pi + 1;
+        }
+    }
+
+    var ret_type: type.TypeId = type.primitive(s.types, type.TK_VOID);
+    if (ret_node::u32 != ast.NODE_NIL::u32) {
+        ret_type = resolve_type_expr(s, mod_id, ret_node);
+    }
+
+    ret type.make_function(s.types, param_types, param_count, ret_type, is_variadic);
+}
+
+fun ensure_symbol_resolved(s: *sema.Sema, sym_id: scope.SymbolId) {
+    val sym: &scope.Symbol = scope.get_sym(s.symbols, sym_id);
+    if (sym.type_id != 0xFFFFFFFF) { ret; }
+    if (sym.is_resolving) { ret; }
+    if (sym.decl_node::u32 == ast.NODE_NIL::u32) { ret; }
+    if (sym.module == 0xFFFFFFFF) { ret; }
+
+    val decl_mod: module.ModuleId = sym.module::module.ModuleId;
+    val decl_node: ast.NodeId = sym.decl_node;
+    val dm: &module.Module = module.get(s.modules, decl_mod);
+    val dn: &ast.Node = ast.get(?dm.store, decl_node);
+
+    val saved_scope: scope.ScopeId = scope.current_scope(s.symbols);
+
+    if (dn.kind == ast.NK_DECL_FUN) {
+        resolve_fun_decl(s, decl_mod, decl_node);
+    }
+    if (dn.kind == ast.NK_DECL_REC) {
+        resolve_rec_decl(s, decl_mod, decl_node);
+    }
+    if (dn.kind == ast.NK_DECL_UNI) {
+        resolve_uni_decl(s, decl_mod, decl_node);
+    }
+    if (dn.kind == ast.NK_DECL_DEF) {
+        resolve_def_decl(s, decl_mod, decl_node);
+    }
+    if (dn.kind == ast.NK_DECL_EXT) {
+        resolve_ext_decl(s, decl_mod, decl_node);
+    }
+    if (dn.kind == ast.NK_DECL_VAL || dn.kind == ast.NK_DECL_VAR) {
+        resolve_var_decl(s, decl_mod, decl_node);
+    }
+
+    set_current_scope(s, saved_scope);
+}
+
+fun lookup_dotted(s: *sema.Sema, mod_id: module.ModuleId,
+                  name: str) scope.SymbolId {
+    val res_dot: Result[usize, str] = str_index_char(name, '.');
+    if (is_err[usize, str](res_dot)) {
+        ret scope.SYM_NIL;
+    }
+    val dot_pos: usize = unwrap_ok[usize, str](res_dot);
+
+    var prefix_buf: [256]u8;
+    var pi: usize = 0;
+    for (pi < dot_pos && pi < 255) {
+        prefix_buf[pi] = name[pi];
+        pi = pi + 1;
+    }
+    prefix_buf[pi] = 0;
+    val prefix: str = ?prefix_buf[0]::str;
+
+    val suffix: str = (name::usize + dot_pos + 1)::str;
+
+    val target_mod: module.ModuleId = module.resolve_alias(s.modules, mod_id, prefix);
+    if (target_mod::u32 != module.MOD_NIL::u32) {
+        val tm: &module.Module = module.get(s.modules, target_mod);
+        if (tm.scope::u32 != scope.SCOPE_NIL::u32) {
+            if (str_contains_char(suffix, '.')) {
+                ret lookup_dotted(s, target_mod, suffix);
+            }
+            val found: scope.SymbolId = scope.lookup_local(s.symbols, tm.scope, suffix);
+            if (found::u32 != scope.SYM_NIL::u32) {
+                val sym: &scope.Symbol = scope.get_sym(s.symbols, found);
+                if (sym.is_public) {
+                    ensure_symbol_resolved(s, found);
+                    ret found;
+                }
+            }
+        }
+    }
+
+    val direct_mod: module.ModuleId = module.find(s.modules, prefix);
+    if (direct_mod::u32 != module.MOD_NIL::u32 && direct_mod::u32 != mod_id::u32) {
+        val dm: &module.Module = module.get(s.modules, direct_mod);
+        if (dm.scope::u32 != scope.SCOPE_NIL::u32) {
+            val found: scope.SymbolId = scope.lookup_local(s.symbols, dm.scope, suffix);
+            if (found::u32 != scope.SYM_NIL::u32) {
+                val sym: &scope.Symbol = scope.get_sym(s.symbols, found);
+                if (sym.is_public) {
+                    ensure_symbol_resolved(s, found);
+                    ret found;
+                }
+            }
+        }
+    }
+
     ret scope.SYM_NIL;
+}
+
+fun lookup_in_imports(s: *sema.Sema, mod_id: module.ModuleId,
+                      name: str) scope.SymbolId {
+    val m: &module.Module = module.get(s.modules, mod_id);
+
+    var i: u32 = 0;
+    for (i < m.import_count) {
+        val imp_mod: module.ModuleId = m.imports[i];
+        val im: &module.Module = module.get(s.modules, imp_mod);
+
+        if (im.scope::u32 == scope.SCOPE_NIL::u32) {
+            i = i + 1;
+            cnt;
+        }
+
+        val found: scope.SymbolId = scope.lookup_local(s.symbols, im.scope, name);
+        if (found::u32 != scope.SYM_NIL::u32) {
+            val sym: &scope.Symbol = scope.get_sym(s.symbols, found);
+            if (sym.is_public) {
+                ensure_symbol_resolved(s, found);
+                ret found;
+            }
+        }
+
+        i = i + 1;
+    }
+
+    ret scope.SYM_NIL;
+}
+
+fun set_current_scope(s: *sema.Sema, target: scope.ScopeId) {
+    if (target::u32 == scope.SCOPE_NIL::u32) { ret; }
+    s.symbols.current = target;
+}
+
+fun emit_error(s: *sema.Sema, mod_id: module.ModuleId,
+               node_id: ast.NodeId, msg: str) {
+    val m: &module.Module = module.get(s.modules, mod_id);
+
+    var loc: diag.SourceLoc;
+    loc.file   = m.file_path;
+    loc.line   = 0;
+    loc.col    = 0;
+    loc.offset = 0;
+    loc.len    = 0;
+
+    if (node_id::u32 != ast.NODE_NIL::u32) {
+        val node: &ast.Node = ast.get(?m.store, node_id);
+        if (node.tok_idx < m.tokens.count) {
+            val tok_offset: u32 = m.tokens.tokens[node.tok_idx].span.offset;
+            loc.offset = tok_offset;
+            loc.len    = m.tokens.tokens[node.tok_idx].span.len;
+            if (m.source != nil) {
+                loc.line = lexer.line_of(m.source, tok_offset);
+                loc.col  = lexer.col_of(m.source, tok_offset);
+            }
+        }
+    }
+
+    diag.error(s.diag, loc, msg);
+}
+
+fun parse_u32_literal(text: str) u32 {
+    if (text == nil) { ret 0; }
+
+    var result: u32 = 0;
+    var i: usize = 0;
+
+    if (text[0] == '0' && text[1] == 'x') {
+        i = 2;
+        for (text[i] != 0) {
+            val c: u8 = text[i];
+            if (c == '_') { i = i + 1; cnt; }
+            if (c >= 'a' && c <= 'f') {
+                result = result * 16 + (c - 'a' + 10)::u32;
+            }
+            or (c >= 'A' && c <= 'F') {
+                result = result * 16 + (c - 'A' + 10)::u32;
+            }
+            or (c >= '0' && c <= '9') {
+                result = result * 16 + (c - '0')::u32;
+            }
+            or { ret result; }
+            i = i + 1;
+        }
+        ret result;
+    }
+
+    if (text[0] == '0' && text[1] == 'b') {
+        i = 2;
+        for (text[i] != 0) {
+            val c: u8 = text[i];
+            if (c == '_') { i = i + 1; cnt; }
+            if (c == '0' || c == '1') {
+                result = result * 2 + (c - '0')::u32;
+            } or { ret result; }
+            i = i + 1;
+        }
+        ret result;
+    }
+
+    if (text[0] == '0' && text[1] == 'o') {
+        i = 2;
+        for (text[i] != 0) {
+            val c: u8 = text[i];
+            if (c == '_') { i = i + 1; cnt; }
+            if (c >= '0' && c <= '7') {
+                result = result * 8 + (c - '0')::u32;
+            } or { ret result; }
+            i = i + 1;
+        }
+        ret result;
+    }
+
+    for (text[i] != 0) {
+        val c: u8 = text[i];
+        if (c == '_') { i = i + 1; cnt; }
+        if (c >= '0' && c <= '9') {
+            result = result * 10 + (c - '0')::u32;
+        } or { ret result; }
+        i = i + 1;
+    }
+
+    ret result;
 }
