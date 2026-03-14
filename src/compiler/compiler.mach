@@ -9,9 +9,21 @@ use std.types.string;
 use std.types.result;
 
 use allocator: std.allocator;
+use fs:        std.filesystem;
+use print:     std.print;
 
 use session: compiler.session;
 use target:  compiler.target.target;
+use diag:    compiler.diag;
+use sema:    compiler.sema.sema;
+use module:  compiler.sema.module;
+use lower:   compiler.lower.lower;
+use codegen: compiler.codegen;
+use linker:  compiler.linker;
+use pass:    compiler.opt.pass;
+use project: config.project;
+
+use masm_mod: masm.module;
 
 # compile_project: compile a mach project from its root directory.
 #
@@ -29,6 +41,181 @@ pub fun compile_project(alloc: &allocator.Allocator, project_path: str, target_n
     result.obj_paths = nil;
     result.obj_count = 0;
     result.binary    = nil;
+
+    val toml_path: str = project_path;
+    val res_load: Result[project.ProjectConfig, str] = project.load(alloc, toml_path);
+    if (is_err[project.ProjectConfig, str](res_load)) {
+        print.eprintf("error: failed to load mach.toml: %s\n", unwrap_err[project.ProjectConfig, str](res_load));
+        ret result;
+    }
+    var config: project.ProjectConfig = unwrap_ok[project.ProjectConfig, str](res_load);
+
+    var tc: *project.TargetConfig = nil;
+    if (target_name != nil) {
+        tc = project.find_target(?config, target_name);
+        if (tc == nil) {
+            print.eprintf("error: target '%s' not found in mach.toml\n", target_name);
+            project.dnit(?config);
+            ret result;
+        }
+    } or {
+        if (config.default_target != nil) {
+            tc = project.find_target(?config, config.default_target);
+        }
+        if (tc == nil && config.target_count > 0) {
+            tc = ?config.targets[0];
+        }
+        if (tc == nil) {
+            print.eprintf("error: no target configured in mach.toml\n");
+            project.dnit(?config);
+            ret result;
+        }
+    }
+
+    var arch: str = "x86_64";
+    var os_name: str = "linux";
+    var abi_name: str = "sysv64";
+    var fmt: str = "elf";
+    if (tc.isa != nil) { arch = tc.isa; }
+    if (tc.os != nil) { os_name = tc.os; }
+    if (tc.abi != nil) { abi_name = tc.abi; }
+
+    val res_target: Result[target.Target, str] = target.select(arch, os_name, abi_name, fmt, alloc);
+    if (is_err[target.Target, str](res_target)) {
+        print.eprintf("error: failed to select target: %s\n", unwrap_err[target.Target, str](res_target));
+        project.dnit(?config);
+        ret result;
+    }
+    var tgt: target.Target = unwrap_ok[target.Target, str](res_target);
+
+    var sess: session.Session = session.init(alloc, opts);
+
+    var entrypoint: str = tc.entrypoint;
+    if (entrypoint == nil) {
+        print.eprintf("error: no entrypoint specified in target config\n");
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        project.dnit(?config);
+        ret result;
+    }
+
+    val res_source: Result[str, str] = fs.read_all(alloc, entrypoint);
+    if (is_err[str, str](res_source)) {
+        print.eprintf("error: failed to read entrypoint '%s': %s\n", entrypoint, unwrap_err[str, str](res_source));
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        project.dnit(?config);
+        ret result;
+    }
+    val source: str = unwrap_ok[str, str](res_source);
+
+    var modules: module.ModuleTable = module.init(alloc);
+    val root_id: module.ModuleId = module.create(?modules, config.id, entrypoint, source);
+    if (root_id::u32 == module.MOD_NIL::u32) {
+        print.eprintf("error: failed to create root module\n");
+        module.dnit(?modules);
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        project.dnit(?config);
+        ret result;
+    }
+
+    var src_root: str = config.dir_src;
+    if (src_root == nil) { src_root = "src"; }
+    var dep_root: str = config.dir_dep;
+    if (dep_root == nil) { dep_root = "dep"; }
+
+    module.load_graph(?modules, root_id, src_root, dep_root, config.id);
+
+    if (!module.topo_sort(?modules)) {
+        print.eprintf("error: cyclic module dependency detected\n");
+        module.dnit(?modules);
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        project.dnit(?config);
+        ret result;
+    }
+
+    var dl: diag.DiagList = diag.init(alloc::*allocator.Allocator);
+    var sa: sema.Sema = sema.init(alloc, ?modules, ?dl, ?sess.strings, tgt.ptr_size::u32);
+
+    sema.analyze(?sa);
+    if (diag.had_errors(?dl)) {
+        diag.print_terminal(?dl, nil);
+        sema.dnit(?sa);
+        diag.dnit(?dl);
+        module.dnit(?modules);
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        project.dnit(?config);
+        ret result;
+    }
+
+    var builder: masm_mod.ModuleBuilder = masm_mod.builder_init(alloc::*allocator.Allocator);
+    val res_lower: Result[lower.LowerContext, str] = lower.init(
+        alloc::*allocator.Allocator, ?tgt::ptr, ?builder, ?sa
+    );
+    if (is_err[lower.LowerContext, str](res_lower)) {
+        print.eprintf("error: failed to initialize lowering: %s\n", unwrap_err[lower.LowerContext, str](res_lower));
+        sema.dnit(?sa);
+        diag.dnit(?dl);
+        module.dnit(?modules);
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        project.dnit(?config);
+        ret result;
+    }
+    var lctx: lower.LowerContext = unwrap_ok[lower.LowerContext, str](res_lower);
+
+    var mi: u32 = 0;
+    for (mi < module.order_count(?modules)) {
+        val mod_id: module.ModuleId = module.order_at(?modules, mi);
+        lower.lower_module(?lctx, mod_id);
+        mi = mi + 1;
+    }
+
+    var ir_module: masm_mod.Module = masm_mod.build(?builder);
+
+    var pipeline: pass.PassPipeline = pass.default_pipeline(alloc, opts.opt_level);
+
+    var fi: usize = 0;
+    for (fi < ir_module.functions.len) {
+        val fn_ptr: ptr = ir_module.functions.data[fi]::ptr;
+        if (fn_ptr != nil) {
+            val cg_result: codegen.CodegenResult = codegen.compile_function(
+                ir_module.functions.data[fi], 0, ?tgt, ?pipeline, alloc, ?tgt.of.obj
+            );
+            if (!cg_result.ok) {
+                print.eprintf("error: codegen failed for function %d\n", fi::i64);
+            }
+        }
+        fi = fi + 1;
+    }
+
+    var binary_path: str = tc.binary;
+    if (binary_path == nil) { binary_path = "a.out"; }
+
+    val link_result: linker.LinkResult = linker.link(alloc, result.obj_paths, result.obj_count, binary_path, ?tgt);
+    if (!link_result.ok) {
+        if (link_result.error != nil) {
+            print.eprintf("error: link failed: %s\n", link_result.error);
+        }
+    } or {
+        result.binary = link_result.output_path;
+    }
+
+    result.ok = true;
+
+    pass.dnit(?pipeline);
+    masm_mod.module_dnit(alloc::*allocator.Allocator, ?ir_module);
+    lower.dnit(?lctx);
+    sema.dnit(?sa);
+    diag.dnit(?dl);
+    module.dnit(?modules);
+    session.dnit(?sess);
+    target.dnit(?tgt);
+    project.dnit(?config);
+
     ret result;
 }
 
@@ -45,5 +232,111 @@ pub fun compile_file(alloc: &allocator.Allocator, source_path: str, output_path:
     result.obj_paths = nil;
     result.obj_count = 0;
     result.binary    = nil;
+
+    val res_target: Result[target.Target, str] = target.select_native(alloc);
+    if (is_err[target.Target, str](res_target)) {
+        print.eprintf("error: failed to select native target: %s\n", unwrap_err[target.Target, str](res_target));
+        ret result;
+    }
+    var tgt: target.Target = unwrap_ok[target.Target, str](res_target);
+
+    var sess: session.Session = session.init(alloc, opts);
+
+    val res_source: Result[str, str] = fs.read_all(alloc, source_path);
+    if (is_err[str, str](res_source)) {
+        print.eprintf("error: failed to read '%s': %s\n", source_path, unwrap_err[str, str](res_source));
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        ret result;
+    }
+    val source: str = unwrap_ok[str, str](res_source);
+
+    var modules: module.ModuleTable = module.init(alloc);
+    val root_id: module.ModuleId = module.create(?modules, source_path, source_path, source);
+    if (root_id::u32 == module.MOD_NIL::u32) {
+        print.eprintf("error: failed to create module\n");
+        module.dnit(?modules);
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        ret result;
+    }
+
+    if (!module.topo_sort(?modules)) {
+        print.eprintf("error: topo_sort failed\n");
+        module.dnit(?modules);
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        ret result;
+    }
+
+    var dl: diag.DiagList = diag.init(alloc::*allocator.Allocator);
+    var sa: sema.Sema = sema.init(alloc, ?modules, ?dl, ?sess.strings, tgt.ptr_size::u32);
+
+    sema.analyze(?sa);
+    if (diag.had_errors(?dl)) {
+        diag.print_terminal(?dl, nil);
+        sema.dnit(?sa);
+        diag.dnit(?dl);
+        module.dnit(?modules);
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        ret result;
+    }
+
+    var builder: masm_mod.ModuleBuilder = masm_mod.builder_init(alloc::*allocator.Allocator);
+    val res_lower: Result[lower.LowerContext, str] = lower.init(
+        alloc::*allocator.Allocator, ?tgt::ptr, ?builder, ?sa
+    );
+    if (is_err[lower.LowerContext, str](res_lower)) {
+        print.eprintf("error: failed to initialize lowering: %s\n", unwrap_err[lower.LowerContext, str](res_lower));
+        sema.dnit(?sa);
+        diag.dnit(?dl);
+        module.dnit(?modules);
+        session.dnit(?sess);
+        target.dnit(?tgt);
+        ret result;
+    }
+    var lctx: lower.LowerContext = unwrap_ok[lower.LowerContext, str](res_lower);
+
+    lower.lower_module(?lctx, root_id);
+
+    var ir_module: masm_mod.Module = masm_mod.build(?builder);
+
+    var pipeline: pass.PassPipeline = pass.default_pipeline(alloc, opts.opt_level);
+
+    var fi: usize = 0;
+    for (fi < ir_module.functions.len) {
+        val fn_ptr: ptr = ir_module.functions.data[fi]::ptr;
+        if (fn_ptr != nil) {
+            val cg_result: codegen.CodegenResult = codegen.compile_function(
+                ir_module.functions.data[fi], 0, ?tgt, ?pipeline, alloc, ?tgt.of.obj
+            );
+            if (!cg_result.ok) {
+                print.eprintf("error: codegen failed for function %d\n", fi::i64);
+            }
+        }
+        fi = fi + 1;
+    }
+
+    val link_result: linker.LinkResult = linker.link(alloc, result.obj_paths, result.obj_count, output_path, ?tgt);
+    if (!link_result.ok) {
+        if (link_result.error != nil) {
+            print.eprintf("error: link failed: %s\n", link_result.error);
+        }
+    } or {
+        result.binary = link_result.output_path;
+    }
+
+    result.ok = true;
+
+    pass.dnit(?pipeline);
+    masm_mod.module_dnit(alloc::*allocator.Allocator, ?ir_module);
+    lower.dnit(?lctx);
+    sema.dnit(?sa);
+    diag.dnit(?dl);
+    module.dnit(?modules);
+    session.dnit(?sess);
+    target.dnit(?tgt);
+
     ret result;
 }
