@@ -14,6 +14,7 @@ use pool:  masm.pool;
 
 use ast:   mach.compiler.parse.ast;
 use token: mach.compiler.lex.token;
+use mach.compiler.sema.type;
 use type:  mach.compiler.sema.type;
 
 use lower:    mach.compiler.lower.ctx;
@@ -227,7 +228,8 @@ fun lower_binary(ctx: *lower.LowerContext, node_id: ast.NodeId,
     val lhs: u16 = lower_expr(ctx, lhs_id, store);
     val rhs: u16 = lower_expr(ctx, rhs_id, store);
     val dst: u16 = lower.alloc_vreg(ctx);
-    val sz: u8 = ctx.ptr_size;
+    val lhs_tid: type.TypeId = lower.node_type(ctx, lhs_id);
+    val sz: u8 = lower.type_size(ctx, lhs_tid);
 
     if (op_tag == token.TAG_PLUS::u8) {
         lower.emit(ctx, inst.make_alu(op.OP_ADD, dst, lhs, rhs, sz));
@@ -351,8 +353,10 @@ fun lower_call(ctx: *lower.LowerContext, node_id: ast.NodeId,
     for (i < args.len) {
         val arg_nid: ast.NodeId = ast.get_extra(store, args.start + i)::ast.NodeId;
         val arg_vreg: u16 = lower_expr(ctx, arg_nid, store);
-        val td: u16 = 0xFFFF;
-        lower.emit(ctx, inst.make_arg(i::u8, arg_vreg, td, ctx.ptr_size));
+        val arg_tid: type.TypeId = lower.node_type(ctx, arg_nid);
+        val td: u16 = lower.make_type_desc(ctx, arg_tid);
+        val arg_sz: u8 = lower.type_size(ctx, arg_tid);
+        lower.emit(ctx, inst.make_arg(i::u8, arg_vreg, td, arg_sz));
         i = i + 1;
     }
 
@@ -405,7 +409,32 @@ fun lower_cast(ctx: *lower.LowerContext, node_id: ast.NodeId,
 
     val src: u16 = lower_expr(ctx, operand_id, store);
     val dst: u16 = lower.alloc_vreg(ctx);
-    lower.emit(ctx, inst.make_conv(dst, src, op.CONV_ZEXT, ctx.ptr_size));
+
+    val src_tid: type.TypeId = lower.node_type(ctx, operand_id);
+    val dst_tid: type.TypeId = lower.node_type(ctx, node_id);
+    val dst_sz: u8 = lower.type_size(ctx, dst_tid);
+    val src_sz: u8 = lower.type_size(ctx, src_tid);
+
+    var conv_kind: u8 = op.CONV_ZEXT;
+    if (type.is_float(ctx.sema.types, src_tid) && type.is_integer(ctx.sema.types, dst_tid)) {
+        conv_kind = op.CONV_FTOI;
+    } or (type.is_integer(ctx.sema.types, src_tid) && type.is_float(ctx.sema.types, dst_tid)) {
+        conv_kind = op.CONV_ITOF;
+    } or (type.is_float(ctx.sema.types, src_tid) && type.is_float(ctx.sema.types, dst_tid)) {
+        conv_kind = op.CONV_FEXT;
+        if (dst_sz < src_sz) { conv_kind = op.CONV_FTRUNC; }
+    } or (dst_sz < src_sz) {
+        conv_kind = op.CONV_TRUNC;
+    } or (dst_sz > src_sz) {
+        val src_t: &type.Type = type.get(ctx.sema.types, src_tid);
+        if (src_t.kind >= type.TK_I8 && src_t.kind <= type.TK_I64) {
+            conv_kind = op.CONV_SEXT;
+        } or {
+            conv_kind = op.CONV_ZEXT;
+        }
+    }
+
+    lower.emit(ctx, inst.make_conv(dst, src, conv_kind, dst_sz));
     ret dst;
 }
 
@@ -482,13 +511,35 @@ fun lower_field_lvalue(ctx: *lower.LowerContext, node_id: ast.NodeId,
                        store: &ast.NodeStore) LvalueResult {
     val node: &ast.Node = ast.get(store, node_id);
     val base_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    val field_sid: ast.StrId = ast.get_extra(store, node.payload + 1)::ast.StrId;
+    val field_name: str = ast.get_str(store, field_sid);
 
     val base_lv: LvalueResult = lower_lvalue(ctx, base_id, store);
 
+    val base_tid: type.TypeId = lower.node_type(ctx, base_id);
+    var rec_tid: type.TypeId = base_tid;
+    if (type.is_pointer(ctx.sema.types, base_tid)) {
+        rec_tid = type.get(ctx.sema.types, base_tid).pointee;
+    }
+
+    var field_offset: u32 = 0;
+    var field_size: u8 = ctx.ptr_size;
+    if (field_name != nil && rec_tid::u32 != type.TYPE_NIL::u32) {
+        val fld: *type.TypeField = type.get_field(ctx.sema.types, rec_tid, field_name);
+        if (fld != nil) {
+            field_offset = fld.offset;
+            val fld_tid: type.TypeId = fld.type_id;
+            field_size = lower.type_size(ctx, fld_tid);
+        }
+    }
+
+    val base_disp: i32 = pool.data_get_i32(?ctx.func.data_pool, base_lv.disp_off::i32);
+    val total_disp: i32 = base_disp + field_offset::i32;
+
     var result: LvalueResult;
     result.base_vreg = base_lv.base_vreg;
-    result.disp_off  = base_lv.disp_off;
-    result.size      = ctx.ptr_size;
+    result.disp_off  = lower.intern_disp(ctx, total_disp);
+    result.size      = field_size;
     ret result;
 }
 
@@ -502,7 +553,17 @@ fun lower_index_lvalue(ctx: *lower.LowerContext, node_id: ast.NodeId,
     val base_addr: u16 = lower_expr(ctx, base_id, store);
     val index_vreg: u16 = lower_expr(ctx, index_id, store);
 
-    val elem_size: u8 = ctx.ptr_size;
+    val base_tid: type.TypeId = lower.node_type(ctx, base_id);
+    var elem_tid: type.TypeId = type.TYPE_NIL;
+    if (base_tid::u32 != type.TYPE_NIL::u32) {
+        val bt: &type.Type = type.get(ctx.sema.types, base_tid);
+        if (bt.kind == type.TK_ARRAY) {
+            elem_tid = bt.elem;
+        } or (bt.kind == type.TK_POINTER) {
+            elem_tid = bt.pointee;
+        }
+    }
+    val elem_size: u8 = lower.type_size(ctx, elem_tid);
     val offset: u16 = lower.alloc_vreg(ctx);
     val size_vreg: u16 = lower.alloc_vreg(ctx);
     val sz_disp: u16 = lower.intern_disp(ctx, elem_size::i32);
@@ -587,18 +648,9 @@ fun lower_struct_lit(ctx: *lower.LowerContext, node_id: ast.NodeId,
     val span_start: u32 = ast.get_extra(store, node.payload + 1);
     val span_count: u32 = ast.get_extra(store, node.payload + 2);
 
-    # determine struct size and alignment from the sema type table
     var total_size: usize = ctx.ptr_size::usize;
     var total_align: usize = ctx.ptr_size::usize;
-    var struct_type_id: type.TypeId = type.TYPE_NIL;
-
-    val type_name: str = ast.get_str(store, type_name_sid);
-    if (type_name != nil && ctx.sema != nil && ctx.sema.types != nil) {
-        val tid: type.TypeId = type.primitive_by_name(ctx.sema.types, type_name);
-        if (tid::u32 != type.TYPE_NIL::u32) {
-            struct_type_id = tid;
-        }
-    }
+    var struct_type_id: type.TypeId = lower.node_type(ctx, node_id);
 
     if (struct_type_id::u32 != type.TYPE_NIL::u32) {
         val st: &type.Type = type.get(ctx.sema.types, struct_type_id);
@@ -660,13 +712,20 @@ fun lower_array_lit(ctx: *lower.LowerContext, node_id: ast.NodeId,
                     store: &ast.NodeStore) u16 {
     val node: &ast.Node = ast.get(store, node_id);
 
-    # payload layout: [span_start, span_count]
     val span_start: u32 = ast.get_extra(store, node.payload);
     val span_count: u32 = ast.get_extra(store, node.payload + 1);
 
-    val elem_size: usize = ctx.ptr_size::usize;
+    val arr_tid: type.TypeId = lower.node_type(ctx, node_id);
+    var elem_tid: type.TypeId = type.TYPE_NIL;
+    if (arr_tid::u32 != type.TYPE_NIL::u32) {
+        val at: &type.Type = type.get(ctx.sema.types, arr_tid);
+        if (at.kind == type.TK_ARRAY) {
+            elem_tid = at.elem;
+        }
+    }
+    val elem_size: usize = lower.type_size(ctx, elem_tid)::usize;
     val total_size: usize = elem_size * span_count::usize;
-    val total_align: usize = elem_size;
+    val total_align: usize = lower.type_align(ctx, elem_tid);
 
     if (total_size == 0) {
         val dst: u16 = lower.alloc_vreg(ctx);
