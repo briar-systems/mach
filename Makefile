@@ -5,7 +5,7 @@
 #   3. self-hosted compiler     (imach builds src/ -> out/bin/smach)
 #   4. final compiler           (smach builds src/ -> out/linux/bin/mach)
 
-CMACH_VERSION ?= 0.9.9
+CMACH_VERSION ?= 0.9.10
 CMACH         ?= $(shell command -v cmach 2>/dev/null)
 CMACH_URL      = https://github.com/octalide/mach-boot/releases/download/v$(CMACH_VERSION)/cmach
 
