@@ -1,9 +1,4 @@
 # mach.compiler.codegen: per-function compilation pipeline
-#
-# orchestrates the backend pipeline for a single function. this is the
-# parallelism boundary -- each function is compiled independently through
-# verify, optimize, CFG, liveness, ISel, peephole, regalloc, frame
-# layout, prologue/epilogue, and encoding.
 
 use std.types.bool;
 use std.types.size;
@@ -24,12 +19,6 @@ use pass:     mach.compiler.opt.pass;
 use ra:       mach.compiler.regalloc;
 use x86_defs: mach.compiler.target.isa.x86_64.defs;
 
-# result of compiling a single function
-# ---
-# ok:          true if compilation succeeded
-# spill_size:  bytes consumed by register spill slots
-# callee_mask: bitmask of callee-saved registers used
-# local_size:  bytes of local variables on the stack
 pub rec CodegenResult {
     ok:          bool;
     spill_size:  usize;
@@ -37,27 +26,6 @@ pub rec CodegenResult {
     local_size:  usize;
 }
 
-# compile_function: compile a single MASM IR function through the full backend pipeline.
-#
-# pipeline steps:
-# 1. verify IR structure
-# 2. run optimization passes
-# 3. build CFG
-# 4. compute liveness
-# 5. instruction selection (IR -> machine instructions)
-# 6. peephole optimization
-# 7. register allocation
-# 8. frame layout
-# 9. prologue/epilogue insertion
-# 10. encoding (machine instructions -> bytes)
-# ---
-# func:       MASM IR function to compile
-# local_size: bytes of local variables from lowering
-# tgt:        target descriptor (ISA, ABI, OS, object format)
-# opt:        optimization pipeline to run
-# alloc:      backing allocator
-# obj:        object writer for encoded output
-# ret:        compilation result
 pub fun compile_function(func: *masm_fn.Function, local_size: usize,
                          tgt: *target.Target, opt: *pass.PassPipeline,
                          alloc: *allocator.Allocator, obj: *of.ObjWriter) CodegenResult {
@@ -69,47 +37,19 @@ pub fun compile_function(func: *masm_fn.Function, local_size: usize,
 
     if (func == nil || tgt == nil) { ret result; }
 
-    # 1. verify IR
-    val res_verify: Result[bool, str] = masm_verify.verify_function(func);
-    if (is_err[bool, str](res_verify))     { ret result; }
-    if (!unwrap_ok[bool, str](res_verify)) { ret result; }
+    if (!verify(func))            { ret result; }
+    if (!optimize(opt, func))     { ret result; }
 
-    # 2. optimization passes
-    if (opt != nil) {
-        if (!pass.run(opt, func)) {
-            ret result;
-        }
-    }
+    var isel_buf: isa.InstBuf = select_instructions(tgt, func, alloc);
+    if (isel_buf.insts == nil) { ret result; }
 
-    # 3. build CFG
     var cfg: masm_cfg.CFG = masm_cfg.build_cfg(alloc, func);
-
-    # 4. compute liveness
     var live: masm_cfg.LiveSets = masm_cfg.compute_liveness(alloc, ?cfg, func);
 
-    # 5. instruction selection
-    var isel_buf: isa.InstBuf = isa.buf_init(alloc);
-
-    val isel_fn: fun(ptr, ptr, ptr, *isa.InstBuf) bool = tgt.isa.isel;
-    if (isel_fn == nil) {
-        isa.buf_dnit(?isel_buf);
-        ret result;
-    }
-    val isel_ok: bool = isel_fn(tgt.isa.ctx, nil, func::ptr, ?isel_buf);
-    if (!isel_ok) {
-        isa.buf_dnit(?isel_buf);
-        ret result;
-    }
-
-    # 6. peephole optimization (no-op until ISA backends provide it)
-
-    # 7. register allocation
     var ra_result: ra.RegAllocResult = ra.alloc_function(
         alloc, ?tgt.isa, ?tgt.abi, ?isel_buf, local_size, ?cfg, ?live
     );
-
     isa.buf_dnit(?isel_buf);
-
     if (!ra_result.ok) {
         isa.buf_dnit(?ra_result.out);
         ret result;
@@ -117,36 +57,84 @@ pub fun compile_function(func: *masm_fn.Function, local_size: usize,
 
     result.spill_size  = ra_result.spill_size;
     result.callee_mask = ra_result.callee_mask;
+    result.local_size  = compute_frame_size(local_size, ra_result.spill_size);
 
-    # 8. frame layout
-    var frame_size: usize = local_size + ra_result.spill_size;
-    if (frame_size > 0) {
-        val align_mask: usize = 15;
-        frame_size = (frame_size + align_mask) & ~align_mask;
-    }
-    result.local_size = frame_size;
-
-    # 9. prologue/epilogue
-    var final_buf: isa.InstBuf = isa.buf_init(alloc);
-    emit_prologue(?final_buf, frame_size);
-    var pi: i32 = 0;
-    for (pi < ra_result.out.count) {
-        val mi: isa.Inst = ra_result.out.insts[pi];
-        if (mi.opcode == x86_defs.RET::u16) {
-            emit_epilogue(?final_buf);
-        }
-        isa.buf_append(?final_buf, mi);
-        pi = pi + 1;
-    }
+    var final_buf: isa.InstBuf = insert_prologue_epilogue(alloc, ?ra_result.out, result.local_size);
     isa.buf_dnit(?ra_result.out);
-    ra_result.out = final_buf;
 
-    # 10. encode and collect debug line info
-    val encode_fn: fun(ptr, *isa.Inst, ptr, *allocator.Allocator) i32 = tgt.isa.encode;
-    if (encode_fn == nil) {
-        isa.buf_dnit(?ra_result.out);
+    if (!encode_and_emit(tgt, alloc, obj, func, ?final_buf)) {
+        isa.buf_dnit(?final_buf);
         ret result;
     }
+
+    isa.buf_dnit(?final_buf);
+    result.ok = true;
+    ret result;
+}
+
+fun verify(func: *masm_fn.Function) bool {
+    val res: Result[bool, str] = masm_verify.verify_function(func);
+    if (is_err[bool, str](res)) { ret false; }
+    ret unwrap_ok[bool, str](res);
+}
+
+fun optimize(opt: *pass.PassPipeline, func: *masm_fn.Function) bool {
+    if (opt == nil) { ret true; }
+    ret pass.run(opt, func);
+}
+
+fun select_instructions(tgt: *target.Target, func: *masm_fn.Function,
+                        alloc: *allocator.Allocator) isa.InstBuf {
+    var buf: isa.InstBuf = isa.buf_init(alloc);
+
+    val isel_fn: fun(ptr, ptr, ptr, *isa.InstBuf) bool = tgt.isa.isel;
+    if (isel_fn == nil) {
+        isa.buf_dnit(?buf);
+        buf.insts = nil;
+        ret buf;
+    }
+
+    if (!isel_fn(tgt.isa.ctx, nil, func::ptr, ?buf)) {
+        isa.buf_dnit(?buf);
+        buf.insts = nil;
+        ret buf;
+    }
+
+    ret buf;
+}
+
+fun compute_frame_size(local_size: usize, spill_size: usize) usize {
+    var total: usize = local_size + spill_size;
+    if (total > 0) {
+        total = (total + 15) & ~15::usize;
+    }
+    ret total;
+}
+
+fun insert_prologue_epilogue(alloc: *allocator.Allocator, ra_out: *isa.InstBuf,
+                             frame_size: usize) isa.InstBuf {
+    var buf: isa.InstBuf = isa.buf_init(alloc);
+    emit_prologue(?buf, frame_size);
+
+    var i: i32 = 0;
+    for (i < ra_out.count) {
+        val inst: isa.Inst = ra_out.insts[i];
+        if (inst.opcode == x86_defs.RET::u16) {
+            emit_epilogue(?buf);
+        }
+        isa.buf_append(?buf, inst);
+        i = i + 1;
+    }
+
+    ret buf;
+}
+
+fun encode_and_emit(tgt: *target.Target, alloc: *allocator.Allocator,
+                    obj: *of.ObjWriter, func: *masm_fn.Function,
+                    buf: *isa.InstBuf) bool {
+    val encode_fn: fun(ptr, *isa.Inst, ptr, *allocator.Allocator) i32 = tgt.isa.encode;
+    if (encode_fn == nil) { ret false; }
+
     var text_sec: ptr = nil;
     if (obj != nil && obj.get_section != nil) {
         val sec_ptr: *of.Section = obj.get_section(obj.ctx, 0);
@@ -154,55 +142,48 @@ pub fun compile_function(func: *masm_fn.Function, local_size: usize,
             text_sec = sec_ptr::ptr;
         }
     }
-    if (text_sec == nil) {
-        isa.buf_dnit(?ra_result.out);
-        ret result;
-    }
-    {
-        var addr: u64 = 0;
-        val debug_fn: fun(ptr, u64, u16, u32, u32) = tgt.of.debug.add_line;
-        val debug_file_fn: fun(ptr, str, str) u16 = tgt.of.debug.add_file;
-        val debug_ctx: ptr = tgt.of.debug.ctx;
+    if (text_sec == nil) { ret false; }
 
-        var ei: i32 = 0;
-        for (ei < ra_result.out.count) {
-            val inst_size: i32 = encode_fn(tgt.isa.ctx, ?ra_result.out.insts[ei], text_sec, alloc);
+    val debug_line_fn: fun(ptr, u64, u16, u32, u32) = tgt.of.debug.add_line;
+    val debug_file_fn: fun(ptr, str, str) u16 = tgt.of.debug.add_file;
+    val debug_ctx: ptr = tgt.of.debug.ctx;
 
-            if (debug_fn != nil && debug_ctx != nil) {
-                val src_line: u32 = ra_result.out.insts[ei].src_line;
-                val src_file: str = ra_result.out.insts[ei].src_file;
-                if (src_line > 0 && src_file != nil) {
-                    val file_idx: u16 = debug_file_fn(debug_ctx, src_file, ".");
-                    if (file_idx > 0) {
-                        debug_fn(debug_ctx, addr, file_idx, src_line, 0);
-                    }
+    var addr: u64 = 0;
+    var i: i32 = 0;
+    for (i < buf.count) {
+        val inst_size: i32 = encode_fn(tgt.isa.ctx, ?buf.insts[i], text_sec, alloc);
+
+        if (debug_line_fn != nil && debug_ctx != nil) {
+            val src_line: u32 = buf.insts[i].src_line;
+            val src_file: str = buf.insts[i].src_file;
+            if (src_line > 0 && src_file != nil) {
+                val file_idx: u16 = debug_file_fn(debug_ctx, src_file, ".");
+                if (file_idx > 0) {
+                    debug_line_fn(debug_ctx, addr, file_idx, src_line, 0);
                 }
             }
-
-            if (inst_size > 0) { addr = addr + inst_size::u64; }
-            ei = ei + 1;
         }
 
-        if (debug_ctx != nil && tgt.of.debug.add_function != nil && func.name != nil) {
-            var fn_file_idx: u16 = 0;
-            if (ra_result.out.count > 0) {
-                val first_file: str = ra_result.out.insts[0].src_file;
-                if (first_file != nil) {
-                    fn_file_idx = debug_file_fn(debug_ctx, first_file, ".");
-                }
-            }
-            var fn_line: u32 = 0;
-            if (ra_result.out.count > 0) {
-                fn_line = ra_result.out.insts[0].src_line;
-            }
-            tgt.of.debug.add_function(debug_ctx, func.name, fn_file_idx, fn_line, 0, addr);
-        }
+        if (inst_size > 0) { addr = addr + inst_size::u64; }
+        i = i + 1;
     }
 
-    isa.buf_dnit(?ra_result.out);
+    if (debug_ctx != nil && tgt.of.debug.add_function != nil && func.name != nil) {
+        var fn_file_idx: u16 = 0;
+        if (buf.count > 0) {
+            val first_file: str = buf.insts[0].src_file;
+            if (first_file != nil) {
+                fn_file_idx = debug_file_fn(debug_ctx, first_file, ".");
+            }
+        }
+        var fn_line: u32 = 0;
+        if (buf.count > 0) {
+            fn_line = buf.insts[0].src_line;
+        }
+        tgt.of.debug.add_function(debug_ctx, func.name, fn_file_idx, fn_line, 0, addr);
+    }
 
-    result.ok = true;
-    ret result;
+    ret true;
 }
 
 fun emit_prologue(buf: *isa.InstBuf, frame_size: usize) {
