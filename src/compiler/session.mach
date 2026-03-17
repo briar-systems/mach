@@ -39,6 +39,8 @@ use masm_op:  masm.op;
 use path:     std.types.path;
 use print:    std.print;
 use fs:       std.filesystem;
+use elf:      mach.compiler.target.of.elf;
+use dwarf:    mach.compiler.target.of.dwarf;
 
 # options controlling compilation behavior
 # ---
@@ -264,11 +266,26 @@ pub fun analyze(s: *Session) {
     check.check_all(?sa);
 }
 
-# lower_all: lower all modules in topological order into MASM IR.
-# ---
-# s:       session
-# builder: masm module builder to populate
-pub fun lower_all(s: *Session, builder: *masm_mod.ModuleBuilder) {
+pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
+    var result: CompileResult;
+    result.ok        = false;
+    result.obj_paths = nil;
+    result.obj_count = 0;
+    result.binary    = nil;
+
+    if (s.target == nil) { ret result; }
+
+    val mod_count: u32 = module.order_count(?s.modules);
+    if (mod_count == 0) { ret result; }
+
+    val res_paths: Result[*str, str] = allocator.allocate[str](s.alloc, mod_count::usize);
+    if (is_err[*str, str](res_paths)) { ret result; }
+    result.obj_paths = unwrap_ok[*str, str](res_paths);
+    result.obj_count = 0;
+
+    var art_dir: str = artifacts_dir;
+    if (art_dir == nil) { art_dir = "out"; }
+
     var sa: sema.Sema;
     sa.alloc   = s.alloc;
     sa.modules = ?s.modules;
@@ -278,119 +295,90 @@ pub fun lower_all(s: *Session, builder: *masm_mod.ModuleBuilder) {
     sa.diag    = ?s.diag;
     sa.strings = ?s.strings;
 
-    val res_lower: Result[lctx.LowerContext, str] = lower.init(
-        s.alloc, s.target::ptr, builder, ?sa
-    );
-    if (is_err[lctx.LowerContext, str](res_lower)) { ret; }
-    var lower_ctx: lctx.LowerContext = unwrap_ok[lctx.LowerContext, str](res_lower);
+    var pipeline: pass.PassPipeline = pass.default_pipeline(s.alloc, s.opts.opt_level);
 
     var i: u32 = 0;
-    for (i < module.order_count(?s.modules)) {
+    for (i < mod_count) {
         val mod_id: module.ModuleId = module.order_at(?s.modules, i);
+        val m: *module.Module = module.get(?s.modules, mod_id);
+
+        var builder: masm_mod.ModuleBuilder = masm_mod.builder_init(s.alloc);
+
+        val res_lower: Result[lctx.LowerContext, str] = lower.init(
+            s.alloc, s.target::ptr, ?builder, ?sa
+        );
+        if (is_err[lctx.LowerContext, str](res_lower)) {
+            i = i + 1;
+            cnt;
+        }
+        var lower_ctx: lctx.LowerContext = unwrap_ok[lctx.LowerContext, str](res_lower);
+
         lower.lower_module(?lower_ctx, mod_id);
+        lower.dnit(?lower_ctx);
+
+        var ir_module: masm_mod.Module = masm_mod.build(?builder);
+
+        if (ir_module.functions.len == 0) {
+            masm_mod.module_dnit(s.alloc, ?ir_module);
+            i = i + 1;
+            cnt;
+        }
+
+        val mod_rel: str = module_to_path(s.alloc, m.path);
+
+        if (s.opts.emit_masm && mod_rel != nil) {
+            emit_module_masm(s, ?ir_module, art_dir, mod_rel);
+        }
+
+        var obj: of.ObjWriter = elf.init_writer(s.alloc);
+        val text_idx: i32 = obj.add_section(obj.ctx, ".text", of.SK_TEXT::u8, 6, 16);
+        if (text_idx < 0) {
+            masm_mod.module_dnit(s.alloc, ?ir_module);
+            i = i + 1;
+            cnt;
+        }
+
+        var debug: of.DebugInfo = dwarf.init(s.alloc, ".");
+
+        var fi: usize = 0;
+        for (fi < ir_module.functions.len) {
+            val fn_ptr: ptr = ir_module.functions.data[fi]::ptr;
+            if (fn_ptr != nil) {
+                codegen.compile_function(
+                    ir_module.functions.data[fi], 0, s.target, ?pipeline, s.alloc, ?obj
+                );
+            }
+            fi = fi + 1;
+        }
+
+        if (debug.finalize != nil) {
+            debug.finalize(debug.ctx, ?obj);
+        }
+
+        if (mod_rel != nil && obj.finalize != nil) {
+            val obj_path: str = build_artifact_path(s.alloc, art_dir, "obj", mod_rel, ".o");
+            if (obj_path != nil) {
+                val obj_dir: str = path_parent_str(s.alloc, obj_path);
+                if (obj_dir != nil && !fs.is_dir(obj_dir)) {
+                    fs.create_dir_all(s.alloc, obj_dir, 0o755);
+                }
+                if (obj.finalize(obj.ctx, obj_path)) {
+                    result.obj_paths[result.obj_count] = obj_path;
+                    result.obj_count = result.obj_count + 1;
+                }
+            }
+        }
+
+        if (debug.dnit != nil) {
+            debug.dnit(debug.ctx);
+        }
+
+        masm_mod.module_dnit(s.alloc, ?ir_module);
         i = i + 1;
     }
 
-    lower.dnit(?lower_ctx);
-}
-
-# compile: compile all functions in an IR module through the backend.
-# ---
-# s:         session
-# ir_module: masm module containing lowered functions
-# ret:       compilation result
-pub fun compile(s: *Session, ir_module: *masm_mod.Module, artifacts_dir: str) CompileResult {
-    var result: CompileResult;
-    result.ok        = false;
-    result.obj_paths = nil;
-    result.obj_count = 0;
-    result.binary    = nil;
-
-    if (s.target == nil) { ret result; }
-
-    val add_section_fn: fun(ptr, str, u8, u32, usize) i32 = s.target.of.obj.add_section;
-    if (add_section_fn == nil) { ret result; }
-
-    val text_idx: i32 = add_section_fn(s.target.of.obj.ctx, ".text", of.SK_TEXT::u8, 6, 16);
-    if (text_idx < 0) { ret result; }
-
-    var pipeline: pass.PassPipeline = pass.default_pipeline(s.alloc, s.opts.opt_level);
-
-    var compile_ok: bool = true;
-    var fi: usize = 0;
-    for (fi < ir_module.functions.len) {
-        val fn_ptr: ptr = ir_module.functions.data[fi]::ptr;
-        if (fn_ptr != nil) {
-            val cg_result: codegen.CodegenResult = codegen.compile_function(
-                ir_module.functions.data[fi], 0, s.target, ?pipeline, s.alloc, ?s.target.of.obj
-            );
-            if (!cg_result.ok) {
-                compile_ok = false;
-            }
-        }
-        fi = fi + 1;
-    }
-
-    # finalize debug info into the object writer
-    val debug_finalize: fun(ptr, *of.ObjWriter) bool = s.target.of.debug.finalize;
-    if (debug_finalize != nil && s.target.of.debug.ctx != nil) {
-        debug_finalize(s.target.of.debug.ctx, ?s.target.of.obj);
-    }
-
-    var art_dir: str = artifacts_dir;
-    if (art_dir == nil) { art_dir = "out"; }
-
-    val res_obj_dir: Result[path.Path, str] = path.join(s.alloc, art_dir, "obj");
-    var obj_dir: str = art_dir;
-    if (is_ok[path.Path, str](res_obj_dir)) {
-        obj_dir = unwrap_ok[path.Path, str](res_obj_dir);
-    }
-    if (!fs.is_dir(obj_dir)) {
-        fs.create_dir_all(s.alloc, obj_dir, 0o755);
-    }
-
-    val res_obj_path: Result[path.Path, str] = path.join(s.alloc, obj_dir, "mach.o");
-    var obj_path: str = "mach.o";
-    if (is_ok[path.Path, str](res_obj_path)) {
-        obj_path = unwrap_ok[path.Path, str](res_obj_path);
-    }
-
-    val finalize_fn: fun(ptr, str) bool = s.target.of.obj.finalize;
-    if (finalize_fn != nil) {
-        val fin_ok: bool = finalize_fn(s.target.of.obj.ctx, obj_path);
-        if (fin_ok) {
-            val res_paths: Result[*str, str] = allocator.allocate[str](s.alloc, 1);
-            if (is_ok[*str, str](res_paths)) {
-                result.obj_paths = unwrap_ok[*str, str](res_paths);
-                result.obj_paths[0] = obj_path;
-                result.obj_count = 1;
-            }
-        }
-    }
-
-    if (s.opts.emit_masm) {
-        val res_masm_dir: Result[path.Path, str] = path.join(s.alloc, art_dir, "masm");
-        if (is_ok[path.Path, str](res_masm_dir)) {
-            val masm_dir: str = unwrap_ok[path.Path, str](res_masm_dir);
-            if (!fs.is_dir(masm_dir)) {
-                fs.create_dir_all(s.alloc, masm_dir, 0o755);
-            }
-            emit_masm_files(s, ir_module, masm_dir);
-        }
-    }
-
-    if (s.opts.emit_asm) {
-        val res_asm_dir: Result[path.Path, str] = path.join(s.alloc, art_dir, "asm");
-        if (is_ok[path.Path, str](res_asm_dir)) {
-            val asm_dir: str = unwrap_ok[path.Path, str](res_asm_dir);
-            if (!fs.is_dir(asm_dir)) {
-                fs.create_dir_all(s.alloc, asm_dir, 0o755);
-            }
-        }
-    }
-
     pass.dnit(?pipeline);
-    result.ok = true;
+    result.ok = result.obj_count > 0;
     ret result;
 }
 
@@ -462,10 +450,86 @@ test "session: pool_intern deduplicates strings" {
     ret 1;
 }
 
-fun emit_masm_files(s: *Session, ir_module: *masm_mod.Module, masm_dir: str) {
-    val res_path: Result[path.Path, str] = path.join(s.alloc, masm_dir, "module.masm");
-    if (is_err[path.Path, str](res_path)) { ret; }
-    val out_path: str = unwrap_ok[path.Path, str](res_path);
+fun module_to_path(alloc: *allocator.Allocator, mod_path: str) str {
+    if (mod_path == nil) { ret nil; }
+    val len: usize = str_len(mod_path);
+    val res: Result[*u8, str] = allocator.allocate[u8](alloc, len + 1);
+    if (is_err[*u8, str](res)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](res);
+    var i: usize = 0;
+    for (i < len) {
+        if (mod_path[i] == '.') {
+            buf[i] = '/';
+        } or {
+            buf[i] = mod_path[i];
+        }
+        i = i + 1;
+    }
+    buf[len] = 0;
+    ret buf::str;
+}
+
+fun build_artifact_path(alloc: *allocator.Allocator, art_dir: str, subdir: str, mod_rel: str, suffix: str) str {
+    val res_sub: Result[path.Path, str] = path.join(alloc, art_dir, subdir);
+    if (is_err[path.Path, str](res_sub)) { ret nil; }
+    val sub: str = unwrap_ok[path.Path, str](res_sub);
+
+    val mod_len: usize = str_len(mod_rel);
+    val suf_len: usize = str_len(suffix);
+    val name_len: usize = mod_len + suf_len;
+    val res_name: Result[*u8, str] = allocator.allocate[u8](alloc, name_len + 1);
+    if (is_err[*u8, str](res_name)) { ret nil; }
+    val name_buf: *u8 = unwrap_ok[*u8, str](res_name);
+    var ni: usize = 0;
+    for (ni < mod_len) {
+        name_buf[ni] = mod_rel[ni];
+        ni = ni + 1;
+    }
+    var si: usize = 0;
+    for (si < suf_len) {
+        name_buf[ni + si] = suffix[si];
+        si = si + 1;
+    }
+    name_buf[name_len] = 0;
+
+    val res_full: Result[path.Path, str] = path.join(alloc, sub, name_buf::str);
+    if (is_err[path.Path, str](res_full)) { ret nil; }
+    ret unwrap_ok[path.Path, str](res_full);
+}
+
+fun path_parent_str(alloc: *allocator.Allocator, p: str) str {
+    if (p == nil) { ret nil; }
+    val len: usize = str_len(p);
+    var last_sep: usize = 0;
+    var found: bool = false;
+    var i: usize = 0;
+    for (i < len) {
+        if (p[i] == '/') {
+            last_sep = i;
+            found = true;
+        }
+        i = i + 1;
+    }
+    if (!found) { ret nil; }
+    val res: Result[*u8, str] = allocator.allocate[u8](alloc, last_sep + 1);
+    if (is_err[*u8, str](res)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](res);
+    i = 0;
+    for (i < last_sep) {
+        buf[i] = p[i];
+        i = i + 1;
+    }
+    buf[last_sep] = 0;
+    ret buf::str;
+}
+
+fun emit_module_masm(s: *Session, ir_module: *masm_mod.Module, art_dir: str, mod_rel: str) {
+    val out_path: str = build_artifact_path(s.alloc, art_dir, "masm", mod_rel, ".masm");
+    if (out_path == nil) { ret; }
+    val out_dir: str = path_parent_str(s.alloc, out_path);
+    if (out_dir != nil && !fs.is_dir(out_dir)) {
+        fs.create_dir_all(s.alloc, out_dir, 0o755);
+    }
 
     val res_file: Result[fs.File, str] = fs.create(out_path, 0o644);
     if (is_err[fs.File, str](res_file)) { ret; }
