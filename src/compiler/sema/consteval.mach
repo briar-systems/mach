@@ -1,0 +1,214 @@
+# mach.compiler.sema.consteval: compile-time constant evaluation
+#
+# evaluates constant initializer expressions for module-level declarations
+# and produces byte buffers. runs after type resolution so field offsets
+# and sizes are known.
+#
+# this module has no dependency on sema.module — it receives AST stores
+# and type tables as parameters. results are returned as a ConstMap that
+# the session owns and passes to lowering.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+
+use ast:   mach.compiler.parse.ast;
+use lit:   mach.compiler.lex.literal;
+use type:  mach.compiler.sema.type;
+use scope: mach.compiler.sema.scope;
+
+pub rec ConstVal {
+    data: *u8;
+    size: u32;
+}
+
+pub rec ConstMap {
+    entries: *ConstVal;
+    count:   u32;
+}
+
+pub fun init_map(alloc: *allocator.Allocator, node_count: u32) ConstMap {
+    var cm: ConstMap;
+    cm.count = node_count;
+    cm.entries = nil;
+    if (node_count > 0) {
+        val res: Result[*ConstVal, str] = allocator.zallocate[ConstVal](alloc, node_count::usize);
+        if (is_ok[*ConstVal, str](res)) {
+            cm.entries = unwrap_ok[*ConstVal, str](res);
+        }
+    }
+    ret cm;
+}
+
+pub fun get_val(cm: *ConstMap, node_id: ast.NodeId) *ConstVal {
+    if (cm == nil || cm.entries == nil) { ret nil; }
+    if (node_id::u32 >= cm.count) { ret nil; }
+    val cv: *ConstVal = ?cm.entries[node_id::u32];
+    if (cv.data == nil) { ret nil; }
+    ret cv;
+}
+
+# eval_globals: evaluate all global val/var initializers in a module.
+# ---
+# alloc:      allocator for result buffers
+# store:      the module's AST node store
+# root:       the module's root node id
+# types:      resolved type table
+# expr_types: per-node type map for this module
+# ret:        ConstMap with evaluated data for each declaration
+pub fun eval_globals(alloc: *allocator.Allocator, store: *ast.NodeStore,
+                     root: ast.NodeId, types: *type.TypeTable,
+                     symbols: *scope.SymbolTable, mod_scope: scope.ScopeId) ConstMap {
+    var cm: ConstMap = init_map(alloc, store.node_count);
+
+    if (root::u32 == ast.NODE_NIL::u32) { ret cm; }
+    val root_node: *ast.Node = ast.get(store, root);
+    if (root_node.kind != ast.NK_PROGRAM) { ret cm; }
+
+    val stmts: ast.NodeSpan = ast.block_stmts(store, root);
+    var i: u32 = 0;
+    for (i < stmts.len) {
+        val stmt_id: ast.NodeId = ast.get_extra(store, stmts.start + i)::ast.NodeId;
+        if (stmt_id::u32 != ast.NODE_NIL::u32) {
+            eval_decl(alloc, store, types, symbols, mod_scope, ?cm, stmt_id);
+        }
+        i = i + 1;
+    }
+
+    ret cm;
+}
+
+fun eval_decl(alloc: *allocator.Allocator, store: *ast.NodeStore,
+              types: *type.TypeTable, symbols: *scope.SymbolTable,
+              mod_scope: scope.ScopeId, cm: *ConstMap, node_id: ast.NodeId) {
+    val node: *ast.Node = ast.get(store, node_id);
+    if (node.kind == ast.NK_DECL_PUB) {
+        val inner_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+        if (inner_id::u32 != ast.NODE_NIL::u32) {
+            eval_decl(alloc, store, types, symbols, mod_scope, cm, inner_id);
+        }
+        ret;
+    }
+    if (node.kind != ast.NK_DECL_VAL && node.kind != ast.NK_DECL_VAR) { ret; }
+
+    val init_id: ast.NodeId = ast.var_init(store, node_id);
+    if (init_id::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val name_sid: ast.StrId = ast.var_name(store, node_id);
+    val name: str = ast.get_str(store, name_sid);
+    if (name == nil) { ret; }
+
+    val sym_id: scope.SymbolId = scope.lookup_from(symbols, mod_scope, name);
+    if (sym_id::u32 == scope.SYM_NIL::u32) { ret; }
+    val sym: *scope.Symbol = scope.get_sym(symbols, sym_id);
+    val var_tid: type.TypeId = sym.type_id::type.TypeId;
+    if (var_tid::u32 == type.TYPE_NIL::u32) { ret; }
+    val sz: u32 = type.get(types, var_tid).size;
+    if (sz == 0) { ret; }
+
+    val res_buf: Result[*u8, str] = allocator.zallocate[u8](alloc, sz::usize);
+    if (is_err[*u8, str](res_buf)) { ret; }
+    val buf: *u8 = unwrap_ok[*u8, str](res_buf);
+
+    if (eval_expr(alloc, store, types, init_id, var_tid, buf, sz::usize, 0)) {
+        if (cm.entries != nil && node_id::u32 < cm.count) {
+            cm.entries[node_id::u32].data = buf;
+            cm.entries[node_id::u32].size = sz;
+        }
+    }
+}
+
+fun eval_expr(alloc: *allocator.Allocator, store: *ast.NodeStore,
+              types: *type.TypeTable, node_id: ast.NodeId, tid: type.TypeId,
+              buf: *u8, buf_size: usize, offset: usize) bool {
+    val node: *ast.Node = ast.get(store, node_id);
+
+    if (node.kind == ast.NK_EXPR_LIT_INT) {
+        ret eval_int_lit(store, node, tid, types, buf, buf_size, offset);
+    }
+    if (node.kind == ast.NK_EXPR_LIT_BOOL) {
+        val val_u32: u32 = ast.get_extra(store, node.payload);
+        if (offset < buf_size) { buf[offset] = val_u32::u8; }
+        ret true;
+    }
+    if (node.kind == ast.NK_EXPR_LIT_NIL) { ret true; }
+    if (node.kind == ast.NK_EXPR_LIT_STR) { ret true; }
+    if (node.kind == ast.NK_EXPR_STRUCT_LIT) {
+        ret eval_struct_lit(alloc, store, types, node_id, tid, buf, buf_size, offset);
+    }
+    if (node.kind == ast.NK_EXPR_PAREN) {
+        val inner: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+        ret eval_expr(alloc, store, types, inner, tid, buf, buf_size, offset);
+    }
+    ret false;
+}
+
+fun eval_int_lit(store: *ast.NodeStore, node: *ast.Node, tid: type.TypeId,
+                 types: *type.TypeTable, buf: *u8, buf_size: usize, offset: usize) bool {
+    val text_sid: ast.StrId = ast.get_extra(store, node.payload)::ast.StrId;
+    val text: str = ast.get_str(store, text_sid);
+    if (text == nil) { ret false; }
+
+    val res: Result[u64, str] = lit.parse_int(text);
+    if (is_err[u64, str](res)) { ret false; }
+    val value: u64 = unwrap_ok[u64, str](res);
+    val sz: u32 = type.get(types, tid).size;
+    if (offset + sz::usize > buf_size) { ret false; }
+
+    if (sz == 1) { buf[offset] = value::u8; }
+    or (sz == 2) { write_le16(buf, offset, value::u16); }
+    or (sz == 4) { write_le32(buf, offset, value::u32); }
+    or (sz == 8) { write_le64(buf, offset, value::u64); }
+    ret true;
+}
+
+fun eval_struct_lit(alloc: *allocator.Allocator, store: *ast.NodeStore,
+                    types: *type.TypeTable, node_id: ast.NodeId, tid: type.TypeId,
+                    buf: *u8, buf_size: usize, offset: usize) bool {
+    val node: *ast.Node = ast.get(store, node_id);
+    val fields_start: u32 = ast.get_extra(store, node.payload + 1);
+    val fields_count: u32 = ast.get_extra(store, node.payload + 2);
+    val rec_tid: type.TypeId = type.canonical(types, tid);
+
+    var i: u32 = 0;
+    for (i < fields_count) {
+        val field_id: ast.NodeId = ast.get_extra(store, fields_start + i)::ast.NodeId;
+        if (field_id::u32 == ast.NODE_NIL::u32) { i = i + 1; cnt; }
+
+        val field_node: *ast.Node = ast.get(store, field_id);
+        val fname_sid: ast.StrId = ast.get_extra(store, field_node.payload)::ast.StrId;
+        val fname: str = ast.get_str(store, fname_sid);
+        val value_id: ast.NodeId = ast.get_extra(store, field_node.payload + 1)::ast.NodeId;
+
+        if (fname != nil && value_id::u32 != ast.NODE_NIL::u32) {
+            val fld: *type.TypeField = type.get_field(types, rec_tid, fname);
+            if (fld != nil) {
+                eval_expr(alloc, store, types,
+                          value_id, fld.type_id, buf, buf_size, offset + fld.offset::usize);
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+
+fun write_le16(buf: *u8, off: usize, v: u16) {
+    buf[off]     = (v & 0xFF)::u8;
+    buf[off + 1] = ((v >> 8) & 0xFF)::u8;
+}
+
+fun write_le32(buf: *u8, off: usize, v: u32) {
+    buf[off]     = (v & 0xFF)::u8;
+    buf[off + 1] = ((v >> 8) & 0xFF)::u8;
+    buf[off + 2] = ((v >> 16) & 0xFF)::u8;
+    buf[off + 3] = ((v >> 24) & 0xFF)::u8;
+}
+
+fun write_le64(buf: *u8, off: usize, v: u64) {
+    write_le32(buf, off, (v & 0xFFFFFFFF)::u32);
+    write_le32(buf, off + 4, ((v >> 32) & 0xFFFFFFFF)::u32);
+}
