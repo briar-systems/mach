@@ -6,18 +6,17 @@ use std.types.string;
 use std.types.result;
 
 use allocator: std.allocator;
-use mem:       std.memory;
 
 use masm_fn:     masm.function;
 use masm_verify: masm.verify;
 use masm_cfg:    masm.cfg;
+use masm_pool:   masm.pool;
 
 use target:   mach.compiler.target.target;
 use isa:      mach.compiler.target.isa;
 use of:       mach.compiler.target.of;
 use pass:     mach.compiler.opt.pass;
 use ra:       mach.compiler.regalloc;
-use x86_defs: mach.compiler.target.isa.x86_64.defs;
 
 pub rec CodegenResult {
     ok:          bool;
@@ -59,7 +58,7 @@ pub fun compile_function(func: *masm_fn.Function, local_size: usize,
     result.callee_mask = ra_result.callee_mask;
     result.local_size  = compute_frame_size(local_size, ra_result.spill_size);
 
-    var final_buf: isa.InstBuf = insert_prologue_epilogue(alloc, ?ra_result.out, result.local_size);
+    var final_buf: isa.InstBuf = insert_prologue_epilogue(tgt, alloc, ?ra_result.out, result.local_size);
     isa.buf_dnit(?ra_result.out);
 
     if (!encode_and_emit(tgt, alloc, obj, func, ?final_buf)) {
@@ -111,22 +110,40 @@ fun compute_frame_size(local_size: usize, spill_size: usize) usize {
     ret total;
 }
 
-fun insert_prologue_epilogue(alloc: *allocator.Allocator, ra_out: *isa.InstBuf,
-                             frame_size: usize) isa.InstBuf {
+fun insert_prologue_epilogue(tgt: *target.Target, alloc: *allocator.Allocator,
+                             ra_out: *isa.InstBuf, frame_size: usize) isa.InstBuf {
     var buf: isa.InstBuf = isa.buf_init(alloc);
-    emit_prologue(?buf, frame_size);
+    if (tgt.isa.emit_prologue != nil) {
+        tgt.isa.emit_prologue(tgt.isa.ctx, ?buf, frame_size);
+    }
 
     var i: i32 = 0;
     for (i < ra_out.count) {
         val inst: isa.Inst = ra_out.insts[i];
-        if (inst.opcode == x86_defs.RET::u16) {
-            emit_epilogue(?buf);
+        if (tgt.isa.is_ret != nil && tgt.isa.is_ret(tgt.isa.ctx, ?ra_out.insts[i])) {
+            if (tgt.isa.emit_epilogue != nil) {
+                tgt.isa.emit_epilogue(tgt.isa.ctx, ?buf);
+            }
         }
         isa.buf_append(?buf, inst);
         i = i + 1;
     }
 
     ret buf;
+}
+
+fun emit_label_reloc(tgt: *target.Target, obj: *of.ObjWriter,
+                     mi: *isa.Inst, inst_size: i32, base_offset: usize) {
+    if (mi.dst.kind != isa.OPK_LABEL || mi.dst.label == nil) { ret; }
+    if (obj.add_symbol == nil || obj.add_reloc == nil) { ret; }
+    if (tgt.isa.reloc_offset == nil) { ret; }
+
+    val disp_off: i32 = tgt.isa.reloc_offset(tgt.isa.ctx, mi, inst_size);
+    if (disp_off < 0) { ret; }
+
+    val callee_sym: u32 = obj.add_symbol(obj.ctx, mi.dst.label, -1, 0, 0, true);
+    val reloc_off: usize = base_offset + disp_off::usize;
+    obj.add_reloc(obj.ctx, 0, reloc_off, of.RK_PLT32, callee_sym, -4::i64);
 }
 
 fun encode_and_emit(tgt: *target.Target, alloc: *allocator.Allocator,
@@ -150,16 +167,34 @@ fun encode_and_emit(tgt: *target.Target, alloc: *allocator.Allocator,
     var addr: u64 = 0;
     var i: i32 = 0;
     for (i < buf.count) {
+        if (buf.insts[i].opcode == isa.ISA_ASM_MARKER) {
+            val lbl_idx: u16 = buf.insts[i].dst.imm::u16;
+            val asm_text: str = masm_pool.label_get(?func.labels, lbl_idx::i32);
+            if (asm_text != nil && tgt.isa.parse_asm != nil) {
+                var asm_buf: isa.InstBuf = isa.buf_init(alloc);
+                tgt.isa.parse_asm(tgt.isa.ctx, asm_text, ?asm_buf);
+
+                var ai: i32 = 0;
+                for (ai < asm_buf.count) {
+                    val asm_inst_size: i32 = encode_fn(tgt.isa.ctx, ?asm_buf.insts[ai], text_sec_ptr::ptr, alloc);
+
+                    if (asm_inst_size > 0) {
+                        emit_label_reloc(tgt, obj, ?asm_buf.insts[ai], asm_inst_size, start_offset + addr::usize);
+                    }
+
+                    if (asm_inst_size > 0) { addr = addr + asm_inst_size::u64; }
+                    ai = ai + 1;
+                }
+                isa.buf_dnit(?asm_buf);
+            }
+            i = i + 1;
+            cnt;
+        }
+
         val inst_size: i32 = encode_fn(tgt.isa.ctx, ?buf.insts[i], text_sec_ptr::ptr, alloc);
 
-        if (inst_size > 0 && buf.insts[i].opcode == x86_defs.CALL::u16) {
-            if (buf.insts[i].dst.kind == isa.OPK_LABEL && buf.insts[i].dst.label != nil) {
-                if (obj.add_symbol != nil && obj.add_reloc != nil) {
-                    val callee_sym: u32 = obj.add_symbol(obj.ctx, buf.insts[i].dst.label, -1, 0, 0, true);
-                    val reloc_off: usize = start_offset + addr::usize + inst_size::usize - 4;
-                    obj.add_reloc(obj.ctx, 0, reloc_off, of.RK_PLT32, callee_sym, -4::i64);
-                }
-            }
+        if (inst_size > 0) {
+            emit_label_reloc(tgt, obj, ?buf.insts[i], inst_size, start_offset + addr::usize);
         }
 
         if (debug_line_fn != nil && debug_ctx != nil) {
@@ -199,46 +234,3 @@ fun encode_and_emit(tgt: *target.Target, alloc: *allocator.Allocator,
     ret true;
 }
 
-fun emit_prologue(buf: *isa.InstBuf, frame_size: usize) {
-    var push_rbp: isa.Inst;
-    mem.zero[isa.Inst](?push_rbp, 1);
-    push_rbp.opcode = x86_defs.PUSH::u16;
-    push_rbp.dst = isa.make_reg(x86_defs.RBP, 8);
-    push_rbp.flags = x86_defs.FLAG_REX_W::u16;
-    isa.buf_append(buf, push_rbp);
-
-    var mov_rbp: isa.Inst;
-    mem.zero[isa.Inst](?mov_rbp, 1);
-    mov_rbp.opcode = x86_defs.MOV::u16;
-    mov_rbp.dst  = isa.make_reg(x86_defs.RBP, 8);
-    mov_rbp.src1 = isa.make_reg(x86_defs.RSP, 8);
-    mov_rbp.flags = x86_defs.FLAG_REX_W::u16;
-    isa.buf_append(buf, mov_rbp);
-
-    if (frame_size > 0) {
-        var sub_rsp: isa.Inst;
-        mem.zero[isa.Inst](?sub_rsp, 1);
-        sub_rsp.opcode = x86_defs.SUB::u16;
-        sub_rsp.dst  = isa.make_reg(x86_defs.RSP, 8);
-        sub_rsp.src1 = isa.make_imm(frame_size::i64, 8);
-        sub_rsp.flags = x86_defs.FLAG_REX_W::u16;
-        isa.buf_append(buf, sub_rsp);
-    }
-}
-
-fun emit_epilogue(buf: *isa.InstBuf) {
-    var mov_rsp: isa.Inst;
-    mem.zero[isa.Inst](?mov_rsp, 1);
-    mov_rsp.opcode = x86_defs.MOV::u16;
-    mov_rsp.dst  = isa.make_reg(x86_defs.RSP, 8);
-    mov_rsp.src1 = isa.make_reg(x86_defs.RBP, 8);
-    mov_rsp.flags = x86_defs.FLAG_REX_W::u16;
-    isa.buf_append(buf, mov_rsp);
-
-    var pop_rbp: isa.Inst;
-    mem.zero[isa.Inst](?pop_rbp, 1);
-    pop_rbp.opcode = x86_defs.POP::u16;
-    pop_rbp.dst = isa.make_reg(x86_defs.RBP, 8);
-    pop_rbp.flags = x86_defs.FLAG_REX_W::u16;
-    isa.buf_append(buf, pop_rbp);
-}
