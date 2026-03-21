@@ -20,6 +20,7 @@ use abi:      mach.compiler.target.abi;
 val VREG_START: i32 = 32;
 val MAX_RANGES: i32 = 4096;
 val MAX_ACTIVE: i32 = 64;
+val MAX_CALLS:  i32 = 1024;
 val REG_CLASS_GP: u8 = 0;
 val REG_CLASS_FP: u8 = 1;
 
@@ -35,16 +36,17 @@ val REG_CLASS_FP: u8 = 1;
 # spill_off: stack offset if spilled (-1 if not spilled)
 # spilled:   true if this range was spilled to the stack
 pub rec LiveRange {
-    vreg:      i32;
-    start:     i32;
-    end_pos:   i32;
-    use_count: i32;
-    size:      u8;
-    reg_class: u8;
-    preg:      i32;
-    spill_off: i64;
-    spilled:   bool;
-    hint:      i32;
+    vreg:         i32;
+    start:        i32;
+    end_pos:      i32;
+    use_count:    i32;
+    size:         u8;
+    reg_class:    u8;
+    preg:         i32;
+    spill_off:    i64;
+    spilled:      bool;
+    hint:         i32;
+    crosses_call: bool;
 }
 
 # result of register allocation for a single function
@@ -81,8 +83,9 @@ fun init_range() LiveRange {
     r.reg_class = REG_CLASS_GP;
     r.preg      = -1;
     r.spill_off = -1;
-    r.spilled   = false;
-    r.hint      = -1;
+    r.spilled      = false;
+    r.hint         = -1;
+    r.crosses_call = false;
     ret r;
 }
 
@@ -124,7 +127,9 @@ fun scan_operand_reg(op: *isa.Operand) i32 {
 
 # build_ranges: scan instructions and build live ranges for all virtual registers
 fun build_ranges(alloc: *allocator.Allocator, insts: *isa.InstBuf,
-                 ranges: *LiveRange, range_count: *i32) {
+                 ranges: *LiveRange, range_count: *i32,
+                 call_positions: *i32, call_count: *i32,
+                 i: *isa.ISA) {
     var pos: i32 = 0;
     for (pos < insts.count) {
         val inst: *isa.Inst = ?insts.insts[pos];
@@ -150,6 +155,13 @@ fun build_ranges(alloc: *allocator.Allocator, insts: *isa.InstBuf,
             }
             pos = pos + 1;
             cnt;
+        }
+
+        if (i != nil && i.is_call != nil && i.is_call(i.ctx, inst)) {
+            if (@call_count < MAX_CALLS) {
+                call_positions[@call_count] = pos;
+                @call_count = @call_count + 1;
+            }
         }
 
         val rc: u8 = classify_operand(inst);
@@ -343,6 +355,61 @@ fun try_alloc_reg(gp_free: *bool, fp_free: *bool, reg_class: u8,
     ret -1;
 }
 
+# try_alloc_reg_callee: allocate a register, preferring callee-saved
+fun try_alloc_reg_callee(gp_free: *bool, fp_free: *bool, reg_class: u8,
+                         a: *abi.ABI, hint: i32) i32 {
+    if (reg_class == REG_CLASS_FP) {
+        if (hint >= 0 && hint < 16 && fp_free[hint]) {
+            fp_free[hint] = false;
+            ret hint;
+        }
+        var fi: i32 = 0;
+        for (fi < 16) {
+            if (fp_free[fi]) {
+                fp_free[fi] = false;
+                ret fi;
+            }
+            fi = fi + 1;
+        }
+        ret -1;
+    }
+
+    if (hint >= 0 && hint < 16 && gp_free[hint] && !is_reserved(hint) && is_callee_saved(a, hint)) {
+        gp_free[hint] = false;
+        ret hint;
+    }
+
+    var ci: i32 = 0;
+    for (ci < 16) {
+        if (gp_free[ci] && !is_reserved(ci) && is_callee_saved(a, ci)) {
+            gp_free[ci] = false;
+            ret ci;
+        }
+        ci = ci + 1;
+    }
+    ci = 0;
+    for (ci < 16) {
+        if (gp_free[ci] && !is_reserved(ci)) {
+            gp_free[ci] = false;
+            ret ci;
+        }
+        ci = ci + 1;
+    }
+    ret -1;
+}
+
+# range_crosses_call: check if a live range spans any call instruction
+fun range_crosses_call(r: *LiveRange, call_positions: *i32, call_count: i32) bool {
+    var ci: i32 = 0;
+    for (ci < call_count) {
+        if (call_positions[ci] > r.start && call_positions[ci] < r.end_pos) {
+            ret true;
+        }
+        ci = ci + 1;
+    }
+    ret false;
+}
+
 # find_spill_candidate: find the active range with lowest use density
 fun find_spill_candidate(active: *ActiveEntry, active_count: i32,
                          ranges: *LiveRange) i32 {
@@ -483,7 +550,16 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
     var ranges: *LiveRange = unwrap_ok[*LiveRange, str](res_ranges);
     var range_count: i32 = 0;
 
-    build_ranges(alloc, insts, ranges, ?range_count);
+    val res_calls: Result[*i32, str] = allocator.allocate[i32](alloc, MAX_CALLS::usize);
+    if (is_err[*i32, str](res_calls)) {
+        allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
+        result.out = isa.buf_init(alloc);
+        ret result;
+    }
+    var call_positions: *i32 = unwrap_ok[*i32, str](res_calls);
+    var call_count: i32 = 0;
+
+    build_ranges(alloc, insts, ranges, ?range_count, call_positions, ?call_count, i);
 
     if (range_count == 0) {
         var out: isa.InstBuf = isa.buf_init(alloc);
@@ -492,10 +568,19 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
             isa.buf_append(?out, insts.insts[ci]);
             ci = ci + 1;
         }
+        allocator.deallocate[i32](alloc, call_positions, MAX_CALLS::usize);
         allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
         result.out = out;
         result.ok  = true;
         ret result;
+    }
+
+    var rci: i32 = 0;
+    for (rci < range_count) {
+        if (range_crosses_call(?ranges[rci], call_positions, call_count)) {
+            ranges[rci].crosses_call = true;
+        }
+        rci = rci + 1;
     }
 
     sort_ranges_by_start(ranges, range_count);
@@ -538,7 +623,12 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
     for (ri < range_count) {
         expire_old(active, ?active_count, gp_free, fp_free, ranges[ri].start);
 
-        val preg: i32 = try_alloc_reg(gp_free, fp_free, ranges[ri].reg_class, a, ranges[ri].hint);
+        var preg: i32 = -1;
+        if (ranges[ri].crosses_call) {
+            preg = try_alloc_reg_callee(gp_free, fp_free, ranges[ri].reg_class, a, ranges[ri].hint);
+        } or {
+            preg = try_alloc_reg(gp_free, fp_free, ranges[ri].reg_class, a, ranges[ri].hint);
+        }
         if (preg >= 0) {
             ranges[ri].preg = preg;
             add_active(active, ?active_count, ri, preg, ranges[ri].end_pos);
@@ -713,6 +803,7 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
     allocator.deallocate[bool](alloc, fp_free, 16);
     allocator.deallocate[bool](alloc, gp_free, 16);
     allocator.deallocate[ActiveEntry](alloc, active, MAX_ACTIVE::usize);
+    allocator.deallocate[i32](alloc, call_positions, MAX_CALLS::usize);
     allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
 
     result.out         = out;
