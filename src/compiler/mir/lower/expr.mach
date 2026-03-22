@@ -1,0 +1,660 @@
+# mach.compiler.mir.lower.expr: AST expression → MIR lowering
+#
+# each lower_* function returns a ValueId holding the expression result.
+# variables are accessed through alloca pointers (load/store pattern).
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use mem:       std.mem;
+use type:      mach.compiler.sema.type;
+use scope:     mach.compiler.sema.scope;
+use smod:      mach.compiler.sema.module;
+use ast:       mach.compiler.parse.ast;
+use token:     mach.compiler.lex.token;
+
+use op:      mach.compiler.mir.op;
+use ir:      mach.compiler.mir.ir;
+use builder: mach.compiler.mir.builder;
+use lctx:    mach.compiler.mir.lower.ctx;
+use data_mod: mach.compiler.mir.lower.data;
+
+# lower any expression node, returns its SSA value
+pub fun lower_expr(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore) ir.ValueId {
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret ir.VALUE_NONE; }
+    val node: *ast.Node = ast.get(store, node_id);
+    val loc: ir.SrcRef = lctx.make_loc(ctx, store, node_id);
+
+    if (node.kind == ast.NK_EXPR_LIT_INT)   { ret lower_int_lit(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_LIT_FLOAT) { ret lower_float_lit(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_LIT_BOOL)  { ret lower_bool_lit(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_LIT_NIL)   { ret lower_nil_lit(ctx, node_id, loc); }
+    if (node.kind == ast.NK_EXPR_LIT_STR)   { ret lower_str_lit(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_LIT_CHAR)  { ret lower_char_lit(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_IDENT)     { ret lower_ident(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_BINARY)    { ret lower_binary(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_UNARY)     { ret lower_unary(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_CALL)      { ret lower_call(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_FIELD)     { ret lower_field(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_INDEX)     { ret lower_index(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_CAST)      { ret lower_cast(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_ADDR)      { ret lower_addr(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_DEREF)     { ret lower_deref(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_PAREN)     { ret lower_paren(ctx, node_id, store); }
+    if (node.kind == ast.NK_EXPR_STRUCT_LIT) { ret lower_struct_lit(ctx, node_id, store, loc); }
+    if (node.kind == ast.NK_EXPR_ARRAY_LIT) { ret lower_array_lit(ctx, node_id, store, loc); }
+
+    ret ir.VALUE_NONE;
+}
+
+# lower an lvalue expression — returns a pointer to the storage location
+pub fun lower_lvalue(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore) ir.ValueId {
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret ir.VALUE_NONE; }
+    val node: *ast.Node = ast.get(store, node_id);
+    val loc: ir.SrcRef = lctx.make_loc(ctx, store, node_id);
+
+    if (node.kind == ast.NK_EXPR_IDENT) {
+        val name_sid: ast.StrId = ast.get_extra(store, node.payload)::ast.StrId;
+        val name: str = ast.get_str(store, name_sid);
+        val local_ptr: ir.ValueId = lctx.find_local(ctx, name);
+        if (local_ptr::u32 != ir.VALUE_NONE::u32) { ret local_ptr; }
+
+        val sym_id: scope.SymbolId = lctx.node_sym(ctx, node_id);
+        if (sym_id::u32 != scope.SYM_NIL::u32) {
+            val sym: *scope.Symbol = lctx.get_sym(ctx, sym_id);
+            if (sym != nil) {
+                val gname: str = if (sym.export_name != nil) { sym.export_name; } or { name; };
+                val sym_res: Result[ir.SymId, str] = builder.module_add_symbol(ctx.mb, gname, false);
+                if (sym_res::bool) {
+                    val sid: ir.SymId = unwrap_ok[ir.SymId, str](sym_res);
+                    val ptr_tid: type.TypeId = type.TK_POINTER::type.TypeId;
+                    val res: Result[ir.ValueId, str] = builder.build_global_addr(?ctx.fb, ptr_tid, sid, loc);
+                    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+                }
+            }
+        }
+        ret ir.VALUE_NONE;
+    }
+
+    if (node.kind == ast.NK_EXPR_DEREF) {
+        val inner: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+        ret lower_expr(ctx, inner, store);
+    }
+
+    if (node.kind == ast.NK_EXPR_FIELD) {
+        ret lower_field_ptr(ctx, node_id, store, loc);
+    }
+
+    if (node.kind == ast.NK_EXPR_INDEX) {
+        ret lower_index_ptr(ctx, node_id, store, loc);
+    }
+
+    if (node.kind == ast.NK_EXPR_PAREN) {
+        val inner: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+        ret lower_lvalue(ctx, inner, store);
+    }
+
+    ret ir.VALUE_NONE;
+}
+
+fun lower_int_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val node: *ast.Node = ast.get(store, node_id);
+    val lo: u64 = ast.get_extra(store, node.payload)::u64;
+    val hi: u64 = ast.get_extra(store, node.payload + 1)::u64;
+    val value: u64 = lo | (hi << 32);
+
+    val res: Result[ir.ValueId, str] = builder.build_iconst(?ctx.fb, tid, value, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_float_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val node: *ast.Node = ast.get(store, node_id);
+    val lo: u64 = ast.get_extra(store, node.payload)::u64;
+    val hi: u64 = ast.get_extra(store, node.payload + 1)::u64;
+    val bits: u64 = lo | (hi << 32);
+
+    val res: Result[ir.ValueId, str] = builder.build_fconst(?ctx.fb, tid, bits, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_bool_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val value: bool = ast.get_extra(store, node.payload) != 0;
+    val res: Result[ir.ValueId, str] = builder.build_bconst(?ctx.fb, value, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_nil_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, loc: ir.SrcRef) ir.ValueId {
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val res: Result[ir.ValueId, str] = builder.build_nullptr(?ctx.fb, tid, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_str_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val str_sid: ast.StrId = ast.get_extra(store, node.payload)::ast.StrId;
+    val text: str = ast.get_str(store, str_sid);
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+
+    val label: str = lctx.next_str_label(ctx);
+    data_mod.add_string_constant(ctx, label, text);
+
+    val sym_res: Result[ir.SymId, str] = builder.module_add_symbol(ctx.mb, label, false);
+    if (sym_res::bool == false) { ret ir.VALUE_NONE; }
+    val sid: ir.SymId = unwrap_ok[ir.SymId, str](sym_res);
+
+    val res: Result[ir.ValueId, str] = builder.build_global_addr(?ctx.fb, tid, sid, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_char_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val node: *ast.Node = ast.get(store, node_id);
+    val value: u64 = ast.get_extra(store, node.payload)::u64;
+    val res: Result[ir.ValueId, str] = builder.build_iconst(?ctx.fb, tid, value, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_ident(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val name_sid: ast.StrId = ast.get_extra(store, node.payload)::ast.StrId;
+    val name: str = ast.get_str(store, name_sid);
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+
+    val local_ptr: ir.ValueId = lctx.find_local(ctx, name);
+    if (local_ptr::u32 != ir.VALUE_NONE::u32) {
+        if (lctx.is_aggregate(ctx, tid)) {
+            ret local_ptr;
+        }
+        val res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, tid, local_ptr, loc);
+        if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+        ret ir.VALUE_NONE;
+    }
+
+    val sym_id: scope.SymbolId = lctx.node_sym(ctx, node_id);
+    if (sym_id::u32 != scope.SYM_NIL::u32) {
+        val sym: *scope.Symbol = lctx.get_sym(ctx, sym_id);
+        if (sym != nil) {
+            val gname: str = if (sym.export_name != nil) { sym.export_name; } or { name; };
+            val sym_res: Result[ir.SymId, str] = builder.module_add_symbol(ctx.mb, gname, false);
+            if (sym_res::bool) {
+                val sid: ir.SymId = unwrap_ok[ir.SymId, str](sym_res);
+                val ptr_tid: type.TypeId = type.TK_POINTER::type.TypeId;
+                val addr_res: Result[ir.ValueId, str] = builder.build_global_addr(?ctx.fb, ptr_tid, sid, loc);
+                if (addr_res::bool) {
+                    val addr: ir.ValueId = unwrap_ok[ir.ValueId, str](addr_res);
+                    if (lctx.is_aggregate(ctx, tid)) { ret addr; }
+                    val ld_res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, tid, addr, loc);
+                    if (ld_res::bool) { ret unwrap_ok[ir.ValueId, str](ld_res); }
+                }
+            }
+        }
+    }
+
+    ret ir.VALUE_NONE;
+}
+
+fun lower_paren(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val inner: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    ret lower_expr(ctx, inner, store);
+}
+
+fun lower_binary(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val lhs_id: ast.NodeId = ast.binary_lhs(store, node_id);
+    val rhs_id: ast.NodeId = ast.binary_rhs(store, node_id);
+    val op_tag: u32 = ast.binary_op(store, node_id)::u32;
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+
+    if (op_tag == token.TAG_EQ) {
+        ret lower_assign(ctx, lhs_id, rhs_id, store, loc);
+    }
+
+    if (op_tag == token.TAG_AMP_AMP) {
+        ret lower_short_circuit(ctx, lhs_id, rhs_id, store, loc, true);
+    }
+    if (op_tag == token.TAG_PIPE_PIPE) {
+        ret lower_short_circuit(ctx, lhs_id, rhs_id, store, loc, false);
+    }
+
+    val lhs: ir.ValueId = lower_expr(ctx, lhs_id, store);
+    val rhs: ir.ValueId = lower_expr(ctx, rhs_id, store);
+    if (lhs::u32 == ir.VALUE_NONE::u32 || rhs::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    val lhs_tid: type.TypeId = lctx.node_type(ctx, lhs_id);
+    val is_f: bool = lctx.is_float(ctx, lhs_tid);
+    val is_s: bool = lctx.is_signed(ctx, lhs_tid);
+
+    var mir_op: op.Op = 0;
+    var cc: op.CC = 0::op.CC;
+    var is_cmp: bool = false;
+
+    if (op_tag == token.TAG_PLUS)      { mir_op = if (is_f) { op.OP_FADD; } or { op.OP_ADD; }; }
+    if (op_tag == token.TAG_MINUS)     { mir_op = if (is_f) { op.OP_FSUB; } or { op.OP_SUB; }; }
+    if (op_tag == token.TAG_STAR)      { mir_op = if (is_f) { op.OP_FMUL; } or { op.OP_MUL; }; }
+    if (op_tag == token.TAG_SLASH)     { mir_op = if (is_f) { op.OP_FDIV; } or { if (is_s) { op.OP_SDIV; } or { op.OP_UDIV; }; }; }
+    if (op_tag == token.TAG_PERCENT)   { mir_op = if (is_s) { op.OP_SREM; } or { op.OP_UREM; }; }
+    if (op_tag == token.TAG_AMP)       { mir_op = op.OP_AND; }
+    if (op_tag == token.TAG_PIPE)      { mir_op = op.OP_OR; }
+    if (op_tag == token.TAG_CARET)     { mir_op = op.OP_XOR; }
+    if (op_tag == token.TAG_LT_LT)    { mir_op = op.OP_SHL; }
+    if (op_tag == token.TAG_GT_GT)     { mir_op = if (is_s) { op.OP_ASHR; } or { op.OP_LSHR; }; }
+
+    if (op_tag == token.TAG_EQ_EQ)     { is_cmp = true; cc = op.CC_EQ; }
+    if (op_tag == token.TAG_BANG_EQ)   { is_cmp = true; cc = op.CC_NE; }
+    if (op_tag == token.TAG_LT)        { is_cmp = true; cc = if (is_s) { op.CC_SLT; } or { op.CC_ULT; }; }
+    if (op_tag == token.TAG_LT_EQ)     { is_cmp = true; cc = if (is_s) { op.CC_SLE; } or { op.CC_ULE; }; }
+    if (op_tag == token.TAG_GT)        { is_cmp = true; cc = if (is_s) { op.CC_SGT; } or { op.CC_UGT; }; }
+    if (op_tag == token.TAG_GT_EQ)     { is_cmp = true; cc = if (is_s) { op.CC_SGE; } or { op.CC_UGE; }; }
+
+    if (is_cmp) {
+        var res: Result[ir.ValueId, str];
+        if (is_f) {
+            res = builder.build_fcmp(?ctx.fb, cc, lhs, rhs, loc);
+        } or {
+            res = builder.build_icmp(?ctx.fb, cc, lhs, rhs, loc);
+        }
+        if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+        ret ir.VALUE_NONE;
+    }
+
+    if (mir_op::u8 != 0) {
+        val res: Result[ir.ValueId, str] = builder.build_binop(?ctx.fb, mir_op, tid, lhs, rhs, loc);
+        if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    }
+
+    ret ir.VALUE_NONE;
+}
+
+fun lower_assign(ctx: *lctx.LowerCtx, lhs_id: ast.NodeId, rhs_id: ast.NodeId,
+                 store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val ptr: ir.ValueId = lower_lvalue(ctx, lhs_id, store);
+    val value: ir.ValueId = lower_expr(ctx, rhs_id, store);
+    if (ptr::u32 == ir.VALUE_NONE::u32 || value::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    val tid: type.TypeId = lctx.node_type(ctx, rhs_id);
+    if (lctx.is_aggregate(ctx, tid)) {
+        val sz: u32 = lctx.type_size(ctx, tid);
+        builder.build_copy(?ctx.fb, ptr, value, sz::u64, loc);
+    } or {
+        builder.build_store(?ctx.fb, ptr, value, loc);
+    }
+    ret value;
+}
+
+fun lower_short_circuit(ctx: *lctx.LowerCtx, lhs_id: ast.NodeId, rhs_id: ast.NodeId,
+                        store: *ast.NodeStore, loc: ir.SrcRef, is_and: bool) ir.ValueId {
+    val rhs_block_res: Result[ir.BlockId, str] = builder.create_block(?ctx.fb, "sc_rhs");
+    val merge_block_res: Result[ir.BlockId, str] = builder.create_block(?ctx.fb, "sc_merge");
+    if (rhs_block_res::bool == false || merge_block_res::bool == false) { ret ir.VALUE_NONE; }
+    val rhs_block: ir.BlockId = unwrap_ok[ir.BlockId, str](rhs_block_res);
+    val merge_block: ir.BlockId = unwrap_ok[ir.BlockId, str](merge_block_res);
+
+    val lhs: ir.ValueId = lower_expr(ctx, lhs_id, store);
+    if (lhs::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    if (is_and) {
+        builder.build_cond_br(?ctx.fb, lhs, rhs_block, nil, 0, merge_block, nil, 0, loc);
+    } or {
+        builder.build_cond_br(?ctx.fb, lhs, merge_block, nil, 0, rhs_block, nil, 0, loc);
+    }
+
+    builder.switch_to_block(?ctx.fb, rhs_block);
+    val rhs: ir.ValueId = lower_expr(ctx, rhs_id, store);
+    builder.build_br(?ctx.fb, merge_block, nil, 0, loc);
+
+    builder.switch_to_block(?ctx.fb, merge_block);
+    ret lhs;
+}
+
+fun lower_unary(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val operand_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    val op_tag: u32 = ast.get_extra(store, node.payload + 1);
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+
+    val operand: ir.ValueId = lower_expr(ctx, operand_id, store);
+    if (operand::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    var mir_op: op.Op = 0;
+    if (op_tag == token.TAG_MINUS) {
+        mir_op = if (lctx.is_float(ctx, tid)) { op.OP_FNEG; } or { op.OP_NEG; };
+    }
+    if (op_tag == token.TAG_BANG) { mir_op = op.OP_LNOT; }
+    if (op_tag == token.TAG_TILDE) { mir_op = op.OP_NOT; }
+
+    if (mir_op::u8 != 0) {
+        val res: Result[ir.ValueId, str] = builder.build_unop(?ctx.fb, mir_op, tid, operand, loc);
+        if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_call(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val callee_id: ast.NodeId = ast.call_callee(store, node_id);
+    val args_span: ast.NodeSpan = ast.call_args(store, node_id);
+    val ret_tid: type.TypeId = lctx.node_type(ctx, node_id);
+
+    val callee_node: *ast.Node = ast.get(store, callee_id);
+    if (callee_node.kind == ast.NK_EXPR_IDENT) {
+        val name_sid: ast.StrId = ast.get_extra(store, callee_node.payload)::ast.StrId;
+        val name: str = ast.get_str(store, name_sid);
+
+        if (name != nil && str_equals(name, "va_start")) {
+            ret lower_va_start(ctx, args_span, store, loc);
+        }
+        if (name != nil && str_equals(name, "va_arg")) {
+            ret lower_va_arg(ctx, args_span, store, ret_tid, loc);
+        }
+        if (name != nil && str_equals(name, "va_end")) {
+            ret ir.VALUE_NONE;
+        }
+    }
+
+    var arg_vals: [64]ir.ValueId;
+    var arg_count: u16 = 0;
+
+    var ai: u32 = 0;
+    for (ai < args_span.len && arg_count < 64) {
+        val arg_nid: ast.NodeId = ast.get_extra(store, args_span.start + ai)::ast.NodeId;
+        if (arg_nid::u32 != ast.NODE_NIL::u32) {
+            arg_vals[arg_count] = lower_expr(ctx, arg_nid, store);
+            arg_count = arg_count + 1;
+        }
+        ai = ai + 1;
+    }
+
+    if (callee_node.kind == ast.NK_EXPR_IDENT) {
+        val name_sid: ast.StrId = ast.get_extra(store, callee_node.payload)::ast.StrId;
+        var name: str = ast.get_str(store, name_sid);
+
+        val sym_id: scope.SymbolId = lctx.node_sym(ctx, callee_id);
+        if (sym_id::u32 != scope.SYM_NIL::u32) {
+            val sym: *scope.Symbol = lctx.get_sym(ctx, sym_id);
+            if (sym != nil && sym.export_name != nil) {
+                name = sym.export_name;
+            } or {
+                val fn_mod: *smod.Module = smod.get(ctx.sema.modules, ctx.current_mod);
+                name = lctx.mangle_symbol(ctx, fn_mod.path, name);
+            }
+        }
+
+        val sym_res: Result[ir.SymId, str] = builder.module_add_symbol(ctx.mb, name, false);
+        if (sym_res::bool) {
+            val sid: ir.SymId = unwrap_ok[ir.SymId, str](sym_res);
+            val res: Result[ir.ValueId, str] = builder.build_call(?ctx.fb, ret_tid, sid, ?arg_vals[0], arg_count, loc);
+            if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+        }
+    } or {
+        val callee_val: ir.ValueId = lower_expr(ctx, callee_id, store);
+        if (callee_val::u32 != ir.VALUE_NONE::u32) {
+            val res: Result[ir.ValueId, str] = builder.build_call_indirect(?ctx.fb, ret_tid, callee_val, ?arg_vals[0], arg_count, loc);
+            if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+        }
+    }
+
+    ret ir.VALUE_NONE;
+}
+
+fun lower_va_start(ctx: *lctx.LowerCtx, args_span: ast.NodeSpan, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    if (args_span.len < 1) { ret ir.VALUE_NONE; }
+    val arg_nid: ast.NodeId = ast.get_extra(store, args_span.start)::ast.NodeId;
+    val va_ptr: ir.ValueId = lower_expr(ctx, arg_nid, store);
+    if (va_ptr::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    var args: [1]ir.ValueId;
+    args[0] = va_ptr;
+    val void_tid: type.TypeId = type.TK_VOID::type.TypeId;
+    builder.emit(?ctx.fb, op.OP_VA_START, 0, void_tid, ?args[0], 1,
+                 ir.BLOCK_NONE, ir.BLOCK_NONE, 0, loc);
+    ret ir.VALUE_NONE;
+}
+
+fun lower_va_arg(ctx: *lctx.LowerCtx, args_span: ast.NodeSpan, store: *ast.NodeStore,
+                 ret_tid: type.TypeId, loc: ir.SrcRef) ir.ValueId {
+    if (args_span.len < 1) { ret ir.VALUE_NONE; }
+    val arg_nid: ast.NodeId = ast.get_extra(store, args_span.start)::ast.NodeId;
+    val va_ptr: ir.ValueId = lower_expr(ctx, arg_nid, store);
+    if (va_ptr::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    var args: [1]ir.ValueId;
+    args[0] = va_ptr;
+    val res: Result[ir.ValueId, str] = builder.emit(?ctx.fb, op.OP_VA_ARG, 0, ret_tid, ?args[0], 1,
+                                                     ir.BLOCK_NONE, ir.BLOCK_NONE, 0, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_field(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val ptr: ir.ValueId = lower_field_ptr(ctx, node_id, store, loc);
+    if (ptr::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    if (lctx.is_aggregate(ctx, tid)) { ret ptr; }
+    val res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, tid, ptr, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_field_ptr(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val base_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    val field_sid: ast.StrId = ast.get_extra(store, node.payload + 1)::ast.StrId;
+    val field_name: str = ast.get_str(store, field_sid);
+
+    val base_ptr: ir.ValueId = lower_lvalue(ctx, base_id, store);
+    if (base_ptr::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    val base_tid: type.TypeId = lctx.node_type(ctx, base_id);
+    val t: *type.Type = lctx.get_type(ctx, base_tid);
+    if (t == nil) { ret ir.VALUE_NONE; }
+
+    var actual_t: *type.Type = t;
+    if (t.kind == type.TK_POINTER) {
+        actual_t = lctx.get_type(ctx, t.pointee);
+        if (actual_t == nil) { ret ir.VALUE_NONE; }
+    }
+
+    var field_idx: u32 = 0;
+    var found: bool = false;
+    var fi: u16 = 0;
+    for (fi < actual_t.field_count) {
+        if (actual_t.fields[fi].name != nil && str_equals(actual_t.fields[fi].name, field_name)) {
+            field_idx = fi::u32;
+            found = true;
+        }
+        fi = fi + 1;
+    }
+
+    if (!found) { ret ir.VALUE_NONE; }
+
+    val ptr_tid: type.TypeId = type.TK_POINTER::type.TypeId;
+    val res: Result[ir.ValueId, str] = builder.build_field_ptr(?ctx.fb, ptr_tid, base_ptr, field_idx, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_index(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val ptr: ir.ValueId = lower_index_ptr(ctx, node_id, store, loc);
+    if (ptr::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    if (lctx.is_aggregate(ctx, tid)) { ret ptr; }
+    val res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, tid, ptr, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_index_ptr(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val base_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    val idx_id: ast.NodeId = ast.get_extra(store, node.payload + 1)::ast.NodeId;
+
+    val base_ptr: ir.ValueId = lower_lvalue(ctx, base_id, store);
+    val index_val: ir.ValueId = lower_expr(ctx, idx_id, store);
+    if (base_ptr::u32 == ir.VALUE_NONE::u32 || index_val::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    val ptr_tid: type.TypeId = type.TK_POINTER::type.TypeId;
+    val res: Result[ir.ValueId, str] = builder.build_index_ptr(?ctx.fb, ptr_tid, base_ptr, index_val, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_cast(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val inner_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    val src_tid: type.TypeId = lctx.node_type(ctx, inner_id);
+    val dst_tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val operand: ir.ValueId = lower_expr(ctx, inner_id, store);
+    if (operand::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    val src_sz: u32 = lctx.type_size(ctx, src_tid);
+    val dst_sz: u32 = lctx.type_size(ctx, dst_tid);
+    val src_float: bool = lctx.is_float(ctx, src_tid);
+    val dst_float: bool = lctx.is_float(ctx, dst_tid);
+    val src_signed: bool = lctx.is_signed(ctx, src_tid);
+    val src_ptr: bool = lctx.is_pointer(ctx, src_tid);
+    val dst_ptr: bool = lctx.is_pointer(ctx, dst_tid);
+
+    var conv_op: op.Op = 0;
+
+    if (src_float && dst_float) {
+        conv_op = if (dst_sz > src_sz) { op.OP_FEXT; } or { op.OP_FTRUNC; };
+    } or (src_float && !dst_float) {
+        conv_op = op.OP_FTOI;
+    } or (!src_float && dst_float) {
+        conv_op = op.OP_ITOF;
+    } or (src_ptr && !dst_ptr) {
+        conv_op = op.OP_PTR_TO_INT;
+    } or (!src_ptr && dst_ptr) {
+        conv_op = op.OP_INT_TO_PTR;
+    } or (src_ptr && dst_ptr) {
+        conv_op = op.OP_BITCAST;
+    } or (dst_sz > src_sz) {
+        conv_op = if (src_signed) { op.OP_SEXT; } or { op.OP_ZEXT; };
+    } or (dst_sz < src_sz) {
+        conv_op = op.OP_TRUNC;
+    } or {
+        conv_op = op.OP_BITCAST;
+    }
+
+    if (conv_op::u8 != 0) {
+        val res: Result[ir.ValueId, str] = builder.build_conv(?ctx.fb, conv_op, dst_tid, operand, loc);
+        if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    }
+    ret operand;
+}
+
+fun lower_addr(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val inner_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    ret lower_lvalue(ctx, inner_id, store);
+}
+
+fun lower_deref(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val node: *ast.Node = ast.get(store, node_id);
+    val inner_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    val ptr_val: ir.ValueId = lower_expr(ctx, inner_id, store);
+    if (ptr_val::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+    if (lctx.is_aggregate(ctx, tid)) { ret ptr_val; }
+    val res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, tid, ptr_val, loc);
+    if (res::bool) { ret unwrap_ok[ir.ValueId, str](res); }
+    ret ir.VALUE_NONE;
+}
+
+fun lower_struct_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val sz: u32 = lctx.type_size(ctx, tid);
+    val al: u32 = lctx.type_align(ctx, tid);
+    val ptr_tid: type.TypeId = type.TK_POINTER::type.TypeId;
+
+    val alloca_res: Result[ir.ValueId, str] = builder.build_alloca(?ctx.fb, ptr_tid, sz::u64, al::u16, loc);
+    if (alloca_res::bool == false) { ret ir.VALUE_NONE; }
+    val ptr: ir.ValueId = unwrap_ok[ir.ValueId, str](alloca_res);
+
+    val node: *ast.Node = ast.get(store, node_id);
+    val fields_start: u32 = ast.get_extra(store, node.payload + 1);
+    val fields_count: u32 = ast.get_extra(store, node.payload + 2);
+
+    var fi: u32 = 0;
+    for (fi < fields_count) {
+        val init_id: ast.NodeId = ast.get_extra(store, fields_start + fi)::ast.NodeId;
+        if (init_id::u32 != ast.NODE_NIL::u32) {
+            val init_node: *ast.Node = ast.get(store, init_id);
+            val val_id: ast.NodeId = ast.get_extra(store, init_node.payload + 1)::ast.NodeId;
+            val field_val: ir.ValueId = lower_expr(ctx, val_id, store);
+            if (field_val::u32 != ir.VALUE_NONE::u32) {
+                val fptr_res: Result[ir.ValueId, str] = builder.build_field_ptr(?ctx.fb, ptr_tid, ptr, fi, loc);
+                if (fptr_res::bool) {
+                    val fptr: ir.ValueId = unwrap_ok[ir.ValueId, str](fptr_res);
+                    val field_tid: type.TypeId = lctx.node_type(ctx, val_id);
+                    if (lctx.is_aggregate(ctx, field_tid)) {
+                        val fsz: u32 = lctx.type_size(ctx, field_tid);
+                        builder.build_copy(?ctx.fb, fptr, field_val, fsz::u64, loc);
+                    } or {
+                        builder.build_store(?ctx.fb, fptr, field_val, loc);
+                    }
+                }
+            }
+        }
+        fi = fi + 1;
+    }
+
+    ret ptr;
+}
+
+fun lower_array_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
+    val tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val sz: u32 = lctx.type_size(ctx, tid);
+    val al: u32 = lctx.type_align(ctx, tid);
+    val ptr_tid: type.TypeId = type.TK_POINTER::type.TypeId;
+
+    val alloca_res: Result[ir.ValueId, str] = builder.build_alloca(?ctx.fb, ptr_tid, sz::u64, al::u16, loc);
+    if (alloca_res::bool == false) { ret ir.VALUE_NONE; }
+    val ptr: ir.ValueId = unwrap_ok[ir.ValueId, str](alloca_res);
+
+    val node: *ast.Node = ast.get(store, node_id);
+    val elems_start: u32 = ast.get_extra(store, node.payload);
+    val elems_count: u32 = ast.get_extra(store, node.payload + 1);
+
+    var ei: u32 = 0;
+    for (ei < elems_count) {
+        val elem_id: ast.NodeId = ast.get_extra(store, elems_start + ei)::ast.NodeId;
+        if (elem_id::u32 != ast.NODE_NIL::u32) {
+            val elem_val: ir.ValueId = lower_expr(ctx, elem_id, store);
+            if (elem_val::u32 != ir.VALUE_NONE::u32) {
+                val idx_res: Result[ir.ValueId, str] = builder.build_iconst(?ctx.fb, type.TK_U64::type.TypeId, ei::u64, loc);
+                if (idx_res::bool) {
+                    val idx_val: ir.ValueId = unwrap_ok[ir.ValueId, str](idx_res);
+                    val eptr_res: Result[ir.ValueId, str] = builder.build_index_ptr(?ctx.fb, ptr_tid, ptr, idx_val, loc);
+                    if (eptr_res::bool) {
+                        val eptr: ir.ValueId = unwrap_ok[ir.ValueId, str](eptr_res);
+                        val elem_tid: type.TypeId = lctx.node_type(ctx, elem_id);
+                        if (lctx.is_aggregate(ctx, elem_tid)) {
+                            val esz: u32 = lctx.type_size(ctx, elem_tid);
+                            builder.build_copy(?ctx.fb, eptr, elem_val, esz::u64, loc);
+                        } or {
+                            builder.build_store(?ctx.fb, eptr, elem_val, loc);
+                        }
+                    }
+                }
+            }
+        }
+        ei = ei + 1;
+    }
+
+    ret ptr;
+}

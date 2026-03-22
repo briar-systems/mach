@@ -1,0 +1,365 @@
+# mach.compiler.mir.lower.ctx: shared lowering context and utilities
+#
+# carries all state needed during AST → MIR translation. variables are
+# represented as alloca pointers (load/store through them). a later
+# mem2reg pass promotes allocas to proper SSA values.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use mem:       std.mem;
+use diag:      mach.compiler.diag;
+
+use sema_mod: mach.compiler.sema.sema;
+use type:     mach.compiler.sema.type;
+use scope:    mach.compiler.sema.scope;
+use smod:     mach.compiler.sema.module;
+use mono:     mach.compiler.sema.mono;
+
+use ast:     mach.compiler.parse.ast;
+use linemap: mach.compiler.lex.linemap;
+
+use op:      mach.compiler.mir.op;
+use ir:      mach.compiler.mir.ir;
+use builder: mach.compiler.mir.builder;
+
+# a local variable tracked during lowering — maps name to its alloca pointer
+pub rec Local {
+    name:    str;
+    type_id: type.TypeId;
+    ptr:     ir.ValueId;     # alloca result (pointer to this variable)
+}
+
+# loop break/continue targets
+pub rec LoopState {
+    brk_block: ir.BlockId;   # block to jump to on break
+    cnt_block: ir.BlockId;   # block to jump to on continue
+}
+
+# deferred statement tracking
+pub rec DeferState {
+    nodes: *ast.NodeId;
+    count: i32;
+    cap:   i32;
+    mark:  i32;
+}
+
+# return state for current function
+pub rec ReturnState {
+    ret_type: type.TypeId;
+}
+
+val MAX_LOCALS: i32 = 1024;
+val INIT_DEFER_CAP: i32 = 16;
+
+# lowering context — carries all state for AST → MIR translation
+pub rec LowerCtx {
+    alloc:        *allocator.Allocator;
+    sema:         *sema_mod.Sema;
+    diag:         *diag.DiagList;
+    mb:           *builder.ModuleBuilder;
+    fb:           builder.FuncBuilder;
+
+    current_mod:  smod.ModuleId;
+    src_path:     str;
+    file_idx:     u16;
+    line_map:     *linemap.LineMap;
+
+    locals:       *Local;
+    local_count:  i32;
+
+    ls:           LoopState;
+    ds:           DeferState;
+    rs:           ReturnState;
+
+    ptr_size:     u8;
+    str_counter:  u32;
+    fn_is_variadic: bool;
+}
+
+# initialize a lowering context
+pub fun init(alloc: *allocator.Allocator, sa: *sema_mod.Sema,
+             dl: *diag.DiagList, mb: *builder.ModuleBuilder) LowerCtx {
+    var ctx: LowerCtx;
+    ctx.alloc       = alloc;
+    ctx.sema        = sa;
+    ctx.diag        = dl;
+    ctx.mb          = mb;
+    ctx.current_mod = 0::smod.ModuleId;
+    ctx.src_path    = nil;
+    ctx.file_idx    = 0;
+    ctx.line_map    = nil;
+    ctx.local_count = 0;
+    ctx.ls.brk_block = ir.BLOCK_NONE;
+    ctx.ls.cnt_block = ir.BLOCK_NONE;
+    ctx.ds.nodes    = nil;
+    ctx.ds.count    = 0;
+    ctx.ds.cap      = 0;
+    ctx.ds.mark     = 0;
+    ctx.rs.ret_type = type.TYPE_NIL;
+    ctx.ptr_size    = 8;
+    ctx.str_counter = 0;
+    ctx.fn_is_variadic = false;
+
+    val res: Result[*Local, str] = allocator.allocate[Local](alloc, MAX_LOCALS::usize);
+    if (res::bool) {
+        ctx.locals = unwrap_ok[*Local, str](res);
+    } or {
+        ctx.locals = nil;
+    }
+
+    ret ctx;
+}
+
+# get resolved type for an AST node from sema side tables
+pub fun node_type(ctx: *LowerCtx, node_id: ast.NodeId) type.TypeId {
+    val m: *smod.Module = smod.get(ctx.sema.modules, ctx.current_mod);
+    ret smod.get_expr_type(m, node_id);
+}
+
+# get resolved symbol for an AST node from sema side tables
+pub fun node_sym(ctx: *LowerCtx, node_id: ast.NodeId) scope.SymbolId {
+    val m: *smod.Module = smod.get(ctx.sema.modules, ctx.current_mod);
+    ret smod.get_node_sym(m, node_id);
+}
+
+# get type of a symbol
+pub fun sym_type(ctx: *LowerCtx, sym_id: scope.SymbolId) type.TypeId {
+    if (sym_id::u32 == scope.SYM_NIL::u32) { ret type.TYPE_NIL; }
+    val sym: *scope.Symbol = scope.get_sym(ctx.sema.symbols, sym_id);
+    if (sym == nil) { ret type.TYPE_NIL; }
+    ret sym.type_id::type.TypeId;
+}
+
+# get symbol record
+pub fun get_sym(ctx: *LowerCtx, sym_id: scope.SymbolId) *scope.Symbol {
+    if (sym_id::u32 == scope.SYM_NIL::u32) { ret nil; }
+    ret scope.get_sym(ctx.sema.symbols, sym_id);
+}
+
+# get type record
+pub fun get_type(ctx: *LowerCtx, tid: type.TypeId) *type.Type {
+    if (tid::u32 == type.TYPE_NIL::u32) { ret nil; }
+    ret type.get(ctx.sema.types, tid);
+}
+
+# type size in bytes
+pub fun type_size(ctx: *LowerCtx, tid: type.TypeId) u32 {
+    if (tid::u32 == type.TYPE_NIL::u32) { ret 0; }
+    val t: *type.Type = type.get(ctx.sema.types, tid);
+    if (t == nil) { ret 0; }
+    ret t.size;
+}
+
+# type alignment in bytes
+pub fun type_align(ctx: *LowerCtx, tid: type.TypeId) u32 {
+    if (tid::u32 == type.TYPE_NIL::u32) { ret 1; }
+    val t: *type.Type = type.get(ctx.sema.types, tid);
+    if (t == nil) { ret 1; }
+    if (t.align == 0) { ret 1; }
+    ret t.align;
+}
+
+# returns true if a type is a floating point type
+pub fun is_float(ctx: *LowerCtx, tid: type.TypeId) bool {
+    val t: *type.Type = get_type(ctx, tid);
+    if (t == nil) { ret false; }
+    ret t.kind == type.TK_F32 || t.kind == type.TK_F64;
+}
+
+# returns true if a type is a signed integer type
+pub fun is_signed(ctx: *LowerCtx, tid: type.TypeId) bool {
+    val t: *type.Type = get_type(ctx, tid);
+    if (t == nil) { ret false; }
+    ret t.kind == type.TK_I8 || t.kind == type.TK_I16 ||
+        t.kind == type.TK_I32 || t.kind == type.TK_I64;
+}
+
+# returns true if a type is a pointer or opaque pointer
+pub fun is_pointer(ctx: *LowerCtx, tid: type.TypeId) bool {
+    val t: *type.Type = get_type(ctx, tid);
+    if (t == nil) { ret false; }
+    ret t.kind == type.TK_POINTER || t.kind == type.TK_OPAQUE_PTR;
+}
+
+# returns true if a type is an aggregate (record, union, array) that
+# should be passed by reference / stored in memory
+pub fun is_aggregate(ctx: *LowerCtx, tid: type.TypeId) bool {
+    val t: *type.Type = get_type(ctx, tid);
+    if (t == nil) { ret false; }
+    ret t.kind == type.TK_RECORD || t.kind == type.TK_UNION || t.kind == type.TK_ARRAY;
+}
+
+# build a source location reference from current context + AST node
+pub fun make_loc(ctx: *LowerCtx, store: *ast.NodeStore, node_id: ast.NodeId) ir.SrcRef {
+    var loc: ir.SrcRef;
+    loc.file_idx = ctx.file_idx;
+    loc.line = 0;
+
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret loc; }
+    val node: *ast.Node = ast.get(store, node_id);
+    if (ctx.line_map != nil) {
+        val tok: u32 = node.tok_idx;
+        loc.line = linemap.token_to_line(ctx.line_map, tok);
+    }
+    ret loc;
+}
+
+# register a local variable (creates alloca, returns the pointer value)
+pub fun push_local(ctx: *LowerCtx, name: str, tid: type.TypeId, loc: ir.SrcRef) Result[ir.ValueId, str] {
+    val sz: u32 = type_size(ctx, tid);
+    val al: u32 = type_align(ctx, tid);
+
+    val ptr_tid: type.TypeId = type.TK_POINTER::type.TypeId;
+    val res: Result[ir.ValueId, str] = builder.build_alloca(?ctx.fb, ptr_tid, sz::u64, al::u16, loc);
+    if (res::bool == false) { ret res; }
+    val ptr_val: ir.ValueId = unwrap_ok[ir.ValueId, str](res);
+
+    if (ctx.local_count < MAX_LOCALS && ctx.locals != nil) {
+        val idx: i32 = ctx.local_count;
+        ctx.locals[idx].name    = name;
+        ctx.locals[idx].type_id = tid;
+        ctx.locals[idx].ptr     = ptr_val;
+        ctx.local_count = idx + 1;
+    }
+
+    ret ok[ir.ValueId, str](ptr_val);
+}
+
+# find a local variable by name, returns its alloca pointer (VALUE_NONE if not found)
+pub fun find_local(ctx: *LowerCtx, name: str) ir.ValueId {
+    if (name == nil || ctx.locals == nil) { ret ir.VALUE_NONE; }
+    var i: i32 = ctx.local_count - 1;
+    for (i >= 0) {
+        if (ctx.locals[i].name != nil && str_equals(ctx.locals[i].name, name)) {
+            ret ctx.locals[i].ptr;
+        }
+        i = i - 1;
+    }
+    ret ir.VALUE_NONE;
+}
+
+# find a local variable's type by name
+pub fun find_local_type(ctx: *LowerCtx, name: str) type.TypeId {
+    if (name == nil || ctx.locals == nil) { ret type.TYPE_NIL; }
+    var i: i32 = ctx.local_count - 1;
+    for (i >= 0) {
+        if (ctx.locals[i].name != nil && str_equals(ctx.locals[i].name, name)) {
+            ret ctx.locals[i].type_id;
+        }
+        i = i - 1;
+    }
+    ret type.TYPE_NIL;
+}
+
+# save local count for scope nesting
+pub fun save_locals(ctx: *LowerCtx) i32 {
+    ret ctx.local_count;
+}
+
+# restore local count (discard inner scope locals)
+pub fun restore_locals(ctx: *LowerCtx, saved: i32) {
+    ctx.local_count = saved;
+}
+
+# defer state: save mark for scope nesting
+pub fun defer_mark(ctx: *LowerCtx) i32 {
+    ret ctx.ds.count;
+}
+
+# defer state: push a deferred statement
+pub fun defer_push(ctx: *LowerCtx, node_id: ast.NodeId) {
+    if (ctx.ds.count >= ctx.ds.cap) {
+        val new_cap: i32 = if (ctx.ds.cap == 0) { INIT_DEFER_CAP; } or { ctx.ds.cap * 2; };
+        val res: Result[*ast.NodeId, str] = allocator.resize[ast.NodeId](
+            ctx.alloc, ctx.ds.nodes, ctx.ds.cap::usize, new_cap::usize
+        );
+        if (res::bool == false) { ret; }
+        ctx.ds.nodes = unwrap_ok[*ast.NodeId, str](res);
+        ctx.ds.cap = new_cap;
+    }
+    ctx.ds.nodes[ctx.ds.count] = node_id;
+    ctx.ds.count = ctx.ds.count + 1;
+}
+
+# mangle a symbol name: module_path.name → module_path__name
+pub fun mangle_symbol(ctx: *LowerCtx, mod_path: str, name: str) str {
+    if (mod_path == nil) { ret name; }
+    if (name == nil) { ret mod_path; }
+
+    val path_len: usize = mem.str_len(mod_path);
+    val name_len: usize = mem.str_len(name);
+    val total: usize = path_len + 2 + name_len + 1;
+
+    val res: Result[*u8, str] = allocator.allocate[u8](ctx.alloc, total);
+    if (res::bool == false) { ret name; }
+    val buf: *u8 = unwrap_ok[*u8, str](res);
+
+    mem.raw_copy(buf::ptr, mod_path, path_len);
+
+    var i: usize = 0;
+    for (i < path_len) {
+        if (buf[i] == 46) { buf[i] = 95; }
+        i = i + 1;
+    }
+
+    buf[path_len] = 95;
+    buf[path_len + 1] = 95;
+    mem.raw_copy((buf::usize + path_len + 2)::ptr, name, name_len);
+    buf[total - 1] = 0;
+    ret buf::str;
+}
+
+# generate a unique string constant label (.str.0, .str.1, etc.)
+pub fun next_str_label(ctx: *LowerCtx) str {
+    val idx: u32 = ctx.str_counter;
+    ctx.str_counter = idx + 1;
+
+    val res: Result[*u8, str] = allocator.allocate[u8](ctx.alloc, 16);
+    if (res::bool == false) { ret ".str"; }
+    val buf: *u8 = unwrap_ok[*u8, str](res);
+
+    buf[0] = 46;  # '.'
+    buf[1] = 115; # 's'
+    buf[2] = 116; # 't'
+    buf[3] = 114; # 'r'
+    buf[4] = 46;  # '.'
+
+    var n: u32 = idx;
+    var pos: usize = 5;
+    if (n == 0) {
+        buf[pos] = 48;
+        pos = pos + 1;
+    } or {
+        var digits: [10]u8;
+        var dcount: usize = 0;
+        for (n > 0) {
+            digits[dcount] = (n % 10)::u8 + 48;
+            n = n / 10;
+            dcount = dcount + 1;
+        }
+        var di: usize = dcount;
+        for (di > 0) {
+            di = di - 1;
+            buf[pos] = digits[di];
+            pos = pos + 1;
+        }
+    }
+    buf[pos] = 0;
+    ret buf::str;
+}
+
+# emit a diagnostic error
+pub fun emit_error(ctx: *LowerCtx, loc: ir.SrcRef, msg: str) {
+    if (ctx.diag == nil) { ret; }
+    var dloc: diag.SourceLoc;
+    dloc.file = ctx.src_path;
+    dloc.line = loc.line;
+    dloc.col = 0;
+    dloc.offset = 0;
+    dloc.len = 0;
+    diag.error(ctx.diag, dloc, msg);
+}
