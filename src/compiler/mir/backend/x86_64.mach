@@ -1,0 +1,696 @@
+# mach.compiler.mir.backend.x86_64: MIR → x86_64 instruction selection
+#
+# maps MIR SSA instructions to x86_64 machine instructions (isa.Inst).
+# each MIR ValueId becomes a virtual register (ValueId + VREG_BASE).
+# the register allocator assigns physical registers afterward.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use isa:   mach.compiler.target.isa;
+use x86:   mach.compiler.target.isa.x86_64.defs;
+use op:    mach.compiler.mir.op;
+use ir:    mach.compiler.mir.ir;
+use frame: mach.compiler.mir.backend.frame;
+
+val VREG_BASE: i32 = 32;
+val FP_REG:    i32 = 5;
+
+# convert MIR ValueId to virtual register ID for regalloc
+fun vreg(v: ir.ValueId) i32 {
+    ret v::i32 + VREG_BASE;
+}
+
+# get operand size from type info
+fun op_size(func: *ir.Function, v: ir.ValueId) u8 {
+    if (v::u32 == ir.VALUE_NONE::u32 || v::u32 >= func.value_count) { ret 8; }
+    val t: *ir.Value = ?func.values[v::u32];
+    val tk: u32 = t.type_id::u32;
+    if (tk == 1 || tk == 5 || tk == 11) { ret 1; }
+    if (tk == 2 || tk == 6) { ret 2; }
+    if (tk == 3 || tk == 7 || tk == 9) { ret 4; }
+    ret 8;
+}
+
+# get result size for an instruction
+fun inst_size(func: *ir.Function, inst: *ir.Inst) u8 {
+    if (inst.result::u32 != ir.VALUE_NONE::u32) {
+        ret op_size(func, inst.result);
+    }
+    ret 8;
+}
+
+# emit a label pseudo-instruction for a MIR block
+fun emit_label(out: *isa.InstBuf, name: str) {
+    var mi: isa.Inst;
+    mi.opcode   = 0xFFFF;
+    mi.dst      = isa.make_label(name);
+    mi.src1.kind = 0;
+    mi.src2.kind = 0;
+    mi.size     = 0;
+    mi.flags    = 0;
+    mi.src_line = 0;
+    mi.src_file = nil;
+    isa.buf_append(out, mi);
+}
+
+# emit a register-to-register instruction
+fun emit_rr(out: *isa.InstBuf, opc: u16, dst: i32, src: i32, sz: u8, line: u32, file: str) {
+    var mi: isa.Inst;
+    mi.opcode   = opc;
+    mi.dst      = isa.make_reg(dst, sz);
+    mi.src1     = isa.make_reg(src, sz);
+    mi.src2.kind = 0;
+    mi.size     = sz;
+    mi.flags    = if (sz == 8) { x86.FLAG_REX_W; } or { 0; };
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+# emit a register-immediate instruction
+fun emit_ri(out: *isa.InstBuf, opc: u16, dst: i32, imm: i64, sz: u8, line: u32, file: str) {
+    var mi: isa.Inst;
+    mi.opcode   = opc;
+    mi.dst      = isa.make_reg(dst, sz);
+    mi.src1     = isa.make_imm(imm, sz);
+    mi.src2.kind = 0;
+    mi.size     = sz;
+    mi.flags    = if (sz == 8) { x86.FLAG_REX_W; } or { 0; };
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+# emit a load from memory [base + disp]
+fun emit_load(out: *isa.InstBuf, dst: i32, base: i32, disp: i32, sz: u8, line: u32, file: str) {
+    var mi: isa.Inst;
+    mi.opcode   = x86.MOV;
+    mi.dst      = isa.make_reg(dst, sz);
+    mi.src1     = isa.make_mem(base, disp, -1, 0, sz);
+    mi.src2.kind = 0;
+    mi.size     = sz;
+    mi.flags    = if (sz == 8) { x86.FLAG_REX_W; } or { 0; };
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+# emit a store to memory [base + disp]
+fun emit_store(out: *isa.InstBuf, base: i32, disp: i32, src: i32, sz: u8, line: u32, file: str) {
+    var mi: isa.Inst;
+    mi.opcode   = x86.MOV;
+    mi.dst      = isa.make_mem(base, disp, -1, 0, sz);
+    mi.src1     = isa.make_reg(src, sz);
+    mi.src2.kind = 0;
+    mi.size     = sz;
+    mi.flags    = if (sz == 8) { x86.FLAG_REX_W; } or { 0; };
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+# emit a register-register-register ALU instruction (dst = src1 op src2)
+fun emit_alu(out: *isa.InstBuf, opc: u16, dst: i32, src1: i32, src2: i32, sz: u8, line: u32, file: str) {
+    if (dst != src1) { emit_rr(out, x86.MOV, dst, src1, sz, line, file); }
+    emit_rr(out, opc, dst, src2, sz, line, file);
+}
+
+# instruction selection entry point for a complete MIR function
+pub fun select(func: *ir.Function, layout: *frame.FrameLayout, out: *isa.InstBuf,
+               alloc: *allocator.Allocator) bool {
+    if (func == nil) { ret false; }
+
+    var bi: u32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = ?func.blocks[bi];
+        emit_label(out, block.name);
+
+        var ii: u32 = 0;
+        for (ii < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+            select_inst(func, inst, layout, out);
+            ii = ii + 1;
+        }
+
+        bi = bi + 1;
+    }
+
+    ret true;
+}
+
+fun select_inst(func: *ir.Function, inst: *ir.Inst, layout: *frame.FrameLayout, out: *isa.InstBuf) {
+    val o: op.Op = inst.op;
+    val line: u32 = inst.loc.line;
+    val file: str = nil;
+    val sz: u8 = inst_size(func, inst);
+
+    if (o == op.OP_ICONST)       { sel_iconst(func, inst, out, sz, line, file); ret; }
+    if (o == op.OP_FCONST)       { sel_fconst(func, inst, out, sz, line, file); ret; }
+    if (o == op.OP_BCONST)       { sel_iconst(func, inst, out, 1, line, file); ret; }
+    if (o == op.OP_NULLPTR)      { sel_nullptr(func, inst, out, line, file); ret; }
+    if (o == op.OP_GLOBAL_ADDR)  { sel_global_addr(func, inst, out, line, file); ret; }
+    if (o == op.OP_PARAM)        { sel_param(func, inst, out, line, file); ret; }
+    if (o == op.OP_ALLOCA)       { sel_alloca(func, inst, layout, out, line, file); ret; }
+    if (o == op.OP_LOAD)         { sel_load(func, inst, layout, out, sz, line, file); ret; }
+    if (o == op.OP_STORE)        { sel_store(func, inst, layout, out, line, file); ret; }
+    if (o == op.OP_FIELD_PTR)    { sel_field_ptr(func, inst, out, line, file); ret; }
+    if (o == op.OP_INDEX_PTR)    { sel_index_ptr(func, inst, out, line, file); ret; }
+    if (o == op.OP_COPY)         { sel_copy(func, inst, out, line, file); ret; }
+
+    if (o == op.OP_ADD || o == op.OP_SUB || o == op.OP_MUL ||
+        o == op.OP_AND || o == op.OP_OR || o == op.OP_XOR ||
+        o == op.OP_SHL || o == op.OP_LSHR || o == op.OP_ASHR) {
+        sel_binop(func, inst, out, sz, line, file);
+        ret;
+    }
+
+    if (o == op.OP_UDIV || o == op.OP_SDIV || o == op.OP_UREM || o == op.OP_SREM) {
+        sel_div(func, inst, out, sz, line, file);
+        ret;
+    }
+
+    if (o == op.OP_FADD || o == op.OP_FSUB || o == op.OP_FMUL || o == op.OP_FDIV) {
+        sel_float_binop(func, inst, out, sz, line, file);
+        ret;
+    }
+
+    if (o == op.OP_NEG)    { sel_neg(func, inst, out, sz, line, file); ret; }
+    if (o == op.OP_NOT)    { sel_not(func, inst, out, sz, line, file); ret; }
+    if (o == op.OP_LNOT)   { sel_lnot(func, inst, out, sz, line, file); ret; }
+    if (o == op.OP_ICMP)   { sel_icmp(func, inst, out, sz, line, file); ret; }
+    if (o == op.OP_FCMP)   { sel_fcmp(func, inst, out, sz, line, file); ret; }
+
+    if (o == op.OP_BR)         { sel_br(func, inst, out, line, file); ret; }
+    if (o == op.OP_COND_BR)    { sel_cond_br(func, inst, out, line, file); ret; }
+    if (o == op.OP_CALL)       { sel_call(func, inst, out, line, file); ret; }
+    if (o == op.OP_RET)        { sel_ret(func, inst, out, sz, line, file); ret; }
+    if (o == op.OP_UNREACHABLE) { emit_ri(out, x86.UD2, 0, 0, 1, line, file); ret; }
+
+    if (o == op.OP_ZEXT || o == op.OP_SEXT || o == op.OP_TRUNC ||
+        o == op.OP_BITCAST || o == op.OP_PTR_TO_INT || o == op.OP_INT_TO_PTR) {
+        sel_conv(func, inst, out, sz, line, file);
+        ret;
+    }
+
+    if (o == op.OP_SYSCALL) { sel_syscall(func, inst, out, line, file); ret; }
+    if (o == op.OP_FENCE)   { sel_fence(func, inst, out, line, file); ret; }
+}
+
+fun sel_iconst(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val value: i64 = inst.imm::i64;
+    if (value > 0x7FFFFFFF || value < -2147483648::i64) {
+        emit_ri(out, x86.MOVABS, dst, value, 8, line, file);
+    } or {
+        emit_ri(out, x86.MOV, dst, value, sz, line, file);
+    }
+}
+
+fun sel_fconst(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    emit_ri(out, x86.MOVABS, dst, inst.imm::i64, 8, line, file);
+}
+
+fun sel_nullptr(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    emit_rr(out, x86.XOR, dst, dst, 8, line, file);
+}
+
+fun sel_global_addr(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val sym_idx: u32 = inst.imm::u32;
+    var mi: isa.Inst;
+    mi.opcode   = x86.LEA;
+    mi.dst      = isa.make_reg(dst, 8);
+    mi.src1.kind = isa.OPK_LABEL;
+    mi.src1.label = nil;
+    mi.src1.size = 8;
+    mi.src1.reg  = -1;
+    mi.src1.imm  = 0;
+    mi.src1.base = -1;
+    mi.src1.index = -1;
+    mi.src1.scale = 0;
+    mi.src1.disp = 0;
+    mi.src1.sym_id = sym_idx;
+    mi.src2.kind = 0;
+    mi.size     = 8;
+    mi.flags    = x86.FLAG_REX_W;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+fun sel_param(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val pidx: u32 = inst.imm::u32;
+    var src_reg: i32 = x86.RDI;
+    if (pidx == 1) { src_reg = x86.RSI; }
+    if (pidx == 2) { src_reg = x86.RDX; }
+    if (pidx == 3) { src_reg = x86.RCX; }
+    if (pidx == 4) { src_reg = x86.R8; }
+    if (pidx == 5) { src_reg = x86.R9; }
+    if (pidx >= 6) {
+        val stack_off: i32 = 16 + (pidx::i32 - 6) * 8;
+        emit_load(out, dst, FP_REG, stack_off, 8, line, file);
+        ret;
+    }
+    emit_rr(out, x86.MOV, dst, src_reg, 8, line, file);
+}
+
+fun sel_alloca(func: *ir.Function, inst: *ir.Inst, layout: *frame.FrameLayout,
+               out: *isa.InstBuf, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val offset: i64 = frame.slot_offset(layout, inst.result);
+    var mi: isa.Inst;
+    mi.opcode   = x86.LEA;
+    mi.dst      = isa.make_reg(dst, 8);
+    mi.src1     = isa.make_mem(FP_REG, offset::i32, -1, 0, 8);
+    mi.src2.kind = 0;
+    mi.size     = 8;
+    mi.flags    = x86.FLAG_REX_W;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+fun sel_load(func: *ir.Function, inst: *ir.Inst, layout: *frame.FrameLayout,
+             out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val ptr_val: ir.ValueId = ir.inst_arg(func, inst, 0);
+
+    if (frame.is_alloca(layout, ptr_val)) {
+        val offset: i64 = frame.slot_offset(layout, ptr_val);
+        emit_load(out, dst, FP_REG, offset::i32, sz, line, file);
+    } or {
+        val base: i32 = vreg(ptr_val);
+        emit_load(out, dst, base, 0, sz, line, file);
+    }
+}
+
+fun sel_store(func: *ir.Function, inst: *ir.Inst, layout: *frame.FrameLayout,
+              out: *isa.InstBuf, line: u32, file: str) {
+    val ptr_val: ir.ValueId = ir.inst_arg(func, inst, 0);
+    val src_val: ir.ValueId = ir.inst_arg(func, inst, 1);
+    val src: i32 = vreg(src_val);
+    val sz: u8 = op_size(func, src_val);
+
+    if (frame.is_alloca(layout, ptr_val)) {
+        val offset: i64 = frame.slot_offset(layout, ptr_val);
+        emit_store(out, FP_REG, offset::i32, src, sz, line, file);
+    } or {
+        val base: i32 = vreg(ptr_val);
+        emit_store(out, base, 0, src, sz, line, file);
+    }
+}
+
+fun sel_field_ptr(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val base_val: ir.ValueId = ir.inst_arg(func, inst, 0);
+    val base: i32 = vreg(base_val);
+    val field_idx: i32 = inst.imm::i32;
+
+    var mi: isa.Inst;
+    mi.opcode   = x86.LEA;
+    mi.dst      = isa.make_reg(dst, 8);
+    mi.src1     = isa.make_mem(base, field_idx, -1, 0, 8);
+    mi.src2.kind = 0;
+    mi.size     = 8;
+    mi.flags    = x86.FLAG_REX_W;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+fun sel_index_ptr(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val base_val: ir.ValueId = ir.inst_arg(func, inst, 0);
+    val idx_val: ir.ValueId = ir.inst_arg(func, inst, 1);
+    val base: i32 = vreg(base_val);
+    val index: i32 = vreg(idx_val);
+
+    var mi: isa.Inst;
+    mi.opcode   = x86.LEA;
+    mi.dst      = isa.make_reg(dst, 8);
+    mi.src1     = isa.make_mem(base, 0, index, 1, 8);
+    mi.src2.kind = 0;
+    mi.size     = 8;
+    mi.flags    = x86.FLAG_REX_W;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+fun sel_copy(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    val dst_ptr: ir.ValueId = ir.inst_arg(func, inst, 0);
+    val src_ptr: ir.ValueId = ir.inst_arg(func, inst, 1);
+    val byte_count: u64 = inst.imm;
+
+    emit_rr(out, x86.MOV, x86.RDI, vreg(dst_ptr), 8, line, file);
+    emit_rr(out, x86.MOV, x86.RSI, vreg(src_ptr), 8, line, file);
+    emit_ri(out, x86.MOV, x86.RCX, byte_count::i64, 8, line, file);
+
+    var mi: isa.Inst;
+    mi.opcode   = x86.MOVSB;
+    mi.dst.kind = 0;
+    mi.src1.kind = 0;
+    mi.src2.kind = 0;
+    mi.size     = 1;
+    mi.flags    = 0;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+fun sel_binop(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val lhs: i32 = vreg(ir.inst_arg(func, inst, 0));
+    val rhs: i32 = vreg(ir.inst_arg(func, inst, 1));
+
+    var opc: u16 = x86.ADD;
+    val o: op.Op = inst.op;
+    if (o == op.OP_ADD)  { opc = x86.ADD; }
+    if (o == op.OP_SUB)  { opc = x86.SUB; }
+    if (o == op.OP_MUL)  { opc = x86.IMUL; }
+    if (o == op.OP_AND)  { opc = x86.AND; }
+    if (o == op.OP_OR)   { opc = x86.OR; }
+    if (o == op.OP_XOR)  { opc = x86.XOR; }
+    if (o == op.OP_SHL)  { opc = x86.SHL; }
+    if (o == op.OP_LSHR) { opc = x86.SHR; }
+    if (o == op.OP_ASHR) { opc = x86.SAR; }
+
+    emit_alu(out, opc, dst, lhs, rhs, sz, line, file);
+}
+
+fun sel_div(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val lhs: i32 = vreg(ir.inst_arg(func, inst, 0));
+    val rhs: i32 = vreg(ir.inst_arg(func, inst, 1));
+    val o: op.Op = inst.op;
+    val is_signed: bool = o == op.OP_SDIV || o == op.OP_SREM;
+    val is_rem: bool = o == op.OP_UREM || o == op.OP_SREM;
+
+    emit_rr(out, x86.MOV, x86.RAX, lhs, sz, line, file);
+    if (is_signed) {
+        if (sz == 8) {
+            var mi: isa.Inst;
+            mi.opcode = x86.CQO;
+            mi.dst.kind = 0;
+            mi.src1.kind = 0;
+            mi.src2.kind = 0;
+            mi.size = sz;
+            mi.flags = x86.FLAG_REX_W;
+            mi.src_line = line;
+            mi.src_file = file;
+            isa.buf_append(out, mi);
+        } or {
+            var mi: isa.Inst;
+            mi.opcode = x86.CDQ;
+            mi.dst.kind = 0;
+            mi.src1.kind = 0;
+            mi.src2.kind = 0;
+            mi.size = sz;
+            mi.flags = 0;
+            mi.src_line = line;
+            mi.src_file = file;
+            isa.buf_append(out, mi);
+        }
+        emit_rr(out, x86.IDIV, x86.RAX, rhs, sz, line, file);
+    } or {
+        emit_rr(out, x86.XOR, x86.RDX, x86.RDX, sz, line, file);
+        emit_rr(out, x86.DIV, x86.RAX, rhs, sz, line, file);
+    }
+
+    if (is_rem) {
+        emit_rr(out, x86.MOV, dst, x86.RDX, sz, line, file);
+    } or {
+        emit_rr(out, x86.MOV, dst, x86.RAX, sz, line, file);
+    }
+}
+
+fun sel_float_binop(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val lhs: i32 = vreg(ir.inst_arg(func, inst, 0));
+    val rhs: i32 = vreg(ir.inst_arg(func, inst, 1));
+    val o: op.Op = inst.op;
+    val is_d: bool = sz == 8;
+
+    var opc: u16 = x86.ADDSD;
+    if (o == op.OP_FADD) { opc = if (is_d) { x86.ADDSD; } or { x86.ADDSS; }; }
+    if (o == op.OP_FSUB) { opc = if (is_d) { x86.SUBSD; } or { x86.SUBSS; }; }
+    if (o == op.OP_FMUL) { opc = if (is_d) { x86.MULSD; } or { x86.MULSS; }; }
+    if (o == op.OP_FDIV) { opc = if (is_d) { x86.DIVSD; } or { x86.DIVSS; }; }
+
+    val mov_opc: u16 = if (is_d) { x86.MOVSD; } or { x86.MOVSS; };
+    if (dst != lhs) { emit_rr(out, mov_opc, dst, lhs, sz, line, file); }
+    emit_rr(out, opc, dst, rhs, sz, line, file);
+}
+
+fun sel_neg(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val src: i32 = vreg(ir.inst_arg(func, inst, 0));
+    emit_rr(out, x86.XOR, dst, dst, sz, line, file);
+    emit_alu(out, x86.SUB, dst, dst, src, sz, line, file);
+}
+
+fun sel_not(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val src: i32 = vreg(ir.inst_arg(func, inst, 0));
+    emit_rr(out, x86.MOV, dst, src, sz, line, file);
+    emit_ri(out, x86.XOR, dst, -1, sz, line, file);
+}
+
+fun sel_lnot(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val src: i32 = vreg(ir.inst_arg(func, inst, 0));
+    emit_ri(out, x86.CMP, src, 0, 1, line, file);
+    emit_ri(out, x86.SETE, dst, 0, 1, line, file);
+}
+
+fun sel_icmp(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val lhs: i32 = vreg(ir.inst_arg(func, inst, 0));
+    val rhs: i32 = vreg(ir.inst_arg(func, inst, 1));
+    val cc: u16 = inst.flags;
+
+    val lhs_sz: u8 = op_size(func, ir.inst_arg(func, inst, 0));
+    emit_rr(out, x86.CMP, lhs, rhs, lhs_sz, line, file);
+
+    var setcc: u16 = x86.SETE;
+    if (cc == op.CC_EQ::u16)  { setcc = x86.SETE; }
+    if (cc == op.CC_NE::u16)  { setcc = x86.SETNE; }
+    if (cc == op.CC_SLT::u16) { setcc = x86.SETL; }
+    if (cc == op.CC_SLE::u16) { setcc = x86.SETLE; }
+    if (cc == op.CC_SGT::u16) { setcc = x86.SETG; }
+    if (cc == op.CC_SGE::u16) { setcc = x86.SETGE; }
+    if (cc == op.CC_ULT::u16) { setcc = x86.SETB; }
+    if (cc == op.CC_ULE::u16) { setcc = x86.SETBE; }
+    if (cc == op.CC_UGT::u16) { setcc = x86.SETA; }
+    if (cc == op.CC_UGE::u16) { setcc = x86.SETAE; }
+
+    emit_ri(out, setcc, dst, 0, 1, line, file);
+}
+
+fun sel_fcmp(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val lhs: i32 = vreg(ir.inst_arg(func, inst, 0));
+    val rhs: i32 = vreg(ir.inst_arg(func, inst, 1));
+    val lhs_sz: u8 = op_size(func, ir.inst_arg(func, inst, 0));
+    val ucom_opc: u16 = if (lhs_sz == 8) { x86.UCOMISD; } or { x86.UCOMISS; };
+    emit_rr(out, ucom_opc, lhs, rhs, lhs_sz, line, file);
+
+    val cc: u16 = inst.flags;
+    var setcc: u16 = x86.SETE;
+    if (cc == op.CC_EQ::u16)  { setcc = x86.SETE; }
+    if (cc == op.CC_NE::u16)  { setcc = x86.SETNE; }
+    if (cc == op.CC_SLT::u16) { setcc = x86.SETB; }
+    if (cc == op.CC_SLE::u16) { setcc = x86.SETBE; }
+    if (cc == op.CC_SGT::u16) { setcc = x86.SETA; }
+    if (cc == op.CC_SGE::u16) { setcc = x86.SETAE; }
+
+    emit_ri(out, setcc, dst, 0, 1, line, file);
+}
+
+fun sel_br(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    if (inst.target::u32 == ir.BLOCK_NONE::u32 || inst.target::u32 >= func.block_count) { ret; }
+    val tgt_block: *ir.Block = ?func.blocks[inst.target::u32];
+    var mi: isa.Inst;
+    mi.opcode   = x86.JMP;
+    mi.dst      = isa.make_label(tgt_block.name);
+    mi.src1.kind = 0;
+    mi.src2.kind = 0;
+    mi.size     = 0;
+    mi.flags    = 0;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+fun sel_cond_br(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    val cond: i32 = vreg(ir.inst_arg(func, inst, 0));
+    emit_ri(out, x86.TEST, cond, cond::i64, 1, line, file);
+
+    if (inst.else_target::u32 != ir.BLOCK_NONE::u32 && inst.else_target::u32 < func.block_count) {
+        val else_block: *ir.Block = ?func.blocks[inst.else_target::u32];
+        var mi: isa.Inst;
+        mi.opcode   = x86.JE;
+        mi.dst      = isa.make_label(else_block.name);
+        mi.src1.kind = 0;
+        mi.src2.kind = 0;
+        mi.size     = 0;
+        mi.flags    = 0;
+        mi.src_line = line;
+        mi.src_file = file;
+        isa.buf_append(out, mi);
+    }
+
+    if (inst.target::u32 != ir.BLOCK_NONE::u32 && inst.target::u32 < func.block_count) {
+        val then_block: *ir.Block = ?func.blocks[inst.target::u32];
+        var mi: isa.Inst;
+        mi.opcode   = x86.JMP;
+        mi.dst      = isa.make_label(then_block.name);
+        mi.src1.kind = 0;
+        mi.src2.kind = 0;
+        mi.size     = 0;
+        mi.flags    = 0;
+        mi.src_line = line;
+        mi.src_file = file;
+        isa.buf_append(out, mi);
+    }
+}
+
+fun sel_call(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    var ai: u16 = 0;
+    for (ai < inst.arg_count) {
+        val arg_val: ir.ValueId = ir.inst_arg(func, inst, ai);
+        val arg_reg: i32 = vreg(arg_val);
+        var param_reg: i32 = x86.RDI;
+        if (ai == 1) { param_reg = x86.RSI; }
+        if (ai == 2) { param_reg = x86.RDX; }
+        if (ai == 3) { param_reg = x86.RCX; }
+        if (ai == 4) { param_reg = x86.R8; }
+        if (ai == 5) { param_reg = x86.R9; }
+        if (ai < 6) {
+            emit_rr(out, x86.MOV, param_reg, arg_reg, 8, line, file);
+        } or {
+            val stack_slot: i32 = (ai::i32 - 6) * 8;
+            emit_store(out, x86.RSP, stack_slot, arg_reg, 8, line, file);
+        }
+        ai = ai + 1;
+    }
+
+    var mi: isa.Inst;
+    mi.opcode   = x86.CALL;
+    mi.dst.kind = 0;
+    mi.src1.kind = isa.OPK_LABEL;
+    mi.src1.label = nil;
+    mi.src1.size = 8;
+    mi.src1.reg  = -1;
+    mi.src1.imm  = 0;
+    mi.src1.base = -1;
+    mi.src1.index = -1;
+    mi.src1.scale = 0;
+    mi.src1.disp = 0;
+    mi.src1.sym_id = inst.imm::u32;
+    mi.src2.kind = 0;
+    mi.size     = 8;
+    mi.flags    = 0;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+
+    if (inst.result::u32 != ir.VALUE_NONE::u32) {
+        emit_rr(out, x86.MOV, vreg(inst.result), x86.RAX, 8, line, file);
+    }
+}
+
+fun sel_ret(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    if (inst.arg_count > 0) {
+        val ret_val: ir.ValueId = ir.inst_arg(func, inst, 0);
+        if (ret_val::u32 != ir.VALUE_NONE::u32) {
+            emit_rr(out, x86.MOV, x86.RAX, vreg(ret_val), 8, line, file);
+        }
+    }
+
+    var mi: isa.Inst;
+    mi.opcode   = x86.RET;
+    mi.dst.kind = 0;
+    mi.src1.kind = 0;
+    mi.src2.kind = 0;
+    mi.size     = 0;
+    mi.flags    = 0;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+fun sel_conv(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, sz: u8, line: u32, file: str) {
+    val dst: i32 = vreg(inst.result);
+    val src: i32 = vreg(ir.inst_arg(func, inst, 0));
+    val o: op.Op = inst.op;
+    val src_sz: u8 = op_size(func, ir.inst_arg(func, inst, 0));
+
+    if (o == op.OP_ZEXT) {
+        emit_rr(out, x86.MOVZX, dst, src, src_sz, line, file);
+    } or (o == op.OP_SEXT) {
+        if (src_sz == 4 && sz == 8) {
+            emit_rr(out, x86.MOVSXD, dst, src, sz, line, file);
+        } or {
+            emit_rr(out, x86.MOVSX, dst, src, src_sz, line, file);
+        }
+    } or (o == op.OP_TRUNC) {
+        emit_rr(out, x86.MOV, dst, src, sz, line, file);
+    } or {
+        emit_rr(out, x86.MOV, dst, src, 8, line, file);
+    }
+}
+
+fun sel_syscall(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    var ai: u16 = 0;
+    for (ai < inst.arg_count && ai < 7) {
+        val arg_val: ir.ValueId = ir.inst_arg(func, inst, ai);
+        val arg_reg: i32 = vreg(arg_val);
+        var dest_reg: i32 = x86.RAX;
+        if (ai == 1) { dest_reg = x86.RDI; }
+        if (ai == 2) { dest_reg = x86.RSI; }
+        if (ai == 3) { dest_reg = x86.RDX; }
+        if (ai == 4) { dest_reg = x86.R10; }
+        if (ai == 5) { dest_reg = x86.R8; }
+        if (ai == 6) { dest_reg = x86.R9; }
+        emit_rr(out, x86.MOV, dest_reg, arg_reg, 8, line, file);
+        ai = ai + 1;
+    }
+
+    var mi: isa.Inst;
+    mi.opcode   = x86.SYSCALL;
+    mi.dst.kind = 0;
+    mi.src1.kind = 0;
+    mi.src2.kind = 0;
+    mi.size     = 0;
+    mi.flags    = 0;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+
+    if (inst.result::u32 != ir.VALUE_NONE::u32) {
+        emit_rr(out, x86.MOV, vreg(inst.result), x86.RAX, 8, line, file);
+    }
+}
+
+fun sel_fence(func: *ir.Function, inst: *ir.Inst, out: *isa.InstBuf, line: u32, file: str) {
+    var mi: isa.Inst;
+    mi.opcode   = x86.MFENCE;
+    mi.dst.kind = 0;
+    mi.src1.kind = 0;
+    mi.src2.kind = 0;
+    mi.size     = 0;
+    mi.flags    = 0;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}

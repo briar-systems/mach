@@ -1,0 +1,425 @@
+# mach.compiler.mir.backend.compile: target-agnostic MIR compilation driver
+#
+# compiles a MIR module to object code via the target's ISel, register
+# allocator, and encoder. the pipeline is:
+#
+#   MIR Function → Frame Layout → ISel → CFG/Liveness → RegAlloc
+#                → Parallel Copy Resolution → Prologue/Epilogue → Encode
+#
+# the only target-specific component is ISel. adding a new architecture
+# means writing one ISel module and adding a dispatch entry in get_isel().
+# all other pipeline stages are shared.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use mem:       std.mem;
+
+use masm_cfg: masm.cfg;
+
+use diag:   mach.compiler.diag;
+use target: mach.compiler.target.target;
+use isa:    mach.compiler.target.isa;
+use of:     mach.compiler.target.of;
+use ra:     mach.compiler.regalloc;
+
+use op:      mach.compiler.mir.op;
+use ir:      mach.compiler.mir.ir;
+use verify:  mach.compiler.mir.verify;
+use frame:   mach.compiler.mir.backend.frame;
+use x86_isel: mach.compiler.mir.backend.x86_64;
+
+pub rec CompileResult {
+    ok: bool;
+}
+
+# compile a complete MIR module to object code
+pub fun compile_module(module: *ir.Module, tgt: *target.Target,
+                       alloc: *allocator.Allocator, obj: *of.ObjWriter,
+                       dl: *diag.DiagList) CompileResult {
+    var result: CompileResult;
+    result.ok = false;
+
+    if (module == nil || tgt == nil) { ret result; }
+
+    var vr: verify.VerifyResult = verify.verify_module(module);
+    if (!vr.ok) {
+        if (dl != nil) {
+            diag.error(dl, diag.make_loc(nil, 0, 0), "MIR verification failed before compilation");
+        }
+        ret result;
+    }
+
+    var gi: u32 = 0;
+    for (gi < module.glob_count) {
+        emit_global(tgt, alloc, obj, ?module.globals[gi]);
+        gi = gi + 1;
+    }
+
+    var fi: u32 = 0;
+    for (fi < module.func_count) {
+        val func: *ir.Function = ?module.functions[fi];
+        val func_ok: bool = compile_function(func, tgt, alloc, obj, dl);
+        if (!func_ok) { ret result; }
+        fi = fi + 1;
+    }
+
+    result.ok = true;
+    ret result;
+}
+
+# compile a single MIR function to object code
+fun compile_function(func: *ir.Function, tgt: *target.Target,
+                     alloc: *allocator.Allocator, obj: *of.ObjWriter,
+                     dl: *diag.DiagList) bool {
+    if (func == nil || func.block_count == 0) { ret true; }
+
+    var layout: frame.FrameLayout = frame.compute(alloc, func);
+
+    var isel_buf: isa.InstBuf = isa.buf_init(alloc);
+
+    val isel_ok: bool = dispatch_isel(tgt, func, ?layout, ?isel_buf, alloc);
+    if (!isel_ok) {
+        if (dl != nil) {
+            diag.error(dl, diag.make_loc(func.src_path, 0, 0), "instruction selection failed");
+        }
+        isa.buf_dnit(?isel_buf);
+        ret false;
+    }
+
+    var cfg: masm_cfg.CFG = build_mir_cfg(alloc, func);
+    var live: masm_cfg.LiveSets = compute_mir_liveness(alloc, ?cfg, func, ?isel_buf);
+
+    var ra_result: ra.RegAllocResult = ra.alloc_function(
+        alloc, ?tgt.isa, ?tgt.abi, ?isel_buf, layout.frame_size, ?cfg, ?live
+    );
+    isa.buf_dnit(?isel_buf);
+
+    if (!ra_result.ok) {
+        if (dl != nil) {
+            diag.error(dl, diag.make_loc(func.src_path, 0, 0), "register allocation failed");
+        }
+        isa.buf_dnit(?ra_result.out);
+        ret false;
+    }
+
+    val total_frame: usize = compute_frame_size(layout.frame_size, ra_result.spill_size);
+
+    var resolved_buf: isa.InstBuf = resolve_parallel_copies(alloc, ?ra_result.out);
+    isa.buf_dnit(?ra_result.out);
+
+    var final_buf: isa.InstBuf = insert_prologue_epilogue(tgt, alloc, ?resolved_buf, total_frame);
+    isa.buf_dnit(?resolved_buf);
+
+    val emit_ok: bool = encode_and_emit(tgt, alloc, obj, func, ?final_buf);
+    isa.buf_dnit(?final_buf);
+
+    ret emit_ok;
+}
+
+# dispatch ISel to the correct target backend
+fun dispatch_isel(tgt: *target.Target, func: *ir.Function, layout: *frame.FrameLayout,
+                  out: *isa.InstBuf, alloc: *allocator.Allocator) bool {
+    if (str_equals(tgt.isa.name, "x86_64")) {
+        ret x86_isel.select(func, layout, out, alloc);
+    }
+
+    ret false;
+}
+
+# build CFG from MIR block structure
+# each MIR block maps to one CFG node; edges from terminators
+fun build_mir_cfg(alloc: *allocator.Allocator, func: *ir.Function) masm_cfg.CFG {
+    var cfg: masm_cfg.CFG;
+    cfg.block_count = func.block_count::u16;
+    cfg.entry = 0;
+
+    val res: Result[*masm_cfg.BasicBlock, str] = allocator.allocate[masm_cfg.BasicBlock](
+        alloc, func.block_count::usize
+    );
+    if (res::bool == false) {
+        cfg.blocks = nil;
+        cfg.block_count = 0;
+        ret cfg;
+    }
+    cfg.blocks = unwrap_ok[*masm_cfg.BasicBlock, str](res);
+
+    var bi: u32 = 0;
+    for (bi < func.block_count) {
+        cfg.blocks[bi].block = nil;
+        cfg.blocks[bi].id = bi::u16;
+        cfg.blocks[bi].preds = nil;
+        cfg.blocks[bi].npreds = 0;
+        cfg.blocks[bi].succs = nil;
+        cfg.blocks[bi].nsuccs = 0;
+        bi = bi + 1;
+    }
+
+    bi = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = ?func.blocks[bi];
+        if (block.inst_count == 0) { bi = bi + 1; cnt; }
+
+        val last_id: ir.InstId = block.insts[block.inst_count - 1];
+        if (last_id::u32 >= func.inst_count) { bi = bi + 1; cnt; }
+        val last: *ir.Inst = ?func.insts[last_id::u32];
+
+        if (last.op == op.OP_BR) {
+            if (last.target::u32 < func.block_count) {
+                add_cfg_edge(alloc, ?cfg, bi::u16, last.target::u16);
+            }
+        }
+        if (last.op == op.OP_COND_BR) {
+            if (last.target::u32 < func.block_count) {
+                add_cfg_edge(alloc, ?cfg, bi::u16, last.target::u16);
+            }
+            if (last.else_target::u32 < func.block_count) {
+                add_cfg_edge(alloc, ?cfg, bi::u16, last.else_target::u16);
+            }
+        }
+
+        bi = bi + 1;
+    }
+
+    ret cfg;
+}
+
+fun add_cfg_edge(alloc: *allocator.Allocator, cfg: *masm_cfg.CFG, from: u16, to: u16) {
+    val src: *masm_cfg.BasicBlock = ?cfg.blocks[from];
+    val dst: *masm_cfg.BasicBlock = ?cfg.blocks[to];
+
+    val new_succs: u16 = src.nsuccs + 1;
+    val sres: Result[*u16, str] = allocator.allocate[u16](alloc, new_succs::usize);
+    if (sres::bool) {
+        val sarr: *u16 = unwrap_ok[*u16, str](sres);
+        var si: u16 = 0;
+        for (si < src.nsuccs) {
+            sarr[si] = src.succs[si];
+            si = si + 1;
+        }
+        sarr[src.nsuccs] = to;
+        src.succs = sarr;
+        src.nsuccs = new_succs;
+    }
+
+    val new_preds: u16 = dst.npreds + 1;
+    val pres: Result[*u16, str] = allocator.allocate[u16](alloc, new_preds::usize);
+    if (pres::bool) {
+        val parr: *u16 = unwrap_ok[*u16, str](pres);
+        var pi: u16 = 0;
+        for (pi < dst.npreds) {
+            parr[pi] = dst.preds[pi];
+            pi = pi + 1;
+        }
+        parr[dst.npreds] = from;
+        dst.preds = parr;
+        dst.npreds = new_preds;
+    }
+}
+
+# compute liveness from CFG and InstBuf
+fun compute_mir_liveness(alloc: *allocator.Allocator, cfg: *masm_cfg.CFG,
+                         func: *ir.Function, isel_buf: *isa.InstBuf) masm_cfg.LiveSets {
+    ret masm_cfg.compute_liveness(alloc, cfg, nil);
+}
+
+fun compute_frame_size(local_size: usize, spill_size: usize) usize {
+    var total: usize = local_size + spill_size;
+    if (total > 0) {
+        total = (total + 15) & ~15::usize;
+    }
+    ret total;
+}
+
+val SCRATCH_REG: i32 = 11;
+
+fun resolve_parallel_copies(alloc: *allocator.Allocator, insts: *isa.InstBuf) isa.InstBuf {
+    var out: isa.InstBuf = isa.buf_init(alloc);
+    var i: i32 = 0;
+
+    for (i < insts.count) {
+        val inst: isa.Inst = insts.insts[i];
+
+        if (inst.opcode == isa.ISA_PCOPY || inst.opcode == isa.ISA_PCOPY_FENCE) {
+            i = i + 1;
+            cnt;
+        }
+
+        isa.buf_append(?out, inst);
+        i = i + 1;
+    }
+
+    ret out;
+}
+
+fun insert_prologue_epilogue(tgt: *target.Target, alloc: *allocator.Allocator,
+                             ra_out: *isa.InstBuf, frame_size: usize) isa.InstBuf {
+    var buf: isa.InstBuf = isa.buf_init(alloc);
+
+    if (tgt.isa.emit_prologue != nil) {
+        tgt.isa.emit_prologue(tgt.isa.ctx, ?buf, frame_size);
+    }
+
+    var i: i32 = 0;
+    for (i < ra_out.count) {
+        val inst: isa.Inst = ra_out.insts[i];
+        if (tgt.isa.is_ret != nil && tgt.isa.is_ret(tgt.isa.ctx, ?ra_out.insts[i])) {
+            if (tgt.isa.emit_epilogue != nil) {
+                tgt.isa.emit_epilogue(tgt.isa.ctx, ?buf);
+            }
+        }
+        isa.buf_append(?buf, inst);
+        i = i + 1;
+    }
+
+    ret buf;
+}
+
+fun encode_and_emit(tgt: *target.Target, alloc: *allocator.Allocator,
+                    obj: *of.ObjWriter, func: *ir.Function,
+                    buf: *isa.InstBuf) bool {
+    val encode_fn: fun(ptr, *isa.Inst, ptr, *allocator.Allocator) i32 = tgt.isa.encode;
+    if (encode_fn == nil) { ret false; }
+
+    var text_sec_ptr: *of.Section = nil;
+    if (obj != nil && obj.get_section != nil) {
+        text_sec_ptr = obj.get_section(obj.ctx, 0);
+    }
+    if (text_sec_ptr == nil) { ret false; }
+
+    var label_names: [256]str;
+    var label_offsets: [256]u64;
+    var label_count: i32 = 0;
+    var fixup_offsets: [512]usize;
+    var fixup_labels: [512]str;
+    var fixup_count: i32 = 0;
+
+    val start_offset: usize = text_sec_ptr.size;
+
+    var pre_i: i32 = 0;
+    for (pre_i < buf.count) {
+        if (buf.insts[pre_i].opcode == 0xFFFF && buf.insts[pre_i].dst.label != nil) {
+            if (label_count < 256) {
+                label_names[label_count] = buf.insts[pre_i].dst.label;
+                label_offsets[label_count] = 0;
+                label_count = label_count + 1;
+            }
+        }
+        pre_i = pre_i + 1;
+    }
+
+    var label_idx: i32 = 0;
+    var addr: u64 = 0;
+    var i: i32 = 0;
+    for (i < buf.count) {
+        if (buf.insts[i].opcode == 0xFFFF) {
+            if (buf.insts[i].dst.label != nil && label_idx < label_count) {
+                label_offsets[label_idx] = addr;
+                label_idx = label_idx + 1;
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        val inst_size: i32 = encode_fn(tgt.isa.ctx, ?buf.insts[i], text_sec_ptr::ptr, alloc);
+
+        if (inst_size > 0) {
+            val dst_lbl: str = buf.insts[i].dst.label;
+            if (dst_lbl != nil && buf.insts[i].dst.kind == isa.OPK_LABEL &&
+                is_local_label(dst_lbl, ?label_names[0], label_count)) {
+                if (fixup_count < 512) {
+                    fixup_offsets[fixup_count] = start_offset + addr::usize + (inst_size - 4)::usize;
+                    fixup_labels[fixup_count] = dst_lbl;
+                    fixup_count = fixup_count + 1;
+                }
+            } or {
+                emit_operand_reloc(tgt, obj, ?buf.insts[i].dst, inst_size, start_offset + addr::usize);
+                emit_operand_reloc(tgt, obj, ?buf.insts[i].src1, inst_size, start_offset + addr::usize);
+            }
+        }
+
+        if (inst_size > 0) { addr = addr + inst_size::u64; }
+        i = i + 1;
+    }
+
+    if (text_sec_ptr.data != nil && fixup_count > 0) {
+        var fi: i32 = 0;
+        for (fi < fixup_count) {
+            val target_off: u64 = find_label_offset(?label_names[0], ?label_offsets[0], label_count, fixup_labels[fi]);
+            val patch_pos: usize = fixup_offsets[fi];
+            val next_ip: u64 = (patch_pos + 4 - start_offset)::u64;
+            val disp: i32 = (target_off::i64 - next_ip::i64)::i32;
+            text_sec_ptr.data[patch_pos]     = (disp & 0xFF)::u8;
+            text_sec_ptr.data[patch_pos + 1] = ((disp >> 8) & 0xFF)::u8;
+            text_sec_ptr.data[patch_pos + 2] = ((disp >> 16) & 0xFF)::u8;
+            text_sec_ptr.data[patch_pos + 3] = ((disp >> 24) & 0xFF)::u8;
+            fi = fi + 1;
+        }
+    }
+
+    if (obj.add_symbol != nil && func.name != nil) {
+        obj.add_symbol(obj.ctx, func.name, 0, start_offset, addr::usize, true);
+    }
+
+    ret true;
+}
+
+fun emit_operand_reloc(tgt: *target.Target, obj: *of.ObjWriter,
+                       operand: *isa.Operand, inst_size: i32, base_offset: usize) {
+    if (operand.label == nil || inst_size < 4) { ret; }
+    if (obj.add_symbol == nil || obj.add_reloc == nil) { ret; }
+
+    val sym_id: u32 = obj.add_symbol(obj.ctx, operand.label, -1, 0, 0, true);
+    val disp_off: usize = base_offset + (inst_size - 4)::usize;
+
+    if (operand.kind == isa.OPK_LABEL) {
+        obj.add_reloc(obj.ctx, 0, disp_off, of.RK_PC32, sym_id, -4::i64);
+    } or (operand.kind == isa.OPK_MEM) {
+        obj.add_reloc(obj.ctx, 0, disp_off, of.RK_ABS32S, sym_id, 0);
+    }
+}
+
+fun is_local_label(name: str, names: *str, count: i32) bool {
+    var i: i32 = 0;
+    for (i < count) {
+        if (names[i] != nil && str_equals(names[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun find_label_offset(names: *str, offsets: *u64, count: i32, name: str) u64 {
+    if (name == nil) { ret 0; }
+    var i: i32 = 0;
+    for (i < count) {
+        if (names[i] != nil && str_equals(names[i], name)) { ret offsets[i]; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun emit_global(tgt: *target.Target, alloc: *allocator.Allocator,
+                obj: *of.ObjWriter, glob: *ir.Global) {
+    if (glob == nil || obj == nil) { ret; }
+    if (glob.name == nil) { ret; }
+
+    if (glob.data != nil && glob.data_len > 0) {
+        if (obj.add_data != nil) {
+            val sec: u32 = if (glob.is_const) { 1; } or { 2; };
+            obj.add_data(obj.ctx, sec, glob.data, glob.data_len::usize, glob.align::usize);
+        }
+        if (obj.add_symbol != nil) {
+            obj.add_symbol(obj.ctx, glob.name, -1, 0, glob.data_len::usize, true);
+        }
+    } or {
+        if (obj.add_bss != nil) {
+            obj.add_bss(obj.ctx, glob.size::usize, glob.align::usize);
+        }
+        if (obj.add_symbol != nil) {
+            obj.add_symbol(obj.ctx, glob.name, -1, 0, glob.size::usize, true);
+        }
+    }
+}
