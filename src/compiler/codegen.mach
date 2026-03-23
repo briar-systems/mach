@@ -1,0 +1,535 @@
+# mach.compiler.codegen: per-function compilation pipeline
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use iobuf:     std.io.buffer;
+
+use masm_fn:     masm.function;
+use masm_verify: masm.verify;
+use masm_cfg:    masm.cfg;
+use masm_pool:   masm.pool;
+
+use diag:     mach.compiler.diag;
+use target:   mach.compiler.target.target;
+use isa:      mach.compiler.target.isa;
+use of:       mach.compiler.target.of;
+use pass:     mach.compiler.opt.pass;
+use ra:       mach.compiler.regalloc;
+
+pub rec CodegenResult {
+    ok:          bool;
+    spill_size:  usize;
+    callee_mask: u32;
+    local_size:  usize;
+}
+
+pub fun compile_function(func: *masm_fn.Function, local_size: usize,
+                         tgt: *target.Target, opt: *pass.PassPipeline,
+                         alloc: *allocator.Allocator, obj: *of.ObjWriter,
+                         asm_buf: *iobuf.WriteBuf,
+                         dl: *diag.DiagList) CodegenResult {
+    var result: CodegenResult;
+    result.ok          = false;
+    result.spill_size  = 0;
+    result.callee_mask = 0;
+    result.local_size  = local_size;
+
+    if (func == nil || tgt == nil) { ret result; }
+
+    if (!verify(func, dl))            { ret result; }
+    if (!optimize(opt, func, dl))     { ret result; }
+
+    var isel_buf: isa.InstBuf = select_instructions(tgt, func, alloc);
+    if (isel_buf.insts == nil) {
+        if (dl != nil && func.name != nil) {
+            diag.error(dl, func_loc(func), "instruction selection failed");
+        }
+        ret result;
+    }
+
+    var cfg: masm_cfg.CFG = masm_cfg.build_cfg(alloc, func);
+    var live: masm_cfg.LiveSets = masm_cfg.compute_liveness(alloc, ?cfg, func);
+
+    var ra_result: ra.RegAllocResult = ra.alloc_function(
+        alloc, ?tgt.isa, ?tgt.abi, ?isel_buf, local_size, ?cfg, ?live
+    );
+    isa.buf_dnit(?isel_buf);
+    if (!ra_result.ok) {
+        if (dl != nil && func.name != nil) {
+            diag.error(dl, func_loc(func), "register allocation failed");
+        }
+        isa.buf_dnit(?ra_result.out);
+        ret result;
+    }
+
+    result.spill_size  = ra_result.spill_size;
+    result.callee_mask = ra_result.callee_mask;
+    result.local_size  = compute_frame_size(local_size, ra_result.spill_size);
+
+    var resolved_buf: isa.InstBuf = resolve_parallel_copies(alloc, ?ra_result.out);
+    isa.buf_dnit(?ra_result.out);
+
+    var is_naked: bool = is_naked_asm(?resolved_buf);
+    val is_leaf: bool = !has_call_inst(tgt, ?resolved_buf);
+    var effective_frame: usize = result.local_size;
+    if (is_leaf && effective_frame > 0 && effective_frame <= 128) {
+        effective_frame = 0;
+    }
+
+    var final_buf: isa.InstBuf;
+    if (is_naked) {
+        final_buf = resolved_buf;
+    } or {
+        final_buf = insert_prologue_epilogue(tgt, alloc, ?resolved_buf, effective_frame);
+        isa.buf_dnit(?resolved_buf);
+    }
+
+    if (asm_buf != nil && tgt.isa.print_inst != nil) {
+        var ai: i32 = 0;
+        for (ai < final_buf.count) {
+            tgt.isa.print_inst(tgt.isa.ctx, ?final_buf.insts[ai], asm_buf);
+            ai = ai + 1;
+        }
+    }
+
+    if (!encode_and_emit(tgt, alloc, obj, func, ?final_buf)) {
+        isa.buf_dnit(?final_buf);
+        ret result;
+    }
+
+    isa.buf_dnit(?final_buf);
+    result.ok = true;
+    ret result;
+}
+
+fun func_loc(func: *masm_fn.Function) diag.SourceLoc {
+    var line: u32 = 0;
+    if (func.blocks.len > 0) {
+        val blk: *masm_fn.Block = func.blocks.data[0];
+        if (blk != nil && blk.inst_count > 0 && blk.debug_locs != nil) {
+            val dl: masm_fn.DebugLoc = blk.debug_locs[0];
+            if (dl.src_line > 0) { line = dl.src_line::u32; }
+        }
+    }
+    ret diag.make_loc(func.src_path, line, 0);
+}
+
+fun verify(func: *masm_fn.Function, dl: *diag.DiagList) bool {
+    val res: Result[bool, str] = masm_verify.verify_function(func);
+    if (is_err[bool, str](res)) {
+        val reason: str = unwrap_err[bool, str](res);
+        if (dl != nil && func.name != nil) {
+            diag.error(dl, func_loc(func), reason);
+        }
+        ret false;
+    }
+    ret unwrap_ok[bool, str](res);
+}
+
+fun optimize(opt: *pass.PassPipeline, func: *masm_fn.Function, dl: *diag.DiagList) bool {
+    if (opt == nil) { ret true; }
+    val ok: bool = pass.run(opt, func, dl);
+    if (!ok && dl != nil && func != nil && func.name != nil) {
+        diag.error(dl, func_loc(func), "optimization pass failed");
+    }
+    ret ok;
+}
+
+fun select_instructions(tgt: *target.Target, func: *masm_fn.Function,
+                        alloc: *allocator.Allocator) isa.InstBuf {
+    var buf: isa.InstBuf = isa.buf_init(alloc);
+
+    val isel_fn: fun(ptr, ptr, ptr, *isa.InstBuf) bool = tgt.isa.isel;
+    if (isel_fn == nil) {
+        isa.buf_dnit(?buf);
+        buf.insts = nil;
+        ret buf;
+    }
+
+    if (!isel_fn(tgt.isa.ctx, nil, func::ptr, ?buf)) {
+        isa.buf_dnit(?buf);
+        buf.insts = nil;
+        ret buf;
+    }
+
+    ret buf;
+}
+
+val SCRATCH_REG: i32 = 11;
+val MAX_PMOVES: i32 = 64;
+
+rec PMove {
+    src:  i32;
+    dst:  i32;
+    size: u8;
+    done: bool;
+}
+
+fun resolve_parallel_copies(alloc: *allocator.Allocator, insts: *isa.InstBuf) isa.InstBuf {
+    var out: isa.InstBuf = isa.buf_init(alloc);
+    var moves: [64]PMove;
+    var move_count: i32 = 0;
+    var overflow: bool = false;
+    var i: i32 = 0;
+
+    for (i < insts.count) {
+        val inst: isa.Inst = insts.insts[i];
+
+        if (inst.opcode == isa.ISA_PCOPY) {
+            if (move_count < MAX_PMOVES) {
+                moves[move_count].dst  = inst.dst.reg;
+                moves[move_count].src  = inst.src1.reg;
+                moves[move_count].size = inst.size;
+                if (moves[move_count].size == 0) { moves[move_count].size = 8; }
+                moves[move_count].done = false;
+                move_count = move_count + 1;
+            } or (move_count == MAX_PMOVES && !overflow) {
+                overflow = true;
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        if (inst.opcode == isa.ISA_PCOPY_FENCE) {
+            if (move_count > 0) {
+                emit_resolved_moves(?out, ?moves[0], move_count);
+                move_count = 0;
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        if (move_count > 0) {
+            emit_resolved_moves(?out, ?moves[0], move_count);
+            move_count = 0;
+        }
+
+        isa.buf_append(?out, inst);
+        i = i + 1;
+    }
+
+    if (move_count > 0) {
+        emit_resolved_moves(?out, ?moves[0], move_count);
+    }
+
+    ret out;
+}
+
+fun emit_resolved_moves(out: *isa.InstBuf, moves: *PMove, count: i32) {
+    var i: i32 = 0;
+    for (i < count) {
+        if (moves[i].src == moves[i].dst) { moves[i].done = true; }
+        i = i + 1;
+    }
+
+    var progress: bool = true;
+    for (progress) {
+        progress = false;
+        i = 0;
+        for (i < count) {
+            if (!moves[i].done && !is_dst_blocked(moves, count, moves[i].dst)) {
+                emit_mov(out, moves[i].dst, moves[i].src, moves[i].size);
+                moves[i].done = true;
+                progress = true;
+            }
+            i = i + 1;
+        }
+    }
+
+    i = 0;
+    for (i < count) {
+        if (!moves[i].done) {
+            val cycle_src: i32 = moves[i].src;
+            val cycle_sz: u8 = moves[i].size;
+            emit_mov(out, SCRATCH_REG, cycle_src, cycle_sz);
+            moves[i].done = true;
+
+            var cur: i32 = moves[i].dst;
+            var j: i32 = find_move_with_src(moves, count, cur);
+            for (j >= 0 && !moves[j].done) {
+                if (moves[j].dst == cycle_src) {
+                    emit_mov(out, moves[j].dst, SCRATCH_REG, moves[j].size);
+                    moves[j].done = true;
+                    j = -1;
+                } or {
+                    emit_mov(out, moves[j].dst, moves[j].src, moves[j].size);
+                    moves[j].done = true;
+                    cur = moves[j].dst;
+                    j = find_move_with_src(moves, count, cur);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun is_dst_blocked(moves: *PMove, count: i32, dst: i32) bool {
+    var i: i32 = 0;
+    for (i < count) {
+        if (!moves[i].done && moves[i].src == dst) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun find_move_with_src(moves: *PMove, count: i32, src: i32) i32 {
+    var i: i32 = 0;
+    for (i < count) {
+        if (!moves[i].done && moves[i].src == src) { ret i; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun emit_mov(out: *isa.InstBuf, dst: i32, src: i32, sz: u8) {
+    var inst: isa.Inst;
+    inst.opcode   = 1;
+    inst.dst      = isa.make_reg(dst, sz);
+    inst.src1     = isa.make_reg(src, sz);
+    inst.src2.kind = 0;
+    inst.size     = sz;
+    inst.flags    = 0;
+    inst.src_line = 0;
+    inst.src_file = nil;
+    isa.buf_append(out, inst);
+}
+
+fun is_naked_asm(buf: *isa.InstBuf) bool {
+    if (buf.count == 0) { ret false; }
+    var i: i32 = 0;
+    for (i < buf.count) {
+        if (buf.insts[i].opcode != isa.ISA_ASM_MARKER) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun has_call_inst(tgt: *target.Target, buf: *isa.InstBuf) bool {
+    if (tgt.isa.is_call == nil) { ret false; }
+    var i: i32 = 0;
+    for (i < buf.count) {
+        if (tgt.isa.is_call(tgt.isa.ctx, ?buf.insts[i])) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun compute_frame_size(local_size: usize, spill_size: usize) usize {
+    var total: usize = local_size + spill_size;
+    if (total > 0) {
+        total = (total + 15) & ~15::usize;
+    }
+    ret total;
+}
+
+fun insert_prologue_epilogue(tgt: *target.Target, alloc: *allocator.Allocator,
+                             ra_out: *isa.InstBuf, frame_size: usize) isa.InstBuf {
+    var buf: isa.InstBuf = isa.buf_init(alloc);
+    if (tgt.isa.emit_prologue != nil) {
+        tgt.isa.emit_prologue(tgt.isa.ctx, ?buf, frame_size);
+    }
+
+    var i: i32 = 0;
+    for (i < ra_out.count) {
+        val inst: isa.Inst = ra_out.insts[i];
+        if (tgt.isa.is_ret != nil && tgt.isa.is_ret(tgt.isa.ctx, ?ra_out.insts[i])) {
+            if (tgt.isa.emit_epilogue != nil) {
+                tgt.isa.emit_epilogue(tgt.isa.ctx, ?buf);
+            }
+        }
+        isa.buf_append(?buf, inst);
+        i = i + 1;
+    }
+
+    ret buf;
+}
+
+fun emit_label_reloc(tgt: *target.Target, obj: *of.ObjWriter,
+                     mi: *isa.Inst, inst_size: i32, base_offset: usize) {
+    if (obj.add_symbol == nil || obj.add_reloc == nil) { ret; }
+
+    emit_operand_reloc(tgt, obj, ?mi.dst, inst_size, base_offset);
+    emit_operand_reloc(tgt, obj, ?mi.src1, inst_size, base_offset);
+}
+
+fun emit_operand_reloc(tgt: *target.Target, obj: *of.ObjWriter,
+                       op: *isa.Operand, inst_size: i32, base_offset: usize) {
+    if (op.label == nil || inst_size < 4) { ret; }
+    if (obj.add_symbol == nil || obj.add_reloc == nil) { ret; }
+
+    val sym_id: u32 = obj.add_symbol(obj.ctx, op.label, -1, 0, 0, true);
+    val disp_off: usize = base_offset + (inst_size - 4)::usize;
+
+    if (op.kind == isa.OPK_LABEL) {
+        obj.add_reloc(obj.ctx, 0, disp_off, of.RK_PC32, sym_id, -4::i64);
+    } or (op.kind == isa.OPK_MEM) {
+        obj.add_reloc(obj.ctx, 0, disp_off, of.RK_ABS32S, sym_id, 0);
+    }
+}
+
+fun is_local_label(name: str, names: *str, count: i32) bool {
+    var i: i32 = 0;
+    for (i < count) {
+        if (names[i] != nil && str_equals(names[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun find_label_offset(names: *str, offsets: *u64, count: i32, name: str) u64 {
+    if (name == nil) { ret 0; }
+    var i: i32 = 0;
+    for (i < count) {
+        if (names[i] != nil && str_equals(names[i], name)) { ret offsets[i]; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun encode_and_emit(tgt: *target.Target, alloc: *allocator.Allocator,
+                    obj: *of.ObjWriter, func: *masm_fn.Function,
+                    buf: *isa.InstBuf) bool {
+    val encode_fn: fun(ptr, *isa.Inst, ptr, *allocator.Allocator) i32 = tgt.isa.encode;
+    if (encode_fn == nil) { ret false; }
+
+    var text_sec_ptr: *of.Section = nil;
+    if (obj != nil && obj.get_section != nil) {
+        text_sec_ptr = obj.get_section(obj.ctx, 0);
+    }
+    if (text_sec_ptr == nil) { ret false; }
+
+    var label_names: [256]str;
+    var label_offsets: [256]u64;
+    var label_count: i32 = 0;
+    var fixup_offsets: [512]usize;
+    var fixup_labels: [512]str;
+    var fixup_count: i32 = 0;
+
+    val start_offset: usize = text_sec_ptr.size;
+
+    val debug_line_fn: fun(ptr, u64, u16, u32, u32) = tgt.of.debug.add_line;
+    val debug_file_fn: fun(ptr, str, str) u16 = tgt.of.debug.add_file;
+    val debug_ctx: ptr = tgt.of.debug.ctx;
+
+    var pre_i: i32 = 0;
+    for (pre_i < buf.count) {
+        if (buf.insts[pre_i].opcode == 0xFFFF && buf.insts[pre_i].dst.label != nil) {
+            if (label_count < 256) {
+                label_names[label_count]   = buf.insts[pre_i].dst.label;
+                label_offsets[label_count] = 0;
+                label_count = label_count + 1;
+            }
+        }
+        pre_i = pre_i + 1;
+    }
+
+    var label_idx: i32 = 0;
+    var addr: u64 = 0;
+    var i: i32 = 0;
+    for (i < buf.count) {
+        if (buf.insts[i].opcode == 0xFFFF) {
+            if (buf.insts[i].dst.label != nil && label_idx < label_count) {
+                label_offsets[label_idx] = addr;
+                label_idx = label_idx + 1;
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        if (buf.insts[i].opcode == isa.ISA_ASM_MARKER) {
+            val lbl_idx: u16 = buf.insts[i].dst.imm::u16;
+            val asm_text: str = masm_pool.label_get(?func.labels, lbl_idx::i32);
+            if (asm_text != nil && tgt.isa.parse_asm != nil) {
+                var asm_buf: isa.InstBuf = isa.buf_init(alloc);
+                tgt.isa.parse_asm(tgt.isa.ctx, asm_text, ?asm_buf, alloc);
+
+                var ai: i32 = 0;
+                for (ai < asm_buf.count) {
+                    val asm_inst_size: i32 = encode_fn(tgt.isa.ctx, ?asm_buf.insts[ai], text_sec_ptr::ptr, alloc);
+
+                    if (asm_inst_size > 0) {
+                        emit_label_reloc(tgt, obj, ?asm_buf.insts[ai], asm_inst_size, start_offset + addr::usize);
+                    }
+
+                    if (asm_inst_size > 0) { addr = addr + asm_inst_size::u64; }
+                    ai = ai + 1;
+                }
+                isa.buf_dnit(?asm_buf);
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        val inst_size: i32 = encode_fn(tgt.isa.ctx, ?buf.insts[i], text_sec_ptr::ptr, alloc);
+
+        if (inst_size > 0) {
+            val dst_lbl: str = buf.insts[i].dst.label;
+            if (dst_lbl != nil && buf.insts[i].dst.kind == isa.OPK_LABEL && is_local_label(dst_lbl, ?label_names[0], label_count)) {
+                if (fixup_count < 512) {
+                    fixup_offsets[fixup_count] = start_offset + addr::usize + (inst_size - 4)::usize;
+                    fixup_labels[fixup_count]  = dst_lbl;
+                    fixup_count = fixup_count + 1;
+                }
+            } or {
+                emit_label_reloc(tgt, obj, ?buf.insts[i], inst_size, start_offset + addr::usize);
+            }
+        }
+
+        if (debug_line_fn != nil && debug_ctx != nil) {
+            val src_line: u32 = buf.insts[i].src_line;
+            val src_file: str = buf.insts[i].src_file;
+            if (src_line > 0 && src_file != nil) {
+                val file_idx: u16 = debug_file_fn(debug_ctx, src_file, ".");
+                if (file_idx > 0) {
+                    debug_line_fn(debug_ctx, start_offset::u64 + addr, file_idx, src_line, 0);
+                }
+            }
+        }
+
+        if (inst_size > 0) { addr = addr + inst_size::u64; }
+        i = i + 1;
+    }
+
+    if (text_sec_ptr.data != nil && fixup_count > 0) {
+        var fi: i32 = 0;
+        for (fi < fixup_count) {
+            val target_off: u64 = find_label_offset(?label_names[0], ?label_offsets[0], label_count, fixup_labels[fi]);
+            val patch_pos: usize = fixup_offsets[fi];
+            val next_ip: u64 = (patch_pos + 4 - start_offset)::u64;
+            val disp: i32 = (target_off::i64 - next_ip::i64)::i32;
+            text_sec_ptr.data[patch_pos]     = (disp & 0xFF)::u8;
+            text_sec_ptr.data[patch_pos + 1] = ((disp >> 8) & 0xFF)::u8;
+            text_sec_ptr.data[patch_pos + 2] = ((disp >> 16) & 0xFF)::u8;
+            text_sec_ptr.data[patch_pos + 3] = ((disp >> 24) & 0xFF)::u8;
+            fi = fi + 1;
+        }
+    }
+
+    if (obj.add_symbol != nil && func.name != nil) {
+        obj.add_symbol(obj.ctx, func.name, 0, start_offset, addr::usize, true);
+    }
+
+    if (debug_ctx != nil && tgt.of.debug.add_function != nil && func.name != nil) {
+        var fn_file_idx: u16 = 0;
+        if (buf.count > 0) {
+            val first_file: str = buf.insts[0].src_file;
+            if (first_file != nil) {
+                fn_file_idx = debug_file_fn(debug_ctx, first_file, ".");
+            }
+        }
+        var fn_line: u32 = 0;
+        if (buf.count > 0) {
+            fn_line = buf.insts[0].src_line;
+        }
+        tgt.of.debug.add_function(debug_ctx, func.name, fn_file_idx, fn_line, start_offset::u64, start_offset::u64 + addr);
+    }
+
+    ret true;
+}
+

@@ -1,0 +1,259 @@
+# mach.compiler.opt.constfold: constant folding
+#
+# folds ALU and CMP instructions where both sources are known constants
+# at compile time. replaces the instruction with a single MOV of the
+# computed result. operates on MASM IR after lowering, before ISel.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+
+use op:      masm.op;
+use inst:    masm.inst;
+use pool:    masm.pool;
+use masm_fn: masm.function;
+
+val MAX_VREGS: i32 = 4096;
+
+# const value tracking for a virtual register
+rec VregConst {
+    known: bool;
+    value: u64;
+}
+
+# run: fold constant expressions in a function
+# ---
+# alloc: backing allocator
+# func:  function to optimize
+# ret:   true if the pass succeeded
+pub fun run(alloc: *allocator.Allocator, func: *masm_fn.Function) bool {
+    if (func == nil) { ret true; }
+    if (func.blocks.len == 0) { ret true; }
+
+    val res_consts: Result[*VregConst, str] =
+        allocator.allocate[VregConst](alloc, MAX_VREGS::usize);
+    if (!res_consts.tag) { ret true; }
+    val consts: *VregConst = res_consts.value.ok;
+
+    var vi: i32 = 0;
+    for (vi < MAX_VREGS) {
+        consts[vi].known = false;
+        consts[vi].value = 0;
+        vi = vi + 1;
+    }
+
+    var bi: usize = 0;
+    for (bi < func.blocks.len) {
+        val blk: *masm_fn.Block = func.blocks.data[bi];
+        if (blk == nil) {
+            bi = bi + 1;
+            cnt;
+        }
+
+        var ii: i32 = 0;
+        for (ii < blk.inst_count) {
+            val i: *inst.Instruction = ?blk.insts[ii];
+            fold_instruction(alloc, func, consts, i);
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    allocator.deallocate[VregConst](alloc, consts, MAX_VREGS::usize);
+    ret true;
+}
+
+fun fold_instruction(alloc: *allocator.Allocator, func: *masm_fn.Function,
+                     consts: *VregConst, i: *inst.Instruction) {
+    val o: u8 = i.op;
+
+    # track mov immediate → register as known constant
+    if (o == op.OP_MOVE) {
+        val dst: i32 = i.f0::i32;
+        if (dst < inst.VREG_START || dst >= MAX_VREGS) { ret; }
+        val flg: u8 = i.meta & 1;
+        val cc_val: u8 = (i.meta >> 4) & 0xF;
+
+        if (flg == 1) {
+            # mov.imm64: f2 is const pool index
+            val v: u64 = pool.const_get(?func.const_pool, i.f2::i32);
+            consts[dst].known = true;
+            consts[dst].value = v;
+            ret;
+        }
+        if (cc_val == 1 && flg == 0) {
+            # mov.imm32: f2 is data pool offset containing i32
+            val v: i32 = pool.data_get_i32(?func.data_pool, i.f2::i32);
+            consts[dst].known = true;
+            consts[dst].value = v::u64;
+            ret;
+        }
+        # reg-reg mov: propagate known value
+        if (flg == 0 && cc_val == 0) {
+            val src: i32 = i.f1::i32;
+            if (src >= inst.VREG_START && src < MAX_VREGS && consts[src].known) {
+                consts[dst].known = true;
+                consts[dst].value = consts[src].value;
+            } or {
+                consts[dst].known = false;
+            }
+        }
+        ret;
+    }
+
+    # try to fold ALU instructions
+    if (is_foldable_alu(o)) {
+        val dst: i32 = i.f0::i32;
+        val s1: i32 = i.f1::i32;
+        val s2: i32 = i.f2::i32;
+        if (dst < inst.VREG_START || dst >= MAX_VREGS) { ret; }
+        val flg: u8 = i.meta & 1;
+
+        # both sources must be known registers (flag=0 means f2 is register)
+        if (flg != 0) {
+            consts[dst].known = false;
+            ret;
+        }
+        if (s1 < inst.VREG_START || s1 >= MAX_VREGS || !consts[s1].known) {
+            consts[dst].known = false;
+            ret;
+        }
+        if (s2 < inst.VREG_START || s2 >= MAX_VREGS || !consts[s2].known) {
+            consts[dst].known = false;
+            ret;
+        }
+
+        val a: u64 = consts[s1].value;
+        val b: u64 = consts[s2].value;
+        var result: u64 = 0;
+        var folded: bool = false;
+
+        if (o == op.OP_ADD) { result = a + b; folded = true; }
+        or (o == op.OP_SUB) { result = a - b; folded = true; }
+        or (o == op.OP_MUL) { result = a * b; folded = true; }
+        or (o == op.OP_AND) { result = a & b; folded = true; }
+        or (o == op.OP_OR)  { result = a | b; folded = true; }
+        or (o == op.OP_XOR) { result = a ^ b; folded = true; }
+        or (o == op.OP_SHL) { result = a << (b & 63); folded = true; }
+        or (o == op.OP_SHR) {
+            val mode: u8 = (i.meta >> 4) & 0xF;
+            if (mode == op.SHR_ARITHMETIC) {
+                result = (a::i64 >> (b & 63))::u64;
+            } or {
+                result = a >> (b & 63);
+            }
+            folded = true;
+        }
+        or (o == op.OP_DIV) {
+            if (b != 0) {
+                val mode: u8 = (i.meta >> 4) & 0xF;
+                if (mode == op.DIV_QUOT) {
+                    result = (a::i64 / b::i64)::u64;
+                } or (mode == op.DIV_REM) {
+                    result = (a::i64 % b::i64)::u64;
+                } or (mode == op.DIV_UQUOT) {
+                    result = a / b;
+                } or (mode == op.DIV_UREM) {
+                    result = a % b;
+                }
+                folded = true;
+            }
+        }
+
+        if (folded) {
+            val sz: u8 = inst.size(i);
+            val ci: i32 = pool.const_intern(alloc, ?func.const_pool, result);
+            if (ci >= 0) {
+                @i = inst.make_mov_imm64(dst::u16, ci::u16, sz);
+                consts[dst].known = true;
+                consts[dst].value = result;
+            }
+        } or {
+            consts[dst].known = false;
+        }
+        ret;
+    }
+
+    # fold CMP where both sources are known constants
+    if (o == op.OP_CMP) {
+        val dst: i32 = i.f0::i32;
+        val s1: i32 = i.f1::i32;
+        val s2: i32 = i.f2::i32;
+        if (dst < inst.VREG_START || dst >= MAX_VREGS) { ret; }
+
+        # skip float comparisons (flag=1)
+        val flg: u8 = i.meta & 1;
+        if (flg != 0) {
+            consts[dst].known = false;
+            ret;
+        }
+
+        if (s1 < inst.VREG_START || s1 >= MAX_VREGS || !consts[s1].known) {
+            consts[dst].known = false;
+            ret;
+        }
+        if (s2 < inst.VREG_START || s2 >= MAX_VREGS || !consts[s2].known) {
+            consts[dst].known = false;
+            ret;
+        }
+
+        val a: u64 = consts[s1].value;
+        val b: u64 = consts[s2].value;
+        val cc_val: u8 = (i.meta >> 4) & 0xF;
+        var cmp_result: u64 = 0;
+
+        if (cc_val == op.CC_EQ) {
+            if (a == b) { cmp_result = 1; }
+        } or (cc_val == op.CC_NE) {
+            if (a != b) { cmp_result = 1; }
+        } or (cc_val == op.CC_LT) {
+            if (a::i64 < b::i64) { cmp_result = 1; }
+        } or (cc_val == op.CC_LE) {
+            if (a::i64 <= b::i64) { cmp_result = 1; }
+        } or (cc_val == op.CC_GT) {
+            if (a::i64 > b::i64) { cmp_result = 1; }
+        } or (cc_val == op.CC_GE) {
+            if (a::i64 >= b::i64) { cmp_result = 1; }
+        } or (cc_val == op.CC_ULT) {
+            if (a < b) { cmp_result = 1; }
+        } or (cc_val == op.CC_ULE) {
+            if (a <= b) { cmp_result = 1; }
+        } or (cc_val == op.CC_UGT) {
+            if (a > b) { cmp_result = 1; }
+        } or (cc_val == op.CC_UGE) {
+            if (a >= b) { cmp_result = 1; }
+        }
+
+        val sz: u8 = inst.size(i);
+        val disp_off: i32 = pool.data_intern_i32(alloc, ?func.data_pool,
+                                                  cmp_result::i32);
+        if (disp_off >= 0) {
+            @i = inst.make_mov_imm32(dst::u16, disp_off::u16, sz);
+            consts[dst].known = true;
+            consts[dst].value = cmp_result;
+        }
+        ret;
+    }
+
+    # any other instruction that writes to f0 invalidates the constant
+    val dst: i32 = i.f0::i32;
+    if (dst >= inst.VREG_START && dst < MAX_VREGS) {
+        consts[dst].known = false;
+    }
+}
+
+fun is_foldable_alu(o: u8) bool {
+    if (o == op.OP_ADD) { ret true; }
+    if (o == op.OP_SUB) { ret true; }
+    if (o == op.OP_MUL) { ret true; }
+    if (o == op.OP_DIV) { ret true; }
+    if (o == op.OP_AND) { ret true; }
+    if (o == op.OP_OR)  { ret true; }
+    if (o == op.OP_XOR) { ret true; }
+    if (o == op.OP_SHL) { ret true; }
+    if (o == op.OP_SHR) { ret true; }
+    ret false;
+}

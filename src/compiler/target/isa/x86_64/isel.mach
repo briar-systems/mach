@@ -1,0 +1,925 @@
+# mach.compiler.target.isa.x86_64.isel: instruction selection for x86_64
+#
+# translates MASM IR instructions into x86_64 machine instructions. iterates
+# all blocks in a function and dispatches each IR instruction to a handler
+# that emits one or more isa.Inst records into the output buffer.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+
+use mach.compiler.target.isa;
+use isa:  mach.compiler.target.isa;
+use defs: mach.compiler.target.isa.x86_64.defs;
+use mem:  std.memory;
+
+use op:   masm.op;
+use inst: masm.inst;
+use pool: masm.pool;
+use fn:   masm.function;
+
+val MACHINST_LABEL: u16 = 0xFFFF;
+
+var _sc_regs: [8]u16;
+var _sc_count: u8 = 0;
+
+val SCRATCH_REG: i32 = 11;
+
+# select: lower all IR instructions in a function to x86_64 machine instructions
+# ---
+# ctx:  ISA backend context (unused)
+# unused: reserved (always nil)
+# func: pointer to the MASM IR function
+# out:  instruction buffer to append results into
+# ret:  true if all instructions were successfully selected
+pub fun select(ctx: ptr, unused: ptr, func: ptr, out: *isa.InstBuf) bool {
+    if (func == nil || out == nil) { ret false; }
+
+    val f: *fn.Function = func::*fn.Function;
+    var bi: usize = 0;
+    for (bi < f.blocks.len) {
+        val blk: *fn.Block = f.blocks.data[bi];
+        if (blk == nil) {
+            bi = bi + 1;
+            cnt;
+        }
+
+        var ii: i32 = 0;
+        for (ii < blk.inst_count) {
+            val ir: *inst.Instruction = ?blk.insts[ii];
+            val before: i32 = out.count;
+            if (!select_one(ir, f, out)) {
+                ret false;
+            }
+            if (blk.debug_locs != nil && f.src_path != nil) {
+                val dl_line: i32 = blk.debug_locs[ii].src_line;
+                if (dl_line > 0) {
+                    var di: i32 = before;
+                    for (di < out.count) {
+                        out.insts[di].src_line = dl_line::u32;
+                        out.insts[di].src_file = f.src_path;
+                        di = di + 1;
+                    }
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    ret true;
+}
+
+# select_one: dispatch a single IR instruction to its handler
+# ---
+# ir:   pointer to the IR instruction
+# func: pointer to the containing function
+# out:  instruction buffer to append results into
+# ret:  true if selection succeeded
+fun select_one(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val opc: u8 = ir.op;
+
+    if (opc == op.OP_MOVE)     { ret sel_mov(ir, func, out); }
+    if (opc == op.OP_LOAD)    { ret sel_load(ir, func, out); }
+    if (opc == op.OP_STORE)   { ret sel_store(ir, func, out); }
+    if (opc == op.OP_ADDR)    { ret sel_addr(ir, func, out); }
+    if (opc == op.OP_ADD)     { ret sel_alu(ir, func, out, defs.ADD); }
+    if (opc == op.OP_SUB)     { ret sel_alu(ir, func, out, defs.SUB); }
+    if (opc == op.OP_MUL)     { ret sel_mul(ir, func, out); }
+    if (opc == op.OP_DIV)     { ret sel_div(ir, func, out); }
+    if (opc == op.OP_AND)     { ret sel_alu(ir, func, out, defs.AND); }
+    if (opc == op.OP_OR)      { ret sel_alu(ir, func, out, defs.OR); }
+    if (opc == op.OP_XOR)     { ret sel_alu(ir, func, out, defs.XOR); }
+    if (opc == op.OP_SHL)     { ret sel_alu(ir, func, out, defs.SHL); }
+    if (opc == op.OP_SHR)     { ret sel_shr(ir, func, out); }
+    if (opc == op.OP_CMP)     { ret sel_cmp(ir, func, out); }
+    if (opc == op.OP_JUMP)     { ret sel_jmp(ir, func, out); }
+    if (opc == op.OP_BRANCH)  { ret sel_branch(ir, func, out); }
+    if (opc == op.OP_CALL)    { ret sel_call(ir, func, out); }
+    if (opc == op.OP_RET)     { ret sel_ret(ir, func, out); }
+    if (opc == op.OP_CONV)    { ret sel_conv(ir, func, out); }
+    if (opc == op.OP_LABEL)   { ret sel_label(ir, func, out); }
+    if (opc == op.OP_SYSCALL) { ret sel_syscall(ir, func, out); }
+    if (opc == op.OP_ARG)     { ret sel_arg(ir, func, out); }
+    if (opc == op.OP_PARAM)   { ret sel_param(ir, func, out); }
+    if (opc == op.OP_TRAP)    { ret sel_trap(ir, func, out); }
+    if (opc == op.OP_HINT)    { ret sel_hint(ir, func, out); }
+
+    if (opc == op.OP_FENCE) {
+        val ordering: u8 = inst.cc(ir);
+        if (ordering >= op.MO_ACQ_REL) {
+            emit(out, defs.MFENCE, none_op(), none_op(), none_op(), 0, 0);
+        }
+        ret true;
+    }
+
+    if (opc == op.OP_ISA_ASM) {
+        var marker: isa.Inst;
+        marker.opcode   = isa.ISA_ASM_MARKER;
+        marker.size     = 0;
+        marker.flags    = 0;
+        marker.src_line = 0;
+        marker.src_file = nil;
+        marker.dst      = isa.make_imm(ir.f2::i64, 2);
+        marker.src1.kind = 0;
+        marker.src2.kind = 0;
+        isa.buf_append(out, marker);
+        ret true;
+    }
+
+    ret false;
+}
+
+# size_flags: compute encoding flags for an operation size
+# ---
+# sz:  operation size in bytes
+# ret: encoding flags (FLAG_16BIT for 2, FLAG_REX_W for 8)
+fun size_flags(sz: u8) u16 {
+    if (sz == 2) { ret defs.FLAG_16BIT; }
+    if (sz == 8) { ret defs.FLAG_REX_W; }
+    ret 0;
+}
+
+# emit: construct and append a machine instruction to the output buffer
+# ---
+# out:    instruction buffer
+# opcode: x86_64 opcode
+# dst:    destination operand
+# src1:   first source operand
+# src2:   second source operand
+# sz:     operation size in bytes
+# flags:  encoding flags
+fun emit(out: *isa.InstBuf, opcode: u16, dst: isa.Operand, src1: isa.Operand,
+         src2: isa.Operand, sz: u8, flags: u16) {
+    var mi: isa.Inst;
+    mi.opcode   = opcode;
+    mi.dst      = dst;
+    mi.src1     = src1;
+    mi.src2     = src2;
+    mi.size     = sz;
+    mi.flags    = flags | size_flags(sz);
+    mi.src_line = 0;
+    mi.src_file = nil;
+    isa.buf_append(out, mi);
+}
+
+# none_op: create a zeroed-out operand with kind OPK_NONE
+# ---
+# ret: empty operand
+fun none_op() isa.Operand {
+    var op: isa.Operand;
+    mem.zero[isa.Operand](?op, 1);
+    ret op;
+}
+
+# sel_mov: OP_MOVE → MOV reg,reg | MOV reg,imm32 | MOVABS reg,imm64
+fun sel_mov(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+    val cc: u8 = inst.cc(ir);
+    val fl: u8 = inst.flag(ir);
+    val dst: u16 = inst.dst_reg(ir);
+
+    if (fl == 1) {
+        # imm64: load from const pool, emit MOVABS
+        val imm: u64 = pool.const_get(?func.const_pool, ir.f2::i32);
+        emit(out, defs.MOVABS,
+            isa.make_reg(dst::i32, sz),
+            isa.make_imm(imm::i64, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    if (cc == 1) {
+        # imm32: load from data pool
+        val imm: i32 = pool.data_get_i32(?func.data_pool, ir.f2::i32);
+        emit(out, defs.MOV,
+            isa.make_reg(dst::i32, sz),
+            isa.make_imm(imm::i64, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    # reg-reg
+    val src: u16 = inst.src1_reg(ir);
+    emit(out, defs.MOV,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(src::i32, sz),
+        none_op(), sz, 0);
+    ret true;
+}
+
+# sel_load: OP_LOAD → MOV reg, [base+disp] | MOV reg, [base+idx*scale+disp]
+fun sel_load(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+    val fl: u8 = inst.flag(ir);
+    val dst: u16 = inst.dst_reg(ir);
+    val base: u16 = inst.src1_reg(ir);
+
+    if (fl == 1) {
+        val cc: u8 = inst.cc(ir);
+        val scale: u8 = 1 << (cc & 3);
+        val packed: i32 = pool.data_get_i32(?func.data_pool, ir.f2::i32);
+        val idx_reg: i32 = (packed >> 16) & 0xFFFF;
+        val disp: i32 = (packed << 16) >> 16;
+        emit(out, defs.MOV,
+            isa.make_reg(dst::i32, sz),
+            isa.make_mem(base::i32, disp, idx_reg, scale, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    val disp: i32 = pool.data_get_i32(?func.data_pool, ir.f2::i32);
+    emit(out, defs.MOV,
+        isa.make_reg(dst::i32, sz),
+        isa.make_mem(base::i32, disp, -1, 0, sz),
+        none_op(), sz, 0);
+    ret true;
+}
+
+# sel_store: OP_STORE → MOV [base+disp], reg | MOV [base+idx*scale+disp], reg
+fun sel_store(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+    val fl: u8 = inst.flag(ir);
+    val raw_src: u16 = inst.dst_reg(ir);
+    val src: u16 = map_param_src(raw_src::i32)::u16;
+    val base: u16 = inst.src1_reg(ir);
+
+    if (fl == 1) {
+        val cc: u8 = inst.cc(ir);
+        val scale: u8 = 1 << (cc & 3);
+        val packed: i32 = pool.data_get_i32(?func.data_pool, ir.f2::i32);
+        val idx_reg: i32 = (packed >> 16) & 0xFFFF;
+        val disp: i32 = (packed << 16) >> 16;
+        emit(out, defs.MOV,
+            isa.make_mem(base::i32, disp, idx_reg, scale, sz),
+            isa.make_reg(src::i32, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    val disp: i32 = pool.data_get_i32(?func.data_pool, ir.f2::i32);
+    emit(out, defs.MOV,
+        isa.make_mem(base::i32, disp, -1, 0, sz),
+        isa.make_reg(src::i32, sz),
+        none_op(), sz, 0);
+    ret true;
+}
+
+# sel_addr: OP_ADDR → LEA reg, [base+disp] | LEA reg, label | LEA reg, [base+idx*scale+disp]
+fun sel_addr(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+    val cc: u8 = inst.cc(ir);
+    val fl: u8 = inst.flag(ir);
+    val dst: u16 = inst.dst_reg(ir);
+
+    if (cc == 1 && fl == 0) {
+        val lbl: str = pool.label_get(?func.labels, ir.f2::i32);
+        emit(out, defs.LEA,
+            isa.make_reg(dst::i32, sz),
+            isa.make_label(lbl),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    if (fl == 1) {
+        val scale: u8 = 1 << (cc & 3);
+        val base: u16 = inst.src1_reg(ir);
+        val packed: i32 = pool.data_get_i32(?func.data_pool, ir.f2::i32);
+        val idx_reg: i32 = (packed >> 16) & 0xFFFF;
+        val disp: i32 = (packed << 16) >> 16;
+        emit(out, defs.LEA,
+            isa.make_reg(dst::i32, sz),
+            isa.make_mem(base::i32, disp, idx_reg, scale, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    val base: u16 = inst.src1_reg(ir);
+    val disp: i32 = pool.data_get_i32(?func.data_pool, ir.f2::i32);
+    emit(out, defs.LEA,
+        isa.make_reg(dst::i32, sz),
+        isa.make_mem(base::i32, disp, -1, 0, sz),
+        none_op(), sz, 0);
+    ret true;
+}
+
+# sel_alu: OP_ADD/SUB/AND/OR/XOR/SHL → MOV dst,src1 + ALU dst,src2/imm
+#
+# x86 ALU instructions are destructive two-operand, so we emit a MOV to
+# copy src1 into dst first, then the ALU op with src2 or an immediate.
+# float variants dispatch to the corresponding SSE instruction.
+fun sel_alu(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf, x86op: u16) bool {
+    val sz: u8 = inst.size(ir);
+    val cc: u8 = inst.cc(ir);
+    val fl: u8 = inst.flag(ir);
+    val dst: u16 = inst.dst_reg(ir);
+    val src1: u16 = inst.src1_reg(ir);
+
+    if (cc == op.ALU_FLOAT) {
+        ret sel_alu_float(ir, func, out, x86op);
+    }
+
+    emit(out, defs.MOV,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(src1::i32, sz),
+        none_op(), sz, 0);
+
+    if (fl == 1) {
+        val imm: u64 = pool.const_get(?func.const_pool, ir.f2::i32);
+        emit(out, x86op,
+            isa.make_reg(dst::i32, sz),
+            isa.make_imm(imm::i64, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    val src2: u16 = inst.src2_reg(ir);
+    emit(out, x86op,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(src2::i32, sz),
+        none_op(), sz, 0);
+    ret true;
+}
+
+# sel_alu_float: float ALU → MOVSS/MOVSD + ADDSS/SUBSS/MULSS/DIVSS or SD variant
+fun sel_alu_float(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf, x86op: u16) bool {
+    val sz: u8 = inst.size(ir);
+    val dst: u16 = inst.dst_reg(ir);
+    val src1: u16 = inst.src1_reg(ir);
+    val src2: u16 = inst.src2_reg(ir);
+
+    var mov_op: u16 = defs.MOVSS;
+    if (sz == 8) { mov_op = defs.MOVSD; }
+
+    emit(out, mov_op,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(src1::i32, sz),
+        none_op(), sz, 0);
+
+    var alu_op: u16 = 0;
+    if (x86op == defs.ADD) {
+        alu_op = defs.ADDSS;
+        if (sz == 8) { alu_op = defs.ADDSD; }
+    }
+    if (x86op == defs.SUB) {
+        alu_op = defs.SUBSS;
+        if (sz == 8) { alu_op = defs.SUBSD; }
+    }
+
+    if (alu_op == 0) { ret false; }
+
+    emit(out, alu_op,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(src2::i32, sz),
+        none_op(), sz, 0);
+    ret true;
+}
+
+# sel_mul: OP_MUL → MOV+IMUL (integer) or MOVSS/SD+MULSS/SD (float)
+fun sel_mul(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+    val cc: u8 = inst.cc(ir);
+    val fl: u8 = inst.flag(ir);
+    val dst: u16 = inst.dst_reg(ir);
+    val src1: u16 = inst.src1_reg(ir);
+
+    if (cc == op.ALU_FLOAT) {
+        var mov_op: u16 = defs.MOVSS;
+        var mul_op: u16 = defs.MULSS;
+        if (sz == 8) {
+            mov_op = defs.MOVSD;
+            mul_op = defs.MULSD;
+        }
+        val src2: u16 = inst.src2_reg(ir);
+        emit(out, mov_op,
+            isa.make_reg(dst::i32, sz),
+            isa.make_reg(src1::i32, sz),
+            none_op(), sz, 0);
+        emit(out, mul_op,
+            isa.make_reg(dst::i32, sz),
+            isa.make_reg(src2::i32, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    emit(out, defs.MOV,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(src1::i32, sz),
+        none_op(), sz, 0);
+
+    if (fl == 1) {
+        val imm: u64 = pool.const_get(?func.const_pool, ir.f2::i32);
+        emit(out, defs.IMUL,
+            isa.make_reg(dst::i32, sz),
+            isa.make_imm(imm::i64, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    val src2: u16 = inst.src2_reg(ir);
+    emit(out, defs.IMUL,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(src2::i32, sz),
+        none_op(), sz, 0);
+    ret true;
+}
+
+# sel_div: OP_DIV → MOV RAX,src1 + sign/zero extend + IDIV/DIV + MOV dst,RAX/RDX
+#
+# float division dispatches to DIVSS/DIVSD. integer division uses the
+# x86 idiom: dividend in RAX, sign/zero extend to RDX:RAX, then IDIV/DIV.
+# quotient lands in RAX, remainder in RDX.
+fun sel_div(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+    val cc: u8 = inst.cc(ir);
+    val dst: u16 = inst.dst_reg(ir);
+    val src1: u16 = inst.src1_reg(ir);
+    val src2: u16 = inst.src2_reg(ir);
+
+    if (cc == op.DIV_FLOAT) {
+        var mov_op: u16 = defs.MOVSS;
+        var div_op: u16 = defs.DIVSS;
+        if (sz == 8) {
+            mov_op = defs.MOVSD;
+            div_op = defs.DIVSD;
+        }
+        emit(out, mov_op,
+            isa.make_reg(dst::i32, sz),
+            isa.make_reg(src1::i32, sz),
+            none_op(), sz, 0);
+        emit(out, div_op,
+            isa.make_reg(dst::i32, sz),
+            isa.make_reg(src2::i32, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    # move dividend to RAX
+    emit(out, defs.MOV,
+        isa.make_reg(defs.RAX, sz),
+        isa.make_reg(src1::i32, sz),
+        none_op(), sz, 0);
+
+    val is_signed: bool = (cc == op.DIV_QUOT) || (cc == op.DIV_REM);
+
+    if (is_signed) {
+        # sign-extend RAX into RDX:RAX
+        if (sz == 8) {
+            emit(out, defs.CQO,
+                isa.make_reg(defs.RDX, sz),
+                isa.make_reg(defs.RAX, sz),
+                none_op(), sz, 0);
+        } or {
+            emit(out, defs.CDQ,
+                isa.make_reg(defs.RDX, sz),
+                isa.make_reg(defs.RAX, sz),
+                none_op(), sz, 0);
+        }
+    } or {
+        # zero RDX for unsigned division
+        emit(out, defs.XOR,
+            isa.make_reg(defs.RDX, sz),
+            isa.make_reg(defs.RDX, sz),
+            none_op(), sz, 0);
+    }
+
+    # emit the divide
+    var div_op: u16 = defs.IDIV;
+    if (!is_signed) { div_op = defs.DIV; }
+
+    emit(out, div_op,
+        isa.make_reg(defs.RAX, sz),
+        isa.make_reg(src2::i32, sz),
+        none_op(), sz, 0);
+
+    # move result to destination
+    val is_rem: bool = (cc == op.DIV_REM) || (cc == op.DIV_UREM);
+    if (is_rem) {
+        emit(out, defs.MOV,
+            isa.make_reg(dst::i32, sz),
+            isa.make_reg(defs.RDX, sz),
+            none_op(), sz, 0);
+    } or {
+        emit(out, defs.MOV,
+            isa.make_reg(dst::i32, sz),
+            isa.make_reg(defs.RAX, sz),
+            none_op(), sz, 0);
+    }
+    ret true;
+}
+
+# sel_shr: OP_SHR → SHR (logical) or SAR (arithmetic)
+fun sel_shr(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+    val cc: u8 = inst.cc(ir);
+    val fl: u8 = inst.flag(ir);
+    val dst: u16 = inst.dst_reg(ir);
+    val src1: u16 = inst.src1_reg(ir);
+
+    var shr_op: u16 = defs.SHR;
+    if (cc == op.SHR_ARITHMETIC) { shr_op = defs.SAR; }
+
+    emit(out, defs.MOV,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(src1::i32, sz),
+        none_op(), sz, 0);
+
+    if (fl == 1) {
+        val imm: u64 = pool.const_get(?func.const_pool, ir.f2::i32);
+        emit(out, shr_op,
+            isa.make_reg(dst::i32, sz),
+            isa.make_imm(imm::i64, sz),
+            none_op(), sz, 0);
+        ret true;
+    }
+
+    val src2: u16 = inst.src2_reg(ir);
+    emit(out, shr_op,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(src2::i32, sz),
+        none_op(), sz, 0);
+    ret true;
+}
+
+# sel_cmp: OP_CMP → CMP/UCOMISS/UCOMISD + SETcc + MOVZX
+#
+# integer: CMP src1, src2, then SETcc to set dst to 0/1 in a byte register,
+# then MOVZX to widen to full register size.
+# float: UCOMISS/UCOMISD + SETcc (unsigned comparison flags) + MOVZX.
+fun sel_cmp(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+    val cc: u8 = inst.cc(ir);
+    val fl: u8 = inst.flag(ir);
+    val dst: u16 = inst.dst_reg(ir);
+    val src1: u16 = inst.src1_reg(ir);
+    val src2: u16 = inst.src2_reg(ir);
+
+    if (fl == 1) {
+        # float comparison
+        var ucomi_op: u16 = defs.UCOMISS;
+        if (sz == 8) { ucomi_op = defs.UCOMISD; }
+        emit(out, ucomi_op,
+            isa.make_reg(src1::i32, sz),
+            isa.make_reg(src2::i32, sz),
+            none_op(), sz, 0);
+    } or {
+        emit(out, defs.CMP,
+            isa.make_reg(src1::i32, sz),
+            isa.make_reg(src2::i32, sz),
+            none_op(), sz, 0);
+    }
+
+    val set_op: u16 = cc_to_setcc(cc);
+    if (set_op == 0) { ret false; }
+
+    emit(out, set_op,
+        isa.make_reg(dst::i32, 1),
+        none_op(),
+        none_op(), 1, 0);
+
+    emit(out, defs.MOVZX,
+        isa.make_reg(dst::i32, sz),
+        isa.make_reg(dst::i32, 1),
+        none_op(), sz, 0);
+    ret true;
+}
+
+# cc_to_setcc: map an IR condition code to a SETcc opcode
+# ---
+# cc:  IR condition code
+# ret: x86_64 SETcc opcode, or 0 if invalid
+fun cc_to_setcc(cc: u8) u16 {
+    if (cc == op.CC_EQ)  { ret defs.SETE; }
+    if (cc == op.CC_NE)  { ret defs.SETNE; }
+    if (cc == op.CC_LT)  { ret defs.SETL; }
+    if (cc == op.CC_LE)  { ret defs.SETLE; }
+    if (cc == op.CC_GT)  { ret defs.SETG; }
+    if (cc == op.CC_GE)  { ret defs.SETGE; }
+    if (cc == op.CC_ULT) { ret defs.SETB; }
+    if (cc == op.CC_ULE) { ret defs.SETBE; }
+    if (cc == op.CC_UGT) { ret defs.SETA; }
+    if (cc == op.CC_UGE) { ret defs.SETAE; }
+    ret 0;
+}
+
+# cc_to_jcc: map an IR condition code to a Jcc opcode
+# ---
+# cc:  IR condition code
+# ret: x86_64 Jcc opcode, or 0 if invalid
+fun cc_to_jcc(cc: u8) u16 {
+    if (cc == op.CC_EQ)  { ret defs.JE; }
+    if (cc == op.CC_NE)  { ret defs.JNE; }
+    if (cc == op.CC_LT)  { ret defs.JL; }
+    if (cc == op.CC_LE)  { ret defs.JLE; }
+    if (cc == op.CC_GT)  { ret defs.JG; }
+    if (cc == op.CC_GE)  { ret defs.JGE; }
+    if (cc == op.CC_ULT) { ret defs.JB; }
+    if (cc == op.CC_ULE) { ret defs.JBE; }
+    if (cc == op.CC_UGT) { ret defs.JA; }
+    if (cc == op.CC_UGE) { ret defs.JAE; }
+    ret 0;
+}
+
+# sel_jmp: OP_JUMP → JMP label
+fun sel_jmp(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val lbl: str = pool.label_get(?func.labels, inst.label_idx(ir));
+    emit(out, defs.JMP,
+        isa.make_label(lbl),
+        none_op(),
+        none_op(), 0, 0);
+    ret true;
+}
+
+# sel_branch: OP_BRANCH → TEST cond_reg, cond_reg + Jcc label
+#
+# branches are conditioned on a boolean register. we TEST the register
+# against itself (sets ZF if zero) and emit the appropriate conditional
+# jump. CC_NE means "branch if nonzero" → JNE, CC_EQ means "branch if
+# zero" → JE.
+fun sel_branch(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val cc: u8 = inst.cc(ir);
+    val cond: u16 = inst.dst_reg(ir);
+    val lbl: str = pool.label_get(?func.labels, inst.label_idx(ir));
+
+    emit(out, defs.TEST,
+        isa.make_reg(cond::i32, 1),
+        isa.make_reg(cond::i32, 1),
+        none_op(), 1, 0);
+
+    val jcc_op: u16 = cc_to_jcc(cc);
+    if (jcc_op == 0) { ret false; }
+
+    emit(out, jcc_op,
+        isa.make_label(lbl),
+        none_op(),
+        none_op(), 0, 0);
+    ret true;
+}
+
+# SysV AMD64 integer parameter registers
+val PARAM_REGS_0: i32 = 7;
+val PARAM_REGS_1: i32 = 6;
+val PARAM_REGS_2: i32 = 2;
+val PARAM_REGS_3: i32 = 1;
+val PARAM_REGS_4: i32 = 8;
+val PARAM_REGS_5: i32 = 9;
+
+fun param_reg(idx: u8) i32 {
+    if (idx == 0) { ret PARAM_REGS_0; }
+    if (idx == 1) { ret PARAM_REGS_1; }
+    if (idx == 2) { ret PARAM_REGS_2; }
+    if (idx == 3) { ret PARAM_REGS_3; }
+    if (idx == 4) { ret PARAM_REGS_4; }
+    if (idx == 5) { ret PARAM_REGS_5; }
+    ret -1;
+}
+
+# sel_param: OP_PARAM → MOV param_reg, param_reg (identity, consumed by store)
+fun sel_param(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val idx: u8 = ir.f0::u8;
+    val param_sz: u8 = ir.f1::u8;
+    var sz: u8 = 8;
+    if (param_sz > 0 && param_sz <= 8) { sz = param_sz; }
+    val preg: i32 = param_reg(idx);
+    if (preg >= 0) {
+        emit(out, defs.MOV, isa.make_reg(preg, sz), isa.make_reg(preg, sz),
+             none_op(), sz, 0);
+    }
+    ret true;
+}
+
+# map_param_src: map MASM param register ID to physical param register
+fun map_param_src(id: i32) i32 {
+    if (id >= 0 && id <= 5) { ret param_reg(id::u8); }
+    ret id;
+}
+
+# sel_arg: OP_ARG → MOV param_reg, vreg
+fun scarg_reg(idx: u8) i32 {
+    if (idx == 0) { ret defs.RAX; }
+    if (idx == 1) { ret defs.RDI; }
+    if (idx == 2) { ret defs.RSI; }
+    if (idx == 3) { ret defs.RDX; }
+    if (idx == 4) { ret 10; }
+    if (idx == 5) { ret 8; }
+    if (idx == 6) { ret 9; }
+    ret -1;
+}
+
+fun sel_arg(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val idx: u8 = ir.f0::u8;
+    val arg_sz: u8 = inst.size(ir);
+    var sz: u8 = 8;
+    if (arg_sz > 0 && arg_sz <= 8) { sz = arg_sz; }
+
+    if (inst.flag(ir) == 1) {
+        if (idx < 8) {
+            _sc_regs[idx] = ir.f1;
+            if (idx >= _sc_count) { _sc_count = idx + 1; }
+        }
+        ret true;
+    }
+
+    val preg: i32 = param_reg(idx);
+    if (preg >= 0) {
+        emit(out, isa.ISA_PCOPY, isa.make_reg(preg, sz), isa.make_reg(ir.f1::i32, sz),
+             none_op(), sz, 0);
+    }
+    ret true;
+}
+
+# sel_call: OP_CALL → CALL label (direct) | CALL reg (indirect)
+fun sel_call(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+    val fl: u8 = inst.flag(ir);
+    val result: u16 = inst.dst_reg(ir);
+
+    emit(out, isa.ISA_PCOPY_FENCE, none_op(), none_op(), none_op(), 0, 0);
+
+    if (fl == 1) {
+        val target: u16 = inst.src1_reg(ir);
+        emit(out, defs.CALL,
+            isa.make_reg(target::i32, 8),
+            none_op(),
+            none_op(), sz, defs.FLAG_INDIRECT);
+    } or {
+        val lbl: str = pool.label_get(?func.labels, inst.label_idx(ir));
+        emit(out, defs.CALL,
+            isa.make_label(lbl),
+            none_op(),
+            none_op(), sz, 0);
+    }
+
+    if (result != 0) {
+        emit(out, defs.MOV,
+            isa.make_reg(result::i32, sz),
+            isa.make_reg(defs.RAX, sz),
+            none_op(), sz, 0);
+    }
+    ret true;
+}
+
+# sel_ret: OP_RET → MOV RAX,value_reg (if has value) + RET
+fun sel_ret(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val sz: u8 = inst.size(ir);
+
+    if (ir.f0 != 0) {
+        val value: u16 = inst.dst_reg(ir);
+        emit(out, defs.MOV,
+            isa.make_reg(defs.RAX, sz),
+            isa.make_reg(value::i32, sz),
+            none_op(), sz, 0);
+    }
+
+    emit(out, defs.RET,
+        none_op(),
+        none_op(),
+        none_op(), 0, 0);
+    ret true;
+}
+
+# sel_conv: OP_CONV → MOVZX/MOVSX/MOVSXD/MOV/CVTSI2SS/CVTSI2SD/CVTTSS2SI/CVTTSD2SI/CVTSS2SD/CVTSD2SS
+fun sel_conv(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val dst_sz: u8 = inst.size(ir);
+    val cc: u8 = inst.cc(ir);
+    val dst: u16 = inst.dst_reg(ir);
+    val src: u16 = inst.src1_reg(ir);
+
+    if (cc == op.CONV_ZEXT) {
+        emit(out, defs.MOV,
+            isa.make_reg(dst::i32, dst_sz),
+            isa.make_reg(src::i32, dst_sz),
+            none_op(), dst_sz, 0);
+        ret true;
+    }
+
+    if (cc == op.CONV_SEXT) {
+        if (dst_sz == 8) {
+            emit(out, defs.MOVSXD,
+                isa.make_reg(dst::i32, dst_sz),
+                isa.make_reg(src::i32, 4),
+                none_op(), dst_sz, 0);
+        } or {
+            emit(out, defs.MOVSX,
+                isa.make_reg(dst::i32, dst_sz),
+                isa.make_reg(src::i32, dst_sz),
+                none_op(), dst_sz, 0);
+        }
+        ret true;
+    }
+
+    if (cc == op.CONV_TRUNC) {
+        emit(out, defs.MOV,
+            isa.make_reg(dst::i32, dst_sz),
+            isa.make_reg(src::i32, dst_sz),
+            none_op(), dst_sz, 0);
+        ret true;
+    }
+
+    if (cc == op.CONV_ITOF) {
+        if (dst_sz == 4) {
+            emit(out, defs.CVTSI2SS,
+                isa.make_reg(dst::i32, dst_sz),
+                isa.make_reg(src::i32, dst_sz),
+                none_op(), dst_sz, 0);
+        } or {
+            emit(out, defs.CVTSI2SD,
+                isa.make_reg(dst::i32, dst_sz),
+                isa.make_reg(src::i32, dst_sz),
+                none_op(), dst_sz, 0);
+        }
+        ret true;
+    }
+
+    if (cc == op.CONV_FTOI) {
+        val src_float_sz: u8 = ir.f2::u8;
+        if (src_float_sz == 4) {
+            emit(out, defs.CVTTSS2SI,
+                isa.make_reg(dst::i32, dst_sz),
+                isa.make_reg(src::i32, src_float_sz),
+                none_op(), dst_sz, 0);
+        } or {
+            emit(out, defs.CVTTSD2SI,
+                isa.make_reg(dst::i32, dst_sz),
+                isa.make_reg(src::i32, src_float_sz),
+                none_op(), dst_sz, 0);
+        }
+        ret true;
+    }
+
+    if (cc == op.CONV_FEXT) {
+        emit(out, defs.CVTSS2SD,
+            isa.make_reg(dst::i32, 8),
+            isa.make_reg(src::i32, 4),
+            none_op(), 8, 0);
+        ret true;
+    }
+
+    if (cc == op.CONV_FTRUNC) {
+        emit(out, defs.CVTSD2SS,
+            isa.make_reg(dst::i32, 4),
+            isa.make_reg(src::i32, 8),
+            none_op(), 4, 0);
+        ret true;
+    }
+
+    ret false;
+}
+
+# sel_label: OP_LABEL → pseudo-instruction MACHINST_LABEL
+fun sel_label(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val lbl: str = pool.label_get(?func.labels, inst.label_idx(ir));
+    emit(out, MACHINST_LABEL,
+        isa.make_label(lbl),
+        none_op(),
+        none_op(), 0, 0);
+    ret true;
+}
+
+# sel_syscall: OP_SYSCALL → SYSCALL + MOV result_reg, RAX
+fun sel_syscall(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    var si: u8 = 0;
+    for (si < _sc_count && si < 8) {
+        val preg: i32 = scarg_reg(si);
+        if (preg >= 0) {
+            emit(out, isa.ISA_PCOPY, isa.make_reg(preg, 8), isa.make_reg(_sc_regs[si]::i32, 8),
+                 none_op(), 8, 0);
+        }
+        si = si + 1;
+    }
+    _sc_count = 0;
+
+    emit(out, isa.ISA_PCOPY_FENCE, none_op(), none_op(), none_op(), 0, 0);
+    emit(out, defs.SYSCALL, none_op(), none_op(), none_op(), 0, 0);
+
+    val result: u16 = inst.dst_reg(ir);
+    if (result != 0) {
+        emit(out, defs.MOV,
+            isa.make_reg(result::i32, 8),
+            isa.make_reg(defs.RAX, 8),
+            none_op(), 8, 0);
+    }
+    ret true;
+}
+
+# sel_trap: OP_TRAP → UD2
+fun sel_trap(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    emit(out, defs.UD2,
+        none_op(),
+        none_op(),
+        none_op(), 0, 0);
+    ret true;
+}
+
+# sel_hint: OP_HINT → PAUSE (if HINT_PAUSE)
+fun sel_hint(ir: *inst.Instruction, func: *fn.Function, out: *isa.InstBuf) bool {
+    val cc: u8 = inst.cc(ir);
+    if (cc == op.HINT_PAUSE) {
+        emit(out, defs.PAUSE,
+            none_op(),
+            none_op(),
+            none_op(), 0, 0);
+        ret true;
+    }
+    ret false;
+}

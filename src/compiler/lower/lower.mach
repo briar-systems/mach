@@ -1,0 +1,395 @@
+# mach.compiler.lower.lower: AST to MASM IR lowering driver
+#
+# transforms typed AST (sema output) into target-independent MASM IR.
+# dispatches to expr, stmt, and data sub-modules. types and utility
+# functions live in ctx.mach to avoid circular imports.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+use std.types.option;
+
+use allocator: std.allocator;
+use diag:      mach.compiler.diag;
+
+use op:       masm.op;
+use inst:     masm.inst;
+use pool:     masm.pool;
+use fn:       masm.function;
+use module:   masm.module;
+use typedesc: masm.typedesc;
+
+use sema:     mach.compiler.sema.sema;
+use type:     mach.compiler.sema.type;
+use scope:    mach.compiler.sema.scope;
+use smod:     mach.compiler.sema.module;
+use mono:     mach.compiler.sema.mono;
+
+use ast:      mach.compiler.parse.ast;
+use linemap:  mach.compiler.lex.linemap;
+
+use lctx:     mach.compiler.lower.ctx;
+use data_mod: mach.compiler.lower.data;
+use stmt_mod: mach.compiler.lower.stmt;
+
+# init: initialize a lowering context
+# ---
+# alloc:   allocator for all internal storage
+# target:  target descriptor pointer
+# builder: masm module builder to populate
+# sa:      semantic analysis context
+# ret:     initialized context or error string
+pub fun init(alloc: *allocator.Allocator, target: ptr,
+             builder: *module.ModuleBuilder, sa: *sema.Sema,
+             dl: *diag.DiagList) Result[lctx.LowerContext, str] {
+    ret lctx.init(alloc, target, builder, sa, dl);
+}
+
+# dnit: tear down a lowering context, freeing all internal storage
+# ---
+# ctx: context to destroy
+pub fun dnit(ctx: *lctx.LowerContext) {
+    lctx.dnit(ctx);
+}
+
+# lower_module: lower all top-level declarations in a module
+# ---
+# ctx:    lowering context
+# mod_id: module to lower
+pub fun lower_module(ctx: *lctx.LowerContext, mod_id: smod.ModuleId) {
+    if (ctx == nil || ctx.sema == nil) { ret; }
+
+    ctx.current_mod = mod_id;
+    val m: *smod.Module = smod.get(ctx.sema.modules, mod_id);
+    val store: *ast.NodeStore = ?m.store;
+    ctx.line_map = linemap.build(ctx.alloc, m.source);
+    ctx.src_path = m.file_path;
+    ctx.current_file = 1;
+    val root: ast.NodeId = m.root;
+    if (root::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val root_node: *ast.Node = ast.get(store, root);
+    if (root_node.kind != ast.NK_PROGRAM && root_node.kind != ast.NK_STMT_BLOCK) { ret; }
+
+    val stmts: ast.NodeSpan = ast.block_stmts(store, root);
+    var i: u32 = 0;
+    for (i < stmts.len) {
+        val child_id: ast.NodeId = ast.get_extra(store, stmts.start + i)::ast.NodeId;
+        if (child_id::u32 == ast.NODE_NIL::u32) {
+            i = i + 1;
+            cnt;
+        }
+
+        lower_top_level(ctx, child_id, store);
+        i = i + 1;
+    }
+
+    if (ctx.sema.mono != nil) {
+        val mc: *mono.MonoCache = ctx.sema.mono;
+        val count: u32 = mono.fn_count(mc);
+        var mi: u32 = 0;
+        for (mi < count) {
+            val fi: *mono.FnInst = mono.get_fn(mc, mi);
+            if (fi != nil && fi.body_resolved && fi.origin_module::u32 == mod_id::u32) {
+                lower_instantiation(ctx, fi);
+            }
+            mi = mi + 1;
+        }
+    }
+}
+
+fun lower_top_level(ctx: *lctx.LowerContext, node_id: ast.NodeId, store: *ast.NodeStore) {
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret; }
+    val node: *ast.Node = ast.get(store, node_id);
+
+    if (node.kind == ast.NK_DECL_FUN) {
+        lower_function(ctx, node_id, store);
+    } or (node.kind == ast.NK_DECL_VAL || node.kind == ast.NK_DECL_VAR) {
+        data_mod.lower_global_var(ctx, node_id);
+    } or (node.kind == ast.NK_DECL_PUB) {
+        val inner_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+        if (inner_id::u32 != ast.NODE_NIL::u32) {
+            lower_top_level(ctx, inner_id, store);
+        }
+    }
+}
+
+fun emit_variadic_save_area(ctx: *lctx.LowerContext, named_params: i32) {
+    ctx.fn_is_variadic = true;
+    ctx.va_named_gp = named_params;
+
+    val save_off: i64 = lctx.push_local(ctx, ".va_regsave", type.TYPE_NIL, 48, 8);
+    ctx.va_reg_save_off = save_off::i32;
+
+    var ri: i32 = 0;
+    for (ri < 6) {
+        val td_nil: u16 = lctx.make_type_desc(ctx, type.TYPE_NIL);
+        lctx.emit(ctx, inst.make_param(ri::u8, ctx.ptr_size::u16, td_nil));
+        val sd: u16 = lctx.intern_disp(ctx, ctx.va_reg_save_off + ri * ctx.ptr_size::i32);
+        lctx.emit(ctx, inst.make_store(ri::u16, inst.VREG_FP::u16, sd, ctx.ptr_size));
+        ri = ri + 1;
+    }
+}
+
+fun setup_variadic(ctx: *lctx.LowerContext, node_id: ast.NodeId,
+                   store: *ast.NodeStore, named_params: i32) {
+    val fn_sym_id: scope.SymbolId = lctx.node_sym(ctx, node_id);
+    if (fn_sym_id::u32 == scope.SYM_NIL::u32) { ret; }
+    val fn_tid: type.TypeId = lctx.sym_type(ctx, fn_sym_id);
+    if (fn_tid::u32 == type.TYPE_NIL::u32) { ret; }
+    val ft: *type.Type = type.get(ctx.sema.types, fn_tid);
+    if (ft.kind != type.TK_FUN || !ft.is_variadic) { ret; }
+    emit_variadic_save_area(ctx, named_params);
+}
+
+fun setup_variadic_from_type(ctx: *lctx.LowerContext, fn_tid: type.TypeId,
+                             named_params: i32) {
+    if (fn_tid::u32 == type.TYPE_NIL::u32) { ret; }
+    val ft: *type.Type = type.get(ctx.sema.types, fn_tid);
+    if (ft.kind != type.TK_FUN || !ft.is_variadic) { ret; }
+    emit_variadic_save_area(ctx, named_params);
+}
+
+# lower_function: lower a single function declaration into MASM IR
+# ---
+# ctx:     lowering context
+# node_id: AST node id for the NK_DECL_FUN node
+# store:   AST node store
+pub fun lower_function(ctx: *lctx.LowerContext, node_id: ast.NodeId, store: *ast.NodeStore) {
+    if (ctx == nil) { ret; }
+
+    val name_sid: ast.StrId = ast.fun_name(store, node_id);
+    var name: str = ast.get_str(store, name_sid);
+    if (name == nil) { ret; }
+
+    val generics: ast.NodeId = ast.fun_generics(store, node_id);
+    if (generics::u32 != ast.NODE_NIL::u32) { ret; }
+
+    val fn_mod: *smod.Module = smod.get(ctx.sema.modules, ctx.current_mod);
+    val opt_fn_sym: Option[scope.SymbolId] = scope.lookup_from(ctx.sema.symbols, fn_mod.scope, name);
+    if (is_some[scope.SymbolId](opt_fn_sym)) {
+        val fn_sym: scope.SymbolId = unwrap[scope.SymbolId](opt_fn_sym);
+        val sym: *scope.Symbol = scope.get_sym(ctx.sema.symbols, fn_sym);
+        if (sym.export_name != nil) {
+            name = sym.export_name;
+        } or {
+            name = lctx.mangle_symbol(ctx, fn_mod.path, name);
+        }
+    } or {
+        name = lctx.mangle_symbol(ctx, fn_mod.path, name);
+    }
+
+    val res_func: Result[*fn.Function, str] =
+        allocator.allocate[fn.Function](ctx.alloc, 1);
+    if (!res_func.tag) {
+        if (ctx.diag != nil) {
+            diag.error(ctx.diag, diag.make_loc(ctx.src_path, 0, 0), "allocation failed during function lowering");
+        }
+        ret;
+    }
+    val func: *fn.Function = res_func.value.ok;
+    @func = fn.func_init(ctx.alloc, name);
+    func.src_path = ctx.src_path;
+    ctx.func = func;
+
+    lctx.set_loc(ctx, store, node_id);
+
+    ctx.vreg_next       = inst.VREG_START;
+    ctx.local_count     = 0;
+    ctx.stack_offset    = 0;
+    ctx.label_counter   = 0;
+    ctx.ds.count        = 0;
+    ctx.ds.mark         = 0;
+    ctx.fn_is_variadic  = false;
+    ctx.va_named_gp     = 0;
+    ctx.va_reg_save_off = 0;
+
+    val res_entry: Result[*fn.Block, str] =
+        allocator.allocate[fn.Block](ctx.alloc, 1);
+    if (!res_entry.tag) {
+        if (ctx.diag != nil) {
+            diag.error(ctx.diag, diag.make_loc(ctx.src_path, 0, 0), "allocation failed during function lowering");
+        }
+        ret;
+    }
+    val entry_block: *fn.Block = res_entry.value.ok;
+    @entry_block = fn.block_init("entry");
+    fn.func_add_block(func, entry_block);
+    ctx.block = entry_block;
+
+    val params: ast.NodeSpan = ast.fun_params(store, node_id);
+    var pi: u32 = 0;
+    for (pi < params.len) {
+        val param_nid: ast.NodeId = ast.get_extra(store, params.start + pi)::ast.NodeId;
+        if (param_nid::u32 != ast.NODE_NIL::u32) {
+            val pnode: *ast.Node = ast.get(store, param_nid);
+            val p_payload: u32 = pnode.payload;
+            val pname_sid: ast.StrId = ast.get_extra(store, p_payload)::ast.StrId;
+            val pname: str = ast.get_str(store, pname_sid);
+
+            val param_tid: type.TypeId = lctx.node_type(ctx, param_nid);
+            val param_sz: u8 = lctx.type_size(ctx, param_tid);
+            val td_idx: u16 = lctx.make_type_desc(ctx, param_tid);
+            lctx.emit(ctx, inst.make_param(pi::u8, param_sz::u16, td_idx));
+
+            if (pname != nil) {
+                val param_align: usize = lctx.type_align(ctx, param_tid);
+                lctx.push_local(ctx, pname, param_tid, param_sz::usize, param_align);
+                val lv: *lctx.LocalVar = lctx.find_local(ctx, pname);
+                if (lv != nil) {
+                    val disp: u16 = lctx.intern_disp(ctx, lv.offset::i32);
+                    lctx.emit(ctx, inst.make_store(pi::u16, inst.VREG_FP::u16, disp, param_sz));
+                }
+            }
+        }
+        pi = pi + 1;
+    }
+
+    setup_variadic(ctx, node_id, store, params.len::i32);
+
+    val ret_type_node: ast.NodeId = ast.fun_ret_type(store, node_id);
+    if (ret_type_node::u32 != ast.NODE_NIL::u32) {
+        val fn_sym: scope.SymbolId = lctx.node_sym(ctx, node_id);
+        val fn_tid: type.TypeId = lctx.sym_type(ctx, fn_sym);
+        if (fn_tid::u32 != type.TYPE_NIL::u32 && type.get(ctx.sema.types, fn_tid).kind == type.TK_FUN) {
+            ctx.rs.ret_type = type.get(ctx.sema.types, fn_tid).ret_type;
+        } or {
+            ctx.rs.ret_type = type.TYPE_NIL;
+        }
+    } or {
+        ctx.rs.ret_type = type.primitive(ctx.sema.types, type.TK_VOID);
+    }
+
+    val body: ast.NodeId = ast.fun_body(store, node_id);
+    if (body::u32 != ast.NODE_NIL::u32) {
+        stmt_mod.lower_stmt(ctx, body, store);
+    }
+
+    if (ctx.block != nil) {
+        val bc: i32 = ctx.block.inst_count;
+        var needs_ret: bool = true;
+        if (bc > 0) {
+            val last_op: u8 = ctx.block.insts[bc - 1].op;
+            if (last_op == op.OP_RET || last_op == op.OP_JUMP || last_op == op.OP_TRAP || last_op == op.OP_ISA_ASM) {
+                needs_ret = false;
+            }
+        }
+        if (needs_ret) {
+            lctx.emit(ctx, inst.make_ret());
+        }
+    }
+
+    func.param_count = params.len::i32;
+    func.frame_size  = ctx.stack_offset::u32;
+    module.builder_add_function(ctx.builder, func);
+}
+
+fun lower_instantiation(ctx: *lctx.LowerContext, fi: *mono.FnInst) {
+    if (ctx == nil || fi == nil) { ret; }
+    if (fi.mangled_name == nil || fi.func_node::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val om: *smod.Module = smod.get(ctx.sema.modules, fi.origin_module);
+    val store: *ast.NodeStore = ?om.store;
+    val node_id: ast.NodeId = fi.func_node;
+
+    val res_func: Result[*fn.Function, str] =
+        allocator.allocate[fn.Function](ctx.alloc, 1);
+    if (!res_func.tag) {
+        if (ctx.diag != nil) {
+            diag.error(ctx.diag, diag.make_loc(ctx.src_path, 0, 0), "allocation failed during function lowering");
+        }
+        ret;
+    }
+    val func: *fn.Function = res_func.value.ok;
+    @func = fn.func_init(ctx.alloc, fi.mangled_name);
+    func.src_path = ctx.src_path;
+    ctx.func = func;
+
+    ctx.vreg_next       = inst.VREG_START;
+    ctx.local_count     = 0;
+    ctx.stack_offset    = 0;
+    ctx.label_counter   = 0;
+    ctx.ds.count        = 0;
+    ctx.ds.mark         = 0;
+    ctx.fn_is_variadic  = false;
+    ctx.va_named_gp     = 0;
+    ctx.va_reg_save_off = 0;
+
+    val res_entry: Result[*fn.Block, str] =
+        allocator.allocate[fn.Block](ctx.alloc, 1);
+    if (!res_entry.tag) {
+        if (ctx.diag != nil) {
+            diag.error(ctx.diag, diag.make_loc(ctx.src_path, 0, 0), "allocation failed during function lowering");
+        }
+        ret;
+    }
+    val entry_block: *fn.Block = res_entry.value.ok;
+    @entry_block = fn.block_init("entry");
+    fn.func_add_block(func, entry_block);
+    ctx.block = entry_block;
+
+    val fn_t: *type.Type = type.get(ctx.sema.types, fi.func_type);
+    val params: ast.NodeSpan = ast.fun_params(store, node_id);
+    var pi: u32 = 0;
+    for (pi < params.len) {
+        val param_nid: ast.NodeId = ast.get_extra(store, params.start + pi)::ast.NodeId;
+        if (param_nid::u32 != ast.NODE_NIL::u32) {
+            val pnode: *ast.Node = ast.get(store, param_nid);
+            val p_payload: u32 = pnode.payload;
+            val pname_sid: ast.StrId = ast.get_extra(store, p_payload)::ast.StrId;
+            val pname: str = ast.get_str(store, pname_sid);
+
+            var param_tid: type.TypeId = type.TYPE_NIL;
+            if (fn_t.kind == type.TK_FUN && pi::u16 < fn_t.param_count) {
+                param_tid = fn_t.params[pi];
+            }
+            val param_sz: u8 = lctx.type_size(ctx, param_tid);
+            val td_idx: u16 = lctx.make_type_desc(ctx, param_tid);
+            lctx.emit(ctx, inst.make_param(pi::u8, param_sz::u16, td_idx));
+
+            if (pname != nil && !str_equals(pname, "...")) {
+                val param_align: usize = lctx.type_align(ctx, param_tid);
+                lctx.push_local(ctx, pname, param_tid, param_sz::usize, param_align);
+                val lv: *lctx.LocalVar = lctx.find_local(ctx, pname);
+                if (lv != nil) {
+                    val disp: u16 = lctx.intern_disp(ctx, lv.offset::i32);
+                    lctx.emit(ctx, inst.make_store(pi::u16, inst.VREG_FP::u16, disp, param_sz));
+                }
+            }
+        }
+        pi = pi + 1;
+    }
+
+    setup_variadic_from_type(ctx, fi.func_type, params.len::i32);
+
+    val fn_tid: type.TypeId = fi.func_type;
+    if (fn_tid::u32 != type.TYPE_NIL::u32 && type.get(ctx.sema.types, fn_tid).kind == type.TK_FUN) {
+        ctx.rs.ret_type = type.get(ctx.sema.types, fn_tid).ret_type;
+    } or {
+        ctx.rs.ret_type = type.primitive(ctx.sema.types, type.TK_VOID);
+    }
+
+    val body: ast.NodeId = ast.fun_body(store, node_id);
+    if (body::u32 != ast.NODE_NIL::u32) {
+        stmt_mod.lower_stmt(ctx, body, store);
+    }
+
+    if (ctx.block != nil) {
+        val bc: i32 = ctx.block.inst_count;
+        var needs_ret: bool = true;
+        if (bc > 0) {
+            val last_op: u8 = ctx.block.insts[bc - 1].op;
+            if (last_op == op.OP_RET || last_op == op.OP_JUMP || last_op == op.OP_TRAP || last_op == op.OP_ISA_ASM) {
+                needs_ret = false;
+            }
+        }
+        if (needs_ret) {
+            lctx.emit(ctx, inst.make_ret());
+        }
+    }
+
+    func.param_count = fi.param_count::i32;
+    func.frame_size  = ctx.stack_offset::u32;
+    module.builder_add_function(ctx.builder, func);
+}

@@ -1,0 +1,737 @@
+# mach.compiler.lower.stmt: statement lowering
+#
+# translates statement AST nodes into MASM IR. dispatches on node kind
+# and delegates expression evaluation to expr.mach. handles control flow
+# (if/or, for), local declarations, return, break, continue, and defer.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+
+use op:   masm.op;
+use inst: masm.inst;
+use pool: masm.pool;
+
+use ast:  mach.compiler.parse.ast;
+use type: mach.compiler.sema.type;
+
+use lower: mach.compiler.lower.ctx;
+use expr:  mach.compiler.lower.expr;
+
+# lower_stmt: dispatch on statement node kind
+# ---
+# ctx:     lowering context
+# node_id: AST node to lower
+# store:   AST node store
+pub fun lower_stmt(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                   store: *ast.NodeStore) {
+    if (ctx == nil) { ret; }
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret; }
+
+    lower.set_loc(ctx, store, node_id);
+    val node: *ast.Node = ast.get(store, node_id);
+
+    if (node.kind == ast.NK_STMT_BLOCK) {
+        lower_block(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_DECL_VAL || node.kind == ast.NK_DECL_VAR) {
+        lower_var_decl(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_IF) {
+        lower_if(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_FOR) {
+        lower_for(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_RET) {
+        lower_return(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_BRK) {
+        lower_break(ctx);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_CNT) {
+        lower_continue(ctx);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_FIN) {
+        lower_defer(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_EXPR) {
+        lower_expr_stmt(ctx, node_id, store);
+        ret;
+    }
+    if (node.kind == ast.NK_STMT_ASM) {
+        lower_asm(ctx, node_id, store);
+        ret;
+    }
+
+    if (ast.is_expr(node.kind)) {
+        expr.lower_expr(ctx, node_id, store);
+        ret;
+    }
+}
+
+# lower a block statement — iterate children, emit deferred at scope exit
+fun lower_block(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                store: *ast.NodeStore) {
+    val stmts: ast.NodeSpan = ast.block_stmts(store, node_id);
+
+    val saved_local_count: i32 = ctx.local_count;
+    val saved_defer_mark: i32 = lower.defer_get_mark(ctx);
+
+    var i: u32 = 0;
+    for (i < stmts.len) {
+        val child_id: ast.NodeId = ast.get_extra(store, stmts.start + i)::ast.NodeId;
+        if (child_id::u32 != ast.NODE_NIL::u32) {
+            lower_stmt(ctx, child_id, store);
+        }
+        i = i + 1;
+    }
+
+    emit_deferred(ctx, saved_defer_mark, store);
+    ctx.local_count = saved_local_count;
+}
+
+# lower a local variable declaration
+fun lower_var_decl(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                   store: *ast.NodeStore) {
+    val name_sid: ast.StrId = ast.var_name(store, node_id);
+    val name: str = ast.get_str(store, name_sid);
+    if (name == nil) { ret; }
+
+    val var_tid: type.TypeId = lower.node_type(ctx, node_id);
+    val sz: usize = lower.type_size(ctx, var_tid)::usize;
+    val align: usize = lower.type_align(ctx, var_tid);
+    val offset: i64 = lower.push_local(ctx, name, var_tid, sz, align);
+
+    val init_id: ast.NodeId = ast.var_init(store, node_id);
+    if (init_id::u32 != ast.NODE_NIL::u32) {
+        val init_vreg: u16 = expr.lower_expr(ctx, init_id, store);
+        val disp: u16 = lower.intern_disp(ctx, offset::i32);
+        lower.emit(ctx, inst.make_store(init_vreg, inst.VREG_FP::u16, disp, sz::u8));
+    }
+}
+
+# lower an if/or-chain
+fun lower_if(ctx: *lower.LowerContext, node_id: ast.NodeId,
+             store: *ast.NodeStore) {
+    val end_label: u16 = lower.alloc_label(ctx, "if_end");
+    lower_if_chain(ctx, node_id, end_label, store);
+    lower.new_block(ctx, end_label);
+}
+
+# recursive helper for if/or chains
+fun lower_if_chain(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                   end_label: u16, store: *ast.NodeStore) {
+    if (node_id::u32 == ast.NODE_NIL::u32) { ret; }
+
+    val node: *ast.Node = ast.get(store, node_id);
+    val cond_id: ast.NodeId = ast.cond_expr(store, node_id);
+    val body_id: ast.NodeId = ast.cond_body(store, node_id);
+    val or_id: ast.NodeId = ast.cond_or_chain(store, node_id);
+
+    if (cond_id::u32 == ast.NODE_NIL::u32) {
+        if (body_id::u32 != ast.NODE_NIL::u32) {
+            lower_stmt(ctx, body_id, store);
+        }
+        ret;
+    }
+
+    val cond_vreg: u16 = expr.lower_expr(ctx, cond_id, store);
+    val then_label: u16 = lower.alloc_label(ctx, "if_then");
+    val else_label: u16 = lower.alloc_label(ctx, "if_else");
+
+    lower.emit(ctx, inst.make_branch(cond_vreg, else_label, op.CC_EQ));
+
+    lower.new_block(ctx, then_label);
+    if (body_id::u32 != ast.NODE_NIL::u32) {
+        lower_stmt(ctx, body_id, store);
+    }
+    if (!lower.block_terminated(ctx)) {
+        lower.emit(ctx, inst.make_jmp(end_label));
+    }
+
+    lower.new_block(ctx, else_label);
+    if (or_id::u32 != ast.NODE_NIL::u32) {
+        val or_node: *ast.Node = ast.get(store, or_id);
+        if (or_node.kind == ast.NK_STMT_OR) {
+            lower_if_chain(ctx, or_id, end_label, store);
+        } or {
+            lower_stmt(ctx, or_id, store);
+        }
+    }
+    if (!lower.block_terminated(ctx)) {
+        lower.emit(ctx, inst.make_jmp(end_label));
+    }
+}
+
+# lower a for-loop
+fun lower_for(ctx: *lower.LowerContext, node_id: ast.NodeId,
+              store: *ast.NodeStore) {
+    val node: *ast.Node = ast.get(store, node_id);
+    val cond_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    val body_id: ast.NodeId = ast.get_extra(store, node.payload + 1)::ast.NodeId;
+
+    val cond_label: u16 = lower.alloc_label(ctx, "for_cond");
+    val body_label: u16 = lower.alloc_label(ctx, "for_body");
+    val end_label: u16 = lower.alloc_label(ctx, "for_end");
+
+    val saved_ls: lower.LoopState = ctx.ls;
+    ctx.ls.brk_label = lower.label_name(ctx, end_label);
+    ctx.ls.cnt_label = lower.label_name(ctx, cond_label);
+
+    lower.emit(ctx, inst.make_jmp(cond_label));
+    lower.new_block(ctx, cond_label);
+
+    if (cond_id::u32 != ast.NODE_NIL::u32) {
+        val cond_vreg: u16 = expr.lower_expr(ctx, cond_id, store);
+        lower.emit(ctx, inst.make_branch(cond_vreg, end_label, op.CC_EQ));
+    } or {
+        lower.emit(ctx, inst.make_jmp(body_label));
+    }
+
+    lower.new_block(ctx, body_label);
+    if (body_id::u32 != ast.NODE_NIL::u32) {
+        lower_stmt(ctx, body_id, store);
+    }
+    if (!lower.block_terminated(ctx)) {
+        lower.emit(ctx, inst.make_jmp(cond_label));
+    }
+
+    lower.new_block(ctx, end_label);
+    ctx.ls = saved_ls;
+}
+
+# lower a return statement
+fun lower_return(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                 store: *ast.NodeStore) {
+    val node: *ast.Node = ast.get(store, node_id);
+    val value_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+
+    if (value_id::u32 != ast.NODE_NIL::u32) {
+        val value_vreg: u16 = expr.lower_expr(ctx, value_id, store);
+        val ret_tid: type.TypeId = lower.node_type(ctx, value_id);
+        val td: u16 = lower.make_type_desc(ctx, ret_tid);
+        lower.emit(ctx, inst.make_ret_value(value_vreg, td, ctx.ptr_size));
+    } or {
+        lower.emit(ctx, inst.make_ret());
+    }
+}
+
+# lower a break statement — emit jump to loop break label
+fun lower_break(ctx: *lower.LowerContext) {
+    if (ctx.ls.brk_label == nil) { ret; }
+    val li: i32 = pool.label_intern(ctx.alloc, ?ctx.func.labels, ctx.ls.brk_label);
+    if (li >= 0) {
+        lower.emit(ctx, inst.make_jmp(li::u16));
+    }
+}
+
+# lower a continue statement — emit jump to loop continue label
+fun lower_continue(ctx: *lower.LowerContext) {
+    if (ctx.ls.cnt_label == nil) { ret; }
+    val li: i32 = pool.label_intern(ctx.alloc, ?ctx.func.labels, ctx.ls.cnt_label);
+    if (li >= 0) {
+        lower.emit(ctx, inst.make_jmp(li::u16));
+    }
+}
+
+# lower a defer statement — store the node for emission at scope exit
+fun lower_defer(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                store: *ast.NodeStore) {
+    val node: *ast.Node = ast.get(store, node_id);
+    val body_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    lower.defer_push(ctx, body_id);
+}
+
+# lower an expression statement — evaluate and discard result
+fun lower_expr_stmt(ctx: *lower.LowerContext, node_id: ast.NodeId,
+                    store: *ast.NodeStore) {
+    val node: *ast.Node = ast.get(store, node_id);
+    val inner_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
+    if (inner_id::u32 != ast.NODE_NIL::u32) {
+        expr.lower_expr(ctx, inner_id, store);
+    }
+}
+
+fun lower_asm(ctx: *lower.LowerContext, node_id: ast.NodeId,
+              store: *ast.NodeStore) {
+    val node: *ast.Node = ast.get(store, node_id);
+    val text_sid: ast.StrId = ast.get_extra(store, node.payload)::ast.StrId;
+    val isa_sid: ast.StrId = ast.get_extra(store, node.payload + 1)::ast.StrId;
+    val text: str = ast.get_str(store, text_sid);
+    if (text == nil) { ret; }
+
+    if (isa_sid::u32 != ast.STR_NIL::u32) {
+        val spec_start: u32 = ast.get_extra(store, node.payload + 2);
+        val spec_count: u32 = ast.get_extra(store, node.payload + 3);
+
+        var si: u32 = 0;
+        for (si < spec_count) {
+            val item_id: ast.NodeId = ast.get_extra(store, spec_start + si)::ast.NodeId;
+            if (item_id::u32 != ast.NODE_NIL::u32) {
+                val item: *ast.Node = ast.get(store, item_id);
+                val spec_kind: u32 = ast.get_extra(store, item.payload);
+                if (spec_kind == 1) {
+                    val reg_sid: ast.StrId = ast.get_extra(store, item.payload + 1)::ast.StrId;
+                    val expr_nid: ast.NodeId = ast.get_extra(store, item.payload + 2)::ast.NodeId;
+                    val reg_name: str = ast.get_str(store, reg_sid);
+                    if (reg_name != nil && expr_nid::u32 != ast.NODE_NIL::u32) {
+                        val vreg: u16 = expr.lower_expr(ctx, expr_nid, store);
+                        val lv_name: str = asm_make_in_temp(ctx, reg_name, vreg);
+                        if (lv_name != nil) {
+                            val in_text: str = asm_build_mov_reg_local(ctx, reg_name, lv_name);
+                            if (in_text != nil) {
+                                val in_li: i32 = pool.label_intern(ctx.alloc, ?ctx.func.labels, in_text);
+                                if (in_li >= 0) {
+                                    lower.emit(ctx, inst.make_isa_asm(in_li::u16));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            si = si + 1;
+        }
+
+        val resolved: str = asm_resolve_var_refs(ctx, text);
+        val li: i32 = pool.label_intern(ctx.alloc, ?ctx.func.labels, resolved);
+        if (li >= 0) {
+            lower.emit(ctx, inst.make_isa_asm(li::u16));
+        }
+
+        si = 0;
+        for (si < spec_count) {
+            val item_id: ast.NodeId = ast.get_extra(store, spec_start + si)::ast.NodeId;
+            if (item_id::u32 != ast.NODE_NIL::u32) {
+                val item: *ast.Node = ast.get(store, item_id);
+                val spec_kind: u32 = ast.get_extra(store, item.payload);
+                if (spec_kind == 2) {
+                    val reg_sid: ast.StrId = ast.get_extra(store, item.payload + 1)::ast.StrId;
+                    val bind_sid: ast.StrId = ast.get_extra(store, item.payload + 2)::ast.StrId;
+                    val reg_name: str = ast.get_str(store, reg_sid);
+                    val bind_name: str = ast.get_str(store, bind_sid);
+                    if (reg_name != nil && bind_name != nil) {
+                        val lv: *lower.LocalVar = lower.find_local(ctx, bind_name);
+                        if (lv != nil) {
+                            val out_text: str = asm_build_mov_local_reg(ctx, bind_name, reg_name);
+                            if (out_text != nil) {
+                                val out_li: i32 = pool.label_intern(ctx.alloc, ?ctx.func.labels, out_text);
+                                if (out_li >= 0) {
+                                    lower.emit(ctx, inst.make_isa_asm(out_li::u16));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            si = si + 1;
+        }
+
+        ret;
+    }
+
+    var pos: usize = 0;
+    val len: usize = str_len(text);
+
+    for (pos < len) {
+        asm_skip_ws(text, len, ?pos);
+        if (pos >= len) { brk; }
+        if (text[pos] == '\n' || text[pos] == '\r') { pos = pos + 1; cnt; }
+
+        var mnem: [64]u8;
+        var ml: usize = 0;
+        for (pos < len && text[pos] != ' ' && text[pos] != '\t' &&
+             text[pos] != '\n' && text[pos] != ',' && ml < 63) {
+            mnem[ml] = text[pos]; ml = ml + 1; pos = pos + 1;
+        }
+        mnem[ml] = 0;
+        if (ml == 0) { cnt; }
+        val mn: str = ?mnem[0];
+
+        if (str_equals(mn, "trap")) {
+            lower.emit(ctx, inst.make_trap());
+        } or (str_equals(mn, "hint.pause")) {
+            lower.emit(ctx, inst.make_hint(op.HINT_PAUSE));
+        } or (str_starts_with(mn, "fence")) {
+            var ordering: u8 = op.MO_SEQ_CST;
+            if (str_ends_with(mn, "relaxed"))  { ordering = op.MO_RELAXED; }
+            or (str_ends_with(mn, "acquire"))  { ordering = op.MO_ACQUIRE; }
+            or (str_ends_with(mn, "release"))  { ordering = op.MO_RELEASE; }
+            or (str_ends_with(mn, "acq_rel"))  { ordering = op.MO_ACQ_REL; }
+            lower.emit(ctx, inst.make_fence(ordering));
+        } or (str_equals(mn, "syscall")) {
+            lower_masm_syscall(ctx, text, len, ?pos);
+        } or (str_starts_with(mn, "atomic.load")) {
+            lower_masm_atomic_load(ctx, text, len, ?pos, mn);
+        } or (str_starts_with(mn, "atomic.store")) {
+            lower_masm_atomic_store(ctx, text, len, ?pos, mn);
+        } or (str_starts_with(mn, "atomic.cas")) {
+            lower_masm_atomic_cas(ctx, text, len, ?pos, mn);
+        } or (str_starts_with(mn, "atomic.rmw")) {
+            lower_masm_atomic_rmw(ctx, text, len, ?pos, mn);
+        }
+
+        asm_skip_to_eol(text, len, ?pos);
+    }
+}
+
+fun asm_skip_ws(text: str, len: usize, pos: *usize) {
+    for (@pos < len && (text[@pos] == ' ' || text[@pos] == '\t')) { @pos = @pos + 1; }
+}
+
+fun asm_skip_to_eol(text: str, len: usize, pos: *usize) {
+    for (@pos < len && text[@pos] != '\n') { @pos = @pos + 1; }
+}
+
+var _asm_op_buf: [64]u8;
+
+fun asm_read_operand(text: str, len: usize, pos: *usize) str {
+    asm_skip_ws(text, len, pos);
+    if (@pos < len && text[@pos] == ',') { @pos = @pos + 1; }
+    asm_skip_ws(text, len, pos);
+    if (@pos < len && text[@pos] == '{') {
+        @pos = @pos + 1;
+        var bl: usize = 0;
+        for (@pos < len && text[@pos] != '}' && bl < 63) {
+            _asm_op_buf[bl] = text[@pos]; bl = bl + 1; @pos = @pos + 1;
+        }
+        if (@pos < len && text[@pos] == '}') { @pos = @pos + 1; }
+        _asm_op_buf[bl] = 0;
+        if (bl == 0) { ret nil; }
+        ret ?_asm_op_buf[0];
+    }
+    var bl: usize = 0;
+    for (@pos < len && text[@pos] != ',' && text[@pos] != '\n' &&
+         text[@pos] != ' ' && text[@pos] != '\t' && bl < 63) {
+        _asm_op_buf[bl] = text[@pos]; bl = bl + 1; @pos = @pos + 1;
+    }
+    _asm_op_buf[bl] = 0;
+    if (bl == 0) { ret nil; }
+    ret ?_asm_op_buf[0];
+}
+
+fun asm_resolve_local(ctx: *lower.LowerContext, name: str) u16 {
+    if (name == nil) { ret 0; }
+    val lv: *lower.LocalVar = lower.find_local(ctx, name);
+    if (lv == nil) { ret 0; }
+    val dst: u16 = lower.alloc_vreg(ctx);
+    val disp: u16 = lower.intern_disp(ctx, lv.offset::i32);
+    lower.emit(ctx, inst.make_load(dst, inst.VREG_FP::u16, disp, ctx.ptr_size));
+    ret dst;
+}
+
+fun asm_store_local(ctx: *lower.LowerContext, name: str, vreg: u16) {
+    if (name == nil) { ret; }
+    val lv: *lower.LocalVar = lower.find_local(ctx, name);
+    if (lv == nil) { ret; }
+    val disp: u16 = lower.intern_disp(ctx, lv.offset::i32);
+    lower.emit(ctx, inst.make_store(vreg, inst.VREG_FP::u16, disp, lv.size::u8));
+}
+
+fun lower_masm_syscall(ctx: *lower.LowerContext, text: str, len: usize, pos: *usize) {
+    var out_buf: [64]u8;
+    val out_name: str = asm_read_operand(text, len, pos);
+    if (out_name != nil) {
+        var oi: usize = 0;
+        for (out_name[oi] != 0 && oi < 63) { out_buf[oi] = out_name[oi]; oi = oi + 1; }
+        out_buf[oi] = 0;
+    }
+
+    val num_name: str = asm_read_operand(text, len, pos);
+    val num_vreg: u16 = asm_resolve_local(ctx, num_name);
+    lower.emit(ctx, inst.make_scarg(0, num_vreg, ctx.ptr_size));
+
+    var ai: u8 = 0;
+    for (ai < 6) {
+        val arg_name: str = asm_read_operand(text, len, pos);
+        if (arg_name == nil) { brk; }
+        val arg_vreg: u16 = asm_resolve_local(ctx, arg_name);
+        lower.emit(ctx, inst.make_scarg(ai + 1, arg_vreg, ctx.ptr_size));
+        ai = ai + 1;
+    }
+
+    val result: u16 = lower.alloc_vreg(ctx);
+    lower.emit(ctx, inst.make_syscall(result));
+    asm_store_local(ctx, ?out_buf[0], result);
+}
+
+fun parse_ordering(mn: str) u8 {
+    if (str_ends_with(mn, "relaxed"))  { ret op.MO_RELAXED; }
+    if (str_ends_with(mn, "acquire"))  { ret op.MO_ACQUIRE; }
+    if (str_ends_with(mn, "release"))  { ret op.MO_RELEASE; }
+    if (str_ends_with(mn, "acq_rel"))  { ret op.MO_ACQ_REL; }
+    ret op.MO_SEQ_CST;
+}
+
+fun lower_masm_atomic_load(ctx: *lower.LowerContext, text: str, len: usize, pos: *usize, mn: str) {
+    val ordering: u8 = parse_ordering(mn);
+    val dst_name: str = asm_read_operand(text, len, pos);
+    val ptr_name: str = asm_read_operand(text, len, pos);
+    val ptr_vreg: u16 = asm_resolve_local(ctx, ptr_name);
+    val result: u16 = lower.alloc_vreg(ctx);
+    val zero_disp: u16 = lower.intern_disp(ctx, 0);
+    lower.emit(ctx, inst.make_atomic_load(result, ptr_vreg, zero_disp, ctx.ptr_size, ordering));
+    asm_store_local(ctx, dst_name, result);
+}
+
+fun lower_masm_atomic_store(ctx: *lower.LowerContext, text: str, len: usize, pos: *usize, mn: str) {
+    val ordering: u8 = parse_ordering(mn);
+    val ptr_name: str = asm_read_operand(text, len, pos);
+    val val_name: str = asm_read_operand(text, len, pos);
+    val ptr_vreg: u16 = asm_resolve_local(ctx, ptr_name);
+    val val_vreg: u16 = asm_resolve_local(ctx, val_name);
+    val zero_disp: u16 = lower.intern_disp(ctx, 0);
+    lower.emit(ctx, inst.make_atomic_store(val_vreg, ptr_vreg, zero_disp, ctx.ptr_size, ordering));
+}
+
+fun lower_masm_atomic_cas(ctx: *lower.LowerContext, text: str, len: usize, pos: *usize, mn: str) {
+    val ordering: u8 = parse_ordering(mn);
+    val old_name: str = asm_read_operand(text, len, pos);
+    val ptr_name: str = asm_read_operand(text, len, pos);
+    val exp_name: str = asm_read_operand(text, len, pos);
+    val des_name: str = asm_read_operand(text, len, pos);
+    val ptr_vreg: u16 = asm_resolve_local(ctx, ptr_name);
+    val exp_vreg: u16 = asm_resolve_local(ctx, exp_name);
+    val des_vreg: u16 = asm_resolve_local(ctx, des_name);
+    val packed: i32 = inst.pack_indexed(exp_vreg, des_vreg::i16);
+    val packed_off: u16 = lower.intern_disp(ctx, packed);
+    val result: u16 = lower.alloc_vreg(ctx);
+    lower.emit(ctx, inst.make_atomic_cas(result, ptr_vreg, packed_off, ctx.ptr_size, ordering));
+    asm_store_local(ctx, old_name, result);
+}
+
+fun lower_masm_atomic_rmw(ctx: *lower.LowerContext, text: str, len: usize, pos: *usize, mn: str) {
+    val ordering: u8 = parse_ordering(mn);
+    val old_name: str = asm_read_operand(text, len, pos);
+    val ptr_name: str = asm_read_operand(text, len, pos);
+    val val_name: str = asm_read_operand(text, len, pos);
+    val ptr_vreg: u16 = asm_resolve_local(ctx, ptr_name);
+    val val_vreg: u16 = asm_resolve_local(ctx, val_name);
+    var rmw_op: u8 = op.RMW_ADD;
+    if (str_contains(mn, "sub"))  { rmw_op = op.RMW_SUB; }
+    or (str_contains(mn, "xchg")) { rmw_op = op.RMW_XCHG; }
+    or (str_contains(mn, "and"))  { rmw_op = op.RMW_AND; }
+    or (str_contains(mn, "or"))   { rmw_op = op.RMW_OR; }
+    or (str_contains(mn, "xor"))  { rmw_op = op.RMW_XOR; }
+    val packed: i32 = (val_vreg::i32 << 16) | (rmw_op::i32 << 8);
+    val packed_off: u16 = lower.intern_disp(ctx, packed);
+    val result: u16 = lower.alloc_vreg(ctx);
+    lower.emit(ctx, inst.make_atomic_rmw(result, ptr_vreg, packed_off, ctx.ptr_size, ordering));
+    asm_store_local(ctx, old_name, result);
+}
+
+fun asm_make_in_temp(ctx: *lower.LowerContext, reg_name: str, vreg: u16) str {
+    var name_buf: [80]u8;
+    name_buf[0] = '.'; name_buf[1] = 'i'; name_buf[2] = 'n';
+    name_buf[3] = '_';
+    var ni: usize = 4;
+    var ri: usize = 0;
+    for (reg_name[ri] != 0 && ni < 78) {
+        name_buf[ni] = reg_name[ri];
+        ni = ni + 1;
+        ri = ri + 1;
+    }
+    name_buf[ni] = 0;
+    val temp_name: str = ?name_buf[0];
+    val tid: type.TypeId = type.primitive(ctx.sema.types, type.TK_U64);
+    val sz: usize = 8;
+    val offset: i64 = lower.push_local(ctx, temp_name, tid, sz, 8);
+    val disp: u16 = lower.intern_disp(ctx, offset::i32);
+    lower.emit(ctx, inst.make_store(vreg, inst.VREG_FP::u16, disp, 8));
+    ret temp_name;
+}
+
+fun asm_build_mov_reg_local(ctx: *lower.LowerContext, reg_name: str, local_name: str) str {
+    val lv: *lower.LocalVar = lower.find_local(ctx, local_name);
+    if (lv == nil) { ret nil; }
+    var abs_off: i64 = lv.offset;
+    if (abs_off < 0) { abs_off = 0 - abs_off; }
+    val buf_size: usize = 128;
+    val res_buf: Result[*u8, str] = allocator.allocate[u8](ctx.alloc, buf_size);
+    if (!res_buf.tag) { ret nil; }
+    val buf: *u8 = res_buf.value.ok;
+    var wi: usize = 0;
+    buf[wi] = 'm'; wi = wi + 1;
+    buf[wi] = 'o'; wi = wi + 1;
+    buf[wi] = 'v'; wi = wi + 1;
+    buf[wi] = ' '; wi = wi + 1;
+    var ri: usize = 0;
+    for (reg_name[ri] != 0 && wi < buf_size - 1) {
+        buf[wi] = reg_name[ri]; wi = wi + 1; ri = ri + 1;
+    }
+    buf[wi] = ','; wi = wi + 1;
+    buf[wi] = ' '; wi = wi + 1;
+    buf[wi] = '['; wi = wi + 1;
+    buf[wi] = 'r'; wi = wi + 1;
+    buf[wi] = 'b'; wi = wi + 1;
+    buf[wi] = 'p'; wi = wi + 1;
+    buf[wi] = ' '; wi = wi + 1;
+    buf[wi] = '-'; wi = wi + 1;
+    buf[wi] = ' '; wi = wi + 1;
+    var digits: [20]u8;
+    var dlen: usize = 0;
+    var tmp: i64 = abs_off;
+    if (tmp == 0) { digits[0] = '0'; dlen = 1; }
+    or { for (tmp > 0) { digits[dlen] = (tmp % 10)::u8 + '0'; dlen = dlen + 1; tmp = tmp / 10; } }
+    var di: usize = dlen;
+    for (di > 0) { di = di - 1; buf[wi] = digits[di]; wi = wi + 1; }
+    buf[wi] = ']'; wi = wi + 1;
+    buf[wi] = 0;
+    ret buf::str;
+}
+
+fun asm_build_mov_local_reg(ctx: *lower.LowerContext, local_name: str, reg_name: str) str {
+    val lv: *lower.LocalVar = lower.find_local(ctx, local_name);
+    if (lv == nil) { ret nil; }
+    var abs_off: i64 = lv.offset;
+    if (abs_off < 0) { abs_off = 0 - abs_off; }
+    val buf_size: usize = 128;
+    val res_buf: Result[*u8, str] = allocator.allocate[u8](ctx.alloc, buf_size);
+    if (!res_buf.tag) { ret nil; }
+    val buf: *u8 = res_buf.value.ok;
+    var wi: usize = 0;
+    buf[wi] = 'm'; wi = wi + 1;
+    buf[wi] = 'o'; wi = wi + 1;
+    buf[wi] = 'v'; wi = wi + 1;
+    buf[wi] = ' '; wi = wi + 1;
+    buf[wi] = '['; wi = wi + 1;
+    buf[wi] = 'r'; wi = wi + 1;
+    buf[wi] = 'b'; wi = wi + 1;
+    buf[wi] = 'p'; wi = wi + 1;
+    buf[wi] = ' '; wi = wi + 1;
+    buf[wi] = '-'; wi = wi + 1;
+    buf[wi] = ' '; wi = wi + 1;
+    var digits: [20]u8;
+    var dlen: usize = 0;
+    var tmp: i64 = abs_off;
+    if (tmp == 0) { digits[0] = '0'; dlen = 1; }
+    or { for (tmp > 0) { digits[dlen] = (tmp % 10)::u8 + '0'; dlen = dlen + 1; tmp = tmp / 10; } }
+    var di: usize = dlen;
+    for (di > 0) { di = di - 1; buf[wi] = digits[di]; wi = wi + 1; }
+    buf[wi] = ']'; wi = wi + 1;
+    buf[wi] = ','; wi = wi + 1;
+    buf[wi] = ' '; wi = wi + 1;
+    var ri: usize = 0;
+    for (reg_name[ri] != 0 && wi < buf_size - 1) {
+        buf[wi] = reg_name[ri]; wi = wi + 1; ri = ri + 1;
+    }
+    buf[wi] = 0;
+    ret buf::str;
+}
+
+fun asm_resolve_var_refs(ctx: *lower.LowerContext, text: str) str {
+    if (text == nil) { ret text; }
+    val len: usize = str_len(text);
+    var has_ref: bool = false;
+    var si: usize = 0;
+    for (si < len) {
+        if (text[si] == '{') { has_ref = true; brk; }
+        si = si + 1;
+    }
+    if (!has_ref) { ret text; }
+
+    val buf_size: usize = len * 4 + 1;
+    val res_buf: Result[*u8, str] = allocator.allocate[u8](ctx.alloc, buf_size);
+    if (!res_buf.tag) { ret text; }
+    val buf: *u8 = res_buf.value.ok;
+
+    var ri: usize = 0;
+    var wi: usize = 0;
+    for (ri < len && wi < buf_size - 1) {
+        if (text[ri] == '{') {
+            ri = ri + 1;
+            var name_buf: [64]u8;
+            var nl: usize = 0;
+            for (ri < len && text[ri] != '}' && nl < 63) {
+                name_buf[nl] = text[ri];
+                nl = nl + 1;
+                ri = ri + 1;
+            }
+            if (ri < len && text[ri] == '}') { ri = ri + 1; }
+            name_buf[nl] = 0;
+
+            val lv: *lower.LocalVar = lower.find_local(ctx, ?name_buf[0]);
+            if (lv != nil) {
+                var abs_off: i64 = lv.offset;
+                if (abs_off < 0) { abs_off = 0 - abs_off; }
+                buf[wi] = '['; wi = wi + 1;
+                buf[wi] = 'r'; wi = wi + 1;
+                buf[wi] = 'b'; wi = wi + 1;
+                buf[wi] = 'p'; wi = wi + 1;
+                buf[wi] = ' '; wi = wi + 1;
+                buf[wi] = '-'; wi = wi + 1;
+                buf[wi] = ' '; wi = wi + 1;
+                var digits: [20]u8;
+                var dlen: usize = 0;
+                var tmp: i64 = abs_off;
+                if (tmp == 0) {
+                    digits[0] = '0';
+                    dlen = 1;
+                } or {
+                    for (tmp > 0) {
+                        digits[dlen] = (tmp % 10)::u8 + '0';
+                        dlen = dlen + 1;
+                        tmp = tmp / 10;
+                    }
+                }
+                var di: usize = dlen;
+                for (di > 0) {
+                    di = di - 1;
+                    buf[wi] = digits[di];
+                    wi = wi + 1;
+                }
+                buf[wi] = ']'; wi = wi + 1;
+            } or {
+                buf[wi] = '{'; wi = wi + 1;
+                var ci: usize = 0;
+                for (ci < nl && wi < buf_size - 1) {
+                    buf[wi] = name_buf[ci];
+                    wi = wi + 1;
+                    ci = ci + 1;
+                }
+                buf[wi] = '}'; wi = wi + 1;
+            }
+        } or {
+            buf[wi] = text[ri];
+            wi = wi + 1;
+            ri = ri + 1;
+        }
+    }
+    buf[wi] = 0;
+    ret buf::str;
+}
+
+fun trim_whitespace(text: str) str {
+    if (text == nil) { ret nil; }
+    var i: usize = 0;
+    for (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r') {
+        i = i + 1;
+    }
+    if (text[i] == 0) { ret nil; }
+    ret (text::usize + i)::str;
+}
+
+# emit deferred statements in reverse order from mark to current count
+fun emit_deferred(ctx: *lower.LowerContext, mark: i32,
+                  store: *ast.NodeStore) {
+    var i: i32 = ctx.ds.count - 1;
+    for (i >= mark) {
+        val deferred_id: ast.NodeId = ctx.ds.nodes[i];
+        if (deferred_id::u32 != ast.NODE_NIL::u32) {
+            lower_stmt(ctx, deferred_id, store);
+        }
+        i = i - 1;
+    }
+    ctx.ds.count = mark;
+}
