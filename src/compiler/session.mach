@@ -1,9 +1,16 @@
-# mach.compiler.session: compilation session and shared state
+# mach.compiler.session: compilation pipeline with phase-separated results
 #
-# owns all compilation state: diagnostics, module table, symbol table, type
-# table, monomorphization cache, and target. the string pool interns strings
-# by pointer with dedup via hash map, so repeated lookups return the same
-# pointer without additional allocation.
+# the compilation pipeline flows through discrete phases, each producing
+# a typed result consumed by the next:
+#
+#   load    → ParseResult  (module table with AST, tokens, dependency graph)
+#   analyze → SemaResult   (types, symbols, mono cache, const maps)
+#   compile → CompileResult (object file paths)
+#   link    → LinkResult    (binary path)
+#
+# the Session provides shared infrastructure (allocator, string pool,
+# diagnostics, target) that all phases reference. phase results own
+# their data and are freed independently.
 
 use std.types.bool;
 use std.types.size;
@@ -25,38 +32,21 @@ use check:     mach.compiler.sema.check;
 use consteval: mach.compiler.sema.consteval;
 use st:      mach.compiler.sema.sidetable;
 use ast:     mach.compiler.parse.ast;
-use lower:   mach.compiler.lower.lower;
-use lctx:    mach.compiler.lower.ctx;
-use codegen: mach.compiler.codegen;
-use linker:  mach.compiler.linker;
-use target:  mach.compiler.target.target;
-use of:      mach.compiler.target.of;
-use pass:    mach.compiler.opt.pass;
-use masm_mod:  masm.module;
-use masm.function;
-use masm_fn:   masm.function;
-use masm.op;
-use masm_op:   masm.op;
-use masm_data: masm.data;
-use masm_sym:  masm.symbol;
-use masm_printer: masm.codec.printer;
-use iobuf:     std.io.buffer;
-use vec:       std.collections.vector;
+use linker:      mach.compiler.linker;
+use target:      mach.compiler.target.target;
+use of:          mach.compiler.target.of;
+use mir_ir:      mach.compiler.mir.ir;
+use mir_builder: mach.compiler.mir.builder;
+use mir_lower:   mach.compiler.mir.lower.lower;
+use mir_lctx:    mach.compiler.mir.lower.ctx;
+use mir_compile: mach.compiler.mir.backend.compile;
+use mir_pass:    mach.compiler.mir.opt.pass;
+use mir_dce:     mach.compiler.mir.opt.dce;
+use iobuf:       std.io.buffer;
 use path:     std.types.path;
 use print:    std.print;
 use fs:       std.filesystem;
-use elf:      mach.compiler.target.of.elf;
-use dwarf:    mach.compiler.target.of.dwarf;
 
-# options controlling compilation behavior
-# ---
-# release:   enable release-mode optimizations
-# emit_masm: dump MASM IR to files
-# emit_asm:  dump final assembly to files
-# verbose:   enable verbose diagnostic output
-# verify_ir: run IR verification passes
-# opt_level: optimization level (0-3)
-# jobs:      number of parallel compilation jobs
 pub rec CompileOpts {
     release:   bool;
     emit_masm: bool;
@@ -67,12 +57,6 @@ pub rec CompileOpts {
     jobs:      u32;
 }
 
-# result of a compilation run
-# ---
-# ok:        true if compilation succeeded
-# obj_paths: array of emitted object file paths
-# obj_count: number of object files
-# binary:    path to the linked binary (or nil)
 pub rec CompileResult {
     ok:        bool;
     obj_paths: *str;
@@ -80,13 +64,6 @@ pub rec CompileResult {
     binary:    str;
 }
 
-# deduplicated string pool backed by a hash map
-# ---
-# alloc:   backing allocator
-# strings: flat array of interned string pointers
-# count:   number of strings in the pool
-# cap:     allocated capacity of the strings array
-# dedup:   map from string content to pool index
 pub rec StringPool {
     alloc:   *allocator.Allocator;
     strings: *str;
@@ -95,44 +72,34 @@ pub rec StringPool {
     dedup:   map.Map[str, u32];
 }
 
-# top-level compilation session
-# ---
-# alloc:   backing allocator
-# strings: shared string pool
-# diag:    diagnostic list
-# modules: module table
-# symbols: symbol table
-# types:   type table
-# mono:    monomorphization cache
-# target:  resolved compilation target
-# opts:    compilation options
+# output of the parse phase: all modules loaded, lexed, parsed, dependency graph built
+pub rec ParseResult {
+    modules: module.ModuleTable;
+}
+
+# output of the sema phase: type system, symbol table, monomorphization, constants
+pub rec SemaResult {
+    symbols:    scope.SymbolTable;
+    types:      type.TypeTable;
+    mono:       mono.MonoCache;
+    const_maps: *consteval.ConstMap;
+    const_cap:  u32;
+}
+
+# shared compilation infrastructure — outlives all phase results
 pub rec Session {
     alloc:   *allocator.Allocator;
     strings: StringPool;
     diag:    diag.DiagList;
-    modules: module.ModuleTable;
-    symbols: scope.SymbolTable;
-    types:   type.TypeTable;
-    mono:    mono.MonoCache;
-    target:     *target.Target;
-    const_maps: *consteval.ConstMap;
-    const_cap:  u32;
+    target:  *target.Target;
     opts:    CompileOpts;
 }
 
-# init: create a new compilation session.
-# ---
-# alloc:    allocator for all session-owned storage
-# opts:     compilation options
-# ptr_size: pointer size in bytes for the target
-# ret:      initialized Session
-pub fun init(alloc: *allocator.Allocator, opts: CompileOpts, ptr_size: u32) Session {
+pub fun init(alloc: *allocator.Allocator, opts: CompileOpts) Session {
     var s: Session;
     s.alloc  = alloc;
     s.opts   = opts;
-    s.target     = nil;
-    s.const_maps = nil;
-    s.const_cap  = 0;
+    s.target = nil;
 
     s.strings.alloc   = alloc;
     s.strings.strings = nil;
@@ -140,25 +107,14 @@ pub fun init(alloc: *allocator.Allocator, opts: CompileOpts, ptr_size: u32) Sess
     s.strings.cap     = 0;
     s.strings.dedup   = map.init[str, u32](alloc, map.hash_str, map.eq_str);
 
-    s.diag    = diag.init(alloc);
-    s.modules = module.init(alloc);
-    s.symbols = scope.init(alloc);
-    s.types   = type.init(alloc, ptr_size, ptr_size);
-    s.mono    = mono.init(alloc);
+    s.diag = diag.init(alloc);
 
     ret s;
 }
 
-# dnit: destroy a session, freeing all owned storage.
-# ---
-# s: session to destroy
 pub fun dnit(s: *Session) {
     if (s == nil) { ret; }
 
-    mono.dnit(?s.mono);
-    scope.dnit(?s.symbols);
-    type.dnit(?s.types);
-    module.dnit(?s.modules);
     diag.dnit(?s.diag);
 
     if (s.strings.strings != nil && s.strings.cap > 0) {
@@ -171,15 +127,22 @@ pub fun dnit(s: *Session) {
     map.dnit[str, u32](?s.strings.dedup);
 }
 
-# pool_intern: intern a string into the pool, returning the canonical pointer.
-#
-# if the string was already interned, returns the existing pointer without
-# allocating. otherwise appends it to the pool and records it in the dedup
-# map.
-# ---
-# pool: string pool to intern into
-# text: string to intern
-# ret:  the canonical interned pointer for this string
+pub fun parse_dnit(pr: *ParseResult) {
+    if (pr == nil) { ret; }
+    module.dnit(?pr.modules);
+}
+
+pub fun sema_dnit(sr: *SemaResult, alloc: *allocator.Allocator) {
+    if (sr == nil) { ret; }
+    mono.dnit(?sr.mono);
+    scope.dnit(?sr.symbols);
+    type.dnit(?sr.types);
+    if (sr.const_maps != nil && sr.const_cap > 0) {
+        allocator.deallocate[consteval.ConstMap](alloc, sr.const_maps, sr.const_cap::usize);
+        sr.const_maps = nil;
+    }
+}
+
 pub fun pool_intern(pool: *StringPool, text: str) str {
     val key: str = text;
     val res_get: Result[*u32, str] = map.get[str, u32](?pool.dedup, ?key);
@@ -214,11 +177,6 @@ pub fun pool_intern(pool: *StringPool, text: str) str {
     ret text;
 }
 
-# default_opts: return default compilation options.
-#
-# all flags are false/zero except verify_ir which defaults to true.
-# ---
-# ret: default CompileOpts
 pub fun default_opts() CompileOpts {
     var opts: CompileOpts;
     opts.release   = false;
@@ -231,74 +189,83 @@ pub fun default_opts() CompileOpts {
     ret opts;
 }
 
-# load: load a root module and its dependency graph into the session.
-# ---
-# s:          session
-# root_path:  dot-separated module path for the root
-# file_path:  filesystem path to the root source file
-# source:     source text of the root file
-# src_dir:    source root directory
-# dep_dir:    dependency root directory
-# project_id: project identifier string
-# deps:       dependency mappings (project_id → dir_name + dir_src)
-# dep_count:  number of dependency mappings
+# parse phase: load a root module and its dependency graph.
+# produces a ParseResult owning the module table.
 pub fun load(s: *Session, root_path: str, file_path: str, source: str,
              src_dir: str, dep_dir: str, project_id: str,
-             deps: *module.DepMapping, dep_count: u32) {
-    val root_id: module.ModuleId = module.create(?s.modules, root_path, file_path, source);
-    if (root_id::u32 == module.MOD_NIL::u32) { ret; }
-    module.load_graph(?s.modules, root_id, src_dir, dep_dir, project_id, deps, dep_count);
+             deps: *module.DepMapping, dep_count: u32) ParseResult {
+    var pr: ParseResult;
+    pr.modules = module.init(s.alloc);
+    pr.modules.diag = ?s.diag;
+    val root_id: module.ModuleId = module.create(?pr.modules, root_path, file_path, source);
+    if (root_id::u32 != module.MOD_NIL::u32) {
+        module.load_graph(?pr.modules, root_id, src_dir, dep_dir, project_id, deps, dep_count);
+    }
+    ret pr;
 }
 
-# analyze: run all four semantic analysis phases.
-# ---
-# s: session
-pub fun analyze(s: *Session) {
+# sema phase: run all four semantic analysis phases.
+# produces a SemaResult owning types, symbols, mono cache, and const maps.
+pub fun analyze(s: *Session, pr: *ParseResult) SemaResult {
+    var sr: SemaResult;
+    sr.symbols = scope.init(s.alloc);
+    sr.types   = type.init(s.alloc, s.target.ptr_size::u32, s.target.ptr_size::u32);
+    if (s.target.abi.init_va_list != nil) {
+        s.target.abi.init_va_list(s.target.abi.ctx, (?sr.types)::ptr);
+    }
+    sr.mono    = mono.init(s.alloc);
+    sr.const_maps = nil;
+    sr.const_cap  = 0;
+
     var sa: sema.Sema;
     sa.alloc   = s.alloc;
-    sa.modules = ?s.modules;
-    sa.symbols = ?s.symbols;
-    sa.types   = ?s.types;
-    sa.mono    = ?s.mono;
+    sa.modules = ?pr.modules;
+    sa.symbols = ?sr.symbols;
+    sa.types   = ?sr.types;
+    sa.mono    = ?sr.mono;
     sa.diag    = ?s.diag;
     sa.strings = ?s.strings;
 
     resolve.collect_all(?sa);
-    if (diag.had_errors(?s.diag)) { ret; }
+    if (diag.had_errors(?s.diag)) { ret sr; }
 
     resolve.resolve_all(?sa);
-    if (diag.had_errors(?s.diag)) { ret; }
+    if (diag.had_errors(?s.diag)) { ret sr; }
 
     check.resolve_bodies(?sa);
     check.resolve_instantiation_bodies(?sa);
-    if (diag.had_errors(?s.diag)) { ret; }
+    if (diag.had_errors(?s.diag)) { ret sr; }
 
     check.check_all(?sa);
-    if (diag.had_errors(?s.diag)) { ret; }
+    if (diag.had_errors(?s.diag)) { ret sr; }
 
     check.validate_sidetables(?sa);
 
-    val cmod_count: u32 = module.order_count(?s.modules);
+    val cmod_count: u32 = module.order_count(?pr.modules);
     if (cmod_count > 0) {
         val res_maps: Result[*consteval.ConstMap, str] = allocator.zallocate[consteval.ConstMap](s.alloc, cmod_count::usize);
         if (is_ok[*consteval.ConstMap, str](res_maps)) {
-            s.const_maps = unwrap_ok[*consteval.ConstMap, str](res_maps);
-            s.const_cap  = cmod_count;
+            sr.const_maps = unwrap_ok[*consteval.ConstMap, str](res_maps);
+            sr.const_cap  = cmod_count;
             var ci: u32 = 0;
             for (ci < cmod_count) {
-                val cmod_id: module.ModuleId = module.order_at(?s.modules, ci);
-                val m: *module.Module = module.get(?s.modules, cmod_id);
-                s.const_maps[ci] = consteval.eval_globals(
-                    s.alloc, ?m.store, m.root, ?s.types,
-                    ?s.symbols, m.scope
+                val cmod_id: module.ModuleId = module.order_at(?pr.modules, ci);
+                val m: *module.Module = module.get(?pr.modules, cmod_id);
+                sr.const_maps[ci] = consteval.eval_globals(
+                    s.alloc, ?m.store, m.root, ?sr.types,
+                    ?sr.symbols, m.scope
                 );
                 ci = ci + 1;
             }
         }
     }
+
+    ret sr;
 }
 
-pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
+# codegen phase: lower MIR, optimize, compile to object files.
+# reads from ParseResult (modules) and SemaResult (types, symbols).
+pub fun compile_all(s: *Session, pr: *ParseResult, sr: *SemaResult, artifacts_dir: str) CompileResult {
     var result: CompileResult;
     result.ok        = false;
     result.obj_paths = nil;
@@ -307,7 +274,7 @@ pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
 
     if (s.target == nil) { ret result; }
 
-    val mod_count: u32 = module.order_count(?s.modules);
+    val mod_count: u32 = module.order_count(?pr.modules);
     if (mod_count == 0) { ret result; }
 
     val res_paths: Result[*str, str] = allocator.allocate[str](s.alloc, mod_count::usize);
@@ -320,46 +287,36 @@ pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
 
     var sa: sema.Sema;
     sa.alloc   = s.alloc;
-    sa.modules = ?s.modules;
-    sa.symbols = ?s.symbols;
-    sa.types   = ?s.types;
-    sa.mono    = ?s.mono;
+    sa.modules = ?pr.modules;
+    sa.symbols = ?sr.symbols;
+    sa.types   = ?sr.types;
+    sa.mono    = ?sr.mono;
     sa.diag    = ?s.diag;
     sa.strings = ?s.strings;
 
-    var pipeline: pass.PassPipeline = pass.default_pipeline(s.alloc, s.opts.opt_level);
+    var opt_pipeline: mir_pass.PassPipeline = mir_pass.init(s.alloc);
+    if (s.opts.opt_level >= 1) {
+        mir_pass.add(?opt_pipeline, mir_dce.run);
+    }
 
     var i: u32 = 0;
     for (i < mod_count) {
-        val mod_id: module.ModuleId = module.order_at(?s.modules, i);
-        val m: *module.Module = module.get(?s.modules, mod_id);
+        val mod_id: module.ModuleId = module.order_at(?pr.modules, i);
+        val m: *module.Module = module.get(?pr.modules, mod_id);
 
-        var builder: masm_mod.ModuleBuilder = masm_mod.builder_init(s.alloc);
+        var mb: mir_builder.ModuleBuilder = mir_builder.module_init(s.alloc, ?sr.types);
+        var mir_ctx: mir_lctx.LowerCtx = mir_lctx.init(s.alloc, ?sa, ?s.diag, ?mb);
 
-        val res_lower: Result[lctx.LowerContext, str] = lower.init(
-            s.alloc, s.target::ptr, ?builder, ?sa, ?s.diag
-        );
-        if (is_err[lctx.LowerContext, str](res_lower)) {
-            diag.error(?s.diag, diag.make_loc(nil, 0, 0), "failed to initialize lowering context");
-            i = i + 1;
-            cnt;
-        }
-        var lower_ctx: lctx.LowerContext = unwrap_ok[lctx.LowerContext, str](res_lower);
-        if (s.const_maps != nil && i < s.const_cap) {
-            lower_ctx.const_map = ?s.const_maps[i];
-        }
+        mir_lower.lower_module(?mir_ctx, mod_id);
 
-        lower.lower_module(?lower_ctx, mod_id);
-        lower.dnit(?lower_ctx);
+        var mir_mod: mir_ir.Module = mir_builder.module_finish(?mb);
 
-        var ir_module: masm_mod.Module = masm_mod.build(?builder);
-
-        if (ir_module.functions.len == 0 && ir_module.data_decls.decls.len == 0) {
-            masm_mod.module_dnit(s.alloc, ?ir_module);
+        if (mir_mod.func_count == 0 && mir_mod.glob_count == 0) {
             i = i + 1;
             cnt;
         }
 
+        mir_pass.run_module(?opt_pipeline, ?mir_mod);
 
         val res_mod_rel: Result[str, str] = module_to_path(s.alloc, m.path);
         var mod_rel: str = nil;
@@ -367,49 +324,22 @@ pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
             mod_rel = unwrap_ok[str, str](res_mod_rel);
         }
 
-        if (s.opts.emit_masm && mod_rel != nil) {
-            emit_module_masm(s, ?ir_module, art_dir, mod_rel);
-        }
-
-        var obj: of.ObjWriter = elf.init_writer(s.alloc);
-        val text_idx: i32 = obj.add_section(obj.ctx, ".text", of.SK_TEXT::u8, 6, 16);
+        var obj: of.ObjWriter = s.target.of.init_obj(s.alloc);
+        val text_idx: i32 = obj.add_section(obj.ctx, ".text", of.SK_TEXT::u8, 6, s.target.isa.code_align::usize);
         if (text_idx < 0) {
-            masm_mod.module_dnit(s.alloc, ?ir_module);
             i = i + 1;
             cnt;
         }
 
-        var debug: of.DebugInfo = dwarf.init(s.alloc, ".");
+        var debug: of.DebugInfo = s.target.of.init_dbg(s.alloc, ".");
         s.target.of.debug = debug;
 
-        emit_data_decls(s, ?ir_module, ?obj);
+        val compile_res: mir_compile.CompileResult = mir_compile.compile_module(
+            ?mir_mod, s.target, s.alloc, ?obj, ?s.diag, text_idx
+        );
 
-        var asm_wb: iobuf.WriteBuf = iobuf.wbuf_make(s.alloc);
-        var use_asm: bool = s.opts.emit_asm;
-
-        var fi: usize = 0;
-        for (fi < ir_module.functions.len) {
-            val fn_ptr: *masm_fn.Function = ir_module.functions.data[fi];
-            if (fn_ptr::ptr != nil) {
-                if (use_asm && fn_ptr.name != nil) {
-                    iobuf.wbuf_write_str(?asm_wb, fn_ptr.name);
-                    iobuf.wbuf_write_str(?asm_wb, ":\n");
-                }
-                var asm_ptr: *iobuf.WriteBuf = nil;
-                if (use_asm) { asm_ptr = ?asm_wb; }
-                codegen.compile_function(
-                    fn_ptr, fn_ptr.frame_size::usize, s.target, ?pipeline, s.alloc, ?obj, asm_ptr,
-                    ?s.diag
-                );
-                if (use_asm) {
-                    iobuf.wbuf_write_str(?asm_wb, "\n");
-                }
-            }
-            fi = fi + 1;
-        }
-
-        if (use_asm && mod_rel != nil && asm_wb.len > 0) {
-            emit_asm_file(s, ?asm_wb, art_dir, mod_rel);
+        if (!compile_res.ok) {
+            diag.error(?s.diag, diag.make_loc(m.file_path, 0, 0), "MIR compilation failed");
         }
 
         if (debug.finalize != nil) {
@@ -438,68 +368,23 @@ pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
             debug.dnit(debug.ctx);
         }
 
-        masm_mod.module_dnit(s.alloc, ?ir_module);
         i = i + 1;
     }
 
-    pass.dnit(?pipeline);
+    mir_pass.dnit(?opt_pipeline);
     result.ok = result.obj_count > 0 && !diag.had_errors(?s.diag);
     ret result;
 }
 
-# link_all: link object files into a final binary.
-# ---
-# s:           session
-# obj_paths:   array of object file paths
-# obj_count:   number of object files
-# output_path: path for the output binary
-# ret:         link result
 pub fun link_all(s: *Session, obj_paths: *str, obj_count: i32, output_path: str) linker.LinkResult {
     ret linker.link(s.alloc, obj_paths, obj_count, output_path, s.target, ?s.diag);
-}
-
-# diagnostics: return a read-only reference to the session's diagnostic list.
-# ---
-# s:   session
-# ret: reference to the diagnostic list
-pub fun diagnostics(s: *Session) *diag.DiagList {
-    ret ?s.diag;
-}
-
-# get_type: look up a type by id.
-# ---
-# s:  session
-# id: type id
-# ret: reference to the type
-pub fun get_type(s: *Session, id: type.TypeId) *type.Type {
-    ret type.get(?s.types, id);
-}
-
-# get_symbol: look up a symbol by id.
-# ---
-# s:  session
-# id: symbol id
-# ret: reference to the symbol
-pub fun get_symbol(s: *Session, id: scope.SymbolId) *scope.Symbol {
-    ret scope.get_sym(?s.symbols, id);
-}
-
-# node_type: get the resolved type for an AST node in a module.
-# ---
-# s:       session
-# mod_id:  module containing the node
-# node_id: AST node id
-# ret:     resolved TypeId, or TYPE_NIL if not set
-pub fun node_type(s: *Session, mod_id: module.ModuleId, node_id: ast.NodeId) type.TypeId {
-    val m: *module.Module = module.get(?s.modules, mod_id);
-    ret st.get_type(?m.expr_types, node_id);
 }
 
 test "session: pool_intern deduplicates strings" {
     var a: allocator.Allocator;
     page.make(?a);
 
-    var s: Session = init(?a, default_opts(), 8);
+    var s: Session = init(?a, default_opts());
 
     val first:  str = pool_intern(?s.strings, "hello");
     val second: str = pool_intern(?s.strings, "hello");
@@ -599,109 +484,6 @@ fun emit_asm_file(s: *Session, wb: *iobuf.WriteBuf, art_dir: str, mod_rel: str) 
             fs.create_dir_all(s.alloc, out_dir, 0o755);
         }
     }
-    val res_file: Result[fs.File, str] = fs.create(out_path, 0o644);
-    if (is_err[fs.File, str](res_file)) { ret; }
-    var f: fs.File = unwrap_ok[fs.File, str](res_file);
-    if (wb.len > 0 && wb.data != nil) {
-        fs.write(?f, wb.data, wb.len);
-    }
-    fs.close(?f);
-}
-
-fun emit_data_decls(s: *Session, ir_module: *masm_mod.Module, obj: *of.ObjWriter) {
-    if (ir_module.data_decls.decls.len == 0) { ret; }
-    if (obj.add_section == nil || obj.add_symbol == nil) { ret; }
-
-    var data_idx: i32 = -1;
-    var bss_idx: i32 = -1;
-    var rodata_idx: i32 = -1;
-
-    var di: usize = 0;
-    for (di < ir_module.data_decls.decls.len) {
-        val r: Result[*masm_data.DataDecl, str] = vec.get[masm_data.DataDecl](?ir_module.data_decls.decls, di);
-        if (is_err[*masm_data.DataDecl, str](r)) {
-            di = di + 1;
-            cnt;
-        }
-        val d: *masm_data.DataDecl = unwrap_ok[*masm_data.DataDecl, str](r);
-        if (d.name == nil) { di = di + 1; cnt; }
-
-        var sec_idx: i32 = -1;
-
-        if (d.section == masm_sym.SEC_BSS || d.kind == masm_data.DATA_ZERO) {
-            if (bss_idx < 0) {
-                bss_idx = obj.add_section(obj.ctx, ".bss", of.SK_BSS::u8, 3, 8);
-            }
-            sec_idx = bss_idx;
-        } or (d.section == masm_sym.SEC_RODATA) {
-            if (rodata_idx < 0) {
-                rodata_idx = obj.add_section(obj.ctx, ".rodata", of.SK_RODATA::u8, 2, 8);
-            }
-            sec_idx = rodata_idx;
-        } or {
-            if (data_idx < 0) {
-                data_idx = obj.add_section(obj.ctx, ".data", of.SK_DATA::u8, 3, 8);
-            }
-            sec_idx = data_idx;
-        }
-
-        if (sec_idx < 0) { di = di + 1; cnt; }
-
-        val sec: *of.Section = obj.get_section(obj.ctx, sec_idx);
-        if (sec == nil) { di = di + 1; cnt; }
-
-        val align_val: usize = d.align::usize;
-        if (align_val > 1 && sec.size > 0) {
-            val pad: usize = (align_val - (sec.size % align_val)) % align_val;
-            if (pad > 0 && obj.emit_bytes != nil && d.kind != masm_data.DATA_ZERO) {
-                var zeros: [16]u8;
-                var zi: usize = 0;
-                for (zi < 16) { zeros[zi] = 0; zi = zi + 1; }
-                var remaining: usize = pad;
-                for (remaining > 0) {
-                    var chunk: usize = remaining;
-                    if (chunk > 16) { chunk = 16; }
-                    obj.emit_bytes(obj.ctx, sec_idx, ?zeros[0], chunk);
-                    remaining = remaining - chunk;
-                }
-            } or (pad > 0) {
-                sec.size = sec.size + pad;
-            }
-        }
-
-        val sym_offset: usize = sec.size;
-        val is_global: bool = d.binding == masm_sym.BIND_GLOBAL;
-
-        if (d.kind == masm_data.DATA_BYTES && d.data != nil && d.data_len > 0) {
-            if (obj.emit_bytes != nil) {
-                obj.emit_bytes(obj.ctx, sec_idx, d.data, d.data_len::usize);
-            }
-        } or (d.kind == masm_data.DATA_ZERO && d.data_len > 0) {
-            sec.size = sec.size + d.data_len::usize;
-        }
-
-        obj.add_symbol(obj.ctx, d.name, sec_idx, sym_offset, d.data_len::usize, is_global);
-
-        di = di + 1;
-    }
-}
-
-fun emit_module_masm(s: *Session, ir_module: *masm_mod.Module, art_dir: str, mod_rel: str) {
-    val res_masm_path: Result[str, str] = build_artifact_path(s.alloc, art_dir, "masm", mod_rel, ".masm");
-    if (is_err[str, str](res_masm_path)) { ret; }
-    val out_path: str = unwrap_ok[str, str](res_masm_path);
-    val res_masm_dir: Result[str, str] = path_parent_str(s.alloc, out_path);
-    if (is_ok[str, str](res_masm_dir)) {
-        val out_dir: str = unwrap_ok[str, str](res_masm_dir);
-        if (!fs.is_dir(out_dir)) {
-            fs.create_dir_all(s.alloc, out_dir, 0o755);
-        }
-    }
-
-    val res_print: Result[iobuf.WriteBuf, str] = masm_printer.print(s.alloc, ir_module);
-    if (is_err[iobuf.WriteBuf, str](res_print)) { ret; }
-    var wb: iobuf.WriteBuf = unwrap_ok[iobuf.WriteBuf, str](res_print);
-
     val res_file: Result[fs.File, str] = fs.create(out_path, 0o644);
     if (is_err[fs.File, str](res_file)) { ret; }
     var f: fs.File = unwrap_ok[fs.File, str](res_file);
