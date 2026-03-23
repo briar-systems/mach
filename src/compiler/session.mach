@@ -25,17 +25,23 @@ use check:     mach.compiler.sema.check;
 use consteval: mach.compiler.sema.consteval;
 use st:      mach.compiler.sema.sidetable;
 use ast:     mach.compiler.parse.ast;
+use lower:   mach.compiler.lower.lower;
+use lctx:    mach.compiler.lower.ctx;
+use codegen: mach.compiler.codegen;
 use linker:  mach.compiler.linker;
 use target:  mach.compiler.target.target;
 use of:      mach.compiler.target.of;
-use mir_ir:      mach.compiler.mir.ir;
-use mir_builder: mach.compiler.mir.builder;
-use mir_lower:   mach.compiler.mir.lower.lower;
-use mir_lctx:    mach.compiler.mir.lower.ctx;
-use mir_compile: mach.compiler.mir.backend.compile;
-use mir_pass:    mach.compiler.mir.opt.pass;
-use mir_dce:     mach.compiler.mir.opt.dce;
+use pass:    mach.compiler.opt.pass;
+use masm_mod:  masm.module;
+use masm.function;
+use masm_fn:   masm.function;
+use masm.op;
+use masm_op:   masm.op;
+use masm_data: masm.data;
+use masm_sym:  masm.symbol;
+use masm_printer: masm.codec.printer;
 use iobuf:     std.io.buffer;
+use vec:       std.collections.vector;
 use path:     std.types.path;
 use print:    std.print;
 use fs:       std.filesystem;
@@ -45,7 +51,7 @@ use dwarf:    mach.compiler.target.of.dwarf;
 # options controlling compilation behavior
 # ---
 # release:   enable release-mode optimizations
-# emit_masm: (reserved, no longer used)
+# emit_masm: dump MASM IR to files
 # emit_asm:  dump final assembly to files
 # verbose:   enable verbose diagnostic output
 # verify_ir: run IR verification passes
@@ -322,29 +328,38 @@ pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
     sa.diag    = ?s.diag;
     sa.strings = ?s.strings;
 
-    var opt_pipeline: mir_pass.PassPipeline = mir_pass.init(s.alloc);
-    if (s.opts.opt_level >= 1) {
-        mir_pass.add(?opt_pipeline, mir_dce.run);
-    }
+    var pipeline: pass.PassPipeline = pass.default_pipeline(s.alloc, s.opts.opt_level);
 
     var i: u32 = 0;
     for (i < mod_count) {
         val mod_id: module.ModuleId = module.order_at(?s.modules, i);
         val m: *module.Module = module.get(?s.modules, mod_id);
 
-        var mb: mir_builder.ModuleBuilder = mir_builder.module_init(s.alloc, ?s.types);
-        var mir_ctx: mir_lctx.LowerCtx = mir_lctx.init(s.alloc, ?sa, ?s.diag, ?mb);
+        var builder: masm_mod.ModuleBuilder = masm_mod.builder_init(s.alloc);
 
-        mir_lower.lower_module(?mir_ctx, mod_id);
-
-        var mir_mod: mir_ir.Module = mir_builder.module_finish(?mb);
-
-        if (mir_mod.func_count == 0 && mir_mod.glob_count == 0) {
+        val res_lower: Result[lctx.LowerContext, str] = lower.init(
+            s.alloc, s.target::ptr, ?builder, ?sa, ?s.diag
+        );
+        if (is_err[lctx.LowerContext, str](res_lower)) {
+            diag.error(?s.diag, diag.make_loc(nil, 0, 0), "failed to initialize lowering context");
             i = i + 1;
             cnt;
         }
+        var lower_ctx: lctx.LowerContext = unwrap_ok[lctx.LowerContext, str](res_lower);
+        if (s.const_maps != nil && i < s.const_cap) {
+            lower_ctx.const_map = ?s.const_maps[i];
+        }
 
-        mir_pass.run_module(?opt_pipeline, ?mir_mod);
+        lower.lower_module(?lower_ctx, mod_id);
+        lower.dnit(?lower_ctx);
+
+        var ir_module: masm_mod.Module = masm_mod.build(?builder);
+
+        if (ir_module.functions.len == 0 && ir_module.data_decls.decls.len == 0) {
+            masm_mod.module_dnit(s.alloc, ?ir_module);
+            i = i + 1;
+            cnt;
+        }
 
         val res_mod_rel: Result[str, str] = module_to_path(s.alloc, m.path);
         var mod_rel: str = nil;
@@ -352,9 +367,14 @@ pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
             mod_rel = unwrap_ok[str, str](res_mod_rel);
         }
 
+        if (s.opts.emit_masm && mod_rel != nil) {
+            emit_module_masm(s, ?ir_module, art_dir, mod_rel);
+        }
+
         var obj: of.ObjWriter = elf.init_writer(s.alloc);
         val text_idx: i32 = obj.add_section(obj.ctx, ".text", of.SK_TEXT::u8, 6, 16);
         if (text_idx < 0) {
+            masm_mod.module_dnit(s.alloc, ?ir_module);
             i = i + 1;
             cnt;
         }
@@ -362,12 +382,34 @@ pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
         var debug: of.DebugInfo = dwarf.init(s.alloc, ".");
         s.target.of.debug = debug;
 
-        val compile_res: mir_compile.CompileResult = mir_compile.compile_module(
-            ?mir_mod, s.target, s.alloc, ?obj, ?s.diag
-        );
+        emit_data_decls(s, ?ir_module, ?obj);
 
-        if (!compile_res.ok) {
-            diag.error(?s.diag, diag.make_loc(m.file_path, 0, 0), "MIR compilation failed");
+        var asm_wb: iobuf.WriteBuf = iobuf.wbuf_make(s.alloc);
+        var use_asm: bool = s.opts.emit_asm;
+
+        var fi: usize = 0;
+        for (fi < ir_module.functions.len) {
+            val fn_ptr: *masm_fn.Function = ir_module.functions.data[fi];
+            if (fn_ptr::ptr != nil) {
+                if (use_asm && fn_ptr.name != nil) {
+                    iobuf.wbuf_write_str(?asm_wb, fn_ptr.name);
+                    iobuf.wbuf_write_str(?asm_wb, ":\n");
+                }
+                var asm_ptr: *iobuf.WriteBuf = nil;
+                if (use_asm) { asm_ptr = ?asm_wb; }
+                codegen.compile_function(
+                    fn_ptr, fn_ptr.frame_size::usize, s.target, ?pipeline, s.alloc, ?obj, asm_ptr,
+                    ?s.diag
+                );
+                if (use_asm) {
+                    iobuf.wbuf_write_str(?asm_wb, "\n");
+                }
+            }
+            fi = fi + 1;
+        }
+
+        if (use_asm && mod_rel != nil && asm_wb.len > 0) {
+            emit_asm_file(s, ?asm_wb, art_dir, mod_rel);
         }
 
         if (debug.finalize != nil) {
@@ -396,10 +438,11 @@ pub fun compile_all(s: *Session, artifacts_dir: str) CompileResult {
             debug.dnit(debug.ctx);
         }
 
+        masm_mod.module_dnit(s.alloc, ?ir_module);
         i = i + 1;
     }
 
-    mir_pass.dnit(?opt_pipeline);
+    pass.dnit(?pipeline);
     result.ok = result.obj_count > 0 && !diag.had_errors(?s.diag);
     ret result;
 }
@@ -565,3 +608,105 @@ fun emit_asm_file(s: *Session, wb: *iobuf.WriteBuf, art_dir: str, mod_rel: str) 
     fs.close(?f);
 }
 
+fun emit_data_decls(s: *Session, ir_module: *masm_mod.Module, obj: *of.ObjWriter) {
+    if (ir_module.data_decls.decls.len == 0) { ret; }
+    if (obj.add_section == nil || obj.add_symbol == nil) { ret; }
+
+    var data_idx: i32 = -1;
+    var bss_idx: i32 = -1;
+    var rodata_idx: i32 = -1;
+
+    var di: usize = 0;
+    for (di < ir_module.data_decls.decls.len) {
+        val r: Result[*masm_data.DataDecl, str] = vec.get[masm_data.DataDecl](?ir_module.data_decls.decls, di);
+        if (is_err[*masm_data.DataDecl, str](r)) {
+            di = di + 1;
+            cnt;
+        }
+        val d: *masm_data.DataDecl = unwrap_ok[*masm_data.DataDecl, str](r);
+        if (d.name == nil) { di = di + 1; cnt; }
+
+        var sec_idx: i32 = -1;
+
+        if (d.section == masm_sym.SEC_BSS || d.kind == masm_data.DATA_ZERO) {
+            if (bss_idx < 0) {
+                bss_idx = obj.add_section(obj.ctx, ".bss", of.SK_BSS::u8, 3, 8);
+            }
+            sec_idx = bss_idx;
+        } or (d.section == masm_sym.SEC_RODATA) {
+            if (rodata_idx < 0) {
+                rodata_idx = obj.add_section(obj.ctx, ".rodata", of.SK_RODATA::u8, 2, 8);
+            }
+            sec_idx = rodata_idx;
+        } or {
+            if (data_idx < 0) {
+                data_idx = obj.add_section(obj.ctx, ".data", of.SK_DATA::u8, 3, 8);
+            }
+            sec_idx = data_idx;
+        }
+
+        if (sec_idx < 0) { di = di + 1; cnt; }
+
+        val sec: *of.Section = obj.get_section(obj.ctx, sec_idx);
+        if (sec == nil) { di = di + 1; cnt; }
+
+        val align_val: usize = d.align::usize;
+        if (align_val > 1 && sec.size > 0) {
+            val pad: usize = (align_val - (sec.size % align_val)) % align_val;
+            if (pad > 0 && obj.emit_bytes != nil && d.kind != masm_data.DATA_ZERO) {
+                var zeros: [16]u8;
+                var zi: usize = 0;
+                for (zi < 16) { zeros[zi] = 0; zi = zi + 1; }
+                var remaining: usize = pad;
+                for (remaining > 0) {
+                    var chunk: usize = remaining;
+                    if (chunk > 16) { chunk = 16; }
+                    obj.emit_bytes(obj.ctx, sec_idx, ?zeros[0], chunk);
+                    remaining = remaining - chunk;
+                }
+            } or (pad > 0) {
+                sec.size = sec.size + pad;
+            }
+        }
+
+        val sym_offset: usize = sec.size;
+        val is_global: bool = d.binding == masm_sym.BIND_GLOBAL;
+
+        if (d.kind == masm_data.DATA_BYTES && d.data != nil && d.data_len > 0) {
+            if (obj.emit_bytes != nil) {
+                obj.emit_bytes(obj.ctx, sec_idx, d.data, d.data_len::usize);
+            }
+        } or (d.kind == masm_data.DATA_ZERO && d.data_len > 0) {
+            sec.size = sec.size + d.data_len::usize;
+        }
+
+        obj.add_symbol(obj.ctx, d.name, sec_idx, sym_offset, d.data_len::usize, is_global);
+
+        di = di + 1;
+    }
+}
+
+fun emit_module_masm(s: *Session, ir_module: *masm_mod.Module, art_dir: str, mod_rel: str) {
+    val res_masm_path: Result[str, str] = build_artifact_path(s.alloc, art_dir, "masm", mod_rel, ".masm");
+    if (is_err[str, str](res_masm_path)) { ret; }
+    val out_path: str = unwrap_ok[str, str](res_masm_path);
+    val res_masm_dir: Result[str, str] = path_parent_str(s.alloc, out_path);
+    if (is_ok[str, str](res_masm_dir)) {
+        val out_dir: str = unwrap_ok[str, str](res_masm_dir);
+        if (!fs.is_dir(out_dir)) {
+            fs.create_dir_all(s.alloc, out_dir, 0o755);
+        }
+    }
+
+    val res_print: Result[iobuf.WriteBuf, str] = masm_printer.print(s.alloc, ir_module);
+    if (is_err[iobuf.WriteBuf, str](res_print)) { ret; }
+    var wb: iobuf.WriteBuf = unwrap_ok[iobuf.WriteBuf, str](res_print);
+
+    val res_file: Result[fs.File, str] = fs.create(out_path, 0o644);
+    if (is_err[fs.File, str](res_file)) { ret; }
+    var f: fs.File = unwrap_ok[fs.File, str](res_file);
+    if (wb.len > 0 && wb.data != nil) {
+        fs.write(?f, wb.data, wb.len);
+    }
+    fs.close(?f);
+}
