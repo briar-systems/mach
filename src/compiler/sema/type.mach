@@ -43,6 +43,9 @@ pub val TK_GENERIC_PARAM: TypeKind = 19;
 pub val TK_ALIAS:         TypeKind = 20;
 pub val TK_ERROR:         TypeKind = 255;
 
+pub val DECL_SYM_NONE: u32 = 0xFFFFFFFF;
+
+pub val TYPE_ERROR_ID: TypeId = 14;
 val PRIM_SLOT_COUNT: u32 = 15;
 val INIT_CAP:        u32 = 64;
 val MAX_ALIAS_DEPTH: u32 = 64;
@@ -117,6 +120,8 @@ pub rec TypeTable {
     ptr_size:   u32;
     ptr_align:  u32;
     intern_map: map.Map[str, TypeId];
+    ptr_cache:  *TypeId;
+    ptr_cache_cap: u32;
 }
 
 # init: initialize a type table and pre-populate primitive slots
@@ -130,8 +135,10 @@ pub fun init(alloc: *allocator.Allocator, ptr_size: u32, ptr_align: u32) TypeTab
     table.alloc     = alloc;
     table.ptr_size  = ptr_size;
     table.ptr_align = ptr_align;
-    table.count     = 0;
-    table.cap       = 0;
+    table.count         = 0;
+    table.cap           = 0;
+    table.ptr_cache     = nil;
+    table.ptr_cache_cap = 0;
     table.types     = nil;
 
     grow(?table, INIT_CAP);
@@ -154,8 +161,6 @@ pub fun init(alloc: *allocator.Allocator, ptr_size: u32, ptr_align: u32) TypeTab
     val err_id: TypeId = add(?table, TK_ERROR);
     val err_t: *Type = ?table.types[err_id];
     err_t.name = "<error>";
-
-    init_va_list(?table);
 
     table.intern_map = map.init[str, TypeId](alloc, map.hash_str, map.eq_str);
 
@@ -223,7 +228,7 @@ pub fun add(table: *TypeTable, kind: TypeKind) TypeId {
     t.generic_args   = nil;
     t.gp_count   = 0;
     t.base_type  = TYPE_NIL;
-    t.decl_sym   = 0xFFFFFFFF;
+    t.decl_sym   = DECL_SYM_NONE;
 
     table.count = table.count + 1;
     ret id;
@@ -242,7 +247,7 @@ pub fun primitive(table: *TypeTable, kind: TypeKind) TypeId {
         ret kind::TypeId;
     }
     if (kind == TK_ERROR) {
-        ret 14;
+        ret TYPE_ERROR_ID;
     }
     ret TYPE_NIL;
 }
@@ -279,14 +284,12 @@ pub fun primitive_by_name(table: *TypeTable, name: str) Option[TypeId] {
 # pointee: TypeId of the pointee
 # ret:     TypeId of the pointer type
 pub fun make_pointer(table: *TypeTable, pointee: TypeId) TypeId {
-    var buf: [64]u8;
-    var off: u32 = 0;
-    buf[off] = 'P'; off = off + 1;
-    buf[off] = ':'; off = off + 1;
-    off = write_key_u32(?buf[0], off, 62, pointee::u32);
+    val pidx: u32 = pointee::u32;
 
-    val cached: TypeId = intern_lookup(table, ?buf[0], off);
-    if (cached::u32 != TYPE_NIL::u32) { ret cached; }
+    if (pidx < table.ptr_cache_cap && table.ptr_cache != nil) {
+        val cached: TypeId = table.ptr_cache[pidx];
+        if (cached::u32 != TYPE_NIL::u32) { ret cached; }
+    }
 
     val id: TypeId = add(table, TK_POINTER);
     val t: *Type = ?table.types[id];
@@ -294,7 +297,26 @@ pub fun make_pointer(table: *TypeTable, pointee: TypeId) TypeId {
     t.size    = table.ptr_size;
     t.align   = table.ptr_align;
 
-    intern_insert(table, ?buf[0], off, id);
+    if (pidx >= table.ptr_cache_cap) {
+        var new_cap: u32 = table.ptr_cache_cap;
+        if (new_cap == 0) { new_cap = 64; }
+        for (new_cap <= pidx) { new_cap = new_cap * 2; }
+        val res: Result[*TypeId, str] = allocator.reallocate[TypeId](
+            table.alloc, table.ptr_cache, table.ptr_cache_cap::usize, new_cap::usize);
+        if (is_ok[*TypeId, str](res)) {
+            table.ptr_cache = unwrap_ok[*TypeId, str](res);
+            var ci: u32 = table.ptr_cache_cap;
+            for (ci < new_cap) {
+                table.ptr_cache[ci] = TYPE_NIL;
+                ci = ci + 1;
+            }
+            table.ptr_cache_cap = new_cap;
+        }
+    }
+    if (pidx < table.ptr_cache_cap && table.ptr_cache != nil) {
+        table.ptr_cache[pidx] = id;
+    }
+
     ret id;
 }
 
@@ -707,6 +729,9 @@ pub fun types_equal(table: *TypeTable, a: TypeId, b: TypeId) bool {
     }
 
     if (ta.kind == TK_RECORD || ta.kind == TK_UNION) {
+        if (ta.decl_sym != DECL_SYM_NONE && tb.decl_sym != DECL_SYM_NONE && ta.decl_sym == tb.decl_sym) {
+            ret true;
+        }
         if (ta.name != nil && tb.name != nil && !str_equals(ta.name, tb.name)) {
             ret false;
         }
@@ -759,6 +784,11 @@ pub fun can_assign(table: *TypeTable, from: TypeId, to: TypeId) bool {
     }
     if (tf.kind == TK_POINTER && tt.kind == TK_OPAQUE_PTR) {
         ret true;
+    }
+
+    # pointer-to-pointer: allow if pointee types are equal
+    if (tf.kind == TK_POINTER && tt.kind == TK_POINTER) {
+        ret types_equal(table, tf.pointee, tt.pointee);
     }
 
     # integer widening: smaller unsigned/signed -> larger of same signedness
@@ -1004,35 +1034,17 @@ fun fill_prim(table: *TypeTable, kind: TypeKind, name: str, size: u32, align: u3
 
 var va_list_id: TypeId = TYPE_NIL;
 
-fun init_va_list(table: *TypeTable) {
-    val res_alloc: Result[*TypeField, str] = allocator.allocate[TypeField](table.alloc, 4);
-    if (is_err[*TypeField, str](res_alloc)) { ret; }
-    val fields: *TypeField = unwrap_ok[*TypeField, str](res_alloc);
-
-    fields[0].name    = "gp_offset";
-    fields[0].type_id = primitive(table, TK_U32);
-    fields[0].offset  = 0;
-
-    fields[1].name    = "fp_offset";
-    fields[1].type_id = primitive(table, TK_U32);
-    fields[1].offset  = 4;
-
-    fields[2].name    = "overflow_arg_area";
-    fields[2].type_id = primitive(table, TK_OPAQUE_PTR);
-    fields[2].offset  = 8;
-
-    fields[3].name    = "reg_save_area";
-    fields[3].type_id = primitive(table, TK_OPAQUE_PTR);
-    fields[3].offset  = 16;
-
+# register_va_list: called by the ABI to register its va_list type.
+# the ABI provides the fields, field count, total size, and alignment.
+pub fun register_va_list(table: *TypeTable, fields: *TypeField,
+                         field_count: u16, size: u32, align: u32) {
     val id: TypeId = add(table, TK_RECORD);
     val t: *Type = ?table.types[id];
     t.name        = "va_list";
     t.fields      = fields;
-    t.field_count = 4;
-    t.size        = 24;
-    t.align       = 8;
-
+    t.field_count = field_count;
+    t.size        = size;
+    t.align       = align;
     va_list_id = id;
 }
 
