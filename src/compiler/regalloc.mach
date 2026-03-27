@@ -1,8 +1,9 @@
 # mach.compiler.regalloc: target-independent linear scan register allocation
 #
-# builds sorted live ranges from the instruction buffer, walks them in
-# order, and assigns physical registers from the target's register file,
-# spilling to the stack when the register file is exhausted.
+# implements a linear scan allocator with live range splitting at call
+# boundaries and eviction-based spilling. ranges that cross calls are split
+# into sub-ranges so each can independently receive a register. spill slots
+# are scoped and shared between non-overlapping ranges.
 
 use std.types.bool;
 use std.types.size;
@@ -16,25 +17,15 @@ use mcfg: mach.compiler.mir.cfg;
 use isa:      mach.compiler.target.isa;
 use abi:      mach.compiler.target.abi;
 
-val VREG_START: i32 = 32;
-val MAX_RANGES: i32 = 4096;
-val MAX_ACTIVE: i32 = 64;
-val MAX_CALLS:  i32 = 1024;
-val REG_CLASS_GP: u8 = 0;
-val REG_CLASS_FP: u8 = 1;
+val VREG_START:      i32 = 32;
+val MAX_RANGES:      i32 = 8192;
+val MAX_ACTIVE:      i32 = 128;
+val MAX_CALLS:       i32 = 1024;
+val MAX_SPILL_SLOTS: i32 = 512;
+val REG_CLASS_GP:    u8  = 0;
+val REG_CLASS_FP:    u8  = 1;
 
-# live range for a single virtual register
-# ---
-# vreg:      virtual register id
-# start:     first instruction index where the range begins
-# end_pos:   last instruction index where the range is live
-# use_count: number of uses (for spill cost heuristic)
-# size:      operand width in bytes
-# reg_class: 0 = GP, 1 = FP
-# preg:      assigned physical register id (-1 if unassigned)
-# spill_off: stack offset if spilled (-1 if not spilled)
-# spilled:   true if this range was spilled to the stack
-pub rec LiveRange {
+rec LiveRange {
     vreg:         i32;
     start:        i32;
     end_pos:      i32;
@@ -42,18 +33,21 @@ pub rec LiveRange {
     size:         u8;
     reg_class:    u8;
     preg:         i32;
-    spill_off:    i64;
+    spill_slot:   i32;
     spilled:      bool;
     hint:         i32;
-    crosses_call: bool;
+    split_parent: i32;
+    split_child:  i32;
+    split_next:   i32;
 }
 
-# result of register allocation for a single function
-# ---
-# out:         instruction buffer with physical registers assigned
-# spill_size:  total bytes of spill slots consumed
-# callee_mask: bitmask of callee-saved registers that were used
-# ok:          true if allocation succeeded
+rec SpillSlot {
+    offset:    i64;
+    size:      u8;
+    range_ids: [16]i32;
+    range_cnt: i32;
+}
+
 pub rec RegAllocResult {
     out:         isa.InstBuf;
     spill_size:  usize;
@@ -61,35 +55,62 @@ pub rec RegAllocResult {
     ok:          bool;
 }
 
-# active range entry for the linear scan loop
-# ---
-# range_idx: index into the sorted ranges array
-# preg:      assigned physical register
-# end_pos:   end position of the range
-rec ActiveEntry {
-    range_idx: i32;
-    preg:      i32;
-    end_pos:   i32;
-    reg_class: u8;
+rec RegAllocState {
+    alloc:       *allocator.Allocator;
+    isa_ref:     *isa.ISA;
+    abi_ref:     *abi.ABI;
+    insts:       *isa.InstBuf;
+    local_size:  usize;
+    ranges:      *LiveRange;
+    range_count: i32;
+    calls:       *i32;
+    call_count:  i32;
+    worklist:    *i32;
+    wl_count:    i32;
+    gp_active:   *i32;
+    fp_active:   *i32;
+    slots:       *SpillSlot;
+    slot_count:  i32;
+    spill_off:   usize;
+    callee_mask: u32;
 }
 
 fun init_range() LiveRange {
     var r: LiveRange;
-    r.vreg      = -1;
-    r.start     = 0x7FFFFFFF;
-    r.end_pos   = -1;
-    r.use_count = 0;
-    r.size      = 8;
-    r.reg_class = REG_CLASS_GP;
-    r.preg      = -1;
-    r.spill_off = -1;
+    r.vreg         = -1;
+    r.start        = 0x7FFFFFFF;
+    r.end_pos      = -1;
+    r.use_count    = 0;
+    r.size         = 8;
+    r.reg_class    = REG_CLASS_GP;
+    r.preg         = -1;
+    r.spill_slot   = -1;
     r.spilled      = false;
     r.hint         = -1;
-    r.crosses_call = false;
+    r.split_parent = -1;
+    r.split_child  = -1;
+    r.split_next   = -1;
     ret r;
 }
 
-# classify_operand: determine reg_class from instruction context
+fun is_vreg(id: i32) bool { ret id >= VREG_START; }
+
+fun is_reserved(i: *isa.ISA, preg: i32) bool {
+    ret preg == i.stack_reg || preg == i.frame_reg;
+}
+
+fun is_callee_saved(a: *abi.ABI, preg: i32) bool {
+    if (a == nil || a.callee_saved == nil) { ret false; }
+    val cs: isa.RegisterFile = a.callee_saved(a.ctx);
+    if (cs.regs == nil) { ret false; }
+    var i: i32 = 0;
+    for (i < cs.count) {
+        if (cs.regs[i].id == preg) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 fun classify_operand(isa_ref: *isa.ISA, inst: *isa.Inst) u8 {
     if (isa_ref.is_fp_opcode != nil && isa_ref.is_fp_opcode(inst.opcode)) {
         ret REG_CLASS_FP;
@@ -97,391 +118,540 @@ fun classify_operand(isa_ref: *isa.ISA, inst: *isa.Inst) u8 {
     ret REG_CLASS_GP;
 }
 
-# is_vreg: check if a register id is virtual
-fun is_vreg(id: i32) bool {
-    ret id >= VREG_START;
-}
-
-# find_range: find or create a range entry for a virtual register
-fun find_range(ranges: *LiveRange, count: *i32, vreg: i32) *LiveRange {
-    var idx: i32 = 0;
-    for (idx < @count) {
-        if (ranges[idx].vreg == vreg) {
-            ret ?ranges[idx];
-        }
-        idx = idx + 1;
-    }
-    if (@count >= MAX_RANGES) { ret nil; }
-    val new_idx: i32 = @count;
-    @count = @count + 1;
-    ranges[new_idx] = init_range();
-    ranges[new_idx].vreg = vreg;
-    ret ?ranges[new_idx];
-}
-
-# scan_operand_reg: extract register id from an operand
 fun scan_operand_reg(op: *isa.Operand) i32 {
     if (op.kind == isa.OPK_REG) { ret op.reg; }
     ret -1;
 }
 
-# build_ranges: scan instructions and build live ranges for all virtual registers
-fun build_ranges(alloc: *allocator.Allocator, insts: *isa.InstBuf,
-                 ranges: *LiveRange, range_count: *i32,
-                 call_positions: *i32, call_count: *i32,
-                 i: *isa.ISA) {
-    var pos: i32 = 0;
-    for (pos < insts.count) {
-        val inst: *isa.Inst = ?insts.insts[pos];
-
-        if (inst.opcode == isa.ISA_PCOPY_FENCE) {
-            pos = pos + 1;
-            cnt;
-        }
-
-        if (inst.opcode == isa.ISA_PCOPY) {
-            val s1_id: i32 = scan_operand_reg(?inst.src1);
-            if (is_vreg(s1_id)) {
-                val r: *LiveRange = find_range(ranges, range_count, s1_id);
-                if (r != nil) {
-                    if (pos < r.start) { r.start = pos; }
-                    if (pos > r.end_pos) { r.end_pos = pos; }
-                    r.use_count = r.use_count + 1;
-                    if (r.size == 0) { r.size = inst.src1.size; }
-                    if (r.hint < 0 && inst.dst.kind == isa.OPK_REG && !is_vreg(inst.dst.reg)) {
-                        r.hint = inst.dst.reg;
-                    }
-                }
-            }
-            pos = pos + 1;
-            cnt;
-        }
-
-        if (i != nil && i.is_call != nil && i.is_call(i.ctx, inst)) {
-            if (@call_count < MAX_CALLS) {
-                call_positions[@call_count] = pos;
-                @call_count = @call_count + 1;
-            }
-        }
-
-        val rc: u8 = classify_operand(i, inst);
-
-        val dst_id: i32 = scan_operand_reg(?inst.dst);
-        if (is_vreg(dst_id)) {
-            val r: *LiveRange = find_range(ranges, range_count, dst_id);
-            if (r != nil) {
-                if (pos < r.start) { r.start = pos; }
-                if (pos > r.end_pos) { r.end_pos = pos; }
-                r.use_count = r.use_count + 1;
-                r.size = inst.dst.size;
-                r.reg_class = rc;
-                val src_hint: i32 = scan_operand_reg(?inst.src1);
-                if (r.hint < 0 && src_hint >= 0 && !is_vreg(src_hint)) {
-                    r.hint = src_hint;
-                }
-            }
-        }
-
-        val s1_id: i32 = scan_operand_reg(?inst.src1);
-        if (is_vreg(s1_id)) {
-            val r: *LiveRange = find_range(ranges, range_count, s1_id);
-            if (r != nil) {
-                if (pos < r.start) { r.start = pos; }
-                if (pos > r.end_pos) { r.end_pos = pos; }
-                r.use_count = r.use_count + 1;
-                if (r.size == 0) { r.size = inst.src1.size; }
-            }
-        }
-
-        val s2_id: i32 = scan_operand_reg(?inst.src2);
-        if (is_vreg(s2_id)) {
-            val r: *LiveRange = find_range(ranges, range_count, s2_id);
-            if (r != nil) {
-                if (pos < r.start) { r.start = pos; }
-                if (pos > r.end_pos) { r.end_pos = pos; }
-                r.use_count = r.use_count + 1;
-                if (r.size == 0) { r.size = inst.src2.size; }
-            }
-        }
-
-        val base_id: i32 = inst.dst.base;
-        if (inst.dst.kind == isa.OPK_MEM && is_vreg(base_id)) {
-            val r: *LiveRange = find_range(ranges, range_count, base_id);
-            if (r != nil) {
-                if (pos < r.start) { r.start = pos; }
-                if (pos > r.end_pos) { r.end_pos = pos; }
-                r.use_count = r.use_count + 1;
-            }
-        }
-        val s1b_id: i32 = inst.src1.base;
-        if (inst.src1.kind == isa.OPK_MEM && is_vreg(s1b_id)) {
-            val r: *LiveRange = find_range(ranges, range_count, s1b_id);
-            if (r != nil) {
-                if (pos < r.start) { r.start = pos; }
-                if (pos > r.end_pos) { r.end_pos = pos; }
-                r.use_count = r.use_count + 1;
-            }
-        }
-        val s2b_id: i32 = inst.src2.base;
-        if (inst.src2.kind == isa.OPK_MEM && is_vreg(s2b_id)) {
-            val r: *LiveRange = find_range(ranges, range_count, s2b_id);
-            if (r != nil) {
-                if (pos < r.start) { r.start = pos; }
-                if (pos > r.end_pos) { r.end_pos = pos; }
-                r.use_count = r.use_count + 1;
-            }
-        }
-
-        val idx1_id: i32 = inst.dst.index;
-        if (inst.dst.kind == isa.OPK_MEM && is_vreg(idx1_id)) {
-            val r: *LiveRange = find_range(ranges, range_count, idx1_id);
-            if (r != nil) {
-                if (pos < r.start) { r.start = pos; }
-                if (pos > r.end_pos) { r.end_pos = pos; }
-                r.use_count = r.use_count + 1;
-            }
-        }
-        val idx2_id: i32 = inst.src1.index;
-        if (inst.src1.kind == isa.OPK_MEM && is_vreg(idx2_id)) {
-            val r: *LiveRange = find_range(ranges, range_count, idx2_id);
-            if (r != nil) {
-                if (pos < r.start) { r.start = pos; }
-                if (pos > r.end_pos) { r.end_pos = pos; }
-                r.use_count = r.use_count + 1;
-            }
-        }
-
-        pos = pos + 1;
-    }
-}
-
-# sort_ranges_by_start: insertion sort ranges by start position
-fun sort_ranges_by_start(ranges: *LiveRange, count: i32) {
-    var i: i32 = 1;
-    for (i < count) {
-        var key: LiveRange = ranges[i];
-        var j: i32 = i - 1;
-        for (j >= 0 && ranges[j].start > key.start) {
-            ranges[j + 1] = ranges[j];
-            j = j - 1;
-        }
-        ranges[j + 1] = key;
-        i = i + 1;
-    }
-}
-
-# is_callee_saved: check if a physical register is callee-saved
-fun is_callee_saved(a: *abi.ABI, preg: i32) bool {
-    if (a == nil || a.callee_saved == nil) { ret false; }
-    val cs: isa.RegisterFile = a.callee_saved(a.ctx);
-    if (cs.regs == nil) { ret false; }
-    var ci: i32 = 0;
-    for (ci < cs.count) {
-        if (cs.regs[ci].id == preg) { ret true; }
-        ci = ci + 1;
-    }
-    ret false;
-}
-
-# is_reserved: check if a register should not be allocated (stack/frame pointer)
-fun is_reserved(i: *isa.ISA, preg: i32) bool {
-    if (preg == i.stack_reg) { ret true; }
-    if (preg == i.frame_reg) { ret true; }
-    ret false;
-}
-
-# expire_old: remove ranges from active list whose end_pos < current start
-fun expire_old(active: *ActiveEntry, active_count: *i32,
-               gp_free: *bool, fp_free: *bool,
-               gp_count: i32, fp_count: i32,
-               current_start: i32) {
-    var write: i32 = 0;
-    var read: i32 = 0;
-    for (read < @active_count) {
-        if (active[read].end_pos >= current_start) {
-            if (write != read) {
-                active[write] = active[read];
-            }
-            write = write + 1;
-        } or {
-            val freed: i32 = active[read].preg;
-            if (active[read].reg_class == REG_CLASS_GP && freed >= 0 && freed < gp_count) {
-                gp_free[freed] = true;
-            } or (active[read].reg_class == REG_CLASS_FP && freed >= 0 && freed < fp_count) {
-                fp_free[freed] = true;
-            }
-        }
-        read = read + 1;
-    }
-    @active_count = write;
-}
-
-# try_alloc_reg: try to allocate a free register, preferring caller-saved
-fun try_alloc_reg(gp_free: *bool, fp_free: *bool, reg_class: u8,
-                  i: *isa.ISA, a: *abi.ABI, hint: i32) i32 {
-    if (reg_class == REG_CLASS_FP) {
-        if (hint >= 0 && hint < i.fp_count && fp_free[hint]) {
-            fp_free[hint] = false;
-            ret hint;
-        }
-        var fi: i32 = 0;
-        for (fi < i.fp_count) {
-            if (fp_free[fi]) {
-                fp_free[fi] = false;
-                ret fi;
-            }
-            fi = fi + 1;
-        }
-        ret -1;
-    }
-
-    if (hint >= 0 && hint < i.gp_count && gp_free[hint] && !is_reserved(i, hint)) {
-        gp_free[hint] = false;
-        ret hint;
-    }
-
-    var ci: i32 = 0;
-    for (ci < i.gp_count) {
-        if (gp_free[ci] && !is_reserved(i, ci) && !is_callee_saved(a, ci)) {
-            gp_free[ci] = false;
-            ret ci;
-        }
-        ci = ci + 1;
-    }
-    ci = 0;
-    for (ci < i.gp_count) {
-        if (gp_free[ci] && !is_reserved(i, ci)) {
-            gp_free[ci] = false;
-            ret ci;
-        }
-        ci = ci + 1;
-    }
-    ret -1;
-}
-
-# try_alloc_reg_callee: allocate a register, preferring callee-saved
-fun try_alloc_reg_callee(gp_free: *bool, fp_free: *bool, reg_class: u8,
-                         i: *isa.ISA, a: *abi.ABI, hint: i32) i32 {
-    if (reg_class == REG_CLASS_FP) {
-        if (hint >= 0 && hint < i.fp_count && fp_free[hint]) {
-            fp_free[hint] = false;
-            ret hint;
-        }
-        var fi: i32 = 0;
-        for (fi < i.fp_count) {
-            if (fp_free[fi]) {
-                fp_free[fi] = false;
-                ret fi;
-            }
-            fi = fi + 1;
-        }
-        ret -1;
-    }
-
-    if (hint >= 0 && hint < i.gp_count && gp_free[hint] && !is_reserved(i, hint) && is_callee_saved(a, hint)) {
-        gp_free[hint] = false;
-        ret hint;
-    }
-
-    var ci: i32 = 0;
-    for (ci < i.gp_count) {
-        if (gp_free[ci] && !is_reserved(i, ci) && is_callee_saved(a, ci)) {
-            gp_free[ci] = false;
-            ret ci;
-        }
-        ci = ci + 1;
-    }
-    ci = 0;
-    for (ci < i.gp_count) {
-        if (gp_free[ci] && !is_reserved(i, ci)) {
-            gp_free[ci] = false;
-            ret ci;
-        }
-        ci = ci + 1;
-    }
-    ret -1;
-}
-
-# range_crosses_call: check if a live range spans any call instruction
-fun range_crosses_call(r: *LiveRange, call_positions: *i32, call_count: i32) bool {
-    var ci: i32 = 0;
-    for (ci < call_count) {
-        if (call_positions[ci] > r.start && call_positions[ci] < r.end_pos) {
-            ret true;
-        }
-        ci = ci + 1;
-    }
-    ret false;
-}
-
-# find_spill_candidate: find the active range with lowest use density
-fun find_spill_candidate(active: *ActiveEntry, active_count: i32,
-                         ranges: *LiveRange) i32 {
-    var best: i32 = -1;
-    var best_density: i64 = 0x7FFFFFFFFFFFFFFF;
-    var ai: i32 = 0;
-    for (ai < active_count) {
-        val ri: i32 = active[ai].range_idx;
-        val span: i32 = ranges[ri].end_pos - ranges[ri].start;
-        var density: i64 = 0;
-        if (span > 0) {
-            density = (ranges[ri].use_count::i64 * 1000) / span::i64;
-        } or {
-            density = ranges[ri].use_count::i64 * 1000;
-        }
-        if (density < best_density) {
-            best_density = density;
-            best = ai;
-        }
-        ai = ai + 1;
-    }
-    ret best;
-}
-
-# add_active: insert into active list
-fun add_active(active: *ActiveEntry, active_count: *i32,
-               range_idx: i32, preg: i32, end_pos: i32, reg_class: u8) {
-    if (@active_count >= MAX_ACTIVE) { ret; }
-    val idx: i32 = @active_count;
-    active[idx].range_idx = range_idx;
-    active[idx].preg = preg;
-    active[idx].end_pos = end_pos;
-    active[idx].reg_class = reg_class;
-    @active_count = @active_count + 1;
-}
-
-# remove_active: remove an entry from the active list by index
-fun remove_active(active: *ActiveEntry, active_count: *i32, idx: i32) {
-    var mi: i32 = idx;
-    for (mi < @active_count - 1) {
-        active[mi] = active[mi + 1];
-        mi = mi + 1;
-    }
-    @active_count = @active_count - 1;
-}
-
-# map_fixed_vreg: translate fixed virtual registers to physical ones
-# vregs 30 and 31 are reserved for the stack pointer and frame pointer
 fun map_fixed_vreg(i: *isa.ISA, id: i32) i32 {
     if (id == 30) { ret i.stack_reg; }
     if (id == 31) { ret i.frame_reg; }
     ret id;
 }
 
-# rewrite_operand: replace virtual register ids with physical ones
-fun rewrite_operand(i: *isa.ISA, op: *isa.Operand, ranges: *LiveRange, range_count: i32) {
+fun align_up(value: usize, alignment: usize) usize {
+    if (alignment == 0) { ret value; }
+    ret (value + alignment - 1) & ~(alignment - 1);
+}
+
+fun ranges_overlap(ranges: *LiveRange, a: i32, b: i32) bool {
+    if (a < 0 || b < 0) { ret false; }
+    ret ranges[a].start <= ranges[b].end_pos && ranges[b].start <= ranges[a].end_pos;
+}
+
+fun find_range(ranges: *LiveRange, count: *i32, vreg: i32) *LiveRange {
+    var i: i32 = 0;
+    for (i < @count) {
+        if (ranges[i].vreg == vreg) { ret ?ranges[i]; }
+        i = i + 1;
+    }
+    if (@count >= MAX_RANGES) { ret nil; }
+    val idx: i32 = @count;
+    @count = @count + 1;
+    ranges[idx] = init_range();
+    ranges[idx].vreg = vreg;
+    ret ?ranges[idx];
+}
+
+fun record_vreg(ranges: *LiveRange, count: *i32, vreg: i32, pos: i32, is_def: bool,
+                size: u8, rc: u8, hint: i32) {
+    val r: *LiveRange = find_range(ranges, count, vreg);
+    if (r == nil) { ret; }
+    if (pos < r.start) { r.start = pos; }
+    if (pos > r.end_pos) { r.end_pos = pos; }
+    r.use_count = r.use_count + 1;
+    if (is_def) { r.size = size; r.reg_class = rc; }
+    or { if (r.size == 0) { r.size = size; } }
+    if (r.hint < 0 && hint >= 0) { r.hint = hint; }
+}
+
+fun build_ranges(state: *RegAllocState) {
+    var pos: i32 = 0;
+    for (pos < state.insts.count) {
+        val inst: *isa.Inst = ?state.insts.insts[pos];
+
+        if (inst.opcode == isa.ISA_PCOPY_FENCE) { pos = pos + 1; cnt; }
+
+        if (inst.opcode == isa.ISA_PCOPY) {
+            val s1: i32 = scan_operand_reg(?inst.src1);
+            if (is_vreg(s1)) {
+                var hint: i32 = -1;
+                if (inst.dst.kind == isa.OPK_REG && !is_vreg(inst.dst.reg)) {
+                    hint = inst.dst.reg;
+                }
+                record_vreg(state.ranges, ?state.range_count, s1, pos, false,
+                            inst.src1.size, REG_CLASS_GP, hint);
+            }
+            pos = pos + 1;
+            cnt;
+        }
+
+        if (state.isa_ref.is_call != nil && state.isa_ref.is_call(state.isa_ref.ctx, inst)) {
+            if (state.call_count < MAX_CALLS) {
+                state.calls[state.call_count] = pos;
+                state.call_count = state.call_count + 1;
+            }
+        }
+
+        val rc: u8 = classify_operand(state.isa_ref, inst);
+
+        val dst_id: i32 = scan_operand_reg(?inst.dst);
+        if (is_vreg(dst_id)) {
+            var h: i32 = -1;
+            val sh: i32 = scan_operand_reg(?inst.src1);
+            if (sh >= 0 && !is_vreg(sh)) { h = sh; }
+            record_vreg(state.ranges, ?state.range_count, dst_id, pos, true,
+                        inst.dst.size, rc, h);
+        }
+
+        val s1_id: i32 = scan_operand_reg(?inst.src1);
+        if (is_vreg(s1_id)) {
+            record_vreg(state.ranges, ?state.range_count, s1_id, pos, false,
+                        inst.src1.size, 0, -1);
+        }
+
+        val s2_id: i32 = scan_operand_reg(?inst.src2);
+        if (is_vreg(s2_id)) {
+            record_vreg(state.ranges, ?state.range_count, s2_id, pos, false,
+                        inst.src2.size, 0, -1);
+        }
+
+        if (inst.dst.kind == isa.OPK_MEM && is_vreg(inst.dst.base)) {
+            record_vreg(state.ranges, ?state.range_count, inst.dst.base, pos, false, 8, 0, -1);
+        }
+        if (inst.src1.kind == isa.OPK_MEM && is_vreg(inst.src1.base)) {
+            record_vreg(state.ranges, ?state.range_count, inst.src1.base, pos, false, 8, 0, -1);
+        }
+        if (inst.src2.kind == isa.OPK_MEM && is_vreg(inst.src2.base)) {
+            record_vreg(state.ranges, ?state.range_count, inst.src2.base, pos, false, 8, 0, -1);
+        }
+        if (inst.dst.kind == isa.OPK_MEM && is_vreg(inst.dst.index)) {
+            record_vreg(state.ranges, ?state.range_count, inst.dst.index, pos, false, 8, 0, -1);
+        }
+        if (inst.src1.kind == isa.OPK_MEM && is_vreg(inst.src1.index)) {
+            record_vreg(state.ranges, ?state.range_count, inst.src1.index, pos, false, 8, 0, -1);
+        }
+
+        pos = pos + 1;
+    }
+}
+
+fun split_range_at(state: *RegAllocState, ri: i32, split_pos: i32) i32 {
+    if (state.range_count >= MAX_RANGES) { ret -1; }
+    val new_ri: i32 = state.range_count;
+    state.range_count = state.range_count + 1;
+    state.ranges[new_ri] = init_range();
+
+    val parent: *LiveRange = ?state.ranges[ri];
+    val child: *LiveRange = ?state.ranges[new_ri];
+
+    child.vreg      = parent.vreg;
+    child.start     = split_pos;
+    child.end_pos   = parent.end_pos;
+    child.size      = parent.size;
+    child.reg_class = parent.reg_class;
+    child.hint      = parent.hint;
+
+    child.split_parent = ri;
+    child.split_next   = parent.split_child;
+    parent.split_child = new_ri;
+
+    parent.end_pos = split_pos - 1;
+
+    var new_uses: i32 = 0;
+    var old_uses: i32 = 0;
+    var pi: i32 = 0;
+    for (pi < state.insts.count) {
+        val inst: *isa.Inst = ?state.insts.insts[pi];
+        if (inst.opcode == isa.ISA_PCOPY_FENCE) { pi = pi + 1; cnt; }
+
+        var touches: bool = false;
+        if (scan_operand_reg(?inst.dst) == parent.vreg) { touches = true; }
+        if (scan_operand_reg(?inst.src1) == parent.vreg) { touches = true; }
+        if (scan_operand_reg(?inst.src2) == parent.vreg) { touches = true; }
+        if (inst.dst.kind == isa.OPK_MEM && inst.dst.base == parent.vreg) { touches = true; }
+        if (inst.src1.kind == isa.OPK_MEM && inst.src1.base == parent.vreg) { touches = true; }
+        if (inst.src2.kind == isa.OPK_MEM && inst.src2.base == parent.vreg) { touches = true; }
+        if (inst.dst.kind == isa.OPK_MEM && inst.dst.index == parent.vreg) { touches = true; }
+        if (inst.src1.kind == isa.OPK_MEM && inst.src1.index == parent.vreg) { touches = true; }
+
+        if (touches) {
+            if (pi >= split_pos) { new_uses = new_uses + 1; }
+            or { old_uses = old_uses + 1; }
+        }
+        pi = pi + 1;
+    }
+    child.use_count  = new_uses;
+    parent.use_count = old_uses;
+
+    ret new_ri;
+}
+
+fun split_at_calls(state: *RegAllocState) {
+    val orig_count: i32 = state.range_count;
+    var ri: i32 = 0;
+    for (ri < orig_count) {
+        val r: *LiveRange = ?state.ranges[ri];
+        if (r.start >= r.end_pos) { ri = ri + 1; cnt; }
+
+        var cur_ri: i32 = ri;
+        var ci: i32 = 0;
+        for (ci < state.call_count) {
+            val cp: i32 = state.calls[ci];
+            val cur: *LiveRange = ?state.ranges[cur_ri];
+            if (cp > cur.start && cp < cur.end_pos) {
+                val new_ri: i32 = split_range_at(state, cur_ri, cp + 1);
+                if (new_ri < 0) { ci = state.call_count; }
+                or { cur_ri = new_ri; }
+            }
+            ci = ci + 1;
+        }
+        ri = ri + 1;
+    }
+}
+
+fun sort_worklist(state: *RegAllocState) {
+    state.wl_count = state.range_count;
+    var i: i32 = 0;
+    for (i < state.range_count) {
+        state.worklist[i] = i;
+        i = i + 1;
+    }
+    var a: i32 = 1;
+    for (a < state.wl_count) {
+        val key: i32 = state.worklist[a];
+        val key_start: i32 = state.ranges[key].start;
+        var b: i32 = a - 1;
+        for (b >= 0 && state.ranges[state.worklist[b]].start > key_start) {
+            state.worklist[b + 1] = state.worklist[b];
+            b = b - 1;
+        }
+        state.worklist[b + 1] = key;
+        a = a + 1;
+    }
+}
+
+fun spill_weight(r: *LiveRange) i64 {
+    val span: i32 = r.end_pos - r.start + 1;
+    if (span <= 0) { ret r.use_count::i64 * 1000; }
+    ret (r.use_count::i64 * 1000) / span::i64;
+}
+
+fun try_alloc_free(state: *RegAllocState, ri: i32) i32 {
+    val r: *LiveRange = ?state.ranges[ri];
+    var count: i32 = state.isa_ref.gp_count;
+    var active: *i32 = state.gp_active;
+    if (r.reg_class == REG_CLASS_FP) {
+        count = state.isa_ref.fp_count;
+        active = state.fp_active;
+    }
+
+    if (r.hint >= 0 && r.hint < count) {
+        if (r.reg_class == REG_CLASS_GP && is_reserved(state.isa_ref, r.hint)) {}
+        or {
+            val occ: i32 = active[r.hint];
+            if (occ < 0 || !ranges_overlap(state.ranges, occ, ri)) {
+                ret r.hint;
+            }
+        }
+    }
+
+    var pi: i32 = 0;
+    for (pi < count) {
+        if (r.reg_class == REG_CLASS_GP && is_reserved(state.isa_ref, pi)) { pi = pi + 1; cnt; }
+        if (r.reg_class == REG_CLASS_GP && is_callee_saved(state.abi_ref, pi)) { pi = pi + 1; cnt; }
+        val occ: i32 = active[pi];
+        if (occ < 0 || !ranges_overlap(state.ranges, occ, ri)) {
+            ret pi;
+        }
+        pi = pi + 1;
+    }
+
+    pi = 0;
+    for (pi < count) {
+        if (r.reg_class == REG_CLASS_GP && is_reserved(state.isa_ref, pi)) { pi = pi + 1; cnt; }
+        val occ: i32 = active[pi];
+        if (occ < 0 || !ranges_overlap(state.ranges, occ, ri)) {
+            ret pi;
+        }
+        pi = pi + 1;
+    }
+
+    ret -1;
+}
+
+fun assign_reg(state: *RegAllocState, ri: i32, preg: i32) {
+    state.ranges[ri].preg = preg;
+    if (state.ranges[ri].reg_class == REG_CLASS_GP) {
+        state.gp_active[preg] = ri;
+    } or {
+        state.fp_active[preg] = ri;
+    }
+    if (is_callee_saved(state.abi_ref, preg)) {
+        state.callee_mask = state.callee_mask | (1 << preg::u32);
+    }
+}
+
+fun try_evict(state: *RegAllocState, ri: i32) bool {
+    val r: *LiveRange = ?state.ranges[ri];
+    var count: i32 = state.isa_ref.gp_count;
+    var active: *i32 = state.gp_active;
+    if (r.reg_class == REG_CLASS_FP) {
+        count = state.isa_ref.fp_count;
+        active = state.fp_active;
+    }
+
+    val our_weight: i64 = spill_weight(r);
+    var best_preg: i32 = -1;
+    var best_weight: i64 = our_weight;
+    var best_ri: i32 = -1;
+
+    var pi: i32 = 0;
+    for (pi < count) {
+        if (r.reg_class == REG_CLASS_GP && is_reserved(state.isa_ref, pi)) { pi = pi + 1; cnt; }
+        val occ: i32 = active[pi];
+        if (occ < 0) { pi = pi + 1; cnt; }
+        if (!ranges_overlap(state.ranges, occ, ri)) { pi = pi + 1; cnt; }
+        val occ_weight: i64 = spill_weight(?state.ranges[occ]);
+        if (occ_weight < best_weight) {
+            best_weight = occ_weight;
+            best_preg = pi;
+            best_ri = occ;
+        }
+        pi = pi + 1;
+    }
+
+    if (best_preg < 0) { ret false; }
+
+    state.ranges[best_ri].preg = -1;
+    active[best_preg] = -1;
+
+    assign_spill(state, best_ri);
+
+    assign_reg(state, ri, best_preg);
+    ret true;
+}
+
+fun get_spill_offset(state: *RegAllocState, ri: i32) i64 {
+    val slot_idx: i32 = state.ranges[ri].spill_slot;
+    if (slot_idx < 0 || slot_idx >= state.slot_count) { ret 0; }
+    ret state.slots[slot_idx].offset;
+}
+
+fun assign_spill(state: *RegAllocState, ri: i32) {
+    state.ranges[ri].spilled = true;
+
+    if (state.ranges[ri].split_parent >= 0) {
+        val parent_slot: i32 = state.ranges[state.ranges[ri].split_parent].spill_slot;
+        if (parent_slot >= 0) {
+            state.ranges[ri].spill_slot = parent_slot;
+            if (state.slots[parent_slot].range_cnt < 16) {
+                state.slots[parent_slot].range_ids[state.slots[parent_slot].range_cnt] = ri;
+                state.slots[parent_slot].range_cnt = state.slots[parent_slot].range_cnt + 1;
+            }
+            ret;
+        }
+    }
+
+    var si: i32 = 0;
+    for (si < state.slot_count) {
+        if (state.slots[si].size >= state.ranges[ri].size) {
+            var ok: bool = true;
+            var k: i32 = 0;
+            for (k < state.slots[si].range_cnt) {
+                if (ranges_overlap(state.ranges, state.slots[si].range_ids[k], ri)) {
+                    ok = false;
+                    k = state.slots[si].range_cnt;
+                }
+                k = k + 1;
+            }
+            if (ok && state.slots[si].range_cnt < 16) {
+                state.ranges[ri].spill_slot = si;
+                state.slots[si].range_ids[state.slots[si].range_cnt] = ri;
+                state.slots[si].range_cnt = state.slots[si].range_cnt + 1;
+                ret;
+            }
+        }
+        si = si + 1;
+    }
+
+    if (state.slot_count >= MAX_SPILL_SLOTS) {
+        state.ranges[ri].spill_slot = 0;
+        ret;
+    }
+
+    var slot_sz: usize = state.ranges[ri].size::usize;
+    if (slot_sz < 8) { slot_sz = 8; }
+    state.spill_off = align_up(state.spill_off + slot_sz, 8);
+
+    val new_si: i32 = state.slot_count;
+    state.slot_count = state.slot_count + 1;
+    state.slots[new_si].offset = state.spill_off::i64;
+    state.slots[new_si].size = state.ranges[ri].size;
+    state.slots[new_si].range_ids[0] = ri;
+    state.slots[new_si].range_cnt = 1;
+    state.ranges[ri].spill_slot = new_si;
+}
+
+fun ensure_split_slot(state: *RegAllocState, ri: i32) i32 {
+    if (state.ranges[ri].spill_slot >= 0) { ret state.ranges[ri].spill_slot; }
+
+    var root: i32 = ri;
+    if (state.ranges[ri].split_parent >= 0) { root = state.ranges[ri].split_parent; }
+    if (state.ranges[root].spill_slot >= 0) {
+        state.ranges[ri].spill_slot = state.ranges[root].spill_slot;
+        ret state.ranges[ri].spill_slot;
+    }
+
+    if (state.slot_count >= MAX_SPILL_SLOTS) { ret -1; }
+
+    var slot_sz: usize = state.ranges[ri].size::usize;
+    if (slot_sz < 8) { slot_sz = 8; }
+    state.spill_off = align_up(state.spill_off + slot_sz, 8);
+
+    val new_si: i32 = state.slot_count;
+    state.slot_count = state.slot_count + 1;
+    state.slots[new_si].offset = state.spill_off::i64;
+    state.slots[new_si].size = state.ranges[ri].size;
+    state.slots[new_si].range_ids[0] = ri;
+    state.slots[new_si].range_cnt = 1;
+    state.ranges[ri].spill_slot = new_si;
+    state.ranges[root].spill_slot = new_si;
+    ret new_si;
+}
+
+fun allocate_ranges(state: *RegAllocState) {
+    var wi: i32 = 0;
+    for (wi < state.wl_count) {
+        val ri: i32 = state.worklist[wi];
+        if (state.ranges[ri].preg >= 0 || state.ranges[ri].spilled) {
+            wi = wi + 1;
+            cnt;
+        }
+        if (state.ranges[ri].start > state.ranges[ri].end_pos) {
+            wi = wi + 1;
+            cnt;
+        }
+
+        val preg: i32 = try_alloc_free(state, ri);
+        if (preg >= 0) {
+            assign_reg(state, ri, preg);
+            wi = wi + 1;
+            cnt;
+        }
+
+        if (try_evict(state, ri)) {
+            wi = wi + 1;
+            cnt;
+        }
+
+        assign_spill(state, ri);
+        wi = wi + 1;
+    }
+}
+
+fun is_call_at(state: *RegAllocState, pos: i32) bool {
+    var i: i32 = 0;
+    for (i < state.call_count) {
+        if (state.calls[i] == pos) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun find_split_sibling(state: *RegAllocState, ri: i32, after_pos: i32) i32 {
+    val vreg: i32 = state.ranges[ri].vreg;
+    var si: i32 = 0;
+    for (si < state.range_count) {
+        if (si != ri && state.ranges[si].vreg == vreg && state.ranges[si].start == after_pos) {
+            ret si;
+        }
+        si = si + 1;
+    }
+    ret -1;
+}
+
+fun emit_mi_store(state: *RegAllocState, out: *isa.InstBuf, preg: i32, slot_off: i64,
+                  size: u8, line: u32, file: str) {
+    var mi: isa.Inst;
+    mi.opcode   = state.isa_ref.store_opcode;
+    mi.dst      = isa.make_mem(state.isa_ref.frame_reg, -(slot_off::i32), -1, 0, size);
+    mi.src1     = isa.make_reg(preg, size);
+    mi.src2     = isa.make_reg(-1, 0);
+    mi.size     = size;
+    mi.flags    = state.isa_ref.rex_w_flag;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+fun emit_mi_load(state: *RegAllocState, out: *isa.InstBuf, preg: i32, slot_off: i64,
+                 size: u8, line: u32, file: str) {
+    var mi: isa.Inst;
+    mi.opcode   = state.isa_ref.load_opcode;
+    mi.dst      = isa.make_reg(preg, size);
+    mi.src1     = isa.make_mem(state.isa_ref.frame_reg, -(slot_off::i32), -1, 0, size);
+    mi.src2     = isa.make_reg(-1, 0);
+    mi.size     = size;
+    mi.flags    = state.isa_ref.rex_w_flag;
+    mi.src_line = line;
+    mi.src_file = file;
+    isa.buf_append(out, mi);
+}
+
+fun emit_split_stores(state: *RegAllocState, out: *isa.InstBuf, call_pos: i32,
+                      line: u32, file: str) {
+    var ri: i32 = 0;
+    for (ri < state.range_count) {
+        val r: *LiveRange = ?state.ranges[ri];
+        if (r.end_pos == call_pos && r.preg >= 0 && !r.spilled && r.split_child >= 0) {
+            val sib: i32 = find_split_sibling(state, ri, call_pos + 1);
+            if (sib >= 0) {
+                val slot_idx: i32 = ensure_split_slot(state, ri);
+                if (slot_idx >= 0) {
+                    val off: i64 = state.slots[slot_idx].offset;
+                    emit_mi_store(state, out, r.preg, off, 8, line, file);
+                }
+            }
+        }
+        ri = ri + 1;
+    }
+}
+
+fun emit_split_loads(state: *RegAllocState, out: *isa.InstBuf, call_pos: i32,
+                     line: u32, file: str) {
+    var ri: i32 = 0;
+    for (ri < state.range_count) {
+        val r: *LiveRange = ?state.ranges[ri];
+        if (r.start == call_pos + 1 && r.preg >= 0 && !r.spilled && r.split_parent >= 0) {
+            val parent: i32 = r.split_parent;
+            if (state.ranges[parent].end_pos == call_pos && state.ranges[parent].preg >= 0) {
+                val slot_idx: i32 = ensure_split_slot(state, ri);
+                if (slot_idx >= 0) {
+                    val off: i64 = state.slots[slot_idx].offset;
+                    emit_mi_load(state, out, r.preg, off, 8, line, file);
+                }
+            }
+        }
+        ri = ri + 1;
+    }
+}
+
+fun rewrite_operand_reg(state: *RegAllocState, op: *isa.Operand, pos: i32) {
     if (op.kind == isa.OPK_REG) {
-        op.reg = map_fixed_vreg(i, op.reg);
+        op.reg = map_fixed_vreg(state.isa_ref, op.reg);
     }
     if (op.kind == isa.OPK_MEM) {
-        op.base = map_fixed_vreg(i, op.base);
-        op.index = map_fixed_vreg(i, op.index);
+        op.base = map_fixed_vreg(state.isa_ref, op.base);
+        op.index = map_fixed_vreg(state.isa_ref, op.index);
     }
     if (op.kind == isa.OPK_REG && is_vreg(op.reg)) {
         var ri: i32 = 0;
-        for (ri < range_count) {
-            if (ranges[ri].vreg == op.reg && ranges[ri].preg >= 0) {
-                op.reg = ranges[ri].preg;
+        for (ri < state.range_count) {
+            if (state.ranges[ri].vreg == op.reg && state.ranges[ri].preg >= 0
+                && !state.ranges[ri].spilled
+                && pos >= state.ranges[ri].start && pos <= state.ranges[ri].end_pos) {
+                op.reg = state.ranges[ri].preg;
                 ret;
             }
             ri = ri + 1;
@@ -489,46 +659,140 @@ fun rewrite_operand(i: *isa.ISA, op: *isa.Operand, ranges: *LiveRange, range_cou
     }
     if (op.kind == isa.OPK_MEM && is_vreg(op.base)) {
         var ri: i32 = 0;
-        for (ri < range_count) {
-            if (ranges[ri].vreg == op.base && ranges[ri].preg >= 0) {
-                op.base = ranges[ri].preg;
-                ri = range_count;
+        for (ri < state.range_count) {
+            if (state.ranges[ri].vreg == op.base && state.ranges[ri].preg >= 0
+                && !state.ranges[ri].spilled
+                && pos >= state.ranges[ri].start && pos <= state.ranges[ri].end_pos) {
+                op.base = state.ranges[ri].preg;
+                ri = state.range_count;
             }
             ri = ri + 1;
         }
     }
     if (op.kind == isa.OPK_MEM && is_vreg(op.index)) {
         var ri: i32 = 0;
-        for (ri < range_count) {
-            if (ranges[ri].vreg == op.index && ranges[ri].preg >= 0) {
-                op.index = ranges[ri].preg;
-                ri = range_count;
+        for (ri < state.range_count) {
+            if (state.ranges[ri].vreg == op.index && state.ranges[ri].preg >= 0
+                && !state.ranges[ri].spilled
+                && pos >= state.ranges[ri].start && pos <= state.ranges[ri].end_pos) {
+                op.index = state.ranges[ri].preg;
+                ri = state.range_count;
             }
             ri = ri + 1;
         }
     }
 }
 
-# align_up: align a value up to the given alignment
-fun align_up(value: usize, alignment: usize) usize {
-    if (alignment == 0) { ret value; }
-    ret (value + alignment - 1) & ~(alignment - 1);
+fun find_spill_for_vreg(state: *RegAllocState, vreg: i32, pos: i32) i32 {
+    var ri: i32 = 0;
+    for (ri < state.range_count) {
+        if (state.ranges[ri].vreg == vreg && state.ranges[ri].spilled
+            && pos >= state.ranges[ri].start && pos <= state.ranges[ri].end_pos) {
+            ret ri;
+        }
+        ri = ri + 1;
+    }
+    ret -1;
 }
 
-# alloc_function: allocate physical registers for a function's instruction buffer
-#
-# builds live ranges from the instruction buffer, sorts them by start
-# position, and performs linear scan allocation. spilled ranges get
-# stack slots; the output buffer has all virtual registers replaced.
-# ---
-# alloc:      backing allocator
-# i:          ISA interface (register files, encoding)
-# a:          ABI interface (callee-saved regs, param regs)
-# insts:      input instruction buffer with virtual registers
-# local_size: bytes of local variables on the stack
-# cfg:        control flow graph
-# live:       liveness sets
-# ret:        allocation result with rewritten instruction buffer
+fun rewrite_instructions(state: *RegAllocState) isa.InstBuf {
+    var out: isa.InstBuf = isa.buf_init(state.alloc);
+
+    var pos: i32 = 0;
+    for (pos < state.insts.count) {
+        var inst: isa.Inst = state.insts.insts[pos];
+
+        if (inst.opcode == isa.ISA_PCOPY_FENCE) {
+            isa.buf_append(?out, inst);
+            pos = pos + 1;
+            cnt;
+        }
+
+        val at_call: bool = is_call_at(state, pos);
+        if (at_call) {
+            emit_split_stores(state, ?out, pos, inst.src_line, inst.src_file);
+        }
+
+        var has_spill_dst: bool = false;
+        var spill_dst_off: i64 = 0;
+        var spill_dst_size: u8 = 8;
+        var has_spill_s1: bool = false;
+        var spill_s1_off: i64 = 0;
+        var spill_s1_size: u8 = 8;
+        var has_spill_s2: bool = false;
+        var spill_s2_off: i64 = 0;
+        var spill_s2_size: u8 = 8;
+
+        if (inst.dst.kind == isa.OPK_REG && is_vreg(inst.dst.reg)) {
+            val sri: i32 = find_spill_for_vreg(state, inst.dst.reg, pos);
+            if (sri >= 0) {
+                has_spill_dst = true;
+                spill_dst_off = get_spill_offset(state, sri);
+                spill_dst_size = state.ranges[sri].size;
+            }
+        }
+        if (inst.src1.kind == isa.OPK_REG && is_vreg(inst.src1.reg)) {
+            val sri: i32 = find_spill_for_vreg(state, inst.src1.reg, pos);
+            if (sri >= 0) {
+                has_spill_s1 = true;
+                spill_s1_off = get_spill_offset(state, sri);
+                spill_s1_size = state.ranges[sri].size;
+            }
+        }
+        if (inst.src2.kind == isa.OPK_REG && is_vreg(inst.src2.reg)) {
+            val sri: i32 = find_spill_for_vreg(state, inst.src2.reg, pos);
+            if (sri >= 0) {
+                has_spill_s2 = true;
+                spill_s2_off = get_spill_offset(state, sri);
+                spill_s2_size = state.ranges[sri].size;
+            }
+        }
+
+        if (inst.src1.kind == isa.OPK_MEM && is_vreg(inst.src1.base)) {
+            val sri: i32 = find_spill_for_vreg(state, inst.src1.base, pos);
+            if (sri >= 0) {
+                val off: i64 = get_spill_offset(state, sri);
+                emit_mi_load(state, ?out, state.isa_ref.scratch_reg2, off, 8,
+                             inst.src_line, inst.src_file);
+                inst.src1.base = state.isa_ref.scratch_reg2;
+            }
+        }
+
+        if (has_spill_s1) {
+            emit_mi_load(state, ?out, state.isa_ref.scratch_reg2, spill_s1_off, spill_s1_size,
+                         inst.src_line, inst.src_file);
+            inst.src1 = isa.make_reg(state.isa_ref.scratch_reg2, spill_s1_size);
+        }
+        if (has_spill_s2) {
+            emit_mi_load(state, ?out, state.isa_ref.scratch_reg, spill_s2_off, spill_s2_size,
+                         inst.src_line, inst.src_file);
+            inst.src2 = isa.make_reg(state.isa_ref.scratch_reg, spill_s2_size);
+        }
+
+        if (has_spill_dst) {
+            inst.dst = isa.make_reg(state.isa_ref.scratch_reg2, spill_dst_size);
+        }
+
+        rewrite_operand_reg(state, ?inst.dst, pos);
+        rewrite_operand_reg(state, ?inst.src1, pos);
+        rewrite_operand_reg(state, ?inst.src2, pos);
+        isa.buf_append(?out, inst);
+
+        if (has_spill_dst) {
+            emit_mi_store(state, ?out, state.isa_ref.scratch_reg2, spill_dst_off, spill_dst_size,
+                          inst.src_line, inst.src_file);
+        }
+
+        if (at_call) {
+            emit_split_loads(state, ?out, pos, inst.src_line, inst.src_file);
+        }
+
+        pos = pos + 1;
+    }
+
+    ret out;
+}
+
 pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
                        insts: *isa.InstBuf, local_size: usize,
                        cfg: *mcfg.CFG, live: *mcfg.LiveSets) RegAllocResult {
@@ -536,11 +800,6 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
     result.spill_size  = 0;
     result.callee_mask = 0;
     result.ok          = false;
-
-    if (cfg == nil || live == nil) {
-        result.out = isa.buf_init(alloc);
-        ret result;
-    }
 
     if (insts == nil || insts.count == 0) {
         result.out = isa.buf_init(alloc);
@@ -553,294 +812,86 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
         result.out = isa.buf_init(alloc);
         ret result;
     }
-    var ranges: *LiveRange = unwrap_ok[*LiveRange, str](res_ranges);
-    var range_count: i32 = 0;
-
     val res_calls: Result[*i32, str] = allocator.allocate[i32](alloc, MAX_CALLS::usize);
     if (is_err[*i32, str](res_calls)) {
-        allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
+        allocator.deallocate[LiveRange](alloc, unwrap_ok[*LiveRange, str](res_ranges), MAX_RANGES::usize);
         result.out = isa.buf_init(alloc);
         ret result;
     }
-    var call_positions: *i32 = unwrap_ok[*i32, str](res_calls);
-    var call_count: i32 = 0;
+    val res_wl: Result[*i32, str] = allocator.allocate[i32](alloc, MAX_RANGES::usize);
+    if (is_err[*i32, str](res_wl)) {
+        allocator.deallocate[LiveRange](alloc, unwrap_ok[*LiveRange, str](res_ranges), MAX_RANGES::usize);
+        allocator.deallocate[i32](alloc, unwrap_ok[*i32, str](res_calls), MAX_CALLS::usize);
+        result.out = isa.buf_init(alloc);
+        ret result;
+    }
+    val res_gp: Result[*i32, str] = allocator.allocate[i32](alloc, i.gp_count::usize);
+    val res_fp: Result[*i32, str] = allocator.allocate[i32](alloc, i.fp_count::usize);
+    if (is_err[*i32, str](res_gp) || is_err[*i32, str](res_fp)) {
+        result.out = isa.buf_init(alloc);
+        ret result;
+    }
+    val res_slots: Result[*SpillSlot, str] = allocator.allocate[SpillSlot](alloc, MAX_SPILL_SLOTS::usize);
+    if (is_err[*SpillSlot, str](res_slots)) {
+        result.out = isa.buf_init(alloc);
+        ret result;
+    }
 
-    build_ranges(alloc, insts, ranges, ?range_count, call_positions, ?call_count, i);
+    var state: RegAllocState;
+    state.alloc       = alloc;
+    state.isa_ref     = i;
+    state.abi_ref     = a;
+    state.insts       = insts;
+    state.local_size  = local_size;
+    state.ranges      = unwrap_ok[*LiveRange, str](res_ranges);
+    state.range_count = 0;
+    state.calls       = unwrap_ok[*i32, str](res_calls);
+    state.call_count  = 0;
+    state.worklist    = unwrap_ok[*i32, str](res_wl);
+    state.wl_count    = 0;
+    state.gp_active   = unwrap_ok[*i32, str](res_gp);
+    state.fp_active   = unwrap_ok[*i32, str](res_fp);
+    state.slots       = unwrap_ok[*SpillSlot, str](res_slots);
+    state.slot_count  = 0;
+    state.spill_off   = local_size;
+    state.callee_mask = 0;
 
-    if (range_count == 0) {
+    var gi: i32 = 0;
+    for (gi < i.gp_count) { state.gp_active[gi] = -1; gi = gi + 1; }
+    var fi: i32 = 0;
+    for (fi < i.fp_count) { state.fp_active[fi] = -1; fi = fi + 1; }
+
+    build_ranges(?state);
+
+    if (state.range_count == 0) {
         var out: isa.InstBuf = isa.buf_init(alloc);
         var ci: i32 = 0;
         for (ci < insts.count) {
             isa.buf_append(?out, insts.insts[ci]);
             ci = ci + 1;
         }
-        allocator.deallocate[i32](alloc, call_positions, MAX_CALLS::usize);
-        allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
         result.out = out;
         result.ok  = true;
         ret result;
     }
 
-    var rci: i32 = 0;
-    for (rci < range_count) {
-        if (range_crosses_call(?ranges[rci], call_positions, call_count)) {
-            ranges[rci].crosses_call = true;
-        }
-        rci = rci + 1;
-    }
+    split_at_calls(?state);
+    sort_worklist(?state);
+    allocate_ranges(?state);
 
-    sort_ranges_by_start(ranges, range_count);
-
-    val res_active: Result[*ActiveEntry, str] = allocator.allocate[ActiveEntry](alloc, MAX_ACTIVE::usize);
-    if (is_err[*ActiveEntry, str](res_active)) {
-        allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
-        result.out = isa.buf_init(alloc);
-        ret result;
-    }
-    var active: *ActiveEntry = unwrap_ok[*ActiveEntry, str](res_active);
-    var active_count: i32 = 0;
-
-    var gp_free: *bool = nil;
-    var fp_free: *bool = nil;
-    val gp_reg_count: i32 = i.gp_count;
-    val fp_reg_count: i32 = i.fp_count;
-    val res_gp: Result[*bool, str] = allocator.allocate[bool](alloc, gp_reg_count::usize);
-    val res_fp: Result[*bool, str] = allocator.allocate[bool](alloc, fp_reg_count::usize);
-    if (is_err[*bool, str](res_gp) || is_err[*bool, str](res_fp)) {
-        allocator.deallocate[ActiveEntry](alloc, active, MAX_ACTIVE::usize);
-        allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
-        result.out = isa.buf_init(alloc);
-        ret result;
-    }
-    gp_free = unwrap_ok[*bool, str](res_gp);
-    fp_free = unwrap_ok[*bool, str](res_fp);
-
-    var gi: i32 = 0;
-    for (gi < gp_reg_count) {
-        gp_free[gi] = true;
-        gi = gi + 1;
-    }
-    var fi: i32 = 0;
-    for (fi < fp_reg_count) {
-        fp_free[fi] = true;
-        fi = fi + 1;
-    }
-    gp_free[i.stack_reg] = false;
-    gp_free[i.frame_reg] = false;
-
-    var callee_mask: u32 = 0;
-    var spill_offset: usize = local_size;
-
-    var ri: i32 = 0;
-    for (ri < range_count) {
-        expire_old(active, ?active_count, gp_free, fp_free, gp_reg_count, fp_reg_count, ranges[ri].start);
-
-        var preg: i32 = -1;
-        if (ranges[ri].crosses_call) {
-            preg = try_alloc_reg_callee(gp_free, fp_free, ranges[ri].reg_class, i, a, ranges[ri].hint);
-        } or {
-            preg = try_alloc_reg(gp_free, fp_free, ranges[ri].reg_class, i, a, ranges[ri].hint);
-        }
-        if (preg >= 0) {
-            ranges[ri].preg = preg;
-            add_active(active, ?active_count, ri, preg, ranges[ri].end_pos, ranges[ri].reg_class);
-            if (is_callee_saved(a, preg)) {
-                callee_mask = callee_mask | (1 << (preg::u32));
-            }
-        } or {
-            val spill_idx: i32 = find_spill_candidate(active, active_count, ranges);
-            if (spill_idx >= 0) {
-                val spilled_ri: i32 = active[spill_idx].range_idx;
-                val freed_preg: i32 = active[spill_idx].preg;
-
-                var slot_size: usize = ranges[spilled_ri].size::usize;
-                if (slot_size < 8) { slot_size = 8; }
-                spill_offset = align_up(spill_offset + slot_size, 8);
-                ranges[spilled_ri].spilled = true;
-                ranges[spilled_ri].spill_off = spill_offset::i64;
-                ranges[spilled_ri].preg = -1;
-
-                if (ranges[spilled_ri].reg_class == REG_CLASS_GP) {
-                    gp_free[freed_preg] = true;
-                } or {
-                    fp_free[freed_preg] = true;
-                }
-                remove_active(active, ?active_count, spill_idx);
-
-                var new_preg: i32 = -1;
-                if (ranges[ri].crosses_call) {
-                    new_preg = try_alloc_reg_callee(gp_free, fp_free, ranges[ri].reg_class, i, a, ranges[ri].hint);
-                } or {
-                    new_preg = try_alloc_reg(gp_free, fp_free, ranges[ri].reg_class, i, a, ranges[ri].hint);
-                }
-                if (new_preg >= 0) {
-                    ranges[ri].preg = new_preg;
-                    add_active(active, ?active_count, ri, new_preg, ranges[ri].end_pos, ranges[ri].reg_class);
-                    if (is_callee_saved(a, new_preg)) {
-                        callee_mask = callee_mask | (1 << (new_preg::u32));
-                    }
-                } or {
-                    var slot_size2: usize = ranges[ri].size::usize;
-                    if (slot_size2 < 8) { slot_size2 = 8; }
-                    spill_offset = align_up(spill_offset + slot_size2, 8);
-                    ranges[ri].spilled = true;
-                    ranges[ri].spill_off = spill_offset::i64;
-                }
-            } or {
-                var slot_size3: usize = ranges[ri].size::usize;
-                if (slot_size3 < 8) { slot_size3 = 8; }
-                spill_offset = align_up(spill_offset + slot_size3, 8);
-                ranges[ri].spilled = true;
-                ranges[ri].spill_off = spill_offset::i64;
-            }
-        }
-
-        ri = ri + 1;
-    }
-
-    var out: isa.InstBuf = isa.buf_init(alloc);
-    var pi: i32 = 0;
-    for (pi < insts.count) {
-        var inst: isa.Inst = insts.insts[pi];
-
-        if (inst.opcode == isa.ISA_PCOPY_FENCE) {
-            isa.buf_append(?out, inst);
-            pi = pi + 1;
-            cnt;
-        }
-
-        var has_spill_dst: bool = false;
-        var spill_dst_off: i64 = 0;
-        var spill_dst_size: u8 = 8;
-        var spill_dst_preg: i32 = -1;
-        var has_spill_s1: bool = false;
-        var spill_s1_off: i64 = 0;
-        var spill_s1_size: u8 = 8;
-        var spill_s1_preg: i32 = -1;
-        var has_spill_s2: bool = false;
-        var spill_s2_off: i64 = 0;
-        var spill_s2_size: u8 = 8;
-        var spill_s2_preg: i32 = -1;
-
-        if (inst.dst.kind == isa.OPK_REG && is_vreg(inst.dst.reg)) {
-            var si: i32 = 0;
-            for (si < range_count) {
-                if (ranges[si].vreg == inst.dst.reg && ranges[si].spilled) {
-                    has_spill_dst = true;
-                    spill_dst_off = ranges[si].spill_off;
-                    spill_dst_size = ranges[si].size;
-                    spill_dst_preg = i.scratch_reg2;
-                    si = range_count;
-                }
-                si = si + 1;
-            }
-        }
-        if (inst.src1.kind == isa.OPK_REG && is_vreg(inst.src1.reg)) {
-            var si: i32 = 0;
-            for (si < range_count) {
-                if (ranges[si].vreg == inst.src1.reg && ranges[si].spilled) {
-                    has_spill_s1 = true;
-                    spill_s1_off = ranges[si].spill_off;
-                    spill_s1_size = ranges[si].size;
-                    spill_s1_preg = i.scratch_reg2;
-                    si = range_count;
-                }
-                si = si + 1;
-            }
-        }
-        if (inst.src2.kind == isa.OPK_REG && is_vreg(inst.src2.reg)) {
-            var si: i32 = 0;
-            for (si < range_count) {
-                if (ranges[si].vreg == inst.src2.reg && ranges[si].spilled) {
-                    has_spill_s2 = true;
-                    spill_s2_off = ranges[si].spill_off;
-                    spill_s2_size = ranges[si].size;
-                    spill_s2_preg = i.scratch_reg;
-                    si = range_count;
-                }
-                si = si + 1;
-            }
-        }
-
-        if (inst.src1.kind == isa.OPK_MEM && is_vreg(inst.src1.base)) {
-            var si: i32 = 0;
-            for (si < range_count) {
-                if (ranges[si].vreg == inst.src1.base && ranges[si].spilled) {
-                    var reload: isa.Inst;
-                    reload.opcode = i.load_opcode;
-                    reload.dst = isa.make_reg(i.scratch_reg2, 8);
-                    reload.src1 = isa.make_mem(i.frame_reg, (-(ranges[si].spill_off::i32))::i32, -1, 0, 8);
-                    reload.src2 = isa.make_reg(-1, 0);
-                    reload.size = 8;
-                    reload.flags = 0;
-                    reload.src_line = inst.src_line;
-                    reload.src_file = inst.src_file;
-                    isa.buf_append(?out, reload);
-                    inst.src1.base = i.scratch_reg2;
-                    si = range_count;
-                }
-                si = si + 1;
-            }
-        }
-
-        if (has_spill_s1) {
-            var reload: isa.Inst;
-            reload.opcode = i.load_opcode;
-            reload.dst = isa.make_reg(spill_s1_preg, spill_s1_size);
-            reload.src1 = isa.make_mem(i.frame_reg, (-(spill_s1_off::i32))::i32, -1, 0, spill_s1_size);
-            reload.src2 = isa.make_reg(-1, 0);
-            reload.size = spill_s1_size;
-            reload.flags = 0;
-            reload.src_line = inst.src_line;
-            reload.src_file = inst.src_file;
-            isa.buf_append(?out, reload);
-            inst.src1 = isa.make_reg(spill_s1_preg, spill_s1_size);
-        }
-        if (has_spill_s2) {
-            val s2_preg: i32 = i.scratch_reg;
-            var reload: isa.Inst;
-            reload.opcode = i.load_opcode;
-            reload.dst = isa.make_reg(s2_preg, spill_s2_size);
-            reload.src1 = isa.make_mem(i.frame_reg, (-(spill_s2_off::i32))::i32, -1, 0, spill_s2_size);
-            reload.src2 = isa.make_reg(-1, 0);
-            reload.size = spill_s2_size;
-            reload.flags = 0;
-            reload.src_line = inst.src_line;
-            reload.src_file = inst.src_file;
-            isa.buf_append(?out, reload);
-            inst.src2 = isa.make_reg(s2_preg, spill_s2_size);
-        }
-
-        rewrite_operand(i, ?inst.dst, ranges, range_count);
-        rewrite_operand(i, ?inst.src1, ranges, range_count);
-        rewrite_operand(i, ?inst.src2, ranges, range_count);
-        isa.buf_append(?out, inst);
-
-        if (has_spill_dst) {
-            var spill: isa.Inst;
-            spill.opcode = i.store_opcode;
-            spill.dst = isa.make_mem(i.frame_reg, (-(spill_dst_off::i32))::i32, -1, 0, spill_dst_size);
-            spill.src1 = inst.dst;
-            spill.src2 = isa.make_reg(-1, 0);
-            spill.size = spill_dst_size;
-            spill.flags = 0;
-            spill.src_line = inst.src_line;
-            spill.src_file = inst.src_file;
-            isa.buf_append(?out, spill);
-        }
-
-        pi = pi + 1;
-    }
-
-    allocator.deallocate[bool](alloc, fp_free, fp_reg_count::usize);
-    allocator.deallocate[bool](alloc, gp_free, gp_reg_count::usize);
-    allocator.deallocate[ActiveEntry](alloc, active, MAX_ACTIVE::usize);
-    allocator.deallocate[i32](alloc, call_positions, MAX_CALLS::usize);
-    allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
+    val out: isa.InstBuf = rewrite_instructions(?state);
 
     result.out         = out;
-    result.spill_size  = align_up(spill_offset - local_size, 16);
-    result.callee_mask = callee_mask;
+    result.spill_size  = align_up(state.spill_off - local_size, 16);
+    result.callee_mask = state.callee_mask;
     result.ok          = true;
+
+    allocator.deallocate[SpillSlot](alloc, state.slots, MAX_SPILL_SLOTS::usize);
+    allocator.deallocate[i32](alloc, state.fp_active, i.fp_count::usize);
+    allocator.deallocate[i32](alloc, state.gp_active, i.gp_count::usize);
+    allocator.deallocate[i32](alloc, state.worklist, MAX_RANGES::usize);
+    allocator.deallocate[i32](alloc, state.calls, MAX_CALLS::usize);
+    allocator.deallocate[LiveRange](alloc, state.ranges, MAX_RANGES::usize);
+
     ret result;
 }
