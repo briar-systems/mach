@@ -229,7 +229,11 @@ fun lower_char_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeSto
     val str_id: ast.StrId = ast.get_extra(store, node.payload)::ast.StrId;
     val text: str = ast.get_str(store, str_id);
     var value: u64 = 0;
-    if (text != nil) { value = text[0]::u64; }
+    if (text != nil) {
+        val pc_res: Result[u8, str] = lit.parse_char(text);
+        if (is_ok[u8, str](pc_res)) { value = unwrap_ok[u8, str](pc_res)::u64; }
+        or { value = text[0]::u64; }
+    }
     val res: Result[ir.ValueId, str] = builder.build_iconst(?ctx.fb, tid, value, loc);
     ret lctx.unwrap_build(ctx, res, loc);
 }
@@ -243,7 +247,8 @@ fun lower_ident(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore,
     val local_ptr: ir.ValueId = lctx.find_local(ctx, name);
     if (local_ptr::u32 != ir.VALUE_NONE::u32) {
         if (lctx.is_aggregate(ctx, tid)) {
-            ret local_ptr;
+            val agg_sz: u32 = lctx.type_size(ctx, tid);
+            if (agg_sz > 8) { ret local_ptr; }
         }
         val res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, tid, local_ptr, loc);
         if (is_ok[ir.ValueId, str](res)) { ret unwrap_ok[ir.ValueId, str](res); }
@@ -274,6 +279,7 @@ fun lower_ident(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore,
                 if (is_ok[ir.ValueId, str](addr_res)) {
                     val addr: ir.ValueId = unwrap_ok[ir.ValueId, str](addr_res);
                     if (lctx.is_aggregate(ctx, tid)) { ret addr; }
+                    if (sym.kind == scope.SK_FUN) { ret addr; }
                     val ld_res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, tid, addr, loc);
                     if (is_ok[ir.ValueId, str](ld_res)) { ret unwrap_ok[ir.ValueId, str](ld_res); }
                 }
@@ -308,6 +314,7 @@ fun lower_ident_sym(ctx: *lctx.LowerCtx, sym: *scope.Symbol, tid: type.TypeId, n
         if (is_ok[ir.ValueId, str](addr_res)) {
             val addr: ir.ValueId = unwrap_ok[ir.ValueId, str](addr_res);
             if (lctx.is_aggregate(ctx, tid)) { ret addr; }
+            if (sym.kind == scope.SK_FUN) { ret addr; }
             val ld_res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, tid, addr, loc);
             if (is_ok[ir.ValueId, str](ld_res)) { ret unwrap_ok[ir.ValueId, str](ld_res); }
         }
@@ -488,8 +495,8 @@ fun lower_assign(ctx: *lctx.LowerCtx, lhs_id: ast.NodeId, rhs_id: ast.NodeId,
     }
 
     val tid: type.TypeId = lctx.node_type(ctx, rhs_id);
-    if (lctx.is_aggregate(ctx, tid)) {
-        val sz: u32 = lctx.type_size(ctx, tid);
+    val sz: u32 = lctx.type_size(ctx, tid);
+    if (lctx.is_aggregate(ctx, tid) && sz > 8) {
         builder.build_copy(?ctx.fb, ptr, value, sz::u64, loc);
     } or {
         builder.build_store(?ctx.fb, ptr, value, loc);
@@ -555,6 +562,74 @@ fun lower_unary(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore,
     ret ir.VALUE_NONE;
 }
 
+val SRET_FLAG: u16 = 0x8000;
+
+fun emit_call(ctx: *lctx.LowerCtx, ret_tid: type.TypeId, sid: ir.SymId,
+              args: *ir.ValueId, arg_count: u16, loc: ir.SrcRef) Result[ir.ValueId, str] {
+    val ret_sz: u32 = lctx.type_size(ctx, ret_tid);
+    if (lctx.is_aggregate(ctx, ret_tid) && ret_sz > 0) {
+        if (ret_sz > ctx.max_reg_ret) {
+            ret emit_sret_call(ctx, ret_tid, sid, args, arg_count, ret_sz, loc);
+        }
+        ret builder.build_call_agg(?ctx.fb, ret_tid, sid, args, arg_count, ret_sz::u16, loc);
+    }
+    ret builder.build_call(?ctx.fb, ret_tid, sid, args, arg_count, loc);
+}
+
+fun emit_call_indirect(ctx: *lctx.LowerCtx, ret_tid: type.TypeId, callee: ir.ValueId,
+                       args: *ir.ValueId, arg_count: u16, loc: ir.SrcRef) Result[ir.ValueId, str] {
+    val ret_sz: u32 = lctx.type_size(ctx, ret_tid);
+    if (lctx.is_aggregate(ctx, ret_tid) && ret_sz > 0) {
+        if (ret_sz > ctx.max_reg_ret) {
+            ret emit_sret_call_indirect(ctx, ret_tid, callee, args, arg_count, ret_sz, loc);
+        }
+        ret builder.build_call_indirect_agg(?ctx.fb, ret_tid, callee, args, arg_count, ret_sz::u16, loc);
+    }
+    ret builder.build_call_indirect(?ctx.fb, ret_tid, callee, args, arg_count, loc);
+}
+
+fun emit_sret_call(ctx: *lctx.LowerCtx, ret_tid: type.TypeId, sid: ir.SymId,
+                   args: *ir.ValueId, arg_count: u16, ret_sz: u32, loc: ir.SrcRef) Result[ir.ValueId, str] {
+    val ptr_tid: type.TypeId = type.make_pointer(ctx.sema.types, ret_tid);
+    val al: u32 = lctx.type_align(ctx, ret_tid);
+    val alloca_res: Result[ir.ValueId, str] = builder.build_alloca(?ctx.fb, ptr_tid, ret_sz::u64, al::u16, loc);
+    if (is_err[ir.ValueId, str](alloca_res)) { ret alloca_res; }
+    val sret_ptr: ir.ValueId = unwrap_ok[ir.ValueId, str](alloca_res);
+
+    var sret_args: [64]ir.ValueId;
+    sret_args[0] = sret_ptr;
+    var i: u16 = 0;
+    for (i < arg_count && i < 63) {
+        sret_args[1 + i] = args[i];
+        i = i + 1;
+    }
+    val total: u16 = 1 + arg_count;
+    val flags: u16 = SRET_FLAG | ret_sz::u16;
+    builder.build_call_agg(?ctx.fb, type.TK_VOID::type.TypeId, sid, ?sret_args[0], total, flags, loc);
+    ret ok[ir.ValueId, str](sret_ptr);
+}
+
+fun emit_sret_call_indirect(ctx: *lctx.LowerCtx, ret_tid: type.TypeId, callee: ir.ValueId,
+                            args: *ir.ValueId, arg_count: u16, ret_sz: u32, loc: ir.SrcRef) Result[ir.ValueId, str] {
+    val ptr_tid: type.TypeId = type.make_pointer(ctx.sema.types, ret_tid);
+    val al: u32 = lctx.type_align(ctx, ret_tid);
+    val alloca_res: Result[ir.ValueId, str] = builder.build_alloca(?ctx.fb, ptr_tid, ret_sz::u64, al::u16, loc);
+    if (is_err[ir.ValueId, str](alloca_res)) { ret alloca_res; }
+    val sret_ptr: ir.ValueId = unwrap_ok[ir.ValueId, str](alloca_res);
+
+    var sret_args: [64]ir.ValueId;
+    sret_args[0] = sret_ptr;
+    var i: u16 = 0;
+    for (i < arg_count && i < 63) {
+        sret_args[1 + i] = args[i];
+        i = i + 1;
+    }
+    val total: u16 = 1 + arg_count;
+    val flags: u16 = SRET_FLAG | ret_sz::u16;
+    builder.build_call_indirect_agg(?ctx.fb, type.TK_VOID::type.TypeId, callee, ?sret_args[0], total, flags, loc);
+    ret ok[ir.ValueId, str](sret_ptr);
+}
+
 fun lower_call(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
     val callee_id: ast.NodeId = ast.call_callee(store, node_id);
     val args_span: ast.NodeSpan = ast.call_args(store, node_id);
@@ -599,7 +674,7 @@ fun lower_call(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, 
             val ld_res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, callee_tid, local_ptr, loc);
             val callee_val: ir.ValueId = lctx.unwrap_build(ctx, ld_res, loc);
             if (callee_val::u32 != ir.VALUE_NONE::u32) {
-                val res: Result[ir.ValueId, str] = builder.build_call_indirect(?ctx.fb, ret_tid, callee_val, ?arg_vals[0], arg_count, loc);
+                val res: Result[ir.ValueId, str] = emit_call_indirect(ctx, ret_tid, callee_val, ?arg_vals[0], arg_count, loc);
                 ret lctx.unwrap_build(ctx, res, loc);
             }
             ret ir.VALUE_NONE;
@@ -611,7 +686,7 @@ fun lower_call(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, 
             if (sym != nil && (sym.kind == scope.SK_VAL || sym.kind == scope.SK_VAR || sym.kind == scope.SK_PARAM)) {
                 val callee_val: ir.ValueId = lower_ident(ctx, callee_id, store, loc);
                 if (callee_val::u32 != ir.VALUE_NONE::u32) {
-                    val res: Result[ir.ValueId, str] = builder.build_call_indirect(?ctx.fb, ret_tid, callee_val, ?arg_vals[0], arg_count, loc);
+                    val res: Result[ir.ValueId, str] = emit_call_indirect(ctx, ret_tid, callee_val, ?arg_vals[0], arg_count, loc);
                     ret lctx.unwrap_build(ctx, res, loc);
                 }
                 ret ir.VALUE_NONE;
@@ -630,7 +705,7 @@ fun lower_call(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, 
         val sym_res: Result[ir.SymId, str] = builder.module_add_symbol(ctx.mb, name, false);
         if (is_ok[ir.SymId, str](sym_res)) {
             val sid: ir.SymId = unwrap_ok[ir.SymId, str](sym_res);
-            val res: Result[ir.ValueId, str] = builder.build_call(?ctx.fb, ret_tid, sid, ?arg_vals[0], arg_count, loc);
+            val res: Result[ir.ValueId, str] = emit_call(ctx, ret_tid, sid, ?arg_vals[0], arg_count, loc);
             if (is_ok[ir.ValueId, str](res)) { ret unwrap_ok[ir.ValueId, str](res); }
         }
     } or {
@@ -648,7 +723,7 @@ fun lower_call(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, 
                 val sym_res: Result[ir.SymId, str] = builder.module_add_symbol(ctx.mb, fname, false);
                 if (is_ok[ir.SymId, str](sym_res)) {
                     val sid: ir.SymId = unwrap_ok[ir.SymId, str](sym_res);
-                    val res: Result[ir.ValueId, str] = builder.build_call(?ctx.fb, ret_tid, sid, ?arg_vals[0], arg_count, loc);
+                    val res: Result[ir.ValueId, str] = emit_call(ctx, ret_tid, sid, ?arg_vals[0], arg_count, loc);
                     if (is_ok[ir.ValueId, str](res)) { ret unwrap_ok[ir.ValueId, str](res); }
                 }
                 ret ir.VALUE_NONE;
@@ -694,7 +769,7 @@ fun lower_call(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, 
                                 val sym_res: Result[ir.SymId, str] = builder.module_add_symbol(ctx.mb, fname, false);
                                 if (is_ok[ir.SymId, str](sym_res)) {
                                     val sid: ir.SymId = unwrap_ok[ir.SymId, str](sym_res);
-                                    val res: Result[ir.ValueId, str] = builder.build_call(?ctx.fb, ret_tid, sid, ?arg_vals[0], arg_count, loc);
+                                    val res: Result[ir.ValueId, str] = emit_call(ctx, ret_tid, sid, ?arg_vals[0], arg_count, loc);
                                     if (is_ok[ir.ValueId, str](res)) { ret unwrap_ok[ir.ValueId, str](res); }
                                 }
                             }
@@ -706,7 +781,7 @@ fun lower_call(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, 
 
         val callee_val: ir.ValueId = lower_expr(ctx, callee_id, store);
         if (callee_val::u32 != ir.VALUE_NONE::u32) {
-            val res: Result[ir.ValueId, str] = builder.build_call_indirect(?ctx.fb, ret_tid, callee_val, ?arg_vals[0], arg_count, loc);
+            val res: Result[ir.ValueId, str] = emit_call_indirect(ctx, ret_tid, callee_val, ?arg_vals[0], arg_count, loc);
             if (is_ok[ir.ValueId, str](res)) { ret unwrap_ok[ir.ValueId, str](res); }
         }
     }
@@ -745,11 +820,13 @@ fun lower_va_start(ctx: *lctx.LowerCtx, args_span: ast.NodeSpan, store: *ast.Nod
     val va_ptr: ir.ValueId = lower_expr(ctx, arg_nid, store);
     if (va_ptr::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
 
+    val named_count: u64 = ctx.fb.func.param_count::u64;
+
     var args: [1]ir.ValueId;
     args[0] = va_ptr;
     val void_tid: type.TypeId = type.TK_VOID::type.TypeId;
     builder.emit(?ctx.fb, op.OP_VA_START, 0, void_tid, ?args[0], 1,
-                 ir.BLOCK_NONE, ir.BLOCK_NONE, 0, loc);
+                 ir.BLOCK_NONE, ir.BLOCK_NONE, named_count, loc);
     ret ir.VALUE_NONE;
 }
 
@@ -837,8 +914,9 @@ fun lower_field_ptr(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeSt
         ret ir.VALUE_NONE;
     }
 
+    val field_offset: u32 = actual_t.fields[field_idx].offset;
     val ptr_tid: type.TypeId = type.TK_POINTER::type.TypeId;
-    val res: Result[ir.ValueId, str] = builder.build_field_ptr(?ctx.fb, ptr_tid, actual_base, field_idx, loc);
+    val res: Result[ir.ValueId, str] = builder.build_field_ptr(?ctx.fb, ptr_tid, actual_base, field_offset, loc);
     ret lctx.unwrap_build(ctx, res, loc);
 }
 
@@ -857,12 +935,25 @@ fun lower_index_ptr(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeSt
     val base_id: ast.NodeId = ast.get_extra(store, node.payload)::ast.NodeId;
     val idx_id: ast.NodeId = ast.get_extra(store, node.payload + 1)::ast.NodeId;
 
-    val base_ptr: ir.ValueId = lower_lvalue(ctx, base_id, store);
+    val base_lv: ir.ValueId = lower_lvalue(ctx, base_id, store);
     val index_val: ir.ValueId = lower_expr(ctx, idx_id, store);
-    if (base_ptr::u32 == ir.VALUE_NONE::u32 || index_val::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+    if (base_lv::u32 == ir.VALUE_NONE::u32 || index_val::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+
+    val base_tid: type.TypeId = lctx.node_type(ctx, base_id);
+    var base_ptr: ir.ValueId = base_lv;
+    if (!lctx.is_aggregate(ctx, base_tid)) {
+        val ld_res: Result[ir.ValueId, str] = builder.build_load(?ctx.fb, base_tid, base_lv, loc);
+        base_ptr = lctx.unwrap_build(ctx, ld_res, loc);
+        if (base_ptr::u32 == ir.VALUE_NONE::u32) { ret ir.VALUE_NONE; }
+    }
+
+    val elem_tid: type.TypeId = lctx.node_type(ctx, node_id);
+    val elem_sz: u32 = lctx.type_size(ctx, elem_tid);
+    var esz: u64 = elem_sz::u64;
+    if (esz == 0) { esz = 1; }
 
     val ptr_tid: type.TypeId = type.TK_POINTER::type.TypeId;
-    val res: Result[ir.ValueId, str] = builder.build_index_ptr(?ctx.fb, ptr_tid, base_ptr, index_val, loc);
+    val res: Result[ir.ValueId, str] = builder.build_index_ptr(?ctx.fb, ptr_tid, base_ptr, index_val, esz, loc);
     ret lctx.unwrap_build(ctx, res, loc);
 }
 
@@ -953,7 +1044,12 @@ fun lower_struct_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeS
             val val_id: ast.NodeId = ast.get_extra(store, init_node.payload + 1)::ast.NodeId;
             val field_val: ir.ValueId = lower_expr(ctx, val_id, store);
             if (field_val::u32 != ir.VALUE_NONE::u32) {
-                val fptr_res: Result[ir.ValueId, str] = builder.build_field_ptr(?ctx.fb, ptr_tid, ptr, fi, loc);
+                val st: *type.Type = lctx.get_type(ctx, tid);
+                var f_off: u32 = fi;
+                if (st != nil && fi::u16 < st.field_count) {
+                    f_off = st.fields[fi].offset;
+                }
+                val fptr_res: Result[ir.ValueId, str] = builder.build_field_ptr(?ctx.fb, ptr_tid, ptr, f_off, loc);
                 if (is_ok[ir.ValueId, str](fptr_res)) {
                     val fptr: ir.ValueId = unwrap_ok[ir.ValueId, str](fptr_res);
                     val field_tid: type.TypeId = lctx.node_type(ctx, val_id);
@@ -995,7 +1091,10 @@ fun lower_array_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeSt
                 val idx_res: Result[ir.ValueId, str] = builder.build_iconst(?ctx.fb, type.TK_U64::type.TypeId, ei::u64, loc);
                 if (is_ok[ir.ValueId, str](idx_res)) {
                     val idx_val: ir.ValueId = unwrap_ok[ir.ValueId, str](idx_res);
-                    val eptr_res: Result[ir.ValueId, str] = builder.build_index_ptr(?ctx.fb, ptr_tid, ptr, idx_val, loc);
+                    val elem_tid_for_sz: type.TypeId = lctx.node_type(ctx, elem_id);
+                    var elem_esz: u64 = lctx.type_size(ctx, elem_tid_for_sz)::u64;
+                    if (elem_esz == 0) { elem_esz = 1; }
+                    val eptr_res: Result[ir.ValueId, str] = builder.build_index_ptr(?ctx.fb, ptr_tid, ptr, idx_val, elem_esz, loc);
                     if (is_ok[ir.ValueId, str](eptr_res)) {
                         val eptr: ir.ValueId = unwrap_ok[ir.ValueId, str](eptr_res);
                         val elem_tid: type.TypeId = lctx.node_type(ctx, elem_id);
@@ -1017,7 +1116,9 @@ fun lower_array_lit(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeSt
 
 fun lower_comptime(ctx: *lctx.LowerCtx, node_id: ast.NodeId, store: *ast.NodeStore, loc: ir.SrcRef) ir.ValueId {
     val m: *smod.Module = smod.get(ctx.sema.modules, ctx.current_mod);
-    val cv: ct.CValue = ct.eval(ctx.sema, ctx.current_mod, m.scope, node_id);
+    var eval_scope: scope.ScopeId = m.scope;
+    if (ctx.inst_scope != 0) { eval_scope = ctx.inst_scope::scope.ScopeId; }
+    val cv: ct.CValue = ct.eval(ctx.sema, ctx.current_mod, eval_scope, node_id);
 
     val tid: type.TypeId = lctx.node_type(ctx, node_id);
 
