@@ -107,6 +107,7 @@ fun compile_function(func: *ir.Function, module: *ir.Module, tgt: *target.Target
     var cfg: mcfg.CFG = build_mir_cfg(alloc, func);
     var live: mcfg.LiveSets = compute_liveness(alloc, ?isel_buf, ?cfg, func.value_count + 32);
 
+
     var ra_result: ra.RegAllocResult = ra.alloc_function(
         alloc, ?tgt.isa, ?tgt.abi, ?isel_buf, layout.frame_size, ?cfg, ?live
     );
@@ -187,6 +188,124 @@ fun dispatch_isel(tgt: *target.Target, module: *ir.Module, func: *ir.Function,
         ret tgt.isa.isel(func::ptr, module::ptr, tgt::ptr, layout::ptr, out, alloc);
     }
     ret false;
+}
+
+# insert_alloca_uses: emit ISA_USE pseudo-instructions for alloca vregs that
+# have explicit register uses (in PCOPYs, as memory bases, etc.) but also have
+# invisible uses through the frame-slot optimization in sel_load/sel_store.
+#
+# without this, build_ranges sees the alloca vreg only at its explicit uses,
+# making its range artificially short. a later alloca LEA assigned to the same
+# register clobbers the value before a frame-slot-optimized use needs it.
+#
+# the pass identifies allocas with explicit uses by scanning for vreg references,
+# then finds frame-slot accesses (using FP_REG with a matching offset) and
+# inserts ISA_USE after each to extend the alloca vreg's visible range.
+fun insert_alloca_uses(alloc: *allocator.Allocator, buf: *isa.InstBuf,
+                       layout: *frame.FrameLayout, tgt: *target.Target) {
+    if (buf == nil || buf.count == 0 || tgt == nil) { ret; }
+    val MAX_ALLOCA_TRACK: i32 = 256;
+    val fp: i32 = tgt.isa.frame_reg;
+
+    val res_vregs: Result[*i32, str] = allocator.allocate[i32](alloc, MAX_ALLOCA_TRACK::usize);
+    val res_offs: Result[*i32, str] = allocator.allocate[i32](alloc, MAX_ALLOCA_TRACK::usize);
+    val res_used: Result[*bool, str] = allocator.allocate[bool](alloc, MAX_ALLOCA_TRACK::usize);
+    if (is_err[*i32, str](res_vregs) || is_err[*i32, str](res_offs) || is_err[*bool, str](res_used)) { ret; }
+    val a_vregs: *i32 = unwrap_ok[*i32, str](res_vregs);
+    val a_offs: *i32 = unwrap_ok[*i32, str](res_offs);
+    val a_used: *bool = unwrap_ok[*bool, str](res_used);
+    var a_count: i32 = 0;
+
+    var pos: i32 = 0;
+    for (pos < buf.count) {
+        val inst: *isa.Inst = ?buf.insts[pos];
+        if (inst.dst.kind == isa.OPK_REG && inst.src1.kind == isa.OPK_MEM &&
+            inst.src1.base == fp && inst.src1.index == -1 && a_count < MAX_ALLOCA_TRACK) {
+            val vid: i32 = inst.dst.reg;
+            if (vid >= 32) {
+                a_vregs[a_count] = vid;
+                a_offs[a_count] = inst.src1.disp;
+                a_used[a_count] = false;
+                a_count = a_count + 1;
+            }
+        }
+        pos = pos + 1;
+    }
+
+    if (a_count == 0) {
+        allocator.deallocate[i32](alloc, a_vregs, MAX_ALLOCA_TRACK::usize);
+        allocator.deallocate[i32](alloc, a_offs, MAX_ALLOCA_TRACK::usize);
+        allocator.deallocate[bool](alloc, a_used, MAX_ALLOCA_TRACK::usize);
+        ret;
+    }
+
+    pos = 0;
+    for (pos < buf.count) {
+        val inst: *isa.Inst = ?buf.insts[pos];
+        var ai: i32 = 0;
+        for (ai < a_count) {
+            val vid: i32 = a_vregs[ai];
+            if (inst.src1.kind == isa.OPK_REG && inst.src1.reg == vid) { a_used[ai] = true; }
+            if (inst.src2.kind == isa.OPK_REG && inst.src2.reg == vid) { a_used[ai] = true; }
+            if (inst.src1.kind == isa.OPK_MEM && (inst.src1.base == vid || inst.src1.index == vid)) { a_used[ai] = true; }
+            if (inst.src2.kind == isa.OPK_MEM && (inst.src2.base == vid || inst.src2.index == vid)) { a_used[ai] = true; }
+            if (inst.dst.kind == isa.OPK_MEM && (inst.dst.base == vid || inst.dst.index == vid)) { a_used[ai] = true; }
+            if (inst.opcode == isa.ISA_PCOPY && inst.src1.kind == isa.OPK_REG && inst.src1.reg == vid) { a_used[ai] = true; }
+            ai = ai + 1;
+        }
+        pos = pos + 1;
+    }
+
+
+    var new_buf: isa.InstBuf = isa.buf_init(alloc);
+    pos = 0;
+    for (pos < buf.count) {
+        isa.buf_append(?new_buf, buf.insts[pos]);
+
+        val inst: *isa.Inst = ?buf.insts[pos];
+        if ((inst.src1.kind == isa.OPK_MEM || inst.dst.kind == isa.OPK_MEM) &&
+            inst.opcode != isa.ISA_LABEL && inst.opcode != isa.ISA_PCOPY &&
+            inst.opcode != isa.ISA_PCOPY_FENCE && inst.opcode != isa.ISA_USE) {
+            var mem_base: i32 = -1;
+            var mem_disp: i32 = 0;
+            if (inst.src1.kind == isa.OPK_MEM && inst.src1.base == fp) {
+                mem_base = fp;
+                mem_disp = inst.src1.disp;
+            }
+            if (inst.dst.kind == isa.OPK_MEM && inst.dst.base == fp) {
+                mem_base = fp;
+                mem_disp = inst.dst.disp;
+            }
+            if (mem_base == fp) {
+                var ai: i32 = 0;
+                for (ai < a_count) {
+                    if (a_used[ai] && a_offs[ai] == mem_disp) {
+                        var use_inst: isa.Inst;
+                        use_inst.clobbers = 0;
+                        use_inst.opcode = isa.ISA_USE;
+                        use_inst.dst.kind = 0;
+                        use_inst.src1 = isa.make_reg(a_vregs[ai], 8);
+                        use_inst.src2.kind = 0;
+                        use_inst.size = 0;
+                        use_inst.flags = 0;
+                        use_inst.src_line = inst.src_line;
+                        use_inst.src_file = inst.src_file;
+                        isa.buf_append(?new_buf, use_inst);
+                        ai = a_count;
+                    }
+                    ai = ai + 1;
+                }
+            }
+        }
+        pos = pos + 1;
+    }
+
+    isa.buf_dnit(buf);
+    @buf = new_buf;
+
+    allocator.deallocate[i32](alloc, a_vregs, MAX_ALLOCA_TRACK::usize);
+    allocator.deallocate[i32](alloc, a_offs, MAX_ALLOCA_TRACK::usize);
+    allocator.deallocate[bool](alloc, a_used, MAX_ALLOCA_TRACK::usize);
 }
 
 fun resolve_sym_labels(module: *ir.Module, buf: *isa.InstBuf) {
@@ -515,6 +634,17 @@ fun compute_block_use_def(insts: *isa.InstBuf, start: i32, end: i32,
         val inst: *isa.Inst = ?insts.insts[pos];
 
         if (inst.opcode == isa.ISA_LABEL || inst.opcode == isa.ISA_PCOPY_FENCE) {
+            pos = pos + 1;
+            cnt;
+        }
+
+        if (inst.opcode == isa.ISA_USE) {
+            if (inst.src1.kind == isa.OPK_REG) {
+                val uid: i32 = inst.src1.reg;
+                if (uid >= VREG_BASE && !mcfg.regset_test(def_set, uid)) {
+                    mcfg.regset_set(use_set, uid);
+                }
+            }
             pos = pos + 1;
             cnt;
         }
