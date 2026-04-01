@@ -1,0 +1,699 @@
+# mach.compiler.mir.opt.mem2reg: promote alloca+load+store to SSA values
+#
+# the standard mem2reg pass. identifies alloca instructions whose address
+# is only used by loads and stores (not taken, not passed to calls, not
+# used in field_ptr/index_ptr/copy). for those allocas, replaces loads
+# with the reaching definition and stores with direct value flow. at
+# control-flow join points, inserts block parameters (SSA phi equivalent).
+#
+# this eliminates the alloca vreg visibility problem: after mem2reg,
+# promoted locals are direct SSA values that the regalloc can see and
+# track through the entire function. only non-promotable allocas
+# (address-taken, aggregates) keep the alloca+load+store pattern.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use allocator: std.allocator;
+use type:      mach.compiler.sema.type;
+use op:        mach.compiler.mir.op;
+use ir:        mach.compiler.mir.ir;
+
+val MAX_PROMOTABLE: u32 = 256;
+val MAX_USES:       u32 = 256;
+
+pub fun run(func: *ir.Function, alloc: *allocator.Allocator) bool {
+    if (func == nil || func.block_count == 0 || func.inst_count == 0) { ret false; }
+
+    val res_alloca_vals: Result[*ir.ValueId, str] = allocator.allocate[ir.ValueId](alloc, MAX_PROMOTABLE::usize);
+    val res_alloca_tids: Result[*type.TypeId, str] = allocator.allocate[type.TypeId](alloc, MAX_PROMOTABLE::usize);
+    val res_promotable: Result[*bool, str] = allocator.allocate[bool](alloc, MAX_PROMOTABLE::usize);
+    if (is_err[*ir.ValueId, str](res_alloca_vals) || is_err[*type.TypeId, str](res_alloca_tids) ||
+        is_err[*bool, str](res_promotable)) { ret false; }
+    val alloca_vals: *ir.ValueId = unwrap_ok[*ir.ValueId, str](res_alloca_vals);
+    val alloca_tids: *type.TypeId = unwrap_ok[*type.TypeId, str](res_alloca_tids);
+    val promotable: *bool = unwrap_ok[*bool, str](res_promotable);
+    var alloca_count: u32 = 0;
+
+    var bi: u32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+            if (inst.op == op.OP_ALLOCA && alloca_count < MAX_PROMOTABLE) {
+                alloca_vals[alloca_count] = inst.result;
+                alloca_tids[alloca_count] = type.TYPE_NIL;
+                promotable[alloca_count] = true;
+                alloca_count = alloca_count + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    if (alloca_count == 0) {
+        allocator.deallocate[ir.ValueId](alloc, alloca_vals, MAX_PROMOTABLE::usize);
+        allocator.deallocate[type.TypeId](alloc, alloca_tids, MAX_PROMOTABLE::usize);
+        allocator.deallocate[bool](alloc, promotable, MAX_PROMOTABLE::usize);
+        ret false;
+    }
+
+    bi = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+            var ai: u16 = 0;
+            for (ai < inst.arg_count) {
+                val arg: ir.ValueId = ir.inst_arg(func, inst, ai);
+                var ci: u32 = 0;
+                for (ci < alloca_count) {
+                    if (arg::u32 == alloca_vals[ci]::u32 && promotable[ci]) {
+                        if (inst.op == op.OP_LOAD && ai == 0) {
+                            # ok: load from alloca
+                        } or (inst.op == op.OP_STORE && ai == 0) {
+                            # ok: store to alloca — record the stored type
+                            if (inst.arg_count > 1) {
+                                val stored: ir.ValueId = ir.inst_arg(func, inst, 1);
+                                if (stored::u32 < func.value_count) {
+                                    alloca_tids[ci] = func.values[stored::u32].type_id;
+                                }
+                            }
+                        } or {
+                            # any other use (copy, call arg, field_ptr, etc.) → not promotable
+                            promotable[ci] = false;
+                        }
+                    }
+                    ci = ci + 1;
+                }
+                ai = ai + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    var changed: bool = false;
+
+    val orig_value_count: u32 = func.value_count;
+    val res_vmap: Result[*ir.ValueId, str] = allocator.allocate[ir.ValueId](alloc, func.value_count::usize);
+    if (is_err[*ir.ValueId, str](res_vmap)) {
+        allocator.deallocate[ir.ValueId](alloc, alloca_vals, MAX_PROMOTABLE::usize);
+        allocator.deallocate[type.TypeId](alloc, alloca_tids, MAX_PROMOTABLE::usize);
+        allocator.deallocate[bool](alloc, promotable, MAX_PROMOTABLE::usize);
+        ret false;
+    }
+    val vmap: *ir.ValueId = unwrap_ok[*ir.ValueId, str](res_vmap);
+    var vi: u32 = 0;
+    for (vi < func.value_count) {
+        vmap[vi] = vi::ir.ValueId;
+        vi = vi + 1;
+    }
+
+    val res_dead: Result[*bool, str] = allocator.allocate[bool](alloc, func.inst_count::usize);
+    if (is_err[*bool, str](res_dead)) {
+        allocator.deallocate[ir.ValueId](alloc, vmap, func.value_count::usize);
+        allocator.deallocate[ir.ValueId](alloc, alloca_vals, MAX_PROMOTABLE::usize);
+        allocator.deallocate[type.TypeId](alloc, alloca_tids, MAX_PROMOTABLE::usize);
+        allocator.deallocate[bool](alloc, promotable, MAX_PROMOTABLE::usize);
+        ret false;
+    }
+    val dead: *bool = unwrap_ok[*bool, str](res_dead);
+    var di: u32 = 0;
+    for (di < func.inst_count) { dead[di] = false; di = di + 1; }
+
+    var ci: u32 = 0;
+    for (ci < alloca_count) {
+        if (!promotable[ci]) { ci = ci + 1; cnt; }
+        if (promote_single_block(func, alloca_vals[ci], vmap, dead)) {
+            changed = true;
+            promotable[ci] = false;
+        }
+        ci = ci + 1;
+    }
+
+    ci = 0;
+    for (ci < alloca_count) {
+        if (!promotable[ci]) { ci = ci + 1; cnt; }
+        if (false) {
+            changed = true;
+        }
+        ci = ci + 1;
+    }
+
+    if (changed) {
+        apply_vmap(func, vmap, orig_value_count);
+        compact_blocks(func, dead);
+    }
+
+    allocator.deallocate[bool](alloc, dead, func.inst_count::usize);
+    allocator.deallocate[ir.ValueId](alloc, vmap, orig_value_count::usize);
+    allocator.deallocate[ir.ValueId](alloc, alloca_vals, MAX_PROMOTABLE::usize);
+    allocator.deallocate[type.TypeId](alloc, alloca_tids, MAX_PROMOTABLE::usize);
+    allocator.deallocate[bool](alloc, promotable, MAX_PROMOTABLE::usize);
+    ret changed;
+}
+
+# promote_single_block: fast path for allocas used entirely within one block.
+# walks the block linearly, replacing each load with the most recent store value.
+# returns true if any loads were replaced.
+fun promote_single_block(func: *ir.Function, alloca_val: ir.ValueId,
+                          vmap: *ir.ValueId, dead: *bool) bool {
+    var def_block: u32 = 0xFFFFFFFF;
+    var all_same_block: bool = true;
+
+    var bi: u32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+
+            var uses_alloca: bool = false;
+            if (inst.op == op.OP_ALLOCA && inst.result::u32 == alloca_val::u32) {
+                uses_alloca = true;
+            }
+            if (inst.op == op.OP_LOAD || inst.op == op.OP_STORE) {
+                if (inst.arg_count > 0 && ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                    uses_alloca = true;
+                }
+            }
+
+            if (uses_alloca) {
+                if (def_block == 0xFFFFFFFF) {
+                    def_block = bi;
+                } or (def_block != bi) {
+                    all_same_block = false;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    if (!all_same_block || def_block == 0xFFFFFFFF) { ret false; }
+
+    val block: *ir.Block = ?func.blocks[def_block];
+    var reaching: ir.ValueId = ir.VALUE_NONE;
+    var promoted: bool = false;
+
+    var ii: u32 = 0;
+    for (ii < block.inst_count) {
+        val inst_id: ir.InstId = block.insts[ii];
+        if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+        val inst: *ir.Inst = ?func.insts[inst_id::u32];
+
+        if (inst.op == op.OP_ALLOCA && inst.result::u32 == alloca_val::u32) {
+            dead[inst_id::u32] = true;
+            promoted = true;
+        }
+        if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
+            ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+            if (inst.arg_count > 1) {
+                reaching = ir.inst_arg(func, inst, 1);
+            }
+            dead[inst_id::u32] = true;
+            promoted = true;
+        }
+        if (inst.op == op.OP_LOAD && inst.arg_count > 0 &&
+            ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+            if (reaching::u32 != ir.VALUE_NONE::u32) {
+                vmap[inst.result::u32] = reaching;
+            }
+            dead[inst_id::u32] = true;
+            promoted = true;
+        }
+
+        ii = ii + 1;
+    }
+
+    ret promoted;
+}
+
+# promote_single_store: promote an alloca with exactly one store across blocks.
+#
+# for val declarations (immutable), there's exactly one store (the init).
+# the stored value directly replaces all loads. no block parameters needed
+# because the value is the same on all paths.
+fun promote_single_store(func: *ir.Function, alloca_val: ir.ValueId,
+                          vmap: *ir.ValueId, dead: *bool) bool {
+    var store_count: u32 = 0;
+    var stored_val: ir.ValueId = ir.VALUE_NONE;
+    var alloca_inst: ir.InstId = ir.INST_NONE;
+    var store_block: u32 = 0xFFFFFFFF;
+
+    var bi: u32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+            if (inst.op == op.OP_ALLOCA && inst.result::u32 == alloca_val::u32) {
+                alloca_inst = inst_id;
+            }
+            if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
+                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                store_count = store_count + 1;
+                store_block = bi;
+                if (inst.arg_count > 1) {
+                    stored_val = ir.inst_arg(func, inst, 1);
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    # only promote if single store is in the entry block (dominates all loads)
+    if (store_count != 1 || stored_val::u32 == ir.VALUE_NONE::u32 || store_block != 0) { ret false; }
+
+    var promoted: bool = false;
+    bi = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+            if (inst.op == op.OP_ALLOCA && inst.result::u32 == alloca_val::u32) {
+                dead[inst_id::u32] = true;
+                promoted = true;
+            }
+            if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
+                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                dead[inst_id::u32] = true;
+                promoted = true;
+            }
+            if (inst.op == op.OP_LOAD && inst.arg_count > 0 &&
+                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                if (inst.result::u32 < func.value_count) {
+                    vmap[inst.result::u32] = stored_val;
+                }
+                dead[inst_id::u32] = true;
+                promoted = true;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    ret promoted;
+}
+
+val MAX_BLOCKS: u32 = 512;
+
+# promote_multi_block: promote an alloca used across multiple blocks.
+#
+# for each block that has a predecessor with a store, a block parameter is
+# inserted so the value flows through the CFG. the algorithm:
+# 1. find blocks that contain stores → "def blocks"
+# 2. find blocks that need the value from a predecessor → insert block params
+# 3. walk blocks in order, threading the reaching definition through branches
+fun promote_multi_block(func: *ir.Function, alloc: *allocator.Allocator,
+                         alloca_val: ir.ValueId, alloca_tid: type.TypeId,
+                         vmap: *ir.ValueId, dead: *bool, vmap_size: u32) bool {
+    val bc: u32 = func.block_count;
+    if (bc > MAX_BLOCKS) { ret false; }
+
+    val res_has_store: Result[*bool, str] = allocator.allocate[bool](alloc, bc::usize);
+    val res_has_load: Result[*bool, str] = allocator.allocate[bool](alloc, bc::usize);
+    val res_reaching: Result[*ir.ValueId, str] = allocator.allocate[ir.ValueId](alloc, bc::usize);
+    val res_need_param: Result[*bool, str] = allocator.allocate[bool](alloc, bc::usize);
+    val res_param_vid: Result[*ir.ValueId, str] = allocator.allocate[ir.ValueId](alloc, bc::usize);
+    if (is_err[*bool, str](res_has_store) || is_err[*bool, str](res_has_load) ||
+        is_err[*ir.ValueId, str](res_reaching) || is_err[*bool, str](res_need_param) ||
+        is_err[*ir.ValueId, str](res_param_vid)) { ret false; }
+    val has_store: *bool = unwrap_ok[*bool, str](res_has_store);
+    val has_load: *bool = unwrap_ok[*bool, str](res_has_load);
+    val reaching: *ir.ValueId = unwrap_ok[*ir.ValueId, str](res_reaching);
+    val need_param: *bool = unwrap_ok[*bool, str](res_need_param);
+    val param_vid: *ir.ValueId = unwrap_ok[*ir.ValueId, str](res_param_vid);
+
+    var bi: u32 = 0;
+    for (bi < bc) {
+        has_store[bi] = false;
+        has_load[bi] = false;
+        reaching[bi] = ir.VALUE_NONE;
+        need_param[bi] = false;
+        param_vid[bi] = ir.VALUE_NONE;
+        bi = bi + 1;
+    }
+
+    bi = 0;
+    for (bi < bc) {
+        val block: *ir.Block = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+            if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
+                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                has_store[bi] = true;
+            }
+            if (inst.op == op.OP_LOAD && inst.arg_count > 0 &&
+                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                has_load[bi] = true;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    # determine which blocks need a block parameter: any block with >1 predecessor
+    # where a predecessor has a store or already has a reaching definition.
+    # iterate until stable (handles loops).
+    var iter: u32 = 0;
+    var param_changed: bool = true;
+    for (param_changed && iter < bc + 2) {
+        param_changed = false;
+        bi = 0;
+        for (bi < bc) {
+            val block: *ir.Block = ?func.blocks[bi];
+            if (block.inst_count == 0) { bi = bi + 1; cnt; }
+
+            var pred_count: u32 = 0;
+            var pred_has_def: bool = false;
+            var bj: u32 = 0;
+            for (bj < bc) {
+                val pblock: *ir.Block = ?func.blocks[bj];
+                if (pblock.inst_count == 0) { bj = bj + 1; cnt; }
+                val last_id: ir.InstId = pblock.insts[pblock.inst_count - 1];
+                if (last_id::u32 >= func.inst_count) { bj = bj + 1; cnt; }
+                val last: *ir.Inst = ?func.insts[last_id::u32];
+                var is_pred: bool = false;
+                if (last.target::u32 == bi) { is_pred = true; }
+                if (last.else_target::u32 == bi) { is_pred = true; }
+                if (is_pred) {
+                    pred_count = pred_count + 1;
+                    if (has_store[bj] || need_param[bj] || (bj == 0 && has_load[bi])) {
+                        pred_has_def = true;
+                    }
+                }
+                bj = bj + 1;
+            }
+
+            if (pred_count > 1 && (has_load[bi] || pred_has_def) && !need_param[bi]) {
+                need_param[bi] = true;
+                param_changed = true;
+            }
+            bi = bi + 1;
+        }
+        iter = iter + 1;
+    }
+
+    # insert block parameters
+    var tid: type.TypeId = alloca_tid;
+    if (tid::u32 == type.TYPE_NIL::u32) { tid = type.TK_U64::type.TypeId; }
+
+    bi = 0;
+    for (bi < bc) {
+        if (need_param[bi]) {
+            val vid: ir.ValueId = add_block_param(func, alloc, bi::ir.BlockId, tid);
+            if (vid::u32 != ir.VALUE_NONE::u32) {
+                param_vid[bi] = vid;
+            } or {
+                need_param[bi] = false;
+            }
+        }
+        bi = bi + 1;
+    }
+
+    # rename: walk blocks in order, maintaining reaching definition
+    var promoted: bool = false;
+
+    bi = 0;
+    for (bi < bc) {
+        var cur_reaching: ir.ValueId = ir.VALUE_NONE;
+
+        # if this block has a param we inserted, that's the reaching def
+        if (need_param[bi] && param_vid[bi]::u32 != ir.VALUE_NONE::u32) {
+            cur_reaching = param_vid[bi];
+        }
+
+        # scan predecessors for their reaching defs
+        if (cur_reaching::u32 == ir.VALUE_NONE::u32) {
+            var bj: u32 = 0;
+            for (bj < bi) {
+                if (reaching[bj]::u32 != ir.VALUE_NONE::u32) {
+                    val pblock: *ir.Block = ?func.blocks[bj];
+                    if (pblock.inst_count > 0) {
+                        val last_id: ir.InstId = pblock.insts[pblock.inst_count - 1];
+                        if (last_id::u32 < func.inst_count) {
+                            val last: *ir.Inst = ?func.insts[last_id::u32];
+                            if (last.target::u32 == bi || last.else_target::u32 == bi) {
+                                cur_reaching = reaching[bj];
+                            }
+                        }
+                    }
+                }
+                bj = bj + 1;
+            }
+        }
+
+        val block: *ir.Block = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+
+            if (inst.op == op.OP_ALLOCA && inst.result::u32 == alloca_val::u32) {
+                dead[inst_id::u32] = true;
+                promoted = true;
+            }
+            if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
+                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                if (inst.arg_count > 1) {
+                    cur_reaching = ir.inst_arg(func, inst, 1);
+                }
+                dead[inst_id::u32] = true;
+                promoted = true;
+            }
+            if (inst.op == op.OP_LOAD && inst.arg_count > 0 &&
+                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                if (cur_reaching::u32 != ir.VALUE_NONE::u32 &&
+                    inst.result::u32 < vmap_size) {
+                    vmap[inst.result::u32] = cur_reaching;
+                    dead[inst_id::u32] = true;
+                    promoted = true;
+                }
+            }
+
+            ii = ii + 1;
+        }
+
+        reaching[bi] = cur_reaching;
+
+        # add reaching def as branch arg to successor blocks that have params
+        if (cur_reaching::u32 != ir.VALUE_NONE::u32 && block.inst_count > 0) {
+            val last_id: ir.InstId = block.insts[block.inst_count - 1];
+            if (last_id::u32 < func.inst_count) {
+                val last: *ir.Inst = ?func.insts[last_id::u32];
+                if (last.op == op.OP_BR && last.target::u32 < bc) {
+                    if (need_param[last.target::u32]) {
+                        add_branch_arg(func, alloc, last, cur_reaching);
+                    }
+                }
+                if (last.op == op.OP_COND_BR) {
+                    val add_then: bool = last.target::u32 < bc && need_param[last.target::u32];
+                    val add_else: bool = last.else_target::u32 < bc && need_param[last.else_target::u32];
+                    if (add_then || add_else) {
+                        add_cond_br_args(func, alloc, last, cur_reaching, add_then, add_else);
+                    }
+                }
+            }
+        }
+
+        bi = bi + 1;
+    }
+
+    allocator.deallocate[ir.ValueId](alloc, param_vid, bc::usize);
+    allocator.deallocate[bool](alloc, need_param, bc::usize);
+    allocator.deallocate[ir.ValueId](alloc, reaching, bc::usize);
+    allocator.deallocate[bool](alloc, has_load, bc::usize);
+    allocator.deallocate[bool](alloc, has_store, bc::usize);
+    ret promoted;
+}
+
+# add_block_param: add a block parameter directly on the Function (not via builder)
+fun add_block_param(func: *ir.Function, alloc: *allocator.Allocator,
+                     block_id: ir.BlockId, tid: type.TypeId) ir.ValueId {
+    if (block_id::u32 >= func.block_count) { ret ir.VALUE_NONE; }
+    val block: *ir.Block = ?func.blocks[block_id::u32];
+
+    if (block.param_count >= block.param_cap) {
+        var new_cap: u32 = block.param_cap * 2;
+        if (block.param_cap == 0) { new_cap = 4; }
+        val res: Result[*ir.BlockParam, str] = allocator.reallocate[ir.BlockParam](
+            alloc, block.params, block.param_cap::usize, new_cap::usize);
+        if (is_err[*ir.BlockParam, str](res)) { ret ir.VALUE_NONE; }
+        block.params = unwrap_ok[*ir.BlockParam, str](res);
+        block.param_cap = new_cap;
+    }
+
+    # allocate a new value
+    if (func.value_count >= func.value_cap) {
+        var new_cap: u32 = func.value_cap * 2;
+        if (func.value_cap == 0) { new_cap = 64; }
+        val res: Result[*ir.Value, str] = allocator.reallocate[ir.Value](
+            alloc, func.values, func.value_cap::usize, new_cap::usize);
+        if (is_err[*ir.Value, str](res)) { ret ir.VALUE_NONE; }
+        func.values = unwrap_ok[*ir.Value, str](res);
+        func.value_cap = new_cap;
+    }
+    val vid: ir.ValueId = func.value_count::ir.ValueId;
+    func.values[func.value_count].kind = ir.VK_BLOCK_PARAM;
+    func.values[func.value_count].type_id = tid;
+    func.values[func.value_count].def_inst = ir.INST_NONE;
+    func.values[func.value_count].block = block_id;
+    func.values[func.value_count].param_idx = block.param_count::u16;
+    func.value_count = func.value_count + 1;
+
+    block.params[block.param_count].value = vid;
+    block.params[block.param_count].type_id = tid;
+    block.param_count = block.param_count + 1;
+    ret vid;
+}
+
+# grow the args pool and append a value
+fun push_arg(func: *ir.Function, alloc: *allocator.Allocator, val_: ir.ValueId) u32 {
+    if (func.arg_count >= func.arg_cap) {
+        var new_cap: u32 = func.arg_cap * 2;
+        if (func.arg_cap == 0) { new_cap = 64; }
+        val res: Result[*ir.ValueId, str] = allocator.reallocate[ir.ValueId](
+            alloc, func.args, func.arg_cap::usize, new_cap::usize);
+        if (is_err[*ir.ValueId, str](res)) { ret 0xFFFFFFFF; }
+        func.args = unwrap_ok[*ir.ValueId, str](res);
+        func.arg_cap = new_cap;
+    }
+    val pos: u32 = func.arg_count;
+    func.args[pos] = val_;
+    func.arg_count = pos + 1;
+    ret pos;
+}
+
+# add_branch_arg: append one arg to a BR instruction's arg list
+fun add_branch_arg(func: *ir.Function, alloc: *allocator.Allocator,
+                    inst: *ir.Inst, val_: ir.ValueId) {
+    if (inst.op != op.OP_BR) { ret; }
+    # copy existing args + new arg to end of pool
+    val new_start: u32 = func.arg_count;
+    var i: u16 = 0;
+    for (i < inst.arg_count) {
+        push_arg(func, alloc, ir.inst_arg(func, inst, i));
+        i = i + 1;
+    }
+    push_arg(func, alloc, val_);
+    inst.arg_start = new_start;
+    inst.arg_count = inst.arg_count + 1;
+}
+
+# add_cond_br_args: atomically append args to cond_br then/else targets.
+# handles the case where both targets need params without stale flags.
+fun add_cond_br_args(func: *ir.Function, alloc: *allocator.Allocator,
+                      inst: *ir.Inst, val_: ir.ValueId,
+                      add_then: bool, add_else: bool) {
+    if (inst.op != op.OP_COND_BR) { ret; }
+    val then_count: u16 = inst.flags;
+    val total: u16 = inst.arg_count;
+    val else_count: u16 = total - 1 - then_count;
+
+    val new_start: u32 = func.arg_count;
+    push_arg(func, alloc, ir.inst_arg(func, inst, 0));
+
+    var i: u16 = 0;
+    for (i < then_count) {
+        push_arg(func, alloc, ir.inst_arg(func, inst, 1 + i));
+        i = i + 1;
+    }
+    if (add_then) { push_arg(func, alloc, val_); }
+
+    i = 0;
+    for (i < else_count) {
+        push_arg(func, alloc, ir.inst_arg(func, inst, 1 + then_count + i));
+        i = i + 1;
+    }
+    if (add_else) { push_arg(func, alloc, val_); }
+
+    var added: u16 = 0;
+    if (add_then) { added = added + 1; }
+    if (add_else) { added = added + 1; }
+
+    inst.arg_start = new_start;
+    inst.arg_count = total + added;
+    if (add_then) { inst.flags = then_count + 1; }
+}
+
+# apply_vmap: replace all value references using the replacement map.
+# resolves transitive chains first (A→B, B→C becomes A→C).
+fun apply_vmap(func: *ir.Function, vmap: *ir.ValueId, vmap_size: u32) {
+    var ri: u32 = 0;
+    for (ri < vmap_size) {
+        var v: ir.ValueId = vmap[ri];
+        var depth: u32 = 0;
+        for (v::u32 < vmap_size && vmap[v::u32]::u32 != v::u32 && depth < 16) {
+            v = vmap[v::u32];
+            depth = depth + 1;
+        }
+        vmap[ri] = v;
+        ri = ri + 1;
+    }
+
+    var bi: u32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+            var ai: u32 = 0;
+            for (ai < inst.arg_count::u32) {
+                val pos: u32 = inst.arg_start + ai;
+                if (pos < func.arg_count) {
+                    val old: ir.ValueId = func.args[pos];
+                    if (old::u32 < vmap_size && vmap[old::u32]::u32 != old::u32) {
+                        func.args[pos] = vmap[old::u32];
+                    }
+                }
+                ai = ai + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+# compact_blocks: remove dead instructions from each block's inst list.
+fun compact_blocks(func: *ir.Function, dead: *bool) {
+    var bi: u32 = 0;
+    for (bi < func.block_count) {
+        val block: *ir.Block = ?func.blocks[bi];
+        var write: u32 = 0;
+        var read: u32 = 0;
+        for (read < block.inst_count) {
+            val inst_id: ir.InstId = block.insts[read];
+            if (inst_id::u32 < func.inst_count && !dead[inst_id::u32]) {
+                block.insts[write] = inst_id;
+                write = write + 1;
+            }
+            read = read + 1;
+        }
+        block.inst_count = write;
+        bi = bi + 1;
+    }
+}
