@@ -1024,13 +1024,14 @@ fun run_linear_scan(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
     ret true;
 }
 
-fun apply_hints_from_pass1(new_ranges: *LiveRange, new_count: i32,
-                           old_ranges: *LiveRange, old_count: i32) {
+fun precolor_from_pass1(new_ranges: *LiveRange, new_count: i32,
+                        old_ranges: *LiveRange, old_count: i32) {
     var ni: i32 = 0;
     for (ni < new_count) {
         var oi: i32 = 0;
         for (oi < old_count) {
             if (old_ranges[oi].vreg == new_ranges[ni].vreg && old_ranges[oi].preg >= 0) {
+                new_ranges[ni].preg = old_ranges[oi].preg;
                 new_ranges[ni].hint = old_ranges[oi].preg;
                 oi = old_count;
             }
@@ -1038,6 +1039,81 @@ fun apply_hints_from_pass1(new_ranges: *LiveRange, new_count: i32,
         }
         ni = ni + 1;
     }
+}
+
+fun run_linear_scan_pass2(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
+                          insts: *isa.InstBuf, ranges: *LiveRange, range_count: i32,
+                          call_positions: *i32, call_count: i32,
+                          local_size: usize,
+                          callee_mask: *u32, spill_offset: *usize) bool {
+    val gp_reg_count: i32 = i.gp_count;
+    val fp_reg_count: i32 = i.fp_count;
+    val res_gp: Result[*bool, str] = allocator.allocate[bool](alloc, gp_reg_count::usize);
+    val res_fp: Result[*bool, str] = allocator.allocate[bool](alloc, fp_reg_count::usize);
+    if (is_err[*bool, str](res_gp) || is_err[*bool, str](res_fp)) { ret false; }
+    var gp_free: *bool = unwrap_ok[*bool, str](res_gp);
+    var fp_free: *bool = unwrap_ok[*bool, str](res_fp);
+
+    var gi: i32 = 0;
+    for (gi < gp_reg_count) { gp_free[gi] = true; gi = gi + 1; }
+    var fi: i32 = 0;
+    for (fi < fp_reg_count) { fp_free[fi] = true; fi = fi + 1; }
+    gp_free[i.stack_reg] = false;
+    gp_free[i.frame_reg] = false;
+    gp_free[i.scratch_reg] = false;
+
+    val res_active: Result[*ActiveEntry, str] = allocator.allocate[ActiveEntry](alloc, MAX_ACTIVE::usize);
+    if (is_err[*ActiveEntry, str](res_active)) {
+        allocator.deallocate[bool](alloc, fp_free, fp_reg_count::usize);
+        allocator.deallocate[bool](alloc, gp_free, gp_reg_count::usize);
+        ret false;
+    }
+    var active: *ActiveEntry = unwrap_ok[*ActiveEntry, str](res_active);
+    var active_count: i32 = 0;
+
+    reserve_param_registers(insts, active, ?active_count, gp_free, a, gp_reg_count);
+
+    var ri: i32 = 0;
+    for (ri < range_count) {
+        expire_old(active, ?active_count, gp_free, fp_free, gp_reg_count, fp_reg_count, ranges[ri].start);
+
+        if (ranges[ri].preg >= 0) {
+            val preg: i32 = ranges[ri].preg;
+            if (preg < gp_reg_count && gp_free[preg]) {
+                gp_free[preg] = false;
+            }
+            add_active(active, ?active_count, ri, preg, ranges[ri].end_pos, ranges[ri].reg_class);
+            if (is_callee_saved(a, preg)) {
+                @callee_mask = @callee_mask | (1 << (preg::u32));
+            }
+        } or {
+            var preg: i32 = -1;
+            if (ranges[ri].crosses_call) {
+                preg = try_alloc_reg_callee(gp_free, fp_free, ranges[ri].reg_class, i, a, ranges[ri].hint);
+            } or {
+                preg = try_alloc_reg(gp_free, fp_free, ranges[ri].reg_class, i, a, ranges[ri].hint);
+            }
+            if (preg >= 0) {
+                ranges[ri].preg = preg;
+                add_active(active, ?active_count, ri, preg, ranges[ri].end_pos, ranges[ri].reg_class);
+                if (is_callee_saved(a, preg)) {
+                    @callee_mask = @callee_mask | (1 << (preg::u32));
+                }
+            } or {
+                var slot_size: usize = ranges[ri].size::usize;
+                if (slot_size < 8) { slot_size = 8; }
+                @spill_offset = align_up(@spill_offset + slot_size, 8);
+                ranges[ri].spilled = true;
+                ranges[ri].spill_off = (@spill_offset)::i64;
+            }
+        }
+        ri = ri + 1;
+    }
+
+    allocator.deallocate[ActiveEntry](alloc, active, MAX_ACTIVE::usize);
+    allocator.deallocate[bool](alloc, fp_free, fp_reg_count::usize);
+    allocator.deallocate[bool](alloc, gp_free, gp_reg_count::usize);
+    ret true;
 }
 
 pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
@@ -1171,7 +1247,7 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
     extend_alloca_for_frame_access(?spill_buf, ranges, range_count, i);
 
     if (old_ranges != nil) {
-        apply_hints_from_pass1(ranges, range_count, old_ranges, old_count);
+        precolor_from_pass1(ranges, range_count, old_ranges, old_count);
         allocator.deallocate[LiveRange](alloc, old_ranges, old_count::usize);
     }
 
@@ -1186,8 +1262,8 @@ pub fun alloc_function(alloc: *allocator.Allocator, i: *isa.ISA, a: *abi.ABI,
 
     callee_mask = 0;
     spill_offset = local_size;
-    if (!run_linear_scan(alloc, i, a, ?spill_buf, ranges, range_count,
-                         call_positions, call_count, local_size, ?callee_mask, ?spill_offset)) {
+    if (!run_linear_scan_pass2(alloc, i, a, ?spill_buf, ranges, range_count,
+                               call_positions, call_count, local_size, ?callee_mask, ?spill_offset)) {
         isa.buf_dnit(?spill_buf);
         allocator.deallocate[i32](alloc, call_positions, MAX_CALLS::usize);
         allocator.deallocate[LiveRange](alloc, ranges, MAX_RANGES::usize);
