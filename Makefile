@@ -44,7 +44,7 @@ $(SMACH): $(IMACH) | $(BIN)
 $(MACH): $(SMACH)
 	@rm -rf $(OUT)/linux
 	@echo "  smach -> mach"
-	@$(SMACH) build . --emit-asm --emit-ir
+	@$(SMACH) build .
 
 $(BIN):
 	@mkdir -p $@
