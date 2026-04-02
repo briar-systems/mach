@@ -39,12 +39,12 @@ $(IMACH): $(CMACH) | $(BIN)
 $(SMACH): $(IMACH) | $(BIN)
 	@rm -rf $(OUT)/smach
 	@echo "  imach -> smach"
-	@$(IMACH) build . -o $@ --artifacts smach/linux --emit-asm
+	@$(IMACH) build . -o $@ --artifacts smach/linux --emit-asm --emit-ir
 
 $(MACH): $(SMACH)
 	@rm -rf $(OUT)/linux
 	@echo "  smach -> mach"
-	@$(SMACH) build . --emit-asm
+	@$(SMACH) build . --emit-asm --emit-ir
 
 $(BIN):
 	@mkdir -p $@
