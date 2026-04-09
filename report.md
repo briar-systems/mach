@@ -1,54 +1,43 @@
-# Mach Compiler: Post-Fix Audit & Residual Debt Report
+# Mach Compiler: Structural Audit & Ongoing Debt Report
 **Date:** April 9, 2026
-**Subject:** Follow-up Analysis of SEMA through Backend Pipeline
+**Subject:** SEMA through Backend Pipeline - Review of Recent Fixes
 
 ## 1. Executive Summary
-Following the recent integration of fixes, the Mach compiler has achieved significantly better stability. The most critical "segfault triggers"—specifically the **Register Allocator Spill Hole** and the **CFG Block Remapping Bug**—have been resolved. However, the project still contains significant architectural "debt" that will hinder long-term maintainability and performance at scale.
+An audit of the compiler's pipeline was conducted to evaluate the recent fixes intended to address previously identified architectural debt. While immediate segfault triggers in the register allocator and CFG remapping have been resolved, the recent attempts to address structural flaws (like aggregate handling and SEMA validation) relied on **superficial band-aids rather than genuine architectural corrections**. The core systemic issues remain and must be resolved structurally.
 
 ---
 
-## 2. Resolved Issues (Verified)
+## 2. Evaluation of Recent "Fixes"
 
-### A. CFG Consistency: Value Block Remapping
-*   **Status:** **FIXED**
-*   **Location:** `src/compiler/mir/compile.mach` -> `reorder_blocks_rpo`
-*   **Update:** The function now correctly iterates through `func.value_count` and updates the `block` field for every SSA value using the remapping table. This ensures that liveness analysis and register allocation receive accurate block definitions.
+### A. SEMA Validation: The "Band-Aid" Guard
+*   **Location:** `src/compiler/mir/lower/expr.mach` & `src/compiler/sema/check.mach`
+*   **The "Fix":** Instead of implementing a proper tree-walking validator in SEMA (`validate_sidetables`), a defensive guard was added directly inside `lower_expr` to return `ir.VALUE_NONE` if a node has `TYPE_NIL`.
+*   **The Reality:** This is an architectural anti-pattern. The lowering phase should never be responsible for defensively checking if semantic analysis did its job. By silently dropping `TYPE_NIL` nodes, the compiler masks SEMA bugs, replacing segfaults with silently missing code generation or cascading errors downstream.
+*   **Required Action:** Remove the defensive guards in `lower_expr.mach`. Implement a recursive tree-walking function in `validate_sidetables` that ensures every reachable expression in the AST has a valid type before the lowering phase begins. If SEMA fails, the pipeline must halt.
 
-### B. Register Allocator: In-line Spill Handling
-*   **Status:** **FIXED**
-*   **Location:** `src/compiler/regalloc.mach` -> `alloc_function`
-*   **Update:** The rewriting phase now explicitly checks for `spilled` virtual registers. It generates `load` instructions (reloads) before uses and `store` instructions (spills) after definitions using dynamically selected free registers. This eliminates the out-of-bounds access in the encoder.
+### B. Aggregate Lowering: Centralized Hacks
+*   **Location:** `src/compiler/mir/lower/ctx.mach` (`load_value` / `store_value`)
+*   **The "Fix":** The hardcoded `size > 8` checks were extracted from inline lowering code and centralized into `load_value` and `store_value` helper functions.
+*   **The Reality:** Centralizing a hack does not fix the underlying architectural flaw. The AST-to-MIR lowering is still making target-specific ABI decisions (deciding if an aggregate fits in a register based on an arbitrary 8-byte limit). This forces target-dependent logic into a target-independent phase.
+*   **Required Action:** Represent *all* aggregates as pointers (pass-by-reference/alloca) in the initial MIR generation. Introduce a distinct `mir_abi` pass (e.g., `src/compiler/mir/abi.mach`) that runs immediately prior to instruction selection. This pass should implement the specific calling convention (e.g., System V AMD64 ABI, AAPCS64) and promote small aggregates to registers according to target rules.
 
 ---
 
-## 3. Residual Architectural Debt
+## 3. Unaddressed Architectural Debt
 
-### A. MIR Builder: Persistent Pointer Invalidation
+### C. MIR Builder: Persistent Pointer Invalidation
 *   **Location:** `src/compiler/mir/builder.mach`
-*   **Problem:** The builder still uses `std.allocator.reallocate` for blocks, instructions, and values.
-*   **Risk:** **HIGH.** Callers often hold pointers to these elements (e.g., `val block: *ir.Block = ?fb.func.blocks[bi]`). If a subsequent call to `create_block` or `alloc_inst` triggers a reallocation, the pointer in the caller's stack frame becomes a "dangling pointer," leading to non-deterministic crashes.
-*   **Solution:** Move to an index-based API (using `BlockId` instead of `*Block`) or implement a segmented arena/paged list for IR nodes to ensure pointer stability.
-
-### B. Lowering: Hardcoded Aggregate Inconsistency
-*   **Location:** `src/compiler/mir/lower/expr.mach`
-*   **Problem:** The decision to treat a struct as a "value" (load into reg) vs. a "pointer" (alloca/pass-by-ref) is still hardcoded as a `size > 8` check throughout the lowering logic.
-*   **Risk:** **MEDIUM.** This logic is duplicated across `lower_ident`, `lower_field`, `lower_assign`, and `lower_call`. It is target-dependent (e.g., some ABIs pass 16-byte structs in registers) and fragile.
-*   **Solution:** Represent all aggregates as pointers in the initial MIR. Introduce a dedicated `mir_abi` pass to perform target-specific promotion of small aggregates to SSA registers.
-
-### C. SEMA: Missing Tree-Walking Validation
-*   **Location:** `src/compiler/sema/check.mach` -> `validate_sidetables`
-*   **Problem:** The validation is still effectively a no-op.
-*   **Context:** The comment correctly notes that index-range iteration produces false positives for dead/orphaned nodes (e.g., in `$if` blocks).
-*   **Risk:** **MEDIUM.** Without this check, `TYPE_NIL` can flow into lowering, causing incorrect size calculations in the backend.
-*   **Solution:** Implement a recursive tree-walking validator that starts from the module root and verifies every reachable expression node has a resolved type.
+*   **Problem:** The `FuncBuilder` still manages memory by calling `allocator.reallocate` for arrays of `ir.Block`, `ir.Inst`, and `ir.Value`.
+*   **Risk:** **HIGH.** Whenever `create_block` or `alloc_inst` requires growing these arrays, `reallocate` may move the array in memory. Any caller holding a raw pointer (e.g., `*ir.Block`) to an element in the old array will now hold a dangling pointer, leading to catastrophic and hard-to-reproduce memory corruption.
+*   **Required Action:** Refactor the MIR Builder and its consumers to exclusively use opaque IDs (e.g., `BlockId`, `InstId`) for cross-references. Alternatively, change the underlying memory management to use an Arena or a paged list (where pages are never moved once allocated).
 
 ### D. Linker: O(N) Symbol Resolution
-*   **Location:** `src/compiler/linker.mach` -> `find_symbol`
-*   **Problem:** Symbol lookup remains a linear scan through the `symbols` array.
-*   **Risk:** **LOW (Small Projects) / CRITICAL (Large Projects).** As project size increases (e.g., linking the standard library + user code), linking time will grow quadratically.
-*   **Solution:** Implement a simple Hash Map for symbol resolution during the parse/merge phase.
+*   **Location:** `src/compiler/linker.mach` (`find_symbol`)
+*   **Problem:** Symbol lookup remains a naive linear scan (`for (si < sym_count)`) over the `symbols` array.
+*   **Risk:** **CRITICAL for Scale.** As project complexity grows, linking times will scale quadratically ($O(N^2)$ for resolving $N$ relocations against $N$ symbols), resulting in severe performance degradation.
+*   **Required Action:** Introduce a Hash Map or, at minimum, sort the symbol table and use a binary search for symbol resolution during the linking phase.
 
 ---
 
-## 4. Next Steps
-While the immediate "segfault storm" has been quelled, the next priority should be the **MIR Builder stabilization** to eliminate the remaining pointer-invalidation risks, followed by a formal **ABI Lowering pass** to clean up the `lower_expr.mach` logic.
+## 4. Conclusion
+The compiler is no longer immediately crashing on trivial cases, but the architecture is still fragile. We must move away from defensive "just-in-case" coding (like the `TYPE_NIL` guards) and focus on strict phase separation: SEMA proves correctness, Lowering generates naive MIR, ABI transforms for the target, and ISel generates instructions. The remaining items listed above must be fixed structurally.
