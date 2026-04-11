@@ -341,242 +341,753 @@ fun promote_single_store(func: *ir.Function, alloca_val: ir.ValueId,
     ret promoted;
 }
 
-val MAX_BLOCKS: u32 = 512;
+val MAX_BLOCKS:     u32 = 512;
+val MAX_PREDS:      u32 = 8;
+val MAX_PRED_TOTAL: u32 = MAX_BLOCKS * MAX_PREDS;
+val NONE_BLOCK:     u32 = 0xFFFFFFFF;
 
-# promote_multi_block: promote an alloca used across multiple blocks.
+# promote_multi_block: promote an alloca used across multiple blocks using the
+# iterated dominance frontier (IDF) algorithm (Cytron et al. 1991).
 #
-# for each block that has a predecessor with a store, a block parameter is
-# inserted so the value flows through the CFG. the algorithm:
-# 1. find blocks that contain stores → "def blocks"
-# 2. find blocks that need the value from a predecessor → insert block params
-# 3. walk blocks in order, threading the reaching definition through branches
+# 1. build predecessor lists from terminators
+# 2. compute reverse postorder via iterative DFS
+# 3. compute dominator tree via Cooper-Harvey-Kennedy iterative algorithm
+# 4. compute dominance frontiers
+# 5. compute IDF for the alloca's store blocks (phi placement)
+# 6. insert block params at IDF blocks
+# 7. rename in domtree preorder: replace loads, mark stores/allocas dead, add branch args
 fun promote_multi_block(func: *ir.Function, alloc: *allocator.Allocator,
                          alloca_val: ir.ValueId, alloca_tid: type.TypeId,
                          vmap: *ir.ValueId, dead: *bool, vmap_size: u32) bool {
     val bc: u32 = func.block_count;
-    if (bc > MAX_BLOCKS) { ret false; }
+    if (bc == 0 || bc > MAX_BLOCKS) { ret false; }
 
-    val res_has_store: Result[*bool, str] = allocator.allocate[bool](alloc, bc::usize);
-    val res_has_load: Result[*bool, str] = allocator.allocate[bool](alloc, bc::usize);
-    val res_reaching: Result[*ir.ValueId, str] = allocator.allocate[ir.ValueId](alloc, bc::usize);
-    val res_need_param: Result[*bool, str] = allocator.allocate[bool](alloc, bc::usize);
+    # resolve the promoted type: use alloca_tid if available, otherwise infer
+    # from the type of a load result that uses this alloca.
+    var tid: type.TypeId = alloca_tid;
+    if (tid::u32 == type.TYPE_NIL::u32) {
+        var bi: u32 = 0;
+        for (bi < bc && tid::u32 == type.TYPE_NIL::u32) {
+            val block: *ir.Block = ?func.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < block.inst_count && tid::u32 == type.TYPE_NIL::u32) {
+                val inst_id: ir.InstId = block.insts[ii];
+                if (inst_id::u32 < func.inst_count) {
+                    val inst: *ir.Inst = ?func.insts[inst_id::u32];
+                    if (inst.op == op.OP_LOAD && inst.arg_count > 0 &&
+                        ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                        if (inst.result::u32 < func.value_count) {
+                            tid = func.values[inst.result::u32].type_id;
+                        }
+                    }
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+    if (tid::u32 == type.TYPE_NIL::u32) { ret false; }
+
+    # allocate working memory:
+    #   pred_starts[bc]  - start index into pred_pool for each block
+    #   pred_counts[bc]  - predecessor count per block
+    #   pred_pool[bc*MAX_PREDS] - flat pred storage
+    #   rpo[bc]          - reverse postorder permutation
+    #   rpo_pos[bc]      - RPO position of each block
+    #   idom[bc]         - immediate dominator (block index)
+    #   df_starts[bc]    - start index into df_pool
+    #   df_counts[bc]    - DF set size per block
+    #   df_pool[bc*MAX_PREDS] - flat DF storage
+    #   has_phi[bc]      - IDF result: block needs a block param
+    #   param_vid[bc]    - ValueId of inserted block param
+    #   def_stack[bc+1]  - reaching-def stack for rename
+    #   children_start[bc] - domtree children list start
+    #   children_count[bc] - domtree children count
+    #   children_pool[bc]  - flat domtree children storage
+    #   dfs_stack[bc]    - explicit DFS stack for rename traversal
+    #   dfs_child[bc]    - child cursor per DFS frame
+
+    val total_u32: usize = bc::usize * 14 + 1 + MAX_PRED_TOTAL::usize * 2;
+    val res_mem: Result[*u32, str] = allocator.allocate[u32](alloc, total_u32);
+    if (is_err[*u32, str](res_mem)) { ret false; }
+    val mem: *u32 = unwrap_ok[*u32, str](res_mem);
+
+    var off: usize = 0;
+    val pred_starts:    *u32 = ?mem[off]; off = off + bc::usize;
+    val pred_counts:    *u32 = ?mem[off]; off = off + bc::usize;
+    val pred_pool:      *u32 = ?mem[off]; off = off + MAX_PRED_TOTAL::usize;
+    val rpo:            *u32 = ?mem[off]; off = off + bc::usize;
+    val rpo_pos:        *u32 = ?mem[off]; off = off + bc::usize;
+    val idom:           *u32 = ?mem[off]; off = off + bc::usize;
+    val df_starts:      *u32 = ?mem[off]; off = off + bc::usize;
+    val df_counts:      *u32 = ?mem[off]; off = off + bc::usize;
+    val df_pool:        *u32 = ?mem[off]; off = off + MAX_PRED_TOTAL::usize;
+    val children_start: *u32 = ?mem[off]; off = off + bc::usize;
+    val children_count: *u32 = ?mem[off]; off = off + bc::usize;
+    val children_pool:  *u32 = ?mem[off]; off = off + bc::usize;
+    val dfs_stack:      *u32 = ?mem[off]; off = off + bc::usize;
+    val dfs_child:      *u32 = ?mem[off]; off = off + bc::usize;
+    val def_stack:      *u32 = ?mem[off];
+
+    val res_flags: Result[*bool, str] = allocator.allocate[bool](alloc, bc::usize * 2);
+    if (is_err[*bool, str](res_flags)) {
+        allocator.deallocate[u32](alloc, mem, total_u32);
+        ret false;
+    }
+    val flags_mem: *bool = unwrap_ok[*bool, str](res_flags);
+    val has_phi:  *bool = ?flags_mem[0];
+    val visited:  *bool = ?flags_mem[bc::usize];
+
     val res_param_vid: Result[*ir.ValueId, str] = allocator.allocate[ir.ValueId](alloc, bc::usize);
-    if (is_err[*bool, str](res_has_store) || is_err[*bool, str](res_has_load) ||
-        is_err[*ir.ValueId, str](res_reaching) || is_err[*bool, str](res_need_param) ||
-        is_err[*ir.ValueId, str](res_param_vid)) { ret false; }
-    val has_store: *bool = unwrap_ok[*bool, str](res_has_store);
-    val has_load: *bool = unwrap_ok[*bool, str](res_has_load);
-    val reaching: *ir.ValueId = unwrap_ok[*ir.ValueId, str](res_reaching);
-    val need_param: *bool = unwrap_ok[*bool, str](res_need_param);
+    if (is_err[*ir.ValueId, str](res_param_vid)) {
+        allocator.deallocate[bool](alloc, flags_mem, bc::usize * 2);
+        allocator.deallocate[u32](alloc, mem, total_u32);
+        ret false;
+    }
     val param_vid: *ir.ValueId = unwrap_ok[*ir.ValueId, str](res_param_vid);
 
+    var i: u32 = 0;
+    for (i < bc) {
+        pred_starts[i] = 0;
+        pred_counts[i] = 0;
+        rpo[i] = 0;
+        rpo_pos[i] = NONE_BLOCK;
+        idom[i] = NONE_BLOCK;
+        df_starts[i] = 0;
+        df_counts[i] = 0;
+        has_phi[i] = false;
+        visited[i] = false;
+        param_vid[i] = ir.VALUE_NONE;
+        children_start[i] = 0;
+        children_count[i] = 0;
+        children_pool[i] = 0;
+        dfs_stack[i] = 0;
+        dfs_child[i] = 0;
+        i = i + 1;
+    }
+    def_stack[0] = ir.VALUE_NONE::u32;
+
+    # step 1: build predecessor lists by scanning terminators
+    var pred_total: u32 = 0;
     var bi: u32 = 0;
     for (bi < bc) {
-        has_store[bi] = false;
-        has_load[bi] = false;
-        reaching[bi] = ir.VALUE_NONE;
-        need_param[bi] = false;
-        param_vid[bi] = ir.VALUE_NONE;
+        val block: *ir.Block = ?func.blocks[bi];
+        if (block.inst_count == 0) { bi = bi + 1; cnt; }
+        val last_id: ir.InstId = block.insts[block.inst_count - 1];
+        if (last_id::u32 >= func.inst_count) { bi = bi + 1; cnt; }
+        val last: *ir.Inst = ?func.insts[last_id::u32];
+        if (last.target::u32 < bc) {
+            val t: u32 = last.target::u32;
+            if (pred_counts[t] < MAX_PREDS && pred_total < MAX_PRED_TOTAL) {
+                pred_pool[pred_total] = bi;
+                pred_total = pred_total + 1;
+                pred_counts[t] = pred_counts[t] + 1;
+            }
+        }
+        if (last.else_target::u32 < bc && last.else_target::u32 != last.target::u32) {
+            val e: u32 = last.else_target::u32;
+            if (pred_counts[e] < MAX_PREDS && pred_total < MAX_PRED_TOTAL) {
+                pred_pool[pred_total] = bi;
+                pred_total = pred_total + 1;
+                pred_counts[e] = pred_counts[e] + 1;
+            }
+        }
         bi = bi + 1;
     }
+
+    # compute pred_starts from pred_counts (exclusive prefix sum), then re-scatter
+    var running: u32 = 0;
+    bi = 0;
+    for (bi < bc) {
+        pred_starts[bi] = running;
+        running = running + pred_counts[bi];
+        pred_counts[bi] = 0;
+        bi = bi + 1;
+    }
+
+    val res_pred_buf: Result[*u32, str] = allocator.allocate[u32](alloc, pred_total::usize + 1);
+    if (is_err[*u32, str](res_pred_buf)) {
+        allocator.deallocate[ir.ValueId](alloc, param_vid, bc::usize);
+        allocator.deallocate[bool](alloc, flags_mem, bc::usize * 2);
+        allocator.deallocate[u32](alloc, mem, total_u32);
+        ret false;
+    }
+    val pred_buf: *u32 = unwrap_ok[*u32, str](res_pred_buf);
 
     bi = 0;
     for (bi < bc) {
         val block: *ir.Block = ?func.blocks[bi];
-        var ii: u32 = 0;
-        for (ii < block.inst_count) {
-            val inst_id: ir.InstId = block.insts[ii];
-            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
-            val inst: *ir.Inst = ?func.insts[inst_id::u32];
-            if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
-                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
-                has_store[bi] = true;
+        if (block.inst_count == 0) { bi = bi + 1; cnt; }
+        val last_id: ir.InstId = block.insts[block.inst_count - 1];
+        if (last_id::u32 >= func.inst_count) { bi = bi + 1; cnt; }
+        val last: *ir.Inst = ?func.insts[last_id::u32];
+        if (last.target::u32 < bc) {
+            val t: u32 = last.target::u32;
+            if (pred_counts[t] < MAX_PREDS) {
+                pred_buf[pred_starts[t] + pred_counts[t]] = bi;
+                pred_counts[t] = pred_counts[t] + 1;
             }
-            if (inst.op == op.OP_LOAD && inst.arg_count > 0 &&
-                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
-                has_load[bi] = true;
+        }
+        if (last.else_target::u32 < bc && last.else_target::u32 != last.target::u32) {
+            val e: u32 = last.else_target::u32;
+            if (pred_counts[e] < MAX_PREDS) {
+                pred_buf[pred_starts[e] + pred_counts[e]] = bi;
+                pred_counts[e] = pred_counts[e] + 1;
             }
-            ii = ii + 1;
         }
         bi = bi + 1;
     }
 
-    # determine which blocks need a block parameter: any block with >1 predecessor
-    # where a predecessor has a store or already has a reaching definition.
-    # iterate until stable (handles loops).
-    var iter: u32 = 0;
-    var param_changed: bool = true;
-    for (param_changed && iter < bc + 2) {
-        param_changed = false;
-        bi = 0;
-        for (bi < bc) {
-            val block: *ir.Block = ?func.blocks[bi];
-            if (block.inst_count == 0) { bi = bi + 1; cnt; }
+    # step 2: reverse postorder via iterative DFS from block 0
+    var rpo_count: u32 = 0;
+    var dfs_top: u32 = 0;
+    dfs_stack[0] = 0;
+    dfs_child[0] = 0;
+    visited[0] = true;
+    dfs_top = 1;
 
-            var pred_count: u32 = 0;
-            var pred_has_def: bool = false;
-            var bj: u32 = 0;
-            for (bj < bc) {
-                val pblock: *ir.Block = ?func.blocks[bj];
-                if (pblock.inst_count == 0) { bj = bj + 1; cnt; }
-                val last_id: ir.InstId = pblock.insts[pblock.inst_count - 1];
-                if (last_id::u32 >= func.inst_count) { bj = bj + 1; cnt; }
-                val last: *ir.Inst = ?func.insts[last_id::u32];
-                var is_pred: bool = false;
-                if (last.target::u32 == bi) { is_pred = true; }
-                if (last.else_target::u32 == bi) { is_pred = true; }
-                if (is_pred) {
-                    pred_count = pred_count + 1;
-                    if (has_store[bj] || need_param[bj] || bj == 0) {
-                        pred_has_def = true;
+    for (dfs_top > 0) {
+        val cur: u32 = dfs_stack[dfs_top - 1];
+        val cur_block: *ir.Block = ?func.blocks[cur];
+        var pushed: bool = false;
+
+        if (cur_block.inst_count > 0) {
+            val lid: ir.InstId = cur_block.insts[cur_block.inst_count - 1];
+            if (lid::u32 < func.inst_count) {
+                val linst: *ir.Inst = ?func.insts[lid::u32];
+                var succ_idx: u32 = dfs_child[dfs_top - 1];
+                for (succ_idx < 2 && !pushed) {
+                    var s: u32 = NONE_BLOCK;
+                    if (succ_idx == 0 && linst.target::u32 < bc) { s = linst.target::u32; }
+                    if (succ_idx == 1 && linst.else_target::u32 < bc &&
+                        linst.else_target::u32 != linst.target::u32) {
+                        s = linst.else_target::u32;
+                    }
+                    succ_idx = succ_idx + 1;
+                    dfs_child[dfs_top - 1] = succ_idx;
+                    if (s != NONE_BLOCK && !visited[s]) {
+                        visited[s] = true;
+                        dfs_stack[dfs_top] = s;
+                        dfs_child[dfs_top] = 0;
+                        dfs_top = dfs_top + 1;
+                        pushed = true;
                     }
                 }
-                bj = bj + 1;
             }
-
-            if (pred_count > 1 && (has_load[bi] || pred_has_def) && !need_param[bi]) {
-                need_param[bi] = true;
-                param_changed = true;
-            }
-            bi = bi + 1;
         }
-        iter = iter + 1;
+
+        if (!pushed) {
+            rpo[rpo_count] = cur;
+            rpo_count = rpo_count + 1;
+            dfs_top = dfs_top - 1;
+        }
     }
 
-    # insert block parameters
-    var tid: type.TypeId = alloca_tid;
-    if (tid::u32 == type.TYPE_NIL::u32 && func.types != nil) {
-        tid = type.primitive(func.types, type.TK_U64);
+    # rpo[] is in reverse-postorder-reversed (postorder). reverse it in place.
+    var lo: u32 = 0;
+    var hi: u32 = rpo_count;
+    if (hi > 0) { hi = hi - 1; }
+    for (lo < hi) {
+        val tmp: u32 = rpo[lo];
+        rpo[lo] = rpo[hi];
+        rpo[hi] = tmp;
+        lo = lo + 1;
+        hi = hi - 1;
     }
 
     bi = 0;
+    for (bi < rpo_count) {
+        rpo_pos[rpo[bi]] = bi;
+        bi = bi + 1;
+    }
+
+    # step 3: dominator tree — Cooper-Harvey-Kennedy iterative algorithm
+    # "A Simple, Fast Dominance Algorithm" (2001)
+    idom[rpo[0]] = rpo[0];
+
+    var dom_changed: bool = true;
+    for (dom_changed) {
+        dom_changed = false;
+        var ri: u32 = 1;
+        for (ri < rpo_count) {
+            val b: u32 = rpo[ri];
+            var new_idom: u32 = NONE_BLOCK;
+            var pi: u32 = 0;
+            for (pi < pred_counts[b]) {
+                val p: u32 = pred_buf[pred_starts[b] + pi];
+                if (idom[p] != NONE_BLOCK) {
+                    if (new_idom == NONE_BLOCK) {
+                        new_idom = p;
+                    } or {
+                        new_idom = intersect_dom(rpo_pos, idom, new_idom, p);
+                    }
+                }
+                pi = pi + 1;
+            }
+            if (new_idom != NONE_BLOCK && idom[b] != new_idom) {
+                idom[b] = new_idom;
+                dom_changed = true;
+            }
+            ri = ri + 1;
+        }
+    }
+
+    # step 4: dominance frontiers
+    # DF(b) = { y : exists pred p of y such that b dominates p but does not strictly dominate y }
+    compute_dom_frontiers(func, bc, pred_buf, pred_starts, pred_counts,
+                          idom, rpo_pos, df_pool, df_starts, df_counts);
+
+    # step 5: IDF computation — seed worklist with store blocks, propagate through DF
+    # reuse dfs_stack as worklist
+    var wl_size: u32 = 0;
+    bi = 0;
     for (bi < bc) {
-        if (need_param[bi]) {
+        val block: *ir.Block = ?func.blocks[bi];
+        var ii: u32 = 0;
+        var is_store_block: bool = false;
+        for (ii < block.inst_count && !is_store_block) {
+            val inst_id: ir.InstId = block.insts[ii];
+            if (inst_id::u32 < func.inst_count) {
+                val inst: *ir.Inst = ?func.insts[inst_id::u32];
+                if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
+                    ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+                    is_store_block = true;
+                }
+            }
+            ii = ii + 1;
+        }
+        if (is_store_block && wl_size < bc) {
+            dfs_stack[wl_size] = bi;
+            wl_size = wl_size + 1;
+        }
+        bi = bi + 1;
+    }
+
+    # also seed block 0 into the worklist if the alloca is defined there
+    # (block 0 provides the implicit "undef" initial definition)
+    var has_alloca_in_entry: bool = false;
+    if (bc > 0) {
+        val entry: *ir.Block = ?func.blocks[0];
+        var ii: u32 = 0;
+        for (ii < entry.inst_count) {
+            val inst_id: ir.InstId = entry.insts[ii];
+            if (inst_id::u32 < func.inst_count) {
+                val inst: *ir.Inst = ?func.insts[inst_id::u32];
+                if (inst.op == op.OP_ALLOCA && inst.result::u32 == alloca_val::u32) {
+                    has_alloca_in_entry = true;
+                }
+            }
+            ii = ii + 1;
+        }
+    }
+    if (has_alloca_in_entry) {
+        var already: bool = false;
+        var wi: u32 = 0;
+        for (wi < wl_size) {
+            if (dfs_stack[wi] == 0) { already = true; }
+            wi = wi + 1;
+        }
+        if (!already && wl_size < bc) {
+            dfs_stack[wl_size] = 0;
+            wl_size = wl_size + 1;
+        }
+    }
+
+    var wl_head: u32 = 0;
+    for (wl_head < wl_size) {
+        val d: u32 = dfs_stack[wl_head];
+        wl_head = wl_head + 1;
+        var di: u32 = 0;
+        for (di < df_counts[d]) {
+            val y: u32 = df_pool[df_starts[d] + di];
+            if (!has_phi[y]) {
+                has_phi[y] = true;
+                if (wl_size < bc) {
+                    dfs_stack[wl_size] = y;
+                    wl_size = wl_size + 1;
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    # don't place a phi in the entry block — it has no predecessors
+    has_phi[0] = false;
+
+    # step 6: insert block params at IDF blocks
+    bi = 0;
+    for (bi < bc) {
+        if (has_phi[bi]) {
             val vid: ir.ValueId = add_block_param(func, alloc, bi::ir.BlockId, tid);
             if (vid::u32 != ir.VALUE_NONE::u32) {
                 param_vid[bi] = vid;
             } or {
-                need_param[bi] = false;
+                has_phi[bi] = false;
             }
         }
         bi = bi + 1;
     }
 
-    # rename: walk blocks iteratively until reaching defs stabilize (handles loops)
+    # step 7: rename — walk domtree in preorder using reaching-def stack
+    # build domtree children lists from idom[]
+    bi = 0;
+    for (bi < bc) { children_count[bi] = 0; bi = bi + 1; }
+    bi = 0;
+    for (bi < bc) {
+        if (idom[bi] != NONE_BLOCK && idom[bi] != bi) {
+            children_count[idom[bi]] = children_count[idom[bi]] + 1;
+        }
+        bi = bi + 1;
+    }
+
+    running = 0;
+    bi = 0;
+    for (bi < bc) {
+        children_start[bi] = running;
+        running = running + children_count[bi];
+        children_count[bi] = 0;
+        bi = bi + 1;
+    }
+
+    # scatter children into children_pool
+    bi = 0;
+    for (bi < bc) {
+        if (idom[bi] != NONE_BLOCK && idom[bi] != bi) {
+            val parent: u32 = idom[bi];
+            children_pool[children_start[parent] + children_count[parent]] = bi;
+            children_count[parent] = children_count[parent] + 1;
+        }
+        bi = bi + 1;
+    }
+
     var promoted: bool = false;
-    var rename_changed: bool = true;
-    var rename_iter: u32 = 0;
-    for (rename_changed && rename_iter < bc + 2) {
-    rename_changed = false;
+    var stack_top: u32 = 1;
+    def_stack[0] = ir.VALUE_NONE::u32;
 
-    bi = 0;
-    for (bi < bc) {
-        var cur_reaching: ir.ValueId = ir.VALUE_NONE;
+    # iterative preorder DFS over domtree
+    dfs_top = 0;
+    dfs_stack[0] = rpo[0];
+    dfs_child[0] = 0;
+    dfs_top = 1;
 
-        # if this block has a param we inserted, that's the reaching def
-        if (need_param[bi] && param_vid[bi]::u32 != ir.VALUE_NONE::u32) {
-            cur_reaching = param_vid[bi];
+    # frame_base[i] stores the def_stack height at DFS entry for frame i,
+    # so we can restore it when backtracking. reuse pred_pool since
+    # predecessor scanning is complete.
+    val frame_base: *u32 = pred_pool;
+    frame_base[0] = stack_top;
+
+    # process block rpo[0]
+    val root: u32 = rpo[0];
+    rename_block(func, root, alloca_val, has_phi, param_vid,
+                 vmap, dead, vmap_size, def_stack, ?stack_top);
+    promoted = promoted || check_block_promoted(func, root, alloca_val, dead);
+
+    for (dfs_top > 0) {
+        val frame: u32 = dfs_top - 1;
+        val cur: u32 = dfs_stack[frame];
+        val child_idx: u32 = dfs_child[frame];
+
+        if (child_idx < children_count[cur]) {
+            dfs_child[frame] = child_idx + 1;
+            val child: u32 = children_pool[children_start[cur] + child_idx];
+
+            dfs_stack[dfs_top] = child;
+            dfs_child[dfs_top] = 0;
+            frame_base[dfs_top] = stack_top;
+            dfs_top = dfs_top + 1;
+
+            rename_block(func, child, alloca_val, has_phi, param_vid,
+                         vmap, dead, vmap_size, def_stack, ?stack_top);
+            promoted = promoted || check_block_promoted(func, child, alloca_val, dead);
+        } or {
+            # backtrack: pop reaching-def stack to entry state
+            stack_top = frame_base[frame];
+            dfs_top = dfs_top - 1;
         }
-        if (cur_reaching::u32 == ir.VALUE_NONE::u32) {
-            var bj: u32 = 0;
-            for (bj < bc) {
-                if (bj == bi) { bj = bj + 1; cnt; }
-                if (reaching[bj]::u32 != ir.VALUE_NONE::u32) {
-                    val pblock: *ir.Block = ?func.blocks[bj];
-                    if (pblock.inst_count > 0) {
-                        val last_id: ir.InstId = pblock.insts[pblock.inst_count - 1];
-                        if (last_id::u32 < func.inst_count) {
-                            val last: *ir.Inst = ?func.insts[last_id::u32];
-                            if (last.target::u32 == bi || last.else_target::u32 == bi) {
-                                cur_reaching = reaching[bj];
-                                bj = bc;
-                            }
-                        }
-                    }
-                }
-                bj = bj + 1;
-            }
-        }
-
-        val block: *ir.Block = ?func.blocks[bi];
-        var ii: u32 = 0;
-        for (ii < block.inst_count) {
-            val inst_id: ir.InstId = block.insts[ii];
-            if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
-            val inst: *ir.Inst = ?func.insts[inst_id::u32];
-
-            if (inst.op == op.OP_ALLOCA && inst.result::u32 == alloca_val::u32) {
-                dead[inst_id::u32] = true;
-                promoted = true;
-            }
-            if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
-                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
-                if (inst.arg_count > 1) {
-                    cur_reaching = ir.inst_arg(func, inst, 1);
-                }
-                dead[inst_id::u32] = true;
-                promoted = true;
-            }
-            if (inst.op == op.OP_LOAD && inst.arg_count > 0 &&
-                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
-                if (cur_reaching::u32 != ir.VALUE_NONE::u32 &&
-                    inst.result::u32 < vmap_size) {
-                    vmap[inst.result::u32] = cur_reaching;
-                    dead[inst_id::u32] = true;
-                    promoted = true;
-                }
-            }
-
-            ii = ii + 1;
-        }
-
-        if (reaching[bi]::u32 != cur_reaching::u32) {
-            rename_changed = true;
-        }
-        reaching[bi] = cur_reaching;
-
-        bi = bi + 1;
-    }
-    rename_iter = rename_iter + 1;
     }
 
-    # add reaching defs as branch args to successor blocks that have params.
-    # this runs ONCE after rename converges, so branch args are not duplicated.
+    # add branch args: for each block, find its reaching def at block exit
+    # and pass it as an argument to successor block params
     bi = 0;
     for (bi < bc) {
         val block: *ir.Block = ?func.blocks[bi];
-        if (block.inst_count > 0) {
-            var resolved_reaching: ir.ValueId = reaching[bi];
-            if (resolved_reaching::u32 != ir.VALUE_NONE::u32 &&
-                resolved_reaching::u32 < vmap_size) {
-                resolved_reaching = vmap[resolved_reaching::u32];
-            }
-            val last_id: ir.InstId = block.insts[block.inst_count - 1];
-            if (last_id::u32 < func.inst_count) {
-                val last: *ir.Inst = ?func.insts[last_id::u32];
-                if (last.op == op.OP_BR && last.target::u32 < bc) {
-                    if (need_param[last.target::u32]) {
-                        add_branch_arg(func, alloc, last, resolved_reaching);
-                    }
-                }
-                if (last.op == op.OP_COND_BR) {
-                    val add_then: bool = last.target::u32 < bc && need_param[last.target::u32];
-                    val add_else: bool = last.else_target::u32 < bc && need_param[last.else_target::u32];
-                    if (add_then || add_else) {
-                        add_cond_br_args(func, alloc, last, resolved_reaching, add_then, add_else);
-                    }
-                }
+        if (block.inst_count == 0) { bi = bi + 1; cnt; }
+        val last_id: ir.InstId = block.insts[block.inst_count - 1];
+        if (last_id::u32 >= func.inst_count) { bi = bi + 1; cnt; }
+        val last: *ir.Inst = ?func.insts[last_id::u32];
+
+        val exit_def: ir.ValueId = block_exit_def(func, bi, alloca_val,
+                                                   has_phi, param_vid,
+                                                   idom, vmap, dead, vmap_size);
+
+        if (last.op == op.OP_BR && last.target::u32 < bc) {
+            if (has_phi[last.target::u32]) {
+                add_branch_arg(func, alloc, last, exit_def);
             }
         }
+        if (last.op == op.OP_COND_BR) {
+            val add_then: bool = last.target::u32 < bc && has_phi[last.target::u32];
+            val add_else: bool = last.else_target::u32 < bc && has_phi[last.else_target::u32];
+            if (add_then || add_else) {
+                add_cond_br_args(func, alloc, last, exit_def, add_then, add_else);
+            }
+        }
+
         bi = bi + 1;
     }
 
+    allocator.deallocate[u32](alloc, pred_buf, pred_total::usize + 1);
     allocator.deallocate[ir.ValueId](alloc, param_vid, bc::usize);
-    allocator.deallocate[bool](alloc, need_param, bc::usize);
-    allocator.deallocate[ir.ValueId](alloc, reaching, bc::usize);
-    allocator.deallocate[bool](alloc, has_load, bc::usize);
-    allocator.deallocate[bool](alloc, has_store, bc::usize);
+    allocator.deallocate[bool](alloc, flags_mem, bc::usize * 2);
+    allocator.deallocate[u32](alloc, mem, total_u32);
     ret promoted;
+}
+
+# intersect_dom: find the common dominator of two blocks using RPO numbering.
+# this is the "intersect" helper from Cooper-Harvey-Kennedy.
+fun intersect_dom(rpo_pos: *u32, idom: *u32, b1: u32, b2: u32) u32 {
+    var f1: u32 = b1;
+    var f2: u32 = b2;
+    for (f1 != f2) {
+        for (rpo_pos[f1] > rpo_pos[f2]) { f1 = idom[f1]; }
+        for (rpo_pos[f2] > rpo_pos[f1]) { f2 = idom[f2]; }
+    }
+    ret f1;
+}
+
+# compute_dom_frontiers: compute DF sets from scratch using the standard algorithm.
+# for each block y with >= 2 predecessors, walk each predecessor p up to idom[y],
+# adding y to DF(runner) at each step.
+fun compute_dom_frontiers(func: *ir.Function, bc: u32,
+                           pred_buf: *u32, pred_starts: *u32, pred_counts: *u32,
+                           idom: *u32, rpo_pos: *u32,
+                           df_pool: *u32, df_starts: *u32, df_counts: *u32) {
+    var bi: u32 = 0;
+    for (bi < bc) {
+        df_counts[bi] = 0;
+        bi = bi + 1;
+    }
+
+    # first pass: count DF entries per block
+    bi = 0;
+    for (bi < bc) {
+        if (pred_counts[bi] >= 2) {
+            var pi: u32 = 0;
+            for (pi < pred_counts[bi]) {
+                var runner: u32 = pred_buf[pred_starts[bi] + pi];
+                for (runner != NONE_BLOCK && runner != idom[bi]) {
+                    df_counts[runner] = df_counts[runner] + 1;
+                    runner = idom[runner];
+                }
+                pi = pi + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+
+    # prefix sum for df_starts
+    var running: u32 = 0;
+    bi = 0;
+    for (bi < bc) {
+        df_starts[bi] = running;
+        running = running + df_counts[bi];
+        df_counts[bi] = 0;
+        bi = bi + 1;
+    }
+
+    # second pass: scatter DF entries (may include duplicates)
+    bi = 0;
+    for (bi < bc) {
+        if (pred_counts[bi] >= 2) {
+            var pi: u32 = 0;
+            for (pi < pred_counts[bi]) {
+                var runner: u32 = pred_buf[pred_starts[bi] + pi];
+                for (runner != NONE_BLOCK && runner != idom[bi]) {
+                    df_pool[df_starts[runner] + df_counts[runner]] = bi;
+                    df_counts[runner] = df_counts[runner] + 1;
+                    runner = idom[runner];
+                }
+                pi = pi + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+
+    # third pass: deduplicate each block's DF set in place
+    bi = 0;
+    for (bi < bc) {
+        if (df_counts[bi] > 1) {
+            val start: u32 = df_starts[bi];
+            var write: u32 = 0;
+            var ri: u32 = 0;
+            for (ri < df_counts[bi]) {
+                val v: u32 = df_pool[start + ri];
+                var dup: bool = false;
+                var wi: u32 = 0;
+                for (wi < write) {
+                    if (df_pool[start + wi] == v) { dup = true; }
+                    wi = wi + 1;
+                }
+                if (!dup) {
+                    df_pool[start + write] = v;
+                    write = write + 1;
+                }
+                ri = ri + 1;
+            }
+            df_counts[bi] = write;
+        }
+        bi = bi + 1;
+    }
+}
+
+# rename_block: process a single block during rename traversal.
+# pushes stores onto the reaching-def stack, replaces loads with the current
+# reaching def, and marks alloca/store/load instructions dead.
+fun rename_block(func: *ir.Function, block_idx: u32,
+                  alloca_val: ir.ValueId,
+                  has_phi: *bool, param_vid: *ir.ValueId,
+                  vmap: *ir.ValueId, dead: *bool, vmap_size: u32,
+                  def_stack: *u32, stack_top: *u32) {
+    val block: *ir.Block = ?func.blocks[block_idx];
+
+    # if this block has a phi (block param), push it as the reaching def
+    if (has_phi[block_idx] && param_vid[block_idx]::u32 != ir.VALUE_NONE::u32) {
+        val st: u32 = @stack_top;
+        def_stack[st] = param_vid[block_idx]::u32;
+        @stack_top = st + 1;
+    }
+
+    var ii: u32 = 0;
+    for (ii < block.inst_count) {
+        val inst_id: ir.InstId = block.insts[ii];
+        if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+        val inst: *ir.Inst = ?func.insts[inst_id::u32];
+
+        if (inst.op == op.OP_ALLOCA && inst.result::u32 == alloca_val::u32) {
+            dead[inst_id::u32] = true;
+        }
+        if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
+            ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+            if (inst.arg_count > 1) {
+                val stored: ir.ValueId = ir.inst_arg(func, inst, 1);
+                val st: u32 = @stack_top;
+                def_stack[st] = stored::u32;
+                @stack_top = st + 1;
+            }
+            dead[inst_id::u32] = true;
+        }
+        if (inst.op == op.OP_LOAD && inst.arg_count > 0 &&
+            ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+            val st: u32 = @stack_top;
+            if (st > 0) {
+                val reaching: ir.ValueId = def_stack[st - 1]::ir.ValueId;
+                if (reaching::u32 != ir.VALUE_NONE::u32 &&
+                    inst.result::u32 < vmap_size) {
+                    vmap[inst.result::u32] = reaching;
+                }
+            }
+            dead[inst_id::u32] = true;
+        }
+
+        ii = ii + 1;
+    }
+}
+
+# check_block_promoted: returns true if any instruction in the block was marked
+# dead for this alloca (used to set the promoted flag).
+fun check_block_promoted(func: *ir.Function, block_idx: u32,
+                          alloca_val: ir.ValueId, dead: *bool) bool {
+    val block: *ir.Block = ?func.blocks[block_idx];
+    var ii: u32 = 0;
+    for (ii < block.inst_count) {
+        val inst_id: ir.InstId = block.insts[ii];
+        if (inst_id::u32 < func.inst_count && dead[inst_id::u32]) {
+            val inst: *ir.Inst = ?func.insts[inst_id::u32];
+            if (inst.op == op.OP_ALLOCA && inst.result::u32 == alloca_val::u32) { ret true; }
+            if (inst.op == op.OP_STORE && inst.arg_count > 0 &&
+                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) { ret true; }
+            if (inst.op == op.OP_LOAD && inst.arg_count > 0 &&
+                ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) { ret true; }
+        }
+        ii = ii + 1;
+    }
+    ret false;
+}
+
+# block_exit_def: compute the reaching definition at the exit of a block.
+# walks the block's instructions to find the last store, or uses the block param
+# if present, or walks up the dominator tree to find the reaching def.
+fun block_exit_def(func: *ir.Function, block_idx: u32,
+                    alloca_val: ir.ValueId,
+                    has_phi: *bool, param_vid: *ir.ValueId,
+                    idom: *u32, vmap: *ir.ValueId, dead: *bool,
+                    vmap_size: u32) ir.ValueId {
+    var result: ir.ValueId = ir.VALUE_NONE;
+
+    # start with the block param if one was inserted
+    if (has_phi[block_idx] && param_vid[block_idx]::u32 != ir.VALUE_NONE::u32) {
+        result = param_vid[block_idx];
+    }
+
+    # walk instructions: each store updates the reaching def
+    val block: *ir.Block = ?func.blocks[block_idx];
+    var ii: u32 = 0;
+    for (ii < block.inst_count) {
+        val inst_id: ir.InstId = block.insts[ii];
+        if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+        val inst: *ir.Inst = ?func.insts[inst_id::u32];
+        if (inst.op == op.OP_STORE && inst.arg_count > 1 &&
+            ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+            result = ir.inst_arg(func, inst, 1);
+        }
+        ii = ii + 1;
+    }
+
+    # if no def in this block, walk up the dominator tree
+    if (result::u32 == ir.VALUE_NONE::u32) {
+        var dom: u32 = idom[block_idx];
+        var depth: u32 = 0;
+        for (dom != NONE_BLOCK && dom != block_idx && result::u32 == ir.VALUE_NONE::u32 && depth < MAX_BLOCKS) {
+            result = block_exit_def_local(func, dom, alloca_val, has_phi, param_vid);
+            if (result::u32 == ir.VALUE_NONE::u32) {
+                if (dom == idom[dom]) { dom = NONE_BLOCK; }
+                or { dom = idom[dom]; }
+            }
+            depth = depth + 1;
+        }
+    }
+
+    # resolve through vmap
+    if (result::u32 != ir.VALUE_NONE::u32 && result::u32 < vmap_size &&
+        vmap[result::u32]::u32 != result::u32) {
+        result = vmap[result::u32];
+    }
+
+    ret result;
+}
+
+# block_exit_def_local: find the reaching def at exit of a block without
+# walking the domtree (only looks at local stores and block params).
+fun block_exit_def_local(func: *ir.Function, block_idx: u32,
+                          alloca_val: ir.ValueId,
+                          has_phi: *bool, param_vid: *ir.ValueId) ir.ValueId {
+    var result: ir.ValueId = ir.VALUE_NONE;
+    if (has_phi[block_idx] && param_vid[block_idx]::u32 != ir.VALUE_NONE::u32) {
+        result = param_vid[block_idx];
+    }
+    val block: *ir.Block = ?func.blocks[block_idx];
+    var ii: u32 = 0;
+    for (ii < block.inst_count) {
+        val inst_id: ir.InstId = block.insts[ii];
+        if (inst_id::u32 >= func.inst_count) { ii = ii + 1; cnt; }
+        val inst: *ir.Inst = ?func.insts[inst_id::u32];
+        if (inst.op == op.OP_STORE && inst.arg_count > 1 &&
+            ir.inst_arg(func, inst, 0)::u32 == alloca_val::u32) {
+            result = ir.inst_arg(func, inst, 1);
+        }
+        ii = ii + 1;
+    }
+    ret result;
 }
 
 # add_block_param: add a block parameter directly on the Function (not via builder)
