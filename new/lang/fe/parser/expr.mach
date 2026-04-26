@@ -1,0 +1,734 @@
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.result;
+
+use token:  mach.lang.fe.token;
+use ast:    mach.lang.fe.ast;
+use id:     mach.lang.fe.ast.id;
+use expr:   mach.lang.fe.ast.expr;
+use m_type: mach.lang.fe.ast.type;
+use decl:   mach.lang.fe.ast.decl;
+use parser: mach.lang.fe.parser.state;
+
+# parses a full expression at the lowest infix binding power
+# ---
+# p:   parser state
+# ret: ExprId of the parsed expression, or EXPR_NIL on failure
+pub fun parse_expr(p: *parser.Parser) id.ExprId {
+    ret parse_expr_bp(p, 0);
+}
+
+# parses an expression whose infix operators have precedence >= min_bp (Pratt climber)
+# ---
+# p:      parser state
+# min_bp: minimum binding power required for the next infix operator to bind
+# ret:    ExprId of the parsed expression
+pub fun parse_expr_bp(p: *parser.Parser, min_bp: u8) id.ExprId {
+    var lhs: id.ExprId = parse_prefix(p);
+    lhs = parse_postfix(p, lhs);
+
+    for (!parser.at_eof(p)) {
+        val op_tok: token.Token = parser.current(p);
+        val op_bp:  u8           = token.infix_precedence(op_tok.kind);
+        if (op_bp == 0)         { brk; }
+        if (op_bp < min_bp)     { brk; }
+
+        parser.advance(p);
+
+        var right_bp: u8 = op_bp + 1;
+        if (token.is_right_assoc(op_tok.kind)) { right_bp = op_bp; }
+
+        val rhs: id.ExprId = parse_expr_bp(p, right_bp);
+
+        var bin: expr.ExprBinary;
+        bin.op  = bin_op_from_kind(op_tok.kind);
+        bin.lhs = lhs;
+        bin.rhs = rhs;
+
+        var node: expr.Expr;
+        node.span = span_of_expr_pair(p, lhs, rhs);
+        node.kind = expr.EXPR_KIND_BINARY;
+        node.data.binary = bin;
+        lhs = parser.push_expr(p, node);
+
+        lhs = parse_postfix(p, lhs);
+    }
+
+    ret lhs;
+}
+
+# parses a type expression and returns its TypeId
+# ---
+# p:   parser state
+# ret: TypeId of the parsed type, or TYPE_NIL on failure
+pub fun parse_type(p: *parser.Parser) id.TypeId {
+    val start: token.Token = parser.current(p);
+
+    if (parser.at(p, token.KIND_STAR))     { ret parse_ptr(p, start.span); }
+    if (parser.at(p, token.KIND_LBRACKET)) { ret parse_array(p, start.span); }
+    if (parser.at_kw(p, "fun"))            { ret parse_fun(p, start.span); }
+    if (parser.at_kw(p, "rec"))            { ret parse_rec_or_uni(p, start.span, m_type.TYPE_KIND_REC); }
+    if (parser.at_kw(p, "uni"))            { ret parse_rec_or_uni(p, start.span, m_type.TYPE_KIND_UNI); }
+    if (parser.at(p, token.KIND_IDENT))    { ret parse_named(p, start.span); }
+
+    parser.error_at_current(p, "expected a type");
+    var t: m_type.Type;
+    t.span = start.span;
+    t.kind = m_type.TYPE_KIND_ERROR;
+    ret parser.push_type(p, t);
+}
+
+# parses a prefix atom: literal, identifier, comptime ident, unary, paren group, array literal, or error recovery
+# ---
+# p:   parser state
+# ret: ExprId of the parsed prefix
+fun parse_prefix(p: *parser.Parser) id.ExprId {
+    val t: token.Token = parser.current(p);
+
+    if (t.kind == token.KIND_LIT_INT)   { ret parse_lit_int(p); }
+    if (t.kind == token.KIND_LIT_FLOAT) { ret parse_lit_float(p); }
+    if (t.kind == token.KIND_LIT_CHAR)  { ret parse_lit_char(p); }
+    if (t.kind == token.KIND_LIT_STR)   { ret parse_lit_str(p); }
+    if (t.kind == token.KIND_LIT_ZSTR)  { ret parse_lit_zstr(p); }
+
+    if (t.kind == token.KIND_MINUS)    { ret parse_unary(p, expr.UN_NEG); }
+    if (t.kind == token.KIND_BANG)     { ret parse_unary(p, expr.UN_NOT); }
+    if (t.kind == token.KIND_TILDE)    { ret parse_unary(p, expr.UN_BIT_NOT); }
+    if (t.kind == token.KIND_QUESTION) { ret parse_unary(p, expr.UN_ADDR); }
+    if (t.kind == token.KIND_AT)       { ret parse_unary(p, expr.UN_DEREF); }
+
+    if (t.kind == token.KIND_LPAREN)   { ret parse_paren(p); }
+    if (t.kind == token.KIND_DOLLAR)   { ret parse_comptime_ident(p); }
+    if (t.kind == token.KIND_LBRACKET) { ret parse_array_literal(p); }
+
+    if (t.kind == token.KIND_IDENT) {
+        if (parser.at_kw(p, "nil"))      { ret parse_lit_nil(p); }
+        if (looks_like_typed_literal(p)) { ret parse_typed_literal(p); }
+        ret parse_ident(p);
+    }
+
+    parser.error_at_current(p, "expected an expression");
+    var node: expr.Expr;
+    node.span = t.span;
+    node.kind = expr.EXPR_KIND_ERROR;
+    ret parser.push_expr(p, node);
+}
+
+# applies postfix operators to a primary expression: call, index, member access, cast
+# ---
+# p:    parser state
+# base: expression to apply postfix operators to
+# ret:  ExprId of the resulting expression after all postfix operators are applied
+fun parse_postfix(p: *parser.Parser, base: id.ExprId) id.ExprId {
+    var lhs: id.ExprId = base;
+    for (true) {
+        val k: token.Kind = parser.current(p).kind;
+        if      (k == token.KIND_LPAREN)      { lhs = parse_call(p, lhs); }
+        or      (k == token.KIND_LBRACKET)    { lhs = parse_index(p, lhs); }
+        or      (k == token.KIND_DOT)         { lhs = parse_member(p, lhs); }
+        or      (k == token.KIND_COLON_COLON) { lhs = parse_cast(p, lhs); }
+        or                                    { brk; }
+    }
+    ret lhs;
+}
+
+# parses an integer literal
+fun parse_lit_int(p: *parser.Parser) id.ExprId {
+    val t: token.Token = parser.advance(p);
+    var node: expr.Expr;
+    node.span = t.span;
+    node.kind = expr.EXPR_KIND_LIT_INT;
+    node.data.lit_int = 0;
+    ret parser.push_expr(p, node);
+}
+
+# parses a float literal
+fun parse_lit_float(p: *parser.Parser) id.ExprId {
+    val t: token.Token = parser.advance(p);
+    var node: expr.Expr;
+    node.span = t.span;
+    node.kind = expr.EXPR_KIND_LIT_FLOAT;
+    node.data.lit_float = 0.0;
+    ret parser.push_expr(p, node);
+}
+
+# parses a char literal
+fun parse_lit_char(p: *parser.Parser) id.ExprId {
+    val t: token.Token = parser.advance(p);
+    var node: expr.Expr;
+    node.span = t.span;
+    node.kind = expr.EXPR_KIND_LIT_CHAR;
+    node.data.lit_char = 0;
+    ret parser.push_expr(p, node);
+}
+
+# parses a double-quoted str literal (fat-pointer string)
+fun parse_lit_str(p: *parser.Parser) id.ExprId {
+    val t: token.Token = parser.advance(p);
+    var node: expr.Expr;
+    node.span = t.span;
+    node.kind = expr.EXPR_KIND_LIT_STR;
+    ret parser.push_expr(p, node);
+}
+
+# parses a backtick-delimited zstr literal (null-terminated *u8 for FFI)
+fun parse_lit_zstr(p: *parser.Parser) id.ExprId {
+    val t: token.Token = parser.advance(p);
+    var node: expr.Expr;
+    node.span = t.span;
+    node.kind = expr.EXPR_KIND_LIT_ZSTR;
+    ret parser.push_expr(p, node);
+}
+
+# parses the `nil` keyword
+fun parse_lit_nil(p: *parser.Parser) id.ExprId {
+    val t: token.Token = parser.advance(p);
+    var node: expr.Expr;
+    node.span = t.span;
+    node.kind = expr.EXPR_KIND_LIT_NIL;
+    ret parser.push_expr(p, node);
+}
+
+# parses a plain identifier reference
+fun parse_ident(p: *parser.Parser) id.ExprId {
+    val t: token.Token = parser.advance(p);
+    var node: expr.Expr;
+    node.span = t.span;
+    node.kind = expr.EXPR_KIND_IDENT;
+    ret parser.push_expr(p, node);
+}
+
+# parses a `$ident` comptime identifier
+fun parse_comptime_ident(p: *parser.Parser) id.ExprId {
+    val dollar: token.Token = parser.advance(p);
+    var end: token.Span = dollar.span;
+    if (parser.at(p, token.KIND_IDENT)) {
+        end = parser.advance(p).span;
+    } or {
+        parser.error_at_current(p, "expected an identifier after '$'");
+    }
+    var node: expr.Expr;
+    node.span = parser.span_of(dollar.span, end);
+    node.kind = expr.EXPR_KIND_COMPTIME_IDENT;
+    ret parser.push_expr(p, node);
+}
+
+# parses a prefix unary operator followed by an operand; applies postfix chains so member/call/index bind tighter than the unary
+fun parse_unary(p: *parser.Parser, op: expr.UnOp) id.ExprId {
+    val start: token.Token = parser.advance(p);
+    var operand: id.ExprId = parse_prefix(p);
+    operand = parse_postfix(p, operand);
+
+    var unary: expr.ExprUnary;
+    unary.op      = op;
+    unary.operand = operand;
+
+    var end_span: token.Span = start.span;
+    if (operand != id.EXPR_NIL) {
+        end_span = ast.get_expr(p.ast, operand).span;
+    }
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start.span, end_span);
+    node.kind = expr.EXPR_KIND_UNARY;
+    node.data.unary = unary;
+    ret parser.push_expr(p, node);
+}
+
+# parses a parenthesized expression `(expr)`
+fun parse_paren(p: *parser.Parser) id.ExprId {
+    parser.advance(p);
+    val inner: id.ExprId = parse_expr(p);
+    parser.expect(p, token.KIND_RPAREN, "expected ')' after parenthesized expression");
+    ret inner;
+}
+
+# parses a call expression `callee(args)`
+fun parse_call(p: *parser.Parser, callee: id.ExprId) id.ExprId {
+    parser.advance(p);
+
+    val args_start: u32 = p.ast.extras_len::u32;
+    var args_len:   u32 = 0;
+
+    if (!parser.at(p, token.KIND_RPAREN)) {
+        val first: id.ExprId = parse_expr(p);
+        parser.push_extra(p, first::u32);
+        args_len = args_len + 1;
+        for (parser.eat(p, token.KIND_COMMA)) {
+            if (parser.at(p, token.KIND_RPAREN)) { brk; }
+            val next: id.ExprId = parse_expr(p);
+            parser.push_extra(p, next::u32);
+            args_len = args_len + 1;
+        }
+    }
+
+    val close: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_RPAREN, "expected ')' to close call arguments");
+
+    var call: expr.ExprCall;
+    call.callee     = callee;
+    call.args_start = args_start;
+    call.args_len   = args_len;
+
+    var start_span: token.Span = close.span;
+    if (callee != id.EXPR_NIL) {
+        start_span = ast.get_expr(p.ast, callee).span;
+    }
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start_span, close.span);
+    node.kind = expr.EXPR_KIND_CALL;
+    node.data.call = call;
+    ret parser.push_expr(p, node);
+}
+
+# parses an index expression `obj[idx]`
+fun parse_index(p: *parser.Parser, object: id.ExprId) id.ExprId {
+    parser.advance(p);
+    val idx: id.ExprId = parse_expr(p);
+    val close: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_RBRACKET, "expected ']' to close index expression");
+
+    var index: expr.ExprIndex;
+    index.object = object;
+    index.index  = idx;
+
+    var start_span: token.Span = close.span;
+    if (object != id.EXPR_NIL) {
+        start_span = ast.get_expr(p.ast, object).span;
+    }
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start_span, close.span);
+    node.kind = expr.EXPR_KIND_INDEX;
+    node.data.index = index;
+    ret parser.push_expr(p, node);
+}
+
+# parses a member access `obj.field`
+fun parse_member(p: *parser.Parser, object: id.ExprId) id.ExprId {
+    parser.advance(p);
+    if (!parser.at(p, token.KIND_IDENT)) {
+        parser.error_at_current(p, "expected field name after '.'");
+        var err_node: expr.Expr;
+        err_node.span = parser.current(p).span;
+        err_node.kind = expr.EXPR_KIND_ERROR;
+        ret parser.push_expr(p, err_node);
+    }
+    val name_tok: token.Token = parser.advance(p);
+
+    var member: expr.ExprMember;
+    member.object = object;
+    member.name   = name_tok.span;
+
+    var start_span: token.Span = name_tok.span;
+    if (object != id.EXPR_NIL) {
+        start_span = ast.get_expr(p.ast, object).span;
+    }
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start_span, name_tok.span);
+    node.kind = expr.EXPR_KIND_MEMBER;
+    node.data.member = member;
+    ret parser.push_expr(p, node);
+}
+
+# parses a cast expression `value::Type`
+fun parse_cast(p: *parser.Parser, value: id.ExprId) id.ExprId {
+    parser.advance(p);
+    val ty: id.TypeId = parse_type(p);
+
+    var cast: expr.ExprCast;
+    cast.value = value;
+    cast.ty    = ty;
+
+    var start_span: token.Span = parser.current(p).span;
+    if (value != id.EXPR_NIL) {
+        start_span = ast.get_expr(p.ast, value).span;
+    }
+    var end_span: token.Span = start_span;
+    if (ty != id.TYPE_NIL) {
+        end_span = ast.get_type(p.ast, ty).span;
+    }
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start_span, end_span);
+    node.kind = expr.EXPR_KIND_CAST;
+    node.data.cast = cast;
+    ret parser.push_expr(p, node);
+}
+
+# parses an array literal `[N]T{a, b, c}`
+fun parse_array_literal(p: *parser.Parser) id.ExprId {
+    val start: token.Token = parser.current(p);
+    val ty: id.TypeId = parse_type(p);
+    parser.expect(p, token.KIND_LBRACE, "expected '{' after array type in array literal");
+
+    val elems_start: u32 = p.ast.extras_len::u32;
+    var elems_len:   u32 = 0;
+
+    if (!parser.at(p, token.KIND_RBRACE)) {
+        val first: id.ExprId = parse_expr(p);
+        parser.push_extra(p, first::u32);
+        elems_len = elems_len + 1;
+        for (parser.eat(p, token.KIND_COMMA)) {
+            if (parser.at(p, token.KIND_RBRACE)) { brk; }
+            val next: id.ExprId = parse_expr(p);
+            parser.push_extra(p, next::u32);
+            elems_len = elems_len + 1;
+        }
+    }
+
+    val close: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_RBRACE, "expected '}' to close array literal");
+
+    var array: expr.ExprArrayLit;
+    array.ty          = ty;
+    array.elems_start = elems_start;
+    array.elems_len   = elems_len;
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start.span, close.span);
+    node.kind = expr.EXPR_KIND_ARRAY_LIT;
+    node.data.array_lit = array;
+    ret parser.push_expr(p, node);
+}
+
+# parses a struct literal `Name{field: value, ...}` or `Name[args]{...}` (type prefix already recognized by looks_like_typed_literal)
+fun parse_typed_literal(p: *parser.Parser) id.ExprId {
+    val start_tok: token.Token = parser.current(p);
+    val ty: id.TypeId = parse_type(p);
+    parser.expect(p, token.KIND_LBRACE, "expected '{' after type in struct literal");
+
+    val fields_start: u32 = p.ast.field_init_len::u32;
+    var fields_len:   u32 = 0;
+
+    if (!parser.at(p, token.KIND_RBRACE)) {
+        if (!parse_field_init(p)) {
+            parser.sync_to(p, token.KIND_RBRACE, token.KIND_EOF, token.KIND_EOF);
+        } or {
+            fields_len = fields_len + 1;
+        }
+        for (parser.eat(p, token.KIND_COMMA)) {
+            if (parser.at(p, token.KIND_RBRACE)) { brk; }
+            if (!parse_field_init(p)) {
+                parser.sync_to(p, token.KIND_RBRACE, token.KIND_EOF, token.KIND_EOF);
+                brk;
+            }
+            fields_len = fields_len + 1;
+        }
+    }
+
+    val close: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_RBRACE, "expected '}' to close struct literal");
+
+    var lit: expr.ExprStructLit;
+    lit.ty           = ty;
+    lit.fields_start = fields_start;
+    lit.fields_len   = fields_len;
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start_tok.span, close.span);
+    node.kind = expr.EXPR_KIND_STRUCT_LIT;
+    node.data.struct_lit = lit;
+    ret parser.push_expr(p, node);
+}
+
+# parses `name: value` and appends it to ast.field_inits; returns false on syntax error
+fun parse_field_init(p: *parser.Parser) bool {
+    if (!parser.at(p, token.KIND_IDENT)) {
+        parser.error_at_current(p, "expected field name in struct literal");
+        ret false;
+    }
+    val name: token.Span = parser.advance(p).span;
+    parser.expect(p, token.KIND_COLON, "expected ':' between field name and value");
+    val value: id.ExprId = parse_expr(p);
+
+    var fi: expr.FieldInit;
+    fi.name  = name;
+    fi.value = value;
+    val r: Result[u32, str] = ast.add_field_init(p.ast, fi);
+    if (is_err[u32, str](r)) {
+        parser.error_at(p, name, "out of memory while parsing struct literal field");
+        ret false;
+    }
+    ret true;
+}
+
+# reports whether the current token sequence looks like `Name(.Name)*([args])?{`,
+# the tell-tale shape of a struct literal's type prefix followed by its body
+fun looks_like_typed_literal(p: *parser.Parser) bool {
+    if (parser.current(p).kind != token.KIND_IDENT) { ret false; }
+
+    var i: usize = 1;
+
+    for (parser.peek(p, i).kind == token.KIND_DOT && parser.peek(p, i + 1).kind == token.KIND_IDENT) {
+        i = i + 2;
+    }
+
+    if (parser.peek(p, i).kind == token.KIND_LBRACKET) {
+        i = i + 1;
+        var depth: usize = 1;
+        for (depth > 0) {
+            val k: token.Kind = parser.peek(p, i).kind;
+            if (k == token.KIND_EOF)      { ret false; }
+            if (k == token.KIND_LBRACKET) { depth = depth + 1; }
+            if (k == token.KIND_RBRACKET) { depth = depth - 1; }
+            i = i + 1;
+        }
+    }
+
+    ret parser.peek(p, i).kind == token.KIND_LBRACE;
+}
+
+# maps a token kind to its corresponding BinOp
+fun bin_op_from_kind(kind: token.Kind) expr.BinOp {
+    if (kind == token.KIND_PLUS)      { ret expr.BIN_ADD; }
+    if (kind == token.KIND_MINUS)     { ret expr.BIN_SUB; }
+    if (kind == token.KIND_STAR)      { ret expr.BIN_MUL; }
+    if (kind == token.KIND_SLASH)     { ret expr.BIN_DIV; }
+    if (kind == token.KIND_PERCENT)   { ret expr.BIN_MOD; }
+    if (kind == token.KIND_EQ_EQ)     { ret expr.BIN_EQ; }
+    if (kind == token.KIND_BANG_EQ)   { ret expr.BIN_NEQ; }
+    if (kind == token.KIND_LT)        { ret expr.BIN_LT; }
+    if (kind == token.KIND_LT_EQ)     { ret expr.BIN_LEQ; }
+    if (kind == token.KIND_GT)        { ret expr.BIN_GT; }
+    if (kind == token.KIND_GT_EQ)     { ret expr.BIN_GEQ; }
+    if (kind == token.KIND_AMP_AMP)   { ret expr.BIN_AND; }
+    if (kind == token.KIND_PIPE_PIPE) { ret expr.BIN_OR; }
+    if (kind == token.KIND_AMP)       { ret expr.BIN_BIT_AND; }
+    if (kind == token.KIND_PIPE)      { ret expr.BIN_BIT_OR; }
+    if (kind == token.KIND_CARET)     { ret expr.BIN_BIT_XOR; }
+    if (kind == token.KIND_LT_LT)     { ret expr.BIN_SHL; }
+    if (kind == token.KIND_GT_GT)     { ret expr.BIN_SHR; }
+    ret expr.BIN_ASSIGN;
+}
+
+# computes the span covering two expressions by id, falling back to the current token when either is EXPR_NIL
+fun span_of_expr_pair(p: *parser.Parser, lhs: id.ExprId, rhs: id.ExprId) token.Span {
+    var start: token.Span = parser.current(p).span;
+    var end:   token.Span = start;
+    if (lhs != id.EXPR_NIL) { start = ast.get_expr(p.ast, lhs).span; }
+    if (rhs != id.EXPR_NIL) { end   = ast.get_expr(p.ast, rhs).span; }
+    ret parser.span_of(start, end);
+}
+
+# parses a named type, including dotted paths and optional generic arguments
+# ---
+# p:     parser state
+# start: span of the first identifier token in the path
+# ret:   TypeId of the resulting TYPE_KIND_NAMED node
+fun parse_named(p: *parser.Parser, start: token.Span) id.TypeId {
+    var last: token.Span = parser.advance(p).span;
+
+    for (parser.at(p, token.KIND_DOT) && parser.peek(p, 1).kind == token.KIND_IDENT) {
+        parser.advance(p);
+        last = parser.advance(p).span;
+    }
+
+    val path_span: token.Span = parser.span_of(start, last);
+
+    var args_start: u32 = 0;
+    var args_len:   u32 = 0;
+    var end:        token.Span = last;
+
+    if (parser.eat(p, token.KIND_LBRACKET)) {
+        args_start = p.ast.extras_len::u32;
+        if (!parser.at(p, token.KIND_RBRACKET)) {
+            val arg: id.TypeId = parse_type(p);
+            parser.push_extra(p, arg::u32);
+            args_len = args_len + 1;
+            for (parser.eat(p, token.KIND_COMMA)) {
+                if (parser.at(p, token.KIND_RBRACKET)) { brk; }
+                val next: id.TypeId = parse_type(p);
+                parser.push_extra(p, next::u32);
+                args_len = args_len + 1;
+            }
+        }
+        val close: token.Token = parser.current(p);
+        parser.expect(p, token.KIND_RBRACKET, "expected ']' to close generic arguments");
+        end = close.span;
+    }
+
+    var named: m_type.TypeNamed;
+    named.name       = path_span;
+    named.args_start = args_start;
+    named.args_len   = args_len;
+
+    var t: m_type.Type;
+    t.span       = parser.span_of(start, end);
+    t.kind       = m_type.TYPE_KIND_NAMED;
+    t.data.named = named;
+    ret parser.push_type(p, t);
+}
+
+# parses a pointer type `*T`
+# ---
+# p:     parser state
+# start: span of the leading `*` token
+# ret:   TypeId of the resulting TYPE_KIND_PTR node
+fun parse_ptr(p: *parser.Parser, start: token.Span) id.TypeId {
+    parser.advance(p);
+    val inner: id.TypeId = parse_type(p);
+
+    var ptr: m_type.TypePtr;
+    ptr.pointee = inner;
+
+    var end_span: token.Span = start;
+    if (inner != id.TYPE_NIL) {
+        end_span = ast.get_type(p.ast, inner).span;
+    }
+
+    var t: m_type.Type;
+    t.span     = parser.span_of(start, end_span);
+    t.kind     = m_type.TYPE_KIND_PTR;
+    t.data.ptr = ptr;
+    ret parser.push_type(p, t);
+}
+
+# parses a fixed-length array type `[N]T`
+# ---
+# p:     parser state
+# start: span of the leading `[` token
+# ret:   TypeId of the resulting TYPE_KIND_ARRAY node
+fun parse_array(p: *parser.Parser, start: token.Span) id.TypeId {
+    parser.advance(p);
+    val length: id.ExprId = parse_expr(p);
+    parser.expect(p, token.KIND_RBRACKET, "expected ']' after array length");
+
+    val element: id.TypeId = parse_type(p);
+
+    var array: m_type.TypeArray;
+    array.length  = length;
+    array.element = element;
+
+    var end_span: token.Span = start;
+    if (element != id.TYPE_NIL) {
+        end_span = ast.get_type(p.ast, element).span;
+    }
+
+    var t: m_type.Type;
+    t.span       = parser.span_of(start, end_span);
+    t.kind       = m_type.TYPE_KIND_ARRAY;
+    t.data.array = array;
+    ret parser.push_type(p, t);
+}
+
+# parses a function type `fun(T, U) R`
+# ---
+# p:     parser state
+# start: span of the `fun` keyword
+# ret:   TypeId of the resulting TYPE_KIND_FUN node
+fun parse_fun(p: *parser.Parser, start: token.Span) id.TypeId {
+    parser.advance(p);
+    parser.expect(p, token.KIND_LPAREN, "expected '(' after 'fun'");
+
+    val params_start: u32 = p.ast.extras_len::u32;
+    var params_len:   u32 = 0;
+
+    if (!parser.at(p, token.KIND_RPAREN)) {
+        val first: id.TypeId = parse_type(p);
+        parser.push_extra(p, first::u32);
+        params_len = params_len + 1;
+        for (parser.eat(p, token.KIND_COMMA)) {
+            if (parser.at(p, token.KIND_RPAREN)) { brk; }
+            val next: id.TypeId = parse_type(p);
+            parser.push_extra(p, next::u32);
+            params_len = params_len + 1;
+        }
+    }
+
+    val close: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_RPAREN, "expected ')' to close function parameters");
+
+    var ret_type: id.TypeId = id.TYPE_NIL;
+    var end_span: token.Span = close.span;
+
+    if (!at_type_boundary(p)) {
+        ret_type = parse_type(p);
+        if (ret_type != id.TYPE_NIL) {
+            end_span = ast.get_type(p.ast, ret_type).span;
+        }
+    }
+
+    var fun_: m_type.TypeFun;
+    fun_.params_start = params_start;
+    fun_.params_len   = params_len;
+    fun_.ret          = ret_type;
+
+    var t: m_type.Type;
+    t.span      = parser.span_of(start, end_span);
+    t.kind      = m_type.TYPE_KIND_FUN;
+    t.data.fun_ = fun_;
+    ret parser.push_type(p, t);
+}
+
+# parses an anonymous record or union type `rec { ... }` / `uni { ... }`
+# ---
+# p:     parser state
+# start: span of the `rec` or `uni` keyword
+# kind:  TYPE_KIND_REC or TYPE_KIND_UNI
+# ret:   TypeId of the resulting node
+fun parse_rec_or_uni(p: *parser.Parser, start: token.Span, kind: m_type.TypeKind) id.TypeId {
+    parser.advance(p);
+    parser.expect(p, token.KIND_LBRACE, "expected '{' to open anonymous type body");
+
+    val fields_start: u32 = p.ast.typed_name_len::u32;
+    var fields_len:   u32 = 0;
+
+    for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
+        if (!parser.at(p, token.KIND_IDENT)) {
+            parser.error_at_current(p, "expected a field name");
+            parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
+            if (parser.at(p, token.KIND_SEMI)) { parser.advance(p); }
+            cnt;
+        }
+        val name: token.Span = parser.advance(p).span;
+        parser.expect(p, token.KIND_COLON, "expected ':' between field name and type");
+        val ty: id.TypeId = parse_type(p);
+
+        var tn: decl.TypedName;
+        tn.name = name;
+        tn.ty   = ty;
+        val tn_r: Result[u32, str] = ast.add_typed_name(p.ast, tn);
+        if (is_err[u32, str](tn_r)) {
+            parser.error_at_current(p, "out of memory while parsing anonymous type field");
+            brk;
+        }
+        fields_len = fields_len + 1;
+
+        parser.expect(p, token.KIND_SEMI, "expected ';' after field declaration");
+    }
+
+    val close: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_RBRACE, "expected '}' to close anonymous type body");
+
+    var t: m_type.Type;
+    t.span = parser.span_of(start, close.span);
+    t.kind = kind;
+    if (kind == m_type.TYPE_KIND_REC) {
+        var r: m_type.TypeRec;
+        r.fields_start = fields_start;
+        r.fields_len   = fields_len;
+        t.data.rec_    = r;
+    } or {
+        var u: m_type.TypeUni;
+        u.fields_start = fields_start;
+        u.fields_len   = fields_len;
+        t.data.uni_    = u;
+    }
+    ret parser.push_type(p, t);
+}
+
+# true when the current token cannot begin a type (used to detect an omitted return type in `fun(...)` signatures)
+fun at_type_boundary(p: *parser.Parser) bool {
+    val k: token.Kind = parser.current(p).kind;
+    if (k == token.KIND_LBRACE)   { ret true; }
+    if (k == token.KIND_SEMI)     { ret true; }
+    if (k == token.KIND_COMMA)    { ret true; }
+    if (k == token.KIND_RPAREN)   { ret true; }
+    if (k == token.KIND_RBRACKET) { ret true; }
+    if (k == token.KIND_EOF)      { ret true; }
+    ret false;
+}
