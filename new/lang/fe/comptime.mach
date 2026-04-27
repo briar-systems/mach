@@ -1,0 +1,206 @@
+# bounded const-eval engine used by the module-graph driver and the resolve
+# phase to evaluate `$if` predicates and other compile-time-constant
+# expressions.
+#
+# scope: literals, references to comptime-known constants (`$mach.*` and
+# user-registered vals), and arithmetic / comparison / logical / bitwise /
+# shift operators over them.
+#
+# explicitly out of scope: function calls, loops, type-introspection
+# intrinsics (`$size_of` and friends are sema's job once types are known),
+# and any expression that cannot be reduced to a single comptime value.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.zstr;
+use std.types.result;
+
+use std.allocator;
+
+use intern: mach.lang.intern;
+use ast:    mach.lang.fe.ast;
+use id:     mach.lang.fe.ast.id;
+use expr:   mach.lang.fe.ast.expr;
+use token:  mach.lang.fe.token;
+use os:     mach.lang.target.os;
+use isa:    mach.lang.target.isa;
+
+# discriminator for CTValue.data
+pub def CTKind: u8;
+
+pub val CT_KIND_INT:   CTKind = 0;
+pub val CT_KIND_FLOAT: CTKind = 1;
+pub val CT_KIND_BOOL:  CTKind = 2;
+pub val CT_KIND_STR:   CTKind = 3;
+
+# a tagged comptime-evaluated value
+# ---
+# kind: which CT_KIND_* variant is active
+# data: kind-specific payload
+pub rec CTValue {
+    kind: CTKind;
+    data: uni {
+        i: i64;
+        f: f64;
+        b: bool;
+        s: intern.StrId;
+    };
+}
+
+# named comptime constant; produced when a comptime-evaluable val decl is
+# registered with a context for later reference by its bare identifier
+# ---
+# name:  interned identifier
+# value: pre-evaluated constant
+pub rec NamedConst {
+    name:  intern.StrId;
+    value: CTValue;
+}
+
+# build/target context plus user-defined comptime constants visible to one
+# evaluation. populated by the driver from mach.toml plus prior comptime val
+# decls evaluated in dependency order.
+# ---
+# alloc:          allocator used for the user_consts buffer
+# target_os_id:   numeric os id (one of os.OS_*)
+# target_arch_id: numeric arch id (one of isa.ARCH_*)
+# pointer_width:  target pointer width in bytes
+# compiler_name:  interned "mach"
+# compiler_ver:   interned compiler version string
+# user_consts:    array of NamedConst entries; linear lookup is fine at this size
+# user_const_len: number of entries currently stored
+# user_const_cap: allocated slots in user_consts
+pub rec ComptimeCtx {
+    alloc:          *Allocator;
+    target_os_id:   u32;
+    target_arch_id: u32;
+    pointer_width:  u32;
+    compiler_name:  intern.StrId;
+    compiler_ver:   intern.StrId;
+    user_consts:    *NamedConst;
+    user_const_len: u32;
+    user_const_cap: u32;
+}
+
+val INITIAL_CONST_CAP: u32 = 16;
+
+# constructs a ComptimeCtx with the given target parameters and no user consts
+# ---
+# alloc:          allocator used for owned storage
+# target_os_id:   numeric os id (one of os.OS_*)
+# target_arch_id: numeric arch id (one of isa.ARCH_*)
+# pointer_width:  pointer width in bytes for the target
+# compiler_name:  interned compiler name
+# compiler_ver:   interned compiler version
+# ret:            a fresh ComptimeCtx
+pub fun init(
+    alloc:          *Allocator,
+    target_os_id:   u32,
+    target_arch_id: u32,
+    pointer_width:  u32,
+    compiler_name:  intern.StrId,
+    compiler_ver:   intern.StrId,
+) ComptimeCtx {
+    var c: ComptimeCtx;
+    c.alloc          = alloc;
+    c.target_os_id   = target_os_id;
+    c.target_arch_id = target_arch_id;
+    c.pointer_width  = pointer_width;
+    c.compiler_name  = compiler_name;
+    c.compiler_ver   = compiler_ver;
+    c.user_consts    = nil;
+    c.user_const_len = 0;
+    c.user_const_cap = 0;
+    ret c;
+}
+
+# releases the user_consts buffer
+# ---
+# c: context to tear down; all fields are zeroed
+pub fun dnit(c: *ComptimeCtx) {
+    if (c == nil) { ret; }
+    if (c.user_consts != nil && c.user_const_cap > 0) {
+        deallocate[NamedConst](c.alloc, c.user_consts, c.user_const_cap::usize);
+    }
+    c.user_consts    = nil;
+    c.user_const_len = 0;
+    c.user_const_cap = 0;
+}
+
+# registers a comptime constant under `name`, growing user_consts as needed
+# ---
+# c:     context to extend
+# name:  interned identifier
+# value: pre-evaluated constant
+# ret:   true on success, or an allocation error
+pub fun register(c: *ComptimeCtx, name: intern.StrId, value: CTValue) Result[bool, str] {
+    if (c.user_consts == nil) {
+        val r: Result[*NamedConst, str] = allocate[NamedConst](c.alloc, INITIAL_CONST_CAP::usize);
+        if (is_err[*NamedConst, str](r)) {
+            ret err[bool, str](unwrap_err[*NamedConst, str](r));
+        }
+        c.user_consts    = unwrap_ok[*NamedConst, str](r);
+        c.user_const_cap = INITIAL_CONST_CAP;
+    }
+    or (c.user_const_len == c.user_const_cap) {
+        val new_cap: u32 = c.user_const_cap * 2;
+        val r: Result[*NamedConst, str] = reallocate[NamedConst](c.alloc, c.user_consts, c.user_const_cap::usize, new_cap::usize);
+        if (is_err[*NamedConst, str](r)) {
+            ret err[bool, str](unwrap_err[*NamedConst, str](r));
+        }
+        c.user_consts    = unwrap_ok[*NamedConst, str](r);
+        c.user_const_cap = new_cap;
+    }
+
+    var nc: NamedConst;
+    nc.name  = name;
+    nc.value = value;
+    c.user_consts[c.user_const_len] = nc;
+    c.user_const_len = c.user_const_len + 1;
+    ret ok[bool, str](true);
+}
+
+# looks up a comptime constant by interned name
+# ---
+# c:    context to search
+# name: interned identifier to find
+# ret:  pointer to the entry in c.user_consts, or nil if not registered
+pub fun lookup(c: *ComptimeCtx, name: intern.StrId) *NamedConst {
+    var i: u32 = 0;
+    for (i < c.user_const_len) {
+        if (c.user_consts[i].name == name) {
+            ret ?c.user_consts[i];
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# truthiness check for $if/$or predicates: only CT_KIND_BOOL values are
+# considered truthy; non-bool values are an error at the call site (this
+# helper is called only after eval has succeeded with a bool result)
+# ---
+# v:   value to test
+# ret: true when v.kind is CT_KIND_BOOL and v.data.b is true
+pub fun is_truthy(v: CTValue) bool {
+    ret v.kind == CT_KIND_BOOL && v.data.b;
+}
+
+# evaluates a comptime expression in the given context
+# ---
+# c:        the comptime context (target params + user constants)
+# ast:      the ast that owns `e`
+# source:   source text covering `e` (for span lookup)
+# e:        expression id to evaluate
+# interner: shared string interner; used to compare identifier text via StrId
+# ret:      a CTValue, or an error message describing why evaluation failed
+pub fun eval(
+    c:        *ComptimeCtx,
+    a:        *ast.Ast,
+    source:   str,
+    e:        id.ExprId,
+    interner: *intern.Interner,
+) Result[CTValue, str] {
+    ret err[CTValue, str]("comptime.eval not yet implemented");
+}
