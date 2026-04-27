@@ -1,0 +1,1202 @@
+# name resolution for one parsed module.
+#
+# walks the module's decls in two passes:
+#   1. collect — registers a Symbol for every binding decl reachable from
+#      module scope, evaluating `$if` predicates via the comptime evaluator
+#      and registering comptime-evaluable val initializers as named consts.
+#      use decls inject symbols into the module scope (as either a single
+#      use-alias or a flat slice of imported pub symbols).
+#   2. bind — walks every decl, stmt, expr, and type, looking up name
+#      references against the scope chain and writing the resolved SymbolId
+#      into parallel arrays sized to the AST.
+#
+# unresolved names become SYMBOL_NIL and emit an error diagnostic but do not
+# halt the pass; sema treats SYMBOL_NIL bindings as having an error type that
+# absorbs further operations.
+
+use std.types.bool;
+use std.types.size;
+use std.types.string;
+use std.types.zstr;
+use std.types.result;
+
+use std.allocator;
+
+use src:    mach.lang.source;
+use diag:   mach.lang.diagnostic;
+use intern: mach.lang.intern;
+use sess:   mach.lang.session;
+
+use ast:      mach.lang.fe.ast;
+use id:       mach.lang.fe.ast.id;
+use module:   mach.lang.fe.ast.module;
+use decl:     mach.lang.fe.ast.decl;
+use stmt:     mach.lang.fe.ast.stmt;
+use expr:     mach.lang.fe.ast.expr;
+use atype:    mach.lang.fe.ast.type;
+use token:    mach.lang.fe.token;
+use comptime: mach.lang.fe.comptime;
+
+# identifier for a Symbol within one ResolveResult / ResolveContext
+pub def SymbolId: u32;
+
+pub val SYMBOL_NIL: SymbolId = 0xFFFFFFFF;
+
+# kind of a resolved Symbol
+pub def SymKind: u8;
+
+pub val SYM_FUN:      SymKind = 0;
+pub val SYM_REC:      SymKind = 1;
+pub val SYM_DEF:      SymKind = 2;
+pub val SYM_VAL:      SymKind = 3;
+pub val SYM_VAR:      SymKind = 4;
+pub val SYM_PARAM:    SymKind = 5;
+pub val SYM_GENERIC:  SymKind = 6;
+pub val SYM_USE:      SymKind = 7;
+pub val SYM_IMPORTED: SymKind = 8;
+pub val SYM_TEST:     SymKind = 9;
+
+# pub-flag bit, set when the symbol's source decl is `pub`
+pub val SYM_FLAG_PUB: u8 = 1;
+
+# a resolved symbol
+# ---
+# kind:   one of SYM_*
+# flags:  bitfield of SYM_FLAG_*
+# name:   interned identifier (STR_NIL for anonymous symbols)
+# decl:   originating DeclId in `origin`'s Ast (DECL_NIL when synthetic)
+# slot:   kind-dependent extra payload; param index for SYM_PARAM, generic
+#         index for SYM_GENERIC, target ModuleId for SYM_USE, otherwise 0
+# origin: ModuleId of the module that owns `decl` (this module for locally
+#         declared symbols, the dependency for SYM_USE / SYM_IMPORTED)
+pub rec Symbol {
+    kind:   SymKind;
+    flags:  u8;
+    name:   intern.StrId;
+    decl:   id.DeclId;
+    slot:   u32;
+    origin: sess.ModuleId;
+}
+
+# a snapshot of one pub symbol, copied by the driver into a dependent
+# module's ResolveDeps so resolve can bind cross-module references
+# ---
+# kind:   one of SYM_*
+# name:   interned identifier
+# decl:   DeclId in the owning module's Ast
+# origin: ModuleId of the owning module (= the dep this entry came from)
+pub rec PublicSymbol {
+    kind:   SymKind;
+    name:   intern.StrId;
+    decl:   id.DeclId;
+    origin: sess.ModuleId;
+}
+
+# the public surface of one module, indexed by interned path text. produced
+# by the driver from a previously resolved module's ResolveResult.
+# ---
+# path:    interned FQN of the module (e.g. "std.types.bool")
+# module:  ModuleId of the module
+# symbols: array of pub symbols
+# count:   number of entries in symbols
+pub rec ModuleExports {
+    path:    intern.StrId;
+    module:  sess.ModuleId;
+    symbols: *PublicSymbol;
+    count:   u32;
+}
+
+# every dependency's exports, supplied by the driver. resolve looks these
+# up by interned path when handling `use` decls.
+# ---
+# entries: array of ModuleExports records, one per loaded dep
+# count:   number of entries
+pub rec ResolveDeps {
+    entries: *ModuleExports;
+    count:   u32;
+}
+
+# parallel scope-chain identifier
+def ScopeId: u32;
+val SCOPE_NIL: ScopeId = 0xFFFFFFFF;
+
+rec ScopeEntry {
+    name: intern.StrId;
+    sym:  SymbolId;
+}
+
+rec Scope {
+    parent:  ScopeId;
+    entries: *ScopeEntry;
+    len:     u32;
+    cap:     u32;
+}
+
+val INITIAL_SCOPE_ENTRY_CAP: u32 = 8;
+val INITIAL_SCOPES_CAP:      u32 = 8;
+val INITIAL_SYMBOLS_CAP:     u32 = 32;
+
+# resolve's working state for one module
+rec ResolveContext {
+    s:          *sess.Session;
+    a:          *ast.Ast;
+    deps:       *ResolveDeps;
+    ctx:        *comptime.ComptimeCtx;
+    own_module: sess.ModuleId;
+    source:     str;
+
+    symbols:    *Symbol;
+    sym_len:    u32;
+    sym_cap:    u32;
+
+    expr_resolved: *SymbolId;
+    type_resolved: *SymbolId;
+    decl_symbol:   *SymbolId;
+
+    scopes:        *Scope;
+    scope_len:     u32;
+    scope_cap:     u32;
+
+    module_scope:  ScopeId;
+    current_scope: ScopeId;
+
+    pub_count: u32;
+}
+
+# the contract resolve produces for sema and the driver's export step
+# ---
+# alloc:         allocator backing all owned arrays
+# symbols:       universe of symbols; pub symbols sorted to indices [0, pub_count)
+# symbol_count:  total number of symbols
+# pub_count:     number of pub symbols at the front of `symbols`
+# expr_resolved: parallel to ast.exprs; SYMBOL_NIL outside binding sites
+# type_resolved: parallel to ast.types; SYMBOL_NIL outside binding sites
+# decl_symbol:   parallel to ast.decls; SYMBOL_NIL for non-binding decls
+pub rec ResolveResult {
+    alloc:         *Allocator;
+    symbols:       *Symbol;
+    symbol_count:  u32;
+    pub_count:     u32;
+    expr_resolved: *SymbolId;
+    type_resolved: *SymbolId;
+    decl_symbol:   *SymbolId;
+}
+
+# releases every array owned by the result and zeroes its fields
+# ---
+# r: result to tear down
+pub fun dnit_result(r: *ResolveResult) {
+    if (r == nil) { ret; }
+    if (r.symbols != nil && r.symbol_count > 0) {
+        deallocate[Symbol](r.alloc, r.symbols, r.symbol_count::usize);
+    }
+    if (r.expr_resolved != nil) {
+        deallocate[SymbolId](r.alloc, r.expr_resolved, 0);
+    }
+    if (r.type_resolved != nil) {
+        deallocate[SymbolId](r.alloc, r.type_resolved, 0);
+    }
+    if (r.decl_symbol != nil) {
+        deallocate[SymbolId](r.alloc, r.decl_symbol, 0);
+    }
+    r.symbols       = nil;
+    r.symbol_count  = 0;
+    r.pub_count     = 0;
+    r.expr_resolved = nil;
+    r.type_resolved = nil;
+    r.decl_symbol   = nil;
+}
+
+# resolves one module against its already-resolved dependencies
+# ---
+# s:          shared session (allocator, sources, diagnostics, interner)
+# a:          parsed Ast for the module being resolved
+# deps:       exports of every dependency, populated by the driver
+# ctx:        comptime evaluator context, pre-populated by the driver with
+#             target params and imported comptime constants. resolve mutates
+#             it as it discovers comptime-evaluable val decls in this module
+# own_module: project-wide ModuleId of the module being resolved
+# ret:        the populated ResolveResult, or an allocation error
+pub fun resolve(
+    s:          *sess.Session,
+    a:          *ast.Ast,
+    deps:       *ResolveDeps,
+    ctx:        *comptime.ComptimeCtx,
+    own_module: sess.ModuleId,
+) Result[ResolveResult, str] {
+    var rc: ResolveContext;
+    val init_r: Result[bool, str] = init_context(?rc, s, a, deps, ctx, own_module);
+    if (is_err[bool, str](init_r)) {
+        ret err[ResolveResult, str](unwrap_err[bool, str](init_r));
+    }
+
+    val ms_r: Result[ScopeId, str] = open_scope(?rc, SCOPE_NIL);
+    if (is_err[ScopeId, str](ms_r)) {
+        dnit_context(?rc);
+        ret err[ResolveResult, str](unwrap_err[ScopeId, str](ms_r));
+    }
+    rc.module_scope  = unwrap_ok[ScopeId, str](ms_r);
+    rc.current_scope = rc.module_scope;
+
+    val mnode: *module.Module = ast.get_module(a, a.root_module);
+
+    val c1: Result[bool, str] = collect_decl_list(?rc, mnode.decls_start, mnode.decls_len, rc.module_scope, true);
+    if (is_err[bool, str](c1)) {
+        dnit_context(?rc);
+        ret err[ResolveResult, str](unwrap_err[bool, str](c1));
+    }
+
+    val b1: Result[bool, str] = bind_decl_list(?rc, mnode.decls_start, mnode.decls_len);
+    if (is_err[bool, str](b1)) {
+        dnit_context(?rc);
+        ret err[ResolveResult, str](unwrap_err[bool, str](b1));
+    }
+
+    ret build_result(?rc);
+}
+
+fun init_context(
+    rc:         *ResolveContext,
+    s:          *sess.Session,
+    a:          *ast.Ast,
+    deps:       *ResolveDeps,
+    ctx:        *comptime.ComptimeCtx,
+    own_module: sess.ModuleId,
+) Result[bool, str] {
+    rc.s          = s;
+    rc.a          = a;
+    rc.deps       = deps;
+    rc.ctx        = ctx;
+    rc.own_module = own_module;
+
+    val file: *src.SourceFile = src.get(?s.sources, a.file_id);
+    rc.source = file.text;
+
+    rc.symbols  = nil;
+    rc.sym_len  = 0;
+    rc.sym_cap  = 0;
+
+    rc.expr_resolved = nil;
+    rc.type_resolved = nil;
+    rc.decl_symbol   = nil;
+
+    rc.scopes        = nil;
+    rc.scope_len     = 0;
+    rc.scope_cap     = 0;
+    rc.module_scope  = SCOPE_NIL;
+    rc.current_scope = SCOPE_NIL;
+    rc.pub_count     = 0;
+
+    val sa: Result[*Symbol, str] = allocate[Symbol](s.alloc, INITIAL_SYMBOLS_CAP::usize);
+    if (is_err[*Symbol, str](sa)) {
+        ret err[bool, str](unwrap_err[*Symbol, str](sa));
+    }
+    rc.symbols = unwrap_ok[*Symbol, str](sa);
+    rc.sym_cap = INITIAL_SYMBOLS_CAP;
+
+    val sca: Result[*Scope, str] = allocate[Scope](s.alloc, INITIAL_SCOPES_CAP::usize);
+    if (is_err[*Scope, str](sca)) {
+        deallocate[Symbol](s.alloc, rc.symbols, rc.sym_cap::usize);
+        rc.symbols = nil;
+        rc.sym_cap = 0;
+        ret err[bool, str](unwrap_err[*Scope, str](sca));
+    }
+    rc.scopes    = unwrap_ok[*Scope, str](sca);
+    rc.scope_cap = INITIAL_SCOPES_CAP;
+
+    if (a.expr_len > 0) {
+        val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.expr_len);
+        if (is_err[*SymbolId, str](r)) { ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
+        rc.expr_resolved = unwrap_ok[*SymbolId, str](r);
+        fill_nil(rc.expr_resolved, a.expr_len::u32);
+    }
+    if (a.type_len > 0) {
+        val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.type_len);
+        if (is_err[*SymbolId, str](r)) { ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
+        rc.type_resolved = unwrap_ok[*SymbolId, str](r);
+        fill_nil(rc.type_resolved, a.type_len::u32);
+    }
+    if (a.decl_len > 0) {
+        val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.decl_len);
+        if (is_err[*SymbolId, str](r)) { ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
+        rc.decl_symbol = unwrap_ok[*SymbolId, str](r);
+        fill_nil(rc.decl_symbol, a.decl_len::u32);
+    }
+
+    ret ok[bool, str](true);
+}
+
+fun fill_nil(arr: *SymbolId, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        arr[i] = SYMBOL_NIL;
+        i = i + 1;
+    }
+}
+
+fun dnit_context(rc: *ResolveContext) {
+    var i: u32 = 0;
+    for (i < rc.scope_len) {
+        val sc: *Scope = ?rc.scopes[i];
+        if (sc.entries != nil && sc.cap > 0) {
+            deallocate[ScopeEntry](rc.s.alloc, sc.entries, sc.cap::usize);
+        }
+        i = i + 1;
+    }
+    if (rc.scopes != nil && rc.scope_cap > 0) {
+        deallocate[Scope](rc.s.alloc, rc.scopes, rc.scope_cap::usize);
+    }
+    if (rc.symbols != nil && rc.sym_cap > 0) {
+        deallocate[Symbol](rc.s.alloc, rc.symbols, rc.sym_cap::usize);
+    }
+    if (rc.expr_resolved != nil) {
+        deallocate[SymbolId](rc.s.alloc, rc.expr_resolved, rc.a.expr_len);
+    }
+    if (rc.type_resolved != nil) {
+        deallocate[SymbolId](rc.s.alloc, rc.type_resolved, rc.a.type_len);
+    }
+    if (rc.decl_symbol != nil) {
+        deallocate[SymbolId](rc.s.alloc, rc.decl_symbol, rc.a.decl_len);
+    }
+}
+
+fun open_scope(rc: *ResolveContext, parent: ScopeId) Result[ScopeId, str] {
+    if (rc.scope_len == rc.scope_cap) {
+        val new_cap: u32 = rc.scope_cap * 2;
+        val r: Result[*Scope, str] = reallocate[Scope](rc.s.alloc, rc.scopes, rc.scope_cap::usize, new_cap::usize);
+        if (is_err[*Scope, str](r)) {
+            ret err[ScopeId, str](unwrap_err[*Scope, str](r));
+        }
+        rc.scopes    = unwrap_ok[*Scope, str](r);
+        rc.scope_cap = new_cap;
+    }
+    var sc: Scope;
+    sc.parent  = parent;
+    sc.entries = nil;
+    sc.len     = 0;
+    sc.cap     = 0;
+    val sid: ScopeId = rc.scope_len;
+    rc.scopes[rc.scope_len] = sc;
+    rc.scope_len = rc.scope_len + 1;
+    ret ok[ScopeId, str](sid);
+}
+
+fun scope_add(rc: *ResolveContext, scope: ScopeId, name: intern.StrId, sym: SymbolId) Result[bool, str] {
+    val sc: *Scope = ?rc.scopes[scope];
+    if (sc.entries == nil) {
+        val r: Result[*ScopeEntry, str] = allocate[ScopeEntry](rc.s.alloc, INITIAL_SCOPE_ENTRY_CAP::usize);
+        if (is_err[*ScopeEntry, str](r)) { ret err[bool, str](unwrap_err[*ScopeEntry, str](r)); }
+        sc.entries = unwrap_ok[*ScopeEntry, str](r);
+        sc.cap     = INITIAL_SCOPE_ENTRY_CAP;
+    }
+    or (sc.len == sc.cap) {
+        val new_cap: u32 = sc.cap * 2;
+        val r: Result[*ScopeEntry, str] = reallocate[ScopeEntry](rc.s.alloc, sc.entries, sc.cap::usize, new_cap::usize);
+        if (is_err[*ScopeEntry, str](r)) { ret err[bool, str](unwrap_err[*ScopeEntry, str](r)); }
+        sc.entries = unwrap_ok[*ScopeEntry, str](r);
+        sc.cap     = new_cap;
+    }
+    var e: ScopeEntry;
+    e.name = name;
+    e.sym  = sym;
+    sc.entries[sc.len] = e;
+    sc.len = sc.len + 1;
+    ret ok[bool, str](true);
+}
+
+fun scope_lookup_local(rc: *ResolveContext, scope: ScopeId, name: intern.StrId) SymbolId {
+    if (scope == SCOPE_NIL) { ret SYMBOL_NIL; }
+    val sc: *Scope = ?rc.scopes[scope];
+    var i: u32 = 0;
+    for (i < sc.len) {
+        if (sc.entries[i].name == name) { ret sc.entries[i].sym; }
+        i = i + 1;
+    }
+    ret SYMBOL_NIL;
+}
+
+fun scope_lookup_chain(rc: *ResolveContext, scope: ScopeId, name: intern.StrId) SymbolId {
+    var cur: ScopeId = scope;
+    for (cur != SCOPE_NIL) {
+        val found: SymbolId = scope_lookup_local(rc, cur, name);
+        if (found != SYMBOL_NIL) { ret found; }
+        cur = rc.scopes[cur].parent;
+    }
+    ret SYMBOL_NIL;
+}
+
+fun add_symbol(rc: *ResolveContext, kind: SymKind, flags: u8, name: intern.StrId, decl_id: id.DeclId, slot: u32, origin: sess.ModuleId) Result[SymbolId, str] {
+    if (rc.sym_len == rc.sym_cap) {
+        val new_cap: u32 = rc.sym_cap * 2;
+        val r: Result[*Symbol, str] = reallocate[Symbol](rc.s.alloc, rc.symbols, rc.sym_cap::usize, new_cap::usize);
+        if (is_err[*Symbol, str](r)) {
+            ret err[SymbolId, str](unwrap_err[*Symbol, str](r));
+        }
+        rc.symbols = unwrap_ok[*Symbol, str](r);
+        rc.sym_cap = new_cap;
+    }
+    var sym: Symbol;
+    sym.kind   = kind;
+    sym.flags  = flags;
+    sym.name   = name;
+    sym.decl   = decl_id;
+    sym.slot   = slot;
+    sym.origin = origin;
+    val sid: SymbolId = rc.sym_len;
+    rc.symbols[rc.sym_len] = sym;
+    rc.sym_len = rc.sym_len + 1;
+    ret ok[SymbolId, str](sid);
+}
+
+fun declare(
+    rc:      *ResolveContext,
+    kind:    SymKind,
+    flags:   u8,
+    name:    token.Span,
+    decl_id: id.DeclId,
+    slot:    u32,
+    origin:  sess.ModuleId,
+    scope:   ScopeId,
+) Result[SymbolId, str] {
+    if (name.len == 0) {
+        ret ok[SymbolId, str](SYMBOL_NIL);
+    }
+    val r_id: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, name);
+    if (is_err[intern.StrId, str](r_id)) {
+        ret err[SymbolId, str](unwrap_err[intern.StrId, str](r_id));
+    }
+    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](r_id);
+
+    val existing: SymbolId = scope_lookup_local(rc, scope, name_id);
+    if (existing != SYMBOL_NIL) {
+        diag.error(?rc.s.diags, rc.a.file_id, name, "duplicate definition in this scope");
+        ret ok[SymbolId, str](SYMBOL_NIL);
+    }
+
+    val r_sym: Result[SymbolId, str] = add_symbol(rc, kind, flags, name_id, decl_id, slot, origin);
+    if (is_err[SymbolId, str](r_sym)) { ret r_sym; }
+    val sid: SymbolId = unwrap_ok[SymbolId, str](r_sym);
+
+    val r_add: Result[bool, str] = scope_add(rc, scope, name_id, sid);
+    if (is_err[bool, str](r_add)) {
+        ret err[SymbolId, str](unwrap_err[bool, str](r_add));
+    }
+
+    ret ok[SymbolId, str](sid);
+}
+
+# ----------------------------------------------------------------------
+# pass 1: collect symbols + register comptime vals
+# ----------------------------------------------------------------------
+
+fun collect_decl_list(rc: *ResolveContext, extras_start: u32, len: u32, scope: ScopeId, at_module_scope: bool) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val decl_id: id.DeclId = rc.a.extras[extras_start + i]::id.DeclId;
+        val r: Result[bool, str] = collect_one_decl(rc, decl_id, scope, at_module_scope);
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun collect_one_decl(rc: *ResolveContext, decl_id: id.DeclId, scope: ScopeId, at_module_scope: bool) Result[bool, str] {
+    val d: *decl.Decl = ast.get_decl(rc.a, decl_id);
+    val flags_in: u8 = d.flags;
+
+    if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+        ret collect_comptime_if(rc, ?d.data.comptime_if, scope, at_module_scope, true);
+    }
+    if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
+        ret ok[bool, str](true);
+    }
+    if (d.kind == decl.DECL_KIND_TEST || d.kind == decl.DECL_KIND_ERROR) {
+        ret ok[bool, str](true);
+    }
+
+    val sym_flags: u8 = symbol_flags_from(flags_in, at_module_scope);
+
+    if (d.kind == decl.DECL_KIND_USE) {
+        ret collect_use(rc, decl_id, ?d.data.use_, scope);
+    }
+    if (d.kind == decl.DECL_KIND_FUN) {
+        ret declare_decl(rc, SYM_FUN, sym_flags, d.data.fun_.name, decl_id, scope);
+    }
+    if (d.kind == decl.DECL_KIND_REC) {
+        ret declare_decl(rc, SYM_REC, sym_flags, d.data.rec_.name, decl_id, scope);
+    }
+    if (d.kind == decl.DECL_KIND_DEF) {
+        ret declare_decl(rc, SYM_DEF, sym_flags, d.data.def_.name, decl_id, scope);
+    }
+    if (d.kind == decl.DECL_KIND_VAL) {
+        val r: Result[bool, str] = declare_decl(rc, SYM_VAL, sym_flags, d.data.bind.name, decl_id, scope);
+        if (is_err[bool, str](r)) { ret r; }
+        if (d.data.bind.init != id.EXPR_NIL) {
+            try_register_comptime_const(rc, d.data.bind.name, d.data.bind.init);
+        }
+        ret ok[bool, str](true);
+    }
+    if (d.kind == decl.DECL_KIND_VAR) {
+        ret declare_decl(rc, SYM_VAR, sym_flags, d.data.bind.name, decl_id, scope);
+    }
+    ret ok[bool, str](true);
+}
+
+fun declare_decl(rc: *ResolveContext, kind: SymKind, flags: u8, name_span: token.Span, decl_id: id.DeclId, scope: ScopeId) Result[bool, str] {
+    val r: Result[SymbolId, str] = declare(rc, kind, flags, name_span, decl_id, 0, rc.own_module, scope);
+    if (is_err[SymbolId, str](r)) { ret err[bool, str](unwrap_err[SymbolId, str](r)); }
+    if (rc.decl_symbol != nil) {
+        rc.decl_symbol[decl_id] = unwrap_ok[SymbolId, str](r);
+    }
+    ret ok[bool, str](true);
+}
+
+fun symbol_flags_from(decl_flags: u8, at_module_scope: bool) u8 {
+    if (at_module_scope && (decl_flags & decl.DECL_FLAG_PUB) != 0) {
+        ret SYM_FLAG_PUB;
+    }
+    ret 0;
+}
+
+fun try_register_comptime_const(rc: *ResolveContext, name_span: token.Span, init_expr: id.ExprId) {
+    if (name_span.len == 0) { ret; }
+    val r_id: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, name_span);
+    if (is_err[intern.StrId, str](r_id)) { ret; }
+    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](r_id);
+
+    val r_val: Result[comptime.CTValue, str] = comptime.eval(rc.ctx, rc.a, rc.source, init_expr, ?rc.s.interner);
+    if (is_err[comptime.CTValue, str](r_val)) { ret; }
+    val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r_val);
+
+    comptime.register(rc.ctx, name_id, v);
+}
+
+fun collect_comptime_if(rc: *ResolveContext, ci: *decl.DeclComptimeIf, scope: ScopeId, at_module_scope: bool, at_decl_scope: bool) Result[bool, str] {
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[ci.branches_start + bi];
+        val take: bool = comptime_branch_active(rc, br);
+        if (take) {
+            if (at_decl_scope) {
+                ret collect_decl_list(rc, br.body_start, br.body_len, scope, at_module_scope);
+            }
+            ret ok[bool, str](true);
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun comptime_branch_active(rc: *ResolveContext, br: *decl.ComptimeBranch) bool {
+    if (br.cond == id.EXPR_NIL) { ret true; }
+    val r: Result[comptime.CTValue, str] = comptime.eval(rc.ctx, rc.a, rc.source, br.cond, ?rc.s.interner);
+    if (is_err[comptime.CTValue, str](r)) {
+        val span: token.Span = ast.get_expr(rc.a, br.cond).span;
+        diag.error(?rc.s.diags, rc.a.file_id, span, unwrap_err[comptime.CTValue, str](r));
+        ret false;
+    }
+    val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r);
+    if (v.kind != comptime.CT_KIND_BOOL) {
+        val span: token.Span = ast.get_expr(rc.a, br.cond).span;
+        diag.error(?rc.s.diags, rc.a.file_id, span, "comptime branch condition must be a bool");
+        ret false;
+    }
+    ret v.data.b;
+}
+
+fun collect_use(rc: *ResolveContext, decl_id: id.DeclId, du: *decl.DeclUse, scope: ScopeId) Result[bool, str] {
+    if (du.path.len == 0) {
+        ret ok[bool, str](true);
+    }
+
+    val r_path: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, du.path);
+    if (is_err[intern.StrId, str](r_path)) {
+        ret err[bool, str](unwrap_err[intern.StrId, str](r_path));
+    }
+    val path_id: intern.StrId = unwrap_ok[intern.StrId, str](r_path);
+
+    val mx: *ModuleExports = find_module_exports(rc, path_id);
+    if (mx == nil) {
+        diag.error(?rc.s.diags, rc.a.file_id, du.path, "imported module is not in the dep set");
+        ret ok[bool, str](true);
+    }
+
+    if (du.alias.len > 0) {
+        val r: Result[SymbolId, str] = declare(rc, SYM_USE, 0, du.alias, decl_id, mx.module::u32, rc.own_module, scope);
+        if (is_err[SymbolId, str](r)) { ret err[bool, str](unwrap_err[SymbolId, str](r)); }
+        if (rc.decl_symbol != nil) {
+            rc.decl_symbol[decl_id] = unwrap_ok[SymbolId, str](r);
+        }
+        ret ok[bool, str](true);
+    }
+
+    var i: u32 = 0;
+    for (i < mx.count) {
+        val ps: *PublicSymbol = ?mx.symbols[i];
+        val existing: SymbolId = scope_lookup_local(rc, scope, ps.name);
+        if (existing != SYMBOL_NIL) {
+            diag.error(?rc.s.diags, rc.a.file_id, du.path, "imported name already defined in this scope");
+        }
+        or {
+            val r_sym: Result[SymbolId, str] = add_symbol(rc, SYM_IMPORTED, 0, ps.name, ps.decl, 0, ps.origin);
+            if (is_err[SymbolId, str](r_sym)) { ret err[bool, str](unwrap_err[SymbolId, str](r_sym)); }
+            val r_add: Result[bool, str] = scope_add(rc, scope, ps.name, unwrap_ok[SymbolId, str](r_sym));
+            if (is_err[bool, str](r_add)) { ret r_add; }
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun find_module_exports(rc: *ResolveContext, path: intern.StrId) *ModuleExports {
+    var i: u32 = 0;
+    for (i < rc.deps.count) {
+        val mx: *ModuleExports = ?rc.deps.entries[i];
+        if (mx.path == path) { ret mx; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# ----------------------------------------------------------------------
+# pass 2: bind name references inside decl bodies
+# ----------------------------------------------------------------------
+
+fun bind_decl_list(rc: *ResolveContext, extras_start: u32, len: u32) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val decl_id: id.DeclId = rc.a.extras[extras_start + i]::id.DeclId;
+        val r: Result[bool, str] = bind_one_decl(rc, decl_id);
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun bind_one_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
+    val d: *decl.Decl = ast.get_decl(rc.a, decl_id);
+
+    if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+        ret bind_comptime_if(rc, ?d.data.comptime_if, true);
+    }
+    if (d.kind == decl.DECL_KIND_USE || d.kind == decl.DECL_KIND_ERROR) {
+        ret ok[bool, str](true);
+    }
+    if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
+        ret bind_expr(rc, d.data.comptime_attr.value);
+    }
+    if (d.kind == decl.DECL_KIND_FUN) {
+        ret bind_fun(rc, ?d.data.fun_, decl_id);
+    }
+    if (d.kind == decl.DECL_KIND_REC) {
+        ret bind_rec(rc, ?d.data.rec_);
+    }
+    if (d.kind == decl.DECL_KIND_DEF) {
+        ret bind_type(rc, d.data.def_.ty);
+    }
+    if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) {
+        if (d.data.bind.ty != id.TYPE_NIL) {
+            val r: Result[bool, str] = bind_type(rc, d.data.bind.ty);
+            if (is_err[bool, str](r)) { ret r; }
+        }
+        if (d.data.bind.init != id.EXPR_NIL) {
+            ret bind_expr(rc, d.data.bind.init);
+        }
+        ret ok[bool, str](true);
+    }
+    if (d.kind == decl.DECL_KIND_TEST) {
+        if (d.data.test_.body != id.STMT_NIL) {
+            ret bind_stmt(rc, d.data.test_.body);
+        }
+        ret ok[bool, str](true);
+    }
+    ret ok[bool, str](true);
+}
+
+fun bind_comptime_if(rc: *ResolveContext, ci: *decl.DeclComptimeIf, at_decl_scope: bool) Result[bool, str] {
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[ci.branches_start + bi];
+        if (comptime_branch_active(rc, br)) {
+            if (at_decl_scope) {
+                ret bind_decl_list(rc, br.body_start, br.body_len);
+            }
+            ret bind_stmt_list(rc, br.body_start, br.body_len);
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun bind_fun(rc: *ResolveContext, f: *decl.DeclFun, decl_id: id.DeclId) Result[bool, str] {
+    val r_g: Result[ScopeId, str] = open_scope(rc, rc.current_scope);
+    if (is_err[ScopeId, str](r_g)) { ret err[bool, str](unwrap_err[ScopeId, str](r_g)); }
+    val gen_scope: ScopeId = unwrap_ok[ScopeId, str](r_g);
+    val saved_scope: ScopeId = rc.current_scope;
+    rc.current_scope = gen_scope;
+
+    var gi: u32 = 0;
+    for (gi < f.generics_len) {
+        val name: token.Span = rc.a.generic_names[f.generics_start + gi];
+        val r: Result[SymbolId, str] = declare(rc, SYM_GENERIC, 0, name, decl_id, gi, rc.own_module, gen_scope);
+        if (is_err[SymbolId, str](r)) {
+            rc.current_scope = saved_scope;
+            ret err[bool, str](unwrap_err[SymbolId, str](r));
+        }
+        gi = gi + 1;
+    }
+
+    val r_p: Result[ScopeId, str] = open_scope(rc, gen_scope);
+    if (is_err[ScopeId, str](r_p)) {
+        rc.current_scope = saved_scope;
+        ret err[bool, str](unwrap_err[ScopeId, str](r_p));
+    }
+    val param_scope: ScopeId = unwrap_ok[ScopeId, str](r_p);
+    rc.current_scope = param_scope;
+
+    var pi: u32 = 0;
+    for (pi < f.params_len) {
+        val tn: *decl.TypedName = ?rc.a.typed_names[f.params_start + pi];
+        val rt: Result[bool, str] = bind_type(rc, tn.ty);
+        if (is_err[bool, str](rt)) {
+            rc.current_scope = saved_scope;
+            ret rt;
+        }
+        val r: Result[SymbolId, str] = declare(rc, SYM_PARAM, 0, tn.name, decl_id, pi, rc.own_module, param_scope);
+        if (is_err[SymbolId, str](r)) {
+            rc.current_scope = saved_scope;
+            ret err[bool, str](unwrap_err[SymbolId, str](r));
+        }
+        pi = pi + 1;
+    }
+
+    if (f.return_type != id.TYPE_NIL) {
+        val rt: Result[bool, str] = bind_type(rc, f.return_type);
+        if (is_err[bool, str](rt)) {
+            rc.current_scope = saved_scope;
+            ret rt;
+        }
+    }
+
+    if (f.body != id.STMT_NIL) {
+        val rb: Result[bool, str] = bind_stmt(rc, f.body);
+        if (is_err[bool, str](rb)) {
+            rc.current_scope = saved_scope;
+            ret rb;
+        }
+    }
+
+    rc.current_scope = saved_scope;
+    ret ok[bool, str](true);
+}
+
+fun bind_rec(rc: *ResolveContext, r: *decl.DeclRec) Result[bool, str] {
+    val r_g: Result[ScopeId, str] = open_scope(rc, rc.current_scope);
+    if (is_err[ScopeId, str](r_g)) { ret err[bool, str](unwrap_err[ScopeId, str](r_g)); }
+    val gen_scope: ScopeId = unwrap_ok[ScopeId, str](r_g);
+    val saved_scope: ScopeId = rc.current_scope;
+    rc.current_scope = gen_scope;
+
+    var gi: u32 = 0;
+    for (gi < r.generics_len) {
+        val name: token.Span = rc.a.generic_names[r.generics_start + gi];
+        val rd: Result[SymbolId, str] = declare(rc, SYM_GENERIC, 0, name, id.DECL_NIL, gi, rc.own_module, gen_scope);
+        if (is_err[SymbolId, str](rd)) {
+            rc.current_scope = saved_scope;
+            ret err[bool, str](unwrap_err[SymbolId, str](rd));
+        }
+        gi = gi + 1;
+    }
+
+    var fi: u32 = 0;
+    for (fi < r.fields_len) {
+        val tn: *decl.TypedName = ?rc.a.typed_names[r.fields_start + fi];
+        val rt: Result[bool, str] = bind_type(rc, tn.ty);
+        if (is_err[bool, str](rt)) {
+            rc.current_scope = saved_scope;
+            ret rt;
+        }
+        fi = fi + 1;
+    }
+
+    rc.current_scope = saved_scope;
+    ret ok[bool, str](true);
+}
+
+fun bind_stmt_list(rc: *ResolveContext, extras_start: u32, len: u32) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val sid: id.StmtId = rc.a.extras[extras_start + i]::id.StmtId;
+        val r: Result[bool, str] = bind_stmt(rc, sid);
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) Result[bool, str] {
+    if (sid == id.STMT_NIL) { ret ok[bool, str](true); }
+    val s: *stmt.Stmt = ast.get_stmt(rc.a, sid);
+
+    if (s.kind == stmt.STMT_KIND_BLOCK) { ret bind_block(rc, ?s.data.block); }
+    if (s.kind == stmt.STMT_KIND_EXPR)  { ret bind_expr(rc, s.data.expr.expr); }
+    if (s.kind == stmt.STMT_KIND_RET) {
+        if (s.data.ret_.value == id.EXPR_NIL) { ret ok[bool, str](true); }
+        ret bind_expr(rc, s.data.ret_.value);
+    }
+    if (s.kind == stmt.STMT_KIND_FIN)   { ret bind_expr(rc, s.data.fin.expr); }
+    if (s.kind == stmt.STMT_KIND_BRK || s.kind == stmt.STMT_KIND_CNT) {
+        ret ok[bool, str](true);
+    }
+    if (s.kind == stmt.STMT_KIND_IF) {
+        val rc_e: Result[bool, str] = bind_expr(rc, s.data.if_.cond);
+        if (is_err[bool, str](rc_e)) { ret rc_e; }
+        val rt: Result[bool, str] = bind_stmt(rc, s.data.if_.then_block);
+        if (is_err[bool, str](rt)) { ret rt; }
+        ret bind_stmt(rc, s.data.if_.else_block);
+    }
+    if (s.kind == stmt.STMT_KIND_FOR) {
+        if (s.data.for_.cond != id.EXPR_NIL) {
+            val rc_e: Result[bool, str] = bind_expr(rc, s.data.for_.cond);
+            if (is_err[bool, str](rc_e)) { ret rc_e; }
+        }
+        ret bind_stmt(rc, s.data.for_.body);
+    }
+    if (s.kind == stmt.STMT_KIND_DECL) {
+        ret bind_local_decl(rc, s.data.decl.decl);
+    }
+    if (s.kind == stmt.STMT_KIND_ASM) {
+        ret ok[bool, str](true);
+    }
+    if (s.kind == stmt.STMT_KIND_COMPTIME_IF) {
+        var fake: decl.DeclComptimeIf;
+        fake.branches_start = s.data.comptime_if.branches_start;
+        fake.branches_len   = s.data.comptime_if.branches_len;
+        ret bind_comptime_if(rc, ?fake, false);
+    }
+    ret ok[bool, str](true);
+}
+
+fun bind_block(rc: *ResolveContext, b: *stmt.StmtBlock) Result[bool, str] {
+    val r_s: Result[ScopeId, str] = open_scope(rc, rc.current_scope);
+    if (is_err[ScopeId, str](r_s)) { ret err[bool, str](unwrap_err[ScopeId, str](r_s)); }
+    val saved: ScopeId = rc.current_scope;
+    rc.current_scope = unwrap_ok[ScopeId, str](r_s);
+
+    val r: Result[bool, str] = bind_stmt_list(rc, b.stmts_start, b.stmts_len);
+    rc.current_scope = saved;
+    ret r;
+}
+
+# locals (val/var inside a block) introduce sequentially visible bindings:
+# the type and initializer are bound first against the existing scope, then
+# the new symbol is added so subsequent statements can see it.
+fun bind_local_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
+    if (decl_id == id.DECL_NIL) { ret ok[bool, str](true); }
+    val d: *decl.Decl = ast.get_decl(rc.a, decl_id);
+
+    if (d.kind != decl.DECL_KIND_VAL && d.kind != decl.DECL_KIND_VAR) {
+        ret ok[bool, str](true);
+    }
+
+    if (d.data.bind.ty != id.TYPE_NIL) {
+        val rt: Result[bool, str] = bind_type(rc, d.data.bind.ty);
+        if (is_err[bool, str](rt)) { ret rt; }
+    }
+    if (d.data.bind.init != id.EXPR_NIL) {
+        val re: Result[bool, str] = bind_expr(rc, d.data.bind.init);
+        if (is_err[bool, str](re)) { ret re; }
+    }
+
+    val kind: SymKind = if_val_kind(d.kind == decl.DECL_KIND_VAL);
+    val r_sym: Result[SymbolId, str] = declare(rc, kind, 0, d.data.bind.name, decl_id, 0, rc.own_module, rc.current_scope);
+    if (is_err[SymbolId, str](r_sym)) {
+        ret err[bool, str](unwrap_err[SymbolId, str](r_sym));
+    }
+    if (rc.decl_symbol != nil) {
+        rc.decl_symbol[decl_id] = unwrap_ok[SymbolId, str](r_sym);
+    }
+
+    if (d.kind == decl.DECL_KIND_VAL && d.data.bind.init != id.EXPR_NIL) {
+        try_register_comptime_const(rc, d.data.bind.name, d.data.bind.init);
+    }
+
+    ret ok[bool, str](true);
+}
+
+fun if_val_kind(is_val: bool) SymKind {
+    if (is_val) { ret SYM_VAL; }
+    ret SYM_VAR;
+}
+
+fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
+    if (eid == id.EXPR_NIL) { ret ok[bool, str](true); }
+    val e: *expr.Expr = ast.get_expr(rc.a, eid);
+
+    if (e.kind == expr.EXPR_KIND_IDENT) {
+        ret bind_ident(rc, eid, e.span);
+    }
+    if (e.kind == expr.EXPR_KIND_BINARY) {
+        val rl: Result[bool, str] = bind_expr(rc, e.data.binary.lhs);
+        if (is_err[bool, str](rl)) { ret rl; }
+        ret bind_expr(rc, e.data.binary.rhs);
+    }
+    if (e.kind == expr.EXPR_KIND_UNARY) {
+        ret bind_expr(rc, e.data.unary.operand);
+    }
+    if (e.kind == expr.EXPR_KIND_CALL) {
+        val rc_e: Result[bool, str] = bind_expr(rc, e.data.call.callee);
+        if (is_err[bool, str](rc_e)) { ret rc_e; }
+        ret bind_expr_list(rc, e.data.call.args_start, e.data.call.args_len);
+    }
+    if (e.kind == expr.EXPR_KIND_INDEX) {
+        val ro: Result[bool, str] = bind_expr(rc, e.data.index.object);
+        if (is_err[bool, str](ro)) { ret ro; }
+        ret bind_expr(rc, e.data.index.index);
+    }
+    if (e.kind == expr.EXPR_KIND_MEMBER) {
+        ret bind_expr(rc, e.data.member.object);
+    }
+    if (e.kind == expr.EXPR_KIND_CAST) {
+        val rv: Result[bool, str] = bind_expr(rc, e.data.cast.value);
+        if (is_err[bool, str](rv)) { ret rv; }
+        ret bind_type(rc, e.data.cast.ty);
+    }
+    if (e.kind == expr.EXPR_KIND_ARRAY_LIT) {
+        val rt: Result[bool, str] = bind_type(rc, e.data.array_lit.ty);
+        if (is_err[bool, str](rt)) { ret rt; }
+        ret bind_expr_list(rc, e.data.array_lit.elems_start, e.data.array_lit.elems_len);
+    }
+    if (e.kind == expr.EXPR_KIND_STRUCT_LIT) {
+        val rt: Result[bool, str] = bind_type(rc, e.data.struct_lit.ty);
+        if (is_err[bool, str](rt)) { ret rt; }
+        var fi: u32 = 0;
+        for (fi < e.data.struct_lit.fields_len) {
+            val finit: *expr.FieldInit = ?rc.a.field_inits[e.data.struct_lit.fields_start + fi];
+            val rf: Result[bool, str] = bind_expr(rc, finit.value);
+            if (is_err[bool, str](rf)) { ret rf; }
+            fi = fi + 1;
+        }
+        ret ok[bool, str](true);
+    }
+    ret ok[bool, str](true);
+}
+
+fun bind_expr_list(rc: *ResolveContext, extras_start: u32, len: u32) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val eid: id.ExprId = rc.a.extras[extras_start + i]::id.ExprId;
+        val r: Result[bool, str] = bind_expr(rc, eid);
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun bind_ident(rc: *ResolveContext, eid: id.ExprId, span: token.Span) Result[bool, str] {
+    val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, span);
+    if (is_err[intern.StrId, str](r)) {
+        ret err[bool, str](unwrap_err[intern.StrId, str](r));
+    }
+    val name: intern.StrId = unwrap_ok[intern.StrId, str](r);
+    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, name);
+    if (sid == SYMBOL_NIL) {
+        diag.error(?rc.s.diags, rc.a.file_id, span, "unresolved identifier");
+    }
+    or {
+        if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = sid; }
+    }
+    ret ok[bool, str](true);
+}
+
+fun bind_type(rc: *ResolveContext, tid: id.TypeId) Result[bool, str] {
+    if (tid == id.TYPE_NIL) { ret ok[bool, str](true); }
+    val t: *atype.Type = ast.get_type(rc.a, tid);
+
+    if (t.kind == atype.TYPE_KIND_NAMED) {
+        val sid: SymbolId = resolve_type_path(rc, ?t.data.named, t.span);
+        if (rc.type_resolved != nil) { rc.type_resolved[tid] = sid; }
+        var ai: u32 = 0;
+        for (ai < t.data.named.args_len) {
+            val arg_id: id.TypeId = rc.a.extras[t.data.named.args_start + ai]::id.TypeId;
+            val r: Result[bool, str] = bind_type(rc, arg_id);
+            if (is_err[bool, str](r)) { ret r; }
+            ai = ai + 1;
+        }
+        ret ok[bool, str](true);
+    }
+    if (t.kind == atype.TYPE_KIND_PTR) {
+        ret bind_type(rc, t.data.ptr.pointee);
+    }
+    if (t.kind == atype.TYPE_KIND_ARRAY) {
+        val re: Result[bool, str] = bind_expr(rc, t.data.array.length);
+        if (is_err[bool, str](re)) { ret re; }
+        ret bind_type(rc, t.data.array.element);
+    }
+    if (t.kind == atype.TYPE_KIND_FUN) {
+        var pi: u32 = 0;
+        for (pi < t.data.fun_.params_len) {
+            val pt: id.TypeId = rc.a.extras[t.data.fun_.params_start + pi]::id.TypeId;
+            val r: Result[bool, str] = bind_type(rc, pt);
+            if (is_err[bool, str](r)) { ret r; }
+            pi = pi + 1;
+        }
+        ret bind_type(rc, t.data.fun_.ret);
+    }
+    if (t.kind == atype.TYPE_KIND_REC || t.kind == atype.TYPE_KIND_UNI) {
+        var fields_start: u32 = 0;
+        var fields_len:   u32 = 0;
+        if (t.kind == atype.TYPE_KIND_REC) {
+            fields_start = t.data.rec_.fields_start;
+            fields_len   = t.data.rec_.fields_len;
+        }
+        or {
+            fields_start = t.data.uni_.fields_start;
+            fields_len   = t.data.uni_.fields_len;
+        }
+        var fi: u32 = 0;
+        for (fi < fields_len) {
+            val tn: *decl.TypedName = ?rc.a.typed_names[fields_start + fi];
+            val r: Result[bool, str] = bind_type(rc, tn.ty);
+            if (is_err[bool, str](r)) { ret r; }
+            fi = fi + 1;
+        }
+        ret ok[bool, str](true);
+    }
+    ret ok[bool, str](true);
+}
+
+# walks a TYPE_KIND_NAMED path. single-segment names look up in the local
+# scope chain. multi-segment names start with an in-scope SYM_USE alias and
+# index into that alias's target module's pub symbols.
+fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.Span) SymbolId {
+    val path: token.Span = named.name;
+    if (path.len == 0) { ret SYMBOL_NIL; }
+
+    var seg_start: usize = path.offset;
+    val end:       usize = path.offset + path.len;
+    var seg_end:   usize = seg_start;
+
+    var current_module: sess.ModuleId = sess.MODULE_NIL;
+    var current_sym:    SymbolId      = SYMBOL_NIL;
+    var first:          bool          = true;
+
+    for (seg_start < end) {
+        seg_end = seg_start;
+        for (seg_end < end && rc.source.data[seg_end] != '.') {
+            seg_end = seg_end + 1;
+        }
+        var seg_span: token.Span;
+        seg_span.offset = seg_start;
+        seg_span.len    = seg_end - seg_start;
+
+        val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, seg_span);
+        if (is_err[intern.StrId, str](r)) { ret SYMBOL_NIL; }
+        val seg_name: intern.StrId = unwrap_ok[intern.StrId, str](r);
+
+        if (first) {
+            current_sym = scope_lookup_chain(rc, rc.current_scope, seg_name);
+            first = false;
+        }
+        or {
+            current_sym = lookup_in_module(rc, current_module, seg_name);
+        }
+
+        if (current_sym == SYMBOL_NIL) {
+            diag.error(?rc.s.diags, rc.a.file_id, full, "unresolved type name");
+            ret SYMBOL_NIL;
+        }
+
+        if (seg_end >= end) { brk; }
+
+        val sym: *Symbol = ?rc.symbols[current_sym];
+        if (sym.kind == SYM_USE) {
+            current_module = sym.slot::sess.ModuleId;
+        }
+        or {
+            diag.error(?rc.s.diags, rc.a.file_id, full, "expected a module alias before `.`");
+            ret SYMBOL_NIL;
+        }
+
+        seg_start = seg_end + 1;
+    }
+
+    ret current_sym;
+}
+
+# looks up `name` among the pub symbols exported by ModuleId `m`. returns a
+# freshly created SYM_IMPORTED symbol so subsequent uses can reference it.
+fun lookup_in_module(rc: *ResolveContext, m: sess.ModuleId, name: intern.StrId) SymbolId {
+    var i: u32 = 0;
+    for (i < rc.deps.count) {
+        val mx: *ModuleExports = ?rc.deps.entries[i];
+        if (mx.module == m) {
+            var j: u32 = 0;
+            for (j < mx.count) {
+                val ps: *PublicSymbol = ?mx.symbols[j];
+                if (ps.name == name) {
+                    val r: Result[SymbolId, str] = add_symbol(rc, SYM_IMPORTED, 0, ps.name, ps.decl, 0, ps.origin);
+                    if (is_err[SymbolId, str](r)) { ret SYMBOL_NIL; }
+                    ret unwrap_ok[SymbolId, str](r);
+                }
+                j = j + 1;
+            }
+            ret SYMBOL_NIL;
+        }
+        i = i + 1;
+    }
+    ret SYMBOL_NIL;
+}
+
+# ----------------------------------------------------------------------
+# pass 3: build the public ResolveResult
+# ----------------------------------------------------------------------
+
+fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
+    var pub_count: u32 = 0;
+    var i: u32 = 0;
+    for (i < rc.sym_len) {
+        if ((rc.symbols[i].flags & SYM_FLAG_PUB) != 0) {
+            pub_count = pub_count + 1;
+        }
+        i = i + 1;
+    }
+
+    val r_syms: Result[*Symbol, str] = allocate[Symbol](rc.s.alloc, rc.sym_len::usize);
+    if (is_err[*Symbol, str](r_syms)) {
+        dnit_context(rc);
+        ret err[ResolveResult, str](unwrap_err[*Symbol, str](r_syms));
+    }
+    val out_syms: *Symbol = unwrap_ok[*Symbol, str](r_syms);
+
+    var pi: u32 = 0;
+    var ni: u32 = pub_count;
+    var k:  u32 = 0;
+    for (k < rc.sym_len) {
+        if ((rc.symbols[k].flags & SYM_FLAG_PUB) != 0) {
+            out_syms[pi] = rc.symbols[k];
+            pi = pi + 1;
+        }
+        or {
+            out_syms[ni] = rc.symbols[k];
+            ni = ni + 1;
+        }
+        k = k + 1;
+    }
+
+    var out: ResolveResult;
+    out.alloc         = rc.s.alloc;
+    out.symbols       = out_syms;
+    out.symbol_count  = rc.sym_len;
+    out.pub_count     = pub_count;
+    out.expr_resolved = rc.expr_resolved;
+    out.type_resolved = rc.type_resolved;
+    out.decl_symbol   = rc.decl_symbol;
+
+    rc.expr_resolved = nil;
+    rc.type_resolved = nil;
+    rc.decl_symbol   = nil;
+
+    dnit_context(rc);
+    ret ok[ResolveResult, str](out);
+}
