@@ -1,20 +1,21 @@
-# name resolution for one parsed module.
+# Per-module name resolution. Walks one parsed `Ast` in two passes:
 #
-# walks the module's decls in two passes:
-#   1. collect — registers a Symbol for every binding decl reachable from
-#      module scope, evaluating `$if` predicates via the comptime evaluator
-#      and registering comptime-evaluable val initializers as named consts.
-#      use decls inject symbols into the module scope (as either a single
-#      use-alias or a flat slice of imported pub symbols).
+#   1. collect — registers a Symbol for every binding decl reachable
+#      from module scope, evaluating `$if` predicates via the comptime
+#      evaluator and registering comptime-evaluable val initializers as
+#      named consts. `use` decls inject symbols into the module scope
+#      (as either a single use-alias or a flat slice of imported pub
+#      symbols).
 #   2. bind — walks every decl, stmt, expr, and type, looking up name
-#      references against the scope chain and writing the resolved SymbolId
-#      into parallel arrays sized to the AST.
+#      references against the scope chain and writing the resolved
+#      SymbolId into parallel arrays sized to the AST.
 #
-# unresolved names become SYMBOL_NIL and emit an error diagnostic but do not
-# halt the pass; sema treats SYMBOL_NIL bindings as having an error type that
-# absorbs further operations.
+# Unresolved names become SYMBOL_NIL and emit an error diagnostic but
+# do not halt the pass; sema treats SYMBOL_NIL bindings as having an
+# error type that absorbs further operations.
 
 use std.types.bool;
+use std.types.option;
 use std.types.size;
 use std.types.string;
 use std.types.zstr;
@@ -26,6 +27,8 @@ use src:    mach.lang.source;
 use diag:   mach.lang.diagnostic;
 use intern: mach.lang.intern;
 use sess:   mach.lang.session;
+
+use map: std.collections.map;
 
 use ast:      mach.lang.fe.ast;
 use id:       mach.lang.fe.ast.id;
@@ -160,7 +163,10 @@ rec ResolveContext {
     module_scope:  ScopeId;
     current_scope: ScopeId;
 
-    pub_count: u32;
+    # caches (origin << 32 | decl) -> SymbolId for already-created
+    # SYM_IMPORTED entries, so repeated `print.println` use-sites share one
+    # Symbol instead of inflating the symbol table per reference.
+    imported_cache: map.Map[u64, SymbolId];
 }
 
 # the contract resolve produces for sema and the driver's export step
@@ -238,7 +244,12 @@ pub fun resolve(
     rc.module_scope  = unwrap_ok[ScopeId, str](ms_r);
     rc.current_scope = rc.module_scope;
 
-    val mnode: *module.Module = ast.get_module(a, a.root_module);
+    val m_opt: Option[*module.Module] = ast.get_module(a, a.root_module);
+    if (is_none[*module.Module](m_opt)) {
+        dnit_context(?rc);
+        ret err[ResolveResult, str]("root_module is not set on this Ast");
+    }
+    val mnode: *module.Module = unwrap[*module.Module](m_opt);
 
     val c1: Result[bool, str] = collect_decl_list(?rc, mnode.decls_start, mnode.decls_len, rc.module_scope, true);
     if (is_err[bool, str](c1)) {
@@ -269,8 +280,11 @@ fun init_context(
     rc.ctx        = ctx;
     rc.own_module = own_module;
 
-    val file: *src.SourceFile = src.get(?s.sources, a.file_id);
-    rc.source = file.text;
+    val src_opt: Option[*src.SourceFile] = src.get(?s.sources, a.file_id);
+    if (is_none[*src.SourceFile](src_opt)) {
+        ret err[bool, str]("Ast.file_id not registered with the session");
+    }
+    rc.source = unwrap[*src.SourceFile](src_opt).text;
 
     rc.symbols  = nil;
     rc.sym_len  = 0;
@@ -285,7 +299,8 @@ fun init_context(
     rc.scope_cap     = 0;
     rc.module_scope  = SCOPE_NIL;
     rc.current_scope = SCOPE_NIL;
-    rc.pub_count     = 0;
+
+    rc.imported_cache = map.init[u64, SymbolId](s.alloc, map.hash_u64, map.eq_u64);
 
     val sa: Result[*Symbol, str] = allocate[Symbol](s.alloc, INITIAL_SYMBOLS_CAP::usize);
     if (is_err[*Symbol, str](sa)) {
@@ -358,6 +373,7 @@ fun dnit_context(rc: *ResolveContext) {
     if (rc.decl_symbol != nil) {
         deallocate[SymbolId](rc.s.alloc, rc.decl_symbol, rc.a.decl_len);
     }
+    map.dnit[u64, SymbolId](?rc.imported_cache);
 }
 
 fun open_scope(rc: *ResolveContext, parent: ScopeId) Result[ScopeId, str] {
@@ -485,14 +501,10 @@ fun declare(
     ret ok[SymbolId, str](sid);
 }
 
-# ----------------------------------------------------------------------
-# pass 1: collect symbols + register comptime vals
-# ----------------------------------------------------------------------
-
-fun collect_decl_list(rc: *ResolveContext, extras_start: u32, len: u32, scope: ScopeId, at_module_scope: bool) Result[bool, str] {
+fun collect_decl_list(rc: *ResolveContext, start: u32, len: u32, scope: ScopeId, at_module_scope: bool) Result[bool, str] {
     var i: u32 = 0;
     for (i < len) {
-        val decl_id: id.DeclId = rc.a.extras[extras_start + i]::id.DeclId;
+        val decl_id: id.DeclId = rc.a.decl_ids[start + i];
         val r: Result[bool, str] = collect_one_decl(rc, decl_id, scope, at_module_scope);
         if (is_err[bool, str](r)) { ret r; }
         i = i + 1;
@@ -501,7 +513,9 @@ fun collect_decl_list(rc: *ResolveContext, extras_start: u32, len: u32, scope: S
 }
 
 fun collect_one_decl(rc: *ResolveContext, decl_id: id.DeclId, scope: ScopeId, at_module_scope: bool) Result[bool, str] {
-    val d: *decl.Decl = ast.get_decl(rc.a, decl_id);
+    val d_opt: Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
+    if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
     val flags_in: u8 = d.flags;
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
@@ -575,8 +589,9 @@ fun collect_comptime_if(rc: *ResolveContext, ci: *decl.DeclComptimeIf, scope: Sc
     var bi: u32 = 0;
     for (bi < ci.branches_len) {
         val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[ci.branches_start + bi];
-        val take: bool = comptime_branch_active(rc, br);
-        if (take) {
+        val take_r: Result[bool, str] = comptime_branch_active(rc, br);
+        if (is_err[bool, str](take_r)) { ret take_r; }
+        if (unwrap_ok[bool, str](take_r)) {
             if (at_decl_scope) {
                 ret collect_decl_list(rc, br.body_start, br.body_len, scope, at_module_scope);
             }
@@ -587,21 +602,24 @@ fun collect_comptime_if(rc: *ResolveContext, ci: *decl.DeclComptimeIf, scope: Sc
     ret ok[bool, str](true);
 }
 
-fun comptime_branch_active(rc: *ResolveContext, br: *decl.ComptimeBranch) bool {
-    if (br.cond == id.EXPR_NIL) { ret true; }
+fun comptime_branch_active(rc: *ResolveContext, br: *decl.ComptimeBranch) Result[bool, str] {
+    if (br.cond == id.EXPR_NIL) { ret ok[bool, str](true); }
     val r: Result[comptime.CTValue, str] = comptime.eval(rc.ctx, rc.a, rc.source, br.cond, ?rc.s.interner);
+    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, br.cond);
+    if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("comptime branch cond ExprId out of range"); }
+    val cond_span: token.Span = unwrap[*expr.Expr](e_opt).span;
     if (is_err[comptime.CTValue, str](r)) {
-        val span: token.Span = ast.get_expr(rc.a, br.cond).span;
-        diag.error(?rc.s.diags, rc.a.file_id, span, unwrap_err[comptime.CTValue, str](r));
-        ret false;
+        val de: Result[bool, str] = diag.error(?rc.s.diags, rc.a.file_id, cond_span, unwrap_err[comptime.CTValue, str](r));
+        if (is_err[bool, str](de)) { ret de; }
+        ret ok[bool, str](false);
     }
     val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r);
     if (v.kind != comptime.CT_KIND_BOOL) {
-        val span: token.Span = ast.get_expr(rc.a, br.cond).span;
-        diag.error(?rc.s.diags, rc.a.file_id, span, "comptime branch condition must be a bool");
-        ret false;
+        val de: Result[bool, str] = diag.error(?rc.s.diags, rc.a.file_id, cond_span, "comptime branch condition must be a bool");
+        if (is_err[bool, str](de)) { ret de; }
+        ret ok[bool, str](false);
     }
-    ret v.data.b;
+    ret ok[bool, str](v.data.b);
 }
 
 fun collect_use(rc: *ResolveContext, decl_id: id.DeclId, du: *decl.DeclUse, scope: ScopeId) Result[bool, str] {
@@ -658,14 +676,10 @@ fun find_module_exports(rc: *ResolveContext, path: intern.StrId) *ModuleExports 
     ret nil;
 }
 
-# ----------------------------------------------------------------------
-# pass 2: bind name references inside decl bodies
-# ----------------------------------------------------------------------
-
-fun bind_decl_list(rc: *ResolveContext, extras_start: u32, len: u32) Result[bool, str] {
+fun bind_decl_list(rc: *ResolveContext, start: u32, len: u32) Result[bool, str] {
     var i: u32 = 0;
     for (i < len) {
-        val decl_id: id.DeclId = rc.a.extras[extras_start + i]::id.DeclId;
+        val decl_id: id.DeclId = rc.a.decl_ids[start + i];
         val r: Result[bool, str] = bind_one_decl(rc, decl_id);
         if (is_err[bool, str](r)) { ret r; }
         i = i + 1;
@@ -674,10 +688,13 @@ fun bind_decl_list(rc: *ResolveContext, extras_start: u32, len: u32) Result[bool
 }
 
 fun bind_one_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
-    val d: *decl.Decl = ast.get_decl(rc.a, decl_id);
+    val d_opt: Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
+    if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
-        ret bind_comptime_if(rc, ?d.data.comptime_if, true);
+        val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
+        ret bind_comptime_if(rc, ci.branches_start, ci.branches_len, true);
     }
     if (d.kind == decl.DECL_KIND_USE || d.kind == decl.DECL_KIND_ERROR) {
         ret ok[bool, str](true);
@@ -689,7 +706,7 @@ fun bind_one_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
         ret bind_fun(rc, ?d.data.fun_, decl_id);
     }
     if (d.kind == decl.DECL_KIND_REC) {
-        ret bind_rec(rc, ?d.data.rec_);
+        ret bind_rec(rc, ?d.data.rec_, decl_id);
     }
     if (d.kind == decl.DECL_KIND_DEF) {
         ret bind_type(rc, d.data.def_.ty);
@@ -713,11 +730,13 @@ fun bind_one_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
-fun bind_comptime_if(rc: *ResolveContext, ci: *decl.DeclComptimeIf, at_decl_scope: bool) Result[bool, str] {
+fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32, at_decl_scope: bool) Result[bool, str] {
     var bi: u32 = 0;
-    for (bi < ci.branches_len) {
-        val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[ci.branches_start + bi];
-        if (comptime_branch_active(rc, br)) {
+    for (bi < branches_len) {
+        val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[branches_start + bi];
+        val take_r: Result[bool, str] = comptime_branch_active(rc, br);
+        if (is_err[bool, str](take_r)) { ret take_r; }
+        if (unwrap_ok[bool, str](take_r)) {
             if (at_decl_scope) {
                 ret bind_decl_list(rc, br.body_start, br.body_len);
             }
@@ -790,7 +809,7 @@ fun bind_fun(rc: *ResolveContext, f: *decl.DeclFun, decl_id: id.DeclId) Result[b
     ret ok[bool, str](true);
 }
 
-fun bind_rec(rc: *ResolveContext, r: *decl.DeclRec) Result[bool, str] {
+fun bind_rec(rc: *ResolveContext, r: *decl.DeclRec, decl_id: id.DeclId) Result[bool, str] {
     val r_g: Result[ScopeId, str] = open_scope(rc, rc.current_scope);
     if (is_err[ScopeId, str](r_g)) { ret err[bool, str](unwrap_err[ScopeId, str](r_g)); }
     val gen_scope: ScopeId = unwrap_ok[ScopeId, str](r_g);
@@ -800,7 +819,7 @@ fun bind_rec(rc: *ResolveContext, r: *decl.DeclRec) Result[bool, str] {
     var gi: u32 = 0;
     for (gi < r.generics_len) {
         val name: token.Span = rc.a.generic_names[r.generics_start + gi];
-        val rd: Result[SymbolId, str] = declare(rc, SYM_GENERIC, 0, name, id.DECL_NIL, gi, rc.own_module, gen_scope);
+        val rd: Result[SymbolId, str] = declare(rc, SYM_GENERIC, 0, name, decl_id, gi, rc.own_module, gen_scope);
         if (is_err[SymbolId, str](rd)) {
             rc.current_scope = saved_scope;
             ret err[bool, str](unwrap_err[SymbolId, str](rd));
@@ -823,10 +842,10 @@ fun bind_rec(rc: *ResolveContext, r: *decl.DeclRec) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
-fun bind_stmt_list(rc: *ResolveContext, extras_start: u32, len: u32) Result[bool, str] {
+fun bind_stmt_list(rc: *ResolveContext, start: u32, len: u32) Result[bool, str] {
     var i: u32 = 0;
     for (i < len) {
-        val sid: id.StmtId = rc.a.extras[extras_start + i]::id.StmtId;
+        val sid: id.StmtId = rc.a.stmt_ids[start + i];
         val r: Result[bool, str] = bind_stmt(rc, sid);
         if (is_err[bool, str](r)) { ret r; }
         i = i + 1;
@@ -836,7 +855,9 @@ fun bind_stmt_list(rc: *ResolveContext, extras_start: u32, len: u32) Result[bool
 
 fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) Result[bool, str] {
     if (sid == id.STMT_NIL) { ret ok[bool, str](true); }
-    val s: *stmt.Stmt = ast.get_stmt(rc.a, sid);
+    val s_opt: Option[*stmt.Stmt] = ast.get_stmt(rc.a, sid);
+    if (is_none[*stmt.Stmt](s_opt)) { ret err[bool, str]("StmtId out of range"); }
+    val s: *stmt.Stmt = unwrap[*stmt.Stmt](s_opt);
 
     if (s.kind == stmt.STMT_KIND_BLOCK) { ret bind_block(rc, ?s.data.block); }
     if (s.kind == stmt.STMT_KIND_EXPR)  { ret bind_expr(rc, s.data.expr.expr); }
@@ -869,10 +890,7 @@ fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) Result[bool, str] {
         ret ok[bool, str](true);
     }
     if (s.kind == stmt.STMT_KIND_COMPTIME_IF) {
-        var fake: decl.DeclComptimeIf;
-        fake.branches_start = s.data.comptime_if.branches_start;
-        fake.branches_len   = s.data.comptime_if.branches_len;
-        ret bind_comptime_if(rc, ?fake, false);
+        ret bind_comptime_if(rc, s.data.comptime_if.branches_start, s.data.comptime_if.branches_len, false);
     }
     ret ok[bool, str](true);
 }
@@ -893,7 +911,9 @@ fun bind_block(rc: *ResolveContext, b: *stmt.StmtBlock) Result[bool, str] {
 # the new symbol is added so subsequent statements can see it.
 fun bind_local_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
     if (decl_id == id.DECL_NIL) { ret ok[bool, str](true); }
-    val d: *decl.Decl = ast.get_decl(rc.a, decl_id);
+    val d_opt: Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
+    if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
 
     if (d.kind != decl.DECL_KIND_VAL && d.kind != decl.DECL_KIND_VAR) {
         ret ok[bool, str](true);
@@ -931,7 +951,9 @@ fun if_val_kind(is_val: bool) SymKind {
 
 fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
     if (eid == id.EXPR_NIL) { ret ok[bool, str](true); }
-    val e: *expr.Expr = ast.get_expr(rc.a, eid);
+    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("ExprId out of range"); }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
 
     if (e.kind == expr.EXPR_KIND_IDENT) {
         ret bind_ident(rc, eid, e.span);
@@ -982,10 +1004,10 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
-fun bind_expr_list(rc: *ResolveContext, extras_start: u32, len: u32) Result[bool, str] {
+fun bind_expr_list(rc: *ResolveContext, start: u32, len: u32) Result[bool, str] {
     var i: u32 = 0;
     for (i < len) {
-        val eid: id.ExprId = rc.a.extras[extras_start + i]::id.ExprId;
+        val eid: id.ExprId = rc.a.expr_ids[start + i];
         val r: Result[bool, str] = bind_expr(rc, eid);
         if (is_err[bool, str](r)) { ret r; }
         i = i + 1;
@@ -1011,14 +1033,16 @@ fun bind_ident(rc: *ResolveContext, eid: id.ExprId, span: token.Span) Result[boo
 
 fun bind_type(rc: *ResolveContext, tid: id.TypeId) Result[bool, str] {
     if (tid == id.TYPE_NIL) { ret ok[bool, str](true); }
-    val t: *atype.Type = ast.get_type(rc.a, tid);
+    val t_opt: Option[*atype.Type] = ast.get_type(rc.a, tid);
+    if (is_none[*atype.Type](t_opt)) { ret err[bool, str]("TypeId out of range"); }
+    val t: *atype.Type = unwrap[*atype.Type](t_opt);
 
     if (t.kind == atype.TYPE_KIND_NAMED) {
         val sid: SymbolId = resolve_type_path(rc, ?t.data.named, t.span);
         if (rc.type_resolved != nil) { rc.type_resolved[tid] = sid; }
         var ai: u32 = 0;
         for (ai < t.data.named.args_len) {
-            val arg_id: id.TypeId = rc.a.extras[t.data.named.args_start + ai]::id.TypeId;
+            val arg_id: id.TypeId = rc.a.type_ids[t.data.named.args_start + ai];
             val r: Result[bool, str] = bind_type(rc, arg_id);
             if (is_err[bool, str](r)) { ret r; }
             ai = ai + 1;
@@ -1036,7 +1060,7 @@ fun bind_type(rc: *ResolveContext, tid: id.TypeId) Result[bool, str] {
     if (t.kind == atype.TYPE_KIND_FUN) {
         var pi: u32 = 0;
         for (pi < t.data.fun_.params_len) {
-            val pt: id.TypeId = rc.a.extras[t.data.fun_.params_start + pi]::id.TypeId;
+            val pt: id.TypeId = rc.a.type_ids[t.data.fun_.params_start + pi];
             val r: Result[bool, str] = bind_type(rc, pt);
             if (is_err[bool, str](r)) { ret r; }
             pi = pi + 1;
@@ -1124,8 +1148,9 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
     ret current_sym;
 }
 
-# looks up `name` among the pub symbols exported by ModuleId `m`. returns a
-# freshly created SYM_IMPORTED symbol so subsequent uses can reference it.
+# looks up `name` among the pub symbols exported by ModuleId `m`. returns
+# a SYM_IMPORTED symbol, reusing an existing one when an earlier use-site
+# already imported the same (origin, decl) pair via `imported_cache`.
 fun lookup_in_module(rc: *ResolveContext, m: sess.ModuleId, name: intern.StrId) SymbolId {
     var i: u32 = 0;
     for (i < rc.deps.count) {
@@ -1135,9 +1160,17 @@ fun lookup_in_module(rc: *ResolveContext, m: sess.ModuleId, name: intern.StrId) 
             for (j < mx.count) {
                 val ps: *PublicSymbol = ?mx.symbols[j];
                 if (ps.name == name) {
+                    val key: u64 = (ps.origin::u64 << 32) | ps.decl::u64;
+                    val cached: Result[*SymbolId, str] = map.get[u64, SymbolId](?rc.imported_cache, ?key);
+                    if (is_ok[*SymbolId, str](cached)) {
+                        ret @unwrap_ok[*SymbolId, str](cached);
+                    }
                     val r: Result[SymbolId, str] = add_symbol(rc, SYM_IMPORTED, 0, ps.name, ps.decl, 0, ps.origin);
                     if (is_err[SymbolId, str](r)) { ret SYMBOL_NIL; }
-                    ret unwrap_ok[SymbolId, str](r);
+                    val sid: SymbolId = unwrap_ok[SymbolId, str](r);
+                    val ins: Result[bool, str] = map.insert[u64, SymbolId](?rc.imported_cache, key, sid);
+                    if (is_err[bool, str](ins)) { ret SYMBOL_NIL; }
+                    ret sid;
                 }
                 j = j + 1;
             }
@@ -1147,10 +1180,6 @@ fun lookup_in_module(rc: *ResolveContext, m: sess.ModuleId, name: intern.StrId) 
     }
     ret SYMBOL_NIL;
 }
-
-# ----------------------------------------------------------------------
-# pass 3: build the public ResolveResult
-# ----------------------------------------------------------------------
 
 fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
     var pub_count: u32 = 0;
