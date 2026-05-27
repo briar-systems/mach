@@ -1,185 +1,78 @@
-# Status — docs-first design phase of the `new/` compiler rewrite
+# Status — building the self-hosted Mach compiler (`new/`)
 
-Snapshot for moving work between machines. Pick this up by checking
-out the `rebuild` branch and the `feat/str` branch in
-`dep/mach-std`.
+## Goal
 
-## What we're doing right now
+A self-hosted Mach compiler that compiles itself — so work shifts to
+iterating on the **language and tooling** instead of chasing compiler
+bugs. Native code generation; our own assembler and linker. No C
+compiler, no external toolchain in the pipeline. x86_64-linux first;
+multi-target only after self-hosting.
 
-A **docs-first design phase**. Per-file spec sheets are being written
-under `doc/mach/`, mirroring the `src/` tree (referenced via that path
-throughout the specs even though the rewrite still lives at `new/` on
-disk). The specs are the canonical design; the source in `new/` is the
-existing partial implementation. After the spec tree is complete the
-plan is: audit → iterate the specs → **implement the entire rewrite
-in one shot from the canonical specs**.
+## How we work — non-negotiable
 
-Touching source code during the docs phase is intentionally limited to:
+The docs-first phase is over. The old plan ("implement the whole
+rewrite in one shot from the canonical specs") is dead: it produced
+six months and zero binaries.
 
-- Module-level doc header comments aligned with the spec opening paragraph.
-- Per-symbol doc comment cleanups (case, wording) that match spec language.
-- Already-approved source restructures driven by design decisions
-  (e.g. AST pool split, sentinel-purge cascade, `TYPE_INSTANCE`
-  addition). These are noted in this STATUS as "source aligned with
-  spec".
+- Progress is measured in exactly one unit: a `.mach` program that
+  compiles and runs correctly and didn't before. Not specs.
+- `tests/` is the spec. Each `NNN_name.mach` declares its expected
+  exit code on line 1; `tests/run.sh` is the gate. The corpus only
+  grows. Self-hosting = the compiler's own source compiles and the
+  corpus stays green.
+- Vertical slices. Build the thinnest end-to-end path, then widen.
+  Never build a stage "complete" — build exactly what the next test
+  needs (a slice is narrow but fully correct, not half-done).
+- No spec is written ahead of code. `doc/mach/` is demoted to design
+  notes — a reference, not a gate, not authoritative.
+- Every work item = "make program/test X compile and run." If an
+  agent starts producing audits, tables, or specs — stop it.
 
-## Where things are committed
+## Pipeline — native, every stage ours
 
-- `rebuild` (parent repo, this commit) — every spec doc written so
-  far + the matching source updates in `new/` + the bumped submodule
-  pointer.
-- `feat/str` (`dep/mach-std`) — mach-std changes that the rewrite
-  consumes (most notably the new `std.crypto.hash.fnv1a` module).
-- Old `tmp` branches are gone.
+    typed AST → SSA IR → MIR → encode → object (ELF) → link → executable
 
-## Design decisions locked in
+asm-text and IR dumps are kept only as debug views.
 
-These are the load-bearing decisions the spec tree commits to. Each
-has matching language in the relevant doc.
+## State
 
-1. **Fat-pointer `str` is a compiler builtin.** `rec { len: u32;
-   data: *u8 }`. Backtick literals (`` `...` ``) produce `zstr` =
-   `*u8`. `zstr` is a userland `pub def` in `std.types.zstr`; the type
-   universe never sees it as a distinct kind.
-2. **Compiler can't see `usize`/`isize`.** Those are userland defs
-   gated by `$mach.build.target.pointer_width`. The compiler-builtin
-   `str` uses `u32` for `len`.
-3. **No silent fallbacks; no readonly pointers.** No `&T`. Casts (`::`)
-   are primitive-to-primitive numeric conversion or non-primitive bit
-   reinterpretation requiring the same size.
-4. **Typed AST pools.** `Ast` carries `decl_ids`, `stmt_ids`,
-   `expr_ids`, `type_ids` (plus the existing typed pools for
-   `typed_names`, `field_inits`, `generic_names`, `comptime_branches`,
-   `asm_operands`). The old untyped `extras: *u32` pool is gone. AST
-   node fields use `(start: u32, len: u32)` pairs (offsets); typed
-   `Slice[T]` from `std.collections.slice` is only constructed at the
-   accessor boundary (no stored Slices — pool reallocation would
-   invalidate `data` pointers).
-5. **Sentinels in node fields are OK; sentinels in function returns
-   are not.** AST keeps `EXPR_NIL`, `STMT_NIL`, `DECL_NIL`, `TYPE_NIL`,
-   `MODULE_NIL`, `STR_NIL`, `SYMBOL_NIL` (compact, intentional). All
-   lookup functions return `Option[T]`: `intern.lookup`, `ast.get_*`,
-   `source.get`, `source.line_start`, `type.get`, `type.prim`,
-   `type.get_param`, `comptime.lookup`.
-6. **`StmtFin` carries `body: StmtId`**, not an `ExprId`. Both
-   `fin call();` and `fin { ... }` parse via `parse_stmt`.
-7. **`pub fwd <module-prefixed-symbol>;` is a real form.** Parser
-   sets `DECL_FLAG_FWD` (+ `DECL_FLAG_PUB`); resolve re-exports the
-   target into this module's pub namespace.
-8. **Shared `TypeInterner` on the session.** Type identity is
-   `TypeId` equality. `intern_pointer` / `intern_array` /
-   `intern_nominal` / `intern_generic_param` dedup via a
-   `Map[Type, TypeId]`; `intern_function` and `intern_instance`
-   bypass the map and dedup via linear scan (acceptable counts; can
-   be re-optimised later).
-9. **Sema-time per-use-site monomorphisation.** When sema encounters
-   `Map[str, u32]` it calls `ty.intern_instance(target, args)` which
-   returns the same `TypeId` everywhere. `TYPE_INSTANCE` lives in the
-   shared interner.
-10. **FNV-1a primitives extracted to `std.crypto.hash.fnv1a`.** Both
-    `std.collections.map.hash_str` and the rewrite's
-    `mach.lang.type.hash_type` consume them; no duplicated magic
-    numbers.
+- Seed compiler: `cmach` at `/usr/local/bin/cmach`. Functional.
+  `cmach build <file>` → ELF object; `cmach build <dir> --target T`
+  → executable (per that project's `mach.toml` `mode`).
+- `new/` frontend is implemented (~7k lines): token, lexer, parser
+  (+decl/expr/state/asm), AST (+ast/*), resolve, comptime, type
+  interner, intern, source, session, diagnostic, driver.
+- `new/` NOT implemented (0-byte): sema (+sema/*), me/* (IR, lower,
+  passes, pipeline), be/* (codegen, obj, linker), target/*, query,
+  cli/cmd/*.
+- Old compiler at `src/` (92 `.mach` files) + the cmach→imach→smach
+  →mach bootstrap chain: superseded. Not being fixed. Mine it for
+  reference (especially `src/compiler/mir`) but do not mirror it.
+- mach-std submodule (`dep/mach-std`) on branch `feat/str`.
+- `doc/mach/` — per-file design specs from the docs-first phase.
+  Reference only; language/design decisions are embodied in the
+  `new/` frontend code.
 
-## Doc tree progress
+## Milestones
 
-Tree mirrors `src/` (paths in specs reference `src/...`). Done = full
-spec written and source-side header aligned. Empty cells = not yet
-started.
+- M0  build harness + `tests/` scaffold.                    [done]
+- M1  `ret 42` — first native binary through the full own
+      pipeline (minimal sema → IR → MIR → x86_64 encode →
+      static ELF → trivial link → `_start` shim).
+- M2+ grow the language test-by-test: arithmetic, locals,
+      if/for, calls, rec, pointers, uni, arrays/str, comptime,
+      generics, inline asm.
+- M-final  self-host: `new/` compiles itself to a fixpoint.
 
-| Path                                   | State                                                     |
-|----------------------------------------|-----------------------------------------------------------|
-| `doc/mach/README.md`                   | (removed by user — top-level doc/ README is not used)     |
-| `doc/mach/main.md`                     | done                                                      |
-| `doc/mach/lang/session.md`             | done                                                      |
-| `doc/mach/lang/intern.md`              | done                                                      |
-| `doc/mach/lang/source.md`              | done                                                      |
-| `doc/mach/lang/diagnostic.md`          | done                                                      |
-| `doc/mach/lang/type.md`                | done (incl. `TYPE_INSTANCE` for generics)                 |
-| `doc/mach/lang/driver.md`              | **next**                                                  |
-| `doc/mach/lang/query.md`               | not started (design — empty placeholder)                  |
-| `doc/mach/lang/target.md`              | not started                                               |
-| `doc/mach/lang/target/{abi,isa,of,os}.md` + each platform impl | not started      |
-| `doc/mach/lang/fe/token.md`            | done                                                      |
-| `doc/mach/lang/fe/lexer.md`            | done                                                      |
-| `doc/mach/lang/fe/ast.md`              | done                                                      |
-| `doc/mach/lang/fe/ast/{id,module,expr,stmt,decl,type}.md` | done                   |
-| `doc/mach/lang/fe/parser.md`           | done                                                      |
-| `doc/mach/lang/fe/parser/{state,expr,decl,asm}.md` | done                          |
-| `doc/mach/lang/fe/comptime.md`         | done                                                      |
-| `doc/mach/lang/fe/resolve.md`          | done                                                      |
-| `doc/mach/lang/fe/sema.md`             | done (design)                                             |
-| `doc/mach/lang/fe/sema/{infer,check,coerce,generics}.md` | done (design)           |
-| `doc/mach/lang/me/*.md`                | not started (design — empty placeholders)                 |
-| `doc/mach/lang/be/*.md`                | not started (design — empty placeholders)                 |
-| `doc/mach/cli/{cmd,args,config}.md`    | not started                                               |
-| `doc/mach/cli/cmd/{build,run,test,dep,init,help}.md` | not started                |
+`query` (incremental compilation) is cut from v1 — recompile
+everything; add it later as an optimisation.
 
-## Source aligned with spec (in `new/`)
+## Build & test
 
-Each source file's module-level doc header now matches the spec
-opening paragraph; per-symbol docs match spec wording. Beyond that,
-the following structural changes were applied to keep source coherent
-with the spec design:
-
-- `lang/fe/ast.mach`: replaced `extras: *u32` pool + `add_extra`
-  function with the four typed pools (`decl_ids`, `stmt_ids`,
-  `expr_ids`, `type_ids`) and their `add_*_id` functions. Updated
-  `init` / `dnit`.
-- `lang/fe/parser/state.mach`: replaced `push_extra` with four typed
-  `push_*_id` helpers.
-- `lang/fe/parser/decl.mach`, `lang/fe/parser/expr.mach`: every
-  list-building site swapped to the appropriate typed pool and
-  `push_*_id` helper.
-- `lang/fe/parser/decl.mach::parse_fin_stmt`: now reads a statement
-  for the body and writes `fin.body: StmtId`.
-- `lang/fe/resolve.mach`, `lang/driver.mach`, `lang/fe/comptime.mach`:
-  list-iterating sites read from the typed pools (`rc.a.decl_ids` etc.).
-- `lang/intern.mach`, `lang/source.mach`, `lang/fe/ast.mach`,
-  `lang/type.mach`, `lang/fe/comptime.mach`: lookup functions
-  (`lookup`, `get_*`, `get`, `line_start`, `prim`, `get_param`)
-  changed signature to `Option[T]`. All call sites in `driver.mach`,
-  `resolve.mach`, `comptime.mach`, `parser/*` updated to either
-  propagate via `is_none` → `ret err[...]` (Result-returning callers)
-  or use inline `unwrap[T](...)` (parser sites where the id is
-  construction-guaranteed valid; unwrap panics on bug rather than
-  silently absorbing).
-- `lang/fe/ast/stmt.mach`: `StmtFin.expr: ExprId` → `body: StmtId`.
-- `lang/type.mach`: added `TYPE_INSTANCE` constant, `TypeInstance`
-  rec, `intern_instance` function with linear-scan dedup.
-
-## Where to pick up
-
-1. **`doc/mach/lang/driver.md`** is the next file to write. The
-   source is `new/lang/driver.mach` (implemented; 1062 lines). The
-   spec describes the project driver — loads `mach.toml` + dep
-   manifests, DFS-walks the module graph from the selected target's
-   entrypoint, evaluates `$if` predicates during load, runs resolve
-   (and eventually sema) in topological dep order.
-2. After driver: `query.md`, then the `target/` subtree, then `cli/*`
-   (small/fast), then the big slabs `me/*` and `be/*`.
-3. Style is locked in. Each spec opens with one paragraph; sections
-   are `## Types`, `## Constants`, `## Functions`, plus extension
-   sections for complex modules (grammar, dispatch tables,
-   algorithms). Code blocks for declarations + parameter tables with
-   linked types for every documented identifier (cross-spec links
-   like `[`Name`](other.md#name)`; primitives stay unlinked since
-   they're stdlib). Dependencies listed individually (no
-   brace-grouping).
-
-## Open audit items (not blockers, just notes)
-
-- `driver.mach::add_pub_const`, `register_val_for_load`,
-  `intern_or_default` cleanups from a prior audit pass are landed in
-  source but may need fresh eyes once the spec for driver is written
-  — the spec is the canonical design, so any drift between source
-  and the new spec needs reconciling in favour of the spec.
-- The `cli/cmd/*.mach` subcommand files are empty placeholders today.
-  Once `cli/cmd.md` exists, the implementation phase will fill them.
-
-## Useful greps
-
-- `grep -r "extras"` — should be empty in both `new/` and `doc/mach/`.
-- `grep -r "TYPE_DEF"` — should only appear in language docs / spec
-  prose explaining the absence.
-- `grep -r "fwd"` — `pub fwd` is real; flag is `DECL_FLAG_FWD`.
+- Compiler source: `new/` (entry `new/main.mach`; modules `mach.*`,
+  stdlib `std.*` → `dep/mach-std/src`).
+- `new/` needs its own `mach.toml` (`mode = "executable"`) to build
+  as a project — created in M1.
+- Module-prefix mapping for single-file builds: `-I mach=new -I
+  std=dep/mach-std/src`.
+- Run the corpus: `tests/run.sh out/bin/machc`.
