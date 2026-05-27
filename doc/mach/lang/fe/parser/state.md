@@ -263,7 +263,7 @@ failure by also checking [`p.panic`](#parser).
 pub fun push_expr(p: *Parser, e: expr.Expr) id.ExprId
 ```
 
-Appends `e` via [`ast.add_expr`](../ast.md#add_module-add_expr-add_stmt-add_decl-add_type).
+Appends `e` via [`ast.add_expr`](../ast.md#add_expr).
 Returns the new [`ExprId`](../ast/id.md#exprid), or
 [`EXPR_NIL`](../ast/id.md#constants) on failure.
 
@@ -278,7 +278,7 @@ Returns the new [`ExprId`](../ast/id.md#exprid), or
 pub fun push_stmt(p: *Parser, s: stmt.Stmt) id.StmtId
 ```
 
-Appends `s` via [`ast.add_stmt`](../ast.md#add_module-add_expr-add_stmt-add_decl-add_type).
+Appends `s` via [`ast.add_stmt`](../ast.md#add_stmt).
 Returns the new [`StmtId`](../ast/id.md#stmtid), or
 [`STMT_NIL`](../ast/id.md#constants) on failure.
 
@@ -293,7 +293,7 @@ Returns the new [`StmtId`](../ast/id.md#stmtid), or
 pub fun push_decl(p: *Parser, d: decl.Decl) id.DeclId
 ```
 
-Appends `d` via [`ast.add_decl`](../ast.md#add_module-add_expr-add_stmt-add_decl-add_type).
+Appends `d` via [`ast.add_decl`](../ast.md#add_decl).
 Returns the new [`DeclId`](../ast/id.md#declid), or
 [`DECL_NIL`](../ast/id.md#constants) on failure.
 
@@ -308,7 +308,7 @@ Returns the new [`DeclId`](../ast/id.md#declid), or
 pub fun push_type(p: *Parser, t: m_type.Type) id.TypeId
 ```
 
-Appends `t` via [`ast.add_type`](../ast.md#add_module-add_expr-add_stmt-add_decl-add_type).
+Appends `t` via [`ast.add_type`](../ast.md#add_type).
 Returns the new [`TypeId`](../ast/id.md#typeid), or
 [`TYPE_NIL`](../ast/id.md#constants) on failure.
 
@@ -323,7 +323,7 @@ Returns the new [`TypeId`](../ast/id.md#typeid), or
 pub fun push_module(p: *Parser, m: module.Module) id.ModuleId
 ```
 
-Appends `m` via [`ast.add_module`](../ast.md#add_module-add_expr-add_stmt-add_decl-add_type).
+Appends `m` via [`ast.add_module`](../ast.md#add_module).
 Returns the new [`ModuleId`](../ast/id.md#moduleid), or
 [`MODULE_NIL`](../ast/id.md#constants) on failure.
 

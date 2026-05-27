@@ -2,7 +2,7 @@
 
 Bottom-up type inference. Computes the semantic [`TypeId`](../../type.md#typeid)
 of every expression and the interned [`TypeId`](../../type.md#typeid)
-that each syntactic [`AstType`](../../ast/type.md#type) refers to.
+that each syntactic [`AstType`](../ast/type.md#type) refers to.
 Drives the rest of sema by calling [`check`](check.md) at composing
 sites and [`coerce`](coerce.md) where the language allows implicit
 narrowing.
@@ -15,13 +15,13 @@ narrowing.
 pub fun infer_decl(sc: *sema.SemaContext, did: id.DeclId) type.TypeId
 ```
 
-Computes the declared type of one decl. Per [`DeclKind`](../../ast/decl.md#declkind):
+Computes the declared type of one decl. Per [`DeclKind`](../ast/decl.md#declkind):
 
 | Kind                       | Returned type                                                              |
 |----------------------------|----------------------------------------------------------------------------|
 | `FUN`                      | An interned [`TYPE_FUN`](../../type.md#typekind) for the signature.        |
 | `REC`                      | An interned [`TYPE_REC`](../../type.md#typekind) nominal type.             |
-| `VAL` / `VAR`              | The annotated [`TypeId`](../../type.md#typeid), or — when the annotation is [`TYPE_NIL`](../../ast/id.md#constants) — the inferred type of the initializer. |
+| `VAL` / `VAR`              | The annotated [`TypeId`](../../type.md#typeid), or — when the annotation is [`TYPE_NIL`](../ast/id.md#constants) — the inferred type of the initializer. |
 | `DEF`                      | Resolves to the underlying type; **transparent** — no `TYPE_DEF` produced (see [type.md](../../type.md)). |
 | `TEST`                     | [`TYPE_NIL`](../../type.md#type_nil) (tests aren't typed; the runner inspects them through resolve). |
 | `USE` / `COMPTIME_*`       | [`TYPE_NIL`](../../type.md#type_nil).                                      |
@@ -29,7 +29,7 @@ Computes the declared type of one decl. Per [`DeclKind`](../../ast/decl.md#declk
 | Param | Type                                          | Description                  |
 |-------|-----------------------------------------------|------------------------------|
 | sc    | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                |
-| did   | [`id.DeclId`](../../ast/id.md#declid)         | Decl to compute the type of. |
+| did   | [`id.DeclId`](../ast/id.md#declid)         | Decl to compute the type of. |
 
 ### `infer_expr`
 
@@ -38,14 +38,14 @@ pub fun infer_expr(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId
 ```
 
 Computes the type of one expression. Recursively infers
-sub-expressions, dispatches per [`ExprKind`](../../ast/expr.md#exprkind),
+sub-expressions, dispatches per [`ExprKind`](../ast/expr.md#exprkind),
 writes the result into [`sc.expr_type[eid]`](../sema.md#semacontext),
 and returns it.
 
 | Param | Type                                          | Description                  |
 |-------|-----------------------------------------------|------------------------------|
 | sc    | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                |
-| eid   | [`id.ExprId`](../../ast/id.md#exprid)         | Expression to type.          |
+| eid   | [`id.ExprId`](../ast/id.md#exprid)         | Expression to type.          |
 
 ### `resolve_type_ref`
 
@@ -53,9 +53,9 @@ and returns it.
 pub fun resolve_type_ref(sc: *sema.SemaContext, tid: id.TypeId) type.TypeId
 ```
 
-Translates a syntactic [`AstType`](../../ast/type.md#type) into an
+Translates a syntactic [`AstType`](../ast/type.md#type) into an
 interned semantic [`TypeId`](../../type.md#typeid). Walks the
-[`TypeKind`](../../ast/type.md#typekind) variants and dispatches
+[`TypeKind`](../ast/type.md#typekind) variants and dispatches
 to the matching [`type.intern_*`](../../type.md#functions). Writes
 the result into
 [`sc.type_resolved_ty[tid]`](../sema.md#semacontext).
@@ -63,7 +63,7 @@ the result into
 | Param | Type                                          | Description                          |
 |-------|-----------------------------------------------|--------------------------------------|
 | sc    | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                        |
-| tid   | [`id.TypeId`](../../ast/id.md#typeid)         | Syntactic type to resolve.           |
+| tid   | [`id.TypeId`](../ast/id.md#typeid)         | Syntactic type to resolve.           |
 
 ## Inference rules
 
@@ -86,33 +86,33 @@ the result into
 | `MEMBER`                | Object type must be [`TYPE_REC`](../../type.md#typekind) or [`TYPE_UNI`](../../type.md#typekind); look up the field by name; result is the field's type. Field tables for built-in records (e.g. `str`) are handled by [field-table](#field-tables). |
 | `CAST`                  | [`check.check_cast`](check.md#check_cast).                                                                                                                               |
 | `ARRAY_LIT`             | Result is [`TYPE_ARRAY(elem, count)`](../../type.md#typearray) of the declared element type; each element checked against `elem` via [`check.check_assignable`](check.md#check_assignable). |
-| `STRUCT_LIT`            | Result is the named [`TYPE_REC`](../../type.md#typekind); each [`FieldInit`](../../ast/expr.md#fieldinit) checked against the record's field of the same name. |
+| `STRUCT_LIT`            | Result is the named [`TYPE_REC`](../../type.md#typekind); each [`FieldInit`](../ast/expr.md#fieldinit) checked against the record's field of the same name. |
 | `ERROR`                 | [`TYPE_ERROR`](../../type.md#typekind) — absorbs further operations without cascading diagnostics.                                                                       |
 
 ### Binary operators
 
-| [`BinOp`](../../ast/expr.md#binop)                          | Operand rule                                | Result                          |
+| [`BinOp`](../ast/expr.md#binop)                          | Operand rule                                | Result                          |
 |-------------------------------------------------------------|---------------------------------------------|---------------------------------|
 | `BIN_ADD`, `BIN_SUB`, `BIN_MUL`, `BIN_DIV`, `BIN_MOD`       | both operands same numeric type             | that type                       |
-| `BIN_EQ`, `BIN_NEQ`                                         | both operands same type                     | [`TYPE_U8`](../../type.md#constants) (boolean) |
+| `BIN_EQ`, `BIN_NEQ`                                         | both operands same type                     | [`TYPE_U8`](../../type.md#constants) (0 / 1)    |
 | `BIN_LT`, `BIN_LEQ`, `BIN_GT`, `BIN_GEQ`                    | both operands same numeric type             | [`TYPE_U8`](../../type.md#constants)            |
-| `BIN_AND`, `BIN_OR`                                         | both operands [`TYPE_U8`](../../type.md#constants) | [`TYPE_U8`](../../type.md#constants)            |
+| `BIN_AND`, `BIN_OR`                                         | both operands any integer type (truthiness) | [`TYPE_U8`](../../type.md#constants)            |
 | `BIN_BIT_AND`, `BIN_BIT_OR`, `BIN_BIT_XOR`, `BIN_SHL`, `BIN_SHR` | both operands same integer type        | that type                       |
 | `BIN_ASSIGN`                                                | LHS is assignable; RHS assignable to LHS    | LHS type                        |
 
 ### Unary operators
 
-| [`UnOp`](../../ast/expr.md#unop) | Operand rule                                  | Result                                                |
+| [`UnOp`](../ast/expr.md#unop) | Operand rule                                  | Result                                                |
 |----------------------------------|-----------------------------------------------|-------------------------------------------------------|
 | `UN_NEG`                         | operand is a numeric type                     | the operand's type                                    |
-| `UN_NOT`                         | operand is [`TYPE_U8`](../../type.md#constants) | [`TYPE_U8`](../../type.md#constants)                |
+| `UN_NOT`                         | operand is any integer type (truthiness)      | [`TYPE_U8`](../../type.md#constants)                  |
 | `UN_BIT_NOT`                     | operand is an integer type                    | the operand's type                                    |
 | `UN_ADDR`                        | operand is an lvalue                          | [`type.intern_pointer(operand_type)`](../../type.md#intern_pointer) |
 | `UN_DEREF`                       | operand is [`TYPE_POINTER`](../../type.md#typekind) | the pointee type                              |
 
 ### Type-reference dispatch
 
-[`resolve_type_ref`](#resolve_type_ref) per [`AstType.kind`](../../ast/type.md#typekind):
+[`resolve_type_ref`](#resolve_type_ref) per [`AstType.kind`](../ast/type.md#typekind):
 
 | `TYPE_KIND_*` | Action                                                                                                  |
 |---------------|---------------------------------------------------------------------------------------------------------|
@@ -163,15 +163,15 @@ File-private; listed for reference.
 |-------------------------|----------------------------------------------------------------------------|
 | `infer_lit_int` / `_float` / `_char` / `_str` / `_zstr` / `_nil` | Per-literal type rule.        |
 | `infer_ident`           | Consults [`sc.rr.expr_resolved`](../resolve.md#resolveresult); maps the [`SymbolId`](../resolve.md#symbolid) to its declared type. |
-| `infer_binary`          | Dispatches per [`BinOp`](../../ast/expr.md#binop).                         |
-| `infer_unary`           | Dispatches per [`UnOp`](../../ast/expr.md#unop).                           |
+| `infer_binary`          | Dispatches per [`BinOp`](../ast/expr.md#binop).                         |
+| `infer_unary`           | Dispatches per [`UnOp`](../ast/expr.md#unop).                           |
 | `infer_call`            | Resolves the callee's signature; arity-checks; checks each arg.            |
 | `infer_index`           | Validates indexed expression / index type.                                 |
 | `infer_member`          | Resolves member via field-table lookup.                                    |
 | `infer_cast`            | Delegates to [`check.check_cast`](check.md#check_cast).                    |
 | `infer_array_lit`       | Validates each element against the declared element type.                  |
 | `infer_struct_lit`      | Validates each field initializer against the named type's field of the same name. |
-| `resolve_type_named`    | Walks a dotted [`TypeNamed`](../../ast/type.md#typenamed) reference (including generics). |
+| `resolve_type_named`    | Walks a dotted [`TypeNamed`](../ast/type.md#typenamed) reference (including generics). |
 | `intern_anonymous_rec_uni` | Synthesises a `(own_module, DECL_NIL, synthetic_name)` nominal entry.   |
 
 ## Dependencies
@@ -179,11 +179,11 @@ File-private; listed for reference.
 `std.types.bool`, `std.types.option`, `std.types.size`,
 `std.types.string`, `std.types.result`,
 [`mach.lang.intern`](../../intern.md), [`mach.lang.type`](../../type.md),
-[`mach.lang.fe.ast`](../../ast.md),
-[`mach.lang.fe.ast.id`](../../ast/id.md),
-[`mach.lang.fe.ast.expr`](../../ast/expr.md),
-[`mach.lang.fe.ast.decl`](../../ast/decl.md),
-[`mach.lang.fe.ast.type`](../../ast/type.md),
+[`mach.lang.fe.ast`](../ast.md),
+[`mach.lang.fe.ast.id`](../ast/id.md),
+[`mach.lang.fe.ast.expr`](../ast/expr.md),
+[`mach.lang.fe.ast.decl`](../ast/decl.md),
+[`mach.lang.fe.ast.type`](../ast/type.md),
 [`mach.lang.fe.comptime`](../comptime.md),
 [`mach.lang.fe.resolve`](../resolve.md),
 [`mach.lang.fe.sema`](../sema.md),

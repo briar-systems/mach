@@ -27,7 +27,7 @@ Emits `"type mismatch: expected <expected>, got <actual>"` on failure.
 | sc       | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                                |
 | expected | [`type.TypeId`](../../type.md#typeid)         | Target slot's type.                          |
 | actual   | [`type.TypeId`](../../type.md#typeid)         | Value's inferred type.                       |
-| span     | [`token.Span`](../../token.md#span)           | Span used for the diagnostic.                |
+| span     | [`token.Span`](../token.md#span)           | Span used for the diagnostic.                |
 
 Returns `true` when compatible, `false` after emitting the diagnostic.
 
@@ -52,9 +52,9 @@ arguments, got M"` on length mismatch, and one
 |------------|-----------------------------------------------|----------------------------------------------------------|
 | sc         | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                                            |
 | callee_sig | [`type.TypeId`](../../type.md#typeid)         | The callee's signature.                                  |
-| args_start | `u32`                                         | Start index into [`ast.expr_ids`](../../ast.md#ast).     |
-| args_len   | `u32`                                         | Number of argument [`ExprId`](../../ast/id.md#exprid)s.  |
-| span       | [`token.Span`](../../token.md#span)           | Span of the call expression for diagnostics.             |
+| args_start | `u32`                                         | Start index into [`ast.expr_ids`](../ast.md#ast).     |
+| args_len   | `u32`                                         | Number of argument [`ExprId`](../ast/id.md#exprid)s.  |
+| span       | [`token.Span`](../token.md#span)           | Span of the call expression for diagnostics.             |
 
 Returns `true` when the call validates fully.
 
@@ -74,7 +74,7 @@ Verifies an index expression. Object must be
 | sc     | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                                |
 | object | [`type.TypeId`](../../type.md#typeid)         | Type of the indexed expression.              |
 | index  | [`type.TypeId`](../../type.md#typeid)         | Type of the index expression.                |
-| span   | [`token.Span`](../../token.md#span)           | Span used for diagnostics.                   |
+| span   | [`token.Span`](../token.md#span)           | Span used for diagnostics.                   |
 
 Returns `some(elem_type)` on success, `none` after emitting
 `"not indexable: ..."` or `"index must be an integer type"`.
@@ -94,8 +94,8 @@ the type's field table.
 |--------|-----------------------------------------------|----------------------------------------------|
 | sc     | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                                |
 | object | [`type.TypeId`](../../type.md#typeid)         | Type of the object expression.               |
-| name   | [`token.Span`](../../token.md#span)           | Span of the field identifier.                |
-| span   | [`token.Span`](../../token.md#span)           | Span of the full member expression.          |
+| name   | [`token.Span`](../token.md#span)           | Span of the field identifier.                |
+| span   | [`token.Span`](../token.md#span)           | Span of the full member expression.          |
 
 Returns `some(field_type)` on success, `none` after emitting
 `"no such field: <name>"` or `"member access on non-record type"`.
@@ -107,7 +107,7 @@ pub fun check_cast(sc: *sema.SemaContext, from: type.TypeId, to: type.TypeId, sp
 ```
 
 Verifies an `expr::Type` cast under the
-[language-reference rules](../../../language/types.md#type-casting):
+[language-reference rules](../../../../language/types.md#type-casting):
 
 1. **Primitive numeric conversion**: both `from` and `to` are
    primitives → permitted; produces a converted value.
@@ -121,7 +121,7 @@ Verifies an `expr::Type` cast under the
 | sc    | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                                |
 | from  | [`type.TypeId`](../../type.md#typeid)         | Source value's type.                         |
 | to    | [`type.TypeId`](../../type.md#typeid)         | Destination type.                            |
-| span  | [`token.Span`](../../token.md#span)           | Span of the `::` operator.                   |
+| span  | [`token.Span`](../token.md#span)           | Span of the `::` operator.                   |
 
 Returns `some(to)` on success, `none` after emitting a diagnostic.
 
@@ -146,7 +146,7 @@ return type.
 | sc     | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                                |
 | fn_ret | [`type.TypeId`](../../type.md#typeid)         | Declared return type of the enclosing fun.   |
 | value  | [`type.TypeId`](../../type.md#typeid)         | Inferred type of the returned expression, or [`TYPE_NIL`](../../type.md#type_nil) for bare `ret;`. |
-| span   | [`token.Span`](../../token.md#span)           | Span of the `ret` statement.                 |
+| span   | [`token.Span`](../token.md#span)           | Span of the `ret` statement.                 |
 
 Returns `true` when the return validates.
 
@@ -156,9 +156,9 @@ Returns `true` when the return validates.
 pub fun check_condition(sc: *sema.SemaContext, cond: type.TypeId, span: token.Span) bool
 ```
 
-Verifies a control-flow condition (`if (cond)`, `for (cond)`,
-`while`-style loops). Mach treats any integer-typed value as a
-condition; `cond` must be one of the integer primitives.
+Verifies a control-flow condition (`if (cond)` / `for (cond)`).
+Mach treats any integer-typed value as a condition; `cond` must be
+one of the integer primitives.
 
 Emits `"condition must be an integer type"` otherwise.
 
@@ -166,7 +166,7 @@ Emits `"condition must be an integer type"` otherwise.
 |-------|-----------------------------------------------|--------------------------------------|
 | sc    | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                        |
 | cond  | [`type.TypeId`](../../type.md#typeid)         | Inferred type of the condition.      |
-| span  | [`token.Span`](../../token.md#span)           | Span of the condition expression.    |
+| span  | [`token.Span`](../token.md#span)           | Span of the condition expression.    |
 
 Returns `true` when the condition is valid.
 
@@ -187,8 +187,8 @@ File-private; listed for reference.
 `std.types.bool`, `std.types.option`, `std.types.size`,
 `std.types.string`, `std.types.result`,
 [`mach.lang.diagnostic`](../../diagnostic.md),
-[`mach.lang.type`](../../type.md), [`mach.lang.fe.ast`](../../ast.md),
-[`mach.lang.fe.ast.id`](../../ast/id.md),
-[`mach.lang.fe.token`](../../token.md),
+[`mach.lang.type`](../../type.md), [`mach.lang.fe.ast`](../ast.md),
+[`mach.lang.fe.ast.id`](../ast/id.md),
+[`mach.lang.fe.token`](../token.md),
 [`mach.lang.fe.sema`](../sema.md),
 [`mach.lang.fe.sema.coerce`](coerce.md).

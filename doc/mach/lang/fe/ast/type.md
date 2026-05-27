@@ -71,16 +71,18 @@ A fixed-length array type `[N]T`.
 pub rec TypeFun {
     params_start: u32;
     params_len:   u32;
+    variadic:     bool;
     ret:          id.TypeId;
 }
 ```
 
-A function type `fun(T, U) R`.
+A function type `fun(T, U) R` or `fun(T, ...) R`.
 
 | Field        | Type                          | Description                                                |
 |--------------|-------------------------------|------------------------------------------------------------|
 | params_start | `u32`                         | Start index into [`Ast.type_ids`](../ast.md#ast). |
-| params_len   | `u32`                         | Number of parameter types.                                 |
+| params_len   | `u32`                         | Number of fixed parameter types.                           |
+| variadic     | `bool`                        | `true` when the type ends with `...` (variadic function type). |
 | ret          | [`id.TypeId`](id.md#typeid)   | Return type, or [`TYPE_NIL`](id.md#constants) for no explicit return. |
 
 ### `TypeRec`
@@ -139,7 +141,7 @@ for `ERROR` (discriminated by kind alone).
 |-------|---------------------------------------|----------------------------------------------|
 | span  | [`token.Span`](../token.md#span)      | Byte range of the type expression.           |
 | kind  | [`TypeKind`](#typekind)               | Which `TYPE_KIND_*` variant is active.       |
-| data  | `uni { … }`                           | Kind-specific payload.                       |
+| data  | `uni { ... }`                           | Kind-specific payload.                       |
 
 ## Constants
 

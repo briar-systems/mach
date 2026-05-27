@@ -5,6 +5,14 @@ text and resolves byte offsets to 1-based `(line, column)` positions.
 Used by [diagnostics](diagnostic.md) for span rendering and by every
 phase that reports source locations.
 
+`SourceMap` is the single source of truth for file bytes — there is no
+parallel "file text" query. Each file carries a [`Revision`](query.md#revision)
+counter (bumped by [`add`](#add) on first load and by
+[`update`](#update) on subsequent reloads); the [`QueryDb`](query.md#querydb)
+uses this counter directly to validate derived entries that read the
+file's text. Derived compute functions read `file.text` through
+[`get`](#get); they do not duplicate the bytes into the cache.
+
 ## Types
 
 ### `FileId`
@@ -39,17 +47,19 @@ pub rec SourceFile {
     text:        str;
     line_starts: *usize;
     line_len:    usize;
+    revision:    query.Revision;
 }
 ```
 
 A loaded source file with a precomputed newline index.
 
-| Field       | Type      | Description                                                  |
-|-------------|-----------|--------------------------------------------------------------|
-| path        | `str`     | Owned file path as known to the loader.                      |
-| text        | `str`     | Owned source text; `text.data[text.len]` is 0 for FFI use.   |
-| line_starts | `*usize`  | Byte offset of the start of each line.                       |
-| line_len    | `usize`   | Number of entries in `line_starts`.                          |
+| Field       | Type                              | Description                                                  |
+|-------------|-----------------------------------|--------------------------------------------------------------|
+| path        | `str`                             | Owned file path. The byte past `path.data[path.len-1]` is `0` so the buffer can be handed to an OS call as a `zstr` without re-copying. |
+| text        | `str`                             | Owned source text. Treated as a `str` only — walks are by length, never by null terminator. No null-padding is guaranteed past `text.data[text.len-1]`. |
+| line_starts | `*usize`                          | Byte offset of the start of each line.                       |
+| line_len    | `usize`                           | Number of entries in `line_starts`.                          |
+| revision    | [`query.Revision`](query.md#revision) | Revision at which this file was last loaded or updated. Read by query validity checks via the `Q_*` derivations that depend on this file. |
 
 ### `SourceMap`
 
@@ -114,21 +124,41 @@ previously issued is invalid.
 ### `add`
 
 ```mach
-pub fun add(m: *SourceMap, path: str, text: str) Result[FileId, str]
+pub fun add(m: *SourceMap, db: *query.QueryDb, path: str, text: str) Result[FileId, str]
 ```
 
 Copies `path` and `text` into the map's allocator, precomputes a newline
-index, and returns a fresh [`FileId`](#fileid). Errors on allocation
-failure; on failure no partial state is added to the map.
+index, sets the new file's `revision` to `db.revision + 1`, bumps
+`db.revision`, and returns a fresh [`FileId`](#fileid). Errors on
+allocation failure; on failure no partial state is added to the map.
 
-| Param | Type                          | Description                                |
-|-------|-------------------------------|--------------------------------------------|
-| m     | [`*SourceMap`](#sourcemap)    | The source map.                            |
-| path  | `str`                         | File path to associate with this file.     |
-| text  | `str`                         | Source text to index and store.            |
+| Param | Type                                  | Description                                |
+|-------|---------------------------------------|--------------------------------------------|
+| m     | [`*SourceMap`](#sourcemap)            | The source map.                            |
+| db    | [`*query.QueryDb`](query.md#querydb)  | Database whose revision is bumped.         |
+| path  | `str`                                 | File path to associate with this file.     |
+| text  | `str`                                 | Source text to index and store.            |
 
 Returns the [`FileId`](#fileid) of the newly added file, or an
 allocation error.
+
+### `update`
+
+```mach
+pub fun update(m: *SourceMap, db: *query.QueryDb, id: FileId, text: str) Result[bool, str]
+```
+
+Replaces the text of an existing file, rebuilds its line index, sets
+its `revision` to `db.revision + 1`, and bumps `db.revision`. Used by
+long-running hosts (LSP) when a user saves a file. Returns
+`ok(false)` if `id` is out of range.
+
+| Param | Type                                  | Description                              |
+|-------|---------------------------------------|------------------------------------------|
+| m     | [`*SourceMap`](#sourcemap)            | The source map.                          |
+| db    | [`*query.QueryDb`](query.md#querydb)  | Database whose revision is bumped.       |
+| id    | [`FileId`](#fileid)                   | File to update.                          |
+| text  | `str`                                 | New source text.                         |
 
 ### `get`
 
@@ -156,6 +186,7 @@ pub fun position(file: *SourceFile, offset: usize) Position
 
 Converts a byte offset in `file.text` to a 1-based `(line, col)`
 [`Position`](#position). Uses binary search over `line_starts`.
+`position(file, 0)` returns `Position{1, 1}`.
 
 | Param  | Type                            | Description                      |
 |--------|---------------------------------|----------------------------------|
@@ -183,4 +214,5 @@ Returns `some(offset)` for a valid line, `none` otherwise.
 ## Dependencies
 
 `std.types.bool`, `std.types.option`, `std.types.size`,
-`std.types.string`, `std.types.result`, `std.allocator`.
+`std.types.string`, `std.types.result`, `std.allocator`,
+[`mach.lang.query`](query.md).

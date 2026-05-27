@@ -215,7 +215,7 @@ assembly text rather than mach tokens.
 |-------|---------------------------------------|----------------------------------------------|
 | span  | [`token.Span`](../token.md#span)      | Byte range of the statement in source.       |
 | kind  | [`StmtKind`](#stmtkind)               | Which `STMT_KIND_*` variant is active.       |
-| data  | `uni { … }`                           | Kind-specific payload.                       |
+| data  | `uni { ... }`                           | Kind-specific payload.                       |
 
 ## Constants
 

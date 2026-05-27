@@ -194,7 +194,7 @@ pub rec Expr {
     data: uni {
         lit_int:    u64;
         lit_float:  f64;
-        lit_char:   u32;
+        lit_char:   u8;
         binary:     ExprBinary;
         unary:      ExprUnary;
         call:       ExprCall;
@@ -215,7 +215,7 @@ A syntactic expression node. Payload is unused for `IDENT`,
 |-------|---------------------------------------|----------------------------------------------|
 | span  | [`token.Span`](../token.md#span)      | Byte range of the expression in source.      |
 | kind  | [`ExprKind`](#exprkind)               | Which `EXPR_KIND_*` variant is active.       |
-| data  | `uni { … }`                           | Kind-specific payload.                       |
+| data  | `uni { ... }`                           | Kind-specific payload.                       |
 
 ## Constants
 

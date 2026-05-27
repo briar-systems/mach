@@ -162,39 +162,100 @@ Releases every array held by the [`Ast`](#ast) and clears its fields.
 |-------|-----------|--------------------------------------|
 | a     | `*Ast`    | `Ast` to tear down. `nil` is a no-op.|
 
-### `add_module`, `add_expr`, `add_stmt`, `add_decl`, `add_type`
+### `add_module`
 
 ```mach
 pub fun add_module(a: *Ast, m: module.Module) Result[id.ModuleId, str]
-pub fun add_expr  (a: *Ast, e: expr.Expr)     Result[id.ExprId, str]
-pub fun add_stmt  (a: *Ast, s: stmt.Stmt)     Result[id.StmtId, str]
-pub fun add_decl  (a: *Ast, d: decl.Decl)     Result[id.DeclId, str]
-pub fun add_type  (a: *Ast, t: m_type.Type)   Result[id.TypeId, str]
 ```
 
-Append a node of the corresponding kind. Each grows its backing array
-on demand. Errors on allocation failure.
+Appends `m` to [`modules`](#ast); grows the array on demand. Returns
+the new [`ModuleId`](ast/id.md#moduleid) or an allocation error.
 
-Returns the newly assigned handle into the corresponding `Ast` array.
+### `add_expr`
 
-### `get_module`, `get_expr`, `get_stmt`, `get_decl`, `get_type`
+```mach
+pub fun add_expr(a: *Ast, e: expr.Expr) Result[id.ExprId, str]
+```
+
+Appends `e` to [`exprs`](#ast); grows the array on demand. Returns
+the new [`ExprId`](ast/id.md#exprid) or an allocation error.
+
+### `add_stmt`
+
+```mach
+pub fun add_stmt(a: *Ast, s: stmt.Stmt) Result[id.StmtId, str]
+```
+
+Appends `s` to [`stmts`](#ast); grows the array on demand. Returns
+the new [`StmtId`](ast/id.md#stmtid) or an allocation error.
+
+### `add_decl`
+
+```mach
+pub fun add_decl(a: *Ast, d: decl.Decl) Result[id.DeclId, str]
+```
+
+Appends `d` to [`decls`](#ast); grows the array on demand. Returns
+the new [`DeclId`](ast/id.md#declid) or an allocation error.
+
+### `add_type`
+
+```mach
+pub fun add_type(a: *Ast, t: m_type.Type) Result[id.TypeId, str]
+```
+
+Appends `t` to [`types`](#ast); grows the array on demand. Returns
+the new [`TypeId`](ast/id.md#typeid) or an allocation error.
+
+### `get_module`
 
 ```mach
 pub fun get_module(a: *Ast, id_: id.ModuleId) Option[*module.Module]
-pub fun get_expr  (a: *Ast, id_: id.ExprId)   Option[*expr.Expr]
-pub fun get_stmt  (a: *Ast, id_: id.StmtId)   Option[*stmt.Stmt]
-pub fun get_decl  (a: *Ast, id_: id.DeclId)   Option[*decl.Decl]
-pub fun get_type  (a: *Ast, id_: id.TypeId)   Option[*m_type.Type]
 ```
 
-Returns `some(*Node)` into the corresponding `Ast` array when `id_` is
-in range, `none` otherwise. The pointer is invalidated by a later
-`add_*` of the same kind that grows the array.
+Returns `some(*Module)` into [`modules`](#ast) when `id_` is in range,
+`none` otherwise. Pointer is invalidated by a later
+[`add_module`](#add_module) that grows the array.
 
-| Param | Type    | Description                          |
-|-------|---------|--------------------------------------|
-| a     | `*Ast`  | The `Ast`.                           |
-| id_   | id      | Handle returned by the matching `add_*`. |
+### `get_expr`
+
+```mach
+pub fun get_expr(a: *Ast, id_: id.ExprId) Option[*expr.Expr]
+```
+
+Returns `some(*Expr)` into [`exprs`](#ast) when `id_` is in range,
+`none` otherwise. Pointer is invalidated by a later
+[`add_expr`](#add_expr) that grows the array.
+
+### `get_stmt`
+
+```mach
+pub fun get_stmt(a: *Ast, id_: id.StmtId) Option[*stmt.Stmt]
+```
+
+Returns `some(*Stmt)` into [`stmts`](#ast) when `id_` is in range,
+`none` otherwise. Pointer is invalidated by a later
+[`add_stmt`](#add_stmt) that grows the array.
+
+### `get_decl`
+
+```mach
+pub fun get_decl(a: *Ast, id_: id.DeclId) Option[*decl.Decl]
+```
+
+Returns `some(*Decl)` into [`decls`](#ast) when `id_` is in range,
+`none` otherwise. Pointer is invalidated by a later
+[`add_decl`](#add_decl) that grows the array.
+
+### `get_type`
+
+```mach
+pub fun get_type(a: *Ast, id_: id.TypeId) Option[*m_type.Type]
+```
+
+Returns `some(*Type)` into [`types`](#ast) when `id_` is in range,
+`none` otherwise. Pointer is invalidated by a later
+[`add_type`](#add_type) that grows the array.
 
 ### `add_typed_name`
 

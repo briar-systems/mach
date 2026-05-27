@@ -95,7 +95,7 @@ single bad input does not abort the stream.
 
 | Param   | Type                                  | Description                                              |
 |---------|---------------------------------------|----------------------------------------------------------|
-| source  | `str`                                 | Null-terminated source text.                             |
+| source  | `str`                                 | Source text to lex. The caller must keep this buffer alive for the returned stream's lifetime — `stream.source` is a non-owning view. |
 | alloc   | `*Allocator`                          | Allocator used for the token and error buffers.          |
 | file_id | [`src.FileId`](../source.md#fileid)   | File identifier stored on the stream for downstream diagnostics.|
 
@@ -132,52 +132,16 @@ Valid for the source buffer's lifetime.
 
 Returns a `str` view spanning the token's bytes (no allocation).
 
-### `push_error`
+## Internal helpers
 
-```mach
-fun push_error(stream: *TokenStream, alloc: *Allocator, offset: usize, len: usize, code: u8) Result[bool, str]
-```
+File-private; listed for reference.
 
-Internal helper used by [`tokenize`](#tokenize) to record a
-[`LexError`](#lexerror) into `stream.errors`. Grows the errors array on
-demand.
-
-| Param  | Type                              | Description                                |
-|--------|-----------------------------------|--------------------------------------------|
-| stream | [`*TokenStream`](#tokenstream)    | Stream whose error buffer receives the entry.|
-| alloc  | `*Allocator`                      | Allocator backing the error buffer.        |
-| offset | `usize`                           | Starting byte offset of the bad span.      |
-| len    | `usize`                           | Length in bytes.                           |
-| code   | `u8`                              | One of the [`LEX_ERR_*`](#constants) codes.|
-
-Returns `true` on success, or an allocation error.
-
-### `is_ident_start`
-
-```mach
-fun is_ident_start(c: u8) bool
-```
-
-Returns `true` when `c` matches the regex `[a-zA-Z_]` — the set of
-bytes that may begin an identifier.
-
-### `is_ident_char`
-
-```mach
-fun is_ident_char(c: u8) bool
-```
-
-Returns `true` when `c` matches the regex `[a-zA-Z_0-9]` — the set of
-bytes that may continue an identifier.
-
-### `is_hex_char`
-
-```mach
-fun is_hex_char(c: u8) bool
-```
-
-Returns `true` when `c` matches the regex `[0-9a-fA-F]` — the set of
-bytes that may appear in a hexadecimal integer literal.
+| Function          | Role                                                                          |
+|-------------------|-------------------------------------------------------------------------------|
+| `push_error`      | Records a [`LexError`](#lexerror) into `stream.errors`; grows the errors array on demand. |
+| `is_ident_start`  | Matches `[a-zA-Z_]` — bytes that may begin an identifier.                     |
+| `is_ident_char`   | Matches `[a-zA-Z_0-9]` — bytes that may continue an identifier.               |
+| `is_hex_char`     | Matches `[0-9a-fA-F]` — bytes that may appear in a hexadecimal literal.       |
 
 ## Recognition
 

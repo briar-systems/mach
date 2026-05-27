@@ -146,6 +146,11 @@ pub val KIND_ERROR:       Kind = 255;
 | `KIND_EOF`          | 254   | end-of-stream sentinel                                 |
 | `KIND_ERROR`        | 255   | invalid-input sentinel                                 |
 
+There is no token kind for `\`. Backslashes only appear inside string,
+char, and zstr literal spans where the [lexer](lexer.md#recognition)
+consumes them as part of the literal body; they never reach the
+parser as standalone tokens.
+
 ## Functions
 
 ### `make`
@@ -167,7 +172,7 @@ Returns a [`Token`](#token) carrying `(kind, Span { offset, len })`.
 ### `kind_str`
 
 ```mach
-pub fun kind_str(kind: Kind) str
+pub fun kind_str(kind: Kind) Option[str]
 ```
 
 Returns a human-readable name for a token kind (e.g. `"("`, `"=="`,
@@ -177,8 +182,10 @@ Returns a human-readable name for a token kind (e.g. `"("`, `"=="`,
 |-------|-----------------|-----------------------|
 | kind  | [`Kind`](#kind) | The kind to describe. |
 
-Returns a printable label for the kind. Returns `"unknown"` if the
-kind value is outside the enumerated set.
+Returns `some(label)` for an enumerated kind, `none` for a value
+outside the enumerated set. A `none` here means the caller holds a
+[`Kind`](#kind) that the lexer never produces — a bug upstream — and
+must be handled explicitly, not papered over with a default string.
 
 ### `infix_precedence`
 
@@ -226,4 +233,5 @@ Returns `true` for right-associative operators; `false` otherwise.
 
 ## Dependencies
 
-`std.types.bool`, `std.types.size`, `std.types.string`.
+`std.types.bool`, `std.types.option`, `std.types.size`,
+`std.types.string`.

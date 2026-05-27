@@ -119,7 +119,17 @@ pub fun error(list: *DiagList, file_id: src.FileId, span: token.Span, message: s
 ```
 
 Appends a [`Diagnostic`](#diagnostic) with `severity = SEVERITY_ERROR`.
-See [`emit`](#emit) for the shared parameter contract.
+`message` is duplicated into `list`'s allocator; the caller retains
+ownership of the original.
+
+| Param   | Type                              | Description                                  |
+|---------|-----------------------------------|----------------------------------------------|
+| list    | [`*DiagList`](#diaglist)          | Diag list to append to.                      |
+| file_id | [`src.FileId`](source.md#fileid)  | Identifier of the file the span points into. |
+| span    | [`token.Span`](fe/token.md#span)  | Byte range being reported on.                |
+| message | `str`                             | Human-readable message; copied into `list`.  |
+
+Returns `ok(true)` on success, or an allocation error.
 
 ### `warning`
 
@@ -128,7 +138,7 @@ pub fun warning(list: *DiagList, file_id: src.FileId, span: token.Span, message:
 ```
 
 Appends a [`Diagnostic`](#diagnostic) with `severity = SEVERITY_WARNING`.
-See [`emit`](#emit) for the shared parameter contract.
+Parameters and ownership match [`error`](#error).
 
 ### `info`
 
@@ -137,7 +147,7 @@ pub fun info(list: *DiagList, file_id: src.FileId, span: token.Span, message: st
 ```
 
 Appends a [`Diagnostic`](#diagnostic) with `severity = SEVERITY_INFO`.
-See [`emit`](#emit) for the shared parameter contract.
+Parameters and ownership match [`error`](#error).
 
 ### `help`
 
@@ -146,7 +156,7 @@ pub fun help(list: *DiagList, file_id: src.FileId, span: token.Span, message: st
 ```
 
 Appends a [`Diagnostic`](#diagnostic) with `severity = SEVERITY_HELP`.
-See [`emit`](#emit) for the shared parameter contract.
+Parameters and ownership match [`error`](#error).
 
 ### `has_errors`
 
@@ -155,32 +165,54 @@ pub fun has_errors(list: *DiagList) bool
 ```
 
 Returns `true` when at least one stored [`Diagnostic`](#diagnostic) has
-`severity == SEVERITY_ERROR`.
+`severity == SEVERITY_ERROR`. Equivalent to
+[`has_severity(list, SEVERITY_ERROR)`](#has_severity). The build is
+considered failed when this is `true`; warnings and below do not
+fail the build by themselves. CLI-side flags such as `-Werror` are the
+mechanism for promoting warnings, not changes here.
 
 | Param | Type                       | Description     |
 |-------|----------------------------|-----------------|
 | list  | [`*DiagList`](#diaglist)   | List to scan.   |
 
-### `emit`
+### `has_severity`
 
 ```mach
-fun emit(list: *DiagList, severity: Severity, file_id: src.FileId, span: token.Span, message: str) Result[bool, str]
+pub fun has_severity(list: *DiagList, threshold: Severity) bool
 ```
 
-Internal common implementation used by [`error`](#error),
-[`warning`](#warning), [`info`](#info), and [`help`](#help). Duplicates
-`message` into the list's allocator and appends a fresh
-[`Diagnostic`](#diagnostic). Errors on allocation failure.
+Returns `true` when at least one stored [`Diagnostic`](#diagnostic) has
+`severity <= threshold`. Severity values are ordered most-urgent first
+(see [Constants](#constants)), so `has_severity(list, SEVERITY_WARNING)`
+matches both errors and warnings; `has_severity(list, SEVERITY_HELP)`
+matches anything stored.
 
-| Param    | Type                              | Description                                  |
-|----------|-----------------------------------|----------------------------------------------|
-| list     | [`*DiagList`](#diaglist)          | Diag list to append to.                      |
-| severity | [`Severity`](#severity)           | One of [`SEVERITY_*`](#constants).           |
-| file_id  | [`src.FileId`](source.md#fileid)  | Identifier of the file the span points into. |
-| span     | [`token.Span`](fe/token.md#span)  | Byte range being reported on.                |
-| message  | `str`                             | Human-readable message; copied into `list`.  |
+| Param     | Type                       | Description                                              |
+|-----------|----------------------------|----------------------------------------------------------|
+| list      | [`*DiagList`](#diaglist)   | List to scan.                                            |
+| threshold | [`Severity`](#severity)    | Most-permissive severity that should still count as a hit. |
 
-Returns `true` on success, or an allocation error.
+### `clear`
+
+```mach
+pub fun clear(list: *DiagList)
+```
+
+Frees every stored diagnostic's owned message and resets `len` to 0
+without releasing the items array. Used by long-running hosts (LSP) and
+by per-query diagnostic storage when an entry is invalidated.
+
+| Param | Type                       | Description                  |
+|-------|----------------------------|------------------------------|
+| list  | [`*DiagList`](#diaglist)   | Diag list to empty.          |
+
+## Internal helpers
+
+File-private; listed for reference.
+
+| Function | Role                                                                                                |
+|----------|-----------------------------------------------------------------------------------------------------|
+| `emit`   | Common path for [`error`](#error) / [`warning`](#warning) / [`info`](#info) / [`help`](#help): duplicates `message` into the list's allocator and appends a fresh [`Diagnostic`](#diagnostic) with the given severity. |
 
 ## Dependencies
 

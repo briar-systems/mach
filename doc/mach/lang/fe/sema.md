@@ -1,7 +1,7 @@
 # mach.lang.fe.sema
 
 Semantic analysis. Consumes a [`ResolveResult`](resolve.md#resolveresult)
-plus the parsed [`Ast`](../ast.md#ast) and produces a
+plus the parsed [`Ast`](ast.md#ast) and produces a
 [`SemaResult`](#semaresult) — parallel arrays mapping every AST node id
 to its semantic [`TypeId`](../type.md#typeid). All interned types live
 in the shared [`TypeInterner`](../type.md#typeinterner) on the
@@ -33,9 +33,9 @@ Per-module typing data.
 | Field             | Type                                          | Description                                                              |
 |-------------------|-----------------------------------------------|--------------------------------------------------------------------------|
 | alloc             | `*Allocator`                                  | Allocator backing every owned array on the result.                       |
-| expr_type         | [`*type.TypeId`](../type.md#typeid)           | Parallel to [`ast.exprs`](../ast.md#ast); the semantic type of each expression. [`TYPE_ERROR`](../type.md#typekind) at positions that failed to typecheck. |
-| type_resolved_ty  | [`*type.TypeId`](../type.md#typeid)           | Parallel to [`ast.types`](../ast.md#ast); the interned semantic [`TypeId`](../type.md#typeid) for each syntactic [`AstType`](../ast/type.md#type). |
-| decl_type         | [`*type.TypeId`](../type.md#typeid)           | Parallel to [`ast.decls`](../ast.md#ast); the declared (or inferred) type of each binding decl. [`TYPE_NIL`](../type.md#type_nil) for decls that don't carry a type (use, comptime_if, comptime_attr, test, error). |
+| expr_type         | [`*type.TypeId`](../type.md#typeid)           | Parallel to [`ast.exprs`](ast.md#ast); the semantic type of each expression. [`TYPE_ERROR`](../type.md#typekind) at positions that failed to typecheck. |
+| type_resolved_ty  | [`*type.TypeId`](../type.md#typeid)           | Parallel to [`ast.types`](ast.md#ast); the interned semantic [`TypeId`](../type.md#typeid) for each syntactic [`AstType`](ast/type.md#type). |
+| decl_type         | [`*type.TypeId`](../type.md#typeid)           | Parallel to [`ast.decls`](ast.md#ast); the declared (or inferred) type of each binding decl. [`TYPE_NIL`](../type.md#type_nil) for decls that don't carry a type (use, comptime_if, comptime_attr, test, error). |
 
 ### `ModuleSema`
 
@@ -86,6 +86,7 @@ rec SemaContext {
     a:          *ast.Ast;
     rr:         *resolve.ResolveResult;
     deps:       *SemaDeps;
+    ctx:        *comptime.ComptimeCtx;
     own_module: sess.ModuleId;
     source:     str;
 
@@ -110,16 +111,17 @@ pub fun sema(
     a:          *ast.Ast,
     rr:         *resolve.ResolveResult,
     deps:       *SemaDeps,
+    ctx:        *comptime.ComptimeCtx,
     own_module: sess.ModuleId,
 ) Result[SemaResult, str]
 ```
 
 Runs semantic analysis on one module. Phases run in order:
 
-1. Allocate the three parallel arrays sized to [`ast.expr_len`](../ast.md#ast)
-   / [`ast.type_len`](../ast.md#ast) / [`ast.decl_len`](../ast.md#ast),
+1. Allocate the three parallel arrays sized to [`ast.expr_len`](ast.md#ast)
+   / [`ast.type_len`](ast.md#ast) / [`ast.decl_len`](ast.md#ast),
    prefilled with [`TYPE_NIL`](../type.md#type_nil).
-2. Resolve every syntactic [`AstType`](../ast/type.md#type) into the
+2. Resolve every syntactic [`AstType`](ast/type.md#type) into the
    shared [`TypeInterner`](../type.md#typeinterner) via
    [`infer.resolve_type_ref`](sema/infer.md#resolve_type_ref); record
    the result in [`type_resolved_ty`](#semacontext).
@@ -141,9 +143,10 @@ does not halt on the first error.
 | Param      | Type                                                  | Description                                                |
 |------------|-------------------------------------------------------|------------------------------------------------------------|
 | s          | [`*sess.Session`](../session.md#session)              | Shared session (allocator, sources, diagnostics, interner, type universe). |
-| a          | [`*ast.Ast`](../ast.md#ast)                           | Parsed AST for the module being analysed.                  |
+| a          | [`*ast.Ast`](ast.md#ast)                           | Parsed AST for the module being analysed.                  |
 | rr         | [`*resolve.ResolveResult`](resolve.md#resolveresult)  | Name-resolution output for the same module.                |
 | deps       | [`*SemaDeps`](#semadeps)                              | Typing snapshots of every dependency, populated by the driver. |
+| ctx        | [`*comptime.ComptimeCtx`](comptime.md#comptimectx)    | Comptime context for the module — required to evaluate array-length expressions during [`resolve_type_ref`](sema/infer.md#resolve_type_ref). |
 | own_module | [`sess.ModuleId`](../session.md#moduleid)             | Project-wide ModuleId of the module being analysed.        |
 
 Returns the populated [`SemaResult`](#semaresult), or an allocation
@@ -213,9 +216,10 @@ The `::` cast operator follows two rules drawn from the
   the corresponding conversion; the type-system check is that both
   source and destination are primitives.
 - **Non-primitive bit reinterpretation** — `from::To` is permitted iff
-  [`$size_of(from) == $size_of(To)`](../type.md). Sema computes the
-  size from the [`TypeInterner`](../type.md#typeinterner). Mismatched
-  sizes emit `cast: size mismatch (M vs N bytes)`.
+  `from` and `to` have the same size in bytes. Sema computes the size
+  from the [`TypeInterner`](../type.md#typeinterner) via
+  [`check.size_of`](sema/check.md#internal-helpers). Mismatched sizes
+  emit `cast: size mismatch (M vs N bytes)`.
 
 ## Internal helpers
 
@@ -237,14 +241,15 @@ File-private; listed for reference.
 [`mach.lang.session`](../session.md),
 [`mach.lang.diagnostic`](../diagnostic.md),
 [`mach.lang.intern`](../intern.md), [`mach.lang.type`](../type.md),
-[`mach.lang.fe.ast`](../ast.md),
-[`mach.lang.fe.ast.id`](../ast/id.md),
-[`mach.lang.fe.ast.expr`](../ast/expr.md),
-[`mach.lang.fe.ast.stmt`](../ast/stmt.md),
-[`mach.lang.fe.ast.decl`](../ast/decl.md),
-[`mach.lang.fe.ast.type`](../ast/type.md),
-[`mach.lang.fe.ast.module`](../ast/module.md),
-[`mach.lang.fe.token`](../token.md),
+[`mach.lang.fe.ast`](ast.md),
+[`mach.lang.fe.ast.id`](ast/id.md),
+[`mach.lang.fe.ast.expr`](ast/expr.md),
+[`mach.lang.fe.ast.stmt`](ast/stmt.md),
+[`mach.lang.fe.ast.decl`](ast/decl.md),
+[`mach.lang.fe.ast.type`](ast/type.md),
+[`mach.lang.fe.ast.module`](ast/module.md),
+[`mach.lang.fe.token`](token.md),
+[`mach.lang.fe.comptime`](comptime.md),
 [`mach.lang.fe.resolve`](resolve.md),
 [`mach.lang.fe.sema.infer`](sema/infer.md),
 [`mach.lang.fe.sema.check`](sema/check.md),

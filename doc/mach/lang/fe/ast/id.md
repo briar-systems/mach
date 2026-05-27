@@ -53,17 +53,48 @@ handle assigned by the driver.
 
 ## Constants
 
+### `EXPR_NIL`
+
 ```mach
-pub val EXPR_NIL:   ExprId   = 0xFFFFFFFF;
-pub val STMT_NIL:   StmtId   = 0xFFFFFFFF;
-pub val DECL_NIL:   DeclId   = 0xFFFFFFFF;
-pub val TYPE_NIL:   TypeId   = 0xFFFFFFFF;
+pub val EXPR_NIL: ExprId = 0xFFFFFFFF;
+```
+
+Absent-[`ExprId`](#exprid) sentinel.
+
+### `STMT_NIL`
+
+```mach
+pub val STMT_NIL: StmtId = 0xFFFFFFFF;
+```
+
+Absent-[`StmtId`](#stmtid) sentinel.
+
+### `DECL_NIL`
+
+```mach
+pub val DECL_NIL: DeclId = 0xFFFFFFFF;
+```
+
+Absent-[`DeclId`](#declid) sentinel.
+
+### `TYPE_NIL`
+
+```mach
+pub val TYPE_NIL: TypeId = 0xFFFFFFFF;
+```
+
+Absent-[`TypeId`](#typeid) sentinel.
+
+### `MODULE_NIL`
+
+```mach
 pub val MODULE_NIL: ModuleId = 0xFFFFFFFF;
 ```
 
-Absent-node sentinels. Consumers receiving a sentinel from a query must
-treat it as an error or as the explicit "no value" case, never as a
-default.
+Absent-[`ModuleId`](#moduleid) sentinel.
+
+Consumers receiving any sentinel from a query must treat it as an
+error or as the explicit "no value" case, never as a default.
 
 ## Dependencies
 

@@ -1,6 +1,6 @@
 # mach.lang.fe.resolve
 
-Per-module name resolution. Walks one parsed [`Ast`](../ast.md#ast) in
+Per-module name resolution. Walks one parsed [`Ast`](ast.md#ast) in
 two passes — *collect* (registers every binding decl reachable from
 module scope) and *bind* (walks every decl, stmt, expr, and type
 looking up references against the scope chain). Inputs come from the
@@ -56,7 +56,7 @@ A resolved symbol.
 | kind   | [`SymKind`](#symkind)                         | One of [`SYM_*`](#constants).                              |
 | flags  | `u8`                                          | Bitfield of [`SYM_FLAG_*`](#constants) (currently only `SYM_FLAG_PUB`). |
 | name   | [`intern.StrId`](../intern.md#strid)          | Interned identifier ([`STR_NIL`](../intern.md#constants) for anonymous symbols). |
-| decl   | [`id.DeclId`](../ast/id.md#declid)            | Originating DeclId in `origin`'s [`Ast`](../ast.md#ast); [`DECL_NIL`](../ast/id.md#constants) when synthetic. |
+| decl   | [`id.DeclId`](ast/id.md#declid)            | Originating DeclId in `origin`'s [`Ast`](ast.md#ast); [`DECL_NIL`](ast/id.md#constants) when synthetic. |
 | slot   | `u32`                                         | Kind-dependent extra payload (see below).                  |
 | origin | [`sess.ModuleId`](../session.md#moduleid)     | ModuleId of the module that owns `decl` (this module for locally-declared symbols; the dependency for `SYM_USE` / `SYM_IMPORTED`). |
 
@@ -89,7 +89,7 @@ producer module's full `ResolveResult`.
 |--------|-----------------------------------------------|---------------------------------------------------|
 | kind   | [`SymKind`](#symkind)                         | One of [`SYM_*`](#constants).                     |
 | name   | [`intern.StrId`](../intern.md#strid)          | Interned identifier.                              |
-| decl   | [`id.DeclId`](../ast/id.md#declid)            | DeclId in the owning module's Ast.                |
+| decl   | [`id.DeclId`](ast/id.md#declid)            | DeclId in the owning module's Ast.                |
 | origin | [`sess.ModuleId`](../session.md#moduleid)     | ModuleId of the owning module.                    |
 
 ### `ModuleExports`
@@ -154,9 +154,9 @@ export step.
 | symbols       | [`*Symbol`](#symbol)                          | Universe of symbols; pub symbols sorted to indices `[0, pub_count)`.       |
 | symbol_count  | `u32`                                         | Total number of symbols.                                                   |
 | pub_count     | `u32`                                         | Number of pub symbols at the front of `symbols`.                           |
-| expr_resolved | [`*SymbolId`](#symbolid)                      | Parallel to [`ast.exprs`](../ast.md#ast); [`SYMBOL_NIL`](#constants) outside binding sites. |
-| type_resolved | [`*SymbolId`](#symbolid)                      | Parallel to [`ast.types`](../ast.md#ast); [`SYMBOL_NIL`](#constants) outside binding sites. |
-| decl_symbol   | [`*SymbolId`](#symbolid)                      | Parallel to [`ast.decls`](../ast.md#ast); [`SYMBOL_NIL`](#constants) for non-binding decls. |
+| expr_resolved | [`*SymbolId`](#symbolid)                      | Parallel to [`ast.exprs`](ast.md#ast); [`SYMBOL_NIL`](#constants) outside binding sites. |
+| type_resolved | [`*SymbolId`](#symbolid)                      | Parallel to [`ast.types`](ast.md#ast); [`SYMBOL_NIL`](#constants) outside binding sites. |
+| decl_symbol   | [`*SymbolId`](#symbolid)                      | Parallel to [`ast.decls`](ast.md#ast); [`SYMBOL_NIL`](#constants) for non-binding decls. |
 
 ## Constants
 
@@ -203,7 +203,7 @@ pub val SYM_FLAG_PUB: u8 = 1;
 ```
 
 Symbol-flag bit set when the originating decl carries
-[`DECL_FLAG_PUB`](../ast/decl.md#constants) at module scope.
+[`DECL_FLAG_PUB`](ast/decl.md#constants) at module scope.
 
 ```mach
 val INITIAL_SCOPE_ENTRY_CAP: u32 = 8;
@@ -237,7 +237,7 @@ error.
 | Param      | Type                                                  | Description                                                |
 |------------|-------------------------------------------------------|------------------------------------------------------------|
 | s          | [`*sess.Session`](../session.md#session)              | Shared session (allocator, sources, diagnostics, interner).|
-| a          | [`*ast.Ast`](../ast.md#ast)                           | Parsed AST for the module being resolved.                  |
+| a          | [`*ast.Ast`](ast.md#ast)                           | Parsed AST for the module being resolved.                  |
 | deps       | [`*ResolveDeps`](#resolvedeps)                        | Exports of every dependency, populated by the driver.      |
 | ctx        | [`*comptime.ComptimeCtx`](comptime.md#comptimectx)    | Comptime context, pre-seeded with target params and imports' pub consts; resolve mutates it as it discovers comptime-evaluable val decls. |
 | own_module | [`sess.ModuleId`](../session.md#moduleid)             | Project-wide ModuleId of the module being resolved.        |
@@ -270,11 +270,12 @@ slice of imported [`SYM_IMPORTED`](#constants) symbols (for the
 bare-import form) into the module scope.
 
 [`collect_one_decl`](#internal-helpers) dispatches per
-[`DeclKind`](../ast/decl.md#declkind):
+[`DeclKind`](ast/decl.md#declkind):
 
 | `DECL_KIND_*`        | Action                                                                                |
 |----------------------|---------------------------------------------------------------------------------------|
 | `USE`                | [`collect_use`](#internal-helpers): alias or bulk-import.                             |
+| `FWD`                | [`collect_fwd`](#internal-helpers): deferred to bind — re-export needs the full module scope in place first. |
 | `FUN`                | Declare a `SYM_FUN` in the enclosing scope.                                           |
 | `REC`                | Declare a `SYM_REC` in the enclosing scope.                                           |
 | `VAL`                | Declare a `SYM_VAL`. Also calls [`try_register_comptime_const`](#internal-helpers) to make the initializer available to subsequent `$if`. |
@@ -291,7 +292,7 @@ Walks every decl, stmt, expr, and type. For each name reference,
 resolves it against the [scope chain](#scope-chain) and writes the
 resolved [`SymbolId`](#symbolid) into the parallel
 [`expr_resolved`](#resolveresult) / [`type_resolved`](#resolveresult)
-arrays. Unresolved names produce a [`SEVERITY_ERROR`](../../diagnostic.md#constants)
+arrays. Unresolved names produce a [`SEVERITY_ERROR`](../diagnostic.md#constants)
 diagnostic and stay at [`SYMBOL_NIL`](#constants).
 
 Function and record decls open generic and parameter scopes for the
@@ -303,14 +304,14 @@ duration of their bodies:
 | [`bind_rec`](#internal-helpers) | Generic scope only. Field types see the generic params.          |
 
 [`bind_local_decl`](#internal-helpers) binds a local
-[`val`](../ast/decl.md#declkind)/[`var`](../ast/decl.md#declkind)'s
+[`val`](ast/decl.md#declkind)/[`var`](ast/decl.md#declkind)'s
 type and initializer **before** declaring the new name. This implements
 let-not-letrec semantics — `val x: i32 = x + 1;` resolves `x` against
 the outer scope, not against the (not-yet-declared) shadow.
 
 [`bind_expr`](#internal-helpers) is exhaustive over
-[`ExprKind`](../ast/expr.md#exprkind) except
-[`EXPR_KIND_MEMBER`](../ast/expr.md#exprkind), which is left
+[`ExprKind`](ast/expr.md#exprkind) except
+[`EXPR_KIND_MEMBER`](ast/expr.md#exprkind), which is left
 intentionally at [`SYMBOL_NIL`](#constants) because member resolution
 requires the object's type — sema's job.
 
@@ -368,14 +369,35 @@ check is local-only.
    [`SYMBOL_NIL`](#constants) (no single symbol; the import expanded
    into many).
 
-`pub fwd <module-prefixed-symbol>;` (re-export):
-
-1. Same lookup as the bare import.
-2. The resulting symbols are declared with [`SYM_FLAG_PUB`](#constants)
-   set, becoming part of *this* module's public surface.
-
 Imports for which the dep is not present in [`deps`](#resolvedeps)
 emit `"imported module is not in the dep set"` and skip registration.
+
+## Re-export (`fwd`)
+
+`fwd <identifier>;` ([`DECL_KIND_FWD`](ast/decl.md#declkind)) is
+its own declaration form — re-exporting always, with no `pub` flag.
+The identifier follows standard scope rules: a bare name resolves
+against the scope chain (hitting any [`SYM_IMPORTED`](#constants)
+introduced by a bare `use`, or a local decl), a dotted form hops
+module aliases declared by `use foo: bar.baz;`. Whatever
+[`Symbol`](#symbol) the identifier resolves to is copied into the
+pub-flagged half of this module's
+[`ResolveResult.symbols`](#resolveresult) with [`SYM_FLAG_PUB`](#constants)
+set; `origin` and `decl` continue to point at the originating module
+so cross-module clients reach the same canonical decl.
+
+[`collect_fwd`](#internal-helpers) is a no-op during collect — the
+re-export is handled in [bind](#pass-2-bind), once the module scope
+(including every sibling `use`) is fully populated. An identifier
+that resolves to nothing emits `"forwarded symbol not in scope"` and
+the `fwd` decl contributes no pub symbol.
+
+The driver does not special-case `fwd` during DFS load — the
+forwarded symbol is only reachable because some sibling `use` in the
+same module already brought its source module into the dep set. This
+is by design: `fwd` is the concrete handle for re-exporting symbols
+whose backing module was selected at comptime (typical shape: a
+`$if`-guarded `use impl: this.os.linux;` followed by `fwd impl.FOO;`).
 
 ## Cross-module dedup
 
@@ -401,30 +423,32 @@ File-private; listed for reference.
 | `scope_lookup_chain`              | Walk parents; first hit wins.                                              |
 | `add_symbol`                      | Append a [`Symbol`](#symbol) to `rc.symbols`; return its [`SymbolId`](#symbolid). |
 | `declare`                         | `add_symbol` + `scope_add` with duplicate detection.                       |
-| `collect_decl_list`               | Loop calling `collect_one_decl` for every [`DeclId`](../ast/id.md#declid) in `[start, start+len)`. |
-| `collect_one_decl`                | Dispatch per [`DeclKind`](../ast/decl.md#declkind) during collect.         |
+| `collect_decl_list`               | Loop calling `collect_one_decl` for every [`DeclId`](ast/id.md#declid) in `[start, start+len)`. |
+| `collect_one_decl`                | Dispatch per [`DeclKind`](ast/decl.md#declkind) during collect.         |
 | `declare_decl`                    | Helper used by per-kind collect branches.                                  |
-| `symbol_flags_from`               | Maps [`DECL_FLAG_*`](../ast/decl.md#constants) → [`SYM_FLAG_*`](#constants); pub only set at module scope. |
+| `symbol_flags_from`               | Maps [`DECL_FLAG_*`](ast/decl.md#constants) → [`SYM_FLAG_*`](#constants); pub only set at module scope. |
 | `try_register_comptime_const`     | Attempts to evaluate a val initializer and register it as a [`NamedConst`](comptime.md#namedconst). Silent on failure (non-comptime vals are normal). |
 | `collect_comptime_if`             | Walks branches; calls `comptime_branch_active`; recurses into the active arm. |
 | `comptime_branch_active`          | Evaluates `br.cond` via [`comptime.eval`](comptime.md#eval); on eval error or non-bool result emits a diagnostic and returns `ok(false)`. |
-| `collect_use`                     | `use` decl handling (alias / bare / re-export forms).                      |
+| `collect_use`                     | `use` decl handling (alias / bare forms).                                  |
+| `collect_fwd`                     | No-op during collect; the `fwd` re-export is resolved in bind once the module scope is complete. |
 | `find_module_exports`             | Linear scan of [`deps.entries`](#resolvedeps) by interned path.            |
 | `bind_decl_list`                  | Loop calling `bind_one_decl` over a decl id slice.                         |
-| `bind_one_decl`                   | Dispatch per [`DeclKind`](../ast/decl.md#declkind) during bind.            |
+| `bind_one_decl`                   | Dispatch per [`DeclKind`](ast/decl.md#declkind) during bind.            |
+| `bind_fwd`                        | Resolves a [`DeclFwd.target`](ast/decl.md#declfwd) identifier against the scope chain and copies the resolved [`Symbol`](#symbol) into the pub half with [`SYM_FLAG_PUB`](#constants). |
 | `bind_comptime_if`                | Stmt-and-decl-scope `$if` handler; takes `(branches_start, branches_len, at_decl_scope)`. |
 | `bind_fun`                        | Opens generic + param scopes; binds return type and body.                  |
 | `bind_rec`                        | Opens generic scope; binds field types.                                    |
 | `bind_stmt_list`                  | Loop calling `bind_stmt` over a stmt id slice.                             |
-| `bind_stmt`                       | Dispatch per [`StmtKind`](../ast/stmt.md#stmtkind).                        |
+| `bind_stmt`                       | Dispatch per [`StmtKind`](ast/stmt.md#stmtkind).                        |
 | `bind_block`                      | Opens a new block scope; binds the contained stmts; closes the scope.      |
 | `bind_local_decl`                 | Binds local `val`/`var` type + init; **then** declares the symbol.         |
 | `if_val_kind`                     | Returns [`SYM_VAL`](#constants) or [`SYM_VAR`](#constants) per the bool.   |
-| `bind_expr`                       | Dispatch per [`ExprKind`](../ast/expr.md#exprkind).                        |
+| `bind_expr`                       | Dispatch per [`ExprKind`](ast/expr.md#exprkind).                        |
 | `bind_expr_list`                  | Loop calling `bind_expr` over an expr id slice.                            |
 | `bind_ident`                      | Interns the ident span and `scope_lookup_chain`s; writes the result to [`expr_resolved`](#resolveresult); emits `"unresolved identifier"` on miss. |
-| `bind_type`                       | Dispatch per [`TypeKind`](../ast/type.md#typekind).                        |
-| `resolve_type_path`               | Walks a dotted [`TypeNamed.name`](../ast/type.md#typenamed) span left-to-right, hopping module aliases via [`SYM_USE`](#constants) → [`ModuleExports`](#moduleexports) until the leaf segment is resolved. |
+| `bind_type`                       | Dispatch per [`TypeKind`](ast/type.md#typekind).                        |
+| `resolve_type_path`               | Walks a dotted [`TypeNamed.name`](ast/type.md#typenamed) span left-to-right, hopping module aliases via [`SYM_USE`](#constants) → [`ModuleExports`](#moduleexports) until the leaf segment is resolved. |
 | `lookup_in_module`                | Looks up `name` among a module's pub exports; caches the resulting [`SYM_IMPORTED`](#constants) via [`imported_cache`](#scope-records). |
 | `build_result`                    | Allocates `out_syms`, partitions pub-first, transfers ownership of parallel arrays, dnit's the context. |
 
@@ -488,10 +512,10 @@ else.
 `std.allocator`, `std.collections.map`,
 [`mach.lang.source`](../source.md), [`mach.lang.diagnostic`](../diagnostic.md),
 [`mach.lang.intern`](../intern.md), [`mach.lang.session`](../session.md),
-[`mach.lang.fe.ast`](../ast.md), [`mach.lang.fe.ast.id`](../ast/id.md),
-[`mach.lang.fe.ast.module`](../ast/module.md),
-[`mach.lang.fe.ast.decl`](../ast/decl.md),
-[`mach.lang.fe.ast.stmt`](../ast/stmt.md),
-[`mach.lang.fe.ast.expr`](../ast/expr.md),
-[`mach.lang.fe.ast.type`](../ast/type.md),
-[`mach.lang.fe.token`](../token.md), [`mach.lang.fe.comptime`](comptime.md).
+[`mach.lang.fe.ast`](ast.md), [`mach.lang.fe.ast.id`](ast/id.md),
+[`mach.lang.fe.ast.module`](ast/module.md),
+[`mach.lang.fe.ast.decl`](ast/decl.md),
+[`mach.lang.fe.ast.stmt`](ast/stmt.md),
+[`mach.lang.fe.ast.expr`](ast/expr.md),
+[`mach.lang.fe.ast.type`](ast/type.md),
+[`mach.lang.fe.token`](token.md), [`mach.lang.fe.comptime`](comptime.md).

@@ -46,8 +46,27 @@ A `use` declaration importing a module, optionally under an alias.
 
 | Field | Type                                  | Description                                                |
 |-------|---------------------------------------|------------------------------------------------------------|
-| alias | [`token.Span`](../token.md#span)      | Span of the alias identifier, or an empty span (len 0) if absent. |
+| alias | [`token.Span`](../token.md#span)      | Span of the alias identifier, or an empty span (`len == 0`) when no alias is given. An empty span is unambiguous as a sentinel because no real identifier has length zero. |
 | path  | [`token.Span`](../token.md#span)      | Span covering the dotted module path.                      |
+
+### `DeclFwd`
+
+```mach
+pub rec DeclFwd {
+    target: token.Span;
+}
+```
+
+A `fwd <identifier>;` re-export. Re-publishes a symbol already in
+this module's scope (typically brought in by a sibling `use`) into
+this module's public namespace. The identifier follows standard
+scope rules — it may be a bare name resolved against in-scope
+imports, or a dotted form `alias.symbol` looked up through a
+`use alias: ...;` declaration.
+
+| Field  | Type                                  | Description                                          |
+|--------|---------------------------------------|------------------------------------------------------|
+| target | [`token.Span`](../token.md#span)      | Span of the identifier (bare or dotted) being re-exported. |
 
 ### `DeclFun`
 
@@ -58,6 +77,7 @@ pub rec DeclFun {
     generics_len:   u32;
     params_start:   u32;
     params_len:     u32;
+    variadic:       bool;
     return_type:    id.TypeId;
     body:           id.StmtId;
 }
@@ -71,9 +91,10 @@ A function declaration.
 | generics_start | `u32`                                 | Start index into [`Ast.generic_names`](../ast.md#ast); each slot holds a [`Span`](../token.md#span). |
 | generics_len   | `u32`                                 | Number of generic parameters.                              |
 | params_start   | `u32`                                 | Start index into [`Ast.typed_names`](../ast.md#ast); each slot holds a [`TypedName`](#typedname). |
-| params_len     | `u32`                                 | Number of parameters.                                      |
+| params_len     | `u32`                                 | Number of fixed (named) parameters.                        |
+| variadic       | `bool`                                | `true` when the parameter list ends with `...` — the function accepts trailing variadic arguments read with `va_start` / `va_arg` / `va_end`. |
 | return_type    | [`id.TypeId`](id.md#typeid)           | Declared return type, or [`TYPE_NIL`](id.md#constants) for no explicit return. |
-| body           | [`id.StmtId`](id.md#stmtid)           | Body statement (typically `STMT_KIND_BLOCK`), or [`STMT_NIL`](id.md#constants) for forward-only declarations. |
+| body           | [`id.StmtId`](id.md#stmtid)           | Body statement (typically `STMT_KIND_BLOCK`), or [`STMT_NIL`](id.md#constants) for external / forward-only declarations (see [`Decl.flags`](#decl)). |
 
 ### `DeclRec`
 
@@ -193,12 +214,28 @@ pub rec DeclComptimeAttr {
 }
 ```
 
-A compile-time attribute directive `$target = value`.
+A **comptime setting** — `$target = value;`. Syntactically these are
+settings, not annotations: the `$`-prefixed left-hand side names a
+compiler-visible knob and the right-hand side assigns its value.
+(The "attr" in the type name is historical; the syntax may be
+revised later.)
 
 | Field  | Type                          | Description                                                |
 |--------|-------------------------------|------------------------------------------------------------|
-| target | [`id.ExprId`](id.md#exprid)   | Expression naming the attribute being set (typically a comptime-ident member chain such as `$main.symbol`). |
-| value  | [`id.ExprId`](id.md#exprid)   | Expression assigned to the attribute.                      |
+| target | [`id.ExprId`](id.md#exprid)   | Expression naming the setting being assigned — a comptime-ident member chain such as `$main.symbol`. |
+| value  | [`id.ExprId`](id.md#exprid)   | Expression assigned to the setting.                        |
+
+Known comptime settings (the set is expected to grow):
+
+| Setting          | Value type | Consumed by                          | Effect                                              |
+|------------------|------------|--------------------------------------|-----------------------------------------------------|
+| `$main.symbol`   | `zstr`     | [`driver`](../../driver.md) / [`be.linker`](../../be/linker.md) | Linker symbol name the entry point is emitted under. |
+| `$main.inline`   | `bool`     | [`me.lower`](../../me/lower.md) → [`me.pass.inline`](../../me/pass/inline.md) | Requests inlining of the named function (`FN_FLAG_INLINE`). |
+
+Resolve evaluates the right-hand side via
+[`comptime.eval`](../comptime.md#eval); each consuming phase reads the
+settings relevant to it. An unrecognised setting target is a
+resolve-time diagnostic, never silently ignored.
 
 ### `Decl`
 
@@ -209,6 +246,7 @@ pub rec Decl {
     flags: u8;
     data: uni {
         use_:          DeclUse;
+        fwd:           DeclFwd;
         fun_:          DeclFun;
         rec_:          DeclRec;
         bind:          DeclBind;
@@ -228,20 +266,21 @@ A syntactic declaration node. Payload is unused for `ERROR`
 | span  | [`token.Span`](../token.md#span)      | Byte range of the declaration in source.     |
 | kind  | [`DeclKind`](#declkind)               | Which `DECL_KIND_*` variant is active.       |
 | flags | `u8`                                  | Bitfield of `DECL_FLAG_*` values.            |
-| data  | `uni { … }`                           | Kind-specific payload.                       |
+| data  | `uni { ... }`                           | Kind-specific payload.                       |
 
 ## Constants
 
 ```mach
 pub val DECL_KIND_USE:            DeclKind = 0;
-pub val DECL_KIND_FUN:            DeclKind = 1;
-pub val DECL_KIND_REC:            DeclKind = 2;
-pub val DECL_KIND_VAL:            DeclKind = 3;
-pub val DECL_KIND_VAR:            DeclKind = 4;
-pub val DECL_KIND_DEF:            DeclKind = 5;
-pub val DECL_KIND_TEST:           DeclKind = 6;
-pub val DECL_KIND_COMPTIME_IF:    DeclKind = 7;
-pub val DECL_KIND_COMPTIME_ATTR:  DeclKind = 8;
+pub val DECL_KIND_FWD:            DeclKind = 1;
+pub val DECL_KIND_FUN:            DeclKind = 2;
+pub val DECL_KIND_REC:            DeclKind = 3;
+pub val DECL_KIND_VAL:            DeclKind = 4;
+pub val DECL_KIND_VAR:            DeclKind = 5;
+pub val DECL_KIND_DEF:            DeclKind = 6;
+pub val DECL_KIND_TEST:           DeclKind = 7;
+pub val DECL_KIND_COMPTIME_IF:    DeclKind = 8;
+pub val DECL_KIND_COMPTIME_ATTR:  DeclKind = 9;
 pub val DECL_KIND_ERROR:          DeclKind = 255;
 ```
 
@@ -250,20 +289,20 @@ pub val DECL_KIND_ERROR:          DeclKind = 255;
 | Constant                  | Value | Payload         |
 |---------------------------|-------|-----------------|
 | `DECL_KIND_USE`           | 0     | `use_`          |
-| `DECL_KIND_FUN`           | 1     | `fun_`          |
-| `DECL_KIND_REC`           | 2     | `rec_`          |
-| `DECL_KIND_VAL`           | 3     | `bind`          |
-| `DECL_KIND_VAR`           | 4     | `bind`          |
-| `DECL_KIND_DEF`           | 5     | `def_`          |
-| `DECL_KIND_TEST`          | 6     | `test_`         |
-| `DECL_KIND_COMPTIME_IF`   | 7     | `comptime_if`   |
-| `DECL_KIND_COMPTIME_ATTR` | 8     | `comptime_attr` |
+| `DECL_KIND_FWD`           | 1     | `fwd`           |
+| `DECL_KIND_FUN`           | 2     | `fun_`          |
+| `DECL_KIND_REC`           | 3     | `rec_`          |
+| `DECL_KIND_VAL`           | 4     | `bind`          |
+| `DECL_KIND_VAR`           | 5     | `bind`          |
+| `DECL_KIND_DEF`           | 6     | `def_`          |
+| `DECL_KIND_TEST`          | 7     | `test_`         |
+| `DECL_KIND_COMPTIME_IF`   | 8     | `comptime_if`   |
+| `DECL_KIND_COMPTIME_ATTR` | 9     | `comptime_attr` |
 | `DECL_KIND_ERROR`         | 255   | (none)          |
 
 ```mach
 pub val DECL_FLAG_PUB: u8 = 1;
 pub val DECL_FLAG_EXT: u8 = 2;
-pub val DECL_FLAG_FWD: u8 = 4;
 ```
 
 Bit flags stored on [`Decl.flags`](#decl).
@@ -272,7 +311,16 @@ Bit flags stored on [`Decl.flags`](#decl).
 |------------------|-----|-------------------------------------------|
 | `DECL_FLAG_PUB`  | 0   | `pub` visibility.                         |
 | `DECL_FLAG_EXT`  | 1   | `ext` external linkage.                   |
-| `DECL_FLAG_FWD`  | 2   | Forward declaration (no body).            |
+
+`fwd` is no longer a flag — it is its own declaration form
+([`DECL_KIND_FWD`](#declkind)) that always re-exports, so no `pub`
+is required or accepted on it.
+
+When [`DECL_FLAG_EXT`](#declkind) is set on a
+[`DECL_KIND_FUN`](#declkind), [`DeclFun.body`](#declfun) is
+[`STMT_NIL`](id.md#constants) — the function has no body. The body
+sentinel is the structural ground truth; the flag is categorical
+metadata for resolve and codegen.
 
 ## Dependencies
 

@@ -134,27 +134,40 @@ lifetime.
 
 Returns `some(text)` when `id` is in range, `none` otherwise.
 
-### `store_and_index`
+### `clear`
 
 ```mach
-fun store_and_index(i: *Interner, owned: str) Result[StrId, str]
+pub fun clear(i: *Interner) Result[bool, str]
 ```
 
-Internal common path used by [`intern`](#intern) and
-[`intern_span`](#intern_span). Appends `owned` to [`i.strings`](#interner)
-(growing on demand), assigns a fresh [`StrId`](#strid), and registers
-the new entry in [`i.dedup`](#interner).
+Resets the interner to empty without releasing the backing allocator
+or the [`strings`](#interner) slot storage. Frees every owned string
+and the dedup map's storage, then re-initialises the dedup map and
+sets `len = 0`. Slot capacity stays allocated for reuse.
 
-On allocation failure of either the strings array or the dedup map
-insertion, the function frees `owned` before returning the error, so
-the caller does not double-free.
+This is a **full-database-reset** operation: every previously-issued
+[`StrId`](#strid) becomes invalid, including ones referenced by live
+[`QueryEntry`](query.md#queryentry) results. Callers must invalidate
+the entire [`QueryDb`](query.md#querydb) before calling `clear` — using
+it between partial recomputes would yank live references out from under
+non-invalidated queries. Intended use is workspace-level reset in
+long-running hosts (LSP server restart, test runner between independent
+suites), not per-recompile cleanup.
 
-| Param | Type                       | Description                                  |
-|-------|----------------------------|----------------------------------------------|
-| i     | [`*Interner`](#interner)   | The interner.                                |
-| owned | `str`                      | An owned copy whose contents are uninterned. |
+| Param | Type                       | Description       |
+|-------|----------------------------|-------------------|
+| i     | [`*Interner`](#interner)   | Interner to reset.|
 
-Returns the freshly assigned [`StrId`](#strid), or an allocation error.
+Returns `ok(true)` after reset; allocation errors from the new dedup map
+propagate as `err`.
+
+## Internal helpers
+
+File-private; listed for reference.
+
+| Function          | Role                                                                          |
+|-------------------|-------------------------------------------------------------------------------|
+| `store_and_index` | Common path for [`intern`](#intern) and [`intern_span`](#intern_span): appends an owned copy to [`i.strings`](#interner), assigns a fresh [`StrId`](#strid), and registers it in [`i.dedup`](#interner). On allocation failure (strings array or dedup map), frees the candidate before returning so the caller does not double-free. |
 
 ## Dependencies
 

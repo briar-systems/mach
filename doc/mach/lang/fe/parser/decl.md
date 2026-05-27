@@ -59,9 +59,10 @@ matches.
 ## Declaration grammar
 
 ```
-decl              := flags? (use | fun | rec | bind | def | test | comptime)
-flags             := ("pub" | "ext" | "fwd")*
+decl              := flags? (use | fwd | fun | rec | bind | def | test | comptime)
+flags             := ("pub" | "ext")*
 use               := "use" (IDENT ":")? dotted_path ";"
+fwd               := "fwd" identifier ";"
 fun               := "fun" IDENT generic_params? fun_params return_type? block
                    | "ext" "fun" IDENT generic_params? fun_params return_type? ";"
 rec               := "rec" IDENT generic_params? rec_body
@@ -71,14 +72,19 @@ test              := "test" STR block
 comptime          := "$if" "(" expr ")" decl_block ("$or" ("(" expr ")")? decl_block)*
                    | "$" comptime_ident "=" expr ";"
 generic_params    := "[" IDENT ("," IDENT)* ","? "]"
-fun_params        := "(" (typed_name ("," typed_name)* ","?)? ")"
+fun_params        := "(" (typed_name ("," typed_name)*)? (","? "...")? ")"
 rec_body          := "{" (typed_name ";")+ "}"
 typed_name        := IDENT ":" type
+identifier        := IDENT ("." IDENT)*
 return_type       := type            # parsed when at_type_boundary holds after fun_params
 block             := "{" stmt* "}"
 decl_block        := "{" decl* "}"
 dotted_path       := IDENT ("." IDENT)*
 ```
+
+A `fun_params` list ending in `...` marks the function variadic —
+[`DeclFun.variadic`](../ast/decl.md#declfun) is set. The `...` always
+comes last; named parameters may precede it.
 
 ### Flags
 
@@ -86,7 +92,7 @@ dotted_path       := IDENT ("." IDENT)*
 fun parse_flags(p: *parser.Parser) u8
 ```
 
-Reads zero or more of `pub`, `ext`, `fwd` in any order, returning the
+Reads zero or more of `pub`, `ext` in any order, returning the
 combined bitfield of [`DECL_FLAG_*`](../ast/decl.md#constants).
 
 ### Dispatch
@@ -96,6 +102,7 @@ Leading keyword (after optional flags):
 | Keyword | Decl form                                                  |
 |---------|------------------------------------------------------------|
 | `use`   | [`parse_use_decl`](#internal-helpers)                      |
+| `fwd`   | [`parse_fwd_decl`](#internal-helpers)                      |
 | `fun`   | [`parse_fun_decl`](#internal-helpers)                      |
 | `rec`   | [`parse_rec_decl`](#internal-helpers)                      |
 | `val`   | [`parse_bind_decl`](#internal-helpers) (`DECL_KIND_VAL`)   |
@@ -109,13 +116,21 @@ When no rule matches, [`error_at_current`](state.md#error_at_current)
 emits `"expected a declaration"` and [`sync_to`](state.md#sync_to)
 skips to the next semicolon or closing brace.
 
-### `pub fwd` re-exports
+### `fwd` re-exports
 
-`pub fwd <module-prefixed-symbol>;` is parsed by
-[`parse_use_decl`](#internal-helpers) — the dotted path identifies the
-target. [`DECL_FLAG_FWD`](../ast/decl.md#constants) is set on the
-emitted [`Decl`](../ast/decl.md#decl) so resolve can wire the alias
-without re-importing the whole module.
+`fwd <identifier>;` is its own declaration form, parsed by
+[`parse_fwd_decl`](#internal-helpers) — not a flag, and no `pub` is
+required or accepted (the form always re-exports). The identifier
+follows standard scope rules — a bare name (resolved against this
+module's own scope plus any [`SYM_IMPORTED`](../resolve.md#constants)
+entries from sibling bare `use`s) or a dotted form `alias.symbol`
+looked up through a [`SYM_USE`](../resolve.md#constants) declared by
+`use alias: ...;`. The emitted [`Decl`](../ast/decl.md#decl) has kind
+[`DECL_KIND_FWD`](../ast/decl.md#constants) and a
+[`DeclFwd`](../ast/decl.md#declfwd) payload; resolve looks the
+identifier up via the standard scope chain and re-publishes the
+resolved symbol into this module's pub namespace — see
+[`resolve.md` Re-export (`fwd`)](../resolve.md#re-export-fwd).
 
 ## Statement grammar
 
@@ -134,7 +149,7 @@ stmt              := block
 block             := "{" stmt* "}"
 if_stmt           := "if" "(" expr ")" stmt or_chain?
 or_chain          := "or" ("(" expr ")")? stmt or_chain?
-for_stmt          := "for" ("(" expr ")")? stmt
+for_stmt          := "for" ("(" expr ")")? stmt   # condition-or-infinite only
 ret_stmt          := "ret" expr? ";"
 brk_stmt          := "brk" ";"
 cnt_stmt          := "cnt" ";"
@@ -163,6 +178,14 @@ Leading token / keyword in [`parse_stmt`](#parse_stmt):
 | `KIND_IDENT` text = `"val"` / `"var"`    | [`parse_local_decl_stmt`](#internal-helpers) |
 | `KIND_DOLLAR` + peek `"if"`              | [`parse_comptime_if_stmt`](#internal-helpers) |
 | anything else                            | [`parse_expr_stmt`](#internal-helpers)   |
+
+### `for` loop forms
+
+`for` has exactly two shapes: `for (cond) stmt` and `for stmt`
+(infinite, exited by `brk` / `ret`). There is **no** range or
+iterator form — `for x in xs` and `for (i = 0; i < n; i++)` are
+deliberately not in the grammar. Iteration over a collection is
+written explicitly with an index counter and a condition.
 
 ### `fin` body
 
@@ -201,21 +224,22 @@ File-private; listed for reference.
 
 | Function                          | Role                                                                       |
 |-----------------------------------|----------------------------------------------------------------------------|
-| `parse_flags`                     | Reads `pub` / `ext` / `fwd` flag bitfield.                                 |
+| `parse_flags`                     | Reads `pub` / `ext` flag bitfield.                                         |
 | `parse_dotted_path`               | Reads `IDENT ("." IDENT)*` as a single span.                               |
 | `peek_is_kw`                      | Peek-only predicate: is the token at offset N an IDENT matching `kw`?      |
-| `parse_use_decl`                  | `use [alias :] path ;` and `pub fwd path ;` forms.                         |
-| `parse_fun_decl`                  | `fun name (params) ret { body }` and `ext fun ...` forms.                  |
+| `parse_use_decl`                  | `use [alias :] path ;` form.                                               |
+| `parse_fwd_decl`                  | `fwd identifier ;` re-export form.                                         |
+| `parse_fun_decl`                  | `fun name (params) ret { body }` and `ext fun ...` forms; sets `variadic` on a trailing `...`. |
 | `parse_rec_decl`                  | `rec name [generics] { fields }`.                                          |
 | `parse_bind_decl`                 | `val` / `var` declarations at decl scope.                                  |
 | `parse_def_decl`                  | `def name : type ;` aliases.                                               |
 | `parse_test_decl`                 | `test "label" { body }`.                                                   |
 | `parse_comptime_decl`             | Dispatches between `$if`-decl and `$<attr> = value` forms.                 |
 | `parse_comptime_if_decl`          | `$if` / `$or` chain at decl scope.                                         |
-| `parse_comptime_attr_decl`        | `$<attr> = value ;` attribute directive.                                   |
+| `parse_comptime_attr_decl`        | `$<target> = value ;` comptime-setting directive.                          |
 | `parse_generic_params`            | `[T, U]` list of generic parameter names.                                  |
 | `parse_generic_param`             | Single generic parameter identifier.                                       |
-| `parse_fun_params`                | `(name: type, ...)` parameter list.                                        |
+| `parse_fun_params`                | `(name: type, ...)` parameter list; recognises a trailing literal `...` and reports variadic-ness to `parse_fun_decl`. |
 | `parse_rec_fields`                | `{ name: type; ... }` record-field list.                                   |
 | `parse_typed_name`                | `IDENT ":" type` entry used by params and fields.                          |
 | `parse_block_stmt`                | `{ stmt* }`.                                                               |

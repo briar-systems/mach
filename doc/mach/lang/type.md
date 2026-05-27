@@ -63,19 +63,21 @@ pub rec TypeFun {
     ret:          TypeId;
     params_start: u32;
     params_len:   u32;
+    variadic:     bool;
 }
 ```
 
 Payload for a `TYPE_FUN`. [`ret`](#typefun) `== `[`TYPE_NIL`](#type_nil)
-signals "no return value". Parameter types live in
-[`TypeInterner.params`](#typeinterner) at
+signals "no return value". Parameter types live in the
+[`ParamPool`](#parampool) at
 `[params_start..params_start+params_len)`.
 
 | Field        | Type                  | Description                                      |
 |--------------|-----------------------|--------------------------------------------------|
 | ret          | [`TypeId`](#typeid)   | Return type. [`TYPE_NIL`](#type_nil) means "no return". |
-| params_start | `u32`                 | Index into [`TypeInterner.params`](#typeinterner).|
-| params_len   | `u32`                 | Number of parameter types.                       |
+| params_start | `u32`                 | Index into the [`ParamPool`](#parampool).        |
+| params_len   | `u32`                 | Number of fixed parameter types.                 |
+| variadic     | `bool`                | `true` for a variadic signature (`fun(T, ...) R`). Participates in identity — a variadic and non-variadic signature with the same `ret` / params are distinct types. |
 
 ### `TypeNominal`
 
@@ -162,9 +164,9 @@ One type entry in the universe. Primitives use no payload.
 | Field | Type                                | Description                                |
 |-------|-------------------------------------|--------------------------------------------|
 | kind  | [`TypeKind`](#typekind)             | Active discriminator.                      |
-| data  | `uni { … }`                         | Kind-specific payload (see field below).   |
+| data  | `uni { ... }`                         | Kind-specific payload (see field below).   |
 
-| `data` variant | Type                                            | Active when `kind` is …          |
+| `data` variant | Type                                            | Active when `kind` is ...          |
 |----------------|-------------------------------------------------|----------------------------------|
 | pointer        | [`TypePointer`](#typepointer)                   | `TYPE_POINTER`                   |
 | array          | [`TypeArray`](#typearray)                       | `TYPE_ARRAY`                     |
@@ -183,29 +185,111 @@ pub rec TypeInterner {
     type_len: u32;
     type_cap: u32;
 
-    params:     *TypeId;
-    params_len: u32;
-    params_cap: u32;
+    params:     ParamPool;
 
-    dedup: map.Map[Type, TypeId];
+    dedup:     map.Map[Type, TypeId];
+    funs:      map.Map[FunKey, TypeId];
+    instances: map.Map[InstanceKey, TypeId];
 
     prims: [12]TypeId;
 }
 ```
 
-| Field      | Type                              | Description                                                              |
-|------------|-----------------------------------|--------------------------------------------------------------------------|
-| alloc      | `*Allocator`                      | Allocator backing every owned array.                                     |
-| types      | [`*Type`](#type)                  | Universe of [`Type`](#type) records indexed by [`TypeId`](#typeid).      |
-| type_len   | `u32`                             | Number of types stored.                                                  |
-| type_cap   | `u32`                             | Allocated slots in `types`.                                              |
-| params     | [`*TypeId`](#typeid)              | Pool of [`TypeId`](#typeid)s referenced by [`TypeFun`](#typefun).        |
-| params_len | `u32`                             | Number of [`TypeId`](#typeid)s stored in `params`.                       |
-| params_cap | `u32`                             | Allocated slots in `params`.                                             |
-| dedup      | `map.Map[Type, TypeId]`           | [`Type`](#type) → [`TypeId`](#typeid) map for kinds with self-contained payloads. |
-| prims      | `[12]TypeId`                      | Pre-allocated [`TypeId`](#typeid)s for primitive kinds, indexed by [`TypeKind`](#typekind) value. |
+| Field      | Type                                  | Description                                                              |
+|------------|---------------------------------------|--------------------------------------------------------------------------|
+| alloc      | `*Allocator`                          | Allocator backing every owned array.                                     |
+| types      | [`*Type`](#type)                      | Universe of [`Type`](#type) records indexed by [`TypeId`](#typeid).      |
+| type_len   | `u32`                                 | Number of types stored.                                                  |
+| type_cap   | `u32`                                 | Allocated slots in `types`.                                              |
+| params     | [`ParamPool`](#parampool)             | Chunked pool of [`TypeId`](#typeid)s referenced by [`TypeFun`](#typefun) and [`TypeInstance`](#typeinstance). |
+| dedup      | `map.Map[Type, TypeId]`               | Dedup table for self-contained compound kinds (`TYPE_POINTER`, `TYPE_ARRAY`, `TYPE_REC`, `TYPE_UNI`, `TYPE_GENERIC_PARAM`). Key is the [`Type`](#type) record itself. |
+| funs       | `map.Map[FunKey, TypeId]`             | Dedup table for [`TYPE_FUN`](#typefun) — key shape forces structural identity through the params pool. |
+| instances  | `map.Map[InstanceKey, TypeId]`        | Dedup table for [`TYPE_INSTANCE`](#typeinstance) — key shape forces structural identity through the args pool. |
+| prims      | `[12]TypeId`                          | Pre-allocated [`TypeId`](#typeid)s for primitive kinds, indexed by [`TypeKind`](#typekind) value. |
+
+[`TypeId`](#typeid) equality always means structural equality. The
+three dedup tables guarantee this — every shape is canonicalised at
+intern time regardless of which kind family it belongs to.
+
+### `ParamPool`
+
+```mach
+pub rec ParamPool {
+    chunks:      *Chunk;
+    chunk_count: u32;
+    chunk_cap:   u32;
+    next_free:   u32;
+}
+
+rec Chunk {
+    data: *TypeId;
+    len:  u32;
+}
+```
+
+Chunked storage for the parameter / argument sequences used by
+[`TypeFun`](#typefun) and [`TypeInstance`](#typeinstance). The pool
+guarantees that **a [`TypeId`](#typeid) once placed never moves**:
+each chunk's `data` allocation is fixed for the chunk's lifetime, and
+chunks are never freed or compacted while the interner is alive. New
+chunks are appended when the active chunk fills.
+
+The descriptor array (`chunks` itself) may reallocate as new chunks
+are appended — only the bytes each `Chunk.data` points to are
+stable. [`FunKey`](#funkey) and [`InstanceKey`](#instancekey) hold
+logical pool offsets that the hash / equality callbacks dereference;
+the callbacks reach the live data through the current `chunks` array,
+which is always available via the owning `TypeInterner` context.
+
+| Field       | Type        | Description                                                |
+|-------------|-------------|------------------------------------------------------------|
+| chunks      | `*Chunk`    | Array of chunk descriptors. May reallocate when a new chunk is appended; per-chunk `data` allocations are stable. |
+| chunk_count | `u32`       | Number of allocated chunks.                                |
+| chunk_cap   | `u32`       | Allocated slots in `chunks`.                               |
+| next_free   | `u32`       | Logical pool offset of the next free slot — also the total `TypeId` count across all chunks. |
+
+A logical offset `n` is resolved to physical storage by computing
+`chunk_id = n / PARAMS_CHUNK_SIZE`, `slot = n % PARAMS_CHUNK_SIZE`,
+then reading `chunks[chunk_id].data[slot]`.
+
+### `FunKey`
+
+```mach
+rec FunKey {
+    ret_ty:       TypeId;
+    params_start: u32;
+    params_len:   u32;
+    variadic:     bool;
+}
+```
+
+Lookup key for the [`funs`](#typeinterner) map.
+`(params_start, params_len)` mirror the same fields on
+[`TypeFun`](#typefun) — a slice into [`TypeInterner.params`](#typeinterner).
+The map's hash and equality callbacks dereference the slice through
+the [`ParamPool`](#parampool), which guarantees that placed `TypeId`s
+never move. `variadic` participates in the key so variadic and
+non-variadic signatures dedup to distinct [`TypeId`](#typeid)s.
+
+### `InstanceKey`
+
+```mach
+rec InstanceKey {
+    target_origin: sess.ModuleId;
+    target_decl:   id.DeclId;
+    args_start:    u32;
+    args_len:      u32;
+}
+```
+
+Lookup key for the [`instances`](#typeinterner) map.
+`(args_start, args_len)` mirror the same fields on
+[`TypeInstance`](#typeinstance) — a slice into the
+[`ParamPool`](#parampool).
 
 ## Constants
+
+### `TYPE_NIL`
 
 ```mach
 pub val TYPE_NIL: TypeId = 0xFFFFFFFF;
@@ -213,6 +297,8 @@ pub val TYPE_NIL: TypeId = 0xFFFFFFFF;
 
 Absent-type sentinel. Also used in [`TypeFun.ret`](#typefun) to signal
 "no return".
+
+### `TYPE_*` kinds
 
 ```mach
 pub val TYPE_U8:            TypeKind = 0;
@@ -254,19 +340,20 @@ interner; their kind is also their pre-allocated [`TypeId`](#typeid).
 | `TYPE_UNI`              | 16    | compound  | Nominal union.                                 |
 | `TYPE_GENERIC_PARAM`    | 17    | compound  | Generic parameter in a declaration site.       |
 | `TYPE_INSTANCE`         | 18    | compound  | Concrete instantiation of a generic.           |
+| (reserved)              | 19..254 | —       | Reserved for future kinds; do not assign.      |
 | `TYPE_ERROR`            | 255   | poison    | Sema-produced absorbing type.                  |
 
 ```mach
 val PRIM_COUNT:         u32 = 12;
 val INITIAL_TYPE_CAP:   u32 = 64;
-val INITIAL_PARAMS_CAP: u32 = 32;
+val PARAMS_CHUNK_SIZE:  u32 = 64;
 ```
 
 | Constant              | Description                                                |
 |-----------------------|------------------------------------------------------------|
 | `PRIM_COUNT`          | Number of primitive [`TypeKind`](#typekind) values; matches the size of [`TypeInterner.prims`](#typeinterner). |
 | `INITIAL_TYPE_CAP`    | Starting capacity for [`TypeInterner.types`](#typeinterner). The array doubles on overflow. |
-| `INITIAL_PARAMS_CAP`  | Starting capacity for [`TypeInterner.params`](#typeinterner). The pool doubles on overflow. |
+| `PARAMS_CHUNK_SIZE`   | Number of [`TypeId`](#typeid) slots per chunk in [`ParamPool`](#parampool). New chunks are appended on overflow; existing chunks never move. |
 
 ## Functions
 
@@ -293,8 +380,11 @@ error.
 pub fun dnit(ti: *TypeInterner)
 ```
 
-Releases the types array, params pool, and dedup map. `nil` is a no-op.
-After `dnit` every [`TypeId`](#typeid) previously issued is invalid.
+Releases the types array, the [`ParamPool`](#parampool) (every chunk
+plus the chunks array), and all three dedup tables
+([`dedup`](#typeinterner), [`funs`](#typeinterner),
+[`instances`](#typeinterner)). `nil` is a no-op. After `dnit` every
+[`TypeId`](#typeid) previously issued is invalid.
 
 | Param | Type                             | Description                          |
 |-------|----------------------------------|--------------------------------------|
@@ -398,16 +488,12 @@ pub fun intern_instance(ti: *TypeInterner, target_origin: sess.ModuleId, target_
 
 Returns the [`TypeId`](#typeid) for a generic instantiation of
 `(target_origin, target_decl)` with the given concrete argument types.
-Linear-scans existing [`TYPE_INSTANCE`](#typekind) entries for a
-match before allocating; on miss, copies `args` into the
-[`params`](#typeinterner) pool and appends a fresh
-[`TypeInstance`](#typeinstance) record.
-
-`TYPE_INSTANCE` is the one compound kind that bypasses the dedup
-[`map`](#typeinterner) — hash-via-pool is awkward with the map's
-fixed `hash_fn(ptr)` signature, and instance counts are small enough
-that linear scan is acceptable. Once profiling shows otherwise, this
-becomes the natural place to introduce a per-target-decl cache.
+Looks up [`InstanceKey`](#instancekey) in
+[`ti.instances`](#typeinterner); on hit returns the cached
+[`TypeId`](#typeid). On miss, copies `args` into the
+[`params`](#typeinterner) pool, appends a fresh
+[`TypeInstance`](#typeinstance) record, and registers the new key.
+Identity is structural across `(target_origin, target_decl, args*)`.
 
 | Param         | Type                                          | Description                                              |
 |---------------|-----------------------------------------------|----------------------------------------------------------|
@@ -423,22 +509,27 @@ allocation error.
 ### `intern_function`
 
 ```mach
-pub fun intern_function(ti: *TypeInterner, ret_ty: TypeId, params: *TypeId, count: u32) Result[TypeId, str]
+pub fun intern_function(ti: *TypeInterner, ret_ty: TypeId, params: *TypeId, count: u32, variadic: bool) Result[TypeId, str]
 ```
 
-Allocates a fresh `TYPE_FUN` and copies the parameter list into the
-side pool. Function types are not deduplicated; structural equivalence
-is available via [`type_equals_signatures`](#type_equals_signatures).
+Returns the [`TypeId`](#typeid) for a function signature with the
+given return type, parameter list, and variadic flag. Looks up
+[`FunKey`](#funkey) in [`ti.funs`](#typeinterner); on hit returns the
+cached [`TypeId`](#typeid). On miss, copies `params` into the
+[`ParamPool`](#parampool), appends a fresh [`TypeFun`](#typefun)
+record, and registers the new key. Identity is structural across
+`(ret_ty, params*, variadic)`.
 
-| Param  | Type                             | Description                                      |
-|--------|----------------------------------|--------------------------------------------------|
-| ti     | [`*TypeInterner`](#typeinterner) | The interner.                                    |
-| ret_ty | [`TypeId`](#typeid)              | Return type. [`TYPE_NIL`](#type_nil) for "no return value". |
-| params | [`*TypeId`](#typeid)             | Pointer to a contiguous array of parameter ids.  |
-| count  | `u32`                            | Number of parameter types.                       |
+| Param    | Type                             | Description                                      |
+|----------|----------------------------------|--------------------------------------------------|
+| ti       | [`*TypeInterner`](#typeinterner) | The interner.                                    |
+| ret_ty   | [`TypeId`](#typeid)              | Return type. [`TYPE_NIL`](#type_nil) for "no return value". |
+| params   | [`*TypeId`](#typeid)             | Pointer to a contiguous array of parameter ids.  |
+| count    | `u32`                            | Number of fixed parameter types.                 |
+| variadic | `bool`                           | `true` for a variadic signature.                 |
 
-Returns a fresh [`TypeId`](#typeid) for the function, or an allocation
-error.
+Returns the (deduped) [`TypeId`](#typeid) for the function, or an
+allocation error.
 
 ### `get`
 
@@ -463,126 +554,31 @@ range, `none` otherwise.
 pub fun get_param(ti: *TypeInterner, index: u32) Option[TypeId]
 ```
 
-Returns the parameter [`TypeId`](#typeid) at the given pool index
-(typically `fun.params_start + i`), or `none` when `index` is out of
-range.
+Returns the parameter [`TypeId`](#typeid) at the given logical pool
+offset (typically `fun.params_start + i`), or `none` when `index` is
+out of range. Wraps [`params_get`](#internal-helpers); the internal
+chunk walk is transparent to callers.
 
 | Param | Type                             | Description                                      |
 |-------|----------------------------------|--------------------------------------------------|
 | ti    | [`*TypeInterner`](#typeinterner) | The interner.                                    |
-| index | `u32`                            | Pool index (typically `fun.params_start + i`).   |
+| index | `u32`                            | Logical pool offset (typically `fun.params_start + i`). |
 
 Returns `some(TypeId)` for a valid slot, `none` otherwise.
 
-### `type_equals_signatures`
+## Internal helpers
 
-```mach
-pub fun type_equals_signatures(ti: *TypeInterner, a: TypeId, b: TypeId) bool
-```
+File-private; listed for reference.
 
-Structural equivalence for two `TYPE_FUN` ids. Returns `true` when
-`a == b`, or when both are `TYPE_FUN` with matching `ret` and identical
-parameter sequences. Required because
-[`intern_function`](#intern_function) does not deduplicate.
-
-| Param | Type                             | Description                          |
-|-------|----------------------------------|--------------------------------------|
-| ti    | [`*TypeInterner`](#typeinterner) | The interner.                        |
-| a     | [`TypeId`](#typeid)              | First TypeId, must be `TYPE_FUN`.    |
-| b     | [`TypeId`](#typeid)              | Second TypeId, must be `TYPE_FUN`.   |
-
-Returns `true` when the signatures match structurally.
-
-### `intern_dedup`
-
-```mach
-fun intern_dedup(ti: *TypeInterner, t: Type) Result[TypeId, str]
-```
-
-Internal common path used by [`intern_pointer`](#intern_pointer),
-[`intern_array`](#intern_array), [`intern_nominal`](#intern_nominal),
-and [`intern_generic_param`](#intern_generic_param). Looks up `t` in
-[`ti.dedup`](#typeinterner); on hit returns the cached
-[`TypeId`](#typeid); on miss appends `t` via [`append_type`](#append_type),
-inserts the new entry into the dedup map, and returns the new
-[`TypeId`](#typeid).
-
-| Param | Type                             | Description                                                |
-|-------|----------------------------------|------------------------------------------------------------|
-| ti    | [`*TypeInterner`](#typeinterner) | The interner.                                              |
-| t     | [`Type`](#type)                  | Candidate type record. Caller must populate `kind` + payload.|
-
-Returns the [`TypeId`](#typeid) for `t`, or an allocation error.
-
-### `append_type`
-
-```mach
-fun append_type(ti: *TypeInterner, t: Type) Result[TypeId, str]
-```
-
-Appends `t` to [`ti.types`](#typeinterner), growing the array on
-demand, and returns the new [`TypeId`](#typeid). Does not consult
-[`ti.dedup`](#typeinterner) — callers performing deduplication call
-[`intern_dedup`](#intern_dedup) instead.
-
-| Param | Type                             | Description       |
-|-------|----------------------------------|-------------------|
-| ti    | [`*TypeInterner`](#typeinterner) | The interner.     |
-| t     | [`Type`](#type)                  | Type record to append.|
-
-Returns the newly assigned [`TypeId`](#typeid), or an allocation error.
-
-### `reserve_params`
-
-```mach
-fun reserve_params(ti: *TypeInterner, need: u32) Result[bool, str]
-```
-
-Ensures [`ti.params`](#typeinterner) has at least `need` free slots
-beyond [`ti.params_len`](#typeinterner). Doubles capacity until the
-requested space is available.
-
-| Param | Type                             | Description                          |
-|-------|----------------------------------|--------------------------------------|
-| ti    | [`*TypeInterner`](#typeinterner) | The interner.                        |
-| need  | `u32`                            | Number of additional slots required. |
-
-Returns `true` on success, or an allocation error.
-
-### `hash_type`
-
-```mach
-fun hash_type(p: ptr) u64
-```
-
-Structural FNV-1a hash over a [`Type`](#type) record's identity-bearing
-fields, built on `std.crypto.hash.fnv1a` primitives. Used as the
-`hash_fn` for [`ti.dedup`](#typeinterner). `TYPE_FUN` is never hashed
-because [`intern_function`](#intern_function) bypasses dedup.
-
-| Param | Type   | Description                          |
-|-------|--------|--------------------------------------|
-| p     | `ptr`  | Pointer to a [`Type`](#type) record. |
-
-Returns a 64-bit hash of the type's identity fields.
-
-### `eq_type`
-
-```mach
-fun eq_type(pa: ptr, pb: ptr) bool
-```
-
-Structural equality over [`Type`](#type) records, compatible with the
-key shape that [`hash_type`](#hash_type) hashes. Used as the `eq_fn`
-for [`ti.dedup`](#typeinterner).
-
-| Param | Type   | Description                                  |
-|-------|--------|----------------------------------------------|
-| pa    | `ptr`  | Pointer to the first [`Type`](#type) record. |
-| pb    | `ptr`  | Pointer to the second [`Type`](#type) record.|
-
-Returns `true` when the two records are identity-equal under the kind
-they share.
+| Function          | Role                                                                                              |
+|-------------------|---------------------------------------------------------------------------------------------------|
+| `intern_dedup`    | Common path for [`intern_pointer`](#intern_pointer) / [`intern_array`](#intern_array) / [`intern_nominal`](#intern_nominal) / [`intern_generic_param`](#intern_generic_param): looks up `t` in [`ti.dedup`](#typeinterner); on hit returns the cached [`TypeId`](#typeid); on miss appends via `append_type` and registers in the map. |
+| `append_type`     | Appends a [`Type`](#type) record to [`ti.types`](#typeinterner), growing on demand. Skips the dedup map. |
+| `params_reserve`  | Ensures [`ti.params`](#typeinterner) has at least `need` free slots starting at `next_free`. Appends new [`Chunk`](#parampool)s as needed; never reallocates an existing chunk. |
+| `params_push`     | Writes one [`TypeId`](#typeid) at `next_free` (allocating a new chunk if necessary) and increments `next_free`. |
+| `params_get`      | Resolves a logical offset to a `*TypeId` by walking the chunk list. |
+| `hash_type`       | Structural FNV-1a hash over a [`Type`](#type) record's identity-bearing fields, built on `std.crypto.hash.fnv1a` primitives. Used as the `hash_fn` for `ti.dedup`. |
+| `eq_type`         | Structural equality over [`Type`](#type) records, compatible with `hash_type`. Used as the `eq_fn` for `ti.dedup`. |
 
 ## Dependencies
 

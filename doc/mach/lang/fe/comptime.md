@@ -38,9 +38,9 @@ A tagged comptime-evaluated value.
 | Field | Type                                  | Description                                  |
 |-------|---------------------------------------|----------------------------------------------|
 | kind  | [`CTKind`](#ctkind)                   | Which [`CT_KIND_*`](#constants) variant is active. |
-| data  | `uni { … }`                           | Kind-specific payload.                       |
+| data  | `uni { ... }`                           | Kind-specific payload.                       |
 
-| `data` variant | Type                              | Active when `kind` is …  |
+| `data` variant | Type                              | Active when `kind` is ...  |
 |----------------|-----------------------------------|--------------------------|
 | i              | `i64`                             | `CT_KIND_INT`            |
 | f              | `f64`                             | `CT_KIND_FLOAT`          |
@@ -211,16 +211,16 @@ pub fun eval(
 ```
 
 Evaluates a comptime expression in the given context. Dispatches on
-the expression's [`ExprKind`](../ast/expr.md#exprkind); unsupported
+the expression's [`ExprKind`](ast/expr.md#exprkind); unsupported
 kinds (call, index, cast, array literal, struct literal, `nil`, error)
 return an explicit error describing the rejection.
 
 | Param    | Type                                          | Description                                              |
 |----------|-----------------------------------------------|----------------------------------------------------------|
 | c        | [`*ComptimeCtx`](#comptimectx)                | The comptime context.                                    |
-| a        | [`*ast.Ast`](../ast.md#ast)                   | The ast that owns `e`.                                   |
+| a        | [`*ast.Ast`](ast.md#ast)                   | The ast that owns `e`.                                   |
 | source   | `str`                                         | Source text covering `e` (used for span lookup).         |
-| e        | [`id.ExprId`](../ast/id.md#exprid)            | Expression id to evaluate.                               |
+| e        | [`id.ExprId`](ast/id.md#exprid)            | Expression id to evaluate.                               |
 | interner | [`*intern.Interner`](../intern.md#interner)   | Shared string interner; used to compare identifier text via [`StrId`](../intern.md#strid). |
 
 Returns the evaluated [`CTValue`](#ctvalue), or an error message
@@ -236,7 +236,7 @@ describing why evaluation failed.
 | `LIT_FLOAT`            | Decode and emit `CT_KIND_FLOAT`.                                           |
 | `LIT_CHAR`             | Decode escape sequences; emit `CT_KIND_INT` (i64 of the byte).             |
 | `LIT_STR` / `LIT_ZSTR` | Decode escapes; intern the contents; emit `CT_KIND_STR`.                   |
-| `BINARY`               | Recurse on operands; dispatch on [`BinOp`](../ast/expr.md#binop) via [operator table](#operators). |
+| `BINARY`               | Recurse on operands; dispatch on [`BinOp`](ast/expr.md#binop) via [operator table](#operators). |
 | `UNARY`                | Recurse on operand; apply unary op via [operator table](#operators).       |
 | `IDENT`                | Intern the identifier text; [`lookup`](#lookup) in `c.user_consts`; return its value. |
 | `COMPTIME_IDENT`       | Treat as a leaf segment of `$mach.*`; see [`$mach.*` path resolution](#mach-path-resolution). |
@@ -256,7 +256,7 @@ describing why evaluation failed.
 
 ### Operators
 
-| Category   | [`BinOp`](../ast/expr.md#binop)                          | Result kind          | Notes                             |
+| Category   | [`BinOp`](ast/expr.md#binop)                          | Result kind          | Notes                             |
 |------------|----------------------------------------------------------|----------------------|-----------------------------------|
 | Arithmetic | `BIN_ADD`, `BIN_SUB`, `BIN_MUL`, `BIN_DIV`, `BIN_MOD`    | i64 or f64           | Operands must share kind; INT/FLOAT only. Integer wraps; float follows IEEE. |
 | Equality   | `BIN_EQ`, `BIN_NEQ`                                      | bool                 | Operands must share kind. Strings compare by [`StrId`](../intern.md#strid). |
@@ -268,7 +268,7 @@ describing why evaluation failed.
 
 Unary operators:
 
-| [`UnOp`](../ast/expr.md#unop) | Result kind | Notes                                          |
+| [`UnOp`](ast/expr.md#unop) | Result kind | Notes                                          |
 |-------------------------------|-------------|------------------------------------------------|
 | `UN_NEG`                      | i64 or f64  | INT or FLOAT.                                  |
 | `UN_NOT`                      | bool        | BOOL only.                                     |
@@ -279,7 +279,7 @@ Unary operators:
 
 A `COMPTIME_IDENT` (possibly the leftmost root of a MEMBER chain)
 identifies a target attribute. The chain is collected as a stack of
-[`Span`](../token.md#span)s (leaf first) up to depth 16, then matched
+[`Span`](token.md#span)s (leaf first) up to depth 16, then matched
 against the supported paths:
 
 | Path                                            | Returns                                                   |
@@ -329,7 +329,7 @@ File-private; listed for reference.
 | `eval_lit_str`          | Decode escape sequences within a string literal; intern; box as `CT_KIND_STR`. |
 | `intern_decoded`        | Allocate a temporary buffer for an escape-decoded string and intern it.    |
 | `decode_char`           | Decode the contents of a single-character literal to a `u8`.               |
-| `decode_escape`         | Decode a single `\…` escape sequence at the given pointer.                 |
+| `decode_escape`         | Decode a single `\...` escape sequence at the given pointer.                 |
 | `hex_digit`             | ASCII hex character → 0..15, or negative on failure.                       |
 | `contains_byte`         | Predicate: does `s` contain the byte `b`?                                  |
 | `eval_binary`           | Recurse on operands and dispatch on `BinOp`.                               |
@@ -351,9 +351,9 @@ File-private; listed for reference.
 `std.types.bool`, `std.types.option`, `std.types.size`,
 `std.types.string`, `std.types.zstr`, `std.types.result`,
 `std.allocator`, [`mach.lang.intern`](../intern.md),
-[`mach.lang.fe.ast`](../ast.md),
-[`mach.lang.fe.ast.id`](../ast/id.md),
-[`mach.lang.fe.ast.expr`](../ast/expr.md),
-[`mach.lang.fe.token`](../token.md),
+[`mach.lang.fe.ast`](ast.md),
+[`mach.lang.fe.ast.id`](ast/id.md),
+[`mach.lang.fe.ast.expr`](ast/expr.md),
+[`mach.lang.fe.token`](token.md),
 [`mach.lang.target.os`](../target/os.md),
 [`mach.lang.target.isa`](../target/isa.md).

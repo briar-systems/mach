@@ -4,6 +4,7 @@ IR data structures and operations. `ir.mach` in the parent directory re-exports 
 
 ## Files
 
+- `id.mach` — IR index-handle types (`BlockId`, `InstructionId`). Leaf module that breaks the `value` ↔ `instruction` import cycle.
 - `type.mach` — IR type system. Structurally interned via `lang/intern.mach` so type equality is a `TypeId` comparison.
 - `value.mach` — SSA values, uses, and use-def chains.
 - `instruction.mach` — the instruction set: opcodes, operands, and results.

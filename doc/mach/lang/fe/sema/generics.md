@@ -35,26 +35,26 @@ applied to `args`. Steps:
 1. Look up the generic's declaration via
    [`sc.deps`](../sema.md#semadeps) (cross-module) or
    [`sc.rr`](../resolve.md#resolveresult) (local) to find its
-   [`generics_len`](../../ast/decl.md#declfun) / [`generics_len`](../../ast/decl.md#declrec).
+   [`generics_len`](../ast/decl.md#declfun) / [`generics_len`](../ast/decl.md#declrec).
 2. Arity-check `arg_count` against the declared generic count;
    emit `"generic arg count: expected N, got M"` and return
    [`TYPE_ERROR`](../../type.md#typekind) on mismatch.
 3. Walk each arg, ensuring it's a valid type (not
    [`TYPE_NIL`](../../type.md#type_nil)); failures absorb into
    `TYPE_ERROR`.
-4. Call [`type.intern_instance`](../../type.md#intern_instance) with
-   `(generic_decl, generic_origin, args)`. The interner returns the
-   same [`TypeId`](../../type.md#typeid) for repeated `(target, args)`
-   tuples.
+4. Call [`type.intern_instance`](../../type.md#intern_instance) as
+   `intern_instance(ti, generic_origin, generic_decl, args, arg_count)`.
+   The interner returns the same [`TypeId`](../../type.md#typeid) for
+   repeated `(target_origin, target_decl, args)` tuples.
 
 | Param          | Type                                          | Description                                              |
 |----------------|-----------------------------------------------|----------------------------------------------------------|
 | sc             | [`*sema.SemaContext`](../sema.md#semacontext) | Sema context.                                            |
-| generic_decl   | [`id.DeclId`](../../ast/id.md#declid)         | The generic decl being instantiated.                     |
+| generic_decl   | [`id.DeclId`](../ast/id.md#declid)         | The generic decl being instantiated.                     |
 | generic_origin | [`sess.ModuleId`](../../session.md#moduleid)  | The module that owns `generic_decl`.                     |
 | args           | [`*type.TypeId`](../../type.md#typeid)        | Pointer to a contiguous array of concrete argument types.|
 | arg_count      | `u32`                                         | Number of argument types.                                |
-| span           | [`token.Span`](../../token.md#span)           | Span of the instantiation site for diagnostics.          |
+| span           | [`token.Span`](../token.md#span)           | Span of the instantiation site for diagnostics.          |
 
 Returns the interned [`TYPE_INSTANCE`](../../type.md#typekind)
 [`TypeId`](../../type.md#typeid), or an error if arity / arg
@@ -161,9 +161,9 @@ File-private; listed for reference.
 `std.types.bool`, `std.types.option`, `std.types.size`,
 `std.types.string`, `std.types.result`,
 [`mach.lang.intern`](../../intern.md), [`mach.lang.session`](../../session.md),
-[`mach.lang.type`](../../type.md), [`mach.lang.fe.ast`](../../ast.md),
-[`mach.lang.fe.ast.id`](../../ast/id.md),
-[`mach.lang.fe.ast.decl`](../../ast/decl.md),
-[`mach.lang.fe.token`](../../token.md),
+[`mach.lang.type`](../../type.md), [`mach.lang.fe.ast`](../ast.md),
+[`mach.lang.fe.ast.id`](../ast/id.md),
+[`mach.lang.fe.ast.decl`](../ast/decl.md),
+[`mach.lang.fe.token`](../token.md),
 [`mach.lang.fe.resolve`](../resolve.md),
 [`mach.lang.fe.sema`](../sema.md).
