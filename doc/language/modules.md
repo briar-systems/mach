@@ -1,74 +1,45 @@
 # Modules
 
-Every `.mach` file is a module. Modules are identified by fully-qualified names (FQNs) derived from the project structure and `mach.toml` configuration.
+A Mach project is a tree of modules rooted at the project's `id`. Each
+`.mach` file under the project's source directory is a module reachable by
+a dotted path from the project root.
 
+## Path structure
 
-## Import Syntax
+The path separator is `.`. A file at `src/foo/bar.mach` in a project with
+`id = "myproj"` is reachable as `myproj.foo.bar`.
 
-### Bare Import
+There is no `this.` self-prefix. Within a project, modules always reference
+each other by their full project-rooted path. Every reference is
+syntactically uniform regardless of where it appears.
 
-```mach
-use std.types.bool;
-```
+## Shadow-module pattern
 
-A bare import makes the module's public symbols available without a prefix. Functions and types from `std.types.bool` can be used directly.
-
-### Aliased Import
-
-```mach
-use print: std.print;
-```
-
-An aliased import requires the alias prefix to access symbols:
-
-```mach
-print.println("hello");
-print.printf("n=%d\n", 42::i64);
-```
-
-
-## Module Resolution
-
-Module paths are dot-separated identifiers that map to filesystem paths. The compiler resolves them deterministically from `mach.toml`.
-
-### Project Modules
-
-`[project].id` is the prefix for all modules in the project. Given `id = "myapp"` and `dir_src = "src"`:
+A file `foo.mach` may co-exist with a directory `foo/`. The file is the
+**surface** module — the public face of `foo`. The directory's files are
+**split** implementations that the surface loads and re-exports.
 
 ```
-src/main.mach           -> myapp.main
-src/util/helpers.mach   -> myapp.util.helpers
+myproj/
+├── foo.mach          # surface
+└── foo/
+    ├── a.mach        # split: myproj.foo.a
+    └── b.mach        # split: myproj.foo.b
 ```
 
-### Dependency Modules
+The surface loads each split with `use myproj.foo.a;` and re-exports its
+public symbols with `fwd a.X;`. Consumers `use myproj.foo;` and access
+symbols through the surface — they never name the split files directly.
 
-Dependencies are declared in `[deps.<alias>]`. The compiler reads the dependency's own `mach.toml` to find its `[project].id` and uses that as the module prefix:
+Two common uses:
 
-```
-dep/mach-std/src/print.mach  -> std.print  (if mach-std has id = "std")
-```
+- **Topical splits** — organize a large module by topic; all splits
+  forwarded unconditionally.
+- **Multiplatform splits** — one impl per target, selected by `$if` on
+  `$mach.target.os` or `$mach.target.arch`.
 
-The alias in `[deps.<alias>]` is a local handle for tooling. Import paths use the dependency's actual project ID.
+## See also
 
-
-## Module Graph
-
-The compiler does not scan directories. It starts from the target's entrypoint and recursively follows `use` statements to build the module graph. Only modules reachable from the entrypoint are compiled.
-
-For library targets, the entrypoint should `use` all modules intended to be part of the library's API:
-
-```mach
-# lib.mach (library entrypoint)
-use mylib.parser;
-use mylib.formatter;
-```
-
-
-## One File, One Module
-
-There is no multi-module file concept. Each `.mach` file corresponds to exactly one module. File paths determine the module's FQN.
-
-
-## Visibility
-
-Only declarations marked `pub` are visible to other modules. Without `pub`, declarations are private to their module.
+- [files.md](files.md) — how `mach.toml` declares the project root
+- [use.md](use.md) — loading a module into another module's scope
+- [fwd.md](fwd.md) — re-exporting from a surface module

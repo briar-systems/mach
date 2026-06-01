@@ -1,0 +1,971 @@
+# mach.lang.me.lower.expr: per-expression lowering.
+#
+# Produces an IR `Value` for every expression.
+# Rvalues and lvalues are disambiguated by call site: `lower_rvalue`
+# returns the loaded value an expression denotes; `lower_lvalue` returns a
+# pointer to the storage an assignable expression names.
+#
+# Locals are
+# alloca slots seeded in `LowerContext.locals`, so an `IDENT` rvalue is a
+# `load` of its slot and an `IDENT` lvalue is the slot pointer itself.
+# `mem2reg` later collapses the slots into SSA values, so the redundant
+# load/store traffic emitted here costs nothing in the final code.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use src:      mach.lang.source;
+use ty:       mach.lang.type;
+use intern:   mach.lang.intern;
+
+use ast:      mach.lang.fe.ast;
+use aid:      mach.lang.fe.ast.id;
+use aexpr:    mach.lang.fe.ast.expr;
+use adecl:    mach.lang.fe.ast.decl;
+use resolve:  mach.lang.fe.resolve;
+use comptime: mach.lang.fe.comptime;
+use token:    mach.lang.fe.token;
+
+use ir:       mach.lang.me.ir;
+use ir_type:  mach.lang.me.ir.type;
+use value:    mach.lang.me.ir.value;
+use builder:  mach.lang.me.ir.builder;
+
+use lower: mach.lang.me.lower;
+
+# lowers an expression to its rvalue: the loaded value the expression
+# denotes. dispatches on the expression's `ExprKind`.
+# ---
+# ctx: per-module lowering context
+# eid: AST ExprId to lower
+# ret: the resulting Value, or an error
+pub fun lower_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Value, str] {
+    val e_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
+    if (is_none[*aexpr.Expr](e_opt)) {
+        ret err[value.Value, str]("lower: expression id out of range");
+    }
+    val e: *aexpr.Expr = unwrap[*aexpr.Expr](e_opt);
+    val k: aexpr.ExprKind = e.kind;
+
+    if (k == aexpr.EXPR_KIND_LIT_INT)        { ret lower_lit_int(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_LIT_FLOAT)      { ret lower_lit_float(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_LIT_CHAR)       { ret lower_lit_char(ctx, e); }
+    if (k == aexpr.EXPR_KIND_LIT_STR)        { ret lower_lit_str(ctx, e); }
+    if (k == aexpr.EXPR_KIND_LIT_NIL)        { ret lower_lit_nil(ctx, eid); }
+    if (k == aexpr.EXPR_KIND_IDENT)          { ret lower_ident_rvalue(ctx, eid); }
+    if (k == aexpr.EXPR_KIND_MEMBER)         { ret lower_member_rvalue(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_INDEX)          { ret lower_index_rvalue(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_CALL)           { ret lower_call(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_BINARY)         { ret lower_binary(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_UNARY)          { ret lower_unary(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_CAST)           { ret lower_cast(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_COMPTIME_IDENT) { ret lower_comptime_ident(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_ARRAY_LIT)      { ret lower_array_lit(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_STRUCT_LIT)     { ret lower_struct_lit(ctx, eid, e); }
+
+    ret err[value.Value, str]("lower: unsupported expression kind in rvalue position");
+}
+
+# lowers an assignable expression to its lvalue: a pointer to the storage
+# the expression names. valid only for the location-denoting expression
+# forms; sema rejects others before lowering.
+# ---
+# ctx: per-module lowering context
+# eid: AST ExprId to lower
+# ret: a pointer Value, or an error
+pub fun lower_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Value, str] {
+    val e_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
+    if (is_none[*aexpr.Expr](e_opt)) {
+        ret err[value.Value, str]("lower: lvalue id out of range");
+    }
+    val e: *aexpr.Expr = unwrap[*aexpr.Expr](e_opt);
+    val k: aexpr.ExprKind = e.kind;
+
+    if (k == aexpr.EXPR_KIND_IDENT)  { ret lower_ident_lvalue(ctx, eid); }
+    if (k == aexpr.EXPR_KIND_MEMBER) { ret lower_member_lvalue(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_INDEX)  { ret lower_index_lvalue(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_UNARY) {
+        # @p as an lvalue is the rvalue of p (already a pointer)
+        if (e.data.unary.op == aexpr.UN_DEREF) {
+            ret lower_rvalue(ctx, e.data.unary.operand);
+        }
+    }
+
+    ret err[value.Value, str]("lower: expression is not an lvalue");
+}
+
+fun lower_lit_int(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    ret ok[value.Value, str](value.const_int(e.data.lit_int, unwrap_ok[ir_type.IrTypeId, str](tr)));
+}
+
+fun lower_lit_float(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    ret ok[value.Value, str](value.const_float(e.data.lit_float, unwrap_ok[ir_type.IrTypeId, str](tr)));
+}
+
+fun lower_lit_char(ctx: *lower.LowerContext, e: *aexpr.Expr) Result[value.Value, str] {
+    val tr: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?ctx.m.types, 8);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    ret ok[value.Value, str](value.const_int(e.data.lit_char::u64, unwrap_ok[ir_type.IrTypeId, str](tr)));
+}
+
+# a string literal lowers to a VAL_CONST_BYTES naming the literal's decoded
+# content bytes; the back end materialises a read-only data global and
+# resolves the Value to a `*u8` pointer to it. escape sequences (\n \t \r \\
+# \' \" \0 \xHH) are decoded into the materialised bytes, matching the
+# documented string-literal semantics and comptime.eval's eval_lit_str. the
+# decoded content is interned (giving a stable byte sequence) and the Value
+# borrows the interned bytes.
+fun lower_lit_str(ctx: *lower.LowerContext, e: *aexpr.Expr) Result[value.Value, str] {
+    val pr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+    if (is_err[ir_type.IrTypeId, str](pr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](pr)); }
+    val pty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](pr);
+
+    # the literal's inner content view, with the surrounding quotes stripped.
+    val txt: str = module_source(ctx);
+    var inner: str;
+    inner.len  = 0;
+    inner.data = nil;
+    if (e.span.len >= 2::usize) {
+        inner.data = ?txt.data[e.span.offset + 1::usize];
+        inner.len  = (e.span.len - 2::usize)::u32;
+    }
+
+    val sid_r: Result[intern.StrId, str] = intern_str_lit(ctx, inner);
+    if (is_err[intern.StrId, str](sid_r)) { ret err[value.Value, str](unwrap_err[intern.StrId, str](sid_r)); }
+    val bytes_opt: Option[str] = intern.lookup(?ctx.s.interner, unwrap_ok[intern.StrId, str](sid_r));
+    if (is_none[str](bytes_opt)) { ret err[value.Value, str]("lower: string literal lookup failed"); }
+    val bytes: str = unwrap[str](bytes_opt);
+
+    ret ok[value.Value, str](value.const_bytes(bytes.data, bytes.len::u32, pty));
+}
+
+# interns a string literal's inner content, decoding escape sequences when
+# present. with no escapes the raw view is interned directly; otherwise the
+# decoded bytes are materialised into a temporary buffer (decoded length
+# never exceeds the source length) and interned, then the buffer is released.
+fun intern_str_lit(ctx: *lower.LowerContext, inner: str) Result[intern.StrId, str] {
+    if (inner.len == 0 || !lit_has_escape(inner)) {
+        ret intern.intern(?ctx.s.interner, inner);
+    }
+
+    val buf_r: Result[*u8, str] = allocate[u8](ctx.s.alloc, inner.len::usize);
+    if (is_err[*u8, str](buf_r)) { ret err[intern.StrId, str](unwrap_err[*u8, str](buf_r)); }
+    val buf: *u8 = unwrap_ok[*u8, str](buf_r);
+
+    var read:  u32 = 0;
+    var write: u32 = 0;
+    for (read < inner.len) {
+        val c: u8 = inner.data[read];
+        if (c != '\\') {
+            buf[write] = c;
+            read  = read + 1;
+            write = write + 1;
+            cnt;
+        }
+        var consumed: u32 = 0;
+        val esc_r: Result[u8, str] = lit_decode_escape(?inner.data[read], inner.len - read, ?consumed);
+        if (is_err[u8, str](esc_r)) {
+            deallocate[u8](ctx.s.alloc, buf, inner.len::usize);
+            ret err[intern.StrId, str](unwrap_err[u8, str](esc_r));
+        }
+        buf[write] = unwrap_ok[u8, str](esc_r);
+        read  = read + consumed;
+        write = write + 1;
+    }
+
+    var decoded: str;
+    decoded.len  = write;
+    decoded.data = buf;
+    val id_r: Result[intern.StrId, str] = intern.intern(?ctx.s.interner, decoded);
+    deallocate[u8](ctx.s.alloc, buf, inner.len::usize);
+    ret id_r;
+}
+
+# true when a string view contains a backslash (an escape sequence).
+fun lit_has_escape(s: str) bool {
+    var i: u32 = 0;
+    for (i < s.len) {
+        if (s.data[i] == '\\') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# decodes one escape sequence starting at `p` (which points at the leading
+# backslash), writing the consumed input byte count into `out_consumed`.
+# mirrors comptime.eval's decode_escape: \n \t \r \\ \' \" \0 \xHH.
+fun lit_decode_escape(p: *u8, len: u32, out_consumed: *u32) Result[u8, str] {
+    if (len < 2) { ret err[u8, str]("lower: incomplete escape sequence in string literal"); }
+    val c: u8 = p[1];
+
+    if (c == 'n')  { @out_consumed = 2; ret ok[u8, str](10); }
+    if (c == 't')  { @out_consumed = 2; ret ok[u8, str](9); }
+    if (c == 'r')  { @out_consumed = 2; ret ok[u8, str](13); }
+    if (c == '\\') { @out_consumed = 2; ret ok[u8, str](92); }
+    if (c == '\'') { @out_consumed = 2; ret ok[u8, str](39); }
+    if (c == '"')  { @out_consumed = 2; ret ok[u8, str](34); }
+    if (c == '0')  { @out_consumed = 2; ret ok[u8, str](0); }
+    if (c == 'x') {
+        if (len < 4) { ret err[u8, str]("lower: incomplete \\x escape in string literal"); }
+        val hi: i64 = lit_hex_digit(p[2]);
+        val lo: i64 = lit_hex_digit(p[3]);
+        if (hi < 0 || lo < 0) { ret err[u8, str]("lower: invalid \\x escape in string literal"); }
+        @out_consumed = 4;
+        ret ok[u8, str]((hi * 16 + lo)::u8);
+    }
+    ret err[u8, str]("lower: unknown escape sequence in string literal");
+}
+
+# maps a hex digit byte to its value 0..15, or -1 when not a hex digit.
+fun lit_hex_digit(c: u8) i64 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i64; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::i64 + 10; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::i64 + 10; }
+    ret 0 - 1;
+}
+
+fun lower_lit_nil(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Value, str] {
+    val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    ret ok[value.Value, str](value.const_null(unwrap_ok[ir_type.IrTypeId, str](tr)));
+}
+
+# an identifier rvalue: a load from its alloca slot when the symbol is a
+# local / parameter slot, the bound VAL_PARAM Value when it is a bare
+# parameter, or a function / global reference otherwise. an aggregate-typed
+# local is left as its slot pointer (not loaded): an aggregate rvalue is its
+# storage address, which the back end consumes for two-register / by-reference
+# argument passing and aggregate returns (loads happen at scalar use sites).
+fun lower_ident_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Value, str] {
+    val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, eid);
+    val local: Option[value.Value] = lower.lookup_local(ctx, sid);
+    if (is_some[value.Value](local)) {
+        val slot: value.Value = unwrap[value.Value](local);
+        if (slot.kind == value.VAL_PARAM) {
+            ret ok[value.Value, str](slot);
+        }
+        val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+        if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+        val ity: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+        if (is_aggregate_ir(ctx, ity)) { ret ok[value.Value, str](slot); }
+        ret builder.emit_load(?ctx.builder, slot, ity);
+    }
+    ret symbol_reference(ctx, eid, sid);
+}
+
+# forms an rvalue for an identifier that names a module-level symbol: a
+# function reference (VAL_FN) for functions, otherwise a load from the
+# global's storage pointer.
+fun symbol_reference(ctx: *lower.LowerContext, eid: aid.ExprId, sid: resolve.SymbolId) Result[value.Value, str] {
+    val sym_opt: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](sym_opt)) {
+        ret err[value.Value, str]("lower: unresolved identifier");
+    }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
+
+    val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+
+    if (sym.kind == resolve.SYM_FUN) {
+        val fi: Option[u32] = find_function(ctx, sym.name);
+        if (is_some[u32](fi)) {
+            ret ok[value.Value, str](value.fn_value(unwrap[u32](fi), vty));
+        }
+        ret ok[value.Value, str](value.fn_value(0, vty));
+    }
+
+    # global val / var: a load from the global's storage pointer, except for
+    # an aggregate global whose rvalue is its storage address (the back end
+    # loads halves / passes the pointer at use sites — see lower_ident_rvalue).
+    val gi: Option[u32] = find_global(ctx, sym.name);
+    if (is_some[u32](gi)) {
+        val pr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+        if (is_err[ir_type.IrTypeId, str](pr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](pr)); }
+        val gptr: value.Value = value.global_value(unwrap[u32](gi), unwrap_ok[ir_type.IrTypeId, str](pr));
+        if (is_aggregate_ir(ctx, vty)) { ret ok[value.Value, str](gptr); }
+        ret builder.emit_load(?ctx.builder, gptr, vty);
+    }
+
+    ret err[value.Value, str]("lower: identifier has no IR storage");
+}
+
+# an identifier lvalue: the alloca slot pointer for a local, or the global
+# storage pointer for a module-level binding.
+fun lower_ident_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Value, str] {
+    val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, eid);
+    val local: Option[value.Value] = lower.lookup_local(ctx, sid);
+    if (is_some[value.Value](local)) {
+        ret ok[value.Value, str](unwrap[value.Value](local));
+    }
+
+    val sym_opt: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](sym_opt)) {
+        ret err[value.Value, str]("lower: unresolved lvalue identifier");
+    }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
+    val gi: Option[u32] = find_global(ctx, sym.name);
+    if (is_some[u32](gi)) {
+        val pr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+        if (is_err[ir_type.IrTypeId, str](pr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](pr)); }
+        ret ok[value.Value, str](value.global_value(unwrap[u32](gi), unwrap_ok[ir_type.IrTypeId, str](pr)));
+    }
+    ret err[value.Value, str]("lower: lvalue identifier has no storage");
+}
+
+# a member rvalue: a load from the field pointer, except for an aggregate
+# field whose rvalue is its storage address (a nested struct / array field is
+# left as a pointer the back end consumes at use sites — see
+# lower_ident_rvalue).
+fun lower_member_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val ptr_r: Result[value.Value, str] = lower_member_lvalue(ctx, eid, e);
+    if (is_err[value.Value, str](ptr_r)) { ret ptr_r; }
+    val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    val ity: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+    if (is_aggregate_ir(ctx, ity)) { ret ptr_r; }
+    ret builder.emit_load(?ctx.builder, unwrap_ok[value.Value, str](ptr_r), ity);
+}
+
+# computes the field pointer of a member access: a gep against the base
+# lvalue with the field index. the field index is resolved from the base's
+# record/union declaration by matching the member name.
+fun lower_member_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val base_r: Result[value.Value, str] = lower_lvalue(ctx, e.data.member.object);
+    if (is_err[value.Value, str](base_r)) { ret base_r; }
+    val base: value.Value = unwrap_ok[value.Value, str](base_r);
+
+    val rec_ty: ty.TypeId = lower.expr_type_of(ctx, e.data.member.object);
+    val field_ix: u32 = field_index_in_type(ctx, rec_ty, e.data.member.name);
+
+    val rec_ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, rec_ty);
+    if (is_err[ir_type.IrTypeId, str](rec_ir_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](rec_ir_r)); }
+    val rec_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](rec_ir_r);
+
+    val xr: Result[ir_type.IrTypeId, str] = index_type(ctx);
+    if (is_err[ir_type.IrTypeId, str](xr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](xr)); }
+    val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](xr);
+
+    var idx: [2]value.Value;
+    idx[0] = value.const_int(0, xty);
+    idx[1] = value.const_int(field_ix::u64, xty);
+    ret builder.emit_gep(?ctx.builder, base, rec_ir, ?idx[0], 2);
+}
+
+# an index rvalue: a load from the element pointer, except for an aggregate
+# element whose rvalue is its storage address (an element of struct / array
+# type is left as a pointer the back end consumes at use sites — see
+# lower_ident_rvalue).
+fun lower_index_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val ptr_r: Result[value.Value, str] = lower_index_lvalue(ctx, eid, e);
+    if (is_err[value.Value, str](ptr_r)) { ret ptr_r; }
+    val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    val ity: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+    if (is_aggregate_ir(ctx, ity)) { ret ptr_r; }
+    ret builder.emit_load(?ctx.builder, unwrap_ok[value.Value, str](ptr_r), ity);
+}
+
+# computes the element pointer of an index expression: a gep against the base
+# (an array slot pointer or a raw pointer rvalue) with the index value. a pointer
+# base `*T` deref'd by one index strides over the element `T` directly (`[ix]`,
+# gep source type T); an array base `[N]T` addresses an element through the
+# canonical `[0, ix]` aggregate walk (gep source type `[N]T`), so the index scales
+# by the element size, not the whole-array size.
+fun lower_index_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val obj_ty: ty.TypeId = lower.expr_type_of(ctx, e.data.index.object);
+    val is_ptr: bool = is_pointer_type(ctx, obj_ty);
+
+    var base: value.Value;
+    if (is_ptr) {
+        val br: Result[value.Value, str] = lower_rvalue(ctx, e.data.index.object);
+        if (is_err[value.Value, str](br)) { ret br; }
+        base = unwrap_ok[value.Value, str](br);
+    } or {
+        val br: Result[value.Value, str] = lower_lvalue(ctx, e.data.index.object);
+        if (is_err[value.Value, str](br)) { ret br; }
+        base = unwrap_ok[value.Value, str](br);
+    }
+
+    val ir2: Result[value.Value, str] = lower_rvalue(ctx, e.data.index.index);
+    if (is_err[value.Value, str](ir2)) { ret ir2; }
+    val ix: value.Value = unwrap_ok[value.Value, str](ir2);
+
+    if (is_ptr) {
+        # `*T[ix]` strides over the pointee element type T. a raw untyped `ptr` has
+        # no element type to size the stride, so indexing one is not lowerable.
+        val et_opt: Option[*ty.Type] = ty.get(?ctx.s.types, obj_ty);
+        if (is_none[*ty.Type](et_opt)) { ret err[value.Value, str]("lower: index base has no pointer type"); }
+        val pt: *ty.Type = unwrap[*ty.Type](et_opt);
+        if (pt.kind != ty.TYPE_POINTER) {
+            ret err[value.Value, str]("lower: cannot index an untyped pointer");
+        }
+        val elem_ty: ty.TypeId = pt.data.pointer.base;
+        val elem_ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, elem_ty);
+        if (is_err[ir_type.IrTypeId, str](elem_ir_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](elem_ir_r)); }
+        val elem_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](elem_ir_r);
+        var idx1: [1]value.Value;
+        idx1[0] = ix;
+        ret builder.emit_gep(?ctx.builder, base, elem_ir, ?idx1[0], 1);
+    }
+
+    # `[N]T[ix]` addresses element ix through the aggregate walk on the array type.
+    val arr_ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, obj_ty);
+    if (is_err[ir_type.IrTypeId, str](arr_ir_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](arr_ir_r)); }
+    val arr_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](arr_ir_r);
+
+    val xr: Result[ir_type.IrTypeId, str] = index_type(ctx);
+    if (is_err[ir_type.IrTypeId, str](xr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](xr)); }
+    val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](xr);
+
+    var idx: [2]value.Value;
+    idx[0] = value.const_int(0, xty);
+    idx[1] = ix;
+    ret builder.emit_gep(?ctx.builder, base, arr_ir, ?idx[0], 2);
+}
+
+# lowers a call: the callee rvalue followed by each argument rvalue, then an
+# OP_CALL. ABI classification (which args ride in registers vs the stack) is
+# deferred to isel against the target ABI; lowering emits the flat operand
+# list the contract specifies. the call's IR result type is the lowered
+# semantic type of the call expression (IRT_VOID for a void call).
+fun lower_call(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val callee_r: Result[value.Value, str] = lower_rvalue(ctx, e.data.call.callee);
+    if (is_err[value.Value, str](callee_r)) { ret callee_r; }
+    val callee: value.Value = unwrap_ok[value.Value, str](callee_r);
+
+    val argc: u32 = e.data.call.args_len;
+    var args: *value.Value = nil;
+    if (argc > 0) {
+        val ar: Result[*value.Value, str] = allocate[value.Value](ctx.s.alloc, argc::usize);
+        if (is_err[*value.Value, str](ar)) { ret err[value.Value, str](unwrap_err[*value.Value, str](ar)); }
+        args = unwrap_ok[*value.Value, str](ar);
+
+        var i: u32 = 0;
+        for (i < argc) {
+            val pool_ix: u32 = e.data.call.args_start + i;
+            if (pool_ix::usize >= ctx.a.expr_id_len) {
+                deallocate[value.Value](ctx.s.alloc, args, argc::usize);
+                ret err[value.Value, str]("lower: call argument index out of range");
+            }
+            val arg_eid: aid.ExprId = ctx.a.expr_ids[pool_ix];
+            val vr: Result[value.Value, str] = lower_rvalue(ctx, arg_eid);
+            if (is_err[value.Value, str](vr)) {
+                deallocate[value.Value](ctx.s.alloc, args, argc::usize);
+                ret vr;
+            }
+            args[i] = unwrap_ok[value.Value, str](vr);
+            i = i + 1;
+        }
+    }
+
+    val rt_r: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](rt_r)) {
+        if (args != nil) { deallocate[value.Value](ctx.s.alloc, args, argc::usize); }
+        ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](rt_r));
+    }
+    val rt: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](rt_r);
+
+    val cr: Result[value.Value, str] = builder.emit_call(?ctx.builder, callee, args, argc, rt);
+    if (args != nil) { deallocate[value.Value](ctx.s.alloc, args, argc::usize); }
+    ret cr;
+}
+
+# lowers a binary expression. assignment evaluates the RHS and stores it
+# through the LHS lvalue; logical && / || short-circuit via cbr diamonds;
+# every other operator maps to one arithmetic / comparison / bitwise
+# instruction selected by the operand type.
+fun lower_binary(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val op: aexpr.BinOp = e.data.binary.op;
+
+    if (op == aexpr.BIN_ASSIGN) { ret lower_assign(ctx, e); }
+    if (op == aexpr.BIN_AND || op == aexpr.BIN_OR) { ret lower_logical(ctx, e); }
+
+    val lr: Result[value.Value, str] = lower_rvalue(ctx, e.data.binary.lhs);
+    if (is_err[value.Value, str](lr)) { ret lr; }
+    val lhs: value.Value = unwrap_ok[value.Value, str](lr);
+
+    val rr: Result[value.Value, str] = lower_rvalue(ctx, e.data.binary.rhs);
+    if (is_err[value.Value, str](rr)) { ret rr; }
+    val rhs: value.Value = unwrap_ok[value.Value, str](rr);
+
+    val signed: bool = is_signed_type(ctx, lower.expr_type_of(ctx, e.data.binary.lhs));
+
+    if (op == aexpr.BIN_ADD) { ret builder.emit_add(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_SUB) { ret builder.emit_sub(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_MUL) { ret builder.emit_mul(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_DIV) {
+        if (signed) { ret builder.emit_div_s(?ctx.builder, lhs, rhs); }
+        ret builder.emit_div_u(?ctx.builder, lhs, rhs);
+    }
+    if (op == aexpr.BIN_MOD) {
+        if (signed) { ret builder.emit_rem_s(?ctx.builder, lhs, rhs); }
+        ret builder.emit_rem_u(?ctx.builder, lhs, rhs);
+    }
+    if (op == aexpr.BIN_BIT_AND) { ret builder.emit_and(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_BIT_OR)  { ret builder.emit_or(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_BIT_XOR) { ret builder.emit_xor(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_SHL)     { ret builder.emit_shl(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_SHR) {
+        if (signed) { ret builder.emit_shr_s(?ctx.builder, lhs, rhs); }
+        ret builder.emit_shr_u(?ctx.builder, lhs, rhs);
+    }
+
+    if (op == aexpr.BIN_EQ)  { ret builder.emit_cmp_eq(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_NEQ) { ret builder.emit_cmp_ne(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_LT) {
+        if (signed) { ret builder.emit_cmp_lt_s(?ctx.builder, lhs, rhs); }
+        ret builder.emit_cmp_lt_u(?ctx.builder, lhs, rhs);
+    }
+    if (op == aexpr.BIN_LEQ) {
+        if (signed) { ret builder.emit_cmp_le_s(?ctx.builder, lhs, rhs); }
+        ret builder.emit_cmp_le_u(?ctx.builder, lhs, rhs);
+    }
+    if (op == aexpr.BIN_GT) {
+        # a > b  ==  b < a
+        if (signed) { ret builder.emit_cmp_lt_s(?ctx.builder, rhs, lhs); }
+        ret builder.emit_cmp_lt_u(?ctx.builder, rhs, lhs);
+    }
+    if (op == aexpr.BIN_GEQ) {
+        # a >= b  ==  b <= a
+        if (signed) { ret builder.emit_cmp_le_s(?ctx.builder, rhs, lhs); }
+        ret builder.emit_cmp_le_u(?ctx.builder, rhs, lhs);
+    }
+
+    ret err[value.Value, str]("lower: unsupported binary operator");
+}
+
+# lowers an assignment expression `lhs = rhs`: evaluate the RHS, store it
+# through the LHS lvalue, and yield the stored value as the result.
+fun lower_assign(ctx: *lower.LowerContext, e: *aexpr.Expr) Result[value.Value, str] {
+    val rr: Result[value.Value, str] = lower_rvalue(ctx, e.data.binary.rhs);
+    if (is_err[value.Value, str](rr)) { ret rr; }
+    val rhs: value.Value = unwrap_ok[value.Value, str](rr);
+
+    val lr: Result[value.Value, str] = lower_lvalue(ctx, e.data.binary.lhs);
+    if (is_err[value.Value, str](lr)) { ret lr; }
+    val ptr: value.Value = unwrap_ok[value.Value, str](lr);
+
+    val sr: Result[bool, str] = builder.emit_store(?ctx.builder, rhs, ptr);
+    if (is_err[bool, str](sr)) { ret err[value.Value, str](unwrap_err[bool, str](sr)); }
+    ret ok[value.Value, str](rhs);
+}
+
+# lowers a short-circuiting `&&` / `||`. lhs is evaluated; for `&&` rhs runs
+# only when lhs is nonzero, for `||` only when lhs is zero. the result is
+# materialised through a tiny alloca slot store/load that mem2reg turns into
+# a phi, so lowering itself emits no phis.
+fun lower_logical(ctx: *lower.LowerContext, e: *aexpr.Expr) Result[value.Value, str] {
+    val ity_r: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?ctx.m.types, 8);
+    if (is_err[ir_type.IrTypeId, str](ity_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](ity_r)); }
+    val i8: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ity_r);
+
+    val xr: Result[ir_type.IrTypeId, str] = index_type(ctx);
+    if (is_err[ir_type.IrTypeId, str](xr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](xr)); }
+    val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](xr);
+
+    val slot_r: Result[value.Value, str] = builder.emit_alloca(?ctx.builder, i8, value.const_int(1, xty));
+    if (is_err[value.Value, str](slot_r)) { ret slot_r; }
+    val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+
+    val lr: Result[value.Value, str] = lower_rvalue(ctx, e.data.binary.lhs);
+    if (is_err[value.Value, str](lr)) { ret lr; }
+    val lhs: value.Value = unwrap_ok[value.Value, str](lr);
+    val s0: Result[bool, str] = builder.emit_store(?ctx.builder, lhs, slot);
+    if (is_err[bool, str](s0)) { ret err[value.Value, str](unwrap_err[bool, str](s0)); }
+
+    val rhs_block_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](rhs_block_r)) { ret err[value.Value, str](unwrap_err[ir.BlockId, str](rhs_block_r)); }
+    val rhs_block: ir.BlockId = unwrap_ok[ir.BlockId, str](rhs_block_r);
+
+    val join_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](join_r)) { ret err[value.Value, str](unwrap_err[ir.BlockId, str](join_r)); }
+    val join: ir.BlockId = unwrap_ok[ir.BlockId, str](join_r);
+
+    var cbr: Result[bool, str] = ok[bool, str](true);
+    if (e.data.binary.op == aexpr.BIN_AND) {
+        cbr = builder.emit_cbr(?ctx.builder, lhs, rhs_block, join);
+    } or {
+        cbr = builder.emit_cbr(?ctx.builder, lhs, join, rhs_block);
+    }
+    if (is_err[bool, str](cbr)) { ret err[value.Value, str](unwrap_err[bool, str](cbr)); }
+
+    builder.set_block(?ctx.builder, rhs_block);
+    val rr: Result[value.Value, str] = lower_rvalue(ctx, e.data.binary.rhs);
+    if (is_err[value.Value, str](rr)) { ret rr; }
+    val s1: Result[bool, str] = builder.emit_store(?ctx.builder, unwrap_ok[value.Value, str](rr), slot);
+    if (is_err[bool, str](s1)) { ret err[value.Value, str](unwrap_err[bool, str](s1)); }
+    val b1: Result[bool, str] = builder.emit_br(?ctx.builder, join);
+    if (is_err[bool, str](b1)) { ret err[value.Value, str](unwrap_err[bool, str](b1)); }
+
+    builder.set_block(?ctx.builder, join);
+    ret builder.emit_load(?ctx.builder, slot, i8);
+}
+
+fun lower_unary(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val op: aexpr.UnOp = e.data.unary.op;
+
+    if (op == aexpr.UN_ADDR) {
+        ret lower_lvalue(ctx, e.data.unary.operand);
+    }
+    if (op == aexpr.UN_DEREF) {
+        val pr: Result[value.Value, str] = lower_rvalue(ctx, e.data.unary.operand);
+        if (is_err[value.Value, str](pr)) { ret pr; }
+        val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+        if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+        val ity: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+        # `@p` of aggregate type yields the pointer itself: an aggregate rvalue
+        # is its storage address, so the operand pointer already names it (the
+        # back end loads halves / passes it by reference at use sites).
+        if (is_aggregate_ir(ctx, ity)) { ret pr; }
+        ret builder.emit_load(?ctx.builder, unwrap_ok[value.Value, str](pr), ity);
+    }
+
+    val vr: Result[value.Value, str] = lower_rvalue(ctx, e.data.unary.operand);
+    if (is_err[value.Value, str](vr)) { ret vr; }
+    val v: value.Value = unwrap_ok[value.Value, str](vr);
+
+    if (op == aexpr.UN_NEG)     { ret builder.emit_neg(?ctx.builder, v); }
+    if (op == aexpr.UN_BIT_NOT) { ret builder.emit_not(?ctx.builder, v); }
+    if (op == aexpr.UN_NOT) {
+        # logical not: x == 0
+        ret builder.emit_cmp_eq(?ctx.builder, v, value.const_int(0, v.ty));
+    }
+
+    ret err[value.Value, str]("lower: unsupported unary operator");
+}
+
+# lowers a `::` cast to a single conversion instruction selected by the
+# source / target type pair. sema has already validated the cast; lowering
+# picks trunc/ext for integers, fp trunc/ext for floats, int<->float
+# conversions, and bitcast for same-size reinterpretation.
+fun lower_cast(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val vr: Result[value.Value, str] = lower_rvalue(ctx, e.data.cast.value);
+    if (is_err[value.Value, str](vr)) { ret vr; }
+    val v: value.Value = unwrap_ok[value.Value, str](vr);
+
+    val from_ty: ty.TypeId = lower.expr_type_of(ctx, e.data.cast.value);
+    val to_ty:   ty.TypeId = lower.type_resolved_of(ctx, e.data.cast.ty);
+
+    val dst_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, to_ty);
+    if (is_err[ir_type.IrTypeId, str](dst_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](dst_r)); }
+    val dst: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](dst_r);
+
+    val from_float:  bool = is_float_type(ctx, from_ty);
+    val to_float:    bool = is_float_type(ctx, to_ty);
+    val from_signed: bool = is_signed_type(ctx, from_ty);
+    val to_signed:   bool = is_signed_type(ctx, to_ty);
+    val from_bits:   u32 = scalar_bits(ctx, from_ty);
+    val to_bits:     u32 = scalar_bits(ctx, to_ty);
+
+    if (from_float && to_float) {
+        if (to_bits < from_bits) { ret builder.emit_fp_trunc(?ctx.builder, v, dst); }
+        if (to_bits > from_bits) { ret builder.emit_fp_ext(?ctx.builder, v, dst); }
+        ret builder.emit_bitcast(?ctx.builder, v, dst);
+    }
+    if (from_float && !to_float) {
+        if (to_signed) { ret builder.emit_fp_to_si(?ctx.builder, v, dst); }
+        ret builder.emit_fp_to_ui(?ctx.builder, v, dst);
+    }
+    if (!from_float && to_float) {
+        if (from_signed) { ret builder.emit_si_to_fp(?ctx.builder, v, dst); }
+        ret builder.emit_ui_to_fp(?ctx.builder, v, dst);
+    }
+
+    if (to_bits < from_bits) { ret builder.emit_trunc(?ctx.builder, v, dst); }
+    if (to_bits > from_bits) {
+        if (from_signed) { ret builder.emit_sext(?ctx.builder, v, dst); }
+        ret builder.emit_zext(?ctx.builder, v, dst);
+    }
+    ret builder.emit_bitcast(?ctx.builder, v, dst);
+}
+
+# a comptime identifier folds to the constant the comptime evaluator
+# produced, looked up by the identifier's interned name in the module's
+# comptime context.
+fun lower_comptime_ident(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), e.span);
+    if (is_err[intern.StrId, str](name_r)) { ret err[value.Value, str](unwrap_err[intern.StrId, str](name_r)); }
+    val nc: Option[*comptime.NamedConst] = comptime.lookup(ctx.ctx, unwrap_ok[intern.StrId, str](name_r));
+    if (is_none[*comptime.NamedConst](nc)) {
+        ret err[value.Value, str]("lower: comptime identifier not folded");
+    }
+    ret const_value_of(ctx, eid, unwrap[*comptime.NamedConst](nc).value);
+}
+
+# lowers an array literal into an alloca plus a per-element store through a
+# gep. the alloca slot pointer is the literal's value (an array rvalue is
+# its storage address; loads happen at use sites).
+fun lower_array_lit(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val arr_ty: ty.TypeId = lower.expr_type_of(ctx, eid);
+    val arr_ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, arr_ty);
+    if (is_err[ir_type.IrTypeId, str](arr_ir_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](arr_ir_r)); }
+    val arr_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](arr_ir_r);
+
+    val xr: Result[ir_type.IrTypeId, str] = index_type(ctx);
+    if (is_err[ir_type.IrTypeId, str](xr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](xr)); }
+    val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](xr);
+
+    val slot_r: Result[value.Value, str] = builder.emit_alloca(?ctx.builder, arr_ir, value.const_int(1, xty));
+    if (is_err[value.Value, str](slot_r)) { ret slot_r; }
+    val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+
+    var i: u32 = 0;
+    for (i < e.data.array_lit.elems_len) {
+        val pool_ix: u32 = e.data.array_lit.elems_start + i;
+        if (pool_ix::usize >= ctx.a.expr_id_len) {
+            ret err[value.Value, str]("lower: array literal element index out of range");
+        }
+        val elem_eid: aid.ExprId = ctx.a.expr_ids[pool_ix];
+        val evr: Result[value.Value, str] = lower_rvalue(ctx, elem_eid);
+        if (is_err[value.Value, str](evr)) { ret evr; }
+
+        var idx: [2]value.Value;
+        idx[0] = value.const_int(0, xty);
+        idx[1] = value.const_int(i::u64, xty);
+        val gr: Result[value.Value, str] = builder.emit_gep(?ctx.builder, slot, arr_ir, ?idx[0], 2);
+        if (is_err[value.Value, str](gr)) { ret gr; }
+        val sr: Result[bool, str] = builder.emit_store(?ctx.builder, unwrap_ok[value.Value, str](evr), unwrap_ok[value.Value, str](gr));
+        if (is_err[bool, str](sr)) { ret err[value.Value, str](unwrap_err[bool, str](sr)); }
+        i = i + 1;
+    }
+
+    ret ok[value.Value, str](slot);
+}
+
+# lowers a struct literal into an alloca plus a per-field store through a
+# gep. the alloca slot pointer is the literal's value.
+fun lower_struct_lit(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val rec_ty: ty.TypeId = lower.expr_type_of(ctx, eid);
+    val rec_ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, rec_ty);
+    if (is_err[ir_type.IrTypeId, str](rec_ir_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](rec_ir_r)); }
+    val rec_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](rec_ir_r);
+
+    val xr: Result[ir_type.IrTypeId, str] = index_type(ctx);
+    if (is_err[ir_type.IrTypeId, str](xr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](xr)); }
+    val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](xr);
+
+    val slot_r: Result[value.Value, str] = builder.emit_alloca(?ctx.builder, rec_ir, value.const_int(1, xty));
+    if (is_err[value.Value, str](slot_r)) { ret slot_r; }
+    val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+
+    var i: u32 = 0;
+    for (i < e.data.struct_lit.fields_len) {
+        val pool_ix: u32 = e.data.struct_lit.fields_start + i;
+        if (pool_ix::usize >= ctx.a.field_init_len) {
+            ret err[value.Value, str]("lower: struct literal field index out of range");
+        }
+        val fi: *aexpr.FieldInit = ?ctx.a.field_inits[pool_ix];
+        val field_ix: u32 = field_index_in_type(ctx, rec_ty, fi.name);
+        val evr: Result[value.Value, str] = lower_rvalue(ctx, fi.value);
+        if (is_err[value.Value, str](evr)) { ret evr; }
+
+        var idx: [2]value.Value;
+        idx[0] = value.const_int(0, xty);
+        idx[1] = value.const_int(field_ix::u64, xty);
+        val gr: Result[value.Value, str] = builder.emit_gep(?ctx.builder, slot, rec_ir, ?idx[0], 2);
+        if (is_err[value.Value, str](gr)) { ret gr; }
+        val sr: Result[bool, str] = builder.emit_store(?ctx.builder, unwrap_ok[value.Value, str](evr), unwrap_ok[value.Value, str](gr));
+        if (is_err[bool, str](sr)) { ret err[value.Value, str](unwrap_err[bool, str](sr)); }
+        i = i + 1;
+    }
+
+    ret ok[value.Value, str](slot);
+}
+
+# materialises a comptime CTValue as an IR constant Value at the expression's
+# IR type. used by COMPTIME_IDENT lowering and by the decl lowerer for
+# comptime-evaluable global initialisers.
+# ---
+# ctx: the context
+# eid: the expression whose IR type the constant takes
+# v:   the folded comptime value
+# ret: the corresponding constant Value, or an error
+pub fun const_value_of(ctx: *lower.LowerContext, eid: aid.ExprId, v: comptime.CTValue) Result[value.Value, str] {
+    val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    val ty_id: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+
+    if (v.kind == comptime.CT_KIND_INT) { ret ok[value.Value, str](value.const_int(v.data.i::u64, ty_id)); }
+    if (v.kind == comptime.CT_KIND_BOOL) {
+        var b: u64 = 0;
+        if (v.data.b) { b = 1; }
+        ret ok[value.Value, str](value.const_int(b, ty_id));
+    }
+    if (v.kind == comptime.CT_KIND_FLOAT) { ret ok[value.Value, str](value.const_float(v.data.f, ty_id)); }
+    if (v.kind == comptime.CT_KIND_STR) {
+        val txt: Option[str] = intern.lookup(?ctx.s.interner, v.data.s);
+        if (is_none[str](txt)) { ret err[value.Value, str]("lower: comptime string lookup failed"); }
+        val s: str = unwrap[str](txt);
+        ret ok[value.Value, str](value.const_bytes(s.data, str_len(s)::u32, ty_id));
+    }
+    ret err[value.Value, str]("lower: unsupported comptime value kind");
+}
+
+# returns the IR type of an expression by lowering its semantic type.
+fun ir_type_of_expr(ctx: *lower.LowerContext, eid: aid.ExprId) Result[ir_type.IrTypeId, str] {
+    ret lower.lower_type(ctx, lower.expr_type_of(ctx, eid));
+}
+
+# the IR integer type used for gep indices and alloca element counts (i64).
+fun index_type(ctx: *lower.LowerContext) Result[ir_type.IrTypeId, str] {
+    ret ir_type.intern_int(?ctx.m.types, 64);
+}
+
+# the module's source text, read from the session source map by the AST's
+# file id. an unregistered file id yields the empty string (a defensive
+# null, never reached for a well-formed pipeline since resolve already
+# required the file to be registered).
+fun module_source(ctx: *lower.LowerContext) str {
+    val sf: Option[*src.SourceFile] = src.get(?ctx.s.sources, ctx.a.file_id);
+    if (is_none[*src.SourceFile](sf)) {
+        var empty: str;
+        empty.len  = 0;
+        empty.data = nil;
+        ret empty;
+    }
+    ret unwrap[*src.SourceFile](sf).text;
+}
+
+# the bit width of a scalar semantic type (int/float/pointer), or 0 for
+# non-scalars.
+fun scalar_bits(ctx: *lower.LowerContext, tid: ty.TypeId) u32 {
+    val t_opt: Option[*ty.Type] = ty.get(?ctx.s.types, tid);
+    if (is_none[*ty.Type](t_opt)) { ret 0; }
+    val k: ty.TypeKind = unwrap[*ty.Type](t_opt).kind;
+    if (k == ty.TYPE_U8  || k == ty.TYPE_I8)  { ret 8; }
+    if (k == ty.TYPE_U16 || k == ty.TYPE_I16) { ret 16; }
+    if (k == ty.TYPE_U32 || k == ty.TYPE_I32 || k == ty.TYPE_F32) { ret 32; }
+    if (k == ty.TYPE_U64 || k == ty.TYPE_I64 || k == ty.TYPE_F64) { ret 64; }
+    if (k == ty.TYPE_PTR || k == ty.TYPE_POINTER) { ret ctx.tgt.arch.pointer_width * 8; }
+    ret 0;
+}
+
+# true when a semantic type is a signed integer.
+fun is_signed_type(ctx: *lower.LowerContext, tid: ty.TypeId) bool {
+    val t_opt: Option[*ty.Type] = ty.get(?ctx.s.types, tid);
+    if (is_none[*ty.Type](t_opt)) { ret false; }
+    val k: ty.TypeKind = unwrap[*ty.Type](t_opt).kind;
+    if (k == ty.TYPE_I8 || k == ty.TYPE_I16 || k == ty.TYPE_I32 || k == ty.TYPE_I64) { ret true; }
+    ret false;
+}
+
+# true when a semantic type is a float.
+fun is_float_type(ctx: *lower.LowerContext, tid: ty.TypeId) bool {
+    val t_opt: Option[*ty.Type] = ty.get(?ctx.s.types, tid);
+    if (is_none[*ty.Type](t_opt)) { ret false; }
+    val k: ty.TypeKind = unwrap[*ty.Type](t_opt).kind;
+    if (k == ty.TYPE_F32 || k == ty.TYPE_F64) { ret true; }
+    ret false;
+}
+
+# true when a semantic type is a pointer (raw ptr or typed pointer).
+fun is_pointer_type(ctx: *lower.LowerContext, tid: ty.TypeId) bool {
+    val t_opt: Option[*ty.Type] = ty.get(?ctx.s.types, tid);
+    if (is_none[*ty.Type](t_opt)) { ret false; }
+    val k: ty.TypeKind = unwrap[*ty.Type](t_opt).kind;
+    if (k == ty.TYPE_PTR || k == ty.TYPE_POINTER) { ret true; }
+    ret false;
+}
+
+# true when an IR type is an aggregate (a struct or array). aggregates flow
+# by address through lowering, not by loaded value: an aggregate rvalue is a
+# pointer to its storage, which the back end consumes for two-register / by-
+# reference argument passing and aggregate returns. classifies on the IR type
+# so the test matches the back end's `mir.value_is_aggregate` exactly.
+fun is_aggregate_ir(ctx: *lower.LowerContext, ity: ir_type.IrTypeId) bool {
+    val it: Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
+    if (is_none[*ir_type.IrType](it)) { ret false; }
+    val k: ir_type.IrTypeKind = unwrap[*ir_type.IrType](it).kind;
+    ret k == ir_type.IRT_STRUCT || k == ir_type.IRT_ARRAY;
+}
+
+# resolves a member name to a field index within a nominal semantic type by
+# matching the interned member name against each field's interned name in
+# the declaration's typed-name list. returns 0 when the layout is not
+# recoverable (an upstream sema error already reported it).
+fun field_index_in_type(ctx: *lower.LowerContext, rec_ty: ty.TypeId, name: token.Span) u32 {
+    val t_opt: Option[*ty.Type] = ty.get(?ctx.s.types, rec_ty);
+    if (is_none[*ty.Type](t_opt)) { ret 0; }
+    val t: *ty.Type = unwrap[*ty.Type](t_opt);
+    if (t.kind != ty.TYPE_REC && t.kind != ty.TYPE_UNI) { ret 0; }
+
+    val d_opt: Option[*adecl.Decl] = ast.get_decl(ctx.a, t.data.nominal.decl);
+    if (is_none[*adecl.Decl](d_opt)) { ret 0; }
+    val d: *adecl.Decl = unwrap[*adecl.Decl](d_opt);
+
+    var fields_start: u32 = 0;
+    var fields_len:   u32 = 0;
+    if (d.kind == adecl.DECL_KIND_REC) {
+        fields_start = d.data.rec_.fields_start;
+        fields_len   = d.data.rec_.fields_len;
+    } or (d.kind == adecl.DECL_KIND_UNI) {
+        fields_start = d.data.uni_.fields_start;
+        fields_len   = d.data.uni_.fields_len;
+    } or {
+        ret 0;
+    }
+
+    val src_text: str = module_source(ctx);
+    val want_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, src_text, name);
+    if (is_err[intern.StrId, str](want_r)) { ret 0; }
+    val want: intern.StrId = unwrap_ok[intern.StrId, str](want_r);
+
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val pool_ix: u32 = fields_start + i;
+        if (pool_ix::usize < ctx.a.typed_name_len) {
+            val tn: *adecl.TypedName = ?ctx.a.typed_names[pool_ix];
+            val fr: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, src_text, tn.name);
+            if (is_ok[intern.StrId, str](fr)) {
+                if (unwrap_ok[intern.StrId, str](fr) == want) { ret i; }
+            }
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# finds the module function index whose interned name matches `name`, or none.
+fun find_function(ctx: *lower.LowerContext, name: intern.StrId) Option[u32] {
+    var i: u32 = 0;
+    for (i < ctx.m.function_len) {
+        if (ctx.m.functions[i].name == name) { ret some[u32](i); }
+        i = i + 1;
+    }
+    ret none[u32]();
+}
+
+# finds the module global index whose interned name matches `name`, or none.
+fun find_global(ctx: *lower.LowerContext, name: intern.StrId) Option[u32] {
+    var i: u32 = 0;
+    for (i < ctx.m.global_len) {
+        if (ctx.m.globals[i].name == name) { ret some[u32](i); }
+        i = i + 1;
+    }
+    ret none[u32]();
+}

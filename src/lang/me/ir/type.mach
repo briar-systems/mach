@@ -1,0 +1,520 @@
+# mach.lang.me.ir.type: machine-oriented IR type system.
+#
+# This is the type universe the IR runs
+# on, a deliberately small subset of `lang.type`: all generics, comptime
+# constructs, instances, and aliases are resolved away during lowering, so
+# only concrete machine shapes survive here. An `IrTypeTable` interns every
+# `IrType` structurally and hands out stable, module-local `IrTypeId`
+# handles; two `IrTypeId`s are equal iff they denote structurally identical
+# types.
+#
+# Notable modelling decisions (per the IR contract):
+#   - There is NO 1-bit boolean type. Comparison instructions produce an
+#     8-bit `IRT_INT`; the consuming instruction carries any signedness.
+#   - Pointers are untyped with respect to mutability and pointee; a pointer
+#     is just a machine word whose width comes from the target.
+#   - Integer width is stored in bits on the `IRT_INT` payload; float width
+#     likewise on `IRT_FLOAT`.
+#
+# `size_of` / `align_of` are target-aware: pointer size and alignment are
+# read from the target ISA's `pointer_width`. Aggregate layout follows the
+# natural C-style rule (each field aligned to its own alignment, struct
+# alignment is the max field alignment, total size rounded up to that).
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use map:   std.collections.map;
+use fnv1a: std.crypto.hash.fnv1a;
+
+use target: mach.lang.target;
+
+# stable, module-local handle into an IrTypeTable; valid for the table's lifetime.
+pub def IrTypeId: u32;
+
+# sentinel "no IR type"; never a valid index. NEVER treat as a default.
+pub val IRT_NIL: IrTypeId = 0xFFFFFFFF;
+
+# discriminator for IrType.data.
+pub def IrTypeKind: u8;
+
+# the empty type; size 0, alignment 1. result type of terminators and stores.
+pub val IRT_VOID:   IrTypeKind = 0;
+# a machine integer of `bits` width (8/16/32/64). signedness is on the
+# consuming instruction, never on the type. comparisons yield an 8-bit IRT_INT.
+pub val IRT_INT:    IrTypeKind = 1;
+# a machine float of `bits` width (32 or 64).
+pub val IRT_FLOAT:  IrTypeKind = 2;
+# an untyped machine pointer; width comes from the target ISA.
+pub val IRT_PTR:    IrTypeKind = 3;
+# a fixed-length array of `count` elements of `element`.
+pub val IRT_ARRAY:  IrTypeKind = 4;
+# an aggregate with an ordered list of field types.
+pub val IRT_STRUCT: IrTypeKind = 5;
+# a function type: return type plus parameter types and a varargs flag.
+pub val IRT_FN:     IrTypeKind = 6;
+
+# struct payload: an ordered list of field types stored inline.
+# ---
+# fields:      pointer to a contiguous array of field IrTypeIds (owned)
+# field_count: number of fields
+pub rec IrTypeStruct {
+    fields:      *IrTypeId;
+    field_count: u32;
+}
+
+# function-type payload.
+# ---
+# ret:         return IrTypeId (IRT_VOID for no return value)
+# params:      pointer to a contiguous array of parameter IrTypeIds (owned)
+# param_count: number of fixed parameters
+# varargs:     true when the function accepts variadic arguments
+pub rec IrTypeFn {
+    ret:         IrTypeId;
+    params:      *IrTypeId;
+    param_count: u32;
+    varargs:     bool;
+}
+
+# one entry in the IR type universe.
+# ---
+# kind: which IRT_* variant is active
+# data: kind-specific payload. IRT_VOID/IRT_PTR carry no meaningful payload;
+#       IRT_INT/IRT_FLOAT use `bits`; IRT_ARRAY uses `element` and reads its
+#       length from the table's parallel `counts` array; IRT_STRUCT/IRT_FN
+#       use their respective sub-records.
+pub rec IrType {
+    kind: IrTypeKind;
+    data: uni {
+        bits:    u32;
+        element: IrTypeId;
+        struct_: IrTypeStruct;
+        fn:      IrTypeFn;
+    };
+}
+
+# structurally-interning table for one IR module's type universe.
+# ---
+# alloc:  allocator backing the type array, owned field/param sub-arrays, and dedup map
+# types:  universe of IrType records indexed by IrTypeId
+# len:    number of types stored
+# cap:    allocated slots in types
+# counts: parallel array of array element counts, indexed by IrTypeId
+#         (meaningful only for IRT_ARRAY entries; 0 elsewhere)
+# dedup:  IrType -> IrTypeId map for structural identity
+pub rec IrTypeTable {
+    alloc: *Allocator;
+
+    types: *IrType;
+    len:   u32;
+    cap:   u32;
+
+    counts: *u32;
+
+    dedup: map.Map[IrType, IrTypeId];
+}
+
+val INITIAL_TYPE_CAP: u32 = 32;
+
+# constructs an empty IR type table.
+# ---
+# alloc: allocator used for all owned storage
+# ret:   a populated IrTypeTable, or an allocation error
+pub fun init(alloc: *Allocator) Result[IrTypeTable, str] {
+    var t: IrTypeTable;
+    t.alloc  = alloc;
+    t.types  = nil;
+    t.len    = 0;
+    t.cap    = 0;
+    t.counts = nil;
+    t.dedup  = map.init[IrType, IrTypeId](alloc, hash_ir_type, eq_ir_type);
+
+    val rt: Result[*IrType, str] = allocate[IrType](alloc, INITIAL_TYPE_CAP::usize);
+    if (is_err[*IrType, str](rt)) {
+        map.dnit[IrType, IrTypeId](?t.dedup);
+        ret err[IrTypeTable, str](unwrap_err[*IrType, str](rt));
+    }
+    t.types = unwrap_ok[*IrType, str](rt);
+    t.cap   = INITIAL_TYPE_CAP;
+
+    val rc: Result[*u32, str] = allocate[u32](alloc, INITIAL_TYPE_CAP::usize);
+    if (is_err[*u32, str](rc)) {
+        deallocate[IrType](alloc, t.types, t.cap::usize);
+        map.dnit[IrType, IrTypeId](?t.dedup);
+        ret err[IrTypeTable, str](unwrap_err[*u32, str](rc));
+    }
+    t.counts = unwrap_ok[*u32, str](rc);
+
+    ret ok[IrTypeTable, str](t);
+}
+
+# releases every owned array and the dedup map.
+# ---
+# t: the table to tear down; all fields are zeroed
+pub fun dnit(t: *IrTypeTable) {
+    if (t == nil) { ret; }
+    var i: u32 = 0;
+    for (i < t.len) {
+        free_payload(t, ?t.types[i]);
+        i = i + 1;
+    }
+    if (t.types != nil && t.cap > 0) {
+        deallocate[IrType](t.alloc, t.types, t.cap::usize);
+    }
+    if (t.counts != nil && t.cap > 0) {
+        deallocate[u32](t.alloc, t.counts, t.cap::usize);
+    }
+    map.dnit[IrType, IrTypeId](?t.dedup);
+    t.types  = nil;
+    t.len    = 0;
+    t.cap    = 0;
+    t.counts = nil;
+}
+
+# interns the void type.
+# ---
+# t:   the table
+# ret: the IrTypeId for void, or an allocation error
+pub fun intern_void(t: *IrTypeTable) Result[IrTypeId, str] {
+    var ir: IrType;
+    ir.kind = IRT_VOID;
+    ir.data.bits = 0;
+    ret intern_scalar(t, ir);
+}
+
+# interns a machine integer of the given bit width.
+# ---
+# t:    the table
+# bits: integer width in bits (8/16/32/64)
+# ret:  the IrTypeId for the integer type, or an allocation error
+pub fun intern_int(t: *IrTypeTable, bits: u32) Result[IrTypeId, str] {
+    var ir: IrType;
+    ir.kind = IRT_INT;
+    ir.data.bits = bits;
+    ret intern_scalar(t, ir);
+}
+
+# interns a machine float of the given bit width.
+# ---
+# t:    the table
+# bits: float width in bits (32 or 64)
+# ret:  the IrTypeId for the float type, or an allocation error
+pub fun intern_float(t: *IrTypeTable, bits: u32) Result[IrTypeId, str] {
+    var ir: IrType;
+    ir.kind = IRT_FLOAT;
+    ir.data.bits = bits;
+    ret intern_scalar(t, ir);
+}
+
+# interns the untyped machine pointer type.
+# ---
+# t:   the table
+# ret: the IrTypeId for a pointer, or an allocation error
+pub fun intern_ptr(t: *IrTypeTable) Result[IrTypeId, str] {
+    var ir: IrType;
+    ir.kind = IRT_PTR;
+    ir.data.bits = 0;
+    ret intern_scalar(t, ir);
+}
+
+# interns a fixed-length array type.
+# ---
+# t:       the table
+# element: element IrTypeId
+# count:   number of elements
+# ret:     the IrTypeId for [count]element, or an allocation error
+pub fun intern_array(t: *IrTypeTable, element: IrTypeId, count: u32) Result[IrTypeId, str] {
+    var i: u32 = 0;
+    for (i < t.len) {
+        val ex: *IrType = ?t.types[i];
+        if (ex.kind == IRT_ARRAY && ex.data.element == element && t.counts[i] == count) {
+            ret ok[IrTypeId, str](i);
+        }
+        i = i + 1;
+    }
+    var ir: IrType;
+    ir.kind = IRT_ARRAY;
+    ir.data.element = element;
+    ret append_with_count(t, ir, count);
+}
+
+# interns a struct type. the field list is copied into table-owned storage.
+# structurally deduplicated against existing struct entries.
+# ---
+# t:           the table
+# fields:      pointer to a contiguous array of field IrTypeIds
+# field_count: number of fields
+# ret:         the IrTypeId for the struct, or an allocation error
+pub fun intern_struct(t: *IrTypeTable, fields: *IrTypeId, field_count: u32) Result[IrTypeId, str] {
+    var i: u32 = 0;
+    for (i < t.len) {
+        val ex: *IrType = ?t.types[i];
+        if (ex.kind == IRT_STRUCT && ex.data.struct_.field_count == field_count) {
+            if (id_seq_equals(ex.data.struct_.fields, fields, field_count)) {
+                ret ok[IrTypeId, str](i);
+            }
+        }
+        i = i + 1;
+    }
+    val owned: Result[*IrTypeId, str] = dup_ids(t.alloc, fields, field_count);
+    if (is_err[*IrTypeId, str](owned)) {
+        ret err[IrTypeId, str](unwrap_err[*IrTypeId, str](owned));
+    }
+    var ir: IrType;
+    ir.kind = IRT_STRUCT;
+    ir.data.struct_.fields      = unwrap_ok[*IrTypeId, str](owned);
+    ir.data.struct_.field_count = field_count;
+    val ap: Result[IrTypeId, str] = append_with_count(t, ir, 0);
+    if (is_err[IrTypeId, str](ap)) {
+        deallocate[IrTypeId](t.alloc, ir.data.struct_.fields, field_count::usize);
+    }
+    ret ap;
+}
+
+# interns a function type. the parameter list is copied into table-owned
+# storage. structurally deduplicated against existing function entries.
+# ---
+# t:           the table
+# ret_ty:      return IrTypeId
+# params:      pointer to a contiguous array of parameter IrTypeIds
+# param_count: number of fixed parameters
+# varargs:     true if the function is variadic
+# ret:         the IrTypeId for the function type, or an allocation error
+pub fun intern_fn(t: *IrTypeTable, ret_ty: IrTypeId, params: *IrTypeId, param_count: u32, varargs: bool) Result[IrTypeId, str] {
+    var i: u32 = 0;
+    for (i < t.len) {
+        val ex: *IrType = ?t.types[i];
+        if (ex.kind == IRT_FN
+            && ex.data.fn.ret == ret_ty
+            && ex.data.fn.param_count == param_count
+            && ex.data.fn.varargs == varargs) {
+            if (id_seq_equals(ex.data.fn.params, params, param_count)) {
+                ret ok[IrTypeId, str](i);
+            }
+        }
+        i = i + 1;
+    }
+    val owned: Result[*IrTypeId, str] = dup_ids(t.alloc, params, param_count);
+    if (is_err[*IrTypeId, str](owned)) {
+        ret err[IrTypeId, str](unwrap_err[*IrTypeId, str](owned));
+    }
+    var ir: IrType;
+    ir.kind = IRT_FN;
+    ir.data.fn.ret         = ret_ty;
+    ir.data.fn.params      = unwrap_ok[*IrTypeId, str](owned);
+    ir.data.fn.param_count = param_count;
+    ir.data.fn.varargs     = varargs;
+    val ap: Result[IrTypeId, str] = append_with_count(t, ir, 0);
+    if (is_err[IrTypeId, str](ap)) {
+        deallocate[IrTypeId](t.alloc, ir.data.fn.params, param_count::usize);
+    }
+    ret ap;
+}
+
+# returns a pointer to the IrType for a given IrTypeId, or none when id is
+# out of range.
+# ---
+# t:   the table
+# id:  IrTypeId returned by a previous intern call
+# ret: some(*IrType) into t.types (invalidated by a later intern that grows the array), or none
+pub fun get(t: *IrTypeTable, id: IrTypeId) Option[*IrType] {
+    if (id >= t.len) { ret none[*IrType](); }
+    ret some[*IrType](?t.types[id]);
+}
+
+# returns the element count for an IRT_ARRAY type, or 0 for any other kind
+# or an out-of-range id.
+# ---
+# t:   the table
+# id:  IrTypeId of an array type
+# ret: the array length, or 0
+pub fun array_count(t: *IrTypeTable, id: IrTypeId) u32 {
+    if (id >= t.len) { ret 0; }
+    ret t.counts[id];
+}
+
+# returns the size in bytes of an IR type for the given target.
+# pointer size is taken from `tgt.arch.pointer_width`. aggregates use
+# natural C-style layout. out-of-range ids and IRT_FN/IRT_VOID return 0.
+# ---
+# t:   the table
+# id:  IrTypeId to measure
+# tgt: resolved compilation target supplying pointer width via its ISA
+# ret: size in bytes
+pub fun size_of(t: *IrTypeTable, id: IrTypeId, tgt: *target.Target) u32 {
+    if (id >= t.len) { ret 0; }
+    val ir: *IrType = ?t.types[id];
+    if (ir.kind == IRT_VOID) { ret 0; }
+    if (ir.kind == IRT_INT)  { ret bits_to_bytes(ir.data.bits); }
+    if (ir.kind == IRT_FLOAT){ ret bits_to_bytes(ir.data.bits); }
+    if (ir.kind == IRT_PTR)  { ret tgt.arch.pointer_width; }
+    if (ir.kind == IRT_ARRAY) {
+        ret size_of(t, ir.data.element, tgt) * t.counts[id];
+    }
+    if (ir.kind == IRT_STRUCT) {
+        var off:   u32 = 0;
+        var align: u32 = 1;
+        var i:     u32 = 0;
+        for (i < ir.data.struct_.field_count) {
+            val fid: IrTypeId = ir.data.struct_.fields[i];
+            val fa:  u32 = align_of(t, fid, tgt);
+            val fs:  u32 = size_of(t, fid, tgt);
+            off = round_up(off, fa);
+            off = off + fs;
+            if (fa > align) { align = fa; }
+            i = i + 1;
+        }
+        ret round_up(off, align);
+    }
+    # IRT_FN has no storage size
+    ret 0;
+}
+
+# returns the alignment in bytes of an IR type for the given target.
+# pointer alignment equals pointer width. struct alignment is the max of
+# its field alignments (1 for an empty struct). out-of-range ids and
+# IRT_FN/IRT_VOID return 1.
+# ---
+# t:   the table
+# id:  IrTypeId to measure
+# tgt: resolved compilation target supplying pointer width via its ISA
+# ret: alignment in bytes (always >= 1)
+pub fun align_of(t: *IrTypeTable, id: IrTypeId, tgt: *target.Target) u32 {
+    if (id >= t.len) { ret 1; }
+    val ir: *IrType = ?t.types[id];
+    if (ir.kind == IRT_INT)   { ret bits_to_bytes(ir.data.bits); }
+    if (ir.kind == IRT_FLOAT) { ret bits_to_bytes(ir.data.bits); }
+    if (ir.kind == IRT_PTR)   { ret tgt.arch.pointer_width; }
+    if (ir.kind == IRT_ARRAY) { ret align_of(t, ir.data.element, tgt); }
+    if (ir.kind == IRT_STRUCT) {
+        var align: u32 = 1;
+        var i:     u32 = 0;
+        for (i < ir.data.struct_.field_count) {
+            val fa: u32 = align_of(t, ir.data.struct_.fields[i], tgt);
+            if (fa > align) { align = fa; }
+            i = i + 1;
+        }
+        ret align;
+    }
+    ret 1;
+}
+
+# scalar (no owned payload) interning path with dedup map.
+fun intern_scalar(t: *IrTypeTable, ir: IrType) Result[IrTypeId, str] {
+    val cached: Result[*IrTypeId, str] = map.get[IrType, IrTypeId](?t.dedup, ?ir);
+    if (is_ok[*IrTypeId, str](cached)) {
+        ret ok[IrTypeId, str](@unwrap_ok[*IrTypeId, str](cached));
+    }
+    val ap: Result[IrTypeId, str] = append_with_count(t, ir, 0);
+    if (is_err[IrTypeId, str](ap)) { ret ap; }
+    val tid: IrTypeId = unwrap_ok[IrTypeId, str](ap);
+    val ins: Result[bool, str] = map.insert[IrType, IrTypeId](?t.dedup, ir, tid);
+    if (is_err[bool, str](ins)) { ret err[IrTypeId, str](unwrap_err[bool, str](ins)); }
+    ret ok[IrTypeId, str](tid);
+}
+
+# appends a type record plus its parallel array-count slot, growing both.
+fun append_with_count(t: *IrTypeTable, ir: IrType, count: u32) Result[IrTypeId, str] {
+    if (t.len == t.cap) {
+        val new_cap: u32 = t.cap * 2;
+        val rt: Result[*IrType, str] = reallocate[IrType](t.alloc, t.types, t.cap::usize, new_cap::usize);
+        if (is_err[*IrType, str](rt)) { ret err[IrTypeId, str](unwrap_err[*IrType, str](rt)); }
+        t.types = unwrap_ok[*IrType, str](rt);
+        val rc: Result[*u32, str] = reallocate[u32](t.alloc, t.counts, t.cap::usize, new_cap::usize);
+        if (is_err[*u32, str](rc)) { ret err[IrTypeId, str](unwrap_err[*u32, str](rc)); }
+        t.counts = unwrap_ok[*u32, str](rc);
+        t.cap = new_cap;
+    }
+    val tid: IrTypeId = t.len;
+    t.types[t.len]  = ir;
+    t.counts[t.len] = count;
+    t.len = t.len + 1;
+    ret ok[IrTypeId, str](tid);
+}
+
+# copies `count` IrTypeIds into a fresh owned buffer (nil when count==0).
+fun dup_ids(alloc: *Allocator, src: *IrTypeId, count: u32) Result[*IrTypeId, str] {
+    if (count == 0) { ret ok[*IrTypeId, str](nil); }
+    val r: Result[*IrTypeId, str] = allocate[IrTypeId](alloc, count::usize);
+    if (is_err[*IrTypeId, str](r)) { ret r; }
+    val buf: *IrTypeId = unwrap_ok[*IrTypeId, str](r);
+    var i: u32 = 0;
+    for (i < count) {
+        buf[i] = src[i];
+        i = i + 1;
+    }
+    ret ok[*IrTypeId, str](buf);
+}
+
+# frees the owned field/param array of an aggregate or function type.
+fun free_payload(t: *IrTypeTable, ir: *IrType) {
+    if (ir.kind == IRT_STRUCT && ir.data.struct_.fields != nil) {
+        deallocate[IrTypeId](t.alloc, ir.data.struct_.fields, ir.data.struct_.field_count::usize);
+    }
+    or (ir.kind == IRT_FN && ir.data.fn.params != nil) {
+        deallocate[IrTypeId](t.alloc, ir.data.fn.params, ir.data.fn.param_count::usize);
+    }
+}
+
+# true when two IrTypeId sequences of length `n` are element-wise equal.
+fun id_seq_equals(a: *IrTypeId, b: *IrTypeId, n: u32) bool {
+    var i: u32 = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun round_up(value: u32, align: u32) u32 {
+    if (align <= 1) { ret value; }
+    val rem: u32 = value % align;
+    if (rem == 0) { ret value; }
+    ret value + (align - rem);
+}
+
+fun bits_to_bytes(bits: u32) u32 {
+    ret (bits + 7) / 8;
+}
+
+# structural FNV-1a hash over an IrType. only the scalar kinds reach the
+# dedup map (aggregates/functions linear-scan), so payload pointers are
+# never hashed.
+fun hash_ir_type(p: ptr) u64 {
+    val ir: *IrType = p::*IrType;
+    var h: u64 = fnv1a.init();
+    h = fnv1a.step_u8(h, ir.kind::u8);
+    if (ir.kind == IRT_INT || ir.kind == IRT_FLOAT) {
+        h = fnv1a.step_u32(h, ir.data.bits);
+    }
+    ret h;
+}
+
+fun eq_ir_type(pa: ptr, pb: ptr) bool {
+    val a: *IrType = pa::*IrType;
+    val b: *IrType = pb::*IrType;
+    if (a.kind != b.kind) { ret false; }
+    if (a.kind == IRT_INT || a.kind == IRT_FLOAT) {
+        ret a.data.bits == b.data.bits;
+    }
+    # IRT_VOID and IRT_PTR are equal by kind alone
+    ret true;
+}

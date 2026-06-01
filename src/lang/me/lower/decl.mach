@@ -1,0 +1,467 @@
+# mach.lang.me.lower.decl: per-declaration lowering.
+#
+# Dispatched from `lower.lower_module` over a
+# module's top-level decl list. Functions become IR `Function`s, module-
+# level bindings become `Global`s, and the erased decl forms (records,
+# aliases, imports, comptime attributes) lower to nothing.
+#
+# A function is lowered by interning its IR signature, appending a fresh
+# `Function` to the module, materialising one `VAL_PARAM` per parameter and
+# spilling each into an alloca slot (so parameters are uniform mutable
+# lvalues that mem2reg later promotes), then lowering the body. A function
+# that falls through its body gets a default terminator: `ret` of a zero of
+# its return type, or `unreachable` when it is `noreturn`.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use map: std.collections.map;
+
+use intern:   mach.lang.intern;
+use ty:       mach.lang.type;
+
+use src:      mach.lang.source;
+use ast:      mach.lang.fe.ast;
+use aid:      mach.lang.fe.ast.id;
+use adecl:    mach.lang.fe.ast.decl;
+use resolve:  mach.lang.fe.resolve;
+use comptime: mach.lang.fe.comptime;
+
+use ir:       mach.lang.me.ir;
+use ir_type:  mach.lang.me.ir.type;
+use value:    mach.lang.me.ir.value;
+use builder:  mach.lang.me.ir.builder;
+
+use lower: mach.lang.me.lower;
+use stmt:  mach.lang.me.lower.stmt;
+use expr:  mach.lang.me.lower.expr;
+
+# lowers one top-level declaration, dispatching on its `DeclKind`.
+# erased forms (rec, uni, def, use, comptime-attr) lower to nothing; a
+# comptime-if walks only its active arm.
+# ---
+# ctx: per-module lowering context
+# did: AST DeclId to lower
+# ret: true on success, or an error
+pub fun lower_decl(ctx: *lower.LowerContext, did: aid.DeclId) Result[bool, str] {
+    val d_opt: Option[*adecl.Decl] = ast.get_decl(ctx.a, did);
+    if (is_none[*adecl.Decl](d_opt)) {
+        ret err[bool, str]("lower: declaration id out of range");
+    }
+    val d: *adecl.Decl = unwrap[*adecl.Decl](d_opt);
+    val k: adecl.DeclKind = d.kind;
+
+    if (k == adecl.DECL_KIND_FUN)  { ret lower_fun(ctx, did, d, false); }
+    if (k == adecl.DECL_KIND_TEST) { ret lower_test(ctx, did, d); }
+    if (k == adecl.DECL_KIND_VAL)  { ret lower_global(ctx, did, d, false); }
+    if (k == adecl.DECL_KIND_VAR)  { ret lower_global(ctx, did, d, true); }
+    if (k == adecl.DECL_KIND_COMPTIME_IF) { ret lower_comptime_if(ctx, d); }
+
+    # an error decl must never reach lowering: the driver aborts on accumulated
+    # diagnostics before the middle end runs, so an error node here is a
+    # coherence violation, not a no-IR decl.
+    if (k == adecl.DECL_KIND_ERROR) {
+        ret err[bool, str]("lower: error declaration reached the middle end");
+    }
+
+    # rec / uni / def / use / fwd / comptime-attr: type-level or re-export decls
+    # that produce no IR.
+    ret ok[bool, str](true);
+}
+
+# lowers a `fun` declaration into an IR function. external functions (no
+# body) are emitted as a signature-only Function tagged FN_FLAG_EXTERN.
+# ---
+# ctx:     the context
+# did:     the function's DeclId
+# d:       the resolved Decl
+# is_test: true when lowering a `test` decl through the function path
+# ret:     true on success, or an error
+pub fun lower_fun(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, is_test: bool) Result[bool, str] {
+    val sig_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, lower.decl_type_of(ctx, did));
+    if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
+    val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
+
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), d.data.fun_.name);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+    val name: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    var flags: u32 = 0;
+    if ((d.flags & adecl.DECL_FLAG_PUB) != 0) { flags = flags | ir.FN_FLAG_PUB; }
+    if ((d.flags & adecl.DECL_FLAG_EXT) != 0 || d.data.fun_.body == aid.STMT_NIL) {
+        flags = flags | ir.FN_FLAG_EXTERN;
+    }
+    if (is_test) { flags = flags | ir.FN_FLAG_TEST; }
+
+    val ret_ir_r: Result[ir_type.IrTypeId, str] = function_return_ir(ctx, did);
+    if (is_err[ir_type.IrTypeId, str](ret_ir_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](ret_ir_r)); }
+    val ret_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ret_ir_r);
+
+    val idx_r: Result[u32, str] = append_function(ctx, name, sig, flags, d.data.fun_.params_len);
+    if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
+    val fn_index: u32 = unwrap_ok[u32, str](idx_r);
+
+    # external functions carry no body
+    if ((flags & ir.FN_FLAG_EXTERN) != 0) {
+        ret ok[bool, str](true);
+    }
+
+    lower.begin_function(ctx, fn_index, ret_ir);
+    builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
+
+    val entry_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](entry_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](entry_r)); }
+    builder.set_block(?ctx.builder, unwrap_ok[ir.BlockId, str](entry_r));
+
+    val params_r: Result[bool, str] = lower_params(ctx, did, d, fn_index);
+    if (is_err[bool, str](params_r)) { ret params_r; }
+
+    if (d.data.fun_.body != aid.STMT_NIL) {
+        val br: Result[bool, str] = stmt.lower_stmt(ctx, d.data.fun_.body);
+        if (is_err[bool, str](br)) { ret br; }
+    }
+
+    ret close_function(ctx, ret_ir);
+}
+
+# lowers a `test "label" { ... }` decl as a zero-parameter, void-returning
+# function tagged FN_FLAG_TEST so the test runner can iterate it.
+fun lower_test(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl) Result[bool, str] {
+    val void_r: Result[ir_type.IrTypeId, str] = ir_type.intern_void(?ctx.m.types);
+    if (is_err[ir_type.IrTypeId, str](void_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](void_r)); }
+    val void_ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](void_r);
+
+    val sig_r: Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?ctx.m.types, void_ty, nil, 0, false);
+    if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
+    val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
+
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), d.data.test_.label);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+    val name: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    val idx_r: Result[u32, str] = append_function(ctx, name, sig, ir.FN_FLAG_TEST, 0);
+    if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
+    val fn_index: u32 = unwrap_ok[u32, str](idx_r);
+
+    lower.begin_function(ctx, fn_index, void_ty);
+    builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
+
+    val entry_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](entry_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](entry_r)); }
+    builder.set_block(?ctx.builder, unwrap_ok[ir.BlockId, str](entry_r));
+
+    if (d.data.test_.body != aid.STMT_NIL) {
+        val br: Result[bool, str] = stmt.lower_stmt(ctx, d.data.test_.body);
+        if (is_err[bool, str](br)) { ret br; }
+    }
+
+    ret close_function(ctx, void_ty);
+}
+
+# materialises one VAL_PARAM per parameter, records them on Function.params,
+# spills each into an alloca slot, and binds the parameter's SymbolId to its
+# slot so the body reads / writes it through load / store.
+fun lower_params(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, fn_index: u32) Result[bool, str] {
+    val count: u32 = d.data.fun_.params_len;
+
+    val pr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+    if (is_err[ir_type.IrTypeId, str](pr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](pr)); }
+    val ity: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](pr);
+
+    val cr: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?ctx.m.types, 64);
+    if (is_err[ir_type.IrTypeId, str](cr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](cr)); }
+    val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](cr);
+
+    var params: *value.Value = nil;
+    if (count > 0) {
+        val ar: Result[*value.Value, str] = allocate[value.Value](ctx.s.alloc, count::usize);
+        if (is_err[*value.Value, str](ar)) { ret err[bool, str](unwrap_err[*value.Value, str](ar)); }
+        params = unwrap_ok[*value.Value, str](ar);
+    }
+
+    var i: u32 = 0;
+    for (i < count) {
+        val pool_ix: u32 = d.data.fun_.params_start + i;
+        var p_ir: ir_type.IrTypeId = ity;
+        if (pool_ix::usize < ctx.a.typed_name_len) {
+            val tn: *adecl.TypedName = ?ctx.a.typed_names[pool_ix];
+            val tr: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, lower.type_resolved_of(ctx, tn.ty));
+            if (is_err[ir_type.IrTypeId, str](tr)) {
+                if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, count::usize); }
+                ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](tr));
+            }
+            p_ir = unwrap_ok[ir_type.IrTypeId, str](tr);
+        }
+        val pval: value.Value = value.param_value(i, p_ir);
+        params[i] = pval;
+
+        # spill the param into an alloca so it is a uniform mutable lvalue
+        val slot_r: Result[value.Value, str] = builder.emit_alloca(?ctx.builder, p_ir, value.const_int(1, xty));
+        if (is_err[value.Value, str](slot_r)) {
+            if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, count::usize); }
+            ret err[bool, str](unwrap_err[value.Value, str](slot_r));
+        }
+        val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+        val sr: Result[bool, str] = builder.emit_store(?ctx.builder, pval, slot);
+        if (is_err[bool, str](sr)) {
+            if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, count::usize); }
+            ret sr;
+        }
+
+        val sid: resolve.SymbolId = param_symbol(ctx, did, i);
+        if (sid != resolve.SYMBOL_NIL) {
+            val bind_r: Result[bool, str] = lower.bind_local(ctx, sid, slot);
+            if (is_err[bool, str](bind_r)) {
+                if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, count::usize); }
+                ret bind_r;
+            }
+        }
+        i = i + 1;
+    }
+
+    ctx.m.functions[fn_index].params      = params;
+    ctx.m.functions[fn_index].param_count = count;
+    ret ok[bool, str](true);
+}
+
+# finalises a function body: if the current block has no terminator, replay
+# the pending fins and emit a default terminator (void / zero return for an
+# ordinary function, unreachable for a noreturn one).
+fun close_function(ctx: *lower.LowerContext, ret_ir: ir_type.IrTypeId) Result[bool, str] {
+    if (block_terminated(ctx)) { ret ok[bool, str](true); }
+
+    val fr: Result[bool, str] = stmt.run_pending_fins(ctx);
+    if (is_err[bool, str](fr)) { ret fr; }
+    if (block_terminated(ctx)) { ret ok[bool, str](true); }
+
+    if ((ctx.m.functions[ctx.fn_index].flags & ir.FN_FLAG_NORETURN) != 0) {
+        ret builder.emit_unreachable(?ctx.builder);
+    }
+    if (is_void_ir(ctx, ret_ir)) {
+        ret builder.emit_ret_void(?ctx.builder);
+    }
+    ret builder.emit_ret(?ctx.builder, value.const_int(0, ret_ir));
+}
+
+# lowers a module-level `val` / `var` into an IR `Global`. a comptime-
+# evaluable initialiser becomes a constant `Value`; a non-comptime
+# initialiser is emitted as logic into the module's lazily created init
+# function, with the global holding a zero placeholder until then.
+# ---
+# ctx:    the context
+# did:    the binding's DeclId
+# d:      the resolved Decl
+# is_mut: true for `var`, false for `val`
+# ret:    true on success, or an error
+pub fun lower_global(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, is_mut: bool) Result[bool, str] {
+    val gty_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, lower.decl_type_of(ctx, did));
+    if (is_err[ir_type.IrTypeId, str](gty_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](gty_r)); }
+    val gty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](gty_r);
+
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), d.data.bind.name);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+    val name: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    var init_val: value.Value = value.const_int(0, gty);
+    if (d.data.bind.init != aid.EXPR_NIL) {
+        val cv: Option[comptime.CTValue] = try_comptime(ctx, d.data.bind.init);
+        if (is_some[comptime.CTValue](cv)) {
+            val vr: Result[value.Value, str] = expr.const_value_of(ctx, d.data.bind.init, unwrap[comptime.CTValue](cv));
+            if (is_err[value.Value, str](vr)) { ret err[bool, str](unwrap_err[value.Value, str](vr)); }
+            init_val = unwrap_ok[value.Value, str](vr);
+        }
+        # a non-comptime initialiser stays a zero placeholder; the runtime
+        # init logic is materialised into the module init function by the
+        # driver's init-synthesis step. lowering records the global so the
+        # initialiser slot exists.
+    }
+
+    var g: ir.Global;
+    g.name   = name;
+    g.ty     = gty;
+    g.init   = init_val;
+    g.is_mut = is_mut;
+    g.is_pub = (d.flags & adecl.DECL_FLAG_PUB) != 0;
+
+    val ai: Result[u32, str] = append_global(ctx, g);
+    if (is_err[u32, str](ai)) { ret err[bool, str](unwrap_err[u32, str](ai)); }
+    ret ok[bool, str](true);
+}
+
+# lowers a decl-scope `$if` chain: evaluates each arm's condition and
+# recurses into the active arm's decl list only.
+fun lower_comptime_if(ctx: *lower.LowerContext, d: *adecl.Decl) Result[bool, str] {
+    val txt: str = module_source(ctx);
+    var bi: u32 = 0;
+    for (bi < d.data.comptime_if.branches_len) {
+        val branch_ix: u32 = d.data.comptime_if.branches_start + bi;
+        if (branch_ix::usize >= ctx.a.comptime_branch_len) {
+            ret err[bool, str]("lower: comptime branch index out of range");
+        }
+        val branch: *adecl.ComptimeBranch = ?ctx.a.comptime_branches[branch_ix];
+
+        var active: bool = false;
+        if (branch.cond == aid.EXPR_NIL) {
+            active = true;
+        } or {
+            val ev: Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a, txt, branch.cond, ?ctx.s.interner);
+            if (is_err[comptime.CTValue, str](ev)) { ret err[bool, str](unwrap_err[comptime.CTValue, str](ev)); }
+            active = ct_truthy(unwrap_ok[comptime.CTValue, str](ev));
+        }
+
+        if (active) {
+            var i: u32 = 0;
+            for (i < branch.body_len) {
+                val pool_ix: u32 = branch.body_start + i;
+                if (pool_ix::usize >= ctx.a.decl_id_len) {
+                    ret err[bool, str]("lower: comptime decl body index out of range");
+                }
+                val r: Result[bool, str] = lower_decl(ctx, ctx.a.decl_ids[pool_ix]);
+                if (is_err[bool, str](r)) { ret r; }
+                i = i + 1;
+            }
+            ret ok[bool, str](true);
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# appends a fresh Function to the module, growing the functions array on
+# overflow, and returns its index. the new function starts with no blocks,
+# no params, and an initialised (empty) asm map.
+fun append_function(ctx: *lower.LowerContext, name: intern.StrId, sig: ir_type.IrTypeId, flags: u32, param_hint: u32) Result[u32, str] {
+    val m: *ir.Module = ctx.m;
+    if (m.function_len == m.function_cap) {
+        val new_cap: u32 = m.function_cap * 2;
+        val r: Result[*ir.Function, str] = reallocate[ir.Function](m.alloc, m.functions, m.function_cap::usize, new_cap::usize);
+        if (is_err[*ir.Function, str](r)) { ret err[u32, str](unwrap_err[*ir.Function, str](r)); }
+        m.functions    = unwrap_ok[*ir.Function, str](r);
+        m.function_cap = new_cap;
+    }
+
+    val idx: u32 = m.function_len;
+    var f: ir.Function;
+    f.name        = name;
+    f.sig         = sig;
+    f.params      = nil;
+    f.param_count = 0;
+    f.blocks      = nil;
+    f.block_count = 0;
+    f.block_cap   = 0;
+    f.flags       = flags;
+    f.asm         = map.init[ir.InstructionId, ir.IrAsm](m.alloc, map.hash_u32, map.eq_u32);
+
+    m.functions[idx] = f;
+    m.function_len   = m.function_len + 1;
+    ret ok[u32, str](idx);
+}
+
+# appends a Global to the module, growing the globals array on overflow,
+# and returns its index.
+fun append_global(ctx: *lower.LowerContext, g: ir.Global) Result[u32, str] {
+    val m: *ir.Module = ctx.m;
+    if (m.global_len == m.global_cap) {
+        val new_cap: u32 = m.global_cap * 2;
+        val r: Result[*ir.Global, str] = reallocate[ir.Global](m.alloc, m.globals, m.global_cap::usize, new_cap::usize);
+        if (is_err[*ir.Global, str](r)) { ret err[u32, str](unwrap_err[*ir.Global, str](r)); }
+        m.globals    = unwrap_ok[*ir.Global, str](r);
+        m.global_cap = new_cap;
+    }
+    val idx: u32 = m.global_len;
+    m.globals[idx] = g;
+    m.global_len   = m.global_len + 1;
+    ret ok[u32, str](idx);
+}
+
+# the IR return type of a function decl: lowers the return type of its
+# semantic TYPE_FUN signature, defaulting to void.
+fun function_return_ir(ctx: *lower.LowerContext, did: aid.DeclId) Result[ir_type.IrTypeId, str] {
+    val sem: ty.TypeId = lower.decl_type_of(ctx, did);
+    val t_opt: Option[*ty.Type] = ty.get(?ctx.s.types, sem);
+    if (is_none[*ty.Type](t_opt)) { ret ir_type.intern_void(?ctx.m.types); }
+    val t: *ty.Type = unwrap[*ty.Type](t_opt);
+    if (t.kind != ty.TYPE_FUN) { ret ir_type.intern_void(?ctx.m.types); }
+    ret lower.lower_type(ctx, t.data.fun.ret);
+}
+
+# finds the SymbolId of a function parameter by its index: the SYM_PARAM
+# symbol owned by this module whose decl is the function and whose slot is
+# the parameter ordinal.
+fun param_symbol(ctx: *lower.LowerContext, fun_did: aid.DeclId, index: u32) resolve.SymbolId {
+    var i: u32 = 0;
+    for (i < ctx.rr.symbol_count) {
+        val sym: *resolve.Symbol = ?ctx.rr.symbols[i];
+        if (sym.kind == resolve.SYM_PARAM && sym.decl == fun_did && sym.slot == index) {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret resolve.SYMBOL_NIL;
+}
+
+# attempts to fold a global initialiser to a comptime constant, returning
+# none when the initialiser is not comptime-evaluable (its runtime logic
+# belongs in the module init function instead).
+fun try_comptime(ctx: *lower.LowerContext, eid: aid.ExprId) Option[comptime.CTValue] {
+    val ev: Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a, module_source(ctx), eid, ?ctx.s.interner);
+    if (is_ok[comptime.CTValue, str](ev)) {
+        ret some[comptime.CTValue](unwrap_ok[comptime.CTValue, str](ev));
+    }
+    ret none[comptime.CTValue]();
+}
+
+# truthiness of a comptime value for `$if` arm selection.
+fun ct_truthy(v: comptime.CTValue) bool {
+    if (v.kind == comptime.CT_KIND_BOOL) { ret v.data.b; }
+    if (v.kind == comptime.CT_KIND_INT)  { ret v.data.i != 0; }
+    ret false;
+}
+
+# true when the builder's current block already carries a terminator.
+fun block_terminated(ctx: *lower.LowerContext) bool {
+    if (ctx.builder.fn == nil) { ret false; }
+    val b: ir.BlockId = ctx.builder.block;
+    if (b == ir.BLOCK_NIL) { ret false; }
+    if (b >= ctx.builder.fn.block_count) { ret false; }
+    ret ctx.builder.fn.blocks[b].terminator != ir.INSTR_NIL;
+}
+
+# true when an IR type is the void type (or unknown).
+fun is_void_ir(ctx: *lower.LowerContext, tid: ir_type.IrTypeId) bool {
+    val t_opt: Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, tid);
+    if (is_none[*ir_type.IrType](t_opt)) { ret true; }
+    ret unwrap[*ir_type.IrType](t_opt).kind == ir_type.IRT_VOID;
+}
+
+# the module's source text from the session source map.
+fun module_source(ctx: *lower.LowerContext) str {
+    val sf: Option[*src.SourceFile] = src.get(?ctx.s.sources, ctx.a.file_id);
+    if (is_none[*src.SourceFile](sf)) {
+        var empty: str;
+        empty.len  = 0;
+        empty.data = nil;
+        ret empty;
+    }
+    ret unwrap[*src.SourceFile](sf).text;
+}

@@ -1,75 +1,83 @@
-# Inline Assembly
+# Inline assembly
 
-The `asm` keyword embeds assembly instructions directly in Mach code. Operands can reference local variables by name.
+Mach has one inline-assembly form: an ISA-tagged block of raw instructions
+with local-variable substitution. The compiler parses the instruction
+stream and infers operand direction and clobbers from the opcode semantics —
+no `in` / `out` declarations, no clobber list.
 
-
-## Syntax
+## Grammar
 
 ```mach
-asm {
-    # instructions here
+asm <isa> {
+    # raw instructions, one per line, # for comments
+    mov rax, [{ptr}]
+    mov {result}, rax
 }
 ```
 
-The compiler stores the block content as a raw string and interprets it during code generation. Nested braces are supported.
+- The ISA tag is mandatory. Bare `asm { ... }` does not exist.
+- Supported tags come from a closed set: `x86_64`, `aarch64`, …
+- Each line is an instruction in the ISA's native syntax.
+- `#` introduces a line comment.
 
+## Operand substitution
 
-## Portable Syscall DSL
-
-The `syscall` directive provides an ABI-agnostic way to make system calls:
-
-```mach
-asm {
-    syscall result, syscall_number, arg0, arg1, arg2
-}
-```
-
-The compiler translates this to the correct register placement for the target platform. Up to 6 arguments are supported.
-
-Example from the standard library:
+`{name}` substitutes a local in scope. The compiler resolves the reference
+to a memory or register operand based on liveness and the instruction's
+expected operand class.
 
 ```mach
-pub fun syscall0(n: usize) i64 {
-    var out: i64;
-    asm {
-        syscall out, n
+pub fun add_via_asm(a: i64, b: i64) i64 {
+    var result: i64 = 0;
+    asm x86_64 {
+        mov rax, {a}
+        add rax, {b}
+        mov {result}, rax
     }
-    ret out;
-}
-
-pub fun syscall3(n: usize, a0: usize, a1: usize, a2: usize) i64 {
-    var out: i64;
-    asm {
-        syscall out, n, a0, a1, a2
-    }
-    ret out;
+    ret result;
 }
 ```
 
+## What the compiler infers
 
-## ISA-Specific Blocks
+- **Operand direction.** Position within an instruction determines whether
+  an operand is read or written.
+- **Clobber set.** The compiler reads each instruction, knows what
+  registers and flags it touches, and adds them to the surrounding
+  function's clobber set.
+- **Memory clobber.** Every `asm` block is conservatively assumed to
+  modify arbitrary memory.
 
-For target-specific instructions, wrap the assembly in an ISA block:
+## Multi-arch dispatch
+
+Different architectures use different mnemonics, registers, and calling
+conventions. There is no nested arch-block construct inside `asm`; instead,
+wrap each `asm` block in `$if` on `$mach.target.arch`:
 
 ```mach
-asm {
-    x86_64 {
-        mov rax, 1
-        mov rdx, rsi
-        mov rsi, rdi
-        mov rdi, 1
-        syscall
-    }
+$if ($mach.target.arch == $mach.arch.x86_64) {
+    asm x86_64 { ... }
+}
+$or ($mach.target.arch == $mach.arch.aarch64) {
+    asm aarch64 { ... }
 }
 ```
 
-ISA-specific blocks emit target instructions directly, bypassing the portable IR layer. This is required for instructions with target-specific semantics like flags or register constraints.
+The discarded branches don't compile (see
+[comptime-control.md](comptime-control.md)), so each `asm` block only needs
+to be valid for its tagged ISA.
 
-Supported ISA names: `x86_64`.
+## When to use
 
+- Truly target-specific operations: syscalls, register reads, stack-frame
+  surgery.
+- Anything that doesn't have a 1:1 stdlib wrapper.
 
-## Limitations
+For ops that exist as named stdlib functions (atomics, fences, traps,
+SIMD long-tail), use the stdlib API — those wrappers already contain the
+arch-dispatched `asm`.
 
-- Operands reference local variables by name; there is no explicit constraint or clobber syntax
-- Only valid inside function bodies
-- No inline assembly interpolation or register allocation integration
+## See also
+
+- [policy.md](policy.md) — compiler vs stdlib boundary
+- [comptime-control.md](comptime-control.md) — `$if` over `$mach.target.arch`

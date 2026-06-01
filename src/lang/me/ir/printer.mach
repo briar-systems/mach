@@ -1,0 +1,572 @@
+# mach.lang.me.ir.printer: textual IR dump for debugging and golden tests.
+#
+# Renders a `Module` in a
+# fixed, human-readable format. The output is NOT a reloadable language —
+# `me.lower` is the only way to materialise IR. Output goes to any
+# `std.io.writer.Writer`, so callers choose buffer / fd / discard sinks.
+#
+# Format:
+#   module "<fqn>" {
+#     global @<name>: <ty> = <value>
+#
+#     fn @<name>(<params>): <ret> {
+#       block bb0:
+#         %0 = add i32 %a, %b
+#         cbr %1, bb1, bb2
+#       block bb1:
+#         ...
+#     }
+#   }
+#
+# Block labels are `bb<id>`; instruction results are `%<instr_id>`; function
+# parameters render as `%p<index>`; globals and functions as `@<name>`; phis
+# as `phi <ty> [bb0 %0, bb1 %3, ...]`. Per-instruction modifier flags render
+# as opcode suffixes (`add.nsw`, `load.volatile`).
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_err;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+
+use writer: std.io.writer;
+use fmt:    std.format;
+
+use intern:  mach.lang.intern;
+use ir:      mach.lang.me.ir;
+use instr:   mach.lang.me.ir.instruction;
+use value:   mach.lang.me.ir.value;
+use ir_type: mach.lang.me.ir.type;
+use id:      mach.lang.me.ir.id;
+
+# writes a full module: its name, globals, then functions.
+# ---
+# out:      destination writer
+# m:        the module to render
+# interner: interner for recovering names backing FQNs and symbols
+# ret:      ok(true) on success, or the first write/format error
+pub fun print_module(out: *writer.Writer, m: *ir.Module, interner: *intern.Interner) Result[bool, str] {
+    val r1: Result[bool, str] = ws(out, "module \"");
+    if (is_err[bool, str](r1)) { ret r1; }
+    val r2: Result[bool, str] = wname(out, interner, m.name);
+    if (is_err[bool, str](r2)) { ret r2; }
+    val r3: Result[bool, str] = ws(out, "\" {\n");
+    if (is_err[bool, str](r3)) { ret r3; }
+
+    var gi: u32 = 0;
+    for (gi < m.global_len) {
+        val rg: Result[bool, str] = print_global(out, m, ?m.globals[gi], interner);
+        if (is_err[bool, str](rg)) { ret rg; }
+        gi = gi + 1;
+    }
+    if (m.global_len > 0) {
+        val rn: Result[bool, str] = ws(out, "\n");
+        if (is_err[bool, str](rn)) { ret rn; }
+    }
+
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val rf: Result[bool, str] = print_function(out, m, ?m.functions[fi], interner);
+        if (is_err[bool, str](rf)) { ret rf; }
+        if (fi + 1 < m.function_len) {
+            val rn: Result[bool, str] = ws(out, "\n");
+            if (is_err[bool, str](rn)) { ret rn; }
+        }
+        fi = fi + 1;
+    }
+
+    ret ws(out, "}\n");
+}
+
+# writes one global declaration line.
+# ---
+# out:      destination writer
+# m:        the owning module (for the IR type table)
+# g:        the global to render
+# interner: interner for recovering the global's name
+# ret:      ok(true) on success, or a write/format error
+pub fun print_global(out: *writer.Writer, m: *ir.Module, g: *ir.Global, interner: *intern.Interner) Result[bool, str] {
+    val r1: Result[bool, str] = ws(out, "  ");
+    if (is_err[bool, str](r1)) { ret r1; }
+    if (g.is_mut) {
+        val rm: Result[bool, str] = ws(out, "var @");
+        if (is_err[bool, str](rm)) { ret rm; }
+    }
+    or {
+        val rm: Result[bool, str] = ws(out, "val @");
+        if (is_err[bool, str](rm)) { ret rm; }
+    }
+    val r2: Result[bool, str] = wname(out, interner, g.name);
+    if (is_err[bool, str](r2)) { ret r2; }
+    val r3: Result[bool, str] = ws(out, ": ");
+    if (is_err[bool, str](r3)) { ret r3; }
+    val r4: Result[bool, str] = print_type(out, m, g.ty);
+    if (is_err[bool, str](r4)) { ret r4; }
+    val r5: Result[bool, str] = ws(out, " = ");
+    if (is_err[bool, str](r5)) { ret r5; }
+    val r6: Result[bool, str] = print_value(out, m, ?g.init, interner);
+    if (is_err[bool, str](r6)) { ret r6; }
+    ret ws(out, "\n");
+}
+
+# writes one function: its signature header, then each block.
+# ---
+# out:      destination writer
+# m:        the owning module (for the IR type table)
+# fn:       the function to render
+# interner: interner for recovering names
+# ret:      ok(true) on success, or a write/format error
+pub fun print_function(out: *writer.Writer, m: *ir.Module, fn: *ir.Function, interner: *intern.Interner) Result[bool, str] {
+    val r1: Result[bool, str] = ws(out, "  fn @");
+    if (is_err[bool, str](r1)) { ret r1; }
+    val r2: Result[bool, str] = wname(out, interner, fn.name);
+    if (is_err[bool, str](r2)) { ret r2; }
+    val r3: Result[bool, str] = ws(out, "(");
+    if (is_err[bool, str](r3)) { ret r3; }
+
+    var pi: u32 = 0;
+    for (pi < fn.param_count) {
+        if (pi > 0) {
+            val rc: Result[bool, str] = ws(out, ", ");
+            if (is_err[bool, str](rc)) { ret rc; }
+        }
+        val rp: Result[bool, str] = ws(out, "%p");
+        if (is_err[bool, str](rp)) { ret rp; }
+        val ru: Result[bool, str] = wu(out, pi::u64);
+        if (is_err[bool, str](ru)) { ret ru; }
+        val rt: Result[bool, str] = ws(out, ": ");
+        if (is_err[bool, str](rt)) { ret rt; }
+        val rty: Result[bool, str] = print_type(out, m, fn.params[pi].ty);
+        if (is_err[bool, str](rty)) { ret rty; }
+        pi = pi + 1;
+    }
+
+    val r4: Result[bool, str] = ws(out, "): ");
+    if (is_err[bool, str](r4)) { ret r4; }
+    val r5: Result[bool, str] = print_signature_ret(out, m, fn.sig);
+    if (is_err[bool, str](r5)) { ret r5; }
+
+    if ((fn.flags & ir.FN_FLAG_EXTERN) != 0) {
+        ret ws(out, " extern\n");
+    }
+
+    val r6: Result[bool, str] = ws(out, " {\n");
+    if (is_err[bool, str](r6)) { ret r6; }
+
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val rb: Result[bool, str] = print_block(out, m, fn, ?fn.blocks[bi], interner);
+        if (is_err[bool, str](rb)) { ret rb; }
+        bi = bi + 1;
+    }
+
+    ret ws(out, "  }\n");
+}
+
+# writes one block: its label, phis, body instructions, then terminator.
+# ---
+# out:      destination writer
+# m:        the owning module (for the IR type table)
+# fn:       the owning function (for the instruction pool)
+# blk:      the block to render
+# interner: interner for recovering names
+# ret:      ok(true) on success, or a write/format error
+pub fun print_block(out: *writer.Writer, m: *ir.Module, fn: *ir.Function, blk: *ir.Block, interner: *intern.Interner) Result[bool, str] {
+    val r1: Result[bool, str] = ws(out, "    block bb");
+    if (is_err[bool, str](r1)) { ret r1; }
+    val r2: Result[bool, str] = wu(out, blk.id::u64);
+    if (is_err[bool, str](r2)) { ret r2; }
+    val r3: Result[bool, str] = ws(out, ":\n");
+    if (is_err[bool, str](r3)) { ret r3; }
+
+    var p: u32 = 0;
+    for (p < blk.phi_count) {
+        val rp: Result[bool, str] = print_instruction(out, m, fn, ?fn.instrs[blk.phis[p]], blk.phis[p], interner);
+        if (is_err[bool, str](rp)) { ret rp; }
+        p = p + 1;
+    }
+
+    var ix: u32 = 0;
+    for (ix < blk.instr_count) {
+        val ii: Result[bool, str] = print_instruction(out, m, fn, ?fn.instrs[blk.instructions[ix]], blk.instructions[ix], interner);
+        if (is_err[bool, str](ii)) { ret ii; }
+        ix = ix + 1;
+    }
+
+    if (blk.terminator != id.INSTR_NIL && blk.terminator < fn.instr_len) {
+        ret print_instruction(out, m, fn, ?fn.instrs[blk.terminator], blk.terminator, interner);
+    }
+    ret ok[bool, str](true);
+}
+
+# writes one instruction line: the optional result binding, opcode and flag
+# suffixes, result type, and operands rendered per the opcode's convention.
+# ---
+# out:      destination writer
+# m:        the owning module (for the IR type table)
+# fn:       the owning function (for operand resolution)
+# ins:      the instruction to render
+# iid:      the instruction's id (used for the result name `%iid`)
+# interner: interner for recovering names
+# ret:      ok(true) on success, or a write/format error
+pub fun print_instruction(out: *writer.Writer, m: *ir.Module, fn: *ir.Function, ins: *instr.Instruction, iid: id.InstructionId, interner: *intern.Interner) Result[bool, str] {
+    val r1: Result[bool, str] = ws(out, "      ");
+    if (is_err[bool, str](r1)) { ret r1; }
+
+    if (produces_value(ins.kind)) {
+        val rp: Result[bool, str] = ws(out, "%");
+        if (is_err[bool, str](rp)) { ret rp; }
+        val ru: Result[bool, str] = wu(out, iid::u64);
+        if (is_err[bool, str](ru)) { ret ru; }
+        val re: Result[bool, str] = ws(out, " = ");
+        if (is_err[bool, str](re)) { ret re; }
+    }
+
+    val ro: Result[bool, str] = ws(out, opcode_name(ins.kind));
+    if (is_err[bool, str](ro)) { ret ro; }
+    val rf: Result[bool, str] = print_flag_suffixes(out, ins.flags);
+    if (is_err[bool, str](rf)) { ret rf; }
+
+    if (produces_value(ins.kind)) {
+        val rt: Result[bool, str] = ws(out, " ");
+        if (is_err[bool, str](rt)) { ret rt; }
+        val rty: Result[bool, str] = print_type(out, m, ins.ty);
+        if (is_err[bool, str](rty)) { ret rty; }
+    }
+
+    if (ins.kind == instr.OP_PHI) {
+        val rph: Result[bool, str] = print_phi_operands(out, m, fn, ins, interner);
+        if (is_err[bool, str](rph)) { ret rph; }
+    }
+    or {
+        val rop: Result[bool, str] = print_operands(out, m, fn, ins, interner);
+        if (is_err[bool, str](rop)) { ret rop; }
+    }
+
+    ret ws(out, "\n");
+}
+
+# renders an instruction's flat operand list as ` op0, op1, ...`. branch
+# targets (const_int block ids) render as `bb<n>`. nothing is written for an
+# operand-less instruction.
+fun print_operands(out: *writer.Writer, m: *ir.Module, fn: *ir.Function, ins: *instr.Instruction, interner: *intern.Interner) Result[bool, str] {
+    if (ins.operand_count == 0) { ret ok[bool, str](true); }
+    val is_branch: bool = ins.kind == instr.OP_BR || ins.kind == instr.OP_CBR;
+
+    var oi: u32 = 0;
+    for (oi < ins.operand_count) {
+        if (oi == 0) {
+            val rs: Result[bool, str] = ws(out, " ");
+            if (is_err[bool, str](rs)) { ret rs; }
+        }
+        or {
+            val rc: Result[bool, str] = ws(out, ", ");
+            if (is_err[bool, str](rc)) { ret rc; }
+        }
+        val op: *value.Value = ?ins.operands[oi];
+        # for BR all operands are targets; for CBR operands 1 and 2 are targets.
+        val is_target: bool = (ins.kind == instr.OP_BR) || (ins.kind == instr.OP_CBR && oi >= 1);
+        if (is_target && op.kind == value.VAL_CONST_INT) {
+            val rb: Result[bool, str] = ws(out, "bb");
+            if (is_err[bool, str](rb)) { ret rb; }
+            val ru: Result[bool, str] = wu(out, op.data.int_lit);
+            if (is_err[bool, str](ru)) { ret ru; }
+        }
+        or {
+            val rv: Result[bool, str] = print_value(out, m, op, interner);
+            if (is_err[bool, str](rv)) { ret rv; }
+        }
+        oi = oi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# renders a phi's `[bbN %v, bbM %w, ...]` incoming list. operands alternate
+# block-id (const_int) and value.
+fun print_phi_operands(out: *writer.Writer, m: *ir.Module, fn: *ir.Function, ins: *instr.Instruction, interner: *intern.Interner) Result[bool, str] {
+    val r1: Result[bool, str] = ws(out, " [");
+    if (is_err[bool, str](r1)) { ret r1; }
+    var oi: u32 = 0;
+    var first: bool = true;
+    for (oi + 1 < ins.operand_count) {
+        if (!first) {
+            val rc: Result[bool, str] = ws(out, ", ");
+            if (is_err[bool, str](rc)) { ret rc; }
+        }
+        first = false;
+        val blk_op: *value.Value = ?ins.operands[oi];
+        val rb: Result[bool, str] = ws(out, "bb");
+        if (is_err[bool, str](rb)) { ret rb; }
+        val ru: Result[bool, str] = wu(out, blk_op.data.int_lit);
+        if (is_err[bool, str](ru)) { ret ru; }
+        val rs: Result[bool, str] = ws(out, " ");
+        if (is_err[bool, str](rs)) { ret rs; }
+        val rv: Result[bool, str] = print_value(out, m, ?ins.operands[oi + 1], interner);
+        if (is_err[bool, str](rv)) { ret rv; }
+        oi = oi + 2;
+    }
+    ret ws(out, "]");
+}
+
+# renders one Value operand reference inline.
+# ---
+# out:      destination writer
+# m:        the owning module (for global/function name lookup)
+# v:        the value to render
+# interner: interner for recovering names
+# ret:      ok(true) on success, or a write/format error
+pub fun print_value(out: *writer.Writer, m: *ir.Module, v: *value.Value, interner: *intern.Interner) Result[bool, str] {
+    if (v.kind == value.VAL_INSTR) {
+        val rp: Result[bool, str] = ws(out, "%");
+        if (is_err[bool, str](rp)) { ret rp; }
+        ret wu(out, v.data.instr::u64);
+    }
+    if (v.kind == value.VAL_PARAM) {
+        val rp: Result[bool, str] = ws(out, "%p");
+        if (is_err[bool, str](rp)) { ret rp; }
+        ret wu(out, v.data.param_ix::u64);
+    }
+    if (v.kind == value.VAL_CONST_INT) {
+        ret wu(out, v.data.int_lit);
+    }
+    if (v.kind == value.VAL_CONST_FLOAT) {
+        # std has no float formatter; print the truncated integer magnitude
+        # tagged `f` so the dump stays readable (the dump is not reloadable).
+        val rp: Result[bool, str] = ws(out, "f");
+        if (is_err[bool, str](rp)) { ret rp; }
+        val f: f64 = v.data.float_lit;
+        if (f < 0.0) {
+            val rn: Result[bool, str] = ws(out, "-");
+            if (is_err[bool, str](rn)) { ret rn; }
+            ret wu(out, (0.0 - f)::u64);
+        }
+        ret wu(out, f::u64);
+    }
+    if (v.kind == value.VAL_CONST_NULL) {
+        ret ws(out, "null");
+    }
+    if (v.kind == value.VAL_CONST_BYTES) {
+        val rb: Result[bool, str] = ws(out, "bytes[");
+        if (is_err[bool, str](rb)) { ret rb; }
+        val ru: Result[bool, str] = wu(out, v.data.bytes.len::u64);
+        if (is_err[bool, str](ru)) { ret ru; }
+        ret ws(out, "]");
+    }
+    if (v.kind == value.VAL_GLOBAL) {
+        val rg: Result[bool, str] = ws(out, "@");
+        if (is_err[bool, str](rg)) { ret rg; }
+        if (v.data.global_ix < m.global_len) {
+            ret wname(out, interner, m.globals[v.data.global_ix].name);
+        }
+        ret wu(out, v.data.global_ix::u64);
+    }
+    if (v.kind == value.VAL_FN) {
+        val rg: Result[bool, str] = ws(out, "@");
+        if (is_err[bool, str](rg)) { ret rg; }
+        if (v.data.fn_ix < m.function_len) {
+            ret wname(out, interner, m.functions[v.data.fn_ix].name);
+        }
+        ret wu(out, v.data.fn_ix::u64);
+    }
+    ret ws(out, "<?value>");
+}
+
+# renders an IR type compactly: `void`, `i<bits>`, `f<bits>`, `ptr`,
+# `[N]elem`, `{f0, f1, ...}`, or `fn(...)->ret`.
+# ---
+# out: destination writer
+# m:   the owning module (for the IR type table)
+# tid: the type to render
+# ret: ok(true) on success, or a write/format error
+pub fun print_type(out: *writer.Writer, m: *ir.Module, tid: ir_type.IrTypeId) Result[bool, str] {
+    val got: Option[*ir_type.IrType] = ir_type.get(?m.types, tid);
+    if (!is_some[*ir_type.IrType](got)) {
+        ret ws(out, "<?type>");
+    }
+    val t: *ir_type.IrType = unwrap[*ir_type.IrType](got);
+
+    if (t.kind == ir_type.IRT_VOID) { ret ws(out, "void"); }
+    if (t.kind == ir_type.IRT_INT) {
+        val ri: Result[bool, str] = ws(out, "i");
+        if (is_err[bool, str](ri)) { ret ri; }
+        ret wu(out, t.data.bits::u64);
+    }
+    if (t.kind == ir_type.IRT_FLOAT) {
+        val rf: Result[bool, str] = ws(out, "f");
+        if (is_err[bool, str](rf)) { ret rf; }
+        ret wu(out, t.data.bits::u64);
+    }
+    if (t.kind == ir_type.IRT_PTR) { ret ws(out, "ptr"); }
+    if (t.kind == ir_type.IRT_ARRAY) {
+        val r1: Result[bool, str] = ws(out, "[");
+        if (is_err[bool, str](r1)) { ret r1; }
+        val r2: Result[bool, str] = wu(out, ir_type.array_count(?m.types, tid)::u64);
+        if (is_err[bool, str](r2)) { ret r2; }
+        val r3: Result[bool, str] = ws(out, "]");
+        if (is_err[bool, str](r3)) { ret r3; }
+        ret print_type(out, m, t.data.element);
+    }
+    if (t.kind == ir_type.IRT_STRUCT) {
+        val r1: Result[bool, str] = ws(out, "{");
+        if (is_err[bool, str](r1)) { ret r1; }
+        var i: u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            if (i > 0) {
+                val rc: Result[bool, str] = ws(out, ", ");
+                if (is_err[bool, str](rc)) { ret rc; }
+            }
+            val rt: Result[bool, str] = print_type(out, m, t.data.struct_.fields[i]);
+            if (is_err[bool, str](rt)) { ret rt; }
+            i = i + 1;
+        }
+        ret ws(out, "}");
+    }
+    if (t.kind == ir_type.IRT_FN) {
+        val r1: Result[bool, str] = ws(out, "fn(");
+        if (is_err[bool, str](r1)) { ret r1; }
+        var i: u32 = 0;
+        for (i < t.data.fn.param_count) {
+            if (i > 0) {
+                val rc: Result[bool, str] = ws(out, ", ");
+                if (is_err[bool, str](rc)) { ret rc; }
+            }
+            val rt: Result[bool, str] = print_type(out, m, t.data.fn.params[i]);
+            if (is_err[bool, str](rt)) { ret rt; }
+            i = i + 1;
+        }
+        if (t.data.fn.varargs) {
+            if (t.data.fn.param_count > 0) {
+                val rc: Result[bool, str] = ws(out, ", ");
+                if (is_err[bool, str](rc)) { ret rc; }
+            }
+            val rd: Result[bool, str] = ws(out, "...");
+            if (is_err[bool, str](rd)) { ret rd; }
+        }
+        val r2: Result[bool, str] = ws(out, ") -> ");
+        if (is_err[bool, str](r2)) { ret r2; }
+        ret print_type(out, m, t.data.fn.ret);
+    }
+    ret ws(out, "<?type>");
+}
+
+# renders a function signature's return type from its IRT_FN type id.
+fun print_signature_ret(out: *writer.Writer, m: *ir.Module, sig: ir_type.IrTypeId) Result[bool, str] {
+    val got: Option[*ir_type.IrType] = ir_type.get(?m.types, sig);
+    if (is_some[*ir_type.IrType](got)) {
+        val t: *ir_type.IrType = unwrap[*ir_type.IrType](got);
+        if (t.kind == ir_type.IRT_FN) {
+            ret print_type(out, m, t.data.fn.ret);
+        }
+    }
+    ret ws(out, "void");
+}
+
+# appends `.nsw`/`.nuw`/`.exact`/`.volatile` for each set modifier flag.
+fun print_flag_suffixes(out: *writer.Writer, flags: u16) Result[bool, str] {
+    if ((flags & instr.INSTR_FLAG_NSW) != 0) {
+        val r: Result[bool, str] = ws(out, ".nsw");
+        if (is_err[bool, str](r)) { ret r; }
+    }
+    if ((flags & instr.INSTR_FLAG_NUW) != 0) {
+        val r: Result[bool, str] = ws(out, ".nuw");
+        if (is_err[bool, str](r)) { ret r; }
+    }
+    if ((flags & instr.INSTR_FLAG_EXACT) != 0) {
+        val r: Result[bool, str] = ws(out, ".exact");
+        if (is_err[bool, str](r)) { ret r; }
+    }
+    if ((flags & instr.INSTR_FLAG_VOLATILE) != 0) {
+        val r: Result[bool, str] = ws(out, ".volatile");
+        if (is_err[bool, str](r)) { ret r; }
+    }
+    ret ok[bool, str](true);
+}
+
+# true when an opcode defines an SSA result worth naming `%n`. terminators,
+# stores, and inline asm produce no value.
+fun produces_value(k: instr.InstrKind) bool {
+    if (instr.is_terminator(k)) { ret false; }
+    if (k == instr.OP_STORE) { ret false; }
+    if (k == instr.OP_ASM)   { ret false; }
+    ret true;
+}
+
+# returns a short mnemonic for an opcode.
+fun opcode_name(k: instr.InstrKind) str {
+    if (k == instr.OP_ADD)         { ret "add"; }
+    if (k == instr.OP_SUB)         { ret "sub"; }
+    if (k == instr.OP_MUL)         { ret "mul"; }
+    if (k == instr.OP_DIV_S)       { ret "div_s"; }
+    if (k == instr.OP_DIV_U)       { ret "div_u"; }
+    if (k == instr.OP_REM_S)       { ret "rem_s"; }
+    if (k == instr.OP_REM_U)       { ret "rem_u"; }
+    if (k == instr.OP_NEG)         { ret "neg"; }
+    if (k == instr.OP_AND)         { ret "and"; }
+    if (k == instr.OP_OR)          { ret "or"; }
+    if (k == instr.OP_XOR)         { ret "xor"; }
+    if (k == instr.OP_SHL)         { ret "shl"; }
+    if (k == instr.OP_SHR_S)       { ret "shr_s"; }
+    if (k == instr.OP_SHR_U)       { ret "shr_u"; }
+    if (k == instr.OP_NOT)         { ret "not"; }
+    if (k == instr.OP_CMP_EQ)      { ret "cmp_eq"; }
+    if (k == instr.OP_CMP_NE)      { ret "cmp_ne"; }
+    if (k == instr.OP_CMP_LT_S)    { ret "cmp_lt_s"; }
+    if (k == instr.OP_CMP_LT_U)    { ret "cmp_lt_u"; }
+    if (k == instr.OP_CMP_LE_S)    { ret "cmp_le_s"; }
+    if (k == instr.OP_CMP_LE_U)    { ret "cmp_le_u"; }
+    if (k == instr.OP_TRUNC)       { ret "trunc"; }
+    if (k == instr.OP_SEXT)        { ret "sext"; }
+    if (k == instr.OP_ZEXT)        { ret "zext"; }
+    if (k == instr.OP_FP_TRUNC)    { ret "fp_trunc"; }
+    if (k == instr.OP_FP_EXT)      { ret "fp_ext"; }
+    if (k == instr.OP_FP_TO_SI)    { ret "fp_to_si"; }
+    if (k == instr.OP_FP_TO_UI)    { ret "fp_to_ui"; }
+    if (k == instr.OP_SI_TO_FP)    { ret "si_to_fp"; }
+    if (k == instr.OP_UI_TO_FP)    { ret "ui_to_fp"; }
+    if (k == instr.OP_BITCAST)     { ret "bitcast"; }
+    if (k == instr.OP_ALLOCA)      { ret "alloca"; }
+    if (k == instr.OP_LOAD)        { ret "load"; }
+    if (k == instr.OP_STORE)       { ret "store"; }
+    if (k == instr.OP_GEP)         { ret "gep"; }
+    if (k == instr.OP_EXTRACT)     { ret "extract"; }
+    if (k == instr.OP_INSERT)      { ret "insert"; }
+    if (k == instr.OP_PHI)         { ret "phi"; }
+    if (k == instr.OP_CALL)        { ret "call"; }
+    if (k == instr.OP_BR)          { ret "br"; }
+    if (k == instr.OP_CBR)         { ret "cbr"; }
+    if (k == instr.OP_RET)         { ret "ret"; }
+    if (k == instr.OP_UNREACHABLE) { ret "unreachable"; }
+    if (k == instr.OP_ASM)         { ret "asm"; }
+    ret "?op";
+}
+
+# write-string helper: writes a string, mapping the byte count to ok(true).
+fun ws(out: *writer.Writer, s: str) Result[bool, str] {
+    val r: Result[usize, str] = fmt.write_str(out, s);
+    if (is_err[usize, str](r)) { ret err[bool, str](unwrap_err[usize, str](r)); }
+    ret ok[bool, str](true);
+}
+
+# write-unsigned helper.
+fun wu(out: *writer.Writer, n: u64) Result[bool, str] {
+    val r: Result[usize, str] = fmt.write_u64(out, n);
+    if (is_err[usize, str](r)) { ret err[bool, str](unwrap_err[usize, str](r)); }
+    ret ok[bool, str](true);
+}
+
+# writes an interned name, or `<?name>` when the id does not resolve.
+fun wname(out: *writer.Writer, interner: *intern.Interner, id_: intern.StrId) Result[bool, str] {
+    val got: Option[str] = intern.lookup(interner, id_);
+    if (is_some[str](got)) {
+        ret ws(out, unwrap[str](got));
+    }
+    ret ws(out, "<?name>");
+}

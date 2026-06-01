@@ -1,139 +1,65 @@
 # Expressions
 
-
-## Operators
-
-### Binary Operators
-
-All binary operators are left-associative **except assignment** (`=`), which is right-associative. Listed from lowest to highest precedence:
-
-| Precedence | Operators | Description |
-|------------|-----------|-------------|
-| 1 | `=` | Assignment (right-associative) |
-| 2 | `\|\|` | Logical OR |
-| 3 | `&&` | Logical AND |
-| 4 | `\|` | Bitwise OR |
-| 5 | `^` | Bitwise XOR |
-| 6 | `&` | Bitwise AND |
-| 7 | `==` `!=` | Equality |
-| 8 | `<` `>` `<=` `>=` | Comparison |
-| 9 | `<<` `>>` | Shift |
-| 10 | `+` `-` | Addition, subtraction |
-| 11 | `*` `/` `%` | Multiplication, division, modulo |
-
-### Unary Operators
-
-Unary operators bind tighter than binary operators:
-
-| Operator | Description |
-|----------|-------------|
-| `!` | Logical NOT |
-| `-` | Numeric negation |
-| `~` | Bitwise NOT |
-| `?` | Address-of (creates pointer to value) |
-| `@` | Dereference (reads/writes through pointer) |
-
-### Postfix Operators
-
-Postfix operators bind tightest:
-
-| Syntax | Description |
-|--------|-------------|
-| `f(args)` | Function call |
-| `a[i]` | Array/pointer indexing |
-| `x.field` | Field access |
-| `x::T` | Type cast (bit reinterpretation) |
-
+Expressions evaluate to values. They appear on the right side of bindings,
+as conditions, and as call arguments.
 
 ## Literals
 
-### Integer Literals
+See [literals.md](literals.md) — numeric, char, string forms.
+
+## Names
+
+A bare identifier references a name in scope. Module-qualified names use
+the dot path:
 
 ```mach
-val dec: i32 = 42;
-val hex: i32 = 0xff;
-val bin: i32 = 0b1010;
-val oct: i32 = 0o755;
-val big: i64 = 1_000_000;   # underscores for readability
+counter             # local or module-level binding
+core.add            # symbol from module `core`
 ```
 
-Integer literals can have a type suffix: `42u8`, `100i64`, `0xffu32`.
+## Record / array / union / vector literals
 
-### Float Literals
+A type name followed by a brace-delimited initializer:
 
 ```mach
-val pi: f64 = 3.14159;
-val sci: f64 = 1.5e-10;
+val p:    Point             = Point{ x: 1, y: 2 };
+val a:    [3]i64            = [3]i64{10, 20, 30};
+val u:    Number            = Number{ i: 99 };
+val v:    f32x4             = f32x4{1.0, 2.0, 3.0, 4.0};
+val pair: Pair[i64, u8]     = Pair[i64, u8]{ left: 5, right: 6u8 };
 ```
 
-Float literals can have a type suffix: `3.14f32`.
+For generics, the type arguments appear in brackets before the body.
 
-### Character Literals
+## Field / index access
 
 ```mach
-val c: u8 = 'A';
-val nl: u8 = '\n';
-val hex: u8 = '\x41';   # 'A'
+val x:     i64 = p.x;
+val first: i64 = a[0];
+val lane:  f32 = v[2];
 ```
 
-Escape sequences: `\n` `\t` `\r` `\\` `\"` `\'` `\0` `\xNN`.
-
-### String Literals
+## Function calls
 
 ```mach
-val s: str = "hello, world";
+add(2, 3)
+identity[i64](42)               # generic call: type args in [ ]
+sum(3, 10i64, 20i64, 30i64)     # variadic
 ```
 
-String literals are null-terminated and placed in read-only memory. The type is `str` (alias for `&u8`).
-
-### Other Literals
+For comptime parameters, the value is passed positionally like a runtime
+argument — the function signature determines whether it must be comptime:
 
 ```mach
-val n: *u8 = nil;       # null pointer
-val t: bool = true;     # boolean (from std.types.bool)
-val f: bool = false;
+checked_add(MODE_FAST, 1, 2)    # MODE_FAST is comptime-knowable
 ```
 
+## Operators
 
-## Composite Literals
+See [operators.md](operators.md). Operators combine expressions into larger
+expressions; precedence follows the usual C-family conventions.
 
-### Record Literals
+## See also
 
-```mach
-rec Point { x: f64; y: f64; }
-val p: Point = Point{x: 1.0, y: 2.0};
-```
-
-### Array Literals
-
-```mach
-val a: [3]i32 = [3]i32{10, 20, 30};
-```
-
-### Generic Typed Literals
-
-```mach
-val pair: Pair[i32, str] = Pair[i32, str]{first: 42, second: "hello"};
-```
-
-
-## Assignment
-
-Only `var` bindings and dereferenced mutable pointers can be assigned to:
-
-```mach
-var x: i32 = 10;
-x = 20;
-
-var p: *i32 = ?x;
-@p = 30;
-```
-
-
-## Parentheses
-
-Parentheses override default precedence:
-
-```mach
-val x: i32 = (2 + 3) * 4;   # 20
-```
+- [statements.md](statements.md) — how expressions appear inside statements
+- [fun.md](fun.md) — function declarations and signatures

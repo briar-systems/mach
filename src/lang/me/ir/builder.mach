@@ -1,0 +1,1037 @@
+# mach.lang.me.ir.builder: IR construction helper.
+#
+# A `Builder` carries an insertion cursor (the
+# current module, function, and block) and exposes one emitter per
+# `InstrKind`. Each emitter appends a fresh `Instruction` to the function's
+# instruction pool, links its id into the current block, and hands back a
+# `Value` naming the result (or `ok(true)` for void-producing emitters).
+#
+# Storage model: instructions live in a flat per-`Function` pool
+# (`Function.instrs`); an `InstructionId` is an index into that pool, so
+# `Value.data.instr` and `Block.instructions` are stable handles for the
+# function's lifetime. The builder owns the growth of the pool, of each
+# block's instruction / phi / pred arrays, and of every instruction's operand
+# array.
+#
+# Terminator emitters (`emit_br` / `emit_cbr` / `emit_ret` /
+# `emit_unreachable`) additionally record the control-flow edge by appending
+# the current block to each successor's predecessor list. A block accepts
+# exactly one terminator; a second terminator emission is rejected with an
+# error rather than silently overwriting the first.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.allocate;
+use std.allocator.reallocate;
+use std.allocator.deallocate;
+
+use ir:      mach.lang.me.ir;
+use instr:   mach.lang.me.ir.instruction;
+use value:   mach.lang.me.ir.value;
+use ir_type: mach.lang.me.ir.type;
+use id:      mach.lang.me.ir.id;
+
+val INITIAL_INSTR_CAP:      u32 = 64;
+val INITIAL_BLOCK_BODY_CAP: u32 = 8;
+val INITIAL_PHI_CAP:        u32 = 4;
+val INITIAL_PRED_CAP:       u32 = 4;
+val INITIAL_BLOCK_CAP:      u32 = 4;
+
+# an insertion cursor over an IR module.
+# ---
+# m:     the module being built (owns the instruction pool growth via fn)
+# fn:    the function currently being emitted into (nil until set_function)
+# block: the block id new instructions land in (BLOCK_NIL until set_block)
+pub rec Builder {
+    m:     *ir.Module;
+    fn:    *ir.Function;
+    block: id.BlockId;
+}
+
+# constructs a builder positioned on a module with no current function. the
+# caller must `set_function` and `set_block` before emitting.
+# ---
+# m:   the module to build into
+# ret: a Builder with fn = nil and a BLOCK_NIL block cursor
+pub fun init(m: *ir.Module) Builder {
+    var b: Builder;
+    b.m     = m;
+    b.fn    = nil;
+    b.block = id.BLOCK_NIL;
+    ret b;
+}
+
+# moves the cursor to a function; clears the block cursor.
+# ---
+# b:  the builder
+# fn: the function to emit into
+pub fun set_function(b: *Builder, fn: *ir.Function) {
+    b.fn    = fn;
+    b.block = id.BLOCK_NIL;
+}
+
+# moves the cursor to a block within the current function.
+# ---
+# b:   the builder
+# blk: the block instructions will be appended to
+pub fun set_block(b: *Builder, blk: id.BlockId) {
+    b.block = blk;
+}
+
+# allocates a fresh empty block in the current function and returns its id.
+# does not move the cursor. the new block has no instructions, no phis, no
+# predecessors, and an INSTR_NIL terminator.
+# ---
+# b:   the builder (must have a current function)
+# ret: the new block's id, or an allocation / state error
+pub fun new_block(b: *Builder) Result[id.BlockId, str] {
+    if (b.fn == nil) { ret err[id.BlockId, str]("builder: new_block with no current function"); }
+    val fn: *ir.Function = b.fn;
+
+    if (fn.block_count == fn.block_cap) {
+        val gr: Result[bool, str] = grow_blocks(b);
+        if (is_err[bool, str](gr)) { ret err[id.BlockId, str](unwrap_err[bool, str](gr)); }
+    }
+
+    val bid: id.BlockId = fn.block_count;
+    var blk: ir.Block;
+    blk.id           = bid;
+    blk.instructions = nil;
+    blk.instr_count  = 0;
+    blk.instr_cap    = 0;
+    blk.phis         = nil;
+    blk.phi_count    = 0;
+    blk.phi_cap      = 0;
+    blk.terminator   = id.INSTR_NIL;
+    blk.preds        = nil;
+    blk.pred_count   = 0;
+    blk.pred_cap     = 0;
+    fn.blocks[bid]   = blk;
+    fn.block_count   = bid + 1;
+    ret ok[id.BlockId, str](bid);
+}
+
+# emits an integer addition `lhs + rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: a value naming the sum, or an error
+pub fun emit_add(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_ADD, lhs, rhs);
+}
+
+# emits an integer subtraction `lhs - rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: a value naming the difference, or an error
+pub fun emit_sub(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_SUB, lhs, rhs);
+}
+
+# emits an integer multiplication `lhs * rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: a value naming the product, or an error
+pub fun emit_mul(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_MUL, lhs, rhs);
+}
+
+# emits a signed integer division `lhs / rhs`.
+# ---
+# b:   the builder
+# lhs: dividend
+# rhs: divisor
+# ret: a value naming the quotient, or an error
+pub fun emit_div_s(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_DIV_S, lhs, rhs);
+}
+
+# emits an unsigned integer division `lhs / rhs`.
+# ---
+# b:   the builder
+# lhs: dividend
+# rhs: divisor
+# ret: a value naming the quotient, or an error
+pub fun emit_div_u(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_DIV_U, lhs, rhs);
+}
+
+# emits a signed remainder `lhs % rhs`.
+# ---
+# b:   the builder
+# lhs: dividend
+# rhs: divisor
+# ret: a value naming the remainder, or an error
+pub fun emit_rem_s(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_REM_S, lhs, rhs);
+}
+
+# emits an unsigned remainder `lhs % rhs`.
+# ---
+# b:   the builder
+# lhs: dividend
+# rhs: divisor
+# ret: a value naming the remainder, or an error
+pub fun emit_rem_u(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_REM_U, lhs, rhs);
+}
+
+# emits a bitwise and `lhs & rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: a value naming the result, or an error
+pub fun emit_and(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_AND, lhs, rhs);
+}
+
+# emits a bitwise or `lhs | rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: a value naming the result, or an error
+pub fun emit_or(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_OR, lhs, rhs);
+}
+
+# emits a bitwise xor `lhs ^ rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: a value naming the result, or an error
+pub fun emit_xor(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_XOR, lhs, rhs);
+}
+
+# emits a shift-left `lhs << rhs`.
+# ---
+# b:   the builder
+# lhs: value to shift
+# rhs: shift amount
+# ret: a value naming the result, or an error
+pub fun emit_shl(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_SHL, lhs, rhs);
+}
+
+# emits an arithmetic shift-right `lhs >> rhs`.
+# ---
+# b:   the builder
+# lhs: value to shift
+# rhs: shift amount
+# ret: a value naming the result, or an error
+pub fun emit_shr_s(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_SHR_S, lhs, rhs);
+}
+
+# emits a logical shift-right `lhs >> rhs`.
+# ---
+# b:   the builder
+# lhs: value to shift
+# rhs: shift amount
+# ret: a value naming the result, or an error
+pub fun emit_shr_u(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_binary(b, instr.OP_SHR_U, lhs, rhs);
+}
+
+# emits an integer negation `-operand`.
+# ---
+# b:       the builder
+# operand: value to negate
+# ret:     a value naming the result, or an error
+pub fun emit_neg(b: *Builder, operand: value.Value) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_NEG, operand, operand.ty);
+}
+
+# emits a bitwise not `~operand`.
+# ---
+# b:       the builder
+# operand: value to invert
+# ret:     a value naming the result, or an error
+pub fun emit_not(b: *Builder, operand: value.Value) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_NOT, operand, operand.ty);
+}
+
+# emits an equality comparison `lhs == rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: an 8-bit boolean value, or an error
+pub fun emit_cmp_eq(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_compare(b, instr.OP_CMP_EQ, lhs, rhs);
+}
+
+# emits an inequality comparison `lhs != rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: an 8-bit boolean value, or an error
+pub fun emit_cmp_ne(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_compare(b, instr.OP_CMP_NE, lhs, rhs);
+}
+
+# emits a signed less-than comparison `lhs < rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: an 8-bit boolean value, or an error
+pub fun emit_cmp_lt_s(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_compare(b, instr.OP_CMP_LT_S, lhs, rhs);
+}
+
+# emits an unsigned less-than comparison `lhs < rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: an 8-bit boolean value, or an error
+pub fun emit_cmp_lt_u(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_compare(b, instr.OP_CMP_LT_U, lhs, rhs);
+}
+
+# emits a signed less-or-equal comparison `lhs <= rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: an 8-bit boolean value, or an error
+pub fun emit_cmp_le_s(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_compare(b, instr.OP_CMP_LE_S, lhs, rhs);
+}
+
+# emits an unsigned less-or-equal comparison `lhs <= rhs`.
+# ---
+# b:   the builder
+# lhs: left operand
+# rhs: right operand
+# ret: an 8-bit boolean value, or an error
+pub fun emit_cmp_le_u(b: *Builder, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    ret emit_compare(b, instr.OP_CMP_LE_U, lhs, rhs);
+}
+
+# emits an integer truncation to a narrower integer type.
+# ---
+# b:       the builder
+# operand: value to truncate
+# to:      destination integer type
+# ret:     a value of type `to`, or an error
+pub fun emit_trunc(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_TRUNC, operand, to);
+}
+
+# emits a sign-extension to a wider integer type.
+# ---
+# b:       the builder
+# operand: value to extend
+# to:      destination integer type
+# ret:     a value of type `to`, or an error
+pub fun emit_sext(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_SEXT, operand, to);
+}
+
+# emits a zero-extension to a wider integer type.
+# ---
+# b:       the builder
+# operand: value to extend
+# to:      destination integer type
+# ret:     a value of type `to`, or an error
+pub fun emit_zext(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_ZEXT, operand, to);
+}
+
+# emits a floating-point truncation (e.g. f64 -> f32).
+# ---
+# b:       the builder
+# operand: value to truncate
+# to:      destination float type
+# ret:     a value of type `to`, or an error
+pub fun emit_fp_trunc(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_FP_TRUNC, operand, to);
+}
+
+# emits a floating-point extension (e.g. f32 -> f64).
+# ---
+# b:       the builder
+# operand: value to extend
+# to:      destination float type
+# ret:     a value of type `to`, or an error
+pub fun emit_fp_ext(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_FP_EXT, operand, to);
+}
+
+# emits a float-to-signed-integer conversion.
+# ---
+# b:       the builder
+# operand: float value to convert
+# to:      destination integer type
+# ret:     a value of type `to`, or an error
+pub fun emit_fp_to_si(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_FP_TO_SI, operand, to);
+}
+
+# emits a float-to-unsigned-integer conversion.
+# ---
+# b:       the builder
+# operand: float value to convert
+# to:      destination integer type
+# ret:     a value of type `to`, or an error
+pub fun emit_fp_to_ui(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_FP_TO_UI, operand, to);
+}
+
+# emits a signed-integer-to-float conversion.
+# ---
+# b:       the builder
+# operand: integer value to convert
+# to:      destination float type
+# ret:     a value of type `to`, or an error
+pub fun emit_si_to_fp(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_SI_TO_FP, operand, to);
+}
+
+# emits an unsigned-integer-to-float conversion.
+# ---
+# b:       the builder
+# operand: integer value to convert
+# to:      destination float type
+# ret:     a value of type `to`, or an error
+pub fun emit_ui_to_fp(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_UI_TO_FP, operand, to);
+}
+
+# emits a same-size bit reinterpretation.
+# ---
+# b:       the builder
+# operand: value to reinterpret
+# to:      destination type (same size as the operand's type)
+# ret:     a value of type `to`, or an error
+pub fun emit_bitcast(b: *Builder, operand: value.Value, to: ir_type.IrTypeId) Result[value.Value, str] {
+    ret emit_unary(b, instr.OP_BITCAST, operand, to);
+}
+
+# emits a stack allocation. the result is a pointer to `count` contiguous
+# slots of `ty`; `count` is a runtime value (use a const_int of 1 for a
+# single slot). the instruction's type records the allocated ELEMENT type so
+# the back end can size the stack slot (an untyped IR pointer carries none);
+# the result Value is an IR pointer.
+# ---
+# b:     the builder
+# ty:    the element type being allocated
+# count: number of elements to allocate
+# ret:   a pointer value naming the allocation, or an error
+pub fun emit_alloca(b: *Builder, ty: ir_type.IrTypeId, count: value.Value) Result[value.Value, str] {
+    val pr: Result[ir_type.IrTypeId, str] = ptr_type(b);
+    if (is_err[ir_type.IrTypeId, str](pr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](pr)); }
+    val pty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](pr);
+
+    var ops: [1]value.Value;
+    ops[0] = count;
+    val r: Result[id.InstructionId, str] = emit_raw(b, instr.OP_ALLOCA, ty, ?ops[0], 1);
+    if (is_err[id.InstructionId, str](r)) { ret err[value.Value, str](unwrap_err[id.InstructionId, str](r)); }
+    ret ok[value.Value, str](value.instr_value(unwrap_ok[id.InstructionId, str](r), pty));
+}
+
+# emits a load of type `ty` from a pointer.
+# ---
+# b:   the builder
+# ptr: pointer to load from
+# ty:  type of the loaded value
+# ret: a value of type `ty`, or an error
+pub fun emit_load(b: *Builder, ptr: value.Value, ty: ir_type.IrTypeId) Result[value.Value, str] {
+    var ops: [1]value.Value;
+    ops[0] = ptr;
+    ret emit_value_instr(b, instr.OP_LOAD, ty, ?ops[0], 1);
+}
+
+# emits a store of `val` to `ptr`. produces no value (void instruction).
+# operand order is [value, ptr] per the opcode convention.
+# ---
+# b:   the builder
+# val: value to store
+# ptr: destination pointer
+# ret: ok(true) on success, or an error
+pub fun emit_store(b: *Builder, val: value.Value, ptr: value.Value) Result[bool, str] {
+    val vr: Result[ir_type.IrTypeId, str] = void_type(b);
+    if (is_err[ir_type.IrTypeId, str](vr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](vr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](vr);
+
+    var ops: [2]value.Value;
+    ops[0] = val;
+    ops[1] = ptr;
+    val r: Result[id.InstructionId, str] = emit_raw(b, instr.OP_STORE, vty, ?ops[0], 2);
+    if (is_err[id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[id.InstructionId, str](r)); }
+    ret ok[bool, str](true);
+}
+
+# emits an address computation: `base` adjusted by the given indices. the
+# result is a pointer. operand order is [base, idx0, idx1, ...]. the index walk
+# follows the standard getelementptr model: index 0 strides over the source
+# pointee `src_ty` (the type one element of `base` denotes), and each subsequent
+# index descends one level into the aggregate reached so far. `src_ty` is
+# recorded on the instruction (`aux_ty`) because the base pointer is untyped, so
+# without it the backend could not turn the indices into byte offsets.
+# ---
+# b:           the builder
+# base:        base pointer
+# src_ty:      source pointee type the index walk starts from
+# indices:     pointer to an array of index values
+# index_count: number of indices
+# ret:         a pointer value naming the computed address, or an error
+pub fun emit_gep(b: *Builder, base: value.Value, src_ty: ir_type.IrTypeId, indices: *value.Value, index_count: u32) Result[value.Value, str] {
+    val pr: Result[ir_type.IrTypeId, str] = ptr_type(b);
+    if (is_err[ir_type.IrTypeId, str](pr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](pr)); }
+    val pty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](pr);
+
+    val total: u32 = index_count + 1;
+    val ar: Result[*value.Value, str] = allocate[value.Value](b.m.alloc, total::usize);
+    if (is_err[*value.Value, str](ar)) { ret err[value.Value, str](unwrap_err[*value.Value, str](ar)); }
+    val ops: *value.Value = unwrap_ok[*value.Value, str](ar);
+    ops[0] = base;
+    var i: u32 = 0;
+    for (i < index_count) {
+        ops[1 + i] = indices[i];
+        i = i + 1;
+    }
+
+    val r: Result[id.InstructionId, str] = emit_raw_owned(b, instr.OP_GEP, pty, ops, total);
+    if (is_err[id.InstructionId, str](r)) { ret err[value.Value, str](unwrap_err[id.InstructionId, str](r)); }
+    val iid: id.InstructionId = unwrap_ok[id.InstructionId, str](r);
+    b.fn.instrs[iid].aux_ty = src_ty;
+    ret ok[value.Value, str](value.instr_value(iid, pty));
+}
+
+# emits an aggregate element extraction. the element type is supplied since
+# the aggregate's element layout is opaque to the builder.
+# ---
+# b:     the builder
+# agg:   aggregate value
+# index: element index value
+# ty:    type of the extracted element
+# ret:   a value of type `ty`, or an error
+pub fun emit_extract(b: *Builder, agg: value.Value, index: value.Value, ty: ir_type.IrTypeId) Result[value.Value, str] {
+    var ops: [2]value.Value;
+    ops[0] = agg;
+    ops[1] = index;
+    ret emit_value_instr(b, instr.OP_EXTRACT, ty, ?ops[0], 2);
+}
+
+# emits an aggregate element insertion, producing a new aggregate value of
+# the same type as the input aggregate.
+# ---
+# b:       the builder
+# agg:     aggregate value
+# index:   element index value
+# element: value to insert
+# ret:     a new aggregate value, or an error
+pub fun emit_insert(b: *Builder, agg: value.Value, index: value.Value, element: value.Value) Result[value.Value, str] {
+    var ops: [3]value.Value;
+    ops[0] = agg;
+    ops[1] = index;
+    ops[2] = element;
+    ret emit_value_instr(b, instr.OP_INSERT, agg.ty, ?ops[0], 3);
+}
+
+# emits a phi node of type `ty` into the current block's phi list with no
+# incoming edges yet; populate it with `phi_add_incoming`. phis logically
+# execute at block entry, before the body.
+# ---
+# b:   the builder
+# ty:  result type of the phi
+# ret: a value naming the phi result, or an error
+pub fun emit_phi(b: *Builder, ty: ir_type.IrTypeId) Result[value.Value, str] {
+    if (b.fn == nil) { ret err[value.Value, str]("builder: emit_phi with no current function"); }
+    if (b.block >= b.fn.block_count) { ret err[value.Value, str]("builder: emit_phi with invalid block cursor"); }
+
+    val ir_res: Result[id.InstructionId, str] = pool_append(b, instr.OP_PHI, ty, nil, 0);
+    if (is_err[id.InstructionId, str](ir_res)) { ret err[value.Value, str](unwrap_err[id.InstructionId, str](ir_res)); }
+    val iid: id.InstructionId = unwrap_ok[id.InstructionId, str](ir_res);
+
+    val blk: *ir.Block = ?b.fn.blocks[b.block];
+    val ar: Result[bool, str] = block_push_phi(b, blk, iid);
+    if (is_err[bool, str](ar)) { ret err[value.Value, str](unwrap_err[bool, str](ar)); }
+    ret ok[value.Value, str](value.instr_value(iid, ty));
+}
+
+# appends one incoming `(source_block, val)` edge to a phi instruction. the
+# operand layout is [block0, val0, block1, val1, ...]; the predecessor block
+# id rides in the value slot it pairs with, encoded as a const_int.
+# ---
+# b:      the builder
+# phi:    the phi value returned by emit_phi
+# source: predecessor block contributing `val`
+# val:    the value flowing in from `source`
+# ret:    ok(true) on success, or an error
+pub fun phi_add_incoming(b: *Builder, phi: value.Value, source: id.BlockId, val: value.Value) Result[bool, str] {
+    if (b.fn == nil) { ret err[bool, str]("builder: phi_add_incoming with no current function"); }
+    if (phi.kind != value.VAL_INSTR) { ret err[bool, str]("builder: phi_add_incoming on a non-instruction value"); }
+
+    val iid: id.InstructionId = phi.data.instr;
+    if (iid >= b.fn.instr_len) { ret err[bool, str]("builder: phi_add_incoming with stale phi id"); }
+    val ins: *instr.Instruction = ?b.fn.instrs[iid];
+    if (ins.kind != instr.OP_PHI) { ret err[bool, str]("builder: phi_add_incoming on a non-phi instruction"); }
+
+    val br: Result[ir_type.IrTypeId, str] = ptr_type(b);
+    if (is_err[ir_type.IrTypeId, str](br)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](br)); }
+    val block_ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](br);
+
+    val block_val: value.Value = value.const_int(source::u64, block_ty);
+
+    val new_count: u32 = ins.operand_count + 2;
+    val gr: Result[*value.Value, str] = grow_operands(b, ins.operands, ins.operand_count, new_count);
+    if (is_err[*value.Value, str](gr)) { ret err[bool, str](unwrap_err[*value.Value, str](gr)); }
+    val ops: *value.Value = unwrap_ok[*value.Value, str](gr);
+    ops[ins.operand_count]     = block_val;
+    ops[ins.operand_count + 1] = val;
+    ins.operands      = ops;
+    ins.operand_count = new_count;
+    ret ok[bool, str](true);
+}
+
+# emits a call to `callee` with the given arguments. the result type is the
+# callee function type's return type, supplied by the caller as `ret_ty`
+# (IRT_VOID for a void call still yields a Value carrying the void type).
+# operand order is [callee, arg0, arg1, ...].
+# ---
+# b:         the builder
+# callee:    function value (VAL_FN or a function-pointer value)
+# args:      pointer to an array of argument values
+# arg_count: number of arguments
+# ret_ty:    the call's result type
+# ret:       a value naming the call result, or an error
+pub fun emit_call(b: *Builder, callee: value.Value, args: *value.Value, arg_count: u32, ret_ty: ir_type.IrTypeId) Result[value.Value, str] {
+    val total: u32 = arg_count + 1;
+    val ar: Result[*value.Value, str] = allocate[value.Value](b.m.alloc, total::usize);
+    if (is_err[*value.Value, str](ar)) { ret err[value.Value, str](unwrap_err[*value.Value, str](ar)); }
+    val ops: *value.Value = unwrap_ok[*value.Value, str](ar);
+    ops[0] = callee;
+    var i: u32 = 0;
+    for (i < arg_count) {
+        ops[1 + i] = args[i];
+        i = i + 1;
+    }
+
+    val r: Result[id.InstructionId, str] = emit_raw_owned(b, instr.OP_CALL, ret_ty, ops, total);
+    if (is_err[id.InstructionId, str](r)) { ret err[value.Value, str](unwrap_err[id.InstructionId, str](r)); }
+    val iid: id.InstructionId = unwrap_ok[id.InstructionId, str](r);
+    ret ok[value.Value, str](value.instr_value(iid, ret_ty));
+}
+
+# emits an unconditional branch to `target`, terminating the current block
+# and recording the edge in `target.preds`.
+# ---
+# b:      the builder
+# target: successor block
+# ret:    ok(true) on success, or an error (e.g. block already terminated)
+pub fun emit_br(b: *Builder, target: id.BlockId) Result[bool, str] {
+    val gr: Result[ir_type.IrTypeId, str] = void_type(b);
+    if (is_err[ir_type.IrTypeId, str](gr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](gr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](gr);
+
+    val br: Result[ir_type.IrTypeId, str] = ptr_type(b);
+    if (is_err[ir_type.IrTypeId, str](br)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](br)); }
+    val block_ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](br);
+
+    var ops: [1]value.Value;
+    ops[0] = value.const_int(target::u64, block_ty);
+    val r: Result[id.InstructionId, str] = emit_terminator(b, instr.OP_BR, vty, ?ops[0], 1);
+    if (is_err[id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[id.InstructionId, str](r)); }
+
+    ret add_pred(b, target);
+}
+
+# emits a conditional branch: if `cond` is nonzero go to `then_b`, else
+# `else_b`. terminates the current block and records both edges.
+# operand order is [cond, then, else].
+# ---
+# b:      the builder
+# cond:   8-bit condition value
+# then_b: taken successor
+# else_b: untaken successor
+# ret:    ok(true) on success, or an error
+pub fun emit_cbr(b: *Builder, cond: value.Value, then_b: id.BlockId, else_b: id.BlockId) Result[bool, str] {
+    val gr: Result[ir_type.IrTypeId, str] = void_type(b);
+    if (is_err[ir_type.IrTypeId, str](gr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](gr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](gr);
+
+    val br: Result[ir_type.IrTypeId, str] = ptr_type(b);
+    if (is_err[ir_type.IrTypeId, str](br)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](br)); }
+    val block_ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](br);
+
+    var ops: [3]value.Value;
+    ops[0] = cond;
+    ops[1] = value.const_int(then_b::u64, block_ty);
+    ops[2] = value.const_int(else_b::u64, block_ty);
+    val r: Result[id.InstructionId, str] = emit_terminator(b, instr.OP_CBR, vty, ?ops[0], 3);
+    if (is_err[id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[id.InstructionId, str](r)); }
+
+    val a1: Result[bool, str] = add_pred(b, then_b);
+    if (is_err[bool, str](a1)) { ret a1; }
+    ret add_pred(b, else_b);
+}
+
+# emits a value-returning ret, terminating the current block.
+# ---
+# b:   the builder
+# val: the value to return
+# ret: ok(true) on success, or an error
+pub fun emit_ret(b: *Builder, val: value.Value) Result[bool, str] {
+    val gr: Result[ir_type.IrTypeId, str] = void_type(b);
+    if (is_err[ir_type.IrTypeId, str](gr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](gr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](gr);
+
+    var ops: [1]value.Value;
+    ops[0] = val;
+    val r: Result[id.InstructionId, str] = emit_terminator(b, instr.OP_RET, vty, ?ops[0], 1);
+    if (is_err[id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[id.InstructionId, str](r)); }
+    ret ok[bool, str](true);
+}
+
+# emits a void ret (no return value), terminating the current block.
+# ---
+# b:   the builder
+# ret: ok(true) on success, or an error
+pub fun emit_ret_void(b: *Builder) Result[bool, str] {
+    val gr: Result[ir_type.IrTypeId, str] = void_type(b);
+    if (is_err[ir_type.IrTypeId, str](gr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](gr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](gr);
+
+    val r: Result[id.InstructionId, str] = emit_terminator(b, instr.OP_RET, vty, nil, 0);
+    if (is_err[id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[id.InstructionId, str](r)); }
+    ret ok[bool, str](true);
+}
+
+# emits an unreachable terminator, ending the current block. used after a
+# noreturn call or as a fallthrough trap.
+# ---
+# b:   the builder
+# ret: ok(true) on success, or an error
+pub fun emit_unreachable(b: *Builder) Result[bool, str] {
+    val gr: Result[ir_type.IrTypeId, str] = void_type(b);
+    if (is_err[ir_type.IrTypeId, str](gr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](gr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](gr);
+
+    val r: Result[id.InstructionId, str] = emit_terminator(b, instr.OP_UNREACHABLE, vty, nil, 0);
+    if (is_err[id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[id.InstructionId, str](r)); }
+    ret ok[bool, str](true);
+}
+
+# emits an inline-asm instruction with the given operand values. the asm
+# body and operand descriptors are registered separately in `Function.asm`
+# by the caller, keyed on the returned instruction id. produces a void
+# result. operands are the values fed into the asm block, in source order.
+# ---
+# b:             the builder
+# operands:      pointer to an array of input operand values
+# operand_count: number of input operands
+# ret:           the new OP_ASM instruction id (key into Function.asm), or an error
+pub fun emit_asm(b: *Builder, operands: *value.Value, operand_count: u32) Result[id.InstructionId, str] {
+    val gr: Result[ir_type.IrTypeId, str] = void_type(b);
+    if (is_err[ir_type.IrTypeId, str](gr)) { ret err[id.InstructionId, str](unwrap_err[ir_type.IrTypeId, str](gr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](gr);
+
+    if (operand_count == 0) {
+        ret emit_raw(b, instr.OP_ASM, vty, nil, 0);
+    }
+    val ar: Result[*value.Value, str] = allocate[value.Value](b.m.alloc, operand_count::usize);
+    if (is_err[*value.Value, str](ar)) { ret err[id.InstructionId, str](unwrap_err[*value.Value, str](ar)); }
+    val ops: *value.Value = unwrap_ok[*value.Value, str](ar);
+    var i: u32 = 0;
+    for (i < operand_count) {
+        ops[i] = operands[i];
+        i = i + 1;
+    }
+    ret emit_raw_owned(b, instr.OP_ASM, vty, ops, operand_count);
+}
+
+# shared body for two-operand binary ops; result type follows lhs.
+fun emit_binary(b: *Builder, k: instr.InstrKind, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    var ops: [2]value.Value;
+    ops[0] = lhs;
+    ops[1] = rhs;
+    ret emit_value_instr(b, k, lhs.ty, ?ops[0], 2);
+}
+
+# shared body for single-operand ops with an explicit result type.
+fun emit_unary(b: *Builder, k: instr.InstrKind, operand: value.Value, ty: ir_type.IrTypeId) Result[value.Value, str] {
+    var ops: [1]value.Value;
+    ops[0] = operand;
+    ret emit_value_instr(b, k, ty, ?ops[0], 1);
+}
+
+# shared body for comparisons; result is an interned 8-bit integer.
+fun emit_compare(b: *Builder, k: instr.InstrKind, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    val tr: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?b.m.types, 8);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    val ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+    var ops: [2]value.Value;
+    ops[0] = lhs;
+    ops[1] = rhs;
+    ret emit_value_instr(b, k, ty, ?ops[0], 2);
+}
+
+# appends a value-producing instruction whose operands live in a caller stack
+# buffer (copied into owned storage), returning the result Value.
+fun emit_value_instr(b: *Builder, k: instr.InstrKind, ty: ir_type.IrTypeId, ops: *value.Value, n: u32) Result[value.Value, str] {
+    val r: Result[id.InstructionId, str] = emit_raw(b, k, ty, ops, n);
+    if (is_err[id.InstructionId, str](r)) { ret err[value.Value, str](unwrap_err[id.InstructionId, str](r)); }
+    val iid: id.InstructionId = unwrap_ok[id.InstructionId, str](r);
+    ret ok[value.Value, str](value.instr_value(iid, ty));
+}
+
+# copies `n` operands from a stack buffer into owned storage, appends a new
+# instruction to the pool, and links it into the current block's body.
+fun emit_raw(b: *Builder, k: instr.InstrKind, ty: ir_type.IrTypeId, ops: *value.Value, n: u32) Result[id.InstructionId, str] {
+    if (n == 0) { ret emit_raw_owned(b, k, ty, nil, 0); }
+    val ar: Result[*value.Value, str] = allocate[value.Value](b.m.alloc, n::usize);
+    if (is_err[*value.Value, str](ar)) { ret err[id.InstructionId, str](unwrap_err[*value.Value, str](ar)); }
+    val owned: *value.Value = unwrap_ok[*value.Value, str](ar);
+    var i: u32 = 0;
+    for (i < n) {
+        owned[i] = ops[i];
+        i = i + 1;
+    }
+    ret emit_raw_owned(b, k, ty, owned, n);
+}
+
+# appends a non-terminator instruction taking ownership of `owned` operands,
+# linking it into the current block's body list. on failure the operand
+# array is released so the caller never leaks it.
+fun emit_raw_owned(b: *Builder, k: instr.InstrKind, ty: ir_type.IrTypeId, owned: *value.Value, n: u32) Result[id.InstructionId, str] {
+    if (b.fn == nil) {
+        if (owned != nil) { dealloc_ops(b, owned, n); }
+        ret err[id.InstructionId, str]("builder: emit with no current function");
+    }
+    if (b.block >= b.fn.block_count) {
+        if (owned != nil) { dealloc_ops(b, owned, n); }
+        ret err[id.InstructionId, str]("builder: emit with invalid block cursor");
+    }
+    val blk: *ir.Block = ?b.fn.blocks[b.block];
+    if (blk.terminator != id.INSTR_NIL) {
+        if (owned != nil) { dealloc_ops(b, owned, n); }
+        ret err[id.InstructionId, str]("builder: emit into an already-terminated block");
+    }
+
+    val r: Result[id.InstructionId, str] = pool_append(b, k, ty, owned, n);
+    if (is_err[id.InstructionId, str](r)) {
+        if (owned != nil) { dealloc_ops(b, owned, n); }
+        ret r;
+    }
+    val iid: id.InstructionId = unwrap_ok[id.InstructionId, str](r);
+
+    # once appended, the operand array is owned by the pool entry; a
+    # block-link failure leaves the instruction (with its operands) in the
+    # pool for dnit_function to reclaim — do not free here.
+    val pr: Result[bool, str] = block_push_instr(b, blk, iid);
+    if (is_err[bool, str](pr)) { ret err[id.InstructionId, str](unwrap_err[bool, str](pr)); }
+    ret ok[id.InstructionId, str](iid);
+}
+
+# appends a terminator instruction. operands are copied from a stack buffer
+# into owned storage. the instruction is recorded in `Block.terminator` (not
+# the body list). rejects a second terminator. successor pred-list updates
+# are the caller's job.
+fun emit_terminator(b: *Builder, k: instr.InstrKind, ty: ir_type.IrTypeId, stack_ops: *value.Value, n: u32) Result[id.InstructionId, str] {
+    if (b.fn == nil) { ret err[id.InstructionId, str]("builder: terminator with no current function"); }
+    if (b.block >= b.fn.block_count) { ret err[id.InstructionId, str]("builder: terminator with invalid block cursor"); }
+    val blk: *ir.Block = ?b.fn.blocks[b.block];
+    if (blk.terminator != id.INSTR_NIL) {
+        ret err[id.InstructionId, str]("builder: block already has a terminator");
+    }
+
+    var owned: *value.Value = nil;
+    if (n > 0) {
+        val ar: Result[*value.Value, str] = allocate[value.Value](b.m.alloc, n::usize);
+        if (is_err[*value.Value, str](ar)) { ret err[id.InstructionId, str](unwrap_err[*value.Value, str](ar)); }
+        owned = unwrap_ok[*value.Value, str](ar);
+        var i: u32 = 0;
+        for (i < n) {
+            owned[i] = stack_ops[i];
+            i = i + 1;
+        }
+    }
+
+    val r: Result[id.InstructionId, str] = pool_append(b, k, ty, owned, n);
+    if (is_err[id.InstructionId, str](r)) {
+        if (owned != nil) { dealloc_ops(b, owned, n); }
+        ret r;
+    }
+    val iid: id.InstructionId = unwrap_ok[id.InstructionId, str](r);
+    blk.terminator = iid;
+    ret ok[id.InstructionId, str](iid);
+}
+
+# allocates a slot in the function's instruction pool and writes a fresh
+# Instruction record; returns its id. takes ownership of `operands`.
+fun pool_append(b: *Builder, k: instr.InstrKind, ty: ir_type.IrTypeId, operands: *value.Value, n: u32) Result[id.InstructionId, str] {
+    val fn: *ir.Function = b.fn;
+    if (fn.instr_len == fn.instr_cap) {
+        val gr: Result[bool, str] = grow_instrs(b);
+        if (is_err[bool, str](gr)) { ret err[id.InstructionId, str](unwrap_err[bool, str](gr)); }
+    }
+    val iid: id.InstructionId = fn.instr_len;
+    var ins: instr.Instruction;
+    ins.kind          = k;
+    ins.ty            = ty;
+    ins.operands      = operands;
+    ins.operand_count = n;
+    ins.block         = b.block;
+    ins.flags         = 0;
+    ins.aux_ty        = ir_type.IRT_NIL;
+    fn.instrs[iid]    = ins;
+    fn.instr_len      = iid + 1;
+    ret ok[id.InstructionId, str](iid);
+}
+
+# grows the function's block array (doubling, or seeding from empty).
+fun grow_blocks(b: *Builder) Result[bool, str] {
+    val fn: *ir.Function = b.fn;
+    var new_cap: u32 = fn.block_cap * 2;
+    if (fn.block_cap == 0) { new_cap = INITIAL_BLOCK_CAP; }
+    if (fn.blocks == nil) {
+        val r: Result[*ir.Block, str] = allocate[ir.Block](b.m.alloc, new_cap::usize);
+        if (is_err[*ir.Block, str](r)) { ret err[bool, str](unwrap_err[*ir.Block, str](r)); }
+        fn.blocks = unwrap_ok[*ir.Block, str](r);
+    }
+    or {
+        val r: Result[*ir.Block, str] = reallocate[ir.Block](b.m.alloc, fn.blocks, fn.block_cap::usize, new_cap::usize);
+        if (is_err[*ir.Block, str](r)) { ret err[bool, str](unwrap_err[*ir.Block, str](r)); }
+        fn.blocks = unwrap_ok[*ir.Block, str](r);
+    }
+    fn.block_cap = new_cap;
+    ret ok[bool, str](true);
+}
+
+# grows the function's instruction pool (doubling, or seeding from empty).
+fun grow_instrs(b: *Builder) Result[bool, str] {
+    val fn: *ir.Function = b.fn;
+    var new_cap: u32 = fn.instr_cap * 2;
+    if (fn.instr_cap == 0) { new_cap = INITIAL_INSTR_CAP; }
+    if (fn.instrs == nil) {
+        val r: Result[*instr.Instruction, str] = allocate[instr.Instruction](b.m.alloc, new_cap::usize);
+        if (is_err[*instr.Instruction, str](r)) { ret err[bool, str](unwrap_err[*instr.Instruction, str](r)); }
+        fn.instrs = unwrap_ok[*instr.Instruction, str](r);
+    }
+    or {
+        val r: Result[*instr.Instruction, str] = reallocate[instr.Instruction](b.m.alloc, fn.instrs, fn.instr_cap::usize, new_cap::usize);
+        if (is_err[*instr.Instruction, str](r)) { ret err[bool, str](unwrap_err[*instr.Instruction, str](r)); }
+        fn.instrs = unwrap_ok[*instr.Instruction, str](r);
+    }
+    fn.instr_cap = new_cap;
+    ret ok[bool, str](true);
+}
+
+# appends an instruction id to a block's non-phi body list, growing it.
+fun block_push_instr(b: *Builder, blk: *ir.Block, iid: id.InstructionId) Result[bool, str] {
+    if (blk.instr_count == blk.instr_cap) {
+        var new_cap: u32 = blk.instr_cap * 2;
+        if (blk.instr_cap == 0) { new_cap = INITIAL_BLOCK_BODY_CAP; }
+        if (blk.instructions == nil) {
+            val r: Result[*id.InstructionId, str] = allocate[id.InstructionId](b.m.alloc, new_cap::usize);
+            if (is_err[*id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[*id.InstructionId, str](r)); }
+            blk.instructions = unwrap_ok[*id.InstructionId, str](r);
+        }
+        or {
+            val r: Result[*id.InstructionId, str] = reallocate[id.InstructionId](b.m.alloc, blk.instructions, blk.instr_cap::usize, new_cap::usize);
+            if (is_err[*id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[*id.InstructionId, str](r)); }
+            blk.instructions = unwrap_ok[*id.InstructionId, str](r);
+        }
+        blk.instr_cap = new_cap;
+    }
+    blk.instructions[blk.instr_count] = iid;
+    blk.instr_count = blk.instr_count + 1;
+    ret ok[bool, str](true);
+}
+
+# appends a phi instruction id to a block's phi list, growing it.
+fun block_push_phi(b: *Builder, blk: *ir.Block, iid: id.InstructionId) Result[bool, str] {
+    if (blk.phi_count == blk.phi_cap) {
+        var new_cap: u32 = blk.phi_cap * 2;
+        if (blk.phi_cap == 0) { new_cap = INITIAL_PHI_CAP; }
+        if (blk.phis == nil) {
+            val r: Result[*id.InstructionId, str] = allocate[id.InstructionId](b.m.alloc, new_cap::usize);
+            if (is_err[*id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[*id.InstructionId, str](r)); }
+            blk.phis = unwrap_ok[*id.InstructionId, str](r);
+        }
+        or {
+            val r: Result[*id.InstructionId, str] = reallocate[id.InstructionId](b.m.alloc, blk.phis, blk.phi_cap::usize, new_cap::usize);
+            if (is_err[*id.InstructionId, str](r)) { ret err[bool, str](unwrap_err[*id.InstructionId, str](r)); }
+            blk.phis = unwrap_ok[*id.InstructionId, str](r);
+        }
+        blk.phi_cap = new_cap;
+    }
+    blk.phis[blk.phi_count] = iid;
+    blk.phi_count = blk.phi_count + 1;
+    ret ok[bool, str](true);
+}
+
+# records the current block as a predecessor of `target`, growing its pred
+# list. duplicate edges (e.g. a cbr with both arms to the same block) are
+# kept, matching the phi-coverage convention of one incoming entry per edge.
+fun add_pred(b: *Builder, target: id.BlockId) Result[bool, str] {
+    if (target >= b.fn.block_count) { ret err[bool, str]("builder: branch to out-of-range block"); }
+    val blk: *ir.Block = ?b.fn.blocks[target];
+    if (blk.pred_count == blk.pred_cap) {
+        var new_cap: u32 = blk.pred_cap * 2;
+        if (blk.pred_cap == 0) { new_cap = INITIAL_PRED_CAP; }
+        if (blk.preds == nil) {
+            val r: Result[*id.BlockId, str] = allocate[id.BlockId](b.m.alloc, new_cap::usize);
+            if (is_err[*id.BlockId, str](r)) { ret err[bool, str](unwrap_err[*id.BlockId, str](r)); }
+            blk.preds = unwrap_ok[*id.BlockId, str](r);
+        }
+        or {
+            val r: Result[*id.BlockId, str] = reallocate[id.BlockId](b.m.alloc, blk.preds, blk.pred_cap::usize, new_cap::usize);
+            if (is_err[*id.BlockId, str](r)) { ret err[bool, str](unwrap_err[*id.BlockId, str](r)); }
+            blk.preds = unwrap_ok[*id.BlockId, str](r);
+        }
+        blk.pred_cap = new_cap;
+    }
+    blk.preds[blk.pred_count] = b.block;
+    blk.pred_count = blk.pred_count + 1;
+    ret ok[bool, str](true);
+}
+
+# grows an instruction's operand array from `old_count` to `new_count`,
+# copying existing operands. used by phi_add_incoming to append edges.
+fun grow_operands(b: *Builder, old: *value.Value, old_count: u32, new_count: u32) Result[*value.Value, str] {
+    if (old == nil || old_count == 0) {
+        ret allocate[value.Value](b.m.alloc, new_count::usize);
+    }
+    ret reallocate[value.Value](b.m.alloc, old, old_count::usize, new_count::usize);
+}
+
+# frees an owned operand array (used on a post-allocation failure path).
+fun dealloc_ops(b: *Builder, ops: *value.Value, n: u32) {
+    if (ops != nil && n > 0) {
+        deallocate[value.Value](b.m.alloc, ops, n::usize);
+    }
+}
+
+# interns and returns the module's void IR type.
+fun void_type(b: *Builder) Result[ir_type.IrTypeId, str] {
+    ret ir_type.intern_void(?b.m.types);
+}
+
+# interns and returns the module's pointer IR type (used for block-target
+# and computed-address operands).
+fun ptr_type(b: *Builder) Result[ir_type.IrTypeId, str] {
+    ret ir_type.intern_ptr(?b.m.types);
+}

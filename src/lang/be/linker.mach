@@ -1,0 +1,1117 @@
+# mach.lang.be.linker: disk-based static linker combining per-module objects into the final artifact.
+#
+# Reads every per-module relocatable object file from
+# disk, parses each into an in-memory `of.ObjectImage` through the active
+# format's `parse_object`, and combines them into the requested artifact:
+# a static executable (the default `mach build` output) or, for library builds,
+# a single merged relocatable object. Linking is the compute body of `Q_LINK`.
+#
+# The pipeline is the classic static-link sequence, kept entirely
+# target-agnostic by routing every machine-specific decision through the
+# `target.Target` vtables:
+#   0. read each input object file (`fs.read_all`) and parse it into an
+#      `of.ObjectImage` via `tgt.of.parse_object`.
+#   1. collect/merge symbols keyed by `intern.StrId` — duplicate strong
+#      definitions are an error.
+#   2. lay out same-kind sections, concatenated with per-section alignment, and
+#      assign virtual addresses from the OS base address, page-aligned per
+#      section group (executables only).
+#   3. resolve each relocation to a final symbol virtual address and patch the
+#      laid-out bytes in place (executables only).
+#   4a. executable: lay the merged sections out as page-aligned load segments
+#       (one per kind) and write them through `tgt.of.emit_exec`, with the
+#       entry point at the OS entry symbol (`_start`).
+#   4b. library (relocatable): carry the input relocations forward unpatched and
+#       write the single merged object through `obj.emit`.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+use std.types.size.usize;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.zallocate;
+use std.allocator.deallocate;
+
+use mem: std.memory;
+use fs:  std.filesystem;
+use map: std.collections.map;
+
+use sess:   mach.lang.session;
+use intern: mach.lang.intern;
+use target: mach.lang.target;
+use of:     mach.lang.target.of;
+use obj:    mach.lang.be.obj;
+
+# link mode: what kind of artifact `link` produces.
+pub def LinkMode: u8;
+
+# fully-linked static executable (default for `mach build`).
+pub val LINK_EXE:         LinkMode = 0;
+# single merged relocatable object; symbols and relocations are preserved.
+pub val LINK_RELOCATABLE: LinkMode = 1;
+# shared object / dynamic library.
+pub val LINK_SHARED:      LinkMode = 2;
+
+# number of distinct merged output sections, one per `of.SK_*` kind. the merge
+# concatenates every input section of a kind into the kind's single output
+# section, in the canonical order TEXT, RODATA, DATA, BSS, DEBUG.
+val MERGED_KIND_COUNT: u32 = 5;
+
+# placement of one input section within the merged image: which merged output
+# section it landed in, its byte offset there, and its final virtual address
+# (0 in relocatable mode). symbols and relocations rebase through this record.
+# ---
+# merged_index: index of the merged output section this input section joined
+# offset:       byte offset of this input section within the merged section
+# vaddr:        final virtual address of this input section (0 if not assigned)
+rec Placement {
+    merged_index: u32;
+    offset:       u32;
+    vaddr:        u64;
+}
+
+# accumulator describing one merged output section while it is being built: its
+# kind, the maximum alignment demanded by any contributing input section, the
+# running content length, and the assigned base virtual address.
+# ---
+# kind:  the section kind this accumulator merges
+# align: largest alignment any contributing section requires
+# len:   total content length accumulated so far
+# vaddr: base virtual address assigned to this merged section (0 if unassigned)
+# used:  true once at least one input section contributed
+rec MergedSection {
+    kind:  of.SectionKind;
+    align: u32;
+    len:   u32;
+    vaddr: u64;
+    used:  bool;
+}
+
+# resolved location of a defined symbol: its final virtual address (the only
+# datum relocation patching needs). undefined symbols never enter this table.
+# ---
+# vaddr: final virtual address of the symbol (its section's vaddr + offset)
+rec SymbolLoc {
+    vaddr: u64;
+}
+
+# link: read the input object files from disk and combine them into the
+# requested artifact.
+#
+# reads each `obj_paths[i]` (`fs.read_all`), parses it into an `of.ObjectImage`
+# through `tgt.of.parse_object`, then merges symbols (rejecting duplicate strong
+# definitions), lays out the concatenated sections, and either (executable)
+# assigns virtual addresses, patches relocations, and writes page-aligned load
+# segments through `tgt.of.emit_exec`, or (library / relocatable) carries the
+# input relocations forward and writes a single merged object through
+# `obj.emit`. `LINK_SHARED` is not yet supported.
+# ---
+# s:         shared session (allocator, interner, diagnostics)
+# tgt:       active target — selects OS base address, entry symbol, and writers
+# obj_paths: array of null-terminated paths to the per-module object files
+# obj_count: number of input object files
+# out_path:  null-terminated output file path
+# mode:      executable, relocatable (library), or shared
+# ret:       true once the artifact is written, or an error string
+pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
+             obj_count: u32, out_path: *u8, mode: LinkMode) Result[bool, str] {
+    if (s == nil)   { ret err[bool, str]("link: nil session"); }
+    if (tgt == nil) { ret err[bool, str]("link: nil target"); }
+    if (tgt.of == nil) { ret err[bool, str]("link: target has no object-format vtable"); }
+    if (tgt.os == nil) { ret err[bool, str]("link: target has no OS vtable"); }
+    if (mode == LINK_SHARED) {
+        ret err[bool, str]("relocation 'shared' not supported by linker");
+    }
+    if (obj_paths == nil || obj_count == 0) {
+        ret err[bool, str]("link: no input objects");
+    }
+
+    val alloc: *Allocator = s.alloc;
+
+    # read and parse every input object file into an in-memory image array. the
+    # array and each populated image are torn down on every exit path below.
+    var modules: *of.ObjectImage = nil;
+    val read_r: Result[*of.ObjectImage, str] = read_objects(s, tgt, obj_paths, obj_count);
+    if (is_err[*of.ObjectImage, str](read_r)) {
+        ret err[bool, str](unwrap_err[*of.ObjectImage, str](read_r));
+    }
+    modules = unwrap_ok[*of.ObjectImage, str](read_r);
+    val module_count: u32 = obj_count;
+
+    # build the merged-section accumulators, one per kind, in canonical order.
+    var merged: [5]MergedSection;
+    init_merged(?merged[0]);
+
+    # first pass over every input section: tally per-kind length and alignment,
+    # and remember each input section's placement (merged index + offset). the
+    # placements live in a flat array indexed by (module, section) via a prefix
+    # sum of per-module section counts.
+    val sec_total: u32 = total_sections(modules, module_count);
+    var placements: *Placement = nil;
+    if (sec_total > 0) {
+        val pr: Result[*Placement, str] = zallocate[Placement](alloc, sec_total::usize);
+        if (is_err[*Placement, str](pr)) {
+            free_modules(alloc, modules, module_count);
+            ret err[bool, str](unwrap_err[*Placement, str](pr));
+        }
+        placements = unwrap_ok[*Placement, str](pr);
+    }
+
+    # per-module base into the flat placements array.
+    var sec_base: *u32 = nil;
+    val br: Result[*u32, str] = zallocate[u32](alloc, module_count::usize);
+    if (is_err[*u32, str](br)) {
+        free_placements(alloc, placements, sec_total);
+        free_modules(alloc, modules, module_count);
+        ret err[bool, str](unwrap_err[*u32, str](br));
+    }
+    sec_base = unwrap_ok[*u32, str](br);
+
+    accumulate_sections(modules, module_count, ?merged[0], placements, sec_base);
+
+    # assign each merged section a virtual address (executables only). sections
+    # are placed in canonical order from the OS base, each kind page-aligned.
+    val assign_vaddrs: bool = (mode == LINK_EXE);
+    if (assign_vaddrs) {
+        assign_section_vaddrs(tgt, ?merged[0]);
+        finalize_placement_vaddrs(?merged[0], placements, sec_total);
+    }
+
+    # collect the global symbol table: every defined symbol keyed by name, with
+    # its resolved location. duplicate strong definitions are rejected.
+    var sym_locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](alloc, map.hash_u32, map.eq_u32);
+
+    val collect_r: Result[bool, str] =
+        collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs, assign_vaddrs);
+    if (is_err[bool, str](collect_r)) {
+        map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_modules(alloc, modules, module_count);
+        ret err[bool, str](unwrap_err[bool, str](collect_r));
+    }
+
+    # build the merged output image. allocate each merged section's byte buffer
+    # and copy every contributing input section into place.
+    var out_img: of.ObjectImage;
+    val img_r: Result[of.ObjectImage, str] = obj.init(alloc, image_name(modules, module_count));
+    if (is_err[of.ObjectImage, str](img_r)) {
+        map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_modules(alloc, modules, module_count);
+        ret err[bool, str](unwrap_err[of.ObjectImage, str](img_r));
+    }
+    out_img = unwrap_ok[of.ObjectImage, str](img_r);
+
+    val build_r: Result[bool, str] =
+        build_merged_image(s, ?out_img, modules, module_count, ?merged[0], placements, sec_base);
+    if (is_err[bool, str](build_r)) {
+        obj.dnit(?out_img);
+        map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_modules(alloc, modules, module_count);
+        ret err[bool, str](unwrap_err[bool, str](build_r));
+    }
+
+    # executable: resolve+patch relocations into the merged bytes, then write the
+    # page-aligned load segments through the format's executable writer.
+    if (mode == LINK_EXE) {
+        val patch_r: Result[bool, str] =
+            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, ?sym_locs);
+        if (is_err[bool, str](patch_r)) {
+            obj.dnit(?out_img);
+            map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+            free_scratch(alloc, placements, sec_total, sec_base, module_count);
+            free_modules(alloc, modules, module_count);
+            ret err[bool, str](unwrap_err[bool, str](patch_r));
+        }
+
+        val emit_r: Result[bool, str] =
+            emit_executable(s, tgt, ?out_img, ?merged[0], ?sym_locs, out_path);
+
+        obj.dnit(?out_img);
+        map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_modules(alloc, modules, module_count);
+
+        if (is_err[bool, str](emit_r)) {
+            ret err[bool, str](unwrap_err[bool, str](emit_r));
+        }
+        ret ok[bool, str](true);
+    }
+
+    # library (relocatable): carry the input relocations forward unpatched and
+    # write the single merged object through the format's object writer.
+    val carry_r: Result[bool, str] =
+        carry_relocations(?out_img, modules, module_count, placements, sec_base);
+    if (is_err[bool, str](carry_r)) {
+        obj.dnit(?out_img);
+        map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_modules(alloc, modules, module_count);
+        ret err[bool, str](unwrap_err[bool, str](carry_r));
+    }
+
+    val obj_r: Result[bool, str] = obj.emit(?out_img, tgt, out_path);
+
+    obj.dnit(?out_img);
+    map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+    free_scratch(alloc, placements, sec_total, sec_base, module_count);
+    free_modules(alloc, modules, module_count);
+
+    if (is_err[bool, str](obj_r)) {
+        ret err[bool, str](unwrap_err[bool, str](obj_r));
+    }
+    ret ok[bool, str](true);
+}
+
+# read_objects: read and parse every input object file into a fresh image array.
+#
+# allocates an `obj_count`-long `of.ObjectImage` array, then for each path reads
+# the whole file (`fs.read_all`) and parses it through the active format's
+# `parse_object`. on any failure every image parsed so far and the array itself
+# are released before returning the error, so the caller never inherits a
+# partial array. the read buffer is freed after parse — `parse_object` copies
+# the section bytes it keeps into the image.
+# ---
+# s:         shared session (allocator, interner)
+# tgt:       active target — supplies the format parser
+# obj_paths: array of null-terminated object-file paths
+# obj_count: number of paths
+# ret:       the populated image array, or an error string
+fun read_objects(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
+                 obj_count: u32) Result[*of.ObjectImage, str] {
+    if (tgt.of.parse_object == nil) {
+        ret err[*of.ObjectImage, str]("link: object format has no parser");
+    }
+    val alloc: *Allocator = s.alloc;
+
+    val ar: Result[*of.ObjectImage, str] = zallocate[of.ObjectImage](alloc, obj_count::usize);
+    if (is_err[*of.ObjectImage, str](ar)) {
+        ret err[*of.ObjectImage, str](unwrap_err[*of.ObjectImage, str](ar));
+    }
+    val modules: *of.ObjectImage = unwrap_ok[*of.ObjectImage, str](ar);
+
+    var i: u32 = 0;
+    for (i < obj_count) {
+        if (obj_paths[i] == nil) {
+            free_modules_to(alloc, modules, i, obj_count);
+            ret err[*of.ObjectImage, str]("link: nil object path");
+        }
+
+        # view the null-terminated path as a str for the filesystem layer.
+        var path: str;
+        path.data = obj_paths[i];
+        path.len  = cstr_len(obj_paths[i])::u32;
+
+        val rb: Result[str, str] = fs.read_all(alloc, path);
+        if (is_err[str, str](rb)) {
+            free_modules_to(alloc, modules, i, obj_count);
+            ret err[*of.ObjectImage, str](read_message(s, path, unwrap_err[str, str](rb)));
+        }
+        val buf: str = unwrap_ok[str, str](rb);
+
+        val pr: Result[bool, str] =
+            tgt.of.parse_object(alloc, buf.data, buf.len::usize, ?modules[i]);
+        # the parser copies any bytes it keeps; the file buffer is no longer
+        # needed regardless of success. read_all over-allocates by one nul byte.
+        if (buf.data != nil) { deallocate[u8](alloc, buf.data, (buf.len + 1)::usize); }
+        if (is_err[bool, str](pr)) {
+            free_modules_to(alloc, modules, i, obj_count);
+            ret err[*of.ObjectImage, str](unwrap_err[bool, str](pr));
+        }
+
+        i = i + 1;
+    }
+
+    ret ok[*of.ObjectImage, str](modules);
+}
+
+# emit_executable: lay the merged sections out as load segments and write the
+# static executable.
+#
+# builds one page-aligned `of.LoadSegment` per used loadable merged kind (text,
+# rodata, data, bss — debug is non-allocated and excluded) — its bytes are the
+# already-patched merged-section content, its vaddr the kind's assigned base, its
+# permissions derived from the kind — then resolves the OS entry symbol
+# (`_start`) to its virtual address and writes the segments through
+# `tgt.of.emit_exec`. an undefined or missing entry symbol is an error.
+# ---
+# s:        shared session (allocator, interner)
+# tgt:      active target — supplies the entry symbol and executable writer
+# out_img:  the merged image holding the patched section bytes
+# merged:   the per-kind merged-section accumulators (carry vaddrs and lengths)
+# sym_locs: resolved symbol table, for the entry address
+# out_path: null-terminated output file path
+# ret:      true once the executable is written, or an error string
+fun emit_executable(s: *sess.Session, tgt: *target.Target, out_img: *of.ObjectImage,
+                    merged: *MergedSection, sym_locs: *map.Map[intern.StrId, SymbolLoc],
+                    out_path: *u8) Result[bool, str] {
+    if (tgt.of.emit_exec == nil) {
+        ret err[bool, str]("link: object format cannot write executables");
+    }
+    if (tgt.os == nil) {
+        ret err[bool, str]("link: target has no operating-system vtable");
+    }
+
+    val alloc: *Allocator = s.alloc;
+
+    # resolve the program entry point to the OS entry symbol's virtual address.
+    val entry_name: intern.StrId = tgt.os.entry_symbol;
+    val el: Result[*SymbolLoc, str] =
+        map.get[intern.StrId, SymbolLoc](sym_locs, ?entry_name);
+    if (is_err[*SymbolLoc, str](el)) {
+        ret err[bool, str](entry_message(s, entry_name));
+    }
+    val entry: u64 = unwrap_ok[*SymbolLoc, str](el).vaddr;
+
+    # one load segment per used loadable merged kind, in canonical
+    # (ascending-vaddr) order.
+    var seg_count: u32 = 0;
+    var k: u32 = 0;
+    for (k < MERGED_KIND_COUNT) {
+        if (is_loadable_kind(merged[k].kind) && merged[k].used && merged[k].len > 0) {
+            seg_count = seg_count + 1;
+        }
+        k = k + 1;
+    }
+    if (seg_count == 0) {
+        ret err[bool, str]("link: no loadable sections");
+    }
+
+    val sr: Result[*of.LoadSegment, str] = zallocate[of.LoadSegment](alloc, seg_count::usize);
+    if (is_err[*of.LoadSegment, str](sr)) {
+        ret err[bool, str](unwrap_err[*of.LoadSegment, str](sr));
+    }
+    val segs: *of.LoadSegment = unwrap_ok[*of.LoadSegment, str](sr);
+
+    var si: u32 = 0;
+    k = 0;
+    for (k < MERGED_KIND_COUNT) {
+        if (is_loadable_kind(merged[k].kind) && merged[k].used && merged[k].len > 0) {
+            segs[si].vaddr  = merged[k].vaddr;
+            segs[si].memsz  = merged[k].len::usize;
+            segs[si].flags  = seg_flags_for(merged[k].kind);
+            if (merged[k].kind == of.SK_BSS) {
+                # bss occupies memory but carries no file bytes.
+                segs[si].filesz = 0;
+                segs[si].bytes  = nil;
+            }
+            or {
+                segs[si].filesz = merged[k].len::usize;
+                segs[si].bytes  = merged_section_bytes(out_img, merged[k].kind);
+            }
+            si = si + 1;
+        }
+        k = k + 1;
+    }
+
+    val emit_r: Result[bool, str] =
+        tgt.of.emit_exec(alloc, tgt.arch, segs, seg_count, entry, out_path);
+
+    deallocate[of.LoadSegment](alloc, segs, seg_count::usize);
+
+    if (is_err[bool, str](emit_r)) {
+        ret err[bool, str](unwrap_err[bool, str](emit_r));
+    }
+    ret ok[bool, str](true);
+}
+
+# is_loadable_kind: whether a merged section kind becomes a loadable executable
+# segment. text, rodata, data, and bss are mapped; debug carries no allocation
+# flag and is excluded from the runnable image.
+fun is_loadable_kind(kind: of.SectionKind) bool {
+    ret kind != of.SK_DEBUG;
+}
+
+# seg_flags_for: the load-segment permissions for a merged section kind. text is
+# read+execute; read-only data is read-only; data and bss are read+write.
+fun seg_flags_for(kind: of.SectionKind) u32 {
+    if (kind == of.SK_TEXT) { ret of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; }
+    if (kind == of.SK_DATA) { ret of.SEG_FLAG_READ | of.SEG_FLAG_WRITE; }
+    if (kind == of.SK_BSS)  { ret of.SEG_FLAG_READ | of.SEG_FLAG_WRITE; }
+    ret of.SEG_FLAG_READ;
+}
+
+# merged_section_bytes: the byte buffer of the output image's section of a given
+# kind, or nil if no such section exists (the merge produced at most one section
+# per kind).
+fun merged_section_bytes(out_img: *of.ObjectImage, kind: of.SectionKind) *u8 {
+    var i: u32 = 0;
+    for (i < out_img.section_count) {
+        if (out_img.sections[i].kind == kind) { ret out_img.sections[i].bytes; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# init_merged: reset the per-kind accumulator array to its canonical kinds and
+# empty state. index i holds kind i (SK_TEXT..SK_DEBUG).
+fun init_merged(merged: *MergedSection) {
+    var i: u32 = 0;
+    for (i < MERGED_KIND_COUNT) {
+        merged[i].kind  = i::u8;
+        merged[i].align = 1;
+        merged[i].len   = 0;
+        merged[i].vaddr = 0;
+        merged[i].used  = false;
+        i = i + 1;
+    }
+}
+
+# total_sections: sum the section counts of every input image.
+fun total_sections(modules: *of.ObjectImage, module_count: u32) u32 {
+    var total: u32 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        total = total + modules[m].section_count;
+        m = m + 1;
+    }
+    ret total;
+}
+
+# accumulate_sections: tally each merged section's length and alignment and
+# record every input section's placement (merged index + offset within the
+# merged section). also fills `sec_base` with the per-module prefix offset into
+# the flat placement array.
+fun accumulate_sections(modules: *of.ObjectImage, module_count: u32,
+                        merged: *MergedSection, placements: *Placement, sec_base: *u32) {
+    var flat: u32 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        sec_base[m] = flat;
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[sc];
+            val ki: u32 = clamp_kind(sec.kind);
+
+            var a: u32 = sec.align;
+            if (a == 0) { a = 1; }
+            if (a > merged[ki].align) { merged[ki].align = a; }
+
+            # align the running offset to this section's alignment.
+            val off: u32 = align_up_u32(merged[ki].len, a);
+            placements[flat].merged_index = ki;
+            placements[flat].offset       = off;
+            placements[flat].vaddr        = 0;
+
+            merged[ki].len  = off + sec.len;
+            merged[ki].used = true;
+
+            flat = flat + 1;
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+}
+
+# assign_section_vaddrs: give each used merged section a base virtual address,
+# starting from the OS base and page-aligning each kind's start.
+fun assign_section_vaddrs(tgt: *target.Target, merged: *MergedSection) {
+    val base: u64 = os_base_addr(tgt);
+    val page: u64 = os_page_size(tgt);
+
+    var va: u64 = base;
+    var i: u32 = 0;
+    for (i < MERGED_KIND_COUNT) {
+        if (merged[i].used) {
+            var seg_align: u64 = merged[i].align::u64;
+            if (seg_align < page) { seg_align = page; }
+            va = align_up_u64(va, seg_align);
+            merged[i].vaddr = va;
+            va = va + merged[i].len::u64;
+        }
+        i = i + 1;
+    }
+}
+
+# finalize_placement_vaddrs: now that merged sections have base addresses, fold
+# each placement's intra-section offset into a final virtual address.
+fun finalize_placement_vaddrs(merged: *MergedSection, placements: *Placement, sec_total: u32) {
+    var i: u32 = 0;
+    for (i < sec_total) {
+        val ki: u32 = placements[i].merged_index;
+        placements[i].vaddr = merged[ki].vaddr + placements[i].offset::u64;
+        i = i + 1;
+    }
+}
+
+# collect_symbols: merge every defined symbol into the global table keyed by
+# name. records the symbol's merged section and final virtual address. rejects a
+# second strong (non-weak) definition of the same name.
+fun collect_symbols(s: *sess.Session, modules: *of.ObjectImage, module_count: u32,
+                    placements: *Placement, sec_base: *u32,
+                    sym_locs: *map.Map[intern.StrId, SymbolLoc], have_vaddrs: bool) Result[bool, str] {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
+            if (sym.section >= modules[m].section_count) { sy = sy + 1; cnt; }
+
+            val flat: u32 = sec_base[m] + sym.section;
+            val pl: *Placement = ?placements[flat];
+
+            val existing: Result[*SymbolLoc, str] =
+                map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name);
+            if (is_ok[*SymbolLoc, str](existing)) {
+                val is_weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
+                if (!is_weak) {
+                    ret err[bool, str](dup_message(s, sym.name));
+                }
+                sy = sy + 1;
+                cnt;
+            }
+
+            var loc: SymbolLoc;
+            if (have_vaddrs) {
+                loc.vaddr = pl.vaddr + sym.offset::u64;
+            }
+            or {
+                loc.vaddr = 0;
+            }
+
+            val ins: Result[bool, str] =
+                map.insert[intern.StrId, SymbolLoc](sym_locs, sym.name, loc);
+            if (is_err[bool, str](ins)) {
+                ret err[bool, str](unwrap_err[bool, str](ins));
+            }
+
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# build_merged_image: allocate one output section per used kind and copy every
+# contributing input section's bytes into its placed offset. records, on the
+# output image, the merged section's kind, alignment, length, and (for
+# executables) virtual address via the section name. BSS sections carry no
+# bytes.
+fun build_merged_image(s: *sess.Session, out_img: *of.ObjectImage,
+                       modules: *of.ObjectImage, module_count: u32,
+                       merged: *MergedSection, placements: *Placement, sec_base: *u32) Result[bool, str] {
+    val alloc: *Allocator = s.alloc;
+
+    # map each used kind to its output-section index so symbols/relocations can
+    # be rebased; -1 (0xFFFFFFFF) marks a kind with no content.
+    var kind_to_out: [5]u32;
+    var k: u32 = 0;
+    for (k < MERGED_KIND_COUNT) { kind_to_out[k] = 0xFFFFFFFF; k = k + 1; }
+
+    k = 0;
+    for (k < MERGED_KIND_COUNT) {
+        if (!merged[k].used || merged[k].len == 0) { k = k + 1; cnt; }
+
+        var bytes: *u8 = nil;
+        if (merged[k].kind != of.SK_BSS) {
+            val zr: Result[*u8, str] = zallocate[u8](alloc, merged[k].len::usize);
+            if (is_err[*u8, str](zr)) { ret err[bool, str](unwrap_err[*u8, str](zr)); }
+            bytes = unwrap_ok[*u8, str](zr);
+        }
+
+        var sec: of.Section;
+        sec.name  = merged_section_name(s, merged[k].kind);
+        sec.kind  = merged[k].kind;
+        sec.bytes = bytes;
+        sec.len   = merged[k].len;
+        sec.align = merged[k].align;
+
+        val add_r: Result[u32, str] = obj.add_section(out_img, sec);
+        if (is_err[u32, str](add_r)) {
+            if (bytes != nil) { deallocate[u8](alloc, bytes, merged[k].len::usize); }
+            ret err[bool, str](unwrap_err[u32, str](add_r));
+        }
+        kind_to_out[k] = unwrap_ok[u32, str](add_r);
+        k = k + 1;
+    }
+
+    # copy input section bytes into their placed offsets within the merged
+    # output sections (skip BSS, which has no on-disk content).
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val src: *of.Section = ?modules[m].sections[sc];
+            if (src.kind == of.SK_BSS || src.bytes == nil || src.len == 0) { sc = sc + 1; cnt; }
+
+            val flat: u32 = sec_base[m] + sc;
+            val ki: u32 = placements[flat].merged_index;
+            val out_ix: u32 = kind_to_out[ki];
+            if (out_ix == 0xFFFFFFFF) { sc = sc + 1; cnt; }
+
+            val dst: *u8 = out_img.sections[out_ix].bytes;
+            val off: u32 = placements[flat].offset;
+            mem.copy[u8](?dst[off], src.bytes, src.len::usize);
+
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+
+    # carry every defined symbol onto the output image, rebased to its merged
+    # section. external (undefined) symbols are dropped — in a static executable
+    # they are resolved by collect_symbols; an unresolved one surfaces during
+    # patching as an undefined-symbol error.
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val isym: *of.Symbol = ?modules[m].symbols[sy];
+            if (isym.section == of.SECTION_EXTERNAL || isym.section >= modules[m].section_count) {
+                sy = sy + 1; cnt;
+            }
+
+            val flat: u32 = sec_base[m] + isym.section;
+            val ki: u32 = placements[flat].merged_index;
+            val out_ix: u32 = kind_to_out[ki];
+            if (out_ix == 0xFFFFFFFF) { sy = sy + 1; cnt; }
+
+            var osym: of.Symbol;
+            osym.name    = isym.name;
+            osym.section = out_ix;
+            osym.offset  = placements[flat].offset + isym.offset;
+            osym.size    = isym.size;
+            osym.flags   = isym.flags;
+
+            val sa: Result[u32, str] = obj.add_symbol(out_img, osym);
+            if (is_err[u32, str](sa)) { ret err[bool, str](unwrap_err[u32, str](sa)); }
+
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+
+    ret ok[bool, str](true);
+}
+
+# patch_relocations: resolve each input relocation to its target symbol's final
+# virtual address and write the patched value into the merged section bytes.
+# absolute kinds store `sym + addend`; pc-relative kinds store
+# `sym + addend - patch_addr`. an undefined target symbol is an error.
+fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
+                     modules: *of.ObjectImage, module_count: u32,
+                     placements: *Placement, sec_base: *u32,
+                     sym_locs: *map.Map[intern.StrId, SymbolLoc]) Result[bool, str] {
+    # intern the abstract relocation-kind names once for fast comparison.
+    val kinds: RelocKindIds = intern_reloc_kinds(s);
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (r.section >= modules[m].section_count) { ri = ri + 1; cnt; }
+
+            # locate the target symbol's final virtual address.
+            val sl: Result[*SymbolLoc, str] =
+                map.get[intern.StrId, SymbolLoc](sym_locs, ?r.symbol);
+            if (is_err[*SymbolLoc, str](sl)) {
+                ret err[bool, str](undef_message(s, r.symbol));
+            }
+            val loc: *SymbolLoc = unwrap_ok[*SymbolLoc, str](sl);
+            val sym_va: u64 = loc.vaddr;
+
+            # compute the patch site's virtual address and its byte location in
+            # the merged image. the placement's merged_index is a section *kind*;
+            # map it to the compacted output-section index.
+            val flat: u32 = sec_base[m] + r.section;
+            val pl: *Placement = ?placements[flat];
+            val patch_va: u64 = pl.vaddr + r.offset::u64;
+            val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
+            if (out_ix == 0xFFFFFFFF) { ri = ri + 1; cnt; }
+            val dst: *u8 = out_img.sections[out_ix].bytes;
+            if (dst == nil) { ri = ri + 1; cnt; }
+            val patch_off: u32 = pl.offset + r.offset;
+
+            val pr: Result[bool, str] =
+                apply_one(s, ?kinds, r.kind, dst, patch_off, out_img.sections[out_ix].len, sym_va, r.addend, patch_va, m, r.offset);
+            if (is_err[bool, str](pr)) {
+                ret err[bool, str](unwrap_err[bool, str](pr));
+            }
+
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# apply_one: write a single resolved relocation into the merged bytes. `abs64`
+# writes a 64-bit little-endian absolute address; `pc32`/`plt32` write a 32-bit
+# little-endian pc-relative displacement. bounds and 32-bit range are checked.
+fun apply_one(s: *sess.Session, kinds: *RelocKindIds, kind: intern.StrId,
+             dst: *u8, patch_off: u32, sec_len: u32,
+             sym_va: u64, addend: i64, patch_va: u64, module: u32, rel_off: u32) Result[bool, str] {
+    if (kind == kinds.abs64) {
+        if (patch_off + 8 > sec_len) {
+            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+        }
+        val value: u64 = sym_va + (addend::u64);
+        write_u64_le(dst, patch_off, value);
+        ret ok[bool, str](true);
+    }
+
+    if (kind == kinds.pc32 || kind == kinds.plt32) {
+        if (patch_off + 4 > sec_len) {
+            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+        }
+        val disp: i64 = (sym_va::i64) + addend - (patch_va::i64);
+        if (disp > 2147483647 || disp < -2147483648) {
+            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+        }
+        write_u32_le(dst, patch_off, (disp::u64) & 0xFFFFFFFF);
+        ret ok[bool, str](true);
+    }
+
+    # abs32s: 32-bit signed absolute.
+    if (kind == kinds.abs32s) {
+        if (patch_off + 4 > sec_len) {
+            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+        }
+        val v: i64 = (sym_va::i64) + addend;
+        if (v > 2147483647 || v < -2147483648) {
+            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+        }
+        write_u32_le(dst, patch_off, (v::u64) & 0xFFFFFFFF);
+        ret ok[bool, str](true);
+    }
+
+    ret err[bool, str](unsupported_message(s, kind));
+}
+
+# carry_relocations: in relocatable mode, copy each input relocation onto the
+# output image rebased to the merged section indices, leaving the bytes
+# unpatched so a later link can resolve them.
+fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module_count: u32,
+                     placements: *Placement, sec_base: *u32) Result[bool, str] {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (r.section >= modules[m].section_count) { ri = ri + 1; cnt; }
+
+            val flat: u32 = sec_base[m] + r.section;
+            val pl: *Placement = ?placements[flat];
+
+            # find the output-section index for this kind by matching merged
+            # index against the already-added output sections.
+            val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
+            if (out_ix == 0xFFFFFFFF) { ri = ri + 1; cnt; }
+
+            var orel: of.Relocation;
+            orel.section = out_ix;
+            orel.offset  = pl.offset + r.offset;
+            orel.kind    = r.kind;
+            orel.symbol  = r.symbol;
+            orel.addend  = r.addend;
+
+            val ar: Result[bool, str] = obj.add_relocation(out_img, orel);
+            if (is_err[bool, str](ar)) { ret err[bool, str](unwrap_err[bool, str](ar)); }
+
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# out_section_for_merged: find the output image's section index whose kind
+# matches the merged kind index; the merge produced at most one section per
+# kind, so a kind-equality match is unambiguous.
+fun out_section_for_merged(out_img: *of.ObjectImage, merged_index: u32) u32 {
+    var i: u32 = 0;
+    for (i < out_img.section_count) {
+        if (out_img.sections[i].kind::u32 == merged_index) { ret i; }
+        i = i + 1;
+    }
+    ret 0xFFFFFFFF;
+}
+
+# interned ids of the abstract relocation-kind names, resolved once per patch
+# pass for fast StrId comparison against each relocation's `kind`.
+# ---
+# abs64:  id of "abs64"  (64-bit absolute)
+# pc32:   id of "pc32"   (32-bit pc-relative)
+# plt32:  id of "plt32"  (32-bit pc-relative through the PLT)
+# abs32s: id of "abs32s" (32-bit signed absolute)
+rec RelocKindIds {
+    abs64:  intern.StrId;
+    pc32:   intern.StrId;
+    plt32:  intern.StrId;
+    abs32s: intern.StrId;
+}
+
+# intern_reloc_kinds: resolve the abstract relocation-kind names into StrIds for
+# comparison. interning is idempotent, so names already present (interned by the
+# format registrars) resolve to their existing ids.
+fun intern_reloc_kinds(s: *sess.Session) RelocKindIds {
+    var k: RelocKindIds;
+    k.abs64  = intern_or_nil(s, "abs64");
+    k.pc32   = intern_or_nil(s, "pc32");
+    k.plt32  = intern_or_nil(s, "plt32");
+    k.abs32s = intern_or_nil(s, "abs32s");
+    ret k;
+}
+
+# intern_or_nil: intern a name, returning STR_NIL on allocation failure so a
+# comparison against it never spuriously matches a real relocation kind.
+fun intern_or_nil(s: *sess.Session, name: str) intern.StrId {
+    val r: Result[intern.StrId, str] = intern.intern(?s.interner, name);
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+# merged_section_name: interned canonical name for a merged output section of a
+# given kind (".text", ".rodata", ".data", ".bss", ".debug").
+fun merged_section_name(s: *sess.Session, kind: of.SectionKind) intern.StrId {
+    if (kind == of.SK_TEXT)   { ret intern_or_nil(s, ".text"); }
+    if (kind == of.SK_RODATA) { ret intern_or_nil(s, ".rodata"); }
+    if (kind == of.SK_DATA)   { ret intern_or_nil(s, ".data"); }
+    if (kind == of.SK_BSS)    { ret intern_or_nil(s, ".bss"); }
+    ret intern_or_nil(s, ".debug");
+}
+
+# image_name: pick a name for the merged image — the first input image's name,
+# or STR_NIL if there are none.
+fun image_name(modules: *of.ObjectImage, module_count: u32) intern.StrId {
+    if (module_count == 0) { ret intern.STR_NIL; }
+    ret modules[0].name;
+}
+
+# os_base_addr: the base virtual address for the active OS's executables, read
+# from the OS vtable (`tgt.os.base_addr`). the loader parameters belong to the OS
+# layer, so the linker never branches on the numeric os id. `link` validates
+# `tgt.os != nil` before any vaddr assignment, so the vtable is always present.
+fun os_base_addr(tgt: *target.Target) u64 {
+    ret tgt.os.base_addr;
+}
+
+# os_page_size: the page granularity used to align segment virtual addresses,
+# read from the OS vtable (`tgt.os.page_size`).
+fun os_page_size(tgt: *target.Target) u64 {
+    ret tgt.os.page_size;
+}
+
+# clamp_kind: map a section kind to a valid merged-accumulator index, treating
+# any out-of-range kind as DEBUG so unknown sections are merged but never
+# loaded.
+fun clamp_kind(kind: of.SectionKind) u32 {
+    if (kind::u32 >= MERGED_KIND_COUNT) { ret of.SK_DEBUG::u32; }
+    ret kind::u32;
+}
+
+# align_up_u32: round `value` up to the next multiple of `align` (a power of
+# two, or 1 for no alignment).
+fun align_up_u32(value: u32, align: u32) u32 {
+    if (align <= 1) { ret value; }
+    ret (value + align - 1) & ~(align - 1);
+}
+
+# align_up_u64: round `value` up to the next multiple of `align` (a power of
+# two, or 1 for no alignment).
+fun align_up_u64(value: u64, align: u64) u64 {
+    if (align <= 1) { ret value; }
+    ret (value + align - 1) & ~(align - 1);
+}
+
+# write_u64_le: store a 64-bit value little-endian at `dst[off..off+8]`.
+fun write_u64_le(dst: *u8, off: u32, value: u64) {
+    var i: u32 = 0;
+    for (i < 8) {
+        dst[off + i] = ((value >> (i * 8)) & 0xFF)::u8;
+        i = i + 1;
+    }
+}
+
+# write_u32_le: store the low 32 bits of `value` little-endian at
+# `dst[off..off+4]`.
+fun write_u32_le(dst: *u8, off: u32, value: u64) {
+    var i: u32 = 0;
+    for (i < 4) {
+        dst[off + i] = ((value >> (i * 8)) & 0xFF)::u8;
+        i = i + 1;
+    }
+}
+
+# dup_message: build the "multiple definition of '<name>'" diagnostic string.
+fun dup_message(s: *sess.Session, name: intern.StrId) str {
+    val nm: Option[str] = intern.lookup(?s.interner, name);
+    if (is_some[str](nm)) { ret join3(s, "multiple definition of '", unwrap[str](nm), "'", "multiple definition of symbol"); }
+    ret "multiple definition of symbol";
+}
+
+# undef_message: build the "undefined symbol: <name>" diagnostic string.
+fun undef_message(s: *sess.Session, name: intern.StrId) str {
+    val nm: Option[str] = intern.lookup(?s.interner, name);
+    if (is_some[str](nm)) { ret join2(s, "undefined symbol: ", unwrap[str](nm), "undefined symbol"); }
+    ret "undefined symbol";
+}
+
+# overflow_message: build the "relocation '<kind>' overflows" diagnostic string.
+fun overflow_message(s: *sess.Session, kind: intern.StrId, module: u32, rel_off: u32) str {
+    val km: Option[str] = intern.lookup(?s.interner, kind);
+    if (is_some[str](km)) { ret join3(s, "relocation '", unwrap[str](km), "' overflows", "relocation overflows"); }
+    ret "relocation overflows";
+}
+
+# unsupported_message: build the "relocation '<kind>' not supported" string.
+fun unsupported_message(s: *sess.Session, kind: intern.StrId) str {
+    val km: Option[str] = intern.lookup(?s.interner, kind);
+    if (is_some[str](km)) { ret join3(s, "relocation '", unwrap[str](km), "' not supported", "relocation not supported"); }
+    ret "relocation not supported";
+}
+
+# entry_message: build the "undefined entry symbol: <name>" diagnostic string
+# for a missing program entry point (the OS `entry_symbol`, e.g. "_start").
+fun entry_message(s: *sess.Session, name: intern.StrId) str {
+    val nm: Option[str] = intern.lookup(?s.interner, name);
+    if (is_some[str](nm)) { ret join2(s, "undefined entry symbol: ", unwrap[str](nm), "undefined entry symbol"); }
+    ret "undefined entry symbol";
+}
+
+# read_message: build the "cannot read object '<path>': <reason>" diagnostic
+# string for an object file the linker failed to read.
+fun read_message(s: *sess.Session, path: str, reason: str) str {
+    val pre: str = join3(s, "cannot read object '", path, "': ", "cannot read object");
+    ret join2(s, pre, reason, pre);
+}
+
+# join2: concatenate two strings into a session-interned, null-terminated
+# string. the result is interned so it outlives this call and is owned by the
+# session for the build's lifetime. returns the literal prefix on allocation
+# failure rather than handing back an unowned or truncated buffer.
+fun join2(s: *sess.Session, a: str, b: str, prefix: str) str {
+    val la: usize = str_len(a);
+    val lb: usize = str_len(b);
+    val total: usize = la + lb;
+
+    val r: Result[*u8, str] = allocate[u8](s.alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret prefix; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    copy_bytes(buf, 0, a, la);
+    copy_bytes(buf, la, b, lb);
+    buf[total] = 0;
+
+    var built: str;
+    built.len  = total::u32;
+    built.data = buf;
+
+    val ir: Result[intern.StrId, str] = intern.intern(?s.interner, built);
+    deallocate[u8](s.alloc, buf, total + 1);
+    if (is_err[intern.StrId, str](ir)) { ret prefix; }
+
+    val nm: Option[str] = intern.lookup(?s.interner, unwrap_ok[intern.StrId, str](ir));
+    if (is_some[str](nm)) { ret unwrap[str](nm); }
+    ret prefix;
+}
+
+# join3: concatenate three strings; like join2, the result is session-interned
+# and returns the literal prefix on allocation failure.
+fun join3(s: *sess.Session, a: str, b: str, c: str, prefix: str) str {
+    val la: usize = str_len(a);
+    val lb: usize = str_len(b);
+    val lc: usize = str_len(c);
+    val total: usize = la + lb + lc;
+
+    val r: Result[*u8, str] = allocate[u8](s.alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret prefix; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    copy_bytes(buf, 0, a, la);
+    copy_bytes(buf, la, b, lb);
+    copy_bytes(buf, la + lb, c, lc);
+    buf[total] = 0;
+
+    var built: str;
+    built.len  = total::u32;
+    built.data = buf;
+
+    val ir: Result[intern.StrId, str] = intern.intern(?s.interner, built);
+    deallocate[u8](s.alloc, buf, total + 1);
+    if (is_err[intern.StrId, str](ir)) { ret prefix; }
+
+    val nm: Option[str] = intern.lookup(?s.interner, unwrap_ok[intern.StrId, str](ir));
+    if (is_some[str](nm)) { ret unwrap[str](nm); }
+    ret prefix;
+}
+
+# copy_bytes: copy `len` bytes from a str's data into `dst` starting at `at`.
+fun copy_bytes(dst: *u8, at: usize, src: str, len: usize) {
+    if (len == 0 || src.data == nil) { ret; }
+    var i: usize = 0;
+    for (i < len) {
+        dst[at + i] = src.data[i];
+        i = i + 1;
+    }
+}
+
+# free_placements: release the flat placement array.
+fun free_placements(alloc: *Allocator, placements: *Placement, sec_total: u32) {
+    if (placements != nil && sec_total > 0) {
+        deallocate[Placement](alloc, placements, sec_total::usize);
+    }
+}
+
+# free_scratch: release the per-link scratch allocations (placements + per-module
+# base array).
+fun free_scratch(alloc: *Allocator, placements: *Placement, sec_total: u32,
+                sec_base: *u32, module_count: u32) {
+    free_placements(alloc, placements, sec_total);
+    if (sec_base != nil && module_count > 0) {
+        deallocate[u32](alloc, sec_base, module_count::usize);
+    }
+}
+
+# free_modules: tear down every parsed input image and release the image array.
+# each image owns its section bytes and section/symbol/relocation arrays through
+# `parse_object`, so `obj.dnit` frees them; the array itself is then released.
+fun free_modules(alloc: *Allocator, modules: *of.ObjectImage, module_count: u32) {
+    free_modules_to(alloc, modules, module_count, module_count);
+}
+
+# free_modules_to: tear down the first `n` parsed images of an array and release
+# the `cap`-long array. used to unwind a partially-filled array when reading or
+# parsing fails partway through.
+# ---
+# alloc:   allocator backing the array
+# modules: the image array (its first n entries are populated)
+# n:       number of populated images to tear down
+# cap:     full allocated length of the array
+fun free_modules_to(alloc: *Allocator, modules: *of.ObjectImage, n: u32, cap: u32) {
+    if (modules == nil) { ret; }
+    var i: u32 = 0;
+    for (i < n) {
+        obj.dnit(?modules[i]);
+        i = i + 1;
+    }
+    if (cap > 0) {
+        deallocate[of.ObjectImage](alloc, modules, cap::usize);
+    }
+}
+
+# cstr_len: length of a null-terminated byte string, excluding the terminator.
+fun cstr_len(p: *u8) usize {
+    if (p == nil) { ret 0; }
+    var n: usize = 0;
+    for (p[n] != 0) { n = n + 1; }
+    ret n;
+}

@@ -1,33 +1,54 @@
-# Mach Language Documentation
+# Mach language reference
 
-## Getting Started
+Per-element reference docs. Each file covers one language component;
+read the index below or follow `see also` links to navigate.
 
-- [Getting Started](getting-started.md) -- prerequisites, building, creating a project
+The live, terse spec lives in `SPEC.md` at the repo root. This directory
+expands each section into focused docs with grammar, examples, and
+neighboring links.
 
-## Language Reference
+## Files and structure
 
-- [Types](types.md) -- primitives, records, unions, arrays, pointers, generics
-- [Declarations](declarations.md) -- functions, records, unions, variables, type aliases, external bindings
-- [Expressions](expressions.md) -- operators, literals, casts, field access, indexing
-- [Control Flow](control-flow.md) -- if/or, for loops, ret/brk/cnt, fin (defer)
-- [Modules](modules.md) -- imports, module resolution, project structure
-- [Memory](memory.md) -- pointers, address-of, dereference, mutability
-- [Generics](generics.md) -- generic types and functions, monomorphization
-- [Compile-Time](comptime.md) -- $if, $size_of, symbol attributes, compiler constants
-- [Variadic Functions](variadic.md) -- va_list, va_start, va_arg, va_end
-- [Testing](testing.md) -- test blocks, test runner, assertions
-- [Inline Assembly](asm.md) -- asm blocks
+- [files.md](files.md) — extensions, `lib.mach` / `main.mach` conventions
+- [modules.md](modules.md) — module tree, path separator, shadow-module pattern
+- [use.md](use.md) — imports
+- [fwd.md](fwd.md) — re-exports
 
-## Tooling
+## Declarations
 
-- [Project Configuration](config.md) -- mach.toml reference
-- [Dependencies](dependencies.md) -- adding, removing, managing dependencies
-- [Cheatsheet](cheatsheet.md) -- quick reference card
+- [visibility.md](visibility.md) — `pub` and `ext` modifiers
+- [def.md](def.md) — type alias
+- [rec.md](rec.md) — record
+- [uni.md](uni.md) — raw union and the discriminated-value convention
+- [fun.md](fun.md) — function
+- [ext-fun.md](ext-fun.md) — external function
+- [val-var.md](val-var.md) — immutable and mutable bindings
 
-## Compiler Internals
+## Values and types
 
-- [MASM Backend](masm/README.md) -- intermediate representation and code generation
+- [literals.md](literals.md) — numeric, char, string
+- [types.md](types.md) — primitive grammar, compound types
+- [operators.md](operators.md) — arithmetic, bitwise, comparison, logical, pointer, cast
+- [expressions.md](expressions.md) — construction, access, calls, generic instantiation
 
-## Proposals
+## Control flow
 
-- [Type Conversions](proposals/type_conversions.md) -- implicit widening proposal
+- [statements.md](statements.md) — `if`/`or`, `for`, `ret`, `brk`, `cnt`, `fin`, blocks
+
+## Comptime channel
+
+- [comptime.md](comptime.md) — channel overview
+- [comptime-mach.md](comptime-mach.md) — `$mach.*` compiler-owned namespace
+- [comptime-attrs.md](comptime-attrs.md) — symbol attributes
+- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`, `$offset_of`, `$error`, `$assert`
+- [comptime-control.md](comptime-control.md) — `$if` / `$or`
+
+## Low-level
+
+- [asm.md](asm.md) — inline assembly
+- [policy.md](policy.md) — compiler vs stdlib boundary
+
+## Conventions
+
+- [documentation.md](documentation.md) — docstring style for functions,
+  types, modules, and values
