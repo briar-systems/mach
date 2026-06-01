@@ -1,0 +1,492 @@
+# mach.lang.target.isa.x64.isel: x86-64 instruction selection — the x64 ISA's `select` entry point.
+#
+# This is the x86-64 implementation of the ISA vtable's `select` operation,
+# reached only through `tgt.arch.select` by the shared `be.codegen.isel`
+# dispatcher. It is the only target-specific back-end selection phase; every
+# other phase (register allocation, frame layout, encoding) is shared and
+# target-agnostic. `mir.lower_ir` has already produced a `MirFunction` whose
+# instructions carry *generic* MIR opcodes that mirror the IR `OP_*` values
+# one-for-one, plus the call/phi pseudo-opcodes. Instruction selection rewrites
+# each generic opcode into the concrete x86-64 encoder opcode this ISA owns (see
+# `be.codegen.encode`), adjusting operands where the machine form differs from
+# the generic one.
+#
+# Most generic opcodes map to a single concrete instruction whose operand layout
+# already matches, so the rewrite is in place: only the opcode changes and the
+# flat operand list is left untouched. Several generic opcodes have no
+# single-instruction machine form, and selection materializes them as short
+# fixed instruction sequences, rewriting the block's instruction list so the
+# extra instructions are spliced in:
+#   - `MIR_NEG  [dst, src]` => `XOR dst, dst` ; `SUB dst, src`
+#   - `MIR_NOT  [dst, src]` => `MOV dst, src` ; `XOR dst, -1`
+# These mirror the ported `src/` selector's `sel_neg` / `sel_not`. Both produce a
+# real destination in operand 0, so the register allocator reads their def/use
+# shape correctly.
+#
+# The integer binary ALU ops (ADD/SUB/MUL/AND/OR/XOR) and the shifts
+# (SHL/SHR_U/SHR_S) arrive three-address (`[dst, lhs, rhs]`, the SSA shape
+# `lower_ir` copies straight from the IR), but every x86-64 ALU instruction is
+# two-address (`dst op= src`, the encoder reading only `dst` and `src1`). These
+# are NOT expanded in selection — like the comparison and division families they
+# survive with their generic opcode so the register allocator sees operand 0 as a
+# pure def (a three-address defining instruction). The encoder materializes the
+# two-address `MOV dst, lhs ; OP dst, rhs` byte sequence from the surviving generic
+# opcode (`encode_binary` / `encode_shift_mir`). Expanding to a two-address pair
+# here would make operand 0 a read-modify-write destination whose spilled-value
+# reload the allocator's spill path (which treats operand 0 purely as a def) omits.
+# A register shift count must live in CL, so `mir.lower_ir` pre-colors it into RCX
+# (mirroring the RAX:RDX division pre-coloring) and the allocator reserves RCX.
+#
+# The comparison family (`MIR_CMP_* [dst, lhs, rhs]`) is deliberately NOT expanded
+# here. A flag-setting `CMP lhs, rhs` carries a source in operand 0, which the
+# allocator's "operand 0 is the destination" convention would misread as a def;
+# its lhs would then lose a reload when spilled. Selection instead leaves the
+# comparison as a single `[dst, lhs, rhs]` instruction with its generic opcode,
+# and the encoder materializes the `CMP` ; `SETcc dst8` ; `MOVZX dst, dst` byte
+# sequence from that opcode — so the allocator only ever sees a clean defining
+# instruction (operand 0 = the boolean result).
+#
+# The conditional branch (`MIR_CBR [cond, then_block, else_block]`) is likewise
+# NOT rewritten here. Keeping the condition and BOTH block targets on one
+# surviving generic instruction lets the register allocator read `cond` as a use
+# and resolve both successor edges for liveness; the encoder materializes the
+# `TEST cond,cond` ; `JNE then` ; `JMP else` byte sequence, emitting a local-label
+# rel32 fixup for each target. Selecting it to a single `Jcc` would drop the TEST
+# and silently lose the else edge.
+#
+# Register allocation, frame layout, and encoding consume the concrete opcodes
+# afterward. The pre-coloring move (`MIR_MOV`) selects to a concrete `MOV`. The
+# call/phi pseudo-opcodes (`MIR_ARG`, `MIR_CALL`, `MIR_CALL_RES`, `MIR_PHI`), the
+# comparison family, the conditional branch, and the integer division / remainder
+# (`MIR_DIV_*` / `MIR_REM_*`) survive isel unchanged and are realized by the shared
+# ABI / register-allocation passes and the encoder. The division keeps its generic
+# opcode so the (target-agnostic) register allocator can detect the divide barrier
+# and reserve RAX:RDX; the encoder materializes the dividend high-half setup +
+# IDIV / DIV byte sequence, reading the signed/unsigned distinction from the
+# surviving opcode and the operation width from the instruction's `width`.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use target: mach.lang.target;
+use x64:    mach.lang.target.isa.x64;
+use mir:    mach.lang.be.codegen.mir;
+
+# SelectFn: the concrete signature the erased `isa.IsaVTable.select` pointer is
+# cast back to. The vtable stores `select` type-erased (`*u8`) because its
+# signature names `target.Target`, `mir.MirFunction`, and `std.allocator`, all
+# of which would otherwise invert the `isa` dependency and form an import cycle;
+# the shared `be.codegen.isel` dispatcher casts the erased pointer back to this
+# type before calling it (exactly as `mir` casts `abi.arg_passing` back to
+# `sysv.ArgPassingFn`). The allocator is threaded explicitly — the per-function
+# selection needs it to rebuild a block's instruction list when expanding the
+# NEG / NOT multi-instruction forms, and neither `Target` nor `MirFunction`
+# carries one — mirroring how the shared regalloc threads `MirModule.alloc`.
+# ---
+# alloc: backing allocator used to rebuild expanded blocks' instruction lists
+# tgt:   resolved compilation target (must be x86-64)
+# fn:    the MIR function to select instructions for; mutated in place
+# ret:   ok(true) on success, or an error naming the failure
+pub def SelectFn: fun(*Allocator, *target.Target, *mir.MirFunction) Result[bool, str];
+
+# select: select concrete x86-64 instructions for one MIR function.
+#
+# walks every block. each generic MIR opcode that has a matching
+# single-instruction machine form is rewritten in place (opcode only). the few
+# opcodes with no single-instruction form (NEG, NOT) are expanded into short
+# fixed instruction sequences, which rewrites the enclosing block's instruction
+# list to splice the extra instructions in. pseudo-opcodes emitted by lowering
+# (calls, phis) are left for the shared ABI and register-allocation passes.
+# fails on an unhandled opcode or an allocation failure while expanding a
+# multi-instruction form. this is the x86-64 implementation behind the ISA
+# vtable's `select` slot; the shared `be.codegen.isel.run` dispatcher reaches it
+# only through `tgt.arch.select`.
+# ---
+# alloc: backing allocator used to rebuild expanded blocks' instruction lists
+# tgt:   resolved compilation target (must be x86-64)
+# fn:    the MIR function to select instructions for; mutated in place
+# ret:   ok(true) on success, or an error naming the failure
+pub fun select(alloc: *Allocator, tgt: *target.Target, fn: *mir.MirFunction) Result[bool, str] {
+    if (alloc == nil) { ret err[bool, str]("isel: nil allocator"); }
+    if (tgt == nil)   { ret err[bool, str]("isel: nil target"); }
+    if (fn == nil)    { ret err[bool, str]("isel: nil mir function"); }
+
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val r: Result[bool, str] = select_block(alloc, ?fn.blocks[bi]);
+        if (is_err[bool, str](r)) { ret r; }
+        bi = bi + 1;
+    }
+
+    ret ok[bool, str](true);
+}
+
+# select concrete instructions for one block. instructions that map 1:1 to a
+# concrete opcode are rewritten in place; the few that expand into a fixed
+# instruction sequence (NEG, NOT) force the block's instruction list to be
+# rebuilt with the extra instructions spliced in at the original position.
+#
+# the rebuild allocates a fresh, exactly-sized instruction array, moves each
+# 1:1 instruction into it (transferring ownership of its operand array), and
+# materializes the expansion instructions for the multi-instruction forms with
+# freshly allocated operand arrays. the original block instruction array is
+# released and replaced so the module's teardown still frees everything exactly
+# once. when no instruction in the block expands, the array is rewritten in
+# place and no reallocation occurs.
+fun select_block(alloc: *Allocator, b: *mir.MirBlock) Result[bool, str] {
+    var total: u32 = 0;
+    var needs_expand: bool = false;
+    var i: u32 = 0;
+    for (i < b.instr_count) {
+        val n: u32 = expansion_count(?b.instrs[i]);
+        if (n == 0) { ret err[bool, str]("isel: unhandled MIR opcode"); }
+        if (n > 1) { needs_expand = true; }
+        total = total + n;
+        i = i + 1;
+    }
+
+    if (!needs_expand) {
+        var j: u32 = 0;
+        for (j < b.instr_count) {
+            val r: Result[bool, str] = rewrite_simple(?b.instrs[j]);
+            if (is_err[bool, str](r)) { ret r; }
+            j = j + 1;
+        }
+        ret ok[bool, str](true);
+    }
+
+    val rnew: Result[*mir.MirInstr, str] = allocate[mir.MirInstr](alloc, total::usize);
+    if (is_err[*mir.MirInstr, str](rnew)) {
+        ret err[bool, str](unwrap_err[*mir.MirInstr, str](rnew));
+    }
+    val dst: *mir.MirInstr = unwrap_ok[*mir.MirInstr, str](rnew);
+
+    var w: u32 = 0;
+    var s: u32 = 0;
+    for (s < b.instr_count) {
+        val mi: *mir.MirInstr = ?b.instrs[s];
+        val n: u32 = expansion_count(mi);
+        if (n == 1) {
+            val r: Result[bool, str] = rewrite_simple(mi);
+            if (is_err[bool, str](r)) { ret r; }
+            dst[w] = @mi;
+            w = w + 1;
+        } or {
+            val r: Result[bool, str] = expand_instr(alloc, mi, dst, ?w);
+            if (is_err[bool, str](r)) { ret r; }
+        }
+        s = s + 1;
+    }
+
+    if (b.instrs != nil && b.instr_cap > 0) {
+        deallocate_instrs(alloc, b.instrs, b.instr_cap);
+    }
+    b.instrs      = dst;
+    b.instr_count = total;
+    b.instr_cap   = total;
+    ret ok[bool, str](true);
+}
+
+# how many concrete instructions one generic MIR instruction selects to. 1 for
+# the common single-instruction forms (rewritten in place), 2 for NEG and NOT,
+# and 0 for an opcode this selector does not model (which `select_block` turns
+# into an error). the comparison family is left as a single `[dst, lhs, rhs]`
+# instruction with its generic MIR_CMP_* opcode surviving selection: register
+# allocation needs a clean defining instruction (operand 0 = the boolean result),
+# and the encoder materializes the CMP + SETcc + MOVZX byte sequence from the
+# surviving opcode. expanding the compare here would emit a flag-only `CMP lhs,
+# rhs` whose operand 0 is a source, which the allocator would misread as a def.
+fun expansion_count(mi: *mir.MirInstr) u32 {
+    val o: mir.MirOpcode = mi.opcode;
+    if (o == mir.MIR_NEG) { ret 2; }
+    if (o == mir.MIR_NOT) { ret 2; }
+    if (is_simple(o)) { ret 1; }
+    ret 0;
+}
+
+# true when a generic opcode has a single concrete machine form whose operand
+# layout already matches, so selection only rewrites the opcode in place.
+fun is_simple(o: mir.MirOpcode) bool {
+    # the three-address binary ALU ops (ADD/SUB/MUL/AND/OR/XOR) survive selection
+    # with their generic opcode (like the division / comparison / shift families):
+    # x86-64 ALU is two-address, so the register allocator must see a clean
+    # three-address defining instruction (operand 0 = a pure def), and the encoder
+    # materializes the two-address `MOV dst, lhs ; OP dst, rhs` byte sequence from
+    # the surviving generic opcode. expanding to a two-address pair here would make
+    # operand 0 a read-modify-write destination the allocator's spill path mishandles.
+    if (o == mir.MIR_ADD || o == mir.MIR_SUB || o == mir.MIR_MUL ||
+        o == mir.MIR_AND || o == mir.MIR_OR  || o == mir.MIR_XOR) { ret true; }
+    # the shifts (SHL / SHR_U / SHR_S) likewise survive selection with their generic
+    # opcode: lowering already emitted them three-address-shaped (`[dst, value,
+    # count]`), the register allocator detects the generic opcode to reserve RCX for
+    # a register count, and the encoder materializes the two-address shift byte form.
+    if (o == mir.MIR_SHL || o == mir.MIR_SHR_U || o == mir.MIR_SHR_S) { ret true; }
+    # division / remainder survive selection as a single `[RAX, b]` instruction
+    # keeping their generic MIR_DIV_*/MIR_REM_* opcode (like the comparison family):
+    # the register allocator detects the divide barrier from the generic opcode
+    # target-agnostically and reserves RAX:RDX, and the encoder materializes the
+    # dividend high-half setup + IDIV / DIV byte sequence from the surviving opcode.
+    if (o == mir.MIR_DIV_S || o == mir.MIR_REM_S ||
+        o == mir.MIR_DIV_U || o == mir.MIR_REM_U) { ret true; }
+    if (o == mir.MIR_TRUNC || o == mir.MIR_SEXT || o == mir.MIR_ZEXT ||
+        o == mir.MIR_BITCAST) { ret true; }
+    if (o == mir.MIR_FP_TRUNC || o == mir.MIR_FP_EXT ||
+        o == mir.MIR_FP_TO_SI || o == mir.MIR_FP_TO_UI ||
+        o == mir.MIR_SI_TO_FP || o == mir.MIR_UI_TO_FP) { ret true; }
+    if (o == mir.MIR_ALLOCA || o == mir.MIR_LOAD || o == mir.MIR_STORE ||
+        o == mir.MIR_GEP) { ret true; }
+    if (o == mir.MIR_EXTRACT || o == mir.MIR_INSERT) { ret true; }
+    if (o == mir.MIR_BR || o == mir.MIR_RET ||
+        o == mir.MIR_UNREACHABLE) { ret true; }
+    # MIR_CBR survives selection as a single `[cond, then_block, else_block]`
+    # instruction (one slot, not expanded here): keeping both block targets and the
+    # condition on one terminator lets the register allocator read the condition as
+    # a use and resolve BOTH successor edges for liveness. the encoder materializes
+    # the TEST ; JNE then ; JMP else byte sequence from the surviving opcode.
+    if (o == mir.MIR_CBR) { ret true; }
+    if (o == mir.MIR_ASM) { ret true; }
+    # the register-to-register / pre-coloring move selects to a plain MOV.
+    if (o == mir.MIR_MOV) { ret true; }
+    # the comparison family stays a single `[dst, lhs, rhs]` instruction; the
+    # encoder realizes the CMP + SETcc + MOVZX byte sequence from the opcode.
+    if (o == mir.MIR_CMP_EQ || o == mir.MIR_CMP_NE ||
+        o == mir.MIR_CMP_LT_S || o == mir.MIR_CMP_LT_U ||
+        o == mir.MIR_CMP_LE_S || o == mir.MIR_CMP_LE_U) { ret true; }
+    if (o == mir.MIR_CALL || o == mir.MIR_ARG || o == mir.MIR_CALL_RES ||
+        o == mir.MIR_PHI) { ret true; }
+    ret false;
+}
+
+# rewrite a single-instruction-form MIR opcode in place into the concrete
+# encoder opcode. the operand list already matches the machine form, so only
+# `opcode` changes. the call/phi pseudos keep their opcode (the shared ABI /
+# regalloc passes consume them). fails only on an opcode that is not a
+# single-instruction form, which `select_block` has already screened out.
+fun rewrite_simple(mi: *mir.MirInstr) Result[bool, str] {
+    val o: mir.MirOpcode = mi.opcode;
+
+    # the three-address binary ALU ops survive selection (x86-64 ALU is two-address,
+    # so the register allocator must see operand 0 as a pure def and the encoder
+    # materializes the two-address `MOV dst, lhs ; OP dst, rhs` byte sequence — see
+    # `encode_binary`). they are rewritten to their high SELECTION-OUTPUT sentinel
+    # so the encoder cannot confuse a surviving generic op with a concrete x86-64
+    # opcode of the same low value (e.g. concrete `x64.MOV` = 1 = `MIR_SUB`). the
+    # encoder's `is_mir_*` predicates and the allocator's divide/shift detection key
+    # on the SAME sentinel, so the three passes agree on the post-isel opcode space.
+    if (o == mir.MIR_ADD) { mi.opcode = mir.MIR_SEL_ADD; ret ok[bool, str](true); }
+    if (o == mir.MIR_SUB) { mi.opcode = mir.MIR_SEL_SUB; ret ok[bool, str](true); }
+    if (o == mir.MIR_MUL) { mi.opcode = mir.MIR_SEL_MUL; ret ok[bool, str](true); }
+    if (o == mir.MIR_AND) { mi.opcode = mir.MIR_SEL_AND; ret ok[bool, str](true); }
+    if (o == mir.MIR_OR)  { mi.opcode = mir.MIR_SEL_OR;  ret ok[bool, str](true); }
+    if (o == mir.MIR_XOR) { mi.opcode = mir.MIR_SEL_XOR; ret ok[bool, str](true); }
+
+    # shifts survive selection as a three-address `[dst, value, count]` instruction
+    # (operand 0 a pure def): the register allocator detects a register-count shift
+    # from the sentinel to reserve RCX, and the encoder materializes the
+    # `MOV dst, value ; shift dst, imm|CL` byte form, reading the direction from the
+    # sentinel. rewritten to the high sentinel to avoid the low-value collision.
+    if (o == mir.MIR_SHL)   { mi.opcode = mir.MIR_SEL_SHL;   ret ok[bool, str](true); }
+    if (o == mir.MIR_SHR_U) { mi.opcode = mir.MIR_SEL_SHR_U; ret ok[bool, str](true); }
+    if (o == mir.MIR_SHR_S) { mi.opcode = mir.MIR_SEL_SHR_S; ret ok[bool, str](true); }
+
+    # division / remainder survive selection (the encoder materializes the dividend
+    # high-half setup + IDIV / DIV byte sequence, reading the signedness from the
+    # opcode; the register allocator reserves RAX:RDX). rewritten to the high
+    # sentinel to avoid the low-value collision (e.g. `MIR_REM_U` = 6 = `x64.SUB`).
+    if (o == mir.MIR_DIV_S) { mi.opcode = mir.MIR_SEL_DIV_S; ret ok[bool, str](true); }
+    if (o == mir.MIR_DIV_U) { mi.opcode = mir.MIR_SEL_DIV_U; ret ok[bool, str](true); }
+    if (o == mir.MIR_REM_S) { mi.opcode = mir.MIR_SEL_REM_S; ret ok[bool, str](true); }
+    if (o == mir.MIR_REM_U) { mi.opcode = mir.MIR_SEL_REM_U; ret ok[bool, str](true); }
+
+    # integer width / representation conversions.
+    if (o == mir.MIR_TRUNC)   { mi.opcode = x64.MOV::u32;    ret ok[bool, str](true); }
+    if (o == mir.MIR_SEXT)    { mi.opcode = x64.MOVSX::u32;  ret ok[bool, str](true); }
+    if (o == mir.MIR_ZEXT)    { mi.opcode = x64.MOVZX::u32;  ret ok[bool, str](true); }
+    if (o == mir.MIR_BITCAST) { mi.opcode = x64.MOV::u32;    ret ok[bool, str](true); }
+
+    # float conversions.
+    if (o == mir.MIR_FP_TRUNC) { mi.opcode = x64.CVTSD2SS::u32;  ret ok[bool, str](true); }
+    if (o == mir.MIR_FP_EXT)   { mi.opcode = x64.CVTSS2SD::u32;  ret ok[bool, str](true); }
+    if (o == mir.MIR_FP_TO_SI) { mi.opcode = x64.CVTTSD2SI::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_FP_TO_UI) { mi.opcode = x64.CVTTSD2SI::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_SI_TO_FP) { mi.opcode = x64.CVTSI2SD::u32;  ret ok[bool, str](true); }
+    if (o == mir.MIR_UI_TO_FP) { mi.opcode = x64.CVTSI2SD::u32;  ret ok[bool, str](true); }
+
+    # memory.
+    if (o == mir.MIR_ALLOCA) { mi.opcode = x64.LEA::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_LOAD)   { mi.opcode = x64.MOV::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_STORE)  { mi.opcode = x64.MOV::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_GEP)    { mi.opcode = x64.LEA::u32; ret ok[bool, str](true); }
+
+    # aggregate element access lowers to plain moves against the computed slot.
+    if (o == mir.MIR_EXTRACT) { mi.opcode = x64.MOV::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_INSERT)  { mi.opcode = x64.MOV::u32; ret ok[bool, str](true); }
+
+    # control flow.
+    if (o == mir.MIR_BR)          { mi.opcode = x64.JMP::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_RET)         { mi.opcode = x64.RET::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_UNREACHABLE) { mi.opcode = x64.UD2::u32; ret ok[bool, str](true); }
+
+    # the register-to-register / ABI pre-coloring move selects to a plain MOV.
+    if (o == mir.MIR_MOV) { mi.opcode = x64.MOV::u32; ret ok[bool, str](true); }
+
+    # the comparison family survives selection as a single `[dst, lhs, rhs]`
+    # instruction: the allocator sees a clean defining instruction (operand 0 = the
+    # boolean result) and the encoder materializes the CMP + SETcc + MOVZX byte
+    # sequence, reading the condition (and its signedness) from the opcode. it is
+    # rewritten to its high SELECTION-OUTPUT sentinel so the encoder cannot confuse
+    # a surviving generic compare with a concrete x86-64 opcode of the same low value
+    # (e.g. `MIR_CMP_LT_U` = 18 = concrete `x64.JMP`, which a `MIR_BR` selects to).
+    if (o == mir.MIR_CMP_EQ)   { mi.opcode = mir.MIR_SEL_CMP_EQ;   ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_NE)   { mi.opcode = mir.MIR_SEL_CMP_NE;   ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_LT_S) { mi.opcode = mir.MIR_SEL_CMP_LT_S; ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_LT_U) { mi.opcode = mir.MIR_SEL_CMP_LT_U; ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_LE_S) { mi.opcode = mir.MIR_SEL_CMP_LE_S; ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_LE_U) { mi.opcode = mir.MIR_SEL_CMP_LE_U; ret ok[bool, str](true); }
+
+    # the conditional branch survives selection as a single
+    # `[cond, then_block, else_block]` instruction. the allocator reads `cond`
+    # (operand 0) as a use and both MIR_OP_BLOCK targets as the block's two successor
+    # edges (it keys on the operand kinds, not the opcode); the encoder materializes
+    # the TEST cond,cond ; JNE then ; JMP else byte sequence, emitting a local-label
+    # rel32 fixup for each target. it is rewritten to its high SELECTION-OUTPUT
+    # sentinel so the encoder's dispatch never confuses it with a concrete opcode of
+    # the same low value. rewriting it to a single Jcc would drop the TEST and the
+    # else edge.
+    if (o == mir.MIR_CBR) { mi.opcode = mir.MIR_SEL_CBR; ret ok[bool, str](true); }
+
+    # inline assembly is passed through verbatim to the encoder.
+    if (o == mir.MIR_ASM) { mi.opcode = x64.ISA_ASM_BLOCK::u32; ret ok[bool, str](true); }
+
+    # call / phi pseudo-opcodes survive isel unchanged. MIR_CALL in particular is
+    # the caller-saved clobber barrier the shared register allocator keys on (it
+    # detects calls target-agnostically by this generic opcode); rewriting it to
+    # the concrete CALL here would make that detection silently fail. the encoder
+    # translates the surviving MIR_CALL into the concrete CALL when it emits bytes.
+    # the argument, result, and phi pseudos are resolved (or skipped) downstream.
+    if (o == mir.MIR_CALL)     { ret ok[bool, str](true); }
+    if (o == mir.MIR_ARG)      { ret ok[bool, str](true); }
+    if (o == mir.MIR_CALL_RES) { ret ok[bool, str](true); }
+    if (o == mir.MIR_PHI)      { ret ok[bool, str](true); }
+
+    ret err[bool, str]("isel: unhandled MIR opcode");
+}
+
+# expand a multi-instruction-form MIR opcode into its fixed concrete sequence,
+# writing the produced instructions into `dst` starting at `@wp` and advancing
+# `@wp` past them. the source instruction's operand array is freed once its
+# operands have been copied into the freshly allocated sequence operands. fails
+# on an allocation failure. only NEG and NOT expand here; the comparison family
+# is realized by the encoder from its surviving single instruction.
+fun expand_instr(alloc: *Allocator, mi: *mir.MirInstr, dst: *mir.MirInstr, wp: *u32) Result[bool, str] {
+    val o: mir.MirOpcode = mi.opcode;
+    if (o == mir.MIR_NEG) { ret expand_neg(alloc, mi, dst, wp); }
+    ret expand_not(alloc, mi, dst, wp);
+}
+
+# expand `MIR_NEG [dst, src]` into `XOR dst, dst` ; `SUB dst, src`, mirroring the
+# ported `src/` `sel_neg`. a single ALU rewrite to SUB would compute `dst - src`,
+# not `-src`; the encoder models no unary NEG, so the zero-then-subtract sequence
+# is the correct selection. the destination vreg is read from the source's
+# operand 0 and the source value from operand 1.
+fun expand_neg(alloc: *Allocator, mi: *mir.MirInstr, dst: *mir.MirInstr, wp: *u32) Result[bool, str] {
+    if (mi.operand_count < 2) { ret err[bool, str]("isel: NEG missing operands"); }
+    val d: mir.MirOperand = mi.operands[0];
+    val src: mir.MirOperand = mi.operands[1];
+    val width: u8 = mi.width;
+
+    # XOR dst, dst   (zero the destination)
+    val r0: Result[*mir.MirOperand, str] = make_ops2(alloc, d, d);
+    if (is_err[*mir.MirOperand, str](r0)) { ret err[bool, str](unwrap_err[*mir.MirOperand, str](r0)); }
+    emit(dst, wp, x64.XOR::u32, unwrap_ok[*mir.MirOperand, str](r0), 2, width);
+
+    # SUB dst, src   (dst = 0 - src = -src)
+    val r1: Result[*mir.MirOperand, str] = make_ops2(alloc, d, src);
+    if (is_err[*mir.MirOperand, str](r1)) { ret err[bool, str](unwrap_err[*mir.MirOperand, str](r1)); }
+    emit(dst, wp, x64.SUB::u32, unwrap_ok[*mir.MirOperand, str](r1), 2, width);
+
+    free_ops(alloc, mi);
+    ret ok[bool, str](true);
+}
+
+# expand `MIR_NOT [dst, src]` into `MOV dst, src` ; `XOR dst, -1`, mirroring the
+# ported `src/` `sel_not`. a single ALU rewrite to XOR would compute `dst ^ src`,
+# not `~src`; the encoder models no unary NOT, so the move-then-xor-immediate
+# sequence is the correct selection.
+fun expand_not(alloc: *Allocator, mi: *mir.MirInstr, dst: *mir.MirInstr, wp: *u32) Result[bool, str] {
+    if (mi.operand_count < 2) { ret err[bool, str]("isel: NOT missing operands"); }
+    val d: mir.MirOperand = mi.operands[0];
+    val src: mir.MirOperand = mi.operands[1];
+    val width: u8 = mi.width;
+
+    # MOV dst, src
+    val r0: Result[*mir.MirOperand, str] = make_ops2(alloc, d, src);
+    if (is_err[*mir.MirOperand, str](r0)) { ret err[bool, str](unwrap_err[*mir.MirOperand, str](r0)); }
+    emit(dst, wp, x64.MOV::u32, unwrap_ok[*mir.MirOperand, str](r0), 2, width);
+
+    # XOR dst, -1   (bitwise complement)
+    val r1: Result[*mir.MirOperand, str] = make_ops2(alloc, d, mir.op_imm(-1));
+    if (is_err[*mir.MirOperand, str](r1)) { ret err[bool, str](unwrap_err[*mir.MirOperand, str](r1)); }
+    emit(dst, wp, x64.XOR::u32, unwrap_ok[*mir.MirOperand, str](r1), 2, width);
+
+    free_ops(alloc, mi);
+    ret ok[bool, str](true);
+}
+
+# write one concrete instruction into `dst` at `@wp` and advance `@wp` past it.
+# `width` is the operation byte width carried from the expanded source instruction
+# so each piece of the NEG / NOT sequence encodes at the value's width, not the
+# always-64-bit default.
+fun emit(dst: *mir.MirInstr, wp: *u32, opcode: u32, ops: *mir.MirOperand, count: u32, width: u8) {
+    val w: u32 = @wp;
+    dst[w].opcode        = opcode;
+    dst[w].operands      = ops;
+    dst[w].operand_count = count;
+    dst[w].width         = width;
+    dst[w].src_width     = width;
+    @wp = w + 1;
+}
+
+# allocate a fresh two-operand array `[a, b]`.
+fun make_ops2(alloc: *Allocator, a: mir.MirOperand, b: mir.MirOperand) Result[*mir.MirOperand, str] {
+    val r: Result[*mir.MirOperand, str] = allocate[mir.MirOperand](alloc, 2::usize);
+    if (is_err[*mir.MirOperand, str](r)) { ret r; }
+    val ops: *mir.MirOperand = unwrap_ok[*mir.MirOperand, str](r);
+    ops[0] = a;
+    ops[1] = b;
+    ret ok[*mir.MirOperand, str](ops);
+}
+
+# free the operand array of an expanded source instruction whose operands have
+# already been copied into its replacement sequence.
+fun free_ops(alloc: *Allocator, mi: *mir.MirInstr) {
+    if (mi.operands != nil && mi.operand_count > 0) {
+        deallocate[mir.MirOperand](alloc, mi.operands, mi.operand_count::usize);
+    }
+    mi.operands      = nil;
+    mi.operand_count = 0;
+}
+
+# free a block's old instruction array after its contents have been moved into a
+# rebuilt array. the instructions' operand arrays are NOT freed here: those that
+# survived 1:1 were moved (ownership transferred to the rebuilt array), and those
+# that expanded were freed by `free_ops`.
+fun deallocate_instrs(alloc: *Allocator, instrs: *mir.MirInstr, cap: u32) {
+    deallocate[mir.MirInstr](alloc, instrs, cap::usize);
+}

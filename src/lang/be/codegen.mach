@@ -1,0 +1,347 @@
+# mach.lang.be.codegen: drive an optimised SSA IR module through the shared backend pipeline into an object image.
+#
+# Drives an optimised SSA `ir.Module` through the
+# shared, target-agnostic backend pipeline and packs the result into a
+# format-agnostic `of.ObjectImage`. The pipeline lowers the IR into a
+# target-aware MIR, selects concrete instructions, allocates registers, lays
+# out stack frames, encodes machine bytes, and finally builds the object image
+# from the encoded text plus the module's globals.
+#
+# Only instruction selection and encoding are target-specific, and both reach
+# their per-arch tables through the `target.Target` vtables; every driver stage
+# here is shared across architectures. This module is the compute body of
+# `Q_CODEGEN`: one `ir.Module` produces exactly one `of.ObjectImage`.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use sess:   mach.lang.session;
+use intern: mach.lang.intern;
+use target: mach.lang.target;
+use of:     mach.lang.target.of;
+
+use ir:    mach.lang.me.ir;
+use value: mach.lang.me.ir.value;
+
+use mir:      mach.lang.be.codegen.mir;
+use isel:     mach.lang.be.codegen.isel;
+use regalloc: mach.lang.be.codegen.regalloc;
+use frame:    mach.lang.be.codegen.frame;
+use encode:   mach.lang.be.codegen.encode;
+use obj:      mach.lang.be.obj;
+
+# code-generation context for one module. bundles the session, resolved
+# target, input IR, the intermediate MIR built by the pipeline, and the output
+# object image. the MIR and image are filled as the pipeline progresses.
+# ---
+# s:     shared session (interner, diagnostics, allocator)
+# tgt:   resolved target — drives isel, regalloc, frame layout, encoding
+# ir:    input SSA IR module (already optimised by the middle end)
+# mir:   intermediate machine IR produced by `mir.lower_ir`
+# image: output object image built from the encoded text and the IR globals
+pub rec CodegenContext {
+    s:     *sess.Session;
+    tgt:   *target.Target;
+    ir:    *ir.Module;
+    mir:   mir.MirModule;
+    image: of.ObjectImage;
+}
+
+# generate an object image for one optimised IR module.
+#
+# runs the shared backend pipeline end to end:
+#   1. lower    — `mir.lower_ir` translates each IR function into MIR with
+#                 virtual registers and abstract ABI markers.
+#   2. isel     — `isel.run` selects concrete target instructions for every
+#                 MIR opcode through the active ISA's selection table.
+#   3. regalloc — `regalloc.run` resolves virtual registers to physical ones
+#                 (or spill slots) per the ISA register classes and ABI.
+#   4. frame    — `frame.run` lays out the stack frame and records the spill
+#                 slot offsets the encoder consumes for `[rbp + disp]` operands.
+#   5. encode   — `encode.run` walks the resolved MIR and emits the `.text`
+#                 bytes, function/label symbol marks, and a pending-relocation
+#                 list.
+#   6. pack     — the encoded text, its symbols and relocations, and the
+#                 module's globals are assembled into an `of.ObjectImage` via
+#                 the `be.obj` builder.
+#
+# stages 2–4 mutate the MIR in place (each `run` returns a status, not a fresh
+# module); the encoder reads it without mutating it. the returned image owns
+# its section / symbol / relocation arrays and is freed with `obj.dnit`.
+# ---
+# s:   shared session; supplies the allocator and interner
+# tgt:   resolved compilation target
+# irmod: optimised SSA IR module to generate code for
+# ret:   the populated object image, or an error string from any pipeline stage
+pub fun codegen_module(s: *sess.Session, tgt: *target.Target,
+                       irmod: *ir.Module) Result[of.ObjectImage, str] {
+    if (s == nil)     { ret err[of.ObjectImage, str]("codegen: nil session"); }
+    if (tgt == nil)   { ret err[of.ObjectImage, str]("codegen: nil target"); }
+    if (irmod == nil) { ret err[of.ObjectImage, str]("codegen: nil ir module"); }
+
+    val rmir: Result[mir.MirModule, str] = mir.lower_ir(tgt, irmod);
+    if (is_err[mir.MirModule, str](rmir)) {
+        ret err[of.ObjectImage, str](unwrap_err[mir.MirModule, str](rmir));
+    }
+    var m: mir.MirModule = unwrap_ok[mir.MirModule, str](rmir);
+
+    val rsel: Result[bool, str] = isel.run(tgt, ?m);
+    if (is_err[bool, str](rsel)) {
+        ret err[of.ObjectImage, str](unwrap_err[bool, str](rsel));
+    }
+
+    val rra: Result[bool, str] = regalloc.run(tgt, ?m);
+    if (is_err[bool, str](rra)) {
+        ret err[of.ObjectImage, str](unwrap_err[bool, str](rra));
+    }
+
+    val rfr: Result[bool, str] = frame.run(tgt, ?m);
+    if (is_err[bool, str](rfr)) {
+        ret err[of.ObjectImage, str](unwrap_err[bool, str](rfr));
+    }
+
+    val renc: Result[encode.EncoderOutput, str] = encode.run(tgt, ?m);
+    if (is_err[encode.EncoderOutput, str](renc)) {
+        ret err[of.ObjectImage, str](unwrap_err[encode.EncoderOutput, str](renc));
+    }
+    val enc: encode.EncoderOutput = unwrap_ok[encode.EncoderOutput, str](renc);
+
+    ret pack_image(s, irmod, ?enc);
+}
+
+# build the object image from the encoder output and the module's globals.
+#
+# creates the `.text` section from the encoded bytes, registers every symbol
+# mark against it, attaches the encoder's relocations, then materialises each
+# module global into a data / rodata / bss section with its defining symbol. on
+# any builder failure the partially built image is torn down before returning.
+# ---
+# s:     shared session; supplies the allocator and interner
+# irmod: IR module whose globals are packed alongside the encoded text
+# enc:   encoder output for the module's `.text`
+# ret:   the populated object image, or an error string
+fun pack_image(s: *sess.Session, irmod: *ir.Module,
+               enc: *encode.EncoderOutput) Result[of.ObjectImage, str] {
+    val rimg: Result[of.ObjectImage, str] = obj.init(s.alloc, irmod.name);
+    if (is_err[of.ObjectImage, str](rimg)) {
+        ret err[of.ObjectImage, str](unwrap_err[of.ObjectImage, str](rimg));
+    }
+    var image: of.ObjectImage = unwrap_ok[of.ObjectImage, str](rimg);
+
+    val rtext: Result[u32, str] = pack_text(s, ?image, enc);
+    if (is_err[u32, str](rtext)) {
+        obj.dnit(?image);
+        ret err[of.ObjectImage, str](unwrap_err[u32, str](rtext));
+    }
+    val text_sec: u32 = unwrap_ok[u32, str](rtext);
+
+    val rsym: Result[bool, str] = pack_symbols(?image, irmod, enc, text_sec);
+    if (is_err[bool, str](rsym)) {
+        obj.dnit(?image);
+        ret err[of.ObjectImage, str](unwrap_err[bool, str](rsym));
+    }
+
+    val rrel: Result[bool, str] = pack_relocs(?image, enc, text_sec);
+    if (is_err[bool, str](rrel)) {
+        obj.dnit(?image);
+        ret err[of.ObjectImage, str](unwrap_err[bool, str](rrel));
+    }
+
+    val rglob: Result[bool, str] = pack_globals(s, ?image, irmod);
+    if (is_err[bool, str](rglob)) {
+        obj.dnit(?image);
+        ret err[of.ObjectImage, str](unwrap_err[bool, str](rglob));
+    }
+
+    ret ok[of.ObjectImage, str](image);
+}
+
+# append the encoded `.text` section to the image.
+# ---
+# s:     session, for interning the section name
+# image: object image being built
+# enc:   encoder output supplying the text bytes
+# ret:   the new section's index, or an error string
+fun pack_text(s: *sess.Session, image: *of.ObjectImage,
+              enc: *encode.EncoderOutput) Result[u32, str] {
+    val rname: Result[intern.StrId, str] = intern.intern(?s.interner, ".text");
+    if (is_err[intern.StrId, str](rname)) {
+        ret err[u32, str](unwrap_err[intern.StrId, str](rname));
+    }
+
+    var sec: of.Section;
+    sec.name  = unwrap_ok[intern.StrId, str](rname);
+    sec.kind  = of.SK_TEXT;
+    sec.bytes = enc.text;
+    sec.len   = enc.text_len;
+    sec.align = 16;
+
+    ret obj.add_section(image, sec);
+}
+
+# register every encoder symbol mark against the `.text` section. each mark is
+# a function entry point (or an exposed inline-asm label) defined at a known
+# text offset. a mark naming a `pub` IR function is given GLOBAL linkage so the
+# whole-program linker can resolve cross-module references to it; module-private
+# functions stay local.
+# ---
+# image:    object image being built
+# irmod:    IR module supplying each function's linkage (pub → global)
+# enc:      encoder output supplying the symbol marks
+# text_sec: index of the `.text` section the marks are defined in
+# ret:      true on success, or an error string
+fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
+                 enc: *encode.EncoderOutput, text_sec: u32) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < enc.symbol_count) {
+        val mark: *encode.SymbolMark = ?enc.symbols[i];
+
+        var flags: u32 = mark.flags | of.SYM_OBJ_FLAG_FUNCTION;
+        if (function_is_pub(irmod, mark.name)) {
+            flags = flags | of.SYM_OBJ_FLAG_GLOBAL;
+        }
+
+        var sym: of.Symbol;
+        sym.name    = mark.name;
+        sym.section = text_sec;
+        sym.offset  = mark.offset;
+        sym.size    = 0;
+        sym.flags   = flags;
+
+        val r: Result[u32, str] = obj.add_symbol(image, sym);
+        if (is_err[u32, str](r)) {
+            ret err[bool, str](unwrap_err[u32, str](r));
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# function_is_pub: true when the IR module defines a function named `name` with
+# `FN_FLAG_PUB` set — an exported function the linker must see as a global
+# symbol. a mark with no matching IR function (an exposed inline-asm label)
+# stays local.
+# ---
+# irmod: IR module whose functions are searched
+# name:  the symbol name to match against function names
+# ret:   true when the named function is exported (pub)
+fun function_is_pub(irmod: *ir.Module, name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < irmod.function_len) {
+        val fn: *ir.Function = ?irmod.functions[i];
+        if (fn.name == name) {
+            ret (fn.flags & ir.FN_FLAG_PUB) != 0;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# attach every pending relocation from the encoder to the `.text` section. the
+# encoder already names each relocation's abstract kind ("pc32", "abs64", ...)
+# and target symbol as interned ids; the format writer maps the kind to its
+# machine type at emit time.
+# ---
+# image:    object image being built
+# enc:      encoder output supplying the pending relocations
+# text_sec: index of the `.text` section the relocations patch
+# ret:      true on success, or an error string
+fun pack_relocs(image: *of.ObjectImage, enc: *encode.EncoderOutput,
+                text_sec: u32) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < enc.reloc_count) {
+        val pr: *encode.PendingReloc = ?enc.relocations[i];
+
+        var rel: of.Relocation;
+        rel.section = text_sec;
+        rel.offset  = pr.offset;
+        rel.kind    = pr.kind;
+        rel.symbol  = pr.sym;
+        rel.addend  = pr.addend::i64;
+
+        val r: Result[bool, str] = obj.add_relocation(image, rel);
+        if (is_err[bool, str](r)) {
+            ret err[bool, str](unwrap_err[bool, str](r));
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# materialise every module global into the image. a global with constant byte
+# content becomes a `.rodata` (immutable) or `.data` (mutable) section; one with
+# no initial bytes becomes a zero-filled `.bss` entry. each global gets a
+# defining symbol pointing at its section.
+# ---
+# s:     session, for interning section names
+# image: object image being built
+# irmod: IR module whose globals are packed
+# ret:   true on success, or an error string
+fun pack_globals(s: *sess.Session, image: *of.ObjectImage,
+                 irmod: *ir.Module) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < irmod.global_len) {
+        val g: *ir.Global = ?irmod.globals[i];
+
+        var bytes: *u8 = nil;
+        var len: u32 = 0;
+        if (g.init.kind == value.VAL_CONST_BYTES) {
+            bytes = g.init.data.bytes.ptr;
+            len   = g.init.data.bytes.len;
+        }
+
+        var kind: of.SectionKind = of.SK_BSS;
+        var sname: str = ".bss";
+        if (bytes != nil && len > 0) {
+            if (g.is_mut) {
+                kind  = of.SK_DATA;
+                sname = ".data";
+            } or {
+                kind  = of.SK_RODATA;
+                sname = ".rodata";
+            }
+        }
+
+        val rname: Result[intern.StrId, str] = intern.intern(?s.interner, sname);
+        if (is_err[intern.StrId, str](rname)) {
+            ret err[bool, str](unwrap_err[intern.StrId, str](rname));
+        }
+
+        var sec: of.Section;
+        sec.name  = unwrap_ok[intern.StrId, str](rname);
+        sec.kind  = kind;
+        sec.bytes = bytes;
+        sec.len   = len;
+        sec.align = 8;
+
+        val ridx: Result[u32, str] = obj.add_section(image, sec);
+        if (is_err[u32, str](ridx)) {
+            ret err[bool, str](unwrap_err[u32, str](ridx));
+        }
+        val sec_idx: u32 = unwrap_ok[u32, str](ridx);
+
+        var flags: u32 = of.SYM_OBJ_FLAG_OBJECT;
+        if (g.is_pub) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
+
+        var sym: of.Symbol;
+        sym.name    = g.name;
+        sym.section = sec_idx;
+        sym.offset  = 0;
+        sym.size    = len;
+        sym.flags   = flags;
+
+        val rsym: Result[u32, str] = obj.add_symbol(image, sym);
+        if (is_err[u32, str](rsym)) {
+            ret err[bool, str](unwrap_err[u32, str](rsym));
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}

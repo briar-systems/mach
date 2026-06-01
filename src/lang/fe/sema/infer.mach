@@ -1,0 +1,747 @@
+# mach.lang.fe.sema.infer: bottom-up type inference.
+#
+# computes the semantic `type.TypeId` of every expression and the interned
+# `type.TypeId` each syntactic AstType refers to. drives the rest of sema by
+# calling `check` at composing sites and `coerce` where the language allows
+# literal narrowing.
+#
+# the public entry points, called by `sema`'s pass loop, are
+# resolve_type_ref (syntactic AstType to interned semantic TypeId),
+# infer_decl (a decl's declared or inferred type), and infer_expr (an
+# expression's type, bottom-up, writing expr_type). all three tolerate
+# holes: an unresolved name or a failed sub-inference yields TYPE_ERROR,
+# which absorbs further operations without cascading diagnostics.
+#
+# `str` is the stdlib alias `def str: *u8`; it resolves transparently to a
+# pointer and has no special field table. anonymous inline rec/uni types get
+# fresh positional nominal entries so identical inline shapes in different
+# positions are distinct (nominal typing).
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use intern:   mach.lang.intern;
+use type:     mach.lang.type;
+
+use ast:      mach.lang.fe.ast;
+use id:       mach.lang.fe.ast.id;
+use decl:     mach.lang.fe.ast.decl;
+use expr:     mach.lang.fe.ast.expr;
+use atype:    mach.lang.fe.ast.type;
+use token:    mach.lang.fe.token;
+use comptime: mach.lang.fe.comptime;
+use resolve:  mach.lang.fe.resolve;
+use sema:     mach.lang.fe.sema;
+use check:    mach.lang.fe.sema.check;
+use coerce:   mach.lang.fe.sema.coerce;
+use generics: mach.lang.fe.sema.generics;
+
+# seeds field tables for built-in nominal types. the only built-in string
+# type in this codebase is the stdlib `def str: *u8`, which resolves
+# transparently to a pointer and has no fields, so there is nothing to seed;
+# the function exists so `sema` can call it unconditionally and so future
+# built-ins have a home.
+# ---
+# sc:  sema context
+# ret: true on success, or an allocation error
+pub fun seed_builtins(sc: *sema.SemaContext) Result[bool, str] {
+    ret ok[bool, str](true);
+}
+
+# computes the declared type of one decl, dispatching per DeclKind. binding
+# decls (val/var) use their annotation when present, else infer from the
+# initializer; functions intern a TYPE_FUN; records / unions intern a
+# nominal and build a field table; `def` is transparent (returns the
+# underlying type). non-typed decls (use, test, comptime) return TYPE_NIL.
+# ---
+# sc:  sema context
+# did: decl to compute the type of
+# ret: the declared TypeId, or TYPE_NIL / TYPE_ERROR
+pub fun infer_decl(sc: *sema.SemaContext, did: id.DeclId) type.TypeId {
+    val d_opt: Option[*decl.Decl] = ast.get_decl(sc.a, did);
+    if (is_none[*decl.Decl](d_opt)) { ret type.TYPE_ERROR; }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    if (d.kind == decl.DECL_KIND_FUN) { ret infer_fun_sig(sc, ?d.data.fun_); }
+    if (d.kind == decl.DECL_KIND_REC) { ret infer_nominal(sc, did, d.data.rec_.name, ?d.data.rec_, type.TYPE_REC); }
+    if (d.kind == decl.DECL_KIND_UNI) { ret infer_nominal_uni(sc, did, d.data.uni_.name, ?d.data.uni_, type.TYPE_UNI); }
+    if (d.kind == decl.DECL_KIND_DEF) { ret sema.resolved_type_of(sc, d.data.def_.ty); }
+    if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) {
+        ret infer_binding(sc, ?d.data.bind);
+    }
+    # use, fwd, test, comptime_if, comptime_attr, error: no carried type
+    ret type.TYPE_NIL;
+}
+
+# interns the TYPE_FUN signature of a function declaration from its resolved
+# parameter and return types.
+fun infer_fun_sig(sc: *sema.SemaContext, f: *decl.DeclFun) type.TypeId {
+    val ret_ty: type.TypeId = sema.resolved_type_of(sc, f.return_type);
+
+    if (f.params_len == 0) {
+        val r: Result[type.TypeId, str] = type.intern_function(?sc.s.types, ret_ty, nil, 0, f.variadic);
+        if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+        ret unwrap_ok[type.TypeId, str](r);
+    }
+
+    val pr: Result[*type.TypeId, str] = allocate_params(sc, f.params_len);
+    if (is_err[*type.TypeId, str](pr)) { ret type.TYPE_ERROR; }
+    val params: *type.TypeId = unwrap_ok[*type.TypeId, str](pr);
+
+    var i: u32 = 0;
+    for (i < f.params_len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[f.params_start + i];
+        params[i] = sema.resolved_type_of(sc, tn.ty);
+        i = i + 1;
+    }
+
+    val r: Result[type.TypeId, str] = type.intern_function(?sc.s.types, ret_ty, params, f.params_len, f.variadic);
+    free_params(sc, params, f.params_len);
+    if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+    ret unwrap_ok[type.TypeId, str](r);
+}
+
+# interns the nominal TYPE_REC for a record declaration and builds its field
+# table (name -> resolved field type) on the context.
+fun infer_nominal(sc: *sema.SemaContext, did: id.DeclId, name_span: token.Span, r: *decl.DeclRec, kind: type.TypeKind) type.TypeId {
+    val name_id: intern.StrId = intern_span_or_nil(sc, name_span);
+    val tr: Result[type.TypeId, str] = type.intern_nominal(?sc.s.types, name_id, sc.own_module, did, kind);
+    if (is_err[type.TypeId, str](tr)) { ret type.TYPE_ERROR; }
+    val ty: type.TypeId = unwrap_ok[type.TypeId, str](tr);
+
+    build_field_table(sc, ty, r.fields_start, r.fields_len);
+    ret ty;
+}
+
+# union variant of infer_nominal (DeclUni has the same field layout).
+fun infer_nominal_uni(sc: *sema.SemaContext, did: id.DeclId, name_span: token.Span, u: *decl.DeclUni, kind: type.TypeKind) type.TypeId {
+    val name_id: intern.StrId = intern_span_or_nil(sc, name_span);
+    val tr: Result[type.TypeId, str] = type.intern_nominal(?sc.s.types, name_id, sc.own_module, did, kind);
+    if (is_err[type.TypeId, str](tr)) { ret type.TYPE_ERROR; }
+    val ty: type.TypeId = unwrap_ok[type.TypeId, str](tr);
+
+    build_field_table(sc, ty, u.fields_start, u.fields_len);
+    ret ty;
+}
+
+# populates a field table for nominal `ty` from a typed_names slice, mapping
+# each field's interned name to its resolved semantic type. a table already
+# built (the nominal interned before) is left untouched.
+fun build_field_table(sc: *sema.SemaContext, ty: type.TypeId, fields_start: u32, fields_len: u32) {
+    val existing: Option[*sema.FieldTable] = sema.field_table_for(sc, ty);
+    if (is_some[*sema.FieldTable](existing)) { ret; }
+
+    val tbl_r: Result[u32, str] = sema.field_table_begin(sc, ty);
+    if (is_err[u32, str](tbl_r)) { ret; }
+    val tbl: u32 = unwrap_ok[u32, str](tbl_r);
+
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[fields_start + i];
+        val fname: intern.StrId = intern_span_or_nil(sc, tn.name);
+        val fty: type.TypeId = sema.resolved_type_of(sc, tn.ty);
+        sema.field_table_push(sc, tbl, fname, fty);
+        i = i + 1;
+    }
+}
+
+# computes a binding's declared type: the annotation if written, otherwise
+# the inferred type of the initializer. an absent annotation with no
+# initializer cannot be typed and yields TYPE_ERROR.
+fun infer_binding(sc: *sema.SemaContext, b: *decl.DeclBind) type.TypeId {
+    if (b.ty != id.TYPE_NIL) {
+        ret sema.resolved_type_of(sc, b.ty);
+    }
+    if (b.init != id.EXPR_NIL) {
+        ret infer_expr(sc, b.init);
+    }
+    ret type.TYPE_ERROR;
+}
+
+# computes the type of one expression, recursively inferring subexpressions,
+# dispatching per ExprKind, writing the result into expr_type[eid], and
+# returning it.
+# ---
+# sc:  sema context
+# eid: expression to type
+# ret: the inferred TypeId (TYPE_ERROR on failure)
+pub fun infer_expr(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
+    if (eid == id.EXPR_NIL) { ret type.TYPE_ERROR; }
+    val e_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret type.TYPE_ERROR; }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+
+    var t: type.TypeId = type.TYPE_ERROR;
+
+    if (e.kind == expr.EXPR_KIND_LIT_INT) {
+        t = prim_or_error(sc, type.TYPE_I64);
+    }
+    or (e.kind == expr.EXPR_KIND_LIT_FLOAT) {
+        t = prim_or_error(sc, type.TYPE_F64);
+    }
+    or (e.kind == expr.EXPR_KIND_LIT_CHAR) {
+        t = prim_or_error(sc, type.TYPE_U8);
+    }
+    or (e.kind == expr.EXPR_KIND_LIT_STR) {
+        t = ptr_to(sc, prim_or_error(sc, type.TYPE_U8));
+    }
+    or (e.kind == expr.EXPR_KIND_LIT_NIL) {
+        t = ptr_to(sc, prim_or_error(sc, type.TYPE_U8));
+    }
+    or (e.kind == expr.EXPR_KIND_IDENT) {
+        t = infer_ident(sc, eid);
+    }
+    or (e.kind == expr.EXPR_KIND_COMPTIME_IDENT) {
+        sema.report(sc, e.span, "cannot infer type: comptime identifier in value context");
+        t = type.TYPE_ERROR;
+    }
+    or (e.kind == expr.EXPR_KIND_BINARY) {
+        t = infer_binary(sc, eid, ?e.data.binary, e.span);
+    }
+    or (e.kind == expr.EXPR_KIND_UNARY) {
+        t = infer_unary(sc, ?e.data.unary, e.span);
+    }
+    or (e.kind == expr.EXPR_KIND_CALL) {
+        t = infer_call(sc, ?e.data.call, e.span);
+    }
+    or (e.kind == expr.EXPR_KIND_INDEX) {
+        t = infer_index(sc, ?e.data.index, e.span);
+    }
+    or (e.kind == expr.EXPR_KIND_MEMBER) {
+        t = infer_member(sc, ?e.data.member, e.span);
+    }
+    or (e.kind == expr.EXPR_KIND_CAST) {
+        t = infer_cast(sc, ?e.data.cast, e.span);
+    }
+    or (e.kind == expr.EXPR_KIND_ARRAY_LIT) {
+        t = infer_array_lit(sc, ?e.data.array_lit, e.span);
+    }
+    or (e.kind == expr.EXPR_KIND_STRUCT_LIT) {
+        t = infer_struct_lit(sc, ?e.data.struct_lit, e.span);
+    }
+    or {
+        t = type.TYPE_ERROR;
+    }
+
+    if (sc.expr_type != nil && eid < sc.a.expr_len::u32) {
+        sc.expr_type[eid] = t;
+    }
+    ret t;
+}
+
+# IDENT: the type of the resolved symbol. an unresolved symbol (SYMBOL_NIL
+# upstream) yields TYPE_ERROR without a fresh diagnostic — resolve already
+# reported the root cause.
+fun infer_ident(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
+    val sym_opt: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, eid);
+    if (is_none[*resolve.Symbol](sym_opt)) { ret type.TYPE_ERROR; }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
+    ret sema.decl_type_for(sc, sym);
+}
+
+# BINARY: per-operator type rules. arithmetic / bitwise / shift return the
+# common operand type; comparisons, equality, and logical ops return u8;
+# assignment returns the LHS type after checking assignability.
+fun infer_binary(sc: *sema.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, span: token.Span) type.TypeId {
+    if (b.op == expr.BIN_ASSIGN) { ret infer_assign(sc, b, span); }
+
+    var lt: type.TypeId = infer_expr(sc, b.lhs);
+    var rt: type.TypeId = infer_expr(sc, b.rhs);
+    if (lt == type.TYPE_ERROR || rt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    # let a literal operand take the shape of the other side
+    val co: Option[type.TypeId] = unify_literals(sc, b.lhs, lt, b.rhs, rt);
+    if (is_some[type.TypeId](co)) {
+        lt = unwrap[type.TypeId](co);
+        rt = lt;
+    }
+
+    val u8t: type.TypeId = prim_or_error(sc, type.TYPE_U8);
+
+    if (b.op == expr.BIN_EQ || b.op == expr.BIN_NEQ) {
+        if (lt != rt) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
+        ret u8t;
+    }
+    if (b.op == expr.BIN_LT || b.op == expr.BIN_LEQ || b.op == expr.BIN_GT || b.op == expr.BIN_GEQ) {
+        if (lt != rt || !is_numeric(sc, lt)) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
+        ret u8t;
+    }
+    if (b.op == expr.BIN_AND || b.op == expr.BIN_OR) {
+        if (!is_integer(sc, lt) || !is_integer(sc, rt)) {
+            sema.report(sc, span, "type mismatch: logical operands must be integer types");
+            ret type.TYPE_ERROR;
+        }
+        ret u8t;
+    }
+    if (b.op == expr.BIN_BIT_AND || b.op == expr.BIN_BIT_OR || b.op == expr.BIN_BIT_XOR
+        || b.op == expr.BIN_SHL || b.op == expr.BIN_SHR) {
+        if (lt != rt || !is_integer(sc, lt)) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
+        ret lt;
+    }
+    # arithmetic: ADD, SUB, MUL, DIV, MOD
+    if (lt != rt || !is_numeric(sc, lt)) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
+    ret lt;
+}
+
+# ASSIGN: RHS must be assignable to LHS; result is the LHS type. a literal
+# RHS is coerced toward the LHS type first.
+fun infer_assign(sc: *sema.SemaContext, b: *expr.ExprBinary, span: token.Span) type.TypeId {
+    val lt: type.TypeId = infer_expr(sc, b.lhs);
+    var rt: type.TypeId = infer_expr(sc, b.rhs);
+    if (lt == type.TYPE_ERROR || rt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    val co: Option[type.TypeId] = coerce.try_coerce_literal(sc, b.rhs, lt);
+    if (is_some[type.TypeId](co)) { rt = unwrap[type.TypeId](co); }
+
+    check.check_assignable(sc, lt, rt, span);
+    ret lt;
+}
+
+# UNARY: per-operator rules. NEG returns the operand type, NOT returns u8,
+# BIT_NOT returns the operand type, ADDR returns a pointer to the operand
+# type, DEREF returns the pointee of a pointer operand.
+fun infer_unary(sc: *sema.SemaContext, u: *expr.ExprUnary, span: token.Span) type.TypeId {
+    val ot: type.TypeId = infer_expr(sc, u.operand);
+    if (ot == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    if (u.op == expr.UN_NEG) {
+        if (!is_numeric(sc, ot)) { sema.report(sc, span, "type mismatch: unary - requires a numeric operand"); ret type.TYPE_ERROR; }
+        ret ot;
+    }
+    if (u.op == expr.UN_NOT) {
+        if (!is_integer(sc, ot)) { sema.report(sc, span, "type mismatch: unary ! requires an integer operand"); ret type.TYPE_ERROR; }
+        ret prim_or_error(sc, type.TYPE_U8);
+    }
+    if (u.op == expr.UN_BIT_NOT) {
+        if (!is_integer(sc, ot)) { sema.report(sc, span, "type mismatch: unary ~ requires an integer operand"); ret type.TYPE_ERROR; }
+        ret ot;
+    }
+    if (u.op == expr.UN_ADDR) {
+        ret ptr_to(sc, ot);
+    }
+    if (u.op == expr.UN_DEREF) {
+        ret pointee_of(sc, ot, span);
+    }
+    ret type.TYPE_ERROR;
+}
+
+# CALL: callee must be TYPE_FUN; check arity and each argument against the
+# parameter types; result is the function's return type.
+fun infer_call(sc: *sema.SemaContext, c: *expr.ExprCall, span: token.Span) type.TypeId {
+    val ct: type.TypeId = infer_expr(sc, c.callee);
+    # infer argument types so their expr_type slots are populated
+    var ai: u32 = 0;
+    for (ai < c.args_len) {
+        infer_expr(sc, sc.a.expr_ids[c.args_start + ai]);
+        ai = ai + 1;
+    }
+    if (ct == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    val fn_opt: Option[*type.Type] = type.get(?sc.s.types, ct);
+    if (is_none[*type.Type](fn_opt)) { ret type.TYPE_ERROR; }
+    val fn: *type.Type = unwrap[*type.Type](fn_opt);
+    if (fn.kind != type.TYPE_FUN) {
+        sema.report(sc, span, "not callable: target is not a function");
+        ret type.TYPE_ERROR;
+    }
+
+    val ret_ty: type.TypeId = fn.data.fun.ret;
+    check.check_call(sc, ct, c.args_start, c.args_len, span);
+    ret ret_ty;
+}
+
+# INDEX: object must be a pointer or array, index must be an integer; result
+# is the element type.
+fun infer_index(sc: *sema.SemaContext, ix: *expr.ExprIndex, span: token.Span) type.TypeId {
+    val ot: type.TypeId = infer_expr(sc, ix.object);
+    val it: type.TypeId = infer_expr(sc, ix.index);
+    if (ot == type.TYPE_ERROR || it == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    val r: Option[type.TypeId] = check.check_index(sc, ot, it, span);
+    if (is_none[type.TypeId](r)) { ret type.TYPE_ERROR; }
+    ret unwrap[type.TypeId](r);
+}
+
+# MEMBER: object must be a record or union; the named field's type is the
+# result. delegates to check.check_member, which consults the field table.
+fun infer_member(sc: *sema.SemaContext, m: *expr.ExprMember, span: token.Span) type.TypeId {
+    val ot: type.TypeId = infer_expr(sc, m.object);
+    if (ot == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    val r: Option[type.TypeId] = check.check_member(sc, ot, m.name, span);
+    if (is_none[type.TypeId](r)) { ret type.TYPE_ERROR; }
+    ret unwrap[type.TypeId](r);
+}
+
+# CAST: delegates to check.check_cast under the primitive-numeric /
+# same-size-reinterpret rules.
+fun infer_cast(sc: *sema.SemaContext, c: *expr.ExprCast, span: token.Span) type.TypeId {
+    val ft: type.TypeId = infer_expr(sc, c.value);
+    val tt: type.TypeId = sema.resolved_type_of(sc, c.ty);
+    if (ft == type.TYPE_ERROR || tt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    val r: Option[type.TypeId] = check.check_cast(sc, ft, tt, span);
+    if (is_none[type.TypeId](r)) { ret type.TYPE_ERROR; }
+    ret unwrap[type.TypeId](r);
+}
+
+# ARRAY_LIT: result is [count]elem of the declared array type; every element
+# is checked against the element type via check.check_assignable.
+fun infer_array_lit(sc: *sema.SemaContext, al: *expr.ExprArrayLit, span: token.Span) type.TypeId {
+    val arr_ty: type.TypeId = sema.resolved_type_of(sc, al.ty);
+    var elem_ty: type.TypeId = type.TYPE_ERROR;
+    val at_opt: Option[*type.Type] = type.get(?sc.s.types, arr_ty);
+    if (is_some[*type.Type](at_opt)) {
+        val at: *type.Type = unwrap[*type.Type](at_opt);
+        if (at.kind == type.TYPE_ARRAY) { elem_ty = at.data.array.base; }
+    }
+
+    var i: u32 = 0;
+    for (i < al.elems_len) {
+        val ee: id.ExprId = sc.a.expr_ids[al.elems_start + i];
+        var et: type.TypeId = infer_expr(sc, ee);
+        if (elem_ty != type.TYPE_ERROR && et != type.TYPE_ERROR) {
+            val co: Option[type.TypeId] = coerce.try_coerce_literal(sc, ee, elem_ty);
+            if (is_some[type.TypeId](co)) { et = unwrap[type.TypeId](co); }
+            check.check_assignable(sc, elem_ty, et, span);
+        }
+        i = i + 1;
+    }
+    ret arr_ty;
+}
+
+# STRUCT_LIT: result is the named record type; each field initializer is
+# checked against the record's field of the same name. field validation is
+# skipped when no field table exists for the type (an imported record whose
+# fields were tabled in its own module's pass, or an upstream type error) —
+# the initializers are still inferred so their expr_type slots fill.
+fun infer_struct_lit(sc: *sema.SemaContext, sl: *expr.ExprStructLit, span: token.Span) type.TypeId {
+    val rec_ty: type.TypeId = sema.resolved_type_of(sc, sl.ty);
+    val have_table: bool = is_some[*sema.FieldTable](sema.field_table_for(sc, rec_ty));
+
+    var i: u32 = 0;
+    for (i < sl.fields_len) {
+        val fi: *expr.FieldInit = ?sc.a.field_inits[sl.fields_start + i];
+        var vt: type.TypeId = infer_expr(sc, fi.value);
+        if (rec_ty != type.TYPE_ERROR && vt != type.TYPE_ERROR && have_table) {
+            val fname: intern.StrId = intern_span_or_nil(sc, fi.name);
+            val ft_opt: Option[type.TypeId] = sema.field_lookup(sc, rec_ty, fname);
+            if (is_none[type.TypeId](ft_opt)) {
+                sema.report(sc, fi.name, "no such field: in struct literal");
+            }
+            or {
+                val ft: type.TypeId = unwrap[type.TypeId](ft_opt);
+                val co: Option[type.TypeId] = coerce.try_coerce_literal(sc, fi.value, ft);
+                if (is_some[type.TypeId](co)) { vt = unwrap[type.TypeId](co); }
+                check.check_assignable(sc, ft, vt, span);
+            }
+        }
+        i = i + 1;
+    }
+    ret rec_ty;
+}
+
+# translates a syntactic AstType into an interned semantic TypeId, walking
+# the TypeKind variants and dispatching to the matching type.intern_*.
+# writes the result into type_resolved_ty[tid].
+# ---
+# sc:  sema context
+# tid: syntactic AstType id to resolve
+# ret: the interned semantic TypeId (TYPE_ERROR on failure)
+pub fun resolve_type_ref(sc: *sema.SemaContext, tid: id.TypeId) type.TypeId {
+    val t_opt: Option[*atype.Type] = ast.get_type(sc.a, tid);
+    if (is_none[*atype.Type](t_opt)) { ret type.TYPE_ERROR; }
+    val t: *atype.Type = unwrap[*atype.Type](t_opt);
+
+    if (t.kind == atype.TYPE_KIND_NAMED) { ret resolve_type_named(sc, tid, ?t.data.named, t.span); }
+    if (t.kind == atype.TYPE_KIND_PTR)   { ret resolve_type_ptr(sc, ?t.data.ptr); }
+    if (t.kind == atype.TYPE_KIND_ARRAY) { ret resolve_type_array(sc, ?t.data.array, t.span); }
+    if (t.kind == atype.TYPE_KIND_FUN)   { ret resolve_type_fun(sc, ?t.data.fun_); }
+    if (t.kind == atype.TYPE_KIND_REC)   { ret resolve_type_anon(sc, tid, t.data.rec_.fields_start, t.data.rec_.fields_len, type.TYPE_REC); }
+    if (t.kind == atype.TYPE_KIND_UNI)   { ret resolve_type_anon(sc, tid, t.data.uni_.fields_start, t.data.uni_.fields_len, type.TYPE_UNI); }
+    ret type.TYPE_ERROR;
+}
+
+# NAMED: resolves the symbol the name refers to (recorded by resolve in
+# type_resolved), maps it to the nominal / primitive / transparent type it
+# names, and — when generic args are present — instantiates.
+fun resolve_type_named(sc: *sema.SemaContext, tid: id.TypeId, named: *atype.TypeNamed, span: token.Span) type.TypeId {
+    val sym_opt: Option[*resolve.Symbol] = sema.symbol_for_type(sc, tid);
+    if (is_none[*resolve.Symbol](sym_opt)) {
+        # resolve already reported the unresolved name; absorb silently
+        ret type.TYPE_ERROR;
+    }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
+
+    if (named.args_len > 0) {
+        ret instantiate_named(sc, sym, named, span);
+    }
+
+    ret type_for_symbol(sc, sym, span);
+}
+
+# maps a resolved type-name symbol to the semantic type it names: generic
+# params become TYPE_GENERIC_PARAM, `def`s are transparent (their underlying
+# type), records / unions become nominals. a cross-module reference resolves
+# to SYM_IMPORTED (the originating rec/uni/def kind is not carried on the
+# import symbol), so its type is read from the dependency's recorded
+# decl_type, which already holds the nominal TypeId or the def's underlying.
+fun type_for_symbol(sc: *sema.SemaContext, sym: *resolve.Symbol, span: token.Span) type.TypeId {
+    if (sym.kind == resolve.SYM_GENERIC) {
+        val r: Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.decl, sym.slot);
+        if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+        ret unwrap_ok[type.TypeId, str](r);
+    }
+    if (sym.kind == resolve.SYM_REC || sym.kind == resolve.SYM_UNI) {
+        var kind: type.TypeKind = type.TYPE_REC;
+        if (sym.kind == resolve.SYM_UNI) { kind = type.TYPE_UNI; }
+        val r: Result[type.TypeId, str] = type.intern_nominal(?sc.s.types, sym.name, sym.origin, sym.decl, kind);
+        if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+        ret unwrap_ok[type.TypeId, str](r);
+    }
+    if (sym.kind == resolve.SYM_DEF) {
+        ret def_underlying(sc, sym, span);
+    }
+    if (sym.kind == resolve.SYM_IMPORTED) {
+        val imported: type.TypeId = sema.decl_type_for(sc, sym);
+        if (imported == type.TYPE_NIL || imported == type.TYPE_ERROR) {
+            sema.report(sc, span, "unresolved type: name does not denote a type");
+            ret type.TYPE_ERROR;
+        }
+        ret imported;
+    }
+    sema.report(sc, span, "unresolved type: name does not denote a type");
+    ret type.TYPE_ERROR;
+}
+
+# resolves a `def` alias to its underlying semantic type. local defs resolve
+# the annotation directly (recomputing rather than reading the parallel
+# array, so a forward reference to a later-indexed def still resolves);
+# imported defs read from the dep's decl_type snapshot.
+fun def_underlying(sc: *sema.SemaContext, sym: *resolve.Symbol, span: token.Span) type.TypeId {
+    if (sym.origin == sc.own_module) {
+        val d_opt: Option[*decl.Decl] = ast.get_decl(sc.a, sym.decl);
+        if (is_none[*decl.Decl](d_opt)) { ret type.TYPE_ERROR; }
+        val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+        if (d.kind != decl.DECL_KIND_DEF) { ret type.TYPE_ERROR; }
+        if (d.data.def_.ty == id.TYPE_NIL) { ret type.TYPE_ERROR; }
+        ret resolve_type_ref(sc, d.data.def_.ty);
+    }
+    ret sema.decl_type_for(sc, sym);
+}
+
+# instantiates a generic type name `Name[args...]` by resolving each arg type
+# and delegating to generics.instantiate.
+fun instantiate_named(sc: *sema.SemaContext, sym: *resolve.Symbol, named: *atype.TypeNamed, span: token.Span) type.TypeId {
+    val pr: Result[*type.TypeId, str] = allocate_params(sc, named.args_len);
+    if (is_err[*type.TypeId, str](pr)) { ret type.TYPE_ERROR; }
+    val args: *type.TypeId = unwrap_ok[*type.TypeId, str](pr);
+
+    var i: u32 = 0;
+    for (i < named.args_len) {
+        val arg_tid: id.TypeId = sc.a.type_ids[named.args_start + i];
+        args[i] = resolve_type_ref(sc, arg_tid);
+        i = i + 1;
+    }
+
+    val r: Result[type.TypeId, str] = generics.instantiate(sc, sym.decl, sym.origin, args, named.args_len, span);
+    free_params(sc, args, named.args_len);
+    if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+    ret unwrap_ok[type.TypeId, str](r);
+}
+
+# PTR: recurses on the pointee and interns a pointer.
+fun resolve_type_ptr(sc: *sema.SemaContext, p: *atype.TypePtr) type.TypeId {
+    val base: type.TypeId = resolve_type_ref(sc, p.pointee);
+    ret ptr_to(sc, base);
+}
+
+# ARRAY: resolves the element type, evaluates the length via the comptime
+# evaluator demanding CT_KIND_INT, and interns a fixed-size array.
+fun resolve_type_array(sc: *sema.SemaContext, ar: *atype.TypeArray, span: token.Span) type.TypeId {
+    val elem: type.TypeId = resolve_type_ref(sc, ar.element);
+    if (elem == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    val len_r: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, ar.length, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](len_r)) {
+        sema.report(sc, span, "cannot infer type: array length is not a comptime constant");
+        ret type.TYPE_ERROR;
+    }
+    val cv: comptime.CTValue = unwrap_ok[comptime.CTValue, str](len_r);
+    if (cv.kind != comptime.CT_KIND_INT) {
+        sema.report(sc, span, "type mismatch: array length must be an integer");
+        ret type.TYPE_ERROR;
+    }
+    if (cv.data.i < 0) {
+        sema.report(sc, span, "type mismatch: array length must be non-negative");
+        ret type.TYPE_ERROR;
+    }
+
+    val r: Result[type.TypeId, str] = type.intern_array(?sc.s.types, elem, cv.data.i::u32);
+    if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+    ret unwrap_ok[type.TypeId, str](r);
+}
+
+# FUN: resolves each parameter and the return type, interns a TYPE_FUN.
+fun resolve_type_fun(sc: *sema.SemaContext, fn: *atype.TypeFun) type.TypeId {
+    var ret_ty: type.TypeId = type.TYPE_NIL;
+    if (fn.ret != id.TYPE_NIL) { ret_ty = resolve_type_ref(sc, fn.ret); }
+
+    if (fn.params_len == 0) {
+        val r: Result[type.TypeId, str] = type.intern_function(?sc.s.types, ret_ty, nil, 0, fn.variadic);
+        if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+        ret unwrap_ok[type.TypeId, str](r);
+    }
+
+    val pr: Result[*type.TypeId, str] = allocate_params(sc, fn.params_len);
+    if (is_err[*type.TypeId, str](pr)) { ret type.TYPE_ERROR; }
+    val params: *type.TypeId = unwrap_ok[*type.TypeId, str](pr);
+
+    var i: u32 = 0;
+    for (i < fn.params_len) {
+        val pt: id.TypeId = sc.a.type_ids[fn.params_start + i];
+        params[i] = resolve_type_ref(sc, pt);
+        i = i + 1;
+    }
+
+    val r: Result[type.TypeId, str] = type.intern_function(?sc.s.types, ret_ty, params, fn.params_len, fn.variadic);
+    free_params(sc, params, fn.params_len);
+    if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+    ret unwrap_ok[type.TypeId, str](r);
+}
+
+# REC / UNI (anonymous): synthesises a fresh positional nominal entry keyed
+# by (own_module, tid) with a synthetic name, so two textually-identical
+# inline records in different positions are distinct nominals. builds the
+# field table from the inline fields.
+fun resolve_type_anon(sc: *sema.SemaContext, tid: id.TypeId, fields_start: u32, fields_len: u32, kind: type.TypeKind) type.TypeId {
+    val name_id: intern.StrId = synth_anon_name(sc, kind);
+
+    # the syntactic type id occupies the nominal `decl` slot so two distinct
+    # inline positions never collide on (origin, decl) identity. consume an
+    # anon ordinal so the per-pass counter stays meaningful for diagnostics.
+    sema.next_anon_ordinal(sc);
+    val anon_decl: id.DeclId = tid;
+    val r: Result[type.TypeId, str] = type.intern_nominal(?sc.s.types, name_id, sc.own_module, anon_decl, kind);
+    if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+    val ty: type.TypeId = unwrap_ok[type.TypeId, str](r);
+
+    build_field_table(sc, ty, fields_start, fields_len);
+    ret ty;
+}
+
+# interns a synthetic display name for an anonymous rec/uni nominal. identity
+# is carried by the (origin, decl=tid) pair, not the name, so a single fixed
+# label per kind is sufficient.
+fun synth_anon_name(sc: *sema.SemaContext, kind: type.TypeKind) intern.StrId {
+    if (kind == type.TYPE_UNI) {
+        val r: Result[intern.StrId, str] = intern.intern(?sc.s.interner, "__anon_uni");
+        if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+        ret unwrap_ok[intern.StrId, str](r);
+    }
+    val r: Result[intern.StrId, str] = intern.intern(?sc.s.interner, "__anon_rec");
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+# interns the pointer type *base. a poisoned base poisons the pointer.
+fun ptr_to(sc: *sema.SemaContext, base: type.TypeId) type.TypeId {
+    if (base == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    val r: Result[type.TypeId, str] = type.intern_pointer(?sc.s.types, base);
+    if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+    ret unwrap_ok[type.TypeId, str](r);
+}
+
+# returns the pointee type of a pointer; non-pointer operands report a
+# diagnostic and yield TYPE_ERROR.
+fun pointee_of(sc: *sema.SemaContext, ty: type.TypeId, span: token.Span) type.TypeId {
+    val t_opt: Option[*type.Type] = type.get(?sc.s.types, ty);
+    if (is_none[*type.Type](t_opt)) { ret type.TYPE_ERROR; }
+    val t: *type.Type = unwrap[*type.Type](t_opt);
+    if (t.kind != type.TYPE_POINTER) {
+        sema.report(sc, span, "type mismatch: dereference of non-pointer type");
+        ret type.TYPE_ERROR;
+    }
+    ret t.data.pointer.base;
+}
+
+# fetches a primitive TypeId by kind; returns TYPE_ERROR when the kind is not
+# a primitive (a compiler-internal misuse).
+fun prim_or_error(sc: *sema.SemaContext, kind: type.TypeKind) type.TypeId {
+    val p: Option[type.TypeId] = type.prim(?sc.s.types, kind);
+    if (is_none[type.TypeId](p)) { ret type.TYPE_ERROR; }
+    ret unwrap[type.TypeId](p);
+}
+
+# is the TypeId one of the numeric primitives u8..f64?
+fun is_numeric(sc: *sema.SemaContext, ty: type.TypeId) bool {
+    val t_opt: Option[*type.Type] = type.get(?sc.s.types, ty);
+    if (is_none[*type.Type](t_opt)) { ret false; }
+    val k: type.TypeKind = unwrap[*type.Type](t_opt).kind;
+    ret k::u32 <= type.TYPE_F64::u32;
+}
+
+# is the TypeId one of the integer primitives u8..i64?
+fun is_integer(sc: *sema.SemaContext, ty: type.TypeId) bool {
+    val t_opt: Option[*type.Type] = type.get(?sc.s.types, ty);
+    if (is_none[*type.Type](t_opt)) { ret false; }
+    val k: type.TypeKind = unwrap[*type.Type](t_opt).kind;
+    ret k::u32 <= type.TYPE_I64::u32;
+}
+
+# attempts to make a binary operation's two operands share a type when one
+# side is a coercible literal. returns the unified type, or none when no
+# coercion applies (operands either already agree or genuinely differ).
+fun unify_literals(sc: *sema.SemaContext, lhs: id.ExprId, lt: type.TypeId, rhs: id.ExprId, rt: type.TypeId) Option[type.TypeId] {
+    if (lt == rt) { ret none[type.TypeId](); }
+    # try coercing the RHS literal toward the LHS type, then vice-versa
+    val cr: Option[type.TypeId] = coerce.try_coerce_literal(sc, rhs, lt);
+    if (is_some[type.TypeId](cr)) { ret some[type.TypeId](lt); }
+    val cl: Option[type.TypeId] = coerce.try_coerce_literal(sc, lhs, rt);
+    if (is_some[type.TypeId](cl)) { ret some[type.TypeId](rt); }
+    ret none[type.TypeId]();
+}
+
+# emits a `type mismatch:` diagnostic for a binary operand-type clash.
+fun type_mismatch(sc: *sema.SemaContext, span: token.Span) {
+    sema.report(sc, span, "type mismatch: incompatible operand types");
+}
+
+# interns the identifier text covered by `span`, or STR_NIL for an empty span.
+fun intern_span_or_nil(sc: *sema.SemaContext, span: token.Span) intern.StrId {
+    if (span.len == 0) { ret intern.STR_NIL; }
+    val r: Result[intern.StrId, str] = intern.intern_span(?sc.s.interner, sc.source, span);
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+# allocates a scratch TypeId array of `count` slots for assembling a
+# parameter / argument list before interning.
+fun allocate_params(sc: *sema.SemaContext, count: u32) Result[*type.TypeId, str] {
+    ret allocate[type.TypeId](sc.s.alloc, count::usize);
+}
+
+# releases a scratch TypeId array allocated by allocate_params.
+fun free_params(sc: *sema.SemaContext, params: *type.TypeId, count: u32) {
+    deallocate[type.TypeId](sc.s.alloc, params, count::usize);
+}

@@ -1,0 +1,1034 @@
+# mach.lang.fe.parser.decl: declarations, statements, and the module-level parse entry point.
+#
+# decls and stmts are kept together because they are mutually recursive
+# (function bodies contain stmts; local `val`/`var` stmts wrap decls;
+# `$if` conditionals appear at both scopes). also owns the orchestrators
+# parse_module, parse_decl, and parse_stmt.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.string.str;
+use std.types.string.str_region_equals;
+use std.types.size.usize;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.option.unwrap;
+
+use token:  mach.lang.fe.token;
+use ast:    mach.lang.fe.ast;
+use id:     mach.lang.fe.ast.id;
+use stmt:   mach.lang.fe.ast.stmt;
+use decl:   mach.lang.fe.ast.decl;
+use module: mach.lang.fe.ast.module;
+
+use parser: mach.lang.fe.parser.state;
+use pexpr:  mach.lang.fe.parser.expr;
+use pasm:   mach.lang.fe.parser.asm;
+
+# parse_module: parses a whole source file as a single Module, sets ast.root_module, and returns the ModuleId.
+# ---
+# p:   parser state positioned at the first token of the file
+# ret: ModuleId of the parsed module (also stored at p.ast.root_module)
+pub fun parse_module(p: *parser.Parser) id.ModuleId {
+    val start: token.Token = parser.current(p);
+
+    val decls_start: u32 = p.ast.decl_id_len::u32;
+    var decls_len:   u32 = 0;
+
+    for (!parser.at_eof(p)) {
+        val d: id.DeclId = parse_decl(p);
+        if (d != id.DECL_NIL) {
+            parser.push_decl_id(p, d);
+            decls_len = decls_len + 1;
+        }
+        if (p.panic) {
+            parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
+            if (parser.at(p, token.KIND_SEMI)) { parser.advance(p); }
+        }
+    }
+
+    val end: token.Token = parser.current(p);
+
+    var m: module.Module;
+    m.span        = parser.span_of(start.span, end.span);
+    m.decls_start = decls_start;
+    m.decls_len   = decls_len;
+
+    val mid: id.ModuleId = parser.push_module(p, m);
+    p.ast.root_module = mid;
+    ret mid;
+}
+
+# parse_decl: parses a single top-level declaration.
+# ---
+# p:   parser state positioned at the first token of the declaration
+# ret: DeclId of the parsed declaration, or DECL_NIL on failure
+pub fun parse_decl(p: *parser.Parser) id.DeclId {
+    val start: token.Token = parser.current(p);
+
+    if (parser.at(p, token.KIND_DOLLAR))  { ret parse_comptime_decl(p, start.span); }
+
+    val flags: u8 = parse_flags(p);
+
+    if (parser.at_kw(p, "use"))   { ret parse_use_decl(p, start.span, flags); }
+    if (parser.at_kw(p, "fwd"))   { ret parse_fwd_decl(p, start.span, flags); }
+    if (parser.at_kw(p, "fun"))   { ret parse_fun_decl(p, start.span, flags); }
+    if (parser.at_kw(p, "rec"))   { ret parse_rec_decl(p, start.span, flags); }
+    if (parser.at_kw(p, "uni"))   { ret parse_uni_decl(p, start.span, flags); }
+    if (parser.at_kw(p, "val"))   { ret parse_bind_decl(p, start.span, flags, decl.DECL_KIND_VAL); }
+    if (parser.at_kw(p, "var"))   { ret parse_bind_decl(p, start.span, flags, decl.DECL_KIND_VAR); }
+    if (parser.at_kw(p, "def"))   { ret parse_def_decl(p, start.span, flags); }
+    if (parser.at_kw(p, "test"))  { ret parse_test_decl(p, start.span, flags); }
+
+    parser.error_at_current(p, "expected a declaration");
+    var err: decl.Decl;
+    err.span  = start.span;
+    err.kind  = decl.DECL_KIND_ERROR;
+    err.flags = flags;
+    ret parser.push_decl(p, err);
+}
+
+# parse_stmt: parses a single statement.
+# ---
+# p:   parser state positioned at the first token of the statement
+# ret: StmtId of the parsed statement, or STMT_NIL on failure
+pub fun parse_stmt(p: *parser.Parser) id.StmtId {
+    val start: token.Token = parser.current(p);
+
+    if (parser.at(p, token.KIND_LBRACE))  { ret parse_block_stmt(p); }
+    if (parser.at_kw(p, "if"))            { ret parse_if_stmt(p, start.span); }
+    if (parser.at_kw(p, "for"))           { ret parse_for_stmt(p, start.span); }
+    if (parser.at_kw(p, "ret"))           { ret parse_ret_stmt(p, start.span); }
+    if (parser.at_kw(p, "brk"))           { ret parse_brk_stmt(p, start.span); }
+    if (parser.at_kw(p, "cnt"))           { ret parse_cnt_stmt(p, start.span); }
+    if (parser.at_kw(p, "fin"))           { ret parse_fin_stmt(p, start.span); }
+    if (parser.at_kw(p, "asm"))           { ret pasm.parse_asm(p); }
+    if (parser.at_kw(p, "val") || parser.at_kw(p, "var")) { ret parse_local_decl_stmt(p, start.span); }
+
+    if (parser.at(p, token.KIND_DOLLAR) && peek_is_kw(p, 1, "if")) {
+        ret parse_comptime_if_stmt(p, start.span);
+    }
+
+    ret parse_expr_stmt(p, start.span);
+}
+
+# parses visibility and linkage flags (pub / ext) in any order, zero or more times
+# ---
+# p:   parser state
+# ret: bitfield of DECL_FLAG_* values
+fun parse_flags(p: *parser.Parser) u8 {
+    var flags: u8 = 0;
+    for (true) {
+        if      (parser.eat_kw(p, "pub")) { flags = flags | decl.DECL_FLAG_PUB; }
+        or      (parser.eat_kw(p, "ext")) { flags = flags | decl.DECL_FLAG_EXT; }
+        or                                { brk; }
+    }
+    ret flags;
+}
+
+# parses a dotted path identifier sequence, returning the span from the first ident to the last
+# ---
+# p:   parser state; current token must be an IDENT
+# ret: span covering the entire dotted path
+fun parse_dotted_path(p: *parser.Parser) token.Span {
+    val start: token.Span = parser.advance(p).span;
+    var last:  token.Span = start;
+    for (parser.at(p, token.KIND_DOT) && parser.peek(p, 1).kind == token.KIND_IDENT) {
+        parser.advance(p);
+        last = parser.advance(p).span;
+    }
+    ret parser.span_of(start, last);
+}
+
+# true if the token at p.pos + offset is an IDENT whose text equals kw
+fun peek_is_kw(p: *parser.Parser, offset: usize, kw: str) bool {
+    val t: token.Token = parser.peek(p, offset);
+    if (t.kind != token.KIND_IDENT) { ret false; }
+    ret str_region_equals(p.tokens.source, t.span.offset, t.span.len, kw);
+}
+
+# parses `use [alias:] path;`
+fun parse_use_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
+    parser.advance(p);
+
+    var alias: token.Span;
+    alias.offset = 0;
+    alias.len    = 0;
+
+    if (parser.at(p, token.KIND_IDENT) && parser.peek(p, 1).kind == token.KIND_COLON) {
+        alias = parser.advance(p).span;
+        parser.advance(p);
+    }
+
+    var path: token.Span;
+    path.offset = 0;
+    path.len    = 0;
+    if (parser.at(p, token.KIND_IDENT)) {
+        path = parse_dotted_path(p);
+    } or {
+        parser.error_at_current(p, "expected module path after 'use'");
+    }
+
+    val end: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_SEMI, "expected ';' after 'use' declaration");
+
+    var u: decl.DeclUse;
+    u.alias = alias;
+    u.path  = path;
+
+    var d: decl.Decl;
+    d.span  = parser.span_of(start, end.span);
+    d.kind  = decl.DECL_KIND_USE;
+    d.flags = flags;
+    d.data.use_ = u;
+    ret parser.push_decl(p, d);
+}
+
+# parses `fwd [alias:] path;`; mirrors `use` grammar but re-exports publicly.
+# `fwd` always publishes, so `pub fwd` is rejected; no visibility flag is carried.
+fun parse_fwd_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
+    if ((flags & decl.DECL_FLAG_PUB) != 0) {
+        parser.error_at(p, start, "'fwd' always publishes; 'pub fwd' is not allowed");
+    }
+
+    parser.advance(p);
+
+    var alias: token.Span;
+    alias.offset = 0;
+    alias.len    = 0;
+
+    if (parser.at(p, token.KIND_IDENT) && parser.peek(p, 1).kind == token.KIND_COLON) {
+        alias = parser.advance(p).span;
+        parser.advance(p);
+    }
+
+    var path: token.Span;
+    path.offset = 0;
+    path.len    = 0;
+    if (parser.at(p, token.KIND_IDENT)) {
+        path = parse_dotted_path(p);
+    } or {
+        parser.error_at_current(p, "expected re-export path after 'fwd'");
+    }
+
+    val end: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_SEMI, "expected ';' after 'fwd' declaration");
+
+    var fwd: decl.DeclFwd;
+    fwd.alias = alias;
+    fwd.path  = path;
+
+    var d: decl.Decl;
+    d.span  = parser.span_of(start, end.span);
+    d.kind  = decl.DECL_KIND_FWD;
+    d.flags = 0;
+    d.data.fwd = fwd;
+    ret parser.push_decl(p, d);
+}
+
+# parses `fun name[generics]?(params) RetType? body`
+fun parse_fun_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
+    parser.advance(p);
+
+    var name: token.Span;
+    name.offset = 0;
+    name.len    = 0;
+    if (parser.at(p, token.KIND_IDENT)) {
+        name = parser.advance(p).span;
+    } or {
+        parser.error_at_current(p, "expected function name");
+    }
+
+    val gen_start: u32 = p.ast.generic_name_len::u32;
+    val gen_len:   u32 = parse_generic_params(p);
+
+    val params_start: u32 = p.ast.typed_name_len::u32;
+    var variadic:     bool = false;
+    val params_len:   u32 = parse_fun_params(p, ?variadic);
+
+    var ret_type: id.TypeId = id.TYPE_NIL;
+    if (!parser.at(p, token.KIND_LBRACE) && !parser.at(p, token.KIND_SEMI)) {
+        ret_type = pexpr.parse_type(p);
+    }
+
+    var body: id.StmtId = id.STMT_NIL;
+    var end:  token.Span = name;
+    if (parser.at(p, token.KIND_LBRACE)) {
+        body = parse_block_stmt(p);
+        if (body != id.STMT_NIL) {
+            end = unwrap[*stmt.Stmt](ast.get_stmt(p.ast, body)).span;
+        }
+    } or {
+        val semi: token.Token = parser.current(p);
+        parser.expect(p, token.KIND_SEMI, "expected '{' or ';' after function signature");
+        end = semi.span;
+    }
+
+    var f: decl.DeclFun;
+    f.name           = name;
+    f.generics_start = gen_start;
+    f.generics_len   = gen_len;
+    f.params_start   = params_start;
+    f.params_len     = params_len;
+    f.variadic       = variadic;
+    f.return_type    = ret_type;
+    f.body           = body;
+
+    var d: decl.Decl;
+    d.span     = parser.span_of(start, end);
+    d.kind     = decl.DECL_KIND_FUN;
+    d.flags    = flags;
+    d.data.fun_ = f;
+    ret parser.push_decl(p, d);
+}
+
+# parses `rec Name[generics]? { field: Type; ... }`
+fun parse_rec_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
+    parser.advance(p);
+
+    var name: token.Span;
+    name.offset = 0;
+    name.len    = 0;
+    if (parser.at(p, token.KIND_IDENT)) {
+        name = parser.advance(p).span;
+    } or {
+        parser.error_at_current(p, "expected record name");
+    }
+
+    val gen_start: u32 = p.ast.generic_name_len::u32;
+    val gen_len:   u32 = parse_generic_params(p);
+
+    val fields_start: u32 = p.ast.typed_name_len::u32;
+    val fields_len:   u32 = parse_rec_fields(p);
+
+    var end_span: token.Span = name;
+    if (p.pos > 0) {
+        end_span = p.tokens.tokens[p.pos - 1].span;
+    }
+
+    var r: decl.DeclRec;
+    r.name           = name;
+    r.generics_start = gen_start;
+    r.generics_len   = gen_len;
+    r.fields_start   = fields_start;
+    r.fields_len     = fields_len;
+
+    var d: decl.Decl;
+    d.span  = parser.span_of(start, end_span);
+    d.kind  = decl.DECL_KIND_REC;
+    d.flags = flags;
+    d.data.rec_ = r;
+    ret parser.push_decl(p, d);
+}
+
+# parses `uni Name[generics]? { field: Type; ... }`
+fun parse_uni_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
+    parser.advance(p);
+
+    var name: token.Span;
+    name.offset = 0;
+    name.len    = 0;
+    if (parser.at(p, token.KIND_IDENT)) {
+        name = parser.advance(p).span;
+    } or {
+        parser.error_at_current(p, "expected union name");
+    }
+
+    val gen_start: u32 = p.ast.generic_name_len::u32;
+    val gen_len:   u32 = parse_generic_params(p);
+
+    val fields_start: u32 = p.ast.typed_name_len::u32;
+    val fields_len:   u32 = parse_rec_fields(p);
+
+    var end_span: token.Span = name;
+    if (p.pos > 0) {
+        end_span = p.tokens.tokens[p.pos - 1].span;
+    }
+
+    var u: decl.DeclUni;
+    u.name           = name;
+    u.generics_start = gen_start;
+    u.generics_len   = gen_len;
+    u.fields_start   = fields_start;
+    u.fields_len     = fields_len;
+
+    var d: decl.Decl;
+    d.span  = parser.span_of(start, end_span);
+    d.kind  = decl.DECL_KIND_UNI;
+    d.flags = flags;
+    d.data.uni_ = u;
+    ret parser.push_decl(p, d);
+}
+
+# parses `val name: Type [= expr];` or `var name: Type [= expr];`
+fun parse_bind_decl(p: *parser.Parser, start: token.Span, flags: u8, kind: decl.DeclKind) id.DeclId {
+    parser.advance(p);
+
+    var name: token.Span;
+    name.offset = 0;
+    name.len    = 0;
+    if (parser.at(p, token.KIND_IDENT)) {
+        name = parser.advance(p).span;
+    } or {
+        parser.error_at_current(p, "expected binding name");
+    }
+
+    var ty: id.TypeId = id.TYPE_NIL;
+    if (parser.eat(p, token.KIND_COLON)) {
+        ty = pexpr.parse_type(p);
+    }
+
+    var init: id.ExprId = id.EXPR_NIL;
+    if (parser.eat(p, token.KIND_EQ)) {
+        init = pexpr.parse_expr(p);
+    }
+
+    val end: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_SEMI, "expected ';' after binding");
+
+    var b: decl.DeclBind;
+    b.name = name;
+    b.ty   = ty;
+    b.init = init;
+
+    var d: decl.Decl;
+    d.span     = parser.span_of(start, end.span);
+    d.kind     = kind;
+    d.flags    = flags;
+    d.data.bind = b;
+    ret parser.push_decl(p, d);
+}
+
+# parses `def Name: Type;`
+fun parse_def_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
+    parser.advance(p);
+
+    var name: token.Span;
+    name.offset = 0;
+    name.len    = 0;
+    if (parser.at(p, token.KIND_IDENT)) {
+        name = parser.advance(p).span;
+    } or {
+        parser.error_at_current(p, "expected type alias name");
+    }
+
+    parser.expect(p, token.KIND_COLON, "expected ':' in 'def' declaration");
+    val ty: id.TypeId = pexpr.parse_type(p);
+
+    val end: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_SEMI, "expected ';' after 'def' declaration");
+
+    var def_: decl.DeclDef;
+    def_.name = name;
+    def_.ty   = ty;
+
+    var d: decl.Decl;
+    d.span     = parser.span_of(start, end.span);
+    d.kind     = decl.DECL_KIND_DEF;
+    d.flags    = flags;
+    d.data.def_ = def_;
+    ret parser.push_decl(p, d);
+}
+
+# parses `test "label" { body }`
+fun parse_test_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
+    parser.advance(p);
+
+    var label: token.Span;
+    label.offset = 0;
+    label.len    = 0;
+    if (parser.at(p, token.KIND_LIT_STR)) {
+        label = parser.advance(p).span;
+    } or {
+        parser.error_at_current(p, "expected a string literal after 'test'");
+    }
+
+    var body: id.StmtId = id.STMT_NIL;
+    var end:  token.Span = label;
+    if (parser.at(p, token.KIND_LBRACE)) {
+        body = parse_block_stmt(p);
+        if (body != id.STMT_NIL) {
+            end = unwrap[*stmt.Stmt](ast.get_stmt(p.ast, body)).span;
+        }
+    } or {
+        parser.error_at_current(p, "expected '{' to open test body");
+    }
+
+    var t: decl.DeclTest;
+    t.label = label;
+    t.body  = body;
+
+    var d: decl.Decl;
+    d.span     = parser.span_of(start, end);
+    d.kind     = decl.DECL_KIND_TEST;
+    d.flags    = flags;
+    d.data.test_ = t;
+    ret parser.push_decl(p, d);
+}
+
+# dispatches a leading `$` at decl scope to either a comptime-if or comptime-attribute directive
+fun parse_comptime_decl(p: *parser.Parser, start: token.Span) id.DeclId {
+    if (peek_is_kw(p, 1, "if")) { ret parse_comptime_if_decl(p, start); }
+    ret parse_comptime_attr_decl(p, start);
+}
+
+# parses `$if (cond) { decls } $or (cond) { decls } $or { decls }` at decl scope
+fun parse_comptime_if_decl(p: *parser.Parser, start: token.Span) id.DeclId {
+    val branches_start: u32 = p.ast.comptime_branch_len::u32;
+    var branches_len:   u32 = 0;
+
+    parser.advance(p);
+    parser.advance(p);
+
+    var has_more: bool = true;
+    var first:    bool = true;
+    var end:      token.Span = start;
+
+    for (has_more) {
+        var cond: id.ExprId = id.EXPR_NIL;
+        if (first) {
+            parser.expect(p, token.KIND_LPAREN, "expected '(' after '$if'");
+            cond = pexpr.parse_expr(p);
+            parser.expect(p, token.KIND_RPAREN, "expected ')' after '$if' condition");
+            first = false;
+        }
+        or {
+            if (parser.eat(p, token.KIND_LPAREN)) {
+                cond = pexpr.parse_expr(p);
+                parser.expect(p, token.KIND_RPAREN, "expected ')' after '$or' condition");
+            }
+        }
+
+        val body_start: u32 = p.ast.decl_id_len::u32;
+        var body_len:   u32 = 0;
+
+        parser.expect(p, token.KIND_LBRACE, "expected '{' to open comptime branch body");
+        for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
+            val d: id.DeclId = parse_decl(p);
+            if (d != id.DECL_NIL) {
+                parser.push_decl_id(p, d);
+                body_len = body_len + 1;
+            }
+            if (p.panic) {
+                parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
+                if (parser.at(p, token.KIND_SEMI)) { parser.advance(p); }
+            }
+        }
+        val close: token.Token = parser.current(p);
+        parser.expect(p, token.KIND_RBRACE, "expected '}' to close comptime branch body");
+        end = close.span;
+
+        var br: decl.ComptimeBranch;
+        br.cond       = cond;
+        br.body_start = body_start;
+        br.body_len   = body_len;
+        val br_r: Result[u32, str] = ast.add_comptime_branch(p.ast, br);
+        if (is_err[u32, str](br_r)) {
+            parser.error_at(p, start, "out of memory while parsing comptime branch");
+            brk;
+        }
+        branches_len = branches_len + 1;
+
+        if (parser.at(p, token.KIND_DOLLAR) && peek_is_kw(p, 1, "or")) {
+            parser.advance(p);
+            parser.advance(p);
+            has_more = true;
+        }
+        or {
+            has_more = false;
+        }
+    }
+
+    var ci: decl.DeclComptimeIf;
+    ci.branches_start = branches_start;
+    ci.branches_len   = branches_len;
+
+    var d: decl.Decl;
+    d.span  = parser.span_of(start, end);
+    d.kind  = decl.DECL_KIND_COMPTIME_IF;
+    d.flags = 0;
+    d.data.comptime_if = ci;
+    ret parser.push_decl(p, d);
+}
+
+# parses `$target = value;` attribute directive
+fun parse_comptime_attr_decl(p: *parser.Parser, start: token.Span) id.DeclId {
+    val target: id.ExprId = pexpr.parse_expr(p);
+    parser.expect(p, token.KIND_EQ, "expected '=' in comptime attribute directive");
+    val value: id.ExprId = pexpr.parse_expr(p);
+    val end: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_SEMI, "expected ';' after comptime attribute");
+
+    var attr: decl.DeclComptimeAttr;
+    attr.target = target;
+    attr.value  = value;
+
+    var d: decl.Decl;
+    d.span  = parser.span_of(start, end.span);
+    d.kind  = decl.DECL_KIND_COMPTIME_ATTR;
+    d.flags = 0;
+    d.data.comptime_attr = attr;
+    ret parser.push_decl(p, d);
+}
+
+# parses `[T, U]` generic parameter names, appending each to ast.generic_names
+fun parse_generic_params(p: *parser.Parser) u32 {
+    if (!parser.eat(p, token.KIND_LBRACKET)) { ret 0; }
+
+    var count: u32 = 0;
+
+    if (parser.at(p, token.KIND_RBRACKET)) {
+        parser.advance(p);
+        ret 0;
+    }
+
+    if (parse_generic_param(p)) { count = count + 1; } or {
+        parser.sync_to(p, token.KIND_RBRACKET, token.KIND_LPAREN, token.KIND_EOF);
+        if (parser.at(p, token.KIND_RBRACKET)) { parser.advance(p); }
+        ret count;
+    }
+
+    for (parser.eat(p, token.KIND_COMMA)) {
+        if (parser.at(p, token.KIND_RBRACKET)) { brk; }
+        if (!parse_generic_param(p)) { brk; }
+        count = count + 1;
+    }
+
+    parser.expect(p, token.KIND_RBRACKET, "expected ']' to close generic parameters");
+    ret count;
+}
+
+fun parse_generic_param(p: *parser.Parser) bool {
+    if (!parser.at(p, token.KIND_IDENT)) {
+        parser.error_at_current(p, "expected generic parameter name");
+        ret false;
+    }
+    val name: token.Span = parser.advance(p).span;
+    val r: Result[u32, str] = ast.add_generic_name(p.ast, name);
+    if (is_err[u32, str](r)) {
+        parser.error_at(p, name, "out of memory while parsing generic parameter");
+        ret false;
+    }
+    ret true;
+}
+
+# parses `(name: Type, ..., ...)` function parameters, appending each to
+# ast.typed_names. a trailing `...` marks the function variadic and is
+# reported through the variadic out-parameter; it may only appear last.
+fun parse_fun_params(p: *parser.Parser, variadic: *bool) u32 {
+    @variadic = false;
+    parser.expect(p, token.KIND_LPAREN, "expected '(' to open parameter list");
+
+    var count: u32 = 0;
+
+    if (parser.at(p, token.KIND_RPAREN)) {
+        parser.advance(p);
+        ret 0;
+    }
+
+    if (parser.at(p, token.KIND_DOT_DOT_DOT)) {
+        parser.advance(p);
+        @variadic = true;
+        parser.expect(p, token.KIND_RPAREN, "expected ')' after variadic '...'");
+        ret 0;
+    }
+
+    if (parse_typed_name(p, "expected parameter name")) { count = count + 1; } or {
+        parser.sync_to(p, token.KIND_RPAREN, token.KIND_LBRACE, token.KIND_EOF);
+        if (parser.at(p, token.KIND_RPAREN)) { parser.advance(p); }
+        ret count;
+    }
+
+    for (parser.eat(p, token.KIND_COMMA)) {
+        if (parser.at(p, token.KIND_RPAREN)) { brk; }
+        if (parser.at(p, token.KIND_DOT_DOT_DOT)) {
+            parser.advance(p);
+            @variadic = true;
+            brk;
+        }
+        if (!parse_typed_name(p, "expected parameter name")) { brk; }
+        count = count + 1;
+    }
+
+    parser.expect(p, token.KIND_RPAREN, "expected ')' to close parameter list");
+    ret count;
+}
+
+# parses `{ name: Type; ... }` record fields, appending each to ast.typed_names
+fun parse_rec_fields(p: *parser.Parser) u32 {
+    parser.expect(p, token.KIND_LBRACE, "expected '{' to open record body");
+
+    var count: u32 = 0;
+
+    for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
+        if (!parse_typed_name(p, "expected field name")) {
+            parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
+            if (parser.at(p, token.KIND_SEMI)) { parser.advance(p); }
+            cnt;
+        }
+        parser.expect(p, token.KIND_SEMI, "expected ';' after record field");
+        count = count + 1;
+    }
+
+    parser.expect(p, token.KIND_RBRACE, "expected '}' to close record body");
+    ret count;
+}
+
+# parses a single `[$]name: Type` entry and appends it to ast.typed_names.
+# a leading `$` marks the entry as a comptime value parameter (function
+# parameters only); the comptime flag is recorded on the TypedName.
+fun parse_typed_name(p: *parser.Parser, missing_name_msg: str) bool {
+    var comptime: bool = false;
+    if (parser.eat(p, token.KIND_DOLLAR)) {
+        comptime = true;
+    }
+
+    if (!parser.at(p, token.KIND_IDENT)) {
+        parser.error_at_current(p, missing_name_msg);
+        ret false;
+    }
+    val name: token.Span = parser.advance(p).span;
+    if (!parser.expect(p, token.KIND_COLON, "expected ':' between name and type")) { ret false; }
+    val ty: id.TypeId = pexpr.parse_type(p);
+
+    var tn: decl.TypedName;
+    tn.name     = name;
+    tn.ty       = ty;
+    tn.comptime = comptime;
+    val r: Result[u32, str] = ast.add_typed_name(p.ast, tn);
+    if (is_err[u32, str](r)) {
+        parser.error_at(p, name, "out of memory while parsing typed name");
+        ret false;
+    }
+    ret true;
+}
+
+# parses `{ stmt; stmt; ... }`
+fun parse_block_stmt(p: *parser.Parser) id.StmtId {
+    val start: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_LBRACE, "expected '{' to open block");
+
+    val stmts_start: u32 = p.ast.stmt_id_len::u32;
+    var stmts_len:   u32 = 0;
+
+    for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
+        val s: id.StmtId = parse_stmt(p);
+        if (s != id.STMT_NIL) {
+            parser.push_stmt_id(p, s);
+            stmts_len = stmts_len + 1;
+        }
+        if (p.panic) {
+            parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
+            if (parser.at(p, token.KIND_SEMI)) { parser.advance(p); }
+        }
+    }
+
+    val close: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_RBRACE, "expected '}' to close block");
+
+    var block: stmt.StmtBlock;
+    block.stmts_start = stmts_start;
+    block.stmts_len   = stmts_len;
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start.span, close.span);
+    node.kind = stmt.STMT_KIND_BLOCK;
+    node.data.block = block;
+    ret parser.push_stmt(p, node);
+}
+
+# parses `if (cond) { then } [or (cond) { ... }]* [or { ... }]?`
+fun parse_if_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
+    parser.advance(p);
+    parser.expect(p, token.KIND_LPAREN, "expected '(' after 'if'");
+    val cond: id.ExprId = pexpr.parse_expr(p);
+    parser.expect(p, token.KIND_RPAREN, "expected ')' after 'if' condition");
+
+    var then_block: id.StmtId = id.STMT_NIL;
+    if (parser.at(p, token.KIND_LBRACE)) {
+        then_block = parse_block_stmt(p);
+    } or {
+        parser.error_at_current(p, "expected '{' to open 'if' body");
+    }
+
+    var else_block: id.StmtId = id.STMT_NIL;
+    if (parser.at_kw(p, "or")) {
+        else_block = parse_or_chain(p);
+    }
+
+    var if_: stmt.StmtIf;
+    if_.cond       = cond;
+    if_.then_block = then_block;
+    if_.else_block = else_block;
+
+    var end_span: token.Span = start;
+    if (else_block != id.STMT_NIL) {
+        end_span = unwrap[*stmt.Stmt](ast.get_stmt(p.ast, else_block)).span;
+    }
+    or (then_block != id.STMT_NIL) {
+        end_span = unwrap[*stmt.Stmt](ast.get_stmt(p.ast, then_block)).span;
+    }
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start, end_span);
+    node.kind = stmt.STMT_KIND_IF;
+    node.data.if_ = if_;
+    ret parser.push_stmt(p, node);
+}
+
+# parses one arm of an `or (...) { ... }` / `or { ... }` chain, recursing for further arms
+fun parse_or_chain(p: *parser.Parser) id.StmtId {
+    val start: token.Token = parser.current(p);
+    parser.advance(p);
+
+    if (parser.at(p, token.KIND_LBRACE)) {
+        ret parse_block_stmt(p);
+    }
+
+    parser.expect(p, token.KIND_LPAREN, "expected '(' after 'or'");
+    val cond: id.ExprId = pexpr.parse_expr(p);
+    parser.expect(p, token.KIND_RPAREN, "expected ')' after 'or' condition");
+
+    var then_block: id.StmtId = id.STMT_NIL;
+    if (parser.at(p, token.KIND_LBRACE)) {
+        then_block = parse_block_stmt(p);
+    } or {
+        parser.error_at_current(p, "expected '{' to open 'or' body");
+    }
+
+    var else_block: id.StmtId = id.STMT_NIL;
+    if (parser.at_kw(p, "or")) {
+        else_block = parse_or_chain(p);
+    }
+
+    var if_: stmt.StmtIf;
+    if_.cond       = cond;
+    if_.then_block = then_block;
+    if_.else_block = else_block;
+
+    var end_span: token.Span = start.span;
+    if (else_block != id.STMT_NIL) {
+        end_span = unwrap[*stmt.Stmt](ast.get_stmt(p.ast, else_block)).span;
+    }
+    or (then_block != id.STMT_NIL) {
+        end_span = unwrap[*stmt.Stmt](ast.get_stmt(p.ast, then_block)).span;
+    }
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start.span, end_span);
+    node.kind = stmt.STMT_KIND_IF;
+    node.data.if_ = if_;
+    ret parser.push_stmt(p, node);
+}
+
+# parses `for [(cond)]? { body }`; an absent condition means infinite loop
+fun parse_for_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
+    parser.advance(p);
+
+    var cond: id.ExprId = id.EXPR_NIL;
+    if (parser.eat(p, token.KIND_LPAREN)) {
+        cond = pexpr.parse_expr(p);
+        parser.expect(p, token.KIND_RPAREN, "expected ')' after 'for' condition");
+    }
+
+    var body: id.StmtId = id.STMT_NIL;
+    var end_span: token.Span = start;
+    if (parser.at(p, token.KIND_LBRACE)) {
+        body = parse_block_stmt(p);
+        if (body != id.STMT_NIL) {
+            end_span = unwrap[*stmt.Stmt](ast.get_stmt(p.ast, body)).span;
+        }
+    } or {
+        parser.error_at_current(p, "expected '{' to open 'for' body");
+    }
+
+    var for_: stmt.StmtFor;
+    for_.cond = cond;
+    for_.body = body;
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start, end_span);
+    node.kind = stmt.STMT_KIND_FOR;
+    node.data.for_ = for_;
+    ret parser.push_stmt(p, node);
+}
+
+# parses `ret [expr];`
+fun parse_ret_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
+    parser.advance(p);
+
+    var value: id.ExprId = id.EXPR_NIL;
+    if (!parser.at(p, token.KIND_SEMI) && !parser.at_eof(p)) {
+        value = pexpr.parse_expr(p);
+    }
+
+    val end: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_SEMI, "expected ';' after 'ret'");
+
+    var ret_: stmt.StmtRet;
+    ret_.value = value;
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start, end.span);
+    node.kind = stmt.STMT_KIND_RET;
+    node.data.ret_ = ret_;
+    ret parser.push_stmt(p, node);
+}
+
+# parses `brk;`
+fun parse_brk_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
+    parser.advance(p);
+    val end: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_SEMI, "expected ';' after 'brk'");
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start, end.span);
+    node.kind = stmt.STMT_KIND_BRK;
+    ret parser.push_stmt(p, node);
+}
+
+# parses `cnt;`
+fun parse_cnt_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
+    parser.advance(p);
+    val end: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_SEMI, "expected ';' after 'cnt'");
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start, end.span);
+    node.kind = stmt.STMT_KIND_CNT;
+    ret parser.push_stmt(p, node);
+}
+
+# parses `fin expr;`
+fun parse_fin_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
+    parser.advance(p);
+    val body_id: id.StmtId = parse_stmt(p);
+
+    var end_span: token.Span = start;
+    if (body_id != id.STMT_NIL) {
+        end_span = unwrap[*stmt.Stmt](ast.get_stmt(p.ast, body_id)).span;
+    }
+
+    var fin: stmt.StmtFin;
+    fin.body = body_id;
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start, end_span);
+    node.kind = stmt.STMT_KIND_FIN;
+    node.data.fin = fin;
+    ret parser.push_stmt(p, node);
+}
+
+# parses a local `val` or `var` declaration used as a statement
+fun parse_local_decl_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
+    val d: id.DeclId = parse_decl(p);
+
+    var sd: stmt.StmtDecl;
+    sd.decl = d;
+
+    var end_span: token.Span = start;
+    if (d != id.DECL_NIL) {
+        end_span = unwrap[*decl.Decl](ast.get_decl(p.ast, d)).span;
+    }
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start, end_span);
+    node.kind = stmt.STMT_KIND_DECL;
+    node.data.decl = sd;
+    ret parser.push_stmt(p, node);
+}
+
+# parses an expression statement `expr;`
+fun parse_expr_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
+    val expr_id: id.ExprId = pexpr.parse_expr(p);
+    val end: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_SEMI, "expected ';' after expression statement");
+
+    var se: stmt.StmtExpr;
+    se.expr = expr_id;
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start, end.span);
+    node.kind = stmt.STMT_KIND_EXPR;
+    node.data.expr = se;
+    ret parser.push_stmt(p, node);
+}
+
+# parses `$if (cond) { stmts } $or (cond) { stmts } $or { stmts }` at statement scope
+fun parse_comptime_if_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
+    val branches_start: u32 = p.ast.comptime_branch_len::u32;
+    var branches_len:   u32 = 0;
+
+    parser.advance(p);
+    parser.advance(p);
+
+    var has_more: bool = true;
+    var first:    bool = true;
+    var end:      token.Span = start;
+
+    for (has_more) {
+        var cond: id.ExprId = id.EXPR_NIL;
+        if (first) {
+            parser.expect(p, token.KIND_LPAREN, "expected '(' after '$if'");
+            cond = pexpr.parse_expr(p);
+            parser.expect(p, token.KIND_RPAREN, "expected ')' after '$if' condition");
+            first = false;
+        }
+        or {
+            if (parser.eat(p, token.KIND_LPAREN)) {
+                cond = pexpr.parse_expr(p);
+                parser.expect(p, token.KIND_RPAREN, "expected ')' after '$or' condition");
+            }
+        }
+
+        val body_start: u32 = p.ast.stmt_id_len::u32;
+        var body_len:   u32 = 0;
+
+        parser.expect(p, token.KIND_LBRACE, "expected '{' to open comptime branch body");
+        for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
+            val s: id.StmtId = parse_stmt(p);
+            if (s != id.STMT_NIL) {
+                parser.push_stmt_id(p, s);
+                body_len = body_len + 1;
+            }
+            if (p.panic) {
+                parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
+                if (parser.at(p, token.KIND_SEMI)) { parser.advance(p); }
+            }
+        }
+        val close: token.Token = parser.current(p);
+        parser.expect(p, token.KIND_RBRACE, "expected '}' to close comptime branch body");
+        end = close.span;
+
+        var br: decl.ComptimeBranch;
+        br.cond       = cond;
+        br.body_start = body_start;
+        br.body_len   = body_len;
+        val br_r: Result[u32, str] = ast.add_comptime_branch(p.ast, br);
+        if (is_err[u32, str](br_r)) {
+            parser.error_at(p, start, "out of memory while parsing comptime branch");
+            brk;
+        }
+        branches_len = branches_len + 1;
+
+        if (parser.at(p, token.KIND_DOLLAR) && peek_is_kw(p, 1, "or")) {
+            parser.advance(p);
+            parser.advance(p);
+            has_more = true;
+        }
+        or {
+            has_more = false;
+        }
+    }
+
+    var ci: stmt.StmtComptimeIf;
+    ci.branches_start = branches_start;
+    ci.branches_len   = branches_len;
+
+    var node: stmt.Stmt;
+    node.span = parser.span_of(start, end);
+    node.kind = stmt.STMT_KIND_COMPTIME_IF;
+    node.data.comptime_if = ci;
+    ret parser.push_stmt(p, node);
+}

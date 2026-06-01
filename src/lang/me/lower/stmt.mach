@@ -1,0 +1,426 @@
+# mach.lang.me.lower.stmt: per-statement lowering.
+#
+# Drives control-flow emission: every branching or
+# looping construct creates the blocks it needs and stitches the
+# predecessor edges through the IR builder's terminator emitters.
+#
+# After a statement that produces a terminator (`ret`, an exhaustive
+# `if`/`or` chain, an infinite `for`), the builder cursor is left on a
+# fresh, unreachable block so the caller's next statement lands somewhere
+# valid; `dce` drops the dead block later. The `fin` stack records deferred
+# bodies that are replayed (lowered inline) before every reachable
+# terminator that closes the enclosing scope.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.none;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use src:      mach.lang.source;
+use intern:   mach.lang.intern;
+
+use ast:      mach.lang.fe.ast;
+use aid:      mach.lang.fe.ast.id;
+use astmt:    mach.lang.fe.ast.stmt;
+use adecl:    mach.lang.fe.ast.decl;
+use resolve:  mach.lang.fe.resolve;
+use comptime: mach.lang.fe.comptime;
+
+use ir:       mach.lang.me.ir;
+use ir_type:  mach.lang.me.ir.type;
+use value:    mach.lang.me.ir.value;
+use builder:  mach.lang.me.ir.builder;
+
+use map: std.collections.map;
+
+use lower: mach.lang.me.lower;
+use expr:  mach.lang.me.lower.expr;
+
+# lowers one statement, dispatching on its `StmtKind`.
+# ---
+# ctx: per-module lowering context
+# sid: AST StmtId to lower
+# ret: true on success, or an error
+pub fun lower_stmt(ctx: *lower.LowerContext, sid: aid.StmtId) Result[bool, str] {
+    val s_opt: Option[*astmt.Stmt] = ast.get_stmt(ctx.a, sid);
+    if (is_none[*astmt.Stmt](s_opt)) {
+        ret err[bool, str]("lower: statement id out of range");
+    }
+    val s: *astmt.Stmt = unwrap[*astmt.Stmt](s_opt);
+    val k: astmt.StmtKind = s.kind;
+
+    if (k == astmt.STMT_KIND_EXPR)        { ret lower_expr_stmt(ctx, s); }
+    if (k == astmt.STMT_KIND_BLOCK)       { ret lower_block(ctx, s); }
+    if (k == astmt.STMT_KIND_IF)          { ret lower_if(ctx, s); }
+    if (k == astmt.STMT_KIND_FOR)         { ret lower_for(ctx, s); }
+    if (k == astmt.STMT_KIND_RET)         { ret lower_ret(ctx, s); }
+    if (k == astmt.STMT_KIND_BRK)         { ret lower_brk(ctx); }
+    if (k == astmt.STMT_KIND_CNT)         { ret lower_cnt(ctx); }
+    if (k == astmt.STMT_KIND_FIN)         { ret lower_fin(ctx, s); }
+    if (k == astmt.STMT_KIND_DECL)        { ret lower_decl_stmt(ctx, s); }
+    if (k == astmt.STMT_KIND_ASM)         { ret lower_asm(ctx, s); }
+    if (k == astmt.STMT_KIND_COMPTIME_IF) { ret lower_comptime_if(ctx, s); }
+    if (k == astmt.STMT_KIND_ERROR) {
+        # an error stmt must never reach lowering: the driver aborts on
+        # accumulated diagnostics before the middle end runs.
+        ret err[bool, str]("lower: error statement reached the middle end");
+    }
+
+    ret err[bool, str]("lower: unsupported statement kind");
+}
+
+# lowers a list of statements (`start`..`start+len` in ast.stmt_ids), the
+# common body shape for blocks, loop bodies, and arm bodies. stops early
+# once the current block is terminated (further stmts are unreachable and
+# are dropped here rather than emitted into a dead block).
+# ---
+# ctx:   the context
+# start: start index into ast.stmt_ids
+# len:   number of statements
+# ret:   true on success, or an error
+pub fun lower_stmt_list(ctx: *lower.LowerContext, start: u32, len: u32) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        if (block_terminated(ctx)) { ret ok[bool, str](true); }
+        val pool_ix: u32 = start + i;
+        if (pool_ix::usize >= ctx.a.stmt_id_len) {
+            ret err[bool, str]("lower: statement list index out of range");
+        }
+        val r: Result[bool, str] = lower_stmt(ctx, ctx.a.stmt_ids[pool_ix]);
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun lower_expr_stmt(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    val r: Result[value.Value, str] = expr.lower_rvalue(ctx, s.data.expr.expr);
+    if (is_err[value.Value, str](r)) { ret err[bool, str](unwrap_err[value.Value, str](r)); }
+    ret ok[bool, str](true);
+}
+
+fun lower_block(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    ret lower_stmt_list(ctx, s.data.block.stmts_start, s.data.block.stmts_len);
+}
+
+# lowers an `if`/`or` chain into a cbr diamond. the parser folds the `or`
+# chain into `else_block`, so a chained `if` is just an `IF` whose else
+# block holds the next `if`. each arm lowers into its own block; the merge
+# block receives an edge from each non-terminated arm. no phis are emitted —
+# mem2reg inserts them for variables mutated across arms.
+fun lower_if(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    val cr: Result[value.Value, str] = expr.lower_rvalue(ctx, s.data.if_.cond);
+    if (is_err[value.Value, str](cr)) { ret err[bool, str](unwrap_err[value.Value, str](cr)); }
+    val cond: value.Value = unwrap_ok[value.Value, str](cr);
+
+    val then_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](then_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](then_r)); }
+    val then_b: ir.BlockId = unwrap_ok[ir.BlockId, str](then_r);
+
+    val has_else: bool = s.data.if_.else_block != aid.STMT_NIL;
+
+    val else_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](else_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](else_r)); }
+    val else_b: ir.BlockId = unwrap_ok[ir.BlockId, str](else_r);
+
+    val merge_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](merge_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](merge_r)); }
+    val merge_b: ir.BlockId = unwrap_ok[ir.BlockId, str](merge_r);
+
+    val cbr_r: Result[bool, str] = builder.emit_cbr(?ctx.builder, cond, then_b, else_b);
+    if (is_err[bool, str](cbr_r)) { ret cbr_r; }
+
+    # then arm
+    builder.set_block(?ctx.builder, then_b);
+    val tr: Result[bool, str] = lower_stmt(ctx, s.data.if_.then_block);
+    if (is_err[bool, str](tr)) { ret tr; }
+    if (!block_terminated(ctx)) {
+        val br_r: Result[bool, str] = builder.emit_br(?ctx.builder, merge_b);
+        if (is_err[bool, str](br_r)) { ret br_r; }
+    }
+
+    # else arm
+    builder.set_block(?ctx.builder, else_b);
+    if (has_else) {
+        val er: Result[bool, str] = lower_stmt(ctx, s.data.if_.else_block);
+        if (is_err[bool, str](er)) { ret er; }
+    }
+    if (!block_terminated(ctx)) {
+        val br_r: Result[bool, str] = builder.emit_br(?ctx.builder, merge_b);
+        if (is_err[bool, str](br_r)) { ret br_r; }
+    }
+
+    builder.set_block(?ctx.builder, merge_b);
+    ret ok[bool, str](true);
+}
+
+# lowers a `for` loop. an absent condition is an infinite loop (the header
+# branches straight to the body). a present condition lowers to a cbr in the
+# header that exits to the loop-exit block. the body's last block branches
+# back to the header (the back-edge); `brk` / `cnt` use the loop frame.
+fun lower_for(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    val header_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](header_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](header_r)); }
+    val header: ir.BlockId = unwrap_ok[ir.BlockId, str](header_r);
+
+    val body_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](body_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](body_r)); }
+    val body: ir.BlockId = unwrap_ok[ir.BlockId, str](body_r);
+
+    val exit_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](exit_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](exit_r)); }
+    val exit: ir.BlockId = unwrap_ok[ir.BlockId, str](exit_r);
+
+    # enter the loop from the current block
+    val enter_r: Result[bool, str] = builder.emit_br(?ctx.builder, header);
+    if (is_err[bool, str](enter_r)) { ret enter_r; }
+
+    # header: branch to body unconditionally (infinite) or by condition
+    builder.set_block(?ctx.builder, header);
+    if (s.data.for_.cond == aid.EXPR_NIL) {
+        val br_r: Result[bool, str] = builder.emit_br(?ctx.builder, body);
+        if (is_err[bool, str](br_r)) { ret br_r; }
+    } or {
+        val cr: Result[value.Value, str] = expr.lower_rvalue(ctx, s.data.for_.cond);
+        if (is_err[value.Value, str](cr)) { ret err[bool, str](unwrap_err[value.Value, str](cr)); }
+        val cbr_r: Result[bool, str] = builder.emit_cbr(?ctx.builder, unwrap_ok[value.Value, str](cr), body, exit);
+        if (is_err[bool, str](cbr_r)) { ret cbr_r; }
+    }
+
+    # body
+    val push_r: Result[bool, str] = lower.push_loop(ctx, header, exit);
+    if (is_err[bool, str](push_r)) { ret push_r; }
+
+    builder.set_block(?ctx.builder, body);
+    val br: Result[bool, str] = lower_stmt(ctx, s.data.for_.body);
+    if (is_err[bool, str](br)) { lower.pop_loop(ctx); ret br; }
+    if (!block_terminated(ctx)) {
+        val back_r: Result[bool, str] = builder.emit_br(?ctx.builder, header);
+        if (is_err[bool, str](back_r)) { lower.pop_loop(ctx); ret back_r; }
+    }
+
+    lower.pop_loop(ctx);
+
+    # continue lowering after the loop in the exit block
+    builder.set_block(?ctx.builder, exit);
+    ret ok[bool, str](true);
+}
+
+# lowers a return: replays the pending fin bodies (innermost first), then
+# emits the `ret` terminator. a bare `ret` in a value-returning function
+# returns a zero of the function's IR return type so the IR stays
+# well-typed.
+fun lower_ret(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    val fr: Result[bool, str] = run_fins(ctx);
+    if (is_err[bool, str](fr)) { ret fr; }
+    if (block_terminated(ctx)) { ret ok[bool, str](true); }
+
+    if (s.data.ret_.value != aid.EXPR_NIL) {
+        val vr: Result[value.Value, str] = expr.lower_rvalue(ctx, s.data.ret_.value);
+        if (is_err[value.Value, str](vr)) { ret err[bool, str](unwrap_err[value.Value, str](vr)); }
+        ret builder.emit_ret(?ctx.builder, unwrap_ok[value.Value, str](vr));
+    }
+
+    # bare ret: void if the function returns void, else a zero of ret_ty
+    if (is_void(ctx, ctx.ret_ty)) {
+        ret builder.emit_ret_void(?ctx.builder);
+    }
+    ret builder.emit_ret(?ctx.builder, value.const_int(0, ctx.ret_ty));
+}
+
+fun lower_brk(ctx: *lower.LowerContext) Result[bool, str] {
+    val lf: Option[lower.LoopFrame] = lower.current_loop(ctx);
+    if (is_none[lower.LoopFrame](lf)) { ret err[bool, str]("lower: brk outside a loop"); }
+    ret builder.emit_br(?ctx.builder, unwrap[lower.LoopFrame](lf).exit);
+}
+
+fun lower_cnt(ctx: *lower.LowerContext) Result[bool, str] {
+    val lf: Option[lower.LoopFrame] = lower.current_loop(ctx);
+    if (is_none[lower.LoopFrame](lf)) { ret err[bool, str]("lower: cnt outside a loop"); }
+    ret builder.emit_br(?ctx.builder, unwrap[lower.LoopFrame](lf).header);
+}
+
+# records a deferred `fin` body on the fin stack. the body is replayed
+# before every reachable terminator that closes the enclosing function
+# scope (currently: at each `ret` and at fall-through function exit).
+fun lower_fin(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    ret lower.push_fin(ctx, s.data.fin.body);
+}
+
+# replays every pending fin body in reverse registration order (innermost
+# first). called immediately before a `ret` and at function fall-through.
+fun run_fins(ctx: *lower.LowerContext) Result[bool, str] {
+    val n: u32 = lower.fin_count(ctx);
+    if (n == 0) { ret ok[bool, str](true); }
+    var i: u32 = n;
+    for (i > 0) {
+        i = i - 1;
+        if (block_terminated(ctx)) { ret ok[bool, str](true); }
+        val body: aid.StmtId = lower.fin_at(ctx, i);
+        if (body != aid.STMT_NIL) {
+            val r: Result[bool, str] = lower_stmt(ctx, body);
+            if (is_err[bool, str](r)) { ret r; }
+        }
+    }
+    ret ok[bool, str](true);
+}
+
+# replays the pending fin bodies at function fall-through (no explicit ret).
+# exposed for the decl lowerer's default-return path.
+# ---
+# ctx: the context
+# ret: true on success, or an error
+pub fun run_pending_fins(ctx: *lower.LowerContext) Result[bool, str] {
+    ret run_fins(ctx);
+}
+
+# lowers a local `val` / `var`: allocate a stack slot, store the initial
+# value if present, and bind the source SymbolId to the slot pointer so
+# later reads / writes lower to load / store. mem2reg promotes the slot.
+fun lower_decl_stmt(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    val did: aid.DeclId = s.data.decl.decl;
+    val d_opt: Option[*adecl.Decl] = ast.get_decl(ctx.a, did);
+    if (is_none[*adecl.Decl](d_opt)) { ret err[bool, str]("lower: local decl id out of range"); }
+    val d: *adecl.Decl = unwrap[*adecl.Decl](d_opt);
+
+    if (d.kind != adecl.DECL_KIND_VAL && d.kind != adecl.DECL_KIND_VAR) {
+        # nested rec/def/use at statement scope contribute no runtime code
+        ret ok[bool, str](true);
+    }
+
+    val slot_ty_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, lower.decl_type_of(ctx, did));
+    if (is_err[ir_type.IrTypeId, str](slot_ty_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](slot_ty_r)); }
+    val slot_ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](slot_ty_r);
+
+    val cr: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?ctx.m.types, 64);
+    if (is_err[ir_type.IrTypeId, str](cr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](cr)); }
+    val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](cr);
+
+    val slot_r: Result[value.Value, str] = builder.emit_alloca(?ctx.builder, slot_ty, value.const_int(1, xty));
+    if (is_err[value.Value, str](slot_r)) { ret err[bool, str](unwrap_err[value.Value, str](slot_r)); }
+    val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+
+    val sid: resolve.SymbolId = decl_symbol_of(ctx, did);
+    val bind_r: Result[bool, str] = lower.bind_local(ctx, sid, slot);
+    if (is_err[bool, str](bind_r)) { ret bind_r; }
+
+    if (d.data.bind.init != aid.EXPR_NIL) {
+        val vr: Result[value.Value, str] = expr.lower_rvalue(ctx, d.data.bind.init);
+        if (is_err[value.Value, str](vr)) { ret err[bool, str](unwrap_err[value.Value, str](vr)); }
+        val sr: Result[bool, str] = builder.emit_store(?ctx.builder, unwrap_ok[value.Value, str](vr), slot);
+        if (is_err[bool, str](sr)) { ret sr; }
+    }
+
+    ret ok[bool, str](true);
+}
+
+# lowers an inline-asm statement to an OP_ASM instruction and registers its
+# `IrAsm` payload (interned ISA tag + raw body) in `Function.asm`, keyed by
+# the instruction id. operand / clobber inference happens in the back end,
+# so no operands are attached here.
+fun lower_asm(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    val txt: str = module_source(ctx);
+
+    val isa_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, txt, s.data.asm_.isa);
+    if (is_err[intern.StrId, str](isa_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](isa_r)); }
+    val isa_id: intern.StrId = unwrap_ok[intern.StrId, str](isa_r);
+
+    val body_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, txt, s.data.asm_.body);
+    if (is_err[intern.StrId, str](body_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](body_r)); }
+    val body_id: intern.StrId = unwrap_ok[intern.StrId, str](body_r);
+
+    val emit_r: Result[ir.InstructionId, str] = builder.emit_asm(?ctx.builder, nil, 0);
+    if (is_err[ir.InstructionId, str](emit_r)) { ret err[bool, str](unwrap_err[ir.InstructionId, str](emit_r)); }
+    val asm_iid: ir.InstructionId = unwrap_ok[ir.InstructionId, str](emit_r);
+
+    var payload: ir.IrAsm;
+    payload.isa  = isa_id;
+    payload.body = body_id;
+
+    ret map.insert[ir.InstructionId, ir.IrAsm](?ctx.builder.fn.asm, asm_iid, payload);
+}
+
+# lowers a statement-scope `$if` chain: evaluates each arm's condition with
+# the comptime evaluator and lowers only the first arm whose condition is
+# true (or the final unconditional `$or` arm). inactive arms emit nothing.
+fun lower_comptime_if(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    val txt: str = module_source(ctx);
+    var bi: u32 = 0;
+    for (bi < s.data.comptime_if.branches_len) {
+        val branch_ix: u32 = s.data.comptime_if.branches_start + bi;
+        if (branch_ix::usize >= ctx.a.comptime_branch_len) {
+            ret err[bool, str]("lower: comptime branch index out of range");
+        }
+        val branch: *adecl.ComptimeBranch = ?ctx.a.comptime_branches[branch_ix];
+
+        var active: bool = false;
+        if (branch.cond == aid.EXPR_NIL) {
+            active = true;
+        } or {
+            val ev: Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a, txt, branch.cond, ?ctx.s.interner);
+            if (is_err[comptime.CTValue, str](ev)) { ret err[bool, str](unwrap_err[comptime.CTValue, str](ev)); }
+            active = ct_truthy(unwrap_ok[comptime.CTValue, str](ev));
+        }
+
+        if (active) {
+            ret lower_stmt_list(ctx, branch.body_start, branch.body_len);
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# true when the builder's current block already has a terminator. used to
+# avoid emitting a second terminator (which the builder refuses) and to skip
+# unreachable trailing statements.
+fun block_terminated(ctx: *lower.LowerContext) bool {
+    if (ctx.builder.fn == nil) { ret false; }
+    val b: ir.BlockId = ctx.builder.block;
+    if (b == ir.BLOCK_NIL) { ret false; }
+    if (b >= ctx.builder.fn.block_count) { ret false; }
+    ret ctx.builder.fn.blocks[b].terminator != ir.INSTR_NIL;
+}
+
+# true when an IR type is the void type.
+fun is_void(ctx: *lower.LowerContext, tid: ir_type.IrTypeId) bool {
+    val t_opt: Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, tid);
+    if (is_none[*ir_type.IrType](t_opt)) { ret true; }
+    ret unwrap[*ir_type.IrType](t_opt).kind == ir_type.IRT_VOID;
+}
+
+# truthiness of a comptime value for `$if` arm selection.
+fun ct_truthy(v: comptime.CTValue) bool {
+    if (v.kind == comptime.CT_KIND_BOOL) { ret v.data.b; }
+    if (v.kind == comptime.CT_KIND_INT)  { ret v.data.i != 0; }
+    ret false;
+}
+
+# the resolved SymbolId bound to a decl, or SYMBOL_NIL.
+fun decl_symbol_of(ctx: *lower.LowerContext, did: aid.DeclId) resolve.SymbolId {
+    if (did == aid.DECL_NIL) { ret resolve.SYMBOL_NIL; }
+    if (did::usize >= ctx.rr.decl_count) { ret resolve.SYMBOL_NIL; }
+    ret ctx.rr.decl_symbol[did];
+}
+
+# the module's source text from the session source map.
+fun module_source(ctx: *lower.LowerContext) str {
+    val sf: Option[*src.SourceFile] = src.get(?ctx.s.sources, ctx.a.file_id);
+    if (is_none[*src.SourceFile](sf)) {
+        var empty: str;
+        empty.len  = 0;
+        empty.data = nil;
+        ret empty;
+    }
+    ret unwrap[*src.SourceFile](sf).text;
+}

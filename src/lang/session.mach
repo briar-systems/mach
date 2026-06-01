@@ -1,0 +1,155 @@
+# mach.lang.session: top-level service container shared across compilation phases.
+#
+# owns the source registry, diagnostic sink, string interner, type
+# interner, and query database. every phase takes a `*Session` and routes
+# service interactions through it.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+
+use source: mach.lang.source;
+use diag:   mach.lang.diagnostic;
+use intern: mach.lang.intern;
+use ty:     mach.lang.type;
+use query:  mach.lang.query;
+use target: mach.lang.target;
+
+# ModuleId: project-wide identifier for a loaded module, assigned by the
+# driver as modules are discovered and stable for the build's lifetime;
+# distinct from `ast.id.ModuleId`, which identifies a Module record within
+# one Ast.
+pub def ModuleId: u32;
+
+# MODULE_NIL: sentinel ModuleId denoting the absence of a module.
+pub val MODULE_NIL: ModuleId = 0xFFFFFFFF;
+
+# Session: top-level driver state shared across compilation phases; owns the allocator-backed services every phase reads or writes.
+# ---
+# alloc:    allocator used for all owned storage on the session
+# sources:  registry of loaded source files
+# diags:    diagnostic sink shared by all phases
+# interner: shared string interner used by sema and downstream phases
+# types:    shared type universe used by sema, middle-end, and backend
+# queries:  memoization database holding every input and derived compiler artifact; the public surface every consumer (CLI, LSP, tests) drives the compiler through
+pub rec Session {
+    alloc:    *Allocator;
+    sources:  source.SourceMap;
+    diags:    diag.DiagList;
+    interner: intern.Interner;
+    types:    ty.TypeInterner;
+    queries:  query.QueryDb;
+}
+
+# init: construct an empty Session backed by the given allocator. sub-services
+# are built in order: sources, diags, interner (infallible), then types
+# and queries (fallible). queries registers the canonical catalog — the
+# input and metadata kinds whose registration needs nothing from a phase
+# module; derived kinds bind their compute functions when their owning
+# phase modules register them. it then populates the process-global target
+# registries via target.register_all so target.select can compose a Target.
+# on any failure the prior sub-services are torn down in reverse construction
+# order.
+# ---
+# alloc: allocator used for all session-owned storage
+# ret:   a new empty Session, or an allocation error from a fallible sub-service
+pub fun init(alloc: *Allocator) Result[Session, str] {
+    var s: Session;
+    s.alloc    = alloc;
+    s.sources  = source.init(alloc);
+    s.diags    = diag.init(alloc);
+    s.interner = intern.init(alloc);
+
+    val r_types: Result[ty.TypeInterner, str] = ty.init(alloc);
+    if (is_err[ty.TypeInterner, str](r_types)) {
+        intern.dnit(?s.interner);
+        diag.dnit(?s.diags);
+        source.dnit(?s.sources);
+        ret err[Session, str](unwrap_err[ty.TypeInterner, str](r_types));
+    }
+    s.types = unwrap_ok[ty.TypeInterner, str](r_types);
+
+    val r_queries: Result[query.QueryDb, str] = query.init(alloc);
+    if (is_err[query.QueryDb, str](r_queries)) {
+        ty.dnit(?s.types);
+        intern.dnit(?s.interner);
+        diag.dnit(?s.diags);
+        source.dnit(?s.sources);
+        ret err[Session, str](unwrap_err[query.QueryDb, str](r_queries));
+    }
+    s.queries = unwrap_ok[query.QueryDb, str](r_queries);
+
+    val r_cat: Result[bool, str] = register_catalog(?s.queries);
+    if (is_err[bool, str](r_cat)) {
+        query.dnit(?s.queries);
+        ty.dnit(?s.types);
+        intern.dnit(?s.interner);
+        diag.dnit(?s.diags);
+        source.dnit(?s.sources);
+        ret err[Session, str](unwrap_err[bool, str](r_cat));
+    }
+
+    val r_targets: Result[bool, str] = target.register_all(?s.interner);
+    if (is_err[bool, str](r_targets)) {
+        query.dnit(?s.queries);
+        ty.dnit(?s.types);
+        intern.dnit(?s.interner);
+        diag.dnit(?s.diags);
+        source.dnit(?s.sources);
+        ret err[Session, str](unwrap_err[bool, str](r_targets));
+    }
+
+    ret ok[Session, str](s);
+}
+
+# register_catalog: register the catalog input kinds owned by the session. the two input
+# queries (project root, target) are self-contained and bound here.
+# Q_FILE_TEXT is a metadata source whose revision is owned by the source
+# map; its registration is deferred to the query layer that supplies the
+# source-map context the bare RevisionFn cannot reach, and derived kinds
+# are reserved by their owning phase modules, which bind the compute
+# functions the database invokes.
+# ---
+# db:  the freshly constructed query database
+# ret: true once every session-owned input kind is registered, or the first registration error
+fun register_catalog(db: *query.QueryDb) Result[bool, str] {
+    val r_root: Result[bool, str] = query.register_input(db, query.Q_PROJECT_ROOT);
+    if (is_err[bool, str](r_root)) { ret r_root; }
+
+    val r_target: Result[bool, str] = query.register_input(db, query.Q_TARGET);
+    if (is_err[bool, str](r_target)) { ret r_target; }
+
+    ret ok[bool, str](true);
+}
+
+# dnit: release every resource held by the Session.
+# ---
+# s: session to tear down; sub-structures are dnit'd in reverse construction order
+pub fun dnit(s: *Session) {
+    if (s == nil) { ret; }
+    query.dnit(?s.queries);
+    ty.dnit(?s.types);
+    intern.dnit(?s.interner);
+    diag.dnit(?s.diags);
+    source.dnit(?s.sources);
+}
+
+# load_source: register a source file with the session and return its FileId.
+# delegates to source.add, which bumps s.queries.revision so derived
+# entries depending on this file invalidate.
+# ---
+# s:    the session
+# path: file path to associate with this file
+# text: null-terminated source text to index and store
+# ret:  FileId of the newly added file, or an allocation error
+pub fun load_source(s: *Session, path: str, text: str) Result[source.FileId, str] {
+    ret source.add(?s.sources, ?s.queries, path, text);
+}

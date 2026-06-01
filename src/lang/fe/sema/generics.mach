@@ -1,0 +1,262 @@
+# mach.lang.fe.sema.generics: generic instantiation and substitution.
+#
+# Mach monomorphizes per use site: every `Name[Arg, ...]` reference to a
+# generic record, union, or function produces a concrete `TYPE_INSTANCE`
+# interned against the generic declaration and its argument sequence.
+# `substitute` is the companion that rewrites a generic body type —
+# replacing each `TYPE_GENERIC_PARAM` by its ordinal with the corresponding
+# argument — so a field table or function signature can be specialized for
+# the instance.
+#
+# instances are interned, so a recursive generic that mentions itself (for
+# example a tree node whose field is a pointer to the same instance) is
+# handled by the interner returning the in-progress TypeId for the inner
+# reference; substitution never has to unfold recursion.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use ty:    mach.lang.type;
+use sess:  mach.lang.session;
+use diag:  mach.lang.diagnostic;
+use token: mach.lang.fe.token;
+use ast:   mach.lang.fe.ast;
+use id:    mach.lang.fe.ast.id;
+use decl:  mach.lang.fe.ast.decl;
+use sema:  mach.lang.fe.sema;
+
+# instantiates a generic declaration with concrete type arguments,
+# producing an interned `TYPE_INSTANCE`. when the generic is declared in
+# this module its generic-parameter count is read directly from the AST and
+# the argument count is checked against it (a non-generic declaration, or a
+# count mismatch, is reported); a generic declared in a dependency was
+# already validated at its declaration site, so the supplied `arg_count` is
+# accepted. every argument must be a real, non-error type. on success the
+# interned instance TypeId is returned.
+# ---
+# sc:             the active sema context
+# generic_decl:   DeclId of the generic declaration in `generic_origin`
+# generic_origin: ModuleId of the module that declared the generic
+# args:           pointer to a contiguous array of concrete argument types
+# arg_count:      number of arguments supplied at the use site
+# span:           source range of the instantiation (for diagnostics)
+# ret:            the interned TYPE_INSTANCE TypeId, or an allocation error
+pub fun instantiate(
+    sc:             *sema.SemaContext,
+    generic_decl:   id.DeclId,
+    generic_origin: sess.ModuleId,
+    args:           *ty.TypeId,
+    arg_count:      u32,
+    span:           token.Span,
+) Result[ty.TypeId, str] {
+    if (generic_decl == id.DECL_NIL) {
+        report(sc, span, "not a generic: declaration is not generic");
+        ret ok[ty.TypeId, str](ty.TYPE_ERROR);
+    }
+
+    # arity check against the declaration when it lives in this module.
+    if (generic_origin == sc.own_module) {
+        val want_opt: Option[u32] = local_generic_count(sc, generic_decl);
+        if (is_none[u32](want_opt)) {
+            report(sc, span, "not a generic: declaration takes no type parameters");
+            ret ok[ty.TypeId, str](ty.TYPE_ERROR);
+        }
+        val want: u32 = unwrap[u32](want_opt);
+        if (arg_count != want) {
+            report(sc, span, "generic arg count: wrong number of type arguments");
+            ret ok[ty.TypeId, str](ty.TYPE_ERROR);
+        }
+    }
+
+    var i: u32 = 0;
+    for (i < arg_count) {
+        if (args[i] == ty.TYPE_NIL || args[i] == ty.TYPE_ERROR) {
+            report(sc, span, "generic arg N: invalid type");
+            ret ok[ty.TypeId, str](ty.TYPE_ERROR);
+        }
+        i = i + 1;
+    }
+
+    ret ty.intern_instance(?sc.s.types, generic_origin, generic_decl, args, arg_count);
+}
+
+# rewrites a generic body type by substituting each generic parameter with
+# the matching argument. `TYPE_GENERIC_PARAM` entries are replaced by index
+# (a param whose ordinal is out of range is left as the error type);
+# pointer, array, function, and instance types are rebuilt structurally so
+# substitution reaches every nested position; primitives and nominal types
+# pass through unchanged. an allocation failure during structural rebuild
+# degrades to `TYPE_ERROR` rather than aborting the whole module.
+# ---
+# sc:        the active sema context
+# body_type: the generic type to specialize (a field type, signature, etc.)
+# args:      pointer to the concrete argument types, indexed by param ordinal
+# arg_count: number of arguments (= the declaration's generic-param count)
+# ret:       the specialized TypeId, or TYPE_ERROR on an allocation failure
+pub fun substitute(sc: *sema.SemaContext, body_type: ty.TypeId, args: *ty.TypeId, arg_count: u32) ty.TypeId {
+    if (body_type == ty.TYPE_NIL || body_type == ty.TYPE_ERROR) { ret body_type; }
+
+    val t_opt: Option[*ty.Type] = ty.get(?sc.s.types, body_type);
+    if (is_none[*ty.Type](t_opt)) { ret body_type; }
+    val t: *ty.Type = unwrap[*ty.Type](t_opt);
+
+    if (t.kind == ty.TYPE_GENERIC_PARAM) {
+        val ix: u32 = t.data.generic_param.index;
+        if (ix < arg_count) { ret args[ix]; }
+        ret ty.TYPE_ERROR;
+    }
+
+    if (t.kind == ty.TYPE_POINTER) {
+        val base: ty.TypeId = substitute(sc, t.data.pointer.base, args, arg_count);
+        if (base == t.data.pointer.base) { ret body_type; }
+        val r: Result[ty.TypeId, str] = ty.intern_pointer(?sc.s.types, base);
+        ret unwrap_or_error(r);
+    }
+
+    if (t.kind == ty.TYPE_ARRAY) {
+        val count: u32 = t.data.array.count;
+        val base: ty.TypeId = substitute(sc, t.data.array.base, args, arg_count);
+        if (base == t.data.array.base) { ret body_type; }
+        val r: Result[ty.TypeId, str] = ty.intern_array(?sc.s.types, base, count);
+        ret unwrap_or_error(r);
+    }
+
+    if (t.kind == ty.TYPE_FUN) {
+        ret substitute_fun(sc, t, args, arg_count, body_type);
+    }
+
+    if (t.kind == ty.TYPE_INSTANCE) {
+        ret substitute_instance(sc, t, args, arg_count, body_type);
+    }
+
+    # primitives, raw ptr, nominal rec/uni: nothing to substitute
+    ret body_type;
+}
+
+# rebuilds a function type with each parameter and the return type
+# substituted. reads the parameter sequence out of the interner's param
+# pool into a fresh buffer before re-interning, since substitution may grow
+# the pool and invalidate the original `*Type` pointer.
+fun substitute_fun(sc: *sema.SemaContext, t: *ty.Type, args: *ty.TypeId, arg_count: u32, original: ty.TypeId) ty.TypeId {
+    val ret_ty_in: ty.TypeId   = t.data.fun.ret;
+    val pstart:    u32         = t.data.fun.params_start;
+    val plen:      u32         = t.data.fun.params_len;
+    val variadic:  bool        = t.data.fun.variadic;
+
+    var changed: bool = false;
+    var buf: *ty.TypeId = nil;
+    if (plen > 0) {
+        val ba: Result[*ty.TypeId, str] = allocate[ty.TypeId](sc.s.alloc, plen::usize);
+        if (is_err[*ty.TypeId, str](ba)) { ret ty.TYPE_ERROR; }
+        buf = unwrap_ok[*ty.TypeId, str](ba);
+
+        var i: u32 = 0;
+        for (i < plen) {
+            val p_opt: Option[ty.TypeId] = ty.get_param(?sc.s.types, pstart + i);
+            if (is_none[ty.TypeId](p_opt)) {
+                deallocate[ty.TypeId](sc.s.alloc, buf, plen::usize);
+                ret ty.TYPE_ERROR;
+            }
+            val orig_p: ty.TypeId = unwrap[ty.TypeId](p_opt);
+            buf[i] = substitute(sc, orig_p, args, arg_count);
+            if (buf[i] != orig_p) { changed = true; }
+            i = i + 1;
+        }
+    }
+
+    val ret_ty: ty.TypeId = substitute(sc, ret_ty_in, args, arg_count);
+    if (ret_ty != ret_ty_in) { changed = true; }
+
+    if (!changed) {
+        if (plen > 0) { deallocate[ty.TypeId](sc.s.alloc, buf, plen::usize); }
+        ret original;
+    }
+
+    val r: Result[ty.TypeId, str] = ty.intern_function(?sc.s.types, ret_ty, buf, plen, variadic);
+    if (plen > 0) {
+        deallocate[ty.TypeId](sc.s.alloc, buf, plen::usize);
+    }
+    ret unwrap_or_error(r);
+}
+
+# rebuilds a generic instance with each argument substituted. like
+# substitute_fun, copies the argument sequence out of the param pool first
+# so a pool growth during substitution cannot invalidate the read.
+fun substitute_instance(sc: *sema.SemaContext, t: *ty.Type, args: *ty.TypeId, arg_count: u32, original: ty.TypeId) ty.TypeId {
+    val origin:  sess.ModuleId = t.data.instance.target_origin;
+    val decl:    id.DeclId     = t.data.instance.target_decl;
+    val astart:  u32           = t.data.instance.args_start;
+    val alen:    u32           = t.data.instance.args_len;
+
+    if (alen == 0) { ret original; }
+
+    val ba: Result[*ty.TypeId, str] = allocate[ty.TypeId](sc.s.alloc, alen::usize);
+    if (is_err[*ty.TypeId, str](ba)) { ret ty.TYPE_ERROR; }
+    val buf: *ty.TypeId = unwrap_ok[*ty.TypeId, str](ba);
+
+    var changed: bool = false;
+    var i: u32 = 0;
+    for (i < alen) {
+        val a_opt: Option[ty.TypeId] = ty.get_param(?sc.s.types, astart + i);
+        if (is_none[ty.TypeId](a_opt)) {
+            deallocate[ty.TypeId](sc.s.alloc, buf, alen::usize);
+            ret ty.TYPE_ERROR;
+        }
+        val orig_arg: ty.TypeId = unwrap[ty.TypeId](a_opt);
+        buf[i] = substitute(sc, orig_arg, args, arg_count);
+        if (buf[i] != orig_arg) { changed = true; }
+        i = i + 1;
+    }
+
+    if (!changed) {
+        deallocate[ty.TypeId](sc.s.alloc, buf, alen::usize);
+        ret original;
+    }
+
+    val r: Result[ty.TypeId, str] = ty.intern_instance(?sc.s.types, origin, decl, buf, alen);
+    deallocate[ty.TypeId](sc.s.alloc, buf, alen::usize);
+    ret unwrap_or_error(r);
+}
+
+# returns the generic-parameter count of a declaration in this module, or
+# none when the declaration is not a kind that can carry generic parameters
+# (only `fun`, `rec`, and `uni` declarations are generic-capable). a zero
+# count is a valid `some(0)` — it means the named decl exists but is not
+# parameterized, which `instantiate` reports as a mismatch when args were
+# supplied.
+fun local_generic_count(sc: *sema.SemaContext, decl_id: id.DeclId) Option[u32] {
+    val d_opt: Option[*decl.Decl] = ast.get_decl(sc.a, decl_id);
+    if (is_none[*decl.Decl](d_opt)) { ret none[u32](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.kind == decl.DECL_KIND_FUN) { ret some[u32](d.data.fun_.generics_len); }
+    if (d.kind == decl.DECL_KIND_REC) { ret some[u32](d.data.rec_.generics_len); }
+    if (d.kind == decl.DECL_KIND_UNI) { ret some[u32](d.data.uni_.generics_len); }
+    ret none[u32]();
+}
+
+# unwraps an intern result to its TypeId, mapping an allocation error to the
+# poison type so structural rebuild degrades instead of propagating.
+fun unwrap_or_error(r: Result[ty.TypeId, str]) ty.TypeId {
+    if (is_err[ty.TypeId, str](r)) { ret ty.TYPE_ERROR; }
+    ret unwrap_ok[ty.TypeId, str](r);
+}
+
+# records an error-severity diagnostic against the module's file. a failed
+# append cannot itself be reported and sema never halts on it.
+fun report(sc: *sema.SemaContext, span: token.Span, message: str) {
+    diag.error(?sc.s.diags, sc.a.file_id, span, message);
+}

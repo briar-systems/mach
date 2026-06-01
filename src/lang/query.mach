@@ -1,0 +1,669 @@
+# mach.lang.query: demand-driven incremental memoization database.
+#
+# maps `(QueryKind, key)` pairs to cached byte buffers, records the
+# inter-query dependencies that produced each value, and recomputes only
+# the entries whose transitive inputs have changed. lives on the
+# `Session`; every phase reaches the compiler's cached artifacts through
+# `get`, never by calling another phase directly.
+#
+# a `QueryKind` selects a per-kind `QueryShard`; the shard's `role`
+# decides whether `get` returns a stored input value, runs a derived
+# `ComputeFn`, or rejects the call (metadata kinds carry no value, only
+# an external revision source). Validation is revision-based: an entry is
+# valid iff every recorded dependency's current `last_changed` still
+# equals the value captured when the entry was computed. Recomputes that
+# reproduce identical bytes leave `last_changed` untouched (early
+# cutoff), which is what keeps `last_changed` distinct from `computed_at`.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use mem: std.memory;
+
+# QueryKind: discriminator identifying a particular query function. one
+# kind maps to exactly one pure `key -> value` function and selects the
+# QueryDb's per-kind storage shard. stable for the lifetime of a build.
+pub def QueryKind: u16;
+
+# the fixed compiler query catalog. each kind's value equals its shard
+# index in QueryDb.storage, so the catalog is registered in this exact
+# order by session.init: the two inputs first, then the metadata source,
+# then the derived pipeline stages in pipeline order. driver and CLI set
+# the inputs and request the top derived artifact; every other stage is
+# reached transitively through get.
+
+# Q_PROJECT_ROOT: input — project configuration bytes for the root project.
+pub val Q_PROJECT_ROOT: QueryKind = 0;
+# Q_TARGET: input — selected target description bytes.
+pub val Q_TARGET: QueryKind = 1;
+# Q_FILE_TEXT: metadata — per-file source text; revision read from SourceFile.revision.
+pub val Q_FILE_TEXT: QueryKind = 2;
+# Q_TOKENIZE: derived — TokenStream for a file, keyed on src.FileId.
+pub val Q_TOKENIZE: QueryKind = 3;
+# Q_PARSE: derived — parsed Ast for a file, keyed on src.FileId.
+pub val Q_PARSE: QueryKind = 4;
+# Q_MODULE_ID_FOR_FQN: derived — sess.ModuleId for an interned FQN, keyed on intern.StrId.
+pub val Q_MODULE_ID_FOR_FQN: QueryKind = 5;
+# Q_COMPTIME_CTX: derived — a module's seeded ComptimeCtx, keyed on sess.ModuleId.
+pub val Q_COMPTIME_CTX: QueryKind = 6;
+# Q_RESOLVE: derived — a module's ResolveResult, keyed on sess.ModuleId.
+pub val Q_RESOLVE: QueryKind = 7;
+# Q_SEMA: derived — a module's SemaResult, keyed on sess.ModuleId.
+pub val Q_SEMA: QueryKind = 8;
+# Q_LOWER: derived — a module's optimized ir.Module, keyed on sess.ModuleId.
+pub val Q_LOWER: QueryKind = 9;
+# Q_CODEGEN: derived — a module's of.ObjectImage, keyed on sess.ModuleId.
+pub val Q_CODEGEN: QueryKind = 10;
+# Q_LINK: derived — the linked output for the project, keyed on unit.
+pub val Q_LINK: QueryKind = 11;
+
+# Revision: monotonic counter owned by the QueryDb, bumped on every
+# set_input. cached entries record the revision at which they were
+# computed and the revision at which their bytes last changed.
+pub def Revision: u64;
+
+# ShardRole: discriminator for a shard's storage and lookup behaviour.
+pub def ShardRole: u8;
+
+# SHARD_INPUT: externally-set source-of-truth value; get returns the cached value.
+pub val SHARD_INPUT: ShardRole = 0;
+# SHARD_DERIVED: value computed on demand; get revalidates deps and recomputes if stale.
+pub val SHARD_DERIVED: ShardRole = 1;
+# SHARD_METADATA: no stored value; get is an error. only reached through a
+# Dep, whose revision is read from the shard's RevisionFn.
+pub val SHARD_METADATA: ShardRole = 2;
+
+# ComputeFn: the signature every derived query's compute function shares:
+# a pure function from `(db, key)` to a produced byte buffer. uniform
+# across all derived kinds, so it is a real typed function pointer with no
+# erasure. the function may call get on db for further deps; those reads
+# are recorded into the requesting entry's dep list by get itself.
+pub def ComputeFn: fun(*QueryDb, u64, *Allocator) Result[QueryOutput, str];
+
+# RevisionFn: the signature every metadata source's revision-lookup
+# shares: maps a key to that source's current revision. invoked by the
+# validator when a Dep names a metadata kind.
+pub def RevisionFn: fun(u64) Revision;
+
+# QueryOutput: bytes produced by a derived ComputeFn; ownership transfers
+# into the cache entry on a successful compute.
+# ---
+# bytes: heap-allocated value buffer allocated with the compute allocator
+# len:   number of valid bytes
+pub rec QueryOutput {
+    bytes: *u8;
+    len:   u32;
+}
+
+# Dep: one recorded dependency of a cached entry. the validator compares
+# last_changed against the dep entry's current last_changed; equality
+# means the dep is unchanged.
+# ---
+# kind:         the dependency's kind
+# key:          the dependency's hashed key
+# last_changed: the dep's last_changed at the time the owning entry was computed
+pub rec Dep {
+    kind:         QueryKind;
+    key:          u64;
+    last_changed: Revision;
+}
+
+# QueryEntry: one cached `(key, value)` plus the metadata needed to validate it.
+# ---
+# key:          hashed key; the kind-key-type -> u64 mapping is the registrar's responsibility
+# value:        owned opaque value buffer (layout is the registered query's responsibility)
+# value_len:    length of value in bytes
+# computed_at:  revision at which value was last recomputed
+# last_changed: revision at which value's bytes last actually changed
+# deps:         queries read while computing value
+# dep_count:    number of entries in deps
+# dep_cap:      allocated slots in deps
+pub rec QueryEntry {
+    key:          u64;
+    value:        *u8;
+    value_len:    u32;
+    computed_at:  Revision;
+    last_changed: Revision;
+    deps:         *Dep;
+    dep_count:    u32;
+    dep_cap:      u32;
+}
+
+# QueryShard: per-kind storage. the kind equals the shard's index in
+# QueryDb.storage. entries are scanned by key (linear); inputs and derived
+# kinds populate entries, metadata kinds never do.
+# ---
+# kind:      self-identifying kind; equals this shard's storage index
+# role:      input / derived / metadata discriminator
+# compute:   compute function for derived kinds; nil otherwise
+# revisions: revision-lookup function for metadata kinds; nil otherwise
+# registered: whether a register_* call has claimed this shard
+# entries:   cached entries keyed by QueryEntry.key
+# len:       number of entries
+# cap:       allocated capacity in entries
+pub rec QueryShard {
+    kind:       QueryKind;
+    role:       ShardRole;
+    compute:    ComputeFn;
+    revisions:  RevisionFn;
+    registered: bool;
+    entries:    *QueryEntry;
+    len:        u32;
+    cap:        u32;
+}
+
+# QueryDb: the full query database. owns one shard per registered kind,
+# indexed by kind value, plus a monotonic revision counter.
+# ---
+# alloc:    backing allocator for shard storage and per-entry buffers
+# revision: current revision; bumped by set_input
+# storage:  shard array indexed by kind
+# kinds:    number of shard slots allocated (length of storage)
+pub rec QueryDb {
+    alloc:    *Allocator;
+    revision: Revision;
+    storage:  *QueryShard;
+    kinds:    u32;
+}
+
+val INITIAL_DEP_CAP:   u32 = 4;
+val INITIAL_ENTRY_CAP: u32 = 8;
+
+# init: construct an empty database. the shard array grows lazily as kinds
+# register; revision starts at 0.
+# ---
+# alloc: allocator used for shard storage and every entry's value/deps buffer
+# ret:   a new empty QueryDb, or an allocation error
+pub fun init(alloc: *Allocator) Result[QueryDb, str] {
+    var db: QueryDb;
+    db.alloc    = alloc;
+    db.revision = 0;
+    db.storage  = nil;
+    db.kinds    = 0;
+    ret ok[QueryDb, str](db);
+}
+
+# dnit: release every shard, every entry, and every entry's value and deps
+# buffers. nil is a no-op.
+# ---
+# db: the database to tear down; all fields are zeroed
+pub fun dnit(db: *QueryDb) {
+    if (db == nil) { ret; }
+
+    if (db.storage != nil && db.kinds > 0) {
+        var i: u32 = 0;
+        for (i < db.kinds) {
+            val sh: *QueryShard = ?db.storage[i];
+            free_shard_entries(db, sh);
+            i = i + 1;
+        }
+        deallocate[QueryShard](db.alloc, db.storage, db.kinds::usize);
+    }
+
+    db.storage  = nil;
+    db.kinds    = 0;
+    db.revision = 0;
+}
+
+# register_input: reserve shard `kind` as an input query. set_input calls
+# with this kind are then accepted, and get returns the stored value
+# directly.
+# ---
+# db:   the database
+# kind: kind value to claim as an input shard
+# ret:  true on success, or an allocation error from growing the shard array
+pub fun register_input(db: *QueryDb, kind: QueryKind) Result[bool, str] {
+    ret register(db, kind, SHARD_INPUT, nil, nil);
+}
+
+# register_derived: reserve shard `kind` as a derived query and bind its compute function.
+# ---
+# db:      the database
+# kind:    kind value to claim as a derived shard
+# compute: the pure ComputeFn invoked by get when the entry is stale or absent
+# ret:     true on success, or an allocation error from growing the shard array
+pub fun register_derived(db: *QueryDb, kind: QueryKind, compute: ComputeFn) Result[bool, str] {
+    ret register(db, kind, SHARD_DERIVED, compute, nil);
+}
+
+# register_metadata: reserve shard `kind` as a metadata source. no value
+# is stored; `lookup` is the external owner's revision function, invoked
+# by the validator when a dependent's Dep names this kind. get on a
+# metadata kind is an error.
+# ---
+# db:     the database
+# kind:   kind value to claim as a metadata shard
+# lookup: the RevisionFn that maps a key to its current revision
+# ret:    true on success, or an allocation error from growing the shard array
+pub fun register_metadata(db: *QueryDb, kind: QueryKind, lookup: RevisionFn) Result[bool, str] {
+    ret register(db, kind, SHARD_METADATA, nil, lookup);
+}
+
+# set_input: store a value under an input shard. bumps the database
+# revision; if the new bytes differ from the existing entry's value, the
+# entry's last_changed is set to the new revision (otherwise it is left in
+# place).
+# ---
+# db:        the database
+# kind:      an input kind previously claimed by register_input
+# key:       hashed key for this input
+# value:     pointer to the value bytes to store (copied into an owned buffer)
+# value_len: number of bytes in value
+# ret:       true on success, or an error if kind is not an input shard / on alloc failure
+pub fun set_input(db: *QueryDb, kind: QueryKind, key: u64, value: *u8, value_len: u32) Result[bool, str] {
+    val rsh: Result[*QueryShard, str] = shard_of(db, kind);
+    if (is_err[*QueryShard, str](rsh)) { ret err[bool, str](unwrap_err[*QueryShard, str](rsh)); }
+    val sh: *QueryShard = unwrap_ok[*QueryShard, str](rsh);
+
+    if (sh.role != SHARD_INPUT) {
+        ret err[bool, str]("set_input: kind is not an input query");
+    }
+
+    db.revision = db.revision + 1;
+
+    val existing: *QueryEntry = find_entry(sh, key);
+    if (existing != nil) {
+        val same: bool = bytes_equal(existing.value, existing.value_len, value, value_len);
+        val rcopy: Result[*u8, str] = dup_bytes(db.alloc, value, value_len);
+        if (is_err[*u8, str](rcopy)) { ret err[bool, str](unwrap_err[*u8, str](rcopy)); }
+        if (existing.value != nil && existing.value_len > 0) {
+            deallocate[u8](db.alloc, existing.value, existing.value_len::usize);
+        }
+        existing.value     = unwrap_ok[*u8, str](rcopy);
+        existing.value_len = value_len;
+        existing.computed_at = db.revision;
+        if (!same) {
+            existing.last_changed = db.revision;
+        }
+        ret ok[bool, str](true);
+    }
+
+    val rcopy: Result[*u8, str] = dup_bytes(db.alloc, value, value_len);
+    if (is_err[*u8, str](rcopy)) { ret err[bool, str](unwrap_err[*u8, str](rcopy)); }
+
+    val rentry: Result[*QueryEntry, str] = append_entry(db, sh, key);
+    if (is_err[*QueryEntry, str](rentry)) {
+        val buf: *u8 = unwrap_ok[*u8, str](rcopy);
+        if (buf != nil && value_len > 0) { deallocate[u8](db.alloc, buf, value_len::usize); }
+        ret err[bool, str](unwrap_err[*QueryEntry, str](rentry));
+    }
+    val entry: *QueryEntry = unwrap_ok[*QueryEntry, str](rentry);
+    entry.value        = unwrap_ok[*u8, str](rcopy);
+    entry.value_len    = value_len;
+    entry.computed_at  = db.revision;
+    entry.last_changed = db.revision;
+    ret ok[bool, str](true);
+}
+
+# invalidate: drop the cached entry for `(kind, key)` regardless of
+# validity. used to force a derived query's recompute (e.g. exercising the
+# compute path in a test). a no-op when no such entry exists.
+# ---
+# db:   the database
+# kind: the entry's kind
+# key:  the entry's hashed key
+# ret:  true on success, or an error when kind is out of range
+pub fun invalidate(db: *QueryDb, kind: QueryKind, key: u64) Result[bool, str] {
+    val rsh: Result[*QueryShard, str] = shard_of(db, kind);
+    if (is_err[*QueryShard, str](rsh)) { ret err[bool, str](unwrap_err[*QueryShard, str](rsh)); }
+    val sh: *QueryShard = unwrap_ok[*QueryShard, str](rsh);
+
+    var i: u32 = 0;
+    for (i < sh.len) {
+        val e: *QueryEntry = ?sh.entries[i];
+        if (e.key == key) {
+            free_entry(db, e);
+            val last: u32 = sh.len - 1;
+            if (i != last) { sh.entries[i] = sh.entries[last]; }
+            sh.len = last;
+            ret ok[bool, str](true);
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# get: the single public lookup. returns the cached entry for `(kind,
+# key)`, revalidating its dependencies recursively and recomputing through
+# the derived shard's compute function when the entry is stale or absent.
+# get on a metadata kind is an error; get on an input kind with no stored
+# value is an error.
+# ---
+# db:   the database
+# kind: the queried kind
+# key:  the hashed key
+# ret:  a pointer to the (fresh-or-current) QueryEntry, or an error
+pub fun get(db: *QueryDb, kind: QueryKind, key: u64) Result[*QueryEntry, str] {
+    val rsh: Result[*QueryShard, str] = shard_of(db, kind);
+    if (is_err[*QueryShard, str](rsh)) { ret err[*QueryEntry, str](unwrap_err[*QueryShard, str](rsh)); }
+    val sh: *QueryShard = unwrap_ok[*QueryShard, str](rsh);
+
+    if (sh.role == SHARD_METADATA) {
+        ret err[*QueryEntry, str]("get: metadata kinds have no stored value");
+    }
+
+    if (sh.role == SHARD_INPUT) {
+        val e: *QueryEntry = find_entry(sh, key);
+        if (e == nil) { ret err[*QueryEntry, str]("get: input query has no value for key"); }
+        ret ok[*QueryEntry, str](e);
+    }
+
+    val existing: *QueryEntry = find_entry(sh, key);
+    if (existing != nil) {
+        if (entry_valid(db, existing)) {
+            existing.computed_at = db.revision;
+            ret ok[*QueryEntry, str](existing);
+        }
+        ret recompute(db, sh, existing, key);
+    }
+
+    val rentry: Result[*QueryEntry, str] = append_entry(db, sh, key);
+    if (is_err[*QueryEntry, str](rentry)) { ret rentry; }
+    val entry: *QueryEntry = unwrap_ok[*QueryEntry, str](rentry);
+    ret recompute(db, sh, entry, key);
+}
+
+# register: claim a shard for a kind, growing the shard array to cover
+# that index when needed. fresh slots default to unregistered; rejects
+# double-claims.
+fun register(db: *QueryDb, kind: QueryKind, role: ShardRole, compute: ComputeFn, revisions: RevisionFn) Result[bool, str] {
+    val need: u32 = kind::u32 + 1;
+    if (need > db.kinds) {
+        val rg: Result[bool, str] = grow_storage(db, need);
+        if (is_err[bool, str](rg)) { ret rg; }
+    }
+
+    val sh: *QueryShard = ?db.storage[kind::u32];
+    if (sh.registered) {
+        ret err[bool, str]("register: kind already registered");
+    }
+    sh.kind       = kind;
+    sh.role       = role;
+    sh.compute    = compute;
+    sh.revisions  = revisions;
+    sh.registered = true;
+    ret ok[bool, str](true);
+}
+
+# grow_storage: grow the shard array to at least `need` slots, initializing new shards as empty and unregistered.
+fun grow_storage(db: *QueryDb, need: u32) Result[bool, str] {
+    var new_cap: u32 = db.kinds;
+    if (new_cap == 0) { new_cap = need; }
+    for (new_cap < need) { new_cap = new_cap * 2; }
+
+    if (db.storage == nil) {
+        val r: Result[*QueryShard, str] = allocate[QueryShard](db.alloc, new_cap::usize);
+        if (is_err[*QueryShard, str](r)) { ret err[bool, str](unwrap_err[*QueryShard, str](r)); }
+        db.storage = unwrap_ok[*QueryShard, str](r);
+    }
+    or {
+        val r: Result[*QueryShard, str] = reallocate[QueryShard](db.alloc, db.storage, db.kinds::usize, new_cap::usize);
+        if (is_err[*QueryShard, str](r)) { ret err[bool, str](unwrap_err[*QueryShard, str](r)); }
+        db.storage = unwrap_ok[*QueryShard, str](r);
+    }
+
+    var i: u32 = db.kinds;
+    for (i < new_cap) {
+        val sh: *QueryShard = ?db.storage[i];
+        sh.kind       = i::QueryKind;
+        sh.role       = SHARD_INPUT;
+        sh.compute    = nil;
+        sh.revisions  = nil;
+        sh.registered = false;
+        sh.entries    = nil;
+        sh.len        = 0;
+        sh.cap        = 0;
+        i = i + 1;
+    }
+
+    db.kinds = new_cap;
+    ret ok[bool, str](true);
+}
+
+# shard_of: resolve a kind to its shard, erroring when the kind is out of range or unregistered.
+fun shard_of(db: *QueryDb, kind: QueryKind) Result[*QueryShard, str] {
+    if (kind::u32 >= db.kinds) {
+        ret err[*QueryShard, str]("query: kind out of range");
+    }
+    val sh: *QueryShard = ?db.storage[kind::u32];
+    if (!sh.registered) {
+        ret err[*QueryShard, str]("query: kind not registered");
+    }
+    ret ok[*QueryShard, str](sh);
+}
+
+# find_entry: linear scan for an entry by key; nil when absent.
+fun find_entry(sh: *QueryShard, key: u64) *QueryEntry {
+    var i: u32 = 0;
+    for (i < sh.len) {
+        val e: *QueryEntry = ?sh.entries[i];
+        if (e.key == key) { ret e; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# append_entry: append a fresh zeroed entry with the given key and return
+# a pointer to it. growing the entries array may move earlier entries, so
+# callers must not hold entry pointers across an append.
+fun append_entry(db: *QueryDb, sh: *QueryShard, key: u64) Result[*QueryEntry, str] {
+    if (sh.entries == nil) {
+        val r: Result[*QueryEntry, str] = allocate[QueryEntry](db.alloc, INITIAL_ENTRY_CAP::usize);
+        if (is_err[*QueryEntry, str](r)) { ret r; }
+        sh.entries = unwrap_ok[*QueryEntry, str](r);
+        sh.cap     = INITIAL_ENTRY_CAP;
+    }
+    or (sh.len == sh.cap) {
+        val new_cap: u32 = sh.cap * 2;
+        val r: Result[*QueryEntry, str] = reallocate[QueryEntry](db.alloc, sh.entries, sh.cap::usize, new_cap::usize);
+        if (is_err[*QueryEntry, str](r)) { ret r; }
+        sh.entries = unwrap_ok[*QueryEntry, str](r);
+        sh.cap     = new_cap;
+    }
+
+    val e: *QueryEntry = ?sh.entries[sh.len];
+    e.key          = key;
+    e.value        = nil;
+    e.value_len    = 0;
+    e.computed_at  = 0;
+    e.last_changed = 0;
+    e.deps         = nil;
+    e.dep_count    = 0;
+    e.dep_cap      = 0;
+    sh.len = sh.len + 1;
+    ret ok[*QueryEntry, str](e);
+}
+
+# entry_valid: an entry is valid iff every dep's current last_changed
+# equals the value captured when the entry was computed. input deps read
+# their stored entry's last_changed; metadata deps read the source's
+# RevisionFn.
+fun entry_valid(db: *QueryDb, e: *QueryEntry) bool {
+    var i: u32 = 0;
+    for (i < e.dep_count) {
+        val d: *Dep = ?e.deps[i];
+        if (current_last_changed(db, d.kind, d.key) != d.last_changed) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# current_last_changed: the current last_changed revision for `(kind,
+# key)`. metadata kinds resolve through their RevisionFn; input and
+# derived kinds read their stored entry (0 when absent — an unset
+# dependency reads as never-changed at revision 0, which forces a
+# recompute once it is set).
+fun current_last_changed(db: *QueryDb, kind: QueryKind, key: u64) Revision {
+    if (kind::u32 >= db.kinds) { ret 0; }
+    val sh: *QueryShard = ?db.storage[kind::u32];
+    if (sh.role == SHARD_METADATA) {
+        if (sh.revisions == nil) { ret 0; }
+        ret sh.revisions(key);
+    }
+    val e: *QueryEntry = find_entry(sh, key);
+    if (e == nil) { ret 0; }
+    ret e.last_changed;
+}
+
+# recompute: recompute a derived entry: clears its dep list, runs the
+# shard's compute fn (which re-records deps via record_dep), and applies
+# early cutoff — identical bytes leave value/last_changed unchanged,
+# differing bytes replace value and bump last_changed.
+fun recompute(db: *QueryDb, sh: *QueryShard, e: *QueryEntry, key: u64) Result[*QueryEntry, str] {
+    if (sh.compute == nil) {
+        ret err[*QueryEntry, str]("recompute: derived kind has no compute function");
+    }
+
+    e.dep_count = 0;
+
+    val rout: Result[QueryOutput, str] = sh.compute(db, key, db.alloc);
+    if (is_err[QueryOutput, str](rout)) {
+        ret err[*QueryEntry, str](unwrap_err[QueryOutput, str](rout));
+    }
+    val out: QueryOutput = unwrap_ok[QueryOutput, str](rout);
+
+    e.computed_at = db.revision;
+
+    val same: bool = bytes_equal(e.value, e.value_len, out.bytes, out.len);
+    if (same) {
+        if (out.bytes != nil && out.len > 0) {
+            deallocate[u8](db.alloc, out.bytes, out.len::usize);
+        }
+        ret ok[*QueryEntry, str](e);
+    }
+
+    if (e.value != nil && e.value_len > 0) {
+        deallocate[u8](db.alloc, e.value, e.value_len::usize);
+    }
+    e.value        = out.bytes;
+    e.value_len    = out.len;
+    e.last_changed = db.revision;
+    ret ok[*QueryEntry, str](e);
+}
+
+# record_dep: record that the entry currently being computed for
+# `(owner_kind, owner_key)` read `(dep_kind, dep_key)`. appends a Dep
+# capturing the dep's current last_changed. invoked by a ComputeFn
+# (through get) to wire the dependency graph; a no-op record (owner
+# absent) cannot happen because get creates the owner entry before calling
+# compute.
+# ---
+# db:         the database
+# owner_kind: kind of the entry being computed
+# owner_key:  key of the entry being computed
+# dep_kind:   kind that was read
+# dep_key:    key that was read
+# ret:        true on success, or an allocation error from growing the dep list
+pub fun record_dep(db: *QueryDb, owner_kind: QueryKind, owner_key: u64, dep_kind: QueryKind, dep_key: u64) Result[bool, str] {
+    if (owner_kind::u32 >= db.kinds) {
+        ret err[bool, str]("record_dep: owner kind out of range");
+    }
+    val sh: *QueryShard = ?db.storage[owner_kind::u32];
+    val e: *QueryEntry = find_entry(sh, owner_key);
+    if (e == nil) {
+        ret err[bool, str]("record_dep: owner entry not found");
+    }
+
+    val rg: Result[bool, str] = reserve_deps(db, e, 1);
+    if (is_err[bool, str](rg)) { ret rg; }
+
+    val d: *Dep = ?e.deps[e.dep_count];
+    d.kind         = dep_kind;
+    d.key          = dep_key;
+    d.last_changed = current_last_changed(db, dep_kind, dep_key);
+    e.dep_count = e.dep_count + 1;
+    ret ok[bool, str](true);
+}
+
+# reserve_deps: ensure the entry's dep array has room for `need` more deps.
+fun reserve_deps(db: *QueryDb, e: *QueryEntry, need: u32) Result[bool, str] {
+    if (e.deps == nil) {
+        var cap: u32 = INITIAL_DEP_CAP;
+        for (cap < need) { cap = cap * 2; }
+        val r: Result[*Dep, str] = allocate[Dep](db.alloc, cap::usize);
+        if (is_err[*Dep, str](r)) { ret err[bool, str](unwrap_err[*Dep, str](r)); }
+        e.deps    = unwrap_ok[*Dep, str](r);
+        e.dep_cap = cap;
+        ret ok[bool, str](true);
+    }
+    if (e.dep_count + need <= e.dep_cap) { ret ok[bool, str](true); }
+
+    var new_cap: u32 = e.dep_cap;
+    for (e.dep_count + need > new_cap) { new_cap = new_cap * 2; }
+    val r: Result[*Dep, str] = reallocate[Dep](db.alloc, e.deps, e.dep_cap::usize, new_cap::usize);
+    if (is_err[*Dep, str](r)) { ret err[bool, str](unwrap_err[*Dep, str](r)); }
+    e.deps    = unwrap_ok[*Dep, str](r);
+    e.dep_cap = new_cap;
+    ret ok[bool, str](true);
+}
+
+# free_entry: free an entry's owned value and deps buffers and zero their slots.
+fun free_entry(db: *QueryDb, e: *QueryEntry) {
+    if (e.value != nil && e.value_len > 0) {
+        deallocate[u8](db.alloc, e.value, e.value_len::usize);
+    }
+    if (e.deps != nil && e.dep_cap > 0) {
+        deallocate[Dep](db.alloc, e.deps, e.dep_cap::usize);
+    }
+    e.value     = nil;
+    e.value_len = 0;
+    e.deps      = nil;
+    e.dep_count = 0;
+    e.dep_cap   = 0;
+}
+
+# free_shard_entries: free every entry in a shard plus the entries array itself.
+fun free_shard_entries(db: *QueryDb, sh: *QueryShard) {
+    if (sh.entries == nil) { ret; }
+    var i: u32 = 0;
+    for (i < sh.len) {
+        free_entry(db, ?sh.entries[i]);
+        i = i + 1;
+    }
+    if (sh.cap > 0) {
+        deallocate[QueryEntry](db.alloc, sh.entries, sh.cap::usize);
+    }
+    sh.entries = nil;
+    sh.len     = 0;
+    sh.cap     = 0;
+}
+
+# dup_bytes: allocate an owned copy of `len` bytes from `src`. a
+# zero-length copy yields a nil buffer (no allocation).
+fun dup_bytes(alloc: *Allocator, src: *u8, len: u32) Result[*u8, str] {
+    if (len == 0) { ret ok[*u8, str](nil); }
+    val r: Result[*u8, str] = allocate[u8](alloc, len::usize);
+    if (is_err[*u8, str](r)) { ret r; }
+    val dst: *u8 = unwrap_ok[*u8, str](r);
+    mem.raw_copy(dst::ptr, src::ptr, len::usize);
+    ret ok[*u8, str](dst);
+}
+
+# bytes_equal: byte-wise equality of two buffers. nil buffers compare as length-0.
+fun bytes_equal(a: *u8, a_len: u32, b: *u8, b_len: u32) bool {
+    if (a_len != b_len) { ret false; }
+    if (a_len == 0) { ret true; }
+    var i: u32 = 0;
+    for (i < a_len) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
