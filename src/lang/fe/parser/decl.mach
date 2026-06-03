@@ -24,7 +24,7 @@ use module: mach.lang.fe.ast.module;
 
 use parser: mach.lang.fe.parser.state;
 use pexpr:  mach.lang.fe.parser.expr;
-use pasm:   mach.lang.fe.parser.asm;
+use pasm:   mach.lang.fe.parser.iasm;
 
 # parse_module: parses a whole source file as a single Module, sets ast.root_module, and returns the ModuleId.
 # ---
@@ -33,22 +33,29 @@ use pasm:   mach.lang.fe.parser.asm;
 pub fun parse_module(p: *parser.Parser) id.ModuleId {
     val start: token.Token = parser.current(p);
 
-    val decls_start: u32 = p.ast.decl_id_len::u32;
-    var decls_len:   u32 = 0;
+    # buffer direct decls so a nested decl-list (comptime branch body) parsed
+    # mid-stream cannot interleave into this module's contiguous decl-id slice
+    var buf: parser.DeclIdBuf = parser.decl_id_buf_init();
 
     for (!parser.at_eof(p)) {
+        val before: usize = p.pos;
         val d: id.DeclId = parse_decl(p);
         if (d != id.DECL_NIL) {
-            parser.push_decl_id(p, d);
-            decls_len = decls_len + 1;
+            parser.decl_id_buf_push(p, ?buf, d);
         }
         if (p.panic) {
-            parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
-            if (parser.at(p, token.KIND_SEMI)) { parser.advance(p); }
+            # realign on the next real declaration boundary so a malformed decl
+            # doesn't make every following token its own error
+            parser.sync_to_decl(p);
         }
+        # guarantee forward progress even when recovery leaves us in place
+        if (p.pos == before && !parser.at_eof(p)) { parser.advance(p); }
     }
 
     val end: token.Token = parser.current(p);
+
+    var decls_len: u32 = 0;
+    val decls_start: u32 = parser.decl_id_buf_flush(p, ?buf, ?decls_len);
 
     var m: module.Module;
     m.span        = parser.span_of(start.span, end.span);
@@ -215,15 +222,15 @@ fun parse_fwd_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
     val end: token.Token = parser.current(p);
     parser.expect(p, token.KIND_SEMI, "expected ';' after 'fwd' declaration");
 
-    var fwd: decl.DeclFwd;
-    fwd.alias = alias;
-    fwd.path  = path;
+    var fwd_d: decl.DeclFwd;
+    fwd_d.alias = alias;
+    fwd_d.path  = path;
 
     var d: decl.Decl;
     d.span  = parser.span_of(start, end.span);
     d.kind  = decl.DECL_KIND_FWD;
     d.flags = 0;
-    d.data.fwd = fwd;
+    d.data.fwd_ = fwd_d;
     ret parser.push_decl(p, d);
 }
 
@@ -243,9 +250,9 @@ fun parse_fun_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
     val gen_start: u32 = p.ast.generic_name_len::u32;
     val gen_len:   u32 = parse_generic_params(p);
 
-    val params_start: u32 = p.ast.typed_name_len::u32;
+    var params_start: u32 = 0;
     var variadic:     bool = false;
-    val params_len:   u32 = parse_fun_params(p, ?variadic);
+    val params_len:   u32 = parse_fun_params(p, ?variadic, ?params_start);
 
     var ret_type: id.TypeId = id.TYPE_NIL;
     if (!parser.at(p, token.KIND_LBRACE) && !parser.at(p, token.KIND_SEMI)) {
@@ -299,8 +306,8 @@ fun parse_rec_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
     val gen_start: u32 = p.ast.generic_name_len::u32;
     val gen_len:   u32 = parse_generic_params(p);
 
-    val fields_start: u32 = p.ast.typed_name_len::u32;
-    val fields_len:   u32 = parse_rec_fields(p);
+    var fields_start: u32 = 0;
+    val fields_len:   u32 = parse_rec_fields(p, ?fields_start);
 
     var end_span: token.Span = name;
     if (p.pos > 0) {
@@ -338,8 +345,8 @@ fun parse_uni_decl(p: *parser.Parser, start: token.Span, flags: u8) id.DeclId {
     val gen_start: u32 = p.ast.generic_name_len::u32;
     val gen_len:   u32 = parse_generic_params(p);
 
-    val fields_start: u32 = p.ast.typed_name_len::u32;
-    val fields_len:   u32 = parse_rec_fields(p);
+    var fields_start: u32 = 0;
+    val fields_len:   u32 = parse_rec_fields(p, ?fields_start);
 
     var end_span: token.Span = name;
     if (p.pos > 0) {
@@ -475,8 +482,9 @@ fun parse_comptime_decl(p: *parser.Parser, start: token.Span) id.DeclId {
 
 # parses `$if (cond) { decls } $or (cond) { decls } $or { decls }` at decl scope
 fun parse_comptime_if_decl(p: *parser.Parser, start: token.Span) id.DeclId {
-    val branches_start: u32 = p.ast.comptime_branch_len::u32;
-    var branches_len:   u32 = 0;
+    # buffer this chain's branches so a nested `$if`/`$or` chain parsed inside a
+    # branch body cannot interleave into this chain's contiguous slice.
+    var br_buf: parser.ComptimeBranchBuf = parser.comptime_branch_buf_init();
 
     parser.advance(p);
     parser.advance(p);
@@ -500,15 +508,15 @@ fun parse_comptime_if_decl(p: *parser.Parser, start: token.Span) id.DeclId {
             }
         }
 
-        val body_start: u32 = p.ast.decl_id_len::u32;
-        var body_len:   u32 = 0;
+        # buffer this branch's direct decls so a nested comptime branch body
+        # parsed inside cannot interleave into this branch's contiguous slice
+        var body_buf: parser.DeclIdBuf = parser.decl_id_buf_init();
 
         parser.expect(p, token.KIND_LBRACE, "expected '{' to open comptime branch body");
         for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
             val d: id.DeclId = parse_decl(p);
             if (d != id.DECL_NIL) {
-                parser.push_decl_id(p, d);
-                body_len = body_len + 1;
+                parser.decl_id_buf_push(p, ?body_buf, d);
             }
             if (p.panic) {
                 parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
@@ -519,16 +527,14 @@ fun parse_comptime_if_decl(p: *parser.Parser, start: token.Span) id.DeclId {
         parser.expect(p, token.KIND_RBRACE, "expected '}' to close comptime branch body");
         end = close.span;
 
+        var body_len: u32 = 0;
+        val body_start: u32 = parser.decl_id_buf_flush(p, ?body_buf, ?body_len);
+
         var br: decl.ComptimeBranch;
         br.cond       = cond;
         br.body_start = body_start;
         br.body_len   = body_len;
-        val br_r: Result[u32, str] = ast.add_comptime_branch(p.ast, br);
-        if (is_err[u32, str](br_r)) {
-            parser.error_at(p, start, "out of memory while parsing comptime branch");
-            brk;
-        }
-        branches_len = branches_len + 1;
+        parser.comptime_branch_buf_push(p, ?br_buf, br);
 
         if (parser.at(p, token.KIND_DOLLAR) && peek_is_kw(p, 1, "or")) {
             parser.advance(p);
@@ -540,25 +546,38 @@ fun parse_comptime_if_decl(p: *parser.Parser, start: token.Span) id.DeclId {
         }
     }
 
+    var branches_len:   u32 = 0;
+    val branches_start: u32 = parser.comptime_branch_buf_flush(p, ?br_buf, ?branches_len);
+
     var ci: decl.DeclComptimeIf;
     ci.branches_start = branches_start;
     ci.branches_len   = branches_len;
 
-    var d: decl.Decl;
-    d.span  = parser.span_of(start, end);
-    d.kind  = decl.DECL_KIND_COMPTIME_IF;
-    d.flags = 0;
-    d.data.comptime_if = ci;
-    ret parser.push_decl(p, d);
+    var decl_node: decl.Decl;
+    decl_node.span  = parser.span_of(start, end);
+    decl_node.kind  = decl.DECL_KIND_COMPTIME_IF;
+    decl_node.flags = 0;
+    decl_node.data.comptime_if = ci;
+    ret parser.push_decl(p, decl_node);
 }
 
-# parses `$target = value;` attribute directive
+# parses a leading-`$` declaration that is not a `$if`: either a comptime
+# attribute write `$sym.attr = value;` or a bare comptime directive
+# `$intrinsic(args);` (e.g. `$error("msg")`, `$assert(cond, "msg")`). both
+# share DECL_KIND_COMPTIME_ATTR; a directive carries `value = EXPR_NIL`,
+# distinguishing it from an attribute write.
 fun parse_comptime_attr_decl(p: *parser.Parser, start: token.Span) id.DeclId {
-    val target: id.ExprId = pexpr.parse_expr(p);
-    parser.expect(p, token.KIND_EQ, "expected '=' in comptime attribute directive");
-    val value: id.ExprId = pexpr.parse_expr(p);
+    # parse the target above assignment precedence so the '=' is not swallowed as
+    # an assignment expression (KIND_EQ is the lowest-precedence infix operator)
+    val target: id.ExprId = pexpr.parse_expr_bp(p, 2);
+
+    var value: id.ExprId = id.EXPR_NIL;
+    if (parser.at(p, token.KIND_EQ)) {
+        parser.advance(p);
+        value = pexpr.parse_expr(p);
+    }
     val end: token.Token = parser.current(p);
-    parser.expect(p, token.KIND_SEMI, "expected ';' after comptime attribute");
+    parser.expect(p, token.KIND_SEMI, "expected ';' after comptime directive");
 
     var attr: decl.DeclComptimeAttr;
     attr.target = target;
@@ -616,27 +635,35 @@ fun parse_generic_param(p: *parser.Parser) bool {
 # parses `(name: Type, ..., ...)` function parameters, appending each to
 # ast.typed_names. a trailing `...` marks the function variadic and is
 # reported through the variadic out-parameter; it may only appear last.
-fun parse_fun_params(p: *parser.Parser, variadic: *bool) u32 {
+# parses a parenthesized parameter list, buffering each parameter so an inline
+# rec/uni parameter type cannot split the list's typed_name slice. flushes the
+# buffer to `ast.typed_names` as one contiguous block; writes the block's start
+# index to `*out_start` and returns the parameter count.
+fun parse_fun_params(p: *parser.Parser, variadic: *bool, out_start: *u32) u32 {
     @variadic = false;
     parser.expect(p, token.KIND_LPAREN, "expected '(' to open parameter list");
 
+    var buf: parser.TypedNameBuf = parser.typed_name_buf_init();
     var count: u32 = 0;
 
     if (parser.at(p, token.KIND_RPAREN)) {
         parser.advance(p);
-        ret 0;
+        @out_start = parser.typed_name_buf_flush(p, ?buf, ?count);
+        ret count;
     }
 
     if (parser.at(p, token.KIND_DOT_DOT_DOT)) {
         parser.advance(p);
         @variadic = true;
         parser.expect(p, token.KIND_RPAREN, "expected ')' after variadic '...'");
-        ret 0;
+        @out_start = parser.typed_name_buf_flush(p, ?buf, ?count);
+        ret count;
     }
 
-    if (parse_typed_name(p, "expected parameter name")) { count = count + 1; } or {
+    if (parse_typed_name(p, ?buf, "expected parameter name")) { } or {
         parser.sync_to(p, token.KIND_RPAREN, token.KIND_LBRACE, token.KIND_EOF);
         if (parser.at(p, token.KIND_RPAREN)) { parser.advance(p); }
+        @out_start = parser.typed_name_buf_flush(p, ?buf, ?count);
         ret count;
     }
 
@@ -647,38 +674,44 @@ fun parse_fun_params(p: *parser.Parser, variadic: *bool) u32 {
             @variadic = true;
             brk;
         }
-        if (!parse_typed_name(p, "expected parameter name")) { brk; }
-        count = count + 1;
+        if (!parse_typed_name(p, ?buf, "expected parameter name")) { brk; }
     }
 
     parser.expect(p, token.KIND_RPAREN, "expected ')' to close parameter list");
+    @out_start = parser.typed_name_buf_flush(p, ?buf, ?count);
     ret count;
 }
 
-# parses `{ name: Type; ... }` record fields, appending each to ast.typed_names
-fun parse_rec_fields(p: *parser.Parser) u32 {
+# parses `{ name: Type; ... }` record/union fields, buffering each so an inline
+# rec/uni field type cannot split the list's typed_name slice. flushes the
+# buffer to `ast.typed_names` as one contiguous block; writes the block's start
+# index to `*out_start` and returns the field count.
+fun parse_rec_fields(p: *parser.Parser, out_start: *u32) u32 {
     parser.expect(p, token.KIND_LBRACE, "expected '{' to open record body");
 
+    var buf: parser.TypedNameBuf = parser.typed_name_buf_init();
     var count: u32 = 0;
 
     for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
-        if (!parse_typed_name(p, "expected field name")) {
+        if (!parse_typed_name(p, ?buf, "expected field name")) {
             parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
             if (parser.at(p, token.KIND_SEMI)) { parser.advance(p); }
             cnt;
         }
         parser.expect(p, token.KIND_SEMI, "expected ';' after record field");
-        count = count + 1;
     }
 
     parser.expect(p, token.KIND_RBRACE, "expected '}' to close record body");
+    @out_start = parser.typed_name_buf_flush(p, ?buf, ?count);
     ret count;
 }
 
-# parses a single `[$]name: Type` entry and appends it to ast.typed_names.
-# a leading `$` marks the entry as a comptime value parameter (function
-# parameters only); the comptime flag is recorded on the TypedName.
-fun parse_typed_name(p: *parser.Parser, missing_name_msg: str) bool {
+# parses a single `[$]name: Type` entry and buffers it into `buf`. a leading
+# `$` marks the entry as a comptime value parameter (function parameters only);
+# the comptime flag is recorded on the TypedName. the entry is buffered (not
+# pushed to ast.typed_names directly) so an inline rec/uni type cannot split the
+# enclosing list's contiguous slice.
+fun parse_typed_name(p: *parser.Parser, buf: *parser.TypedNameBuf, missing_name_msg: str) bool {
     var comptime: bool = false;
     if (parser.eat(p, token.KIND_DOLLAR)) {
         comptime = true;
@@ -696,11 +729,7 @@ fun parse_typed_name(p: *parser.Parser, missing_name_msg: str) bool {
     tn.name     = name;
     tn.ty       = ty;
     tn.comptime = comptime;
-    val r: Result[u32, str] = ast.add_typed_name(p.ast, tn);
-    if (is_err[u32, str](r)) {
-        parser.error_at(p, name, "out of memory while parsing typed name");
-        ret false;
-    }
+    parser.typed_name_buf_push(p, buf, tn);
     ret true;
 }
 
@@ -709,14 +738,15 @@ fun parse_block_stmt(p: *parser.Parser) id.StmtId {
     val start: token.Token = parser.current(p);
     parser.expect(p, token.KIND_LBRACE, "expected '{' to open block");
 
-    val stmts_start: u32 = p.ast.stmt_id_len::u32;
-    var stmts_len:   u32 = 0;
+    # buffer the statements: a statement containing a nested block (an inner
+    # `{}`, or an `if`/`for` body) appends its own statement ids to the shared
+    # pool mid-parse, so flush this block as one contiguous slice afterward.
+    var buf: parser.StmtIdBuf = parser.stmt_id_buf_init();
 
     for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
         val s: id.StmtId = parse_stmt(p);
         if (s != id.STMT_NIL) {
-            parser.push_stmt_id(p, s);
-            stmts_len = stmts_len + 1;
+            parser.stmt_id_buf_push(p, ?buf, s);
         }
         if (p.panic) {
             parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
@@ -726,6 +756,9 @@ fun parse_block_stmt(p: *parser.Parser) id.StmtId {
 
     val close: token.Token = parser.current(p);
     parser.expect(p, token.KIND_RBRACE, "expected '}' to close block");
+
+    var stmts_len: u32 = 0;
+    val stmts_start: u32 = parser.stmt_id_buf_flush(p, ?buf, ?stmts_len);
 
     var block: stmt.StmtBlock;
     block.stmts_start = stmts_start;
@@ -910,13 +943,13 @@ fun parse_fin_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
         end_span = unwrap[*stmt.Stmt](ast.get_stmt(p.ast, body_id)).span;
     }
 
-    var fin: stmt.StmtFin;
-    fin.body = body_id;
+    var fin_s: stmt.StmtFin;
+    fin_s.body = body_id;
 
     var node: stmt.Stmt;
     node.span = parser.span_of(start, end_span);
     node.kind = stmt.STMT_KIND_FIN;
-    node.data.fin = fin;
+    node.data.fin_ = fin_s;
     ret parser.push_stmt(p, node);
 }
 
@@ -957,8 +990,9 @@ fun parse_expr_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
 
 # parses `$if (cond) { stmts } $or (cond) { stmts } $or { stmts }` at statement scope
 fun parse_comptime_if_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
-    val branches_start: u32 = p.ast.comptime_branch_len::u32;
-    var branches_len:   u32 = 0;
+    # buffer this chain's branches so a nested `$if`/`$or` chain parsed inside a
+    # branch body cannot interleave into this chain's contiguous slice.
+    var br_buf: parser.ComptimeBranchBuf = parser.comptime_branch_buf_init();
 
     parser.advance(p);
     parser.advance(p);
@@ -982,15 +1016,15 @@ fun parse_comptime_if_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
             }
         }
 
-        val body_start: u32 = p.ast.stmt_id_len::u32;
-        var body_len:   u32 = 0;
+        # buffer this branch's statements so a nested block inside cannot
+        # interleave into the branch's contiguous slice.
+        var body_buf: parser.StmtIdBuf = parser.stmt_id_buf_init();
 
         parser.expect(p, token.KIND_LBRACE, "expected '{' to open comptime branch body");
         for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
             val s: id.StmtId = parse_stmt(p);
             if (s != id.STMT_NIL) {
-                parser.push_stmt_id(p, s);
-                body_len = body_len + 1;
+                parser.stmt_id_buf_push(p, ?body_buf, s);
             }
             if (p.panic) {
                 parser.sync_to(p, token.KIND_SEMI, token.KIND_RBRACE, token.KIND_EOF);
@@ -1001,16 +1035,14 @@ fun parse_comptime_if_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
         parser.expect(p, token.KIND_RBRACE, "expected '}' to close comptime branch body");
         end = close.span;
 
+        var body_len: u32 = 0;
+        val body_start: u32 = parser.stmt_id_buf_flush(p, ?body_buf, ?body_len);
+
         var br: decl.ComptimeBranch;
         br.cond       = cond;
         br.body_start = body_start;
         br.body_len   = body_len;
-        val br_r: Result[u32, str] = ast.add_comptime_branch(p.ast, br);
-        if (is_err[u32, str](br_r)) {
-            parser.error_at(p, start, "out of memory while parsing comptime branch");
-            brk;
-        }
-        branches_len = branches_len + 1;
+        parser.comptime_branch_buf_push(p, ?br_buf, br);
 
         if (parser.at(p, token.KIND_DOLLAR) && peek_is_kw(p, 1, "or")) {
             parser.advance(p);
@@ -1021,6 +1053,9 @@ fun parse_comptime_if_stmt(p: *parser.Parser, start: token.Span) id.StmtId {
             has_more = false;
         }
     }
+
+    var branches_len:   u32 = 0;
+    val branches_start: u32 = parser.comptime_branch_buf_flush(p, ?br_buf, ?branches_len);
 
     var ci: stmt.StmtComptimeIf;
     ci.branches_start = branches_start;

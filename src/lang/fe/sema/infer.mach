@@ -13,9 +13,10 @@
 # which absorbs further operations without cascading diagnostics.
 #
 # `str` is the stdlib alias `def str: *u8`; it resolves transparently to a
-# pointer and has no special field table. anonymous inline rec/uni types get
-# fresh positional nominal entries so identical inline shapes in different
-# positions are distinct (nominal typing).
+# pointer and has no special field table. anonymous inline rec/uni types are
+# structurally typed: two inline shapes with the same field names and field
+# types intern to the same nominal, so a value of one is interchangeable with
+# the other (a `def`-named record stays nominal — identity by declaration).
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -42,6 +43,7 @@ use std.allocator.deallocate;
 
 use intern:   mach.lang.intern;
 use type:     mach.lang.type;
+use sess:     mach.lang.module;
 
 use ast:      mach.lang.fe.ast;
 use id:       mach.lang.fe.ast.id;
@@ -51,7 +53,7 @@ use atype:    mach.lang.fe.ast.type;
 use token:    mach.lang.fe.token;
 use comptime: mach.lang.fe.comptime;
 use resolve:  mach.lang.fe.resolve;
-use sema:     mach.lang.fe.sema;
+use sema:     mach.lang.fe.sema.context;
 use check:    mach.lang.fe.sema.check;
 use coerce:   mach.lang.fe.sema.coerce;
 use generics: mach.lang.fe.sema.generics;
@@ -228,7 +230,7 @@ pub fun infer_expr(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
         t = infer_index(sc, ?e.data.index, e.span);
     }
     or (e.kind == expr.EXPR_KIND_MEMBER) {
-        t = infer_member(sc, ?e.data.member, e.span);
+        t = infer_member(sc, eid, ?e.data.member, e.span);
     }
     or (e.kind == expr.EXPR_KIND_CAST) {
         t = infer_cast(sc, ?e.data.cast, e.span);
@@ -278,16 +280,31 @@ fun infer_binary(sc: *sema.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, spa
 
     val u8t: type.TypeId = prim_or_error(sc, type.TYPE_U8);
 
+    # integer operands compare and combine across widths: a Mach scalar
+    # integer operation is value-based, not identity-based, so two integer
+    # primitives need not share a TypeId (e.g. a `u32`-backed `def` against a
+    # `u8`-backed `def`). this width-agnostic integer compatibility is distinct
+    # from assignment, which stays identity-only (no implicit widening between
+    # variables). non-integer operands still require an exact TypeId match.
+    val both_int:  bool = is_integer(sc, lt) && is_integer(sc, rt);
+    val operands_ok: bool = lt == rt || both_int;
+
     if (b.op == expr.BIN_EQ || b.op == expr.BIN_NEQ) {
-        if (lt != rt) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
+        # equality also relates two address-shaped operands (pointers and
+        # functions, both runtime code/data addresses). this covers `fn == nil`
+        # / `fn != nil`, where `nil` types as `*u8`, without permitting nil to
+        # be assignable to a function type. cmach performs no operand-type
+        # check on comparisons at all.
+        val addr_ok: bool = is_pointer_like(sc, lt) && is_pointer_like(sc, rt);
+        if (!operands_ok && !addr_ok) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
         ret u8t;
     }
     if (b.op == expr.BIN_LT || b.op == expr.BIN_LEQ || b.op == expr.BIN_GT || b.op == expr.BIN_GEQ) {
-        if (lt != rt || !is_numeric(sc, lt)) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
+        if (!operands_ok || !is_numeric(sc, lt)) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
         ret u8t;
     }
     if (b.op == expr.BIN_AND || b.op == expr.BIN_OR) {
-        if (!is_integer(sc, lt) || !is_integer(sc, rt)) {
+        if (!both_int) {
             sema.report(sc, span, "type mismatch: logical operands must be integer types");
             ret type.TYPE_ERROR;
         }
@@ -295,11 +312,11 @@ fun infer_binary(sc: *sema.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, spa
     }
     if (b.op == expr.BIN_BIT_AND || b.op == expr.BIN_BIT_OR || b.op == expr.BIN_BIT_XOR
         || b.op == expr.BIN_SHL || b.op == expr.BIN_SHR) {
-        if (lt != rt || !is_integer(sc, lt)) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
+        if (!both_int) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
         ret lt;
     }
     # arithmetic: ADD, SUB, MUL, DIV, MOD
-    if (lt != rt || !is_numeric(sc, lt)) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
+    if ((!operands_ok) || !is_numeric(sc, lt)) { type_mismatch(sc, span); ret type.TYPE_ERROR; }
     ret lt;
 }
 
@@ -346,8 +363,15 @@ fun infer_unary(sc: *sema.SemaContext, u: *expr.ExprUnary, span: token.Span) typ
 }
 
 # CALL: callee must be TYPE_FUN; check arity and each argument against the
-# parameter types; result is the function's return type.
+# parameter types; result is the function's return type. a call carrying
+# explicit type arguments `callee[T, ...](args)` instantiates the generic
+# callee's signature before checking. a call whose callee is a comptime
+# intrinsic (`$size_of`, `$align_of`, `$offset_of`) is a value intrinsic
+# yielding an unsigned integer, handled before normal callee inference.
 fun infer_call(sc: *sema.SemaContext, c: *expr.ExprCall, span: token.Span) type.TypeId {
+    val intr: type.TypeId = infer_comptime_intrinsic(sc, c, span);
+    if (intr != type.TYPE_NIL) { ret intr; }
+
     val ct: type.TypeId = infer_expr(sc, c.callee);
     # infer argument types so their expr_type slots are populated
     var ai: u32 = 0;
@@ -355,6 +379,11 @@ fun infer_call(sc: *sema.SemaContext, c: *expr.ExprCall, span: token.Span) type.
         infer_expr(sc, sc.a.expr_ids[c.args_start + ai]);
         ai = ai + 1;
     }
+
+    if (c.type_args_len > 0) {
+        ret infer_generic_call(sc, c, ct, span);
+    }
+
     if (ct == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
 
     val fn_opt: Option[*type.Type] = type.get(?sc.s.types, ct);
@@ -365,8 +394,117 @@ fun infer_call(sc: *sema.SemaContext, c: *expr.ExprCall, span: token.Span) type.
         ret type.TYPE_ERROR;
     }
 
-    val ret_ty: type.TypeId = fn.data.fun.ret;
+    val ret_ty: type.TypeId = fn.data.fn.ret_ty;
     check.check_call(sc, ct, c.args_start, c.args_len, span);
+    ret ret_ty;
+}
+
+# recognises and types a comptime value intrinsic call. `$size_of(T)` /
+# `$align_of(T)` take one type-naming argument; `$offset_of(T, field)` takes a
+# type and a field. each yields an unsigned integer (`u64`), matching the
+# closed intrinsic set in the language. the type argument is resolved so its
+# expr_type slot carries the operand type the lowerer needs to fold the size.
+# returns TYPE_NIL when the call is not a comptime intrinsic (caller proceeds
+# with normal call inference), the result type when it is, or TYPE_ERROR for a
+# malformed intrinsic.
+fun infer_comptime_intrinsic(sc: *sema.SemaContext, c: *expr.ExprCall, span: token.Span) type.TypeId {
+    val ce_opt: Option[*expr.Expr] = ast.get_expr(sc.a, c.callee);
+    if (is_none[*expr.Expr](ce_opt)) { ret type.TYPE_NIL; }
+    val ce: *expr.Expr = unwrap[*expr.Expr](ce_opt);
+    if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret type.TYPE_NIL; }
+
+    val name: intern.StrId = comptime_ident_name(sc, ce.span);
+    if (name == intern.STR_NIL) { ret type.TYPE_NIL; }
+    val is_size:   bool = name == interned(sc, "size_of");
+    val is_align:  bool = name == interned(sc, "align_of");
+    val is_offset: bool = name == interned(sc, "offset_of");
+    if (!is_size && !is_align && !is_offset) { ret type.TYPE_NIL; }
+
+    val want: u32 = 1;
+    var need: u32 = want;
+    if (is_offset) { need = 2; }
+    if (c.args_len != need) {
+        sema.report(sc, span, "comptime intrinsic: wrong number of arguments");
+        ret type.TYPE_ERROR;
+    }
+
+    # the first argument names the operand type; infer it so its type slot is
+    # set (the lowerer reads this to compute the size/alignment/offset). the
+    # offset field argument is a field reference and is left untyped here.
+    infer_expr(sc, sc.a.expr_ids[c.args_start]);
+    ret prim_or_error(sc, type.TYPE_U64);
+}
+
+# interns the identifier text of a `$ident` comptime ident, with the leading
+# `$` stripped, returning its StrId (STR_NIL on failure or an empty name).
+fun comptime_ident_name(sc: *sema.SemaContext, full: token.Span) intern.StrId {
+    if (full.len <= 1) { ret intern.STR_NIL; }
+    var s: token.Span;
+    s.offset = full.offset + 1;
+    s.len    = full.len - 1;
+    ret intern_span_or_nil(sc, s);
+}
+
+# interns a static literal in the session interner, returning its StrId or
+# STR_NIL on allocation failure.
+fun interned(sc: *sema.SemaContext, text: str) intern.StrId {
+    val r: Result[intern.StrId, str] = intern.intern(?sc.s.interner, text);
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+# instantiates a generic call's signature: resolves each call-site type
+# argument, checks arity against the callee generic declaration, substitutes
+# the argument sequence into the callee's TYPE_FUN, and checks the call
+# arguments against the concrete parameter types. the call's result type is
+# the substituted return type.
+fun infer_generic_call(sc: *sema.SemaContext, c: *expr.ExprCall, ct: type.TypeId, span: token.Span) type.TypeId {
+    val sym_opt: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, c.callee);
+    if (is_none[*resolve.Symbol](sym_opt)) { ret type.TYPE_ERROR; }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
+
+    val pr: Result[*type.TypeId, str] = allocate_params(sc, c.type_args_len);
+    if (is_err[*type.TypeId, str](pr)) { ret type.TYPE_ERROR; }
+    val args: *type.TypeId = unwrap_ok[*type.TypeId, str](pr);
+
+    var i: u32 = 0;
+    for (i < c.type_args_len) {
+        val arg_tid: id.TypeId = sc.a.type_ids[c.type_args_start + i];
+        args[i] = resolve_type_ref(sc, arg_tid);
+        i = i + 1;
+    }
+
+    if (!generics.check_arity(sc, sym.decl, sym.origin, c.type_args_len, span)) {
+        free_params(sc, args, c.type_args_len);
+        ret type.TYPE_ERROR;
+    }
+
+    if (ct == type.TYPE_ERROR) {
+        free_params(sc, args, c.type_args_len);
+        ret type.TYPE_ERROR;
+    }
+    val fn_opt: Option[*type.Type] = type.get(?sc.s.types, ct);
+    if (is_none[*type.Type](fn_opt)) {
+        free_params(sc, args, c.type_args_len);
+        ret type.TYPE_ERROR;
+    }
+    if (unwrap[*type.Type](fn_opt).kind != type.TYPE_FUN) {
+        sema.report(sc, span, "not callable: target is not a function");
+        free_params(sc, args, c.type_args_len);
+        ret type.TYPE_ERROR;
+    }
+
+    val sig: type.TypeId = generics.substitute(sc.s, ct, args, c.type_args_len);
+    free_params(sc, args, c.type_args_len);
+    if (sig == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    val sfn_opt: Option[*type.Type] = type.get(?sc.s.types, sig);
+    if (is_none[*type.Type](sfn_opt)) { ret type.TYPE_ERROR; }
+    val sfn: *type.Type = unwrap[*type.Type](sfn_opt);
+    if (sfn.kind != type.TYPE_FUN) { ret type.TYPE_ERROR; }
+
+    val ret_ty: type.TypeId = sfn.data.fn.ret_ty;
+    check.check_call(sc, sig, c.args_start, c.args_len, span);
     ret ret_ty;
 }
 
@@ -382,15 +520,41 @@ fun infer_index(sc: *sema.SemaContext, ix: *expr.ExprIndex, span: token.Span) ty
     ret unwrap[type.TypeId](r);
 }
 
-# MEMBER: object must be a record or union; the named field's type is the
-# result. delegates to check.check_member, which consults the field table.
-fun infer_member(sc: *sema.SemaContext, m: *expr.ExprMember, span: token.Span) type.TypeId {
-    val ot: type.TypeId = infer_expr(sc, m.object);
-    if (ot == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+# MEMBER: a member access is either a qualified module reference
+# `alias.symbol` — resolved during name resolution and recorded on the member
+# expression, whose type is that symbol's — or a field access `object.field`.
+# for the latter the object must be a record or union (or a pointer to one),
+# and a generic instance's field layout is materialized on demand before the
+# field lookup.
+fun infer_member(sc: *sema.SemaContext, eid: id.ExprId, m: *expr.ExprMember, span: token.Span) type.TypeId {
+    val qsym_opt: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, eid);
+    if (is_some[*resolve.Symbol](qsym_opt)) {
+        ret sema.decl_type_for(sc, unwrap[*resolve.Symbol](qsym_opt));
+    }
 
-    val r: Option[type.TypeId] = check.check_member(sc, ot, m.name, span);
+    val ot: type.TypeId = infer_expr(sc, m.object);
+    if (ot == type.TYPE_ERROR || ot == type.TYPE_NIL) { ret type.TYPE_ERROR; }
+
+    ensure_record_fields(sc, ot);
+
+    val name_id: intern.StrId = intern_span_or_nil(sc, m.name);
+    val r: Option[type.TypeId] = check.check_member(sc, ot, name_id, span);
     if (is_none[type.TypeId](r)) { ret type.TYPE_ERROR; }
     ret unwrap[type.TypeId](r);
+}
+
+# materializes the field layout of `tid` (and, if `tid` is a pointer, its
+# pointee) for an upcoming field access. only generic instances need this —
+# nominal layouts are built when their declaring module is analysed — but a
+# pointer-to-instance reaches a field through one level of indirection.
+fun ensure_record_fields(sc: *sema.SemaContext, tid: type.TypeId) {
+    generics.ensure_fields(sc.s, tid);
+    val t_opt: Option[*type.Type] = type.get(?sc.s.types, tid);
+    if (is_none[*type.Type](t_opt)) { ret; }
+    val t: *type.Type = unwrap[*type.Type](t_opt);
+    if (t.kind == type.TYPE_POINTER) {
+        generics.ensure_fields(sc.s, t.data.pointer.base);
+    }
 }
 
 # CAST: delegates to check.check_cast under the primitive-numeric /
@@ -437,6 +601,7 @@ fun infer_array_lit(sc: *sema.SemaContext, al: *expr.ExprArrayLit, span: token.S
 # the initializers are still inferred so their expr_type slots fill.
 fun infer_struct_lit(sc: *sema.SemaContext, sl: *expr.ExprStructLit, span: token.Span) type.TypeId {
     val rec_ty: type.TypeId = sema.resolved_type_of(sc, sl.ty);
+    generics.ensure_fields(sc.s, rec_ty);
     val have_table: bool = is_some[*sema.FieldTable](sema.field_table_for(sc, rec_ty));
 
     var i: u32 = 0;
@@ -507,6 +672,9 @@ fun resolve_type_named(sc: *sema.SemaContext, tid: id.TypeId, named: *atype.Type
 # import symbol), so its type is read from the dependency's recorded
 # decl_type, which already holds the nominal TypeId or the def's underlying.
 fun type_for_symbol(sc: *sema.SemaContext, sym: *resolve.Symbol, span: token.Span) type.TypeId {
+    if (sym.kind == resolve.SYM_PRIM) {
+        ret prim_or_error(sc, sym.slot::type.TypeKind);
+    }
     if (sym.kind == resolve.SYM_GENERIC) {
         val r: Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.decl, sym.slot);
         if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
@@ -605,7 +773,7 @@ fun resolve_type_array(sc: *sema.SemaContext, ar: *atype.TypeArray, span: token.
 # FUN: resolves each parameter and the return type, interns a TYPE_FUN.
 fun resolve_type_fun(sc: *sema.SemaContext, fn: *atype.TypeFun) type.TypeId {
     var ret_ty: type.TypeId = type.TYPE_NIL;
-    if (fn.ret != id.TYPE_NIL) { ret_ty = resolve_type_ref(sc, fn.ret); }
+    if (fn.ret_ty != id.TYPE_NIL) { ret_ty = resolve_type_ref(sc, fn.ret_ty); }
 
     if (fn.params_len == 0) {
         val r: Result[type.TypeId, str] = type.intern_function(?sc.s.types, ret_ty, nil, 0, fn.variadic);
@@ -630,24 +798,72 @@ fun resolve_type_fun(sc: *sema.SemaContext, fn: *atype.TypeFun) type.TypeId {
     ret unwrap_ok[type.TypeId, str](r);
 }
 
-# REC / UNI (anonymous): synthesises a fresh positional nominal entry keyed
-# by (own_module, tid) with a synthetic name, so two textually-identical
-# inline records in different positions are distinct nominals. builds the
-# field table from the inline fields.
+# REC / UNI (anonymous): interns a structurally-keyed nominal so two inline
+# records (or unions) with the same field names and field types resolve to a
+# single TypeId. the identity key is a canonical signature of the shape,
+# interned to a StrId and carried in the nominal `decl` slot under the
+# reserved `MODULE_NIL` origin; the StrId interner guarantees the key is exact
+# (equal shapes -> equal StrId, distinct shapes -> distinct StrId), so the
+# match is collision-free. builds the field table on first occurrence.
 fun resolve_type_anon(sc: *sema.SemaContext, tid: id.TypeId, fields_start: u32, fields_len: u32, kind: type.TypeKind) type.TypeId {
     val name_id: intern.StrId = synth_anon_name(sc, kind);
 
-    # the syntactic type id occupies the nominal `decl` slot so two distinct
-    # inline positions never collide on (origin, decl) identity. consume an
-    # anon ordinal so the per-pass counter stays meaningful for diagnostics.
+    # consume an anon ordinal so the per-pass counter stays meaningful for
+    # diagnostics, then derive the structural identity key.
     sema.next_anon_ordinal(sc);
-    val anon_decl: id.DeclId = tid;
-    val r: Result[type.TypeId, str] = type.intern_nominal(?sc.s.types, name_id, sc.own_module, anon_decl, kind);
+    val key: intern.StrId = anon_struct_key(sc, fields_start, fields_len, kind);
+    if (key == intern.STR_NIL) { ret type.TYPE_ERROR; }
+
+    val r: Result[type.TypeId, str] = type.intern_nominal(?sc.s.types, name_id, sess.MODULE_NIL, key::id.DeclId, kind);
     if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
     val ty: type.TypeId = unwrap_ok[type.TypeId, str](r);
 
     build_field_table(sc, ty, fields_start, fields_len);
     ret ty;
+}
+
+# builds a canonical structural-identity key for an anonymous rec/uni: a hex
+# signature of the kind, the field count, and each field's interned name and
+# resolved type, interned to a StrId. equal shapes intern to the same StrId,
+# distinct shapes to distinct StrIds. STR_NIL signals an allocation failure.
+fun anon_struct_key(sc: *sema.SemaContext, fields_start: u32, fields_len: u32, kind: type.TypeKind) intern.StrId {
+    var buf: [1024]u8;
+    var n: usize = 0;
+    n = put_hex_u32(?buf[0], n, 1024, kind::u32);
+    n = put_hex_u32(?buf[0], n, 1024, fields_len);
+
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[fields_start + i];
+        val fname: intern.StrId = intern_span_or_nil(sc, tn.name);
+        val fty: type.TypeId = sema.resolved_type_of(sc, tn.ty);
+        n = put_hex_u32(?buf[0], n, 1024, fname::u32);
+        n = put_hex_u32(?buf[0], n, 1024, fty::u32);
+        i = i + 1;
+    }
+
+    val r: Result[intern.StrId, str] = intern.intern_bytes(?sc.s.interner, (?buf[0])::str, n);
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+# appends the 8 lowercase hex digits of `v` to `buf` at offset `off`, never
+# writing past `cap`; returns the new offset. hex avoids NUL bytes so the
+# buffer is safe to intern as a string key.
+fun put_hex_u32(buf: *u8, off: usize, cap: usize, v: u32) usize {
+    var o: usize = off;
+    var d: u32 = 0;
+    for (d < 8) {
+        if (o >= cap) { ret o; }
+        val shift: u32 = (7 - d) * 4;
+        val nib: u32 = (v >> shift) & 0xF;
+        var c: u8 = nib::u8 + 0x30;
+        if (nib > 9) { c = nib::u8 - 10 + 0x61; }
+        buf[o] = c;
+        o = o + 1;
+        d = d + 1;
+    }
+    ret o;
 }
 
 # interns a synthetic display name for an anonymous rec/uni nominal. identity
@@ -707,6 +923,16 @@ fun is_integer(sc: *sema.SemaContext, ty: type.TypeId) bool {
     if (is_none[*type.Type](t_opt)) { ret false; }
     val k: type.TypeKind = unwrap[*type.Type](t_opt).kind;
     ret k::u32 <= type.TYPE_I64::u32;
+}
+
+# is the TypeId address-shaped — a raw `ptr`, a typed `*T`, or a function
+# (`TYPE_FUN`, a code address)? used by equality to relate `nil` against
+# pointer and function operands.
+fun is_pointer_like(sc: *sema.SemaContext, ty: type.TypeId) bool {
+    val t_opt: Option[*type.Type] = type.get(?sc.s.types, ty);
+    if (is_none[*type.Type](t_opt)) { ret false; }
+    val k: type.TypeKind = unwrap[*type.Type](t_opt).kind;
+    ret k == type.TYPE_PTR || k == type.TYPE_POINTER || k == type.TYPE_FUN;
 }
 
 # attempts to make a binary operation's two operands share a type when one

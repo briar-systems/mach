@@ -135,13 +135,67 @@ fun parse_postfix(p: *parser.Parser, base: id.ExprId) id.ExprId {
     var lhs: id.ExprId = base;
     for (true) {
         val k: token.Kind = parser.current(p).kind;
-        if      (k == token.KIND_LPAREN)      { lhs = parse_call(p, lhs); }
-        or      (k == token.KIND_LBRACKET)    { lhs = parse_index(p, lhs); }
+        if      (k == token.KIND_LPAREN)      { lhs = parse_call(p, lhs, 0, 0); }
+        or      (k == token.KIND_LBRACKET) {
+            if (type_args_follow_kind(p) == token.KIND_LPAREN) {
+                lhs = parse_generic_call(p, lhs);
+            }
+            or {
+                lhs = parse_index(p, lhs);
+            }
+        }
         or      (k == token.KIND_DOT)         { lhs = parse_member(p, lhs); }
         or      (k == token.KIND_COLON_COLON) { lhs = parse_cast(p, lhs); }
         or                                    { brk; }
     }
     ret lhs;
+}
+
+# scans the balanced [...] starting at the current '[' and returns the token
+# kind immediately after the matching ']' (KIND_EOF if unterminated or empty).
+# a postfix '[' is a generic-arg list only when that follow-kind is '(' (a
+# call) — the '{' typed-literal form is recognized at the prefix stage and
+# never reaches postfix.
+fun type_args_follow_kind(p: *parser.Parser) token.Kind {
+    var i: usize = 1;            # peek(p, 0) is the current '['
+    var depth: usize = 1;
+    var has_payload: bool = false;
+    for (depth > 0) {
+        val k: token.Kind = parser.peek(p, i).kind;
+        if (k == token.KIND_EOF || k == token.KIND_SEMI) { ret token.KIND_EOF; }
+        if (k == token.KIND_LBRACKET) { depth = depth + 1; }
+        or (k == token.KIND_RBRACKET) { depth = depth - 1; }
+        or                            { has_payload = true; }
+        i = i + 1;
+    }
+    if (!has_payload) { ret token.KIND_EOF; }
+    ret parser.peek(p, i).kind;
+}
+
+# parses a generic call `callee[T, U](args)`: consumes the bracketed type-arg
+# list, then delegates to parse_call to read the parenthesized arguments,
+# threading the type args onto the produced ExprCall.
+fun parse_generic_call(p: *parser.Parser, callee: id.ExprId) id.ExprId {
+    parser.advance(p);
+
+    # buffer the type arguments: a nested generic type argument appends its own
+    # child type ids to the shared type_id pool mid-parse, so flush the parent's
+    # direct args as one contiguous block afterward (see parse_call).
+    var buf: parser.TypeIdBuf = parser.type_id_buf_init();
+
+    if (!parser.at(p, token.KIND_RBRACKET)) {
+        parser.type_id_buf_push(p, ?buf, parse_type(p));
+        for (parser.eat(p, token.KIND_COMMA)) {
+            if (parser.at(p, token.KIND_RBRACKET)) { brk; }
+            parser.type_id_buf_push(p, ?buf, parse_type(p));
+        }
+    }
+    parser.expect(p, token.KIND_RBRACKET, "expected ']' to close generic arguments");
+
+    var type_args_len: u32 = 0;
+    val type_args_start: u32 = parser.type_id_buf_flush(p, ?buf, ?type_args_len);
+
+    ret parse_call(p, callee, type_args_start, type_args_len);
 }
 
 # parses an integer literal
@@ -246,32 +300,39 @@ fun parse_paren(p: *parser.Parser) id.ExprId {
     ret inner;
 }
 
-# parses a call expression `callee(args)`
-fun parse_call(p: *parser.Parser, callee: id.ExprId) id.ExprId {
+# parses a call expression `callee(args)`. type_args_start/type_args_len carry
+# any call-site generic arguments parsed by parse_generic_call; both are 0 for
+# a plain call.
+fun parse_call(p: *parser.Parser, callee: id.ExprId, type_args_start: u32, type_args_len: u32) id.ExprId {
     parser.advance(p);
 
-    val args_start: u32 = p.ast.expr_id_len::u32;
-    var args_len:   u32 = 0;
+    # buffer the arguments rather than pushing them to the shared expr_id pool
+    # as they are parsed: an argument that is itself a call or array literal
+    # appends its own child ids to the same pool mid-parse, which would split
+    # this list's (start, len) slice. flushing the buffer as one contiguous
+    # block after parsing keeps the slice intact.
+    var buf: parser.ExprIdBuf = parser.expr_id_buf_init();
 
     if (!parser.at(p, token.KIND_RPAREN)) {
-        val first: id.ExprId = parse_expr(p);
-        parser.push_expr_id(p, first);
-        args_len = args_len + 1;
+        parser.expr_id_buf_push(p, ?buf, parse_expr(p));
         for (parser.eat(p, token.KIND_COMMA)) {
             if (parser.at(p, token.KIND_RPAREN)) { brk; }
-            val next: id.ExprId = parse_expr(p);
-            parser.push_expr_id(p, next);
-            args_len = args_len + 1;
+            parser.expr_id_buf_push(p, ?buf, parse_expr(p));
         }
     }
 
     val close: token.Token = parser.current(p);
     parser.expect(p, token.KIND_RPAREN, "expected ')' to close call arguments");
 
+    var args_len: u32 = 0;
+    val args_start: u32 = parser.expr_id_buf_flush(p, ?buf, ?args_len);
+
     var call: expr.ExprCall;
-    call.callee     = callee;
-    call.args_start = args_start;
-    call.args_len   = args_len;
+    call.callee          = callee;
+    call.args_start      = args_start;
+    call.args_len        = args_len;
+    call.type_args_start = type_args_start;
+    call.type_args_len   = type_args_len;
 
     var start_span: token.Span = close.span;
     if (callee != id.EXPR_NIL) {
@@ -367,23 +428,25 @@ fun parse_array_literal(p: *parser.Parser) id.ExprId {
     val ty: id.TypeId = parse_type(p);
     parser.expect(p, token.KIND_LBRACE, "expected '{' after array type in array literal");
 
-    val elems_start: u32 = p.ast.expr_id_len::u32;
-    var elems_len:   u32 = 0;
+    # buffer the elements: an element that is itself a call or array literal
+    # appends its own child ids to the shared expr_id pool mid-parse, so flush
+    # the parent's direct elements as one contiguous block afterward (see
+    # parse_call).
+    var buf: parser.ExprIdBuf = parser.expr_id_buf_init();
 
     if (!parser.at(p, token.KIND_RBRACE)) {
-        val first: id.ExprId = parse_expr(p);
-        parser.push_expr_id(p, first);
-        elems_len = elems_len + 1;
+        parser.expr_id_buf_push(p, ?buf, parse_expr(p));
         for (parser.eat(p, token.KIND_COMMA)) {
             if (parser.at(p, token.KIND_RBRACE)) { brk; }
-            val next: id.ExprId = parse_expr(p);
-            parser.push_expr_id(p, next);
-            elems_len = elems_len + 1;
+            parser.expr_id_buf_push(p, ?buf, parse_expr(p));
         }
     }
 
     val close: token.Token = parser.current(p);
     parser.expect(p, token.KIND_RBRACE, "expected '}' to close array literal");
+
+    var elems_len: u32 = 0;
+    val elems_start: u32 = parser.expr_id_buf_flush(p, ?buf, ?elems_len);
 
     var array: expr.ExprArrayLit;
     array.ty          = ty;
@@ -403,27 +466,29 @@ fun parse_typed_literal(p: *parser.Parser) id.ExprId {
     val ty: id.TypeId = parse_type(p);
     parser.expect(p, token.KIND_LBRACE, "expected '{' after type in struct literal");
 
-    val fields_start: u32 = p.ast.field_init_len::u32;
-    var fields_len:   u32 = 0;
+    # buffer the fields: a field initializer may be a nested struct literal
+    # that appends its own FieldInits to the shared pool mid-parse, so flush
+    # this literal's fields as one contiguous block afterward (see parse_call).
+    var buf: parser.FieldInitBuf = parser.field_init_buf_init();
 
     if (!parser.at(p, token.KIND_RBRACE)) {
-        if (!parse_field_init(p)) {
+        if (!parse_field_init(p, ?buf)) {
             parser.sync_to(p, token.KIND_RBRACE, token.KIND_EOF, token.KIND_EOF);
-        } or {
-            fields_len = fields_len + 1;
         }
         for (parser.eat(p, token.KIND_COMMA)) {
             if (parser.at(p, token.KIND_RBRACE)) { brk; }
-            if (!parse_field_init(p)) {
+            if (!parse_field_init(p, ?buf)) {
                 parser.sync_to(p, token.KIND_RBRACE, token.KIND_EOF, token.KIND_EOF);
                 brk;
             }
-            fields_len = fields_len + 1;
         }
     }
 
     val close: token.Token = parser.current(p);
     parser.expect(p, token.KIND_RBRACE, "expected '}' to close struct literal");
+
+    var fields_len: u32 = 0;
+    val fields_start: u32 = parser.field_init_buf_flush(p, ?buf, ?fields_len);
 
     var lit: expr.ExprStructLit;
     lit.ty           = ty;
@@ -437,8 +502,10 @@ fun parse_typed_literal(p: *parser.Parser) id.ExprId {
     ret parser.push_expr(p, node);
 }
 
-# parses `name: value` and appends it to ast.field_inits; returns false on syntax error
-fun parse_field_init(p: *parser.Parser) bool {
+# parses `name: value` and buffers it into `buf`; returns false on syntax
+# error. the field is buffered (not pushed to ast.field_inits directly) so a
+# nested struct-literal value cannot split the enclosing literal's field slice.
+fun parse_field_init(p: *parser.Parser, buf: *parser.FieldInitBuf) bool {
     if (!parser.at(p, token.KIND_IDENT)) {
         parser.error_at_current(p, "expected field name in struct literal");
         ret false;
@@ -450,11 +517,7 @@ fun parse_field_init(p: *parser.Parser) bool {
     var fi: expr.FieldInit;
     fi.name  = name;
     fi.value = value;
-    val r: Result[u32, str] = ast.add_field_init(p.ast, fi);
-    if (is_err[u32, str](r)) {
-        parser.error_at(p, name, "out of memory while parsing struct literal field");
-        ret false;
-    }
+    parser.field_init_buf_push(p, buf, fi);
     ret true;
 }
 
@@ -536,21 +599,21 @@ fun parse_named(p: *parser.Parser, start: token.Span) id.TypeId {
     var end:        token.Span = last;
 
     if (parser.eat(p, token.KIND_LBRACKET)) {
-        args_start = p.ast.type_id_len::u32;
+        # buffer the generic arguments: a nested generic type argument appends
+        # its own child type ids to the shared type_id pool mid-parse, so flush
+        # this list as one contiguous block afterward (see parse_call).
+        var buf: parser.TypeIdBuf = parser.type_id_buf_init();
         if (!parser.at(p, token.KIND_RBRACKET)) {
-            val arg: id.TypeId = parse_type(p);
-            parser.push_type_id(p, arg);
-            args_len = args_len + 1;
+            parser.type_id_buf_push(p, ?buf, parse_type(p));
             for (parser.eat(p, token.KIND_COMMA)) {
                 if (parser.at(p, token.KIND_RBRACKET)) { brk; }
-                val next: id.TypeId = parse_type(p);
-                parser.push_type_id(p, next);
-                args_len = args_len + 1;
+                parser.type_id_buf_push(p, ?buf, parse_type(p));
             }
         }
         val close: token.Token = parser.current(p);
         parser.expect(p, token.KIND_RBRACKET, "expected ']' to close generic arguments");
         end = close.span;
+        args_start = parser.type_id_buf_flush(p, ?buf, ?args_len);
     }
 
     var named: m_type.TypeNamed;
@@ -626,18 +689,20 @@ fun parse_fun(p: *parser.Parser, start: token.Span) id.TypeId {
     parser.advance(p);
     parser.expect(p, token.KIND_LPAREN, "expected '(' after 'fun'");
 
-    val params_start: u32 = p.ast.type_id_len::u32;
-    var params_len:   u32 = 0;
-    var variadic:     bool = false;
+    # buffer the parameter types: a parameter that is itself a generic or
+    # function type appends its own child type ids to the shared type_id pool
+    # mid-parse. flush this list as one contiguous block before parsing the
+    # return type, so its nested ids cannot split the parameter slice (see
+    # parse_call).
+    var buf: parser.TypeIdBuf = parser.type_id_buf_init();
+    var variadic: bool = false;
 
     if (parser.at(p, token.KIND_DOT_DOT_DOT)) {
         parser.advance(p);
         variadic = true;
     }
     or (!parser.at(p, token.KIND_RPAREN)) {
-        val first: id.TypeId = parse_type(p);
-        parser.push_type_id(p, first);
-        params_len = params_len + 1;
+        parser.type_id_buf_push(p, ?buf, parse_type(p));
         for (parser.eat(p, token.KIND_COMMA)) {
             if (parser.at(p, token.KIND_RPAREN)) { brk; }
             if (parser.at(p, token.KIND_DOT_DOT_DOT)) {
@@ -645,14 +710,15 @@ fun parse_fun(p: *parser.Parser, start: token.Span) id.TypeId {
                 variadic = true;
                 brk;
             }
-            val next: id.TypeId = parse_type(p);
-            parser.push_type_id(p, next);
-            params_len = params_len + 1;
+            parser.type_id_buf_push(p, ?buf, parse_type(p));
         }
     }
 
     val close: token.Token = parser.current(p);
     parser.expect(p, token.KIND_RPAREN, "expected ')' to close function parameters");
+
+    var params_len: u32 = 0;
+    val params_start: u32 = parser.type_id_buf_flush(p, ?buf, ?params_len);
 
     var ret_type: id.TypeId = id.TYPE_NIL;
     var end_span: token.Span = close.span;
@@ -668,7 +734,7 @@ fun parse_fun(p: *parser.Parser, start: token.Span) id.TypeId {
     fun_.params_start = params_start;
     fun_.params_len   = params_len;
     fun_.variadic     = variadic;
-    fun_.ret          = ret_type;
+    fun_.ret_ty       = ret_type;
 
     var t: m_type.Type;
     t.span      = parser.span_of(start, end_span);
@@ -687,8 +753,10 @@ fun parse_rec_or_uni(p: *parser.Parser, start: token.Span, kind: m_type.TypeKind
     parser.advance(p);
     parser.expect(p, token.KIND_LBRACE, "expected '{' to open anonymous type body");
 
-    val fields_start: u32 = p.ast.typed_name_len::u32;
-    var fields_len:   u32 = 0;
+    # buffer the fields: a field whose type is itself an inline rec/uni appends
+    # its own typed_names to the shared pool mid-parse, so flush this type's
+    # fields as one contiguous block afterward (see parse_call).
+    var buf: parser.TypedNameBuf = parser.typed_name_buf_init();
 
     for (!parser.at(p, token.KIND_RBRACE) && !parser.at_eof(p)) {
         if (!parser.at(p, token.KIND_IDENT)) {
@@ -705,18 +773,16 @@ fun parse_rec_or_uni(p: *parser.Parser, start: token.Span, kind: m_type.TypeKind
         tn.name     = name;
         tn.ty       = ty;
         tn.comptime = false;
-        val tn_r: Result[u32, str] = ast.add_typed_name(p.ast, tn);
-        if (is_err[u32, str](tn_r)) {
-            parser.error_at_current(p, "out of memory while parsing anonymous type field");
-            brk;
-        }
-        fields_len = fields_len + 1;
+        parser.typed_name_buf_push(p, ?buf, tn);
 
         parser.expect(p, token.KIND_SEMI, "expected ';' after field declaration");
     }
 
     val close: token.Token = parser.current(p);
     parser.expect(p, token.KIND_RBRACE, "expected '}' to close anonymous type body");
+
+    var fields_len: u32 = 0;
+    val fields_start: u32 = parser.typed_name_buf_flush(p, ?buf, ?fields_len);
 
     var t: m_type.Type;
     t.span = parser.span_of(start, close.span);
@@ -743,6 +809,7 @@ fun at_type_boundary(p: *parser.Parser) bool {
     if (k == token.KIND_COMMA)    { ret true; }
     if (k == token.KIND_RPAREN)   { ret true; }
     if (k == token.KIND_RBRACKET) { ret true; }
+    if (k == token.KIND_EQ)       { ret true; }
     if (k == token.KIND_EOF)      { ret true; }
     ret false;
 }

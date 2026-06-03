@@ -15,8 +15,12 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
+use std.types.char.char;
 use std.types.string.str;
 use std.types.string.str_len;
+
+use std.types.string.StrView;
+use std.types.string.view;
 use std.types.option.Option;
 use std.types.option.some;
 use std.types.option.none;
@@ -51,7 +55,10 @@ use ir_type:  mach.lang.me.ir.type;
 use value:    mach.lang.me.ir.value;
 use builder:  mach.lang.me.ir.builder;
 
-use lower: mach.lang.me.lower;
+use lower:    mach.lang.me.lower.context;
+use mangle:   mach.lang.me.lower.mangle;
+use generics: mach.lang.fe.sema.generics;
+use sess:     mach.lang.session;
 
 # lowers an expression to its rvalue: the loaded value the expression
 # denotes. dispatches on the expression's `ExprKind`.
@@ -111,6 +118,18 @@ pub fun lower_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Val
         }
     }
 
+    # a by-value aggregate returned from a call is materialized into storage (its
+    # sret slot); by the aggregate convention its rvalue IS that storage pointer,
+    # which is exactly the lvalue a field/index access or address-of wants. a
+    # scalar call result has no storage and is not an lvalue (it falls through).
+    if (k == aexpr.EXPR_KIND_CALL) {
+        val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+        if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+        if (is_aggregate_ir(ctx, unwrap_ok[ir_type.IrTypeId, str](tr))) {
+            ret lower_rvalue(ctx, eid);
+        }
+    }
+
     ret err[value.Value, str]("lower: expression is not an lvalue");
 }
 
@@ -146,12 +165,9 @@ fun lower_lit_str(ctx: *lower.LowerContext, e: *aexpr.Expr) Result[value.Value, 
 
     # the literal's inner content view, with the surrounding quotes stripped.
     val txt: str = module_source(ctx);
-    var inner: str;
-    inner.len  = 0;
-    inner.data = nil;
+    var inner: StrView = view(nil, 0);
     if (e.span.len >= 2::usize) {
-        inner.data = ?txt.data[e.span.offset + 1::usize];
-        inner.len  = (e.span.len - 2::usize)::u32;
+        inner = view(?txt[e.span.offset + 1::usize], e.span.len - 2::usize);
     }
 
     val sid_r: Result[intern.StrId, str] = intern_str_lit(ctx, inner);
@@ -160,24 +176,27 @@ fun lower_lit_str(ctx: *lower.LowerContext, e: *aexpr.Expr) Result[value.Value, 
     if (is_none[str](bytes_opt)) { ret err[value.Value, str]("lower: string literal lookup failed"); }
     val bytes: str = unwrap[str](bytes_opt);
 
-    ret ok[value.Value, str](value.const_bytes(bytes.data, bytes.len::u32, pty));
+    # materialise the literal as an anonymous `.rodata` global and yield a
+    # pointer to it; a raw byte blob must not reach the back end as an operand.
+    val blob: value.Value = value.const_bytes(bytes::*u8, str_len(bytes)::u32, pty);
+    ret lower.add_rodata_bytes(ctx, blob, pty);
 }
 
 # interns a string literal's inner content, decoding escape sequences when
 # present. with no escapes the raw view is interned directly; otherwise the
 # decoded bytes are materialised into a temporary buffer (decoded length
 # never exceeds the source length) and interned, then the buffer is released.
-fun intern_str_lit(ctx: *lower.LowerContext, inner: str) Result[intern.StrId, str] {
+fun intern_str_lit(ctx: *lower.LowerContext, inner: StrView) Result[intern.StrId, str] {
     if (inner.len == 0 || !lit_has_escape(inner)) {
-        ret intern.intern(?ctx.s.interner, inner);
+        ret intern.intern_bytes(?ctx.s.interner, inner.data::str, inner.len);
     }
 
-    val buf_r: Result[*u8, str] = allocate[u8](ctx.s.alloc, inner.len::usize);
+    val buf_r: Result[*u8, str] = allocate[u8](ctx.s.alloc, inner.len);
     if (is_err[*u8, str](buf_r)) { ret err[intern.StrId, str](unwrap_err[*u8, str](buf_r)); }
     val buf: *u8 = unwrap_ok[*u8, str](buf_r);
 
-    var read:  u32 = 0;
-    var write: u32 = 0;
+    var read:  usize = 0;
+    var write: usize = 0;
     for (read < inner.len) {
         val c: u8 = inner.data[read];
         if (c != '\\') {
@@ -186,10 +205,10 @@ fun intern_str_lit(ctx: *lower.LowerContext, inner: str) Result[intern.StrId, st
             write = write + 1;
             cnt;
         }
-        var consumed: u32 = 0;
-        val esc_r: Result[u8, str] = lit_decode_escape(?inner.data[read], inner.len - read, ?consumed);
+        var consumed: usize = 0;
+        val esc_r: Result[u8, str] = lit_decode_escape((?inner.data[read])::*u8, inner.len - read, ?consumed);
         if (is_err[u8, str](esc_r)) {
-            deallocate[u8](ctx.s.alloc, buf, inner.len::usize);
+            deallocate[u8](ctx.s.alloc, buf, inner.len);
             ret err[intern.StrId, str](unwrap_err[u8, str](esc_r));
         }
         buf[write] = unwrap_ok[u8, str](esc_r);
@@ -197,17 +216,14 @@ fun intern_str_lit(ctx: *lower.LowerContext, inner: str) Result[intern.StrId, st
         write = write + 1;
     }
 
-    var decoded: str;
-    decoded.len  = write;
-    decoded.data = buf;
-    val id_r: Result[intern.StrId, str] = intern.intern(?ctx.s.interner, decoded);
-    deallocate[u8](ctx.s.alloc, buf, inner.len::usize);
+    val id_r: Result[intern.StrId, str] = intern.intern_bytes(?ctx.s.interner, buf::str, write);
+    deallocate[u8](ctx.s.alloc, buf, inner.len);
     ret id_r;
 }
 
 # true when a string view contains a backslash (an escape sequence).
-fun lit_has_escape(s: str) bool {
-    var i: u32 = 0;
+fun lit_has_escape(s: StrView) bool {
+    var i: usize = 0;
     for (i < s.len) {
         if (s.data[i] == '\\') { ret true; }
         i = i + 1;
@@ -218,7 +234,7 @@ fun lit_has_escape(s: str) bool {
 # decodes one escape sequence starting at `p` (which points at the leading
 # backslash), writing the consumed input byte count into `out_consumed`.
 # mirrors comptime.eval's decode_escape: \n \t \r \\ \' \" \0 \xHH.
-fun lit_decode_escape(p: *u8, len: u32, out_consumed: *u32) Result[u8, str] {
+fun lit_decode_escape(p: *u8, len: usize, out_consumed: *usize) Result[u8, str] {
     if (len < 2) { ret err[u8, str]("lower: incomplete escape sequence in string literal"); }
     val c: u8 = p[1];
 
@@ -277,6 +293,22 @@ fun lower_ident_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.V
     ret symbol_reference(ctx, eid, sid);
 }
 
+# reference_linkage_name: the back-end symbol name a reference to module-level
+# symbol `sym` must resolve to. it is mangled against the *defining* module's
+# FQN (keyed by `sym.origin`) and honours the defining decl's export override
+# (an `ext fun` or `$<sym>.symbol` literal stays literal), so it byte-matches the
+# name `lower_fun` / `lower_global` emitted for the definition: the definition
+# mangles against its own FQN through the same chokepoint with the same bare
+# name and override. a self-reference (origin == own_module) agrees trivially.
+fun reference_linkage_name(ctx: *lower.LowerContext, sym: *resolve.Symbol) Result[intern.StrId, str] {
+    val fqn: intern.StrId = sess.module_fqn(ctx.s, sym.origin);
+    var export: Option[intern.StrId] = none[intern.StrId]();
+    if (sym.decl != aid.DECL_NIL) {
+        export = sess.export_name(ctx.s, sym.origin, sym.decl::u32);
+    }
+    ret mangle.linkage_name(ctx.s, fqn, sym.name, export);
+}
+
 # forms an rvalue for an identifier that names a module-level symbol: a
 # function reference (VAL_FN) for functions, otherwise a load from the
 # global's storage pointer.
@@ -291,18 +323,30 @@ fun symbol_reference(ctx: *lower.LowerContext, eid: aid.ExprId, sid: resolve.Sym
     if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
     val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
 
-    if (sym.kind == resolve.SYM_FUN) {
-        val fi: Option[u32] = find_function(ctx, sym.name);
+    # the back-end symbol name of the referent, mangled against its defining
+    # module (or kept literal when exempted) so it matches the definition.
+    val ln_r: Result[intern.StrId, str] = reference_linkage_name(ctx, sym);
+    if (is_err[intern.StrId, str](ln_r)) { ret err[value.Value, str](unwrap_err[intern.StrId, str](ln_r)); }
+    val link: intern.StrId = unwrap_ok[intern.StrId, str](ln_r);
+
+    # a function reference: a local function resolves to its module index; a
+    # function imported from another module (kind SYM_IMPORTED, function-typed)
+    # resolves through a signature-only extern declaration so the back end emits
+    # a name-based call relocation the linker binds to the defining object.
+    if (sym.kind == resolve.SYM_FUN || references_function(ctx, eid)) {
+        val fi: Option[u32] = find_function(ctx, link);
         if (is_some[u32](fi)) {
             ret ok[value.Value, str](value.fn_value(unwrap[u32](fi), vty));
         }
-        ret ok[value.Value, str](value.fn_value(0, vty));
+        val xr: Result[u32, str] = lower.ensure_extern_function(ctx, link, vty);
+        if (is_err[u32, str](xr)) { ret err[value.Value, str](unwrap_err[u32, str](xr)); }
+        ret ok[value.Value, str](value.fn_value(unwrap_ok[u32, str](xr), vty));
     }
 
     # global val / var: a load from the global's storage pointer, except for
     # an aggregate global whose rvalue is its storage address (the back end
     # loads halves / passes the pointer at use sites — see lower_ident_rvalue).
-    val gi: Option[u32] = find_global(ctx, sym.name);
+    val gi: Option[u32] = find_global(ctx, link);
     if (is_some[u32](gi)) {
         val pr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
         if (is_err[ir_type.IrTypeId, str](pr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](pr)); }
@@ -311,7 +355,72 @@ fun symbol_reference(ctx: *lower.LowerContext, eid: aid.ExprId, sid: resolve.Sym
         ret builder.emit_load(?ctx.builder, gptr, vty);
     }
 
-    ret err[value.Value, str]("lower: identifier has no IR storage");
+    # a comptime-const val that lives in another module has no global in this
+    # module's IR (its storage was never emitted here). such a constant — e.g.
+    # the stdlib `val true: bool = 1;` imported by name — folds to its value,
+    # read from the module's comptime context where the load walk registered it.
+    val nc: Option[*comptime.NamedConst] = comptime.lookup(ctx.ctx, sym.name);
+    if (is_some[*comptime.NamedConst](nc)) {
+        ret const_value_of(ctx, eid, unwrap[*comptime.NamedConst](nc).value);
+    }
+
+    # a runtime global `val`/`var` defined in another module (imach emits one
+    # object per module, so its storage lives only in the defining module's IR).
+    # declare a storage-less extern global here and load through it; the back end
+    # emits a name-based relocation the linker binds to the defining object —
+    # mirroring the extern-function path above.
+    val xg: Result[u32, str] = lower.ensure_extern_global(ctx, link, vty);
+    if (is_err[u32, str](xg)) { ret err[value.Value, str](unwrap_err[u32, str](xg)); }
+    val xpr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+    if (is_err[ir_type.IrTypeId, str](xpr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](xpr)); }
+    val xptr: value.Value = value.global_value(unwrap_ok[u32, str](xg), unwrap_ok[ir_type.IrTypeId, str](xpr));
+    if (is_aggregate_ir(ctx, vty)) { ret ok[value.Value, str](xptr); }
+    ret builder.emit_load(?ctx.builder, xptr, vty);
+}
+
+# true when the identifier expression's semantic type is a function type, so a
+# reference to it is a function-pointer reference (resolved to a local or extern
+# function rather than a global load).
+fun references_function(ctx: *lower.LowerContext, eid: aid.ExprId) bool {
+    val tid: ty.TypeId = lower.expr_type_of(ctx, eid);
+    val t_opt: Option[*ty.Type] = ty.get(?ctx.s.types, tid);
+    if (is_none[*ty.Type](t_opt)) { ret false; }
+    ret unwrap[*ty.Type](t_opt).kind == ty.TYPE_FUN;
+}
+
+# the storage pointer of a module-level binding `sid`: a global defined in this
+# module resolves to its module index; a runtime global val/var defined in
+# another module declares a storage-less extern global here and yields its
+# storage pointer (the back end emits a name-based relocation the linker binds
+# to the defining object). `eid` supplies the binding's value type, needed to
+# size the extern global. shared by the ident and module-qualified-member
+# lvalue paths.
+fun symbol_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId, sid: resolve.SymbolId) Result[value.Value, str] {
+    val sym_opt: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](sym_opt)) {
+        ret err[value.Value, str]("lower: unresolved lvalue identifier");
+    }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
+
+    val ln_r: Result[intern.StrId, str] = reference_linkage_name(ctx, sym);
+    if (is_err[intern.StrId, str](ln_r)) { ret err[value.Value, str](unwrap_err[intern.StrId, str](ln_r)); }
+    val link: intern.StrId = unwrap_ok[intern.StrId, str](ln_r);
+
+    val gi: Option[u32] = find_global(ctx, link);
+    if (is_some[u32](gi)) {
+        val pr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+        if (is_err[ir_type.IrTypeId, str](pr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](pr)); }
+        ret ok[value.Value, str](value.global_value(unwrap[u32](gi), unwrap_ok[ir_type.IrTypeId, str](pr)));
+    }
+
+    val vtr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](vtr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](vtr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](vtr);
+    val xg: Result[u32, str] = lower.ensure_extern_global(ctx, link, vty);
+    if (is_err[u32, str](xg)) { ret err[value.Value, str](unwrap_err[u32, str](xg)); }
+    val xpr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+    if (is_err[ir_type.IrTypeId, str](xpr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](xpr)); }
+    ret ok[value.Value, str](value.global_value(unwrap_ok[u32, str](xg), unwrap_ok[ir_type.IrTypeId, str](xpr)));
 }
 
 # an identifier lvalue: the alloca slot pointer for a local, or the global
@@ -322,19 +431,7 @@ fun lower_ident_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.V
     if (is_some[value.Value](local)) {
         ret ok[value.Value, str](unwrap[value.Value](local));
     }
-
-    val sym_opt: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
-    if (is_none[*resolve.Symbol](sym_opt)) {
-        ret err[value.Value, str]("lower: unresolved lvalue identifier");
-    }
-    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
-    val gi: Option[u32] = find_global(ctx, sym.name);
-    if (is_some[u32](gi)) {
-        val pr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
-        if (is_err[ir_type.IrTypeId, str](pr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](pr)); }
-        ret ok[value.Value, str](value.global_value(unwrap[u32](gi), unwrap_ok[ir_type.IrTypeId, str](pr)));
-    }
-    ret err[value.Value, str]("lower: lvalue identifier has no storage");
+    ret symbol_lvalue(ctx, eid, sid);
 }
 
 # a member rvalue: a load from the field pointer, except for an aggregate
@@ -342,6 +439,15 @@ fun lower_ident_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.V
 # left as a pointer the back end consumes at use sites — see
 # lower_ident_rvalue).
 fun lower_member_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    # a module-qualified reference (`alias.name`, where `alias` is a `use`
+    # binding) is recorded by resolve as a symbol on the member expression
+    # itself; it denotes the imported value, not a field of a record. lower it
+    # as a plain symbol reference (cross-module const / global / function).
+    val qsid: resolve.SymbolId = lower.expr_symbol_of(ctx, eid);
+    if (qsid != resolve.SYMBOL_NIL) {
+        ret symbol_reference(ctx, eid, qsid);
+    }
+
     val ptr_r: Result[value.Value, str] = lower_member_lvalue(ctx, eid, e);
     if (is_err[value.Value, str](ptr_r)) { ret ptr_r; }
     val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
@@ -352,14 +458,47 @@ fun lower_member_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Exp
 }
 
 # computes the field pointer of a member access: a gep against the base
-# lvalue with the field index. the field index is resolved from the base's
-# record/union declaration by matching the member name.
+# with the field index. the receiver may be the record's own storage
+# (`s.field`, base = lvalue of `s`, gep source = the record type) or a pointer
+# to it (`p.field` with `p: *S`, auto-deref: base = the pointer rvalue, gep
+# source = the pointee record), mirroring the array/pointer split in
+# lower_index_lvalue. the field index is resolved against the record type, not
+# the pointer.
 fun lower_member_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
-    val base_r: Result[value.Value, str] = lower_lvalue(ctx, e.data.member.object);
-    if (is_err[value.Value, str](base_r)) { ret base_r; }
-    val base: value.Value = unwrap_ok[value.Value, str](base_r);
+    # a module-qualified reference (`alias.name`) is recorded by resolve as a
+    # symbol on the member expression itself; it denotes the imported binding's
+    # storage, not a field of a record. yield its storage pointer (the lvalue
+    # twin of the qsid branch in lower_member_rvalue).
+    val qsid: resolve.SymbolId = lower.expr_symbol_of(ctx, eid);
+    if (qsid != resolve.SYMBOL_NIL) {
+        ret symbol_lvalue(ctx, eid, qsid);
+    }
 
-    val rec_ty: ty.TypeId = lower.expr_type_of(ctx, e.data.member.object);
+    val obj_ty: ty.TypeId = lower.expr_type_of(ctx, e.data.member.object);
+    val is_ptr: bool = is_pointer_type(ctx, obj_ty);
+
+    # the record type the field belongs to, and the base pointing at its storage:
+    # a pointer receiver auto-derefs (base = pointer value, record = pointee);
+    # a value receiver uses its own storage (base = lvalue, record = the type).
+    var rec_ty: ty.TypeId = obj_ty;
+    var base:   value.Value;
+    if (is_ptr) {
+        val pt_opt: Option[*ty.Type] = ty.get(?ctx.s.types, obj_ty);
+        if (is_none[*ty.Type](pt_opt)) { ret err[value.Value, str]("lower: member base has no pointer type"); }
+        val pt: *ty.Type = unwrap[*ty.Type](pt_opt);
+        if (pt.kind != ty.TYPE_POINTER) {
+            ret err[value.Value, str]("lower: cannot access a field of an untyped pointer");
+        }
+        rec_ty = pt.data.pointer.base;
+        val br: Result[value.Value, str] = lower_rvalue(ctx, e.data.member.object);
+        if (is_err[value.Value, str](br)) { ret br; }
+        base = unwrap_ok[value.Value, str](br);
+    } or {
+        val br: Result[value.Value, str] = lower_lvalue(ctx, e.data.member.object);
+        if (is_err[value.Value, str](br)) { ret br; }
+        base = unwrap_ok[value.Value, str](br);
+    }
+
     val field_ix: u32 = field_index_in_type(ctx, rec_ty, e.data.member.name);
 
     val rec_ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, rec_ty);
@@ -448,13 +587,84 @@ fun lower_index_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr
     ret builder.emit_gep(?ctx.builder, base, arr_ir, ?idx[0], 2);
 }
 
+# interns a static literal in the session interner, returning its StrId or
+# STR_NIL on allocation failure (a STR_NIL never matches a real span name).
+fun interned_literal(ctx: *lower.LowerContext, text: str) intern.StrId {
+    val r: Result[intern.StrId, str] = intern.intern(?ctx.s.interner, text);
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+# folds a comptime value intrinsic call (`$size_of(T)`, `$align_of(T)`,
+# `$offset_of(T, field)`) to an integer constant, mirroring cmach's sema-time
+# fold. returns none when the callee is not such an intrinsic, leaving the
+# caller to lower a normal call. the constant takes the call's IR result type
+# (u64), set by sema. sizes/offsets come from the target-aware IR layout, the
+# same authority the backend uses for alloca and gep.
+fun try_lower_comptime_intrinsic(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Option[Result[value.Value, str]] {
+    val ce_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, e.data.call.callee);
+    if (is_none[*aexpr.Expr](ce_opt)) { ret none[Result[value.Value, str]](); }
+    val ce: *aexpr.Expr = unwrap[*aexpr.Expr](ce_opt);
+    if (ce.kind != aexpr.EXPR_KIND_COMPTIME_IDENT) { ret none[Result[value.Value, str]](); }
+    if (ce.span.len <= 1) { ret none[Result[value.Value, str]](); }
+
+    var ns: token.Span = ce.span;
+    ns.offset = ns.offset + 1;
+    ns.len    = ns.len - 1;
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), ns);
+    if (is_err[intern.StrId, str](name_r)) {
+        ret some[Result[value.Value, str]](err[value.Value, str](unwrap_err[intern.StrId, str](name_r)));
+    }
+    val name: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+    val is_size:   bool = name == interned_literal(ctx, "size_of");
+    val is_align:  bool = name == interned_literal(ctx, "align_of");
+    val is_offset: bool = name == interned_literal(ctx, "offset_of");
+    if (!is_size && !is_align && !is_offset) { ret none[Result[value.Value, str]](); }
+
+    if (e.data.call.args_len::usize > ctx.a.expr_id_len) {
+        ret some[Result[value.Value, str]](err[value.Value, str]("lower: comptime intrinsic argument index out of range"));
+    }
+    val arg0_eid: aid.ExprId = ctx.a.expr_ids[e.data.call.args_start];
+    val op_ty:    ty.TypeId  = lower.expr_type_of(ctx, arg0_eid);
+    val ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, op_ty);
+    if (is_err[ir_type.IrTypeId, str](ir_r)) {
+        ret some[Result[value.Value, str]](err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](ir_r)));
+    }
+    val ir_id: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ir_r);
+
+    val rt_r: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](rt_r)) {
+        ret some[Result[value.Value, str]](err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](rt_r)));
+    }
+    val rt: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](rt_r);
+
+    var n: u32 = 0;
+    if (is_size)  { n = ir_type.byte_size(?ctx.m.types, ir_id, ctx.tgt); }
+    if (is_align) { n = ir_type.byte_align(?ctx.m.types, ir_id, ctx.tgt); }
+    if (is_offset) {
+        val f_eid: aid.ExprId = ctx.a.expr_ids[e.data.call.args_start + 1];
+        val f_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, f_eid);
+        if (is_none[*aexpr.Expr](f_opt)) {
+            ret some[Result[value.Value, str]](err[value.Value, str]("lower: offset_of field argument out of range"));
+        }
+        val field_ix: u32 = field_index_in_type(ctx, op_ty, unwrap[*aexpr.Expr](f_opt).span);
+        n = ir_type.byte_offset(?ctx.m.types, ir_id, field_ix, ctx.tgt);
+    }
+
+    ret some[Result[value.Value, str]](ok[value.Value, str](value.const_int(n::u64, rt)));
+}
+
 # lowers a call: the callee rvalue followed by each argument rvalue, then an
 # OP_CALL. ABI classification (which args ride in registers vs the stack) is
 # deferred to isel against the target ABI; lowering emits the flat operand
 # list the contract specifies. the call's IR result type is the lowered
-# semantic type of the call expression (IRT_VOID for a void call).
+# semantic type of the call expression (IRT_VOID for a void call). a comptime
+# value intrinsic callee is folded to a constant before normal call lowering.
 fun lower_call(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
-    val callee_r: Result[value.Value, str] = lower_rvalue(ctx, e.data.call.callee);
+    val intr: Option[Result[value.Value, str]] = try_lower_comptime_intrinsic(ctx, eid, e);
+    if (is_some[Result[value.Value, str]](intr)) { ret unwrap[Result[value.Value, str]](intr); }
+
+    val callee_r: Result[value.Value, str] = lower_callee(ctx, eid, e);
     if (is_err[value.Value, str](callee_r)) { ret callee_r; }
     val callee: value.Value = unwrap_ok[value.Value, str](callee_r);
 
@@ -493,6 +703,81 @@ fun lower_call(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result
     val cr: Result[value.Value, str] = builder.emit_call(?ctx.builder, callee, args, argc, rt);
     if (args != nil) { deallocate[value.Value](ctx.s.alloc, args, argc::usize); }
     ret cr;
+}
+
+# lowers a call's callee to a function-reference value. a call carrying explicit
+# type arguments (`callee[T, ...](...)`) names a generic; it resolves to the
+# monomorphized INSTANCE — a distinct, correctly-typed body emitted once per
+# `(generic, type-args)` — rather than the (pointer-erased) generic template. a
+# plain call delegates to the normal rvalue lowering of the callee.
+fun lower_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    if (e.data.call.type_args_len == 0) {
+        ret lower_rvalue(ctx, e.data.call.callee);
+    }
+    ret lower_generic_callee(ctx, eid, e);
+}
+
+# resolves a generic call to its monomorphized instance: reads the call-site
+# type arguments (substituting any that are themselves generic params bound in
+# the enclosing instance body, so a transitive `allocate[T]` -> `reallocate[T]`
+# resolves T to the concrete arg), computes the instance's mangled linkage name,
+# enqueues the instance for body emission, and returns a function reference to
+# it. the instance lives in the generic's origin module; the back end emits a
+# name-based call the linker binds to the (weak, deduped) instance body.
+fun lower_generic_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, e.data.call.callee);
+    val sym_opt: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](sym_opt)) {
+        ret err[value.Value, str]("lower: unresolved generic call target");
+    }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
+
+    val argc: u32 = e.data.call.type_args_len;
+    val ab: Result[*ty.TypeId, str] = allocate[ty.TypeId](ctx.s.alloc, argc::usize);
+    if (is_err[*ty.TypeId, str](ab)) { ret err[value.Value, str](unwrap_err[*ty.TypeId, str](ab)); }
+    val args: *ty.TypeId = unwrap_ok[*ty.TypeId, str](ab);
+
+    var i: u32 = 0;
+    for (i < argc) {
+        val pool_ix: u32 = e.data.call.type_args_start + i;
+        if (pool_ix::usize >= ctx.a.type_id_len) {
+            deallocate[ty.TypeId](ctx.s.alloc, args, argc::usize);
+            ret err[value.Value, str]("lower: generic call type-argument index out of range");
+        }
+        var at: ty.TypeId = lower.type_resolved_of(ctx, ctx.a.type_ids[pool_ix]);
+        if (ctx.subst != nil && ctx.subst_len > 0) {
+            at = generics.substitute(ctx.s, at, ctx.subst, ctx.subst_len);
+        }
+        args[i] = at;
+        i = i + 1;
+    }
+
+    # the instance is owned by the generic's origin module; mangle the instance
+    # name against that module's FQN so the definition (emitted by the drain) and
+    # every reference agree.
+    val fqn: intern.StrId = sess.module_fqn(ctx.s, sym.origin);
+    val name_r: Result[intern.StrId, str] = mangle.instance_name(ctx.s, fqn, sym.name, args, argc);
+    if (is_err[intern.StrId, str](name_r)) {
+        deallocate[ty.TypeId](ctx.s.alloc, args, argc::usize);
+        ret err[value.Value, str](unwrap_err[intern.StrId, str](name_r));
+    }
+    val link: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    val enq: Result[bool, str] = lower.enqueue_instance(ctx, sym.decl, sym.origin, args, argc, link);
+    deallocate[ty.TypeId](ctx.s.alloc, args, argc::usize);
+    if (is_err[bool, str](enq)) { ret err[value.Value, str](unwrap_err[bool, str](enq)); }
+
+    val vtr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+    if (is_err[ir_type.IrTypeId, str](vtr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](vtr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](vtr);
+
+    val fi: Option[u32] = find_function(ctx, link);
+    if (is_some[u32](fi)) {
+        ret ok[value.Value, str](value.fn_value(unwrap[u32](fi), vty));
+    }
+    val xr: Result[u32, str] = lower.ensure_extern_function(ctx, link, vty);
+    if (is_err[u32, str](xr)) { ret err[value.Value, str](unwrap_err[u32, str](xr)); }
+    ret ok[value.Value, str](value.fn_value(unwrap_ok[u32, str](xr), vty));
 }
 
 # lowers a binary expression. assignment evaluates the RHS and stores it
@@ -706,9 +991,13 @@ fun lower_cast(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result
 
 # a comptime identifier folds to the constant the comptime evaluator
 # produced, looked up by the identifier's interned name in the module's
-# comptime context.
+# comptime context. the `$ident` span carries the leading `$`; constants are
+# registered under the bare name, so strip it before interning the lookup key.
 fun lower_comptime_ident(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
-    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), e.span);
+    var name_span: token.Span = e.span;
+    name_span.offset = name_span.offset + 1;
+    name_span.len    = name_span.len - 1;
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), name_span);
     if (is_err[intern.StrId, str](name_r)) { ret err[value.Value, str](unwrap_err[intern.StrId, str](name_r)); }
     val nc: Option[*comptime.NamedConst] = comptime.lookup(ctx.ctx, unwrap_ok[intern.StrId, str](name_r));
     if (is_none[*comptime.NamedConst](nc)) {
@@ -821,7 +1110,7 @@ pub fun const_value_of(ctx: *lower.LowerContext, eid: aid.ExprId, v: comptime.CT
         val txt: Option[str] = intern.lookup(?ctx.s.interner, v.data.s);
         if (is_none[str](txt)) { ret err[value.Value, str]("lower: comptime string lookup failed"); }
         val s: str = unwrap[str](txt);
-        ret ok[value.Value, str](value.const_bytes(s.data, str_len(s)::u32, ty_id));
+        ret ok[value.Value, str](value.const_bytes(s::*u8, str_len(s)::u32, ty_id));
     }
     ret err[value.Value, str]("lower: unsupported comptime value kind");
 }
@@ -843,10 +1132,7 @@ fun index_type(ctx: *lower.LowerContext) Result[ir_type.IrTypeId, str] {
 fun module_source(ctx: *lower.LowerContext) str {
     val sf: Option[*src.SourceFile] = src.get(?ctx.s.sources, ctx.a.file_id);
     if (is_none[*src.SourceFile](sf)) {
-        var empty: str;
-        empty.len  = 0;
-        empty.data = nil;
-        ret empty;
+        ret nil::str;
     }
     ret unwrap[*src.SourceFile](sf).text;
 }
@@ -905,45 +1191,23 @@ fun is_aggregate_ir(ctx: *lower.LowerContext, ity: ir_type.IrTypeId) bool {
 }
 
 # resolves a member name to a field index within a nominal semantic type by
-# matching the interned member name against each field's interned name in
-# the declaration's typed-name list. returns 0 when the layout is not
-# recoverable (an upstream sema error already reported it).
+# matching the interned member name against each field's interned name in the
+# session-global field store (keyed by TypeId). using the store rather than an
+# AST declaration resolves anonymous records (structural identity) and cross-
+# module records uniformly. returns 0 when the layout is not recoverable (an
+# upstream sema error already reported it).
 fun field_index_in_type(ctx: *lower.LowerContext, rec_ty: ty.TypeId, name: token.Span) u32 {
-    val t_opt: Option[*ty.Type] = ty.get(?ctx.s.types, rec_ty);
-    if (is_none[*ty.Type](t_opt)) { ret 0; }
-    val t: *ty.Type = unwrap[*ty.Type](t_opt);
-    if (t.kind != ty.TYPE_REC && t.kind != ty.TYPE_UNI) { ret 0; }
-
-    val d_opt: Option[*adecl.Decl] = ast.get_decl(ctx.a, t.data.nominal.decl);
-    if (is_none[*adecl.Decl](d_opt)) { ret 0; }
-    val d: *adecl.Decl = unwrap[*adecl.Decl](d_opt);
-
-    var fields_start: u32 = 0;
-    var fields_len:   u32 = 0;
-    if (d.kind == adecl.DECL_KIND_REC) {
-        fields_start = d.data.rec_.fields_start;
-        fields_len   = d.data.rec_.fields_len;
-    } or (d.kind == adecl.DECL_KIND_UNI) {
-        fields_start = d.data.uni_.fields_start;
-        fields_len   = d.data.uni_.fields_len;
-    } or {
-        ret 0;
-    }
-
     val src_text: str = module_source(ctx);
     val want_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, src_text, name);
     if (is_err[intern.StrId, str](want_r)) { ret 0; }
     val want: intern.StrId = unwrap_ok[intern.StrId, str](want_r);
 
+    val fields_len: u32 = ty.field_count(?ctx.s.types, rec_ty);
     var i: u32 = 0;
     for (i < fields_len) {
-        val pool_ix: u32 = fields_start + i;
-        if (pool_ix::usize < ctx.a.typed_name_len) {
-            val tn: *adecl.TypedName = ?ctx.a.typed_names[pool_ix];
-            val fr: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, src_text, tn.name);
-            if (is_ok[intern.StrId, str](fr)) {
-                if (unwrap_ok[intern.StrId, str](fr) == want) { ret i; }
-            }
+        val fe_opt: Option[*ty.FieldEntry] = ty.field_at(?ctx.s.types, rec_ty, i);
+        if (is_some[*ty.FieldEntry](fe_opt)) {
+            if (unwrap[*ty.FieldEntry](fe_opt).name == want) { ret i; }
         }
         i = i + 1;
     }

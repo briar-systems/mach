@@ -1,21 +1,19 @@
 # mach build system
 # builds:
-#   1. acquire cmach            (auto-downloaded or user-provided)
+#   1. acquire cmach            (pinned version auto-downloaded to out/bin)
 #   2. intermediary compiler    (cmach builds src/ -> out/bin/imach)
 #   3. self-hosted compiler     (imach builds src/ -> out/bin/smach)
 #   4. final compiler           (smach builds src/ -> out/linux/bin/mach)
 
-CMACH_VERSION ?= 0.10.0
-CMACH         ?= $(shell command -v cmach 2>/dev/null)
-CMACH_URL      = https://github.com/octalide/mach-boot/releases/download/v$(CMACH_VERSION)/cmach
-
 OUT := out
 BIN := $(OUT)/bin
 
-# if CMACH is empty (not in PATH, not overridden), download it
-ifeq ($(CMACH),)
-  CMACH := $(BIN)/cmach
-endif
+# cmach is the bootstrap seed: the exact pinned version is auto-downloaded so a
+# stale system cmach can never silently break the bootstrap. override the seed
+# explicitly with `make CMACH=/path/to/cmach` when you know it matches.
+CMACH_VERSION ?= 0.10.2
+CMACH         ?= $(BIN)/cmach
+CMACH_URL      = https://github.com/octalide/mach-boot/releases/download/v$(CMACH_VERSION)/cmach
 
 IMACH := $(BIN)/imach
 SMACH := $(BIN)/smach

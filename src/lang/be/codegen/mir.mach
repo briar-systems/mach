@@ -59,8 +59,10 @@ use std.allocator.reallocate;
 
 use std.system.panic.panic;
 
+use map: std.collections.map;
+
 use intern:  mach.lang.intern;
-use target:  mach.lang.target;
+use target:  mach.lang.target.resolved;
 use abi:     mach.lang.target.abi;
 use sysv:    mach.lang.target.abi.sysv;
 use isa:     mach.lang.target.isa;
@@ -277,6 +279,46 @@ pub val MIR_SEL_CMP_LE_U: MirOpcode = 0x1112;
 # MIR_SEL_CBR: selection-output sentinel for a conditional branch (TEST;JNE;JMP).
 pub val MIR_SEL_CBR:    MirOpcode = 0x1113;
 
+# the scalar floating-point arithmetic / comparison ops. the shared IR integer
+# opcodes (OP_ADD / OP_SUB / OP_MUL / OP_DIV_* / OP_CMP_*) cover both int and
+# float operands; `lower_ir` dispatches on operand/result float type and emits one
+# of these dedicated opcodes for a float instead of the integer ALU form, which
+# would mis-encode an XMM-classed value. like the compare / divide families they
+# survive instruction selection unchanged and the encoder materializes the SSE
+# byte sequence (operands loaded `[rbp+off]`/reg -> XMM scratch, the SSE op, the
+# result stored back). the operation width (4 for f32, 8 for f64) rides on
+# `mi.width` so the encoder selects the SS vs SD form. they occupy the high
+# selection-output space so the encoder never confuses one with a concrete x86-64
+# opcode of the same low value.
+# MIR_FADD: scalar float addition (ADDSS / ADDSD).
+pub val MIR_FADD:      MirOpcode = 0x1114;
+# MIR_FSUB: scalar float subtraction (SUBSS / SUBSD).
+pub val MIR_FSUB:      MirOpcode = 0x1115;
+# MIR_FMUL: scalar float multiplication (MULSS / MULSD).
+pub val MIR_FMUL:      MirOpcode = 0x1116;
+# MIR_FDIV: scalar float division (DIVSS / DIVSD).
+pub val MIR_FDIV:      MirOpcode = 0x1117;
+# MIR_FCMP: scalar float comparison (UCOMISS / UCOMISD + unsigned SETcc + MOVZX).
+# the condition code (one of CC_*) rides on `mi.src_width`'s companion field via a
+# dedicated `fcc` carrier set by lowering.
+pub val MIR_FCMP:      MirOpcode = 0x1118;
+
+# float-comparison condition codes carried on a MIR_FCMP. a UCOMISD sets CF/ZF/PF
+# (an UNORDERED result sets all three), so the float compare maps to UNSIGNED
+# SETcc — distinct from the integer compare family's signed conditions.
+# FCC_EQ: equal (SETE).
+pub val FCC_EQ: u8 = 0;
+# FCC_NE: not equal (SETNE).
+pub val FCC_NE: u8 = 1;
+# FCC_LT: less than (SETB — CF set when below).
+pub val FCC_LT: u8 = 2;
+# FCC_LE: less or equal (SETBE).
+pub val FCC_LE: u8 = 3;
+# FCC_GT: greater than (SETA).
+pub val FCC_GT: u8 = 4;
+# FCC_GE: greater or equal (SETAE).
+pub val FCC_GE: u8 = 5;
+
 # MIR_VREG_NIL: sentinel "no virtual register"; never a valid vreg id, never a default.
 pub val MIR_VREG_NIL: u32 = 0xFFFFFFFF;
 
@@ -320,6 +362,34 @@ pub rec MirOperand {
     index_is_preg: bool;
 }
 
+# MirAsmBind: one resolved `{name}` binding for an inline-asm block — the source
+# name paired with the slot-owning vreg the alloca's result mapped to. the
+# encoder resolves the vreg to a frame offset and substitutes `[rbp+off]` for
+# `{name}` when it expands the body.
+# ---
+# name:      interned source local name (the text inside `{ }`)
+# slot_vreg: slot-owning vreg id of the local's alloca storage
+pub rec MirAsmBind {
+    name:      intern.StrId;
+    slot_vreg: u32;
+}
+
+# MirAsm: the inline-asm payload carried by a MIR_ASM instruction. the body text
+# is resolved from the interner at lower time; the `{name}` bindings carry the
+# slot-owning vreg ids the encoder turns into `[rbp+off]` once the frame is laid
+# out. owned by the MIR_ASM instruction and freed in `dnit_instr`.
+# ---
+# isa:        the target ISA tag the body was written for (e.g. "x86_64")
+# body:       raw inline-asm body text (borrowed from the interner; stable)
+# binds:      `{name}` -> slot-vreg bindings referenced by the body (owned)
+# bind_count: number of bindings
+pub rec MirAsm {
+    isa:        str;
+    body:       str;
+    binds:      *MirAsmBind;
+    bind_count: u32;
+}
+
 # MirInstr: one MIR instruction — a generic-or-concrete opcode plus a flat operand list (dst at operand 0).
 # ---
 # opcode:        generic MIR opcode (pre-isel) or concrete encoder opcode (post-isel)
@@ -339,12 +409,22 @@ pub rec MirOperand {
 #                source is narrower or wider than the destination. for every other
 #                opcode it equals `width`. the encoder sizes source operands by
 #                this field so MOVZX / MOVSX select the byte-vs-word source form.
+#                EXCEPTION: a MIR_FCMP carries its float-comparison condition code
+#                (one of FCC_*) here, since a float comparison has no narrower /
+#                wider source form — both operands ride at `width` (4 for f32, 8
+#                for f64) and the single MIR_FCMP opcode selects the UNSIGNED SETcc
+#                from this condition, mirroring how the integer compare family
+#                encodes its condition in the opcode itself.
+# asm_block:     inline-asm payload for a MIR_ASM instruction (owned), else nil.
+#                carries the raw body text plus `{name}` -> slot-vreg bindings the
+#                encoder expands into machine instructions.
 pub rec MirInstr {
     opcode:        MirOpcode;
     operands:      *MirOperand;
     operand_count: u32;
     width:         u8;
     src_width:     u8;
+    asm_block:     *MirAsm;
 }
 
 # MirBlock: a MIR basic block — an ordered instruction list plus predecessor ids, sharing the source IR `Block.id`.
@@ -469,11 +549,15 @@ pub rec MirFunction {
 # MirModule: the per-source-module unit produced by `lower_ir`.
 # ---
 # alloc:        allocator backing every owned array (mirrors the IR module's)
+# interner:     the session interner, threaded through so the encoder can
+#               resolve interned strings (inline-asm bodies) and intern new
+#               symbol names referenced from inline asm into relocations
 # functions:    MIR functions, parallel to the source IR module's functions (owned)
 # function_len: number of functions
 # function_cap: allocated capacity for functions
 pub rec MirModule {
     alloc:        *Allocator;
+    interner:     *intern.Interner;
     functions:    *MirFunction;
     function_len: u32;
     function_cap: u32;
@@ -644,16 +728,19 @@ pub fun op_block(block: u32) MirOperand {
 
 # lower_ir: lower an IR module to a parallel MIR module, one MIR function per IR function.
 # ---
-# tgt: resolved compilation target; supplies register classes via `tgt.arch`
-# m:   the source IR module to lower
-# ret: a populated MirModule (owned, release with `dnit_module`), or an allocation / lowering error
-pub fun lower_ir(tgt: *target.Target, m: *ir.Module) Result[MirModule, str] {
+# tgt:      resolved compilation target; supplies register classes via `tgt.arch`
+# m:        the source IR module to lower
+# interner: session interner, recorded on the MIR module so the encoder can
+#           resolve interned strings and intern inline-asm symbol references
+# ret:      a populated MirModule (owned, release with `dnit_module`), or an allocation / lowering error
+pub fun lower_ir(tgt: *target.Target, m: *ir.Module, interner: *intern.Interner) Result[MirModule, str] {
     if (tgt == nil || m == nil) {
         ret err[MirModule, str]("mir.lower_ir: nil target or module");
     }
 
     var mm: MirModule;
     mm.alloc        = m.alloc;
+    mm.interner     = interner;
     mm.functions    = nil;
     mm.function_len = 0;
     mm.function_cap = 0;
@@ -667,7 +754,7 @@ pub fun lower_ir(tgt: *target.Target, m: *ir.Module) Result[MirModule, str] {
 
     var fi: u32 = 0;
     for (fi < m.function_len) {
-        val lf: Result[MirFunction, str] = lower_function(tgt, m, ?m.functions[fi]);
+        val lf: Result[MirFunction, str] = lower_function(tgt, m, ?m.functions[fi], interner);
         if (is_err[MirFunction, str](lf)) {
             dnit_module(?mm);
             ret err[MirModule, str](unwrap_err[MirFunction, str](lf));
@@ -698,6 +785,7 @@ pub fun lower_ir(tgt: *target.Target, m: *ir.Module) Result[MirModule, str] {
 # param_count: number of parameters
 # instr_vregs: per-instruction vreg map (MIR_VREG_NIL for void-defining)
 # instr_count: number of instructions in the source pool
+# interner:    session interner, for resolving inline-asm body / name strings
 rec LowerCtx {
     alloc:       *Allocator;
     tgt:         *target.Target;
@@ -708,14 +796,22 @@ rec LowerCtx {
     param_vregs: *u32;
     param_count: u32;
     instr_vregs: *u32;
+    # slot_key_vregs: per-instruction map (len instr_count) from an OP_ALLOCA
+    # instruction id to the slot-key vreg that owns its frame slot, MIR_VREG_NIL
+    # for every non-alloca id. an alloca's result vreg holds its pointer value
+    # and may be register-allocated, while the frame slot is keyed on a separate
+    # slot-key vreg; inline-asm `{name}` references need the slot key to resolve
+    # the local to `[rbp + offset]`.
+    slot_key_vregs: *u32;
     instr_count: u32;
+    interner:    *intern.Interner;
 }
 
 # lowers one IR function into a MirFunction. allocates the vreg table and the
 # per-definition vreg maps, assigns a vreg to every parameter and every
 # non-void instruction result, then translates each block's phis, body, and
 # terminator into MIR instructions.
-fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function) Result[MirFunction, str] {
+fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, interner: *intern.Interner) Result[MirFunction, str] {
     var mf: MirFunction;
     mf.name        = fn.name;
     mf.blocks      = nil;
@@ -766,7 +862,9 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function) Result[
     ctx.param_vregs = nil;
     ctx.param_count = fn.param_count;
     ctx.instr_vregs = nil;
+    ctx.slot_key_vregs = nil;
     ctx.instr_count = fn.instr_len;
+    ctx.interner    = interner;
 
     val setup: Result[bool, str] = ctx_setup(?ctx, tgt, fn);
     if (is_err[bool, str](setup)) {
@@ -834,6 +932,12 @@ fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) Result[bool
         val ri: Result[*u32, str] = allocate[u32](ctx.alloc, ctx.instr_count::usize);
         if (is_err[*u32, str](ri)) { ret err[bool, str](unwrap_err[*u32, str](ri)); }
         ctx.instr_vregs = unwrap_ok[*u32, str](ri);
+
+        val rk: Result[*u32, str] = allocate[u32](ctx.alloc, ctx.instr_count::usize);
+        if (is_err[*u32, str](rk)) { ret err[bool, str](unwrap_err[*u32, str](rk)); }
+        ctx.slot_key_vregs = unwrap_ok[*u32, str](rk);
+        var ki: u32 = 0;
+        for (ki < ctx.instr_count) { ctx.slot_key_vregs[ki] = MIR_VREG_NIL; ki = ki + 1; }
     }
 
     var pi: u32 = 0;
@@ -875,6 +979,10 @@ fun ctx_dnit(ctx: *LowerCtx) {
     if (ctx.instr_vregs != nil && ctx.instr_count > 0) {
         deallocate[u32](ctx.alloc, ctx.instr_vregs, ctx.instr_count::usize);
         ctx.instr_vregs = nil;
+    }
+    if (ctx.slot_key_vregs != nil && ctx.instr_count > 0) {
+        deallocate[u32](ctx.alloc, ctx.slot_key_vregs, ctx.instr_count::usize);
+        ctx.slot_key_vregs = nil;
     }
 }
 
@@ -946,7 +1054,7 @@ fun fp_class_index(tgt: *target.Target) u32 {
 }
 
 # op_width_of: the encoder operand width in bytes for an IR type — its
-# `ir_type.size_of` clamped to the nearest legal x86-64 operand width (1, 2, 4,
+# `ir_type.byte_size` clamped to the nearest legal x86-64 operand width (1, 2, 4,
 # or 8). a scalar (int / float / pointer) maps to its own size; an aggregate or a
 # value wider than a machine word is held and addressed by pointer, so it rides at
 # the word width. a zero-sized or void type (e.g. the void result of a store)
@@ -955,7 +1063,7 @@ fun fp_class_index(tgt: *target.Target) u32 {
 # 1 / 2 / 4 / 8-byte operations at the correct REX.W and prefix, replacing the old
 # always-64-bit default.
 fun op_width_of(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8 {
-    val sz: u32 = ir_type.size_of(ctx.types, ty, ctx.tgt);
+    val sz: u32 = ir_type.byte_size(ctx.types, ty, ctx.tgt);
     if (sz == 1) { ret 1; }
     if (sz == 2) { ret 2; }
     if (sz == 4) { ret 4; }
@@ -1073,7 +1181,7 @@ fun lower_block_phis(ctx: *LowerCtx, fn: *ir.Function, blk: *ir.Block) Result[bo
     var pi: u32 = 0;
     for (pi < blk.pred_count && err_msg == nil) {
         val pred_id: u32 = blk.preds[pi]::u32;
-        val pred_mb: *MirBlock = mir_block_by_id(ctx.f, pred_id);
+        var pred_mb: *MirBlock = mir_block_by_id(ctx.f, pred_id);
         if (pred_mb == nil) {
             err_msg = "mir.lower_ir: phi predecessor block has no MIR block";
             pi = pi + 1;
@@ -1084,12 +1192,13 @@ fun lower_block_phis(ctx: *LowerCtx, fn: *ir.Function, blk: *ir.Block) Result[bo
         # `P -> S` is critical when `P` also has multiple successors (a CBR). Placing
         # this edge's phi copies at the end of `P` would run them on `P`'s other
         # successor path too, which can corrupt a value the sibling edge's copies
-        # need. Resolving this requires splitting the edge into its own block, which
-        # this block model has no machinery for; reject loudly rather than miscompile.
+        # need. Split the edge into a fresh block `B` that branches to `S`, retarget
+        # `P`'s CBR to `B`, and emit this edge's copies into `B` (which ends in an
+        # unconditional branch and so is a safe splice point).
         if (block_ends_in_cbr(pred_mb)) {
-            err_msg = "mir.lower_ir: phi on a critical edge (conditional branch into a merge) is not supported";
-            pi = pi + 1;
-            cnt;
+            val sr: Result[*MirBlock, str] = split_critical_edge(ctx, pred_mb, blk.id::u32);
+            if (is_err[*MirBlock, str](sr)) { err_msg = unwrap_err[*MirBlock, str](sr); pi = pi + 1; cnt; }
+            pred_mb = unwrap_ok[*MirBlock, str](sr);
         }
 
         # collect this edge's copies: for each phi, the incoming value paired with
@@ -1293,6 +1402,122 @@ fun block_ends_in_cbr(mb: *MirBlock) bool {
     ret mb.instrs[mb.instr_count - 1].opcode == MIR_CBR;
 }
 
+# grow_block: ensure the function's block array has room for one more block,
+# growing it on demand. `lower_function` allocates exactly `fn.block_count`
+# blocks, so any critical-edge split needs this to extend the array.
+fun grow_block(ctx: *LowerCtx) Result[bool, str] {
+    val f: *MirFunction = ctx.f;
+    if (f.block_count >= f.block_cap) {
+        var new_cap: u32 = f.block_cap * 2;
+        if (new_cap < f.block_count + 1) { new_cap = f.block_count + 1; }
+        val r: Result[*MirBlock, str] = reallocate[MirBlock](ctx.alloc, f.blocks, f.block_cap::usize, new_cap::usize);
+        if (is_err[*MirBlock, str](r)) { ret err[bool, str](unwrap_err[*MirBlock, str](r)); }
+        f.blocks    = unwrap_ok[*MirBlock, str](r);
+        f.block_cap = new_cap;
+    }
+    ret ok[bool, str](true);
+}
+
+# fresh_block_id: a block id one past the current maximum, guaranteed not to
+# collide with any existing block id.
+fun fresh_block_id(f: *MirFunction) u32 {
+    var max_id: u32 = 0;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        if (f.blocks[bi].id > max_id) { max_id = f.blocks[bi].id; }
+        bi = bi + 1;
+    }
+    ret max_id + 1;
+}
+
+# split_critical_edge: break the critical edge `pred -> succ_id` by inserting a
+# fresh block `B` that unconditionally branches to `succ`. `pred`'s CBR target
+# matching `succ_id` is retargeted to `B`, `succ`'s predecessor entry for `pred`
+# is replaced by `B`, and `B`'s sole predecessor is `pred`. `B` is returned so
+# the caller emits this edge's phi merge copies into it — `B` ends in an
+# unconditional branch, so the splice is safe. Block pointers are re-fetched by
+# id after the (possibly reallocating) growth, since growth invalidates them.
+fun split_critical_edge(ctx: *LowerCtx, pred: *MirBlock, succ_id: u32) Result[*MirBlock, str] {
+    val pred_id: u32 = pred.id;
+    val new_id:  u32 = fresh_block_id(ctx.f);
+
+    val gr: Result[bool, str] = grow_block(ctx);
+    if (is_err[bool, str](gr)) { ret err[*MirBlock, str](unwrap_err[bool, str](gr)); }
+
+    val f: *MirFunction = ctx.f;
+    val b: *MirBlock = ?f.blocks[f.block_count];
+    b.id          = new_id;
+    b.instrs      = nil;
+    b.instr_count = 0;
+    b.instr_cap   = 0;
+    b.preds       = nil;
+    b.pred_count  = 0;
+    b.pred_cap    = 0;
+
+    # B's terminator: an unconditional branch to the merge block.
+    val rb: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 1::usize);
+    if (is_err[*MirOperand, str](rb)) { ret err[*MirBlock, str](unwrap_err[*MirOperand, str](rb)); }
+    val bops: *MirOperand = unwrap_ok[*MirOperand, str](rb);
+    bops[0] = op_block(succ_id);
+    var br: MirInstr;
+    br.opcode        = MIR_BR;
+    br.operands      = bops;
+    br.operand_count = 1;
+    br.width         = WORD_WIDTH;
+    br.src_width     = WORD_WIDTH;
+
+    val ri: Result[*MirInstr, str] = allocate[MirInstr](ctx.alloc, 1::usize);
+    if (is_err[*MirInstr, str](ri)) { deallocate[MirOperand](ctx.alloc, bops, 1::usize); ret err[*MirBlock, str](unwrap_err[*MirInstr, str](ri)); }
+    b.instrs     = unwrap_ok[*MirInstr, str](ri);
+    b.instrs[0]  = br;
+    b.instr_count = 1;
+    b.instr_cap   = 1;
+
+    # B's predecessor is `pred`.
+    val rp: Result[*u32, str] = allocate[u32](ctx.alloc, 1::usize);
+    if (is_err[*u32, str](rp)) { ret err[*MirBlock, str](unwrap_err[*u32, str](rp)); }
+    b.preds      = unwrap_ok[*u32, str](rp);
+    b.preds[0]   = pred_id;
+    b.pred_count = 1;
+    b.pred_cap   = 1;
+
+    f.block_count = f.block_count + 1;
+
+    # retarget pred's CBR edge to succ so it now jumps to B, and replace succ's
+    # predecessor entry for pred with B. both blocks are re-fetched by id since
+    # the growth above may have moved the array.
+    retarget_cbr(mir_block_by_id(f, pred_id), succ_id, new_id);
+    replace_pred(mir_block_by_id(f, succ_id), pred_id, new_id);
+
+    ret ok[*MirBlock, str](?f.blocks[f.block_count - 1]);
+}
+
+# retarget_cbr: rewrite every MIR_OP_BLOCK target operand of `mb`'s terminator
+# that equals `from` to `to`. Used to redirect a conditional branch's edge
+# through a freshly split block.
+fun retarget_cbr(mb: *MirBlock, from: u32, to: u32) {
+    if (mb == nil || mb.instr_count == 0) { ret; }
+    val term: *MirInstr = ?mb.instrs[mb.instr_count - 1];
+    var i: u32 = 0;
+    for (i < term.operand_count) {
+        if (term.operands[i].kind == MIR_OP_BLOCK && term.operands[i].imm::u32 == from) {
+            term.operands[i].imm = to::i64;
+        }
+        i = i + 1;
+    }
+}
+
+# replace_pred: replace the first predecessor entry of `mb` equal to `from` with
+# `to`, so a split block takes over the original predecessor's edge.
+fun replace_pred(mb: *MirBlock, from: u32, to: u32) {
+    if (mb == nil) { ret; }
+    var i: u32 = 0;
+    for (i < mb.pred_count) {
+        if (mb.preds[i] == from) { mb.preds[i] = to; ret; }
+        i = i + 1;
+    }
+}
+
 # grow_instr: ensure `mb` has room for one more instruction, growing the list on
 # demand. Unlike push_instr it does not append; the caller places the instruction
 # (used by the before-terminator splice).
@@ -1344,6 +1569,15 @@ fun lower_instr(ctx: *LowerCtx, fn: *ir.Function, mb: *MirBlock, iid: id.Instruc
     if (inst.kind == instr.OP_GEP) {
         ret lower_gep(ctx, mb, inst, iid);
     }
+    # scalar floating-point arithmetic / comparison shares the IR integer opcodes
+    # (the front end emits OP_ADD / OP_SUB / OP_MUL / OP_DIV_* / OP_CMP_* for both
+    # int and float operands). a float instruction is dispatched to the dedicated
+    # SSE lowering before the integer division / shift / generic paths, which would
+    # emit the integer ALU / IDIV byte forms and silently miscompile an XMM-classed
+    # value.
+    if (is_float_op(ctx, inst)) {
+        ret lower_float_op(ctx, mb, inst, iid);
+    }
     # integer division / remainder needs the dividend / remainder register wiring
     # the active ISA's division form mandates (x86-64 IDIV/DIV reads the dividend
     # in RAX and yields the quotient in RAX / remainder in RDX). the accumulator
@@ -1365,7 +1599,132 @@ fun lower_instr(ctx: *LowerCtx, fn: *ir.Function, mb: *MirBlock, iid: id.Instruc
         ret lower_shift(ctx, mb, inst, iid);
     }
 
+    # an inline-asm block carries its body + `{name}` bindings in `fn.asm_blocks`
+    # keyed by this instruction id; build the MIR_ASM payload (resolving each
+    # `{name}`'s alloca to its slot vreg) rather than dropping it through the
+    # generic path, which keeps no asm field.
+    if (inst.kind == instr.OP_ASM) {
+        ret lower_asm_instr(ctx, mb, iid);
+    }
+
+    # a conditional branch whose condition lowers to a constant immediate (a
+    # comptime-known / folded boolean) cannot drive the encoder's `TEST cond, cond`,
+    # which requires a register. mirror cmach (`emit_cmp_branch` -> `load_operand`):
+    # materialize the immediate into a register first, then branch on it.
+    if (inst.kind == instr.OP_CBR) {
+        ret lower_cbr(ctx, mb, inst, iid);
+    }
+
     ret lower_generic(ctx, mb, inst, iid);
+}
+
+# lower_cbr: lower an IR OP_CBR `[cond, then_block, else_block]` into a
+# `MIR_CBR [cond, then, else]`. the then/else targets ride as MIR_OP_BLOCK
+# operands (per `lower_operand`). the condition is normally a register-resident
+# boolean and lowers to a vreg operand, lowered unchanged. when the condition is
+# a constant — a comptime-known / folded boolean reaching the back end as a
+# VAL_CONST_INT — it lowers to a MIR_OP_IMM, which the encoder's `TEST cond, cond`
+# cannot read. mirror cmach's `emit_cmp_branch`, which routes the condition through
+# `load_operand` (emitting `MOV reg, imm` for an immediate): materialize the
+# immediate into a fresh GP vreg via `MIR_MOV reg <- imm`, then branch on the
+# register so the encoder always sees a register condition.
+fun lower_cbr(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
+    if (inst.operand_count < 3) {
+        ret err[bool, str]("mir.lower_ir: conditional branch missing operands");
+    }
+
+    var cond: MirOperand = lower_operand(ctx, inst, 0);
+    if (cond.kind == MIR_OP_IMM) {
+        val rv: Result[u32, str] = new_vreg(ctx, REG_CLASS_GP);
+        if (is_err[u32, str](rv)) { ret err[bool, str](unwrap_err[u32, str](rv)); }
+        val creg: u32 = unwrap_ok[u32, str](rv);
+        val mv: Result[bool, str] = emit_mov(ctx, mb, op_vreg(creg), cond);
+        if (is_err[bool, str](mv)) { ret mv; }
+        cond = op_vreg(creg);
+    }
+
+    val rop: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 3::usize);
+    if (is_err[*MirOperand, str](rop)) { ret err[bool, str](unwrap_err[*MirOperand, str](rop)); }
+    val ops: *MirOperand = unwrap_ok[*MirOperand, str](rop);
+    ops[0] = cond;
+    ops[1] = lower_operand(ctx, inst, 1);
+    ops[2] = lower_operand(ctx, inst, 2);
+
+    var mi: MirInstr;
+    mi.opcode        = inst.kind::u32;
+    mi.operands      = ops;
+    mi.operand_count = 3;
+    set_generic_widths(ctx, inst, ?mi);
+    ret push_instr(ctx, mb, mi);
+}
+
+# lower_asm_instr: build a MIR_ASM instruction from the IR `IrAsm` payload bound
+# to this OP_ASM instruction id. resolves the interned ISA / body strings to
+# text and maps each `{name}` binding's alloca instruction id to the slot-owning
+# vreg the encoder later turns into `[rbp+off]`. the payload is heap-owned and
+# freed by `dnit_instr`.
+fun lower_asm_instr(ctx: *LowerCtx, mb: *MirBlock, iid: id.InstructionId) Result[bool, str] {
+    var key: id.InstructionId = iid;
+    val pr: Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?ctx.fn.asm_blocks, ?key);
+    if (is_err[*ir.IrAsm, str](pr)) {
+        ret err[bool, str]("mir.lower_ir: OP_ASM instruction has no asm payload");
+    }
+    val src: *ir.IrAsm = unwrap_ok[*ir.IrAsm, str](pr);
+
+    val isa_opt: Option[str] = intern.lookup(ctx.interner, src.isa);
+    if (!is_some[str](isa_opt)) { ret err[bool, str]("mir.lower_ir: inline-asm ISA tag not interned"); }
+    val body_opt: Option[str] = intern.lookup(ctx.interner, src.body);
+    if (!is_some[str](body_opt)) { ret err[bool, str]("mir.lower_ir: inline-asm body not interned"); }
+
+    val rp: Result[*MirAsm, str] = allocate[MirAsm](ctx.alloc, 1::usize);
+    if (is_err[*MirAsm, str](rp)) { ret err[bool, str](unwrap_err[*MirAsm, str](rp)); }
+    val payload: *MirAsm = unwrap_ok[*MirAsm, str](rp);
+    payload.isa        = unwrap[str](isa_opt);
+    payload.body       = unwrap[str](body_opt);
+    payload.binds      = nil;
+    payload.bind_count = 0;
+
+    if (src.bind_count > 0) {
+        val rb: Result[*MirAsmBind, str] = allocate[MirAsmBind](ctx.alloc, src.bind_count::usize);
+        if (is_err[*MirAsmBind, str](rb)) {
+            deallocate[MirAsm](ctx.alloc, payload, 1::usize);
+            ret err[bool, str](unwrap_err[*MirAsmBind, str](rb));
+        }
+        payload.binds = unwrap_ok[*MirAsmBind, str](rb);
+        var k: u32 = 0;
+        for (k < src.bind_count) {
+            # a `{name}` local is the addressable storage behind an alloca; bind
+            # to its slot-key vreg (which owns the frame slot) when the referenced
+            # instruction is an alloca, else to the value's own vreg.
+            var vreg: u32 = slot_key_vreg(ctx, src.binds[k].instr);
+            if (vreg == MIR_VREG_NIL) { vreg = instr_vreg(ctx, src.binds[k].instr); }
+            if (vreg == MIR_VREG_NIL) {
+                deallocate[MirAsmBind](ctx.alloc, payload.binds, src.bind_count::usize);
+                deallocate[MirAsm](ctx.alloc, payload, 1::usize);
+                ret err[bool, str]("mir.lower_ir: inline-asm '{name}' local has no slot vreg");
+            }
+            payload.binds[k].name      = src.binds[k].name;
+            payload.binds[k].slot_vreg = vreg;
+            k = k + 1;
+        }
+        payload.bind_count = src.bind_count;
+    }
+
+    var mi: MirInstr;
+    mi.opcode        = MIR_ASM;
+    mi.operands      = nil;
+    mi.operand_count = 0;
+    mi.width         = 0;
+    mi.src_width     = 0;
+    mi.asm_block     = payload;
+
+    val push: Result[bool, str] = push_instr(ctx, mb, mi);
+    if (is_err[bool, str](push)) {
+        if (payload.binds != nil) { deallocate[MirAsmBind](ctx.alloc, payload.binds, payload.bind_count::usize); }
+        deallocate[MirAsm](ctx.alloc, payload, 1::usize);
+        ret push;
+    }
+    ret ok[bool, str](true);
 }
 
 # lower_shift: lower an integer OP_SHL / OP_SHR_S / OP_SHR_U into a three-address
@@ -1452,14 +1811,9 @@ fun lower_div(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.I
     if (inst.operand_count < 2) {
         ret err[bool, str]("mir.lower_ir: division missing dividend or divisor operand");
     }
-    # floating-point division reaches here through the shared OP_DIV opcode (the
-    # front end emits OP_DIV_U/OP_DIV_S for `/` regardless of operand type); the
-    # integer IDIV / DIV byte sequence would silently miscompile a float, and SSE
-    # division is not yet implemented, so reject it loudly.
-    if (value_is_float(ctx, inst.ty) ||
-        (inst.operand_count >= 1 && value_is_float(ctx, inst.operands[0].ty))) {
-        ret err[bool, str]("mir.lower_ir: floating-point division not yet supported");
-    }
+    # floating-point division never reaches here: `lower_instr` dispatches every
+    # float arithmetic / comparison op to `lower_float_op` (which emits MIR_FDIV)
+    # before this integer-division path.
     val dst: u32 = result_vreg(ctx, iid);
     if (dst == MIR_VREG_NIL) {
         ret err[bool, str]("mir.lower_ir: division defines no result vreg");
@@ -1568,18 +1922,12 @@ fun emit_promote(ctx: *LowerCtx, mb: *MirBlock, dst: MirOperand, src: MirOperand
 # that name block targets become MIR_OP_BLOCK operands.
 fun lower_generic(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
     # scalar floating-point arithmetic / comparison shares the IR integer opcodes
-    # (OP_ADD / OP_SUB / OP_MUL / OP_CMP_* operate on both int and float operands).
-    # the integer ALU / CMP byte forms the encoder materializes from these generic
-    # opcodes would silently miscompile a float operand (it would run an integer ADD
-    # / CMP on the XMM-classed value), so a float arithmetic / comparison op is
-    # rejected loudly here rather than mis-encoded. the float CONVERSIONS
-    # (FP_TRUNC / FP_EXT / FP_TO_SI / SI_TO_FP / ...) have their own opcodes and SSE
-    # encoders and are unaffected; this guard targets only the shared-opcode ALU /
-    # comparison forms. (float scalar arithmetic codegen is not yet implemented.)
-    if (is_unsupported_float_op(ctx, inst)) {
-        ret err[bool, str]("mir.lower_ir: floating-point scalar arithmetic / comparison not yet supported");
-    }
-
+    # (OP_ADD / OP_SUB / OP_MUL / OP_CMP_* operate on both int and float operands),
+    # but a float instruction never reaches here: `lower_instr` dispatches it to
+    # `lower_float_op` (emitting the dedicated MIR_FADD / FSUB / FMUL / FDIV / FCMP
+    # SSE opcodes) before the generic path. the float CONVERSIONS (FP_TRUNC / FP_EXT
+    # / FP_TO_SI / SI_TO_FP / ...) carry their own opcodes and SSE encoders and DO
+    # ride this generic path unchanged.
     val dst: u32 = result_vreg(ctx, iid);
     val has_dst: bool = dst != MIR_VREG_NIL;
     var total: u32 = inst.operand_count;
@@ -1664,24 +2012,96 @@ fun is_int_conversion_kind(k: instr.InstrKind) bool {
     ret k == instr.OP_TRUNC || k == instr.OP_SEXT || k == instr.OP_ZEXT;
 }
 
-# is_unsupported_float_op: true for a scalar floating-point arithmetic / bitwise /
-# comparison instruction that shares an IR integer opcode (OP_ADD / OP_SUB /
-# OP_MUL / OP_NEG / OP_AND / OP_OR / OP_XOR / OP_NOT / OP_CMP_*). these select to
-# the integer ALU / CMP byte forms, which would silently miscompile a float
-# operand, and SSE arithmetic codegen is not yet implemented — so they are rejected
-# loudly. the float CONVERSIONS (FP_TRUNC / FP_EXT / FP_TO_SI / FP_TO_UI /
-# SI_TO_FP / UI_TO_FP) have their own opcodes and SSE encoders and are NOT rejected.
-fun is_unsupported_float_op(ctx: *LowerCtx, inst: *instr.Instruction) bool {
+# is_float_op: true for a scalar floating-point arithmetic (OP_ADD / OP_SUB /
+# OP_MUL / OP_DIV_*) or comparison (OP_CMP_*) instruction that shares an IR integer
+# opcode. these select to SSE forms in `lower_float_op` rather than the integer ALU
+# / IDIV / CMP byte forms, which would miscompile an XMM-classed value. the float
+# CONVERSIONS (FP_TRUNC / FP_EXT / FP_TO_SI / FP_TO_UI / SI_TO_FP / UI_TO_FP) carry
+# their own opcodes and SSE encoders and ride the generic path, so they are NOT
+# claimed here. an op is float when its result or first operand is a float type.
+fun is_float_op(ctx: *LowerCtx, inst: *instr.Instruction) bool {
     val k: instr.InstrKind = inst.kind;
-    var arith: bool = false;
+    var shared: bool = false;
     if (k == instr.OP_ADD || k == instr.OP_SUB || k == instr.OP_MUL ||
-        k == instr.OP_NEG || k == instr.OP_AND || k == instr.OP_OR ||
-        k == instr.OP_XOR || k == instr.OP_NOT) { arith = true; }
-    if (is_compare_kind(k)) { arith = true; }
-    if (!arith) { ret false; }
+        k == instr.OP_DIV_S || k == instr.OP_DIV_U) { shared = true; }
+    if (is_compare_kind(k)) { shared = true; }
+    if (!shared) { ret false; }
     if (value_is_float(ctx, inst.ty)) { ret true; }
     if (inst.operand_count >= 1 && value_is_float(ctx, inst.operands[0].ty)) { ret true; }
     ret false;
+}
+
+# float_op_width: the SSE operation width (4 for f32, 8 for f64) of a float
+# arithmetic / comparison instruction. an arithmetic op takes it from its own float
+# result type; a comparison's result is i8, so it takes the width from the compared
+# float operand (operand 0).
+fun float_op_width(ctx: *LowerCtx, inst: *instr.Instruction) u8 {
+    if (is_compare_kind(inst.kind) && inst.operand_count >= 1) {
+        ret op_width_of(ctx, inst.operands[0].ty);
+    }
+    ret op_width_of(ctx, inst.ty);
+}
+
+# float_cmp_cc: the FCC_* float-comparison condition code realizing an IR compare
+# opcode. the front end emits only the EQ / NE / LT / LE forms (GT / GE are
+# canonicalized to LT / LE with swapped operands), and a float compare is unordered-
+# aware via UNSIGNED SETcc, so signedness is irrelevant: OP_CMP_LT_S and
+# OP_CMP_LT_U both map to FCC_LT.
+fun float_cmp_cc(k: instr.InstrKind) u8 {
+    if (k == instr.OP_CMP_EQ)   { ret FCC_EQ; }
+    if (k == instr.OP_CMP_NE)   { ret FCC_NE; }
+    if (k == instr.OP_CMP_LT_S || k == instr.OP_CMP_LT_U) { ret FCC_LT; }
+    ret FCC_LE;
+}
+
+# lower_float_op: lower a scalar floating-point arithmetic / comparison instruction
+# to its dedicated SSE MIR opcode (MIR_FADD / FSUB / FMUL / FDIV for the four
+# arithmetic ops, MIR_FCMP for a comparison). the opcode survives instruction
+# selection and the encoder materializes the SSE byte sequence (operands loaded
+# into XMM scratch, the SSE op, the result stored back) — mirroring cmach's
+# `emit_float_op` / `emit_float_cmp`. the operation width (4 for f32, 8 for f64)
+# rides on `mi.width` so the encoder selects the SS vs SD form; a MIR_FCMP also
+# carries its FCC_* condition on `mi.src_width`. the layout is `[dst, lhs, rhs]`
+# like the generic three-address ALU / compare forms.
+fun lower_float_op(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
+    if (inst.operand_count < 2) {
+        ret err[bool, str]("mir.lower_ir: float op missing operand");
+    }
+    val dst: u32 = result_vreg(ctx, iid);
+    if (dst == MIR_VREG_NIL) {
+        ret err[bool, str]("mir.lower_ir: float op defines no result vreg");
+    }
+
+    val rop: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 3::usize);
+    if (is_err[*MirOperand, str](rop)) { ret err[bool, str](unwrap_err[*MirOperand, str](rop)); }
+    val ops: *MirOperand = unwrap_ok[*MirOperand, str](rop);
+    ops[0] = op_vreg(dst);
+    ops[1] = lower_value(ctx, inst.operands[0]);
+    ops[2] = lower_value(ctx, inst.operands[1]);
+
+    val w: u8 = float_op_width(ctx, inst);
+
+    var mi: MirInstr;
+    mi.operands      = ops;
+    mi.operand_count = 3;
+    mi.width         = w;
+    mi.src_width     = w;
+
+    val k: instr.InstrKind = inst.kind;
+    if (is_compare_kind(k)) {
+        mi.opcode    = MIR_FCMP;
+        mi.src_width = float_cmp_cc(k);
+    } or (k == instr.OP_ADD) {
+        mi.opcode = MIR_FADD;
+    } or (k == instr.OP_SUB) {
+        mi.opcode = MIR_FSUB;
+    } or (k == instr.OP_MUL) {
+        mi.opcode = MIR_FMUL;
+    } or {
+        mi.opcode = MIR_FDIV;
+    }
+
+    ret push_instr(ctx, mb, mi);
 }
 
 # is_float_kind: true when an instruction's result or first operand is a float, so
@@ -1733,8 +2153,8 @@ fun lower_alloca(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
 
     # the element type is the instruction's own type; size and align the slot from
     # it. the allocated region is `count` contiguous elements.
-    val elem_size: u32  = ir_type.size_of(ctx.types, inst.ty, ctx.tgt);
-    val elem_align: u32 = ir_type.align_of(ctx.types, inst.ty, ctx.tgt);
+    val elem_size: u32  = ir_type.byte_size(ctx.types, inst.ty, ctx.tgt);
+    val elem_align: u32 = ir_type.byte_align(ctx.types, inst.ty, ctx.tgt);
     val total: u64 = elem_size::u64 * count;
 
     val dst: u32 = result_vreg(ctx, iid);
@@ -1750,6 +2170,12 @@ fun lower_alloca(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
 
     val ar: Result[bool, str] = add_alloca_slot(ctx, sk, total, elem_align);
     if (is_err[bool, str](ar)) { ret ar; }
+
+    # record the slot-key vreg under this alloca's instruction id so an
+    # inline-asm `{name}` binding referencing the alloca resolves to its slot.
+    if (ctx.slot_key_vregs != nil && iid::u32 < ctx.instr_count) {
+        ctx.slot_key_vregs[iid::u32] = sk;
+    }
 
     val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
     if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
@@ -1809,11 +2235,23 @@ fun lower_store(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[
     if (value_is_aggregate(ctx, inst.operands[0].ty)) {
         ret lower_store_aggregate(ctx, mb, inst);
     }
+    # the stored scalar value. a global / function symbol lowers to its address as
+    # an rvalue (`op_sym`), and x86-64 cannot store a 64-bit symbol address straight
+    # to memory (the encoder's mem-to-mem split would load the symbol's contents, not
+    # its address) — so a symbol value is LEA-materialized into a register first,
+    # mirroring the aggregate / by-reference / sret paths.
+    var stored: MirOperand = lower_value(ctx, inst.operands[0]);
+    if (stored.kind == MIR_OP_SYM) {
+        var addr: u32 = MIR_VREG_NIL;
+        val ar: Result[bool, str] = addr_to_vreg(ctx, mb, stored, ?addr);
+        if (is_err[bool, str](ar)) { ret ar; }
+        stored = op_vreg(addr);
+    }
     val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
     if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
     val ops: *MirOperand = unwrap_ok[*MirOperand, str](r);
     ops[0] = mem_operand_of(ctx, inst.operands[1]);
-    ops[1] = lower_value(ctx, inst.operands[0]);
+    ops[1] = stored;
     var mi: MirInstr;
     mi.opcode        = MIR_STORE;
     mi.operands      = ops;
@@ -1834,7 +2272,7 @@ fun lower_store(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[
 # chunk. a fresh scratch vreg per chunk keeps each load/store independent for the
 # register allocator. a zero-sized aggregate copies nothing.
 fun lower_store_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bool, str] {
-    val size: u32 = ir_type.size_of(ctx.types, inst.operands[0].ty, ctx.tgt);
+    val size: u32 = ir_type.byte_size(ctx.types, inst.operands[0].ty, ctx.tgt);
     var off: i64 = 0;
     for (off::u32 < size) {
         val remaining: u32 = size - off::u32;
@@ -1913,7 +2351,7 @@ fun agg_pointer_mem(ctx: *LowerCtx, v: value.Value, disp: i64) MirOperand {
 # (selected to LEA), folding the index walk into the effective address. the IR
 # operands are `[base, idx0, idx1, ...]` and the instruction's `aux_ty` is the
 # source pointee type the walk starts from (the base pointer itself is untyped, so
-# element/field sizes come from `aux_ty` via `ir_type.size_of`). the walk follows
+# element/field sizes come from `aux_ty` via `ir_type.byte_size`). the walk follows
 # the standard getelementptr model: index 0 strides over `aux_ty`, and each later
 # index descends one aggregate level (an array element stride, or a constant
 # struct-field offset). constant index contributions fold into the displacement;
@@ -1955,7 +2393,7 @@ fun lower_gep(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.I
         var stride:    u64 = 0;
         var is_struct: bool = false;
         if (is_first) {
-            stride = ir_type.size_of(ctx.types, cur_ty, ctx.tgt)::u64;
+            stride = ir_type.byte_size(ctx.types, cur_ty, ctx.tgt)::u64;
         } or {
             val ct_opt: Option[*ir_type.IrType] = ir_type.get(ctx.types, cur_ty);
             if (!is_some[*ir_type.IrType](ct_opt)) {
@@ -1963,7 +2401,7 @@ fun lower_gep(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.I
             }
             val ct: *ir_type.IrType = unwrap[*ir_type.IrType](ct_opt);
             if (ct.kind == ir_type.IRT_ARRAY) {
-                stride = ir_type.size_of(ctx.types, ct.data.element, ctx.tgt)::u64;
+                stride = ir_type.byte_size(ctx.types, ct.data.element, ctx.tgt)::u64;
                 cur_ty = ct.data.element;
             } or (ct.kind == ir_type.IRT_STRUCT) {
                 is_struct = true;
@@ -2007,7 +2445,7 @@ fun lower_gep(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.I
     }
 
     # form the folded MEM operand from the base, carrying the scaled index.
-    val mem: Result[MirOperand, str] = fold_gep_mem(ctx, base, idx_vreg, idx_scale, disp);
+    val mem: Result[MirOperand, str] = fold_gep_mem(ctx, mb, base, idx_vreg, idx_scale, disp);
     if (is_err[MirOperand, str](mem)) { ret err[bool, str](unwrap_err[MirOperand, str](mem)); }
 
     val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
@@ -2083,10 +2521,11 @@ fun is_sib_scale(s: u64) bool {
 
 # fold_gep_mem: build the final folded MEM operand for a GEP from its base operand,
 # the scaled runtime index (MIR_VREG_NIL when none), and the constant displacement.
-# a value-vreg base carries the index in the SIB position; a symbol / immediate
-# base supports only a constant offset (a runtime index against a non-register base
-# has no register to scale into and is rejected loudly rather than miscompiled).
-fun fold_gep_mem(ctx: *LowerCtx, base: MirOperand, idx_vreg: u32, idx_scale: u8, disp: i64) Result[MirOperand, str] {
+# a value-vreg base carries the index in the SIB position; a symbol base with only a
+# constant offset folds into `sym_off` (a pure `[rip+sym+off]` reference), and a
+# symbol base with a runtime index LEA-materializes the symbol address into a value
+# vreg first (`addr_to_vreg`) so the scaled index has a register base to ride.
+fun fold_gep_mem(ctx: *LowerCtx, mb: *MirBlock, base: MirOperand, idx_vreg: u32, idx_scale: u8, disp: i64) Result[MirOperand, str] {
     var o: MirOperand = base;
     if (base.kind == MIR_OP_MEM) {
         # a value-pointer / physical-register / frame-slot-key base all fold the
@@ -2101,17 +2540,29 @@ fun fold_gep_mem(ctx: *LowerCtx, base: MirOperand, idx_vreg: u32, idx_scale: u8,
         ret ok[MirOperand, str](o);
     }
     if (base.kind == MIR_OP_SYM) {
-        if (idx_vreg != MIR_VREG_NIL) {
-            ret err[MirOperand, str]("mir.lower_ir: gep runtime index against a symbol base unsupported");
+        if (idx_vreg == MIR_VREG_NIL) {
+            o.sym_off = base.sym_off + disp::i32;
+            ret ok[MirOperand, str](o);
         }
-        o.sym_off = base.sym_off + disp::i32;
-        ret ok[MirOperand, str](o);
+        # runtime index against a global: there is no register in a `[rip+sym]`
+        # reference to scale the index into, so LEA the symbol address (carrying
+        # its `sym_off`) into a value vreg and index `[base + idx*scale + disp]`
+        # off that register, the same materialization `addr_to_vreg` performs for
+        # by-reference aggregate placement.
+        var sbase: u32 = MIR_VREG_NIL;
+        val ar: Result[bool, str] = addr_to_vreg(ctx, mb, base, ?sbase);
+        if (is_err[bool, str](ar)) { ret err[MirOperand, str](unwrap_err[bool, str](ar)); }
+        var m: MirOperand = op_mem_value(sbase, disp);
+        m.index         = idx_vreg;
+        m.scale         = idx_scale;
+        m.index_is_preg = false;
+        ret ok[MirOperand, str](m);
     }
     ret err[MirOperand, str]("mir.lower_ir: gep base is neither a memory nor a symbol reference");
 }
 
 # struct_field_offset: byte offset of field `ix` within an IRT_STRUCT, computed by
-# the same aligned-layout walk as `ir_type.size_of`.
+# the same aligned-layout walk as `ir_type.byte_size`.
 fun struct_field_offset(ctx: *LowerCtx, struct_ty: ir_type.IrTypeId, ix: u32) Result[i64, str] {
     val st_opt: Option[*ir_type.IrType] = ir_type.get(ctx.types, struct_ty);
     if (!is_some[*ir_type.IrType](st_opt)) {
@@ -2128,10 +2579,10 @@ fun struct_field_offset(ctx: *LowerCtx, struct_ty: ir_type.IrTypeId, ix: u32) Re
     var i:   u32 = 0;
     for (i <= ix) {
         val fid: ir_type.IrTypeId = st.data.struct_.fields[i];
-        val fa:  u32 = ir_type.align_of(ctx.types, fid, ctx.tgt);
+        val fa:  u32 = ir_type.byte_align(ctx.types, fid, ctx.tgt);
         off = round_up_u32(off, fa);
         if (i == ix) { ret ok[i64, str](off::i64); }
-        off = off + ir_type.size_of(ctx.types, fid, ctx.tgt);
+        off = off + ir_type.byte_size(ctx.types, fid, ctx.tgt);
         i = i + 1;
     }
     ret err[i64, str]("mir.lower_ir: gep struct field offset walk failed");
@@ -2390,7 +2841,7 @@ fun lower_call(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
     # return classification decides whether the call needs an sret pointer in the
     # first GP argument register, which also consumes one GP slot for the args.
     val ret_ty:    ir_type.IrTypeId = inst.ty;
-    val ret_size:  u64 = ir_type.size_of(ctx.types, ret_ty, ctx.tgt)::u64;
+    val ret_size:  u64 = ir_type.byte_size(ctx.types, ret_ty, ctx.tgt)::u64;
     val ret_float: bool = value_is_float(ctx, ret_ty);
     val ret_aggr:  bool = value_is_aggregate(ctx, ret_ty);
     val rslot: abi.ParamSlot = classify_ret(arch, ret_size, 0, ret_float, ret_aggr);
@@ -2436,7 +2887,7 @@ fun lower_call(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
     var idx: i32 = 0;
     for (ai < inst.operand_count) {
         val av:   value.Value = inst.operands[ai];
-        val asz:  u64  = ir_type.size_of(ctx.types, av.ty, ctx.tgt)::u64;
+        val asz:  u64  = ir_type.byte_size(ctx.types, av.ty, ctx.tgt)::u64;
         val afl:  bool = value_is_float(ctx, av.ty);
         val aag:  bool = value_is_aggregate(ctx, av.ty);
         val slot: abi.ParamSlot = classify_arg(arch, idx, asz, 0, afl, aag, gp_used, fp_used);
@@ -2736,7 +3187,7 @@ fun lower_params(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
     var fp_used: i32 = 0;
     val ret_ty:    ir_type.IrTypeId = fn_return_type(ctx);
     if (ret_ty != ir_type.IRT_NIL) {
-        val rsz:  u64  = ir_type.size_of(ctx.types, ret_ty, ctx.tgt)::u64;
+        val rsz:  u64  = ir_type.byte_size(ctx.types, ret_ty, ctx.tgt)::u64;
         val rfl:  bool = value_is_float(ctx, ret_ty);
         val rag:  bool = value_is_aggregate(ctx, ret_ty);
         val classify_ret: sysv.RetPassingFn = ctx.tgt.abi.ret_passing::sysv.RetPassingFn;
@@ -2755,7 +3206,7 @@ fun lower_params(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
     for (pi < ctx.param_count) {
         val pv:   u32 = ctx.param_vregs[pi];
         val pty:  ir_type.IrTypeId = ctx.fn.params[pi].ty;
-        val psz:  u64  = ir_type.size_of(ctx.types, pty, ctx.tgt)::u64;
+        val psz:  u64  = ir_type.byte_size(ctx.types, pty, ctx.tgt)::u64;
         val pfl:  bool = value_is_float(ctx, pty);
         val pag:  bool = value_is_aggregate(ctx, pty);
         val slot: abi.ParamSlot = classify_arg(arch, pi::i32, psz, 0, pfl, pag, gp_used, fp_used);
@@ -2861,7 +3312,7 @@ fun lower_ret(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bo
 
     val arch: u32 = ctx.tgt.arch_id;
     val rv:   value.Value = inst.operands[0];
-    val rsz:  u64  = ir_type.size_of(ctx.types, rv.ty, ctx.tgt)::u64;
+    val rsz:  u64  = ir_type.byte_size(ctx.types, rv.ty, ctx.tgt)::u64;
     val rfl:  bool = value_is_float(ctx, rv.ty);
     val rag:  bool = value_is_aggregate(ctx, rv.ty);
     val classify_ret: sysv.RetPassingFn = ctx.tgt.abi.ret_passing::sysv.RetPassingFn;
@@ -2914,7 +3365,7 @@ fun fn_return_type(ctx: *LowerCtx) ir_type.IrTypeId {
     if (!is_some[*ir_type.IrType](it)) { ret ir_type.IRT_NIL; }
     val t: *ir_type.IrType = unwrap[*ir_type.IrType](it);
     if (t.kind != ir_type.IRT_FN) { ret ir_type.IRT_NIL; }
-    ret t.data.fn.ret;
+    ret t.data.fn.ret_ty;
 }
 
 # add_spill_slot: append a SLOT_SPILL frame slot for a register-passed aggregate
@@ -3008,7 +3459,7 @@ fun alloc_result_storage(ctx: *LowerCtx, mb: *MirBlock, dst: u32, size: u64, ali
 # caller-owned result storage. defaults to the machine word when the type is
 # unavailable so a slot is never sub-word aligned.
 fun ret_align(ctx: *LowerCtx, ty: ir_type.IrTypeId) u32 {
-    val a: u32 = ir_type.align_of(ctx.types, ty, ctx.tgt);
+    val a: u32 = ir_type.byte_align(ctx.types, ty, ctx.tgt);
     if (a == 0) { ret WORD_WIDTH::u32; }
     ret a;
 }
@@ -3074,6 +3525,15 @@ fun instr_vreg(ctx: *LowerCtx, iid: id.InstructionId) u32 {
     if (ctx.instr_vregs == nil)      { ret MIR_VREG_NIL; }
     if (iid::u32 >= ctx.instr_count) { ret MIR_VREG_NIL; }
     ret ctx.instr_vregs[iid::u32];
+}
+
+# returns the slot-key vreg owning the frame slot of the alloca at instruction
+# `iid` (MIR_VREG_NIL when the id is out of range or names a non-alloca).
+fun slot_key_vreg(ctx: *LowerCtx, iid: id.InstructionId) u32 {
+    if (iid == id.INSTR_NIL)         { ret MIR_VREG_NIL; }
+    if (ctx.slot_key_vregs == nil)   { ret MIR_VREG_NIL; }
+    if (iid::u32 >= ctx.instr_count) { ret MIR_VREG_NIL; }
+    ret ctx.slot_key_vregs[iid::u32];
 }
 
 # returns the vreg mapped to a parameter ordinal (MIR_VREG_NIL when out of range).
@@ -3157,6 +3617,12 @@ fun dnit_block(alloc: *Allocator, mb: *MirBlock) {
         val mi: *MirInstr = ?mb.instrs[ii];
         if (mi.operands != nil && mi.operand_count > 0) {
             deallocate[MirOperand](alloc, mi.operands, mi.operand_count::usize);
+        }
+        if (mi.opcode == MIR_ASM && mi.asm_block != nil) {
+            if (mi.asm_block.binds != nil && mi.asm_block.bind_count > 0) {
+                deallocate[MirAsmBind](alloc, mi.asm_block.binds, mi.asm_block.bind_count::usize);
+            }
+            deallocate[MirAsm](alloc, mi.asm_block, 1::usize);
         }
         ii = ii + 1;
     }

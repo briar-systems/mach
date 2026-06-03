@@ -15,10 +15,12 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
+use std.types.char.char;
 use std.types.string.str;
 use std.types.option.Option;
 use std.types.option.none;
 use std.types.option.is_none;
+use std.types.option.is_some;
 use std.types.option.unwrap;
 use std.types.result.Result;
 use std.types.result.ok;
@@ -26,6 +28,10 @@ use std.types.result.err;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
+
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
 
 use src:      mach.lang.source;
 use intern:   mach.lang.intern;
@@ -44,7 +50,7 @@ use builder:  mach.lang.me.ir.builder;
 
 use map: std.collections.map;
 
-use lower: mach.lang.me.lower;
+use lower: mach.lang.me.lower.context;
 use expr:  mach.lang.me.lower.expr;
 
 # lowers one statement, dispatching on its `StmtKind`.
@@ -240,22 +246,22 @@ fun lower_ret(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
 }
 
 fun lower_brk(ctx: *lower.LowerContext) Result[bool, str] {
-    val lf: Option[lower.LoopFrame] = lower.current_loop(ctx);
-    if (is_none[lower.LoopFrame](lf)) { ret err[bool, str]("lower: brk outside a loop"); }
-    ret builder.emit_br(?ctx.builder, unwrap[lower.LoopFrame](lf).exit);
+    val lf: *lower.LoopFrame = lower.current_loop(ctx);
+    if (lf == nil) { ret err[bool, str]("lower: brk outside a loop"); }
+    ret builder.emit_br(?ctx.builder, lf.exit);
 }
 
 fun lower_cnt(ctx: *lower.LowerContext) Result[bool, str] {
-    val lf: Option[lower.LoopFrame] = lower.current_loop(ctx);
-    if (is_none[lower.LoopFrame](lf)) { ret err[bool, str]("lower: cnt outside a loop"); }
-    ret builder.emit_br(?ctx.builder, unwrap[lower.LoopFrame](lf).header);
+    val lf: *lower.LoopFrame = lower.current_loop(ctx);
+    if (lf == nil) { ret err[bool, str]("lower: cnt outside a loop"); }
+    ret builder.emit_br(?ctx.builder, lf.header);
 }
 
 # records a deferred `fin` body on the fin stack. the body is replayed
 # before every reachable terminator that closes the enclosing function
 # scope (currently: at each `ret` and at fall-through function exit).
 fun lower_fin(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
-    ret lower.push_fin(ctx, s.data.fin.body);
+    ret lower.push_fin(ctx, s.data.fin_.body);
 }
 
 # replays every pending fin body in reverse registration order (innermost
@@ -329,6 +335,12 @@ fun lower_decl_stmt(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] 
 # `IrAsm` payload (interned ISA tag + raw body) in `Function.asm`, keyed by
 # the instruction id. operand / clobber inference happens in the back end,
 # so no operands are attached here.
+#
+# each `{name}` reference in the body is resolved against the locals in scope
+# and recorded as a `{name}` -> alloca binding so the back end can substitute
+# the local's frame offset once the frame is laid out. an unknown `{name}` is
+# a hard error: a mis-typed local would otherwise silently encode a bad
+# address.
 fun lower_asm(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
     val txt: str = module_source(ctx);
 
@@ -340,15 +352,114 @@ fun lower_asm(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
     if (is_err[intern.StrId, str](body_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](body_r)); }
     val body_id: intern.StrId = unwrap_ok[intern.StrId, str](body_r);
 
+    var payload: ir.IrAsm;
+    payload.isa        = isa_id;
+    payload.body       = body_id;
+    payload.binds      = nil;
+    payload.bind_count = 0;
+    payload.bind_cap   = 0;
+
+    val br: Result[bool, str] = collect_asm_binds(ctx, body_id, ?payload);
+    if (is_err[bool, str](br)) {
+        if (payload.binds != nil) { deallocate[ir.IrAsmBind](ctx.s.alloc, payload.binds, payload.bind_cap::usize); }
+        ret br;
+    }
+
     val emit_r: Result[ir.InstructionId, str] = builder.emit_asm(?ctx.builder, nil, 0);
-    if (is_err[ir.InstructionId, str](emit_r)) { ret err[bool, str](unwrap_err[ir.InstructionId, str](emit_r)); }
+    if (is_err[ir.InstructionId, str](emit_r)) {
+        if (payload.binds != nil) { deallocate[ir.IrAsmBind](ctx.s.alloc, payload.binds, payload.bind_cap::usize); }
+        ret err[bool, str](unwrap_err[ir.InstructionId, str](emit_r));
+    }
     val asm_iid: ir.InstructionId = unwrap_ok[ir.InstructionId, str](emit_r);
 
-    var payload: ir.IrAsm;
-    payload.isa  = isa_id;
-    payload.body = body_id;
+    val ir2: Result[bool, str] = map.insert[ir.InstructionId, ir.IrAsm](?ctx.builder.fn.asm_blocks, asm_iid, payload);
+    if (is_err[bool, str](ir2)) {
+        if (payload.binds != nil) { deallocate[ir.IrAsmBind](ctx.s.alloc, payload.binds, payload.bind_cap::usize); }
+        ret ir2;
+    }
+    ret ok[bool, str](true);
+}
 
-    ret map.insert[ir.InstructionId, ir.IrAsm](?ctx.builder.fn.asm, asm_iid, payload);
+# scans an inline-asm body for `{name}` references and records each as a
+# `{name}` -> alloca binding in `payload.binds`. a name is interned and resolved
+# against the locals in scope (`lookup_local_name`); a duplicate `{name}` is
+# recorded once. an unknown name, or one bound to a non-alloca Value, is a hard
+# error rather than a silently dropped substitution.
+fun collect_asm_binds(ctx: *lower.LowerContext, body_id: intern.StrId, payload: *ir.IrAsm) Result[bool, str] {
+    val bopt: Option[str] = intern.lookup(?ctx.s.interner, body_id);
+    if (is_none[str](bopt)) { ret err[bool, str]("lower: inline-asm body interning failed"); }
+    val body: str = unwrap[str](bopt);
+
+    var i: usize = 0;
+    for (body[i] != 0) {
+        if (body[i] != '{'::char) { i = i + 1; cnt; }
+
+        # collect the name between '{' and the matching '}'.
+        val name_start: usize = i + 1;
+        var j: usize = name_start;
+        for (body[j] != 0 && body[j] != '}'::char) { j = j + 1; }
+        if (body[j] == 0) { ret err[bool, str]("lower: unterminated '{' in inline asm body"); }
+        val name_len: usize = j - name_start;
+        if (name_len == 0) { ret err[bool, str]("lower: empty '{}' reference in inline asm body"); }
+
+        val nr: Result[intern.StrId, str] = intern.intern_bytes(?ctx.s.interner, (body::usize + name_start)::str, name_len);
+        if (is_err[intern.StrId, str](nr)) { ret err[bool, str](unwrap_err[intern.StrId, str](nr)); }
+        val name_id: intern.StrId = unwrap_ok[intern.StrId, str](nr);
+
+        val ar: Result[bool, str] = add_asm_bind(ctx, payload, name_id);
+        if (is_err[bool, str](ar)) { ret ar; }
+
+        i = j + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# resolves a single `{name}` to its local alloca and appends the binding to
+# `payload.binds` (once per distinct name). the local's storage Value must be a
+# VAL_INSTR naming the alloca whose slot the back end addresses; anything else
+# (an unbound name, a parameter still in a register, a constant) is rejected.
+fun add_asm_bind(ctx: *lower.LowerContext, payload: *ir.IrAsm, name_id: intern.StrId) Result[bool, str] {
+    var k: u32 = 0;
+    for (k < payload.bind_count) {
+        if (payload.binds[k].name == name_id) { ret ok[bool, str](true); }
+        k = k + 1;
+    }
+
+    val vopt: Option[value.Value] = lower.lookup_local_name(ctx, name_id);
+    if (!is_some[value.Value](vopt)) {
+        ret err[bool, str]("lower: unknown local in inline asm '{name}' reference");
+    }
+    val v: value.Value = unwrap[value.Value](vopt);
+    if (v.kind != value.VAL_INSTR) {
+        ret err[bool, str]("lower: inline-asm '{name}' local has no addressable storage slot");
+    }
+
+    if (payload.bind_count == payload.bind_cap) {
+        val new_cap: u32 = grow_bind_cap(payload.bind_cap);
+        var nb: *ir.IrAsmBind = nil;
+        if (payload.binds == nil) {
+            val r: Result[*ir.IrAsmBind, str] = allocate[ir.IrAsmBind](ctx.s.alloc, new_cap::usize);
+            if (is_err[*ir.IrAsmBind, str](r)) { ret err[bool, str](unwrap_err[*ir.IrAsmBind, str](r)); }
+            nb = unwrap_ok[*ir.IrAsmBind, str](r);
+        } or {
+            val r: Result[*ir.IrAsmBind, str] = reallocate[ir.IrAsmBind](ctx.s.alloc, payload.binds, payload.bind_cap::usize, new_cap::usize);
+            if (is_err[*ir.IrAsmBind, str](r)) { ret err[bool, str](unwrap_err[*ir.IrAsmBind, str](r)); }
+            nb = unwrap_ok[*ir.IrAsmBind, str](r);
+        }
+        payload.binds    = nb;
+        payload.bind_cap = new_cap;
+    }
+
+    payload.binds[payload.bind_count].name  = name_id;
+    payload.binds[payload.bind_count].instr = v.data.instr;
+    payload.bind_count = payload.bind_count + 1;
+    ret ok[bool, str](true);
+}
+
+# initial / doubling capacity for an inline-asm body's `{name}` binding array.
+fun grow_bind_cap(cap: u32) u32 {
+    if (cap == 0) { ret 4; }
+    ret cap * 2;
 }
 
 # lowers a statement-scope `$if` chain: evaluates each arm's condition with
@@ -417,10 +528,7 @@ fun decl_symbol_of(ctx: *lower.LowerContext, did: aid.DeclId) resolve.SymbolId {
 fun module_source(ctx: *lower.LowerContext) str {
     val sf: Option[*src.SourceFile] = src.get(?ctx.s.sources, ctx.a.file_id);
     if (is_none[*src.SourceFile](sf)) {
-        var empty: str;
-        empty.len  = 0;
-        empty.data = nil;
-        ret empty;
+        ret nil::str;
     }
     ret unwrap[*src.SourceFile](sf).text;
 }

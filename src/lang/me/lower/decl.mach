@@ -36,9 +36,11 @@ use std.allocator.deallocate;
 use std.allocator.reallocate;
 
 use map: std.collections.map;
+use maphash: std.collections.map;
 
 use intern:   mach.lang.intern;
 use ty:       mach.lang.type;
+use sess:     mach.lang.session;
 
 use src:      mach.lang.source;
 use ast:      mach.lang.fe.ast;
@@ -52,9 +54,10 @@ use ir_type:  mach.lang.me.ir.type;
 use value:    mach.lang.me.ir.value;
 use builder:  mach.lang.me.ir.builder;
 
-use lower: mach.lang.me.lower;
-use stmt:  mach.lang.me.lower.stmt;
-use expr:  mach.lang.me.lower.expr;
+use lower:  mach.lang.me.lower.context;
+use mangle: mach.lang.me.lower.mangle;
+use stmt:   mach.lang.me.lower.stmt;
+use expr:   mach.lang.me.lower.expr;
 
 # lowers one top-level declaration, dispatching on its `DeclKind`.
 # erased forms (rec, uni, def, use, comptime-attr) lower to nothing; a
@@ -102,7 +105,11 @@ pub fun lower_fun(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, is_
     if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
     val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
 
-    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), d.data.fun_.name);
+    val bare_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), d.data.fun_.name);
+    if (is_err[intern.StrId, str](bare_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](bare_r)); }
+    val bare: intern.StrId = unwrap_ok[intern.StrId, str](bare_r);
+
+    val name_r: Result[intern.StrId, str] = mangle.linkage_name(ctx.s, ctx.fqn, bare, fun_export_of(ctx, did));
     if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
     val name: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
 
@@ -144,18 +151,71 @@ pub fun lower_fun(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, is_
     ret close_function(ctx, ret_ir);
 }
 
-# lowers a `test "label" { ... }` decl as a zero-parameter, void-returning
-# function tagged FN_FLAG_TEST so the test runner can iterate it.
-fun lower_test(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl) Result[bool, str] {
-    val void_r: Result[ir_type.IrTypeId, str] = ir_type.intern_void(?ctx.m.types);
-    if (is_err[ir_type.IrTypeId, str](void_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](void_r)); }
-    val void_ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](void_r);
+# lowers one monomorphized generic instance: a concrete body for the template
+# function `did` under the instance linkage `name`. the context must already be
+# bound to the template's origin module (its AST / typing / name-resolution) with
+# the instance's substitution env active, so every `lower_type` resolves the
+# generic params to the concrete arguments. the emitted function is PUB | WEAK —
+# globally visible (so any object's call binds to it) and weak (so the linker
+# collapses the copies every using object emits into one). a body-less template
+# (a generic `ext`/forward decl) is not a valid instance and is skipped.
+# ---
+# ctx:  the context, already bound to the origin module + subst env
+# did:  DeclId of the generic template function in the origin AST
+# d:    the resolved template Decl
+# name: the instance's mangled linkage name
+# ret:  true on success, or an error
+pub fun lower_instance(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, name: intern.StrId) Result[bool, str] {
+    if (d.data.fun_.body == aid.STMT_NIL) { ret ok[bool, str](true); }
 
-    val sig_r: Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?ctx.m.types, void_ty, nil, 0, false);
+    val sig_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, lower.decl_type_of(ctx, did));
     if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
     val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
 
-    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), d.data.test_.label);
+    val ret_ir_r: Result[ir_type.IrTypeId, str] = function_return_ir(ctx, did);
+    if (is_err[ir_type.IrTypeId, str](ret_ir_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](ret_ir_r)); }
+    val ret_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ret_ir_r);
+
+    val flags: u32 = ir.FN_FLAG_PUB | ir.FN_FLAG_WEAK;
+    val idx_r: Result[u32, str] = append_function(ctx, name, sig, flags, d.data.fun_.params_len);
+    if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
+    val fn_index: u32 = unwrap_ok[u32, str](idx_r);
+
+    lower.begin_function(ctx, fn_index, ret_ir);
+    builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
+
+    val entry_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](entry_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](entry_r)); }
+    builder.set_block(?ctx.builder, unwrap_ok[ir.BlockId, str](entry_r));
+
+    val params_r: Result[bool, str] = lower_params(ctx, did, d, fn_index);
+    if (is_err[bool, str](params_r)) { ret params_r; }
+
+    val br: Result[bool, str] = stmt.lower_stmt(ctx, d.data.fun_.body);
+    if (is_err[bool, str](br)) { ret br; }
+
+    ret close_function(ctx, ret_ir);
+}
+
+# lowers a `test "label" { ... }` decl as a zero-parameter, i32-returning
+# function tagged FN_FLAG_TEST so the test runner can iterate it. a test body
+# returns an integer process status (`ret 0` / `ret 1`), so the lowered
+# signature and default terminator are i32 to match those returns and the
+# i32 return type sema checks the body against.
+fun lower_test(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl) Result[bool, str] {
+    val i32_r: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?ctx.m.types, 32);
+    if (is_err[ir_type.IrTypeId, str](i32_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](i32_r)); }
+    val ret_ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](i32_r);
+
+    val sig_r: Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?ctx.m.types, ret_ty, nil, 0, false);
+    if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
+    val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
+
+    val bare_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), d.data.test_.label);
+    if (is_err[intern.StrId, str](bare_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](bare_r)); }
+    val bare: intern.StrId = unwrap_ok[intern.StrId, str](bare_r);
+
+    val name_r: Result[intern.StrId, str] = mangle.linkage_name(ctx.s, ctx.fqn, bare, none[intern.StrId]());
     if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
     val name: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
 
@@ -163,7 +223,7 @@ fun lower_test(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl) Result
     if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
     val fn_index: u32 = unwrap_ok[u32, str](idx_r);
 
-    lower.begin_function(ctx, fn_index, void_ty);
+    lower.begin_function(ctx, fn_index, ret_ty);
     builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
 
     val entry_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
@@ -175,7 +235,7 @@ fun lower_test(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl) Result
         if (is_err[bool, str](br)) { ret br; }
     }
 
-    ret close_function(ctx, void_ty);
+    ret close_function(ctx, ret_ty);
 }
 
 # materialises one VAL_PARAM per parameter, records them on Function.params,
@@ -248,12 +308,26 @@ fun lower_params(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, fn_i
 # the pending fins and emit a default terminator (void / zero return for an
 # ordinary function, unreachable for a noreturn one).
 fun close_function(ctx: *lower.LowerContext, ret_ir: ir_type.IrTypeId) Result[bool, str] {
-    if (block_terminated(ctx)) { ret ok[bool, str](true); }
+    if (!block_terminated(ctx)) {
+        val fr: Result[bool, str] = stmt.run_pending_fins(ctx);
+        if (is_err[bool, str](fr)) { ret fr; }
+    }
+    if (!block_terminated(ctx)) {
+        val dr: Result[bool, str] = emit_default_terminator(ctx, ret_ir);
+        if (is_err[bool, str](dr)) { ret dr; }
+    }
 
-    val fr: Result[bool, str] = stmt.run_pending_fins(ctx);
-    if (is_err[bool, str](fr)) { ret fr; }
-    if (block_terminated(ctx)) { ret ok[bool, str](true); }
+    # any block the control-flow lowering parked without a terminator (e.g. the
+    # exit of an infinite loop reached by no `brk`, or a merge whose every
+    # incoming arm already returned) is unreachable. give it an `unreachable`
+    # terminator so the IR is structurally well-formed; `dce` then drops it.
+    ret terminate_orphan_blocks(ctx);
+}
 
+# emits the function's default fall-through terminator into the current block:
+# `unreachable` for a noreturn function, a void return for a void function,
+# otherwise a zero return of the declared type.
+fun emit_default_terminator(ctx: *lower.LowerContext, ret_ir: ir_type.IrTypeId) Result[bool, str] {
     if ((ctx.m.functions[ctx.fn_index].flags & ir.FN_FLAG_NORETURN) != 0) {
         ret builder.emit_unreachable(?ctx.builder);
     }
@@ -261,6 +335,24 @@ fun close_function(ctx: *lower.LowerContext, ret_ir: ir_type.IrTypeId) Result[bo
         ret builder.emit_ret_void(?ctx.builder);
     }
     ret builder.emit_ret(?ctx.builder, value.const_int(0, ret_ir));
+}
+
+# gives every still-unterminated block in the current function an `unreachable`
+# terminator, restoring the "every block has a terminator" invariant the
+# verifier and back end rely on. such blocks are unreachable by construction.
+fun terminate_orphan_blocks(ctx: *lower.LowerContext) Result[bool, str] {
+    if (ctx.builder.fn == nil) { ret ok[bool, str](true); }
+    val fn: *ir.Function = ctx.builder.fn;
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        if (fn.blocks[bi].terminator == ir.INSTR_NIL) {
+            builder.set_block(?ctx.builder, bi::ir.BlockId);
+            val ur: Result[bool, str] = builder.emit_unreachable(?ctx.builder);
+            if (is_err[bool, str](ur)) { ret ur; }
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
 }
 
 # lowers a module-level `val` / `var` into an IR `Global`. a comptime-
@@ -278,7 +370,11 @@ pub fun lower_global(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, 
     if (is_err[ir_type.IrTypeId, str](gty_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](gty_r)); }
     val gty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](gty_r);
 
-    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), d.data.bind.name);
+    val bare_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, module_source(ctx), d.data.bind.name);
+    if (is_err[intern.StrId, str](bare_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](bare_r)); }
+    val bare: intern.StrId = unwrap_ok[intern.StrId, str](bare_r);
+
+    val name_r: Result[intern.StrId, str] = mangle.linkage_name(ctx.s, ctx.fqn, bare, global_export_of(ctx, did));
     if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
     val name: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
 
@@ -297,11 +393,13 @@ pub fun lower_global(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, 
     }
 
     var g: ir.Global;
-    g.name   = name;
-    g.ty     = gty;
-    g.init   = init_val;
-    g.is_mut = is_mut;
-    g.is_pub = (d.flags & adecl.DECL_FLAG_PUB) != 0;
+    g.name      = name;
+    g.ty        = gty;
+    g.init      = init_val;
+    g.is_mut    = is_mut;
+    g.is_pub    = (d.flags & adecl.DECL_FLAG_PUB) != 0;
+    g.is_extern = false;
+    g.is_local  = false;
 
     val ai: Result[u32, str] = append_global(ctx, g);
     if (is_err[u32, str](ai)) { ret err[bool, str](unwrap_err[u32, str](ai)); }
@@ -369,8 +467,11 @@ fun append_function(ctx: *lower.LowerContext, name: intern.StrId, sig: ir_type.I
     f.blocks      = nil;
     f.block_count = 0;
     f.block_cap   = 0;
+    f.instrs      = nil;
+    f.instr_len   = 0;
+    f.instr_cap   = 0;
     f.flags       = flags;
-    f.asm         = map.init[ir.InstructionId, ir.IrAsm](m.alloc, map.hash_u32, map.eq_u32);
+    f.asm_blocks  = map.init[ir.InstructionId, ir.IrAsm](m.alloc, maphash.hash_u32, maphash.eq_u32);
 
     m.functions[idx] = f;
     m.function_len   = m.function_len + 1;
@@ -402,7 +503,7 @@ fun function_return_ir(ctx: *lower.LowerContext, did: aid.DeclId) Result[ir_type
     if (is_none[*ty.Type](t_opt)) { ret ir_type.intern_void(?ctx.m.types); }
     val t: *ty.Type = unwrap[*ty.Type](t_opt);
     if (t.kind != ty.TYPE_FUN) { ret ir_type.intern_void(?ctx.m.types); }
-    ret lower.lower_type(ctx, t.data.fun.ret);
+    ret lower.lower_type(ctx, t.data.fn.ret_ty);
 }
 
 # finds the SymbolId of a function parameter by its index: the SYM_PARAM
@@ -458,10 +559,27 @@ fun is_void_ir(ctx: *lower.LowerContext, tid: ir_type.IrTypeId) bool {
 fun module_source(ctx: *lower.LowerContext) str {
     val sf: Option[*src.SourceFile] = src.get(?ctx.s.sources, ctx.a.file_id);
     if (is_none[*src.SourceFile](sf)) {
-        var empty: str;
-        empty.len  = 0;
-        empty.data = nil;
-        ret empty;
+        ret nil::str;
     }
     ret unwrap[*src.SourceFile](sf).text;
+}
+
+# fun_export_of: the link-name override that exempts a function declaration from
+# mangling, or none. the exemption is read from the session's `export_names`
+# registry, the single source of truth the driver populates from both exemption
+# sources: a `$<sym>.symbol = "..."` directive's explicit literal name, and an
+# `ext fun` foreign symbol's bare name (registered keyed on `DECL_FLAG_EXT`, NOT
+# on FN_FLAG_EXTERN — a body-less mach signature is still a mangled mach symbol).
+# a definition and every reference consult this same registry, so the mangled /
+# literal choice always agrees.
+fun fun_export_of(ctx: *lower.LowerContext, did: aid.DeclId) Option[intern.StrId] {
+    ret sess.export_name(ctx.s, ctx.own_module, did::u32);
+}
+
+# global_export_of: the link-name override that exempts a global declaration from
+# mangling, or none. a `$<sym>.symbol` directive on the session supplies a
+# literal name (the runtime `_rt_argc/argv/envp` globals referenced by inline
+# asm). globals have no `ext` form, so the directive is the only source.
+fun global_export_of(ctx: *lower.LowerContext, did: aid.DeclId) Option[intern.StrId] {
+    ret sess.export_name(ctx.s, ctx.own_module, did::u32);
 }

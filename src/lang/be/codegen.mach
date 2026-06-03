@@ -14,6 +14,7 @@
 
 use std.types.bool.bool;
 use std.types.bool.true;
+use std.types.bool.false;
 use std.types.string.str;
 use std.types.result.Result;
 use std.types.result.ok;
@@ -27,8 +28,9 @@ use intern: mach.lang.intern;
 use target: mach.lang.target;
 use of:     mach.lang.target.of;
 
-use ir:    mach.lang.me.ir;
-use value: mach.lang.me.ir.value;
+use ir:      mach.lang.me.ir;
+use ir_type: mach.lang.me.ir.type;
+use value:   mach.lang.me.ir.value;
 
 use mir:      mach.lang.be.codegen.mir;
 use isel:     mach.lang.be.codegen.isel;
@@ -86,7 +88,7 @@ pub fun codegen_module(s: *sess.Session, tgt: *target.Target,
     if (tgt == nil)   { ret err[of.ObjectImage, str]("codegen: nil target"); }
     if (irmod == nil) { ret err[of.ObjectImage, str]("codegen: nil ir module"); }
 
-    val rmir: Result[mir.MirModule, str] = mir.lower_ir(tgt, irmod);
+    val rmir: Result[mir.MirModule, str] = mir.lower_ir(tgt, irmod, ?s.interner);
     if (is_err[mir.MirModule, str](rmir)) {
         ret err[of.ObjectImage, str](unwrap_err[mir.MirModule, str](rmir));
     }
@@ -113,7 +115,7 @@ pub fun codegen_module(s: *sess.Session, tgt: *target.Target,
     }
     val enc: encode.EncoderOutput = unwrap_ok[encode.EncoderOutput, str](renc);
 
-    ret pack_image(s, irmod, ?enc);
+    ret pack_image(s, tgt, irmod, ?enc);
 }
 
 # build the object image from the encoder output and the module's globals.
@@ -124,10 +126,11 @@ pub fun codegen_module(s: *sess.Session, tgt: *target.Target,
 # any builder failure the partially built image is torn down before returning.
 # ---
 # s:     shared session; supplies the allocator and interner
+# tgt:   resolved target; supplies type sizes for bss global layout
 # irmod: IR module whose globals are packed alongside the encoded text
 # enc:   encoder output for the module's `.text`
 # ret:   the populated object image, or an error string
-fun pack_image(s: *sess.Session, irmod: *ir.Module,
+fun pack_image(s: *sess.Session, tgt: *target.Target, irmod: *ir.Module,
                enc: *encode.EncoderOutput) Result[of.ObjectImage, str] {
     val rimg: Result[of.ObjectImage, str] = obj.init(s.alloc, irmod.name);
     if (is_err[of.ObjectImage, str](rimg)) {
@@ -154,13 +157,67 @@ fun pack_image(s: *sess.Session, irmod: *ir.Module,
         ret err[of.ObjectImage, str](unwrap_err[bool, str](rrel));
     }
 
-    val rglob: Result[bool, str] = pack_globals(s, ?image, irmod);
+    val rglob: Result[bool, str] = pack_globals(s, tgt, ?image, irmod);
     if (is_err[bool, str](rglob)) {
         obj.dnit(?image);
         ret err[of.ObjectImage, str](unwrap_err[bool, str](rglob));
     }
 
+    val rxr: Result[bool, str] = pack_reloc_externs(?image, enc);
+    if (is_err[bool, str](rxr)) {
+        obj.dnit(?image);
+        ret err[of.ObjectImage, str](unwrap_err[bool, str](rxr));
+    }
+
     ret ok[of.ObjectImage, str](image);
+}
+
+# emit an undefined (external) symbol for every relocation target the module
+# references but has not already declared — a symbol named only from an inline-
+# asm body (e.g. the entry `main`, called from the runtime `_start` asm), which
+# leaves no IR function or global declaration for the earlier symbol passes to
+# catch. without a matching symbol-table entry the object writer would map the
+# relocation to the null symbol (index 0), so the linker would see no target
+# name. a relocation whose target is already a defined or extern symbol is left
+# alone, so a symbol is never declared twice.
+# ---
+# image: object image being built (its symbol table already holds every defined
+#        and IR-declared extern symbol)
+# enc:   encoder output supplying the pending relocations
+# ret:   true on success, or an error string
+fun pack_reloc_externs(image: *of.ObjectImage,
+                       enc: *encode.EncoderOutput) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < enc.reloc_count) {
+        val name: intern.StrId = enc.relocations[i].sym;
+        if (name == intern.STR_NIL) { i = i + 1; cnt; }
+        if (image_has_symbol(image, name)) { i = i + 1; cnt; }
+
+        var xsym: of.Symbol;
+        xsym.name    = name;
+        xsym.section = of.SECTION_EXTERNAL;
+        xsym.offset  = 0;
+        xsym.size    = 0;
+        xsym.flags   = of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
+
+        val rx: Result[u32, str] = obj.add_symbol(image, xsym);
+        if (is_err[u32, str](rx)) {
+            ret err[bool, str](unwrap_err[u32, str](rx));
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# image_has_symbol: true when the image's symbol table already holds a symbol
+# named `name` (defined here or already declared extern).
+fun image_has_symbol(image: *of.ObjectImage, name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        if (image.symbols[i].name == name) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # append the encoded `.text` section to the image.
@@ -188,12 +245,17 @@ fun pack_text(s: *sess.Session, image: *of.ObjectImage,
 
 # register every encoder symbol mark against the `.text` section. each mark is
 # a function entry point (or an exposed inline-asm label) defined at a known
-# text offset. a mark naming a `pub` IR function is given GLOBAL linkage so the
-# whole-program linker can resolve cross-module references to it; module-private
-# functions stay local.
+# text offset. a mark naming a defined IR function is given GLOBAL linkage so the
+# whole-program linker can resolve cross-module references to it (every function
+# symbol name is now globally unique — module-path-mangled, or an exempted
+# literal like `main` / `_start` — so global linkage cannot collide). a mark with
+# no matching IR function (an exposed inline-asm label) stays local. a function
+# carrying `FN_FLAG_WEAK` (a monomorphized generic instance emitted into every
+# using object) is additionally marked WEAK so the linker collapses the
+# duplicates to one definition.
 # ---
 # image:    object image being built
-# irmod:    IR module supplying each function's linkage (pub → global)
+# irmod:    IR module supplying each function's linkage
 # enc:      encoder output supplying the symbol marks
 # text_sec: index of the `.text` section the marks are defined in
 # ret:      true on success, or an error string
@@ -204,8 +266,11 @@ fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
         val mark: *encode.SymbolMark = ?enc.symbols[i];
 
         var flags: u32 = mark.flags | of.SYM_OBJ_FLAG_FUNCTION;
-        if (function_is_pub(irmod, mark.name)) {
+        if (function_defined(irmod, mark.name)) {
             flags = flags | of.SYM_OBJ_FLAG_GLOBAL;
+        }
+        if (function_is_weak(irmod, mark.name)) {
+            flags = flags | of.SYM_OBJ_FLAG_WEAK;
         }
 
         var sym: of.Symbol;
@@ -224,21 +289,39 @@ fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
     ret ok[bool, str](true);
 }
 
-# function_is_pub: true when the IR module defines a function named `name` with
-# `FN_FLAG_PUB` set — an exported function the linker must see as a global
-# symbol. a mark with no matching IR function (an exposed inline-asm label)
-# stays local.
+# function_defined: true when the IR module defines a (non-extern) function named
+# `name` — one with a body emitted into this object. such a mark gets GLOBAL
+# linkage; a mark with no matching defined IR function (an inline-asm label, or a
+# name only referenced through an extern stub) stays local. ALL functions of the
+# name are checked: a forward call lowered before its target appends an extern
+# stub of the same name, so the defined entry may not be the first match — the
+# name is "defined here" when ANY entry of the name carries a body.
 # ---
 # irmod: IR module whose functions are searched
 # name:  the symbol name to match against function names
-# ret:   true when the named function is exported (pub)
-fun function_is_pub(irmod: *ir.Module, name: intern.StrId) bool {
+# ret:   true when some function of that name is defined (has a body)
+fun function_defined(irmod: *ir.Module, name: intern.StrId) bool {
     var i: u32 = 0;
     for (i < irmod.function_len) {
         val fn: *ir.Function = ?irmod.functions[i];
-        if (fn.name == name) {
-            ret (fn.flags & ir.FN_FLAG_PUB) != 0;
-        }
+        if (fn.name == name && (fn.flags & ir.FN_FLAG_EXTERN) == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# function_is_weak: true when the IR module defines a function named `name` with
+# `FN_FLAG_WEAK` set — a monomorphized generic instance emitted into every using
+# object, deduped to one by the linker through weak linkage.
+# ---
+# irmod: IR module whose functions are searched
+# name:  the symbol name to match against function names
+# ret:   true when the named function is a weak (instance) definition
+fun function_is_weak(irmod: *ir.Module, name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < irmod.function_len) {
+        val fn: *ir.Function = ?irmod.functions[i];
+        if (fn.name == name && (fn.flags & ir.FN_FLAG_WEAK) != 0) { ret true; }
         i = i + 1;
     }
     ret false;
@@ -284,11 +367,31 @@ fun pack_relocs(image: *of.ObjectImage, enc: *encode.EncoderOutput,
 # image: object image being built
 # irmod: IR module whose globals are packed
 # ret:   true on success, or an error string
-fun pack_globals(s: *sess.Session, image: *of.ObjectImage,
+fun pack_globals(s: *sess.Session, tgt: *target.Target, image: *of.ObjectImage,
                  irmod: *ir.Module) Result[bool, str] {
     var i: u32 = 0;
     for (i < irmod.global_len) {
         val g: *ir.Global = ?irmod.globals[i];
+
+        # a global `val`/`var` defined in another module is declared here as an
+        # undefined external symbol (no section, no storage) — the data analog of
+        # an extern function. the defining module exports the definition; the
+        # linker binds this object's relocations to it.
+        if (g.is_extern) {
+            var xsym: of.Symbol;
+            xsym.name    = g.name;
+            xsym.section = of.SECTION_EXTERNAL;
+            xsym.offset  = 0;
+            xsym.size    = 0;
+            xsym.flags   = of.SYM_OBJ_FLAG_OBJECT | of.SYM_OBJ_FLAG_EXTERN;
+
+            val rx: Result[u32, str] = obj.add_symbol(image, xsym);
+            if (is_err[u32, str](rx)) {
+                ret err[bool, str](unwrap_err[u32, str](rx));
+            }
+            i = i + 1;
+            cnt;
+        }
 
         var bytes: *u8 = nil;
         var len: u32 = 0;
@@ -314,11 +417,21 @@ fun pack_globals(s: *sess.Session, image: *of.ObjectImage,
             ret err[bool, str](unwrap_err[intern.StrId, str](rname));
         }
 
+        # a section's length is the global's in-memory size. for initialized
+        # data that is the initializer byte count; a zero-initialized bss global
+        # has no initializer bytes, so its size comes from the global's type —
+        # without this the section would reserve zero bytes and every bss global
+        # would collapse onto the section's base address.
+        var sec_len: u32 = len;
+        if (kind == of.SK_BSS) {
+            sec_len = ir_type.byte_size(?irmod.types, g.ty, tgt);
+        }
+
         var sec: of.Section;
         sec.name  = unwrap_ok[intern.StrId, str](rname);
         sec.kind  = kind;
         sec.bytes = bytes;
-        sec.len   = len;
+        sec.len   = sec_len;
         sec.align = 8;
 
         val ridx: Result[u32, str] = obj.add_section(image, sec);
@@ -327,14 +440,19 @@ fun pack_globals(s: *sess.Session, image: *of.ObjectImage,
         }
         val sec_idx: u32 = unwrap_ok[u32, str](ridx);
 
+        # a named user global is given GLOBAL linkage — its name is module-path-
+        # mangled and globally unique, so it resolves cross-object without
+        # collision (mirroring every defined function). only a compiler-
+        # synthesized anonymous data global (`is_local`, a string / byte-blob
+        # literal) stays object-private.
         var flags: u32 = of.SYM_OBJ_FLAG_OBJECT;
-        if (g.is_pub) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
+        if (!g.is_local) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
 
         var sym: of.Symbol;
         sym.name    = g.name;
         sym.section = sec_idx;
         sym.offset  = 0;
-        sym.size    = len;
+        sym.size    = sec_len;
         sym.flags   = flags;
 
         val rsym: Result[u32, str] = obj.add_symbol(image, sym);

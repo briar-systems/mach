@@ -16,14 +16,20 @@ use std.types.bool.true;
 use std.types.bool.false;
 
 use std.types.size.usize;
+use std.types.char.char;
 
 use std.types.string.str;
-use std.types.string.str_dup;
-use std.types.string.str_free;
+use std.types.string.str_len;
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.string.StrView;
+use std.types.string.view;
+use std.types.string.view_eq_str;
 use std.types.string.str_equals;
 
 use std.types.option.Option;
 use std.types.option.is_none;
+use std.types.option.is_some;
 use std.types.option.unwrap;
 
 use std.types.result.Result;
@@ -42,6 +48,7 @@ use std.allocator.reallocate;
 use fs:   std.filesystem;
 use toml: std.data.toml;
 use map:  std.collections.map;
+use maphash: std.collections.map;
 
 use src:    mach.lang.source;
 use diag:   mach.lang.diagnostic;
@@ -113,6 +120,7 @@ pub rec DepEntry {
 # dir_dep:      interned `[project].dir_dep` (default "dep")
 # out:          interned output root directory under `[project]` (default "out")
 # project_root: interned absolute filesystem path of the project root
+# target:       interned `[project].target` default selector (default "native")
 # targets:      flat array of TargetEntry records
 # target_count: number of entries in targets
 # deps:         flat array of DepEntry records
@@ -123,6 +131,7 @@ pub rec ProjectConfig {
     dir_dep:      intern.StrId;
     out:          intern.StrId;
     project_root: intern.StrId;
+    target:       intern.StrId;
     targets:      *TargetEntry;
     target_count: u32;
     deps:         *DepEntry;
@@ -209,6 +218,33 @@ val INITIAL_MODULE_CAP: u32 = 16;
 val INITIAL_PUB_CAP:    u32 = 4;
 val INITIAL_DEP_CAP:    u32 = 4;
 
+# HOST_OS_ID / HOST_ARCH_ID: the os/arch this compiler binary was built
+# for, which is the host it runs on. resolved at comptime from the active
+# build target so a "native"/"host" selector picks the matching
+# [targets.<name>] entry by host os/arch.
+$if ($mach.target.os == $mach.os.linux) {
+    val HOST_OS_ID: u32 = os.OS_LINUX;
+}
+$or ($mach.target.os == $mach.os.darwin) {
+    val HOST_OS_ID: u32 = os.OS_DARWIN;
+}
+$or ($mach.target.os == $mach.os.windows) {
+    val HOST_OS_ID: u32 = os.OS_WINDOWS;
+}
+$or {
+    val HOST_OS_ID: u32 = os.OS_UNKNOWN;
+}
+
+$if ($mach.target.arch == $mach.arch.x86_64) {
+    val HOST_ARCH_ID: u32 = isa.ARCH_X86_64;
+}
+$or ($mach.target.arch == $mach.arch.aarch64) {
+    val HOST_ARCH_ID: u32 = isa.ARCH_AARCH64;
+}
+$or {
+    val HOST_ARCH_ID: u32 = isa.ARCH_UNKNOWN;
+}
+
 # build_project: load `project_root/mach.toml`, select `target_name`, and
 # build the full module graph plus per-module ResolveResults.
 # ---
@@ -251,13 +287,206 @@ pub fun build_project(s: *sess.Session, project_root: str, target_name: str) Res
         ret err[Project, str](unwrap_err[sess.ModuleId, str](load_r));
     }
 
+    # the module table is stable past the load pass; publish every module's
+    # AST to the session registry so later phases can reach cross-module
+    # declarations (imported record fields, generics from transitive deps).
+    val reg_r: Result[bool, str] = register_module_asts(?p);
+    if (is_err[bool, str](reg_r)) {
+        dnit_project(?p);
+        ret err[Project, str](unwrap_err[bool, str](reg_r));
+    }
+
     val resolve_r: Result[bool, str] = run_resolve_pass(?p);
     if (is_err[bool, str](resolve_r)) {
         dnit_project(?p);
         ret err[Project, str](unwrap_err[bool, str](resolve_r));
     }
 
+    # record every `$<sym>.symbol = "..."` link-name override so the back-end
+    # mangler keeps the named entry / runtime symbols literal.
+    val exp_r: Result[bool, str] = register_export_names(?p);
+    if (is_err[bool, str](exp_r)) {
+        dnit_project(?p);
+        ret err[Project, str](unwrap_err[bool, str](exp_r));
+    }
+
     ret ok[Project, str](p);
+}
+
+# register_export_names: scan every module for `$<sym>.symbol = "..."` directives
+# and record each as a literal link-name override keyed by (ModuleId, DeclId) on
+# the session. the directive's `$<sym>` names a sibling top-level declaration by
+# its source identifier; the matched decl keeps the literal string verbatim as
+# its emitted symbol name. this is the sole mechanism keeping the program entry
+# (`main`), the OS entry (`_start`), and the runtime symbols (`_rt_*`) literal so
+# the inline-asm relocations against those exact names resolve at link.
+fun register_export_names(p: *Project) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val r: Result[bool, str] = register_module_export_names(p, i::sess.ModuleId);
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun register_module_export_names(p: *Project, mid: sess.ModuleId) Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val m_opt: Option[*module.Module] = ast.get_module(?m.a, m.a.root_module);
+    if (is_none[*module.Module](m_opt)) { ret ok[bool, str](true); }
+    val mod_node: *module.Module = unwrap[*module.Module](m_opt);
+
+    val src_opt: Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
+    if (is_none[*src.SourceFile](src_opt)) { ret ok[bool, str](true); }
+    val source: str = unwrap[*src.SourceFile](src_opt).text;
+
+    ret scan_export_directives(p, mid, source, mod_node.decls_start, mod_node.decls_len);
+}
+
+# scan_export_directives: walk a decl list (recursing into comptime-if branch
+# bodies, where target-selected runtime directives live) and register each
+# link-name exemption against its decl: a `$<sym>.symbol = "..."` directive's
+# override against the sibling decl it names, and every `ext fun` foreign symbol
+# (`DECL_FLAG_EXT`) under its bare source name. recording both here gives lowering
+# one source of truth, consulted identically at a definition and at every
+# reference so the mangled / literal choice always agrees.
+fun scan_export_directives(p: *Project, mid: sess.ModuleId, source: str, start: u32, len: u32) Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = m.a.decl_ids[start + i];
+        val d_opt: Option[*decl.Decl] = ast.get_decl(?m.a, did);
+        if (is_some[*decl.Decl](d_opt)) {
+            val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+            if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
+                val r: Result[bool, str] = register_one_export_directive(p, mid, source, d, start, len);
+                if (is_err[bool, str](r)) { ret r; }
+            }
+            or (d.kind == decl.DECL_KIND_FUN && (d.flags & decl.DECL_FLAG_EXT) != 0) {
+                val r: Result[bool, str] = register_ext_fun(p, mid, source, d, did);
+                if (is_err[bool, str](r)) { ret r; }
+            }
+            or (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+                val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
+                var bi: u32 = 0;
+                for (bi < ci.branches_len) {
+                    val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+                    val rb: Result[bool, str] = scan_export_directives(p, mid, source, br.body_start, br.body_len);
+                    if (is_err[bool, str](rb)) { ret rb; }
+                    bi = bi + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# register_one_export_directive: register one `$<sym>.symbol = "..."` directive.
+# the target must be a member access `<comptime-ident>.symbol` and the value a
+# string literal; the comptime-ident's bare identifier is matched against a
+# sibling decl in `[start, start+len)`, and the literal string is interned as
+# that decl's link-name override. directives that are not `.symbol` writes, or
+# whose target names no sibling, are ignored.
+fun register_one_export_directive(p: *Project, mid: sess.ModuleId, source: str, d: *decl.Decl, start: u32, len: u32) Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val ca: *decl.DeclComptimeAttr = ?d.data.comptime_attr;
+    if (ca.value == id.EXPR_NIL) { ret ok[bool, str](true); }
+
+    val tgt_opt: Option[*expr.Expr] = ast.get_expr(?m.a, ca.target);
+    if (is_none[*expr.Expr](tgt_opt)) { ret ok[bool, str](true); }
+    val te: *expr.Expr = unwrap[*expr.Expr](tgt_opt);
+    if (te.kind != expr.EXPR_KIND_MEMBER) { ret ok[bool, str](true); }
+
+    # the attribute being written must be `.symbol`.
+    if (!span_eq_str(source, te.data.member.name, "symbol")) { ret ok[bool, str](true); }
+
+    val obj_opt: Option[*expr.Expr] = ast.get_expr(?m.a, te.data.member.object);
+    if (is_none[*expr.Expr](obj_opt)) { ret ok[bool, str](true); }
+    val obj: *expr.Expr = unwrap[*expr.Expr](obj_opt);
+    if (obj.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret ok[bool, str](true); }
+
+    # the comptime-ident's span includes the leading `$`; strip it to recover the
+    # named symbol's source identifier.
+    var ident: token.Span = obj.span;
+    if (ident.len < 1::usize) { ret ok[bool, str](true); }
+    ident.offset = ident.offset + 1::usize;
+    ident.len    = ident.len - 1::usize;
+
+    val val_opt: Option[*expr.Expr] = ast.get_expr(?m.a, ca.value);
+    if (is_none[*expr.Expr](val_opt)) { ret ok[bool, str](true); }
+    val ve: *expr.Expr = unwrap[*expr.Expr](val_opt);
+    if (ve.kind != expr.EXPR_KIND_LIT_STR) { ret ok[bool, str](true); }
+
+    # the string literal's inner content, quotes stripped.
+    var inner: token.Span = ve.span;
+    if (inner.len < 2::usize) { ret ok[bool, str](true); }
+    inner.offset = inner.offset + 1::usize;
+    inner.len    = inner.len - 2::usize;
+
+    # match the named identifier against a sibling top-level decl.
+    val target_did: id.DeclId = find_named_decl(p, mid, source, ident, start, len);
+    if (target_did == id.DECL_NIL) { ret ok[bool, str](true); }
+
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, inner);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+
+    ret sess.register_export_name(p.s, mid, target_did::u32, unwrap_ok[intern.StrId, str](name_r));
+}
+
+# register_ext_fun: record an `ext fun` foreign symbol's literal link name (its
+# bare source identifier) as the decl's export override, so it is never mangled.
+# the linker binds it to the imported C / syscall symbol of that name.
+fun register_ext_fun(p: *Project, mid: sess.ModuleId, source: str, d: *decl.Decl, did: id.DeclId) Result[bool, str] {
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, d.data.fun_.name);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+    ret sess.register_export_name(p.s, mid, did::u32, unwrap_ok[intern.StrId, str](name_r));
+}
+
+# find_named_decl: the DeclId of the fun / val / var declaration in
+# `[start, start+len)` whose source identifier equals `ident`, or DECL_NIL when
+# none matches.
+fun find_named_decl(p: *Project, mid: sess.ModuleId, source: str, ident: token.Span, start: u32, len: u32) id.DeclId {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = m.a.decl_ids[start + i];
+        val d_opt: Option[*decl.Decl] = ast.get_decl(?m.a, did);
+        if (is_some[*decl.Decl](d_opt)) {
+            val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+            var nspan: token.Span;
+            var have: bool = false;
+            if (d.kind == decl.DECL_KIND_FUN) { nspan = d.data.fun_.name; have = true; }
+            or (d.kind == decl.DECL_KIND_VAL) { nspan = d.data.bind.name; have = true; }
+            or (d.kind == decl.DECL_KIND_VAR) { nspan = d.data.bind.name; have = true; }
+            if (have && span_eq_span(source, nspan, ident)) { ret did; }
+        }
+        i = i + 1;
+    }
+    ret id.DECL_NIL;
+}
+
+# span_eq_str: true when the bytes of `span` in `source` equal the bytes of `s`.
+fun span_eq_str(source: str, span: token.Span, s: str) bool {
+    val n: usize = str_len(s);
+    if (span.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (source[span.offset + i] != s[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# span_eq_span: true when two spans of the same source name the same byte sequence.
+fun span_eq_span(source: str, a: token.Span, b: token.Span) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (source[a.offset + i] != source[b.offset + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # dnit_project: release every owned array on the project.
@@ -310,7 +539,7 @@ fun init_project(p: *Project, s: *sess.Session) {
     p.modules       = nil;
     p.module_len    = 0;
     p.module_cap    = 0;
-    p.by_fqn        = map.init[intern.StrId, sess.ModuleId](s.alloc, map.hash_u32, map.eq_u32);
+    p.by_fqn        = map.init[intern.StrId, sess.ModuleId](s.alloc, maphash.hash_u32, maphash.eq_u32);
     p.load_status   = nil;
     p.load_cap      = 0;
     p.topo          = nil;
@@ -346,7 +575,7 @@ fun load_project_config(p: *Project, project_root: str) Result[bool, str] {
     var t: toml.Table = unwrap_ok[toml.Table, str](toml_r);
 
     val id_str: str = toml.get_str(?t, "project.id");
-    if (id_str.len == 0) { ret err[bool, str]("mach.toml is missing [project].id"); }
+    if (str_len(id_str) == 0) { ret err[bool, str]("mach.toml is missing [project].id"); }
     val id_iv: Result[intern.StrId, str] = intern.intern(?p.s.interner, id_str);
     if (is_err[intern.StrId, str](id_iv)) { ret err[bool, str](unwrap_err[intern.StrId, str](id_iv)); }
     p.config.id = unwrap_ok[intern.StrId, str](id_iv);
@@ -362,6 +591,10 @@ fun load_project_config(p: *Project, project_root: str) Result[bool, str] {
     val out_r: Result[intern.StrId, str] = intern_or(?p.s.interner, toml.get_str(?t, "project.out"), "out");
     if (is_err[intern.StrId, str](out_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](out_r)); }
     p.config.out = unwrap_ok[intern.StrId, str](out_r);
+
+    val ptgt_r: Result[intern.StrId, str] = intern_or(?p.s.interner, toml.get_str(?t, "project.target"), "native");
+    if (is_err[intern.StrId, str](ptgt_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](ptgt_r)); }
+    p.config.target = unwrap_ok[intern.StrId, str](ptgt_r);
 
     val targets_r: Result[bool, str] = parse_targets_table(p, ?t);
     if (is_err[bool, str](targets_r)) { ret targets_r; }
@@ -482,7 +715,7 @@ fun resolve_dep(s: *sess.Session, alias: str, project_root: str, dir_dep: str) R
     var t: toml.Table = unwrap_ok[toml.Table, str](tr);
 
     val id_str: str = toml.get_str(?t, "project.id");
-    if (id_str.len == 0) {
+    if (str_len(id_str) == 0) {
         str_free(s.alloc, dep_dir);
         ret err[DepEntry, str]("dep mach.toml is missing [project].id");
     }
@@ -541,17 +774,50 @@ fun parse_toml_file(alloc: *Allocator, path: str) Result[toml.Table, str] {
 
 fun intern_or(i: *intern.Interner, text: str, default: str) Result[intern.StrId, str] {
     var t: str = text;
-    if (t.len == 0) { t = default; }
+    if (str_len(t) == 0) { t = default; }
     ret intern.intern(i, t);
 }
 
+# find_target: resolve a target selector against the config's [targets.*]
+# entries. an empty selector defers to [project].target. the selectors
+# "native" and "host" resolve to the entry whose os/isa match the build
+# host (HOST_OS_ID/HOST_ARCH_ID); any other selector matches an entry by
+# name. returns nil when nothing matches.
 fun find_target(c: *ProjectConfig, name: str, i: *intern.Interner) *TargetEntry {
-    val r: Result[intern.StrId, str] = intern.intern(i, name);
+    var sel: str = name;
+    if (str_len(sel) == 0) {
+        val pt_opt: Option[str] = intern.lookup(i, c.target);
+        if (is_none[str](pt_opt)) { ret nil; }
+        sel = unwrap[str](pt_opt);
+    }
+
+    if (str_equals(sel, "native") || str_equals(sel, "host")) {
+        ret find_host_target(c, i);
+    }
+
+    val r: Result[intern.StrId, str] = intern.intern(i, sel);
     if (is_err[intern.StrId, str](r)) { ret nil; }
     val nm: intern.StrId = unwrap_ok[intern.StrId, str](r);
     var k: u32 = 0;
     for (k < c.target_count) {
         if (c.targets[k].name == nm) { ret ?c.targets[k]; }
+        k = k + 1;
+    }
+    ret nil;
+}
+
+# find_host_target: pick the [targets.<name>] entry whose os/isa map to the
+# build host's os/arch ids. returns nil when no entry matches the host.
+fun find_host_target(c: *ProjectConfig, i: *intern.Interner) *TargetEntry {
+    var k: u32 = 0;
+    for (k < c.target_count) {
+        val os_opt: Option[str] = intern.lookup(i, c.targets[k].os_name);
+        val isa_opt: Option[str] = intern.lookup(i, c.targets[k].isa_name);
+        if (is_some[str](os_opt) && is_some[str](isa_opt)) {
+            val os_id:   u32 = os_id_for(unwrap[str](os_opt));
+            val arch_id: u32 = arch_id_for(unwrap[str](isa_opt));
+            if (os_id == HOST_OS_ID && arch_id == HOST_ARCH_ID) { ret ?c.targets[k]; }
+        }
         k = k + 1;
     }
     ret nil;
@@ -613,15 +879,17 @@ fun entry_module_fqn(p: *Project, t: *TargetEntry) Result[intern.StrId, str] {
     if (is_none[str](id_opt)) { ret err[intern.StrId, str]("project id StrId not interned"); }
     val id_text: str = unwrap[str](id_opt);
 
-    val ep_stripped: str = strip_mach_suffix(ep_text);
+    val ep_stripped: StrView = strip_mach_suffix(ep_text);
 
-    val r_buf: Result[*u8, str] = allocate[u8](p.s.alloc, (id_text.len::usize + 1 + ep_stripped.len::usize));
+    val id_len: usize = str_len(id_text);
+    val total:  usize = id_len + 1 + ep_stripped.len;
+    val r_buf: Result[*u8, str] = allocate[u8](p.s.alloc, total);
     if (is_err[*u8, str](r_buf)) { ret err[intern.StrId, str](unwrap_err[*u8, str](r_buf)); }
     val buf: *u8 = unwrap_ok[*u8, str](r_buf);
 
     var k: usize = 0;
-    var j: u32 = 0;
-    for (j < id_text.len) { buf[k] = id_text.data[j]; k = k + 1; j = j + 1; }
+    var j: usize = 0;
+    for (j < id_len) { buf[k] = id_text[j]; k = k + 1; j = j + 1; }
     buf[k] = '.';
     k = k + 1;
     j = 0;
@@ -633,26 +901,22 @@ fun entry_module_fqn(p: *Project, t: *TargetEntry) Result[intern.StrId, str] {
         j = j + 1;
     }
 
-    var view: str;
-    view.len  = k::u32;
-    view.data = buf;
-    val r: Result[intern.StrId, str] = intern.intern(?p.s.interner, view);
-    deallocate[u8](p.s.alloc, buf, (id_text.len::usize + 1 + ep_stripped.len::usize));
+    val r: Result[intern.StrId, str] = intern.intern_bytes(?p.s.interner, buf::str, k);
+    deallocate[u8](p.s.alloc, buf, total);
     ret r;
 }
 
-fun strip_mach_suffix(s: str) str {
+fun strip_mach_suffix(s: str) StrView {
     val suffix: str = ".mach";
-    if (s.len < suffix.len) { ret s; }
-    var i: u32 = 0;
-    for (i < suffix.len) {
-        if (s.data[s.len - suffix.len + i] != suffix.data[i]) { ret s; }
+    val s_len:   usize = str_len(s);
+    val suf_len: usize = str_len(suffix);
+    if (s_len < suf_len) { ret view(s::*char, s_len); }
+    var i: usize = 0;
+    for (i < suf_len) {
+        if (s[s_len - suf_len + i] != suffix[i]) { ret view(s::*char, s_len); }
         i = i + 1;
     }
-    var out: str;
-    out.len  = s.len - suffix.len;
-    out.data = s.data;
-    ret out;
+    ret view(s::*char, s_len - suf_len);
 }
 
 # fqn_to_file_path: resolve an FQN like "std.types.bool" against the
@@ -663,21 +927,19 @@ fun fqn_to_file_path(p: *Project, fqn: intern.StrId) Result[str, str] {
     if (is_none[str](fqn_opt)) { ret err[str, str]("module FQN StrId not interned"); }
     val fqn_text: str = unwrap[str](fqn_opt);
 
-    var head_end: u32 = 0;
-    for (head_end < fqn_text.len && fqn_text.data[head_end] != '.') {
+    val fqn_len: usize = str_len(fqn_text);
+    var head_end: usize = 0;
+    for (head_end < fqn_len && fqn_text[head_end] != '.') {
         head_end = head_end + 1;
     }
-    var head: str;
-    head.len  = head_end;
-    head.data = fqn_text.data;
+    val head: StrView = view(fqn_text::*char, head_end);
 
-    var tail_start: u32 = head_end;
-    if (tail_start < fqn_text.len && fqn_text.data[tail_start] == '.') {
+    var tail_start: usize = head_end;
+    if (tail_start < fqn_len && fqn_text[tail_start] == '.') {
         tail_start = tail_start + 1;
     }
-    var tail: str;
-    tail.len  = fqn_text.len - tail_start;
-    if (tail.len > 0) { tail.data = ?fqn_text.data[tail_start]; } or { tail.data = nil; }
+    var tail: StrView = view(nil, 0);
+    if (fqn_len - tail_start > 0) { tail = view(?fqn_text[tail_start], fqn_len - tail_start); }
 
     val pid_opt: Option[str] = intern.lookup(?p.s.interner, p.config.id);
     if (is_none[str](pid_opt)) { ret err[str, str]("project id StrId not interned"); }
@@ -687,7 +949,7 @@ fun fqn_to_file_path(p: *Project, fqn: intern.StrId) Result[str, str] {
     if (is_none[str](pr_opt)) { ret err[str, str]("project_root StrId not interned"); }
     val project_root_text: str = unwrap[str](pr_opt);
 
-    if (str_equals(head, proj_id_text)) {
+    if (view_eq_str(head, proj_id_text)) {
         val sd_opt: Option[str] = intern.lookup(?p.s.interner, p.config.dir_src);
         if (is_none[str](sd_opt)) { ret err[str, str]("dir_src StrId not interned"); }
         val src_dir_text: str = unwrap[str](sd_opt);
@@ -702,7 +964,7 @@ fun fqn_to_file_path(p: *Project, fqn: intern.StrId) Result[str, str] {
         if (is_none[str](di_opt)) { ret err[str, str]("dep project_id StrId not interned"); }
         val dep_id_text: str = unwrap[str](di_opt);
 
-        if (str_equals(head, dep_id_text)) {
+        if (view_eq_str(head, dep_id_text)) {
             val dr_opt: Option[str] = intern.lookup(?p.s.interner, dep.vendor_root);
             if (is_none[str](dr_opt)) { ret err[str, str]("dep vendor_root StrId not interned"); }
             val dep_root_text: str = unwrap[str](dr_opt);
@@ -720,18 +982,20 @@ fun fqn_to_file_path(p: *Project, fqn: intern.StrId) Result[str, str] {
 }
 
 # build_module_path: compose "<root>/<src_dir>/<dotted-tail-with-slashes>.mach".
-fun build_module_path(alloc: *Allocator, root: str, src_dir: str, dotted_tail: str) Result[str, str] {
-    val total: usize = root.len::usize + 1 + src_dir.len::usize + 1 + dotted_tail.len::usize + 5;
+fun build_module_path(alloc: *Allocator, root: str, src_dir: str, dotted_tail: StrView) Result[str, str] {
+    val root_len: usize = str_len(root);
+    val src_len:  usize = str_len(src_dir);
+    val total: usize = root_len + 1 + src_len + 1 + dotted_tail.len + 5 + 1;
     val r_buf: Result[*u8, str] = allocate[u8](alloc, total);
     if (is_err[*u8, str](r_buf)) { ret err[str, str](unwrap_err[*u8, str](r_buf)); }
     val buf: *u8 = unwrap_ok[*u8, str](r_buf);
 
     var k: usize = 0;
-    var j: u32 = 0;
-    for (j < root.len) { buf[k] = root.data[j]; k = k + 1; j = j + 1; }
+    var j: usize = 0;
+    for (j < root_len) { buf[k] = root[j]; k = k + 1; j = j + 1; }
     if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
     j = 0;
-    for (j < src_dir.len) { buf[k] = src_dir.data[j]; k = k + 1; j = j + 1; }
+    for (j < src_len) { buf[k] = src_dir[j]; k = k + 1; j = j + 1; }
     buf[k] = '/'; k = k + 1;
     j = 0;
     for (j < dotted_tail.len) {
@@ -747,35 +1011,29 @@ fun build_module_path(alloc: *Allocator, root: str, src_dir: str, dotted_tail: s
     buf[k + 3] = 'c';
     buf[k + 4] = 'h';
     k = k + 5;
+    buf[k] = 0;
 
-    var path_view: str;
-    path_view.len  = k::u32;
-    path_view.data = buf;
-    val r: Result[str, str] = str_dup(alloc, path_view);
-    deallocate[u8](alloc, buf, total);
-    ret r;
+    ret ok[str, str](buf::str);
 }
 
 # join_path: join two path segments with a single '/' separator and return an owned str.
 fun join_path(alloc: *Allocator, a: str, b: str) Result[str, str] {
-    val total: usize = a.len::usize + 1 + b.len::usize;
+    val a_len: usize = str_len(a);
+    val b_len: usize = str_len(b);
+    val total: usize = a_len + 1 + b_len + 1;
     val r_buf: Result[*u8, str] = allocate[u8](alloc, total);
     if (is_err[*u8, str](r_buf)) { ret err[str, str](unwrap_err[*u8, str](r_buf)); }
     val buf: *u8 = unwrap_ok[*u8, str](r_buf);
 
     var k: usize = 0;
-    var j: u32 = 0;
-    for (j < a.len) { buf[k] = a.data[j]; k = k + 1; j = j + 1; }
+    var j: usize = 0;
+    for (j < a_len) { buf[k] = a[j]; k = k + 1; j = j + 1; }
     if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
     j = 0;
-    for (j < b.len) { buf[k] = b.data[j]; k = k + 1; j = j + 1; }
+    for (j < b_len) { buf[k] = b[j]; k = k + 1; j = j + 1; }
+    buf[k] = 0;
 
-    var view: str;
-    view.len  = k::u32;
-    view.data = buf;
-    val r: Result[str, str] = str_dup(alloc, view);
-    deallocate[u8](alloc, buf, total);
-    ret r;
+    ret ok[str, str](buf::str);
 }
 
 fun ensure_load_status_capacity(p: *Project, needed: u32) Result[bool, str] {
@@ -860,6 +1118,9 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) Result[sess.ModuleId, s
     var m: ModuleEntry;
     m.fqn               = fqn;
     m.file_id           = 0;
+    # initialise an empty Ast up front so the entry is always teardown-safe,
+    # even if parsing never runs (parse_module overwrites it with the real one)
+    m.a                 = ast.init(p.s.alloc, 0);
     m.ctx               = comptime.init(p.s.alloc, p.target.os_id, p.target.arch_id, p.target.arch.pointer_width, p.compiler_name, p.compiler_ver);
     m.pub_consts        = nil;
     m.pub_const_count   = 0;
@@ -1005,11 +1266,11 @@ fun walk_use_for_load(p: *Project, mid: sess.ModuleId, du: *decl.DeclUse) Result
     if (is_none[*src.SourceFile](src_opt)) { ret err[bool, str]("module file_id not found in SourceMap"); }
     val source: str = unwrap[*src.SourceFile](src_opt).text;
 
-    val r_path: Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, du.path);
-    if (is_err[intern.StrId, str](r_path)) { ret err[bool, str](unwrap_err[intern.StrId, str](r_path)); }
-    val path_id: intern.StrId = unwrap_ok[intern.StrId, str](r_path);
+    val tgt_r: Result[UseTarget, str] = resolve_use_target(p, source, du.path);
+    if (is_err[UseTarget, str](tgt_r)) { ret err[bool, str](unwrap_err[UseTarget, str](tgt_r)); }
+    val ut: UseTarget = unwrap_ok[UseTarget, str](tgt_r);
 
-    val dep_r: Result[sess.ModuleId, str] = dfs_load(p, path_id);
+    val dep_r: Result[sess.ModuleId, str] = dfs_load(p, ut.module_fqn);
     if (is_err[sess.ModuleId, str](dep_r)) { ret err[bool, str](unwrap_err[sess.ModuleId, str](dep_r)); }
     val dep_mid: sess.ModuleId = unwrap_ok[sess.ModuleId, str](dep_r);
 
@@ -1020,11 +1281,78 @@ fun walk_use_for_load(p: *Project, mid: sess.ModuleId, du: *decl.DeclUse) Result
         ret ok[bool, str](true);
     }
 
-    val leaf_r: Result[intern.StrId, str] = leaf_name(?p.s.interner, source, du.path);
-    if (is_err[intern.StrId, str](leaf_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](leaf_r)); }
+    ret merge_pub_consts(p, mid, dep_mid, ut.leaf);
+}
+
+# UseTarget: the resolution of a `use` path into the module to load plus
+# the leaf name an unaliased import binds.
+# ---
+# module_fqn: FQN of the module file the path resolves to (longest prefix
+#             of the path naming a real `.mach` file)
+# leaf:       the name an unaliased `use` binds — the trailing symbol
+#             segment when the path ends at a symbol, else the module leaf
+pub rec UseTarget {
+    module_fqn: intern.StrId;
+    leaf:       intern.StrId;
+}
+
+# resolve_use_target: split a dotted `use` path into the module it names
+# and the leaf it binds. per use.md a path may end at a module (the whole
+# path is a file) or at a symbol inside a module (the last segments name
+# symbols, not files). the module is the longest dotted prefix whose
+# `fqn_to_file_path` resolves to an existing file; any trailing segment is
+# a symbol, and an unaliased import binds the final path segment as its
+# leaf. resolution always interns the full path first so an exact module
+# file short-circuits before any prefix probing.
+fun resolve_use_target(p: *Project, source: str, path: token.Span) Result[UseTarget, str] {
+    val full_r: Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, path);
+    if (is_err[intern.StrId, str](full_r)) { ret err[UseTarget, str](unwrap_err[intern.StrId, str](full_r)); }
+    val full_id: intern.StrId = unwrap_ok[intern.StrId, str](full_r);
+
+    val leaf_r: Result[intern.StrId, str] = leaf_name(?p.s.interner, source, path);
+    if (is_err[intern.StrId, str](leaf_r)) { ret err[UseTarget, str](unwrap_err[intern.StrId, str](leaf_r)); }
     val leaf: intern.StrId = unwrap_ok[intern.StrId, str](leaf_r);
 
-    ret merge_pub_consts(p, mid, dep_mid, leaf);
+    # the full path is itself a module file: bind it as a module, leaf is its own name.
+    if (fqn_names_file(p, full_id)) {
+        var ut: UseTarget;
+        ut.module_fqn = full_id;
+        ut.leaf       = leaf;
+        ret ok[UseTarget, str](ut);
+    }
+
+    # otherwise trim trailing segments until a prefix names a real file.
+    val end: usize = path.offset + path.len;
+    var seg_end: usize = end;
+    for (seg_end > path.offset) {
+        var dot: usize = seg_end;
+        for (dot > path.offset && source[dot - 1] != '.') { dot = dot - 1; }
+        if (dot == path.offset) { ret err[UseTarget, str]("use path does not name a module"); }
+        var prefix: token.Span;
+        prefix.offset = path.offset;
+        prefix.len    = (dot - 1) - path.offset;
+        val pid_r: Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, prefix);
+        if (is_err[intern.StrId, str](pid_r)) { ret err[UseTarget, str](unwrap_err[intern.StrId, str](pid_r)); }
+        val pid: intern.StrId = unwrap_ok[intern.StrId, str](pid_r);
+        if (fqn_names_file(p, pid)) {
+            var ut: UseTarget;
+            ut.module_fqn = pid;
+            ut.leaf       = leaf;
+            ret ok[UseTarget, str](ut);
+        }
+        seg_end = dot - 1;
+    }
+    ret err[UseTarget, str]("use path does not name a module");
+}
+
+# fqn_names_file: true when an FQN resolves to an existing `.mach` file.
+fun fqn_names_file(p: *Project, fqn: intern.StrId) bool {
+    val path_r: Result[str, str] = fqn_to_file_path(p, fqn);
+    if (is_err[str, str](path_r)) { ret false; }
+    val file_path: str = unwrap_ok[str, str](path_r);
+    val ok_: bool = fs.is_file(file_path);
+    str_free(p.s.alloc, file_path);
+    ret ok_;
 }
 
 # leaf_name: intern the trailing `.`-separated segment of a dotted path
@@ -1040,7 +1368,7 @@ fun leaf_name(i: *intern.Interner, source: str, path: token.Span) Result[intern.
     var k: usize = path.offset;
     val end: usize = path.offset + path.len;
     for (k < end) {
-        if (source.data[k] == '.') { seg_start = k + 1; }
+        if (source[k] == '.') { seg_start = k + 1; }
         k = k + 1;
     }
     var leaf_span: token.Span;
@@ -1112,13 +1440,18 @@ fun register_val_for_load(p: *Project, mid: sess.ModuleId, d: *decl.Decl, _did: 
     }
     val name_id: intern.StrId = unwrap_ok[intern.StrId, str](r_id);
 
+    # a module-level `val` need not be a comptime constant: only those whose
+    # initializer folds are registered into the comptime ctx (so `$if`
+    # predicates and intrinsics can read them). a non-foldable initializer
+    # (e.g. a runtime constant such as `os.OS_LINUX` accessed through an alias)
+    # is DELIBERATELY skipped here — NOT an error. cmach folds module `val`s
+    # lazily and likewise never rejects one at its definition site; a genuine
+    # comptime-context requirement is enforced at the USE site, where
+    # `comptime.mach:702` errors "identifier is not a comptime constant in
+    # scope" if the name was never registered. do not promote this skip to a
+    # hard definition-site error.
     val r_val: Result[comptime.CTValue, str] = comptime.eval(?m.ctx, ?m.a, source, d.data.bind.init, ?p.s.interner);
-    if (is_err[comptime.CTValue, str](r_val)) {
-        val e_opt: Option[*expr.Expr] = ast.get_expr(?m.a, d.data.bind.init);
-        if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("val init ExprId out of range"); }
-        val span: token.Span = unwrap[*expr.Expr](e_opt).span;
-        ret diag.error(?p.s.diags, m.file_id, span, unwrap_err[comptime.CTValue, str](r_val));
-    }
+    if (is_err[comptime.CTValue, str](r_val)) { ret ok[bool, str](true); }
     val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r_val);
 
     val rr: Result[bool, str] = comptime.register(?m.ctx, name_id, v);
@@ -1171,6 +1504,24 @@ fun topo_push(p: *Project, mid: sess.ModuleId) Result[bool, str] {
     }
     p.topo[p.topo_len] = mid;
     p.topo_len = p.topo_len + 1;
+    ret ok[bool, str](true);
+}
+
+# register_module_asts: publish every loaded module's AST and FQN to the
+# session's ModuleId-indexed registries. the modules array is stable past the
+# load pass, so the borrowed pointers remain valid for the rest of the build.
+# the FQN registry lets the back-end mangler name a cross-module symbol against
+# its defining module.
+fun register_module_asts(p: *Project) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *ModuleEntry = ?p.modules[i];
+        val r: Result[bool, str] = sess.register_module_ast(p.s, i, ?m.a);
+        if (is_err[bool, str](r)) { ret r; }
+        val rf: Result[bool, str] = sess.register_module_fqn(p.s, i, m.fqn);
+        if (is_err[bool, str](rf)) { ret rf; }
+        i = i + 1;
+    }
     ret ok[bool, str](true);
 }
 

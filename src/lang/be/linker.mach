@@ -49,6 +49,7 @@ use std.allocator.deallocate;
 use mem: std.memory;
 use fs:  std.filesystem;
 use map: std.collections.map;
+use maphash: std.collections.map;
 
 use sess:   mach.lang.session;
 use intern: mach.lang.intern;
@@ -194,7 +195,7 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     # collect the global symbol table: every defined symbol keyed by name, with
     # its resolved location. duplicate strong definitions are rejected.
     var sym_locs: map.Map[intern.StrId, SymbolLoc] =
-        map.init[intern.StrId, SymbolLoc](alloc, map.hash_u32, map.eq_u32);
+        map.init[intern.StrId, SymbolLoc](alloc, maphash.hash_u32, maphash.eq_u32);
 
     val collect_r: Result[bool, str] =
         collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs, assign_vaddrs);
@@ -313,23 +314,25 @@ fun read_objects(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
             ret err[*of.ObjectImage, str]("link: nil object path");
         }
 
-        # view the null-terminated path as a str for the filesystem layer.
-        var path: str;
-        path.data = obj_paths[i];
-        path.len  = cstr_len(obj_paths[i])::u32;
+        # the path is already a null-terminated *u8; the filesystem layer takes a str.
+        val path: str = obj_paths[i]::str;
 
-        val rb: Result[str, str] = fs.read_all(alloc, path);
-        if (is_err[str, str](rb)) {
+        # object files are binary and embed NUL bytes, so the read must carry the
+        # file's true byte length; recovering it via `str_len` would truncate at
+        # the first NUL (e.g. the ELF header's zero padding) and reject or
+        # mis-parse the object.
+        val rb: Result[fs.Buffer, str] = fs.read_all_sized(alloc, path);
+        if (is_err[fs.Buffer, str](rb)) {
             free_modules_to(alloc, modules, i, obj_count);
-            ret err[*of.ObjectImage, str](read_message(s, path, unwrap_err[str, str](rb)));
+            ret err[*of.ObjectImage, str](read_message(s, path, unwrap_err[fs.Buffer, str](rb)));
         }
-        val buf: str = unwrap_ok[str, str](rb);
+        val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
 
         val pr: Result[bool, str] =
-            tgt.of.parse_object(alloc, buf.data, buf.len::usize, ?modules[i]);
+            tgt.of.parse_object(alloc, buf.data, buf.len, ?modules[i]);
         # the parser copies any bytes it keeps; the file buffer is no longer
-        # needed regardless of success. read_all over-allocates by one nul byte.
-        if (buf.data != nil) { deallocate[u8](alloc, buf.data, (buf.len + 1)::usize); }
+        # needed regardless of success. read_all_sized over-allocates by one nul byte.
+        if (buf.data != nil) { deallocate[u8](alloc, buf.data, buf.len + 1); }
         if (is_err[bool, str](pr)) {
             free_modules_to(alloc, modules, i, obj_count);
             ret err[*of.ObjectImage, str](unwrap_err[bool, str](pr));
@@ -550,9 +553,13 @@ fun finalize_placement_vaddrs(merged: *MergedSection, placements: *Placement, se
     }
 }
 
-# collect_symbols: merge every defined symbol into the global table keyed by
-# name. records the symbol's merged section and final virtual address. rejects a
-# second strong (non-weak) definition of the same name.
+# collect_symbols: merge every defined GLOBAL symbol into the global table keyed
+# by name. records the symbol's merged section and final virtual address. rejects
+# a second strong (non-weak) definition of the same name. LOCAL (object-private)
+# symbols are deliberately skipped: they never enter this cross-object name table,
+# so two modules' identically-named locals (e.g. each module's `.Lc.00000000`
+# anonymous data-global) never collide here. relocations that reference a local
+# resolve against the owning module directly (see patch_relocations).
 fun collect_symbols(s: *sess.Session, modules: *of.ObjectImage, module_count: u32,
                     placements: *Placement, sec_base: *u32,
                     sym_locs: *map.Map[intern.StrId, SymbolLoc], have_vaddrs: bool) Result[bool, str] {
@@ -563,6 +570,7 @@ fun collect_symbols(s: *sess.Session, modules: *of.ObjectImage, module_count: u3
             val sym: *of.Symbol = ?modules[m].symbols[sy];
             if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
             if (sym.section >= modules[m].section_count) { sy = sy + 1; cnt; }
+            if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { sy = sy + 1; cnt; }
 
             val flat: u32 = sec_base[m] + sym.section;
             val pl: *Placement = ?placements[flat];
@@ -705,6 +713,12 @@ fun build_merged_image(s: *sess.Session, out_img: *of.ObjectImage,
 # virtual address and write the patched value into the merged section bytes.
 # absolute kinds store `sym + addend`; pc-relative kinds store
 # `sym + addend - patch_addr`. an undefined target symbol is an error.
+#
+# a relocation in module `m` references its target symbol by name, but a LOCAL
+# (object-private) target is resolved against module `m`'s own definition — never
+# the cross-object `sym_locs` table, which holds only globals — so identically
+# named locals in different modules resolve to the correct same-object symbol.
+# GLOBAL targets (and undefined externs) resolve by name through `sym_locs`.
 fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
                      modules: *of.ObjectImage, module_count: u32,
                      placements: *Placement, sec_base: *u32,
@@ -719,14 +733,23 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
             val r: *of.Relocation = ?modules[m].relocations[ri];
             if (r.section >= modules[m].section_count) { ri = ri + 1; cnt; }
 
-            # locate the target symbol's final virtual address.
-            val sl: Result[*SymbolLoc, str] =
-                map.get[intern.StrId, SymbolLoc](sym_locs, ?r.symbol);
-            if (is_err[*SymbolLoc, str](sl)) {
-                ret err[bool, str](undef_message(s, r.symbol));
+            # locate the target symbol's final virtual address. a LOCAL target is
+            # private to module `m`; resolve it against `m`'s own definition.
+            # GLOBAL targets (and undefined externs) resolve by name via sym_locs.
+            var sym_va: u64 = 0;
+            val lv: Result[u64, str] =
+                local_symbol_vaddr(modules, module_count, m, r.symbol, placements, sec_base);
+            if (is_ok[u64, str](lv)) {
+                sym_va = unwrap_ok[u64, str](lv);
             }
-            val loc: *SymbolLoc = unwrap_ok[*SymbolLoc, str](sl);
-            val sym_va: u64 = loc.vaddr;
+            or {
+                val sl: Result[*SymbolLoc, str] =
+                    map.get[intern.StrId, SymbolLoc](sym_locs, ?r.symbol);
+                if (is_err[*SymbolLoc, str](sl)) {
+                    ret err[bool, str](undef_message(s, r.symbol));
+                }
+                sym_va = unwrap_ok[*SymbolLoc, str](sl).vaddr;
+            }
 
             # compute the patch site's virtual address and its byte location in
             # the merged image. the placement's merged_index is a section *kind*;
@@ -751,6 +774,40 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
         m = m + 1;
     }
     ret ok[bool, str](true);
+}
+
+# local_symbol_vaddr: resolve a relocation target that names a LOCAL (object-
+# private) symbol of module `m` to its final virtual address.
+#
+# scans module `m`'s symbols for a defined (non-external) symbol named `name`
+# that is LOCAL (no GLOBAL flag) and computes its final virtual address the same
+# way collect_symbols rebases a definition: the vaddr of the placement of the
+# symbol's section plus the symbol's offset. returns err when module `m` has no
+# such local symbol, so the caller resolves the name through the cross-object
+# global table instead. mirrors how a real linker keeps locals per-object.
+# ---
+# modules:      parsed input images
+# module_count: number of images
+# m:            index of the module owning the relocation
+# name:         interned name of the referenced symbol
+# placements:   per-input-section placements (carry final vaddrs)
+# sec_base:     per-module base into the flat placement array
+# ret:          the local symbol's final virtual address, or err if none
+fun local_symbol_vaddr(modules: *of.ObjectImage, module_count: u32, m: u32,
+                       name: intern.StrId, placements: *Placement, sec_base: *u32) Result[u64, str] {
+    if (m >= module_count) { ret err[u64, str]("no local"); }
+    var sy: u32 = 0;
+    for (sy < modules[m].symbol_count) {
+        val sym: *of.Symbol = ?modules[m].symbols[sy];
+        if (sym.name != name) { sy = sy + 1; cnt; }
+        if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
+        if (sym.section >= modules[m].section_count) { sy = sy + 1; cnt; }
+        if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { sy = sy + 1; cnt; }
+
+        val flat: u32 = sec_base[m] + sym.section;
+        ret ok[u64, str](placements[flat].vaddr + sym.offset::u64);
+    }
+    ret err[u64, str]("no local");
 }
 
 # apply_one: write a single resolved relocation into the merged bytes. `abs64`
@@ -1011,11 +1068,7 @@ fun join2(s: *sess.Session, a: str, b: str, prefix: str) str {
     copy_bytes(buf, la, b, lb);
     buf[total] = 0;
 
-    var built: str;
-    built.len  = total::u32;
-    built.data = buf;
-
-    val ir: Result[intern.StrId, str] = intern.intern(?s.interner, built);
+    val ir: Result[intern.StrId, str] = intern.intern(?s.interner, buf::str);
     deallocate[u8](s.alloc, buf, total + 1);
     if (is_err[intern.StrId, str](ir)) { ret prefix; }
 
@@ -1041,11 +1094,7 @@ fun join3(s: *sess.Session, a: str, b: str, c: str, prefix: str) str {
     copy_bytes(buf, la + lb, c, lc);
     buf[total] = 0;
 
-    var built: str;
-    built.len  = total::u32;
-    built.data = buf;
-
-    val ir: Result[intern.StrId, str] = intern.intern(?s.interner, built);
+    val ir: Result[intern.StrId, str] = intern.intern(?s.interner, buf::str);
     deallocate[u8](s.alloc, buf, total + 1);
     if (is_err[intern.StrId, str](ir)) { ret prefix; }
 
@@ -1056,10 +1105,10 @@ fun join3(s: *sess.Session, a: str, b: str, c: str, prefix: str) str {
 
 # copy_bytes: copy `len` bytes from a str's data into `dst` starting at `at`.
 fun copy_bytes(dst: *u8, at: usize, src: str, len: usize) {
-    if (len == 0 || src.data == nil) { ret; }
+    if (len == 0 || src == nil) { ret; }
     var i: usize = 0;
     for (i < len) {
-        dst[at + i] = src.data[i];
+        dst[at + i] = src[i];
         i = i + 1;
     }
 }

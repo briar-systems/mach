@@ -20,24 +20,29 @@ use std.types.option.Option;
 use std.types.option.some;
 use std.types.option.none;
 use std.types.option.is_none;
+use std.types.option.is_some;
 use std.types.option.unwrap;
 use std.types.string.str;
+use std.types.size.usize;
 use std.types.result.Result;
 use std.types.result.ok;
+use std.types.result.is_ok;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 
 use std.allocator.allocate;
 use std.allocator.deallocate;
 
-use ty:    mach.lang.type;
-use sess:  mach.lang.session;
-use diag:  mach.lang.diagnostic;
-use token: mach.lang.fe.token;
-use ast:   mach.lang.fe.ast;
-use id:    mach.lang.fe.ast.id;
-use decl:  mach.lang.fe.ast.decl;
-use sema:  mach.lang.fe.sema;
+use ty:     mach.lang.type;
+use sess:   mach.lang.session;
+use diag:   mach.lang.diagnostic;
+use intern: mach.lang.intern;
+use src:    mach.lang.source;
+use token:  mach.lang.fe.token;
+use ast:    mach.lang.fe.ast;
+use id:     mach.lang.fe.ast.id;
+use decl:   mach.lang.fe.ast.decl;
+use sema:   mach.lang.fe.sema.context;
 
 # instantiates a generic declaration with concrete type arguments,
 # producing an interned `TYPE_INSTANCE`. when the generic is declared in
@@ -61,25 +66,15 @@ pub fun instantiate(
     generic_origin: sess.ModuleId,
     args:           *ty.TypeId,
     arg_count:      u32,
-    span:           token.Span,
+    span:           token.Span
 ) Result[ty.TypeId, str] {
     if (generic_decl == id.DECL_NIL) {
         report(sc, span, "not a generic: declaration is not generic");
         ret ok[ty.TypeId, str](ty.TYPE_ERROR);
     }
 
-    # arity check against the declaration when it lives in this module.
-    if (generic_origin == sc.own_module) {
-        val want_opt: Option[u32] = local_generic_count(sc, generic_decl);
-        if (is_none[u32](want_opt)) {
-            report(sc, span, "not a generic: declaration takes no type parameters");
-            ret ok[ty.TypeId, str](ty.TYPE_ERROR);
-        }
-        val want: u32 = unwrap[u32](want_opt);
-        if (arg_count != want) {
-            report(sc, span, "generic arg count: wrong number of type arguments");
-            ret ok[ty.TypeId, str](ty.TYPE_ERROR);
-        }
+    if (!check_arity(sc, generic_decl, generic_origin, arg_count, span)) {
+        ret ok[ty.TypeId, str](ty.TYPE_ERROR);
     }
 
     var i: u32 = 0;
@@ -94,6 +89,206 @@ pub fun instantiate(
     ret ty.intern_instance(?sc.s.types, generic_origin, generic_decl, args, arg_count);
 }
 
+# ensures a field table exists for TypeId `tid`, materializing one on demand
+# for a generic instance. a `TYPE_INSTANCE` carries no fields of its own: this
+# resolves the generic nominal it specializes (whose field table, built with
+# `TYPE_GENERIC_PARAM` placeholders by the declaring module, holds the
+# unsubstituted layout) and registers a fresh table for the instance with
+# every field type substituted by the instance's concrete arguments. nominal
+# and primitive types already have (or need) no synthesized table, so they
+# return immediately. idempotent once the table exists.
+# ---
+# s:   the shared session (type universe, AST registry, sources)
+# tid: the TypeId whose field layout must be available
+pub fun ensure_fields(s: *sess.Session, tid: ty.TypeId) {
+    if (is_some[*ty.FieldTable](ty.field_table_for(?s.types, tid))) { ret; }
+
+    val t_opt: Option[*ty.Type] = ty.get(?s.types, tid);
+    if (is_none[*ty.Type](t_opt)) { ret; }
+    val t: *ty.Type = unwrap[*ty.Type](t_opt);
+    if (t.kind != ty.TYPE_INSTANCE) { ret; }
+
+    val origin: sess.ModuleId = t.data.instance.target_origin;
+    val gdecl:  id.DeclId     = t.data.instance.target_decl;
+
+    val gnom: ty.TypeId = generic_nominal_of(s, origin, gdecl);
+    if (gnom == ty.TYPE_ERROR) { ret; }
+
+    build_instance_table(s, tid, gnom);
+}
+
+# resolves the generic nominal TypeId that instance `(origin, gdecl)`
+# specializes, so its unsubstituted field table can be read. the nominal's
+# display name and rec/uni kind are recovered from the declaration in its
+# origin module's AST (reached through the session registry), then re-interned
+# — `intern_nominal` is keyed by `(origin, decl)`, so this returns exactly the
+# id the declaring module tabled its fields against. returns TYPE_ERROR when
+# the origin AST or declaration is unavailable.
+fun generic_nominal_of(s: *sess.Session, origin: sess.ModuleId, gdecl: id.DeclId) ty.TypeId {
+    val ga: *ast.Ast = sess.module_ast(s, origin);
+    if (ga == nil) { ret ty.TYPE_ERROR; }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(ga, gdecl);
+    if (is_none[*decl.Decl](d_opt)) { ret ty.TYPE_ERROR; }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    var gname: intern.StrId = intern.STR_NIL;
+    var gkind: ty.TypeKind  = ty.TYPE_REC;
+    if (d.kind == decl.DECL_KIND_REC) {
+        gname = intern_name_in(s, ga, d.data.rec_.name);
+        gkind = ty.TYPE_REC;
+    } or (d.kind == decl.DECL_KIND_UNI) {
+        gname = intern_name_in(s, ga, d.data.uni_.name);
+        gkind = ty.TYPE_UNI;
+    } or {
+        ret ty.TYPE_ERROR;
+    }
+
+    val gnom_r: Result[ty.TypeId, str] = ty.intern_nominal(?s.types, gname, origin, gdecl, gkind);
+    if (is_err[ty.TypeId, str](gnom_r)) { ret ty.TYPE_ERROR; }
+    ret unwrap_ok[ty.TypeId, str](gnom_r);
+}
+
+# builds and registers `instance`'s field table by substituting each field of
+# the generic nominal `gnom`'s table with `instance`'s concrete arguments.
+# this is the shared core behind both a top-level generic instance and a
+# nested anonymous aggregate (a `uni {ok: T}` inside `Result[T,E]`), both of
+# which intern to a TYPE_INSTANCE over the generic nominal. nested substituted
+# aggregates are materialized recursively via `substitute`. a no-op when `gnom`
+# has no table or `instance` already has one.
+fun build_instance_table(s: *sess.Session, instance: ty.TypeId, gnom: ty.TypeId) {
+    if (is_some[*ty.FieldTable](ty.field_table_for(?s.types, instance))) { ret; }
+
+    val gtbl_opt: Option[*ty.FieldTable] = ty.field_table_for(?s.types, gnom);
+    if (is_none[*ty.FieldTable](gtbl_opt)) { ret; }
+    val flen: u32 = unwrap[*ty.FieldTable](gtbl_opt).fields_len;
+
+    val i_opt: Option[*ty.Type] = ty.get(?s.types, instance);
+    if (is_none[*ty.Type](i_opt)) { ret; }
+    val it: *ty.Type = unwrap[*ty.Type](i_opt);
+    if (it.kind != ty.TYPE_INSTANCE) { ret; }
+    val astart: u32 = it.data.instance.args_start;
+    val alen:   u32 = it.data.instance.args_len;
+
+    # copy the instance args out of the param pool; substitution may append to
+    # it and invalidate a borrowed read.
+    var args: *ty.TypeId = nil;
+    if (alen > 0) {
+        val ba: Result[*ty.TypeId, str] = allocate[ty.TypeId](s.alloc, alen::usize);
+        if (is_err[*ty.TypeId, str](ba)) { ret; }
+        args = unwrap_ok[*ty.TypeId, str](ba);
+        var ai: u32 = 0;
+        for (ai < alen) {
+            val a_opt: Option[ty.TypeId] = ty.get_param(?s.types, astart + ai);
+            if (is_none[ty.TypeId](a_opt)) {
+                deallocate[ty.TypeId](s.alloc, args, alen::usize);
+                ret;
+            }
+            args[ai] = unwrap[ty.TypeId](a_opt);
+            ai = ai + 1;
+        }
+    }
+
+    if (flen == 0) {
+        ty.field_table_begin(?s.types, instance);
+        if (alen > 0) { deallocate[ty.TypeId](s.alloc, args, alen::usize); }
+        ret;
+    }
+
+    # substitute every field type into a side buffer FIRST. a substituted
+    # field may itself be a nested aggregate whose own table is built here
+    # (recursively); the global field pool requires each table's fields to be
+    # pushed contiguously, so all nested tables must be finished before this
+    # table's own fields are appended.
+    val fb: Result[*ty.TypeId, str] = allocate[ty.TypeId](s.alloc, flen::usize);
+    if (is_err[*ty.TypeId, str](fb)) {
+        if (alen > 0) { deallocate[ty.TypeId](s.alloc, args, alen::usize); }
+        ret;
+    }
+    val ftys: *ty.TypeId = unwrap_ok[*ty.TypeId, str](fb);
+    val nb: Result[*intern.StrId, str] = allocate[intern.StrId](s.alloc, flen::usize);
+    if (is_err[*intern.StrId, str](nb)) {
+        deallocate[ty.TypeId](s.alloc, ftys, flen::usize);
+        if (alen > 0) { deallocate[ty.TypeId](s.alloc, args, alen::usize); }
+        ret;
+    }
+    val fnames: *intern.StrId = unwrap_ok[*intern.StrId, str](nb);
+
+    var i: u32 = 0;
+    for (i < flen) {
+        val fe_opt: Option[*ty.FieldEntry] = ty.field_at(?s.types, gnom, i);
+        if (is_none[*ty.FieldEntry](fe_opt)) {
+            fnames[i] = intern.STR_NIL;
+            ftys[i]   = ty.TYPE_ERROR;
+        } or {
+            fnames[i] = unwrap[*ty.FieldEntry](fe_opt).name;
+            ftys[i]   = substitute(s, unwrap[*ty.FieldEntry](fe_opt).ty, args, alen);
+        }
+        i = i + 1;
+    }
+
+    # all nested tables are now complete; this table's fields can be appended
+    # contiguously.
+    val tbl_r: Result[u32, str] = ty.field_table_begin(?s.types, instance);
+    if (is_ok[u32, str](tbl_r)) {
+        val tbl: u32 = unwrap_ok[u32, str](tbl_r);
+        var j: u32 = 0;
+        for (j < flen) {
+            ty.field_table_push(?s.types, tbl, fnames[j], ftys[j]);
+            j = j + 1;
+        }
+    }
+
+    deallocate[intern.StrId](s.alloc, fnames, flen::usize);
+    deallocate[ty.TypeId](s.alloc, ftys, flen::usize);
+    if (alen > 0) { deallocate[ty.TypeId](s.alloc, args, alen::usize); }
+}
+
+# interns the identifier text of a name `span` taken from module `ga`'s
+# source. the generic nominal must be re-interned under exactly the name its
+# declaring module used, so the text is read from that module's source (via
+# the session source map keyed by `ga.file_id`), not the current module's.
+fun intern_name_in(s: *sess.Session, ga: *ast.Ast, span: token.Span) intern.StrId {
+    val so: Option[*src.SourceFile] = src.get(?s.sources, ga.file_id);
+    if (is_none[*src.SourceFile](so)) { ret intern.STR_NIL; }
+    val text: str = unwrap[*src.SourceFile](so).text;
+    val r: Result[intern.StrId, str] = intern.intern_span(?s.interner, text, span);
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+# validates the supplied argument count against a generic declaration's
+# parameter count. only declarations in this module are checked: a generic
+# declared in a dependency was already validated at its declaration site, so
+# its supplied `arg_count` is accepted. a non-generic declaration, or a count
+# mismatch, is reported and returns false; a valid arity returns true.
+# ---
+# sc:             the active sema context
+# generic_decl:   DeclId of the generic declaration
+# generic_origin: ModuleId that declared the generic
+# arg_count:      number of arguments supplied at the use site
+# span:           source range for diagnostics
+# ret:            true when the arity is acceptable, false otherwise
+pub fun check_arity(
+    sc:             *sema.SemaContext,
+    generic_decl:   id.DeclId,
+    generic_origin: sess.ModuleId,
+    arg_count:      u32,
+    span:           token.Span
+) bool {
+    if (generic_origin != sc.own_module) { ret true; }
+    val want_opt: Option[u32] = local_generic_count(sc, generic_decl);
+    if (is_none[u32](want_opt)) {
+        report(sc, span, "not a generic: declaration takes no type parameters");
+        ret false;
+    }
+    val want: u32 = unwrap[u32](want_opt);
+    if (arg_count != want) {
+        report(sc, span, "generic arg count: wrong number of type arguments");
+        ret false;
+    }
+    ret true;
+}
+
 # rewrites a generic body type by substituting each generic parameter with
 # the matching argument. `TYPE_GENERIC_PARAM` entries are replaced by index
 # (a param whose ordinal is out of range is left as the error type);
@@ -102,15 +297,15 @@ pub fun instantiate(
 # pass through unchanged. an allocation failure during structural rebuild
 # degrades to `TYPE_ERROR` rather than aborting the whole module.
 # ---
-# sc:        the active sema context
+# s:         the shared session (type universe, allocator)
 # body_type: the generic type to specialize (a field type, signature, etc.)
 # args:      pointer to the concrete argument types, indexed by param ordinal
 # arg_count: number of arguments (= the declaration's generic-param count)
 # ret:       the specialized TypeId, or TYPE_ERROR on an allocation failure
-pub fun substitute(sc: *sema.SemaContext, body_type: ty.TypeId, args: *ty.TypeId, arg_count: u32) ty.TypeId {
+pub fun substitute(s: *sess.Session, body_type: ty.TypeId, args: *ty.TypeId, arg_count: u32) ty.TypeId {
     if (body_type == ty.TYPE_NIL || body_type == ty.TYPE_ERROR) { ret body_type; }
 
-    val t_opt: Option[*ty.Type] = ty.get(?sc.s.types, body_type);
+    val t_opt: Option[*ty.Type] = ty.get(?s.types, body_type);
     if (is_none[*ty.Type](t_opt)) { ret body_type; }
     val t: *ty.Type = unwrap[*ty.Type](t_opt);
 
@@ -121,74 +316,147 @@ pub fun substitute(sc: *sema.SemaContext, body_type: ty.TypeId, args: *ty.TypeId
     }
 
     if (t.kind == ty.TYPE_POINTER) {
-        val base: ty.TypeId = substitute(sc, t.data.pointer.base, args, arg_count);
+        val base: ty.TypeId = substitute(s, t.data.pointer.base, args, arg_count);
         if (base == t.data.pointer.base) { ret body_type; }
-        val r: Result[ty.TypeId, str] = ty.intern_pointer(?sc.s.types, base);
+        val r: Result[ty.TypeId, str] = ty.intern_pointer(?s.types, base);
         ret unwrap_or_error(r);
     }
 
     if (t.kind == ty.TYPE_ARRAY) {
         val count: u32 = t.data.array.count;
-        val base: ty.TypeId = substitute(sc, t.data.array.base, args, arg_count);
+        val base: ty.TypeId = substitute(s, t.data.array.base, args, arg_count);
         if (base == t.data.array.base) { ret body_type; }
-        val r: Result[ty.TypeId, str] = ty.intern_array(?sc.s.types, base, count);
+        val r: Result[ty.TypeId, str] = ty.intern_array(?s.types, base, count);
         ret unwrap_or_error(r);
     }
 
     if (t.kind == ty.TYPE_FUN) {
-        ret substitute_fun(sc, t, args, arg_count, body_type);
+        ret substitute_fun(s, t, args, arg_count, body_type);
     }
 
     if (t.kind == ty.TYPE_INSTANCE) {
-        ret substitute_instance(sc, t, args, arg_count, body_type);
+        ret substitute_instance(s, t, args, arg_count, body_type);
     }
 
-    # primitives, raw ptr, nominal rec/uni: nothing to substitute
+    # a nominal rec/uni whose field layout mentions a generic parameter is a
+    # nested aggregate inside the generic body (e.g. the anonymous `uni {ok: T}`
+    # in `Result[T,E]`); it must be specialized too. it interns to a
+    # TYPE_INSTANCE over the nominal's own (origin, decl) carrying the current
+    # arguments, whose substituted field table is built eagerly. a nominal with
+    # no generic-parameter field is fully concrete and passes through.
+    if (t.kind == ty.TYPE_REC || t.kind == ty.TYPE_UNI) {
+        if (!nominal_has_gparam(s, body_type)) { ret body_type; }
+        ret substitute_aggregate(s, t, args, arg_count, body_type);
+    }
+
+    # primitives, raw ptr: nothing to substitute
     ret body_type;
+}
+
+# specializes a nested nominal aggregate that mentions generic parameters.
+# interns a TYPE_INSTANCE over the aggregate's own (origin, decl) with the
+# active argument sequence and eagerly materializes its substituted field
+# table from the original nominal's table. the generic-param ordinals in the
+# aggregate's fields are the enclosing declaration's, so the same `args` apply.
+fun substitute_aggregate(s: *sess.Session, t: *ty.Type, args: *ty.TypeId, arg_count: u32, original: ty.TypeId) ty.TypeId {
+    val origin: sess.ModuleId = t.data.nominal.origin;
+    val decl:   id.DeclId     = t.data.nominal.decl;
+
+    val r: Result[ty.TypeId, str] = ty.intern_instance(?s.types, origin, decl, args, arg_count);
+    if (is_err[ty.TypeId, str](r)) { ret ty.TYPE_ERROR; }
+    val inst: ty.TypeId = unwrap_ok[ty.TypeId, str](r);
+
+    build_instance_table(s, inst, original);
+    ret inst;
+}
+
+# reports whether the field table registered for nominal TypeId `tid`
+# contains any `TYPE_GENERIC_PARAM` (directly, or nested under a pointer,
+# array, or instance). such a nominal is part of an unspecialized generic
+# body and must be substituted per instance; a fully concrete one need not be.
+fun nominal_has_gparam(s: *sess.Session, tid: ty.TypeId) bool {
+    val ft_opt: Option[*ty.FieldTable] = ty.field_table_for(?s.types, tid);
+    if (is_none[*ty.FieldTable](ft_opt)) { ret false; }
+    val flen: u32 = unwrap[*ty.FieldTable](ft_opt).fields_len;
+    var i: u32 = 0;
+    for (i < flen) {
+        val fe_opt: Option[*ty.FieldEntry] = ty.field_at(?s.types, tid, i);
+        if (is_some[*ty.FieldEntry](fe_opt)) {
+            if (mentions_gparam(s, unwrap[*ty.FieldEntry](fe_opt).ty)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# reports whether `tid` is, or structurally contains, a generic parameter.
+# descends pointers, arrays, and instance arguments; a nested nominal is
+# checked through its own field table. bounded by the finite type graph.
+fun mentions_gparam(s: *sess.Session, tid: ty.TypeId) bool {
+    if (tid == ty.TYPE_NIL || tid == ty.TYPE_ERROR) { ret false; }
+    val t_opt: Option[*ty.Type] = ty.get(?s.types, tid);
+    if (is_none[*ty.Type](t_opt)) { ret false; }
+    val t: *ty.Type = unwrap[*ty.Type](t_opt);
+    if (t.kind == ty.TYPE_GENERIC_PARAM) { ret true; }
+    if (t.kind == ty.TYPE_POINTER)       { ret mentions_gparam(s, t.data.pointer.base); }
+    if (t.kind == ty.TYPE_ARRAY)         { ret mentions_gparam(s, t.data.array.base); }
+    if (t.kind == ty.TYPE_INSTANCE) {
+        val astart: u32 = t.data.instance.args_start;
+        val alen:   u32 = t.data.instance.args_len;
+        var i: u32 = 0;
+        for (i < alen) {
+            val a_opt: Option[ty.TypeId] = ty.get_param(?s.types, astart + i);
+            if (is_some[ty.TypeId](a_opt)) {
+                if (mentions_gparam(s, unwrap[ty.TypeId](a_opt))) { ret true; }
+            }
+            i = i + 1;
+        }
+    }
+    ret false;
 }
 
 # rebuilds a function type with each parameter and the return type
 # substituted. reads the parameter sequence out of the interner's param
 # pool into a fresh buffer before re-interning, since substitution may grow
 # the pool and invalidate the original `*Type` pointer.
-fun substitute_fun(sc: *sema.SemaContext, t: *ty.Type, args: *ty.TypeId, arg_count: u32, original: ty.TypeId) ty.TypeId {
-    val ret_ty_in: ty.TypeId   = t.data.fun.ret;
-    val pstart:    u32         = t.data.fun.params_start;
-    val plen:      u32         = t.data.fun.params_len;
-    val variadic:  bool        = t.data.fun.variadic;
+fun substitute_fun(s: *sess.Session, t: *ty.Type, args: *ty.TypeId, arg_count: u32, original: ty.TypeId) ty.TypeId {
+    val ret_ty_in: ty.TypeId   = t.data.fn.ret_ty;
+    val pstart:    u32         = t.data.fn.params_start;
+    val plen:      u32         = t.data.fn.params_len;
+    val variadic:  bool        = t.data.fn.variadic;
 
     var changed: bool = false;
     var buf: *ty.TypeId = nil;
     if (plen > 0) {
-        val ba: Result[*ty.TypeId, str] = allocate[ty.TypeId](sc.s.alloc, plen::usize);
+        val ba: Result[*ty.TypeId, str] = allocate[ty.TypeId](s.alloc, plen::usize);
         if (is_err[*ty.TypeId, str](ba)) { ret ty.TYPE_ERROR; }
         buf = unwrap_ok[*ty.TypeId, str](ba);
 
         var i: u32 = 0;
         for (i < plen) {
-            val p_opt: Option[ty.TypeId] = ty.get_param(?sc.s.types, pstart + i);
+            val p_opt: Option[ty.TypeId] = ty.get_param(?s.types, pstart + i);
             if (is_none[ty.TypeId](p_opt)) {
-                deallocate[ty.TypeId](sc.s.alloc, buf, plen::usize);
+                deallocate[ty.TypeId](s.alloc, buf, plen::usize);
                 ret ty.TYPE_ERROR;
             }
             val orig_p: ty.TypeId = unwrap[ty.TypeId](p_opt);
-            buf[i] = substitute(sc, orig_p, args, arg_count);
+            buf[i] = substitute(s, orig_p, args, arg_count);
             if (buf[i] != orig_p) { changed = true; }
             i = i + 1;
         }
     }
 
-    val ret_ty: ty.TypeId = substitute(sc, ret_ty_in, args, arg_count);
+    val ret_ty: ty.TypeId = substitute(s, ret_ty_in, args, arg_count);
     if (ret_ty != ret_ty_in) { changed = true; }
 
     if (!changed) {
-        if (plen > 0) { deallocate[ty.TypeId](sc.s.alloc, buf, plen::usize); }
+        if (plen > 0) { deallocate[ty.TypeId](s.alloc, buf, plen::usize); }
         ret original;
     }
 
-    val r: Result[ty.TypeId, str] = ty.intern_function(?sc.s.types, ret_ty, buf, plen, variadic);
+    val r: Result[ty.TypeId, str] = ty.intern_function(?s.types, ret_ty, buf, plen, variadic);
     if (plen > 0) {
-        deallocate[ty.TypeId](sc.s.alloc, buf, plen::usize);
+        deallocate[ty.TypeId](s.alloc, buf, plen::usize);
     }
     ret unwrap_or_error(r);
 }
@@ -196,7 +464,7 @@ fun substitute_fun(sc: *sema.SemaContext, t: *ty.Type, args: *ty.TypeId, arg_cou
 # rebuilds a generic instance with each argument substituted. like
 # substitute_fun, copies the argument sequence out of the param pool first
 # so a pool growth during substitution cannot invalidate the read.
-fun substitute_instance(sc: *sema.SemaContext, t: *ty.Type, args: *ty.TypeId, arg_count: u32, original: ty.TypeId) ty.TypeId {
+fun substitute_instance(s: *sess.Session, t: *ty.Type, args: *ty.TypeId, arg_count: u32, original: ty.TypeId) ty.TypeId {
     val origin:  sess.ModuleId = t.data.instance.target_origin;
     val decl:    id.DeclId     = t.data.instance.target_decl;
     val astart:  u32           = t.data.instance.args_start;
@@ -204,31 +472,31 @@ fun substitute_instance(sc: *sema.SemaContext, t: *ty.Type, args: *ty.TypeId, ar
 
     if (alen == 0) { ret original; }
 
-    val ba: Result[*ty.TypeId, str] = allocate[ty.TypeId](sc.s.alloc, alen::usize);
+    val ba: Result[*ty.TypeId, str] = allocate[ty.TypeId](s.alloc, alen::usize);
     if (is_err[*ty.TypeId, str](ba)) { ret ty.TYPE_ERROR; }
     val buf: *ty.TypeId = unwrap_ok[*ty.TypeId, str](ba);
 
     var changed: bool = false;
     var i: u32 = 0;
     for (i < alen) {
-        val a_opt: Option[ty.TypeId] = ty.get_param(?sc.s.types, astart + i);
+        val a_opt: Option[ty.TypeId] = ty.get_param(?s.types, astart + i);
         if (is_none[ty.TypeId](a_opt)) {
-            deallocate[ty.TypeId](sc.s.alloc, buf, alen::usize);
+            deallocate[ty.TypeId](s.alloc, buf, alen::usize);
             ret ty.TYPE_ERROR;
         }
         val orig_arg: ty.TypeId = unwrap[ty.TypeId](a_opt);
-        buf[i] = substitute(sc, orig_arg, args, arg_count);
+        buf[i] = substitute(s, orig_arg, args, arg_count);
         if (buf[i] != orig_arg) { changed = true; }
         i = i + 1;
     }
 
     if (!changed) {
-        deallocate[ty.TypeId](sc.s.alloc, buf, alen::usize);
+        deallocate[ty.TypeId](s.alloc, buf, alen::usize);
         ret original;
     }
 
-    val r: Result[ty.TypeId, str] = ty.intern_instance(?sc.s.types, origin, decl, buf, alen);
-    deallocate[ty.TypeId](sc.s.alloc, buf, alen::usize);
+    val r: Result[ty.TypeId, str] = ty.intern_instance(?s.types, origin, decl, buf, alen);
+    deallocate[ty.TypeId](s.alloc, buf, alen::usize);
     ret unwrap_or_error(r);
 }
 

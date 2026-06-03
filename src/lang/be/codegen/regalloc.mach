@@ -135,6 +135,10 @@ rec LiveRange {
 # active:        active-range vreg ids during the scan
 # active_count:  number of active ranges
 # pinned_end:    per-GP-register reservation end position (param-reg lifetimes)
+# reload_scratch: the ISA's reload-scratch GP register ids, reserved from value
+#                 allocation and drawn from for spill reloads (borrowed pointer
+#                 into the ISA vtable; nil when the ISA wires no pool)
+# reload_scratch_count: number of reload-scratch registers
 rec AllocCtx {
     alloc:         *Allocator;
     f:             *mir.MirFunction;
@@ -151,6 +155,8 @@ rec AllocCtx {
     active:        *u32;
     active_count:  u32;
     pinned_end:    *i64;
+    reload_scratch:       *isa.Register;
+    reload_scratch_count: i32;
 }
 
 # run: allocate physical registers for every function in a MIR module.
@@ -296,6 +302,8 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.active       = nil;
     ctx.active_count = 0;
     ctx.pinned_end   = nil;
+    ctx.reload_scratch       = tgt.arch.reload_scratch_regs;
+    ctx.reload_scratch_count = tgt.arch.reload_scratch_count;
 
     val ro: Result[*u32, str] = allocate[u32](m.alloc, f.block_count::usize);
     if (is_err[*u32, str](ro)) { ret err[bool, str](unwrap_err[*u32, str](ro)); }
@@ -444,12 +452,14 @@ fun seed_callee_saved(tgt: *target.Target, ctx: *AllocCtx) {
     }
 }
 
-# seed_reserved: mark every register the ISA reports as never-allocatable (the
-# stack and frame pointers) off-limits to allocation. reads the list from
-# `tgt.arch.reserved_regs` rather than naming RSP/RBP directly, so a new ISA needs
-# no edit here. registers outside the GP bank are ignored.
+# seed_reserved: mark every register the ISA holds off-limits to value allocation:
+# the never-allocatable stack and frame pointers (`tgt.arch.reserved_regs`), the
+# spill-reload scratch pool (`tgt.arch.reload_scratch_regs`, drawn from by
+# `reload_temp`), and the encoder's mem-mem split scratch (`tgt.arch.scratch_reg`).
+# every register is read from the ISA vtable rather than named directly, so a new
+# ISA needs no edit here. registers outside the GP bank are ignored.
 # ---
-# tgt: the active target; supplies the ISA reserved-register list
+# tgt: the active target; supplies the ISA reserved-register lists
 # ctx: the allocation context whose `reserved` flags are set
 fun seed_reserved(tgt: *target.Target, ctx: *AllocCtx) {
     var i: i32 = 0;
@@ -457,6 +467,12 @@ fun seed_reserved(tgt: *target.Target, ctx: *AllocCtx) {
         reserve_reg(ctx, tgt.arch.reserved_regs[i].id);
         i = i + 1;
     }
+    var j: i32 = 0;
+    for (j < tgt.arch.reload_scratch_count && j < MAX_REG_FILE) {
+        reserve_reg(ctx, tgt.arch.reload_scratch_regs[j].id);
+        j = j + 1;
+    }
+    reserve_reg(ctx, tgt.arch.scratch_reg);
 }
 
 # function_has_divide: true when any instruction is an integer division /
@@ -1538,6 +1554,23 @@ fun is_spilled(ctx: *AllocCtx, v: u32) bool {
     ret ctx.f.vregs[v].spill_slot >= 0;
 }
 
+# is_float_op_mir: true for a surviving scalar float arithmetic / comparison op
+# (MIR_FADD / FSUB / FMUL / FDIV / FCMP). the encoder expands these through a fixed
+# XMM scratch pair, so a spilled float operand / result is left as a frame-slot MEM
+# operand for it rather than reloaded into a GP temp.
+fun is_float_op_mir(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_FADD || op == mir.MIR_FSUB || op == mir.MIR_FMUL ||
+        op == mir.MIR_FDIV || op == mir.MIR_FCMP;
+}
+
+# is_fp_vreg: true when a vreg belongs to the float / vector register class, so a
+# spilled instance is addressed and loaded as a float rather than reloaded through
+# a GP temp. the MIR_FCMP result is GP-classed (the i8 boolean) and is excluded.
+fun is_fp_vreg(ctx: *AllocCtx, v: u32) bool {
+    if (v >= ctx.f.vreg_count) { ret false; }
+    ret ctx.f.vregs[v].class != REG_CLASS_GP;
+}
+
 # is_storage_slot: true when a vreg owns a frame slot from lowering and the vreg
 # IS that storage (an alloca pointer or a by-value aggregate), so a MEM base
 # naming it addresses `[rbp + offset]` directly. a value the allocator spilled is
@@ -1578,6 +1611,16 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
     var store_dst_vreg: u32 = mir.MIR_VREG_NIL;
     var store_dst_tmp: i32 = -1;
 
+    # a float arithmetic / comparison instruction (MIR_FADD / FSUB / FMUL / FDIV /
+    # FCMP) is expanded by the encoder through a fixed XMM scratch pair, reading each
+    # float operand from wherever it lives — an XMM register or a `[rbp + off]` frame
+    # slot — and writing the result the same way. so a SPILLED float operand or
+    # destination is left as a frame-slot MEM operand for the encoder rather than
+    # reloaded into a GP temp (which would copy float bits through a GP register and
+    # then be misread as an XMM register by the float encoder). an XMM-resident float
+    # operand still rewrites to its assigned XMM preg below.
+    val is_float: bool = is_float_op_mir(mi.opcode);
+
     var k: u32 = 0;
     for (k < n) {
         val op: *mir.MirOperand = ?ops[k];
@@ -1585,8 +1628,11 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
             val v: u32 = op.vreg;
             if (has_def && k == 0) {
                 # a destination vreg.
-                if (is_spilled(ctx, v)) {
-                    val tmp: i32 = reload_temp(ctx, claimed, claimed_count, -1);
+                if (is_float && is_fp_vreg(ctx, v) && is_spilled(ctx, v)) {
+                    # the float result is stored directly into its slot by the encoder.
+                    ops[k] = mir.op_mem_slot(v, 0);
+                } or (is_spilled(ctx, v)) {
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1);
                     if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled destination"); }
                     claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
                     ops[k] = mir.op_preg(tmp::u32);
@@ -1596,8 +1642,11 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
                     ops[k] = preg_of(ctx, v);
                 }
             } or {
-                if (is_spilled(ctx, v)) {
-                    val tmp: i32 = reload_temp(ctx, claimed, claimed_count, -1);
+                if (is_float && is_fp_vreg(ctx, v) && is_spilled(ctx, v)) {
+                    # the float operand is loaded from its slot by the encoder.
+                    ops[k] = mir.op_mem_slot(v, 0);
+                } or (is_spilled(ctx, v)) {
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1);
                     if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled source"); }
                     claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
                     emit_reload(ctx, dst, wp, tmp::u32, v);
@@ -1622,7 +1671,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
                 } or (is_spilled(ctx, v)) {
                     # a spilled pointer value: reload the pointer into a temp so the
                     # base addresses what it points to, not its spill slot.
-                    val tmp: i32 = reload_temp(ctx, claimed, claimed_count, -1);
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1);
                     if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled MEM base"); }
                     claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
                     emit_reload(ctx, dst, wp, tmp::u32, v);
@@ -1640,7 +1689,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
             if (!ops[k].index_is_preg && ops[k].index != mir.MIR_VREG_NIL) {
                 val iv: u32 = ops[k].index;
                 if (is_spilled(ctx, iv)) {
-                    val tmp: i32 = reload_temp(ctx, claimed, claimed_count, -1);
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1);
                     if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled MEM index"); }
                     claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
                     emit_reload(ctx, dst, wp, tmp::u32, iv);
@@ -1663,6 +1712,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
     dst[@wp].operand_count = n;
     dst[@wp].width         = mi.width;
     dst[@wp].src_width     = mi.src_width;
+    dst[@wp].asm_block     = mi.asm_block;
     @wp = @wp + 1;
 
     # release the original operand array; its contents were copied into `ops`.
@@ -1717,36 +1767,24 @@ fun assigned_preg(ctx: *AllocCtx, v: u32) u32 {
     ret a;
 }
 
-# reload_temp: choose a general-purpose register free to hold a reloaded spill
-# value, excluding registers already assigned to a live vreg, the reserved
-# registers, and any temporary already claimed at this instruction. -1 when none
-# is available.
+# reload_temp: choose a reload-scratch register to hold a reloaded spill value.
+# the pool (`ctx.reload_scratch`) is reserved from value allocation in
+# `seed_reserved`, so its registers never hold a live value and are always free
+# for a reload — the only constraint is not reusing one already claimed at this
+# instruction (its base / scaled index / value operands reload into distinct
+# temporaries that must coexist in the rewritten instruction). `exclude` skips a
+# specific register the caller already holds. -1 when the pool is exhausted at
+# this instruction (more simultaneous reloads than the ISA's pool covers), which
+# the caller reports loudly rather than encoding a clobbering register.
 fun reload_temp(ctx: *AllocCtx, claimed: *i32, claimed_count: u32, exclude: i32) i32 {
-    var ci: u32 = 0;
-    for (ci < ctx.gp_count) {
-        if (ctx.reserved[ci]) { ci = ci + 1; cnt; }
-        if (ci::i32 == exclude) { ci = ci + 1; cnt; }
-        if (gp_id_busy_assigned(ctx, ci)) { ci = ci + 1; cnt; }
-        if (id_claimed(claimed, claimed_count, ci::i32)) { ci = ci + 1; cnt; }
-        ret ci::i32;
+    var i: i32 = 0;
+    for (i < ctx.reload_scratch_count) {
+        val id: i32 = ctx.reload_scratch[i].id;
+        if (id == exclude) { i = i + 1; cnt; }
+        if (id_claimed(claimed, claimed_count, id)) { i = i + 1; cnt; }
+        ret id;
     }
     ret -1;
-}
-
-# gp_id_busy_assigned: true when GP register `id` is currently assigned to some
-# vreg (so a reload temp must avoid it). a spilled vreg releases its register, so
-# only still-assigned vregs hold one.
-fun gp_id_busy_assigned(ctx: *AllocCtx, id: u32) bool {
-    var v: u32 = 0;
-    for (v < ctx.f.vreg_count) {
-        val mv: *mir.MirVReg = ?ctx.f.vregs[v];
-        if (mv.assigned == id && mv.spill_slot < 0) {
-            val lr: *LiveRange = ?ctx.ranges[v];
-            if (lr.reg_class == REG_CLASS_GP) { ret true; }
-        }
-        v = v + 1;
-    }
-    ret false;
 }
 
 # id_claimed: true when register `id` is already a claimed reload temporary.

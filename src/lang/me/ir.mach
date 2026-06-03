@@ -12,6 +12,7 @@
 # as `ir.BlockId` / `ir.InstructionId` / `ir.BLOCK_NIL` / `ir.INSTR_NIL`.
 
 use std.types.bool.bool;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.option.Option;
@@ -57,18 +58,45 @@ pub val FN_FLAG_INLINE:   u32 = 0x04;
 pub val FN_FLAG_NORETURN: u32 = 0x08;
 # the function is a test entry point (iterated by the test runner).
 pub val FN_FLAG_TEST:     u32 = 0x10;
+# the function is a monomorphized generic instance: emitted into every object
+# that uses it under one globally-unique mangled name, and given weak linkage so
+# the linker collapses the duplicate definitions to one.
+pub val FN_FLAG_WEAK:     u32 = 0x20;
+
+# one `{name}` local binding referenced by an inline-asm body: the interned
+# source name and the alloca instruction that owns the local's stack slot. the
+# back end resolves the alloca to a frame offset and substitutes `[rbp+off]`
+# for `{name}` when it expands the asm body.
+# ---
+# name:  interned source local name (the text inside `{ }`)
+# instr: OP_ALLOCA instruction id naming the local's storage slot
+pub rec IrAsmBind {
+    name:  intern.StrId;
+    instr: id.InstructionId;
+}
 
 # the inline-asm payload attached to an OP_ASM instruction. kept out of the
 # instruction proper (in Function.asm) so the common instruction stays small.
 # matches the locked asm syntax model: an inline-asm statement is just an ISA
 # tag plus a raw body span, with no structured operands (clobber / register
 # inference happens in the back end against the target).
+#
+# `{name}` references in the body name locals in scope; their bindings are
+# captured here (as alloca instruction ids) at lower time and resolved to frame
+# offsets by the back end, since the frame layout is unknown until after
+# register allocation.
 # ---
-# isa:  interned target ISA tag the body is written for
-# body: interned raw asm body text
+# isa:        interned target ISA tag the body is written for
+# body:       interned raw asm body text
+# binds:      `{name}` -> alloca bindings referenced by the body (owned)
+# bind_count: number of bindings
+# bind_cap:   allocated capacity of `binds`
 pub rec IrAsm {
-    isa:  intern.StrId;
-    body: intern.StrId;
+    isa:        intern.StrId;
+    body:       intern.StrId;
+    binds:      *IrAsmBind;
+    bind_count: u32;
+    bind_cap:   u32;
 }
 
 # a basic block: an ordered instruction list ending in exactly one
@@ -116,7 +144,7 @@ pub rec Block {
 # instr_len:   number of instructions in the pool
 # instr_cap:   allocated capacity for the instruction pool
 # flags:       bitwise-or of FN_FLAG_* bits
-# asm:         OP_ASM instruction id -> IrAsm payload map
+# asm_blocks:  OP_ASM instruction id -> IrAsm payload map
 pub rec Function {
     name:        intern.StrId;
     sig:         ir_type.IrTypeId;
@@ -134,7 +162,7 @@ pub rec Function {
 
     flags:       u32;
 
-    asm:         map.Map[id.InstructionId, IrAsm];
+    asm_blocks:  map.Map[id.InstructionId, IrAsm];
 }
 
 # a module-level global data declaration.
@@ -143,14 +171,25 @@ pub rec Function {
 # ty:     IR type of the global's storage
 # init:   initial value; a constant Value, or a placeholder when the real
 #         initializer is emitted as logic into the module's init_fn
-# is_mut: true for mutable globals (var), false for read-only (val)
-# is_pub: true when exported from the module
+# is_mut:    true for mutable globals (var), false for read-only (val)
+# is_pub:    true when exported from the module
+# is_extern: true for a global defined in another module; carries no storage
+#            here and is emitted only as a relocation target (the linker binds
+#            it to the defining module's object).
+# is_local:  true for a compiler-synthesized anonymous data global (a string /
+#            byte-blob literal), which is object-private — resolved per-object
+#            and never entered into the cross-object symbol table, so two
+#            modules' anonymous globals never collide. a named user global is
+#            not local: its name is module-path-mangled and globally unique, so
+#            it is given GLOBAL linkage and resolves cross-object.
 pub rec Global {
-    name:   intern.StrId;
-    ty:     ir_type.IrTypeId;
-    init:   value.Value;
-    is_mut: bool;
-    is_pub: bool;
+    name:      intern.StrId;
+    ty:        ir_type.IrTypeId;
+    init:      value.Value;
+    is_mut:    bool;
+    is_pub:    bool;
+    is_extern: bool;
+    is_local:  bool;
 }
 
 # an IR module: one per source module.
@@ -274,6 +313,25 @@ fun dnit_function(m: *Module, fn: *Function) {
     if (fn.params != nil && fn.param_count > 0) {
         deallocate[value.Value](m.alloc, fn.params, fn.param_count::usize);
     }
+    # release each inline-asm block's owned `{name}` binding array. every key in
+    # `asm_blocks` is an OP_ASM instruction id, so iterating the instruction pool
+    # reaches every payload through the public map lookup (the map exposes no
+    # iterator).
+    var ai: u32 = 0;
+    for (ai < fn.instr_len) {
+        if (fn.instrs[ai].kind == instr.OP_ASM) {
+            var key: id.InstructionId = ai::id.InstructionId;
+            val r: Result[*IrAsm, str] = map.get[id.InstructionId, IrAsm](?fn.asm_blocks, ?key);
+            if (is_ok[*IrAsm, str](r)) {
+                val pl: *IrAsm = unwrap_ok[*IrAsm, str](r);
+                if (pl.binds != nil && pl.bind_cap > 0) {
+                    deallocate[IrAsmBind](m.alloc, pl.binds, pl.bind_cap::usize);
+                }
+            }
+        }
+        ai = ai + 1;
+    }
+
     var i: u32 = 0;
     for (i < fn.instr_len) {
         dnit_instruction(m, ?fn.instrs[i]);
@@ -282,7 +340,7 @@ fun dnit_function(m: *Module, fn: *Function) {
     if (fn.instrs != nil && fn.instr_cap > 0) {
         deallocate[instr.Instruction](m.alloc, fn.instrs, fn.instr_cap::usize);
     }
-    map.dnit[id.InstructionId, IrAsm](?fn.asm);
+    map.dnit[id.InstructionId, IrAsm](?fn.asm_blocks);
 }
 
 # frees one instruction's owned operand array. safe on a zero-operand instruction.
