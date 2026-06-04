@@ -135,6 +135,13 @@ rec LiveRange {
 # active:        active-range vreg ids during the scan
 # active_count:  number of active ranges
 # pinned_end:    per-GP-register reservation end position (param-reg lifetimes)
+# arg_res_reg / arg_res_start / arg_res_end: parallel windows reserving an
+#                outgoing call-argument register over [setup-move, call] so a
+#                later same-call argument's materialization cannot reuse a
+#                register already holding a placed argument
+# arg_res_count: number of outgoing-argument reservation windows
+# cur_start / cur_end: the interval of the range currently being colored, so
+#                `gp_available` can test it against each outgoing-arg window
 # reload_scratch: the ISA's reload-scratch GP register ids, reserved from value
 #                 allocation and drawn from for spill reloads (borrowed pointer
 #                 into the ISA vtable; nil when the ISA wires no pool)
@@ -155,6 +162,12 @@ rec AllocCtx {
     active:        *u32;
     active_count:  u32;
     pinned_end:    *i64;
+    arg_res_reg:   *u32;
+    arg_res_start: *i64;
+    arg_res_end:   *i64;
+    arg_res_count: u32;
+    cur_start:     i64;
+    cur_end:       i64;
     reload_scratch:       *isa.Register;
     reload_scratch_count: i32;
 }
@@ -302,6 +315,12 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.active       = nil;
     ctx.active_count = 0;
     ctx.pinned_end   = nil;
+    ctx.arg_res_reg   = nil;
+    ctx.arg_res_start = nil;
+    ctx.arg_res_end   = nil;
+    ctx.arg_res_count = 0;
+    ctx.cur_start     = 0;
+    ctx.cur_end       = 0;
     ctx.reload_scratch       = tgt.arch.reload_scratch_regs;
     ctx.reload_scratch_count = tgt.arch.reload_scratch_count;
 
@@ -400,6 +419,18 @@ fun ctx_dnit(ctx: *AllocCtx) {
     if (ctx.pinned_end != nil) {
         deallocate[i64](ctx.alloc, ctx.pinned_end, ctx.gp_count::usize);
         ctx.pinned_end = nil;
+    }
+    if (ctx.arg_res_reg != nil && ctx.flat_count > 0) {
+        deallocate[u32](ctx.alloc, ctx.arg_res_reg, ctx.flat_count::usize);
+        ctx.arg_res_reg = nil;
+    }
+    if (ctx.arg_res_start != nil && ctx.flat_count > 0) {
+        deallocate[i64](ctx.alloc, ctx.arg_res_start, ctx.flat_count::usize);
+        ctx.arg_res_start = nil;
+    }
+    if (ctx.arg_res_end != nil && ctx.flat_count > 0) {
+        deallocate[i64](ctx.alloc, ctx.arg_res_end, ctx.flat_count::usize);
+        ctx.arg_res_end = nil;
     }
     if (ctx.fp_busy != nil) {
         deallocate[bool](ctx.alloc, ctx.fp_busy, ctx.fp_count::usize);
@@ -1061,6 +1092,8 @@ fun mark_call_crossing(ctx: *AllocCtx) {
 # capturing MOV.
 fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
     reserve_param_registers(ctx);
+    val br: Result[bool, str] = build_arg_reservations(ctx);
+    if (is_err[bool, str](br)) { ret br; }
 
     # build the start-order traversal of ranges (vreg ids sorted by range start).
     val nv: u32 = ctx.f.vreg_count;
@@ -1084,6 +1117,11 @@ fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
 
         expire_active(ctx, lr.start);
         release_pins(ctx, lr.start);
+
+        # publish this range's interval so `gp_available` can reject any register
+        # an outgoing call-argument window holds busy over an overlapping span.
+        ctx.cur_start = lr.start;
+        ctx.cur_end   = lr.end_pos;
 
         var preg: i32 = -1;
         if (lr.reg_class == REG_CLASS_GP) {
@@ -1137,6 +1175,98 @@ fun reserve_param_registers(ctx: *AllocCtx) {
         pos = pos + 1;
         ii = ii + 1;
     }
+}
+
+# build_arg_reservations: record one window per outgoing call-argument register.
+# the per-argument setup `MOV preg <- value` / `LEA preg <- [rip+sym]` that
+# `lower_call`/`emit_arg_slot` emit leaves the argument's value live in a physical
+# register from that move until the `MIR_CALL` that consumes it — but the value
+# rides a `MIR_OP_PREG`, invisible to the vreg liveness `build_ranges` tracks. so
+# a later argument of the SAME call (e.g. a string-literal address LEA'd into a
+# fresh vreg) can be colored onto a register still holding an already-placed
+# argument, clobbering it before the call. for every instruction whose operand 0
+# is a GP `MIR_OP_PREG` definition, find the next `MIR_CALL` reached without that
+# same register being redefined, and reserve [def-pos, call-pos] so `gp_available`
+# rejects the register for any value range overlapping that span. an asm clobber
+# barrier ends the search just like a call (its window is honored identically).
+fun build_arg_reservations(ctx: *AllocCtx) Result[bool, str] {
+    ctx.arg_res_count = 0;
+    if (ctx.flat_count == 0) { ret ok[bool, str](true); }
+
+    val rr: Result[*u32, str] = allocate[u32](ctx.alloc, ctx.flat_count::usize);
+    if (is_err[*u32, str](rr)) { ret err[bool, str](unwrap_err[*u32, str](rr)); }
+    ctx.arg_res_reg = unwrap_ok[*u32, str](rr);
+    val rs: Result[*i64, str] = allocate[i64](ctx.alloc, ctx.flat_count::usize);
+    if (is_err[*i64, str](rs)) { ret err[bool, str](unwrap_err[*i64, str](rs)); }
+    ctx.arg_res_start = unwrap_ok[*i64, str](rs);
+    val re: Result[*i64, str] = allocate[i64](ctx.alloc, ctx.flat_count::usize);
+    if (is_err[*i64, str](re)) { ret err[bool, str](unwrap_err[*i64, str](re)); }
+    ctx.arg_res_end = unwrap_ok[*i64, str](re);
+
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, pos);
+        if (!instr_defines_preg(mi)) { pos = pos + 1; cnt; }
+        val d: *mir.MirOperand = ?mi.operands[0];
+        val r: u32 = d.preg;
+        if (r >= ctx.gp_count) { pos = pos + 1; cnt; }
+
+        # walk forward to the first call/barrier; abandon the window if this same
+        # register is redefined first (it then holds a different live value whose
+        # own setup-move opens a fresh window).
+        var c: u32 = pos + 1;
+        var found: bool = false;
+        var killed: bool = false;
+        for (c < ctx.flat_count && !found && !killed) {
+            if (ctx.flat[c].is_call) {
+                found = true;
+            } or {
+                val mj: *mir.MirInstr = flat_instr(ctx, c);
+                if (instr_defines_preg(mj) && mj.operands[0].preg == r) { killed = true; }
+                c = c + 1;
+            }
+        }
+        if (found) {
+            # the register holds the argument only AFTER the setup move executes,
+            # so the window opens at pos+1: a value the move consumes (its range
+            # ending at `pos`) is free to have lived in this register up to here.
+            ctx.arg_res_reg[ctx.arg_res_count]   = r;
+            ctx.arg_res_start[ctx.arg_res_count] = (pos + 1)::i64;
+            ctx.arg_res_end[ctx.arg_res_count]   = c::i64;
+            ctx.arg_res_count = ctx.arg_res_count + 1;
+        }
+        pos = pos + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# instr_defines_preg: true when operand 0 of an instruction is a written physical
+# register (a pre-coloring move into an argument / return / fixed register). like
+# `instr_defines`, branches and the value-less call / marker opcodes write nothing.
+fun instr_defines_preg(mi: *mir.MirInstr) bool {
+    if (mi.operand_count == 0) { ret false; }
+    if (mi.opcode == mir.MIR_CALL) { ret false; }
+    if (mi.opcode == mir.MIR_CALL_RES) { ret false; }
+    if (mi.opcode == mir.MIR_ARG) { ret false; }
+    if (has_block_operand(mi)) { ret false; }
+    ret mi.operands[0].kind == mir.MIR_OP_PREG;
+}
+
+# arg_reg_reserved: true when an outgoing call-argument window holds GP register
+# `id` busy over a span that overlaps the range currently being colored
+# (`cur_start`..`cur_end`). two intervals overlap when neither ends before the
+# other starts.
+fun arg_reg_reserved(ctx: *AllocCtx, id: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.arg_res_count) {
+        if (ctx.arg_res_reg[i] == id) {
+            if (!(ctx.cur_end < ctx.arg_res_start[i] || ctx.cur_start > ctx.arg_res_end[i])) {
+                ret true;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # release_pins: clear any param-register reservation whose end position has been
@@ -1250,11 +1380,13 @@ fun pick_gp(ctx: *AllocCtx, crosses_call: bool) i32 {
     ret -1;
 }
 
-# gp_available: true when GP register `id` is neither busy nor pinned as a live
-# param register.
+# gp_available: true when GP register `id` is neither busy, pinned as a live
+# incoming param register, nor held by an outgoing call-argument window that
+# overlaps the range currently being colored.
 fun gp_available(ctx: *AllocCtx, id: u32) bool {
     if (ctx.gp_busy[id]) { ret false; }
     if (ctx.pinned_end[id] >= 0) { ret false; }
+    if (arg_reg_reserved(ctx, id)) { ret false; }
     ret true;
 }
 
