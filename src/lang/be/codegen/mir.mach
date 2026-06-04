@@ -805,6 +805,11 @@ rec LowerCtx {
     slot_key_vregs: *u32;
     instr_count: u32;
     interner:    *intern.Interner;
+    # sret_vreg: the vreg holding the hidden return-storage pointer when the
+    # function returns a >16-byte aggregate (CLASS_SRET), captured from the first
+    # GP argument register in `lower_params`; MIR_VREG_NIL otherwise. `lower_ret`
+    # copies the returned aggregate into this storage and returns it in RAX.
+    sret_vreg:   u32;
 }
 
 # lowers one IR function into a MirFunction. allocates the vreg table and the
@@ -865,6 +870,7 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, interne
     ctx.slot_key_vregs = nil;
     ctx.instr_count = fn.instr_len;
     ctx.interner    = interner;
+    ctx.sret_vreg   = MIR_VREG_NIL;
 
     val setup: Result[bool, str] = ctx_setup(?ctx, tgt, fn);
     if (is_err[bool, str](setup)) {
@@ -3201,12 +3207,10 @@ fun emit_ret_slot_to_vreg(ctx: *LowerCtx, mb: *MirBlock, slot: abi.ParamSlot, ds
 # loads from the caller frame at `[fp + 16 + offset]`. driven purely through the
 # ABI vtable: an absent / unsupported ABI vtable is a loud error.
 fun lower_params(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
-    if (ctx.param_count == 0)      { ret ok[bool, str](true); }
     val rok: Result[bool, str] = require_abi(ctx.tgt);
     if (is_err[bool, str](rok)) { ret rok; }
 
     val arch: u32 = ctx.tgt.arch_id;
-    val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
 
     # an sret return consumes the first GP register for the hidden pointer; the
     # callee's parameters classify against that reservation.
@@ -3219,8 +3223,29 @@ fun lower_params(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
         val rag:  bool = value_is_aggregate(ctx, ret_ty);
         val classify_ret: sysv.RetPassingFn = ctx.tgt.abi.ret_passing::sysv.RetPassingFn;
         val rslot: abi.ParamSlot = classify_ret(arch, rsz, 0, rfl, rag);
-        if (rslot.class == abi.CLASS_SRET) { gp_used = gp_used + 1; }
+        if (rslot.class == abi.CLASS_SRET) {
+            # the caller passes the hidden result-storage pointer in the first GP
+            # argument register; capture it into a vreg so `lower_ret` copies the
+            # returned aggregate into that storage and returns the pointer in RAX.
+            var sret_reg: i32 = 0;
+            val sr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, gp_used, ?sret_reg);
+            if (is_err[bool, str](sr)) { ret sr; }
+            val svr: Result[u32, str] = new_vreg(ctx, REG_CLASS_GP);
+            if (is_err[u32, str](svr)) { ret err[bool, str](unwrap_err[u32, str](svr)); }
+            val sv: u32 = unwrap_ok[u32, str](svr);
+            val mv: Result[bool, str] = emit_mov(ctx, mb, op_vreg(sv), op_preg(sret_reg::u32));
+            if (is_err[bool, str](mv)) { ret mv; }
+            ctx.sret_vreg = sv;
+            gp_used = gp_used + 1;
+        }
     }
+
+    # a zero-parameter function still needs the sret-pointer capture above (a
+    # niladic aggregate-returning function receives the hidden pointer); only the
+    # per-parameter classification below is skipped.
+    if (ctx.param_count == 0) { ret ok[bool, str](true); }
+
+    val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
 
     # running offset into the caller's outgoing-argument area for stack-passed
     # parameters, read at `[rbp + 16 + stack_off]`. it advances by each stack
@@ -3339,9 +3364,16 @@ fun lower_ret(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bo
 
     val arch: u32 = ctx.tgt.arch_id;
     val rv:   value.Value = inst.operands[0];
-    val rsz:  u64  = ir_type.byte_size(ctx.types, rv.ty, ctx.tgt)::u64;
-    val rfl:  bool = value_is_float(ctx, rv.ty);
-    val rag:  bool = value_is_aggregate(ctx, rv.ty);
+    # classify the return ABI from the function's declared return type, not the
+    # value operand's IR type: an aggregate flows by address, so `rv.ty` is a
+    # pointer (8 bytes) and would misclassify a >16-byte aggregate as a scalar
+    # RAX return (returning a pointer to a dead local). the declared return type
+    # carries the true size/shape, matching the hidden-pointer reservation
+    # `lower_params` already classifies from `fn_return_type`.
+    val rt:   ir_type.IrTypeId = fn_return_type(ctx);
+    val rsz:  u64  = ir_type.byte_size(ctx.types, rt, ctx.tgt)::u64;
+    val rfl:  bool = value_is_float(ctx, rt);
+    val rag:  bool = value_is_aggregate(ctx, rt);
     val classify_ret: sysv.RetPassingFn = ctx.tgt.abi.ret_passing::sysv.RetPassingFn;
     val slot: abi.ParamSlot = classify_ret(arch, rsz, 0, rfl, rag);
     # a returned global / function symbol is its address; LEA-materialize it so
@@ -3352,12 +3384,16 @@ fun lower_ret(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bo
     val rvop: MirOperand = unwrap_ok[MirOperand, str](rvr);
 
     if (slot.class == abi.CLASS_SRET) {
-        # the callee returns the hidden storage pointer in RAX; materialize a
-        # global's symbol address into a vreg so RAX carries the address itself.
-        var base: u32 = MIR_VREG_NIL;
-        val ar: Result[bool, str] = addr_to_vreg(ctx, mb, rvop, ?base);
-        if (is_err[bool, str](ar)) { ret ar; }
-        val mr: Result[bool, str] = emit_mov(ctx, mb, op_preg(slot.reg::u32), op_vreg(base));
+        # copy the returned aggregate into the caller-owned result storage (the
+        # hidden pointer captured from the first GP argument register in
+        # `lower_params`), then return that pointer in RAX. without the copy the
+        # callee would return the address of a dead local the caller never reads.
+        if (ctx.sret_vreg == MIR_VREG_NIL) {
+            ret err[bool, str]("mir.lower_ret: sret return without a captured result-storage pointer");
+        }
+        val cr: Result[bool, str] = copy_aggregate(ctx, mb, op_mem_value(ctx.sret_vreg, 0), rvop, rsz);
+        if (is_err[bool, str](cr)) { ret cr; }
+        val mr: Result[bool, str] = emit_mov(ctx, mb, op_preg(slot.reg::u32), op_vreg(ctx.sret_vreg));
         if (is_err[bool, str](mr)) { ret mr; }
     } or (slot.reg2 >= 0 && rag) {
         # 9–16 byte aggregate: load each half from the aggregate's storage (a
