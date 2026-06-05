@@ -30,8 +30,10 @@
 #      base (`preg` set, `vreg` cleared to MIR_VREG_NIL) while a frame-slot-owning
 #      MEM base keeps its slot-key vreg id (the encoder resolves it to `[rbp +
 #      offset]`); spilled vregs get reload-before-use / store-after-def `MIR_MOV`s,
-#      excluding the instruction's clobbered registers when choosing a reload
-#      temporary. After this pass no value vreg remains in any MEM base.
+#      excluding the instruction's clobbered registers — and, in the entry block,
+#      any reload-scratch register still holding a not-yet-captured incoming
+#      argument — when choosing a reload temporary. After this pass no value vreg
+#      remains in any MEM base.
 #
 # Everything target-specific flows through `tgt`: the register-class bank widths
 # from `tgt.arch.reg_classes`, the callee-saved register file from `tgt.abi`, the
@@ -162,6 +164,11 @@ rec AllocCtx {
     active:        *u32;
     active_count:  u32;
     pinned_end:    *i64;
+    # param_reg_end: a durable copy of each GP arg register's capture-end position
+    # (pinned_end is zeroed by linear-scan's release_pins, so the rewrite pass needs
+    # its own copy to keep a reload-scratch register that is also an incoming arg
+    # register off-limits until that argument's capture MOV in the entry block).
+    param_reg_end: *i64;
     arg_res_reg:   *u32;
     arg_res_start: *i64;
     arg_res_end:   *i64;
@@ -315,6 +322,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.active       = nil;
     ctx.active_count = 0;
     ctx.pinned_end   = nil;
+    ctx.param_reg_end = nil;
     ctx.arg_res_reg   = nil;
     ctx.arg_res_start = nil;
     ctx.arg_res_end   = nil;
@@ -356,13 +364,17 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
         val rpe: Result[*i64, str] = allocate[i64](m.alloc, ctx.gp_count::usize);
         if (is_err[*i64, str](rpe)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*i64, str](rpe)); }
         ctx.pinned_end = unwrap_ok[*i64, str](rpe);
+        val rpr: Result[*i64, str] = allocate[i64](m.alloc, ctx.gp_count::usize);
+        if (is_err[*i64, str](rpr)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*i64, str](rpr)); }
+        ctx.param_reg_end = unwrap_ok[*i64, str](rpr);
 
         var gi: u32 = 0;
         for (gi < ctx.gp_count) {
-            ctx.callee_saved[gi] = false;
-            ctx.reserved[gi]     = false;
-            ctx.gp_busy[gi]      = false;
-            ctx.pinned_end[gi]   = -1;
+            ctx.callee_saved[gi]  = false;
+            ctx.reserved[gi]      = false;
+            ctx.gp_busy[gi]       = false;
+            ctx.pinned_end[gi]    = -1;
+            ctx.param_reg_end[gi] = -1;
             gi = gi + 1;
         }
 
@@ -419,6 +431,10 @@ fun ctx_dnit(ctx: *AllocCtx) {
     if (ctx.pinned_end != nil) {
         deallocate[i64](ctx.alloc, ctx.pinned_end, ctx.gp_count::usize);
         ctx.pinned_end = nil;
+    }
+    if (ctx.param_reg_end != nil) {
+        deallocate[i64](ctx.alloc, ctx.param_reg_end, ctx.gp_count::usize);
+        ctx.param_reg_end = nil;
     }
     if (ctx.arg_res_reg != nil && ctx.flat_count > 0) {
         deallocate[u32](ctx.alloc, ctx.arg_res_reg, ctx.flat_count::usize);
@@ -1168,7 +1184,8 @@ fun reserve_param_registers(ctx: *AllocCtx) {
             if (d.kind == mir.MIR_OP_VREG && s.kind == mir.MIR_OP_PREG) {
                 val r: u32 = s.preg;
                 if (r < ctx.gp_count && pos::i64 > ctx.pinned_end[r]) {
-                    ctx.pinned_end[r] = pos::i64;
+                    ctx.pinned_end[r]    = pos::i64;
+                    ctx.param_reg_end[r] = pos::i64;
                 }
             }
         }
@@ -1616,7 +1633,9 @@ fun rewrite(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
     val f: *mir.MirFunction = ctx.f;
     var bi: u32 = 0;
     for (bi < f.block_count) {
-        val rb: Result[bool, str] = rewrite_block(tgt, ctx, ?f.blocks[bi]);
+        # block 0 is the entry block: its `vreg <- preg` param captures share the
+        # source positions reserve_param_registers recorded in param_reg_end.
+        val rb: Result[bool, str] = rewrite_block(tgt, ctx, ?f.blocks[bi], bi == 0);
         if (is_err[bool, str](rb)) { ret rb; }
         bi = bi + 1;
     }
@@ -1626,7 +1645,7 @@ fun rewrite(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
 # rewrite_block: rebuild one block's instruction list, splicing in reload and
 # store MIR_MOVs around spilled operands and rewriting vreg operands in place.
 # the new list is sized by counting the reloads/stores each instruction needs.
-fun rewrite_block(tgt: *target.Target, ctx: *AllocCtx, blk: *mir.MirBlock) Result[bool, str] {
+fun rewrite_block(tgt: *target.Target, ctx: *AllocCtx, blk: *mir.MirBlock, is_entry: bool) Result[bool, str] {
     if (blk.instr_count == 0) { ret ok[bool, str](true); }
 
     var total: u32 = 0;
@@ -1644,7 +1663,7 @@ fun rewrite_block(tgt: *target.Target, ctx: *AllocCtx, blk: *mir.MirBlock) Resul
     ii = 0;
     for (ii < blk.instr_count) {
         val mi: *mir.MirInstr = ?blk.instrs[ii];
-        val re: Result[bool, str] = rewrite_instr(tgt, ctx, mi, dst, ?w);
+        val re: Result[bool, str] = rewrite_instr(tgt, ctx, mi, dst, ?w, is_entry, ii);
         if (is_err[bool, str](re)) {
             # release any operand arrays already moved into `dst` and the array.
             deallocate[mir.MirInstr](ctx.alloc, dst, total::usize);
@@ -1732,7 +1751,7 @@ fun is_storage_slot(ctx: *AllocCtx, v: u32) bool {
 # references the temporaries; a spilled destination is written to a temporary and
 # stored back to its slot afterward.
 fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
-                  dst: *mir.MirInstr, wp: *u32) Result[bool, str] {
+                  dst: *mir.MirInstr, wp: *u32, is_entry: bool, src_pos: u32) Result[bool, str] {
     # copy the source operand array into a fresh array we own and mutate.
     val n: u32 = mi.operand_count;
     var ops: *mir.MirOperand = nil;
@@ -1777,7 +1796,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
                     # the float result is stored directly into its slot by the encoder.
                     ops[k] = mir.op_mem_slot(v, 0);
                 } or (is_spilled(ctx, v)) {
-                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1);
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1, is_entry, src_pos);
                     if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled destination"); }
                     claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
                     ops[k] = mir.op_preg(tmp::u32);
@@ -1791,7 +1810,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
                     # the float operand is loaded from its slot by the encoder.
                     ops[k] = mir.op_mem_slot(v, 0);
                 } or (is_spilled(ctx, v)) {
-                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1);
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1, is_entry, src_pos);
                     if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled source"); }
                     claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
                     emit_reload(ctx, dst, wp, tmp::u32, v);
@@ -1816,7 +1835,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
                 } or (is_spilled(ctx, v)) {
                     # a spilled pointer value: reload the pointer into a temp so the
                     # base addresses what it points to, not its spill slot.
-                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1);
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1, is_entry, src_pos);
                     if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled MEM base"); }
                     claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
                     emit_reload(ctx, dst, wp, tmp::u32, v);
@@ -1834,7 +1853,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
             if (!ops[k].index_is_preg && ops[k].index != mir.MIR_VREG_NIL) {
                 val iv: u32 = ops[k].index;
                 if (is_spilled(ctx, iv)) {
-                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1);
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1, is_entry, src_pos);
                     if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled MEM index"); }
                     claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
                     emit_reload(ctx, dst, wp, tmp::u32, iv);
@@ -1916,19 +1935,36 @@ fun assigned_preg(ctx: *AllocCtx, v: u32) u32 {
 
 # reload_temp: choose a reload-scratch register to hold a reloaded spill value.
 # the pool (`ctx.reload_scratch`) is reserved from value allocation in
-# `seed_reserved`, so its registers never hold a live value and are always free
-# for a reload — the only constraint is not reusing one already claimed at this
-# instruction (its base / scaled index / value operands reload into distinct
+# `seed_reserved`, so its registers hold no allocator-assigned value and are free
+# for a reload, with one exception handled below: in the entry block a pool
+# register that the ISA also passes an incoming argument in is busy until that
+# argument is captured. the other constraint is not reusing one already claimed at
+# this instruction (its base / scaled index / value operands reload into distinct
 # temporaries that must coexist in the rewritten instruction). `exclude` skips a
 # specific register the caller already holds. -1 when the pool is exhausted at
 # this instruction (more simultaneous reloads than the ISA's pool covers), which
 # the caller reports loudly rather than encoding a clobbering register.
-fun reload_temp(ctx: *AllocCtx, claimed: *i32, claimed_count: u32, exclude: i32) i32 {
+fun reload_temp(ctx: *AllocCtx, claimed: *i32, claimed_count: u32, exclude: i32,
+                is_entry: bool, src_pos: u32) i32 {
     var i: i32 = 0;
     for (i < ctx.reload_scratch_count) {
         val id: i32 = ctx.reload_scratch[i].id;
         if (id == exclude) { i = i + 1; cnt; }
         if (id_claimed(claimed, claimed_count, id)) { i = i + 1; cnt; }
+        # the reload-scratch pool is drawn from caller-saved GP registers; on a
+        # register-starved target those unavoidably overlap the ABI's argument
+        # registers (the ISA owns that pool choice — see its reload_scratch_regs).
+        # a scratch register that is also an incoming argument register still holds
+        # its un-captured argument value through the entry block until that
+        # argument's `MOV vreg <- preg` capture; using it as a reload/store temp
+        # before then would clobber the live argument. skip it until past its
+        # capture position — the rewrite-phase counterpart of the param-register
+        # busy-until-capture reservation the allocation phase already enforces.
+        # outside the entry block, and after capture, the full pool is free.
+        if (is_entry && id::u32 < ctx.gp_count
+            && ctx.param_reg_end[id] >= 0 && src_pos::i64 <= ctx.param_reg_end[id]) {
+            i = i + 1; cnt;
+        }
         ret id;
     }
     ret -1;
