@@ -1179,9 +1179,14 @@ fun reserve_param_registers(ctx: *AllocCtx) {
         if (mi.operand_count == 2) {
             val d: *mir.MirOperand = ?mi.operands[0];
             val s: *mir.MirOperand = ?mi.operands[1];
-            # a `vreg <- preg` move captures an incoming argument register; reserve
-            # that register until this position so no earlier range steals it.
-            if (d.kind == mir.MIR_OP_VREG && s.kind == mir.MIR_OP_PREG) {
+            # capturing an incoming argument register into the entry block: either a
+            # `vreg <- preg` move (a scalar param) or a `[slot] <- preg` store (an
+            # aggregate param spills each register half into its frame slot, not a
+            # vreg move). reserve that register until this position so no earlier
+            # range steals it — without the store case an aggregate param's register
+            # (e.g. a 16-byte value's second eightbyte) is colored over and clobbered
+            # before it is captured.
+            if ((d.kind == mir.MIR_OP_VREG || d.kind == mir.MIR_OP_MEM) && s.kind == mir.MIR_OP_PREG) {
                 val r: u32 = s.preg;
                 if (r < ctx.gp_count && pos::i64 > ctx.pinned_end[r]) {
                     ctx.pinned_end[r]    = pos::i64;
@@ -1280,6 +1285,25 @@ fun arg_reg_reserved(ctx: *AllocCtx, id: u32) bool {
             if (!(ctx.cur_end < ctx.arg_res_start[i] || ctx.cur_start > ctx.arg_res_end[i])) {
                 ret true;
             }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# arg_reg_busy_at: true when an outgoing call-argument reservation holds GP register
+# `id` busy at flat stream position `pos` — i.e. the value `id` carries was placed by
+# an argument setup move and is awaited by the consuming call. used by the rewrite's
+# reload-scratch selection so a temp never lands on a register that already holds a
+# live outgoing argument (the argument-side counterpart of the entry-block param
+# busy-until-capture rule). `pos` must be a flat position (see `rewrite`).
+fun arg_reg_busy_at(ctx: *AllocCtx, id: u32, pos: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.arg_res_count) {
+        if (ctx.arg_res_reg[i] == id
+            && pos::i64 >= ctx.arg_res_start[i]
+            && pos::i64 <= ctx.arg_res_end[i]) {
+            ret true;
         }
         i = i + 1;
     }
@@ -1632,11 +1656,20 @@ fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
 fun rewrite(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
     val f: *mir.MirFunction = ctx.f;
     var bi: u32 = 0;
+    # `flat_base` is each block's start offset in the flat instruction stream
+    # `build_arg_reservations` / param pinning use as their coordinate. flatten and
+    # this loop walk blocks in identical order, so a block's flat position is the
+    # running sum of prior blocks' (original) instruction counts. capture the count
+    # before rewrite_block mutates it (splicing reloads/stores changes instr_count).
+    var flat_base: u32 = 0;
     for (bi < f.block_count) {
         # block 0 is the entry block: its `vreg <- preg` param captures share the
         # source positions reserve_param_registers recorded in param_reg_end.
-        val rb: Result[bool, str] = rewrite_block(tgt, ctx, ?f.blocks[bi], bi == 0);
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        val orig_count: u32 = blk.instr_count;
+        val rb: Result[bool, str] = rewrite_block(tgt, ctx, blk, bi == 0, flat_base);
         if (is_err[bool, str](rb)) { ret rb; }
+        flat_base = flat_base + orig_count;
         bi = bi + 1;
     }
     ret ok[bool, str](true);
@@ -1645,7 +1678,7 @@ fun rewrite(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
 # rewrite_block: rebuild one block's instruction list, splicing in reload and
 # store MIR_MOVs around spilled operands and rewriting vreg operands in place.
 # the new list is sized by counting the reloads/stores each instruction needs.
-fun rewrite_block(tgt: *target.Target, ctx: *AllocCtx, blk: *mir.MirBlock, is_entry: bool) Result[bool, str] {
+fun rewrite_block(tgt: *target.Target, ctx: *AllocCtx, blk: *mir.MirBlock, is_entry: bool, flat_base: u32) Result[bool, str] {
     if (blk.instr_count == 0) { ret ok[bool, str](true); }
 
     var total: u32 = 0;
@@ -1663,7 +1696,7 @@ fun rewrite_block(tgt: *target.Target, ctx: *AllocCtx, blk: *mir.MirBlock, is_en
     ii = 0;
     for (ii < blk.instr_count) {
         val mi: *mir.MirInstr = ?blk.instrs[ii];
-        val re: Result[bool, str] = rewrite_instr(tgt, ctx, mi, dst, ?w, is_entry, ii);
+        val re: Result[bool, str] = rewrite_instr(tgt, ctx, mi, dst, ?w, is_entry, flat_base + ii);
         if (is_err[bool, str](re)) {
             # release any operand arrays already moved into `dst` and the array.
             deallocate[mir.MirInstr](ctx.alloc, dst, total::usize);
@@ -1963,6 +1996,15 @@ fun reload_temp(ctx: *AllocCtx, claimed: *i32, claimed_count: u32, exclude: i32,
         # outside the entry block, and after capture, the full pool is free.
         if (is_entry && id::u32 < ctx.gp_count
             && ctx.param_reg_end[id] >= 0 && src_pos::i64 <= ctx.param_reg_end[id]) {
+            i = i + 1; cnt;
+        }
+        # the argument-side counterpart: a scratch register that already holds a
+        # placed outgoing call argument (between its setup move and the consuming
+        # call) must not be reused as a reload temp — doing so clobbers the argument
+        # before the call. e.g. a 16-byte aggregate argument's first half sits in a
+        # pool register while the second half's spilled base is reloaded for the same
+        # call. consult the outgoing-argument reservation windows the allocator built.
+        if (id::u32 < ctx.gp_count && arg_reg_busy_at(ctx, id::u32, src_pos)) {
             i = i + 1; cnt;
         }
         ret id;
