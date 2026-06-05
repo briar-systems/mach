@@ -2829,6 +2829,145 @@ fun emit_store_to(ctx: *LowerCtx, mb: *MirBlock, mem: MirOperand, src: MirOperan
     ret push_instr(ctx, mb, mi);
 }
 
+# classify_signature: classify a whole function ABI in ONE left-to-right walk and
+# fill `out` with the resulting `SigLayout`. this is the single ABI-lowering oracle
+# the param / return / call lowering all read, so they can never disagree on a
+# value's placement: every fact (size / float / aggregate) is taken from a DECLARED
+# type via the IR layout oracle, never from a per-operand value type that diverges
+# when an aggregate flows by address (its operand is an 8-byte pointer).
+#
+# the walk:
+#   - classifies the return through `tgt.abi.ret_passing` from `ret_ty` (the
+#     function's declared return type — the call passes its result type, the
+#     callee its signature's return); a CLASS_SRET return reserves the first GP
+#     argument register (seeds `gp_used = 1`) just as the hidden pointer consumes a
+#     GP slot in the call / params lowering;
+#   - when `sig` resolves to an IRT_FN, classifies each fixed parameter through
+#     `tgt.abi.arg_passing` against the running GP/FP counters, then assigns the
+#     real outgoing stack offset into the slot's `offset` (an eight-byte-granular
+#     cursor) and advances the matching cursor — register slots advance `gp_used` /
+#     `fp_used` (a 9–16 byte two-GP aggregate advances by two), a stack slot
+#     advances `stack_off`. when `sig` is not an IRT_FN (an indirect call through
+#     an untyped function pointer, whose declared parameter types the IR does not
+#     carry), `param_count` is 0 and the caller classifies every argument from its
+#     operand type against the returned running cursors — the same fallback the
+#     variadic tail uses.
+#
+# `out.params` is a fresh allocation (sized to the signature's own param_count, so
+# never over/under-run regardless of the caller's parameter count) the caller
+# releases with `sig_layout_free` once the lowering of this signature is done. the
+# 9–16 byte two-register and >16 byte by-reference / sret behavior is whatever
+# `classify_arg` / `classify_return` return, unchanged — this oracle only walks
+# them in order and records offsets.
+# ---
+# ctx:    the active lowering context (supplies the IR type oracle and target)
+# sig:    the function signature (an IRT_FN id; non-IRT_FN yields zero fixed params)
+# ret_ty: the declared return type to classify the return / sret reservation from
+# out:    receives the assembled SigLayout (`params` is owned — free it with
+#         `sig_layout_free`)
+# ret:    ok(true) on success, or a loud error from the ABI vtable surface
+fun classify_signature(ctx: *LowerCtx, sig: ir_type.IrTypeId, ret_ty: ir_type.IrTypeId,
+                       out: *abi.SigLayout) Result[bool, str] {
+    val rok: Result[bool, str] = require_abi(ctx.tgt);
+    if (is_err[bool, str](rok)) { ret rok; }
+
+    val arch: u32 = ctx.tgt.arch_id;
+    val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
+    val classify_ret: sysv.RetPassingFn = ctx.tgt.abi.ret_passing::sysv.RetPassingFn;
+
+    out.params      = nil;
+    out.param_count = 0;
+
+    # the return value's placement decides whether the first GP argument register
+    # is reserved for a hidden sret pointer; classify it from the declared return
+    # type so its size / shape match what the params / ret lowering both reserve.
+    val ret_size:  u64  = ir_type.byte_size(ctx.types, ret_ty, ctx.tgt)::u64;
+    val ret_float: bool = value_is_float(ctx, ret_ty);
+    val ret_aggr:  bool = value_is_aggregate(ctx, ret_ty);
+    out.ret_slot = classify_ret(arch, ret_size, 0, ret_float, ret_aggr);
+
+    var gp_used:   i32 = 0;
+    var fp_used:   i32 = 0;
+    var stack_off: i64 = 0;
+
+    # a CLASS_SRET return reserves the first GP argument register for the hidden
+    # result-storage pointer, so the parameters classify against that reservation.
+    if (out.ret_slot.class == abi.CLASS_SRET) {
+        gp_used = 1;
+    }
+
+    # an indirect call through an untyped function pointer carries no declared
+    # parameter types (the signature is not an IRT_FN); leave the fixed-param list
+    # empty so the caller classifies every argument from its operand type.
+    val it: Option[*ir_type.IrType] = ir_type.get(ctx.types, sig);
+    if (!is_some[*ir_type.IrType](it)) {
+        out.gp_used   = gp_used;
+        out.fp_used   = fp_used;
+        out.stack_off = stack_off;
+        ret ok[bool, str](true);
+    }
+    val t: *ir_type.IrType = unwrap[*ir_type.IrType](it);
+    if (t.kind != ir_type.IRT_FN) {
+        out.gp_used   = gp_used;
+        out.fp_used   = fp_used;
+        out.stack_off = stack_off;
+        ret ok[bool, str](true);
+    }
+
+    val pc: u32 = t.data.fn.param_count;
+    var slots: *abi.ParamSlot = nil;
+    if (pc > 0) {
+        val sb: Result[*abi.ParamSlot, str] = allocate[abi.ParamSlot](ctx.alloc, pc::usize);
+        if (is_err[*abi.ParamSlot, str](sb)) { ret err[bool, str](unwrap_err[*abi.ParamSlot, str](sb)); }
+        slots = unwrap_ok[*abi.ParamSlot, str](sb);
+    }
+
+    var pi: u32 = 0;
+    for (pi < pc) {
+        val pty:  ir_type.IrTypeId = t.data.fn.params[pi];
+        val psz:  u64  = ir_type.byte_size(ctx.types, pty, ctx.tgt)::u64;
+        val pfl:  bool = value_is_float(ctx, pty);
+        val pag:  bool = value_is_aggregate(ctx, pty);
+        var slot: abi.ParamSlot = classify_arg(arch, pi::i32, psz, 0, pfl, pag, gp_used, fp_used);
+
+        # record the real outgoing stack offset on the slot (the ABI classifier
+        # returns a sizing-only slot with offset 0); the param / call lowering
+        # read this instead of re-deriving a parallel cursor.
+        if (slot.class == abi.CLASS_STACK) {
+            slot.offset = stack_off;
+            stack_off   = stack_off + stack_slot_bytes(slot.size);
+        } or (slot.class == abi.CLASS_FP) {
+            fp_used = fp_used + 1;
+        } or (slot.class == abi.CLASS_GP) {
+            gp_used = gp_used + 1;
+            if (slot.reg2 >= 0) { gp_used = gp_used + 1; }
+        } or (slot.class == abi.CLASS_BYREF) {
+            gp_used = gp_used + 1;
+        }
+
+        slots[pi] = slot;
+        pi = pi + 1;
+    }
+
+    out.params      = slots;
+    out.param_count = pc;
+    out.gp_used     = gp_used;
+    out.fp_used     = fp_used;
+    out.stack_off   = stack_off;
+    ret ok[bool, str](true);
+}
+
+# sig_layout_free: release the owned `params` array of a `SigLayout` produced by
+# `classify_signature`. safe on an empty (nil-params) layout. every site that
+# classifies a signature calls this once the layout's slots are consumed.
+fun sig_layout_free(ctx: *LowerCtx, layout: *abi.SigLayout) {
+    if (layout.params != nil && layout.param_count > 0) {
+        deallocate[abi.ParamSlot](ctx.alloc, layout.params, layout.param_count::usize);
+        layout.params      = nil;
+        layout.param_count = 0;
+    }
+}
+
 # expands an OP_CALL under SysV AMD64. classifies the callee's return value and
 # each argument through the ABI vtable, then emits, in order:
 #   - the SRET hidden-pointer move into RDI when the return is >16 bytes;
@@ -2851,18 +2990,32 @@ fun lower_call(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
 
     val arch: u32 = ctx.tgt.arch_id;
     val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
-    val classify_ret: sysv.RetPassingFn = ctx.tgt.abi.ret_passing::sysv.RetPassingFn;
 
-    # return classification decides whether the call needs an sret pointer in the
-    # first GP argument register, which also consumes one GP slot for the args.
-    val ret_ty:    ir_type.IrTypeId = inst.ty;
+    # classify the WHOLE declared signature once (the callee's IRT_FN rides on
+    # `inst.aux_ty`, the call's result type on `inst.ty`); the return and every
+    # fixed argument read their placement from this single layout so the call and
+    # the callee's `lower_params` can never disagree — in particular a by-value
+    # aggregate argument is classified from its DECLARED parameter type, not from
+    # the 8-byte pointer its operand carries. an indirect call through an untyped
+    # function pointer yields zero fixed params, so every argument falls back to
+    # per-operand classification below.
+    val sig: ir_type.IrTypeId = inst.aux_ty;
+    val ret_ty: ir_type.IrTypeId = inst.ty;
+    var layout: abi.SigLayout;
+    val cls: Result[bool, str] = classify_signature(ctx, sig, ret_ty, ?layout);
+    if (is_err[bool, str](cls)) { ret cls; }
+
+    val rslot: abi.ParamSlot = layout.ret_slot;
+
+    # the call's result type sizes the caller-owned aggregate result storage.
     val ret_size:  u64 = ir_type.byte_size(ctx.types, ret_ty, ctx.tgt)::u64;
-    val ret_float: bool = value_is_float(ctx, ret_ty);
     val ret_aggr:  bool = value_is_aggregate(ctx, ret_ty);
-    val rslot: abi.ParamSlot = classify_ret(arch, ret_size, 0, ret_float, ret_aggr);
 
-    var gp_used: i32 = 0;
-    var fp_used: i32 = 0;
+    # the running register / stack cursors resume from the fixed-parameter walk so
+    # a variadic call's tail arguments continue against the same counters.
+    var gp_used:   i32 = layout.gp_used;
+    var fp_used:   i32 = layout.fp_used;
+    var stack_off: i64 = layout.stack_off;
 
     # an aggregate return arrives by address: the caller owns the result storage
     # and the result vreg points at it. allocate that storage and LEA its address
@@ -2872,66 +3025,96 @@ fun lower_call(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
     val res_dst: u32 = result_vreg(ctx, iid);
     if (ret_aggr && res_dst != MIR_VREG_NIL) {
         val ra: Result[bool, str] = alloc_result_storage(ctx, mb, res_dst, ret_size, ret_align(ctx, ret_ty));
-        if (is_err[bool, str](ra)) { ret ra; }
+        if (is_err[bool, str](ra)) {
+            sig_layout_free(ctx, ?layout);
+            ret ra;
+        }
     }
-
-    # running offset into this call's outgoing stack-argument region. each
-    # stack-passed argument is stored at `[rsp + stack_off]`, eight-byte aligned
-    # per the SysV stack-slot rule, and `stack_off` advances by the slot's size so
-    # the next stack argument lands in the next slot rather than overwriting it.
-    var stack_off: i64 = 0;
 
     if (rslot.class == abi.CLASS_SRET) {
         # the caller allocates the return storage (above) and passes its address in
         # the first GP argument register (the ABI's GP argument file, RDI under
-        # SysV); the result vreg names that storage.
+        # SysV); the result vreg names that storage. the layout already reserved the
+        # GP slot in `gp_used`, so emit the pre-coloring move into the first register.
         if (res_dst != MIR_VREG_NIL) {
             var sret_reg: i32 = 0;
-            val sr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, gp_used, ?sret_reg);
-            if (is_err[bool, str](sr)) { ret sr; }
+            val sr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, 0, ?sret_reg);
+            if (is_err[bool, str](sr)) {
+                sig_layout_free(ctx, ?layout);
+                ret sr;
+            }
             val pre: Result[bool, str] = emit_mov(ctx, mb,
                 op_preg(sret_reg::u32), op_vreg(res_dst));
-            if (is_err[bool, str](pre)) { ret pre; }
+            if (is_err[bool, str](pre)) {
+                sig_layout_free(ctx, ?layout);
+                ret pre;
+            }
         }
-        gp_used = gp_used + 1;
     }
 
-    # arguments, in source order. each consumes GP/FP slots per its placement so
-    # the next argument classifies against the running usage counters.
+    # arguments, in source order. a fixed argument reads its placement (and real
+    # stack offset) from the precomputed layout; a variadic tail argument (past the
+    # declared param count) classifies from its operand type against the running
+    # counters — the one place an operand's own type is consulted.
     var ai:  u32 = 1;
-    var idx: i32 = 0;
     for (ai < inst.operand_count) {
         val av:   value.Value = inst.operands[ai];
-        val asz:  u64  = ir_type.byte_size(ctx.types, av.ty, ctx.tgt)::u64;
-        val afl:  bool = value_is_float(ctx, av.ty);
-        val aag:  bool = value_is_aggregate(ctx, av.ty);
-        val slot: abi.ParamSlot = classify_arg(arch, idx, asz, 0, afl, aag, gp_used, fp_used);
+        val pidx: u32 = ai - 1;
+        var slot: abi.ParamSlot;
+        var soff: i64 = 0;
+        if (pidx < layout.param_count) {
+            slot = layout.params[pidx];
+            soff = slot.offset;
+        } or {
+            val asz:  u64  = ir_type.byte_size(ctx.types, av.ty, ctx.tgt)::u64;
+            val afl:  bool = value_is_float(ctx, av.ty);
+            val aag:  bool = value_is_aggregate(ctx, av.ty);
+            slot = classify_arg(arch, pidx::i32, asz, 0, afl, aag, gp_used, fp_used);
+            soff = stack_off;
+        }
+
+        val aag2: bool = value_is_aggregate(ctx, av.ty);
+        # the operand's true byte size is the copy length for a by-value aggregate
+        # spilled to the stack: a >16-byte aggregate's ABI slot carries a sizing-only
+        # size of 8 (it is otherwise passed by reference), so reading slot.size would
+        # truncate the copy. for a fixed param this equals the declared param size
+        # (same interned type); for every register / by-ref / <=16B-stack slot it
+        # equals slot.size, so only the >16B-on-stack copy length is affected.
+        val asz2: u64 = ir_type.byte_size(ctx.types, av.ty, ctx.tgt)::u64;
         # a global / function symbol argument is its address; LEA-materialize it
         # so the register / stack move passes the address, not the symbol's bytes.
         val aor: Result[MirOperand, str] = lower_value_addr(ctx, mb, av);
-        if (is_err[MirOperand, str](aor)) { ret err[bool, str](unwrap_err[MirOperand, str](aor)); }
+        if (is_err[MirOperand, str](aor)) {
+            sig_layout_free(ctx, ?layout);
+            ret err[bool, str](unwrap_err[MirOperand, str](aor));
+        }
         val argop: MirOperand = unwrap_ok[MirOperand, str](aor);
 
-        val er: Result[bool, str] = emit_arg_slot(ctx, mb, slot, argop, stack_off, aag, asz);
-        if (is_err[bool, str](er)) { ret er; }
-
-        # advance the usage counters by what this argument consumed. a stack
-        # argument advances the outgoing-region cursor instead of a register file;
-        # each slot is rounded up to the eight-byte stack-slot granularity.
-        if (slot.class == abi.CLASS_FP) {
-            fp_used = fp_used + 1;
-        } or (slot.class == abi.CLASS_GP) {
-            gp_used = gp_used + 1;
-            if (slot.reg2 >= 0) { gp_used = gp_used + 1; }
-        } or (slot.class == abi.CLASS_BYREF) {
-            gp_used = gp_used + 1;
-        } or (slot.class == abi.CLASS_STACK) {
-            stack_off = stack_off + stack_slot_bytes(slot.size);
+        val er: Result[bool, str] = emit_arg_slot(ctx, mb, slot, argop, soff, aag2, asz2);
+        if (is_err[bool, str](er)) {
+            sig_layout_free(ctx, ?layout);
+            ret er;
         }
 
-        ai  = ai + 1;
-        idx = idx + 1;
+        # advance the running cursors only for the variadic tail; the fixed-param
+        # cursors were already consumed by `classify_signature`.
+        if (pidx >= layout.param_count) {
+            if (slot.class == abi.CLASS_FP) {
+                fp_used = fp_used + 1;
+            } or (slot.class == abi.CLASS_GP) {
+                gp_used = gp_used + 1;
+                if (slot.reg2 >= 0) { gp_used = gp_used + 1; }
+            } or (slot.class == abi.CLASS_BYREF) {
+                gp_used = gp_used + 1;
+            } or (slot.class == abi.CLASS_STACK) {
+                stack_off = stack_off + stack_slot_bytes(slot.size);
+            }
+        }
+
+        ai = ai + 1;
     }
+
+    sig_layout_free(ctx, ?layout);
 
     # record this call's outgoing stack-argument footprint. frame.run reserves the
     # maximum over all calls, sixteen-byte aligned, as the lowest region of the
@@ -3209,77 +3392,61 @@ fun emit_ret_slot_to_vreg(ctx: *LowerCtx, mb: *MirBlock, slot: abi.ParamSlot, ds
 # loads from the caller frame at `[fp + 16 + offset]`. driven purely through the
 # ABI vtable: an absent / unsupported ABI vtable is a loud error.
 fun lower_params(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
-    val rok: Result[bool, str] = require_abi(ctx.tgt);
-    if (is_err[bool, str](rok)) { ret rok; }
+    # classify the whole function signature once: the same layout the caller's
+    # `lower_call` derives, so a parameter is placed exactly where the call passed
+    # it. an sret return reserves the first GP register (in the layout); the per-
+    # parameter slots carry their real `[rbp + 16 + offset]` stack offsets.
+    val ret_ty: ir_type.IrTypeId = fn_return_type(ctx);
+    var layout: abi.SigLayout;
+    val cls: Result[bool, str] = classify_signature(ctx, ctx.fn.sig, ret_ty, ?layout);
+    if (is_err[bool, str](cls)) { ret cls; }
 
-    val arch: u32 = ctx.tgt.arch_id;
-
-    # an sret return consumes the first GP register for the hidden pointer; the
-    # callee's parameters classify against that reservation.
-    var gp_used: i32 = 0;
-    var fp_used: i32 = 0;
-    val ret_ty:    ir_type.IrTypeId = fn_return_type(ctx);
-    if (ret_ty != ir_type.IRT_NIL) {
-        val rsz:  u64  = ir_type.byte_size(ctx.types, ret_ty, ctx.tgt)::u64;
-        val rfl:  bool = value_is_float(ctx, ret_ty);
-        val rag:  bool = value_is_aggregate(ctx, ret_ty);
-        val classify_ret: sysv.RetPassingFn = ctx.tgt.abi.ret_passing::sysv.RetPassingFn;
-        val rslot: abi.ParamSlot = classify_ret(arch, rsz, 0, rfl, rag);
-        if (rslot.class == abi.CLASS_SRET) {
-            # the caller passes the hidden result-storage pointer in the first GP
-            # argument register; capture it into a vreg so `lower_ret` copies the
-            # returned aggregate into that storage and returns the pointer in RAX.
-            var sret_reg: i32 = 0;
-            val sr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, gp_used, ?sret_reg);
-            if (is_err[bool, str](sr)) { ret sr; }
-            val svr: Result[u32, str] = new_vreg(ctx, REG_CLASS_GP);
-            if (is_err[u32, str](svr)) { ret err[bool, str](unwrap_err[u32, str](svr)); }
-            val sv: u32 = unwrap_ok[u32, str](svr);
-            val mv: Result[bool, str] = emit_mov(ctx, mb, op_vreg(sv), op_preg(sret_reg::u32));
-            if (is_err[bool, str](mv)) { ret mv; }
-            ctx.sret_vreg = sv;
-            gp_used = gp_used + 1;
+    # an sret return: the caller passes the hidden result-storage pointer in the
+    # first GP argument register; capture it into a vreg so `lower_ret` copies the
+    # returned aggregate into that storage and returns the pointer in RAX.
+    if (layout.ret_slot.class == abi.CLASS_SRET) {
+        var sret_reg: i32 = 0;
+        val sr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, 0, ?sret_reg);
+        if (is_err[bool, str](sr)) {
+            sig_layout_free(ctx, ?layout);
+            ret sr;
         }
+        val svr: Result[u32, str] = new_vreg(ctx, REG_CLASS_GP);
+        if (is_err[u32, str](svr)) {
+            sig_layout_free(ctx, ?layout);
+            ret err[bool, str](unwrap_err[u32, str](svr));
+        }
+        val sv: u32 = unwrap_ok[u32, str](svr);
+        val mv: Result[bool, str] = emit_mov(ctx, mb, op_vreg(sv), op_preg(sret_reg::u32));
+        if (is_err[bool, str](mv)) {
+            sig_layout_free(ctx, ?layout);
+            ret mv;
+        }
+        ctx.sret_vreg = sv;
     }
 
-    # a zero-parameter function still needs the sret-pointer capture above (a
-    # niladic aggregate-returning function receives the hidden pointer); only the
-    # per-parameter classification below is skipped.
-    if (ctx.param_count == 0) { ret ok[bool, str](true); }
-
-    val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
-
-    # running offset into the caller's outgoing-argument area for stack-passed
-    # parameters, read at `[rbp + 16 + stack_off]`. it advances by each stack
-    # parameter's eight-byte-granular slot size, mirroring the offsets the caller
-    # used in `lower_call`; the ABI classifier returns a sizing-only slot, so this
-    # cursor is the callee's responsibility.
-    var stack_off: i64 = 0;
-
+    # the signature's declared param count and the function's param count are the
+    # same list (both lowered from the same semantic parameter types); iterate the
+    # smaller as a hard bound so neither the layout slots nor the param vregs are
+    # indexed out of range.
+    var bound: u32 = ctx.param_count;
+    if (layout.param_count < bound) { bound = layout.param_count; }
     var pi: u32 = 0;
-    for (pi < ctx.param_count) {
+    for (pi < bound) {
         val pv:   u32 = ctx.param_vregs[pi];
         val pty:  ir_type.IrTypeId = ctx.fn.params[pi].ty;
-        val psz:  u64  = ir_type.byte_size(ctx.types, pty, ctx.tgt)::u64;
-        val pfl:  bool = value_is_float(ctx, pty);
         val pag:  bool = value_is_aggregate(ctx, pty);
-        val slot: abi.ParamSlot = classify_arg(arch, pi::i32, psz, 0, pfl, pag, gp_used, fp_used);
+        val slot: abi.ParamSlot = layout.params[pi];
 
-        val er: Result[bool, str] = emit_param_slot(ctx, mb, slot, pv, psz, stack_off, pag);
-        if (is_err[bool, str](er)) { ret er; }
-
-        if (slot.class == abi.CLASS_FP) {
-            fp_used = fp_used + 1;
-        } or (slot.class == abi.CLASS_GP) {
-            gp_used = gp_used + 1;
-            if (slot.reg2 >= 0) { gp_used = gp_used + 1; }
-        } or (slot.class == abi.CLASS_BYREF) {
-            gp_used = gp_used + 1;
-        } or (slot.class == abi.CLASS_STACK) {
-            stack_off = stack_off + stack_slot_bytes(slot.size);
+        val er: Result[bool, str] = emit_param_slot(ctx, mb, slot, pv, slot.size, slot.offset, pag);
+        if (is_err[bool, str](er)) {
+            sig_layout_free(ctx, ?layout);
+            ret er;
         }
         pi = pi + 1;
     }
+
+    sig_layout_free(ctx, ?layout);
     ret ok[bool, str](true);
 }
 
@@ -3361,23 +3528,21 @@ fun lower_ret(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bo
     if (inst.operand_count == 0) {
         ret emit_bare_ret(ctx, mb);
     }
-    val rok: Result[bool, str] = require_abi(ctx.tgt);
-    if (is_err[bool, str](rok)) { ret rok; }
-
-    val arch: u32 = ctx.tgt.arch_id;
     val rv:   value.Value = inst.operands[0];
     # classify the return ABI from the function's declared return type, not the
     # value operand's IR type: an aggregate flows by address, so `rv.ty` is a
     # pointer (8 bytes) and would misclassify a >16-byte aggregate as a scalar
     # RAX return (returning a pointer to a dead local). the declared return type
-    # carries the true size/shape, matching the hidden-pointer reservation
-    # `lower_params` already classifies from `fn_return_type`.
+    # carries the true size/shape. the same whole-signature oracle the caller and
+    # `lower_params` use returns the slot, so the return placement is identical.
     val rt:   ir_type.IrTypeId = fn_return_type(ctx);
     val rsz:  u64  = ir_type.byte_size(ctx.types, rt, ctx.tgt)::u64;
-    val rfl:  bool = value_is_float(ctx, rt);
     val rag:  bool = value_is_aggregate(ctx, rt);
-    val classify_ret: sysv.RetPassingFn = ctx.tgt.abi.ret_passing::sysv.RetPassingFn;
-    val slot: abi.ParamSlot = classify_ret(arch, rsz, 0, rfl, rag);
+    var layout: abi.SigLayout;
+    val cls: Result[bool, str] = classify_signature(ctx, ctx.fn.sig, rt, ?layout);
+    if (is_err[bool, str](cls)) { ret cls; }
+    val slot: abi.ParamSlot = layout.ret_slot;
+    sig_layout_free(ctx, ?layout);
     # a returned global / function symbol is its address; LEA-materialize it so
     # the scalar-register return carries the address, not the symbol's bytes. the
     # SRET / two-register branches re-`addr_to_vreg` the resulting vreg harmlessly.
