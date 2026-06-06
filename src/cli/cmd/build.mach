@@ -44,6 +44,8 @@ use arena: std.allocator.arena;
 use os: std.system.os;
 use fs: std.filesystem;
 
+use writer: std.io.writer;
+
 use intern: mach.lang.intern;
 use sess:   mach.lang.session;
 use src:    mach.lang.source;
@@ -54,6 +56,7 @@ use sema:    mach.lang.fe.sema;
 use token:   mach.lang.fe.token;
 
 use ir:         mach.lang.me.ir;
+use ir_printer: mach.lang.me.ir.printer;
 use lower:      mach.lang.me.lower;
 use testrunner: mach.lang.me.lower.testrunner;
 use pipeline:   mach.lang.me.pipeline;
@@ -75,6 +78,21 @@ use cfg: mach.cli.config;
 pub rec BuildResult {
     code:        i64;
     output_path: *u8;
+}
+
+# EmitArtifacts: the debug-artifact emission settings threaded into the per-module
+# compile loop. `base` is the resolved `<root>/<out>/<artifacts>` prefix the `asm/`
+# and `ir/` trees hang off (a borrowed pointer into the caller's path buffer, valid
+# for the compile); `want_asm` / `want_ir` toggle each text artifact (`--emit-asm` /
+# `--emit-ir`). when both flags are off `base` is unused.
+# ---
+# base: resolved `<root>/<out>/<artifacts>` directory prefix (borrowed)
+# want_asm: emit per-module `.s` assembly text
+# want_ir:  emit per-module `.ir` SSA IR text
+rec EmitArtifacts {
+    base:     *u8;
+    want_asm: bool;
+    want_ir:  bool;
 }
 
 # eq: byte-wise equality of two null-terminated `*u8` strings.
@@ -289,8 +307,10 @@ fun free_sema_deps(alloc: *Allocator, deps: *sema.SemaDeps) {
 # codegen passes off a semantically broken AST. `images` (caller-owned, sized
 # to p.module_len) is filled in topo order. on failure the partial images and
 # IR modules are torn down by the caller via `free_modules`. when `verbose`
-# is set, each module's stage transitions are written to stderr.
-fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: bool, verbose: bool,
+# is set, each module's stage transitions are written to stderr. `ea` requests
+# the per-module `.ir` (written right after lowering) and `.s` (written from the
+# fully-resolved MIR inside codegen) debug artifacts.
+fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: bool, verbose: bool, ea: *EmitArtifacts,
                     results: *sema.SemaResult, ready: *bool,
                     irs: *ir.Module, ir_ready: *bool,
                     images: *of.ObjectImage, image_ready: *bool) Result[bool, str] {
@@ -340,6 +360,22 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
         irs[mid::u32]     = unwrap_ok[ir.Module, str](lower_r);
         ir_ready[mid::u32] = true;
 
+        # textual SSA IR, rendered straight after lowering.
+        if (ea.want_ir) {
+            val fqn_opt: Option[str] = intern.lookup(?p.s.interner, m.fqn);
+            if (is_none[str](fqn_opt)) { ret err[bool, str]("module FQN not interned"); }
+            val fqn: str = unwrap[str](fqn_opt);
+
+            var irf: fs.File;
+            var irw: writer.Writer;
+            val oir: Result[bool, str] = open_artifact(ea.base, "ir", fqn, "ir", ?irf, ?irw);
+            if (is_err[bool, str](oir)) { ret err[bool, str](unwrap_err[bool, str](oir)); }
+            val pir: Result[bool, str] = ir_printer.print_module(?irw, ?irs[mid::u32], ?p.s.interner);
+            val cir: Result[bool, str] = fs.close(?irf);
+            if (is_err[bool, str](pir)) { ret err[bool, str](unwrap_err[bool, str](pir)); }
+            if (is_err[bool, str](cir)) { ret err[bool, str](unwrap_err[bool, str](cir)); }
+        }
+
         val opt_r: Result[bool, str] = pipeline.run(?irs[mid::u32], ?p.target, level, verify_ir);
         if (is_err[bool, str](opt_r)) { ret err[bool, str](unwrap_err[bool, str](opt_r)); }
 
@@ -358,7 +394,25 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
 
         if (verbose) { emit_stage(p, "codegen", m.fqn); }
 
-        val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?irs[mid::u32]);
+        # codegen, optionally rendering the resolved MIR to a `.s` artifact.
+        var asmf: fs.File;
+        var asmw: writer.Writer;
+        var asm_out: *writer.Writer = nil;
+        if (ea.want_asm) {
+            val fqn_opt: Option[str] = intern.lookup(?p.s.interner, m.fqn);
+            if (is_none[str](fqn_opt)) { ret err[bool, str]("module FQN not interned"); }
+            val fqn: str = unwrap[str](fqn_opt);
+            val oas: Result[bool, str] = open_artifact(ea.base, "asm", fqn, "s", ?asmf, ?asmw);
+            if (is_err[bool, str](oas)) { ret err[bool, str](unwrap_err[bool, str](oas)); }
+            asm_out = ?asmw;
+        }
+        val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?irs[mid::u32], asm_out);
+        if (ea.want_asm) {
+            val cas: Result[bool, str] = fs.close(?asmf);
+            if (is_ok[of.ObjectImage, str](cg_r) && is_err[bool, str](cas)) {
+                ret err[bool, str](unwrap_err[bool, str](cas));
+            }
+        }
         if (is_err[of.ObjectImage, str](cg_r)) { ret err[bool, str](unwrap_err[of.ObjectImage, str](cg_r)); }
         images[mid::u32]      = unwrap_ok[of.ObjectImage, str](cg_r);
         image_ready[mid::u32] = true;
@@ -469,7 +523,7 @@ pub fun build(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_m
     }
     var p: driver.Project = unwrap_ok[driver.Project, str](proj_r);
 
-    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, config.verbose, ?root[0], config.output, config.artifacts, ?br.output_path);
+    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, config.verbose, config.emit_asm, config.emit_ir, ?root[0], config.output, config.artifacts, ?br.output_path);
 
     flush_diagnostics(?s, ?s.diags);
     driver.dnit_project(?p);
@@ -482,8 +536,10 @@ pub fun build(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_m
 # sets `*out_path` to the produced artifact path on success. `out_override`
 # (-o) and `art_override` (--artifacts), when non-nil, replace the target's
 # configured binary and artifacts paths. when `verbose` is set, per-stage
-# progress is written to stderr.
+# progress is written to stderr. `emit_asm` / `emit_ir` request the per-module
+# `.s` / `.ir` debug artifacts.
 fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: bool, verify_ir: bool, verbose: bool,
+                     emit_asm: bool, emit_ir: bool,
                      root: *u8, out_override: *u8, art_override: *u8, out_path: **u8) i64 {
     val n: usize = p.module_len::usize;
     if (n == 0) {
@@ -492,6 +548,20 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
     }
 
     if (verbose) { emit_target(p); }
+
+    # resolve the `<root>/<out>/<artifacts>` prefix the text-artifact trees hang
+    # off once, up front, so each module writes its `.s` / `.ir` next to its `.o`.
+    var art_base: [4096]u8;
+    var ea: EmitArtifacts;
+    ea.base = ?art_base[0];
+    ea.want_asm = emit_asm;
+    ea.want_ir  = emit_ir;
+    if (emit_asm || emit_ir) {
+        if (!resolve_art_base(p, root, art_override, ?art_base[0], 4096)) {
+            emit("error: project out / artifacts dir not interned\n");
+            ret 2;
+        }
+    }
 
     val rr: Result[*sema.SemaResult, str] = allocate[sema.SemaResult](p.s.alloc, n);
     if (is_err[*sema.SemaResult, str](rr)) { emit("error: out of memory\n"); ret 2; }
@@ -533,7 +603,7 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
     var runner_img_ok: bool = false;
 
     var code: i64 = 0;
-    val comp_r: Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, verbose, results, ready, irs, ir_ready, images, image_ready);
+    val comp_r: Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, verbose, ?ea, results, ready, irs, ir_ready, images, image_ready);
     if (is_err[bool, str](comp_r)) {
         emit("error: ");
         emit(unwrap_err[bool, str](comp_r));
@@ -597,7 +667,7 @@ fun build_test_runner(p: *driver.Project, level: u8, verify_ir: bool,
         ret 2;
     }
 
-    val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, runner_ir);
+    val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, runner_ir, nil);
     if (is_err[of.ObjectImage, str](cg_r)) {
         emit("error: ");
         emit(unwrap_err[of.ObjectImage, str](cg_r));
@@ -630,20 +700,12 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, test_mode: bool, have_runn
     val te: *driver.TargetEntry = p.target_entry;
     if (te == nil) { emit("error: no target selected\n"); ret 2; }
 
-    val out_opt: Option[str] = intern.lookup(?p.s.interner, p.config.out);
-    if (is_none[str](out_opt)) { emit("error: project out dir not interned\n"); ret 2; }
-    val art_opt: Option[str] = intern.lookup(?p.s.interner, te.artifacts);
-    if (is_none[str](art_opt)) { emit("error: target artifacts dir not interned\n"); ret 2; }
-
     # <root>/<out>/<artifacts>/obj — the per-module object tree root.
     # --artifacts overrides <artifacts>.
     var obj_base: [4096]u8;
-    join_into_str(?obj_base[0], 4096, root, unwrap[str](out_opt));
-    if (art_override != nil) {
-        join_into(?obj_base[0], 4096, ?obj_base[0], art_override);
-    }
-    or {
-        join_into_str(?obj_base[0], 4096, ?obj_base[0], unwrap[str](art_opt));
+    if (!resolve_art_base(p, root, art_override, ?obj_base[0], 4096)) {
+        emit("error: project out / artifacts dir not interned\n");
+        ret 2;
     }
     join_into(?obj_base[0], 4096, ?obj_base[0], "obj");
 
@@ -691,6 +753,12 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, test_mode: bool, have_runn
         join_into(?artifact[0], 4096, root, out_override);
     }
     or {
+        val out_opt: Option[str] = intern.lookup(?p.s.interner, p.config.out);
+        if (is_none[str](out_opt)) {
+            free_paths(p.s.alloc, paths, count, count);
+            emit("error: project out dir not interned\n");
+            ret 2;
+        }
         val bin_opt: Option[str] = intern.lookup(?p.s.interner, te.binary);
         if (is_none[str](bin_opt) || slen(unwrap[str](bin_opt)::*u8) == 0) {
             free_paths(p.s.alloc, paths, count, count);
@@ -743,6 +811,30 @@ fun join_into_str(buf: *u8, cap: usize, dir: *u8, leaf: str) usize {
     for (i < ll) { buf[k] = leaf[i]; k = k + 1; i = i + 1; }
     buf[k] = 0;
     ret k;
+}
+
+# resolve_art_base: write `<root>/<out>/<artifacts>` into `buf`, the directory the
+# per-module artifact trees (`obj/`, `asm/`, `ir/`) hang off. `<out>` is the
+# project out dir; `<artifacts>` is `art_override` (--artifacts) when non-nil, else
+# the target's configured artifacts dir. returns true on success; false when either
+# the out or artifacts dir is not interned. the caller appends the per-tree leaf.
+fun resolve_art_base(p: *driver.Project, root: *u8, art_override: *u8, buf: *u8, cap: usize) bool {
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te == nil) { ret false; }
+
+    val out_opt: Option[str] = intern.lookup(?p.s.interner, p.config.out);
+    if (is_none[str](out_opt)) { ret false; }
+    val art_opt: Option[str] = intern.lookup(?p.s.interner, te.artifacts);
+    if (is_none[str](art_opt)) { ret false; }
+
+    join_into_str(buf, cap, root, unwrap[str](out_opt));
+    if (art_override != nil) {
+        join_into(buf, cap, buf, art_override);
+    }
+    or {
+        join_into_str(buf, cap, buf, unwrap[str](art_opt));
+    }
+    ret true;
 }
 
 # ensure_dir: create the directory at `path` if it does not already exist.
@@ -803,7 +895,7 @@ fun write_objects(p: *driver.Project, images: *of.ObjectImage,
         }
 
         var path: [4096]u8;
-        mirror_fqn(?path[0], 4096, obj_base, unwrap[str](fqn_opt));
+        mirror_fqn(?path[0], 4096, obj_base, unwrap[str](fqn_opt), "o");
 
         if (!ensure_parents(?path[0])) {
             free_paths(p.s.alloc, paths, ti, count);
@@ -864,18 +956,20 @@ fun append_runner_object(p: *driver.Project, runner_img: *of.ObjectImage,
     ret 0;
 }
 
-# mirror_fqn: write `<obj_base>/<rel>.o` into `buf`, where `<rel>` is the module
-# FQN with every '.' replaced by '/'. returns the byte length written
-# (excluding the terminator), or 0 if it would not fit.
-fun mirror_fqn(buf: *u8, cap: usize, obj_base: *u8, fqn: str) usize {
-    val bl: usize = slen(obj_base);
+# mirror_fqn: write `<base>/<rel>.<ext>` into `buf`, where `<rel>` is the module
+# FQN with every '.' replaced by '/' (so `a.b.c` with ext `o` becomes
+# `<base>/a/b/c.o`). returns the byte length written (excluding the terminator),
+# or 0 if it would not fit.
+fun mirror_fqn(buf: *u8, cap: usize, base: *u8, fqn: str, suffix: str) usize {
+    val bl: usize = slen(base);
     val fl: usize = slen(fqn::*u8);
-    var need: usize = bl + 1 + fl + 2 + 1;
+    val el: usize = slen(suffix::*u8);
+    var need: usize = bl + 1 + fl + 1 + el + 1;
     if (need > cap) { ret 0; }
 
     var k: usize = 0;
     var i: usize = 0;
-    for (i < bl) { buf[k] = obj_base[i]; k = k + 1; i = i + 1; }
+    for (i < bl) { buf[k] = base[i]; k = k + 1; i = i + 1; }
     if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
 
     i = 0;
@@ -886,10 +980,37 @@ fun mirror_fqn(buf: *u8, cap: usize, obj_base: *u8, fqn: str) usize {
         k = k + 1;
         i = i + 1;
     }
-    buf[k]     = '.';
-    buf[k + 1] = 'o';
-    buf[k + 2] = 0;
-    ret k + 2;
+    buf[k] = '.';
+    k = k + 1;
+
+    i = 0;
+    for (i < el) { buf[k] = suffix[i]; k = k + 1; i = i + 1; }
+    buf[k] = 0;
+    ret k;
+}
+
+# open_artifact: create `<base>/<sub>/<rel>.<ext>` (making any parent directories)
+# and wire `w` to stream into it through the returned `file`. the FQN is mapped to
+# `<rel>` exactly as the object tree is. the caller owns `file` and must close it
+# once writing is done — the Writer borrows the File and must not outlive it.
+fun open_artifact(base: *u8, sub: str, fqn: str, suffix: str,
+                  file: *fs.File, w: *writer.Writer) Result[bool, str] {
+    var sub_base: [4096]u8;
+    join_into(?sub_base[0], 4096, base, sub::*u8);
+
+    var path: [4096]u8;
+    if (mirror_fqn(?path[0], 4096, ?sub_base[0], fqn, suffix) == 0) {
+        ret err[bool, str]("artifact path too long");
+    }
+    if (!ensure_parents(?path[0])) {
+        ret err[bool, str]("failed to create artifact directory");
+    }
+
+    val cr: Result[fs.File, str] = fs.create(cstr_str(?path[0]), 0o644);
+    if (is_err[fs.File, str](cr)) { ret err[bool, str](unwrap_err[fs.File, str](cr)); }
+    @file = unwrap_ok[fs.File, str](cr);
+    fs.get_writer(file, w);
+    ret ok[bool, str](true);
 }
 
 # free_paths: release the first `n` owned path strings of a path array and the
