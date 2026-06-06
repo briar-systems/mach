@@ -69,14 +69,25 @@ fun apply($mode: u8, n: i64) i64 {
 Rules:
 
 - The argument bound to a `$`-parameter must be a compile-time constant at the
-  call site; a runtime value is rejected with `comptime argument is not a
-  compile-time constant`.
+  call site (a literal, a `pub val`, or another comptime parameter); a runtime
+  value is rejected with `comptime argument is not a compile-time constant`. A
+  cross-module constant works, whether imported by bare name or as a qualified
+  member (`alias.CONST`).
+- Each arm gate of a comptime-parameter `$if` must itself be comptime-foldable:
+  its identifiers must all be comptime (the comptime parameters or comptime
+  constants). A gate referencing a runtime local/parameter is rejected.
+- A comptime parameter has no storage, so its address cannot be taken
+  (`?$mode` is rejected with `cannot take the address of a comptime parameter`).
 - Comptime parameters carry no runtime cost: they are stripped from the lowered
   signature and ABI, so only the runtime parameters are passed.
 - A comptime parameter may be mixed freely with runtime parameters in any order.
 - A comptime parameter on a **generic** function (`fun f[T]($mode: u8, ...)`) is
   not yet supported — combining a type instance with a value instance is a
   pending extension and is reported with a clear diagnostic.
+- The function may live in any module: a value-parameter instance is emitted
+  against its declaring module and folds its `$if` gates against that module's
+  own comptime constants, so a library can export a comptime-parameter function
+  gated on its own `pub val`s.
 - A comptime parameter may gate per-target asm safely, since each instance only
   compiles its taken arm:
 
