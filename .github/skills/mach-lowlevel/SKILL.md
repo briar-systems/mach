@@ -137,4 +137,4 @@ Vector types follow `<u|i|f><width>x<count>`: `f32x4`, `i32x8`, `u8x16`. Higher 
 - [doc/language/policy.md](../../../doc/language/policy.md) — the compiler-vs-stdlib boundary in full.
 - [doc/language/comptime-control.md](../../../doc/language/comptime-control.md) — `$if`/`$or` over `$mach.target.arch`.
 - [doc/language/comptime-intrinsics.md](../../../doc/language/comptime-intrinsics.md) — what is a compiler intrinsic vs deferred to stdlib.
-- [SPEC.md](../../../SPEC.md) — locked decisions, source of truth.
+- [doc/language/](../../../doc/language/README.md) — full language reference index.

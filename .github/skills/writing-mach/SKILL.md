@@ -295,7 +295,8 @@ attribute (write-once, before the decl, same module). Closed attribute set:
 `$if (C) {} $or (C) {} $or {}` — only the taken branch compiles. Value
 intrinsics `$size_of(T) $align_of(T) $offset_of(T, f)` yield comptime unsigned
 integers; `$error("msg")` / `$assert(C, "msg")` are diagnostics. The full
-comptime/asm grammar is out of scope here — see `SPEC.md`.
+comptime/asm grammar is out of scope here — see the comptime docs under
+[doc/language/](../../../doc/language/README.md).
 
 ## Reference
 
@@ -316,4 +317,4 @@ comptime/asm grammar is out of scope here — see `SPEC.md`.
 - [doc/language/statements.md](../../../doc/language/statements.md) — statement forms
 - [doc/language/expressions.md](../../../doc/language/expressions.md) — expression forms
 - [doc/language/documentation.md](../../../doc/language/documentation.md) — docstring conventions
-- [SPEC.md](../../../SPEC.md) — locked decisions, comptime channel, inline asm
+- [doc/language/](../../../doc/language/README.md) — full language reference index

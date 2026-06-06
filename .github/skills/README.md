@@ -20,9 +20,8 @@ reminders and points back to writing-mach for the full rules.
 
 ## Authoritative references
 
-The skills are the fast path, not the contract. For exhaustive detail:
-
-- [`doc/language/*.md`](../../doc/language/) — the complete per-feature reference.
-  Each skill links the relevant files in its own Reference section.
-- [`SPEC.md`](../../SPEC.md) — locked-decision source of truth. When a skill and
-  SPEC.md disagree, SPEC.md wins, and the skill is the bug.
+The skills are the fast path, not the contract. For exhaustive detail, see
+[`doc/language/`](../../doc/language/README.md) — the complete per-feature
+reference and source of truth. Each skill links the relevant files in its own
+Reference section. When a skill and the reference disagree, the reference wins,
+and the skill is the bug.
