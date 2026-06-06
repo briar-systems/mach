@@ -5,7 +5,7 @@ as conditions, and as call arguments.
 
 ## Literals
 
-See [literals.md](literals.md) — numeric, char, string forms.
+See [literals.md](literals.md) — numeric, char, string, and `nil` forms.
 
 ## Names
 
@@ -17,7 +17,7 @@ counter             # local or module-level binding
 core.add            # symbol from module `core`
 ```
 
-## Record / array / union / vector literals
+## Record / array / union literals
 
 A type name followed by a brace-delimited initializer:
 
@@ -25,18 +25,19 @@ A type name followed by a brace-delimited initializer:
 val p:    Point             = Point{ x: 1, y: 2 };
 val a:    [3]i64            = [3]i64{10, 20, 30};
 val u:    Number            = Number{ i: 99 };
-val v:    f32x4             = f32x4{1.0, 2.0, 3.0, 4.0};
 val pair: Pair[i64, u8]     = Pair[i64, u8]{ left: 5, right: 6u8 };
 ```
 
 For generics, the type arguments appear in brackets before the body.
 
+Vector literals (`f32x4{ ... }`) follow the same shape but depend on the
+SIMD vector types, which are not yet implemented — see [types.md](types.md).
+
 ## Field / index access
 
 ```mach
-val x:     i64 = p.x;
-val first: i64 = a[0];
-val lane:  f32 = v[2];
+val x:     i64 = p.x;            # record field
+val first: i64 = a[0];           # array index
 ```
 
 ## Function calls
@@ -44,8 +45,11 @@ val lane:  f32 = v[2];
 ```mach
 add(2, 3)
 identity[i64](42)               # generic call: type args in [ ]
-sum(3, 10i64, 20i64, 30i64)     # variadic
+sum(3, 10i64, 20i64, 30i64)     # variadic (call site parses; see fun.md)
 ```
+
+Variadic call sites parse, but the callee-side `va_list` machinery is not
+yet implemented — see [fun.md](fun.md).
 
 For comptime parameters, the value is passed positionally like a runtime
 argument — the function signature determines whether it must be comptime:

@@ -1,32 +1,36 @@
 # Operators
 
+SIMD vector operands described below are part of the planned vector
+design and are not yet implemented — see [types.md](types.md).
+
 ## Arithmetic
 
 `+` `-` `*` `/` `%` — work on integer and floating-point scalars. SIMD
-vector types support the same operators, applied lane-wise.
+vector types are intended to support the same operators, applied lane-wise.
 
 ```mach
 val s: i64    = 10 + 20;
 val q: f32    = 1.5 * 2.0;
-val v: f32x4  = a + b;       # lane-wise add
+val v: f32x4  = a + b;       # lane-wise add (vectors not yet implemented)
 ```
 
 ## Bitwise
 
-`&` `|` `^` `~` `<<` `>>` — work on integer scalars and integer SIMD
-vectors.
+`&` `|` `^` `~` `<<` `>>` — work on integer scalars and (planned) integer
+SIMD vectors.
 
 ```mach
 val x: i64    = (a & b) | (c ^ d);
 val y: i64    = x << 2;
-val z: i32x4  = (m & n) ^ k;
+val z: i32x4  = (m & n) ^ k;     # vectors not yet implemented
 ```
 
 ## Comparison
 
 `==` `!=` `<` `>` `<=` `>=` — produce `u8` (`1` or `0`). Mach has no compiler
 `bool`; `bool` is a stdlib alias for `u8`. Compare values of matching types.
-On SIMD vectors, comparison produces a mask vector (lane-wise).
+A pointer may be compared against `nil` (the null-address literal). On the
+planned SIMD vectors, comparison produces a mask vector (lane-wise).
 
 ## Logical
 

@@ -86,6 +86,12 @@ fields, not other contexts.
 
 ## Variadic functions
 
+> **Partially implemented.** The parser accepts a trailing `...` parameter
+> and the function type carries a `variadic` flag, but the `va_list` type
+> and the `va_start` / `va_arg` / `va_end` intrinsics are not yet seeded or
+> lowered. The `sum` example above describes the intended form, not what
+> compiles today. Tracked in #1028.
+
 A function ending in `...` accepts a variable number of trailing arguments.
 The body accesses them through `va_list` / `va_start` / `va_arg` / `va_end`,
 matching C's convention.
