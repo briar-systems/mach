@@ -43,11 +43,15 @@ val n: i64            = p.x;            # field access via .
 ## Layout
 
 By default the compiler may insert padding between fields for alignment.
-Two attributes adjust this:
+Two attributes are intended to adjust this:
 
 - `$NAME.align = N;` — minimum type alignment in bytes (power of two).
 - `$NAME.packed = true;` — disable padding entirely (binary protocol /
   on-disk layouts).
+
+> **Not yet honored.** Both attributes parse but do not currently affect
+> layout — the compiler always uses the natural C-style rule. See the
+> status note in [comptime-attrs.md](comptime-attrs.md).
 
 ## See also
 

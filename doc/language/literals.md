@@ -40,6 +40,18 @@ String escapes: the char escape set plus `\"`.
 A string literal is a single line. There is no multi-line string syntax —
 long content uses `\n` escapes or lives in external files.
 
+## `nil`
+
+The `nil` keyword is the null-address literal. With no context it types as
+`*u8`; it coerces to any pointer type. It is not assignable to a function
+type — function/`nil` relationships are expressed through `==` / `!=`
+comparison, not assignment.
+
+```mach
+var p: *i64 = nil;          # null pointer
+val absent: u8 = p == nil;  # nil compares against any pointer
+```
+
 ## Backticks
 
 Backticks (`` ` ``) are **reserved** as a literal/quote-class character

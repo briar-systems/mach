@@ -24,6 +24,11 @@ pub val POINT_X:    i64 = $offset_of(Point, x);
 
 ## Diagnostic intrinsics
 
+> **Not yet implemented.** `$error` and `$assert` parse as comptime
+> directives but the compiler does not yet evaluate them — a `$error(...)`
+> directive is currently accepted and ignored rather than failing
+> compilation. The shapes below describe the intended behavior.
+
 Operate at compile time. `$error` fails compilation; `$assert` is sugar
 over `$if` plus `$error`.
 

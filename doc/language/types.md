@@ -1,9 +1,9 @@
 # Types
 
 Mach has a small set of compiler-shipped concrete types plus a uniform
-type-construction grammar for pointers, arrays, function types, and SIMD
-vectors. There are no compiler-known type aliases — names like `bool`,
-`usize`, and `str` are stdlib `def`s.
+type-construction grammar for pointers, arrays, and function types. There
+are no compiler-known type aliases — names like `bool`, `usize`, and `str`
+are stdlib `def`s.
 
 ## Primitive scalars
 
@@ -13,14 +13,20 @@ vectors. There are no compiler-known type aliases — names like `bool`,
 | Signed int | `i8`, `i16`, `i32`, `i64` |
 | Float | `f32`, `f64` |
 | Untyped pointer | `ptr` |
-| Varargs cursor | `va_list` |
+
+These eleven names are the complete set of compiler-seeded primitive types.
 
 There is no compiler `bool`. `bool` is a stdlib `def bool: u8;` with `true` /
 `false` as stdlib `val`s (`1` / `0`) — see [def.md](def.md).
 
 ## SIMD vectors
 
-Primitive numeric types extend into vectors by appending `x<count>`:
+> **Not yet implemented.** The vector type grammar below describes the
+> planned design. The compiler does not seed vector types today; a name
+> like `f32x4` resolves as an ordinary (unbound) identifier, not a type.
+
+The planned design extends primitive numeric types into vectors by
+appending `x<count>`:
 
 ```mach
 f32x4           # 4 lanes of f32

@@ -3,9 +3,9 @@
 Per-element reference docs. Each file covers one language component;
 read the index below or follow `see also` links to navigate.
 
-The live, terse spec lives in `SPEC.md` at the repo root. This directory
-expands each section into focused docs with grammar, examples, and
-neighboring links.
+This directory is the authoritative reference for the locked Mach
+dialect. Each file is a focused doc with grammar, examples, and
+neighboring links; start from the index below.
 
 ## Files and structure
 
