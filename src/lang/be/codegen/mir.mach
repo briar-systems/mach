@@ -302,6 +302,17 @@ pub val MIR_FDIV:      MirOpcode = 0x1117;
 # the condition code (one of CC_*) rides on `mi.src_width`'s companion field via a
 # dedicated `fcc` carrier set by lowering.
 pub val MIR_FCMP:      MirOpcode = 0x1118;
+# MIR_FMOV: a scalar float register copy (MOVSS / MOVSD), operands [dst, src]. it
+# is the float-domain analogue of MIR_MOV: a plain MIR_MOV between XMM-classed
+# operands would mis-select to a general-purpose MOV, which — because the GP and
+# XMM register id spaces overlap (XMM0 == RAX, XMM1 == RCX, ...) — would silently
+# move the aliased GP register's bytes instead of the float value. isel retags a
+# float MIR_MOV (an operand is an FP-class vreg) to MIR_FMOV using the function's
+# vreg classes; like the float arith ops it then survives selection so regalloc
+# routes a spilled float operand to its frame slot (MOVSS / MOVSD read and write
+# memory directly) and the encoder materializes the SSE move. the width (4 for
+# f32, 8 for f64) selects MOVSS vs MOVSD.
+pub val MIR_FMOV:      MirOpcode = 0x1119;
 
 # float-comparison condition codes carried on a MIR_FCMP. a UCOMISD sets CF/ZF/PF
 # (an UNORDERED result sets all three), so the float compare maps to UNSIGNED
@@ -326,6 +337,19 @@ pub val MIR_VREG_NIL: u32 = 0xFFFFFFFF;
 # general-purpose bank is the first declared class and the float/vector bank is
 # selected by its wide bit width, so no arch-specific class name is hardcoded.
 val REG_CLASS_GP:  u32 = 0;
+
+# true when a vreg id names a float/vector-bank value (a non-GP register class).
+# exposed so instruction selection can identify a float register copy from the
+# function's recorded vreg classes without hardcoding the GP class convention. an
+# out-of-range vreg id is not an FP value.
+# ---
+# fn:   the MIR function owning the vreg table
+# vreg: the vreg id to test
+# ret:  true when the vreg's class is the float/vector bank
+pub fun vreg_is_fp(fn: *MirFunction, vreg: u32) bool {
+    if (vreg >= fn.vreg_count) { ret false; }
+    ret fn.vregs[vreg].class != REG_CLASS_GP;
+}
 # minimum register width in bits that identifies the float/vector bank.
 val FP_CLASS_MIN_BITS: u32 = 128;
 
@@ -2894,6 +2918,31 @@ fun emit_mov(ctx: *LowerCtx, mb: *MirBlock, dst: MirOperand, src: MirOperand) Re
     ret push_instr(ctx, mb, mi);
 }
 
+# emit_fmov: append a scalar floating-point register copy `MIR_FMOV (dst) <- (src)`
+# at the given float width (4 for f32, 8 for f64). used for the CLASS_FP ABI
+# pre-coloring moves — a float argument / return / parameter that pairs an XMM
+# physical register with a value vreg or a float-constant immediate. emitting the
+# dedicated MIR_FMOV (rather than MIR_MOV) is mandatory when EITHER side is a bare
+# XMM physical register or a float-constant immediate, because neither carries an
+# FP register class for isel to recover: a plain MIR_MOV would select to a
+# general-purpose MOV and move the GP register that aliases the XMM id (XMM0 ==
+# RAX), placing the float in the wrong register file. the encoder materializes the
+# MOVSS / MOVSD (or, for an immediate, MOVABS + MOVQ) byte form from MIR_FMOV.
+fun emit_fmov(ctx: *LowerCtx, mb: *MirBlock, dst: MirOperand, src: MirOperand, w: u8) Result[bool, str] {
+    val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
+    if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
+    val ops: *MirOperand = unwrap_ok[*MirOperand, str](r);
+    ops[0] = dst;
+    ops[1] = src;
+    var mi: MirInstr;
+    mi.opcode        = MIR_FMOV;
+    mi.operands      = ops;
+    mi.operand_count = 2;
+    mi.width         = w;
+    mi.src_width     = w;
+    ret push_instr(ctx, mb, mi);
+}
+
 # emit_mov_w: append a `MIR_MOV (dst) <- (src)` driven at an explicit operation
 # width rather than the machine word. used for the division dividend / result
 # pre-coloring moves, where the move must be exactly the divide's width so a
@@ -3385,8 +3434,23 @@ fun emit_arg_slot(ctx: *LowerCtx, mb: *MirBlock, slot: abi.ParamSlot, argop: Mir
         if (is_err[bool, str](ar)) { ret ar; }
         ret emit_mov(ctx, mb, op_preg(slot.reg::u32), op_mem_value(base, 0));
     }
-    # single GP or FP register scalar argument.
+    # single FP register scalar argument: a float copy into the XMM argument
+    # register. emitted as MIR_FMOV so a float-constant immediate or the bare XMM
+    # preg (neither of which carries an FP register class) still selects to the SSE
+    # move rather than a general-purpose MOV of the GP register aliasing the XMM id.
+    if (slot.class == abi.CLASS_FP) {
+        ret emit_fmov(ctx, mb, op_preg(slot.reg::u32), argop, fp_move_width(size));
+    }
+    # single GP register scalar argument.
     ret emit_mov(ctx, mb, op_preg(slot.reg::u32), argop);
+}
+
+# fp_move_width: the SSE move width (4 for f32, 8 for f64) for a CLASS_FP scalar of
+# `size` bytes. a CLASS_FP slot is always a 4- or 8-byte scalar float; any other
+# size is an ABI-classification bug, defaulted to the f64 form.
+fun fp_move_width(size: u64) u8 {
+    if (size == 4) { ret 4; }
+    ret 8;
 }
 
 # copy_aggregate: memcpy `size` bytes from the source aggregate storage (`src`, a
@@ -3686,6 +3750,12 @@ fun lower_ret(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bo
         val ar: Result[bool, str] = addr_to_vreg(ctx, mb, rvop, ?base);
         if (is_err[bool, str](ar)) { ret ar; }
         val mr: Result[bool, str] = emit_mov(ctx, mb, op_preg(slot.reg::u32), op_mem_value(base, 0));
+        if (is_err[bool, str](mr)) { ret mr; }
+    } or (slot.class == abi.CLASS_FP) {
+        # scalar float return: a float copy into XMM0. emitted as MIR_FMOV so a
+        # float-constant immediate or the bare XMM0 preg still selects to the SSE
+        # move rather than a general-purpose MOV of RAX (which aliases XMM0's id).
+        val mr: Result[bool, str] = emit_fmov(ctx, mb, op_preg(slot.reg::u32), rvop, fp_move_width(rsz));
         if (is_err[bool, str](mr)) { ret mr; }
     } or (slot.reg >= 0) {
         val mr: Result[bool, str] = emit_mov(ctx, mb, op_preg(slot.reg::u32), rvop);
