@@ -19,6 +19,12 @@ IMACH := $(BIN)/imach
 SMACH := $(BIN)/smach
 MACH  := $(BIN)/mach
 
+# every bootstrap stage recompiles the whole source tree, so any source or
+# manifest change invalidates all stages. list the sources as prerequisites so
+# plain `make` rebuilds the chain on a source change (no full `clean` + cmach
+# re-download needed).
+SRC := $(shell find src dep -name '*.mach' 2>/dev/null) mach.toml
+
 .PHONY: mach clean
 
 mach: $(MACH)
@@ -29,17 +35,17 @@ $(BIN)/cmach:
 	@echo "downloading cmach v$(CMACH_VERSION)..."
 	@curl -fsSL "$(CMACH_URL)" -o $@ && chmod +x $@
 
-$(IMACH): $(CMACH) | $(BIN)
+$(IMACH): $(CMACH) $(SRC) | $(BIN)
 	@rm -rf $(OUT)/imach
 	@echo "  cmach -> imach"
 	@$(CMACH) build . -o $@ --artifacts imach/linux
 
-$(SMACH): $(IMACH) | $(BIN)
+$(SMACH): $(IMACH) $(SRC) | $(BIN)
 	@rm -rf $(OUT)/smach
 	@echo "  imach -> smach"
 	@$(IMACH) build . -o $@ --artifacts smach/linux
 
-$(MACH): $(SMACH) | $(BIN)
+$(MACH): $(SMACH) $(SRC) | $(BIN)
 	@rm -rf $(OUT)/mach
 	@echo "  smach -> mach"
 	@$(SMACH) build . -o $@ --artifacts mach/linux
