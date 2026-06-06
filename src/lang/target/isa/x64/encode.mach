@@ -2473,6 +2473,15 @@ fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
         ret encode_float_mov(f, mi, ?st.buf);
     }
 
+    # a float conversion survives selection keeping its dedicated MIR_FP_* opcode;
+    # the encoder materializes the SSE conversion byte sequence here, routing the
+    # float side through the XMM scratch and the integer side through the GP scratch
+    # so any spilled frame-slot operand encodes (the reg-reg-only `encode_cvt` path
+    # cannot) and selecting the SS vs SD form from the carried float-side width.
+    if (is_mir_float_conv(mi.opcode)) {
+        ret encode_float_conv(f, mi, ?st.buf);
+    }
+
     # the AL-guarded variadic FP-register spill survives selection keeping its
     # MIR_VA_FP_SAVE opcode; the encoder materializes its self-contained TEST ; JZ ;
     # MOVSD sequence here (the conditional skip is intra-instruction, so no block
@@ -2877,6 +2886,144 @@ fun encode_float_mov(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Resu
     val ld: Result[bool, str] = emit_float_load(src, FLOAT_SCRATCH0, w, buf);
     if (is_err[bool, str](ld)) { ret ld; }
     ret emit_float_store(dst, FLOAT_SCRATCH0, w, buf);
+}
+
+# is_mir_float_conv: true when a post-isel opcode is a surviving float conversion
+# (FP_TRUNC / FP_EXT / FP_TO_SI / FP_TO_UI / SI_TO_FP / UI_TO_FP). these keep their
+# dedicated MIR opcode through selection; the encoder materializes the SSE byte
+# sequence here.
+fun is_mir_float_conv(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_FP_TRUNC || op == mir.MIR_FP_EXT ||
+        op == mir.MIR_FP_TO_SI || op == mir.MIR_FP_TO_UI ||
+        op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP;
+}
+
+# emit_gp_load: load a GP integer operand into the GP scratch register `gp` at byte
+# width `w`. the operand resolves after register allocation to a physical register
+# (a plain MOV), a frame slot (a `MOV reg, [rbp + off]` reload), or an immediate (a
+# `MOV reg, imm`). a float-bank operand would mean the allocator placed an integer
+# value in the wrong bank — rejected loudly. mirrors `emit_float_load` for the GP
+# side of a conversion.
+fun emit_gp_load(op: isa.Operand, gp: i32, w: u8, buf: *ByteBuf) Result[bool, str] {
+    if (op.kind == isa.OPK_REG || op.kind == isa.OPK_MEM || op.kind == isa.OPK_IMM) {
+        var ld: isa.Inst;
+        zero_inst(?ld);
+        ld.opcode = x64.MOV;
+        ld.dst    = isa.make_reg(gp, w);
+        ld.src1   = op;
+        ld.size   = w;
+        ld.flags  = width_flags(w);
+        encode_inst(?ld, buf);
+        ret ok[bool, str](true);
+    }
+    ret err[bool, str]("encode: conversion integer operand is not a register, frame slot, or immediate");
+}
+
+# emit_gp_store: store the GP scratch register `gp` to a conversion's integer
+# destination at byte width `w` — a physical register (a plain MOV) or a frame slot
+# (a `MOV [rbp + off], reg` spill). a float-bank destination is a backend bug,
+# rejected loudly. mirrors `emit_float_store` for the GP side of a conversion.
+fun emit_gp_store(dst: isa.Operand, gp: i32, w: u8, buf: *ByteBuf) Result[bool, str] {
+    if (dst.kind == isa.OPK_REG || dst.kind == isa.OPK_MEM) {
+        var st: isa.Inst;
+        zero_inst(?st);
+        st.opcode = x64.MOV;
+        st.dst    = dst;
+        st.src1   = isa.make_reg(gp, w);
+        st.size   = w;
+        st.flags  = width_flags(w);
+        encode_inst(?st, buf);
+        ret ok[bool, str](true);
+    }
+    ret err[bool, str]("encode: conversion integer destination is not a register or frame slot");
+}
+
+# emit_cvt_reg: emit one register-register SSE conversion `cvt_op dst_reg, src_reg`
+# at the given integer-side byte width (sizes REX.W for the GP operand of a
+# CVTSI2SS/SD / CVTTSS2SI/SD; a float-to-float CVTSS2SD / CVTSD2SS ignores it).
+fun emit_cvt_reg(cvt_op: u16, dst_reg: i32, src_reg: i32, int_w: u8, buf: *ByteBuf) {
+    var cvt: isa.Inst;
+    zero_inst(?cvt);
+    cvt.opcode = cvt_op;
+    cvt.dst    = isa.make_reg(dst_reg, 16);
+    cvt.src1   = isa.make_reg(src_reg, 16);
+    cvt.size   = int_w;
+    cvt.flags  = width_flags(int_w);
+    encode_inst(?cvt, buf);
+}
+
+# encode_float_conv: materialize a fully-resolved float conversion into its SSE byte
+# sequence, routing operands through the fixed scratch registers (XMM FLOAT_SCRATCH0
+# for the float side, the GP SCRATCH_REG for the integer side) exactly as
+# `encode_float_arith` does — so every operand shape regalloc can produce (a
+# register, a spilled `[rbp + off]` frame slot, or an immediate) encodes without the
+# reg-reg-only `encode_cvt` path. the carried widths (`mi.width` = result type,
+# `mi.src_width` = operand-0 type, both from `set_conv_widths`) select the
+# single-precision SS vs double SD form on the float side and size the GP integer
+# side for REX.W. operand layout is `[dst, src]`.
+#
+# FP_TO_SI / FP_TO_UI map to the signed CVTTSS2SI / CVTTSD2SI: a full unsigned
+# 64-bit conversion needs a range-fixup sequence x86-64 lacks a single instruction
+# for; the signed form is correct for every value in signed range, which is what the
+# language's reachable conversions produce, and matches the prior selection.
+fun encode_float_conv(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Result[bool, str] {
+    if (mi.operand_count < 2) {
+        ret err[bool, str]("encode: float conversion missing operands");
+    }
+    val op: mir.MirOpcode = mi.opcode;
+    val dst_w: u8 = mi.width;
+    val src_w: u8 = mi.src_width;
+
+    # FP_TRUNC (f64 -> f32) and FP_EXT (f32 -> f64): float on both sides.
+    if (op == mir.MIR_FP_TRUNC || op == mir.MIR_FP_EXT) {
+        val rd: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], 16);
+        if (is_err[isa.Operand, str](rd)) { ret err[bool, str](unwrap_err[isa.Operand, str](rd)); }
+        val dst: isa.Operand = unwrap_ok[isa.Operand, str](rd);
+        val rs: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[1], src_w);
+        if (is_err[isa.Operand, str](rs)) { ret err[bool, str](unwrap_err[isa.Operand, str](rs)); }
+        val src: isa.Operand = unwrap_ok[isa.Operand, str](rs);
+
+        val ld: Result[bool, str] = emit_float_load(src, FLOAT_SCRATCH0, src_w, buf);
+        if (is_err[bool, str](ld)) { ret ld; }
+        var cvt_op: u16 = x64.CVTSD2SS;
+        if (op == mir.MIR_FP_EXT) { cvt_op = x64.CVTSS2SD; }
+        emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, FLOAT_SCRATCH0, 0, buf);
+        ret emit_float_store(dst, FLOAT_SCRATCH0, dst_w, buf);
+    }
+
+    # SI_TO_FP / UI_TO_FP (int -> float): dst is float (dst_w picks SS / SD), src is
+    # an integer (src_w sizes the GP load + REX.W of the CVTSI2SS/SD).
+    if (op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP) {
+        val rd: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], 16);
+        if (is_err[isa.Operand, str](rd)) { ret err[bool, str](unwrap_err[isa.Operand, str](rd)); }
+        val dst: isa.Operand = unwrap_ok[isa.Operand, str](rd);
+        val rs: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[1], src_w);
+        if (is_err[isa.Operand, str](rs)) { ret err[bool, str](unwrap_err[isa.Operand, str](rs)); }
+        val src: isa.Operand = unwrap_ok[isa.Operand, str](rs);
+
+        val ld: Result[bool, str] = emit_gp_load(src, x64.SCRATCH_REG, src_w, buf);
+        if (is_err[bool, str](ld)) { ret ld; }
+        var cvt_op: u16 = x64.CVTSI2SD;
+        if (dst_w == 4) { cvt_op = x64.CVTSI2SS; }
+        emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, x64.SCRATCH_REG, src_w, buf);
+        ret emit_float_store(dst, FLOAT_SCRATCH0, dst_w, buf);
+    }
+
+    # FP_TO_SI / FP_TO_UI (float -> int): src is float (src_w picks SS / SD), dst is
+    # an integer (dst_w sizes the GP store + REX.W of the CVTTSS/SD2SI).
+    val rd: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], dst_w);
+    if (is_err[isa.Operand, str](rd)) { ret err[bool, str](unwrap_err[isa.Operand, str](rd)); }
+    val dst: isa.Operand = unwrap_ok[isa.Operand, str](rd);
+    val rs: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[1], 16);
+    if (is_err[isa.Operand, str](rs)) { ret err[bool, str](unwrap_err[isa.Operand, str](rs)); }
+    val src: isa.Operand = unwrap_ok[isa.Operand, str](rs);
+
+    val ld: Result[bool, str] = emit_float_load(src, FLOAT_SCRATCH0, src_w, buf);
+    if (is_err[bool, str](ld)) { ret ld; }
+    var cvt_op: u16 = x64.CVTTSD2SI;
+    if (src_w == 4) { cvt_op = x64.CVTTSS2SI; }
+    emit_cvt_reg(cvt_op, x64.SCRATCH_REG, FLOAT_SCRATCH0, dst_w, buf);
+    ret emit_gp_store(dst, x64.SCRATCH_REG, dst_w, buf);
 }
 
 # encode_va_fp_save: materialize the AL-guarded variadic FP-register spill
