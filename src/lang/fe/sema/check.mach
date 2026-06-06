@@ -47,6 +47,9 @@ use token: mach.lang.fe.token;
 use ast:   mach.lang.fe.ast;
 use id:    mach.lang.fe.ast.id;
 use expr:  mach.lang.fe.ast.expr;
+use adecl: mach.lang.fe.ast.decl;
+use comptime: mach.lang.fe.comptime;
+use resolve: mach.lang.fe.resolve;
 use sema:  mach.lang.fe.sema.context;
 use coerce: mach.lang.fe.sema.coerce;
 use generics: mach.lang.fe.sema.generics;
@@ -132,6 +135,136 @@ pub fun check_call(sc: *sema.SemaContext, callee_sig: ty.TypeId, args_start: u32
         i = i + 1;
     }
     ret ok_all;
+}
+
+# checks a call to a function with comptime value parameters. arity is checked
+# against the AST parameter list (which includes the comptime ones); each
+# `$`-parameter's argument must be compile-time foldable (else a diagnostic);
+# each runtime-parameter's argument is checked assignable against the stripped
+# TYPE_FUN signature, whose params omit the comptime ordinals.
+# ---
+# sc:         the active sema context
+# callee_sig: the callee's stripped TYPE_FUN (comptime params removed)
+# callee:     the call's callee expression id (to resolve the origin DeclFun)
+# f:          the callee's DeclFun, read from its origin AST
+# args_start: start index into sc.a.expr_ids for the argument expressions
+# args_len:   number of arguments supplied at the call site
+# span:       source range of the call
+# ret:        true when the call is well-typed, false (with a diagnostic) otherwise
+pub fun check_comptime_call(sc: *sema.SemaContext, callee_sig: ty.TypeId, callee: id.ExprId, f: *adecl.DeclFun, args_start: u32, args_len: u32, span: token.Span) bool {
+    val params_ast: *ast.Ast = callee_origin_ast(sc, callee);
+    if (params_ast == nil) { ret true; }
+
+    val total: u32 = f.params_len;
+    if (f.variadic) {
+        if (args_len < total) {
+            report(sc, span, "arity mismatch: too few call arguments");
+            ret false;
+        }
+    }
+    or (args_len != total) {
+        report(sc, span, "arity mismatch: wrong number of call arguments");
+        ret false;
+    }
+
+    val sig_opt: Option[*ty.Type] = ty.get(?sc.s.types, callee_sig);
+    if (is_none[*ty.Type](sig_opt)) { ret true; }
+    val sig: *ty.Type = unwrap[*ty.Type](sig_opt);
+    val rt_start: u32 = sig.data.fn.params_start;
+    val rt_count: u32 = sig.data.fn.params_len;
+
+    var ok_all: bool = true;
+    var pi: u32 = 0;
+    var rt_seen: u32 = 0;
+    for (pi < total) {
+        val tn: *adecl.TypedName = ?params_ast.typed_names[f.params_start + pi];
+        val arg_eid: id.ExprId = sc.a.expr_ids[args_start + pi];
+        val arg_span: token.Span = expr_span_of(sc, arg_eid, span);
+
+        if (tn.comptime) {
+            # the argument bound to a `$`-parameter must fold to a compile-time
+            # constant in the caller's comptime context. an argument that itself
+            # references a comptime parameter (a recursive comptime-param call,
+            # e.g. `f($n - 1)`) is unfoldable at sema (the parameter's value is
+            # per call site) but IS foldable at lowering, where the value is bound;
+            # its constness is checked there, with an instantiation cap guarding
+            # unbounded recursion.
+            if (!arg_references_comptime_param(sc, arg_eid) && !arg_names_module_constant(sc, arg_eid)) {
+                val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, arg_eid, ?sc.s.interner);
+                if (is_err[comptime.CTValue, str](ev)) {
+                    report(sc, arg_span, "comptime argument is not a compile-time constant");
+                    ok_all = false;
+                }
+            }
+            pi = pi + 1;
+            cnt;
+        }
+
+        # a runtime parameter: check the argument against the next stripped
+        # signature param.
+        if (rt_seen < rt_count) {
+            val pty_opt: Option[ty.TypeId] = ty.get_param(?sc.s.types, rt_start + rt_seen);
+            if (is_some[ty.TypeId](pty_opt)) {
+                val expected: ty.TypeId = unwrap[ty.TypeId](pty_opt);
+                var actual: ty.TypeId = expr_type_of(sc, arg_eid);
+                val co: Option[ty.TypeId] = coerce.try_coerce_literal(sc, arg_eid, expected);
+                if (is_some[ty.TypeId](co)) { actual = unwrap[ty.TypeId](co); }
+                if (!check_assignable(sc, expected, actual, arg_span)) { ok_all = false; }
+            }
+            rt_seen = rt_seen + 1;
+        }
+        pi = pi + 1;
+    }
+    ret ok_all;
+}
+
+# reports whether `eid` names a constant IMPORTED from another module (a bare
+# import or a module-qualified member `alias.CONST`, both SYM_IMPORTED). such a
+# value lives only in the defining module's comptime context, which sema does not
+# hold, so its constness fold is deferred to lowering. a local or module-level
+# SYM_VAL is NOT deferred: a comptime one folds in the eager check here, and a
+# non-foldable (runtime) one is reported eagerly rather than slipping through an
+# uninstantiated template whose body never lowers.
+fun arg_names_module_constant(sc: *sema.SemaContext, eid: id.ExprId) bool {
+    val so: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, eid);
+    if (is_none[*resolve.Symbol](so)) { ret false; }
+    ret unwrap[*resolve.Symbol](so).kind == resolve.SYM_IMPORTED;
+}
+
+# walks `eid` reporting whether any leaf identifier resolves to a comptime value
+# parameter (SYM_PARAM with SYM_FLAG_COMPTIME). such an argument is foldable only
+# at lowering, so its constness check is deferred there.
+fun arg_references_comptime_param(sc: *sema.SemaContext, eid: id.ExprId) bool {
+    if (eid == id.EXPR_NIL) { ret false; }
+    val e_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+
+    if (e.kind == expr.EXPR_KIND_IDENT) {
+        val so: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, eid);
+        if (is_none[*resolve.Symbol](so)) { ret false; }
+        val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+        ret sym.kind == resolve.SYM_PARAM && (sym.flags & resolve.SYM_FLAG_COMPTIME) != 0;
+    }
+    if (e.kind == expr.EXPR_KIND_BINARY) {
+        ret arg_references_comptime_param(sc, e.data.binary.lhs)
+         || arg_references_comptime_param(sc, e.data.binary.rhs);
+    }
+    if (e.kind == expr.EXPR_KIND_UNARY) {
+        ret arg_references_comptime_param(sc, e.data.unary.operand);
+    }
+    ret false;
+}
+
+# the AST a call's callee is declared in: the caller's own AST for a local
+# callee, or the origin module's AST for a cross-module one. nil when the callee
+# does not resolve to a function declaration.
+fun callee_origin_ast(sc: *sema.SemaContext, callee: id.ExprId) *ast.Ast {
+    val so: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, callee);
+    if (is_none[*resolve.Symbol](so)) { ret nil; }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+    if (sym.origin == sc.own_module) { ret sc.a; }
+    ret sess.module_ast(sc.s, sym.origin);
 }
 
 # checks an index expression `object[index]`. the object must be a pointer

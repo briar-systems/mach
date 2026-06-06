@@ -136,8 +136,145 @@ pub fun lower_module(
         ret err[ir.Module, str](unwrap_err[bool, str](drain_r));
     }
 
+    # emit one concrete body per comptime value-parameter instance collected at
+    # this module's call sites, draining to fixpoint. a value-instance body may
+    # call generics (landing on the type-instance worklist) or other comptime-
+    # param functions (landing back here), so both worklists are drained in turn.
+    val vdrain_r: Result[bool, str] = drain_value_instances(?lc, s, a, sema_result, rr);
+    if (is_err[bool, str](vdrain_r)) {
+        lctx.dnit_context(?lc);
+        ir.dnit_module(?m);
+        ret err[ir.Module, str](unwrap_err[bool, str](vdrain_r));
+    }
+
     lctx.dnit_context(?lc);
     ret ok[ir.Module, str](m);
+}
+
+# drains the comptime value-parameter instance worklist to fixpoint, emitting one
+# weak body per collected `(decl, origin, comptime-values)` instance. each body is
+# lowered against its DECLARING module's AST / typing / name-resolution with the
+# instance's `$param -> CTValue` bindings active, so its `$param`-gated `$if`s fold
+# to the selected arm. a body may enqueue further value instances (a comptime-
+# param function calling another) or type instances (a generic call); the value
+# worklist is processed until empty, and any type instances it produced are then
+# drained too. the context's phase inputs are restored after the drain.
+# ---
+# lc:        the active lowering context (its value worklist is drained)
+# s:         shared session (origin-module registries)
+# home_a:    the current module's AST (restored after the drain)
+# home_sema: the current module's typing (restored after the drain)
+# home_rr:   the current module's name resolution (restored after the drain)
+# ret:       true once both worklists are empty, or the first lowering error
+fun drain_value_instances(lc: *lctx.LowerContext, s: *sess.Session,
+                          home_a: *ast.Ast, home_sema: *sema.SemaResult,
+                          home_rr: *resolve.ResolveResult) Result[bool, str] {
+    # alternate value-instance and type-instance draining to fixpoint: a value
+    # body may queue type instances (a generic call), and a type body may queue
+    # value instances (a comptime-param call), so loop until both worklists are
+    # fully consumed. each worklist resumes from its own cursor, so every body —
+    # value or generic — is emitted exactly once.
+    var processed: u32 = 0;
+    for (processed < lc.vinst_len || lc.inst_drained < lc.inst_len) {
+        for (processed < lc.vinst_len) {
+            # snapshot the entry by value: the worklist array may grow (reallocate)
+            # while this instance's body enqueues transitive instances.
+            val decl_id: aid.DeclId    = lc.vinsts[processed].decl;
+            val origin:  sess.ModuleId = lc.vinsts[processed].origin;
+            val val_len: u32           = lc.vinsts[processed].val_len;
+            val name:    intern.StrId  = lc.vinsts[processed].name;
+            val vals:    *comptime.CTValue = lc.vinsts[processed].vals;
+            val names:   *intern.StrId     = lc.vinsts[processed].names;
+
+            val r: Result[bool, str] = emit_one_value_instance(lc, s, decl_id, origin, vals, names, val_len, name);
+            if (is_err[bool, str](r)) {
+                lc.a           = home_a;
+                lc.sema_result = home_sema;
+                lc.rr          = home_rr;
+                lc.fqn         = sess.module_fqn(s, lc.own_module);
+                lc.subst       = nil;
+                lc.subst_len   = 0;
+                ret r;
+            }
+
+            processed = processed + 1;
+        }
+
+        # drain any type instances queued by the value bodies just emitted; the
+        # persistent cursor in drain_instances emits each generic body once.
+        val td: Result[bool, str] = drain_instances(lc, s, home_a, home_sema, home_rr);
+        if (is_err[bool, str](td)) { ret td; }
+    }
+
+    lc.a           = home_a;
+    lc.sema_result = home_sema;
+    lc.rr          = home_rr;
+    lc.fqn         = sess.module_fqn(s, lc.own_module);
+    lc.subst       = nil;
+    lc.subst_len   = 0;
+    ret ok[bool, str](true);
+}
+
+# emits one value-instance body: binds the context to the instance's origin
+# module — AST, typing, name-resolution, FQN, AND comptime context — then pushes
+# the instance's `$param -> CTValue` bindings onto the ORIGIN module's comptime
+# param scope (a dedicated stack, marked so the bindings are popped afterward — on
+# the error path too, so a failed instance never poisons the next), lowers the
+# template under the instance name, pops the bindings, and restores the home
+# comptime context. binding the origin module's comptime context (not the calling
+# module's) lets a value-instance body fold `$if` gates that reference the
+# defining module's own `pub val`s. every origin registry is populated before the
+# drain runs (the caller already emitted an extern reference to this instance), so
+# a missing one is a coherence violation, not a no-op: it aborts with an internal
+# error rather than silently dropping the body (which would surface as a confusing
+# undefined-symbol link failure).
+fun emit_one_value_instance(lc: *lctx.LowerContext, s: *sess.Session,
+                            decl_id: aid.DeclId, origin: sess.ModuleId,
+                            vals: *comptime.CTValue, names: *intern.StrId, val_len: u32,
+                            name: intern.StrId) Result[bool, str] {
+    val oa: *ast.Ast = sess.module_ast(s, origin);
+    if (oa == nil) { ret err[bool, str]("lower: value-instance origin AST not registered"); }
+    val osema: *sema.SemaResult = (sess.module_sema_ptr(s, origin))::*sema.SemaResult;
+    if (osema == nil) { ret err[bool, str]("lower: value-instance origin typing not registered"); }
+    val orr: *resolve.ResolveResult = (sess.module_resolve_ptr(s, origin))::*resolve.ResolveResult;
+    if (orr == nil) { ret err[bool, str]("lower: value-instance origin name-resolution not registered"); }
+    val octx: *comptime.ComptimeCtx = (sess.module_comptime_ptr(s, origin))::*comptime.ComptimeCtx;
+    if (octx == nil) { ret err[bool, str]("lower: value-instance origin comptime context not registered"); }
+
+    val d_opt: Option[*adecl.Decl] = ast.get_decl(oa, decl_id);
+    if (is_none[*adecl.Decl](d_opt)) { ret err[bool, str]("lower: value-instance origin declaration not found"); }
+    val d: *adecl.Decl = unwrap[*adecl.Decl](d_opt);
+    if (d.kind != adecl.DECL_KIND_FUN) { ret err[bool, str]("lower: value-instance origin declaration is not a function"); }
+
+    val home_ctx: *comptime.ComptimeCtx = lc.ctx;
+    lc.a           = oa;
+    lc.sema_result = osema;
+    lc.rr          = orr;
+    lc.fqn         = sess.module_fqn(s, origin);
+    lc.ctx         = octx;
+    lc.subst       = nil;
+    lc.subst_len   = 0;
+
+    # push the `$param -> CTValue` bindings onto the ORIGIN context's param scope;
+    # mark the scope so EXACTLY these bindings are popped afterward. the param scope
+    # shadows same-named consts during this body's lowering without disturbing the
+    # general comptime-const table.
+    val mark: u32 = comptime.param_mark(octx);
+    var bi: u32 = 0;
+    for (bi < val_len) {
+        val rr: Result[bool, str] = comptime.push_param(octx, names[bi], vals[bi]);
+        if (is_err[bool, str](rr)) {
+            comptime.param_truncate(octx, mark);
+            lc.ctx = home_ctx;
+            ret err[bool, str](unwrap_err[bool, str](rr));
+        }
+        bi = bi + 1;
+    }
+
+    val lr: Result[bool, str] = decl.lower_value_instance(lc, decl_id, d, name);
+    comptime.param_truncate(octx, mark);
+    lc.ctx = home_ctx;
+    ret lr;
 }
 
 # drains the instance worklist to fixpoint, emitting one weak body per collected
@@ -159,10 +296,13 @@ pub fun lower_module(
 fun drain_instances(lc: *lctx.LowerContext, s: *sess.Session,
                     home_a: *ast.Ast, home_sema: *sema.SemaResult,
                     home_rr: *resolve.ResolveResult) Result[bool, str] {
-    var processed: u32 = 0;
-    for (processed < lc.inst_len) {
+    # resume from the persistent cursor: a re-entrant drain (type instances queued
+    # while value instances lower) processes only entries enqueued since the last
+    # drain, so each generic body is emitted exactly once.
+    for (lc.inst_drained < lc.inst_len) {
         # snapshot the entry by value: the worklist array may grow (reallocate)
         # while this instance's body enqueues transitive instances.
+        val processed: u32 = lc.inst_drained;
         val decl_id: aid.DeclId      = lc.insts[processed].decl;
         val origin:  sess.ModuleId   = lc.insts[processed].origin;
         val arg_len: u32             = lc.insts[processed].arg_len;
@@ -172,7 +312,7 @@ fun drain_instances(lc: *lctx.LowerContext, s: *sess.Session,
         val r: Result[bool, str] = emit_one_instance(lc, s, decl_id, origin, args, arg_len, name);
         if (is_err[bool, str](r)) { ret r; }
 
-        processed = processed + 1;
+        lc.inst_drained = lc.inst_drained + 1;
     }
 
     # restore the home module's phase inputs (the body lowering swapped them).
