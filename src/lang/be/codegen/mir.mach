@@ -61,6 +61,7 @@ use std.system.panic.panic;
 
 use map: std.collections.map;
 
+use float:   mach.lang.float;
 use intern:  mach.lang.intern;
 use target:  mach.lang.target.resolved;
 use abi:     mach.lang.target.abi;
@@ -2094,16 +2095,14 @@ fun lower_generic(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: 
 #     0, so the encoder's MOVZX / MOVSX selects the narrow / wide source form;
 #   - a comparison (CMP_*) yields an i8 result but the CMP operates at the compared
 #     operand width, so both widths come from operand 0;
-#   - the float conversions (FP_TO_SI / SI_TO_FP family) and other FP ops ride at the
-#     word width: their integer-vs-float operand widths are handled by the float
-#     encoders, outside this base-width carrier, so the prior word-sized behavior is
-#     preserved unchanged;
+#   - the float conversions (FP_TO_SI / SI_TO_FP family) carry their true result and
+#     operand-0 widths so the SSE conversion encoder selects the SS-vs-SD float form
+#     from the float side and sizes the GP integer side for REX.W (`set_conv_widths`);
 #   - a void-result terminator / branch has no natural width and rides at the word
 #     width, which only sizes its address-sized fields.
 fun set_generic_widths(ctx: *LowerCtx, inst: *instr.Instruction, mi: *MirInstr) {
     if (is_float_kind(ctx, inst)) {
-        mi.width     = WORD_WIDTH;
-        mi.src_width = WORD_WIDTH;
+        set_conv_widths(ctx, inst, mi);
         ret;
     }
     if (is_compare_kind(inst.kind) && inst.operand_count >= 1) {
@@ -2124,6 +2123,22 @@ fun set_generic_widths(ctx: *LowerCtx, inst: *instr.Instruction, mi: *MirInstr) 
     if (is_int_conversion_kind(inst.kind) && inst.operand_count >= 1) {
         sw = op_width_of(ctx, inst.operands[0].ty);
     }
+    mi.width     = dw;
+    mi.src_width = sw;
+}
+
+# set_conv_widths: stamp the destination and source widths of a float conversion
+# (FP_TO_SI / FP_TO_UI / SI_TO_FP / UI_TO_FP / FP_TRUNC / FP_EXT). `mi.width` is the
+# result-type width and `mi.src_width` is operand 0's width. the SSE conversion
+# encoder reads the FLOAT side of the pair (the side whose type is f32 / f64,
+# determined from the concrete opcode) to pick the single-precision SS vs double SD
+# form, and sizes the GP integer side from its own width for REX.W. an FP_TRUNC /
+# FP_EXT has float on both sides; its single opcode needs no width selection, so the
+# carried widths only document the operand sizes.
+fun set_conv_widths(ctx: *LowerCtx, inst: *instr.Instruction, mi: *MirInstr) {
+    var dw: u8 = op_width_of(ctx, inst.ty);
+    var sw: u8 = dw;
+    if (inst.operand_count >= 1) { sw = op_width_of(ctx, inst.operands[0].ty); }
     mi.width     = dw;
     mi.src_width = sw;
 }
@@ -2348,6 +2363,15 @@ fun lower_alloca(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
 # address resolves to `[rbp + offset]` and a runtime pointer to `[reg]`), while a
 # symbol / immediate pointer is left as a plain operand for the encoder to form
 # its own reference. the result vreg is the loaded value.
+#
+# a FLOAT load is retagged to MIR_FMOV by isel and emitted through the SSE
+# operand-routing encoder, which materializes a MOVSS / MOVSD off the resolved
+# operand WITHOUT recording a symbol relocation (it has no patch-site hook). a
+# global / function symbol pointer must therefore be LEA-materialized into a GP
+# base vreg first (the LEA carries the relocation through the generic path), so the
+# float load addresses `[base]` rather than an unrelocated `[rip+sym]` that would
+# read the wrong address. an integer load keeps the symbol operand: its generic
+# encoding records the relocation directly.
 fun lower_load(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
     if (inst.operand_count == 0) {
         ret err[bool, str]("mir.lower_ir: load with no pointer operand");
@@ -2356,11 +2380,18 @@ fun lower_load(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
     if (dst == MIR_VREG_NIL) {
         ret err[bool, str]("mir.lower_ir: load defines no result vreg");
     }
+    var mem: MirOperand = mem_operand_of(ctx, inst.operands[0]);
+    if (mem.kind == MIR_OP_SYM && value_is_float(ctx, inst.ty)) {
+        var base: u32 = MIR_VREG_NIL;
+        val ar: Result[bool, str] = addr_to_vreg(ctx, mb, mem, ?base);
+        if (is_err[bool, str](ar)) { ret err[bool, str](unwrap_err[bool, str](ar)); }
+        mem = op_mem_value(base, 0);
+    }
     val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
     if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
     val ops: *MirOperand = unwrap_ok[*MirOperand, str](r);
     ops[0] = op_vreg(dst);
-    ops[1] = mem_operand_of(ctx, inst.operands[0]);
+    ops[1] = mem;
     var mi: MirInstr;
     mi.opcode        = MIR_LOAD;
     mi.operands      = ops;
@@ -2405,10 +2436,22 @@ fun lower_store(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[
         if (is_err[bool, str](ar)) { ret ar; }
         stored = op_vreg(addr);
     }
+    # a FLOAT store is retagged to MIR_FMOV and emitted through the SSE encoder,
+    # which records no symbol relocation for its destination MEM. a global symbol
+    # destination must therefore be LEA-materialized into a GP base vreg first (so
+    # the store addresses `[base]`), mirroring the float-load path; an integer store
+    # keeps the symbol destination and relocates through the generic encoding.
+    var dest: MirOperand = mem_operand_of(ctx, inst.operands[1]);
+    if (dest.kind == MIR_OP_SYM && value_is_float(ctx, inst.operands[0].ty)) {
+        var dbase: u32 = MIR_VREG_NIL;
+        val dr: Result[bool, str] = addr_to_vreg(ctx, mb, dest, ?dbase);
+        if (is_err[bool, str](dr)) { ret err[bool, str](unwrap_err[bool, str](dr)); }
+        dest = op_mem_value(dbase, 0);
+    }
     val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
     if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
     val ops: *MirOperand = unwrap_ok[*MirOperand, str](r);
-    ops[0] = mem_operand_of(ctx, inst.operands[1]);
+    ops[0] = dest;
     ops[1] = stored;
     var mi: MirInstr;
     mi.opcode        = MIR_STORE;
@@ -4603,6 +4646,15 @@ fun lower_value(ctx: *LowerCtx, v: value.Value) MirOperand {
         ret op_imm(0);
     }
     if (v.kind == value.VAL_CONST_FLOAT) {
+        # the constant carries its comptime f64 bit pattern (the `int_lit` /
+        # `float_lit` union alias). an f32 constant must materialize its
+        # single-precision pattern so the low 32 bits an SS-form load / op reads
+        # are the f32 value, not the low half of the f64 representation. narrow
+        # with the shared round-to-nearest-even conversion, matching the global
+        # initializer emission.
+        if (op_width_of(ctx, v.ty) == 4) {
+            ret op_imm(float.f64_to_f32_bits(v.data.int_lit)::i64);
+        }
         ret op_imm(v.data.int_lit::i64);
     }
     if (v.kind == value.VAL_GLOBAL) {
