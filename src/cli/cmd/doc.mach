@@ -1,0 +1,646 @@
+# mach.cli.cmd.doc: `mach doc` — generates reference documentation from source doc-comments.
+#
+# loads the full module graph through the same driver pipeline as `build`,
+# then for every module walks its source text and pairs each `pub`
+# declaration with the run of leading `#` comment lines immediately
+# preceding it. each module is rendered to a Markdown page under
+# `<root>/doc/api/<fqn-as-path>.md` (FQN `a.b.c` -> `doc/api/a/b/c.md`),
+# with an index at `doc/api/README.md` linking every page. the hand-written
+# `doc/language/` material is never touched.
+#
+# doc-comments are not retained on the AST — the lexer drops `#` comments at
+# tokenisation — so this is a textual extraction over the original source,
+# which is the tractable MVP. output is written straight to the filesystem;
+# no std.print or std.format is used.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+
+use page: std.allocator.page;
+
+use os: std.system.os;
+use fs: std.filesystem;
+
+use intern: mach.lang.intern;
+use sess:   mach.lang.session;
+use src:    mach.lang.source;
+use driver: mach.lang.driver;
+use tgt:    mach.lang.target;
+
+use cfg: mach.cli.config;
+use args: mach.cli.args;
+
+# slen: length in bytes of a null-terminated `*u8` string, excluding the terminator.
+# ---
+# s:   null-terminated byte string
+# ret: number of bytes before the terminator (0 for nil)
+fun slen(s: *u8) usize {
+    if (s == nil) { ret 0; }
+    var n: usize = 0;
+    for (s[n] != 0) { n = n + 1; }
+    ret n;
+}
+
+# emit: write a null-terminated `*u8` string to stderr.
+# ---
+# s: null-terminated byte string to write
+fun emit(s: *u8) {
+    os.write(os.STDERR_FD, s, slen(s));
+}
+
+# out: write a null-terminated `*u8` string to stdout.
+# ---
+# s: null-terminated byte string to write
+fun out(s: *u8) {
+    os.write(os.STDOUT_FD, s, slen(s));
+}
+
+# cstr_str: view a null-terminated `*u8` path as a length-counted `str` for the
+# filesystem layer. the returned `str` borrows the same bytes — it must not
+# outlive `s`.
+# ---
+# s:   null-terminated byte string
+# ret: a `str` over the same bytes
+fun cstr_str(s: *u8) str {
+    ret s::str;
+}
+
+# join_into: join `dir` and `leaf` with a single '/' into `buf` and
+# null-terminate. returns the byte length written (excluding the terminator),
+# or 0 if it would not fit.
+fun join_into(buf: *u8, cap: usize, dir: *u8, leaf: *u8) usize {
+    val dl: usize = slen(dir);
+    val ll: usize = slen(leaf);
+    val need: usize = dl + 1 + ll + 1;
+    if (need > cap) { ret 0; }
+    var k: usize = 0;
+    var i: usize = 0;
+    for (i < dl) { buf[k] = dir[i]; k = k + 1; i = i + 1; }
+    if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
+    i = 0;
+    for (i < ll) { buf[k] = leaf[i]; k = k + 1; i = i + 1; }
+    buf[k] = 0;
+    ret k;
+}
+
+# ensure_dir: create the directory at `path` if it does not already exist.
+# returns true on success or when it already exists.
+fun ensure_dir(path: *u8) bool {
+    val p: str = cstr_str(path);
+    if (fs.is_dir(p)) { ret true; }
+    val mk: Result[bool, str] = fs.create_dir(p, 493);
+    if (is_ok[bool, str](mk)) { ret true; }
+    ret fs.is_dir(p);
+}
+
+# ensure_parents: create every parent directory of the file path `path`
+# (mkdir-p over the leading components, excluding the final leaf). returns
+# true once every parent exists.
+fun ensure_parents(path: *u8) bool {
+    val n: usize = slen(path);
+    var i: usize = 1;
+    for (i < n) {
+        if (path[i] == '/') {
+            val saved: u8 = path[i];
+            path[i] = 0;
+            val ok_dir: bool = ensure_dir(path);
+            path[i] = saved;
+            if (!ok_dir) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# wr: write a null-terminated literal to an open file, ignoring short writes.
+# ---
+# f: destination file
+# s: null-terminated byte string
+fun wr(f: *fs.File, s: *u8) {
+    fs.write(f, s, slen(s));
+}
+
+# wr_n: write `len` bytes of `s` to an open file.
+# ---
+# f:   destination file
+# s:   source bytes (not necessarily null-terminated within the range)
+# len: number of bytes to write
+fun wr_n(f: *fs.File, s: *u8, len: usize) {
+    if (len == 0) { ret; }
+    fs.write(f, s, len);
+}
+
+# line_end: index of the byte just past the current line's content (the '\n'
+# or terminator) starting from `pos`.
+# ---
+# s:   source text
+# pos: offset to scan from
+# ret: index of the line-ending '\n' or the terminator
+fun line_end(s: *u8, pos: usize) usize {
+    var i: usize = pos;
+    for (s[i] != 0 && s[i] != '\n') { i = i + 1; }
+    ret i;
+}
+
+# first_nonspace: index of the first non-space, non-tab byte on the line
+# starting at `pos`, stopping at the line end.
+# ---
+# s:   source text
+# pos: offset of the line start
+# ret: index of the first significant byte, or the line end if blank
+fun first_nonspace(s: *u8, pos: usize) usize {
+    var i: usize = pos;
+    for (s[i] == ' ' || s[i] == '\t') { i = i + 1; }
+    ret i;
+}
+
+# is_blank_line: true when the line starting at `pos` holds only whitespace.
+# ---
+# s:   source text
+# pos: offset of the line start
+# ret: true if the line is empty or all spaces/tabs
+fun is_blank_line(s: *u8, pos: usize) bool {
+    val i: usize = first_nonspace(s, pos);
+    ret s[i] == '\n' || s[i] == 0;
+}
+
+# starts_with: true when the bytes at `s[pos..]` begin with the literal `lit`.
+# ---
+# s:   source text
+# pos: offset to test
+# lit: null-terminated literal to match
+# ret: true on a full prefix match
+fun starts_with(s: *u8, pos: usize, lit: *u8) bool {
+    var i: usize = 0;
+    for (lit[i] != 0) {
+        if (s[pos + i] != lit[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# is_comment_line: true when the line at `pos` is a `#` comment line.
+# ---
+# s:   source text
+# pos: offset of the line start
+# ret: true when the first significant byte is '#'
+fun is_comment_line(s: *u8, pos: usize) bool {
+    val i: usize = first_nonspace(s, pos);
+    ret s[i] == '#';
+}
+
+# is_pub_line: true when the line at `pos` opens a `pub ` declaration.
+# ---
+# s:   source text
+# pos: offset of the line start
+# ret: true when the first significant token is `pub` followed by a space
+fun is_pub_line(s: *u8, pos: usize) bool {
+    val i: usize = first_nonspace(s, pos);
+    ret starts_with(s, i, "pub ");
+}
+
+# next_line: index of the start of the line following the one at `pos`.
+# ---
+# s:   source text
+# pos: offset of a line start
+# ret: offset of the next line start, or the terminator index
+fun next_line(s: *u8, pos: usize) usize {
+    val e: usize = line_end(s, pos);
+    if (s[e] == 0) { ret e; }
+    ret e + 1;
+}
+
+# fqn_path_into: write `fqn` into `buf` with each '.' turned into '/', so an
+# FQN like `a.b.c` becomes the path tail `a/b/c`. null-terminates.
+# ---
+# buf: destination buffer
+# cap: capacity of buf
+# fqn: dotted module path
+# ret: bytes written (excluding the terminator), or 0 if it would not fit
+fun fqn_path_into(buf: *u8, cap: usize, fqn: *u8) usize {
+    val n: usize = slen(fqn);
+    if (n + 1 > cap) { ret 0; }
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = fqn[i];
+        if (c == '.') { buf[i] = '/'; } or { buf[i] = c; }
+        i = i + 1;
+    }
+    buf[n] = 0;
+    ret n;
+}
+
+# write_comment_body: write the comment block spanning source lines
+# `[start, stop)` as Markdown, stripping the leading `# ` from each line and
+# rendering the `# ---` separator row as a blank line.
+# ---
+# f:     destination file
+# s:     source text
+# start: line-start offset of the first comment line
+# stop:  line-start offset just past the last comment line
+fun write_comment_body(f: *fs.File, s: *u8, start: usize, stop: usize) {
+    var pos: usize = start;
+    for (pos < stop) {
+        val sig: usize = first_nonspace(s, pos);
+        # sig indexes the '#'; skip it and a single following space.
+        var body: usize = sig + 1;
+        if (s[body] == ' ') { body = body + 1; }
+        val e: usize = line_end(s, pos);
+
+        if (starts_with(s, body, "---")) {
+            wr(f, "\n");
+        }
+        or {
+            wr_n(f, ?s[body], e - body);
+            wr(f, "\n");
+        }
+        pos = next_line(s, pos);
+    }
+}
+
+# write_signature: write the declaration whose first line starts at `pos` as a
+# fenced `mach` code block, capturing every line up to and including the one
+# that closes the signature with `;` or `{` at the outer brace/paren depth. a
+# trailing `{` is rewritten to `;` so the rendered signature omits the body.
+# ---
+# f:   destination file
+# s:   source text
+# pos: line-start offset of the declaration's first line
+# ret: line-start offset just past the declaration's signature
+fun write_signature(f: *fs.File, s: *u8, pos: usize) usize {
+    wr(f, "```mach\n");
+    var line: usize = pos;
+    var depth: i64 = 0;
+    var done: bool = false;
+    for (!done && s[line] != 0) {
+        val e: usize = line_end(s, line);
+        # scan this line for the terminating ';' or opening '{' at depth 0.
+        var i: usize = first_nonspace(s, line);
+        var cut: usize = e;
+        var saw_brace: bool = false;
+        for (i < e) {
+            val c: u8 = s[i];
+            if (c == '(' || c == '[') { depth = depth + 1; }
+            or (c == ')' || c == ']') { depth = depth - 1; }
+            or (depth == 0 && c == ';') { cut = i; done = true; i = e; cnt; }
+            or (depth == 0 && c == '{') { cut = i; saw_brace = true; done = true; i = e; cnt; }
+            i = i + 1;
+        }
+        val begin: usize = first_nonspace(s, line);
+        # trim trailing whitespace so a `{` rewritten to `;` does not leave a gap.
+        var trimmed: usize = cut;
+        for (trimmed > begin && (s[trimmed - 1] == ' ' || s[trimmed - 1] == '\t')) {
+            trimmed = trimmed - 1;
+        }
+        wr_n(f, ?s[begin], trimmed - begin);
+        if (saw_brace) { wr(f, ";"); }
+        wr(f, "\n");
+        line = next_line(s, line);
+    }
+    wr(f, "```\n\n");
+    ret line;
+}
+
+# DocStats: running counts for a documentation run.
+# ---
+# modules: number of module pages written
+# entries: number of public entities documented
+rec DocStats {
+    modules: u32;
+    entries: u32;
+}
+
+# document_module: render one module's page from its source text. scans for
+# `pub` declarations, attaching each to its immediately-preceding run of `#`
+# comment lines (a single blank line is allowed between the comment block and
+# the decl, matching the codebase convention). returns the number of public
+# entities written, or a negative value on a filesystem error.
+# ---
+# out_path: full path of the page file to create
+# fqn:      dotted module FQN, used as the page title
+# source:   the module's full source text
+# ret:      number of public entities documented, or -1 on error
+fun document_module(out_path: *u8, fqn: *u8, source: str) i64 {
+    if (!ensure_parents(out_path)) { ret -1; }
+
+    val fr: Result[fs.File, str] = fs.create(cstr_str(out_path), 420);
+    if (is_err[fs.File, str](fr)) { ret -1; }
+    var file: fs.File = unwrap_ok[fs.File, str](fr);
+
+    val s: *u8 = source::*u8;
+
+    wr(?file, "# ");
+    wr(?file, fqn);
+    wr(?file, "\n\n");
+
+    var count: i64 = 0;
+    var pos: usize = 0;
+    # the start of the current contiguous comment block, or its sentinel.
+    var block_start: usize = 0;
+    var have_block: bool = false;
+
+    for (s[pos] != 0) {
+        if (is_comment_line(s, pos)) {
+            if (!have_block) { block_start = pos; have_block = true; }
+            pos = next_line(s, pos);
+            cnt;
+        }
+
+        if (is_pub_line(s, pos)) {
+            wr(?file, "## ");
+            # the declaration's leading line, sans the `pub ` prefix and any
+            # trailing `{`/`;`, serves as the heading.
+            write_heading(?file, s, pos);
+            wr(?file, "\n\n");
+
+            val sig_end: usize = write_signature(?file, s, pos);
+            if (have_block) {
+                write_comment_body(?file, s, block_start, pos);
+                wr(?file, "\n");
+            }
+            count = count + 1;
+            have_block = false;
+            pos = sig_end;
+            cnt;
+        }
+
+        # any non-comment line (including a blank) detaches the pending comment
+        # block, so a decl's doc-comment is only the contiguous `#` run flush
+        # against it — matching the codebase convention.
+        have_block = false;
+        pos = next_line(s, pos);
+    }
+
+    fs.close(?file);
+    ret count;
+}
+
+# write_heading: write a declaration's name for use as a Markdown heading: the
+# decl line with the `pub ` prefix removed and truncated at the first `(`, `[`,
+# `:`, `=`, `{`, or `;` so only the kind keyword and name remain.
+# ---
+# f:   destination file
+# s:   source text
+# pos: line-start offset of the declaration
+fun write_heading(f: *fs.File, s: *u8, pos: usize) {
+    var i: usize = first_nonspace(s, pos);
+    if (starts_with(s, i, "pub ")) { i = i + 4; }
+    i = first_nonspace(s, i);
+    val e: usize = line_end(s, i);
+    var j: usize = i;
+    for (j < e) {
+        val c: u8 = s[j];
+        if (c == '(' || c == '[' || c == ':' || c == '=' || c == '{' || c == ';') { j = e; cnt; }
+        j = j + 1;
+    }
+    # trim trailing spaces from the captured span.
+    var stop: usize = i;
+    var k: usize = i;
+    for (k < e) {
+        val c: u8 = s[k];
+        if (c == '(' || c == '[' || c == ':' || c == '=' || c == '{' || c == ';') { k = e; cnt; }
+        if (c != ' ' && c != '\t') { stop = k + 1; }
+        k = k + 1;
+    }
+    wr_n(f, ?s[i], stop - i);
+}
+
+# generate: drive the documentation run over a loaded project. writes one page
+# per module under `<api_dir>/<fqn>.md` and an index at `<api_dir>/README.md`.
+# ---
+# p:       the loaded project
+# api_dir: output directory for the generated pages
+# stats:   running counts updated as pages are written
+# ret:     0 on success, non-zero on a filesystem error
+fun generate(p: *driver.Project, api_dir: *u8, stats: *DocStats) i64 {
+    if (!ensure_dir(api_dir)) {
+        emit("error: could not create output directory\n");
+        ret 2;
+    }
+
+    var index_path: [4096]u8;
+    if (join_into(?index_path[0], 4096, api_dir, "README.md") == 0) { ret 2; }
+    val ir: Result[fs.File, str] = fs.create(cstr_str(?index_path[0]), 420);
+    if (is_err[fs.File, str](ir)) {
+        emit("error: could not create the documentation index\n");
+        ret 2;
+    }
+    var index: fs.File = unwrap_ok[fs.File, str](ir);
+    wr(?index, "# API reference\n\n");
+    wr(?index, "generated by `mach doc` from source doc-comments.\n\n");
+
+    var mi: u32 = 0;
+    for (mi < p.module_len) {
+        val m: *driver.ModuleEntry = ?p.modules[mi];
+
+        val fqn_opt: Option[str] = intern.lookup(?p.s.interner, m.fqn);
+        if (is_none[str](fqn_opt)) { mi = mi + 1; cnt; }
+        val fqn: *u8 = unwrap[str](fqn_opt)::*u8;
+
+        val src_opt: Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
+        if (is_none[*src.SourceFile](src_opt)) { mi = mi + 1; cnt; }
+        val source: str = unwrap[*src.SourceFile](src_opt).text;
+
+        var rel: [4096]u8;
+        val rl: usize = fqn_path_into(?rel[0], 4096, fqn);
+        if (rl == 0) { mi = mi + 1; cnt; }
+
+        var page_path: [4096]u8;
+        if (join_into(?page_path[0], 4096, api_dir, ?rel[0]) == 0) { mi = mi + 1; cnt; }
+        # append the .md extension.
+        val pl: usize = slen(?page_path[0]);
+        if (pl + 4 > 4096) { mi = mi + 1; cnt; }
+        page_path[pl + 0] = '.';
+        page_path[pl + 1] = 'm';
+        page_path[pl + 2] = 'd';
+        page_path[pl + 3] = 0;
+
+        val n: i64 = document_module(?page_path[0], fqn, source);
+        if (n < 0) {
+            emit("error: failed to write page for ");
+            emit(fqn);
+            emit("\n");
+            fs.close(?index);
+            ret 2;
+        }
+
+        # index entry: a relative link to the module page.
+        wr(?index, "- [");
+        wr(?index, fqn);
+        wr(?index, "](");
+        wr(?index, ?rel[0]);
+        wr(?index, ".md)\n");
+
+        stats.modules = stats.modules + 1;
+        stats.entries = stats.entries + n::u32;
+        mi = mi + 1;
+    }
+
+    fs.close(?index);
+    ret 0;
+}
+
+# write_uint: write a decimal `u32` to stdout.
+# ---
+# v: value to render
+fun write_uint(v: u32) {
+    if (v == 0) { out("0"); ret; }
+    var buf: [16]u8;
+    var i: usize = 16;
+    var n: u32 = v;
+    for (n > 0) {
+        i = i - 1;
+        buf[i] = '0' + (n % 10)::u8;
+        n = n / 10;
+    }
+    os.write(os.STDOUT_FD, ?buf[i], 16 - i);
+}
+
+# run: `mach doc` subcommand entry point. loads the project's module graph and
+# generates Markdown reference documentation under `<root>/doc/api`, or a
+# directory given by `--out`. called by cmd.dispatch.
+# ---
+# argc: argument count including argv[0]
+# argv: the argument vector (argc null-terminated byte pointers)
+# ret:  0 on success, 1 on a user error, 2 on an internal error
+pub fun run(argc: usize, argv: **u8) i64 {
+    val cfg_opt: Option[cfg.Config] = cfg.parse(argc, argv);
+    if (is_none[cfg.Config](cfg_opt)) {
+        emit("error: invalid command-line flags\n");
+        ret 1;
+    }
+    val config: cfg.Config = unwrap[cfg.Config](cfg_opt);
+
+    var root: [4096]u8;
+    if (!find_project_root(config.cwd, ?root[0], 4096)) {
+        emit("error: no mach.toml found in the working directory or any parent\n");
+        ret 1;
+    }
+
+    var alloc: Allocator;
+    val mk: Option[str] = page.make(?alloc);
+    if (is_some[str](mk)) {
+        emit("error: failed to initialise allocator\n");
+        ret 2;
+    }
+
+    val sess_r: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sess_r)) {
+        emit("error: failed to initialise compiler session\n");
+        ret 2;
+    }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sess_r);
+
+    val reg_r: Result[bool, str] = tgt.register_all(?s.interner);
+    if (is_err[bool, str](reg_r)) {
+        emit("error: failed to register targets\n");
+        sess.dnit(?s);
+        ret 2;
+    }
+
+    var target_name: *u8 = config.target;
+    if (target_name == nil) { target_name = ""; }
+
+    val proj_r: Result[driver.Project, str] = driver.build_project(?s, cstr_str(?root[0]), cstr_str(target_name));
+    if (is_err[driver.Project, str](proj_r)) {
+        emit("error: ");
+        emit(unwrap_err[driver.Project, str](proj_r));
+        emit("\n");
+        sess.dnit(?s);
+        ret 1;
+    }
+    var p: driver.Project = unwrap_ok[driver.Project, str](proj_r);
+
+    # resolve the output directory: --out <dir> rooted at the project root, or
+    # the default doc/api.
+    var api_dir: [4096]u8;
+    val out_opt: Option[*u8] = args.get_value(argc, argv, "--out");
+    if (is_some[*u8](out_opt)) {
+        join_into(?api_dir[0], 4096, ?root[0], unwrap[*u8](out_opt));
+    }
+    or {
+        join_into(?api_dir[0], 4096, ?root[0], "doc/api");
+    }
+
+    var stats: DocStats;
+    stats.modules = 0;
+    stats.entries = 0;
+
+    val code: i64 = generate(?p, ?api_dir[0], ?stats);
+
+    if (code == 0) {
+        out("documented ");
+        write_uint(stats.entries);
+        out(" public entities across ");
+        write_uint(stats.modules);
+        out(" modules -> ");
+        out(?api_dir[0]);
+        out("\n");
+    }
+
+    driver.dnit_project(?p);
+    sess.dnit(?s);
+    ret code;
+}
+
+# find_project_root: walk up from `start` (or the process cwd when nil) until a
+# directory containing mach.toml is found, writing the resolved root into `out`
+# (caller-provided, at least 4096 bytes). returns true on success.
+fun find_project_root(start: *u8, out_buf: *u8, cap: usize) bool {
+    var i: usize = 0;
+    if (start != nil && start[0] != 0) {
+        val n: usize = slen(start);
+        if (n + 1 > cap) { ret false; }
+        for (i < n) { out_buf[i] = start[i]; i = i + 1; }
+        out_buf[n] = 0;
+    }
+    or {
+        val g: i64 = os.getcwd(out_buf, cap);
+        if (g < 0) { ret false; }
+    }
+
+    var probe: [4096]u8;
+    for (true) {
+        val plen: usize = join_into(?probe[0], 4096, out_buf, "mach.toml");
+        if (plen > 0 && fs.is_file(cstr_str(?probe[0]))) { ret true; }
+        if (!parent_dir(out_buf)) { ret false; }
+    }
+    ret false;
+}
+
+# parent_dir: strip the final path component of `path` in place. returns true
+# if a parent component remained, false when `path` had no separator.
+fun parent_dir(path: *u8) bool {
+    var last: usize = 0;
+    var found: bool = false;
+    var i: usize = 0;
+    for (path[i] != 0) {
+        if (path[i] == '/') { last = i; found = true; }
+        i = i + 1;
+    }
+    if (!found) { ret false; }
+    if (last == 0) {
+        path[1] = 0;
+        ret false;
+    }
+    path[last] = 0;
+    ret true;
+}
