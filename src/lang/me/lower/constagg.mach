@@ -1,19 +1,26 @@
 # mach.lang.me.lower.constagg: compile-time folding of aggregate global
 # initializers into initialized data.
 #
-# A module-level `val`/`var` whose initializer is a struct / array / `str`
-# literal is a compile-time constant: its bytes are known at compile time and
-# must be emitted into `.data`/`.rodata`, not left as a zeroed `.bss` slot.
-# `comptime.eval` only folds scalars, so this module folds the aggregate shapes
-# it rejects.
+# A module-level `val`/`var` whose initializer is a struct / array / union /
+# `str` literal is, when every leaf is a compile-time constant, known at compile
+# time and must be emitted into `.data`/`.rodata` rather than left as a zeroed
+# `.bss` slot. `comptime.eval` only folds scalars, so this module folds the
+# aggregate shapes it rejects.
 #
-# The folder lays the initializer out into a blob sized to the aggregate's IR
-# type, placing each leaf at its IR field offset / array stride, and records a
-# relocation for every pointer leaf (a `str` literal, whose value is the address
-# of an anonymous `.rodata` global the linker must patch in). The result is a
-# `VAL_CONST_AGG` value the back end serializes directly. Record layout is
-# backend-owned, so this mirrors the `$size_of` handling path in `lower_global`:
-# it folds here, where the IR type table answers layout questions.
+# The folder is BEST-EFFORT: it fully folds every constant leaf, and on a
+# genuinely non-constant leaf (a runtime value / runtime call) it abandons the
+# fold and signals the caller to fall back to the zero-placeholder path — it
+# never turns a valid program into a compile error. An `err` is reserved for a
+# real malformed-input or internal-invariant violation.
+#
+# It lays the initializer out into a blob sized to the aggregate's IR type,
+# placing each leaf at its IR field offset / array stride, and records a
+# relocation for every pointer / function leaf (a `str` literal, an address-of-
+# global, a function pointer) whose value is a symbol address the linker patches
+# in. The result is a `VAL_CONST_AGG` value the back end serializes directly.
+# Record layout is backend-owned, so this mirrors the `$size_of` handling path
+# in `lower_global`: it folds here, where the IR type table answers layout
+# questions.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -34,10 +41,11 @@ use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
 
 use std.allocator.allocate;
+use std.allocator.zallocate;
 use std.allocator.reallocate;
 
-use src:      mach.lang.source;
 use ty:       mach.lang.type;
+use intern:   mach.lang.intern;
 
 use ast:      mach.lang.fe.ast;
 use aid:      mach.lang.fe.ast.id;
@@ -50,6 +58,15 @@ use value:    mach.lang.me.ir.value;
 
 use lower:    mach.lang.me.lower.context;
 use expr:     mach.lang.me.lower.expr;
+
+# the outcome of laying out one leaf. distinguishes a successful fold from a
+# best-effort bail-out (a genuinely non-constant leaf -> the caller falls back
+# to the zero placeholder) so a valid program never becomes a compile error.
+def FoldResult: u8;
+# the leaf (and every leaf below it) folded into the blob.
+val FOLD_OK:       FoldResult = 0;
+# a leaf is genuinely non-constant; abandon the fold and fall back.
+val FOLD_FALLBACK: FoldResult = 1;
 
 # a growing collection of pointer-leaf relocations accumulated while laying out
 # an aggregate. backed by the module allocator so the side-table outlives the
@@ -86,11 +103,12 @@ fun reloc_push(ctx: *lower.LowerContext, rb: *RelocBuf, r: value.AggReloc) Resul
 }
 
 # attempts to fold an aggregate (or `str`) global initializer into a
-# VAL_CONST_AGG value. returns some(value) when `eid` is a struct / array
-# literal, or a `str` literal initializing a pointer global, whose leaves are
-# all compile-time constants; none when `eid` is not such an initializer (the
-# caller falls back to its scalar path); an error when a leaf is not a
-# compile-time constant.
+# VAL_CONST_AGG value. returns some(value) when `eid` is a struct / array /
+# union literal, or a `str` literal initializing a pointer global, whose leaves
+# are all compile-time constants; none when `eid` is not such an initializer, or
+# is one but has a genuinely non-constant leaf (the caller falls back to the
+# zero-placeholder path); an error only on a real malformed-input / internal
+# failure.
 # ---
 # ctx:    the lowering context
 # eid:    the initializer expression
@@ -111,47 +129,64 @@ pub fun try_const_aggregate(ctx: *lower.LowerContext, eid: aid.ExprId, gty: ir_t
         ret ok[Option[value.Value], str](none[value.Value]());
     }
 
+    # a zero-size aggregate (e.g. an empty record) carries no data; there is
+    # nothing to emit, so fall back to the existing path rather than allocate a
+    # zero-length blob.
     val size: u32 = ir_type.byte_size(?ctx.m.types, gty, ctx.tgt);
-    if (size == 0) { ret err[Option[value.Value], str]("constagg: aggregate global has zero size"); }
+    if (size == 0) { ret ok[Option[value.Value], str](none[value.Value]()); }
 
-    val br: Result[*u8, str] = allocate[u8](ctx.m.alloc, size::usize);
+    # the blob is zero-initialized so inter-field padding, trailing alignment
+    # pad, a union's inactive bytes, and any unwritten slot are deterministically
+    # zero — required for the byte-identical fixpoint.
+    val br: Result[*u8, str] = zallocate[u8](ctx.m.alloc, size::usize);
     if (is_err[*u8, str](br)) { ret err[Option[value.Value], str](unwrap_err[*u8, str](br)); }
     val blob: *u8 = unwrap_ok[*u8, str](br);
-    zero_fill(blob, size);
 
     var rb: RelocBuf;
     rb.relocs = nil;
     rb.len    = 0;
     rb.cap    = 0;
 
-    val pr: Result[bool, str] = place(ctx, eid, gty, blob, 0, ?rb);
+    var fold: FoldResult = FOLD_OK;
+    val pr: Result[bool, str] = place(ctx, eid, gty, blob, 0, ?rb, ?fold);
     if (is_err[bool, str](pr)) { ret err[Option[value.Value], str](unwrap_err[bool, str](pr)); }
+    if (fold == FOLD_FALLBACK) { ret ok[Option[value.Value], str](none[value.Value]()); }
 
     ret ok[Option[value.Value], str](some[value.Value](value.const_agg(blob, size, rb.relocs, rb.len, gty)));
 }
 
 # lays the initializer `eid` out at byte offset `base` within `blob`, dispatching
-# on the leaf's IR type. struct and array leaves recurse; pointer leaves record a
-# relocation; scalar leaves are comptime-folded and written little-endian.
-fun place(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, rb: *RelocBuf) Result[bool, str] {
+# on the leaf's IR type. struct / union / array leaves recurse; pointer and
+# function leaves record a relocation; scalar leaves are comptime-folded and
+# written little-endian. sets `*fold` to FOLD_FALLBACK on a genuinely non-
+# constant leaf (and stops); `err` is reserved for a real failure.
+fun place(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, rb: *RelocBuf, fold: *FoldResult) Result[bool, str] {
     val t_opt: Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
     if (is_none[*ir_type.IrType](t_opt)) { ret err[bool, str]("constagg: leaf has unknown IR type"); }
     val t: *ir_type.IrType = unwrap[*ir_type.IrType](t_opt);
 
-    if (t.kind == ir_type.IRT_STRUCT) { ret place_struct(ctx, eid, ity, blob, base, rb); }
-    if (t.kind == ir_type.IRT_ARRAY)  { ret place_array(ctx, eid, ity, blob, base, rb); }
-    if (t.kind == ir_type.IRT_PTR)    { ret place_ptr(ctx, eid, ity, blob, base, rb); }
-    ret place_scalar(ctx, eid, ity, blob, base);
+    # a union shares the struct payload and lays its single active member at
+    # offset 0 (byte_offset returns 0 for every union member), so it folds
+    # through the struct-literal path unchanged.
+    if (t.kind == ir_type.IRT_STRUCT) { ret place_struct(ctx, eid, ity, blob, base, rb, fold); }
+    if (t.kind == ir_type.IRT_UNION)  { ret place_struct(ctx, eid, ity, blob, base, rb, fold); }
+    if (t.kind == ir_type.IRT_ARRAY)  { ret place_array(ctx, eid, ity, blob, base, rb, fold); }
+    if (t.kind == ir_type.IRT_PTR)    { ret place_ptr(ctx, eid, blob, base, rb, fold); }
+    if (t.kind == ir_type.IRT_FN)     { ret place_fn(ctx, eid, blob, base, rb, fold); }
+    ret place_scalar(ctx, eid, ity, blob, base, fold);
 }
 
-# lays out a struct literal: each field-init is placed at its field's IR byte
-# offset. fields with no initializer stay zero (the blob is pre-zeroed).
-fun place_struct(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, rb: *RelocBuf) Result[bool, str] {
+# lays out a struct / union literal: each field-init is placed at its field's IR
+# byte offset (0 for every union member). a non-struct-literal initializer for an
+# aggregate-typed leaf is a genuinely non-constant value (e.g. a runtime call
+# returning the aggregate) -> fall back. fields with no initializer stay zero.
+fun place_struct(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, rb: *RelocBuf, fold: *FoldResult) Result[bool, str] {
     val e_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
     if (is_none[*aexpr.Expr](e_opt)) { ret err[bool, str]("constagg: struct leaf expr out of range"); }
     val e: *aexpr.Expr = unwrap[*aexpr.Expr](e_opt);
     if (e.kind != aexpr.EXPR_KIND_STRUCT_LIT) {
-        ret err[bool, str]("constagg: struct-typed aggregate field has a non-struct-literal initializer");
+        @fold = FOLD_FALLBACK;
+        ret ok[bool, str](true);
     }
 
     val rec_ty: ty.TypeId = lower.expr_type_of(ctx, eid);
@@ -168,21 +203,26 @@ fun place_struct(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeI
         if (field_ix >= t.data.struct_.field_count) { ret err[bool, str]("constagg: struct field index exceeds IR field count"); }
         val fty: ir_type.IrTypeId = t.data.struct_.fields[field_ix];
         val foff: u32 = ir_type.byte_offset(?ctx.m.types, ity, field_ix, ctx.tgt);
-        val r: Result[bool, str] = place(ctx, fi.value, fty, blob, base + foff, rb);
+        val r: Result[bool, str] = place(ctx, fi.value, fty, blob, base + foff, rb, fold);
         if (is_err[bool, str](r)) { ret r; }
+        if (@fold == FOLD_FALLBACK) { ret ok[bool, str](true); }
         i = i + 1;
     }
     ret ok[bool, str](true);
 }
 
-# lays out an array literal: each element is placed at `i * element-size`.
-# elements past the literal's length stay zero.
-fun place_array(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, rb: *RelocBuf) Result[bool, str] {
+# lays out an array literal: each element is placed at `i * element-size`. the
+# write is bounded by the array TYPE's declared element count, never the literal
+# length, so a too-long literal that slips past sema cannot write past the blob
+# (the real fix for the length mismatch is upstream in sema, issue #1113). a
+# too-short literal leaves the remaining elements zero.
+fun place_array(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, rb: *RelocBuf, fold: *FoldResult) Result[bool, str] {
     val e_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
     if (is_none[*aexpr.Expr](e_opt)) { ret err[bool, str]("constagg: array leaf expr out of range"); }
     val e: *aexpr.Expr = unwrap[*aexpr.Expr](e_opt);
     if (e.kind != aexpr.EXPR_KIND_ARRAY_LIT) {
-        ret err[bool, str]("constagg: array-typed aggregate field has a non-array-literal initializer");
+        @fold = FOLD_FALLBACK;
+        ret ok[bool, str](true);
     }
 
     val t_opt: Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
@@ -190,23 +230,31 @@ fun place_array(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId
     val t: *ir_type.IrType = unwrap[*ir_type.IrType](t_opt);
     val ety: ir_type.IrTypeId = t.data.element;
     val stride: u32 = ir_type.byte_size(?ctx.m.types, ety, ctx.tgt);
+    val cap: u32 = ir_type.array_count(?ctx.m.types, ity);
 
     var i: u32 = 0;
     for (i < e.data.array_lit.elems_len) {
+        # never write past the declared array length: a literal longer than the
+        # type is malformed input (rejected upstream) but must not corrupt the
+        # heap blob here. extra elements are dropped.
+        if (i >= cap) { ret ok[bool, str](true); }
         val pool_ix: u32 = e.data.array_lit.elems_start + i;
         if (pool_ix::usize >= ctx.a.expr_id_len) { ret err[bool, str]("constagg: array element index out of range"); }
         val elem_eid: aid.ExprId = ctx.a.expr_ids[pool_ix];
-        val r: Result[bool, str] = place(ctx, elem_eid, ety, blob, base + i * stride, rb);
+        val r: Result[bool, str] = place(ctx, elem_eid, ety, blob, base + i * stride, rb, fold);
         if (is_err[bool, str](r)) { ret r; }
+        if (@fold == FOLD_FALLBACK) { ret ok[bool, str](true); }
         i = i + 1;
     }
     ret ok[bool, str](true);
 }
 
-# lays out a pointer leaf. a `str` literal materializes an anonymous `.rodata`
-# global and records a relocation patching this slot with its address; `nil`
-# stays zero. any other pointer initializer is not a compile-time constant.
-fun place_ptr(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, rb: *RelocBuf) Result[bool, str] {
+# lays out a pointer leaf. records a relocation patching this slot with a symbol
+# address: a `str` literal materializes an anonymous `.rodata` global; `&G` (or
+# `&G.field`) takes the address of a module global with a field-offset addend.
+# `nil` stays zero. any other pointer initializer (a runtime pointer) -> fall
+# back.
+fun place_ptr(ctx: *lower.LowerContext, eid: aid.ExprId, blob: *u8, base: u32, rb: *RelocBuf, fold: *FoldResult) Result[bool, str] {
     val e_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
     if (is_none[*aexpr.Expr](e_opt)) { ret err[bool, str]("constagg: pointer leaf expr out of range"); }
     val e: *aexpr.Expr = unwrap[*aexpr.Expr](e_opt);
@@ -220,40 +268,135 @@ fun place_ptr(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, 
         if (gv.kind != value.VAL_GLOBAL || gv.data.global_ix >= ctx.m.global_len) {
             ret err[bool, str]("constagg: string leaf did not lower to a global");
         }
-        var r: value.AggReloc;
-        r.offset = base;
-        r.symbol = ctx.m.globals[gv.data.global_ix].name;
-        r.addend = 0;
-        ret reloc_push(ctx, rb, r);
+        ret push_sym_reloc(ctx, rb, base, ctx.m.globals[gv.data.global_ix].name, 0);
     }
 
-    ret err[bool, str]("constagg: non-constant pointer in aggregate global initializer");
+    # `&G` / `&G.field`: the address of a module global. resolve the base global's
+    # linkage symbol and sum the member-chain field offsets into the addend,
+    # without emitting any IR (no active builder block at global scope).
+    if (e.kind == aexpr.EXPR_KIND_UNARY && e.data.unary.op == aexpr.UN_ADDR) {
+        ret place_addr_of(ctx, e.data.unary.operand, blob, base, rb, fold);
+    }
+
+    @fold = FOLD_FALLBACK;
+    ret ok[bool, str](true);
 }
 
-# lays out a scalar leaf: comptime-folds the expression and writes its bits
-# little-endian into the leaf's type-sized slot.
-fun place_scalar(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32) Result[bool, str] {
-    val ev: Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a, module_source(ctx), eid, ?ctx.s.interner);
-    if (is_err[comptime.CTValue, str](ev)) {
-        ret err[bool, str]("constagg: aggregate global initializer has a non-constant leaf");
+# lays out a function-pointer leaf: an identifier naming a function records a
+# relocation to that function's symbol. anything else (a runtime callback) ->
+# fall back.
+fun place_fn(ctx: *lower.LowerContext, eid: aid.ExprId, blob: *u8, base: u32, rb: *RelocBuf, fold: *FoldResult) Result[bool, str] {
+    val name_opt: Option[intern.StrId] = expr.symbol_linkage_name(ctx, eid);
+    if (is_some[intern.StrId](name_opt)) {
+        ret push_sym_reloc(ctx, rb, base, unwrap[intern.StrId](name_opt), 0);
     }
-    val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](ev);
+    @fold = FOLD_FALLBACK;
+    ret ok[bool, str](true);
+}
 
+# resolves `&operand` to a symbol-plus-offset relocation. the operand is an
+# identifier naming a module global (offset 0) or a member chain `G.f.g` rooting
+# at one (offset = summed field offsets). anything else -> fall back.
+fun place_addr_of(ctx: *lower.LowerContext, operand: aid.ExprId, blob: *u8, base: u32, rb: *RelocBuf, fold: *FoldResult) Result[bool, str] {
+    var cur: aid.ExprId = operand;
+    var addend: i64 = 0;
+
+    # walk an outer-to-inner member chain, accumulating each field's byte offset,
+    # until the base identifier is reached.
+    for (true) {
+        val ce_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, cur);
+        if (is_none[*aexpr.Expr](ce_opt)) { @fold = FOLD_FALLBACK; ret ok[bool, str](true); }
+        val ce: *aexpr.Expr = unwrap[*aexpr.Expr](ce_opt);
+        if (ce.kind != aexpr.EXPR_KIND_MEMBER) { brk; }
+
+        val obj_ty: ty.TypeId = lower.expr_type_of(ctx, ce.data.member.object);
+        val obj_ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, obj_ty);
+        if (is_err[ir_type.IrTypeId, str](obj_ir_r)) { @fold = FOLD_FALLBACK; ret ok[bool, str](true); }
+        val obj_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](obj_ir_r);
+        val field_ix: u32 = expr.field_index_in_type(ctx, obj_ty, ce.data.member.name);
+        addend = addend + ir_type.byte_offset(?ctx.m.types, obj_ir, field_ix, ctx.tgt)::i64;
+        cur = ce.data.member.object;
+    }
+
+    val name_opt: Option[intern.StrId] = expr.symbol_linkage_name(ctx, cur);
+    if (is_none[intern.StrId](name_opt)) { @fold = FOLD_FALLBACK; ret ok[bool, str](true); }
+    ret push_sym_reloc(ctx, rb, base, unwrap[intern.StrId](name_opt), addend);
+}
+
+# records an abs64 relocation at blob offset `off` to `symbol` plus `addend`.
+fun push_sym_reloc(ctx: *lower.LowerContext, rb: *RelocBuf, off: u32, symbol: intern.StrId, addend: i64) Result[bool, str] {
+    var r: value.AggReloc;
+    r.offset = off;
+    r.symbol = symbol;
+    r.addend = addend;
+    ret reloc_push(ctx, rb, r);
+}
+
+# lays out a scalar leaf: folds the expression to a compile-time constant and
+# writes its bits little-endian into the leaf's type-sized slot. an `$size_of` /
+# `$align_of` / `$offset_of` intrinsic call folds through the same path the
+# scalar global initializer uses; everything else folds through `comptime.eval`.
+# a non-constant leaf -> fall back. a float leaf narrower than f64 is re-encoded
+# to its IEEE-754 width.
+fun place_scalar(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, fold: *FoldResult) Result[bool, str] {
     val size: u32 = ir_type.byte_size(?ctx.m.types, ity, ctx.tgt);
     if (size == 0 || size > 8) { ret err[bool, str]("constagg: scalar leaf has unsupported size"); }
+
+    # an `$size_of(T)`-style intrinsic is a comptime constant `comptime.eval`
+    # cannot fold (it rejects CALL exprs); fold it through the same layout-aware
+    # path the scalar global path uses.
+    val ie_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
+    if (is_some[*aexpr.Expr](ie_opt)) {
+        val ie: *aexpr.Expr = unwrap[*aexpr.Expr](ie_opt);
+        if (ie.kind == aexpr.EXPR_KIND_CALL) {
+            val intr: Option[Result[value.Value, str]] = expr.try_lower_comptime_intrinsic(ctx, eid, ie);
+            if (is_some[Result[value.Value, str]](intr)) {
+                val ir2: Result[value.Value, str] = unwrap[Result[value.Value, str]](intr);
+                if (is_err[value.Value, str](ir2)) { ret err[bool, str](unwrap_err[value.Value, str](ir2)); }
+                write_bits(blob, base, unwrap_ok[value.Value, str](ir2).data.int_lit, size);
+                ret ok[bool, str](true);
+            }
+            # a non-intrinsic call is a runtime value: fall back.
+            @fold = FOLD_FALLBACK;
+            ret ok[bool, str](true);
+        }
+    }
+
+    val ev: Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a, lower.module_source(ctx), eid, ?ctx.s.interner);
+    if (is_err[comptime.CTValue, str](ev)) {
+        @fold = FOLD_FALLBACK;
+        ret ok[bool, str](true);
+    }
+    val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](ev);
 
     var bits: u64 = 0;
     if (v.kind == comptime.CT_KIND_INT)   { bits = v.data.i::u64; }
     or (v.kind == comptime.CT_KIND_BOOL)  { if (v.data.b) { bits = 1; } }
-    or (v.kind == comptime.CT_KIND_FLOAT) { bits = f64_bits(v.data.f); }
-    or { ret err[bool, str]("constagg: unsupported scalar leaf kind"); }
+    or (v.kind == comptime.CT_KIND_FLOAT) {
+        # comptime floats are always f64; a narrower float leaf must carry the
+        # IEEE-754 pattern of its own width, not the low bytes of the f64.
+        if (size == 8)      { bits = f64_bits(v.data.f); }
+        or (size == 4)      { bits = f64_to_f32_bits(f64_bits(v.data.f))::u64; }
+        or { ret err[bool, str]("constagg: unsupported float leaf width"); }
+    }
+    or {
+        # a comptime string scalar leaf at a non-pointer type is not representable
+        # as inline bits; fall back rather than emit wrong data.
+        @fold = FOLD_FALLBACK;
+        ret ok[bool, str](true);
+    }
 
+    write_bits(blob, base, bits, size);
+    ret ok[bool, str](true);
+}
+
+# writes the low `size` bytes of `bits` little-endian at `blob[base..]`.
+fun write_bits(blob: *u8, base: u32, bits: u64, size: u32) {
     var i: u32 = 0;
     for (i < size) {
         blob[base + i] = (bits >> (i::u64 * 8::u64))::u8;
         i = i + 1;
     }
-    ret ok[bool, str](true);
 }
 
 # reinterprets an f64 as its raw 64-bit pattern via a one-element union.
@@ -263,26 +406,64 @@ fun f64_bits(f: f64) u64 {
     ret u.i;
 }
 
+# converts an IEEE-754 double bit pattern to the IEEE-754 single pattern with
+# round-to-nearest-even, using only integer arithmetic (the f32 narrowing cast
+# is not yet encodable on every backend, and this keeps the result deterministic
+# across hosts). handles zero, subnormal, normal, overflow-to-infinity, and
+# NaN/infinity inputs.
+fun f64_to_f32_bits(d: u64) u32 {
+    val sign: u32 = ((d >> 63) & 0x1)::u32;
+    val exp:  u32 = ((d >> 52) & 0x7FF)::u32;
+    val mant: u64 = d & 0xFFFFFFFFFFFFF;
+
+    # NaN / infinity: exponent all ones. preserve infinity; map any NaN to a
+    # canonical quiet NaN so the result is deterministic.
+    if (exp == 0x7FF) {
+        if (mant != 0) { ret (sign << 31) | 0x7FC00000; }
+        ret (sign << 31) | 0x7F800000;
+    }
+
+    # rebias the exponent from double (1023) to single (127).
+    val e: i32 = exp::i32 - 1023 + 127;
+
+    # overflow: too large for single -> signed infinity.
+    if (e >= 0xFF) { ret (sign << 31) | 0x7F800000; }
+
+    # the 23-bit single mantissa with round-to-nearest-even, taken from the top
+    # 23 bits of the 52-bit double mantissa plus the implicit leading 1.
+    if (e <= 0) {
+        # subnormal or underflow in single. shift the full significand (with the
+        # implicit 1) right by (1 - e) and round to nearest even.
+        if (e < -23) { ret sign << 31; }
+        val full: u64 = mant | 0x10000000000000;
+        val shift: u32 = (1 - e)::u32 + 29;
+        if (shift >= 64) { ret sign << 31; }
+        var frac: u32 = (full >> shift::u64)::u32;
+        val rem:  u64 = full & ((1::u64 << shift::u64) - 1);
+        val half: u64 = 1::u64 << (shift - 1)::u64;
+        if (rem > half || (rem == half && (frac & 0x1) != 0)) { frac = frac + 1; }
+        ret (sign << 31) | frac;
+    }
+
+    var frac: u32 = (mant >> 29)::u32;
+    val rem:  u64 = mant & 0x1FFFFFFF;
+    val half: u64 = 0x10000000;
+    var em: u32 = e::u32;
+    if (rem > half || (rem == half && (frac & 0x1) != 0)) {
+        frac = frac + 1;
+        # rounding overflowed the 23-bit mantissa: carry into the exponent.
+        if (frac == 0x800000) {
+            frac = 0;
+            em = em + 1;
+            if (em >= 0xFF) { ret (sign << 31) | 0x7F800000; }
+        }
+    }
+    ret (sign << 31) | (em << 23) | frac;
+}
+
 # true when IR type `ity` is a pointer.
 fun ir_is_ptr(ctx: *lower.LowerContext, ity: ir_type.IrTypeId) bool {
     val t_opt: Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
     if (is_none[*ir_type.IrType](t_opt)) { ret false; }
     ret unwrap[*ir_type.IrType](t_opt).kind == ir_type.IRT_PTR;
-}
-
-# zero-fills `len` bytes at `p`.
-fun zero_fill(p: *u8, len: u32) {
-    var i: u32 = 0;
-    for (i < len) {
-        p[i] = 0;
-        i = i + 1;
-    }
-}
-
-# the module's source text from the session source map (empty for an
-# unregistered file id, which a well-formed pipeline never produces).
-fun module_source(ctx: *lower.LowerContext) str {
-    val sf: Option[*src.SourceFile] = src.get(?ctx.s.sources, ctx.a.file_id);
-    if (is_none[*src.SourceFile](sf)) { ret nil::str; }
-    ret unwrap[*src.SourceFile](sf).text;
 }
