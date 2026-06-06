@@ -23,6 +23,7 @@ neighboring links; start from the index below.
 - [fun.md](fun.md) — function
 - [ext-fun.md](ext-fun.md) — external function
 - [val-var.md](val-var.md) — immutable and mutable bindings
+- [test.md](test.md) — `test` declaration and the `mach test` workflow
 
 ## Values and types
 
