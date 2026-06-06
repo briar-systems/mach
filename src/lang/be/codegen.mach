@@ -23,12 +23,16 @@ use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
 use std.types.size.usize;
+use std.types.option.Option;
+use std.types.option.is_none;
+use std.types.option.unwrap;
 use std.allocator.allocate;
 
 use writer: std.io.writer;
 
 use sess:   mach.lang.session;
 use intern: mach.lang.intern;
+use float:  mach.lang.float;
 use target: mach.lang.target;
 use of:     mach.lang.target.of;
 
@@ -187,7 +191,45 @@ fun pack_image(s: *sess.Session, tgt: *target.Target, irmod: *ir.Module,
         ret err[of.ObjectImage, str](unwrap_err[bool, str](rxr));
     }
 
+    # an aggregate constant's `&G` / function-pointer leaf may target a symbol
+    # defined in another module (cross-object reference). every such data-section
+    # relocation target that this object has not defined is declared undefined so
+    # the linker binds it — the data analog of pack_reloc_externs.
+    val rdx: Result[bool, str] = pack_data_reloc_externs(?image);
+    if (is_err[bool, str](rdx)) {
+        obj.dnit(?image);
+        ret err[of.ObjectImage, str](unwrap_err[bool, str](rdx));
+    }
+
     ret ok[of.ObjectImage, str](image);
+}
+
+# declare an undefined (external) symbol for every relocation target the image
+# references but has not defined. covers aggregate-constant data relocations
+# whose `&G` / function-pointer leaf names a symbol defined in another module;
+# a target already defined or declared here is left alone (no double declaration).
+# ---
+# image: object image being built (its symbol table holds every defined symbol)
+# ret:   true on success, or an error string
+fun pack_data_reloc_externs(image: *of.ObjectImage) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < image.reloc_count) {
+        val name: intern.StrId = image.relocations[i].symbol;
+        if (name == intern.STR_NIL) { i = i + 1; cnt; }
+        if (image_has_symbol(image, name)) { i = i + 1; cnt; }
+
+        var xsym: of.Symbol;
+        xsym.name    = name;
+        xsym.section = of.SECTION_EXTERNAL;
+        xsym.offset  = 0;
+        xsym.size    = 0;
+        xsym.flags   = of.SYM_OBJ_FLAG_OBJECT | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
+
+        val rx: Result[u32, str] = obj.add_symbol(image, xsym);
+        if (is_err[u32, str](rx)) { ret err[bool, str](unwrap_err[u32, str](rx)); }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
 }
 
 # emit an undefined (external) symbol for every relocation target the module
@@ -376,6 +418,14 @@ fun pack_relocs(image: *of.ObjectImage, enc: *encode.EncoderOutput,
     ret ok[bool, str](true);
 }
 
+# true when IR type `id` is a 32-bit float.
+fun is_f32_type(types: *ir_type.IrTypeTable, id: ir_type.IrTypeId) bool {
+    val t_opt: Option[*ir_type.IrType] = ir_type.get(types, id);
+    if (is_none[*ir_type.IrType](t_opt)) { ret false; }
+    val t: *ir_type.IrType = unwrap[*ir_type.IrType](t_opt);
+    ret t.kind == ir_type.IRT_FLOAT && t.data.bits == 32;
+}
+
 # materialise every module global into the image. a global with an initializer
 # becomes a `.rodata` (immutable) or `.data` (mutable) section; one with no
 # initializer becomes a zero-filled `.bss` entry sized from its type. each global
@@ -417,6 +467,14 @@ fun pack_globals(s: *sess.Session, tgt: *target.Target, image: *of.ObjectImage,
             bytes = g.init.data.bytes.ptr;
             len   = g.init.data.bytes.len;
         }
+        or (g.init.kind == value.VAL_CONST_AGG) {
+            # a pre-serialized aggregate constant carries its laid-out blob and a
+            # relocation side-table for its pointer leaves. the blob lands in
+            # .data/.rodata like any byte image; the relocations are attached to
+            # the new section below.
+            bytes = g.init.data.agg.bytes;
+            len   = g.init.data.agg.len;
+        }
         or (g.init.kind == value.VAL_CONST_INT || g.init.kind == value.VAL_CONST_FLOAT) {
             # a scalar constant initializer is materialized into its type-sized
             # little-endian byte image so it lands in .data/.rodata. without this
@@ -429,7 +487,13 @@ fun pack_globals(s: *sess.Session, tgt: *target.Target, image: *of.ObjectImage,
                 val br: Result[*u8, str] = allocate[u8](s.alloc, gsz::usize);
                 if (is_err[*u8, str](br)) { ret err[bool, str](unwrap_err[*u8, str](br)); }
                 bytes = unwrap_ok[*u8, str](br);
-                val bits: u64 = g.init.data.int_lit;
+                # a comptime float is always an f64 bit pattern; a 32-bit float
+                # global must carry the IEEE-754 single pattern of its own width,
+                # not the low 4 bytes of the f64 (which would corrupt the value).
+                var bits: u64 = g.init.data.int_lit;
+                if (g.init.kind == value.VAL_CONST_FLOAT && is_f32_type(?irmod.types, g.ty)) {
+                    bits = float.f64_to_f32_bits(bits)::u64;
+                }
                 var bi: u32 = 0;
                 for (bi < gsz) {
                     bytes[bi] = (bits >> (bi::u64 * 8::u64))::u8;
@@ -503,6 +567,69 @@ fun pack_globals(s: *sess.Session, tgt: *target.Target, image: *of.ObjectImage,
         val rsym: Result[u32, str] = obj.add_symbol(image, sym);
         if (is_err[u32, str](rsym)) {
             ret err[bool, str](unwrap_err[u32, str](rsym));
+        }
+
+        # an aggregate constant's pointer leaves (a `str` / address-of-global)
+        # are patched at link time: each side-table entry becomes an abs64
+        # relocation against this global's section, naming the target symbol
+        # (an anonymous rodata global already packed in this same loop). the
+        # ELF writer emits a `.rela.<section>` for any section carrying these.
+        if (g.init.kind == value.VAL_CONST_AGG) {
+            val rr: Result[bool, str] = pack_agg_relocs(s, tgt, image, ?g.init, sec_idx);
+            if (is_err[bool, str](rr)) { ret err[bool, str](unwrap_err[bool, str](rr)); }
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# attach the relocation side-table of an aggregate constant initializer to its
+# packed section: one abs64 relocation per pointer leaf, patching the leaf's
+# byte offset with the address of its target symbol plus the recorded addend.
+# ---
+# s:       session, for the interner
+# tgt:     resolved target, supplying the object format's abs64 kind name
+# image:   object image being built
+# init:    the VAL_CONST_AGG initializer carrying the side-table
+# sec_idx: index of the section the relocations patch
+# ret:     true on success, or an error string
+fun pack_agg_relocs(s: *sess.Session, tgt: *target.Target, image: *of.ObjectImage,
+                    init: *value.Value, sec_idx: u32) Result[bool, str] {
+    val kind: intern.StrId = of.reloc_kind_name(tgt.of, of.RK_ABS64);
+    if (kind == intern.STR_NIL) {
+        ret err[bool, str]("codegen: target object format does not map the abs64 relocation kind");
+    }
+
+    var i: u32 = 0;
+    for (i < init.data.agg.reloc_count) {
+        val ar: *value.AggReloc = ?init.data.agg.relocs[i];
+
+        var rel: of.Relocation;
+        rel.section = sec_idx;
+        rel.offset  = ar.offset;
+        rel.kind    = kind;
+        rel.symbol  = ar.symbol;
+        rel.addend  = ar.addend;
+
+        val r: Result[bool, str] = obj.add_relocation(image, rel);
+        if (is_err[bool, str](r)) { ret err[bool, str](unwrap_err[bool, str](r)); }
+
+        # a function-pointer leaf targeting a symbol this object has not defined is
+        # a cross-module reference: declare a STT_FUNC extern stub now. every local
+        # function is already defined (pack_symbols ran before pack_globals), so an
+        # undefined fn-target is genuinely external. object (global) targets are
+        # left to pack_data_reloc_externs, which a later-packed global may still
+        # define.
+        if (ar.is_fn && ar.symbol != intern.STR_NIL && !image_has_symbol(image, ar.symbol)) {
+            var xsym: of.Symbol;
+            xsym.name    = ar.symbol;
+            xsym.section = of.SECTION_EXTERNAL;
+            xsym.offset  = 0;
+            xsym.size    = 0;
+            xsym.flags   = of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
+
+            val rx: Result[u32, str] = obj.add_symbol(image, xsym);
+            if (is_err[u32, str](rx)) { ret err[bool, str](unwrap_err[u32, str](rx)); }
         }
         i = i + 1;
     }
