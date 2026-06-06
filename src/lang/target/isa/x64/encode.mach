@@ -1297,20 +1297,38 @@ fun encode_xorps(mi: *isa.Inst, buf: *ByteBuf) i32 {
     ret 0;
 }
 
-# encode_movq: encode MOVQ gpr->xmm (66 REX.W 0F 6E).
+# encode_movq: encode a register-register GP<->XMM MOVD / MOVQ. the direction is
+# read from the operand sizes — an XMM operand is built at size 16, a GP operand at
+# 4 or 8 — and `mi.size` selects the form (8 emits REX.W for the 64-bit MOVQ, 4 the
+# 32-bit MOVD). GP -> XMM is `66 [REX.W] 0F 6E /r` with ModRM reg = xmm (the SSE
+# operand), rm = gpr; XMM -> GP is `66 [REX.W] 0F 7E /r` with the same reg/rm
+# assignment. both transfer the raw bit pattern between the banks with no
+# conversion, realizing a same-size cross-domain bit reinterpret.
 fun encode_movq(mi: *isa.Inst, buf: *ByteBuf) i32 {
     val start: usize = buf.len;
     val dst: *isa.Operand = ?mi.dst;
     val src1: *isa.Operand = ?mi.src1;
-    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+    if (dst.kind != isa.OPK_REG || src1.kind != isa.OPK_REG) { ret 0; }
+
+    var w: u8 = 0;
+    if (mi.size == 8) { w = 1; }
+
+    # GP -> XMM: destination is the SSE operand (size 16).
+    if (dst.size == 16) {
         emit_byte(buf, 0x66);
-        emit_byte(buf, encode_rex(1, dst.reg, src1.reg));
+        emit_byte(buf, encode_rex(w, dst.reg, src1.reg));
         emit_byte(buf, 0x0F);
         emit_byte(buf, 0x6E);
         emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
         ret (buf.len - start)::i32;
     }
-    ret 0;
+    # XMM -> GP: source is the SSE operand (size 16), ModRM reg names it.
+    emit_byte(buf, 0x66);
+    emit_byte(buf, encode_rex(w, src1.reg, dst.reg));
+    emit_byte(buf, 0x0F);
+    emit_byte(buf, 0x7E);
+    emit_byte(buf, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
+    ret (buf.len - start)::i32;
 }
 
 # encode_movzx: encode a zero-extending move from an 8- or 16-bit source.
@@ -2479,6 +2497,13 @@ fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
     if (mi.opcode == mir.MIR_FNEG) {
         ret encode_float_neg(f, mi, ?st.buf);
     }
+    # a domain-crossing bit reinterpret survives selection keeping its
+    # MIR_BITCAST_CROSS opcode; the encoder materializes the GP<->XMM MOVD / MOVQ
+    # here, routing the float side through the XMM scratch and the integer side
+    # through the GP scratch so any spilled-operand shape encodes.
+    if (mi.opcode == mir.MIR_BITCAST_CROSS) {
+        ret encode_bitcast_cross(f, mi, ?st.buf);
+    }
 
     # a float conversion survives selection keeping its dedicated MIR_FP_* opcode;
     # the encoder materializes the SSE conversion byte sequence here, routing the
@@ -3099,6 +3124,64 @@ fun encode_float_conv(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Res
     if (src_w == 4) { cvt_op = x64.CVTTSS2SI; }
     emit_cvt_reg(cvt_op, x64.SCRATCH_REG, FLOAT_SCRATCH0, dst_w, buf);
     ret emit_gp_store(dst, x64.SCRATCH_REG, dst_w, buf);
+}
+
+# emit_movd_movq_reg: emit one register-register GP<->XMM MOVD / MOVQ, transferring
+# the raw `w`-byte (4 -> MOVD, 8 -> MOVQ) bit pattern between the GP register `gp`
+# and the XMM register `xmm`. `gp_to_xmm` selects the direction. used by the cross-
+# domain bit-reinterpret encoder to move bits across the register banks.
+fun emit_movd_movq_reg(gp: i32, xmm: i32, w: u8, gp_to_xmm: bool, buf: *ByteBuf) {
+    var mq: isa.Inst;
+    zero_inst(?mq);
+    mq.opcode = x64.MOVQ;
+    mq.size   = w;
+    if (gp_to_xmm) {
+        mq.dst  = isa.make_reg(xmm, 16);
+        mq.src1 = isa.make_reg(gp, w);
+    } or {
+        mq.dst  = isa.make_reg(gp, w);
+        mq.src1 = isa.make_reg(xmm, 16);
+    }
+    encode_inst(?mq, buf);
+}
+
+# encode_bitcast_cross: materialize a domain-crossing bit reinterpret
+# `MIR_BITCAST_CROSS [dst, src]` (a `:~` between a float and an equal-size integer)
+# into its GP<->XMM byte sequence. the operand's raw bits are transferred between
+# the register banks with MOVD (4-byte) or MOVQ (8-byte) — no numeric conversion —
+# routing each side through a fixed scratch register so any spilled frame-slot or
+# physical-register operand shape encodes. `mi.width` is the equal byte size; isel
+# stamped the direction onto `mi.src_width` (1 = destination is the float side,
+# GP -> XMM; 0 = source is the float side, XMM -> GP).
+fun encode_bitcast_cross(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Result[bool, str] {
+    if (mi.operand_count < 2) {
+        ret err[bool, str]("encode: cross bitcast missing operands");
+    }
+    val w: u8 = mi.width;
+    val dst_is_float: bool = mi.src_width == 1;
+
+    val rd: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], w);
+    if (is_err[isa.Operand, str](rd)) { ret err[bool, str](unwrap_err[isa.Operand, str](rd)); }
+    val dst: isa.Operand = unwrap_ok[isa.Operand, str](rd);
+    val rs: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[1], w);
+    if (is_err[isa.Operand, str](rs)) { ret err[bool, str](unwrap_err[isa.Operand, str](rs)); }
+    val src: isa.Operand = unwrap_ok[isa.Operand, str](rs);
+
+    # GP -> XMM: the integer source loads into the GP scratch, the bits move to the
+    # float scratch via MOVD/MOVQ, and the float scratch stores to the float dest.
+    if (dst_is_float) {
+        val ld: Result[bool, str] = emit_gp_load(src, x64.SCRATCH_REG, w, buf);
+        if (is_err[bool, str](ld)) { ret ld; }
+        emit_movd_movq_reg(x64.SCRATCH_REG, FLOAT_SCRATCH0, w, true, buf);
+        ret emit_float_store(dst, FLOAT_SCRATCH0, w, buf);
+    }
+
+    # XMM -> GP: the float source loads into the float scratch, the bits move to the
+    # GP scratch via MOVD/MOVQ, and the GP scratch stores to the integer dest.
+    val ld: Result[bool, str] = emit_float_load(src, FLOAT_SCRATCH0, w, buf);
+    if (is_err[bool, str](ld)) { ret ld; }
+    emit_movd_movq_reg(x64.SCRATCH_REG, FLOAT_SCRATCH0, w, false, buf);
+    ret emit_gp_store(dst, x64.SCRATCH_REG, w, buf);
 }
 
 # encode_va_fp_save: materialize the AL-guarded variadic FP-register spill
