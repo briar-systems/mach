@@ -74,6 +74,9 @@ Rules:
 - Comptime parameters carry no runtime cost: they are stripped from the lowered
   signature and ABI, so only the runtime parameters are passed.
 - A comptime parameter may be mixed freely with runtime parameters in any order.
+- A comptime parameter on a **generic** function (`fun f[T]($mode: u8, ...)`) is
+  not yet supported — combining a type instance with a value instance is a
+  pending extension and is reported with a clear diagnostic.
 - A comptime parameter may gate per-target asm safely, since each instance only
   compiles its taken arm:
 
