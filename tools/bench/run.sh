@@ -7,7 +7,7 @@
 # and reports per-input wall-clock min + median in milliseconds alongside the
 # input's module and line counts.
 #
-# usage: bench/run.sh [path-to-mach] [iterations]
+# usage: tools/bench/run.sh [path-to-mach] [iterations]
 #   path-to-mach  compiler binary to benchmark   (default: out/bin/mach)
 #   iterations    timed runs per input           (default: 5, or $BENCH_ITER)
 #
@@ -16,7 +16,7 @@
 # removed on exit, so the harness leaves no stray objects or binaries behind.
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 mach="${1:-$repo_root/out/bin/mach}"
 iterations="${2:-${BENCH_ITER:-5}}"
@@ -63,7 +63,7 @@ trap cleanup EXIT
 syn_dir="$tmp_dir/synthetic"
 mkdir -p "$syn_dir/dep"
 ln -s "$repo_root/dep/mach-std" "$syn_dir/dep/mach-std"
-bash "$repo_root/bench/gen.sh" "${BENCH_SYN_COUNT:-400}" > "$syn_dir/main.mach"
+bash "$repo_root/tools/bench/gen.sh" "${BENCH_SYN_COUNT:-400}" > "$syn_dir/main.mach"
 cat > "$syn_dir/mach.toml" <<EOF
 [project]
 id = "synthetic"

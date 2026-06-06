@@ -136,9 +136,10 @@ It reads `--list` / `--filter` from its own argv (forwarded by `mach test`). The
 only OS interaction is a `write` syscall emitted as a small inline-asm helper,
 so the runner has no standard-library dependency.
 
-The corpus under `tests/testing/` is a self-contained, no-std project that
-exercises the framework: discovery, the pass/fail convention, exit codes, and
-`--list` / `--filter`.
+Tests live inline alongside the code they cover: write `test "..." { }`
+declarations directly in the relevant `src/` module, or group them under
+`src/test/`. The runner collects every `FN_FLAG_TEST` across modules, so
+src-local tests are discovered automatically with no separate corpus project.
 
 ## See also
 
