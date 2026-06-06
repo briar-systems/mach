@@ -44,6 +44,7 @@ use std.allocator.deallocate;
 use intern:   mach.lang.intern;
 use type:     mach.lang.type;
 use sess:     mach.lang.module;
+use session:  mach.lang.session;
 
 use ast:      mach.lang.fe.ast;
 use id:       mach.lang.fe.ast.id;
@@ -96,29 +97,45 @@ pub fun infer_decl(sc: *sema.SemaContext, did: id.DeclId) type.TypeId {
 }
 
 # interns the TYPE_FUN signature of a function declaration from its resolved
-# parameter and return types.
+# parameter and return types. comptime value parameters (`$name: T`) are EXCLUDED
+# from the interned signature: they are folded per call site and stripped from
+# both the runtime ABI and the lowered IR, so the semantic TYPE_FUN carries only
+# the runtime parameters. call arity is checked against the AST parameter list
+# (which includes the comptime ones) in `check_call`.
 fun infer_fun_sig(sc: *sema.SemaContext, f: *decl.DeclFun) type.TypeId {
     val ret_ty: type.TypeId = sema.resolved_type_of(sc, f.return_type);
 
-    if (f.params_len == 0) {
+    var runtime_count: u32 = 0;
+    var ci: u32 = 0;
+    for (ci < f.params_len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[f.params_start + ci];
+        if (!tn.comptime) { runtime_count = runtime_count + 1; }
+        ci = ci + 1;
+    }
+
+    if (runtime_count == 0) {
         val r: Result[type.TypeId, str] = type.intern_function(?sc.s.types, ret_ty, nil, 0, f.variadic);
         if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
         ret unwrap_ok[type.TypeId, str](r);
     }
 
-    val pr: Result[*type.TypeId, str] = allocate_params(sc, f.params_len);
+    val pr: Result[*type.TypeId, str] = allocate_params(sc, runtime_count);
     if (is_err[*type.TypeId, str](pr)) { ret type.TYPE_ERROR; }
     val params: *type.TypeId = unwrap_ok[*type.TypeId, str](pr);
 
     var i: u32 = 0;
+    var w: u32 = 0;
     for (i < f.params_len) {
         val tn: *decl.TypedName = ?sc.a.typed_names[f.params_start + i];
-        params[i] = sema.resolved_type_of(sc, tn.ty);
+        if (!tn.comptime) {
+            params[w] = sema.resolved_type_of(sc, tn.ty);
+            w = w + 1;
+        }
         i = i + 1;
     }
 
-    val r: Result[type.TypeId, str] = type.intern_function(?sc.s.types, ret_ty, params, f.params_len, f.variadic);
-    free_params(sc, params, f.params_len);
+    val r: Result[type.TypeId, str] = type.intern_function(?sc.s.types, ret_ty, params, runtime_count, f.variadic);
+    free_params(sc, params, runtime_count);
     if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
     ret unwrap_ok[type.TypeId, str](r);
 }
@@ -404,8 +421,63 @@ fun infer_call(sc: *sema.SemaContext, c: *expr.ExprCall, span: token.Span) type.
     }
 
     val ret_ty: type.TypeId = fn.data.fn.ret_ty;
+
+    # a callee with comptime value parameters is checked against its AST
+    # parameter list (the stripped TYPE_FUN omits the comptime ordinals), and
+    # each `$`-argument is required to be compile-time foldable.
+    val cf: Option[*decl.DeclFun] = callee_fun_decl(sc, c.callee);
+    if (is_some[*decl.DeclFun](cf)) {
+        val f: *decl.DeclFun = unwrap[*decl.DeclFun](cf);
+        if (decl_has_comptime_param(sc, c.callee, f)) {
+            check.check_comptime_call(sc, ct, c.callee, f, c.args_start, c.args_len, span);
+            ret ret_ty;
+        }
+    }
+
     check.check_call(sc, ct, c.args_start, c.args_len, span);
     ret ret_ty;
+}
+
+# resolves a call's callee to its DeclFun, reading the origin module's AST for a
+# cross-module callee. none when the callee does not name a function.
+fun callee_fun_decl(sc: *sema.SemaContext, callee: id.ExprId) Option[*decl.DeclFun] {
+    val so: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, callee);
+    if (is_none[*resolve.Symbol](so)) { ret none[*decl.DeclFun](); }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+    if (sym.kind != resolve.SYM_FUN && sym.kind != resolve.SYM_IMPORTED) { ret none[*decl.DeclFun](); }
+    if (sym.decl == id.DECL_NIL) { ret none[*decl.DeclFun](); }
+
+    var a: *ast.Ast = sc.a;
+    if (sym.origin != sc.own_module) {
+        a = session.module_ast(sc.s, sym.origin);
+        if (a == nil) { ret none[*decl.DeclFun](); }
+    }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (is_none[*decl.Decl](d_opt)) { ret none[*decl.DeclFun](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_FUN) { ret none[*decl.DeclFun](); }
+    ret some[*decl.DeclFun](?d.data.fun_);
+}
+
+# reports whether the callee DeclFun declares any comptime value parameter. the
+# typed_names slice is read from the callee's origin AST (the caller and callee
+# may differ).
+fun decl_has_comptime_param(sc: *sema.SemaContext, callee: id.ExprId, f: *decl.DeclFun) bool {
+    val so: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, callee);
+    if (is_none[*resolve.Symbol](so)) { ret false; }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+
+    var a: *ast.Ast = sc.a;
+    if (sym.origin != sc.own_module) {
+        a = session.module_ast(sc.s, sym.origin);
+        if (a == nil) { ret false; }
+    }
+    var i: u32 = 0;
+    for (i < f.params_len) {
+        if (a.typed_names[f.params_start + i].comptime) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # recognises and types a comptime value intrinsic call. `$size_of(T)` /
