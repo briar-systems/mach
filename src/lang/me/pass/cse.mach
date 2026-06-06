@@ -1,0 +1,248 @@
+# mach.lang.me.pass.cse: local common-subexpression elimination.
+#
+# A forward pass that, within each basic block, replaces a redundant pure
+# instruction — one whose opcode, flags, result type, auxiliary type, and
+# operand list exactly match an earlier instruction in the same block — with a
+# reference to that earlier result. The redundant instruction is left in the
+# pool with its uses rewritten away; dce then removes it.
+#
+# The transform is LOCAL: an expression is only reused within the single block
+# that first computed it. Within one block there is no intervening control flow,
+# so two instructions with identical (resolved) operands provably compute the
+# same value. Operands are compared after applying the running substitution, so
+# `b = a + 1; c = a + 1; d = b + c` canonicalises `c` to `b` and then matches
+# the two `b` operands of `d`.
+#
+# CORRECTNESS CONTRACT: only PURE, value-producing opcodes are candidates
+# (`instr.is_pure`). This excludes loads (an intervening store may change the
+# loaded value), stores, calls, alloca, phis, terminators, inline asm, and the
+# variadic intrinsics. Two candidates are equal only when their opcode, flag
+# word, result type, auxiliary type, operand count, and every (resolved) operand
+# match exactly — so a no-signed-wrap add never merges with a wrapping add, and
+# a GEP only merges with a GEP walking the same source pointee type. Division
+# and remainder ARE pure, but CSE of two identical divisions is value-preserving
+# (a trap on division by zero happens identically for both, and merging removes
+# only the second, still-trapping, computation if the first is reached); a
+# divide-by-zero never miscompiles because the surviving instruction performs
+# the same operation. Because matching is by exact value identity, a substitution
+# never changes which value an operand names — it only shares an equal one.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use ir:    mach.lang.me.ir;
+use instr: mach.lang.me.ir.instruction;
+use value: mach.lang.me.ir.value;
+use id:    mach.lang.me.ir.id;
+
+# Pass entry. Runs local CSE on every non-extern function in the module.
+# ---
+# m:   module to mutate in place
+# ret: ok(true) on a successful pass, or the first allocation error
+pub fun run(m: *ir.Module) Result[bool, str] {
+    var f: u32 = 0;
+    for (f < m.function_len) {
+        val fn: *ir.Function = ?m.functions[f];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
+            val r: Result[bool, str] = cse_function(m, fn);
+            if (is_err[bool, str](r)) { ret r; }
+        }
+        f = f + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# runs local CSE on one function. A per-instruction substitution table maps a
+# redundant instruction id to the canonical (earlier) instruction's result
+# Value; `has_sub` marks live entries. Each block is processed independently:
+# instructions are visited in program order, and a candidate that matches an
+# earlier in-block candidate records a substitution. After every block the
+# substitutions are applied to every operand in the function.
+fun cse_function(m: *ir.Module, fn: *ir.Function) Result[bool, str] {
+    val ilen: u32 = fn.instr_len;
+    if (ilen == 0) { ret ok[bool, str](true); }
+
+    val rs: Result[*value.Value, str] = allocate[value.Value](m.alloc, ilen::usize);
+    if (is_err[*value.Value, str](rs)) { ret err[bool, str](unwrap_err[*value.Value, str](rs)); }
+    val subst: *value.Value = unwrap_ok[*value.Value, str](rs);
+
+    val rh: Result[*bool, str] = allocate[bool](m.alloc, ilen::usize);
+    if (is_err[*bool, str](rh)) {
+        deallocate[value.Value](m.alloc, subst, ilen::usize);
+        ret err[bool, str](unwrap_err[*bool, str](rh));
+    }
+    val has_sub: *bool = unwrap_ok[*bool, str](rh);
+
+    # `seen` collects the canonical (kept) candidate instruction ids of the block
+    # currently being processed; it is reused per block.
+    val rw: Result[*id.InstructionId, str] = allocate[id.InstructionId](m.alloc, ilen::usize);
+    if (is_err[*id.InstructionId, str](rw)) {
+        deallocate[value.Value](m.alloc, subst, ilen::usize);
+        deallocate[bool](m.alloc, has_sub, ilen::usize);
+        ret err[bool, str](unwrap_err[*id.InstructionId, str](rw));
+    }
+    val seen: *id.InstructionId = unwrap_ok[*id.InstructionId, str](rw);
+
+    var i: u32 = 0;
+    for (i < ilen) { has_sub[i] = false; i = i + 1; }
+
+    var any: bool = false;
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        if (cse_block(m, fn, ?fn.blocks[b], subst, has_sub, ilen, seen)) { any = true; }
+        b = b + 1;
+    }
+    if (any) { apply_substitutions(fn, subst, has_sub, ilen); }
+
+    deallocate[value.Value](m.alloc, subst, ilen::usize);
+    deallocate[bool](m.alloc, has_sub, ilen::usize);
+    deallocate[id.InstructionId](m.alloc, seen, ilen::usize);
+    ret ok[bool, str](true);
+}
+
+# processes one block: walks its instruction list in order, and for each pure
+# candidate either matches it against an already-seen canonical candidate (and
+# records a substitution to that candidate's result) or records it as a new
+# canonical candidate. Returns true if any substitution was recorded.
+fun cse_block(m: *ir.Module, fn: *ir.Function, blk: *ir.Block,
+              subst: *value.Value, has_sub: *bool, ilen: u32, seen: *id.InstructionId) bool {
+    var any: bool = false;
+    var seen_count: u32 = 0;
+    var ix: u32 = 0;
+    for (ix < blk.instr_count) {
+        val iid: id.InstructionId = blk.instructions[ix];
+        val inst_opt: Option[*instr.Instruction] = ir.get_instruction(fn, iid);
+        if (is_some[*instr.Instruction](inst_opt)) {
+            val inst: *instr.Instruction = unwrap[*instr.Instruction](inst_opt);
+            if (is_candidate(inst)) {
+                # search the canonical candidates already seen in this block.
+                var matched: bool = false;
+                var s: u32 = 0;
+                for (s < seen_count && matched == false) {
+                    val cid: id.InstructionId = seen[s];
+                    val cand_opt: Option[*instr.Instruction] = ir.get_instruction(fn, cid);
+                    if (is_some[*instr.Instruction](cand_opt)) {
+                        val cand: *instr.Instruction = unwrap[*instr.Instruction](cand_opt);
+                        if (instrs_equal(inst, cand, subst, has_sub, ilen)) {
+                            # redundant: reuse the canonical candidate's result.
+                            subst[iid::u32]   = value.instr_value(cid, inst.ty);
+                            has_sub[iid::u32] = true;
+                            matched           = true;
+                            any               = true;
+                        }
+                    }
+                    s = s + 1;
+                }
+                if (matched == false) {
+                    seen[seen_count] = iid;
+                    seen_count       = seen_count + 1;
+                }
+            }
+        }
+        ix = ix + 1;
+    }
+    ret any;
+}
+
+# true when an instruction is a CSE candidate: a pure, value-producing opcode
+# with no volatile flag. Pure already excludes loads/stores/calls/alloca/phi/
+# terminators/asm/va_*; the volatile guard is belt-and-braces (volatile rides on
+# loads/stores, which are not pure, but the check costs nothing).
+fun is_candidate(inst: *instr.Instruction) bool {
+    if (instr.is_pure(inst.kind) == false) { ret false; }
+    if ((inst.flags & instr.INSTR_FLAG_VOLATILE) != 0) { ret false; }
+    ret true;
+}
+
+# true when two candidate instructions compute the same value: identical opcode,
+# flag word, result type, auxiliary type, operand count, and every operand equal
+# by value identity after resolving each through the substitution table. The
+# substitution resolution canonicalises operands that were themselves CSE'd, so
+# transitively-equal expressions match.
+fun instrs_equal(a: *instr.Instruction, b: *instr.Instruction,
+                 subst: *value.Value, has_sub: *bool, ilen: u32) bool {
+    if (a.kind != b.kind) { ret false; }
+    if (a.flags != b.flags) { ret false; }
+    if (a.ty != b.ty) { ret false; }
+    if (a.aux_ty != b.aux_ty) { ret false; }
+    if (a.operand_count != b.operand_count) { ret false; }
+    var o: u32 = 0;
+    for (o < a.operand_count) {
+        val va: value.Value = resolve(a.operands[o], subst, has_sub, ilen);
+        val vb: value.Value = resolve(b.operands[o], subst, has_sub, ilen);
+        if (values_equal(va, vb) == false) { ret false; }
+        o = o + 1;
+    }
+    ret true;
+}
+
+# true when two operand values are the exact same SSA value or the same constant
+# literal. Instruction results match by id; parameters by index; integer / null
+# / float constants by payload; globals / functions by index. Byte-blob
+# constants are conservatively treated as unequal (a pointer-identity match on a
+# borrowed blob is not worth the risk). The carried IR type need not match — two
+# operands naming the same value through differently-typed slots still denote it.
+fun values_equal(a: value.Value, b: value.Value) bool {
+    if (a.kind != b.kind) { ret false; }
+    if (a.kind == value.VAL_INSTR)       { ret a.data.instr == b.data.instr; }
+    if (a.kind == value.VAL_PARAM)       { ret a.data.param_ix == b.data.param_ix; }
+    if (a.kind == value.VAL_CONST_INT)   { ret a.data.int_lit == b.data.int_lit; }
+    if (a.kind == value.VAL_CONST_NULL)  { ret true; }
+    if (a.kind == value.VAL_CONST_FLOAT) { ret a.data.float_lit == b.data.float_lit; }
+    if (a.kind == value.VAL_GLOBAL)      { ret a.data.global_ix == b.data.global_ix; }
+    if (a.kind == value.VAL_FN)          { ret a.data.fn_ix == b.data.fn_ix; }
+    ret false;
+}
+
+# resolves an operand through the substitution table, following chains: a
+# VAL_INSTR naming a CSE'd instruction becomes the canonical instruction's
+# result, followed again if that canonical was itself merged, up to `ilen` hops
+# (the table is acyclic; the bound is a guard). Non-instruction operands pass
+# through unchanged. The result carries the original operand's type.
+fun resolve(v: value.Value, subst: *value.Value, has_sub: *bool, ilen: u32) value.Value {
+    var cur: value.Value = v;
+    var hops: u32 = 0;
+    for (cur.kind == value.VAL_INSTR && hops <= ilen) {
+        val iid: u32 = cur.data.instr::u32;
+        if (iid >= ilen || has_sub[iid] == false) { ret value.retype(cur, v.ty); }
+        cur  = subst[iid];
+        hops = hops + 1;
+    }
+    ret value.retype(cur, v.ty);
+}
+
+# rewrites every operand naming a CSE'd instruction to its canonical result,
+# resolved transitively so a chain of merges collapses fully.
+fun apply_substitutions(fn: *ir.Function, subst: *value.Value, has_sub: *bool, ilen: u32) {
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val inst: *instr.Instruction = ?fn.instrs[i];
+        var o: u32 = 0;
+        for (o < inst.operand_count) {
+            val op: value.Value = inst.operands[o];
+            if (op.kind == value.VAL_INSTR) {
+                val iid: u32 = op.data.instr::u32;
+                if (iid < ilen && has_sub[iid]) {
+                    inst.operands[o] = resolve(op, subst, has_sub, ilen);
+                }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+}

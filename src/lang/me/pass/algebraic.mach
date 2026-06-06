@@ -1,0 +1,360 @@
+# mach.lang.me.pass.algebraic: algebraic simplification (peephole identities).
+#
+# A forward pass that rewrites a pure arithmetic / bitwise / shift instruction
+# whose result is fixed by an algebraic identity into the operand (or constant)
+# the identity yields, without evaluating any non-constant operand. It
+# complements constfold: constfold collapses all-constant expressions, while
+# this pass simplifies an expression one of whose operands is a constant
+# identity element, or whose two operands are the same SSA value.
+#
+# The mechanism mirrors constfold's substitution table. For each instruction a
+# replacement Value may be recorded (instruction id -> Value); `apply` then
+# rewrites every operand naming a simplified instruction to its replacement, and
+# the now-dead instructions are left for dce. Because a replacement can name an
+# instruction result, the table is iterated to a fixpoint so a chain collapses.
+#
+# CORRECTNESS CONTRACT: every rewrite must preserve the exact runtime value for
+# all operand values. The pass is INTEGER-ONLY where float semantics differ:
+#
+#   - `x + 0`, `0 + x`, `x - 0`           -> x          (int only; float +0.0/-0.0)
+#   - `x * 1`, `1 * x`                    -> x          (int only)
+#   - `x * 0`, `0 * x`                    -> 0          (int only; float NaN/inf)
+#   - `x - x`                             -> 0          (int only; float NaN)
+#   - `x & x`, `x | x`                    -> x
+#   - `x ^ x`                             -> 0
+#   - `x & 0`, `0 & x`                    -> 0
+#   - `x | 0`, `0 | x`, `x ^ 0`, `0 ^ x`  -> x
+#   - `x & ~0`, `~0 & x`                  -> x          (all-ones mask)
+#   - `x | ~0`, `~0 | x`                  -> ~0
+#   - `x << 0`, `x >> 0`                  -> x
+#   - `0 << c`, `0 >> c`                  -> 0
+#   - `x / 1` (signed/unsigned)           -> x
+#   - `x % 1` (signed/unsigned)           -> 0
+#   - `-(-x)`, `~(~x)`                    -> x          (double negation)
+#
+# Float operands are never simplified: `x + 0.0` is not `x` for `x == -0.0`,
+# `x * 0.0` is NaN for `x` infinite/NaN, and `x - x` is NaN for `x == NaN`. The
+# integer/float opcodes overlap, so each rewrite first confirms the result type
+# resolves to an IRT_INT (`is_int`); a float-typed instruction is left untouched.
+# Division/remainder by a non-one constant is never simplified; only the exact
+# identities `/ 1` and `% 1` fire (never `/ 0`, which traps at runtime).
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use ir:      mach.lang.me.ir;
+use instr:   mach.lang.me.ir.instruction;
+use value:   mach.lang.me.ir.value;
+use ir_type: mach.lang.me.ir.type;
+
+# Pass entry. Simplifies every non-extern function in the module in place.
+# ---
+# m:   module to mutate in place
+# ret: ok(true) on a successful pass, or the first allocation error
+pub fun run(m: *ir.Module) Result[bool, str] {
+    var f: u32 = 0;
+    for (f < m.function_len) {
+        val fn: *ir.Function = ?m.functions[f];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
+            val r: Result[bool, str] = simplify_function(m, fn);
+            if (is_err[bool, str](r)) { ret r; }
+        }
+        f = f + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# simplifies one function. A per-instruction substitution table maps a
+# simplified instruction id to its replacement Value; `has_sub` marks live
+# entries. Simplification repeats until no instruction changes (operands are
+# resolved through the table first, so a chain collapses across sweeps); the
+# substitutions are then applied to every operand.
+fun simplify_function(m: *ir.Module, fn: *ir.Function) Result[bool, str] {
+    val ilen: u32 = fn.instr_len;
+    if (ilen == 0) { ret ok[bool, str](true); }
+
+    val rs: Result[*value.Value, str] = allocate[value.Value](m.alloc, ilen::usize);
+    if (is_err[*value.Value, str](rs)) { ret err[bool, str](unwrap_err[*value.Value, str](rs)); }
+    val subst: *value.Value = unwrap_ok[*value.Value, str](rs);
+
+    val rh: Result[*bool, str] = allocate[bool](m.alloc, ilen::usize);
+    if (is_err[*bool, str](rh)) {
+        deallocate[value.Value](m.alloc, subst, ilen::usize);
+        ret err[bool, str](unwrap_err[*bool, str](rh));
+    }
+    val has_sub: *bool = unwrap_ok[*bool, str](rh);
+    var i: u32 = 0;
+    for (i < ilen) { has_sub[i] = false; i = i + 1; }
+
+    simplify_to_fixpoint(m, fn, subst, has_sub, ilen);
+    apply_substitutions(fn, subst, has_sub, ilen);
+
+    deallocate[value.Value](m.alloc, subst, ilen::usize);
+    deallocate[bool](m.alloc, has_sub, ilen::usize);
+    ret ok[bool, str](true);
+}
+
+# repeatedly sweeps the instruction pool, simplifying every instruction whose
+# (resolved) operands now match an identity, until a sweep changes nothing.
+fun simplify_to_fixpoint(m: *ir.Module, fn: *ir.Function,
+                         subst: *value.Value, has_sub: *bool, ilen: u32) {
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var k: u32 = 0;
+        for (k < ilen) {
+            if (has_sub[k] == false) {
+                val inst: *instr.Instruction = ?fn.instrs[k];
+                var out: value.Value;
+                if (try_simplify(m, fn, inst, subst, has_sub, ilen, ?out)) {
+                    subst[k]   = out;
+                    has_sub[k] = true;
+                    changed    = true;
+                }
+            }
+            k = k + 1;
+        }
+    }
+}
+
+# resolves an operand through the substitution table, following chains: a
+# VAL_INSTR naming a simplified instruction becomes that instruction's
+# replacement, and if that replacement also names a simplified instruction it is
+# followed again, up to `ilen` hops (the table is acyclic, so this is a guard
+# only). The result carries the original operand's type. Non-instruction
+# operands pass through unchanged.
+fun resolve(v: value.Value, subst: *value.Value, has_sub: *bool, ilen: u32) value.Value {
+    var cur: value.Value = v;
+    var hops: u32 = 0;
+    for (cur.kind == value.VAL_INSTR && hops <= ilen) {
+        val iid: u32 = cur.data.instr::u32;
+        if (iid >= ilen || has_sub[iid] == false) { ret value.retype(cur, v.ty); }
+        cur  = subst[iid];
+        hops = hops + 1;
+    }
+    ret value.retype(cur, v.ty);
+}
+
+# attempts to simplify one instruction via an algebraic identity. Writes the
+# replacement Value into `out` and returns true on a successful rewrite. Only
+# integer-typed pure arithmetic / bitwise / shift opcodes are considered; the
+# unary double-negation forms handle OP_NEG / OP_NOT.
+fun try_simplify(m: *ir.Module, fn: *ir.Function, inst: *instr.Instruction,
+                 subst: *value.Value, has_sub: *bool, ilen: u32, out: *value.Value) bool {
+    val k: instr.InstrKind = inst.kind;
+
+    # unary double-negation: -(-x) -> x, ~(~x) -> x. integer only; float
+    # negation flips the sign bit, observable on -0.0, so it is never collapsed.
+    if ((k == instr.OP_NEG || k == instr.OP_NOT) && inst.operand_count == 1) {
+        if (is_int(m, inst.ty) == false) { ret false; }
+        val a: value.Value = resolve(inst.operands[0], subst, has_sub, ilen);
+        if (a.kind != value.VAL_INSTR) { ret false; }
+        val inner_opt: Option[*instr.Instruction] = ir.get_instruction(fn, a.data.instr);
+        if (is_none[*instr.Instruction](inner_opt)) { ret false; }
+        val inner: *instr.Instruction = unwrap[*instr.Instruction](inner_opt);
+        # the inner op must be the same negation and integer-typed; then its
+        # operand is the original value, returned with this result's type.
+        if (inner.kind == k && inner.operand_count == 1 && is_int(m, inner.ty)) {
+            val src: value.Value = resolve(inner.operands[0], subst, has_sub, ilen);
+            @out = value.retype(src, inst.ty);
+            ret true;
+        }
+        ret false;
+    }
+
+    # binary identities: [lhs, rhs]. integer result types only.
+    if (is_simplifiable_binary(k) && inst.operand_count == 2) {
+        if (is_int(m, inst.ty) == false) { ret false; }
+        val a: value.Value = resolve(inst.operands[0], subst, has_sub, ilen);
+        val b: value.Value = resolve(inst.operands[1], subst, has_sub, ilen);
+        ret simplify_binary(m, k, a, b, inst.ty, out);
+    }
+
+    ret false;
+}
+
+# true for the binary opcodes this pass recognises identities for.
+fun is_simplifiable_binary(k: instr.InstrKind) bool {
+    if (k == instr.OP_ADD || k == instr.OP_SUB || k == instr.OP_MUL)     { ret true; }
+    if (k == instr.OP_DIV_S || k == instr.OP_DIV_U)                      { ret true; }
+    if (k == instr.OP_REM_S || k == instr.OP_REM_U)                      { ret true; }
+    if (k == instr.OP_AND || k == instr.OP_OR || k == instr.OP_XOR)      { ret true; }
+    if (k == instr.OP_SHL || k == instr.OP_SHR_S || k == instr.OP_SHR_U) { ret true; }
+    ret false;
+}
+
+# applies the binary identities for opcode `k` on resolved operands a, b with
+# integer result type `res_ty`. Writes the replacement into `out` and returns
+# true on a rewrite. The replacement is one of the operands (the surviving
+# operand) or a fresh integer constant (0 / all-ones).
+fun simplify_binary(m: *ir.Module, k: instr.InstrKind, a: value.Value, b: value.Value,
+                    res_ty: ir_type.IrTypeId, out: *value.Value) bool {
+    val bits: u32 = int_bits(m, res_ty);
+    if (bits == 0) { ret false; }
+
+    val a_zero: bool = is_int_zero(a);
+    val b_zero: bool = is_int_zero(b);
+    val a_one:  bool = is_int_one(a);
+    val b_one:  bool = is_int_one(b);
+    val a_ones: bool = is_int_all_ones(a, bits);
+    val b_ones: bool = is_int_all_ones(b, bits);
+    val same:   bool = same_value(a, b);
+
+    if (k == instr.OP_ADD) {
+        # x + 0 -> x, 0 + x -> x
+        if (b_zero) { @out = value.retype(a, res_ty); ret true; }
+        if (a_zero) { @out = value.retype(b, res_ty); ret true; }
+        ret false;
+    }
+    if (k == instr.OP_SUB) {
+        # x - 0 -> x, x - x -> 0
+        if (b_zero) { @out = value.retype(a, res_ty); ret true; }
+        if (same)   { @out = value.const_int(0, res_ty); ret true; }
+        ret false;
+    }
+    if (k == instr.OP_MUL) {
+        # x * 1 -> x, 1 * x -> x, x * 0 -> 0, 0 * x -> 0
+        if (b_one)  { @out = value.retype(a, res_ty); ret true; }
+        if (a_one)  { @out = value.retype(b, res_ty); ret true; }
+        if (b_zero) { @out = value.const_int(0, res_ty); ret true; }
+        if (a_zero) { @out = value.const_int(0, res_ty); ret true; }
+        ret false;
+    }
+    if (k == instr.OP_DIV_S || k == instr.OP_DIV_U) {
+        # x / 1 -> x (division by zero is never an identity and traps).
+        if (b_one) { @out = value.retype(a, res_ty); ret true; }
+        ret false;
+    }
+    if (k == instr.OP_REM_S || k == instr.OP_REM_U) {
+        # x % 1 -> 0 (every integer is divisible by one).
+        if (b_one) { @out = value.const_int(0, res_ty); ret true; }
+        ret false;
+    }
+    if (k == instr.OP_AND) {
+        # x & x -> x, x & 0 -> 0, x & ~0 -> x
+        if (same)   { @out = value.retype(a, res_ty); ret true; }
+        if (b_zero) { @out = value.const_int(0, res_ty); ret true; }
+        if (a_zero) { @out = value.const_int(0, res_ty); ret true; }
+        if (b_ones) { @out = value.retype(a, res_ty); ret true; }
+        if (a_ones) { @out = value.retype(b, res_ty); ret true; }
+        ret false;
+    }
+    if (k == instr.OP_OR) {
+        # x | x -> x, x | 0 -> x, x | ~0 -> ~0
+        if (same)   { @out = value.retype(a, res_ty); ret true; }
+        if (b_zero) { @out = value.retype(a, res_ty); ret true; }
+        if (a_zero) { @out = value.retype(b, res_ty); ret true; }
+        if (b_ones) { @out = value.const_int(all_ones(bits), res_ty); ret true; }
+        if (a_ones) { @out = value.const_int(all_ones(bits), res_ty); ret true; }
+        ret false;
+    }
+    if (k == instr.OP_XOR) {
+        # x ^ x -> 0, x ^ 0 -> x
+        if (same)   { @out = value.const_int(0, res_ty); ret true; }
+        if (b_zero) { @out = value.retype(a, res_ty); ret true; }
+        if (a_zero) { @out = value.retype(b, res_ty); ret true; }
+        ret false;
+    }
+    if (k == instr.OP_SHL || k == instr.OP_SHR_S || k == instr.OP_SHR_U) {
+        # x << 0 -> x, x >> 0 -> x, 0 << c -> 0, 0 >> c -> 0
+        if (b_zero) { @out = value.retype(a, res_ty); ret true; }
+        if (a_zero) { @out = value.const_int(0, res_ty); ret true; }
+        ret false;
+    }
+    ret false;
+}
+
+# true when `v` is the integer constant 0 (the additive / xor / or identity and
+# the multiplicative / and annihilator).
+fun is_int_zero(v: value.Value) bool {
+    ret v.kind == value.VAL_CONST_INT && v.data.int_lit == 0;
+}
+
+# true when `v` is the integer constant 1 (the multiplicative identity).
+fun is_int_one(v: value.Value) bool {
+    ret v.kind == value.VAL_CONST_INT && v.data.int_lit == 1;
+}
+
+# true when `v` is the all-ones constant for a `bits`-wide integer (the bitwise
+# `and` identity / `or` annihilator), comparing only the low `bits` bits.
+fun is_int_all_ones(v: value.Value, bits: u32) bool {
+    if (v.kind != value.VAL_CONST_INT) { ret false; }
+    ret mask(v.data.int_lit, bits) == all_ones(bits);
+}
+
+# the all-ones bit pattern for a `bits`-wide integer.
+fun all_ones(bits: u32) u64 {
+    if (bits >= 64) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret (1::u64 << bits::u64) - 1;
+}
+
+# masks `v` to its low `bits` bits (a 64-bit value passes through unchanged).
+fun mask(v: u64, bits: u32) u64 {
+    if (bits >= 64) { ret v; }
+    val m: u64 = (1::u64 << bits::u64) - 1;
+    ret v & m;
+}
+
+# true when two resolved operands name the exact same SSA value, so they are
+# guaranteed to evaluate identically at runtime. Only instruction results and
+# parameters are treated as "same"; an all-constant expression is constfold's
+# job. Two VAL_INSTR match iff they name the same instruction id; two VAL_PARAM
+# iff the same parameter index.
+fun same_value(a: value.Value, b: value.Value) bool {
+    if (a.kind != b.kind) { ret false; }
+    if (a.kind == value.VAL_INSTR) { ret a.data.instr == b.data.instr; }
+    if (a.kind == value.VAL_PARAM) { ret a.data.param_ix == b.data.param_ix; }
+    ret false;
+}
+
+# true when `tid` resolves to an IRT_INT type (the only types simplified here).
+fun is_int(m: *ir.Module, tid: ir_type.IrTypeId) bool {
+    ret int_bits(m, tid) != 0;
+}
+
+# returns the bit width of an IRT_INT type, or 0 when the id does not resolve to
+# an integer type (the caller declines to simplify).
+fun int_bits(m: *ir.Module, tid: ir_type.IrTypeId) u32 {
+    val got: Option[*ir_type.IrType] = ir_type.get(?m.types, tid);
+    if (is_none[*ir_type.IrType](got)) { ret 0; }
+    val t: *ir_type.IrType = unwrap[*ir_type.IrType](got);
+    if (t.kind != ir_type.IRT_INT) { ret 0; }
+    ret t.data.bits;
+}
+
+# rewrites every operand of every instruction that names a simplified
+# instruction to its replacement. Operands are resolved transitively through the
+# table (via `resolve`) so a chain of simplifications collapses fully.
+fun apply_substitutions(fn: *ir.Function, subst: *value.Value, has_sub: *bool, ilen: u32) {
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val inst: *instr.Instruction = ?fn.instrs[i];
+        var o: u32 = 0;
+        for (o < inst.operand_count) {
+            val op: value.Value = inst.operands[o];
+            if (op.kind == value.VAL_INSTR) {
+                val iid: u32 = op.data.instr::u32;
+                if (iid < ilen && has_sub[iid]) {
+                    inst.operands[o] = resolve(op, subst, has_sub, ilen);
+                }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+}
