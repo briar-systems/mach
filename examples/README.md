@@ -38,8 +38,9 @@ the repository's `dep/mach-std`. The build resolves it as a local dependency.
 It is a reference for the language surface, not a runnable program against the
 current compiler.
 
-## Output helpers
+## Output
 
-Several examples include a small local `out` / `out_num` pair that writes to
-stdout via `std.system.os.write`. They are written out in full in each file so
-every example reads top to bottom without cross-references.
+Examples print through `std.print`: `println` for a line of text and
+`printlnf` for formatted output (`%d` signed, `%u` unsigned, `%s` string).
+`10_lowlevel` is the exception — it writes its first line with a hand-issued
+`write` syscall, since the raw syscall is the point of that example.
