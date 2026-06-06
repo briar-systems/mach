@@ -95,7 +95,7 @@ use          std.runtime;
 use print:   std.print;
 
 $main.symbol = "main";
-fun main(argc: i64, argv: &&u8) i64 {
+fun main(argc: i64, argv: **u8) i64 {
     print.println("Hello, World!");
     ret 0;
 }
@@ -116,7 +116,7 @@ fun fibr(n: u64) u64 {
 }
 
 $main.symbol = "main";
-fun main(argc: i64, argv: &&u8) i64 {
+fun main(argc: i64, argv: **u8) i64 {
     print.printf("fib(%d) = %d\n", 10::i64, fibr(10));
     ret 0;
 }
@@ -137,7 +137,7 @@ fun fact(n: u64) u64 {
 }
 
 $main.symbol = "main";
-fun main(argc: i64, argv: &&u8) i64 {
+fun main(argc: i64, argv: **u8) i64 {
     print.printf("fact(%d) = %d\n", 10::i64, fact(10));
     ret 0;
 }
