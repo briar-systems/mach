@@ -313,6 +313,19 @@ pub val MIR_FCMP:      MirOpcode = 0x1118;
 # memory directly) and the encoder materializes the SSE move. the width (4 for
 # f32, 8 for f64) selects MOVSS vs MOVSD.
 pub val MIR_FMOV:      MirOpcode = 0x1119;
+# MIR_VA_FP_SAVE: the AL-guarded variadic FP-register spill pseudo. operand 0 is
+# the save-area MEM operand at `va_fp_save_offset` (a frame-slot key the encoder
+# resolves to `[rbp + off]`); operand 1 is an immediate count of FP argument
+# registers to dump (the convention's `FP_PARAM_COUNT`). it survives selection and
+# the encoder materializes a self-contained `test al,al ; jz over ; movsd
+# [save+i*16], xmm_i (i in 0..count)` sequence, AL-guarding the spill exactly as
+# the SysV variadic prologue requires (AL carries the caller's vector-register
+# count; zero means no FP varargs, so the dump is skipped). the low 8 bytes of each
+# XMM hold the passed f32/f64, so a MOVSD per register suffices and needs no 16-byte
+# alignment. it reads AL and XMM0..7 as fixed incoming argument registers — like the
+# GP spill's RDI..R9 reads, they are invisible to vreg liveness and the pseudo runs
+# in the prologue before any allocatable value is live, so no clobber conflict.
+pub val MIR_VA_FP_SAVE: MirOpcode = 0x111A;
 
 # float-comparison condition codes carried on a MIR_FCMP. a UCOMISD sets CF/ZF/PF
 # (an UNORDERED result sets all three), so the float compare maps to UNSIGNED
@@ -3842,11 +3855,35 @@ fun emit_va_save_prologue(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
         gi = gi + 1;
     }
 
-    # the FP argument registers (XMM0–7) are NOT spilled: `va_arg` of a floating-
-    # point type is not yet supported (it errors loudly in `lower_va_arg`), so the
-    # FP region of the save area is never read. dumping XMM to the save area — and
-    # the AL-guarded conditional spill a full implementation needs — is a follow-up.
+    # spill the FP argument registers (XMM0–XMM7) into the save area's FP region,
+    # AL-guarded: the SysV variadic call convention passes the number of vector
+    # registers used in AL, so when AL is zero (no FP varargs) the dump is skipped.
+    # the self-contained pseudo materializes `test al,al ; jz over ; movsd
+    # [save+i*16], xmm_i` in the encoder, keeping the conditional spill in one block
+    # (no entry-block CFG split). its base is the save-area slot at the FP region's
+    # start; its count is the convention's FP argument-register file size.
+    val sp: Result[bool, str] = emit_va_fp_save(ctx, mb, sk);
+    if (is_err[bool, str](sp)) { ret sp; }
     ret ok[bool, str](true);
+}
+
+# emit_va_fp_save: append the AL-guarded FP-register spill pseudo to the prologue.
+# `save_vreg` is the register-save area's slot-key vreg; operand 0 addresses the FP
+# region at `va_fp_save_offset` within it, operand 1 carries the FP argument-register
+# count. the encoder expands it (see MIR_VA_FP_SAVE) into the conditional XMM dump.
+fun emit_va_fp_save(ctx: *LowerCtx, mb: *MirBlock, save_vreg: u32) Result[bool, str] {
+    val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
+    if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
+    val ops: *MirOperand = unwrap_ok[*MirOperand, str](r);
+    ops[0] = op_mem_slot(save_vreg, sysv.va_fp_save_offset()::i64);
+    ops[1] = op_imm(sysv.FP_PARAM_COUNT::i64);
+    var mi: MirInstr;
+    mi.opcode        = MIR_VA_FP_SAVE;
+    mi.operands      = ops;
+    mi.operand_count = 2;
+    mi.width         = 8;
+    mi.src_width     = 8;
+    ret push_instr(ctx, mb, mi);
 }
 
 # lower_va_start: expand `OP_VA_START [ap]` into the AMD64 `__va_list_tag`
@@ -3929,10 +3966,9 @@ fun emit_store_imm(ctx: *LowerCtx, mb: *MirBlock, mem: MirOperand, imm: i64, wid
 #   gp_offset       += (8 & mask32)          (only when a register was used)
 #   overflow_arg_area += (8 & ~mask)         (only when overflow was used)
 #   result = load.T [addr]
-# FP-class (float) and >16-byte by-value arguments are not handled here — only the
-# scalar / pointer GP cases `std.format` needs; a float va_arg errors loudly
-# rather than miscompiling. fp_offset / fp register-save reads are a documented
-# follow-up.
+# a float result is handled by `lower_va_arg_fp` (the same branch-free select over
+# the fp_offset cursor / FP register-save region). a >16-byte by-value aggregate is
+# not handled here and still errors loudly rather than miscompiling.
 fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
     if (inst.operand_count == 0) {
         ret err[bool, str]("mir.lower_ir: va_arg with no va_list operand");
@@ -3942,7 +3978,7 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
         ret err[bool, str]("mir.lower_ir: va_arg defines no result vreg");
     }
     if (value_is_float(ctx, inst.ty)) {
-        ret err[bool, str]("mir.lower_ir: va_arg of a floating-point type is not yet supported");
+        ret lower_va_arg_fp(ctx, mb, inst, dst);
     }
     if (value_is_aggregate(ctx, inst.ty)) {
         ret err[bool, str]("mir.lower_ir: va_arg of an aggregate type is not yet supported");
@@ -4033,6 +4069,100 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
     mi.src_width     = w;
     mi.width         = clamp_alu_width(w);
     ret push_instr(ctx, mb, mi);
+}
+
+# lower_va_arg_fp: expand `OP_VA_ARG [ap]` for a floating-point (f32 / f64) result.
+# the FP analogue of `lower_va_arg`: per SysV the next float argument is taken from
+# the FP register-save region while an FP slot remains (fp_offset < fp_offset_max),
+# else from the overflow area. fp_offset starts past the named FP params at the FP
+# region base and advances by 16 (the XMM save stride) on a register read; the
+# overflow cursor advances by 8 on an overflow read. the register-vs-overflow choice
+# is realized branch-free with the same 0/-1 mask the GP path uses, so no extra basic
+# blocks are introduced:
+#   in_reg = fp_offset < fp_offset_max
+#   mask   = 0 - in_reg                       (i64: all-ones when in_reg else 0)
+#   reg_ad = reg_save_area + fp_offset        (low lane of the saved XMM slot)
+#   addr   = (reg_ad & mask) | (overflow & ~mask)
+#   fp_offset         += (16 & mask32)        (only when a register was used)
+#   overflow_arg_area += (8  & ~mask)         (only when overflow was used)
+#   result = fmov.T [addr]                    (MOVSS / MOVSD into the FP-class dst)
+# the address arithmetic / select runs in GP vregs; only the final load is a float
+# move so the value lands in the XMM-classed result vreg.
+fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst: u32) Result[bool, str] {
+    val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
+
+    # fp = load.i32 [ap + fp_offset].
+    var fp: u32 = MIR_VREG_NIL;
+    val lf: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_FP_OFFSET), 4, ?fp);
+    if (is_err[bool, str](lf)) { ret lf; }
+
+    # in_reg = fp < fp_offset_max  (u32 compare -> i8 boolean).
+    var in_reg: u32 = MIR_VREG_NIL;
+    val cr: Result[bool, str] = emit_alu3(ctx, mb, MIR_CMP_LT_U, op_vreg(fp),
+        op_imm(sysv.va_fp_offset_max()::i64), 4, ?in_reg);
+    if (is_err[bool, str](cr)) { ret cr; }
+
+    # mask = 0 - zext(in_reg)  -> 0 or 0xFFFFFFFFFFFFFFFF (64-bit).
+    var inz: u32 = MIR_VREG_NIL;
+    val zr: Result[bool, str] = emit_zext_to(ctx, mb, op_vreg(in_reg), 1, ?inz);
+    if (is_err[bool, str](zr)) { ret zr; }
+    var mask: u32 = MIR_VREG_NIL;
+    val mr: Result[bool, str] = emit_alu3(ctx, mb, MIR_SUB, op_imm(0), op_vreg(inz), 8, ?mask);
+    if (is_err[bool, str](mr)) { ret mr; }
+    var nmask: u32 = MIR_VREG_NIL;
+    val nr: Result[bool, str] = emit_not_to(ctx, mb, op_vreg(mask), 8, ?nmask);
+    if (is_err[bool, str](nr)) { ret nr; }
+
+    # reg_addr = reg_save_area + zext(fp).
+    var rsa: u32 = MIR_VREG_NIL;
+    val lr: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_REG_SAVE_AREA), 8, ?rsa);
+    if (is_err[bool, str](lr)) { ret lr; }
+    var fp64: u32 = MIR_VREG_NIL;
+    val fzr: Result[bool, str] = emit_zext_to(ctx, mb, op_vreg(fp), 4, ?fp64);
+    if (is_err[bool, str](fzr)) { ret fzr; }
+    var reg_addr: u32 = MIR_VREG_NIL;
+    val rar: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(rsa), op_vreg(fp64), 8, ?reg_addr);
+    if (is_err[bool, str](rar)) { ret rar; }
+
+    # ovf = overflow_arg_area.
+    var ovf: u32 = MIR_VREG_NIL;
+    val lo: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), 8, ?ovf);
+    if (is_err[bool, str](lo)) { ret lo; }
+
+    # addr = (reg_addr & mask) | (ovf & ~mask).
+    var ra_m: u32 = MIR_VREG_NIL;
+    val r1: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(reg_addr), op_vreg(mask), 8, ?ra_m);
+    if (is_err[bool, str](r1)) { ret r1; }
+    var ov_m: u32 = MIR_VREG_NIL;
+    val r2: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(ovf), op_vreg(nmask), 8, ?ov_m);
+    if (is_err[bool, str](r2)) { ret r2; }
+    var addr: u32 = MIR_VREG_NIL;
+    val r3: Result[bool, str] = emit_alu3(ctx, mb, MIR_OR, op_vreg(ra_m), op_vreg(ov_m), 8, ?addr);
+    if (is_err[bool, str](r3)) { ret r3; }
+
+    # fp_offset += (16 & mask32): advance by an XMM save stride when a register was used.
+    var step_fp: u32 = MIR_VREG_NIL;
+    val sf: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_imm(16), op_vreg(mask), 4, ?step_fp);
+    if (is_err[bool, str](sf)) { ret sf; }
+    var new_fp: u32 = MIR_VREG_NIL;
+    val nf: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(fp), op_vreg(step_fp), 4, ?new_fp);
+    if (is_err[bool, str](nf)) { ret nf; }
+    val wf: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_FP_OFFSET), op_vreg(new_fp), 4);
+    if (is_err[bool, str](wf)) { ret wf; }
+
+    # overflow_arg_area += (8 & ~mask): advance by one eightbyte when the overflow area was used.
+    var step_ov: u32 = MIR_VREG_NIL;
+    val so: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_imm(8), op_vreg(nmask), 8, ?step_ov);
+    if (is_err[bool, str](so)) { ret so; }
+    var new_ov: u32 = MIR_VREG_NIL;
+    val no: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(ovf), op_vreg(step_ov), 8, ?new_ov);
+    if (is_err[bool, str](no)) { ret no; }
+    val wo: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), op_vreg(new_ov), 8);
+    if (is_err[bool, str](wo)) { ret wo; }
+
+    # result = fmov.T [addr]: a float move so the value lands in the XMM-classed dst.
+    val w: u8 = op_width_of(ctx, inst.ty);
+    ret emit_fmov(ctx, mb, op_vreg(dst), op_mem_value(addr, 0), w);
 }
 
 # emit_zext_to: zero-extend `src` (`src_w` bytes) into a fresh 8-byte GP vreg,
