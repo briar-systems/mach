@@ -1,11 +1,12 @@
 ---
 name: mach-lowlevel
-description: Use when writing or reviewing Mach inline assembly or deciding whether functionality belongs in the compiler or the stdlib. Covers the asm <isa> { ... } form with {name} operand substitution, multi-arch dispatch via $if on $mach.target.arch, the compiler-infers-operands-and-clobbers model, and the compiler-vs-stdlib boundary policy (SIMD operators and asm encoding in the compiler; atomics, fences, syscalls, SIMD long-tail in stdlib).
+description: Use when writing or reviewing Mach inline assembly, syscalls, or other target-specific code. Covers the asm <isa> { ... } form with {name} operand substitution, multi-arch dispatch via $if on $mach.target.arch, the compiler-infers-operands-and-clobbers model, and when to write asm versus call a standard-library wrapper.
 ---
 
 # Mach low-level layer
 
-Inline assembly and the compiler-vs-stdlib boundary. Two concerns: how to write an `asm` block correctly, and where a low-level operation belongs.
+Inline assembly and target-specific code. Two concerns: how to write an `asm`
+block correctly, and when to reach for `asm` versus a stdlib wrapper.
 
 ## The `asm` form
 
@@ -81,33 +82,16 @@ $or {
 
 Write `asm` only for truly target-specific operations with no 1:1 stdlib wrapper: raw syscalls, special-register reads, stack-frame surgery.
 
-For anything that maps to a named stdlib function — atomics, fences, traps, bit ops, the SIMD long-tail — **call the stdlib API**. Those wrappers already contain the arch-dispatched `asm`; reimplementing them inline duplicates the dispatch and loses the encapsulation.
+For anything that maps to a named stdlib function — atomics, fences, traps, bit ops, the SIMD long-tail — **call the stdlib API**. Those wrappers already contain the arch-dispatched `asm`; reimplementing them inline duplicates the dispatch and loses the encapsulation. The standard library covers, among others:
 
-## Compiler vs stdlib boundary
-
-> Compiler handles things that need to **feel like the language**. Stdlib handles things that map **1:1 to specific instruction sequences** with predictable lowerings.
-
-**Compiler** (intrinsic, language-level):
-- Type system, control flow (`if`/`or`, `for`, `ret`, `brk`, `cnt`, `fin`).
-- **SIMD operators on primitive vector types** — arithmetic (`+ - * / %`), bitwise (`& | ^ ~ << >>`), comparison, lane indexing, vector literals. One CPU instruction per operator per ISA.
-- **`asm` parsing, encoding, and operand allocation** per ISA.
-- The comptime channel — `$mach.*` reads, attribute writes, the closed intrinsic set, `$if`/`$or`.
-- Comptime function-parameter dispatch (`$name: T`).
-
-**Stdlib** (1:1 instruction sequences, built on `asm`):
 - **Atomics** — load/store/cas/RMW, per arch × per ordering.
 - **Memory fences and CPU hints** — pause, prefetch.
 - **Traps / unreachable** — `trap()` with per-arch `asm { ud2 / brk 0 / ... }`.
 - **Syscalls** — per-platform ABI wrappers.
-- **CPU feature detection** — CPUID-style runtime reads.
-- **SIMD long tail** — shuffles, reductions, gather/scatter, saturating arithmetic, specialized math. Functions over the compiler-known SIMD types.
 - **Bit manipulation** — popcount, clz, ctz, bswap.
-- **Formatting, parsing, math, allocators** — pure Mach over the primitives.
+- **SIMD long tail** — shuffles, reductions, gather/scatter, saturating arithmetic, specialized math (once SIMD types land).
 
-Decision rule for placement:
-- Does it need to feel like the language (an operator, a type, control flow)? Compiler.
-- Does it map to a fixed instruction sequence per arch with a predictable lowering? Stdlib, via `$if ($mach.target.arch == ...)` → `asm <isa> { ... }`.
-- The compiler grows **only** when something genuinely cannot be expressed as a 1:1 instruction sequence per arch (autovectorization, 128-bit arithmetic needing context-dependent lowering). Default is stdlib.
+Rule of thumb: if the operation maps to a fixed instruction sequence per arch, there is (or should be) a stdlib wrapper — prefer it. Reach for raw `asm` only when no such wrapper exists.
 
 ## Variant parameters in stdlib wrappers
 
@@ -117,9 +101,14 @@ Memory orderings and similar runtime-relevant variants are passed as **comptime 
 fun atomic_load[T](ptr: *T, $order: Order) T { ... }
 ```
 
+> **Implementation status.** A `$name: T` parameter is accepted in a signature
+> but is not yet usable as a comptime constant inside the body (`$if (order ==
+> RELAXED)` is not yet supported). Until it lands, branch on such a parameter
+> with a runtime `if`.
+
 ## SIMD type spelling
 
-Vector types follow `<u|i|f><width>x<count>`: `f32x4`, `i32x8`, `u8x16`. Higher dimensions are grammatically legal (`f32x4x4`) and populated as backends accelerate. The set is compiler-shipped and closed per target. Operators on these types are compiler intrinsics; everything beyond the basic operator set is stdlib.
+Vector types follow `<u|i|f><width>x<count>`: `f32x4`, `i32x8`, `u8x16`. Higher dimensions are grammatically legal (`f32x4x4`). **Planned, not yet implemented** — these names do not resolve as types today. Once seeded, the basic operators on them are compiler intrinsics and everything beyond is stdlib.
 
 ## Mach gotchas that bite in low-level code
 
@@ -133,8 +122,9 @@ Vector types follow `<u|i|f><width>x<count>`: `f32x4`, `i32x8`, `u8x16`. Higher 
 
 ## Reference
 
-- [doc/language/asm.md](../../../doc/language/asm.md) — the `asm` form, operand substitution, inferred clobbers, multi-arch dispatch.
-- [doc/language/policy.md](../../../doc/language/policy.md) — the compiler-vs-stdlib boundary in full.
-- [doc/language/comptime-control.md](../../../doc/language/comptime-control.md) — `$if`/`$or` over `$mach.target.arch`.
-- [doc/language/comptime-intrinsics.md](../../../doc/language/comptime-intrinsics.md) — what is a compiler intrinsic vs deferred to stdlib.
-- [doc/language/](../../../doc/language/README.md) — full language reference index.
+The authoritative low-level reference lives in the Mach repository under
+[`doc/language/`](https://github.com/octalide/mach/tree/dev/doc/language) —
+`asm.md` (the `asm` form, operand substitution, inferred clobbers, multi-arch
+dispatch), `comptime-control.md` (`$if`/`$or` over `$mach.target.arch`), and
+`policy.md` (the full compiler-vs-stdlib boundary). When a skill and the
+reference disagree, the reference wins.

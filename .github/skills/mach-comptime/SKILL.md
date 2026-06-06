@@ -1,6 +1,6 @@
 ---
 name: mach-comptime
-description: Use when writing or reviewing Mach code that touches the comptime channel: the $ namespace, conditional compilation, target/build/project/source queries ($mach.*), symbol attributes ($sym.attr), compiler intrinsics ($size_of/$align_of/$offset_of/$error/$assert), $if/$or comptime control flow, and comptime function parameters ($name: T).
+description: Use when writing or reviewing Mach code that touches the comptime channel: the $ namespace, conditional compilation, target/compiler/build/project/source queries ($mach.*), symbol attributes ($sym.attr), compiler intrinsics ($size_of/$align_of/$offset_of/$error/$assert), $if/$or comptime control flow, and comptime function parameters ($name: T).
 ---
 
 # Mach comptime channel
@@ -26,8 +26,11 @@ All reads, all comptime constants. Closed tree. Subtrees:
 ```mach
 $mach.target.os                 # compare against $mach.os.* tags
 $mach.target.arch               # compare against $mach.arch.* tags
-$mach.target.abi
 $mach.target.pointer_width      # integer byte count
+$mach.target.abi
+
+$mach.compiler.name
+$mach.compiler.version
 
 $mach.build.mode
 $mach.build.timestamp
@@ -48,6 +51,12 @@ $mach.os.linux $mach.os.darwin $mach.os.windows $mach.os.freestanding
 $mach.arch.x86_64 $mach.arch.aarch64
 ```
 
+> **Implementation status.** Only a subset resolves today:
+> `$mach.target.{os,arch,pointer_width}`, `$mach.os.*`, `$mach.arch.*`, and
+> `$mach.compiler.{name,version}`. The `$mach.target.abi`, `$mach.build.*`,
+> `$mach.project.*`, and `$mach.source.*` paths are reserved stubs — reading one
+> is a compile error. Prefer the live reads in real code.
+
 Tag comparison is path-value — no `.id` suffix, no unwrapping:
 
 ```mach
@@ -61,7 +70,7 @@ type inference — the binding still declares its type):
 
 ```mach
 pub val IS_LINUX: u8  = $mach.target.os == $mach.os.linux;
-pub val VERSION:  *u8 = $mach.project.version;
+pub val COMPILER: *u8 = $mach.compiler.name;
 ```
 
 ## Symbol attributes — `$sym.attr`
@@ -100,6 +109,13 @@ Closed attribute set:
 | `.section` | functions, vars | `*u8` literal | linker section name |
 | `.packed` | records, unions | `u8` flag | disable field padding |
 
+> **Implementation status.** Any well-formed attribute write parses, but only
+> `.symbol` currently changes compiler output (the linker name). The rest are
+> accepted and ignored — layout uses the natural C-style rule regardless of
+> `.align` / `.packed`, and `.noreturn` / `.inline` / `.section` do not yet
+> feed codegen. Flag attributes take a `u8`; `true` and `1` are equivalent when
+> stdlib `bool` is in scope.
+
 The `ext fun` rename uses `.symbol`:
 
 ```mach
@@ -135,6 +151,10 @@ $assert(cond, "msg")    # sugar: $if (!cond) { $error("msg"); }
 $assert($size_of(i64) == 8, "expected 64-bit i64");
 ```
 
+> **Implementation status.** `$error` / `$assert` parse but are not yet
+> evaluated — a failing directive is currently accepted rather than aborting the
+> build. The shapes above describe the intended behavior.
+
 Runtime-instruction emitters (`trap`, `fence`, `pause`, …) are **not**
 intrinsics — they live in stdlib as functions with per-arch `asm` bodies. The
 intrinsic set is closed; new ones need a compiler patch.
@@ -152,15 +172,14 @@ type-checked, or emitted — names inside them are never looked up. This is what
 makes per-arch `asm` blocks safe: the untaken block may reference registers a
 backend doesn't know.
 
-`cond` must be comptime: `$mach.*` reads, comparisons of comptime constants, or
-comptime function parameters.
+`cond` must be comptime: `$mach.*` reads, or comparisons of comptime constants.
 
 ```mach
 $if ($mach.target.os == $mach.os.linux) {
-    use full.os.linux;
+    use std.runtime.linux;
 }
 $or ($mach.target.os == $mach.os.windows) {
-    use full.os.windows;
+    use std.runtime.windows;
 }
 $or {
     $error("unsupported OS");
@@ -174,9 +193,8 @@ arch-block construct.
 
 A comptime value parameter sits in the regular paren list as `$name: T`. The
 caller must pass a comptime-evaluable value; the compiler enforces it at the
-call site. Inside the body, reference it by bare `name` (no `$`) — `$if` then
-dispatches on it. This is the idiom for passing memory orderings and similar
-variants into stdlib.
+call site. Inside the body, reference it by bare `name` (no `$`). This is the
+idiom for passing memory orderings and similar variants into stdlib wrappers.
 
 ```mach
 pub fun load($order: Order, ptr: *i64) i64 {
@@ -194,6 +212,13 @@ pub fun load($order: Order, ptr: *i64) i64 {
     ret result;
 }
 ```
+
+> **Implementation status.** The `$name: T` parameter is accepted in a
+> signature, but it is not yet usable as a comptime constant inside the body —
+> `$if (order == RELAXED)` reports that the identifier is not a comptime
+> constant in scope. Per-call-site dispatch requires monomorphizing the body per
+> distinct value, which is not yet done. Until it lands, branch on such a
+> parameter with a runtime `if`.
 
 The `$name: T` form applies to **function parameters only** — not record
 fields, not generic-bracket contexts. Generic *type* parameters use `[T]`
@@ -214,7 +239,7 @@ brackets and are a separate mechanism.
 - **Value intrinsics are unsigned constants with no implicit type.** The binding
   declares the storage type (Mach has no type inference and no `usize`).
 - **Comptime param is referenced bare in the body.** Declared `$order: Order`,
-  used as `order` inside `$if`.
+  used as `order`.
 - **Not in the channel:** no `$<Type>.*` reflection subtree (types aren't
   first-class comptime values), no comptime function definitions, no comptime
   loops.
@@ -224,9 +249,8 @@ brackets and are a separate mechanism.
 
 ## Reference
 
-- [doc/language/comptime.md](../../../doc/language/comptime.md) — channel overview, four shapes
-- [doc/language/comptime-mach.md](../../../doc/language/comptime-mach.md) — `$mach.*` namespace
-- [doc/language/comptime-attrs.md](../../../doc/language/comptime-attrs.md) — symbol attributes
-- [doc/language/comptime-intrinsics.md](../../../doc/language/comptime-intrinsics.md) — intrinsics
-- [doc/language/comptime-control.md](../../../doc/language/comptime-control.md) — `$if` / `$or`
-- [doc/language/](../../../doc/language/README.md) — full language reference index
+The authoritative comptime reference lives in the Mach repository under
+[`doc/language/`](https://github.com/octalide/mach/tree/dev/doc/language) —
+`comptime.md`, `comptime-mach.md`, `comptime-attrs.md`,
+`comptime-intrinsics.md`, and `comptime-control.md`. When a skill and the
+reference disagree, the reference wins.
