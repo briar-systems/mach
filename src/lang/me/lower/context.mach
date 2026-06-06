@@ -56,6 +56,12 @@ use builder:  mach.lang.me.ir.builder;
 # initial capacity for the loop and fin working stacks on a LowerContext.
 val INITIAL_STACK_CAP: u32 = 8;
 
+# upper bound on the number of distinct comptime value-parameter instances one
+# module may emit. a recursive comptime-param function called with a changing
+# value (`f($n - 1)`) would otherwise instantiate without end; hitting this cap
+# is reported as an error rather than exhausting memory.
+pub val MAX_VALUE_INSTANCES: u32 = 4096;
+
 # one entry on the loop stack: the header and exit blocks of an active
 # loop. `cnt` branches to `header`, `brk` branches to `exit`.
 # ---
@@ -81,6 +87,29 @@ pub rec Instance {
     origin:  sess.ModuleId;
     args:    *ty.TypeId;
     arg_len: u32;
+    name:    intern.StrId;
+}
+
+# one collected comptime value-parameter instance awaiting body emission: a
+# `(decl, origin, comptime-value sequence)` triple plus the mangled symbol name
+# the instance is emitted under. mirrors `Instance` but keys on folded comptime
+# VALUES (CTValues) rather than type arguments, so a function with one or more
+# `$`-parameters is monomorphized once per distinct argument-value sequence. the
+# worklist dedups by `name`.
+# ---
+# decl:    DeclId of the comptime-param function in `origin`'s AST
+# origin:  ModuleId that declares the function
+# vals:    owned copy of the folded comptime-value sequence (by comptime ordinal)
+# val_len: number of comptime values
+# names:   owned copy of the bare comptime-param identifiers (by comptime ordinal),
+#          paired positionally with `vals` for binding into the comptime context
+# name:    instance linkage name (mangled, with the value-args suffix)
+pub rec ValueInstance {
+    decl:    aid.DeclId;
+    origin:  sess.ModuleId;
+    vals:    *comptime.CTValue;
+    val_len: u32;
+    names:   *intern.StrId;
     name:    intern.StrId;
 }
 
@@ -122,6 +151,12 @@ pub rec Instance {
 #              instance emits one concrete weak body)
 # inst_len:    number of worklist entries
 # inst_cap:    allocated capacity of the worklist
+# vinsts:      per-module worklist of comptime value-parameter instances collected
+#              at call sites, drained to fixpoint after the type-instance worklist;
+#              each emits one concrete weak body with its `$param->CTValue` bindings
+#              active so the comptime evaluator selects each `$if` arm
+# vinst_len:   number of value-instance worklist entries
+# vinst_cap:   allocated capacity of the value-instance worklist
 pub rec LowerContext {
     s:           *sess.Session;
     tgt:         *target.Target;
@@ -153,6 +188,10 @@ pub rec LowerContext {
     insts:       *Instance;
     inst_len:    u32;
     inst_cap:    u32;
+
+    vinsts:      *ValueInstance;
+    vinst_len:   u32;
+    vinst_cap:   u32;
 }
 
 
@@ -225,6 +264,9 @@ pub fun init_context(
     lc.insts     = nil;
     lc.inst_len  = 0;
     lc.inst_cap  = 0;
+    lc.vinsts    = nil;
+    lc.vinst_len = 0;
+    lc.vinst_cap = 0;
 
     ret ok[bool, str](true);
 }
@@ -254,6 +296,19 @@ pub fun dnit_context(lc: *LowerContext) {
         }
         deallocate[Instance](lc.s.alloc, lc.insts, lc.inst_cap::usize);
     }
+    if (lc.vinsts != nil && lc.vinst_cap > 0) {
+        var vi: u32 = 0;
+        for (vi < lc.vinst_len) {
+            if (lc.vinsts[vi].vals != nil && lc.vinsts[vi].val_len > 0) {
+                deallocate[comptime.CTValue](lc.s.alloc, lc.vinsts[vi].vals, lc.vinsts[vi].val_len::usize);
+            }
+            if (lc.vinsts[vi].names != nil && lc.vinsts[vi].val_len > 0) {
+                deallocate[intern.StrId](lc.s.alloc, lc.vinsts[vi].names, lc.vinsts[vi].val_len::usize);
+            }
+            vi = vi + 1;
+        }
+        deallocate[ValueInstance](lc.s.alloc, lc.vinsts, lc.vinst_cap::usize);
+    }
     lc.loops    = nil;
     lc.loop_len = 0;
     lc.loop_cap = 0;
@@ -263,6 +318,9 @@ pub fun dnit_context(lc: *LowerContext) {
     lc.insts    = nil;
     lc.inst_len = 0;
     lc.inst_cap = 0;
+    lc.vinsts    = nil;
+    lc.vinst_len = 0;
+    lc.vinst_cap = 0;
 }
 
 # resets the per-function working state before lowering a new function:
@@ -434,6 +492,79 @@ pub fun enqueue_instance(lc: *LowerContext, decl: aid.DeclId, origin: sess.Modul
     inst.name    = name;
     lc.insts[lc.inst_len] = inst;
     lc.inst_len = lc.inst_len + 1;
+    ret ok[bool, str](true);
+}
+
+# enqueue_value_instance: record a comptime value-parameter instance
+# `(decl, origin, vals, names)` on the per-module worklist under its mangled
+# `name`, deduped by name (identical to `enqueue_instance` — a linear scan, no
+# map/hash, so determinism is preserved). takes OWNED copies of `vals` and
+# `names` so the caller's buffers can be reused / freed; the copies are released
+# when the context is torn down. exceeding MAX_VALUE_INSTANCES distinct instances
+# is reported as an error (a recursive comptime-param function called with a
+# changing value would otherwise instantiate without end).
+# ---
+# lc:      the context
+# decl:    DeclId of the comptime-param function in `origin`'s AST
+# origin:  ModuleId declaring the function
+# vals:    folded comptime-value sequence (copied), by comptime ordinal
+# names:   bare comptime-param identifiers (copied), by comptime ordinal
+# val_len: number of comptime values / names
+# name:    instance linkage name
+# ret:     true on success, or an allocation / cap error
+pub fun enqueue_value_instance(lc: *LowerContext, decl: aid.DeclId, origin: sess.ModuleId,
+                               vals: *comptime.CTValue, names: *intern.StrId, val_len: u32,
+                               name: intern.StrId) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < lc.vinst_len) {
+        if (lc.vinsts[i].name == name) { ret ok[bool, str](true); }
+        i = i + 1;
+    }
+
+    if (lc.vinst_len >= MAX_VALUE_INSTANCES) {
+        ret err[bool, str]("comptime value-parameter instantiation limit exceeded (likely unbounded comptime recursion)");
+    }
+
+    if (lc.vinst_len == lc.vinst_cap) {
+        var new_cap: u32 = lc.vinst_cap * 2;
+        if (new_cap == 0) { new_cap = INITIAL_STACK_CAP; }
+        if (lc.vinsts == nil) {
+            val r: Result[*ValueInstance, str] = allocate[ValueInstance](lc.s.alloc, new_cap::usize);
+            if (is_err[*ValueInstance, str](r)) { ret err[bool, str](unwrap_err[*ValueInstance, str](r)); }
+            lc.vinsts = unwrap_ok[*ValueInstance, str](r);
+        } or {
+            val r: Result[*ValueInstance, str] = reallocate[ValueInstance](lc.s.alloc, lc.vinsts, lc.vinst_cap::usize, new_cap::usize);
+            if (is_err[*ValueInstance, str](r)) { ret err[bool, str](unwrap_err[*ValueInstance, str](r)); }
+            lc.vinsts = unwrap_ok[*ValueInstance, str](r);
+        }
+        lc.vinst_cap = new_cap;
+    }
+
+    var vcopy: *comptime.CTValue = nil;
+    var ncopy: *intern.StrId = nil;
+    if (val_len > 0) {
+        val vr: Result[*comptime.CTValue, str] = allocate[comptime.CTValue](lc.s.alloc, val_len::usize);
+        if (is_err[*comptime.CTValue, str](vr)) { ret err[bool, str](unwrap_err[*comptime.CTValue, str](vr)); }
+        vcopy = unwrap_ok[*comptime.CTValue, str](vr);
+        val nr: Result[*intern.StrId, str] = allocate[intern.StrId](lc.s.alloc, val_len::usize);
+        if (is_err[*intern.StrId, str](nr)) {
+            deallocate[comptime.CTValue](lc.s.alloc, vcopy, val_len::usize);
+            ret err[bool, str](unwrap_err[*intern.StrId, str](nr));
+        }
+        ncopy = unwrap_ok[*intern.StrId, str](nr);
+        var j: u32 = 0;
+        for (j < val_len) { vcopy[j] = vals[j]; ncopy[j] = names[j]; j = j + 1; }
+    }
+
+    var inst: ValueInstance;
+    inst.decl    = decl;
+    inst.origin  = origin;
+    inst.vals    = vcopy;
+    inst.val_len = val_len;
+    inst.names   = ncopy;
+    inst.name    = name;
+    lc.vinsts[lc.vinst_len] = inst;
+    lc.vinst_len = lc.vinst_len + 1;
     ret ok[bool, str](true);
 }
 
