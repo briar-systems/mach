@@ -61,12 +61,26 @@ val v: i64  = @p;           # read through
 
 ## Cast
 
-`expr::Type` — explicit conversion. Used for numeric width changes,
-signedness changes, pointer reinterpretation, etc.
+Two postfix cast operators, both written `expr OP Type`:
+
+- `expr::Type` — **value conversion**. Resizes integers (sign- or zero-extend,
+  truncate), converts between integer and float (a numeric `CVT`), and is the
+  identity on a same-type operand. Value-preserving where representable.
+- `expr:~Type` — **bit reinterpret**. Reads the operand's exact bits as the
+  target type with no conversion. Legal only when `Type` has the same byte size
+  as the operand's type (a size mismatch is a compile error). The `~` recalls
+  its bitwise heritage, so `:~` reads as "bit cast".
+
+The two differ sharply on int<->float. `::` runs a numeric conversion, while
+`:~` reinterprets the raw bit pattern:
 
 ```mach
-val a: u64 = some_i64::u64;
-val p: *u8 = some_ptr::*u8;
+val a: u64 = some_i64::u64;     # value conversion (resize)
+val p: *u8 = some_ptr::*u8;     # pointer value, retyped
+
+val n: u64 = 1.5::u64;          # 1                  (float -> int conversion)
+val b: u64 = 1.5:~u64;          # 0x3FF8000000000000 (raw IEEE-754 bits)
+val f: f64 = b:~f64;            # 1.5                (bits read back as a float)
 ```
 
 ## See also
