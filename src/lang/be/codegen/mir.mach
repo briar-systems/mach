@@ -3975,8 +3975,8 @@ fun emit_store_imm(ctx: *LowerCtx, mb: *MirBlock, mem: MirOperand, imm: i64, wid
 #   overflow_arg_area += (8 & ~mask)         (only when overflow was used)
 #   result = load.T [addr]
 # a float result is handled by `lower_va_arg_fp` (the same branch-free select over
-# the fp_offset cursor / FP register-save region). a >16-byte by-value aggregate is
-# not handled here and still errors loudly rather than miscompiling.
+# the fp_offset cursor / FP register-save region); an aggregate result is handled by
+# `lower_va_arg_aggregate` (the GP-cursor select plus a by-value copy).
 fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
     if (inst.operand_count == 0) {
         ret err[bool, str]("mir.lower_ir: va_arg with no va_list operand");
@@ -3989,7 +3989,7 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
         ret lower_va_arg_fp(ctx, mb, inst, dst);
     }
     if (value_is_aggregate(ctx, inst.ty)) {
-        ret err[bool, str]("mir.lower_ir: va_arg of an aggregate type is not yet supported");
+        ret lower_va_arg_aggregate(ctx, mb, inst, dst);
     }
 
     val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
@@ -4171,6 +4171,153 @@ fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst
     # result = fmov.T [addr]: a float move so the value lands in the XMM-classed dst.
     val w: u8 = op_width_of(ctx, inst.ty);
     ret emit_fmov(ctx, mb, op_vreg(dst), op_mem_value(addr, 0), w);
+}
+
+# lower_va_arg_aggregate: expand `OP_VA_ARG [ap]` for a by-value aggregate result.
+# the aggregate analogue of `lower_va_arg`: the next argument's eightbytes are taken
+# from the GP register-save area while they fit (gp_offset + gp_bytes <= 48), else
+# from the overflow area; matching the SysV aggregate placement this compiler's
+# `classify_arg` emits for the same operand:
+#   * <=16B aggregates ride in one (<=8B) or two (9-16B) consecutive GP eightbytes,
+#     saved contiguously in the register-save area, so the bytes there ARE the value;
+#     the overflow copy reads the same by-value bytes.
+#   * >16B aggregates are passed BY REFERENCE in one GP register when one remains, so
+#     the saved eightbyte is a POINTER to the aggregate (dereferenced before the copy);
+#     once the GP file is exhausted they spill BY VALUE into the overflow area.
+# the register-vs-overflow choice reuses the GP path's branch-free 0/-1 mask so no
+# extra basic blocks are introduced; the chosen source address feeds a sized
+# `copy_aggregate` into caller-owned result storage, and the result vreg carries that
+# storage pointer so downstream consumers read the aggregate by value:
+#   gp_bytes = (>16B ? 8 : (>8B ? 16 : 8))     (GP eightbytes the operand consumed)
+#   in_reg   = gp_offset < (49 - gp_bytes)      (the eightbytes all fit in the save area)
+#   mask     = 0 - in_reg                        (i64: all-ones when in_reg else 0)
+#   reg_base = reg_save_area + gp_offset
+#   reg_src  = (>16B ? load8[reg_base] : reg_base)   (pointer deref for the by-ref form)
+#   ovf_al   = (overflow_arg_area + 7) & ~7      (overflow is eight-byte granular)
+#   src      = (reg_src & mask) | (ovf_al & ~mask)
+#   gp_offset         += (gp_bytes      & mask32)
+#   overflow_arg_area  = (overflow & mask) | ((ovf_al + roundup8(size)) & ~mask)
+#   copy size bytes from [src] into the result storage
+fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst: u32) Result[bool, str] {
+    val rok: Result[bool, str] = require_abi(ctx.tgt);
+    if (is_err[bool, str](rok)) { ret rok; }
+
+    val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
+    val size:   u64 = ir_type.byte_size(ctx.types, inst.ty, ctx.tgt)::u64;
+
+    # derive the placement from the same ABI classifier the call site emits, against
+    # a fresh register file so the result is the operand's canonical shape: BYREF (a
+    # hidden pointer, one GP eightbyte) for a >16B aggregate, two GP eightbytes for a
+    # 9-16B aggregate, one for a <=8B aggregate. the runtime gp_offset cursor — not
+    # gp_used — decides registers vs overflow below.
+    val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
+    val align: u64 = ir_type.byte_align(ctx.types, inst.ty, ctx.tgt)::u64;
+    val slot:  abi.ParamSlot = classify_arg(ctx.tgt.arch_id, 0, size, align, false, true, 0, 0);
+    val byref: bool = slot.class == abi.CLASS_BYREF;
+    var gp_bytes: i64 = 8;
+    if (!byref && slot.reg2 >= 0) { gp_bytes = 16; }
+
+    # back the result vreg with caller-owned storage; its address is the result so
+    # downstream copies / stores / returns treat the aggregate by value.
+    val rs: Result[bool, str] = alloc_result_storage(ctx, mb, dst, size, ret_align(ctx, inst.ty));
+    if (is_err[bool, str](rs)) { ret rs; }
+
+    # gp = load.i32 [ap + gp_offset].
+    var gp: u32 = MIR_VREG_NIL;
+    val lg: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_GP_OFFSET), 4, ?gp);
+    if (is_err[bool, str](lg)) { ret lg; }
+
+    # in_reg = gp < (gp_offset_max - gp_bytes + 1): the operand's eightbytes all fit.
+    val thr: i64 = sysv.va_gp_offset_max()::i64 - gp_bytes + 1;
+    var in_reg: u32 = MIR_VREG_NIL;
+    val cr: Result[bool, str] = emit_alu3(ctx, mb, MIR_CMP_LT_U, op_vreg(gp), op_imm(thr), 4, ?in_reg);
+    if (is_err[bool, str](cr)) { ret cr; }
+
+    # mask = 0 - zext(in_reg) -> 0 or all-ones (64-bit); nmask = ~mask.
+    var inz: u32 = MIR_VREG_NIL;
+    val zr: Result[bool, str] = emit_zext_to(ctx, mb, op_vreg(in_reg), 1, ?inz);
+    if (is_err[bool, str](zr)) { ret zr; }
+    var mask: u32 = MIR_VREG_NIL;
+    val mr: Result[bool, str] = emit_alu3(ctx, mb, MIR_SUB, op_imm(0), op_vreg(inz), 8, ?mask);
+    if (is_err[bool, str](mr)) { ret mr; }
+    var nmask: u32 = MIR_VREG_NIL;
+    val nr: Result[bool, str] = emit_not_to(ctx, mb, op_vreg(mask), 8, ?nmask);
+    if (is_err[bool, str](nr)) { ret nr; }
+
+    # reg_base = reg_save_area + zext(gp).
+    var rsa: u32 = MIR_VREG_NIL;
+    val lr: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_REG_SAVE_AREA), 8, ?rsa);
+    if (is_err[bool, str](lr)) { ret lr; }
+    var gp64: u32 = MIR_VREG_NIL;
+    val gzr: Result[bool, str] = emit_zext_to(ctx, mb, op_vreg(gp), 4, ?gp64);
+    if (is_err[bool, str](gzr)) { ret gzr; }
+    var reg_base: u32 = MIR_VREG_NIL;
+    val rar: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(rsa), op_vreg(gp64), 8, ?reg_base);
+    if (is_err[bool, str](rar)) { ret rar; }
+
+    # reg_src: the in-register source address. a >16B aggregate is passed by hidden
+    # pointer, so the saved eightbyte IS that pointer (dereference it); a <=16B
+    # aggregate's eightbytes sit in the save area by value, so the address is reg_base.
+    var reg_src: u32 = reg_base;
+    if (byref) {
+        var p: u32 = MIR_VREG_NIL;
+        val lp: Result[bool, str] = emit_load_w(ctx, mb, op_mem_value(reg_base, 0), 8, ?p);
+        if (is_err[bool, str](lp)) { ret lp; }
+        reg_src = p;
+    }
+
+    # ovf = overflow_arg_area; ovf_al = (ovf + 7) & ~7 (eight-byte granular overflow).
+    var ovf: u32 = MIR_VREG_NIL;
+    val lo: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), 8, ?ovf);
+    if (is_err[bool, str](lo)) { ret lo; }
+    var ovf_up: u32 = MIR_VREG_NIL;
+    val au: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(ovf), op_imm(7), 8, ?ovf_up);
+    if (is_err[bool, str](au)) { ret au; }
+    var ovf_al: u32 = MIR_VREG_NIL;
+    val ad: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(ovf_up), op_imm(~7::i64), 8, ?ovf_al);
+    if (is_err[bool, str](ad)) { ret ad; }
+
+    # src = (reg_src & mask) | (ovf_al & ~mask).
+    var rs_m: u32 = MIR_VREG_NIL;
+    val r1: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(reg_src), op_vreg(mask), 8, ?rs_m);
+    if (is_err[bool, str](r1)) { ret r1; }
+    var ov_m: u32 = MIR_VREG_NIL;
+    val r2: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(ovf_al), op_vreg(nmask), 8, ?ov_m);
+    if (is_err[bool, str](r2)) { ret r2; }
+    var src: u32 = MIR_VREG_NIL;
+    val r3: Result[bool, str] = emit_alu3(ctx, mb, MIR_OR, op_vreg(rs_m), op_vreg(ov_m), 8, ?src);
+    if (is_err[bool, str](r3)) { ret r3; }
+
+    # gp_offset += (gp_bytes & mask32): advance the consumed GP eightbytes when used.
+    var step_gp: u32 = MIR_VREG_NIL;
+    val sg: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_imm(gp_bytes), op_vreg(mask), 4, ?step_gp);
+    if (is_err[bool, str](sg)) { ret sg; }
+    var new_gp: u32 = MIR_VREG_NIL;
+    val ng: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(gp), op_vreg(step_gp), 4, ?new_gp);
+    if (is_err[bool, str](ng)) { ret ng; }
+    val wg: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_GP_OFFSET), op_vreg(new_gp), 4);
+    if (is_err[bool, str](wg)) { ret wg; }
+
+    # overflow_arg_area = (ovf & mask) | ((ovf_al + roundup8(size)) & ~mask): when the
+    # overflow area was used, advance past the aligned by-value bytes; else leave it.
+    val ovf_step: i64 = ((size + 7) & ~7::u64)::i64;
+    var ovf_next: u32 = MIR_VREG_NIL;
+    val on: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(ovf_al), op_imm(ovf_step), 8, ?ovf_next);
+    if (is_err[bool, str](on)) { ret on; }
+    var ovf_keep: u32 = MIR_VREG_NIL;
+    val ok1: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(ovf), op_vreg(mask), 8, ?ovf_keep);
+    if (is_err[bool, str](ok1)) { ret ok1; }
+    var ovf_take: u32 = MIR_VREG_NIL;
+    val ok2: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(ovf_next), op_vreg(nmask), 8, ?ovf_take);
+    if (is_err[bool, str](ok2)) { ret ok2; }
+    var new_ovf: u32 = MIR_VREG_NIL;
+    val ok3: Result[bool, str] = emit_alu3(ctx, mb, MIR_OR, op_vreg(ovf_keep), op_vreg(ovf_take), 8, ?new_ovf);
+    if (is_err[bool, str](ok3)) { ret ok3; }
+    val wo: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), op_vreg(new_ovf), 8);
+    if (is_err[bool, str](wo)) { ret wo; }
+
+    # copy the aggregate's bytes from the selected source into the result storage.
+    ret copy_aggregate(ctx, mb, op_mem_value(dst, 0), op_vreg(src), size);
 }
 
 # emit_zext_to: zero-extend `src` (`src_w` bytes) into a fresh 8-byte GP vreg,
