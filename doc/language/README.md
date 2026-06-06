@@ -49,6 +49,11 @@ neighboring links; start from the index below.
 - [asm.md](asm.md) — inline assembly
 - [policy.md](policy.md) — compiler vs stdlib boundary
 
+## Formal grammar
+
+- [grammar.md](grammar.md) — full EBNF grammar of the implemented dialect,
+  derived from the lexer and parser
+
 ## Conventions
 
 - [documentation.md](documentation.md) — docstring style for functions,
