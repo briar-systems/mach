@@ -46,6 +46,7 @@ token ::= IDENT
         | punctuation
         | operator
         | EOF
+        | ERROR    (* emitted for an unexpected character, see below *)
 
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
               | ";" | ":" | "," | "." | "?" | "@" | "$"
@@ -69,6 +70,11 @@ Notes:
 - The lexer recognizes the standalone characters `=`, `!`, `<`, `>`, `&`,
   `|` and the two-character forms above. There is no `+=`, `-=`, etc. —
   compound assignment does not exist.
+- `ERROR` (`KIND_ERROR`) is a real token kind the lexer emits for an
+  unexpected character: the input is recorded as a `LEX_ERR_UNEXPECTED_CHAR`
+  in the sibling error buffer, a one-byte `ERROR` token is pushed, and
+  lexing continues. `EOF` (`KIND_EOF`) terminates every stream. Neither
+  appears in a well-formed production; they are listed here for completeness.
 
 ### Identifiers and keywords
 
@@ -98,9 +104,9 @@ keywords — they are ordinary identifiers resolved by name later.
 LIT_INT  ::= dec-int | hex-int | bin-int | oct-int
 
 dec-int  ::= digit { digit | "_" } [ int-suffix ]
-hex-int  ::= "0x" hex-digit { hex-digit | "_" }
-bin-int  ::= "0b" ( "0" | "1" ) { "0" | "1" | "_" }
-oct-int  ::= "0o" oct-digit { oct-digit | "_" }
+hex-int  ::= "0x" hex-digit { hex-digit | "_" } [ int-suffix ]
+bin-int  ::= "0b" ( "0" | "1" ) { "0" | "1" | "_" } [ int-suffix ]
+oct-int  ::= "0o" oct-digit { oct-digit | "_" } [ int-suffix ]
 
 int-suffix ::= ( "u" | "i" ) { digit }   (* e.g. u8, i64 — width digits *)
 
@@ -109,9 +115,11 @@ hex-digit ::= digit | 'a'..'f' | 'A'..'F'
 oct-digit ::= '0'..'7'
 ```
 
-A leading `0x` / `0b` / `0o` selects the base; the suffix (`u`/`i` + width
-digits) is only scanned on a non-float decimal literal. Underscores are
-permitted as digit separators in every base.
+A leading `0x` / `0b` / `0o` selects the base; the `u`/`i` width suffix is
+scanned on any non-float integer literal regardless of base (the lexer
+scans the digit run, then — when the token is not a float — accepts a
+trailing `u`/`i` followed by width digits). Underscores are permitted as
+digit separators in every base.
 
 ### Float literals
 
@@ -147,8 +155,11 @@ char escapes:   \n  \t  \r  \\  \'  \0  \xHH
 string escapes: (char escapes) + \"
 ```
 
-A string literal is single-line; there is no multi-line string form. An
-unterminated `'` or `"` is a lexer error but still produces a token span.
+A string literal may span multiple lines: the lexer scans from the opening
+`"` to the next unescaped `"` or to EOF, and a newline in between is just
+another body byte (it does not terminate the literal). A char literal scans
+likewise to the next `'` or EOF. An unterminated `'` or `"` (the scan hits
+EOF first) is a lexer error but still produces a token span.
 
 ### Comments and whitespace
 
@@ -161,11 +172,13 @@ whitespace ::= " " | "\t" | "\n" | "\r"
 newline. There is no block-comment form. Whitespace and comments separate
 tokens and are otherwise discarded.
 
-### Reserved, no role
+### Unexpected characters
 
-The backtick `` ` `` is reserved as a literal/quote-class character but has
-no assigned syntactic role and is not currently lexable in normal source
-(an unexpected character produces a lex error).
+The lexer has no fall-through quote or reserved class: any byte that begins
+none of the token forms above — the backtick `` ` `` among them — is an
+**unexpected character**. The lexer records a `LEX_ERR_UNEXPECTED_CHAR`,
+emits a one-byte `ERROR` token (`KIND_ERROR`) for it, and continues. The
+backtick carries no special role; it is just one such character.
 
 
 ## Module
