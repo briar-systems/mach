@@ -3,7 +3,7 @@
 #   1. acquire cmach            (pinned version auto-downloaded to out/bin)
 #   2. intermediary compiler    (cmach builds src/ -> out/bin/imach)
 #   3. self-hosted compiler     (imach builds src/ -> out/bin/smach)
-#   4. final compiler           (smach builds src/ -> out/linux/bin/mach)
+#   4. final compiler           (smach builds src/ -> out/bin/mach)
 
 OUT := out
 BIN := $(OUT)/bin
@@ -17,7 +17,7 @@ CMACH_URL      = https://github.com/octalide/mach-boot/releases/download/v$(CMAC
 
 IMACH := $(BIN)/imach
 SMACH := $(BIN)/smach
-MACH  := $(OUT)/linux/bin/mach
+MACH  := $(BIN)/mach
 
 .PHONY: mach clean
 
@@ -37,12 +37,12 @@ $(IMACH): $(CMACH) | $(BIN)
 $(SMACH): $(IMACH) | $(BIN)
 	@rm -rf $(OUT)/smach
 	@echo "  imach -> smach"
-	@$(IMACH) build . -o $@ --artifacts smach/linux --emit-asm --emit-ir
+	@$(IMACH) build . -o $@ --artifacts smach/linux
 
-$(MACH): $(SMACH)
-	@rm -rf $(OUT)/linux
+$(MACH): $(SMACH) | $(BIN)
+	@rm -rf $(OUT)/mach
 	@echo "  smach -> mach"
-	@$(SMACH) build .
+	@$(SMACH) build . -o $@ --artifacts mach/linux
 
 $(BIN):
 	@mkdir -p $@
