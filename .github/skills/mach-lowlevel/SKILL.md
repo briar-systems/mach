@@ -86,7 +86,8 @@ For anything that maps to a named stdlib function — atomics, fences, traps, bi
 
 - **Atomics** — load/store/cas/RMW, per arch × per ordering.
 - **Memory fences and CPU hints** — pause, prefetch.
-- **Traps / unreachable** — `trap()` with per-arch `asm { ud2 / brk 0 / ... }`.
+- **Traps / unreachable** — `trap()` with per-arch ISA-tagged blocks
+  (`asm x86_64 { ud2 }` / `asm aarch64 { brk 0 }`).
 - **Syscalls** — per-platform ABI wrappers.
 - **Bit manipulation** — popcount, clz, ctz, bswap.
 - **SIMD long tail** — shuffles, reductions, gather/scatter, saturating arithmetic, specialized math (once SIMD types land).
@@ -114,7 +115,7 @@ Vector types follow `<u|i|f><width>x<count>`: `f32x4`, `i32x8`, `u8x16`. Higher 
 
 - **No type inference.** Every binding declares its type: `var result: i64 = 0;`. The `asm` block does not infer the result type from usage.
 - **No compiler-known type aliases.** `usize`, `str` are stdlib `def`s, not built-ins. `$size_of`/`$align_of`/`$offset_of` resolve to comptime constant unsigned integers stored in whatever type the binding declares.
-- **Strings are `"..."` → `*u8`, null-terminated** in the data segment. Backtick is **reserved and unused** — never use it for an `asm` body or anything else.
+- **Strings are `"..."` → `*u8`, null-terminated** in the data segment. Backtick has **no role**: the lexer treats it as an unexpected character (a lex error) — never use it for an `asm` body or anything else.
 - **`ext fun` is the only body-less function form.** No forward declarations; body-less signatures are reserved for C-ABI externals. Symbol rename via `$NAME.symbol = "real_name";`.
 - **`fwd` is bare** (no `pub fwd`) and **always publishes** — it re-exports a symbol through a surface file, used by both topical splits (all impls forwarded unconditionally) and multiplatform splits (one impl forwarded per target).
 - **No tagged unions, no `match`.** Discriminated values are a `rec` carrying a discriminator plus a `uni` payload (`rec{ kind: ValueKind; data: uni{...} }`); consumers branch with `if`/`or`. The compiler does not enforce kind/payload consistency.

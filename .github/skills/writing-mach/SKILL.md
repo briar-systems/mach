@@ -15,14 +15,16 @@ Reference section) is the exhaustive source of truth.
 - **No type inference.** Every binding declares its type. `val x = 42;` is an
   error; write `val x: i64 = 42;`.
 - **No compiler-known type aliases.** `bool`, `usize`, `str`, etc. are *stdlib*
-  `def`s, not built-ins. The compiler ships only `ptr` and the numeric/SIMD
-  family. Import the alias from stdlib before using it. `bool` is `def bool: u8;`;
-  `true`/`false` are stdlib `val`s (`1`/`0`). Comparison and logical operators
-  produce `u8`.
+  `def`s, not built-ins. The compiler ships only `ptr`, `va_list`, and the
+  numeric/SIMD family. Import the alias from stdlib before using it. `bool` is
+  `def bool: u8;`; `true`/`false` are stdlib `val`s (`1`/`0`). Comparison and
+  logical operators produce `u8`.
 - **Strings are `*u8`.** `"hello"` produces a `*u8` pointing at null-terminated
-  bytes. There is no fat-pointer string type. Length-aware strings are a stdlib
-  type (`std.types.string.str` is itself `def str: *u8;`). Backtick `` ` `` is
-  reserved and currently unused — never emit it.
+  bytes. There is no fat-pointer string type — `std.types.string.str` is itself
+  `def str: *char;` (a null-terminated pointer, not length-aware). The
+  length-aware view is the stdlib record `std.types.string.StrView`
+  (`{ data: *char; len: usize; }`). Backtick `` ` `` has no role: the lexer
+  treats it as an unexpected character (a lex error) — never emit it.
 - **`fwd` is bare and always public.** No `pub fwd`. `ext fun` is the *only*
   body-less function form — there are no forward declarations of regular
   functions.
@@ -71,13 +73,15 @@ There is no built-in `print`. Use the standard library, which returns a
 use std.print;
 
 fun greet() {
-    std.print.println("hello, mach");
+    print.println("hello, mach");
 }
 ```
 
-`std.print` exposes `print` / `println` (stdout), `eprint` / `eprintln`
-(stderr), and formatting variants. Each returns `Result[usize, str]` — bytes
-written, or an error.
+`use std.print;` binds the leaf name `print` (the module), so members are
+reached qualified as `print.<member>` — `std` is not itself in scope, so
+`std.print.println(...)` would not resolve. The `print` module exposes
+`print` / `println` (stdout), `eprint` / `eprintln` (stderr), and formatting
+variants. Each returns `Result[usize, str]` — bytes written, or an error.
 
 ## `use` — private import
 
@@ -190,9 +194,11 @@ pub fun identity[T](value: T) T { ret value; }
   positionally like a runtime arg). This form is **function parameters only** —
   never record fields.
 - Variadic via trailing `...`; access through `va_list` / `va_start` /
-  `va_arg[T]` / `va_end` (C convention). Partially implemented: call sites and
-  the trailing `...` parse, but the callee-side `va_*` machinery is not yet
-  fully seeded — check your toolchain before relying on it.
+  `va_arg[T]` / `va_end` (C convention). The `va_list` builtin type and the
+  `va_*` intrinsics are compiler-seeded — typed in sema and lowered to
+  dedicated IR opcodes against the SysV register-save area. The limitation is
+  ABI completeness at the edges (e.g. passing/fetching large by-value
+  aggregates as variadic arguments); scalar and pointer varargs work.
 
 ### `ext fun` — external function
 
@@ -220,6 +226,8 @@ Primitives follow `<u|i|f><width>(x<count>)*`.
 
 - Scalars: `u8 u16 u32 u64`, `i8 i16 i32 i64`, `f32 f64`.
 - Untyped pointer: `ptr`. (`bool` is a stdlib `def` for `u8`, not a built-in.)
+- Variadic cursor: `va_list` — the compiler-seeded register-save struct used
+  with `va_start` / `va_arg[T]` / `va_end` (see Variadics under `fun`).
 - SIMD vectors: append `x<count>` — `f32x4`, `i32x8`, `u8x16`. **Planned, not
   yet implemented**: vector type names do not resolve as types today. Higher
   dims (`f32x4x4`) are grammatically legal. Atomic/volatile live outside the
@@ -256,8 +264,9 @@ Untyped numeric literals are *checked* against the surrounding declared type;
 they do not infer it. If context does not constrain the type, use a suffix
 (`42i64`). `nil` types as `*u8` with no context and coerces to any pointer;
 relate function pointers to `nil` via `==` / `!=`, not assignment. Char escapes:
-`\n \t \r \\ \' \0 \xHH`. String escapes: same plus `\"`. Strings are
-single-line (use `\n`; no multi-line syntax).
+`\n \t \r \\ \' \0 \xHH`. String escapes: same plus `\"`. A string literal may
+span multiple lines — the lexer scans to the next unescaped `"`, so a raw
+newline inside the quotes is part of the literal.
 
 ## Operators
 

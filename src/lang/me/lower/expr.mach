@@ -58,6 +58,7 @@ use lower:    mach.lang.me.lower.context;
 use mangle:   mach.lang.me.lower.mangle;
 use generics: mach.lang.fe.sema.generics;
 use sess:     mach.lang.session;
+use src:      mach.lang.source;
 use diag:     mach.lang.diagnostic;
 
 # lowers an expression to its rvalue: the loaded value the expression
@@ -283,6 +284,15 @@ fun lower_lit_nil(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Value,
 # argument passing and aggregate returns (loads happen at scalar use sites).
 fun lower_ident_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Value, str] {
     val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, eid);
+
+    # a comptime value parameter has no runtime storage in the monomorphized body;
+    # its value was bound into the comptime context by the value-instance drain,
+    # so a reference folds to that constant.
+    val cv: Option[comptime.CTValue] = comptime_param_value(ctx, sid);
+    if (is_some[comptime.CTValue](cv)) {
+        ret const_value_of(ctx, eid, unwrap[comptime.CTValue](cv));
+    }
+
     val local: Option[value.Value] = lower.lookup_local(ctx, sid);
     if (is_some[value.Value](local)) {
         val slot: value.Value = unwrap[value.Value](local);
@@ -300,6 +310,22 @@ fun lower_ident_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.V
         ret builder.emit_load(?ctx.builder, slot, ity);
     }
     ret symbol_reference(ctx, eid, sid);
+}
+
+# the folded comptime value of a symbol, when it is a comptime value parameter
+# (SYM_PARAM with SYM_FLAG_COMPTIME) currently bound in the comptime context by a
+# value-instance drain. none for any other symbol, or when not in a value-instance
+# body. used to fold a `$param` reference to a constant instead of a slot load.
+fun comptime_param_value(ctx: *lower.LowerContext, sid: resolve.SymbolId) Option[comptime.CTValue] {
+    val so: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](so)) { ret none[comptime.CTValue](); }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+    if (sym.kind != resolve.SYM_PARAM || (sym.flags & resolve.SYM_FLAG_COMPTIME) == 0) {
+        ret none[comptime.CTValue]();
+    }
+    val nc: Option[*comptime.NamedConst] = comptime.lookup(ctx.ctx, sym.name);
+    if (is_none[*comptime.NamedConst](nc)) { ret none[comptime.CTValue](); }
+    ret some[comptime.CTValue](unwrap[*comptime.NamedConst](nc).value);
 }
 
 # reference_linkage_name: the back-end symbol name a reference to module-level
@@ -492,6 +518,15 @@ fun symbol_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId, sid: resolve.Symbol
 # storage pointer for a module-level binding.
 fun lower_ident_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Value, str] {
     val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, eid);
+
+    # a comptime value parameter has no storage (it folds to a constant), so it is
+    # not addressable. sema already rejects `?$param`; guard the lower path too so
+    # a fabricated extern global can never be emitted for it.
+    val cv: Option[comptime.CTValue] = comptime_param_value(ctx, sid);
+    if (is_some[comptime.CTValue](cv)) {
+        ret err[value.Value, str]("lower: cannot take the address of a comptime parameter");
+    }
+
     val local: Option[value.Value] = lower.lookup_local(ctx, sid);
     if (is_some[value.Value](local)) {
         ret ok[value.Value, str](unwrap[value.Value](local));
@@ -800,53 +835,314 @@ fun lower_call(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result
     if (is_err[value.Value, str](callee_r)) { ret callee_r; }
     val callee: value.Value = unwrap_ok[value.Value, str](callee_r);
 
+    # a comptime value parameter is fixed at the call site (folded into the
+    # instance), so its argument is dropped from the runtime OP_CALL: only the
+    # runtime ordinals are passed, matching the stripped instance signature.
+    val cf: Option[*adecl.DeclFun] = callee_decl_fun(ctx, e.data.call.callee);
+    var has_ct: bool = false;
+    var cf_decl: *adecl.DeclFun = nil;
+    var cf_ast: *ast.Ast = nil;
+    if (is_some[*adecl.DeclFun](cf)) {
+        cf_decl = unwrap[*adecl.DeclFun](cf);
+        if (decl_fun_has_comptime_param(ctx, e.data.call.callee, cf_decl)) {
+            has_ct = true;
+            cf_ast = callee_ast(ctx, e.data.call.callee);
+        }
+    }
+
     val argc: u32 = e.data.call.args_len;
+    var rtc: u32 = argc;
+    if (has_ct) { rtc = runtime_arg_count(ctx, cf_ast, cf_decl, argc); }
+
     var args: *value.Value = nil;
-    if (argc > 0) {
-        val ar: Result[*value.Value, str] = allocate[value.Value](ctx.s.alloc, argc::usize);
+    if (rtc > 0) {
+        val ar: Result[*value.Value, str] = allocate[value.Value](ctx.s.alloc, rtc::usize);
         if (is_err[*value.Value, str](ar)) { ret err[value.Value, str](unwrap_err[*value.Value, str](ar)); }
         args = unwrap_ok[*value.Value, str](ar);
 
+        var w: u32 = 0;
         var i: u32 = 0;
         for (i < argc) {
+            if (has_ct && arg_is_comptime(ctx, cf_ast, cf_decl, i)) { i = i + 1; cnt; }
             val pool_ix: u32 = e.data.call.args_start + i;
             if (pool_ix::usize >= ctx.a.expr_id_len) {
-                deallocate[value.Value](ctx.s.alloc, args, argc::usize);
+                deallocate[value.Value](ctx.s.alloc, args, rtc::usize);
                 ret err[value.Value, str]("lower: call argument index out of range");
             }
             val arg_eid: aid.ExprId = ctx.a.expr_ids[pool_ix];
             val vr: Result[value.Value, str] = lower_rvalue(ctx, arg_eid);
             if (is_err[value.Value, str](vr)) {
-                deallocate[value.Value](ctx.s.alloc, args, argc::usize);
+                deallocate[value.Value](ctx.s.alloc, args, rtc::usize);
                 ret vr;
             }
-            args[i] = unwrap_ok[value.Value, str](vr);
+            args[w] = unwrap_ok[value.Value, str](vr);
+            w = w + 1;
             i = i + 1;
         }
     }
-
     val rt_r: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
     if (is_err[ir_type.IrTypeId, str](rt_r)) {
-        if (args != nil) { deallocate[value.Value](ctx.s.alloc, args, argc::usize); }
+        if (args != nil) { deallocate[value.Value](ctx.s.alloc, args, rtc::usize); }
         ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](rt_r));
     }
     val rt: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](rt_r);
 
-    val cr: Result[value.Value, str] = builder.emit_call(?ctx.builder, callee, args, argc, rt);
-    if (args != nil) { deallocate[value.Value](ctx.s.alloc, args, argc::usize); }
+    val cr: Result[value.Value, str] = builder.emit_call(?ctx.builder, callee, args, rtc, rt);
+    if (args != nil) { deallocate[value.Value](ctx.s.alloc, args, rtc::usize); }
     ret cr;
 }
 
-# lowers a call's callee to a function-reference value. a call carrying explicit
-# type arguments (`callee[T, ...](...)`) names a generic; it resolves to the
-# monomorphized INSTANCE — a distinct, correctly-typed body emitted once per
-# `(generic, type-args)` — rather than the (pointer-erased) generic template. a
-# plain call delegates to the normal rvalue lowering of the callee.
+# the number of RUNTIME arguments at a comptime-param call site: the call's
+# argument count minus the comptime ordinals (which are folded into the instance,
+# not passed at runtime).
+fun runtime_arg_count(ctx: *lower.LowerContext, a: *ast.Ast, f: *adecl.DeclFun, argc: u32) u32 {
+    if (a == nil) { ret argc; }
+    var count: u32 = 0;
+    var i: u32 = 0;
+    for (i < argc) {
+        if (!arg_is_comptime(ctx, a, f, i)) { count = count + 1; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+# whether the argument at call-ordinal `i` binds a comptime parameter, read from
+# the callee's origin DeclFun typed_names. ordinals beyond the declared params
+# (variadic tail) are runtime.
+fun arg_is_comptime(ctx: *lower.LowerContext, a: *ast.Ast, f: *adecl.DeclFun, i: u32) bool {
+    if (a == nil) { ret false; }
+    if (i >= f.params_len) { ret false; }
+    ret a.typed_names[f.params_start + i].comptime;
+}
+
+# lowers a call's callee to a function-reference value. a call to a function with
+# comptime value parameters resolves to a per-value monomorphized INSTANCE; a call
+# carrying explicit type arguments (`callee[T, ...](...)`) names a generic and
+# resolves to its per-type instance; a plain call delegates to the normal rvalue
+# lowering of the callee.
 fun lower_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val cf: Option[*adecl.DeclFun] = callee_decl_fun(ctx, e.data.call.callee);
+    if (is_some[*adecl.DeclFun](cf)) {
+        val f: *adecl.DeclFun = unwrap[*adecl.DeclFun](cf);
+        if (decl_fun_has_comptime_param(ctx, e.data.call.callee, f)) {
+            # a callee that is BOTH generic (`[T]`) and comptime-param (`$mode`)
+            # needs a combined type+value instance, which is unsupported. sema
+            # already rejects such a call with a clean diagnostic and the driver
+            # aborts before lowering, so reaching here is a coherence violation:
+            # neither lower_value_callee (which ignores the type args, producing a
+            # wrong symbol) nor lower_generic_callee (which lowers against the
+            # comptime-stripped signature) is correct, so hard-error instead.
+            if (f.generics_len > 0) {
+                ret err[value.Value, str]("lower: comptime value parameters on a generic function are not supported");
+            }
+            ret lower_value_callee(ctx, eid, e, f);
+        }
+    }
     if (e.data.call.type_args_len == 0) {
         ret lower_rvalue(ctx, e.data.call.callee);
     }
     ret lower_generic_callee(ctx, eid, e);
+}
+
+# the callee's origin DeclFun, read from its origin module's AST for a
+# cross-module callee. none when the callee does not name a function declaration.
+fun callee_decl_fun(ctx: *lower.LowerContext, callee: aid.ExprId) Option[*adecl.DeclFun] {
+    val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, callee);
+    val so: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](so)) { ret none[*adecl.DeclFun](); }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+    if (sym.kind != resolve.SYM_FUN && sym.kind != resolve.SYM_IMPORTED) { ret none[*adecl.DeclFun](); }
+    if (sym.decl == aid.DECL_NIL) { ret none[*adecl.DeclFun](); }
+
+    var a: *ast.Ast = ctx.a;
+    if (sym.origin != ctx.own_module) {
+        a = sess.module_ast(ctx.s, sym.origin);
+        if (a == nil) { ret none[*adecl.DeclFun](); }
+    }
+    val d_opt: Option[*adecl.Decl] = ast.get_decl(a, sym.decl);
+    if (is_none[*adecl.Decl](d_opt)) { ret none[*adecl.DeclFun](); }
+    val d: *adecl.Decl = unwrap[*adecl.Decl](d_opt);
+    if (d.kind != adecl.DECL_KIND_FUN) { ret none[*adecl.DeclFun](); }
+    ret some[*adecl.DeclFun](?d.data.fun_);
+}
+
+# reports whether the callee's DeclFun declares any comptime value parameter,
+# reading the comptime flags from the callee's origin AST.
+fun decl_fun_has_comptime_param(ctx: *lower.LowerContext, callee: aid.ExprId, f: *adecl.DeclFun) bool {
+    val a: *ast.Ast = callee_ast(ctx, callee);
+    if (a == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < f.params_len) {
+        if (a.typed_names[f.params_start + i].comptime) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the AST the callee is declared in: the caller's own AST for a local callee, the
+# origin module's AST for a cross-module one, or nil when unresolvable.
+fun callee_ast(ctx: *lower.LowerContext, callee: aid.ExprId) *ast.Ast {
+    val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, callee);
+    val so: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](so)) { ret nil; }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+    if (sym.origin == ctx.own_module) { ret ctx.a; }
+    ret sess.module_ast(ctx.s, sym.origin);
+}
+
+# resolves a comptime value-parameter call to its monomorphized instance: folds
+# each comptime-ordinal argument to a CTValue (the same fold `$if` uses) against
+# the caller's comptime context, computes the instance's mangled linkage name
+# (with the values encoded into the disjoint `K...E` suffix), enqueues the
+# instance for body emission, and returns a function reference to it. a non-
+# constant argument at a `$`-parameter is a hard error pointing at the argument.
+fun lower_value_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr, f: *adecl.DeclFun) Result[value.Value, str] {
+    val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, e.data.call.callee);
+    val so: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](so)) {
+        ret err[value.Value, str]("lower: unresolved comptime-param call target");
+    }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+    val origin_a: *ast.Ast = callee_ast(ctx, e.data.call.callee);
+    if (origin_a == nil) { ret err[value.Value, str]("lower: comptime-param callee AST unavailable"); }
+
+    # count comptime parameters to size the value / name buffers.
+    var ct_count: u32 = 0;
+    var pi: u32 = 0;
+    for (pi < f.params_len) {
+        if (origin_a.typed_names[f.params_start + pi].comptime) { ct_count = ct_count + 1; }
+        pi = pi + 1;
+    }
+    if (ct_count == 0) { ret err[value.Value, str]("lower: comptime-param call has no comptime parameters"); }
+
+    val vr: Result[*comptime.CTValue, str] = allocate[comptime.CTValue](ctx.s.alloc, ct_count::usize);
+    if (is_err[*comptime.CTValue, str](vr)) { ret err[value.Value, str](unwrap_err[*comptime.CTValue, str](vr)); }
+    val vals: *comptime.CTValue = unwrap_ok[*comptime.CTValue, str](vr);
+    val nr: Result[*intern.StrId, str] = allocate[intern.StrId](ctx.s.alloc, ct_count::usize);
+    if (is_err[*intern.StrId, str](nr)) {
+        deallocate[comptime.CTValue](ctx.s.alloc, vals, ct_count::usize);
+        ret err[value.Value, str](unwrap_err[*intern.StrId, str](nr));
+    }
+    val names: *intern.StrId = unwrap_ok[*intern.StrId, str](nr);
+
+    # fold each comptime-ordinal argument and record its bare parameter name.
+    var w: u32 = 0;
+    var i: u32 = 0;
+    for (i < f.params_len) {
+        val tn: *adecl.TypedName = ?origin_a.typed_names[f.params_start + i];
+        if (tn.comptime) {
+            if (i >= e.data.call.args_len) {
+                deallocate[comptime.CTValue](ctx.s.alloc, vals, ct_count::usize);
+                deallocate[intern.StrId](ctx.s.alloc, names, ct_count::usize);
+                ret err[value.Value, str]("lower: comptime-param call argument index out of range");
+            }
+            val arg_eid: aid.ExprId = ctx.a.expr_ids[e.data.call.args_start + i];
+            val fv: Option[comptime.CTValue] = fold_comptime_arg(ctx, arg_eid);
+            if (is_none[comptime.CTValue](fv)) {
+                val asp: token.Span = arg_span_of(ctx, arg_eid);
+                diag.error(?ctx.s.diags, ctx.a.file_id, asp, "comptime argument is not a compile-time constant");
+                deallocate[comptime.CTValue](ctx.s.alloc, vals, ct_count::usize);
+                deallocate[intern.StrId](ctx.s.alloc, names, ct_count::usize);
+                ret err[value.Value, str]("comptime argument is not a compile-time constant");
+            }
+            vals[w] = unwrap[comptime.CTValue](fv);
+
+            # the bare parameter identifier, interned against the session, paired
+            # positionally with the value so the drain binds `$param -> CTValue`.
+            # the origin module's source must be registered (a resolvable callee's
+            # module is loaded); a missing one is a coherence violation, not a no-op,
+            # so hard-error rather than slicing a nil source in intern_span.
+            val so2: Option[*src.SourceFile] = src.get(?ctx.s.sources, origin_a.file_id);
+            if (is_none[*src.SourceFile](so2)) {
+                deallocate[comptime.CTValue](ctx.s.alloc, vals, ct_count::usize);
+                deallocate[intern.StrId](ctx.s.alloc, names, ct_count::usize);
+                ret err[value.Value, str]("lower: comptime-param callee origin module source unavailable");
+            }
+            val ptext: str = unwrap[*src.SourceFile](so2).text;
+            val nm_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, ptext, tn.name);
+            if (is_err[intern.StrId, str](nm_r)) {
+                deallocate[comptime.CTValue](ctx.s.alloc, vals, ct_count::usize);
+                deallocate[intern.StrId](ctx.s.alloc, names, ct_count::usize);
+                ret err[value.Value, str](unwrap_err[intern.StrId, str](nm_r));
+            }
+            names[w] = unwrap_ok[intern.StrId, str](nm_r);
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+
+    # the instance is owned by the function's origin module; mangle against that
+    # module's FQN so the definition (emitted by the drain) and every reference
+    # agree byte-for-byte.
+    val fqn: intern.StrId = sess.module_fqn(ctx.s, sym.origin);
+    val name_r: Result[intern.StrId, str] = mangle.value_instance_name(ctx.s, fqn, sym.name, vals, ct_count);
+    if (is_err[intern.StrId, str](name_r)) {
+        deallocate[comptime.CTValue](ctx.s.alloc, vals, ct_count::usize);
+        deallocate[intern.StrId](ctx.s.alloc, names, ct_count::usize);
+        ret err[value.Value, str](unwrap_err[intern.StrId, str](name_r));
+    }
+    val link: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    val enq: Result[bool, str] = lower.enqueue_value_instance(ctx, sym.decl, sym.origin, vals, names, ct_count, link);
+    deallocate[comptime.CTValue](ctx.s.alloc, vals, ct_count::usize);
+    deallocate[intern.StrId](ctx.s.alloc, names, ct_count::usize);
+    if (is_err[bool, str](enq)) { ret err[value.Value, str](unwrap_err[bool, str](enq)); }
+
+    val vtr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+    if (is_err[ir_type.IrTypeId, str](vtr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](vtr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](vtr);
+
+    val fi: Option[u32] = find_function(ctx, link);
+    if (is_some[u32](fi)) {
+        ret ok[value.Value, str](value.fn_value(unwrap[u32](fi), vty));
+    }
+    val xr: Result[u32, str] = lower.ensure_extern_function(ctx, link, vty);
+    if (is_err[u32, str](xr)) { ret err[value.Value, str](unwrap_err[u32, str](xr)); }
+    ret ok[value.Value, str](value.fn_value(unwrap_ok[u32, str](xr), vty));
+}
+
+# folds a comptime call argument to a CTValue. tries the comptime evaluator
+# against the caller's context first (handles literals, `$mach.*`, and bare-name
+# constants registered in the caller's context). on failure, resolves a cross-
+# module constant reference — a module-qualified member `alias.CONST` (or a bare
+# import) binds to an imported symbol whose `(origin, name)` names a `pub val` in
+# the defining module; its folded value is read from that module's comptime
+# context. none when the argument is not a compile-time constant.
+fun fold_comptime_arg(ctx: *lower.LowerContext, eid: aid.ExprId) Option[comptime.CTValue] {
+    val ev: Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a, lower.module_source(ctx), eid, ?ctx.s.interner);
+    if (is_ok[comptime.CTValue, str](ev)) {
+        ret some[comptime.CTValue](unwrap_ok[comptime.CTValue, str](ev));
+    }
+
+    # a cross-module constant: resolve the arg's symbol and read its value from
+    # the DEFINING module's comptime context.
+    val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, eid);
+    val so: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](so)) { ret none[comptime.CTValue](); }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+    if (sym.kind != resolve.SYM_VAL && sym.kind != resolve.SYM_IMPORTED) { ret none[comptime.CTValue](); }
+
+    # the defining module's comptime context holds the folded value under the bare
+    # symbol name. the caller's own context is the same when origin == own module.
+    var dctx: *comptime.ComptimeCtx = ctx.ctx;
+    if (sym.origin != ctx.own_module) {
+        dctx = (sess.module_comptime_ptr(ctx.s, sym.origin))::*comptime.ComptimeCtx;
+        if (dctx == nil) { ret none[comptime.CTValue](); }
+    }
+    val nc: Option[*comptime.NamedConst] = comptime.lookup(dctx, sym.name);
+    if (is_none[*comptime.NamedConst](nc)) { ret none[comptime.CTValue](); }
+    ret some[comptime.CTValue](unwrap[*comptime.NamedConst](nc).value);
+}
+
+# the source span of an argument expression, for an error pointing at a non-
+# constant comptime argument.
+fun arg_span_of(ctx: *lower.LowerContext, eid: aid.ExprId) token.Span {
+    val e_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
+    if (is_some[*aexpr.Expr](e_opt)) { ret unwrap[*aexpr.Expr](e_opt).span; }
+    var s: token.Span;
+    s.offset = 0;
+    s.len = 0;
+    ret s;
 }
 
 # resolves a generic call to its monomorphized instance: reads the call-site

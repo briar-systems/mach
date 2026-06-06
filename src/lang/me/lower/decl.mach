@@ -102,6 +102,13 @@ pub fun lower_decl(ctx: *lower.LowerContext, did: aid.DeclId) Result[bool, str] 
 # is_test: true when lowering a `test` decl through the function path
 # ret:     true on success, or an error
 pub fun lower_fun(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, is_test: bool) Result[bool, str] {
+    # a function with comptime value parameters is a TEMPLATE, not a concrete
+    # function: it is emitted once per distinct comptime-argument value through
+    # the value-instance worklist (lower_value_instance), never as a standalone
+    # body here. emitting it directly would fail — its `$param`-gated `$if`s
+    # cannot fold without a bound value.
+    if (fun_has_comptime_param(ctx, d)) { ret ok[bool, str](true); }
+
     val sig_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, lower.decl_type_of(ctx, did));
     if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
     val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
@@ -198,6 +205,65 @@ pub fun lower_instance(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl
     ret close_function(ctx, ret_ir);
 }
 
+# lowers one comptime value-parameter instance: a concrete body for the template
+# function `did` under the instance linkage `name`. the context must already be
+# bound to the template's origin module, with the instance's `$param -> CTValue`
+# bindings pushed into the active comptime context (by the value-instance drain),
+# so every `$param`-gated `$if` folds to its selected arm and every `$param`
+# reference folds to its constant. the comptime parameters are stripped from the
+# lowered signature, ABI, and body (lower_params skips them). the emitted function
+# is PUB | WEAK so any using object binds to it and the linker collapses the
+# copies. a body-less template is not a valid instance and is skipped.
+# ---
+# ctx:  the context, already bound to the origin module + comptime bindings
+# did:  DeclId of the template function in the origin AST
+# d:    the resolved template Decl
+# name: the instance's mangled linkage name
+# ret:  true on success, or an error
+pub fun lower_value_instance(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, name: intern.StrId) Result[bool, str] {
+    if (d.data.fun_.body == aid.STMT_NIL) { ret ok[bool, str](true); }
+
+    val sig_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, lower.decl_type_of(ctx, did));
+    if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
+    val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
+
+    val ret_ir_r: Result[ir_type.IrTypeId, str] = function_return_ir(ctx, did);
+    if (is_err[ir_type.IrTypeId, str](ret_ir_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](ret_ir_r)); }
+    val ret_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ret_ir_r);
+
+    val flags: u32 = ir.FN_FLAG_PUB | ir.FN_FLAG_WEAK;
+    val idx_r: Result[u32, str] = append_function(ctx, name, sig, flags, d.data.fun_.params_len);
+    if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
+    val fn_index: u32 = unwrap_ok[u32, str](idx_r);
+
+    lower.begin_function(ctx, fn_index, ret_ir);
+    builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
+
+    val entry_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](entry_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](entry_r)); }
+    builder.set_block(?ctx.builder, unwrap_ok[ir.BlockId, str](entry_r));
+
+    val params_r: Result[bool, str] = lower_params(ctx, did, d, fn_index);
+    if (is_err[bool, str](params_r)) { ret params_r; }
+
+    val br: Result[bool, str] = stmt.lower_stmt(ctx, d.data.fun_.body);
+    if (is_err[bool, str](br)) { ret br; }
+
+    ret close_function(ctx, ret_ir);
+}
+
+# reports whether a function declaration declares any comptime value parameter,
+# read from its own AST typed_names.
+pub fun fun_has_comptime_param(ctx: *lower.LowerContext, d: *adecl.Decl) bool {
+    var i: u32 = 0;
+    for (i < d.data.fun_.params_len) {
+        val pool_ix: u32 = d.data.fun_.params_start + i;
+        if (pool_ix::usize < ctx.a.typed_name_len && ctx.a.typed_names[pool_ix].comptime) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # lowers a `test "label" { ... }` decl as a zero-parameter, i32-returning
 # function tagged FN_FLAG_TEST so the test runner can iterate it. a test body
 # returns an integer process status (`ret 0` / `ret 1`), so the lowered
@@ -239,9 +305,13 @@ fun lower_test(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl) Result
     ret close_function(ctx, ret_ty);
 }
 
-# materialises one VAL_PARAM per parameter, records them on Function.params,
-# spills each into an alloca slot, and binds the parameter's SymbolId to its
-# slot so the body reads / writes it through load / store.
+# materialises one VAL_PARAM per RUNTIME parameter, records them on
+# Function.params, spills each into an alloca slot, and binds the parameter's
+# SymbolId to its slot so the body reads / writes it through load / store.
+# comptime value parameters (`$name: T`) have no runtime storage — they are
+# stripped from the lowered signature and ABI and folded to constants in the body
+# — so they are skipped here and the runtime parameters take compacted ABI
+# ordinals matching the stripped TYPE_FUN signature.
 fun lower_params(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, fn_index: u32) Result[bool, str] {
     val count: u32 = d.data.fun_.params_len;
 
@@ -253,39 +323,55 @@ fun lower_params(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, fn_i
     if (is_err[ir_type.IrTypeId, str](cr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](cr)); }
     val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](cr);
 
+    # number of runtime (non-comptime) parameters: the lowered ABI count.
+    var rt_count: u32 = 0;
+    var ci: u32 = 0;
+    for (ci < count) {
+        val cpool: u32 = d.data.fun_.params_start + ci;
+        if (cpool::usize >= ctx.a.typed_name_len || !ctx.a.typed_names[cpool].comptime) {
+            rt_count = rt_count + 1;
+        }
+        ci = ci + 1;
+    }
+
     var params: *value.Value = nil;
-    if (count > 0) {
-        val ar: Result[*value.Value, str] = allocate[value.Value](ctx.s.alloc, count::usize);
+    if (rt_count > 0) {
+        val ar: Result[*value.Value, str] = allocate[value.Value](ctx.s.alloc, rt_count::usize);
         if (is_err[*value.Value, str](ar)) { ret err[bool, str](unwrap_err[*value.Value, str](ar)); }
         params = unwrap_ok[*value.Value, str](ar);
     }
 
+    var w: u32 = 0;
     var i: u32 = 0;
     for (i < count) {
         val pool_ix: u32 = d.data.fun_.params_start + i;
+        if (pool_ix::usize < ctx.a.typed_name_len && ctx.a.typed_names[pool_ix].comptime) {
+            i = i + 1;
+            cnt;
+        }
         var p_ir: ir_type.IrTypeId = ity;
         if (pool_ix::usize < ctx.a.typed_name_len) {
             val tn: *adecl.TypedName = ?ctx.a.typed_names[pool_ix];
             val tr: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, lower.type_resolved_of(ctx, tn.ty));
             if (is_err[ir_type.IrTypeId, str](tr)) {
-                if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, count::usize); }
+                if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, rt_count::usize); }
                 ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](tr));
             }
             p_ir = unwrap_ok[ir_type.IrTypeId, str](tr);
         }
-        val pval: value.Value = value.param_value(i, p_ir);
-        params[i] = pval;
+        val pval: value.Value = value.param_value(w, p_ir);
+        params[w] = pval;
 
         # spill the param into an alloca so it is a uniform mutable lvalue
         val slot_r: Result[value.Value, str] = builder.emit_alloca(?ctx.builder, p_ir, value.const_int(1, xty));
         if (is_err[value.Value, str](slot_r)) {
-            if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, count::usize); }
+            if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, rt_count::usize); }
             ret err[bool, str](unwrap_err[value.Value, str](slot_r));
         }
         val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
         val sr: Result[bool, str] = builder.emit_store(?ctx.builder, pval, slot);
         if (is_err[bool, str](sr)) {
-            if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, count::usize); }
+            if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, rt_count::usize); }
             ret sr;
         }
 
@@ -293,15 +379,16 @@ fun lower_params(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, fn_i
         if (sid != resolve.SYMBOL_NIL) {
             val bind_r: Result[bool, str] = lower.bind_local(ctx, sid, slot);
             if (is_err[bool, str](bind_r)) {
-                if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, count::usize); }
+                if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, rt_count::usize); }
                 ret bind_r;
             }
         }
+        w = w + 1;
         i = i + 1;
     }
 
     ctx.m.functions[fn_index].params      = params;
-    ctx.m.functions[fn_index].param_count = count;
+    ctx.m.functions[fn_index].param_count = rt_count;
     ret ok[bool, str](true);
 }
 
