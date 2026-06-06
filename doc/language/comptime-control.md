@@ -22,8 +22,7 @@ $or {
 The condition must be a comptime expression. Common shapes:
 
 - `$mach.*` reads for target / build conditions
-- Comparisons of comptime constants
-- Comptime function parameters
+- Comparisons of comptime constants (`pub val` declarations)
 
 ## Examples
 
@@ -42,6 +41,14 @@ $or {
 ```
 
 ### Dispatch on a comptime function parameter
+
+> **Not yet supported.** A comptime function parameter (`$order: Order`) is
+> accepted in a signature, but it is *not* yet usable as a comptime constant
+> inside the body — `$if (order == RELAXED)` reports `identifier is not a
+> comptime constant in scope`. Per-call-site dispatch on a comptime value
+> parameter requires monomorphizing the body per distinct argument value,
+> which the compiler does not yet do. The shape below describes the intended
+> behavior; until it lands, branch on such a parameter with a runtime `if`.
 
 ```mach
 pub fun load($order: Order, ptr: *i64) i64 {
