@@ -31,6 +31,7 @@ the repository's `dep/mach-std`. The build resolves it as a local dependency.
 | [`08_strings`](08_strings) | strings | the `str` type, `str_len` and friends, and byte-by-byte manipulation |
 | [`09_collections`](09_collections) | collections | the standard hash `Map` and `Set` over an allocator |
 | [`10_lowlevel`](10_lowlevel) | low level | an `asm x86_64` block and a hand-issued Linux `write` syscall |
+| [`11_casts`](11_casts) | casts | the `::` value conversion vs the `:~` bit reinterpret, and how they differ on int<->float |
 
 ## Note on `full`
 

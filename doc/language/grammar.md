@@ -50,7 +50,7 @@ token ::= IDENT
 
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
               | ";" | ":" | "," | "." | "?" | "@" | "$"
-              | "::" | "..."
+              | "::" | ":~" | "..."
 
 operator ::= "+" | "-" | "*" | "/" | "%"
            | "&" | "|" | "^" | "~"
@@ -65,8 +65,9 @@ Notes:
   tokens; the parser recognizes them contextually by their text
   (`at_kw` / `eat_kw` in `parser/state.mach`). The same applies to the
   primitive type names and `nil`.
-- The maximal-munch multi-character operators are `::`, `...`, `==`, `!=`,
-  `<=`, `<<`, `>=`, `>>`, `&&`, `||`.
+- The maximal-munch multi-character operators are `::`, `:~`, `...`, `==`,
+  `!=`, `<=`, `<<`, `>=`, `>>`, `&&`, `||`. A leading `:` lexes as `::` or
+  `:~` before a bare `:`, so `expr:~Type` is one cast, never `:` then `~`.
 - The lexer recognizes the standalone characters `=`, `!`, `<`, `>`, `&`,
   `|` and the two-character forms above. There is no `+=`, `-=`, etc. —
   compound assignment does not exist.
@@ -425,8 +426,11 @@ call-args    ::= "(" [ expr { "," expr } [ "," ] ] ")"
 generic-call ::= type-args call-args        (* callee[T, U](args) *)
 index        ::= "[" expr "]"
 member       ::= "." IDENT
-cast         ::= "::" type
+cast         ::= ( "::" | ":~" ) type
 ```
+
+`::` is a value conversion and `:~` a same-size bit reinterpret; see
+[operators.md](operators.md#cast). Both bind as postfix.
 
 Disambiguating a postfix `[`:
 - `callee[T, U](args)` — a generic call: the bracketed list is scanned; if
