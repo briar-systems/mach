@@ -61,6 +61,7 @@ use std.system.panic.panic;
 
 use map: std.collections.map;
 
+use float:   mach.lang.float;
 use intern:  mach.lang.intern;
 use target:  mach.lang.target.resolved;
 use abi:     mach.lang.target.abi;
@@ -313,6 +314,12 @@ pub val MIR_FCMP:      MirOpcode = 0x1118;
 # memory directly) and the encoder materializes the SSE move. the width (4 for
 # f32, 8 for f64) selects MOVSS vs MOVSD.
 pub val MIR_FMOV:      MirOpcode = 0x1119;
+# MIR_FNEG: scalar float negation, operands [dst, src]. a float negate flips the
+# IEEE-754 sign bit, which an integer MIR_NEG (two's-complement of the whole bit
+# pattern) would not produce; this dedicated opcode survives selection and the
+# encoder materializes the sign-bit XOR on the XMM value (XORPS with a sign mask).
+# the width (4 for f32, 8 for f64) selects the f32 vs f64 sign-bit mask.
+pub val MIR_FNEG:      MirOpcode = 0x111B;
 # MIR_VA_FP_SAVE: the AL-guarded variadic FP-register spill pseudo. operand 0 is
 # the save-area MEM operand at `va_fp_save_offset` (a frame-slot key the encoder
 # resolves to `[rbp + off]`); operand 1 is an immediate count of FP argument
@@ -1682,6 +1689,13 @@ fun lower_instr(ctx: *LowerCtx, fn: *ir.Function, mb: *MirBlock, iid: id.Instruc
     if (is_float_op(ctx, inst)) {
         ret lower_float_op(ctx, mb, inst, iid);
     }
+    # a scalar float negate shares the IR integer OP_NEG opcode; routing it to the
+    # integer path would emit a GP MIR_NEG (two's-complement of the float bit
+    # pattern) instead of flipping the IEEE-754 sign bit. dispatch a float-typed
+    # negate to its dedicated SSE lowering before the generic path.
+    if (inst.kind == instr.OP_NEG && value_is_float(ctx, inst.ty)) {
+        ret lower_float_neg(ctx, mb, inst, iid);
+    }
     # integer division / remainder needs the dividend / remainder register wiring
     # the active ISA's division form mandates (x86-64 IDIV/DIV reads the dividend
     # in RAX and yields the quotient in RAX / remainder in RDX). the accumulator
@@ -2094,16 +2108,14 @@ fun lower_generic(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: 
 #     0, so the encoder's MOVZX / MOVSX selects the narrow / wide source form;
 #   - a comparison (CMP_*) yields an i8 result but the CMP operates at the compared
 #     operand width, so both widths come from operand 0;
-#   - the float conversions (FP_TO_SI / SI_TO_FP family) and other FP ops ride at the
-#     word width: their integer-vs-float operand widths are handled by the float
-#     encoders, outside this base-width carrier, so the prior word-sized behavior is
-#     preserved unchanged;
+#   - the float conversions (FP_TO_SI / SI_TO_FP family) carry their true result and
+#     operand-0 widths so the SSE conversion encoder selects the SS-vs-SD float form
+#     from the float side and sizes the GP integer side for REX.W (`set_conv_widths`);
 #   - a void-result terminator / branch has no natural width and rides at the word
 #     width, which only sizes its address-sized fields.
 fun set_generic_widths(ctx: *LowerCtx, inst: *instr.Instruction, mi: *MirInstr) {
     if (is_float_kind(ctx, inst)) {
-        mi.width     = WORD_WIDTH;
-        mi.src_width = WORD_WIDTH;
+        set_conv_widths(ctx, inst, mi);
         ret;
     }
     if (is_compare_kind(inst.kind) && inst.operand_count >= 1) {
@@ -2124,6 +2136,22 @@ fun set_generic_widths(ctx: *LowerCtx, inst: *instr.Instruction, mi: *MirInstr) 
     if (is_int_conversion_kind(inst.kind) && inst.operand_count >= 1) {
         sw = op_width_of(ctx, inst.operands[0].ty);
     }
+    mi.width     = dw;
+    mi.src_width = sw;
+}
+
+# set_conv_widths: stamp the destination and source widths of a float conversion
+# (FP_TO_SI / FP_TO_UI / SI_TO_FP / UI_TO_FP / FP_TRUNC / FP_EXT). `mi.width` is the
+# result-type width and `mi.src_width` is operand 0's width. the SSE conversion
+# encoder reads the FLOAT side of the pair (the side whose type is f32 / f64,
+# determined from the concrete opcode) to pick the single-precision SS vs double SD
+# form, and sizes the GP integer side from its own width for REX.W. an FP_TRUNC /
+# FP_EXT has float on both sides; its single opcode needs no width selection, so the
+# carried widths only document the operand sizes.
+fun set_conv_widths(ctx: *LowerCtx, inst: *instr.Instruction, mi: *MirInstr) {
+    var dw: u8 = op_width_of(ctx, inst.ty);
+    var sw: u8 = dw;
+    if (inst.operand_count >= 1) { sw = op_width_of(ctx, inst.operands[0].ty); }
     mi.width     = dw;
     mi.src_width = sw;
 }
@@ -2255,6 +2283,39 @@ fun lower_float_op(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid:
     ret push_instr(ctx, mb, mi);
 }
 
+# lower_float_neg: lower a scalar floating-point negation (a float-typed OP_NEG) to
+# the dedicated MIR_FNEG opcode. the opcode survives instruction selection and the
+# encoder flips the IEEE-754 sign bit on the XMM value (XORPS with a width-selected
+# sign mask) rather than the integer MIR_NEG, which would two's-complement the whole
+# bit pattern and produce garbage. operand layout is `[dst, src]` like MIR_FMOV; the
+# operation width (4 for f32, 8 for f64) rides on `mi.width` so the encoder selects
+# the f32 vs f64 sign-bit mask.
+fun lower_float_neg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
+    if (inst.operand_count < 1) {
+        ret err[bool, str]("mir.lower_ir: float negate missing operand");
+    }
+    val dst: u32 = result_vreg(ctx, iid);
+    if (dst == MIR_VREG_NIL) {
+        ret err[bool, str]("mir.lower_ir: float negate defines no result vreg");
+    }
+
+    val rop: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
+    if (is_err[*MirOperand, str](rop)) { ret err[bool, str](unwrap_err[*MirOperand, str](rop)); }
+    val ops: *MirOperand = unwrap_ok[*MirOperand, str](rop);
+    ops[0] = op_vreg(dst);
+    ops[1] = lower_value(ctx, inst.operands[0]);
+
+    val w: u8 = op_width_of(ctx, inst.ty);
+
+    var mi: MirInstr;
+    mi.opcode        = MIR_FNEG;
+    mi.operands      = ops;
+    mi.operand_count = 2;
+    mi.width         = w;
+    mi.src_width     = w;
+    ret push_instr(ctx, mb, mi);
+}
+
 # is_float_kind: true when an instruction's result or first operand is a float, so
 # its width is driven by the float encoders rather than this integer base-width
 # carrier. the float conversions, scalar float arithmetic, and float comparisons
@@ -2348,6 +2409,15 @@ fun lower_alloca(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
 # address resolves to `[rbp + offset]` and a runtime pointer to `[reg]`), while a
 # symbol / immediate pointer is left as a plain operand for the encoder to form
 # its own reference. the result vreg is the loaded value.
+#
+# a FLOAT load is retagged to MIR_FMOV by isel and emitted through the SSE
+# operand-routing encoder, which materializes a MOVSS / MOVSD off the resolved
+# operand WITHOUT recording a symbol relocation (it has no patch-site hook). a
+# global / function symbol pointer must therefore be LEA-materialized into a GP
+# base vreg first (the LEA carries the relocation through the generic path), so the
+# float load addresses `[base]` rather than an unrelocated `[rip+sym]` that would
+# read the wrong address. an integer load keeps the symbol operand: its generic
+# encoding records the relocation directly.
 fun lower_load(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
     if (inst.operand_count == 0) {
         ret err[bool, str]("mir.lower_ir: load with no pointer operand");
@@ -2356,11 +2426,18 @@ fun lower_load(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
     if (dst == MIR_VREG_NIL) {
         ret err[bool, str]("mir.lower_ir: load defines no result vreg");
     }
+    var mem: MirOperand = mem_operand_of(ctx, inst.operands[0]);
+    if (mem.kind == MIR_OP_SYM && value_is_float(ctx, inst.ty)) {
+        var base: u32 = MIR_VREG_NIL;
+        val ar: Result[bool, str] = addr_to_vreg(ctx, mb, mem, ?base);
+        if (is_err[bool, str](ar)) { ret err[bool, str](unwrap_err[bool, str](ar)); }
+        mem = op_mem_value(base, 0);
+    }
     val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
     if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
     val ops: *MirOperand = unwrap_ok[*MirOperand, str](r);
     ops[0] = op_vreg(dst);
-    ops[1] = mem_operand_of(ctx, inst.operands[0]);
+    ops[1] = mem;
     var mi: MirInstr;
     mi.opcode        = MIR_LOAD;
     mi.operands      = ops;
@@ -2405,10 +2482,22 @@ fun lower_store(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[
         if (is_err[bool, str](ar)) { ret ar; }
         stored = op_vreg(addr);
     }
+    # a FLOAT store is retagged to MIR_FMOV and emitted through the SSE encoder,
+    # which records no symbol relocation for its destination MEM. a global symbol
+    # destination must therefore be LEA-materialized into a GP base vreg first (so
+    # the store addresses `[base]`), mirroring the float-load path; an integer store
+    # keeps the symbol destination and relocates through the generic encoding.
+    var dest: MirOperand = mem_operand_of(ctx, inst.operands[1]);
+    if (dest.kind == MIR_OP_SYM && value_is_float(ctx, inst.operands[0].ty)) {
+        var dbase: u32 = MIR_VREG_NIL;
+        val dr: Result[bool, str] = addr_to_vreg(ctx, mb, dest, ?dbase);
+        if (is_err[bool, str](dr)) { ret err[bool, str](unwrap_err[bool, str](dr)); }
+        dest = op_mem_value(dbase, 0);
+    }
     val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
     if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
     val ops: *MirOperand = unwrap_ok[*MirOperand, str](r);
-    ops[0] = mem_operand_of(ctx, inst.operands[1]);
+    ops[0] = dest;
     ops[1] = stored;
     var mi: MirInstr;
     mi.opcode        = MIR_STORE;
@@ -2721,9 +2810,29 @@ fun is_sib_scale(s: u64) bool {
 # a value-vreg base carries the index in the SIB position; a symbol base with only a
 # constant offset folds into `sym_off` (a pure `[rip+sym+off]` reference), and a
 # symbol base with a runtime index LEA-materializes the symbol address into a value
-# vreg first (`addr_to_vreg`) so the scaled index has a register base to ride.
+# vreg first (`addr_to_vreg`) so the scaled index has a register base to ride. a
+# constant-address base (a null or integer pointer, e.g. a `null` argument inlined
+# into a pointer parameter the callee GEPs) materializes the constant into a value
+# vreg and indexes `[base + idx*scale + disp]` off it.
 fun fold_gep_mem(ctx: *LowerCtx, mb: *MirBlock, base: MirOperand, idx_vreg: u32, idx_scale: u8, disp: i64) Result[MirOperand, str] {
     var o: MirOperand = base;
+    if (base.kind == MIR_OP_IMM) {
+        # the base is a compile-time address; MOV it into a value vreg so the LEA /
+        # load / store has a register base to fold the constant displacement and the
+        # optional scaled index against.
+        val vr: Result[u32, str] = new_vreg(ctx, REG_CLASS_GP);
+        if (is_err[u32, str](vr)) { ret err[MirOperand, str](unwrap_err[u32, str](vr)); }
+        val vbase: u32 = unwrap_ok[u32, str](vr);
+        val mv: Result[bool, str] = emit_mov(ctx, mb, op_vreg(vbase), op_imm(base.imm));
+        if (is_err[bool, str](mv)) { ret err[MirOperand, str](unwrap_err[bool, str](mv)); }
+        var m: MirOperand = op_mem_value(vbase, disp);
+        if (idx_vreg != MIR_VREG_NIL) {
+            m.index         = idx_vreg;
+            m.scale         = idx_scale;
+            m.index_is_preg = false;
+        }
+        ret ok[MirOperand, str](m);
+    }
     if (base.kind == MIR_OP_MEM) {
         # a value-pointer / physical-register / frame-slot-key base all fold the
         # constant displacement into `imm`; the encoder resolves a slot key to
@@ -3975,8 +4084,8 @@ fun emit_store_imm(ctx: *LowerCtx, mb: *MirBlock, mem: MirOperand, imm: i64, wid
 #   overflow_arg_area += (8 & ~mask)         (only when overflow was used)
 #   result = load.T [addr]
 # a float result is handled by `lower_va_arg_fp` (the same branch-free select over
-# the fp_offset cursor / FP register-save region). a >16-byte by-value aggregate is
-# not handled here and still errors loudly rather than miscompiling.
+# the fp_offset cursor / FP register-save region); an aggregate result is handled by
+# `lower_va_arg_aggregate` (the GP-cursor select plus a by-value copy).
 fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
     if (inst.operand_count == 0) {
         ret err[bool, str]("mir.lower_ir: va_arg with no va_list operand");
@@ -3989,7 +4098,7 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
         ret lower_va_arg_fp(ctx, mb, inst, dst);
     }
     if (value_is_aggregate(ctx, inst.ty)) {
-        ret err[bool, str]("mir.lower_ir: va_arg of an aggregate type is not yet supported");
+        ret lower_va_arg_aggregate(ctx, mb, inst, dst);
     }
 
     val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
@@ -4171,6 +4280,153 @@ fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst
     # result = fmov.T [addr]: a float move so the value lands in the XMM-classed dst.
     val w: u8 = op_width_of(ctx, inst.ty);
     ret emit_fmov(ctx, mb, op_vreg(dst), op_mem_value(addr, 0), w);
+}
+
+# lower_va_arg_aggregate: expand `OP_VA_ARG [ap]` for a by-value aggregate result.
+# the aggregate analogue of `lower_va_arg`: the next argument's eightbytes are taken
+# from the GP register-save area while they fit (gp_offset + gp_bytes <= 48), else
+# from the overflow area; matching the SysV aggregate placement this compiler's
+# `classify_arg` emits for the same operand:
+#   * <=16B aggregates ride in one (<=8B) or two (9-16B) consecutive GP eightbytes,
+#     saved contiguously in the register-save area, so the bytes there ARE the value;
+#     the overflow copy reads the same by-value bytes.
+#   * >16B aggregates are passed BY REFERENCE in one GP register when one remains, so
+#     the saved eightbyte is a POINTER to the aggregate (dereferenced before the copy);
+#     once the GP file is exhausted they spill BY VALUE into the overflow area.
+# the register-vs-overflow choice reuses the GP path's branch-free 0/-1 mask so no
+# extra basic blocks are introduced; the chosen source address feeds a sized
+# `copy_aggregate` into caller-owned result storage, and the result vreg carries that
+# storage pointer so downstream consumers read the aggregate by value:
+#   gp_bytes = (>16B ? 8 : (>8B ? 16 : 8))     (GP eightbytes the operand consumed)
+#   in_reg   = gp_offset < (49 - gp_bytes)      (the eightbytes all fit in the save area)
+#   mask     = 0 - in_reg                        (i64: all-ones when in_reg else 0)
+#   reg_base = reg_save_area + gp_offset
+#   reg_src  = (>16B ? load8[reg_base] : reg_base)   (pointer deref for the by-ref form)
+#   ovf_al   = (overflow_arg_area + 7) & ~7      (overflow is eight-byte granular)
+#   src      = (reg_src & mask) | (ovf_al & ~mask)
+#   gp_offset         += (gp_bytes      & mask32)
+#   overflow_arg_area  = (overflow & mask) | ((ovf_al + roundup8(size)) & ~mask)
+#   copy size bytes from [src] into the result storage
+fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst: u32) Result[bool, str] {
+    val rok: Result[bool, str] = require_abi(ctx.tgt);
+    if (is_err[bool, str](rok)) { ret rok; }
+
+    val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
+    val size:   u64 = ir_type.byte_size(ctx.types, inst.ty, ctx.tgt)::u64;
+
+    # derive the placement from the same ABI classifier the call site emits, against
+    # a fresh register file so the result is the operand's canonical shape: BYREF (a
+    # hidden pointer, one GP eightbyte) for a >16B aggregate, two GP eightbytes for a
+    # 9-16B aggregate, one for a <=8B aggregate. the runtime gp_offset cursor — not
+    # gp_used — decides registers vs overflow below.
+    val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
+    val align: u64 = ir_type.byte_align(ctx.types, inst.ty, ctx.tgt)::u64;
+    val slot:  abi.ParamSlot = classify_arg(ctx.tgt.arch_id, 0, size, align, false, true, 0, 0);
+    val byref: bool = slot.class == abi.CLASS_BYREF;
+    var gp_bytes: i64 = 8;
+    if (!byref && slot.reg2 >= 0) { gp_bytes = 16; }
+
+    # back the result vreg with caller-owned storage; its address is the result so
+    # downstream copies / stores / returns treat the aggregate by value.
+    val rs: Result[bool, str] = alloc_result_storage(ctx, mb, dst, size, ret_align(ctx, inst.ty));
+    if (is_err[bool, str](rs)) { ret rs; }
+
+    # gp = load.i32 [ap + gp_offset].
+    var gp: u32 = MIR_VREG_NIL;
+    val lg: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_GP_OFFSET), 4, ?gp);
+    if (is_err[bool, str](lg)) { ret lg; }
+
+    # in_reg = gp < (gp_offset_max - gp_bytes + 1): the operand's eightbytes all fit.
+    val thr: i64 = sysv.va_gp_offset_max()::i64 - gp_bytes + 1;
+    var in_reg: u32 = MIR_VREG_NIL;
+    val cr: Result[bool, str] = emit_alu3(ctx, mb, MIR_CMP_LT_U, op_vreg(gp), op_imm(thr), 4, ?in_reg);
+    if (is_err[bool, str](cr)) { ret cr; }
+
+    # mask = 0 - zext(in_reg) -> 0 or all-ones (64-bit); nmask = ~mask.
+    var inz: u32 = MIR_VREG_NIL;
+    val zr: Result[bool, str] = emit_zext_to(ctx, mb, op_vreg(in_reg), 1, ?inz);
+    if (is_err[bool, str](zr)) { ret zr; }
+    var mask: u32 = MIR_VREG_NIL;
+    val mr: Result[bool, str] = emit_alu3(ctx, mb, MIR_SUB, op_imm(0), op_vreg(inz), 8, ?mask);
+    if (is_err[bool, str](mr)) { ret mr; }
+    var nmask: u32 = MIR_VREG_NIL;
+    val nr: Result[bool, str] = emit_not_to(ctx, mb, op_vreg(mask), 8, ?nmask);
+    if (is_err[bool, str](nr)) { ret nr; }
+
+    # reg_base = reg_save_area + zext(gp).
+    var rsa: u32 = MIR_VREG_NIL;
+    val lr: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_REG_SAVE_AREA), 8, ?rsa);
+    if (is_err[bool, str](lr)) { ret lr; }
+    var gp64: u32 = MIR_VREG_NIL;
+    val gzr: Result[bool, str] = emit_zext_to(ctx, mb, op_vreg(gp), 4, ?gp64);
+    if (is_err[bool, str](gzr)) { ret gzr; }
+    var reg_base: u32 = MIR_VREG_NIL;
+    val rar: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(rsa), op_vreg(gp64), 8, ?reg_base);
+    if (is_err[bool, str](rar)) { ret rar; }
+
+    # reg_src: the in-register source address. a >16B aggregate is passed by hidden
+    # pointer, so the saved eightbyte IS that pointer (dereference it); a <=16B
+    # aggregate's eightbytes sit in the save area by value, so the address is reg_base.
+    var reg_src: u32 = reg_base;
+    if (byref) {
+        var p: u32 = MIR_VREG_NIL;
+        val lp: Result[bool, str] = emit_load_w(ctx, mb, op_mem_value(reg_base, 0), 8, ?p);
+        if (is_err[bool, str](lp)) { ret lp; }
+        reg_src = p;
+    }
+
+    # ovf = overflow_arg_area; ovf_al = (ovf + 7) & ~7 (eight-byte granular overflow).
+    var ovf: u32 = MIR_VREG_NIL;
+    val lo: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), 8, ?ovf);
+    if (is_err[bool, str](lo)) { ret lo; }
+    var ovf_up: u32 = MIR_VREG_NIL;
+    val au: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(ovf), op_imm(7), 8, ?ovf_up);
+    if (is_err[bool, str](au)) { ret au; }
+    var ovf_al: u32 = MIR_VREG_NIL;
+    val ad: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(ovf_up), op_imm(~7::i64), 8, ?ovf_al);
+    if (is_err[bool, str](ad)) { ret ad; }
+
+    # src = (reg_src & mask) | (ovf_al & ~mask).
+    var rs_m: u32 = MIR_VREG_NIL;
+    val r1: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(reg_src), op_vreg(mask), 8, ?rs_m);
+    if (is_err[bool, str](r1)) { ret r1; }
+    var ov_m: u32 = MIR_VREG_NIL;
+    val r2: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(ovf_al), op_vreg(nmask), 8, ?ov_m);
+    if (is_err[bool, str](r2)) { ret r2; }
+    var src: u32 = MIR_VREG_NIL;
+    val r3: Result[bool, str] = emit_alu3(ctx, mb, MIR_OR, op_vreg(rs_m), op_vreg(ov_m), 8, ?src);
+    if (is_err[bool, str](r3)) { ret r3; }
+
+    # gp_offset += (gp_bytes & mask32): advance the consumed GP eightbytes when used.
+    var step_gp: u32 = MIR_VREG_NIL;
+    val sg: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_imm(gp_bytes), op_vreg(mask), 4, ?step_gp);
+    if (is_err[bool, str](sg)) { ret sg; }
+    var new_gp: u32 = MIR_VREG_NIL;
+    val ng: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(gp), op_vreg(step_gp), 4, ?new_gp);
+    if (is_err[bool, str](ng)) { ret ng; }
+    val wg: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_GP_OFFSET), op_vreg(new_gp), 4);
+    if (is_err[bool, str](wg)) { ret wg; }
+
+    # overflow_arg_area = (ovf & mask) | ((ovf_al + roundup8(size)) & ~mask): when the
+    # overflow area was used, advance past the aligned by-value bytes; else leave it.
+    val ovf_step: i64 = ((size + 7) & ~7::u64)::i64;
+    var ovf_next: u32 = MIR_VREG_NIL;
+    val on: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(ovf_al), op_imm(ovf_step), 8, ?ovf_next);
+    if (is_err[bool, str](on)) { ret on; }
+    var ovf_keep: u32 = MIR_VREG_NIL;
+    val ok1: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(ovf), op_vreg(mask), 8, ?ovf_keep);
+    if (is_err[bool, str](ok1)) { ret ok1; }
+    var ovf_take: u32 = MIR_VREG_NIL;
+    val ok2: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_vreg(ovf_next), op_vreg(nmask), 8, ?ovf_take);
+    if (is_err[bool, str](ok2)) { ret ok2; }
+    var new_ovf: u32 = MIR_VREG_NIL;
+    val ok3: Result[bool, str] = emit_alu3(ctx, mb, MIR_OR, op_vreg(ovf_keep), op_vreg(ovf_take), 8, ?new_ovf);
+    if (is_err[bool, str](ok3)) { ret ok3; }
+    val wo: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), op_vreg(new_ovf), 8);
+    if (is_err[bool, str](wo)) { ret wo; }
+
+    # copy the aggregate's bytes from the selected source into the result storage.
+    ret copy_aggregate(ctx, mb, op_mem_value(dst, 0), op_vreg(src), size);
 }
 
 # emit_zext_to: zero-extend `src` (`src_w` bytes) into a fresh 8-byte GP vreg,
@@ -4456,6 +4712,15 @@ fun lower_value(ctx: *LowerCtx, v: value.Value) MirOperand {
         ret op_imm(0);
     }
     if (v.kind == value.VAL_CONST_FLOAT) {
+        # the constant carries its comptime f64 bit pattern (the `int_lit` /
+        # `float_lit` union alias). an f32 constant must materialize its
+        # single-precision pattern so the low 32 bits an SS-form load / op reads
+        # are the f32 value, not the low half of the f64 representation. narrow
+        # with the shared round-to-nearest-even conversion, matching the global
+        # initializer emission.
+        if (op_width_of(ctx, v.ty) == 4) {
+            ret op_imm(float.f64_to_f32_bits(v.data.int_lit)::i64);
+        }
         ret op_imm(v.data.int_lit::i64);
     }
     if (v.kind == value.VAL_GLOBAL) {
