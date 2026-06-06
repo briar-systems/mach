@@ -73,8 +73,15 @@ in the example above.
 
 Tests are not tied to a single file. Every `test` declaration in every
 module that is part of the build — the project and its dependencies — is
-collected. `mach test` drives a build whose entry point is a test runner
-that iterates the collected tests rather than the project's normal `main`.
+collected. `mach test` drives a build whose entry point is a synthesized
+test runner that iterates the collected tests rather than the project's
+normal `main`.
+
+> **Note.** Because dependency tests are collected too, a project that
+> depends on a library carrying tests that do not follow the `0` = pass
+> convention will see those tests reported as failures. Use `--filter` to
+> scope a run to your own tests while a dependency's suite is being
+> reconciled.
 
 ## The `mach test` workflow
 
@@ -110,24 +117,28 @@ The exit code of `mach test` follows the runner:
 - `2` — a build or internal error before the tests could run.
 
 `--list` enumerates the collected tests and exits without running them.
-`--filter <pattern>` restricts the run to tests whose label contains the
-given pattern.
+`--filter <pattern>` restricts the run (or the `--list` output) to tests
+whose label contains the given pattern.
 
-## Verification notes
+## The runner
 
-The following are documented as the intended behavior but were **not fully
-verifiable from the compiler source** at the time of writing:
+The runner is synthesized in IR by the compiler (`mach.lang.me.lower.testrunner`)
+during a test build and codegen'd into one extra object that joins the link.
+For each collected test it emits a body-less extern referencing the test's
+linkage name plus a private `.rodata` global holding the label; the synthesized
+`main` then walks the table. In a test build the project's own `main` is
+neutralised (turned into a body-less extern) so the runner's `main` is the sole
+program entry, and an executable is always linked — even for a library target.
 
-- The test-runner stub that iterates the collected tests and interprets
-  each test's exit status (including how it applies `--filter` and
-  `--list`) is described by the `mach test` command but its emission site
-  was not located in the compiler sources; only the per-test tagging that
-  marks a lowered test function as a test entry point was found. The
-  per-test pass/fail interpretation therefore lives in the runner, not in
-  the compiler's type checking.
-- Because the runner — not the language — decides what a non-zero status
-  means, the exact mapping of specific non-zero codes to failure messages
-  is a runner detail and may evolve.
+The runner prints one line per executed test, `PASS <label>` or `FAIL <label>`,
+to stdout, and returns `0` when every selected test passed and `1` otherwise.
+It reads `--list` / `--filter` from its own argv (forwarded by `mach test`). The
+only OS interaction is a `write` syscall emitted as a small inline-asm helper,
+so the runner has no standard-library dependency.
+
+The corpus under `tests/testing/` is a self-contained, no-std project that
+exercises the framework: discovery, the pass/fail convention, exit codes, and
+`--list` / `--filter`.
 
 ## See also
 
