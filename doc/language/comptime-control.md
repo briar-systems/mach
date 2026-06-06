@@ -78,6 +78,9 @@ Rules:
   constants). A gate referencing a runtime local/parameter is rejected.
 - A comptime parameter has no storage, so its address cannot be taken
   (`?$mode` is rejected with `cannot take the address of a comptime parameter`).
+- A comptime-parameter function is a template, not a value: it can only be
+  called, not assigned, passed, or compared (`val fp = apply;` is rejected with
+  `cannot reference a comptime-parameter function as a value`).
 - Comptime parameters carry no runtime cost: they are stripped from the lowered
   signature and ABI, so only the runtime parameters are passed.
 - A comptime parameter may be mixed freely with runtime parameters in any order.

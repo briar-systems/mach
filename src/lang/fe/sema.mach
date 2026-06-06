@@ -178,6 +178,7 @@ fun init_context(
     sc.decl_type        = nil;
 
     sc.anon_counter = 0;
+    sc.callee_eid   = id.EXPR_NIL;
 
     if (a.expr_len > 0) {
         val r: Result[*type.TypeId, str] = allocate[type.TypeId](s.alloc, a.expr_len);
@@ -531,49 +532,94 @@ fun expr_references_comptime_param(sc: *ctxm.SemaContext, eid: id.ExprId) bool {
     ret false;
 }
 
-# verifies a comptime-param `$if` gate is fully comptime-foldable: every leaf
-# identifier must name a comptime thing (a comptime parameter or a comptime
-# constant), and a runtime local / non-comptime param / `var` is rejected with a
-# span'd diagnostic at the offending identifier. literals, `$mach.*` comptime
-# paths, and module-qualified constants pass. recurses through binary / unary
-# operators. (this runs only for a chain already known to be param-gated.)
+# verifies a comptime-param `$if` gate is fully comptime-foldable so arm selection
+# can be deferred to lowering without a span-less abort there. every leaf must be
+# comptime: a comptime parameter, a comptime-foldable constant (checked by actually
+# folding it, not by symbol kind — a runtime block-local `val` is SYM_VAL yet not
+# foldable), a literal, or a `$mach.*` / module-constant path. a non-foldable
+# subexpression (a runtime value, or an unevaluable index / call / cast / deref) is
+# reported against its own span. recurses through every composite expression kind.
 fun check_comptime_gate(sc: *ctxm.SemaContext, eid: id.ExprId) {
     if (eid == id.EXPR_NIL) { ret; }
     val e_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
     if (is_none[*expr.Expr](e_opt)) { ret; }
     val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+    val k: expr.ExprKind = e.kind;
 
-    if (e.kind == expr.EXPR_KIND_BINARY) {
+    # composite operators: recurse into operands so a runtime leaf is reported at
+    # its own span rather than masked by the parent.
+    if (k == expr.EXPR_KIND_BINARY) {
         check_comptime_gate(sc, e.data.binary.lhs);
         check_comptime_gate(sc, e.data.binary.rhs);
         ret;
     }
-    if (e.kind == expr.EXPR_KIND_UNARY) {
+    if (k == expr.EXPR_KIND_UNARY) {
+        # a deref / address-of is not comptime-evaluable at all; report it.
+        if (e.data.unary.op == expr.UN_DEREF || e.data.unary.op == expr.UN_ADDR) {
+            ctxm.report(sc, e.span, "comptime `$if` gate is not a compile-time constant");
+            ret;
+        }
         check_comptime_gate(sc, e.data.unary.operand);
         ret;
     }
-    if (e.kind == expr.EXPR_KIND_IDENT) {
+
+    # literals and `$mach.*` comptime paths fold directly.
+    if (k == expr.EXPR_KIND_LIT_INT || k == expr.EXPR_KIND_LIT_FLOAT
+     || k == expr.EXPR_KIND_LIT_CHAR || k == expr.EXPR_KIND_LIT_STR
+     || k == expr.EXPR_KIND_COMPTIME_IDENT) {
+        ret;
+    }
+
+    if (k == expr.EXPR_KIND_IDENT) {
         val so: Option[*resolve.Symbol] = ctxm.symbol_for_expr(sc, eid);
         # an unresolved ident may be a language literal (`true`/`false`) the
         # evaluator folds directly; leave it to the evaluator.
         if (is_none[*resolve.Symbol](so)) { ret; }
         val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
-        # comptime param, or a constant binding (a `val` / imported `pub val`) —
-        # all comptime-foldable. a runtime `var`, or a non-comptime `param`, is not.
         if (sym.kind == resolve.SYM_PARAM) {
             if ((sym.flags & resolve.SYM_FLAG_COMPTIME) == 0) {
                 ctxm.report(sc, e.span, "comptime `$if` gate cannot reference a runtime parameter");
             }
             ret;
         }
-        if (sym.kind == resolve.SYM_VAL || sym.kind == resolve.SYM_IMPORTED) { ret; }
+        # a `val` / imported binding is foldable ONLY if it actually resolves to a
+        # comptime constant — a runtime block-local `val n = f();` is SYM_VAL but
+        # not foldable. test by folding it through the comptime evaluator.
+        if (sym.kind == resolve.SYM_VAL || sym.kind == resolve.SYM_IMPORTED) {
+            val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
+            if (is_err[comptime.CTValue, str](ev) && !arg_names_module_const_sym(sym)) {
+                ctxm.report(sc, e.span, "comptime `$if` gate cannot reference a runtime value");
+            }
+            ret;
+        }
         ctxm.report(sc, e.span, "comptime `$if` gate cannot reference a runtime value");
         ret;
     }
-    # member access (`alias.CONST`), comptime path (`$mach.*`), and literals are
-    # foldable; anything else (call, index, cast, ...) is left to the evaluator,
-    # which reports a precise error at lowering if it cannot fold.
+
+    # a module-qualified member (`alias.CONST`) folds to the defining module's
+    # constant; a member of a runtime value does not. fold to decide.
+    if (k == expr.EXPR_KIND_MEMBER) {
+        val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
+        if (is_err[comptime.CTValue, str](ev)) {
+            val so: Option[*resolve.Symbol] = ctxm.symbol_for_expr(sc, eid);
+            if (is_none[*resolve.Symbol](so) || !arg_names_module_const_sym(unwrap[*resolve.Symbol](so))) {
+                ctxm.report(sc, e.span, "comptime `$if` gate is not a compile-time constant");
+            }
+        }
+        ret;
+    }
+
+    # index / call / cast / array-lit / struct-lit: not comptime-evaluable in a
+    # gate. report against the whole subexpression.
+    ctxm.report(sc, e.span, "comptime `$if` gate is not a compile-time constant");
     ret;
+}
+
+# reports whether a symbol names a module-origin constant (an import, or a
+# module-level `val`) whose value lives in the defining module's comptime context
+# — foldable at lowering even when sema cannot fold it here.
+fun arg_names_module_const_sym(sym: *resolve.Symbol) bool {
+    ret sym.kind == resolve.SYM_IMPORTED;
 }
 
 # types a local val/var: records its declared (or inferred) type in
