@@ -229,4 +229,4 @@ brackets and are a separate mechanism.
 - [doc/language/comptime-attrs.md](../../../doc/language/comptime-attrs.md) — symbol attributes
 - [doc/language/comptime-intrinsics.md](../../../doc/language/comptime-intrinsics.md) — intrinsics
 - [doc/language/comptime-control.md](../../../doc/language/comptime-control.md) — `$if` / `$or`
-- [SPEC.md](../../../SPEC.md) — locked decisions, source of truth
+- [doc/language/](../../../doc/language/README.md) — full language reference index

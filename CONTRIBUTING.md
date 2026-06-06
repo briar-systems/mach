@@ -19,9 +19,9 @@ Be respectful, constructive, and professional. Treat Mach like a passion project
 
 ### Building
 
-Mach uses a 4-stage bootstrap build chain. The bootstrap compiler (`cmach`) is automatically downloaded from [mach-boot](https://github.com/octalide/mach-boot) releases.
+Mach is self-hosting — the compiler is written in Mach and compiles its own source. `make` runs a 4-stage bootstrap build chain; the seed compiler (`cmach`) is automatically downloaded from [mach-boot](https://github.com/octalide/mach-boot) releases.
 
-1. **cmach** — Bootstrap compiler (pre-built, auto-downloaded)
+1. **cmach** — Seed compiler (pre-built, auto-downloaded)
 2. **imach** — Intermediate compiler: Mach source compiled by cmach
 3. **smach** — Self-hosted compiler: Mach source compiled by imach
 4. **mach** — Final compiler: Mach source compiled by smach
@@ -31,6 +31,8 @@ git clone --recurse-submodules https://github.com/octalide/mach.git
 cd mach
 make    # downloads cmach and builds all stages
 ```
+
+The four binaries are written to `out/bin/`; the final compiler is `out/bin/mach`. The bootstrap reaches a byte-identical fixpoint — recompiling the source with `mach` reproduces `mach` exactly. `make clean` wipes `out/`.
 
 To use a custom cmach build:
 
@@ -123,7 +125,7 @@ dev (ongoing work)
 
 ### Mach Code (in `src/` and `dep/mach-std/`)
 
-Mach coding standards are in flux while syntax stabilizes and the userbase grows. Follow existing patterns and refer to the [language specification](doc/language-spec.md) for language features.
+Mach coding standards are in flux while syntax stabilizes and the userbase grows. Follow existing patterns and refer to the [language reference](doc/language/README.md) for language features.
 
 ---
 
@@ -134,7 +136,9 @@ mach/
 ├── dep/
 │   └── mach-std/      # standard library (git submodule)
 ├── doc/               # documentation
+├── examples/          # example projects and syntax fixtures
 ├── src/               # self-hosting mach compiler
+├── out/               # build output (git-ignored); final compiler at out/bin/mach
 ├── Makefile           # build system (auto-downloads cmach)
 └── mach.toml          # project configuration
 ```
