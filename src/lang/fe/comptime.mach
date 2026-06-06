@@ -1,11 +1,12 @@
 # mach.lang.fe.comptime: bounded compile-time evaluator.
 #
-# consumed by resolve and driver to evaluate `$if` predicates against
-# compile-time constants (`$mach.*` target parameters plus user-registered
-# `pub val` decls). scope is intentionally narrow: literals, references to
-# comptime-known constants, and arithmetic / comparison / logical / bitwise
-# / shift operators over them. out of scope: function calls, loops,
-# type-introspection intrinsics, casts.
+# consumed by resolve, driver, and lower to evaluate `$if` predicates against
+# compile-time constants (`$mach.*` target parameters plus the scoped
+# environment of bound comptime constants — module-level / imported `pub val`s
+# plus a value-instance's `$param` bindings). scope is intentionally narrow:
+# literals, references to comptime-known constants, and arithmetic / comparison
+# / logical / bitwise / shift operators over them. out of scope: function calls,
+# loops, type-introspection intrinsics, casts.
 #
 # `$mach.target.{os,arch,abi}` resolve to the numeric tag of the active
 # target; the matching `$mach.os.*` / `$mach.arch.*` tags resolve to the
@@ -75,7 +76,8 @@ pub rec CTValue {
     };
 }
 
-# NamedConst: a named comptime constant, produced when a comptime-evaluable val decl is registered with a context for later reference by its bare identifier.
+# NamedConst: a named comptime constant, bound into a ComptimeCtx's entries
+# array for later reference by its bare identifier.
 # ---
 # name:  interned identifier
 # value: pre-evaluated constant
@@ -84,24 +86,33 @@ pub rec NamedConst {
     value: CTValue;
 }
 
-# ComptimeCtx: build/target context plus user-defined comptime constants visible to one evaluation, populated by the driver from mach.toml plus prior comptime val decls evaluated in dependency order.
+# FrameMark: an opaque entries-array depth, returned by `frame_open` and passed
+# to `frame_close` to pop exactly the bindings introduced after the mark.
+pub def FrameMark: u32;
+
+# ComptimeCtx: build/target context plus a single scoped environment of named
+# comptime constants visible to one evaluation.
+#
+# `entries` is one append-only array partitioned implicitly into frames by
+# marks: a frame is the run [mark, entries_len). The bottom run is the module
+# frame — built once (driver this-module pub vals + imported pub consts, resolve
+# module-level vals) and NEVER closed, so all three passes read it. A value-
+# instance drain opens a transient frame on top, binds its `$param`s, lowers the
+# body, then closes the frame; the close pops exactly those param bindings.
+#
+# `$mach.*` is NOT stored here — it is resolved structurally in resolve_mach_path
+# from the target fields below.
 # ---
-# alloc:          allocator used for the user_consts buffer
+# alloc:          allocator used for the entries buffer
 # target_os_id:   numeric os id (one of os.OS_*)
 # target_arch_id: numeric arch id (one of isa.ARCH_*)
 # pointer_width:  target pointer width in bytes
 # compiler_name:  interned "mach"
 # compiler_ver:   interned compiler version string
-# user_consts:    array of NamedConst entries; linear lookup is fine at this size
-# user_const_len: number of entries currently stored
-# user_const_cap: allocated slots in user_consts
-# params:         a separate stack of `$param -> CTValue` bindings, active only
-#                 while a comptime value-parameter instance body is being lowered;
-#                 consulted (most-recent-first) BEFORE user_consts so a parameter
-#                 shadows a same-named module / block const without disturbing
-#                 general comptime-const lookup semantics
-# param_len:      number of active param bindings
-# param_cap:      allocated slots in params
+# entries:        scoped array of NamedConst bindings; lookup scans it in reverse
+#                 so an innermost (later-bound) name shadows an outer one
+# entries_len:    number of entries currently stored
+# entries_cap:    allocated slots in entries
 pub rec ComptimeCtx {
     alloc:          *Allocator;
     target_os_id:   u32;
@@ -109,17 +120,15 @@ pub rec ComptimeCtx {
     pointer_width:  u32;
     compiler_name:  intern.StrId;
     compiler_ver:   intern.StrId;
-    user_consts:    *NamedConst;
-    user_const_len: u32;
-    user_const_cap: u32;
-    params:         *NamedConst;
-    param_len:      u32;
-    param_cap:      u32;
+    entries:        *NamedConst;
+    entries_len:    u32;
+    entries_cap:    u32;
 }
 
 val INITIAL_CONST_CAP: u32 = 8;
 
-# init: constructs a ComptimeCtx with the given target parameters and no user consts.
+# init: constructs a ComptimeCtx with the given target parameters and an empty
+# environment.
 # ---
 # alloc:          allocator used for owned storage
 # target_os_id:   numeric os id (one of os.OS_*)
@@ -143,140 +152,94 @@ pub fun init(
     c.pointer_width  = pointer_width;
     c.compiler_name  = compiler_name;
     c.compiler_ver   = compiler_ver;
-    c.user_consts    = nil;
-    c.user_const_len = 0;
-    c.user_const_cap = 0;
-    c.params         = nil;
-    c.param_len      = 0;
-    c.param_cap      = 0;
+    c.entries        = nil;
+    c.entries_len    = 0;
+    c.entries_cap    = 0;
     ret c;
 }
 
-# dnit: releases the user_consts and param buffers.
+# dnit: releases the entries buffer.
 # ---
 # c: context to tear down; all fields are zeroed
 pub fun dnit(c: *ComptimeCtx) {
     if (c == nil) { ret; }
-    if (c.user_consts != nil && c.user_const_cap > 0) {
-        deallocate[NamedConst](c.alloc, c.user_consts, c.user_const_cap::usize);
+    if (c.entries != nil && c.entries_cap > 0) {
+        deallocate[NamedConst](c.alloc, c.entries, c.entries_cap::usize);
     }
-    if (c.params != nil && c.param_cap > 0) {
-        deallocate[NamedConst](c.alloc, c.params, c.param_cap::usize);
-    }
-    c.user_consts    = nil;
-    c.user_const_len = 0;
-    c.user_const_cap = 0;
-    c.params         = nil;
-    c.param_len      = 0;
-    c.param_cap      = 0;
+    c.entries     = nil;
+    c.entries_len = 0;
+    c.entries_cap = 0;
 }
 
-# register: registers a comptime constant under `name`, growing user_consts as needed.
+# bind: appends a comptime constant under `name` to the current (innermost)
+# frame, growing the entries array as needed. a later binding of the same name
+# shadows an earlier one under the reverse-scan lookup.
 # ---
 # c:     context to extend
 # name:  interned identifier
 # value: pre-evaluated constant
 # ret:   true on success, or an allocation error
-pub fun register(c: *ComptimeCtx, name: intern.StrId, value: CTValue) Result[bool, str] {
-    if (c.user_consts == nil) {
+pub fun bind(c: *ComptimeCtx, name: intern.StrId, value: CTValue) Result[bool, str] {
+    if (c.entries == nil) {
         val r: Result[*NamedConst, str] = allocate[NamedConst](c.alloc, INITIAL_CONST_CAP::usize);
         if (is_err[*NamedConst, str](r)) {
             ret err[bool, str](unwrap_err[*NamedConst, str](r));
         }
-        c.user_consts    = unwrap_ok[*NamedConst, str](r);
-        c.user_const_cap = INITIAL_CONST_CAP;
+        c.entries     = unwrap_ok[*NamedConst, str](r);
+        c.entries_cap = INITIAL_CONST_CAP;
     }
-    or (c.user_const_len == c.user_const_cap) {
-        val new_cap: u32 = c.user_const_cap * 2;
-        val r: Result[*NamedConst, str] = reallocate[NamedConst](c.alloc, c.user_consts, c.user_const_cap::usize, new_cap::usize);
+    or (c.entries_len == c.entries_cap) {
+        val new_cap: u32 = c.entries_cap * 2;
+        val r: Result[*NamedConst, str] = reallocate[NamedConst](c.alloc, c.entries, c.entries_cap::usize, new_cap::usize);
         if (is_err[*NamedConst, str](r)) {
             ret err[bool, str](unwrap_err[*NamedConst, str](r));
         }
-        c.user_consts    = unwrap_ok[*NamedConst, str](r);
-        c.user_const_cap = new_cap;
+        c.entries     = unwrap_ok[*NamedConst, str](r);
+        c.entries_cap = new_cap;
     }
 
     var nc: NamedConst;
     nc.name  = name;
     nc.value = value;
-    c.user_consts[c.user_const_len] = nc;
-    c.user_const_len = c.user_const_len + 1;
+    c.entries[c.entries_len] = nc;
+    c.entries_len = c.entries_len + 1;
     ret ok[bool, str](true);
 }
 
-# param_mark: returns the current depth of the param-binding stack, to be passed
-# to `param_truncate` to pop exactly the bindings pushed after this mark.
+# frame_open: returns the current entries depth as a frame mark. bindings made
+# after this mark belong to the opened frame and are removed by `frame_close`.
 # ---
 # c:   the context
-# ret: the current param stack depth
-pub fun param_mark(c: *ComptimeCtx) u32 {
-    ret c.param_len;
+# ret: the current entries depth
+pub fun frame_open(c: *ComptimeCtx) FrameMark {
+    ret c.entries_len;
 }
 
-# param_truncate: pops the param stack back to `mark`, removing every binding
-# pushed since the matching `param_mark`. used to scope a value-instance body's
+# frame_close: pops the entries array back to `mark`, removing every binding
+# made since the matching `frame_open`. used to scope a value-instance body's
 # `$param` bindings to that body's lowering, restoring exactly on every path.
 # ---
 # c:    the context
-# mark: a depth previously returned by `param_mark`
-pub fun param_truncate(c: *ComptimeCtx, mark: u32) {
-    if (mark <= c.param_len) { c.param_len = mark; }
+# mark: a depth previously returned by `frame_open`
+pub fun frame_close(c: *ComptimeCtx, mark: FrameMark) {
+    if (mark <= c.entries_len) { c.entries_len = mark; }
 }
 
-# push_param: pushes a `$param -> CTValue` binding onto the param-binding stack,
-# growing it as needed. these bindings shadow same-named user consts during a
-# value-instance body's lowering and are popped via `param_truncate` afterward.
-# ---
-# c:     the context
-# name:  interned parameter identifier
-# value: the parameter's folded comptime value for this instance
-# ret:   true on success, or an allocation error
-pub fun push_param(c: *ComptimeCtx, name: intern.StrId, value: CTValue) Result[bool, str] {
-    if (c.params == nil) {
-        val r: Result[*NamedConst, str] = allocate[NamedConst](c.alloc, INITIAL_CONST_CAP::usize);
-        if (is_err[*NamedConst, str](r)) { ret err[bool, str](unwrap_err[*NamedConst, str](r)); }
-        c.params    = unwrap_ok[*NamedConst, str](r);
-        c.param_cap = INITIAL_CONST_CAP;
-    }
-    or (c.param_len == c.param_cap) {
-        val new_cap: u32 = c.param_cap * 2;
-        val r: Result[*NamedConst, str] = reallocate[NamedConst](c.alloc, c.params, c.param_cap::usize, new_cap::usize);
-        if (is_err[*NamedConst, str](r)) { ret err[bool, str](unwrap_err[*NamedConst, str](r)); }
-        c.params    = unwrap_ok[*NamedConst, str](r);
-        c.param_cap = new_cap;
-    }
-
-    var nc: NamedConst;
-    nc.name  = name;
-    nc.value = value;
-    c.params[c.param_len] = nc;
-    c.param_len = c.param_len + 1;
-    ret ok[bool, str](true);
-}
-
-# lookup: looks up a comptime constant by interned name. the active `$param`
-# bindings are consulted first (most-recent-first, so a parameter shadows a
-# same-named const while an instance body lowers); the general user-const table
-# is then searched first-match (the original semantics, so a never-popped block-
-# local `val` does not shadow a later module const).
+# lookup: looks up a comptime constant by interned name with a single reverse
+# scan of the scoped environment: the innermost (latest-bound) match wins, so a
+# value-instance `$param` shadows a same-named module const while its body
+# lowers, falling back to the persistent module frame otherwise.
 # ---
 # c:    context to search
 # name: interned identifier to find
-# ret:  some(*NamedConst) when registered, none otherwise
+# ret:  some(*NamedConst) when bound, none otherwise
 pub fun lookup(c: *ComptimeCtx, name: intern.StrId) Option[*NamedConst] {
-    var pi: u32 = c.param_len;
-    for (pi > 0) {
-        pi = pi - 1;
-        if (c.params[pi].name == name) {
-            ret some[*NamedConst](?c.params[pi]);
+    var i: u32 = c.entries_len;
+    for (i > 0) {
+        i = i - 1;
+        if (c.entries[i].name == name) {
+            ret some[*NamedConst](?c.entries[i]);
         }
-    }
-    var i: u32 = 0;
-    for (i < c.user_const_len) {
-        if (c.user_consts[i].name == name) {
-            ret some[*NamedConst](?c.user_consts[i]);
-        }
-        i = i + 1;
     }
     ret none[*NamedConst]();
 }
