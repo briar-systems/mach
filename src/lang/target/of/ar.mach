@@ -91,12 +91,13 @@ pub fun first_member() usize {
 
 # next_member: read the member header at `pos` and yield its content slice.
 #
-# parses the 60-byte header, decodes the decimal-ASCII size, and returns the
-# member's `(data, len)` slice plus the offset of the following header (the
-# member is padded to an even boundary). a truncated or non-numeric header is a
-# hard stop (`ok` false). reaching the end of the buffer ends iteration
-# (`done` true). bookkeeping members (`/`, `//`, `__.SYMDEF`) are still yielded
-# here — the caller filters them via `is_special` — so offsets stay exact.
+# parses the 60-byte header, validates the `\x60\n` terminator, decodes the
+# decimal-ASCII size, and returns the member's `(data, len)` slice plus the
+# offset of the following header (the member is padded to an even boundary).
+# `pos == len` is the clean end of iteration (`done` true); a truncated header,
+# missing terminator, non-numeric size, out-of-bounds body, or missing pad byte
+# is a hard stop (`ok` false). bookkeeping members are still yielded here — the
+# caller filters them via `is_special` — so offsets stay exact.
 # ---
 # buf: the archive bytes
 # len: length of `buf`
@@ -110,9 +111,14 @@ pub fun next_member(buf: *u8, len: usize, pos: usize) Step {
     st.done        = false;
     st.ok          = true;
 
-    # no room for another header: clean end of archive.
-    if (pos >= len || len - pos < HEADER_LEN) {
+    # exactly at the end: clean end of archive.
+    if (pos == len) {
         st.done = true;
+        ret st;
+    }
+    # trailing bytes too short for a header: a truncated archive, not a clean end.
+    if (pos > len || len - pos < HEADER_LEN) {
+        st.ok = false;
         ret st;
     }
 
@@ -122,9 +128,18 @@ pub fun next_member(buf: *u8, len: usize, pos: usize) Step {
         ret st;
     }
 
-    val size: usize = parse_size(buf, pos + SIZE_OFFSET);
+    # the size field must be a non-empty run of decimal digits.
+    var ok_size: bool = false;
+    val size: usize = parse_size(buf, pos + SIZE_OFFSET, ?ok_size);
+    if (!ok_size) {
+        st.ok = false;
+        ret st;
+    }
+
+    # the member body must fit; check against the remaining bytes so the sum
+    # cannot overflow `usize`.
     val data_start: usize = pos + HEADER_LEN;
-    if (data_start + size > len) {
+    if (size > len - data_start) {
         st.ok = false;
         ret st;
     }
@@ -132,50 +147,86 @@ pub fun next_member(buf: *u8, len: usize, pos: usize) Step {
     st.member.data = (buf::usize + data_start)::*u8;
     st.member.len  = size;
 
-    # members are padded to an even byte boundary with a trailing `\n`.
+    # members are padded to an even byte boundary with a trailing `\n`; an
+    # odd-sized member that runs to the very end is missing its pad — truncated.
     var after: usize = data_start + size;
-    if ((size & 1) == 1) { after = after + 1; }
+    if ((size & 1) == 1) {
+        if (after >= len) {
+            st.ok = false;
+            ret st;
+        }
+        after = after + 1;
+    }
     st.next = after;
     ret st;
 }
 
 # is_special: whether a member is archive bookkeeping rather than an object.
 #
-# an archiver prepends a symbol directory (`/` under GNU ar, `__.SYMDEF` under
-# BSD ar) and, under GNU ar, a long-name table (`//`); neither is an object and
-# both must be skipped. the member name is the first 16 bytes of its header,
-# space-padded; this matches the special names by their leading bytes.
+# an archiver prepends a symbol directory and, under GNU ar, a long-name table;
+# neither is an object and both must be skipped. the member name is the first 16
+# bytes of the header, space-padded. the recognized bookkeeping names are:
+#   `/`       — GNU symbol table (header: `/` then spaces)
+#   `/SYM64/` — GNU 64-bit symbol table
+#   `//`      — GNU long-name table
+#   `__.SYMDEF`, `__.SYMDEF SORTED` — BSD symbol table
+# a `/<digits>` name is a long-name *reference* for a real object, so a `/`
+# followed by a digit is deliberately not treated as special.
 # ---
 # buf: the archive bytes
 # pos: offset of the member header
-# ret: true if the member is a symbol directory or name table
+# ret: true if the member is a symbol table or long-name table
 pub fun is_special(buf: *u8, pos: usize) bool {
     val c0: u8 = buf[pos];
     val c1: u8 = buf[pos + 1];
-    # "/ " or "//" — GNU symbol directory / long-name table.
-    if (c0 == '/' && (c1 == ' ' || c1 == '/')) { ret true; }
-    # "__.SYMDEF" — BSD symbol directory.
-    if (c0 == '_' && c1 == '_' && buf[pos + 2] == '.') { ret true; }
+    if (c0 == '/') {
+        # "/ " GNU symbol table, "//" long-name table, "/SYM64/" 64-bit table.
+        # a "/<digit>" name is an object's long-name reference, not special.
+        if (c1 == ' ' || c1 == '/') { ret true; }
+        if (name_has_prefix(buf, pos, "/SYM64/")) { ret true; }
+        ret false;
+    }
+    # BSD symbol table, matched by its exact name prefix.
+    if (name_has_prefix(buf, pos, "__.SYMDEF")) { ret true; }
     ret false;
+}
+
+# name_has_prefix: whether the member name at `pos` begins with the literal
+# `pre`. the name occupies the first 16 header bytes; this compares only `pre`'s
+# bytes, so a longer name sharing the prefix (e.g. `__.SYMDEF SORTED`) matches.
+fun name_has_prefix(buf: *u8, pos: usize, pre: *u8) bool {
+    var i: usize = 0;
+    for (pre[i] != 0) {
+        if (buf[pos + i] != pre[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # parse_size: decode the right-space-padded decimal-ASCII size field at `at`.
 #
 # the `ar` size field is `SIZE_LEN` bytes of decimal digits padded with trailing
-# spaces. non-digit bytes (the padding) terminate the scan. returns the decoded
-# byte count.
+# spaces. non-digit bytes (the padding) terminate the scan. a field with no
+# leading digit is malformed — `ok` is set false and the return value is unused.
 # ---
 # buf: the archive bytes
 # at:  offset of the size field
+# ok:  out — true if at least one leading digit was decoded
 # ret: the decoded member size in bytes
-fun parse_size(buf: *u8, at: usize) usize {
+fun parse_size(buf: *u8, at: usize, ok: *bool) usize {
     var v: usize = 0;
+    var n: usize = 0;
     var i: usize = 0;
     for (i < SIZE_LEN) {
         val c: u8 = buf[at + i];
-        if (c < '0' || c > '9') { ret v; }
+        if (c < '0' || c > '9') {
+            @ok = (n > 0);
+            ret v;
+        }
         v = v * 10 + (c - '0')::usize;
+        n = n + 1;
         i = i + 1;
     }
+    @ok = (n > 0);
     ret v;
 }
