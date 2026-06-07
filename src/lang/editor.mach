@@ -1,0 +1,512 @@
+# mach.lang.editor: the compiler-as-library query surface for editor tooling.
+#
+# the single entry every editor (LSP server, plugin) binds to. an editor
+# holds dirty, possibly-broken in-memory buffers and wants best-effort
+# analysis of one buffer at a time without a full `driver.build_project`.
+# this module is that path: register a buffer's TEXT directly, then ask for
+# its tokens, its parsed `ast.Ast`, its `res.ResolveResult` side tables,
+# or its diagnostics — each tolerant of a malformed buffer, each returning a
+# usable partial result rather than bailing at the first error.
+#
+# an `EditorSession` borrows a caller-owned `session.Session` (whose
+# `SourceMap` holds the buffer text and whose `DiagList` collects every
+# phase's diagnostics) and owns one `*ast.Ast` plus one `*res.ResolveResult`
+# per registered buffer, indexed by `source.FileId`. teardown frees those.
+#
+# diagnostics are the proven first consumer slice: `diagnostics` runs
+# tokenize -> emit-lex-errors -> parse and leaves every reported span on the
+# session's `DiagList` for the editor to translate into LSP `Diagnostic`s.
+# resolution layers the `ResolveResult` side tables on top for the
+# hover / go-to-def / references features that pivot on offset -> id lookup
+# (see `ast.offset_to_expr` and friends).
+#
+# this surface deliberately drives the front-end phases directly rather than
+# routing through `query.QueryDb.get(Q_PARSE / Q_RESOLVE)`: the derived query
+# shards are not registered until the query DB is wired into the build
+# (issue #1164). the buffer is still registered as a real source input whose
+# revision the `Q_FILE_TEXT` metadata source reads, so the incremental story
+# is preserved; the `get`-routed form of these entries lands with #1164
+# without changing this module's signatures.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use page: std.allocator.page;
+
+use sess:    mach.lang.session;
+use src:     mach.lang.source;
+use diag:    mach.lang.diagnostic;
+use lexer:   mach.lang.fe.lexer;
+use parser:  mach.lang.fe.parser;
+use res:     mach.lang.fe.resolve;
+use comptime: mach.lang.fe.comptime;
+use ast:     mach.lang.fe.ast;
+use id:      mach.lang.fe.ast.id;
+use intern:  mach.lang.intern;
+
+# Buffer: the per-file analysis state the editor session owns for one
+# registered buffer.
+# ---
+# file_id:  source FileId the buffer is registered under
+# in_use:   whether this slot holds a live buffer (slots are indexed by FileId)
+# a:        owned parsed Ast, or nil before the first `parse`
+# rr:       owned ResolveResult side tables, or nil before the first `resolve`
+# ctx:      comptime context resolve mutates; seeded with neutral host defaults
+pub rec Buffer {
+    file_id: src.FileId;
+    in_use:  bool;
+    a:       *ast.Ast;
+    rr:      *res.ResolveResult;
+    ctx:     comptime.ComptimeCtx;
+}
+
+# EditorSession: the editor-facing facade over a borrowed compiler session.
+# ---
+# s:        borrowed session; owns the SourceMap (buffer text) and DiagList
+# alloc:    allocator for the buffer registry and the per-buffer Ast / ResolveResult
+# buffers:  registry of Buffers indexed by FileId
+# buf_len:  number of slots in `buffers`
+pub rec EditorSession {
+    s:       *sess.Session;
+    alloc:   *Allocator;
+    buffers: *Buffer;
+    buf_len: u32;
+}
+
+# init: construct an editor session over a caller-owned compiler session.
+# the session must outlive the editor session; the editor borrows its
+# SourceMap and DiagList and never tears them down.
+# ---
+# s: the compiler session whose SourceMap and DiagList back this editor
+# ret: a new empty EditorSession
+pub fun init(s: *sess.Session) EditorSession {
+    var es: EditorSession;
+    es.s       = s;
+    es.alloc   = s.alloc;
+    es.buffers = nil;
+    es.buf_len = 0;
+    ret es;
+}
+
+# dnit: release every owned Ast, ResolveResult, and comptime context, plus
+# the buffer registry. the borrowed session is left untouched.
+# ---
+# es: the editor session to tear down; all owned fields are zeroed
+pub fun dnit(es: *EditorSession) {
+    if (es == nil) { ret; }
+    if (es.buffers != nil && es.buf_len > 0) {
+        var i: u32 = 0;
+        for (i < es.buf_len) {
+            free_buffer(es, ?es.buffers[i]);
+            i = i + 1;
+        }
+        deallocate[Buffer](es.alloc, es.buffers, es.buf_len::usize);
+    }
+    es.buffers = nil;
+    es.buf_len = 0;
+}
+
+# open: register an unsaved buffer's TEXT directly and return its FileId.
+# this is the editor's entry into the compiler without a build_project:
+# the text is loaded into the session's SourceMap (bumping the query DB
+# revision so any derived entry over this file invalidates), and a fresh
+# analysis slot is reserved for it. the buffer is not yet parsed.
+# ---
+# es:   the editor session
+# path: a display path for the buffer (the LSP document URI, or any label)
+# text: the buffer's full source text; copied into the session
+# ret:  the FileId the buffer is registered under, or an allocation error
+pub fun open(es: *EditorSession, path: str, text: str) Result[src.FileId, str] {
+    val fid_r: Result[src.FileId, str] = sess.load_source(es.s, path, text);
+    if (is_err[src.FileId, str](fid_r)) { ret fid_r; }
+    val fid: src.FileId = unwrap_ok[src.FileId, str](fid_r);
+
+    val br: Result[*Buffer, str] = ensure_slot(es, fid);
+    if (is_err[*Buffer, str](br)) { ret err[src.FileId, str](unwrap_err[*Buffer, str](br)); }
+
+    ret ok[src.FileId, str](fid);
+}
+
+# update: replace the text of an already-open buffer (an editor keystroke
+# edit). the session's SourceMap text is rebuilt and the query DB revision
+# bumped; the buffer's cached Ast and ResolveResult are dropped so the next
+# `parse` / `resolve` recomputes against the new text. out-of-range or
+# never-opened ids are a no-op returning false.
+# ---
+# es:   the editor session
+# fid:  FileId of the buffer to replace
+# text: the buffer's new full source text
+# ret:  true when the buffer was updated, false when fid is unknown, or an allocation error
+pub fun update(es: *EditorSession, fid: src.FileId, text: str) Result[bool, str] {
+    val b: *Buffer = slot(es, fid);
+    if (b == nil || !b.in_use) { ret ok[bool, str](false); }
+
+    val ur: Result[bool, str] = src.update(?es.s.sources, ?es.s.queries, fid, text);
+    if (is_err[bool, str](ur)) { ret ur; }
+    if (!unwrap_ok[bool, str](ur)) { ret ok[bool, str](false); }
+
+    drop_analysis(es, b);
+    ret ok[bool, str](true);
+}
+
+# tokenize: lex the buffer and surface any lex errors as diagnostics on the
+# session's DiagList. returns the owning TokenStream; the caller frees it
+# with `lexer.dnit`. malformed input is recorded, never aborted.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: the owning TokenStream, or an error when fid is unknown / on allocation failure
+pub fun tokenize(es: *EditorSession, fid: src.FileId) Result[lexer.TokenStream, str] {
+    val fopt: Option[*src.SourceFile] = src.get(?es.s.sources, fid);
+    if (is_none[*src.SourceFile](fopt)) {
+        ret err[lexer.TokenStream, str]("editor: buffer not open");
+    }
+    val file: *src.SourceFile = unwrap[*src.SourceFile](fopt);
+
+    val tr: Result[lexer.TokenStream, str] = lexer.tokenize(file.text, es.alloc, fid);
+    if (is_err[lexer.TokenStream, str](tr)) { ret tr; }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+
+    val er: Result[bool, str] = lexer.emit_diagnostics(?stream, ?es.s.diags);
+    if (is_err[bool, str](er)) {
+        lexer.dnit(?stream, es.alloc);
+        ret err[lexer.TokenStream, str](unwrap_err[bool, str](er));
+    }
+    ret ok[lexer.TokenStream, str](stream);
+}
+
+# parse: tokenize and parse the buffer best-effort, returning its `ast.Ast`.
+# lex errors and parse errors land on the session's DiagList; the AST is a
+# usable partial tree even for a broken buffer. the returned Ast is owned by
+# the editor session and cached for this buffer — repeated calls reparse and
+# replace the cached tree. drives `ast.offset_to_*` for position lookups.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the buffer's parsed Ast, or an error when fid is unknown / on allocation failure
+pub fun parse(es: *EditorSession, fid: src.FileId) Result[*ast.Ast, str] {
+    val b: *Buffer = slot(es, fid);
+    if (b == nil || !b.in_use) { ret err[*ast.Ast, str]("editor: buffer not open"); }
+
+    val tr: Result[lexer.TokenStream, str] = tokenize(es, fid);
+    if (is_err[lexer.TokenStream, str](tr)) { ret err[*ast.Ast, str](unwrap_err[lexer.TokenStream, str](tr)); }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+
+    drop_analysis(es, b);
+
+    val ar: Result[*ast.Ast, str] = alloc_ast(es, fid);
+    if (is_err[*ast.Ast, str](ar)) {
+        lexer.dnit(?stream, es.alloc);
+        ret ar;
+    }
+    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](ar);
+
+    parser.parse(?stream, a, ?es.s.diags);
+    lexer.dnit(?stream, es.alloc);
+
+    b.a = a;
+    ret ok[*ast.Ast, str](a);
+}
+
+# resolve: name-resolve the buffer best-effort, returning its
+# `res.ResolveResult` side tables (expr_resolved / type_resolved /
+# decl_symbol). parses first if needed. dependencies are not resolved — the
+# buffer is analyzed in isolation with an empty dep set, so cross-module
+# references resolve to SYMBOL_NIL while everything local still binds. name
+# errors land on the session's DiagList; the side tables remain usable. the
+# returned ResolveResult is owned by the editor session and cached.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the buffer's ResolveResult, or an error when fid is unknown / on allocation failure
+pub fun resolve(es: *EditorSession, fid: src.FileId) Result[*res.ResolveResult, str] {
+    val b: *Buffer = slot(es, fid);
+    if (b == nil || !b.in_use) { ret err[*res.ResolveResult, str]("editor: buffer not open"); }
+
+    if (b.a == nil) {
+        val pr: Result[*ast.Ast, str] = parse(es, fid);
+        if (is_err[*ast.Ast, str](pr)) { ret err[*res.ResolveResult, str](unwrap_err[*ast.Ast, str](pr)); }
+    }
+
+    if (b.rr != nil) {
+        res.dnit_result(b.rr);
+        deallocate[res.ResolveResult](es.alloc, b.rr, 1);
+        b.rr = nil;
+    }
+
+    seed_ctx(es, b);
+
+    var deps: res.ResolveDeps;
+    deps.entries = nil;
+    deps.count   = 0;
+
+    val rr_r: Result[res.ResolveResult, str] = res.resolve(es.s, b.a, ?deps, ?b.ctx, fid::sess.ModuleId);
+    if (is_err[res.ResolveResult, str](rr_r)) { ret err[*res.ResolveResult, str](unwrap_err[res.ResolveResult, str](rr_r)); }
+
+    val rr: Result[*res.ResolveResult, str] = allocate[res.ResolveResult](es.alloc, 1);
+    if (is_err[*res.ResolveResult, str](rr)) {
+        var local: res.ResolveResult = unwrap_ok[res.ResolveResult, str](rr_r);
+        res.dnit_result(?local);
+        ret rr;
+    }
+    val slot_rr: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](rr);
+    @slot_rr = unwrap_ok[res.ResolveResult, str](rr_r);
+    b.rr = slot_rr;
+    ret ok[*res.ResolveResult, str](slot_rr);
+}
+
+# diagnostics: the first consumer slice — analyze the buffer and return the
+# session's DiagList holding every reported diagnostic's `(severity, span,
+# message)`. runs tokenize -> emit-lex-errors -> parse, so the list reflects
+# the buffer's syntactic diagnostics; the editor reads `items[].span` and
+# maps each through `source.position` into an LSP range. the DiagList is
+# borrowed from the session and reset on entry so the result reflects only
+# this buffer's current analysis.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the session DiagList, or an error when fid is unknown / on allocation failure
+pub fun diagnostics(es: *EditorSession, fid: src.FileId) Result[*diag.DiagList, str] {
+    diag.dnit(?es.s.diags);
+    es.s.diags = diag.init(es.alloc);
+
+    val pr: Result[*ast.Ast, str] = parse(es, fid);
+    if (is_err[*ast.Ast, str](pr)) { ret err[*diag.DiagList, str](unwrap_err[*ast.Ast, str](pr)); }
+
+    ret ok[*diag.DiagList, str](?es.s.diags);
+}
+
+# ast_of: the buffer's cached parsed Ast, or nil when it has not been parsed.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: borrowed pointer to the cached Ast, or nil
+pub fun ast_of(es: *EditorSession, fid: src.FileId) *ast.Ast {
+    val b: *Buffer = slot(es, fid);
+    if (b == nil || !b.in_use) { ret nil; }
+    ret b.a;
+}
+
+# resolve_of: the buffer's cached ResolveResult, or nil when it has not been
+# resolved.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: borrowed pointer to the cached ResolveResult, or nil
+pub fun resolve_of(es: *EditorSession, fid: src.FileId) *res.ResolveResult {
+    val b: *Buffer = slot(es, fid);
+    if (b == nil || !b.in_use) { ret nil; }
+    ret b.rr;
+}
+
+# slot: the Buffer for a FileId, or nil when the id is out of the registry's range.
+fun slot(es: *EditorSession, fid: src.FileId) *Buffer {
+    if (es.buffers == nil || fid::u32 >= es.buf_len) { ret nil; }
+    ret ?es.buffers[fid::u32];
+}
+
+# ensure_slot: grow the buffer registry to cover `fid` and mark its slot in
+# use, returning a pointer to it. new slots between the old length and `fid`
+# are zeroed and left free.
+fun ensure_slot(es: *EditorSession, fid: src.FileId) Result[*Buffer, str] {
+    val needed: u32 = fid::u32 + 1;
+    if (needed > es.buf_len) {
+        var new_len: u32 = es.buf_len;
+        if (new_len == 0) { new_len = 8; }
+        for (new_len < needed) { new_len = new_len * 2; }
+
+        if (es.buffers == nil) {
+            val r: Result[*Buffer, str] = allocate[Buffer](es.alloc, new_len::usize);
+            if (is_err[*Buffer, str](r)) { ret r; }
+            es.buffers = unwrap_ok[*Buffer, str](r);
+        }
+        or {
+            val r: Result[*Buffer, str] = reallocate[Buffer](es.alloc, es.buffers, es.buf_len::usize, new_len::usize);
+            if (is_err[*Buffer, str](r)) { ret r; }
+            es.buffers = unwrap_ok[*Buffer, str](r);
+        }
+
+        var z: u32 = es.buf_len;
+        for (z < new_len) {
+            val nb: *Buffer = ?es.buffers[z];
+            nb.file_id = z::src.FileId;
+            nb.in_use  = false;
+            nb.a       = nil;
+            nb.rr      = nil;
+            nb.ctx     = comptime.init(es.alloc, 0, 0, 8, intern.STR_NIL, intern.STR_NIL);
+            z = z + 1;
+        }
+        es.buf_len = new_len;
+    }
+
+    val b: *Buffer = ?es.buffers[fid::u32];
+    if (b.in_use) {
+        drop_analysis(es, b);
+    }
+    b.file_id = fid;
+    b.in_use  = true;
+    ret ok[*Buffer, str](b);
+}
+
+# alloc_ast: heap a fresh empty Ast for the buffer so the editor can hand
+# back a stable `*ast.Ast` and free it on teardown.
+fun alloc_ast(es: *EditorSession, fid: src.FileId) Result[*ast.Ast, str] {
+    val r: Result[*ast.Ast, str] = allocate[ast.Ast](es.alloc, 1);
+    if (is_err[*ast.Ast, str](r)) { ret r; }
+    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](r);
+    @a = ast.init(es.alloc, fid);
+    ret ok[*ast.Ast, str](a);
+}
+
+# seed_ctx: (re)initialize the buffer's comptime context with neutral host
+# defaults. the editor resolves a buffer in isolation, so no target params or
+# imported constants are bound; `$if` predicates evaluate against the host
+# os / arch only. resets any prior context first.
+fun seed_ctx(es: *EditorSession, b: *Buffer) {
+    comptime.dnit(?b.ctx);
+    b.ctx = comptime.init(es.alloc, 0, 0, 8, intern.STR_NIL, intern.STR_NIL);
+}
+
+# drop_analysis: free a buffer's cached Ast, ResolveResult, and comptime
+# context, leaving the slot in use with empty analysis.
+fun drop_analysis(es: *EditorSession, b: *Buffer) {
+    if (b.rr != nil) {
+        res.dnit_result(b.rr);
+        deallocate[res.ResolveResult](es.alloc, b.rr, 1);
+        b.rr = nil;
+    }
+    if (b.a != nil) {
+        ast.dnit(b.a);
+        deallocate[ast.Ast](es.alloc, b.a, 1);
+        b.a = nil;
+    }
+    comptime.dnit(?b.ctx);
+}
+
+# free_buffer: fully release a registry slot, including its analysis.
+fun free_buffer(es: *EditorSession, b: *Buffer) {
+    if (!b.in_use) { ret; }
+    drop_analysis(es, b);
+    b.in_use = false;
+}
+
+# t_session: build a Session over a page allocator for the editor tests, or
+# ret 1 from the caller on failure.
+fun t_session(alloc: *Allocator) Result[sess.Session, str] {
+    page.make(alloc);
+    ret sess.init(alloc);
+}
+
+test "editor: single-file entry parses a clean buffer with no diagnostics" {
+    var alloc: Allocator;
+    val sr: Result[sess.Session, str] = t_session(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+    var es: EditorSession = init(?s);
+
+    val fr: Result[src.FileId, str] = open(?es, "buf.mach", "fun f(a: i64) i64 { ret a; }\n");
+    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+
+    val ar: Result[*ast.Ast, str] = parse(?es, fid);
+    if (is_err[*ast.Ast, str](ar)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](ar);
+    if (a.decl_len == 0) { dnit(?es); sess.dnit(?s); ret 1; }
+
+    val dr: Result[*diag.DiagList, str] = diagnostics(?es, fid);
+    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    if (diag.has_errors(unwrap_ok[*diag.DiagList, str](dr))) { dnit(?es); sess.dnit(?s); ret 1; }
+
+    dnit(?es);
+    sess.dnit(?s);
+    ret 0;
+}
+
+test "editor: broken buffer yields partial AST + diagnostics, never bails" {
+    var alloc: Allocator;
+    val sr: Result[sess.Session, str] = t_session(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+    var es: EditorSession = init(?s);
+
+    # a missing ')' plus a stray backtick: the parser recovers and the lexer
+    # records the bad char, so we expect both error diagnostics AND a usable
+    # partial AST that still contains the broken function decl.
+    val fr: Result[src.FileId, str] = open(?es, "broken.mach", "fun g(a: i64 { ret a ` ; }\n");
+    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+
+    val dr: Result[*diag.DiagList, str] = diagnostics(?es, fid);
+    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val list: *diag.DiagList = unwrap_ok[*diag.DiagList, str](dr);
+    if (!diag.has_errors(list)) { dnit(?es); sess.dnit(?s); ret 1; }
+
+    val a: *ast.Ast = ast_of(?es, fid);
+    if (a == nil) { dnit(?es); sess.dnit(?s); ret 1; }
+    if (a.decl_len == 0) { dnit(?es); sess.dnit(?s); ret 1; }
+
+    # offset 0 falls on the `fun g` declaration; the partial tree still
+    # answers an offset -> id query.
+    if (ast.offset_to_decl(a, 2) == id.DECL_NIL) { dnit(?es); sess.dnit(?s); ret 1; }
+
+    # resolve still produces usable side tables over the broken buffer.
+    val rr: Result[*res.ResolveResult, str] = resolve(?es, fid);
+    if (is_err[*res.ResolveResult, str](rr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val rrp: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](rr);
+    if (rrp.decl_count != a.decl_len::u32) { dnit(?es); sess.dnit(?s); ret 1; }
+
+    dnit(?es);
+    sess.dnit(?s);
+    ret 0;
+}
+
+test "editor: update drops cached analysis and reparses against new text" {
+    var alloc: Allocator;
+    val sr: Result[sess.Session, str] = t_session(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+    var es: EditorSession = init(?s);
+
+    val fr: Result[src.FileId, str] = open(?es, "buf.mach", "fun a() {}\n");
+    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+
+    val p1: Result[*ast.Ast, str] = parse(?es, fid);
+    if (is_err[*ast.Ast, str](p1)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val n1: usize = unwrap_ok[*ast.Ast, str](p1).decl_len;
+
+    val ur: Result[bool, str] = update(?es, fid, "fun a() {}\nfun b() {}\n");
+    if (is_err[bool, str](ur)) { dnit(?es); sess.dnit(?s); ret 1; }
+    if (!unwrap_ok[bool, str](ur)) { dnit(?es); sess.dnit(?s); ret 1; }
+    # the cached AST is dropped on update.
+    if (ast_of(?es, fid) != nil) { dnit(?es); sess.dnit(?s); ret 1; }
+
+    val p2: Result[*ast.Ast, str] = parse(?es, fid);
+    if (is_err[*ast.Ast, str](p2)) { dnit(?es); sess.dnit(?s); ret 1; }
+    if (unwrap_ok[*ast.Ast, str](p2).decl_len <= n1) { dnit(?es); sess.dnit(?s); ret 1; }
+
+    dnit(?es);
+    sess.dnit(?s);
+    ret 0;
+}
