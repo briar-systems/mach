@@ -44,6 +44,7 @@ with `mach.toml has no [targets.<name>] entries`.
 | `binary`     | string | yes      | —        | Output path of the linked binary, relative to `<dir_out>` (e.g. `"linux/bin/mach"`). Required for **every** target, even in library mode where no binary is linked. |
 | `artifacts`  | string | no       | `<name>` | Subdirectory under `<dir_out>` holding the per-module object tree (`obj/`) and any `--emit-asm` / `--emit-ir` output. Defaults to the target name; may be nested (e.g. `"smach/linux"`). |
 | `mode`       | string | no       | `"executable"` | `"executable"` links the per-module objects into a static binary; `"library"` stops at the objects (no link). Any value other than `"library"` is treated as `"executable"`. |
+| `opt`        | string | no       | — (debug) | Default optimization level for this target. `"O0"` / `"debug"` selects the debug pipeline; `"O1"` / `"O2"` / `"release"` selects the release pipeline. An absent key leaves the build at its own default (debug). A CLI `-O0` / `-O1` / `-O2` / `--release` flag overrides this per invocation. Any other value is a manifest error. See the accepted set below. |
 | `libs`       | array of strings | no | `[]` | Project-level external link inputs. Each entry is either an explicit object/archive path (a `.o` or `.a`, project-root-relative or absolute) or a bare `-l`-style name resolved to a `lib<name>.o` / `<name>.o` / `lib<name>.a` / `<name>.a` at link time. These join every `mach build`/`run`/`test` link in addition to any CLI `-L`/`-l`/object arguments. A non-array value, or a non-string element, is a manifest error. The alias `link` is accepted when `libs` is absent. |
 
 Informational (parsed by TOML, not read by the build): `abi`. The ABI is derived
@@ -82,6 +83,20 @@ Any other value resolves to "unknown" and fails target selection.
 |--------------|--------|
 | `executable` | default; link the objects into a static binary at `<dir_out>/<binary>` |
 | `library`    | leave the per-module objects as the deliverable; no binary is linked |
+
+### Accepted `opt` values
+
+| Value     | Pipeline |
+|-----------|----------|
+| `O0`      | debug — the default; mem2reg, constfold, dce |
+| `debug`   | debug — alias of `O0` |
+| `O1`      | release |
+| `O2`      | release — alias of `O1` |
+| `release` | release — alias of `O1` / `O2` |
+
+`opt` sets the target's **default** optimization level. A CLI `-O0` / `-O1` /
+`-O2` / `--release` flag on `mach build` / `run` / `test` overrides it for that
+invocation; with no flag and no `opt` key, the build uses the debug pipeline.
 
 The single fully-supported triple today is `os = "linux"`, `isa = "x86_64"`
 (SysV ABI, ELF objects). The other recognized values pass manifest parsing and
@@ -137,6 +152,7 @@ mode       = "executable"     # executable (default) | library
 entrypoint = "main.mach"      # entry module: mach.main, under src/
 artifacts  = "linux"          # objects under out/linux/obj/...
 binary     = "linux/bin/mach" # linked binary at out/linux/bin/mach
+# opt      = "O2"             # optional default opt level (CLI -O* overrides)
 # libs     = ["build/libfoo.o", "bar"]  # optional external link inputs
 
 [deps.mach-std]
