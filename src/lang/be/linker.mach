@@ -112,6 +112,27 @@ rec SymbolLoc {
     vaddr: u64;
 }
 
+# the linker's mutable dynamic-link state: the format-neutral plan (`of.DynamicInfo`)
+# being assembled plus the import call-site fixups (`of.PltFixup`) collected during
+# relocation patching, and the map from an imported symbol name to its index in the
+# plan's import array. empty for a static link; the writer consumes `info` + the
+# fixups. owns the `info.libs` / `info.imports` arrays and the fixup array.
+# ---
+# info:        the dynamic-link plan handed to `emit_dyn_exec`
+# import_map:  imported symbol name -> index into `info.imports`, for the patch pass
+# fixups:      collected import call-site fixups
+# fixup_count: number of fixups
+# fixup_cap:   capacity of the fixup array
+# active:      true once `build_dynamic_info` populated the plan (a dynamic link)
+rec DynState {
+    info:        of.DynamicInfo;
+    import_map:  map.Map[intern.StrId, u32];
+    fixups:      *of.PltFixup;
+    fixup_count: u32;
+    fixup_cap:   u32;
+    active:      bool;
+}
+
 # link: read the input object files from disk and combine them into the
 # requested artifact.
 #
@@ -120,18 +141,30 @@ rec SymbolLoc {
 # definitions), lays out the concatenated sections, and either (executable)
 # assigns virtual addresses, patches relocations, and writes page-aligned load
 # segments through `tgt.of.emit_exec`, or (library / relocatable) carries the
-# input relocations forward and writes a single merged object through
-# `obj.emit`. `LINK_SHARED` is not yet supported.
+# input relocations forward and writes a single merged object through `obj.emit`.
+#
+# DYNAMIC vs STATIC resolution of an undefined `ext` symbol: when no shared
+# dependencies are supplied (`soname_count == 0`) every undefined `ext` must be
+# satisfied by an input object/archive or the link fails — the fully static path,
+# emitted byte-for-byte as before through `emit_exec`. when shared dependencies
+# are supplied, any `ext` left undefined after merging is taken as a DYNAMIC
+# import bound at run time against those libraries, and the executable is emitted
+# through the format's `emit_dyn_exec` (ELF: PT_INTERP + .dynamic/PLT/GOT). a
+# static input definition always wins over a dynamic import of the same name.
+# `LINK_SHARED` (producing a shared object) is not yet supported.
 # ---
-# s:         shared session (allocator, interner, diagnostics)
-# tgt:       active target — selects OS base address, entry symbol, and writers
-# obj_paths: array of null-terminated paths to the per-module object files
-# obj_count: number of input object files
-# out_path:  null-terminated output file path
-# mode:      executable, relocatable (library), or shared
-# ret:       true once the artifact is written, or an error string
+# s:            shared session (allocator, interner, diagnostics)
+# tgt:          active target — selects OS base address, entry symbol, and writers
+# obj_paths:    array of null-terminated paths to the per-module object files
+# obj_count:    number of input object files
+# sonames:      interned shared-library sonames to depend on dynamically (or nil)
+# soname_count: number of shared-library dependencies
+# out_path:     null-terminated output file path
+# mode:         executable, relocatable (library), or shared
+# ret:          true once the artifact is written, or an error string
 pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
-             obj_count: u32, out_path: *u8, mode: LinkMode) Result[bool, str] {
+             obj_count: u32, sonames: *intern.StrId, soname_count: u32,
+             out_path: *u8, mode: LinkMode) Result[bool, str] {
     if (s == nil)   { ret err[bool, str]("link: nil session"); }
     if (tgt == nil) { ret err[bool, str]("link: nil target"); }
     if (tgt.of == nil) { ret err[bool, str]("link: target has no object-format vtable"); }
@@ -142,6 +175,9 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     if (obj_paths == nil || obj_count == 0) {
         ret err[bool, str]("link: no input objects");
     }
+    # a dynamic link is requested when shared dependencies are present and the
+    # output is an executable; libraries/relocatables ignore dependencies.
+    val dynamic: bool = (mode == LINK_EXE) && (soname_count > 0);
 
     val alloc: *Allocator = s.alloc;
 
@@ -244,9 +280,29 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     # executable: resolve+patch relocations into the merged bytes, then write the
     # page-aligned load segments through the format's executable writer.
     if (mode == LINK_EXE) {
+        # the dynamic-link plan. for a static link `dyn` stays empty and every
+        # undefined `ext` must resolve against an input object, exactly as before;
+        # for a dynamic link the unresolved externs become imports and a relocation
+        # targeting one is recorded as a `PltFixup` instead of erroring.
+        var dyn: DynState;
+        init_dynstate(?dyn);
+        if (dynamic) {
+            val dr: Result[bool, str] =
+                build_dynamic_info(s, tgt, ?dyn, modules, module_count, ?sym_locs, sonames, soname_count);
+            if (is_err[bool, str](dr)) {
+                free_dynstate(alloc, ?dyn);
+                obj.dnit(?out_img);
+                map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+                free_scratch(alloc, placements, sec_total, sec_base, module_count);
+                free_modules(alloc, modules, module_count);
+                ret err[bool, str](unwrap_err[bool, str](dr));
+            }
+        }
+
         val patch_r: Result[bool, str] =
-            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, ?sym_locs);
+            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, ?sym_locs, ?dyn);
         if (is_err[bool, str](patch_r)) {
+            free_dynstate(alloc, ?dyn);
             obj.dnit(?out_img);
             map.dnit[intern.StrId, SymbolLoc](?sym_locs);
             free_scratch(alloc, placements, sec_total, sec_base, module_count);
@@ -254,9 +310,15 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
             ret err[bool, str](unwrap_err[bool, str](patch_r));
         }
 
-        val emit_r: Result[bool, str] =
-            emit_executable(s, tgt, ?out_img, ?merged[0], ?sym_locs, out_path);
+        var emit_r: Result[bool, str] = ok[bool, str](true);
+        if (dynamic) {
+            emit_r = emit_dynamic_executable(s, tgt, ?out_img, ?merged[0], ?sym_locs, ?dyn, out_path);
+        }
+        or {
+            emit_r = emit_executable(s, tgt, ?out_img, ?merged[0], ?sym_locs, out_path);
+        }
 
+        free_dynstate(alloc, ?dyn);
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count);
@@ -527,32 +589,111 @@ fun emit_executable(s: *sess.Session, tgt: *target.Target, out_img: *of.ObjectIm
 
     val alloc: *Allocator = s.alloc;
 
-    # resolve the program entry point to the OS entry symbol's virtual address.
+    val er: Result[u64, str] = entry_vaddr(s, tgt, sym_locs);
+    if (is_err[u64, str](er)) { ret err[bool, str](unwrap_err[u64, str](er)); }
+    val entry: u64 = unwrap_ok[u64, str](er);
+
+    var seg_count: u32 = 0;
+    val sr: Result[*of.LoadSegment, str] = build_load_segments(alloc, out_img, merged, ?seg_count);
+    if (is_err[*of.LoadSegment, str](sr)) { ret err[bool, str](unwrap_err[*of.LoadSegment, str](sr)); }
+    val segs: *of.LoadSegment = unwrap_ok[*of.LoadSegment, str](sr);
+
+    val emit_r: Result[bool, str] =
+        tgt.of.emit_exec(alloc, tgt.arch, segs, seg_count, entry, out_path);
+
+    deallocate[of.LoadSegment](alloc, segs, seg_count::usize);
+
+    if (is_err[bool, str](emit_r)) {
+        ret err[bool, str](unwrap_err[bool, str](emit_r));
+    }
+    ret ok[bool, str](true);
+}
+
+# emit_dynamic_executable: lay the merged sections out as load segments and write
+# the dynamically-linked executable through the format's `emit_dyn_exec`,
+# handing it the dynamic plan and the import call-site fixups so it can frame the
+# format's dynamic-linking structures (ELF PT_INTERP/.dynamic/PLT/GOT) and
+# redirect each fixup to its import's call-thunk. the segment layout and entry
+# resolution are identical to the static path; only the writer differs. an
+# object format with no dynamic-link writer is rejected.
+# ---
+# s:        shared session (allocator, interner)
+# tgt:      active target — supplies the entry symbol and dynamic-exec writer
+# out_img:  the merged image holding the patched section bytes
+# merged:   the per-kind merged-section accumulators (carry vaddrs and lengths)
+# sym_locs: resolved symbol table, for the entry address
+# dyn:      the dynamic-link plan + collected import call-site fixups
+# out_path: null-terminated output file path
+# ret:      true once the executable is written, or an error string
+fun emit_dynamic_executable(s: *sess.Session, tgt: *target.Target, out_img: *of.ObjectImage,
+                            merged: *MergedSection, sym_locs: *map.Map[intern.StrId, SymbolLoc],
+                            dyn: *DynState, out_path: *u8) Result[bool, str] {
+    if (tgt.of.emit_dyn_exec == nil) {
+        ret err[bool, str]("link: object format cannot write dynamically-linked executables");
+    }
+    if (tgt.os == nil) {
+        ret err[bool, str]("link: target has no operating-system vtable");
+    }
+
+    val alloc: *Allocator = s.alloc;
+
+    val er: Result[u64, str] = entry_vaddr(s, tgt, sym_locs);
+    if (is_err[u64, str](er)) { ret err[bool, str](unwrap_err[u64, str](er)); }
+    val entry: u64 = unwrap_ok[u64, str](er);
+
+    var seg_count: u32 = 0;
+    val sr: Result[*of.LoadSegment, str] = build_load_segments(alloc, out_img, merged, ?seg_count);
+    if (is_err[*of.LoadSegment, str](sr)) { ret err[bool, str](unwrap_err[*of.LoadSegment, str](sr)); }
+    val segs: *of.LoadSegment = unwrap_ok[*of.LoadSegment, str](sr);
+
+    val emit_r: Result[bool, str] =
+        tgt.of.emit_dyn_exec(alloc, tgt.arch, segs, seg_count, entry,
+                             ?dyn.info, dyn.fixups, dyn.fixup_count, out_path);
+
+    deallocate[of.LoadSegment](alloc, segs, seg_count::usize);
+
+    if (is_err[bool, str](emit_r)) {
+        ret err[bool, str](unwrap_err[bool, str](emit_r));
+    }
+    ret ok[bool, str](true);
+}
+
+# entry_vaddr: resolve the program entry point to the OS entry symbol's virtual
+# address. an undefined or missing entry symbol is an error.
+fun entry_vaddr(s: *sess.Session, tgt: *target.Target,
+                sym_locs: *map.Map[intern.StrId, SymbolLoc]) Result[u64, str] {
     val entry_name: intern.StrId = tgt.os.entry_symbol;
     val el: Result[*SymbolLoc, str] =
         map.get[intern.StrId, SymbolLoc](sym_locs, ?entry_name);
     if (is_err[*SymbolLoc, str](el)) {
-        ret err[bool, str](entry_message(s, entry_name));
+        ret err[u64, str](entry_message(s, entry_name));
     }
-    val entry: u64 = unwrap_ok[*SymbolLoc, str](el).vaddr;
+    ret ok[u64, str](unwrap_ok[*SymbolLoc, str](el).vaddr);
+}
 
-    # one load segment per used loadable merged kind, in canonical
-    # (ascending-vaddr) order.
-    var seg_count: u32 = 0;
+# build_load_segments: build one `of.LoadSegment` per used loadable merged kind
+# (text, rodata, data, bss — debug is non-allocated and excluded), in canonical
+# (ascending-vaddr) order, writing the segment count through `seg_count`. each
+# segment's bytes are the already-patched merged-section content, its vaddr the
+# kind's assigned base, its permissions derived from the kind; bss carries memory
+# but no file bytes. the caller frees the returned array by `seg_count`.
+fun build_load_segments(alloc: *Allocator, out_img: *of.ObjectImage, merged: *MergedSection,
+                        seg_count: *u32) Result[*of.LoadSegment, str] {
+    var count: u32 = 0;
     var k: u32 = 0;
     for (k < MERGED_KIND_COUNT) {
         if (is_loadable_kind(merged[k].kind) && merged[k].used && merged[k].len > 0) {
-            seg_count = seg_count + 1;
+            count = count + 1;
         }
         k = k + 1;
     }
-    if (seg_count == 0) {
-        ret err[bool, str]("link: no loadable sections");
+    if (count == 0) {
+        ret err[*of.LoadSegment, str]("link: no loadable sections");
     }
 
-    val sr: Result[*of.LoadSegment, str] = zallocate[of.LoadSegment](alloc, seg_count::usize);
+    val sr: Result[*of.LoadSegment, str] = zallocate[of.LoadSegment](alloc, count::usize);
     if (is_err[*of.LoadSegment, str](sr)) {
-        ret err[bool, str](unwrap_err[*of.LoadSegment, str](sr));
+        ret err[*of.LoadSegment, str](unwrap_err[*of.LoadSegment, str](sr));
     }
     val segs: *of.LoadSegment = unwrap_ok[*of.LoadSegment, str](sr);
 
@@ -577,15 +718,8 @@ fun emit_executable(s: *sess.Session, tgt: *target.Target, out_img: *of.ObjectIm
         k = k + 1;
     }
 
-    val emit_r: Result[bool, str] =
-        tgt.of.emit_exec(alloc, tgt.arch, segs, seg_count, entry, out_path);
-
-    deallocate[of.LoadSegment](alloc, segs, seg_count::usize);
-
-    if (is_err[bool, str](emit_r)) {
-        ret err[bool, str](unwrap_err[bool, str](emit_r));
-    }
-    ret ok[bool, str](true);
+    @seg_count = count;
+    ret ok[*of.LoadSegment, str](segs);
 }
 
 # is_loadable_kind: whether a merged section kind becomes a loadable executable
@@ -866,7 +1000,10 @@ fun build_merged_image(s: *sess.Session, out_img: *of.ObjectImage,
 # patch_relocations: resolve each input relocation to its target symbol's final
 # virtual address and write the patched value into the merged section bytes.
 # absolute kinds store `sym + addend`; pc-relative kinds store
-# `sym + addend - patch_addr`. an undefined target symbol is an error.
+# `sym + addend - patch_addr`. an undefined target symbol is an error UNLESS it is
+# a dynamic import (`dyn.active`), in which case a pc-relative call site is
+# recorded as a `PltFixup` for the writer to redirect to the import's PLT stub
+# and patching is deferred.
 #
 # a relocation in module `m` references its target symbol by name, but a LOCAL
 # (object-private) target is resolved against module `m`'s own definition — never
@@ -876,7 +1013,8 @@ fun build_merged_image(s: *sess.Session, out_img: *of.ObjectImage,
 fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
                      modules: *of.ObjectImage, module_count: u32,
                      placements: *Placement, sec_base: *u32,
-                     sym_locs: *map.Map[intern.StrId, SymbolLoc]) Result[bool, str] {
+                     sym_locs: *map.Map[intern.StrId, SymbolLoc],
+                     dyn: *DynState) Result[bool, str] {
     # intern the abstract relocation-kind names once for fast comparison.
     val kinds: RelocKindIds = intern_reloc_kinds(s);
 
@@ -886,6 +1024,17 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
         for (ri < modules[m].reloc_count) {
             val r: *of.Relocation = ?modules[m].relocations[ri];
             if (r.section >= modules[m].section_count) { ri = ri + 1; cnt; }
+
+            # the patch site's location in the merged image. the placement's
+            # merged_index is a section *kind*; map it to the output-section index.
+            val flat: u32 = sec_base[m] + r.section;
+            val pl: *Placement = ?placements[flat];
+            val patch_va: u64 = pl.vaddr + r.offset::u64;
+            val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
+            if (out_ix == 0xFFFFFFFF) { ri = ri + 1; cnt; }
+            val dst: *u8 = out_img.sections[out_ix].bytes;
+            if (dst == nil) { ri = ri + 1; cnt; }
+            val patch_off: u32 = pl.offset + r.offset;
 
             # locate the target symbol's final virtual address. a LOCAL target is
             # private to module `m`; resolve it against `m`'s own definition.
@@ -899,23 +1048,24 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
             or {
                 val sl: Result[*SymbolLoc, str] =
                     map.get[intern.StrId, SymbolLoc](sym_locs, ?r.symbol);
-                if (is_err[*SymbolLoc, str](sl)) {
+                if (is_ok[*SymbolLoc, str](sl)) {
+                    sym_va = unwrap_ok[*SymbolLoc, str](sl).vaddr;
+                }
+                or {
+                    # not defined anywhere: a dynamic import, or a hard error. a
+                    # pc-relative call to an import is deferred to the writer; any
+                    # other unresolved reference is rejected.
+                    val imp: Result[u32, str] = dynstate_import_index(dyn, r.symbol);
+                    if (is_ok[u32, str](imp) && is_call_kind(?kinds, r.kind)) {
+                        val rec_r: Result[bool, str] = dynstate_add_fixup(s, dyn,
+                            segment_index_for(out_img, out_ix), patch_off,
+                            unwrap_ok[u32, str](imp), patch_va, r.addend);
+                        if (is_err[bool, str](rec_r)) { ret err[bool, str](unwrap_err[bool, str](rec_r)); }
+                        ri = ri + 1; cnt;
+                    }
                     ret err[bool, str](undef_message(s, r.symbol));
                 }
-                sym_va = unwrap_ok[*SymbolLoc, str](sl).vaddr;
             }
-
-            # compute the patch site's virtual address and its byte location in
-            # the merged image. the placement's merged_index is a section *kind*;
-            # map it to the compacted output-section index.
-            val flat: u32 = sec_base[m] + r.section;
-            val pl: *Placement = ?placements[flat];
-            val patch_va: u64 = pl.vaddr + r.offset::u64;
-            val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
-            if (out_ix == 0xFFFFFFFF) { ri = ri + 1; cnt; }
-            val dst: *u8 = out_img.sections[out_ix].bytes;
-            if (dst == nil) { ri = ri + 1; cnt; }
-            val patch_off: u32 = pl.offset + r.offset;
 
             val pr: Result[bool, str] =
                 apply_one(s, ?kinds, r.kind, dst, patch_off, out_img.sections[out_ix].len, sym_va, r.addend, patch_va, m, r.offset);
@@ -927,6 +1077,193 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
         }
         m = m + 1;
     }
+    ret ok[bool, str](true);
+}
+
+# init_dynstate: reset a DynState to the empty (static-link) state. its plan and
+# fixup array are populated only when a dynamic link is requested.
+fun init_dynstate(dyn: *DynState) {
+    dyn.info.libs         = nil;
+    dyn.info.lib_count    = 0;
+    dyn.info.imports      = nil;
+    dyn.info.import_count = 0;
+    dyn.info.interp       = intern.STR_NIL;
+    dyn.fixups            = nil;
+    dyn.fixup_count       = 0;
+    dyn.fixup_cap         = 0;
+    dyn.active            = false;
+}
+
+# free_dynstate: release the plan arrays, the fixup array, and the import map. a
+# no-op on the empty (static) state.
+fun free_dynstate(alloc: *Allocator, dyn: *DynState) {
+    if (dyn.info.libs != nil && dyn.info.lib_count > 0) {
+        deallocate[of.DynLib](alloc, dyn.info.libs, dyn.info.lib_count::usize);
+    }
+    if (dyn.info.imports != nil && dyn.info.import_count > 0) {
+        deallocate[of.DynImport](alloc, dyn.info.imports, dyn.info.import_count::usize);
+    }
+    if (dyn.fixups != nil && dyn.fixup_cap > 0) {
+        deallocate[of.PltFixup](alloc, dyn.fixups, dyn.fixup_cap::usize);
+    }
+    if (dyn.active) {
+        map.dnit[intern.StrId, u32](?dyn.import_map);
+    }
+    init_dynstate(dyn);
+}
+
+# build_dynamic_info: assemble the dynamic-link plan from the shared dependencies
+# and the undefined `ext` symbols left after symbol merging.
+#
+# every soname becomes a `DynLib` (a DT_NEEDED dependency, in input order). every
+# global `ext` symbol that no input object defines (not in `sym_locs`) becomes a
+# function `DynImport`, deduplicated by name through `import_map`; a relocation
+# targeting it is later bound to its PLT stub. the loader's global search resolves
+# each import against the dependencies, so imports are not pinned to a specific
+# library (`DYNLIB_ANY`). the interpreter path comes from the OS vtable; without
+# one the OS has no dynamic-link support and the link is rejected.
+fun build_dynamic_info(s: *sess.Session, tgt: *target.Target, dyn: *DynState,
+                       modules: *of.ObjectImage, module_count: u32,
+                       sym_locs: *map.Map[intern.StrId, SymbolLoc],
+                       sonames: *intern.StrId, soname_count: u32) Result[bool, str] {
+    val alloc: *Allocator = s.alloc;
+
+    val interp: intern.StrId = tgt.os.dynamic_linker;
+    if (interp == intern.STR_NIL) {
+        ret err[bool, str]("link: target OS has no dynamic loader for a dynamic link");
+    }
+    dyn.info.interp = interp;
+
+    # one DynLib per soname, in input order.
+    if (soname_count > 0) {
+        val lr: Result[*of.DynLib, str] = zallocate[of.DynLib](alloc, soname_count::usize);
+        if (is_err[*of.DynLib, str](lr)) { ret err[bool, str](unwrap_err[*of.DynLib, str](lr)); }
+        dyn.info.libs = unwrap_ok[*of.DynLib, str](lr);
+        var i: u32 = 0;
+        for (i < soname_count) {
+            dyn.info.libs[i].soname = sonames[i];
+            i = i + 1;
+        }
+        dyn.info.lib_count = soname_count;
+    }
+
+    dyn.import_map = map.init[intern.StrId, u32](alloc, maphash.hash_u32, maphash.eq_u32);
+    dyn.active = true;
+
+    # count distinct undefined externs first so the import array is sized exactly.
+    var seen: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, maphash.hash_u32, maphash.eq_u32);
+    var n_imports: u32 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (!is_undefined_extern(sym)) { sy = sy + 1; cnt; }
+            if (is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
+            if (is_ok[*u32, str](map.get[intern.StrId, u32](?seen, ?sym.name))) { sy = sy + 1; cnt; }
+            val ins: Result[bool, str] = map.insert[intern.StrId, u32](?seen, sym.name, n_imports);
+            if (is_err[bool, str](ins)) { map.dnit[intern.StrId, u32](?seen); ret err[bool, str](unwrap_err[bool, str](ins)); }
+            n_imports = n_imports + 1;
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    map.dnit[intern.StrId, u32](?seen);
+
+    if (n_imports == 0) { ret ok[bool, str](true); }
+
+    val ir: Result[*of.DynImport, str] = zallocate[of.DynImport](alloc, n_imports::usize);
+    if (is_err[*of.DynImport, str](ir)) { ret err[bool, str](unwrap_err[*of.DynImport, str](ir)); }
+    dyn.info.imports = unwrap_ok[*of.DynImport, str](ir);
+
+    # populate the imports and the name->index map (dedup by name).
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (!is_undefined_extern(sym)) { sy = sy + 1; cnt; }
+            if (is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
+            if (is_ok[*u32, str](map.get[intern.StrId, u32](?dyn.import_map, ?sym.name))) { sy = sy + 1; cnt; }
+
+            val idx: u32 = dyn.info.import_count;
+            dyn.info.imports[idx].symbol    = sym.name;
+            dyn.info.imports[idx].lib_index = of.DYNLIB_ANY;
+            # every undefined extern reaches the linker as a code symbol today
+            # (an `ext fun`); data imports would clear this once supported.
+            dyn.info.imports[idx].is_func   = true;
+            val ins: Result[bool, str] = map.insert[intern.StrId, u32](?dyn.import_map, sym.name, idx);
+            if (is_err[bool, str](ins)) { ret err[bool, str](unwrap_err[bool, str](ins)); }
+            dyn.info.import_count = idx + 1;
+
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# is_undefined_extern: whether an object symbol is an undefined external — a
+# reference the owning object does not define. these are the candidates for a
+# dynamic import when no input object supplies the definition.
+fun is_undefined_extern(sym: *of.Symbol) bool {
+    if (sym.section != of.SECTION_EXTERNAL) { ret false; }
+    if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { ret false; }
+    ret true;
+}
+
+# dynstate_import_index: the plan import index for symbol `name`, or err when it
+# is not a dynamic import (so the caller falls through to the undefined-symbol
+# error).
+fun dynstate_import_index(dyn: *DynState, name: intern.StrId) Result[u32, str] {
+    if (!dyn.active) { ret err[u32, str]("not dynamic"); }
+    val g: Result[*u32, str] = map.get[intern.StrId, u32](?dyn.import_map, ?name);
+    if (is_err[*u32, str](g)) { ret err[u32, str]("not an import"); }
+    ret ok[u32, str](@unwrap_ok[*u32, str](g));
+}
+
+# is_call_kind: whether an abstract relocation kind is a pc-relative call/branch
+# that can be redirected through a PLT stub. only these are bound to an import's
+# thunk; an absolute reference to an import is unsupported and stays an error.
+fun is_call_kind(kinds: *RelocKindIds, kind: intern.StrId) bool {
+    ret kind == kinds.pc32 || kind == kinds.plt32;
+}
+
+# segment_index_for: the load-segment index a merged output section maps to in the
+# writer's segment array. the writer builds one segment per loadable used section
+# in output order, so the index is the count of loadable sections before `out_ix`.
+fun segment_index_for(out_img: *of.ObjectImage, out_ix: u32) u32 {
+    var seg: u32 = 0;
+    var i: u32 = 0;
+    for (i < out_ix && i < out_img.section_count) {
+        if (is_loadable_kind(out_img.sections[i].kind)) { seg = seg + 1; }
+        i = i + 1;
+    }
+    ret seg;
+}
+
+# dynstate_add_fixup: append an import call-site fixup, growing the array
+# geometrically. the writer redirects each to its import's PLT stub.
+fun dynstate_add_fixup(s: *sess.Session, dyn: *DynState, seg_index: u32, seg_offset: u32,
+                       import_index: u32, patch_vaddr: u64, addend: i64) Result[bool, str] {
+    val alloc: *Allocator = s.alloc;
+    if (dyn.fixup_count == dyn.fixup_cap) {
+        var new_cap: u32 = dyn.fixup_cap * 2;
+        if (new_cap == 0) { new_cap = 4; }
+        val gr: Result[*of.PltFixup, str] =
+            reallocate[of.PltFixup](alloc, dyn.fixups, dyn.fixup_cap::usize, new_cap::usize);
+        if (is_err[*of.PltFixup, str](gr)) { ret err[bool, str](unwrap_err[*of.PltFixup, str](gr)); }
+        dyn.fixups = unwrap_ok[*of.PltFixup, str](gr);
+        dyn.fixup_cap = new_cap;
+    }
+    val ix: u32 = dyn.fixup_count;
+    dyn.fixups[ix].seg_index    = seg_index;
+    dyn.fixups[ix].seg_offset   = seg_offset;
+    dyn.fixups[ix].import_index = import_index;
+    dyn.fixups[ix].patch_vaddr  = patch_vaddr;
+    dyn.fixups[ix].addend       = addend;
+    dyn.fixup_count = ix + 1;
     ret ok[bool, str](true);
 }
 
