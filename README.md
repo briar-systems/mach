@@ -66,10 +66,12 @@ mach <command> [options]
 | `run`   | build and execute the current project (`-- args...` forward to the program) |
 | `test`  | build and run the project's tests |
 | `dep`   | manage vendored dependencies (`list`, `add`, `remove`, `sync`, `vendor`) |
-| `init`  | scaffold a new project (`--bin`, `--lib`, `--name`) |
+| `init`  | scaffold a new project (`--lib`, `--name`, `--force`) |
+| `doc`   | generate Markdown reference docs from source doc-comments |
 | `help`  | show usage; `mach help <command>` for detail |
 
-Run `mach help <command>` for more information about a specific subcommand.
+Run `mach help <command>` for more information about a specific subcommand, or
+see the full [CLI reference](doc/cli.md).
 
 
 # Examples
@@ -135,7 +137,11 @@ fun main(argc: i64, argv: **u8) i64 {
 
 # Documentation
 
-The full language reference is in [`doc/language/`](doc/language/README.md).
+The full language reference is in [`doc/language/`](doc/language/README.md). The
+build system is documented in:
+
+- [`doc/manifest.md`](doc/manifest.md) — the `mach.toml` manifest reference
+- [`doc/cli.md`](doc/cli.md) — the `mach` command-line reference
 
 
 # Credit
