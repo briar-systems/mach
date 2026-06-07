@@ -46,21 +46,12 @@ Read the [language reference](doc/language/README.md) before installing. The doc
 Prerequisites: git, make, curl.
 
 ```bash
-git clone https://github.com/octalide/mach
+git clone --recurse-submodules https://github.com/octalide/mach
 cd mach
 make
 ```
 
-`make` runs the 4-stage bootstrap, each stage compiling the same Mach source with the previous compiler:
-
-1. **cmach** — seed compiler (the pinned version is auto-downloaded from [mach-boot](https://github.com/octalide/mach-boot))
-2. **imach** — intermediate compiler (`cmach` compiles the source)
-3. **smach** — self-hosted compiler (`imach` compiles the source)
-4. **mach** — final compiler (`smach` compiles the source)
-
-The four binaries land in `out/bin/`; the final compiler is `out/bin/mach`. Because the language is self-hosting, the bootstrap reaches a byte-identical fixpoint — recompiling the source with `mach` reproduces `mach` exactly.
-
-`make clean` wipes `out/`. To bootstrap from a custom seed: `CMACH=/path/to/cmach make`.
+The final compiler is `out/bin/mach`; `make clean` wipes `out/`.
 
 
 # Usage
