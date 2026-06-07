@@ -528,7 +528,7 @@ pub fun build(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_m
     }
     var p: driver.Project = unwrap_ok[driver.Project, str](proj_r);
 
-    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, config.verbose, config.emit_asm, config.emit_ir, ?root[0], config.output, config.artifacts, ?br.output_path);
+    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, config.verbose, config.emit_asm, config.emit_ir, ?root[0], config.output, config.artifacts, argc, argv, ?br.output_path);
 
     flush_diagnostics(?s, ?s.diags);
     driver.dnit_project(?p);
@@ -545,7 +545,8 @@ pub fun build(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_m
 # `.s` / `.ir` debug artifacts.
 fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: bool, verify_ir: bool, verbose: bool,
                      emit_asm: bool, emit_ir: bool,
-                     root: *u8, out_override: *u8, art_override: *u8, out_path: **u8) i64 {
+                     root: *u8, out_override: *u8, art_override: *u8,
+                     argc: usize, argv: **u8, out_path: **u8) i64 {
     val n: usize = p.module_len::usize;
     if (n == 0) {
         emit("error: project graph is empty\n");
@@ -623,7 +624,7 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
             code = build_test_runner(p, level, verify_ir, irs, ?runner_ir, ?runner_ir_ok, ?runner_img, ?runner_img_ok);
         }
         if (code == 0) {
-            code = link_artifact(p, emit_obj, test_mode, runner_img_ok, ?runner_img, verbose, root, out_override, art_override, images, out_path);
+            code = link_artifact(p, emit_obj, test_mode, runner_img_ok, ?runner_img, verbose, root, out_override, art_override, argc, argv, images, out_path);
         }
     }
 
@@ -701,6 +702,7 @@ fun build_test_runner(p: *driver.Project, level: u8, verify_ir: bool,
 fun link_artifact(p: *driver.Project, emit_obj: bool, test_mode: bool, have_runner: bool,
                   runner_img: *of.ObjectImage, verbose: bool, root: *u8,
                   out_override: *u8, art_override: *u8,
+                  argc: usize, argv: **u8,
                   images: *of.ObjectImage, out_path: **u8) i64 {
     val te: *driver.TargetEntry = p.target_entry;
     if (te == nil) { emit("error: no target selected\n"); ret 2; }
@@ -731,12 +733,6 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, test_mode: bool, have_runn
         count = count + 1;
     }
 
-    if (verbose) {
-        emit("link ");
-        emit_num(count::usize);
-        emit(" object(s)\n");
-    }
-
     # library mode (or `--emit obj`): the per-module objects are the deliverable;
     # do not link an executable. a test build always links an executable, even
     # for a library target, since the test runner needs a runnable entry point.
@@ -749,6 +745,22 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, test_mode: bool, have_runn
         free_paths(p.s.alloc, paths, count, count);
         @out_path = dup_cstr(p.s.alloc, ?obj_base[0]);
         ret 0;
+    }
+
+    # append every external link input — manifest `[targets.*].libs` plus the
+    # `-L`/`-l`/explicit-object CLI flags — as extra object paths. each resolves
+    # to a loose `.o` on disk that joins the link so undefined `ext` / in-graph
+    # symbols bind against its definitions. `paths` is grown and re-bound here.
+    val ext_code: i64 = append_external_objects(p, root, argc, argv, ?paths, ?count);
+    if (ext_code != 0) {
+        free_paths(p.s.alloc, paths, count, count);
+        ret ext_code;
+    }
+
+    if (verbose) {
+        emit("link ");
+        emit_num(count::usize);
+        emit(" object(s)\n");
     }
 
     # the executable path: `-o` overrides it with a path rooted directly at
@@ -795,6 +807,206 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, test_mode: bool, have_runn
     }
 
     @out_path = dup_cstr(p.s.alloc, ?artifact[0]);
+    ret 0;
+}
+
+# is_object_path: whether a link-input token denotes an explicit object-file
+# path rather than a bare `-l`-style library name. a token is treated as a path
+# when it contains a '/' (any directory component) or ends in `.o`.
+fun is_object_path(tok: *u8) bool {
+    if (tok == nil) { ret false; }
+    val n: usize = slen(tok);
+    if (n == 0) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (tok[i] == '/') { ret true; }
+        i = i + 1;
+    }
+    if (n >= 2 && tok[n - 2] == '.' && tok[n - 1] == 'o') { ret true; }
+    ret false;
+}
+
+# resolve_input_into: resolve one link-input token to an existing object file,
+# writing the absolute-or-relative path into `buf`. an explicit object path
+# (`is_object_path`) is taken verbatim. a bare `-l`-style name is searched in
+# each `-L <dir>` as `<dir>/lib<name>.o` then `<dir>/<name>.o`, then as
+# `lib<name>.o` and `<name>.o` relative to the working directory. returns true
+# once an existing file is found and written; false when nothing resolves.
+# `.a`/`.so` archives are not handled — only loose `.o` objects.
+fun resolve_input_into(tok: *u8, argc: usize, argv: **u8, buf: *u8, cap: usize) bool {
+    if (tok == nil || slen(tok) == 0) { ret false; }
+
+    if (is_object_path(tok)) {
+        val n: usize = slen(tok);
+        if (n + 1 > cap) { ret false; }
+        var i: usize = 0;
+        for (i < n) { buf[i] = tok[i]; i = i + 1; }
+        buf[n] = 0;
+        ret fs.is_file(cstr_str(buf));
+    }
+
+    # bare name: search each `-L` dir, then the working directory, for the
+    # `lib<name>.o` and `<name>.o` candidates in turn.
+    var li: usize = 0;
+    for (li < argc) {
+        if (eq(argv[li], "-L") && li + 1 < argc) {
+            if (try_named_object(argv[li + 1], tok, buf, cap)) { ret true; }
+        }
+        li = li + 1;
+    }
+    if (try_named_object(nil, tok, buf, cap)) { ret true; }
+    ret false;
+}
+
+# try_named_object: probe `<dir>/lib<name>.o` then `<dir>/<name>.o` for an
+# existing file, writing the first hit into `buf`. a nil `dir` probes the bare
+# `lib<name>.o` / `<name>.o` relative to the working directory. returns true on
+# the first existing candidate.
+fun try_named_object(dir: *u8, name: *u8, buf: *u8, cap: usize) bool {
+    if (write_named_candidate(dir, "lib", name, buf, cap) && fs.is_file(cstr_str(buf))) { ret true; }
+    if (write_named_candidate(dir, "", name, buf, cap) && fs.is_file(cstr_str(buf)))    { ret true; }
+    ret false;
+}
+
+# write_named_candidate: compose `<dir>/<prefix><name>.o` (or `<prefix><name>.o`
+# when `dir` is nil) into `buf`, null-terminated. returns false if it would not
+# fit. `prefix` is "lib" or "".
+fun write_named_candidate(dir: *u8, prefix: *u8, name: *u8, buf: *u8, cap: usize) bool {
+    val dl: usize = slen(dir);
+    val pl: usize = slen(prefix);
+    val nl: usize = slen(name);
+    var need: usize = dl;
+    if (dl > 0) { need = need + 1; }
+    need = need + pl + nl + 2 + 1;
+    if (need > cap) { ret false; }
+
+    var k: usize = 0;
+    var i: usize = 0;
+    if (dir != nil) {
+        for (i < dl) { buf[k] = dir[i]; k = k + 1; i = i + 1; }
+        if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
+    }
+    i = 0;
+    for (i < pl) { buf[k] = prefix[i]; k = k + 1; i = i + 1; }
+    i = 0;
+    for (i < nl) { buf[k] = name[i]; k = k + 1; i = i + 1; }
+    buf[k] = '.'; k = k + 1;
+    buf[k] = 'o'; k = k + 1;
+    buf[k] = 0;
+    ret true;
+}
+
+# count_external_tokens: number of external link-input tokens — manifest
+# `[targets.*].libs` entries plus every `-l <name>` flag and bare object-file
+# path argument in argv. argv[0] (the program), the subcommand, every known
+# flag and its value, and the project-path positional are skipped so only real
+# link inputs are counted.
+fun count_external_tokens(p: *driver.Project, argc: usize, argv: **u8) u32 {
+    var n: u32 = 0;
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te != nil) { n = n + te.lib_count; }
+
+    var i: usize = 0;
+    for (i < argc) {
+        val a: *u8 = argv[i];
+        if (eq(a, "-l") && i + 1 < argc)      { n = n + 1; i = i + 2; cnt; }
+        if (is_value_flag(a) && i + 1 < argc) { i = i + 2; cnt; }
+        if (i > 1 && a != nil && a[0] != '-' && is_object_path(a)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# is_value_flag: whether a CLI token is a known flag that consumes the following
+# argv entry as its value. listing them lets the link-input scan step over a
+# flag's value without mistaking it for a bare object path.
+fun is_value_flag(a: *u8) bool {
+    ret eq(a, "-L") || eq(a, "-l") || eq(a, "-o") ||
+        eq(a, "--target") || eq(a, "--cwd") || eq(a, "--color") ||
+        eq(a, "--artifacts") || eq(a, "--emit") || eq(a, "--filter");
+}
+
+# append_external_objects: resolve every external link input (manifest
+# `[targets.*].libs` plus the CLI `-L`/`-l`/explicit-object flags) to a loose
+# `.o` on disk and append each as an extra object path. `*paths` is grown from
+# `*count` to `*count + resolved` and re-bound; `*count` is advanced. an input
+# that resolves to no existing file is a hard error so a typo never silently
+# drops a link dependency. returns 0 on success, or a non-zero exit code (the
+# caller frees `*paths` at the updated `*count`).
+fun append_external_objects(p: *driver.Project, root: *u8, argc: usize, argv: **u8,
+                            paths: ***u8, count: *u32) i64 {
+    val extra: u32 = count_external_tokens(p, argc, argv);
+    if (extra == 0) { ret 0; }
+
+    val base: u32 = @count;
+    val gr: Result[**u8, str] = reallocate[*u8](p.s.alloc, @paths, base::usize, (base + extra)::usize);
+    if (is_err[**u8, str](gr)) { emit("error: out of memory\n"); ret 2; }
+    @paths = unwrap_ok[**u8, str](gr);
+
+    var written: u32 = base;
+    var buf: [4096]u8;
+
+    # manifest libs first, then the CLI tokens — a stable order keeps the link
+    # deterministic across runs.
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te != nil) {
+        var li: u32 = 0;
+        for (li < te.lib_count) {
+            val lib_opt: Option[str] = intern.lookup(?p.s.interner, te.libs[li]);
+            if (is_none[str](lib_opt)) { @count = written; ret 2; }
+            val tok: *u8 = unwrap[str](lib_opt)::*u8;
+            val code: i64 = resolve_and_store(p, tok, root, argc, argv, ?buf[0], 4096, @paths, ?written);
+            if (code != 0) { @count = written; ret code; }
+            li = li + 1;
+        }
+    }
+
+    var i: usize = 0;
+    for (i < argc) {
+        val a: *u8 = argv[i];
+        if (eq(a, "-l") && i + 1 < argc) {
+            val code: i64 = resolve_and_store(p, argv[i + 1], root, argc, argv, ?buf[0], 4096, @paths, ?written);
+            if (code != 0) { @count = written; ret code; }
+            i = i + 2; cnt;
+        }
+        if (is_value_flag(a) && i + 1 < argc) { i = i + 2; cnt; }
+        if (i > 1 && a != nil && a[0] != '-' && is_object_path(a)) {
+            val code: i64 = resolve_and_store(p, a, root, argc, argv, ?buf[0], 4096, @paths, ?written);
+            if (code != 0) { @count = written; ret code; }
+        }
+        i = i + 1;
+    }
+
+    @count = written;
+    ret 0;
+}
+
+# resolve_and_store: resolve one link-input token to an on-disk object and store
+# its owned path into `paths[*written]`, advancing `*written`. an explicit
+# relative object path is first tried verbatim, then rooted at the project root;
+# a bare name is resolved through `resolve_input_into`. an unresolvable input is
+# a hard error. returns 0 on success or a non-zero exit code.
+fun resolve_and_store(p: *driver.Project, tok: *u8, root: *u8, argc: usize, argv: **u8,
+                      buf: *u8, cap: usize, paths: **u8, written: *u32) i64 {
+    var found: bool = resolve_input_into(tok, argc, argv, buf, cap);
+
+    # a relative explicit path that misses the working directory is retried
+    # rooted at the project root, so manifest `libs` paths are project-relative.
+    if (!found && is_object_path(tok) && tok[0] != '/') {
+        if (join_into(buf, cap, root, tok) > 0 && fs.is_file(cstr_str(buf))) { found = true; }
+    }
+
+    if (!found) {
+        emit("error: cannot find link input '");
+        emit(tok);
+        emit("'\n");
+        ret 1;
+    }
+
+    val dup: *u8 = dup_cstr(p.s.alloc, buf);
+    if (dup == nil) { emit("error: out of memory\n"); ret 2; }
+    paths[@written] = dup;
+    @written = @written + 1;
     ret 0;
 }
 
