@@ -89,24 +89,30 @@ target composition but are not exercised by the working bootstrap.
 
 ## `[deps.<alias>]`
 
-Each `<alias>` names a vendored dependency under `<dir_dep>/<alias>/`. The
+Each `<alias>` names a dependency materialised under `<dir_dep>/<alias>/`. The
 compiler resolves a dependency by reading that directory's own `mach.toml`
 (its `[project].id` becomes the head segment of the dep's module paths, and its
 `[project].dir_src` locates the dep's sources). A module path whose head matches
 a dep's `id` resolves into that dep's tree.
 
-The keys written under `[deps.<alias>]` are **not** consumed by the build's
-dependency resolution — resolution is purely by vendor layout. They are read
-only by `mach dep list`, which prints `path=<…>` if present, else `source=<…>`:
+Resolution is purely by vendor layout — the build never reads the `[deps.*]`
+keys. They drive `mach dep`, which fetches a dependency from git into
+`<dir_dep>/<alias>/` (see [cli.md](cli.md#mach-dep)):
 
-| Key      | Type   | Read by                 | Meaning |
-|----------|--------|-------------------------|---------|
-| `path`   | string | `mach dep list` display | Local or remote location of the dependency. Preferred over `source` when both are present. |
-| `source` | string | `mach dep list` display | Alternate location field, shown when `path` is absent. |
+| Key       | Type   | Read by    | Meaning |
+|-----------|--------|------------|---------|
+| `url`     | string | `mach dep` | Git URL to clone. `source` and the legacy `path` are accepted as fallbacks, in that order. |
+| `source`  | string | `mach dep` | Alternate URL field, used when `url` is absent. |
+| `ref`     | string | `mach dep` | Git ref to check out: a `tag/<name>`, `branch/<name>`, bare tag/branch, or commit SHA. The legacy `version` key is accepted as a fallback. An absent ref means the remote default branch. |
 
-Other keys seen in practice — `type`, `version` — are informational: parsed by
-TOML, displayed by nothing, and not read by the build. They record provenance
-for the (not-yet-implemented) `mach dep add`/`sync`/`vendor` actions.
+`type` (e.g. `"remote"`) is informational — parsed by TOML, read by nothing.
+
+A bare branch/tag name and a 7–40 char hex string are auto-detected as a branch
+and a commit respectively; the explicit `branch/` / `tag/` prefixes remove the
+ambiguity. `mach dep sync` records the resolved commit of every git-fetched dep
+in `mach.lock`, and honours that lockfile on the next sync for reproducible
+builds. A hand-vendored tree or a git submodule under `<dir_dep>` (anything
+`mach dep` did not clone) is left untouched and excluded from the lockfile.
 
 The dependency at `<dir_dep>/<alias>/` must itself be a valid project (have its
 own `mach.toml` with a `[project].id`), or the build fails resolving the dep.
@@ -134,10 +140,13 @@ binary     = "linux/bin/mach" # linked binary at out/linux/bin/mach
 # libs     = ["build/libfoo.o", "bar"]  # optional external link inputs
 
 [deps.mach-std]
-type    = "remote"                                # informational
-path    = "https://github.com/octalide/mach-std"  # shown by `mach dep list`
-version = "branch/dev"                            # informational
+url = "https://github.com/octalide/mach-std"  # git url cloned by `mach dep`
+ref = "branch/dev"                            # git ref to check out
 ```
+
+The compiler's own `mach.toml` carries `mach-std` as a git **submodule** rather
+than a `mach dep`-managed clone; `mach dep sync` recognises the submodule and
+skips it, so its keys remain informational there.
 
 With this manifest, `mach build` (no `--target`) selects `linux` because
 `[project].target = "native"` resolves to the host-matching entry, compiles
