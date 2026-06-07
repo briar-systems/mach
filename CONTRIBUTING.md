@@ -13,32 +13,20 @@ Be respectful, constructive, and professional. Treat Mach like a passion project
 ## Getting Started
 
 ### Prerequisites
-- GNU Make
 - Git
-- curl (for auto-downloading the bootstrap compiler)
+- An existing `mach` binary — Mach is self-hosting, so building from source needs one. Install the latest [release](https://github.com/octalide/mach/releases).
 
 ### Building
 
-Mach is self-hosting — the compiler is written in Mach and compiles its own source. `make` runs a 4-stage bootstrap build chain; the seed compiler (`cmach`) is automatically downloaded from [mach-boot](https://github.com/octalide/mach-boot) releases.
-
-1. **cmach** — Seed compiler (pre-built, auto-downloaded)
-2. **imach** — Intermediate compiler: Mach source compiled by cmach
-3. **smach** — Self-hosted compiler: Mach source compiled by imach
-4. **mach** — Final compiler: Mach source compiled by smach
+Mach builds its own source with an existing `mach`:
 
 ```bash
 git clone --recurse-submodules https://github.com/octalide/mach.git
 cd mach
-make    # downloads cmach and builds all stages
+mach build .
 ```
 
-The four binaries are written to `out/bin/`; the final compiler is `out/bin/mach`. The bootstrap reaches a byte-identical fixpoint — recompiling the source with `mach` reproduces `mach` exactly. `make clean` wipes `out/`.
-
-To use a custom cmach build:
-
-```bash
-CMACH=/path/to/cmach make
-```
+The compiler is written to `out/<target>/bin/mach`. Because the language is self-hosting, the build reaches a byte-identical fixpoint — recompiling the source with the result reproduces it exactly.
 
 ---
 
@@ -83,8 +71,8 @@ All work happens on feature branches off `dev`. When `dev` reaches a stable mile
 - Target `dev` branch (not `main`)
 - Provide clear description of changes
 - Link related issues
-- Ensure code builds with `make` and reaches the byte-identical fixpoint
-- Run the tests: `mach test --cwd .` (unit corpus), and for codegen changes `tools/test/differential.sh` (optimization-level / cross-compiler agreement)
+- Ensure the compiler builds and reaches the byte-identical fixpoint
+- Run the tests with `mach test .`
 - Follow coding standards
 
 ## Versioning
@@ -137,10 +125,8 @@ mach/
 ├── dep/
 │   └── mach-std/      # standard library (git submodule)
 ├── doc/               # documentation
-├── examples/          # example projects and syntax fixtures
 ├── src/               # self-hosting mach compiler
-├── out/               # build output (git-ignored); final compiler at out/bin/mach
-├── Makefile           # build system (auto-downloads cmach)
+├── out/               # build output (git-ignored); compiler at out/<target>/bin/mach
 └── mach.toml          # project configuration
 ```
 
