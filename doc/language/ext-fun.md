@@ -51,29 +51,31 @@ undefined `ext` symbol with no object supplying it is a link error.
 C-toolchain-style flags, consumed by `mach build`:
 
 ```sh
-# explicit object-file path
+# explicit object / archive path
 mach build . path/to/libfoo.o
+mach build . path/to/libfoo.a
 
-# search dir + library name: resolves `lib<name>.o` then `<name>.o` in each -L dir
+# search dir + library name: resolves lib<name>.o / <name>.o / lib<name>.a / <name>.a in each -L dir
 mach build . -L build/libs -l foo
 ```
 
-- A bare argument that contains a `/` or ends in `.o` is treated as an explicit
-  object path. A relative path is tried first against the working directory,
-  then against the project root.
-- `-l <name>` resolves to a loose object: each `-L <dir>` is searched for
-  `lib<name>.o`, then `<name>.o`; finally the working directory is searched for
-  the same two names. `-L` and `-l` may each be repeated.
+- A bare argument that contains a `/` or ends in `.o` (object) or `.a` (archive)
+  is treated as an explicit input path. A relative path is tried first against the
+  working directory, then against the project root.
+- `-l <name>` resolves to an object or archive: each `-L <dir>` is searched for
+  `lib<name>.o`, `<name>.o`, `lib<name>.a`, then `<name>.a`; finally the working
+  directory is searched for the same four names (loose objects preferred over
+  archives). `-L` and `-l` may each be repeated.
 
 ### Manifest
 
-`[targets.*].libs` lists project-level link inputs, each an explicit object
-path (project-relative or absolute) or a bare `-l`-style name:
+`[targets.*].libs` lists project-level link inputs, each an explicit object /
+archive path (project-relative or absolute) or a bare `-l`-style name:
 
 ```toml
 [targets.linux]
 # ...
-libs = ["build/libs/libfoo.o", "bar"]
+libs = ["build/libs/libfoo.a", "bar"]
 ```
 
 `link` is accepted as an alias for `libs`. Manifest inputs and command-line
@@ -82,9 +84,10 @@ error.
 
 ### Scope
 
-Only loose `.o` relocatable objects are linked. Static archives (`.a`) and
-shared libraries (`.so`) are not yet supported — extract or recompile the
-member objects you need, or wait on the dynamic-linker work.
+Loose `.o` relocatable objects and static `.a` archives are linked; a `.a`
+contributes every one of its member objects (all members are pulled, not just
+those satisfying an undefined symbol). Shared libraries (`.so`) are not yet
+supported — wait on the dynamic-linker work.
 
 ## See also
 

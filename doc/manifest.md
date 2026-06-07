@@ -44,15 +44,15 @@ with `mach.toml has no [targets.<name>] entries`.
 | `binary`     | string | yes      | —        | Output path of the linked binary, relative to `<dir_out>` (e.g. `"linux/bin/mach"`). Required for **every** target, even in library mode where no binary is linked. |
 | `artifacts`  | string | no       | `<name>` | Subdirectory under `<dir_out>` holding the per-module object tree (`obj/`) and any `--emit-asm` / `--emit-ir` output. Defaults to the target name; may be nested (e.g. `"smach/linux"`). |
 | `mode`       | string | no       | `"executable"` | `"executable"` links the per-module objects into a static binary; `"library"` stops at the objects (no link). Any value other than `"library"` is treated as `"executable"`. |
-| `libs`       | array of strings | no | `[]` | Project-level external link inputs. Each entry is either an explicit object-file path (project-root-relative or absolute) or a bare `-l`-style name resolved to a loose `lib<name>.o` / `<name>.o` at link time. These join every `mach build`/`run`/`test` link in addition to any CLI `-L`/`-l`/object arguments. A non-array value, or a non-string element, is a manifest error. The alias `link` is accepted when `libs` is absent. |
+| `libs`       | array of strings | no | `[]` | Project-level external link inputs. Each entry is either an explicit object/archive path (a `.o` or `.a`, project-root-relative or absolute) or a bare `-l`-style name resolved to a `lib<name>.o` / `<name>.o` / `lib<name>.a` / `<name>.a` at link time. These join every `mach build`/`run`/`test` link in addition to any CLI `-L`/`-l`/object arguments. A non-array value, or a non-string element, is a manifest error. The alias `link` is accepted when `libs` is absent. |
 
 Informational (parsed by TOML, not read by the build): `abi`. The ABI is derived
 from `os` (Linux/macOS → SysV, Windows → Win64), so the key documents intent but
 does not change the build.
 
-Only loose `.o` relocatable objects are linked — static archives (`.a`) and
-shared libraries (`.so`) are not yet supported. See
-[language/ext-fun.md](language/ext-fun.md#linking-external-objects) for the
+Loose `.o` relocatable objects and static `.a` archives are linked; a `.a`
+contributes every member object. Shared libraries (`.so`) are not yet supported.
+See [language/ext-fun.md](language/ext-fun.md#linking-external-objects) for the
 `ext fun` workflow that consumes these inputs, and [cli.md](cli.md#external-link-inputs)
 for the equivalent command-line flags.
 

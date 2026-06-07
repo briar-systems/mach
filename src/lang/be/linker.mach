@@ -44,6 +44,7 @@ use std.types.size.usize;
 use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.zallocate;
+use std.allocator.reallocate;
 use std.allocator.deallocate;
 
 use mem: std.memory;
@@ -55,6 +56,7 @@ use sess:   mach.lang.session;
 use intern: mach.lang.intern;
 use target: mach.lang.target;
 use of:     mach.lang.target.of;
+use ar:     mach.lang.target.of.ar;
 use obj:    mach.lang.be.obj;
 
 # link mode: what kind of artifact `link` produces.
@@ -144,14 +146,25 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     val alloc: *Allocator = s.alloc;
 
     # read and parse every input object file into an in-memory image array. the
-    # array and each populated image are torn down on every exit path below.
+    # array and each populated image are torn down on every exit path below. an
+    # `.a` archive input expands into one image per member object, so the parsed
+    # image count can exceed the input-path count — `read_objects` reports the
+    # true module count through `module_count`.
     var modules: *of.ObjectImage = nil;
-    val read_r: Result[*of.ObjectImage, str] = read_objects(s, tgt, obj_paths, obj_count);
+    var module_count: u32 = 0;
+    val read_r: Result[*of.ObjectImage, str] = read_objects(s, tgt, obj_paths, obj_count, ?module_count);
     if (is_err[*of.ObjectImage, str](read_r)) {
         ret err[bool, str](unwrap_err[*of.ObjectImage, str](read_r));
     }
     modules = unwrap_ok[*of.ObjectImage, str](read_r);
-    val module_count: u32 = obj_count;
+
+    # every input resolved to zero modules (e.g. an empty archive or one holding
+    # only bookkeeping members) — there is nothing to link, so reject rather than
+    # emit an empty artifact.
+    if (module_count == 0) {
+        free_modules(alloc, modules, module_count);
+        ret err[bool, str]("link: no input objects");
+    }
 
     # build the merged-section accumulators, one per kind, in canonical order.
     var merged: [5]MergedSection;
@@ -280,37 +293,44 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     ret ok[bool, str](true);
 }
 
-# read_objects: read and parse every input object file into a fresh image array.
+# read_objects: read and parse every input file into a fresh image array.
 #
-# allocates an `obj_count`-long `of.ObjectImage` array, then for each path reads
-# the whole file (`fs.read_all`) and parses it through the active format's
-# `parse_object`. on any failure every image parsed so far and the array itself
-# are released before returning the error, so the caller never inherits a
-# partial array. the read buffer is freed after parse — `parse_object` copies
-# the section bytes it keeps into the image.
+# grows an `of.ObjectImage` array one slot at a time. for each path it reads the
+# whole file (`fs.read_all_sized`) and either parses it directly through the
+# active format's `parse_object` (a loose `.o`) or, when the file opens with the
+# `ar` magic, expands every ordinary member object of the archive into its own
+# image. an `.a` therefore contributes one module per member, so the final image
+# count — written through `module_count` — can exceed `obj_count`. on any failure
+# every image parsed so far and the array itself are released before returning the
+# error, so the caller never inherits a partial array. each read buffer is freed
+# after its objects are parsed — `parse_object` copies the section bytes it keeps.
 # ---
-# s:         shared session (allocator, interner)
-# tgt:       active target — supplies the format parser
-# obj_paths: array of null-terminated object-file paths
-# obj_count: number of paths
-# ret:       the populated image array, or an error string
+# s:            shared session (allocator, interner)
+# tgt:          active target — supplies the format parser
+# obj_paths:    array of null-terminated input-file paths
+# obj_count:    number of paths
+# module_count: out — the number of images produced (>= obj_count with archives)
+# ret:          the populated image array, or an error string
 fun read_objects(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
-                 obj_count: u32) Result[*of.ObjectImage, str] {
+                 obj_count: u32, module_count: *u32) Result[*of.ObjectImage, str] {
+    @module_count = 0;
     if (tgt.of.parse_object == nil) {
         ret err[*of.ObjectImage, str]("link: object format has no parser");
     }
     val alloc: *Allocator = s.alloc;
 
-    val ar: Result[*of.ObjectImage, str] = zallocate[of.ObjectImage](alloc, obj_count::usize);
-    if (is_err[*of.ObjectImage, str](ar)) {
-        ret err[*of.ObjectImage, str](unwrap_err[*of.ObjectImage, str](ar));
-    }
-    val modules: *of.ObjectImage = unwrap_ok[*of.ObjectImage, str](ar);
+    # the image array grows geometrically (capacity doubles) so appending one
+    # image per object/member stays amortized O(1) even for a large archive; it
+    # is shrunk to exactly `count` before returning so the rest of the linker's
+    # "array length == module count" invariant holds.
+    var modules: *of.ObjectImage = nil;
+    var count: u32 = 0;
+    var cap:   u32 = 0;
 
     var i: u32 = 0;
     for (i < obj_count) {
         if (obj_paths[i] == nil) {
-            free_modules_to(alloc, modules, i, obj_count);
+            free_modules_to(alloc, modules, count, cap);
             ret err[*of.ObjectImage, str]("link: nil object path");
         }
 
@@ -323,25 +343,159 @@ fun read_objects(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
         # mis-parse the object.
         val rb: Result[fs.Buffer, str] = fs.read_all_sized(alloc, path);
         if (is_err[fs.Buffer, str](rb)) {
-            free_modules_to(alloc, modules, i, obj_count);
+            free_modules_to(alloc, modules, count, cap);
             ret err[*of.ObjectImage, str](read_message(s, path, unwrap_err[fs.Buffer, str](rb)));
         }
         val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
 
-        val pr: Result[bool, str] =
-            tgt.of.parse_object(alloc, buf.data, buf.len, ?modules[i]);
+        var input_r: Result[bool, str] = ok[bool, str](true);
+        if (ar.is_archive(buf.data, buf.len)) {
+            input_r = parse_archive(s, tgt, path, buf.data, buf.len, ?modules, ?count, ?cap);
+        }
+        or {
+            input_r = parse_loose(alloc, tgt, buf.data, buf.len, ?modules, ?count, ?cap);
+        }
+
         # the parser copies any bytes it keeps; the file buffer is no longer
         # needed regardless of success. read_all_sized over-allocates by one nul byte.
         if (buf.data != nil) { deallocate[u8](alloc, buf.data, buf.len + 1); }
-        if (is_err[bool, str](pr)) {
-            free_modules_to(alloc, modules, i, obj_count);
-            ret err[*of.ObjectImage, str](unwrap_err[bool, str](pr));
+        if (is_err[bool, str](input_r)) {
+            free_modules_to(alloc, modules, count, cap);
+            ret err[*of.ObjectImage, str](unwrap_err[bool, str](input_r));
         }
 
         i = i + 1;
     }
 
+    # shrink the over-allocated capacity back to the live count so the rest of
+    # the linker (and `free_modules`) sees `array length == module count`. on the
+    # (practically impossible) shrink failure the whole array is released and the
+    # error surfaced rather than leaving a capacity/count mismatch behind.
+    if (cap > count) {
+        val sr: Result[*of.ObjectImage, str] =
+            reallocate[of.ObjectImage](alloc, modules, cap::usize, count::usize);
+        if (is_err[*of.ObjectImage, str](sr)) {
+            free_modules_to(alloc, modules, count, cap);
+            ret err[*of.ObjectImage, str](unwrap_err[*of.ObjectImage, str](sr));
+        }
+        modules = unwrap_ok[*of.ObjectImage, str](sr);
+    }
+
+    @module_count = count;
     ret ok[*of.ObjectImage, str](modules);
+}
+
+# grow_modules: append one empty image slot to the module array, doubling the
+# backing capacity when it is exhausted and zero-initializing the new tail.
+#
+# the array grows geometrically — capacity doubles (from 1) when `count` reaches
+# `cap` — so a long archive's per-member appends stay amortized O(1). the new slot
+# is fully zeroed so a later parse failure (or an unparsed slot left behind by a
+# partial read) tears down cleanly through `obj.dnit`, which reads the nil
+# section/symbol/relocation pointers as empty. on success `*modules` is rebound to
+# the grown array, `*cap` updated, and `*count` advanced; the slot's index is the
+# old count.
+# ---
+# alloc:   allocator backing the array
+# modules: in/out — the image array, rebound when the capacity grows
+# count:   in/out — current image count, incremented on success
+# cap:     in/out — current backing capacity, updated when it grows
+# ret:     index of the appended slot, or an allocation error
+fun grow_modules(alloc: *Allocator, modules: **of.ObjectImage, count: *u32, cap: *u32) Result[u32, str] {
+    val old: u32 = @count;
+    if (old == @cap) {
+        var new_cap: u32 = @cap * 2;
+        if (new_cap == 0) { new_cap = 1; }
+        val gr: Result[*of.ObjectImage, str] =
+            reallocate[of.ObjectImage](alloc, @modules, (@cap)::usize, new_cap::usize);
+        if (is_err[*of.ObjectImage, str](gr)) {
+            ret err[u32, str](unwrap_err[*of.ObjectImage, str](gr));
+        }
+        @modules = unwrap_ok[*of.ObjectImage, str](gr);
+        @cap = new_cap;
+    }
+
+    val arr: *of.ObjectImage = @modules;
+    val slot: *of.ObjectImage = ?arr[old];
+    slot.alloc         = alloc;
+    slot.name          = intern.STR_NIL;
+    slot.sections      = nil;
+    slot.section_count = 0;
+    slot.symbols       = nil;
+    slot.symbol_count  = 0;
+    slot.relocations   = nil;
+    slot.reloc_count   = 0;
+
+    @count = old + 1;
+    ret ok[u32, str](old);
+}
+
+# parse_loose: parse a single loose object file's bytes into a new image slot.
+#
+# appends an image and parses `buf` into it through the active format's
+# `parse_object`. the appended slot stays in the array on parse failure (zeroed,
+# so the caller's teardown frees it cleanly) and the error is propagated.
+# ---
+# alloc:   allocator backing the image arrays
+# tgt:     active target — supplies the format parser
+# buf:     the object file bytes
+# buf_len: length of `buf`
+# modules: in/out — the image array, rebound on growth
+# count:   in/out — current image count
+# cap:     in/out — current backing capacity
+# ret:     ok(true) on success, or an error string
+fun parse_loose(alloc: *Allocator, tgt: *target.Target, buf: *u8, buf_len: usize,
+                modules: **of.ObjectImage, count: *u32, cap: *u32) Result[bool, str] {
+    val gr: Result[u32, str] = grow_modules(alloc, modules, count, cap);
+    if (is_err[u32, str](gr)) { ret err[bool, str](unwrap_err[u32, str](gr)); }
+    val ix: u32 = unwrap_ok[u32, str](gr);
+    val arr: *of.ObjectImage = @modules;
+    ret tgt.of.parse_object(alloc, buf, buf_len, ?arr[ix]);
+}
+
+# parse_archive: expand every ordinary member of an `ar` archive into the image
+# array.
+#
+# walks the archive members (`ar.next_member`), skipping the bookkeeping members
+# (`ar.is_special`), and parses each remaining member's object bytes into a new
+# image slot through the active format's `parse_object`. the member slices borrow
+# the archive buffer, which the caller keeps alive across this call. a malformed
+# member header is a hard error. this implements the v1 member-selection policy:
+# every object member is pulled (see `of.ar`).
+# ---
+# s:       shared session (diagnostics)
+# tgt:     active target — supplies the format parser
+# path:    archive path, for the diagnostic on a malformed member
+# buf:     the archive bytes
+# buf_len: length of `buf`
+# modules: in/out — the image array, rebound on growth
+# count:   in/out — current image count
+# cap:     in/out — current backing capacity
+# ret:     ok(true) once every member is parsed, or an error string
+fun parse_archive(s: *sess.Session, tgt: *target.Target, path: str, buf: *u8, buf_len: usize,
+                  modules: **of.ObjectImage, count: *u32, cap: *u32) Result[bool, str] {
+    val alloc: *Allocator = s.alloc;
+    var pos: usize = ar.first_member();
+    for (true) {
+        val st: ar.Step = ar.next_member(buf, buf_len, pos);
+        if (!st.ok) {
+            ret err[bool, str](read_message(s, path, "malformed archive member header"));
+        }
+        if (st.done) { ret ok[bool, str](true); }
+
+        if (!ar.is_special(buf, pos)) {
+            val gr: Result[u32, str] = grow_modules(alloc, modules, count, cap);
+            if (is_err[u32, str](gr)) { ret err[bool, str](unwrap_err[u32, str](gr)); }
+            val ix: u32 = unwrap_ok[u32, str](gr);
+            val arr: *of.ObjectImage = @modules;
+            val pr: Result[bool, str] =
+                tgt.of.parse_object(alloc, st.member.data, st.member.len, ?arr[ix]);
+            if (is_err[bool, str](pr)) { ret err[bool, str](unwrap_err[bool, str](pr)); }
+        }
+
+        pos = st.next;
+    }
+    ret ok[bool, str](true);
 }
 
 # emit_executable: lay the merged sections out as load segments and write the
