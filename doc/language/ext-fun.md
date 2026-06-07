@@ -42,40 +42,50 @@ Common reasons to rename:
 ## Linking external objects
 
 An `ext fun` is only a forward reference — its definition must be supplied at
-link time by an external precompiled object. Provide those objects to
+link time, either **statically** by an external precompiled object/archive or
+**dynamically** by a shared library bound at load time. Provide those inputs to
 `mach build` either on the command line or through the project manifest. An
-undefined `ext` symbol with no object supplying it is a link error.
+undefined `ext` symbol that no static object defines and no shared library can
+bind is a link error.
 
 ### Command line
 
 C-toolchain-style flags, consumed by `mach build`:
 
 ```sh
-# explicit object / archive path
+# explicit object / archive / shared-library path
 mach build . path/to/libfoo.o
 mach build . path/to/libfoo.a
+mach build . path/to/libfoo.so
 
-# search dir + library name: resolves lib<name>.o / <name>.o / lib<name>.a / <name>.a in each -L dir
+# search dir + library name: resolves lib<name>.o / <name>.o / lib<name>.a / <name>.a, then lib<name>.so
 mach build . -L build/libs -l foo
+
+# link against a system shared library (libc) dynamically
+mach build . -l c
 ```
 
-- A bare argument that contains a `/` or ends in `.o` (object) or `.a` (archive)
-  is treated as an explicit input path. A relative path is tried first against the
-  working directory, then against the project root.
-- `-l <name>` resolves to an object or archive: each `-L <dir>` is searched for
-  `lib<name>.o`, `<name>.o`, `lib<name>.a`, then `<name>.a`; finally the working
-  directory is searched for the same four names (loose objects preferred over
-  archives). `-L` and `-l` may each be repeated.
+- A bare argument that contains a `/`, ends in `.o` (object) or `.a` (archive),
+  or names a `.so` (shared library) is treated as an explicit input path. A
+  relative path is tried first against the working directory, then against the
+  project root.
+- `-l <name>` resolves to an object, archive, or shared library: each `-L <dir>`
+  is searched for `lib<name>.o`, `<name>.o`, `lib<name>.a`, then `<name>.a`;
+  finally the working directory is searched for the same four names (loose
+  objects preferred over archives). Only if no static candidate exists does it
+  fall back to a shared `lib<name>.so` (in the `-L` dirs and the system library
+  directories). `-L` and `-l` may each be repeated.
 
 ### Manifest
 
 `[targets.*].libs` lists project-level link inputs, each an explicit object /
-archive path (project-relative or absolute) or a bare `-l`-style name:
+archive / shared-library path (project-relative or absolute) or a bare
+`-l`-style name:
 
 ```toml
 [targets.linux]
 # ...
-libs = ["build/libs/libfoo.a", "bar"]
+libs = ["build/libs/libfoo.a", "bar", "c"]
 ```
 
 `link` is accepted as an alias for `libs`. Manifest inputs and command-line
@@ -84,10 +94,14 @@ error.
 
 ### Scope
 
-Loose `.o` relocatable objects and static `.a` archives are linked; a `.a`
-contributes every one of its member objects (all members are pulled, not just
-those satisfying an undefined symbol). Shared libraries (`.so`) are not yet
-supported — wait on the dynamic-linker work.
+Loose `.o` relocatable objects and static `.a` archives are linked **statically**
+(a `.a` contributes every one of its member objects — all members are pulled, not
+just those satisfying an undefined symbol). A shared `.so` library is a **dynamic**
+dependency: its `DT_SONAME` is recorded and undefined `ext` symbols are bound
+against it at load time through a `PT_INTERP`/PLT in the produced binary. A
+static definition always wins over a same-named dynamic import. Dynamic linking
+is currently implemented for the ELF (Linux) target; the PE (Windows) and Mach-O
+(Darwin) import paths are in progress.
 
 ## See also
 

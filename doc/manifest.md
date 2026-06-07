@@ -45,17 +45,22 @@ with `mach.toml has no [targets.<name>] entries`.
 | `artifacts`  | string | no       | `<name>` | Subdirectory under `<dir_out>` holding the per-module object tree (`obj/`) and any `--emit-asm` / `--emit-ir` output. Defaults to the target name; may be nested (e.g. `"smach/linux"`). |
 | `mode`       | string | no       | `"executable"` | `"executable"` links the per-module objects into a static binary; `"library"` stops at the objects (no link). Any value other than `"library"` is treated as `"executable"`. |
 | `opt`        | string | no       | — (debug) | Default optimization level for this target. `"O0"` / `"debug"` selects the debug pipeline; `"O1"` / `"O2"` / `"release"` selects the release pipeline. An absent key leaves the build at its own default (debug). A CLI `-O0` / `-O1` / `-O2` / `--release` flag overrides this per invocation. Any other value is a manifest error. See the accepted set below. |
-| `libs`       | array of strings | no | `[]` | Project-level external link inputs. Each entry is either an explicit object/archive path (a `.o` or `.a`, project-root-relative or absolute) or a bare `-l`-style name resolved to a `lib<name>.o` / `<name>.o` / `lib<name>.a` / `<name>.a` at link time. These join every `mach build`/`run`/`test` link in addition to any CLI `-L`/`-l`/object arguments. A non-array value, or a non-string element, is a manifest error. The alias `link` is accepted when `libs` is absent. |
+| `libs`       | array of strings | no | `[]` | Project-level external link inputs. Each entry is either an explicit path (a `.o` object, a `.a` archive, or a `.so` shared library, project-root-relative or absolute) or a bare `-l`-style name resolved to a `lib<name>.o` / `<name>.o` / `lib<name>.a` / `<name>.a`, then a shared `lib<name>.so`, at link time. These join every `mach build`/`run`/`test` link in addition to any CLI `-L`/`-l`/object arguments. A non-array value, or a non-string element, is a manifest error. The alias `link` is accepted when `libs` is absent. |
 
 Informational (parsed by TOML, not read by the build): `abi`. The ABI is derived
 from `os` (Linux/macOS → SysV, Windows → Win64), so the key documents intent but
 does not change the build.
 
-Loose `.o` relocatable objects and static `.a` archives are linked; a `.a`
-contributes every member object. Shared libraries (`.so`) are not yet supported.
-See [language/ext-fun.md](language/ext-fun.md#linking-external-objects) for the
-`ext fun` workflow that consumes these inputs, and [cli.md](cli.md#external-link-inputs)
-for the equivalent command-line flags.
+Loose `.o` relocatable objects and static `.a` archives are linked **statically**
+(a `.a` contributes every member object); a shared `.so` library is recorded as a
+**dynamic** dependency (its `DT_SONAME`), bound against undefined `ext` symbols at
+load time through a `PT_INTERP`/PLT in the produced binary. A `-l <name>` prefers
+a static `.o`/`.a` and only falls back to a shared `lib<name>.so` when none is
+found. Dynamic linking is currently implemented for the ELF (Linux) target. See
+[cli.md](cli.md#static-vs-dynamic-resolution) for the full resolution rules,
+[language/ext-fun.md](language/ext-fun.md#linking-external-objects) for the
+`ext fun` workflow that consumes these inputs, and
+[cli.md](cli.md#external-link-inputs) for the equivalent command-line flags.
 
 ### Accepted `os` values
 
