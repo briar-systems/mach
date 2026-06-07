@@ -58,3 +58,8 @@ neighboring links; start from the index below.
 
 - [documentation.md](documentation.md) — docstring style for functions,
   types, modules, and values
+
+## Build system
+
+- [../manifest.md](../manifest.md) — the `mach.toml` manifest reference
+- [../cli.md](../cli.md) — the `mach` command-line reference
