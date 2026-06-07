@@ -43,15 +43,15 @@ Read the [language reference](doc/language/README.md) before installing. The doc
 
 ## Building Mach
 
-Prerequisites: git, make, curl.
+Mach builds itself, so building from source needs an existing `mach` — install the latest [release](https://github.com/octalide/mach/releases) first.
 
 ```bash
 git clone --recurse-submodules https://github.com/octalide/mach
 cd mach
-make
+mach build .
 ```
 
-The final compiler is `out/bin/mach`; `make clean` wipes `out/`.
+The compiler is written to `out/<target>/bin/mach`.
 
 
 # Usage
