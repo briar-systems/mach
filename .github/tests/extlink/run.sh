@@ -40,10 +40,12 @@ cp "$OBJ" "$WORK/libs/libextadd.o"
 
 fail=0
 
+# expect_42 <desc> <build args...> — the build args are passed verbatim, so each
+# case supplies its own project-path positional (`.`, `./`, ...).
 expect_42() {
     local desc="$1"; shift
     rm -rf "$WORK/app/out"
-    if ! ( cd "$WORK/app" && "$MACH" build . "$@" ) >/dev/null 2>&1; then
+    if ! ( cd "$WORK/app" && "$MACH" build "$@" ) >/dev/null 2>&1; then
         echo "FAIL extlink: $desc — build failed" >&2
         fail=1
         return
@@ -60,12 +62,15 @@ expect_42() {
     echo "PASS extlink: $desc"
 }
 
-expect_42 "explicit object path" "$OBJ"
-expect_42 "-L dir -l name"       -L "$WORK/libs" -l extadd
+expect_42 "explicit object path" . "$OBJ"
+expect_42 "-L dir -l name"       . -L "$WORK/libs" -l extadd
+# a `./`-style path positional is the project root, not an object input — it
+# must be skipped by the link-input scan even though it ends in '/'.
+expect_42 "project-path positional skipped" ./ -L "$WORK/libs" -l extadd
 
 # manifest libs: point `[targets.linux].libs` at the object by absolute path.
 sed "s|^binary = \"linux/bin/extapp\"|&\nlibs = [\"$OBJ\"]|" "$HERE/app/mach.toml" > "$WORK/app/mach.toml"
-expect_42 "[targets.*].libs manifest"
+expect_42 "[targets.*].libs manifest" .
 
 # no external input: the undefined `ext` symbol must make the link fail.
 cp "$HERE/app/mach.toml" "$WORK/app/mach.toml"
