@@ -66,14 +66,40 @@ objects are the deliverable and nothing is linked.
 | `-O1`          | —              | select the release pipeline |
 | `-O2`          | —              | select the release pipeline |
 | `--emit <kind>`| `obj`\|`exe`   | `obj` stops at the relocatable objects; `exe` (default) links a binary |
+| `-L <dir>`     | dir            | add a search directory for `-l`-resolved objects; repeatable |
+| `-l <name>`    | name           | link a named loose object, resolved through the `-L` dirs (see below); repeatable |
+| *(positional)* | object path    | a bare argument that contains `/` or ends in `.o` is linked verbatim |
 
 Plus the global flags above. The `-O<n>` flags override `--release` when both
 are present; absent any optimisation flag the build uses the debug pipeline
 (the bootstrap-stable default). `-O1` and `-O2` currently select the same
 release pipeline.
 
+### External link inputs
+
+`ext fun` declarations are forward references whose definitions are supplied at
+link time by external precompiled objects. Those objects come from the
+command line and from the target's `[targets.*].libs` manifest field (see
+[manifest.md](manifest.md)); both sets are linked. An input that resolves to no
+existing file is a hard error, so a typo never silently drops a dependency.
+
+- **Explicit object path** — a bare (non-flag) argument that contains a `/` or
+  ends in `.o` is treated as an object path. The first non-flag positional after
+  `build` is the project root and is skipped; remaining object-path positionals
+  are link inputs. A relative path is tried verbatim against the working
+  directory first, then rooted at the project root.
+- **`-l <name>`** — resolves to a loose object. Each `-L <dir>` is searched for
+  `<dir>/lib<name>.o`, then `<dir>/<name>.o`; if none hit, `lib<name>.o` then
+  `<name>.o` relative to the working directory are tried.
+- **`-L <dir>`** — adds a search directory for the `-l` resolution above. Both
+  `-L` and `-l` may be repeated.
+
+Only loose `.o` relocatable objects are supported — static archives (`.a`) and
+shared libraries (`.so`) are not. Manifest `libs` are resolved before the CLI
+inputs, giving a stable, deterministic link order.
+
 Exit codes: `0` ok, `1` user error (no `mach.toml`, unknown target, compile
-errors), `2` internal error.
+errors, an unresolvable link input), `2` internal error.
 
 ## `mach run`
 
