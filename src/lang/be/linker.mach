@@ -319,13 +319,18 @@ fun read_objects(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     }
     val alloc: *Allocator = s.alloc;
 
+    # the image array grows geometrically (capacity doubles) so appending one
+    # image per object/member stays amortized O(1) even for a large archive; it
+    # is shrunk to exactly `count` before returning so the rest of the linker's
+    # "array length == module count" invariant holds.
     var modules: *of.ObjectImage = nil;
     var count: u32 = 0;
+    var cap:   u32 = 0;
 
     var i: u32 = 0;
     for (i < obj_count) {
         if (obj_paths[i] == nil) {
-            free_modules_to(alloc, modules, count, count);
+            free_modules_to(alloc, modules, count, cap);
             ret err[*of.ObjectImage, str]("link: nil object path");
         }
 
@@ -338,54 +343,77 @@ fun read_objects(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
         # mis-parse the object.
         val rb: Result[fs.Buffer, str] = fs.read_all_sized(alloc, path);
         if (is_err[fs.Buffer, str](rb)) {
-            free_modules_to(alloc, modules, count, count);
+            free_modules_to(alloc, modules, count, cap);
             ret err[*of.ObjectImage, str](read_message(s, path, unwrap_err[fs.Buffer, str](rb)));
         }
         val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
 
         var input_r: Result[bool, str] = ok[bool, str](true);
         if (ar.is_archive(buf.data, buf.len)) {
-            input_r = parse_archive(s, tgt, path, buf.data, buf.len, ?modules, ?count);
+            input_r = parse_archive(s, tgt, path, buf.data, buf.len, ?modules, ?count, ?cap);
         }
         or {
-            input_r = parse_loose(alloc, tgt, buf.data, buf.len, ?modules, ?count);
+            input_r = parse_loose(alloc, tgt, buf.data, buf.len, ?modules, ?count, ?cap);
         }
 
         # the parser copies any bytes it keeps; the file buffer is no longer
         # needed regardless of success. read_all_sized over-allocates by one nul byte.
         if (buf.data != nil) { deallocate[u8](alloc, buf.data, buf.len + 1); }
         if (is_err[bool, str](input_r)) {
-            free_modules_to(alloc, modules, count, count);
+            free_modules_to(alloc, modules, count, cap);
             ret err[*of.ObjectImage, str](unwrap_err[bool, str](input_r));
         }
 
         i = i + 1;
     }
 
+    # shrink the over-allocated capacity back to the live count so the rest of
+    # the linker (and `free_modules`) sees `array length == module count`. on the
+    # (practically impossible) shrink failure the whole array is released and the
+    # error surfaced rather than leaving a capacity/count mismatch behind.
+    if (cap > count) {
+        val sr: Result[*of.ObjectImage, str] =
+            reallocate[of.ObjectImage](alloc, modules, cap::usize, count::usize);
+        if (is_err[*of.ObjectImage, str](sr)) {
+            free_modules_to(alloc, modules, count, cap);
+            ret err[*of.ObjectImage, str](unwrap_err[*of.ObjectImage, str](sr));
+        }
+        modules = unwrap_ok[*of.ObjectImage, str](sr);
+    }
+
     @module_count = count;
     ret ok[*of.ObjectImage, str](modules);
 }
 
-# grow_modules: append one empty image slot to the module array, growing it by
-# one and zero-initializing the new tail.
+# grow_modules: append one empty image slot to the module array, doubling the
+# backing capacity when it is exhausted and zero-initializing the new tail.
 #
-# the new slot is fully zeroed so a later parse failure (or an unparsed slot left
-# behind by a partial read) tears down cleanly through `obj.dnit`, which reads the
-# nil section/symbol/relocation pointers as empty. on success `*modules` is rebound
-# to the grown array and `*count` advanced; the new slot's index is the old count.
+# the array grows geometrically — capacity doubles (from 1) when `count` reaches
+# `cap` — so a long archive's per-member appends stay amortized O(1). the new slot
+# is fully zeroed so a later parse failure (or an unparsed slot left behind by a
+# partial read) tears down cleanly through `obj.dnit`, which reads the nil
+# section/symbol/relocation pointers as empty. on success `*modules` is rebound to
+# the grown array, `*cap` updated, and `*count` advanced; the slot's index is the
+# old count.
 # ---
 # alloc:   allocator backing the array
-# modules: in/out — the image array, rebound after growth
+# modules: in/out — the image array, rebound when the capacity grows
 # count:   in/out — current image count, incremented on success
+# cap:     in/out — current backing capacity, updated when it grows
 # ret:     index of the appended slot, or an allocation error
-fun grow_modules(alloc: *Allocator, modules: **of.ObjectImage, count: *u32) Result[u32, str] {
+fun grow_modules(alloc: *Allocator, modules: **of.ObjectImage, count: *u32, cap: *u32) Result[u32, str] {
     val old: u32 = @count;
-    val gr: Result[*of.ObjectImage, str] =
-        reallocate[of.ObjectImage](alloc, @modules, old::usize, (old + 1)::usize);
-    if (is_err[*of.ObjectImage, str](gr)) {
-        ret err[u32, str](unwrap_err[*of.ObjectImage, str](gr));
+    if (old == @cap) {
+        var new_cap: u32 = @cap * 2;
+        if (new_cap == 0) { new_cap = 1; }
+        val gr: Result[*of.ObjectImage, str] =
+            reallocate[of.ObjectImage](alloc, @modules, (@cap)::usize, new_cap::usize);
+        if (is_err[*of.ObjectImage, str](gr)) {
+            ret err[u32, str](unwrap_err[*of.ObjectImage, str](gr));
+        }
+        @modules = unwrap_ok[*of.ObjectImage, str](gr);
+        @cap = new_cap;
     }
-    @modules = unwrap_ok[*of.ObjectImage, str](gr);
 
     val arr: *of.ObjectImage = @modules;
     val slot: *of.ObjectImage = ?arr[old];
@@ -414,10 +442,11 @@ fun grow_modules(alloc: *Allocator, modules: **of.ObjectImage, count: *u32) Resu
 # buf_len: length of `buf`
 # modules: in/out — the image array, rebound on growth
 # count:   in/out — current image count
+# cap:     in/out — current backing capacity
 # ret:     ok(true) on success, or an error string
 fun parse_loose(alloc: *Allocator, tgt: *target.Target, buf: *u8, buf_len: usize,
-                modules: **of.ObjectImage, count: *u32) Result[bool, str] {
-    val gr: Result[u32, str] = grow_modules(alloc, modules, count);
+                modules: **of.ObjectImage, count: *u32, cap: *u32) Result[bool, str] {
+    val gr: Result[u32, str] = grow_modules(alloc, modules, count, cap);
     if (is_err[u32, str](gr)) { ret err[bool, str](unwrap_err[u32, str](gr)); }
     val ix: u32 = unwrap_ok[u32, str](gr);
     val arr: *of.ObjectImage = @modules;
@@ -441,9 +470,10 @@ fun parse_loose(alloc: *Allocator, tgt: *target.Target, buf: *u8, buf_len: usize
 # buf_len: length of `buf`
 # modules: in/out — the image array, rebound on growth
 # count:   in/out — current image count
+# cap:     in/out — current backing capacity
 # ret:     ok(true) once every member is parsed, or an error string
 fun parse_archive(s: *sess.Session, tgt: *target.Target, path: str, buf: *u8, buf_len: usize,
-                  modules: **of.ObjectImage, count: *u32) Result[bool, str] {
+                  modules: **of.ObjectImage, count: *u32, cap: *u32) Result[bool, str] {
     val alloc: *Allocator = s.alloc;
     var pos: usize = ar.first_member();
     for (true) {
@@ -454,7 +484,7 @@ fun parse_archive(s: *sess.Session, tgt: *target.Target, path: str, buf: *u8, bu
         if (st.done) { ret ok[bool, str](true); }
 
         if (!ar.is_special(buf, pos)) {
-            val gr: Result[u32, str] = grow_modules(alloc, modules, count);
+            val gr: Result[u32, str] = grow_modules(alloc, modules, count, cap);
             if (is_err[u32, str](gr)) { ret err[bool, str](unwrap_err[u32, str](gr)); }
             val ix: u32 = unwrap_ok[u32, str](gr);
             val arr: *of.ObjectImage = @modules;
