@@ -1,0 +1,744 @@
+# mach.lang.type: semantic type universe shared across sema, middle-end, and backend.
+#
+# `TypeInterner` lives on the session next to `intern.Interner`. it owns
+# every `Type` record produced during sema and hands out stable `TypeId`
+# handles; equality of two `TypeId`s is identity equality.
+#
+# Primitive types (`u8`..`f64`, `ptr`) are pre-allocated by `init` and
+# exposed via `prim(kind)`. There is no builtin string type: the `str`
+# alias for `*u8` is an ordinary stdlib `def` and resolves nominally, not
+# as a primitive here. Compound types are interned by their canonical
+# form: pointer types by base, array types by `(base, count)`, nominal
+# types (`rec`/`uni`) by `(origin, decl)`, generic parameters by
+# `(owner, index)`. Function types are not deduplicated; structural
+# equality of function types is available via `type_equals_signatures`.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.unwrap;
+use std.types.option.is_none;
+use std.types.option.is_some;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use map:   std.collections.map;
+use fnv1a: std.crypto.hash.fnv1a;
+
+use intern: mach.lang.intern;
+use sess:   mach.lang.module;
+use id:     mach.lang.fe.ast.id;
+
+# TypeId: stable handle into a TypeInterner's universe; valid for the interner's lifetime.
+pub def TypeId: u32;
+
+# TYPE_NIL: sentinel TypeId denoting the absence of a type.
+pub val TYPE_NIL: TypeId = 0xFFFFFFFF;
+
+# TYPE_ERROR: sentinel TypeId denoting a type-checking failure. distinct from
+# TYPE_NIL (which means "no type"); error types absorb further operations
+# without cascading diagnostics.
+pub val TYPE_ERROR: TypeId = 0xFFFFFFFE;
+
+# TypeKind: discriminator for Type.data.
+pub def TypeKind: u8;
+
+# primitive type kinds (TYPE_U8 .. TYPE_PTR); these have no payload.
+pub val TYPE_U8:            TypeKind = 0;
+pub val TYPE_U16:           TypeKind = 1;
+pub val TYPE_U32:           TypeKind = 2;
+pub val TYPE_U64:           TypeKind = 3;
+pub val TYPE_I8:            TypeKind = 4;
+pub val TYPE_I16:           TypeKind = 5;
+pub val TYPE_I32:           TypeKind = 6;
+pub val TYPE_I64:           TypeKind = 7;
+pub val TYPE_F32:           TypeKind = 8;
+pub val TYPE_F64:           TypeKind = 9;
+pub val TYPE_PTR:           TypeKind = 10;
+# compound and nominal type kinds; each selects a Type.data payload.
+pub val TYPE_POINTER:       TypeKind = 11;
+pub val TYPE_ARRAY:         TypeKind = 12;
+pub val TYPE_FUN:           TypeKind = 13;
+pub val TYPE_REC:           TypeKind = 14;
+pub val TYPE_UNI:           TypeKind = 15;
+pub val TYPE_GENERIC_PARAM: TypeKind = 16;
+pub val TYPE_INSTANCE:      TypeKind = 17;
+# the AMD64 `__va_list_tag` builtin: a payload-free aggregate the backend
+# lowers to the four-field register-save struct. used by the variadic
+# intrinsics (`va_list` / `va_start` / `va_arg` / `va_end`).
+pub val TYPE_VA_LIST:       TypeKind = 18;
+
+val PRIM_COUNT: u32 = 11;
+
+# TypePointer: pointer-to-T type payload.
+# ---
+# base: pointee TypeId
+pub rec TypePointer {
+    base: TypeId;
+}
+
+# TypeArray: fixed-size array type payload.
+# ---
+# base:  element TypeId
+# count: element count
+pub rec TypeArray {
+    base:  TypeId;
+    count: u32;
+}
+
+# TypeFun: function type payload.
+# ---
+# ret_ty:       return type
+# params_start: index into ti.params for the first parameter type
+# params_len:   number of fixed parameter types
+# variadic:     true when the function accepts a variable number of trailing
+#               arguments after the fixed parameters (C-ABI `...`)
+pub rec TypeFun {
+    ret_ty:       TypeId;
+    params_start: u32;
+    params_len:   u32;
+    variadic:     bool;
+}
+
+# TypeNominal: nominal (rec / uni / def) reference payload. two nominal
+# types are identical iff they refer to the same declaration site.
+# ---
+# name:   interned identifier (for diagnostics; not load-bearing for identity)
+# origin: ModuleId of the declaring module
+# decl:   DeclId of the declaration in `origin`'s Ast
+pub rec TypeNominal {
+    name:   intern.StrId;
+    origin: sess.ModuleId;
+    decl:   id.DeclId;
+}
+
+# TypeGenericParam: placeholder type for a generic parameter as written in a declaration.
+# ---
+# name:  interned identifier (for diagnostics)
+# owner: DeclId of the enclosing generic decl (in its module's Ast)
+# index: ordinal among the owner's generic parameters
+pub rec TypeGenericParam {
+    name:  intern.StrId;
+    owner: id.DeclId;
+    index: u32;
+}
+
+# TypeInstance: concrete instantiation of a generic declaration. two
+# instances are identical iff (target_origin, target_decl) match and the
+# args sequences are element-wise equal.
+# ---
+# target_origin: module that declared the generic
+# target_decl:   declaration in target_origin's Ast
+# args_start:    index into TypeInterner.params
+# args_len:      number of concrete argument types
+pub rec TypeInstance {
+    target_origin: sess.ModuleId;
+    target_decl:   id.DeclId;
+    args_start:    u32;
+    args_len:      u32;
+}
+
+# Type: one type entry in the universe.
+# ---
+# kind: which TYPE_* variant is active
+# data: kind-specific payload; primitives use no payload
+pub rec Type {
+    kind: TypeKind;
+    data: uni {
+        pointer:       TypePointer;
+        array:         TypeArray;
+        fn:            TypeFun;
+        nominal:       TypeNominal;
+        generic_param: TypeGenericParam;
+        instance:      TypeInstance;
+    };
+}
+
+# FieldEntry: one field of a nominal record/union or generic instance, as recorded in the session-global field store.
+# ---
+# name: interned field identifier
+# ty:   interned semantic type of the field
+pub rec FieldEntry {
+    name: intern.StrId;
+    ty:   TypeId;
+}
+
+# FieldTable: the structural field list for one nominal or instance TypeId; fields live in a contiguous slice of the interner's field pool.
+# ---
+# ty:           the TypeId this table describes
+# fields_start: index of the first field in the field pool
+# fields_len:   number of fields
+pub rec FieldTable {
+    ty:           TypeId;
+    fields_start: u32;
+    fields_len:   u32;
+}
+
+# TypeInterner: session-shared interner for the type universe.
+# ---
+# alloc:      allocator backing all owned arrays
+# types:      universe of Type records indexed by TypeId
+# type_len:   number of types stored
+# type_cap:   allocated slots in types
+# params:     pool of TypeIds referenced by TypeFun
+# params_len: number of TypeIds stored
+# params_cap: allocated slots in params
+# dedup:      Type -> TypeId map; populated for kinds with self-contained payloads
+# prims:      pre-allocated TypeIds for each primitive TypeKind, indexed by kind
+# field_tables:    one FieldTable per nominal / instance TypeId that has a field layout; built once and shared session-wide so any module can resolve a cross-module record's fields
+# field_table_len: number of field tables stored
+# field_table_cap: allocated slots in field_tables
+# field_pool:      contiguous FieldEntry storage backing field_tables
+# field_pool_len:  number of FieldEntries stored
+# field_pool_cap:  allocated slots in field_pool
+pub rec TypeInterner {
+    alloc: *Allocator;
+
+    types:    *Type;
+    type_len: u32;
+    type_cap: u32;
+
+    params:     *TypeId;
+    params_len: u32;
+    params_cap: u32;
+
+    dedup: map.Map[Type, TypeId];
+
+    prims: [11]TypeId;
+
+    field_tables:    *FieldTable;
+    field_table_len: u32;
+    field_table_cap: u32;
+
+    field_pool:     *FieldEntry;
+    field_pool_len: u32;
+    field_pool_cap: u32;
+}
+
+val INITIAL_TYPE_CAP:   u32 = 64;
+val INITIAL_PARAMS_CAP: u32 = 32;
+
+# init: construct an empty interner with primitives pre-allocated.
+# ---
+# alloc: allocator used for all owned storage
+# ret:   a populated TypeInterner, or an allocation error
+pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
+    var ti: TypeInterner;
+    ti.alloc      = alloc;
+    ti.types      = nil;
+    ti.type_len   = 0;
+    ti.type_cap   = 0;
+    ti.params     = nil;
+    ti.params_len = 0;
+    ti.params_cap = 0;
+    ti.dedup      = map.init[Type, TypeId](alloc, hash_type, eq_type);
+    ti.field_tables    = nil;
+    ti.field_table_len = 0;
+    ti.field_table_cap = 0;
+    ti.field_pool      = nil;
+    ti.field_pool_len  = 0;
+    ti.field_pool_cap  = 0;
+
+    val ra: Result[*Type, str] = allocate[Type](alloc, INITIAL_TYPE_CAP::usize);
+    if (is_err[*Type, str](ra)) {
+        map.dnit[Type, TypeId](?ti.dedup);
+        ret err[TypeInterner, str](unwrap_err[*Type, str](ra));
+    }
+    ti.types    = unwrap_ok[*Type, str](ra);
+    ti.type_cap = INITIAL_TYPE_CAP;
+
+    val rp: Result[*TypeId, str] = allocate[TypeId](alloc, INITIAL_PARAMS_CAP::usize);
+    if (is_err[*TypeId, str](rp)) {
+        deallocate[Type](alloc, ti.types, ti.type_cap::usize);
+        map.dnit[Type, TypeId](?ti.dedup);
+        ret err[TypeInterner, str](unwrap_err[*TypeId, str](rp));
+    }
+    ti.params     = unwrap_ok[*TypeId, str](rp);
+    ti.params_cap = INITIAL_PARAMS_CAP;
+
+    var k: u32 = 0;
+    for (k < PRIM_COUNT) {
+        var prim: Type;
+        prim.kind = k::TypeKind;
+        val pr: Result[TypeId, str] = append_type(?ti, prim);
+        if (is_err[TypeId, str](pr)) {
+            deallocate[TypeId](alloc, ti.params, ti.params_cap::usize);
+            deallocate[Type](alloc, ti.types, ti.type_cap::usize);
+            map.dnit[Type, TypeId](?ti.dedup);
+            ret err[TypeInterner, str](unwrap_err[TypeId, str](pr));
+        }
+        val tid: TypeId = unwrap_ok[TypeId, str](pr);
+        ti.prims[k] = tid;
+        val ins: Result[bool, str] = map.insert[Type, TypeId](?ti.dedup, prim, tid);
+        if (is_err[bool, str](ins)) {
+            deallocate[TypeId](alloc, ti.params, ti.params_cap::usize);
+            deallocate[Type](alloc, ti.types, ti.type_cap::usize);
+            map.dnit[Type, TypeId](?ti.dedup);
+            ret err[TypeInterner, str](unwrap_err[bool, str](ins));
+        }
+        k = k + 1;
+    }
+
+    ret ok[TypeInterner, str](ti);
+}
+
+# dnit: release every owned array.
+# ---
+# ti: the interner to tear down; all fields are zeroed
+pub fun dnit(ti: *TypeInterner) {
+    if (ti == nil) { ret; }
+    if (ti.types != nil && ti.type_cap > 0) {
+        deallocate[Type](ti.alloc, ti.types, ti.type_cap::usize);
+    }
+    if (ti.params != nil && ti.params_cap > 0) {
+        deallocate[TypeId](ti.alloc, ti.params, ti.params_cap::usize);
+    }
+    if (ti.field_tables != nil && ti.field_table_cap > 0) {
+        deallocate[FieldTable](ti.alloc, ti.field_tables, ti.field_table_cap::usize);
+    }
+    if (ti.field_pool != nil && ti.field_pool_cap > 0) {
+        deallocate[FieldEntry](ti.alloc, ti.field_pool, ti.field_pool_cap::usize);
+    }
+    map.dnit[Type, TypeId](?ti.dedup);
+    ti.types      = nil;
+    ti.type_len   = 0;
+    ti.type_cap   = 0;
+    ti.params     = nil;
+    ti.params_len = 0;
+    ti.params_cap = 0;
+    ti.field_tables    = nil;
+    ti.field_table_len = 0;
+    ti.field_table_cap = 0;
+    ti.field_pool      = nil;
+    ti.field_pool_len  = 0;
+    ti.field_pool_cap  = 0;
+}
+
+# prim: return the TypeId for a primitive TypeKind.
+# ---
+# ti:   the interner
+# kind: a primitive kind (TYPE_U8 .. TYPE_PTR)
+# ret:  some(TypeId) for a primitive kind, none when kind is not a primitive
+pub fun prim(ti: *TypeInterner, kind: TypeKind) Option[TypeId] {
+    if (kind::u32 >= PRIM_COUNT) { ret none[TypeId](); }
+    ret some[TypeId](ti.prims[kind::u32]);
+}
+
+# field_table_for: the field table describing nominal or instance TypeId `ty`, or none when none has been registered yet.
+# ---
+# ti: the interner
+# ty: the TypeId to look up
+# ret: some(*FieldTable) when present, none otherwise
+pub fun field_table_for(ti: *TypeInterner, ty: TypeId) Option[*FieldTable] {
+    var i: u32 = 0;
+    for (i < ti.field_table_len) {
+        if (ti.field_tables[i].ty == ty) { ret some[*FieldTable](?ti.field_tables[i]); }
+        i = i + 1;
+    }
+    ret none[*FieldTable]();
+}
+
+# field_table_begin: begin a new field table for TypeId `ty`, returning its index; fields are appended with field_table_push. each TypeId interns to a stable id, so a table is built once and shared session-wide.
+# ---
+# ti: the interner
+# ty: the TypeId the table describes
+# ret: the new table's index, or an allocation error
+pub fun field_table_begin(ti: *TypeInterner, ty: TypeId) Result[u32, str] {
+    if (ti.field_table_len == ti.field_table_cap) {
+        var new_cap: u32 = ti.field_table_cap * 2;
+        if (new_cap == 0) { new_cap = 16; }
+        if (ti.field_tables == nil) {
+            val ar: Result[*FieldTable, str] = allocate[FieldTable](ti.alloc, new_cap::usize);
+            if (is_err[*FieldTable, str](ar)) { ret err[u32, str](unwrap_err[*FieldTable, str](ar)); }
+            ti.field_tables = unwrap_ok[*FieldTable, str](ar);
+        } or {
+            val rr: Result[*FieldTable, str] = reallocate[FieldTable](ti.alloc, ti.field_tables, ti.field_table_cap::usize, new_cap::usize);
+            if (is_err[*FieldTable, str](rr)) { ret err[u32, str](unwrap_err[*FieldTable, str](rr)); }
+            ti.field_tables = unwrap_ok[*FieldTable, str](rr);
+        }
+        ti.field_table_cap = new_cap;
+    }
+    var ft: FieldTable;
+    ft.ty           = ty;
+    ft.fields_start = ti.field_pool_len;
+    ft.fields_len   = 0;
+    val idx: u32 = ti.field_table_len;
+    ti.field_tables[idx] = ft;
+    ti.field_table_len = ti.field_table_len + 1;
+    ret ok[u32, str](idx);
+}
+
+# field_table_push: append one `(name, ty)` field to the table at `table_idx`, growing the shared field pool as needed. fields must be pushed contiguously, before any other table is begun.
+# ---
+# ti:        the interner
+# table_idx: index returned by field_table_begin
+# name:      interned field identifier
+# ty:        interned semantic type of the field
+# ret:       true on success, or an allocation error
+pub fun field_table_push(ti: *TypeInterner, table_idx: u32, name: intern.StrId, ty: TypeId) Result[bool, str] {
+    if (ti.field_pool_len == ti.field_pool_cap) {
+        var new_cap: u32 = ti.field_pool_cap * 2;
+        if (new_cap == 0) { new_cap = 64; }
+        if (ti.field_pool == nil) {
+            val ar: Result[*FieldEntry, str] = allocate[FieldEntry](ti.alloc, new_cap::usize);
+            if (is_err[*FieldEntry, str](ar)) { ret err[bool, str](unwrap_err[*FieldEntry, str](ar)); }
+            ti.field_pool = unwrap_ok[*FieldEntry, str](ar);
+        } or {
+            val rr: Result[*FieldEntry, str] = reallocate[FieldEntry](ti.alloc, ti.field_pool, ti.field_pool_cap::usize, new_cap::usize);
+            if (is_err[*FieldEntry, str](rr)) { ret err[bool, str](unwrap_err[*FieldEntry, str](rr)); }
+            ti.field_pool = unwrap_ok[*FieldEntry, str](rr);
+        }
+        ti.field_pool_cap = new_cap;
+    }
+    var fe: FieldEntry;
+    fe.name = name;
+    fe.ty   = ty;
+    ti.field_pool[ti.field_pool_len] = fe;
+    ti.field_pool_len = ti.field_pool_len + 1;
+    ti.field_tables[table_idx].fields_len = ti.field_tables[table_idx].fields_len + 1;
+    ret ok[bool, str](true);
+}
+
+# field_count: the number of fields registered for TypeId `ty`, or 0 when no table exists.
+# ---
+# ti: the interner
+# ty: the TypeId to inspect
+# ret: the field count
+pub fun field_count(ti: *TypeInterner, ty: TypeId) u32 {
+    val ft_opt: Option[*FieldTable] = field_table_for(ti, ty);
+    if (is_none[*FieldTable](ft_opt)) { ret 0; }
+    ret unwrap[*FieldTable](ft_opt).fields_len;
+}
+
+# field_at: the `(name, ty)` entry at ordinal `ix` of TypeId `ty`'s table, or none when out of range or no table exists.
+# ---
+# ti: the interner
+# ty: the TypeId to inspect
+# ix: the field ordinal
+# ret: some(*FieldEntry) on success, none otherwise
+pub fun field_at(ti: *TypeInterner, ty: TypeId, ix: u32) Option[*FieldEntry] {
+    val ft_opt: Option[*FieldTable] = field_table_for(ti, ty);
+    if (is_none[*FieldTable](ft_opt)) { ret none[*FieldEntry](); }
+    val ft: *FieldTable = unwrap[*FieldTable](ft_opt);
+    if (ix >= ft.fields_len) { ret none[*FieldEntry](); }
+    ret some[*FieldEntry](?ti.field_pool[ft.fields_start + ix]);
+}
+
+# intern_pointer: intern a pointer-to type. returns an existing TypeId
+# when the same base has been interned before.
+# ---
+# ti:   the interner
+# base: pointee TypeId
+# ret:  TypeId for *base, or an allocation error
+pub fun intern_pointer(ti: *TypeInterner, base: TypeId) Result[TypeId, str] {
+    var t: Type;
+    t.kind = TYPE_POINTER;
+    t.data.pointer.base = base;
+    ret intern_dedup(ti, t);
+}
+
+# intern_array: intern a fixed-size array type. returns an existing TypeId
+# when the same (base, count) pair has been interned before.
+# ---
+# ti:    the interner
+# base:  element TypeId
+# count: element count
+# ret:   TypeId for [count]base, or an allocation error
+pub fun intern_array(ti: *TypeInterner, base: TypeId, count: u32) Result[TypeId, str] {
+    var t: Type;
+    t.kind = TYPE_ARRAY;
+    t.data.array.base  = base;
+    t.data.array.count = count;
+    ret intern_dedup(ti, t);
+}
+
+# intern_va_list: intern the builtin `va_list` type. payload-free, so it
+# dedups by kind alone (one shared TypeId per interner).
+# ---
+# ti:  the interner
+# ret: the TypeId for `va_list`, or an allocation error
+pub fun intern_va_list(ti: *TypeInterner) Result[TypeId, str] {
+    var t: Type;
+    t.kind = TYPE_VA_LIST;
+    ret intern_dedup(ti, t);
+}
+
+# intern_nominal: intern a nominal type (rec / uni). two nominal types
+# intern to the same TypeId iff their (origin, decl) pairs match.
+# ---
+# ti:     the interner
+# name:   interned identifier (diagnostic only)
+# origin: declaring module
+# decl:   declaration in origin's Ast
+# kind:   TYPE_REC or TYPE_UNI
+# ret:    TypeId for the nominal type, or an allocation error
+pub fun intern_nominal(ti: *TypeInterner, name: intern.StrId, origin: sess.ModuleId, decl: id.DeclId, kind: TypeKind) Result[TypeId, str] {
+    var t: Type;
+    t.kind = kind;
+    t.data.nominal.name   = name;
+    t.data.nominal.origin = origin;
+    t.data.nominal.decl   = decl;
+    ret intern_dedup(ti, t);
+}
+
+# intern_generic_param: intern a generic parameter placeholder. two
+# generic params intern to the same TypeId iff they share an (owner,
+# index) pair.
+# ---
+# ti:    the interner
+# name:  interned identifier (diagnostic only)
+# owner: enclosing generic DeclId
+# index: ordinal among the owner's generic parameters
+# ret:   TypeId for the generic param, or an allocation error
+pub fun intern_generic_param(ti: *TypeInterner, name: intern.StrId, owner: id.DeclId, index: u32) Result[TypeId, str] {
+    var t: Type;
+    t.kind = TYPE_GENERIC_PARAM;
+    t.data.generic_param.name  = name;
+    t.data.generic_param.owner = owner;
+    t.data.generic_param.index = index;
+    ret intern_dedup(ti, t);
+}
+
+# intern_function: append a function type. parameter list is copied into
+# the side pool. function types are not currently deduplicated; structural
+# equivalence is available via `type_equals_signatures`. callers that need
+# pointer-equal function types (e.g. cached vtable slots) should
+# canonicalize at a higher layer.
+# ---
+# ti:       the interner
+# ret_ty:   return type
+# params:   pointer to a contiguous array of fixed parameter TypeIds
+# count:    number of fixed parameter types
+# variadic: true when the function accepts trailing variadic arguments
+# ret:      a fresh TypeId for the function, or an allocation error
+pub fun intern_function(ti: *TypeInterner, ret_ty: TypeId, params: *TypeId, count: u32, variadic: bool) Result[TypeId, str] {
+    val start: u32 = ti.params_len;
+    val rp: Result[bool, str] = reserve_params(ti, count);
+    if (is_err[bool, str](rp)) { ret err[TypeId, str](unwrap_err[bool, str](rp)); }
+    var i: u32 = 0;
+    for (i < count) {
+        ti.params[start + i] = params[i];
+        i = i + 1;
+    }
+    ti.params_len = start + count;
+
+    var t: Type;
+    t.kind = TYPE_FUN;
+    t.data.fn.ret_ty          = ret_ty;
+    t.data.fn.params_start = start;
+    t.data.fn.params_len   = count;
+    t.data.fn.variadic     = variadic;
+    ret append_type(ti, t);
+}
+
+# intern_instance: intern a generic instantiation `(target_origin,
+# target_decl)<args>`. linear-scans existing TYPE_INSTANCE entries for a
+# match before appending; on miss, copies args into the params pool and
+# appends a fresh TypeInstance record. TYPE_INSTANCE bypasses the dedup
+# map (hash is awkward with args living in a side pool); instance counts
+# are small enough that linear scan is acceptable.
+# ---
+# ti:            the interner
+# target_origin: module that declared the generic
+# target_decl:   declaration in target_origin's Ast
+# args:          pointer to a contiguous array of concrete arg types
+# count:         number of argument types
+# ret:           the (deduped) TypeId for the instance, or an allocation error
+pub fun intern_instance(ti: *TypeInterner, target_origin: sess.ModuleId, target_decl: id.DeclId, args: *TypeId, count: u32) Result[TypeId, str] {
+    var i: u32 = 0;
+    for (i < ti.type_len) {
+        val ex: *Type = ?ti.types[i];
+        if (ex.kind == TYPE_INSTANCE
+            && ex.data.instance.target_origin == target_origin
+            && ex.data.instance.target_decl   == target_decl
+            && ex.data.instance.args_len      == count) {
+            var match: bool = true;
+            var j:     u32  = 0;
+            for (j < count) {
+                if (ti.params[ex.data.instance.args_start + j] != args[j]) {
+                    match = false;
+                    brk;
+                }
+                j = j + 1;
+            }
+            if (match) { ret ok[TypeId, str](i); }
+        }
+        i = i + 1;
+    }
+
+    val start: u32 = ti.params_len;
+    val rp: Result[bool, str] = reserve_params(ti, count);
+    if (is_err[bool, str](rp)) { ret err[TypeId, str](unwrap_err[bool, str](rp)); }
+    var k: u32 = 0;
+    for (k < count) {
+        ti.params[start + k] = args[k];
+        k = k + 1;
+    }
+    ti.params_len = start + count;
+
+    var t: Type;
+    t.kind = TYPE_INSTANCE;
+    t.data.instance.target_origin = target_origin;
+    t.data.instance.target_decl   = target_decl;
+    t.data.instance.args_start    = start;
+    t.data.instance.args_len      = count;
+    ret append_type(ti, t);
+}
+
+# get: return a pointer to the Type for a given TypeId, or none when tid
+# is out of range.
+# ---
+# ti:  the interner
+# tid: TypeId returned by a previous intern call
+# ret: some(*Type) into ti.types (invalidated by a later intern that grows the array), or none
+pub fun get(ti: *TypeInterner, tid: TypeId) Option[*Type] {
+    if (tid >= ti.type_len) { ret none[*Type](); }
+    ret some[*Type](?ti.types[tid]);
+}
+
+# get_param: return the TypeId at `index` in the parameter pool, or none
+# when index is out of range.
+# ---
+# ti:    the interner
+# index: pool index (typically `fun.params_start + i`)
+# ret:   some(TypeId) at the given pool slot, or none
+pub fun get_param(ti: *TypeInterner, index: u32) Option[TypeId] {
+    if (index >= ti.params_len) { ret none[TypeId](); }
+    ret some[TypeId](ti.params[index]);
+}
+
+# type_equals_signatures: structural equivalence for two function types.
+# used by sema where function-type identity is insufficient (signatures
+# can match without being the same interned TypeId).
+# ---
+# ti:  the interner
+# a:   first TypeId; must be TYPE_FUN
+# b:   second TypeId; must be TYPE_FUN
+# ret: true when both have matching return type and parameter sequence
+pub fun type_equals_signatures(ti: *TypeInterner, a: TypeId, b: TypeId) bool {
+    if (a == b) { ret true; }
+    if (a >= ti.type_len || b >= ti.type_len) { ret false; }
+    val ta: *Type = ?ti.types[a];
+    val tb: *Type = ?ti.types[b];
+    if (ta.kind != TYPE_FUN || tb.kind != TYPE_FUN) { ret false; }
+    if (ta.data.fn.ret_ty != tb.data.fn.ret_ty) { ret false; }
+    if (ta.data.fn.variadic != tb.data.fn.variadic) { ret false; }
+    if (ta.data.fn.params_len != tb.data.fn.params_len) { ret false; }
+    var i: u32 = 0;
+    for (i < ta.data.fn.params_len) {
+        if (ti.params[ta.data.fn.params_start + i] != ti.params[tb.data.fn.params_start + i]) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# intern_dedup: return the existing TypeId for `t` via the dedup map, or append it and record the mapping.
+fun intern_dedup(ti: *TypeInterner, t: Type) Result[TypeId, str] {
+    val cached: Result[*TypeId, str] = map.get[Type, TypeId](?ti.dedup, ?t);
+    if (is_ok[*TypeId, str](cached)) {
+        ret ok[TypeId, str](@unwrap_ok[*TypeId, str](cached));
+    }
+    val ap: Result[TypeId, str] = append_type(ti, t);
+    if (is_err[TypeId, str](ap)) { ret ap; }
+    val tid: TypeId = unwrap_ok[TypeId, str](ap);
+    val ins: Result[bool, str] = map.insert[Type, TypeId](?ti.dedup, t, tid);
+    if (is_err[bool, str](ins)) { ret err[TypeId, str](unwrap_err[bool, str](ins)); }
+    ret ok[TypeId, str](tid);
+}
+
+# append_type: append `t` to the universe (growing it as needed) and return its fresh TypeId.
+fun append_type(ti: *TypeInterner, t: Type) Result[TypeId, str] {
+    if (ti.type_len == ti.type_cap) {
+        val new_cap: u32 = ti.type_cap * 2;
+        val r: Result[*Type, str] = reallocate[Type](ti.alloc, ti.types, ti.type_cap::usize, new_cap::usize);
+        if (is_err[*Type, str](r)) { ret err[TypeId, str](unwrap_err[*Type, str](r)); }
+        ti.types    = unwrap_ok[*Type, str](r);
+        ti.type_cap = new_cap;
+    }
+    val tid: TypeId = ti.type_len;
+    ti.types[ti.type_len] = t;
+    ti.type_len = ti.type_len + 1;
+    ret ok[TypeId, str](tid);
+}
+
+# reserve_params: ensure the parameter pool has room for `need` more TypeIds, growing it if not.
+fun reserve_params(ti: *TypeInterner, need: u32) Result[bool, str] {
+    if (ti.params_len + need <= ti.params_cap) { ret ok[bool, str](true); }
+    var new_cap: u32 = ti.params_cap;
+    if (new_cap == 0) { new_cap = INITIAL_PARAMS_CAP; }
+    for (ti.params_len + need > new_cap) { new_cap = new_cap * 2; }
+    val r: Result[*TypeId, str] = reallocate[TypeId](ti.alloc, ti.params, ti.params_cap::usize, new_cap::usize);
+    if (is_err[*TypeId, str](r)) { ret err[bool, str](unwrap_err[*TypeId, str](r)); }
+    ti.params     = unwrap_ok[*TypeId, str](r);
+    ti.params_cap = new_cap;
+    ret ok[bool, str](true);
+}
+
+# hash_type: structural FNV-1a hash over Type's identity-bearing fields.
+# function types bypass dedup, so this never hashes one.
+fun hash_type(p: ptr) u64 {
+    val t: *Type = p::*Type;
+    var h: u64 = fnv1a.init();
+    h = fnv1a.step_u8(h, t.kind::u8);
+    if (t.kind == TYPE_POINTER) {
+        h = fnv1a.step_u32(h, t.data.pointer.base::u32);
+    }
+    or (t.kind == TYPE_ARRAY) {
+        h = fnv1a.step_u32(h, t.data.array.base::u32);
+        h = fnv1a.step_u32(h, t.data.array.count);
+    }
+    or (t.kind == TYPE_REC || t.kind == TYPE_UNI) {
+        h = fnv1a.step_u32(h, t.data.nominal.origin::u32);
+        h = fnv1a.step_u32(h, t.data.nominal.decl::u32);
+    }
+    or (t.kind == TYPE_GENERIC_PARAM) {
+        h = fnv1a.step_u32(h, t.data.generic_param.owner::u32);
+        h = fnv1a.step_u32(h, t.data.generic_param.index);
+    }
+    ret h;
+}
+
+# eq_type: structural equality over two Types' identity-bearing fields; primitives compare by kind alone.
+fun eq_type(pa: ptr, pb: ptr) bool {
+    val a: *Type = pa::*Type;
+    val b: *Type = pb::*Type;
+    if (a.kind != b.kind) { ret false; }
+    if (a.kind == TYPE_POINTER) {
+        ret a.data.pointer.base == b.data.pointer.base;
+    }
+    if (a.kind == TYPE_ARRAY) {
+        ret a.data.array.base == b.data.array.base
+            && a.data.array.count == b.data.array.count;
+    }
+    if (a.kind == TYPE_REC || a.kind == TYPE_UNI) {
+        ret a.data.nominal.origin == b.data.nominal.origin
+            && a.data.nominal.decl == b.data.nominal.decl;
+    }
+    if (a.kind == TYPE_GENERIC_PARAM) {
+        ret a.data.generic_param.owner == b.data.generic_param.owner
+            && a.data.generic_param.index == b.data.generic_param.index;
+    }
+    # primitives and TYPE_ERROR are equal by kind alone
+    ret true;
+}

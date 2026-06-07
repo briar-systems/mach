@@ -1,0 +1,331 @@
+# mach.lang.fe.sema.context: sema's shared working state and accessor API.
+#
+# `SemaContext` (and the field-table machinery hung off it) is the state the
+# infer / check / generics / coerce passes mutate in place. it lives in this
+# leaf — apart from the `sema` orchestrator that runs the passes — so the
+# passes can take a `*SemaContext` without importing the orchestrator, which
+# would close an import cycle.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+
+use sess:     mach.lang.module;
+use session:  mach.lang.session;
+use diag:     mach.lang.diagnostic;
+use intern:   mach.lang.intern;
+use type:     mach.lang.type;
+
+use ast:      mach.lang.fe.ast;
+use id:       mach.lang.fe.ast.id;
+use decl:     mach.lang.fe.ast.decl;
+use token:    mach.lang.fe.token;
+use comptime: mach.lang.fe.comptime;
+use resolve:  mach.lang.fe.resolve;
+
+# SemaResult: per-module typing data, produced by `sema` and consumed by lowering and the driver's export step.
+# ---
+# alloc:            allocator backing every owned array on the result
+# expr_type:        parallel to ast.exprs; the semantic type of each expression
+# type_resolved_ty: parallel to ast.types; the interned TypeId for each syntactic AstType
+# decl_type:        parallel to ast.decls; the declared (or inferred) type of each binding decl
+# expr_count:       length of expr_type
+# type_count:       length of type_resolved_ty
+# decl_count:       length of decl_type
+pub rec SemaResult {
+    alloc:            *Allocator;
+    expr_type:        *type.TypeId;
+    type_resolved_ty: *type.TypeId;
+    decl_type:        *type.TypeId;
+    expr_count:       u32;
+    type_count:       u32;
+    decl_count:       u32;
+}
+
+# ModuleSema: a snapshot of one previously-sema'd module's decl_type array, exposed to dependents so cross-module references can look up signature TypeIds without dragging in the whole SemaResult.
+# ---
+# path:       interned FQN of the module
+# module:     ModuleId of the owning module
+# decl_type:  borrowed reference to the producer's SemaResult.decl_type
+# decl_count: length of the borrowed array
+pub rec ModuleSema {
+    path:       intern.StrId;
+    module:     sess.ModuleId;
+    decl_type:  *type.TypeId;
+    decl_count: u32;
+}
+
+# SemaDeps: every dependency's typing snapshot, supplied by the driver; sema looks these up by ModuleId when resolving cross-module symbol types.
+# ---
+# entries: array of ModuleSema snapshots, one per loaded dep
+# count:   number of entries
+pub rec SemaDeps {
+    entries: *ModuleSema;
+    count:   u32;
+}
+
+# field tables and their entries are owned by the session-global type
+# interner (`type.FieldStore`), so a record's field layout is built once by
+# its origin module and visible to every dependent. these forward the names
+# so callers can keep spelling them `sema.FieldEntry` / `sema.FieldTable`.
+fwd type.FieldEntry;
+fwd type.FieldTable;
+
+# SemaContext: sema's working state for one module-analysis, owned by `sema` for one pass and transferred into the returned SemaResult by `build_result`; its parallel arrays and field tables are mutated in place by the infer / check / generics sub-modules through *SemaContext.
+# ---
+# s:                shared session (allocator, diagnostics, interners)
+# a:                parsed Ast for the module being analysed
+# rr:               name-resolution output for the same module
+# deps:             typing snapshots of every dependency
+# ctx:              comptime context (array-length evaluation)
+# own_module:       project-wide ModuleId of the module being analysed
+# source:           source text of the module (span -> identifier text)
+# expr_type:        parallel to ast.exprs; written by infer_expr
+# type_resolved_ty: parallel to ast.types; written by resolve_type_ref
+# decl_type:        parallel to ast.decls; written by infer_decl
+# anon_counter:     next ordinal for synthetic anonymous rec/uni names
+pub rec SemaContext {
+    s:          *session.Session;
+    a:          *ast.Ast;
+    rr:         *resolve.ResolveResult;
+    deps:       *SemaDeps;
+    ctx:        *comptime.ComptimeCtx;
+    own_module: sess.ModuleId;
+    source:     str;
+
+    expr_type:        *type.TypeId;
+    type_resolved_ty: *type.TypeId;
+    decl_type:        *type.TypeId;
+
+    anon_counter: u32;
+
+    # the call-callee expression currently being inferred, or EXPR_NIL. set
+    # transiently by infer_call so infer_ident permits a comptime-parameter
+    # function in callee position (it is a template, callable but not a value) and
+    # rejects it everywhere else.
+    callee_eid: id.ExprId;
+}
+
+# resolved_type_of: returns the interned TypeId a syntactic AstType resolved to, or TYPE_ERROR/TYPE_NIL for out-of-range or absent ids.
+# ---
+# sc:      sema context
+# ast_tid: the syntactic AstType id
+# ret:     the resolved semantic TypeId
+pub fun resolved_type_of(sc: *SemaContext, ast_tid: id.TypeId) type.TypeId {
+    if (ast_tid == id.TYPE_NIL) { ret type.TYPE_NIL; }
+    if (sc.type_resolved_ty == nil) { ret type.TYPE_ERROR; }
+    if (ast_tid >= sc.a.type_len::u32) { ret type.TYPE_ERROR; }
+    ret sc.type_resolved_ty[ast_tid];
+}
+
+# find_module_sema: locates the ModuleSema snapshot for a dependency by its ModuleId, used by the infer / generics sub-modules for cross-module signature lookup.
+# ---
+# sc:     sema context
+# module: project-wide ModuleId to find among the deps
+# ret:    some(*ModuleSema) when the module is a recorded dep, none otherwise
+pub fun find_module_sema(sc: *SemaContext, module: sess.ModuleId) Option[*ModuleSema] {
+    if (sc.deps == nil) { ret none[*ModuleSema](); }
+    var i: u32 = 0;
+    for (i < sc.deps.count) {
+        val ms: *ModuleSema = ?sc.deps.entries[i];
+        if (ms.module == module) { ret some[*ModuleSema](ms); }
+        i = i + 1;
+    }
+    ret none[*ModuleSema]();
+}
+
+# decl_type_for: resolves a resolved symbol's declared type, reading local symbols from this module's decl_type and imported symbols from their dep's ModuleSema snapshot; returns TYPE_ERROR when the symbol or its type cannot be found.
+# ---
+# sc:  sema context
+# sym: the resolved Symbol whose declared type is wanted
+# ret: the symbol's declared TypeId, or TYPE_ERROR
+pub fun decl_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
+    if (sym.decl == id.DECL_NIL) { ret type.TYPE_ERROR; }
+
+    # parameters and generic parameters share the enclosing function's DeclId
+    # and are distinguished only by `slot`; their types are not stored in
+    # `decl_type` (which is keyed by DeclId) but recovered from the function
+    # declaration's parameter / generic lists.
+    if (sym.kind == resolve.SYM_PARAM) { ret param_type_for(sc, sym); }
+    if (sym.kind == resolve.SYM_GENERIC) { ret generic_param_type_for(sc, sym); }
+
+    if (sym.origin == sc.own_module) {
+        if (sc.decl_type == nil) { ret type.TYPE_ERROR; }
+        if (sym.decl >= sc.a.decl_len::u32) { ret type.TYPE_ERROR; }
+        ret sc.decl_type[sym.decl];
+    }
+    val ms_opt: Option[*ModuleSema] = find_module_sema(sc, sym.origin);
+    if (is_none[*ModuleSema](ms_opt)) { ret type.TYPE_ERROR; }
+    val ms: *ModuleSema = unwrap[*ModuleSema](ms_opt);
+    if (ms.decl_type == nil || sym.decl >= ms.decl_count) { ret type.TYPE_ERROR; }
+    ret ms.decl_type[sym.decl];
+}
+
+# param_type_for: the declared type of a SYM_PARAM, read from the enclosing
+# function's parameter list at `sym.slot`. the parameter's syntactic type
+# already has its interned TypeId in the resolved-type table, so a value-
+# position reference to the parameter yields exactly the type the signature
+# was built from (including a `TYPE_GENERIC_PARAM` for a generic function).
+fun param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
+    val f_opt: Option[*decl.DeclFun] = fun_decl_for(sc, sym.decl);
+    if (is_none[*decl.DeclFun](f_opt)) { ret type.TYPE_ERROR; }
+    val f: *decl.DeclFun = unwrap[*decl.DeclFun](f_opt);
+    if (sym.slot >= f.params_len) { ret type.TYPE_ERROR; }
+    val tn: *decl.TypedName = ?sc.a.typed_names[f.params_start + sym.slot];
+    ret resolved_type_of(sc, tn.ty);
+}
+
+# generic_param_type_for: the `TYPE_GENERIC_PARAM` a SYM_GENERIC denotes,
+# interned by (owner decl, ordinal). a value-position reference to a generic
+# parameter is rare but well-formed (e.g. `$size_of(T)`); resolving it to the
+# same placeholder the signature uses keeps substitution consistent.
+fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
+    val r: Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.decl, sym.slot);
+    if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+    ret unwrap_ok[type.TypeId, str](r);
+}
+
+# fun_decl_for: the DeclFun payload of a function DeclId, or none when the id
+# is out of range or names a non-function declaration.
+fun fun_decl_for(sc: *SemaContext, did: id.DeclId) Option[*decl.DeclFun] {
+    val d_opt: Option[*decl.Decl] = ast.get_decl(sc.a, did);
+    if (is_none[*decl.Decl](d_opt)) { ret none[*decl.DeclFun](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_FUN) { ret none[*decl.DeclFun](); }
+    ret some[*decl.DeclFun](?d.data.fun_);
+}
+
+# symbol_for_expr: resolves the Symbol an expression's IDENT references, via the resolve result's expr_resolved parallel array; returns none when the slot is out of range or unresolved (SYMBOL_NIL).
+# ---
+# sc:  sema context
+# eid: the IDENT expression id
+# ret: some(*Symbol) when resolved, none otherwise
+pub fun symbol_for_expr(sc: *SemaContext, eid: id.ExprId) Option[*resolve.Symbol] {
+    if (sc.rr == nil || sc.rr.expr_resolved == nil) { ret none[*resolve.Symbol](); }
+    if (eid >= sc.rr.expr_count) { ret none[*resolve.Symbol](); }
+    val sid: resolve.SymbolId = sc.rr.expr_resolved[eid];
+    ret symbol_by_id(sc, sid);
+}
+
+# symbol_for_type: resolves the Symbol a syntactic AstType's NAMED reference points at, via the resolve result's type_resolved parallel array.
+# ---
+# sc:  sema context
+# tid: the syntactic AstType id
+# ret: some(*Symbol) when resolved, none otherwise
+pub fun symbol_for_type(sc: *SemaContext, tid: id.TypeId) Option[*resolve.Symbol] {
+    if (sc.rr == nil || sc.rr.type_resolved == nil) { ret none[*resolve.Symbol](); }
+    if (tid >= sc.rr.type_count) { ret none[*resolve.Symbol](); }
+    val sid: resolve.SymbolId = sc.rr.type_resolved[tid];
+    ret symbol_by_id(sc, sid);
+}
+
+# symbol_by_id: returns the Symbol at SymbolId `sid` in the resolve result, or none for SYMBOL_NIL / out-of-range ids.
+# ---
+# sc:  sema context
+# sid: a SymbolId into the resolve result's symbol table
+# ret: some(*Symbol) when valid, none otherwise
+pub fun symbol_by_id(sc: *SemaContext, sid: resolve.SymbolId) Option[*resolve.Symbol] {
+    if (sid == resolve.SYMBOL_NIL) { ret none[*resolve.Symbol](); }
+    if (sc.rr == nil || sc.rr.symbols == nil) { ret none[*resolve.Symbol](); }
+    if (sid >= sc.rr.symbol_count) { ret none[*resolve.Symbol](); }
+    ret some[*resolve.Symbol](?sc.rr.symbols[sid]);
+}
+
+# report: emits a SEVERITY_ERROR diagnostic at `span` with `message`; allocation failures in the diagnostic sink are swallowed so a single out-of-memory diagnostic does not abort the whole pass.
+# ---
+# sc:      sema context
+# span:    source span the diagnostic refers to
+# message: human-readable error text
+pub fun report(sc: *SemaContext, span: token.Span, message: str) {
+    diag.error(?sc.s.diags, sc.a.file_id, span, message);
+}
+
+# report_note: like report, but also attaches a static secondary `note:` line
+# clarifying the error; allocation failures in the sink are swallowed.
+# ---
+# sc:      sema context
+# span:    source span the diagnostic refers to
+# message: human-readable error text
+# note:    secondary clarifying message rendered on a `note:` line
+pub fun report_note(sc: *SemaContext, span: token.Span, message: str, note: str) {
+    diag.error(?sc.s.diags, sc.a.file_id, span, message);
+    diag.attach_note(?sc.s.diags, note);
+}
+
+# field_table_begin: begins a new field table for nominal `ty`, returning the index of the table; fields are appended with `field_table_push`, and since a nominal type interns to a stable TypeId a table is built once per pass.
+# ---
+# sc:  sema context
+# ty:  the nominal TypeId the table describes
+# ret: the new field table's index, or an allocation error
+pub fun field_table_begin(sc: *SemaContext, ty: type.TypeId) Result[u32, str] {
+    ret type.field_table_begin(?sc.s.types, ty);
+}
+
+# field_table_push: appends one `(name, ty)` field to the table at `table_idx`, growing the shared field pool as needed; fields must be pushed contiguously, before any other table is begun.
+# ---
+# sc:        sema context
+# table_idx: index returned by field_table_begin
+# name:      interned field identifier
+# ty:        interned semantic type of the field
+# ret:       true on success, or an allocation error
+pub fun field_table_push(sc: *SemaContext, table_idx: u32, name: intern.StrId, ty: type.TypeId) Result[bool, str] {
+    ret type.field_table_push(?sc.s.types, table_idx, name, ty);
+}
+
+# field_table_for: returns the field table describing nominal or instance TypeId `ty`, or none when no table has been built for it.
+# ---
+# sc:  sema context
+# ty:  the TypeId to look up
+# ret: some(*FieldTable) when present, none otherwise
+pub fun field_table_for(sc: *SemaContext, ty: type.TypeId) Option[*FieldTable] {
+    ret type.field_table_for(?sc.s.types, ty);
+}
+
+# field_lookup: looks up a field by interned name within nominal or instance TypeId `ty`, returning the field's interned type, or none when the type has no table or no such field.
+# ---
+# sc:   sema context
+# ty:   the TypeId to search
+# name: interned field identifier
+# ret:  some(field_type) when found, none otherwise
+pub fun field_lookup(sc: *SemaContext, ty: type.TypeId, name: intern.StrId) Option[type.TypeId] {
+    val ft_opt: Option[*FieldTable] = field_table_for(sc, ty);
+    if (is_none[*FieldTable](ft_opt)) { ret none[type.TypeId](); }
+    val ft: *FieldTable = unwrap[*FieldTable](ft_opt);
+    var i: u32 = 0;
+    for (i < ft.fields_len) {
+        val fe_opt: Option[*type.FieldEntry] = type.field_at(?sc.s.types, ty, i);
+        if (is_none[*type.FieldEntry](fe_opt)) { ret none[type.TypeId](); }
+        val fe: *type.FieldEntry = unwrap[*type.FieldEntry](fe_opt);
+        if (fe.name == name) { ret some[type.TypeId](fe.ty); }
+        i = i + 1;
+    }
+    ret none[type.TypeId]();
+}
+
+# next_anon_ordinal: mints the next synthetic ordinal for an anonymous record/union nominal, so two textually-identical inline records in different positions intern to distinct (nominal) TypeIds.
+# ---
+# sc:  sema context
+# ret: a fresh ordinal, monotonically increasing per pass
+pub fun next_anon_ordinal(sc: *SemaContext) u32 {
+    val n: u32 = sc.anon_counter;
+    sc.anon_counter = sc.anon_counter + 1;
+    ret n;
+}

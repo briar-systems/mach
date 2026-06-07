@@ -1,0 +1,2211 @@
+# mach.lang.be.codegen.regalloc: MIR linear-scan register allocation.
+#
+# Register allocation over the one backend model — the MIR records defined in
+# `mach.lang.be.codegen.mir`. `run` walks each `MirFunction`, assigns every
+# `MirVReg` a physical register from its register class (or a stack spill slot),
+# and rewrites every `MIR_OP_VREG` operand into a `MIR_OP_PREG` so the encoder's
+# job is purely physical. There is no `isa.InstBuf` instruction model here; the
+# allocator consumes and mutates MIR directly.
+#
+# The algorithm is a standard linear scan:
+#   1. blocks are reordered into reverse-postorder so the flat instruction stream
+#      reads in a topological order;
+#   2. one merged live range per vreg is built over that stream from def/use of
+#      `MIR_OP_VREG` operands (including a `MIR_OP_MEM` base vreg), then extended
+#      by per-block live-in/live-out from a backward dataflow fixpoint so values
+#      live across a loop back edge are covered;
+#   3. `MIR_OP_PREG` operands (the ABI param / argument / return pre-coloring
+#      `lower_ir` emitted) are FIXED — their physical register is reserved for
+#      the instruction that names it, and incoming param-register lifetimes are
+#      held busy from entry until the `MOV vreg <- preg` that captures them;
+#   4. ranges are assigned in start order, call-crossing ranges preferring
+#      callee-saved registers (so the value survives a call without a save) and
+#      others preferring caller-saved; on pressure the lowest-density victim is
+#      spilled to a fresh `SLOT_SPILL` frame slot;
+#   5. around each `MIR_CALL` — the caller-saved clobber barrier (see its MIR
+#      definition) — any live vreg whose assigned register is caller-saved (or
+#      any FP register) is spilled and reloaded;
+#   6. a final pass rewrites every `MIR_OP_VREG` to its assigned `MIR_OP_PREG`;
+#      a `MIR_OP_MEM` base that is a value-pointer vreg becomes a physical-register
+#      base (`preg` set, `vreg` cleared to MIR_VREG_NIL) while a frame-slot-owning
+#      MEM base keeps its slot-key vreg id (the encoder resolves it to `[rbp +
+#      offset]`); spilled vregs get reload-before-use / store-after-def `MIR_MOV`s,
+#      excluding the instruction's clobbered registers — and, in the entry block,
+#      any reload-scratch register still holding a not-yet-captured incoming
+#      argument — when choosing a reload temporary. After this pass no value vreg
+#      remains in any MEM base.
+#
+# Everything target-specific flows through `tgt`: the register-class bank widths
+# from `tgt.arch.reg_classes`, the callee-saved register file from `tgt.abi`, the
+# never-allocatable reserved registers (stack / frame pointers) from
+# `tgt.arch.reserved_regs`, and the division / shift registers the ISA's division
+# and variable-shift forms hard-wire from `tgt.arch.div_reg` / `div_hi_reg` /
+# `shift_count_reg` (the ISA vtable is the `Target.arch` field). The allocator
+# names no architecture register directly and
+# never branches on an architecture id; the linear-scan algorithm itself is fully
+# target-agnostic. An absent ABI / ISA vtable is a loud error.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.zallocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use std.system.panic.panic;
+
+use target: mach.lang.target;
+use isa:    mach.lang.target.isa;
+use sysv:   mach.lang.target.abi.sysv;
+use mir:    mach.lang.be.codegen.mir;
+
+# REG_CLASS_GP: index of the general-purpose register bank in `reg_classes`.
+# `lower_ir` assigns this class to every non-float vreg.
+pub val REG_CLASS_GP: u32 = 0;
+
+# the floating-point / vector register bank is identified by a register width in
+# bits at least this wide, matching `mir.lower_ir`'s `fp_class_index`.
+val FP_CLASS_MIN_BITS: u32 = 128;
+
+# SPILL_MOV_WIDTH: the byte width of a spill reload / store MOV. a spill slot is
+# sized to a full register, so the value is saved and restored at the machine-word
+# width regardless of its logical sub-register width.
+val SPILL_MOV_WIDTH: u8 = 8;
+
+# RANGE_NIL: sentinel "no live range"; never a valid range index.
+val RANGE_NIL: u32 = 0xFFFFFFFF;
+# POS_MAX: a position larger than any instruction index, used as an empty range start.
+val POS_MAX: i64 = 0x7FFFFFFFFFFFFFFF;
+
+# FlatInstr: one instruction's position in the reverse-postorder flat stream.
+# ---
+# block: index into `MirFunction.blocks` of the owning block
+# instr: index into that block's `instrs`
+# is_call: true when the instruction is the MIR_CALL caller-saved barrier
+rec FlatInstr {
+    block:   u32;
+    instr:   u32;
+    is_call: bool;
+}
+
+# LiveRange: the merged live interval of one virtual register plus its
+# allocation decision.
+# ---
+# vreg:         the virtual register this range describes
+# start:        first flat position where the value is defined or used
+# end_pos:      last flat position where the value is live
+# use_count:    number of defs/uses (spill-density heuristic)
+# reg_class:    register-class index (gp / fp bank)
+# crosses_call: true when a MIR_CALL falls inside [start, end_pos]
+rec LiveRange {
+    vreg:         u32;
+    start:        i64;
+    end_pos:      i64;
+    use_count:    u32;
+    reg_class:    u32;
+    crosses_call: bool;
+}
+
+# AllocCtx: the per-function allocation scratch state. owns every working array
+# for the duration of one function's allocation and frees them on teardown.
+# ---
+# alloc:         backing allocator
+# f:             the function being allocated
+# flat:          reverse-postorder flat instruction stream
+# flat_count:    number of flat instructions
+# order:         block visitation order (RPO) by block index
+# ranges:        one live range per vreg, indexed by vreg id (vreg == range slot)
+# gp_count:      number of general-purpose registers in the bank
+# fp_count:      number of floating-point registers in the bank
+# callee_saved:  per-GP-register flag: is this register callee-saved?
+# reserved:      per-GP-register flag: is this register off-limits (rsp/rbp)?
+# gp_busy:       per-GP-register transient busy flag during scan
+# fp_busy:       per-FP-register transient busy flag during scan
+# active:        active-range vreg ids during the scan
+# active_count:  number of active ranges
+# pinned_end:    per-GP-register reservation end position (param-reg lifetimes)
+# arg_res_reg / arg_res_start / arg_res_end: parallel windows reserving an
+#                outgoing call-argument register over [setup-move, call] so a
+#                later same-call argument's materialization cannot reuse a
+#                register already holding a placed argument
+# arg_res_count: number of outgoing-argument reservation windows
+# def_res_reg / def_res_pos: parallel records of every precolored physical
+#                register DEF (operand 0 a MIR_OP_PREG, e.g. the RAX/RDX of a
+#                two-register aggregate return's `MOV preg <- [base+n]`). a value
+#                vreg live PAST the defining position must not be colored to that
+#                register, or the def clobbers the still-live value at that
+#                instruction (the two-register-return `mov (%rax),%rax` regression)
+# def_res_count: number of precolored-DEF reservation records
+# cur_start / cur_end: the interval of the range currently being colored, so
+#                `gp_available` can test it against each outgoing-arg window
+# reload_scratch: the ISA's reload-scratch GP register ids, reserved from value
+#                 allocation and drawn from for spill reloads (borrowed pointer
+#                 into the ISA vtable; nil when the ISA wires no pool)
+# reload_scratch_count: number of reload-scratch registers
+rec AllocCtx {
+    alloc:         *Allocator;
+    f:             *mir.MirFunction;
+    flat:          *FlatInstr;
+    flat_count:    u32;
+    order:         *u32;
+    ranges:        *LiveRange;
+    gp_count:      u32;
+    fp_count:      u32;
+    callee_saved:  *bool;
+    reserved:      *bool;
+    gp_busy:       *bool;
+    fp_busy:       *bool;
+    active:        *u32;
+    active_count:  u32;
+    pinned_end:    *i64;
+    # param_reg_end: a durable copy of each GP arg register's capture-end position
+    # (pinned_end is zeroed by linear-scan's release_pins, so the rewrite pass needs
+    # its own copy to keep a reload-scratch register that is also an incoming arg
+    # register off-limits until that argument's capture MOV in the entry block).
+    param_reg_end: *i64;
+    arg_res_reg:   *u32;
+    arg_res_start: *i64;
+    arg_res_end:   *i64;
+    arg_res_count: u32;
+    def_res_reg:   *u32;
+    def_res_pos:   *i64;
+    def_res_count: u32;
+    cur_start:     i64;
+    cur_end:       i64;
+    reload_scratch:       *isa.Register;
+    reload_scratch_count: i32;
+}
+
+# run: allocate physical registers for every function in a MIR module.
+#
+# every function is allocated in place — vregs become physical registers or spill
+# slots and `MirFunction.callee_mask` is written for the prologue/epilogue. the
+# allocator reads the callee-saved register file from the ABI vtable and the
+# reserved / division / shift registers from the ISA vtable, so an absent ABI or
+# ISA vtable (an unsupported target) is a loud error rather than a silent no-op
+# that would leave the pre-colored MIR with virtual registers the encoder cannot
+# emit.
+# ---
+# tgt: resolved compilation target; supplies the register banks, ABI, and ISA
+# m:   MIR module whose functions are allocated in place
+# ret: ok(true) on success, or an error string on an allocation failure
+pub fun run(tgt: *target.Target, m: *mir.MirModule) Result[bool, str] {
+    if (tgt == nil)      { ret err[bool, str]("regalloc.run: nil target"); }
+    if (m == nil)        { ret err[bool, str]("regalloc.run: nil mir module"); }
+    if (tgt.abi == nil)  { ret err[bool, str]("regalloc.run: target has no ABI vtable"); }
+    if (tgt.arch == nil) { ret err[bool, str]("regalloc.run: target has no ISA vtable"); }
+    if (tgt.abi.callee_saved == nil) {
+        ret err[bool, str]("regalloc.run: ABI vtable exposes no callee-saved register file");
+    }
+
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val af: Result[bool, str] = alloc_function(tgt, m, ?m.functions[fi]);
+        if (is_err[bool, str](af)) { ret af; }
+        fi = fi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# fp_class_index: index of the float/vector register bank, identified by its wide
+# register width, matching `mir.lower_ir`. a target with no wide bank cannot hold
+# a float, so a missing bank is a target-configuration bug and fails loudly rather
+# than collapsing a float class into the GP bank.
+fun fp_class_index(tgt: *target.Target) u32 {
+    var ci: u32 = 0;
+    for (ci < tgt.arch.reg_class_count) {
+        if (tgt.arch.reg_classes[ci].bit_width >= FP_CLASS_MIN_BITS) { ret ci; }
+        ci = ci + 1;
+    }
+    panic("regalloc: target has no float/vector register bank\n");
+    ret REG_CLASS_GP;
+}
+
+# bank_count: number of registers in a register-class bank, 0 for an out-of-range
+# class index.
+fun bank_count(tgt: *target.Target, class: u32) u32 {
+    if (class >= tgt.arch.reg_class_count) { ret 0; }
+    ret tgt.arch.reg_classes[class].count;
+}
+
+# alloc_function: assign physical registers (or spill slots) to one function and
+# rewrite its MIR so no virtual register remains. body-less functions and
+# functions with no vregs are left untouched.
+# ---
+# tgt: resolved compilation target
+# m:   owning MIR module (for the allocator)
+# f:   the function to allocate in place
+# ret: ok(true) on success, or an error string on an allocation failure
+fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) Result[bool, str] {
+    if (f.block_count == 0) { ret ok[bool, str](true); }
+    if (f.vreg_count == 0)  { ret ok[bool, str](true); }
+
+    var ctx: AllocCtx;
+    val ic: Result[bool, str] = ctx_init(?ctx, tgt, m, f);
+    if (is_err[bool, str](ic)) { ret ic; }
+
+    # a function that divides hard-wires the dividend into the accumulator and
+    # clobbers the accumulator (quotient) and high-half register (remainder) at
+    # every divide (x86-64 RAX:RDX). those registers — named through
+    # `tgt.arch.div_reg` / `div_hi_reg`, never a literal — are filled and read by
+    # fixed-register pre-coloring moves, never by allocation, so removing them from
+    # the allocatable set guarantees no live value, and no divisor operand, can
+    # collide with the division wiring. both are caller-saved, so reserving them
+    # costs nothing in the prologue/epilogue.
+    if (function_has_divide(?ctx)) {
+        reserve_reg(?ctx, tgt.arch.div_reg);
+        reserve_reg(?ctx, tgt.arch.div_hi_reg);
+    }
+
+    # a function with a register-count shift pre-colors the count into the ISA's
+    # shift-count register (the only register the x86-64 variable-shift form reads,
+    # as CL), named through `tgt.arch.shift_count_reg`, and references it at the
+    # shift; removing it from the allocatable set guarantees no live value collides
+    # with the count wiring. it is caller-saved, so reserving it costs nothing in
+    # the prologue / epilogue. detection is by the shared post-isel MIR_SEL_SHL /
+    # MIR_SEL_SHR_* sentinel with a physical-register count operand, so it stays
+    # target-agnostic (the sentinel is a shared selection-output opcode, never a
+    # concrete encoder opcode).
+    if (function_has_reg_shift(?ctx)) {
+        reserve_reg(?ctx, tgt.arch.shift_count_reg);
+    }
+
+    # a variadic function that takes FP args has an FP-register-save pseudo reading
+    # the caller's vector count in a fixed register (AL/RAX) at the AL-guarded
+    # prologue spill. that register is filled by the calling convention and read by
+    # the pseudo, never by allocation, so reserving it keeps a prologue param-capture
+    # vreg from being colored onto it and clobbering the count before the guard. the
+    # register is carried in the pseudo's preg-use operand (so the ISA register choice
+    # stays out of the generic allocator). only such functions pay the cost, and it is
+    # not free: the register stays caller-saved (no callee-save spill), but removing it
+    # from the allocatable pool adds register pressure for that function's body.
+    val va_fp_reg: i32 = function_va_fp_save_reg(?ctx);
+    if (va_fp_reg >= 0) {
+        reserve_reg(?ctx, va_fp_reg);
+    }
+
+    val bo: Result[bool, str] = build_order(?ctx);
+    if (is_err[bool, str](bo)) { ctx_dnit(?ctx); ret bo; }
+
+    val ao: Result[bool, str] = apply_order(?ctx);
+    if (is_err[bool, str](ao)) { ctx_dnit(?ctx); ret ao; }
+
+    val fl: Result[bool, str] = flatten(?ctx);
+    if (is_err[bool, str](fl)) { ctx_dnit(?ctx); ret fl; }
+
+    build_ranges(?ctx);
+
+    val lv: Result[bool, str] = extend_liveness(?ctx);
+    if (is_err[bool, str](lv)) { ctx_dnit(?ctx); ret lv; }
+
+    mark_call_crossing(?ctx);
+
+    val sc: Result[bool, str] = linear_scan(tgt, ?ctx);
+    if (is_err[bool, str](sc)) { ctx_dnit(?ctx); ret sc; }
+
+    val sp: Result[bool, str] = spill_across_calls(?ctx);
+    if (is_err[bool, str](sp)) { ctx_dnit(?ctx); ret sp; }
+
+    val rw: Result[bool, str] = rewrite(tgt, ?ctx);
+    if (is_err[bool, str](rw)) { ctx_dnit(?ctx); ret rw; }
+
+    record_callee_mask(tgt, ?ctx);
+
+    ctx_dnit(?ctx);
+    ret ok[bool, str](true);
+}
+
+# ctx_init: allocate every per-function working array and seed the register-bank
+# descriptors (callee-saved, reserved). one live range slot exists per vreg.
+fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) Result[bool, str] {
+    ctx.alloc        = m.alloc;
+    ctx.f            = f;
+    ctx.flat         = nil;
+    ctx.flat_count   = 0;
+    ctx.order        = nil;
+    ctx.ranges       = nil;
+    ctx.gp_count     = bank_count(tgt, REG_CLASS_GP);
+    ctx.fp_count     = bank_count(tgt, fp_class_index(tgt));
+    ctx.callee_saved = nil;
+    ctx.reserved     = nil;
+    ctx.gp_busy      = nil;
+    ctx.fp_busy      = nil;
+    ctx.active       = nil;
+    ctx.active_count = 0;
+    ctx.pinned_end   = nil;
+    ctx.param_reg_end = nil;
+    ctx.arg_res_reg   = nil;
+    ctx.arg_res_start = nil;
+    ctx.arg_res_end   = nil;
+    ctx.arg_res_count = 0;
+    ctx.def_res_reg   = nil;
+    ctx.def_res_pos   = nil;
+    ctx.def_res_count = 0;
+    ctx.cur_start     = 0;
+    ctx.cur_end       = 0;
+    ctx.reload_scratch       = tgt.arch.reload_scratch_regs;
+    ctx.reload_scratch_count = tgt.arch.reload_scratch_count;
+
+    val ro: Result[*u32, str] = allocate[u32](m.alloc, f.block_count::usize);
+    if (is_err[*u32, str](ro)) { ret err[bool, str](unwrap_err[*u32, str](ro)); }
+    ctx.order = unwrap_ok[*u32, str](ro);
+
+    val rr: Result[*LiveRange, str] = allocate[LiveRange](m.alloc, f.vreg_count::usize);
+    if (is_err[*LiveRange, str](rr)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*LiveRange, str](rr)); }
+    ctx.ranges = unwrap_ok[*LiveRange, str](rr);
+
+    var vi: u32 = 0;
+    for (vi < f.vreg_count) {
+        ctx.ranges[vi].vreg         = vi;
+        ctx.ranges[vi].start        = POS_MAX;
+        ctx.ranges[vi].end_pos      = -1;
+        ctx.ranges[vi].use_count    = 0;
+        ctx.ranges[vi].reg_class    = f.vregs[vi].class;
+        ctx.ranges[vi].crosses_call = false;
+        vi = vi + 1;
+    }
+
+    if (ctx.gp_count > 0) {
+        val rcs: Result[*bool, str] = allocate[bool](m.alloc, ctx.gp_count::usize);
+        if (is_err[*bool, str](rcs)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*bool, str](rcs)); }
+        ctx.callee_saved = unwrap_ok[*bool, str](rcs);
+        val rrv: Result[*bool, str] = allocate[bool](m.alloc, ctx.gp_count::usize);
+        if (is_err[*bool, str](rrv)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*bool, str](rrv)); }
+        ctx.reserved = unwrap_ok[*bool, str](rrv);
+        val rgb: Result[*bool, str] = allocate[bool](m.alloc, ctx.gp_count::usize);
+        if (is_err[*bool, str](rgb)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*bool, str](rgb)); }
+        ctx.gp_busy = unwrap_ok[*bool, str](rgb);
+        val rpe: Result[*i64, str] = allocate[i64](m.alloc, ctx.gp_count::usize);
+        if (is_err[*i64, str](rpe)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*i64, str](rpe)); }
+        ctx.pinned_end = unwrap_ok[*i64, str](rpe);
+        val rpr: Result[*i64, str] = allocate[i64](m.alloc, ctx.gp_count::usize);
+        if (is_err[*i64, str](rpr)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*i64, str](rpr)); }
+        ctx.param_reg_end = unwrap_ok[*i64, str](rpr);
+
+        var gi: u32 = 0;
+        for (gi < ctx.gp_count) {
+            ctx.callee_saved[gi]  = false;
+            ctx.reserved[gi]      = false;
+            ctx.gp_busy[gi]       = false;
+            ctx.pinned_end[gi]    = -1;
+            ctx.param_reg_end[gi] = -1;
+            gi = gi + 1;
+        }
+
+        # the callee-saved partition comes from the ABI vtable's callee-saved
+        # register file, and the never-allocatable reserved registers (stack / frame
+        # pointers) from the ISA vtable's reserved-register list — no architecture
+        # register is named here, and the linear scan reads these flags unchanged.
+        seed_callee_saved(tgt, ctx);
+        seed_reserved(tgt, ctx);
+    }
+
+    if (ctx.fp_count > 0) {
+        val rfb: Result[*bool, str] = allocate[bool](m.alloc, ctx.fp_count::usize);
+        if (is_err[*bool, str](rfb)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*bool, str](rfb)); }
+        ctx.fp_busy = unwrap_ok[*bool, str](rfb);
+        var fii: u32 = 0;
+        for (fii < ctx.fp_count) { ctx.fp_busy[fii] = false; fii = fii + 1; }
+    }
+
+    val ra: Result[*u32, str] = allocate[u32](m.alloc, f.vreg_count::usize);
+    if (is_err[*u32, str](ra)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*u32, str](ra)); }
+    ctx.active = unwrap_ok[*u32, str](ra);
+
+    ret ok[bool, str](true);
+}
+
+# ctx_dnit: release every per-function working array. safe on a partially built
+# context (every field is nil until allocated).
+fun ctx_dnit(ctx: *AllocCtx) {
+    if (ctx.flat != nil && ctx.flat_count > 0) {
+        deallocate[FlatInstr](ctx.alloc, ctx.flat, ctx.flat_count::usize);
+        ctx.flat = nil;
+    }
+    if (ctx.order != nil) {
+        deallocate[u32](ctx.alloc, ctx.order, ctx.f.block_count::usize);
+        ctx.order = nil;
+    }
+    if (ctx.ranges != nil) {
+        deallocate[LiveRange](ctx.alloc, ctx.ranges, ctx.f.vreg_count::usize);
+        ctx.ranges = nil;
+    }
+    if (ctx.callee_saved != nil) {
+        deallocate[bool](ctx.alloc, ctx.callee_saved, ctx.gp_count::usize);
+        ctx.callee_saved = nil;
+    }
+    if (ctx.reserved != nil) {
+        deallocate[bool](ctx.alloc, ctx.reserved, ctx.gp_count::usize);
+        ctx.reserved = nil;
+    }
+    if (ctx.gp_busy != nil) {
+        deallocate[bool](ctx.alloc, ctx.gp_busy, ctx.gp_count::usize);
+        ctx.gp_busy = nil;
+    }
+    if (ctx.pinned_end != nil) {
+        deallocate[i64](ctx.alloc, ctx.pinned_end, ctx.gp_count::usize);
+        ctx.pinned_end = nil;
+    }
+    if (ctx.param_reg_end != nil) {
+        deallocate[i64](ctx.alloc, ctx.param_reg_end, ctx.gp_count::usize);
+        ctx.param_reg_end = nil;
+    }
+    if (ctx.arg_res_reg != nil && ctx.flat_count > 0) {
+        deallocate[u32](ctx.alloc, ctx.arg_res_reg, ctx.flat_count::usize);
+        ctx.arg_res_reg = nil;
+    }
+    if (ctx.arg_res_start != nil && ctx.flat_count > 0) {
+        deallocate[i64](ctx.alloc, ctx.arg_res_start, ctx.flat_count::usize);
+        ctx.arg_res_start = nil;
+    }
+    if (ctx.arg_res_end != nil && ctx.flat_count > 0) {
+        deallocate[i64](ctx.alloc, ctx.arg_res_end, ctx.flat_count::usize);
+        ctx.arg_res_end = nil;
+    }
+    if (ctx.def_res_reg != nil && ctx.flat_count > 0) {
+        deallocate[u32](ctx.alloc, ctx.def_res_reg, ctx.flat_count::usize);
+        ctx.def_res_reg = nil;
+    }
+    if (ctx.def_res_pos != nil && ctx.flat_count > 0) {
+        deallocate[i64](ctx.alloc, ctx.def_res_pos, ctx.flat_count::usize);
+        ctx.def_res_pos = nil;
+    }
+    if (ctx.fp_busy != nil) {
+        deallocate[bool](ctx.alloc, ctx.fp_busy, ctx.fp_count::usize);
+        ctx.fp_busy = nil;
+    }
+    if (ctx.active != nil) {
+        deallocate[u32](ctx.alloc, ctx.active, ctx.f.vreg_count::usize);
+        ctx.active = nil;
+    }
+}
+
+# MAX_REG_FILE: upper bound on a register-file size used to size the stack buffer
+# the ABI / ISA register-file accessors fill. every modeled convention's
+# callee-saved file (SysV's six, Win64's larger set) and any reserved-register
+# list fits.
+val MAX_REG_FILE: i32 = 32;
+
+# reserve_reg: mark GP register `id` off-limits to allocation, ignoring a -1
+# sentinel (an ISA that wires no such register) or an id outside the GP bank. used
+# both for the ISA's reserved (stack / frame pointer) registers and for the
+# division / shift registers a dividing / shifting function pre-colors.
+# ---
+# ctx: the allocation context whose `reserved` flags are updated
+# id:  the GP register id to reserve, or -1 / out-of-range to ignore
+fun reserve_reg(ctx: *AllocCtx, id: i32) {
+    if (id < 0) { ret; }
+    if (id::u32 >= ctx.gp_count) { ret; }
+    ctx.reserved[id::u32] = true;
+}
+
+# seed_callee_saved: mark every register in the ABI's callee-saved file as
+# callee-saved. reads the file from `tgt.abi.callee_saved` (the convention's
+# preserved GP registers, e.g. SysV's RBX/RBP/R12–R15) rather than naming any
+# architecture register, so a new convention needs no edit here. registers outside
+# the GP bank are ignored.
+# ---
+# tgt: the active target; supplies the ABI callee-saved register file
+# ctx: the allocation context whose `callee_saved` flags are set
+fun seed_callee_saved(tgt: *target.Target, ctx: *AllocCtx) {
+    var regs: [32]isa.Register;
+    val fill: sysv.RegFileFn = tgt.abi.callee_saved::sysv.RegFileFn;
+    val n: i32 = fill(?regs[0]);
+    var i: i32 = 0;
+    for (i < n && i < MAX_REG_FILE) {
+        val id: i32 = regs[i].id;
+        if (id >= 0 && id::u32 < ctx.gp_count) {
+            ctx.callee_saved[id::u32] = true;
+        }
+        i = i + 1;
+    }
+}
+
+# seed_reserved: mark every register the ISA holds off-limits to value allocation:
+# the never-allocatable stack and frame pointers (`tgt.arch.reserved_regs`), the
+# spill-reload scratch pool (`tgt.arch.reload_scratch_regs`, drawn from by
+# `reload_temp`), and the encoder's mem-mem split scratch (`tgt.arch.scratch_reg`).
+# every register is read from the ISA vtable rather than named directly, so a new
+# ISA needs no edit here. registers outside the GP bank are ignored.
+# ---
+# tgt: the active target; supplies the ISA reserved-register lists
+# ctx: the allocation context whose `reserved` flags are set
+fun seed_reserved(tgt: *target.Target, ctx: *AllocCtx) {
+    var i: i32 = 0;
+    for (i < tgt.arch.reserved_reg_count && i < MAX_REG_FILE) {
+        reserve_reg(ctx, tgt.arch.reserved_regs[i].id);
+        i = i + 1;
+    }
+    var j: i32 = 0;
+    for (j < tgt.arch.reload_scratch_count && j < MAX_REG_FILE) {
+        reserve_reg(ctx, tgt.arch.reload_scratch_regs[j].id);
+        j = j + 1;
+    }
+    reserve_reg(ctx, tgt.arch.scratch_reg);
+}
+
+# function_has_divide: true when any instruction is an integer division /
+# remainder. regalloc runs after isel, so detection keys on the shared post-isel
+# divide sentinel (MIR_SEL_DIV_*/MIR_SEL_REM_*, in the 0x11xx selection-output space
+# of mir.mach, not a concrete encoder opcode), so this stays target-agnostic. a
+# dividing function reserves RAX:RDX from allocation because the x86-64 division
+# form hard-wires the dividend into RAX and clobbers RAX (quotient) and RDX
+# (sign-extension / remainder).
+fun function_has_divide(ctx: *AllocCtx) bool {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val o: mir.MirOpcode = blk.instrs[ii].opcode;
+            if (o == mir.MIR_SEL_DIV_S || o == mir.MIR_SEL_REM_S ||
+                o == mir.MIR_SEL_DIV_U || o == mir.MIR_SEL_REM_U) { ret true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# function_has_reg_shift: true when any instruction is a shift (the selected
+# MIR_SEL_SHL / MIR_SEL_SHR_U / MIR_SEL_SHR_S) whose count is a physical register —
+# the RCX pre-coloring `mir.lower_ir` emits for a runtime shift count. regalloc
+# runs after isel, so detection keys on the shared post-isel shift sentinel (in the
+# 0x11xx selection-output space of mir.mach, not an x64 opcode) plus a MIR_OP_PREG
+# count operand, staying target-agnostic. a constant-count shift carries an
+# immediate count and needs no reservation.
+fun function_has_reg_shift(ctx: *AllocCtx) bool {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            val o: mir.MirOpcode = mi.opcode;
+            if (o == mir.MIR_SEL_SHL || o == mir.MIR_SEL_SHR_U || o == mir.MIR_SEL_SHR_S) {
+                # the three-address shift is `[dst, value, count]`; a register count
+                # is the RCX pre-coloring in operand 2.
+                if (mi.operand_count >= 3 && mi.operands[2].kind == mir.MIR_OP_PREG) {
+                    ret true;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# function_va_fp_save_reg: the GP register a variadic FP-register-save pseudo reads
+# (its MIR_OP_PREG vector-count operand), or -1 when the function has no such pseudo.
+# the AL-guarded MIR_VA_FP_SAVE runs in the variadic prologue and reads the caller's
+# vector-register count in this register; like the division accumulator it is filled
+# by the calling convention, not by allocation, so reserving it from the value pool
+# guarantees no prologue param-capture vreg is colored onto it and clobbers the count
+# before the guard reads it. the register stays caller-saved (no callee-save spill),
+# but reserving it does cost the function's body one fewer allocatable GP register —
+# only variadic functions taking FP args pay it. the register rides in the pseudo (a
+# shared selection-output opcode, never a concrete encoder opcode), keeping this
+# detection target-agnostic.
+fun function_va_fp_save_reg(ctx: *AllocCtx) i32 {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode == mir.MIR_VA_FP_SAVE && mi.operand_count >= 3
+                && mi.operands[2].kind == mir.MIR_OP_PREG) {
+                ret mi.operands[2].preg::i32;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret -1;
+}
+
+# build_order: compute a reverse-postorder block visitation order into `ctx.order`
+# by id, starting from the entry block (block index 0). successors are the
+# terminator's MIR_OP_BLOCK operands. blocks unreachable from entry are appended
+# in their original order so every block is laid out exactly once.
+fun build_order(ctx: *AllocCtx) Result[bool, str] {
+    val f: *mir.MirFunction = ctx.f;
+    val n: u32 = f.block_count;
+
+    val rv: Result[*bool, str] = allocate[bool](ctx.alloc, n::usize);
+    if (is_err[*bool, str](rv)) { ret err[bool, str](unwrap_err[*bool, str](rv)); }
+    val visited: *bool = unwrap_ok[*bool, str](rv);
+    var i: u32 = 0;
+    for (i < n) { visited[i] = false; i = i + 1; }
+
+    # an explicit stack of (block, next-successor-index) frames for an iterative
+    # postorder DFS; postorder is reversed into `ctx.order`.
+    val rs: Result[*u32, str] = allocate[u32](ctx.alloc, n::usize);
+    if (is_err[*u32, str](rs)) { deallocate[bool](ctx.alloc, visited, n::usize); ret err[bool, str](unwrap_err[*u32, str](rs)); }
+    val stack: *u32 = unwrap_ok[*u32, str](rs);
+    val re: Result[*u32, str] = allocate[u32](ctx.alloc, n::usize);
+    if (is_err[*u32, str](re)) {
+        deallocate[bool](ctx.alloc, visited, n::usize);
+        deallocate[u32](ctx.alloc, stack, n::usize);
+        ret err[bool, str](unwrap_err[*u32, str](re));
+    }
+    val succ_ix: *u32 = unwrap_ok[*u32, str](re);
+
+    val rp: Result[*u32, str] = allocate[u32](ctx.alloc, n::usize);
+    if (is_err[*u32, str](rp)) {
+        deallocate[bool](ctx.alloc, visited, n::usize);
+        deallocate[u32](ctx.alloc, stack, n::usize);
+        deallocate[u32](ctx.alloc, succ_ix, n::usize);
+        ret err[bool, str](unwrap_err[*u32, str](rp));
+    }
+    val post: *u32 = unwrap_ok[*u32, str](rp);
+    var post_count: u32 = 0;
+
+    var sp: u32 = 0;
+    stack[sp] = 0;
+    succ_ix[sp] = 0;
+    visited[0] = true;
+    sp = sp + 1;
+
+    for (sp > 0) {
+        val top: u32 = sp - 1;
+        val b: u32 = stack[top];
+        val next: u32 = next_unvisited_succ(ctx, b, ?succ_ix[top], visited);
+        if (next == RANGE_NIL) {
+            post[post_count] = b;
+            post_count = post_count + 1;
+            sp = sp - 1;
+        } or {
+            visited[next] = true;
+            stack[sp] = next;
+            succ_ix[sp] = 0;
+            sp = sp + 1;
+        }
+    }
+
+    var oi: u32 = 0;
+    var k: u32 = post_count;
+    for (k > 0) {
+        k = k - 1;
+        ctx.order[oi] = post[k];
+        oi = oi + 1;
+    }
+    # append any block unreachable from entry so all blocks are laid out once.
+    var bi: u32 = 0;
+    for (bi < n) {
+        if (!visited[bi]) {
+            ctx.order[oi] = bi;
+            oi = oi + 1;
+        }
+        bi = bi + 1;
+    }
+
+    deallocate[bool](ctx.alloc, visited, n::usize);
+    deallocate[u32](ctx.alloc, stack, n::usize);
+    deallocate[u32](ctx.alloc, succ_ix, n::usize);
+    deallocate[u32](ctx.alloc, post, n::usize);
+    ret ok[bool, str](true);
+}
+
+# next_unvisited_succ: advance `@six` past already-visited successors of block
+# index `b` and return the next unvisited successor's block index, or RANGE_NIL
+# when none remain. successors are resolved from the block's terminator
+# MIR_OP_BLOCK operands by matching their target id to a block index.
+fun next_unvisited_succ(ctx: *AllocCtx, b: u32, six: *u32, visited: *bool) u32 {
+    val f: *mir.MirFunction = ctx.f;
+    val blk: *mir.MirBlock = ?f.blocks[b];
+    if (blk.instr_count == 0) { ret RANGE_NIL; }
+
+    val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+    for (@six < term.operand_count) {
+        val op: *mir.MirOperand = ?term.operands[@six];
+        @six = @six + 1;
+        if (op.kind == mir.MIR_OP_BLOCK) {
+            val tgt_idx: u32 = block_index_of(ctx, op.imm::u32);
+            if (tgt_idx != RANGE_NIL && !visited[tgt_idx]) {
+                ret tgt_idx;
+            }
+        }
+    }
+    ret RANGE_NIL;
+}
+
+# block_index_of: the block-array index whose `id` equals `bid`, or RANGE_NIL.
+fun block_index_of(ctx: *AllocCtx, bid: u32) u32 {
+    val f: *mir.MirFunction = ctx.f;
+    var i: u32 = 0;
+    for (i < f.block_count) {
+        if (f.blocks[i].id == bid) { ret i; }
+        i = i + 1;
+    }
+    ret RANGE_NIL;
+}
+
+# apply_order: permute `f.blocks` into the computed reverse-postorder. the entry
+# block keeps index 0 (it is the first RPO node), and block ids are unchanged so
+# MIR_OP_BLOCK branch targets stay valid. a stable selection by `ctx.order`
+# rebuilds the array in place via a temporary copy. the scratch allocation is
+# propagated rather than swallowed: dropping it would leave the blocks in their
+# original (non-RPO) order, silently breaking the linear-scan liveness invariant.
+fun apply_order(ctx: *AllocCtx) Result[bool, str] {
+    val f: *mir.MirFunction = ctx.f;
+    val n: u32 = f.block_count;
+    if (n <= 1) { ret ok[bool, str](true); }
+
+    val rt: Result[*mir.MirBlock, str] = allocate[mir.MirBlock](ctx.alloc, n::usize);
+    if (is_err[*mir.MirBlock, str](rt)) { ret err[bool, str](unwrap_err[*mir.MirBlock, str](rt)); }
+    val tmp: *mir.MirBlock = unwrap_ok[*mir.MirBlock, str](rt);
+
+    var i: u32 = 0;
+    for (i < n) {
+        tmp[i] = f.blocks[ctx.order[i]];
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        f.blocks[i] = tmp[i];
+        i = i + 1;
+    }
+    deallocate[mir.MirBlock](ctx.alloc, tmp, n::usize);
+
+    # after reordering, the order array is identity (blocks are physically in RPO).
+    i = 0;
+    for (i < n) { ctx.order[i] = i; i = i + 1; }
+    ret ok[bool, str](true);
+}
+
+# flatten: count every instruction across all blocks (now in RPO) and build the
+# flat instruction stream, tagging each MIR_CALL as a caller-saved barrier. the
+# scratch allocation is propagated rather than swallowed: a dropped failure would
+# leave an empty stream, silently collapsing every live range to nothing.
+fun flatten(ctx: *AllocCtx) Result[bool, str] {
+    val f: *mir.MirFunction = ctx.f;
+    var total: u32 = 0;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        total = total + f.blocks[bi].instr_count;
+        bi = bi + 1;
+    }
+    ctx.flat_count = total;
+    if (total == 0) { ctx.flat = nil; ret ok[bool, str](true); }
+
+    val rf: Result[*FlatInstr, str] = allocate[FlatInstr](ctx.alloc, total::usize);
+    if (is_err[*FlatInstr, str](rf)) {
+        ctx.flat = nil;
+        ctx.flat_count = 0;
+        ret err[bool, str](unwrap_err[*FlatInstr, str](rf));
+    }
+    ctx.flat = unwrap_ok[*FlatInstr, str](rf);
+
+    var p: u32 = 0;
+    bi = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            ctx.flat[p].block   = bi;
+            ctx.flat[p].instr   = ii;
+            # a MIR_CALL and an inline-asm block are both caller-saved clobber
+            # barriers: an asm block freely writes registers (a `syscall` alone
+            # clobbers rax/rcx/r11), so a live value must not stay in a
+            # caller-saved register across it. detect asm generically by its
+            # payload (the opcode is target-specific post-isel).
+            ctx.flat[p].is_call = blk.instrs[ii].opcode == mir.MIR_CALL
+                                  || blk.instrs[ii].asm_block != nil;
+            p = p + 1;
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# flat_instr: the MIR instruction at flat position `pos`.
+fun flat_instr(ctx: *AllocCtx, pos: u32) *mir.MirInstr {
+    val fi: *FlatInstr = ?ctx.flat[pos];
+    ret ?ctx.f.blocks[fi.block].instrs[fi.instr];
+}
+
+# touch: extend vreg `v`'s range to cover flat position `pos` and bump its use
+# count. an out-of-range vreg id is a malformed operand a valid MIR never carries
+# (a valid vreg is always < vreg_count), so it is a backend bug and fails loudly
+# rather than being silently dropped from the live ranges.
+fun touch(ctx: *AllocCtx, v: u32, pos: u32) {
+    if (v >= ctx.f.vreg_count) {
+        panic("regalloc: out-of-range vreg id in a MIR operand\n");
+    }
+    val lr: *LiveRange = ?ctx.ranges[v];
+    if (pos::i64 < lr.start)   { lr.start = pos::i64; }
+    if (pos::i64 > lr.end_pos) { lr.end_pos = pos::i64; }
+    lr.use_count = lr.use_count + 1;
+}
+
+# build_ranges: scan the flat stream and extend each vreg's range over every
+# operand that names it, including a MIR_OP_MEM base vreg.
+fun build_ranges(ctx: *AllocCtx) {
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, pos);
+        var k: u32 = 0;
+        for (k < mi.operand_count) {
+            val op: *mir.MirOperand = ?mi.operands[k];
+            if (op.kind == mir.MIR_OP_VREG) {
+                touch(ctx, op.vreg, pos);
+            } or (op.kind == mir.MIR_OP_MEM && op.vreg != mir.MIR_VREG_NIL) {
+                touch(ctx, op.vreg, pos);
+            }
+            # a MEM scaled-index value vreg is live wherever the address is formed.
+            if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg && op.index != mir.MIR_VREG_NIL) {
+                touch(ctx, op.index, pos);
+            }
+            k = k + 1;
+        }
+        pos = pos + 1;
+    }
+}
+
+# extend_liveness: solve per-block live-in/live-out by a backward dataflow
+# fixpoint over the RPO block order, then extend each vreg's range to span every
+# block in which it is live so values crossing a loop back edge are covered.
+# block use/def are computed from MIR_OP_VREG (and MEM base) operands; the entry
+# pre-coloring `MOV vreg <- preg` instructions define their vreg.
+fun extend_liveness(ctx: *AllocCtx) Result[bool, str] {
+    val f: *mir.MirFunction = ctx.f;
+    val nb: u32 = f.block_count;
+    val nv: u32 = f.vreg_count;
+    if (nb == 0 || nv == 0) { ret ok[bool, str](true); }
+
+    # per-block bitsets are nv-wide boolean rows packed as one flat array.
+    val total: usize = (nb::usize) * (nv::usize);
+    val use_set: Result[*bool, str] = allocate[bool](ctx.alloc, total);
+    if (is_err[*bool, str](use_set)) { ret err[bool, str](unwrap_err[*bool, str](use_set)); }
+    val uses: *bool = unwrap_ok[*bool, str](use_set);
+    val def_set: Result[*bool, str] = allocate[bool](ctx.alloc, total);
+    if (is_err[*bool, str](def_set)) { deallocate[bool](ctx.alloc, uses, total); ret err[bool, str](unwrap_err[*bool, str](def_set)); }
+    val defs: *bool = unwrap_ok[*bool, str](def_set);
+    val in_set: Result[*bool, str] = allocate[bool](ctx.alloc, total);
+    if (is_err[*bool, str](in_set)) {
+        deallocate[bool](ctx.alloc, uses, total);
+        deallocate[bool](ctx.alloc, defs, total);
+        ret err[bool, str](unwrap_err[*bool, str](in_set));
+    }
+    val live_in: *bool = unwrap_ok[*bool, str](in_set);
+    val out_set: Result[*bool, str] = allocate[bool](ctx.alloc, total);
+    if (is_err[*bool, str](out_set)) {
+        deallocate[bool](ctx.alloc, uses, total);
+        deallocate[bool](ctx.alloc, defs, total);
+        deallocate[bool](ctx.alloc, live_in, total);
+        ret err[bool, str](unwrap_err[*bool, str](out_set));
+    }
+    val live_out: *bool = unwrap_ok[*bool, str](out_set);
+
+    var z: usize = 0;
+    for (z < total) {
+        uses[z] = false;
+        defs[z] = false;
+        live_in[z] = false;
+        live_out[z] = false;
+        z = z + 1;
+    }
+
+    compute_use_def(ctx, uses, defs, nv);
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        # process in reverse RPO so information flows backward quickly.
+        var ri: i64 = nb::i64 - 1;
+        for (ri >= 0) {
+            val b: u32 = ri::u32;
+            val base: usize = (b::usize) * (nv::usize);
+
+            # live_out[b] = union of live_in of successors.
+            var v: u32 = 0;
+            for (v < nv) { live_out[base + v::usize] = false; v = v + 1; }
+            union_succ_live_in(ctx, b, live_out, live_in, nv);
+
+            # live_in[b] = use[b] | (live_out[b] - def[b]).
+            v = 0;
+            for (v < nv) {
+                val idx: usize = base + v::usize;
+                var nv_in: bool = uses[idx];
+                if (live_out[idx] && !defs[idx]) { nv_in = true; }
+                if (nv_in && !live_in[idx]) {
+                    live_in[idx] = true;
+                    changed = true;
+                }
+                v = v + 1;
+            }
+            ri = ri - 1;
+        }
+    }
+
+    # extend ranges to cover blocks where the vreg is live-in or live-out.
+    var bi: u32 = 0;
+    for (bi < nb) {
+        val span: BlockSpan = block_span(ctx, bi);
+        val base: usize = (bi::usize) * (nv::usize);
+        var v: u32 = 0;
+        for (v < nv) {
+            val idx: usize = base + v::usize;
+            if (live_in[idx] || live_out[idx]) {
+                val lr: *LiveRange = ?ctx.ranges[v];
+                if (span.start >= 0 && span.start < lr.start) { lr.start = span.start; }
+                if (span.end > lr.end_pos) { lr.end_pos = span.end; }
+            }
+            v = v + 1;
+        }
+        bi = bi + 1;
+    }
+
+    deallocate[bool](ctx.alloc, uses, total);
+    deallocate[bool](ctx.alloc, defs, total);
+    deallocate[bool](ctx.alloc, live_in, total);
+    deallocate[bool](ctx.alloc, live_out, total);
+    ret ok[bool, str](true);
+}
+
+# BlockSpan: the flat-position span of one block.
+# ---
+# start: first flat position in the block (-1 when the block is empty)
+# end:   last flat position in the block (-1 when the block is empty)
+rec BlockSpan {
+    start: i64;
+    end:   i64;
+}
+
+# block_span: the [first, last] flat positions belonging to block index `bi`.
+fun block_span(ctx: *AllocCtx, bi: u32) BlockSpan {
+    var span: BlockSpan;
+    span.start = -1;
+    span.end   = -1;
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        if (ctx.flat[pos].block == bi) {
+            if (span.start < 0) { span.start = pos::i64; }
+            span.end = pos::i64;
+        }
+        pos = pos + 1;
+    }
+    ret span;
+}
+
+# compute_use_def: fill per-block upward-exposed uses and definitions. operand 0
+# of an instruction is its definition (when a vreg); the remaining vreg/MEM-base
+# operands are uses unless already defined earlier in the block.
+fun compute_use_def(ctx: *AllocCtx, uses: *bool, defs: *bool, nv: u32) {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        val base: usize = (bi::usize) * (nv::usize);
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            val has_def: bool = instr_defines(mi);
+
+            # uses first (operands after the destination, plus a def operand read).
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                var v: u32 = mir.MIR_VREG_NIL;
+                if (op.kind == mir.MIR_OP_VREG) { v = op.vreg; }
+                if (op.kind == mir.MIR_OP_MEM && op.vreg != mir.MIR_VREG_NIL) { v = op.vreg; }
+                if (v != mir.MIR_VREG_NIL && v < nv) {
+                    val is_dst: bool = has_def && k == 0 && op.kind == mir.MIR_OP_VREG;
+                    if (!is_dst) {
+                        if (!defs[base + v::usize]) { uses[base + v::usize] = true; }
+                    }
+                }
+                # a MEM scaled-index value vreg is always a use (never a def).
+                if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg && op.index != mir.MIR_VREG_NIL && op.index < nv) {
+                    if (!defs[base + op.index::usize]) { uses[base + op.index::usize] = true; }
+                }
+                k = k + 1;
+            }
+            # then the definition.
+            if (has_def) {
+                val d: *mir.MirOperand = ?mi.operands[0];
+                if (d.kind == mir.MIR_OP_VREG && d.vreg < nv) {
+                    defs[base + d.vreg::usize] = true;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+# instr_defines: true when operand 0 of an instruction is a written destination
+# vreg. classification is by operand shape and the surviving MIR_CALL barrier,
+# NOT by the terminator/store opcodes — those are rewritten to concrete machine
+# opcodes by instruction selection before the allocator runs, so keying on the
+# generic opcode would silently misread them. a store's operand 0 is a memory
+# destination (kind != VREG) and a conditional branch's operand 0 is its
+# condition with explicit MIR_OP_BLOCK targets following; treating any
+# block-target-bearing instruction as a non-defining branch keeps the condition a
+# use, not a def. MIR_CALL is the value-less call barrier and survives selection.
+# MIR_CALL_RES and MIR_ARG are zero-byte liveness markers (the encoder drops both):
+# MIR_CALL_RES's result vreg is bound by the return-register move emitted before
+# it (an sret call binds it pre-call via RDI), so operand 0 is a live use the
+# marker extends, never a destination — treating it as a def would emit a spurious
+# store of an undefined post-call register over the vreg's live slot.
+fun instr_defines(mi: *mir.MirInstr) bool {
+    if (mi.operand_count == 0) { ret false; }
+    if (mi.opcode == mir.MIR_CALL) { ret false; }
+    if (mi.opcode == mir.MIR_CALL_RES) { ret false; }
+    if (mi.opcode == mir.MIR_ARG) { ret false; }
+    if (has_block_operand(mi)) { ret false; }
+    val d: *mir.MirOperand = ?mi.operands[0];
+    ret d.kind == mir.MIR_OP_VREG;
+}
+
+# has_block_operand: true when any operand names a branch-target block. such an
+# instruction is a branch (unconditional or conditional) and defines no value —
+# its operand 0 is either a block target or a branch condition, never a written
+# destination. recognizing branches this way is robust to instruction selection
+# rewriting the generic branch opcodes into concrete machine forms.
+fun has_block_operand(mi: *mir.MirInstr) bool {
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        if (mi.operands[k].kind == mir.MIR_OP_BLOCK) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# union_succ_live_in: OR each successor block's live-in row into block `b`'s
+# live-out row. explicit successors are the terminator's MIR_OP_BLOCK targets;
+# an implicit fallthrough to the next block in layout order is recognized only
+# when that next block actually lists `b` as a predecessor. relying on the
+# predecessor relation (recorded by `mir.lower_ir`) rather than on the terminator
+# opcode keeps this correct after instruction selection has rewritten the generic
+# terminator opcodes into concrete machine forms: a RET / UNREACHABLE block is
+# never a predecessor of the next block, so no spurious fallthrough edge is added.
+fun union_succ_live_in(ctx: *AllocCtx, b: u32, live_out: *bool, live_in: *bool, nv: u32) {
+    val f: *mir.MirFunction = ctx.f;
+    val blk: *mir.MirBlock = ?f.blocks[b];
+    val ob: usize = (b::usize) * (nv::usize);
+
+    if (blk.instr_count > 0) {
+        val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+        var k: u32 = 0;
+        for (k < term.operand_count) {
+            val op: *mir.MirOperand = ?term.operands[k];
+            if (op.kind == mir.MIR_OP_BLOCK) {
+                val si: u32 = block_index_of(ctx, op.imm::u32);
+                if (si != RANGE_NIL) {
+                    or_row(live_out, ob, live_in, (si::usize) * (nv::usize), nv);
+                }
+            }
+            k = k + 1;
+        }
+    }
+
+    # implicit fallthrough: the next layout block is a successor only if it names
+    # this block as a predecessor.
+    if (b + 1 < f.block_count && block_lists_pred(?f.blocks[b + 1], blk.id)) {
+        or_row(live_out, ob, live_in, ((b + 1)::usize) * (nv::usize), nv);
+    }
+}
+
+# block_lists_pred: true when `blk` records `pred_id` among its predecessor block
+# ids. used to confirm an implicit fallthrough edge from the predecessor relation
+# rather than from the (post-isel concrete) terminator opcode.
+fun block_lists_pred(blk: *mir.MirBlock, pred_id: u32) bool {
+    var i: u32 = 0;
+    for (i < blk.pred_count) {
+        if (blk.preds[i] == pred_id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# or_row: OR `nv` booleans of the source row into the destination row.
+fun or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
+    var v: u32 = 0;
+    for (v < nv) {
+        if (src[sbase + v::usize]) { dst[dbase + v::usize] = true; }
+        v = v + 1;
+    }
+}
+
+# mark_call_crossing: flag every range whose interval contains a MIR_CALL barrier
+# so the scan prefers a callee-saved register for it.
+fun mark_call_crossing(ctx: *AllocCtx) {
+    var ci: u32 = 0;
+    for (ci < ctx.flat_count) {
+        if (ctx.flat[ci].is_call) {
+            var v: u32 = 0;
+            for (v < ctx.f.vreg_count) {
+                val lr: *LiveRange = ?ctx.ranges[v];
+                if (lr.end_pos >= 0 && lr.start <= ci::i64 && lr.end_pos >= ci::i64) {
+                    lr.crosses_call = true;
+                }
+                v = v + 1;
+            }
+        }
+        ci = ci + 1;
+    }
+}
+
+# linear_scan: assign each vreg a physical register (writing `MirVReg.assigned`)
+# in start order, or spill it to a fresh SLOT_SPILL frame slot. pre-colored
+# MIR_OP_PREG operands hold their physical register fixed for the instruction
+# that names them, and incoming param-register lifetimes are reserved until their
+# capturing MOV.
+fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
+    reserve_param_registers(ctx);
+    val br: Result[bool, str] = build_arg_reservations(ctx);
+    if (is_err[bool, str](br)) { ret br; }
+
+    # build the start-order traversal of ranges (vreg ids sorted by range start).
+    val nv: u32 = ctx.f.vreg_count;
+    val ro: Result[*u32, str] = allocate[u32](ctx.alloc, nv::usize);
+    if (is_err[*u32, str](ro)) { ret err[bool, str](unwrap_err[*u32, str](ro)); }
+    val order: *u32 = unwrap_ok[*u32, str](ro);
+    var i: u32 = 0;
+    for (i < nv) { order[i] = i; i = i + 1; }
+    sort_by_start(ctx, order, nv);
+
+    var oi: u32 = 0;
+    for (oi < nv) {
+        val v: u32 = order[oi];
+        val lr: *LiveRange = ?ctx.ranges[v];
+        # a vreg never referenced (no def/use) and not a frame-slot pointer needs
+        # no register; skip it.
+        if (lr.end_pos < 0) { oi = oi + 1; cnt; }
+        # a vreg that already owns a frame slot (a by-value aggregate or spilled
+        # param) lives on the stack; it is never register-allocated.
+        if (vreg_has_slot(ctx, v)) { oi = oi + 1; cnt; }
+
+        expire_active(ctx, lr.start);
+        release_pins(ctx, lr.start);
+
+        # publish this range's interval so `gp_available` can reject any register
+        # an outgoing call-argument window holds busy over an overlapping span.
+        ctx.cur_start = lr.start;
+        ctx.cur_end   = lr.end_pos;
+
+        var preg: i32 = -1;
+        if (lr.reg_class == REG_CLASS_GP) {
+            preg = pick_gp(ctx, lr.crosses_call);
+        } or {
+            preg = pick_fp(ctx);
+        }
+
+        if (preg >= 0) {
+            assign(ctx, v, preg::u32, lr.reg_class);
+        } or {
+            val sr: Result[bool, str] = spill_on_pressure(ctx, v);
+            if (is_err[bool, str](sr)) { deallocate[u32](ctx.alloc, order, nv::usize); ret sr; }
+        }
+        oi = oi + 1;
+    }
+
+    deallocate[u32](ctx.alloc, order, nv::usize);
+    ret ok[bool, str](true);
+}
+
+# reserve_param_registers: hold each incoming param register busy from entry
+# until the `vreg <- preg` move that captures it, so the scan does not reuse an
+# argument register before its value is moved out. the entry pre-coloring moves
+# are the leading instructions of block 0. a capture is identified by operand
+# shape — destination vreg, source physical register — not by the MOV opcode:
+# instruction selection has already rewritten the generic MIR_MOV into a concrete
+# machine move by the time the allocator runs, so an opcode filter would never
+# match. block 0 is the first RPO node, so its per-block instruction index equals
+# the flat-stream position the pins are compared against.
+fun reserve_param_registers(ctx: *AllocCtx) {
+    val f: *mir.MirFunction = ctx.f;
+    if (f.block_count == 0) { ret; }
+    val blk: *mir.MirBlock = ?f.blocks[0];
+    var pos: u32 = 0;
+    var ii: u32 = 0;
+    for (ii < blk.instr_count) {
+        val mi: *mir.MirInstr = ?blk.instrs[ii];
+        if (mi.operand_count == 2) {
+            val d: *mir.MirOperand = ?mi.operands[0];
+            val s: *mir.MirOperand = ?mi.operands[1];
+            # capturing an incoming argument register into the entry block: either a
+            # `vreg <- preg` move (a scalar param) or a `[slot] <- preg` store (an
+            # aggregate param spills each register half into its frame slot, not a
+            # vreg move). reserve that register until this position so no earlier
+            # range steals it — without the store case an aggregate param's register
+            # (e.g. a 16-byte value's second eightbyte) is colored over and clobbered
+            # before it is captured.
+            if ((d.kind == mir.MIR_OP_VREG || d.kind == mir.MIR_OP_MEM) && s.kind == mir.MIR_OP_PREG) {
+                val r: u32 = s.preg;
+                if (r < ctx.gp_count && pos::i64 > ctx.pinned_end[r]) {
+                    ctx.pinned_end[r]    = pos::i64;
+                    ctx.param_reg_end[r] = pos::i64;
+                }
+            }
+        }
+        pos = pos + 1;
+        ii = ii + 1;
+    }
+}
+
+# build_arg_reservations: record reservations protecting every precolored
+# physical-register definition (operand 0 a GP `MIR_OP_PREG`) from value coloring.
+# two distinct hazards are covered, both rooted in the fact that a value carried in
+# a `MIR_OP_PREG` is invisible to the vreg liveness `build_ranges` tracks:
+#
+#   - outgoing call argument: the per-argument setup `MOV preg <- value` /
+#     `LEA preg <- [rip+sym]` that `lower_call`/`emit_arg_slot` emit leaves the
+#     argument live in a physical register from that move until the `MIR_CALL`
+#     that consumes it, so a later argument of the SAME call can be colored onto a
+#     register still holding an already-placed argument and clobber it. for every
+#     precolored DEF, the next `MIR_CALL` reached without that register being
+#     redefined opens a `[def-pos+1, call-pos]` window (an asm clobber barrier ends
+#     the search like a call); `arg_reg_reserved` rejects the register for any
+#     value range overlapping that span. the window opens at pos+1 so a value the
+#     setup move consumes (its range ending at `pos`) may have lived there up to
+#     the move.
+#   - precolored DEF clobber: the DEF itself overwrites its register at `pos`, so a
+#     value vreg merely USED at `pos` (a `MIR_OP_MEM` base) yet LIVE PAST it must
+#     not own that register, or the def clobbers the value before its later use —
+#     exactly the two-register aggregate return `MOV RAX <- [base+0]; MOV RDX <-
+#     [base+8]` where coloring `base` to RAX yields `mov (%rax),%rax`, destroying
+#     the pointer the second load needs. every precolored DEF records its position
+#     so `def_reg_reserved` rejects that register for any value range living past
+#     it (a value dying exactly at `pos` may still share the register).
+fun build_arg_reservations(ctx: *AllocCtx) Result[bool, str] {
+    ctx.arg_res_count = 0;
+    ctx.def_res_count = 0;
+    if (ctx.flat_count == 0) { ret ok[bool, str](true); }
+
+    val rr: Result[*u32, str] = allocate[u32](ctx.alloc, ctx.flat_count::usize);
+    if (is_err[*u32, str](rr)) { ret err[bool, str](unwrap_err[*u32, str](rr)); }
+    ctx.arg_res_reg = unwrap_ok[*u32, str](rr);
+    val rs: Result[*i64, str] = allocate[i64](ctx.alloc, ctx.flat_count::usize);
+    if (is_err[*i64, str](rs)) { ret err[bool, str](unwrap_err[*i64, str](rs)); }
+    ctx.arg_res_start = unwrap_ok[*i64, str](rs);
+    val re: Result[*i64, str] = allocate[i64](ctx.alloc, ctx.flat_count::usize);
+    if (is_err[*i64, str](re)) { ret err[bool, str](unwrap_err[*i64, str](re)); }
+    ctx.arg_res_end = unwrap_ok[*i64, str](re);
+    val dr: Result[*u32, str] = allocate[u32](ctx.alloc, ctx.flat_count::usize);
+    if (is_err[*u32, str](dr)) { ret err[bool, str](unwrap_err[*u32, str](dr)); }
+    ctx.def_res_reg = unwrap_ok[*u32, str](dr);
+    val dp: Result[*i64, str] = allocate[i64](ctx.alloc, ctx.flat_count::usize);
+    if (is_err[*i64, str](dp)) { ret err[bool, str](unwrap_err[*i64, str](dp)); }
+    ctx.def_res_pos = unwrap_ok[*i64, str](dp);
+
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, pos);
+        if (!instr_defines_preg(mi)) { pos = pos + 1; cnt; }
+        val d: *mir.MirOperand = ?mi.operands[0];
+        val r: u32 = d.preg;
+        if (r >= ctx.gp_count) { pos = pos + 1; cnt; }
+
+        # record the precolored DEF position: no value vreg living past `pos` may
+        # own `r`, since the def overwrites `r` here.
+        ctx.def_res_reg[ctx.def_res_count] = r;
+        ctx.def_res_pos[ctx.def_res_count] = pos::i64;
+        ctx.def_res_count = ctx.def_res_count + 1;
+
+        # walk forward to the first call/barrier; abandon the window if this same
+        # register is redefined first (it then holds a different live value whose
+        # own setup-move opens a fresh window).
+        var c: u32 = pos + 1;
+        var found: bool = false;
+        var killed: bool = false;
+        for (c < ctx.flat_count && !found && !killed) {
+            if (ctx.flat[c].is_call) {
+                found = true;
+            } or {
+                val mj: *mir.MirInstr = flat_instr(ctx, c);
+                if (instr_defines_preg(mj) && mj.operands[0].preg == r) { killed = true; }
+                c = c + 1;
+            }
+        }
+        if (found) {
+            # the register holds the argument only AFTER the setup move executes,
+            # so the window opens at pos+1: a value the move consumes (its range
+            # ending at `pos`) is free to have lived in this register up to here.
+            ctx.arg_res_reg[ctx.arg_res_count]   = r;
+            ctx.arg_res_start[ctx.arg_res_count] = (pos + 1)::i64;
+            ctx.arg_res_end[ctx.arg_res_count]   = c::i64;
+            ctx.arg_res_count = ctx.arg_res_count + 1;
+        }
+        pos = pos + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# instr_defines_preg: true when operand 0 of an instruction is a written physical
+# register (a pre-coloring move into an argument / return / fixed register). like
+# `instr_defines`, branches and the value-less call / marker opcodes write nothing.
+fun instr_defines_preg(mi: *mir.MirInstr) bool {
+    if (mi.operand_count == 0) { ret false; }
+    if (mi.opcode == mir.MIR_CALL) { ret false; }
+    if (mi.opcode == mir.MIR_CALL_RES) { ret false; }
+    if (mi.opcode == mir.MIR_ARG) { ret false; }
+    if (has_block_operand(mi)) { ret false; }
+    ret mi.operands[0].kind == mir.MIR_OP_PREG;
+}
+
+# arg_reg_reserved: true when an outgoing call-argument window holds GP register
+# `id` busy over a span that overlaps the range currently being colored
+# (`cur_start`..`cur_end`). two intervals overlap when neither ends before the
+# other starts.
+fun arg_reg_reserved(ctx: *AllocCtx, id: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.arg_res_count) {
+        if (ctx.arg_res_reg[i] == id) {
+            if (!(ctx.cur_end < ctx.arg_res_start[i] || ctx.cur_start > ctx.arg_res_end[i])) {
+                ret true;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# arg_reg_busy_at: true when an outgoing call-argument reservation holds GP register
+# `id` busy at flat stream position `pos` — i.e. the value `id` carries was placed by
+# an argument setup move and is awaited by the consuming call. used by the rewrite's
+# reload-scratch selection so a temp never lands on a register that already holds a
+# live outgoing argument (the argument-side counterpart of the entry-block param
+# busy-until-capture rule). `pos` must be a flat position (see `rewrite`).
+fun arg_reg_busy_at(ctx: *AllocCtx, id: u32, pos: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.arg_res_count) {
+        if (ctx.arg_res_reg[i] == id
+            && pos::i64 >= ctx.arg_res_start[i]
+            && pos::i64 <= ctx.arg_res_end[i]) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# release_pins: clear any param-register reservation whose end position has been
+# reached, returning the register to the free pool.
+fun release_pins(ctx: *AllocCtx, current_start: i64) {
+    var r: u32 = 0;
+    for (r < ctx.gp_count) {
+        if (ctx.pinned_end[r] >= 0 && ctx.pinned_end[r] < current_start) {
+            ctx.pinned_end[r] = -1;
+        }
+        r = r + 1;
+    }
+}
+
+# vreg_has_slot: true when a vreg owns a frame slot (alloca pointer or by-value
+# aggregate / spill). such vregs are addressed as `[rbp + offset]` and never
+# register-allocated.
+fun vreg_has_slot(ctx: *AllocCtx, v: u32) bool {
+    val frame: *mir.MirFrame = ?ctx.f.frame;
+    var i: u32 = 0;
+    for (i < frame.slot_count) {
+        if (frame.slots[i].value == v) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# sort_by_start: insertion-sort vreg ids in `order` by ascending range start,
+# the order linear scan walks them in.
+fun sort_by_start(ctx: *AllocCtx, order: *u32, count: u32) {
+    var i: u32 = 1;
+    for (i < count) {
+        val key: u32 = order[i];
+        val ks: i64 = ctx.ranges[key].start;
+        var j: i64 = i::i64 - 1;
+        for (j >= 0 && ctx.ranges[order[j::u32]].start > ks) {
+            order[(j + 1)::u32] = order[j::u32];
+            j = j - 1;
+        }
+        order[(j + 1)::u32] = key;
+        i = i + 1;
+    }
+}
+
+# expire_active: drop active ranges whose end precedes `current_start`, returning
+# their physical registers to the free pool.
+fun expire_active(ctx: *AllocCtx, current_start: i64) {
+    var write: u32 = 0;
+    var read: u32 = 0;
+    for (read < ctx.active_count) {
+        val v: u32 = ctx.active[read];
+        val lr: *LiveRange = ?ctx.ranges[v];
+        if (lr.end_pos >= current_start) {
+            ctx.active[write] = v;
+            write = write + 1;
+        } or {
+            free_assigned(ctx, v);
+        }
+        read = read + 1;
+    }
+    ctx.active_count = write;
+}
+
+# free_assigned: return a vreg's assigned register to its bank's free pool. the
+# assigned id is a composite register id (class tag + within-bank index); the busy
+# array is keyed on the within-bank index, so the index is extracted from it.
+fun free_assigned(ctx: *AllocCtx, v: u32) {
+    val mv: *mir.MirVReg = ?ctx.f.vregs[v];
+    if (mv.assigned == mir.MIR_VREG_NIL) { ret; }
+    val lr: *LiveRange = ?ctx.ranges[v];
+    val index: u32 = isa.regid_index(mv.assigned::i32)::u32;
+    if (lr.reg_class == REG_CLASS_GP) {
+        if (index < ctx.gp_count) { ctx.gp_busy[index] = false; }
+    } or {
+        if (index < ctx.fp_count) { ctx.fp_busy[index] = false; }
+    }
+}
+
+# pick_gp: choose a free general-purpose register, preferring caller-saved for a
+# non-call-crossing range and callee-saved for one that crosses a call. reserved
+# (rsp/rbp) and currently pinned param registers are never returned. -1 when no
+# GP register is free.
+fun pick_gp(ctx: *AllocCtx, crosses_call: bool) i32 {
+    if (crosses_call) {
+        # prefer a free callee-saved register so the value survives the call.
+        var ci: u32 = 0;
+        for (ci < ctx.gp_count) {
+            if (gp_available(ctx, ci) && ctx.callee_saved[ci] && !ctx.reserved[ci]) {
+                ctx.gp_busy[ci] = true;
+                ret isa.regid_make(isa.REG_CLASS_ID_GP, ci::i32);
+            }
+            ci = ci + 1;
+        }
+    } or {
+        # prefer a free caller-saved register to leave callee-saved untouched.
+        var ci: u32 = 0;
+        for (ci < ctx.gp_count) {
+            if (gp_available(ctx, ci) && !ctx.callee_saved[ci] && !ctx.reserved[ci]) {
+                ctx.gp_busy[ci] = true;
+                ret isa.regid_make(isa.REG_CLASS_ID_GP, ci::i32);
+            }
+            ci = ci + 1;
+        }
+    }
+    # fall back to any free, non-reserved register of either partition.
+    var ci: u32 = 0;
+    for (ci < ctx.gp_count) {
+        if (gp_available(ctx, ci) && !ctx.reserved[ci]) {
+            ctx.gp_busy[ci] = true;
+            ret isa.regid_make(isa.REG_CLASS_ID_GP, ci::i32);
+        }
+        ci = ci + 1;
+    }
+    ret -1;
+}
+
+# def_reg_reserved: true when GP register `id` is overwritten by a precolored
+# physical-register DEF at a position the range currently being colored
+# (`cur_start`..`cur_end`) is live PAST. a value used at the def position but live
+# only up to it (`cur_end == def-pos`) may still share the register — the def reads
+# its sources before writing, the standard def/use coalescing on a 2-address ISA —
+# so the test rejects only a value live strictly beyond the def (`cur_end >
+# def-pos`) that the def would clobber. this is the return-register / fixed-DEF
+# counterpart of `arg_reg_reserved`, closing the interference gap that colored a
+# two-register aggregate return's `base` pointer onto the RAX its first load
+# defines.
+fun def_reg_reserved(ctx: *AllocCtx, id: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.def_res_count) {
+        if (ctx.def_res_reg[i] == id
+            && ctx.cur_start <= ctx.def_res_pos[i]
+            && ctx.cur_end > ctx.def_res_pos[i]) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# gp_available: true when GP register `id` is neither busy, pinned as a live
+# incoming param register, held by an outgoing call-argument window, nor
+# overwritten by a precolored DEF the colored range is live past — each tested
+# against the range currently being colored.
+fun gp_available(ctx: *AllocCtx, id: u32) bool {
+    if (ctx.gp_busy[id]) { ret false; }
+    if (ctx.pinned_end[id] >= 0) { ret false; }
+    if (arg_reg_reserved(ctx, id)) { ret false; }
+    if (def_reg_reserved(ctx, id)) { ret false; }
+    ret true;
+}
+
+# pick_fp: choose a free floating-point register, or -1 when none is free. the
+# chosen within-bank index is composed with the SSE class tag so the returned id
+# carries its bank — the allocation ORDER is unchanged, only the representation of
+# the assigned id.
+fun pick_fp(ctx: *AllocCtx) i32 {
+    var fi: u32 = 0;
+    for (fi < ctx.fp_count) {
+        if (!ctx.fp_busy[fi]) {
+            ctx.fp_busy[fi] = true;
+            ret isa.regid_make(isa.REG_CLASS_ID_XMM, fi::i32);
+        }
+        fi = fi + 1;
+    }
+    ret -1;
+}
+
+# assign: record a physical register for a vreg and add it to the active set. the
+# assigned id's class tag must match the vreg's register class — a mismatch is an
+# allocator bug (a float vreg handed a GP register or vice versa) and fails loudly
+# rather than silently mis-encoding, the correctness backstop the disjoint id
+# spaces make checkable.
+fun assign(ctx: *AllocCtx, v: u32, preg: u32, reg_class: u32) {
+    val preg_class: i32 = isa.regid_class(preg::i32);
+    if (reg_class == REG_CLASS_GP) {
+        if (preg_class != isa.REG_CLASS_ID_GP) {
+            panic("regalloc: GP vreg assigned a non-GP register\n");
+        }
+    } or {
+        if (preg_class != isa.REG_CLASS_ID_XMM) {
+            panic("regalloc: float vreg assigned a non-XMM register\n");
+        }
+    }
+    ctx.f.vregs[v].assigned = preg;
+    ctx.active[ctx.active_count] = v;
+    ctx.active_count = ctx.active_count + 1;
+}
+
+# spill_on_pressure: relieve register pressure for vreg `v`. picks the best
+# active eviction candidate of `v`'s class; if that victim lives at least as far
+# as `v` it is evicted (its register reassigned to `v`), otherwise `v` is the
+# shorter-lived value and is spilled directly. with no eviction candidate `v` is
+# spilled. a spilled vreg gets a SLOT_SPILL frame slot keyed on its id.
+fun spill_on_pressure(ctx: *AllocCtx, v: u32) Result[bool, str] {
+    val lr: *LiveRange = ?ctx.ranges[v];
+    val victim: u32 = find_spill_victim(ctx, lr.reg_class);
+    if (victim == mir.MIR_VREG_NIL) {
+        ret spill_vreg(ctx, v);
+    }
+
+    # evict the victim only when it lives at least as far as `v`; otherwise `v`
+    # is the shorter-lived value and spilling it wastes no longer-lived register.
+    val vr: *LiveRange = ?ctx.ranges[victim];
+    if (vr.end_pos < lr.end_pos) {
+        ret spill_vreg(ctx, v);
+    }
+
+    val freed: u32 = ctx.f.vregs[victim].assigned;
+    val sr: Result[bool, str] = spill_vreg(ctx, victim);
+    if (is_err[bool, str](sr)) { ret sr; }
+    free_assigned_id(ctx, victim, lr.reg_class, freed);
+    remove_active(ctx, victim);
+
+    var preg: i32 = -1;
+    if (lr.reg_class == REG_CLASS_GP) {
+        preg = pick_gp(ctx, lr.crosses_call);
+    } or {
+        preg = pick_fp(ctx);
+    }
+    if (preg >= 0) {
+        assign(ctx, v, preg::u32, lr.reg_class);
+        ret ok[bool, str](true);
+    }
+    ret spill_vreg(ctx, v);
+}
+
+# free_assigned_id: return a specific physical register of a class to its free
+# pool (used after a victim has been spilled and its `assigned` cleared). `preg`
+# is a composite register id; the busy array is keyed on the within-bank index.
+fun free_assigned_id(ctx: *AllocCtx, v: u32, reg_class: u32, preg: u32) {
+    val index: u32 = isa.regid_index(preg::i32)::u32;
+    if (reg_class == REG_CLASS_GP) {
+        if (index < ctx.gp_count) { ctx.gp_busy[index] = false; }
+    } or {
+        if (index < ctx.fp_count) { ctx.fp_busy[index] = false; }
+    }
+}
+
+# remove_active: drop vreg `v` from the active set if present.
+fun remove_active(ctx: *AllocCtx, v: u32) {
+    var write: u32 = 0;
+    var read: u32 = 0;
+    for (read < ctx.active_count) {
+        if (ctx.active[read] != v) {
+            ctx.active[write] = ctx.active[read];
+            write = write + 1;
+        }
+        read = read + 1;
+    }
+    ctx.active_count = write;
+}
+
+# find_spill_victim: choose the active range to evict — prefer a non-call-crossing
+# one, then the lowest use density (fewest uses per instruction spanned). returns
+# the victim vreg id, or MIR_VREG_NIL when no candidate of the class is active.
+fun find_spill_victim(ctx: *AllocCtx, reg_class: u32) u32 {
+    var best: u32 = mir.MIR_VREG_NIL;
+    var best_density: i64 = POS_MAX;
+    var best_crosses: bool = true;
+    var ai: u32 = 0;
+    for (ai < ctx.active_count) {
+        val v: u32 = ctx.active[ai];
+        val lr: *LiveRange = ?ctx.ranges[v];
+        if (lr.reg_class != reg_class) { ai = ai + 1; cnt; }
+
+        val span: i64 = lr.end_pos - lr.start;
+        var density: i64 = lr.use_count::i64 * 1000;
+        if (span > 0) { density = (lr.use_count::i64 * 1000) / span; }
+
+        var better: bool = false;
+        if (!lr.crosses_call && best_crosses) {
+            better = true;
+        } or (lr.crosses_call == best_crosses && density < best_density) {
+            better = true;
+        }
+        if (better) {
+            best_density = density;
+            best_crosses = lr.crosses_call;
+            best = v;
+        }
+        ai = ai + 1;
+    }
+    ret best;
+}
+
+# spill_vreg: mark a vreg spilled — set its `spill_slot` and add a SLOT_SPILL
+# frame slot keyed on its id so frame.run assigns an offset and the encoder forms
+# `[rbp + offset]`. the slot width is the register width of the vreg's class.
+fun spill_vreg(ctx: *AllocCtx, v: u32) Result[bool, str] {
+    val mv: *mir.MirVReg = ?ctx.f.vregs[v];
+    if (mv.spill_slot >= 0) { ret ok[bool, str](true); }
+    mv.assigned = mir.MIR_VREG_NIL;
+
+    val size: u32 = class_width(ctx, ?ctx.ranges[v]);
+    val sr: Result[i32, str] = add_spill_slot(ctx, v, size);
+    if (is_err[i32, str](sr)) { ret err[bool, str](unwrap_err[i32, str](sr)); }
+    mv.spill_slot = unwrap_ok[i32, str](sr);
+    ret ok[bool, str](true);
+}
+
+# class_width: the spill-slot byte width for a range's register class (at least
+# 8 bytes; FP values occupy 16).
+fun class_width(ctx: *AllocCtx, lr: *LiveRange) u32 {
+    if (lr.reg_class != REG_CLASS_GP) { ret 16; }
+    ret 8;
+}
+
+# add_spill_slot: append a SLOT_SPILL frame slot keyed on a vreg id and return
+# its slot index. mirrors `mir`'s param-spill slot construction so frame.run and
+# the encoder resolve the slot identically.
+fun add_spill_slot(ctx: *AllocCtx, value_id: u32, size: u32) Result[i32, str] {
+    val frame: *mir.MirFrame = ?ctx.f.frame;
+    if (frame.slot_count >= frame.slot_cap) {
+        var new_cap: u32 = frame.slot_cap * 2;
+        if (new_cap < 8) { new_cap = 8; }
+        val r: Result[*mir.MirSlot, str] = reallocate[mir.MirSlot](ctx.alloc, frame.slots, frame.slot_cap::usize, new_cap::usize);
+        if (is_err[*mir.MirSlot, str](r)) { ret err[i32, str](unwrap_err[*mir.MirSlot, str](r)); }
+        frame.slots    = unwrap_ok[*mir.MirSlot, str](r);
+        frame.slot_cap = new_cap;
+    }
+    val si: u32 = frame.slot_count;
+    frame.slots[si].value  = value_id;
+    frame.slots[si].kind   = mir.SLOT_SPILL;
+    frame.slots[si].offset = 0;
+    frame.slots[si].size   = size;
+    frame.slots[si].align  = 8;
+    frame.slot_count = frame.slot_count + 1;
+    ret ok[i32, str](si::i32);
+}
+
+# spill_across_calls: at each MIR_CALL barrier, spill every live vreg whose
+# assigned register is caller-saved (or any FP register) so the call cannot
+# destroy it. a spilled value is reloaded at its uses by the rewrite pass; here
+# we only convert call-clobbered live registers into spill slots. ranges already
+# placed in callee-saved registers survive the call untouched.
+fun spill_across_calls(ctx: *AllocCtx) Result[bool, str] {
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        if (!ctx.flat[pos].is_call) { pos = pos + 1; cnt; }
+        var v: u32 = 0;
+        for (v < ctx.f.vreg_count) {
+            val mv: *mir.MirVReg = ?ctx.f.vregs[v];
+            if (mv.assigned == mir.MIR_VREG_NIL) { v = v + 1; cnt; }
+            if (mv.spill_slot >= 0) { v = v + 1; cnt; }
+            val lr: *LiveRange = ?ctx.ranges[v];
+            # live strictly across the call (defined before, used after).
+            if (lr.start >= pos::i64 || lr.end_pos <= pos::i64) { v = v + 1; cnt; }
+
+            var must_spill: bool = false;
+            if (lr.reg_class != REG_CLASS_GP) {
+                must_spill = true;
+            } or (mv.assigned < ctx.gp_count && !ctx.callee_saved[mv.assigned]) {
+                must_spill = true;
+            }
+            if (must_spill) {
+                val sr: Result[bool, str] = spill_vreg(ctx, v);
+                if (is_err[bool, str](sr)) { ret sr; }
+            }
+            v = v + 1;
+        }
+        pos = pos + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# record_callee_mask: set `MirFunction.callee_mask` bit `n` for every callee-saved
+# GP register the allocator actually assigned, so the prologue saves and the
+# epilogue restores exactly those registers.
+fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
+    var mask: u32 = 0;
+    var v: u32 = 0;
+    for (v < ctx.f.vreg_count) {
+        val mv: *mir.MirVReg = ?ctx.f.vregs[v];
+        if (mv.assigned == mir.MIR_VREG_NIL) { v = v + 1; cnt; }
+        val lr: *LiveRange = ?ctx.ranges[v];
+        if (lr.reg_class != REG_CLASS_GP) { v = v + 1; cnt; }
+        if (mv.assigned < ctx.gp_count && ctx.callee_saved[mv.assigned] && !ctx.reserved[mv.assigned]) {
+            mask = mask | (1::u32 << mv.assigned);
+        }
+        v = v + 1;
+    }
+    ctx.f.callee_mask = mask;
+}
+
+# rewrite: the final pass. for each block, rebuild its instruction list so every
+# MIR_OP_VREG operand is rewritten to MIR_OP_PREG via the vreg's assigned register;
+# a value-pointer MEM base is rewritten to a physical-register base (preg set,
+# vreg cleared) while a frame-slot-owning MEM base keeps its slot-key vreg id for
+# the encoder to resolve to `[rbp + offset]`; and a spilled vreg's uses get a
+# reload-before-use MIR_MOV and its defs get a store-after-def MIR_MOV. after this
+# no MIR_OP_VREG naming an allocatable value, and no value vreg in a MEM base,
+# remains.
+fun rewrite(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    # `flat_base` is each block's start offset in the flat instruction stream
+    # `build_arg_reservations` / param pinning use as their coordinate. flatten and
+    # this loop walk blocks in identical order, so a block's flat position is the
+    # running sum of prior blocks' (original) instruction counts. capture the count
+    # before rewrite_block mutates it (splicing reloads/stores changes instr_count).
+    var flat_base: u32 = 0;
+    for (bi < f.block_count) {
+        # block 0 is the entry block: its `vreg <- preg` param captures share the
+        # source positions reserve_param_registers recorded in param_reg_end.
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        val orig_count: u32 = blk.instr_count;
+        val rb: Result[bool, str] = rewrite_block(tgt, ctx, blk, bi == 0, flat_base);
+        if (is_err[bool, str](rb)) { ret rb; }
+        flat_base = flat_base + orig_count;
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# rewrite_block: rebuild one block's instruction list, splicing in reload and
+# store MIR_MOVs around spilled operands and rewriting vreg operands in place.
+# the new list is sized by counting the reloads/stores each instruction needs.
+fun rewrite_block(tgt: *target.Target, ctx: *AllocCtx, blk: *mir.MirBlock, is_entry: bool, flat_base: u32) Result[bool, str] {
+    if (blk.instr_count == 0) { ret ok[bool, str](true); }
+
+    var total: u32 = 0;
+    var ii: u32 = 0;
+    for (ii < blk.instr_count) {
+        total = total + 1 + extra_movs(ctx, ?blk.instrs[ii]);
+        ii = ii + 1;
+    }
+
+    # zero the buffer so spliced reload/store MOVs (emit_reload/emit_store set
+    # opcode/operands/width but not asm_block) default to asm_block=nil rather than
+    # bump-arena residue; the rewritten real instruction still copies its own
+    # asm_block from `mi` explicitly. keeps every MirInstr reaching encode with a
+    # well-defined asm_block.
+    val rn: Result[*mir.MirInstr, str] = zallocate[mir.MirInstr](ctx.alloc, total::usize);
+    if (is_err[*mir.MirInstr, str](rn)) { ret err[bool, str](unwrap_err[*mir.MirInstr, str](rn)); }
+    val dst: *mir.MirInstr = unwrap_ok[*mir.MirInstr, str](rn);
+    var w: u32 = 0;
+
+    ii = 0;
+    for (ii < blk.instr_count) {
+        val mi: *mir.MirInstr = ?blk.instrs[ii];
+        val re: Result[bool, str] = rewrite_instr(tgt, ctx, mi, dst, ?w, is_entry, flat_base + ii);
+        if (is_err[bool, str](re)) {
+            # release any operand arrays already moved into `dst` and the array.
+            deallocate[mir.MirInstr](ctx.alloc, dst, total::usize);
+            ret re;
+        }
+        ii = ii + 1;
+    }
+
+    if (blk.instrs != nil && blk.instr_cap > 0) {
+        deallocate[mir.MirInstr](ctx.alloc, blk.instrs, blk.instr_cap::usize);
+    }
+    blk.instrs      = dst;
+    blk.instr_count = w;
+    blk.instr_cap   = total;
+    ret ok[bool, str](true);
+}
+
+# extra_movs: how many reload / store MIR_MOVs an instruction needs — one reload
+# per spilled source operand (or spilled-pointer MEM base), and one store per
+# spilled destination vreg. a storage-slot MEM base (an alloca pointer or
+# by-value aggregate, where the vreg IS the storage) needs no reload: the encoder
+# addresses it as `[rbp + offset]` directly.
+fun extra_movs(ctx: *AllocCtx, mi: *mir.MirInstr) u32 {
+    var n: u32 = 0;
+    val has_def: bool = instr_defines(mi);
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        if (op.kind == mir.MIR_OP_VREG) {
+            # a spilled source or destination needs a reload (before) or store
+            # (after); both count as one extra MOV.
+            if (is_spilled(ctx, op.vreg)) { n = n + 1; }
+        } or (op.kind == mir.MIR_OP_MEM && op.vreg != mir.MIR_VREG_NIL) {
+            # a spilled-pointer base needs its value reloaded; a storage-slot base
+            # is addressed directly and needs nothing.
+            if (is_spilled(ctx, op.vreg)) { n = n + 1; }
+        }
+        # a spilled scaled-index value vreg needs its value reloaded too.
+        if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg && op.index != mir.MIR_VREG_NIL) {
+            if (is_spilled(ctx, op.index)) { n = n + 1; }
+        }
+        k = k + 1;
+    }
+    ret n;
+}
+
+# is_spilled: true when the allocator spilled this vreg's value to a frame slot.
+# distinct from a storage slot owned from lowering (alloca / by-value aggregate),
+# which is reported by `is_storage_slot` instead.
+fun is_spilled(ctx: *AllocCtx, v: u32) bool {
+    if (v >= ctx.f.vreg_count) { ret false; }
+    ret ctx.f.vregs[v].spill_slot >= 0;
+}
+
+# is_fp_vreg: true when a vreg belongs to the float / vector register class, so a
+# spilled instance is addressed and loaded as a float rather than reloaded through
+# a GP temp. the MIR_FCMP result is GP-classed (the i8 boolean) and is excluded.
+fun is_fp_vreg(ctx: *AllocCtx, v: u32) bool {
+    if (v >= ctx.f.vreg_count) { ret false; }
+    ret ctx.f.vregs[v].class != REG_CLASS_GP;
+}
+
+# is_storage_slot: true when a vreg owns a frame slot from lowering and the vreg
+# IS that storage (an alloca pointer or a by-value aggregate), so a MEM base
+# naming it addresses `[rbp + offset]` directly. a value the allocator spilled is
+# excluded — its slot holds the value, not storage the base points into.
+fun is_storage_slot(ctx: *AllocCtx, v: u32) bool {
+    if (is_spilled(ctx, v)) { ret false; }
+    ret vreg_has_slot(ctx, v);
+}
+
+# rewrite_instr: emit the reloads, the rewritten instruction, and the stores for
+# one source instruction into `dst` at `@wp`, advancing `@wp`. spilled source
+# vregs are reloaded into a fresh temporary register (excluding the instruction's
+# clobbered registers and any temp already claimed); the rewritten instruction
+# references the temporaries; a spilled destination is written to a temporary and
+# stored back to its slot afterward.
+fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
+                  dst: *mir.MirInstr, wp: *u32, is_entry: bool, src_pos: u32) Result[bool, str] {
+    # copy the source operand array into a fresh array we own and mutate.
+    val n: u32 = mi.operand_count;
+    var ops: *mir.MirOperand = nil;
+    if (n > 0) {
+        val ro: Result[*mir.MirOperand, str] = allocate[mir.MirOperand](ctx.alloc, n::usize);
+        if (is_err[*mir.MirOperand, str](ro)) { ret err[bool, str](unwrap_err[*mir.MirOperand, str](ro)); }
+        ops = unwrap_ok[*mir.MirOperand, str](ro);
+        var c: u32 = 0;
+        for (c < n) { ops[c] = mi.operands[c]; c = c + 1; }
+    }
+
+    val has_def: bool = instr_defines_ops(mi, ops, n);
+
+    # temporaries claimed at this instruction, so a reload does not reuse one.
+    var claimed: [16]i32;
+    var claimed_count: u32 = 0;
+    var ci: u32 = 0;
+    for (ci < 16) { claimed[ci] = -1; ci = ci + 1; }
+
+    # reload each spilled source operand (and non-slot MEM base) into a temp.
+    var store_dst_vreg: u32 = mir.MIR_VREG_NIL;
+    var store_dst_tmp: i32 = -1;
+
+    # a float operand is read and written by the encoder through a fixed XMM scratch
+    # — the float arithmetic / comparison ops (MIR_FADD / FSUB / FMUL / FDIV / FCMP)
+    # and the class-dispatched float MOV / cross bitcast all reach each float operand
+    # wherever it lives, an XMM register or a `[rbp + off]` frame slot. so a SPILLED
+    # FLOAT operand or destination is left as a frame-slot MEM operand for the encoder
+    # rather than reloaded into a GP temp (which would copy float bits through a GP
+    # register and then be misread as an XMM register). the float side is identified
+    # by the operand's vreg register CLASS, never the opcode, so a folded float MOV is
+    # routed the same as a dedicated float op. an XMM-resident float operand still
+    # rewrites to its assigned XMM preg below.
+    var k: u32 = 0;
+    for (k < n) {
+        val op: *mir.MirOperand = ?ops[k];
+        if (op.kind == mir.MIR_OP_VREG) {
+            val v: u32 = op.vreg;
+            if (has_def && k == 0) {
+                # a destination vreg.
+                if (is_fp_vreg(ctx, v) && is_spilled(ctx, v)) {
+                    # the float result is stored directly into its slot by the encoder.
+                    ops[k] = mir.op_mem_slot(v, 0);
+                } or (is_spilled(ctx, v)) {
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1, is_entry, src_pos);
+                    if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled destination"); }
+                    claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
+                    ops[k] = mir.op_preg(tmp::u32);
+                    store_dst_vreg = v;
+                    store_dst_tmp  = tmp;
+                } or {
+                    ops[k] = preg_of(ctx, v);
+                }
+            } or {
+                if (is_fp_vreg(ctx, v) && is_spilled(ctx, v)) {
+                    # the float operand is loaded from its slot by the encoder.
+                    ops[k] = mir.op_mem_slot(v, 0);
+                } or (store_dst_tmp >= 0 && v == store_dst_vreg) {
+                    # this spilled source names the SAME vreg as the (also-spilled)
+                    # destination — e.g. the `XOR dst, dst` zeroing idiom the x64 NEG
+                    # expansion emits, which is only valid when both operands are the
+                    # identical physical register. reuse the destination's reload
+                    # scratch (claimed at operand 0) rather than reloading the same
+                    # value into a second register, which would split the two
+                    # occurrences across registers and break the idiom.
+                    ops[k] = mir.op_preg(store_dst_tmp::u32);
+                } or (is_spilled(ctx, v)) {
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1, is_entry, src_pos);
+                    if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled source"); }
+                    claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
+                    emit_reload(ctx, dst, wp, tmp::u32, v);
+                    ops[k] = mir.op_preg(tmp::u32);
+                } or {
+                    ops[k] = preg_of(ctx, v);
+                }
+            }
+        } or (op.kind == mir.MIR_OP_MEM) {
+            # a MEM base in `vreg` is either a frame-slot key (left for the encoder
+            # to resolve) or a value-pointer vreg (rewritten to its physical
+            # register, `preg` set + `vreg` cleared); a physical-register base
+            # already carries `vreg == MIR_VREG_NIL`. the optional scaled index is a
+            # value vreg the GEP address-folding leaves behind and is rewritten the
+            # same way. operand fields are mutated in place so the index / scale /
+            # displacement survive the base rewrite.
+            if (op.vreg != mir.MIR_VREG_NIL) {
+                val v: u32 = op.vreg;
+                if (is_storage_slot(ctx, v)) {
+                    # a frame-slot storage base (alloca / by-value aggregate): the
+                    # encoder resolves it to `[rbp + offset]`; leave the slot key.
+                } or (is_spilled(ctx, v)) {
+                    # a spilled pointer value: reload the pointer into a temp so the
+                    # base addresses what it points to, not its spill slot.
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1, is_entry, src_pos);
+                    if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled MEM base"); }
+                    claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
+                    emit_reload(ctx, dst, wp, tmp::u32, v);
+                    ops[k].vreg = mir.MIR_VREG_NIL;
+                    ops[k].preg = tmp::u32;
+                } or {
+                    # an ordinary value-pointer base: rewrite to its physical register.
+                    ops[k].vreg = mir.MIR_VREG_NIL;
+                    ops[k].preg = assigned_preg(ctx, v);
+                }
+            }
+            # rewrite the scaled index value vreg to its physical register, reloading
+            # it first when spilled. a frame-slot-key base coexists with an index
+            # (the encoder adds the SIB term to `[rbp + offset]`).
+            if (!ops[k].index_is_preg && ops[k].index != mir.MIR_VREG_NIL) {
+                val iv: u32 = ops[k].index;
+                if (is_spilled(ctx, iv)) {
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, -1, is_entry, src_pos);
+                    if (tmp < 0) { free_ops(ctx, ops, n); ret err[bool, str]("regalloc: no free register for spilled MEM index"); }
+                    claimed[claimed_count] = tmp; claimed_count = claimed_count + 1;
+                    emit_reload(ctx, dst, wp, tmp::u32, iv);
+                    ops[k].index         = tmp::u32;
+                    ops[k].index_is_preg = true;
+                } or {
+                    ops[k].index         = assigned_preg(ctx, iv);
+                    ops[k].index_is_preg = true;
+                }
+            }
+        }
+        k = k + 1;
+    }
+
+    # the rewritten instruction itself. the operation width / source width are
+    # carried through unchanged from lowering so the encoder still sizes the op at
+    # 1 / 2 / 4 / 8 bytes after register assignment.
+    dst[@wp].opcode        = mi.opcode;
+    dst[@wp].operands      = ops;
+    dst[@wp].operand_count = n;
+    dst[@wp].width         = mi.width;
+    dst[@wp].src_width     = mi.src_width;
+    dst[@wp].asm_block     = mi.asm_block;
+    @wp = @wp + 1;
+
+    # release the original operand array; its contents were copied into `ops`.
+    if (mi.operands != nil && mi.operand_count > 0) {
+        deallocate[mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+    }
+
+    # store a spilled destination back to its slot.
+    if (store_dst_vreg != mir.MIR_VREG_NIL) {
+        val sr: Result[bool, str] = emit_store(ctx, dst, wp, store_dst_vreg, store_dst_tmp::u32);
+        if (is_err[bool, str](sr)) { ret sr; }
+    }
+    ret ok[bool, str](true);
+}
+
+# instr_defines_ops: like `instr_defines` but reads the working operand copy so
+# the destination check uses the operands we are about to rewrite. classification
+# is by operand shape and the surviving MIR_CALL barrier (see `instr_defines`),
+# never by the selection-rewritten terminator/store opcodes.
+fun instr_defines_ops(mi: *mir.MirInstr, ops: *mir.MirOperand, n: u32) bool {
+    if (n == 0) { ret false; }
+    if (mi.opcode == mir.MIR_CALL) { ret false; }
+    if (mi.opcode == mir.MIR_CALL_RES) { ret false; }
+    if (mi.opcode == mir.MIR_ARG) { ret false; }
+    var k: u32 = 0;
+    for (k < n) {
+        if (ops[k].kind == mir.MIR_OP_BLOCK) { ret false; }
+        k = k + 1;
+    }
+    ret ops[0].kind == mir.MIR_OP_VREG;
+}
+
+# preg_of: the MIR_OP_PREG operand for an assigned vreg. a spilled vreg is
+# excluded by the caller; a slot-owning vreg is never a plain value operand. an
+# unassigned vreg reaching here is a register-allocation bug, reported by
+# `assigned_preg`.
+fun preg_of(ctx: *AllocCtx, v: u32) mir.MirOperand {
+    ret mir.op_preg(assigned_preg(ctx, v));
+}
+
+# assigned_preg: the physical register id assigned to a vreg. every vreg that
+# reaches the rewrite as a register-resident value or an ordinary pointer base
+# was assigned a register; an unassigned vreg here means a value that should have
+# been proven dead and dropped (or a linear-scan bug), so it fails loudly rather
+# than encoding an arbitrary register 0.
+fun assigned_preg(ctx: *AllocCtx, v: u32) u32 {
+    if (v >= ctx.f.vreg_count) {
+        panic("regalloc: operand vreg id out of range during rewrite\n");
+    }
+    val a: u32 = ctx.f.vregs[v].assigned;
+    if (a == mir.MIR_VREG_NIL) {
+        panic("regalloc: unassigned vreg reached instruction rewrite\n");
+    }
+    ret a;
+}
+
+# reload_temp: choose a reload-scratch register to hold a reloaded spill value.
+# the pool (`ctx.reload_scratch`) is reserved from value allocation in
+# `seed_reserved`, so its registers hold no allocator-assigned value and are free
+# for a reload, with one exception handled below: in the entry block a pool
+# register that the ISA also passes an incoming argument in is busy until that
+# argument is captured. the other constraint is not reusing one already claimed at
+# this instruction (its base / scaled index / value operands reload into distinct
+# temporaries that must coexist in the rewritten instruction). `exclude` skips a
+# specific register the caller already holds. -1 when the pool is exhausted at
+# this instruction (more simultaneous reloads than the ISA's pool covers), which
+# the caller reports loudly rather than encoding a clobbering register.
+fun reload_temp(ctx: *AllocCtx, claimed: *i32, claimed_count: u32, exclude: i32,
+                is_entry: bool, src_pos: u32) i32 {
+    var i: i32 = 0;
+    for (i < ctx.reload_scratch_count) {
+        val id: i32 = ctx.reload_scratch[i].id;
+        if (id == exclude) { i = i + 1; cnt; }
+        if (id_claimed(claimed, claimed_count, id)) { i = i + 1; cnt; }
+        # the reload-scratch pool is drawn from caller-saved GP registers; on a
+        # register-starved target those unavoidably overlap the ABI's argument
+        # registers (the ISA owns that pool choice — see its reload_scratch_regs).
+        # a scratch register that is also an incoming argument register still holds
+        # its un-captured argument value through the entry block until that
+        # argument's `MOV vreg <- preg` capture; using it as a reload/store temp
+        # before then would clobber the live argument. skip it until past its
+        # capture position — the rewrite-phase counterpart of the param-register
+        # busy-until-capture reservation the allocation phase already enforces.
+        # outside the entry block, and after capture, the full pool is free.
+        if (is_entry && id::u32 < ctx.gp_count
+            && ctx.param_reg_end[id] >= 0 && src_pos::i64 <= ctx.param_reg_end[id]) {
+            i = i + 1; cnt;
+        }
+        # the argument-side counterpart: a scratch register that already holds a
+        # placed outgoing call argument (between its setup move and the consuming
+        # call) must not be reused as a reload temp — doing so clobbers the argument
+        # before the call. e.g. a 16-byte aggregate argument's first half sits in a
+        # pool register while the second half's spilled base is reloaded for the same
+        # call. consult the outgoing-argument reservation windows the allocator built.
+        if (id::u32 < ctx.gp_count && arg_reg_busy_at(ctx, id::u32, src_pos)) {
+            i = i + 1; cnt;
+        }
+        ret id;
+    }
+    ret -1;
+}
+
+# id_claimed: true when register `id` is already a claimed reload temporary.
+fun id_claimed(claimed: *i32, count: u32, id: i32) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (claimed[i] == id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# emit_reload: append `MIR_MOV (preg tmp) <- [rbp + slot]` reloading a spilled
+# vreg into a temporary. the slot is addressed by a MEM operand whose base is the
+# spilled vreg id (the encoder resolves it to `[rbp + offset]` via the frame
+# slot), matching the by-value-spill addressing convention.
+fun emit_reload(ctx: *AllocCtx, dst: *mir.MirInstr, wp: *u32, tmp: u32, v: u32) {
+    val ro: Result[*mir.MirOperand, str] = allocate[mir.MirOperand](ctx.alloc, 2::usize);
+    if (is_err[*mir.MirOperand, str](ro)) { panic("regalloc: reload operand allocation failed\n"); }
+    val ops: *mir.MirOperand = unwrap_ok[*mir.MirOperand, str](ro);
+    ops[0] = mir.op_preg(tmp);
+    ops[1] = mir.op_mem_slot(v, 0);
+    dst[@wp].opcode        = mir.MIR_MOV;
+    dst[@wp].operands      = ops;
+    dst[@wp].operand_count = 2;
+    # a spill slot holds a full register; reload it at the machine-word width.
+    dst[@wp].width         = SPILL_MOV_WIDTH;
+    dst[@wp].src_width     = SPILL_MOV_WIDTH;
+    @wp = @wp + 1;
+}
+
+# emit_store: append `MIR_MOV [rbp + slot] <- (preg tmp)` storing a temporary
+# back to a spilled destination vreg's slot. the destination MEM base is the
+# spilled vreg id so the encoder resolves it to `[rbp + offset]`.
+fun emit_store(ctx: *AllocCtx, dst: *mir.MirInstr, wp: *u32, v: u32, tmp: u32) Result[bool, str] {
+    val ro: Result[*mir.MirOperand, str] = allocate[mir.MirOperand](ctx.alloc, 2::usize);
+    if (is_err[*mir.MirOperand, str](ro)) { ret err[bool, str](unwrap_err[*mir.MirOperand, str](ro)); }
+    val ops: *mir.MirOperand = unwrap_ok[*mir.MirOperand, str](ro);
+    ops[0] = mir.op_mem_slot(v, 0);
+    ops[1] = mir.op_preg(tmp);
+    dst[@wp].opcode        = mir.MIR_MOV;
+    dst[@wp].operands      = ops;
+    dst[@wp].operand_count = 2;
+    # a spill slot holds a full register; store it at the machine-word width.
+    dst[@wp].width         = SPILL_MOV_WIDTH;
+    dst[@wp].src_width     = SPILL_MOV_WIDTH;
+    @wp = @wp + 1;
+    ret ok[bool, str](true);
+}
+
+# free_ops: release a working operand array on an error path before returning.
+fun free_ops(ctx: *AllocCtx, ops: *mir.MirOperand, n: u32) {
+    if (ops != nil && n > 0) {
+        deallocate[mir.MirOperand](ctx.alloc, ops, n::usize);
+    }
+}

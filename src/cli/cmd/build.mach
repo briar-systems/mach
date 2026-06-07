@@ -1,0 +1,1222 @@
+# mach.cli.cmd.build: `mach build` — compiles the current project to per-module objects and, in executable mode, a linked binary.
+#
+# resolves the project root by walking up from the working directory until
+# a mach.toml is found, initialises a Session, and loads the full module
+# graph through driver.build_project (config parse + DFS load + resolve).
+# it then drives each reachable module, in topo order, through sema ->
+# lower -> the optimisation pipeline -> codegen, collecting one
+# ObjectImage per module. each image is written to a relocatable object
+# whose path mirrors the module FQN under the target's artifact directory:
+# FQN `a.b.c` -> `<root>/<out>/<artifacts>/obj/a/b/c.o` (parent directories
+# created as needed). in executable mode the collected object paths are
+# linked into `<root>/<out>/<binary>`; in library mode the per-module
+# objects are the deliverable and no executable is linked. finally
+# diagnostics are flushed. exit codes: 0 ok, 1 user error (missing
+# mach.toml, unknown target, compile errors), 2 internal error.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use page:  std.allocator.page;
+use arena: std.allocator.arena;
+
+use os: std.system.os;
+use fs: std.filesystem;
+
+use writer: std.io.writer;
+
+use intern: mach.lang.intern;
+use sess:   mach.lang.session;
+use src:    mach.lang.source;
+use diag:   mach.lang.diagnostic;
+use driver: mach.lang.driver;
+
+use sema:    mach.lang.fe.sema;
+use token:   mach.lang.fe.token;
+
+use ir:         mach.lang.me.ir;
+use ir_printer: mach.lang.me.ir.printer;
+use lower:      mach.lang.me.lower;
+use testrunner: mach.lang.me.lower.testrunner;
+use pipeline:   mach.lang.me.pipeline;
+
+use tgt:      mach.lang.target;
+use of:       mach.lang.target.of;
+use codegen:  mach.lang.be.codegen;
+use linker:   mach.lang.be.linker;
+use obj:      mach.lang.be.obj;
+
+use cfg: mach.cli.config;
+
+# BuildResult: the outcome of a single `build` invocation: the exit code
+# to return plus the absolute path of the produced artifact (nil when the
+# build failed before emission).
+# ---
+# code:        process exit code (0 ok, 1 user error, 2 internal error)
+# output_path: owned path of the produced artifact, or nil on failure
+pub rec BuildResult {
+    code:        i64;
+    output_path: *u8;
+}
+
+# EmitArtifacts: the debug-artifact emission settings threaded into the per-module
+# compile loop. `base` is the resolved `<root>/<out>/<artifacts>` prefix the `asm/`
+# and `ir/` trees hang off (a borrowed pointer into the caller's path buffer, valid
+# for the compile); `want_asm` / `want_ir` toggle each text artifact (`--emit-asm` /
+# `--emit-ir`). when both flags are off `base` is unused.
+# ---
+# base: resolved `<root>/<out>/<artifacts>` directory prefix (borrowed)
+# want_asm: emit per-module `.s` assembly text
+# want_ir:  emit per-module `.ir` SSA IR text
+rec EmitArtifacts {
+    base:     *u8;
+    want_asm: bool;
+    want_ir:  bool;
+}
+
+# eq: byte-wise equality of two null-terminated `*u8` strings.
+# ---
+# a:   first null-terminated byte string
+# b:   second null-terminated byte string
+# ret: true if both reach the terminator at the same position with matching bytes
+fun eq(a: *u8, b: *u8) bool {
+    if (a == b)               { ret true; }
+    if (a == nil || b == nil) { ret false; }
+    var i: usize = 0;
+    for (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret a[i] == b[i];
+}
+
+# slen: length in bytes of a null-terminated `*u8` string, excluding the terminator.
+# ---
+# s:   null-terminated byte string
+# ret: number of bytes before the terminator (0 for nil)
+fun slen(s: *u8) usize {
+    if (s == nil) { ret 0; }
+    var n: usize = 0;
+    for (s[n] != 0) { n = n + 1; }
+    ret n;
+}
+
+# emit: write a null-terminated `*u8` string to stderr.
+# ---
+# s: null-terminated byte string to write
+fun emit(s: *u8) {
+    os.write(os.STDERR_FD, s, slen(s));
+}
+
+# emit_id: resolve an interned StrId against the project interner and write
+# it to stderr; a miss writes "<?>".
+# ---
+# p:  the project (for its session interner)
+# id: the interned string to render
+fun emit_id(p: *driver.Project, id: intern.StrId) {
+    val o: Option[str] = intern.lookup(?p.s.interner, id);
+    if (is_some[str](o)) {
+        val v: str = unwrap[str](o);
+        os.write(os.STDERR_FD, v::*u8, slen(v::*u8));
+    }
+    or {
+        emit("<?>");
+    }
+}
+
+# emit_target: write the resolved target name and module count to stderr.
+# the leading line of verbose output, emitted once after graph discovery.
+# ---
+# p: the project carrying the selected target and module graph
+fun emit_target(p: *driver.Project) {
+    emit("target ");
+    if (p.target_entry != nil) { emit_id(p, p.target_entry.name); }
+    or                         { emit("<none>"); }
+    emit(" (");
+    emit_num(p.topo_len::usize);
+    emit(" module(s))\n");
+}
+
+# emit_stage: write a `<stage> <fqn>` progress line to stderr for one module.
+# ---
+# p:     the project (for its interner)
+# stage: a short stage label (e.g. "sema", "lower/codegen")
+# fqn:   the module's interned fully-qualified name
+fun emit_stage(p: *driver.Project, stage: *u8, fqn: intern.StrId) {
+    emit(stage);
+    emit(" ");
+    emit_id(p, fqn);
+    emit("\n");
+}
+
+# cstr_str: view a null-terminated `*u8` path as a length-counted `str` for the
+# filesystem layer, whose API is fat-string based. the returned `str` borrows
+# the same bytes — it must not outlive `s`.
+# ---
+# s:   null-terminated byte string
+# ret: a `str` over the same bytes, length computed up to the terminator
+fun cstr_str(s: *u8) str {
+    ret s::str;
+}
+
+# join_into: join `dir` and `leaf` with a single '/' into the
+# caller-provided buffer and null-terminate. returns the byte length
+# written (excluding the terminator), or 0 if it would not fit.
+fun join_into(buf: *u8, cap: usize, dir: *u8, leaf: *u8) usize {
+    val dl: usize = slen(dir);
+    val ll: usize = slen(leaf);
+    var need: usize = dl + 1 + ll + 1;
+    if (need > cap) { ret 0; }
+    var k: usize = 0;
+    var i: usize = 0;
+    for (i < dl) { buf[k] = dir[i]; k = k + 1; i = i + 1; }
+    if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
+    i = 0;
+    for (i < ll) { buf[k] = leaf[i]; k = k + 1; i = i + 1; }
+    buf[k] = 0;
+    ret k;
+}
+
+# parent_dir: strip the final path component of `path` in place, turning
+# the last '/' into a terminator. returns true if a parent component
+# remained, false when `path` had no separator (already at a root or bare
+# name).
+fun parent_dir(path: *u8) bool {
+    var last: usize = 0;
+    var found: bool = false;
+    var i: usize = 0;
+    for (path[i] != 0) {
+        if (path[i] == '/') { last = i; found = true; }
+        i = i + 1;
+    }
+    if (!found) { ret false; }
+    if (last == 0) {
+        # path is "/<leaf>" — keep the root slash
+        path[1] = 0;
+        ret false;
+    }
+    path[last] = 0;
+    ret true;
+}
+
+# find_project_root: walk up from `start` (or the process cwd when nil)
+# until a directory containing mach.toml is found, writing the resolved
+# root into `out` (caller-provided, must hold at least 4096 bytes).
+# returns true on success; false when no ancestor directory holds a
+# mach.toml.
+fun find_project_root(start: *u8, out: *u8, cap: usize) bool {
+    var i: usize = 0;
+    if (start != nil && start[0] != 0) {
+        val n: usize = slen(start);
+        if (n + 1 > cap) { ret false; }
+        for (i < n) { out[i] = start[i]; i = i + 1; }
+        out[n] = 0;
+    }
+    or {
+        val g: i64 = os.getcwd(out, cap);
+        if (g < 0) { ret false; }
+    }
+
+    var probe: [4096]u8;
+    for (true) {
+        val plen: usize = join_into(?probe[0], 4096, out, "mach.toml");
+        if (plen > 0 && fs.is_file(cstr_str(?probe[0]))) { ret true; }
+        if (!parent_dir(out)) { ret false; }
+    }
+    ret false;
+}
+
+# build_sema_deps: build the SemaDeps for module `m`, one ModuleSema entry
+# per already-analysed module in the project, copying each module's
+# SemaResult decl table. cross-module symbol types are looked up by the
+# symbol's origin ModuleId, and a `fwd` re-export carries the originating
+# (transitive) module as the origin — so the snapshot must cover every
+# transitively-reachable module, not only `m`'s direct dependencies. all of
+# them are strictly earlier in topo order and thus already analysed, so
+# exposing the full set of ready modules (keyed by ModuleId) is both correct
+# and harmless: lookups match an exact origin and never a sibling.
+fun build_sema_deps(p: *driver.Project, m: *driver.ModuleEntry,
+                    results: *sema.SemaResult, ready: *bool) Result[sema.SemaDeps, str] {
+    var deps: sema.SemaDeps;
+    deps.entries = nil;
+    deps.count   = 0;
+
+    var ready_count: u32 = 0;
+    var j: u32 = 0;
+    for (j < p.module_len) {
+        if (ready[j]) { ready_count = ready_count + 1; }
+        j = j + 1;
+    }
+    if (ready_count == 0) { ret ok[sema.SemaDeps, str](deps); }
+
+    val r: Result[*sema.ModuleSema, str] = allocate[sema.ModuleSema](p.s.alloc, ready_count::usize);
+    if (is_err[*sema.ModuleSema, str](r)) { ret err[sema.SemaDeps, str](unwrap_err[*sema.ModuleSema, str](r)); }
+    deps.entries = unwrap_ok[*sema.ModuleSema, str](r);
+    deps.count   = ready_count;
+
+    var i: u32 = 0;
+    var k: u32 = 0;
+    for (i < p.module_len) {
+        if (ready[i]) {
+            val dep: *driver.ModuleEntry = ?p.modules[i];
+            var ms: sema.ModuleSema;
+            ms.path       = dep.fqn;
+            ms.module     = i::sess.ModuleId;
+            ms.decl_type  = results[i].decl_type;
+            ms.decl_count = results[i].decl_count;
+            deps.entries[k] = ms;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret ok[sema.SemaDeps, str](deps);
+}
+
+fun free_sema_deps(alloc: *Allocator, deps: *sema.SemaDeps) {
+    if (deps.entries == nil) { ret; }
+    deallocate[sema.ModuleSema](alloc, deps.entries, deps.count::usize);
+    deps.entries = nil;
+    deps.count   = 0;
+}
+
+# compile_modules: drive every reachable module through the back half of the
+# pipeline. semantic analysis runs over the whole module graph first; only if
+# no module reported an error does the build proceed to lower + optimise +
+# codegen each module to an ObjectImage. this ordering keeps the lowering and
+# codegen passes off a semantically broken AST. `images` (caller-owned, sized
+# to p.module_len) is filled in topo order. on failure the partial images and
+# IR modules are torn down by the caller via `free_modules`. when `verbose`
+# is set, each module's stage transitions are written to stderr. `ea` requests
+# the per-module `.ir` (written right after lowering) and `.s` (written from the
+# fully-resolved MIR inside codegen) debug artifacts.
+fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: bool, verbose: bool, ea: *EmitArtifacts,
+                    results: *sema.SemaResult, ready: *bool,
+                    irs: *ir.Module, ir_ready: *bool,
+                    images: *of.ObjectImage, image_ready: *bool) Result[bool, str] {
+    var ti: u32 = 0;
+    for (ti < p.topo_len) {
+        val mid: sess.ModuleId = p.topo[ti];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+
+        if (verbose) { emit_stage(p, "sema", m.fqn); }
+
+        val deps_r: Result[sema.SemaDeps, str] = build_sema_deps(p, m, results, ready);
+        if (is_err[sema.SemaDeps, str](deps_r)) { ret err[bool, str](unwrap_err[sema.SemaDeps, str](deps_r)); }
+        var deps: sema.SemaDeps = unwrap_ok[sema.SemaDeps, str](deps_r);
+
+        val sema_r: Result[sema.SemaResult, str] = sema.sema(p.s, ?m.a, ?m.resolve_result, ?deps, ?m.ctx, mid);
+        free_sema_deps(p.s.alloc, ?deps);
+        if (is_err[sema.SemaResult, str](sema_r)) { ret err[bool, str](unwrap_err[sema.SemaResult, str](sema_r)); }
+        results[mid::u32] = unwrap_ok[sema.SemaResult, str](sema_r);
+        ready[mid::u32]   = true;
+
+        # publish this module's typing and name-resolution to the session so the
+        # back-end monomorphizer can lower a generic template body (declared in
+        # any module) against the typing of its declaring module.
+        val rs: Result[bool, str] = sess.register_module_sema(p.s, mid, (?results[mid::u32])::ptr);
+        if (is_err[bool, str](rs)) { ret err[bool, str](unwrap_err[bool, str](rs)); }
+        val rr2: Result[bool, str] = sess.register_module_resolve(p.s, mid, (?m.resolve_result)::ptr);
+        if (is_err[bool, str](rr2)) { ret err[bool, str](unwrap_err[bool, str](rr2)); }
+        # publish this module's comptime context too, so a value-parameter instance
+        # of a function declared here can fold its `$if` gates against this module's
+        # own `pub val`s when lowered from a calling module.
+        val rc: Result[bool, str] = sess.register_module_comptime(p.s, mid, (?m.ctx)::ptr);
+        if (is_err[bool, str](rc)) { ret err[bool, str](unwrap_err[bool, str](rc)); }
+
+        ti = ti + 1;
+    }
+
+    # do not lower or codegen a semantically broken module graph.
+    if (diag.has_errors(?p.s.diags)) { ret ok[bool, str](true); }
+
+    # lower + optimise every module first. in test mode the project's `main` is
+    # then neutralised (the runner supplies the program entry) before any module
+    # is codegen'd, so the dropped `main` body never reaches an object.
+    ti = 0;
+    for (ti < p.topo_len) {
+        val mid: sess.ModuleId = p.topo[ti];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+
+        if (verbose) { emit_stage(p, "lower", m.fqn); }
+
+        val lower_r: Result[ir.Module, str] = lower.lower_module(p.s, ?p.target, ?m.a, m.fqn, mid, ?results[mid::u32], ?m.resolve_result, ?m.ctx);
+        if (is_err[ir.Module, str](lower_r)) { ret err[bool, str](unwrap_err[ir.Module, str](lower_r)); }
+        irs[mid::u32]     = unwrap_ok[ir.Module, str](lower_r);
+        ir_ready[mid::u32] = true;
+
+        # textual SSA IR, rendered straight after lowering.
+        if (ea.want_ir) {
+            val fqn_opt: Option[str] = intern.lookup(?p.s.interner, m.fqn);
+            if (is_none[str](fqn_opt)) { ret err[bool, str]("module FQN not interned"); }
+            val fqn: str = unwrap[str](fqn_opt);
+
+            var irf: fs.File;
+            var irw: writer.Writer;
+            val oir: Result[bool, str] = open_artifact(ea.base, "ir", fqn, "ir", ?irf, ?irw);
+            if (is_err[bool, str](oir)) { ret err[bool, str](unwrap_err[bool, str](oir)); }
+            val pir: Result[bool, str] = ir_printer.print_module(?irw, ?irs[mid::u32], ?p.s.interner);
+            val cir: Result[bool, str] = fs.close(?irf);
+            if (is_err[bool, str](pir)) { ret err[bool, str](unwrap_err[bool, str](pir)); }
+            if (is_err[bool, str](cir)) { ret err[bool, str](unwrap_err[bool, str](cir)); }
+        }
+
+        val opt_r: Result[bool, str] = pipeline.run(?irs[mid::u32], ?p.target, level, verify_ir);
+        if (is_err[bool, str](opt_r)) { ret err[bool, str](unwrap_err[bool, str](opt_r)); }
+
+        ti = ti + 1;
+    }
+
+    if (test_mode) {
+        val nr: Result[bool, str] = testrunner.neutralize_project_main(p.s, irs, p.module_len);
+        if (is_err[bool, str](nr)) { ret err[bool, str](unwrap_err[bool, str](nr)); }
+    }
+
+    ti = 0;
+    for (ti < p.topo_len) {
+        val mid: sess.ModuleId = p.topo[ti];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+
+        if (verbose) { emit_stage(p, "codegen", m.fqn); }
+
+        # codegen, optionally rendering the resolved MIR to a `.s` artifact.
+        var asmf: fs.File;
+        var asmw: writer.Writer;
+        var asm_out: *writer.Writer = nil;
+        if (ea.want_asm) {
+            val fqn_opt: Option[str] = intern.lookup(?p.s.interner, m.fqn);
+            if (is_none[str](fqn_opt)) { ret err[bool, str]("module FQN not interned"); }
+            val fqn: str = unwrap[str](fqn_opt);
+            val oas: Result[bool, str] = open_artifact(ea.base, "asm", fqn, "s", ?asmf, ?asmw);
+            if (is_err[bool, str](oas)) { ret err[bool, str](unwrap_err[bool, str](oas)); }
+            asm_out = ?asmw;
+        }
+        val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?irs[mid::u32], asm_out);
+        if (ea.want_asm) {
+            val cas: Result[bool, str] = fs.close(?asmf);
+            if (is_ok[of.ObjectImage, str](cg_r) && is_err[bool, str](cas)) {
+                ret err[bool, str](unwrap_err[bool, str](cas));
+            }
+        }
+        if (is_err[of.ObjectImage, str](cg_r)) { ret err[bool, str](unwrap_err[of.ObjectImage, str](cg_r)); }
+        images[mid::u32]      = unwrap_ok[of.ObjectImage, str](cg_r);
+        image_ready[mid::u32] = true;
+
+        ti = ti + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun free_modules(p: *driver.Project,
+                 results: *sema.SemaResult, ready: *bool,
+                 irs: *ir.Module, ir_ready: *bool,
+                 images: *of.ObjectImage, image_ready: *bool) {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        if (image_ready[i]) { obj.dnit(?images[i]); }
+        if (ir_ready[i])    { ir.dnit_module(?irs[i]); }
+        if (ready[i])       { sema.dnit_result(?results[i]); }
+        i = i + 1;
+    }
+}
+
+
+# build: run the full build pipeline, returning the exit code and (on
+# success) the produced artifact path. this is the shared body behind
+# `run` that `cmd.run` and `cmd.test` reuse so they can build and then
+# exec. the returned `output_path`, when non-nil, is owned by `alloc` —
+# the caller frees it (and tears `alloc` down) once done with it.
+# ---
+# alloc:    allocator owning the session and the returned artifact path;
+#           must outlive the returned BuildResult
+# argc:     argument count including argv[0]
+# argv:     the argument vector (argc null-terminated byte pointers)
+# emit_obj: when true, emit a relocatable object instead of an executable
+# test_mode: when true, build a test binary — synthesize a test-runner `main`
+#            over every collected `test` declaration instead of the project's own
+#            entry point, and always link an executable (even a library target)
+# ret:      a BuildResult carrying the exit code and artifact path
+pub fun build(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mode: bool) BuildResult {
+    var br: BuildResult;
+    br.code        = 2;
+    br.output_path = nil;
+
+    val cfg_opt: Option[cfg.Config] = cfg.parse(argc, argv);
+    if (is_none[cfg.Config](cfg_opt)) {
+        emit("error: invalid command-line flags\n");
+        br.code = 1;
+        ret br;
+    }
+    val config: cfg.Config = unwrap[cfg.Config](cfg_opt);
+
+    var root: [4096]u8;
+    if (!find_project_root(config.cwd, ?root[0], 4096)) {
+        emit("error: no mach.toml found in the working directory or any parent\n");
+        br.code = 1;
+        ret br;
+    }
+
+    # optimisation level: `--release` selects the release pipeline; the explicit
+    # `-O<n>` flags override it (-O0 debug, -O1/-O2 release). absent any flag the
+    # default is the debug pipeline (mem2reg, constfold, dce) — what the bootstrap
+    # uses, kept fixpoint-stable.
+    val release: bool = has_flag_local(argc, argv, "--release");
+    var level: u8 = pipeline.OPT_DEBUG;
+    if (release) { level = pipeline.OPT_RELEASE; }
+    if (has_flag_local(argc, argv, "-O0")) { level = pipeline.OPT_DEBUG; }
+    or (has_flag_local(argc, argv, "-O1")) { level = pipeline.OPT_RELEASE; }
+    or (has_flag_local(argc, argv, "-O2")) { level = pipeline.OPT_RELEASE; }
+
+    # when --target is absent, defer to [project].target from mach.toml
+    # (the driver resolves "native"/"host" to the host-matching entry).
+    var target_name: *u8 = config.target;
+    if (target_name == nil) { target_name = ""; }
+
+    val sess_r: Result[sess.Session, str] = sess.init(alloc);
+    if (is_err[sess.Session, str](sess_r)) {
+        emit("error: failed to initialise compiler session: ");
+        emit(unwrap_err[sess.Session, str](sess_r));
+        emit("\n");
+        br.code = 2;
+        ret br;
+    }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sess_r);
+
+    # populate the process-global target registries from the session at its STABLE
+    # address (this frame's `s`, not init's local that was returned by value): the
+    # object-format registrar captures the interner BY POINTER (elf_interner) for
+    # use during linking, so it must bind the final home or it dangles. register_all
+    # is idempotent.
+    val reg_r: Result[bool, str] = tgt.register_all(?s.interner);
+    if (is_err[bool, str](reg_r)) {
+        emit("error: ");
+        emit(unwrap_err[bool, str](reg_r));
+        emit("\n");
+        sess.dnit(?s);
+        br.code = 2;
+        ret br;
+    }
+
+    val proj_r: Result[driver.Project, str] = driver.build_project(?s, cstr_str(?root[0]), cstr_str(target_name));
+    if (is_err[driver.Project, str](proj_r)) {
+        emit("error: ");
+        emit(unwrap_err[driver.Project, str](proj_r));
+        emit("\n");
+        sess.dnit(?s);
+        br.code = 1;
+        ret br;
+    }
+    var p: driver.Project = unwrap_ok[driver.Project, str](proj_r);
+
+    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, config.verbose, config.emit_asm, config.emit_ir, ?root[0], config.output, config.artifacts, ?br.output_path);
+
+    flush_diagnostics(?s, ?s.diags);
+    driver.dnit_project(?p);
+    sess.dnit(?s);
+    ret br;
+}
+
+# compile_and_link: orchestrate the per-module compile + link, allocating
+# and freeing the parallel module-state arrays. returns the exit code and
+# sets `*out_path` to the produced artifact path on success. `out_override`
+# (-o) and `art_override` (--artifacts), when non-nil, replace the target's
+# configured binary and artifacts paths. when `verbose` is set, per-stage
+# progress is written to stderr. `emit_asm` / `emit_ir` request the per-module
+# `.s` / `.ir` debug artifacts.
+fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: bool, verify_ir: bool, verbose: bool,
+                     emit_asm: bool, emit_ir: bool,
+                     root: *u8, out_override: *u8, art_override: *u8, out_path: **u8) i64 {
+    val n: usize = p.module_len::usize;
+    if (n == 0) {
+        emit("error: project graph is empty\n");
+        ret 1;
+    }
+
+    if (verbose) { emit_target(p); }
+
+    # resolve the `<root>/<out>/<artifacts>` prefix the text-artifact trees hang
+    # off once, up front, so each module writes its `.s` / `.ir` next to its `.o`.
+    var art_base: [4096]u8;
+    var ea: EmitArtifacts;
+    ea.base = ?art_base[0];
+    ea.want_asm = emit_asm;
+    ea.want_ir  = emit_ir;
+    if (emit_asm || emit_ir) {
+        if (!resolve_art_base(p, root, art_override, ?art_base[0], 4096)) {
+            emit("error: project out / artifacts dir not interned\n");
+            ret 2;
+        }
+    }
+
+    val rr: Result[*sema.SemaResult, str] = allocate[sema.SemaResult](p.s.alloc, n);
+    if (is_err[*sema.SemaResult, str](rr)) { emit("error: out of memory\n"); ret 2; }
+    val results: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](rr);
+
+    val rdy: Result[*bool, str] = allocate[bool](p.s.alloc, n);
+    if (is_err[*bool, str](rdy)) { deallocate[sema.SemaResult](p.s.alloc, results, n); emit("error: out of memory\n"); ret 2; }
+    val ready: *bool = unwrap_ok[*bool, str](rdy);
+
+    val iri: Result[*ir.Module, str] = allocate[ir.Module](p.s.alloc, n);
+    if (is_err[*ir.Module, str](iri)) { deallocate[bool](p.s.alloc, ready, n); deallocate[sema.SemaResult](p.s.alloc, results, n); emit("error: out of memory\n"); ret 2; }
+    val irs: *ir.Module = unwrap_ok[*ir.Module, str](iri);
+
+    val irr: Result[*bool, str] = allocate[bool](p.s.alloc, n);
+    if (is_err[*bool, str](irr)) { deallocate[ir.Module](p.s.alloc, irs, n); deallocate[bool](p.s.alloc, ready, n); deallocate[sema.SemaResult](p.s.alloc, results, n); emit("error: out of memory\n"); ret 2; }
+    val ir_ready: *bool = unwrap_ok[*bool, str](irr);
+
+    val imi: Result[*of.ObjectImage, str] = allocate[of.ObjectImage](p.s.alloc, n);
+    if (is_err[*of.ObjectImage, str](imi)) { deallocate[bool](p.s.alloc, ir_ready, n); deallocate[ir.Module](p.s.alloc, irs, n); deallocate[bool](p.s.alloc, ready, n); deallocate[sema.SemaResult](p.s.alloc, results, n); emit("error: out of memory\n"); ret 2; }
+    val images: *of.ObjectImage = unwrap_ok[*of.ObjectImage, str](imi);
+
+    val imr: Result[*bool, str] = allocate[bool](p.s.alloc, n);
+    if (is_err[*bool, str](imr)) { deallocate[of.ObjectImage](p.s.alloc, images, n); deallocate[bool](p.s.alloc, ir_ready, n); deallocate[ir.Module](p.s.alloc, irs, n); deallocate[bool](p.s.alloc, ready, n); deallocate[sema.SemaResult](p.s.alloc, results, n); emit("error: out of memory\n"); ret 2; }
+    val image_ready: *bool = unwrap_ok[*bool, str](imr);
+
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        ready[i]       = false;
+        ir_ready[i]    = false;
+        image_ready[i] = false;
+        i = i + 1;
+    }
+
+    # the synthesized test-runner module + its codegen image, materialized only
+    # in test mode and only when the build collected at least one test.
+    var runner_ir:    ir.Module;
+    var runner_img:   of.ObjectImage;
+    var runner_ir_ok:  bool = false;
+    var runner_img_ok: bool = false;
+
+    var code: i64 = 0;
+    val comp_r: Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, verbose, ?ea, results, ready, irs, ir_ready, images, image_ready);
+    if (is_err[bool, str](comp_r)) {
+        emit("error: ");
+        emit(unwrap_err[bool, str](comp_r));
+        emit("\n");
+        code = 1;
+    }
+    or (diag.has_errors(?p.s.diags)) {
+        code = 1;
+    }
+    or {
+        if (test_mode) {
+            code = build_test_runner(p, level, verify_ir, irs, ?runner_ir, ?runner_ir_ok, ?runner_img, ?runner_img_ok);
+        }
+        if (code == 0) {
+            code = link_artifact(p, emit_obj, test_mode, runner_img_ok, ?runner_img, verbose, root, out_override, art_override, images, out_path);
+        }
+    }
+
+    if (runner_img_ok) { obj.dnit(?runner_img); }
+    if (runner_ir_ok)  { ir.dnit_module(?runner_ir); }
+    free_modules(p, results, ready, irs, ir_ready, images, image_ready);
+    deallocate[bool](p.s.alloc, image_ready, n);
+    deallocate[of.ObjectImage](p.s.alloc, images, n);
+    deallocate[bool](p.s.alloc, ir_ready, n);
+    deallocate[ir.Module](p.s.alloc, irs, n);
+    deallocate[bool](p.s.alloc, ready, n);
+    deallocate[sema.SemaResult](p.s.alloc, results, n);
+    ret code;
+}
+
+# build_test_runner: synthesize the test-runner IR module over every collected
+# `test` declaration in the freshly-lowered module set, then optimise and codegen
+# it into an extra object image. on success `*runner_ir`/`*runner_img` hold the
+# module and its image and the corresponding `*_ok` flags are set; a build with no
+# tests leaves both flags false (a no-op the caller treats as success). returns 0
+# on success, 2 on an internal error.
+fun build_test_runner(p: *driver.Project, level: u8, verify_ir: bool,
+                      irs: *ir.Module,
+                      runner_ir: *ir.Module, runner_ir_ok: *bool,
+                      runner_img: *of.ObjectImage, runner_img_ok: *bool) i64 {
+    val syn_r: Result[Option[ir.Module], str] = testrunner.synthesize(p.s, irs, p.module_len);
+    if (is_err[Option[ir.Module], str](syn_r)) {
+        emit("error: ");
+        emit(unwrap_err[Option[ir.Module], str](syn_r));
+        emit("\n");
+        ret 2;
+    }
+    val syn: Option[ir.Module] = unwrap_ok[Option[ir.Module], str](syn_r);
+    if (is_none[ir.Module](syn)) {
+        emit("error: no tests found in the project\n");
+        ret 1;
+    }
+    @runner_ir    = unwrap[ir.Module](syn);
+    @runner_ir_ok = true;
+
+    val opt_r: Result[bool, str] = pipeline.run(runner_ir, ?p.target, level, verify_ir);
+    if (is_err[bool, str](opt_r)) {
+        emit("error: ");
+        emit(unwrap_err[bool, str](opt_r));
+        emit("\n");
+        ret 2;
+    }
+
+    val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, runner_ir, nil);
+    if (is_err[of.ObjectImage, str](cg_r)) {
+        emit("error: ");
+        emit(unwrap_err[of.ObjectImage, str](cg_r));
+        emit("\n");
+        ret 2;
+    }
+    @runner_img    = unwrap_ok[of.ObjectImage, str](cg_r);
+    @runner_img_ok = true;
+    ret 0;
+}
+
+# link_artifact: write each per-module image to a relocatable `.o` on disk
+# whose path mirrors the module FQN under the target's artifact directory,
+# then — in executable mode — link the on-disk object set into the
+# configured binary. the layout is `<root>/<out>/<artifacts>/obj/<rel>.o`,
+# where `<rel>` is the FQN with '.' turned into '/'; the executable is
+# `<root>/<out>/<binary>`. `art_override` (--artifacts), when non-nil, replaces
+# `<artifacts>`; `out_override` (-o), when non-nil, replaces `<out>/<binary>`
+# with a path rooted directly at `<root>`. in library mode (or with
+# `--emit obj`) no executable is linked and the per-module objects are the
+# deliverable. returns the exit code and sets `*out_path` on success — the
+# binary in executable mode, the object tree root in library mode. the linker
+# reads its inputs from disk, so the per-module objects are materialised
+# before linking. when `verbose` is set, the object count and output path are
+# written to stderr.
+fun link_artifact(p: *driver.Project, emit_obj: bool, test_mode: bool, have_runner: bool,
+                  runner_img: *of.ObjectImage, verbose: bool, root: *u8,
+                  out_override: *u8, art_override: *u8,
+                  images: *of.ObjectImage, out_path: **u8) i64 {
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te == nil) { emit("error: no target selected\n"); ret 2; }
+
+    # <root>/<out>/<artifacts>/obj — the per-module object tree root.
+    # --artifacts overrides <artifacts>.
+    var obj_base: [4096]u8;
+    if (!resolve_art_base(p, root, art_override, ?obj_base[0], 4096)) {
+        emit("error: project out / artifacts dir not interned\n");
+        ret 2;
+    }
+    join_into(?obj_base[0], 4096, ?obj_base[0], "obj");
+
+    var paths: **u8 = nil;
+    val obj_code: i64 = write_objects(p, images, ?obj_base[0], ?paths);
+    if (obj_code != 0) { ret obj_code; }
+    var count: u32 = p.topo_len;
+
+    # in test mode the synthesized runner object joins the link as one extra
+    # input. it is written alongside the per-module objects and appended to the
+    # path set; `paths` is grown by one and re-bound here.
+    if (test_mode && have_runner) {
+        val rcode: i64 = append_runner_object(p, runner_img, ?obj_base[0], ?paths, count);
+        if (rcode != 0) {
+            free_paths(p.s.alloc, paths, count, count);
+            ret rcode;
+        }
+        count = count + 1;
+    }
+
+    if (verbose) {
+        emit("link ");
+        emit_num(count::usize);
+        emit(" object(s)\n");
+    }
+
+    # library mode (or `--emit obj`): the per-module objects are the deliverable;
+    # do not link an executable. a test build always links an executable, even
+    # for a library target, since the test runner needs a runnable entry point.
+    if ((te.mode == driver.MODE_LIBRARY || emit_obj) && !test_mode) {
+        if (verbose) {
+            emit("output ");
+            emit(?obj_base[0]);
+            emit("\n");
+        }
+        free_paths(p.s.alloc, paths, count, count);
+        @out_path = dup_cstr(p.s.alloc, ?obj_base[0]);
+        ret 0;
+    }
+
+    # the executable path: `-o` overrides it with a path rooted directly at
+    # <root>; otherwise it is the target's <out>/<binary>.
+    var artifact: [4096]u8;
+    if (out_override != nil) {
+        join_into(?artifact[0], 4096, root, out_override);
+    }
+    or {
+        val out_opt: Option[str] = intern.lookup(?p.s.interner, p.config.out);
+        if (is_none[str](out_opt)) {
+            free_paths(p.s.alloc, paths, count, count);
+            emit("error: project out dir not interned\n");
+            ret 2;
+        }
+        val bin_opt: Option[str] = intern.lookup(?p.s.interner, te.binary);
+        if (is_none[str](bin_opt) || slen(unwrap[str](bin_opt)::*u8) == 0) {
+            free_paths(p.s.alloc, paths, count, count);
+            emit("error: target has no binary path configured\n");
+            ret 1;
+        }
+        join_into_str(?artifact[0], 4096, root, unwrap[str](out_opt));
+        join_into_str(?artifact[0], 4096, ?artifact[0], unwrap[str](bin_opt));
+    }
+    if (!ensure_parents(?artifact[0])) {
+        free_paths(p.s.alloc, paths, count, count);
+        emit("error: failed to create binary directory\n");
+        ret 2;
+    }
+
+    val link_r: Result[bool, str] = linker.link(p.s, ?p.target, paths, count, ?artifact[0], linker.LINK_EXE);
+    free_paths(p.s.alloc, paths, count, count);
+    if (is_err[bool, str](link_r)) {
+        emit("error: ");
+        emit(unwrap_err[bool, str](link_r));
+        emit("\n");
+        ret 1;
+    }
+
+    if (verbose) {
+        emit("output ");
+        emit(?artifact[0]);
+        emit("\n");
+    }
+
+    @out_path = dup_cstr(p.s.alloc, ?artifact[0]);
+    ret 0;
+}
+
+# join_into_str: join `dir` and the fat-string `leaf` with a single '/'
+# separator into the caller's buffer and null-terminate. `dir` may alias `buf`
+# (the copy is then an identity self-copy). behaves like join_into but consumes
+# a `str` (length-counted) rather than a null-terminated `*u8`. returns the byte
+# length written, or 0 if it would not fit.
+fun join_into_str(buf: *u8, cap: usize, dir: *u8, leaf: str) usize {
+    val dl: usize = slen(dir);
+    val ll: usize = slen(leaf::*u8);
+    var need: usize = dl + 1 + ll + 1;
+    if (need > cap) { ret 0; }
+    var k: usize = 0;
+    var i: usize = 0;
+    for (i < dl) { buf[k] = dir[i]; k = k + 1; i = i + 1; }
+    if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
+    i = 0;
+    for (i < ll) { buf[k] = leaf[i]; k = k + 1; i = i + 1; }
+    buf[k] = 0;
+    ret k;
+}
+
+# resolve_art_base: write `<root>/<out>/<artifacts>` into `buf`, the directory the
+# per-module artifact trees (`obj/`, `asm/`, `ir/`) hang off. `<out>` is the
+# project out dir; `<artifacts>` is `art_override` (--artifacts) when non-nil, else
+# the target's configured artifacts dir. returns true on success; false when either
+# the out or artifacts dir is not interned. the caller appends the per-tree leaf.
+fun resolve_art_base(p: *driver.Project, root: *u8, art_override: *u8, buf: *u8, cap: usize) bool {
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te == nil) { ret false; }
+
+    val out_opt: Option[str] = intern.lookup(?p.s.interner, p.config.out);
+    if (is_none[str](out_opt)) { ret false; }
+    val art_opt: Option[str] = intern.lookup(?p.s.interner, te.artifacts);
+    if (is_none[str](art_opt)) { ret false; }
+
+    join_into_str(buf, cap, root, unwrap[str](out_opt));
+    if (art_override != nil) {
+        join_into(buf, cap, buf, art_override);
+    }
+    or {
+        join_into_str(buf, cap, buf, unwrap[str](art_opt));
+    }
+    ret true;
+}
+
+# ensure_dir: create the directory at `path` if it does not already exist.
+# returns true on success or when it already exists.
+fun ensure_dir(path: *u8) bool {
+    val p: str = cstr_str(path);
+    if (fs.is_dir(p)) { ret true; }
+    val mk: Result[bool, str] = fs.create_dir(p, 493);
+    if (is_ok[bool, str](mk)) { ret true; }
+    ret fs.is_dir(p);
+}
+
+# ensure_parents: create every parent directory of the file path `path`
+# (mkdir-p over the leading components, excluding the final leaf). each
+# intermediate prefix is created in turn so deeply nested module paths like
+# `obj/a/b/c.o` materialise their `obj/a` and `obj/a/b` directories. the path
+# buffer is restored after each temporary truncation. returns true once every
+# parent exists.
+fun ensure_parents(path: *u8) bool {
+    val n: usize = slen(path);
+    var i: usize = 1;
+    for (i < n) {
+        if (path[i] == '/') {
+            val saved: u8 = path[i];
+            path[i] = 0;
+            val ok_dir: bool = ensure_dir(path);
+            path[i] = saved;
+            if (!ok_dir) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# write_objects: write each per-module image to a relocatable object whose path
+# mirrors the module FQN under `obj_base` (FQN `a.b.c` -> `<obj_base>/a/b/c.o`,
+# creating parent directories), collecting the owned path strings — one per
+# topo entry, in topo order — into a fresh `**u8` array stored through
+# `paths_out`. returns 0 on success; on failure any paths produced so far are
+# released and a non-zero code returned.
+fun write_objects(p: *driver.Project, images: *of.ObjectImage,
+                  obj_base: *u8, paths_out: ***u8) i64 {
+    val count: u32 = p.topo_len;
+    val ar: Result[**u8, str] = allocate[*u8](p.s.alloc, count::usize);
+    if (is_err[**u8, str](ar)) { emit("error: out of memory\n"); ret 2; }
+    val paths: **u8 = unwrap_ok[**u8, str](ar);
+
+    var ti: u32 = 0;
+    for (ti < p.topo_len) {
+        val mid: sess.ModuleId = p.topo[ti];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+
+        val fqn_opt: Option[str] = intern.lookup(?p.s.interner, m.fqn);
+        if (is_none[str](fqn_opt)) {
+            free_paths(p.s.alloc, paths, ti, count);
+            emit("error: module FQN not interned\n");
+            ret 2;
+        }
+
+        var path: [4096]u8;
+        mirror_fqn(?path[0], 4096, obj_base, unwrap[str](fqn_opt), "o");
+
+        if (!ensure_parents(?path[0])) {
+            free_paths(p.s.alloc, paths, ti, count);
+            emit("error: failed to create object directory\n");
+            ret 2;
+        }
+
+        val em: Result[bool, str] = obj.emit(?images[mid::u32], ?p.target, ?path[0]);
+        if (is_err[bool, str](em)) {
+            free_paths(p.s.alloc, paths, ti, count);
+            emit("error: ");
+            emit(unwrap_err[bool, str](em));
+            emit("\n");
+            ret 1;
+        }
+
+        paths[ti] = dup_cstr(p.s.alloc, ?path[0]);
+        if (paths[ti] == nil) {
+            free_paths(p.s.alloc, paths, ti, count);
+            emit("error: out of memory\n");
+            ret 2;
+        }
+        ti = ti + 1;
+    }
+
+    @paths_out = paths;
+    ret 0;
+}
+
+# append_runner_object: write the synthesized test-runner image to
+# `<obj_base>/__mach_test.o` and append its owned path to the existing `*paths`
+# array (grown from `count` to `count + 1`). `*paths` is re-bound to the grown
+# array. returns 0 on success, or a non-zero exit code (the caller frees the
+# original array on failure).
+fun append_runner_object(p: *driver.Project, runner_img: *of.ObjectImage,
+                         obj_base: *u8, paths: ***u8, count: u32) i64 {
+    var path: [4096]u8;
+    join_into(?path[0], 4096, obj_base, "__mach_test.o");
+    if (!ensure_parents(?path[0])) {
+        emit("error: failed to create object directory\n");
+        ret 2;
+    }
+
+    val em: Result[bool, str] = obj.emit(runner_img, ?p.target, ?path[0]);
+    if (is_err[bool, str](em)) {
+        emit("error: ");
+        emit(unwrap_err[bool, str](em));
+        emit("\n");
+        ret 1;
+    }
+
+    val gr: Result[**u8, str] = reallocate[*u8](p.s.alloc, @paths, count::usize, (count + 1)::usize);
+    if (is_err[**u8, str](gr)) { emit("error: out of memory\n"); ret 2; }
+    @paths = unwrap_ok[**u8, str](gr);
+
+    (@paths)[count] = dup_cstr(p.s.alloc, ?path[0]);
+    if ((@paths)[count] == nil) { emit("error: out of memory\n"); ret 2; }
+    ret 0;
+}
+
+# mirror_fqn: write `<base>/<rel>.<ext>` into `buf`, where `<rel>` is the module
+# FQN with every '.' replaced by '/' (so `a.b.c` with ext `o` becomes
+# `<base>/a/b/c.o`). returns the byte length written (excluding the terminator),
+# or 0 if it would not fit.
+fun mirror_fqn(buf: *u8, cap: usize, base: *u8, fqn: str, suffix: str) usize {
+    val bl: usize = slen(base);
+    val fl: usize = slen(fqn::*u8);
+    val el: usize = slen(suffix::*u8);
+    var need: usize = bl + 1 + fl + 1 + el + 1;
+    if (need > cap) { ret 0; }
+
+    var k: usize = 0;
+    var i: usize = 0;
+    for (i < bl) { buf[k] = base[i]; k = k + 1; i = i + 1; }
+    if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
+
+    i = 0;
+    for (i < fl) {
+        var c: u8 = fqn[i];
+        if (c == '.') { c = '/'; }
+        buf[k] = c;
+        k = k + 1;
+        i = i + 1;
+    }
+    buf[k] = '.';
+    k = k + 1;
+
+    i = 0;
+    for (i < el) { buf[k] = suffix[i]; k = k + 1; i = i + 1; }
+    buf[k] = 0;
+    ret k;
+}
+
+# open_artifact: create `<base>/<sub>/<rel>.<ext>` (making any parent directories)
+# and wire `w` to stream into it through the returned `file`. the FQN is mapped to
+# `<rel>` exactly as the object tree is. the caller owns `file` and must close it
+# once writing is done — the Writer borrows the File and must not outlive it.
+fun open_artifact(base: *u8, sub: str, fqn: str, suffix: str,
+                  file: *fs.File, w: *writer.Writer) Result[bool, str] {
+    var sub_base: [4096]u8;
+    join_into(?sub_base[0], 4096, base, sub::*u8);
+
+    var path: [4096]u8;
+    if (mirror_fqn(?path[0], 4096, ?sub_base[0], fqn, suffix) == 0) {
+        ret err[bool, str]("artifact path too long");
+    }
+    if (!ensure_parents(?path[0])) {
+        ret err[bool, str]("failed to create artifact directory");
+    }
+
+    val cr: Result[fs.File, str] = fs.create(cstr_str(?path[0]), 0o644);
+    if (is_err[fs.File, str](cr)) { ret err[bool, str](unwrap_err[fs.File, str](cr)); }
+    @file = unwrap_ok[fs.File, str](cr);
+    fs.get_writer(file, w);
+    ret ok[bool, str](true);
+}
+
+# free_paths: release the first `n` owned path strings of a path array and the
+# `cap`-long array itself. `n` may be less than `cap` when unwinding a
+# partially-filled array; the array is always freed at its full capacity.
+# ---
+# alloc: allocator backing the array and its strings
+# paths: the path array (its first n entries are populated)
+# n:     number of populated path strings to free
+# cap:   full allocated length of the array
+fun free_paths(alloc: *Allocator, paths: **u8, n: u32, cap: u32) {
+    if (paths == nil) { ret; }
+    var i: u32 = 0;
+    for (i < n) {
+        if (paths[i] != nil) { deallocate[u8](alloc, paths[i], (slen(paths[i]) + 1)::usize); }
+        i = i + 1;
+    }
+    if (cap > 0) { deallocate[*u8](alloc, paths, cap::usize); }
+}
+
+# flush_diagnostics: render every diagnostic to stderr as
+# `severity: path:line:col: message`, followed by the offending source line and
+# a `^~~~` underline under the reported span. resolving each span against the
+# session source map. an unknown file id degrades to `severity: message`.
+fun flush_diagnostics(s: *sess.Session, list: *diag.DiagList) {
+    var i: usize = 0;
+    for (i < list.len) {
+        val d: *diag.Diagnostic = ?list.items[i];
+        if (d.severity == diag.SEVERITY_ERROR)        { emit("error: "); }
+        or (d.severity == diag.SEVERITY_WARNING)      { emit("warning: "); }
+        or (d.severity == diag.SEVERITY_INFO)         { emit("info: "); }
+        or                                            { emit("help: "); }
+
+        val so: Option[*src.SourceFile] = src.get(?s.sources, d.file_id);
+        if (is_some[*src.SourceFile](so)) {
+            val sf: *src.SourceFile = unwrap[*src.SourceFile](so);
+            val pos: src.Position = src.position(sf, d.span.offset);
+            os.write(os.STDERR_FD, sf.path::*u8, slen(sf.path::*u8));
+            emit(":");
+            emit_num(pos.line);
+            emit(":");
+            emit_num(pos.col);
+            emit(": ");
+            os.write(os.STDERR_FD, d.message::*u8, slen(d.message::*u8));
+            emit("\n");
+            emit_snippet(sf, ?d.span, pos.line);
+        }
+        or {
+            os.write(os.STDERR_FD, d.message::*u8, slen(d.message::*u8));
+            emit("\n");
+        }
+
+        if (d.note != nil) {
+            emit("  note: ");
+            os.write(os.STDERR_FD, d.note::*u8, slen(d.note::*u8));
+            emit("\n");
+        }
+        i = i + 1;
+    }
+}
+
+# emit_snippet: render the source line containing `span` followed by a caret
+# underline marking the span. the underline mirrors the line's leading bytes
+# (whitespace kept verbatim, other bytes shown as spaces) so the caret aligns
+# under tabs and multibyte text; the span is marked with a leading `^` and
+# trailing `~` for each remaining byte. a zero-length span underlines one column.
+fun emit_snippet(sf: *src.SourceFile, span: *token.Span, line: usize) {
+    val lbo: Option[src.LineSpan] = src.line_bounds(sf, line);
+    if (is_none[src.LineSpan](lbo)) { ret; }
+    val lb: src.LineSpan = unwrap[src.LineSpan](lbo);
+
+    os.write(os.STDERR_FD, ?sf.text[lb.start], lb.end - lb.start);
+    emit("\n");
+
+    var caret_at: usize = span.offset;
+    if (caret_at < lb.start) { caret_at = lb.start; }
+    if (caret_at > lb.end)   { caret_at = lb.end; }
+
+    var c: usize = lb.start;
+    for (c < caret_at) {
+        if (sf.text[c] == '\t') { emit("\t"); } or { emit(" "); }
+        c = c + 1;
+    }
+
+    emit("^");
+
+    var span_end: usize = span.offset + span.len;
+    if (span_end > lb.end) { span_end = lb.end; }
+    var u: usize = caret_at + 1;
+    for (u < span_end) {
+        emit("~");
+        u = u + 1;
+    }
+    emit("\n");
+}
+
+# emit_num: write the base-10 rendering of `n` to stderr.
+fun emit_num(n: usize) {
+    var buf: [24]u8;
+    var len: usize = 0;
+    var v: usize = n;
+    if (v == 0) { buf[0] = '0'; len = 1; }
+    or {
+        var tmp: [24]u8;
+        var t: usize = 0;
+        for (v > 0) { tmp[t] = (v % 10)::u8 + '0'; v = v / 10; t = t + 1; }
+        var ri: usize = 0;
+        for (ri < t) { buf[ri] = tmp[t - 1 - ri]; ri = ri + 1; }
+        len = t;
+    }
+    os.write(os.STDERR_FD, ?buf[0], len);
+}
+
+# dup_cstr: duplicate a null-terminated string into freshly allocated
+# storage. returns nil on allocation failure (the caller treats that as
+# "no path").
+fun dup_cstr(alloc: *Allocator, s: *u8) *u8 {
+    val n: usize = slen(s);
+    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var i: usize = 0;
+    for (i < n) { buf[i] = s[i]; i = i + 1; }
+    buf[n] = 0;
+    ret buf;
+}
+
+# has_flag_local: local copy of args.has_flag to avoid a circular CLI
+# import for the few build-only flags consumed before config is reused by
+# run/test.
+fun has_flag_local(argc: usize, argv: **u8, flag: *u8) bool {
+    var i: usize = 0;
+    for (i < argc) {
+        if (eq(argv[i], flag)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# run: `mach build` subcommand entry point. builds the current project to
+# an executable (or a relocatable object with `--emit obj`) under
+# `<project_root>/out/`. called by cmd.dispatch.
+# ---
+# argc: argument count including argv[0]
+# argv: the argument vector (argc null-terminated byte pointers)
+# ret:  0 on success, 1 on a user error, 2 on an internal error
+pub fun run(argc: usize, argv: **u8) i64 {
+    var emit_obj: bool = false;
+    val emit_opt: Option[*u8] = emit_kind(argc, argv);
+    if (is_some[*u8](emit_opt)) {
+        val kind: *u8 = unwrap[*u8](emit_opt);
+        if (eq(kind, "obj"))      { emit_obj = true; }
+        or (eq(kind, "exe"))      { emit_obj = false; }
+        or {
+            emit("error: --emit expects 'obj' or 'exe'\n");
+            ret 1;
+        }
+    }
+
+    # back the build with an arena over a page allocator: the page
+    # allocator mmaps once per allocation, so the allocation-heavy compile
+    # is suballocated through an arena and reclaimed in one dnit.
+    var backing: Allocator;
+    if (is_some[str](page.make(?backing))) {
+        emit("error: failed to initialise allocator\n");
+        ret 2;
+    }
+
+    var ar: arena.Arena;
+    if (is_some[str](arena.init(?ar, ?backing, 0))) {
+        emit("error: failed to initialise allocator\n");
+        ret 2;
+    }
+
+    var alloc: Allocator;
+    if (is_some[str](arena.make(?alloc, ?ar))) {
+        arena.dnit(?ar);
+        emit("error: failed to initialise allocator\n");
+        ret 2;
+    }
+
+    val br: BuildResult = build(?alloc, argc, argv, emit_obj, false);
+    arena.dnit(?ar);
+    ret br.code;
+}
+
+# emit_kind: scan argv for the value following `--emit`, exposed so
+# `cmd.run` can reject the flag before it builds. returns none when
+# `--emit` is absent or is the final argument with no value.
+# ---
+# argc: argument count including argv[0]
+# argv: the argument vector (argc null-terminated byte pointers)
+# ret:  some(kind) when `--emit <kind>` is present, else none
+pub fun emit_kind(argc: usize, argv: **u8) Option[*u8] {
+    var i: usize = 0;
+    for (i < argc) {
+        if (eq(argv[i], "--emit")) {
+            if (i + 1 < argc) { ret some[*u8](argv[i + 1]); }
+            ret none[*u8]();
+        }
+        i = i + 1;
+    }
+    ret none[*u8]();
+}

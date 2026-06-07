@@ -1,0 +1,701 @@
+# mach.lang.target.isa.x64: x86-64 instruction set implementation.
+#
+# Owns the concrete register numbering, machine opcode space, and encoding flags
+# for the architecture, plus the register-file construction, register-name
+# lookup, and the frame-shape helpers (prologue / epilogue emission, return /
+# call recognition, relocation-patch offset) that the encoder calls by name.
+# Builds and self-registers an `isa.IsaVTable` (gpr / xmm / flags register
+# classes) into the process-global ISA registry so `target.select` can compose
+# an x86-64 target. Only the isel and encode tables are target-specific;
+# everything the back end consumes that is x86-64-shaped lives here.
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+
+use intern: mach.lang.intern;
+use isa:    mach.lang.target.isa;
+
+# general-purpose register ids. these are the canonical x86-64 GP register
+# numbers (matching the ModRM/REX encoding), used directly as `Operand.reg`
+# values throughout isel, regalloc, and encode.
+pub val RAX: i32 = 0;
+pub val RCX: i32 = 1;
+pub val RDX: i32 = 2;
+pub val RBX: i32 = 3;
+pub val RSP: i32 = 4;
+pub val RBP: i32 = 5;
+pub val RSI: i32 = 6;
+pub val RDI: i32 = 7;
+pub val R8:  i32 = 8;
+pub val R9:  i32 = 9;
+pub val R10: i32 = 10;
+pub val R11: i32 = 11;
+pub val R12: i32 = 12;
+pub val R13: i32 = 13;
+pub val R14: i32 = 14;
+pub val R15: i32 = 15;
+
+# SSE register ids (XMM0–XMM15). distinct id space from the GP registers; the
+# `flags` register-class width selects which file a vreg draws from.
+pub val XMM0:  i32 = 0;
+pub val XMM1:  i32 = 1;
+pub val XMM2:  i32 = 2;
+pub val XMM3:  i32 = 3;
+pub val XMM4:  i32 = 4;
+pub val XMM5:  i32 = 5;
+pub val XMM6:  i32 = 6;
+pub val XMM7:  i32 = 7;
+pub val XMM8:  i32 = 8;
+pub val XMM9:  i32 = 9;
+pub val XMM10: i32 = 10;
+pub val XMM11: i32 = 11;
+pub val XMM12: i32 = 12;
+pub val XMM13: i32 = 13;
+pub val XMM14: i32 = 14;
+pub val XMM15: i32 = 15;
+
+# number of registers in each file.
+pub val GP_COUNT: i32 = 16;
+pub val FP_COUNT: i32 = 16;
+
+# the stack pointer and frame pointer. both are reserved by the frame pass and
+# must never be handed out by the register allocator.
+pub val STACK_REG: i32 = 4;
+pub val FRAME_REG: i32 = 5;
+
+# scratch registers the back end reserves for materializing addresses, spilled
+# reloads, and the 16-byte-return / varargs lowering sequences. `SCRATCH_REG`
+# (R11) and `SCRATCH_REG2` (R10) are caller-saved and excluded from allocation;
+# `FP_SCRATCH_REG` (XMM15) plays the same role in the SSE file. a physical
+# register id is composite (the class tag in the high byte, the within-bank index
+# in the low byte): a GP scratch keeps its raw index (class 0), the SSE scratch
+# carries the SSE class tag (`(REG_CLASS_ID_XMM << 8) | 15 = 0x010F`).
+pub val SCRATCH_REG:    i32 = 11;
+pub val SCRATCH_REG2:   i32 = 10;
+pub val FP_SCRATCH_REG: i32 = (1 << 8) | 15;
+
+# code alignment for function entry points, in bytes.
+pub val CODE_ALIGN: u32 = 16;
+
+# the x86-64 machine opcode space. each value names a logical instruction form;
+# the encoder maps it to concrete bytes and the isel table emits it. pseudo
+# opcodes (`isa.ISA_*`) live above this space and never collide.
+pub def Opcode: u16;
+
+# no-op (0x90).
+pub val NOP:       Opcode = 0;
+# register/memory/immediate move.
+pub val MOV:       Opcode = 1;
+# load effective address.
+pub val LEA:       Opcode = 2;
+# push onto the stack.
+pub val PUSH:      Opcode = 3;
+# pop from the stack.
+pub val POP:       Opcode = 4;
+# integer add.
+pub val ADD:       Opcode = 5;
+# integer subtract.
+pub val SUB:       Opcode = 6;
+# signed integer multiply.
+pub val IMUL:      Opcode = 7;
+# signed integer divide.
+pub val IDIV:      Opcode = 8;
+# unsigned integer divide.
+pub val DIV:       Opcode = 9;
+# bitwise and.
+pub val AND:       Opcode = 10;
+# bitwise or.
+pub val OR:        Opcode = 11;
+# bitwise xor.
+pub val XOR:       Opcode = 12;
+# logical shift left.
+pub val SHL:       Opcode = 13;
+# logical shift right.
+pub val SHR:       Opcode = 14;
+# arithmetic shift right.
+pub val SAR:       Opcode = 15;
+# compare (sets flags).
+pub val CMP:       Opcode = 16;
+# bitwise test (sets flags).
+pub val TEST:      Opcode = 17;
+# unconditional jump.
+pub val JMP:       Opcode = 18;
+# call.
+pub val CALL:      Opcode = 19;
+# return.
+pub val RET:       Opcode = 20;
+# jump if equal.
+pub val JE:        Opcode = 21;
+# jump if not equal.
+pub val JNE:       Opcode = 22;
+# jump if signed less.
+pub val JL:        Opcode = 23;
+# jump if signed less-or-equal.
+pub val JLE:       Opcode = 24;
+# jump if signed greater.
+pub val JG:        Opcode = 25;
+# jump if signed greater-or-equal.
+pub val JGE:       Opcode = 26;
+# jump if unsigned below.
+pub val JB:        Opcode = 27;
+# jump if unsigned below-or-equal.
+pub val JBE:       Opcode = 28;
+# jump if unsigned above.
+pub val JA:        Opcode = 29;
+# jump if unsigned above-or-equal.
+pub val JAE:       Opcode = 30;
+# set byte if equal.
+pub val SETE:      Opcode = 31;
+# set byte if not equal.
+pub val SETNE:     Opcode = 32;
+# set byte if signed less.
+pub val SETL:      Opcode = 33;
+# set byte if signed less-or-equal.
+pub val SETLE:     Opcode = 34;
+# set byte if signed greater.
+pub val SETG:      Opcode = 35;
+# set byte if signed greater-or-equal.
+pub val SETGE:     Opcode = 36;
+# set byte if unsigned below.
+pub val SETB:      Opcode = 37;
+# set byte if unsigned below-or-equal.
+pub val SETBE:     Opcode = 38;
+# set byte if unsigned above.
+pub val SETA:      Opcode = 39;
+# set byte if unsigned above-or-equal.
+pub val SETAE:     Opcode = 40;
+# scalar single-precision move.
+pub val MOVSS:     Opcode = 41;
+# scalar double-precision move.
+pub val MOVSD:     Opcode = 42;
+# scalar single-precision add.
+pub val ADDSS:     Opcode = 43;
+# scalar double-precision add.
+pub val ADDSD:     Opcode = 44;
+# scalar single-precision subtract.
+pub val SUBSS:     Opcode = 45;
+# scalar double-precision subtract.
+pub val SUBSD:     Opcode = 46;
+# scalar single-precision multiply.
+pub val MULSS:     Opcode = 47;
+# scalar double-precision multiply.
+pub val MULSD:     Opcode = 48;
+# scalar single-precision divide.
+pub val DIVSS:     Opcode = 49;
+# scalar double-precision divide.
+pub val DIVSD:     Opcode = 50;
+# syscall.
+pub val SYSCALL:   Opcode = 51;
+# move 64-bit immediate into register.
+pub val MOVABS:    Opcode = 52;
+# undefined instruction (trap).
+pub val UD2:       Opcode = 53;
+# spin-loop hint.
+pub val PAUSE:     Opcode = 54;
+# sign-extend EAX into EDX:EAX.
+pub val CDQ:       Opcode = 55;
+# sign-extend RAX into RDX:RAX.
+pub val CQO:       Opcode = 56;
+# move with sign extension.
+pub val MOVSX:     Opcode = 57;
+# move with zero extension.
+pub val MOVZX:     Opcode = 58;
+# move dword with sign extension to qword.
+pub val MOVSXD:    Opcode = 59;
+# convert signed integer to scalar single.
+pub val CVTSI2SS:  Opcode = 60;
+# convert signed integer to scalar double.
+pub val CVTSI2SD:  Opcode = 61;
+# convert scalar single to scalar double.
+pub val CVTSS2SD:  Opcode = 62;
+# convert scalar double to scalar single.
+pub val CVTSD2SS:  Opcode = 63;
+# convert with truncation scalar single to signed integer.
+pub val CVTTSS2SI: Opcode = 64;
+# convert with truncation scalar double to signed integer.
+pub val CVTTSD2SI: Opcode = 65;
+# unordered compare scalar single (sets flags).
+pub val UCOMISS:   Opcode = 66;
+# unordered compare scalar double (sets flags).
+pub val UCOMISD:   Opcode = 67;
+# move string byte.
+pub val MOVSB:     Opcode = 68;
+# full memory fence.
+pub val MFENCE:    Opcode = 69;
+# inline-assembly raw-byte block.
+pub val ISA_ASM_BLOCK: Opcode = 70;
+# sign-extend AL into AX.
+pub val CBW:       Opcode = 71;
+# sign-extend AX into DX:AX.
+pub val CWD:       Opcode = 72;
+# move qword between GP and XMM (or XMM and XMM).
+pub val MOVQ:      Opcode = 73;
+# bitwise xor of packed single (used to zero an XMM register).
+pub val XORPS:     Opcode = 74;
+# two's-complement negate (group-3 /3).
+pub val NEG:       Opcode = 75;
+# one's-complement (group-3 /2).
+pub val NOT:       Opcode = 76;
+# increment by one (group-5 /0).
+pub val INC:       Opcode = 77;
+# decrement by one (group-5 /1).
+pub val DEC:       Opcode = 78;
+# halt the processor (privileged; used as an unreachable trap).
+pub val HLT:       Opcode = 79;
+# exchange register and register-or-memory.
+pub val XCHG:      Opcode = 80;
+# exchange-and-add (LOCK-prefixable for atomics).
+pub val XADD:      Opcode = 81;
+# compare-and-exchange against RAX (LOCK-prefixable for atomics).
+pub val CMPXCHG:   Opcode = 82;
+# emit a single raw byte verbatim (inline-asm `.byte` directive).
+pub val RAW_BYTE:  Opcode = 83;
+
+# the canonical opcode the back end uses to load a GP value from memory.
+pub val LOAD_OPCODE: Opcode = 1;
+# the canonical opcode the back end uses to store a GP value to memory.
+pub val STORE_OPCODE: Opcode = 1;
+# the canonical opcode the back end uses to zero-extend a narrow GP value.
+pub val ZEXT_OPCODE: Opcode = 58;
+# the canonical opcode the back end uses to load a scalar FP value.
+pub val FP_LOAD_OPCODE: Opcode = 42;
+# the canonical opcode the back end uses to store a scalar FP value.
+pub val FP_STORE_OPCODE: Opcode = 42;
+
+# encoding flags carried on `isa.Inst.flags`. they steer prefix and width
+# selection in the encoder independently of the opcode.
+pub def EncFlag: u16;
+# emit a REX.W prefix (64-bit operand size).
+pub val FLAG_REX_W:    EncFlag = 1;
+# emit a 0x66 operand-size prefix (16-bit operand size).
+pub val FLAG_16BIT:    EncFlag = 2;
+# emit a LOCK prefix.
+pub val FLAG_LOCK:     EncFlag = 4;
+# emit a REP prefix.
+pub val FLAG_REP:      EncFlag = 8;
+# the memory operand is an indirect access through the named register.
+pub val FLAG_INDIRECT: EncFlag = 16;
+# force a bare REX prefix (needed for SPL/BPL/SIL/DIL byte operands).
+pub val FLAG_REX_BYTE: EncFlag = 32;
+
+# per-process register-file backing for the x86-64 ISA. the register descriptor
+# arrays are allocated once and referenced by the register files; they live for
+# the lifetime of the process.
+# ---
+# alloc:   backing allocator
+# gp:      general-purpose register descriptors
+# fp:      SSE register descriptors
+# gp_file: register file over `gp`
+# fp_file: register file over `fp`
+pub rec X86Context {
+    alloc:   *Allocator;
+    gp:      *isa.Register;
+    fp:      *isa.Register;
+    gp_file: isa.RegisterFile;
+    fp_file: isa.RegisterFile;
+}
+
+# init_context: build the x86-64 register files.
+#
+# allocates the 16 GP and 16 SSE register descriptors, sizes them (8 bytes for
+# GP, 16 for SSE), and wires up the two register files. returns nil on any
+# allocation failure so the caller can surface a clean target-selection error.
+# ---
+# alloc: backing allocator
+# ret:   a fully constructed X86Context, or nil on allocation failure
+pub fun init_context(alloc: *Allocator) *X86Context {
+    val res_ctx: Result[*X86Context, str] = allocate[X86Context](alloc, 1);
+    if (is_err[*X86Context, str](res_ctx)) { ret nil; }
+    val xctx: *X86Context = unwrap_ok[*X86Context, str](res_ctx);
+    xctx.alloc = alloc;
+
+    val res_gp: Result[*isa.Register, str] = allocate[isa.Register](alloc, GP_COUNT::usize);
+    if (is_err[*isa.Register, str](res_gp)) { ret nil; }
+    xctx.gp = unwrap_ok[*isa.Register, str](res_gp);
+    var i: i32 = 0;
+    for (i < GP_COUNT) {
+        xctx.gp[i].id   = i;
+        xctx.gp[i].size = 8;
+        i = i + 1;
+    }
+
+    val res_fp: Result[*isa.Register, str] = allocate[isa.Register](alloc, FP_COUNT::usize);
+    if (is_err[*isa.Register, str](res_fp)) { ret nil; }
+    xctx.fp = unwrap_ok[*isa.Register, str](res_fp);
+    i = 0;
+    for (i < FP_COUNT) {
+        xctx.fp[i].id   = i;
+        xctx.fp[i].size = 16;
+        i = i + 1;
+    }
+
+    xctx.gp_file.regs  = xctx.gp;
+    xctx.gp_file.count = GP_COUNT;
+    xctx.fp_file.regs  = xctx.fp;
+    xctx.fp_file.count = FP_COUNT;
+
+    ret xctx;
+}
+
+# gp_registers: the general-purpose register file.
+# ---
+# ctx: an X86Context cast to ptr (nil yields an empty-pointer file with the
+#      correct count)
+# ret: the GP register file
+pub fun gp_registers(ctx: ptr) isa.RegisterFile {
+    if (ctx != nil) {
+        val xctx: *X86Context = ctx::*X86Context;
+        ret xctx.gp_file;
+    }
+    var rf: isa.RegisterFile;
+    rf.regs  = nil;
+    rf.count = GP_COUNT;
+    ret rf;
+}
+
+# fp_registers: the SSE register file.
+# ---
+# ctx: an X86Context cast to ptr (nil yields an empty-pointer file with the
+#      correct count)
+# ret: the SSE register file
+pub fun fp_registers(ctx: ptr) isa.RegisterFile {
+    if (ctx != nil) {
+        val xctx: *X86Context = ctx::*X86Context;
+        ret xctx.fp_file;
+    }
+    var rf: isa.RegisterFile;
+    rf.regs  = nil;
+    rf.count = FP_COUNT;
+    ret rf;
+}
+
+# is_fp_opcode: report whether an opcode operates on the SSE register file.
+#
+# the floating-point opcodes occupy two contiguous ranges (the MOVSS…DIVSD
+# scalar ops and the CVTSI2SS…UCOMISD conversion/compare ops) plus the two
+# isolated MOVQ and XORPS forms.
+# ---
+# op: machine opcode to classify
+# ret: true if the opcode reads or writes an XMM register
+pub fun is_fp_opcode(op: u16) bool {
+    if (op >= MOVSS && op <= DIVSD) { ret true; }
+    if (op >= CVTSI2SS && op <= UCOMISD) { ret true; }
+    if (op == MOVQ || op == XORPS) { ret true; }
+    ret false;
+}
+
+# reg_name: the assembly mnemonic for a GP register at a given operand size.
+#
+# the byte-size forms (size 1) for RSP/RBP/RSI/RDI are SPL/BPL/SIL/DIL, which
+# require a REX prefix to encode distinctly from AH/CH/DH/BH; the encoder, not
+# this lookup, is responsible for emitting that prefix.
+# ---
+# ctx:  ISA backend context (unused; accepted for call-site uniformity)
+# id:   register number (0–15)
+# size: operand width in bytes (1, 2, 4, or 8)
+# ret:  the register mnemonic, or "???" for an out-of-range id
+pub fun reg_name(ctx: ptr, id: i32, size: u8) str {
+    if (size == 1) {
+        if (id == RAX) { ret "al"; }
+        if (id == RCX) { ret "cl"; }
+        if (id == RDX) { ret "dl"; }
+        if (id == RBX) { ret "bl"; }
+        if (id == RSP) { ret "spl"; }
+        if (id == RBP) { ret "bpl"; }
+        if (id == RSI) { ret "sil"; }
+        if (id == RDI) { ret "dil"; }
+        if (id == R8)  { ret "r8b"; }
+        if (id == R9)  { ret "r9b"; }
+        if (id == R10) { ret "r10b"; }
+        if (id == R11) { ret "r11b"; }
+        if (id == R12) { ret "r12b"; }
+        if (id == R13) { ret "r13b"; }
+        if (id == R14) { ret "r14b"; }
+        if (id == R15) { ret "r15b"; }
+    }
+
+    if (size == 2) {
+        if (id == RAX) { ret "ax"; }
+        if (id == RCX) { ret "cx"; }
+        if (id == RDX) { ret "dx"; }
+        if (id == RBX) { ret "bx"; }
+        if (id == RSP) { ret "sp"; }
+        if (id == RBP) { ret "bp"; }
+        if (id == RSI) { ret "si"; }
+        if (id == RDI) { ret "di"; }
+        if (id == R8)  { ret "r8w"; }
+        if (id == R9)  { ret "r9w"; }
+        if (id == R10) { ret "r10w"; }
+        if (id == R11) { ret "r11w"; }
+        if (id == R12) { ret "r12w"; }
+        if (id == R13) { ret "r13w"; }
+        if (id == R14) { ret "r14w"; }
+        if (id == R15) { ret "r15w"; }
+    }
+
+    if (size == 4) {
+        if (id == RAX) { ret "eax"; }
+        if (id == RCX) { ret "ecx"; }
+        if (id == RDX) { ret "edx"; }
+        if (id == RBX) { ret "ebx"; }
+        if (id == RSP) { ret "esp"; }
+        if (id == RBP) { ret "ebp"; }
+        if (id == RSI) { ret "esi"; }
+        if (id == RDI) { ret "edi"; }
+        if (id == R8)  { ret "r8d"; }
+        if (id == R9)  { ret "r9d"; }
+        if (id == R10) { ret "r10d"; }
+        if (id == R11) { ret "r11d"; }
+        if (id == R12) { ret "r12d"; }
+        if (id == R13) { ret "r13d"; }
+        if (id == R14) { ret "r14d"; }
+        if (id == R15) { ret "r15d"; }
+    }
+
+    if (id == RAX) { ret "rax"; }
+    if (id == RCX) { ret "rcx"; }
+    if (id == RDX) { ret "rdx"; }
+    if (id == RBX) { ret "rbx"; }
+    if (id == RSP) { ret "rsp"; }
+    if (id == RBP) { ret "rbp"; }
+    if (id == RSI) { ret "rsi"; }
+    if (id == RDI) { ret "rdi"; }
+    if (id == R8)  { ret "r8"; }
+    if (id == R9)  { ret "r9"; }
+    if (id == R10) { ret "r10"; }
+    if (id == R11) { ret "r11"; }
+    if (id == R12) { ret "r12"; }
+    if (id == R13) { ret "r13"; }
+    if (id == R14) { ret "r14"; }
+    if (id == R15) { ret "r15"; }
+
+    ret "???";
+}
+
+# fp_reg_name: the assembly mnemonic for an SSE register.
+# ---
+# id:  composite XMM register id (the within-bank index is extracted)
+# ret: the register mnemonic, or "???" for an out-of-range id
+pub fun fp_reg_name(cid: i32) str {
+    val id: i32 = isa.regid_index(cid);
+    if (id == 0)  { ret "xmm0"; }
+    if (id == 1)  { ret "xmm1"; }
+    if (id == 2)  { ret "xmm2"; }
+    if (id == 3)  { ret "xmm3"; }
+    if (id == 4)  { ret "xmm4"; }
+    if (id == 5)  { ret "xmm5"; }
+    if (id == 6)  { ret "xmm6"; }
+    if (id == 7)  { ret "xmm7"; }
+    if (id == 8)  { ret "xmm8"; }
+    if (id == 9)  { ret "xmm9"; }
+    if (id == 10) { ret "xmm10"; }
+    if (id == 11) { ret "xmm11"; }
+    if (id == 12) { ret "xmm12"; }
+    if (id == 13) { ret "xmm13"; }
+    if (id == 14) { ret "xmm14"; }
+    if (id == 15) { ret "xmm15"; }
+    ret "???";
+}
+
+# count_callee_saved: number of callee-saved GP registers set in a clobber
+# mask. the SysV callee-saved GP set the back end may preserve is
+# {RBX, R12, R13, R14, R15} (RBP is handled by the frame pointer chain).
+# ---
+# mask: bitmask of physical registers (bit N = register N)
+# ret:  count of callee-saved registers present in the mask
+fun count_callee_saved(mask: u32) i32 {
+    var n: i32 = 0;
+    if ((mask & (1 << RBX::u32)) != 0) { n = n + 1; }
+    if ((mask & (1 << R12::u32)) != 0) { n = n + 1; }
+    if ((mask & (1 << R13::u32)) != 0) { n = n + 1; }
+    if ((mask & (1 << R14::u32)) != 0) { n = n + 1; }
+    if ((mask & (1 << R15::u32)) != 0) { n = n + 1; }
+    ret n;
+}
+
+# emit a `mov [base+disp], reg` storing a callee-saved register into its frame
+# home slot.
+# ---
+# buf:  instruction buffer to append into
+# reg:  source register id
+# base: base register id for the memory operand
+# disp: frame-pointer-relative displacement
+fun emit_frame_store(buf: *isa.InstBuf, reg: i32, base: i32, disp: i32) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = MOV;
+    mi.dst    = isa.make_mem(base, disp, -1, 0, 8);
+    mi.src1   = isa.make_reg(reg, 8);
+    mi.size   = 8;
+    mi.flags  = FLAG_REX_W;
+    isa.buf_append(buf, mi);
+}
+
+# emit a `mov reg, [base+disp]` reloading a callee-saved register from its frame
+# home slot.
+# ---
+# buf:  instruction buffer to append into
+# reg:  destination register id
+# base: base register id for the memory operand
+# disp: frame-pointer-relative displacement
+fun emit_frame_load(buf: *isa.InstBuf, reg: i32, base: i32, disp: i32) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = MOV;
+    mi.dst    = isa.make_reg(reg, 8);
+    mi.src1   = isa.make_mem(base, disp, -1, 0, 8);
+    mi.size   = 8;
+    mi.flags  = FLAG_REX_W;
+    isa.buf_append(buf, mi);
+}
+
+# emit_prologue: emit the standard x86-64 function prologue.
+#
+# pushes RBP, establishes the frame pointer (`mov rbp, rsp`), reserves the
+# frame and callee-saved spill space rounded up to 16-byte alignment, then
+# stores each preserved callee-saved register (RBX, R12–R15) into a
+# frame-pointer-relative home slot below the locals.
+# ---
+# ctx:         ISA backend context (unused; accepted for call-site uniformity)
+# buf:         instruction buffer to append the prologue into
+# frame_size:  size of the local frame in bytes
+# callee_mask: bitmask of callee-saved registers to preserve
+pub fun emit_prologue(ctx: ptr, buf: *isa.InstBuf, frame_size: usize, callee_mask: u32) {
+    var push_rbp: isa.Inst;
+    zero_inst(?push_rbp);
+    push_rbp.opcode = PUSH;
+    push_rbp.dst    = isa.make_reg(FRAME_REG, 8);
+    push_rbp.flags  = FLAG_REX_W;
+    isa.buf_append(buf, push_rbp);
+
+    var mov_rbp: isa.Inst;
+    zero_inst(?mov_rbp);
+    mov_rbp.opcode = MOV;
+    mov_rbp.dst    = isa.make_reg(FRAME_REG, 8);
+    mov_rbp.src1   = isa.make_reg(STACK_REG, 8);
+    mov_rbp.size   = 8;
+    mov_rbp.flags  = FLAG_REX_W;
+    isa.buf_append(buf, mov_rbp);
+
+    val callee_space: usize = count_callee_saved(callee_mask)::usize * 8;
+    var total: usize = frame_size + callee_space;
+    if (total > 0 && (total & 15) != 0) { total = (total + 15) & ~15::usize; }
+    if (total > 0) {
+        var sub_rsp: isa.Inst;
+        zero_inst(?sub_rsp);
+        sub_rsp.opcode = SUB;
+        sub_rsp.dst    = isa.make_reg(STACK_REG, 8);
+        sub_rsp.src1   = isa.make_imm(total::i64, 8);
+        sub_rsp.size   = 8;
+        sub_rsp.flags  = FLAG_REX_W;
+        isa.buf_append(buf, sub_rsp);
+    }
+
+    var coff: i32 = frame_size::i32 + 8;
+    if ((callee_mask & (1 << RBX::u32)) != 0) { emit_frame_store(buf, RBX, FRAME_REG, -coff); coff = coff + 8; }
+    if ((callee_mask & (1 << R12::u32)) != 0) { emit_frame_store(buf, R12, FRAME_REG, -coff); coff = coff + 8; }
+    if ((callee_mask & (1 << R13::u32)) != 0) { emit_frame_store(buf, R13, FRAME_REG, -coff); coff = coff + 8; }
+    if ((callee_mask & (1 << R14::u32)) != 0) { emit_frame_store(buf, R14, FRAME_REG, -coff); coff = coff + 8; }
+    if ((callee_mask & (1 << R15::u32)) != 0) { emit_frame_store(buf, R15, FRAME_REG, -coff); coff = coff + 8; }
+}
+
+# emit_epilogue: emit the standard x86-64 function epilogue.
+#
+# reloads each preserved callee-saved register from its frame home slot, then
+# tears down the frame (`mov rsp, rbp` ; `pop rbp`). the caller appends the
+# `ret` after this sequence.
+# ---
+# ctx:         ISA backend context (unused; accepted for call-site uniformity)
+# buf:         instruction buffer to append the epilogue into
+# frame_size:  size of the local frame in bytes (matching the prologue)
+# callee_mask: bitmask of callee-saved registers that were preserved
+pub fun emit_epilogue(ctx: ptr, buf: *isa.InstBuf, frame_size: usize, callee_mask: u32) {
+    var coff: i32 = frame_size::i32 + 8;
+    if ((callee_mask & (1 << RBX::u32)) != 0) { emit_frame_load(buf, RBX, FRAME_REG, -coff); coff = coff + 8; }
+    if ((callee_mask & (1 << R12::u32)) != 0) { emit_frame_load(buf, R12, FRAME_REG, -coff); coff = coff + 8; }
+    if ((callee_mask & (1 << R13::u32)) != 0) { emit_frame_load(buf, R13, FRAME_REG, -coff); coff = coff + 8; }
+    if ((callee_mask & (1 << R14::u32)) != 0) { emit_frame_load(buf, R14, FRAME_REG, -coff); coff = coff + 8; }
+    if ((callee_mask & (1 << R15::u32)) != 0) { emit_frame_load(buf, R15, FRAME_REG, -coff); coff = coff + 8; }
+
+    var mov_rsp: isa.Inst;
+    zero_inst(?mov_rsp);
+    mov_rsp.opcode = MOV;
+    mov_rsp.dst    = isa.make_reg(STACK_REG, 8);
+    mov_rsp.src1   = isa.make_reg(FRAME_REG, 8);
+    mov_rsp.size   = 8;
+    mov_rsp.flags  = FLAG_REX_W;
+    isa.buf_append(buf, mov_rsp);
+
+    var pop_rbp: isa.Inst;
+    zero_inst(?pop_rbp);
+    pop_rbp.opcode = POP;
+    pop_rbp.dst    = isa.make_reg(FRAME_REG, 8);
+    pop_rbp.flags  = FLAG_REX_W;
+    isa.buf_append(buf, pop_rbp);
+}
+
+# is_ret: report whether an instruction is a return.
+# ---
+# ctx: ISA backend context (unused; accepted for call-site uniformity)
+# mi:  instruction to classify
+# ret: true if the instruction is a RET
+pub fun is_ret(ctx: ptr, mi: *isa.Inst) bool {
+    ret mi.opcode == RET;
+}
+
+# is_call: report whether an instruction is a call.
+# ---
+# ctx: ISA backend context (unused; accepted for call-site uniformity)
+# mi:  instruction to classify
+# ret: true if the instruction is a CALL
+pub fun is_call(ctx: ptr, mi: *isa.Inst) bool {
+    ret mi.opcode == CALL;
+}
+
+# clear an instruction to a known-empty state before its fields are filled. all
+# operand kinds default to OPK_NONE (0) with no register and the base/index
+# fields set to -1 (no register).
+# ---
+# inst: instruction to zero in place
+fun zero_inst(inst: *isa.Inst) {
+    inst.opcode   = 0;
+    inst.size     = 0;
+    inst.flags    = 0;
+    inst.clobbers = 0;
+    inst.src_line = 0;
+    inst.src_file = nil;
+    zero_operand(?inst.dst);
+    zero_operand(?inst.src1);
+    zero_operand(?inst.src2);
+}
+
+# clear an operand to OPK_NONE with no register references.
+# ---
+# op: operand to zero in place
+fun zero_operand(op: *isa.Operand) {
+    op.kind   = isa.OPK_NONE;
+    op.size   = 0;
+    op.reg    = 0;
+    op.imm    = 0;
+    op.base   = -1;
+    op.index  = -1;
+    op.scale  = 0;
+    op.disp   = 0;
+    op.sym_id = 0;
+    op.label  = nil;
+}

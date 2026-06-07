@@ -1,0 +1,176 @@
+# mach.lang.me.pipeline: middle-end pass pipeline.
+#
+# Runs the canonical optimisation sequence over an
+# `ir.Module` in place and returns the same module mutated. The pipeline shape
+# is fixed by optimisation level; passes are not user-pluggable.
+#
+# `run` is the body invoked by the Q_LOWER compute path immediately after
+# lowering, before the module is published as the query result — so the
+# unoptimised IR is never observed elsewhere. The verifier runs before and
+# after the level's stages; a post-pipeline verification failure is an internal
+# compiler error (a pass bug), surfaced as the returned `err`.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use ir:        mach.lang.me.ir;
+use verify:    mach.lang.me.ir.verify;
+use mem2reg:   mach.lang.me.pass.mem2reg;
+use constfold: mach.lang.me.pass.constfold;
+use algebraic: mach.lang.me.pass.algebraic;
+use cse:       mach.lang.me.pass.cse;
+use dce:       mach.lang.me.pass.dce;
+use inline:    mach.lang.me.pass.inline;
+use target:    mach.lang.target;
+
+# the optimisation level selecting the pipeline's stage sequence.
+pub def OptLevel: u8;
+
+# debug optimisation (`-O0`): the always-on sequence — mem2reg, constfold, dce.
+# Default for `mach build`.
+pub val OPT_DEBUG:   OptLevel = 0;
+# release optimisation (`-O1`+): the always-on sequence plus inline, then a late
+# algebraic-simplification / local-CSE / constfold / dce sweep over the inlined
+# bodies.
+pub val OPT_RELEASE: OptLevel = 1;
+
+# Drives the middle-end pipeline over `m` at the requested level. Always runs
+# `verify_module` before and after the level's stages; a non-empty
+# `VerifyReport` from either run is formatted (via `verify.describe`) into the
+# returned `err`, which the driver surfaces as an internal compiler error.
+# ---
+# m:     module to optimise in place
+# tgt:   target — passed to the passes that consult a cost model (inline)
+# level: selects the stage sequence (debug vs release)
+# ret:   ok(true) on a clean pipeline, or an internal-compiler-error message
+pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool) Result[bool, str] {
+    # entry verification: sanity-check the lowered input. reachability and
+    # dominance are not enforced here — freshly-lowered IR carries the
+    # unreachable blocks the lowerer parks after terminators, which `dce`
+    # removes below. the aggregate-representation checks (`repr`) are opt-in via
+    # --verify-ir per-pass below; the always-on entry/exit runs keep `repr=false`
+    # until a clean self-host promotes them.
+    val rv_in: Result[bool, str] = run_verify(m, false, false);
+    if (is_err[bool, str](rv_in)) { ret rv_in; }
+
+    # mem2reg always runs — code generation expects mostly-SSA input.
+    val rm: Result[bool, str] = mem2reg.run(m);
+    if (is_err[bool, str](rm)) { ret rm; }
+    if (verify_ir) {
+        val rvm: Result[bool, str] = run_verify(m, false, true);
+        if (is_err[bool, str](rvm)) { ret rvm; }
+    }
+
+    # constfold always runs: with locals in SSA after mem2reg, constant operands
+    # are exposed, so folding/propagation and constant-branch simplification fire
+    # before dce sweeps the dead fold instructions and any newly-unreachable
+    # blocks. it produces the exact runtime value, so it is correct at every level.
+    val rcf: Result[bool, str] = constfold.run(m);
+    if (is_err[bool, str](rcf)) { ret rcf; }
+    if (verify_ir) {
+        val rvc: Result[bool, str] = run_verify(m, false, true);
+        if (is_err[bool, str](rvc)) { ret rvc; }
+    }
+
+    # dce always runs: beyond cleaning dead values, its reachability sweep
+    # removes the unreachable blocks lowering left behind, so the back end
+    # receives a connected CFG at every optimisation level.
+    val rd0: Result[bool, str] = dce.run(m);
+    if (is_err[bool, str](rd0)) { ret rd0; }
+    # after dce the CFG is connected: reachability/dominance hold (full=true).
+    if (verify_ir) {
+        val rvd: Result[bool, str] = run_verify(m, true, true);
+        if (is_err[bool, str](rvd)) { ret rvd; }
+    }
+
+    if (level == OPT_RELEASE) {
+        # inline: single-use and small functions.
+        val ri: Result[bool, str] = inline.run(m, tgt);
+        if (is_err[bool, str](ri)) { ret ri; }
+        if (verify_ir) {
+            val rvi: Result[bool, str] = run_verify(m, true, true);
+            if (is_err[bool, str](rvi)) { ret rvi; }
+        }
+
+        # late constfold: inlining substitutes constant arguments into callee
+        # bodies, exposing fresh folding opportunities across the inlined code.
+        # a constant-branch simplification here can strand a block with no
+        # predecessors that the following dce removes, so reachability is not yet
+        # enforced (full=false) — it is re-checked after the late dce below.
+        val rcf1: Result[bool, str] = constfold.run(m);
+        if (is_err[bool, str](rcf1)) { ret rcf1; }
+        if (verify_ir) {
+            val rvc1: Result[bool, str] = run_verify(m, false, true);
+            if (is_err[bool, str](rvc1)) { ret rvc1; }
+        }
+
+        # algebraic simplification: peephole identities (x+0, x*1, x&x, x^x, …)
+        # the all-constant cases constfold cannot reach. value-preserving by
+        # construction (integer-only where float semantics differ).
+        val ra: Result[bool, str] = algebraic.run(m);
+        if (is_err[bool, str](ra)) { ret ra; }
+        if (verify_ir) {
+            val rva: Result[bool, str] = run_verify(m, false, true);
+            if (is_err[bool, str](rva)) { ret rva; }
+        }
+
+        # local CSE: within each block, share a redundant pure computation with
+        # the earlier identical one. inlining frequently duplicates address /
+        # arithmetic expressions across a call boundary, which this collapses.
+        val rcs: Result[bool, str] = cse.run(m);
+        if (is_err[bool, str](rcs)) { ret rcs; }
+        if (verify_ir) {
+            val rvcs: Result[bool, str] = run_verify(m, false, true);
+            if (is_err[bool, str](rvcs)) { ret rvcs; }
+        }
+
+        # second constfold: algebra/CSE expose constants (e.g. x*0 -> 0) and may
+        # feed a constant condition to a branch; fold and simplify before dce.
+        val rcf2: Result[bool, str] = constfold.run(m);
+        if (is_err[bool, str](rcf2)) { ret rcf2; }
+        if (verify_ir) {
+            val rvc2: Result[bool, str] = run_verify(m, false, true);
+            if (is_err[bool, str](rvc2)) { ret rvc2; }
+        }
+
+        # late dce: sweep up now-dead calls, branches, and the instructions left
+        # dead by simplification / CSE.
+        val rd1: Result[bool, str] = dce.run(m);
+        if (is_err[bool, str](rd1)) { ret rd1; }
+        if (verify_ir) {
+            val rvl: Result[bool, str] = run_verify(m, true, true);
+            if (is_err[bool, str](rvl)) { ret rvl; }
+        }
+    }
+
+    # exit verification: full invariant check before the backend takes over.
+    ret run_verify(m, true, false);
+}
+
+# runs the verifier over `m` and maps a non-empty report into an err carrying
+# the description of the first failed check. A clean module yields ok(true).
+# `full` enforces the post-DCE reachability / dominance invariants; `repr`
+# enables the opt-in aggregate-representation checks.
+fun run_verify(m: *ir.Module, full: bool, repr: bool) Result[bool, str] {
+    val rr: Result[verify.VerifyReport, str] = verify.verify_module_ext(m, m.alloc, full, repr);
+    if (is_err[verify.VerifyReport, str](rr)) {
+        ret err[bool, str](unwrap_err[verify.VerifyReport, str](rr));
+    }
+    var report: verify.VerifyReport = unwrap_ok[verify.VerifyReport, str](rr);
+    if (report.count == 0) {
+        verify.dnit_report(?report);
+        ret ok[bool, str](true);
+    }
+    # internal compiler error: report the first violated invariant.
+    val msg: str = verify.describe(report.violations[0].check);
+    verify.dnit_report(?report);
+    ret err[bool, str](msg);
+}

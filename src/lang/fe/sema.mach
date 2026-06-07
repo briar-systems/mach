@@ -1,0 +1,709 @@
+# mach.lang.fe.sema: semantic analysis.
+#
+# consumes a ResolveResult plus the parsed Ast and produces a SemaResult —
+# parallel arrays mapping every AST node id to its semantic type.TypeId.
+# all interned types live in the shared TypeInterner on the session;
+# SemaResult owns only the per-Ast id-to-type mappings.
+#
+# each module is analysed in passes: the three parallel arrays are allocated
+# (TYPE_NIL prefill), every syntactic AstType is resolved into the interner
+# (resolve_type_ref), the declared type of every decl is computed
+# (infer_decl) with signatures before bodies so recursive declarations
+# resolve, and finally every decl body and initializer is walked
+# (infer_expr) and validated at composing sites via the check/* family.
+#
+# errors push a SEVERITY_ERROR diagnostic and mark the failing position with
+# TYPE_ERROR; sema never halts on the first error.
+#
+# field tables (the structural view of nominal record/union types) live on
+# the per-module SemaContext rather than the shared interner: different
+# modules may resolve the same nominal `(origin, decl)` pair, but each
+# computes its own field table during its own pass. the field-table API is
+# pub so the infer / check / generics sub-modules can populate and query it.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use src:      mach.lang.source;
+use sess:     mach.lang.session;
+use diag:     mach.lang.diagnostic;
+use intern:   mach.lang.intern;
+use type:     mach.lang.type;
+
+use ast:      mach.lang.fe.ast;
+use id:       mach.lang.fe.ast.id;
+use module:   mach.lang.fe.ast.module;
+use decl:     mach.lang.fe.ast.decl;
+use stmt:     mach.lang.fe.ast.stmt;
+use expr:     mach.lang.fe.ast.expr;
+use token:    mach.lang.fe.token;
+use comptime: mach.lang.fe.comptime;
+use resolve:  mach.lang.fe.resolve;
+use ctxm:     mach.lang.fe.sema.context;
+use infer:    mach.lang.fe.sema.infer;
+use check:    mach.lang.fe.sema.check;
+use coerce:   mach.lang.fe.sema.coerce;
+
+# re-export sema's shared state and accessor API (which lives in the context
+# leaf to break the orchestrator<->pass import cycle) so external consumers
+# keep spelling them as `sema.SemaResult` / `sema.SemaContext` / etc.
+fwd ctxm.SemaResult;
+fwd ctxm.ModuleSema;
+fwd ctxm.SemaDeps;
+fwd ctxm.FieldEntry;
+fwd ctxm.FieldTable;
+fwd ctxm.SemaContext;
+fwd ctxm.resolved_type_of;
+fwd ctxm.find_module_sema;
+fwd ctxm.decl_type_for;
+fwd ctxm.symbol_for_expr;
+fwd ctxm.symbol_for_type;
+fwd ctxm.symbol_by_id;
+fwd ctxm.report;
+fwd ctxm.field_table_begin;
+fwd ctxm.field_table_push;
+fwd ctxm.field_table_for;
+fwd ctxm.field_lookup;
+fwd ctxm.next_anon_ordinal;
+
+# sema: runs semantic analysis on one module, allocating the three parallel TypeId arrays, resolving every syntactic type, computing every decl's declared type, then walking every decl body inferring and checking expressions; diagnostics are pushed into the session and sema does not halt on errors.
+# ---
+# s:          shared session (allocator, sources, diagnostics, interners)
+# a:          parsed Ast for the module being analysed
+# rr:         name-resolution output for the same module
+# deps:       typing snapshots of every dependency, populated by the driver
+# ctx:        comptime context, required to evaluate array-length expressions
+# own_module: project-wide ModuleId of the module being analysed
+# ret:        the populated SemaResult, or an allocation error
+pub fun sema(
+    s:          *sess.Session,
+    a:          *ast.Ast,
+    rr:         *resolve.ResolveResult,
+    deps:       *ctxm.SemaDeps,
+    ctx:        *comptime.ComptimeCtx,
+    own_module: sess.ModuleId
+) Result[ctxm.SemaResult, str] {
+    var sc: ctxm.SemaContext;
+    val ir: Result[bool, str] = init_context(?sc, s, a, rr, deps, ctx, own_module);
+    if (is_err[bool, str](ir)) {
+        ret err[ctxm.SemaResult, str](unwrap_err[bool, str](ir));
+    }
+
+    val r1: Result[bool, str] = resolve_all_types(?sc);
+    if (is_err[bool, str](r1)) {
+        dnit_context(?sc);
+        ret err[ctxm.SemaResult, str](unwrap_err[bool, str](r1));
+    }
+
+    val r2: Result[bool, str] = infer_all_decls(?sc);
+    if (is_err[bool, str](r2)) {
+        dnit_context(?sc);
+        ret err[ctxm.SemaResult, str](unwrap_err[bool, str](r2));
+    }
+
+    val r3: Result[bool, str] = infer_all_bodies(?sc);
+    if (is_err[bool, str](r3)) {
+        dnit_context(?sc);
+        ret err[ctxm.SemaResult, str](unwrap_err[bool, str](r3));
+    }
+
+    ret build_result(?sc);
+}
+
+# dnit_result: releases the parallel arrays held by the result and zeroes its fields; nil is a no-op.
+# ---
+# r: result to tear down; nil is a no-op
+pub fun dnit_result(r: *ctxm.SemaResult) {
+    if (r == nil) { ret; }
+    if (r.expr_type != nil && r.expr_count > 0) {
+        deallocate[type.TypeId](r.alloc, r.expr_type, r.expr_count::usize);
+    }
+    if (r.type_resolved_ty != nil && r.type_count > 0) {
+        deallocate[type.TypeId](r.alloc, r.type_resolved_ty, r.type_count::usize);
+    }
+    if (r.decl_type != nil && r.decl_count > 0) {
+        deallocate[type.TypeId](r.alloc, r.decl_type, r.decl_count::usize);
+    }
+    r.expr_type        = nil;
+    r.type_resolved_ty = nil;
+    r.decl_type        = nil;
+    r.expr_count       = 0;
+    r.type_count       = 0;
+    r.decl_count       = 0;
+}
+
+fun init_context(
+    sc:         *ctxm.SemaContext,
+    s:          *sess.Session,
+    a:          *ast.Ast,
+    rr:         *resolve.ResolveResult,
+    deps:       *ctxm.SemaDeps,
+    ctx:        *comptime.ComptimeCtx,
+    own_module: sess.ModuleId
+) Result[bool, str] {
+    sc.s          = s;
+    sc.a          = a;
+    sc.rr         = rr;
+    sc.deps       = deps;
+    sc.ctx        = ctx;
+    sc.own_module = own_module;
+    sc.source     = source_text_of(s, a);
+
+    sc.expr_type        = nil;
+    sc.type_resolved_ty = nil;
+    sc.decl_type        = nil;
+
+    sc.anon_counter = 0;
+    sc.callee_eid   = id.EXPR_NIL;
+
+    if (a.expr_len > 0) {
+        val r: Result[*type.TypeId, str] = allocate[type.TypeId](s.alloc, a.expr_len);
+        if (is_err[*type.TypeId, str](r)) { ret err[bool, str](unwrap_err[*type.TypeId, str](r)); }
+        sc.expr_type = unwrap_ok[*type.TypeId, str](r);
+        fill_nil(sc.expr_type, a.expr_len::u32);
+    }
+    if (a.type_len > 0) {
+        val r: Result[*type.TypeId, str] = allocate[type.TypeId](s.alloc, a.type_len);
+        if (is_err[*type.TypeId, str](r)) { ret err[bool, str](unwrap_err[*type.TypeId, str](r)); }
+        sc.type_resolved_ty = unwrap_ok[*type.TypeId, str](r);
+        fill_nil(sc.type_resolved_ty, a.type_len::u32);
+    }
+    if (a.decl_len > 0) {
+        val r: Result[*type.TypeId, str] = allocate[type.TypeId](s.alloc, a.decl_len);
+        if (is_err[*type.TypeId, str](r)) { ret err[bool, str](unwrap_err[*type.TypeId, str](r)); }
+        sc.decl_type = unwrap_ok[*type.TypeId, str](r);
+        fill_nil(sc.decl_type, a.decl_len::u32);
+    }
+
+    val sr: Result[bool, str] = infer.seed_builtins(sc);
+    if (is_err[bool, str](sr)) {
+        dnit_context(sc);
+        ret err[bool, str](unwrap_err[bool, str](sr));
+    }
+
+    ret ok[bool, str](true);
+}
+
+# the module's source text, used to read identifier spans during inference.
+# the Ast.file_id is registered with the session by the driver before sema
+# runs; an absent file yields an empty string (spans become empty lookups).
+fun source_text_of(s: *sess.Session, a: *ast.Ast) str {
+    val so: Option[*src.SourceFile] = src.get(?s.sources, a.file_id);
+    if (is_none[*src.SourceFile](so)) { ret nil::str; }
+    ret unwrap[*src.SourceFile](so).text;
+}
+
+fun fill_nil(arr: *type.TypeId, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        arr[i] = type.TYPE_NIL;
+        i = i + 1;
+    }
+}
+
+fun dnit_context(sc: *ctxm.SemaContext) {
+    if (sc.expr_type != nil && sc.a.expr_len > 0) {
+        deallocate[type.TypeId](sc.s.alloc, sc.expr_type, sc.a.expr_len);
+    }
+    if (sc.type_resolved_ty != nil && sc.a.type_len > 0) {
+        deallocate[type.TypeId](sc.s.alloc, sc.type_resolved_ty, sc.a.type_len);
+    }
+    if (sc.decl_type != nil && sc.a.decl_len > 0) {
+        deallocate[type.TypeId](sc.s.alloc, sc.decl_type, sc.a.decl_len);
+    }
+    sc.expr_type        = nil;
+    sc.type_resolved_ty = nil;
+    sc.decl_type        = nil;
+}
+
+fun resolve_all_types(sc: *ctxm.SemaContext) Result[bool, str] {
+    if (sc.type_resolved_ty == nil) { ret ok[bool, str](true); }
+    var ti: u32 = 0;
+    for (ti < sc.a.type_len::u32) {
+        sc.type_resolved_ty[ti] = infer.resolve_type_ref(sc, ti);
+        ti = ti + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun infer_all_decls(sc: *ctxm.SemaContext) Result[bool, str] {
+    if (sc.decl_type == nil) { ret ok[bool, str](true); }
+    val m_opt: Option[*module.Module] = ast.get_module(sc.a, sc.a.root_module);
+    if (is_none[*module.Module](m_opt)) {
+        ret err[bool, str]("root_module is not set on this Ast");
+    }
+    val mnode: *module.Module = unwrap[*module.Module](m_opt);
+    ret infer_decls_in_list(sc, mnode.decls_start, mnode.decls_len);
+}
+
+# walks a decl list in source order, computing each binding decl's declared
+# type. comptime-if arms are flattened: the active arm's decls are walked,
+# inactive arms are skipped.
+fun infer_decls_in_list(sc: *ctxm.SemaContext, start: u32, len: u32) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = sc.a.decl_ids[start + i];
+        val r: Result[bool, str] = infer_one_decl(sc, did);
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun infer_one_decl(sc: *ctxm.SemaContext, did: id.DeclId) Result[bool, str] {
+    val d_opt: Option[*decl.Decl] = ast.get_decl(sc.a, did);
+    if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+        ret infer_decls_comptime_if(sc, ?d.data.comptime_if);
+    }
+
+    val t: type.TypeId = infer.infer_decl(sc, did);
+    sc.decl_type[did] = t;
+    ret ok[bool, str](true);
+}
+
+# evaluates a decl-scope comptime-if and recurses into the first active arm's
+# decl list, so its declared types are computed in the enclosing pass.
+fun infer_decls_comptime_if(sc: *ctxm.SemaContext, ci: *decl.DeclComptimeIf) Result[bool, str] {
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[ci.branches_start + bi];
+        val active: Result[bool, str] = comptime_branch_active(sc, br);
+        if (is_err[bool, str](active)) { ret active; }
+        if (unwrap_ok[bool, str](active)) {
+            ret infer_decls_in_list(sc, br.body_start, br.body_len);
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun infer_all_bodies(sc: *ctxm.SemaContext) Result[bool, str] {
+    if (sc.decl_type == nil) { ret ok[bool, str](true); }
+    val m_opt: Option[*module.Module] = ast.get_module(sc.a, sc.a.root_module);
+    if (is_none[*module.Module](m_opt)) {
+        ret err[bool, str]("root_module is not set on this Ast");
+    }
+    val mnode: *module.Module = unwrap[*module.Module](m_opt);
+    ret infer_bodies_in_list(sc, mnode.decls_start, mnode.decls_len);
+}
+
+fun infer_bodies_in_list(sc: *ctxm.SemaContext, start: u32, len: u32) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = sc.a.decl_ids[start + i];
+        val r: Result[bool, str] = infer_one_body(sc, did);
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun infer_one_body(sc: *ctxm.SemaContext, did: id.DeclId) Result[bool, str] {
+    val d_opt: Option[*decl.Decl] = ast.get_decl(sc.a, did);
+    if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+        ret infer_bodies_comptime_if(sc, ?d.data.comptime_if);
+    }
+    if (d.kind == decl.DECL_KIND_FUN) {
+        if (d.data.fun_.body != id.STMT_NIL) {
+            val rt: type.TypeId = ctxm.resolved_type_of(sc, d.data.fun_.return_type);
+            ret infer_stmt(sc, d.data.fun_.body, rt);
+        }
+        ret ok[bool, str](true);
+    }
+    if (d.kind == decl.DECL_KIND_TEST) {
+        if (d.data.test_.body != id.STMT_NIL) {
+            # a test body returns an integer process status (`ret 0` / `ret 1`);
+            # type it as i32 so those literals coerce and are checked, matching
+            # the i32-returning function the middle end lowers each test into.
+            val rt: type.TypeId = test_return_type(sc);
+            ret infer_stmt(sc, d.data.test_.body, rt);
+        }
+        ret ok[bool, str](true);
+    }
+    if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) {
+        ret infer_binding_init(sc, did, d);
+    }
+    if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
+        infer.infer_expr(sc, d.data.comptime_attr.value);
+        ret ok[bool, str](true);
+    }
+    ret ok[bool, str](true);
+}
+
+# the return type a `test` body is checked against: the canonical i32
+# primitive TypeId from the interner, falling back to TYPE_ERROR if the
+# primitive is somehow unregistered (which suppresses cascading diagnostics).
+fun test_return_type(sc: *ctxm.SemaContext) type.TypeId {
+    val p: Option[type.TypeId] = type.prim(?sc.s.types, type.TYPE_I32);
+    if (is_none[type.TypeId](p)) { ret type.TYPE_ERROR; }
+    ret unwrap[type.TypeId](p);
+}
+
+# infers a module-scope binding's initializer and checks it against the
+# declared (or inferred) type recorded in decl_type by the decl-type pass.
+fun infer_binding_init(sc: *ctxm.SemaContext, did: id.DeclId, d: *decl.Decl) Result[bool, str] {
+    if (d.data.bind.init == id.EXPR_NIL) { ret ok[bool, str](true); }
+    val actual: type.TypeId = infer.infer_expr(sc, d.data.bind.init);
+    val expected: type.TypeId = sc.decl_type[did];
+    if (expected != type.TYPE_NIL && expected != type.TYPE_ERROR
+        && actual != type.TYPE_ERROR && d.data.bind.ty != id.TYPE_NIL) {
+        check_binding(sc, expected, d.data.bind.init, actual, d.span);
+    }
+    ret ok[bool, str](true);
+}
+
+fun infer_bodies_comptime_if(sc: *ctxm.SemaContext, ci: *decl.DeclComptimeIf) Result[bool, str] {
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[ci.branches_start + bi];
+        val active: Result[bool, str] = comptime_branch_active(sc, br);
+        if (is_err[bool, str](active)) { ret active; }
+        if (unwrap_ok[bool, str](active)) {
+            ret infer_bodies_in_list(sc, br.body_start, br.body_len);
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# walks a statement subtree inferring and checking every expression it
+# contains. `fn_ret` is the enclosing function's resolved return type,
+# threaded through so `ret` statements can be validated. STMT_NIL is a no-op.
+fun infer_stmt(sc: *ctxm.SemaContext, sid: id.StmtId, fn_ret: type.TypeId) Result[bool, str] {
+    if (sid == id.STMT_NIL) { ret ok[bool, str](true); }
+    val s_opt: Option[*stmt.Stmt] = ast.get_stmt(sc.a, sid);
+    if (is_none[*stmt.Stmt](s_opt)) { ret err[bool, str]("StmtId out of range"); }
+    val st: *stmt.Stmt = unwrap[*stmt.Stmt](s_opt);
+
+    if (st.kind == stmt.STMT_KIND_EXPR) {
+        infer.infer_expr(sc, st.data.expr.expr);
+        ret ok[bool, str](true);
+    }
+    if (st.kind == stmt.STMT_KIND_BLOCK) {
+        ret infer_stmt_list(sc, st.data.block.stmts_start, st.data.block.stmts_len, fn_ret);
+    }
+    if (st.kind == stmt.STMT_KIND_IF) {
+        val ct: type.TypeId = infer.infer_expr(sc, st.data.if_.cond);
+        if (ct != type.TYPE_ERROR) { check.check_condition(sc, ct, st.span); }
+        val rt: Result[bool, str] = infer_stmt(sc, st.data.if_.then_block, fn_ret);
+        if (is_err[bool, str](rt)) { ret rt; }
+        ret infer_stmt(sc, st.data.if_.else_block, fn_ret);
+    }
+    if (st.kind == stmt.STMT_KIND_FOR) {
+        if (st.data.for_.cond != id.EXPR_NIL) {
+            val ct: type.TypeId = infer.infer_expr(sc, st.data.for_.cond);
+            if (ct != type.TYPE_ERROR) { check.check_condition(sc, ct, st.span); }
+        }
+        ret infer_stmt(sc, st.data.for_.body, fn_ret);
+    }
+    if (st.kind == stmt.STMT_KIND_RET) {
+        check_return_stmt(sc, fn_ret, st.data.ret_.value, st.span);
+        ret ok[bool, str](true);
+    }
+    if (st.kind == stmt.STMT_KIND_FIN) {
+        ret infer_stmt(sc, st.data.fin_.body, fn_ret);
+    }
+    if (st.kind == stmt.STMT_KIND_DECL) {
+        ret infer_local_decl(sc, st.data.decl.decl);
+    }
+    if (st.kind == stmt.STMT_KIND_COMPTIME_IF) {
+        ret infer_stmt_comptime_if(sc, st.data.comptime_if.branches_start, st.data.comptime_if.branches_len, fn_ret);
+    }
+    # BRK, CNT, ASM, ERROR carry no expressions to infer
+    ret ok[bool, str](true);
+}
+
+fun infer_stmt_list(sc: *ctxm.SemaContext, start: u32, len: u32, fn_ret: type.TypeId) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val sid: id.StmtId = sc.a.stmt_ids[start + i];
+        val r: Result[bool, str] = infer_stmt(sc, sid, fn_ret);
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+fun infer_stmt_comptime_if(sc: *ctxm.SemaContext, start: u32, len: u32, fn_ret: type.TypeId) Result[bool, str] {
+    # a chain gated on a comptime value parameter cannot select an arm at sema
+    # time (the parameter's value is fixed per call site). type-check EVERY arm
+    # structurally; arm selection is deferred to per-value monomorphization.
+    if (stmt_comptime_if_gated_on_param(sc, start, len)) {
+        var ai: u32 = 0;
+        for (ai < len) {
+            val arm: *decl.ComptimeBranch = ?sc.a.comptime_branches[start + ai];
+            if (arm.cond != id.EXPR_NIL) {
+                infer.infer_expr(sc, arm.cond);
+                # every arm gate of a param-gated chain must itself be comptime-
+                # foldable: its free identifiers must all be comptime (comptime
+                # params or comptime constants), never a runtime local/param/var.
+                # arm selection happens at lowering via the comptime evaluator, so
+                # a runtime-gated arm would otherwise abort there with a span-less
+                # error. report it here, against the offending gate.
+                check_comptime_gate(sc, arm.cond);
+            }
+            val rb: Result[bool, str] = infer_stmt_list(sc, arm.body_start, arm.body_len, fn_ret);
+            if (is_err[bool, str](rb)) { ret rb; }
+            ai = ai + 1;
+        }
+        ret ok[bool, str](true);
+    }
+
+    var bi: u32 = 0;
+    for (bi < len) {
+        val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[start + bi];
+        val active: Result[bool, str] = comptime_branch_active(sc, br);
+        if (is_err[bool, str](active)) { ret active; }
+        if (unwrap_ok[bool, str](active)) {
+            ret infer_stmt_list(sc, br.body_start, br.body_len, fn_ret);
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# reports whether any arm gate of a statement-level `$if` chain references a
+# comptime value parameter. such a gate is unfoldable until the call-site value
+# is known, so all arms are type-checked and arm selection deferred to lowering.
+fun stmt_comptime_if_gated_on_param(sc: *ctxm.SemaContext, start: u32, len: u32) bool {
+    var bi: u32 = 0;
+    for (bi < len) {
+        val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[start + bi];
+        if (br.cond != id.EXPR_NIL && expr_references_comptime_param(sc, br.cond)) {
+            ret true;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# walks `eid` reporting whether any leaf identifier resolves to a comptime value
+# parameter (SYM_PARAM with SYM_FLAG_COMPTIME), using the resolve result's
+# already-populated symbol bindings.
+fun expr_references_comptime_param(sc: *ctxm.SemaContext, eid: id.ExprId) bool {
+    if (eid == id.EXPR_NIL) { ret false; }
+    val e_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+
+    if (e.kind == expr.EXPR_KIND_IDENT) {
+        val so: Option[*resolve.Symbol] = ctxm.symbol_for_expr(sc, eid);
+        if (is_none[*resolve.Symbol](so)) { ret false; }
+        val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+        ret sym.kind == resolve.SYM_PARAM && (sym.flags & resolve.SYM_FLAG_COMPTIME) != 0;
+    }
+    if (e.kind == expr.EXPR_KIND_BINARY) {
+        ret expr_references_comptime_param(sc, e.data.binary.lhs)
+         || expr_references_comptime_param(sc, e.data.binary.rhs);
+    }
+    if (e.kind == expr.EXPR_KIND_UNARY) {
+        ret expr_references_comptime_param(sc, e.data.unary.operand);
+    }
+    ret false;
+}
+
+# verifies a comptime-param `$if` gate is fully comptime-foldable so arm selection
+# can be deferred to lowering without a span-less abort there. every leaf must be
+# comptime: a comptime parameter, a comptime-foldable constant (checked by actually
+# folding it, not by symbol kind — a runtime block-local `val` is SYM_VAL yet not
+# foldable), a literal, or a `$mach.*` / module-constant path. a non-foldable
+# subexpression (a runtime value, or an unevaluable index / call / cast / deref) is
+# reported against its own span. recurses through every composite expression kind.
+fun check_comptime_gate(sc: *ctxm.SemaContext, eid: id.ExprId) {
+    if (eid == id.EXPR_NIL) { ret; }
+    val e_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret; }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+    val k: expr.ExprKind = e.kind;
+
+    # composite operators: recurse into operands so a runtime leaf is reported at
+    # its own span rather than masked by the parent.
+    if (k == expr.EXPR_KIND_BINARY) {
+        check_comptime_gate(sc, e.data.binary.lhs);
+        check_comptime_gate(sc, e.data.binary.rhs);
+        ret;
+    }
+    if (k == expr.EXPR_KIND_UNARY) {
+        # a deref / address-of is not comptime-evaluable at all; report it.
+        if (e.data.unary.op == expr.UN_DEREF || e.data.unary.op == expr.UN_ADDR) {
+            ctxm.report(sc, e.span, "comptime `$if` gate is not a compile-time constant");
+            ret;
+        }
+        check_comptime_gate(sc, e.data.unary.operand);
+        ret;
+    }
+
+    # literals and `$mach.*` comptime paths fold directly.
+    if (k == expr.EXPR_KIND_LIT_INT || k == expr.EXPR_KIND_LIT_FLOAT
+     || k == expr.EXPR_KIND_LIT_CHAR || k == expr.EXPR_KIND_LIT_STR
+     || k == expr.EXPR_KIND_COMPTIME_IDENT) {
+        ret;
+    }
+
+    if (k == expr.EXPR_KIND_IDENT) {
+        val so: Option[*resolve.Symbol] = ctxm.symbol_for_expr(sc, eid);
+        # an unresolved ident may be a language literal (`true`/`false`) the
+        # evaluator folds directly; leave it to the evaluator.
+        if (is_none[*resolve.Symbol](so)) { ret; }
+        val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+        if (sym.kind == resolve.SYM_PARAM) {
+            if ((sym.flags & resolve.SYM_FLAG_COMPTIME) == 0) {
+                ctxm.report(sc, e.span, "comptime `$if` gate cannot reference a runtime parameter");
+            }
+            ret;
+        }
+        # a `val` / imported binding is foldable ONLY if it actually resolves to a
+        # comptime constant — a runtime block-local `val n = f();` is SYM_VAL but
+        # not foldable. test by folding it through the comptime evaluator.
+        if (sym.kind == resolve.SYM_VAL || sym.kind == resolve.SYM_IMPORTED) {
+            val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
+            if (is_err[comptime.CTValue, str](ev) && !arg_names_module_const_sym(sym)) {
+                ctxm.report(sc, e.span, "comptime `$if` gate cannot reference a runtime value");
+            }
+            ret;
+        }
+        ctxm.report(sc, e.span, "comptime `$if` gate cannot reference a runtime value");
+        ret;
+    }
+
+    # a module-qualified member (`alias.CONST`) folds to the defining module's
+    # constant; a member of a runtime value does not. fold to decide.
+    if (k == expr.EXPR_KIND_MEMBER) {
+        val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
+        if (is_err[comptime.CTValue, str](ev)) {
+            val so: Option[*resolve.Symbol] = ctxm.symbol_for_expr(sc, eid);
+            if (is_none[*resolve.Symbol](so) || !arg_names_module_const_sym(unwrap[*resolve.Symbol](so))) {
+                ctxm.report(sc, e.span, "comptime `$if` gate is not a compile-time constant");
+            }
+        }
+        ret;
+    }
+
+    # index / call / cast / array-lit / struct-lit: not comptime-evaluable in a
+    # gate. report against the whole subexpression.
+    ctxm.report(sc, e.span, "comptime `$if` gate is not a compile-time constant");
+    ret;
+}
+
+# reports whether a symbol names a module-origin constant (an import, or a
+# module-level `val`) whose value lives in the defining module's comptime context
+# — foldable at lowering even when sema cannot fold it here.
+fun arg_names_module_const_sym(sym: *resolve.Symbol) bool {
+    ret sym.kind == resolve.SYM_IMPORTED;
+}
+
+# types a local val/var: records its declared (or inferred) type in
+# decl_type, infers the initializer, and checks compatibility when an
+# explicit annotation is present.
+fun infer_local_decl(sc: *ctxm.SemaContext, did: id.DeclId) Result[bool, str] {
+    if (did == id.DECL_NIL) { ret ok[bool, str](true); }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(sc.a, did);
+    if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_VAL && d.kind != decl.DECL_KIND_VAR) {
+        ret ok[bool, str](true);
+    }
+
+    val t: type.TypeId = infer.infer_decl(sc, did);
+    if (sc.decl_type != nil) { sc.decl_type[did] = t; }
+
+    if (d.data.bind.init != id.EXPR_NIL) {
+        val actual: type.TypeId = infer.infer_expr(sc, d.data.bind.init);
+        if (d.data.bind.ty != id.TYPE_NIL && t != type.TYPE_NIL
+            && t != type.TYPE_ERROR && actual != type.TYPE_ERROR) {
+            check_binding(sc, t, d.data.bind.init, actual, d.span);
+        }
+    }
+    ret ok[bool, str](true);
+}
+
+# checks an initializer expression against the declared slot type. attempts
+# a literal coercion first (which rewrites expr_type[eid] on success), then
+# delegates to check.check_assignable on the post-coercion type.
+fun check_binding(sc: *ctxm.SemaContext, expected: type.TypeId, eid: id.ExprId, actual: type.TypeId, span: token.Span) {
+    var have: type.TypeId = actual;
+    val co: Option[type.TypeId] = coerce.try_coerce_literal(sc, eid, expected);
+    if (is_some[type.TypeId](co)) { have = unwrap[type.TypeId](co); }
+    check.check_assignable(sc, expected, have, span);
+}
+
+# checks a return statement: infers the returned value (if any), applies a
+# literal coercion toward the resolved return type, then delegates to
+# check.check_return.
+fun check_return_stmt(sc: *ctxm.SemaContext, ret_ty: type.TypeId, value: id.ExprId, span: token.Span) {
+    if (value == id.EXPR_NIL) {
+        check.check_return(sc, ret_ty, type.TYPE_NIL, span);
+        ret;
+    }
+    var vt: type.TypeId = infer.infer_expr(sc, value);
+    if (ret_ty != type.TYPE_NIL && ret_ty != type.TYPE_ERROR && vt != type.TYPE_ERROR) {
+        val co: Option[type.TypeId] = coerce.try_coerce_literal(sc, value, ret_ty);
+        if (is_some[type.TypeId](co)) { vt = unwrap[type.TypeId](co); }
+    }
+    check.check_return(sc, ret_ty, vt, span);
+}
+
+# evaluates a comptime-branch condition through the shared comptime
+# evaluator. an empty cond (`$or { }`) is the unconditional final arm;
+# evaluation failures and non-bool results report a diagnostic and yield
+# false (the arm is treated as inactive).
+fun comptime_branch_active(sc: *ctxm.SemaContext, br: *decl.ComptimeBranch) Result[bool, str] {
+    if (br.cond == id.EXPR_NIL) { ret ok[bool, str](true); }
+    val r: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, br.cond, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](r)) {
+        ret ok[bool, str](false);
+    }
+    val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r);
+    if (v.kind != comptime.CT_KIND_BOOL) { ret ok[bool, str](false); }
+    ret ok[bool, str](v.data.b);
+}
+
+fun build_result(sc: *ctxm.SemaContext) Result[ctxm.SemaResult, str] {
+    var out: ctxm.SemaResult;
+    out.alloc            = sc.s.alloc;
+    out.expr_type        = sc.expr_type;
+    out.type_resolved_ty = sc.type_resolved_ty;
+    out.decl_type        = sc.decl_type;
+    out.expr_count       = sc.a.expr_len::u32;
+    out.type_count       = sc.a.type_len::u32;
+    out.decl_count       = sc.a.decl_len::u32;
+
+    # ownership of the three parallel arrays passes to the result; clear the
+    # context handles so dnit_context releases only the field-table storage.
+    sc.expr_type        = nil;
+    sc.type_resolved_ty = nil;
+    sc.decl_type        = nil;
+    dnit_context(sc);
+
+    ret ok[ctxm.SemaResult, str](out);
+}

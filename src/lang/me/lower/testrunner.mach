@@ -1,0 +1,1144 @@
+# mach.lang.me.lower.testrunner: synthesizes the `mach test` runner module.
+#
+# `mach test` builds the project with a test-runner entry point instead of the
+# project's own `main`. that entry point is not written in source — it is built
+# here, in IR, from the set of `test "..."` declarations the build collected
+# (every IR function tagged `ir.FN_FLAG_TEST`, across every module).
+#
+# `synthesize` produces one extra IR module whose `main` is the runner. for each
+# collected test it adds a signature-only extern `i32()` declaration under the
+# test's linkage name so the runner can `call` it across object boundaries, plus
+# a private `.rodata` global holding the test's label text. the runner's `main`
+# invokes each test in turn, interprets the returned `i32` as a process status
+# (`0` = pass, non-zero = fail), prints a line per test plus a summary, and
+# returns `0` when every test passed and `1` otherwise.
+#
+# the only OS interaction is a `write` syscall, emitted as a small inline-asm
+# helper, so the runner depends on nothing but the test symbols themselves — it
+# works for any target project, with or without a standard library.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use map:     std.collections.map;
+use maphash: std.collections.map;
+
+use intern: mach.lang.intern;
+use sess:   mach.lang.session;
+
+use ir:      mach.lang.me.ir;
+use ir_type: mach.lang.me.ir.type;
+use irid:    mach.lang.me.ir.id;
+use value:   mach.lang.me.ir.value;
+use builder: mach.lang.me.ir.builder;
+
+# Test: one collected test — its linkage name (the symbol the runner calls) and
+# its source label (printed in the per-test line).
+rec Test {
+    linkage: intern.StrId;
+    label:   intern.StrId;
+}
+
+# Ctx: synthesis state carried across the emission passes.
+rec Ctx {
+    s:    *sess.Session;
+    m:    *ir.Module;
+    b:    builder.Builder;
+    i32:  ir_type.IrTypeId;
+    i64:  ir_type.IrTypeId;
+    i8:   ir_type.IrTypeId;
+    ptr:  ir_type.IrTypeId;
+    void: ir_type.IrTypeId;
+
+    write_fn:    u32;
+    streq_fn:    u32;
+    contains_fn: u32;
+}
+
+# synthesize: build the test-runner IR module from the test functions spread
+# across `modules[0..count)`. returns none when the build has no tests (the
+# caller keeps the project's own `main`); otherwise a fresh unoptimised IR
+# module whose `main` is the runner.
+pub fun synthesize(s: *sess.Session, modules: *ir.Module, count: u32) Result[Option[ir.Module], str] {
+    var tests:    *Test = nil;
+    var test_len: u32   = 0;
+    var test_cap: u32   = 0;
+
+    val cr: Result[bool, str] = collect_tests(s, modules, count, ?tests, ?test_len, ?test_cap);
+    if (is_err[bool, str](cr)) {
+        free_tests(s, tests, test_cap);
+        ret err[Option[ir.Module], str](unwrap_err[bool, str](cr));
+    }
+
+    if (test_len == 0) {
+        free_tests(s, tests, test_cap);
+        ret ok[Option[ir.Module], str](none[ir.Module]());
+    }
+
+    val name_r: Result[intern.StrId, str] = intern.intern(?s.interner, "__mach_test");
+    if (is_err[intern.StrId, str](name_r)) {
+        free_tests(s, tests, test_cap);
+        ret err[Option[ir.Module], str](unwrap_err[intern.StrId, str](name_r));
+    }
+
+    val mod_r: Result[ir.Module, str] = ir.init_module(s.alloc, unwrap_ok[intern.StrId, str](name_r));
+    if (is_err[ir.Module, str](mod_r)) {
+        free_tests(s, tests, test_cap);
+        ret err[Option[ir.Module], str](unwrap_err[ir.Module, str](mod_r));
+    }
+    var m: ir.Module = unwrap_ok[ir.Module, str](mod_r);
+
+    val br: Result[bool, str] = build_runner(s, ?m, tests, test_len);
+    free_tests(s, tests, test_cap);
+    if (is_err[bool, str](br)) {
+        ir.dnit_module(?m);
+        ret err[Option[ir.Module], str](unwrap_err[bool, str](br));
+    }
+
+    ret ok[Option[ir.Module], str](some[ir.Module](m));
+}
+
+fun free_tests(s: *sess.Session, tests: *Test, cap: u32) {
+    if (tests != nil && cap > 0) { deallocate[Test](s.alloc, tests, cap::usize); }
+}
+
+# neutralize_project_main: turn any function whose linkage name is literally
+# `main` into a body-less extern so the synthesized runner's `main` is the sole
+# program entry. the dropped blocks are reclaimed by the module's own dnit; a
+# test build never references the project's `main`, so the extern emits nothing.
+# called between lowering and codegen in a test build.
+pub fun neutralize_project_main(s: *sess.Session, modules: *ir.Module, count: u32) Result[bool, str] {
+    val main_r: Result[intern.StrId, str] = intern.intern(?s.interner, "main");
+    if (is_err[intern.StrId, str](main_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](main_r)); }
+    val main_id: intern.StrId = unwrap_ok[intern.StrId, str](main_r);
+
+    var mi: u32 = 0;
+    for (mi < count) {
+        val mod: *ir.Module = ?modules[mi];
+        var fi: u32 = 0;
+        for (fi < mod.function_len) {
+            val fn: *ir.Function = ?mod.functions[fi];
+            if (fn.name == main_id && (fn.flags & ir.FN_FLAG_EXTERN) == 0) {
+                fn.flags       = fn.flags | ir.FN_FLAG_EXTERN;
+                fn.block_count = 0;
+            }
+            fi = fi + 1;
+        }
+        mi = mi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# collect_tests: append a Test entry for every `FN_FLAG_TEST` function across the
+# module set.
+fun collect_tests(s: *sess.Session, modules: *ir.Module, count: u32,
+                  tests: **Test, test_len: *u32, test_cap: *u32) Result[bool, str] {
+    var mi: u32 = 0;
+    for (mi < count) {
+        val mod: *ir.Module = ?modules[mi];
+        var fi: u32 = 0;
+        for (fi < mod.function_len) {
+            val fn: *ir.Function = ?mod.functions[fi];
+            if ((fn.flags & ir.FN_FLAG_TEST) != 0) {
+                var t: Test;
+                t.linkage = fn.name;
+                t.label   = label_of(s, fn.name);
+                val ar: Result[bool, str] = push_test(s, tests, test_len, test_cap, t);
+                if (is_err[bool, str](ar)) { ret ar; }
+            }
+            fi = fi + 1;
+        }
+        mi = mi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# label_of: recover the source label from a test function's mangled linkage
+# name. the mangler emits `_M<path>N<len><name>`, and a test's `<name>` is its
+# label, so the label is the `<len>`-byte run after the final `N<len>`. falls
+# back to the whole linkage name when the shape is unexpected.
+fun label_of(s: *sess.Session, linkage: intern.StrId) intern.StrId {
+    val o: Option[str] = intern.lookup(?s.interner, linkage);
+    if (is_none[str](o)) { ret linkage; }
+    val name: str = unwrap[str](o);
+    val n: usize = str_len(name);
+
+    var i: usize = 0;
+    var best_start: usize = 0;
+    var best_len: usize = 0;
+    var found: bool = false;
+    for (i < n) {
+        if (name[i] == 'N') {
+            var j: usize = i + 1;
+            var num: usize = 0;
+            var digits: usize = 0;
+            for (j < n && name[j] >= '0' && name[j] <= '9') {
+                num = num * 10 + (name[j] - '0')::usize;
+                j = j + 1;
+                digits = digits + 1;
+            }
+            if (digits > 0 && j + num <= n) {
+                best_start = j;
+                best_len   = num;
+                found      = true;
+            }
+        }
+        i = i + 1;
+    }
+    if (!found || best_len == 0) { ret linkage; }
+
+    # a test label is parsed from a string-literal token, so its mangled `<name>`
+    # still carries the surrounding quotes; strip a matching pair so the printed
+    # label is the bare text.
+    var off: usize = best_start;
+    var len: usize = best_len;
+    if (len >= 2 && name[off] == '"' && name[off + len - 1] == '"') {
+        off = off + 1;
+        len = len - 2;
+    }
+
+    val r: Result[intern.StrId, str] = intern.intern_bytes(?s.interner, (name::usize + off)::str, len);
+    if (is_err[intern.StrId, str](r)) { ret linkage; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+fun push_test(s: *sess.Session, tests: **Test, test_len: *u32, test_cap: *u32, t: Test) Result[bool, str] {
+    if (@test_len == @test_cap) {
+        var new_cap: u32 = @test_cap * 2;
+        if (new_cap < 8) { new_cap = 8; }
+        if (@tests == nil) {
+            val r: Result[*Test, str] = allocate[Test](s.alloc, new_cap::usize);
+            if (is_err[*Test, str](r)) { ret err[bool, str](unwrap_err[*Test, str](r)); }
+            @tests = unwrap_ok[*Test, str](r);
+        }
+        or {
+            val r: Result[*Test, str] = reallocate[Test](s.alloc, @tests, (@test_cap)::usize, new_cap::usize);
+            if (is_err[*Test, str](r)) { ret err[bool, str](unwrap_err[*Test, str](r)); }
+            @tests = unwrap_ok[*Test, str](r);
+        }
+        @test_cap = new_cap;
+    }
+    (@tests)[@test_len] = t;
+    @test_len = @test_len + 1;
+    ret ok[bool, str](true);
+}
+
+# build_runner: emit the inline-asm write helper, then `main`.
+fun build_runner(s: *sess.Session, m: *ir.Module, tests: *Test, test_len: u32) Result[bool, str] {
+    var c: Ctx;
+    c.s = s;
+    c.m = m;
+    c.b = builder.init(m);
+
+    val r32: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 32);
+    if (is_err[ir_type.IrTypeId, str](r32)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](r32)); }
+    c.i32 = unwrap_ok[ir_type.IrTypeId, str](r32);
+    val r64: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (is_err[ir_type.IrTypeId, str](r64)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](r64)); }
+    c.i64 = unwrap_ok[ir_type.IrTypeId, str](r64);
+    val r8: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (is_err[ir_type.IrTypeId, str](r8)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](r8)); }
+    c.i8 = unwrap_ok[ir_type.IrTypeId, str](r8);
+    val rp: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (is_err[ir_type.IrTypeId, str](rp)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](rp)); }
+    c.ptr = unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rv: Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (is_err[ir_type.IrTypeId, str](rv)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](rv)); }
+    c.void = unwrap_ok[ir_type.IrTypeId, str](rv);
+
+    val wr: Result[bool, str] = emit_write_helper(?c);
+    if (is_err[bool, str](wr)) { ret wr; }
+    val sr: Result[bool, str] = emit_streq_helper(?c);
+    if (is_err[bool, str](sr)) { ret sr; }
+    val cor: Result[bool, str] = emit_contains_helper(?c);
+    if (is_err[bool, str](cor)) { ret cor; }
+
+    ret emit_main(?c, tests, test_len);
+}
+
+# append_function: grow the function array if needed and append a Function with
+# the given linkage, returning its index. mirrors decl.append_function against a
+# bare module.
+fun append_function(c: *Ctx, name: intern.StrId, sig: ir_type.IrTypeId, flags: u32) Result[u32, str] {
+    val m: *ir.Module = c.m;
+    if (m.function_len == m.function_cap) {
+        val new_cap: u32 = m.function_cap * 2;
+        val r: Result[*ir.Function, str] = reallocate[ir.Function](m.alloc, m.functions, m.function_cap::usize, new_cap::usize);
+        if (is_err[*ir.Function, str](r)) { ret err[u32, str](unwrap_err[*ir.Function, str](r)); }
+        m.functions    = unwrap_ok[*ir.Function, str](r);
+        m.function_cap = new_cap;
+    }
+    val idx: u32 = m.function_len;
+    var f: ir.Function;
+    f.name        = name;
+    f.sig         = sig;
+    f.params      = nil;
+    f.param_count = 0;
+    f.blocks      = nil;
+    f.block_count = 0;
+    f.block_cap   = 0;
+    f.instrs      = nil;
+    f.instr_len   = 0;
+    f.instr_cap   = 0;
+    f.flags       = flags;
+    f.asm_blocks  = map.init[irid.InstructionId, ir.IrAsm](m.alloc, maphash.hash_u32, maphash.eq_u32);
+    m.functions[idx] = f;
+    m.function_len   = m.function_len + 1;
+    ret ok[u32, str](idx);
+}
+
+# begin_fn: append a defined function and position the builder on a fresh entry
+# block, spilling each parameter into an alloca so the body reads it as an
+# lvalue. the param slot pointers are written into `slots[0..param_count)`.
+fun begin_fn(c: *Ctx, name: intern.StrId, ret_ty: ir_type.IrTypeId,
+             param_tys: *ir_type.IrTypeId, param_count: u32, flags: u32,
+             slots: *value.Value) Result[u32, str] {
+    val sig_r: Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?c.m.types, ret_ty, param_tys, param_count, false);
+    if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[u32, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
+    val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
+
+    val idx_r: Result[u32, str] = append_function(c, name, sig, flags);
+    if (is_err[u32, str](idx_r)) { ret idx_r; }
+    val idx: u32 = unwrap_ok[u32, str](idx_r);
+
+    builder.set_function(?c.b, ?c.m.functions[idx]);
+    val eb: Result[irid.BlockId, str] = builder.new_block(?c.b);
+    if (is_err[irid.BlockId, str](eb)) { ret err[u32, str](unwrap_err[irid.BlockId, str](eb)); }
+    builder.set_block(?c.b, unwrap_ok[irid.BlockId, str](eb));
+
+    if (param_count > 0) {
+        val pr: Result[*value.Value, str] = allocate[value.Value](c.s.alloc, param_count::usize);
+        if (is_err[*value.Value, str](pr)) { ret err[u32, str](unwrap_err[*value.Value, str](pr)); }
+        c.m.functions[idx].params      = unwrap_ok[*value.Value, str](pr);
+        c.m.functions[idx].param_count = param_count;
+        var pi: u32 = 0;
+        for (pi < param_count) {
+            val pv: value.Value = value.param_value(pi, param_tys[pi]);
+            c.m.functions[idx].params[pi] = pv;
+            val one: value.Value = value.const_int(1, c.i64);
+            val slot_r: Result[value.Value, str] = builder.emit_alloca(?c.b, param_tys[pi], one);
+            if (is_err[value.Value, str](slot_r)) { ret err[u32, str](unwrap_err[value.Value, str](slot_r)); }
+            val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+            val sr: Result[bool, str] = builder.emit_store(?c.b, pv, slot);
+            if (is_err[bool, str](sr)) { ret err[u32, str](unwrap_err[bool, str](sr)); }
+            slots[pi] = slot;
+            pi = pi + 1;
+        }
+    }
+    ret ok[u32, str](idx);
+}
+
+# extern_fn: declare a signature-only `i32()` extern under `linkage` and return a
+# VAL_FN reference to it, reusing an existing declaration when present.
+fun extern_fn(c: *Ctx, linkage: intern.StrId) Result[value.Value, str] {
+    var fi: u32 = 0;
+    for (fi < c.m.function_len) {
+        if (c.m.functions[fi].name == linkage) {
+            ret ok[value.Value, str](value.fn_value(fi, c.m.functions[fi].sig));
+        }
+        fi = fi + 1;
+    }
+    val sig_r: Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?c.m.types, c.i32, nil, 0, false);
+    if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
+    val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
+    val idx_r: Result[u32, str] = append_function(c, linkage, sig, ir.FN_FLAG_EXTERN);
+    if (is_err[u32, str](idx_r)) { ret err[value.Value, str](unwrap_err[u32, str](idx_r)); }
+    ret ok[value.Value, str](value.fn_value(unwrap_ok[u32, str](idx_r), sig));
+}
+
+# rodata_cstr: materialise an interned byte string (label or fixed message) as a
+# private `.rodata` global, null terminator included, and return both a `*u8`
+# pointer to it and its byte length (excluding the terminator) through `len_out`.
+fun rodata_cstr(c: *Ctx, sid: intern.StrId, len_out: *usize) Result[value.Value, str] {
+    val o: Option[str] = intern.lookup(?c.s.interner, sid);
+    if (is_none[str](o)) { ret err[value.Value, str]("testrunner: string not interned"); }
+    val bytes: str = unwrap[str](o);
+    @len_out = str_len(bytes);
+
+    val m: *ir.Module = c.m;
+    if (m.global_len == m.global_cap) {
+        var new_cap: u32 = m.global_cap * 2;
+        if (new_cap < 8) { new_cap = 8; }
+        val r: Result[*ir.Global, str] = reallocate[ir.Global](m.alloc, m.globals, m.global_cap::usize, new_cap::usize);
+        if (is_err[*ir.Global, str](r)) { ret err[value.Value, str](unwrap_err[*ir.Global, str](r)); }
+        m.globals    = unwrap_ok[*ir.Global, str](r);
+        m.global_cap = new_cap;
+    }
+    val idx: u32 = m.global_len;
+    val name_r: Result[intern.StrId, str] = anon_name(c, idx);
+    if (is_err[intern.StrId, str](name_r)) { ret err[value.Value, str](unwrap_err[intern.StrId, str](name_r)); }
+
+    val blob: value.Value = value.const_bytes(bytes::*u8, (str_len(bytes) + 1::usize)::u32, c.ptr);
+    var g: ir.Global;
+    g.name      = unwrap_ok[intern.StrId, str](name_r);
+    g.ty        = c.ptr;
+    g.init      = blob;
+    g.is_mut    = false;
+    g.is_pub    = false;
+    g.is_extern = false;
+    g.is_local  = true;
+    m.globals[idx] = g;
+    m.global_len   = m.global_len + 1;
+    ret ok[value.Value, str](value.global_value(idx, c.ptr));
+}
+
+# anon_name: a unique object-private global name for the runner's string blobs.
+fun anon_name(c: *Ctx, idx: u32) Result[intern.StrId, str] {
+    var buf: [32]u8;
+    var k: usize = 0;
+    val prefix: str = ".Ltest";
+    var pi: usize = 0;
+    for (pi < str_len(prefix)) { buf[k] = prefix[pi]::u8; k = k + 1; pi = pi + 1; }
+    if (idx == 0) { buf[k] = '0'; k = k + 1; }
+    or {
+        var tmp: [16]u8;
+        var t: usize = 0;
+        var v: u32 = idx;
+        for (v > 0) { tmp[t] = (v % 10)::u8 + '0'; v = v / 10; t = t + 1; }
+        var ri: usize = 0;
+        for (ri < t) { buf[k] = tmp[t - 1 - ri]; k = k + 1; ri = ri + 1; }
+    }
+    ret intern.intern_bytes(?c.s.interner, (?buf[0])::str, k);
+}
+
+# emit_write_helper: a `void __mach_test_write(buf: *u8, len: i64)` whose body is
+# a single inline-asm `write(1, buf, len)` syscall. all the runner's output flows
+# through here so no other function touches the OS.
+fun emit_write_helper(c: *Ctx) Result[bool, str] {
+    val nm_r: Result[intern.StrId, str] = intern.intern(?c.s.interner, "__mach_test_write");
+    if (is_err[intern.StrId, str](nm_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](nm_r)); }
+
+    var ptys: [2]ir_type.IrTypeId;
+    ptys[0] = c.ptr;
+    ptys[1] = c.i64;
+    var slots: [2]value.Value;
+    val idx_r: Result[u32, str] = begin_fn(c, unwrap_ok[intern.StrId, str](nm_r), c.void, ?ptys[0], 2, 0, ?slots[0]);
+    if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
+    c.write_fn = unwrap_ok[u32, str](idx_r);
+
+    val asm_r: Result[bool, str] = emit_asm_block(c,
+        "mov rax, 1\nmov rdi, 1\nmov rsi, {buf}\nmov rdx, {len}\nsyscall\n",
+        ?slots[0], 2);
+    if (is_err[bool, str](asm_r)) { ret err[bool, str](unwrap_err[bool, str](asm_r)); }
+
+    ret builder.emit_ret_void(?c.b);
+}
+
+# emit_asm_block: append an OP_ASM instruction with isa tag `x86_64` and the
+# given body, binding the `{name}` references in declaration order (`buf`, then
+# `len`) to the supplied param alloca slots.
+fun emit_asm_block(c: *Ctx, body: str, slots: *value.Value, slot_count: u32) Result[bool, str] {
+    val isa_r: Result[intern.StrId, str] = intern.intern(?c.s.interner, "x86_64");
+    if (is_err[intern.StrId, str](isa_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](isa_r)); }
+    val body_r: Result[intern.StrId, str] = intern.intern(?c.s.interner, body);
+    if (is_err[intern.StrId, str](body_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](body_r)); }
+
+    val em_r: Result[irid.InstructionId, str] = builder.emit_asm(?c.b, nil, 0);
+    if (is_err[irid.InstructionId, str](em_r)) { ret err[bool, str](unwrap_err[irid.InstructionId, str](em_r)); }
+    val iid: irid.InstructionId = unwrap_ok[irid.InstructionId, str](em_r);
+
+    var payload: ir.IrAsm;
+    payload.isa        = unwrap_ok[intern.StrId, str](isa_r);
+    payload.body       = unwrap_ok[intern.StrId, str](body_r);
+    payload.binds      = nil;
+    payload.bind_count = 0;
+    payload.bind_cap   = 0;
+
+    if (slot_count > 0) {
+        val br: Result[*ir.IrAsmBind, str] = allocate[ir.IrAsmBind](c.s.alloc, slot_count::usize);
+        if (is_err[*ir.IrAsmBind, str](br)) { ret err[bool, str](unwrap_err[*ir.IrAsmBind, str](br)); }
+        payload.binds    = unwrap_ok[*ir.IrAsmBind, str](br);
+        payload.bind_cap = slot_count;
+
+        var i: u32 = 0;
+        for (i < slot_count) {
+            val nm_r: Result[intern.StrId, str] = intern.intern(?c.s.interner, bind_name(i));
+            if (is_err[intern.StrId, str](nm_r)) {
+                deallocate[ir.IrAsmBind](c.s.alloc, payload.binds, slot_count::usize);
+                ret err[bool, str](unwrap_err[intern.StrId, str](nm_r));
+            }
+            payload.binds[i].name  = unwrap_ok[intern.StrId, str](nm_r);
+            payload.binds[i].instr = slots[i].data.instr;
+            payload.bind_count = payload.bind_count + 1;
+            i = i + 1;
+        }
+    }
+
+    var key: irid.InstructionId = iid;
+    val ins_r: Result[bool, str] = map.insert[irid.InstructionId, ir.IrAsm](?c.b.fn.asm_blocks, key, payload);
+    if (is_err[bool, str](ins_r)) {
+        if (payload.binds != nil) { deallocate[ir.IrAsmBind](c.s.alloc, payload.binds, slot_count::usize); }
+        ret err[bool, str](unwrap_err[bool, str](ins_r));
+    }
+    ret ok[bool, str](true);
+}
+
+# bind_name: the inline-asm `{name}` for the i-th bound slot (`buf`, `len`).
+fun bind_name(i: u32) str {
+    if (i == 0) { ret "buf"; }
+    ret "len";
+}
+
+# write_msg: emit a call to the write helper for a fixed message string.
+fun write_msg(c: *Ctx, msg: str) Result[bool, str] {
+    val sid_r: Result[intern.StrId, str] = intern.intern(?c.s.interner, msg);
+    if (is_err[intern.StrId, str](sid_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](sid_r)); }
+    var len: usize = 0;
+    val ptr_r: Result[value.Value, str] = rodata_cstr(c, unwrap_ok[intern.StrId, str](sid_r), ?len);
+    if (is_err[value.Value, str](ptr_r)) { ret err[bool, str](unwrap_err[value.Value, str](ptr_r)); }
+    ret call_write(c, unwrap_ok[value.Value, str](ptr_r), len);
+}
+
+# write_label: emit a call to the write helper for a collected test label.
+fun write_label(c: *Ctx, label: intern.StrId) Result[bool, str] {
+    var len: usize = 0;
+    val ptr_r: Result[value.Value, str] = rodata_cstr(c, label, ?len);
+    if (is_err[value.Value, str](ptr_r)) { ret err[bool, str](unwrap_err[value.Value, str](ptr_r)); }
+    ret call_write(c, unwrap_ok[value.Value, str](ptr_r), len);
+}
+
+# call_write: `__mach_test_write(ptr, len)`.
+fun call_write(c: *Ctx, ptr: value.Value, len: usize) Result[bool, str] {
+    var args: [2]value.Value;
+    args[0] = ptr;
+    args[1] = value.const_int(len::u64, c.i64);
+    val callee: value.Value = value.fn_value(c.write_fn, c.m.functions[c.write_fn].sig);
+    val cr: Result[value.Value, str] = builder.emit_call(?c.b, callee, ?args[0], 2, c.void);
+    if (is_err[value.Value, str](cr)) { ret err[bool, str](unwrap_err[value.Value, str](cr)); }
+    ret ok[bool, str](true);
+}
+
+# alloc_ptr: a fresh pointer-typed stack slot initialised to `init`.
+fun alloc_ptr(c: *Ctx, init: value.Value) Result[value.Value, str] {
+    val one: value.Value = value.const_int(1, c.i64);
+    val slot_r: Result[value.Value, str] = builder.emit_alloca(?c.b, c.ptr, one);
+    if (is_err[value.Value, str](slot_r)) { ret slot_r; }
+    val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+    val sr: Result[bool, str] = builder.emit_store(?c.b, init, slot);
+    if (is_err[bool, str](sr)) { ret err[value.Value, str](unwrap_err[bool, str](sr)); }
+    ret ok[value.Value, str](slot);
+}
+
+# byte_at: load the byte at `base[index]` as an i8 (index is an i64 value).
+fun byte_at(c: *Ctx, base: value.Value, index: value.Value) Result[value.Value, str] {
+    var idx: [1]value.Value;
+    idx[0] = index;
+    val gep_r: Result[value.Value, str] = builder.emit_gep(?c.b, base, c.i8, ?idx[0], 1);
+    if (is_err[value.Value, str](gep_r)) { ret gep_r; }
+    ret builder.emit_load(?c.b, unwrap_ok[value.Value, str](gep_r), c.i8);
+}
+
+# new_block: a fresh block id in the current function.
+fun mkblock(c: *Ctx) Result[irid.BlockId, str] {
+    ret builder.new_block(?c.b);
+}
+
+# emit_streq_helper: `i8 __mach_test_streq(a: *u8, b: *u8)` — 1 when the two
+# null-terminated strings are byte-equal, 0 otherwise. used by argv scanning.
+fun emit_streq_helper(c: *Ctx) Result[bool, str] {
+    val nm_r: Result[intern.StrId, str] = intern.intern(?c.s.interner, "__mach_test_streq");
+    if (is_err[intern.StrId, str](nm_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](nm_r)); }
+
+    var ptys: [2]ir_type.IrTypeId;
+    ptys[0] = c.ptr;
+    ptys[1] = c.ptr;
+    var slots: [2]value.Value;
+    val idx_r: Result[u32, str] = begin_fn(c, unwrap_ok[intern.StrId, str](nm_r), c.i8, ?ptys[0], 2, 0, ?slots[0]);
+    if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
+    c.streq_fn = unwrap_ok[u32, str](idx_r);
+
+    # i counter slot; loop while a[i]!=0 && b[i]!=0 && a[i]==b[i]; on exit the
+    # strings are equal iff a[i]==b[i] (both terminators reached together).
+    val izero: value.Value = value.const_int(0, c.i64);
+    val islot_r: Result[value.Value, str] = alloc_i64_slot(c, izero);
+    if (is_err[value.Value, str](islot_r)) { ret err[bool, str](unwrap_err[value.Value, str](islot_r)); }
+    val islot: value.Value = unwrap_ok[value.Value, str](islot_r);
+
+    val hdr_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](hdr_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](hdr_r)); }
+    val hdr: irid.BlockId = unwrap_ok[irid.BlockId, str](hdr_r);
+    val body_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](body_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](body_r)); }
+    val body: irid.BlockId = unwrap_ok[irid.BlockId, str](body_r);
+    val exit_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](exit_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](exit_r)); }
+    val exit_b: irid.BlockId = unwrap_ok[irid.BlockId, str](exit_r);
+
+    val e0: Result[bool, str] = builder.emit_br(?c.b, hdr);
+    if (is_err[bool, str](e0)) { ret e0; }
+
+    # header: load a[i], b[i]; continue iff both non-zero and equal.
+    builder.set_block(?c.b, hdr);
+    val abyte_r: Result[value.Value, str] = byte_at(c, ld(c, slots[0]), ld_i64(c, islot));
+    if (is_err[value.Value, str](abyte_r)) { ret err[bool, str](unwrap_err[value.Value, str](abyte_r)); }
+    val abyte: value.Value = unwrap_ok[value.Value, str](abyte_r);
+    val bbyte_r: Result[value.Value, str] = byte_at(c, ld(c, slots[1]), ld_i64(c, islot));
+    if (is_err[value.Value, str](bbyte_r)) { ret err[bool, str](unwrap_err[value.Value, str](bbyte_r)); }
+    val bbyte: value.Value = unwrap_ok[value.Value, str](bbyte_r);
+
+    val zero8: value.Value = value.const_int(0, c.i8);
+    val a_nz_r: Result[value.Value, str] = builder.emit_cmp_ne(?c.b, abyte, zero8);
+    if (is_err[value.Value, str](a_nz_r)) { ret err[bool, str](unwrap_err[value.Value, str](a_nz_r)); }
+    val eq_r: Result[value.Value, str] = builder.emit_cmp_eq(?c.b, abyte, bbyte);
+    if (is_err[value.Value, str](eq_r)) { ret err[bool, str](unwrap_err[value.Value, str](eq_r)); }
+    val cont_r: Result[value.Value, str] = builder.emit_and(?c.b, unwrap_ok[value.Value, str](a_nz_r), unwrap_ok[value.Value, str](eq_r));
+    if (is_err[value.Value, str](cont_r)) { ret err[bool, str](unwrap_err[value.Value, str](cont_r)); }
+    val cbr0: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](cont_r), body, exit_b);
+    if (is_err[bool, str](cbr0)) { ret cbr0; }
+
+    # body: i = i + 1; back to header.
+    builder.set_block(?c.b, body);
+    val inc_r: Result[value.Value, str] = builder.emit_add(?c.b, ld_i64(c, islot), value.const_int(1, c.i64));
+    if (is_err[value.Value, str](inc_r)) { ret err[bool, str](unwrap_err[value.Value, str](inc_r)); }
+    val st_r: Result[bool, str] = builder.emit_store(?c.b, unwrap_ok[value.Value, str](inc_r), islot);
+    if (is_err[bool, str](st_r)) { ret st_r; }
+    val bbr: Result[bool, str] = builder.emit_br(?c.b, hdr);
+    if (is_err[bool, str](bbr)) { ret bbr; }
+
+    # exit: equal iff a[i]==b[i] (both at terminator).
+    builder.set_block(?c.b, exit_b);
+    val fa_r: Result[value.Value, str] = byte_at(c, ld(c, slots[0]), ld_i64(c, islot));
+    if (is_err[value.Value, str](fa_r)) { ret err[bool, str](unwrap_err[value.Value, str](fa_r)); }
+    val fb_r: Result[value.Value, str] = byte_at(c, ld(c, slots[1]), ld_i64(c, islot));
+    if (is_err[value.Value, str](fb_r)) { ret err[bool, str](unwrap_err[value.Value, str](fb_r)); }
+    val feq_r: Result[value.Value, str] = builder.emit_cmp_eq(?c.b, unwrap_ok[value.Value, str](fa_r), unwrap_ok[value.Value, str](fb_r));
+    if (is_err[value.Value, str](feq_r)) { ret err[bool, str](unwrap_err[value.Value, str](feq_r)); }
+    val ret_r: Result[value.Value, str] = builder.emit_zext(?c.b, unwrap_ok[value.Value, str](feq_r), c.i8);
+    if (is_err[value.Value, str](ret_r)) { ret err[bool, str](unwrap_err[value.Value, str](ret_r)); }
+    ret builder.emit_ret(?c.b, unwrap_ok[value.Value, str](ret_r));
+}
+
+# emit_contains_helper: `i8 __mach_test_contains(hay: *u8, needle: *u8)` — 1 when
+# `needle` occurs as a contiguous substring of `hay`, or `needle` is empty; 0
+# otherwise. used for `--filter`. implemented as the naive O(n*m) scan, which is
+# ample for short test labels.
+fun emit_contains_helper(c: *Ctx) Result[bool, str] {
+    val nm_r: Result[intern.StrId, str] = intern.intern(?c.s.interner, "__mach_test_contains");
+    if (is_err[intern.StrId, str](nm_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](nm_r)); }
+
+    var ptys: [2]ir_type.IrTypeId;
+    ptys[0] = c.ptr;
+    ptys[1] = c.ptr;
+    var slots: [2]value.Value;
+    val idx_r: Result[u32, str] = begin_fn(c, unwrap_ok[intern.StrId, str](nm_r), c.i8, ?ptys[0], 2, 0, ?slots[0]);
+    if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
+    c.contains_fn = unwrap_ok[u32, str](idx_r);
+
+    val one8:  value.Value = value.const_int(1, c.i8);
+    val zero8: value.Value = value.const_int(0, c.i8);
+
+    # the i / j cursor slots are allocated in the entry block (a function's
+    # allocas belong before any branch); they back the outer / inner loops below.
+    val islot_r: Result[value.Value, str] = alloc_i64_slot(c, value.const_int(0, c.i64));
+    if (is_err[value.Value, str](islot_r)) { ret err[bool, str](unwrap_err[value.Value, str](islot_r)); }
+    val islot: value.Value = unwrap_ok[value.Value, str](islot_r);
+    val jslot_r: Result[value.Value, str] = alloc_i64_slot(c, value.const_int(0, c.i64));
+    if (is_err[value.Value, str](jslot_r)) { ret err[bool, str](unwrap_err[value.Value, str](jslot_r)); }
+    val jslot: value.Value = unwrap_ok[value.Value, str](jslot_r);
+
+    # empty needle (needle[0] == 0) matches: return 1 immediately.
+    val n0_r: Result[value.Value, str] = byte_at(c, ld(c, slots[1]), value.const_int(0, c.i64));
+    if (is_err[value.Value, str](n0_r)) { ret err[bool, str](unwrap_err[value.Value, str](n0_r)); }
+    val nempty_r: Result[value.Value, str] = builder.emit_cmp_eq(?c.b, unwrap_ok[value.Value, str](n0_r), zero8);
+    if (is_err[value.Value, str](nempty_r)) { ret err[bool, str](unwrap_err[value.Value, str](nempty_r)); }
+
+    val empty_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](empty_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](empty_b_r)); }
+    val empty_b: irid.BlockId = unwrap_ok[irid.BlockId, str](empty_b_r);
+    val outer_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](outer_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](outer_r)); }
+    val outer: irid.BlockId = unwrap_ok[irid.BlockId, str](outer_r);
+    val cbr_e: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](nempty_r), empty_b, outer);
+    if (is_err[bool, str](cbr_e)) { ret cbr_e; }
+
+    builder.set_block(?c.b, empty_b);
+    val re: Result[bool, str] = builder.emit_ret(?c.b, one8);
+    if (is_err[bool, str](re)) { ret re; }
+
+    # outer loop over hay start positions i (slot). inner loop matches needle[j]
+    # against hay[i+j]; a needle terminator reached means a full match.
+    val outer_body_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](outer_body_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](outer_body_r)); }
+    val outer_body: irid.BlockId = unwrap_ok[irid.BlockId, str](outer_body_r);
+    val inner_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](inner_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](inner_r)); }
+    val inner: irid.BlockId = unwrap_ok[irid.BlockId, str](inner_r);
+    val inner_adv_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](inner_adv_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](inner_adv_r)); }
+    val inner_adv: irid.BlockId = unwrap_ok[irid.BlockId, str](inner_adv_r);
+    val match_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](match_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](match_b_r)); }
+    val match_b: irid.BlockId = unwrap_ok[irid.BlockId, str](match_b_r);
+    val outer_adv_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](outer_adv_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](outer_adv_r)); }
+    val outer_adv: irid.BlockId = unwrap_ok[irid.BlockId, str](outer_adv_r);
+    val none_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](none_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](none_b_r)); }
+    val none_b: irid.BlockId = unwrap_ok[irid.BlockId, str](none_b_r);
+
+    builder.set_block(?c.b, outer);
+    # outer header: stop (no match) when hay[i] == 0.
+    val hi_r: Result[value.Value, str] = byte_at(c, ld(c, slots[0]), ld_i64(c, islot));
+    if (is_err[value.Value, str](hi_r)) { ret err[bool, str](unwrap_err[value.Value, str](hi_r)); }
+    val hay_nz_r: Result[value.Value, str] = builder.emit_cmp_ne(?c.b, unwrap_ok[value.Value, str](hi_r), zero8);
+    if (is_err[value.Value, str](hay_nz_r)) { ret err[bool, str](unwrap_err[value.Value, str](hay_nz_r)); }
+    val ocbr: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](hay_nz_r), outer_body, none_b);
+    if (is_err[bool, str](ocbr)) { ret ocbr; }
+
+    builder.set_block(?c.b, outer_body);
+    val jreset: Result[bool, str] = builder.emit_store(?c.b, value.const_int(0, c.i64), jslot);
+    if (is_err[bool, str](jreset)) { ret jreset; }
+    val ibr: Result[bool, str] = builder.emit_br(?c.b, inner);
+    if (is_err[bool, str](ibr)) { ret ibr; }
+
+    builder.set_block(?c.b, inner);
+    # inner header: needle[j]==0 => full match. else hay[i+j]==needle[j] => advance.
+    val nj_r: Result[value.Value, str] = byte_at(c, ld(c, slots[1]), ld_i64(c, jslot));
+    if (is_err[value.Value, str](nj_r)) { ret err[bool, str](unwrap_err[value.Value, str](nj_r)); }
+    val nj: value.Value = unwrap_ok[value.Value, str](nj_r);
+    val nj_zero_r: Result[value.Value, str] = builder.emit_cmp_eq(?c.b, nj, zero8);
+    if (is_err[value.Value, str](nj_zero_r)) { ret err[bool, str](unwrap_err[value.Value, str](nj_zero_r)); }
+    val cbr_m: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](nj_zero_r), match_b, inner_adv);
+    if (is_err[bool, str](cbr_m)) { ret cbr_m; }
+
+    builder.set_block(?c.b, inner_adv);
+    # compare hay[i+j] to needle[j]; on mismatch advance the outer index.
+    val ij_r: Result[value.Value, str] = builder.emit_add(?c.b, ld_i64(c, islot), ld_i64(c, jslot));
+    if (is_err[value.Value, str](ij_r)) { ret err[bool, str](unwrap_err[value.Value, str](ij_r)); }
+    val hij_r: Result[value.Value, str] = byte_at(c, ld(c, slots[0]), unwrap_ok[value.Value, str](ij_r));
+    if (is_err[value.Value, str](hij_r)) { ret err[bool, str](unwrap_err[value.Value, str](hij_r)); }
+    val same_r: Result[value.Value, str] = builder.emit_cmp_eq(?c.b, unwrap_ok[value.Value, str](hij_r), nj);
+    if (is_err[value.Value, str](same_r)) { ret err[bool, str](unwrap_err[value.Value, str](same_r)); }
+    val jadv_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](jadv_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](jadv_r)); }
+    val jadv: irid.BlockId = unwrap_ok[irid.BlockId, str](jadv_r);
+    val cbr_s: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](same_r), jadv, outer_adv);
+    if (is_err[bool, str](cbr_s)) { ret cbr_s; }
+
+    builder.set_block(?c.b, jadv);
+    val jinc_r: Result[value.Value, str] = builder.emit_add(?c.b, ld_i64(c, jslot), value.const_int(1, c.i64));
+    if (is_err[value.Value, str](jinc_r)) { ret err[bool, str](unwrap_err[value.Value, str](jinc_r)); }
+    val jst: Result[bool, str] = builder.emit_store(?c.b, unwrap_ok[value.Value, str](jinc_r), jslot);
+    if (is_err[bool, str](jst)) { ret jst; }
+    val jloop: Result[bool, str] = builder.emit_br(?c.b, inner);
+    if (is_err[bool, str](jloop)) { ret jloop; }
+
+    builder.set_block(?c.b, outer_adv);
+    val iinc_r: Result[value.Value, str] = builder.emit_add(?c.b, ld_i64(c, islot), value.const_int(1, c.i64));
+    if (is_err[value.Value, str](iinc_r)) { ret err[bool, str](unwrap_err[value.Value, str](iinc_r)); }
+    val ist: Result[bool, str] = builder.emit_store(?c.b, unwrap_ok[value.Value, str](iinc_r), islot);
+    if (is_err[bool, str](ist)) { ret ist; }
+    val iloop: Result[bool, str] = builder.emit_br(?c.b, outer);
+    if (is_err[bool, str](iloop)) { ret iloop; }
+
+    builder.set_block(?c.b, match_b);
+    val rm: Result[bool, str] = builder.emit_ret(?c.b, one8);
+    if (is_err[bool, str](rm)) { ret rm; }
+
+    builder.set_block(?c.b, none_b);
+    ret builder.emit_ret(?c.b, zero8);
+}
+
+# alloc_i64_slot: a fresh i64 stack slot initialised to `init`.
+fun alloc_i64_slot(c: *Ctx, init: value.Value) Result[value.Value, str] {
+    val one: value.Value = value.const_int(1, c.i64);
+    val slot_r: Result[value.Value, str] = builder.emit_alloca(?c.b, c.i64, one);
+    if (is_err[value.Value, str](slot_r)) { ret slot_r; }
+    val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+    val sr: Result[bool, str] = builder.emit_store(?c.b, init, slot);
+    if (is_err[bool, str](sr)) { ret err[value.Value, str](unwrap_err[bool, str](sr)); }
+    ret ok[value.Value, str](slot);
+}
+
+# ld / ld_i64: convenience loads that abort the synthesis on error by returning a
+# null value the subsequent emit rejects; used only where a slot is known-valid
+# (a parameter or freshly-allocated local), so the load cannot actually fail.
+fun ld(c: *Ctx, slot: value.Value) value.Value {
+    val r: Result[value.Value, str] = builder.emit_load(?c.b, slot, c.ptr);
+    if (is_err[value.Value, str](r)) { ret value.const_null(c.ptr); }
+    ret unwrap_ok[value.Value, str](r);
+}
+fun ld_i64(c: *Ctx, slot: value.Value) value.Value {
+    val r: Result[value.Value, str] = builder.emit_load(?c.b, slot, c.i64);
+    if (is_err[value.Value, str](r)) { ret value.const_int(0, c.i64); }
+    ret unwrap_ok[value.Value, str](r);
+}
+
+# emit_main: the `main(argc: i64, argv: **u8) i32` runner. it reads `--list` and
+# `--filter <pattern>` from argv, then walks every collected test in
+# source-collection order. in list mode it prints each (selected) label and
+# exits 0; otherwise it runs each selected test, printing `PASS <label>` /
+# `FAIL <label>`, accumulating the failure count, and returns `1` when any test
+# failed, `0` otherwise.
+fun emit_main(c: *Ctx, tests: *Test, test_len: u32) Result[bool, str] {
+    # pre-declare every test as an extern and capture its VAL_FN reference BEFORE
+    # building `main`. `extern_fn` may grow `m.functions` (reallocating it), which
+    # would dangle the builder's current-function pointer if done mid-body; doing
+    # it up front keeps `main`'s emission stable.
+    var callees: *value.Value = nil;
+    if (test_len > 0) {
+        val car: Result[*value.Value, str] = allocate[value.Value](c.s.alloc, test_len::usize);
+        if (is_err[*value.Value, str](car)) { ret err[bool, str](unwrap_err[*value.Value, str](car)); }
+        callees = unwrap_ok[*value.Value, str](car);
+        var di: u32 = 0;
+        for (di < test_len) {
+            val cr: Result[value.Value, str] = extern_fn(c, tests[di].linkage);
+            if (is_err[value.Value, str](cr)) {
+                deallocate[value.Value](c.s.alloc, callees, test_len::usize);
+                ret err[bool, str](unwrap_err[value.Value, str](cr));
+            }
+            callees[di] = unwrap_ok[value.Value, str](cr);
+            di = di + 1;
+        }
+    }
+
+    val nm_r: Result[intern.StrId, str] = intern.intern(?c.s.interner, "main");
+    if (is_err[intern.StrId, str](nm_r)) {
+        if (callees != nil) { deallocate[value.Value](c.s.alloc, callees, test_len::usize); }
+        ret err[bool, str](unwrap_err[intern.StrId, str](nm_r));
+    }
+
+    var ptys: [2]ir_type.IrTypeId;
+    ptys[0] = c.i64;
+    ptys[1] = c.ptr;
+    var slots: [2]value.Value;
+    # `main` is exempt from mangling (the OS entry calls the literal `main`); the
+    # session's export registry is not consulted for a synthesized module, so the
+    # function is named "main" directly.
+    val idx_r: Result[u32, str] = begin_fn(c, unwrap_ok[intern.StrId, str](nm_r), c.i32, ?ptys[0], 2, ir.FN_FLAG_PUB, ?slots[0]);
+    if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
+
+    # `failed` counter in a stack slot, promoted to a register by mem2reg.
+    val zero32: value.Value = value.const_int(0, c.i32);
+    val one32:  value.Value = value.const_int(1, c.i32);
+    val fail_slot_r: Result[value.Value, str] = alloc_i32(c, zero32);
+    if (is_err[value.Value, str](fail_slot_r)) { ret err[bool, str](unwrap_err[value.Value, str](fail_slot_r)); }
+    val fail_slot: value.Value = unwrap_ok[value.Value, str](fail_slot_r);
+
+    # scan argv for `--list` (a flag) and `--filter <pattern>` (a value): `list`
+    # is a bool slot, `filter` a `*u8` slot (nil = no filter).
+    val list_slot_r: Result[value.Value, str] = alloc_i32(c, zero32);
+    if (is_err[value.Value, str](list_slot_r)) { ret err[bool, str](unwrap_err[value.Value, str](list_slot_r)); }
+    val list_slot: value.Value = unwrap_ok[value.Value, str](list_slot_r);
+    val filter_slot_r: Result[value.Value, str] = alloc_ptr(c, value.const_null(c.ptr));
+    if (is_err[value.Value, str](filter_slot_r)) { ret err[bool, str](unwrap_err[value.Value, str](filter_slot_r)); }
+    val filter_slot: value.Value = unwrap_ok[value.Value, str](filter_slot_r);
+
+    val scan_r: Result[bool, str] = emit_argv_scan(c, slots[0], slots[1], list_slot, filter_slot);
+    if (is_err[bool, str](scan_r)) {
+        deallocate[value.Value](c.s.alloc, callees, test_len::usize);
+        ret scan_r;
+    }
+
+    var ti: u32 = 0;
+    for (ti < test_len) {
+        val one_r: Result[bool, str] = emit_one_test(c, tests[ti], callees[ti], list_slot, filter_slot, fail_slot);
+        if (is_err[bool, str](one_r)) {
+            deallocate[value.Value](c.s.alloc, callees, test_len::usize);
+            ret one_r;
+        }
+        ti = ti + 1;
+    }
+
+    if (callees != nil) { deallocate[value.Value](c.s.alloc, callees, test_len::usize); }
+
+    # return 1 when any test failed, else 0.
+    val final_r: Result[value.Value, str] = builder.emit_load(?c.b, fail_slot, c.i32);
+    if (is_err[value.Value, str](final_r)) { ret err[bool, str](unwrap_err[value.Value, str](final_r)); }
+    val failed: value.Value = unwrap_ok[value.Value, str](final_r);
+    val any_r: Result[value.Value, str] = builder.emit_cmp_ne(?c.b, failed, zero32);
+    if (is_err[value.Value, str](any_r)) { ret err[bool, str](unwrap_err[value.Value, str](any_r)); }
+    val code_r: Result[value.Value, str] = builder.emit_zext(?c.b, unwrap_ok[value.Value, str](any_r), c.i32);
+    if (is_err[value.Value, str](code_r)) { ret err[bool, str](unwrap_err[value.Value, str](code_r)); }
+    ret builder.emit_ret(?c.b, unwrap_ok[value.Value, str](code_r));
+}
+
+# alloc_i32: a fresh i32 stack slot initialised to `init`.
+fun alloc_i32(c: *Ctx, init: value.Value) Result[value.Value, str] {
+    val one: value.Value = value.const_int(1, c.i64);
+    val slot_r: Result[value.Value, str] = builder.emit_alloca(?c.b, c.i32, one);
+    if (is_err[value.Value, str](slot_r)) { ret slot_r; }
+    val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+    val sr: Result[bool, str] = builder.emit_store(?c.b, init, slot);
+    if (is_err[bool, str](sr)) { ret err[value.Value, str](unwrap_err[bool, str](sr)); }
+    ret ok[value.Value, str](slot);
+}
+
+# call_streq: `__mach_test_streq(a, b)` -> i8.
+fun call_streq(c: *Ctx, a: value.Value, b: value.Value) Result[value.Value, str] {
+    var args: [2]value.Value;
+    args[0] = a;
+    args[1] = b;
+    val callee: value.Value = value.fn_value(c.streq_fn, c.m.functions[c.streq_fn].sig);
+    ret builder.emit_call(?c.b, callee, ?args[0], 2, c.i8);
+}
+
+# call_contains: `__mach_test_contains(hay, needle)` -> i8.
+fun call_contains(c: *Ctx, hay: value.Value, needle: value.Value) Result[value.Value, str] {
+    var args: [2]value.Value;
+    args[0] = hay;
+    args[1] = needle;
+    val callee: value.Value = value.fn_value(c.contains_fn, c.m.functions[c.contains_fn].sig);
+    ret builder.emit_call(?c.b, callee, ?args[0], 2, c.i8);
+}
+
+# argv_at: load `argv[i]` (a `*u8`) from the argv slot, where `i` is an i64.
+fun argv_at(c: *Ctx, argv_slot: value.Value, i: value.Value) Result[value.Value, str] {
+    val base_r: Result[value.Value, str] = builder.emit_load(?c.b, argv_slot, c.ptr);
+    if (is_err[value.Value, str](base_r)) { ret base_r; }
+    var idx: [1]value.Value;
+    idx[0] = i;
+    val gep_r: Result[value.Value, str] = builder.emit_gep(?c.b, unwrap_ok[value.Value, str](base_r), c.ptr, ?idx[0], 1);
+    if (is_err[value.Value, str](gep_r)) { ret gep_r; }
+    ret builder.emit_load(?c.b, unwrap_ok[value.Value, str](gep_r), c.ptr);
+}
+
+# emit_argv_scan: walk argv[0..argc) once, setting `list_slot` to 1 when a
+# `--list` argument is present and `filter_slot` to the argument following the
+# first `--filter`. argc/argv are read from their parameter slots.
+fun emit_argv_scan(c: *Ctx, argc_slot: value.Value, argv_slot: value.Value,
+                   list_slot: value.Value, filter_slot: value.Value) Result[bool, str] {
+    val islot_r: Result[value.Value, str] = alloc_i64_slot(c, value.const_int(0, c.i64));
+    if (is_err[value.Value, str](islot_r)) { ret err[bool, str](unwrap_err[value.Value, str](islot_r)); }
+    val islot: value.Value = unwrap_ok[value.Value, str](islot_r);
+
+    val hdr_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](hdr_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](hdr_r)); }
+    val hdr: irid.BlockId = unwrap_ok[irid.BlockId, str](hdr_r);
+    val body_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](body_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](body_r)); }
+    val body: irid.BlockId = unwrap_ok[irid.BlockId, str](body_r);
+    val done_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](done_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](done_r)); }
+    val done: irid.BlockId = unwrap_ok[irid.BlockId, str](done_r);
+
+    val b0: Result[bool, str] = builder.emit_br(?c.b, hdr);
+    if (is_err[bool, str](b0)) { ret b0; }
+
+    builder.set_block(?c.b, hdr);
+    val argc_v_r: Result[value.Value, str] = builder.emit_load(?c.b, argc_slot, c.i64);
+    if (is_err[value.Value, str](argc_v_r)) { ret err[bool, str](unwrap_err[value.Value, str](argc_v_r)); }
+    val lt_r: Result[value.Value, str] = builder.emit_cmp_lt_s(?c.b, ld_i64(c, islot), unwrap_ok[value.Value, str](argc_v_r));
+    if (is_err[value.Value, str](lt_r)) { ret err[bool, str](unwrap_err[value.Value, str](lt_r)); }
+    val hcbr: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](lt_r), body, done);
+    if (is_err[bool, str](hcbr)) { ret hcbr; }
+
+    builder.set_block(?c.b, body);
+    val arg_r: Result[value.Value, str] = argv_at(c, argv_slot, ld_i64(c, islot));
+    if (is_err[value.Value, str](arg_r)) { ret err[bool, str](unwrap_err[value.Value, str](arg_r)); }
+    val arg: value.Value = unwrap_ok[value.Value, str](arg_r);
+
+    # `--list`: set the list flag.
+    val list_lit_r: Result[value.Value, str] = rodata_literal(c, "--list");
+    if (is_err[value.Value, str](list_lit_r)) { ret err[bool, str](unwrap_err[value.Value, str](list_lit_r)); }
+    val is_list_r: Result[value.Value, str] = call_streq(c, arg, unwrap_ok[value.Value, str](list_lit_r));
+    if (is_err[value.Value, str](is_list_r)) { ret err[bool, str](unwrap_err[value.Value, str](is_list_r)); }
+    val set_list_r: Result[bool, str] = store_if(c, unwrap_ok[value.Value, str](is_list_r), value.const_int(1, c.i32), list_slot, c.i32);
+    if (is_err[bool, str](set_list_r)) { ret set_list_r; }
+
+    # `--filter`: store argv[i+1] into the filter slot (best-effort: a trailing
+    # `--filter` with no value leaves the filter unset).
+    val filt_lit_r: Result[value.Value, str] = rodata_literal(c, "--filter");
+    if (is_err[value.Value, str](filt_lit_r)) { ret err[bool, str](unwrap_err[value.Value, str](filt_lit_r)); }
+    val is_filt_r: Result[value.Value, str] = call_streq(c, arg, unwrap_ok[value.Value, str](filt_lit_r));
+    if (is_err[value.Value, str](is_filt_r)) { ret err[bool, str](unwrap_err[value.Value, str](is_filt_r)); }
+
+    val set_filt_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](set_filt_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](set_filt_b_r)); }
+    val set_filt_b: irid.BlockId = unwrap_ok[irid.BlockId, str](set_filt_b_r);
+    val latch_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](latch_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](latch_r)); }
+    val latch: irid.BlockId = unwrap_ok[irid.BlockId, str](latch_r);
+    val fcbr: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](is_filt_r), set_filt_b, latch);
+    if (is_err[bool, str](fcbr)) { ret fcbr; }
+
+    builder.set_block(?c.b, set_filt_b);
+    val next_i_r: Result[value.Value, str] = builder.emit_add(?c.b, ld_i64(c, islot), value.const_int(1, c.i64));
+    if (is_err[value.Value, str](next_i_r)) { ret err[bool, str](unwrap_err[value.Value, str](next_i_r)); }
+    val argc_v2_r: Result[value.Value, str] = builder.emit_load(?c.b, argc_slot, c.i64);
+    if (is_err[value.Value, str](argc_v2_r)) { ret err[bool, str](unwrap_err[value.Value, str](argc_v2_r)); }
+    val has_next_r: Result[value.Value, str] = builder.emit_cmp_lt_s(?c.b, unwrap_ok[value.Value, str](next_i_r), unwrap_ok[value.Value, str](argc_v2_r));
+    if (is_err[value.Value, str](has_next_r)) { ret err[bool, str](unwrap_err[value.Value, str](has_next_r)); }
+    val store_v_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](store_v_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](store_v_b_r)); }
+    val store_v_b: irid.BlockId = unwrap_ok[irid.BlockId, str](store_v_b_r);
+    val scbr: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](has_next_r), store_v_b, latch);
+    if (is_err[bool, str](scbr)) { ret scbr; }
+
+    builder.set_block(?c.b, store_v_b);
+    val nv_r: Result[value.Value, str] = argv_at(c, argv_slot, unwrap_ok[value.Value, str](next_i_r));
+    if (is_err[value.Value, str](nv_r)) { ret err[bool, str](unwrap_err[value.Value, str](nv_r)); }
+    val fst: Result[bool, str] = builder.emit_store(?c.b, unwrap_ok[value.Value, str](nv_r), filter_slot);
+    if (is_err[bool, str](fst)) { ret fst; }
+    val svbr: Result[bool, str] = builder.emit_br(?c.b, latch);
+    if (is_err[bool, str](svbr)) { ret svbr; }
+
+    builder.set_block(?c.b, latch);
+    val iinc_r: Result[value.Value, str] = builder.emit_add(?c.b, ld_i64(c, islot), value.const_int(1, c.i64));
+    if (is_err[value.Value, str](iinc_r)) { ret err[bool, str](unwrap_err[value.Value, str](iinc_r)); }
+    val ist: Result[bool, str] = builder.emit_store(?c.b, unwrap_ok[value.Value, str](iinc_r), islot);
+    if (is_err[bool, str](ist)) { ret ist; }
+    val lbr: Result[bool, str] = builder.emit_br(?c.b, hdr);
+    if (is_err[bool, str](lbr)) { ret lbr; }
+
+    builder.set_block(?c.b, done);
+    ret ok[bool, str](true);
+}
+
+# store_if: store `v` into `slot` when the i8 condition `cond` is non-zero, via a
+# small diamond. `ty` is the stored value's type.
+fun store_if(c: *Ctx, cond: value.Value, v: value.Value, slot: value.Value, ty: ir_type.IrTypeId) Result[bool, str] {
+    val then_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](then_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](then_r)); }
+    val then_b: irid.BlockId = unwrap_ok[irid.BlockId, str](then_r);
+    val cont_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](cont_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](cont_r)); }
+    val cont_b: irid.BlockId = unwrap_ok[irid.BlockId, str](cont_r);
+    val cbr_r: Result[bool, str] = builder.emit_cbr(?c.b, cond, then_b, cont_b);
+    if (is_err[bool, str](cbr_r)) { ret cbr_r; }
+    builder.set_block(?c.b, then_b);
+    val st: Result[bool, str] = builder.emit_store(?c.b, v, slot);
+    if (is_err[bool, str](st)) { ret st; }
+    val br: Result[bool, str] = builder.emit_br(?c.b, cont_b);
+    if (is_err[bool, str](br)) { ret br; }
+    builder.set_block(?c.b, cont_b);
+    ret ok[bool, str](true);
+}
+
+# rodata_literal: materialise a fixed string and return a `*u8` value to it.
+fun rodata_literal(c: *Ctx, lit: str) Result[value.Value, str] {
+    val sid_r: Result[intern.StrId, str] = intern.intern(?c.s.interner, lit);
+    if (is_err[intern.StrId, str](sid_r)) { ret err[value.Value, str](unwrap_err[intern.StrId, str](sid_r)); }
+    var len: usize = 0;
+    ret rodata_cstr(c, unwrap_ok[intern.StrId, str](sid_r), ?len);
+}
+
+# emit_one_test: emit one test's selection + execution. the test is skipped when
+# a filter is set and the label does not contain it; otherwise, in list mode only
+# the label is printed, and in run mode the test is called and its `PASS`/`FAIL`
+# line emitted (bumping the failure counter on a non-zero return).
+fun emit_one_test(c: *Ctx, t: Test, callee: value.Value,
+                  list_slot: value.Value, filter_slot: value.Value, fail_slot: value.Value) Result[bool, str] {
+    var label_len: usize = 0;
+    val label_ptr_r: Result[value.Value, str] = rodata_cstr(c, t.label, ?label_len);
+    if (is_err[value.Value, str](label_ptr_r)) { ret err[bool, str](unwrap_err[value.Value, str](label_ptr_r)); }
+    val label_ptr: value.Value = unwrap_ok[value.Value, str](label_ptr_r);
+
+    val sel_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](sel_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](sel_b_r)); }
+    val sel_b: irid.BlockId = unwrap_ok[irid.BlockId, str](sel_b_r);
+    val skip_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](skip_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](skip_b_r)); }
+    val skip_b: irid.BlockId = unwrap_ok[irid.BlockId, str](skip_b_r);
+
+    # filter: select unconditionally when no filter is set, else when the label
+    # contains the filter pattern.
+    val filt_r: Result[value.Value, str] = builder.emit_load(?c.b, filter_slot, c.ptr);
+    if (is_err[value.Value, str](filt_r)) { ret err[bool, str](unwrap_err[value.Value, str](filt_r)); }
+    val filt: value.Value = unwrap_ok[value.Value, str](filt_r);
+    val no_filter_r: Result[value.Value, str] = builder.emit_cmp_eq(?c.b, filt, value.const_null(c.ptr));
+    if (is_err[value.Value, str](no_filter_r)) { ret err[bool, str](unwrap_err[value.Value, str](no_filter_r)); }
+
+    val check_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](check_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](check_b_r)); }
+    val check_b: irid.BlockId = unwrap_ok[irid.BlockId, str](check_b_r);
+    val cbr0: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](no_filter_r), sel_b, check_b);
+    if (is_err[bool, str](cbr0)) { ret cbr0; }
+
+    builder.set_block(?c.b, check_b);
+    val cont_r: Result[value.Value, str] = call_contains(c, label_ptr, filt);
+    if (is_err[value.Value, str](cont_r)) { ret err[bool, str](unwrap_err[value.Value, str](cont_r)); }
+    val match_r: Result[value.Value, str] = builder.emit_cmp_ne(?c.b, unwrap_ok[value.Value, str](cont_r), value.const_int(0, c.i8));
+    if (is_err[value.Value, str](match_r)) { ret err[bool, str](unwrap_err[value.Value, str](match_r)); }
+    val cbr1: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](match_r), sel_b, skip_b);
+    if (is_err[bool, str](cbr1)) { ret cbr1; }
+
+    # selected: branch on list mode.
+    builder.set_block(?c.b, sel_b);
+    val list_v_r: Result[value.Value, str] = builder.emit_load(?c.b, list_slot, c.i32);
+    if (is_err[value.Value, str](list_v_r)) { ret err[bool, str](unwrap_err[value.Value, str](list_v_r)); }
+    val is_list_r: Result[value.Value, str] = builder.emit_cmp_ne(?c.b, unwrap_ok[value.Value, str](list_v_r), value.const_int(0, c.i32));
+    if (is_err[value.Value, str](is_list_r)) { ret err[bool, str](unwrap_err[value.Value, str](is_list_r)); }
+    val list_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](list_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](list_b_r)); }
+    val list_b: irid.BlockId = unwrap_ok[irid.BlockId, str](list_b_r);
+    val run_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](run_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](run_b_r)); }
+    val run_b: irid.BlockId = unwrap_ok[irid.BlockId, str](run_b_r);
+    val cbr2: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](is_list_r), list_b, run_b);
+    if (is_err[bool, str](cbr2)) { ret cbr2; }
+
+    # list mode: print "<label>\n".
+    builder.set_block(?c.b, list_b);
+    val l1: Result[bool, str] = call_write(c, label_ptr, label_len);
+    if (is_err[bool, str](l1)) { ret l1; }
+    val l2: Result[bool, str] = write_msg(c, "\n");
+    if (is_err[bool, str](l2)) { ret l2; }
+    val lbr: Result[bool, str] = builder.emit_br(?c.b, skip_b);
+    if (is_err[bool, str](lbr)) { ret lbr; }
+
+    # run mode: call the test, then a pass/fail diamond.
+    builder.set_block(?c.b, run_b);
+    val rc_r: Result[value.Value, str] = builder.emit_call(?c.b, callee, nil, 0, c.i32);
+    if (is_err[value.Value, str](rc_r)) { ret err[bool, str](unwrap_err[value.Value, str](rc_r)); }
+    val passed_r: Result[value.Value, str] = builder.emit_cmp_eq(?c.b, unwrap_ok[value.Value, str](rc_r), value.const_int(0, c.i32));
+    if (is_err[value.Value, str](passed_r)) { ret err[bool, str](unwrap_err[value.Value, str](passed_r)); }
+    val pass_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](pass_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](pass_b_r)); }
+    val pass_b: irid.BlockId = unwrap_ok[irid.BlockId, str](pass_b_r);
+    val fail_b_r: Result[irid.BlockId, str] = mkblock(c);
+    if (is_err[irid.BlockId, str](fail_b_r)) { ret err[bool, str](unwrap_err[irid.BlockId, str](fail_b_r)); }
+    val fail_b: irid.BlockId = unwrap_ok[irid.BlockId, str](fail_b_r);
+    val cbr3: Result[bool, str] = builder.emit_cbr(?c.b, unwrap_ok[value.Value, str](passed_r), pass_b, fail_b);
+    if (is_err[bool, str](cbr3)) { ret cbr3; }
+
+    builder.set_block(?c.b, pass_b);
+    val p1: Result[bool, str] = write_msg(c, "PASS ");
+    if (is_err[bool, str](p1)) { ret p1; }
+    val p2: Result[bool, str] = call_write(c, label_ptr, label_len);
+    if (is_err[bool, str](p2)) { ret p2; }
+    val p3: Result[bool, str] = write_msg(c, "\n");
+    if (is_err[bool, str](p3)) { ret p3; }
+    val pbr: Result[bool, str] = builder.emit_br(?c.b, skip_b);
+    if (is_err[bool, str](pbr)) { ret pbr; }
+
+    builder.set_block(?c.b, fail_b);
+    val f1: Result[bool, str] = write_msg(c, "FAIL ");
+    if (is_err[bool, str](f1)) { ret f1; }
+    val f2: Result[bool, str] = call_write(c, label_ptr, label_len);
+    if (is_err[bool, str](f2)) { ret f2; }
+    val f3: Result[bool, str] = write_msg(c, "\n");
+    if (is_err[bool, str](f3)) { ret f3; }
+    val cur_r: Result[value.Value, str] = builder.emit_load(?c.b, fail_slot, c.i32);
+    if (is_err[value.Value, str](cur_r)) { ret err[bool, str](unwrap_err[value.Value, str](cur_r)); }
+    val inc_r: Result[value.Value, str] = builder.emit_add(?c.b, unwrap_ok[value.Value, str](cur_r), value.const_int(1, c.i32));
+    if (is_err[value.Value, str](inc_r)) { ret err[bool, str](unwrap_err[value.Value, str](inc_r)); }
+    val fst: Result[bool, str] = builder.emit_store(?c.b, unwrap_ok[value.Value, str](inc_r), fail_slot);
+    if (is_err[bool, str](fst)) { ret fst; }
+    val fbr: Result[bool, str] = builder.emit_br(?c.b, skip_b);
+    if (is_err[bool, str](fbr)) { ret fbr; }
+
+    # merge: continue to the next test.
+    builder.set_block(?c.b, skip_b);
+    ret ok[bool, str](true);
+}

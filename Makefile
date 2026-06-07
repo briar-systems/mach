@@ -1,152 +1,57 @@
-# mach unified build system
+# mach build system
 # builds:
-#   1. bootstrap c compiler (boot/ -> out/bin/cmach)
-#   2. intermediary compiler with cmach (src/ -> out/bin/imach)
-#   3. final compiler with imach (src/ -> out/bin/mach)
-#
-# directory structure:
-#   out/
-#     bin/         # final binaries (cmach, imach)
-#     cmach/       # cmach artifacts (obj/)
-#     imach/<target>/  # imach artifacts (ast/, ir/, asm/, obj/)
-#     mach/<target>/   # mach artifacts (ast/, ir/, asm/, obj/)
+#   1. acquire cmach            (pinned version auto-downloaded to out/bin)
+#   2. intermediary compiler    (cmach builds src/ -> out/bin/imach)
+#   3. self-hosted compiler     (imach builds src/ -> out/bin/smach)
+#   4. final compiler           (smach builds src/ -> out/bin/mach)
 
-# compiler and flags
-CC := clang
-CFLAGS := -std=c23 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pedantic -O2
-CFLAGS_DEBUG := -std=c23 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pedantic -g -O0 -DDEBUG
+OUT := out
+BIN := $(OUT)/bin
 
-OUT_DIR := out
-BIN_DIR := $(OUT_DIR)/bin
+# cmach is the bootstrap seed: the exact pinned version is auto-downloaded so a
+# stale system cmach can never silently break the bootstrap. override the seed
+# explicitly with `make CMACH=/path/to/cmach` when you know it matches.
+CMACH_VERSION ?= 0.10.2
+CMACH         ?= $(BIN)/cmach
+CMACH_URL      = https://github.com/octalide/mach-boot/releases/download/v$(CMACH_VERSION)/cmach
 
-# standard library (source only, referenced directly)
-STD_DIR := std
-MACH_SRC_DIR := src
+IMACH := $(BIN)/imach
+SMACH := $(BIN)/smach
+MACH  := $(BIN)/mach
 
-# bootstrap compiler
-BOOT_DIR := boot
-BOOT_SRC_DIR := $(BOOT_DIR)/src
-BOOT_INC_DIR := $(BOOT_DIR)/include
-CMACH_OBJ_DIR := $(OUT_DIR)/cmach/obj
+# every bootstrap stage recompiles the whole source tree, so any source or
+# manifest change invalidates all stages. list the sources as prerequisites so
+# plain `make` rebuilds the chain on a source change (no full `clean` + cmach
+# re-download needed).
+SRC := $(shell find src dep -name '*.mach' 2>/dev/null) mach.toml
 
-# final executables
-CMACH := $(BIN_DIR)/cmach
-IMACH := $(BIN_DIR)/imach
-MACH := $(OUT_DIR)/linux/bin/mach
+.PHONY: mach clean
 
-# bootstrap compiler sources
-BOOT_SOURCES := $(shell find $(BOOT_SRC_DIR) -type f -name '*.c')
-BOOT_OBJECTS := $(BOOT_SOURCES:$(BOOT_SRC_DIR)/%.c=$(CMACH_OBJ_DIR)/%.o)
-BOOT_HEADERS := $(shell find $(BOOT_INC_DIR) -type f -name '*.h')
+mach: $(MACH)
 
-# main targets
-.PHONY: help cmach-clean cmach-build cmach imach-clean imach-build imach mach-clean mach-build mach full clean test
+# download cmach if it doesn't exist at the resolved path
+$(BIN)/cmach:
+	@mkdir -p $(BIN)
+	@echo "downloading cmach v$(CMACH_VERSION)..."
+	@curl -fsSL "$(CMACH_URL)" -o $@ && chmod +x $@
 
-# default target: print help
-.DEFAULT_GOAL := help
-
-help:
-	@echo "mach compiler build system"
-	@echo ""
-	@echo "bootstrap (c compiler):"
-	@echo "  cmach-clean  - clean cmach build artifacts"
-	@echo "  cmach-build  - build cmach"
-	@echo "  cmach        - clean and build cmach"
-	@echo ""
-	@echo "intermediary (compiled with cmach):"
-	@echo "  imach-clean  - clean imach build artifacts"
-	@echo "  imach-build  - build imach"
-	@echo "  imach        - clean and build imach"
-	@echo ""
-	@echo "final (compiled with imach):"
-	@echo "  mach-clean   - clean mach build artifacts"
-	@echo "  mach-build   - build mach"
-	@echo "  mach         - clean and build mach (output per mach.toml)"
-	@echo ""
-	@echo "meta:"
-	@echo "  clean        - clean all build artifacts"
-	@echo "  test         - run test suite"
-	@echo ""
-	@echo "note: target platform determined by mach.toml (target = \"native\")"
-	@echo "  imach        - clean and build imach"
-	@echo ""
-	@echo "final (compiled with imach):"
-	@echo "  mach-clean   - clean mach build artifacts"
-	@echo "  mach-build   - build mach"
-	@echo "  mach         - clean and build mach"
-	@echo ""
-	@echo "meta:"
-	@echo "  clean        - clean all build artifacts"
-
-# bootstrap compiler
-cmach-clean:
-	@echo "cleaning cmach"
-	@rm -rf $(OUT_DIR)/cmach
-	@rm -f $(CMACH)
-
-cmach-build: $(CMACH)
-
-cmach: cmach-clean cmach-build
-
-test: cmach-build
-	@./out/bin/cmach test
-
-# intermediary compiler
-imach-clean:
-	@echo "cleaning imach"
-	@rm -rf $(OUT_DIR)/imach
-	@rm -f $(IMACH)
-
-imach-build: $(IMACH)
-
-imach: imach-clean imach-build
-
-# final compiler
-mach-clean:
-	@echo "cleaning mach"
-	@rm -rf $(OUT_DIR)/mach
-	@rm -f $(MACH)
-
-mach-build: $(MACH)
-
-mach: mach-clean mach-build
-
-# clean everything
-clean:
-	@echo "cleaning all"
-	@rm -rf $(OUT_DIR)
-
-$(BIN_DIR):
-	@mkdir -p $(BIN_DIR)
-
-$(CMACH_OBJ_DIR):
-	@mkdir -p $(CMACH_OBJ_DIR)
-
-$(CMACH_OBJ_DIR)/%.o: $(BOOT_SRC_DIR)/%.c $(BOOT_HEADERS) | $(CMACH_OBJ_DIR)
-	@echo "  cc  $<"
-	@mkdir -p $(dir $@)
-	@$(CC) $(CFLAGS) -I$(BOOT_INC_DIR) -c $< -o $@
-
-# bootstrap compiler build
-$(CMACH): $(BOOT_OBJECTS) | $(BIN_DIR)
-	@echo "  ld  $@"
-	@$(CC) $(BOOT_OBJECTS) -o $@
-	@echo "bootstrap compiler ready: $@"
-
-# intermediary compiler build (using cmach)
-# mach.toml determines target and output paths
-$(IMACH): $(CMACH) | $(BIN_DIR)
-	@echo "  cleaning artifacts for imach build"
-	@rm -rf $(OUT_DIR)/imach
+$(IMACH): $(CMACH) $(SRC) | $(BIN)
+	@rm -rf $(OUT)/imach
 	@echo "  cmach -> imach"
-	@$(CMACH) build . -o $(IMACH)
-	@echo "intermediary compiler ready: $@"
+	@$(CMACH) build . -o $@ --artifacts imach/linux
 
-# final compiler build (using imach)
-# mach.toml determines target and output paths
-$(MACH): $(IMACH)
-	@echo "  cleaning artifacts for mach build"
-	@rm -rf $(OUT_DIR)/mach
-	@echo "  imach -> mach"
-	@$(IMACH) build .
-	@echo "final compiler ready: $@"
+$(SMACH): $(IMACH) $(SRC) | $(BIN)
+	@rm -rf $(OUT)/smach
+	@echo "  imach -> smach"
+	@$(IMACH) build . -o $@ --artifacts smach/linux
+
+$(MACH): $(SMACH) $(SRC) | $(BIN)
+	@rm -rf $(OUT)/mach
+	@echo "  smach -> mach"
+	@$(SMACH) build . -o $@ --artifacts mach/linux
+
+$(BIN):
+	@mkdir -p $@
+
+clean:
+	@rm -rf $(OUT)

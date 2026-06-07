@@ -1,0 +1,181 @@
+# mach.lang.be.codegen.frame: assign each MIR frame slot a frame-pointer offset and size the frame.
+#
+# Assigns each MIR frame slot a negative offset from the frame pointer,
+# sizes the frame to the ABI stack alignment, and records the
+# variadic-argument save area. The slots themselves — allocas plus the
+# small-aggregate param / aggregate-load / aggregate-return spill slots —
+# are materialized into `mir.MirFrame` during instruction selection; this
+# pass only computes their final offsets and the total frame size.
+# Completely target-agnostic except for the stack alignment read through
+# the ABI vtable; the resulting offsets are consumed by the encoder when
+# it forms `[rbp + disp]` memory operands.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+
+use target: mach.lang.target.resolved;
+use mir: mach.lang.be.codegen.mir;
+
+# DEFAULT_STACK_ALIGN: frame alignment used when no ABI override applies; the 16-byte call-boundary minimum.
+pub val DEFAULT_STACK_ALIGN: u32 = 16;
+
+# run: compute stack-frame offsets and size for every function in a MIR module.
+# ---
+# tgt: resolved target; the ABI vtable supplies the stack alignment
+# m:   MIR module whose functions are laid out in place
+# ret: true on success, or an error string on a malformed frame
+pub fun run(tgt: *target.Target, m: *mir.MirModule) Result[bool, str] {
+    if (m == nil) { ret err[bool, str]("frame: nil mir module"); }
+    if (tgt == nil || tgt.abi == nil) {
+        ret err[bool, str]("frame.run: target has no ABI");
+    }
+
+    val align: u32 = stack_align(tgt);
+
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val func: *mir.MirFunction = ?m.functions[fi];
+        layout_function(func, align);
+        fi = fi + 1;
+    }
+
+    ret ok[bool, str](true);
+}
+
+# read the ABI stack alignment. the caller (`run`) has already verified the
+# target and its ABI are present; an ABI that left `stack_align` unset (0) takes
+# the 16-byte call-boundary default.
+# ---
+# t:   resolved target with a non-nil ABI (guaranteed by `run`)
+# ret: the stack alignment in bytes
+fun stack_align(t: *target.Target) u32 {
+    if (t.abi.stack_align == 0) { ret DEFAULT_STACK_ALIGN; }
+    ret t.abi.stack_align;
+}
+
+# lay out one function's frame: assign offsets to each slot, reserve the va
+# save area, the outgoing-argument region, and compute the aligned frame size.
+#
+# the frame is laid out from the frame pointer downward:
+#   [rbp - .. ]   locals / spills / two-register-param copies (the slots)
+#   [rbp - .. ]   variadic-argument save area (when has_va_save)
+#   ---- the above two regions are `frame.size`, negative-from-rbp ----
+#   [rbp - (frame.size + 8) .. ]   callee-saved registers (encoder, frame.size-relative)
+#   [rsp .. rsp + outgoing_size)   outgoing call-argument region (lowest region)
+# the encoder reserves the callee-save and outgoing regions below `frame.size`
+# when it subtracts RSP, placing the outgoing region at the very bottom so a
+# caller's `[rsp + off]` store lands in it. this pass aligns `outgoing_size` to
+# the stack alignment so the encoder's RSP subtraction stays 16-byte aligned at
+# every call site (`frame.size`+callee region is aligned independently, and a
+# 16-aligned outgoing region added below it preserves the call-boundary
+# invariant).
+# ---
+# func:  the function to lay out; its `frame` is filled in place
+# align: stack alignment to round the frame size up to
+fun layout_function(func: *mir.MirFunction, align: u32) {
+    val frame: *mir.MirFrame = ?func.frame;
+    frame.align = align;
+
+    var offset: i64 = 0;
+
+    var si: u32 = 0;
+    for (si < frame.slot_count) {
+        val slot: *mir.MirSlot = ?frame.slots[si];
+
+        var al: u64 = 1;
+        if (slot.align > 0) { al = slot.align::u64; }
+
+        offset = offset - slot.size::i64;
+        if (al > 1) {
+            val mask: i64 = al::i64 - 1;
+            offset = (offset - mask) & ~mask;
+        }
+
+        slot.offset = offset;
+        si = si + 1;
+    }
+
+    # the variadic save area lives at the current bottom of the frame so a
+    # function that spills its register arguments has contiguous storage below
+    # the ordinary slots. it is 8-byte aligned.
+    frame.va_save_off = offset;
+    if (frame.has_va_save) {
+        offset = offset - frame.va_save_size::i64;
+        val vmask: i64 = 7;
+        offset = (offset - vmask) & ~vmask;
+        frame.va_save_off = offset;
+    }
+
+    var size: usize = 0;
+    if (offset < 0) {
+        val amask: usize = align::usize - 1;
+        size = ((-offset)::usize + amask) & ~amask;
+    }
+    frame.size = size::u32;
+
+    # round the reserved outgoing-argument region up to the stack alignment. it is
+    # carved out below the callee-save area by the encoder; keeping it a multiple
+    # of the alignment lets the encoder add it to the (independently aligned)
+    # local + callee-save region without disturbing the 16-byte call-boundary
+    # alignment of RSP.
+    if (frame.outgoing_size > 0) {
+        val omask: u32 = align - 1;
+        frame.outgoing_size = (frame.outgoing_size + omask) & ~omask;
+    }
+}
+
+# slot_offset: look up the frame-pointer offset assigned to a MIR value's slot.
+# ---
+# frame: the laid-out frame to search
+# v:     the MIR value id whose slot offset is requested
+# ret:   the negative offset, or none if `v` owns no frame slot
+pub fun slot_offset(frame: *mir.MirFrame, v: u32) Option[i64] {
+    if (frame == nil) { ret none[i64](); }
+    if (frame.slots == nil) { ret none[i64](); }
+    var i: u32 = 0;
+    for (i < frame.slot_count) {
+        if (frame.slots[i].value == v) {
+            ret some[i64](frame.slots[i].offset);
+        }
+        i = i + 1;
+    }
+    ret none[i64]();
+}
+
+# is_slot: report whether a MIR value owns a frame slot.
+# ---
+# frame: the laid-out frame to search
+# v:     the MIR value id to test
+# ret:   true if `v` has an assigned stack slot
+pub fun is_slot(frame: *mir.MirFrame, v: u32) bool {
+    ret is_some[i64](slot_offset(frame, v));
+}
+
+# is_alloca_slot: report whether a MIR value's slot is an addressed alloca rather than an aggregate spill.
+# ---
+# frame: the laid-out frame to search
+# v:     the MIR value id to test
+# ret:   true if `v`'s slot is an alloca; false if it is an aggregate spill or
+#        `v` owns no slot
+pub fun is_alloca_slot(frame: *mir.MirFrame, v: u32) bool {
+    if (frame == nil) { ret false; }
+    if (frame.slots == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < frame.slot_count) {
+        if (frame.slots[i].value == v) {
+            ret frame.slots[i].kind == mir.SLOT_ALLOCA;
+        }
+        i = i + 1;
+    }
+    ret false;
+}

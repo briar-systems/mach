@@ -1,0 +1,520 @@
+# mach.lang.target.isa: instruction-set interface and id registry.
+#
+# Defines the target-agnostic machine model — operands, instructions,
+# instruction buffers — plus the `IsaVTable` runtime-dispatch interface and a
+# process-global registry that per-arch implementations self-register into from
+# module init. The numeric `ARCH_*` ids are stable across compiler versions and
+# drive comptime conditional compilation via `$mach.arch.<name>`.
+
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+
+use std.allocator.Allocator;
+use std.allocator.reallocate;
+use std.allocator.deallocate;
+
+use intern: mach.lang.intern;
+
+# byte order of a target's scalar storage.
+# ---
+# ENDIAN_LITTLE: least-significant byte first
+# ENDIAN_BIG:    most-significant byte first
+pub val ENDIAN_LITTLE: u32 = 0;
+pub val ENDIAN_BIG:    u32 = 1;
+
+# canonical numeric ids for known instruction sets. stable across compiler
+# versions; user code dispatches on them through `$mach.arch.<name>` and
+# `$mach.target.arch`.
+pub val ARCH_UNKNOWN: u32 = 0;
+pub val ARCH_X86_64:  u32 = 1;
+pub val ARCH_AARCH64: u32 = 2;
+
+# pseudo-opcodes shared by every ISA. they occupy the high end of the opcode
+# space so that no real machine opcode collides with them. the backend emits
+# these during isel/regalloc and lowers or drops them before encoding.
+# ---
+# ISA_LABEL:       a branch target placeholder (no bytes emitted)
+# ISA_ASM_MARKER:  marks an inline-asm block boundary
+# ISA_PCOPY:       a parallel copy awaiting sequencing
+# ISA_PCOPY_FENCE: a barrier delimiting a parallel-copy group
+# ISA_USE:         a liveness pin keeping a value live with no effect
+pub val ISA_LABEL:       u16 = 0xFFFF;
+pub val ISA_ASM_MARKER:  u16 = 0xFFFE;
+pub val ISA_PCOPY:       u16 = 0xFFFD;
+pub val ISA_PCOPY_FENCE: u16 = 0xFFFC;
+pub val ISA_USE:         u16 = 0xFFFB;
+
+# instruction-level encoding flags shared across ISAs.
+# ---
+# ISA_FLAG_DST_READ: the destination operand is also read (read-modify-write)
+# ISA_FLAG_FP_COPY:  a register copy moves a floating-point value
+pub val ISA_FLAG_DST_READ: u16 = 0x8000;
+pub val ISA_FLAG_FP_COPY:  u16 = 0x4000;
+
+# the kind of a machine operand.
+pub def OperandKind: u8;
+
+# no operand present.
+pub val OPK_NONE:  OperandKind = 0;
+# a physical or virtual register.
+pub val OPK_REG:   OperandKind = 1;
+# an immediate constant.
+pub val OPK_IMM:   OperandKind = 2;
+# a memory reference (base + index*scale + disp).
+pub val OPK_MEM:   OperandKind = 3;
+# a branch-target label.
+pub val OPK_LABEL: OperandKind = 4;
+# a symbol reference resolved by the linker.
+pub val OPK_SYM:   OperandKind = 5;
+
+# a physical register descriptor.
+# ---
+# id:   register number within its class
+# size: width in bytes (1, 2, 4, 8, or 16 for vector)
+pub rec Register {
+    id:   i32;
+    size: u8;
+}
+
+# a homogeneous set of registers (e.g. all GP regs or all FP regs).
+# ---
+# regs:  array of registers
+# count: number of registers in the set
+pub rec RegisterFile {
+    regs:  *Register;
+    count: i32;
+}
+
+# a single machine-instruction operand. the active fields depend on `kind`:
+# REG uses `reg`; IMM uses `imm`; MEM uses `base`/`index`/`scale`/`disp`;
+# LABEL uses `label`; SYM uses `sym_id`.
+# ---
+# kind:   operand discriminant
+# size:   operand width in bytes
+# reg:    register id for OPK_REG (or base for some forms)
+# imm:    immediate value for OPK_IMM
+# base:   base register id for OPK_MEM (-1 if none)
+# index:  index register id for OPK_MEM (-1 if none)
+# scale:  index scale for OPK_MEM (1, 2, 4, or 8)
+# disp:   displacement for OPK_MEM
+# sym_id: symbol id for OPK_SYM
+# label:  label name for OPK_LABEL
+pub rec Operand {
+    kind:   OperandKind;
+    size:   u8;
+    reg:    i32;
+    imm:    i64;
+    base:   i32;
+    index:  i32;
+    scale:  u8;
+    disp:   i32;
+    sym_id: u32;
+    label:  str;
+}
+
+# a single machine instruction in the target-agnostic model. `opcode` is a
+# target-specific value (or one of the ISA_* pseudo-opcodes); the encoder
+# table in the active ISA interprets it.
+# ---
+# opcode:   target-specific opcode (or ISA_* pseudo-opcode)
+# dst:      destination operand
+# src1:     first source operand
+# src2:     second source operand
+# size:     operation width in bytes
+# flags:    encoding flags (REX_W, 16BIT, LOCK, ISA_FLAG_*, etc.)
+# clobbers: bitmask of physical registers destroyed beyond dst/src1/src2
+# src_line: source line for debug info
+# src_file: source file for debug info
+pub rec Inst {
+    opcode:   u16;
+    dst:      Operand;
+    src1:     Operand;
+    src2:     Operand;
+    size:     u8;
+    flags:    u16;
+    clobbers: u32;
+    src_line: u32;
+    src_file: str;
+}
+
+# growable buffer of machine instructions used throughout the backend.
+# ---
+# insts: array of instructions
+# count: number of instructions stored
+# cap:   allocated capacity
+# alloc: backing allocator
+# err:   true if a buf_append failed due to an allocation error
+pub rec InstBuf {
+    insts: *Inst;
+    count: i32;
+    cap:   i32;
+    alloc: *Allocator;
+    err:   bool;
+}
+
+# a register class exposed by an ISA. the backend reads these to size and
+# allocate virtual registers without target-specific knowledge.
+# ---
+# name:      interned class name ("gpr", "xmm", "flags", ...)
+# bit_width: width of one register in bits
+# count:     number of registers in the class
+pub rec RegClass {
+    name:      intern.StrId;
+    bit_width: u32;
+    count:     u32;
+}
+
+# the ISA runtime-dispatch interface. exactly one of these exists per
+# architecture; the backend reads pointer width, endianness, register classes,
+# and the arch-specific operation entry points through it and never branches on
+# the numeric `id`.
+#
+# `select`, `encode`, and `emit_asm` are the target-specific backend operations.
+# they are stored type-erased (`*u8`) for the same reason the ABI vtable erases its
+# classify/arg/ret pointers and the object-format `WriterFn` takes an
+# `*IsaVTable` rather than the full `Target`: their concrete signatures name
+# `target.Target`, `mir.MirModule`, and the encoder's output / a writer, every
+# one of which imports `isa`. a typed field here would invert that dependency
+# and form an import cycle. each consumer — the shared `isel.run` / `encode.run` /
+# `encode.print_asm` dispatchers, which already import `mir` and `target` — casts
+# the erased pointer back to the concrete `SelectFn` / `EncodeFn` / `PrintAsmFn`
+# signature declared in the per-arch implementation file (e.g. `target/isa/x64`),
+# exactly as `mir` casts `abi.arg_passing` back to `sysv.ArgPassingFn`. `emit_asm`
+# is an optional debug hook: an ISA that supplies no human-readable assembly
+# printer leaves it nil and the `print_asm` dispatcher no-ops.
+#
+# `reserved_regs`, `scratch_reg`, `scratch_reg2`, `fp_scratch_reg`,
+# `frame_ptr_reg`, `stack_ptr_reg`, `div_reg`, `div_hi_reg`, and
+# `shift_count_reg` are the arch-specific register identities the shared regalloc,
+# frame, and MIR-lowering passes need but cannot name without target knowledge:
+# the registers that must never be handed to the allocator (the stack and frame
+# pointers), the scratch registers the backend reserves for address
+# materialization, spill reloads, and the two-register-return / varargs lowering
+# sequences, the frame/stack pointers named directly when forming the
+# incoming-parameter and outgoing-argument stack memory operands, and the fixed
+# accumulator / high-half / shift-count registers the ISA's division and
+# variable-shift instruction forms hard-wire (e.g. x86-64 IDIV/DIV's RAX:RDX and
+# the variable shift's CL). the ABI vtable owns the orthogonal arg/return register
+# files and the caller/callee-saved partition; these are the ISA's own register
+# identities. an ISA whose division / shift forms wire no fixed register (or that
+# is otherwise unimplemented) reports -1 for the div/shift fields.
+# ---
+# id:                 architecture id (one of ARCH_*)
+# name:               interned architecture name ("x86_64", "aarch64")
+# pointer_width:      pointer width in bytes
+# endianness:         ENDIAN_LITTLE or ENDIAN_BIG (see target.mach)
+# reg_classes:        array of register classes
+# reg_class_count:    number of register classes
+# select:             erased fn ptr — perform instruction selection for one
+#                     MirFunction in place (cast back to the arch's `SelectFn`)
+# encode:             erased fn ptr — encode one fully-resolved MirFunction to
+#                     bytes + relocations + symbol marks (cast back to the arch's
+#                     `EncodeFn`); owns prologue/epilogue emission, local-label
+#                     rel32 fixups, and relocation offsets for this ISA
+# emit_asm:           erased fn ptr — format one fully-resolved MirModule as
+#                     human-readable assembly text into a writer (cast back to the
+#                     arch's `PrintAsmFn`); a debug-only artifact hook, nil when the
+#                     ISA supplies no printer
+# reserved_regs:      registers the allocator must never assign (stack/frame
+#                     pointers); owned by the per-arch impl for the process
+#                     lifetime
+# reserved_reg_count: number of reserved registers
+# reload_scratch_regs:  GP registers the allocator reserves from value
+#                       allocation and draws spill-reload temporaries from; a
+#                       single high-pressure instruction can reload its base,
+#                       scaled index, and value operands at once, so this pool
+#                       sizes the worst-case simultaneous reloads. distinct from
+#                       `scratch_reg` (the encoder's own mem-mem split scratch),
+#                       which the allocator reserves but never hands to a reload.
+#                       owned by the per-arch impl for the process lifetime
+# reload_scratch_count: number of reload-scratch registers
+# scratch_reg:        primary GP scratch register reserved by the backend
+# scratch_reg2:       secondary GP scratch register reserved by the backend
+# fp_scratch_reg:     FP/vector scratch register reserved by the backend
+# frame_ptr_reg:      frame-pointer register id; the base of incoming
+#                     stack-parameter memory operands (`[fp + ...]`)
+# stack_ptr_reg:      stack-pointer register id; the base of outgoing
+#                     stack-argument memory operands (`[sp + ...]`)
+# div_reg:            register the integer division form hard-wires as the
+#                     dividend / quotient accumulator (x86-64 RAX), or -1
+# div_hi_reg:         register the integer division form hard-wires for the
+#                     dividend high half / remainder (x86-64 RDX), or -1
+# shift_count_reg:    register a variable shift's runtime count must occupy
+#                     (x86-64 RCX, used as CL), or -1
+pub rec IsaVTable {
+    id:                 u32;
+    name:               intern.StrId;
+    pointer_width:      u32;
+    endianness:         u32;
+    reg_classes:        *RegClass;
+    reg_class_count:    u32;
+    select:             *u8;
+    encode:             *u8;
+    emit_asm:           *u8;
+    reserved_regs:      *Register;
+    reserved_reg_count: i32;
+    reload_scratch_regs:  *Register;
+    reload_scratch_count: i32;
+    scratch_reg:        i32;
+    scratch_reg2:       i32;
+    fp_scratch_reg:     i32;
+    frame_ptr_reg:      i32;
+    stack_ptr_reg:      i32;
+    div_reg:            i32;
+    div_hi_reg:         i32;
+    shift_count_reg:    i32;
+}
+
+val ISA_REGISTRY_CAP: u32 = 8;
+
+# process-global write-once registry of ISA vtables, indexed by architecture
+# id. per-arch implementations self-register from module init; the entry stays
+# nil until its implementation registers.
+var isa_registry: [8]*IsaVTable;
+var isa_registry_init: bool = false;
+
+fun ensure_isa_registry() {
+    if (isa_registry_init) { ret; }
+    var i: u32 = 0;
+    for (i < ISA_REGISTRY_CAP) {
+        isa_registry[i] = nil;
+        i = i + 1;
+    }
+    isa_registry_init = true;
+}
+
+# register: install an ISA vtable into the process-global registry.
+#
+# write-once per architecture id: a second registration for the same id is
+# ignored so the first implementation to initialize wins deterministically.
+# ---
+# vt: the ISA vtable to register; its `id` selects the slot
+pub fun register(vt: *IsaVTable) {
+    ensure_isa_registry();
+    if (vt == nil) { ret; }
+    if (vt.id >= ISA_REGISTRY_CAP) { ret; }
+    if (isa_registry[vt.id] != nil) { ret; }
+    isa_registry[vt.id] = vt;
+}
+
+# lookup: find the ISA vtable registered for an architecture id.
+# ---
+# arch_id: architecture id (one of ARCH_*)
+# ret:     the registered vtable, or none if no implementation is registered
+pub fun lookup(arch_id: u32) Option[*IsaVTable] {
+    ensure_isa_registry();
+    if (arch_id >= ISA_REGISTRY_CAP) { ret none[*IsaVTable](); }
+    if (isa_registry[arch_id] == nil) { ret none[*IsaVTable](); }
+    ret some[*IsaVTable](isa_registry[arch_id]);
+}
+
+val INSTBUF_INIT_CAP: i32 = 64;
+
+# buf_init: construct an empty instruction buffer.
+# ---
+# alloc: backing allocator
+# ret:   an empty InstBuf
+pub fun buf_init(alloc: *Allocator) InstBuf {
+    var buf: InstBuf;
+    buf.insts = nil;
+    buf.count = 0;
+    buf.cap   = 0;
+    buf.alloc = alloc;
+    buf.err   = false;
+    ret buf;
+}
+
+# buf_append: append an instruction, growing the buffer if needed. on
+# allocation failure it sets `buf.err` instead of silently dropping the
+# instruction.
+# ---
+# buf:  instruction buffer
+# inst: instruction to append
+pub fun buf_append(buf: *InstBuf, inst: Inst) {
+    if (buf.err) { ret; }
+    if (buf.count >= buf.cap) {
+        var new_cap: i32 = INSTBUF_INIT_CAP;
+        if (buf.cap > 0) {
+            new_cap = buf.cap * 2;
+        }
+
+        val res_realloc: Result[*Inst, str] = reallocate[Inst](
+            buf.alloc, buf.insts, buf.cap::usize, new_cap::usize
+        );
+        if (is_err[*Inst, str](res_realloc)) {
+            buf.err = true;
+            ret;
+        }
+        buf.insts = unwrap_ok[*Inst, str](res_realloc);
+        buf.cap = new_cap;
+    }
+
+    buf.insts[buf.count] = inst;
+    buf.count = buf.count + 1;
+}
+
+# buf_dnit: free an instruction buffer's backing storage.
+# ---
+# buf: buffer to destroy; safe on nil
+pub fun buf_dnit(buf: *InstBuf) {
+    if (buf == nil) { ret; }
+    if (buf.insts != nil && buf.cap > 0) {
+        deallocate[Inst](buf.alloc, buf.insts, buf.cap::usize);
+        buf.insts = nil;
+    }
+    buf.count = 0;
+    buf.cap   = 0;
+}
+
+# a physical register id is a COMPOSITE value that encodes both the register
+# CLASS and the within-bank INDEX: `regid = (class_id << 8) | index`. the class
+# id occupies the high byte, the within-bank index the low byte. this makes a
+# post-register-allocation register operand self-describing — the encoder reads
+# the class straight off the id to pick the GP versus SSE machine form, so a float
+# value can never be silently encoded as a move of the GP register that aliases
+# its XMM index (XMM0 and RAX both index 0). the general-purpose bank is class 0,
+# so a GP id is numerically identical to its raw index (0..15) and every GP-keyed
+# table, mask, and comparison in the back end is unchanged; only the wider
+# register classes (XMM = class 1, ids 0x0100..0x010F) gain the high-byte tag.
+
+# REG_CLASS_ID_GP: the composite-register-id class tag for the general-purpose
+# bank. zero by construction so a GP id equals its raw within-bank index.
+pub val REG_CLASS_ID_GP: i32 = 0;
+
+# REG_CLASS_ID_XMM: the composite-register-id class tag for the SSE / vector bank.
+pub val REG_CLASS_ID_XMM: i32 = 1;
+
+# regid_make: compose a physical register id from a class tag and within-bank
+# index. the inverse of `regid_class` / `regid_index`.
+pub fun regid_make(class_id: i32, index: i32) i32 {
+    ret ((class_id & 0xFF) << 8) | (index & 0xFF);
+}
+
+# regid_class: the class tag encoded in a composite register id (its high byte).
+pub fun regid_class(regid: i32) i32 {
+    ret (regid >> 8) & 0xFF;
+}
+
+# regid_index: the within-bank register index encoded in a composite register id
+# (its low byte). every machine-encoding helper reads the index through this so a
+# class-tagged id encodes to the same ModRM / REX bits as its raw index did.
+pub fun regid_index(regid: i32) i32 {
+    ret regid & 0xFF;
+}
+
+# make_reg: build a register operand.
+# ---
+# id:   composite register id (`regid_make`): the class tag in the high byte, the
+#       within-bank index in the low byte. a GP id is its raw index (class 0).
+# size: width in bytes
+# ret:  Operand with kind=OPK_REG
+pub fun make_reg(id: i32, size: u8) Operand {
+    var op: Operand;
+    op.kind   = OPK_REG;
+    op.size   = size;
+    op.reg    = id;
+    op.imm    = 0;
+    op.base   = -1;
+    op.index  = -1;
+    op.scale  = 0;
+    op.disp   = 0;
+    op.sym_id = 0;
+    op.label  = nil;
+    ret op;
+}
+
+# make_imm: build an immediate operand.
+# ---
+# value: immediate value
+# size:  width in bytes
+# ret:   Operand with kind=OPK_IMM
+pub fun make_imm(value: i64, size: u8) Operand {
+    var op: Operand;
+    op.kind   = OPK_IMM;
+    op.size   = size;
+    op.reg    = -1;
+    op.imm    = value;
+    op.base   = -1;
+    op.index  = -1;
+    op.scale  = 0;
+    op.disp   = 0;
+    op.sym_id = 0;
+    op.label  = nil;
+    ret op;
+}
+
+# make_mem: build a memory operand (base + index*scale + disp).
+# ---
+# base:  base register id (-1 if none); a general-purpose composite id (no SSE
+#        addressing form exists, so the encoder rejects a non-GP base)
+# disp:  displacement
+# index: index register id (-1 if none); likewise general-purpose
+# scale: index scale (1, 2, 4, or 8)
+# size:  access width in bytes
+# ret:   Operand with kind=OPK_MEM
+pub fun make_mem(base: i32, disp: i32, index: i32, scale: u8, size: u8) Operand {
+    var op: Operand;
+    op.kind   = OPK_MEM;
+    op.size   = size;
+    op.reg    = -1;
+    op.imm    = 0;
+    op.base   = base;
+    op.index  = index;
+    op.scale  = scale;
+    op.disp   = disp;
+    op.sym_id = 0;
+    op.label  = nil;
+    ret op;
+}
+
+# make_label: build a label operand.
+# ---
+# name: label name
+# ret:  Operand with kind=OPK_LABEL
+pub fun make_label(name: str) Operand {
+    var op: Operand;
+    op.kind   = OPK_LABEL;
+    op.size   = 0;
+    op.reg    = -1;
+    op.imm    = 0;
+    op.base   = -1;
+    op.index  = -1;
+    op.scale  = 0;
+    op.disp   = 0;
+    op.sym_id = 0;
+    op.label  = name;
+    ret op;
+}
+
+# make_sym: build a symbol-reference operand.
+# ---
+# sym_id: symbol id resolved by the linker
+# size:   reference width in bytes
+# ret:    Operand with kind=OPK_SYM
+pub fun make_sym(sym_id: u32, size: u8) Operand {
+    var op: Operand;
+    op.kind   = OPK_SYM;
+    op.size   = size;
+    op.reg    = -1;
+    op.imm    = 0;
+    op.base   = -1;
+    op.index  = -1;
+    op.scale  = 0;
+    op.disp   = 0;
+    op.sym_id = sym_id;
+    op.label  = nil;
+    ret op;
+}

@@ -1,0 +1,1152 @@
+# mach.lang.target.of.elf: ELF64 object-format writer.
+#
+# Implements the `of.OfVTable` for `OF_ELF` and self-registers from module init.
+# The writer serializes an `of.ObjectImage` into a relocatable ET_REL `.o`
+# (header, section data, a symbol table with
+# locals ordered before globals, a string table, per-text `.rela.<name>`
+# relocation sections with `r_info = (sym << 32) | type`, and a section-name
+# string table followed by the section-header table). It also provides the
+# static ET_EXEC executable emitter (program headers, a leading PT_LOAD that
+# covers the ELF header and phdrs, page-aligned loadable segments) and the
+# object parser plus relocation applier that the linker drives.
+#
+# The abstract `of.RK_*` relocation kinds are interned at registration; the
+# writer matches a `Relocation.kind` StrId directly against those handles and
+# maps it to the machine relocation type for the ISA it is handed
+# (`ARCH_X86_64` -> R_X86_64_*; `ARCH_AARCH64` -> R_AARCH64_*).
+#
+# `WriterFn` carries no interner, yet section/symbol names are `intern.StrId`.
+# `register` captures the session interner in a module-level pointer (exactly
+# as it interns the vtable's own string fields), and the writer resolves names
+# through it. `be.obj.emit` must register the ELF format with the active
+# session interner before emitting.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.zallocate;
+use std.allocator.deallocate;
+
+use mem: std.memory;
+use fs:  std.filesystem;
+
+use intern: mach.lang.intern;
+use isa:    mach.lang.target.isa;
+use of:     mach.lang.target.of;
+
+# ELF identification bytes.
+val ELFCLASS64:    u8 = 2;
+val ELFDATA2LSB:   u8 = 1;
+val EV_CURRENT:    u8 = 1;
+val ELFOSABI_NONE: u8 = 0;
+
+# ELF object file types.
+val ET_REL:  u16 = 1;
+val ET_EXEC: u16 = 2;
+
+# ELF machine types.
+val EM_X86_64:  u16 = 62;
+val EM_AARCH64: u16 = 183;
+
+# ELF section header types.
+val SHT_PROGBITS: u32 = 1;
+val SHT_SYMTAB:   u32 = 2;
+val SHT_STRTAB:   u32 = 3;
+val SHT_RELA:     u32 = 4;
+val SHT_NOBITS:   u32 = 8;
+
+# ELF section header flags.
+val SHF_WRITE:     u64 = 1;
+val SHF_ALLOC:     u64 = 2;
+val SHF_EXECINSTR: u64 = 4;
+
+# ELF symbol bindings and types.
+val STB_LOCAL:   u8 = 0;
+val STB_GLOBAL:  u8 = 1;
+val STB_WEAK:    u8 = 2;
+val STT_NOTYPE:  u8 = 0;
+val STT_OBJECT:  u8 = 1;
+val STT_FUNC:    u8 = 2;
+
+# x86_64 relocation types.
+val R_X86_64_64:       u32 = 1;
+val R_X86_64_PC32:     u32 = 2;
+val R_X86_64_PLT32:    u32 = 4;
+val R_X86_64_GOTPCREL: u32 = 9;
+val R_X86_64_32S:      u32 = 11;
+
+# aarch64 relocation types.
+val R_AARCH64_ABS64:  u32 = 257;
+val R_AARCH64_PREL32: u32 = 261;
+val R_AARCH64_CALL26: u32 = 283;
+
+# ELF program header types and flags.
+val PT_LOAD: u32 = 1;
+val PF_X: u32 = 1;
+val PF_W: u32 = 2;
+val PF_R: u32 = 4;
+
+# fixed on-disk structure sizes for ELF64.
+val ELF_HEADER_SIZE: usize = 64;
+val SHDR_SIZE:       usize = 64;
+val PHDR_SIZE:       usize = 56;
+val SYM_SIZE:        usize = 24;
+val RELA_SIZE:       usize = 24;
+
+# default page size for static executables; segment vaddrs are page-aligned.
+val EXEC_PAGE_SIZE: u64 = 4096;
+
+# write a u16 little-endian into a buffer.
+fun write_u16_le(buf: *u8, offset: usize, value: u16) {
+    buf[offset]     = (value & 0xFF)::u8;
+    buf[offset + 1] = ((value >> 8) & 0xFF)::u8;
+}
+
+# write a u32 little-endian into a buffer.
+fun write_u32_le(buf: *u8, offset: usize, value: u32) {
+    buf[offset]     = (value & 0xFF)::u8;
+    buf[offset + 1] = ((value >> 8) & 0xFF)::u8;
+    buf[offset + 2] = ((value >> 16) & 0xFF)::u8;
+    buf[offset + 3] = ((value >> 24) & 0xFF)::u8;
+}
+
+# write a u64 little-endian into a buffer.
+fun write_u64_le(buf: *u8, offset: usize, value: u64) {
+    write_u32_le(buf, offset, (value & 0xFFFFFFFF)::u32);
+    write_u32_le(buf, offset + 4, ((value >> 32) & 0xFFFFFFFF)::u32);
+}
+
+# read a u16 little-endian from a buffer.
+fun read_u16_le(buf: *u8, offset: usize) u16 {
+    ret buf[offset]::u16 | (buf[offset + 1]::u16 << 8);
+}
+
+# read a u32 little-endian from a buffer.
+fun read_u32_le(buf: *u8, offset: usize) u32 {
+    ret buf[offset]::u32 | (buf[offset + 1]::u32 << 8)
+      | (buf[offset + 2]::u32 << 16) | (buf[offset + 3]::u32 << 24);
+}
+
+# read a u64 little-endian from a buffer.
+fun read_u64_le(buf: *u8, offset: usize) u64 {
+    ret read_u32_le(buf, offset)::u64 | (read_u32_le(buf, offset + 4)::u64 << 32);
+}
+
+# write a null-terminated string into a buffer, returning the bytes written.
+fun write_str(buf: *u8, offset: usize, s: str) usize {
+    if (s == nil) {
+        buf[offset] = 0;
+        ret 1;
+    }
+    val len: usize = str_len(s);
+    var i: usize = 0;
+    for (i < len) {
+        buf[offset + i] = s[i];
+        i = i + 1;
+    }
+    buf[offset + len] = 0;
+    ret len + 1;
+}
+
+# align a usize up to the given power-of-two alignment.
+fun align_up(value: usize, alignment: usize) usize {
+    if (alignment == 0) { ret value; }
+    ret (value + alignment - 1) & ~(alignment - 1);
+}
+
+# session interner captured at registration so the writer can resolve the
+# `intern.StrId` names carried by `of.ObjectImage`. set by `register`.
+var elf_interner: *intern.Interner = nil;
+
+# interned names of the abstract relocation kinds, filled at registration. the
+# writer matches a `Relocation.kind` StrId directly against these.
+var rk_abs64:    intern.StrId = 0;
+var rk_pc32:     intern.StrId = 0;
+var rk_plt32:    intern.StrId = 0;
+var rk_gotpcrel: intern.StrId = 0;
+var rk_abs32s:   intern.StrId = 0;
+
+# resolve an interned StrId to its backing text through the captured interner,
+# or nil if no interner is set or the id is out of range.
+fun resolve(id: intern.StrId) str {
+    if (elf_interner == nil) { ret nil; }
+    if (id == intern.STR_NIL) { ret nil; }
+    val o: Option[str] = intern.lookup(elf_interner, id);
+    if (is_some[str](o)) { ret unwrap[str](o); }
+    ret nil;
+}
+
+# map an abstract relocation-kind StrId to the ELF machine relocation type for
+# the given ISA. defaults to the 64-bit absolute type for unknown kinds.
+fun reloc_type_for(kind: intern.StrId, arch_id: u32) u32 {
+    if (arch_id == isa.ARCH_AARCH64) {
+        if (kind == rk_abs64)  { ret R_AARCH64_ABS64; }
+        if (kind == rk_pc32)   { ret R_AARCH64_PREL32; }
+        if (kind == rk_plt32)  { ret R_AARCH64_CALL26; }
+        if (kind == rk_abs32s) { ret R_AARCH64_ABS64; }
+        ret R_AARCH64_ABS64;
+    }
+    if (kind == rk_abs64)    { ret R_X86_64_64; }
+    if (kind == rk_pc32)     { ret R_X86_64_PC32; }
+    if (kind == rk_plt32)    { ret R_X86_64_PLT32; }
+    if (kind == rk_gotpcrel) { ret R_X86_64_GOTPCREL; }
+    if (kind == rk_abs32s)   { ret R_X86_64_32S; }
+    ret R_X86_64_64;
+}
+
+# map an ELF machine relocation type back to its abstract RK_* kind name.
+fun reloc_kind_for(r_type: u32) intern.StrId {
+    if (r_type == R_X86_64_64 || r_type == R_AARCH64_ABS64) { ret rk_abs64; }
+    if (r_type == R_X86_64_PC32 || r_type == R_AARCH64_PREL32) { ret rk_pc32; }
+    if (r_type == R_X86_64_PLT32 || r_type == R_AARCH64_CALL26) { ret rk_plt32; }
+    if (r_type == R_X86_64_GOTPCREL) { ret rk_gotpcrel; }
+    if (r_type == R_X86_64_32S) { ret rk_abs32s; }
+    ret rk_abs64;
+}
+
+# ELF machine type for an ISA id.
+fun machine_for(arch_id: u32) u16 {
+    if (arch_id == isa.ARCH_AARCH64) { ret EM_AARCH64; }
+    ret EM_X86_64;
+}
+
+# ELF section type for an abstract section kind.
+fun section_type_for(kind: of.SectionKind) u32 {
+    if (kind == of.SK_BSS) { ret SHT_NOBITS; }
+    ret SHT_PROGBITS;
+}
+
+# ELF section flags for an abstract section kind.
+fun section_flags_for(kind: of.SectionKind) u64 {
+    if (kind == of.SK_DEBUG) { ret 0; }
+    var f: u64 = SHF_ALLOC;
+    if (kind == of.SK_TEXT) { f = f | SHF_EXECINSTR; }
+    if (kind == of.SK_DATA) { f = f | SHF_WRITE; }
+    if (kind == of.SK_BSS)  { f = f | SHF_WRITE; }
+    ret f;
+}
+
+# ELF symbol type for an abstract section kind (functions live in text).
+fun symbol_type_for(kind: of.SectionKind) u8 {
+    if (kind == of.SK_TEXT) { ret STT_FUNC; }
+    ret STT_OBJECT;
+}
+
+# count the relocations in an image that patch a given section.
+fun count_relocs_for_section(img: *of.ObjectImage, sec_idx: u32) u32 {
+    var count: u32 = 0;
+    var i: u32 = 0;
+    for (i < img.reloc_count) {
+        if (img.relocations[i].section == sec_idx) { count = count + 1; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+# count how many sections carry at least one relocation.
+fun sections_with_relocs(img: *of.ObjectImage) u32 {
+    var count: u32 = 0;
+    var s: u32 = 0;
+    for (s < img.section_count) {
+        if (count_relocs_for_section(img, s) > 0) { count = count + 1; }
+        s = s + 1;
+    }
+    ret count;
+}
+
+# total size of the symbol string table (a leading nul plus each symbol name).
+fun strtab_size(img: *of.ObjectImage) usize {
+    var total: usize = 1;
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        val name: str = resolve(img.symbols[i].name);
+        if (name != nil) { total = total + str_len(name) + 1; } or { total = total + 1; }
+        i = i + 1;
+    }
+    ret total;
+}
+
+# find the elf symbol-table index of the symbol named `name`, after the
+# locals-before-globals reordering captured in `remap`. returns 0 (the
+# reserved undefined entry) when no symbol matches.
+fun find_sym_index(img: *of.ObjectImage, remap: *u32, name: str) u32 {
+    if (name == nil) { ret 0; }
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        val sn: str = resolve(img.symbols[i].name);
+        if (sn != nil && str_equals(sn, name)) { ret remap[i]; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# write one Elf64_Sym entry and advance the string-table cursor `str_pos`.
+fun write_symbol(buf: *u8, sym_off: usize, str_off: usize, str_pos: *usize,
+                 img: *of.ObjectImage, idx: u32, binding: u8) {
+    val name_pos: usize = @str_pos;
+    @str_pos = @str_pos + write_str(buf, str_off + @str_pos, resolve(img.symbols[idx].name));
+    write_u32_le(buf, sym_off, name_pos::u32);
+
+    var sym_type: u8 = STT_NOTYPE;
+    var sec_idx: u16 = 0;
+    if (img.symbols[idx].section != of.SECTION_EXTERNAL && img.symbols[idx].section < img.section_count) {
+        sym_type = symbol_type_for(img.sections[img.symbols[idx].section].kind);
+        sec_idx = (img.symbols[idx].section + 1)::u16;
+    }
+    if ((img.symbols[idx].flags & of.SYM_OBJ_FLAG_FUNCTION) != 0) { sym_type = STT_FUNC; }
+    or ((img.symbols[idx].flags & of.SYM_OBJ_FLAG_OBJECT) != 0) { sym_type = STT_OBJECT; }
+
+    val info: u8 = (binding << 4) | (sym_type & 0xF);
+    buf[sym_off + 4] = info;
+    buf[sym_off + 5] = 0;
+    write_u16_le(buf, sym_off + 6, sec_idx);
+    write_u64_le(buf, sym_off + 8, img.symbols[idx].offset::u64);
+    write_u64_le(buf, sym_off + 16, img.symbols[idx].size::u64);
+}
+
+# emit_object: serialize an ObjectImage to a relocatable ELF64 .o file.
+#
+# the format-writer entry installed in the ELF `of.OfVTable`. lays out section
+# data after the header, then the symbol table (locals before globals), the
+# symbol string table, the section-name string table, per-section `.rela.*`
+# relocation tables, and finally the section-header table. relocation entries
+# carry `r_info = (sym << 32) | type` with `type` mapped from the abstract
+# kind for `tgt_isa`.
+# ---
+# tgt_isa: the instruction-set vtable describing the machine
+# img:     the object image to serialize
+# path:    null-terminated output file path
+# ret:     ok(true) on success, or an error string
+fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) Result[bool, str] {
+    if (tgt_isa == nil || img == nil || path == nil) {
+        ret err[bool, str]("elf: nil writer argument");
+    }
+    val alloc: *Allocator = img.alloc;
+
+    val num_secs:      u32 = img.section_count;
+    val num_syms:      u32 = img.symbol_count;
+    val num_rela_secs: u32 = sections_with_relocs(img);
+
+    # 1 null + sections + .symtab + .strtab + .shstrtab + per-rela sections
+    val total_shdr: u32 = 1 + num_secs + 3 + num_rela_secs;
+    val shdr_table_size: usize = total_shdr::usize * SHDR_SIZE;
+
+    # section-name string table: leading nul, section names, the three fixed
+    # names, then one ".rela<name>" per relocated section.
+    var shstrtab_cap: usize = 1;
+    var s: u32 = 0;
+    for (s < num_secs) {
+        val sn: str = resolve(img.sections[s].name);
+        if (sn != nil) { shstrtab_cap = shstrtab_cap + str_len(sn) + 1; } or { shstrtab_cap = shstrtab_cap + 1; }
+        s = s + 1;
+    }
+    shstrtab_cap = shstrtab_cap + 8 + 8 + 10;
+    s = 0;
+    for (s < num_secs) {
+        if (count_relocs_for_section(img, s) > 0) {
+            val sn: str = resolve(img.sections[s].name);
+            if (sn != nil) { shstrtab_cap = shstrtab_cap + 5 + str_len(sn) + 1; } or { shstrtab_cap = shstrtab_cap + 5 + 1; }
+        }
+        s = s + 1;
+    }
+
+    val res_shstr: Result[*u8, str] = zallocate[u8](alloc, shstrtab_cap);
+    if (is_err[*u8, str](res_shstr)) { ret err[bool, str]("elf: shstrtab alloc failed"); }
+    var shstrtab: *u8 = unwrap_ok[*u8, str](res_shstr);
+
+    val res_names: Result[*u32, str] = zallocate[u32](alloc, (num_secs + 1)::usize);
+    if (is_err[*u32, str](res_names)) {
+        deallocate[u8](alloc, shstrtab, shstrtab_cap);
+        ret err[bool, str]("elf: name table alloc failed");
+    }
+    var name_offsets: *u32 = unwrap_ok[*u32, str](res_names);
+
+    val res_rnames: Result[*u32, str] = zallocate[u32](alloc, (num_secs + 1)::usize);
+    if (is_err[*u32, str](res_rnames)) {
+        deallocate[u8](alloc, shstrtab, shstrtab_cap);
+        deallocate[u32](alloc, name_offsets, (num_secs + 1)::usize);
+        ret err[bool, str]("elf: rela name table alloc failed");
+    }
+    var rela_name_offsets: *u32 = unwrap_ok[*u32, str](res_rnames);
+
+    var shstrtab_off: usize = 1;
+    s = 0;
+    for (s < num_secs) {
+        name_offsets[s] = shstrtab_off::u32;
+        shstrtab_off = shstrtab_off + write_str(shstrtab, shstrtab_off, resolve(img.sections[s].name));
+        s = s + 1;
+    }
+    val symtab_name_off: u32 = shstrtab_off::u32;
+    shstrtab_off = shstrtab_off + write_str(shstrtab, shstrtab_off, ".symtab");
+    val strtab_name_off: u32 = shstrtab_off::u32;
+    shstrtab_off = shstrtab_off + write_str(shstrtab, shstrtab_off, ".strtab");
+    val shstrtab_name_off: u32 = shstrtab_off::u32;
+    shstrtab_off = shstrtab_off + write_str(shstrtab, shstrtab_off, ".shstrtab");
+
+    s = 0;
+    for (s < num_secs) {
+        if (count_relocs_for_section(img, s) > 0) {
+            rela_name_offsets[s] = shstrtab_off::u32;
+            shstrtab[shstrtab_off]     = '.';
+            shstrtab[shstrtab_off + 1] = 'r';
+            shstrtab[shstrtab_off + 2] = 'e';
+            shstrtab[shstrtab_off + 3] = 'l';
+            shstrtab[shstrtab_off + 4] = 'a';
+            shstrtab_off = shstrtab_off + 5;
+            val sn: str = resolve(img.sections[s].name);
+            if (sn != nil) {
+                val nlen: usize = str_len(sn);
+                var ni: usize = 0;
+                for (ni < nlen) {
+                    shstrtab[shstrtab_off] = sn[ni];
+                    shstrtab_off = shstrtab_off + 1;
+                    ni = ni + 1;
+                }
+            }
+            shstrtab[shstrtab_off] = 0;
+            shstrtab_off = shstrtab_off + 1;
+        }
+        s = s + 1;
+    }
+    val shstrtab_len: usize = shstrtab_off;
+
+    # file layout: header, section data, symtab, strtab, shstrtab, rela tables,
+    # section headers.
+    var data_offset: usize = ELF_HEADER_SIZE;
+    s = 0;
+    for (s < num_secs) {
+        if (img.sections[s].kind != of.SK_BSS) {
+            data_offset = align_up(data_offset, img.sections[s].align::usize);
+            data_offset = data_offset + img.sections[s].len::usize;
+        }
+        s = s + 1;
+    }
+
+    val symtab_offset: usize = align_up(data_offset, 8);
+    val symtab_size: usize = (num_syms + 1)::usize * SYM_SIZE;
+    val strtab_offset: usize = symtab_offset + symtab_size;
+    val strtab_sz: usize = strtab_size(img);
+    val shstrtab_offset: usize = strtab_offset + strtab_sz;
+
+    val res_roff: Result[*usize, str] = zallocate[usize](alloc, (num_secs + 1)::usize);
+    if (is_err[*usize, str](res_roff)) {
+        deallocate[u8](alloc, shstrtab, shstrtab_cap);
+        deallocate[u32](alloc, name_offsets, (num_secs + 1)::usize);
+        deallocate[u32](alloc, rela_name_offsets, (num_secs + 1)::usize);
+        ret err[bool, str]("elf: rela offset table alloc failed");
+    }
+    var rela_offsets: *usize = unwrap_ok[*usize, str](res_roff);
+
+    var rela_offset: usize = shstrtab_offset + shstrtab_len;
+    s = 0;
+    for (s < num_secs) {
+        val rc: u32 = count_relocs_for_section(img, s);
+        if (rc > 0) {
+            rela_offset = align_up(rela_offset, 8);
+            rela_offsets[s] = rela_offset;
+            rela_offset = rela_offset + rc::usize * RELA_SIZE;
+        }
+        s = s + 1;
+    }
+
+    val shdr_offset: usize = align_up(rela_offset, 8);
+    val total_file_size: usize = shdr_offset + shdr_table_size;
+
+    val res_buf: Result[*u8, str] = zallocate[u8](alloc, total_file_size);
+    if (is_err[*u8, str](res_buf)) {
+        deallocate[u8](alloc, shstrtab, shstrtab_cap);
+        deallocate[u32](alloc, name_offsets, (num_secs + 1)::usize);
+        deallocate[u32](alloc, rela_name_offsets, (num_secs + 1)::usize);
+        deallocate[usize](alloc, rela_offsets, (num_secs + 1)::usize);
+        ret err[bool, str]("elf: output buffer alloc failed");
+    }
+    var buf: *u8 = unwrap_ok[*u8, str](res_buf);
+
+    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
+    buf[4] = ELFCLASS64;
+    buf[5] = ELFDATA2LSB;
+    buf[6] = EV_CURRENT;
+    buf[7] = ELFOSABI_NONE;
+
+    write_u16_le(buf, 16, ET_REL);
+    write_u16_le(buf, 18, machine_for(tgt_isa.id));
+    write_u32_le(buf, 20, 1);
+    write_u64_le(buf, 24, 0);
+    write_u64_le(buf, 32, 0);
+    write_u64_le(buf, 40, shdr_offset::u64);
+    write_u32_le(buf, 48, 0);
+    write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
+    write_u16_le(buf, 54, 0);
+    write_u16_le(buf, 56, 0);
+    write_u16_le(buf, 58, SHDR_SIZE::u16);
+    write_u16_le(buf, 60, total_shdr::u16);
+    val shstrtab_idx: u16 = (1 + num_secs + 2)::u16;
+    write_u16_le(buf, 62, shstrtab_idx);
+
+    # section data
+    var sec_offset: usize = ELF_HEADER_SIZE;
+    s = 0;
+    for (s < num_secs) {
+        if (img.sections[s].kind != of.SK_BSS) {
+            sec_offset = align_up(sec_offset, img.sections[s].align::usize);
+            if (img.sections[s].bytes != nil && img.sections[s].len > 0) {
+                mem.raw_copy((buf::usize + sec_offset)::ptr, img.sections[s].bytes::ptr, img.sections[s].len::usize);
+            }
+            sec_offset = sec_offset + img.sections[s].len::usize;
+        }
+        s = s + 1;
+    }
+
+    # symbol table: index 0 is the reserved null entry; locals first, then
+    # globals. build the original->elf-index remap for relocation patching.
+    var sym_remap: *u32 = nil;
+    if (num_syms > 0) {
+        val res_remap: Result[*u32, str] = zallocate[u32](alloc, num_syms::usize);
+        if (is_ok[*u32, str](res_remap)) { sym_remap = unwrap_ok[*u32, str](res_remap); }
+    }
+
+    var sym_off: usize = symtab_offset + SYM_SIZE;
+    var str_off: usize = strtab_offset;
+    buf[str_off] = 0;
+    var str_pos: usize = 1;
+    var elf_idx: u32 = 1;
+
+    var symi: u32 = 0;
+    for (symi < num_syms) {
+        if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { symi = symi + 1; cnt; }
+        if (sym_remap != nil) { sym_remap[symi] = elf_idx; }
+        write_symbol(buf, sym_off, str_off, ?str_pos, img, symi, STB_LOCAL);
+        sym_off = sym_off + SYM_SIZE;
+        elf_idx = elf_idx + 1;
+        symi = symi + 1;
+    }
+    val first_global: u32 = elf_idx;
+    symi = 0;
+    for (symi < num_syms) {
+        if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { symi = symi + 1; cnt; }
+        if (sym_remap != nil) { sym_remap[symi] = elf_idx; }
+        # a WEAK symbol (a monomorphized generic instance, emitted into every
+        # using object) gets STB_WEAK so the linker collapses the duplicates to
+        # one definition rather than rejecting them as a multiple definition.
+        var bind: u8 = STB_GLOBAL;
+        if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_WEAK) != 0) { bind = STB_WEAK; }
+        write_symbol(buf, sym_off, str_off, ?str_pos, img, symi, bind);
+        sym_off = sym_off + SYM_SIZE;
+        elf_idx = elf_idx + 1;
+        symi = symi + 1;
+    }
+
+    mem.raw_copy((buf::usize + shstrtab_offset)::ptr, shstrtab::ptr, shstrtab_len);
+
+    # per-section relocation tables
+    s = 0;
+    for (s < num_secs) {
+        val rc: u32 = count_relocs_for_section(img, s);
+        if (rc > 0) {
+            var ro: usize = rela_offsets[s];
+            var ri: u32 = 0;
+            for (ri < img.reloc_count) {
+                if (img.relocations[ri].section == s) {
+                    write_u64_le(buf, ro, img.relocations[ri].offset::u64);
+                    var elf_sym: u64 = 0;
+                    if (sym_remap != nil) {
+                        elf_sym = find_sym_index(img, sym_remap, resolve(img.relocations[ri].symbol))::u64;
+                    }
+                    val elf_type: u32 = reloc_type_for(img.relocations[ri].kind, tgt_isa.id);
+                    val r_info: u64 = (elf_sym << 32) | elf_type::u64;
+                    write_u64_le(buf, ro + 8, r_info);
+                    write_u64_le(buf, ro + 16, img.relocations[ri].addend::u64);
+                    ro = ro + RELA_SIZE;
+                }
+                ri = ri + 1;
+            }
+        }
+        s = s + 1;
+    }
+
+    # section-header table: null, sections, .symtab, .strtab, .shstrtab, relas.
+    var shdr_pos: usize = shdr_offset;
+    mem.raw_zero((buf::usize + shdr_pos)::ptr, SHDR_SIZE);
+    shdr_pos = shdr_pos + SHDR_SIZE;
+
+    sec_offset = ELF_HEADER_SIZE;
+    s = 0;
+    for (s < num_secs) {
+        var this_off: usize = 0;
+        if (img.sections[s].kind != of.SK_BSS) {
+            sec_offset = align_up(sec_offset, img.sections[s].align::usize);
+            this_off = sec_offset;
+        }
+        write_u32_le(buf, shdr_pos, name_offsets[s]);
+        write_u32_le(buf, shdr_pos + 4, section_type_for(img.sections[s].kind));
+        write_u64_le(buf, shdr_pos + 8, section_flags_for(img.sections[s].kind));
+        write_u64_le(buf, shdr_pos + 16, 0);
+        if (img.sections[s].kind == of.SK_BSS) {
+            write_u64_le(buf, shdr_pos + 24, 0);
+        } or {
+            write_u64_le(buf, shdr_pos + 24, this_off::u64);
+        }
+        write_u64_le(buf, shdr_pos + 32, img.sections[s].len::u64);
+        write_u32_le(buf, shdr_pos + 40, 0);
+        write_u32_le(buf, shdr_pos + 44, 0);
+        var sec_align: usize = img.sections[s].align::usize;
+        if (sec_align == 0) { sec_align = 1; }
+        write_u64_le(buf, shdr_pos + 48, sec_align::u64);
+        write_u64_le(buf, shdr_pos + 56, 0);
+        shdr_pos = shdr_pos + SHDR_SIZE;
+        if (img.sections[s].kind != of.SK_BSS) {
+            sec_offset = sec_offset + img.sections[s].len::usize;
+        }
+        s = s + 1;
+    }
+
+    val symtab_shidx: u32 = 1 + num_secs;
+    write_u32_le(buf, shdr_pos, symtab_name_off);
+    write_u32_le(buf, shdr_pos + 4, SHT_SYMTAB);
+    write_u64_le(buf, shdr_pos + 8, 0);
+    write_u64_le(buf, shdr_pos + 16, 0);
+    write_u64_le(buf, shdr_pos + 24, symtab_offset::u64);
+    write_u64_le(buf, shdr_pos + 32, symtab_size::u64);
+    write_u32_le(buf, shdr_pos + 40, (symtab_shidx + 1)::u32);
+    write_u32_le(buf, shdr_pos + 44, first_global::u32);
+    write_u64_le(buf, shdr_pos + 48, 8);
+    write_u64_le(buf, shdr_pos + 56, SYM_SIZE::u64);
+    shdr_pos = shdr_pos + SHDR_SIZE;
+
+    write_u32_le(buf, shdr_pos, strtab_name_off);
+    write_u32_le(buf, shdr_pos + 4, SHT_STRTAB);
+    write_u64_le(buf, shdr_pos + 8, 0);
+    write_u64_le(buf, shdr_pos + 16, 0);
+    write_u64_le(buf, shdr_pos + 24, strtab_offset::u64);
+    write_u64_le(buf, shdr_pos + 32, strtab_sz::u64);
+    write_u32_le(buf, shdr_pos + 40, 0);
+    write_u32_le(buf, shdr_pos + 44, 0);
+    write_u64_le(buf, shdr_pos + 48, 1);
+    write_u64_le(buf, shdr_pos + 56, 0);
+    shdr_pos = shdr_pos + SHDR_SIZE;
+
+    write_u32_le(buf, shdr_pos, shstrtab_name_off);
+    write_u32_le(buf, shdr_pos + 4, SHT_STRTAB);
+    write_u64_le(buf, shdr_pos + 8, 0);
+    write_u64_le(buf, shdr_pos + 16, 0);
+    write_u64_le(buf, shdr_pos + 24, shstrtab_offset::u64);
+    write_u64_le(buf, shdr_pos + 32, shstrtab_len::u64);
+    write_u32_le(buf, shdr_pos + 40, 0);
+    write_u32_le(buf, shdr_pos + 44, 0);
+    write_u64_le(buf, shdr_pos + 48, 1);
+    write_u64_le(buf, shdr_pos + 56, 0);
+    shdr_pos = shdr_pos + SHDR_SIZE;
+
+    s = 0;
+    for (s < num_secs) {
+        val rc: u32 = count_relocs_for_section(img, s);
+        if (rc > 0) {
+            write_u32_le(buf, shdr_pos, rela_name_offsets[s]);
+            write_u32_le(buf, shdr_pos + 4, SHT_RELA);
+            write_u64_le(buf, shdr_pos + 8, 0);
+            write_u64_le(buf, shdr_pos + 16, 0);
+            write_u64_le(buf, shdr_pos + 24, rela_offsets[s]::u64);
+            write_u64_le(buf, shdr_pos + 32, (rc::usize * RELA_SIZE)::u64);
+            write_u32_le(buf, shdr_pos + 40, symtab_shidx::u32);
+            write_u32_le(buf, shdr_pos + 44, (s + 1)::u32);
+            write_u64_le(buf, shdr_pos + 48, 8);
+            write_u64_le(buf, shdr_pos + 56, RELA_SIZE::u64);
+            shdr_pos = shdr_pos + SHDR_SIZE;
+        }
+        s = s + 1;
+    }
+
+    if (sym_remap != nil) { deallocate[u32](alloc, sym_remap, num_syms::usize); }
+
+    val res_file: Result[fs.File, str] = fs.create(path, 0o644);
+    if (is_err[fs.File, str](res_file)) {
+        deallocate[u8](alloc, buf, total_file_size);
+        deallocate[u8](alloc, shstrtab, shstrtab_cap);
+        deallocate[u32](alloc, name_offsets, (num_secs + 1)::usize);
+        deallocate[u32](alloc, rela_name_offsets, (num_secs + 1)::usize);
+        deallocate[usize](alloc, rela_offsets, (num_secs + 1)::usize);
+        ret err[bool, str]("elf: could not create output file");
+    }
+    var f: fs.File = unwrap_ok[fs.File, str](res_file);
+    val res_write: Result[usize, str] = fs.write(?f, buf, total_file_size);
+    fs.close(?f);
+
+    deallocate[u8](alloc, buf, total_file_size);
+    deallocate[u8](alloc, shstrtab, shstrtab_cap);
+    deallocate[u32](alloc, name_offsets, (num_secs + 1)::usize);
+    deallocate[u32](alloc, rela_name_offsets, (num_secs + 1)::usize);
+    deallocate[usize](alloc, rela_offsets, (num_secs + 1)::usize);
+
+    if (is_err[usize, str](res_write)) { ret err[bool, str]("elf: write failed"); }
+    ret ok[bool, str](true);
+}
+
+# the ELF object-format vtable plus its relocation-kind table, populated by
+# register and handed out as borrowed pointers for the process lifetime.
+var elf_vtable: of.OfVTable;
+var elf_reloc_kinds: [5]of.RelocationKind;
+var elf_registered: bool = false;
+
+# register: build the ELF OfVTable and install it into the format registry.
+#
+# captures the interner so the writer can resolve `intern.StrId` names, interns
+# the format name ("elf"), extension ("o"), and the five abstract relocation
+# kind names, fills the relocation-kind table and the module-level vtable, and
+# registers it under `of.OF_ELF`. idempotent: a second call returns ok without
+# re-interning.
+# ---
+# i:   interner used to intern the vtable's string fields and capture for the writer
+# ret: ok(true) on success, or an allocation error from interning
+pub fun register(i: *intern.Interner) Result[bool, str] {
+    elf_interner = i;
+    if (elf_registered) { ret ok[bool, str](true); }
+
+    val rname: Result[intern.StrId, str] = intern.intern(i, "elf");
+    if (is_err[intern.StrId, str](rname)) { ret err[bool, str](unwrap_err[intern.StrId, str](rname)); }
+    val rext: Result[intern.StrId, str] = intern.intern(i, "o");
+    if (is_err[intern.StrId, str](rext)) { ret err[bool, str](unwrap_err[intern.StrId, str](rext)); }
+
+    val ra: Result[intern.StrId, str] = intern.intern(i, "abs64");
+    if (is_err[intern.StrId, str](ra)) { ret err[bool, str](unwrap_err[intern.StrId, str](ra)); }
+    val rp: Result[intern.StrId, str] = intern.intern(i, "pc32");
+    if (is_err[intern.StrId, str](rp)) { ret err[bool, str](unwrap_err[intern.StrId, str](rp)); }
+    val rpl: Result[intern.StrId, str] = intern.intern(i, "plt32");
+    if (is_err[intern.StrId, str](rpl)) { ret err[bool, str](unwrap_err[intern.StrId, str](rpl)); }
+    val rg: Result[intern.StrId, str] = intern.intern(i, "gotpcrel");
+    if (is_err[intern.StrId, str](rg)) { ret err[bool, str](unwrap_err[intern.StrId, str](rg)); }
+    val rs: Result[intern.StrId, str] = intern.intern(i, "abs32s");
+    if (is_err[intern.StrId, str](rs)) { ret err[bool, str](unwrap_err[intern.StrId, str](rs)); }
+
+    rk_abs64    = unwrap_ok[intern.StrId, str](ra);
+    rk_pc32     = unwrap_ok[intern.StrId, str](rp);
+    rk_plt32    = unwrap_ok[intern.StrId, str](rpl);
+    rk_gotpcrel = unwrap_ok[intern.StrId, str](rg);
+    rk_abs32s   = unwrap_ok[intern.StrId, str](rs);
+
+    elf_reloc_kinds[0].id = of.RK_ABS64::u32;    elf_reloc_kinds[0].name = rk_abs64;    elf_reloc_kinds[0].bit_width = 64; elf_reloc_kinds[0].pc_rel = false;
+    elf_reloc_kinds[1].id = of.RK_PC32::u32;     elf_reloc_kinds[1].name = rk_pc32;     elf_reloc_kinds[1].bit_width = 32; elf_reloc_kinds[1].pc_rel = true;
+    elf_reloc_kinds[2].id = of.RK_PLT32::u32;    elf_reloc_kinds[2].name = rk_plt32;    elf_reloc_kinds[2].bit_width = 32; elf_reloc_kinds[2].pc_rel = true;
+    elf_reloc_kinds[3].id = of.RK_GOTPCREL::u32; elf_reloc_kinds[3].name = rk_gotpcrel; elf_reloc_kinds[3].bit_width = 32; elf_reloc_kinds[3].pc_rel = true;
+    elf_reloc_kinds[4].id = of.RK_ABS32S::u32;   elf_reloc_kinds[4].name = rk_abs32s;   elf_reloc_kinds[4].bit_width = 32; elf_reloc_kinds[4].pc_rel = false;
+
+    elf_vtable.id               = of.OF_ELF;
+    elf_vtable.name             = unwrap_ok[intern.StrId, str](rname);
+    elf_vtable.file_extension   = unwrap_ok[intern.StrId, str](rext);
+    elf_vtable.emit_object      = emit_object;
+    elf_vtable.parse_object     = parse_object;
+    elf_vtable.emit_exec        = emit_exec;
+    elf_vtable.relocation_kinds = ?elf_reloc_kinds[0];
+    elf_vtable.relocation_count = 5;
+
+    of.register(?elf_vtable);
+    elf_registered = true;
+    ret ok[bool, str](true);
+}
+
+# pf_flags_for: map the format-neutral segment permission bits onto the ELF
+# program-header PF_* flags. an unflagged segment defaults to read-only so a
+# loadable segment is never produced with no permissions.
+fun pf_flags_for(flags: u32) u32 {
+    var f: u32 = 0;
+    if ((flags & of.SEG_FLAG_READ) != 0)    { f = f | PF_R; }
+    if ((flags & of.SEG_FLAG_WRITE) != 0)   { f = f | PF_W; }
+    if ((flags & of.SEG_FLAG_EXECUTE) != 0) { f = f | PF_X; }
+    if (f == 0) { f = PF_R; }
+    ret f;
+}
+
+# emit_exec: write a static ET_EXEC executable. installed in the ELF
+# `of.OfVTable` as its `of.ExecFn`.
+#
+# emits the ELF header, a program-header table, then the loadable segments. the
+# first PT_LOAD always covers the ELF header and the program headers so the
+# loader maps them; each provided segment becomes a page-aligned PT_LOAD at its
+# `vaddr`. the linker computes vaddrs (from the os base address) and the entry
+# address before calling this. each segment's file offset is page-aligned so
+# `offset % page == vaddr % page` holds for the loader.
+# ---
+# alloc:     allocator for the output buffer and the segment-offset scratch
+# tgt_isa:   the instruction-set vtable selecting the ELF machine type
+# segs:      loadable segments, in ascending virtual-address order
+# seg_count: number of segments
+# entry:     program entry-point virtual address
+# path:      null-terminated output file path
+# ret:       ok(true) on success, or an error string
+fun emit_exec(alloc: *Allocator, tgt_isa: *isa.IsaVTable, segs: *of.LoadSegment,
+              seg_count: u32, entry: u64, path: *u8) Result[bool, str] {
+    if (tgt_isa == nil) { ret err[bool, str]("elf: nil exec isa"); }
+    if (path == nil) { ret err[bool, str]("elf: nil exec path"); }
+
+    val phdr_count: u32 = seg_count + 1;
+    val phdr_offset: usize = ELF_HEADER_SIZE;
+    val phdr_table_size: usize = phdr_count::usize * PHDR_SIZE;
+
+    # per-segment file offsets; the neutral LoadSegment carries no offset field,
+    # so the layout is computed into a scratch array indexed by segment.
+    var seg_offsets: *usize = nil;
+    if (seg_count > 0) {
+        val ro: Result[*usize, str] = zallocate[usize](alloc, seg_count::usize);
+        if (is_err[*usize, str](ro)) { ret err[bool, str]("elf: exec offset table alloc failed"); }
+        seg_offsets = unwrap_ok[*usize, str](ro);
+    }
+
+    var total_size: usize = align_up(phdr_offset + phdr_table_size, EXEC_PAGE_SIZE::usize);
+    var li: u32 = 0;
+    for (li < seg_count) {
+        total_size = align_up(total_size, EXEC_PAGE_SIZE::usize);
+        seg_offsets[li] = total_size;
+        total_size = total_size + segs[li].filesz;
+        li = li + 1;
+    }
+
+    val res_buf: Result[*u8, str] = zallocate[u8](alloc, total_size);
+    if (is_err[*u8, str](res_buf)) {
+        if (seg_offsets != nil) { deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+        ret err[bool, str]("elf: exec buffer alloc failed");
+    }
+    var buf: *u8 = unwrap_ok[*u8, str](res_buf);
+
+    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
+    buf[4] = ELFCLASS64;
+    buf[5] = ELFDATA2LSB;
+    buf[6] = EV_CURRENT;
+    buf[7] = ELFOSABI_NONE;
+
+    write_u16_le(buf, 16, ET_EXEC);
+    write_u16_le(buf, 18, machine_for(tgt_isa.id));
+    write_u32_le(buf, 20, 1);
+    write_u64_le(buf, 24, entry);
+    write_u64_le(buf, 32, phdr_offset::u64);
+    write_u64_le(buf, 40, 0);
+    write_u32_le(buf, 48, 0);
+    write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
+    write_u16_le(buf, 54, PHDR_SIZE::u16);
+    write_u16_le(buf, 56, phdr_count::u16);
+    write_u16_le(buf, 58, SHDR_SIZE::u16);
+    write_u16_le(buf, 60, 0);
+    write_u16_le(buf, 62, 0);
+
+    var phdr_pos: usize = phdr_offset;
+
+    # leading PT_LOAD covering the ELF header and the program headers.
+    var hdr_vaddr: u64 = entry & ~(EXEC_PAGE_SIZE - 1);
+    if (seg_count > 0) { hdr_vaddr = segs[0].vaddr & ~(EXEC_PAGE_SIZE - 1); }
+    val hdr_filesz: usize = phdr_offset + phdr_table_size;
+    write_u32_le(buf, phdr_pos, PT_LOAD);
+    write_u32_le(buf, phdr_pos + 4, PF_R);
+    write_u64_le(buf, phdr_pos + 8, 0);
+    write_u64_le(buf, phdr_pos + 16, hdr_vaddr);
+    write_u64_le(buf, phdr_pos + 24, hdr_vaddr);
+    write_u64_le(buf, phdr_pos + 32, hdr_filesz::u64);
+    write_u64_le(buf, phdr_pos + 40, hdr_filesz::u64);
+    write_u64_le(buf, phdr_pos + 48, EXEC_PAGE_SIZE);
+    phdr_pos = phdr_pos + PHDR_SIZE;
+
+    li = 0;
+    for (li < seg_count) {
+        write_u32_le(buf, phdr_pos, PT_LOAD);
+        write_u32_le(buf, phdr_pos + 4, pf_flags_for(segs[li].flags));
+        write_u64_le(buf, phdr_pos + 8, seg_offsets[li]::u64);
+        write_u64_le(buf, phdr_pos + 16, segs[li].vaddr);
+        write_u64_le(buf, phdr_pos + 24, segs[li].vaddr);
+        write_u64_le(buf, phdr_pos + 32, segs[li].filesz::u64);
+        write_u64_le(buf, phdr_pos + 40, segs[li].memsz::u64);
+        write_u64_le(buf, phdr_pos + 48, EXEC_PAGE_SIZE);
+        phdr_pos = phdr_pos + PHDR_SIZE;
+
+        if (segs[li].bytes != nil && segs[li].filesz > 0) {
+            mem.raw_copy((buf::usize + seg_offsets[li])::ptr, segs[li].bytes::ptr, segs[li].filesz);
+        }
+        li = li + 1;
+    }
+
+    if (seg_offsets != nil) { deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+
+    val res_file: Result[fs.File, str] = fs.create(path, 0o755);
+    if (is_err[fs.File, str](res_file)) {
+        deallocate[u8](alloc, buf, total_size);
+        ret err[bool, str]("elf: could not create executable file");
+    }
+    var f: fs.File = unwrap_ok[fs.File, str](res_file);
+    val res_write: Result[usize, str] = fs.write(?f, buf, total_size);
+    fs.close(?f);
+    deallocate[u8](alloc, buf, total_size);
+
+    if (is_err[usize, str](res_write)) { ret err[bool, str]("elf: exec write failed"); }
+    ret ok[bool, str](true);
+}
+
+# parse_object: parse a relocatable ELF64 object into an ObjectImage.
+#
+# reads the section, symbol, and relocation tables of a `.o` produced by
+# `emit_object` (or a compatible toolchain) into a fresh `of.ObjectImage`
+# owning copied section bytes and interned names. relocation kinds are mapped
+# from the ELF machine type back to the abstract `RK_*` names; symbol and
+# section references are kept by interned name so the linker matches across
+# objects. the captured interner (see `register`) interns the names.
+# ---
+# alloc:    allocator for the image and its arrays
+# buf:      the object file bytes
+# buf_size: length of `buf`
+# out:      image to populate (its arrays are allocated here)
+# ret:      ok(true) on success, or an error string
+pub fun parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.ObjectImage) Result[bool, str] {
+    if (buf == nil || out == nil || buf_size < ELF_HEADER_SIZE) {
+        ret err[bool, str]("elf: object too small");
+    }
+    if (buf[0] != 0x7F || buf[1] != 0x45 || buf[2] != 0x4C || buf[3] != 0x46) {
+        ret err[bool, str]("elf: bad magic");
+    }
+    if (elf_interner == nil) { ret err[bool, str]("elf: no interner registered"); }
+
+    val e_shoff:     usize = read_u64_le(buf, 40)::usize;
+    val e_shentsize: u16   = read_u16_le(buf, 58);
+    val e_shnum:     u16   = read_u16_le(buf, 60);
+    val e_shstrndx:  u16   = read_u16_le(buf, 62);
+    if (e_shoff == 0 || e_shnum == 0) { ret err[bool, str]("elf: no section headers"); }
+
+    var shstrtab: *u8 = nil;
+    if (e_shstrndx < e_shnum) {
+        val so: usize = e_shoff + e_shstrndx::usize * e_shentsize::usize;
+        shstrtab = (buf::usize + read_u64_le(buf, so + 24)::usize)::*u8;
+    }
+
+    var strtab: *u8 = nil;
+    var symtab: *u8 = nil;
+    var symtab_count: u32 = 0;
+    var sh: u16 = 0;
+    for (sh < e_shnum) {
+        val so: usize = e_shoff + sh::usize * e_shentsize::usize;
+        if (read_u32_le(buf, so + 4) == SHT_SYMTAB) {
+            symtab = (buf::usize + read_u64_le(buf, so + 24)::usize)::*u8;
+            val sz: usize = read_u64_le(buf, so + 32)::usize;
+            val ent: usize = read_u64_le(buf, so + 56)::usize;
+            if (ent > 0) { symtab_count = (sz / ent)::u32; }
+            val link: u32 = read_u32_le(buf, so + 40);
+            if (link < e_shnum::u32) {
+                val lo: usize = e_shoff + link::usize * e_shentsize::usize;
+                strtab = (buf::usize + read_u64_le(buf, lo + 24)::usize)::*u8;
+            }
+        }
+        sh = sh + 1;
+    }
+
+    # count progbits/nobits sections and total relocations for allocation.
+    var sec_n: u32 = 0;
+    var rel_n: u32 = 0;
+    sh = 0;
+    for (sh < e_shnum) {
+        val so: usize = e_shoff + sh::usize * e_shentsize::usize;
+        val ty: u32 = read_u32_le(buf, so + 4);
+        if (ty == SHT_PROGBITS || ty == SHT_NOBITS) { sec_n = sec_n + 1; }
+        if (ty == SHT_RELA) { rel_n = rel_n + (read_u64_le(buf, so + 32)::usize / RELA_SIZE)::u32; }
+        sh = sh + 1;
+    }
+    val sym_n: u32 = symtab_count;
+
+    out.alloc = alloc;
+    out.section_count = 0;
+    out.symbol_count = 0;
+    out.reloc_count = 0;
+    out.sections = nil;
+    out.symbols = nil;
+    out.relocations = nil;
+
+    if (sec_n > 0) {
+        val rsec: Result[*of.Section, str] = zallocate[of.Section](alloc, sec_n::usize);
+        if (is_err[*of.Section, str](rsec)) { ret err[bool, str]("elf: section array alloc failed"); }
+        out.sections = unwrap_ok[*of.Section, str](rsec);
+    }
+    if (sym_n > 0) {
+        val rsym: Result[*of.Symbol, str] = zallocate[of.Symbol](alloc, sym_n::usize);
+        if (is_err[*of.Symbol, str](rsym)) { ret err[bool, str]("elf: symbol array alloc failed"); }
+        out.symbols = unwrap_ok[*of.Symbol, str](rsym);
+    }
+    if (rel_n > 0) {
+        val rrel: Result[*of.Relocation, str] = zallocate[of.Relocation](alloc, rel_n::usize);
+        if (is_err[*of.Relocation, str](rrel)) { ret err[bool, str]("elf: reloc array alloc failed"); }
+        out.relocations = unwrap_ok[*of.Relocation, str](rrel);
+    }
+
+    # map ELF section header index -> ObjectImage section index.
+    val res_map: Result[*i32, str] = zallocate[i32](alloc, e_shnum::usize);
+    if (is_err[*i32, str](res_map)) { ret err[bool, str]("elf: section map alloc failed"); }
+    var sec_map: *i32 = unwrap_ok[*i32, str](res_map);
+
+    sh = 0;
+    for (sh < e_shnum) {
+        sec_map[sh] = -1;
+        val so: usize = e_shoff + sh::usize * e_shentsize::usize;
+        val ty: u32 = read_u32_le(buf, so + 4);
+        if (ty == SHT_PROGBITS || ty == SHT_NOBITS) {
+            val flags: u64 = read_u64_le(buf, so + 8);
+            var kind: of.SectionKind = of.SK_DATA;
+            if ((flags & SHF_ALLOC) == 0) { kind = of.SK_DEBUG; }
+            or ((flags & SHF_EXECINSTR) != 0) { kind = of.SK_TEXT; }
+            or (ty == SHT_NOBITS) { kind = of.SK_BSS; }
+            or ((flags & SHF_WRITE) == 0) { kind = of.SK_RODATA; }
+
+            var sec_name: str = "";
+            if (shstrtab != nil) {
+                sec_name = (shstrtab::usize + read_u32_le(buf, so)::usize)::str;
+            }
+            val rin: Result[intern.StrId, str] = intern.intern(elf_interner, sec_name);
+            if (is_err[intern.StrId, str](rin)) { ret err[bool, str](unwrap_err[intern.StrId, str](rin)); }
+
+            val idx: u32 = out.section_count;
+            out.sections[idx].name  = unwrap_ok[intern.StrId, str](rin);
+            out.sections[idx].kind  = kind;
+            out.sections[idx].align = read_u64_le(buf, so + 48)::u32;
+            out.sections[idx].len   = read_u64_le(buf, so + 32)::u32;
+            out.sections[idx].bytes = nil;
+            if (ty != SHT_NOBITS && out.sections[idx].len > 0) {
+                val sz: usize = out.sections[idx].len::usize;
+                val rb: Result[*u8, str] = allocate[u8](alloc, sz);
+                if (is_err[*u8, str](rb)) { ret err[bool, str]("elf: section bytes alloc failed"); }
+                out.sections[idx].bytes = unwrap_ok[*u8, str](rb);
+                val src: *u8 = (buf::usize + read_u64_le(buf, so + 24)::usize)::*u8;
+                mem.raw_copy(out.sections[idx].bytes::ptr, src::ptr, sz);
+            }
+            sec_map[sh] = idx::i32;
+            out.section_count = out.section_count + 1;
+        }
+        sh = sh + 1;
+    }
+
+    # symbols (skip the reserved index-0 entry).
+    if (symtab != nil && strtab != nil) {
+        var si: u32 = 1;
+        for (si < sym_n) {
+            val so: usize = si::usize * SYM_SIZE;
+            val st_name:  u32 = read_u32_le(symtab, so);
+            val st_info:  u8  = symtab[so + 4];
+            val st_shndx: u16 = read_u16_le(symtab, so + 6);
+            val st_value: u64 = read_u64_le(symtab, so + 8);
+            val st_size:  u64 = read_u64_le(symtab, so + 16);
+
+            val name: str = (strtab::usize + st_name::usize)::str;
+            val rin: Result[intern.StrId, str] = intern.intern(elf_interner, name);
+            if (is_err[intern.StrId, str](rin)) { ret err[bool, str](unwrap_err[intern.StrId, str](rin)); }
+
+            val idx: u32 = out.symbol_count;
+            out.symbols[idx].name = unwrap_ok[intern.StrId, str](rin);
+            out.symbols[idx].offset = st_value::u32;
+            out.symbols[idx].size = st_size::u32;
+            var flags: u32 = 0;
+            if ((st_info >> 4) == STB_GLOBAL) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
+            # a STB_WEAK symbol is cross-object-visible (GLOBAL) but overridable:
+            # the linker keeps the first definition and skips later weak ones, so
+            # the duplicate instance bodies collapse to one.
+            or ((st_info >> 4) == STB_WEAK) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK; }
+            if ((st_info & 0xF) == STT_FUNC) { flags = flags | of.SYM_OBJ_FLAG_FUNCTION; }
+            or ((st_info & 0xF) == STT_OBJECT) { flags = flags | of.SYM_OBJ_FLAG_OBJECT; }
+            if (st_shndx == 0) {
+                flags = flags | of.SYM_OBJ_FLAG_EXTERN;
+                out.symbols[idx].section = of.SECTION_EXTERNAL;
+            } or (st_shndx < e_shnum && sec_map[st_shndx] >= 0) {
+                out.symbols[idx].section = sec_map[st_shndx]::u32;
+            } or {
+                out.symbols[idx].section = of.SECTION_EXTERNAL;
+            }
+            out.symbols[idx].flags = flags;
+            out.symbol_count = out.symbol_count + 1;
+            si = si + 1;
+        }
+    }
+
+    # relocations: pair each RELA section with the section it patches (sh_info).
+    sh = 0;
+    for (sh < e_shnum) {
+        val so: usize = e_shoff + sh::usize * e_shentsize::usize;
+        if (read_u32_le(buf, so + 4) == SHT_RELA) {
+            val r_base: usize = read_u64_le(buf, so + 24)::usize;
+            val r_size: usize = read_u64_le(buf, so + 32)::usize;
+            val sh_info: u32 = read_u32_le(buf, so + 44);
+            val count: u32 = (r_size / RELA_SIZE)::u32;
+            var target_sec: i32 = -1;
+            if (sh_info < e_shnum::u32) { target_sec = sec_map[sh_info]; }
+
+            var ri: u32 = 0;
+            for (ri < count) {
+                val ro: usize = r_base + ri::usize * RELA_SIZE;
+                val r_info: u64 = read_u64_le(buf, ro + 8);
+                val r_type: u32 = (r_info & 0xFFFFFFFF)::u32;
+                val r_sym:  u32 = (r_info >> 32)::u32;
+
+                val idx: u32 = out.reloc_count;
+                if (target_sec >= 0) { out.relocations[idx].section = target_sec::u32; }
+                or { out.relocations[idx].section = of.SECTION_EXTERNAL; }
+                out.relocations[idx].offset = read_u64_le(buf, ro)::u32;
+                out.relocations[idx].addend = read_u64_le(buf, ro + 16)::i64;
+                out.relocations[idx].kind = reloc_kind_for(r_type);
+                # r_sym indexes the on-disk symtab (1-based, index 0 reserved),
+                # so the ObjectImage symbol is r_sym - 1.
+                if (r_sym > 0 && (r_sym - 1) < out.symbol_count) {
+                    out.relocations[idx].symbol = out.symbols[r_sym - 1].name;
+                } or {
+                    out.relocations[idx].symbol = intern.STR_NIL;
+                }
+                out.reloc_count = out.reloc_count + 1;
+                ri = ri + 1;
+            }
+        }
+        sh = sh + 1;
+    }
+
+    deallocate[i32](alloc, sec_map, e_shnum::usize);
+    ret ok[bool, str](true);
+}
+
+# apply_reloc: patch a relocation into a section's bytes.
+#
+# resolves one abstract relocation in place. `sym_addr` is the final virtual
+# address of the referenced symbol and `patch_addr` is the virtual address of
+# the patch site (the section base plus the relocation offset). ABS64 writes an
+# 8-byte absolute; PC32/PLT32/GOTPCREL write a 4-byte pc-relative displacement
+# (`sym + addend - patch`); ABS32S writes a 4-byte signed absolute.
+# ---
+# bytes:      the section bytes being patched
+# offset:     byte offset of the patch site within the section
+# kind:       the abstract relocation-kind name (one of the interned RK_* names)
+# addend:     constant added to the resolved symbol address
+# sym_addr:   final virtual address of the referenced symbol
+# patch_addr: virtual address of the patch site
+# ret:        ok(true) on success, or an error string for an unknown kind
+pub fun apply_reloc(bytes: *u8, offset: u32, kind: intern.StrId, addend: i64,
+                    sym_addr: u64, patch_addr: u64) Result[bool, str] {
+    val off: usize = offset::usize;
+    if (kind == rk_abs64) {
+        write_u64_le(bytes, off, sym_addr + addend::u64);
+        ret ok[bool, str](true);
+    }
+    if (kind == rk_pc32 || kind == rk_plt32 || kind == rk_gotpcrel) {
+        write_u32_le(bytes, off, (sym_addr::i64 + addend - patch_addr::i64)::u32);
+        ret ok[bool, str](true);
+    }
+    if (kind == rk_abs32s) {
+        write_u32_le(bytes, off, (sym_addr::i64 + addend)::u32);
+        ret ok[bool, str](true);
+    }
+    ret err[bool, str]("elf: relocation kind not supported");
+}

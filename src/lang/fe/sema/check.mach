@@ -1,0 +1,940 @@
+# mach.lang.fe.sema.check: type checking for semantic analysis.
+#
+# where infer computes the type of every expression bottom-up, check
+# validates that those types compose correctly at the sites that constrain
+# them — assignments, calls, index and member access, casts, returns, and
+# conditions — and reports a diagnostic with the canonical sema prefix when
+# they do not.
+#
+# every check tolerates the poison type: a `TYPE_ERROR` operand short-
+# circuits to success (or to an error-typed result) so a single upstream
+# failure produces exactly one diagnostic instead of a cascade.
+#
+# assignability is literal coercion followed by identity (see `coerce`):
+# an untyped literal is first offered the expected type, and only if that
+# fails are the two types compared for identity. there is no implicit
+# widening between typed values.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.is_none;
+use std.types.option.unwrap;
+use std.types.char.char;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.size.usize;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.is_ok;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use ty:    mach.lang.type;
+use diag:  mach.lang.diagnostic;
+use intern: mach.lang.intern;
+use sess:   mach.lang.session;
+use token: mach.lang.fe.token;
+use ast:   mach.lang.fe.ast;
+use id:    mach.lang.fe.ast.id;
+use expr:  mach.lang.fe.ast.expr;
+use adecl: mach.lang.fe.ast.decl;
+use comptime: mach.lang.fe.comptime;
+use resolve: mach.lang.fe.resolve;
+use sema:  mach.lang.fe.sema.context;
+use coerce: mach.lang.fe.sema.coerce;
+use generics: mach.lang.fe.sema.generics;
+
+# check_assignable: checks that a value of type `actual` may flow into a slot of type `expected`; callers coerce literals themselves before delegating here, so this is a pure type relation (identity first, then the structural assignability rule from `coerce`), recording a `type mismatch:` diagnostic against `span` on failure.
+# ---
+# sc:       the active sema context
+# expected: the destination slot's type
+# actual:   the source value's (already-coerced) type
+# span:     source range to attribute a mismatch to
+# ret:      true when the value is assignable, false (with a diagnostic) otherwise
+pub fun check_assignable(sc: *sema.SemaContext, expected: ty.TypeId, actual: ty.TypeId, span: token.Span) bool {
+    if (expected == ty.TYPE_ERROR || actual == ty.TYPE_ERROR) { ret true; }
+    if (expected == actual) { ret true; }
+
+    if (coerce.is_assignable(sc, actual, expected)) { ret true; }
+
+    report_mismatch(sc, span, expected, actual,
+        "mach has no implicit widening; cast the value with `value::Type`");
+    ret false;
+}
+
+# checks a call against the callee's function signature: the callee type
+# must be a function, the argument count must match the fixed parameter
+# count (or be at least that many for a variadic function), and each fixed
+# argument must be assignable to its parameter. trailing variadic arguments
+# carry their inferred types unchecked, as the C-ABI variadic contract
+# imposes no parameter type. argument expressions are taken from
+# `sc.a.expr_ids[args_start ..]`, which allows untyped-literal arguments to
+# coerce to their parameter type.
+# ---
+# sc:         the active sema context
+# callee_sig: the callee's type; must be TYPE_FUN
+# args_start: start index into sc.a.expr_ids for the argument expressions
+# args_len:   number of arguments supplied at the call site
+# span:       source range of the call
+# ret:        true when the call is well-typed, false (with a diagnostic) otherwise
+pub fun check_call(sc: *sema.SemaContext, callee_sig: ty.TypeId, args_start: u32, args_len: u32, span: token.Span) bool {
+    if (callee_sig == ty.TYPE_ERROR) { ret true; }
+
+    val ft_opt: Option[*ty.Type] = ty.get(?sc.s.types, callee_sig);
+    if (is_none[*ty.Type](ft_opt)) {
+        report(sc, span, "not callable: callee is not a function");
+        ret false;
+    }
+    val ft: *ty.Type = unwrap[*ty.Type](ft_opt);
+    if (ft.kind != ty.TYPE_FUN) {
+        report(sc, span, "not callable: callee is not a function");
+        ret false;
+    }
+
+    val param_count: u32 = ft.data.fn.params_len;
+    val variadic:    bool = ft.data.fn.variadic;
+    if (variadic) {
+        if (args_len < param_count) {
+            report(sc, span, "arity mismatch: too few call arguments");
+            ret false;
+        }
+    }
+    or (args_len != param_count) {
+        report(sc, span, "arity mismatch: wrong number of call arguments");
+        ret false;
+    }
+
+    val params_start: u32 = ft.data.fn.params_start;
+    var ok_all: bool = true;
+    var i: u32 = 0;
+    for (i < param_count) {
+        val pty_opt: Option[ty.TypeId] = ty.get_param(?sc.s.types, params_start + i);
+        if (is_none[ty.TypeId](pty_opt)) { ok_all = false; brk; }
+        val expected: ty.TypeId = unwrap[ty.TypeId](pty_opt);
+
+        val arg_eid: id.ExprId = sc.a.expr_ids[args_start + i];
+        var actual: ty.TypeId = expr_type_of(sc, arg_eid);
+        # a bare integer / float literal argument adopts the parameter's type,
+        # so `err[i64, i32](-1)` passes `-1` as an i32.
+        val co: Option[ty.TypeId] = coerce.try_coerce_literal(sc, arg_eid, expected);
+        if (is_some[ty.TypeId](co)) { actual = unwrap[ty.TypeId](co); }
+        val arg_span: token.Span = expr_span_of(sc, arg_eid, span);
+        if (!check_assignable(sc, expected, actual, arg_span)) {
+            ok_all = false;
+        }
+        i = i + 1;
+    }
+    ret ok_all;
+}
+
+# checks a call to a function with comptime value parameters. arity is checked
+# against the AST parameter list (which includes the comptime ones); each
+# `$`-parameter's argument must be compile-time foldable (else a diagnostic);
+# each runtime-parameter's argument is checked assignable against the stripped
+# TYPE_FUN signature, whose params omit the comptime ordinals.
+# ---
+# sc:         the active sema context
+# callee_sig: the callee's stripped TYPE_FUN (comptime params removed)
+# callee:     the call's callee expression id (to resolve the origin DeclFun)
+# f:          the callee's DeclFun, read from its origin AST
+# args_start: start index into sc.a.expr_ids for the argument expressions
+# args_len:   number of arguments supplied at the call site
+# span:       source range of the call
+# ret:        true when the call is well-typed, false (with a diagnostic) otherwise
+pub fun check_comptime_call(sc: *sema.SemaContext, callee_sig: ty.TypeId, callee: id.ExprId, f: *adecl.DeclFun, args_start: u32, args_len: u32, span: token.Span) bool {
+    val params_ast: *ast.Ast = callee_origin_ast(sc, callee);
+    if (params_ast == nil) { ret true; }
+
+    val total: u32 = f.params_len;
+    if (f.variadic) {
+        if (args_len < total) {
+            report(sc, span, "arity mismatch: too few call arguments");
+            ret false;
+        }
+    }
+    or (args_len != total) {
+        report(sc, span, "arity mismatch: wrong number of call arguments");
+        ret false;
+    }
+
+    val sig_opt: Option[*ty.Type] = ty.get(?sc.s.types, callee_sig);
+    if (is_none[*ty.Type](sig_opt)) { ret true; }
+    val sig: *ty.Type = unwrap[*ty.Type](sig_opt);
+    val rt_start: u32 = sig.data.fn.params_start;
+    val rt_count: u32 = sig.data.fn.params_len;
+
+    var ok_all: bool = true;
+    var pi: u32 = 0;
+    var rt_seen: u32 = 0;
+    for (pi < total) {
+        val tn: *adecl.TypedName = ?params_ast.typed_names[f.params_start + pi];
+        val arg_eid: id.ExprId = sc.a.expr_ids[args_start + pi];
+        val arg_span: token.Span = expr_span_of(sc, arg_eid, span);
+
+        if (tn.comptime) {
+            # the argument bound to a `$`-parameter must fold to a compile-time
+            # constant in the caller's comptime context. an argument that itself
+            # references a comptime parameter (a recursive comptime-param call,
+            # e.g. `f($n - 1)`) is unfoldable at sema (the parameter's value is
+            # per call site) but IS foldable at lowering, where the value is bound;
+            # its constness is checked there, with an instantiation cap guarding
+            # unbounded recursion.
+            if (!arg_references_comptime_param(sc, arg_eid) && !arg_names_module_constant(sc, arg_eid)) {
+                val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, arg_eid, ?sc.s.interner);
+                if (is_err[comptime.CTValue, str](ev)) {
+                    report(sc, arg_span, "comptime argument is not a compile-time constant");
+                    ok_all = false;
+                }
+            }
+            pi = pi + 1;
+            cnt;
+        }
+
+        # a runtime parameter: check the argument against the next stripped
+        # signature param.
+        if (rt_seen < rt_count) {
+            val pty_opt: Option[ty.TypeId] = ty.get_param(?sc.s.types, rt_start + rt_seen);
+            if (is_some[ty.TypeId](pty_opt)) {
+                val expected: ty.TypeId = unwrap[ty.TypeId](pty_opt);
+                var actual: ty.TypeId = expr_type_of(sc, arg_eid);
+                val co: Option[ty.TypeId] = coerce.try_coerce_literal(sc, arg_eid, expected);
+                if (is_some[ty.TypeId](co)) { actual = unwrap[ty.TypeId](co); }
+                if (!check_assignable(sc, expected, actual, arg_span)) { ok_all = false; }
+            }
+            rt_seen = rt_seen + 1;
+        }
+        pi = pi + 1;
+    }
+    ret ok_all;
+}
+
+# reports whether `eid` names a constant IMPORTED from another module (a bare
+# import or a module-qualified member `alias.CONST`, both SYM_IMPORTED). such a
+# value lives only in the defining module's comptime context, which sema does not
+# hold, so its constness fold is deferred to lowering. a local or module-level
+# SYM_VAL is NOT deferred: a comptime one folds in the eager check here, and a
+# non-foldable (runtime) one is reported eagerly rather than slipping through an
+# uninstantiated template whose body never lowers.
+fun arg_names_module_constant(sc: *sema.SemaContext, eid: id.ExprId) bool {
+    val so: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, eid);
+    if (is_none[*resolve.Symbol](so)) { ret false; }
+    ret unwrap[*resolve.Symbol](so).kind == resolve.SYM_IMPORTED;
+}
+
+# walks `eid` reporting whether any leaf identifier resolves to a comptime value
+# parameter (SYM_PARAM with SYM_FLAG_COMPTIME). such an argument is foldable only
+# at lowering, so its constness check is deferred there.
+fun arg_references_comptime_param(sc: *sema.SemaContext, eid: id.ExprId) bool {
+    if (eid == id.EXPR_NIL) { ret false; }
+    val e_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+
+    if (e.kind == expr.EXPR_KIND_IDENT) {
+        val so: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, eid);
+        if (is_none[*resolve.Symbol](so)) { ret false; }
+        val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+        ret sym.kind == resolve.SYM_PARAM && (sym.flags & resolve.SYM_FLAG_COMPTIME) != 0;
+    }
+    if (e.kind == expr.EXPR_KIND_BINARY) {
+        ret arg_references_comptime_param(sc, e.data.binary.lhs)
+         || arg_references_comptime_param(sc, e.data.binary.rhs);
+    }
+    if (e.kind == expr.EXPR_KIND_UNARY) {
+        ret arg_references_comptime_param(sc, e.data.unary.operand);
+    }
+    ret false;
+}
+
+# the AST a call's callee is declared in: the caller's own AST for a local
+# callee, or the origin module's AST for a cross-module one. nil when the callee
+# does not resolve to a function declaration.
+fun callee_origin_ast(sc: *sema.SemaContext, callee: id.ExprId) *ast.Ast {
+    val so: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, callee);
+    if (is_none[*resolve.Symbol](so)) { ret nil; }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+    if (sym.origin == sc.own_module) { ret sc.a; }
+    ret sess.module_ast(sc.s, sym.origin);
+}
+
+# checks an index expression `object[index]`. the object must be a pointer
+# or array; the index must be an integer. the result type is the pointee /
+# element type. on failure a `not indexable:` diagnostic is recorded and
+# `none` is returned (the caller poisons the expression).
+# ---
+# sc:     the active sema context
+# object: the indexed object's type
+# index:  the index expression's type
+# span:   source range of the index expression
+# ret:    some(element type) on success, none (with a diagnostic) otherwise
+pub fun check_index(sc: *sema.SemaContext, object: ty.TypeId, index: ty.TypeId, span: token.Span) Option[ty.TypeId] {
+    if (object == ty.TYPE_ERROR) { ret some[ty.TypeId](ty.TYPE_ERROR); }
+
+    val ot_opt: Option[*ty.Type] = ty.get(?sc.s.types, object);
+    if (is_none[*ty.Type](ot_opt)) {
+        report(sc, span, "not indexable: object is neither a pointer nor an array");
+        ret none[ty.TypeId]();
+    }
+    val ot: *ty.Type = unwrap[*ty.Type](ot_opt);
+
+    var elem: ty.TypeId = ty.TYPE_NIL;
+    if (ot.kind == ty.TYPE_POINTER) {
+        elem = ot.data.pointer.base;
+    }
+    or (ot.kind == ty.TYPE_ARRAY) {
+        elem = ot.data.array.base;
+    }
+    or {
+        report(sc, span, "not indexable: object is neither a pointer nor an array");
+        ret none[ty.TypeId]();
+    }
+
+    if (index != ty.TYPE_ERROR && !is_integer(index)) {
+        report(sc, span, "type mismatch: index must be an integer");
+    }
+    ret some[ty.TypeId](elem);
+}
+
+# checks a member access `object.name`. delegates field lookup to the sema
+# field tables (which know the fields of every record, union, and the
+# builtin `str`). on a missing field a `no such field:` diagnostic is
+# recorded and `none` is returned.
+# ---
+# sc:     the active sema context
+# object: the type of the expression to the left of the dot
+# name:   interned identifier of the accessed field
+# span:   source range of the member access
+# ret:    some(field type) on success, none (with a diagnostic) otherwise
+pub fun check_member(sc: *sema.SemaContext, object: ty.TypeId, name: intern.StrId, span: token.Span) Option[ty.TypeId] {
+    if (object == ty.TYPE_ERROR) { ret some[ty.TypeId](ty.TYPE_ERROR); }
+
+    # member access auto-dereferences a single pointer level: `p.x` on a
+    # `*Point` denotes the field through the pointer.
+    val record: ty.TypeId = deref_one(sc, object);
+
+    val f: Option[ty.TypeId] = sema.field_lookup(sc, record, name);
+    if (is_some[ty.TypeId](f)) { ret f; }
+
+    report(sc, span, "no such field: type has no field with that name");
+    ret none[ty.TypeId]();
+}
+
+# the pointee of a single pointer level, or the type itself when not a
+# pointer. field access uses this so a record reached through a pointer is
+# looked up in the record's own field table.
+fun deref_one(sc: *sema.SemaContext, object: ty.TypeId) ty.TypeId {
+    val t_opt: Option[*ty.Type] = ty.get(?sc.s.types, object);
+    if (is_none[*ty.Type](t_opt)) { ret object; }
+    val t: *ty.Type = unwrap[*ty.Type](t_opt);
+    if (t.kind == ty.TYPE_POINTER) { ret t.data.pointer.base; }
+    ret object;
+}
+
+# checks an explicit cast `value::Type`. two casts are legal: a numeric
+# conversion between primitive numeric types, or a bit reinterpretation
+# between any two types of identical byte size. anything else is rejected
+# with a `cast:` diagnostic.
+# ---
+# sc:   the active sema context
+# from: the operand's type
+# to:   the target type written after `::`
+# span: source range of the cast
+# ret:  some(to) when the cast is legal, none (with a diagnostic) otherwise
+pub fun check_cast(sc: *sema.SemaContext, from: ty.TypeId, to: ty.TypeId, span: token.Span) Option[ty.TypeId] {
+    if (from == ty.TYPE_ERROR || to == ty.TYPE_ERROR) { ret some[ty.TypeId](to); }
+    if (from == to) { ret some[ty.TypeId](to); }
+
+    # primitive numeric <-> primitive numeric conversion
+    if (is_primitive_numeric(from) && is_primitive_numeric(to)) {
+        ret some[ty.TypeId](to);
+    }
+
+    # same-size bit reinterpretation for everything else (covers
+    # pointer<->pointer, since every pointer type has size 8)
+    val sf: u32 = byte_size(sc, from);
+    val st: u32 = byte_size(sc, to);
+    if (sf != 0 && sf == st) {
+        ret some[ty.TypeId](to);
+    }
+
+    report_note(sc, span, "cast: conversion is invalid",
+        "`::` casts numeric types or reinterprets equal-size values only");
+    ret none[ty.TypeId]();
+}
+
+# checks a bit-reinterpret cast `value:~Type`. legal only when `from` and `to`
+# have a known, identical byte size; the operand's exact bits are reinterpreted
+# as the target type. a size mismatch (or an unknown-layout operand) is rejected
+# with an `bit reinterpret:` diagnostic naming both types and their sizes.
+# ---
+# sc:   the active sema context
+# from: the operand's type
+# to:   the target type written after `:~`
+# span: source range of the cast
+# ret:  some(to) when the reinterpret is legal, none (with a diagnostic) otherwise
+pub fun check_reinterpret(sc: *sema.SemaContext, from: ty.TypeId, to: ty.TypeId, span: token.Span) Option[ty.TypeId] {
+    if (from == ty.TYPE_ERROR || to == ty.TYPE_ERROR) { ret some[ty.TypeId](to); }
+
+    val sf: u32 = byte_size(sc, from);
+    val st: u32 = byte_size(sc, to);
+    if (sf != 0 && sf == st) { ret some[ty.TypeId](to); }
+
+    report_reinterpret_mismatch(sc, span, from, sf, to, st);
+    ret none[ty.TypeId]();
+}
+
+# reports a `bit reinterpret requires equal-size types: <X> (<n> bytes) vs <Y>
+# (<m> bytes)` diagnostic, rendering each type via type_to_str and its byte size
+# as a decimal. the assembled message and type spellings are owned only for the
+# call; any allocation failure degrades to a static, size-free message so the
+# error is always reported.
+fun report_reinterpret_mismatch(sc: *sema.SemaContext, span: token.Span,
+                                from: ty.TypeId, sf: u32, to: ty.TypeId, st: u32) {
+    val fr: Result[str, str] = type_to_str(sc, from);
+    val tr: Result[str, str] = type_to_str(sc, to);
+    if (is_err[str, str](fr) || is_err[str, str](tr)) {
+        report_note(sc, span, "bit reinterpret requires equal-size types",
+            "`:~` reinterprets bits between types of identical, known byte size");
+        if (is_ok[str, str](fr)) { type_str_free(sc, unwrap_ok[str, str](fr)); }
+        if (is_ok[str, str](tr)) { type_str_free(sc, unwrap_ok[str, str](tr)); }
+        ret;
+    }
+    val fs: str = unwrap_ok[str, str](fr);
+    val ts: str = unwrap_ok[str, str](tr);
+
+    val prefix: str = "bit reinterpret requires equal-size types: ";
+    val open:   str = " (";
+    val unit:   str = " bytes) vs ";
+    val close:  str = " bytes)";
+    val total:  usize = str_len(prefix) + str_len(fs) + str_len(open)
+        + decimal_len(sf::usize) + str_len(unit) + str_len(ts) + str_len(open)
+        + decimal_len(st::usize) + str_len(close);
+
+    val r: Result[*char, str] = allocate[char](sc.s.alloc, total + 1);
+    if (is_err[*char, str](r)) {
+        report_note(sc, span, "bit reinterpret requires equal-size types",
+            "`:~` reinterprets bits between types of identical, known byte size");
+        type_str_free(sc, fs);
+        type_str_free(sc, ts);
+        ret;
+    }
+    val msg: str = unwrap_ok[*char, str](r);
+    var w: usize = write_kw(msg, 0, prefix);
+    w = write_kw(msg, w, fs);
+    w = write_kw(msg, w, open);
+    w = write_decimal(msg, w, sf::usize);
+    w = write_kw(msg, w, unit);
+    w = write_kw(msg, w, ts);
+    w = write_kw(msg, w, open);
+    w = write_decimal(msg, w, st::usize);
+    w = write_kw(msg, w, close);
+    msg[w] = 0;
+
+    report(sc, span, msg);
+
+    deallocate[char](sc.s.alloc, msg, total + 1);
+    type_str_free(sc, fs);
+    type_str_free(sc, ts);
+}
+
+# checks a `ret value;` against the enclosing function's declared return
+# type. a bare `ret;` is signalled by `value == TYPE_NIL` and is valid only
+# when the function returns nothing (fn_ret TYPE_NIL); a value is required
+# otherwise and must be assignable to the return type. `value` is the
+# already-inferred (and caller-coerced) type of the returned expression.
+# ---
+# sc:      the active sema context
+# fn_ret:  the enclosing function's declared return type (TYPE_NIL = no return)
+# value:   the returned value's inferred type (TYPE_NIL for a bare `ret;`)
+# span:    source range of the return statement
+# ret:     true when the return is well-typed, false (with a diagnostic) otherwise
+pub fun check_return(sc: *sema.SemaContext, fn_ret: ty.TypeId, value: ty.TypeId, span: token.Span) bool {
+    if (value == ty.TYPE_NIL) {
+        if (fn_ret == ty.TYPE_NIL || fn_ret == ty.TYPE_ERROR) { ret true; }
+        report(sc, span, "type mismatch: function must return a value");
+        ret false;
+    }
+    if (fn_ret == ty.TYPE_NIL) {
+        report(sc, span, "type mismatch: function returns no value");
+        ret false;
+    }
+    ret check_assignable(sc, fn_ret, value, span);
+}
+
+# checks that a control-flow condition is usable as a truth value. Mach has
+# no distinct boolean type; comparisons and logical operators produce `u8`
+# (the stdlib `bool`), so a condition must be an integer primitive. a non-
+# integer condition records a `type mismatch:` diagnostic.
+# ---
+# sc:   the active sema context
+# cond: the condition expression's inferred type
+# span: source range of the condition
+# ret:  true when the condition is an integer primitive, false otherwise
+pub fun check_condition(sc: *sema.SemaContext, cond: ty.TypeId, span: token.Span) bool {
+    if (cond == ty.TYPE_ERROR) { ret true; }
+    if (is_integer(cond)) { ret true; }
+    report_note(sc, span, "type mismatch: condition must be an integer",
+        "mach has no `bool` type; comparisons yield an integer truth value");
+    ret false;
+}
+
+# reports whether `t` is any numeric primitive (integer or float).
+# ---
+# t:   a TypeId
+# ret: true for u8..u64, i8..i64, f32, f64
+pub fun is_numeric(t: ty.TypeId) bool {
+    ret is_integer(t) || t == ty.TYPE_F32 || t == ty.TYPE_F64;
+}
+
+# reports whether `t` is an integer primitive (any signed or unsigned width).
+# ---
+# t:   a TypeId
+# ret: true for u8..u64 and i8..i64
+pub fun is_integer(t: ty.TypeId) bool {
+    ret t == ty.TYPE_U8  || t == ty.TYPE_U16 || t == ty.TYPE_U32 || t == ty.TYPE_U64
+     || t == ty.TYPE_I8  || t == ty.TYPE_I16 || t == ty.TYPE_I32 || t == ty.TYPE_I64;
+}
+
+# reports whether `t` is a primitive numeric type eligible for a numeric
+# cast. identical to `is_numeric`; named separately to mirror the cast-rule
+# vocabulary in the sema design.
+# ---
+# t:   a TypeId
+# ret: true for any integer or float primitive
+pub fun is_primitive_numeric(t: ty.TypeId) bool {
+    ret is_numeric(t);
+}
+
+# returns the byte size of a type, resolving pointers/arrays/records via the
+# interner. pointer width is fixed at 8 (the only currently supported
+# targets are 64-bit); records and unions report 0 because their layout is
+# not computed in sema (the backend owns layout). a 0 result signals
+# "size unknown" and disables same-size cast reinterpretation.
+# ---
+# sc: the active sema context
+# t:  a TypeId
+# ret: the size in bytes, or 0 when the size is not known at this layer
+pub fun byte_size(sc: *sema.SemaContext, t: ty.TypeId) u32 {
+    if (t == ty.TYPE_U8  || t == ty.TYPE_I8)  { ret 1; }
+    if (t == ty.TYPE_U16 || t == ty.TYPE_I16) { ret 2; }
+    if (t == ty.TYPE_U32 || t == ty.TYPE_I32 || t == ty.TYPE_F32) { ret 4; }
+    if (t == ty.TYPE_U64 || t == ty.TYPE_I64 || t == ty.TYPE_F64) { ret 8; }
+    if (t == ty.TYPE_PTR) { ret 8; }
+
+    val t_opt: Option[*ty.Type] = ty.get(?sc.s.types, t);
+    if (is_none[*ty.Type](t_opt)) { ret 0; }
+    val tp: *ty.Type = unwrap[*ty.Type](t_opt);
+    if (tp.kind == ty.TYPE_POINTER) { ret 8; }
+    # a function value is its code address, so it is pointer-sized and may be
+    # bit-reinterpreted to/from a pointer (e.g. an erased `*u8` vtable slot).
+    if (tp.kind == ty.TYPE_FUN) { ret 8; }
+    if (tp.kind == ty.TYPE_ARRAY) {
+        ret byte_size(sc, tp.data.array.base) * tp.data.array.count;
+    }
+    ret 0;
+}
+
+# returns a short, static human-readable name for a type for diagnostics.
+# primitive types render to their spelling; compound and nominal types
+# render to a category word. the returned str is a static literal and must
+# not be freed.
+# ---
+# sc: the active sema context
+# t:  the type to describe
+# ret: a static, non-owning name for the type
+pub fun format_type(sc: *sema.SemaContext, t: ty.TypeId) str {
+    if (t == ty.TYPE_U8)  { ret "u8"; }
+    if (t == ty.TYPE_U16) { ret "u16"; }
+    if (t == ty.TYPE_U32) { ret "u32"; }
+    if (t == ty.TYPE_U64) { ret "u64"; }
+    if (t == ty.TYPE_I8)  { ret "i8"; }
+    if (t == ty.TYPE_I16) { ret "i16"; }
+    if (t == ty.TYPE_I32) { ret "i32"; }
+    if (t == ty.TYPE_I64) { ret "i64"; }
+    if (t == ty.TYPE_F32) { ret "f32"; }
+    if (t == ty.TYPE_F64) { ret "f64"; }
+    if (t == ty.TYPE_PTR) { ret "ptr"; }
+    if (t == ty.TYPE_ERROR) { ret "<error>"; }
+
+    val t_opt: Option[*ty.Type] = ty.get(?sc.s.types, t);
+    if (is_none[*ty.Type](t_opt)) { ret "<type>"; }
+    val tp: *ty.Type = unwrap[*ty.Type](t_opt);
+    if (tp.kind == ty.TYPE_POINTER)       { ret "pointer"; }
+    if (tp.kind == ty.TYPE_ARRAY)         { ret "array"; }
+    if (tp.kind == ty.TYPE_FUN)           { ret "function"; }
+    if (tp.kind == ty.TYPE_REC)           { ret "record"; }
+    if (tp.kind == ty.TYPE_UNI)           { ret "union"; }
+    if (tp.kind == ty.TYPE_GENERIC_PARAM) { ret "generic"; }
+    if (tp.kind == ty.TYPE_INSTANCE)      { ret "instance"; }
+    ret "<type>";
+}
+
+# type_to_str: render `t` to an owned, human-readable spelling for diagnostics.
+# primitives render to their keyword (`i64`, `f32`, `ptr`); a pointer to `*T`;
+# an array to `[N]T`; a record / union / generic parameter to its declared
+# name; a function to `fun(A, B) R`; and a generic instance to `Name[Arg, ...]`.
+# composite forms recurse over their components; an unknown or unnamed type
+# renders to a `<error>` / `<anon>` placeholder. the result is allocated from
+# the session allocator and must be released with type_str_free.
+# ---
+# sc: the active sema context (type universe, interner, AST registry)
+# t:  the type to render
+# ret: an owned, null-terminated spelling, or an allocation error
+pub fun type_to_str(sc: *sema.SemaContext, t: ty.TypeId) Result[str, str] {
+    val n: usize = type_str_len(sc, t);
+    val r: Result[*char, str] = allocate[char](sc.s.alloc, n + 1);
+    if (is_err[*char, str](r)) { ret err[str, str](unwrap_err[*char, str](r)); }
+    val buf: str = unwrap_ok[*char, str](r);
+    val w: usize = write_type_str(sc, buf, 0, t);
+    buf[w] = 0;
+    ret ok[str, str](buf);
+}
+
+# type_str_free: release a string returned by type_to_str.
+# ---
+# sc: the sema context whose allocator backed the string
+# s:  the owned string to free (nil is a no-op)
+pub fun type_str_free(sc: *sema.SemaContext, s: str) {
+    if (s == nil) { ret; }
+    deallocate[char](sc.s.alloc, s, str_len(s) + 1);
+}
+
+# type_str_len: the byte length type_to_str will write for `t`, excluding the
+# null terminator. mirrors write_type_str branch-for-branch so the single
+# allocation in type_to_str is sized exactly.
+fun type_str_len(sc: *sema.SemaContext, t: ty.TypeId) usize {
+    if (t == ty.TYPE_U8)  { ret 2; }
+    if (t == ty.TYPE_U16) { ret 3; }
+    if (t == ty.TYPE_U32) { ret 3; }
+    if (t == ty.TYPE_U64) { ret 3; }
+    if (t == ty.TYPE_I8)  { ret 2; }
+    if (t == ty.TYPE_I16) { ret 3; }
+    if (t == ty.TYPE_I32) { ret 3; }
+    if (t == ty.TYPE_I64) { ret 3; }
+    if (t == ty.TYPE_F32) { ret 3; }
+    if (t == ty.TYPE_F64) { ret 3; }
+    if (t == ty.TYPE_PTR) { ret 3; }
+    if (t == ty.TYPE_ERROR || t == ty.TYPE_NIL) { ret 7; }
+
+    val t_opt: Option[*ty.Type] = ty.get(?sc.s.types, t);
+    if (is_none[*ty.Type](t_opt)) { ret 7; }
+    val tp: *ty.Type = unwrap[*ty.Type](t_opt);
+    val k: ty.TypeKind = tp.kind;
+
+    if (k == ty.TYPE_VA_LIST) { ret 7; }
+    if (k == ty.TYPE_POINTER) {
+        ret 1 + type_str_len(sc, tp.data.pointer.base);
+    }
+    if (k == ty.TYPE_ARRAY) {
+        ret 1 + decimal_len(tp.data.array.count::usize) + 1 + type_str_len(sc, tp.data.array.base);
+    }
+    if (k == ty.TYPE_REC || k == ty.TYPE_UNI) {
+        ret name_str_len(sc, tp.data.nominal.name);
+    }
+    if (k == ty.TYPE_GENERIC_PARAM) {
+        ret name_str_len(sc, tp.data.generic_param.name);
+    }
+    if (k == ty.TYPE_INSTANCE) {
+        ret instance_str_len(sc, tp);
+    }
+    if (k == ty.TYPE_FUN) {
+        ret fun_str_len(sc, tp);
+    }
+    ret 7;
+}
+
+# write_type_str: write type_to_str's spelling for `t` into `buf` at offset
+# `k`, returning the offset just past it.
+fun write_type_str(sc: *sema.SemaContext, buf: str, k: usize, t: ty.TypeId) usize {
+    if (t == ty.TYPE_U8)  { ret write_kw(buf, k, "u8"); }
+    if (t == ty.TYPE_U16) { ret write_kw(buf, k, "u16"); }
+    if (t == ty.TYPE_U32) { ret write_kw(buf, k, "u32"); }
+    if (t == ty.TYPE_U64) { ret write_kw(buf, k, "u64"); }
+    if (t == ty.TYPE_I8)  { ret write_kw(buf, k, "i8"); }
+    if (t == ty.TYPE_I16) { ret write_kw(buf, k, "i16"); }
+    if (t == ty.TYPE_I32) { ret write_kw(buf, k, "i32"); }
+    if (t == ty.TYPE_I64) { ret write_kw(buf, k, "i64"); }
+    if (t == ty.TYPE_F32) { ret write_kw(buf, k, "f32"); }
+    if (t == ty.TYPE_F64) { ret write_kw(buf, k, "f64"); }
+    if (t == ty.TYPE_PTR) { ret write_kw(buf, k, "ptr"); }
+    if (t == ty.TYPE_ERROR || t == ty.TYPE_NIL) { ret write_kw(buf, k, "<error>"); }
+
+    val t_opt: Option[*ty.Type] = ty.get(?sc.s.types, t);
+    if (is_none[*ty.Type](t_opt)) { ret write_kw(buf, k, "<error>"); }
+    val tp: *ty.Type = unwrap[*ty.Type](t_opt);
+    val kk: ty.TypeKind = tp.kind;
+
+    if (kk == ty.TYPE_VA_LIST) { ret write_kw(buf, k, "va_list"); }
+    if (kk == ty.TYPE_POINTER) {
+        buf[k] = '*';
+        ret write_type_str(sc, buf, k + 1, tp.data.pointer.base);
+    }
+    if (kk == ty.TYPE_ARRAY) {
+        buf[k] = '[';
+        var w: usize = write_decimal(buf, k + 1, tp.data.array.count::usize);
+        buf[w] = ']'; w = w + 1;
+        ret write_type_str(sc, buf, w, tp.data.array.base);
+    }
+    if (kk == ty.TYPE_REC || kk == ty.TYPE_UNI) {
+        ret write_name(sc, buf, k, tp.data.nominal.name);
+    }
+    if (kk == ty.TYPE_GENERIC_PARAM) {
+        ret write_name(sc, buf, k, tp.data.generic_param.name);
+    }
+    if (kk == ty.TYPE_INSTANCE) {
+        ret write_instance(sc, buf, k, tp);
+    }
+    if (kk == ty.TYPE_FUN) {
+        ret write_fun(sc, buf, k, tp);
+    }
+    ret write_kw(buf, k, "<error>");
+}
+
+# instance_str_len / write_instance: a generic instance renders as
+# `Name[Arg, ...]`, the name recovered from the generic declaration via
+# generics.generic_nominal_of and the arguments rendered recursively.
+fun instance_str_len(sc: *sema.SemaContext, tp: *ty.Type) usize {
+    var total: usize = instance_name_len(sc, tp);
+    total = total + 1;
+    val astart: u32 = tp.data.instance.args_start;
+    val alen:   u32 = tp.data.instance.args_len;
+    var i: u32 = 0;
+    for (i < alen) {
+        if (i > 0) { total = total + 2; }
+        total = total + type_str_len(sc, instance_arg(sc, astart + i));
+        i = i + 1;
+    }
+    total = total + 1;
+    ret total;
+}
+
+fun write_instance(sc: *sema.SemaContext, buf: str, k: usize, tp: *ty.Type) usize {
+    var w: usize = write_instance_name(sc, buf, k, tp);
+    buf[w] = '['; w = w + 1;
+    val astart: u32 = tp.data.instance.args_start;
+    val alen:   u32 = tp.data.instance.args_len;
+    var i: u32 = 0;
+    for (i < alen) {
+        if (i > 0) { buf[w] = ','; w = w + 1; buf[w] = ' '; w = w + 1; }
+        w = write_type_str(sc, buf, w, instance_arg(sc, astart + i));
+        i = i + 1;
+    }
+    buf[w] = ']'; w = w + 1;
+    ret w;
+}
+
+# instance_arg: the concrete argument TypeId at pool slot `idx`, or TYPE_ERROR
+# when out of range so rendering stays total.
+fun instance_arg(sc: *sema.SemaContext, idx: u32) ty.TypeId {
+    val a_opt: Option[ty.TypeId] = ty.get_param(?sc.s.types, idx);
+    if (is_none[ty.TypeId](a_opt)) { ret ty.TYPE_ERROR; }
+    ret unwrap[ty.TypeId](a_opt);
+}
+
+# instance_name_len / write_instance_name: the generic's declared name,
+# recovered through generics.generic_nominal_of (which re-interns the name the
+# declaring module used). falls back to `<anon>` when the declaration cannot be
+# reached.
+fun instance_name_len(sc: *sema.SemaContext, tp: *ty.Type) usize {
+    val gnom: ty.TypeId = generics.generic_nominal_of(sc.s, tp.data.instance.target_origin, tp.data.instance.target_decl);
+    val nm: intern.StrId = nominal_name_of(sc, gnom);
+    if (nm == intern.STR_NIL) { ret 6; }
+    ret name_str_len(sc, nm);
+}
+
+fun write_instance_name(sc: *sema.SemaContext, buf: str, k: usize, tp: *ty.Type) usize {
+    val gnom: ty.TypeId = generics.generic_nominal_of(sc.s, tp.data.instance.target_origin, tp.data.instance.target_decl);
+    val nm: intern.StrId = nominal_name_of(sc, gnom);
+    if (nm == intern.STR_NIL) { ret write_kw(buf, k, "<anon>"); }
+    ret write_name(sc, buf, k, nm);
+}
+
+# nominal_name_of: the `name` StrId of a nominal TypeId, or STR_NIL when `t` is
+# not a registered nominal.
+fun nominal_name_of(sc: *sema.SemaContext, t: ty.TypeId) intern.StrId {
+    if (t == ty.TYPE_ERROR || t == ty.TYPE_NIL) { ret intern.STR_NIL; }
+    val t_opt: Option[*ty.Type] = ty.get(?sc.s.types, t);
+    if (is_none[*ty.Type](t_opt)) { ret intern.STR_NIL; }
+    val tp: *ty.Type = unwrap[*ty.Type](t_opt);
+    if (tp.kind != ty.TYPE_REC && tp.kind != ty.TYPE_UNI) { ret intern.STR_NIL; }
+    ret tp.data.nominal.name;
+}
+
+# fun_str_len / write_fun: a function type renders as `fun(A, B) R`, with a void
+# return rendered as the bare `fun(A, B)` (no trailing type).
+fun fun_str_len(sc: *sema.SemaContext, tp: *ty.Type) usize {
+    var total: usize = 4;
+    val pstart: u32 = tp.data.fn.params_start;
+    val plen:   u32 = tp.data.fn.params_len;
+    var i: u32 = 0;
+    for (i < plen) {
+        if (i > 0) { total = total + 2; }
+        total = total + type_str_len(sc, instance_arg(sc, pstart + i));
+        i = i + 1;
+    }
+    if (tp.data.fn.variadic) {
+        if (plen > 0) { total = total + 2; }
+        total = total + 3;
+    }
+    total = total + 1;
+    if (tp.data.fn.ret_ty != ty.TYPE_NIL) {
+        total = total + 1 + type_str_len(sc, tp.data.fn.ret_ty);
+    }
+    ret total;
+}
+
+fun write_fun(sc: *sema.SemaContext, buf: str, k: usize, tp: *ty.Type) usize {
+    var w: usize = write_kw(buf, k, "fun");
+    buf[w] = '('; w = w + 1;
+    val pstart: u32 = tp.data.fn.params_start;
+    val plen:   u32 = tp.data.fn.params_len;
+    var i: u32 = 0;
+    for (i < plen) {
+        if (i > 0) { buf[w] = ','; w = w + 1; buf[w] = ' '; w = w + 1; }
+        w = write_type_str(sc, buf, w, instance_arg(sc, pstart + i));
+        i = i + 1;
+    }
+    if (tp.data.fn.variadic) {
+        if (plen > 0) { buf[w] = ','; w = w + 1; buf[w] = ' '; w = w + 1; }
+        w = write_kw(buf, w, "...");
+    }
+    buf[w] = ')'; w = w + 1;
+    if (tp.data.fn.ret_ty != ty.TYPE_NIL) {
+        buf[w] = ' '; w = w + 1;
+        w = write_type_str(sc, buf, w, tp.data.fn.ret_ty);
+    }
+    ret w;
+}
+
+# name_str_len / write_name: an interned identifier, falling back to `<anon>`
+# when the StrId is nil or unresolvable.
+fun name_str_len(sc: *sema.SemaContext, name: intern.StrId) usize {
+    val no: Option[str] = intern.lookup(?sc.s.interner, name);
+    if (is_none[str](no)) { ret 6; }
+    val nm: str = unwrap[str](no);
+    if (str_len(nm) == 0) { ret 6; }
+    ret str_len(nm);
+}
+
+fun write_name(sc: *sema.SemaContext, buf: str, k: usize, name: intern.StrId) usize {
+    val no: Option[str] = intern.lookup(?sc.s.interner, name);
+    if (is_none[str](no)) { ret write_kw(buf, k, "<anon>"); }
+    val nm: str = unwrap[str](no);
+    if (str_len(nm) == 0) { ret write_kw(buf, k, "<anon>"); }
+    ret write_kw(buf, k, nm);
+}
+
+# write_kw: copy a string's bytes into `buf` at offset `k`, returning the new
+# offset.
+fun write_kw(buf: str, k: usize, s: str) usize {
+    val n: usize = str_len(s);
+    var w: usize = k;
+    var i: usize = 0;
+    for (i < n) { buf[w] = s[i]; w = w + 1; i = i + 1; }
+    ret w;
+}
+
+# decimal_len: number of base-10 digits in `n` (1 for 0).
+fun decimal_len(n: usize) usize {
+    if (n == 0) { ret 1; }
+    var len: usize = 0;
+    var v: usize = n;
+    for (v > 0) { len = len + 1; v = v / 10; }
+    ret len;
+}
+
+# write_decimal: write the base-10 digits of `n` into `buf` at offset `k`,
+# returning the new offset.
+fun write_decimal(buf: str, k: usize, n: usize) usize {
+    if (n == 0) { buf[k] = '0'; ret k + 1; }
+    var tmp: [24]char;
+    var t: usize = 0;
+    var v: usize = n;
+    for (v > 0) { tmp[t] = (v % 10)::char + '0'; v = v / 10; t = t + 1; }
+    var w: usize = k;
+    var ri: usize = 0;
+    for (ri < t) { buf[w] = tmp[t - 1 - ri]; w = w + 1; ri = ri + 1; }
+    ret w;
+}
+
+# reads expr_type[eid] from the parallel array, returning TYPE_ERROR for an
+# out-of-range or nil id so callers never read past the array.
+fun expr_type_of(sc: *sema.SemaContext, eid: id.ExprId) ty.TypeId {
+    if (eid == id.EXPR_NIL) { ret ty.TYPE_ERROR; }
+    if (sc.expr_type == nil || eid::usize >= sc.a.expr_len) { ret ty.TYPE_ERROR; }
+    ret sc.expr_type[eid];
+}
+
+# returns the source span of an expression, falling back to `fallback` when
+# the id is out of range.
+fun expr_span_of(sc: *sema.SemaContext, eid: id.ExprId, fallback: token.Span) token.Span {
+    val e_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret fallback; }
+    ret unwrap[*expr.Expr](e_opt).span;
+}
+
+# records an error-severity diagnostic against the module's file. the
+# allocation result of the sink is intentionally dropped: a failed
+# diagnostic append cannot itself be reported, and sema never halts on it.
+fun report(sc: *sema.SemaContext, span: token.Span, message: str) {
+    diag.error(?sc.s.diags, sc.a.file_id, span, message);
+}
+
+# report_note: report plus a static clarifying `note:` line on the same diagnostic.
+fun report_note(sc: *sema.SemaContext, span: token.Span, message: str, note: str) {
+    diag.error(?sc.s.diags, sc.a.file_id, span, message);
+    diag.attach_note(?sc.s.diags, note);
+}
+
+# report_mismatch: report a `type mismatch: expected <X>, found <Y>` diagnostic
+# with the two types rendered via type_to_str, plus a static clarifying note.
+# the assembled message and both type spellings are owned only for the duration
+# of the call (the diagnostic sink copies them) and freed before returning. any
+# allocation failure degrades to the static, type-free message so a mismatch is
+# always reported.
+fun report_mismatch(sc: *sema.SemaContext, span: token.Span, expected: ty.TypeId, actual: ty.TypeId, note: str) {
+    val ex_r: Result[str, str] = type_to_str(sc, expected);
+    val ac_r: Result[str, str] = type_to_str(sc, actual);
+    if (is_err[str, str](ex_r) || is_err[str, str](ac_r)) {
+        report_note(sc, span, "type mismatch: incompatible types in assignment", note);
+        if (is_ok[str, str](ex_r)) { type_str_free(sc, unwrap_ok[str, str](ex_r)); }
+        if (is_ok[str, str](ac_r)) { type_str_free(sc, unwrap_ok[str, str](ac_r)); }
+        ret;
+    }
+    val ex: str = unwrap_ok[str, str](ex_r);
+    val ac: str = unwrap_ok[str, str](ac_r);
+
+    val prefix: str = "type mismatch: expected ";
+    val mid:    str = ", found ";
+    val total:  usize = str_len(prefix) + str_len(ex) + str_len(mid) + str_len(ac);
+
+    val r: Result[*char, str] = allocate[char](sc.s.alloc, total + 1);
+    if (is_err[*char, str](r)) {
+        report_note(sc, span, "type mismatch: incompatible types in assignment", note);
+        type_str_free(sc, ex);
+        type_str_free(sc, ac);
+        ret;
+    }
+    val msg: str = unwrap_ok[*char, str](r);
+    var w: usize = write_kw(msg, 0, prefix);
+    w = write_kw(msg, w, ex);
+    w = write_kw(msg, w, mid);
+    w = write_kw(msg, w, ac);
+    msg[w] = 0;
+
+    report_note(sc, span, msg, note);
+
+    deallocate[char](sc.s.alloc, msg, total + 1);
+    type_str_free(sc, ex);
+    type_str_free(sc, ac);
+}

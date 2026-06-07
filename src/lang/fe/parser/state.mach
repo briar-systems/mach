@@ -1,0 +1,849 @@
+# mach.lang.fe.parser.state: the Parser record plus the shared helpers every other parser file builds on.
+#
+# provides cursor (current, peek, advance), predicate (at, at_kw, eat,
+# eat_kw), error reporting (error_at, error_at_current, expect, sync_to),
+# span arithmetic (span_of), and the push_* wrappers that log allocation
+# failures and return *_NIL rather than aborting. all sibling files depend
+# on this one; nothing here depends back on them.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.string.str;
+use std.types.string.str_region_equals;
+use std.types.size.usize;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.reallocate;
+use std.allocator.deallocate;
+
+use token:  mach.lang.fe.token;
+use lexer:  mach.lang.fe.lexer;
+use diag:   mach.lang.diagnostic;
+use ast:    mach.lang.fe.ast;
+use id:     mach.lang.fe.ast.id;
+use expr:   mach.lang.fe.ast.expr;
+use stmt:   mach.lang.fe.ast.stmt;
+use decl:   mach.lang.fe.ast.decl;
+use m_type: mach.lang.fe.ast.type;
+use module: mach.lang.fe.ast.module;
+
+# Parser: parser cursor and output sinks; lives for the duration of one parse.
+# ---
+# tokens: stream produced by the lexer
+# pos:    index into tokens.tokens of the current token
+# ast:    output AST; nodes are appended here as parsing progresses
+# diags:  diagnostic sink for parse errors and recovery messages
+# panic:  true while skipping tokens during error recovery; cleared at the next synchronization point
+pub rec Parser {
+    tokens: *lexer.TokenStream;
+    pos:    usize;
+    ast:    *ast.Ast;
+    diags:  *diag.DiagList;
+    panic:  bool;
+}
+
+# init: initializes a Parser over the given token stream, filling output into ast and diags.
+# ---
+# tokens: lexer output to consume
+# out:    AST to append parsed nodes into
+# diags:  diagnostic sink
+# ret:    a fresh Parser positioned at the first token
+pub fun init(tokens: *lexer.TokenStream, out: *ast.Ast, diags: *diag.DiagList) Parser {
+    var p: Parser;
+    p.tokens = tokens;
+    p.pos    = 0;
+    p.ast    = out;
+    p.diags  = diags;
+    p.panic  = false;
+    ret p;
+}
+
+# current: returns the current token without consuming it.
+# ---
+# p:   parser state
+# ret: token at p.pos
+pub fun current(p: *Parser) token.Token {
+    ret p.tokens.tokens[p.pos];
+}
+
+# peek: returns the token at an offset from the current position without consuming it.
+# ---
+# p:      parser state
+# offset: positive offset from the current position
+# ret:    token at p.pos + offset, or the trailing EOF if past the end
+pub fun peek(p: *Parser, offset: usize) token.Token {
+    val idx: usize = p.pos + offset;
+    if (idx >= p.tokens.len) {
+        ret p.tokens.tokens[p.tokens.len - 1];
+    }
+    ret p.tokens.tokens[idx];
+}
+
+# advance: consumes the current token and returns it.
+# ---
+# p:   parser state
+# ret: the token that was current before the call
+pub fun advance(p: *Parser) token.Token {
+    val t: token.Token = p.tokens.tokens[p.pos];
+    if (t.kind != token.KIND_EOF) {
+        p.pos = p.pos + 1;
+    }
+    ret t;
+}
+
+# at: reports whether the current token has the given kind.
+# ---
+# p:    parser state
+# kind: token kind to test against
+# ret:  true if current().kind == kind
+pub fun at(p: *Parser, kind: token.Kind) bool {
+    ret current(p).kind == kind;
+}
+
+# eat: consumes the current token if its kind matches, reporting whether it did.
+# ---
+# p:    parser state
+# kind: token kind to match and consume
+# ret:  true if the token was consumed
+pub fun eat(p: *Parser, kind: token.Kind) bool {
+    if (at(p, kind)) {
+        advance(p);
+        ret true;
+    }
+    ret false;
+}
+
+# at_kw: reports whether the current IDENT token matches the given keyword text.
+# ---
+# p:   parser state
+# kw:  keyword to match against the current IDENT's source text
+# ret: true when the current token is an IDENT whose text equals kw
+pub fun at_kw(p: *Parser, kw: str) bool {
+    if (!at(p, token.KIND_IDENT)) { ret false; }
+    val t: token.Token = current(p);
+    ret str_region_equals(p.tokens.source, t.span.offset, t.span.len, kw);
+}
+
+# eat_kw: consumes the current IDENT token if it matches the given keyword text.
+# ---
+# p:   parser state
+# kw:  keyword to match and consume
+# ret: true if the keyword was consumed
+pub fun eat_kw(p: *Parser, kw: str) bool {
+    if (at_kw(p, kw)) {
+        advance(p);
+        ret true;
+    }
+    ret false;
+}
+
+# expect: consumes the current token when its kind matches, emitting an error otherwise.
+# ---
+# p:       parser state
+# kind:    expected token kind
+# message: diagnostic text used when the expected token is absent
+# ret:     true if the expected token was consumed; false after emitting an error
+pub fun expect(p: *Parser, kind: token.Kind, message: str) bool {
+    if (eat(p, kind)) {
+        ret true;
+    }
+    error_at_current(p, message);
+    ret false;
+}
+
+# error_at_current: emits an error-severity diagnostic pinned to the current token's span.
+# ---
+# p:       parser state
+# message: diagnostic text to record
+pub fun error_at_current(p: *Parser, message: str) {
+    if (p.panic) { ret; }
+    p.panic = true;
+    val t: token.Token = current(p);
+    val r: Result[bool, str] = diag.error(p.diags, p.tokens.file_id, t.span, message);
+    if (is_err[bool, str](r)) { ret; }
+}
+
+# error_at: emits an error-severity diagnostic pinned to the given span.
+# ---
+# p:       parser state
+# span:    span to pin the diagnostic to
+# message: diagnostic text to record
+pub fun error_at(p: *Parser, span: token.Span, message: str) {
+    if (p.panic) { ret; }
+    p.panic = true;
+    val r: Result[bool, str] = diag.error(p.diags, p.tokens.file_id, span, message);
+    if (is_err[bool, str](r)) { ret; }
+}
+
+# sync_to: advances until the current token is EOF or matches one of the synchronization kinds, then clears panic.
+# ---
+# p:  parser state
+# k0: first synchronization kind
+# k1: second synchronization kind (use KIND_ERROR if only one is needed)
+# k2: third synchronization kind (use KIND_ERROR if not needed)
+pub fun sync_to(p: *Parser, k0: token.Kind, k1: token.Kind, k2: token.Kind) {
+    for (!at(p, token.KIND_EOF)) {
+        val k: token.Kind = current(p).kind;
+        if (k == k0 || k == k1 || k == k2) {
+            p.panic = false;
+            ret;
+        }
+        advance(p);
+    }
+    p.panic = false;
+}
+
+# at_decl_start: true when the current token can begin a top-level
+# declaration — a `$` directive, a `pub`/`ext` flag, or one of the decl
+# keywords. used to find a genuine declaration boundary during recovery.
+pub fun at_decl_start(p: *Parser) bool {
+    if (at(p, token.KIND_DOLLAR)) { ret true; }
+    if (!at(p, token.KIND_IDENT)) { ret false; }
+    ret at_kw(p, "pub") || at_kw(p, "ext")
+     || at_kw(p, "use") || at_kw(p, "fwd") || at_kw(p, "fun")
+     || at_kw(p, "rec") || at_kw(p, "uni") || at_kw(p, "val")
+     || at_kw(p, "var") || at_kw(p, "def") || at_kw(p, "test");
+}
+
+# sync_to_decl: advance until the current token begins a top-level
+# declaration (`at_decl_start`) or EOF, then clear panic. recovery at module
+# or comptime-branch scope uses this so one malformed declaration does not
+# turn every following body token into its own "expected a declaration"
+# error — the parser realigns on the next real declaration boundary instead.
+pub fun sync_to_decl(p: *Parser) {
+    advance(p);
+    for (!at(p, token.KIND_EOF) && !at_decl_start(p)) {
+        advance(p);
+    }
+    p.panic = false;
+}
+
+# at_eof: true when the parser has consumed every token up to and including EOF.
+# ---
+# p:   parser state
+# ret: true if no more real tokens remain
+pub fun at_eof(p: *Parser) bool {
+    ret at(p, token.KIND_EOF);
+}
+
+# span_of: joins two spans into the minimal span that covers both.
+# ---
+# start: span at the beginning of the region
+# end:   span at the end of the region
+# ret:   span from start.offset to end.offset + end.len
+pub fun span_of(start: token.Span, end: token.Span) token.Span {
+    var s: token.Span;
+    s.offset = start.offset;
+    s.len    = (end.offset + end.len) - start.offset;
+    ret s;
+}
+
+# push_expr: appends an Expr to the AST, reporting an allocation error and returning EXPR_NIL on failure.
+# ---
+# p:   parser state
+# e:   expression to append
+# ret: the new ExprId, or EXPR_NIL if storage could not be allocated
+pub fun push_expr(p: *Parser, e: expr.Expr) id.ExprId {
+    val r: Result[id.ExprId, str] = ast.add_expr(p.ast, e);
+    if (is_err[id.ExprId, str](r)) {
+        error_at(p, e.span, "out of memory while parsing expression");
+        ret id.EXPR_NIL;
+    }
+    ret unwrap_ok[id.ExprId, str](r);
+}
+
+# push_stmt: appends a Stmt to the AST, reporting an allocation error and returning STMT_NIL on failure.
+# ---
+# p:   parser state
+# s:   statement to append
+# ret: the new StmtId, or STMT_NIL if storage could not be allocated
+pub fun push_stmt(p: *Parser, s: stmt.Stmt) id.StmtId {
+    val r: Result[id.StmtId, str] = ast.add_stmt(p.ast, s);
+    if (is_err[id.StmtId, str](r)) {
+        error_at(p, s.span, "out of memory while parsing statement");
+        ret id.STMT_NIL;
+    }
+    ret unwrap_ok[id.StmtId, str](r);
+}
+
+# push_decl: appends a Decl to the AST, reporting an allocation error and returning DECL_NIL on failure.
+# ---
+# p:   parser state
+# d:   declaration to append
+# ret: the new DeclId, or DECL_NIL if storage could not be allocated
+pub fun push_decl(p: *Parser, d: decl.Decl) id.DeclId {
+    val r: Result[id.DeclId, str] = ast.add_decl(p.ast, d);
+    if (is_err[id.DeclId, str](r)) {
+        error_at(p, d.span, "out of memory while parsing declaration");
+        ret id.DECL_NIL;
+    }
+    ret unwrap_ok[id.DeclId, str](r);
+}
+
+# push_type: appends a Type to the AST, reporting an allocation error and returning TYPE_NIL on failure.
+# ---
+# p:   parser state
+# t:   type to append
+# ret: the new TypeId, or TYPE_NIL if storage could not be allocated
+pub fun push_type(p: *Parser, t: m_type.Type) id.TypeId {
+    val r: Result[id.TypeId, str] = ast.add_type(p.ast, t);
+    if (is_err[id.TypeId, str](r)) {
+        error_at(p, t.span, "out of memory while parsing type");
+        ret id.TYPE_NIL;
+    }
+    ret unwrap_ok[id.TypeId, str](r);
+}
+
+# push_module: appends a Module to the AST, reporting an allocation error and returning MODULE_NIL on failure.
+# ---
+# p:   parser state
+# m:   module to append
+# ret: the new ModuleId, or MODULE_NIL if storage could not be allocated
+pub fun push_module(p: *Parser, m: module.Module) id.ModuleId {
+    val r: Result[id.ModuleId, str] = ast.add_module(p.ast, m);
+    if (is_err[id.ModuleId, str](r)) {
+        error_at(p, m.span, "out of memory while parsing module");
+        ret id.MODULE_NIL;
+    }
+    ret unwrap_ok[id.ModuleId, str](r);
+}
+
+# push_decl_id: appends a DeclId to ast.decl_ids, returning 0 on failure (caller must check p.panic).
+# ---
+# p:   parser state
+# id_: DeclId to append
+# ret: index into ast.decl_ids, or 0 on allocation failure
+pub fun push_decl_id(p: *Parser, id_: id.DeclId) u32 {
+    val r: Result[u32, str] = ast.add_decl_id(p.ast, id_);
+    if (is_err[u32, str](r)) {
+        error_at_current(p, "out of memory while parsing");
+        ret 0;
+    }
+    ret unwrap_ok[u32, str](r);
+}
+
+# DeclIdBuf: a temporary, contiguous buffer of DeclIds collected while
+# parsing a decl-list (a module body or a comptime branch body). because the
+# `ast.decl_ids` pool is shared and append-only, pushing a parent list's ids
+# directly would interleave with the ids a nested decl-list (e.g. a comptime
+# branch body) pushes mid-parse, breaking the parent's contiguous (start,len)
+# slice. buffering the parent's direct children and flushing them as one block
+# after all nested lists are parsed keeps every slice contiguous and disjoint.
+# ---
+# data: heap buffer of collected DeclIds
+# len:  number of ids buffered
+# cap:  allocated slots
+pub rec DeclIdBuf {
+    data: *id.DeclId;
+    len:  u32;
+    cap:  u32;
+}
+
+# decl_id_buf_init: start an empty DeclIdBuf.
+pub fun decl_id_buf_init() DeclIdBuf {
+    var b: DeclIdBuf;
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret b;
+}
+
+# decl_id_buf_push: buffer one DeclId, growing on demand. on allocation
+# failure it reports through the parser and leaves the buffer unchanged.
+pub fun decl_id_buf_push(p: *Parser, b: *DeclIdBuf, id_: id.DeclId) {
+    if (b.len == b.cap) {
+        var new_cap: u32 = b.cap * 2;
+        if (new_cap == 0) { new_cap = 8; }
+        if (b.data == nil) {
+            val r: Result[*id.DeclId, str] = allocate[id.DeclId](p.ast.alloc, new_cap::usize);
+            if (is_err[*id.DeclId, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*id.DeclId, str](r);
+        }
+        or {
+            val r: Result[*id.DeclId, str] = reallocate[id.DeclId](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
+            if (is_err[*id.DeclId, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*id.DeclId, str](r);
+        }
+        b.cap = new_cap;
+    }
+    b.data[b.len] = id_;
+    b.len = b.len + 1;
+}
+
+# decl_id_buf_flush: append the buffered DeclIds to `ast.decl_ids` as one
+# contiguous block and free the buffer. returns the pool start index of the
+# block (the run's `decls_start`/`body_start`); `*out_len` receives its length.
+pub fun decl_id_buf_flush(p: *Parser, b: *DeclIdBuf, out_len: *u32) u32 {
+    val start: u32 = p.ast.decl_id_len::u32;
+    var i: u32 = 0;
+    for (i < b.len) {
+        push_decl_id(p, b.data[i]);
+        i = i + 1;
+    }
+    @out_len = b.len;
+    if (b.data != nil && b.cap > 0) {
+        deallocate[id.DeclId](p.ast.alloc, b.data, b.cap::usize);
+    }
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret start;
+}
+
+# ExprIdBuf: a temporary, contiguous buffer of ExprIds collected while parsing
+# an expr-list (call arguments, array-literal elements). the `ast.expr_ids`
+# pool is shared and append-only, and parsing one element fully — including any
+# nested call/array-literal it contains — appends that element's own child ids
+# to the same pool. pushing the parent's element ids directly would therefore
+# interleave with a nested element's ids, corrupting the parent's (start, len)
+# slice. buffering the parent's direct elements and flushing them as one block
+# after every nested parse completes keeps each slice contiguous and disjoint.
+# ---
+# data: heap buffer of collected ExprIds
+# len:  number of ids buffered
+# cap:  allocated slots
+pub rec ExprIdBuf {
+    data: *id.ExprId;
+    len:  u32;
+    cap:  u32;
+}
+
+# expr_id_buf_init: start an empty ExprIdBuf.
+pub fun expr_id_buf_init() ExprIdBuf {
+    var b: ExprIdBuf;
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret b;
+}
+
+# expr_id_buf_push: buffer one ExprId, growing on demand. on allocation failure
+# it reports through the parser and leaves the buffer unchanged.
+pub fun expr_id_buf_push(p: *Parser, b: *ExprIdBuf, id_: id.ExprId) {
+    if (b.len == b.cap) {
+        var new_cap: u32 = b.cap * 2;
+        if (new_cap == 0) { new_cap = 8; }
+        if (b.data == nil) {
+            val r: Result[*id.ExprId, str] = allocate[id.ExprId](p.ast.alloc, new_cap::usize);
+            if (is_err[*id.ExprId, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*id.ExprId, str](r);
+        }
+        or {
+            val r: Result[*id.ExprId, str] = reallocate[id.ExprId](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
+            if (is_err[*id.ExprId, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*id.ExprId, str](r);
+        }
+        b.cap = new_cap;
+    }
+    b.data[b.len] = id_;
+    b.len = b.len + 1;
+}
+
+# expr_id_buf_flush: append the buffered ExprIds to `ast.expr_ids` as one
+# contiguous block and free the buffer. returns the pool start index of the
+# block (the list's `args_start`/`elems_start`); `*out_len` receives its length.
+pub fun expr_id_buf_flush(p: *Parser, b: *ExprIdBuf, out_len: *u32) u32 {
+    val start: u32 = p.ast.expr_id_len::u32;
+    var i: u32 = 0;
+    for (i < b.len) {
+        push_expr_id(p, b.data[i]);
+        i = i + 1;
+    }
+    @out_len = b.len;
+    if (b.data != nil && b.cap > 0) {
+        deallocate[id.ExprId](p.ast.alloc, b.data, b.cap::usize);
+    }
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret start;
+}
+
+# TypeIdBuf: a temporary, contiguous buffer of TypeIds collected while parsing
+# a type-list (call-site or named-type generic arguments, function-type
+# parameters). the `ast.type_ids` pool is shared and append-only, and parsing
+# one element fully — including any nested generic type it contains — appends
+# that element's own child ids to the same pool. buffering the parent's direct
+# elements and flushing them after every nested parse completes keeps each
+# slice contiguous and disjoint, exactly as ExprIdBuf does for expr-lists.
+# ---
+# data: heap buffer of collected TypeIds
+# len:  number of ids buffered
+# cap:  allocated slots
+pub rec TypeIdBuf {
+    data: *id.TypeId;
+    len:  u32;
+    cap:  u32;
+}
+
+# type_id_buf_init: start an empty TypeIdBuf.
+pub fun type_id_buf_init() TypeIdBuf {
+    var b: TypeIdBuf;
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret b;
+}
+
+# type_id_buf_push: buffer one TypeId, growing on demand. on allocation failure
+# it reports through the parser and leaves the buffer unchanged.
+pub fun type_id_buf_push(p: *Parser, b: *TypeIdBuf, id_: id.TypeId) {
+    if (b.len == b.cap) {
+        var new_cap: u32 = b.cap * 2;
+        if (new_cap == 0) { new_cap = 8; }
+        if (b.data == nil) {
+            val r: Result[*id.TypeId, str] = allocate[id.TypeId](p.ast.alloc, new_cap::usize);
+            if (is_err[*id.TypeId, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*id.TypeId, str](r);
+        }
+        or {
+            val r: Result[*id.TypeId, str] = reallocate[id.TypeId](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
+            if (is_err[*id.TypeId, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*id.TypeId, str](r);
+        }
+        b.cap = new_cap;
+    }
+    b.data[b.len] = id_;
+    b.len = b.len + 1;
+}
+
+# type_id_buf_flush: append the buffered TypeIds to `ast.type_ids` as one
+# contiguous block and free the buffer. returns the pool start index of the
+# block (the list's `args_start`/`params_start`); `*out_len` receives its length.
+pub fun type_id_buf_flush(p: *Parser, b: *TypeIdBuf, out_len: *u32) u32 {
+    val start: u32 = p.ast.type_id_len::u32;
+    var i: u32 = 0;
+    for (i < b.len) {
+        push_type_id(p, b.data[i]);
+        i = i + 1;
+    }
+    @out_len = b.len;
+    if (b.data != nil && b.cap > 0) {
+        deallocate[id.TypeId](p.ast.alloc, b.data, b.cap::usize);
+    }
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret start;
+}
+
+# FieldInitBuf: a temporary, contiguous buffer of FieldInits collected while
+# parsing a struct literal's field list. the `ast.field_inits` pool is shared
+# and append-only, and a field's initializer may itself be a nested struct
+# literal that appends its own FieldInits to the same pool. buffering the
+# parent's direct fields and flushing them after every nested parse completes
+# keeps each literal's (start, len) slice contiguous and disjoint.
+# ---
+# data: heap buffer of collected FieldInits
+# len:  number of entries buffered
+# cap:  allocated slots
+pub rec FieldInitBuf {
+    data: *expr.FieldInit;
+    len:  u32;
+    cap:  u32;
+}
+
+# field_init_buf_init: start an empty FieldInitBuf.
+pub fun field_init_buf_init() FieldInitBuf {
+    var b: FieldInitBuf;
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret b;
+}
+
+# field_init_buf_push: buffer one FieldInit, growing on demand. on allocation
+# failure it reports through the parser and leaves the buffer unchanged.
+pub fun field_init_buf_push(p: *Parser, b: *FieldInitBuf, fi: expr.FieldInit) {
+    if (b.len == b.cap) {
+        var new_cap: u32 = b.cap * 2;
+        if (new_cap == 0) { new_cap = 8; }
+        if (b.data == nil) {
+            val r: Result[*expr.FieldInit, str] = allocate[expr.FieldInit](p.ast.alloc, new_cap::usize);
+            if (is_err[*expr.FieldInit, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*expr.FieldInit, str](r);
+        }
+        or {
+            val r: Result[*expr.FieldInit, str] = reallocate[expr.FieldInit](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
+            if (is_err[*expr.FieldInit, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*expr.FieldInit, str](r);
+        }
+        b.cap = new_cap;
+    }
+    b.data[b.len] = fi;
+    b.len = b.len + 1;
+}
+
+# field_init_buf_flush: append the buffered FieldInits to `ast.field_inits` as
+# one contiguous block and free the buffer. returns the pool start index of the
+# block (the literal's `fields_start`); `*out_len` receives its length.
+pub fun field_init_buf_flush(p: *Parser, b: *FieldInitBuf, out_len: *u32) u32 {
+    val start: u32 = p.ast.field_init_len::u32;
+    var i: u32 = 0;
+    for (i < b.len) {
+        val r: Result[u32, str] = ast.add_field_init(p.ast, b.data[i]);
+        if (is_err[u32, str](r)) { error_at_current(p, "out of memory while parsing"); }
+        i = i + 1;
+    }
+    @out_len = b.len;
+    if (b.data != nil && b.cap > 0) {
+        deallocate[expr.FieldInit](p.ast.alloc, b.data, b.cap::usize);
+    }
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret start;
+}
+
+# TypedNameBuf: a temporary, contiguous buffer of TypedNames collected while
+# parsing a typed-name list (function parameters, record/union fields). the
+# `ast.typed_names` pool is shared and append-only, and a parameter or field
+# whose type is an inline anonymous `rec {...}` / `uni {...}` appends that
+# inline type's own fields to the same pool mid-parse. buffering the parent's
+# direct entries and flushing them after every nested parse completes keeps
+# each list's (start, len) slice contiguous and disjoint.
+# ---
+# data: heap buffer of collected TypedNames
+# len:  number of entries buffered
+# cap:  allocated slots
+pub rec TypedNameBuf {
+    data: *decl.TypedName;
+    len:  u32;
+    cap:  u32;
+}
+
+# typed_name_buf_init: start an empty TypedNameBuf.
+pub fun typed_name_buf_init() TypedNameBuf {
+    var b: TypedNameBuf;
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret b;
+}
+
+# typed_name_buf_push: buffer one TypedName, growing on demand. on allocation
+# failure it reports through the parser and leaves the buffer unchanged.
+pub fun typed_name_buf_push(p: *Parser, b: *TypedNameBuf, tn: decl.TypedName) {
+    if (b.len == b.cap) {
+        var new_cap: u32 = b.cap * 2;
+        if (new_cap == 0) { new_cap = 8; }
+        if (b.data == nil) {
+            val r: Result[*decl.TypedName, str] = allocate[decl.TypedName](p.ast.alloc, new_cap::usize);
+            if (is_err[*decl.TypedName, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*decl.TypedName, str](r);
+        }
+        or {
+            val r: Result[*decl.TypedName, str] = reallocate[decl.TypedName](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
+            if (is_err[*decl.TypedName, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*decl.TypedName, str](r);
+        }
+        b.cap = new_cap;
+    }
+    b.data[b.len] = tn;
+    b.len = b.len + 1;
+}
+
+# typed_name_buf_flush: append the buffered TypedNames to `ast.typed_names` as
+# one contiguous block and free the buffer. returns the pool start index of the
+# block (the list's `params_start`/`fields_start`); `*out_len` receives its length.
+pub fun typed_name_buf_flush(p: *Parser, b: *TypedNameBuf, out_len: *u32) u32 {
+    val start: u32 = p.ast.typed_name_len::u32;
+    var i: u32 = 0;
+    for (i < b.len) {
+        val r: Result[u32, str] = ast.add_typed_name(p.ast, b.data[i]);
+        if (is_err[u32, str](r)) { error_at_current(p, "out of memory while parsing"); }
+        i = i + 1;
+    }
+    @out_len = b.len;
+    if (b.data != nil && b.cap > 0) {
+        deallocate[decl.TypedName](p.ast.alloc, b.data, b.cap::usize);
+    }
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret start;
+}
+
+# StmtIdBuf: a temporary, contiguous buffer of StmtIds collected while parsing
+# a block or comptime-branch statement body. the `ast.stmt_ids` pool is shared
+# and append-only, and a statement that contains a nested block (an inner `{}`,
+# or an `if`/`for` body) appends that block's own statement ids to the same pool
+# mid-parse. buffering the parent's direct statements and flushing them after
+# every nested parse completes keeps each body's (start, len) slice contiguous.
+# ---
+# data: heap buffer of collected StmtIds
+# len:  number of ids buffered
+# cap:  allocated slots
+pub rec StmtIdBuf {
+    data: *id.StmtId;
+    len:  u32;
+    cap:  u32;
+}
+
+# stmt_id_buf_init: start an empty StmtIdBuf.
+pub fun stmt_id_buf_init() StmtIdBuf {
+    var b: StmtIdBuf;
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret b;
+}
+
+# stmt_id_buf_push: buffer one StmtId, growing on demand. on allocation failure
+# it reports through the parser and leaves the buffer unchanged.
+pub fun stmt_id_buf_push(p: *Parser, b: *StmtIdBuf, id_: id.StmtId) {
+    if (b.len == b.cap) {
+        var new_cap: u32 = b.cap * 2;
+        if (new_cap == 0) { new_cap = 8; }
+        if (b.data == nil) {
+            val r: Result[*id.StmtId, str] = allocate[id.StmtId](p.ast.alloc, new_cap::usize);
+            if (is_err[*id.StmtId, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*id.StmtId, str](r);
+        }
+        or {
+            val r: Result[*id.StmtId, str] = reallocate[id.StmtId](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
+            if (is_err[*id.StmtId, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*id.StmtId, str](r);
+        }
+        b.cap = new_cap;
+    }
+    b.data[b.len] = id_;
+    b.len = b.len + 1;
+}
+
+# stmt_id_buf_flush: append the buffered StmtIds to `ast.stmt_ids` as one
+# contiguous block and free the buffer. returns the pool start index of the
+# block (the body's `stmts_start`/`body_start`); `*out_len` receives its length.
+pub fun stmt_id_buf_flush(p: *Parser, b: *StmtIdBuf, out_len: *u32) u32 {
+    val start: u32 = p.ast.stmt_id_len::u32;
+    var i: u32 = 0;
+    for (i < b.len) {
+        push_stmt_id(p, b.data[i]);
+        i = i + 1;
+    }
+    @out_len = b.len;
+    if (b.data != nil && b.cap > 0) {
+        deallocate[id.StmtId](p.ast.alloc, b.data, b.cap::usize);
+    }
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret start;
+}
+
+# ComptimeBranchBuf: a temporary, contiguous buffer of ComptimeBranches
+# collected while parsing one `$if`/`$or` chain. the `ast.comptime_branches`
+# pool is shared and append-only, and a branch body may contain a nested
+# `$if`/`$or` chain that appends its own branches to the same pool mid-parse.
+# buffering this chain's direct branches and flushing them after every nested
+# parse completes keeps each chain's (start, len) slice contiguous and disjoint.
+# ---
+# data: heap buffer of collected ComptimeBranches
+# len:  number of branches buffered
+# cap:  allocated slots
+pub rec ComptimeBranchBuf {
+    data: *decl.ComptimeBranch;
+    len:  u32;
+    cap:  u32;
+}
+
+# comptime_branch_buf_init: start an empty ComptimeBranchBuf.
+pub fun comptime_branch_buf_init() ComptimeBranchBuf {
+    var b: ComptimeBranchBuf;
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret b;
+}
+
+# comptime_branch_buf_push: buffer one ComptimeBranch, growing on demand. on
+# allocation failure it reports through the parser and leaves the buffer
+# unchanged.
+pub fun comptime_branch_buf_push(p: *Parser, b: *ComptimeBranchBuf, br: decl.ComptimeBranch) {
+    if (b.len == b.cap) {
+        var new_cap: u32 = b.cap * 2;
+        if (new_cap == 0) { new_cap = 8; }
+        if (b.data == nil) {
+            val r: Result[*decl.ComptimeBranch, str] = allocate[decl.ComptimeBranch](p.ast.alloc, new_cap::usize);
+            if (is_err[*decl.ComptimeBranch, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*decl.ComptimeBranch, str](r);
+        }
+        or {
+            val r: Result[*decl.ComptimeBranch, str] = reallocate[decl.ComptimeBranch](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
+            if (is_err[*decl.ComptimeBranch, str](r)) { error_at_current(p, "out of memory while parsing"); ret; }
+            b.data = unwrap_ok[*decl.ComptimeBranch, str](r);
+        }
+        b.cap = new_cap;
+    }
+    b.data[b.len] = br;
+    b.len = b.len + 1;
+}
+
+# comptime_branch_buf_flush: append the buffered ComptimeBranches to
+# `ast.comptime_branches` as one contiguous block and free the buffer. returns
+# the pool start index of the block (the chain's `branches_start`); `*out_len`
+# receives its length.
+pub fun comptime_branch_buf_flush(p: *Parser, b: *ComptimeBranchBuf, out_len: *u32) u32 {
+    val start: u32 = p.ast.comptime_branch_len::u32;
+    var i: u32 = 0;
+    for (i < b.len) {
+        val r: Result[u32, str] = ast.add_comptime_branch(p.ast, b.data[i]);
+        if (is_err[u32, str](r)) { error_at_current(p, "out of memory while parsing"); }
+        i = i + 1;
+    }
+    @out_len = b.len;
+    if (b.data != nil && b.cap > 0) {
+        deallocate[decl.ComptimeBranch](p.ast.alloc, b.data, b.cap::usize);
+    }
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+    ret start;
+}
+
+# push_stmt_id: appends a StmtId to ast.stmt_ids, returning 0 on failure (caller must check p.panic).
+# ---
+# p:   parser state
+# id_: StmtId to append
+# ret: index into ast.stmt_ids, or 0 on allocation failure
+pub fun push_stmt_id(p: *Parser, id_: id.StmtId) u32 {
+    val r: Result[u32, str] = ast.add_stmt_id(p.ast, id_);
+    if (is_err[u32, str](r)) {
+        error_at_current(p, "out of memory while parsing");
+        ret 0;
+    }
+    ret unwrap_ok[u32, str](r);
+}
+
+# push_expr_id: appends an ExprId to ast.expr_ids, returning 0 on failure (caller must check p.panic).
+# ---
+# p:   parser state
+# id_: ExprId to append
+# ret: index into ast.expr_ids, or 0 on allocation failure
+pub fun push_expr_id(p: *Parser, id_: id.ExprId) u32 {
+    val r: Result[u32, str] = ast.add_expr_id(p.ast, id_);
+    if (is_err[u32, str](r)) {
+        error_at_current(p, "out of memory while parsing");
+        ret 0;
+    }
+    ret unwrap_ok[u32, str](r);
+}
+
+# push_type_id: appends a TypeId to ast.type_ids, returning 0 on failure (caller must check p.panic).
+# ---
+# p:   parser state
+# id_: TypeId to append
+# ret: index into ast.type_ids, or 0 on allocation failure
+pub fun push_type_id(p: *Parser, id_: id.TypeId) u32 {
+    val r: Result[u32, str] = ast.add_type_id(p.ast, id_);
+    if (is_err[u32, str](r)) {
+        error_at_current(p, "out of memory while parsing");
+        ret 0;
+    }
+    ret unwrap_ok[u32, str](r);
+}

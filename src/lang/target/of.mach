@@ -1,0 +1,319 @@
+# mach.lang.target.of: object-format interface and format-agnostic object model.
+#
+# This file owns the `ObjectImage` data model — the contract between the back
+# end (which builds an image) and the format writer (which serializes it) — so
+# it lives here rather than in be.obj to avoid an import cycle. The `OfVTable`
+# runtime-dispatch interface plus a process-global registry let per-format
+# implementations (elf, coff, macho) self-register from module init. The back
+# end emits relocations using the abstract `RK_*` kinds; each format maps those
+# to its own machine relocation types through its `relocation_kinds` table.
+
+use std.types.result.Result;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.size.usize;
+
+use std.allocator.Allocator;
+
+use intern: mach.lang.intern;
+
+use isa: mach.lang.target.isa;
+
+# canonical numeric ids for known object formats. stable across compiler
+# versions and used as the registry slot index.
+pub val OF_UNKNOWN: u32 = 0;
+pub val OF_ELF:     u32 = 1;
+pub val OF_MACHO:   u32 = 2;
+pub val OF_COFF:    u32 = 3;
+
+# the kind of an output section, abstracted across formats.
+pub def SectionKind: u8;
+
+# executable machine code.
+pub val SK_TEXT:   SectionKind = 0;
+# initialized writable data.
+pub val SK_DATA:   SectionKind = 1;
+# initialized read-only data.
+pub val SK_RODATA: SectionKind = 2;
+# zero-initialized data (no bytes on disk).
+pub val SK_BSS:    SectionKind = 3;
+# debug information.
+pub val SK_DEBUG:  SectionKind = 4;
+
+# abstract relocation kinds emitted by the back end. each object format maps
+# these to its own machine relocation types via its `relocation_kinds` table.
+pub def RelocKind: u8;
+
+# 64-bit absolute address (R_X86_64_64 / R_AARCH64_ABS64 / IMAGE_REL_*_ADDR64).
+pub val RK_ABS64:    RelocKind = 0;
+# 32-bit pc-relative (R_X86_64_PC32 / *_PREL32 / IMAGE_REL_*_REL32).
+pub val RK_PC32:     RelocKind = 1;
+# 32-bit pc-relative through the PLT (R_X86_64_PLT32 / *_CALL26 / branch26).
+pub val RK_PLT32:    RelocKind = 2;
+# 32-bit pc-relative through the GOT (R_X86_64_GOTPCREL).
+pub val RK_GOTPCREL: RelocKind = 3;
+# 32-bit signed absolute (R_X86_64_32S).
+pub val RK_ABS32S:   RelocKind = 4;
+
+# object-symbol flags. combined as a bitmask in `Symbol.flags`.
+# ---
+# SYM_OBJ_FLAG_GLOBAL:   visible outside the object
+# SYM_OBJ_FLAG_WEAK:     weak binding (overridable at link time)
+# SYM_OBJ_FLAG_EXTERN:   undefined here; resolved by the linker
+# SYM_OBJ_FLAG_FUNCTION: a function (code) symbol
+# SYM_OBJ_FLAG_OBJECT:   a data (object) symbol
+pub val SYM_OBJ_FLAG_GLOBAL:   u32 = 0x01;
+pub val SYM_OBJ_FLAG_WEAK:     u32 = 0x02;
+pub val SYM_OBJ_FLAG_EXTERN:   u32 = 0x04;
+pub val SYM_OBJ_FLAG_FUNCTION: u32 = 0x08;
+pub val SYM_OBJ_FLAG_OBJECT:   u32 = 0x10;
+
+# sentinel `Symbol.section` value marking an undefined (external) symbol.
+pub val SECTION_EXTERNAL: u32 = 0xFFFFFFFF;
+
+# loadable-segment permission flags, combined as a bitmask in
+# `LoadSegment.flags`. format-neutral; each format maps them to its own segment
+# permission bits (ELF PF_*, Mach-O VM_PROT_*).
+# ---
+# SEG_FLAG_READ:    the segment is readable
+# SEG_FLAG_WRITE:   the segment is writable
+# SEG_FLAG_EXECUTE: the segment is executable
+pub val SEG_FLAG_READ:    u32 = 0x4;
+pub val SEG_FLAG_WRITE:   u32 = 0x2;
+pub val SEG_FLAG_EXECUTE: u32 = 0x1;
+
+# one output section of an object image. BSS sections carry `bytes = nil`; all
+# others own a `len`-byte buffer.
+# ---
+# name:  interned section name (".text", ".data", ...)
+# kind:  section kind (one of SK_*)
+# bytes: section content, or nil for SK_BSS
+# len:   content length in bytes (logical size for SK_BSS)
+# align: required alignment in bytes
+pub rec Section {
+    name:  intern.StrId;
+    kind:  SectionKind;
+    bytes: *u8;
+    len:   u32;
+    align: u32;
+}
+
+# one symbol defined or referenced by an object image.
+# ---
+# name:    interned symbol name
+# section: defining section index, or SECTION_EXTERNAL if undefined here
+# offset:  offset within the defining section
+# size:    symbol size in bytes (0 if unknown)
+# flags:   bitmask of SYM_OBJ_FLAG_*
+pub rec Symbol {
+    name:    intern.StrId;
+    section: u32;
+    offset:  u32;
+    size:    u32;
+    flags:   u32;
+}
+
+# one relocation in an object image. `kind` names an abstract relocation kind
+# (an interned RK_* name); the format writer maps it to a machine type.
+# ---
+# section: index of the section being patched
+# offset:  byte offset of the patch site within that section
+# kind:    interned abstract relocation-kind name ("abs64", "pc32", ...)
+# symbol:  interned name of the referenced symbol
+# addend:  constant added to the resolved symbol address
+pub rec Relocation {
+    section: u32;
+    offset:  u32;
+    kind:    intern.StrId;
+    symbol:  intern.StrId;
+    addend:  i64;
+}
+
+# the complete, format-agnostic image the back end builds and the format
+# writer serializes. owns its section/symbol/relocation arrays.
+# ---
+# alloc:         allocator backing the owned arrays
+# name:          interned object/module name
+# sections:      array of sections
+# section_count: number of sections
+# symbols:       array of symbols
+# symbol_count:  number of symbols
+# relocations:   array of relocations
+# reloc_count:   number of relocations
+pub rec ObjectImage {
+    alloc:         *Allocator;
+    name:          intern.StrId;
+    sections:      *Section;
+    section_count: u32;
+    symbols:       *Symbol;
+    symbol_count:  u32;
+    relocations:   *Relocation;
+    reloc_count:   u32;
+}
+
+# one loadable segment of a static executable, in the format-neutral terms the
+# linker lays out and a format's `emit_exec` consumes. each segment maps a
+# contiguous run of bytes at a page-aligned virtual address; `memsz` exceeds
+# `filesz` for segments with a trailing zero-fill (bss) region.
+# ---
+# vaddr:  virtual address the segment is mapped at (page-aligned)
+# filesz: bytes occupied in the file
+# memsz:  bytes occupied in memory (>= filesz; the tail is zero-filled)
+# flags:  segment permissions (bitmask of SEG_FLAG_*)
+# bytes:  segment contents, or nil for a zero-only (bss) segment
+pub rec LoadSegment {
+    vaddr:  u64;
+    filesz: usize;
+    memsz:  usize;
+    flags:  u32;
+    bytes:  *u8;
+}
+
+# one entry in a format's relocation-kind table: the format's mapping of an
+# abstract relocation kind to its machine type and encoding properties.
+# ---
+# id:        abstract relocation kind this entry implements (one of RK_*)
+# name:      interned abstract kind name ("abs64", "pc32", ...)
+# bit_width: width in bits of the patched field
+# pc_rel:    true if the relocation is pc-relative
+pub rec RelocationKind {
+    id:        u32;
+    name:      intern.StrId;
+    bit_width: u32;
+    pc_rel:    bool;
+}
+
+# a format writer: serializes an `ObjectImage` to a relocatable object file at
+# the given path. takes the `IsaVTable` (not the full Target) to break the
+# target↔object-format import cycle; the writer uses only what the ISA exposes
+# (machine type, endianness, pointer width).
+# ---
+# arg 0: the instruction-set vtable describing the machine
+# arg 1: the object image to serialize
+# arg 2: null-terminated output file path
+# ret:   true on success, or an error string
+pub def WriterFn: fun(*isa.IsaVTable, *ObjectImage, *u8) Result[bool, str];
+
+# an object reader: parses a relocatable object file's bytes into a fresh
+# `ObjectImage` (sections, symbols, relocations) the linker consumes from disk.
+# the mirror of `WriterFn`; `parse_object` round-trips what `emit_object`
+# writes. names and relocation kinds are kept interned so the linker matches
+# symbols and maps relocations across objects; section bytes are copied into
+# the image, which owns them through `out.alloc`.
+# ---
+# arg 0: allocator backing the image's owned section/symbol/relocation arrays
+# arg 1: the object file bytes
+# arg 2: length of the object file bytes
+# arg 3: image to populate (its arrays are allocated here)
+# ret:   true on success, or an error string
+pub def ParserFn: fun(*Allocator, *u8, usize, *ObjectImage) Result[bool, str];
+
+# a static-executable writer: serializes the linker's laid-out load segments
+# into a static executable at the given path. like `WriterFn` it takes the
+# `IsaVTable` (not the full Target) to break the target↔object-format import
+# cycle; the writer uses only the ISA's machine type and endianness. the linker
+# has already assigned every segment's virtual address and resolved the entry
+# point, so the writer only frames the segments in the format's container (ELF
+# program headers, Mach-O load commands) with a leading header-covering segment.
+# ---
+# arg 0: allocator backing the writer's output buffer
+# arg 1: the instruction-set vtable describing the machine
+# arg 2: the loadable segments, in ascending virtual-address order
+# arg 3: number of load segments
+# arg 4: program entry-point virtual address
+# arg 5: null-terminated output file path
+# ret:   true on success, or an error string
+pub def ExecFn: fun(*Allocator, *isa.IsaVTable, *LoadSegment, u32, u64, *u8) Result[bool, str];
+
+# the object-format runtime-dispatch interface. exactly one of these exists
+# per format; the back end serializes through `emit_object`, the linker reads
+# through `parse_object` and writes executables through `emit_exec`, and all
+# consult `relocation_kinds` to map abstract relocations. it never branches on
+# `id`.
+# ---
+# id:               object-format id (one of OF_*)
+# name:             interned format name ("elf", "coff", "macho")
+# file_extension:   interned default object-file extension ("o", "obj")
+# emit_object:      serializes an ObjectImage to a relocatable object file
+# parse_object:     reads a relocatable object file into an ObjectImage
+# emit_exec:        serializes laid-out load segments into a static executable
+# relocation_kinds: array mapping abstract RK_* kinds to machine types
+# relocation_count: number of relocation-kind entries
+pub rec OfVTable {
+    id:               u32;
+    name:             intern.StrId;
+    file_extension:   intern.StrId;
+    emit_object:      WriterFn;
+    parse_object:     ParserFn;
+    emit_exec:        ExecFn;
+    relocation_kinds: *RelocationKind;
+    relocation_count: u32;
+}
+
+val OF_REGISTRY_CAP: u32 = 8;
+
+# process-global write-once registry of object-format vtables, indexed by
+# format id. per-format implementations self-register from module init.
+var of_registry: [8]*OfVTable;
+var of_registry_init: bool = false;
+
+fun ensure_of_registry() {
+    if (of_registry_init) { ret; }
+    var i: u32 = 0;
+    for (i < OF_REGISTRY_CAP) {
+        of_registry[i] = nil;
+        i = i + 1;
+    }
+    of_registry_init = true;
+}
+
+# register: install an object-format vtable into the process-global registry.
+#
+# write-once per format id: a second registration for the same id is ignored
+# so the first implementation to initialize wins deterministically.
+# ---
+# vt: the object-format vtable to register; its `id` selects the slot
+pub fun register(vt: *OfVTable) {
+    ensure_of_registry();
+    if (vt == nil) { ret; }
+    if (vt.id >= OF_REGISTRY_CAP) { ret; }
+    if (of_registry[vt.id] != nil) { ret; }
+    of_registry[vt.id] = vt;
+}
+
+# lookup: find the object-format vtable registered for a format id.
+# ---
+# of_id: object-format id (one of OF_*)
+# ret:   the registered vtable, or none if no implementation is registered
+pub fun lookup(of_id: u32) Option[*OfVTable] {
+    ensure_of_registry();
+    if (of_id >= OF_REGISTRY_CAP) { ret none[*OfVTable](); }
+    if (of_registry[of_id] == nil) { ret none[*OfVTable](); }
+    ret some[*OfVTable](of_registry[of_id]);
+}
+
+# reloc_kind_name: the interned abstract relocation-kind name an `RK_*` id maps
+# to in a format vtable's `relocation_kinds` table — the StrId a `Relocation.kind`
+# must carry so the format writer matches it. returns intern.STR_NIL for a nil
+# vtable or an unmapped kind.
+# ---
+# vt:   the object-format vtable (nil yields STR_NIL)
+# kind: the abstract relocation kind (one of RK_*)
+# ret:  the interned kind name, or intern.STR_NIL
+pub fun reloc_kind_name(vt: *OfVTable, kind: RelocKind) intern.StrId {
+    if (vt == nil) { ret intern.STR_NIL; }
+    var i: u32 = 0;
+    for (i < vt.relocation_count) {
+        if (vt.relocation_kinds[i].id == kind::u32) {
+            ret vt.relocation_kinds[i].name;
+        }
+        i = i + 1;
+    }
+    ret intern.STR_NIL;
+}

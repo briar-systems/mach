@@ -1,0 +1,495 @@
+# mach.lang.target.abi.sysv: System V AMD64 calling convention.
+#
+# Implements `abi.AbiVTable` and self-registers under `abi.ABI_SYSV` at startup.
+# Owns the SysV AMD64 classification of parameters and return values — the
+# ≤8-byte one-register, 9–16-byte two-register (RDI:RSI for args, RAX:RDX for
+# returns), and >16-byte by-reference/sret rules — plus the GP/FP/callee-saved
+# register files, the 16-byte stack alignment, the 128-byte red zone, and the
+# variadic save-area hooks. The three `classify`/`arg_passing`/`ret_passing`
+# vtable function pointers are type-erased (`*u8`); a consumer casts each back to
+# the concrete signature declared here (`ClassifyFn`, `ArgPassingFn`,
+# `RetPassingFn`).
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.string.str;
+
+use intern: mach.lang.intern;
+use isa:    mach.lang.target.isa;
+use abi:    mach.lang.target.abi;
+
+# canonical x86-64 register numbers (DWARF / encoding order) used by the SysV
+# AMD64 convention. these are the same physical-register ids the x86_64 ISA
+# exposes; they are fixed by the architecture, so the ABI carries them directly
+# rather than depending on the ISA implementation being registered first.
+pub val REG_RAX: i32 = 0;
+pub val REG_RCX: i32 = 1;
+pub val REG_RDX: i32 = 2;
+pub val REG_RBX: i32 = 3;
+pub val REG_RSP: i32 = 4;
+pub val REG_RBP: i32 = 5;
+pub val REG_RSI: i32 = 6;
+pub val REG_RDI: i32 = 7;
+pub val REG_R8:  i32 = 8;
+pub val REG_R9:  i32 = 9;
+pub val REG_R10: i32 = 10;
+pub val REG_R11: i32 = 11;
+pub val REG_R12: i32 = 12;
+pub val REG_R13: i32 = 13;
+pub val REG_R14: i32 = 14;
+pub val REG_R15: i32 = 15;
+
+# floating-point / vector register numbers (XMM0–XMM15). a physical register id
+# is composite — the SSE class tag in the high byte, the within-bank index in the
+# low byte (`isa.regid_make`) — so a float pre-coloring is self-describing and the
+# encoder picks the SSE machine form rather than aliasing the GP register of the
+# same index. XMM0 is `(REG_CLASS_ID_XMM << 8) | 0 = 0x0100`, XMM1 `0x0101`.
+pub val REG_XMM0: i32 = (1 << 8) | 0;
+pub val REG_XMM1: i32 = (1 << 8) | 1;
+
+# number of general-purpose registers available for argument passing
+# (RDI, RSI, RDX, RCX, R8, R9).
+pub val GP_PARAM_COUNT: i32 = 6;
+# number of floating-point registers available for argument passing
+# (XMM0–XMM7).
+pub val FP_PARAM_COUNT: i32 = 8;
+# the register whose low byte (AL) a variadic caller sets to the number of vector
+# registers used, read by the AL-guarded FP-register spill in a variadic callee's
+# prologue. named here so the spill pseudo can carry it as a use the allocator
+# keeps off-limits to value coloring across the guard.
+pub val VA_VECTOR_COUNT_REG: i32 = REG_RAX;
+# number of callee-saved general-purpose registers (RBX, RBP, R12–R15).
+pub val CALLEE_SAVED_COUNT: i32 = 6;
+
+# required stack alignment in bytes at a call boundary.
+pub val STACK_ALIGN: u32 = 16;
+# size in bytes of the leaf-function red zone below RSP.
+pub val RED_ZONE: u32 = 128;
+# largest aggregate size in bytes that may be returned in registers; anything
+# larger is returned via a hidden sret pointer.
+pub val MAX_REG_RET: u64 = 16;
+
+# concrete signature the erased `AbiVTable.classify` pointer is cast back to.
+# classifies one value into a placement decision. `gp_used` and `fp_used` are
+# the counts of GP and FP registers already consumed by earlier arguments.
+# ---
+# arch_id:      architecture id (one of isa.ARCH_*)
+# size:         value size in bytes
+# align:        value alignment in bytes
+# is_float:     true if the value is a floating-point scalar or an all-float
+#               aggregate eligible for FP registers
+# is_aggregate: true if the value is a record/array (recursively classified)
+# gp_used:      GP registers already consumed
+# fp_used:      FP registers already consumed
+# ret:          the placement decision
+pub def ClassifyFn: fun(u32, u64, u64, bool, bool, i32, i32) abi.ParamSlot;
+
+# concrete signature the erased `AbiVTable.arg_passing` pointer is cast back to.
+# assigns the registers or stack slot for a single argument under the SysV
+# rules, given the GP/FP usage counters tracked by the caller.
+# ---
+# arch_id:      architecture id (one of isa.ARCH_*)
+# index:        zero-based logical argument position
+# size:         argument size in bytes
+# align:        argument alignment in bytes
+# is_float:     true if the argument goes in FP registers
+# is_aggregate: true if the argument is an aggregate
+# gp_used:      GP registers already consumed
+# fp_used:      FP registers already consumed
+# ret:          the placement decision
+pub def ArgPassingFn: fun(u32, i32, u64, u64, bool, bool, i32, i32) abi.ParamSlot;
+
+# concrete signature the erased `AbiVTable.ret_passing` pointer is cast back to.
+# assigns the registers or sret slot for a return value under the SysV rules.
+# ---
+# arch_id:      architecture id (one of isa.ARCH_*)
+# size:         return-value size in bytes
+# align:        return-value alignment in bytes
+# is_float:     true if the value is returned in FP registers
+# is_aggregate: true if the value is an aggregate
+# ret:          the placement decision
+pub def RetPassingFn: fun(u32, u64, u64, bool, bool) abi.ParamSlot;
+
+# concrete signature the erased `AbiVTable.gp_arg_regs` / `fp_arg_regs` /
+# `callee_saved` pointers are cast back to. fills the caller-owned `out` buffer
+# with a register bank in canonical order and returns the number of registers
+# written. the caller must size `out` to hold at least the bank's maximum count
+# (`GP_PARAM_COUNT`, `FP_PARAM_COUNT`, or `CALLEE_SAVED_COUNT`).
+# ---
+# out: caller-owned buffer receiving the register descriptors
+# ret: the number of registers written
+pub def RegFileFn: fun(*isa.Register) i32;
+
+# gp_param_reg: the GP argument register for a given argument-register index.
+# returns -1 when the index is past the six GP argument registers.
+# ---
+# index: zero-based GP argument-register index
+# ret:   the physical register id, or -1 if out of range
+pub fun gp_param_reg(index: i32) i32 {
+    if (index == 0) { ret REG_RDI; }
+    if (index == 1) { ret REG_RSI; }
+    if (index == 2) { ret REG_RDX; }
+    if (index == 3) { ret REG_RCX; }
+    if (index == 4) { ret REG_R8; }
+    if (index == 5) { ret REG_R9; }
+    ret -1;
+}
+
+# fp_param_reg: the FP argument register for a given argument-register index.
+# XMM registers are numbered identically to their index within the SSE bank; the
+# returned id is composite (the SSE class tag in the high byte) so a float
+# pre-coloring carries its bank. returns -1 past XMM7.
+# ---
+# index: zero-based FP argument-register index
+# ret:   the composite XMM register id, or -1 if out of range
+pub fun fp_param_reg(index: i32) i32 {
+    if (index < 0) { ret -1; }
+    if (index >= FP_PARAM_COUNT) { ret -1; }
+    ret isa.regid_make(isa.REG_CLASS_ID_XMM, index);
+}
+
+# unsupported_slot: the honest "unsupported architecture" sentinel returned by
+# this AMD64-only classifier when handed a non-x86_64 arch_id.
+#
+# the vtable classify/arg/ret signatures return a plain `ParamSlot` (not a
+# `Result`), so an out-of-scope architecture cannot surface a `str` error here.
+# instead this returns a structurally impossible placement — CLASS_STACK with
+# offset = -1 and size = 0 — that no real SysV AMD64 placement ever produces (a
+# genuine stack slot always carries its true byte size and offset 0). a consumer
+# can reject it with `is_unsupported_slot`; it must never be treated as a valid
+# aarch64 (or any other) register/stack placement. aarch64 AAPCS64 classification
+# is intentionally out of scope for this file and belongs in a separate impl.
+# ---
+# ret: the unsupported-architecture sentinel slot
+pub fun unsupported_slot() abi.ParamSlot {
+    ret abi.make_slot(abi.CLASS_STACK, -1, -1, -1, 0);
+}
+
+# is_unsupported_slot: report whether a ParamSlot is the unsupported sentinel.
+#
+# consumers casting these classify/arg/ret pointers back to their concrete
+# signatures must call this before trusting a placement, so the AMD64-only
+# fallback is rejected rather than mistaken for a real stack slot.
+# ---
+# slot: the placement decision to test
+# ret:  true if `slot` is the `unsupported_slot` sentinel
+pub fun is_unsupported_slot(slot: abi.ParamSlot) bool {
+    ret slot.class == abi.CLASS_STACK && slot.offset == -1 && slot.size == 0;
+}
+
+# classify: classify one value into a SysV placement decision.
+#
+# this is the body behind the erased `AbiVTable.classify` pointer; it treats
+# the value as the first argument and routes through `classify_arg`. returns
+# are routed separately through `classify_return`.
+# ---
+# arch_id:      architecture id (one of isa.ARCH_*)
+# size:         value size in bytes
+# align:        value alignment in bytes
+# is_float:     true if the value is FP-eligible
+# is_aggregate: true if the value is an aggregate
+# gp_used:      GP registers already consumed
+# fp_used:      FP registers already consumed
+# ret:          the placement decision
+pub fun classify(arch_id: u32, size: u64, align: u64, is_float: bool,
+                 is_aggregate: bool, gp_used: i32, fp_used: i32) abi.ParamSlot {
+    ret classify_arg(arch_id, 0, size, align, is_float, is_aggregate, gp_used, fp_used);
+}
+
+# classify_arg: assign registers or a stack slot for one argument (SysV).
+#
+# aggregates larger than 16 bytes are passed by hidden reference (CLASS_BYREF)
+# when a GP argument register remains — the pointer occupies that register; once
+# the GP registers are exhausted such an aggregate is MEMORY-class, passed BY
+# VALUE on the stack (its full byte size, CLASS_STACK), not by reference.
+# aggregates of 9–16 bytes take TWO consecutive GP registers
+# (RDI:RSI, RSI:RDX, ...); aggregates of ≤8 bytes take one GP register, or one
+# FP register when all-float. scalars take one GP or FP register until that set
+# is exhausted, then spill to the stack. this classifier is AMD64-only: a
+# non-x86_64 arch_id (e.g. aarch64, whose AAPCS64 placement differs) yields the
+# `unsupported_slot` sentinel, which callers must reject -- it is never a valid
+# placement on the requested architecture.
+# ---
+# arch_id:      architecture id (one of isa.ARCH_*)
+# index:        zero-based logical argument position
+# size:         argument size in bytes
+# align:        argument alignment in bytes
+# is_float:     true if the argument goes in FP registers
+# is_aggregate: true if the argument is an aggregate
+# gp_used:      GP registers already consumed
+# fp_used:      FP registers already consumed
+# ret:          the placement decision
+pub fun classify_arg(arch_id: u32, index: i32, size: u64, align: u64,
+                     is_float: bool, is_aggregate: bool,
+                     gp_used: i32, fp_used: i32) abi.ParamSlot {
+    if (arch_id != isa.ARCH_X86_64) {
+        ret unsupported_slot();
+    }
+
+    if (is_aggregate && size > MAX_REG_RET) {
+        if (gp_used < GP_PARAM_COUNT) {
+            ret abi.make_slot(abi.CLASS_BYREF, gp_param_reg(gp_used), -1, 0, 8);
+        }
+        # no GP register remains: the aggregate is MEMORY-class, passed BY VALUE on
+        # the stack (its full byte size), not by reference. the slot size is the true
+        # aggregate size so the caller's by-value copy, the outgoing-region cursor /
+        # reservation, and the callee's in-place read all agree on its footprint.
+        ret abi.make_slot(abi.CLASS_STACK, -1, -1, 0, size);
+    }
+
+    if (is_aggregate) {
+        if (size <= 8 && is_float && fp_used < FP_PARAM_COUNT) {
+            ret abi.make_slot(abi.CLASS_FP, fp_param_reg(fp_used), -1, 0, size);
+        }
+        if (size <= 8 && gp_used < GP_PARAM_COUNT) {
+            ret abi.make_slot(abi.CLASS_GP, gp_param_reg(gp_used), -1, 0, size);
+        }
+        if (size <= MAX_REG_RET && gp_used + 1 < GP_PARAM_COUNT) {
+            ret abi.make_slot(abi.CLASS_GP, gp_param_reg(gp_used),
+                              gp_param_reg(gp_used + 1), 0, size);
+        }
+        ret abi.make_slot(abi.CLASS_STACK, -1, -1, 0, size);
+    }
+
+    if (is_float) {
+        if (fp_used < FP_PARAM_COUNT) {
+            ret abi.make_slot(abi.CLASS_FP, fp_param_reg(fp_used), -1, 0, size);
+        }
+        ret abi.make_slot(abi.CLASS_STACK, -1, -1, 0, size);
+    }
+
+    if (gp_used < GP_PARAM_COUNT) {
+        ret abi.make_slot(abi.CLASS_GP, gp_param_reg(gp_used), -1, 0, size);
+    }
+    ret abi.make_slot(abi.CLASS_STACK, -1, -1, 0, size);
+}
+
+# classify_return: assign registers or an sret pointer for a return value (SysV).
+#
+# a zero-size (void) return yields CLASS_GP with reg=-1. aggregates larger than
+# 16 bytes are returned through a hidden struct-return pointer: the caller
+# passes the storage address in RDI and the callee returns it in RAX
+# (CLASS_SRET, reg=RAX). aggregates of 9–16 bytes return in RAX:RDX; ≤8-byte
+# aggregates return in RAX (or XMM0 when all-float). scalars return in RAX, or
+# XMM0 for floats. this classifier is AMD64-only: a non-x86_64 arch_id (e.g.
+# aarch64, which returns sret in X8) yields the `unsupported_slot` sentinel,
+# which callers must reject rather than treat as a valid placement.
+# ---
+# arch_id:      architecture id (one of isa.ARCH_*)
+# size:         return-value size in bytes
+# align:        return-value alignment in bytes
+# is_float:     true if the value is returned in FP registers
+# is_aggregate: true if the value is an aggregate
+# ret:          the placement decision
+pub fun classify_return(arch_id: u32, size: u64, align: u64,
+                        is_float: bool, is_aggregate: bool) abi.ParamSlot {
+    if (arch_id != isa.ARCH_X86_64) {
+        ret unsupported_slot();
+    }
+
+    if (size == 0) {
+        ret abi.make_slot(abi.CLASS_GP, -1, -1, 0, 0);
+    }
+
+    if (is_aggregate && size > MAX_REG_RET) {
+        ret abi.make_slot(abi.CLASS_SRET, REG_RAX, -1, 0, 8);
+    }
+
+    if (is_aggregate) {
+        if (size <= 8 && is_float) {
+            ret abi.make_slot(abi.CLASS_FP, REG_XMM0, -1, 0, size);
+        }
+        if (size <= 8) {
+            ret abi.make_slot(abi.CLASS_GP, REG_RAX, -1, 0, size);
+        }
+        ret abi.make_slot(abi.CLASS_GP, REG_RAX, REG_RDX, 0, size);
+    }
+
+    if (is_float) {
+        ret abi.make_slot(abi.CLASS_FP, REG_XMM0, -1, 0, size);
+    }
+
+    ret abi.make_slot(abi.CLASS_GP, REG_RAX, -1, 0, size);
+}
+
+# gp_param_regs: the general-purpose argument registers, in passing order.
+#
+# fills `out[0..GP_PARAM_COUNT)` with RDI, RSI, RDX, RCX, R8, R9 (each 8 bytes
+# wide). the caller owns `out`, which must hold at least `GP_PARAM_COUNT`
+# registers; the count is returned so the call composes with `RegisterFile`.
+# ---
+# out: caller-owned buffer of at least GP_PARAM_COUNT registers
+# ret: the number of registers written (GP_PARAM_COUNT)
+pub fun gp_param_regs(out: *isa.Register) i32 {
+    var i: i32 = 0;
+    for (i < GP_PARAM_COUNT) {
+        out[i].id   = gp_param_reg(i);
+        out[i].size = 8;
+        i = i + 1;
+    }
+    ret GP_PARAM_COUNT;
+}
+
+# fp_param_regs: the floating-point argument registers, in passing order.
+#
+# fills `out[0..FP_PARAM_COUNT)` with XMM0–XMM7 (each 16 bytes wide). the caller
+# owns `out`, which must hold at least `FP_PARAM_COUNT` registers.
+# ---
+# out: caller-owned buffer of at least FP_PARAM_COUNT registers
+# ret: the number of registers written (FP_PARAM_COUNT)
+pub fun fp_param_regs(out: *isa.Register) i32 {
+    var i: i32 = 0;
+    for (i < FP_PARAM_COUNT) {
+        out[i].id   = isa.regid_make(isa.REG_CLASS_ID_XMM, i);
+        out[i].size = 16;
+        i = i + 1;
+    }
+    ret FP_PARAM_COUNT;
+}
+
+# callee_saved: the callee-saved general-purpose registers.
+#
+# fills `out[0..CALLEE_SAVED_COUNT)` with RBX, RBP, R12, R13, R14, R15 (each 8
+# bytes wide). a callee that touches any of these must preserve it across the
+# call. the caller owns `out`, which must hold at least `CALLEE_SAVED_COUNT`
+# registers.
+# ---
+# out: caller-owned buffer of at least CALLEE_SAVED_COUNT registers
+# ret: the number of registers written (CALLEE_SAVED_COUNT)
+pub fun callee_saved(out: *isa.Register) i32 {
+    out[0].id = REG_RBX; out[0].size = 8;
+    out[1].id = REG_RBP; out[1].size = 8;
+    out[2].id = REG_R12; out[2].size = 8;
+    out[3].id = REG_R13; out[3].size = 8;
+    out[4].id = REG_R14; out[4].size = 8;
+    out[5].id = REG_R15; out[5].size = 8;
+    ret CALLEE_SAVED_COUNT;
+}
+
+# stack_align: required stack alignment in bytes at a call boundary (16).
+# ---
+# ret: the alignment in bytes
+pub fun stack_align() u32 {
+    ret STACK_ALIGN;
+}
+
+# red_zone: size in bytes of the leaf-function red zone below RSP (128).
+# ---
+# ret: the red-zone size in bytes
+pub fun red_zone() u32 {
+    ret RED_ZONE;
+}
+
+# max_reg_ret: largest aggregate size in bytes returnable in registers (16).
+# aggregates larger than this are returned via an sret pointer.
+# ---
+# ret: the maximum register-return size in bytes
+pub fun max_reg_ret() u64 {
+    ret MAX_REG_RET;
+}
+
+# va_save_size: size in bytes of the register save area a variadic prologue
+# must reserve. it holds all six GP argument registers (8 bytes each) followed
+# by all eight FP argument registers (16 bytes each), matching the AMD64
+# `va_list` register-save-area layout.
+# ---
+# ret: the save-area size in bytes
+pub fun va_save_size() u64 {
+    ret GP_PARAM_COUNT::u64 * 8 + FP_PARAM_COUNT::u64 * 16;
+}
+
+# va_list_size: size in bytes of the AMD64 `__va_list_tag` structure.
+# ---
+# ret: the va_list size in bytes (24)
+pub fun va_list_size() u64 {
+    ret 24;
+}
+
+# va_list_align: alignment in bytes of the AMD64 `__va_list_tag` structure.
+# ---
+# ret: the va_list alignment in bytes (8)
+pub fun va_list_align() u64 {
+    ret 8;
+}
+
+# VA_GP_OFFSET: byte offset of the gp_offset field in the AMD64 `__va_list_tag`.
+pub val VA_GP_OFFSET:         u32 = 0;
+# VA_FP_OFFSET: byte offset of the fp_offset field in the AMD64 `__va_list_tag`.
+pub val VA_FP_OFFSET:         u32 = 4;
+# VA_OVERFLOW_ARG_AREA: byte offset of the overflow_arg_area pointer in the AMD64 `__va_list_tag`.
+pub val VA_OVERFLOW_ARG_AREA: u32 = 8;
+# VA_REG_SAVE_AREA: byte offset of the reg_save_area pointer in the AMD64 `__va_list_tag`.
+pub val VA_REG_SAVE_AREA:     u32 = 16;
+
+# va_fp_save_offset: byte offset within the register save area at which the FP
+# register dump begins — after all six GP argument registers (6 * 8 bytes).
+# ---
+# ret: the byte offset of the first FP register slot in the save area
+pub fun va_fp_save_offset() u64 {
+    ret GP_PARAM_COUNT::u64 * 8;
+}
+
+# va_gp_offset_max: the gp_offset value at which the GP register-save area is
+# exhausted (all six GP argument registers consumed). a `va_arg` of a GP-class
+# value whose gp_offset has reached this falls through to the overflow area.
+# ---
+# ret: the exhausted gp_offset (48)
+pub fun va_gp_offset_max() u32 {
+    ret GP_PARAM_COUNT::u32 * 8;
+}
+
+# va_fp_offset_max: the fp_offset value at which the FP register-save area is
+# exhausted (all eight FP argument registers consumed). the FP dump begins after
+# the GP dump, so the max is the GP area size plus eight 16-byte FP slots.
+# ---
+# ret: the exhausted fp_offset (176)
+pub fun va_fp_offset_max() u32 {
+    ret GP_PARAM_COUNT::u32 * 8 + FP_PARAM_COUNT::u32 * 16;
+}
+
+# the SysV AMD64 ABI vtable. populated by register on first call and handed out
+# as a borrowed pointer to the registry. its three classify/arg/ret function
+# pointers are stored type-erased (`*u8`); consumers cast them back to
+# `ClassifyFn`/`ArgPassingFn`/`RetPassingFn`.
+var sysv_vtable: abi.AbiVTable;
+var sysv_registered: bool = false;
+
+# register: build the SysV AMD64 AbiVTable and install it into the ABI registry.
+#
+# interns the convention name ("sysv"), wires the type-erased classify/arg/ret
+# operation pointers and the GP/FP argument-register and callee-saved register
+# file accessors, sets the 16-byte stack alignment and 128-byte red zone, and
+# registers it under abi.ABI_SYSV so target.select can find it through
+# abi.lookup. idempotent: a second call returns ok without re-interning.
+# ---
+# i:   interner used to intern the vtable's string fields
+# ret: ok(true) on success, or an allocation error from interning
+pub fun register(i: *intern.Interner) Result[bool, str] {
+    if (sysv_registered) { ret ok[bool, str](true); }
+
+    val rn: Result[intern.StrId, str] = intern.intern(i, "sysv");
+    if (is_err[intern.StrId, str](rn)) { ret err[bool, str](unwrap_err[intern.StrId, str](rn)); }
+
+    sysv_vtable.id           = abi.ABI_SYSV;
+    sysv_vtable.name         = unwrap_ok[intern.StrId, str](rn);
+    sysv_vtable.classify     = classify::*u8;
+    sysv_vtable.arg_passing  = classify_arg::*u8;
+    sysv_vtable.ret_passing  = classify_return::*u8;
+    sysv_vtable.gp_arg_regs  = gp_param_regs::*u8;
+    sysv_vtable.fp_arg_regs  = fp_param_regs::*u8;
+    sysv_vtable.callee_saved = callee_saved::*u8;
+    sysv_vtable.stack_align  = STACK_ALIGN;
+    sysv_vtable.red_zone     = RED_ZONE;
+
+    abi.register(?sysv_vtable);
+    sysv_registered = true;
+    ret ok[bool, str](true);
+}
