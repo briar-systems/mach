@@ -102,10 +102,36 @@ val R_AARCH64_PREL32: u32 = 261;
 val R_AARCH64_CALL26: u32 = 283;
 
 # ELF program header types and flags.
-val PT_LOAD: u32 = 1;
+val PT_LOAD:    u32 = 1;
+val PT_DYNAMIC: u32 = 2;
+val PT_INTERP:  u32 = 3;
+val PT_PHDR:    u32 = 6;
 val PF_X: u32 = 1;
 val PF_W: u32 = 2;
 val PF_R: u32 = 4;
+
+# ELF PLT/GOT dynamic relocation types.
+val R_X86_64_JUMP_SLOT: u32 = 7;
+val R_AARCH64_JUMP_SLOT: u32 = 1026;
+
+# ELF `.dynamic` tag ids consumed by the loader. only the tags a minimal
+# dynamically-linked PLT image needs are listed.
+val DT_NULL:     u64 = 0;
+val DT_NEEDED:   u64 = 1;
+val DT_PLTRELSZ: u64 = 2;
+val DT_PLTGOT:   u64 = 3;
+val DT_HASH:     u64 = 4;
+val DT_STRTAB:   u64 = 5;
+val DT_SYMTAB:   u64 = 6;
+val DT_STRSZ:    u64 = 10;
+val DT_SYMENT:   u64 = 11;
+val DT_PLTREL:   u64 = 20;
+val DT_JMPREL:   u64 = 23;
+
+# fixed on-disk sizes of the dynamic-link structures (ELF64).
+val DYN_SIZE: usize = 16;
+val GOT_ENTRY_SIZE: usize = 8;
+val PLT_ENTRY_SIZE: usize = 16;
 
 # fixed on-disk structure sizes for ELF64.
 val ELF_HEADER_SIZE: usize = 64;
@@ -171,6 +197,12 @@ fun write_str(buf: *u8, offset: usize, s: str) usize {
 
 # align a usize up to the given power-of-two alignment.
 fun align_up(value: usize, alignment: usize) usize {
+    if (alignment == 0) { ret value; }
+    ret (value + alignment - 1) & ~(alignment - 1);
+}
+
+# align a u64 virtual address up to the given power-of-two alignment.
+fun align_up_u64(value: u64, alignment: u64) u64 {
     if (alignment == 0) { ret value; }
     ret (value + alignment - 1) & ~(alignment - 1);
 }
@@ -756,6 +788,7 @@ pub fun register(i: *intern.Interner) Result[bool, str] {
     elf_vtable.emit_object      = emit_object;
     elf_vtable.parse_object     = parse_object;
     elf_vtable.emit_exec        = emit_exec;
+    elf_vtable.emit_dyn_exec    = emit_dyn_exec;
     elf_vtable.relocation_kinds = ?elf_reloc_kinds[0];
     elf_vtable.relocation_count = 5;
 
@@ -895,6 +928,634 @@ fun emit_exec(alloc: *Allocator, tgt_isa: *isa.IsaVTable, segs: *of.LoadSegment,
 
     if (is_err[usize, str](res_write)) { ret err[bool, str]("elf: exec write failed"); }
     ret ok[bool, str](true);
+}
+
+# the ELF machine JUMP_SLOT (PLT) relocation type for an ISA. defaults to the
+# x86-64 type for unknown ISAs (the dynamic writer is x86-64-only for now).
+fun jump_slot_for(arch_id: u32) u32 {
+    if (arch_id == isa.ARCH_AARCH64) { ret R_AARCH64_JUMP_SLOT; }
+    ret R_X86_64_JUMP_SLOT;
+}
+
+# the resolved layout of every synthesized dynamic-link structure, computed once
+# from the import/dependency counts and the address the structures start at, then
+# consumed by the write pass. every `*_off` is a file offset; every `*_va` is the
+# matching virtual address. the RO group (.interp/.dynsym/.dynstr/.hash/.rela.plt)
+# shares one page-aligned load segment, .plt its own R+X segment, and
+# .got.plt/.dynamic a final R+W segment.
+# ---
+# ro_off/ro_va/ro_size:       read-only metadata segment span
+# interp_off/interp_va:       PT_INTERP string
+# dynsym_off/dynsym_va:       .dynsym (Elf64_Sym[1 + import_count])
+# dynstr_off/dynstr_va/size:  .dynstr (NUL + names + sonames)
+# hash_off/hash_va:           .hash (SysV: nbucket,nchain,buckets,chain)
+# relaplt_off/relaplt_va/sz:  .rela.plt (Elf64_Rela[func_import_count])
+# plt_off/plt_va/plt_size:    .plt (R+X), header + one stub per func import
+# rw_off/rw_va/rw_size:       writable segment span (.got.plt + .dynamic)
+# gotplt_off/gotplt_va:       .got.plt (GOT[0..2] reserved + one per func import)
+# dynamic_off/dynamic_va/sz:  .dynamic (Elf64_Dyn array)
+rec DynLayout {
+    ro_off: usize;       ro_va: u64;        ro_size: usize;
+    interp_off: usize;   interp_va: u64;    interp_size: usize;
+    dynsym_off: usize;   dynsym_va: u64;
+    dynstr_off: usize;   dynstr_va: u64;    dynstr_size: usize;
+    hash_off: usize;     hash_va: u64;      hash_size: usize;
+    relaplt_off: usize;  relaplt_va: u64;   relaplt_size: usize;
+    plt_off: usize;      plt_va: u64;       plt_size: usize;
+    rw_off: usize;       rw_va: u64;        rw_size: usize;
+    gotplt_off: usize;   gotplt_va: u64;    gotplt_size: usize;
+    dynamic_off: usize;  dynamic_va: u64;   dynamic_size: usize;
+}
+
+# count the function imports in a dynamic plan — only these get a PLT stub, a
+# GOT.PLT slot, and a `.rela.plt` JUMP_SLOT entry. data imports (none emitted
+# today) would bind through a GLOB_DAT relocation instead.
+fun func_import_count(dyn: *of.DynamicInfo) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < dyn.import_count) {
+        if (dyn.imports[i].is_func) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the byte length of an interned name (its text plus the NUL terminator).
+fun dynstr_name_len(id: intern.StrId) usize {
+    val s: str = resolve(id);
+    if (s == nil) { ret 1; }
+    ret str_len(s) + 1;
+}
+
+# emit_dyn_exec: write a dynamically-linked ET_DYN ELF executable. installed in
+# the ELF `of.OfVTable` as its `of.DynExecFn`.
+#
+# frames the linker's laid-out load segments with the ELF dynamic-linking
+# structures: a PT_INTERP naming the run-time loader, a .dynamic table listing a
+# DT_NEEDED per shared dependency, the .dynsym/.dynstr/.hash dynamic symbol
+# tables, and a PLT/GOT with a `.rela.plt` JUMP_SLOT relocation per imported
+# function. the synthesized structures occupy three new load segments placed
+# above the linker's segments: a read-only metadata segment, a read+execute .plt
+# segment, and a read+write .got.plt/.dynamic segment. each call site the linker
+# could not resolve (a `PltFixup`) is patched to its import's PLT stub. the image
+# is ET_DYN (a PIE-form dynamic executable) so the loader maps it; the static
+# `emit_exec` ET_EXEC path is untouched.
+# ---
+# alloc:       allocator for the output buffer and layout scratch
+# tgt_isa:     instruction-set vtable selecting the ELF machine and JUMP_SLOT type
+# segs:        the linker's loadable segments, ascending virtual-address order
+# seg_count:   number of segments
+# entry:       program entry-point virtual address
+# dyn:         the dynamic-link plan (dependencies, imports, interpreter path)
+# fixups:      import call-site fixups to redirect to PLT stubs
+# fixup_count: number of fixups
+# path:        null-terminated output file path
+# ret:         ok(true) on success, or an error string
+fun emit_dyn_exec(alloc: *Allocator, tgt_isa: *isa.IsaVTable, segs: *of.LoadSegment,
+                  seg_count: u32, entry: u64, dyn: *of.DynamicInfo,
+                  fixups: *of.PltFixup, fixup_count: u32, path: *u8) Result[bool, str] {
+    if (tgt_isa == nil) { ret err[bool, str]("elf: nil dyn-exec isa"); }
+    if (path == nil)    { ret err[bool, str]("elf: nil dyn-exec path"); }
+    if (dyn == nil)     { ret err[bool, str]("elf: nil dynamic plan"); }
+    if (elf_interner == nil) { ret err[bool, str]("elf: no interner registered for dyn-exec"); }
+
+    val nimp: u32 = func_import_count(dyn);
+
+    # the highest virtual address the linker's segments reach; the synthesized
+    # dynamic structures are placed page-aligned above it so the linker's segment
+    # vaddrs (and the patched call sites' targets) stay valid.
+    var hi_va: u64 = 0;
+    var li: u32 = 0;
+    for (li < seg_count) {
+        val end: u64 = segs[li].vaddr + segs[li].memsz::u64;
+        if (end > hi_va) { hi_va = end; }
+        li = li + 1;
+    }
+
+    # the program-header table sits right after the ELF header; its size depends
+    # on the segment count (PT_PHDR + PT_INTERP + the linker segments + the 3
+    # synthesized + PT_DYNAMIC). the first linker segment also maps the ELF
+    # header + phdrs, so no separate header-covering PT_LOAD is needed.
+    val phdr_count: u32 = seg_count + 6;
+    val phdr_offset: usize = ELF_HEADER_SIZE;
+    val phdr_table_size: usize = phdr_count::usize * PHDR_SIZE;
+
+    # the file offset where the synthesized structures begin: after the linker's
+    # segment file bytes, page-aligned. the linker segments are written at file
+    # offsets matching their vaddr page (`offset % page == vaddr % page`).
+    var struct_file: usize = align_up(phdr_offset + phdr_table_size, EXEC_PAGE_SIZE::usize);
+    var seg_offsets: *usize = nil;
+    if (seg_count > 0) {
+        val ro: Result[*usize, str] = zallocate[usize](alloc, seg_count::usize);
+        if (is_err[*usize, str](ro)) { ret err[bool, str]("elf: dyn-exec seg-offset alloc failed"); }
+        seg_offsets = unwrap_ok[*usize, str](ro);
+        li = 0;
+        for (li < seg_count) {
+            struct_file = align_up(struct_file, EXEC_PAGE_SIZE::usize);
+            seg_offsets[li] = struct_file;
+            struct_file = struct_file + segs[li].filesz;
+            li = li + 1;
+        }
+    }
+
+    var lay: DynLayout;
+    compute_dyn_layout(?lay, dyn, nimp, align_up(struct_file, EXEC_PAGE_SIZE::usize),
+                       align_up_u64(hi_va, EXEC_PAGE_SIZE));
+
+    val total_size: usize = lay.rw_off + lay.rw_size;
+
+    val res_buf: Result[*u8, str] = zallocate[u8](alloc, total_size);
+    if (is_err[*u8, str](res_buf)) {
+        if (seg_offsets != nil) { deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+        ret err[bool, str]("elf: dyn-exec buffer alloc failed");
+    }
+    var buf: *u8 = unwrap_ok[*u8, str](res_buf);
+
+    # ELF header. a fixed-address (ET_EXEC) dynamically-linked executable: the
+    # linker assigned absolute virtual addresses from the OS base and the back end
+    # emits absolute addressing, so the image must map at those fixed addresses
+    # (an ET_DYN/PIE would be relocated by a load bias and invalidate them). glibc
+    # loads an ET_EXEC carrying PT_INTERP/PT_DYNAMIC as a classic non-PIE dynamic
+    # binary and still resolves the PLT.
+    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
+    buf[4] = ELFCLASS64; buf[5] = ELFDATA2LSB; buf[6] = EV_CURRENT; buf[7] = ELFOSABI_NONE;
+    write_u16_le(buf, 16, ET_EXEC);
+    write_u16_le(buf, 18, machine_for(tgt_isa.id));
+    write_u32_le(buf, 20, 1);
+    write_u64_le(buf, 24, entry);
+    write_u64_le(buf, 32, phdr_offset::u64);
+    write_u64_le(buf, 40, 0);
+    write_u32_le(buf, 48, 0);
+    write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
+    write_u16_le(buf, 54, PHDR_SIZE::u16);
+    write_u16_le(buf, 56, phdr_count::u16);
+    write_u16_le(buf, 58, SHDR_SIZE::u16);
+    write_u16_le(buf, 60, 0);
+    write_u16_le(buf, 62, 0);
+
+    # copy the linker's segment bytes into their file offsets.
+    li = 0;
+    for (li < seg_count) {
+        if (segs[li].bytes != nil && segs[li].filesz > 0) {
+            mem.raw_copy((buf::usize + seg_offsets[li])::ptr, segs[li].bytes::ptr, segs[li].filesz);
+        }
+        li = li + 1;
+    }
+
+    # per-name offsets into .dynstr, indexed by raw import / lib index. allocated
+    # here (not a fixed-size scratch) so any number of imports/dependencies works.
+    var imp_str: *usize = nil;
+    if (dyn.import_count > 0) {
+        val ri: Result[*usize, str] = zallocate[usize](alloc, dyn.import_count::usize);
+        if (is_err[*usize, str](ri)) {
+            if (seg_offsets != nil) { deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+            deallocate[u8](alloc, buf, total_size);
+            ret err[bool, str]("elf: dyn-exec import-name table alloc failed");
+        }
+        imp_str = unwrap_ok[*usize, str](ri);
+    }
+    var lib_str: *usize = nil;
+    if (dyn.lib_count > 0) {
+        val rl: Result[*usize, str] = zallocate[usize](alloc, dyn.lib_count::usize);
+        if (is_err[*usize, str](rl)) {
+            if (imp_str != nil) { deallocate[usize](alloc, imp_str, dyn.import_count::usize); }
+            if (seg_offsets != nil) { deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+            deallocate[u8](alloc, buf, total_size);
+            ret err[bool, str]("elf: dyn-exec lib-name table alloc failed");
+        }
+        lib_str = unwrap_ok[*usize, str](rl);
+    }
+
+    # write the synthesized structures, then patch the import call sites.
+    write_dyn_structures(buf, ?lay, dyn, nimp, tgt_isa.id, imp_str, lib_str);
+    patch_plt_fixups(buf, ?lay, dyn, fixups, fixup_count, seg_offsets, segs, seg_count, nimp);
+
+    if (imp_str != nil) { deallocate[usize](alloc, imp_str, dyn.import_count::usize); }
+    if (lib_str != nil) { deallocate[usize](alloc, lib_str, dyn.lib_count::usize); }
+
+    # program headers: leading header-cover PT_LOAD, PT_INTERP, the linker
+    # segments, the RO/PLT/RW synthesized segments, then PT_DYNAMIC.
+    write_dyn_phdrs(buf, phdr_offset, ?lay, segs, seg_offsets, seg_count);
+
+    if (seg_offsets != nil) { deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+
+    val res_file: Result[fs.File, str] = fs.create(path, 0o755);
+    if (is_err[fs.File, str](res_file)) {
+        deallocate[u8](alloc, buf, total_size);
+        ret err[bool, str]("elf: could not create dynamic executable file");
+    }
+    var f: fs.File = unwrap_ok[fs.File, str](res_file);
+    val res_write: Result[usize, str] = fs.write(?f, buf, total_size);
+    fs.close(?f);
+    deallocate[u8](alloc, buf, total_size);
+
+    if (is_err[usize, str](res_write)) { ret err[bool, str]("elf: dyn-exec write failed"); }
+    ret ok[bool, str](true);
+}
+
+# compute_dyn_layout: place every synthesized dynamic structure at a file offset
+# and virtual address, given the file offset (`struct_file`) and virtual address
+# (`struct_va`) the structures start at. the RO group, .plt, and the RW group
+# each occupy their own page-aligned load segment so they get distinct loader
+# permissions. file offset and vaddr advance in lockstep within a segment so the
+# loader's `offset % page == vaddr % page` invariant holds.
+fun compute_dyn_layout(lay: *DynLayout, dyn: *of.DynamicInfo, nimp: u32,
+                       struct_file: usize, struct_va: u64) {
+    val page: usize = EXEC_PAGE_SIZE::usize;
+
+    # read-only metadata segment.
+    lay.ro_off = struct_file;
+    lay.ro_va  = struct_va;
+
+    var off: usize = struct_file;
+    var va:  u64   = struct_va;
+
+    # .interp: the dynamic-loader path (NUL-terminated).
+    lay.interp_off  = off;
+    lay.interp_va   = va;
+    lay.interp_size = dynstr_name_len(dyn.interp);
+    off = off + lay.interp_size;
+    va  = va  + lay.interp_size::u64;
+
+    # .dynsym: index 0 reserved-null, then one entry per function import.
+    off = align_up(off, 8);
+    va  = align_up_u64(va, 8);
+    lay.dynsym_off = off;
+    lay.dynsym_va  = va;
+    val dynsym_size: usize = (nimp + 1)::usize * SYM_SIZE;
+    off = off + dynsym_size;
+    va  = va  + dynsym_size::u64;
+
+    # .dynstr: leading NUL, the interp path, each import name, each soname.
+    lay.dynstr_off = off;
+    lay.dynstr_va  = va;
+    var dynstr_size: usize = 1;
+    dynstr_size = dynstr_size + dynstr_name_len(dyn.interp);
+    var i: u32 = 0;
+    for (i < dyn.import_count) {
+        if (dyn.imports[i].is_func) { dynstr_size = dynstr_size + dynstr_name_len(dyn.imports[i].symbol); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < dyn.lib_count) { dynstr_size = dynstr_size + dynstr_name_len(dyn.libs[i].soname); i = i + 1; }
+    lay.dynstr_size = dynstr_size;
+    off = off + dynstr_size;
+    va  = va  + dynstr_size::u64;
+
+    # .hash: SysV hash (nbucket, nchain, buckets[nbucket], chain[nchain]). a
+    # single bucket keeps the table valid with a trivial (linear-chain) layout.
+    off = align_up(off, 8);
+    va  = align_up_u64(va, 8);
+    lay.hash_off = off;
+    lay.hash_va  = va;
+    val nchain: usize = (nimp + 1)::usize;
+    lay.hash_size = 8 + 4 + nchain * 4;
+    off = off + lay.hash_size;
+    va  = va  + lay.hash_size::u64;
+
+    # .rela.plt: one JUMP_SLOT relocation per function import.
+    off = align_up(off, 8);
+    va  = align_up_u64(va, 8);
+    lay.relaplt_off  = off;
+    lay.relaplt_va   = va;
+    lay.relaplt_size = nimp::usize * RELA_SIZE;
+    off = off + lay.relaplt_size;
+    va  = va  + lay.relaplt_size::u64;
+
+    lay.ro_size = off - lay.ro_off;
+
+    # .plt: read+execute, its own page-aligned segment. header stub + one per
+    # import. empty (size 0) when there are no function imports.
+    off = align_up(off, page);
+    va  = align_up_u64(va, page::u64);
+    lay.plt_off = off;
+    lay.plt_va  = va;
+    if (nimp > 0) { lay.plt_size = PLT_ENTRY_SIZE * (nimp + 1)::usize; } or { lay.plt_size = 0; }
+    off = off + lay.plt_size;
+    va  = va  + lay.plt_size::u64;
+
+    # .got.plt + .dynamic: read+write, its own page-aligned segment.
+    off = align_up(off, page);
+    va  = align_up_u64(va, page::u64);
+    lay.rw_off = off;
+    lay.rw_va  = va;
+
+    lay.gotplt_off  = off;
+    lay.gotplt_va   = va;
+    lay.gotplt_size = (nimp + 3)::usize * GOT_ENTRY_SIZE;
+    off = off + lay.gotplt_size;
+    va  = va  + lay.gotplt_size::u64;
+
+    off = align_up(off, 8);
+    va  = align_up_u64(va, 8);
+    lay.dynamic_off = off;
+    lay.dynamic_va  = va;
+    # DT_NEEDED per lib + HASH,STRTAB,SYMTAB,STRSZ,SYMENT + (PLT tags when imports)
+    # + DT_NULL.
+    var dyn_entries: u32 = dyn.lib_count + 6;
+    if (nimp > 0) { dyn_entries = dyn_entries + 4; }
+    lay.dynamic_size = dyn_entries::usize * DYN_SIZE;
+    off = off + lay.dynamic_size;
+    va  = va  + lay.dynamic_size::u64;
+
+    lay.rw_size = off - lay.rw_off;
+}
+
+# write_dyn_structures: serialize every synthesized dynamic structure into `buf`
+# at its laid-out offset — .interp, .dynsym, .dynstr, .hash, .rela.plt, the PLT
+# stubs, the GOT.PLT slots, and the .dynamic table. the loader reads these to
+# resolve the imports at run time. the .dynstr offsets computed here are recorded
+# into `imp_str` (per raw import index) and `lib_str` (per dependency) for reuse
+# by the .dynsym / .dynamic writers, so the string table is laid out first.
+fun write_dyn_structures(buf: *u8, lay: *DynLayout, dyn: *of.DynamicInfo, nimp: u32,
+                         arch_id: u32, imp_str: *usize, lib_str: *usize) {
+    # .interp: the loader path.
+    write_str(buf, lay.interp_off, resolve(dyn.interp));
+
+    # .dynstr and the offset of every name within it, recorded for .dynsym /
+    # .dynamic. the interp path is included so the table is self-contained.
+    buf[lay.dynstr_off] = 0;
+    var str_pos: usize = 1;
+    str_pos = str_pos + write_str(buf, lay.dynstr_off + str_pos, resolve(dyn.interp));
+
+    var i: u32 = 0;
+    for (i < dyn.import_count) {
+        if (dyn.imports[i].is_func) {
+            imp_str[i] = str_pos;
+            str_pos = str_pos + write_str(buf, lay.dynstr_off + str_pos, resolve(dyn.imports[i].symbol));
+        } or {
+            imp_str[i] = 0;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < dyn.lib_count) {
+        lib_str[i] = str_pos;
+        str_pos = str_pos + write_str(buf, lay.dynstr_off + str_pos, resolve(dyn.libs[i].soname));
+        i = i + 1;
+    }
+
+    # .dynsym: index 0 reserved-null, then one GLOBAL/UNDEF entry per function
+    # import. st_name points into .dynstr; st_shndx 0 (SHN_UNDEF) marks it
+    # imported.
+    var sym_off: usize = lay.dynsym_off + SYM_SIZE;
+    i = 0;
+    for (i < dyn.import_count) {
+        if (dyn.imports[i].is_func) {
+            write_u32_le(buf, sym_off, imp_str[i]::u32);
+            buf[sym_off + 4] = (STB_GLOBAL << 4) | (STT_FUNC & 0xF);
+            buf[sym_off + 5] = 0;
+            write_u16_le(buf, sym_off + 6, 0);
+            write_u64_le(buf, sym_off + 8, 0);
+            write_u64_le(buf, sym_off + 16, 0);
+            sym_off = sym_off + SYM_SIZE;
+        }
+        i = i + 1;
+    }
+
+    # .hash: a single-bucket SysV table — bucket[0] points at dynsym index 1 and
+    # the chain links 1->2->...->n->0. with one bucket the loader walks the whole
+    # chain, which is correct (if not fast) for the small import sets here.
+    val nchain: u32 = nimp + 1;
+    write_u32_le(buf, lay.hash_off, 1);
+    write_u32_le(buf, lay.hash_off + 4, nchain);
+    if (nimp > 0) { write_u32_le(buf, lay.hash_off + 8, 1); } or { write_u32_le(buf, lay.hash_off + 8, 0); }
+    var c: u32 = 0;
+    for (c < nchain) {
+        var next: u32 = c + 1;
+        if (next >= nchain) { next = 0; }
+        write_u32_le(buf, lay.hash_off + 12 + c::usize * 4, next);
+        c = c + 1;
+    }
+
+    # GOT.PLT: GOT[0] = &.dynamic, GOT[1]/GOT[2] = 0 (filled by the loader with
+    # the link_map and the lazy-resolver). GOT[3+n] points at the push in PLT[n]
+    # so the first call triggers lazy resolution.
+    write_u64_le(buf, lay.gotplt_off, lay.dynamic_va);
+    write_u64_le(buf, lay.gotplt_off + 8, 0);
+    write_u64_le(buf, lay.gotplt_off + 16, 0);
+
+    # .plt and .rela.plt, per function import.
+    if (nimp > 0) {
+        write_plt_header(buf, lay);
+        var rela_off: usize = lay.relaplt_off;
+        var n: u32 = 0;
+        var sym_index: u32 = 1;
+        i = 0;
+        for (i < dyn.import_count) {
+            if (dyn.imports[i].is_func) {
+                write_plt_stub(buf, lay, n);
+
+                # GOT[3+n] -> PLT[n] + 6 (the `push` after the indirect jump).
+                val got_slot_off: usize = lay.gotplt_off + (3 + n)::usize * GOT_ENTRY_SIZE;
+                val plt_stub_va: u64 = lay.plt_va + (n + 1)::u64 * PLT_ENTRY_SIZE::u64;
+                write_u64_le(buf, got_slot_off, plt_stub_va + 6);
+
+                # .rela.plt JUMP_SLOT: r_offset = &GOT[3+n], r_sym = dynsym slot.
+                val got_slot_va: u64 = lay.gotplt_va + (3 + n)::u64 * GOT_ENTRY_SIZE::u64;
+                write_u64_le(buf, rela_off, got_slot_va);
+                val r_info: u64 = (sym_index::u64 << 32) | jump_slot_for(arch_id)::u64;
+                write_u64_le(buf, rela_off + 8, r_info);
+                write_u64_le(buf, rela_off + 16, 0);
+                rela_off = rela_off + RELA_SIZE;
+
+                n = n + 1;
+                sym_index = sym_index + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    # .dynamic: the table the loader walks. DT_NEEDED per dependency, then the
+    # table pointers, then the PLT tags (when there are imports), then DT_NULL.
+    var dpos: usize = lay.dynamic_off;
+    i = 0;
+    for (i < dyn.lib_count) {
+        dpos = write_dyn_entry(buf, dpos, DT_NEEDED, lib_str[i]::u64);
+        i = i + 1;
+    }
+    dpos = write_dyn_entry(buf, dpos, DT_HASH,   lay.hash_va);
+    dpos = write_dyn_entry(buf, dpos, DT_STRTAB, lay.dynstr_va);
+    dpos = write_dyn_entry(buf, dpos, DT_SYMTAB, lay.dynsym_va);
+    dpos = write_dyn_entry(buf, dpos, DT_STRSZ,  lay.dynstr_size::u64);
+    dpos = write_dyn_entry(buf, dpos, DT_SYMENT, SYM_SIZE::u64);
+    if (nimp > 0) {
+        dpos = write_dyn_entry(buf, dpos, DT_PLTGOT,   lay.gotplt_va);
+        dpos = write_dyn_entry(buf, dpos, DT_PLTRELSZ, lay.relaplt_size::u64);
+        dpos = write_dyn_entry(buf, dpos, DT_PLTREL,   DT_RELA_TAG);
+        dpos = write_dyn_entry(buf, dpos, DT_JMPREL,   lay.relaplt_va);
+    }
+    dpos = write_dyn_entry(buf, dpos, DT_NULL, 0);
+}
+
+# DT_PLTREL value declaring the PLT relocations use the RELA (addend-bearing)
+# form — the only form this writer emits.
+val DT_RELA_TAG: u64 = 7;
+
+# write_dyn_entry: write one Elf64_Dyn (d_tag, d_un) at `off`, returning the next
+# offset.
+fun write_dyn_entry(buf: *u8, off: usize, tag: u64, value: u64) usize {
+    write_u64_le(buf, off, tag);
+    write_u64_le(buf, off + 8, value);
+    ret off + DYN_SIZE;
+}
+
+# write_plt_header: write PLT[0], the lazy-resolution trampoline. it pushes
+# GOT[1] (the link_map) and jumps through GOT[2] (the resolver), both filled by
+# the loader. the rip-relative displacements reach GOT.PLT from each instruction's
+# end.
+fun write_plt_header(buf: *u8, lay: *DynLayout) {
+    val p: usize = lay.plt_off;
+    # push qword [rip + d1]  (FF 35 d1) -> GOT[1]
+    buf[p] = 0xFF; buf[p + 1] = 0x35;
+    val next1: u64 = lay.plt_va + 6;
+    val got1:  u64 = lay.gotplt_va + 8;
+    write_u32_le(buf, p + 2, (got1 - next1)::u32);
+    # jmp qword [rip + d2]   (FF 25 d2) -> GOT[2]
+    buf[p + 6] = 0xFF; buf[p + 7] = 0x25;
+    val next2: u64 = lay.plt_va + 12;
+    val got2:  u64 = lay.gotplt_va + 16;
+    write_u32_le(buf, p + 8, (got2 - next2)::u32);
+    # padding nop (0F 1F 40 00).
+    buf[p + 12] = 0x0F; buf[p + 13] = 0x1F; buf[p + 14] = 0x40; buf[p + 15] = 0x00;
+}
+
+# write_plt_stub: write PLT[n+1], the per-import stub. it jumps through GOT[3+n]
+# (initially pointing back at the stub's push, triggering resolution), pushes the
+# relocation index, and jumps to PLT[0].
+fun write_plt_stub(buf: *u8, lay: *DynLayout, n: u32) {
+    val stub_off: usize = lay.plt_off + (n + 1)::usize * PLT_ENTRY_SIZE;
+    val stub_va:  u64   = lay.plt_va + (n + 1)::u64 * PLT_ENTRY_SIZE::u64;
+    # jmp qword [rip + d]  (FF 25 d) -> GOT[3+n]
+    buf[stub_off] = 0xFF; buf[stub_off + 1] = 0x25;
+    val next: u64 = stub_va + 6;
+    val got:  u64 = lay.gotplt_va + (3 + n)::u64 * GOT_ENTRY_SIZE::u64;
+    write_u32_le(buf, stub_off + 2, (got - next)::u32);
+    # push <reloc index n>  (68 imm32)
+    buf[stub_off + 6] = 0x68;
+    write_u32_le(buf, stub_off + 7, n);
+    # jmp PLT[0]  (E9 rel32)
+    buf[stub_off + 11] = 0xE9;
+    val plt0: u64 = lay.plt_va;
+    val after: u64 = stub_va + 16;
+    write_u32_le(buf, stub_off + 12, (plt0 - after)::u32);
+}
+
+# patch_plt_fixups: rewrite each import call site (a `PltFixup` the linker could
+# not resolve) to a pc-relative call to the import's PLT stub. the fixup records
+# the segment + offset of the 4-byte displacement field and the patch-site vaddr;
+# the stub vaddr is `S` and the patched value is `S + A - P`.
+fun patch_plt_fixups(buf: *u8, lay: *DynLayout, dyn: *of.DynamicInfo,
+                     fixups: *of.PltFixup, fixup_count: u32, seg_offsets: *usize,
+                     segs: *of.LoadSegment, seg_count: u32, nimp: u32) {
+    if (nimp == 0) { ret; }
+    var i: u32 = 0;
+    for (i < fixup_count) {
+        val fx: *of.PltFixup = ?fixups[i];
+        if (fx.seg_index >= seg_count) { i = i + 1; cnt; }
+        # the func-import ordinal of this fixup's target import (its PLT slot).
+        val n: u32 = func_ordinal(dyn, fx.import_index);
+        if (n == 0xFFFFFFFF) { i = i + 1; cnt; }
+        val stub_va: u64 = lay.plt_va + (n + 1)::u64 * PLT_ENTRY_SIZE::u64;
+        val disp: i64 = (stub_va::i64) + fx.addend - (fx.patch_vaddr::i64);
+        val file_off: usize = seg_offsets[fx.seg_index] + fx.seg_offset::usize;
+        write_u32_le(buf, file_off, (disp::u64)::u32);
+        i = i + 1;
+    }
+}
+
+# func_ordinal: the PLT slot index (0-based among function imports) for the
+# import at raw index `import_index`, or 0xFFFFFFFF if it is not a function
+# import. the PLT, GOT.PLT, and .rela.plt are laid out in func-import order, so
+# this maps a raw import index onto that ordering.
+fun func_ordinal(dyn: *of.DynamicInfo, import_index: u32) u32 {
+    if (import_index >= dyn.import_count) { ret 0xFFFFFFFF; }
+    if (!dyn.imports[import_index].is_func) { ret 0xFFFFFFFF; }
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < import_index) {
+        if (dyn.imports[i].is_func) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# write_dyn_phdrs: write the program-header table for a dynamic executable.
+#
+# unlike the static writer — which adds a separate header-covering PT_LOAD that
+# overlaps the text segment's page (the kernel tolerates it, but the dynamic
+# loader rejects two PT_LOADs over one page) — the first linker segment is
+# extended DOWN one page to file offset 0 so a single PT_LOAD covers the ELF
+# header, the program headers, and the segment's own bytes with no overlap. the
+# header page maps one page below the segment's base (`vaddr ≡ offset (mod page)`
+# still holds), keeping every assigned virtual address unchanged. a leading
+# PT_PHDR locates the table, PT_INTERP names the loader, each remaining linker
+# segment and each synthesized segment (RO, PLT, RW) is a PT_LOAD, and PT_DYNAMIC
+# points at the .dynamic table.
+fun write_dyn_phdrs(buf: *u8, phdr_offset: usize, lay: *DynLayout,
+                    segs: *of.LoadSegment, seg_offsets: *usize, seg_count: u32) {
+    var pos: usize = phdr_offset;
+
+    # the page the ELF header + phdrs map at: one page below the first segment's
+    # base, so extending the first segment down to file offset 0 covers them.
+    var hdr_vaddr: u64 = 0;
+    if (seg_count > 0) { hdr_vaddr = (segs[0].vaddr & ~(EXEC_PAGE_SIZE - 1)) - EXEC_PAGE_SIZE; }
+
+    # PT_PHDR -> the program-header table, so the dynamic loader can locate the
+    # program's own headers. it lies within the first (header+text) PT_LOAD.
+    pos = write_phdr(buf, pos, PT_PHDR, PF_R, phdr_offset, hdr_vaddr + phdr_offset::u64,
+                     phdr_count_bytes(seg_count), phdr_count_bytes(seg_count), 8);
+
+    # PT_INTERP -> the .interp string.
+    pos = write_phdr(buf, pos, PT_INTERP, PF_R, lay.interp_off, lay.interp_va,
+                     lay.interp_size, lay.interp_size, 1);
+
+    # one PT_LOAD per linker segment; the first extends down to file offset 0 so
+    # it also maps the ELF header + program headers (no overlapping page).
+    var li: u32 = 0;
+    for (li < seg_count) {
+        if (li == 0) {
+            val first_filesz: usize = seg_offsets[0] + segs[0].filesz;
+            val first_memsz:  usize = seg_offsets[0] + segs[0].memsz;
+            pos = write_phdr(buf, pos, PT_LOAD, pf_flags_for(segs[0].flags), 0,
+                             hdr_vaddr, first_filesz, first_memsz, EXEC_PAGE_SIZE);
+        }
+        or {
+            pos = write_phdr(buf, pos, PT_LOAD, pf_flags_for(segs[li].flags), seg_offsets[li],
+                             segs[li].vaddr, segs[li].filesz, segs[li].memsz, EXEC_PAGE_SIZE);
+        }
+        li = li + 1;
+    }
+
+    # RO metadata, PLT (R+X), RW (R+W) synthesized segments.
+    pos = write_phdr(buf, pos, PT_LOAD, PF_R, lay.ro_off, lay.ro_va, lay.ro_size, lay.ro_size, EXEC_PAGE_SIZE);
+    pos = write_phdr(buf, pos, PT_LOAD, PF_R | PF_X, lay.plt_off, lay.plt_va, lay.plt_size, lay.plt_size, EXEC_PAGE_SIZE);
+    pos = write_phdr(buf, pos, PT_LOAD, PF_R | PF_W, lay.rw_off, lay.rw_va, lay.rw_size, lay.rw_size, EXEC_PAGE_SIZE);
+
+    # PT_DYNAMIC -> the .dynamic table.
+    pos = write_phdr(buf, pos, PT_DYNAMIC, PF_R | PF_W, lay.dynamic_off, lay.dynamic_va,
+                     lay.dynamic_size, lay.dynamic_size, 8);
+}
+
+# phdr_count_bytes: the byte size of the program-header table for a dynamic image
+# with `seg_count` linker segments: PT_PHDR + PT_INTERP + the linker segments +
+# the 3 synthesized segments + PT_DYNAMIC.
+fun phdr_count_bytes(seg_count: u32) usize {
+    ret (seg_count + 6)::usize * PHDR_SIZE;
+}
+
+# write_phdr: write one Elf64_Phdr at `pos`, returning the next phdr offset.
+fun write_phdr(buf: *u8, pos: usize, p_type: u32, flags: u32, off: usize, vaddr: u64,
+               filesz: usize, memsz: usize, align: u64) usize {
+    write_u32_le(buf, pos, p_type);
+    write_u32_le(buf, pos + 4, flags);
+    write_u64_le(buf, pos + 8, off::u64);
+    write_u64_le(buf, pos + 16, vaddr);
+    write_u64_le(buf, pos + 24, vaddr);
+    write_u64_le(buf, pos + 32, filesz::u64);
+    write_u64_le(buf, pos + 40, memsz::u64);
+    write_u64_le(buf, pos + 48, align);
+    ret pos + PHDR_SIZE;
 }
 
 # parse_object: parse a relocatable ELF64 object into an ObjectImage.
