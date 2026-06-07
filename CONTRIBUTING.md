@@ -83,7 +83,8 @@ All work happens on feature branches off `dev`. When `dev` reaches a stable mile
 - Target `dev` branch (not `main`)
 - Provide clear description of changes
 - Link related issues
-- Ensure code builds with `make`
+- Ensure code builds with `make` and reaches the byte-identical fixpoint
+- Run the tests: `mach test --cwd .` (unit corpus), and for codegen changes `tools/test/differential.sh` (optimization-level / cross-compiler agreement)
 - Follow coding standards
 
 ## Versioning

@@ -279,7 +279,7 @@ newline inside the quotes is part of the literal.
   true) → `u8`.
 - Unary: `-` negate, `~` bitwise NOT, `!` logical NOT.
 - Pointer: `?expr` address-of, `@ptr` dereference (also `@p = x;` to write).
-- Cast: `expr::Type` — explicit width/sign/pointer conversion.
+- Cast: `expr::Type` value conversion (width/sign/pointer, int↔float by value) and `expr:~Type` bit reinterpret (read the exact bits as an equal-size type).
 
 Precedence follows C-family conventions. There is no compound assignment
 (`+=`, `-=`, … do not exist).

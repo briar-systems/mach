@@ -55,7 +55,10 @@ $mach.arch.x86_64 $mach.arch.aarch64
 > `$mach.target.{os,arch,pointer_width}`, `$mach.os.*`, `$mach.arch.*`, and
 > `$mach.compiler.{name,version}`. The `$mach.target.abi`, `$mach.build.*`,
 > `$mach.project.*`, and `$mach.source.*` paths are reserved stubs — reading one
-> is a compile error. Prefer the live reads in real code.
+> is a compile error. Prefer the live reads in real code. Note `$mach.arch.aarch64`
+> resolves as a value, but only `$mach.arch.x86_64` is a working backend target
+> today ([#1045](https://github.com/octalide/mach/issues/1045)) — aarch64 dispatch
+> branches below illustrate the pattern but are comptime-discarded on an x86_64 build.
 
 Tag comparison is path-value — no `.id` suffix, no unwrapping:
 

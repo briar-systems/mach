@@ -16,7 +16,7 @@ asm <isa> {
 ```
 
 - The ISA tag is mandatory. Bare `asm { ... }` does not exist.
-- Supported tags come from a closed set: `x86_64`, `aarch64`, …
+- The tag comes from a closed set: `x86_64`, `aarch64`. Only `x86_64` has a working code generator today; `aarch64` is recognized for portable target-conditional source but is not yet a buildable target (see issue #1045).
 - Each line is an instruction in the ISA's native syntax.
 - `#` introduces a line comment.
 
