@@ -83,8 +83,8 @@ All work happens on feature branches off `dev`. When `dev` reaches a stable mile
 - Target `dev` branch (not `main`)
 - Provide clear description of changes
 - Link related issues
-- Ensure code builds with `make` and reaches the byte-identical fixpoint
-- Run the tests: `mach test --cwd .` (unit corpus), and for codegen changes `tools/test/differential.sh` (optimization-level / cross-compiler agreement)
+- Ensure the compiler builds and reaches the byte-identical fixpoint
+- Run the tests with `mach test .`
 - Follow coding standards
 
 ## Versioning
@@ -137,7 +137,6 @@ mach/
 ├── dep/
 │   └── mach-std/      # standard library (git submodule)
 ├── doc/               # documentation
-├── examples/          # example projects and syntax fixtures
 ├── src/               # self-hosting mach compiler
 ├── out/               # build output (git-ignored); final compiler at out/bin/mach
 ├── Makefile           # build system (auto-downloads cmach)
