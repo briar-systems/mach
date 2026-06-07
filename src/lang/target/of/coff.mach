@@ -1,13 +1,37 @@
-# mach.lang.target.of.coff: COFF object-format stub.
+# mach.lang.target.of.coff: COFF object-format writer and reader.
 #
-# Supplies a correctly-shaped `OfVTable` for the Common Object File Format (no
-# PE wrapper) — file extension "obj" and the abstract relocation-kind table
-# mapping abs64/pc32/addr32nb/branch26 to COFF machine relocations — so
-# target.select can compose a Windows target descriptor. COFF serialization and
-# parsing are not yet implemented: both `emit_object` and `parse_object` return
-# a clear "unsupported object format" error rather than producing a malformed
-# file or partial image. `register` interns the strings, installs the
-# reader/writer, and is idempotent.
+# Implements the `of.OfVTable` for `OF_COFF` (the Common Object File Format, the
+# object container PE consumes on Windows). The writer serializes an
+# `of.ObjectImage` into a relocatable x86-64 COFF object: the 20-byte file
+# header (`IMAGE_FILE_MACHINE_AMD64`), 40-byte section headers with the right
+# `IMAGE_SCN_*` characteristics, per-section raw data, per-section 10-byte
+# `IMAGE_RELOCATION` arrays (`IMAGE_REL_AMD64_*`), an 18-byte `IMAGE_SYMBOL`
+# table (a leading section symbol per section with its aux record, then the
+# image's own symbols), and a trailing string table for names longer than eight
+# bytes. The reader mirrors that back into a fresh `of.ObjectImage`.
+#
+# The abstract `of.RK_*` relocation kinds are interned at registration; the
+# writer matches a `Relocation.kind` StrId against those handles and maps it to
+# an `IMAGE_REL_AMD64_*` machine type, and the reader maps the machine type back.
+#
+# `WriterFn`/`ParserFn` carry no interner, yet section/symbol names are
+# `intern.StrId`. `register_coff` captures the session interner in a module-level
+# pointer (exactly as it interns the vtable's own string fields), and the
+# reader/writer resolve names through it.
+#
+# DEFERRED (compose with #1159 dynamic-import linker and #1177 OS layer): the
+# PE32+ executable container (`emit_exec`) and the `.idata` import table / IAT.
+# A runnable Windows binary needs #1159's import abstraction, #1173's win64 ABI,
+# and #1177's OS layer; this module scopes to the relocatable object only.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.size.usize;
+
+use std.types.string.str;
+use std.types.string.str_len;
 
 use std.types.result.Result;
 use std.types.result.ok;
@@ -16,57 +40,827 @@ use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
 
-use std.types.bool.bool;
-use std.types.bool.true;
-use std.types.bool.false;
-
-use std.types.string.str;
-
-use std.types.size.usize;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.unwrap;
 
 use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.zallocate;
+use std.allocator.deallocate;
+
+use page: std.allocator.page;
+use mem:  std.memory;
+use fs:   std.filesystem;
 
 use intern: mach.lang.intern;
 use isa:    mach.lang.target.isa;
 use of:     mach.lang.target.of;
 
-# error returned by the COFF reader and writer until the format is implemented.
-val COFF_UNSUPPORTED: str = "unsupported object format: coff not implemented";
+# COFF machine type for x86-64.
+val IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 
-# coff_emit_object: serialize an ObjectImage to a COFF object file.
-#
-# stub: COFF serialization is not yet implemented. always returns the
-# unsupported-target error so no malformed object is written. matches the
-# of.WriterFn signature exactly.
-# ---
-# isa_vt: the instruction-set vtable describing the machine
-# image:  the object image to serialize
-# path:   null-terminated output file path
-# ret:    the unsupported-target error
-fun coff_emit_object(isa_vt: *isa.IsaVTable, image: *of.ObjectImage, path: *u8) Result[bool, str] {
-    ret err[bool, str](COFF_UNSUPPORTED);
+# section characteristics (IMAGE_SCN_*).
+val IMAGE_SCN_CNT_CODE:               u32 = 0x00000020;
+val IMAGE_SCN_CNT_INITIALIZED_DATA:   u32 = 0x00000040;
+val IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x00000080;
+val IMAGE_SCN_MEM_DISCARDABLE:        u32 = 0x02000000;
+val IMAGE_SCN_MEM_EXECUTE:            u32 = 0x20000000;
+val IMAGE_SCN_MEM_READ:               u32 = 0x40000000;
+val IMAGE_SCN_MEM_WRITE:              u32 = 0x80000000;
+
+# x86-64 relocation types (IMAGE_REL_AMD64_*).
+val IMAGE_REL_AMD64_ADDR64:   u16 = 0x0001;
+val IMAGE_REL_AMD64_ADDR32:   u16 = 0x0002;
+val IMAGE_REL_AMD64_ADDR32NB: u16 = 0x0003;
+val IMAGE_REL_AMD64_REL32:    u16 = 0x0004;
+
+# symbol storage classes (IMAGE_SYM_CLASS_*).
+val IMAGE_SYM_CLASS_EXTERNAL:      u8 = 2;
+val IMAGE_SYM_CLASS_STATIC:        u8 = 3;
+val IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
+
+# the undefined / special section number (SectionNumber is 1-based and signed;
+# values <= 0 are undefined or absolute).
+val IMAGE_SYM_UNDEFINED: i16 = 0;
+
+# symbol derived type for a function (DT_FUNCTION in the high four bits of Type).
+val IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20;
+
+# fixed on-disk structure sizes for COFF.
+val COFF_HEADER_SIZE:    usize = 20;
+val SECTION_HEADER_SIZE: usize = 40;
+val SYMBOL_SIZE:         usize = 18;
+val RELOCATION_SIZE:     usize = 10;
+
+# write a u16 little-endian into a buffer.
+fun write_u16_le(buf: *u8, offset: usize, value: u16) {
+    buf[offset]     = (value & 0xFF)::u8;
+    buf[offset + 1] = ((value >> 8) & 0xFF)::u8;
 }
 
-# coff_parse_object: parse a COFF object file into an ObjectImage.
+# write a u32 little-endian into a buffer.
+fun write_u32_le(buf: *u8, offset: usize, value: u32) {
+    buf[offset]     = (value & 0xFF)::u8;
+    buf[offset + 1] = ((value >> 8) & 0xFF)::u8;
+    buf[offset + 2] = ((value >> 16) & 0xFF)::u8;
+    buf[offset + 3] = ((value >> 24) & 0xFF)::u8;
+}
+
+# read a u16 little-endian from a buffer.
+fun read_u16_le(buf: *u8, offset: usize) u16 {
+    ret buf[offset]::u16 | (buf[offset + 1]::u16 << 8);
+}
+
+# read a u32 little-endian from a buffer.
+fun read_u32_le(buf: *u8, offset: usize) u32 {
+    ret buf[offset]::u32 | (buf[offset + 1]::u32 << 8)
+      | (buf[offset + 2]::u32 << 16) | (buf[offset + 3]::u32 << 24);
+}
+
+# write a null-terminated string into a buffer, returning the bytes written
+# (name length plus the terminator). a nil name writes a lone terminator.
+fun write_str(buf: *u8, offset: usize, s: str) usize {
+    if (s == nil) {
+        buf[offset] = 0;
+        ret 1;
+    }
+    val len: usize = str_len(s);
+    var i: usize = 0;
+    for (i < len) {
+        buf[offset + i] = s[i];
+        i = i + 1;
+    }
+    buf[offset + len] = 0;
+    ret len + 1;
+}
+
+# session interner captured at registration so the reader/writer can resolve the
+# `intern.StrId` names carried by `of.ObjectImage`. set by `register_coff`.
+var coff_interner: *intern.Interner = nil;
+
+# interned names of the abstract relocation kinds, filled at registration. the
+# writer matches a `Relocation.kind` StrId directly against these.
+var rk_abs64:    intern.StrId = 0;
+var rk_pc32:     intern.StrId = 0;
+var rk_addr32nb: intern.StrId = 0;
+var rk_plt32:    intern.StrId = 0;
+
+# resolve an interned StrId to its backing text through the captured interner,
+# or nil if no interner is set or the id is out of range.
+fun resolve(id: intern.StrId) str {
+    if (coff_interner == nil) { ret nil; }
+    if (id == intern.STR_NIL) { ret nil; }
+    val o: Option[str] = intern.lookup(coff_interner, id);
+    if (is_some[str](o)) { ret unwrap[str](o); }
+    ret nil;
+}
+
+# map an abstract relocation-kind StrId to the COFF x86-64 machine relocation
+# type. defaults to ADDR64 for an unknown kind. pc32/plt32 both encode a 32-bit
+# pc-relative reference (REL32); addr32nb is the image-relative ADDR32NB.
+fun reloc_type_for(kind: intern.StrId) u16 {
+    if (kind == rk_abs64)    { ret IMAGE_REL_AMD64_ADDR64; }
+    if (kind == rk_pc32)     { ret IMAGE_REL_AMD64_REL32; }
+    if (kind == rk_plt32)    { ret IMAGE_REL_AMD64_REL32; }
+    if (kind == rk_addr32nb) { ret IMAGE_REL_AMD64_ADDR32NB; }
+    ret IMAGE_REL_AMD64_ADDR64;
+}
+
+# map a COFF x86-64 machine relocation type back to its abstract RK_* kind name.
+fun reloc_kind_for(r_type: u16) intern.StrId {
+    if (r_type == IMAGE_REL_AMD64_ADDR64)   { ret rk_abs64; }
+    if (r_type == IMAGE_REL_AMD64_REL32)    { ret rk_pc32; }
+    if (r_type == IMAGE_REL_AMD64_ADDR32NB) { ret rk_addr32nb; }
+    if (r_type == IMAGE_REL_AMD64_ADDR32)   { ret rk_abs64; }
+    ret rk_abs64;
+}
+
+# COFF section characteristics for an abstract section kind (the alignment bits
+# are merged in separately). code is executable+readable; data is read/write;
+# rodata is read-only; bss is uninitialized read/write (no raw data); debug is
+# discardable initialized data.
+fun section_characteristics_for(kind: of.SectionKind) u32 {
+    if (kind == of.SK_TEXT) {
+        ret IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    }
+    if (kind == of.SK_DATA) {
+        ret IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    }
+    if (kind == of.SK_RODATA) {
+        ret IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    }
+    if (kind == of.SK_BSS) {
+        ret IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    }
+    ret IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_DISCARDABLE | IMAGE_SCN_MEM_READ;
+}
+
+# COFF alignment characteristic bits for a byte alignment. COFF encodes
+# alignment as a 4-bit field at bit 20 holding `log2(align)+1`, clamped to
+# 8192-byte alignment. a zero or sub-1 alignment yields 1-byte alignment.
+fun align_characteristic(align: u32) u32 {
+    var a: u32 = align;
+    if (a < 1) { a = 1; }
+    var log: u32 = 0;
+    for (a > 1) {
+        a = a >> 1;
+        log = log + 1;
+    }
+    if (log > 13) { log = 13; }
+    ret (log + 1) << 20;
+}
+
+# recover a byte alignment from a section's characteristics. the field is the
+# 4 bits at bit 20 holding `log2(align)+1`; a zero field (no alignment recorded)
+# yields 1-byte alignment.
+fun align_from_characteristics(chars: u32) u32 {
+    val field: u32 = (chars >> 20) & 0xF;
+    if (field == 0) { ret 1; }
+    var a: u32 = 1;
+    var n: u32 = field - 1;
+    for (n > 0) {
+        a = a << 1;
+        n = n - 1;
+    }
+    ret a;
+}
+
+# whether an abstract section kind has raw bytes on disk (everything but bss).
+fun section_has_data(kind: of.SectionKind) bool {
+    if (kind == of.SK_BSS) { ret false; }
+    ret true;
+}
+
+# COFF symbol Type word for an abstract section kind: a symbol in text gets the
+# function derived type so the linker and debuggers treat it as code.
+fun symbol_type_for(kind: of.SectionKind) u16 {
+    if (kind == of.SK_TEXT) { ret IMAGE_SYM_DTYPE_FUNCTION; }
+    ret 0;
+}
+
+# count the relocations in an image that patch a given section.
+fun count_relocs_for_section(img: *of.ObjectImage, sec_idx: u32) u32 {
+    var count: u32 = 0;
+    var i: u32 = 0;
+    for (i < img.reloc_count) {
+        if (img.relocations[i].section == sec_idx) { count = count + 1; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+# whether a name needs the string table (longer than the eight inline bytes).
+fun name_in_strtab(name: str) bool {
+    if (name == nil) { ret false; }
+    if (str_len(name) > 8) { ret true; }
+    ret false;
+}
+
+# upper bound on the COFF string table: a 4-byte length field (counting itself)
+# plus a null-terminated copy of every name longer than eight bytes — section
+# names (referenced once each by both the section header and its section symbol,
+# which share one string-table entry) and symbol names.
+fun strtab_size(img: *of.ObjectImage) usize {
+    var total: usize = 4;
+    var s: u32 = 0;
+    for (s < img.section_count) {
+        val sn: str = resolve(img.sections[s].name);
+        if (name_in_strtab(sn)) { total = total + str_len(sn) + 1; }
+        s = s + 1;
+    }
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        val name: str = resolve(img.symbols[i].name);
+        if (name_in_strtab(name)) { total = total + str_len(name) + 1; }
+        i = i + 1;
+    }
+    ret total;
+}
+
+# write an inline 8-byte symbol/section name field at `off`, zero-padded.
+fun write_inline_name(buf: *u8, off: usize, name: str) {
+    var i: usize = 0;
+    for (i < 8) { buf[off + i] = 0; i = i + 1; }
+    if (name == nil) { ret; }
+    val len: usize = str_len(name);
+    i = 0;
+    for (i < len) { buf[off + i] = name[i]; i = i + 1; }
+}
+
+# write the decimal text of `value` right-justified into `width` bytes starting
+# at `off`, space-padded on the left. used for the "/offset" section-name form,
+# whose offset field is the seven bytes after the leading '/'.
+fun write_decimal(buf: *u8, off: usize, width: usize, value: u32) {
+    var v: u32 = value;
+    var i: usize = width;
+    for (i > 0) {
+        i = i - 1;
+        if (v > 0 || i == width - 1) {
+            buf[off + i] = ('0'::u32 + (v % 10))::u8;
+            v = v / 10;
+        } or {
+            buf[off + i] = ' ';
+        }
+    }
+}
+
+# find the COFF symbol-table index of the image symbol with interned name
+# `name`. `sym_remap` maps an image symbol index to its COFF symbol-table index
+# (which counts the leading section symbols and their aux records). returns 0
+# when no symbol matches — pointing the relocation at the first section symbol.
+fun find_sym_index(img: *of.ObjectImage, sym_remap: *u32, name: intern.StrId) u32 {
+    if (name == intern.STR_NIL) { ret 0; }
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        if (img.symbols[i].name == name) { ret sym_remap[i]; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# coff_emit_object: serialize an ObjectImage to a relocatable x86-64 COFF object.
 #
-# stub: COFF parsing is not yet implemented. always returns the
-# unsupported-target error so no partial image is produced. matches the
-# of.ParserFn signature exactly.
+# the format-writer entry installed in the COFF `of.OfVTable`. lays out the file
+# header, the section-header table, each section's raw data, each section's
+# `IMAGE_RELOCATION` array, the symbol table (a section symbol with its aux
+# record per section, then the image's symbols), and the string table.
+# relocations reference symbols by their COFF symbol-table index and carry an
+# `IMAGE_REL_AMD64_*` type mapped from the abstract kind.
+# ---
+# tgt_isa: the instruction-set vtable describing the machine (must be x86-64)
+# img:     the object image to serialize
+# path:    null-terminated output file path
+# ret:     ok(true) on success, or an error string
+fun coff_emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) Result[bool, str] {
+    if (tgt_isa == nil || img == nil || path == nil) {
+        ret err[bool, str]("coff: nil writer argument");
+    }
+    if (tgt_isa.id != isa.ARCH_X86_64) {
+        ret err[bool, str]("coff: only x86-64 is supported");
+    }
+    val alloc: *Allocator = img.alloc;
+
+    val num_secs: u32 = img.section_count;
+    val num_syms: u32 = img.symbol_count;
+
+    # file layout: header, section headers, per-section raw data, per-section
+    # relocation arrays, symbol table, string table. compute each region's file
+    # offset up front so section headers can point at their data and relocs.
+    val secdata_base: usize = COFF_HEADER_SIZE + num_secs::usize * SECTION_HEADER_SIZE;
+
+    val res_doff: Result[*usize, str] = zallocate[usize](alloc, (num_secs + 1)::usize);
+    if (is_err[*usize, str](res_doff)) { ret err[bool, str]("coff: data offset table alloc failed"); }
+    var data_offsets: *usize = unwrap_ok[*usize, str](res_doff);
+
+    val res_roff: Result[*usize, str] = zallocate[usize](alloc, (num_secs + 1)::usize);
+    if (is_err[*usize, str](res_roff)) {
+        deallocate[usize](alloc, data_offsets, (num_secs + 1)::usize);
+        ret err[bool, str]("coff: reloc offset table alloc failed");
+    }
+    var reloc_offsets: *usize = unwrap_ok[*usize, str](res_roff);
+
+    # string-table offset of each section's name (shared by header + symbol), or
+    # 0 for an inline (<= 8 byte) name. filled while writing section headers.
+    val res_snoff: Result[*u32, str] = zallocate[u32](alloc, (num_secs + 1)::usize);
+    if (is_err[*u32, str](res_snoff)) {
+        deallocate[usize](alloc, data_offsets, (num_secs + 1)::usize);
+        deallocate[usize](alloc, reloc_offsets, (num_secs + 1)::usize);
+        ret err[bool, str]("coff: section name offset table alloc failed");
+    }
+    var sec_name_offsets: *u32 = unwrap_ok[*u32, str](res_snoff);
+
+    var cursor: usize = secdata_base;
+    var s: u32 = 0;
+    for (s < num_secs) {
+        if (section_has_data(img.sections[s].kind) && img.sections[s].len > 0) {
+            data_offsets[s] = cursor;
+            cursor = cursor + img.sections[s].len::usize;
+        } or {
+            data_offsets[s] = 0;
+        }
+        s = s + 1;
+    }
+    s = 0;
+    for (s < num_secs) {
+        val rc: u32 = count_relocs_for_section(img, s);
+        if (rc > 0) {
+            reloc_offsets[s] = cursor;
+            cursor = cursor + rc::usize * RELOCATION_SIZE;
+        } or {
+            reloc_offsets[s] = 0;
+        }
+        s = s + 1;
+    }
+
+    # symbol table: one section symbol (+ one aux record) per section, then one
+    # record per image symbol. the COFF symbol-table index of the i-th image
+    # symbol is therefore `2*num_secs + i`.
+    val symtab_offset: usize = cursor;
+    val total_sym_records: u32 = num_secs * 2 + num_syms;
+    val symtab_size: usize = total_sym_records::usize * SYMBOL_SIZE;
+    val strtab_offset: usize = symtab_offset + symtab_size;
+    val strtab_sz: usize = strtab_size(img);
+    val total_file_size: usize = strtab_offset + strtab_sz;
+
+    # map image symbol index -> COFF symbol-table index for relocation patching.
+    var sym_remap: *u32 = nil;
+    if (num_syms > 0) {
+        val res_remap: Result[*u32, str] = zallocate[u32](alloc, num_syms::usize);
+        if (is_err[*u32, str](res_remap)) {
+            deallocate[usize](alloc, data_offsets, (num_secs + 1)::usize);
+            deallocate[usize](alloc, reloc_offsets, (num_secs + 1)::usize);
+            deallocate[u32](alloc, sec_name_offsets, (num_secs + 1)::usize);
+            ret err[bool, str]("coff: symbol remap alloc failed");
+        }
+        sym_remap = unwrap_ok[*u32, str](res_remap);
+    }
+    var i: u32 = 0;
+    for (i < num_syms) {
+        sym_remap[i] = num_secs * 2 + i;
+        i = i + 1;
+    }
+
+    val res_buf: Result[*u8, str] = zallocate[u8](alloc, total_file_size);
+    if (is_err[*u8, str](res_buf)) {
+        deallocate[usize](alloc, data_offsets, (num_secs + 1)::usize);
+        deallocate[usize](alloc, reloc_offsets, (num_secs + 1)::usize);
+        deallocate[u32](alloc, sec_name_offsets, (num_secs + 1)::usize);
+        if (sym_remap != nil) { deallocate[u32](alloc, sym_remap, num_syms::usize); }
+        ret err[bool, str]("coff: output buffer alloc failed");
+    }
+    var buf: *u8 = unwrap_ok[*u8, str](res_buf);
+
+    # file header.
+    write_u16_le(buf, 0, IMAGE_FILE_MACHINE_AMD64);
+    write_u16_le(buf, 2, num_secs::u16);
+    write_u32_le(buf, 4, 0);
+    write_u32_le(buf, 8, symtab_offset::u32);
+    write_u32_le(buf, 12, total_sym_records);
+    write_u16_le(buf, 16, 0);
+    write_u16_le(buf, 18, 0);
+
+    # the string-table cursor starts past its own 4-byte length field; the
+    # length is written last. long names (section + symbol) append here.
+    var str_pos: usize = 4;
+
+    # section headers, recording each long section name in the string table once.
+    s = 0;
+    for (s < num_secs) {
+        val sh: usize = COFF_HEADER_SIZE + s::usize * SECTION_HEADER_SIZE;
+        val sn: str = resolve(img.sections[s].name);
+        if (name_in_strtab(sn)) {
+            sec_name_offsets[s] = str_pos::u32;
+            buf[sh] = '/';
+            write_decimal(buf, sh + 1, 7, str_pos::u32);
+            str_pos = str_pos + write_str(buf, strtab_offset + str_pos, sn);
+        } or {
+            sec_name_offsets[s] = 0;
+            write_inline_name(buf, sh, sn);
+        }
+
+        val seclen: u32 = img.sections[s].len;
+        write_u32_le(buf, sh + 8, 0);
+        write_u32_le(buf, sh + 12, 0);
+        write_u32_le(buf, sh + 16, seclen);
+        if (section_has_data(img.sections[s].kind) && seclen > 0) {
+            write_u32_le(buf, sh + 20, data_offsets[s]::u32);
+        } or {
+            write_u32_le(buf, sh + 20, 0);
+        }
+        val rc: u32 = count_relocs_for_section(img, s);
+        if (rc > 0) {
+            write_u32_le(buf, sh + 24, reloc_offsets[s]::u32);
+        } or {
+            write_u32_le(buf, sh + 24, 0);
+        }
+        write_u32_le(buf, sh + 28, 0);
+        write_u16_le(buf, sh + 32, rc::u16);
+        write_u16_le(buf, sh + 34, 0);
+        val chars: u32 = section_characteristics_for(img.sections[s].kind)
+                       | align_characteristic(img.sections[s].align);
+        write_u32_le(buf, sh + 36, chars);
+        s = s + 1;
+    }
+
+    # section raw data.
+    s = 0;
+    for (s < num_secs) {
+        if (section_has_data(img.sections[s].kind) && img.sections[s].len > 0
+            && img.sections[s].bytes != nil) {
+            mem.raw_copy((buf::usize + data_offsets[s])::ptr,
+                         img.sections[s].bytes::ptr, img.sections[s].len::usize);
+        }
+        s = s + 1;
+    }
+
+    # per-section relocation arrays.
+    s = 0;
+    for (s < num_secs) {
+        val rc: u32 = count_relocs_for_section(img, s);
+        if (rc > 0) {
+            var ro: usize = reloc_offsets[s];
+            var ri: u32 = 0;
+            for (ri < img.reloc_count) {
+                if (img.relocations[ri].section == s) {
+                    write_u32_le(buf, ro, img.relocations[ri].offset);
+                    var coff_sym: u32 = 0;
+                    if (sym_remap != nil) {
+                        coff_sym = find_sym_index(img, sym_remap, img.relocations[ri].symbol);
+                    }
+                    write_u32_le(buf, ro + 4, coff_sym);
+                    write_u16_le(buf, ro + 8, reloc_type_for(img.relocations[ri].kind));
+                    ro = ro + RELOCATION_SIZE;
+                }
+                ri = ri + 1;
+            }
+        }
+        s = s + 1;
+    }
+
+    # symbol table: a section symbol (+ aux record) per section, then the image
+    # symbols. the section symbol is class STATIC, value 0, 1-based section
+    # number; its aux record carries the section length and relocation count.
+    var sym_off: usize = symtab_offset;
+    s = 0;
+    for (s < num_secs) {
+        val sn: str = resolve(img.sections[s].name);
+        if (name_in_strtab(sn)) {
+            write_u32_le(buf, sym_off, 0);
+            write_u32_le(buf, sym_off + 4, sec_name_offsets[s]);
+        } or {
+            write_inline_name(buf, sym_off, sn);
+        }
+        write_u32_le(buf, sym_off + 8, 0);
+        write_u16_le(buf, sym_off + 12, (s + 1)::u16);
+        write_u16_le(buf, sym_off + 14, 0);
+        buf[sym_off + 16] = IMAGE_SYM_CLASS_STATIC;
+        buf[sym_off + 17] = 1;
+        sym_off = sym_off + SYMBOL_SIZE;
+
+        # aux section record: length (4), nreloc (2), nlnno (2), checksum (4),
+        # number (2), selection (1), 3 bytes pad. zeroed by the buffer alloc;
+        # fill length and reloc count.
+        write_u32_le(buf, sym_off, img.sections[s].len);
+        write_u16_le(buf, sym_off + 4, count_relocs_for_section(img, s)::u16);
+        sym_off = sym_off + SYMBOL_SIZE;
+        s = s + 1;
+    }
+
+    var symi: u32 = 0;
+    for (symi < num_syms) {
+        val name: str = resolve(img.symbols[symi].name);
+        if (name_in_strtab(name)) {
+            write_u32_le(buf, sym_off, 0);
+            write_u32_le(buf, sym_off + 4, str_pos::u32);
+            str_pos = str_pos + write_str(buf, strtab_offset + str_pos, name);
+        } or {
+            write_inline_name(buf, sym_off, name);
+        }
+        write_u32_le(buf, sym_off + 8, img.symbols[symi].offset);
+
+        var sec_num: i16 = IMAGE_SYM_UNDEFINED;
+        var sym_ty: u16 = 0;
+        if (img.symbols[symi].section != of.SECTION_EXTERNAL
+            && img.symbols[symi].section < num_secs) {
+            sec_num = (img.symbols[symi].section + 1)::i16;
+            sym_ty = symbol_type_for(img.sections[img.symbols[symi].section].kind);
+        }
+        if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_FUNCTION) != 0) {
+            sym_ty = IMAGE_SYM_DTYPE_FUNCTION;
+        }
+        write_u16_le(buf, sym_off + 12, sec_num::u16);
+        write_u16_le(buf, sym_off + 14, sym_ty);
+
+        # global, weak, and external-undefined symbols are class EXTERNAL; a
+        # local definition is class STATIC. COFF has no separate storage class
+        # for a defined weak symbol, so a weak definition is emitted as a plain
+        # external; the weak-external aux form is reserved for the #1159 import
+        # work and unused here.
+        var scl: u8 = IMAGE_SYM_CLASS_STATIC;
+        if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
+            || (img.symbols[symi].flags & of.SYM_OBJ_FLAG_EXTERN) != 0) {
+            scl = IMAGE_SYM_CLASS_EXTERNAL;
+        }
+        buf[sym_off + 16] = scl;
+        buf[sym_off + 17] = 0;
+        sym_off = sym_off + SYMBOL_SIZE;
+        symi = symi + 1;
+    }
+
+    # the string-table length field counts itself and every appended name.
+    write_u32_le(buf, strtab_offset, str_pos::u32);
+
+    if (sym_remap != nil) { deallocate[u32](alloc, sym_remap, num_syms::usize); }
+    deallocate[usize](alloc, data_offsets, (num_secs + 1)::usize);
+    deallocate[usize](alloc, reloc_offsets, (num_secs + 1)::usize);
+    deallocate[u32](alloc, sec_name_offsets, (num_secs + 1)::usize);
+
+    val res_file: Result[fs.File, str] = fs.create(path, 0o644);
+    if (is_err[fs.File, str](res_file)) {
+        deallocate[u8](alloc, buf, total_file_size);
+        ret err[bool, str]("coff: could not create output file");
+    }
+    var f: fs.File = unwrap_ok[fs.File, str](res_file);
+    val res_write: Result[usize, str] = fs.write(?f, buf, total_file_size);
+    fs.close(?f);
+    deallocate[u8](alloc, buf, total_file_size);
+
+    if (is_err[usize, str](res_write)) { ret err[bool, str]("coff: write failed"); }
+    ret ok[bool, str](true);
+}
+
+# the inline-name scratch buffer: an 8-byte COFF name has no terminator when it
+# fills all eight bytes, so it is copied here and null-terminated to form a str.
+var name_scratch: [9]u8;
+
+# copy an 8-byte inline name at `off` into the static scratch buffer, terminate
+# it, and return it as a str. the buffer is reused per call; the caller interns
+# the result immediately, so no two live names overlap.
+fun framed_name(buf: *u8, off: usize) str {
+    var i: usize = 0;
+    for (i < 8) {
+        name_scratch[i] = buf[off + i];
+        i = i + 1;
+    }
+    name_scratch[8] = 0;
+    ret ((?name_scratch[0])::usize)::str;
+}
+
+# read a section-header name: an inline 8-byte name, or a "/offset" reference
+# into the string table (decimal offset after the leading slash). the long form
+# returns a pointer into the string table; the short form is framed and
+# null-terminated through the scratch buffer.
+fun read_section_name(buf: *u8, sh: usize, strtab_base: usize) str {
+    if (buf[sh] == '/') {
+        var off: u32 = 0;
+        var i: usize = 1;
+        for (i < 8) {
+            val c: u8 = buf[sh + i];
+            if (c >= '0' && c <= '9') { off = off * 10 + (c - '0')::u32; }
+            i = i + 1;
+        }
+        ret (buf::usize + strtab_base + off::usize)::str;
+    }
+    ret framed_name(buf, sh);
+}
+
+# read a symbol-record name: inline when the first four name bytes are non-zero,
+# otherwise a 4-byte string-table offset stored in the second name word.
+fun read_symbol_name(buf: *u8, so: usize, strtab_base: usize) str {
+    if (read_u32_le(buf, so) == 0) {
+        val off: u32 = read_u32_le(buf, so + 4);
+        ret (buf::usize + strtab_base + off::usize)::str;
+    }
+    ret framed_name(buf, so);
+}
+
+# coff_parse_object: parse a relocatable x86-64 COFF object into an ObjectImage.
+#
+# reads the section, symbol, and relocation tables a COFF `.obj` produced by
+# `coff_emit_object` (or a compatible toolchain) carries into a fresh
+# `of.ObjectImage` owning copied section bytes and interned names. relocation
+# kinds map from the COFF machine type back to the abstract `RK_*` names; symbol
+# and section references are kept by interned name so the linker matches across
+# objects. the captured interner (see `register_coff`) interns the names.
 # ---
 # alloc:    allocator for the image and its arrays
 # buf:      the object file bytes
-# buf_size: length of the object file bytes
-# out:      image to populate
-# ret:      the unsupported-target error
+# buf_size: length of `buf`
+# out:      image to populate (its arrays are allocated here)
+# ret:      ok(true) on success, or an error string
 fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.ObjectImage) Result[bool, str] {
-    ret err[bool, str](COFF_UNSUPPORTED);
+    if (buf == nil || out == nil || buf_size < COFF_HEADER_SIZE) {
+        ret err[bool, str]("coff: object too small");
+    }
+    if (read_u16_le(buf, 0) != IMAGE_FILE_MACHINE_AMD64) {
+        ret err[bool, str]("coff: not an x86-64 object");
+    }
+    if (coff_interner == nil) { ret err[bool, str]("coff: no interner registered"); }
+
+    val num_secs:     u32   = read_u16_le(buf, 2)::u32;
+    val symtab_off:   usize = read_u32_le(buf, 8)::usize;
+    val num_records:  u32   = read_u32_le(buf, 12);
+    val opt_size:     u16   = read_u16_le(buf, 16);
+    val secthdr_base: usize = COFF_HEADER_SIZE + opt_size::usize;
+    val strtab_base:  usize = symtab_off + num_records::usize * SYMBOL_SIZE;
+
+    out.alloc = alloc;
+    out.section_count = 0;
+    out.symbol_count = 0;
+    out.reloc_count = 0;
+    out.sections = nil;
+    out.symbols = nil;
+    out.relocations = nil;
+
+    # count total relocations across sections and total non-aux symbol records.
+    var rel_n: u32 = 0;
+    var s: u32 = 0;
+    for (s < num_secs) {
+        val sh: usize = secthdr_base + s::usize * SECTION_HEADER_SIZE;
+        rel_n = rel_n + read_u16_le(buf, sh + 32)::u32;
+        s = s + 1;
+    }
+    var sym_n: u32 = 0;
+    var ri: u32 = 0;
+    for (ri < num_records) {
+        val so: usize = symtab_off + ri::usize * SYMBOL_SIZE;
+        val aux: u8 = buf[so + 17];
+        sym_n = sym_n + 1;
+        ri = ri + 1 + aux::u32;
+    }
+
+    if (num_secs > 0) {
+        val rsec: Result[*of.Section, str] = zallocate[of.Section](alloc, num_secs::usize);
+        if (is_err[*of.Section, str](rsec)) { ret err[bool, str]("coff: section array alloc failed"); }
+        out.sections = unwrap_ok[*of.Section, str](rsec);
+    }
+    if (sym_n > 0) {
+        val rsym: Result[*of.Symbol, str] = zallocate[of.Symbol](alloc, sym_n::usize);
+        if (is_err[*of.Symbol, str](rsym)) { ret err[bool, str]("coff: symbol array alloc failed"); }
+        out.symbols = unwrap_ok[*of.Symbol, str](rsym);
+    }
+    if (rel_n > 0) {
+        val rrel: Result[*of.Relocation, str] = zallocate[of.Relocation](alloc, rel_n::usize);
+        if (is_err[*of.Relocation, str](rrel)) { ret err[bool, str]("coff: reloc array alloc failed"); }
+        out.relocations = unwrap_ok[*of.Relocation, str](rrel);
+    }
+
+    # map a COFF symbol-table record index -> ObjectImage symbol index, so a
+    # relocation's SymbolTableIndex resolves to the interned symbol name.
+    val res_map: Result[*i32, str] = zallocate[i32](alloc, (num_records + 1)::usize);
+    if (is_err[*i32, str](res_map)) { ret err[bool, str]("coff: symbol map alloc failed"); }
+    var rec_map: *i32 = unwrap_ok[*i32, str](res_map);
+
+    # sections.
+    s = 0;
+    for (s < num_secs) {
+        val sh: usize = secthdr_base + s::usize * SECTION_HEADER_SIZE;
+        val sec_name: str = read_section_name(buf, sh, strtab_base);
+        val rin: Result[intern.StrId, str] = intern.intern(coff_interner, sec_name);
+        if (is_err[intern.StrId, str](rin)) {
+            deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+            ret err[bool, str](unwrap_err[intern.StrId, str](rin));
+        }
+
+        val chars: u32 = read_u32_le(buf, sh + 36);
+        var kind: of.SectionKind = of.SK_DATA;
+        if ((chars & IMAGE_SCN_CNT_CODE) != 0) { kind = of.SK_TEXT; }
+        or ((chars & IMAGE_SCN_CNT_UNINITIALIZED_DATA) != 0) { kind = of.SK_BSS; }
+        or ((chars & IMAGE_SCN_MEM_DISCARDABLE) != 0) { kind = of.SK_DEBUG; }
+        or ((chars & IMAGE_SCN_MEM_WRITE) == 0) { kind = of.SK_RODATA; }
+
+        out.sections[s].name  = unwrap_ok[intern.StrId, str](rin);
+        out.sections[s].kind  = kind;
+        out.sections[s].len   = read_u32_le(buf, sh + 16);
+        out.sections[s].align = align_from_characteristics(chars);
+        out.sections[s].bytes = nil;
+
+        val raw_ptr: u32 = read_u32_le(buf, sh + 20);
+        if ((chars & IMAGE_SCN_CNT_UNINITIALIZED_DATA) == 0 && raw_ptr != 0
+            && out.sections[s].len > 0) {
+            val sz: usize = out.sections[s].len::usize;
+            val rb: Result[*u8, str] = allocate[u8](alloc, sz);
+            if (is_err[*u8, str](rb)) {
+                deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+                ret err[bool, str]("coff: section bytes alloc failed");
+            }
+            out.sections[s].bytes = unwrap_ok[*u8, str](rb);
+            mem.raw_copy(out.sections[s].bytes::ptr, (buf::usize + raw_ptr::usize)::ptr, sz);
+        }
+        s = s + 1;
+    }
+    out.section_count = num_secs;
+
+    # symbols: walk records, skipping aux records, recording each definition.
+    ri = 0;
+    for (ri < num_records) {
+        rec_map[ri] = -1;
+        val so: usize = symtab_off + ri::usize * SYMBOL_SIZE;
+        val aux: u8 = buf[so + 17];
+
+        val name: str = read_symbol_name(buf, so, strtab_base);
+        val rin: Result[intern.StrId, str] = intern.intern(coff_interner, name);
+        if (is_err[intern.StrId, str](rin)) {
+            deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+            ret err[bool, str](unwrap_err[intern.StrId, str](rin));
+        }
+
+        val idx: u32 = out.symbol_count;
+        rec_map[ri] = idx::i32;
+        out.symbols[idx].name = unwrap_ok[intern.StrId, str](rin);
+        out.symbols[idx].offset = read_u32_le(buf, so + 8);
+        out.symbols[idx].size = 0;
+
+        val sec_num: i16 = read_u16_le(buf, so + 12)::i16;
+        val sym_ty:  u16 = read_u16_le(buf, so + 14);
+        val scl:     u8  = buf[so + 16];
+
+        var flags: u32 = 0;
+        if (scl == IMAGE_SYM_CLASS_EXTERNAL || scl == IMAGE_SYM_CLASS_WEAK_EXTERNAL) {
+            flags = flags | of.SYM_OBJ_FLAG_GLOBAL;
+        }
+        if (scl == IMAGE_SYM_CLASS_WEAK_EXTERNAL) { flags = flags | of.SYM_OBJ_FLAG_WEAK; }
+        if (sym_ty == IMAGE_SYM_DTYPE_FUNCTION) { flags = flags | of.SYM_OBJ_FLAG_FUNCTION; }
+
+        if (sec_num <= IMAGE_SYM_UNDEFINED) {
+            flags = flags | of.SYM_OBJ_FLAG_EXTERN;
+            out.symbols[idx].section = of.SECTION_EXTERNAL;
+        } or ((sec_num::u32 - 1) < num_secs) {
+            out.symbols[idx].section = sec_num::u32 - 1;
+        } or {
+            out.symbols[idx].section = of.SECTION_EXTERNAL;
+        }
+        out.symbols[idx].flags = flags;
+        out.symbol_count = out.symbol_count + 1;
+
+        # an aux record carries no own image symbol; map it to its owner so a
+        # stray SymbolTableIndex pointing at an aux record still resolves.
+        var a: u32 = 0;
+        for (a < aux::u32) {
+            if ((ri + 1 + a) < num_records) { rec_map[ri + 1 + a] = idx::i32; }
+            a = a + 1;
+        }
+        ri = ri + 1 + aux::u32;
+    }
+
+    # relocations: each section header points at its IMAGE_RELOCATION array.
+    s = 0;
+    for (s < num_secs) {
+        val sh: usize = secthdr_base + s::usize * SECTION_HEADER_SIZE;
+        val rptr: usize = read_u32_le(buf, sh + 24)::usize;
+        val rcount: u32 = read_u16_le(buf, sh + 32)::u32;
+        var k: u32 = 0;
+        for (k < rcount) {
+            val ro: usize = rptr + k::usize * RELOCATION_SIZE;
+            val idx: u32 = out.reloc_count;
+            out.relocations[idx].section = s;
+            out.relocations[idx].offset = read_u32_le(buf, ro);
+            out.relocations[idx].addend = 0;
+            out.relocations[idx].kind = reloc_kind_for(read_u16_le(buf, ro + 8));
+
+            val rec: u32 = read_u32_le(buf, ro + 4);
+            if (rec < num_records && rec_map[rec] >= 0) {
+                out.relocations[idx].symbol = out.symbols[rec_map[rec]::u32].name;
+            } or {
+                out.relocations[idx].symbol = intern.STR_NIL;
+            }
+            out.reloc_count = out.reloc_count + 1;
+            k = k + 1;
+        }
+        s = s + 1;
+    }
+
+    deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+    ret ok[bool, str](true);
 }
 
-# coff_emit_exec: serialize laid-out load segments into a PE/COFF executable.
+# coff_emit_exec: serialize laid-out load segments into a PE32+ executable.
 #
-# stub: COFF executable emission is not yet implemented. always returns the
-# unsupported-target error so no malformed executable is written. matches the
-# of.ExecFn signature exactly.
+# DEFERRED: the PE32+ executable container and the `.idata` import table / IAT
+# compose with the #1159 dynamic-import linker and the #1177 OS layer. until
+# then this returns a clear error rather than producing a malformed executable.
+# matches the of.ExecFn signature exactly.
 # ---
 # alloc:     allocator for the output buffer
 # isa_vt:    the instruction-set vtable describing the machine
@@ -74,10 +868,10 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
 # seg_count: number of load segments
 # entry:     program entry-point virtual address
 # path:      null-terminated output file path
-# ret:       the unsupported-target error
+# ret:       the deferred-feature error
 fun coff_emit_exec(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
                    seg_count: u32, entry: u64, path: *u8) Result[bool, str] {
-    ret err[bool, str](COFF_UNSUPPORTED);
+    ret err[bool, str]("coff: PE executable emission deferred to #1159/#1177");
 }
 
 # the COFF relocation-kind table, indexed by entry order. populated by register.
@@ -90,16 +884,19 @@ var coff_registered: bool = false;
 
 # register_coff: build and install the COFF OfVTable.
 #
+# captures the interner so the reader/writer can resolve `intern.StrId` names,
 # interns the format name ("coff"), file extension ("obj"), and relocation-kind
-# names, fills the relocation-kind table and vtable, wires the (stub) writer,
-# and self-registers it into the process-global OF registry under of.OF_COFF.
-# write-once: a second call is a no-op. must be invoked at compiler startup
-# before target.select requests a Windows target.
+# names, fills the relocation-kind table and vtable, wires the writer/reader, and
+# self-registers it into the process-global OF registry under of.OF_COFF.
+# write-once: a second call only refreshes the captured interner. must be invoked
+# at compiler startup before target.select requests a Windows target.
 # ---
 # alloc: backing allocator (reserved for parity with other registrars)
-# i:     string interner used to intern the vtable's string fields
+# i:     string interner used to intern the vtable's string fields and captured
+#        for the reader/writer
 # ret:   true on success, or an error string if name interning fails
 pub fun register_coff(alloc: *Allocator, i: *intern.Interner) Result[bool, str] {
+    coff_interner = i;
     if (coff_registered) { ret ok[bool, str](true); }
 
     val rn: Result[intern.StrId, str] = intern.intern(i, "coff");
@@ -117,34 +914,37 @@ pub fun register_coff(alloc: *Allocator, i: *intern.Interner) Result[bool, str] 
     val rab: Result[intern.StrId, str] = intern.intern(i, "addr32nb");
     if (is_err[intern.StrId, str](rab)) { ret err[bool, str](unwrap_err[intern.StrId, str](rab)); }
 
-    val rb: Result[intern.StrId, str] = intern.intern(i, "branch26");
+    val rb: Result[intern.StrId, str] = intern.intern(i, "plt32");
     if (is_err[intern.StrId, str](rb)) { ret err[bool, str](unwrap_err[intern.StrId, str](rb)); }
+
+    rk_abs64    = unwrap_ok[intern.StrId, str](ra);
+    rk_pc32     = unwrap_ok[intern.StrId, str](rp);
+    rk_addr32nb = unwrap_ok[intern.StrId, str](rab);
+    rk_plt32    = unwrap_ok[intern.StrId, str](rb);
 
     # abs64 → IMAGE_REL_AMD64_ADDR64 (64-bit absolute, not pc-relative)
     coff_reloc_kinds[0].id        = of.RK_ABS64::u32;
-    coff_reloc_kinds[0].name      = unwrap_ok[intern.StrId, str](ra);
+    coff_reloc_kinds[0].name      = rk_abs64;
     coff_reloc_kinds[0].bit_width = 64;
     coff_reloc_kinds[0].pc_rel    = false;
 
     # pc32 → IMAGE_REL_AMD64_REL32 (32-bit pc-relative)
     coff_reloc_kinds[1].id        = of.RK_PC32::u32;
-    coff_reloc_kinds[1].name      = unwrap_ok[intern.StrId, str](rp);
+    coff_reloc_kinds[1].name      = rk_pc32;
     coff_reloc_kinds[1].bit_width = 32;
     coff_reloc_kinds[1].pc_rel    = true;
 
-    # addr32nb → IMAGE_REL_AMD64_ADDR32NB (32-bit image-relative, not pc-rel).
-    # the abstract RK_* set has no image-relative variant; RK_ABS32S is the
-    # nearest 32-bit absolute kind. deferred: a dedicated image-relative RK_*.
-    coff_reloc_kinds[2].id        = of.RK_ABS32S::u32;
-    coff_reloc_kinds[2].name      = unwrap_ok[intern.StrId, str](rab);
+    # addr32nb → IMAGE_REL_AMD64_ADDR32NB (32-bit image-relative, not pc-rel)
+    coff_reloc_kinds[2].id        = of.RK_ADDR32NB::u32;
+    coff_reloc_kinds[2].name      = rk_addr32nb;
     coff_reloc_kinds[2].bit_width = 32;
     coff_reloc_kinds[2].pc_rel    = false;
 
-    # branch26 → IMAGE_REL_ARM64_BRANCH26 (26-bit pc-relative branch); maps to
-    # the abstract PLT-branch kind RK_PLT32 (documented as branch26).
+    # plt32 → IMAGE_REL_AMD64_REL32 (a call through an import thunk is a plain
+    # 32-bit pc-relative reference on x86-64; COFF has no separate PLT type).
     coff_reloc_kinds[3].id        = of.RK_PLT32::u32;
-    coff_reloc_kinds[3].name      = unwrap_ok[intern.StrId, str](rb);
-    coff_reloc_kinds[3].bit_width = 26;
+    coff_reloc_kinds[3].name      = rk_plt32;
+    coff_reloc_kinds[3].bit_width = 32;
     coff_reloc_kinds[3].pc_rel    = true;
 
     coff_vtable.id               = of.OF_COFF;
@@ -161,4 +961,234 @@ pub fun register_coff(alloc: *Allocator, i: *intern.Interner) Result[bool, str] 
     of.register(?coff_vtable);
     coff_registered = true;
     ret ok[bool, str](true);
+}
+
+# intern a name into the test interner, returning STR_NIL on failure (the test
+# checks the resulting image, which fails loudly if a name went missing).
+fun t_intern(i: *intern.Interner, s: str) intern.StrId {
+    val r: Result[intern.StrId, str] = intern.intern(i, s);
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    # register_coff captures `i` as the reader/writer interner and interns the
+    # relocation-kind names into it; the kind StrIds resolve against this same
+    # interner below.
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    val vt_o: Option[*of.OfVTable] = of.lookup(of.OF_COFF);
+    if (!is_some[*of.OfVTable](vt_o)) { ret 1; }
+    val vt: *of.OfVTable = unwrap[*of.OfVTable](vt_o);
+
+    # a minimal isa vtable: the writer reads only its `id`.
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # build a small image: .text (8 bytes, one fn `main`), .data (4 bytes, one
+    # global `gvar`), .bss (16 zero bytes), plus an undefined extern `puts`.
+    var text_bytes: [8]u8;
+    var k: usize = 0;
+    for (k < 8) { text_bytes[k] = (0xE8 + k)::u8; k = k + 1; }
+    var data_bytes: [4]u8;
+    data_bytes[0] = 0xDE; data_bytes[1] = 0xAD; data_bytes[2] = 0xBE; data_bytes[3] = 0xEF;
+
+    var secs: [3]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".data"); secs[1].kind = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0]; secs[1].len = 4; secs[1].align = 4;
+    secs[2].name = t_intern(?i, ".bss"); secs[2].kind = of.SK_BSS;
+    secs[2].bytes = nil; secs[2].len = 16; secs[2].align = 8;
+
+    var syms: [3]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "gvar"); syms[1].section = 1; syms[1].offset = 0;
+    syms[1].size = 4; syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+    syms[2].name = t_intern(?i, "puts"); syms[2].section = of.SECTION_EXTERNAL;
+    syms[2].offset = 0; syms[2].size = 0; syms[2].flags = of.SYM_OBJ_FLAG_EXTERN;
+
+    val k_pc32:  intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
+    val k_abs64: intern.StrId = of.reloc_kind_name(vt, of.RK_ABS64);
+
+    var relocs: [2]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = k_pc32;
+    relocs[0].symbol = syms[2].name; relocs[0].addend = 0;
+    relocs[1].section = 0; relocs[1].offset = 4; relocs[1].kind = k_abs64;
+    relocs[1].symbol = syms[1].name; relocs[1].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 3;
+    img.symbols = ?syms[0]; img.symbol_count = 3;
+    img.relocations = ?relocs[0]; img.reloc_count = 2;
+
+    # write the object to a temp file, then read the bytes back.
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_rt");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, tpath::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    # structural checks against the COFF spec: machine, section count, the
+    # symbol-table offset's record count (2 section symbols/aux pairs each = 6,
+    # plus 3 image symbols = 9), and a zero optional-header size.
+    if (read_u16_le(buf.data, 0) != IMAGE_FILE_MACHINE_AMD64) { ret 1; }
+    if (read_u16_le(buf.data, 2) != 3) { ret 1; }
+    if (read_u16_le(buf.data, 16) != 0) { ret 1; }
+    if (read_u32_le(buf.data, 12) != 9) { ret 1; }
+
+    # .text section header: code+exec+read characteristics and 16-byte align.
+    val sh0: usize = COFF_HEADER_SIZE;
+    val chars0: u32 = read_u32_le(buf.data, sh0 + 36);
+    if ((chars0 & IMAGE_SCN_CNT_CODE) == 0) { ret 1; }
+    if ((chars0 & IMAGE_SCN_MEM_EXECUTE) == 0) { ret 1; }
+    if (read_u16_le(buf.data, sh0 + 32) != 2) { ret 1; }
+
+    # parse the bytes back into a fresh image and verify the round-trip.
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = coff_parse_object(?alloc, buf.data, buf.len, ?out);
+    if (is_err[bool, str](pr)) { ret 1; }
+
+    if (out.section_count != 3) { ret 1; }
+    # the reader faithfully surfaces every COFF symbol: the three writer-emitted
+    # section symbols (one per section, what a real linker consumes for
+    # section-relative relocs) plus the three image symbols, six in total. the
+    # image symbols are recovered by name below.
+    if (out.symbol_count != 6) { ret 1; }
+    if (out.reloc_count != 2) { ret 1; }
+
+    # section kinds and lengths survive.
+    if (out.sections[0].kind != of.SK_TEXT || out.sections[0].len != 8) { ret 1; }
+    if (out.sections[1].kind != of.SK_DATA || out.sections[1].len != 4) { ret 1; }
+    if (out.sections[2].kind != of.SK_BSS  || out.sections[2].len != 16) { ret 1; }
+    if (out.sections[0].align != 16 || out.sections[1].align != 4) { ret 1; }
+
+    # .text bytes survive; .bss carries none.
+    if (out.sections[0].bytes == nil) { ret 1; }
+    k = 0;
+    for (k < 8) {
+        if (out.sections[0].bytes[k] != (0xE8 + k)::u8) { ret 1; }
+        k = k + 1;
+    }
+    if (out.sections[2].bytes != nil) { ret 1; }
+
+    # symbol names + flags survive: `main` is a global function, `puts` extern.
+    var saw_main: bool = false;
+    var saw_puts: bool = false;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (out.symbols[si].name == syms[0].name) {
+            saw_main = true;
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_FUNCTION) == 0) { ret 1; }
+            if (out.symbols[si].section != 0) { ret 1; }
+        }
+        if (out.symbols[si].name == syms[2].name) {
+            saw_puts = true;
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_EXTERN) == 0) { ret 1; }
+            if (out.symbols[si].section != of.SECTION_EXTERNAL) { ret 1; }
+        }
+        si = si + 1;
+    }
+    if (!saw_main || !saw_puts) { ret 1; }
+
+    # relocations survive: a pc32 to `puts` at offset 1, an abs64 to `gvar` at 4.
+    var saw_pc32: bool = false;
+    var saw_abs64: bool = false;
+    var rj: u32 = 0;
+    for (rj < out.reloc_count) {
+        if (out.relocations[rj].section != 0) { ret 1; }
+        if (out.relocations[rj].offset == 1 && out.relocations[rj].kind == k_pc32
+            && out.relocations[rj].symbol == syms[2].name) { saw_pc32 = true; }
+        if (out.relocations[rj].offset == 4 && out.relocations[rj].kind == k_abs64
+            && out.relocations[rj].symbol == syms[1].name) { saw_abs64 = true; }
+        rj = rj + 1;
+    }
+    if (!saw_pc32 || !saw_abs64) { ret 1; }
+
+    ret 0;
+}
+
+test "coff: long section and symbol names round-trip through the string table" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # a section and a symbol whose names exceed the eight inline bytes, forcing
+    # the "/offset" section-name form and the symbol string-table-offset form.
+    val long_sec: str = ".text$mn_generic";
+    val long_sym: str = "mach__generic__instance__symbol";
+
+    var data_bytes: [4]u8;
+    data_bytes[0] = 1; data_bytes[1] = 2; data_bytes[2] = 3; data_bytes[3] = 4;
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, long_sec); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?data_bytes[0]; secs[0].len = 4; secs[0].align = 1;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, long_sym); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 4; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_ln");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    # the section header's name field begins with '/' for a string-table name.
+    if (buf.data[COFF_HEADER_SIZE] != '/') { ret 1; }
+
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = coff_parse_object(?alloc, buf.data, buf.len, ?out);
+    if (is_err[bool, str](pr)) { ret 1; }
+
+    # the long section name interns to the same id it was emitted under.
+    if (out.section_count != 1) { ret 1; }
+    if (out.sections[0].name != secs[0].name) { ret 1; }
+
+    # the long symbol name survives among the section symbol + image symbol.
+    var saw: bool = false;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (out.symbols[si].name == syms[0].name) { saw = true; }
+        si = si + 1;
+    }
+    if (!saw) { ret 1; }
+
+    ret 0;
 }
