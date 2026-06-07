@@ -7,9 +7,7 @@ MACH
 ![Last Commit](https://img.shields.io/github/last-commit/octalide/mach)
 ![Issues](https://img.shields.io/github/issues/octalide/mach)
 
-Mach is a statically-typed, compiled systems language designed to be simple, fast, verbose, and intuitive. The compiler is written in Mach and is **self-hosting**: it compiles its own source and reproduces itself bit-for-bit.
-
-> Mach is still alpha quality. Expect breaking changes as the compiler and standard library iterate.
+Mach is a statically-typed, compiled systems language designed to be simple, fast, verbose, and intuitive.
 
 We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
 
@@ -33,9 +31,9 @@ Mach is designed with the following principles in mind:
 
 Mach is NOT designed to prioritize:
 - **Features**: Batteries are not included. Ever.
-- **Flexibility**: Mach is rigid and opinionated. It should not be flexible or allow for many ways to do the same thing.
-- **Code Reduction**: Mach is explicit and verbose. More code is not worse code.
-- **Hand-holding**: Mach provides tools for safety (like read-only pointers and deferred cleanup), but it will not stop you from doing dangerous things if you explicitly ask to. Safety is a partnership between the language and the programmer.
+- **Flexibility**: Mach does not allow for many ways to do the same thing.
+- **Code Reduction**: Mach is explicit and verbose by design. More code is not worse code.
+- **Hand-holding**: Mach will not stop you from doing dangerous things. Safety is a decision made by the programmer, not a restriction to be imposed upon them.
 
 
 # Getting Started
@@ -80,7 +78,7 @@ mach <command> [options]
 | `init`  | scaffold a new project (`--bin`, `--lib`, `--name`) |
 | `help`  | show usage; `mach help <command>` for detail |
 
-Common flags: `--target <name>` selects a `[targets.<name>]` entry, `--release` enables the optimisation pipeline, `--emit obj` stops at object files, `-o <path>` sets the output, and `--verbose`/`--quiet` adjust output. Run `mach help <command>` for the full set.
+Run `mach help <command>` for more information about a specific subcommand.
 
 
 # Examples
@@ -151,16 +149,16 @@ The full language reference is in [`doc/language/`](doc/language/README.md).
 
 # Credit
 
-The inspiration for Mach comes from too many languages to count. Almost every language has problems that Mach attempts to elegantly resolve (most often by the process of reductive simplification).
+The inspiration for Mach comes from too many languages to count.
 
-Direct inspiration for the compiler comes from a few specific sources:
+Direct inspiration for the compiler itself comes from a few specific sources:
 
 - [Golang](https://golang.org/)
 - [Vlang](https://vlang.org/)
 - [Zig](https://ziglang.org/)
 - [Rust](https://www.rust-lang.org/)
 
-Mach, at its core, stands on the shoulders of countless giants that have contributed to the development of these languages either directly or by proxy. It is out of respect for their work that Mach will always be fully open source. Thank you all.
+Mach stands on the shoulders of countless giants that have contributed to the development of these languages either directly or by proxy. It is out of respect for their work that Mach will always be fully open source. Thank you all.
 
 
 ## Contributing
