@@ -71,10 +71,18 @@ val IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 val IMAGE_SCN_CNT_CODE:               u32 = 0x00000020;
 val IMAGE_SCN_CNT_INITIALIZED_DATA:   u32 = 0x00000040;
 val IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x00000080;
+val IMAGE_SCN_LNK_COMDAT:             u32 = 0x00001000;
 val IMAGE_SCN_MEM_DISCARDABLE:        u32 = 0x02000000;
 val IMAGE_SCN_MEM_EXECUTE:            u32 = 0x20000000;
 val IMAGE_SCN_MEM_READ:               u32 = 0x40000000;
 val IMAGE_SCN_MEM_WRITE:              u32 = 0x80000000;
+
+# COMDAT selection for a section symbol's aux record. ANY keeps one of N
+# identical definitions and discards the rest — the COFF mechanism the mach
+# whole-program linker reads back as a weak (deduplicated) definition, mirroring
+# the ELF STB_WEAK binding. a defined weak symbol is emitted into its own
+# LNK_COMDAT section so the attribute survives the write→read round-trip.
+val IMAGE_COMDAT_SELECT_ANY: u8 = 2;
 
 # x86-64 relocation types (IMAGE_REL_AMD64_*).
 val IMAGE_REL_AMD64_ADDR64:   u16 = 0x0001;
@@ -437,6 +445,182 @@ fun validate_reloc_ranges(img: *of.ObjectImage) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
+# whether a symbol is a defined weak symbol — weak binding with a real defining
+# section (not an undefined extern). such a symbol is the one a COMDAT section
+# carries so the weak attribute survives the COFF round-trip.
+fun is_defined_weak(sym: *of.Symbol, num_secs: u32) bool {
+    if ((sym.flags & of.SYM_OBJ_FLAG_WEAK) == 0) { ret false; }
+    if (sym.section == of.SECTION_EXTERNAL) { ret false; }
+    if (sym.section >= num_secs) { ret false; }
+    ret true;
+}
+
+# count the defined weak symbols in an image — the number of extra COMDAT
+# sections the writer adds, one carrying each weak definition.
+fun count_defined_weak(img: *of.ObjectImage) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        if (is_defined_weak(?img.symbols[i], img.section_count)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the byte extent of a symbol within its defining section: from its own offset up
+# to the next symbol's offset in the same section, or the section end if it is the
+# last. monomorphized function bodies fully partition `.text` (each is one
+# contiguous symbol), so this recovers exactly the weak definition's bytes — any
+# trailing padding rides along harmlessly. an out-of-range or empty result is
+# clamped so the carved COMDAT section never exceeds the source section.
+fun weak_symbol_extent(img: *of.ObjectImage, sym_idx: u32) u32 {
+    val sec: u32 = img.symbols[sym_idx].section;
+    val start: u32 = img.symbols[sym_idx].offset;
+    val sec_len: u32 = img.sections[sec].len;
+    var end: u32 = sec_len;
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        if (i != sym_idx && img.symbols[i].section == sec) {
+            val o: u32 = img.symbols[i].offset;
+            if (o > start && o < end) { end = o; }
+        }
+        i = i + 1;
+    }
+    if (end < start) { ret 0; }
+    if (end > sec_len) { end = sec_len; }
+    ret end - start;
+}
+
+# build_weak_comdat_image: derive a serialization image in which every defined
+# weak symbol is carried by its own COMDAT section, so the weak/dedup attribute
+# round-trips through COFF (which has no defined-weak storage class). mirrors the
+# ELF writer's STB_WEAK binding at the `of.ObjectImage` level; the COMDAT section
+# is the COFF-specific encoding `coff_parse_object` recovers the weak flag from.
+#
+# each defined weak symbol gets a new section that is a view onto its byte extent
+# in the source section (no copy — the view aliases the source bytes, which the
+# caller keeps live through serialization); the symbol is rebound into that
+# section at offset 0, and every relocation patching its extent moves with it. the
+# original sections are kept whole — the weak body's bytes remain in place but are
+# unreferenced there, exactly as a duplicate weak definition is dead under ELF.
+# `out_comdat[s]` is true for the sections that must be emitted with
+# `IMAGE_SCN_LNK_COMDAT` and a `SELECT_ANY` section-symbol aux record.
+# ---
+# alloc:       allocator for the derived arrays
+# img:         the source image (read-only; its bytes back the derived views)
+# out:         the derived image to populate
+# out_comdat:  per-derived-section flag set true for the COMDAT carrier sections
+# ret:         ok(true) on success, or an error string
+fun build_weak_comdat_image(alloc: *Allocator, img: *of.ObjectImage,
+                            out: *of.ObjectImage, out_comdat: **bool) Result[bool, str] {
+    val weak_n: u32 = count_defined_weak(img);
+    val new_secs: u32 = img.section_count + weak_n;
+
+    out.alloc = alloc;
+    out.name = img.name;
+    out.section_count = new_secs;
+    out.symbol_count = img.symbol_count;
+    out.reloc_count = img.reloc_count;
+    out.sections = nil;
+    out.symbols = nil;
+    out.relocations = nil;
+
+    val rs: Result[*of.Section, str] = zallocate[of.Section](alloc, new_secs::usize);
+    if (is_err[*of.Section, str](rs)) { ret err[bool, str]("coff: comdat section array alloc failed"); }
+    out.sections = unwrap_ok[*of.Section, str](rs);
+
+    val rc: Result[*bool, str] = zallocate[bool](alloc, new_secs::usize);
+    if (is_err[*bool, str](rc)) { ret err[bool, str]("coff: comdat flag array alloc failed"); }
+    @out_comdat = unwrap_ok[*bool, str](rc);
+    val comdat: *bool = @out_comdat;
+
+    if (img.symbol_count > 0) {
+        val ry: Result[*of.Symbol, str] = zallocate[of.Symbol](alloc, img.symbol_count::usize);
+        if (is_err[*of.Symbol, str](ry)) { ret err[bool, str]("coff: comdat symbol array alloc failed"); }
+        out.symbols = unwrap_ok[*of.Symbol, str](ry);
+    }
+    if (img.reloc_count > 0) {
+        val rr: Result[*of.Relocation, str] = zallocate[of.Relocation](alloc, img.reloc_count::usize);
+        if (is_err[*of.Relocation, str](rr)) { ret err[bool, str]("coff: comdat reloc array alloc failed"); }
+        out.relocations = unwrap_ok[*of.Relocation, str](rr);
+    }
+
+    # copy the source sections verbatim; they keep their original indices.
+    var s: u32 = 0;
+    for (s < img.section_count) {
+        out.sections[s] = img.sections[s];
+        comdat[s] = false;
+        s = s + 1;
+    }
+    # copy the source symbols and relocations verbatim; weak ones are rebound below.
+    var i: u32 = 0;
+    for (i < img.symbol_count) { out.symbols[i] = img.symbols[i]; i = i + 1; }
+    i = 0;
+    for (i < img.reloc_count) { out.relocations[i] = img.relocations[i]; i = i + 1; }
+
+    # carve one COMDAT section per defined weak symbol and rebind the symbol and
+    # its in-extent relocations into it.
+    var next_sec: u32 = img.section_count;
+    i = 0;
+    for (i < img.symbol_count) {
+        if (!is_defined_weak(?img.symbols[i], img.section_count)) { i = i + 1; cnt; }
+
+        val src_sec: u32 = img.symbols[i].section;
+        val start: u32 = img.symbols[i].offset;
+        val extent: u32 = weak_symbol_extent(img, i);
+
+        out.sections[next_sec].name  = img.sections[src_sec].name;
+        out.sections[next_sec].kind  = img.sections[src_sec].kind;
+        out.sections[next_sec].len   = extent;
+        out.sections[next_sec].align = img.sections[src_sec].align;
+        if (section_has_data(img.sections[src_sec].kind) && img.sections[src_sec].bytes != nil
+            && extent > 0) {
+            out.sections[next_sec].bytes = (img.sections[src_sec].bytes::usize + start::usize)::*u8;
+        } or {
+            out.sections[next_sec].bytes = nil;
+        }
+        comdat[next_sec] = true;
+
+        out.symbols[i].section = next_sec;
+        out.symbols[i].offset = 0;
+
+        # move every relocation whose patch site lies in the carved extent into the
+        # new section, rebasing its offset to the section start.
+        var ri: u32 = 0;
+        for (ri < img.reloc_count) {
+            if (img.relocations[ri].section == src_sec) {
+                val ro: u32 = img.relocations[ri].offset;
+                if (ro >= start && ro < start + extent) {
+                    out.relocations[ri].section = next_sec;
+                    out.relocations[ri].offset = ro - start;
+                }
+            }
+            ri = ri + 1;
+        }
+
+        next_sec = next_sec + 1;
+        i = i + 1;
+    }
+
+    ret ok[bool, str](true);
+}
+
+# free the derived arrays a `build_weak_comdat_image` allocated.
+fun free_weak_comdat_image(alloc: *Allocator, out: *of.ObjectImage, comdat: *bool) {
+    if (out.sections != nil) {
+        deallocate[of.Section](alloc, out.sections, out.section_count::usize);
+    }
+    if (out.symbols != nil) {
+        deallocate[of.Symbol](alloc, out.symbols, out.symbol_count::usize);
+    }
+    if (out.relocations != nil) {
+        deallocate[of.Relocation](alloc, out.relocations, out.reloc_count::usize);
+    }
+    if (comdat != nil) {
+        deallocate[bool](alloc, comdat, out.section_count::usize);
+    }
+}
+
 # coff_emit_object: serialize an ObjectImage to a relocatable x86-64 COFF object.
 #
 # the format-writer entry installed in the COFF `of.OfVTable`. lays out the file
@@ -444,7 +628,10 @@ fun validate_reloc_ranges(img: *of.ObjectImage) Result[bool, str] {
 # `IMAGE_RELOCATION` array, the symbol table (a section symbol with its aux
 # record per section, then the image's symbols), and the string table.
 # relocations reference symbols by their COFF symbol-table index and carry an
-# `IMAGE_REL_AMD64_*` type mapped from the abstract kind.
+# `IMAGE_REL_AMD64_*` type mapped from the abstract kind. a defined weak symbol is
+# emitted into its own `IMAGE_SCN_LNK_COMDAT` section (with a `SELECT_ANY`
+# section-symbol aux record) so the weak attribute round-trips, mirroring ELF
+# STB_WEAK; `build_weak_comdat_image` derives that layout up front.
 # ---
 # tgt_isa: the instruction-set vtable describing the machine (must be x86-64)
 # img:     the object image to serialize
@@ -457,6 +644,34 @@ fun coff_emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R
     if (tgt_isa.id != isa.ARCH_X86_64) {
         ret err[bool, str]("coff: only x86-64 is supported");
     }
+    val alloc: *Allocator = img.alloc;
+
+    # derive a serialization image that carries each defined weak symbol in its own
+    # COMDAT section, then serialize that. the derived sections alias the source
+    # bytes, so `img` must stay live until serialization finishes.
+    var derived: of.ObjectImage;
+    var comdat: *bool = nil;
+    val br: Result[bool, str] = build_weak_comdat_image(alloc, img, ?derived, ?comdat);
+    if (is_err[bool, str](br)) {
+        free_weak_comdat_image(alloc, ?derived, comdat);
+        ret err[bool, str](unwrap_err[bool, str](br));
+    }
+
+    val sr: Result[bool, str] = coff_serialize_image(?derived, comdat, path);
+    free_weak_comdat_image(alloc, ?derived, comdat);
+    ret sr;
+}
+
+# coff_serialize_image: lay out and write the COFF object file for an already
+# COMDAT-prepared image. `comdat[s]` selects the sections emitted with
+# `IMAGE_SCN_LNK_COMDAT` and a `SELECT_ANY` section-symbol aux record. callers go
+# through `coff_emit_object`, which builds the COMDAT layout first.
+# ---
+# img:    the COMDAT-prepared object image to serialize
+# comdat: per-section COMDAT flag (true → emit as a COMDAT carrier section)
+# path:   null-terminated output file path
+# ret:    ok(true) on success, or an error string
+fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) Result[bool, str] {
     val alloc: *Allocator = img.alloc;
 
     val num_secs: u32 = img.section_count;
@@ -603,8 +818,12 @@ fun coff_emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R
         write_u32_le(buf, sh + 28, 0);
         write_u16_le(buf, sh + 32, rc::u16);
         write_u16_le(buf, sh + 34, 0);
-        val chars: u32 = section_characteristics_for(img.sections[s].kind)
+        var chars: u32 = section_characteristics_for(img.sections[s].kind)
                        | align_characteristic(img.sections[s].align);
+        # a COMDAT carrier section (one defined weak symbol) is flagged so the
+        # reader recovers the weak/dedup attribute; its section symbol's aux record
+        # carries SELECT_ANY below.
+        if (comdat != nil && comdat[s]) { chars = chars | IMAGE_SCN_LNK_COMDAT; }
         write_u32_le(buf, sh + 36, chars);
         s = s + 1;
     }
@@ -686,9 +905,15 @@ fun coff_emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R
 
         # aux section record: length (4), nreloc (2), nlnno (2), checksum (4),
         # number (2), selection (1), 3 bytes pad. zeroed by the buffer alloc;
-        # fill length and reloc count.
+        # fill length and reloc count. a COMDAT section also fills `number` with its
+        # own 1-based section index and `selection` with SELECT_ANY — the encoding
+        # the reader maps to a defined weak symbol.
         write_u32_le(buf, sym_off, img.sections[s].len);
         write_u16_le(buf, sym_off + 4, count_relocs_for_section(img, s)::u16);
+        if (comdat != nil && comdat[s]) {
+            write_u16_le(buf, sym_off + 12, (s + 1)::u16);
+            buf[sym_off + 14] = IMAGE_COMDAT_SELECT_ANY;
+        }
         sym_off = sym_off + SYMBOL_SIZE;
         s = s + 1;
     }
@@ -719,10 +944,11 @@ fun coff_emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R
         write_u16_le(buf, sym_off + 14, sym_ty);
 
         # global, weak, and external-undefined symbols are class EXTERNAL; a
-        # local definition is class STATIC. COFF has no separate storage class
-        # for a defined weak symbol, so a weak definition is emitted as a plain
-        # external; the weak-external aux form is reserved for the #1159 import
-        # work and unused here.
+        # local definition is class STATIC. a defined weak symbol is class
+        # EXTERNAL too — its weak/dedup attribute is carried by the COMDAT section
+        # it was moved into (LNK_COMDAT + a SELECT_ANY section-symbol aux record),
+        # which the reader recovers. the weak-external aux form is reserved for the
+        # #1159 import work and unused here.
         var scl: u8 = IMAGE_SYM_CLASS_STATIC;
         if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
             || (img.symbols[symi].flags & of.SYM_OBJ_FLAG_EXTERN) != 0) {
@@ -956,6 +1182,21 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
             out.symbols[idx].section = sec_num::u32 - 1;
         } or {
             out.symbols[idx].section = of.SECTION_EXTERNAL;
+        }
+
+        # a global definition in a COMDAT section is a defined weak symbol: the
+        # writer carries each defined weak symbol in its own LNK_COMDAT section,
+        # mirroring ELF STB_WEAK. recover the weak flag so `collect_symbols`
+        # deduplicates the duplicate instances instead of rejecting them as a
+        # multiple definition. the section's own STATIC section symbol also lives in
+        # the COMDAT section but is not global, so the weak attribute (meaningful
+        # only for a global) is not applied to it.
+        if ((flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
+            && out.symbols[idx].section != of.SECTION_EXTERNAL) {
+            val dsh: usize = secthdr_base + out.symbols[idx].section::usize * SECTION_HEADER_SIZE;
+            if ((read_u32_le(buf, dsh + 36) & IMAGE_SCN_LNK_COMDAT) != 0) {
+                flags = flags | of.SYM_OBJ_FLAG_WEAK;
+            }
         }
         out.symbols[idx].flags = flags;
         out.symbol_count = out.symbol_count + 1;
@@ -1935,6 +2176,142 @@ test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
         rj = rj + 1;
     }
     if (!saw_pc32 || !saw_abs64) { ret 1; }
+
+    ret 0;
+}
+
+test "coff: a defined weak symbol round-trips its weak flag through a COMDAT section" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    val vt_o: Option[*of.OfVTable] = of.lookup(of.OF_COFF);
+    if (!is_some[*of.OfVTable](vt_o)) { ret 1; }
+    val vt: *of.OfVTable = unwrap[*of.OfVTable](vt_o);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # a .text holding two functions: a strong global `main` in [0,8) and a weak
+    # monomorphized instance `okI3u64P2u8E` in [8,16), the kind emitted into every
+    # using object. a relocation patches a field inside the weak body (offset 12),
+    # so the COMDAT carve must move it with the symbol and the round-trip recover
+    # it. an undefined extern `puts` is the relocation's target.
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = (0x10 + k)::u8; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [3]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 0; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "okI3u64P2u8E"); syms[1].section = 0; syms[1].offset = 8;
+    syms[1].size = 0;
+    syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_WEAK;
+    syms[2].name = t_intern(?i, "puts"); syms[2].section = of.SECTION_EXTERNAL;
+    syms[2].offset = 0; syms[2].size = 0; syms[2].flags = of.SYM_OBJ_FLAG_EXTERN;
+
+    val k_pc32: intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
+
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 12; relocs[0].kind = k_pc32;
+    relocs[0].symbol = syms[2].name; relocs[0].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 3;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_wk");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    # the file carries the original .text plus one COMDAT carrier section for the
+    # single weak symbol: two sections in total.
+    if (read_u16_le(buf.data, 2) != 2) { ret 1; }
+
+    # exactly one section header carries the LNK_COMDAT characteristic.
+    var comdat_secs: u32 = 0;
+    var sh_i: u32 = 0;
+    for (sh_i < 2) {
+        val sh: usize = COFF_HEADER_SIZE + sh_i::usize * SECTION_HEADER_SIZE;
+        if ((read_u32_le(buf.data, sh + 36) & IMAGE_SCN_LNK_COMDAT) != 0) {
+            comdat_secs = comdat_secs + 1;
+        }
+        sh_i = sh_i + 1;
+    }
+    if (comdat_secs != 1) { ret 1; }
+
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = coff_parse_object(?alloc, buf.data, buf.len, ?out);
+    if (is_err[bool, str](pr)) { ret 1; }
+
+    # the weak symbol recovers its WEAK flag; the strong `main` does not; `puts`
+    # stays an undefined extern.
+    var saw_weak: bool = false;
+    var saw_main: bool = false;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (out.symbols[si].name == syms[1].name) {
+            saw_weak = true;
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_WEAK) == 0) { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { ret 1; }
+            # the weak body is carried in its own COMDAT section, defined at offset 0.
+            if (out.symbols[si].offset != 0) { ret 1; }
+            if (out.sections[out.symbols[si].section].kind != of.SK_TEXT) { ret 1; }
+            if (out.sections[out.symbols[si].section].len != 8) { ret 1; }
+            # the weak body bytes survive: text_bytes[8..16).
+            val wb: *u8 = out.sections[out.symbols[si].section].bytes;
+            if (wb == nil) { ret 1; }
+            var wk: usize = 0;
+            for (wk < 8) {
+                if (wb[wk] != (0x10 + 8 + wk)::u8) { ret 1; }
+                wk = wk + 1;
+            }
+        }
+        if (out.symbols[si].name == syms[0].name) {
+            saw_main = true;
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_WEAK) != 0) { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { ret 1; }
+        }
+        si = si + 1;
+    }
+    if (!saw_weak || !saw_main) { ret 1; }
+
+    # the relocation that patched the weak body moved into the COMDAT section,
+    # rebased to offset 4 (was 12, the body starts at 8), still targeting `puts`.
+    var saw_reloc: bool = false;
+    var rj: u32 = 0;
+    for (rj < out.reloc_count) {
+        if (out.relocations[rj].symbol == syms[2].name && out.relocations[rj].offset == 4) {
+            # its section must be the COMDAT carrier, i.e. the weak symbol's section.
+            var wsec: u32 = of.SECTION_EXTERNAL;
+            var sj: u32 = 0;
+            for (sj < out.symbol_count) {
+                if (out.symbols[sj].name == syms[1].name) { wsec = out.symbols[sj].section; }
+                sj = sj + 1;
+            }
+            if (out.relocations[rj].section == wsec) { saw_reloc = true; }
+        }
+        rj = rj + 1;
+    }
+    if (!saw_reloc) { ret 1; }
 
     ret 0;
 }
