@@ -764,6 +764,116 @@ pub fun try_lower_comptime_intrinsic(ctx: *lower.LowerContext, eid: aid.ExprId, 
     ret some[Result[value.Value, str]](ok[value.Value, str](value.const_int(n::u64, rt)));
 }
 
+# folds a constant scalar cast expression (`<const>::T`, including chains like
+# `(-11)::i32::u32`) to a constant Value at the cast's IR type. a cast of a
+# constant operand is itself a constant the frontend `comptime.eval` rejects
+# (it has no type resolution to model width/sign); this folds it here via the
+# same trunc/extend/convert semantics `lower_cast` emits, so a global
+# initialiser `val X: T = <const>::U` becomes a real constant instead of the
+# zero placeholder a read-only global can never receive. returns none when the
+# expression is not a cast or its operand is not a foldable scalar constant.
+pub fun try_lower_comptime_cast(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Option[Result[value.Value, str]] {
+    if (e.kind != aexpr.EXPR_KIND_CAST) { ret none[Result[value.Value, str]](); }
+    val folded: Option[Result[comptime.CTValue, str]] = fold_const_scalar(ctx, eid);
+    if (is_none[Result[comptime.CTValue, str]](folded)) { ret none[Result[value.Value, str]](); }
+    val cv_r: Result[comptime.CTValue, str] = unwrap[Result[comptime.CTValue, str]](folded);
+    if (is_err[comptime.CTValue, str](cv_r)) {
+        ret some[Result[value.Value, str]](err[value.Value, str](unwrap_err[comptime.CTValue, str](cv_r)));
+    }
+    ret some[Result[value.Value, str]](const_value_of(ctx, eid, unwrap_ok[comptime.CTValue, str](cv_r)));
+}
+
+# folds a constant scalar expression to its comptime value. a non-cast leaf is
+# delegated to `comptime.eval`; a cast recurses on its operand and applies the
+# same value-conversion `lower_cast` lowers (int trunc/extend by width and
+# signedness, int<->float convert, float trunc/extend, and `:~` reinterpret).
+# returns none when the expression is not a foldable scalar constant.
+fun fold_const_scalar(ctx: *lower.LowerContext, eid: aid.ExprId) Option[Result[comptime.CTValue, str]] {
+    val e_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
+    if (is_none[*aexpr.Expr](e_opt)) { ret none[Result[comptime.CTValue, str]](); }
+    val e: *aexpr.Expr = unwrap[*aexpr.Expr](e_opt);
+
+    if (e.kind != aexpr.EXPR_KIND_CAST) {
+        val ev: Result[comptime.CTValue, str] =
+            comptime.eval(ctx.ctx, ctx.a, lower.module_source(ctx), eid, ?ctx.s.interner);
+        if (is_err[comptime.CTValue, str](ev)) { ret none[Result[comptime.CTValue, str]](); }
+        ret some[Result[comptime.CTValue, str]](ok[comptime.CTValue, str](unwrap_ok[comptime.CTValue, str](ev)));
+    }
+
+    val op_r: Option[Result[comptime.CTValue, str]] = fold_const_scalar(ctx, e.data.cast.value);
+    if (is_none[Result[comptime.CTValue, str]](op_r)) { ret none[Result[comptime.CTValue, str]](); }
+    val opv_r: Result[comptime.CTValue, str] = unwrap[Result[comptime.CTValue, str]](op_r);
+    if (is_err[comptime.CTValue, str](opv_r)) { ret some[Result[comptime.CTValue, str]](opv_r); }
+    val opv: comptime.CTValue = unwrap_ok[comptime.CTValue, str](opv_r);
+
+    val from_ty: ty.TypeId = lower.expr_type_of(ctx, e.data.cast.value);
+    val to_ty:   ty.TypeId = lower.type_resolved_of(ctx, e.data.cast.ty);
+    ret some[Result[comptime.CTValue, str]](convert_const_scalar(ctx, opv, from_ty, to_ty, e.data.cast.reinterpret));
+}
+
+# applies a `::` value conversion (or `:~` reinterpret) to a folded scalar
+# constant, matching `lower_cast`'s instruction selection: integer
+# truncate/sign-/zero-extend by the destination width, int<->float convert, and
+# float truncate/extend. the folded integer is held in an `i64` already
+# canonicalised to its source type's representation, so a conversion to an
+# integer target is exactly "take the low `to_bits` bits, then sign- or
+# zero-extend to 64 by the target's signedness".
+fun convert_const_scalar(
+    ctx:         *lower.LowerContext,
+    v:           comptime.CTValue,
+    from_ty:     ty.TypeId,
+    to_ty:       ty.TypeId,
+    reinterpret: bool
+) Result[comptime.CTValue, str] {
+    val from_float: bool = is_float_type(ctx, from_ty);
+    val to_float:   bool = is_float_type(ctx, to_ty);
+    val to_signed:  bool = is_signed_type(ctx, to_ty);
+    val to_bits:    u32  = scalar_bits(ctx, to_ty);
+
+    # `:~` reinterprets the raw bits; the value is sema-validated as equal size,
+    # so the comptime payload already carries those bits unchanged.
+    if (reinterpret) { ret ok[comptime.CTValue, str](v); }
+
+    if (from_float && to_float) { ret float_ct(v.data.f); }
+    if (from_float && !to_float) {
+        # float -> int truncates toward zero into the target representation.
+        ret int_ct(rerepresent_int(v.data.f::i64, to_bits, to_signed));
+    }
+    if (!from_float && to_float) {
+        # int -> float yields the integer's real value as an f64.
+        ret float_ct(v.data.i::f64);
+    }
+
+    ret int_ct(rerepresent_int(v.data.i, to_bits, to_signed));
+}
+
+# canonicalises an integer to a `to_bits`-wide target's representation in an
+# `i64`: takes the low `to_bits` bits then sign- or zero-extends to 64. a
+# `to_bits` of 0 (a non-scalar or pointer-width target) or >= 64 leaves the
+# value unchanged.
+fun rerepresent_int(x: i64, to_bits: u32, to_signed: bool) i64 {
+    if (to_bits == 0 || to_bits >= 64) { ret x; }
+    val shift: u64 = (64 - to_bits)::u64;
+    val masked: u64 = (x::u64 << shift) >> shift;
+    if (!to_signed) { ret masked::i64; }
+    # arithmetic right shift sign-extends from the target's high bit.
+    ret (masked::i64 << shift) >> shift;
+}
+
+fun int_ct(i: i64) Result[comptime.CTValue, str] {
+    var v: comptime.CTValue;
+    v.kind   = comptime.CT_KIND_INT;
+    v.data.i = i;
+    ret ok[comptime.CTValue, str](v);
+}
+
+fun float_ct(f: f64) Result[comptime.CTValue, str] {
+    var v: comptime.CTValue;
+    v.kind   = comptime.CT_KIND_FLOAT;
+    v.data.f = f;
+    ret ok[comptime.CTValue, str](v);
+}
+
 # lowers a variadic intrinsic call (`va_start`/`va_arg`/`va_end`) to its
 # dedicated IR opcode. the single value argument is the `*va_list` pointer; for
 # `va_arg` the call expression's lowered type is the fetched value's type. returns
