@@ -545,6 +545,29 @@ fun build_weak_comdat_image(alloc: *Allocator, img: *of.ObjectImage,
         out.relocations = unwrap_ok[*of.Relocation, str](rr);
     }
 
+    # per-weak-symbol carve tables, parallel and indexed 0..weak_n, filled in the
+    # carve pass and consulted by the single relocation re-home pass. holding the
+    # carve geometry (source section, start, extent, new section) avoids re-scanning
+    # the whole relocation table once per weak symbol.
+    # one allocation holding all four carve fields contiguously (srcsec, start,
+    # extent, newsec), so a single alloc/free manages the carve table. the caller
+    # frees `out`'s arrays on an error return; this block frees itself.
+    var carve: *u32 = nil;
+    var w_srcsec: *u32 = nil;
+    var w_start:  *u32 = nil;
+    var w_extent: *u32 = nil;
+    var w_newsec: *u32 = nil;
+    if (weak_n > 0) {
+        val ra: Result[*u32, str] = zallocate[u32](alloc, (weak_n * 4)::usize);
+        if (is_err[*u32, str](ra)) { ret err[bool, str]("coff: comdat carve table alloc failed"); }
+        carve = unwrap_ok[*u32, str](ra);
+        # four u32 fields laid out contiguously, each `weak_n` long (4 bytes each).
+        w_srcsec = carve;
+        w_start  = (carve::usize + weak_n::usize * 4)::*u32;
+        w_extent = (carve::usize + weak_n::usize * 8)::*u32;
+        w_newsec = (carve::usize + weak_n::usize * 12)::*u32;
+    }
+
     # copy the source sections verbatim; they keep their original indices.
     var s: u32 = 0;
     for (s < img.section_count) {
@@ -558,9 +581,10 @@ fun build_weak_comdat_image(alloc: *Allocator, img: *of.ObjectImage,
     i = 0;
     for (i < img.reloc_count) { out.relocations[i] = img.relocations[i]; i = i + 1; }
 
-    # carve one COMDAT section per defined weak symbol and rebind the symbol and
-    # its in-extent relocations into it.
+    # carve one COMDAT section per defined weak symbol, rebind the symbol into it,
+    # and record the carve geometry for the relocation pass below.
     var next_sec: u32 = img.section_count;
+    var w: u32 = 0;
     i = 0;
     for (i < img.symbol_count) {
         if (!is_defined_weak(?img.symbols[i], img.section_count)) { i = i + 1; cnt; }
@@ -584,23 +608,38 @@ fun build_weak_comdat_image(alloc: *Allocator, img: *of.ObjectImage,
         out.symbols[i].section = next_sec;
         out.symbols[i].offset = 0;
 
-        # move every relocation whose patch site lies in the carved extent into the
-        # new section, rebasing its offset to the section start.
-        var ri: u32 = 0;
-        for (ri < img.reloc_count) {
-            if (img.relocations[ri].section == src_sec) {
-                val ro: u32 = img.relocations[ri].offset;
-                if (ro >= start && ro < start + extent) {
-                    out.relocations[ri].section = next_sec;
-                    out.relocations[ri].offset = ro - start;
-                }
-            }
-            ri = ri + 1;
-        }
+        w_srcsec[w] = src_sec;
+        w_start[w]  = start;
+        w_extent[w] = extent;
+        w_newsec[w] = next_sec;
 
         next_sec = next_sec + 1;
+        w = w + 1;
         i = i + 1;
     }
+
+    # move each relocation whose patch site lies in a carved extent into the new
+    # COMDAT section, rebasing its offset. one pass over the relocations, each
+    # against the carve table, breaking on the single carve that can contain it
+    # (carve extents are disjoint). a relocation in a section with no carves exits
+    # the inner loop without a match.
+    var ri: u32 = 0;
+    for (ri < img.reloc_count) {
+        val rsec: u32 = img.relocations[ri].section;
+        val ro: u32 = img.relocations[ri].offset;
+        var k: u32 = 0;
+        for (k < weak_n) {
+            if (w_srcsec[k] == rsec && ro >= w_start[k] && ro < w_start[k] + w_extent[k]) {
+                out.relocations[ri].section = w_newsec[k];
+                out.relocations[ri].offset = ro - w_start[k];
+                brk;
+            }
+            k = k + 1;
+        }
+        ri = ri + 1;
+    }
+
+    if (carve != nil) { deallocate[u32](alloc, carve, (weak_n * 4)::usize); }
 
     ret ok[bool, str](true);
 }
@@ -905,13 +944,13 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) Result[
 
         # aux section record: length (4), nreloc (2), nlnno (2), checksum (4),
         # number (2), selection (1), 3 bytes pad. zeroed by the buffer alloc;
-        # fill length and reloc count. a COMDAT section also fills `number` with its
-        # own 1-based section index and `selection` with SELECT_ANY — the encoding
-        # the reader maps to a defined weak symbol.
+        # fill length and reloc count. a COMDAT section sets `selection` to
+        # SELECT_ANY — the encoding the reader maps to a defined weak symbol. the
+        # `number` field stays 0: it names the associated section only for an
+        # associative COMDAT, which SELECT_ANY is not.
         write_u32_le(buf, sym_off, img.sections[s].len);
         write_u16_le(buf, sym_off + 4, count_relocs_for_section(img, s)::u16);
         if (comdat != nil && comdat[s]) {
-            write_u16_le(buf, sym_off + 12, (s + 1)::u16);
             buf[sym_off + 14] = IMAGE_COMDAT_SELECT_ANY;
         }
         sym_off = sym_off + SYMBOL_SIZE;
@@ -1025,6 +1064,29 @@ fun read_symbol_name(buf: *u8, so: usize, strtab_base: usize) str {
         ret (buf::usize + strtab_base + off::usize)::str;
     }
     ret framed_name(buf, so);
+}
+
+# whether the COMDAT for 1-based section `sec_num` selects SELECT_ANY — the
+# duplicate-keep policy the mach writer emits for a defined weak symbol. COMDAT is
+# only a container; the actual policy lives in the section symbol's aux record
+# (`Selection`). a SELECT_NODUPLICATES / SELECT_SAME_SIZE COMDAT from a foreign
+# toolchain is a strong definition and must not be weakened, so the reader gates
+# the weak flag on SELECT_ANY here. the section symbol is the STATIC record whose
+# SectionNumber is `sec_num` and value 0, carrying an aux section-definition
+# record; returns false when no such record is found.
+fun comdat_select_any_for_section(buf: *u8, symtab_off: usize, num_records: u32, sec_num: u32) bool {
+    var ri: u32 = 0;
+    for (ri < num_records) {
+        val so: usize = symtab_off + ri::usize * SYMBOL_SIZE;
+        val aux: u8 = buf[so + 17];
+        if (buf[so + 16] == IMAGE_SYM_CLASS_STATIC && aux >= 1
+            && read_u16_le(buf, so + 12)::u32 == sec_num && read_u32_le(buf, so + 8) == 0) {
+            val ax: usize = so + SYMBOL_SIZE;
+            ret buf[ax + 14] == IMAGE_COMDAT_SELECT_ANY;
+        }
+        ri = ri + 1 + aux::u32;
+    }
+    ret false;
 }
 
 # coff_parse_object: parse a relocatable x86-64 COFF object into an ObjectImage.
@@ -1184,17 +1246,21 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
             out.symbols[idx].section = of.SECTION_EXTERNAL;
         }
 
-        # a global definition in a COMDAT section is a defined weak symbol: the
-        # writer carries each defined weak symbol in its own LNK_COMDAT section,
-        # mirroring ELF STB_WEAK. recover the weak flag so `collect_symbols`
+        # a global definition in a SELECT_ANY COMDAT section is a defined weak
+        # symbol: the writer carries each defined weak symbol in its own LNK_COMDAT
+        # section, mirroring ELF STB_WEAK. recover the weak flag so `collect_symbols`
         # deduplicates the duplicate instances instead of rejecting them as a
-        # multiple definition. the section's own STATIC section symbol also lives in
-        # the COMDAT section but is not global, so the weak attribute (meaningful
-        # only for a global) is not applied to it.
+        # multiple definition. gated on SELECT_ANY (not just LNK_COMDAT) so a
+        # strong-keep COMDAT from a foreign toolchain (e.g. SELECT_NODUPLICATES) is
+        # not weakened. the section's own STATIC section symbol also lives in the
+        # COMDAT section but is not global, so the weak attribute (meaningful only
+        # for a global) is not applied to it.
         if ((flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
             && out.symbols[idx].section != of.SECTION_EXTERNAL) {
             val dsh: usize = secthdr_base + out.symbols[idx].section::usize * SECTION_HEADER_SIZE;
-            if ((read_u32_le(buf, dsh + 36) & IMAGE_SCN_LNK_COMDAT) != 0) {
+            if ((read_u32_le(buf, dsh + 36) & IMAGE_SCN_LNK_COMDAT) != 0
+                && comdat_select_any_for_section(buf, symtab_off, num_records,
+                                                 out.symbols[idx].section + 1)) {
                 flags = flags | of.SYM_OBJ_FLAG_WEAK;
             }
         }
