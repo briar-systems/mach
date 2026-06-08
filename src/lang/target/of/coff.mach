@@ -23,12 +23,13 @@
 # `coff_emit_dyn_exec` (with a dynamic-import plan). The writer frames the
 # linker's load segments in a PE container: DOS header + stub, PE signature, COFF
 # file header, the PE32+ optional header (ImageBase, SectionAlignment/
-# FileAlignment, console subsystem, data directories), the section table, the
+# FileAlignment, console subsystem, data directories), the section table, and the
 # `.idata` import directory + IAT built from the `of.DynamicInfo` plan (one
 # IMAGE_IMPORT_DESCRIPTOR per DynLib, an ILT/IAT thunk per DynImport, a hint/name
-# table), and `.pdata`/`.xdata` exception/unwind tables (image-relative via
-# `RK_ADDR32NB`). Each `PltFixup` call site is redirected to an import stub that
-# jumps through the IAT slot the loader fills.
+# table). Each `PltFixup` call site is redirected to an import stub that jumps
+# through the IAT slot the loader fills. Exception/unwind tables (`.pdata`/
+# `.xdata`) are not emitted yet: correct unwind needs per-function prologue codes
+# the back end does not produce, and wrong unwind metadata is worse than none.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -110,12 +111,10 @@ val IMAGE_FILE_LARGE_ADDRESS_AWARE: u16 = 0x0020;
 # the loader reads to map and start the image.
 val PE32PLUS_MAGIC:                u16 = 0x020B;
 val IMAGE_SUBSYSTEM_WINDOWS_CUI:   u16 = 3;
-val IMAGE_DLLCHARACTERISTICS_NX_COMPAT:    u16 = 0x0100;
-val IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
+val IMAGE_DLLCHARACTERISTICS_NX_COMPAT: u16 = 0x0100;
 
 # data-directory indices in the PE32+ optional header.
 val IMAGE_DIRECTORY_ENTRY_IMPORT:    u32 = 1;
-val IMAGE_DIRECTORY_ENTRY_EXCEPTION: u32 = 3;
 val IMAGE_DIRECTORY_ENTRY_IAT:       u32 = 12;
 val IMAGE_NUMBEROF_DIRECTORY_ENTRIES: u32 = 16;
 
@@ -131,19 +130,11 @@ val PE_SECTION_ALIGN:    u64   = 0x1000;
 val PE_FILE_ALIGN:       u64   = 0x200;
 val PE_IMAGE_BASE_RESERVE: u64 = 0x10000;
 
-# a PE section-header characteristics for a synthesized section (idata/pdata/xdata
-# are initialized read-only data; the loader needs no alignment field on these).
-val IMAGE_SCN_ALIGN_NONE: u32 = 0;
-
 # one IMAGE_IMPORT_DESCRIPTOR (20 bytes) and one PE thunk slot (8 bytes, PE32+).
 val IMPORT_DESCRIPTOR_SIZE: usize = 20;
 val THUNK_SIZE:             usize = 8;
 # the per-function import stub: `jmp qword [rip+disp32]` through the IAT slot.
 val IMPORT_STUB_SIZE:       usize = 6;
-# one .pdata RUNTIME_FUNCTION (3 image-relative dwords) and the minimal .xdata
-# UNWIND_INFO (version 1, no unwind codes) it points at.
-val RUNTIME_FUNCTION_SIZE:  usize = 12;
-val UNWIND_INFO_SIZE:       usize = 4;
 
 # write a u16 little-endian into a buffer.
 fun write_u16_le(buf: *u8, offset: usize, value: u16) {
@@ -409,6 +400,43 @@ fun find_sym_index(img: *of.ObjectImage, sym_remap: *u32, name: intern.StrId) u3
     ret 0;
 }
 
+# reloc_field_width: the byte width of a relocation's patched field for the COFF
+# x86-64 machine type the abstract kind maps to — 8 for ADDR64, 4 for every other
+# (REL32 / ADDR32 / ADDR32NB).
+fun reloc_field_width(kind: intern.StrId) usize {
+    if (reloc_type_for(kind) == IMAGE_REL_AMD64_ADDR64) { ret 8; }
+    ret 4;
+}
+
+# validate_reloc_ranges: check every relocation's patch field lies fully within
+# its defining section. the addend fold (and any in-place patch) writes the field
+# in the section bytes, so an out-of-range offset would corrupt unrelated bytes;
+# this fails the link with a clear error instead. a relocation against an external
+# / out-of-range section index, or against a bss section (no raw bytes), is also
+# rejected — there is no field to patch.
+# ---
+# img: the object image whose relocations are validated
+# ret: ok(true) when every relocation is in range, or an error string
+fun validate_reloc_ranges(img: *of.ObjectImage) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < img.reloc_count) {
+        val rsec: u32 = img.relocations[i].section;
+        if (rsec >= img.section_count) {
+            ret err[bool, str]("coff: relocation references an out-of-range section");
+        }
+        if (!section_has_data(img.sections[rsec].kind)) {
+            ret err[bool, str]("coff: relocation patches a section with no raw data");
+        }
+        val w:   usize = reloc_field_width(img.relocations[i].kind);
+        val off: usize = img.relocations[i].offset::usize;
+        if (off + w > img.sections[rsec].len::usize) {
+            ret err[bool, str]("coff: relocation offset out of range for its section");
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
 # coff_emit_object: serialize an ObjectImage to a relocatable x86-64 COFF object.
 #
 # the format-writer entry installed in the COFF `of.OfVTable`. lays out the file
@@ -433,6 +461,14 @@ fun coff_emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R
 
     val num_secs: u32 = img.section_count;
     val num_syms: u32 = img.symbol_count;
+
+    # validate every relocation's patch field lies within its section before any
+    # output is built — the addend fold writes the in-place value here (COFF has no
+    # RELA addend), so a malformed offset must fail the link, not write out of
+    # bounds. checked up front (nothing is allocated yet) so the error path needs
+    # no cleanup. ADDR64 patches an 8-byte field; every other kind a 4-byte field.
+    val vr: Result[bool, str] = validate_reloc_ranges(img);
+    if (is_err[bool, str](vr)) { ret err[bool, str](unwrap_err[bool, str](vr)); }
 
     # file layout: header, section headers, per-section raw data, per-section
     # relocation arrays, symbol table, string table. compute each region's file
@@ -589,14 +625,13 @@ fun coff_emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R
     # value the linker adds to the resolved target, so it must live in the section
     # bytes. (a `call sym` carries addend -4 for the pc32 field-to-next-ip
     # correction; without folding it the call would land 4 bytes past its target.)
+    # `validate_reloc_ranges` already proved every field lies within its section.
     var ridx: u32 = 0;
     for (ridx < img.reloc_count) {
         val rsec: u32 = img.relocations[ridx].section;
-        if (rsec < num_secs && section_has_data(img.sections[rsec].kind)
-            && img.relocations[ridx].addend != 0) {
+        if (img.relocations[ridx].addend != 0) {
             val fld: usize = data_offsets[rsec] + img.relocations[ridx].offset::usize;
-            val w: u16 = reloc_type_for(img.relocations[ridx].kind);
-            if (w == IMAGE_REL_AMD64_ADDR64) {
+            if (reloc_field_width(img.relocations[ridx].kind) == 8) {
                 write_u64_le(buf, fld, read_u64_le(buf, fld) + img.relocations[ridx].addend::u64);
             } or {
                 write_u32_le(buf, fld, read_u32_le(buf, fld) + (img.relocations[ridx].addend::u64)::u32);
@@ -989,11 +1024,14 @@ rec PeSection {
 }
 
 # the resolved layout of a PE32+ image: ImageBase, the header span, the linker's
-# load segments, and the synthesized sections (import stubs, .idata, .pdata,
-# .xdata). every RVA is relative to ImageBase and every file offset is absolute.
-# computed once from the segment and import counts, then consumed by the write
-# pass. `sec_total` counts the section-table entries (linker segments + stubs +
-# idata + pdata + xdata, the synthesized ones present only when used).
+# load segments, and the synthesized sections (import stubs, .idata). every RVA is
+# relative to ImageBase and every file offset is absolute. computed once from the
+# segment and import counts, then consumed by the write pass. `sec_total` counts
+# the section-table entries (linker segments + stubs + idata, the synthesized ones
+# present only when used). exception/unwind tables (.pdata/.xdata) are not emitted:
+# the back end does not yet produce per-function prologue unwind codes, and
+# structurally-valid-but-wrong unwind metadata is worse than none — see the
+# follow-up issue for proper per-function .pdata/.xdata.
 # ---
 # image_base:    PE ImageBase (64 KiB-aligned, one reserve region below seg[0])
 # header_size:   SizeOfHeaders (file-aligned span of DOS+PE+section headers)
@@ -1001,8 +1039,6 @@ rec PeSection {
 # seg_secs:      per-linker-segment PeSection (rva/file_off/sizes)
 # stub_sec:      the executable import-stub section (one `jmp [IAT]` per import)
 # idata_sec:     the import directory + ILT/IAT + hint-name + dll-name section
-# pdata_sec:     the .pdata RUNTIME_FUNCTION table (image-relative)
-# xdata_sec:     the .xdata UNWIND_INFO the .pdata entries point at
 # iat_rva/size:  the IAT span within .idata (the IAT data directory)
 # import_dir_*:  the import directory span within .idata (the IMPORT directory)
 # nimp:          number of function imports (IAT/stub/hint-name entries)
@@ -1014,8 +1050,6 @@ rec PeLayout {
     seg_secs:    *PeSection;
     stub_sec:    PeSection;
     idata_sec:   PeSection;
-    pdata_sec:   PeSection;
-    xdata_sec:   PeSection;
     iat_rva:     u64;
     iat_size:    u64;
     import_dir_rva:  u64;
@@ -1023,7 +1057,6 @@ rec PeLayout {
     nimp:        u32;
     have_stub:   bool;
     have_idata:  bool;
-    have_pdata:  bool;
     sec_total:   u32;
 }
 
@@ -1049,13 +1082,18 @@ fun name_len_z(id: intern.StrId) usize {
 }
 
 # pe_section_flags: the PE section-header characteristics for a linker load segment,
-# from its format-neutral SEG_FLAG_* permission bits. code is execute+read; a
-# writable segment is read+write; otherwise read-only. every loadable segment is
-# at least readable so the loader maps it.
-fun pe_section_flags(flags: u32) u32 {
+# from its format-neutral SEG_FLAG_* permission bits and whether it carries file
+# bytes. code is execute+read; a segment with no file bytes (the linker's bss:
+# `filesz == 0` / `bytes == nil`) is uninitialized data, kept read+write; a
+# writable data segment is initialized read+write; otherwise initialized
+# read-only. every loadable segment is at least readable so the loader maps it.
+fun pe_section_flags(flags: u32, has_data: bool) u32 {
     var c: u32 = 0;
     if ((flags & of.SEG_FLAG_EXECUTE) != 0) {
         c = c | IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    }
+    or (!has_data) {
+        c = c | IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
     }
     or ((flags & of.SEG_FLAG_WRITE) != 0) {
         c = c | IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
@@ -1085,7 +1123,6 @@ fun compute_pe_layout(lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
     lay.seg_secs  = seg_secs;
     lay.have_stub = lay.nimp > 0;
     lay.have_idata = dyn != nil && (dyn.lib_count > 0 || dyn.import_count > 0);
-    lay.have_pdata = seg_count > 0;
 
     # ImageBase: 64 KiB-aligned, one reserve region below the first segment's page
     # so the PE headers map at RVA 0 and segment[0] sits at RVA >= the reserve.
@@ -1093,12 +1130,11 @@ fun compute_pe_layout(lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
     if (seg_count > 0) { seg0 = segs[0].vaddr; }
     lay.image_base = (seg0 & ~(0xFFFF::u64)) - PE_IMAGE_BASE_RESERVE;
 
-    # the synthesized section count: the linker segments, then stub/idata/pdata/
-    # xdata when present.
+    # the synthesized section count: the linker segments, then the stub and idata
+    # sections when present.
     var nsec: u32 = seg_count;
     if (lay.have_stub)  { nsec = nsec + 1; }
     if (lay.have_idata) { nsec = nsec + 1; }
-    if (lay.have_pdata) { nsec = nsec + 2; }
     lay.sec_total = nsec;
 
     # headers: DOS header + PE signature + COFF header + optional header + the
@@ -1188,45 +1224,8 @@ fun compute_pe_layout(lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
         rva = rva + align_up_u64(ioff::u64, PE_SECTION_ALIGN);
     }
 
-    # the .xdata (UNWIND_INFO) and .pdata (RUNTIME_FUNCTION table) for the code
-    # segments — one RUNTIME_FUNCTION spanning each executable segment, all
-    # pointing at a single trivial UNWIND_INFO (no prologue unwind codes).
-    if (lay.have_pdata) {
-        rva = align_up_u64(rva, PE_SECTION_ALIGN);
-        lay.xdata_sec.rva       = rva;
-        lay.xdata_sec.vsize     = UNWIND_INFO_SIZE::u64;
-        lay.xdata_sec.file_off  = file_off;
-        lay.xdata_sec.file_size = align_up(UNWIND_INFO_SIZE, PE_FILE_ALIGN::usize);
-        file_off = file_off + lay.xdata_sec.file_size;
-        rva = rva + align_up_u64(UNWIND_INFO_SIZE::u64, PE_SECTION_ALIGN);
-
-        rva = align_up_u64(rva, PE_SECTION_ALIGN);
-        val nrf: usize = pdata_func_count(segs, seg_count);
-        lay.pdata_sec.rva       = rva;
-        lay.pdata_sec.vsize     = (nrf * RUNTIME_FUNCTION_SIZE)::u64;
-        lay.pdata_sec.file_off  = file_off;
-        lay.pdata_sec.file_size = align_up(nrf * RUNTIME_FUNCTION_SIZE, PE_FILE_ALIGN::usize);
-        file_off = file_off + lay.pdata_sec.file_size;
-        rva = rva + align_up_u64((nrf * RUNTIME_FUNCTION_SIZE)::u64, PE_SECTION_ALIGN);
-        # a code image with no executable segment carries no .pdata entries.
-        if (nrf == 0) { lay.have_pdata = false; lay.sec_total = lay.sec_total - 2; }
-    }
-
     lay.image_size = align_up_u64(rva, PE_SECTION_ALIGN);
     ret file_off;
-}
-
-# pdata_func_count: the number of RUNTIME_FUNCTION entries — one per executable
-# linker segment. exception/unwind tables describe code regions; a non-executable
-# segment carries none.
-fun pdata_func_count(segs: *of.LoadSegment, seg_count: u32) usize {
-    var n: usize = 0;
-    var i: u32 = 0;
-    for (i < seg_count) {
-        if ((segs[i].flags & of.SEG_FLAG_EXECUTE) != 0) { n = n + 1; }
-        i = i + 1;
-    }
-    ret n;
 }
 
 # coff_emit_exec: serialize laid-out load segments into a static PE32+ executable.
@@ -1272,11 +1271,11 @@ fun coff_emit_dyn_exec(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.Load
 
 # write_pe: the shared PE32+ executable writer behind `coff_emit_exec` (static)
 # and `coff_emit_dyn_exec` (with imports). lays out the headers, the linker
-# segments, and — when a dynamic plan is present — the import stubs, `.idata`
-# import directory + IAT, and `.pdata`/`.xdata` unwind tables, then writes the DOS
-# header + stub, PE signature, COFF file header, PE32+ optional header (ImageBase,
-# alignments, entry, subsystem, data directories), the section table, and every
-# section's bytes. each `PltFixup` call site is redirected to its import stub.
+# segments, and — when a dynamic plan is present — the import stubs and the
+# `.idata` import directory + IAT, then writes the DOS header + stub, PE signature,
+# COFF file header, PE32+ optional header (ImageBase, alignments, entry, subsystem,
+# data directories), the section table, and every section's bytes. each `PltFixup`
+# call site is redirected to its import stub.
 fun write_pe(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
              seg_count: u32, entry: u64, dyn: *of.DynamicInfo,
              fixups: *of.PltFixup, fixup_count: u32, path: *u8) Result[bool, str] {
@@ -1311,11 +1310,10 @@ fun write_pe(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
         li = li + 1;
     }
 
-    # synthesized sections: import stubs, the import directory + IAT, and the
-    # unwind tables. these own the IAT slot RVAs the stubs jump through.
+    # synthesized sections: the import directory + IAT, then the import stubs that
+    # jump through the IAT slots the import section owns.
     if (lay.have_idata) { write_pe_imports(buf, ?lay, dyn); }
     if (lay.have_stub)  { write_pe_stubs(buf, ?lay, dyn); }
-    if (lay.have_pdata) { write_pe_unwind(buf, ?lay, segs, seg_count); }
 
     # redirect each import call site to its stub (a non-import call site never
     # reaches here — the linker only records fixups for function imports).
@@ -1508,33 +1506,6 @@ fun write_pe_stubs(buf: *u8, lay: *PeLayout, dyn: *of.DynamicInfo) {
     }
 }
 
-# write_pe_unwind: write the `.xdata` UNWIND_INFO and the `.pdata` RUNTIME_FUNCTION
-# table. one RUNTIME_FUNCTION spans each executable linker segment (begin/end
-# image-relative addresses) and points at a single trivial UNWIND_INFO (version 1,
-# zero unwind codes), enough for the OS loader to accept the functions and walk
-# the stack without a registered prologue.
-fun write_pe_unwind(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32) {
-    # UNWIND_INFO: Version(3)=1 | Flags(5)=0, SizeOfProlog=0, CountOfCodes=0,
-    # FrameRegister=0 | FrameOffset=0.
-    val x: usize = lay.xdata_sec.file_off;
-    buf[x] = 1; buf[x + 1] = 0; buf[x + 2] = 0; buf[x + 3] = 0;
-    val unwind_rva: u64 = lay.xdata_sec.rva;
-
-    var pos: usize = lay.pdata_sec.file_off;
-    var i: u32 = 0;
-    for (i < seg_count) {
-        if ((segs[i].flags & of.SEG_FLAG_EXECUTE) != 0) {
-            val begin: u64 = lay.seg_secs[i].rva;
-            val end:   u64 = lay.seg_secs[i].rva + segs[i].memsz::u64;
-            write_u32_le(buf, pos, begin::u32);
-            write_u32_le(buf, pos + 4, end::u32);
-            write_u32_le(buf, pos + 8, unwind_rva::u32);
-            pos = pos + RUNTIME_FUNCTION_SIZE;
-        }
-        i = i + 1;
-    }
-}
-
 # patch_pe_fixups: rewrite each import call site (a `PltFixup` the linker could not
 # resolve) to a pc-relative call to the import's stub. the fixup records the
 # segment + offset of the 4-byte displacement field and the patch-site vaddr; the
@@ -1575,13 +1546,16 @@ fun patch_pe_fixups(buf: *u8, lay: *PeLayout, dyn: *of.DynamicInfo, fixups: *of.
 
 # write_pe_section_header: write one 40-byte IMAGE_SECTION_HEADER at `pos` — the
 # 8-byte name, virtual size + RVA, raw size + file offset, zeroed reloc/line-number
-# fields, and the characteristics.
+# fields, and the characteristics. a zero-raw-size section (an uninitialized/bss
+# segment, no file bytes) carries PointerToRawData = 0: a non-zero file pointer on
+# a zero-size section is malformed and some loaders reject it.
 fun write_pe_section_header(buf: *u8, pos: usize, name: str, sec: *PeSection, chars: u32) {
     write_inline_name(buf, pos, name);
     write_u32_le(buf, pos + 8, sec.vsize::u32);
     write_u32_le(buf, pos + 12, sec.rva::u32);
     write_u32_le(buf, pos + 16, sec.file_size::u32);
-    write_u32_le(buf, pos + 20, sec.file_off::u32);
+    if (sec.file_size > 0) { write_u32_le(buf, pos + 20, sec.file_off::u32); }
+    or { write_u32_le(buf, pos + 20, 0); }
     write_u32_le(buf, pos + 24, 0);
     write_u32_le(buf, pos + 28, 0);
     write_u16_le(buf, pos + 32, 0);
@@ -1676,17 +1650,19 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
         write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_IAT::usize * DATA_DIR_SIZE, lay.iat_rva::u32);
         write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_IAT::usize * DATA_DIR_SIZE + 4, lay.iat_size::u32);
     }
-    # EXCEPTION directory (index 3) — the .pdata RUNTIME_FUNCTION table.
-    if (lay.have_pdata) {
-        write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE, lay.pdata_sec.rva::u32);
-        write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE + 4, lay.pdata_sec.vsize::u32);
-    }
+    # no EXCEPTION directory: the .pdata/.xdata unwind tables are not emitted (the
+    # back end does not yet produce per-function prologue unwind codes), so real
+    # Windows treats these frames as leaf functions rather than unwinding with
+    # wrong metadata. see the follow-up issue for proper per-function unwind.
 
     # the section table follows the optional header.
     var pos: usize = oh + OPTIONAL_HEADER_SIZE;
     li = 0;
     for (li < seg_count) {
-        write_pe_section_header(buf, pos, segment_name(segs[li].flags), ?lay.seg_secs[li], pe_section_flags(segs[li].flags));
+        # a segment the linker carries with no file bytes is bss (uninitialized).
+        val has_data: bool = segs[li].bytes != nil && segs[li].filesz > 0;
+        write_pe_section_header(buf, pos, segment_name(segs[li].flags, has_data),
+            ?lay.seg_secs[li], pe_section_flags(segs[li].flags, has_data));
         pos = pos + SECTION_HEADER_SIZE;
         li = li + 1;
     }
@@ -1700,21 +1676,15 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
         pos = pos + SECTION_HEADER_SIZE;
     }
-    if (lay.have_pdata) {
-        write_pe_section_header(buf, pos, ".xdata", ?lay.xdata_sec,
-            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
-        pos = pos + SECTION_HEADER_SIZE;
-        write_pe_section_header(buf, pos, ".pdata", ?lay.pdata_sec,
-            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
-        pos = pos + SECTION_HEADER_SIZE;
-    }
 }
 
 # segment_name: the conventional PE section name for a linker load segment from
-# its permission bits — `.text` for code, `.data` for writable, `.rdata` for
-# read-only.
-fun segment_name(flags: u32) str {
+# its permission bits and whether it carries file bytes — `.text` for code,
+# `.bss` for a no-file-bytes (uninitialized) segment, `.data` for writable,
+# `.rdata` for read-only.
+fun segment_name(flags: u32, has_data: bool) str {
     if ((flags & of.SEG_FLAG_EXECUTE) != 0) { ret ".text"; }
+    if (!has_data)                          { ret ".bss"; }
     if ((flags & of.SEG_FLAG_WRITE) != 0)   { ret ".data"; }
     ret ".rdata";
 }
@@ -1834,17 +1804,18 @@ test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
     var isa_vt: isa.IsaVTable;
     isa_vt.id = isa.ARCH_X86_64;
 
-    # build a small image: .text (8 bytes, one fn `main`), .data (4 bytes, one
-    # global `gvar`), .bss (16 zero bytes), plus an undefined extern `puts`.
-    var text_bytes: [8]u8;
+    # build a small image: .text (16 bytes, one fn `main` — sized so the abs64
+    # patch field at offset 4 fits within the section), .data (4 bytes, one global
+    # `gvar`), .bss (16 zero bytes), plus an undefined extern `puts`.
+    var text_bytes: [16]u8;
     var k: usize = 0;
-    for (k < 8) { text_bytes[k] = (0xE8 + k)::u8; k = k + 1; }
+    for (k < 16) { text_bytes[k] = (0xE8 + k)::u8; k = k + 1; }
     var data_bytes: [4]u8;
     data_bytes[0] = 0xDE; data_bytes[1] = 0xAD; data_bytes[2] = 0xBE; data_bytes[3] = 0xEF;
 
     var secs: [3]of.Section;
     secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
-    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
     secs[1].name = t_intern(?i, ".data"); secs[1].kind = of.SK_DATA;
     secs[1].bytes = ?data_bytes[0]; secs[1].len = 4; secs[1].align = 4;
     secs[2].name = t_intern(?i, ".bss"); secs[2].kind = of.SK_BSS;
@@ -1852,7 +1823,7 @@ test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
 
     var syms: [3]of.Symbol;
     syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
-    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
     syms[1].name = t_intern(?i, "gvar"); syms[1].section = 1; syms[1].offset = 0;
     syms[1].size = 4; syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
     syms[2].name = t_intern(?i, "puts"); syms[2].section = of.SECTION_EXTERNAL;
@@ -1917,7 +1888,7 @@ test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
     if (out.reloc_count != 2) { ret 1; }
 
     # section kinds and lengths survive.
-    if (out.sections[0].kind != of.SK_TEXT || out.sections[0].len != 8) { ret 1; }
+    if (out.sections[0].kind != of.SK_TEXT || out.sections[0].len != 16) { ret 1; }
     if (out.sections[1].kind != of.SK_DATA || out.sections[1].len != 4) { ret 1; }
     if (out.sections[2].kind != of.SK_BSS  || out.sections[2].len != 16) { ret 1; }
     if (out.sections[0].align != 16 || out.sections[1].align != 4) { ret 1; }
@@ -1925,7 +1896,7 @@ test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
     # .text bytes survive; .bss carries none.
     if (out.sections[0].bytes == nil) { ret 1; }
     k = 0;
-    for (k < 8) {
+    for (k < 16) {
         if (out.sections[0].bytes[k] != (0xE8 + k)::u8) { ret 1; }
         k = k + 1;
     }
@@ -2033,6 +2004,73 @@ test "coff: long section and symbol names round-trip through the string table" {
         si = si + 1;
     }
     if (!saw) { ret 1; }
+
+    ret 0;
+}
+
+test "coff: emit_exec writes a well-formed PE32+ header" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # a single executable load segment at the windows base, plus a writable data
+    # segment one page up. emit a static PE (no imports) and assert the header.
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }  # nop sled
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { data_bytes[k] = 0; k = k + 1; }
+
+    val base:  u64 = 0x140000000;
+    val entry: u64 = base + 4;
+
+    var segs: [2]of.LoadSegment;
+    segs[0].vaddr = base; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+    segs[1].vaddr = base + 0x1000; segs[1].filesz = 8; segs[1].memsz = 8;
+    segs[1].flags = of.SEG_FLAG_READ | of.SEG_FLAG_WRITE; segs[1].bytes = ?data_bytes[0];
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_pe");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: Result[bool, str] = coff_emit_exec(?alloc, ?isa_vt, ?segs[0], 2, entry, fs.temp_path(?tf)::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    # the DOS header: 'MZ' magic, e_lfanew (offset 0x3C) -> the PE signature.
+    if (buf.data[0] != 'M' || buf.data[1] != 'Z') { ret 1; }
+    val pe_off: usize = read_u32_le(buf.data, 0x3C)::usize;
+    # the PE signature 'PE\0\0'.
+    if (buf.data[pe_off] != 'P' || buf.data[pe_off + 1] != 'E'
+        || buf.data[pe_off + 2] != 0 || buf.data[pe_off + 3] != 0) { ret 1; }
+
+    # the COFF file header: Machine = AMD64, two sections (no imports / unwind).
+    val ch: usize = pe_off + PE_SIGNATURE_SIZE;
+    if (read_u16_le(buf.data, ch) != IMAGE_FILE_MACHINE_AMD64) { ret 1; }
+    if (read_u16_le(buf.data, ch + 2) != 2) { ret 1; }
+
+    # the PE32+ optional header: Magic = 0x20B, subsystem = console.
+    val oh: usize = ch + COFF_HEADER_SIZE;
+    if (read_u16_le(buf.data, oh) != PE32PLUS_MAGIC) { ret 1; }
+    if (read_u16_le(buf.data, oh + 68) != IMAGE_SUBSYSTEM_WINDOWS_CUI) { ret 1; }
+
+    # AddressOfEntryPoint is the entry vaddr relative to ImageBase, and ImageBase
+    # is the 64 KiB-reserved base — so entry maps back to the provided address.
+    val image_base: u64 = read_u64_le(buf.data, oh + 24);
+    val entry_rva:  u32 = read_u32_le(buf.data, oh + 16);
+    if (image_base + entry_rva::u64 != entry) { ret 1; }
 
     ret 0;
 }
