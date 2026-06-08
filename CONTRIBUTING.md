@@ -132,7 +132,7 @@ mach/
 
 The standard library lives in a separate repository ([mach-std](https://github.com/octalide/mach-std)) and is included as a git submodule under `dep/mach-std/`.
 
-The bootstrap compiler lives in a separate repository ([mach-boot](https://github.com/octalide/mach-boot)) and is automatically downloaded during the build.
+Building from source uses an existing `mach` (the latest release) — see [Getting Started](#getting-started). The original bootstrap seed ([mach-boot](https://github.com/octalide/mach-boot)) is no longer part of the build; it remains only as a from-scratch cold-start hatch.
 
 ---
 

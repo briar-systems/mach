@@ -56,6 +56,7 @@ use intern: mach.lang.intern;
 use isa:    mach.lang.target.isa;
 use x64:    mach.lang.target.isa.x64;
 use target: mach.lang.target.resolved;
+use abi:    mach.lang.target.abi;
 use of:     mach.lang.target.of;
 use mir:    mach.lang.be.codegen.mir;
 use enc:    mach.lang.be.codegen.encode;
@@ -1160,6 +1161,32 @@ fun encode_imul(mi: *isa.Inst, buf: *ByteBuf) i32 {
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_IMM) {
         val imm: i64 = src1.imm;
+        # the imm forms here -- `imul r64, r/m64, imm8` (6B) and `imul r64, r/m64,
+        # imm32` (69) -- carry at most a 32-bit field that the CPU sign-extends to
+        # the operand width; x86-64 has no `imul r64, imm64`. a 64-bit immediate
+        # outside signed-imm32 range cannot be encoded directly without corrupting
+        # its value, so it is materialized into the reserved R11 scratch and
+        # re-encoded as the two-operand register form `imul dst, r11` (dst = dst *
+        # r11), mirroring the same split in encode_alu_imm.
+        if (size == 8 && (imm < -2147483648 || imm > 2147483647)) {
+            val scratch: i32 = x64.R11;
+            var ld: isa.Inst;
+            zero_inst(?ld);
+            ld.opcode = x64.MOV;
+            ld.dst    = isa.make_reg(scratch, 8);
+            ld.src1   = isa.make_imm(imm, 8);
+            ld.size   = 8;
+            encode_mov(?ld, buf);
+            var rr: isa.Inst;
+            zero_inst(?rr);
+            rr.opcode = x64.IMUL;
+            rr.dst    = isa.make_reg(dst.reg, size);
+            rr.src1   = isa.make_reg(scratch, size);
+            rr.size   = size;
+            rr.flags  = flags;
+            encode_imul(?rr, buf);
+            ret (buf.len - start)::i32;
+        }
         if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
         emit_rex_if_needed(buf, w, dst.reg, dst.reg);
         if (imm >= -128 && imm <= 127) {
@@ -2000,15 +2027,19 @@ pub fun encode_inst(mi: *isa.Inst, buf: *ByteBuf) i32 {
     ret 0;
 }
 
-# count_callee_saved: count how many callee-saved GPRs the mask selects (used to
-# size the callee-save spill area in the prologue).
-fun count_callee_saved(mask: u32) i32 {
+# count_callee_saved: count how many callee-saved GPRs the mask selects from the
+# active ABI's saveable set (`x64.callee_saved_gp_list`), used to size the
+# callee-save spill area in the prologue. ABI-driven, so win64's wider set
+# (RDI/RSI) is sized correctly, not just the SysV {RBX, R12–R15}.
+fun count_callee_saved(abi_vt: *abi.AbiVTable, mask: u32) i32 {
+    var list: [16]i32;
+    val ln: i32 = x64.callee_saved_gp_list(abi_vt, ?list[0]);
     var n: i32 = 0;
-    if ((mask & (1 << x64.RBX::u32)) != 0) { n = n + 1; }
-    if ((mask & (1 << x64.R12::u32)) != 0) { n = n + 1; }
-    if ((mask & (1 << x64.R13::u32)) != 0) { n = n + 1; }
-    if ((mask & (1 << x64.R14::u32)) != 0) { n = n + 1; }
-    if ((mask & (1 << x64.R15::u32)) != 0) { n = n + 1; }
+    var i: i32 = 0;
+    for (i < ln) {
+        if ((mask & (1::u32 << list[i]::u32)) != 0) { n = n + 1; }
+        i = i + 1;
+    }
     ret n;
 }
 
@@ -2023,8 +2054,8 @@ fun count_callee_saved(mask: u32) i32 {
 # the outgoing region as the bottommost slice puts its base exactly at the new
 # RSP, so a caller's `[rsp + off]` argument store lands in it, and keeping every
 # addend 16-aligned holds RSP 16-byte aligned at each call boundary.
-fun frame_total(frame_size: u32, callee_mask: u32, outgoing_size: u32) usize {
-    val callee_space: usize = count_callee_saved(callee_mask)::usize * 8;
+fun frame_total(abi_vt: *abi.AbiVTable, frame_size: u32, callee_mask: u32, outgoing_size: u32) usize {
+    val callee_space: usize = count_callee_saved(abi_vt, callee_mask)::usize * 8;
     var base: usize = frame_size::usize + callee_space;
     if (base > 0 && (base & 15) != 0) { base = (base + 15) & ~15::usize; }
     ret base + outgoing_size::usize;
@@ -2063,14 +2094,17 @@ fun emit_frame_load(st: *EncodeState, reg: i32, disp: i32) {
     emit_inst(st, ?mi);
 }
 
-# emit_prologue: encode the standard System V x86-64 function prologue into the
-# `.text` byte sink.
+# emit_prologue: encode the standard x86-64 function prologue into the `.text`
+# byte sink.
 #
 # pushes RBP, sets RBP = RSP, subtracts the 16-byte-aligned local frame plus
 # callee-save space plus the outgoing-argument region from RSP, and stores each
 # selected callee-saved register in the region just below the local slots
-# (`[rbp - (frame_size + 8*k)]`). the callee-save offsets are frame_size-relative
-# and so are unaffected by the outgoing region reserved below them.
+# (`[rbp - (frame_size + 8*k)]`). the registers saved are exactly the active ABI's
+# saveable GP set (`x64.callee_saved_gp_list`) the allocator used — under win64
+# this includes RDI/RSI, which a caller may legitimately hold a value in across
+# the call. the callee-save offsets are frame_size-relative and so are unaffected
+# by the outgoing region reserved below them.
 # ---
 # st:            encoder state whose byte sink the prologue bytes are appended to
 # frame_size:    size of the local frame in bytes (locals + va-save; pre callee-save)
@@ -2094,7 +2128,7 @@ fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_
     mov_rbp.flags  = x64.FLAG_REX_W;
     emit_inst(st, ?mov_rbp);
 
-    val total: usize = frame_total(frame_size, callee_mask, outgoing_size);
+    val total: usize = frame_total(st.abi, frame_size, callee_mask, outgoing_size);
     if (total > 0) {
         var sub_rsp: isa.Inst;
         zero_inst(?sub_rsp);
@@ -2106,30 +2140,43 @@ fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_
         emit_inst(st, ?sub_rsp);
     }
 
+    var list: [16]i32;
+    val ln: i32 = x64.callee_saved_gp_list(st.abi, ?list[0]);
     var coff: i32 = frame_size::i32 + 8;
-    if ((callee_mask & (1 << x64.RBX::u32)) != 0) { emit_frame_store(st, x64.RBX, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << x64.R12::u32)) != 0) { emit_frame_store(st, x64.R12, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << x64.R13::u32)) != 0) { emit_frame_store(st, x64.R13, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << x64.R14::u32)) != 0) { emit_frame_store(st, x64.R14, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << x64.R15::u32)) != 0) { emit_frame_store(st, x64.R15, -coff); coff = coff + 8; }
+    var i: i32 = 0;
+    for (i < ln) {
+        if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
+            emit_frame_store(st, list[i], -coff);
+            coff = coff + 8;
+        }
+        i = i + 1;
+    }
 }
 
-# emit_epilogue: encode the standard System V x86-64 function epilogue into the
-# `.text` byte sink, before a RET.
+# emit_epilogue: encode the standard x86-64 function epilogue into the `.text`
+# byte sink, before a RET.
 #
 # restores each selected callee-saved register, resets RSP = RBP, and pops RBP.
-# the RET itself is encoded from the MIR_RET instruction that follows.
+# the registers and their frame offsets mirror `emit_prologue` exactly (the same
+# forward `x64.callee_saved_gp_list` order at the same frame-size-relative slots),
+# so each is reloaded from the slot it was saved into. the RET itself is encoded
+# from the MIR_RET instruction that follows.
 # ---
 # st:          encoder state whose byte sink the epilogue bytes are appended to
 # frame_size:  size of the local frame in bytes (locals + va-save; pre callee-save)
 # callee_mask: bitmask of callee-saved GP registers regalloc assigned
 fun emit_epilogue(st: *EncodeState, frame_size: u32, callee_mask: u32) {
+    var list: [16]i32;
+    val ln: i32 = x64.callee_saved_gp_list(st.abi, ?list[0]);
     var coff: i32 = frame_size::i32 + 8;
-    if ((callee_mask & (1 << x64.RBX::u32)) != 0) { emit_frame_load(st, x64.RBX, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << x64.R12::u32)) != 0) { emit_frame_load(st, x64.R12, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << x64.R13::u32)) != 0) { emit_frame_load(st, x64.R13, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << x64.R14::u32)) != 0) { emit_frame_load(st, x64.R14, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << x64.R15::u32)) != 0) { emit_frame_load(st, x64.R15, -coff); coff = coff + 8; }
+    var i: i32 = 0;
+    for (i < ln) {
+        if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
+            emit_frame_load(st, list[i], -coff);
+            coff = coff + 8;
+        }
+        i = i + 1;
+    }
 
     var mov_rsp: isa.Inst;
     zero_inst(?mov_rsp);
@@ -2315,6 +2362,8 @@ rec BlockOffset {
 # block_cap:    capacity of `blocks`
 # rk_pc32:      interned "pc32" relocation-kind name from the target's `of` vtable
 # rk_abs64:     interned "abs64" relocation-kind name from the target's `of` vtable
+# rk_addr32nb:  interned image-relative kind name (COFF ADDR32NB), or STR_NIL on
+#               formats without one (ELF/Mach-O); names PE unwind-table relocs
 # interner:     session interner; resolves inline-asm `{name}` binding names and
 #               interns symbol names referenced from inline asm into relocations
 rec EncodeState {
@@ -2334,7 +2383,9 @@ rec EncodeState {
     block_cap:   u32;
     rk_pc32:     intern.StrId;
     rk_abs64:    intern.StrId;
+    rk_addr32nb: intern.StrId;
     interner:    *intern.Interner;
+    abi:         *abi.AbiVTable;
 }
 
 # encode_x64: encode a fully-resolved MIR module into `.text` bytes, symbol
@@ -2375,7 +2426,9 @@ pub fun encode_x64(alloc: *Allocator, tgt: *target.Target, m: *mir.MirModule) Re
     st.block_cap   = 0;
     st.rk_pc32     = reloc_kind_name(tgt, of.RK_PC32);
     st.rk_abs64    = reloc_kind_name(tgt, of.RK_ABS64);
+    st.rk_addr32nb = reloc_kind_name(tgt, of.RK_ADDR32NB);
     st.interner    = m.interner;
+    st.abi         = tgt.abi;
 
     var fi: u32 = 0;
     for (fi < m.function_len) {

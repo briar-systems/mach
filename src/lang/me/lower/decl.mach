@@ -443,10 +443,10 @@ fun terminate_orphan_blocks(ctx: *lower.LowerContext) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
-# lowers a module-level `val` / `var` into an IR `Global`. a comptime-
-# evaluable initialiser becomes a constant `Value`; a non-comptime
-# initialiser is emitted as logic into the module's lazily created init
-# function, with the global holding a zero placeholder until then.
+# lowers a module-level `val` / `var` into an IR `Global`. the initialiser is
+# folded to a constant `Value` by `fold_global_init`; a global with no
+# initialiser holds a zero placeholder. a present-but-non-constant initialiser
+# is a hard error — there is no runtime init-synthesis pass to fill it later.
 # ---
 # ctx:    the context
 # did:    the binding's DeclId
@@ -468,55 +468,9 @@ pub fun lower_global(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, 
 
     var init_val: value.Value = value.const_int(0, gty);
     if (d.data.bind.init != aid.EXPR_NIL) {
-        # a struct / array / `str`-into-pointer initializer is a compile-time
-        # constant aggregate the frontend `comptime.eval` cannot fold to a
-        # scalar: its bytes (and the relocations for its pointer leaves) are laid
-        # out here and emitted as initialized data, never a zeroed .bss slot.
-        # tried before the scalar path so a `val X: str = "..."` becomes a real
-        # pointer-with-relocation instead of the bytes inline.
-        val agg: Result[Option[value.Value], str] = constagg.try_const_aggregate(ctx, d.data.bind.init, gty);
-        if (is_err[Option[value.Value], str](agg)) { ret err[bool, str](unwrap_err[Option[value.Value], str](agg)); }
-        val agg_opt: Option[value.Value] = unwrap_ok[Option[value.Value], str](agg);
-
-        if (is_some[value.Value](agg_opt)) {
-            init_val = unwrap[value.Value](agg_opt);
-        } or {
-            # the aggregate folder did not apply; try the scalar comptime fold.
-            # only evaluated here (not unconditionally above) so a folded aggregate
-            # never pays for a wasted comptime.eval pass.
-            val cv: Option[comptime.CTValue] = try_comptime(ctx, d.data.bind.init);
-            if (is_some[comptime.CTValue](cv)) {
-                val vr: Result[value.Value, str] = expr.const_value_of(ctx, d.data.bind.init, unwrap[comptime.CTValue](cv));
-                if (is_err[value.Value, str](vr)) { ret err[bool, str](unwrap_err[value.Value, str](vr)); }
-                init_val = unwrap_ok[value.Value, str](vr);
-            } or {
-                # a type-introspection intrinsic ($size_of/$align_of/$offset_of) is a
-                # comptime constant the frontend `comptime.eval` cannot fold — record
-                # layout is backend-owned. fold it here via the same path function
-                # bodies use, so `val X = $size_of(T)` becomes a real .rodata constant
-                # instead of a zero placeholder the read-only global can never receive.
-                val ie_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, d.data.bind.init);
-                if (is_some[*aexpr.Expr](ie_opt)) {
-                    val ie: *aexpr.Expr = unwrap[*aexpr.Expr](ie_opt);
-                    if (ie.kind == aexpr.EXPR_KIND_CALL) {
-                        val intr: Option[Result[value.Value, str]] =
-                            expr.try_lower_comptime_intrinsic(ctx, d.data.bind.init, ie);
-                        if (is_some[Result[value.Value, str]](intr)) {
-                            val ir2: Result[value.Value, str] = unwrap[Result[value.Value, str]](intr);
-                            if (is_err[value.Value, str](ir2)) { ret err[bool, str](unwrap_err[value.Value, str](ir2)); }
-                            init_val = unwrap_ok[value.Value, str](ir2);
-                        }
-                    }
-                }
-            }
-        }
-        # an initialiser that none of the paths above could fold stays a zero
-        # placeholder and lands in `.bss`. there is no runtime init-synthesis pass
-        # to fill it later (`ir.Module.init_fn` is never populated), so any
-        # initialiser that must carry data — a struct / array / `str` aggregate,
-        # or a const-address pointer (`?G`, a function name) — is deliberately
-        # routed through `constagg.try_const_aggregate` above to be emitted as
-        # initialised data instead of reaching this fall-through.
+        val fr: Result[value.Value, str] = fold_global_init(ctx, d.data.bind.init, gty);
+        if (is_err[value.Value, str](fr)) { ret err[bool, str](unwrap_err[value.Value, str](fr)); }
+        init_val = unwrap_ok[value.Value, str](fr);
     }
 
     var g: ir.Global;
@@ -531,6 +485,59 @@ pub fun lower_global(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, 
     val ai: Result[u32, str] = append_global(ctx, g);
     if (is_err[u32, str](ai)) { ret err[bool, str](unwrap_err[u32, str](ai)); }
     ret ok[bool, str](true);
+}
+
+# folds a global initialiser to the constant `Value` the global is emitted
+# with. a global must be a constant expression: there is no runtime
+# init-synthesis pass (`ir.Module.init_fn` is never populated), so an
+# initialiser that no constant path can fold is a hard error rather than a
+# silent zero placeholder. the folders are tried in turn:
+#   1. an aggregate (struct / array / `str`-into-pointer) whose bytes and
+#      pointer relocations are laid out as initialised data; tried first so a
+#      `val X: str = "..."` becomes a pointer-with-relocation, not inline bytes.
+#   2. a scalar comptime constant the frontend `comptime.eval` folds.
+#   3. a `nil` pointer initialiser, materialised as the null constant.
+#   4. a constant scalar cast (`<const>::T`, including chains), folded with the
+#      same width / sign semantics `lower_cast` lowers.
+#   5. a type-introspection intrinsic (`$size_of` / `$align_of` / `$offset_of`)
+#      whose layout is backend-owned, folded via the path function bodies use.
+# ---
+# ctx: the context
+# eid: the initialiser expression
+# gty: the global's IR type
+# ret: the constant initialiser Value, or an error
+fun fold_global_init(ctx: *lower.LowerContext, eid: aid.ExprId, gty: ir_type.IrTypeId) Result[value.Value, str] {
+    val agg: Result[Option[value.Value], str] = constagg.try_const_aggregate(ctx, eid, gty);
+    if (is_err[Option[value.Value], str](agg)) { ret err[value.Value, str](unwrap_err[Option[value.Value], str](agg)); }
+    val agg_opt: Option[value.Value] = unwrap_ok[Option[value.Value], str](agg);
+    if (is_some[value.Value](agg_opt)) { ret ok[value.Value, str](unwrap[value.Value](agg_opt)); }
+
+    # the aggregate folder did not apply; try the scalar comptime fold. only
+    # evaluated here (not unconditionally above) so a folded aggregate never pays
+    # for a wasted comptime.eval pass.
+    val cv: Option[comptime.CTValue] = try_comptime(ctx, eid);
+    if (is_some[comptime.CTValue](cv)) {
+        ret expr.const_value_of(ctx, eid, unwrap[comptime.CTValue](cv));
+    }
+
+    val ie_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
+    if (is_none[*aexpr.Expr](ie_opt)) { ret err[value.Value, str]("lower: global initialiser expression out of range"); }
+    val ie: *aexpr.Expr = unwrap[*aexpr.Expr](ie_opt);
+
+    # a `nil` pointer initialiser is a constant null. `comptime.eval` has no
+    # CTValue for nil and the aggregate folder routes it here, so materialise it
+    # as the null constant the global is emitted with.
+    if (ie.kind == aexpr.EXPR_KIND_LIT_NIL) { ret ok[value.Value, str](value.const_null(gty)); }
+
+    val cast: Option[Result[value.Value, str]] = expr.try_lower_comptime_cast(ctx, eid, ie);
+    if (is_some[Result[value.Value, str]](cast)) { ret unwrap[Result[value.Value, str]](cast); }
+
+    if (ie.kind == aexpr.EXPR_KIND_CALL) {
+        val intr: Option[Result[value.Value, str]] = expr.try_lower_comptime_intrinsic(ctx, eid, ie);
+        if (is_some[Result[value.Value, str]](intr)) { ret unwrap[Result[value.Value, str]](intr); }
+    }
+
+    ret err[value.Value, str]("lower: a global initialiser must be a constant expression");
 }
 
 # lowers a decl-scope `$if` chain: evaluates each arm's condition and

@@ -60,6 +60,10 @@ pub val RK_PLT32:    RelocKind = 2;
 pub val RK_GOTPCREL: RelocKind = 3;
 # 32-bit signed absolute (R_X86_64_32S).
 pub val RK_ABS32S:   RelocKind = 4;
+# 32-bit image-relative (IMAGE_REL_AMD64_ADDR32NB): the displacement of the
+# target from the PE image base, used by exception/unwind tables. ELF and
+# Mach-O have no equivalent and never emit it.
+pub val RK_ADDR32NB: RelocKind = 5;
 
 # object-symbol flags. combined as a bitmask in `Symbol.flags`.
 # ---
@@ -157,6 +161,81 @@ pub rec ObjectImage {
     reloc_count:   u32;
 }
 
+# one dynamic dependency of a linked image: a shared library that must be loaded
+# at run time (ELF `DT_NEEDED`, PE import-directory DLL, Mach-O `LC_LOAD_DYLIB`).
+# the linker collects one per shared-library link input; the format writer emits
+# it into the format's dependency list. format-neutral so PE/Mach-O reuse it.
+# ---
+# soname: interned shared-object name the loader resolves (e.g. "libc.so.6")
+pub rec DynLib {
+    soname: intern.StrId;
+}
+
+# one dynamic import: an undefined symbol satisfied at run time by a shared
+# library rather than by an in-graph definition. the linker creates one per
+# unresolved `ext` symbol when shared dependencies are present, instead of
+# erroring. the format writer turns each into a binding record (ELF
+# `.rela.plt`/`.dynsym`, PE `.idata` IAT slot, Mach-O dyld bind opcode) and, for
+# a function import, a call-thunk (ELF PLT stub) the linker points call sites at.
+# format-neutral so PE `.idata` and Mach-O dyld bind reuse the same model.
+# ---
+# symbol:    interned imported symbol name (the `ext` name, e.g. "getpid")
+# lib_index: index into the image's `DynLib` list of the providing library, or
+#            DYNLIB_ANY when the binding is left to the loader's global search
+# is_func:   true for a code (call) import needing a call-thunk; false for data
+pub rec DynImport {
+    symbol:    intern.StrId;
+    lib_index: u32;
+    is_func:   bool;
+}
+
+# sentinel `DynImport.lib_index` marking an import not pinned to a specific
+# dependency — the loader resolves it through its global symbol search.
+pub val DYNLIB_ANY: u32 = 0xFFFFFFFF;
+
+# the complete format-neutral plan for a dynamically-linked image: the shared
+# dependencies to record and the imports to bind. the linker builds this from the
+# unresolved `ext` symbols and the shared-library link inputs; a format's
+# `emit_dyn_exec` consumes it to lay out the format's dynamic-linking structures
+# (ELF `.dynamic`/PLT/GOT, PE `.idata`, Mach-O dyld info). when `lib_count` and
+# `import_count` are both zero the link is fully static and `emit_exec` is used.
+# ---
+# libs:         array of shared dependencies (DT_NEEDED order)
+# lib_count:    number of dependencies
+# imports:      array of imports to bind
+# import_count: number of imports
+# interp:       interned dynamic-loader path for PT_INTERP (e.g. the ELF interp),
+#               or intern.STR_NIL when the format embeds the loader differently
+pub rec DynamicInfo {
+    libs:         *DynLib;
+    lib_count:    u32;
+    imports:      *DynImport;
+    import_count: u32;
+    interp:       intern.StrId;
+}
+
+# one pc-relative call site the linker located that targets a dynamic import, to
+# be redirected to the import's call-thunk by `emit_dyn_exec`. the linker cannot
+# resolve it during relocation patching because the thunk's address is part of
+# the format's dynamic layout (ELF PLT), which the writer owns; it instead
+# records the patch site here and the writer fills in `S + A - P` once the thunk
+# is placed. `S` is the thunk vaddr; `A`/`P` are carried so the writer reproduces
+# the exact pc-relative displacement. format-neutral: PE/Mach-O reuse it to point
+# a call at an IAT/stub.
+# ---
+# seg_index:    index into the writer's segment array of the patched segment
+# seg_offset:   byte offset of the 4-byte pc-relative field within that segment
+# import_index: index into `DynamicInfo.imports` of the targeted import
+# patch_vaddr:  virtual address of the patch site (the `P` in `S + A - P`)
+# addend:       relocation addend (the `A`)
+pub rec PltFixup {
+    seg_index:    u32;
+    seg_offset:   u32;
+    import_index: u32;
+    patch_vaddr:  u64;
+    addend:       i64;
+}
+
 # one loadable segment of a static executable, in the format-neutral terms the
 # linker lays out and a format's `emit_exec` consumes. each segment maps a
 # contiguous run of bytes at a page-aligned virtual address; `memsz` exceeds
@@ -231,11 +310,35 @@ pub def ParserFn: fun(*Allocator, *u8, usize, *ObjectImage) Result[bool, str];
 # ret:   true on success, or an error string
 pub def ExecFn: fun(*Allocator, *isa.IsaVTable, *LoadSegment, u32, u64, *u8) Result[bool, str];
 
+# a dynamically-linked-executable writer: serializes the linker's laid-out load
+# segments into a dynamically-linked executable, framing the format's
+# dynamic-linking structures (ELF `PT_INTERP`/`.dynamic`/`.dynsym`/PLT/GOT, PE
+# `.idata`, Mach-O dyld info) around them. takes the same segments and entry as
+# `ExecFn` plus the `DynamicInfo` plan (dependencies + imports) and the call-site
+# fixups the linker could not resolve. the writer places each import's call-thunk
+# (ELF PLT stub) in its own layout, then patches every `PltFixup` to point at the
+# matching thunk. like the other writers it takes the `IsaVTable`, not the full
+# Target, to break the target↔object-format import cycle. used in place of
+# `emit_exec` when `DynamicInfo` carries any dependency or import.
+# ---
+# arg 0: allocator backing the writer's output buffer
+# arg 1: the instruction-set vtable describing the machine
+# arg 2: the loadable segments, in ascending virtual-address order
+# arg 3: number of load segments
+# arg 4: program entry-point virtual address
+# arg 5: the dynamic-link plan (dependencies, imports, interpreter)
+# arg 6: the import call-site fixups to redirect to call-thunks
+# arg 7: number of fixups
+# arg 8: null-terminated output file path
+# ret:   true on success, or an error string
+pub def DynExecFn: fun(*Allocator, *isa.IsaVTable, *LoadSegment, u32, u64,
+                       *DynamicInfo, *PltFixup, u32, *u8) Result[bool, str];
+
 # the object-format runtime-dispatch interface. exactly one of these exists
 # per format; the back end serializes through `emit_object`, the linker reads
-# through `parse_object` and writes executables through `emit_exec`, and all
-# consult `relocation_kinds` to map abstract relocations. it never branches on
-# `id`.
+# through `parse_object` and writes executables through `emit_exec` (or
+# `emit_dyn_exec` for a dynamic link), and all consult `relocation_kinds` to map
+# abstract relocations. it never branches on `id`.
 # ---
 # id:               object-format id (one of OF_*)
 # name:             interned format name ("elf", "coff", "macho")
@@ -243,6 +346,8 @@ pub def ExecFn: fun(*Allocator, *isa.IsaVTable, *LoadSegment, u32, u64, *u8) Res
 # emit_object:      serializes an ObjectImage to a relocatable object file
 # parse_object:     reads a relocatable object file into an ObjectImage
 # emit_exec:        serializes laid-out load segments into a static executable
+# emit_dyn_exec:    serializes them into a dynamically-linked executable, or nil
+#                   when the format has no dynamic-link writer yet
 # relocation_kinds: array mapping abstract RK_* kinds to machine types
 # relocation_count: number of relocation-kind entries
 pub rec OfVTable {
@@ -252,6 +357,7 @@ pub rec OfVTable {
     emit_object:      WriterFn;
     parse_object:     ParserFn;
     emit_exec:        ExecFn;
+    emit_dyn_exec:    DynExecFn;
     relocation_kinds: *RelocationKind;
     relocation_count: u32;
 }

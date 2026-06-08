@@ -871,10 +871,16 @@ rec LowerCtx {
     # GP argument register in `lower_params`; MIR_VREG_NIL otherwise. `lower_ret`
     # copies the returned aggregate into this storage and returns it in RAX.
     sret_vreg:   u32;
+    # va_active: true once the entry prologue has emitted a variadic save model for
+    # this function. `lower_va_start` / `lower_va_arg` reject a va intrinsic in a
+    # non-variadic function by this flag (not by `va_save_vreg`, which the home-area
+    # model leaves NIL since it saves into the caller's frame, not a local slot).
+    va_active: bool;
     # va_save_vreg: slot-key vreg owning the variadic register-save area (a
-    # SLOT_ALLOCA frame slot) for a variadic function definition; MIR_VREG_NIL for
-    # a non-variadic function. the entry prologue spills the incoming GP/FP
-    # argument registers into it and `lower_va_start` points the va_list there.
+    # SLOT_ALLOCA frame slot) under the SysV register-save model; MIR_VREG_NIL under
+    # the win64 home-area model and for a non-variadic function. the entry prologue
+    # spills the incoming GP/FP argument registers into it and `lower_va_start`
+    # points the va_list there.
     va_save_vreg: u32;
     # va_named_gp / va_named_fp: GP and FP argument registers consumed by the
     # function's fixed (named) parameters, so `va_start` seeds gp_offset / fp_offset
@@ -944,6 +950,7 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, interne
     ctx.instr_count = fn.instr_len;
     ctx.interner    = interner;
     ctx.sret_vreg   = MIR_VREG_NIL;
+    ctx.va_active    = false;
     ctx.va_save_vreg = MIR_VREG_NIL;
     ctx.va_named_gp  = 0;
     ctx.va_named_fp  = 0;
@@ -3056,6 +3063,24 @@ fun abi_gp_ret_reg(tgt: *target.Target, out: *i32) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
+# abi_va_model: the active ABI's variadic save model, read from `tgt.abi.va_model`.
+# the variadic prologue / va_start / va_arg expansion dispatch on `VaModel.kind`
+# (the register-save vs home-area model) so the mechanism stays ABI-agnostic and
+# the convention-specific facts live in the vtable. errors loudly when no ABI
+# exposes a va_model accessor (an unsupported convention).
+# ---
+# tgt: the active target
+# out: receives the convention's variadic save model on success
+# ret: ok(true) on success, or a loud error
+fun abi_va_model(tgt: *target.Target, out: *abi.VaModel) Result[bool, str] {
+    if (tgt.abi.va_model == nil) {
+        ret err[bool, str]("mir.lower_ir: ABI vtable exposes no variadic save model");
+    }
+    val model: sysv.VaModelFn = tgt.abi.va_model::sysv.VaModelFn;
+    @out = model();
+    ret ok[bool, str](true);
+}
+
 # value_is_float: true when an IR type is a floating-point scalar, so the ABI
 # classifier routes it through the FP register file.
 fun value_is_float(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool {
@@ -3213,7 +3238,10 @@ fun classify_signature(ctx: *LowerCtx, sig: ir_type.IrTypeId, ret_ty: ir_type.Ir
 
     var gp_used:   i32 = 0;
     var fp_used:   i32 = 0;
-    var stack_off: i64 = 0;
+    # outgoing stack arguments start above the ABI's caller shadow space (win64's
+    # 32-byte home region; 0 under SysV). a callee homes its register parameters
+    # into this region, so a stack argument placed below it would be clobbered.
+    var stack_off: i64 = ctx.tgt.abi.shadow_space::i64;
 
     # a CLASS_SRET return reserves the first GP argument register for the hidden
     # result-storage pointer, so the parameters classify against that reservation.
@@ -3934,31 +3962,25 @@ fun emit_alu3(ctx: *LowerCtx, mb: *MirBlock, op: MirOpcode, a: MirOperand, b: Mi
     ret ok[bool, str](true);
 }
 
-# emit_va_save_prologue: reserve the variadic register-save area and spill the
-# incoming GP/FP argument registers into it so `va_arg` can read them. the save
-# area is a SLOT_ALLOCA frame slot keyed on a fresh slot-key vreg (`va_save_vreg`),
-# sized by the active ABI's `va_save_size`. the six GP argument registers are
-# stored at offsets 0,8,..,40 and the eight FP argument registers at
-# `va_fp_save_offset()` + i*16 — matching the AMD64 `__va_list_tag` register-save
-# layout the `va_arg` field offsets index. the named-parameter GP/FP usage and the
-# first stack-argument offset are captured from the signature layout so
-# `va_start` can seed the cursors. all SysV register-file / layout facts are read
-# through `sysv` (its erased vtable casts and layout helpers), keeping the
-# expansion mechanism generic and the numbers in the ABI.
+# emit_va_save_prologue: emit the variadic-argument save prologue for the active
+# ABI's save model. captures the named-parameter register usage and first
+# stack-argument offset from the signature layout (the same oracle `lower_params`
+# walks), then dispatches on the model read from the ABI vtable: the register-save
+# model (SysV) reserves a frame-local save area and spills the GP/FP argument
+# files into it; the home-area model (win64) spills the integer argument registers
+# at/after the named parameters into the caller's home slots. the dispatch is on
+# `VaModel.kind`, never the convention id.
 fun emit_va_save_prologue(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
     val rok: Result[bool, str] = require_abi(ctx.tgt);
     if (is_err[bool, str](rok)) { ret rok; }
 
-    # the register-save area: one addressed alloca slot keyed on a slot-key vreg.
-    val skr: Result[u32, str] = new_vreg(ctx, REG_CLASS_GP);
-    if (is_err[u32, str](skr)) { ret err[bool, str](unwrap_err[u32, str](skr)); }
-    val sk: u32 = unwrap_ok[u32, str](skr);
-    val ar: Result[bool, str] = add_alloca_slot(ctx, sk, sysv.va_save_size(), 8);
-    if (is_err[bool, str](ar)) { ret ar; }
-    ctx.va_save_vreg = sk;
+    var model: abi.VaModel;
+    val mr: Result[bool, str] = abi_va_model(ctx.tgt, ?model);
+    if (is_err[bool, str](mr)) { ret mr; }
 
     # capture the named-parameter register usage and overflow base from the
-    # signature layout (the same oracle `lower_params` walks).
+    # signature layout (the same oracle `lower_params` walks). a CLASS_SRET return
+    # consumes the first GP argument register, so `va_named_gp` already counts it.
     val ret_ty: ir_type.IrTypeId = fn_return_type(ctx);
     var layout: abi.SigLayout;
     val cls: Result[bool, str] = classify_signature(ctx, ctx.fn.sig, ret_ty, ?layout);
@@ -3967,10 +3989,34 @@ fun emit_va_save_prologue(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
     ctx.va_named_fp     = layout.fp_used;
     ctx.va_overflow_off = 16 + layout.stack_off;
     sig_layout_free(ctx, ?layout);
+    ctx.va_active = true;
+
+    if (model.kind == abi.VA_MODEL_HOME) {
+        ret emit_va_save_home(ctx, mb, ?model);
+    }
+    ret emit_va_save_regsave(ctx, mb, ?model);
+}
+
+# emit_va_save_regsave: reserve the SysV register-save area and spill the incoming
+# GP/FP argument registers into it so `va_arg` can read them. the save area is a
+# SLOT_ALLOCA frame slot keyed on a fresh slot-key vreg (`va_save_vreg`), sized by
+# the active ABI's `va_save_size`. the GP argument registers are stored at offsets
+# 0,8,..,40 and the FP argument registers at `va_fp_save_offset()` + i*16 —
+# matching the AMD64 `__va_list_tag` register-save layout the `va_arg` field
+# offsets index. all SysV register-file / layout facts are read through `sysv` (its
+# erased vtable casts and layout helpers), keeping the mechanism generic.
+fun emit_va_save_regsave(ctx: *LowerCtx, mb: *MirBlock, model: *abi.VaModel) Result[bool, str] {
+    # the register-save area: one addressed alloca slot keyed on a slot-key vreg.
+    val skr: Result[u32, str] = new_vreg(ctx, REG_CLASS_GP);
+    if (is_err[u32, str](skr)) { ret err[bool, str](unwrap_err[u32, str](skr)); }
+    val sk: u32 = unwrap_ok[u32, str](skr);
+    val ar: Result[bool, str] = add_alloca_slot(ctx, sk, sysv.va_save_size(), 8);
+    if (is_err[bool, str](ar)) { ret ar; }
+    ctx.va_save_vreg = sk;
 
     # spill every GP argument register into its fixed save-area slot (0,8,..).
     var gi: i32 = 0;
-    for (gi < sysv.GP_PARAM_COUNT) {
+    for (gi < model.gp_save_count) {
         var greg: i32 = 0;
         val gr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, gi, ?greg);
         if (is_err[bool, str](gr)) { ret gr; }
@@ -3989,6 +4035,36 @@ fun emit_va_save_prologue(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
     # start; its count is the convention's FP argument-register file size.
     val sp: Result[bool, str] = emit_va_fp_save(ctx, mb, sk);
     if (is_err[bool, str](sp)) { ret sp; }
+    ret ok[bool, str](true);
+}
+
+# emit_va_save_home: spill the integer argument registers that hold UNNAMED
+# arguments into the caller's home/shadow space (win64). the home area sits just
+# above the saved frame pointer and return address (`model.home_base_off`,
+# `[rbp+16]`), one 8-byte slot per positional argument register (RCX/RDX/R8/R9);
+# the caller always reserves it. the named parameters already occupy the first
+# `va_named_gp + va_named_fp` positional slots (`lower_params` pre-colored them
+# from their registers), so this stores `slot_gp_reg(i)` into `[rbp + base + i*8]`
+# for each remaining positional slot, making the named and unnamed arguments one
+# contiguous stack array; `va_start` then seeds the va_list pointer just past the
+# named arguments. there is NO frame-local save area, so `va_save_vreg` stays
+# NIL and the frame reserves no va-save slot — the home spill targets the caller's
+# frame. a variadic float rides both its XMM register and the matching integer
+# register, so spilling the integer registers alone captures every unnamed
+# argument (`fp_save_count` is 0 for this model).
+fun emit_va_save_home(ctx: *LowerCtx, mb: *MirBlock, model: *abi.VaModel) Result[bool, str] {
+    val named: i32 = ctx.va_named_gp + ctx.va_named_fp;
+    val fp: u32 = ctx.tgt.arch.frame_ptr_reg::u32;
+    var si: i32 = named;
+    for (si < model.gp_save_count) {
+        var greg: i32 = 0;
+        val gr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, si, ?greg);
+        if (is_err[bool, str](gr)) { ret gr; }
+        val off: i64 = model.home_base_off + si::i64 * 8;
+        val st: Result[bool, str] = emit_store_to(ctx, mb, op_mem_preg(fp, off), op_preg(greg::u32));
+        if (is_err[bool, str](st)) { ret st; }
+        si = si + 1;
+    }
     ret ok[bool, str](true);
 }
 
@@ -4015,20 +4091,35 @@ fun emit_va_fp_save(ctx: *LowerCtx, mb: *MirBlock, save_vreg: u32) Result[bool, 
     ret push_instr(ctx, mb, mi);
 }
 
-# lower_va_start: expand `OP_VA_START [ap]` into the AMD64 `__va_list_tag`
-# initialization. with `ap` the va_list storage pointer, it writes:
+# lower_va_start: expand `OP_VA_START [ap]` for the active ABI's variadic save
+# model. dispatches on the model read from the ABI vtable: the register-save model
+# (SysV) initializes the four-field `__va_list_tag`; the home-area model (win64)
+# seeds the single va_list pointer just past the named arguments. the dispatch is
+# on `VaModel.kind`, never the convention id.
+fun lower_va_start(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bool, str] {
+    if (inst.operand_count == 0) {
+        ret err[bool, str]("mir.lower_ir: va_start with no va_list operand");
+    }
+    if (!ctx.va_active) {
+        ret err[bool, str]("mir.lower_ir: va_start in a non-variadic function");
+    }
+    var model: abi.VaModel;
+    val mr: Result[bool, str] = abi_va_model(ctx.tgt, ?model);
+    if (is_err[bool, str](mr)) { ret mr; }
+    if (model.kind == abi.VA_MODEL_HOME) {
+        ret lower_va_start_home(ctx, mb, inst, ?model);
+    }
+    ret lower_va_start_regsave(ctx, mb, inst);
+}
+
+# lower_va_start_regsave: initialize the SysV `__va_list_tag`. with `ap` the
+# va_list storage pointer, it writes:
 #   gp_offset         = named GP regs * 8   (cursor past the fixed params)
 #   fp_offset         = GP area size + named FP regs * 16
 #   reg_save_area     = &register-save slot
 #   overflow_arg_area = &first incoming stack argument (`[rbp + overflow_off]`)
 # all four fields at the SysV `VA_*` offsets the lowering and `va_arg` share.
-fun lower_va_start(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bool, str] {
-    if (inst.operand_count == 0) {
-        ret err[bool, str]("mir.lower_ir: va_start with no va_list operand");
-    }
-    if (ctx.va_save_vreg == MIR_VREG_NIL) {
-        ret err[bool, str]("mir.lower_ir: va_start in a non-variadic function");
-    }
+fun lower_va_start_regsave(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bool, str] {
     # base address of the va_list struct (the `ap` pointer operand).
     val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
 
@@ -4055,6 +4146,24 @@ fun lower_va_start(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Resu
     val lo: Result[bool, str] = emit_lea_slot(ctx, mb, op_mem_preg(fp, ctx.va_overflow_off), ?ovf);
     if (is_err[bool, str](lo)) { ret lo; }
     ret emit_store_to(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), op_vreg(ovf));
+}
+
+# lower_va_start_home: seed the win64 single-pointer va_list. the named and unnamed
+# arguments form one contiguous stack array starting at the caller's first home slot
+# (`[rbp + home_base_off]`, where `emit_va_save_home` spilled the integer argument
+# registers); the named parameters occupy the first `va_named_gp + va_named_fp`
+# positional slots, so the first unnamed argument is at `[rbp + home_base_off +
+# named*8]`. store that address into the va_list pointer (field offset 0); `va_arg`
+# then reads `arg_stride` bytes and advances the pointer.
+fun lower_va_start_home(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, model: *abi.VaModel) Result[bool, str] {
+    val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
+    val named: i32 = ctx.va_named_gp + ctx.va_named_fp;
+    val first_off: i64 = model.home_base_off + named::i64 * 8;
+    val fp: u32 = ctx.tgt.arch.frame_ptr_reg::u32;
+    var ap0: u32 = MIR_VREG_NIL;
+    val la: Result[bool, str] = emit_lea_slot(ctx, mb, op_mem_preg(fp, first_off), ?ap0);
+    if (is_err[bool, str](la)) { ret la; }
+    ret emit_store_to(ctx, mb, va_field_mem(apbase, 0), op_vreg(ap0));
 }
 
 # va_field_mem: form a memory operand addressing field `field_off` of a va_list
@@ -4097,14 +4206,26 @@ fun emit_store_imm(ctx: *LowerCtx, mb: *MirBlock, mem: MirOperand, imm: i64, wid
 #   result = load.T [addr]
 # a float result is handled by `lower_va_arg_fp` (the same branch-free select over
 # the fp_offset cursor / FP register-save region); an aggregate result is handled by
-# `lower_va_arg_aggregate` (the GP-cursor select plus a by-value copy).
+# `lower_va_arg_aggregate` (the GP-cursor select plus a by-value copy). under the
+# home-area model (win64) every result category — scalar, float, aggregate — walks
+# a single va_list pointer, so it routes to `lower_va_arg_home` before the SysV
+# category split. the dispatch is on `VaModel.kind`, never the convention id.
 fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.InstructionId) Result[bool, str] {
     if (inst.operand_count == 0) {
         ret err[bool, str]("mir.lower_ir: va_arg with no va_list operand");
     }
+    if (!ctx.va_active) {
+        ret err[bool, str]("mir.lower_ir: va_arg in a non-variadic function");
+    }
     val dst: u32 = result_vreg(ctx, iid);
     if (dst == MIR_VREG_NIL) {
         ret err[bool, str]("mir.lower_ir: va_arg defines no result vreg");
+    }
+    var vmodel: abi.VaModel;
+    val vmr: Result[bool, str] = abi_va_model(ctx.tgt, ?vmodel);
+    if (is_err[bool, str](vmr)) { ret vmr; }
+    if (vmodel.kind == abi.VA_MODEL_HOME) {
+        ret lower_va_arg_home(ctx, mb, inst, dst, ?vmodel);
     }
     if (value_is_float(ctx, inst.ty)) {
         ret lower_va_arg_fp(ctx, mb, inst, dst);
@@ -4441,6 +4562,88 @@ fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instructi
 
     # copy the aggregate's bytes from the selected source into the result storage.
     ret copy_aggregate(ctx, mb, op_mem_value(dst, 0), op_vreg(src), size);
+}
+
+# lower_va_arg_home: expand `OP_VA_ARG [ap]` under the win64 home-area model. the
+# named and unnamed arguments form one contiguous array of 8-byte stack slots; the
+# va_list is a single pointer (field offset 0) walking up it, one slot per argument
+# (`model.arg_stride`). every result category reads from the current slot and the
+# cursor advances by one slot:
+#   * a scalar / pointer / float occupies its slot by value — load `width` bytes
+#     (a variadic float was duplicated into the integer slot, so it is read here).
+#   * a 1/2/4/8-byte aggregate rides one slot by value — copy `size` bytes from the
+#     slot.
+#   * any other aggregate is passed by hidden reference — the slot holds a pointer;
+#     dereference it, then copy `size` bytes.
+# the aggregate's by-value vs by-reference shape is read from the ABI's `arg_passing`
+# classifier (a fresh register file), so the in-slot / pointer choice stays driven by
+# the vtable, not hard-coded here.
+fun lower_va_arg_home(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst: u32,
+                      model: *abi.VaModel) Result[bool, str] {
+    val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
+
+    # ap = the current slot pointer (va_list field 0).
+    var ap: u32 = MIR_VREG_NIL;
+    val la: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, 0), 8, ?ap);
+    if (is_err[bool, str](la)) { ret la; }
+
+    # advance the cursor by one slot and store it back before reading, so a later
+    # va_arg sees the next slot.
+    var next: u32 = MIR_VREG_NIL;
+    val ad: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(ap), op_imm(model.arg_stride), 8, ?next);
+    if (is_err[bool, str](ad)) { ret ad; }
+    val ws: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, 0), op_vreg(next), 8);
+    if (is_err[bool, str](ws)) { ret ws; }
+
+    if (value_is_aggregate(ctx, inst.ty)) {
+        val rok: Result[bool, str] = require_abi(ctx.tgt);
+        if (is_err[bool, str](rok)) { ret rok; }
+        val size:  u64 = ir_type.byte_size(ctx.types, inst.ty, ctx.tgt)::u64;
+        val align: u64 = ir_type.byte_align(ctx.types, inst.ty, ctx.tgt)::u64;
+
+        # classify the aggregate to learn whether the slot holds it by value or a
+        # hidden pointer to it.
+        val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
+        val slot: abi.ParamSlot = classify_arg(ctx.tgt.arch_id, 0, size, align, false, true, 0, 0);
+        val byref: bool = slot.class == abi.CLASS_BYREF;
+
+        # back the result vreg with caller-owned storage so downstream copies / stores
+        # / returns treat the aggregate by value.
+        val rs: Result[bool, str] = alloc_result_storage(ctx, mb, dst, size, ret_align(ctx, inst.ty));
+        if (is_err[bool, str](rs)) { ret rs; }
+
+        # the source is the slot itself for a by-value aggregate, or the pointer it
+        # holds for a by-reference aggregate.
+        var src: u32 = ap;
+        if (byref) {
+            var p: u32 = MIR_VREG_NIL;
+            val lp: Result[bool, str] = emit_load_w(ctx, mb, op_mem_value(ap, 0), 8, ?p);
+            if (is_err[bool, str](lp)) { ret lp; }
+            src = p;
+        }
+        ret copy_aggregate(ctx, mb, op_mem_value(dst, 0), op_vreg(src), size);
+    }
+
+    val w: u8 = op_width_of(ctx, inst.ty);
+    if (value_is_float(ctx, inst.ty)) {
+        # a variadic float was duplicated into its integer/stack slot; read it there
+        # with a float move so the value lands in the XMM-classed result vreg.
+        ret emit_fmov(ctx, mb, op_vreg(dst), op_mem_value(ap, 0), w);
+    }
+
+    # a scalar / pointer rides its slot by value: load `width` bytes into the result.
+    val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 2::usize);
+    if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
+    val ops: *MirOperand = unwrap_ok[*MirOperand, str](r);
+    ops[0] = op_vreg(dst);
+    ops[1] = op_mem_value(ap, 0);
+    var mi: MirInstr;
+    mi.opcode        = MIR_LOAD;
+    mi.operands      = ops;
+    mi.operand_count = 2;
+    mi.src_width     = w;
+    mi.width         = clamp_alu_width(w);
+    ret push_instr(ctx, mb, mi);
 }
 
 # emit_zext_to: zero-extend `src` (`src_w` bytes) into a fresh 8-byte GP vreg,

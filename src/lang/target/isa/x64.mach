@@ -29,6 +29,8 @@ use std.allocator.allocate;
 
 use intern: mach.lang.intern;
 use isa:    mach.lang.target.isa;
+use abi:    mach.lang.target.abi;
+use sysv:   mach.lang.target.abi.sysv;
 
 # general-purpose register ids. these are the canonical x86-64 GP register
 # numbers (matching the ModRM/REX encoding), used directly as `Operand.reg`
@@ -512,19 +514,63 @@ pub fun fp_reg_name(cid: i32) str {
     ret "???";
 }
 
-# count_callee_saved: number of callee-saved GP registers set in a clobber
-# mask. the SysV callee-saved GP set the back end may preserve is
-# {RBX, R12, R13, R14, R15} (RBP is handled by the frame pointer chain).
+# CALLEE_SAVED_GP_MAX: upper bound on the saveable GP callee-saved register list —
+# the whole GP file, so `callee_saved_gp_list`'s `out` buffer never overruns.
+pub val CALLEE_SAVED_GP_MAX: i32 = GP_COUNT;
+
+# callee_saved_gp_list: the ordered GP registers the prologue must spill, drawn
+# from the active ABI's callee-saved register file.
+#
+# reads the convention's callee-saved set through `abi.callee_saved` (SysV's
+# RBX/RBP/R12–R15, win64's wider RBX/RBP/RDI/RSI/RSP/R12–R15) and keeps only the
+# GP registers the frame must spill: RSP and RBP are excluded (the stack/frame
+# pointer chain preserves them) and the vector set is ignored. the result drives
+# the prologue stores, the epilogue reloads, and the callee-save frame sizing so
+# all three preserve exactly the registers the calling convention demands —
+# nothing about the SysV set is hard-coded here, so the win64 RSI/RDI registers
+# are saved when the allocator uses them. `out` must hold `CALLEE_SAVED_GP_MAX`.
 # ---
-# mask: bitmask of physical registers (bit N = register N)
-# ret:  count of callee-saved registers present in the mask
-fun count_callee_saved(mask: u32) i32 {
+# abi_vt: the active calling-convention vtable (its `callee_saved` file is read)
+# out:    caller-owned buffer of at least CALLEE_SAVED_GP_MAX register ids
+# ret:    the number of GP callee-saved register ids written
+pub fun callee_saved_gp_list(abi_vt: *abi.AbiVTable, out: *i32) i32 {
+    var file: [32]isa.Register;
+    val fill: sysv.RegFileFn = abi_vt.callee_saved::sysv.RegFileFn;
+    val total: i32 = fill(?file[0]);
+
     var n: i32 = 0;
-    if ((mask & (1 << RBX::u32)) != 0) { n = n + 1; }
-    if ((mask & (1 << R12::u32)) != 0) { n = n + 1; }
-    if ((mask & (1 << R13::u32)) != 0) { n = n + 1; }
-    if ((mask & (1 << R14::u32)) != 0) { n = n + 1; }
-    if ((mask & (1 << R15::u32)) != 0) { n = n + 1; }
+    var i: i32 = 0;
+    for (i < total && i < 32) {
+        val id: i32 = file[i].id;
+        # GP-only (raw 0–15 ids, class tag 0); the stack/frame pointers are spilled
+        # by the push-rbp / rsp-rbp frame discipline, never into a home slot.
+        if (isa.regid_class(id) == isa.REG_CLASS_ID_GP &&
+            id >= 0 && id < GP_COUNT &&
+            id != STACK_REG && id != FRAME_REG) {
+            out[n] = id;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# count_callee_saved: number of callee-saved GP registers the `mask` selects from
+# the active ABI's saveable set (`callee_saved_gp_list`). used to size the
+# callee-save home area in the prologue. driven by the ABI, never a hard-coded set.
+# ---
+# abi_vt: the active calling-convention vtable
+# mask:   bitmask of physical registers (bit N = register N)
+# ret:    count of callee-saved registers present in the mask
+fun count_callee_saved(abi_vt: *abi.AbiVTable, mask: u32) i32 {
+    var list: [16]i32;
+    val ln: i32 = callee_saved_gp_list(abi_vt, ?list[0]);
+    var n: i32 = 0;
+    var i: i32 = 0;
+    for (i < ln) {
+        if ((mask & (1::u32 << list[i]::u32)) != 0) { n = n + 1; }
+        i = i + 1;
+    }
     ret n;
 }
 
@@ -568,14 +614,15 @@ fun emit_frame_load(buf: *isa.InstBuf, reg: i32, base: i32, disp: i32) {
 #
 # pushes RBP, establishes the frame pointer (`mov rbp, rsp`), reserves the
 # frame and callee-saved spill space rounded up to 16-byte alignment, then
-# stores each preserved callee-saved register (RBX, R12–R15) into a
-# frame-pointer-relative home slot below the locals.
+# stores each preserved callee-saved register (the ABI's saveable GP set —
+# `callee_saved_gp_list`) into a frame-pointer-relative home slot below the locals.
 # ---
 # ctx:         ISA backend context (unused; accepted for call-site uniformity)
+# abi_vt:      active calling-convention vtable; supplies the callee-saved set
 # buf:         instruction buffer to append the prologue into
 # frame_size:  size of the local frame in bytes
 # callee_mask: bitmask of callee-saved registers to preserve
-pub fun emit_prologue(ctx: ptr, buf: *isa.InstBuf, frame_size: usize, callee_mask: u32) {
+pub fun emit_prologue(ctx: ptr, abi_vt: *abi.AbiVTable, buf: *isa.InstBuf, frame_size: usize, callee_mask: u32) {
     var push_rbp: isa.Inst;
     zero_inst(?push_rbp);
     push_rbp.opcode = PUSH;
@@ -592,7 +639,7 @@ pub fun emit_prologue(ctx: ptr, buf: *isa.InstBuf, frame_size: usize, callee_mas
     mov_rbp.flags  = FLAG_REX_W;
     isa.buf_append(buf, mov_rbp);
 
-    val callee_space: usize = count_callee_saved(callee_mask)::usize * 8;
+    val callee_space: usize = count_callee_saved(abi_vt, callee_mask)::usize * 8;
     var total: usize = frame_size + callee_space;
     if (total > 0 && (total & 15) != 0) { total = (total + 15) & ~15::usize; }
     if (total > 0) {
@@ -606,12 +653,17 @@ pub fun emit_prologue(ctx: ptr, buf: *isa.InstBuf, frame_size: usize, callee_mas
         isa.buf_append(buf, sub_rsp);
     }
 
+    var list: [16]i32;
+    val ln: i32 = callee_saved_gp_list(abi_vt, ?list[0]);
     var coff: i32 = frame_size::i32 + 8;
-    if ((callee_mask & (1 << RBX::u32)) != 0) { emit_frame_store(buf, RBX, FRAME_REG, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << R12::u32)) != 0) { emit_frame_store(buf, R12, FRAME_REG, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << R13::u32)) != 0) { emit_frame_store(buf, R13, FRAME_REG, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << R14::u32)) != 0) { emit_frame_store(buf, R14, FRAME_REG, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << R15::u32)) != 0) { emit_frame_store(buf, R15, FRAME_REG, -coff); coff = coff + 8; }
+    var i: i32 = 0;
+    for (i < ln) {
+        if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
+            emit_frame_store(buf, list[i], FRAME_REG, -coff);
+            coff = coff + 8;
+        }
+        i = i + 1;
+    }
 }
 
 # emit_epilogue: emit the standard x86-64 function epilogue.
@@ -621,16 +673,22 @@ pub fun emit_prologue(ctx: ptr, buf: *isa.InstBuf, frame_size: usize, callee_mas
 # `ret` after this sequence.
 # ---
 # ctx:         ISA backend context (unused; accepted for call-site uniformity)
+# abi_vt:      active calling-convention vtable; supplies the callee-saved set
 # buf:         instruction buffer to append the epilogue into
 # frame_size:  size of the local frame in bytes (matching the prologue)
 # callee_mask: bitmask of callee-saved registers that were preserved
-pub fun emit_epilogue(ctx: ptr, buf: *isa.InstBuf, frame_size: usize, callee_mask: u32) {
+pub fun emit_epilogue(ctx: ptr, abi_vt: *abi.AbiVTable, buf: *isa.InstBuf, frame_size: usize, callee_mask: u32) {
+    var list: [16]i32;
+    val ln: i32 = callee_saved_gp_list(abi_vt, ?list[0]);
     var coff: i32 = frame_size::i32 + 8;
-    if ((callee_mask & (1 << RBX::u32)) != 0) { emit_frame_load(buf, RBX, FRAME_REG, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << R12::u32)) != 0) { emit_frame_load(buf, R12, FRAME_REG, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << R13::u32)) != 0) { emit_frame_load(buf, R13, FRAME_REG, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << R14::u32)) != 0) { emit_frame_load(buf, R14, FRAME_REG, -coff); coff = coff + 8; }
-    if ((callee_mask & (1 << R15::u32)) != 0) { emit_frame_load(buf, R15, FRAME_REG, -coff); coff = coff + 8; }
+    var i: i32 = 0;
+    for (i < ln) {
+        if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
+            emit_frame_load(buf, list[i], FRAME_REG, -coff);
+            coff = coff + 8;
+        }
+        i = i + 1;
+    }
 
     var mov_rsp: isa.Inst;
     zero_inst(?mov_rsp);

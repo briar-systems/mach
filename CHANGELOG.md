@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-06-08
+
+Tooling and cross-compilation release. Mach can now emit Windows executables,
+link dynamically, manage dependencies, and answer editor queries — while the
+Linux self-host continues to build to a byte-identical fixpoint.
+
+### Added
+
+- **Windows cross-compilation** for `x86_64-windows`: the Microsoft x64 calling
+  convention (win64 ABI), a COFF/PE object and executable writer, and kernel32
+  import linking. Mach builds runnable Windows `.exe`s. (Running the compiler
+  itself natively on Windows is in progress for a later release.)
+- **ELF dynamic linking**: link against shared libraries via `-l`/`-L` and
+  `[targets.*].libs`, with a real PLT/GOT and `DT_NEEDED`/`PT_INTERP`.
+- **External linking and static archives**: link prebuilt `.o`/`.a` inputs; a
+  Unix `ar` archive reader.
+- **`mach dep`**: git-based dependency management (`add`/`remove`/`sync`/`vendor`)
+  with a `mach.lock`.
+- **`mach check`**: single-file diagnostics with no project or link step.
+- **Per-target optimization levels** via the manifest, overridable on the CLI.
+- **Editor query surface** (`mach.lang.editor`): single-file/unsaved-buffer
+  open, parse, resolve, and diagnostics for tooling and language servers.
+
+### Fixed
+
+- `fwd` re-exports now resolve against the dependency set correctly.
+- x86-64 `imul` by a constant outside signed-imm32 range no longer truncates to
+  the low 32 bits (silent miscompile of large-constant multiplies).
+- A global `val` initialized from a constant cast no longer silently lowers to
+  zero; a non-foldable global initializer is now a hard error.
+- Several win64 codegen fixes (shadow space, variadic definitions, callee-saved
+  register preservation) and a COFF weak-symbol round-trip.
+
 ## [1.0.0] - 2026-06-06
 
 First stable release of Mach: a self-hosting, dependency-free native compiler
