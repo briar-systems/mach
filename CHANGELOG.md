@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-06-09
+
+Patch release focused on project scaffolding correctness.
+
+### Fixed
+
+- `mach init` now scaffolds a fully buildable project out of the box:
+  - writes complete `mach.toml` defaults with `linux`/`windows`/`darwin` targets
+  - includes `mach-std` in `[deps.mach-std]`
+  - writes a standard-library hello world entry module
+  - fetches `dep/mach-std` during init so `mach build .` works immediately
+
 ## [1.1.0] - 2026-06-08
 
 Tooling and cross-compilation release. Mach can now emit Windows executables,

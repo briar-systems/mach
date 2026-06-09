@@ -239,22 +239,21 @@ mach init [dir] [options]
 ```
 
 Scaffolds a new project in `[dir]` (default: the current directory). Writes a
-minimal `mach.toml` with a `[project]` block and a `[targets.host]` entry
-matching the running compiler, a starter source file, and an empty `dep/`
-directory. Refuses to overwrite an existing `mach.toml` unless `--force`.
+complete `mach.toml` with a `[project]` block, default targets for
+`linux`/`windows`/`darwin` (on the host ISA), a `[deps.mach-std]` dependency, a
+starter source file, and `dep/mach-std/` cloned from the declared ref. Refuses
+to overwrite an existing `mach.toml` unless `--force`.
 
 | Flag           | Value | Effect |
 |----------------|-------|--------|
 | `--name <name>`| name  | project id (default: the directory base name) |
 | `--force`      | —     | scaffold even when a `mach.toml` already exists |
-| `--lib`        | —     | library layout: write `src/lib.mach` instead of `src/main.mach`, and omit `entrypoint` from the manifest |
+| `--lib`        | —     | library layout: write `src/lib.mach` instead of `src/main.mach`, and scaffold targets in `mode = "library"` with `entrypoint = "lib.mach"` |
 
 The first non-flag argument after `init` is the target directory.
 
-> The scaffolded manifest omits the `binary` key (and, with `--lib`, the
-> `entrypoint` key too) — both of which a build requires. A scaffolded project
-> therefore needs its `[targets.host]` entry completed before `mach build`
-> succeeds. See [manifest.md](manifest.md) for the required keys.
+`mach init` scaffolds a buildable project directly. For a default binary
+scaffold, `mach build .` links and runs without further manifest edits.
 
 Exit codes: `0` ok, `1` user error, `2` internal error.
 
