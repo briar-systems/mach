@@ -1101,9 +1101,11 @@ fun framed_name(buf: *u8, off: usize) str {
 
 # read a section-header name: an inline 8-byte name, or a "/offset" reference
 # into the string table (decimal offset after the leading slash). the long form
-# returns a pointer into the string table; the short form is framed and
-# null-terminated through the scratch buffer.
-fun read_section_name(buf: *u8, sh: usize, strtab_base: usize) str {
+# is validated through `bin.cstr_at` — its offset must land inside the buffer and
+# the name must be terminated before the end — so a hostile offset errors rather
+# than interning off the end. the short form is framed (within the already-bounded
+# section-header region) and null-terminated through the scratch buffer.
+fun read_section_name(buf: *u8, buf_size: usize, sh: usize, strtab_base: usize) Result[str, str] {
     if (buf[sh] == '/') {
         var off: u32 = 0;
         var i: usize = 1;
@@ -1112,19 +1114,21 @@ fun read_section_name(buf: *u8, sh: usize, strtab_base: usize) str {
             if (c >= '0' && c <= '9') { off = off * 10 + (c - '0')::u32; }
             i = i + 1;
         }
-        ret (buf::usize + strtab_base + off::usize)::str;
+        ret bin.cstr_at(buf, buf_size, strtab_base + off::usize);
     }
-    ret framed_name(buf, sh);
+    ret ok[str, str](framed_name(buf, sh));
 }
 
 # read a symbol-record name: inline when the first four name bytes are non-zero,
-# otherwise a 4-byte string-table offset stored in the second name word.
-fun read_symbol_name(buf: *u8, so: usize, strtab_base: usize) str {
+# otherwise a 4-byte string-table offset stored in the second name word. the long
+# form is bounds-checked through `bin.cstr_at`; the inline form is framed within
+# the already-bounded symbol-table region.
+fun read_symbol_name(buf: *u8, buf_size: usize, so: usize, strtab_base: usize) Result[str, str] {
     if (bin.read_u32_le(buf, so) == 0) {
         val off: u32 = bin.read_u32_le(buf, so + 4);
-        ret (buf::usize + strtab_base + off::usize)::str;
+        ret bin.cstr_at(buf, buf_size, strtab_base + off::usize);
     }
-    ret framed_name(buf, so);
+    ret ok[str, str](framed_name(buf, so));
 }
 
 # whether the COMDAT for 1-based section `sec_num` selects SELECT_ANY — the
@@ -1140,7 +1144,10 @@ fun comdat_select_any_for_section(buf: *u8, symtab_off: usize, num_records: u32,
     for (ri < num_records) {
         val so: usize = symtab_off + ri::usize * SYMBOL_SIZE;
         val aux: u8 = buf[so + 17];
-        if (buf[so + 16] == IMAGE_SYM_CLASS_STATIC && aux >= 1
+        # the aux read is bounded by the symbol-table validation only when the aux
+        # record is itself a counted record; a last record falsely claiming an aux
+        # would read past the table, so require the aux index to be in range.
+        if (buf[so + 16] == IMAGE_SYM_CLASS_STATIC && aux >= 1 && (ri + 1) < num_records
             && bin.read_u16_le(buf, so + 12)::u32 == sec_num && bin.read_u32_le(buf, so + 8) == 0) {
             val ax: usize = so + SYMBOL_SIZE;
             ret buf[ax + 14] == IMAGE_COMDAT_SELECT_ANY;
@@ -1178,6 +1185,19 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
     val num_records:  u32   = bin.read_u32_le(buf, 12);
     val opt_size:     u16   = bin.read_u16_le(buf, 16);
     val secthdr_base: usize = COFF_HEADER_SIZE + opt_size::usize;
+
+    # validate the header-derived table extents against the input size before any
+    # field is dereferenced: the section-header array and the symbol table (each a
+    # fixed-stride run) must lie fully within the buffer, so a truncated or hostile
+    # object errors here instead of walking off the end of the mapped bytes. the
+    # string table follows the symbol table; bounding the symbol table bounds its
+    # base, and individual names are checked as they are read.
+    val vsh: Result[bool, str] = bin.require_region(buf_size, secthdr_base,
+        num_secs::usize * SECTION_HEADER_SIZE, "coff: section header table out of bounds");
+    if (is_err[bool, str](vsh)) { ret err[bool, str](unwrap_err[bool, str](vsh)); }
+    val vsy: Result[bool, str] = bin.require_region(buf_size, symtab_off,
+        num_records::usize * SYMBOL_SIZE, "coff: symbol table out of bounds");
+    if (is_err[bool, str](vsy)) { ret err[bool, str](unwrap_err[bool, str](vsy)); }
     val strtab_base:  usize = symtab_off + num_records::usize * SYMBOL_SIZE;
 
     out.alloc = alloc;
@@ -1231,8 +1251,12 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
     s = 0;
     for (s < num_secs) {
         val sh: usize = secthdr_base + s::usize * SECTION_HEADER_SIZE;
-        val sec_name: str = read_section_name(buf, sh, strtab_base);
-        val rin: Result[intern.StrId, str] = intern.intern(coff_interner, sec_name);
+        val rsn: Result[str, str] = read_section_name(buf, buf_size, sh, strtab_base);
+        if (is_err[str, str](rsn)) {
+            deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+            ret err[bool, str](unwrap_err[str, str](rsn));
+        }
+        val rin: Result[intern.StrId, str] = intern.intern(coff_interner, unwrap_ok[str, str](rsn));
         if (is_err[intern.StrId, str](rin)) {
             deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
             ret err[bool, str](unwrap_err[intern.StrId, str](rin));
@@ -1255,6 +1279,12 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
         if ((chars & IMAGE_SCN_CNT_UNINITIALIZED_DATA) == 0 && raw_ptr != 0
             && out.sections[s].len > 0) {
             val sz: usize = out.sections[s].len::usize;
+            # the section's PointerToRawData + SizeOfRawData must lie within the
+            # input before the bytes are copied out of it.
+            if (!bin.region_ok(buf_size, raw_ptr::usize, sz)) {
+                deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+                ret err[bool, str]("coff: section raw data out of bounds");
+            }
             val rb: Result[*u8, str] = allocate[u8](alloc, sz);
             if (is_err[*u8, str](rb)) {
                 deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
@@ -1274,8 +1304,12 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
         val so: usize = symtab_off + ri::usize * SYMBOL_SIZE;
         val aux: u8 = buf[so + 17];
 
-        val name: str = read_symbol_name(buf, so, strtab_base);
-        val rin: Result[intern.StrId, str] = intern.intern(coff_interner, name);
+        val rsyn: Result[str, str] = read_symbol_name(buf, buf_size, so, strtab_base);
+        if (is_err[str, str](rsyn)) {
+            deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+            ret err[bool, str](unwrap_err[str, str](rsyn));
+        }
+        val rin: Result[intern.StrId, str] = intern.intern(coff_interner, unwrap_ok[str, str](rsyn));
         if (is_err[intern.StrId, str](rin)) {
             deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
             ret err[bool, str](unwrap_err[intern.StrId, str](rin));
@@ -1344,6 +1378,12 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
         val sh: usize = secthdr_base + s::usize * SECTION_HEADER_SIZE;
         val rptr: usize = bin.read_u32_le(buf, sh + 24)::usize;
         val rcount: u32 = bin.read_u16_le(buf, sh + 32)::u32;
+        # the section's relocation array (PointerToRelocations + count records)
+        # must lie within the input before any record is read.
+        if (rcount > 0 && !bin.region_ok(buf_size, rptr, rcount::usize * RELOCATION_SIZE)) {
+            deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+            ret err[bool, str]("coff: relocation array out of bounds");
+        }
         var k: u32 = 0;
         for (k < rcount) {
             val ro: usize = rptr + k::usize * RELOCATION_SIZE;
@@ -3699,5 +3739,61 @@ test "coff: emit rejects a section reloc count above the u16 limit (#1256)" {
 
     if (!is_err[bool, str](em)) { ret 1; }
     if (!str_contains(unwrap_err[bool, str](em), "exceeds")) { ret 1; }
+    ret 0;
+}
+
+test "coff: parse rejects a truncated object instead of reading out of bounds (#1256)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_trunc");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, tpath::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    # the full object parses cleanly; a buffer truncated past the header (the
+    # symbol table and relocation arrays now lie beyond the end) must error rather
+    # than walk off the mapped bytes.
+    var ok_out: of.ObjectImage;
+    if (is_err[bool, str](coff_parse_object(?alloc, buf.data, buf.len, ?ok_out))) { ret 1; }
+
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = coff_parse_object(?alloc, buf.data, COFF_HEADER_SIZE + 8, ?out);
+    if (!is_err[bool, str](pr)) { ret 1; }
+    if (!str_contains(unwrap_err[bool, str](pr), "out of bounds")) { ret 1; }
     ret 0;
 }

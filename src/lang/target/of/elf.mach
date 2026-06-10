@@ -1664,27 +1664,58 @@ pub fun parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obje
     val e_shstrndx:  u16   = bin.read_u16_le(buf, 62);
     if (e_shoff == 0 || e_shnum == 0) { ret err[bool, str]("elf: no section headers"); }
 
-    var shstrtab: *u8 = nil;
+    # the section-header table is a run of e_shnum entries of e_shentsize bytes;
+    # each header is read up to offset 56 (sh_entsize), so the stride must cover a
+    # full SHDR_SIZE header and the whole table must lie within the input before any
+    # header field is dereferenced — a truncated or hostile object errors here.
+    if (e_shentsize::usize < SHDR_SIZE) { ret err[bool, str]("elf: section header entry too small"); }
+    val vsht: Result[bool, str] = bin.require_region(buf_size, e_shoff,
+        e_shnum::usize * e_shentsize::usize, "elf: section header table out of bounds");
+    if (is_err[bool, str](vsht)) { ret err[bool, str](unwrap_err[bool, str](vsht)); }
+
+    # the section-name string table (offset, size); names are read against this
+    # window through bin.cstr_at. validated to lie within the input when present.
+    var shstr_off:  usize = 0;
+    var have_shstr: bool = false;
     if (e_shstrndx < e_shnum) {
         val so: usize = e_shoff + e_shstrndx::usize * e_shentsize::usize;
-        shstrtab = (buf::usize + bin.read_u64_le(buf, so + 24)::usize)::*u8;
+        shstr_off = bin.read_u64_le(buf, so + 24)::usize;
+        val shstr_size: usize = bin.read_u64_le(buf, so + 32)::usize;
+        val vss: Result[bool, str] = bin.require_region(buf_size, shstr_off, shstr_size,
+            "elf: section-name string table out of bounds");
+        if (is_err[bool, str](vss)) { ret err[bool, str](unwrap_err[bool, str](vss)); }
+        have_shstr = true;
     }
 
-    var strtab: *u8 = nil;
+    # the symbol-name string table (offset, size) linked from the symtab.
+    var strtab_off:  usize = 0;
+    var strtab_size: usize = 0;
+    var have_strtab: bool = false;
     var symtab: *u8 = nil;
     var symtab_count: u32 = 0;
     var sh: u16 = 0;
     for (sh < e_shnum) {
         val so: usize = e_shoff + sh::usize * e_shentsize::usize;
         if (bin.read_u32_le(buf, so + 4) == SHT_SYMTAB) {
-            symtab = (buf::usize + bin.read_u64_le(buf, so + 24)::usize)::*u8;
+            val symtab_off: usize = bin.read_u64_le(buf, so + 24)::usize;
             val sz: usize = bin.read_u64_le(buf, so + 32)::usize;
             val ent: usize = bin.read_u64_le(buf, so + 56)::usize;
             if (ent > 0) { symtab_count = (sz / ent)::u32; }
+            # the symtab entries actually walked (symtab_count of SYM_SIZE each)
+            # must lie within the input before they are read.
+            val vsy: Result[bool, str] = bin.require_region(buf_size, symtab_off,
+                symtab_count::usize * SYM_SIZE, "elf: symbol table out of bounds");
+            if (is_err[bool, str](vsy)) { ret err[bool, str](unwrap_err[bool, str](vsy)); }
+            symtab = (buf::usize + symtab_off)::*u8;
             val link: u32 = bin.read_u32_le(buf, so + 40);
             if (link < e_shnum::u32) {
                 val lo: usize = e_shoff + link::usize * e_shentsize::usize;
-                strtab = (buf::usize + bin.read_u64_le(buf, lo + 24)::usize)::*u8;
+                strtab_off = bin.read_u64_le(buf, lo + 24)::usize;
+                strtab_size = bin.read_u64_le(buf, lo + 32)::usize;
+                val vst: Result[bool, str] = bin.require_region(buf_size, strtab_off, strtab_size,
+                    "elf: symbol string table out of bounds");
+                if (is_err[bool, str](vst)) { ret err[bool, str](unwrap_err[bool, str](vst)); }
+                have_strtab = true;
             }
         }
         sh = sh + 1;
@@ -1746,11 +1777,19 @@ pub fun parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obje
             or ((flags & SHF_WRITE) == 0) { kind = of.SK_RODATA; }
 
             var sec_name: str = "";
-            if (shstrtab != nil) {
-                sec_name = (shstrtab::usize + bin.read_u32_le(buf, so)::usize)::str;
+            if (have_shstr) {
+                val rnm: Result[str, str] = bin.cstr_at(buf, buf_size, shstr_off + bin.read_u32_le(buf, so)::usize);
+                if (is_err[str, str](rnm)) {
+                    deallocate[i32](alloc, sec_map, e_shnum::usize);
+                    ret err[bool, str](unwrap_err[str, str](rnm));
+                }
+                sec_name = unwrap_ok[str, str](rnm);
             }
             val rin: Result[intern.StrId, str] = intern.intern(elf_interner, sec_name);
-            if (is_err[intern.StrId, str](rin)) { ret err[bool, str](unwrap_err[intern.StrId, str](rin)); }
+            if (is_err[intern.StrId, str](rin)) {
+                deallocate[i32](alloc, sec_map, e_shnum::usize);
+                ret err[bool, str](unwrap_err[intern.StrId, str](rin));
+            }
 
             val idx: u32 = out.section_count;
             out.sections[idx].name  = unwrap_ok[intern.StrId, str](rin);
@@ -1760,10 +1799,20 @@ pub fun parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obje
             out.sections[idx].bytes = nil;
             if (ty != SHT_NOBITS && out.sections[idx].len > 0) {
                 val sz: usize = out.sections[idx].len::usize;
+                val src_off: usize = bin.read_u64_le(buf, so + 24)::usize;
+                # the section's sh_offset + sh_size must lie within the input before
+                # its bytes are copied out.
+                if (!bin.region_ok(buf_size, src_off, sz)) {
+                    deallocate[i32](alloc, sec_map, e_shnum::usize);
+                    ret err[bool, str]("elf: section data out of bounds");
+                }
                 val rb: Result[*u8, str] = allocate[u8](alloc, sz);
-                if (is_err[*u8, str](rb)) { ret err[bool, str]("elf: section bytes alloc failed"); }
+                if (is_err[*u8, str](rb)) {
+                    deallocate[i32](alloc, sec_map, e_shnum::usize);
+                    ret err[bool, str]("elf: section bytes alloc failed");
+                }
                 out.sections[idx].bytes = unwrap_ok[*u8, str](rb);
-                val src: *u8 = (buf::usize + bin.read_u64_le(buf, so + 24)::usize)::*u8;
+                val src: *u8 = (buf::usize + src_off)::*u8;
                 mem.raw_copy(out.sections[idx].bytes::ptr, src::ptr, sz);
             }
             sec_map[sh] = idx::i32;
@@ -1773,7 +1822,7 @@ pub fun parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obje
     }
 
     # symbols (skip the reserved index-0 entry).
-    if (symtab != nil && strtab != nil) {
+    if (symtab != nil && have_strtab) {
         var si: u32 = 1;
         for (si < sym_n) {
             val so: usize = si::usize * SYM_SIZE;
@@ -1783,9 +1832,16 @@ pub fun parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obje
             val st_value: u64 = bin.read_u64_le(symtab, so + 8);
             val st_size:  u64 = bin.read_u64_le(symtab, so + 16);
 
-            val name: str = (strtab::usize + st_name::usize)::str;
-            val rin: Result[intern.StrId, str] = intern.intern(elf_interner, name);
-            if (is_err[intern.StrId, str](rin)) { ret err[bool, str](unwrap_err[intern.StrId, str](rin)); }
+            val rnm: Result[str, str] = bin.cstr_at(buf, buf_size, strtab_off + st_name::usize);
+            if (is_err[str, str](rnm)) {
+                deallocate[i32](alloc, sec_map, e_shnum::usize);
+                ret err[bool, str](unwrap_err[str, str](rnm));
+            }
+            val rin: Result[intern.StrId, str] = intern.intern(elf_interner, unwrap_ok[str, str](rnm));
+            if (is_err[intern.StrId, str](rin)) {
+                deallocate[i32](alloc, sec_map, e_shnum::usize);
+                ret err[bool, str](unwrap_err[intern.StrId, str](rin));
+            }
 
             val idx: u32 = out.symbol_count;
             out.symbols[idx].name = unwrap_ok[intern.StrId, str](rin);
@@ -1822,6 +1878,12 @@ pub fun parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obje
             val r_size: usize = bin.read_u64_le(buf, so + 32)::usize;
             val sh_info: u32 = bin.read_u32_le(buf, so + 44);
             val count: u32 = (r_size / RELA_SIZE)::u32;
+            # the rela array (count entries of RELA_SIZE) must lie within the input
+            # before any entry is read.
+            if (!bin.region_ok(buf_size, r_base, count::usize * RELA_SIZE)) {
+                deallocate[i32](alloc, sec_map, e_shnum::usize);
+                ret err[bool, str]("elf: relocation array out of bounds");
+            }
             var target_sec: i32 = -1;
             if (sh_info < e_shnum::u32) { target_sec = sec_map[sh_info]; }
 
@@ -2080,5 +2142,60 @@ test "elf: parse rejects an unknown machine relocation type (#1256)" {
     val pr: Result[bool, str] = parse_object(?alloc, buf.data, buf.len, ?out);
     if (!is_err[bool, str](pr)) { ret 1; }
     if (!str_contains(unwrap_err[bool, str](pr), "relocation type")) { ret 1; }
+    ret 0;
+}
+
+test "elf: parse rejects a truncated object instead of reading out of bounds (#1256)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register(?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "elf_trunc");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    # the full object parses cleanly; a buffer truncated so e_shoff's section-header
+    # table lies past the end must error rather than dereference off the buffer.
+    var ok_out: of.ObjectImage;
+    if (is_err[bool, str](parse_object(?alloc, buf.data, buf.len, ?ok_out))) { ret 1; }
+
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = parse_object(?alloc, buf.data, ELF_HEADER_SIZE, ?out);
+    if (!is_err[bool, str](pr)) { ret 1; }
+    if (!str_contains(unwrap_err[bool, str](pr), "out of bounds")) { ret 1; }
     ret 0;
 }
