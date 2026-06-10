@@ -138,6 +138,9 @@ rec LiveRange {
 # active:        active-range vreg ids during the scan
 # active_count:  number of active ranges
 # pinned_end:    per-GP-register reservation end position (param-reg lifetimes)
+# fp_pinned_end: per-FP-register reservation end position — the FP-bank twin of
+#                pinned_end, holding an incoming XMM param register busy from
+#                entry until its capture move so no earlier FP range steals it
 # arg_res_reg / arg_res_start / arg_res_end: parallel windows reserving an
 #                outgoing call-argument register over [setup-move, call] so a
 #                later same-call argument's materialization cannot reuse a
@@ -169,6 +172,7 @@ rec AllocCtx {
     reserved:      *bool;
     gp_busy:       *bool;
     fp_busy:       *bool;
+    fp_pinned_end: *i64;
     active:        *u32;
     active_count:  u32;
     pinned_end:    *i64;
@@ -344,6 +348,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.reserved     = nil;
     ctx.gp_busy      = nil;
     ctx.fp_busy      = nil;
+    ctx.fp_pinned_end = nil;
     ctx.active       = nil;
     ctx.active_count = 0;
     ctx.pinned_end   = nil;
@@ -418,8 +423,11 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
         val rfb: Result[*bool, str] = allocate[bool](m.alloc, ctx.fp_count::usize);
         if (is_err[*bool, str](rfb)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*bool, str](rfb)); }
         ctx.fp_busy = unwrap_ok[*bool, str](rfb);
+        val rfp: Result[*i64, str] = allocate[i64](m.alloc, ctx.fp_count::usize);
+        if (is_err[*i64, str](rfp)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*i64, str](rfp)); }
+        ctx.fp_pinned_end = unwrap_ok[*i64, str](rfp);
         var fii: u32 = 0;
-        for (fii < ctx.fp_count) { ctx.fp_busy[fii] = false; fii = fii + 1; }
+        for (fii < ctx.fp_count) { ctx.fp_busy[fii] = false; ctx.fp_pinned_end[fii] = -1; fii = fii + 1; }
     }
 
     val ra: Result[*u32, str] = allocate[u32](m.alloc, f.vreg_count::usize);
@@ -487,6 +495,10 @@ fun ctx_dnit(ctx: *AllocCtx) {
     if (ctx.fp_busy != nil) {
         deallocate[bool](ctx.alloc, ctx.fp_busy, ctx.fp_count::usize);
         ctx.fp_busy = nil;
+    }
+    if (ctx.fp_pinned_end != nil) {
+        deallocate[i64](ctx.alloc, ctx.fp_pinned_end, ctx.fp_count::usize);
+        ctx.fp_pinned_end = nil;
     }
     if (ctx.active != nil) {
         deallocate[u32](ctx.alloc, ctx.active, ctx.f.vreg_count::usize);
@@ -1253,10 +1265,22 @@ fun reserve_param_registers(ctx: *AllocCtx) {
             # (e.g. a 16-byte value's second eightbyte) is colored over and clobbered
             # before it is captured.
             if ((d.kind == mir.MIR_OP_VREG || d.kind == mir.MIR_OP_MEM) && s.kind == mir.MIR_OP_PREG) {
+                # `r` is the composite source register id. a GP id is its raw index
+                # (< gp_count); an XMM id carries the SSE class tag, so it is pinned
+                # in the FP bank's array keyed on its within-bank index. the FP twin
+                # keeps an incoming float param (XMM0–XMM7) busy until its capture
+                # MOVSD, the mirror of the GP arg-register pin.
                 val r: u32 = s.preg;
-                if (r < ctx.gp_count && pos::i64 > ctx.pinned_end[r]) {
-                    ctx.pinned_end[r]    = pos::i64;
-                    ctx.param_reg_end[r] = pos::i64;
+                if (isa.regid_class(r::i32) == isa.REG_CLASS_ID_GP) {
+                    if (r < ctx.gp_count && pos::i64 > ctx.pinned_end[r]) {
+                        ctx.pinned_end[r]    = pos::i64;
+                        ctx.param_reg_end[r] = pos::i64;
+                    }
+                } or {
+                    val fi: u32 = isa.regid_index(r::i32)::u32;
+                    if (ctx.fp_pinned_end != nil && fi < ctx.fp_count && pos::i64 > ctx.fp_pinned_end[fi]) {
+                        ctx.fp_pinned_end[fi] = pos::i64;
+                    }
                 }
             }
         }
@@ -1266,7 +1290,10 @@ fun reserve_param_registers(ctx: *AllocCtx) {
 }
 
 # build_arg_reservations: record reservations protecting every precolored
-# physical-register definition (operand 0 a GP `MIR_OP_PREG`) from value coloring.
+# physical-register definition (operand 0 a `MIR_OP_PREG`, GP or XMM) from value
+# coloring. the records key on the composite register id, so one set of windows
+# serves both banks: `gp_available` consults them with GP ids and `fp_available`
+# with XMM ids, and the disjoint id spaces keep the two banks from interfering.
 # two distinct hazards are covered, both rooted in the fact that a value carried in
 # a `MIR_OP_PREG` is invisible to the vreg liveness `build_ranges` tracks:
 #
@@ -1315,8 +1342,15 @@ fun build_arg_reservations(ctx: *AllocCtx) Result[bool, str] {
         val mi: *mir.MirInstr = flat_instr(ctx, pos);
         if (!instr_defines_preg(mi)) { pos = pos + 1; cnt; }
         val d: *mir.MirOperand = ?mi.operands[0];
+        # `r` is a composite physical-register id (GP index, or the SSE class tag
+        # plus index for an XMM precoloring). the reservation lists key on it
+        # directly, so both banks share one set of records and `gp_available` /
+        # `fp_available` consult the same lists with their bank's composite ids —
+        # the GP and XMM id spaces are disjoint, so neither bank sees the other's
+        # entries. FP argument-setup moves (`MOVSD xmm_k <- vreg`) were previously
+        # skipped here, leaving FP precolored defs invisible to interference (the
+        # swapped-float-args miscompile).
         val r: u32 = d.preg;
-        if (r >= ctx.gp_count) { pos = pos + 1; cnt; }
 
         # record the precolored DEF position: no value vreg living past `pos` may
         # own `r`, since the def overwrites `r` here.
@@ -1365,10 +1399,10 @@ fun instr_defines_preg(mi: *mir.MirInstr) bool {
     ret mi.operands[0].kind == mir.MIR_OP_PREG;
 }
 
-# arg_reg_reserved: true when an outgoing call-argument window holds GP register
-# `id` busy over a span that overlaps the range currently being colored
-# (`cur_start`..`cur_end`). two intervals overlap when neither ends before the
-# other starts.
+# arg_reg_reserved: true when an outgoing call-argument window holds physical
+# register `id` (a composite GP or XMM id) busy over a span that overlaps the range
+# currently being colored (`cur_start`..`cur_end`). two intervals overlap when
+# neither ends before the other starts.
 fun arg_reg_reserved(ctx: *AllocCtx, id: u32) bool {
     var i: u32 = 0;
     for (i < ctx.arg_res_count) {
@@ -1401,8 +1435,8 @@ fun arg_reg_busy_at(ctx: *AllocCtx, id: u32, pos: u32) bool {
     ret false;
 }
 
-# release_pins: clear any param-register reservation whose end position has been
-# reached, returning the register to the free pool.
+# release_pins: clear any param-register reservation (GP or FP) whose end position
+# has been reached, returning the register to the free pool.
 fun release_pins(ctx: *AllocCtx, current_start: i64) {
     var r: u32 = 0;
     for (r < ctx.gp_count) {
@@ -1410,6 +1444,15 @@ fun release_pins(ctx: *AllocCtx, current_start: i64) {
             ctx.pinned_end[r] = -1;
         }
         r = r + 1;
+    }
+    if (ctx.fp_pinned_end != nil) {
+        var fi: u32 = 0;
+        for (fi < ctx.fp_count) {
+            if (ctx.fp_pinned_end[fi] >= 0 && ctx.fp_pinned_end[fi] < current_start) {
+                ctx.fp_pinned_end[fi] = -1;
+            }
+            fi = fi + 1;
+        }
     }
 }
 
@@ -1515,9 +1558,9 @@ fun pick_gp(ctx: *AllocCtx, crosses_call: bool) i32 {
     ret -1;
 }
 
-# def_reg_reserved: true when GP register `id` is overwritten by a precolored
-# physical-register DEF at a position the range currently being colored
-# (`cur_start`..`cur_end`) is live PAST. a value used at the def position but live
+# def_reg_reserved: true when physical register `id` (a composite GP or XMM id) is
+# overwritten by a precolored physical-register DEF at a position the range
+# currently being colored (`cur_start`..`cur_end`) is live PAST. a value used at the def position but live
 # only up to it (`cur_end == def-pos`) may still share the register — the def reads
 # its sources before writing, the standard def/use coalescing on a 2-address ISA —
 # so the test rejects only a value live strictly beyond the def (`cur_end >
@@ -1550,14 +1593,29 @@ fun gp_available(ctx: *AllocCtx, id: u32) bool {
     ret true;
 }
 
+# fp_available: true when FP register index `fi` is neither busy, pinned as a live
+# incoming param register, held by an outgoing call-argument window, nor overwritten
+# by a precolored DEF the colored range is live past — the FP-bank twin of
+# `gp_available`. the argument / def reservations key on the composite XMM id so the
+# shared windows reject the right register for a float range exactly as for a GP one.
+fun fp_available(ctx: *AllocCtx, fi: u32) bool {
+    if (ctx.fp_busy[fi]) { ret false; }
+    if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[fi] >= 0) { ret false; }
+    val cid: u32 = isa.regid_make(isa.REG_CLASS_ID_XMM, fi::i32)::u32;
+    if (arg_reg_reserved(ctx, cid)) { ret false; }
+    if (def_reg_reserved(ctx, cid)) { ret false; }
+    ret true;
+}
+
 # pick_fp: choose a free floating-point register, or -1 when none is free. the
 # chosen within-bank index is composed with the SSE class tag so the returned id
-# carries its bank — the allocation ORDER is unchanged, only the representation of
-# the assigned id.
+# carries its bank. an FP range is gated by `fp_available` exactly as a GP range is
+# by `gp_available`, so an argument-setup move's precolored XMM def can no longer be
+# colored over a still-live float (the swapped-float-args miscompile).
 fun pick_fp(ctx: *AllocCtx) i32 {
     var fi: u32 = 0;
     for (fi < ctx.fp_count) {
-        if (!ctx.fp_busy[fi]) {
+        if (fp_available(ctx, fi)) {
             ctx.fp_busy[fi] = true;
             ret isa.regid_make(isa.REG_CLASS_ID_XMM, fi::i32);
         }
