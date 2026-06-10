@@ -3101,27 +3101,6 @@ fun is_mir_float_conv(op: mir.MirOpcode) bool {
         op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP;
 }
 
-# emit_gp_load: load a GP integer operand into the GP scratch register `gp` at byte
-# width `w`. the operand resolves after register allocation to a physical register
-# (a plain MOV), a frame slot (a `MOV reg, [rbp + off]` reload), or an immediate (a
-# `MOV reg, imm`). a float-bank operand would mean the allocator placed an integer
-# value in the wrong bank — rejected loudly. mirrors `emit_float_load` for the GP
-# side of a conversion.
-fun emit_gp_load(op: isa.Operand, gp: i32, w: u8, buf: *ByteBuf) Result[bool, str] {
-    if (op.kind == isa.OPK_REG || op.kind == isa.OPK_MEM || op.kind == isa.OPK_IMM) {
-        var ld: isa.Inst;
-        zero_inst(?ld);
-        ld.opcode = x64.MOV;
-        ld.dst    = isa.make_reg(gp, w);
-        ld.src1   = op;
-        ld.size   = w;
-        ld.flags  = width_flags(w);
-        encode_inst(?ld, buf);
-        ret ok[bool, str](true);
-    }
-    ret err[bool, str]("encode: conversion integer operand is not a register, frame slot, or immediate");
-}
-
 # emit_gp_store: store the GP scratch register `gp` to a conversion's integer
 # destination at byte width `w` — a physical register (a plain MOV) or a frame slot
 # (a `MOV [rbp + off], reg` spill). a float-bank destination is a backend bug,
@@ -3155,6 +3134,159 @@ fun emit_cvt_reg(cvt_op: u16, dst_reg: i32, src_reg: i32, int_w: u8, buf: *ByteB
     encode_inst(?cvt, buf);
 }
 
+# patch_rel32: overwrite the 4-byte little-endian rel32 placeholder at `pos` with
+# `disp`. fills an intra-instruction forward jump once its target offset is known —
+# the self-contained sequences that branch within a single MIR instruction.
+fun patch_rel32(buf: *ByteBuf, pos: usize, disp: i32) {
+    buf.data[pos]     = (disp & 0xFF)::u8;
+    buf.data[pos + 1] = ((disp >> 8) & 0xFF)::u8;
+    buf.data[pos + 2] = ((disp >> 16) & 0xFF)::u8;
+    buf.data[pos + 3] = ((disp >> 24) & 0xFF)::u8;
+}
+
+# emit_gp_rr8: emit a 64-bit register-register GP op (`opcode dst_reg, src_reg`).
+fun emit_gp_rr8(opcode: u16, dst_reg: i32, src_reg: i32, buf: *ByteBuf) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = opcode;
+    mi.dst    = isa.make_reg(dst_reg, 8);
+    mi.src1   = isa.make_reg(src_reg, 8);
+    mi.size   = 8;
+    mi.flags  = width_flags(8);
+    encode_inst(?mi, buf);
+}
+
+# emit_gp_ri8: emit a 64-bit register-immediate GP op (`opcode dst_reg, imm`).
+fun emit_gp_ri8(opcode: u16, dst_reg: i32, imm: i64, buf: *ByteBuf) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = opcode;
+    mi.dst    = isa.make_reg(dst_reg, 8);
+    mi.src1   = isa.make_imm(imm, 8);
+    mi.size   = 8;
+    mi.flags  = width_flags(8);
+    encode_inst(?mi, buf);
+}
+
+# emit_fp_rr: emit a register-register SSE op (`opcode dst_reg, src_reg`) at float
+# width `w` (4 -> single, 8 -> double).
+fun emit_fp_rr(opcode: u16, dst_reg: i32, src_reg: i32, w: u8, buf: *ByteBuf) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = opcode;
+    mi.dst    = isa.make_reg(dst_reg, 16);
+    mi.src1   = isa.make_reg(src_reg, 16);
+    mi.size   = w;
+    encode_inst(?mi, buf);
+}
+
+# normalize_int_imm: reduce an integer constant to the value its `width`-byte source
+# represents, zero- or sign-extended (by `signed`) to 64 bits, so a constant
+# conversion source converts the same value a runtime register of that width would.
+fun normalize_int_imm(imm: i64, width: u8, signed: bool) i64 {
+    if (width >= 8) { ret imm; }
+    val bits: u64 = width::u64 * 8;
+    val mask: u64 = (1::u64 << bits) - 1;
+    var v: u64 = imm::u64 & mask;
+    if (signed) {
+        val sign: u64 = 1::u64 << (bits - 1);
+        if ((v & sign) != 0) { v = v | ~mask; }
+    }
+    ret v::i64;
+}
+
+# emit_gp_load_ext: load an integer conversion source into the full 64-bit GP scratch
+# `gp`, extending a sub-64-bit value by signedness so the CVTSI2SS/SD that follows
+# reads a clean register rather than stale upper bits. a u32 source rides a 4-byte MOV
+# (which already zero-extends into the 64-bit register); a u8/u16 source uses MOVZX
+# (unsigned) / MOVSX (signed); a 32-bit signed source uses MOVSXD; a 64-bit source
+# loads as-is; an immediate is re-normalized to its source width and materialized.
+# accepts the same operand shapes regalloc can produce (register, frame slot,
+# immediate); a float-bank operand is a regalloc bug, rejected loudly.
+fun emit_gp_load_ext(op: isa.Operand, gp: i32, src_w: u8, signed: bool, buf: *ByteBuf) Result[bool, str] {
+    if (op.kind == isa.OPK_IMM) {
+        emit_gp_ri8(x64.MOV, gp, normalize_int_imm(op.imm, src_w, signed), buf);
+        ret ok[bool, str](true);
+    }
+    if (op.kind != isa.OPK_REG && op.kind != isa.OPK_MEM) {
+        ret err[bool, str]("encode: conversion integer operand is not a register, frame slot, or immediate");
+    }
+
+    var ld: isa.Inst;
+    zero_inst(?ld);
+    ld.dst       = isa.make_reg(gp, 8);
+    ld.src1      = op;
+    ld.src1.size = src_w;
+    ld.size      = 8;
+    ld.flags     = width_flags(8);
+    if (src_w >= 8) {
+        ld.opcode = x64.MOV;
+    } or (signed && src_w >= 4) {
+        ld.opcode = x64.MOVSXD;
+    } or (signed) {
+        ld.opcode = x64.MOVSX;
+    } or {
+        # MOVZX with a >= 4-byte source emits a plain 32-bit MOV whose write clears the
+        # upper 32 bits; a sub-word source emits the true MOVZX.
+        ld.opcode = x64.MOVZX;
+    }
+    encode_inst(?ld, buf);
+    ret ok[bool, str](true);
+}
+
+# emit_u64_to_fp: convert the unsigned 64-bit value in SCRATCH_REG to the float in
+# FLOAT_SCRATCH0 and store it to `dst`. the signed CVTSI2SS/SD treats bit 63 as a
+# sign, so a value >= 2^63 would convert negative; branch on the sign (`test`; with OF
+# cleared, JL is "jump if sign") — a value < 2^63 converts exactly, a value >= 2^63 is
+# halved with a low-bit-preserving round-to-odd, converted, then doubled. SCRATCH_REG2
+# is the halving temp. the two forward rel32 jumps are intra-instruction, patched here
+# from the measured branch lengths.
+fun emit_u64_to_fp(dst: isa.Operand, dst_w: u8, cvt_op: u16, buf: *ByteBuf) Result[bool, str] {
+    var test_inst: isa.Inst;
+    zero_inst(?test_inst);
+    test_inst.opcode = x64.TEST;
+    test_inst.dst    = isa.make_reg(x64.SCRATCH_REG, 8);
+    test_inst.src1   = isa.make_reg(x64.SCRATCH_REG, 8);
+    test_inst.size   = 8;
+    test_inst.flags  = width_flags(8);
+    encode_inst(?test_inst, buf);
+
+    var jl: isa.Inst;
+    zero_inst(?jl);
+    jl.opcode = x64.JL;
+    jl.dst    = isa.make_label(nil);
+    jl.size   = DEFAULT_OPERAND_SIZE;
+    encode_inst(?jl, buf);
+    val jl_patch: usize = buf.len - 4;
+    val after_jl: usize = buf.len;
+
+    # value < 2^63: the signed conversion is exact.
+    emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, x64.SCRATCH_REG, 8, buf);
+
+    var jmp: isa.Inst;
+    zero_inst(?jmp);
+    jmp.opcode = x64.JMP;
+    jmp.dst    = isa.make_label(nil);
+    jmp.size   = DEFAULT_OPERAND_SIZE;
+    encode_inst(?jmp, buf);
+    val jmp_patch: usize = buf.len - 4;
+    val after_jmp: usize = buf.len;
+
+    # value >= 2^63: r11 = (r11 >> 1) | (r11 & 1); convert; double.
+    patch_rel32(buf, jl_patch, (buf.len - after_jl)::i32);
+    emit_gp_rr8(x64.MOV, x64.SCRATCH_REG2, x64.SCRATCH_REG, buf);
+    emit_gp_ri8(x64.SHR, x64.SCRATCH_REG2, 1, buf);
+    emit_gp_ri8(x64.AND, x64.SCRATCH_REG, 1, buf);
+    emit_gp_rr8(x64.OR, x64.SCRATCH_REG, x64.SCRATCH_REG2, buf);
+    emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, x64.SCRATCH_REG, 8, buf);
+    var add_op: u16 = x64.ADDSD;
+    if (dst_w == 4) { add_op = x64.ADDSS; }
+    emit_fp_rr(add_op, FLOAT_SCRATCH0, FLOAT_SCRATCH0, dst_w, buf);
+
+    patch_rel32(buf, jmp_patch, (buf.len - after_jmp)::i32);
+    ret emit_float_store(dst, FLOAT_SCRATCH0, dst_w, buf);
+}
+
 # encode_float_conv: materialize a fully-resolved float conversion into its SSE byte
 # sequence, routing operands through the fixed scratch registers (XMM FLOAT_SCRATCH0
 # for the float side, the GP SCRATCH_REG for the integer side) exactly as
@@ -3162,8 +3294,14 @@ fun emit_cvt_reg(cvt_op: u16, dst_reg: i32, src_reg: i32, int_w: u8, buf: *ByteB
 # register, a spilled `[rbp + off]` frame slot, or an immediate) encodes without the
 # reg-reg-only `encode_cvt` path. the carried widths (`mi.width` = result type,
 # `mi.src_width` = operand-0 type, both from `set_conv_widths`) select the
-# single-precision SS vs double SD form on the float side and size the GP integer
-# side for REX.W. operand layout is `[dst, src]`.
+# single-precision SS vs double SD form on the float side; the integer side is always
+# extended to a clean 64-bit value and converted with the REX.W CVT. operand layout is
+# `[dst, src]`.
+#
+# SI_TO_FP / UI_TO_FP extend the integer source to 64 bits by signedness (so a u32 is
+# not converted as a signed i32 and a sub-word source carries no stale upper bits); an
+# unsigned 64-bit value >= 2^63 takes a range-fixup path (`emit_u64_to_fp`) since the
+# signed CVTSI2SS/SD has no direct unsigned-64 form.
 #
 # FP_TO_SI / FP_TO_UI map to the signed CVTTSS2SI / CVTTSD2SI: a full unsigned
 # 64-bit conversion needs a range-fixup sequence x86-64 lacks a single instruction
@@ -3194,8 +3332,11 @@ fun encode_float_conv(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Res
         ret emit_float_store(dst, FLOAT_SCRATCH0, dst_w, buf);
     }
 
-    # SI_TO_FP / UI_TO_FP (int -> float): dst is float (dst_w picks SS / SD), src is
-    # an integer (src_w sizes the GP load + REX.W of the CVTSI2SS/SD).
+    # SI_TO_FP / UI_TO_FP (int -> float): dst is float (dst_w picks SS / SD), src is an
+    # integer. the source is extended to a clean 64-bit value by signedness (so a u32
+    # is not converted as a signed i32 and a u8/u16 is not read off stale upper bits),
+    # then the REX.W signed CVTSI2SS/SD converts it. an unsigned 64-bit source whose
+    # top bit is set has no signed CVT form, so it takes the range-fixup path.
     if (op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP) {
         val rd: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], 16);
         if (is_err[isa.Operand, str](rd)) { ret err[bool, str](unwrap_err[isa.Operand, str](rd)); }
@@ -3204,11 +3345,15 @@ fun encode_float_conv(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Res
         if (is_err[isa.Operand, str](rs)) { ret err[bool, str](unwrap_err[isa.Operand, str](rs)); }
         val src: isa.Operand = unwrap_ok[isa.Operand, str](rs);
 
-        val ld: Result[bool, str] = emit_gp_load(src, x64.SCRATCH_REG, src_w, buf);
+        val signed: bool = op == mir.MIR_SI_TO_FP;
+        val ld: Result[bool, str] = emit_gp_load_ext(src, x64.SCRATCH_REG, src_w, signed, buf);
         if (is_err[bool, str](ld)) { ret ld; }
         var cvt_op: u16 = x64.CVTSI2SD;
         if (dst_w == 4) { cvt_op = x64.CVTSI2SS; }
-        emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, x64.SCRATCH_REG, src_w, buf);
+        if (!signed && src_w >= 8) {
+            ret emit_u64_to_fp(dst, dst_w, cvt_op, buf);
+        }
+        emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, x64.SCRATCH_REG, 8, buf);
         ret emit_float_store(dst, FLOAT_SCRATCH0, dst_w, buf);
     }
 
