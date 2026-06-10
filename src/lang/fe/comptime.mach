@@ -8,11 +8,13 @@
 # / logical / bitwise / shift operators over them. out of scope: function calls,
 # loops, type-introspection intrinsics, casts.
 #
-# `$mach.target.{os,arch,abi}` resolve to the numeric tag of the active
-# target; the matching `$mach.os.*` / `$mach.arch.*` tags resolve to the
-# same numeric space, so `$if ($mach.target.os == $mach.os.linux)` is a
+# `$mach.target.{os,arch,pointer_width}` resolve to the active target's
+# numeric parameters; the matching `$mach.os.*` / `$mach.arch.*` tags resolve
+# to the same numeric space, so `$if ($mach.target.os == $mach.os.linux)` is a
 # plain integer comparison. Tag comparisons are path-value: there is no
-# `.id` suffix and no `$mach.build.target` chain.
+# `.id` suffix and no `$mach.build.target` chain. `$mach.target.abi`,
+# `$mach.project.*`, `$mach.build.*`, and `$mach.source.*` are reserved stubs:
+# reading one is a compile error until the value is populated.
 
 use std.types.result.Result;
 use std.types.result.ok;
@@ -128,6 +130,10 @@ pub rec ComptimeCtx {
 
 val INITIAL_CONST_CAP: u32 = 8;
 
+# the i64 minimum, as a bit pattern since the literal `9223372036854775808` is
+# itself out of i64 range. used to trap the `INT64_MIN / -1` idiv overflow.
+val CT_I64_MIN: i64 = 0x8000000000000000::i64;
+
 # init: constructs a ComptimeCtx with the given target parameters and an empty
 # environment.
 # ---
@@ -218,12 +224,20 @@ pub fun frame_open(c: *ComptimeCtx) FrameMark {
 
 # frame_close: pops the entries array back to `mark`, removing every binding
 # made since the matching `frame_open`. used to scope a value-instance body's
-# `$param` bindings to that body's lowering, restoring exactly on every path.
+# `$param` bindings to that body's lowering, restoring exactly on every path. a
+# `mark` beyond the current depth means frames were closed out of order or
+# twice — a caller-side discipline bug — and is surfaced as an error rather than
+# silently ignored, so the open/close invariant the scoped model rests on is loud.
 # ---
 # c:    the context
 # mark: a depth previously returned by `frame_open`
-pub fun frame_close(c: *ComptimeCtx, mark: FrameMark) {
-    if (mark <= c.entries_len) { c.entries_len = mark; }
+# ret:  true on success, or an error when `mark` exceeds the current depth
+pub fun frame_close(c: *ComptimeCtx, mark: FrameMark) Result[bool, str] {
+    if (mark > c.entries_len) {
+        ret err[bool, str]("comptime: frame_close mark exceeds current frame depth");
+    }
+    c.entries_len = mark;
+    ret ok[bool, str](true);
 }
 
 # lookup: looks up a comptime constant by interned name with a single reverse
@@ -714,10 +728,16 @@ fun apply_arith(op: expr.BinOp, lhs: CTValue, rhs: CTValue) Result[CTValue, str]
         if (op == expr.BIN_MUL) { ret int_value(lhs.data.i * rhs.data.i); }
         if (op == expr.BIN_DIV) {
             if (rhs.data.i == 0) { ret err[CTValue, str]("integer division by zero"); }
+            if (lhs.data.i == CT_I64_MIN && rhs.data.i == (0 - 1)) {
+                ret err[CTValue, str]("integer division overflow (INT64_MIN / -1)");
+            }
             ret int_value(lhs.data.i / rhs.data.i);
         }
         if (op == expr.BIN_MOD) {
             if (rhs.data.i == 0) { ret err[CTValue, str]("integer modulo by zero"); }
+            if (lhs.data.i == CT_I64_MIN && rhs.data.i == (0 - 1)) {
+                ret err[CTValue, str]("integer modulo overflow (INT64_MIN % -1)");
+            }
             ret int_value(lhs.data.i % rhs.data.i);
         }
         if (op == expr.BIN_BIT_AND) { ret int_value(lhs.data.i & rhs.data.i); }
@@ -827,9 +847,15 @@ fun eval_path(
     ret resolve_mach_path(c, source, ?stack[0], depth);
 }
 
-# returns the span of the identifier portion of a `$ident` token (skips the
-# leading `$`)
-fun comptime_ident_name(full: token.Span) token.Span {
+# comptime_ident_name: the span of the identifier portion of a `$ident` token,
+# with the leading `$` skipped. the single owner of this offset+1 / len-1 span
+# surgery — sema, resolve, and lower all call it rather than hand-rolling it,
+# so the zero-length guard lives in exactly one place. a `$`-only span (len <= 1)
+# yields a zero-length span the caller can detect.
+# ---
+# full: the full span of a `$ident` token, including the leading `$`
+# ret:  the span covering just the identifier text
+pub fun comptime_ident_name(full: token.Span) token.Span {
     var s: token.Span;
     s.offset = full.offset + 1;
     if (full.len > 0) { s.len = full.len - 1; } or { s.len = 0; }
@@ -878,15 +904,21 @@ fun resolve_mach_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u
         ret int_value(c.pointer_width::i64);
     }
 
-    # $mach.os.<name> — os tag value
+    # $mach.os.<name> — os tag value. an unrecognized name is an error, never a
+    # silent fold to OS_UNKNOWN (a typo'd tag must not quietly compare against a
+    # real target).
     if (depth == 3 && seg_is(source, stack, 1, "os")) {
         val name: StrView = span_text(source, stack[0]);
-        ret int_value(os_tag_for(name)::i64);
+        val r: Result[u32, str] = os_tag_for(name);
+        if (is_err[u32, str](r)) { ret err[CTValue, str](unwrap_err[u32, str](r)); }
+        ret int_value(unwrap_ok[u32, str](r)::i64);
     }
-    # $mach.arch.<name> — arch tag value
+    # $mach.arch.<name> — arch tag value; unrecognized names error likewise.
     if (depth == 3 && seg_is(source, stack, 1, "arch")) {
         val name: StrView = span_text(source, stack[0]);
-        ret int_value(arch_tag_for(name)::i64);
+        val r: Result[u32, str] = arch_tag_for(name);
+        if (is_err[u32, str](r)) { ret err[CTValue, str](unwrap_err[u32, str](r)); }
+        ret int_value(unwrap_ok[u32, str](r)::i64);
     }
 
     # $mach.compiler.{name,version}
@@ -931,20 +963,23 @@ fun seg_is(source: str, stack: *token.Span, idx: u32, expected: str) bool {
     ret view_eq_str(text, expected);
 }
 
-# maps an `$mach.os.<name>` tag to its numeric os id (os.OS_*)
-fun os_tag_for(name: StrView) u32 {
-    if (view_eq_str(name, "linux"))        { ret os.OS_LINUX; }
-    if (view_eq_str(name, "darwin"))       { ret os.OS_DARWIN; }
-    if (view_eq_str(name, "windows"))      { ret os.OS_WINDOWS; }
-    if (view_eq_str(name, "freestanding")) { ret os.OS_UNKNOWN; }
-    ret os.OS_UNKNOWN;
+# maps an `$mach.os.<name>` tag to its numeric os id (os.OS_*). the tag list is
+# closed: `freestanding` has its own id distinct from the unknown sentinel, and
+# an unrecognized name is an error rather than a fold to OS_UNKNOWN.
+fun os_tag_for(name: StrView) Result[u32, str] {
+    if (view_eq_str(name, "linux"))        { ret ok[u32, str](os.OS_LINUX); }
+    if (view_eq_str(name, "darwin"))       { ret ok[u32, str](os.OS_DARWIN); }
+    if (view_eq_str(name, "windows"))      { ret ok[u32, str](os.OS_WINDOWS); }
+    if (view_eq_str(name, "freestanding")) { ret ok[u32, str](os.OS_FREESTANDING); }
+    ret err[u32, str]("unknown `$mach.os.*` tag");
 }
 
-# maps an `$mach.arch.<name>` tag to its numeric arch id (isa.ARCH_*)
-fun arch_tag_for(name: StrView) u32 {
-    if (view_eq_str(name, "x86_64"))  { ret isa.ARCH_X86_64; }
-    if (view_eq_str(name, "aarch64")) { ret isa.ARCH_AARCH64; }
-    ret isa.ARCH_UNKNOWN;
+# maps an `$mach.arch.<name>` tag to its numeric arch id (isa.ARCH_*). closed
+# list; an unrecognized name is an error rather than a fold to ARCH_UNKNOWN.
+fun arch_tag_for(name: StrView) Result[u32, str] {
+    if (view_eq_str(name, "x86_64"))  { ret ok[u32, str](isa.ARCH_X86_64); }
+    if (view_eq_str(name, "aarch64")) { ret ok[u32, str](isa.ARCH_AARCH64); }
+    ret err[u32, str]("unknown `$mach.arch.*` tag");
 }
 
 fun int_value(i: i64) Result[CTValue, str] {
@@ -1001,5 +1036,52 @@ test "comptime: the u64-max literal is accepted with its bits preserved (#1247)"
 test "comptime: a hex literal wider than 16 nibbles is rejected (#1247)" {
     val r: Result[CTValue, str] = t_eval_int("0x1FFFFFFFFFFFFFFFF");
     if (!is_err[CTValue, str](r)) { ret 1; }
+    ret 0;
+}
+
+# helper: a full-length StrView over a literal, for the tag-name lookups.
+fun t_view(s: str) StrView {
+    ret view(?s[0], str_len(s));
+}
+
+test "comptime: INT64_MIN / -1 and % -1 trap as errors instead of SIGFPE (#1249)" {
+    val lhs: CTValue = unwrap_ok[CTValue, str](int_value(CT_I64_MIN));
+    val rhs: CTValue = unwrap_ok[CTValue, str](int_value(0 - 1));
+    # the idiv overflow that would SIGFPE the compiler must be a comptime error.
+    if (!is_err[CTValue, str](apply_arith(expr.BIN_DIV, lhs, rhs))) { ret 1; }
+    if (!is_err[CTValue, str](apply_arith(expr.BIN_MOD, lhs, rhs))) { ret 1; }
+    # an ordinary division still folds.
+    val ten: CTValue = unwrap_ok[CTValue, str](int_value(10));
+    val two: CTValue = unwrap_ok[CTValue, str](int_value(2));
+    val okd: Result[CTValue, str] = apply_arith(expr.BIN_DIV, ten, two);
+    if (is_err[CTValue, str](okd)) { ret 1; }
+    if (unwrap_ok[CTValue, str](okd).data.i != 5) { ret 1; }
+    ret 0;
+}
+
+test "comptime: an unknown $mach.os/arch tag errors; freestanding is distinct from unknown (#1249)" {
+    # a typo'd tag name must error, never fold to the unknown sentinel.
+    if (!is_err[u32, str](os_tag_for(t_view("linxu")))) { ret 1; }
+    if (!is_err[u32, str](arch_tag_for(t_view("x84_64")))) { ret 1; }
+    # freestanding resolves to its own id, distinct from OS_UNKNOWN.
+    val fr: Result[u32, str] = os_tag_for(t_view("freestanding"));
+    if (is_err[u32, str](fr)) { ret 1; }
+    if (unwrap_ok[u32, str](fr) == os.OS_UNKNOWN) { ret 1; }
+    ret 0;
+}
+
+test "comptime: frame_close rejects a mark beyond the current frame depth (#1249)" {
+    var c: ComptimeCtx;
+    c.entries     = nil;
+    c.entries_len = 2;
+    c.entries_cap = 0;
+    # a mark past the current depth is a caller-discipline bug, surfaced loud.
+    val bad: Result[bool, str] = frame_close(?c, 5);
+    if (!is_err[bool, str](bad)) { ret 1; }
+    if (c.entries_len != 2) { ret 1; }
+    # a valid mark still pops to that depth.
+    val good: Result[bool, str] = frame_close(?c, 1);
+    if (is_err[bool, str](good)) { ret 1; }
+    if (c.entries_len != 1) { ret 1; }
     ret 0;
 }
