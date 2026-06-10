@@ -1626,6 +1626,36 @@ fun encode_sse_mov(mi: *isa.Inst, buf: *ByteBuf) i32 {
     ret 0;
 }
 
+# encode_movaps: encode MOVAPS in reg<-mem (`0F 28 /r`, a 128-bit aligned load)
+# and mem<-reg (`0F 29 /r`, a 128-bit aligned store) forms — the prologue /
+# epilogue callee-saved XMM save and restore. MOVAPS takes no mandatory SSE prefix.
+# the memory operand must be 16-byte aligned, which the frame layout guarantees
+# (RBP is 16-aligned after `push rbp; mov rbp, rsp`, and the XMM slots sit at
+# 16-aligned `[rbp - k*16]`). reg<->reg is unused here and not emitted.
+fun encode_movaps(mi: *isa.Inst, buf: *ByteBuf) i32 {
+    val start: usize = buf.len;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_rex_mem(buf, 0, dst.reg, src1);
+        emit_byte(buf, 0x0F);
+        emit_byte(buf, 0x28);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
+        emit_rex_mem(buf, 0, src1.reg, dst);
+        emit_byte(buf, 0x0F);
+        emit_byte(buf, 0x29);
+        encode_mem_operand(buf, src1.reg, dst);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
 # sse_alu_opcode: map an SSE arithmetic opcode to its secondary opcode byte.
 fun sse_alu_opcode(opcode: u16) u8 {
     if (opcode == x64.ADDSS || opcode == x64.ADDSD) { ret 0x58; }
@@ -1919,6 +1949,10 @@ pub fun encode_inst(mi: *isa.Inst, buf: *ByteBuf) i32 {
         ret encode_sse_mov(mi, buf);
     }
 
+    if (opcode == x64.MOVAPS) {
+        ret encode_movaps(mi, buf);
+    }
+
     if (is_sse_alu(opcode)) {
         ret encode_sse_alu(mi, buf);
     }
@@ -2055,11 +2089,37 @@ fun count_callee_saved(abi_vt: *abi.AbiVTable, mask: u32) i32 {
 # the outgoing region as the bottommost slice puts its base exactly at the new
 # RSP, so a caller's `[rsp + off]` argument store lands in it, and keeping every
 # addend 16-aligned holds RSP 16-byte aligned at each call boundary.
-fun frame_total(abi_vt: *abi.AbiVTable, frame_size: u32, callee_mask: u32, outgoing_size: u32) usize {
-    val callee_space: usize = count_callee_saved(abi_vt, callee_mask)::usize * 8;
-    var base: usize = frame_size::usize + callee_space;
+fun frame_total(abi_vt: *abi.AbiVTable, frame_size: u32, callee_mask: u32, callee_mask_fp: u32, outgoing_size: u32) usize {
+    var base: usize = fp_save_base(abi_vt, frame_size, callee_mask);
+    # the callee-saved XMM save area (16 bytes per register, MOVAPS-aligned) sits
+    # below the 16-aligned GP-area base. `fp_save_base` is already 16-aligned, so
+    # adding 16-byte slots keeps the whole area 16-aligned.
+    base = base + popcount32(callee_mask_fp)::usize * 16;
     if (base > 0 && (base & 15) != 0) { base = (base + 15) & ~15::usize; }
     ret base + outgoing_size::usize;
+}
+
+# fp_save_base: the 16-byte-aligned offset (from RBP) at which the callee-saved
+# XMM save area begins — just below the local frame and the GP save area. the XMM
+# slots are then at `[rbp - (fp_save_base + 16*k)]`, each 16-aligned because RBP and
+# fp_save_base are. shared by `frame_total`, `emit_prologue`, and `emit_epilogue` so
+# the reserved size and the actual save offsets always agree.
+fun fp_save_base(abi_vt: *abi.AbiVTable, frame_size: u32, callee_mask: u32) usize {
+    val gp_space: usize = count_callee_saved(abi_vt, callee_mask)::usize * 8;
+    var base: usize = frame_size::usize + gp_space;
+    if ((base & 15) != 0) { base = (base + 15) & ~15::usize; }
+    ret base;
+}
+
+# popcount32: the number of set bits in a 32-bit mask.
+fun popcount32(m: u32) i32 {
+    var n: i32 = 0;
+    var x: u32 = m;
+    for (x != 0) {
+        n = n + (x & 1)::i32;
+        x = x >> 1;
+    }
+    ret n;
 }
 
 # emit_inst: encode one fully-formed `isa.Inst` into the encoder byte sink. used
@@ -2095,6 +2155,32 @@ fun emit_frame_load(st: *EncodeState, reg: i32, disp: i32) {
     emit_inst(st, ?mi);
 }
 
+# emit_xmm_store: encode a `movaps [rbp+disp], xmm` saving a callee-saved vector
+# register into the frame. `idx` is the XMM within-bank index (0–15); the operand
+# is built on its composite SSE id so the encoder selects the SSE form. `disp` must
+# be 16-aligned (the frame layout guarantees it) for the aligned MOVAPS.
+fun emit_xmm_store(st: *EncodeState, idx: i32, disp: i32) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = x64.MOVAPS;
+    mi.dst    = isa.make_mem(x64.RBP, disp, -1, 0, 16);
+    mi.src1   = isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, idx), 16);
+    mi.size   = 16;
+    emit_inst(st, ?mi);
+}
+
+# emit_xmm_load: encode a `movaps xmm, [rbp+disp]` restoring a callee-saved vector
+# register from the frame, mirroring emit_xmm_store.
+fun emit_xmm_load(st: *EncodeState, idx: i32, disp: i32) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = x64.MOVAPS;
+    mi.dst    = isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, idx), 16);
+    mi.src1   = isa.make_mem(x64.RBP, disp, -1, 0, 16);
+    mi.size   = 16;
+    emit_inst(st, ?mi);
+}
+
 # emit_prologue: encode the standard x86-64 function prologue into the `.text`
 # byte sink.
 #
@@ -2107,11 +2193,13 @@ fun emit_frame_load(st: *EncodeState, reg: i32, disp: i32) {
 # the call. the callee-save offsets are frame_size-relative and so are unaffected
 # by the outgoing region reserved below them.
 # ---
-# st:            encoder state whose byte sink the prologue bytes are appended to
-# frame_size:    size of the local frame in bytes (locals + va-save; pre callee-save)
-# callee_mask:   bitmask of callee-saved GP registers regalloc assigned
-# outgoing_size: bytes reserved at the bottom of the frame for stack-passed call args
-fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_size: u32) {
+# st:             encoder state whose byte sink the prologue bytes are appended to
+# frame_size:     size of the local frame in bytes (locals + va-save; pre callee-save)
+# callee_mask:    bitmask of callee-saved GP registers regalloc assigned
+# callee_mask_fp: bitmask of callee-saved XMM register indices regalloc assigned
+#                 (win64 only; 0 under SysV, where the XMM save path is inert)
+# outgoing_size:  bytes reserved at the bottom of the frame for stack-passed call args
+fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, callee_mask_fp: u32, outgoing_size: u32) {
     var push_rbp: isa.Inst;
     zero_inst(?push_rbp);
     push_rbp.opcode = x64.PUSH;
@@ -2129,7 +2217,7 @@ fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_
     mov_rbp.flags  = x64.FLAG_REX_W;
     emit_inst(st, ?mov_rbp);
 
-    val total: usize = frame_total(st.abi, frame_size, callee_mask, outgoing_size);
+    val total: usize = frame_total(st.abi, frame_size, callee_mask, callee_mask_fp, outgoing_size);
     if (total > 0) {
         var sub_rsp: isa.Inst;
         zero_inst(?sub_rsp);
@@ -2152,6 +2240,19 @@ fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_
         }
         i = i + 1;
     }
+
+    # callee-saved XMM saves (win64): each at a 16-aligned `[rbp - (base + 16*k)]`
+    # below the GP save area, in ascending index order (matching the epilogue).
+    val xbase: i32 = fp_save_base(st.abi, frame_size, callee_mask)::i32;
+    var xoff: i32 = xbase + 16;
+    var x: i32 = 0;
+    for (x < 16) {
+        if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
+            emit_xmm_store(st, x, -xoff);
+            xoff = xoff + 16;
+        }
+        x = x + 1;
+    }
 }
 
 # emit_epilogue: encode the standard x86-64 function epilogue into the `.text`
@@ -2163,10 +2264,24 @@ fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_
 # so each is reloaded from the slot it was saved into. the RET itself is encoded
 # from the MIR_RET instruction that follows.
 # ---
-# st:          encoder state whose byte sink the epilogue bytes are appended to
-# frame_size:  size of the local frame in bytes (locals + va-save; pre callee-save)
-# callee_mask: bitmask of callee-saved GP registers regalloc assigned
-fun emit_epilogue(st: *EncodeState, frame_size: u32, callee_mask: u32) {
+# st:             encoder state whose byte sink the epilogue bytes are appended to
+# frame_size:     size of the local frame in bytes (locals + va-save; pre callee-save)
+# callee_mask:    bitmask of callee-saved GP registers regalloc assigned
+# callee_mask_fp: bitmask of callee-saved XMM register indices regalloc assigned
+fun emit_epilogue(st: *EncodeState, frame_size: u32, callee_mask: u32, callee_mask_fp: u32) {
+    # restore the callee-saved XMM registers first (the reverse of the prologue's
+    # last stores), from the same 16-aligned slots in ascending index order.
+    val xbase: i32 = fp_save_base(st.abi, frame_size, callee_mask)::i32;
+    var xoff: i32 = xbase + 16;
+    var x: i32 = 0;
+    for (x < 16) {
+        if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
+            emit_xmm_load(st, x, -xoff);
+            xoff = xoff + 16;
+        }
+        x = x + 1;
+    }
+
     var list: [16]i32;
     val ln: i32 = x64.callee_saved_gp_list(st.abi, ?list[0]);
     var coff: i32 = frame_size::i32 + 8;
@@ -2514,6 +2629,7 @@ fun shrink_text(st: *EncodeState) Result[bool, str] {
 fun function_is_naked(f: *mir.MirFunction) bool {
     if (f.frame.size != 0) { ret false; }
     if (f.callee_mask != 0) { ret false; }
+    if (f.callee_mask_fp != 0) { ret false; }
     if (f.frame.outgoing_size != 0) { ret false; }
 
     var bi: u32 = 0;
@@ -2548,8 +2664,9 @@ fun encode_function(st: *EncodeState, f: *mir.MirFunction) Result[bool, str] {
     val naked: bool = function_is_naked(f);
     val frame_size: u32 = f.frame.size;
     val callee_mask: u32 = f.callee_mask;
+    val callee_mask_fp: u32 = f.callee_mask_fp;
     val outgoing_size: u32 = f.frame.outgoing_size;
-    if (!naked) { emit_prologue(st, frame_size, callee_mask, outgoing_size); }
+    if (!naked) { emit_prologue(st, frame_size, callee_mask, callee_mask_fp, outgoing_size); }
 
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -2563,7 +2680,7 @@ fun encode_function(st: *EncodeState, f: *mir.MirFunction) Result[bool, str] {
             # the function epilogue precedes every RET: restore callee-saved
             # registers and tear down the frame, then encode the RET itself.
             if (mi.opcode::u16 == x64.RET::u16 && !naked) {
-                emit_epilogue(st, frame_size, callee_mask);
+                emit_epilogue(st, frame_size, callee_mask, callee_mask_fp);
             }
             val ei: Result[bool, str] = encode_mir_instr(st, f, fn_base, mi);
             if (is_err[bool, str](ei)) { ret ei; }

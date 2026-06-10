@@ -158,6 +158,8 @@ val UWOP_ALLOC_SMALL: u8 = 2;
 val UWOP_SET_FPREG: u8 = 3;
 val UWOP_SAVE_NONVOL: u8 = 4;
 val UWOP_SAVE_NONVOL_FAR: u8 = 5;
+val UWOP_SAVE_XMM128: u8 = 8;
+val UWOP_SAVE_XMM128_FAR: u8 = 9;
 val UWREG_RBP: u8 = 5;
 
 # write a u16 little-endian into a buffer.
@@ -1551,7 +1553,7 @@ rec FunctionUnwind {
     slot_count:  u32;
     xdata_rva:   u64;
     xdata_size:  usize;
-    codes:       [16]UnwindCode;
+    codes:       [32]UnwindCode;
 }
 
 # func_import_count: the number of function imports in a dynamic plan — only these
@@ -1608,7 +1610,7 @@ fun import_dir_bytes(dyn: *of.DynamicInfo) usize {
 # to a function's code array, tracking the running slot count; false when full.
 fun push_unwind_code(uw: *FunctionUnwind, end_off: u8, op: u8, info: u8,
                      extra0: u16, extra1: u16, extra_slots: u8) bool {
-    if (uw.code_count >= 16) { ret false; }
+    if (uw.code_count >= 32) { ret false; }
     uw.codes[uw.code_count].end_off = end_off;
     uw.codes[uw.code_count].op = op;
     uw.codes[uw.code_count].info = info;
@@ -1650,6 +1652,28 @@ fun push_save_nonvol(uw: *FunctionUnwind, end_off: u8, reg: u8, save_off: usize)
     # the far form records the UNSCALED byte offset in two slots (cf. ALLOC_LARGE info=1).
     ret push_unwind_code(uw, end_off, UWOP_SAVE_NONVOL_FAR, reg,
                          (save_off & 0xFFFF)::u16, ((save_off >> 16) & 0xFFFF)::u16, 2);
+}
+
+# push_save_xmm128: append the unwind code for a `movaps [frame-off], xmm` 128-bit
+# callee-saved vector save — SAVE_XMM128 with the offset scaled by 16, or
+# SAVE_XMM128_FAR with the unscaled byte offset when that scaled value exceeds 16
+# bits. the offset must be 16-aligned (the frame layout guarantees it).
+fun push_save_xmm128(uw: *FunctionUnwind, end_off: u8, reg: u8, save_off: usize) bool {
+    if ((save_off & 15) != 0) { ret false; }
+    val scaled: u64 = (save_off / 16)::u64;
+    if (scaled <= 0xFFFF) {
+        ret push_unwind_code(uw, end_off, UWOP_SAVE_XMM128, reg, scaled::u16, 0, 1);
+    }
+    if (save_off > 0xFFFFFFFF::usize) { ret false; }
+    # the far form records the UNSCALED byte offset in two slots (cf. SAVE_NONVOL_FAR).
+    ret push_unwind_code(uw, end_off, UWOP_SAVE_XMM128_FAR, reg,
+                         (save_off & 0xFFFF)::u16, ((save_off >> 16) & 0xFFFF)::u16, 2);
+}
+
+# is_win64_nonvol_xmm: whether a vector register number is callee-saved under the
+# win64 ABI (XMM6–XMM15).
+fun is_win64_nonvol_xmm(reg: u8) bool {
+    ret reg >= 6 && reg <= 15;
 }
 
 # is_win64_nonvol_reg: whether a register number is callee-saved under the win64
@@ -1758,6 +1782,51 @@ fun parse_function_unwind(uw: *FunctionUnwind, segs: *of.LoadSegment, seg_count:
         if ((rex & 4) != 0) { reg = reg + 8; }
         if (!is_win64_nonvol_reg(reg)) { brk; }
         if (!push_save_nonvol(uw, (cur + inst_len)::u8, reg, save_off)) { ret false; }
+        pos = cur + inst_len;
+    }
+
+    # callee-saved XMM saves (`movaps [rbp-off], xmm`), emitted after the GP saves
+    # under win64. each is `[REX.R] 0F 29 modrm disp` storing an XMM6–15 to a
+    # 16-aligned frame slot; recorded as UWOP_SAVE_XMM128 so the unwinder restores
+    # the full register. parsing them here keeps the prologue size and the unwind
+    # codes complete (an unrecognized save would leave them silently invisible).
+    for (true) {
+        var cur: usize = pos;
+        if (cur + 4 > lim) { brk; }
+        var rex: u8 = 0;
+        if (seg.bytes[base + cur] >= 0x40 && seg.bytes[base + cur] <= 0x4F) {
+            rex = seg.bytes[base + cur];
+            cur = cur + 1;
+            if (cur + 4 > lim) { brk; }
+        }
+        # MOVAPS store is `0F 29 /r`; a REX.B extended base is not [rbp].
+        if (seg.bytes[base + cur] != 0x0F || seg.bytes[base + cur + 1] != 0x29) { brk; }
+        if ((rex & 1) != 0) { brk; }
+        val modrm: u8 = seg.bytes[base + cur + 2];
+        val mod: u8 = modrm >> 6;
+        if ((modrm & 7) != 5 || (mod != 1 && mod != 2)) { brk; }
+
+        var disp: i64 = 0;
+        var inst_len: usize = 0;
+        if (mod == 1) {
+            if (cur + 4 > lim) { brk; }
+            disp = (seg.bytes[base + cur + 3]::i8)::i64;
+            inst_len = 4;
+        }
+        or {
+            if (cur + 7 > lim) { brk; }
+            disp = (read_u32_le(seg.bytes, base + cur + 3)::i32)::i64;
+            inst_len = 7;
+        }
+        if (disp >= 0) { brk; }
+
+        val off_rbp: usize = (-disp)::usize;
+        if (alloc < off_rbp) { ret false; }
+        val save_off: usize = alloc - off_rbp;
+        var reg: u8 = ((modrm >> 3) & 7);
+        if ((rex & 4) != 0) { reg = reg + 8; }
+        if (!is_win64_nonvol_xmm(reg)) { brk; }
+        if (!push_save_xmm128(uw, (cur + inst_len)::u8, reg, save_off)) { ret false; }
         pos = cur + inst_len;
     }
 
@@ -2245,9 +2314,9 @@ fun write_unwind_xdata(buf: *u8, lay: *PeLayout, uw: *FunctionUnwind) {
     buf[xoff + 2] = uw.slot_count::u8;
     buf[xoff + 3] = (uw.frame_reg & 0x0F) | ((uw.frame_off & 0x0F) << 4);
 
-    var used: [16]bool;
+    var used: [32]bool;
     var i: usize = 0;
-    for (i < 16) { used[i] = false; i = i + 1; }
+    for (i < 32) { used[i] = false; i = i + 1; }
 
     var slots_written: usize = 0;
     var codes_written: u32 = 0;
@@ -3366,6 +3435,68 @@ test "coff: push_save_nonvol writes the unscaled offset in the SAVE_NONVOL_FAR f
     if (c.extra1 != ((off >> 16) & 0xFFFF)::u16) { ret 1; }
     val scaled: usize = off / 8;
     if (c.extra0 == (scaled & 0xFFFF)::u16 && c.extra1 == ((scaled >> 16) & 0xFFFF)::u16) { ret 1; }
+    ret 0;
+}
+
+test "coff: parse_function_unwind decodes callee-saved XMM saves as SAVE_XMM128 (#1254)" {
+    # push rbp; mov rbp,rsp; sub rsp,0x40; mov [rbp-8],rbx;
+    # movaps [rbp-0x20],xmm6; movaps [rbp-0x30],xmm8 (REX.R); ret
+    var text_bytes: [22]u8;
+    text_bytes[0] = 0x55;
+    text_bytes[1] = 0x48; text_bytes[2] = 0x89; text_bytes[3] = 0xE5;
+    text_bytes[4] = 0x48; text_bytes[5] = 0x83; text_bytes[6] = 0xEC; text_bytes[7] = 0x40;
+    text_bytes[8] = 0x48; text_bytes[9] = 0x89; text_bytes[10] = 0x5D; text_bytes[11] = 0xF8;
+    text_bytes[12] = 0x0F; text_bytes[13] = 0x29; text_bytes[14] = 0x75; text_bytes[15] = 0xE0;
+    text_bytes[16] = 0x44; text_bytes[17] = 0x0F; text_bytes[18] = 0x29; text_bytes[19] = 0x45; text_bytes[20] = 0xD0;
+    text_bytes[21] = 0xC3;
+
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x140000000; segs[0].filesz = 22; segs[0].memsz = 22;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+
+    var funcs: [1]of.ExecFunction;
+    funcs[0].seg_index = 0; funcs[0].seg_offset = 0; funcs[0].size = 22;
+
+    var uw: FunctionUnwind;
+    if (!parse_function_unwind(?uw, ?segs[0], 1, ?funcs[0], 0)) { ret 1; }
+    # PUSH_NONVOL, ALLOC_SMALL, SAVE_NONVOL(rbx), SAVE_XMM128(xmm6), SAVE_XMM128(xmm8).
+    if (uw.code_count != 5) { ret 1; }
+    if (uw.prolog_size != 21) { ret 1; }  # the whole prologue, including the XMM saves
+
+    # codes are recorded in insertion order; the two XMM saves follow the GP save.
+    val x6: *UnwindCode = ?uw.codes[3];
+    if (x6.op != UWOP_SAVE_XMM128) { ret 1; }
+    if (x6.info != 6) { ret 1; }
+    if (x6.extra0 != 2) { ret 1; }   # save_off (0x40 - 0x20) = 0x20, scaled by 16
+    if (x6.end_off != 16) { ret 1; }
+
+    val x8: *UnwindCode = ?uw.codes[4];
+    if (x8.op != UWOP_SAVE_XMM128) { ret 1; }
+    if (x8.info != 8) { ret 1; }
+    if (x8.extra0 != 1) { ret 1; }   # save_off (0x40 - 0x30) = 0x10, scaled by 16
+    if (x8.end_off != 21) { ret 1; }
+
+    ret 0;
+}
+
+test "coff: push_save_xmm128 writes the unscaled offset in the SAVE_XMM128_FAR form" {
+    var uw: FunctionUnwind;
+    uw.code_count = 0;
+    uw.slot_count = 0;
+    # 0x110000 / 16 = 0x11000 exceeds the 16-bit scaled field, forcing the far form.
+    val off: usize = 0x110000;
+    if (!push_save_xmm128(?uw, 0, 9, off)) { ret 1; }  # xmm9
+    if (uw.code_count != 1) { ret 1; }
+    val c: *UnwindCode = ?uw.codes[0];
+    if (c.op != UWOP_SAVE_XMM128_FAR) { ret 1; }
+    if (c.info != 9) { ret 1; }
+    if (c.extra_slots != 2) { ret 1; }
+    if (c.extra0 != (off & 0xFFFF)::u16) { ret 1; }
+    if (c.extra1 != ((off >> 16) & 0xFFFF)::u16) { ret 1; }
+    # a 16-misaligned offset is rejected (MOVAPS requires alignment).
+    uw.code_count = 0;
+    uw.slot_count = 0;
+    if (push_save_xmm128(?uw, 0, 6, 0x18)) { ret 1; }
     ret 0;
 }
 

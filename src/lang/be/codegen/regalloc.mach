@@ -132,6 +132,10 @@ rec LiveRange {
 # gp_count:      number of general-purpose registers in the bank
 # fp_count:      number of floating-point registers in the bank
 # callee_saved:  per-GP-register flag: is this register callee-saved?
+# fp_callee_saved: per-FP-register flag: is this XMM register callee-saved? (the
+#                FP-bank twin of `callee_saved` — win64 preserves XMM6–15, SysV
+#                none, so under SysV every entry is false and the FP callee-save
+#                machinery is inert)
 # reserved:      per-GP-register flag: is this register off-limits (rsp/rbp)?
 # gp_busy:       per-GP-register transient busy flag during scan
 # fp_busy:       per-FP-register transient busy flag during scan
@@ -169,6 +173,7 @@ rec AllocCtx {
     gp_count:      u32;
     fp_count:      u32;
     callee_saved:  *bool;
+    fp_callee_saved: *bool;
     reserved:      *bool;
     gp_busy:       *bool;
     fp_busy:       *bool;
@@ -352,6 +357,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.gp_count     = bank_count(tgt, REG_CLASS_GP);
     ctx.fp_count     = bank_count(tgt, fp_class_index(tgt));
     ctx.callee_saved = nil;
+    ctx.fp_callee_saved = nil;
     ctx.reserved     = nil;
     ctx.gp_busy      = nil;
     ctx.fp_busy      = nil;
@@ -418,11 +424,10 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
             gi = gi + 1;
         }
 
-        # the callee-saved partition comes from the ABI vtable's callee-saved
-        # register file, and the never-allocatable reserved registers (stack / frame
-        # pointers) from the ISA vtable's reserved-register list — no architecture
-        # register is named here, and the linear scan reads these flags unchanged.
-        seed_callee_saved(tgt, ctx);
+        # the never-allocatable reserved registers (stack / frame pointers) come
+        # from the ISA vtable's reserved-register list — no architecture register is
+        # named here, and the linear scan reads these flags unchanged. the
+        # callee-saved partition is seeded below, once the FP bank is also allocated.
         seed_reserved(tgt, ctx);
     }
 
@@ -433,9 +438,22 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
         val rfp: Result[*i64, str] = allocate[i64](m.alloc, ctx.fp_count::usize);
         if (is_err[*i64, str](rfp)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*i64, str](rfp)); }
         ctx.fp_pinned_end = unwrap_ok[*i64, str](rfp);
+        val rfc: Result[*bool, str] = allocate[bool](m.alloc, ctx.fp_count::usize);
+        if (is_err[*bool, str](rfc)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*bool, str](rfc)); }
+        ctx.fp_callee_saved = unwrap_ok[*bool, str](rfc);
         var fii: u32 = 0;
-        for (fii < ctx.fp_count) { ctx.fp_busy[fii] = false; ctx.fp_pinned_end[fii] = -1; fii = fii + 1; }
+        for (fii < ctx.fp_count) {
+            ctx.fp_busy[fii] = false;
+            ctx.fp_pinned_end[fii] = -1;
+            ctx.fp_callee_saved[fii] = false;
+            fii = fii + 1;
+        }
     }
+
+    # seed the callee-saved partition of BOTH banks from the ABI vtable's
+    # callee-saved register file, now that both banks' flag arrays exist. one walk
+    # routes each register to its bank by the composite id's class tag.
+    seed_callee_saved(tgt, ctx);
 
     val ra: Result[*u32, str] = allocate[u32](m.alloc, f.vreg_count::usize);
     if (is_err[*u32, str](ra)) { ctx_dnit(ctx); ret err[bool, str](unwrap_err[*u32, str](ra)); }
@@ -462,6 +480,10 @@ fun ctx_dnit(ctx: *AllocCtx) {
     if (ctx.callee_saved != nil) {
         deallocate[bool](ctx.alloc, ctx.callee_saved, ctx.gp_count::usize);
         ctx.callee_saved = nil;
+    }
+    if (ctx.fp_callee_saved != nil) {
+        deallocate[bool](ctx.alloc, ctx.fp_callee_saved, ctx.fp_count::usize);
+        ctx.fp_callee_saved = nil;
     }
     if (ctx.reserved != nil) {
         deallocate[bool](ctx.alloc, ctx.reserved, ctx.gp_count::usize);
@@ -533,13 +555,16 @@ fun reserve_reg(ctx: *AllocCtx, id: i32) {
 }
 
 # seed_callee_saved: mark every register in the ABI's callee-saved file as
-# callee-saved. reads the file from `tgt.abi.callee_saved` (the convention's
-# preserved GP registers, e.g. SysV's RBX/RBP/R12–R15) rather than naming any
-# architecture register, so a new convention needs no edit here. registers outside
-# the GP bank are ignored.
+# callee-saved in its bank. reads the file from `tgt.abi.callee_saved` (the
+# convention's preserved registers, e.g. SysV's RBX/RBP/R12–R15, or win64's GP set
+# plus XMM6–15) rather than naming any architecture register, so a new convention
+# needs no edit here. each register is routed to the GP or FP flag array by its
+# composite-id class tag, so the FP bank gains the same callee-saved partition the
+# GP bank has always had (the win64 vector callee-saves the old GP-only seed
+# silently dropped).
 # ---
 # tgt: the active target; supplies the ABI callee-saved register file
-# ctx: the allocation context whose `callee_saved` flags are set
+# ctx: the allocation context whose `callee_saved` / `fp_callee_saved` flags are set
 fun seed_callee_saved(tgt: *target.Target, ctx: *AllocCtx) {
     var regs: [32]isa.Register;
     val fill: abi.RegFileFn = tgt.abi.callee_saved::abi.RegFileFn;
@@ -547,8 +572,15 @@ fun seed_callee_saved(tgt: *target.Target, ctx: *AllocCtx) {
     var i: i32 = 0;
     for (i < n && i < MAX_REG_FILE) {
         val id: i32 = regs[i].id;
-        if (id >= 0 && id::u32 < ctx.gp_count) {
-            ctx.callee_saved[id::u32] = true;
+        if (isa.regid_class(id) == isa.REG_CLASS_ID_GP) {
+            if (ctx.callee_saved != nil && id >= 0 && id::u32 < ctx.gp_count) {
+                ctx.callee_saved[id::u32] = true;
+            }
+        } or {
+            val idx: i32 = isa.regid_index(id);
+            if (ctx.fp_callee_saved != nil && idx >= 0 && idx::u32 < ctx.fp_count) {
+                ctx.fp_callee_saved[idx::u32] = true;
+            }
         }
         i = i + 1;
     }
@@ -1227,7 +1259,7 @@ fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
         if (lr.reg_class == REG_CLASS_GP) {
             preg = pick_gp(ctx, lr.crosses_call);
         } or {
-            preg = pick_fp(ctx);
+            preg = pick_fp(ctx, lr.crosses_call);
         }
 
         if (preg >= 0) {
@@ -1612,12 +1644,36 @@ fun fp_available(ctx: *AllocCtx, fi: u32) bool {
     ret true;
 }
 
-# pick_fp: choose a free floating-point register, or -1 when none is free. the
-# chosen within-bank index is composed with the SSE class tag so the returned id
-# carries its bank. an FP range is gated by `fp_available` exactly as a GP range is
-# by `gp_available`, so an argument-setup move's precolored XMM def can no longer be
-# colored over a still-live float (the swapped-float-args miscompile).
-fun pick_fp(ctx: *AllocCtx) i32 {
+# pick_fp: choose a free floating-point register, preferring a callee-saved XMM for
+# a call-crossing range (so the value survives the call without a spill) and a
+# caller-saved one otherwise — the FP-bank twin of pick_gp. -1 when none is free.
+# under SysV no XMM is callee-saved, so the callee-saved loop finds nothing and the
+# caller-saved loop returns the same first-available register the old single loop
+# did (FP behavior is unchanged there). an FP range is gated by `fp_available`
+# exactly as a GP range is by `gp_available`.
+fun pick_fp(ctx: *AllocCtx, crosses_call: bool) i32 {
+    if (crosses_call) {
+        # prefer a free callee-saved XMM so the value survives the call.
+        var ci: u32 = 0;
+        for (ci < ctx.fp_count) {
+            if (fp_available(ctx, ci) && ctx.fp_callee_saved[ci]) {
+                ctx.fp_busy[ci] = true;
+                ret isa.regid_make(isa.REG_CLASS_ID_XMM, ci::i32);
+            }
+            ci = ci + 1;
+        }
+    } or {
+        # prefer a free caller-saved XMM to leave callee-saved untouched.
+        var ci: u32 = 0;
+        for (ci < ctx.fp_count) {
+            if (fp_available(ctx, ci) && !ctx.fp_callee_saved[ci]) {
+                ctx.fp_busy[ci] = true;
+                ret isa.regid_make(isa.REG_CLASS_ID_XMM, ci::i32);
+            }
+            ci = ci + 1;
+        }
+    }
+    # fall back to any free XMM of either partition.
     var fi: u32 = 0;
     for (fi < ctx.fp_count) {
         if (fp_available(ctx, fi)) {
@@ -1679,7 +1735,7 @@ fun spill_on_pressure(ctx: *AllocCtx, v: u32) Result[bool, str] {
     if (lr.reg_class == REG_CLASS_GP) {
         preg = pick_gp(ctx, lr.crosses_call);
     } or {
-        preg = pick_fp(ctx);
+        preg = pick_fp(ctx, lr.crosses_call);
     }
     if (preg >= 0) {
         assign(ctx, v, preg::u32, lr.reg_class);
@@ -1916,7 +1972,17 @@ fun spill_across_calls(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
 
             var must_spill: bool = false;
             if (lr.reg_class != REG_CLASS_GP) {
-                must_spill = true;
+                # an FP value: spill only when its XMM is caller-saved (a
+                # callee-saved XMM survives the call once the prologue preserves it).
+                # under SysV every XMM is caller-saved, so this still spills every
+                # FP value across a call. an asm barrier additionally spills a
+                # callee-saved XMM the body writes.
+                val xidx: u32 = isa.regid_index(mv.assigned::i32)::u32;
+                if (xidx >= ctx.fp_count || !ctx.fp_callee_saved[xidx]) {
+                    must_spill = true;
+                } or (is_asm && (asm_fp & (1::u32 << xidx)) != 0) {
+                    must_spill = true;
+                }
             } or (mv.assigned < ctx.gp_count && !ctx.callee_saved[mv.assigned]) {
                 must_spill = true;
             } or (is_asm && mv.assigned < ctx.gp_count && (asm_gp & (1::u32 << mv.assigned)) != 0) {
@@ -1934,23 +2000,32 @@ fun spill_across_calls(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
-# record_callee_mask: set `MirFunction.callee_mask` bit `n` for every callee-saved
-# GP register the function must preserve — those the allocator assigned, plus any
-# a function's inline asm body writes. the prologue saves and the epilogue restores
-# exactly these. the asm contribution closes the caller-corruption path: an asm
-# body may overwrite a callee-saved register the allocator never assigned (so its
-# value was spilled or never placed there), yet the function still owes its caller
-# that register's preservation.
+# record_callee_mask: set `MirFunction.callee_mask` / `callee_mask_fp` bit `n` for
+# every callee-saved GP / XMM register the function must preserve — those the
+# allocator assigned, plus any a function's inline asm body writes (GP only; the
+# inline-asm grammar names no vector register). the prologue saves and the epilogue
+# restores exactly these. the asm contribution closes the caller-corruption path:
+# an asm body may overwrite a callee-saved register the allocator never assigned
+# (so its value was spilled or never placed there), yet the function still owes its
+# caller that register's preservation. the FP mask is keyed on the XMM within-bank
+# index; under SysV (no callee-saved XMM) it stays 0.
 fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
     var mask: u32 = 0;
+    var fp_mask: u32 = 0;
     var v: u32 = 0;
     for (v < ctx.f.vreg_count) {
         val mv: *mir.MirVReg = ?ctx.f.vregs[v];
         if (mv.assigned == mir.MIR_VREG_NIL) { v = v + 1; cnt; }
         val lr: *LiveRange = ?ctx.ranges[v];
-        if (lr.reg_class != REG_CLASS_GP) { v = v + 1; cnt; }
-        if (mv.assigned < ctx.gp_count && ctx.callee_saved[mv.assigned] && !ctx.reserved[mv.assigned]) {
-            mask = mask | (1::u32 << mv.assigned);
+        if (lr.reg_class == REG_CLASS_GP) {
+            if (mv.assigned < ctx.gp_count && ctx.callee_saved[mv.assigned] && !ctx.reserved[mv.assigned]) {
+                mask = mask | (1::u32 << mv.assigned);
+            }
+        } or {
+            val xidx: u32 = isa.regid_index(mv.assigned::i32)::u32;
+            if (ctx.fp_callee_saved != nil && xidx < ctx.fp_count && ctx.fp_callee_saved[xidx]) {
+                fp_mask = fp_mask | (1::u32 << xidx);
+            }
         }
         v = v + 1;
     }
@@ -1960,7 +2035,8 @@ fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
     # value lives there.
     mask = mask | asm_callee_mask(tgt, ctx.f);
 
-    ctx.f.callee_mask = mask;
+    ctx.f.callee_mask    = mask;
+    ctx.f.callee_mask_fp = fp_mask;
 }
 
 # rewrite: the final pass. for each block, rebuild its instruction list so every
