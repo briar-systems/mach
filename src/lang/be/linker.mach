@@ -51,6 +51,7 @@ use mem: std.memory;
 use fs:  std.filesystem;
 use map: std.collections.map;
 use maphash: std.collections.map;
+use page: std.allocator.page;
 
 use sess:   mach.lang.session;
 use intern: mach.lang.intern;
@@ -105,12 +106,17 @@ rec MergedSection {
     used:  bool;
 }
 
-# resolved location of a defined symbol: its final virtual address (the only
-# datum relocation patching needs). undefined symbols never enter this table.
+# resolved location of a defined symbol: its final virtual address (what
+# relocation patching needs) and whether the winning definition is weak, so a
+# later strong definition can override it rather than collide. undefined symbols
+# never enter this table.
 # ---
 # vaddr: final virtual address of the symbol (its section's vaddr + offset)
+# weak:  true while the current winner is a weak definition (overridable by a
+#        later strong definition; a strong winner errors on a second strong)
 rec SymbolLoc {
     vaddr: u64;
+    weak:  bool;
 }
 
 # the linker's mutable dynamic-link state: the format-neutral plan (`of.DynamicInfo`)
@@ -979,24 +985,29 @@ fun collect_symbols(s: *sess.Session, modules: *of.ObjectImage, module_count: u3
             val flat: u32 = sec_base[m] + sym.section;
             val pl: *Placement = ?placements[flat];
 
+            val is_weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
+            var vaddr: u64 = 0;
+            if (have_vaddrs) { vaddr = pl.vaddr + sym.offset::u64; }
+
             val existing: Result[*SymbolLoc, str] =
                 map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name);
             if (is_ok[*SymbolLoc, str](existing)) {
-                val is_weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
-                if (!is_weak) {
-                    ret err[bool, str](dup_message(s, sym.name));
-                }
+                # standard weak/strong resolution, independent of input order: a weak
+                # definition never displaces an existing one; a strong definition
+                # overrides an existing weak winner (taking its address) but collides
+                # with an existing strong one.
+                val cur: *SymbolLoc = unwrap_ok[*SymbolLoc, str](existing);
+                if (is_weak) { sy = sy + 1; cnt; }
+                if (!cur.weak) { ret err[bool, str](dup_message(s, sym.name)); }
+                cur.vaddr = vaddr;
+                cur.weak = false;
                 sy = sy + 1;
                 cnt;
             }
 
             var loc: SymbolLoc;
-            if (have_vaddrs) {
-                loc.vaddr = pl.vaddr + sym.offset::u64;
-            }
-            or {
-                loc.vaddr = 0;
-            }
+            loc.vaddr = vaddr;
+            loc.weak = is_weak;
 
             val ins: Result[bool, str] =
                 map.insert[intern.StrId, SymbolLoc](sym_locs, sym.name, loc);
@@ -1757,4 +1768,76 @@ fun cstr_len(p: *u8) usize {
     var n: usize = 0;
     for (p[n] != 0) { n = n + 1; }
     ret n;
+}
+
+# lt_link: collect two single-symbol modules into a fresh symbol table and return
+# the winning definition's resolved virtual address (or the collect error). a test
+# helper for the weak/strong resolution rules; module 0 is placed at 0x1000 and
+# module 1 at 0x2000 so the winner is identifiable by address.
+fun lt_link(s: *sess.Session, name: intern.StrId, a: *of.Symbol, b: *of.Symbol) Result[u64, str] {
+    var placements: [2]Placement;
+    placements[0].vaddr = 0x1000; placements[0].offset = 0; placements[0].merged_index = 0;
+    placements[1].vaddr = 0x2000; placements[1].offset = 0; placements[1].merged_index = 0;
+    var sec_base: [2]u32;
+    sec_base[0] = 0; sec_base[1] = 1;
+
+    var mods: [2]of.ObjectImage;
+    mods[0].alloc = s.alloc; mods[0].symbols = a; mods[0].symbol_count = 1;
+    mods[0].sections = nil; mods[0].section_count = 1; mods[0].relocations = nil; mods[0].reloc_count = 0;
+    mods[1].alloc = s.alloc; mods[1].symbols = b; mods[1].symbol_count = 1;
+    mods[1].sections = nil; mods[1].section_count = 1; mods[1].relocations = nil; mods[1].reloc_count = 0;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](s.alloc, maphash.hash_u32, maphash.eq_u32);
+    val cr: Result[bool, str] = collect_symbols(s, ?mods[0], 2, ?placements[0], ?sec_base[0], ?locs, true);
+    if (is_err[bool, str](cr)) {
+        map.dnit[intern.StrId, SymbolLoc](?locs);
+        ret err[u64, str](unwrap_err[bool, str](cr));
+    }
+    val g: Result[*SymbolLoc, str] = map.get[intern.StrId, SymbolLoc](?locs, ?name);
+    if (is_err[*SymbolLoc, str](g)) {
+        map.dnit[intern.StrId, SymbolLoc](?locs);
+        ret err[u64, str]("missing");
+    }
+    val v: u64 = unwrap_ok[*SymbolLoc, str](g).vaddr;
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    ret ok[u64, str](v);
+}
+
+test "linker: weak/strong symbol resolution is order-independent (#1257)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    val ri: Result[intern.StrId, str] = intern.intern(?s.interner, "dup");
+    if (is_err[intern.StrId, str](ri)) { ret 1; }
+    val nm: intern.StrId = unwrap_ok[intern.StrId, str](ri);
+
+    var weak: of.Symbol;
+    weak.name = nm; weak.section = 0; weak.offset = 0; weak.size = 0;
+    weak.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK;
+    var strong: of.Symbol;
+    strong.name = nm; strong.section = 0; strong.offset = 0; strong.size = 0;
+    strong.flags = of.SYM_OBJ_FLAG_GLOBAL;
+    var strong2: of.Symbol;
+    strong2.name = nm; strong2.section = 0; strong2.offset = 0; strong2.size = 0;
+    strong2.flags = of.SYM_OBJ_FLAG_GLOBAL;
+
+    # weak-then-strong: the strong definition must override the weak one (before
+    # #1257 this was a hard "multiple definition" error), and its address wins.
+    val r1: Result[u64, str] = lt_link(?s, nm, ?weak, ?strong);
+    if (is_err[u64, str](r1)) { ret 1; }
+    if (unwrap_ok[u64, str](r1) != 0x2000) { ret 1; }
+
+    # strong-then-weak: the later weak definition is skipped; the strong wins.
+    val r2: Result[u64, str] = lt_link(?s, nm, ?strong, ?weak);
+    if (is_err[u64, str](r2)) { ret 1; }
+    if (unwrap_ok[u64, str](r2) != 0x1000) { ret 1; }
+
+    # strong-then-strong: still a multiple-definition error.
+    val r3: Result[u64, str] = lt_link(?s, nm, ?strong, ?strong2);
+    if (!is_err[u64, str](r3)) { ret 1; }
+    ret 0;
 }
