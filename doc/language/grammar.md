@@ -156,11 +156,11 @@ char escapes:   \n  \t  \r  \\  \'  \0  \xHH
 string escapes: (char escapes) + \"
 ```
 
-A string literal may span multiple lines: the lexer scans from the opening
-`"` to the next unescaped `"` or to EOF, and a newline in between is just
-another body byte (it does not terminate the literal). A char literal scans
-likewise to the next `'` or EOF. An unterminated `'` or `"` (the scan hits
-EOF first) is a lexer error but still produces a token span.
+A string literal is single-line (see [literals.md](literals.md)): the lexer
+scans from the opening `"` to the next unescaped `"`, stopping at an
+unescaped newline or EOF. A char literal scans likewise to the next `'`. An
+unterminated `'` or `"` (the scan hits a newline or EOF first) is a lexer
+error but still produces a token span covering the rest of that line.
 
 ### Comments and whitespace
 
@@ -274,13 +274,16 @@ typed-name ::= [ "$" ] IDENT ":" type
 ### `val` / `var` — bindings
 
 ```ebnf
-bind-decl ::= ( "val" | "var" ) IDENT [ ":" type ] [ "=" expr ] ";"
+val-decl  ::= "val" IDENT ":" type "=" expr ";"
+var-decl  ::= "var" IDENT ":" type [ "=" expr ] ";"
+bind-decl ::= val-decl | var-decl
 ```
 
-`val` is immutable, `var` mutable. Both the type annotation and the
-initializer are independently optional in the grammar (the parser accepts
-either, both, or neither); semantic checks enforce the real requirements.
-A `val`/`var` may also appear as a local statement (see [Statements](#statements)).
+`val` is immutable, `var` mutable. The type annotation is mandatory for both
+(Mach has no type inference — see [val-var.md](val-var.md)); the parser
+rejects a binding with no `: type`. A `val` requires an initializer; a `var`
+may omit it and is default-initialized. A `val`/`var` may also appear as a
+local statement (see [Statements](#statements)).
 
 ### `test`
 
@@ -433,10 +436,16 @@ cast         ::= ( "::" | ":~" ) type
 [operators.md](operators.md#cast). Both bind as postfix.
 
 Disambiguating a postfix `[`:
-- `callee[T, U](args)` — a generic call: the bracketed list is scanned; if
-  the token after the matching `]` is `(`, it is parsed as type arguments
-  followed by a call.
-- `obj[idx]` — an index expression otherwise.
+- `callee[T, U](args)` — a generic call: the bracketed list is committed as
+  type arguments only when its first token can begin a type (`*`, `[`, or an
+  identifier) **and** the token after the matching `]` is `(`.
+- `obj[idx]` — an index expression otherwise. In particular a bracket whose
+  payload starts with a token that cannot begin a type (a literal, `-`, `@`,
+  `$`, …) is always an index, so `table[0]()` parses as index-then-call —
+  calling an element of a function-pointer table needs no parentheses.
+- The single residual ambiguity is a bare identifier payload (`callee[x](…)`):
+  it is locally indistinguishable from one type argument and binds as a
+  generic call; name resolution owns that case.
 - The struct-literal `Name[T]{...}` form is recognized at the **prefix**
   stage (`typed-literal`) and never reaches postfix.
 
