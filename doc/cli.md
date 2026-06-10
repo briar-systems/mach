@@ -241,13 +241,15 @@ mach init [dir] [options]
 Scaffolds a new project in `[dir]` (default: the current directory). Writes a
 complete `mach.toml` with a `[project]` block, default targets for
 `linux`/`windows`/`darwin` (on the host ISA), a `[deps.mach-std]` dependency, a
-starter source file, and `dep/mach-std/` cloned from the declared ref. Refuses
-to overwrite an existing `mach.toml` unless `--force`.
+starter source file, and `dep/mach-std/` cloned from the declared ref (through
+the same path as `mach dep sync`). Refuses to overwrite an existing `mach.toml`,
+`src/main.mach`, or `src/lib.mach` unless `--force`; every collision is checked
+before any file is written, so a refused init leaves nothing behind.
 
 | Flag           | Value | Effect |
 |----------------|-------|--------|
 | `--name <name>`| name  | project id (default: the directory base name) |
-| `--force`      | —     | scaffold even when a `mach.toml` already exists |
+| `--force`      | —     | scaffold even when `mach.toml`, `src/main.mach`, or `src/lib.mach` already exists |
 | `--lib`        | —     | library layout: write `src/lib.mach` instead of `src/main.mach`, and scaffold targets in `mode = "library"` with `entrypoint = "lib.mach"` |
 
 The first non-flag argument after `init` is the target directory.
