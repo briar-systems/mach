@@ -28,7 +28,17 @@ val z: i32x4  = (m & n) ^ k;     # vectors not yet implemented
 ## Comparison
 
 `==` `!=` `<` `>` `<=` `>=` — produce `u8` (`1` or `0`). Mach has no compiler
-`bool`; `bool` is a stdlib alias for `u8`. Compare values of matching types.
+`bool`; `bool` is a stdlib alias for `u8`. Comparisons relate **mathematical
+values**, so the result is identical in either operand order:
+
+- **integer vs integer** — any signedness and width mix is legal and compares
+  the true values (e.g. a negative `i64` is never equal to, and always less
+  than, any `u64`). Width aliases (`usize`, `isize`) follow their backing type.
+- **float vs float** — any width mix is legal; the narrower operand widens
+  exactly (`f32` -> `f64`).
+- **integer vs float** — a compile error; cast one operand explicitly with
+  `::`. An implicit widening would hide `f64` rounding above `2^53`.
+
 A pointer may be compared against `nil` (the null-address literal). On the
 planned SIMD vectors, comparison produces a mask vector (lane-wise).
 
