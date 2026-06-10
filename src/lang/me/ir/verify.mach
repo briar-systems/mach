@@ -25,6 +25,8 @@ use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
 use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
 use std.types.option.is_some;
 use std.types.option.unwrap;
 
@@ -38,6 +40,10 @@ use instr:   mach.lang.me.ir.instruction;
 use value:   mach.lang.me.ir.value;
 use ir_type: mach.lang.me.ir.type;
 use id:      mach.lang.me.ir.id;
+
+use page:    std.allocator.page;
+use builder: mach.lang.me.ir.builder;
+use intern:  mach.lang.intern;
 
 # selects which invariant a `Violation` records.
 pub def VerifyCheck: u8;
@@ -72,10 +78,22 @@ pub val VC_REACHABILITY:    VerifyCheck = 9;
 pub val VC_AGG_ADDRESS:     VerifyCheck = 10;
 
 # an operand carries a type id that does not resolve in the module's type table
-# (and is not the IRT_NIL sentinel), or a GEP's source-pointee aux_ty is
-# unresolvable. a stale id silently classifies as scalar/size-8 downstream,
-# turning a sized memcpy into a truncated move.
+# (and is not the IRT_NIL sentinel), or a GEP/ALLOCA/MEMZERO aux_ty or a CALL's
+# stamped signature is unresolvable. a stale id silently classifies as
+# scalar/size-8 downstream, turning a sized memcpy into a truncated move.
 pub val VC_TYPE_RESOLVE:    VerifyCheck = 11;
+
+# an InstructionId named in a block's phi list, body list, or terminator slot is
+# out of range (>= Function.instr_len) or the INSTR_NIL sentinel — a dangling id
+# that every downstream consumer would dereference out of bounds.
+pub val VC_DANGLING_ID:     VerifyCheck = 12;
+
+# two operands an opcode requires to share a type disagree, or an operand's type
+# violates the opcode's typing contract (a binary op's operands differ, a branch
+# condition is not an integer, a store/load/gep base is not a pointer, a ret's
+# value type disagrees with the function signature, a branch target is not a
+# const-int block id). opt-in alongside the other `repr` checks.
+pub val VC_TYPE_AGREE:      VerifyCheck = 13;
 
 # one invariant failure, located as precisely as the failing check allows.
 # ---
@@ -128,6 +146,9 @@ pub fun verify_module(m: *ir.Module, alloc: *Allocator) Result[VerifyReport, str
 # m:     the module to validate
 # alloc: allocator for the report's violations array
 # full:  enforce reachability / dominance (post-DCE invariants)
+# repr:  enable the opt-in aggregate-representation / type-resolution / type-
+#        agreement checks (VC_AGG_ADDRESS, VC_TYPE_RESOLVE, VC_TYPE_AGREE) that a
+#        clean self-host promotes to always-on
 # ret:   a VerifyReport, or an allocation error
 pub fun verify_module_ext(m: *ir.Module, alloc: *Allocator, full: bool, repr: bool) Result[VerifyReport, str] {
     var r: VerifyReport;
@@ -180,7 +201,9 @@ pub fun describe(check: VerifyCheck) str {
     if (check == VC_DOMINANCE)       { ret "dominance: operand definition does not dominate its use"; }
     if (check == VC_REACHABILITY)    { ret "reachability: block is unreachable"; }
     if (check == VC_AGG_ADDRESS)     { ret "aggregate representation: aggregate-typed operand is not address-producing"; }
-    if (check == VC_TYPE_RESOLVE)    { ret "type resolution: operand or gep aux type does not resolve"; }
+    if (check == VC_TYPE_RESOLVE)    { ret "type resolution: operand or aux type does not resolve"; }
+    if (check == VC_DANGLING_ID)     { ret "dangling id: a block list names an out-of-range instruction id"; }
+    if (check == VC_TYPE_AGREE)      { ret "type agreement: operand types violate the opcode's typing contract"; }
     ret "unknown verification check";
 }
 
@@ -192,6 +215,9 @@ fun verify_function(m: *ir.Module, fn: *ir.Function, fi: u32, r: *VerifyReport, 
 
     val ds: Result[bool, str] = check_definitions(fn, fi, r);
     if (is_err[bool, str](ds)) { ret ds; }
+
+    val bl: Result[bool, str] = check_block_lists(fn, fi, r);
+    if (is_err[bool, str](bl)) { ret bl; }
 
     var bi: u32 = 0;
     for (bi < fn.block_count) {
@@ -261,13 +287,59 @@ fun check_definitions(fn: *ir.Function, fi: u32, r: *VerifyReport) Result[bool, 
     ret ok[bool, str](true);
 }
 
-# marks one placed instruction id, reporting VC_SSA on a repeat.
+# marks one placed instruction id, reporting VC_SSA on a repeat. an out-of-range
+# id is not the concern of this check (check_block_lists flags it as
+# VC_DANGLING_ID); skipping it here avoids a duplicate report.
 fun mark_def(seen: *u8, iid: id.InstructionId, fn: *ir.Function, bi: u32, fi: u32, r: *VerifyReport) Result[bool, str] {
     if (iid >= fn.instr_len) { ret ok[bool, str](true); }
     if (seen[iid] != 0) {
         ret push(r, fi, bi::id.BlockId, iid, VC_SSA);
     }
     seen[iid] = 1;
+    ret ok[bool, str](true);
+}
+
+# VC_DANGLING_ID: every InstructionId named in a block's phi list, body list, or
+# terminator slot must be in range. this is the silent skip every other walk
+# relied on; flagging it here turns block-list corruption into a precise
+# violation instead of a downstream out-of-bounds read.
+fun check_block_lists(fn: *ir.Function, fi: u32, r: *VerifyReport) Result[bool, str] {
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var p: u32 = 0;
+        for (p < blk.phi_count) {
+            val rr: Result[bool, str] = check_listed_id(fn, blk.phis[p], fi, blk.id, r);
+            if (is_err[bool, str](rr)) { ret rr; }
+            p = p + 1;
+        }
+        var ix: u32 = 0;
+        for (ix < blk.instr_count) {
+            val rr: Result[bool, str] = check_listed_id(fn, blk.instructions[ix], fi, blk.id, r);
+            if (is_err[bool, str](rr)) { ret rr; }
+            ix = ix + 1;
+        }
+        # an INSTR_NIL terminator slot is the "no terminator yet" state, reported
+        # by VC_TERM_PRESENCE; only a non-nil id is checked for danglingness here.
+        if (blk.terminator != id.INSTR_NIL) {
+            val rr: Result[bool, str] = check_listed_id(fn, blk.terminator, fi, blk.id, r);
+            if (is_err[bool, str](rr)) { ret rr; }
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# checks one block-list id: out-of-range / INSTR_NIL is VC_DANGLING_ID. the
+# instruction's own `block` field is intentionally NOT cross-checked here:
+# Instruction.block is vestigial (no consumer reads it — the back end derives
+# placement from the block lists, regalloc's FlatInstr) and passes maintain it
+# inconsistently, so verifying it would flag harmless transient metadata. see
+# the block-agreement note on #1250.
+fun check_listed_id(fn: *ir.Function, iid: id.InstructionId, fi: u32, bid: id.BlockId, r: *VerifyReport) Result[bool, str] {
+    if (iid == id.INSTR_NIL || iid >= fn.instr_len) {
+        ret push(r, fi, bid, iid, VC_DANGLING_ID);
+    }
     ret ok[bool, str](true);
 }
 
@@ -315,20 +387,18 @@ fun check_terminator_unique(fn: *ir.Function, blk: *ir.Block, fi: u32, r: *Verif
     ret ok[bool, str](true);
 }
 
-# VC_SUCC_EXISTS: a terminator's block targets must be in range.
+# VC_SUCC_EXISTS: a terminator's block targets must be in range. successors are
+# decoded through the single ir.block_successors access point.
 fun check_successors(fn: *ir.Function, blk: *ir.Block, fi: u32, r: *VerifyReport) Result[bool, str] {
-    if (blk.terminator == id.INSTR_NIL || blk.terminator >= fn.instr_len) { ret ok[bool, str](true); }
-    val t: *instr.Instruction = ?fn.instrs[blk.terminator];
-
     var s0: id.BlockId = id.BLOCK_NIL;
     var s1: id.BlockId = id.BLOCK_NIL;
-    succ_targets(t, ?s0, ?s1);
+    val sc: u32 = ir.block_successors(fn, blk, ?s0, ?s1);
 
-    if (s0 != id.BLOCK_NIL && s0 >= fn.block_count) {
+    if (sc >= 1 && s0 >= fn.block_count) {
         val rr: Result[bool, str] = push(r, fi, blk.id, blk.terminator, VC_SUCC_EXISTS);
         if (is_err[bool, str](rr)) { ret rr; }
     }
-    if (s1 != id.BLOCK_NIL && s1 >= fn.block_count) {
+    if (sc >= 2 && s1 >= fn.block_count) {
         val rr: Result[bool, str] = push(r, fi, blk.id, blk.terminator, VC_SUCC_EXISTS);
         if (is_err[bool, str](rr)) { ret rr; }
     }
@@ -393,24 +463,127 @@ fun check_one_instr(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, fi: 
         }
         oi = oi + 1;
     }
-    # VC_TYPE_RESOLVE: a GEP with indices descends from its source-pointee aux_ty;
-    # it must resolve (an aggregate kind is NOT required — a single-index pointer
-    # stride legitimately walks a scalar element type).
-    if (repr && ins.kind == instr.OP_GEP && ins.operand_count > 1) {
-        val at: Option[*ir_type.IrType] = ir_type.get(?m.types, ins.aux_ty);
-        if (!is_some[*ir_type.IrType](at)) {
-            val rr: Result[bool, str] = push(r, fi, bid, iid, VC_TYPE_RESOLVE);
-            if (is_err[bool, str](rr)) { ret rr; }
-        }
+    if (repr) {
+        val ax: Result[bool, str] = check_aux_resolve(m, ins, fi, bid, iid, r);
+        if (is_err[bool, str](ax)) { ret ax; }
+        val ta: Result[bool, str] = check_type_agree(m, ins, fi, bid, iid, r);
+        if (is_err[bool, str](ta)) { ret ta; }
     }
     ret ok[bool, str](true);
+}
+
+# VC_TYPE_RESOLVE: the per-opcode auxiliary type slot must resolve in the type
+# table. each opcode that carries a type the back end resolves is checked:
+#   OP_GEP     aux_ty  the source pointee the index walk descends (when indexed)
+#   OP_MEMZERO aux_ty  the aggregate pointee whose byte_size sizes the fill
+#   OP_CALL    aux_ty  the stamped IRT_FN signature classifying the ABI
+#   OP_ALLOCA  ty      the allocated element type sizing the stack slot
+# a stale id silently classifies as scalar/size-8 (or zeroes nothing for
+# memzero) downstream, so an unresolvable aux type is a real miscompile.
+fun check_aux_resolve(m: *ir.Module, ins: *instr.Instruction, fi: u32, bid: id.BlockId, iid: id.InstructionId, r: *VerifyReport) Result[bool, str] {
+    var ty: ir_type.IrTypeId = ir_type.IRT_NIL;
+    if (ins.kind == instr.OP_GEP && ins.operand_count > 1) { ty = ins.aux_ty; }
+    or (ins.kind == instr.OP_MEMZERO) { ty = ins.aux_ty; }
+    or (ins.kind == instr.OP_CALL)    { ty = ins.aux_ty; }
+    or (ins.kind == instr.OP_ALLOCA)  { ty = ins.ty; }
+    or { ret ok[bool, str](true); }
+
+    val at: Option[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (!is_some[*ir_type.IrType](at)) {
+        ret push(r, fi, bid, iid, VC_TYPE_RESOLVE);
+    }
+    ret ok[bool, str](true);
+}
+
+# VC_TYPE_AGREE: the cleanly well-defined operand-typing contracts the builder
+# emits on trust. a binary/compare op's two operands share a type (the result
+# type the builder copies from lhs is then unambiguous); a load/store/gep/memzero
+# addresses memory (an IR pointer or an aggregate carried by address); a branch
+# target is a const-int block id and a cbr condition is integer-typed. ret-value-
+# vs-signature and call-args-vs-signature need IRT_FN payload + vararg/sret
+# reasoning and are scoped on #1250. shifts are excluded: a shift count
+# legitimately differs in width from the shifted value.
+fun check_type_agree(m: *ir.Module, ins: *instr.Instruction, fi: u32, bid: id.BlockId, iid: id.InstructionId, r: *VerifyReport) Result[bool, str] {
+    val k: instr.InstrKind = ins.kind;
+
+    if (is_binary_agree(k) && ins.operand_count == 2) {
+        val t0: ir_type.IrTypeId = ins.operands[0].ty;
+        val t1: ir_type.IrTypeId = ins.operands[1].ty;
+        # exact type identity, except that two pointer-ish operands agree even when
+        # their ids differ: by the aggregate-representation convention an address
+        # can be IRT_PTR (a plain pointer / nil), an IRT_FN (a function pointer), or
+        # an aggregate type, so pointer/fnptr/aggregate-vs-nil compares are well
+        # typed. the check still catches scalar width / int-vs-float mismatches.
+        if (t0 != t1 && !(is_pointerish(m, t0) && is_pointerish(m, t1))) {
+            ret push(r, fi, bid, iid, VC_TYPE_AGREE);
+        }
+    }
+    if (k == instr.OP_LOAD && ins.operand_count >= 1) {
+        if (!is_address_typed(m, ins.operands[0].ty)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_STORE && ins.operand_count >= 2) {
+        if (!is_address_typed(m, ins.operands[1].ty)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_GEP && ins.operand_count >= 1) {
+        if (!is_address_typed(m, ins.operands[0].ty)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_MEMZERO && ins.operand_count >= 1) {
+        if (!is_address_typed(m, ins.operands[0].ty)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_BR && ins.operand_count >= 1) {
+        if (ins.operands[0].kind != value.VAL_CONST_INT) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_CBR && ins.operand_count >= 3) {
+        if (!type_has_kind(m, ins.operands[0].ty, ir_type.IRT_INT)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+        if (ins.operands[1].kind != value.VAL_CONST_INT) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+        if (ins.operands[2].kind != value.VAL_CONST_INT) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    ret ok[bool, str](true);
+}
+
+# true for the binary and comparison opcodes whose two operands must share a
+# type. shifts are deliberately absent (the count may differ in width).
+fun is_binary_agree(k: instr.InstrKind) bool {
+    if (k == instr.OP_ADD || k == instr.OP_SUB || k == instr.OP_MUL) { ret true; }
+    if (k == instr.OP_DIV_S || k == instr.OP_DIV_U) { ret true; }
+    if (k == instr.OP_REM_S || k == instr.OP_REM_U) { ret true; }
+    if (k == instr.OP_AND || k == instr.OP_OR || k == instr.OP_XOR) { ret true; }
+    if (k == instr.OP_CMP_EQ || k == instr.OP_CMP_NE) { ret true; }
+    if (k == instr.OP_CMP_LT_S || k == instr.OP_CMP_LT_U) { ret true; }
+    if (k == instr.OP_CMP_LE_S || k == instr.OP_CMP_LE_U) { ret true; }
+    ret false;
+}
+
+# true when type id `ty` resolves to a type of kind `k`.
+fun type_has_kind(m: *ir.Module, ty: ir_type.IrTypeId, k: ir_type.IrTypeKind) bool {
+    val ot: Option[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (!is_some[*ir_type.IrType](ot)) { ret false; }
+    ret unwrap[*ir_type.IrType](ot).kind == k;
+}
+
+# true when `ty` denotes a memory address: an IR pointer, or an aggregate type.
+# by the IR's aggregate-representation convention an aggregate value is carried
+# by address (a pointer tagged with the aggregate type, see value.retype), so a
+# load/store/gep/memzero base may be aggregate-typed as well as IRT_PTR.
+fun is_address_typed(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    if (type_has_kind(m, ty, ir_type.IRT_PTR)) { ret true; }
+    ret ir_type.is_aggregate(?m.types, ty);
+}
+
+# true when `ty` is physically a pointer-sized address: an IR pointer, a function
+# pointer (IRT_FN — compared against nil and each other), or an aggregate carried
+# by address. used to bless pointer-vs-nil / fnptr-vs-nil / aggregate compares,
+# which are well-typed even though the operand type ids differ.
+fun is_pointerish(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    if (type_has_kind(m, ty, ir_type.IRT_FN)) { ret true; }
+    ret is_address_typed(m, ty);
 }
 
 # agg_value_is_address_producing: an aggregate value flows by address, so a valid
 # aggregate-typed operand must be a global (its symbol IS the address), a parameter
 # (lower_params establishes its storage), or the result of an address-producing
-# instruction. alloca/gep yield addresses directly; load/call/bitcast pass an
-# aggregate's storage pointer through (the back end reads it by reference). a
+# instruction. alloca/gep yield addresses directly; load/call/va_arg/bitcast pass
+# an aggregate's storage pointer through (the back end reads it by reference). a
 # constant cannot be an aggregate's storage address.
 fun agg_value_is_address_producing(fn: *ir.Function, op: *value.Value) bool {
     if (op.kind == value.VAL_GLOBAL) { ret true; }
@@ -420,155 +593,392 @@ fun agg_value_is_address_producing(fn: *ir.Function, op: *value.Value) bool {
         if (did >= fn.instr_len) { ret false; }
         val k: instr.InstrKind = (?fn.instrs[did]).kind;
         ret k == instr.OP_ALLOCA || k == instr.OP_GEP || k == instr.OP_LOAD
-            || k == instr.OP_CALL || k == instr.OP_BITCAST;
+            || k == instr.OP_CALL || k == instr.OP_BITCAST || k == instr.OP_VA_ARG;
     }
     ret false;
 }
 
-# VC_PRED_CONSISTENT: a block's recorded preds must equal the multiset of
-# blocks whose terminator targets it. checked by counting incoming edges per
-# target and comparing to pred_count.
+# VC_PRED_CONSISTENT: a block's recorded preds must equal — as a multiset — the
+# set of blocks whose terminator targets it. for each target the incoming edge
+# multiset (decoded via ir.block_successors) is differenced against the pred
+# list; a nonzero residue, or an out-of-range pred id, is a mismatch. comparing
+# membership (not just counts) catches a pred list of the right length but wrong
+# members, which the old count-only test accepted.
 fun check_pred_consistency(fn: *ir.Function, fi: u32, r: *VerifyReport) Result[bool, str] {
-    val cr: Result[*u32, str] = allocate[u32](r.alloc, fn.block_count::usize);
+    val n: u32 = fn.block_count;
+    if (n == 0) { ret ok[bool, str](true); }
+    val cr: Result[*u32, str] = allocate[u32](r.alloc, n::usize);
     if (is_err[*u32, str](cr)) { ret err[bool, str](unwrap_err[*u32, str](cr)); }
-    val incoming: *u32 = unwrap_ok[*u32, str](cr);
-    var i: u32 = 0;
-    for (i < fn.block_count) { incoming[i] = 0; i = i + 1; }
+    val count: *u32 = unwrap_ok[*u32, str](cr);
 
-    var bi: u32 = 0;
-    for (bi < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[bi];
-        if (blk.terminator != id.INSTR_NIL && blk.terminator < fn.instr_len) {
-            val t: *instr.Instruction = ?fn.instrs[blk.terminator];
+    var ti: u32 = 0;
+    for (ti < n) {
+        var z: u32 = 0;
+        for (z < n) { count[z] = 0; z = z + 1; }
+
+        val blk: *ir.Block = ?fn.blocks[ti];
+        var bad: bool = false;
+        var pi: u32 = 0;
+        for (pi < blk.pred_count) {
+            val p: id.BlockId = blk.preds[pi];
+            if (p < n) { count[p] = count[p] + 1; } or { bad = true; }
+            pi = pi + 1;
+        }
+        var s: u32 = 0;
+        for (s < n) {
             var s0: id.BlockId = id.BLOCK_NIL;
             var s1: id.BlockId = id.BLOCK_NIL;
-            succ_targets(t, ?s0, ?s1);
-            if (s0 != id.BLOCK_NIL && s0 < fn.block_count) { incoming[s0] = incoming[s0] + 1; }
-            if (s1 != id.BLOCK_NIL && s1 < fn.block_count) { incoming[s1] = incoming[s1] + 1; }
+            val sc: u32 = ir.block_successors(fn, ?fn.blocks[s], ?s0, ?s1);
+            if (sc >= 1 && s0 == ti::id.BlockId) { count[s] = count[s] - 1; }
+            if (sc >= 2 && s1 == ti::id.BlockId) { count[s] = count[s] - 1; }
+            s = s + 1;
         }
-        bi = bi + 1;
-    }
-
-    var ci: u32 = 0;
-    for (ci < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[ci];
-        if (blk.pred_count != incoming[ci]) {
-            val rr: Result[bool, str] = push(r, fi, ci::id.BlockId, id.INSTR_NIL, VC_PRED_CONSISTENT);
-            if (is_err[bool, str](rr)) { deallocate[u32](r.alloc, incoming, fn.block_count::usize); ret rr; }
+        if (!bad) {
+            var k: u32 = 0;
+            for (k < n) {
+                if (count[k] != 0) { bad = true; }
+                k = k + 1;
+            }
         }
-        ci = ci + 1;
+        if (bad) {
+            val rr: Result[bool, str] = push(r, fi, ti::id.BlockId, id.INSTR_NIL, VC_PRED_CONSISTENT);
+            if (is_err[bool, str](rr)) { deallocate[u32](r.alloc, count, n::usize); ret rr; }
+        }
+        ti = ti + 1;
     }
-    deallocate[u32](r.alloc, incoming, fn.block_count::usize);
+    deallocate[u32](r.alloc, count, n::usize);
     ret ok[bool, str](true);
 }
 
-# VC_PHI_COVERAGE: a phi's operand list holds [block,val] pairs, one per
-# predecessor, so operand_count must equal 2 * pred_count.
+# VC_PHI_COVERAGE: a phi's operand list holds [block,val] pairs, and the multiset
+# of incoming source blocks must exactly equal the block's predecessor multiset —
+# every predecessor named once, no non-predecessor named, no predecessor named
+# twice while another is omitted. an odd operand count (a stray half-pair) or an
+# out-of-range incoming block id is also a violation. the old check compared only
+# operand_count == 2*pred_count, which a wrong-members phi passed.
 fun check_phi_coverage(fn: *ir.Function, fi: u32, r: *VerifyReport) Result[bool, str] {
+    val n: u32 = fn.block_count;
+    if (n == 0) { ret ok[bool, str](true); }
+    val cr: Result[*u32, str] = allocate[u32](r.alloc, n::usize);
+    if (is_err[*u32, str](cr)) { ret err[bool, str](unwrap_err[*u32, str](cr)); }
+    val count: *u32 = unwrap_ok[*u32, str](cr);
+
     var bi: u32 = 0;
-    for (bi < fn.block_count) {
+    for (bi < n) {
         val blk: *ir.Block = ?fn.blocks[bi];
         var p: u32 = 0;
         for (p < blk.phi_count) {
             val iid: id.InstructionId = blk.phis[p];
             if (iid < fn.instr_len) {
                 val ins: *instr.Instruction = ?fn.instrs[iid];
-                if (ins.operand_count != blk.pred_count * 2) {
+                var z: u32 = 0;
+                for (z < n) { count[z] = 0; z = z + 1; }
+                var bad: bool = false;
+                if ((ins.operand_count % 2) != 0) { bad = true; }
+                var o: u32 = 0;
+                for (o + 1 < ins.operand_count) {
+                    val src: id.BlockId = ir.block_target(ins.operands[o]);
+                    if (src < n) { count[src] = count[src] + 1; } or { bad = true; }
+                    o = o + 2;
+                }
+                var pp: u32 = 0;
+                for (pp < blk.pred_count) {
+                    val pb: id.BlockId = blk.preds[pp];
+                    if (pb < n) { count[pb] = count[pb] - 1; }
+                    pp = pp + 1;
+                }
+                if (!bad) {
+                    var k: u32 = 0;
+                    for (k < n) {
+                        if (count[k] != 0) { bad = true; }
+                        k = k + 1;
+                    }
+                }
+                if (bad) {
                     val rr: Result[bool, str] = push(r, fi, blk.id, iid, VC_PHI_COVERAGE);
-                    if (is_err[bool, str](rr)) { ret rr; }
+                    if (is_err[bool, str](rr)) { deallocate[u32](r.alloc, count, n::usize); ret rr; }
                 }
             }
             p = p + 1;
         }
         bi = bi + 1;
     }
+    deallocate[u32](r.alloc, count, n::usize);
     ret ok[bool, str](true);
 }
 
-# VC_REACHABILITY: every non-entry block must have at least one predecessor.
-# block 0 is the entry and is always reachable.
+# VC_REACHABILITY: every non-entry block must be reachable from the entry (block
+# 0) along terminator edges. a real worklist DFS over successors — a pred-count
+# test accepts a dead cycle (A->B->A with no entry path), which this rejects.
 fun check_reachability(fn: *ir.Function, fi: u32, r: *VerifyReport) Result[bool, str] {
+    val n: u32 = fn.block_count;
+    if (n == 0) { ret ok[bool, str](true); }
+    val vr: Result[*u8, str] = allocate[u8](r.alloc, n::usize);
+    if (is_err[*u8, str](vr)) { ret err[bool, str](unwrap_err[*u8, str](vr)); }
+    val visited: *u8 = unwrap_ok[*u8, str](vr);
+    val sr: Result[*u32, str] = allocate[u32](r.alloc, n::usize);
+    if (is_err[*u32, str](sr)) { deallocate[u8](r.alloc, visited, n::usize); ret err[bool, str](unwrap_err[*u32, str](sr)); }
+    val stack: *u32 = unwrap_ok[*u32, str](sr);
+
+    var i: u32 = 0;
+    for (i < n) { visited[i] = 0; i = i + 1; }
+    var sp: u32 = 0;
+    visited[0] = 1;
+    stack[sp] = 0; sp = sp + 1;
+    for (sp > 0) {
+        sp = sp - 1;
+        val b: u32 = stack[sp];
+        var s0: id.BlockId = id.BLOCK_NIL;
+        var s1: id.BlockId = id.BLOCK_NIL;
+        val sc: u32 = ir.block_successors(fn, ?fn.blocks[b], ?s0, ?s1);
+        if (sc >= 1 && s0 < n && visited[s0] == 0) { visited[s0] = 1; stack[sp] = s0; sp = sp + 1; }
+        if (sc >= 2 && s1 < n && visited[s1] == 0) { visited[s1] = 1; stack[sp] = s1; sp = sp + 1; }
+    }
+
     var bi: u32 = 1;
-    for (bi < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[bi];
-        if (blk.pred_count == 0) {
+    for (bi < n) {
+        if (visited[bi] == 0) {
             val rr: Result[bool, str] = push(r, fi, bi::id.BlockId, id.INSTR_NIL, VC_REACHABILITY);
-            if (is_err[bool, str](rr)) { ret rr; }
+            if (is_err[bool, str](rr)) { deallocate[u8](r.alloc, visited, n::usize); deallocate[u32](r.alloc, stack, n::usize); ret rr; }
         }
         bi = bi + 1;
     }
+    deallocate[u8](r.alloc, visited, n::usize);
+    deallocate[u32](r.alloc, stack, n::usize);
     ret ok[bool, str](true);
 }
 
-# VC_DOMINANCE: every VAL_INSTR operand's defining instruction must dominate
-# its use. computes the block dominator relation by iterative dataflow over
-# the CFG, then walks each use and checks def-dominates-use (intra-block by
-# position, inter-block by block dominance). phi operands are exempt — a phi
-# legitimately uses values defined in predecessor blocks that need not
-# dominate the phi's own block.
+# sentinel for an instruction never placed in any block (index_definitions).
+val DEF_BLOCK_NIL: u32 = 0xFFFFFFFF;
+# sentinel for an unreachable block's reverse-postorder number.
+val RPO_NIL: u32 = 0xFFFFFFFF;
+
+# scratch buffers for the dominance check, grouped so allocation/teardown is one
+# call each. all are sized by block count except def_block/def_ord (by pool size).
+# ---
+# rpo_num:   reverse-postorder index per block (RPO_NIL when unreachable)
+# post:      blocks in postorder (post[0..post_count) are the reachable blocks)
+# succ_ix:   per-block successor cursor used by the iterative postorder DFS
+# stack:     DFS work stack
+# idom:      immediate dominator per block (BLOCK_NIL until computed)
+# def_block: defining block per instruction id (DEF_BLOCK_NIL when unplaced)
+# def_ord:   strictly-increasing in-block ordinal per instruction id
+rec DomScratch {
+    rpo_num:   *u32;
+    post:      *u32;
+    succ_ix:   *u32;
+    stack:     *u32;
+    idom:      *u32;
+    def_block: *u32;
+    def_ord:   *u32;
+    n:  u32;
+    il: u32;
+}
+
+# VC_DOMINANCE: every VAL_INSTR operand's defining instruction must dominate its
+# use. dominators are computed by the near-linear Cooper-Harvey-Kennedy idom
+# algorithm over the reverse-postorder of the CFG (successors decoded through
+# ir.block_successors); each use is then checked intra-block by ordinal and
+# inter-block by an idom-chain ancestor walk. phi operands are exempt — a phi
+# legitimately uses values defined in predecessor blocks that need not dominate
+# the phi's own block. an operand whose def was never placed in any block (it
+# never executes) cannot dominate any use and is flagged.
 fun check_dominance(fn: *ir.Function, fi: u32, r: *VerifyReport) Result[bool, str] {
     val n: u32 = fn.block_count;
     if (n == 0) { ret ok[bool, str](true); }
 
-    # dom[b*n + d] != 0  iff block d dominates block b.
-    val dr: Result[*u8, str] = allocate[u8](r.alloc, (n * n)::usize);
-    if (is_err[*u8, str](dr)) { ret err[bool, str](unwrap_err[*u8, str](dr)); }
-    val dom: *u8 = unwrap_ok[*u8, str](dr);
-    val cr: Result[bool, str] = compute_dominators(r.alloc, fn, dom, n);
-    if (is_err[bool, str](cr)) { deallocate[u8](r.alloc, dom, (n * n)::usize); ret cr; }
+    var sc: DomScratch;
+    val ar: Option[str] = dom_scratch_alloc(r.alloc, n, fn.instr_len, ?sc);
+    if (is_some[str](ar)) { ret err[bool, str](unwrap[str](ar)); }
 
-    # map each instruction id to its (block, position-in-block) for ordering.
-    val posr: Result[*u32, str] = allocate[u32](r.alloc, fn.instr_len::usize);
-    if (is_err[*u32, str](posr)) { deallocate[u8](r.alloc, dom, (n * n)::usize); ret err[bool, str](unwrap_err[*u32, str](posr)); }
-    val def_block: *u32 = unwrap_ok[*u32, str](posr);
-    val ordr: Result[*u32, str] = allocate[u32](r.alloc, fn.instr_len::usize);
-    if (is_err[*u32, str](ordr)) {
-        deallocate[u8](r.alloc, dom, (n * n)::usize);
-        deallocate[u32](r.alloc, def_block, fn.instr_len::usize);
-        ret err[bool, str](unwrap_err[*u32, str](ordr));
-    }
-    val def_ord: *u32 = unwrap_ok[*u32, str](ordr);
-    index_definitions(fn, def_block, def_ord);
+    compute_rpo(fn, ?sc);
+    compute_idom(fn, ?sc);
+    index_definitions(fn, sc.def_block, sc.def_ord);
 
     var bi: u32 = 0;
     for (bi < n) {
         val blk: *ir.Block = ?fn.blocks[bi];
-        # body instructions; ordinal continues past the phis.
+        val reachable: bool = sc.rpo_num[bi] != RPO_NIL;
         var ix: u32 = 0;
         for (ix < blk.instr_count) {
             val use_id: id.InstructionId = blk.instructions[ix];
             if (use_id < fn.instr_len) {
                 val ins: *instr.Instruction = ?fn.instrs[use_id];
-                val rr: Result[bool, str] = check_operands_dominate(fn, ins, bi, def_ord[use_id], dom, n, def_block, def_ord, fi, blk.id, use_id, r);
-                if (is_err[bool, str](rr)) { dom_cleanup(r, dom, def_block, def_ord, n, fn.instr_len); ret rr; }
+                val rr: Result[bool, str] = check_operands_dominate(fn, ins, bi, sc.def_ord[use_id], ?sc, reachable, fi, blk.id, use_id, r);
+                if (is_err[bool, str](rr)) { dom_scratch_free(r.alloc, ?sc); ret rr; }
             }
             ix = ix + 1;
         }
-        # terminator
         if (blk.terminator != id.INSTR_NIL && blk.terminator < fn.instr_len) {
             val ins: *instr.Instruction = ?fn.instrs[blk.terminator];
-            val rr: Result[bool, str] = check_operands_dominate(fn, ins, bi, def_ord[blk.terminator], dom, n, def_block, def_ord, fi, blk.id, blk.terminator, r);
-            if (is_err[bool, str](rr)) { dom_cleanup(r, dom, def_block, def_ord, n, fn.instr_len); ret rr; }
+            val rr: Result[bool, str] = check_operands_dominate(fn, ins, bi, sc.def_ord[blk.terminator], ?sc, reachable, fi, blk.id, blk.terminator, r);
+            if (is_err[bool, str](rr)) { dom_scratch_free(r.alloc, ?sc); ret rr; }
         }
         bi = bi + 1;
     }
 
-    dom_cleanup(r, dom, def_block, def_ord, n, fn.instr_len);
+    dom_scratch_free(r.alloc, ?sc);
     ret ok[bool, str](true);
 }
 
-# releases the three scratch buffers used by check_dominance.
-fun dom_cleanup(r: *VerifyReport, dom: *u8, def_block: *u32, def_ord: *u32, n: u32, instr_len: u32) {
-    deallocate[u8](r.alloc, dom, (n * n)::usize);
-    deallocate[u32](r.alloc, def_block, instr_len::usize);
-    deallocate[u32](r.alloc, def_ord, instr_len::usize);
+# allocates every DomScratch buffer, freeing partial work on failure. returns
+# none on success, some(err) on an allocation failure.
+fun dom_scratch_alloc(alloc: *Allocator, n: u32, il: u32, sc: *DomScratch) Option[str] {
+    sc.n  = n;
+    sc.il = il;
+    sc.rpo_num = nil; sc.post = nil; sc.succ_ix = nil; sc.stack = nil;
+    sc.idom = nil; sc.def_block = nil; sc.def_ord = nil;
+
+    val a1: Result[*u32, str] = allocate[u32](alloc, n::usize);
+    if (is_err[*u32, str](a1)) { ret some[str](unwrap_err[*u32, str](a1)); }
+    sc.rpo_num = unwrap_ok[*u32, str](a1);
+    val a2: Result[*u32, str] = allocate[u32](alloc, n::usize);
+    if (is_err[*u32, str](a2)) { dom_scratch_free(alloc, sc); ret some[str](unwrap_err[*u32, str](a2)); }
+    sc.post = unwrap_ok[*u32, str](a2);
+    val a3: Result[*u32, str] = allocate[u32](alloc, n::usize);
+    if (is_err[*u32, str](a3)) { dom_scratch_free(alloc, sc); ret some[str](unwrap_err[*u32, str](a3)); }
+    sc.succ_ix = unwrap_ok[*u32, str](a3);
+    val a4: Result[*u32, str] = allocate[u32](alloc, n::usize);
+    if (is_err[*u32, str](a4)) { dom_scratch_free(alloc, sc); ret some[str](unwrap_err[*u32, str](a4)); }
+    sc.stack = unwrap_ok[*u32, str](a4);
+    val a5: Result[*u32, str] = allocate[u32](alloc, n::usize);
+    if (is_err[*u32, str](a5)) { dom_scratch_free(alloc, sc); ret some[str](unwrap_err[*u32, str](a5)); }
+    sc.idom = unwrap_ok[*u32, str](a5);
+    val a6: Result[*u32, str] = allocate[u32](alloc, il::usize);
+    if (is_err[*u32, str](a6)) { dom_scratch_free(alloc, sc); ret some[str](unwrap_err[*u32, str](a6)); }
+    sc.def_block = unwrap_ok[*u32, str](a6);
+    val a7: Result[*u32, str] = allocate[u32](alloc, il::usize);
+    if (is_err[*u32, str](a7)) { dom_scratch_free(alloc, sc); ret some[str](unwrap_err[*u32, str](a7)); }
+    sc.def_ord = unwrap_ok[*u32, str](a7);
+    ret none[str]();
+}
+
+# releases every allocated DomScratch buffer; nil pointers are skipped.
+fun dom_scratch_free(alloc: *Allocator, sc: *DomScratch) {
+    if (sc.rpo_num != nil)   { deallocate[u32](alloc, sc.rpo_num, sc.n::usize); }
+    if (sc.post != nil)      { deallocate[u32](alloc, sc.post, sc.n::usize); }
+    if (sc.succ_ix != nil)   { deallocate[u32](alloc, sc.succ_ix, sc.n::usize); }
+    if (sc.stack != nil)     { deallocate[u32](alloc, sc.stack, sc.n::usize); }
+    if (sc.idom != nil)      { deallocate[u32](alloc, sc.idom, sc.n::usize); }
+    if (sc.def_block != nil) { deallocate[u32](alloc, sc.def_block, sc.il::usize); }
+    if (sc.def_ord != nil)   { deallocate[u32](alloc, sc.def_ord, sc.il::usize); }
+    sc.rpo_num = nil; sc.post = nil; sc.succ_ix = nil; sc.stack = nil;
+    sc.idom = nil; sc.def_block = nil; sc.def_ord = nil;
+}
+
+# iterative postorder DFS from the entry (block 0) over terminator edges, then
+# numbers each reachable block by reverse-postorder. rpo_num[b] stays RPO_NIL
+# for any block unreachable from the entry. n is small per function but the DFS
+# avoids native recursion so a deep CFG cannot overflow the call stack.
+fun compute_rpo(fn: *ir.Function, sc: *DomScratch) {
+    val n: u32 = sc.n;
+    var i: u32 = 0;
+    for (i < n) { sc.rpo_num[i] = RPO_NIL; sc.succ_ix[i] = 0; i = i + 1; }
+
+    var pc: u32 = 0;
+    var sp: u32 = 0;
+    # rpo_num doubles as the DFS color: RPO_NIL = white, RPO_DISCOVERED = grey,
+    # a value < n (assigned below) = black with its reverse-postorder index.
+    val DISCOVERED: u32 = 0xFFFFFFFE;
+    sc.rpo_num[0] = DISCOVERED;
+    sc.stack[sp]  = 0; sp = sp + 1;
+    for (sp > 0) {
+        val b: u32 = sc.stack[sp - 1];
+        var s0: id.BlockId = id.BLOCK_NIL;
+        var s1: id.BlockId = id.BLOCK_NIL;
+        val cnt: u32 = ir.block_successors(fn, ?fn.blocks[b], ?s0, ?s1);
+        var advanced: bool = false;
+        for (sc.succ_ix[b] < cnt && !advanced) {
+            val k: u32 = sc.succ_ix[b];
+            sc.succ_ix[b] = k + 1;
+            var t: id.BlockId = s0;
+            if (k == 1) { t = s1; }
+            if (t < n && sc.rpo_num[t] == RPO_NIL) {
+                sc.rpo_num[t] = DISCOVERED;
+                sc.stack[sp]  = t; sp = sp + 1;
+                advanced = true;
+            }
+        }
+        if (!advanced) {
+            sp = sp - 1;
+            sc.post[pc] = b; pc = pc + 1;
+        }
+    }
+
+    # reverse postorder: the last-finished block (the entry) gets index 0.
+    var j: u32 = 0;
+    for (j < pc) {
+        sc.rpo_num[sc.post[j]] = pc - 1 - j;
+        j = j + 1;
+    }
+    # record the count of reachable blocks for the idom pass (stack[0] is free
+    # after the DFS; reuse it as the post_count slot).
+    sc.stack[0] = pc;
+}
+
+# Cooper-Harvey-Kennedy immediate-dominator fixpoint over the reverse-postorder.
+# idom[entry] = entry; every other reachable block's idom is the intersection of
+# its already-processed predecessors. unreachable blocks keep idom BLOCK_NIL. a
+# predecessor that is unreachable, or whose idom is not yet known, is skipped —
+# which is exactly why a pred-less (stranded) predecessor cannot strip a block's
+# true dominators (the old dense fixpoint's special case got this wrong).
+fun compute_idom(fn: *ir.Function, sc: *DomScratch) {
+    val n: u32 = sc.n;
+    val pc: u32 = sc.stack[0];
+    var i: u32 = 0;
+    for (i < n) { sc.idom[i] = id.BLOCK_NIL; i = i + 1; }
+    if (pc == 0) { ret; }
+    sc.idom[0] = 0;
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        # walk blocks in reverse-postorder, skipping the entry (rpo index 0).
+        var ri: u32 = 1;
+        for (ri < pc) {
+            val b: u32 = sc.post[pc - 1 - ri];
+            val blk: *ir.Block = ?fn.blocks[b];
+            var new_idom: u32 = id.BLOCK_NIL;
+            var pi: u32 = 0;
+            for (pi < blk.pred_count) {
+                val p: id.BlockId = blk.preds[pi];
+                if (p < n && sc.rpo_num[p] != RPO_NIL && sc.idom[p] != id.BLOCK_NIL) {
+                    if (new_idom == id.BLOCK_NIL) { new_idom = p; }
+                    or { new_idom = idom_intersect(sc, p, new_idom); }
+                }
+                pi = pi + 1;
+            }
+            if (new_idom != id.BLOCK_NIL && sc.idom[b] != new_idom) {
+                sc.idom[b] = new_idom;
+                changed = true;
+            }
+            ri = ri + 1;
+        }
+    }
+}
+
+# walks two dominator-tree fingers toward the entry until they meet; the meeting
+# block is the nearest common dominator. the finger with the larger reverse-
+# postorder index (deeper from the entry) is advanced up its idom chain. a step
+# cap (the verifier must terminate on any input) guards a malformed idom chain.
+fun idom_intersect(sc: *DomScratch, a: u32, b: u32) u32 {
+    var x: u32 = a;
+    var y: u32 = b;
+    var steps: u32 = 0;
+    val cap: u32 = 2 * sc.n + 2;
+    for (x != y && steps <= cap) {
+        for (x != y && sc.rpo_num[x] > sc.rpo_num[y]) { x = sc.idom[x]; steps = steps + 1; }
+        for (x != y && sc.rpo_num[y] > sc.rpo_num[x]) { y = sc.idom[y]; steps = steps + 1; }
+        steps = steps + 1;
+    }
+    ret x;
 }
 
 # fills def_block[iid] = defining block and def_ord[iid] = a strictly
 # increasing in-block ordinal (phis first, then body, then terminator).
 fun index_definitions(fn: *ir.Function, def_block: *u32, def_ord: *u32) {
     var i: u32 = 0;
-    for (i < fn.instr_len) { def_block[i] = 0xFFFFFFFF; def_ord[i] = 0; i = i + 1; }
+    for (i < fn.instr_len) { def_block[i] = DEF_BLOCK_NIL; def_ord[i] = 0; i = i + 1; }
 
     var bi: u32 = 0;
     for (bi < fn.block_count) {
@@ -596,8 +1006,11 @@ fun index_definitions(fn: *ir.Function, def_block: *u32, def_ord: *u32) {
     }
 }
 
-# checks every VAL_INSTR operand of a non-phi instruction for dominance.
-fun check_operands_dominate(fn: *ir.Function, ins: *instr.Instruction, use_block: u32, use_ord: u32, dom: *u8, n: u32, def_block: *u32, def_ord: *u32, fi: u32, bid: id.BlockId, use_id: id.InstructionId, r: *VerifyReport) Result[bool, str] {
+# checks every VAL_INSTR operand of a non-phi instruction for dominance. an
+# operand whose def was never placed (def_block DEF_BLOCK_NIL) is flagged
+# unconditionally; an inter-block dominance check is run only when the use's
+# block is reachable (an unreachable use block is already a VC_REACHABILITY).
+fun check_operands_dominate(fn: *ir.Function, ins: *instr.Instruction, use_block: u32, use_ord: u32, sc: *DomScratch, use_reachable: bool, fi: u32, bid: id.BlockId, use_id: id.InstructionId, r: *VerifyReport) Result[bool, str] {
     if (ins.kind == instr.OP_PHI) { ret ok[bool, str](true); }
     var oi: u32 = 0;
     for (oi < ins.operand_count) {
@@ -605,12 +1018,14 @@ fun check_operands_dominate(fn: *ir.Function, ins: *instr.Instruction, use_block
         if (op.kind == value.VAL_INSTR) {
             val def_id: id.InstructionId = op.data.instr;
             if (def_id < fn.instr_len) {
-                val db: u32 = def_block[def_id];
-                if (db != 0xFFFFFFFF) {
-                    if (!dominates(db, def_ord[def_id], use_block, use_ord, dom, n)) {
-                        val rr: Result[bool, str] = push(r, fi, bid, use_id, VC_DOMINANCE);
-                        if (is_err[bool, str](rr)) { ret rr; }
-                    }
+                val db: u32 = sc.def_block[def_id];
+                if (db == DEF_BLOCK_NIL) {
+                    val rr: Result[bool, str] = push(r, fi, bid, use_id, VC_DOMINANCE);
+                    if (is_err[bool, str](rr)) { ret rr; }
+                }
+                or (use_reachable && !def_dominates_use(sc, db, sc.def_ord[def_id], use_block, use_ord)) {
+                    val rr: Result[bool, str] = push(r, fi, bid, use_id, VC_DOMINANCE);
+                    if (is_err[bool, str](rr)) { ret rr; }
                 }
             }
         }
@@ -619,110 +1034,26 @@ fun check_operands_dominate(fn: *ir.Function, ins: *instr.Instruction, use_block
     ret ok[bool, str](true);
 }
 
-# true when a definition dominates a use. same block: by ordinal. different
-# blocks: the def's block must dominate the use's block.
-fun dominates(def_block: u32, def_ord: u32, use_block: u32, use_ord: u32, dom: *u8, n: u32) bool {
+# true when a definition dominates a use. same block: the def must precede the
+# use by ordinal. different blocks: the def's block must dominate the use's block.
+fun def_dominates_use(sc: *DomScratch, def_block: u32, def_ord: u32, use_block: u32, use_ord: u32) bool {
     if (def_block == use_block) { ret def_ord < use_ord; }
-    ret dom[use_block * n + def_block] != 0;
+    ret block_dominates(sc, def_block, use_block);
 }
 
-# computes the dominator relation by the classic iterative fixpoint:
-# dom(entry) = {entry}; dom(b) = {b} U (intersection over preds p of dom(p)).
-# entry is block 0. unreachable blocks (no preds) end up dominated by all,
-# which is harmless — their uses are separately flagged by reachability.
-fun compute_dominators(alloc: *Allocator, fn: *ir.Function, dom: *u8, n: u32) Result[bool, str] {
-    # initialize: entry dominated only by itself; every other block tentatively
-    # dominated by all blocks (the universal set for intersection).
-    var b: u32 = 0;
-    for (b < n) {
-        var d: u32 = 0;
-        for (d < n) {
-            if (b == 0) {
-                if (d == 0) { dom[b * n + d] = 1; } or { dom[b * n + d] = 0; }
-            }
-            or {
-                dom[b * n + d] = 1;
-            }
-            d = d + 1;
-        }
-        b = b + 1;
+# true when block `a` dominates block `b` (a != b), by walking b up its idom
+# chain to the entry. an unreachable def block dominates nothing. a step cap
+# guards against a malformed idom chain so the verifier always terminates.
+fun block_dominates(sc: *DomScratch, a: u32, b: u32) bool {
+    if (sc.rpo_num[a] == RPO_NIL) { ret false; }
+    var x: u32 = b;
+    var steps: u32 = 0;
+    for (x != 0 && steps <= sc.n) {
+        x = sc.idom[x];
+        if (x == a) { ret true; }
+        steps = steps + 1;
     }
-
-    val tr: Result[*u8, str] = allocate[u8](alloc, n::usize);
-    if (is_err[*u8, str](tr)) { ret err[bool, str](unwrap_err[*u8, str](tr)); }
-    val tmp: *u8 = unwrap_ok[*u8, str](tr);
-
-    var changed: bool = true;
-    for (changed) {
-        changed = false;
-        var bi: u32 = 1;
-        for (bi < n) {
-            val blk: *ir.Block = ?fn.blocks[bi];
-
-            # new = {bi} U intersection of dom(pred) over all preds.
-            var i: u32 = 0;
-            for (i < n) { tmp[i] = 1; i = i + 1; }
-
-            if (blk.pred_count == 0) {
-                # unreachable: leave as universal but ensure self-domination.
-                var z: u32 = 0;
-                for (z < n) { tmp[z] = 0; z = z + 1; }
-                tmp[bi] = 1;
-            }
-            or {
-                var pi: u32 = 0;
-                for (pi < blk.pred_count) {
-                    val pred: id.BlockId = blk.preds[pi];
-                    if (pred < n) {
-                        var d: u32 = 0;
-                        for (d < n) {
-                            if (dom[pred * n + d] == 0) { tmp[d] = 0; }
-                            d = d + 1;
-                        }
-                    }
-                    pi = pi + 1;
-                }
-                tmp[bi] = 1;
-            }
-
-            # commit if changed.
-            var d2: u32 = 0;
-            for (d2 < n) {
-                if (dom[bi * n + d2] != tmp[d2]) {
-                    dom[bi * n + d2] = tmp[d2];
-                    changed = true;
-                }
-                d2 = d2 + 1;
-            }
-            bi = bi + 1;
-        }
-    }
-
-    deallocate[u8](alloc, tmp, n::usize);
-    ret ok[bool, str](true);
-}
-
-# extracts up to two successor block ids from a terminator's operands per the
-# opcode operand conventions: BR=[target], CBR=[cond, then, else], others none.
-# block ids ride in const_int operands. unset successors are BLOCK_NIL.
-fun succ_targets(t: *instr.Instruction, s0: *id.BlockId, s1: *id.BlockId) {
-    @s0 = id.BLOCK_NIL;
-    @s1 = id.BLOCK_NIL;
-    if (t.kind == instr.OP_BR) {
-        if (t.operand_count >= 1) { @s0 = operand_block(?t.operands[0]); }
-    }
-    or (t.kind == instr.OP_CBR) {
-        if (t.operand_count >= 3) {
-            @s0 = operand_block(?t.operands[1]);
-            @s1 = operand_block(?t.operands[2]);
-        }
-    }
-}
-
-# reads a block id out of a const_int operand (branch targets are encoded so).
-fun operand_block(v: *value.Value) id.BlockId {
-    if (v.kind == value.VAL_CONST_INT) { ret v.data.int_lit::id.BlockId; }
-    ret id.BLOCK_NIL;
+    ret false;
 }
 
 # operand-count expectation per opcode. returns true when `count` is valid.
@@ -772,7 +1103,13 @@ fun arity_ok(k: instr.InstrKind, count: u32) bool {
     if (k == instr.OP_UNREACHABLE) { ret count == 0; }
     # asm: any number of input operands.
     if (k == instr.OP_ASM) { ret true; }
-    ret true;
+    # va_start / va_arg / va_end: a single va_list-pointer operand.
+    if (k == instr.OP_VA_START || k == instr.OP_VA_ARG || k == instr.OP_VA_END) {
+        ret count == 1;
+    }
+    # an opcode with no arity entry is a missing dispatch case, not valid IR:
+    # fail loudly (VC_OPERAND_TYPE) instead of silently accepting any count.
+    ret false;
 }
 
 # VC_CONST_TYPE: a constant operand's carried type must match its kind.
@@ -828,4 +1165,409 @@ fun push(r: *VerifyReport, function: u32, block: id.BlockId, ins: id.Instruction
     r.violations[r.count] = v;
     r.count = r.count + 1;
     ret ok[bool, str](true);
+}
+
+# test scaffolding: a module holding one `void ()` function with a builder
+# positioned on it and a cached i64 type for synthesizing operands. the module's
+# storage lives inside the TEnv so pointers the builder takes into it stay stable
+# for the test's duration.
+rec TEnv {
+    alloc: Allocator;
+    m:     ir.Module;
+    bld:   builder.Builder;
+    i64ty: ir_type.IrTypeId;
+}
+
+# initializes a TEnv: page allocator, empty module, one void() function, builder.
+# returns false on any allocation / interning failure.
+fun t_env(env: *TEnv) bool {
+    page.make(?env.alloc);
+    val mr: Result[ir.Module, str] = ir.init_module(?env.alloc, intern.STR_NIL);
+    if (is_err[ir.Module, str](mr)) { ret false; }
+    env.m = unwrap_ok[ir.Module, str](mr);
+
+    val it: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?env.m.types, 64);
+    if (is_err[ir_type.IrTypeId, str](it)) { ret false; }
+    env.i64ty = unwrap_ok[ir_type.IrTypeId, str](it);
+
+    val vt: Result[ir_type.IrTypeId, str] = ir_type.intern_void(?env.m.types);
+    if (is_err[ir_type.IrTypeId, str](vt)) { ret false; }
+    val voidty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](vt);
+
+    val sr: Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?env.m.types, voidty, nil, 0, false);
+    if (is_err[ir_type.IrTypeId, str](sr)) { ret false; }
+    val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sr);
+
+    val fr: Result[u32, str] = ir.add_function(?env.m, intern.STR_NIL, sig, 0);
+    if (is_err[u32, str](fr)) { ret false; }
+
+    env.bld = builder.init(?env.m);
+    builder.set_function(?env.bld, ?env.m.functions[0]);
+    ret true;
+}
+
+# allocates a fresh block in the test function, returning BLOCK_NIL on failure.
+fun t_block(env: *TEnv) id.BlockId {
+    val r: Result[id.BlockId, str] = builder.new_block(?env.bld);
+    if (is_err[id.BlockId, str](r)) { ret id.BLOCK_NIL; }
+    ret unwrap_ok[id.BlockId, str](r);
+}
+
+# an i64 constant operand.
+fun t_ci(env: *TEnv, n: u64) value.Value {
+    ret value.const_int(n, env.i64ty);
+}
+
+# runs the verifier over the test module and returns how many recorded
+# violations carry `check`, or -1 on an allocation failure.
+fun t_count(env: *TEnv, full: bool, repr: bool, check: VerifyCheck) i64 {
+    val rr: Result[VerifyReport, str] = verify_module_ext(?env.m, ?env.alloc, full, repr);
+    if (is_err[VerifyReport, str](rr)) { ret -1; }
+    var rep: VerifyReport = unwrap_ok[VerifyReport, str](rr);
+    var c: i64 = 0;
+    var i: u32 = 0;
+    for (i < rep.count) {
+        if (rep.violations[i].check == check) { c = c + 1; }
+        i = i + 1;
+    }
+    dnit_report(?rep);
+    ret c;
+}
+
+# runs the verifier and returns the total violation count, or -1 on failure.
+fun t_total(env: *TEnv, full: bool, repr: bool) i64 {
+    val rr: Result[VerifyReport, str] = verify_module_ext(?env.m, ?env.alloc, full, repr);
+    if (is_err[VerifyReport, str](rr)) { ret -1; }
+    var rep: VerifyReport = unwrap_ok[VerifyReport, str](rr);
+    val c: i64 = rep.count::i64;
+    dnit_report(?rep);
+    ret c;
+}
+
+test "ir.verify: dominance accepts a diamond whose def is in the entry" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    val b3: id.BlockId = t_block(?env);
+    if (b3 != 3) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    val av: Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (is_err[value.Value, str](av)) { ret 1; }
+    val v: value.Value = unwrap_ok[value.Value, str](av);
+    if (is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b1, b2))) { ret 1; }
+
+    builder.set_block(?env.bld, b1);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+    builder.set_block(?env.bld, b2);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+
+    builder.set_block(?env.bld, b3);
+    if (is_err[value.Value, str](builder.emit_add(?env.bld, v, c))) { ret 1; }
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    if (t_total(?env, true, false) != 0) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: dominance rejects a use of a def from one diamond arm" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    val b3: id.BlockId = t_block(?env);
+    if (b3 != 3) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    if (is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b1, b2))) { ret 1; }
+
+    builder.set_block(?env.bld, b1);
+    val av: Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (is_err[value.Value, str](av)) { ret 1; }
+    val v: value.Value = unwrap_ok[value.Value, str](av);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+
+    builder.set_block(?env.bld, b2);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+
+    builder.set_block(?env.bld, b3);
+    if (is_err[value.Value, str](builder.emit_add(?env.bld, v, c))) { ret 1; }
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    if (t_count(?env, true, false, VC_DOMINANCE) < 1) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: dominance accepts a loop header def used in the loop body" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    val b3: id.BlockId = t_block(?env);
+    if (b3 != 3) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b1))) { ret 1; }
+
+    builder.set_block(?env.bld, b1);
+    val av: Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (is_err[value.Value, str](av)) { ret 1; }
+    val v: value.Value = unwrap_ok[value.Value, str](av);
+    if (is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b2, b3))) { ret 1; }
+
+    builder.set_block(?env.bld, b2);
+    if (is_err[value.Value, str](builder.emit_add(?env.bld, v, c))) { ret 1; }
+    if (is_err[bool, str](builder.emit_br(?env.bld, b1))) { ret 1; }
+
+    builder.set_block(?env.bld, b3);
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    if (t_total(?env, true, false) != 0) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: dominance rejects a loop body def used after the loop" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    val b3: id.BlockId = t_block(?env);
+    if (b3 != 3) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b1))) { ret 1; }
+
+    builder.set_block(?env.bld, b1);
+    if (is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b2, b3))) { ret 1; }
+
+    builder.set_block(?env.bld, b2);
+    val av: Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (is_err[value.Value, str](av)) { ret 1; }
+    val v: value.Value = unwrap_ok[value.Value, str](av);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b1))) { ret 1; }
+
+    builder.set_block(?env.bld, b3);
+    if (is_err[value.Value, str](builder.emit_add(?env.bld, v, c))) { ret 1; }
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    if (t_count(?env, true, false, VC_DOMINANCE) < 1) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: dominance accepts an entry def used in an irreducible loop" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    if (b2 != 2) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    val av: Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (is_err[value.Value, str](av)) { ret 1; }
+    val v: value.Value = unwrap_ok[value.Value, str](av);
+    if (is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b1, b2))) { ret 1; }
+
+    builder.set_block(?env.bld, b1);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b2))) { ret 1; }
+
+    builder.set_block(?env.bld, b2);
+    if (is_err[value.Value, str](builder.emit_add(?env.bld, v, c))) { ret 1; }
+    if (is_err[bool, str](builder.emit_br(?env.bld, b1))) { ret 1; }
+
+    if (t_count(?env, true, false, VC_DOMINANCE) != 0) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: dominance rejects a cross-edge def in an irreducible loop" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    if (b2 != 2) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    if (is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b1, b2))) { ret 1; }
+
+    builder.set_block(?env.bld, b1);
+    val av: Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (is_err[value.Value, str](av)) { ret 1; }
+    val v: value.Value = unwrap_ok[value.Value, str](av);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b2))) { ret 1; }
+
+    builder.set_block(?env.bld, b2);
+    if (is_err[value.Value, str](builder.emit_add(?env.bld, v, c))) { ret 1; }
+    if (is_err[bool, str](builder.emit_br(?env.bld, b1))) { ret 1; }
+
+    if (t_count(?env, true, false, VC_DOMINANCE) < 1) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: reachability flags a dead cycle unreachable from entry" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    if (b2 != 2) { ret 1; }
+
+    builder.set_block(?env.bld, b0);
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+    builder.set_block(?env.bld, b1);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b2))) { ret 1; }
+    builder.set_block(?env.bld, b2);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b1))) { ret 1; }
+
+    # both dead-cycle blocks have a predecessor, so the old pred-count test
+    # accepted them; the DFS from the entry must flag both as unreachable.
+    if (t_count(?env, true, false, VC_REACHABILITY) < 2) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: a dangling terminator id is flagged, not read out of bounds" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    builder.set_block(?env.bld, b0);
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    # point the terminator slot at an id past the end of the pool.
+    env.m.functions[0].blocks[0].terminator = env.m.functions[0].instr_len + 100;
+    if (t_count(?env, false, false, VC_DANGLING_ID) < 1) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: a va_start with the wrong operand count is rejected" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    builder.set_block(?env.bld, b0);
+    if (is_err[bool, str](builder.emit_va_start(?env.bld, t_ci(?env, 0)))) { ret 1; }
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    # the single-operand form is accepted by the new arity entry.
+    if (t_count(?env, false, false, VC_OPERAND_TYPE) != 0) { ret 1; }
+
+    # drop the operand: the strict arity table must flag it (the old permissive
+    # default accepted any count for an opcode with no entry).
+    val sid: id.InstructionId = env.m.functions[0].blocks[0].instructions[0];
+    env.m.functions[0].instrs[sid].operand_count = 0;
+    if (t_count(?env, false, false, VC_OPERAND_TYPE) < 1) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: pred consistency catches a right-length wrong-member pred list" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    val b3: id.BlockId = t_block(?env);
+    if (b3 != 3) { ret 1; }
+
+    builder.set_block(?env.bld, b0);
+    if (is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b1, b2))) { ret 1; }
+    builder.set_block(?env.bld, b1);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+    builder.set_block(?env.bld, b2);
+    if (is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+    builder.set_block(?env.bld, b3);
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    # block 3's preds are {1, 2}; rewrite to {1, 1} — same length, wrong members.
+    # the old count-only check passed this; the multiset check must reject it.
+    env.m.functions[0].blocks[3].preds[1] = 1::id.BlockId;
+    if (t_count(?env, false, false, VC_PRED_CONSISTENT) < 1) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: rebuild_preds keeps both edges of a same-target cbr" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    if (b1 != 1) { ret 1; }
+
+    builder.set_block(?env.bld, b0);
+    # both arms of the cbr target b1: two incoming edges from b0.
+    if (is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b1, b1))) { ret 1; }
+    builder.set_block(?env.bld, b1);
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    # rebuild_preds must reproduce the multiset {b0, b0}; a deduping append would
+    # leave pred_count=1 against 2 incoming edges and trip VC_PRED_CONSISTENT.
+    if (is_err[bool, str](ir.rebuild_preds(?env.m, ?env.m.functions[0]))) { ret 1; }
+    if (t_count(?env, false, false, VC_PRED_CONSISTENT) != 0) { ret 1; }
+    if (env.m.functions[0].blocks[1].pred_count != 2) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: type agreement (repr) rejects mismatched binary operand types" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    val i32r: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?env.m.types, 32);
+    if (is_err[ir_type.IrTypeId, str](i32r)) { ret 1; }
+    val i32ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](i32r);
+
+    builder.set_block(?env.bld, b0);
+    # add of an i64 and an i32 operand: the builder copies the result type from
+    # lhs without checking the operands agree.
+    if (is_err[value.Value, str](builder.emit_add(?env.bld, t_ci(?env, 0), value.const_int(0, i32ty)))) { ret 1; }
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    # the check is opt-in: repr surfaces it, the always-on (repr=false) run does not.
+    if (t_count(?env, false, true, VC_TYPE_AGREE) < 1) { ret 1; }
+    if (t_count(?env, false, false, VC_TYPE_AGREE) != 0) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: type agreement (repr) rejects a store through a non-pointer" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    builder.set_block(?env.bld, b0);
+    # store whose destination operand is an integer, not an address.
+    if (is_err[bool, str](builder.emit_store(?env.bld, t_ci(?env, 1), t_ci(?env, 0)))) { ret 1; }
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    if (t_count(?env, false, true, VC_TYPE_AGREE) < 1) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: type resolution (repr) flags an unresolvable alloca element type" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    builder.set_block(?env.bld, b0);
+    val ar: Result[value.Value, str] = builder.emit_alloca(?env.bld, env.i64ty, t_ci(?env, 1));
+    if (is_err[value.Value, str](ar)) { ret 1; }
+    val av: value.Value = unwrap_ok[value.Value, str](ar);
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    # well-formed: the element type resolves.
+    if (t_count(?env, false, true, VC_TYPE_RESOLVE) != 0) { ret 1; }
+    # corrupt the element type (carried in ins.ty for alloca) to an out-of-range,
+    # non-sentinel id; check_aux_resolve must flag it.
+    val aid: id.InstructionId = av.data.instr;
+    env.m.functions[0].instrs[aid].ty = 0xFFFF::ir_type.IrTypeId;
+    if (t_count(?env, false, true, VC_TYPE_RESOLVE) < 1) { ret 1; }
+    ret 0;
 }
