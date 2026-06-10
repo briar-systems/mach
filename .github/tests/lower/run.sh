@@ -9,6 +9,8 @@
 #   xmod-generic: a generic body whose `$if` gates on the defining module's
 #                 `pub val`, instantiated from another module — used to fail with
 #                 "identifier is not a comptime constant in scope".
+#   fnptr-table:  variable-index function-pointer-table dispatch `table[i](..)`
+#                 — used to misparse as a generic call and fail in resolve (#1270).
 #
 # usage: run.sh [path-to-mach]   (defaults to `mach` on PATH)
 set -euo pipefail
@@ -59,5 +61,6 @@ build_and_run() {
 
 build_and_run comptime-str 0
 build_and_run xmod-generic 0
+build_and_run fnptr-table 0
 
 exit "$fail"
