@@ -10,8 +10,9 @@
 # as a primitive here. Compound types are interned by their canonical
 # form: pointer types by base, array types by `(base, count)`, nominal
 # types (`rec`/`uni`) by `(origin, decl)`, generic parameters by
-# `(owner, index)`. Function types are not deduplicated; structural
-# equality of function types is available via `type_equals_signatures`.
+# `(owner, index)`, function types by a content hash of their signature, and
+# instances by `(origin, decl, args)`. Structural equality of function types is
+# also available via `type_equals_signatures`.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -223,6 +224,14 @@ pub rec TypeInterner {
 
     dedup: map.Map[Type, TypeId];
 
+    # TYPE_FUN also bypasses `dedup` (its params live in the side pool); a
+    # content hash of (ret, params, variadic) -> TypeId deduplicates structurally
+    # equal function types, collapsing the per-generic-call TYPE_FUN explosion. a
+    # hash collision degrades to a fresh append (the prior non-deduped default),
+    # never to a wrong identity, since the candidate is verified against the
+    # mapped type before reuse.
+    fun_index: map.Map[u64, TypeId];
+
     # TYPE_INSTANCE bypasses `dedup` (its args live in the side pool, which the
     # context-free dedup hash cannot read), so instance TypeIds are tracked in
     # their own list and deduped by scanning it — O(instances), not O(type_len).
@@ -262,6 +271,7 @@ pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
     ti.params_len = 0;
     ti.params_cap = 0;
     ti.dedup      = map.init[Type, TypeId](alloc, hash_type, eq_type);
+    ti.fun_index     = map.init[u64, TypeId](alloc, map.hash_u64, map.eq_u64);
     ti.instances     = nil;
     ti.instances_len = 0;
     ti.instances_cap = 0;
@@ -275,6 +285,7 @@ pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
 
     val ra: Result[*Type, str] = allocate[Type](alloc, INITIAL_TYPE_CAP::usize);
     if (is_err[*Type, str](ra)) {
+        map.dnit[u64, TypeId](?ti.fun_index);
         map.dnit[TypeId, u32](?ti.field_index);
         map.dnit[Type, TypeId](?ti.dedup);
         ret err[TypeInterner, str](unwrap_err[*Type, str](ra));
@@ -285,6 +296,7 @@ pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
     val rp: Result[*TypeId, str] = allocate[TypeId](alloc, INITIAL_PARAMS_CAP::usize);
     if (is_err[*TypeId, str](rp)) {
         deallocate[Type](alloc, ti.types, ti.type_cap::usize);
+        map.dnit[u64, TypeId](?ti.fun_index);
         map.dnit[TypeId, u32](?ti.field_index);
         map.dnit[Type, TypeId](?ti.dedup);
         ret err[TypeInterner, str](unwrap_err[*TypeId, str](rp));
@@ -304,6 +316,7 @@ pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
         if (is_err[TypeId, str](pr)) {
             deallocate[TypeId](alloc, ti.params, ti.params_cap::usize);
             deallocate[Type](alloc, ti.types, ti.type_cap::usize);
+            map.dnit[u64, TypeId](?ti.fun_index);
             map.dnit[TypeId, u32](?ti.field_index);
             map.dnit[Type, TypeId](?ti.dedup);
             ret err[TypeInterner, str](unwrap_err[TypeId, str](pr));
@@ -314,6 +327,7 @@ pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
         if (is_err[bool, str](ins)) {
             deallocate[TypeId](alloc, ti.params, ti.params_cap::usize);
             deallocate[Type](alloc, ti.types, ti.type_cap::usize);
+            map.dnit[u64, TypeId](?ti.fun_index);
             map.dnit[TypeId, u32](?ti.field_index);
             map.dnit[Type, TypeId](?ti.dedup);
             ret err[TypeInterner, str](unwrap_err[bool, str](ins));
@@ -344,6 +358,7 @@ pub fun dnit(ti: *TypeInterner) {
     if (ti.field_pool != nil && ti.field_pool_cap > 0) {
         deallocate[FieldEntry](ti.alloc, ti.field_pool, ti.field_pool_cap::usize);
     }
+    map.dnit[u64, TypeId](?ti.fun_index);
     map.dnit[TypeId, u32](?ti.field_index);
     map.dnit[Type, TypeId](?ti.dedup);
     ti.types      = nil;
@@ -598,19 +613,28 @@ pub fun intern_generic_param(ti: *TypeInterner, name: intern.StrId, owner: id.De
     ret intern_dedup(ti, t);
 }
 
-# intern_function: append a function type. parameter list is copied into
-# the side pool. function types are not currently deduplicated; structural
-# equivalence is available via `type_equals_signatures`. callers that need
-# pointer-equal function types (e.g. cached vtable slots) should
-# canonicalize at a higher layer.
+# intern_function: intern a function type, deduplicating structurally equal
+# signatures through a content-hash index so a generic call's repeated
+# substitute_fun does not grow the universe without bound. on a hash hit the
+# candidate is verified against the mapped type before reuse, so a collision
+# degrades to a fresh append (the historical non-deduped default), never to a
+# wrong identity. structural equivalence is also available via
+# `type_equals_signatures`.
 # ---
 # ti:       the interner
 # ret_ty:   return type
 # params:   pointer to a contiguous array of fixed parameter TypeIds
 # count:    number of fixed parameter types
 # variadic: true when the function accepts trailing variadic arguments
-# ret:      a fresh TypeId for the function, or an allocation error
+# ret:      the (deduped) TypeId for the function, or an allocation error
 pub fun intern_function(ti: *TypeInterner, ret_ty: TypeId, params: *TypeId, count: u32, variadic: bool) Result[TypeId, str] {
+    val h: u64 = hash_fun(ret_ty, params, count, variadic);
+    val cached: Result[*TypeId, str] = map.get[u64, TypeId](?ti.fun_index, ?h);
+    if (is_ok[*TypeId, str](cached)) {
+        val ex: TypeId = @unwrap_ok[*TypeId, str](cached);
+        if (fun_matches(ti, ex, ret_ty, params, count, variadic)) { ret ok[TypeId, str](ex); }
+    }
+
     val start: u32 = ti.params_len;
     val rp: Result[bool, str] = reserve_params(ti, count);
     if (is_err[bool, str](rp)) { ret err[TypeId, str](unwrap_err[bool, str](rp)); }
@@ -623,11 +647,51 @@ pub fun intern_function(ti: *TypeInterner, ret_ty: TypeId, params: *TypeId, coun
 
     var t: Type;
     t.kind = TYPE_FUN;
-    t.data.fn.ret_ty          = ret_ty;
+    t.data.fn.ret_ty       = ret_ty;
     t.data.fn.params_start = start;
     t.data.fn.params_len   = count;
     t.data.fn.variadic     = variadic;
-    ret append_type(ti, t);
+    val ap: Result[TypeId, str] = append_type(ti, t);
+    if (is_err[TypeId, str](ap)) { ret ap; }
+    val tid: TypeId = unwrap_ok[TypeId, str](ap);
+    # last-writer-wins on a hash collision: the most recently interned signature
+    # for this hash is the one reused next, so equal signatures still collapse.
+    val ins: Result[bool, str] = map.insert[u64, TypeId](?ti.fun_index, h, tid);
+    if (is_err[bool, str](ins)) { ret err[TypeId, str](unwrap_err[bool, str](ins)); }
+    ret ok[TypeId, str](tid);
+}
+
+# hash_fun: FNV-1a content hash over a function signature (ret, params, variadic),
+# matching the identity `fun_matches` verifies.
+fun hash_fun(ret_ty: TypeId, params: *TypeId, count: u32, variadic: bool) u64 {
+    var h: u64 = fnv1a.init();
+    h = fnv1a.step_u8(h, TYPE_FUN::u8);
+    h = fnv1a.step_u32(h, ret_ty::u32);
+    if (variadic) { h = fnv1a.step_u8(h, 1); } or { h = fnv1a.step_u8(h, 0); }
+    h = fnv1a.step_u32(h, count);
+    var i: u32 = 0;
+    for (i < count) {
+        h = fnv1a.step_u32(h, params[i]::u32);
+        i = i + 1;
+    }
+    ret h;
+}
+
+# fun_matches: whether the interned TYPE_FUN at `tid` has exactly the given
+# signature (ret, params slice, variadic).
+fun fun_matches(ti: *TypeInterner, tid: TypeId, ret_ty: TypeId, params: *TypeId, count: u32, variadic: bool) bool {
+    if (tid >= ti.type_len) { ret false; }
+    val t: *Type = ?ti.types[tid];
+    if (t.kind != TYPE_FUN) { ret false; }
+    if (t.data.fn.ret_ty != ret_ty) { ret false; }
+    if (t.data.fn.variadic != variadic) { ret false; }
+    if (t.data.fn.params_len != count) { ret false; }
+    var i: u32 = 0;
+    for (i < count) {
+        if (ti.params[t.data.fn.params_start + i] != params[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # intern_instance: intern a generic instantiation `(target_origin,
