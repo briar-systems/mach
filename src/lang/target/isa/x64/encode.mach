@@ -4414,6 +4414,173 @@ fun encode_asm_text(st: *EncodeState, fn_base: u32, text: str) Result[bool, str]
     ret ok[bool, str](true);
 }
 
+# asm_clobbers: the `AsmClobbersFn` the x86-64 ISA vtable exposes — infer the
+# registers an inline-asm body writes so the allocator never leaves a live value
+# in one and the prologue preserves any callee-saved register the body clobbers.
+#
+# the doc (`doc/language/asm.md`) promises clobber inference from the instruction
+# stream; this implements it for the x86-64 inline-asm grammar `encode_asm_stmt`
+# accepts. the body still carries `{name}` placeholders (they substitute to
+# `[rbp+off]` memory operands at encode time, never registers), so they contribute
+# no register. the grammar admits no SSE mnemonic, so a register operand is always
+# a GP write and `fp_out` stays empty — except the opaque `.byte` directive (and
+# any unrecognized statement), which is treated as clobbering every register so
+# the result is always a sound over-approximation. RSP/RBP moves (push/pop) touch
+# only the reserved stack/frame pointers and are not reported.
+pub fun asm_clobbers(body: str, gp_out: *u32, fp_out: *u32) {
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    val len: usize = str_len(body);
+    var start: usize = 0;
+    for (start < len) {
+        var end: usize = start;
+        for (end < len && body[end] != '\n'::char && body[end] != ';'::char) { end = end + 1; }
+        var lo: usize = start;
+        for (lo < end && is_asm_space(body[lo])) { lo = lo + 1; }
+        var hi: usize = lo;
+        for (hi < end && body[hi] != '#'::char) { hi = hi + 1; }
+        for (hi > lo && is_asm_space(body[hi - 1])) { hi = hi - 1; }
+        if (hi > lo) {
+            var line: [256]u8;
+            val ll: usize = hi - lo;
+            if (ll >= 256) {
+                # an over-long statement the encoder will reject; be conservative.
+                gp = gp | 0xFFFF::u32;
+                fp = fp | 0xFFFF::u32;
+            } or {
+                var c: usize = 0;
+                for (c < ll) { line[c] = body[lo + c]::u8; c = c + 1; }
+                line[ll] = 0;
+                stmt_clobbers((?line[0])::str, ?gp, ?fp);
+            }
+        }
+        start = end + 1;
+    }
+    @gp_out = gp;
+    @fp_out = fp;
+}
+
+# clobber_reg_operand: OR a register operand's GP-index bit into `@gp`. the inline
+# grammar produces only GP register operands; a memory / immediate / symbol
+# operand contributes no register write (a memory destination writes memory, its
+# base register is only read).
+fun clobber_reg_operand(op: *AsmOperand, gp: *u32) {
+    if (op.kind == ASMOP_REG && op.reg >= 0 && op.reg < 16) {
+        @gp = @gp | (1::u32 << op.reg::u32);
+    }
+}
+
+# clobber_two_dst: mark the destination (first) operand of a two-operand statement
+# as written. a malformed operand list the encoder will reject is treated
+# conservatively (every GP register written).
+fun clobber_two_dst(args: str, gp: *u32) {
+    var dst: AsmOperand;
+    var src: AsmOperand;
+    var dbuf: [128]u8;
+    var sbuf: [128]u8;
+    if (split_two_op(args, ?dst, ?src, ?dbuf[0], ?sbuf[0])) {
+        clobber_reg_operand(?dst, gp);
+    } or {
+        @gp = @gp | 0xFFFF::u32;
+    }
+}
+
+# clobber_two_both: mark both operands of a two-operand statement as written (the
+# XCHG / XADD exchange forms).
+fun clobber_two_both(args: str, gp: *u32) {
+    var dst: AsmOperand;
+    var src: AsmOperand;
+    var dbuf: [128]u8;
+    var sbuf: [128]u8;
+    if (split_two_op(args, ?dst, ?src, ?dbuf[0], ?sbuf[0])) {
+        clobber_reg_operand(?dst, gp);
+        clobber_reg_operand(?src, gp);
+    } or {
+        @gp = @gp | 0xFFFF::u32;
+    }
+}
+
+# clobber_one: mark the sole operand of a one-operand write form (neg / not / inc
+# / dec / pop) as written.
+fun clobber_one(args: str, gp: *u32) {
+    var op: AsmOperand;
+    if (parse_asm_operand(trim_str(args), ?op)) {
+        clobber_reg_operand(?op, gp);
+    } or {
+        @gp = @gp | 0xFFFF::u32;
+    }
+}
+
+# stmt_clobbers: OR the registers one trimmed inline-asm statement writes into
+# `@gp` / `@fp`. covers exactly the grammar `encode_asm_stmt` encodes; an
+# unrecognized statement (including `.byte`) is opaque and conservatively clobbers
+# every register.
+fun stmt_clobbers(stmt: str, gp: *u32, fp: *u32) {
+    # zero-operand forms: syscall implicitly clobbers RAX (return), RCX and R11.
+    if (str_equals(stmt, "syscall")) {
+        @gp = @gp | (1::u32 << x64.RAX::u32) | (1::u32 << x64.RCX::u32) | (1::u32 << x64.R11::u32);
+        ret;
+    }
+    if (str_equals(stmt, "ret") || str_equals(stmt, "hlt") || str_equals(stmt, "mfence")
+        || str_equals(stmt, "pause") || str_equals(stmt, "nop")) { ret; }
+
+    # a control transfer writes no callee-saved register; the surrounding asm
+    # barrier already covers a call's caller-saved clobbers.
+    if (mnemonic_is(stmt, "call") || mnemonic_is(stmt, "jmp")
+        || mnemonic_is(stmt, "je") || mnemonic_is(stmt, "jz")
+        || mnemonic_is(stmt, "jne") || mnemonic_is(stmt, "jnz")) { ret; }
+
+    # cmp / test write only the flags.
+    if (mnemonic_is(stmt, "cmp"))  { ret; }
+    if (mnemonic_is(stmt, "test")) { ret; }
+
+    # exchange forms write both operands.
+    if (mnemonic_is(stmt, "lock xadd")) { clobber_two_both(arg_str(stmt, 9), gp); ret; }
+    if (mnemonic_is(stmt, "xadd"))      { clobber_two_both(arg_str(stmt, 4), gp); ret; }
+    if (mnemonic_is(stmt, "xchg"))      { clobber_two_both(arg_str(stmt, 4), gp); ret; }
+
+    # cmpxchg writes its destination and implicitly RAX.
+    if (mnemonic_is(stmt, "lock cmpxchg")) {
+        clobber_two_dst(arg_str(stmt, 12), gp);
+        @gp = @gp | (1::u32 << x64.RAX::u32);
+        ret;
+    }
+    if (mnemonic_is(stmt, "cmpxchg")) {
+        clobber_two_dst(arg_str(stmt, 7), gp);
+        @gp = @gp | (1::u32 << x64.RAX::u32);
+        ret;
+    }
+
+    # two-operand write-first forms.
+    if (mnemonic_is(stmt, "mov"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "lea"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "add"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "sub"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "and"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "or"))    { clobber_two_dst(arg_str(stmt, 2), gp); ret; }
+    if (mnemonic_is(stmt, "xor"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "shl"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "shr"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "sar"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "movzx")) { clobber_two_dst(arg_str(stmt, 5), gp); ret; }
+    if (mnemonic_is(stmt, "movsx")) { clobber_two_dst(arg_str(stmt, 5), gp); ret; }
+
+    # one-operand write forms.
+    if (mnemonic_is(stmt, "neg")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "not")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "inc")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "dec")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "pop")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+
+    # push reads its operand and adjusts the reserved RSP; nothing else is written.
+    if (mnemonic_is(stmt, "push")) { ret; }
+
+    # `.byte` raw bytes or any statement outside the grammar is opaque: assume it
+    # writes every register so no live value is left in one it might overwrite.
+    @gp = @gp | 0xFFFF::u32;
+    @fp = @fp | 0xFFFF::u32;
+}
+
 # encode_asm_stmt: parse and encode one trimmed inline-asm statement.
 fun encode_asm_stmt(st: *EncodeState, fn_base: u32, tok: str) Result[bool, str] {
     # zero-operand mnemonics.

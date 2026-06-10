@@ -256,7 +256,14 @@ fun bank_count(tgt: *target.Target, class: u32) u32 {
 # ret: ok(true) on success, or an error string on an allocation failure
 fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) Result[bool, str] {
     if (f.block_count == 0) { ret ok[bool, str](true); }
-    if (f.vreg_count == 0)  { ret ok[bool, str](true); }
+    # a function with no vregs has nothing to allocate, but its inline asm may still
+    # clobber callee-saved registers the prologue must preserve for the caller, so
+    # derive the callee mask before returning (the asm-clobber caller-corruption
+    # path also corrupts callers from a value-free asm-only function).
+    if (f.vreg_count == 0)  {
+        f.callee_mask = asm_callee_mask(tgt, f);
+        ret ok[bool, str](true);
+    }
 
     var ctx: AllocCtx;
     val ic: Result[bool, str] = ctx_init(?ctx, tgt, m, f);
@@ -321,7 +328,7 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
     val sc: Result[bool, str] = linear_scan(tgt, ?ctx);
     if (is_err[bool, str](sc)) { ctx_dnit(?ctx); ret sc; }
 
-    val sp: Result[bool, str] = spill_across_calls(?ctx);
+    val sp: Result[bool, str] = spill_across_calls(tgt, ?ctx);
     if (is_err[bool, str](sp)) { ctx_dnit(?ctx); ret sp; }
 
     val rw: Result[bool, str] = rewrite(tgt, ?ctx);
@@ -1787,15 +1794,119 @@ fun add_spill_slot(ctx: *AllocCtx, value_id: u32, size: u32) Result[i32, str] {
     ret ok[i32, str](si::i32);
 }
 
+# asm_instr_clobbers: when `mi` is an inline-asm instruction, fill `gp` / `fp` with
+# the register-index clobber bitmasks the ISA infers from its body and return true;
+# otherwise return false. an ISA exposing no analyzer is treated conservatively
+# (every register potentially clobbered) rather than as "no clobbers", so a value
+# is never left in a register a foreign asm body might overwrite. the masks index
+# registers by their within-bank index (bit n -> GP / XMM register n).
+fun asm_instr_clobbers(tgt: *target.Target, mi: *mir.MirInstr, gp: *u32, fp: *u32) bool {
+    if (mi.asm_block == nil) { ret false; }
+    @gp = 0;
+    @fp = 0;
+    if (tgt.arch.asm_clobbers == nil) {
+        @gp = 0xFFFFFFFF;
+        @fp = 0xFFFFFFFF;
+        ret true;
+    }
+    val clob: isa.AsmClobbersFn = tgt.arch.asm_clobbers::isa.AsmClobbersFn;
+    clob(mi.asm_block.body, gp, fp);
+    ret true;
+}
+
+# asm_clobbers_at: `asm_instr_clobbers` for the flat-stream instruction at `pos`.
+# only valid before the rewrite pass rebuilds the per-block instruction lists (the
+# flat stream indexes the original layout); record_callee_mask, which runs after
+# rewrite, walks the blocks directly instead.
+fun asm_clobbers_at(tgt: *target.Target, ctx: *AllocCtx, pos: u32, gp: *u32, fp: *u32) bool {
+    ret asm_instr_clobbers(tgt, flat_instr(ctx, pos), gp, fp);
+}
+
+# abi_callee_saved_gp_mask: GP-register bitmask of the ABI's callee-saved file —
+# the bitmask form of `seed_callee_saved`, for the asm-clobber callee-mask
+# derivation that runs without a full allocation context (a vreg-free function).
+fun abi_callee_saved_gp_mask(tgt: *target.Target) u32 {
+    var regs: [32]isa.Register;
+    val fill: abi.RegFileFn = tgt.abi.callee_saved::abi.RegFileFn;
+    val n: i32 = fill(?regs[0]);
+    var m: u32 = 0;
+    var i: i32 = 0;
+    for (i < n && i < MAX_REG_FILE) {
+        val id: i32 = regs[i].id;
+        if (isa.regid_class(id) == isa.REG_CLASS_ID_GP && id >= 0 && id < 32) {
+            m = m | (1::u32 << id::u32);
+        }
+        i = i + 1;
+    }
+    ret m;
+}
+
+# isa_reserved_gp_mask: GP-register bitmask the ISA reserves from allocation (the
+# stack / frame pointers, the reload-scratch pool, and the encoder's split
+# scratch) — the bitmask form of `seed_reserved`'s always-reserved set, so a
+# callee-saved-but-reserved register (the frame pointer) is excluded from an asm
+# clobber mask just as it is from an allocated one.
+fun isa_reserved_gp_mask(tgt: *target.Target) u32 {
+    var m: u32 = 0;
+    var i: i32 = 0;
+    for (i < tgt.arch.reserved_reg_count && i < MAX_REG_FILE) {
+        val id: i32 = tgt.arch.reserved_regs[i].id;
+        if (id >= 0 && id < 32) { m = m | (1::u32 << id::u32); }
+        i = i + 1;
+    }
+    var j: i32 = 0;
+    for (j < tgt.arch.reload_scratch_count && j < MAX_REG_FILE) {
+        val id: i32 = tgt.arch.reload_scratch_regs[j].id;
+        if (id >= 0 && id < 32) { m = m | (1::u32 << id::u32); }
+        j = j + 1;
+    }
+    val sid: i32 = tgt.arch.scratch_reg;
+    if (sid >= 0 && sid < 32) { m = m | (1::u32 << sid::u32); }
+    ret m;
+}
+
+# asm_callee_mask: the callee-saved GP registers any inline-asm body in `f` writes
+# — the registers the prologue must additionally preserve for the caller. computed
+# directly from the ABI callee-saved file and the ISA reserved set so it works for
+# a function with no vregs, which skips register allocation (and record_callee_mask)
+# entirely yet may still carry an asm body that clobbers a callee-saved register.
+fun asm_callee_mask(tgt: *target.Target, f: *mir.MirFunction) u32 {
+    val cs: u32 = abi_callee_saved_gp_mask(tgt);
+    val res: u32 = isa_reserved_gp_mask(tgt);
+    var mask: u32 = 0;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            var agp: u32 = 0;
+            var afp: u32 = 0;
+            if (asm_instr_clobbers(tgt, ?blk.instrs[ii], ?agp, ?afp)) {
+                mask = mask | (agp & cs & ~res);
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret mask;
+}
+
 # spill_across_calls: at each MIR_CALL barrier, spill every live vreg whose
 # assigned register is caller-saved (or any FP register) so the call cannot
-# destroy it. a spilled value is reloaded at its uses by the rewrite pass; here
-# we only convert call-clobbered live registers into spill slots. ranges already
-# placed in callee-saved registers survive the call untouched.
-fun spill_across_calls(ctx: *AllocCtx) Result[bool, str] {
+# destroy it. an inline-asm barrier additionally spills a live value held in a
+# CALLEE-saved register the asm body writes — pick_gp parks call-crossing values
+# in callee-saved registers, exactly the ones a `mov rbx, ...` asm would corrupt
+# (the inline-asm clobber miscompile). a spilled value is reloaded at its uses by
+# the rewrite pass; here we only convert clobbered live registers into spill slots.
+# ranges in callee-saved registers no barrier writes survive untouched.
+fun spill_across_calls(tgt: *target.Target, ctx: *AllocCtx) Result[bool, str] {
     var pos: u32 = 0;
     for (pos < ctx.flat_count) {
         if (!ctx.flat[pos].is_call) { pos = pos + 1; cnt; }
+        # the inline-asm clobber set for this barrier (empty for a MIR_CALL).
+        var asm_gp: u32 = 0;
+        var asm_fp: u32 = 0;
+        val is_asm: bool = asm_clobbers_at(tgt, ctx, pos, ?asm_gp, ?asm_fp);
         var v: u32 = 0;
         for (v < ctx.f.vreg_count) {
             val mv: *mir.MirVReg = ?ctx.f.vregs[v];
@@ -1810,6 +1921,9 @@ fun spill_across_calls(ctx: *AllocCtx) Result[bool, str] {
                 must_spill = true;
             } or (mv.assigned < ctx.gp_count && !ctx.callee_saved[mv.assigned]) {
                 must_spill = true;
+            } or (is_asm && mv.assigned < ctx.gp_count && (asm_gp & (1::u32 << mv.assigned)) != 0) {
+                # a callee-saved GP register the asm body itself overwrites.
+                must_spill = true;
             }
             if (must_spill) {
                 val sr: Result[bool, str] = spill_vreg(ctx, v);
@@ -1823,8 +1937,12 @@ fun spill_across_calls(ctx: *AllocCtx) Result[bool, str] {
 }
 
 # record_callee_mask: set `MirFunction.callee_mask` bit `n` for every callee-saved
-# GP register the allocator actually assigned, so the prologue saves and the
-# epilogue restores exactly those registers.
+# GP register the function must preserve — those the allocator assigned, plus any
+# a function's inline asm body writes. the prologue saves and the epilogue restores
+# exactly these. the asm contribution closes the caller-corruption path: an asm
+# body may overwrite a callee-saved register the allocator never assigned (so its
+# value was spilled or never placed there), yet the function still owes its caller
+# that register's preservation.
 fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
     var mask: u32 = 0;
     var v: u32 = 0;
@@ -1838,6 +1956,12 @@ fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
         }
         v = v + 1;
     }
+
+    # OR in every callee-saved GP register any inline-asm body in the function
+    # writes, so the prologue preserves it for the caller even when no allocated
+    # value lives there.
+    mask = mask | asm_callee_mask(tgt, ctx.f);
+
     ctx.f.callee_mask = mask;
 }
 
