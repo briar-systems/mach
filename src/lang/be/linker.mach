@@ -50,12 +50,13 @@ use std.allocator.deallocate;
 use mem: std.memory;
 use fs:  std.filesystem;
 use map: std.collections.map;
-use maphash: std.collections.map;
+use page: std.allocator.page;
 
 use sess:   mach.lang.session;
 use intern: mach.lang.intern;
 use target: mach.lang.target;
 use of:     mach.lang.target.of;
+use bin:    mach.lang.target.of.bin;
 use ar:     mach.lang.target.of.ar;
 use obj:    mach.lang.be.obj;
 
@@ -104,12 +105,17 @@ rec MergedSection {
     used:  bool;
 }
 
-# resolved location of a defined symbol: its final virtual address (the only
-# datum relocation patching needs). undefined symbols never enter this table.
+# resolved location of a defined symbol: its final virtual address (what
+# relocation patching needs) and whether the winning definition is weak, so a
+# later strong definition can override it rather than collide. undefined symbols
+# never enter this table.
 # ---
 # vaddr: final virtual address of the symbol (its section's vaddr + offset)
+# weak:  true while the current winner is a weak definition (overridable by a
+#        later strong definition; a strong winner errors on a second strong)
 rec SymbolLoc {
     vaddr: u64;
+    weak:  bool;
 }
 
 # the linker's mutable dynamic-link state: the format-neutral plan (`of.DynamicInfo`)
@@ -170,7 +176,7 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     if (tgt.of == nil) { ret err[bool, str]("link: target has no object-format vtable"); }
     if (tgt.os == nil) { ret err[bool, str]("link: target has no OS vtable"); }
     if (mode == LINK_SHARED) {
-        ret err[bool, str]("relocation 'shared' not supported by linker");
+        ret err[bool, str]("link: shared-object output (LINK_SHARED) is not supported");
     }
     if (obj_paths == nil || obj_count == 0) {
         ret err[bool, str]("link: no input objects");
@@ -231,7 +237,13 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     }
     sec_base = unwrap_ok[*u32, str](br);
 
-    accumulate_sections(modules, module_count, ?merged[0], placements, sec_base);
+    val acc_r: Result[bool, str] =
+        accumulate_sections(modules, module_count, ?merged[0], placements, sec_base);
+    if (is_err[bool, str](acc_r)) {
+        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_modules(alloc, modules, module_count);
+        ret err[bool, str](unwrap_err[bool, str](acc_r));
+    }
 
     # assign each merged section a virtual address (executables only). sections
     # are placed in canonical order from the OS base, each kind page-aligned.
@@ -244,7 +256,7 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     # collect the global symbol table: every defined symbol keyed by name, with
     # its resolved location. duplicate strong definitions are rejected.
     var sym_locs: map.Map[intern.StrId, SymbolLoc] =
-        map.init[intern.StrId, SymbolLoc](alloc, maphash.hash_u32, maphash.eq_u32);
+        map.init[intern.StrId, SymbolLoc](alloc, map.hash_u32, map.eq_u32);
 
     val collect_r: Result[bool, str] =
         collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs, assign_vaddrs);
@@ -895,7 +907,7 @@ fun total_sections(modules: *of.ObjectImage, module_count: u32) u32 {
 # merged section). also fills `sec_base` with the per-module prefix offset into
 # the flat placement array.
 fun accumulate_sections(modules: *of.ObjectImage, module_count: u32,
-                        merged: *MergedSection, placements: *Placement, sec_base: *u32) {
+                        merged: *MergedSection, placements: *Placement, sec_base: *u32) Result[bool, str] {
     var flat: u32 = 0;
     var m: u32 = 0;
     for (m < module_count) {
@@ -903,19 +915,33 @@ fun accumulate_sections(modules: *of.ObjectImage, module_count: u32,
         var sc: u32 = 0;
         for (sc < modules[m].section_count) {
             val sec: *of.Section = ?modules[m].sections[sc];
-            val ki: u32 = clamp_kind(sec.kind);
+            # the parser must hand the linker one of the known section kinds; an
+            # out-of-range kind is a contract violation, not a section to silently
+            # fold into .debug.
+            if (sec.kind::u32 >= MERGED_KIND_COUNT) {
+                ret err[bool, str]("linker: input section has an unknown section kind");
+            }
+            val ki: u32 = sec.kind::u32;
 
             var a: u32 = sec.align;
             if (a == 0) { a = 1; }
             if (a > merged[ki].align) { merged[ki].align = a; }
 
-            # align the running offset to this section's alignment.
-            val off: u32 = align_up_u32(merged[ki].len, a);
+            # align the running offset to this section's alignment and add this
+            # section's bytes, computed in u64 so a >4GiB merged section group is
+            # rejected rather than wrapping the u32 length into a tiny value that
+            # later truncates the output.
+            val off64: u64 = bin.align_up_u64(merged[ki].len::u64, a::u64);
+            val newlen: u64 = off64 + sec.len::u64;
+            if (newlen > 0xFFFFFFFF) {
+                ret err[bool, str]("linker: merged section size exceeds the 4 GiB u32 limit");
+            }
+
             placements[flat].merged_index = ki;
-            placements[flat].offset       = off;
+            placements[flat].offset       = off64::u32;
             placements[flat].vaddr        = 0;
 
-            merged[ki].len  = off + sec.len;
+            merged[ki].len  = newlen::u32;
             merged[ki].used = true;
 
             flat = flat + 1;
@@ -923,6 +949,7 @@ fun accumulate_sections(modules: *of.ObjectImage, module_count: u32,
         }
         m = m + 1;
     }
+    ret ok[bool, str](true);
 }
 
 # assign_section_vaddrs: give each used merged section a base virtual address,
@@ -937,7 +964,7 @@ fun assign_section_vaddrs(tgt: *target.Target, merged: *MergedSection) {
         if (merged[i].used) {
             var seg_align: u64 = merged[i].align::u64;
             if (seg_align < page) { seg_align = page; }
-            va = align_up_u64(va, seg_align);
+            va = bin.align_up_u64(va, seg_align);
             merged[i].vaddr = va;
             va = va + merged[i].len::u64;
         }
@@ -972,30 +999,40 @@ fun collect_symbols(s: *sess.Session, modules: *of.ObjectImage, module_count: u3
         for (sy < modules[m].symbol_count) {
             val sym: *of.Symbol = ?modules[m].symbols[sy];
             if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
-            if (sym.section >= modules[m].section_count) { sy = sy + 1; cnt; }
+            # a defined symbol whose section index is out of range is a corrupt
+            # object: erroring here surfaces it directly instead of letting the
+            # definition vanish and resurface later as a baffling undefined symbol.
+            if (sym.section >= modules[m].section_count) {
+                ret err[bool, str]("linker: symbol names an out-of-range section");
+            }
             if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { sy = sy + 1; cnt; }
 
             val flat: u32 = sec_base[m] + sym.section;
             val pl: *Placement = ?placements[flat];
 
+            val is_weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
+            var vaddr: u64 = 0;
+            if (have_vaddrs) { vaddr = pl.vaddr + sym.offset::u64; }
+
             val existing: Result[*SymbolLoc, str] =
                 map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name);
             if (is_ok[*SymbolLoc, str](existing)) {
-                val is_weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
-                if (!is_weak) {
-                    ret err[bool, str](dup_message(s, sym.name));
-                }
+                # standard weak/strong resolution, independent of input order: a weak
+                # definition never displaces an existing one; a strong definition
+                # overrides an existing weak winner (taking its address) but collides
+                # with an existing strong one.
+                val cur: *SymbolLoc = unwrap_ok[*SymbolLoc, str](existing);
+                if (is_weak) { sy = sy + 1; cnt; }
+                if (!cur.weak) { ret err[bool, str](dup_message(s, sym.name)); }
+                cur.vaddr = vaddr;
+                cur.weak = false;
                 sy = sy + 1;
                 cnt;
             }
 
             var loc: SymbolLoc;
-            if (have_vaddrs) {
-                loc.vaddr = pl.vaddr + sym.offset::u64;
-            }
-            or {
-                loc.vaddr = 0;
-            }
+            loc.vaddr = vaddr;
+            loc.weak = is_weak;
 
             val ins: Result[bool, str] =
                 map.insert[intern.StrId, SymbolLoc](sym_locs, sym.name, loc);
@@ -1132,68 +1169,138 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
                      dyn: *DynState) Result[bool, str] {
     # intern the abstract relocation-kind names once for fast comparison.
     val kinds: RelocKindIds = intern_reloc_kinds(s);
+    val alloc: *Allocator = s.alloc;
 
     var m: u32 = 0;
     for (m < module_count) {
-        var ri: u32 = 0;
-        for (ri < modules[m].reloc_count) {
-            val r: *of.Relocation = ?modules[m].relocations[ri];
-            if (r.section >= modules[m].section_count) { ri = ri + 1; cnt; }
+        # build module m's local-name -> vaddr index once, replacing the per-
+        # relocation linear symbol-table scan (an O(relocations x symbols) hot path
+        # on a self-host link). the index holds only LOCALs; GLOBAL targets resolve
+        # through the cross-object sym_locs table. the map is always freed after the
+        # module's relocations are patched, regardless of outcome.
+        var local_map: map.Map[intern.StrId, u64] =
+            map.init[intern.StrId, u64](alloc, map.hash_u32, map.eq_u32);
+        val br: Result[bool, str] = build_local_index(modules, m, placements, sec_base, ?local_map);
+        if (is_err[bool, str](br)) {
+            map.dnit[intern.StrId, u64](?local_map);
+            ret err[bool, str](unwrap_err[bool, str](br));
+        }
 
-            # the patch site's location in the merged image. the placement's
-            # merged_index is a section *kind*; map it to the output-section index.
-            val flat: u32 = sec_base[m] + r.section;
-            val pl: *Placement = ?placements[flat];
-            val patch_va: u64 = pl.vaddr + r.offset::u64;
-            val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
-            if (out_ix == 0xFFFFFFFF) { ri = ri + 1; cnt; }
-            val dst: *u8 = out_img.sections[out_ix].bytes;
-            if (dst == nil) { ri = ri + 1; cnt; }
-            val patch_off: u32 = pl.offset + r.offset;
+        val pr: Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
+            placements, sec_base, sym_locs, dyn, ?kinds, ?local_map);
+        map.dnit[intern.StrId, u64](?local_map);
+        if (is_err[bool, str](pr)) { ret err[bool, str](unwrap_err[bool, str](pr)); }
 
-            # locate the target symbol's final virtual address. a LOCAL target is
-            # private to module `m`; resolve it against `m`'s own definition.
-            # GLOBAL targets (and undefined externs) resolve by name via sym_locs.
-            var sym_va: u64 = 0;
-            val lv: Result[u64, str] =
-                local_symbol_vaddr(modules, module_count, m, r.symbol, placements, sec_base);
-            if (is_ok[u64, str](lv)) {
-                sym_va = unwrap_ok[u64, str](lv);
+        m = m + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# build_local_index: fill `out` with module `m`'s LOCAL (object-private) symbol
+# definitions, name -> final virtual address. the first definition of a name wins,
+# mirroring the linear scan it replaces. EXTERNAL, out-of-range, and GLOBAL symbols
+# are excluded — globals live in the cross-object table.
+fun build_local_index(modules: *of.ObjectImage, m: u32, placements: *Placement, sec_base: *u32,
+                      out: *map.Map[intern.StrId, u64]) Result[bool, str] {
+    var sy: u32 = 0;
+    for (sy < modules[m].symbol_count) {
+        val sym: *of.Symbol = ?modules[m].symbols[sy];
+        if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
+        if (sym.section >= modules[m].section_count) { sy = sy + 1; cnt; }
+        if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { sy = sy + 1; cnt; }
+
+        if (is_err[*u64, str](map.get[intern.StrId, u64](out, ?sym.name))) {
+            val flat: u32 = sec_base[m] + sym.section;
+            val va: u64 = placements[flat].vaddr + sym.offset::u64;
+            val ins: Result[bool, str] = map.insert[intern.StrId, u64](out, sym.name, va);
+            if (is_err[bool, str](ins)) { ret err[bool, str](unwrap_err[bool, str](ins)); }
+        }
+        sy = sy + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# patch_module_relocations: apply every relocation in module `m` into the merged
+# bytes. a LOCAL target resolves through `local_map` (module `m`'s private index);
+# a GLOBAL target (or an undefined extern) resolves by name through `sym_locs`, and
+# an unresolved pc-relative call to a function import is deferred as a PltFixup.
+fun patch_module_relocations(s: *sess.Session, out_img: *of.ObjectImage,
+                             modules: *of.ObjectImage, m: u32,
+                             placements: *Placement, sec_base: *u32,
+                             sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
+                             kinds: *RelocKindIds, local_map: *map.Map[intern.StrId, u64]) Result[bool, str] {
+    var ri: u32 = 0;
+    for (ri < modules[m].reloc_count) {
+        val r: *of.Relocation = ?modules[m].relocations[ri];
+        # a corrupt object can name an out-of-range section, or an offset past the
+        # end of its own section (which would wrap the u32 patch cursor and scribble
+        # outside the merged buffer). reject both loudly instead of silently dropping
+        # the relocation, which would ship an executable with an unpatched site.
+        if (r.section >= modules[m].section_count) {
+            ret err[bool, str]("linker: relocation names an out-of-range section");
+        }
+        if (r.offset > modules[m].sections[r.section].len) {
+            ret err[bool, str]("linker: relocation offset is past the end of its section");
+        }
+
+        # the patch site's location in the merged image. the placement's
+        # merged_index is a section *kind*; map it to the output-section index.
+        val flat: u32 = sec_base[m] + r.section;
+        val pl: *Placement = ?placements[flat];
+        val patch_va: u64 = pl.vaddr + r.offset::u64;
+        val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
+        # a relocation in a section with no merged output, or one whose patch site
+        # lands in a (byteless) BSS section, cannot be applied — that is a contract
+        # violation from a buggy parser/codegen, not a relocation to quietly skip.
+        if (out_ix == 0xFFFFFFFF) {
+            ret err[bool, str]("linker: relocation targets a section with no merged output");
+        }
+        val dst: *u8 = out_img.sections[out_ix].bytes;
+        if (dst == nil) {
+            ret err[bool, str]("linker: relocation patch site lands in a BSS section");
+        }
+        val patch_off: u32 = pl.offset + r.offset;
+
+        # locate the target symbol's final virtual address. a LOCAL target is
+        # private to module `m`; resolve it through `m`'s local index. GLOBAL targets
+        # (and undefined externs) resolve by name via sym_locs.
+        var sym_va: u64 = 0;
+        val lvm: Result[*u64, str] = map.get[intern.StrId, u64](local_map, ?r.symbol);
+        if (is_ok[*u64, str](lvm)) {
+            sym_va = @unwrap_ok[*u64, str](lvm);
+        }
+        or {
+            val sl: Result[*SymbolLoc, str] =
+                map.get[intern.StrId, SymbolLoc](sym_locs, ?r.symbol);
+            if (is_ok[*SymbolLoc, str](sl)) {
+                sym_va = unwrap_ok[*SymbolLoc, str](sl).vaddr;
             }
             or {
-                val sl: Result[*SymbolLoc, str] =
-                    map.get[intern.StrId, SymbolLoc](sym_locs, ?r.symbol);
-                if (is_ok[*SymbolLoc, str](sl)) {
-                    sym_va = unwrap_ok[*SymbolLoc, str](sl).vaddr;
+                # not defined anywhere: a dynamic import, or a hard error. a
+                # pc-relative call to a FUNCTION import is deferred to the writer
+                # (only function imports get a PLT stub); any other unresolved
+                # reference — including a call kind against a data import (deferred)
+                # — is rejected as undefined.
+                val imp: Result[u32, str] = dynstate_import_index(dyn, r.symbol);
+                if (is_ok[u32, str](imp) && is_call_kind(kinds, r.kind)
+                    && dynstate_import_is_func(dyn, unwrap_ok[u32, str](imp))) {
+                    val rec_r: Result[bool, str] = dynstate_add_fixup(s, dyn,
+                        segment_index_for(out_img, out_ix), patch_off,
+                        unwrap_ok[u32, str](imp), patch_va, r.addend);
+                    if (is_err[bool, str](rec_r)) { ret err[bool, str](unwrap_err[bool, str](rec_r)); }
+                    ri = ri + 1; cnt;
                 }
-                or {
-                    # not defined anywhere: a dynamic import, or a hard error. a
-                    # pc-relative call to a FUNCTION import is deferred to the
-                    # writer (only function imports get a PLT stub); any other
-                    # unresolved reference — including a call kind against a data
-                    # import (deferred) — is rejected as undefined.
-                    val imp: Result[u32, str] = dynstate_import_index(dyn, r.symbol);
-                    if (is_ok[u32, str](imp) && is_call_kind(?kinds, r.kind)
-                        && dynstate_import_is_func(dyn, unwrap_ok[u32, str](imp))) {
-                        val rec_r: Result[bool, str] = dynstate_add_fixup(s, dyn,
-                            segment_index_for(out_img, out_ix), patch_off,
-                            unwrap_ok[u32, str](imp), patch_va, r.addend);
-                        if (is_err[bool, str](rec_r)) { ret err[bool, str](unwrap_err[bool, str](rec_r)); }
-                        ri = ri + 1; cnt;
-                    }
-                    ret err[bool, str](undef_message(s, r.symbol));
-                }
+                ret err[bool, str](undef_message(s, r.symbol));
             }
-
-            val pr: Result[bool, str] =
-                apply_one(s, ?kinds, r.kind, dst, patch_off, out_img.sections[out_ix].len, sym_va, r.addend, patch_va, m, r.offset);
-            if (is_err[bool, str](pr)) {
-                ret err[bool, str](unwrap_err[bool, str](pr));
-            }
-
-            ri = ri + 1;
         }
-        m = m + 1;
+
+        val pr: Result[bool, str] =
+            apply_one(s, kinds, r.kind, dst, patch_off, out_img.sections[out_ix].len, sym_va, r.addend, patch_va);
+        if (is_err[bool, str](pr)) {
+            ret err[bool, str](unwrap_err[bool, str](pr));
+        }
+
+        ri = ri + 1;
     }
     ret ok[bool, str](true);
 }
@@ -1265,12 +1372,12 @@ fun build_dynamic_info(s: *sess.Session, tgt: *target.Target, dyn: *DynState,
         dyn.info.lib_count = soname_count;
     }
 
-    dyn.import_map = map.init[intern.StrId, u32](alloc, maphash.hash_u32, maphash.eq_u32);
+    dyn.import_map = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
     dyn.active = true;
 
     # count distinct undefined externs first so the import array is sized exactly.
     var seen: map.Map[intern.StrId, u32] =
-        map.init[intern.StrId, u32](alloc, maphash.hash_u32, maphash.eq_u32);
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
     var n_imports: u32 = 0;
     var m: u32 = 0;
     for (m < module_count) {
@@ -1395,77 +1502,46 @@ fun dynstate_add_fixup(s: *sess.Session, dyn: *DynState, seg_index: u32, seg_off
     ret ok[bool, str](true);
 }
 
-# local_symbol_vaddr: resolve a relocation target that names a LOCAL (object-
-# private) symbol of module `m` to its final virtual address.
-#
-# scans module `m`'s symbols for a defined (non-external) symbol named `name`
-# that is LOCAL (no GLOBAL flag) and computes its final virtual address the same
-# way collect_symbols rebases a definition: the vaddr of the placement of the
-# symbol's section plus the symbol's offset. returns err when module `m` has no
-# such local symbol, so the caller resolves the name through the cross-object
-# global table instead. mirrors how a real linker keeps locals per-object.
-# ---
-# modules:      parsed input images
-# module_count: number of images
-# m:            index of the module owning the relocation
-# name:         interned name of the referenced symbol
-# placements:   per-input-section placements (carry final vaddrs)
-# sec_base:     per-module base into the flat placement array
-# ret:          the local symbol's final virtual address, or err if none
-fun local_symbol_vaddr(modules: *of.ObjectImage, module_count: u32, m: u32,
-                       name: intern.StrId, placements: *Placement, sec_base: *u32) Result[u64, str] {
-    if (m >= module_count) { ret err[u64, str]("no local"); }
-    var sy: u32 = 0;
-    for (sy < modules[m].symbol_count) {
-        val sym: *of.Symbol = ?modules[m].symbols[sy];
-        if (sym.name != name) { sy = sy + 1; cnt; }
-        if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
-        if (sym.section >= modules[m].section_count) { sy = sy + 1; cnt; }
-        if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { sy = sy + 1; cnt; }
-
-        val flat: u32 = sec_base[m] + sym.section;
-        ret ok[u64, str](placements[flat].vaddr + sym.offset::u64);
-    }
-    ret err[u64, str]("no local");
-}
-
 # apply_one: write a single resolved relocation into the merged bytes. `abs64`
 # writes a 64-bit little-endian absolute address; `pc32`/`plt32` write a 32-bit
 # little-endian pc-relative displacement. bounds and 32-bit range are checked.
 fun apply_one(s: *sess.Session, kinds: *RelocKindIds, kind: intern.StrId,
              dst: *u8, patch_off: u32, sec_len: u32,
-             sym_va: u64, addend: i64, patch_va: u64, module: u32, rel_off: u32) Result[bool, str] {
+             sym_va: u64, addend: i64, patch_va: u64) Result[bool, str] {
     if (kind == kinds.abs64) {
-        if (patch_off + 8 > sec_len) {
-            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+        # bound the patch site in u64: patch_off + width can wrap a u32 for an
+        # offset near 0xFFFFFFFF, which would pass a u32 check and then scribble
+        # outside the merged buffer.
+        if (patch_off::u64 + 8 > sec_len::u64) {
+            ret err[bool, str](overflow_message(s, kind));
         }
         val value: u64 = sym_va + (addend::u64);
-        write_u64_le(dst, patch_off, value);
+        bin.write_u64_le(dst, patch_off::usize, value);
         ret ok[bool, str](true);
     }
 
     if (kind == kinds.pc32 || kind == kinds.plt32) {
-        if (patch_off + 4 > sec_len) {
-            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+        if (patch_off::u64 + 4 > sec_len::u64) {
+            ret err[bool, str](overflow_message(s, kind));
         }
         val disp: i64 = (sym_va::i64) + addend - (patch_va::i64);
         if (disp > 2147483647 || disp < -2147483648) {
-            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+            ret err[bool, str](overflow_message(s, kind));
         }
-        write_u32_le(dst, patch_off, (disp::u64) & 0xFFFFFFFF);
+        bin.write_u32_le(dst, patch_off::usize, ((disp::u64) & 0xFFFFFFFF)::u32);
         ret ok[bool, str](true);
     }
 
     # abs32s: 32-bit signed absolute.
     if (kind == kinds.abs32s) {
-        if (patch_off + 4 > sec_len) {
-            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+        if (patch_off::u64 + 4 > sec_len::u64) {
+            ret err[bool, str](overflow_message(s, kind));
         }
         val v: i64 = (sym_va::i64) + addend;
         if (v > 2147483647 || v < -2147483648) {
-            ret err[bool, str](overflow_message(s, kind, module, rel_off));
+            ret err[bool, str](overflow_message(s, kind));
         }
-        write_u32_le(dst, patch_off, (v::u64) & 0xFFFFFFFF);
+        bin.write_u32_le(dst, patch_off::usize, ((v::u64) & 0xFFFFFFFF)::u32);
         ret ok[bool, str](true);
     }
 
@@ -1482,7 +1558,14 @@ fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module
         var ri: u32 = 0;
         for (ri < modules[m].reloc_count) {
             val r: *of.Relocation = ?modules[m].relocations[ri];
-            if (r.section >= modules[m].section_count) { ri = ri + 1; cnt; }
+            # reject the same corrupt-input conditions the patch path does, rather
+            # than silently dropping a relocation from the carried-forward object.
+            if (r.section >= modules[m].section_count) {
+                ret err[bool, str]("linker: relocation names an out-of-range section");
+            }
+            if (r.offset > modules[m].sections[r.section].len) {
+                ret err[bool, str]("linker: relocation offset is past the end of its section");
+            }
 
             val flat: u32 = sec_base[m] + r.section;
             val pl: *Placement = ?placements[flat];
@@ -1490,7 +1573,9 @@ fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module
             # find the output-section index for this kind by matching merged
             # index against the already-added output sections.
             val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
-            if (out_ix == 0xFFFFFFFF) { ri = ri + 1; cnt; }
+            if (out_ix == 0xFFFFFFFF) {
+                ret err[bool, str]("linker: relocation targets a section with no merged output");
+            }
 
             var orel: of.Relocation;
             orel.section = out_ix;
@@ -1586,47 +1671,6 @@ fun os_page_size(tgt: *target.Target) u64 {
     ret tgt.os.page_size;
 }
 
-# clamp_kind: map a section kind to a valid merged-accumulator index, treating
-# any out-of-range kind as DEBUG so unknown sections are merged but never
-# loaded.
-fun clamp_kind(kind: of.SectionKind) u32 {
-    if (kind::u32 >= MERGED_KIND_COUNT) { ret of.SK_DEBUG::u32; }
-    ret kind::u32;
-}
-
-# align_up_u32: round `value` up to the next multiple of `align` (a power of
-# two, or 1 for no alignment).
-fun align_up_u32(value: u32, align: u32) u32 {
-    if (align <= 1) { ret value; }
-    ret (value + align - 1) & ~(align - 1);
-}
-
-# align_up_u64: round `value` up to the next multiple of `align` (a power of
-# two, or 1 for no alignment).
-fun align_up_u64(value: u64, align: u64) u64 {
-    if (align <= 1) { ret value; }
-    ret (value + align - 1) & ~(align - 1);
-}
-
-# write_u64_le: store a 64-bit value little-endian at `dst[off..off+8]`.
-fun write_u64_le(dst: *u8, off: u32, value: u64) {
-    var i: u32 = 0;
-    for (i < 8) {
-        dst[off + i] = ((value >> (i * 8)) & 0xFF)::u8;
-        i = i + 1;
-    }
-}
-
-# write_u32_le: store the low 32 bits of `value` little-endian at
-# `dst[off..off+4]`.
-fun write_u32_le(dst: *u8, off: u32, value: u64) {
-    var i: u32 = 0;
-    for (i < 4) {
-        dst[off + i] = ((value >> (i * 8)) & 0xFF)::u8;
-        i = i + 1;
-    }
-}
-
 # dup_message: build the "multiple definition of '<name>'" diagnostic string.
 fun dup_message(s: *sess.Session, name: intern.StrId) str {
     val nm: Option[str] = intern.lookup(?s.interner, name);
@@ -1642,7 +1686,7 @@ fun undef_message(s: *sess.Session, name: intern.StrId) str {
 }
 
 # overflow_message: build the "relocation '<kind>' overflows" diagnostic string.
-fun overflow_message(s: *sess.Session, kind: intern.StrId, module: u32, rel_off: u32) str {
+fun overflow_message(s: *sess.Session, kind: intern.StrId) str {
     val km: Option[str] = intern.lookup(?s.interner, kind);
     if (is_some[str](km)) { ret join3(s, "relocation '", unwrap[str](km), "' overflows", "relocation overflows"); }
     ret "relocation overflows";
@@ -1776,10 +1820,74 @@ fun free_modules_to(alloc: *Allocator, modules: *of.ObjectImage, n: u32, cap: u3
     }
 }
 
-# cstr_len: length of a null-terminated byte string, excluding the terminator.
-fun cstr_len(p: *u8) usize {
-    if (p == nil) { ret 0; }
-    var n: usize = 0;
-    for (p[n] != 0) { n = n + 1; }
-    ret n;
+# lt_link: collect two single-symbol modules into a fresh symbol table and return
+# the winning definition's resolved virtual address (or the collect error). a test
+# helper for the weak/strong resolution rules; module 0 is placed at 0x1000 and
+# module 1 at 0x2000 so the winner is identifiable by address.
+fun lt_link(s: *sess.Session, name: intern.StrId, a: *of.Symbol, b: *of.Symbol) Result[u64, str] {
+    var placements: [2]Placement;
+    placements[0].vaddr = 0x1000; placements[0].offset = 0; placements[0].merged_index = 0;
+    placements[1].vaddr = 0x2000; placements[1].offset = 0; placements[1].merged_index = 0;
+    var sec_base: [2]u32;
+    sec_base[0] = 0; sec_base[1] = 1;
+
+    var mods: [2]of.ObjectImage;
+    mods[0].alloc = s.alloc; mods[0].symbols = a; mods[0].symbol_count = 1;
+    mods[0].sections = nil; mods[0].section_count = 1; mods[0].relocations = nil; mods[0].reloc_count = 0;
+    mods[1].alloc = s.alloc; mods[1].symbols = b; mods[1].symbol_count = 1;
+    mods[1].sections = nil; mods[1].section_count = 1; mods[1].relocations = nil; mods[1].reloc_count = 0;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](s.alloc, map.hash_u32, map.eq_u32);
+    val cr: Result[bool, str] = collect_symbols(s, ?mods[0], 2, ?placements[0], ?sec_base[0], ?locs, true);
+    if (is_err[bool, str](cr)) {
+        map.dnit[intern.StrId, SymbolLoc](?locs);
+        ret err[u64, str](unwrap_err[bool, str](cr));
+    }
+    val g: Result[*SymbolLoc, str] = map.get[intern.StrId, SymbolLoc](?locs, ?name);
+    if (is_err[*SymbolLoc, str](g)) {
+        map.dnit[intern.StrId, SymbolLoc](?locs);
+        ret err[u64, str]("missing");
+    }
+    val v: u64 = unwrap_ok[*SymbolLoc, str](g).vaddr;
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    ret ok[u64, str](v);
+}
+
+test "linker: weak/strong symbol resolution is order-independent (#1257)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    val ri: Result[intern.StrId, str] = intern.intern(?s.interner, "dup");
+    if (is_err[intern.StrId, str](ri)) { ret 1; }
+    val nm: intern.StrId = unwrap_ok[intern.StrId, str](ri);
+
+    var weak: of.Symbol;
+    weak.name = nm; weak.section = 0; weak.offset = 0; weak.size = 0;
+    weak.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK;
+    var strong: of.Symbol;
+    strong.name = nm; strong.section = 0; strong.offset = 0; strong.size = 0;
+    strong.flags = of.SYM_OBJ_FLAG_GLOBAL;
+    var strong2: of.Symbol;
+    strong2.name = nm; strong2.section = 0; strong2.offset = 0; strong2.size = 0;
+    strong2.flags = of.SYM_OBJ_FLAG_GLOBAL;
+
+    # weak-then-strong: the strong definition must override the weak one (before
+    # #1257 this was a hard "multiple definition" error), and its address wins.
+    val r1: Result[u64, str] = lt_link(?s, nm, ?weak, ?strong);
+    if (is_err[u64, str](r1)) { ret 1; }
+    if (unwrap_ok[u64, str](r1) != 0x2000) { ret 1; }
+
+    # strong-then-weak: the later weak definition is skipped; the strong wins.
+    val r2: Result[u64, str] = lt_link(?s, nm, ?strong, ?weak);
+    if (is_err[u64, str](r2)) { ret 1; }
+    if (unwrap_ok[u64, str](r2) != 0x1000) { ret 1; }
+
+    # strong-then-strong: still a multiple-definition error.
+    val r3: Result[u64, str] = lt_link(?s, nm, ?strong, ?strong2);
+    if (!is_err[u64, str](r3)) { ret 1; }
+    ret 0;
 }
