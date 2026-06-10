@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# release-pipeline IR-verification regression (issue #1252): build the `app`
-# library with `--release --verify-ir`. The release pipeline used to emit IR the
-# aggregate-representation verifier rejected on almost any program (inline's
+# release-pipeline IR-verification regression (issues #1252 / #1280): build the
+# `app` library with `--release --verify-ir`. The release pipeline used to emit IR
+# the aggregate-representation verifier rejected on almost any program (inline's
 # single-return result phi over an aggregate, plus a too-strict post-inline
-# reachability gate), so `mach build . --release --verify-ir` failed on a
-# hello-world. The app exercises scalar and aggregate single-return inlining,
-# constant propagation across an inline boundary, and a dead inlined-argument
-# computation; the build must pass at both -O0 and --release under --verify-ir.
+# reachability gate), and an aggregate callee returning from two or more sites
+# merges into an aggregate result phi the verifier rejected (#1280), so
+# `mach build . --release --verify-ir` failed on a hello-world. The app exercises
+# scalar and aggregate single-return inlining, a multi-return aggregate inline
+# (the result-phi case), constant propagation across an inline boundary, and a
+# dead inlined-argument computation; the build must pass at both -O0 and --release
+# under --verify-ir.
 #
 # usage: run.sh [path-to-mach]   (defaults to `mach` on PATH)
 set -euo pipefail
@@ -27,9 +30,9 @@ if ! ( cd "$WORK/app" && "$MACH" build . --verify-ir ) >/dev/null 2>&1; then
 fi
 
 if ! ( cd "$WORK/app" && "$MACH" build . --release --verify-ir ) >/dev/null 2>&1; then
-    echo "FAIL relverify: --release --verify-ir build failed (inline aggregate phi / post-inline gate)" >&2
+    echo "FAIL relverify: --release --verify-ir build failed (inline aggregate result phi / post-inline gate)" >&2
     exit 1
 fi
 
-echo "PASS relverify: release pipeline passes --verify-ir on inlined aggregate/constant-propagation paths"
+echo "PASS relverify: release pipeline passes --verify-ir on inlined aggregate (incl. multi-return phi) / constant-propagation paths"
 exit 0
