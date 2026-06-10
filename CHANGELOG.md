@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-10
+
+Native Windows release. `mach.exe` now builds Mach itself on the win64 target
+to a byte-identical fixpoint (verified under wine), and releases ship
+per-target artifacts.
+
+### Added
+
+- **Per-target release artifacts**: `mach-x86_64-linux`, `mach-x86_64-windows.zip`
+  and `SHA256SUMS` alongside the bare `mach` seed binary; the windows artifact is
+  gated on a wine smoke test in which `mach.exe` builds and runs a real project.
+- CI now runs the integration suites (dynlink, extlink, opt, win64byref,
+  win64fnptr) with wine on every pull request, plus a windows cross-build of the
+  compiler.
+- Per-function `.pdata`/`.xdata` unwind metadata on win64 executables, with
+  spec-correct `UNWIND_INFO` encoding.
+
+### Fixed
+
+- Function-to-pointer casts (`fn::*u8`) lowered as a 32-bit truncating move,
+  corrupting every type-erased function pointer above 4 GiB — the fault that
+  kept native `mach.exe` from running on win64 image bases.
+- win64 by-reference aggregates passed as a fifth-or-later argument: caller and
+  callee now agree on the spilled hidden pointer via an explicit ABI class
+  (`CLASS_STACK_BYREF`), covering sub-pointer (3/5/6/7-byte) aggregates.
+- win64 unwind metadata: removed the incorrect frame-register declaration,
+  fixed `UWOP_SAVE_NONVOL_FAR` to record unscaled offsets, and stopped
+  misreading `[r13+disp]` stores as frame saves.
+- The ELF and COFF writers now fail loudly, naming the symbol, when a
+  relocation targets an unresolved symbol instead of silently emitting a
+  corrupt object.
+- COFF extern-function inference is scoped to foreign objects, indexed O(n),
+  and propagates allocation failure.
+- `mach dep`: unified dependency-root resolution across sync/add/remove,
+  proxy environment variables (`ALL_PROXY`, `all_proxy`, `no_proxy`) forwarded
+  to git, idempotent lockfile writes, and `mach init` no longer pre-creates
+  the dependency directory.
+- Release tags are verified against the manifest version before any artifact
+  is built.
+
 ## [1.1.1] - 2026-06-09
 
 Patch release for project scaffolding correctness.
