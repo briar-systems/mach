@@ -25,6 +25,14 @@ The condition must be a comptime expression. Common shapes:
 - Comparisons of comptime constants (`pub val` declarations)
 - Comparisons of a comptime function parameter (`$mode`) — see below
 
+A comptime comparison or arithmetic relates the **mathematical values** of its
+operands, exactly as the runtime operators do (see
+[operators.md](operators.md)). A constant in `2^63 .. 2^64-1` is its true
+unsigned magnitude, so `$if (0xFFFFFFFFFFFFFFFF > 0)` is taken and a cross-sign
+comparison agrees with the runtime `if` — `$if (X < Y)` never selects a branch
+that `if (X < Y)` would not. Comptime arithmetic that overflows the value's
+range is a compile error rather than a silent wrap.
+
 ## Examples
 
 ### Target-conditional code
