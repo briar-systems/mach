@@ -184,14 +184,43 @@ fun resolve(id: intern.StrId) str {
 }
 
 # map an abstract relocation-kind StrId to the COFF x86-64 machine relocation
-# type. defaults to ADDR64 for an unknown kind. pc32/plt32 both encode a 32-bit
-# pc-relative reference (REL32); addr32nb is the image-relative ADDR32NB.
-fun reloc_type_for(kind: intern.StrId) u16 {
-    if (kind == rk_abs64)    { ret IMAGE_REL_AMD64_ADDR64; }
-    if (kind == rk_pc32)     { ret IMAGE_REL_AMD64_REL32; }
-    if (kind == rk_plt32)    { ret IMAGE_REL_AMD64_REL32; }
-    if (kind == rk_addr32nb) { ret IMAGE_REL_AMD64_ADDR32NB; }
-    ret IMAGE_REL_AMD64_ADDR64;
+# type. an unmapped kind is an error naming the kind, never silently serialized
+# as ADDR64 (an 8-byte write over what codegen sized as a 4-byte field).
+# pc32/plt32 both encode a 32-bit pc-relative reference (REL32); addr32nb is the
+# image-relative ADDR32NB. `alloc` backs the error string.
+fun reloc_type_for(alloc: *Allocator, kind: intern.StrId) Result[u16, str] {
+    if (kind == rk_abs64)    { ret ok[u16, str](IMAGE_REL_AMD64_ADDR64); }
+    if (kind == rk_pc32)     { ret ok[u16, str](IMAGE_REL_AMD64_REL32); }
+    if (kind == rk_plt32)    { ret ok[u16, str](IMAGE_REL_AMD64_REL32); }
+    if (kind == rk_addr32nb) { ret ok[u16, str](IMAGE_REL_AMD64_ADDR32NB); }
+    ret err[u16, str](unsupported_kind_message(alloc, kind));
+}
+
+# "coff: unsupported relocation kind: <name>" for an abstract kind the writer has
+# no width-correct COFF machine type for.
+fun unsupported_kind_message(alloc: *Allocator, kind: intern.StrId) str {
+    ret bin.name_message(coff_interner, alloc, "coff: unsupported relocation kind: ",
+                         resolve(kind), "coff: unsupported relocation kind");
+}
+
+# "coff: unsupported relocation type <n>" for a machine type the parser cannot
+# map to an abstract kind (e.g. a foreign ADDR32 — a 32-bit field that must not
+# be linked as a 64-bit absolute).
+fun unsupported_type_message(alloc: *Allocator, r_type: u64) str {
+    ret bin.number_message(coff_interner, alloc, "coff: unsupported relocation type ",
+                           r_type, "coff: unsupported relocation type");
+}
+
+# verify every relocation's abstract kind maps to a COFF machine type, up front
+# before any output is allocated. an unmapped kind fails the emit naming the kind.
+fun validate_reloc_kinds(img: *of.ObjectImage) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < img.reloc_count) {
+        val r: Result[u16, str] = reloc_type_for(img.alloc, img.relocations[i].kind);
+        if (is_err[u16, str](r)) { ret err[bool, str](unwrap_err[u16, str](r)); }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
 }
 
 # read_inplace_addend: recover a COFF relocation's in-place addend from the
@@ -210,12 +239,15 @@ fun read_inplace_addend(sec: *of.Section, r_type: u16, offset: u32) i64 {
 }
 
 # map a COFF x86-64 machine relocation type back to its abstract RK_* kind name.
-fun reloc_kind_for(r_type: u16) intern.StrId {
-    if (r_type == IMAGE_REL_AMD64_ADDR64)   { ret rk_abs64; }
-    if (r_type == IMAGE_REL_AMD64_REL32)    { ret rk_pc32; }
-    if (r_type == IMAGE_REL_AMD64_ADDR32NB) { ret rk_addr32nb; }
-    if (r_type == IMAGE_REL_AMD64_ADDR32)   { ret rk_abs64; }
-    ret rk_abs64;
+# an unrecognized type is an error naming the type rather than a silent
+# fall-through to abs64. ADDR32 (a 32-bit absolute) is rejected too: there is no
+# width-correct abstract kind for it, and aliasing it to abs64 would link a
+# foreign object's 4-byte field with an 8-byte write.
+fun reloc_kind_for(alloc: *Allocator, r_type: u16) Result[intern.StrId, str] {
+    if (r_type == IMAGE_REL_AMD64_ADDR64)   { ret ok[intern.StrId, str](rk_abs64); }
+    if (r_type == IMAGE_REL_AMD64_REL32)    { ret ok[intern.StrId, str](rk_pc32); }
+    if (r_type == IMAGE_REL_AMD64_ADDR32NB) { ret ok[intern.StrId, str](rk_addr32nb); }
+    ret err[intern.StrId, str](unsupported_type_message(alloc, r_type::u64));
 }
 
 # COFF section characteristics for an abstract section kind (the alignment bits
@@ -409,11 +441,12 @@ fun validate_reloc_symbols(img: *of.ObjectImage) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
-# reloc_field_width: the byte width of a relocation's patched field for the COFF
-# x86-64 machine type the abstract kind maps to — 8 for ADDR64, 4 for every other
-# (REL32 / ADDR32 / ADDR32NB).
+# reloc_field_width: the byte width of a relocation's patched field — 8 for the
+# 64-bit absolute kind, 4 for every other supported kind (pc32 / plt32 / addr32nb,
+# all 4-byte). derived from the abstract kind directly; `validate_reloc_kinds`
+# rejects any kind the writer cannot map before this is consulted.
 fun reloc_field_width(kind: intern.StrId) usize {
-    if (reloc_type_for(kind) == IMAGE_REL_AMD64_ADDR64) { ret 8; }
+    if (kind == rk_abs64) { ret 8; }
     ret 4;
 }
 
@@ -717,6 +750,12 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) Result[
     val num_secs: u32 = img.section_count;
     val num_syms: u32 = img.symbol_count;
 
+    # map every relocation kind to a machine type first, so an unmapped kind fails
+    # the emit naming the kind (never silently serialized as ADDR64) and the range
+    # check below sees only known, width-correct kinds.
+    val vrk: Result[bool, str] = validate_reloc_kinds(img);
+    if (is_err[bool, str](vrk)) { ret err[bool, str](unwrap_err[bool, str](vrk)); }
+
     # validate every relocation's patch field lies within its section before any
     # output is built — the addend fold writes the in-place value here (COFF has no
     # RELA addend), so a malformed offset must fail the link, not write out of
@@ -921,7 +960,9 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) Result[
                     # never silently aliased.
                     val rsi: u32 = unwrap_ok[u32, str](reloc_sym_index(img, img.relocations[ri].symbol));
                     bin.write_u32_le(buf, ro + 4, sym_remap[rsi]);
-                    bin.write_u16_le(buf, ro + 8, reloc_type_for(img.relocations[ri].kind));
+                    # validate_reloc_kinds proved every kind maps, so this lookup
+                    # cannot miss; ADDR64 is never silently substituted.
+                    bin.write_u16_le(buf, ro + 8, unwrap_ok[u16, str](reloc_type_for(alloc, img.relocations[ri].kind)));
                     ro = ro + RELOCATION_SIZE;
                 }
                 ri = ri + 1;
@@ -1299,7 +1340,12 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
             val r_off:  u32 = bin.read_u32_le(buf, ro);
             out.relocations[idx].section = s;
             out.relocations[idx].offset = r_off;
-            out.relocations[idx].kind = reloc_kind_for(r_type);
+            val rk: Result[intern.StrId, str] = reloc_kind_for(alloc, r_type);
+            if (is_err[intern.StrId, str](rk)) {
+                deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+                ret err[bool, str](unwrap_err[intern.StrId, str](rk));
+            }
+            out.relocations[idx].kind = unwrap_ok[intern.StrId, str](rk);
             # COFF carries the addend in-place in the patched field, not in the
             # relocation record (no RELA addend). recover it as a signed value the
             # abstract `S + A - P` / `S + A` applier expects — a 64-bit field for
@@ -2515,7 +2561,6 @@ var coff_reloc_kinds: [4]of.RelocationKind;
 # the COFF OF vtable. populated by register on first call and handed out as a
 # borrowed pointer to the registry.
 var coff_vtable: of.OfVTable;
-var coff_registered: bool = false;
 
 # register_coff: build and install the COFF OfVTable.
 #
@@ -2523,8 +2568,11 @@ var coff_registered: bool = false;
 # interns the format name ("coff"), file extension ("obj"), and relocation-kind
 # names, fills the relocation-kind table and vtable, wires the writer/reader, and
 # self-registers it into the process-global OF registry under of.OF_COFF.
-# write-once: a second call only refreshes the captured interner. must be invoked
-# at compiler startup before target.select requests a Windows target.
+# reentrant: every call re-interns all names and refreshes the captured interner
+# and the `rk_*` / vtable kind handles against `i`, so a second session (or test)
+# with a different interner is fully consistent rather than leaving stale ids from
+# the first registration; `of.register` itself is idempotent. must be invoked at
+# compiler startup before target.select requests a Windows target.
 # ---
 # alloc: backing allocator (reserved for parity with other registrars)
 # i:     string interner used to intern the vtable's string fields and captured
@@ -2532,7 +2580,6 @@ var coff_registered: bool = false;
 # ret:   true on success, or an error string if name interning fails
 pub fun register_coff(alloc: *Allocator, i: *intern.Interner) Result[bool, str] {
     coff_interner = i;
-    if (coff_registered) { ret ok[bool, str](true); }
 
     val rn: Result[intern.StrId, str] = intern.intern(i, "coff");
     if (is_err[intern.StrId, str](rn)) { ret err[bool, str](unwrap_err[intern.StrId, str](rn)); }
@@ -2593,7 +2640,6 @@ pub fun register_coff(alloc: *Allocator, i: *intern.Interner) Result[bool, str] 
     coff_vtable.relocation_count = 4;
 
     of.register(?coff_vtable);
-    coff_registered = true;
     ret ok[bool, str](true);
 }
 
@@ -3461,5 +3507,122 @@ test "coff: parse_function_unwind rejects an [r13+disp] store as a save (REX.B)"
         k = k + 1;
     }
     if (uw.prolog_size != 8) { ret 1; }  # prologue ends at the sub rsp; the r13 store is body
+    ret 0;
+}
+
+test "coff: emit rejects a relocation whose kind has no COFF machine type (#1256)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    # a defined symbol but a kind COFF has no machine type for (gotpcrel is ELF-only)
+    # — before #1256 it was silently serialized as ADDR64 (an 8-byte write over the
+    # 4-byte field); it must now fail naming the kind.
+    val bogus: intern.StrId = t_intern(?i, "gotpcrel");
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = bogus;
+    relocs[0].symbol = syms[0].name; relocs[0].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_kind");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, tpath::*u8);
+    fs.temp_close_and_remove(?tf);
+
+    if (!is_err[bool, str](em)) { ret 1; }
+    if (!str_contains(unwrap_err[bool, str](em), "gotpcrel")) { ret 1; }
+    ret 0;
+}
+
+test "coff: parse rejects a foreign ADDR32 relocation type (#1256)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    val vt_o: Option[*of.OfVTable] = of.lookup(of.OF_COFF);
+    if (!is_some[*of.OfVTable](vt_o)) { ret 1; }
+    val vt: *of.OfVTable = unwrap[*of.OfVTable](vt_o);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    val k_pc32: intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = k_pc32;
+    relocs[0].symbol = syms[0].name; relocs[0].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_ptype");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, tpath::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    # overwrite the lone relocation record's Type with ADDR32 (a 32-bit absolute
+    # the writer never emits). before #1256 the parser aliased ADDR32 to abs64 —
+    # an 8-byte relocation over the 4-byte field.
+    val rptr: usize = bin.read_u32_le(buf.data, COFF_HEADER_SIZE + 24)::usize;
+    if (rptr == 0) { ret 1; }
+    bin.write_u16_le(buf.data, rptr + 8, IMAGE_REL_AMD64_ADDR32);
+
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = coff_parse_object(?alloc, buf.data, buf.len, ?out);
+    if (!is_err[bool, str](pr)) { ret 1; }
+    if (!str_contains(unwrap_err[bool, str](pr), "relocation type")) { ret 1; }
     ret 0;
 }
