@@ -39,6 +39,7 @@ use std.types.size.usize;
 
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_contains;
 
 use std.types.result.Result;
 use std.types.result.ok;
@@ -409,18 +410,66 @@ fun write_decimal(buf: *u8, off: usize, width: usize, value: u32) {
     }
 }
 
-# find the COFF symbol-table index of the image symbol with interned name
-# `name`. `sym_remap` maps an image symbol index to its COFF symbol-table index
-# (which counts the leading section symbols and their aux records). returns 0
-# when no symbol matches — pointing the relocation at the first section symbol.
-fun find_sym_index(img: *of.ObjectImage, sym_remap: *u32, name: intern.StrId) u32 {
-    if (name == intern.STR_NIL) { ret 0; }
+# resolve a relocation's target symbol to its index in the image symbol table.
+# every relocation must name a symbol the image defines or declares extern (the
+# back end guarantees this — `pack_reloc_externs` declares an extern for any
+# named target the module did not define, and lowering panics before emitting a
+# nameless target). a miss is therefore a back-end invariant violation, returned
+# as an error naming the symbol rather than silently aliased to index 0 (the
+# first section symbol), which would corrupt the link.
+fun reloc_sym_index(img: *of.ObjectImage, sym: intern.StrId) Result[u32, str] {
+    if (sym != intern.STR_NIL) {
+        var i: u32 = 0;
+        for (i < img.symbol_count) {
+            if (img.symbols[i].name == sym) { ret ok[u32, str](i); }
+            i = i + 1;
+        }
+    }
+    ret err[u32, str](unresolved_reloc_message(img.alloc, sym));
+}
+
+# build the "coff: unresolved relocation symbol: <name>" diagnostic, interned so
+# it outlives this call. an unnamed (STR_NIL) target, or interning failure under
+# memory pressure, degrades to the generic static form; the emit still fails.
+fun unresolved_reloc_message(alloc: *Allocator, sym: intern.StrId) str {
+    val generic: str = "coff: relocation references an unresolved symbol";
+    val name: str = resolve(sym);
+    if (name == nil || coff_interner == nil) { ret generic; }
+
+    val pre:  str = "coff: unresolved relocation symbol: ";
+    val lpre: usize = str_len(pre);
+    val lnam: usize = str_len(name);
+    val total: usize = lpre + lnam;
+
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret generic; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    for (k < lpre) { buf[k] = pre[k]; k = k + 1; }
+    var n: usize = 0;
+    for (n < lnam) { buf[lpre + n] = name[n]; n = n + 1; }
+    buf[total] = 0;
+
+    val ir: Result[intern.StrId, str] = intern.intern(coff_interner, buf::str);
+    deallocate[u8](alloc, buf, total + 1);
+    if (is_err[intern.StrId, str](ir)) { ret generic; }
+    val nm: Option[str] = intern.lookup(coff_interner, unwrap_ok[intern.StrId, str](ir));
+    if (is_some[str](nm)) { ret unwrap[str](nm); }
+    ret generic;
+}
+
+# verify every relocation's target symbol resolves to an image symbol, up front
+# before any output is allocated so the error path needs no cleanup. an
+# unresolved target fails the emit naming the symbol instead of silently writing
+# a relocation against the first section symbol.
+fun validate_reloc_symbols(img: *of.ObjectImage) Result[bool, str] {
     var i: u32 = 0;
-    for (i < img.symbol_count) {
-        if (img.symbols[i].name == name) { ret sym_remap[i]; }
+    for (i < img.reloc_count) {
+        val r: Result[u32, str] = reloc_sym_index(img, img.relocations[i].symbol);
+        if (is_err[u32, str](r)) { ret err[bool, str](unwrap_err[u32, str](r)); }
         i = i + 1;
     }
-    ret 0;
+    ret ok[bool, str](true);
 }
 
 # reloc_field_width: the byte width of a relocation's patched field for the COFF
@@ -739,6 +788,12 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) Result[
     val vr: Result[bool, str] = validate_reloc_ranges(img);
     if (is_err[bool, str](vr)) { ret err[bool, str](unwrap_err[bool, str](vr)); }
 
+    # resolve every relocation's target symbol up front, before anything is
+    # allocated, so an unresolved target fails the emit naming the symbol rather
+    # than silently aliasing the first section symbol (index 0).
+    val vrs: Result[bool, str] = validate_reloc_symbols(img);
+    if (is_err[bool, str](vrs)) { ret err[bool, str](unwrap_err[bool, str](vrs)); }
+
     # file layout: header, section headers, per-section raw data, per-section
     # relocation arrays, symbol table, string table. compute each region's file
     # offset up front so section headers can point at their data and relocs.
@@ -923,11 +978,12 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) Result[
             for (ri < img.reloc_count) {
                 if (img.relocations[ri].section == s) {
                     write_u32_le(buf, ro, img.relocations[ri].offset);
-                    var coff_sym: u32 = 0;
-                    if (sym_remap != nil) {
-                        coff_sym = find_sym_index(img, sym_remap, img.relocations[ri].symbol);
-                    }
-                    write_u32_le(buf, ro + 4, coff_sym);
+                    # validate_reloc_symbols proved every reloc resolves, and a
+                    # relocated section implies symbols, so sym_remap is non-nil
+                    # and the lookup cannot miss; the first section symbol is
+                    # never silently aliased.
+                    val rsi: u32 = unwrap_ok[u32, str](reloc_sym_index(img, img.relocations[ri].symbol));
+                    write_u32_le(buf, ro + 4, sym_remap[rsi]);
                     write_u16_le(buf, ro + 8, reloc_type_for(img.relocations[ri].kind));
                     ro = ro + RELOCATION_SIZE;
                 }
@@ -2696,6 +2752,64 @@ test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
     }
     if (!saw_pc32 || !saw_abs64) { ret 1; }
 
+    ret 0;
+}
+
+test "coff: emit rejects a relocation naming an unresolved symbol (#1196)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    val vt_o: Option[*of.OfVTable] = of.lookup(of.OF_COFF);
+    if (!is_some[*of.OfVTable](vt_o)) { ret 1; }
+    val vt: *of.OfVTable = unwrap[*of.OfVTable](vt_o);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # a valid .text section and one defined symbol, so range validation passes
+    # and only the unresolved relocation symbol can fail the emit.
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    # the relocation targets a symbol interned but absent from the image symbol
+    # table — the back-end-invariant violation #1196 must surface as an error,
+    # not silently alias the first section symbol.
+    val ghost: intern.StrId = t_intern(?i, "ghost_symbol");
+    val k_pc32: intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = k_pc32;
+    relocs[0].symbol = ghost; relocs[0].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_unres");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, tpath::*u8);
+    fs.temp_close_and_remove(?tf);
+
+    if (!is_err[bool, str](em)) { ret 1; }
+    if (!str_contains(unwrap_err[bool, str](em), "ghost_symbol")) { ret 1; }
     ret 0;
 }
 

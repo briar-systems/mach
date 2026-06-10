@@ -30,11 +30,11 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_equals;
+use std.types.string.str_contains;
 
 use std.types.result.Result;
 use std.types.result.ok;
 use std.types.result.err;
-use std.types.result.is_ok;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
@@ -48,8 +48,9 @@ use std.allocator.allocate;
 use std.allocator.zallocate;
 use std.allocator.deallocate;
 
-use mem: std.memory;
-use fs:  std.filesystem;
+use mem:  std.memory;
+use fs:   std.filesystem;
+use page: std.allocator.page;
 
 use intern: mach.lang.intern;
 use isa:    mach.lang.target.isa;
@@ -319,18 +320,68 @@ fun strtab_size(img: *of.ObjectImage) usize {
     ret total;
 }
 
-# find the elf symbol-table index of the symbol named `name`, after the
-# locals-before-globals reordering captured in `remap`. returns 0 (the
-# reserved undefined entry) when no symbol matches.
-fun find_sym_index(img: *of.ObjectImage, remap: *u32, name: str) u32 {
-    if (name == nil) { ret 0; }
+# resolve a relocation's target symbol to its index in the image symbol table.
+# every relocation must name a symbol the image defines or declares extern (the
+# back end guarantees this — `pack_reloc_externs` declares an extern for any
+# named target the module did not define, and lowering panics before emitting a
+# nameless target). a miss is therefore a back-end invariant violation, returned
+# as an error naming the symbol rather than silently aliased to index 0 (the
+# reserved undefined entry), which would corrupt the link.
+fun reloc_sym_index(img: *of.ObjectImage, sym: intern.StrId) Result[u32, str] {
+    val name: str = resolve(sym);
+    if (name != nil) {
+        var i: u32 = 0;
+        for (i < img.symbol_count) {
+            val sn: str = resolve(img.symbols[i].name);
+            if (sn != nil && str_equals(sn, name)) { ret ok[u32, str](i); }
+            i = i + 1;
+        }
+    }
+    ret err[u32, str](unresolved_reloc_message(img.alloc, sym));
+}
+
+# build the "elf: unresolved relocation symbol: <name>" diagnostic, interned so
+# it outlives this call. an unnamed (STR_NIL) target, or interning failure under
+# memory pressure, degrades to the generic static form; the emit still fails.
+fun unresolved_reloc_message(alloc: *Allocator, sym: intern.StrId) str {
+    val generic: str = "elf: relocation references an unresolved symbol";
+    val name: str = resolve(sym);
+    if (name == nil || elf_interner == nil) { ret generic; }
+
+    val pre:  str = "elf: unresolved relocation symbol: ";
+    val lpre: usize = str_len(pre);
+    val lnam: usize = str_len(name);
+    val total: usize = lpre + lnam;
+
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret generic; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    for (k < lpre) { buf[k] = pre[k]; k = k + 1; }
+    var n: usize = 0;
+    for (n < lnam) { buf[lpre + n] = name[n]; n = n + 1; }
+    buf[total] = 0;
+
+    val ir: Result[intern.StrId, str] = intern.intern(elf_interner, buf::str);
+    deallocate[u8](alloc, buf, total + 1);
+    if (is_err[intern.StrId, str](ir)) { ret generic; }
+    val nm: Option[str] = intern.lookup(elf_interner, unwrap_ok[intern.StrId, str](ir));
+    if (is_some[str](nm)) { ret unwrap[str](nm); }
+    ret generic;
+}
+
+# verify every relocation's target symbol resolves to an image symbol, up front
+# before any output buffer is allocated so the error path needs no cleanup. an
+# unresolved target fails the emit naming the symbol instead of silently writing
+# a relocation against index 0.
+fun validate_reloc_symbols(img: *of.ObjectImage) Result[bool, str] {
     var i: u32 = 0;
-    for (i < img.symbol_count) {
-        val sn: str = resolve(img.symbols[i].name);
-        if (sn != nil && str_equals(sn, name)) { ret remap[i]; }
+    for (i < img.reloc_count) {
+        val r: Result[u32, str] = reloc_sym_index(img, img.relocations[i].symbol);
+        if (is_err[u32, str](r)) { ret err[bool, str](unwrap_err[u32, str](r)); }
         i = i + 1;
     }
-    ret 0;
+    ret ok[bool, str](true);
 }
 
 # write one Elf64_Sym entry and advance the string-table cursor `str_pos`.
@@ -375,6 +426,11 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) Result
         ret err[bool, str]("elf: nil writer argument");
     }
     val alloc: *Allocator = img.alloc;
+
+    # resolve every relocation's target symbol before allocating any output, so
+    # an unresolved target fails the emit (naming the symbol) with no cleanup.
+    val vrs: Result[bool, str] = validate_reloc_symbols(img);
+    if (is_err[bool, str](vrs)) { ret err[bool, str](unwrap_err[bool, str](vrs)); }
 
     val num_secs:      u32 = img.section_count;
     val num_syms:      u32 = img.symbol_count;
@@ -555,7 +611,15 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) Result
     var sym_remap: *u32 = nil;
     if (num_syms > 0) {
         val res_remap: Result[*u32, str] = zallocate[u32](alloc, num_syms::usize);
-        if (is_ok[*u32, str](res_remap)) { sym_remap = unwrap_ok[*u32, str](res_remap); }
+        if (is_err[*u32, str](res_remap)) {
+            deallocate[u8](alloc, shstrtab, shstrtab_cap);
+            deallocate[u32](alloc, name_offsets, (num_secs + 1)::usize);
+            deallocate[u32](alloc, rela_name_offsets, (num_secs + 1)::usize);
+            deallocate[usize](alloc, rela_offsets, (num_secs + 1)::usize);
+            deallocate[u8](alloc, buf, total_file_size);
+            ret err[bool, str]("elf: symbol remap alloc failed");
+        }
+        sym_remap = unwrap_ok[*u32, str](res_remap);
     }
 
     var sym_off: usize = symtab_offset + SYM_SIZE;
@@ -601,10 +665,11 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) Result
             for (ri < img.reloc_count) {
                 if (img.relocations[ri].section == s) {
                     write_u64_le(buf, ro, img.relocations[ri].offset::u64);
-                    var elf_sym: u64 = 0;
-                    if (sym_remap != nil) {
-                        elf_sym = find_sym_index(img, sym_remap, resolve(img.relocations[ri].symbol))::u64;
-                    }
+                    # validate_reloc_symbols proved every reloc resolves, and a
+                    # relocated section implies symbols, so sym_remap is non-nil
+                    # and the lookup cannot miss; index 0 is never silently used.
+                    val rsi: u32 = unwrap_ok[u32, str](reloc_sym_index(img, img.relocations[ri].symbol));
+                    val elf_sym: u64 = sym_remap[rsi]::u64;
                     val elf_type: u32 = reloc_type_for(img.relocations[ri].kind, tgt_isa.id);
                     val r_info: u64 = (elf_sym << 32) | elf_type::u64;
                     write_u64_le(buf, ro + 8, r_info);
@@ -1861,4 +1926,68 @@ pub fun apply_reloc(bytes: *u8, offset: u32, kind: intern.StrId, addend: i64,
         ret ok[bool, str](true);
     }
     ret err[bool, str]("elf: relocation kind not supported");
+}
+
+# intern `s` for a test, yielding STR_NIL on the (test-only) allocation failure.
+fun t_intern(i: *intern.Interner, s: str) intern.StrId {
+    val r: Result[intern.StrId, str] = intern.intern(i, s);
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+test "elf: emit rejects a relocation naming an unresolved symbol (#1196)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    # register captures `i` as the writer interner so names resolve against it.
+    val rr: Result[bool, str] = register(?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    val vt_o: Option[*of.OfVTable] = of.lookup(of.OF_ELF);
+    if (!is_some[*of.OfVTable](vt_o)) { ret 1; }
+    val vt: *of.OfVTable = unwrap[*of.OfVTable](vt_o);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    # the relocation targets a symbol interned but absent from the image symbol
+    # table — the back-end-invariant violation #1196 must surface as an error,
+    # not silently alias the reserved undefined entry (index 0).
+    val ghost: intern.StrId = t_intern(?i, "ghost_symbol");
+    val k_pc32: intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = k_pc32;
+    relocs[0].symbol = ghost; relocs[0].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "elf_unres");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    fs.temp_close_and_remove(?tf);
+
+    if (!is_err[bool, str](em)) { ret 1; }
+    if (!str_contains(unwrap_err[bool, str](em), "ghost_symbol")) { ret 1; }
+    ret 0;
 }
