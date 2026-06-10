@@ -142,10 +142,11 @@ fun parse_postfix(p: *parser.Parser, base: id.ExprId) id.ExprId {
     var lhs: id.ExprId = base;
     for (true) {
         val k: token.Kind = parser.current(p).kind;
-        if      (k == token.KIND_LPAREN)      { lhs = parse_call(p, lhs, 0, 0); }
+        if      (k == token.KIND_LPAREN)      { lhs = parse_call(p, lhs, 0, 0, id.EXPR_NIL); }
         or      (k == token.KIND_LBRACKET) {
-            if (postfix_is_generic_call(p)) {
-                lhs = parse_generic_call(p, lhs);
+            val after: usize = scan_bracket_close(p, 0);
+            if (after != 0 && parser.peek(p, after).kind == token.KIND_LPAREN) {
+                lhs = parse_bracket_call(p, lhs);
             }
             or {
                 lhs = parse_index(p, lhs);
@@ -164,7 +165,7 @@ fun parse_postfix(p: *parser.Parser, base: id.ExprId) id.ExprId {
 # matching ']' and returns the cursor offset of the token immediately after it. a
 # ';' or EOF reached inside the brackets means the region can never be a type
 # list, reported as 0 (the brackets are unbalanced for that purpose). shared by
-# postfix_is_generic_call and looks_like_typed_literal so the two scanners cannot
+# parse_bracket_call and looks_like_typed_literal so the two scanners cannot
 # drift apart.
 fun scan_bracket_close(p: *parser.Parser, bracket_off: usize) usize {
     var i: usize = bracket_off + 1;
@@ -179,35 +180,98 @@ fun scan_bracket_close(p: *parser.Parser, bracket_off: usize) usize {
     ret i;
 }
 
-# true when `k` can begin a type (per parse_type): a pointer '*', an array '[',
-# or an identifier (which covers named types and the `fun`/`rec`/`uni` keywords).
-fun token_begins_type(k: token.Kind) bool {
-    ret k == token.KIND_STAR || k == token.KIND_LBRACKET || k == token.KIND_IDENT;
+# true when `k` can begin an expression (per parse_prefix). used to gate the
+# index-reading probe: a payload that cannot start an expression (a bare '*',
+# for instance) is never an index, so it is left to the type reading.
+fun token_begins_expr(k: token.Kind) bool {
+    ret k == token.KIND_LIT_INT   || k == token.KIND_LIT_FLOAT
+     || k == token.KIND_LIT_CHAR  || k == token.KIND_LIT_STR
+     || k == token.KIND_IDENT     || k == token.KIND_DOLLAR
+     || k == token.KIND_MINUS     || k == token.KIND_BANG
+     || k == token.KIND_TILDE     || k == token.KIND_QUESTION
+     || k == token.KIND_AT        || k == token.KIND_LPAREN
+     || k == token.KIND_LBRACKET;
 }
 
-# decides whether a postfix '[' opens a generic call `callee[T, ..](args)` rather
-# than an index `obj[i]`. it is a generic call only when the bracketed payload can
-# begin a type AND the token after the matching ']' is '(' (the call). a payload
-# that starts with a token which cannot begin a type — a literal, '-', '@', '$',
-# etc. — is an index, so `table[0]()` parses as index-then-call (#1247). the
-# decision is purely syntactic and has one residual gap: a bare-identifier payload
-# is locally indistinguishable from a single type argument, so `table[i]()` still
-# binds as a generic call and, if `i` names a value, resolve then errors on it —
-# the variable-index-then-call form still needs `(table[i])()`. the complete fix
-# (deferring the index/generic decision to resolve) is tracked in #1270. the '{'
-# typed-literal form is recognized at the prefix stage and never reaches postfix.
-fun postfix_is_generic_call(p: *parser.Parser) bool {
-    if (!token_begins_type(parser.peek(p, 1).kind)) { ret false; }
-    val after: usize = scan_bracket_close(p, 0);   # peek(p, 0) is the current '['
-    if (after == 0) { ret false; }
-    ret parser.peek(p, after).kind == token.KIND_LPAREN;
+# parses a postfix '[' whose matching ']' is followed by '(' — a bracket that
+# may open a generic call `callee[T, ..](args)` OR be the index of an
+# index-then-call `callee[expr](args)`. the type and expression grammars overlap
+# (a bare name is both a type and a value reference), so the parser cannot decide
+# locally; it probes the payload against both grammars and:
+#   - parses cleanly only as a type list   -> a generic call;
+#   - parses cleanly only as an expression -> an index (the trailing '(' is read
+#     as a separate call by the postfix loop);
+#   - parses cleanly as both               -> a provisional call carrying both
+#     readings, deferred to resolve, which picks by the callee's resolved kind
+#     (a value indexes; a function/type takes type arguments);
+#   - parses cleanly as neither            -> falls to parse_index, whose real
+#     parse surfaces the diagnostic.
+# the '{' typed-literal form is recognized at the prefix stage and never reaches
+# here.
+fun parse_bracket_call(p: *parser.Parser, callee: id.ExprId) id.ExprId {
+    val idx_probe: id.ExprId = probe_index_payload(p);
+    val ty_ok:     bool       = probe_type_payload(p);
+
+    if (ty_ok && idx_probe != id.EXPR_NIL) {
+        ret parse_provisional_call(p, callee, idx_probe);
+    }
+    if (ty_ok) {
+        ret parse_generic_call(p, callee);
+    }
+    ret parse_index(p, callee);
 }
 
-# parses a generic call `callee[T, U](args)`: consumes the bracketed type-arg
-# list, then delegates to parse_call to read the parenthesized arguments,
-# threading the type args onto the produced ExprCall.
-fun parse_generic_call(p: *parser.Parser, callee: id.ExprId) id.ExprId {
-    parser.advance(p);
+# speculatively reads the current '[...]' payload as a single index expression,
+# returning its ExprId when the payload parses cleanly up to the closing ']' and
+# EXPR_NIL otherwise. the cursor is restored and diagnostics are suppressed (via
+# panic) so the probe is side-effect free except for the orphaned AST nodes it
+# appends, which a clean result intentionally reuses.
+fun probe_index_payload(p: *parser.Parser) id.ExprId {
+    if (!token_begins_expr(parser.peek(p, 1).kind)) { ret id.EXPR_NIL; }
+    val save_pos:   usize = p.pos;
+    val save_panic: bool  = p.panic;
+    p.panic = true;
+    parser.advance(p);                       # consume '['
+    val before: usize = p.pos;
+    val e: id.ExprId = parse_expr(p);
+    val clean: bool = p.pos > before && !p.fatal && parser.at(p, token.KIND_RBRACKET);
+    p.pos   = save_pos;
+    p.panic = save_panic;
+    if (clean) { ret e; }
+    ret id.EXPR_NIL;
+}
+
+# speculatively reads the current '[...]' payload as a generic type-argument
+# list, returning whether it parses cleanly up to the closing ']'. like
+# probe_index_payload it restores the cursor and suppresses diagnostics; the
+# orphaned type nodes it appends are discarded (the committing parse re-reads
+# the list).
+fun probe_type_payload(p: *parser.Parser) bool {
+    val save_pos:   usize = p.pos;
+    val save_panic: bool  = p.panic;
+    p.panic = true;
+    parser.advance(p);                       # consume '['
+    var ok: bool = false;
+    if (!parser.at(p, token.KIND_RBRACKET)) {
+        val before: usize = p.pos;
+        parse_type(p);
+        for (parser.eat(p, token.KIND_COMMA)) {
+            if (parser.at(p, token.KIND_RBRACKET)) { brk; }
+            parse_type(p);
+        }
+        ok = p.pos > before && !p.fatal && parser.at(p, token.KIND_RBRACKET);
+    }
+    p.pos   = save_pos;
+    p.panic = save_panic;
+    ret ok;
+}
+
+# consumes a '[T, U, ..]' type-argument list (the cursor is on the '[') and
+# flushes it into the shared type_id pool, returning the slice start through
+# `out_len`. factored out of the generic-call parses so both readings build the
+# list identically.
+fun parse_type_args(p: *parser.Parser, out_len: *u32) u32 {
+    parser.advance(p);                       # consume '['
 
     # buffer the type arguments: a nested generic type argument appends its own
     # child type ids to the shared type_id pool mid-parse, so flush the parent's
@@ -223,10 +287,52 @@ fun parse_generic_call(p: *parser.Parser, callee: id.ExprId) id.ExprId {
     }
     parser.expect(p, token.KIND_RBRACKET, "expected ']' to close generic arguments");
 
-    var type_args_len: u32 = 0;
-    val type_args_start: u32 = parser.type_id_buf_flush(p, ?buf, ?type_args_len);
+    ret parser.type_id_buf_flush(p, ?buf, out_len);
+}
 
-    ret parse_call(p, callee, type_args_start, type_args_len);
+# parses a generic call `callee[T, U](args)`: consumes the bracketed type-arg
+# list, then delegates to parse_call to read the parenthesized arguments,
+# threading the type args onto the produced ExprCall.
+fun parse_generic_call(p: *parser.Parser, callee: id.ExprId) id.ExprId {
+    var type_args_len: u32 = 0;
+    val type_args_start: u32 = parse_type_args(p, ?type_args_len);
+    ret parse_call(p, callee, type_args_start, type_args_len, id.EXPR_NIL);
+}
+
+# parses a provisional bracket call `callee[x](args)` whose payload read cleanly
+# as both a type list and the index expression `idx`. it commits the type-arg
+# reading and, alongside it, wraps `callee[idx]` as the alternative index reading
+# (index_callee) so resolve can choose between them by the callee's kind. `idx`
+# is the expression the index probe already built from the same tokens.
+fun parse_provisional_call(p: *parser.Parser, callee: id.ExprId, idx: id.ExprId) id.ExprId {
+    var type_args_len: u32 = 0;
+    val type_args_start: u32 = parse_type_args(p, ?type_args_len);
+    val index_callee: id.ExprId = make_index(p, callee, idx);
+    ret parse_call(p, callee, type_args_start, type_args_len, index_callee);
+}
+
+# builds an INDEX node `object[index]` without consuming tokens, used to record
+# the index-then-call reading of a provisional bracket call. its span runs from
+# the object to the index expression.
+fun make_index(p: *parser.Parser, object: id.ExprId, index: id.ExprId) id.ExprId {
+    var node_index: expr.ExprIndex;
+    node_index.object = object;
+    node_index.index  = index;
+
+    var start_span: token.Span = parser.current(p).span;
+    if (object != id.EXPR_NIL) {
+        start_span = unwrap[*expr.Expr](ast.get_expr(p.ast, object)).span;
+    }
+    var end_span: token.Span = start_span;
+    if (index != id.EXPR_NIL) {
+        end_span = unwrap[*expr.Expr](ast.get_expr(p.ast, index)).span;
+    }
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start_span, end_span);
+    node.kind = expr.EXPR_KIND_INDEX;
+    node.data.index = node_index;
+    ret parser.push_expr(p, node);
 }
 
 # parses an integer literal, decoding its value from the source span (the token
@@ -359,8 +465,10 @@ fun parse_paren(p: *parser.Parser) id.ExprId {
 
 # parses a call expression `callee(args)`. type_args_start/type_args_len carry
 # any call-site generic arguments parsed by parse_generic_call; both are 0 for
-# a plain call.
-fun parse_call(p: *parser.Parser, callee: id.ExprId, type_args_start: u32, type_args_len: u32) id.ExprId {
+# a plain call. index_callee is EXPR_NIL except for a provisional bracket call,
+# where it carries the index-then-call reading for resolve to choose (see
+# ExprCall.index_callee).
+fun parse_call(p: *parser.Parser, callee: id.ExprId, type_args_start: u32, type_args_len: u32, index_callee: id.ExprId) id.ExprId {
     parser.advance(p);
 
     # buffer the arguments rather than pushing them to the shared expr_id pool
@@ -390,6 +498,7 @@ fun parse_call(p: *parser.Parser, callee: id.ExprId, type_args_start: u32, type_
     call.args_len        = args_len;
     call.type_args_start = type_args_start;
     call.type_args_len   = type_args_len;
+    call.index_callee    = index_callee;
 
     var start_span: token.Span = close.span;
     if (callee != id.EXPR_NIL) {
@@ -923,6 +1032,126 @@ test "parser: a true generic call callee[T](args) still binds its type args (#12
         if (callee.kind != expr.EXPR_KIND_IDENT) { rc = 1; }
     }
     if (diag.has_errors(?diags)) { rc = 1; }
+
+    diag.dnit(?diags);
+    ast.dnit(?a);
+    lexer.dnit(?stream, ?alloc);
+    ret rc;
+}
+
+test "parser: bare-identifier bracket call tbl[i](args) is provisional (#1270)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    val tr: Result[lexer.TokenStream, str] = lexer.tokenize("tbl[i]()", ?alloc, 0::src.FileId);
+    if (is_err[lexer.TokenStream, str](tr)) { ret 1; }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+    var a: ast.Ast = ast.init(?alloc, 0::src.FileId);
+    var diags: diag.DiagList = diag.init(?alloc);
+    var p: parser.Parser = parser.init(?stream, ?a, ?diags);
+
+    val eid: id.ExprId = parse_expr(?p);
+    var rc: i32 = 0;
+    val e: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, eid));
+    # `tbl[i]()`: payload `i` reads as both a type arg and an index expression, so
+    # the parser records both readings (type_args plus a pre-built index callee)
+    # and defers the choice to resolve.
+    if (e.kind != expr.EXPR_KIND_CALL) { rc = 1; }
+    or (e.data.call.type_args_len != 1) { rc = 1; }
+    or (e.data.call.index_callee == id.EXPR_NIL) { rc = 1; }
+    or {
+        val callee: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, e.data.call.callee));
+        if (callee.kind != expr.EXPR_KIND_IDENT) { rc = 1; }
+        or {
+            val idx: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, e.data.call.index_callee));
+            if (idx.kind != expr.EXPR_KIND_INDEX) { rc = 1; }
+            or (idx.data.index.object != e.data.call.callee) { rc = 1; }
+        }
+    }
+    if (diag.has_errors(?diags)) { rc = 1; }
+
+    diag.dnit(?diags);
+    ast.dnit(?a);
+    lexer.dnit(?stream, ?alloc);
+    ret rc;
+}
+
+test "parser: nested index-then-call m[i][j](args) keeps an index callee (#1270)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    val tr: Result[lexer.TokenStream, str] = lexer.tokenize("m[i][j]()", ?alloc, 0::src.FileId);
+    if (is_err[lexer.TokenStream, str](tr)) { ret 1; }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+    var a: ast.Ast = ast.init(?alloc, 0::src.FileId);
+    var diags: diag.DiagList = diag.init(?alloc);
+    var p: parser.Parser = parser.init(?stream, ?a, ?diags);
+
+    val eid: id.ExprId = parse_expr(?p);
+    var rc: i32 = 0;
+    val e: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, eid));
+    # `m[i]` is a plain index (no trailing call), so the provisional `[j](` sits
+    # on an index callee; the bracket call still records its index reading.
+    if (e.kind != expr.EXPR_KIND_CALL) { rc = 1; }
+    or (e.data.call.index_callee == id.EXPR_NIL) { rc = 1; }
+    or {
+        val callee: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, e.data.call.callee));
+        if (callee.kind != expr.EXPR_KIND_INDEX) { rc = 1; }
+    }
+    if (diag.has_errors(?diags)) { rc = 1; }
+
+    diag.dnit(?diags);
+    ast.dnit(?a);
+    lexer.dnit(?stream, ?alloc);
+    ret rc;
+}
+
+test "parser: chained call f[i]()() nests a provisional inner call (#1270)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    val tr: Result[lexer.TokenStream, str] = lexer.tokenize("f[i]()()", ?alloc, 0::src.FileId);
+    if (is_err[lexer.TokenStream, str](tr)) { ret 1; }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+    var a: ast.Ast = ast.init(?alloc, 0::src.FileId);
+    var diags: diag.DiagList = diag.init(?alloc);
+    var p: parser.Parser = parser.init(?stream, ?a, ?diags);
+
+    val eid: id.ExprId = parse_expr(?p);
+    var rc: i32 = 0;
+    val e: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, eid));
+    # outer call applies to the inner provisional bracket call `f[i]()`.
+    if (e.kind != expr.EXPR_KIND_CALL) { rc = 1; }
+    or (e.data.call.index_callee != id.EXPR_NIL) { rc = 1; }
+    or {
+        val inner: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, e.data.call.callee));
+        if (inner.kind != expr.EXPR_KIND_CALL) { rc = 1; }
+        or (inner.data.call.index_callee == id.EXPR_NIL) { rc = 1; }
+    }
+    if (diag.has_errors(?diags)) { rc = 1; }
+
+    diag.dnit(?diags);
+    ast.dnit(?a);
+    lexer.dnit(?stream, ?alloc);
+    ret rc;
+}
+
+test "parser: a malformed bracket payload t[a b](x) is rejected (#1270)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    val tr: Result[lexer.TokenStream, str] = lexer.tokenize("t[a b]()", ?alloc, 0::src.FileId);
+    if (is_err[lexer.TokenStream, str](tr)) { ret 1; }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+    var a: ast.Ast = ast.init(?alloc, 0::src.FileId);
+    var diags: diag.DiagList = diag.init(?alloc);
+    var p: parser.Parser = parser.init(?stream, ?a, ?diags);
+
+    parse_expr(?p);
+    var rc: i32 = 0;
+    # a payload that reads cleanly as neither a type list nor an expression is
+    # not silently accepted: the committing index parse surfaces a diagnostic.
+    if (!diag.has_errors(?diags)) { rc = 1; }
 
     diag.dnit(?diags);
     ast.dnit(?a);
