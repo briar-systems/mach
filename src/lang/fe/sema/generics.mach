@@ -34,6 +34,7 @@ use std.types.result.unwrap_ok;
 
 use std.allocator.allocate;
 use std.allocator.deallocate;
+use std.allocator.reallocate;
 
 use ty:     mach.lang.type;
 use sess:   mach.lang.session;
@@ -47,13 +48,13 @@ use decl:   mach.lang.fe.ast.decl;
 use sema:   mach.lang.fe.sema.context;
 
 # instantiates a generic declaration with concrete type arguments,
-# producing an interned `TYPE_INSTANCE`. when the generic is declared in
-# this module its generic-parameter count is read directly from the AST and
-# the argument count is checked against it (a non-generic declaration, or a
-# count mismatch, is reported); a generic declared in a dependency was
-# already validated at its declaration site, so the supplied `arg_count` is
-# accepted. every argument must be a real, non-error type. on success the
-# interned instance TypeId is returned.
+# producing an interned `TYPE_INSTANCE`. the supplied argument count is
+# checked against the declaration's generic-parameter count — read from the
+# declaring module's AST, whether that is this module or a dependency (a use
+# site's arity cannot be validated at the declaration site, so a cross-module
+# instantiation is checked here too); a non-generic declaration, or a count
+# mismatch, is reported. every argument must be a real, non-error type. on
+# success the interned instance TypeId is returned.
 # ---
 # sc:             the active sema context
 # generic_decl:   DeclId of the generic declaration in `generic_origin`
@@ -265,10 +266,13 @@ fun intern_name_in(s: *sess.Session, ga: *ast.Ast, span: token.Span) intern.StrI
 }
 
 # validates the supplied argument count against a generic declaration's
-# parameter count. only declarations in this module are checked: a generic
-# declared in a dependency was already validated at its declaration site, so
-# its supplied `arg_count` is accepted. a non-generic declaration, or a count
-# mismatch, is reported and returns false; a valid arity returns true.
+# parameter count, read from the declaring module's AST (this module for a
+# local generic, or the origin dependency's AST reached through the session
+# registry for a cross-module one — a use site's arity is its own to validate,
+# never the declaration site's). a non-generic declaration, or a count
+# mismatch, is reported and returns false; a valid arity returns true. an
+# origin AST that cannot be reached is accepted (the reference will fail
+# elsewhere), so a missing dependency never masquerades as an arity error.
 # ---
 # sc:             the active sema context
 # generic_decl:   DeclId of the generic declaration
@@ -283,8 +287,12 @@ pub fun check_arity(
     arg_count:      u32,
     span:           token.Span
 ) bool {
-    if (generic_origin != sc.own_module) { ret true; }
-    val want_opt: Option[u32] = local_generic_count(sc, generic_decl);
+    var a: *ast.Ast = sc.a;
+    if (generic_origin != sc.own_module) {
+        a = sess.module_ast(sc.s, generic_origin);
+        if (a == nil) { ret true; }
+    }
+    val want_opt: Option[u32] = generic_count_in(a, generic_decl);
     if (is_none[u32](want_opt)) {
         report(sc, span, "not a generic: declaration takes no type parameters");
         ret false;
@@ -378,11 +386,46 @@ fun substitute_aggregate(s: *sess.Session, t: *ty.Type, args: *ty.TypeId, arg_co
     ret inst;
 }
 
+# GParamScan: the set of nominal TypeIds already entered during a single
+# generic-parameter search, so a recursive nominal (`rec Node { next: *Node; }`)
+# breaks its own cycle instead of recursing forever.
+# ---
+# visited: dynamic array of entered nominal TypeIds
+# len:     number of ids stored
+# cap:     allocated slots
+rec GParamScan {
+    visited: *ty.TypeId;
+    len:     u32;
+    cap:     u32;
+}
+
 # reports whether the field table registered for nominal TypeId `tid`
 # contains any `TYPE_GENERIC_PARAM` (directly, or nested under a pointer,
-# array, or instance). such a nominal is part of an unspecialized generic
-# body and must be substituted per instance; a fully concrete one need not be.
+# array, instance, or a further nominal). such a nominal is part of an
+# unspecialized generic body and must be substituted per instance; a fully
+# concrete one need not be. a fresh cycle-guard scan bounds the search against
+# recursive nominals.
 fun nominal_has_gparam(s: *sess.Session, tid: ty.TypeId) bool {
+    var scan: GParamScan;
+    scan.visited = nil;
+    scan.len     = 0;
+    scan.cap     = 0;
+    val r: bool = nominal_fields_mention(s, tid, ?scan);
+    if (scan.visited != nil && scan.cap > 0) {
+        deallocate[ty.TypeId](s.alloc, scan.visited, scan.cap::usize);
+    }
+    ret r;
+}
+
+# reports whether any field of nominal `tid` mentions a generic parameter.
+# guards against recursive nominals via `scan`: a TypeId already on the search
+# stack yields false here (its own frame examines every field), so a cycle
+# cannot recurse forever. an allocation failure recording the visit degrades to
+# true (forcing a harmless substitution attempt) rather than risking a leak.
+fun nominal_fields_mention(s: *sess.Session, tid: ty.TypeId, scan: *GParamScan) bool {
+    if (scan_contains(scan, tid)) { ret false; }
+    if (!scan_push(s, scan, tid)) { ret true; }
+
     val ft_opt: Option[*ty.FieldTable] = ty.field_table_for(?s.types, tid);
     if (is_none[*ty.FieldTable](ft_opt)) { ret false; }
     val flen: u32 = unwrap[*ty.FieldTable](ft_opt).fields_len;
@@ -390,7 +433,7 @@ fun nominal_has_gparam(s: *sess.Session, tid: ty.TypeId) bool {
     for (i < flen) {
         val fe_opt: Option[*ty.FieldEntry] = ty.field_at(?s.types, tid, i);
         if (is_some[*ty.FieldEntry](fe_opt)) {
-            if (mentions_gparam(s, unwrap[*ty.FieldEntry](fe_opt).ty)) { ret true; }
+            if (mentions_gparam(s, unwrap[*ty.FieldEntry](fe_opt).ty, scan)) { ret true; }
         }
         i = i + 1;
     }
@@ -399,15 +442,20 @@ fun nominal_has_gparam(s: *sess.Session, tid: ty.TypeId) bool {
 
 # reports whether `tid` is, or structurally contains, a generic parameter.
 # descends pointers, arrays, and instance arguments; a nested nominal is
-# checked through its own field table. bounded by the finite type graph.
-fun mentions_gparam(s: *sess.Session, tid: ty.TypeId) bool {
+# checked through its own field table (`nominal_fields_mention`), which carries
+# the cycle guard so two-plus levels of nested anonymous aggregate are reached
+# without unbounded recursion on a recursive nominal.
+fun mentions_gparam(s: *sess.Session, tid: ty.TypeId, scan: *GParamScan) bool {
     if (tid == ty.TYPE_NIL || tid == ty.TYPE_ERROR) { ret false; }
     val t_opt: Option[*ty.Type] = ty.get(?s.types, tid);
     if (is_none[*ty.Type](t_opt)) { ret false; }
     val t: *ty.Type = unwrap[*ty.Type](t_opt);
     if (t.kind == ty.TYPE_GENERIC_PARAM) { ret true; }
-    if (t.kind == ty.TYPE_POINTER)       { ret mentions_gparam(s, t.data.pointer.base); }
-    if (t.kind == ty.TYPE_ARRAY)         { ret mentions_gparam(s, t.data.array.base); }
+    if (t.kind == ty.TYPE_POINTER)       { ret mentions_gparam(s, t.data.pointer.base, scan); }
+    if (t.kind == ty.TYPE_ARRAY)         { ret mentions_gparam(s, t.data.array.base, scan); }
+    if (t.kind == ty.TYPE_REC || t.kind == ty.TYPE_UNI) {
+        ret nominal_fields_mention(s, tid, scan);
+    }
     if (t.kind == ty.TYPE_INSTANCE) {
         val astart: u32 = t.data.instance.args_start;
         val alen:   u32 = t.data.instance.args_len;
@@ -415,12 +463,44 @@ fun mentions_gparam(s: *sess.Session, tid: ty.TypeId) bool {
         for (i < alen) {
             val a_opt: Option[ty.TypeId] = ty.get_param(?s.types, astart + i);
             if (is_some[ty.TypeId](a_opt)) {
-                if (mentions_gparam(s, unwrap[ty.TypeId](a_opt))) { ret true; }
+                if (mentions_gparam(s, unwrap[ty.TypeId](a_opt), scan)) { ret true; }
             }
             i = i + 1;
         }
     }
     ret false;
+}
+
+# scan_contains: whether nominal TypeId `tid` is already recorded in `scan`.
+fun scan_contains(scan: *GParamScan, tid: ty.TypeId) bool {
+    var i: u32 = 0;
+    for (i < scan.len) {
+        if (scan.visited[i] == tid) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# scan_push: record nominal TypeId `tid` in `scan`, growing the backing array
+# as needed. returns false only on an allocation failure.
+fun scan_push(s: *sess.Session, scan: *GParamScan, tid: ty.TypeId) bool {
+    if (scan.len == scan.cap) {
+        var new_cap: u32 = scan.cap * 2;
+        if (new_cap == 0) { new_cap = 8; }
+        if (scan.visited == nil) {
+            val ar: Result[*ty.TypeId, str] = allocate[ty.TypeId](s.alloc, new_cap::usize);
+            if (is_err[*ty.TypeId, str](ar)) { ret false; }
+            scan.visited = unwrap_ok[*ty.TypeId, str](ar);
+        } or {
+            val rr: Result[*ty.TypeId, str] = reallocate[ty.TypeId](s.alloc, scan.visited, scan.cap::usize, new_cap::usize);
+            if (is_err[*ty.TypeId, str](rr)) { ret false; }
+            scan.visited = unwrap_ok[*ty.TypeId, str](rr);
+        }
+        scan.cap = new_cap;
+    }
+    scan.visited[scan.len] = tid;
+    scan.len = scan.len + 1;
+    ret true;
 }
 
 # rebuilds a function type with each parameter and the return type
@@ -508,14 +588,15 @@ fun substitute_instance(s: *sess.Session, t: *ty.Type, args: *ty.TypeId, arg_cou
     ret unwrap_or_error(r);
 }
 
-# returns the generic-parameter count of a declaration in this module, or
-# none when the declaration is not a kind that can carry generic parameters
-# (only `fun`, `rec`, and `uni` declarations are generic-capable). a zero
-# count is a valid `some(0)` — it means the named decl exists but is not
-# parameterized, which `instantiate` reports as a mismatch when args were
-# supplied.
-fun local_generic_count(sc: *sema.SemaContext, decl_id: id.DeclId) Option[u32] {
-    val d_opt: Option[*decl.Decl] = ast.get_decl(sc.a, decl_id);
+# returns the generic-parameter count of a declaration in AST `a`, or none
+# when the declaration is not a kind that can carry generic parameters (only
+# `fun`, `rec`, and `uni` declarations are generic-capable). a zero count is a
+# valid `some(0)` — it means the named decl exists but is not parameterized,
+# which `check_arity` reports as a mismatch when args were supplied. `a` is the
+# declaring module's AST, so the same check applies to a local or a
+# cross-module generic.
+fun generic_count_in(a: *ast.Ast, decl_id: id.DeclId) Option[u32] {
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, decl_id);
     if (is_none[*decl.Decl](d_opt)) { ret none[u32](); }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
     if (d.kind == decl.DECL_KIND_FUN) { ret some[u32](d.data.fun_.generics_len); }
