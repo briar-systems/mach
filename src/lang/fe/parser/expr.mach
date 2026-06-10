@@ -26,6 +26,12 @@ use decl:     mach.lang.fe.ast.decl;
 use parser:   mach.lang.fe.parser.state;
 use comptime: mach.lang.fe.comptime;
 
+use lexer: mach.lang.fe.lexer;
+use diag:  mach.lang.diagnostic;
+use src:   mach.lang.source;
+use page:  std.allocator.page;
+use std.allocator.Allocator;
+
 # parse_expr: parses a full expression at the lowest infix binding power.
 # ---
 # p:   parser state
@@ -57,7 +63,7 @@ pub fun parse_expr_bp(p: *parser.Parser, min_bp: u8) id.ExprId {
         val rhs: id.ExprId = parse_expr_bp(p, right_bp);
 
         var bin: expr.ExprBinary;
-        bin.op  = bin_op_from_kind(op_tok.kind);
+        bin.op  = bin_op_from_kind(p, op_tok.kind);
         bin.lhs = lhs;
         bin.rhs = rhs;
 
@@ -66,8 +72,6 @@ pub fun parse_expr_bp(p: *parser.Parser, min_bp: u8) id.ExprId {
         node.kind = expr.EXPR_KIND_BINARY;
         node.data.binary = bin;
         lhs = parser.push_expr(p, node);
-
-        lhs = parse_postfix(p, lhs);
     }
 
     ret lhs;
@@ -140,7 +144,7 @@ fun parse_postfix(p: *parser.Parser, base: id.ExprId) id.ExprId {
         val k: token.Kind = parser.current(p).kind;
         if      (k == token.KIND_LPAREN)      { lhs = parse_call(p, lhs, 0, 0); }
         or      (k == token.KIND_LBRACKET) {
-            if (type_args_follow_kind(p) == token.KIND_LPAREN) {
+            if (postfix_is_generic_call(p)) {
                 lhs = parse_generic_call(p, lhs);
             }
             or {
@@ -155,25 +159,46 @@ fun parse_postfix(p: *parser.Parser, base: id.ExprId) id.ExprId {
     ret lhs;
 }
 
-# scans the balanced [...] starting at the current '[' and returns the token
-# kind immediately after the matching ']' (KIND_EOF if unterminated or empty).
-# a postfix '[' is a generic-arg list only when that follow-kind is '(' (a
-# call) — the '{' typed-literal form is recognized at the prefix stage and
-# never reaches postfix.
-fun type_args_follow_kind(p: *parser.Parser) token.Kind {
-    var i: usize = 1;            # peek(p, 0) is the current '['
+# scans a balanced bracket region for the postfix/prefix disambiguators: starting
+# at the '[' whose offset from the cursor is `bracket_off`, it walks to the
+# matching ']' and returns the cursor offset of the token immediately after it. a
+# ';' or EOF reached inside the brackets means the region can never be a type
+# list, reported as 0 (the brackets are unbalanced for that purpose). shared by
+# postfix_is_generic_call and looks_like_typed_literal so the two scanners cannot
+# drift apart.
+fun scan_bracket_close(p: *parser.Parser, bracket_off: usize) usize {
+    var i: usize = bracket_off + 1;
     var depth: usize = 1;
-    var has_payload: bool = false;
     for (depth > 0) {
         val k: token.Kind = parser.peek(p, i).kind;
-        if (k == token.KIND_EOF || k == token.KIND_SEMI) { ret token.KIND_EOF; }
+        if (k == token.KIND_EOF || k == token.KIND_SEMI) { ret 0; }
         if (k == token.KIND_LBRACKET) { depth = depth + 1; }
         or (k == token.KIND_RBRACKET) { depth = depth - 1; }
-        or                            { has_payload = true; }
         i = i + 1;
     }
-    if (!has_payload) { ret token.KIND_EOF; }
-    ret parser.peek(p, i).kind;
+    ret i;
+}
+
+# true when `k` can begin a type (per parse_type): a pointer '*', an array '[',
+# or an identifier (which covers named types and the `fun`/`rec`/`uni` keywords).
+fun token_begins_type(k: token.Kind) bool {
+    ret k == token.KIND_STAR || k == token.KIND_LBRACKET || k == token.KIND_IDENT;
+}
+
+# decides whether a postfix '[' opens a generic call `callee[T, ..](args)` rather
+# than an index `obj[i]`. it is a generic call only when the bracketed payload can
+# begin a type AND the token after the matching ']' is '(' (the call). a payload
+# that starts with a token which cannot begin a type — a literal, '-', '@', '$',
+# etc. — is an index, so `table[0]()` parses as index-then-call (#1247). the
+# decision stays purely syntactic: an index whose value is a bare identifier is
+# locally indistinguishable from a single type argument and still binds as a
+# generic call; resolve owns that residual ambiguity. the '{' typed-literal form
+# is recognized at the prefix stage and never reaches postfix.
+fun postfix_is_generic_call(p: *parser.Parser) bool {
+    if (!token_begins_type(parser.peek(p, 1).kind)) { ret false; }
+    val after: usize = scan_bracket_close(p, 0);   # peek(p, 0) is the current '['
+    if (after == 0) { ret false; }
+    ret parser.peek(p, after).kind == token.KIND_LPAREN;
 }
 
 # parses a generic call `callee[T, U](args)`: consumes the bracketed type-arg
@@ -565,22 +590,20 @@ fun looks_like_typed_literal(p: *parser.Parser) bool {
     }
 
     if (parser.peek(p, i).kind == token.KIND_LBRACKET) {
-        i = i + 1;
-        var depth: usize = 1;
-        for (depth > 0) {
-            val k: token.Kind = parser.peek(p, i).kind;
-            if (k == token.KIND_EOF)      { ret false; }
-            if (k == token.KIND_LBRACKET) { depth = depth + 1; }
-            if (k == token.KIND_RBRACKET) { depth = depth - 1; }
-            i = i + 1;
-        }
+        val after: usize = scan_bracket_close(p, i);
+        if (after == 0) { ret false; }
+        i = after;
     }
 
     ret parser.peek(p, i).kind == token.KIND_LBRACE;
 }
 
-# maps a token kind to its corresponding BinOp
-fun bin_op_from_kind(kind: token.Kind) expr.BinOp {
+# maps a token kind to its corresponding BinOp. paired with
+# token.infix_precedence: the Pratt loop only calls this for kinds with nonzero
+# infix precedence, so every operator listed there must be mapped here. `=` is
+# the sole assignment mapping; an unmapped kind means the two tables have drifted
+# out of sync and is reported rather than silently parsed as an assignment.
+fun bin_op_from_kind(p: *parser.Parser, kind: token.Kind) expr.BinOp {
     if (kind == token.KIND_PLUS)      { ret expr.BIN_ADD; }
     if (kind == token.KIND_MINUS)     { ret expr.BIN_SUB; }
     if (kind == token.KIND_STAR)      { ret expr.BIN_MUL; }
@@ -599,6 +622,8 @@ fun bin_op_from_kind(kind: token.Kind) expr.BinOp {
     if (kind == token.KIND_CARET)     { ret expr.BIN_BIT_XOR; }
     if (kind == token.KIND_LT_LT)     { ret expr.BIN_SHL; }
     if (kind == token.KIND_GT_GT)     { ret expr.BIN_SHR; }
+    if (kind == token.KIND_EQ)        { ret expr.BIN_ASSIGN; }
+    parser.error_at_current(p, "internal error: infix operator has no binary-operator mapping");
     ret expr.BIN_ASSIGN;
 }
 
@@ -844,4 +869,61 @@ fun at_type_boundary(p: *parser.Parser) bool {
     if (k == token.KIND_EQ)       { ret true; }
     if (k == token.KIND_EOF)      { ret true; }
     ret false;
+}
+
+test "parser: expr[i](args) parses as index-then-call, not a generic call (#1247)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    val tr: Result[lexer.TokenStream, str] = lexer.tokenize("t[0]()", ?alloc, 0::src.FileId);
+    if (is_err[lexer.TokenStream, str](tr)) { ret 1; }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+    var a: ast.Ast = ast.init(?alloc, 0::src.FileId);
+    var diags: diag.DiagList = diag.init(?alloc);
+    var p: parser.Parser = parser.init(?stream, ?a, ?diags);
+
+    val eid: id.ExprId = parse_expr(?p);
+    var rc: i32 = 0;
+    val e: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, eid));
+    # `t[0]()` is a call whose callee is the index `t[0]`, with no type args
+    if (e.kind != expr.EXPR_KIND_CALL) { rc = 1; }
+    or (e.data.call.type_args_len != 0) { rc = 1; }
+    or {
+        val callee: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, e.data.call.callee));
+        if (callee.kind != expr.EXPR_KIND_INDEX) { rc = 1; }
+    }
+    if (diag.has_errors(?diags)) { rc = 1; }
+
+    diag.dnit(?diags);
+    ast.dnit(?a);
+    lexer.dnit(?stream, ?alloc);
+    ret rc;
+}
+
+test "parser: a true generic call callee[T](args) still binds its type args (#1247)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    val tr: Result[lexer.TokenStream, str] = lexer.tokenize("make[i64]()", ?alloc, 0::src.FileId);
+    if (is_err[lexer.TokenStream, str](tr)) { ret 1; }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+    var a: ast.Ast = ast.init(?alloc, 0::src.FileId);
+    var diags: diag.DiagList = diag.init(?alloc);
+    var p: parser.Parser = parser.init(?stream, ?a, ?diags);
+
+    val eid: id.ExprId = parse_expr(?p);
+    var rc: i32 = 0;
+    val e: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, eid));
+    if (e.kind != expr.EXPR_KIND_CALL) { rc = 1; }
+    or (e.data.call.type_args_len != 1) { rc = 1; }
+    or {
+        val callee: *expr.Expr = unwrap[*expr.Expr](ast.get_expr(?a, e.data.call.callee));
+        if (callee.kind != expr.EXPR_KIND_IDENT) { rc = 1; }
+    }
+    if (diag.has_errors(?diags)) { rc = 1; }
+
+    diag.dnit(?diags);
+    ast.dnit(?a);
+    lexer.dnit(?stream, ?alloc);
+    ret rc;
 }
