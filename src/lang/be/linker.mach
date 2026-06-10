@@ -238,7 +238,13 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
     }
     sec_base = unwrap_ok[*u32, str](br);
 
-    accumulate_sections(modules, module_count, ?merged[0], placements, sec_base);
+    val acc_r: Result[bool, str] =
+        accumulate_sections(modules, module_count, ?merged[0], placements, sec_base);
+    if (is_err[bool, str](acc_r)) {
+        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_modules(alloc, modules, module_count);
+        ret err[bool, str](unwrap_err[bool, str](acc_r));
+    }
 
     # assign each merged section a virtual address (executables only). sections
     # are placed in canonical order from the OS base, each kind page-aligned.
@@ -902,7 +908,7 @@ fun total_sections(modules: *of.ObjectImage, module_count: u32) u32 {
 # merged section). also fills `sec_base` with the per-module prefix offset into
 # the flat placement array.
 fun accumulate_sections(modules: *of.ObjectImage, module_count: u32,
-                        merged: *MergedSection, placements: *Placement, sec_base: *u32) {
+                        merged: *MergedSection, placements: *Placement, sec_base: *u32) Result[bool, str] {
     var flat: u32 = 0;
     var m: u32 = 0;
     for (m < module_count) {
@@ -910,19 +916,33 @@ fun accumulate_sections(modules: *of.ObjectImage, module_count: u32,
         var sc: u32 = 0;
         for (sc < modules[m].section_count) {
             val sec: *of.Section = ?modules[m].sections[sc];
-            val ki: u32 = clamp_kind(sec.kind);
+            # the parser must hand the linker one of the known section kinds; an
+            # out-of-range kind is a contract violation, not a section to silently
+            # fold into .debug.
+            if (sec.kind::u32 >= MERGED_KIND_COUNT) {
+                ret err[bool, str]("linker: input section has an unknown section kind");
+            }
+            val ki: u32 = sec.kind::u32;
 
             var a: u32 = sec.align;
             if (a == 0) { a = 1; }
             if (a > merged[ki].align) { merged[ki].align = a; }
 
-            # align the running offset to this section's alignment.
-            val off: u32 = align_up_u32(merged[ki].len, a);
+            # align the running offset to this section's alignment and add this
+            # section's bytes, computed in u64 so a >4GiB merged section group is
+            # rejected rather than wrapping the u32 length into a tiny value that
+            # later truncates the output.
+            val off64: u64 = bin.align_up_u64(merged[ki].len::u64, a::u64);
+            val newlen: u64 = off64 + sec.len::u64;
+            if (newlen > 0xFFFFFFFF) {
+                ret err[bool, str]("linker: merged section size exceeds the 4 GiB u32 limit");
+            }
+
             placements[flat].merged_index = ki;
-            placements[flat].offset       = off;
+            placements[flat].offset       = off64::u32;
             placements[flat].vaddr        = 0;
 
-            merged[ki].len  = off + sec.len;
+            merged[ki].len  = newlen::u32;
             merged[ki].used = true;
 
             flat = flat + 1;
@@ -930,6 +950,7 @@ fun accumulate_sections(modules: *of.ObjectImage, module_count: u32,
         }
         m = m + 1;
     }
+    ret ok[bool, str](true);
 }
 
 # assign_section_vaddrs: give each used merged section a base virtual address,
@@ -979,7 +1000,12 @@ fun collect_symbols(s: *sess.Session, modules: *of.ObjectImage, module_count: u3
         for (sy < modules[m].symbol_count) {
             val sym: *of.Symbol = ?modules[m].symbols[sy];
             if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
-            if (sym.section >= modules[m].section_count) { sy = sy + 1; cnt; }
+            # a defined symbol whose section index is out of range is a corrupt
+            # object: erroring here surfaces it directly instead of letting the
+            # definition vanish and resurface later as a baffling undefined symbol.
+            if (sym.section >= modules[m].section_count) {
+                ret err[bool, str]("linker: symbol names an out-of-range section");
+            }
             if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { sy = sy + 1; cnt; }
 
             val flat: u32 = sec_base[m] + sym.section;
@@ -1150,7 +1176,17 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
         var ri: u32 = 0;
         for (ri < modules[m].reloc_count) {
             val r: *of.Relocation = ?modules[m].relocations[ri];
-            if (r.section >= modules[m].section_count) { ri = ri + 1; cnt; }
+            # a corrupt object can name an out-of-range section, or an offset past
+            # the end of its own section (which would wrap the u32 patch cursor and
+            # scribble outside the merged buffer). reject both loudly instead of
+            # silently dropping the relocation, which would ship an executable with
+            # an unpatched site.
+            if (r.section >= modules[m].section_count) {
+                ret err[bool, str]("linker: relocation names an out-of-range section");
+            }
+            if (r.offset > modules[m].sections[r.section].len) {
+                ret err[bool, str]("linker: relocation offset is past the end of its section");
+            }
 
             # the patch site's location in the merged image. the placement's
             # merged_index is a section *kind*; map it to the output-section index.
@@ -1158,9 +1194,17 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
             val pl: *Placement = ?placements[flat];
             val patch_va: u64 = pl.vaddr + r.offset::u64;
             val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
-            if (out_ix == 0xFFFFFFFF) { ri = ri + 1; cnt; }
+            # a relocation in a section with no merged output, or one whose patch
+            # site lands in a (byteless) BSS section, cannot be applied — that is a
+            # contract violation from a buggy parser/codegen, not a relocation to
+            # quietly skip.
+            if (out_ix == 0xFFFFFFFF) {
+                ret err[bool, str]("linker: relocation targets a section with no merged output");
+            }
             val dst: *u8 = out_img.sections[out_ix].bytes;
-            if (dst == nil) { ri = ri + 1; cnt; }
+            if (dst == nil) {
+                ret err[bool, str]("linker: relocation patch site lands in a BSS section");
+            }
             val patch_off: u32 = pl.offset + r.offset;
 
             # locate the target symbol's final virtual address. a LOCAL target is
@@ -1448,7 +1492,10 @@ fun apply_one(s: *sess.Session, kinds: *RelocKindIds, kind: intern.StrId,
              dst: *u8, patch_off: u32, sec_len: u32,
              sym_va: u64, addend: i64, patch_va: u64, module: u32, rel_off: u32) Result[bool, str] {
     if (kind == kinds.abs64) {
-        if (patch_off + 8 > sec_len) {
+        # bound the patch site in u64: patch_off + width can wrap a u32 for an
+        # offset near 0xFFFFFFFF, which would pass a u32 check and then scribble
+        # outside the merged buffer.
+        if (patch_off::u64 + 8 > sec_len::u64) {
             ret err[bool, str](overflow_message(s, kind, module, rel_off));
         }
         val value: u64 = sym_va + (addend::u64);
@@ -1457,7 +1504,7 @@ fun apply_one(s: *sess.Session, kinds: *RelocKindIds, kind: intern.StrId,
     }
 
     if (kind == kinds.pc32 || kind == kinds.plt32) {
-        if (patch_off + 4 > sec_len) {
+        if (patch_off::u64 + 4 > sec_len::u64) {
             ret err[bool, str](overflow_message(s, kind, module, rel_off));
         }
         val disp: i64 = (sym_va::i64) + addend - (patch_va::i64);
@@ -1470,7 +1517,7 @@ fun apply_one(s: *sess.Session, kinds: *RelocKindIds, kind: intern.StrId,
 
     # abs32s: 32-bit signed absolute.
     if (kind == kinds.abs32s) {
-        if (patch_off + 4 > sec_len) {
+        if (patch_off::u64 + 4 > sec_len::u64) {
             ret err[bool, str](overflow_message(s, kind, module, rel_off));
         }
         val v: i64 = (sym_va::i64) + addend;
@@ -1494,7 +1541,14 @@ fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module
         var ri: u32 = 0;
         for (ri < modules[m].reloc_count) {
             val r: *of.Relocation = ?modules[m].relocations[ri];
-            if (r.section >= modules[m].section_count) { ri = ri + 1; cnt; }
+            # reject the same corrupt-input conditions the patch path does, rather
+            # than silently dropping a relocation from the carried-forward object.
+            if (r.section >= modules[m].section_count) {
+                ret err[bool, str]("linker: relocation names an out-of-range section");
+            }
+            if (r.offset > modules[m].sections[r.section].len) {
+                ret err[bool, str]("linker: relocation offset is past the end of its section");
+            }
 
             val flat: u32 = sec_base[m] + r.section;
             val pl: *Placement = ?placements[flat];
@@ -1502,7 +1556,9 @@ fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module
             # find the output-section index for this kind by matching merged
             # index against the already-added output sections.
             val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
-            if (out_ix == 0xFFFFFFFF) { ri = ri + 1; cnt; }
+            if (out_ix == 0xFFFFFFFF) {
+                ret err[bool, str]("linker: relocation targets a section with no merged output");
+            }
 
             var orel: of.Relocation;
             orel.section = out_ix;
@@ -1596,21 +1652,6 @@ fun os_base_addr(tgt: *target.Target) u64 {
 # read from the OS vtable (`tgt.os.page_size`).
 fun os_page_size(tgt: *target.Target) u64 {
     ret tgt.os.page_size;
-}
-
-# clamp_kind: map a section kind to a valid merged-accumulator index, treating
-# any out-of-range kind as DEBUG so unknown sections are merged but never
-# loaded.
-fun clamp_kind(kind: of.SectionKind) u32 {
-    if (kind::u32 >= MERGED_KIND_COUNT) { ret of.SK_DEBUG::u32; }
-    ret kind::u32;
-}
-
-# align_up_u32: round `value` up to the next multiple of `align` (a power of
-# two, or 1 for no alignment).
-fun align_up_u32(value: u32, align: u32) u32 {
-    if (align <= 1) { ret value; }
-    ret (value + align - 1) & ~(align - 1);
 }
 
 # dup_message: build the "multiple definition of '<name>'" diagnostic string.
