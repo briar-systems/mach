@@ -117,11 +117,15 @@ pub rec Symbol {
 # kind:   one of SYM_*
 # name:   interned identifier
 # decl:   DeclId in the owning module's Ast
+# slot:   kind-dependent payload, mirrored from the source Symbol; for a
+#         re-exported module alias (SYM_USE) it carries the target ModuleId so a
+#         downstream consumer can resolve through the `fwd`
 # origin: ModuleId of the owning module (= the dep this entry came from)
 pub rec PublicSymbol {
     kind:   SymKind;
     name:   intern.StrId;
     decl:   id.DeclId;
+    slot:   u32;
     origin: sess.ModuleId;
 }
 
@@ -384,8 +388,13 @@ fun init_context(
 
     rc.imported_cache = map.init[u64, SymbolId](s.alloc, map.hash_u64, map.eq_u64);
 
+    # every allocation past this point is owned by the context; on a failure
+    # dnit_context tears down whatever has been allocated so far (the array
+    # handles are nil and the cache is initialised), leaving no partial state
+    # leaked on the OOM path.
     val sa: Result[*Symbol, str] = allocate[Symbol](s.alloc, INITIAL_SYMBOLS_CAP::usize);
     if (is_err[*Symbol, str](sa)) {
+        dnit_context(rc);
         ret err[bool, str](unwrap_err[*Symbol, str](sa));
     }
     rc.symbols = unwrap_ok[*Symbol, str](sa);
@@ -393,9 +402,7 @@ fun init_context(
 
     val sca: Result[*Scope, str] = allocate[Scope](s.alloc, INITIAL_SCOPES_CAP::usize);
     if (is_err[*Scope, str](sca)) {
-        deallocate[Symbol](s.alloc, rc.symbols, rc.sym_cap::usize);
-        rc.symbols = nil;
-        rc.sym_cap = 0;
+        dnit_context(rc);
         ret err[bool, str](unwrap_err[*Scope, str](sca));
     }
     rc.scopes    = unwrap_ok[*Scope, str](sca);
@@ -403,19 +410,19 @@ fun init_context(
 
     if (a.expr_len > 0) {
         val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.expr_len);
-        if (is_err[*SymbolId, str](r)) { ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
+        if (is_err[*SymbolId, str](r)) { dnit_context(rc); ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
         rc.expr_resolved = unwrap_ok[*SymbolId, str](r);
         fill_nil(rc.expr_resolved, a.expr_len::u32);
     }
     if (a.type_len > 0) {
         val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.type_len);
-        if (is_err[*SymbolId, str](r)) { ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
+        if (is_err[*SymbolId, str](r)) { dnit_context(rc); ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
         rc.type_resolved = unwrap_ok[*SymbolId, str](r);
         fill_nil(rc.type_resolved, a.type_len::u32);
     }
     if (a.decl_len > 0) {
         val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.decl_len);
-        if (is_err[*SymbolId, str](r)) { ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
+        if (is_err[*SymbolId, str](r)) { dnit_context(rc); ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
         rc.decl_symbol = unwrap_ok[*SymbolId, str](r);
         fill_nil(rc.decl_symbol, a.decl_len::u32);
     }
@@ -871,15 +878,24 @@ fun bind_imported_symbol(rc: *ResolveContext, decl_id: id.DeclId, bind_span: tok
     ret ok[bool, str](true);
 }
 
-# returns a SYM_IMPORTED SymbolId for `ps`, reusing the cached one when an
-# earlier use-site already imported the same (origin, decl) pair.
+# returns a Symbol for `ps`, reusing the cached one when an earlier use-site
+# already imported the same (origin, decl) pair. an ordinary export degrades to
+# a plain SYM_IMPORTED reference; a re-exported module alias (SYM_USE) keeps its
+# kind and target-module slot so a downstream consumer can resolve through the
+# `fwd` (the slot is a project-wide ModuleId, shared across the one build).
 fun imported_symbol_for(rc: *ResolveContext, ps: *PublicSymbol) Result[SymbolId, str] {
     val key: u64 = (ps.origin::u64 << 32) | ps.decl::u64;
     val cached: Result[*SymbolId, str] = map.get[u64, SymbolId](?rc.imported_cache, ?key);
     if (is_ok[*SymbolId, str](cached)) {
         ret ok[SymbolId, str](@unwrap_ok[*SymbolId, str](cached));
     }
-    val r: Result[SymbolId, str] = add_symbol(rc, SYM_IMPORTED, 0, ps.name, ps.decl, 0, ps.origin);
+    var kind: SymKind = SYM_IMPORTED;
+    var slot: u32     = 0;
+    if (ps.kind == SYM_USE) {
+        kind = SYM_USE;
+        slot = ps.slot;
+    }
+    val r: Result[SymbolId, str] = add_symbol(rc, kind, 0, ps.name, ps.decl, slot, ps.origin);
     if (is_err[SymbolId, str](r)) { ret r; }
     val sid: SymbolId = unwrap_ok[SymbolId, str](r);
     val ins: Result[bool, str] = map.insert[u64, SymbolId](?rc.imported_cache, key, sid);
@@ -997,7 +1013,11 @@ fun bind_member_qualified(rc: *ResolveContext, eid: id.ExprId, member: *expr.Exp
         ret ok[bool, str](true);
     }
 
-    val r_sym: Result[SymbolId, str] = add_symbol(rc, SYM_IMPORTED, 0, leaf_id, ps.decl, 0, ps.origin);
+    # reuse the imported-symbol cache instead of minting a fresh Symbol per
+    # qualified reference, the exact use-case the cache documents; this also
+    # preserves a re-exported module alias as SYM_USE so `alias.member` chains
+    # through a `fwd`.
+    val r_sym: Result[SymbolId, str] = imported_symbol_for(rc, ps);
     if (is_err[SymbolId, str](r_sym)) { ret err[bool, str](unwrap_err[SymbolId, str](r_sym)); }
     rc.expr_resolved[eid] = unwrap_ok[SymbolId, str](r_sym);
     ret ok[bool, str](true);
