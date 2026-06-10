@@ -445,7 +445,10 @@ Disambiguating a postfix `[`:
   calling an element of a function-pointer table needs no parentheses.
 - The single residual ambiguity is a bare identifier payload (`callee[x](…)`):
   it is locally indistinguishable from one type argument and binds as a
-  generic call; name resolution owns that case.
+  generic call. If `x` names a value rather than a type, name resolution then
+  reports an error, so the variable-index-then-call form `table[i]()` still
+  needs `(table[i])()`; deferring this decision to resolve is tracked
+  separately.
 - The struct-literal `Name[T]{...}` form is recognized at the **prefix**
   stage (`typed-literal`) and never reaches postfix.
 
