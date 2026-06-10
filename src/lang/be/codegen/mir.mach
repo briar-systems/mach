@@ -65,7 +65,6 @@ use float:   mach.lang.float;
 use intern:  mach.lang.intern;
 use target:  mach.lang.target.resolved;
 use abi:     mach.lang.target.abi;
-use sysv:    mach.lang.target.abi.sysv;
 use isa:     mach.lang.target.isa;
 use ir:      mach.lang.me.ir;
 use ir_type: mach.lang.me.ir.type;
@@ -894,6 +893,13 @@ rec LowerCtx {
     # past them. captured from the signature layout in the entry prologue.
     va_named_gp: i32;
     va_named_fp: i32;
+    # va_named_slots: the number of POSITIONAL argument slots the named parameters
+    # (plus a hidden sret pointer) consume under the home-area model — `va_start`
+    # seeds the single va_list pointer just past them. unlike `va_named_gp +
+    # va_named_fp` (register-passed named count, which saturates at the register
+    # file size), this counts every named slot including stack-passed ones, so a
+    # variadic function with more than four named params seeds the cursor correctly.
+    va_named_slots: i32;
     # va_overflow_off: the `[rbp + off]` displacement of the first stack-passed
     # argument (the overflow area `va_start` points overflow_arg_area at). it is the
     # base of the incoming stack-argument region, 16 plus the fixed params' stack
@@ -3041,33 +3047,12 @@ fun require_abi(tgt: *target.Target) Result[bool, str] {
 # ret:   ok(true) on success, or a loud error
 fun abi_gp_arg_reg(tgt: *target.Target, index: i32, out: *i32) Result[bool, str] {
     var regs: [16]isa.Register;
-    val fill: sysv.RegFileFn = tgt.abi.gp_arg_regs::sysv.RegFileFn;
+    val fill: abi.RegFileFn = tgt.abi.gp_arg_regs::abi.RegFileFn;
     val n: i32 = fill(?regs[0]);
     if (index < 0 || index >= n || index >= MAX_GP_ARG_REGS) {
         ret err[bool, str]("mir.lower_ir: GP argument register index out of range");
     }
     @out = regs[index].id;
-    ret ok[bool, str](true);
-}
-
-# abi_gp_ret_reg: the physical register id of the active ABI's general-purpose
-# scalar-return register, obtained by classifying an 8-byte integer return through
-# `tgt.abi.ret_passing`. SysV's varargs convention requires the count of vector
-# registers a variadic call uses in this register (AL, the low byte of RAX) before
-# every call; sourcing it from the return classifier keeps that placement
-# vtable-driven rather than naming RAX directly. errors loudly when the classifier
-# returns no register (an unsupported convention).
-# ---
-# tgt: the active target
-# out: receives the physical register id on success
-# ret: ok(true) on success, or a loud error
-fun abi_gp_ret_reg(tgt: *target.Target, out: *i32) Result[bool, str] {
-    val classify_ret: sysv.RetPassingFn = tgt.abi.ret_passing::sysv.RetPassingFn;
-    val slot: abi.ParamSlot = classify_ret(tgt.arch_id, 8, 8, false, false);
-    if (slot.class != abi.CLASS_GP || slot.reg < 0) {
-        ret err[bool, str]("mir.lower_ir: ABI vtable has no GP return register");
-    }
-    @out = slot.reg;
     ret ok[bool, str](true);
 }
 
@@ -3084,7 +3069,7 @@ fun abi_va_model(tgt: *target.Target, out: *abi.VaModel) Result[bool, str] {
     if (tgt.abi.va_model == nil) {
         ret err[bool, str]("mir.lower_ir: ABI vtable exposes no variadic save model");
     }
-    val model: sysv.VaModelFn = tgt.abi.va_model::sysv.VaModelFn;
+    val model: abi.VaModelFn = tgt.abi.va_model::abi.VaModelFn;
     @out = model();
     ret ok[bool, str](true);
 }
@@ -3099,6 +3084,118 @@ fun value_is_float(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool {
 # classifier applies the aggregate (one/two-register or by-reference) rules.
 fun value_is_aggregate(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool {
     ret ir_type.is_aggregate(ctx.types, ty);
+}
+
+# per-eightbyte SysV class tags used while classifying an aggregate's eightbytes.
+# the merge keeps the higher tag, so INTEGER dominates SSE dominates NO_CLASS: an
+# eightbyte is SSE only when every field that overlaps it is floating-point.
+val EB_NO_CLASS: u8 = 0;
+val EB_SSE:      u8 = 1;
+val EB_INTEGER:  u8 = 2;
+
+# mark_eightbyte_range: merge class `cls` into every eightbyte the byte range
+# `[off, off+size)` overlaps (only eightbytes 0 and 1 are tracked — a ≤16 byte
+# aggregate has at most two). the merge keeps the dominant tag.
+fun mark_eightbyte_range(classes: *u8, off: u64, size: u64, cls: u8) {
+    if (size == 0) { ret; }
+    var e: u64 = off / 8;
+    val last: u64 = (off + size - 1) / 8;
+    for (e <= last) {
+        if (e < 2) {
+            if (cls > classes[e]) { classes[e] = cls; }
+        }
+        e = e + 1;
+    }
+}
+
+# mark_eightbyte_classes: recursively classify each leaf scalar of an aggregate
+# type into the eightbyte(s) it occupies, starting at absolute byte offset
+# `base_off`. a float leaf marks its eightbytes SSE; an integer / pointer / function
+# leaf marks them INTEGER; structs recurse at each field offset, unions at offset 0
+# (members overlap), arrays at each element offset. `classes[0..1]` accumulate the
+# merged per-eightbyte class for the SysV SSE-aggregate classification.
+fun mark_eightbyte_classes(ctx: *LowerCtx, ty: ir_type.IrTypeId, base_off: u64, classes: *u8) {
+    val it: Option[*ir_type.IrType] = ir_type.get(ctx.types, ty);
+    if (!is_some[*ir_type.IrType](it)) { ret; }
+    val t: *ir_type.IrType = unwrap[*ir_type.IrType](it);
+
+    if (t.kind == ir_type.IRT_FLOAT) {
+        mark_eightbyte_range(classes, base_off, ir_type.byte_size(ctx.types, ty, ctx.tgt)::u64, EB_SSE);
+        ret;
+    }
+    if (t.kind == ir_type.IRT_STRUCT) {
+        var i: u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            val fid: ir_type.IrTypeId = t.data.struct_.fields[i];
+            val fo:  u64 = ir_type.byte_offset(ctx.types, ty, i, ctx.tgt)::u64;
+            mark_eightbyte_classes(ctx, fid, base_off + fo, classes);
+            i = i + 1;
+        }
+        ret;
+    }
+    if (t.kind == ir_type.IRT_UNION) {
+        # union members all overlap at offset 0; merge each member's classes.
+        var i: u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            mark_eightbyte_classes(ctx, t.data.struct_.fields[i], base_off, classes);
+            i = i + 1;
+        }
+        ret;
+    }
+    if (t.kind == ir_type.IRT_ARRAY) {
+        val elem: ir_type.IrTypeId = t.data.element;
+        val es:   u64 = ir_type.byte_size(ctx.types, elem, ctx.tgt)::u64;
+        val n:    u32 = ir_type.array_count(ctx.types, ty);
+        var i: u32 = 0;
+        for (i < n) {
+            mark_eightbyte_classes(ctx, elem, base_off + i::u64 * es, classes);
+            i = i + 1;
+        }
+        ret;
+    }
+    # integer / pointer / function leaf: an INTEGER-class eightbyte.
+    mark_eightbyte_range(classes, base_off, ir_type.byte_size(ctx.types, ty, ctx.tgt)::u64, EB_INTEGER);
+}
+
+# aggregate_sse_mask: the per-eightbyte SSE mask for a ≤16 byte aggregate type — bit
+# `e` set when eightbyte `e` is SSE class (every overlapping field floating-point),
+# which the SysV classifier uses to place that eightbyte in a vector register. 0 for
+# a non-aggregate or a >16 byte aggregate (which is byref/sret, so the mask is
+# unused).
+fun aggregate_sse_mask(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8 {
+    if (!value_is_aggregate(ctx, ty)) { ret 0; }
+    val size: u64 = ir_type.byte_size(ctx.types, ty, ctx.tgt)::u64;
+    if (size == 0 || size > 16) { ret 0; }
+    var classes: [2]u8;
+    classes[0] = EB_NO_CLASS;
+    classes[1] = EB_NO_CLASS;
+    mark_eightbyte_classes(ctx, ty, 0, ?classes[0]);
+    var mask: u8 = 0;
+    if (classes[0] == EB_SSE) { mask = mask | 1; }
+    if (classes[1] == EB_SSE) { mask = mask | 2; }
+    ret mask;
+}
+
+# advance_one_cursor: advance the GP or FP argument-register cursor for one assigned
+# register, dispatching on the register's bank (the composite id encodes it). a
+# negative id (no register) advances neither. so a register aggregate's GP and SSE
+# eightbytes each consume from the right file.
+fun advance_one_cursor(reg: i32, gp_used: *i32, fp_used: *i32) {
+    if (reg < 0) { ret; }
+    if (isa.regid_class(reg) == isa.REG_CLASS_ID_XMM) {
+        @fp_used = @fp_used + 1;
+    } or {
+        @gp_used = @gp_used + 1;
+    }
+}
+
+# advance_arg_cursors: advance the GP / FP cursors for a register-passed slot by the
+# bank of each register it occupies (`reg` and, for a two-register aggregate, `reg2`),
+# so a scalar, a by-reference pointer, and a mixed GP/SSE aggregate each consume the
+# correct registers. stack slots carry no register and advance neither.
+fun advance_arg_cursors(slot: *abi.ParamSlot, gp_used: *i32, fp_used: *i32) {
+    advance_one_cursor(slot.reg, gp_used, fp_used);
+    advance_one_cursor(slot.reg2, gp_used, fp_used);
 }
 
 # emit_mov: append a `MIR_MOV (dst) <- (src)` to a block. used for every ABI
@@ -3229,9 +3326,8 @@ fun classify_signature(ctx: *LowerCtx, sig: ir_type.IrTypeId, ret_ty: ir_type.Ir
     val rok: Result[bool, str] = require_abi(ctx.tgt);
     if (is_err[bool, str](rok)) { ret rok; }
 
-    val arch: u32 = ctx.tgt.arch_id;
-    val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
-    val classify_ret: sysv.RetPassingFn = ctx.tgt.abi.ret_passing::sysv.RetPassingFn;
+    val classify_arg: abi.ArgPassingFn = ctx.tgt.abi.arg_passing::abi.ArgPassingFn;
+    val classify_ret: abi.RetPassingFn = ctx.tgt.abi.ret_passing::abi.RetPassingFn;
 
     out.params      = nil;
     out.param_count = 0;
@@ -3242,7 +3338,8 @@ fun classify_signature(ctx: *LowerCtx, sig: ir_type.IrTypeId, ret_ty: ir_type.Ir
     val ret_size:  u64  = ir_type.byte_size(ctx.types, ret_ty, ctx.tgt)::u64;
     val ret_float: bool = value_is_float(ctx, ret_ty);
     val ret_aggr:  bool = value_is_aggregate(ctx, ret_ty);
-    out.ret_slot = classify_ret(arch, ret_size, 0, ret_float, ret_aggr);
+    val ret_eb:    u8   = aggregate_sse_mask(ctx, ret_ty);
+    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr);
 
     var gp_used:   i32 = 0;
     var fp_used:   i32 = 0;
@@ -3289,23 +3386,21 @@ fun classify_signature(ctx: *LowerCtx, sig: ir_type.IrTypeId, ret_ty: ir_type.Ir
         val psz:  u64  = ir_type.byte_size(ctx.types, pty, ctx.tgt)::u64;
         val pfl:  bool = value_is_float(ctx, pty);
         val pag:  bool = value_is_aggregate(ctx, pty);
-        var slot: abi.ParamSlot = classify_arg(arch, pi::i32, psz, 0, pfl, pag, gp_used, fp_used);
+        val peb:  u8   = aggregate_sse_mask(ctx, pty);
+        var slot: abi.ParamSlot = classify_arg(pi::i32, psz, 0, pfl, peb, pag, gp_used, fp_used);
 
         # record the real outgoing stack offset on the slot (the ABI classifier
         # returns a sizing-only slot with offset 0); the param / call lowering
         # read this instead of re-deriving a parallel cursor. a byref stack spill
         # occupies the same eight-byte slot as a by-value one — only its contents
-        # (a hidden pointer) differ — so it advances the cursor identically.
+        # (a hidden pointer) differ — so it advances the cursor identically. a
+        # register slot advances each assigned register's bank cursor (a mixed
+        # GP/SSE aggregate consumes one of each).
         if (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
             slot.offset = stack_off;
             stack_off   = stack_off + stack_slot_bytes(slot.size);
-        } or (slot.class == abi.CLASS_FP) {
-            fp_used = fp_used + 1;
-        } or (slot.class == abi.CLASS_GP) {
-            gp_used = gp_used + 1;
-            if (slot.reg2 >= 0) { gp_used = gp_used + 1; }
-        } or (slot.class == abi.CLASS_BYREF) {
-            gp_used = gp_used + 1;
+        } or {
+            advance_arg_cursors(?slot, ?gp_used, ?fp_used);
         }
 
         slots[pi] = slot;
@@ -3351,8 +3446,14 @@ fun lower_call(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
     val rok: Result[bool, str] = require_abi(ctx.tgt);
     if (is_err[bool, str](rok)) { ret rok; }
 
-    val arch: u32 = ctx.tgt.arch_id;
-    val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
+    val classify_arg: abi.ArgPassingFn = ctx.tgt.abi.arg_passing::abi.ArgPassingFn;
+
+    # the convention's variadic save model drives the pre-call vector-count move and
+    # the win64 variadic-float duplication — both ABI facts the call lowering reads
+    # from the model rather than naming a register or convention directly.
+    var vamodel: abi.VaModel;
+    val vmr: Result[bool, str] = abi_va_model(ctx.tgt, ?vamodel);
+    if (is_err[bool, str](vmr)) { ret vmr; }
 
     # classify the WHOLE declared signature once (the callee's IRT_FN rides on
     # `inst.aux_ty`, the call's result type on `inst.ty`); the return and every
@@ -3432,7 +3533,11 @@ fun lower_call(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
             val asz:  u64  = ir_type.byte_size(ctx.types, av.ty, ctx.tgt)::u64;
             val afl:  bool = value_is_float(ctx, av.ty);
             val aag:  bool = value_is_aggregate(ctx, av.ty);
-            slot = classify_arg(arch, pidx::i32, asz, 0, afl, aag, gp_used, fp_used);
+            # a variadic tail aggregate is classified as integer eightbytes (mask 0):
+            # the va_arg read path walks the GP register-save / overflow areas, so the
+            # caller and callee stay consistent. SSE-eightbyte aggregate passing is for
+            # fixed parameters and returns (the C-FFI boundary), not the varargs tail.
+            slot = classify_arg(pidx::i32, asz, 0, afl, 0, aag, gp_used, fp_used);
             soff = stack_off;
         }
 
@@ -3458,18 +3563,35 @@ fun lower_call(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
             ret er;
         }
 
+        # win64 variadic float: an unnamed (tail) float argument rides BOTH its XMM
+        # register and the integer argument register of the same positional slot, so
+        # a callee reading it through `va_arg` (which only walks the integer/home
+        # slots) sees it. duplicate the float's bits into the slot's GP argument
+        # register (the positional slot is `gp_used + fp_used`, before the advance);
+        # the move is cross-bank (MOVQ), gated on the model's `float_dup_gp` so SysV —
+        # whose FP save area captures floats directly — never emits it.
+        if (pidx >= layout.param_count && vamodel.float_dup_gp && slot.class == abi.CLASS_FP) {
+            var dup_reg: i32 = 0;
+            val dr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, gp_used + fp_used, ?dup_reg);
+            if (is_err[bool, str](dr)) {
+                sig_layout_free(ctx, ?layout);
+                ret dr;
+            }
+            val dm: Result[bool, str] = emit_mov(ctx, mb, op_preg(dup_reg::u32), argop);
+            if (is_err[bool, str](dm)) {
+                sig_layout_free(ctx, ?layout);
+                ret dm;
+            }
+        }
+
         # advance the running cursors only for the variadic tail; the fixed-param
-        # cursors were already consumed by `classify_signature`.
+        # cursors were already consumed by `classify_signature`. a register slot
+        # advances each assigned register's bank; a stack slot advances the offset.
         if (pidx >= layout.param_count) {
-            if (slot.class == abi.CLASS_FP) {
-                fp_used = fp_used + 1;
-            } or (slot.class == abi.CLASS_GP) {
-                gp_used = gp_used + 1;
-                if (slot.reg2 >= 0) { gp_used = gp_used + 1; }
-            } or (slot.class == abi.CLASS_BYREF) {
-                gp_used = gp_used + 1;
-            } or (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
+            if (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
                 stack_off = stack_off + stack_slot_bytes(slot.size);
+            } or {
+                advance_arg_cursors(?slot, ?gp_used, ?fp_used);
             }
         }
 
@@ -3484,17 +3606,17 @@ fun lower_call(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: id.
     # call-site RSP stays sixteen-byte aligned.
     record_outgoing_size(ctx, stack_off);
 
-    # SysV requires the GP return register (AL, the low byte of RAX) to hold the
-    # number of vector registers used by variadic arguments before every call (a
-    # conservative upper bound is the FP count). the register is the ABI's GP
-    # scalar-return register, obtained by classifying an integer return through the
-    # ret classifier rather than naming RAX directly.
-    var al_reg: i32 = 0;
-    val alr: Result[bool, str] = abi_gp_ret_reg(ctx.tgt, ?al_reg);
-    if (is_err[bool, str](alr)) { ret alr; }
-    val al: Result[bool, str] = emit_mov(ctx, mb,
-        op_preg(al_reg::u32), op_imm(fp_used::i64));
-    if (is_err[bool, str](al)) { ret al; }
+    # the pre-call vector-count move: a convention that encodes the number of vector
+    # registers a variadic call uses (SysV's AL, the low byte of RAX) sets it before
+    # every call (a conservative upper bound is the FP count). the register rides on
+    # the variadic save model — a convention that encodes no count (win64) reports -1
+    # and the move is skipped, so the instruction is an ABI-driven hook rather than an
+    # unconditional emission on every target.
+    if (vamodel.vector_count_reg >= 0) {
+        val al: Result[bool, str] = emit_mov(ctx, mb,
+            op_preg(vamodel.vector_count_reg::u32), op_imm(fp_used::i64));
+        if (is_err[bool, str](al)) { ret al; }
+    }
 
     # the call itself: the caller-saved clobber barrier (see MIR_CALL docs).
     val rcall: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 1::usize);
@@ -3853,25 +3975,27 @@ fun lower_params(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
 # — see `lower_params`).
 fun emit_param_slot(ctx: *LowerCtx, mb: *MirBlock, slot: abi.ParamSlot, pv: u32, size: u64,
                     stack_off: i64, is_aggr: bool) Result[bool, str] {
+    # incoming stack parameters are addressed off the ISA's frame pointer at the
+    # arch's incoming-argument base (`[fp + incoming_arg_base + off]`), both named
+    # through the ISA vtable rather than bare literals.
+    val arg_base: i64 = ctx.tgt.arch.incoming_arg_base;
     if (slot.class == abi.CLASS_STACK_BYREF) {
         # win64 by-reference overflow: the caller stored the hidden aggregate
         # pointer into this stack slot; load it so `pv` is the aggregate's address,
         # matching the register BYREF parameter form.
         val fp: u32 = ctx.tgt.arch.frame_ptr_reg::u32;
-        ret emit_mov(ctx, mb, op_vreg(pv), op_mem_preg(fp, 16 + stack_off));
+        ret emit_mov(ctx, mb, op_vreg(pv), op_mem_preg(fp, arg_base + stack_off));
     }
     if (slot.class == abi.CLASS_STACK) {
-        # incoming stack parameters are addressed off the ISA's frame pointer
-        # (x86-64 RBP), named through `tgt.arch.frame_ptr_reg` rather than a literal.
         val fp: u32 = ctx.tgt.arch.frame_ptr_reg::u32;
         if (is_aggr) {
             # the aggregate's bytes already sit in the caller's by-value stack copy;
             # `pv` is its address so reads / the local copy index it directly.
-            ret emit_lea_preg(ctx, mb, pv, fp, 16 + stack_off);
+            ret emit_lea_preg(ctx, mb, pv, fp, arg_base + stack_off);
         }
         # a scalar stack argument lives above the return address and saved frame
         # pointer, addressed through the physical frame pointer at the running offset.
-        ret emit_mov(ctx, mb, op_vreg(pv), op_mem_preg(fp, 16 + stack_off));
+        ret emit_mov(ctx, mb, op_vreg(pv), op_mem_preg(fp, arg_base + stack_off));
     }
     if (slot.class == abi.CLASS_BYREF) {
         ret emit_mov(ctx, mb, op_vreg(pv), op_preg(slot.reg::u32));
@@ -4017,7 +4141,14 @@ fun emit_va_save_prologue(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
     if (is_err[bool, str](cls)) { ret cls; }
     ctx.va_named_gp     = layout.gp_used;
     ctx.va_named_fp     = layout.fp_used;
-    ctx.va_overflow_off = 16 + layout.stack_off;
+    # the home model is strictly one positional slot per argument, so the named
+    # slots are the fixed params plus a hidden sret pointer (a CLASS_SRET return
+    # consumes positional slot 0). counts stack-passed named params that the
+    # register cursors do not, so `va_start` seeds past every named argument.
+    var named_slots: i32 = layout.param_count::i32;
+    if (layout.ret_slot.class == abi.CLASS_SRET) { named_slots = named_slots + 1; }
+    ctx.va_named_slots  = named_slots;
+    ctx.va_overflow_off = ctx.tgt.arch.incoming_arg_base + layout.stack_off;
     sig_layout_free(ctx, ?layout);
     ctx.va_active = true;
 
@@ -4032,15 +4163,16 @@ fun emit_va_save_prologue(ctx: *LowerCtx, mb: *MirBlock) Result[bool, str] {
 # SLOT_ALLOCA frame slot keyed on a fresh slot-key vreg (`va_save_vreg`), sized by
 # the active ABI's `va_save_size`. the GP argument registers are stored at offsets
 # 0,8,..,40 and the FP argument registers at `va_fp_save_offset()` + i*16 —
-# matching the AMD64 `__va_list_tag` register-save layout the `va_arg` field
-# offsets index. all SysV register-file / layout facts are read through `sysv` (its
-# erased vtable casts and layout helpers), keeping the mechanism generic.
+# matching the register-save layout the `va_arg` field offsets index. every layout
+# fact — the save-area size, the FP dump offset, the argument-register files — is
+# read from the `VaModel` and the ABI vtable's register-file accessors, so the
+# mechanism names no convention module.
 fun emit_va_save_regsave(ctx: *LowerCtx, mb: *MirBlock, model: *abi.VaModel) Result[bool, str] {
     # the register-save area: one addressed alloca slot keyed on a slot-key vreg.
     val skr: Result[u32, str] = new_vreg(ctx, REG_CLASS_GP);
     if (is_err[u32, str](skr)) { ret err[bool, str](unwrap_err[u32, str](skr)); }
     val sk: u32 = unwrap_ok[u32, str](skr);
-    val ar: Result[bool, str] = add_alloca_slot(ctx, sk, sysv.va_save_size(), 8);
+    val ar: Result[bool, str] = add_alloca_slot(ctx, sk, model.save_size, 8);
     if (is_err[bool, str](ar)) { ret ar; }
     ctx.va_save_vreg = sk;
 
@@ -4063,34 +4195,38 @@ fun emit_va_save_regsave(ctx: *LowerCtx, mb: *MirBlock, model: *abi.VaModel) Res
     # [save+i*16], xmm_i` in the encoder, keeping the conditional spill in one block
     # (no entry-block CFG split). its base is the save-area slot at the FP region's
     # start; its count is the convention's FP argument-register file size.
-    val sp: Result[bool, str] = emit_va_fp_save(ctx, mb, sk);
+    val sp: Result[bool, str] = emit_va_fp_save(ctx, mb, sk, model);
     if (is_err[bool, str](sp)) { ret sp; }
     ret ok[bool, str](true);
 }
 
 # emit_va_save_home: spill the integer argument registers that hold UNNAMED
 # arguments into the caller's home/shadow space (win64). the home area sits just
-# above the saved frame pointer and return address (`model.home_base_off`,
+# above the saved frame pointer and return address (the ISA's `incoming_arg_base`,
 # `[rbp+16]`), one 8-byte slot per positional argument register (RCX/RDX/R8/R9);
 # the caller always reserves it. the named parameters already occupy the first
-# `va_named_gp + va_named_fp` positional slots (`lower_params` pre-colored them
-# from their registers), so this stores `slot_gp_reg(i)` into `[rbp + base + i*8]`
-# for each remaining positional slot, making the named and unnamed arguments one
-# contiguous stack array; `va_start` then seeds the va_list pointer just past the
-# named arguments. there is NO frame-local save area, so `va_save_vreg` stays
-# NIL and the frame reserves no va-save slot — the home spill targets the caller's
-# frame. a variadic float rides both its XMM register and the matching integer
-# register, so spilling the integer registers alone captures every unnamed
-# argument (`fp_save_count` is 0 for this model).
+# `va_named_gp + va_named_fp` REGISTER positional slots (`lower_params` pre-colored
+# them from their registers), so this stores `slot_gp_reg(i)` into
+# `[rbp + base + i*8]` for each remaining register slot, making the named and
+# unnamed arguments one contiguous stack array; `va_start` then seeds the va_list
+# pointer just past the named arguments. there is NO frame-local save area, so
+# `va_save_vreg` stays NIL and the frame reserves no va-save slot — the home spill
+# targets the caller's frame. a variadic float rides both its XMM register and the
+# matching integer register, so spilling the integer registers alone captures every
+# unnamed argument (`fp_save_count` is 0 for this model).
 fun emit_va_save_home(ctx: *LowerCtx, mb: *MirBlock, model: *abi.VaModel) Result[bool, str] {
-    val named: i32 = ctx.va_named_gp + ctx.va_named_fp;
+    # the number of register-passed named arguments is the start of the unnamed
+    # register slots; a named param spilled to the stack consumed no register, so
+    # this is the right (register-count) quantity, not the full positional count.
+    val named_regs: i32 = ctx.va_named_gp + ctx.va_named_fp;
+    val base: i64 = ctx.tgt.arch.incoming_arg_base;
     val fp: u32 = ctx.tgt.arch.frame_ptr_reg::u32;
-    var si: i32 = named;
+    var si: i32 = named_regs;
     for (si < model.gp_save_count) {
         var greg: i32 = 0;
         val gr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, si, ?greg);
         if (is_err[bool, str](gr)) { ret gr; }
-        val off: i64 = model.home_base_off + si::i64 * 8;
+        val off: i64 = base + si::i64 * 8;
         val st: Result[bool, str] = emit_store_to(ctx, mb, op_mem_preg(fp, off), op_preg(greg::u32));
         if (is_err[bool, str](st)) { ret st; }
         si = si + 1;
@@ -4100,18 +4236,19 @@ fun emit_va_save_home(ctx: *LowerCtx, mb: *MirBlock, model: *abi.VaModel) Result
 
 # emit_va_fp_save: append the AL-guarded FP-register spill pseudo to the prologue.
 # `save_vreg` is the register-save area's slot-key vreg; operand 0 addresses the FP
-# region at `va_fp_save_offset` within it, operand 1 carries the FP argument-register
-# count, operand 2 is a MIR_OP_PREG use of the vector-count register (AL/RAX) the
-# guard reads. the encoder expands operands 0-1 into the conditional XMM dump (see
-# MIR_VA_FP_SAVE); operand 2 is invisible to the encoder but makes the AL read
-# visible to regalloc so no value vreg is colored to that register before the guard.
-fun emit_va_fp_save(ctx: *LowerCtx, mb: *MirBlock, save_vreg: u32) Result[bool, str] {
+# region at the model's `fp_save_offset` within it, operand 1 carries the FP
+# argument-register count (`fp_save_count`), operand 2 is a MIR_OP_PREG use of the
+# model's vector-count register (AL/RAX) the guard reads. the encoder expands
+# operands 0-1 into the conditional XMM dump (see MIR_VA_FP_SAVE); operand 2 is
+# invisible to the encoder but makes the AL read visible to regalloc so no value
+# vreg is colored to that register before the guard.
+fun emit_va_fp_save(ctx: *LowerCtx, mb: *MirBlock, save_vreg: u32, model: *abi.VaModel) Result[bool, str] {
     val r: Result[*MirOperand, str] = allocate[MirOperand](ctx.alloc, 3::usize);
     if (is_err[*MirOperand, str](r)) { ret err[bool, str](unwrap_err[*MirOperand, str](r)); }
     val ops: *MirOperand = unwrap_ok[*MirOperand, str](r);
-    ops[0] = op_mem_slot(save_vreg, sysv.va_fp_save_offset()::i64);
-    ops[1] = op_imm(sysv.FP_PARAM_COUNT::i64);
-    ops[2] = op_preg(sysv.VA_VECTOR_COUNT_REG::u32);
+    ops[0] = op_mem_slot(save_vreg, model.fp_save_offset::i64);
+    ops[1] = op_imm(model.fp_save_count::i64);
+    ops[2] = op_preg(model.vector_count_reg::u32);
     var mi: MirInstr;
     mi.opcode        = MIR_VA_FP_SAVE;
     mi.operands      = ops;
@@ -4139,7 +4276,7 @@ fun lower_va_start(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Resu
     if (model.kind == abi.VA_MODEL_HOME) {
         ret lower_va_start_home(ctx, mb, inst, ?model);
     }
-    ret lower_va_start_regsave(ctx, mb, inst);
+    ret lower_va_start_regsave(ctx, mb, inst, ?model);
 }
 
 # lower_va_start_regsave: initialize the SysV `__va_list_tag`. with `ap` the
@@ -4148,26 +4285,27 @@ fun lower_va_start(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Resu
 #   fp_offset         = GP area size + named FP regs * 16
 #   reg_save_area     = &register-save slot
 #   overflow_arg_area = &first incoming stack argument (`[rbp + overflow_off]`)
-# all four fields at the SysV `VA_*` offsets the lowering and `va_arg` share.
-fun lower_va_start_regsave(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction) Result[bool, str] {
+# all four fields at the model's `__va_list_tag` offsets the lowering and `va_arg`
+# share.
+fun lower_va_start_regsave(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, model: *abi.VaModel) Result[bool, str] {
     # base address of the va_list struct (the `ap` pointer operand).
     val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
 
     # gp_offset = named GP regs * 8.
     val gp_init: i64 = ctx.va_named_gp::i64 * 8;
-    val sg: Result[bool, str] = emit_store_imm(ctx, mb, va_field_mem(apbase, sysv.VA_GP_OFFSET), gp_init, 4);
+    val sg: Result[bool, str] = emit_store_imm(ctx, mb, va_field_mem(apbase, model.gp_offset_field), gp_init, 4);
     if (is_err[bool, str](sg)) { ret sg; }
 
-    # fp_offset = GP area size + named FP regs * 16.
-    val fp_init: i64 = sysv.va_fp_save_offset()::i64 + ctx.va_named_fp::i64 * 16;
-    val sf: Result[bool, str] = emit_store_imm(ctx, mb, va_field_mem(apbase, sysv.VA_FP_OFFSET), fp_init, 4);
+    # fp_offset = FP region offset + named FP regs * per-XMM stride.
+    val fp_init: i64 = model.fp_save_offset::i64 + ctx.va_named_fp::i64 * model.fp_save_stride::i64;
+    val sf: Result[bool, str] = emit_store_imm(ctx, mb, va_field_mem(apbase, model.fp_offset_field), fp_init, 4);
     if (is_err[bool, str](sf)) { ret sf; }
 
     # reg_save_area = &register-save slot.
     var rsa: u32 = MIR_VREG_NIL;
     val lr: Result[bool, str] = emit_lea_slot(ctx, mb, op_mem_slot(ctx.va_save_vreg, 0), ?rsa);
     if (is_err[bool, str](lr)) { ret lr; }
-    val sr: Result[bool, str] = emit_store_to(ctx, mb, va_field_mem(apbase, sysv.VA_REG_SAVE_AREA), op_vreg(rsa));
+    val sr: Result[bool, str] = emit_store_to(ctx, mb, va_field_mem(apbase, model.reg_save_field), op_vreg(rsa));
     if (is_err[bool, str](sr)) { ret sr; }
 
     # overflow_arg_area = &first incoming stack argument (`[rbp + overflow_off]`).
@@ -4175,20 +4313,22 @@ fun lower_va_start_regsave(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instructi
     var ovf: u32 = MIR_VREG_NIL;
     val lo: Result[bool, str] = emit_lea_slot(ctx, mb, op_mem_preg(fp, ctx.va_overflow_off), ?ovf);
     if (is_err[bool, str](lo)) { ret lo; }
-    ret emit_store_to(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), op_vreg(ovf));
+    ret emit_store_to(ctx, mb, va_field_mem(apbase, model.overflow_field), op_vreg(ovf));
 }
 
 # lower_va_start_home: seed the win64 single-pointer va_list. the named and unnamed
 # arguments form one contiguous stack array starting at the caller's first home slot
-# (`[rbp + home_base_off]`, where `emit_va_save_home` spilled the integer argument
-# registers); the named parameters occupy the first `va_named_gp + va_named_fp`
-# positional slots, so the first unnamed argument is at `[rbp + home_base_off +
-# named*8]`. store that address into the va_list pointer (field offset 0); `va_arg`
-# then reads `arg_stride` bytes and advances the pointer.
+# (`[rbp + incoming_arg_base]`, where `emit_va_save_home` spilled the integer
+# argument registers); the named parameters occupy the first `va_named_slots`
+# positional slots (every named argument, register- AND stack-passed, plus a hidden
+# sret pointer), so the first unnamed argument is at `[rbp + incoming_arg_base +
+# named_slots*8]`. store that address into the va_list pointer (field offset 0);
+# `va_arg` then reads `arg_stride` bytes and advances the pointer. using the full
+# positional slot count (not the register-passed count) keeps the cursor correct
+# when more than four named parameters precede the varargs.
 fun lower_va_start_home(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, model: *abi.VaModel) Result[bool, str] {
     val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
-    val named: i32 = ctx.va_named_gp + ctx.va_named_fp;
-    val first_off: i64 = model.home_base_off + named::i64 * 8;
+    val first_off: i64 = ctx.tgt.arch.incoming_arg_base + ctx.va_named_slots::i64 * 8;
     val fp: u32 = ctx.tgt.arch.frame_ptr_reg::u32;
     var ap0: u32 = MIR_VREG_NIL;
     val la: Result[bool, str] = emit_lea_slot(ctx, mb, op_mem_preg(fp, first_off), ?ap0);
@@ -4258,23 +4398,23 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
         ret lower_va_arg_home(ctx, mb, inst, dst, ?vmodel);
     }
     if (value_is_float(ctx, inst.ty)) {
-        ret lower_va_arg_fp(ctx, mb, inst, dst);
+        ret lower_va_arg_fp(ctx, mb, inst, dst, ?vmodel);
     }
     if (value_is_aggregate(ctx, inst.ty)) {
-        ret lower_va_arg_aggregate(ctx, mb, inst, dst);
+        ret lower_va_arg_aggregate(ctx, mb, inst, dst, ?vmodel);
     }
 
     val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
 
     # gp = load.i32 [ap + gp_offset]; gp64 = zext gp.
     var gp: u32 = MIR_VREG_NIL;
-    val lg: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_GP_OFFSET), 4, ?gp);
+    val lg: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, vmodel.gp_offset_field), 4, ?gp);
     if (is_err[bool, str](lg)) { ret lg; }
 
     # in_reg = gp < gp_offset_max  (u32 compare -> i8 boolean).
     var in_reg: u32 = MIR_VREG_NIL;
     val cr: Result[bool, str] = emit_alu3(ctx, mb, MIR_CMP_LT_U, op_vreg(gp),
-        op_imm(sysv.va_gp_offset_max()::i64), 4, ?in_reg);
+        op_imm(vmodel.gp_offset_max::i64), 4, ?in_reg);
     if (is_err[bool, str](cr)) { ret cr; }
 
     # mask = 0 - zext(in_reg)  -> 0 or 0xFFFFFFFFFFFFFFFF (64-bit).
@@ -4290,7 +4430,7 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
 
     # reg_addr = reg_save_area + zext(gp).
     var rsa: u32 = MIR_VREG_NIL;
-    val lr: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_REG_SAVE_AREA), 8, ?rsa);
+    val lr: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, vmodel.reg_save_field), 8, ?rsa);
     if (is_err[bool, str](lr)) { ret lr; }
     var gp64: u32 = MIR_VREG_NIL;
     val gzr: Result[bool, str] = emit_zext_to(ctx, mb, op_vreg(gp), 4, ?gp64);
@@ -4301,7 +4441,7 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
 
     # ovf = overflow_arg_area.
     var ovf: u32 = MIR_VREG_NIL;
-    val lo: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), 8, ?ovf);
+    val lo: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, vmodel.overflow_field), 8, ?ovf);
     if (is_err[bool, str](lo)) { ret lo; }
 
     # addr = (reg_addr & mask) | (ovf & ~mask).
@@ -4322,7 +4462,7 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
     var new_gp: u32 = MIR_VREG_NIL;
     val ng: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(gp), op_vreg(step_gp), 4, ?new_gp);
     if (is_err[bool, str](ng)) { ret ng; }
-    val wg: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_GP_OFFSET), op_vreg(new_gp), 4);
+    val wg: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, vmodel.gp_offset_field), op_vreg(new_gp), 4);
     if (is_err[bool, str](wg)) { ret wg; }
 
     # overflow_arg_area += (8 & ~mask): advance only when the overflow area was used.
@@ -4332,7 +4472,7 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
     var new_ov: u32 = MIR_VREG_NIL;
     val no: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(ovf), op_vreg(step_ov), 8, ?new_ov);
     if (is_err[bool, str](no)) { ret no; }
-    val wo: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), op_vreg(new_ov), 8);
+    val wo: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, vmodel.overflow_field), op_vreg(new_ov), 8);
     if (is_err[bool, str](wo)) { ret wo; }
 
     # result = load.T [addr], at the result type's width.
@@ -4368,18 +4508,19 @@ fun lower_va_arg(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, iid: i
 #   result = fmov.T [addr]                    (MOVSS / MOVSD into the FP-class dst)
 # the address arithmetic / select runs in GP vregs; only the final load is a float
 # move so the value lands in the XMM-classed result vreg.
-fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst: u32) Result[bool, str] {
+fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst: u32,
+                    model: *abi.VaModel) Result[bool, str] {
     val apbase: MirOperand = mem_operand_of(ctx, inst.operands[0]);
 
     # fp = load.i32 [ap + fp_offset].
     var fp: u32 = MIR_VREG_NIL;
-    val lf: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_FP_OFFSET), 4, ?fp);
+    val lf: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, model.fp_offset_field), 4, ?fp);
     if (is_err[bool, str](lf)) { ret lf; }
 
     # in_reg = fp < fp_offset_max  (u32 compare -> i8 boolean).
     var in_reg: u32 = MIR_VREG_NIL;
     val cr: Result[bool, str] = emit_alu3(ctx, mb, MIR_CMP_LT_U, op_vreg(fp),
-        op_imm(sysv.va_fp_offset_max()::i64), 4, ?in_reg);
+        op_imm(model.fp_offset_max::i64), 4, ?in_reg);
     if (is_err[bool, str](cr)) { ret cr; }
 
     # mask = 0 - zext(in_reg)  -> 0 or 0xFFFFFFFFFFFFFFFF (64-bit).
@@ -4395,7 +4536,7 @@ fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst
 
     # reg_addr = reg_save_area + zext(fp).
     var rsa: u32 = MIR_VREG_NIL;
-    val lr: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_REG_SAVE_AREA), 8, ?rsa);
+    val lr: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, model.reg_save_field), 8, ?rsa);
     if (is_err[bool, str](lr)) { ret lr; }
     var fp64: u32 = MIR_VREG_NIL;
     val fzr: Result[bool, str] = emit_zext_to(ctx, mb, op_vreg(fp), 4, ?fp64);
@@ -4406,7 +4547,7 @@ fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst
 
     # ovf = overflow_arg_area.
     var ovf: u32 = MIR_VREG_NIL;
-    val lo: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), 8, ?ovf);
+    val lo: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, model.overflow_field), 8, ?ovf);
     if (is_err[bool, str](lo)) { ret lo; }
 
     # addr = (reg_addr & mask) | (ovf & ~mask).
@@ -4420,14 +4561,14 @@ fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst
     val r3: Result[bool, str] = emit_alu3(ctx, mb, MIR_OR, op_vreg(ra_m), op_vreg(ov_m), 8, ?addr);
     if (is_err[bool, str](r3)) { ret r3; }
 
-    # fp_offset += (16 & mask32): advance by an XMM save stride when a register was used.
+    # fp_offset += (stride & mask32): advance by the per-XMM save stride when a register was used.
     var step_fp: u32 = MIR_VREG_NIL;
-    val sf: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_imm(16), op_vreg(mask), 4, ?step_fp);
+    val sf: Result[bool, str] = emit_alu3(ctx, mb, MIR_AND, op_imm(model.fp_save_stride::i64), op_vreg(mask), 4, ?step_fp);
     if (is_err[bool, str](sf)) { ret sf; }
     var new_fp: u32 = MIR_VREG_NIL;
     val nf: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(fp), op_vreg(step_fp), 4, ?new_fp);
     if (is_err[bool, str](nf)) { ret nf; }
-    val wf: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_FP_OFFSET), op_vreg(new_fp), 4);
+    val wf: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, model.fp_offset_field), op_vreg(new_fp), 4);
     if (is_err[bool, str](wf)) { ret wf; }
 
     # overflow_arg_area += (8 & ~mask): advance by one eightbyte when the overflow area was used.
@@ -4437,7 +4578,7 @@ fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst
     var new_ov: u32 = MIR_VREG_NIL;
     val no: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(ovf), op_vreg(step_ov), 8, ?new_ov);
     if (is_err[bool, str](no)) { ret no; }
-    val wo: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), op_vreg(new_ov), 8);
+    val wo: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, model.overflow_field), op_vreg(new_ov), 8);
     if (is_err[bool, str](wo)) { ret wo; }
 
     # result = fmov.T [addr]: a float move so the value lands in the XMM-classed dst.
@@ -4470,7 +4611,8 @@ fun lower_va_arg_fp(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst
 #   gp_offset         += (gp_bytes      & mask32)
 #   overflow_arg_area  = (overflow & mask) | ((ovf_al + stack_slot_bytes(size)) & ~mask)
 #   copy size bytes from [src] into the result storage
-fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst: u32) Result[bool, str] {
+fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, dst: u32,
+                           model: *abi.VaModel) Result[bool, str] {
     val rok: Result[bool, str] = require_abi(ctx.tgt);
     if (is_err[bool, str](rok)) { ret rok; }
 
@@ -4482,9 +4624,9 @@ fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instructi
     # hidden pointer, one GP eightbyte) for a >16B aggregate, two GP eightbytes for a
     # 9-16B aggregate, one for a <=8B aggregate. the runtime gp_offset cursor — not
     # gp_used — decides registers vs overflow below.
-    val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
+    val classify_arg: abi.ArgPassingFn = ctx.tgt.abi.arg_passing::abi.ArgPassingFn;
     val align: u64 = ir_type.byte_align(ctx.types, inst.ty, ctx.tgt)::u64;
-    val slot:  abi.ParamSlot = classify_arg(ctx.tgt.arch_id, 0, size, align, false, true, 0, 0);
+    val slot:  abi.ParamSlot = classify_arg(0, size, align, false, 0, true, 0, 0);
     val byref: bool = slot.class == abi.CLASS_BYREF;
     var gp_bytes: i64 = 8;
     if (!byref && slot.reg2 >= 0) { gp_bytes = 16; }
@@ -4496,11 +4638,11 @@ fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instructi
 
     # gp = load.i32 [ap + gp_offset].
     var gp: u32 = MIR_VREG_NIL;
-    val lg: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_GP_OFFSET), 4, ?gp);
+    val lg: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, model.gp_offset_field), 4, ?gp);
     if (is_err[bool, str](lg)) { ret lg; }
 
     # in_reg = gp < (gp_offset_max - gp_bytes + 1): the operand's eightbytes all fit.
-    val thr: i64 = sysv.va_gp_offset_max()::i64 - gp_bytes + 1;
+    val thr: i64 = model.gp_offset_max::i64 - gp_bytes + 1;
     var in_reg: u32 = MIR_VREG_NIL;
     val cr: Result[bool, str] = emit_alu3(ctx, mb, MIR_CMP_LT_U, op_vreg(gp), op_imm(thr), 4, ?in_reg);
     if (is_err[bool, str](cr)) { ret cr; }
@@ -4518,7 +4660,7 @@ fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instructi
 
     # reg_base = reg_save_area + zext(gp).
     var rsa: u32 = MIR_VREG_NIL;
-    val lr: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_REG_SAVE_AREA), 8, ?rsa);
+    val lr: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, model.reg_save_field), 8, ?rsa);
     if (is_err[bool, str](lr)) { ret lr; }
     var gp64: u32 = MIR_VREG_NIL;
     val gzr: Result[bool, str] = emit_zext_to(ctx, mb, op_vreg(gp), 4, ?gp64);
@@ -4540,7 +4682,7 @@ fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instructi
 
     # ovf = overflow_arg_area; ovf_al = (ovf + 7) & ~7 (eight-byte granular overflow).
     var ovf: u32 = MIR_VREG_NIL;
-    val lo: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), 8, ?ovf);
+    val lo: Result[bool, str] = emit_load_w(ctx, mb, va_field_mem(apbase, model.overflow_field), 8, ?ovf);
     if (is_err[bool, str](lo)) { ret lo; }
     var ovf_up: u32 = MIR_VREG_NIL;
     val au: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(ovf), op_imm(7), 8, ?ovf_up);
@@ -4567,7 +4709,7 @@ fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instructi
     var new_gp: u32 = MIR_VREG_NIL;
     val ng: Result[bool, str] = emit_alu3(ctx, mb, MIR_ADD, op_vreg(gp), op_vreg(step_gp), 4, ?new_gp);
     if (is_err[bool, str](ng)) { ret ng; }
-    val wg: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_GP_OFFSET), op_vreg(new_gp), 4);
+    val wg: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, model.gp_offset_field), op_vreg(new_gp), 4);
     if (is_err[bool, str](wg)) { ret wg; }
 
     # overflow_arg_area = (ovf & mask) | ((ovf_al + stack_slot_bytes(size)) & ~mask):
@@ -4587,7 +4729,7 @@ fun lower_va_arg_aggregate(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instructi
     var new_ovf: u32 = MIR_VREG_NIL;
     val ok3: Result[bool, str] = emit_alu3(ctx, mb, MIR_OR, op_vreg(ovf_keep), op_vreg(ovf_take), 8, ?new_ovf);
     if (is_err[bool, str](ok3)) { ret ok3; }
-    val wo: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, sysv.VA_OVERFLOW_ARG_AREA), op_vreg(new_ovf), 8);
+    val wo: Result[bool, str] = emit_store_to_w(ctx, mb, va_field_mem(apbase, model.overflow_field), op_vreg(new_ovf), 8);
     if (is_err[bool, str](wo)) { ret wo; }
 
     # copy the aggregate's bytes from the selected source into the result storage.
@@ -4633,8 +4775,8 @@ fun lower_va_arg_home(ctx: *LowerCtx, mb: *MirBlock, inst: *instr.Instruction, d
 
         # classify the aggregate to learn whether the slot holds it by value or a
         # hidden pointer to it.
-        val classify_arg: sysv.ArgPassingFn = ctx.tgt.abi.arg_passing::sysv.ArgPassingFn;
-        val slot: abi.ParamSlot = classify_arg(ctx.tgt.arch_id, 0, size, align, false, true, 0, 0);
+        val classify_arg: abi.ArgPassingFn = ctx.tgt.abi.arg_passing::abi.ArgPassingFn;
+        val slot: abi.ParamSlot = classify_arg(0, size, align, false, 0, true, 0, 0);
         val byref: bool = slot.class == abi.CLASS_BYREF;
 
         # back the result vreg with caller-owned storage so downstream copies / stores
