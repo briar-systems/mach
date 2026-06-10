@@ -1170,86 +1170,138 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
                      dyn: *DynState) Result[bool, str] {
     # intern the abstract relocation-kind names once for fast comparison.
     val kinds: RelocKindIds = intern_reloc_kinds(s);
+    val alloc: *Allocator = s.alloc;
 
     var m: u32 = 0;
     for (m < module_count) {
-        var ri: u32 = 0;
-        for (ri < modules[m].reloc_count) {
-            val r: *of.Relocation = ?modules[m].relocations[ri];
-            # a corrupt object can name an out-of-range section, or an offset past
-            # the end of its own section (which would wrap the u32 patch cursor and
-            # scribble outside the merged buffer). reject both loudly instead of
-            # silently dropping the relocation, which would ship an executable with
-            # an unpatched site.
-            if (r.section >= modules[m].section_count) {
-                ret err[bool, str]("linker: relocation names an out-of-range section");
-            }
-            if (r.offset > modules[m].sections[r.section].len) {
-                ret err[bool, str]("linker: relocation offset is past the end of its section");
-            }
+        # build module m's local-name -> vaddr index once, replacing the per-
+        # relocation linear symbol-table scan (an O(relocations x symbols) hot path
+        # on a self-host link). the index holds only LOCALs; GLOBAL targets resolve
+        # through the cross-object sym_locs table. the map is always freed after the
+        # module's relocations are patched, regardless of outcome.
+        var local_map: map.Map[intern.StrId, u64] =
+            map.init[intern.StrId, u64](alloc, maphash.hash_u32, maphash.eq_u32);
+        val br: Result[bool, str] = build_local_index(modules, m, placements, sec_base, ?local_map);
+        if (is_err[bool, str](br)) {
+            map.dnit[intern.StrId, u64](?local_map);
+            ret err[bool, str](unwrap_err[bool, str](br));
+        }
 
-            # the patch site's location in the merged image. the placement's
-            # merged_index is a section *kind*; map it to the output-section index.
-            val flat: u32 = sec_base[m] + r.section;
-            val pl: *Placement = ?placements[flat];
-            val patch_va: u64 = pl.vaddr + r.offset::u64;
-            val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
-            # a relocation in a section with no merged output, or one whose patch
-            # site lands in a (byteless) BSS section, cannot be applied — that is a
-            # contract violation from a buggy parser/codegen, not a relocation to
-            # quietly skip.
-            if (out_ix == 0xFFFFFFFF) {
-                ret err[bool, str]("linker: relocation targets a section with no merged output");
-            }
-            val dst: *u8 = out_img.sections[out_ix].bytes;
-            if (dst == nil) {
-                ret err[bool, str]("linker: relocation patch site lands in a BSS section");
-            }
-            val patch_off: u32 = pl.offset + r.offset;
+        val pr: Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
+            placements, sec_base, sym_locs, dyn, ?kinds, ?local_map);
+        map.dnit[intern.StrId, u64](?local_map);
+        if (is_err[bool, str](pr)) { ret err[bool, str](unwrap_err[bool, str](pr)); }
 
-            # locate the target symbol's final virtual address. a LOCAL target is
-            # private to module `m`; resolve it against `m`'s own definition.
-            # GLOBAL targets (and undefined externs) resolve by name via sym_locs.
-            var sym_va: u64 = 0;
-            val lv: Result[u64, str] =
-                local_symbol_vaddr(modules, module_count, m, r.symbol, placements, sec_base);
-            if (is_ok[u64, str](lv)) {
-                sym_va = unwrap_ok[u64, str](lv);
+        m = m + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# build_local_index: fill `out` with module `m`'s LOCAL (object-private) symbol
+# definitions, name -> final virtual address. the first definition of a name wins,
+# mirroring the linear scan it replaces. EXTERNAL, out-of-range, and GLOBAL symbols
+# are excluded — globals live in the cross-object table.
+fun build_local_index(modules: *of.ObjectImage, m: u32, placements: *Placement, sec_base: *u32,
+                      out: *map.Map[intern.StrId, u64]) Result[bool, str] {
+    var sy: u32 = 0;
+    for (sy < modules[m].symbol_count) {
+        val sym: *of.Symbol = ?modules[m].symbols[sy];
+        if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
+        if (sym.section >= modules[m].section_count) { sy = sy + 1; cnt; }
+        if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { sy = sy + 1; cnt; }
+
+        if (is_err[*u64, str](map.get[intern.StrId, u64](out, ?sym.name))) {
+            val flat: u32 = sec_base[m] + sym.section;
+            val va: u64 = placements[flat].vaddr + sym.offset::u64;
+            val ins: Result[bool, str] = map.insert[intern.StrId, u64](out, sym.name, va);
+            if (is_err[bool, str](ins)) { ret err[bool, str](unwrap_err[bool, str](ins)); }
+        }
+        sy = sy + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# patch_module_relocations: apply every relocation in module `m` into the merged
+# bytes. a LOCAL target resolves through `local_map` (module `m`'s private index);
+# a GLOBAL target (or an undefined extern) resolves by name through `sym_locs`, and
+# an unresolved pc-relative call to a function import is deferred as a PltFixup.
+fun patch_module_relocations(s: *sess.Session, out_img: *of.ObjectImage,
+                             modules: *of.ObjectImage, m: u32,
+                             placements: *Placement, sec_base: *u32,
+                             sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
+                             kinds: *RelocKindIds, local_map: *map.Map[intern.StrId, u64]) Result[bool, str] {
+    var ri: u32 = 0;
+    for (ri < modules[m].reloc_count) {
+        val r: *of.Relocation = ?modules[m].relocations[ri];
+        # a corrupt object can name an out-of-range section, or an offset past the
+        # end of its own section (which would wrap the u32 patch cursor and scribble
+        # outside the merged buffer). reject both loudly instead of silently dropping
+        # the relocation, which would ship an executable with an unpatched site.
+        if (r.section >= modules[m].section_count) {
+            ret err[bool, str]("linker: relocation names an out-of-range section");
+        }
+        if (r.offset > modules[m].sections[r.section].len) {
+            ret err[bool, str]("linker: relocation offset is past the end of its section");
+        }
+
+        # the patch site's location in the merged image. the placement's
+        # merged_index is a section *kind*; map it to the output-section index.
+        val flat: u32 = sec_base[m] + r.section;
+        val pl: *Placement = ?placements[flat];
+        val patch_va: u64 = pl.vaddr + r.offset::u64;
+        val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
+        # a relocation in a section with no merged output, or one whose patch site
+        # lands in a (byteless) BSS section, cannot be applied — that is a contract
+        # violation from a buggy parser/codegen, not a relocation to quietly skip.
+        if (out_ix == 0xFFFFFFFF) {
+            ret err[bool, str]("linker: relocation targets a section with no merged output");
+        }
+        val dst: *u8 = out_img.sections[out_ix].bytes;
+        if (dst == nil) {
+            ret err[bool, str]("linker: relocation patch site lands in a BSS section");
+        }
+        val patch_off: u32 = pl.offset + r.offset;
+
+        # locate the target symbol's final virtual address. a LOCAL target is
+        # private to module `m`; resolve it through `m`'s local index. GLOBAL targets
+        # (and undefined externs) resolve by name via sym_locs.
+        var sym_va: u64 = 0;
+        val lvm: Result[*u64, str] = map.get[intern.StrId, u64](local_map, ?r.symbol);
+        if (is_ok[*u64, str](lvm)) {
+            sym_va = @unwrap_ok[*u64, str](lvm);
+        }
+        or {
+            val sl: Result[*SymbolLoc, str] =
+                map.get[intern.StrId, SymbolLoc](sym_locs, ?r.symbol);
+            if (is_ok[*SymbolLoc, str](sl)) {
+                sym_va = unwrap_ok[*SymbolLoc, str](sl).vaddr;
             }
             or {
-                val sl: Result[*SymbolLoc, str] =
-                    map.get[intern.StrId, SymbolLoc](sym_locs, ?r.symbol);
-                if (is_ok[*SymbolLoc, str](sl)) {
-                    sym_va = unwrap_ok[*SymbolLoc, str](sl).vaddr;
+                # not defined anywhere: a dynamic import, or a hard error. a
+                # pc-relative call to a FUNCTION import is deferred to the writer
+                # (only function imports get a PLT stub); any other unresolved
+                # reference — including a call kind against a data import (deferred)
+                # — is rejected as undefined.
+                val imp: Result[u32, str] = dynstate_import_index(dyn, r.symbol);
+                if (is_ok[u32, str](imp) && is_call_kind(kinds, r.kind)
+                    && dynstate_import_is_func(dyn, unwrap_ok[u32, str](imp))) {
+                    val rec_r: Result[bool, str] = dynstate_add_fixup(s, dyn,
+                        segment_index_for(out_img, out_ix), patch_off,
+                        unwrap_ok[u32, str](imp), patch_va, r.addend);
+                    if (is_err[bool, str](rec_r)) { ret err[bool, str](unwrap_err[bool, str](rec_r)); }
+                    ri = ri + 1; cnt;
                 }
-                or {
-                    # not defined anywhere: a dynamic import, or a hard error. a
-                    # pc-relative call to a FUNCTION import is deferred to the
-                    # writer (only function imports get a PLT stub); any other
-                    # unresolved reference — including a call kind against a data
-                    # import (deferred) — is rejected as undefined.
-                    val imp: Result[u32, str] = dynstate_import_index(dyn, r.symbol);
-                    if (is_ok[u32, str](imp) && is_call_kind(?kinds, r.kind)
-                        && dynstate_import_is_func(dyn, unwrap_ok[u32, str](imp))) {
-                        val rec_r: Result[bool, str] = dynstate_add_fixup(s, dyn,
-                            segment_index_for(out_img, out_ix), patch_off,
-                            unwrap_ok[u32, str](imp), patch_va, r.addend);
-                        if (is_err[bool, str](rec_r)) { ret err[bool, str](unwrap_err[bool, str](rec_r)); }
-                        ri = ri + 1; cnt;
-                    }
-                    ret err[bool, str](undef_message(s, r.symbol));
-                }
+                ret err[bool, str](undef_message(s, r.symbol));
             }
-
-            val pr: Result[bool, str] =
-                apply_one(s, ?kinds, r.kind, dst, patch_off, out_img.sections[out_ix].len, sym_va, r.addend, patch_va, m, r.offset);
-            if (is_err[bool, str](pr)) {
-                ret err[bool, str](unwrap_err[bool, str](pr));
-            }
-
-            ri = ri + 1;
         }
-        m = m + 1;
+
+        val pr: Result[bool, str] =
+            apply_one(s, kinds, r.kind, dst, patch_off, out_img.sections[out_ix].len, sym_va, r.addend, patch_va, m, r.offset);
+        if (is_err[bool, str](pr)) {
+            ret err[bool, str](unwrap_err[bool, str](pr));
+        }
+
+        ri = ri + 1;
     }
     ret ok[bool, str](true);
 }
@@ -1449,40 +1501,6 @@ fun dynstate_add_fixup(s: *sess.Session, dyn: *DynState, seg_index: u32, seg_off
     dyn.fixups[ix].addend       = addend;
     dyn.fixup_count = ix + 1;
     ret ok[bool, str](true);
-}
-
-# local_symbol_vaddr: resolve a relocation target that names a LOCAL (object-
-# private) symbol of module `m` to its final virtual address.
-#
-# scans module `m`'s symbols for a defined (non-external) symbol named `name`
-# that is LOCAL (no GLOBAL flag) and computes its final virtual address the same
-# way collect_symbols rebases a definition: the vaddr of the placement of the
-# symbol's section plus the symbol's offset. returns err when module `m` has no
-# such local symbol, so the caller resolves the name through the cross-object
-# global table instead. mirrors how a real linker keeps locals per-object.
-# ---
-# modules:      parsed input images
-# module_count: number of images
-# m:            index of the module owning the relocation
-# name:         interned name of the referenced symbol
-# placements:   per-input-section placements (carry final vaddrs)
-# sec_base:     per-module base into the flat placement array
-# ret:          the local symbol's final virtual address, or err if none
-fun local_symbol_vaddr(modules: *of.ObjectImage, module_count: u32, m: u32,
-                       name: intern.StrId, placements: *Placement, sec_base: *u32) Result[u64, str] {
-    if (m >= module_count) { ret err[u64, str]("no local"); }
-    var sy: u32 = 0;
-    for (sy < modules[m].symbol_count) {
-        val sym: *of.Symbol = ?modules[m].symbols[sy];
-        if (sym.name != name) { sy = sy + 1; cnt; }
-        if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
-        if (sym.section >= modules[m].section_count) { sy = sy + 1; cnt; }
-        if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { sy = sy + 1; cnt; }
-
-        val flat: u32 = sec_base[m] + sym.section;
-        ret ok[u64, str](placements[flat].vaddr + sym.offset::u64);
-    }
-    ret err[u64, str]("no local");
 }
 
 # apply_one: write a single resolved relocation into the merged bytes. `abs64`
