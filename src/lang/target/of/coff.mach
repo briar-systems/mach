@@ -27,9 +27,9 @@
 # `.idata` import directory + IAT built from the `of.DynamicInfo` plan (one
 # IMAGE_IMPORT_DESCRIPTOR per DynLib, an ILT/IAT thunk per DynImport, a hint/name
 # table). Each `PltFixup` call site is redirected to an import stub that jumps
-# through the IAT slot the loader fills. Exception/unwind tables (`.pdata`/
-# `.xdata`) are not emitted yet: correct unwind needs per-function prologue codes
-# the back end does not produce, and wrong unwind metadata is worse than none.
+# through the IAT slot the loader fills. Per-function exception/unwind tables are
+# emitted for functions whose x86-64 prologue matches the encoder's canonical
+# frame shape.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -39,6 +39,7 @@ use std.types.size.usize;
 
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_contains;
 
 use std.types.result.Result;
 use std.types.result.ok;
@@ -63,6 +64,8 @@ use fs:   std.filesystem;
 use intern: mach.lang.intern;
 use isa:    mach.lang.target.isa;
 use of:     mach.lang.target.of;
+use map:     std.collections.map;
+use maphash: std.collections.map;
 
 # COFF machine type for x86-64.
 val IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -123,6 +126,7 @@ val IMAGE_DLLCHARACTERISTICS_NX_COMPAT: u16 = 0x0100;
 
 # data-directory indices in the PE32+ optional header.
 val IMAGE_DIRECTORY_ENTRY_IMPORT:    u32 = 1;
+val IMAGE_DIRECTORY_ENTRY_EXCEPTION: u32 = 3;
 val IMAGE_DIRECTORY_ENTRY_IAT:       u32 = 12;
 val IMAGE_NUMBEROF_DIRECTORY_ENTRIES: u32 = 16;
 
@@ -143,6 +147,18 @@ val IMPORT_DESCRIPTOR_SIZE: usize = 20;
 val THUNK_SIZE:             usize = 8;
 # the per-function import stub: `jmp qword [rip+disp32]` through the IAT slot.
 val IMPORT_STUB_SIZE:       usize = 6;
+# one RUNTIME_FUNCTION table row (`BeginAddress`, `EndAddress`, `UnwindInfoAddress`).
+val RUNTIME_FUNCTION_SIZE:  usize = 12;
+
+# x64 unwind opcodes / register ids (PE/COFF).
+val UNWIND_VERSION: u8 = 1;
+val UWOP_PUSH_NONVOL: u8 = 0;
+val UWOP_ALLOC_LARGE: u8 = 1;
+val UWOP_ALLOC_SMALL: u8 = 2;
+val UWOP_SET_FPREG: u8 = 3;
+val UWOP_SAVE_NONVOL: u8 = 4;
+val UWOP_SAVE_NONVOL_FAR: u8 = 5;
+val UWREG_RBP: u8 = 5;
 
 # write a u16 little-endian into a buffer.
 fun write_u16_le(buf: *u8, offset: usize, value: u16) {
@@ -394,18 +410,66 @@ fun write_decimal(buf: *u8, off: usize, width: usize, value: u32) {
     }
 }
 
-# find the COFF symbol-table index of the image symbol with interned name
-# `name`. `sym_remap` maps an image symbol index to its COFF symbol-table index
-# (which counts the leading section symbols and their aux records). returns 0
-# when no symbol matches — pointing the relocation at the first section symbol.
-fun find_sym_index(img: *of.ObjectImage, sym_remap: *u32, name: intern.StrId) u32 {
-    if (name == intern.STR_NIL) { ret 0; }
+# resolve a relocation's target symbol to its index in the image symbol table.
+# every relocation must name a symbol the image defines or declares extern (the
+# back end guarantees this — `pack_reloc_externs` declares an extern for any
+# named target the module did not define, and lowering panics before emitting a
+# nameless target). a miss is therefore a back-end invariant violation, returned
+# as an error naming the symbol rather than silently aliased to index 0 (the
+# first section symbol), which would corrupt the link.
+fun reloc_sym_index(img: *of.ObjectImage, sym: intern.StrId) Result[u32, str] {
+    if (sym != intern.STR_NIL) {
+        var i: u32 = 0;
+        for (i < img.symbol_count) {
+            if (img.symbols[i].name == sym) { ret ok[u32, str](i); }
+            i = i + 1;
+        }
+    }
+    ret err[u32, str](unresolved_reloc_message(img.alloc, sym));
+}
+
+# build the "coff: unresolved relocation symbol: <name>" diagnostic, interned so
+# it outlives this call. an unnamed (STR_NIL) target, or interning failure under
+# memory pressure, degrades to the generic static form; the emit still fails.
+fun unresolved_reloc_message(alloc: *Allocator, sym: intern.StrId) str {
+    val generic: str = "coff: relocation references an unresolved symbol";
+    val name: str = resolve(sym);
+    if (name == nil || coff_interner == nil) { ret generic; }
+
+    val pre:  str = "coff: unresolved relocation symbol: ";
+    val lpre: usize = str_len(pre);
+    val lnam: usize = str_len(name);
+    val total: usize = lpre + lnam;
+
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret generic; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    for (k < lpre) { buf[k] = pre[k]; k = k + 1; }
+    var n: usize = 0;
+    for (n < lnam) { buf[lpre + n] = name[n]; n = n + 1; }
+    buf[total] = 0;
+
+    val ir: Result[intern.StrId, str] = intern.intern(coff_interner, buf::str);
+    deallocate[u8](alloc, buf, total + 1);
+    if (is_err[intern.StrId, str](ir)) { ret generic; }
+    val nm: Option[str] = intern.lookup(coff_interner, unwrap_ok[intern.StrId, str](ir));
+    if (is_some[str](nm)) { ret unwrap[str](nm); }
+    ret generic;
+}
+
+# verify every relocation's target symbol resolves to an image symbol, up front
+# before any output is allocated so the error path needs no cleanup. an
+# unresolved target fails the emit naming the symbol instead of silently writing
+# a relocation against the first section symbol.
+fun validate_reloc_symbols(img: *of.ObjectImage) Result[bool, str] {
     var i: u32 = 0;
-    for (i < img.symbol_count) {
-        if (img.symbols[i].name == name) { ret sym_remap[i]; }
+    for (i < img.reloc_count) {
+        val r: Result[u32, str] = reloc_sym_index(img, img.relocations[i].symbol);
+        if (is_err[u32, str](r)) { ret err[bool, str](unwrap_err[u32, str](r)); }
         i = i + 1;
     }
-    ret 0;
+    ret ok[bool, str](true);
 }
 
 # reloc_field_width: the byte width of a relocation's patched field for the COFF
@@ -724,6 +788,12 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) Result[
     val vr: Result[bool, str] = validate_reloc_ranges(img);
     if (is_err[bool, str](vr)) { ret err[bool, str](unwrap_err[bool, str](vr)); }
 
+    # resolve every relocation's target symbol up front, before anything is
+    # allocated, so an unresolved target fails the emit naming the symbol rather
+    # than silently aliasing the first section symbol (index 0).
+    val vrs: Result[bool, str] = validate_reloc_symbols(img);
+    if (is_err[bool, str](vrs)) { ret err[bool, str](unwrap_err[bool, str](vrs)); }
+
     # file layout: header, section headers, per-section raw data, per-section
     # relocation arrays, symbol table, string table. compute each region's file
     # offset up front so section headers can point at their data and relocs.
@@ -908,11 +978,12 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) Result[
             for (ri < img.reloc_count) {
                 if (img.relocations[ri].section == s) {
                     write_u32_le(buf, ro, img.relocations[ri].offset);
-                    var coff_sym: u32 = 0;
-                    if (sym_remap != nil) {
-                        coff_sym = find_sym_index(img, sym_remap, img.relocations[ri].symbol);
-                    }
-                    write_u32_le(buf, ro + 4, coff_sym);
+                    # validate_reloc_symbols proved every reloc resolves, and a
+                    # relocated section implies symbols, so sym_remap is non-nil
+                    # and the lookup cannot miss; the first section symbol is
+                    # never silently aliased.
+                    val rsi: u32 = unwrap_ok[u32, str](reloc_sym_index(img, img.relocations[ri].symbol));
+                    write_u32_le(buf, ro + 4, sym_remap[rsi]);
                     write_u16_le(buf, ro + 8, reloc_type_for(img.relocations[ri].kind));
                     ro = ro + RELOCATION_SIZE;
                 }
@@ -1311,7 +1382,91 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
         s = s + 1;
     }
 
+    # foreign COFF inputs (objects/archives from other toolchains, linked via
+    # explicit object-path arguments) may leave an undefined import's Type field 0
+    # even when every reference is a call relocation. recover the function bit from
+    # the reloc stream so dynamic-import discovery can still bind those call targets
+    # through import stubs. mach's own emitter always stamps DT_FUNCTION on a
+    # call-target import (codegen `pack_reloc_externs`), so this never fires for
+    # mach-produced objects — see issue #1231.
+    val inf: Result[bool, str] = infer_extern_function_flags_from_calls(out);
+
     deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+    if (is_err[bool, str](inf)) { ret err[bool, str](unwrap_err[bool, str](inf)); }
+    ret ok[bool, str](true);
+}
+
+# is_flagless_extern: whether a symbol is an undefined external import that still
+# lacks the function type bit — the candidate set inference may recover.
+fun is_flagless_extern(sym: *of.Symbol) bool {
+    if (sym.section != of.SECTION_EXTERNAL) { ret false; }
+    if ((sym.flags & of.SYM_OBJ_FLAG_EXTERN) == 0) { ret false; }
+    ret (sym.flags & of.SYM_OBJ_FLAG_FUNCTION) == 0;
+}
+
+# infer_extern_function_flags_from_calls: recover the function type bit for an
+# undefined external symbol that a relocation calls (`pc32`/`plt32` whose site is
+# preceded by a `call`/`jmp rel32` opcode, 0xE8/0xE9) but whose symbol record
+# encodes Type 0. this serves foreign COFF inputs from toolchains that leave an
+# undefined import's type at 0; mach's own emitter already stamps DT_FUNCTION on
+# such imports (codegen `pack_reloc_externs`), so the candidate set below is empty
+# for mach-produced objects and the pass returns before allocating. the flagless
+# undefined externs are indexed by name once, so each call reloc is an O(1) lookup
+# rather than a full symbol-table scan (issue #1231).
+fun infer_extern_function_flags_from_calls(out: *of.ObjectImage) Result[bool, str] {
+    if (out == nil || out.reloc_count == 0 || out.symbol_count == 0) {
+        ret ok[bool, str](true);
+    }
+
+    # candidates are undefined externs still missing the function bit — the only
+    # symbols inference can change. mach objects have none, so the common path
+    # returns here without allocating.
+    var candidates: u32 = 0;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (is_flagless_extern(?out.symbols[si])) { candidates = candidates + 1; }
+        si = si + 1;
+    }
+    if (candidates == 0) { ret ok[bool, str](true); }
+
+    # index those candidates by name so each call reloc is an O(1) lookup rather
+    # than a full symbol-table scan.
+    var idx: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](out.alloc, maphash.hash_u32, maphash.eq_u32);
+    si = 0;
+    for (si < out.symbol_count) {
+        if (is_flagless_extern(?out.symbols[si])) {
+            val ins: Result[bool, str] =
+                map.insert[intern.StrId, u32](?idx, out.symbols[si].name, si);
+            if (is_err[bool, str](ins)) {
+                map.dnit[intern.StrId, u32](?idx);
+                ret err[bool, str](unwrap_err[bool, str](ins));
+            }
+        }
+        si = si + 1;
+    }
+
+    var ri: u32 = 0;
+    for (ri < out.reloc_count) {
+        val r: *of.Relocation = ?out.relocations[ri];
+        if (r.symbol == intern.STR_NIL) { ri = ri + 1; cnt; }
+        if (r.kind != rk_pc32 && r.kind != rk_plt32) { ri = ri + 1; cnt; }
+        if (r.section >= out.section_count) { ri = ri + 1; cnt; }
+        val sec: *of.Section = ?out.sections[r.section];
+        if (sec.bytes == nil || r.offset == 0) { ri = ri + 1; cnt; }
+        if (r.offset::usize + 4 > sec.len::usize) { ri = ri + 1; cnt; }
+        val op: u8 = sec.bytes[r.offset::usize - 1];
+        if (op != 0xE8 && op != 0xE9) { ri = ri + 1; cnt; }
+
+        val g: Result[*u32, str] = map.get[intern.StrId, u32](?idx, ?r.symbol);
+        if (is_err[*u32, str](g)) { ri = ri + 1; cnt; }
+        val sidx: u32 = @unwrap_ok[*u32, str](g);
+        out.symbols[sidx].flags =
+            out.symbols[sidx].flags | of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_GLOBAL;
+        ri = ri + 1;
+    }
+
+    map.dnit[intern.StrId, u32](?idx);
     ret ok[bool, str](true);
 }
 
@@ -1334,11 +1489,8 @@ rec PeSection {
 # load segments, and the synthesized sections (import stubs, .idata). every RVA is
 # relative to ImageBase and every file offset is absolute. computed once from the
 # segment and import counts, then consumed by the write pass. `sec_total` counts
-# the section-table entries (linker segments + stubs + idata, the synthesized ones
-# present only when used). exception/unwind tables (.pdata/.xdata) are not emitted:
-# the back end does not yet produce per-function prologue unwind codes, and
-# structurally-valid-but-wrong unwind metadata is worse than none — see the
-# follow-up issue for proper per-function .pdata/.xdata.
+# the section-table entries (linker segments + synthesized stubs/import/unwind
+# sections, present only when used).
 # ---
 # image_base:    PE ImageBase (64 KiB-aligned, one reserve region below seg[0])
 # header_size:   SizeOfHeaders (file-aligned span of DOS+PE+section headers)
@@ -1349,6 +1501,7 @@ rec PeSection {
 # iat_rva/size:  the IAT span within .idata (the IAT data directory)
 # import_dir_*:  the import directory span within .idata (the IMPORT directory)
 # nimp:          number of function imports (IAT/stub/hint-name entries)
+# exception_*:   the .pdata span (EXCEPTION data directory target)
 # sec_total:     number of section-table entries
 rec PeLayout {
     image_base:  u64;
@@ -1357,14 +1510,48 @@ rec PeLayout {
     seg_secs:    *PeSection;
     stub_sec:    PeSection;
     idata_sec:   PeSection;
+    xdata_sec:   PeSection;
+    pdata_sec:   PeSection;
     iat_rva:     u64;
     iat_size:    u64;
     import_dir_rva:  u64;
     import_dir_size: u64;
+    exception_rva:   u64;
+    exception_size:  u64;
     nimp:        u32;
     have_stub:   bool;
     have_idata:  bool;
+    have_xdata:  bool;
+    have_pdata:  bool;
     sec_total:   u32;
+}
+
+# UnwindCode: one decoded x64 unwind operation — its prologue end offset, the
+# opcode and operation-info nibble, and up to two extra u16 operand slots.
+rec UnwindCode {
+    end_off:     u8;
+    op:          u8;
+    info:        u8;
+    extra0:      u16;
+    extra1:      u16;
+    extra_slots: u8;
+}
+
+# FunctionUnwind: the parsed unwind description of one function — its location,
+# prologue size, frame declaration, and the unwind-code array that drives the
+# .xdata/.pdata emission.
+rec FunctionUnwind {
+    seg_index:   u32;
+    seg_offset:  u32;
+    size:        u32;
+    prolog_size: u8;
+    frame_reg:   u8;
+    frame_off:   u8;
+    code_count:  u32;
+    slot_count:  u32;
+    xdata_rva:   u64;
+    xdata_size:  usize;
+    codes:       [16]UnwindCode;
 }
 
 # func_import_count: the number of function imports in a dynamic plan — only these
@@ -1417,6 +1604,183 @@ fun import_dir_bytes(dyn: *of.DynamicInfo) usize {
     ret (dyn.lib_count + 1)::usize * IMPORT_DESCRIPTOR_SIZE;
 }
 
+# push_unwind_code: append one unwind code (with up to two extra operand slots)
+# to a function's code array, tracking the running slot count; false when full.
+fun push_unwind_code(uw: *FunctionUnwind, end_off: u8, op: u8, info: u8,
+                     extra0: u16, extra1: u16, extra_slots: u8) bool {
+    if (uw.code_count >= 16) { ret false; }
+    uw.codes[uw.code_count].end_off = end_off;
+    uw.codes[uw.code_count].op = op;
+    uw.codes[uw.code_count].info = info;
+    uw.codes[uw.code_count].extra0 = extra0;
+    uw.codes[uw.code_count].extra1 = extra1;
+    uw.codes[uw.code_count].extra_slots = extra_slots;
+    uw.code_count = uw.code_count + 1;
+    uw.slot_count = uw.slot_count + 1 + extra_slots::u32;
+    ret true;
+}
+
+# push_alloc_code: append the unwind code(s) for a prologue stack allocation of
+# `alloc` bytes — ALLOC_SMALL, or ALLOC_LARGE with a scaled (info 0) or unscaled
+# (info 1) size.
+fun push_alloc_code(uw: *FunctionUnwind, end_off: u8, alloc: usize) bool {
+    if (alloc == 0) { ret true; }
+    if ((alloc & 7) != 0) { ret false; }
+    if (alloc <= 128) {
+        ret push_unwind_code(uw, end_off, UWOP_ALLOC_SMALL, ((alloc - 8) / 8)::u8, 0, 0, 0);
+    }
+    val scaled: u32 = (alloc / 8)::u32;
+    if (scaled <= 0xFFFF) {
+        ret push_unwind_code(uw, end_off, UWOP_ALLOC_LARGE, 0, scaled::u16, 0, 1);
+    }
+    ret push_unwind_code(uw, end_off, UWOP_ALLOC_LARGE, 1,
+                         (alloc & 0xFFFF)::u16, ((alloc >> 16) & 0xFFFF)::u16, 2);
+}
+
+# push_save_nonvol: append the unwind code for a `mov [frame-off], reg` nonvolatile
+# save — SAVE_NONVOL with the scaled-by-8 offset, or SAVE_NONVOL_FAR with the
+# unscaled byte offset when that scaled value exceeds 16 bits.
+fun push_save_nonvol(uw: *FunctionUnwind, end_off: u8, reg: u8, save_off: usize) bool {
+    if ((save_off & 7) != 0) { ret false; }
+    val scaled: u64 = (save_off / 8)::u64;
+    if (scaled <= 0xFFFF) {
+        ret push_unwind_code(uw, end_off, UWOP_SAVE_NONVOL, reg, scaled::u16, 0, 1);
+    }
+    if (save_off > 0xFFFFFFFF::usize) { ret false; }
+    # the far form records the UNSCALED byte offset in two slots (cf. ALLOC_LARGE info=1).
+    ret push_unwind_code(uw, end_off, UWOP_SAVE_NONVOL_FAR, reg,
+                         (save_off & 0xFFFF)::u16, ((save_off >> 16) & 0xFFFF)::u16, 2);
+}
+
+# is_win64_nonvol_reg: whether a register number is callee-saved under the win64
+# ABI (RBX, RBP, RSI, RDI, R12–R15).
+fun is_win64_nonvol_reg(reg: u8) bool {
+    if (reg == 3 || reg == 5 || reg == 6 || reg == 7) { ret true; }  # RBX/RBP/RSI/RDI
+    if (reg >= 12 && reg <= 15) { ret true; }  # R12-R15
+    ret false;
+}
+
+# parse_function_unwind: decode one emitted function's canonical prologue
+# (push rbp; mov rbp,rsp; sub rsp,N; nonvolatile saves) into x64 unwind codes;
+# false when the bytes are not the recognized fixed-frame shape.
+fun parse_function_unwind(uw: *FunctionUnwind, segs: *of.LoadSegment, seg_count: u32,
+                          funcs: *of.ExecFunction, idx: u32) bool {
+    uw.seg_index = funcs[idx].seg_index;
+    uw.seg_offset = funcs[idx].seg_offset;
+    uw.size = funcs[idx].size;
+    uw.prolog_size = 0;
+    uw.frame_reg = 0;
+    uw.frame_off = 0;
+    uw.code_count = 0;
+    uw.slot_count = 0;
+    uw.xdata_rva = 0;
+    uw.xdata_size = 0;
+
+    if (uw.seg_index >= seg_count || uw.size == 0) { ret false; }
+    val seg: *of.LoadSegment = ?segs[uw.seg_index];
+    if (seg.bytes == nil) { ret false; }
+    if (uw.seg_offset::usize >= seg.filesz) { ret false; }
+    val lim_all: usize = seg.filesz - uw.seg_offset::usize;
+    var lim: usize = uw.size::usize;
+    if (lim > lim_all) { lim = lim_all; }
+    if (lim < 4) { ret false; }
+
+    val base: usize = uw.seg_offset::usize;
+    var pos: usize = 0;
+
+    if (seg.bytes[base] != 0x55) { ret false; }
+    if (!push_unwind_code(uw, 1, UWOP_PUSH_NONVOL, UWREG_RBP, 0, 0, 0)) { ret false; }
+    pos = 1;
+
+    if (pos + 3 > lim) { ret false; }
+    if (seg.bytes[base + pos] != 0x48 || seg.bytes[base + pos + 1] != 0x89 || seg.bytes[base + pos + 2] != 0xE5) {
+        ret false;
+    }
+    pos = pos + 3;
+    # no frame register is declared: this prologue leaves RSP fixed for the whole
+    # body, so RtlVirtualUnwind takes RSP as the offset base and the RSP-relative
+    # save offsets below stay valid. `mov rbp,rsp` needs no unwind code — RBP is
+    # restored by the UWOP_PUSH_NONVOL above. frame_reg/frame_off stay 0.
+
+    var alloc: usize = 0;
+    if (pos + 4 <= lim
+        && seg.bytes[base + pos] == 0x48
+        && seg.bytes[base + pos + 1] == 0x83
+        && seg.bytes[base + pos + 2] == 0xEC) {
+        alloc = seg.bytes[base + pos + 3]::usize;
+        if (!push_alloc_code(uw, (pos + 4)::u8, alloc)) { ret false; }
+        pos = pos + 4;
+    }
+    or (pos + 7 <= lim
+         && seg.bytes[base + pos] == 0x48
+         && seg.bytes[base + pos + 1] == 0x81
+         && seg.bytes[base + pos + 2] == 0xEC) {
+        alloc = read_u32_le(seg.bytes, base + pos + 3)::usize;
+        if (!push_alloc_code(uw, (pos + 7)::u8, alloc)) { ret false; }
+        pos = pos + 7;
+    }
+
+    for (true) {
+        var cur: usize = pos;
+        if (cur + 3 > lim) { brk; }
+        var rex: u8 = 0;
+        if (seg.bytes[base + cur] >= 0x40 && seg.bytes[base + cur] <= 0x4F) {
+            rex = seg.bytes[base + cur];
+            cur = cur + 1;
+            if (cur + 2 > lim) { brk; }
+        }
+        if (seg.bytes[base + cur] != 0x89) { brk; }
+        if ((rex & 8) == 0) { brk; }
+        val modrm: u8 = seg.bytes[base + cur + 1];
+        val mod: u8 = modrm >> 6;
+        # rm==5 with mod 1|2 is [rbp+disp] only when REX.B is clear; with REX.B set
+        # it addresses [r13+disp], so a body `mov [r13+disp], r64` is not a save.
+        if ((modrm & 7) != 5 || (mod != 1 && mod != 2) || (rex & 1) != 0) { brk; }
+
+        var disp: i64 = 0;
+        var inst_len: usize = 0;
+        if (mod == 1) {
+            if (cur + 3 > lim) { brk; }
+            disp = (seg.bytes[base + cur + 2]::i8)::i64;
+            inst_len = 3;
+        }
+        or {
+            if (cur + 6 > lim) { brk; }
+            disp = (read_u32_le(seg.bytes, base + cur + 2)::i32)::i64;
+            inst_len = 6;
+        }
+        if (disp >= 0) { brk; }
+
+        val off_rbp: usize = (-disp)::usize;
+        if (alloc < off_rbp) { ret false; }
+        val save_off: usize = alloc - off_rbp;
+        var reg: u8 = ((modrm >> 3) & 7);
+        if ((rex & 4) != 0) { reg = reg + 8; }
+        if (!is_win64_nonvol_reg(reg)) { brk; }
+        if (!push_save_nonvol(uw, (cur + inst_len)::u8, reg, save_off)) { ret false; }
+        pos = cur + inst_len;
+    }
+
+    if (uw.code_count == 0) { ret false; }
+    if (pos > 255) { ret false; }
+    uw.prolog_size = pos::u8;
+    uw.xdata_size = align_up(4 + uw.slot_count::usize * 2, 4);
+    ret true;
+}
+
+# collect_function_unwind: parse every emitted function into `out`, returning the
+# count whose prologue matched and that carry unwind data.
+fun collect_function_unwind(segs: *of.LoadSegment, seg_count: u32, funcs: *of.ExecFunction,
+                            func_count: u32, out: *FunctionUnwind) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < func_count) {
+        if (parse_function_unwind(?out[n], segs, seg_count, funcs, i)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
 # compute_pe_layout: place every PE section at an RVA and file offset, given the
 # linker's load segments and the dynamic-import plan. the headers occupy file
 # offset 0 (mapped at ImageBase, RVA 0); each linker segment maps at its assigned
@@ -1425,11 +1789,14 @@ fun import_dir_bytes(dyn: *of.DynamicInfo) usize {
 # RVAs advance under their own alignments (FileAlignment on disk, SectionAlignment
 # in memory). returns the total file size.
 fun compute_pe_layout(lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
-                      dyn: *of.DynamicInfo, seg_secs: *PeSection) usize {
+                      dyn: *of.DynamicInfo, seg_secs: *PeSection,
+                      xdata_vsize: usize, pdata_vsize: usize) usize {
     lay.nimp      = func_import_count(dyn);
     lay.seg_secs  = seg_secs;
     lay.have_stub = lay.nimp > 0;
     lay.have_idata = dyn != nil && (dyn.lib_count > 0 || dyn.import_count > 0);
+    lay.have_xdata = xdata_vsize > 0;
+    lay.have_pdata = pdata_vsize > 0;
 
     # ImageBase: 64 KiB-aligned, one reserve region below the first segment's page
     # so the PE headers map at RVA 0 and segment[0] sits at RVA >= the reserve.
@@ -1442,6 +1809,8 @@ fun compute_pe_layout(lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
     var nsec: u32 = seg_count;
     if (lay.have_stub)  { nsec = nsec + 1; }
     if (lay.have_idata) { nsec = nsec + 1; }
+    if (lay.have_xdata) { nsec = nsec + 1; }
+    if (lay.have_pdata) { nsec = nsec + 1; }
     lay.sec_total = nsec;
 
     # headers: DOS header + PE signature + COFF header + optional header + the
@@ -1531,6 +1900,28 @@ fun compute_pe_layout(lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
         rva = rva + align_up_u64(ioff::u64, PE_SECTION_ALIGN);
     }
 
+    if (lay.have_xdata) {
+        rva = align_up_u64(rva, PE_SECTION_ALIGN);
+        lay.xdata_sec.rva       = rva;
+        lay.xdata_sec.vsize     = xdata_vsize::u64;
+        lay.xdata_sec.file_off  = file_off;
+        lay.xdata_sec.file_size = align_up(xdata_vsize, PE_FILE_ALIGN::usize);
+        file_off = file_off + lay.xdata_sec.file_size;
+        rva = rva + align_up_u64(lay.xdata_sec.vsize, PE_SECTION_ALIGN);
+    }
+
+    if (lay.have_pdata) {
+        rva = align_up_u64(rva, PE_SECTION_ALIGN);
+        lay.pdata_sec.rva       = rva;
+        lay.pdata_sec.vsize     = pdata_vsize::u64;
+        lay.pdata_sec.file_off  = file_off;
+        lay.pdata_sec.file_size = align_up(pdata_vsize, PE_FILE_ALIGN::usize);
+        lay.exception_rva       = rva;
+        lay.exception_size      = pdata_vsize::u64;
+        file_off = file_off + lay.pdata_sec.file_size;
+        rva = rva + align_up_u64(lay.pdata_sec.vsize, PE_SECTION_ALIGN);
+    }
+
     lay.image_size = align_up_u64(rva, PE_SECTION_ALIGN);
     ret file_off;
 }
@@ -1540,16 +1931,19 @@ fun compute_pe_layout(lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
 # imports) is the dynamic write with an empty plan, so this delegates to the
 # shared PE writer with a nil DynamicInfo and no fixups.
 # ---
-# alloc:     allocator for the output buffer and layout scratch
-# isa_vt:    the instruction-set vtable describing the machine (must be x86-64)
-# segs:      the loadable segments, in ascending virtual-address order
-# seg_count: number of load segments
-# entry:     program entry-point virtual address
-# path:      null-terminated output file path
-# ret:       ok(true) on success, or an error string
+# alloc:      allocator for the output buffer and layout scratch
+# isa_vt:     the instruction-set vtable describing the machine (must be x86-64)
+# segs:       the loadable segments, in ascending virtual-address order
+# seg_count:  number of load segments
+# entry:      program entry-point virtual address
+# funcs:      per-function metadata for unwind-table emission
+# func_count: number of entries in funcs
+# path:       null-terminated output file path
+# ret:        ok(true) on success, or an error string
 fun coff_emit_exec(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
-                   seg_count: u32, entry: u64, path: *u8) Result[bool, str] {
-    ret write_pe(alloc, isa_vt, segs, seg_count, entry, nil, nil, 0, path);
+                   seg_count: u32, entry: u64, funcs: *of.ExecFunction,
+                   func_count: u32, path: *u8) Result[bool, str] {
+    ret write_pe(alloc, isa_vt, segs, seg_count, entry, funcs, func_count, nil, nil, 0, path);
 }
 
 # coff_emit_dyn_exec: serialize laid-out load segments into a dynamically-linked
@@ -1565,15 +1959,18 @@ fun coff_emit_exec(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegm
 # segs:        the loadable segments, in ascending virtual-address order
 # seg_count:   number of load segments
 # entry:       program entry-point virtual address
+# funcs:       per-function metadata for unwind-table emission
+# func_count:  number of entries in funcs
 # dyn:         the dynamic-link plan (dependencies, imports)
 # fixups:      the import call-site fixups to redirect to import stubs
 # fixup_count: number of fixups
 # path:        null-terminated output file path
 # ret:         ok(true) on success, or an error string
 fun coff_emit_dyn_exec(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
-                       seg_count: u32, entry: u64, dyn: *of.DynamicInfo,
+                       seg_count: u32, entry: u64, funcs: *of.ExecFunction,
+                       func_count: u32, dyn: *of.DynamicInfo,
                        fixups: *of.PltFixup, fixup_count: u32, path: *u8) Result[bool, str] {
-    ret write_pe(alloc, isa_vt, segs, seg_count, entry, dyn, fixups, fixup_count, path);
+    ret write_pe(alloc, isa_vt, segs, seg_count, entry, funcs, func_count, dyn, fixups, fixup_count, path);
 }
 
 # write_pe: the shared PE32+ executable writer behind `coff_emit_exec` (static)
@@ -1584,7 +1981,8 @@ fun coff_emit_dyn_exec(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.Load
 # data directories), the section table, and every section's bytes. each `PltFixup`
 # call site is redirected to its import stub.
 fun write_pe(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
-             seg_count: u32, entry: u64, dyn: *of.DynamicInfo,
+             seg_count: u32, entry: u64, funcs: *of.ExecFunction, func_count: u32,
+             dyn: *of.DynamicInfo,
              fixups: *of.PltFixup, fixup_count: u32, path: *u8) Result[bool, str] {
     if (isa_vt == nil) { ret err[bool, str]("coff: nil exec isa"); }
     if (path == nil)   { ret err[bool, str]("coff: nil exec path"); }
@@ -1598,12 +1996,33 @@ fun write_pe(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
     if (is_err[*PeSection, str](ssr)) { ret err[bool, str]("coff: segment layout alloc failed"); }
     seg_secs = unwrap_ok[*PeSection, str](ssr);
 
+    var uw_all: *FunctionUnwind = nil;
+    var uw_count: u32 = 0;
+    var xdata_vsize: usize = 0;
+    var pdata_vsize: usize = 0;
+    if (func_count > 0 && funcs != nil) {
+        val ur: Result[*FunctionUnwind, str] = zallocate[FunctionUnwind](alloc, func_count::usize);
+        if (is_err[*FunctionUnwind, str](ur)) {
+            deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+            ret err[bool, str]("coff: unwind table alloc failed");
+        }
+        uw_all = unwrap_ok[*FunctionUnwind, str](ur);
+        uw_count = collect_function_unwind(segs, seg_count, funcs, func_count, uw_all);
+        var ui: u32 = 0;
+        for (ui < uw_count) {
+            xdata_vsize = xdata_vsize + uw_all[ui].xdata_size;
+            ui = ui + 1;
+        }
+        pdata_vsize = uw_count::usize * RUNTIME_FUNCTION_SIZE;
+    }
+
     var lay: PeLayout;
-    val total_size: usize = compute_pe_layout(?lay, segs, seg_count, dyn, seg_secs);
+    val total_size: usize = compute_pe_layout(?lay, segs, seg_count, dyn, seg_secs, xdata_vsize, pdata_vsize);
 
     val res_buf: Result[*u8, str] = zallocate[u8](alloc, total_size);
     if (is_err[*u8, str](res_buf)) {
         deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+        if (uw_all != nil && func_count > 0) { deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
         ret err[bool, str]("coff: PE buffer alloc failed");
     }
     var buf: *u8 = unwrap_ok[*u8, str](res_buf);
@@ -1621,6 +2040,7 @@ fun write_pe(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
     # jump through the IAT slots the import section owns.
     if (lay.have_idata) { write_pe_imports(buf, ?lay, dyn); }
     if (lay.have_stub)  { write_pe_stubs(buf, ?lay, dyn); }
+    if (lay.have_xdata || lay.have_pdata) { write_pe_unwind(buf, ?lay, uw_all, uw_count); }
 
     # redirect each import call site to its stub (a non-import call site never
     # reaches here — the linker only records fixups for function imports).
@@ -1628,6 +2048,7 @@ fun write_pe(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
     if (is_err[bool, str](fx_r)) {
         deallocate[u8](alloc, buf, total_size);
         deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+        if (uw_all != nil && func_count > 0) { deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
         ret err[bool, str](unwrap_err[bool, str](fx_r));
     }
 
@@ -1635,6 +2056,7 @@ fun write_pe(alloc: *Allocator, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
     write_pe_headers(buf, ?lay, segs, seg_count, entry);
 
     deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+    if (uw_all != nil && func_count > 0) { deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
 
     val res_file: Result[fs.File, str] = fs.create(path, 0o755);
     if (is_err[fs.File, str](res_file)) {
@@ -1813,6 +2235,82 @@ fun write_pe_stubs(buf: *u8, lay: *PeLayout, dyn: *of.DynamicInfo) {
     }
 }
 
+# write_unwind_xdata: write one function's UNWIND_INFO record into .xdata — the
+# header (version/flags, prolog size, slot count, frame nibble) followed by its
+# unwind codes in descending prologue-offset order.
+fun write_unwind_xdata(buf: *u8, lay: *PeLayout, uw: *FunctionUnwind) {
+    val xoff: usize = lay.xdata_sec.file_off + (uw.xdata_rva - lay.xdata_sec.rva)::usize;
+    buf[xoff] = UNWIND_VERSION;
+    buf[xoff + 1] = uw.prolog_size;
+    buf[xoff + 2] = uw.slot_count::u8;
+    buf[xoff + 3] = (uw.frame_reg & 0x0F) | ((uw.frame_off & 0x0F) << 4);
+
+    var used: [16]bool;
+    var i: usize = 0;
+    for (i < 16) { used[i] = false; i = i + 1; }
+
+    var slots_written: usize = 0;
+    var codes_written: u32 = 0;
+    for (codes_written < uw.code_count) {
+        var best: i32 = -1;
+        var best_off: u8 = 0;
+        var ci: u32 = 0;
+        for (ci < uw.code_count) {
+            if (!used[ci::usize]
+                && (best < 0 || uw.codes[ci].end_off > best_off)) {
+                best = ci::i32;
+                best_off = uw.codes[ci].end_off;
+            }
+            ci = ci + 1;
+        }
+        if (best < 0) { brk; }
+        val c: *UnwindCode = ?uw.codes[best::u32];
+        val slot_off: usize = xoff + 4 + slots_written * 2;
+        buf[slot_off] = c.end_off;
+        buf[slot_off + 1] = c.op | (c.info << 4);
+        slots_written = slots_written + 1;
+        if (c.extra_slots >= 1) {
+            write_u16_le(buf, xoff + 4 + slots_written * 2, c.extra0);
+            slots_written = slots_written + 1;
+        }
+        if (c.extra_slots >= 2) {
+            write_u16_le(buf, xoff + 4 + slots_written * 2, c.extra1);
+            slots_written = slots_written + 1;
+        }
+        used[best::usize] = true;
+        codes_written = codes_written + 1;
+    }
+}
+
+# write_pe_unwind: emit the .xdata UNWIND_INFO records and the .pdata
+# RUNTIME_FUNCTION table for every collected function. parse_function_unwind has
+# already rejected any out-of-range seg_index, so every entry maps to a segment.
+fun write_pe_unwind(buf: *u8, lay: *PeLayout, uws: *FunctionUnwind, uw_count: u32) {
+    if (uw_count == 0 || uws == nil) { ret; }
+    if (!lay.have_xdata || !lay.have_pdata) { ret; }
+
+    var xcur: usize = 0;
+    var i: u32 = 0;
+    for (i < uw_count) {
+        uws[i].xdata_rva = lay.xdata_sec.rva + xcur::u64;
+        write_unwind_xdata(buf, lay, ?uws[i]);
+        xcur = xcur + uws[i].xdata_size;
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < uw_count) {
+        val poff: usize = lay.pdata_sec.file_off + i::usize * RUNTIME_FUNCTION_SIZE;
+        val seg_rva: u64 = lay.seg_secs[uws[i].seg_index].rva;
+        val begin_rva: u32 = (seg_rva + uws[i].seg_offset::u64)::u32;
+        val end_rva: u32 = begin_rva + uws[i].size;
+        write_u32_le(buf, poff, begin_rva);
+        write_u32_le(buf, poff + 4, end_rva);
+        write_u32_le(buf, poff + 8, uws[i].xdata_rva::u32);
+        i = i + 1;
+    }
+}
+
 # patch_pe_fixups: rewrite each import call site (a `PltFixup` the linker could not
 # resolve) to a pc-relative call to the import's stub. the fixup records the
 # segment + offset of the 4-byte displacement field and the patch-site vaddr; the
@@ -1957,10 +2455,11 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
         write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_IAT::usize * DATA_DIR_SIZE, lay.iat_rva::u32);
         write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_IAT::usize * DATA_DIR_SIZE + 4, lay.iat_size::u32);
     }
-    # no EXCEPTION directory: the .pdata/.xdata unwind tables are not emitted (the
-    # back end does not yet produce per-function prologue unwind codes), so real
-    # Windows treats these frames as leaf functions rather than unwinding with
-    # wrong metadata. see the follow-up issue for proper per-function unwind.
+    # EXCEPTION directory (index 3) — the RUNTIME_FUNCTION table in .pdata.
+    if (lay.have_pdata) {
+        write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE, lay.exception_rva::u32);
+        write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE + 4, lay.exception_size::u32);
+    }
 
     # the section table follows the optional header.
     var pos: usize = oh + OPTIONAL_HEADER_SIZE;
@@ -1981,6 +2480,16 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
     if (lay.have_idata) {
         write_pe_section_header(buf, pos, ".idata", ?lay.idata_sec,
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
+        pos = pos + SECTION_HEADER_SIZE;
+    }
+    if (lay.have_xdata) {
+        write_pe_section_header(buf, pos, ".xdata", ?lay.xdata_sec,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+        pos = pos + SECTION_HEADER_SIZE;
+    }
+    if (lay.have_pdata) {
+        write_pe_section_header(buf, pos, ".pdata", ?lay.pdata_sec,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
         pos = pos + SECTION_HEADER_SIZE;
     }
 }
@@ -2246,6 +2755,64 @@ test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
     ret 0;
 }
 
+test "coff: emit rejects a relocation naming an unresolved symbol (#1196)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    val vt_o: Option[*of.OfVTable] = of.lookup(of.OF_COFF);
+    if (!is_some[*of.OfVTable](vt_o)) { ret 1; }
+    val vt: *of.OfVTable = unwrap[*of.OfVTable](vt_o);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # a valid .text section and one defined symbol, so range validation passes
+    # and only the unresolved relocation symbol can fail the emit.
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    # the relocation targets a symbol interned but absent from the image symbol
+    # table — the back-end-invariant violation #1196 must surface as an error,
+    # not silently alias the first section symbol.
+    val ghost: intern.StrId = t_intern(?i, "ghost_symbol");
+    val k_pc32: intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = k_pc32;
+    relocs[0].symbol = ghost; relocs[0].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_unres");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, tpath::*u8);
+    fs.temp_close_and_remove(?tf);
+
+    if (!is_err[bool, str](em)) { ret 1; }
+    if (!str_contains(unwrap_err[bool, str](em), "ghost_symbol")) { ret 1; }
+    ret 0;
+}
+
 test "coff: a defined weak symbol round-trips its weak flag through a COMDAT section" {
     var alloc: Allocator;
     page.make(?alloc);
@@ -2484,7 +3051,7 @@ test "coff: emit_exec writes a well-formed PE32+ header" {
     if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
 
-    val em: Result[bool, str] = coff_emit_exec(?alloc, ?isa_vt, ?segs[0], 2, entry, fs.temp_path(?tf)::*u8);
+    val em: Result[bool, str] = coff_emit_exec(?alloc, ?isa_vt, ?segs[0], 2, entry, nil, 0, fs.temp_path(?tf)::*u8);
     if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, fs.temp_path(?tf));
@@ -2515,5 +3082,318 @@ test "coff: emit_exec writes a well-formed PE32+ header" {
     val entry_rva:  u32 = read_u32_le(buf.data, oh + 16);
     if (image_base + entry_rva::u64 != entry) { ret 1; }
 
+    ret 0;
+}
+
+# the real #1211 path: mach's codegen stamps DT_FUNCTION on a call-target import,
+# and emit/parse must preserve it without any inference. this guards the actual
+# mechanism the inference is wrongly credited with — the import keeps its function
+# bit through the round-trip even though it is, like a real undefined import,
+# defined in no section.
+test "coff: a function-flagged call-target import round-trips DT_FUNCTION" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    val vt_o: Option[*of.OfVTable] = of.lookup(of.OF_COFF);
+    if (!is_some[*of.OfVTable](vt_o)) { ret 1; }
+    val vt: *of.OfVTable = unwrap[*of.OfVTable](vt_o);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # a defined `main` whose body calls an undefined function import, exactly as
+    # codegen emits one: the import carries FUNCTION|EXTERN|GLOBAL up front.
+    var text_bytes: [8]u8;
+    text_bytes[0] = 0xE8;  # call rel32
+    text_bytes[1] = 0; text_bytes[2] = 0; text_bytes[3] = 0; text_bytes[4] = 0;
+    text_bytes[5] = 0x90; text_bytes[6] = 0x90; text_bytes[7] = 0xC3;
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "GetCommandLineA"); syms[1].section = of.SECTION_EXTERNAL;
+    syms[1].offset = 0; syms[1].size = 0;
+    syms[1].flags =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+
+    val k_pc32: intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = k_pc32;
+    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_rtf");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = coff_parse_object(?alloc, buf.data, buf.len, ?out);
+    if (is_err[bool, str](pr)) { ret 1; }
+
+    var saw: bool = false;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (out.symbols[si].name == syms[1].name) {
+            saw = true;
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_EXTERN) == 0) { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_FUNCTION) == 0) { ret 1; }
+        }
+        si = si + 1;
+    }
+    if (!saw) { ret 1; }
+
+    ret 0;
+}
+
+test "coff: parse infers function imports from a foreign object's call relocations" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    val vt_o: Option[*of.OfVTable] = of.lookup(of.OF_COFF);
+    if (!is_some[*of.OfVTable](vt_o)) { ret 1; }
+    val vt: *of.OfVTable = unwrap[*of.OfVTable](vt_o);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # a tiny text body with one call-site relocation targeting an undefined extern.
+    var text_bytes: [8]u8;
+    text_bytes[0] = 0xE8;  # call rel32
+    text_bytes[1] = 0; text_bytes[2] = 0; text_bytes[3] = 0; text_bytes[4] = 0;
+    text_bytes[5] = 0x90; text_bytes[6] = 0x90; text_bytes[7] = 0xC3;
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "GetCommandLineA"); syms[1].section = of.SECTION_EXTERNAL;
+    syms[1].offset = 0; syms[1].size = 0;
+    # omit FUNCTION to emulate a foreign toolchain that encodes an undefined import
+    # type as 0 (mach's own emitter never does — see the round-trip test below); the
+    # parser must recover function intent from the call reloc so the import binds.
+    syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+
+    val k_pc32: intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = k_pc32;
+    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_ifn");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = coff_parse_object(?alloc, buf.data, buf.len, ?out);
+    if (is_err[bool, str](pr)) { ret 1; }
+
+    var saw: bool = false;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (out.symbols[si].name == syms[1].name) {
+            saw = true;
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_EXTERN) == 0) { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_FUNCTION) == 0) { ret 1; }
+        }
+        si = si + 1;
+    }
+    if (!saw) { ret 1; }
+
+    ret 0;
+}
+
+test "coff: emit_exec emits .xdata/.pdata for a canonical x64 prologue" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # push rbp; mov rbp,rsp; sub rsp,0x20; mov [rbp-8],rbx; nop; ret
+    var text_bytes: [14]u8;
+    text_bytes[0] = 0x55;
+    text_bytes[1] = 0x48; text_bytes[2] = 0x89; text_bytes[3] = 0xE5;
+    text_bytes[4] = 0x48; text_bytes[5] = 0x83; text_bytes[6] = 0xEC; text_bytes[7] = 0x20;
+    text_bytes[8] = 0x48; text_bytes[9] = 0x89; text_bytes[10] = 0x5D; text_bytes[11] = 0xF8;
+    text_bytes[12] = 0x90;
+    text_bytes[13] = 0xC3;
+
+    val base:  u64 = 0x140000000;
+    val entry: u64 = base;
+
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = base; segs[0].filesz = 14; segs[0].memsz = 14;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+
+    var funcs: [1]of.ExecFunction;
+    funcs[0].seg_index = 0;
+    funcs[0].seg_offset = 0;
+    funcs[0].size = 14;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_unw");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: Result[bool, str] = coff_emit_exec(?alloc, ?isa_vt, ?segs[0], 1, entry, ?funcs[0], 1, fs.temp_path(?tf)::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    val pe_off: usize = read_u32_le(buf.data, 0x3C)::usize;
+    val ch: usize = pe_off + PE_SIGNATURE_SIZE;
+    if (read_u16_le(buf.data, ch + 2) != 3) { ret 1; }  # .text + .xdata + .pdata
+
+    val oh: usize = ch + COFF_HEADER_SIZE;
+    val dd: usize = oh + 112;
+    val exc_rva: u32 = read_u32_le(buf.data, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE);
+    val exc_size: u32 = read_u32_le(buf.data, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE + 4);
+    if (exc_rva == 0 || exc_size != RUNTIME_FUNCTION_SIZE::u32) { ret 1; }
+
+    var xdata_rva: u32 = 0;
+    var xdata_ptr: u32 = 0;
+    var pdata_ptr: u32 = 0;
+    var si: u32 = 0;
+    var sh: usize = oh + OPTIONAL_HEADER_SIZE;
+    for (si < 3) {
+        if (buf.data[sh] == '.' && buf.data[sh + 1] == 'x'
+            && buf.data[sh + 2] == 'd' && buf.data[sh + 3] == 'a'
+            && buf.data[sh + 4] == 't' && buf.data[sh + 5] == 'a') {
+            xdata_rva = read_u32_le(buf.data, sh + 12);
+            xdata_ptr = read_u32_le(buf.data, sh + 20);
+        }
+        if (buf.data[sh] == '.' && buf.data[sh + 1] == 'p'
+            && buf.data[sh + 2] == 'd' && buf.data[sh + 3] == 'a'
+            && buf.data[sh + 4] == 't' && buf.data[sh + 5] == 'a') {
+            pdata_ptr = read_u32_le(buf.data, sh + 20);
+        }
+        sh = sh + SECTION_HEADER_SIZE;
+        si = si + 1;
+    }
+    if (xdata_rva == 0 || xdata_ptr == 0 || pdata_ptr == 0) { ret 1; }
+
+    val begin_rva: u32 = read_u32_le(buf.data, pdata_ptr::usize);
+    val end_rva: u32 = read_u32_le(buf.data, pdata_ptr::usize + 4);
+    val unwind_rva: u32 = read_u32_le(buf.data, pdata_ptr::usize + 8);
+    if (begin_rva == 0 || end_rva <= begin_rva) { ret 1; }
+    if (unwind_rva < xdata_rva) { ret 1; }
+    val uw_ptr: usize = xdata_ptr::usize + (unwind_rva - xdata_rva)::usize;
+
+    # the full UNWIND_INFO image for `push rbp; mov rbp,rsp; sub rsp,0x20; mov [rbp-8],rbx`.
+    # this is a fixed-RSP frame: no frame register is declared (byte 3 == 0), so the
+    # SAVE_NONVOL offset is RSP-relative — (0x20 - 8) / 8 = 3. wine ignores .xdata, so
+    # these byte assertions are the only verification of unwind correctness.
+    if (buf.data[uw_ptr + 0] != 0x01) { ret 1; }  # version 1, flags 0
+    if (buf.data[uw_ptr + 1] != 0x0C) { ret 1; }  # size of prolog = 12
+    if (buf.data[uw_ptr + 2] != 0x04) { ret 1; }  # 4 unwind slots
+    if (buf.data[uw_ptr + 3] != 0x00) { ret 1; }  # frame_reg = 0, frame_off = 0
+    # codes are written in descending prologue-offset order. each op byte is
+    # op | (info << 4): SAVE_NONVOL(4)|rbx(3)=0x34, ALLOC_SMALL(2)|3=0x32, PUSH(0)|rbp(5)=0x50.
+    if (buf.data[uw_ptr + 4] != 0x0C) { ret 1; }             # SAVE_NONVOL end_off = 12
+    if (buf.data[uw_ptr + 5] != 0x34) { ret 1; }             # op 4 (SAVE_NONVOL), info 3 (rbx)
+    if (read_u16_le(buf.data, uw_ptr + 6) != 3) { ret 1; }   # scaled offset (0x18 / 8)
+    if (buf.data[uw_ptr + 8] != 0x08) { ret 1; }             # ALLOC_SMALL end_off = 8
+    if (buf.data[uw_ptr + 9] != 0x32) { ret 1; }             # op 2 (ALLOC_SMALL), info 3 ((0x20-8)/8)
+    if (buf.data[uw_ptr + 10] != 0x01) { ret 1; }            # PUSH_NONVOL end_off = 1
+    if (buf.data[uw_ptr + 11] != 0x50) { ret 1; }            # op 0 (PUSH_NONVOL), info 5 (rbp)
+
+    ret 0;
+}
+
+test "coff: push_save_nonvol writes the unscaled offset in the SAVE_NONVOL_FAR form" {
+    var uw: FunctionUnwind;
+    uw.code_count = 0;
+    uw.slot_count = 0;
+    # 0x88888 / 8 = 0x11111 exceeds the 16-bit scaled field, forcing the far form.
+    val off: usize = 0x88888;
+    if (!push_save_nonvol(?uw, 0, 12, off)) { ret 1; }  # r12
+    if (uw.code_count != 1) { ret 1; }
+    val c: *UnwindCode = ?uw.codes[0];
+    if (c.op != UWOP_SAVE_NONVOL_FAR) { ret 1; }
+    if (c.info != 12) { ret 1; }
+    if (c.extra_slots != 2) { ret 1; }
+    # the two slots carry the UNSCALED byte offset (0x8888, 0x0008), never the scaled 0x11111.
+    if (c.extra0 != (off & 0xFFFF)::u16) { ret 1; }
+    if (c.extra1 != ((off >> 16) & 0xFFFF)::u16) { ret 1; }
+    val scaled: usize = off / 8;
+    if (c.extra0 == (scaled & 0xFFFF)::u16 && c.extra1 == ((scaled >> 16) & 0xFFFF)::u16) { ret 1; }
+    ret 0;
+}
+
+test "coff: parse_function_unwind rejects an [r13+disp] store as a save (REX.B)" {
+    # push rbp; mov rbp,rsp; sub rsp,0x20; mov [r13-8],r12; ret
+    var text_bytes: [13]u8;
+    text_bytes[0] = 0x55;
+    text_bytes[1] = 0x48; text_bytes[2] = 0x89; text_bytes[3] = 0xE5;
+    text_bytes[4] = 0x48; text_bytes[5] = 0x83; text_bytes[6] = 0xEC; text_bytes[7] = 0x20;
+    text_bytes[8] = 0x4D; text_bytes[9] = 0x89; text_bytes[10] = 0x65; text_bytes[11] = 0xF8;
+    text_bytes[12] = 0xC3;
+
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x140000000; segs[0].filesz = 13; segs[0].memsz = 13;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+
+    var funcs: [1]of.ExecFunction;
+    funcs[0].seg_index = 0; funcs[0].seg_offset = 0; funcs[0].size = 13;
+
+    var uw: FunctionUnwind;
+    if (!parse_function_unwind(?uw, ?segs[0], 1, ?funcs[0], 0)) { ret 1; }
+    # only PUSH_NONVOL + ALLOC_SMALL — the [r13-8] store must not become a save.
+    if (uw.code_count != 2) { ret 1; }
+    var k: u32 = 0;
+    for (k < uw.code_count) {
+        if (uw.codes[k].op == UWOP_SAVE_NONVOL || uw.codes[k].op == UWOP_SAVE_NONVOL_FAR) { ret 1; }
+        k = k + 1;
+    }
+    if (uw.prolog_size != 8) { ret 1; }  # prologue ends at the sub rsp; the r13 store is body
     ret 0;
 }

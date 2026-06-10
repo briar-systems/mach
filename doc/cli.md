@@ -123,8 +123,8 @@ fallback only applies when no static candidate exists (the common case for
 system libraries like libc). Manifest `libs` are resolved before the CLI inputs,
 giving a stable, deterministic link order.
 
-> Dynamic linking is currently implemented for the ELF (Linux) target; the PE
-> (Windows) and Mach-O (Darwin) import paths are in progress.
+> Dynamic linking is implemented for the ELF (Linux) and PE (Windows) targets;
+> the Mach-O (Darwin) import path is not yet implemented (#1176).
 
 Exit codes: `0` ok, `1` user error (no `mach.toml`, unknown target, compile
 errors, an unresolvable link input), `2` internal error.
@@ -241,13 +241,15 @@ mach init [dir] [options]
 Scaffolds a new project in `[dir]` (default: the current directory). Writes a
 complete `mach.toml` with a `[project]` block, default targets for
 `linux`/`windows`/`darwin` (on the host ISA), a `[deps.mach-std]` dependency, a
-starter source file, and `dep/mach-std/` cloned from the declared ref. Refuses
-to overwrite an existing `mach.toml` unless `--force`.
+starter source file, and `dep/mach-std/` cloned from the declared ref (through
+the same path as `mach dep sync`). Refuses to overwrite an existing `mach.toml`,
+`src/main.mach`, or `src/lib.mach` unless `--force`; every collision is checked
+before any file is written, so a refused init leaves nothing behind.
 
 | Flag           | Value | Effect |
 |----------------|-------|--------|
 | `--name <name>`| name  | project id (default: the directory base name) |
-| `--force`      | —     | scaffold even when a `mach.toml` already exists |
+| `--force`      | —     | scaffold even when `mach.toml`, `src/main.mach`, or `src/lib.mach` already exists |
 | `--lib`        | —     | library layout: write `src/lib.mach` instead of `src/main.mach`, and scaffold targets in `mode = "library"` with `entrypoint = "lib.mach"` |
 
 The first non-flag argument after `init` is the target directory.
