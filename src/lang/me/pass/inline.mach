@@ -11,8 +11,11 @@
 # an incoming predecessor is re-keyed to the continuation block.
 #
 # The inliner deliberately produces mechanical, un-cleaned output — the release
-# pipeline re-runs mem2reg and dce afterward to tidy it. Recursive functions and
-# calls reaching through inline asm are never inlined.
+# pipeline runs a late constfold / algebraic / cse / constfold / dce sweep
+# afterward to tidy it. mem2reg runs ONCE, before inline, and is not re-run, so a
+# caller alloca whose address only stops escaping after a callee is inlined is not
+# re-promoted (tracked as a known gap). Recursive functions and calls reaching
+# through inline asm are never inlined.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -45,8 +48,10 @@ use target:  mach.lang.target;
 # target.
 val INLINE_INSTR_THRESHOLD: u32 = 25;
 
-# global ceiling on inlines per pass invocation, guarding against runaway
-# expansion (mutually small functions calling each other).
+# global ceiling on inlines per pass invocation. With the call-graph recursion
+# guard below, inlining only contracts the graph along a DAG and terminates on
+# its own; the budget is kept solely as an ICE-grade backstop against an
+# unforeseen runaway, not as the termination mechanism.
 val INLINE_BUDGET: u32 = 1024;
 
 # Pass entry. Repeatedly inlines the first eligible call site found anywhere in
@@ -56,21 +61,42 @@ val INLINE_BUDGET: u32 = 1024;
 # tgt: target — reserved for target-derived cost-model parameters
 # ret: ok(true) after a full pass, or the first allocation error
 pub fun run(m: *ir.Module, tgt: *target.Target) Result[bool, str] {
+    # mark the recursion-cycle members once on the original call graph; they are
+    # never inlined (see should_inline). function_len does not change during the
+    # pass — inlining never adds functions — so this marking stays valid.
+    var recursive: *bool = nil;
+    if (m.function_len > 0) {
+        val rr: Result[*bool, str] = allocate[bool](m.alloc, m.function_len::usize);
+        if (is_err[*bool, str](rr)) { ret err[bool, str](unwrap_err[*bool, str](rr)); }
+        recursive = unwrap_ok[*bool, str](rr);
+        val rm: Result[bool, str] = mark_recursive(m, recursive);
+        if (is_err[bool, str](rm)) {
+            deallocate[bool](m.alloc, recursive, m.function_len::usize);
+            ret rm;
+        }
+    }
+
     var budget: u32 = INLINE_BUDGET;
     var progress: bool = true;
     for (progress && budget > 0) {
         progress = false;
-        val r: Result[bool, str] = inline_one(m, ?progress);
-        if (is_err[bool, str](r)) { ret r; }
+        val r: Result[bool, str] = inline_one(m, recursive, ?progress);
+        if (is_err[bool, str](r)) {
+            if (recursive != nil) { deallocate[bool](m.alloc, recursive, m.function_len::usize); }
+            ret r;
+        }
         if (progress) { budget = budget - 1; }
     }
+
+    if (recursive != nil) { deallocate[bool](m.alloc, recursive, m.function_len::usize); }
     ret ok[bool, str](true);
 }
 
 # scans the module for the first eligible call site and inlines it. sets
 # `did` to true when an inline happened. returns ok(false-in-did) when no
-# eligible site remains.
-fun inline_one(m: *ir.Module, did: *bool) Result[bool, str] {
+# eligible site remains. `recursive` flags the call-graph cycle members that
+# must never be inlined.
+fun inline_one(m: *ir.Module, recursive: *bool, did: *bool) Result[bool, str] {
     @did = false;
     var fi: u32 = 0;
     for (fi < m.function_len) {
@@ -89,7 +115,7 @@ fun inline_one(m: *ir.Module, did: *bool) Result[bool, str] {
                             val callee_ix: u32 = callee_index(inst);
                             if (callee_ix != 0xFFFFFFFF && callee_ix < m.function_len) {
                                 val callee: *ir.Function = ?m.functions[callee_ix];
-                                if (should_inline(m, fi, callee_ix, caller, callee)) {
+                                if (should_inline(m, recursive, fi, callee_ix, caller, callee)) {
                                     val r: Result[bool, str] =
                                         do_inline(m, caller, bi, ii, iid, callee_ix, callee);
                                     if (is_err[bool, str](r)) { ret r; }
@@ -123,9 +149,12 @@ fun callee_index(call: *instr.Instruction) u32 {
 # inline asm is never inlined: its OP_ASM payload lives in the callee's
 # Function.asm map keyed by the callee-side InstructionId, which the clone does
 # not carry over, so inlining it would silently drop the asm body/ISA/operands.
-fun should_inline(m: *ir.Module, caller_ix: u32, callee_ix: u32, caller: *ir.Function, callee: *ir.Function) bool {
+# A recursion-cycle member (`recursive[callee_ix]`) is never inlined — direct or
+# mutual; inlining one re-introduces a call into the cycle every iteration, so
+# the budget would be the only thing stopping the loop.
+fun should_inline(m: *ir.Module, recursive: *bool, caller_ix: u32, callee_ix: u32, caller: *ir.Function, callee: *ir.Function) bool {
     if ((callee.flags & ir.FN_FLAG_EXTERN) != 0) { ret false; }
-    if (callee_ix == caller_ix) { ret false; }      # direct self-recursion
+    if (recursive[callee_ix]) { ret false; }         # direct or mutual recursion
     if (callee.block_count == 0) { ret false; }      # no body to inline
     if (callee_has_asm(callee)) { ret false; }       # inline asm is never inlined
     if (callee_is_variadic(m, callee)) { ret false; } # variadic body is not inlinable
@@ -202,6 +231,86 @@ fun call_count(m: *ir.Module, callee_ix: u32) u32 {
         fi = fi + 1;
     }
     ret total;
+}
+
+# marks every function that lies on a recursion cycle (it can transitively reach
+# itself through direct calls). `recursive` is caller-owned of length
+# function_len. Allocates the BFS scratch once and reuses it across the
+# per-function reachability walks.
+fun mark_recursive(m: *ir.Module, recursive: *bool) Result[bool, str] {
+    val n: u32 = m.function_len;
+    val rv: Result[*bool, str] = allocate[bool](m.alloc, n::usize);
+    if (is_err[*bool, str](rv)) { ret err[bool, str](unwrap_err[*bool, str](rv)); }
+    val visited: *bool = unwrap_ok[*bool, str](rv);
+    val rq: Result[*u32, str] = allocate[u32](m.alloc, n::usize);
+    if (is_err[*u32, str](rq)) {
+        deallocate[bool](m.alloc, visited, n::usize);
+        ret err[bool, str](unwrap_err[*u32, str](rq));
+    }
+    val queue: *u32 = unwrap_ok[*u32, str](rq);
+
+    var f: u32 = 0;
+    for (f < n) {
+        recursive[f] = reaches_self(m, f, visited, queue, n);
+        f = f + 1;
+    }
+
+    deallocate[bool](m.alloc, visited, n::usize);
+    deallocate[u32](m.alloc, queue, n::usize);
+    ret ok[bool, str](true);
+}
+
+# true when function `start` can transitively reach itself through direct
+# (VAL_FN) calls — i.e. it is part of a recursion cycle. BFS over the call graph
+# from start's callees; reaching `start` again closes a cycle. `visited`/`queue`
+# are caller-owned scratch of length n, reset on entry. Each function is enqueued
+# at most once, so the queue never overflows n.
+fun reaches_self(m: *ir.Module, start: u32, visited: *bool, queue: *u32, n: u32) bool {
+    var i: u32 = 0;
+    for (i < n) { visited[i] = false; i = i + 1; }
+
+    var qt: u32 = 0;
+    if (scan_callees(m, start, start, visited, queue, ?qt)) { ret true; }
+    var qh: u32 = 0;
+    for (qh < qt) {
+        val g: u32 = queue[qh];
+        qh = qh + 1;
+        if (scan_callees(m, g, start, visited, queue, ?qt)) { ret true; }
+    }
+    ret false;
+}
+
+# scans function `fn_ix`'s live call sites; for each direct callee c, returns
+# true when c == target (the cycle is closed) and otherwise enqueues c the first
+# time it is seen. Mirrors call_count's live-only view — pool entries orphaned by
+# a prior inline are not edges.
+fun scan_callees(m: *ir.Module, fn_ix: u32, target: u32, visited: *bool, queue: *u32, qt: *u32) bool {
+    val fn: *ir.Function = ?m.functions[fn_ix];
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[b];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val opt: Option[*instr.Instruction] = ir.get_instruction(fn, blk.instructions[ii]);
+            if (is_some[*instr.Instruction](opt)) {
+                val inst: *instr.Instruction = unwrap[*instr.Instruction](opt);
+                if (inst.kind == instr.OP_CALL && inst.operand_count >= 1) {
+                    val c: u32 = callee_index(inst);
+                    if (c != 0xFFFFFFFF && c < m.function_len) {
+                        if (c == target) { ret true; }
+                        if (visited[c] == false) {
+                            visited[c] = true;
+                            queue[@qt] = c;
+                            @qt = @qt + 1;
+                        }
+                    }
+                }
+            }
+            ii = ii + 1;
+        }
+        b = b + 1;
+    }
+    ret false;
 }
 
 # clone bookkeeping for one inline: maps from callee block/instruction ids to
@@ -587,10 +696,14 @@ fun emit_br(cx: *InlineCtx, in_blk: id.BlockId, target: id.BlockId) Result[id.In
     ret rid;
 }
 
-# rewrites every cloned `ret` into a branch to the continuation, collecting the
-# returned values; builds a result phi in the continuation when the callee
-# returns a value; then replaces the original call's result Value across the
-# whole caller with the phi (or the single return value).
+# rewrites every cloned `ret` into a branch to the continuation and wires the
+# call's result. With a single returning predecessor (the common case) the call
+# result is replaced directly by that return value — no phi is built, matching
+# the header; this also avoids a single-aggregate-return phi the verifier would
+# reject (an aggregate flows by address, and a phi is not address-producing). With
+# two or more returning predecessors a result phi over the return values is built
+# in the continuation. A non-returning callee leaves the result unwired (its
+# continuation is unreachable and the later dce removes it).
 fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) Result[bool, str] {
     val m: *ir.Module = cx.m;
     val caller: *ir.Function = cx.caller;
@@ -599,13 +712,10 @@ fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) Result[bool, str] 
     if (is_err[ir_type.IrTypeId, str](rvt)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](rvt)); }
     val returns_value: bool = cx.ret_ty != unwrap_ok[ir_type.IrTypeId, str](rvt);
 
-    # gather (clone-block, return-value) for each cloned ret, converting it to a
-    # branch to the continuation in place.
+    # count the cloned blocks that return a value, choosing the wiring strategy.
+    val value_rets: u32 = count_value_returns(cx, returns_value);
     var phi_id: id.InstructionId = id.INSTR_NIL;
-    var phi_incomings: u32 = 0;
-
-    # pre-create the phi (empty) so we can append incomings as we walk rets.
-    if (returns_value) {
+    if (returns_value && value_rets >= 2) {
         var phi: instr.Instruction;
         phi.kind          = instr.OP_PHI;
         phi.ty            = cx.ret_ty;
@@ -619,6 +729,10 @@ fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) Result[bool, str] 
         phi_id = unwrap_ok[id.InstructionId, str](rp);
     }
 
+    # walk the cloned returns, capturing the single value (or filling the phi) and
+    # converting each ret into a branch to the continuation in place.
+    var single_val: value.Value;
+    var have_single: bool = false;
     var cb: u32 = 0;
     for (cb < callee.block_count) {
         val clone_bid: id.BlockId = cx.block_map[cb]::id.BlockId;
@@ -629,12 +743,14 @@ fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) Result[bool, str] 
                 val term: *instr.Instruction = unwrap[*instr.Instruction](topt);
                 if (term.kind == instr.OP_RET) {
                     if (returns_value && term.operand_count >= 1) {
-                        # append (clone_bid, ret_value) to the phi.
-                        val pa: Result[bool, str] = phi_append(cx, phi_id, clone_bid, term.operands[0]);
-                        if (is_err[bool, str](pa)) { ret pa; }
-                        phi_incomings = phi_incomings + 1;
+                        if (value_rets == 1) {
+                            single_val  = term.operands[0];
+                            have_single = true;
+                        } or {
+                            val pa: Result[bool, str] = phi_append(cx, phi_id, clone_bid, term.operands[0]);
+                            if (is_err[bool, str](pa)) { ret pa; }
+                        }
                     }
-                    # rewrite this ret into a branch to the continuation.
                     val rconv: Result[bool, str] = convert_ret_to_br(cx, term);
                     if (is_err[bool, str](rconv)) { ret rconv; }
                 }
@@ -643,11 +759,10 @@ fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) Result[bool, str] 
         cb = cb + 1;
     }
 
-    # register the result phi in the continuation and replace the call's result
-    # with it. The phi carries exactly one incoming per returning predecessor, so
-    # it covers every predecessor of the continuation; it must live in the block's
-    # phi list for the back end (and verifier) to see it.
-    if (returns_value && phi_incomings >= 1) {
+    # wire the call's result to the single return value or the result phi.
+    if (returns_value && value_rets == 1 && have_single) {
+        replace_value_uses(caller, call_id, single_val);
+    } or (returns_value && value_rets >= 2) {
         val cont: *ir.Block = ?caller.blocks[cx.cont_blk::u32];
         val ap: Result[bool, str] = ir.block_append_phi(m, cont, phi_id);
         if (is_err[bool, str](ap)) { ret ap; }
@@ -659,6 +774,30 @@ fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) Result[bool, str] 
     # split_call_block truncated the call block to call_ii, so it is no longer
     # listed in any block. nothing more to do.
     ret ok[bool, str](true);
+}
+
+# counts the cloned callee blocks whose terminator is a value-carrying `ret`.
+# Zero when the callee returns void or never returns; the result selects the
+# direct-value vs result-phi wiring in finish_returns.
+fun count_value_returns(cx: *InlineCtx, returns_value: bool) u32 {
+    if (returns_value == false) { ret 0; }
+    val caller: *ir.Function = cx.caller;
+    val callee: *ir.Function = cx.callee;
+    var n: u32 = 0;
+    var cb: u32 = 0;
+    for (cb < callee.block_count) {
+        val clone_bid: id.BlockId = cx.block_map[cb]::id.BlockId;
+        val blk: *ir.Block = ?caller.blocks[clone_bid::u32];
+        if (blk.terminator != id.INSTR_NIL) {
+            val topt: Option[*instr.Instruction] = ir.get_instruction(caller, blk.terminator);
+            if (is_some[*instr.Instruction](topt)) {
+                val term: *instr.Instruction = unwrap[*instr.Instruction](topt);
+                if (term.kind == instr.OP_RET && term.operand_count >= 1) { n = n + 1; }
+            }
+        }
+        cb = cb + 1;
+    }
+    ret n;
 }
 
 # converts a cloned OP_RET into an OP_BR to the continuation block. The ret's
