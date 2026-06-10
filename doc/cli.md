@@ -124,7 +124,7 @@ system libraries like libc). Manifest `libs` are resolved before the CLI inputs,
 giving a stable, deterministic link order.
 
 > Dynamic linking is implemented for the ELF (Linux) and PE (Windows) targets;
-> the Mach-O (Darwin) import path is not yet implemented (#1244).
+> the Mach-O (Darwin) import path is not yet implemented (#1176).
 
 Exit codes: `0` ok, `1` user error (no `mach.toml`, unknown target, compile
 errors, an unresolvable link input), `2` internal error.
