@@ -67,10 +67,17 @@ pub val CT_KIND_STR:   CTKind = 3;
 
 # CTValue: a tagged comptime-evaluated value.
 # ---
-# kind: which CT_KIND_* variant is active
-# data: kind-specific payload
+# kind:         which CT_KIND_* variant is active
+# int_unsigned: for CT_KIND_INT, whether `data.i` carries an unsigned u64
+#               magnitude (true) rather than a signed i64 (false). a literal in
+#               2^63..2^64-1 is representable only as unsigned, so its signedness
+#               travels with the bits — comparison and arithmetic interpret the
+#               payload as the mathematical value it names, so comptime agrees
+#               with runtime value semantics. ignored for the non-int kinds.
+# data:         kind-specific payload
 pub rec CTValue {
-    kind: CTKind;
+    kind:         CTKind;
+    int_unsigned: bool;
     data: uni {
         i: i64;
         f: f64;
@@ -130,9 +137,15 @@ pub rec ComptimeCtx {
 
 val INITIAL_CONST_CAP: u32 = 8;
 
-# the i64 minimum, as a bit pattern since the literal `9223372036854775808` is
-# itself out of i64 range. used to trap the `INT64_MIN / -1` idiv overflow.
-val CT_I64_MIN: i64 = 0x8000000000000000::i64;
+# is_i64_min: whether `a` is the most negative i64 (the bit pattern 0x8000…0).
+# detected by self-negation — `0 - i64_MIN` wraps back to i64_MIN, so it is the
+# sole nonzero value equal to its own negation. computed rather than compared
+# against a constant: a module-scope `i64` constant holding i64_MIN cannot be
+# written without a u64->i64 cast, which an out-of-range literal fold would
+# corrupt. the overflow checks likewise avoid i64 MIN/MAX constants entirely.
+fun is_i64_min(a: i64) bool {
+    ret a != 0 && (0 - a) == a;
+}
 
 # init: constructs a ComptimeCtx with the given target parameters and an empty
 # environment.
@@ -369,10 +382,12 @@ pub fun eval_lit_int(source: str, span: token.Span) Result[CTValue, str] {
 
     if (!saw_digit) { ret err[CTValue, str]("integer literal has no digits"); }
 
-    var v: CTValue;
-    v.kind   = CT_KIND_INT;
-    v.data.i = value:~i64;
-    ret ok[CTValue, str](v);
+    # a literal whose magnitude exceeds i64 max is representable only as unsigned;
+    # one that fits keeps the historical signed default (its bits are identical).
+    # the signedness rides along so a u64-range constant compares and computes as
+    # its true magnitude rather than the negative its raw bits would read as.
+    val signed_max: u64 = 0x7FFFFFFFFFFFFFFF;
+    ret make_int_value(value:~i64, value > signed_max);
 }
 
 # parses a float literal from its source text. supports decimal `digit.digit`
@@ -646,7 +661,7 @@ fun eval_unary(
     val v: CTValue = unwrap_ok[CTValue, str](r);
 
     if (un.op == expr.UN_NEG) {
-        if (v.kind == CT_KIND_INT)   { ret int_value(0 - v.data.i); }
+        if (v.kind == CT_KIND_INT)   { ret ct_negate(v); }
         if (v.kind == CT_KIND_FLOAT) { ret float_value(0.0 - v.data.f); }
         ret err[CTValue, str]("unary - requires a numeric operand");
     }
@@ -656,7 +671,8 @@ fun eval_unary(
     }
     if (un.op == expr.UN_BIT_NOT) {
         if (v.kind != CT_KIND_INT) { ret err[CTValue, str]("unary ~ requires an integer operand"); }
-        ret int_value(~v.data.i);
+        # bitwise complement is a pure bit operation; it preserves signedness.
+        ret make_int_value(~v.data.i, v.int_unsigned);
     }
     ret err[CTValue, str]("unsupported unary operator");
 }
@@ -685,12 +701,42 @@ fun eval_logical(
     ret bool_value(rhs.data.b);
 }
 
+# ct_is_negative: whether an integer CTValue denotes a negative mathematical
+# value. only a signed payload with its high bit set is negative; an unsigned
+# payload is always a non-negative magnitude. non-integer values are never
+# negative.
+pub fun ct_is_negative(v: CTValue) bool {
+    if (v.kind != CT_KIND_INT) { ret false; }
+    if (v.int_unsigned) { ret false; }
+    ret v.data.i < 0;
+}
+
+# ct_int_lt: orders two integer CTValues by mathematical value, correct across
+# signedness. a negative operand is always less than a non-negative one; two
+# operands of the same sign class order identically under an unsigned compare of
+# their 64-bit payloads (two's complement preserves order within a sign class),
+# which is exactly the runtime ruling's "negative i64 is never >= any u64".
+fun ct_int_lt(a: CTValue, b: CTValue) bool {
+    val an: bool = ct_is_negative(a);
+    val bn: bool = ct_is_negative(b);
+    if (an != bn) { ret an; }
+    ret (a.data.i:~u64) < (b.data.i:~u64);
+}
+
+# ct_int_eq: mathematical-value equality of two integer CTValues. operands of
+# opposite sign class are never equal; within a class equal bits mean equal
+# value.
+fun ct_int_eq(a: CTValue, b: CTValue) bool {
+    if (ct_is_negative(a) != ct_is_negative(b)) { ret false; }
+    ret a.data.i == b.data.i;
+}
+
 fun apply_equality(op: expr.BinOp, lhs: CTValue, rhs: CTValue) Result[CTValue, str] {
     if (lhs.kind != rhs.kind) {
         ret err[CTValue, str]("equality requires operands of the same kind");
     }
     var eq: bool = false;
-    if (lhs.kind == CT_KIND_INT)   { eq = lhs.data.i == rhs.data.i; }
+    if (lhs.kind == CT_KIND_INT)   { eq = ct_int_eq(lhs, rhs); }
     or (lhs.kind == CT_KIND_FLOAT) { eq = lhs.data.f == rhs.data.f; }
     or (lhs.kind == CT_KIND_BOOL)  { eq = lhs.data.b == rhs.data.b; }
     or (lhs.kind == CT_KIND_STR)   { eq = lhs.data.s == rhs.data.s; }
@@ -704,10 +750,12 @@ fun apply_compare(op: expr.BinOp, lhs: CTValue, rhs: CTValue) Result[CTValue, st
         ret err[CTValue, str]("comparison requires operands of the same kind");
     }
     if (lhs.kind == CT_KIND_INT) {
-        if (op == expr.BIN_LT)  { ret bool_value(lhs.data.i <  rhs.data.i); }
-        if (op == expr.BIN_LEQ) { ret bool_value(lhs.data.i <= rhs.data.i); }
-        if (op == expr.BIN_GT)  { ret bool_value(lhs.data.i >  rhs.data.i); }
-        ret bool_value(lhs.data.i >= rhs.data.i);
+        # all four orderings derive from the value-correct strict less-than:
+        # a <= b == !(b < a) and a >= b == !(a < b).
+        if (op == expr.BIN_LT)  { ret bool_value(ct_int_lt(lhs, rhs)); }
+        if (op == expr.BIN_LEQ) { ret bool_value(!ct_int_lt(rhs, lhs)); }
+        if (op == expr.BIN_GT)  { ret bool_value(ct_int_lt(rhs, lhs)); }
+        ret bool_value(!ct_int_lt(lhs, rhs));
     }
     if (lhs.kind == CT_KIND_FLOAT) {
         if (op == expr.BIN_LT)  { ret bool_value(lhs.data.f <  rhs.data.f); }
@@ -722,31 +770,7 @@ fun apply_arith(op: expr.BinOp, lhs: CTValue, rhs: CTValue) Result[CTValue, str]
     if (lhs.kind != rhs.kind) {
         ret err[CTValue, str]("arithmetic requires operands of the same kind");
     }
-    if (lhs.kind == CT_KIND_INT) {
-        if (op == expr.BIN_ADD) { ret int_value(lhs.data.i + rhs.data.i); }
-        if (op == expr.BIN_SUB) { ret int_value(lhs.data.i - rhs.data.i); }
-        if (op == expr.BIN_MUL) { ret int_value(lhs.data.i * rhs.data.i); }
-        if (op == expr.BIN_DIV) {
-            if (rhs.data.i == 0) { ret err[CTValue, str]("integer division by zero"); }
-            if (lhs.data.i == CT_I64_MIN && rhs.data.i == (0 - 1)) {
-                ret err[CTValue, str]("integer division overflow (INT64_MIN / -1)");
-            }
-            ret int_value(lhs.data.i / rhs.data.i);
-        }
-        if (op == expr.BIN_MOD) {
-            if (rhs.data.i == 0) { ret err[CTValue, str]("integer modulo by zero"); }
-            if (lhs.data.i == CT_I64_MIN && rhs.data.i == (0 - 1)) {
-                ret err[CTValue, str]("integer modulo overflow (INT64_MIN % -1)");
-            }
-            ret int_value(lhs.data.i % rhs.data.i);
-        }
-        if (op == expr.BIN_BIT_AND) { ret int_value(lhs.data.i & rhs.data.i); }
-        if (op == expr.BIN_BIT_OR)  { ret int_value(lhs.data.i | rhs.data.i); }
-        if (op == expr.BIN_BIT_XOR) { ret int_value(lhs.data.i ^ rhs.data.i); }
-        if (op == expr.BIN_SHL)     { ret int_value(lhs.data.i << rhs.data.i); }
-        if (op == expr.BIN_SHR)     { ret int_value(lhs.data.i >> rhs.data.i); }
-        ret err[CTValue, str]("unsupported integer operator");
-    }
+    if (lhs.kind == CT_KIND_INT)   { ret apply_int_arith(op, lhs, rhs); }
     if (lhs.kind == CT_KIND_FLOAT) {
         if (op == expr.BIN_ADD) { ret float_value(lhs.data.f + rhs.data.f); }
         if (op == expr.BIN_SUB) { ret float_value(lhs.data.f - rhs.data.f); }
@@ -758,6 +782,125 @@ fun apply_arith(op: expr.BinOp, lhs: CTValue, rhs: CTValue) Result[CTValue, str]
         ret err[CTValue, str]("unsupported float operator");
     }
     ret err[CTValue, str]("arithmetic requires numeric operands");
+}
+
+# integer arithmetic with value-correct signedness. bitwise ops produce a pure
+# bit result carrying the combined signedness; shifts follow the shifted
+# operand's signedness. value arithmetic runs in the signed domain when both
+# operands are signed (so 5 - 10 is -5) and in the unsigned domain once any
+# operand is an unsigned magnitude — and a negative operand mixed with an
+# unsigned one has no representable result, so it is rejected rather than
+# silently reinterpreted. every domain errors on overflow rather than wrapping,
+# matching the literal-range rejection in eval_lit_int.
+fun apply_int_arith(op: expr.BinOp, lhs: CTValue, rhs: CTValue) Result[CTValue, str] {
+    val res_uns: bool = lhs.int_unsigned || rhs.int_unsigned;
+
+    if (op == expr.BIN_BIT_AND) { ret make_int_value(lhs.data.i & rhs.data.i, res_uns); }
+    if (op == expr.BIN_BIT_OR)  { ret make_int_value(lhs.data.i | rhs.data.i, res_uns); }
+    if (op == expr.BIN_BIT_XOR) { ret make_int_value(lhs.data.i ^ rhs.data.i, res_uns); }
+    if (op == expr.BIN_SHL || op == expr.BIN_SHR) { ret apply_int_shift(op, lhs, rhs); }
+
+    if (!res_uns) { ret apply_signed_arith(op, lhs.data.i, rhs.data.i); }
+    if (ct_is_negative(lhs) || ct_is_negative(rhs)) {
+        ret err[CTValue, str]("comptime arithmetic mixes a negative value with an unsigned operand");
+    }
+    ret apply_unsigned_arith(op, lhs.data.i:~u64, rhs.data.i:~u64);
+}
+
+# signed integer arithmetic over two i64 values, erroring on i64 overflow.
+# overflow is detected with the two's-complement sign-bit identities (no i64
+# MIN/MAX constants): add overflows when the operands share a sign the result
+# does not; subtract overflows when the operands differ in sign and the result's
+# sign differs from the minuend's.
+fun apply_signed_arith(op: expr.BinOp, a: i64, b: i64) Result[CTValue, str] {
+    if (op == expr.BIN_ADD) {
+        val s: i64 = a + b;
+        if (((a ^ s) & (b ^ s)) < 0) {
+            ret err[CTValue, str]("comptime integer overflow in '+'");
+        }
+        ret make_int_value(s, false);
+    }
+    if (op == expr.BIN_SUB) {
+        val s: i64 = a - b;
+        if (((a ^ b) & (a ^ s)) < 0) {
+            ret err[CTValue, str]("comptime integer overflow in '-'");
+        }
+        ret make_int_value(s, false);
+    }
+    if (op == expr.BIN_MUL) { ret signed_mul(a, b); }
+    if (op == expr.BIN_DIV) {
+        if (b == 0) { ret err[CTValue, str]("integer division by zero"); }
+        if (is_i64_min(a) && b == (0 - 1)) {
+            ret err[CTValue, str]("integer division overflow (INT64_MIN / -1)");
+        }
+        ret make_int_value(a / b, false);
+    }
+    if (op == expr.BIN_MOD) {
+        if (b == 0) { ret err[CTValue, str]("integer modulo by zero"); }
+        if (is_i64_min(a) && b == (0 - 1)) {
+            ret err[CTValue, str]("integer modulo overflow (INT64_MIN % -1)");
+        }
+        ret make_int_value(a % b, false);
+    }
+    ret err[CTValue, str]("unsupported integer operator");
+}
+
+# signed multiply guarding i64 overflow. the i64-MIN * -1 case (= +2^63) is
+# trapped before the `p / a` check, whose own divisor would otherwise SIGFPE.
+# any other overflow is caught by re-dividing the product (p / a != b).
+fun signed_mul(a: i64, b: i64) Result[CTValue, str] {
+    if (a == 0 || b == 0) { ret make_int_value(0, false); }
+    if ((is_i64_min(a) && b == (0 - 1)) || (is_i64_min(b) && a == (0 - 1))) {
+        ret err[CTValue, str]("comptime integer overflow in '*'");
+    }
+    val p: i64 = a * b;
+    if (p / a != b) { ret err[CTValue, str]("comptime integer overflow in '*'"); }
+    ret make_int_value(p, false);
+}
+
+# unsigned integer arithmetic over two u64 magnitudes, erroring on u64 overflow.
+# overflow is detected by the wraparound identities (no u64 MAX constant): add
+# wraps when the sum drops below an addend; subtract wraps when the minuend is
+# the smaller; multiply wraps when re-dividing the product loses the multiplier.
+# the result keeps the unsigned tag so a downstream compare reads its magnitude.
+fun apply_unsigned_arith(op: expr.BinOp, a: u64, b: u64) Result[CTValue, str] {
+    if (op == expr.BIN_ADD) {
+        val s: u64 = a + b;
+        if (s < a) { ret err[CTValue, str]("comptime integer overflow in '+'"); }
+        ret make_int_value(s:~i64, true);
+    }
+    if (op == expr.BIN_SUB) {
+        if (a < b) { ret err[CTValue, str]("comptime integer overflow in '-'"); }
+        ret make_int_value((a - b):~i64, true);
+    }
+    if (op == expr.BIN_MUL) {
+        val p: u64 = a * b;
+        if (b != 0 && p / b != a) { ret err[CTValue, str]("comptime integer overflow in '*'"); }
+        ret make_int_value(p:~i64, true);
+    }
+    if (op == expr.BIN_DIV) {
+        if (b == 0) { ret err[CTValue, str]("integer division by zero"); }
+        ret make_int_value((a / b):~i64, true);
+    }
+    if (op == expr.BIN_MOD) {
+        if (b == 0) { ret err[CTValue, str]("integer modulo by zero"); }
+        ret make_int_value((a % b):~i64, true);
+    }
+    ret err[CTValue, str]("unsupported integer operator");
+}
+
+# integer shift. the count is the right operand's mathematical value and must be
+# a non-negative amount below 64; the result follows the shifted operand's
+# signedness, so `>>` is arithmetic for a signed value and logical for an
+# unsigned one — the same split the back end makes between shr_s and shr_u.
+fun apply_int_shift(op: expr.BinOp, lhs: CTValue, rhs: CTValue) Result[CTValue, str] {
+    if (ct_is_negative(rhs)) { ret err[CTValue, str]("comptime shift amount is negative"); }
+    val amt: u64 = rhs.data.i:~u64;
+    if (amt >= 64) { ret err[CTValue, str]("comptime shift amount must be less than 64"); }
+    val sh: i64 = amt:~i64;
+    if (op == expr.BIN_SHL) { ret make_int_value(lhs.data.i << sh, lhs.int_unsigned); }
+    if (lhs.int_unsigned) { ret make_int_value((lhs.data.i:~u64 >> amt):~i64, true); }
+    ret make_int_value(lhs.data.i >> sh, false);
 }
 
 # resolves a bare identifier expression (no `$` prefix). language-level
@@ -982,11 +1125,42 @@ fun arch_tag_for(name: StrView) Result[u32, str] {
     ret err[u32, str]("unknown `$mach.arch.*` tag");
 }
 
-fun int_value(i: i64) Result[CTValue, str] {
+# make_int_value: an integer CTValue from its 64-bit payload and signedness.
+# unsigned => the bits are a u64 magnitude (the only way to carry 2^63..2^64-1);
+# signed => the bits are an i64 (possibly negative).
+fun make_int_value(bits: i64, unsigned: bool) Result[CTValue, str] {
     var v: CTValue;
-    v.kind   = CT_KIND_INT;
-    v.data.i = i;
+    v.kind         = CT_KIND_INT;
+    v.int_unsigned = unsigned;
+    v.data.i       = bits;
     ret ok[CTValue, str](v);
+}
+
+# constructs a signed comptime integer. `$mach.*` parameters, char literals, and
+# any value within i64 range originate here; a u64-range magnitude must instead
+# come from make_int_value with `unsigned` set.
+fun int_value(i: i64) Result[CTValue, str] {
+    ret make_int_value(i, false);
+}
+
+# ct_negate: arithmetic negation of an integer CTValue, value-correct across the
+# full range. negating i64 MIN yields +2^63, representable only as unsigned;
+# negating an unsigned magnitude above 2^63 has no representable result and is
+# rejected rather than wrapped.
+fun ct_negate(v: CTValue) Result[CTValue, str] {
+    if (!v.int_unsigned) {
+        # -(i64 MIN) == +2^63: the two's-complement bits are unchanged, but the
+        # value is now representable only as unsigned.
+        if (is_i64_min(v.data.i)) { ret make_int_value(v.data.i, true); }
+        ret make_int_value(0 - v.data.i, false);
+    }
+    val mag: u64 = v.data.i:~u64;
+    if (mag == 0) { ret make_int_value(0, false); }
+    val signed_min_mag: u64 = 0x8000000000000000;
+    if (mag > signed_min_mag) {
+        ret err[CTValue, str]("comptime negation of an unsigned value is out of range");
+    }
+    ret make_int_value(0 - v.data.i, false);
 }
 
 fun float_value(f: f64) Result[CTValue, str] {
@@ -1018,6 +1192,12 @@ fun t_eval_int(s: str) Result[CTValue, str] {
     ret eval_lit_int(s, span);
 }
 
+# helper: the i64 minimum and maximum as runtime values. built by shifting so no
+# u64-range literal is const-folded (an older bootstrap seed mis-folds a
+# u64->i64 cast at fold time, the very defect #1272 fixes).
+fun t_i64_min() i64 { var one: u64 = 1; ret (one << 63):~i64; }
+fun t_i64_max() i64 { var one: u64 = 1; ret ((one << 63) - 1):~i64; }
+
 test "comptime: an integer literal above u64 max is rejected, not silently wrapped (#1247)" {
     # 2^64 is one past the representable range and must error instead of wrapping
     val r: Result[CTValue, str] = t_eval_int("18446744073709551616");
@@ -1045,7 +1225,7 @@ fun t_view(s: str) StrView {
 }
 
 test "comptime: INT64_MIN / -1 and % -1 trap as errors instead of SIGFPE (#1249)" {
-    val lhs: CTValue = unwrap_ok[CTValue, str](int_value(CT_I64_MIN));
+    val lhs: CTValue = unwrap_ok[CTValue, str](int_value(t_i64_min()));
     val rhs: CTValue = unwrap_ok[CTValue, str](int_value(0 - 1));
     # the idiv overflow that would SIGFPE the compiler must be a comptime error.
     if (!is_err[CTValue, str](apply_arith(expr.BIN_DIV, lhs, rhs))) { ret 1; }
@@ -1083,5 +1263,101 @@ test "comptime: frame_close rejects a mark beyond the current frame depth (#1249
     val good: Result[bool, str] = frame_close(?c, 1);
     if (is_err[bool, str](good)) { ret 1; }
     if (c.entries_len != 1) { ret 1; }
+    ret 0;
+}
+
+# helper: the bool payload of a folded comparison / equality CTValue result.
+fun t_bool(r: Result[CTValue, str]) bool {
+    ret unwrap_ok[CTValue, str](r).data.b;
+}
+
+test "comptime: a u64-range constant compares as its true magnitude, not a negative (#1272)" {
+    val big:  CTValue = unwrap_ok[CTValue, str](t_eval_int("0xFFFFFFFFFFFFFFFF"));
+    val zero: CTValue = unwrap_ok[CTValue, str](int_value(0));
+    # the raw bits read as -1, so a signed compare would make this false.
+    if (!t_bool(apply_compare(expr.BIN_GT, big, zero))) { ret 1; }
+    if (t_bool(apply_compare(expr.BIN_LT, big, zero)))  { ret 1; }
+    ret 0;
+}
+
+test "comptime: cross-sign integer comparison matches runtime value semantics (#1272/#1248)" {
+    val big: CTValue = unwrap_ok[CTValue, str](t_eval_int("0xFFFFFFFFFFFFFFFF")); # u64 max
+    val neg: CTValue = unwrap_ok[CTValue, str](int_value(0 - 1));                 # i64 -1
+    # big and neg share identical raw bits but name different values: a negative
+    # i64 is never >= any u64, in either operand order.
+    if (!t_bool(apply_compare(expr.BIN_LT, neg, big)))   { ret 1; }
+    if (!t_bool(apply_compare(expr.BIN_GT, big, neg)))   { ret 1; }
+    if (t_bool(apply_compare(expr.BIN_GEQ, neg, big)))   { ret 1; }
+    if (t_bool(apply_equality(expr.BIN_EQ, neg, big)))   { ret 1; }
+    if (!t_bool(apply_equality(expr.BIN_NEQ, neg, big))) { ret 1; }
+    ret 0;
+}
+
+test "comptime: equal magnitudes across signedness compare equal (#1272)" {
+    val s5: CTValue = unwrap_ok[CTValue, str](int_value(5));
+    val u5: CTValue = unwrap_ok[CTValue, str](make_int_value(5, true));
+    if (!t_bool(apply_equality(expr.BIN_EQ, s5, u5))) { ret 1; }
+    if (t_bool(apply_compare(expr.BIN_LT, s5, u5)))   { ret 1; }
+    ret 0;
+}
+
+test "comptime: u64-range arithmetic computes the unsigned value, not the signed (#1272)" {
+    val big: CTValue = unwrap_ok[CTValue, str](t_eval_int("0xFFFFFFFFFFFFFFFF"));
+    val two: CTValue = unwrap_ok[CTValue, str](int_value(2));
+    val q:   CTValue = unwrap_ok[CTValue, str](apply_arith(expr.BIN_DIV, big, two));
+    # unsigned: (2^64-1)/2 == 0x7FFFFFFFFFFFFFFF; a signed -1/2 would fold to 0.
+    if (q.data.i:~u64 != 0x7FFFFFFFFFFFFFFF) { ret 1; }
+    if (!q.int_unsigned) { ret 1; }
+    ret 0;
+}
+
+test "comptime: arithmetic at the u64 boundary stays unsigned and traps overflow (#1272)" {
+    val big:  CTValue = unwrap_ok[CTValue, str](t_eval_int("0xFFFFFFFFFFFFFFFF"));
+    val one:  CTValue = unwrap_ok[CTValue, str](int_value(1));
+    val zero: CTValue = unwrap_ok[CTValue, str](int_value(0));
+    # u64::MAX - 1 is still a huge positive, > 0.
+    val dec: CTValue = unwrap_ok[CTValue, str](apply_arith(expr.BIN_SUB, big, one));
+    if (!t_bool(apply_compare(expr.BIN_GT, dec, zero))) { ret 1; }
+    if (dec.data.i:~u64 != 0xFFFFFFFFFFFFFFFE) { ret 1; }
+    # u64::MAX + 1 overflows the unsigned range and must error, not wrap to 0.
+    if (!is_err[CTValue, str](apply_arith(expr.BIN_ADD, big, one))) { ret 1; }
+    ret 0;
+}
+
+test "comptime: signed integer overflow errors instead of wrapping (#1272)" {
+    val imax: CTValue = unwrap_ok[CTValue, str](int_value(t_i64_max()));
+    val one:  CTValue = unwrap_ok[CTValue, str](int_value(1));
+    if (!is_err[CTValue, str](apply_arith(expr.BIN_ADD, imax, one))) { ret 1; }
+    # an ordinary signed subtraction still folds (5 - 10 == -5, signed).
+    val five: CTValue = unwrap_ok[CTValue, str](int_value(5));
+    val ten:  CTValue = unwrap_ok[CTValue, str](int_value(10));
+    val d:    CTValue = unwrap_ok[CTValue, str](apply_arith(expr.BIN_SUB, five, ten));
+    if (d.data.i != (0 - 5)) { ret 1; }
+    if (d.int_unsigned) { ret 1; }
+    ret 0;
+}
+
+test "comptime: >> is logical for unsigned and arithmetic for signed operands (#1272)" {
+    val big: CTValue = unwrap_ok[CTValue, str](t_eval_int("0xFFFFFFFFFFFFFFFF"));
+    val one: CTValue = unwrap_ok[CTValue, str](int_value(1));
+    # logical shift of the unsigned magnitude: 0xFFFF... >> 1 == 0x7FFF...
+    val lu: CTValue = unwrap_ok[CTValue, str](apply_arith(expr.BIN_SHR, big, one));
+    if (lu.data.i:~u64 != 0x7FFFFFFFFFFFFFFF) { ret 1; }
+    # arithmetic shift of a signed negative: (-2) >> 1 == -1.
+    val negtwo: CTValue = unwrap_ok[CTValue, str](int_value(0 - 2));
+    val ls: CTValue = unwrap_ok[CTValue, str](apply_arith(expr.BIN_SHR, negtwo, one));
+    if (ls.data.i != (0 - 1)) { ret 1; }
+    ret 0;
+}
+
+test "comptime: negation is value-correct across the i64/u64 boundary (#1272)" {
+    val imin: CTValue = unwrap_ok[CTValue, str](int_value(t_i64_min()));
+    val n:    CTValue = unwrap_ok[CTValue, str](ct_negate(imin));
+    # -(i64 MIN) == +2^63, representable only as unsigned.
+    if (!n.int_unsigned) { ret 1; }
+    if (n.data.i:~u64 != 0x8000000000000000) { ret 1; }
+    # negating a u64 magnitude above 2^63 has no representable result.
+    val big: CTValue = unwrap_ok[CTValue, str](t_eval_int("0xFFFFFFFFFFFFFFFF"));
+    if (!is_err[CTValue, str](ct_negate(big))) { ret 1; }
     ret 0;
 }
