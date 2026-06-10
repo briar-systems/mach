@@ -63,6 +63,8 @@ use fs:   std.filesystem;
 use intern: mach.lang.intern;
 use isa:    mach.lang.target.isa;
 use of:     mach.lang.target.of;
+use map:     std.collections.map;
+use maphash: std.collections.map;
 
 # COFF machine type for x86-64.
 val IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -1324,24 +1326,70 @@ fun coff_parse_object(alloc: *Allocator, buf: *u8, buf_size: usize, out: *of.Obj
         s = s + 1;
     }
 
-    # some external COFF producers leave an undefined import's Type field as 0
-    # (no DT_FUNCTION) even when every reference is a call relocation. recover the
-    # function bit from the reloc stream so dynamic-import discovery can still bind
-    # those call targets through import stubs.
-    infer_extern_function_flags_from_calls(out);
+    # foreign COFF inputs (objects/archives from other toolchains, linked via
+    # explicit object-path arguments) may leave an undefined import's Type field 0
+    # even when every reference is a call relocation. recover the function bit from
+    # the reloc stream so dynamic-import discovery can still bind those call targets
+    # through import stubs. mach's own emitter always stamps DT_FUNCTION on a
+    # call-target import (codegen `pack_reloc_externs`), so this never fires for
+    # mach-produced objects — see issue #1231.
+    val inf: Result[bool, str] = infer_extern_function_flags_from_calls(out);
 
     deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+    if (is_err[bool, str](inf)) { ret err[bool, str](unwrap_err[bool, str](inf)); }
     ret ok[bool, str](true);
 }
 
-# infer_extern_function_flags_from_calls: mark an undefined external symbol as a
-# function import when some relocation calls it (`pc32`/`plt32`) but the symbol
-# record itself lacks the function type bit. this preserves dynamic import binding
-# for COFF inputs emitted by toolchains that encode undefined import type as 0.
-# only infers when the relocation site is preceded by a `call rel32` (0xE8) or
-# `jmp rel32` (0xE9) opcode byte; data-referencing pc32 relocations are excluded.
-fun infer_extern_function_flags_from_calls(out: *of.ObjectImage) {
-    if (out == nil || out.reloc_count == 0 || out.symbol_count == 0) { ret; }
+# is_flagless_extern: whether a symbol is an undefined external import that still
+# lacks the function type bit — the candidate set inference may recover.
+fun is_flagless_extern(sym: *of.Symbol) bool {
+    if (sym.section != of.SECTION_EXTERNAL) { ret false; }
+    if ((sym.flags & of.SYM_OBJ_FLAG_EXTERN) == 0) { ret false; }
+    ret (sym.flags & of.SYM_OBJ_FLAG_FUNCTION) == 0;
+}
+
+# infer_extern_function_flags_from_calls: recover the function type bit for an
+# undefined external symbol that a relocation calls (`pc32`/`plt32` whose site is
+# preceded by a `call`/`jmp rel32` opcode, 0xE8/0xE9) but whose symbol record
+# encodes Type 0. this serves foreign COFF inputs from toolchains that leave an
+# undefined import's type at 0; mach's own emitter already stamps DT_FUNCTION on
+# such imports (codegen `pack_reloc_externs`), so the candidate set below is empty
+# for mach-produced objects and the pass returns before allocating. the flagless
+# undefined externs are indexed by name once, so each call reloc is an O(1) lookup
+# rather than a full symbol-table scan (issue #1231).
+fun infer_extern_function_flags_from_calls(out: *of.ObjectImage) Result[bool, str] {
+    if (out == nil || out.reloc_count == 0 || out.symbol_count == 0) {
+        ret ok[bool, str](true);
+    }
+
+    # candidates are undefined externs still missing the function bit — the only
+    # symbols inference can change. mach objects have none, so the common path
+    # returns here without allocating.
+    var candidates: u32 = 0;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (is_flagless_extern(?out.symbols[si])) { candidates = candidates + 1; }
+        si = si + 1;
+    }
+    if (candidates == 0) { ret ok[bool, str](true); }
+
+    # index those candidates by name so each call reloc is an O(1) lookup rather
+    # than a full symbol-table scan.
+    var idx: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](out.alloc, maphash.hash_u32, maphash.eq_u32);
+    si = 0;
+    for (si < out.symbol_count) {
+        if (is_flagless_extern(?out.symbols[si])) {
+            val ins: Result[bool, str] =
+                map.insert[intern.StrId, u32](?idx, out.symbols[si].name, si);
+            if (is_err[bool, str](ins)) {
+                map.dnit[intern.StrId, u32](?idx);
+                ret err[bool, str](unwrap_err[bool, str](ins));
+            }
+        }
+        si = si + 1;
+    }
+
     var ri: u32 = 0;
     for (ri < out.reloc_count) {
         val r: *of.Relocation = ?out.relocations[ri];
@@ -1353,18 +1401,17 @@ fun infer_extern_function_flags_from_calls(out: *of.ObjectImage) {
         if (r.offset::usize + 4 > sec.len::usize) { ri = ri + 1; cnt; }
         val op: u8 = sec.bytes[r.offset::usize - 1];
         if (op != 0xE8 && op != 0xE9) { ri = ri + 1; cnt; }
-        var si: u32 = 0;
-        for (si < out.symbol_count) {
-            val sym: *of.Symbol = ?out.symbols[si];
-            if (sym.name == r.symbol && sym.section == of.SECTION_EXTERNAL
-                && (sym.flags & of.SYM_OBJ_FLAG_EXTERN) != 0) {
-                sym.flags = sym.flags | of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_GLOBAL;
-                brk;
-            }
-            si = si + 1;
-        }
+
+        val g: Result[*u32, str] = map.get[intern.StrId, u32](?idx, ?r.symbol);
+        if (is_err[*u32, str](g)) { ri = ri + 1; cnt; }
+        val sidx: u32 = @unwrap_ok[*u32, str](g);
+        out.symbols[sidx].flags =
+            out.symbols[sidx].flags | of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_GLOBAL;
         ri = ri + 1;
     }
+
+    map.dnit[intern.StrId, u32](?idx);
+    ret ok[bool, str](true);
 }
 
 # the resolved layout of one PE section: its in-memory RVA (relative to ImageBase)
@@ -2896,7 +2943,89 @@ test "coff: emit_exec writes a well-formed PE32+ header" {
     ret 0;
 }
 
-test "coff: parse infers function imports from call relocations" {
+# the real #1211 path: mach's codegen stamps DT_FUNCTION on a call-target import,
+# and emit/parse must preserve it without any inference. this guards the actual
+# mechanism the inference is wrongly credited with — the import keeps its function
+# bit through the round-trip even though it is, like a real undefined import,
+# defined in no section.
+test "coff: a function-flagged call-target import round-trips DT_FUNCTION" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    val rr: Result[bool, str] = register_coff(?alloc, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    val vt_o: Option[*of.OfVTable] = of.lookup(of.OF_COFF);
+    if (!is_some[*of.OfVTable](vt_o)) { ret 1; }
+    val vt: *of.OfVTable = unwrap[*of.OfVTable](vt_o);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # a defined `main` whose body calls an undefined function import, exactly as
+    # codegen emits one: the import carries FUNCTION|EXTERN|GLOBAL up front.
+    var text_bytes: [8]u8;
+    text_bytes[0] = 0xE8;  # call rel32
+    text_bytes[1] = 0; text_bytes[2] = 0; text_bytes[3] = 0; text_bytes[4] = 0;
+    text_bytes[5] = 0x90; text_bytes[6] = 0x90; text_bytes[7] = 0xC3;
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "GetCommandLineA"); syms[1].section = of.SECTION_EXTERNAL;
+    syms[1].offset = 0; syms[1].size = 0;
+    syms[1].flags =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+
+    val k_pc32: intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = k_pc32;
+    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_rtf");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = coff_parse_object(?alloc, buf.data, buf.len, ?out);
+    if (is_err[bool, str](pr)) { ret 1; }
+
+    var saw: bool = false;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (out.symbols[si].name == syms[1].name) {
+            saw = true;
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_EXTERN) == 0) { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_FUNCTION) == 0) { ret 1; }
+        }
+        si = si + 1;
+    }
+    if (!saw) { ret 1; }
+
+    ret 0;
+}
+
+test "coff: parse infers function imports from a foreign object's call relocations" {
     var alloc: Allocator;
     page.make(?alloc);
     var i: intern.Interner = intern.init(?alloc);
@@ -2926,8 +3055,9 @@ test "coff: parse infers function imports from call relocations" {
     syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
     syms[1].name = t_intern(?i, "GetCommandLineA"); syms[1].section = of.SECTION_EXTERNAL;
     syms[1].offset = 0; syms[1].size = 0;
-    # intentionally omit FUNCTION to emulate toolchains that encode undefined
-    # import type as 0; parser must recover function intent from the call reloc.
+    # omit FUNCTION to emulate a foreign toolchain that encodes an undefined import
+    # type as 0 (mach's own emitter never does — see the round-trip test below); the
+    # parser must recover function intent from the call reloc so the import binds.
     syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
 
     val k_pc32: intern.StrId = of.reloc_kind_name(vt, of.RK_PC32);
