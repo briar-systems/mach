@@ -88,16 +88,12 @@ pub val VC_TYPE_RESOLVE:    VerifyCheck = 11;
 # that every downstream consumer would dereference out of bounds.
 pub val VC_DANGLING_ID:     VerifyCheck = 12;
 
-# an instruction's recorded `block` field disagrees with the block whose list
-# actually names it; the back end trusts `Instruction.block` for placement.
-pub val VC_BLOCK_AGREE:     VerifyCheck = 13;
-
 # two operands an opcode requires to share a type disagree, or an operand's type
 # violates the opcode's typing contract (a binary op's operands differ, a branch
 # condition is not an integer, a store/load/gep base is not a pointer, a ret's
 # value type disagrees with the function signature, a branch target is not a
 # const-int block id). opt-in alongside the other `repr` checks.
-pub val VC_TYPE_AGREE:      VerifyCheck = 14;
+pub val VC_TYPE_AGREE:      VerifyCheck = 13;
 
 # one invariant failure, located as precisely as the failing check allows.
 # ---
@@ -207,7 +203,6 @@ pub fun describe(check: VerifyCheck) str {
     if (check == VC_AGG_ADDRESS)     { ret "aggregate representation: aggregate-typed operand is not address-producing"; }
     if (check == VC_TYPE_RESOLVE)    { ret "type resolution: operand or aux type does not resolve"; }
     if (check == VC_DANGLING_ID)     { ret "dangling id: a block list names an out-of-range instruction id"; }
-    if (check == VC_BLOCK_AGREE)     { ret "block agreement: instruction.block disagrees with its listing block"; }
     if (check == VC_TYPE_AGREE)      { ret "type agreement: operand types violate the opcode's typing contract"; }
     ret "unknown verification check";
 }
@@ -304,11 +299,10 @@ fun mark_def(seen: *u8, iid: id.InstructionId, fn: *ir.Function, bi: u32, fi: u3
     ret ok[bool, str](true);
 }
 
-# VC_DANGLING_ID + VC_BLOCK_AGREE: every InstructionId named in a block's phi
-# list, body list, or terminator slot must be in range, and the instruction it
-# names must record that same block in its `block` field. these are the silent
-# skips every other walk relied on; flagging them here turns block-list
-# corruption into a precise violation instead of a downstream OOB read.
+# VC_DANGLING_ID: every InstructionId named in a block's phi list, body list, or
+# terminator slot must be in range. this is the silent skip every other walk
+# relied on; flagging it here turns block-list corruption into a precise
+# violation instead of a downstream out-of-bounds read.
 fun check_block_lists(fn: *ir.Function, fi: u32, r: *VerifyReport) Result[bool, str] {
     var bi: u32 = 0;
     for (bi < fn.block_count) {
@@ -336,15 +330,15 @@ fun check_block_lists(fn: *ir.Function, fi: u32, r: *VerifyReport) Result[bool, 
     ret ok[bool, str](true);
 }
 
-# checks one block-list id: out-of-range / INSTR_NIL is VC_DANGLING_ID, otherwise
-# the named instruction's `block` field must equal the listing block.
+# checks one block-list id: out-of-range / INSTR_NIL is VC_DANGLING_ID. the
+# instruction's own `block` field is intentionally NOT cross-checked here:
+# Instruction.block is vestigial (no consumer reads it — the back end derives
+# placement from the block lists, regalloc's FlatInstr) and passes maintain it
+# inconsistently, so verifying it would flag harmless transient metadata. see
+# the block-agreement note on #1250.
 fun check_listed_id(fn: *ir.Function, iid: id.InstructionId, fi: u32, bid: id.BlockId, r: *VerifyReport) Result[bool, str] {
     if (iid == id.INSTR_NIL || iid >= fn.instr_len) {
         ret push(r, fi, bid, iid, VC_DANGLING_ID);
-    }
-    val ins: *instr.Instruction = ?fn.instrs[iid];
-    if (ins.block != bid) {
-        ret push(r, fi, bid, iid, VC_BLOCK_AGREE);
     }
     ret ok[bool, str](true);
 }
@@ -469,24 +463,127 @@ fun check_one_instr(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, fi: 
         }
         oi = oi + 1;
     }
-    # VC_TYPE_RESOLVE: a GEP with indices descends from its source-pointee aux_ty;
-    # it must resolve (an aggregate kind is NOT required — a single-index pointer
-    # stride legitimately walks a scalar element type).
-    if (repr && ins.kind == instr.OP_GEP && ins.operand_count > 1) {
-        val at: Option[*ir_type.IrType] = ir_type.get(?m.types, ins.aux_ty);
-        if (!is_some[*ir_type.IrType](at)) {
-            val rr: Result[bool, str] = push(r, fi, bid, iid, VC_TYPE_RESOLVE);
-            if (is_err[bool, str](rr)) { ret rr; }
-        }
+    if (repr) {
+        val ax: Result[bool, str] = check_aux_resolve(m, ins, fi, bid, iid, r);
+        if (is_err[bool, str](ax)) { ret ax; }
+        val ta: Result[bool, str] = check_type_agree(m, ins, fi, bid, iid, r);
+        if (is_err[bool, str](ta)) { ret ta; }
     }
     ret ok[bool, str](true);
+}
+
+# VC_TYPE_RESOLVE: the per-opcode auxiliary type slot must resolve in the type
+# table. each opcode that carries a type the back end resolves is checked:
+#   OP_GEP     aux_ty  the source pointee the index walk descends (when indexed)
+#   OP_MEMZERO aux_ty  the aggregate pointee whose byte_size sizes the fill
+#   OP_CALL    aux_ty  the stamped IRT_FN signature classifying the ABI
+#   OP_ALLOCA  ty      the allocated element type sizing the stack slot
+# a stale id silently classifies as scalar/size-8 (or zeroes nothing for
+# memzero) downstream, so an unresolvable aux type is a real miscompile.
+fun check_aux_resolve(m: *ir.Module, ins: *instr.Instruction, fi: u32, bid: id.BlockId, iid: id.InstructionId, r: *VerifyReport) Result[bool, str] {
+    var ty: ir_type.IrTypeId = ir_type.IRT_NIL;
+    if (ins.kind == instr.OP_GEP && ins.operand_count > 1) { ty = ins.aux_ty; }
+    or (ins.kind == instr.OP_MEMZERO) { ty = ins.aux_ty; }
+    or (ins.kind == instr.OP_CALL)    { ty = ins.aux_ty; }
+    or (ins.kind == instr.OP_ALLOCA)  { ty = ins.ty; }
+    or { ret ok[bool, str](true); }
+
+    val at: Option[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (!is_some[*ir_type.IrType](at)) {
+        ret push(r, fi, bid, iid, VC_TYPE_RESOLVE);
+    }
+    ret ok[bool, str](true);
+}
+
+# VC_TYPE_AGREE: the cleanly well-defined operand-typing contracts the builder
+# emits on trust. a binary/compare op's two operands share a type (the result
+# type the builder copies from lhs is then unambiguous); a load/store/gep/memzero
+# addresses memory (an IR pointer or an aggregate carried by address); a branch
+# target is a const-int block id and a cbr condition is integer-typed. ret-value-
+# vs-signature and call-args-vs-signature need IRT_FN payload + vararg/sret
+# reasoning and are scoped on #1250. shifts are excluded: a shift count
+# legitimately differs in width from the shifted value.
+fun check_type_agree(m: *ir.Module, ins: *instr.Instruction, fi: u32, bid: id.BlockId, iid: id.InstructionId, r: *VerifyReport) Result[bool, str] {
+    val k: instr.InstrKind = ins.kind;
+
+    if (is_binary_agree(k) && ins.operand_count == 2) {
+        val t0: ir_type.IrTypeId = ins.operands[0].ty;
+        val t1: ir_type.IrTypeId = ins.operands[1].ty;
+        # exact type identity, except that two pointer-ish operands agree even when
+        # their ids differ: by the aggregate-representation convention an address
+        # can be IRT_PTR (a plain pointer / nil), an IRT_FN (a function pointer), or
+        # an aggregate type, so pointer/fnptr/aggregate-vs-nil compares are well
+        # typed. the check still catches scalar width / int-vs-float mismatches.
+        if (t0 != t1 && !(is_pointerish(m, t0) && is_pointerish(m, t1))) {
+            ret push(r, fi, bid, iid, VC_TYPE_AGREE);
+        }
+    }
+    if (k == instr.OP_LOAD && ins.operand_count >= 1) {
+        if (!is_address_typed(m, ins.operands[0].ty)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_STORE && ins.operand_count >= 2) {
+        if (!is_address_typed(m, ins.operands[1].ty)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_GEP && ins.operand_count >= 1) {
+        if (!is_address_typed(m, ins.operands[0].ty)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_MEMZERO && ins.operand_count >= 1) {
+        if (!is_address_typed(m, ins.operands[0].ty)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_BR && ins.operand_count >= 1) {
+        if (ins.operands[0].kind != value.VAL_CONST_INT) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    if (k == instr.OP_CBR && ins.operand_count >= 3) {
+        if (!type_has_kind(m, ins.operands[0].ty, ir_type.IRT_INT)) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+        if (ins.operands[1].kind != value.VAL_CONST_INT) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+        if (ins.operands[2].kind != value.VAL_CONST_INT) { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
+    }
+    ret ok[bool, str](true);
+}
+
+# true for the binary and comparison opcodes whose two operands must share a
+# type. shifts are deliberately absent (the count may differ in width).
+fun is_binary_agree(k: instr.InstrKind) bool {
+    if (k == instr.OP_ADD || k == instr.OP_SUB || k == instr.OP_MUL) { ret true; }
+    if (k == instr.OP_DIV_S || k == instr.OP_DIV_U) { ret true; }
+    if (k == instr.OP_REM_S || k == instr.OP_REM_U) { ret true; }
+    if (k == instr.OP_AND || k == instr.OP_OR || k == instr.OP_XOR) { ret true; }
+    if (k == instr.OP_CMP_EQ || k == instr.OP_CMP_NE) { ret true; }
+    if (k == instr.OP_CMP_LT_S || k == instr.OP_CMP_LT_U) { ret true; }
+    if (k == instr.OP_CMP_LE_S || k == instr.OP_CMP_LE_U) { ret true; }
+    ret false;
+}
+
+# true when type id `ty` resolves to a type of kind `k`.
+fun type_has_kind(m: *ir.Module, ty: ir_type.IrTypeId, k: ir_type.IrTypeKind) bool {
+    val ot: Option[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (!is_some[*ir_type.IrType](ot)) { ret false; }
+    ret unwrap[*ir_type.IrType](ot).kind == k;
+}
+
+# true when `ty` denotes a memory address: an IR pointer, or an aggregate type.
+# by the IR's aggregate-representation convention an aggregate value is carried
+# by address (a pointer tagged with the aggregate type, see value.retype), so a
+# load/store/gep/memzero base may be aggregate-typed as well as IRT_PTR.
+fun is_address_typed(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    if (type_has_kind(m, ty, ir_type.IRT_PTR)) { ret true; }
+    ret ir_type.is_aggregate(?m.types, ty);
+}
+
+# true when `ty` is physically a pointer-sized address: an IR pointer, a function
+# pointer (IRT_FN — compared against nil and each other), or an aggregate carried
+# by address. used to bless pointer-vs-nil / fnptr-vs-nil / aggregate compares,
+# which are well-typed even though the operand type ids differ.
+fun is_pointerish(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    if (type_has_kind(m, ty, ir_type.IRT_FN)) { ret true; }
+    ret is_address_typed(m, ty);
 }
 
 # agg_value_is_address_producing: an aggregate value flows by address, so a valid
 # aggregate-typed operand must be a global (its symbol IS the address), a parameter
 # (lower_params establishes its storage), or the result of an address-producing
-# instruction. alloca/gep yield addresses directly; load/call/bitcast pass an
-# aggregate's storage pointer through (the back end reads it by reference). a
+# instruction. alloca/gep yield addresses directly; load/call/va_arg/bitcast pass
+# an aggregate's storage pointer through (the back end reads it by reference). a
 # constant cannot be an aggregate's storage address.
 fun agg_value_is_address_producing(fn: *ir.Function, op: *value.Value) bool {
     if (op.kind == value.VAL_GLOBAL) { ret true; }
@@ -496,7 +593,7 @@ fun agg_value_is_address_producing(fn: *ir.Function, op: *value.Value) bool {
         if (did >= fn.instr_len) { ret false; }
         val k: instr.InstrKind = (?fn.instrs[did]).kind;
         ret k == instr.OP_ALLOCA || k == instr.OP_GEP || k == instr.OP_LOAD
-            || k == instr.OP_CALL || k == instr.OP_BITCAST;
+            || k == instr.OP_CALL || k == instr.OP_BITCAST || k == instr.OP_VA_ARG;
     }
     ret false;
 }
@@ -1416,5 +1513,61 @@ test "ir.verify: rebuild_preds keeps both edges of a same-target cbr" {
     if (is_err[bool, str](ir.rebuild_preds(?env.m, ?env.m.functions[0]))) { ret 1; }
     if (t_count(?env, false, false, VC_PRED_CONSISTENT) != 0) { ret 1; }
     if (env.m.functions[0].blocks[1].pred_count != 2) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: type agreement (repr) rejects mismatched binary operand types" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    val i32r: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?env.m.types, 32);
+    if (is_err[ir_type.IrTypeId, str](i32r)) { ret 1; }
+    val i32ty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](i32r);
+
+    builder.set_block(?env.bld, b0);
+    # add of an i64 and an i32 operand: the builder copies the result type from
+    # lhs without checking the operands agree.
+    if (is_err[value.Value, str](builder.emit_add(?env.bld, t_ci(?env, 0), value.const_int(0, i32ty)))) { ret 1; }
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    # the check is opt-in: repr surfaces it, the always-on (repr=false) run does not.
+    if (t_count(?env, false, true, VC_TYPE_AGREE) < 1) { ret 1; }
+    if (t_count(?env, false, false, VC_TYPE_AGREE) != 0) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: type agreement (repr) rejects a store through a non-pointer" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    builder.set_block(?env.bld, b0);
+    # store whose destination operand is an integer, not an address.
+    if (is_err[bool, str](builder.emit_store(?env.bld, t_ci(?env, 1), t_ci(?env, 0)))) { ret 1; }
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    if (t_count(?env, false, true, VC_TYPE_AGREE) < 1) { ret 1; }
+    ret 0;
+}
+
+test "ir.verify: type resolution (repr) flags an unresolvable alloca element type" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    builder.set_block(?env.bld, b0);
+    val ar: Result[value.Value, str] = builder.emit_alloca(?env.bld, env.i64ty, t_ci(?env, 1));
+    if (is_err[value.Value, str](ar)) { ret 1; }
+    val av: value.Value = unwrap_ok[value.Value, str](ar);
+    if (is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    # well-formed: the element type resolves.
+    if (t_count(?env, false, true, VC_TYPE_RESOLVE) != 0) { ret 1; }
+    # corrupt the element type (carried in ins.ty for alloca) to an out-of-range,
+    # non-sentinel id; check_aux_resolve must flag it.
+    val aid: id.InstructionId = av.data.instr;
+    env.m.functions[0].instrs[aid].ty = 0xFFFF::ir_type.IrTypeId;
+    if (t_count(?env, false, true, VC_TYPE_RESOLVE) < 1) { ret 1; }
     ret 0;
 }
