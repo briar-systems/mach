@@ -16,6 +16,9 @@
 set -euo pipefail
 
 MACH="${1:-mach}"
+# absolutize a path argument: the suites cd into temp dirs, so a relative
+# compiler path would break after the first cd.
+case "$MACH" in */*) MACH="$(cd "$(dirname "$MACH")" && pwd)/$(basename "$MACH")";; esac
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 STD="$REPO_ROOT/dep/mach-std"
