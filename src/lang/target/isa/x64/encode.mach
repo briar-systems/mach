@@ -285,7 +285,14 @@ fun encode_mem_operand(buf: *ByteBuf, reg: i32, op: *isa.Operand) {
         if (op.scale <= 1) { scale_bits = 0; }
         or (op.scale == 2) { scale_bits = 1; }
         or (op.scale == 4) { scale_bits = 2; }
-        or { scale_bits = 3; }
+        or (op.scale == 8) { scale_bits = 3; }
+        or {
+            # the x86 SIB scale field encodes 1/2/4/8 only; lowering produces only
+            # those and parse_asm_mem rejects any other inline-asm scale, so a
+            # non-power-of-two scale here is a backend bug -- rejected loudly rather
+            # than silently encoded as *8.
+            panic("encode: invalid SIB scale (must be 1, 2, 4, or 8)\n");
+        }
     }
 
     if (base == -1 && has_index) {
@@ -570,11 +577,15 @@ fun encode_fp_mov(mi: *isa.Inst, buf: *ByteBuf) i32 {
     }
 
     # a same-bank float move: load the source into the float scratch and store it to
-    # the destination, so every register / frame-slot / immediate shape encodes.
+    # the destination, so every register / frame-slot / immediate shape encodes. a
+    # load/store error means an operand reached here in a bank the move cannot model
+    # (a regalloc / lowering bug); surface its specific message loudly rather than
+    # returning zero bytes the driver would report as the generic "produced no bytes",
+    # matching encode_mem_operand's handling of the same class of backend bug.
     val ld: Result[bool, str] = emit_float_load(@src1, FLOAT_SCRATCH0, w, buf);
-    if (is_err[bool, str](ld)) { ret 0; }
+    if (is_err[bool, str](ld)) { panic(unwrap_err[bool, str](ld)::*u8); }
     val st: Result[bool, str] = emit_float_store(@dst, FLOAT_SCRATCH0, w, buf);
-    if (is_err[bool, str](st)) { ret 0; }
+    if (is_err[bool, str](st)) { panic(unwrap_err[bool, str](st)::*u8); }
     ret (buf.len - start)::i32;
 }
 
@@ -2480,7 +2491,11 @@ pub fun encode_x64(alloc: *Allocator, tgt: *target.Target, m: *mir.MirModule) Re
         fi = fi + 1;
     }
 
-    patch_branches(?st);
+    val pb: Result[bool, str] = patch_branches(?st);
+    if (is_err[bool, str](pb)) {
+        free_state(?st);
+        ret err[enc.EncoderOutput, str](unwrap_err[bool, str](pb));
+    }
 
     # right-size the text buffer so its allocation length equals `text_len`: the
     # object builder owns these bytes and frees them by `len`, so the backing
@@ -2760,15 +2775,27 @@ fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
     }
 
     if (has_block) {
+        # a block-referencing branch must have a rel32 patch site; a missing one means
+        # a branch shape reached the encoder without a relocation field (a backend
+        # bug), rejected loudly rather than guessed at `inst_size - 4` -- the symbol
+        # path below rejects the identical condition.
         val reloc_off: i32 = x86_reloc_offset(nil, ?inst, inst_size);
-        var patch_off: i32 = reloc_off;
-        if (patch_off < 0) { patch_off = inst_size - 4; }
-        val patch_pos: u32 = (inst_start + patch_off::usize)::u32;
+        if (reloc_off < 0) {
+            ret err[bool, str]("encode: block-referencing instruction has no relocation patch site");
+        }
+        val patch_pos: u32 = (inst_start + reloc_off::usize)::u32;
         val next_ip: u32 = (inst_start + inst_size::usize)::u32;
         ret push_fixup(st, patch_pos, next_ip, target_block, fn_base);
     }
 
-    if (has_sym && sym != intern.STR_NIL) {
+    if (has_sym) {
+        # has_sym means classify_refs found a MIR_OP_SYM operand, so it must carry a
+        # resolved interned name; a nil name means a symbol operand reached the encoder
+        # unresolved (a backend bug), rejected loudly rather than emitted as
+        # unrelocated bytes the linker would leave pointing at the wrong address.
+        if (sym == intern.STR_NIL) {
+            ret err[bool, str]("encode: symbol-referencing instruction has no resolved symbol name");
+        }
         # the instruction names a relocatable symbol, so it must have a patch site;
         # a missing one means an instruction shape reached the encoder without a
         # reloc field (a backend bug), rejected loudly rather than emitted as
@@ -4488,7 +4515,11 @@ fun parse_asm_mem(tok: str, len: usize, op: *AsmOperand) bool {
         if (!copy_trimmed(tok, star + 1, bi_hi, ?buf[0], 32)) { ret false; }
         val scr: Result[i64, str] = parse.parse_i64_exact((?buf[0])::str, 0);
         if (is_err[i64, str](scr)) { ret false; }
-        op.scale = unwrap_ok[i64, str](scr)::u8;
+        val scale_val: i64 = unwrap_ok[i64, str](scr);
+        # the x86 SIB scale field encodes 1/2/4/8 only; reject any other scale here so
+        # it surfaces as an inline-asm parse failure rather than silently encoding *8.
+        if (scale_val != 1 && scale_val != 2 && scale_val != 4 && scale_val != 8) { ret false; }
+        op.scale = scale_val::u8;
     } or {
         # `[ base ]` or `[ symbol ]` (no index term).
         if (!copy_trimmed(tok, inner_lo, bi_hi, ?buf[0], 32)) { ret false; }
@@ -4990,33 +5021,43 @@ fun classify_refs(mi: *mir.MirInstr, target_block: *u32, has_block: *bool,
 
 # pass 2: patch each recorded intra-module branch fixup with the rel32
 # displacement from the end of the branch to the start of its target block.
-fun patch_branches(st: *EncodeState) {
-    if (st.buf.data == nil) { ret; }
+fun patch_branches(st: *EncodeState) Result[bool, str] {
+    if (st.buf.data == nil) { ret ok[bool, str](true); }
     var i: u32 = 0;
     for (i < st.fixup_count) {
         val fx: *BranchFixup = ?st.fixups[i];
-        val target_off: u32 = block_offset(st, fx.fn_text_base, fx.target_block);
+        val tr: Result[u32, str] = block_offset(st, fx.fn_text_base, fx.target_block);
+        if (is_err[u32, str](tr)) { ret err[bool, str](unwrap_err[u32, str](tr)); }
+        val target_off: u32 = unwrap_ok[u32, str](tr);
         val disp: i32 = target_off::i32 - fx.next_ip::i32;
-        if (fx.patch_pos::usize + 4 <= st.buf.len) {
-            st.buf.data[fx.patch_pos]     = (disp & 0xFF)::u8;
-            st.buf.data[fx.patch_pos + 1] = ((disp >> 8) & 0xFF)::u8;
-            st.buf.data[fx.patch_pos + 2] = ((disp >> 16) & 0xFF)::u8;
-            st.buf.data[fx.patch_pos + 3] = ((disp >> 24) & 0xFF)::u8;
+        # the fixup site was recorded when its branch was emitted, so it must lie
+        # within the text buffer; an out-of-range site is a backend bug, rejected
+        # loudly rather than skipped (which would leave a zero rel32 branching into
+        # the first function).
+        if (fx.patch_pos::usize + 4 > st.buf.len) {
+            ret err[bool, str]("encode: branch fixup site is outside the text buffer");
         }
+        st.buf.data[fx.patch_pos]     = (disp & 0xFF)::u8;
+        st.buf.data[fx.patch_pos + 1] = ((disp >> 8) & 0xFF)::u8;
+        st.buf.data[fx.patch_pos + 2] = ((disp >> 16) & 0xFF)::u8;
+        st.buf.data[fx.patch_pos + 3] = ((disp >> 24) & 0xFF)::u8;
         i = i + 1;
     }
+    ret ok[bool, str](true);
 }
 
-# resolve a function-local block id to its `.text` offset (0 if unrecorded).
-fun block_offset(st: *EncodeState, fn_base: u32, block_id: u32) u32 {
+# resolve a function-local block id to its `.text` offset. an unrecorded target is
+# a backend bug (a branch to a block the encoder never emitted), rejected loudly
+# rather than resolved to offset 0 (a branch into the first function's middle).
+fun block_offset(st: *EncodeState, fn_base: u32, block_id: u32) Result[u32, str] {
     var i: u32 = 0;
     for (i < st.block_count) {
         if (st.blocks[i].fn_text_base == fn_base && st.blocks[i].block_id == block_id) {
-            ret st.blocks[i].offset;
+            ret ok[u32, str](st.blocks[i].offset);
         }
         i = i + 1;
     }
-    ret 0;
+    ret err[u32, str]("encode: branch target block was never recorded");
 }
 
 # build an inactive (OPK_NONE) operand with no register references.
