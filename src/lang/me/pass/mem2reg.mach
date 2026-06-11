@@ -39,8 +39,11 @@ use instr:   mach.lang.me.ir.instruction;
 use value:   mach.lang.me.ir.value;
 use ir_type: mach.lang.me.ir.type;
 use id:      mach.lang.me.ir.id;
+use builder: mach.lang.me.ir.builder;
+use intern:  mach.lang.intern;
 
 use map:     std.collections.map;
+use page:    std.allocator.page;
 
 # sentinel marking an unprocessed entry in u32 work arrays (idom / rpo index).
 val NONE_U32: u32 = 0xFFFFFFFF;
@@ -1328,4 +1331,103 @@ fun is_promoted_memop(st: *State, iid: id.InstructionId) bool {
         }
     }
     ret false;
+}
+
+# counts the OP_ALLOCA instructions still listed in a block's instruction stream
+# (test helper).
+fun live_alloca_count(fn: *ir.Function, blk: *ir.Block) u32 {
+    var n: u32 = 0;
+    var ix: u32 = 0;
+    for (ix < blk.instr_count) {
+        val opt: Option[*instr.Instruction] = ir.get_instruction(fn, blk.instructions[ix]);
+        if (is_some[*instr.Instruction](opt)) {
+            if (unwrap[*instr.Instruction](opt).kind == instr.OP_ALLOCA) { n = n + 1; }
+        }
+        ix = ix + 1;
+    }
+    ret n;
+}
+
+# unlinks instruction `iid` from a block's instruction list, leaving it in the
+# pool as a ghost — the exact state inline leaves a removed call in (test helper).
+fun unlink_block_instr(blk: *ir.Block, iid: id.InstructionId) {
+    var w: u32 = 0;
+    var ix: u32 = 0;
+    for (ix < blk.instr_count) {
+        if (blk.instructions[ix] != iid) {
+            blk.instructions[w] = blk.instructions[ix];
+            w = w + 1;
+        }
+        ix = ix + 1;
+    }
+    blk.instr_count = w;
+}
+
+test "mem2reg: an alloca whose escaping call is removed (as inline does) promotes on a re-run (#1281)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    val mr: Result[ir.Module, str] = ir.init_module(?alloc, intern.STR_NIL);
+    if (is_err[ir.Module, str](mr)) { ret 1; }
+    var m: ir.Module = unwrap_ok[ir.Module, str](mr);
+
+    val tr: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret 1; }
+    val i64t: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+    val vr: Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (is_err[ir_type.IrTypeId, str](vr)) { ret 1; }
+    val voidt: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](vr);
+    val ppr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (is_err[ir_type.IrTypeId, str](ppr)) { ret 1; }
+    val ptrt: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ppr);
+
+    # a dummy callee for the escaping call to name.
+    val cer: Result[u32, str] = ir.add_function(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (is_err[u32, str](cer)) { ret 1; }
+    val callee_ix: u32 = unwrap_ok[u32, str](cer);
+
+    # caller: p = alloca i64; store 0 -> p; call dummy(p); v = load p; ret v.
+    val car: Result[u32, str] = ir.add_function(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (is_err[u32, str](car)) { ret 1; }
+    val caller_ix: u32 = unwrap_ok[u32, str](car);
+    val fn: *ir.Function = ?m.functions[caller_ix];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val e0: Result[id.BlockId, str] = builder.new_block(?bld);
+    if (is_err[id.BlockId, str](e0)) { ret 1; }
+    val entry: id.BlockId = unwrap_ok[id.BlockId, str](e0);
+    builder.set_block(?bld, entry);
+
+    val ar: Result[value.Value, str] = builder.emit_alloca(?bld, i64t, value.const_int(1, i64t));
+    if (is_err[value.Value, str](ar)) { ret 1; }
+    val p: value.Value = unwrap_ok[value.Value, str](ar);
+
+    if (is_err[bool, str](builder.emit_store(?bld, value.const_int(0, i64t), p))) { ret 1; }
+
+    var args: [1]value.Value;
+    args[0] = p;
+    val callee_val: value.Value = value.fn_value(callee_ix, ptrt);
+    val crr: Result[value.Value, str] = builder.emit_call(?bld, callee_val, ?args[0], 1, voidt);
+    if (is_err[value.Value, str](crr)) { ret 1; }
+    val call_v: value.Value = unwrap_ok[value.Value, str](crr);
+    val call_id: id.InstructionId = call_v.data.instr;
+
+    val lr: Result[value.Value, str] = builder.emit_load(?bld, p, i64t);
+    if (is_err[value.Value, str](lr)) { ret 1; }
+    if (is_err[bool, str](builder.emit_ret(?bld, unwrap_ok[value.Value, str](lr)))) { ret 1; }
+
+    val entry_blk: *ir.Block = ?fn.blocks[entry::u32];
+
+    # first mem2reg: p's address escapes into the call, so it is not promoted.
+    if (is_err[bool, str](run(?m))) { ret 1; }
+    if (live_alloca_count(fn, entry_blk) != 1) { ret 1; }
+
+    # simulate inline removing the call: unlink it, leaving a pool ghost.
+    unlink_block_instr(entry_blk, call_id);
+
+    # second mem2reg: the escaping call is gone (and the ghost is skipped), so p
+    # promotes to SSA and its alloca leaves the block.
+    if (is_err[bool, str](run(?m))) { ret 1; }
+    if (live_alloca_count(fn, entry_blk) != 0) { ret 1; }
+    ret 0;
 }
