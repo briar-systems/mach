@@ -37,11 +37,16 @@ Read by `build`, `run`, `test`, and `doc` (they share one config parser).
 | `--quiet`, `-q`  | —                | suppress non-error output |
 | `--color <mode>` | `auto`\|`always`\|`never` | color preference for terminal output (default `auto`); an unknown mode is a parse error |
 | `--cwd <path>`   | path             | run as if started in `<path>` (project-root search begins there) |
-| `--target <name>`| target name      | select a `[targets.<name>]` entry; absent, defers to `[project].target` |
+| `--target <name>`| target name      | select a declared target; absent, defers to `[project].target` |
+| `--profile <name>`| profile name    | select a `[profile.<name>]` build variant (v2 manifest); absent, the first declared profile |
+| `--bin <name>`   | artifact name    | narrow a v2 build to one `[bin.<name>]` artifact |
+| `--lib <name>`   | artifact name    | narrow a v2 build to one `[lib.<name>]` artifact (mutually exclusive with `--bin`) |
 | `-o <path>`      | path             | override the linked-binary path, rooted at the project root (build/run/test) |
-| `--artifacts <dir>` | dir           | override the per-target object directory, rooted at `<dir_out>` (build/run/test) |
-| `--emit-asm`     | —                | emit per-module assembly text (`.s`) beside each object |
-| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`) beside each object |
+| `--artifacts <dir>` | dir           | override the per-target object directory, rooted at `<dir_out>` (old manifest only) |
+| `--emit-asm`     | —                | emit per-module assembly text (`.s`); on a v2 manifest, forces the profile toggle on |
+| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`); on a v2 manifest, forces the profile toggle on |
+| `--no-emit-asm`  | —                | force per-module assembly emission off, overriding a v2 profile's `emit_asm` |
+| `--no-emit-ir`   | —                | force per-module IR emission off, overriding a v2 profile's `emit_ir` |
 | `--verify-ir`    | —                | run the IR verifier after each optimisation pass |
 
 > `mach dep` and `mach init` do not use the shared config parser; they read only
