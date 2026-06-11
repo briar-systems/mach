@@ -1,0 +1,1772 @@
+# mach.lang.manifest: the v2 `mach.toml` schema model, parser, validator,
+# template engine, and build-unit resolver.
+#
+# this module is the single owner of the v2 manifest format (see #1218). it
+# reads an already-parsed `std.data.toml` table into a `Manifest` value,
+# validating loudly (unknown keys, missing required keys, reserved names,
+# `\` in paths), then resolves a build selection — a target (with `native`
+# host resolution), a profile, and one artifact — into a `BuildUnit` whose
+# output paths come only from the declared `out`/`obj`/`ir`/`asm` templates
+# expanded over `{target} {profile} {name} {ext}`. nothing is inferred: every
+# value resolves from a stanza present in the file.
+#
+# the old plural `[targets.*]` format is still parsed by `mach.lang.driver`
+# directly; `is_v2` distinguishes the two so a transitional manifest routes to
+# the right reader. the old reader is removed in the final phase of #1218.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.text.string.str_free;
+
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_none;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use page:  std.allocator.page;
+use arena: std.allocator.arena;
+
+use toml: std.data.toml;
+
+use intern: mach.lang.intern;
+use os:     mach.lang.target.os;
+use isa:    mach.lang.target.isa;
+use tgt:    mach.lang.target;
+
+# MOpt: a profile's declared optimization level. mirrors the driver's
+# TargetOpt values so the driver maps one to the other by identity.
+pub def MOpt: u8;
+
+# MOPT_DEFAULT: no `opt` key — the build's own default (debug).
+pub val MOPT_DEFAULT: MOpt = 0;
+# MOPT_DEBUG: `opt = "O0"` / `"debug"`.
+pub val MOPT_DEBUG:   MOpt = 1;
+# MOPT_RELEASE: `opt = "O1"` / `"O2"` / `"release"`.
+pub val MOPT_RELEASE: MOpt = 2;
+
+# LibKind: a `[lib.*]` artifact's link kind.
+pub def LibKind: u8;
+
+# LIBKIND_STATIC: `kind = "static"` — the default; objects are the deliverable.
+pub val LIBKIND_STATIC: LibKind = 0;
+# LIBKIND_SHARED: `kind = "shared"` — a shared library.
+pub val LIBKIND_SHARED: LibKind = 1;
+
+# TargetDef: one `[target.<name>]` platform stanza. tuples are fully spelled;
+# nothing is inferred. `ext` defaults to the empty string. `libs`/`defines`
+# are the per-target overlay applied over an artifact's own fields.
+# ---
+# name:         interned target selector (e.g. "linux")
+# isa:          interned instruction-set architecture (required)
+# os:           interned operating system (required)
+# abi:          interned ABI (required)
+# ext:          interned artifact extension, "" when omitted
+# libs:         interned platform link overlay; nil when none
+# lib_count:    number of entries in libs
+# defines:      interned per-target comptime defines (#1191); nil when none
+# define_count: number of entries in defines
+pub rec TargetDef {
+    name:         intern.StrId;
+    isa:          intern.StrId;
+    os:           intern.StrId;
+    abi:          intern.StrId;
+    ext:          intern.StrId;
+    libs:         *intern.StrId;
+    lib_count:    u32;
+    defines:      *intern.StrId;
+    define_count: u32;
+}
+
+# CellDef: one `[bin.<a>.target.<t>]` per-cell exception refining an artifact
+# for a single target. an unset override (STR_NIL) inherits the artifact field.
+# ---
+# target:    interned name of the target this cell refines
+# entry:     interned entry-file override, STR_NIL to inherit
+# out:       interned `out` template override, STR_NIL to inherit
+# libs:      interned per-cell link inputs appended to the merge; nil when none
+# lib_count: number of entries in libs
+pub rec CellDef {
+    target:    intern.StrId;
+    entry:     intern.StrId;
+    out:       intern.StrId;
+    libs:      *intern.StrId;
+    lib_count: u32;
+}
+
+# ArtifactDef: one `[bin.<name>]` or `[lib.<name>]` artifact. every artifact is
+# declared explicitly and named by its table key.
+# ---
+# name:         interned artifact name
+# is_lib:       true for `[lib.*]`, false for `[bin.*]`
+# entry:        interned entry-source path, relative to the project src dir (required)
+# kind:         link kind for a lib (LIBKIND_STATIC default); ignored for a bin
+# out:          interned per-artifact `out` template override, STR_NIL to inherit
+# libs:         interned per-artifact link inputs; nil when none
+# lib_count:    number of entries in libs
+# defines:      interned per-artifact defines (#1191); nil when none
+# define_count: number of entries in defines
+# cells:        per-cell `[*.target.*]` exceptions; nil when none
+# cell_count:   number of entries in cells
+pub rec ArtifactDef {
+    name:         intern.StrId;
+    is_lib:       bool;
+    entry:        intern.StrId;
+    kind:         LibKind;
+    out:          intern.StrId;
+    libs:         *intern.StrId;
+    lib_count:    u32;
+    defines:      *intern.StrId;
+    define_count: u32;
+    cells:        *CellDef;
+    cell_count:   u32;
+}
+
+# ProfileDef: one `[profile.<name>]` build variant. emission toggles live here
+# because emission is a build-variant concern (amendment 3).
+# ---
+# name:     interned profile name
+# opt:      declared optimization level
+# emit_ir:  default `--emit-ir` for this profile
+# emit_asm: default `--emit-asm` for this profile
+pub rec ProfileDef {
+    name:     intern.StrId;
+    opt:      MOpt;
+    emit_ir:  bool;
+    emit_asm: bool;
+}
+
+# DepDef: one `[deps.<name>]` dependency. exactly one source key — `git` or
+# `path` — plus an optional `ref` for git. registry `version =` is reserved
+# and rejected at parse time.
+# ---
+# name: interned dependency alias
+# git:  interned git url, STR_NIL when path-sourced
+# path: interned local path, STR_NIL when git-sourced
+# ref:  interned git ref, STR_NIL when omitted
+pub rec DepDef {
+    name: intern.StrId;
+    git:  intern.StrId;
+    path: intern.StrId;
+    ref:  intern.StrId;
+}
+
+# Manifest: a fully parsed and validated v2 manifest.
+# ---
+# id:             interned `[project].id` (required)
+# version:        interned `[project].version` (required)
+# name:           interned `[project].name` metadata, STR_NIL when omitted
+# description:    interned `[project].description` metadata, STR_NIL when omitted
+# license:        interned `[project].license` metadata, STR_NIL when omitted
+# src:            interned source dir (default "src")
+# dep:            interned vendored-dependency dir (default "dep")
+# default_target: interned `[project].target` default selector (default "native")
+# out_tmpl:       interned artifact path template
+# obj_tmpl:       interned intermediate-object dir template
+# ir_tmpl:        interned IR-dump dir template
+# asm_tmpl:       interned ASM-dump dir template
+# targets:        declared `[target.*]` platforms
+# target_count:   number of targets
+# artifacts:      declared `[bin.*]`/`[lib.*]` artifacts
+# artifact_count: number of artifacts
+# profiles:       declared `[profile.*]` variants
+# profile_count:  number of profiles
+# deps:           declared `[deps.*]` dependencies
+# dep_count:      number of deps
+pub rec Manifest {
+    id:             intern.StrId;
+    version:        intern.StrId;
+    name:           intern.StrId;
+    description:    intern.StrId;
+    license:        intern.StrId;
+    src:            intern.StrId;
+    dep:            intern.StrId;
+    default_target: intern.StrId;
+    out_tmpl:       intern.StrId;
+    obj_tmpl:       intern.StrId;
+    ir_tmpl:        intern.StrId;
+    asm_tmpl:       intern.StrId;
+    targets:        *TargetDef;
+    target_count:   u32;
+    artifacts:      *ArtifactDef;
+    artifact_count: u32;
+    profiles:       *ProfileDef;
+    profile_count:  u32;
+    deps:           *DepDef;
+    dep_count:      u32;
+}
+
+# DEFAULT_OUT: the init-written artifact path template.
+pub val DEFAULT_OUT: str = "out/{target}/{profile}/bin/{name}{ext}";
+# DEFAULT_OBJ: the init-written intermediate-object dir template.
+pub val DEFAULT_OBJ: str = "out/{target}/{profile}/obj";
+# DEFAULT_IR: the init-written IR-dump dir template.
+pub val DEFAULT_IR:  str = "out/{target}/{profile}/ir";
+# DEFAULT_ASM: the init-written ASM-dump dir template.
+pub val DEFAULT_ASM: str = "out/{target}/{profile}/asm";
+
+# is_v2: whether a parsed manifest table is in the v2 format. the old format is
+# distinguished solely by its plural `[targets.*]` table; its absence routes a
+# manifest through the v2 reader. (transitional, removed with the old reader in
+# the final phase of #1218.)
+pub fun is_v2(t: *toml.Table) bool {
+    ret toml.get_table(t, "targets") == nil;
+}
+
+# cc: concatenate two strings into a freshly-allocated owned string. used to
+# build span-free diagnostic messages with dynamic names. on allocation failure
+# the second part is returned as a best-effort fragment (the build is already
+# failing on OOM).
+fun cc(alloc: *Allocator, a: str, b: str) str {
+    val la: usize = str_len(a);
+    val lb: usize = str_len(b);
+    val r: Result[*u8, str] = allocate[u8](alloc, la + lb + 1);
+    if (is_err[*u8, str](r)) { ret b; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    var i: usize = 0;
+    for (i < la) { buf[k] = a[i]; k = k + 1; i = i + 1; }
+    i = 0;
+    for (i < lb) { buf[k] = b[i]; k = k + 1; i = i + 1; }
+    buf[k] = 0;
+    ret buf::str;
+}
+
+# cc3: concatenate three strings.
+fun cc3(alloc: *Allocator, a: str, b: str, c: str) str {
+    ret cc(alloc, cc(alloc, a, b), c);
+}
+
+# cc5: concatenate five strings.
+fun cc5(alloc: *Allocator, a: str, b: str, c: str, d: str, e: str) str {
+    ret cc(alloc, cc3(alloc, a, b, c), cc(alloc, d, e));
+}
+
+# host_sep: the host path separator, resolved at comptime. manifest paths are
+# `/`-canonical and normalized to this at the filesystem boundary (amendment 2).
+fun host_sep() u8 {
+    $if ($mach.target.os == $mach.os.windows) { ret '\\'; }
+    $or                                        { ret '/'; }
+}
+
+# os_id_for: map a target os name to its canonical id.
+fun os_id_for(name: str) u32 {
+    if (str_equals(name, "linux"))   { ret os.OS_LINUX; }
+    if (str_equals(name, "darwin"))  { ret os.OS_DARWIN; }
+    if (str_equals(name, "windows")) { ret os.OS_WINDOWS; }
+    ret os.OS_UNKNOWN;
+}
+
+# arch_id_for: map a target isa name to its canonical id.
+fun arch_id_for(name: str) u32 {
+    if (str_equals(name, "x86_64"))  { ret isa.ARCH_X86_64; }
+    if (str_equals(name, "aarch64")) { ret isa.ARCH_AARCH64; }
+    ret isa.ARCH_UNKNOWN;
+}
+
+# host_isa_name: the build host's isa name.
+fun host_isa_name() str {
+    val a: u32 = tgt.host_arch_id();
+    if (a == isa.ARCH_X86_64)  { ret "x86_64"; }
+    if (a == isa.ARCH_AARCH64) { ret "aarch64"; }
+    ret "unknown";
+}
+
+# host_os_name: the build host's os name.
+fun host_os_name() str {
+    val o: u32 = tgt.host_os_id();
+    if (o == os.OS_LINUX)   { ret "linux"; }
+    if (o == os.OS_DARWIN)  { ret "darwin"; }
+    if (o == os.OS_WINDOWS) { ret "windows"; }
+    ret "unknown";
+}
+
+# host_tuple: the build host's `<isa>-<os>` tuple string, for the no-match
+# native warning. owned by `alloc`.
+pub fun host_tuple(alloc: *Allocator) str {
+    ret cc3(alloc, host_isa_name(), "-", host_os_name());
+}
+
+# has_backslash: true when a path/template contains a literal `\`. manifest
+# paths are `/`-separated; a `\` is rejected so the same manifest is portable.
+fun has_backslash(s: str) bool {
+    if (str_empty(s)) { ret false; }
+    val n: usize = str_len(s);
+    var i: usize = 0;
+    for (i < n) {
+        if (s[i] == '\\') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# intern_or: intern `text`, falling back to `default` when it is empty.
+fun intern_or(i: *intern.Interner, text: str, default: str) Result[intern.StrId, str] {
+    var t: str = text;
+    if (str_empty(t)) { t = default; }
+    ret intern.intern(i, t);
+}
+
+# intern_opt: intern `text`, or STR_NIL when it is empty (an absent optional).
+fun intern_opt(i: *intern.Interner, text: str) Result[intern.StrId, str] {
+    if (str_empty(text)) { ret ok[intern.StrId, str](intern.STR_NIL); }
+    ret intern.intern(i, text);
+}
+
+# StrArr: an interned string array carved from a TOML array of strings.
+rec StrArr {
+    items: *intern.StrId;
+    count: u32;
+}
+
+# parse_str_array: read a TOML string array into an interned StrArr. a nil array
+# yields an empty StrArr. a non-string element fails with `elem_err`.
+fun parse_str_array(alloc: *Allocator, i: *intern.Interner, arr: *toml.Array, elem_err: str) Result[StrArr, str] {
+    var out: StrArr;
+    out.items = nil;
+    out.count = 0;
+    if (arr == nil) { ret ok[StrArr, str](out); }
+
+    val n: usize = toml.array_len(arr);
+    if (n == 0) { ret ok[StrArr, str](out); }
+
+    val r: Result[*intern.StrId, str] = allocate[intern.StrId](alloc, n);
+    if (is_err[*intern.StrId, str](r)) { ret err[StrArr, str](unwrap_err[*intern.StrId, str](r)); }
+    out.items = unwrap_ok[*intern.StrId, str](r);
+    out.count = n::u32;
+
+    var k: usize = 0;
+    for (k < n) {
+        val v: *toml.Value = toml.array_get(arr, k);
+        if (v == nil || v.tag != toml.TYPE_STRING) {
+            deallocate[intern.StrId](alloc, out.items, n);
+            ret err[StrArr, str](elem_err);
+        }
+        val iv: Result[intern.StrId, str] = intern.intern(i, v.data.string);
+        if (is_err[intern.StrId, str](iv)) {
+            deallocate[intern.StrId](alloc, out.items, n);
+            ret err[StrArr, str](unwrap_err[intern.StrId, str](iv));
+        }
+        out.items[k] = unwrap_ok[intern.StrId, str](iv);
+        k = k + 1;
+    }
+    ret ok[StrArr, str](out);
+}
+
+# parse_opt_level: map a profile/target `opt` string to an MOpt. an empty value
+# is MOPT_DEFAULT; any unrecognized value is a manifest error.
+fun parse_opt_level(alloc: *Allocator, label: str, text: str) Result[MOpt, str] {
+    if (str_empty(text)) { ret ok[MOpt, str](MOPT_DEFAULT); }
+    if (str_equals(text, "O0") || str_equals(text, "debug")) { ret ok[MOpt, str](MOPT_DEBUG); }
+    if (str_equals(text, "O1") || str_equals(text, "O2") || str_equals(text, "release")) { ret ok[MOpt, str](MOPT_RELEASE); }
+    ret err[MOpt, str](cc(alloc, label, ".opt must be one of \"O0\"/\"debug\", \"O1\"/\"O2\"/\"release\""));
+}
+
+# unknown_key_msg: the "unknown key" diagnostic for `key` under `label`.
+fun unknown_key_msg(alloc: *Allocator, key: str, label: str) str {
+    ret cc(alloc, cc3(alloc, "mach.toml: unknown key '", key, "' in "), label);
+}
+
+# TK_*: table kinds for key-allowlist validation.
+val TK_PROJECT: u8 = 0;
+val TK_TARGET:  u8 = 1;
+val TK_BIN:     u8 = 2;
+val TK_LIB:     u8 = 3;
+val TK_PROFILE: u8 = 4;
+val TK_DEP:     u8 = 5;
+val TK_CELL:    u8 = 6;
+
+# key_known: whether `k` is an allowed key for the given table kind.
+fun key_known(kind: u8, k: str) bool {
+    if (kind == TK_PROJECT) {
+        ret str_equals(k, "id") || str_equals(k, "version") || str_equals(k, "name")
+            || str_equals(k, "description") || str_equals(k, "license") || str_equals(k, "authors")
+            || str_equals(k, "src") || str_equals(k, "dep") || str_equals(k, "target")
+            || str_equals(k, "out") || str_equals(k, "obj") || str_equals(k, "ir") || str_equals(k, "asm");
+    }
+    if (kind == TK_TARGET) {
+        ret str_equals(k, "isa") || str_equals(k, "os") || str_equals(k, "abi")
+            || str_equals(k, "ext") || str_equals(k, "libs") || str_equals(k, "defines");
+    }
+    if (kind == TK_BIN) {
+        ret str_equals(k, "entry") || str_equals(k, "out") || str_equals(k, "libs")
+            || str_equals(k, "defines") || str_equals(k, "target");
+    }
+    if (kind == TK_LIB) {
+        ret str_equals(k, "entry") || str_equals(k, "kind") || str_equals(k, "out")
+            || str_equals(k, "libs") || str_equals(k, "defines") || str_equals(k, "target");
+    }
+    if (kind == TK_PROFILE) {
+        ret str_equals(k, "opt") || str_equals(k, "emit_ir") || str_equals(k, "emit_asm");
+    }
+    if (kind == TK_DEP) {
+        ret str_equals(k, "git") || str_equals(k, "path") || str_equals(k, "ref");
+    }
+    if (kind == TK_CELL) {
+        ret str_equals(k, "entry") || str_equals(k, "out") || str_equals(k, "libs") || str_equals(k, "defines");
+    }
+    ret false;
+}
+
+# check_keys: reject the first unknown key in `tab` for the given table kind.
+fun check_keys(alloc: *Allocator, tab: *toml.Table, label: str, kind: u8) Result[bool, str] {
+    val n: usize = toml.table_len(tab);
+    var i: usize = 0;
+    for (i < n) {
+        val k: str = toml.table_key(tab, i);
+        if (!key_known(kind, k)) { ret err[bool, str](unknown_key_msg(alloc, k, label)); }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# check_path: reject a `\` in a path/template field, naming the offending value.
+fun check_path(alloc: *Allocator, value: str, field: str) Result[bool, str] {
+    if (has_backslash(value)) {
+        ret err[bool, str](cc3(alloc, "mach.toml: ", field, " contains a '\\'; manifest paths use '/'"));
+    }
+    ret ok[bool, str](true);
+}
+
+# parse: read a v2 manifest from an already-parsed TOML table. validates loudly
+# and returns a fully populated Manifest, or the first diagnostic.
+pub fun parse(alloc: *Allocator, i: *intern.Interner, t: *toml.Table) Result[Manifest, str] {
+    var m: Manifest;
+    m.targets        = nil;
+    m.target_count   = 0;
+    m.artifacts      = nil;
+    m.artifact_count = 0;
+    m.profiles       = nil;
+    m.profile_count  = 0;
+    m.deps           = nil;
+    m.dep_count      = 0;
+
+    val pr: *toml.Table = toml.get_table(t, "project");
+    if (pr == nil) { ret err[Manifest, str]("mach.toml: missing [project] table"); }
+    val pk: Result[bool, str] = check_keys(alloc, pr, "[project]", TK_PROJECT);
+    if (is_err[bool, str](pk)) { ret err[Manifest, str](unwrap_err[bool, str](pk)); }
+
+    val id_str: str = toml.get_str(pr, "id");
+    if (str_empty(id_str)) { ret err[Manifest, str]("mach.toml: [project] is missing required key 'id'"); }
+    val ver_str: str = toml.get_str(pr, "version");
+    if (str_empty(ver_str)) { ret err[Manifest, str]("mach.toml: [project] is missing required key 'version'"); }
+
+    val src_str: str = first_nonempty(toml.get_str(pr, "src"), "src");
+    val dep_str: str = first_nonempty(toml.get_str(pr, "dep"), "dep");
+    val out_str: str = first_nonempty(toml.get_str(pr, "out"), DEFAULT_OUT);
+    val obj_str: str = first_nonempty(toml.get_str(pr, "obj"), DEFAULT_OBJ);
+    val ir_str:  str = first_nonempty(toml.get_str(pr, "ir"),  DEFAULT_IR);
+    val asm_str: str = first_nonempty(toml.get_str(pr, "asm"), DEFAULT_ASM);
+
+    val cps: Result[bool, str] = check_path(alloc, src_str, "[project].src");
+    if (is_err[bool, str](cps)) { ret err[Manifest, str](unwrap_err[bool, str](cps)); }
+    val cpd: Result[bool, str] = check_path(alloc, dep_str, "[project].dep");
+    if (is_err[bool, str](cpd)) { ret err[Manifest, str](unwrap_err[bool, str](cpd)); }
+    val cpo: Result[bool, str] = check_path(alloc, out_str, "[project].out");
+    if (is_err[bool, str](cpo)) { ret err[Manifest, str](unwrap_err[bool, str](cpo)); }
+    val cpj: Result[bool, str] = check_path(alloc, obj_str, "[project].obj");
+    if (is_err[bool, str](cpj)) { ret err[Manifest, str](unwrap_err[bool, str](cpj)); }
+    val cpi: Result[bool, str] = check_path(alloc, ir_str, "[project].ir");
+    if (is_err[bool, str](cpi)) { ret err[Manifest, str](unwrap_err[bool, str](cpi)); }
+    val cpa: Result[bool, str] = check_path(alloc, asm_str, "[project].asm");
+    if (is_err[bool, str](cpa)) { ret err[Manifest, str](unwrap_err[bool, str](cpa)); }
+
+    val rid: Result[intern.StrId, str] = intern.intern(i, id_str);
+    if (is_err[intern.StrId, str](rid)) { ret err[Manifest, str](unwrap_err[intern.StrId, str](rid)); }
+    m.id = unwrap_ok[intern.StrId, str](rid);
+    val rver: Result[intern.StrId, str] = intern.intern(i, ver_str);
+    if (is_err[intern.StrId, str](rver)) { ret err[Manifest, str](unwrap_err[intern.StrId, str](rver)); }
+    m.version = unwrap_ok[intern.StrId, str](rver);
+
+    val rnm: Result[intern.StrId, str] = intern_opt(i, toml.get_str(pr, "name"));
+    if (is_err[intern.StrId, str](rnm)) { ret err[Manifest, str](unwrap_err[intern.StrId, str](rnm)); }
+    m.name = unwrap_ok[intern.StrId, str](rnm);
+    val rds: Result[intern.StrId, str] = intern_opt(i, toml.get_str(pr, "description"));
+    if (is_err[intern.StrId, str](rds)) { ret err[Manifest, str](unwrap_err[intern.StrId, str](rds)); }
+    m.description = unwrap_ok[intern.StrId, str](rds);
+    val rlc: Result[intern.StrId, str] = intern_opt(i, toml.get_str(pr, "license"));
+    if (is_err[intern.StrId, str](rlc)) { ret err[Manifest, str](unwrap_err[intern.StrId, str](rlc)); }
+    m.license = unwrap_ok[intern.StrId, str](rlc);
+
+    m.src            = intern_unwrap(i, src_str);
+    m.dep            = intern_unwrap(i, dep_str);
+    m.out_tmpl       = intern_unwrap(i, out_str);
+    m.obj_tmpl       = intern_unwrap(i, obj_str);
+    m.ir_tmpl        = intern_unwrap(i, ir_str);
+    m.asm_tmpl       = intern_unwrap(i, asm_str);
+    m.default_target = intern_unwrap(i, first_nonempty(toml.get_str(pr, "target"), "native"));
+
+    val tr: Result[bool, str] = parse_targets(alloc, i, t, ?m);
+    if (is_err[bool, str](tr)) { dnit(?m, alloc); ret err[Manifest, str](unwrap_err[bool, str](tr)); }
+
+    val ar: Result[bool, str] = parse_artifacts(alloc, i, t, ?m);
+    if (is_err[bool, str](ar)) { dnit(?m, alloc); ret err[Manifest, str](unwrap_err[bool, str](ar)); }
+
+    val plr: Result[bool, str] = parse_profiles(alloc, i, t, ?m);
+    if (is_err[bool, str](plr)) { dnit(?m, alloc); ret err[Manifest, str](unwrap_err[bool, str](plr)); }
+
+    val dr: Result[bool, str] = parse_deps(alloc, i, t, ?m);
+    if (is_err[bool, str](dr)) { dnit(?m, alloc); ret err[Manifest, str](unwrap_err[bool, str](dr)); }
+
+    ret ok[Manifest, str](m);
+}
+
+# first_nonempty: `a` when it is non-empty, else `b`.
+fun first_nonempty(a: str, b: str) str {
+    if (str_empty(a)) { ret b; }
+    ret a;
+}
+
+# intern_unwrap: intern `text`, returning STR_NIL on failure. used for values
+# already validated non-empty (project dirs/templates), so a failure here is an
+# allocator fault surfaced later as a lookup miss rather than swallowed silently.
+fun intern_unwrap(i: *intern.Interner, text: str) intern.StrId {
+    val r: Result[intern.StrId, str] = intern.intern(i, text);
+    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret unwrap_ok[intern.StrId, str](r);
+}
+
+# parse_targets: read every `[target.<name>]` stanza. declaring `[target.native]`
+# is a hard error — `native` is the reserved host-resolution selector.
+fun parse_targets(alloc: *Allocator, i: *intern.Interner, t: *toml.Table, m: *Manifest) Result[bool, str] {
+    val tab: *toml.Table = toml.get_table(t, "target");
+    if (tab == nil) { ret ok[bool, str](true); }
+    val n: usize = toml.table_len(tab);
+    if (n == 0) { ret ok[bool, str](true); }
+
+    val r: Result[*TargetDef, str] = allocate[TargetDef](alloc, n);
+    if (is_err[*TargetDef, str](r)) { ret err[bool, str](unwrap_err[*TargetDef, str](r)); }
+    m.targets      = unwrap_ok[*TargetDef, str](r);
+    m.target_count = n::u32;
+
+    var k: usize = 0;
+    for (k < n) {
+        val name: str = toml.table_key(tab, k);
+        if (str_equals(name, "native")) {
+            ret err[bool, str]("mach.toml: [target.native] is reserved; 'native' resolves to a declared target");
+        }
+        val v: *toml.Value = toml.table_value(tab, k);
+        if (v == nil || v.tag != toml.TYPE_TABLE) {
+            ret err[bool, str](cc3(alloc, "mach.toml: [target.", name, "] must be a table"));
+        }
+        val sub: *toml.Table = ?v.data.table;
+        val label: str = cc3(alloc, "[target.", name, "]");
+        val ck: Result[bool, str] = check_keys(alloc, sub, label, TK_TARGET);
+        if (is_err[bool, str](ck)) { ret ck; }
+
+        var d: TargetDef;
+        d.libs         = nil;
+        d.lib_count    = 0;
+        d.defines      = nil;
+        d.define_count = 0;
+        d.name = intern_unwrap(i, name);
+
+        val isa_s: str = toml.get_str(sub, "isa");
+        if (str_empty(isa_s)) { ret err[bool, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'isa'")); }
+        val os_s: str = toml.get_str(sub, "os");
+        if (str_empty(os_s)) { ret err[bool, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'os'")); }
+        val abi_s: str = toml.get_str(sub, "abi");
+        if (str_empty(abi_s)) { ret err[bool, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'abi'")); }
+        d.isa = intern_unwrap(i, isa_s);
+        d.os  = intern_unwrap(i, os_s);
+        d.abi = intern_unwrap(i, abi_s);
+        d.ext = intern_unwrap(i, first_nonempty(toml.get_str(sub, "ext"), ""));
+
+        val lr: Result[StrArr, str] = parse_str_array(alloc, i, toml.get_array(sub, "libs"),
+            cc3(alloc, "mach.toml: ", label, ".libs must be an array of strings"));
+        if (is_err[StrArr, str](lr)) { ret err[bool, str](unwrap_err[StrArr, str](lr)); }
+        val la: StrArr = unwrap_ok[StrArr, str](lr);
+        d.libs = la.items; d.lib_count = la.count;
+
+        val dr: Result[StrArr, str] = parse_str_array(alloc, i, toml.get_array(sub, "defines"),
+            cc3(alloc, "mach.toml: ", label, ".defines must be an array of strings"));
+        if (is_err[StrArr, str](dr)) { ret err[bool, str](unwrap_err[StrArr, str](dr)); }
+        val da: StrArr = unwrap_ok[StrArr, str](dr);
+        d.defines = da.items; d.define_count = da.count;
+
+        m.targets[k] = d;
+        k = k + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# parse_artifacts: read every `[bin.<name>]` and `[lib.<name>]` stanza into the
+# single artifact array (bins first, then libs, in declaration order).
+fun parse_artifacts(alloc: *Allocator, i: *intern.Interner, t: *toml.Table, m: *Manifest) Result[bool, str] {
+    val bins: *toml.Table = toml.get_table(t, "bin");
+    val libs: *toml.Table = toml.get_table(t, "lib");
+    var bn: usize = 0;
+    var ln: usize = 0;
+    if (bins != nil) { bn = toml.table_len(bins); }
+    if (libs != nil) { ln = toml.table_len(libs); }
+    val total: usize = bn + ln;
+    if (total == 0) { ret ok[bool, str](true); }
+
+    val r: Result[*ArtifactDef, str] = allocate[ArtifactDef](alloc, total);
+    if (is_err[*ArtifactDef, str](r)) { ret err[bool, str](unwrap_err[*ArtifactDef, str](r)); }
+    m.artifacts      = unwrap_ok[*ArtifactDef, str](r);
+    m.artifact_count = total::u32;
+
+    var w: usize = 0;
+    if (bins != nil) {
+        var k: usize = 0;
+        for (k < bn) {
+            val ar: Result[ArtifactDef, str] = parse_one_artifact(alloc, i, bins, k, false);
+            if (is_err[ArtifactDef, str](ar)) { ret err[bool, str](unwrap_err[ArtifactDef, str](ar)); }
+            m.artifacts[w] = unwrap_ok[ArtifactDef, str](ar);
+            w = w + 1; k = k + 1;
+        }
+    }
+    if (libs != nil) {
+        var k: usize = 0;
+        for (k < ln) {
+            val ar: Result[ArtifactDef, str] = parse_one_artifact(alloc, i, libs, k, true);
+            if (is_err[ArtifactDef, str](ar)) { ret err[bool, str](unwrap_err[ArtifactDef, str](ar)); }
+            m.artifacts[w] = unwrap_ok[ArtifactDef, str](ar);
+            w = w + 1; k = k + 1;
+        }
+    }
+    ret ok[bool, str](true);
+}
+
+# parse_one_artifact: read one artifact stanza at index `k` of its `[bin]`/`[lib]`
+# container table.
+fun parse_one_artifact(alloc: *Allocator, i: *intern.Interner, tab: *toml.Table, k: usize, is_lib: bool) Result[ArtifactDef, str] {
+    val name: str = toml.table_key(tab, k);
+    val v: *toml.Value = toml.table_value(tab, k);
+    var kind_tag: str = "bin";
+    if (is_lib) { kind_tag = "lib"; }
+    val label: str = cc5(alloc, "[", kind_tag, ".", name, "]");
+    if (v == nil || v.tag != toml.TYPE_TABLE) {
+        ret err[ArtifactDef, str](cc3(alloc, "mach.toml: ", label, " must be a table"));
+    }
+    val sub: *toml.Table = ?v.data.table;
+
+    var tk: u8 = TK_BIN;
+    if (is_lib) { tk = TK_LIB; }
+    val ck: Result[bool, str] = check_keys(alloc, sub, label, tk);
+    if (is_err[bool, str](ck)) { ret err[ArtifactDef, str](unwrap_err[bool, str](ck)); }
+
+    var a: ArtifactDef;
+    a.libs         = nil;
+    a.lib_count    = 0;
+    a.defines      = nil;
+    a.define_count = 0;
+    a.cells        = nil;
+    a.cell_count   = 0;
+    a.name   = intern_unwrap(i, name);
+    a.is_lib = is_lib;
+    a.kind   = LIBKIND_STATIC;
+
+    val entry_s: str = toml.get_str(sub, "entry");
+    if (str_empty(entry_s)) { ret err[ArtifactDef, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'entry'")); }
+    val cpe: Result[bool, str] = check_path(alloc, entry_s, cc3(alloc, label, ".entry", ""));
+    if (is_err[bool, str](cpe)) { ret err[ArtifactDef, str](unwrap_err[bool, str](cpe)); }
+    a.entry = intern_unwrap(i, entry_s);
+
+    if (is_lib) {
+        val kind_s: str = toml.get_str(sub, "kind");
+        if (!str_empty(kind_s)) {
+            if (str_equals(kind_s, "static"))      { a.kind = LIBKIND_STATIC; }
+            or (str_equals(kind_s, "shared"))      { a.kind = LIBKIND_SHARED; }
+            or { ret err[ArtifactDef, str](cc3(alloc, "mach.toml: ", label, ".kind must be \"static\" or \"shared\"")); }
+        }
+    }
+
+    val out_s: str = toml.get_str(sub, "out");
+    if (!str_empty(out_s)) {
+        val cpo: Result[bool, str] = check_path(alloc, out_s, cc3(alloc, label, ".out", ""));
+        if (is_err[bool, str](cpo)) { ret err[ArtifactDef, str](unwrap_err[bool, str](cpo)); }
+        a.out = intern_unwrap(i, out_s);
+    }
+    or { a.out = intern.STR_NIL; }
+
+    val lr: Result[StrArr, str] = parse_str_array(alloc, i, toml.get_array(sub, "libs"),
+        cc3(alloc, "mach.toml: ", label, ".libs must be an array of strings"));
+    if (is_err[StrArr, str](lr)) { ret err[ArtifactDef, str](unwrap_err[StrArr, str](lr)); }
+    val laa: StrArr = unwrap_ok[StrArr, str](lr);
+    a.libs = laa.items; a.lib_count = laa.count;
+
+    val dr: Result[StrArr, str] = parse_str_array(alloc, i, toml.get_array(sub, "defines"),
+        cc3(alloc, "mach.toml: ", label, ".defines must be an array of strings"));
+    if (is_err[StrArr, str](dr)) { ret err[ArtifactDef, str](unwrap_err[StrArr, str](dr)); }
+    val daa: StrArr = unwrap_ok[StrArr, str](dr);
+    a.defines = daa.items; a.define_count = daa.count;
+
+    val cr: Result[bool, str] = parse_cells(alloc, i, sub, kind_tag, name, ?a);
+    if (is_err[bool, str](cr)) { ret err[ArtifactDef, str](unwrap_err[bool, str](cr)); }
+
+    ret ok[ArtifactDef, str](a);
+}
+
+# parse_cells: read an artifact's `[<kind>.<name>.target.<t>]` per-cell stanzas.
+fun parse_cells(alloc: *Allocator, i: *intern.Interner, sub: *toml.Table, kind_tag: str, art_name: str, a: *ArtifactDef) Result[bool, str] {
+    val ct: *toml.Table = toml.get_table(sub, "target");
+    if (ct == nil) { ret ok[bool, str](true); }
+    val n: usize = toml.table_len(ct);
+    if (n == 0) { ret ok[bool, str](true); }
+
+    val r: Result[*CellDef, str] = allocate[CellDef](alloc, n);
+    if (is_err[*CellDef, str](r)) { ret err[bool, str](unwrap_err[*CellDef, str](r)); }
+    a.cells      = unwrap_ok[*CellDef, str](r);
+    a.cell_count = n::u32;
+
+    var k: usize = 0;
+    for (k < n) {
+        val tname: str = toml.table_key(ct, k);
+        val v: *toml.Value = toml.table_value(ct, k);
+        val label: str = cc5(alloc, cc3(alloc, "[", kind_tag, "."), art_name, ".target.", tname, "]");
+        if (v == nil || v.tag != toml.TYPE_TABLE) {
+            ret err[bool, str](cc3(alloc, "mach.toml: ", label, " must be a table"));
+        }
+        val cs: *toml.Table = ?v.data.table;
+        val ck: Result[bool, str] = check_keys(alloc, cs, label, TK_CELL);
+        if (is_err[bool, str](ck)) { ret ck; }
+
+        var c: CellDef;
+        c.libs      = nil;
+        c.lib_count = 0;
+        c.target = intern_unwrap(i, tname);
+        c.entry  = intern_opt_unwrap(i, toml.get_str(cs, "entry"));
+        c.out    = intern_opt_unwrap(i, toml.get_str(cs, "out"));
+
+        val lr: Result[StrArr, str] = parse_str_array(alloc, i, toml.get_array(cs, "libs"),
+            cc3(alloc, "mach.toml: ", label, ".libs must be an array of strings"));
+        if (is_err[StrArr, str](lr)) { ret err[bool, str](unwrap_err[StrArr, str](lr)); }
+        val laa: StrArr = unwrap_ok[StrArr, str](lr);
+        c.libs = laa.items; c.lib_count = laa.count;
+
+        a.cells[k] = c;
+        k = k + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# intern_opt_unwrap: intern an optional value, STR_NIL when empty or on failure.
+fun intern_opt_unwrap(i: *intern.Interner, text: str) intern.StrId {
+    if (str_empty(text)) { ret intern.STR_NIL; }
+    ret intern_unwrap(i, text);
+}
+
+# parse_profiles: read every `[profile.<name>]` build variant.
+fun parse_profiles(alloc: *Allocator, i: *intern.Interner, t: *toml.Table, m: *Manifest) Result[bool, str] {
+    val tab: *toml.Table = toml.get_table(t, "profile");
+    if (tab == nil) { ret ok[bool, str](true); }
+    val n: usize = toml.table_len(tab);
+    if (n == 0) { ret ok[bool, str](true); }
+
+    val r: Result[*ProfileDef, str] = allocate[ProfileDef](alloc, n);
+    if (is_err[*ProfileDef, str](r)) { ret err[bool, str](unwrap_err[*ProfileDef, str](r)); }
+    m.profiles      = unwrap_ok[*ProfileDef, str](r);
+    m.profile_count = n::u32;
+
+    var k: usize = 0;
+    for (k < n) {
+        val name: str = toml.table_key(tab, k);
+        val v: *toml.Value = toml.table_value(tab, k);
+        val label: str = cc3(alloc, "[profile.", name, "]");
+        if (v == nil || v.tag != toml.TYPE_TABLE) {
+            ret err[bool, str](cc3(alloc, "mach.toml: ", label, " must be a table"));
+        }
+        val sub: *toml.Table = ?v.data.table;
+        val ck: Result[bool, str] = check_keys(alloc, sub, label, TK_PROFILE);
+        if (is_err[bool, str](ck)) { ret ck; }
+
+        var pf: ProfileDef;
+        pf.name = intern_unwrap(i, name);
+        val opr: Result[MOpt, str] = parse_opt_level(alloc, cc3(alloc, "mach.toml: ", label, ""), toml.get_str(sub, "opt"));
+        if (is_err[MOpt, str](opr)) { ret err[bool, str](unwrap_err[MOpt, str](opr)); }
+        pf.opt = unwrap_ok[MOpt, str](opr);
+        pf.emit_ir  = bool_or(toml.get_bool(sub, "emit_ir"), false);
+        pf.emit_asm = bool_or(toml.get_bool(sub, "emit_asm"), false);
+
+        m.profiles[k] = pf;
+        k = k + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# bool_or: the boolean value, or `default` when absent/mistyped.
+fun bool_or(o: Option[bool], default: bool) bool {
+    if (is_some[bool](o)) { ret unwrap[bool](o); }
+    ret default;
+}
+
+# parse_deps: read every `[deps.<name>]`. exactly one of `git`/`path` is
+# required; a registry-style `version =` is reserved and rejected.
+fun parse_deps(alloc: *Allocator, i: *intern.Interner, t: *toml.Table, m: *Manifest) Result[bool, str] {
+    val tab: *toml.Table = toml.get_table(t, "deps");
+    if (tab == nil) { ret ok[bool, str](true); }
+    val n: usize = toml.table_len(tab);
+    if (n == 0) { ret ok[bool, str](true); }
+
+    val r: Result[*DepDef, str] = allocate[DepDef](alloc, n);
+    if (is_err[*DepDef, str](r)) { ret err[bool, str](unwrap_err[*DepDef, str](r)); }
+    m.deps      = unwrap_ok[*DepDef, str](r);
+    m.dep_count = n::u32;
+
+    var k: usize = 0;
+    for (k < n) {
+        val name: str = toml.table_key(tab, k);
+        val v: *toml.Value = toml.table_value(tab, k);
+        val label: str = cc3(alloc, "[deps.", name, "]");
+        if (v == nil || v.tag != toml.TYPE_TABLE) {
+            ret err[bool, str](cc3(alloc, "mach.toml: ", label, " must be a table"));
+        }
+        val sub: *toml.Table = ?v.data.table;
+
+        if (toml.get(sub, "version") != nil) {
+            ret err[bool, str](cc3(alloc, "mach.toml: ", label, ".version is reserved for the registry era"));
+        }
+        val ck: Result[bool, str] = check_keys(alloc, sub, label, TK_DEP);
+        if (is_err[bool, str](ck)) { ret ck; }
+
+        var d: DepDef;
+        d.name = intern_unwrap(i, name);
+        val git_s:  str = toml.get_str(sub, "git");
+        val path_s: str = toml.get_str(sub, "path");
+        val has_git:  bool = !str_empty(git_s);
+        val has_path: bool = !str_empty(path_s);
+        if (has_git == has_path) {
+            ret err[bool, str](cc3(alloc, "mach.toml: ", label, " needs exactly one source key: 'git' or 'path'"));
+        }
+        d.git  = intern_opt_unwrap(i, git_s);
+        d.path = intern_opt_unwrap(i, path_s);
+        d.ref  = intern_opt_unwrap(i, toml.get_str(sub, "ref"));
+
+        m.deps[k] = d;
+        k = k + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# dnit: release every owned array on a Manifest (and its nested overlays).
+pub fun dnit(m: *Manifest, alloc: *Allocator) {
+    if (m.targets != nil && m.target_count > 0) {
+        var k: u32 = 0;
+        for (k < m.target_count) {
+            free_strarr(alloc, m.targets[k].libs, m.targets[k].lib_count);
+            free_strarr(alloc, m.targets[k].defines, m.targets[k].define_count);
+            k = k + 1;
+        }
+        deallocate[TargetDef](alloc, m.targets, m.target_count::usize);
+        m.targets = nil; m.target_count = 0;
+    }
+    if (m.artifacts != nil && m.artifact_count > 0) {
+        var k: u32 = 0;
+        for (k < m.artifact_count) {
+            val a: *ArtifactDef = ?m.artifacts[k];
+            free_strarr(alloc, a.libs, a.lib_count);
+            free_strarr(alloc, a.defines, a.define_count);
+            if (a.cells != nil && a.cell_count > 0) {
+                var c: u32 = 0;
+                for (c < a.cell_count) {
+                    free_strarr(alloc, a.cells[c].libs, a.cells[c].lib_count);
+                    c = c + 1;
+                }
+                deallocate[CellDef](alloc, a.cells, a.cell_count::usize);
+            }
+            k = k + 1;
+        }
+        deallocate[ArtifactDef](alloc, m.artifacts, m.artifact_count::usize);
+        m.artifacts = nil; m.artifact_count = 0;
+    }
+    if (m.profiles != nil && m.profile_count > 0) {
+        deallocate[ProfileDef](alloc, m.profiles, m.profile_count::usize);
+        m.profiles = nil; m.profile_count = 0;
+    }
+    if (m.deps != nil && m.dep_count > 0) {
+        deallocate[DepDef](alloc, m.deps, m.dep_count::usize);
+        m.deps = nil; m.dep_count = 0;
+    }
+}
+
+# free_strarr: release an interned string array, if any.
+fun free_strarr(alloc: *Allocator, items: *intern.StrId, count: u32) {
+    if (items != nil && count > 0) {
+        deallocate[intern.StrId](alloc, items, count::usize);
+    }
+}
+
+# seg_eq: whether the byte range tmpl[start, end) equals `lit`.
+fun seg_eq(tmpl: str, start: usize, end: usize, lit: str) bool {
+    val ll: usize = str_len(lit);
+    if (end - start != ll) { ret false; }
+    var i: usize = 0;
+    for (i < ll) {
+        if (tmpl[start + i] != lit[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# seg_dup: an owned copy of the byte range tmpl[start, end).
+fun seg_dup(alloc: *Allocator, tmpl: str, start: usize, end: usize) str {
+    val n: usize = end - start;
+    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
+    if (is_err[*u8, str](r)) { ret ""; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var i: usize = 0;
+    for (i < n) { buf[i] = tmpl[start + i]; i = i + 1; }
+    buf[n] = 0;
+    ret buf::str;
+}
+
+# tmpl_value: the substitution string for the variable named by tmpl[start, end).
+# only `{target} {profile} {name} {ext}` are valid; anything else is an error.
+fun tmpl_value(alloc: *Allocator, tmpl: str, start: usize, end: usize,
+               target_name: str, profile_name: str, art_name: str, ext: str) Result[str, str] {
+    if (seg_eq(tmpl, start, end, "target"))  { ret ok[str, str](target_name); }
+    if (seg_eq(tmpl, start, end, "profile")) { ret ok[str, str](profile_name); }
+    if (seg_eq(tmpl, start, end, "name"))    { ret ok[str, str](art_name); }
+    if (seg_eq(tmpl, start, end, "ext"))     { ret ok[str, str](ext); }
+    ret err[str, str](cc3(alloc, "mach.toml: unknown template variable '{", seg_dup(alloc, tmpl, start, end), "}'"));
+}
+
+# expand: expand a `/`-canonical path template over `{target} {profile} {name}
+# {ext}`, normalizing each separator to the host's at the same time (the
+# filesystem boundary for manifest paths). returns an owned string.
+pub fun expand(alloc: *Allocator, tmpl: str,
+               target_name: str, profile_name: str, art_name: str, ext: str) Result[str, str] {
+    val n: usize = str_len(tmpl);
+    val sep: u8 = host_sep();
+
+    # pass 1: measure the expanded length.
+    var total: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        if (tmpl[i] == '{') {
+            var j: usize = i + 1;
+            for (j < n && tmpl[j] != '}') { j = j + 1; }
+            if (j >= n) { ret err[str, str]("mach.toml: unterminated '{' in a path template"); }
+            val vr: Result[str, str] = tmpl_value(alloc, tmpl, i + 1, j, target_name, profile_name, art_name, ext);
+            if (is_err[str, str](vr)) { ret err[str, str](unwrap_err[str, str](vr)); }
+            total = total + str_len(unwrap_ok[str, str](vr));
+            i = j + 1;
+        }
+        or {
+            total = total + 1;
+            i = i + 1;
+        }
+    }
+
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret err[str, str](unwrap_err[*u8, str](r)); }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    # pass 2: fill, converting every '/' to the host separator.
+    var k: usize = 0;
+    i = 0;
+    for (i < n) {
+        if (tmpl[i] == '{') {
+            var j: usize = i + 1;
+            for (j < n && tmpl[j] != '}') { j = j + 1; }
+            val vr: Result[str, str] = tmpl_value(alloc, tmpl, i + 1, j, target_name, profile_name, art_name, ext);
+            val vv: str = unwrap_ok[str, str](vr);
+            val vl: usize = str_len(vv);
+            var x: usize = 0;
+            for (x < vl) {
+                var ch: u8 = vv[x];
+                if (ch == '/') { ch = sep; }
+                buf[k] = ch; k = k + 1; x = x + 1;
+            }
+            i = j + 1;
+        }
+        or {
+            var ch: u8 = tmpl[i];
+            if (ch == '/') { ch = sep; }
+            buf[k] = ch; k = k + 1; i = i + 1;
+        }
+    }
+    buf[k] = 0;
+    ret ok[str, str](buf::str);
+}
+
+# Selection: the build selection a CLI invocation narrows the manifest with.
+# every field is optional; an unset value resolves to the manifest default.
+# ---
+# target:       declared target name, "native"/"host", or nil for the manifest default
+# profile:      declared profile name, or nil for the default profile
+# artifact:     a `[bin.*]`/`[lib.*]` name, or nil for the default artifact
+# want_lib:     the artifact selector came from `--lib` (disambiguates a name)
+# has_artifact: whether an artifact selector was given
+pub rec Selection {
+    target:       str;
+    profile:      str;
+    artifact:     str;
+    want_lib:     bool;
+    has_artifact: bool;
+}
+
+# BuildUnit: one fully-resolved (artifact, target, profile) cell with concrete,
+# template-expanded output paths. `{target}` is the resolved name, never the
+# literal `native`. `libs` is the merged target+artifact+cell link overlay,
+# owned by the resolving allocator.
+# ---
+# target:       the resolved target stanza
+# artifact:     the selected artifact stanza
+# target_name:  interned resolved target name (drives `{target}`)
+# profile_name: interned resolved profile name (drives `{profile}`)
+# entry:        interned effective entry-source path
+# bin_path:     interned expanded artifact path
+# obj_root:     interned expanded intermediate-object dir
+# ir_root:      interned expanded IR-dump dir
+# asm_root:     interned expanded ASM-dump dir
+# opt:          resolved optimization level
+# emit_ir:      profile default for IR emission
+# emit_asm:     profile default for ASM emission
+# is_lib:       whether the artifact is a library
+# kind:         library link kind (meaningful when is_lib)
+# libs:         merged interned link overlay; nil when none
+# lib_count:    number of entries in libs
+# warned:       native resolution found no host match and fell back to the first target
+pub rec BuildUnit {
+    target:       *TargetDef;
+    artifact:     *ArtifactDef;
+    target_name:  intern.StrId;
+    profile_name: intern.StrId;
+    entry:        intern.StrId;
+    bin_path:     intern.StrId;
+    obj_root:     intern.StrId;
+    ir_root:      intern.StrId;
+    asm_root:     intern.StrId;
+    opt:          MOpt;
+    emit_ir:      bool;
+    emit_asm:     bool;
+    is_lib:       bool;
+    kind:         LibKind;
+    libs:         *intern.StrId;
+    lib_count:    u32;
+    warned:       bool;
+}
+
+# ResolvedTarget: a resolved target plus the native no-match warning flag.
+pub rec ResolvedTarget {
+    target: *TargetDef;
+    warned: bool;
+}
+
+# must_lookup: look up an interned StrId, erroring on a miss (a parser invariant
+# break rather than a user error).
+fun must_lookup(i: *intern.Interner, id: intern.StrId) Result[str, str] {
+    val o: Option[str] = intern.lookup(i, id);
+    if (is_none[str](o)) { ret err[str, str]("internal: manifest StrId not interned"); }
+    ret ok[str, str](unwrap[str](o));
+}
+
+# find_target_by_name: the declared target whose name equals `name`, or nil.
+fun find_target_by_name(i: *intern.Interner, m: *Manifest, name: str) *TargetDef {
+    val r: Result[intern.StrId, str] = intern.intern(i, name);
+    if (is_err[intern.StrId, str](r)) { ret nil; }
+    val id: intern.StrId = unwrap_ok[intern.StrId, str](r);
+    var k: u32 = 0;
+    for (k < m.target_count) {
+        if (m.targets[k].name == id) { ret ?m.targets[k]; }
+        k = k + 1;
+    }
+    ret nil;
+}
+
+# target_matches_host: whether a target's (isa, os) tuple equals the build host's.
+fun target_matches_host(i: *intern.Interner, d: *TargetDef, host_os: u32, host_arch: u32) bool {
+    val os_o: Option[str] = intern.lookup(i, d.os);
+    val isa_o: Option[str] = intern.lookup(i, d.isa);
+    if (is_none[str](os_o) || is_none[str](isa_o)) { ret false; }
+    ret os_id_for(unwrap[str](os_o)) == host_os && arch_id_for(unwrap[str](isa_o)) == host_arch;
+}
+
+# resolve_target: resolve a target selector to a declared target. an empty
+# selector defers to `[project].target`; `native`/`host` resolve the host tuple
+# against the declared set only (ambiguity is an error; no match warns and falls
+# back to the first declared target). a named selector must match a stanza.
+pub fun resolve_target(alloc: *Allocator, i: *intern.Interner, m: *Manifest, sel: str) Result[ResolvedTarget, str] {
+    if (m.target_count == 0) { ret err[ResolvedTarget, str]("mach.toml: no [target.*] declared"); }
+
+    var name: str = sel;
+    if (str_empty(name)) {
+        val d: Result[str, str] = must_lookup(i, m.default_target);
+        if (is_err[str, str](d)) { ret err[ResolvedTarget, str](unwrap_err[str, str](d)); }
+        name = unwrap_ok[str, str](d);
+    }
+
+    if (str_equals(name, "native") || str_equals(name, "host")) {
+        ret resolve_native(alloc, i, m);
+    }
+
+    val d: *TargetDef = find_target_by_name(i, m, name);
+    if (d == nil) { ret err[ResolvedTarget, str](cc3(alloc, "mach.toml: no target named '", name, "'")); }
+    var rt: ResolvedTarget;
+    rt.target = d;
+    rt.warned = false;
+    ret ok[ResolvedTarget, str](rt);
+}
+
+# resolve_native: the host-resolution rule. exactly one host-tuple match wins;
+# several is an ambiguity error naming the candidates; none warns (via the
+# `warned` flag) and falls back to the first declared target.
+fun resolve_native(alloc: *Allocator, i: *intern.Interner, m: *Manifest) Result[ResolvedTarget, str] {
+    val host_os:   u32 = tgt.host_os_id();
+    val host_arch: u32 = tgt.host_arch_id();
+
+    var first_match: *TargetDef = nil;
+    var match_count: u32 = 0;
+    var names: str = "";
+    var k: u32 = 0;
+    for (k < m.target_count) {
+        if (target_matches_host(i, ?m.targets[k], host_os, host_arch)) {
+            val no: Option[str] = intern.lookup(i, m.targets[k].name);
+            val nm: str = first_nonempty_opt(no);
+            if (match_count == 0) { first_match = ?m.targets[k]; names = nm; }
+            or                    { names = cc3(alloc, names, ", ", nm); }
+            match_count = match_count + 1;
+        }
+        k = k + 1;
+    }
+
+    if (match_count > 1) {
+        ret err[ResolvedTarget, str](cc3(alloc, "mach.toml: 'native' matches multiple targets for the host (", names, ")"));
+    }
+    var rt: ResolvedTarget;
+    if (match_count == 1) {
+        rt.target = first_match;
+        rt.warned = false;
+        ret ok[ResolvedTarget, str](rt);
+    }
+    rt.target = ?m.targets[0];
+    rt.warned = true;
+    ret ok[ResolvedTarget, str](rt);
+}
+
+# first_nonempty_opt: the string in `o`, or "" when absent.
+fun first_nonempty_opt(o: Option[str]) str {
+    if (is_some[str](o)) { ret unwrap[str](o); }
+    ret "";
+}
+
+# ResolvedProfile: a resolved (or implicit-default) profile's effective fields.
+pub rec ResolvedProfile {
+    name:     intern.StrId;
+    opt:      MOpt;
+    emit_ir:  bool;
+    emit_asm: bool;
+}
+
+# resolve_profile: resolve a profile selector. a named selector must match a
+# `[profile.*]`; an empty selector takes the first declared profile, or — when
+# none are declared — an implicit `debug` profile (default opt, emission off).
+pub fun resolve_profile(alloc: *Allocator, i: *intern.Interner, m: *Manifest, sel: str) Result[ResolvedProfile, str] {
+    var rp: ResolvedProfile;
+    if (!str_empty(sel)) {
+        val r: Result[intern.StrId, str] = intern.intern(i, sel);
+        if (is_err[intern.StrId, str](r)) { ret err[ResolvedProfile, str](unwrap_err[intern.StrId, str](r)); }
+        val id: intern.StrId = unwrap_ok[intern.StrId, str](r);
+        var k: u32 = 0;
+        for (k < m.profile_count) {
+            if (m.profiles[k].name == id) {
+                rp.name = m.profiles[k].name; rp.opt = m.profiles[k].opt;
+                rp.emit_ir = m.profiles[k].emit_ir; rp.emit_asm = m.profiles[k].emit_asm;
+                ret ok[ResolvedProfile, str](rp);
+            }
+            k = k + 1;
+        }
+        ret err[ResolvedProfile, str](cc3(alloc, "mach.toml: no profile named '", sel, "'"));
+    }
+
+    if (m.profile_count > 0) {
+        rp.name = m.profiles[0].name; rp.opt = m.profiles[0].opt;
+        rp.emit_ir = m.profiles[0].emit_ir; rp.emit_asm = m.profiles[0].emit_asm;
+        ret ok[ResolvedProfile, str](rp);
+    }
+
+    val di: Result[intern.StrId, str] = intern.intern(i, "debug");
+    if (is_err[intern.StrId, str](di)) { ret err[ResolvedProfile, str](unwrap_err[intern.StrId, str](di)); }
+    rp.name = unwrap_ok[intern.StrId, str](di);
+    rp.opt = MOPT_DEFAULT;
+    rp.emit_ir = false;
+    rp.emit_asm = false;
+    ret ok[ResolvedProfile, str](rp);
+}
+
+# resolve_artifact: resolve an artifact selector. with a `--bin`/`--lib`
+# selector, the named artifact of that kind must exist; without one, a single
+# declared artifact is taken, and several is an error directing the user to
+# select one (the multi-artifact matrix lands in a later phase of #1218).
+pub fun resolve_artifact(alloc: *Allocator, i: *intern.Interner, m: *Manifest, sel: Selection) *ArtifactDef {
+    if (m.artifact_count == 0) { ret nil; }
+
+    if (sel.has_artifact) {
+        val r: Result[intern.StrId, str] = intern.intern(i, sel.artifact);
+        if (is_err[intern.StrId, str](r)) { ret nil; }
+        val id: intern.StrId = unwrap_ok[intern.StrId, str](r);
+        var k: u32 = 0;
+        for (k < m.artifact_count) {
+            if (m.artifacts[k].name == id && m.artifacts[k].is_lib == sel.want_lib) { ret ?m.artifacts[k]; }
+            k = k + 1;
+        }
+        ret nil;
+    }
+
+    if (m.artifact_count == 1) { ret ?m.artifacts[0]; }
+    ret nil;
+}
+
+# find_cell: the per-cell override for `art` matching the target named `tname`,
+# or nil when none refines that target.
+fun find_cell(art: *ArtifactDef, tname: intern.StrId) *CellDef {
+    var c: u32 = 0;
+    for (c < art.cell_count) {
+        if (art.cells[c].target == tname) { ret ?art.cells[c]; }
+        c = c + 1;
+    }
+    ret nil;
+}
+
+# merge_libs: the deduplicated target+artifact+cell link overlay, in that
+# precedence order. owned by `alloc`; nil/0 when empty.
+fun merge_libs(alloc: *Allocator, t: *TargetDef, a: *ArtifactDef, cell: *CellDef) Result[StrArr, str] {
+    var out: StrArr;
+    out.items = nil;
+    out.count = 0;
+    var cell_n: u32 = 0;
+    if (cell != nil) { cell_n = cell.lib_count; }
+    val max: u32 = t.lib_count + a.lib_count + cell_n;
+    if (max == 0) { ret ok[StrArr, str](out); }
+
+    val r: Result[*intern.StrId, str] = allocate[intern.StrId](alloc, max::usize);
+    if (is_err[*intern.StrId, str](r)) { ret err[StrArr, str](unwrap_err[*intern.StrId, str](r)); }
+    val buf: *intern.StrId = unwrap_ok[*intern.StrId, str](r);
+    var c: u32 = 0;
+    c = append_unique(buf, c, t.libs, t.lib_count);
+    c = append_unique(buf, c, a.libs, a.lib_count);
+    if (cell != nil) { c = append_unique(buf, c, cell.libs, cell.lib_count); }
+
+    if (c == 0) {
+        deallocate[intern.StrId](alloc, buf, max::usize);
+        ret ok[StrArr, str](out);
+    }
+    if (c < max) {
+        val sr: Result[*intern.StrId, str] = reallocate[intern.StrId](alloc, buf, max::usize, c::usize);
+        if (is_ok[*intern.StrId, str](sr)) {
+            out.items = unwrap_ok[*intern.StrId, str](sr);
+            out.count = c;
+            ret ok[StrArr, str](out);
+        }
+    }
+    out.items = buf;
+    out.count = c;
+    ret ok[StrArr, str](out);
+}
+
+# append_unique: append each id in `src` not already in buf[0, c) and return the
+# new count.
+fun append_unique(buf: *intern.StrId, c: u32, src: *intern.StrId, n: u32) u32 {
+    var i: u32 = 0;
+    var w: u32 = c;
+    for (i < n) {
+        val id: intern.StrId = src[i];
+        var seen: bool = false;
+        var j: u32 = 0;
+        for (j < w) { if (buf[j] == id) { seen = true; } j = j + 1; }
+        if (!seen) { buf[w] = id; w = w + 1; }
+        i = i + 1;
+    }
+    ret w;
+}
+
+# effective_out: the effective `out` template for an artifact under a cell —
+# cell override, else artifact override, else the project template.
+fun effective_out(m: *Manifest, a: *ArtifactDef, cell: *CellDef) intern.StrId {
+    if (cell != nil && cell.out != intern.STR_NIL) { ret cell.out; }
+    if (a.out != intern.STR_NIL) { ret a.out; }
+    ret m.out_tmpl;
+}
+
+# resolve_build_unit: resolve a Selection into one BuildUnit with concrete
+# template-expanded output paths and the merged link overlay.
+pub fun resolve_build_unit(alloc: *Allocator, i: *intern.Interner, m: *Manifest, sel: Selection) Result[BuildUnit, str] {
+    val rt_r: Result[ResolvedTarget, str] = resolve_target(alloc, i, m, sel.target);
+    if (is_err[ResolvedTarget, str](rt_r)) { ret err[BuildUnit, str](unwrap_err[ResolvedTarget, str](rt_r)); }
+    val rt: ResolvedTarget = unwrap_ok[ResolvedTarget, str](rt_r);
+
+    val rp_r: Result[ResolvedProfile, str] = resolve_profile(alloc, i, m, sel.profile);
+    if (is_err[ResolvedProfile, str](rp_r)) { ret err[BuildUnit, str](unwrap_err[ResolvedProfile, str](rp_r)); }
+    val rp: ResolvedProfile = unwrap_ok[ResolvedProfile, str](rp_r);
+
+    val a: *ArtifactDef = resolve_artifact(alloc, i, m, sel);
+    if (a == nil) { ret err[BuildUnit, str](artifact_err(alloc, m, sel)); }
+
+    val cell: *CellDef = find_cell(a, rt.target.name);
+
+    var u: BuildUnit;
+    u.target       = rt.target;
+    u.artifact     = a;
+    u.target_name  = rt.target.name;
+    u.profile_name = rp.name;
+    u.opt          = rp.opt;
+    u.emit_ir      = rp.emit_ir;
+    u.emit_asm     = rp.emit_asm;
+    u.is_lib       = a.is_lib;
+    u.kind         = a.kind;
+    u.warned       = rt.warned;
+
+    u.entry = a.entry;
+    if (cell != nil && cell.entry != intern.STR_NIL) { u.entry = cell.entry; }
+
+    val lm: Result[StrArr, str] = merge_libs(alloc, rt.target, a, cell);
+    if (is_err[StrArr, str](lm)) { ret err[BuildUnit, str](unwrap_err[StrArr, str](lm)); }
+    val merged: StrArr = unwrap_ok[StrArr, str](lm);
+    u.libs = merged.items;
+    u.lib_count = merged.count;
+
+    # expansion variables, all from stanzas present in the file.
+    val tn_r: Result[str, str] = must_lookup(i, rt.target.name);
+    if (is_err[str, str](tn_r)) { ret err[BuildUnit, str](unwrap_err[str, str](tn_r)); }
+    val pn_r: Result[str, str] = must_lookup(i, rp.name);
+    if (is_err[str, str](pn_r)) { ret err[BuildUnit, str](unwrap_err[str, str](pn_r)); }
+    val an_r: Result[str, str] = must_lookup(i, a.name);
+    if (is_err[str, str](an_r)) { ret err[BuildUnit, str](unwrap_err[str, str](an_r)); }
+    val ex_r: Result[str, str] = must_lookup(i, rt.target.ext);
+    if (is_err[str, str](ex_r)) { ret err[BuildUnit, str](unwrap_err[str, str](ex_r)); }
+    val tn: str = unwrap_ok[str, str](tn_r);
+    val pn: str = unwrap_ok[str, str](pn_r);
+    val an: str = unwrap_ok[str, str](an_r);
+    val ex: str = unwrap_ok[str, str](ex_r);
+
+    val out_tmpl: intern.StrId = effective_out(m, a, cell);
+    val bin_r: Result[intern.StrId, str] = expand_intern(alloc, i, out_tmpl, tn, pn, an, ex);
+    if (is_err[intern.StrId, str](bin_r)) { ret err[BuildUnit, str](unwrap_err[intern.StrId, str](bin_r)); }
+    u.bin_path = unwrap_ok[intern.StrId, str](bin_r);
+
+    val obj_r: Result[intern.StrId, str] = expand_intern(alloc, i, m.obj_tmpl, tn, pn, an, ex);
+    if (is_err[intern.StrId, str](obj_r)) { ret err[BuildUnit, str](unwrap_err[intern.StrId, str](obj_r)); }
+    u.obj_root = unwrap_ok[intern.StrId, str](obj_r);
+
+    val ir_r: Result[intern.StrId, str] = expand_intern(alloc, i, m.ir_tmpl, tn, pn, an, ex);
+    if (is_err[intern.StrId, str](ir_r)) { ret err[BuildUnit, str](unwrap_err[intern.StrId, str](ir_r)); }
+    u.ir_root = unwrap_ok[intern.StrId, str](ir_r);
+
+    val asm_r: Result[intern.StrId, str] = expand_intern(alloc, i, m.asm_tmpl, tn, pn, an, ex);
+    if (is_err[intern.StrId, str](asm_r)) { ret err[BuildUnit, str](unwrap_err[intern.StrId, str](asm_r)); }
+    u.asm_root = unwrap_ok[intern.StrId, str](asm_r);
+
+    ret ok[BuildUnit, str](u);
+}
+
+# artifact_err: the diagnostic for a failed artifact selection.
+fun artifact_err(alloc: *Allocator, m: *Manifest, sel: Selection) str {
+    if (m.artifact_count == 0) { ret "mach.toml: no [bin.*] or [lib.*] artifacts declared"; }
+    if (sel.has_artifact) {
+        if (sel.want_lib) { ret cc3(alloc, "mach.toml: no lib named '", sel.artifact, "'"); }
+        ret cc3(alloc, "mach.toml: no bin named '", sel.artifact, "'");
+    }
+    ret "mach.toml: multiple artifacts declared; select one with --bin or --lib";
+}
+
+# expand_intern: expand a template then intern the result.
+fun expand_intern(alloc: *Allocator, i: *intern.Interner, tmpl_id: intern.StrId,
+                  tn: str, pn: str, an: str, ex: str) Result[intern.StrId, str] {
+    val ts_r: Result[str, str] = must_lookup(i, tmpl_id);
+    if (is_err[str, str](ts_r)) { ret err[intern.StrId, str](unwrap_err[str, str](ts_r)); }
+    val ex_r: Result[str, str] = expand(alloc, unwrap_ok[str, str](ts_r), tn, pn, an, ex);
+    if (is_err[str, str](ex_r)) { ret err[intern.StrId, str](unwrap_err[str, str](ex_r)); }
+    val s: str = unwrap_ok[str, str](ex_r);
+    val ir: Result[intern.StrId, str] = intern.intern(i, s);
+    str_free(alloc, s);
+    ret ir;
+}
+
+# check_collisions: reject two artifacts that resolve to the same `out` path for
+# the selected target and profile — the honest "build start" guard against a
+# degenerate template (amendment 2).
+pub fun check_collisions(alloc: *Allocator, i: *intern.Interner, m: *Manifest,
+                         t: *TargetDef, profile_name: str) Result[bool, str] {
+    if (m.artifact_count < 2) { ret ok[bool, str](true); }
+
+    val tn_r: Result[str, str] = must_lookup(i, t.name);
+    if (is_err[str, str](tn_r)) { ret err[bool, str](unwrap_err[str, str](tn_r)); }
+    val tn: str = unwrap_ok[str, str](tn_r);
+    val ex_r: Result[str, str] = must_lookup(i, t.ext);
+    if (is_err[str, str](ex_r)) { ret err[bool, str](unwrap_err[str, str](ex_r)); }
+    val ex: str = unwrap_ok[str, str](ex_r);
+
+    val pr: Result[*str, str] = allocate[str](alloc, m.artifact_count::usize);
+    if (is_err[*str, str](pr)) { ret err[bool, str](unwrap_err[*str, str](pr)); }
+    val paths: *str = unwrap_ok[*str, str](pr);
+
+    var k: u32 = 0;
+    for (k < m.artifact_count) {
+        val a: *ArtifactDef = ?m.artifacts[k];
+        val an_r: Result[str, str] = must_lookup(i, a.name);
+        if (is_err[str, str](an_r)) { ret err[bool, str](unwrap_err[str, str](an_r)); }
+        val cell: *CellDef = find_cell(a, t.name);
+        val ot_r: Result[str, str] = must_lookup(i, effective_out(m, a, cell));
+        if (is_err[str, str](ot_r)) { ret err[bool, str](unwrap_err[str, str](ot_r)); }
+        val pe: Result[str, str] = expand(alloc, unwrap_ok[str, str](ot_r), tn, profile_name, unwrap_ok[str, str](an_r), ex);
+        if (is_err[str, str](pe)) { ret err[bool, str](unwrap_err[str, str](pe)); }
+        paths[k] = unwrap_ok[str, str](pe);
+        k = k + 1;
+    }
+
+    var x: u32 = 0;
+    for (x < m.artifact_count) {
+        var y: u32 = x + 1;
+        for (y < m.artifact_count) {
+            if (str_equals(paths[x], paths[y])) {
+                val nx: str = first_nonempty_opt(intern.lookup(i, m.artifacts[x].name));
+                val ny: str = first_nonempty_opt(intern.lookup(i, m.artifacts[y].name));
+                ret err[bool, str](cc5(alloc, cc3(alloc, "mach.toml: artifacts '", nx, "' and '"), ny, "' both build to '", paths[x], "'"));
+            }
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# tinit: stand up a page-backed arena allocator and a fresh interner for a test.
+# `backing`/`ar` are owned by the caller's frame so the arena outlives the test.
+fun tinit(backing: *Allocator, ar: *arena.Arena, alloc: *Allocator, itn: *intern.Interner) bool {
+    if (is_some[str](page.make(backing))) { ret false; }
+    if (is_some[str](arena.init(ar, backing, 0))) { ret false; }
+    if (is_some[str](arena.make(alloc, ar))) { ret false; }
+    @itn = intern.init(alloc);
+    ret true;
+}
+
+# tparse: parse a manifest from TOML source text for a test.
+fun tparse(alloc: *Allocator, itn: *intern.Interner, source: str) Result[Manifest, str] {
+    val tr: Result[toml.Table, str] = toml.parse(alloc, source);
+    if (is_err[toml.Table, str](tr)) { ret err[Manifest, str](unwrap_err[toml.Table, str](tr)); }
+    var t: toml.Table = unwrap_ok[toml.Table, str](tr);
+    ret parse(alloc, itn, ?t);
+}
+
+# idstr: the interned string behind a StrId, or "" on a miss (test helper).
+fun idstr(itn: *intern.Interner, id: intern.StrId) str {
+    ret first_nonempty_opt(intern.lookup(itn, id));
+}
+
+# mk_sel: build a Selection for a test.
+fun mk_sel(target: str, profile: str, artifact: str, want_lib: bool, has_artifact: bool) Selection {
+    var s: Selection;
+    s.target = target; s.profile = profile; s.artifact = artifact;
+    s.want_lib = want_lib; s.has_artifact = has_artifact;
+    ret s;
+}
+
+# DEMO: a representative two-bin, two-target, two-profile manifest.
+fun demo_src() str {
+    ret "[project]\nid = \"demo\"\nversion = \"0.1.0\"\nsrc = \"src\"\ndep = \"dep\"\ntarget = \"native\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\next = \".exe\"\n\n[bin.ls]\nentry = \"bin/ls.mach\"\n\n[bin.cat]\nentry = \"bin/cat.mach\"\n\n[profile.debug]\nopt = \"O0\"\n\n[profile.release]\nopt = \"O2\"\nemit_ir = true\n\n[deps.mach-std]\ngit = \"https://github.com/octalide/mach-std\"\nref = \"v0.4.0\"\n";
+}
+
+test "manifest: is_v2 distinguishes the singular [target] schema from plural [targets]" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val v2r: Result[toml.Table, str] = toml.parse(?alloc, "[project]\nid=\"x\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    val v1r: Result[toml.Table, str] = toml.parse(?alloc, "[project]\nid=\"x\"\n[targets.linux]\nos=\"linux\"\n");
+    if (is_err[toml.Table, str](v2r) || is_err[toml.Table, str](v1r)) { code = 1; }
+    or {
+        var v2t: toml.Table = unwrap_ok[toml.Table, str](v2r);
+        var v1t: toml.Table = unwrap_ok[toml.Table, str](v1r);
+        if (!is_v2(?v2t)) { code = 1; }
+        if (is_v2(?v1t))  { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: a full v2 manifest parses every stanza" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, demo_src());
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        if (!str_equals(idstr(?itn, m.id), "demo")) { code = 1; }
+        if (!str_equals(idstr(?itn, m.version), "0.1.0")) { code = 1; }
+        if (m.target_count != 2)   { code = 1; }
+        if (m.artifact_count != 2) { code = 1; }
+        if (m.profile_count != 2)  { code = 1; }
+        if (m.dep_count != 1)      { code = 1; }
+        if (!str_equals(idstr(?itn, m.out_tmpl), DEFAULT_OUT)) { code = 1; }
+        if (!str_equals(idstr(?itn, m.targets[1].ext), ".exe")) { code = 1; }
+        if (!str_equals(idstr(?itn, m.deps[0].git), "https://github.com/octalide/mach-std")) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: missing required project keys are rejected by name" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nversion=\"1\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    if (is_ok[Manifest, str](a) || !str_equals(unwrap_err[Manifest, str](a), "mach.toml: [project] is missing required key 'id'")) { code = 1; }
+
+    val b: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    if (is_ok[Manifest, str](b) || !str_equals(unwrap_err[Manifest, str](b), "mach.toml: [project] is missing required key 'version'")) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: an unknown key is rejected naming the key and table" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nbogus=\"y\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    if (is_ok[Manifest, str](a) || !str_equals(unwrap_err[Manifest, str](a), "mach.toml: unknown key 'bogus' in [project]")) { code = 1; }
+
+    val b: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\nwat=\"z\"\n");
+    if (is_ok[Manifest, str](b) || !str_equals(unwrap_err[Manifest, str](b), "mach.toml: unknown key 'wat' in [target.l]")) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: [target.native] is a reserved name" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val a: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\n[target.native]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    if (is_ok[Manifest, str](a) || !str_equals(unwrap_err[Manifest, str](a), "mach.toml: [target.native] is reserved; 'native' resolves to a declared target")) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: a dependency 'version' key is reserved" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val a: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[deps.std]\nversion=\"1.0\"\n");
+    if (is_ok[Manifest, str](a) || !str_equals(unwrap_err[Manifest, str](a), "mach.toml: [deps.std].version is reserved for the registry era")) { code = 1; }
+
+    val b: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[deps.std]\ngit=\"u\"\npath=\"p\"\n");
+    if (is_ok[Manifest, str](b) || !str_equals(unwrap_err[Manifest, str](b), "mach.toml: [deps.std] needs exactly one source key: 'git' or 'path'")) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: a backslash in a path is rejected" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val a: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"a\\\\b\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    if (is_ok[Manifest, str](a) || !str_equals(unwrap_err[Manifest, str](a), "mach.toml: [project].src contains a '\\'; manifest paths use '/'")) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: a library kind other than static/shared is rejected" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val a: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[lib.core]\nentry=\"lib.mach\"\nkind=\"plugin\"\n");
+    if (is_ok[Manifest, str](a) || !str_equals(unwrap_err[Manifest, str](a), "mach.toml: [lib.core].kind must be \"static\" or \"shared\"")) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: template expansion substitutes the four variables and nothing else" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: Result[str, str] = expand(?alloc, DEFAULT_OUT, "linux", "debug", "ls", "");
+    if (is_err[str, str](a) || !str_equals(unwrap_ok[str, str](a), "out/linux/debug/bin/ls")) { code = 1; }
+
+    val b: Result[str, str] = expand(?alloc, "{name}{ext}", "windows", "release", "cat", ".exe");
+    if (is_err[str, str](b) || !str_equals(unwrap_ok[str, str](b), "cat.exe")) { code = 1; }
+
+    val c: Result[str, str] = expand(?alloc, "out/{flavor}", "linux", "debug", "ls", "");
+    if (is_ok[str, str](c) || !str_equals(unwrap_err[str, str](c), "mach.toml: unknown template variable '{flavor}'")) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: native resolves the host tuple against declared targets only" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, demo_src());
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        val rt: Result[ResolvedTarget, str] = resolve_target(?alloc, ?itn, ?m, "native");
+        if (is_err[ResolvedTarget, str](rt)) { code = 1; }
+        or {
+            val r: ResolvedTarget = unwrap_ok[ResolvedTarget, str](rt);
+            if (r.warned) { code = 1; }
+            if (!str_equals(idstr(?itn, r.target.name), "linux")) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: native with no host match warns and falls back to the first target" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[bin.app]\nentry=\"main.mach\"\n");
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        val rt: Result[ResolvedTarget, str] = resolve_target(?alloc, ?itn, ?m, "native");
+        if (is_err[ResolvedTarget, str](rt)) { code = 1; }
+        or {
+            val r: ResolvedTarget = unwrap_ok[ResolvedTarget, str](rt);
+            if (!r.warned) { code = 1; }
+            if (!str_equals(idstr(?itn, r.target.name), "windows")) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: native ambiguity among host-matching targets is an error naming candidates" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.linux2]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[bin.app]\nentry=\"main.mach\"\n");
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        val rt: Result[ResolvedTarget, str] = resolve_target(?alloc, ?itn, ?m, "native");
+        if (is_ok[ResolvedTarget, str](rt) || !str_equals(unwrap_err[ResolvedTarget, str](rt), "mach.toml: 'native' matches multiple targets for the host (linux, linux2)")) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: an unknown target/profile selector is an error" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, demo_src());
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        val t: Result[ResolvedTarget, str] = resolve_target(?alloc, ?itn, ?m, "bsd");
+        if (is_ok[ResolvedTarget, str](t) || !str_equals(unwrap_err[ResolvedTarget, str](t), "mach.toml: no target named 'bsd'")) { code = 1; }
+        val pf: Result[ResolvedProfile, str] = resolve_profile(?alloc, ?itn, ?m, "fast");
+        if (is_ok[ResolvedProfile, str](pf) || !str_equals(unwrap_err[ResolvedProfile, str](pf), "mach.toml: no profile named 'fast'")) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: a build unit resolves concrete paths from the templates" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, demo_src());
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        val u: Result[BuildUnit, str] = resolve_build_unit(?alloc, ?itn, ?m, mk_sel("", "", "ls", false, true));
+        if (is_err[BuildUnit, str](u)) { code = 1; }
+        or {
+            val bu: BuildUnit = unwrap_ok[BuildUnit, str](u);
+            if (!str_equals(idstr(?itn, bu.target_name), "linux")) { code = 1; }
+            if (!str_equals(idstr(?itn, bu.profile_name), "debug")) { code = 1; }
+            if (!str_equals(idstr(?itn, bu.entry), "bin/ls.mach")) { code = 1; }
+            if (!str_equals(idstr(?itn, bu.bin_path), "out/linux/debug/bin/ls")) { code = 1; }
+            if (!str_equals(idstr(?itn, bu.obj_root), "out/linux/debug/obj")) { code = 1; }
+            if (bu.opt != MOPT_DEBUG) { code = 1; }
+            if (bu.is_lib) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: a release profile selection switches opt and emission" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, demo_src());
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        val u: Result[BuildUnit, str] = resolve_build_unit(?alloc, ?itn, ?m, mk_sel("", "release", "cat", false, true));
+        if (is_err[BuildUnit, str](u)) { code = 1; }
+        or {
+            val bu: BuildUnit = unwrap_ok[BuildUnit, str](u);
+            if (bu.opt != MOPT_RELEASE) { code = 1; }
+            if (!bu.emit_ir) { code = 1; }
+            if (!str_equals(idstr(?itn, bu.bin_path), "out/linux/release/bin/cat")) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: two artifacts resolving to the same path collide at build start" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nout=\"bin/app\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[bin.a]\nentry=\"a.mach\"\n[bin.b]\nentry=\"b.mach\"\n");
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        val cr: Result[bool, str] = check_collisions(?alloc, ?itn, ?m, ?m.targets[0], "debug");
+        if (is_ok[bool, str](cr) || !str_equals(unwrap_err[bool, str](cr), "mach.toml: artifacts 'a' and 'b' both build to 'bin/app'")) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: a per-cell [bin.X.target.Y] override refines entry and merges libs" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\ntarget=\"windows\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\next=\".exe\"\nlibs=[\"kernel32.dll\"]\n[bin.app]\nentry=\"main.mach\"\nlibs=[\"base.o\"]\n[bin.app.target.windows]\nentry=\"win.mach\"\nlibs=[\"user32.dll\"]\n");
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        val u: Result[BuildUnit, str] = resolve_build_unit(?alloc, ?itn, ?m, mk_sel("windows", "", "app", false, true));
+        if (is_err[BuildUnit, str](u)) { code = 1; }
+        or {
+            val bu: BuildUnit = unwrap_ok[BuildUnit, str](u);
+            if (!str_equals(idstr(?itn, bu.entry), "win.mach")) { code = 1; }
+            if (!str_equals(idstr(?itn, bu.bin_path), "out/windows/debug/bin/app.exe")) { code = 1; }
+            if (bu.lib_count != 3) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}

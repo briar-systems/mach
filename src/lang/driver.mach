@@ -73,6 +73,9 @@ use os:  mach.lang.target.os;
 use isa: mach.lang.target.isa;
 use tgt: mach.lang.target;
 
+use sysos:    std.system.os;
+use manifest: mach.lang.manifest;
+
 # BuildMode: the kind of artifact a target build produces.
 pub def BuildMode: u8;
 
@@ -151,6 +154,15 @@ pub rec DepEntry {
 # target_count: number of entries in targets
 # deps:         flat array of DepEntry records
 # dep_count:    number of entries in deps
+# is_v2:        true when this config came from the v2 manifest reader; the
+#               build then takes its concrete output paths from the resolved
+#               `v2_*` fields below rather than composing `out`/`binary`
+# v2_bin:       interned resolved artifact path (root-relative), v2 only
+# v2_obj_root:  interned resolved intermediate-object dir (root-relative), v2 only
+# v2_ir_root:   interned resolved IR-dump dir (root-relative), v2 only
+# v2_asm_root:  interned resolved ASM-dump dir (root-relative), v2 only
+# v2_emit_ir:   selected profile's IR-emission default, v2 only
+# v2_emit_asm:  selected profile's ASM-emission default, v2 only
 pub rec ProjectConfig {
     id:           intern.StrId;
     dir_src:      intern.StrId;
@@ -162,6 +174,13 @@ pub rec ProjectConfig {
     target_count: u32;
     deps:         *DepEntry;
     dep_count:    u32;
+    is_v2:        bool;
+    v2_bin:       intern.StrId;
+    v2_obj_root:  intern.StrId;
+    v2_ir_root:   intern.StrId;
+    v2_asm_root:  intern.StrId;
+    v2_emit_ir:   bool;
+    v2_emit_asm:  bool;
 }
 
 # PubConst: one comptime constant exported by a module to its importers.
@@ -245,28 +264,61 @@ val INITIAL_PUB_CAP:    u32 = 4;
 val INITIAL_DEP_CAP:    u32 = 4;
 
 # build_project: load `project_root/mach.toml`, select `target_name`, and
-# build the full module graph plus per-module ResolveResults.
+# build the full module graph plus per-module ResolveResults. a convenience
+# wrapper over build_project_sel that selects only a target (no profile/artifact
+# narrowing) — used by read-only consumers such as `mach doc`.
 # ---
 # s:            shared session
 # project_root: filesystem path to the project root (containing mach.toml)
-# target_name:  selector that must match a `[targets.<name>]` entry
+# target_name:  selector that must match a declared target
 # ret:          fully populated Project, or an error message
 pub fun build_project(s: *sess.Session, project_root: str, target_name: str) Result[Project, str] {
+    var sel: manifest.Selection;
+    sel.target       = target_name;
+    sel.profile      = "";
+    sel.artifact     = "";
+    sel.want_lib     = false;
+    sel.has_artifact = false;
+    ret build_project_sel(s, project_root, ?sel);
+}
+
+# build_project_sel: load `project_root/mach.toml` and build the module graph
+# for the given build selection (target, profile, and one artifact). the v2
+# reader resolves the selection into the project's single target entry and
+# concrete output paths; the old reader uses the selection's target only.
+# ---
+# s:            shared session
+# project_root: filesystem path to the project root (containing mach.toml)
+# sel:          the build selection narrowing target/profile/artifact
+# ret:          fully populated Project, or an error message
+pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Selection) Result[Project, str] {
     var p: Project;
     init_project(?p, s);
 
-    val cfg_r: Result[bool, str] = load_project_config(?p, project_root);
+    val cfg_r: Result[bool, str] = load_project_config(?p, project_root, sel);
     if (is_err[bool, str](cfg_r)) {
         dnit_project(?p);
         ret err[Project, str](unwrap_err[bool, str](cfg_r));
     }
 
-    val te: *TargetEntry = find_target(?p.config, target_name, ?p.s.interner);
-    if (te == nil) {
-        dnit_project(?p);
-        ret err[Project, str]("target not found in mach.toml");
+    var te: *TargetEntry = nil;
+    if (p.config.is_v2) {
+        # the v2 reader already selected and synthesized the target entry.
+        te = p.target_entry;
+        if (te == nil) {
+            dnit_project(?p);
+            ret err[Project, str]("internal: v2 manifest selected no target");
+        }
     }
-    p.target_entry = te;
+    or {
+        te = find_target(?p.config, sel.target, ?p.s.interner);
+        if (te == nil) {
+            dnit_project(?p);
+            ret err[Project, str]("target not found in mach.toml");
+        }
+        p.target_entry = te;
+    }
+
     val fp_r: Result[bool, str] = select_target(?p, te);
     if (is_err[bool, str](fp_r)) {
         dnit_project(?p);
@@ -535,6 +587,17 @@ fun init_project(p: *Project, s: *sess.Session) {
     p.target.of      = nil;
     p.compiler_name = intern.STR_NIL;
     p.compiler_ver  = intern.STR_NIL;
+    p.config.targets      = nil;
+    p.config.target_count = 0;
+    p.config.deps         = nil;
+    p.config.dep_count    = 0;
+    p.config.is_v2        = false;
+    p.config.v2_bin       = intern.STR_NIL;
+    p.config.v2_obj_root  = intern.STR_NIL;
+    p.config.v2_ir_root   = intern.STR_NIL;
+    p.config.v2_asm_root  = intern.STR_NIL;
+    p.config.v2_emit_ir   = false;
+    p.config.v2_emit_asm  = false;
     p.modules       = nil;
     p.module_len    = 0;
     p.module_cap    = 0;
@@ -567,7 +630,7 @@ fun deallocate_config(c: *ProjectConfig, alloc: *Allocator) {
     c.dep_count    = 0;
 }
 
-fun load_project_config(p: *Project, project_root: str) Result[bool, str] {
+fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection) Result[bool, str] {
     val abs_root_r: Result[intern.StrId, str] = intern.intern(?p.s.interner, project_root);
     if (is_err[intern.StrId, str](abs_root_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](abs_root_r)); }
     p.config.project_root = unwrap_ok[intern.StrId, str](abs_root_r);
@@ -580,6 +643,13 @@ fun load_project_config(p: *Project, project_root: str) Result[bool, str] {
     str_free(p.s.alloc, toml_path);
     if (is_err[toml.Table, str](toml_r)) { ret err[bool, str](unwrap_err[toml.Table, str](toml_r)); }
     var t: toml.Table = unwrap_ok[toml.Table, str](toml_r);
+
+    # transitional dual-format dispatch (#1218): a manifest with the new
+    # singular `[target.*]` schema (no plural `[targets.*]`) routes to the v2
+    # reader; everything below is the old reader, removed in the final phase.
+    if (manifest.is_v2(?t)) {
+        ret load_v2_config(p, project_root, ?t, sel);
+    }
 
     val id_str: str = toml.get_str(?t, "project.id");
     if (str_empty(id_str)) { ret err[bool, str]("mach.toml is missing [project].id"); }
@@ -611,6 +681,132 @@ fun load_project_config(p: *Project, project_root: str) Result[bool, str] {
     val deps_r: Result[bool, str] = parse_deps_table(p, ?t, project_root);
     if (is_err[bool, str](deps_r)) { ret deps_r; }
 
+    ret ok[bool, str](true);
+}
+
+# load_v2_config: parse a v2 manifest, resolve the build selection into one
+# build unit, and synthesize the ProjectConfig the rest of the driver consumes —
+# a single target entry plus the unit's concrete, template-expanded output paths
+# (`v2_*`). collisions are checked before anything is built. a `native`
+# selection that finds no host match emits an unmissable warning here.
+fun load_v2_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.Selection) Result[bool, str] {
+    val mr: Result[manifest.Manifest, str] = manifest.parse(p.s.alloc, ?p.s.interner, t);
+    if (is_err[manifest.Manifest, str](mr)) { ret err[bool, str](unwrap_err[manifest.Manifest, str](mr)); }
+    var m: manifest.Manifest = unwrap_ok[manifest.Manifest, str](mr);
+
+    val ur: Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(p.s.alloc, ?p.s.interner, ?m, @sel);
+    if (is_err[manifest.BuildUnit, str](ur)) {
+        manifest.dnit(?m, p.s.alloc);
+        ret err[bool, str](unwrap_err[manifest.BuildUnit, str](ur));
+    }
+    val bu: manifest.BuildUnit = unwrap_ok[manifest.BuildUnit, str](ur);
+
+    # honest collision guard over every artifact for the selected target/profile.
+    val pn_opt: Option[str] = intern.lookup(?p.s.interner, bu.profile_name);
+    if (is_some[str](pn_opt)) {
+        val cr: Result[bool, str] = manifest.check_collisions(p.s.alloc, ?p.s.interner, ?m, bu.target, unwrap[str](pn_opt));
+        if (is_err[bool, str](cr)) {
+            manifest.dnit(?m, p.s.alloc);
+            ret err[bool, str](unwrap_err[bool, str](cr));
+        }
+    }
+
+    if (bu.warned) { emit_native_warning(p, bu.target_name); }
+
+    # synthesize the single target entry the downstream driver selects on.
+    val ter: Result[*TargetEntry, str] = allocate[TargetEntry](p.s.alloc, 1::usize);
+    if (is_err[*TargetEntry, str](ter)) { manifest.dnit(?m, p.s.alloc); ret err[bool, str](unwrap_err[*TargetEntry, str](ter)); }
+    val targets: *TargetEntry = unwrap_ok[*TargetEntry, str](ter);
+    var entry: TargetEntry;
+    entry.name       = bu.target_name;
+    entry.os_name    = bu.target.os;
+    entry.isa_name   = bu.target.isa;
+    entry.entrypoint = bu.entry;
+    entry.artifacts  = intern.STR_NIL;
+    entry.binary     = bu.bin_path;
+    entry.mode       = MODE_EXECUTABLE;
+    if (bu.is_lib) { entry.mode = MODE_LIBRARY; }
+    entry.opt        = map_v2_opt(bu.opt);
+    entry.libs       = bu.libs;
+    entry.lib_count  = bu.lib_count;
+    targets[0] = entry;
+
+    p.config.id           = m.id;
+    p.config.dir_src      = m.src;
+    p.config.dir_dep      = m.dep;
+    p.config.out          = m.out_tmpl;
+    p.config.target       = bu.target_name;
+    p.config.targets      = targets;
+    p.config.target_count = 1;
+    p.config.is_v2        = true;
+    p.config.v2_bin       = bu.bin_path;
+    p.config.v2_obj_root  = bu.obj_root;
+    p.config.v2_ir_root   = bu.ir_root;
+    p.config.v2_asm_root  = bu.asm_root;
+    p.config.v2_emit_ir   = bu.emit_ir;
+    p.config.v2_emit_asm  = bu.emit_asm;
+    p.target_entry        = ?p.config.targets[0];
+
+    val dr: Result[bool, str] = resolve_v2_deps(p, ?m, project_root);
+    if (is_err[bool, str](dr)) { manifest.dnit(?m, p.s.alloc); ret dr; }
+
+    manifest.dnit(?m, p.s.alloc);
+    ret ok[bool, str](true);
+}
+
+# map_v2_opt: map a manifest profile opt level to the driver's TargetOpt.
+fun map_v2_opt(o: manifest.MOpt) TargetOpt {
+    if (o == manifest.MOPT_RELEASE) { ret TARGET_OPT_RELEASE; }
+    if (o == manifest.MOPT_DEBUG)   { ret TARGET_OPT_DEBUG; }
+    ret TARGET_OPT_DEFAULT;
+}
+
+# emit_native_warning: write the unmissable `native` no-match warning to stderr,
+# naming the host tuple and the target being built instead.
+fun emit_native_warning(p: *Project, target_name: intern.StrId) {
+    val tuple: str = manifest.host_tuple(p.s.alloc);
+    val name_opt: Option[str] = intern.lookup(?p.s.interner, target_name);
+    var name: str = "?";
+    if (is_some[str](name_opt)) { name = unwrap[str](name_opt); }
+    emit_stderr("warning: no declared target matches the host (");
+    emit_stderr(tuple);
+    emit_stderr("); building '");
+    emit_stderr(name);
+    emit_stderr("'\n");
+}
+
+# emit_stderr: write a string to stderr, computing its length.
+fun emit_stderr(s: str) {
+    sysos.write(sysos.STDERR_FD, s::*u8, str_len(s));
+}
+
+# resolve_v2_deps: resolve each `[deps.*]` into a DepEntry by vendor layout,
+# reading the dependency's own mach.toml — identical to the old reader's dep
+# resolution, just driven off the v2 dependency list.
+fun resolve_v2_deps(p: *Project, m: *manifest.Manifest, project_root: str) Result[bool, str] {
+    if (m.dep_count == 0) {
+        p.config.deps      = nil;
+        p.config.dep_count = 0;
+        ret ok[bool, str](true);
+    }
+    val r: Result[*DepEntry, str] = allocate[DepEntry](p.s.alloc, m.dep_count::usize);
+    if (is_err[*DepEntry, str](r)) { ret err[bool, str](unwrap_err[*DepEntry, str](r)); }
+    p.config.deps      = unwrap_ok[*DepEntry, str](r);
+    p.config.dep_count = m.dep_count;
+
+    val dir_dep_opt: Option[str] = intern.lookup(?p.s.interner, p.config.dir_dep);
+    if (is_none[str](dir_dep_opt)) { ret err[bool, str]("dep dir StrId not interned"); }
+    val dir_dep: str = unwrap[str](dir_dep_opt);
+
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val alias_opt: Option[str] = intern.lookup(?p.s.interner, m.deps[i].name);
+        if (is_none[str](alias_opt)) { ret err[bool, str]("dep alias StrId not interned"); }
+        val rd: Result[DepEntry, str] = resolve_dep(p.s, unwrap[str](alias_opt), project_root, dir_dep);
+        if (is_err[DepEntry, str](rd)) { ret err[bool, str](unwrap_err[DepEntry, str](rd)); }
+        p.config.deps[i] = unwrap_ok[DepEntry, str](rd);
+        i = i + 1;
+    }
     ret ok[bool, str](true);
 }
 
@@ -807,7 +1003,12 @@ fun resolve_dep(s: *sess.Session, alias: str, project_root: str, dir_dep: str) R
     }
     entry.project_id = unwrap_ok[intern.StrId, str](rp);
 
-    val rds: Result[intern.StrId, str] = intern_or(?s.interner, toml.get_str(?t, "project.dir_src"), "src");
+    # the dep's source dir: `dir_src` (old) or `src` (v2), defaulting to "src".
+    # reading both lets a consumer depend on a dep in either format during the
+    # transition (#1218); resolution is purely by vendor layout otherwise.
+    var dep_src_key: str = toml.get_str(?t, "project.dir_src");
+    if (str_empty(dep_src_key)) { dep_src_key = toml.get_str(?t, "project.src"); }
+    val rds: Result[intern.StrId, str] = intern_or(?s.interner, dep_src_key, "src");
     if (is_err[intern.StrId, str](rds)) {
         str_free(s.alloc, dep_dir);
         ret err[DepEntry, str](unwrap_err[intern.StrId, str](rds));

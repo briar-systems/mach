@@ -5,9 +5,114 @@ identity, one or more build targets, and its dependencies. The compiler finds
 it by walking up from the working directory until a `mach.toml` is seen, so any
 subcommand run inside a project tree resolves the same manifest.
 
-This page is the authoritative reference for the manifest schema as the current
-compiler reads it. Keys the parser does not consume are noted as **informational**
-— they are accepted (TOML still parses) but have no effect on the build today.
+## Two formats during the v2 transition
+
+The manifest is moving to a **v2 schema** (#1218) that separates the three axes
+the old `[targets.<name>]` table fused — *what* is built (artifacts), *where* it
+runs (targets), and *where* outputs land (templates). Both formats are accepted
+for now: a manifest with the new singular `[target.<name>]` table (and no plural
+`[targets.<name>]`) is read by the v2 reader; everything else uses the old reader
+documented in [The old format](#the-old-format) below. The old reader is removed
+once the ecosystem has migrated.
+
+## mach.toml v2
+
+The v2 manifest is the complete, readable statement of what a project builds.
+Repetition between axes is eliminated by the build engine's cartesian product,
+never by the file; layout rules the file states (the path templates) are
+explicit, and nothing is inferred.
+
+```toml
+[project]
+id      = "demo"            # required: root of every module path the project exposes
+version = "0.1.0"           # required
+src     = "src"             # source dir (default "src")
+dep     = "dep"             # vendored-dependency dir (default "dep")
+target  = "native"          # default target selector (default "native")
+out     = "out/{target}/{profile}/bin/{name}{ext}"  # artifact path template
+obj     = "out/{target}/{profile}/obj"              # intermediate-object dir template
+ir      = "out/{target}/{profile}/ir"               # IR-dump dir template
+asm     = "out/{target}/{profile}/asm"              # ASM-dump dir template
+# optional metadata: name, description, license, authors
+
+[target.linux]             # a platform: fully-spelled tuple, nothing inferred
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
+[target.windows]
+isa     = "x86_64"
+os      = "windows"
+abi     = "win64"
+ext     = ".exe"           # artifact extension (default "")
+libs    = ["kernel32.dll"] # platform link overlay, inherited by every artifact
+defines = []               # per-target comptime defines (reserved for #1191)
+
+[bin.hello]                # an executable artifact, named by its table key
+entry = "hello.mach"       # entry source, relative to the src dir (required)
+
+[lib.core]                 # a library artifact
+entry = "lib.mach"
+kind  = "static"           # "static" (default) | "shared"
+
+[bin.hello.target.windows] # a per-cell exception refining one artifact-target pair
+entry = "hello_win.mach"   # overrides the artifact's entry for this target only
+libs  = ["user32.dll"]     # appended to the merged link overlay
+
+[profile.debug]            # a build variant
+opt = "O0"                 # "O0"/"debug" | "O1"/"O2"/"release"
+
+[profile.release]
+opt      = "O2"
+emit_ir  = true            # emit per-module IR for this profile (default false)
+emit_asm = false           # emit per-module assembly for this profile (default false)
+
+[deps.mach-std]            # a dependency: exactly one of git|path, plus ref for git
+git = "https://github.com/octalide/mach-std"
+ref = "v0.4.0"
+```
+
+### Path templates
+
+Output paths come only from the declared templates, expanded over four variables
+— `{target}` (the resolved target name), `{profile}`, `{name}` (the artifact
+name), and `{ext}` (the target's extension). Manifest paths are always
+`/`-separated and normalized to the host separator at the filesystem boundary, so
+the same manifest is portable; a literal `\` in a path is a hard error. Two
+artifacts that resolve to the same `out` path collide and fail at build start.
+
+### Selection and the build matrix
+
+A build resolves one artifact × one target × one profile. `--bin <name>` /
+`--lib <name>` select an artifact, `--target <name>` selects a declared target,
+`--profile <name>` (with `--release` sugar) selects a profile. With several
+artifacts declared and no `--bin`/`--lib`, the build asks you to pick one (the
+full multi-artifact matrix is a later phase of #1218). Absent `--profile`/
+`--release`, the first declared profile is used; absent any declared profile, a
+`debug` default (no optimization, no emission) applies.
+
+### `native` target resolution
+
+`native` is a reserved selector (declaring `[target.native]` is an error). It
+resolves the host's `(isa, os)` tuple against the **declared** targets only —
+never a synthesized tuple. Exactly one host match is chosen; several matching
+tuples is an ambiguity error naming the candidates; no match warns
+(`no declared target matches the host (...)`) and falls back to the first
+declared target so cross-only projects still build on a foreign host. `{target}`
+always expands to the chosen target's name, never the literal `native`.
+
+### Precedence and link overlays
+
+A `[bin.X]`/`[lib.X]` field is overlaid by its `[target.Y]` platform overlay
+(`libs`, `defines`), which is overlaid by a `[bin.X.target.Y]` per-cell
+exception. Link inputs (`libs`) merge in that order, deduplicated by name. A
+dependency's source key is `git` (with `ref`) or `path`; a registry-style
+`version =` is reserved and rejected.
+
+## The old format
+
+The remainder of this page documents the old (plural `[targets.<name>]`) format,
+read unchanged during the transition.
 
 ## Tables
 
