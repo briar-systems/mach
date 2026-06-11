@@ -36,6 +36,7 @@ use maphash: std.collections.map;
 use sess:     mach.lang.session;
 use src:      mach.lang.source;
 use target:   mach.lang.target.resolved;
+use abi:      mach.lang.target.abi;
 use ty:       mach.lang.type;
 use intern:   mach.lang.intern;
 
@@ -660,10 +661,10 @@ pub fun lower_type(lc: *LowerContext, tid: ty.TypeId) Result[ir_type.IrTypeId, s
     if (k == ty.TYPE_PTR)                     { ret ir_type.intern_ptr(?lc.m.types); }
     if (k == ty.TYPE_POINTER)                 { ret ir_type.intern_ptr(?lc.m.types); }
 
-    # `va_list` is the AMD64 `__va_list_tag` register-save struct:
-    # { gp_offset: u32, fp_offset: u32, overflow_arg_area: ptr, reg_save_area: ptr }
-    # (size 24, align 8). it lowers to that concrete IR struct so storage sizing,
-    # field addressing, and by-address flow reuse the ordinary aggregate path.
+    # `va_list` lowers per the target ABI's variadic save model: the register-save
+    # model (SysV) uses the four-field `__va_list_tag` struct, the home-area model
+    # (win64) a single pointer. dispatching here keeps `$size_of(va_list)`, C-interop
+    # struct layouts, and the scalar-vs-aggregate value path correct on every target.
     if (k == ty.TYPE_VA_LIST) {
         ret lower_va_list(lc);
     }
@@ -746,11 +747,20 @@ fun lower_nominal(lc: *LowerContext, tid: ty.TypeId, is_union: bool) Result[ir_t
     ret sr;
 }
 
-# lowers the builtin `va_list` type to the AMD64 `__va_list_tag` IR struct:
-# { i32 gp_offset, i32 fp_offset, ptr overflow_arg_area, ptr reg_save_area }.
-# the field order and types match `target.abi.sysv`'s VA_* offset constants, so
-# the backend's `va_start` / `va_arg` expansion GEPs the right field offsets.
+# lowers the builtin `va_list` type per the target ABI's variadic save model. the
+# register-save model (SysV) lowers it to the AMD64 `__va_list_tag` IR struct
+# { i32 gp_offset, i32 fp_offset, ptr overflow_arg_area, ptr reg_save_area }, whose
+# field order and types match the model's VA_* field offsets so the backend's
+# va_start / va_arg expansion GEPs the right offsets. the home-area model (win64)
+# lowers it to a single pointer — the cursor `va_start` seeds and `va_arg` walks —
+# so `$size_of(va_list)` is 8 (not 24) and a C-interop struct embedding it lays out
+# correctly. the model is read from the selected target's ABI vtable.
 fun lower_va_list(lc: *LowerContext) Result[ir_type.IrTypeId, str] {
+    val model: abi.VaModelFn = lc.tgt.abi.va_model::abi.VaModelFn;
+    val m: abi.VaModel = model();
+    if (m.kind == abi.VA_MODEL_HOME) {
+        ret ir_type.intern_ptr(?lc.m.types);
+    }
     var buf: [4]ir_type.IrTypeId;
     val i32r: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?lc.m.types, 32);
     if (is_err[ir_type.IrTypeId, str](i32r)) { ret i32r; }
@@ -859,7 +869,7 @@ pub fun expr_symbol_of(lc: *LowerContext, eid: aid.ExprId) resolve.SymbolId {
 # ret: the module's source text, or the empty string
 pub fun module_source(lc: *LowerContext) str {
     val sf: Option[*src.SourceFile] = src.get(?lc.s.sources, lc.a.file_id);
-    if (is_none[*src.SourceFile](sf)) { ret nil::str; }
+    if (is_none[*src.SourceFile](sf)) { ret ""; }
     ret unwrap[*src.SourceFile](sf).text;
 }
 
@@ -886,11 +896,8 @@ pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) Option[*resolve.Symb
 # ret:  the function index, or an allocation error
 pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: ir_type.IrTypeId) Result[u32, str] {
     val m: *ir.Module = lc.m;
-    var i: u32 = 0;
-    for (i < m.function_len) {
-        if (m.functions[i].name == name) { ret ok[u32, str](i); }
-        i = i + 1;
-    }
+    val existing: Option[u32] = ir.lookup_function(m, name);
+    if (is_some[u32](existing)) { ret ok[u32, str](unwrap[u32](existing)); }
 
     if (m.function_len == m.function_cap) {
         val new_cap: u32 = grow_cap(m.function_cap);
@@ -913,10 +920,13 @@ pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: ir_ty
     f.instr_len   = 0;
     f.instr_cap   = 0;
     f.flags       = ir.FN_FLAG_EXTERN;
+    f.label       = intern.STR_NIL;
     f.asm_blocks  = map.init[ir.InstructionId, ir.IrAsm](m.alloc, maphash.hash_u32, maphash.eq_u32);
 
     m.functions[idx] = f;
     m.function_len   = m.function_len + 1;
+    val reg: Result[bool, str] = ir.register_function(m, name, idx);
+    if (is_err[bool, str](reg)) { ret err[u32, str](unwrap_err[bool, str](reg)); }
 
     # appending may have reallocated `m.functions`, invalidating the builder's
     # raw pointer to the function currently being lowered. re-point it at the
@@ -944,11 +954,8 @@ fun grow_cap(cap: u32) u32 {
 # ret:  the global index, or an allocation error
 pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: ir_type.IrTypeId) Result[u32, str] {
     val m: *ir.Module = lc.m;
-    var i: u32 = 0;
-    for (i < m.global_len) {
-        if (m.globals[i].name == name) { ret ok[u32, str](i); }
-        i = i + 1;
-    }
+    val existing: Option[u32] = ir.lookup_global(m, name);
+    if (is_some[u32](existing)) { ret ok[u32, str](unwrap[u32](existing)); }
 
     if (m.global_len == m.global_cap) {
         val new_cap: u32 = grow_cap(m.global_cap);
@@ -969,6 +976,8 @@ pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: ir_type.
     g.is_local  = false;
     m.globals[idx] = g;
     m.global_len   = m.global_len + 1;
+    val reg: Result[bool, str] = ir.register_global(m, name, idx);
+    if (is_err[bool, str](reg)) { ret err[u32, str](unwrap_err[bool, str](reg)); }
     ret ok[u32, str](idx);
 }
 

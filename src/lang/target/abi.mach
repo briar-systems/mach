@@ -16,12 +16,17 @@ use std.types.bool.true;
 use std.types.bool.false;
 
 use intern: mach.lang.intern;
+use isa:    mach.lang.target.isa;
 
 # canonical numeric ids for known calling conventions. stable across compiler
 # versions and used as the registry slot index.
 pub val ABI_UNKNOWN: u32 = 0;
 pub val ABI_SYSV:    u32 = 1;
 pub val ABI_WIN64:   u32 = 2;
+# AArch64 AAPCS64. reserved now so `target.select` resolves an (os, aarch64) pair
+# to it and fails loudly at `abi.lookup` until the AAPCS64 implementation (#1045)
+# registers — never silently composing the x86-64 SysV vtable for an arm64 target.
+pub val ABI_AAPCS64: u32 = 3;
 
 # how a single parameter or return value is classified for passing.
 pub def ParamClass: u8;
@@ -60,6 +65,79 @@ pub rec ParamSlot {
     size:   u64;
 }
 
+# the concrete signatures the erased `AbiVTable` function pointers are cast back
+# to. they live in this neutral module — which every calling convention already
+# imports — rather than in one concrete convention's module, so a consumer
+# typing a win64 vtable's pointer never routes through the sysv module (the
+# coupling a target-agnostic backend must avoid). naming `isa.Register` here only
+# adds a typedef-level dependency on `isa`; the vtable's own fields stay erased
+# (`*u8`), so the runtime-dispatch interface itself carries no ISA type. each
+# per-ABI implementation aliases these (e.g. `sysv.RegFileFn`) for local use.
+
+# classify one value into a placement decision. `gp_used` / `fp_used` are the GP
+# and FP registers already consumed by earlier arguments. the implementation is
+# arch-specific by selection (`target.select` composes an (os, arch)-keyed vtable),
+# so the classifier carries no `arch_id`. `fp_eightbytes` is the per-eightbyte SSE
+# mask the caller computes from the aggregate's field layout — bit `e` set means
+# eightbyte `e` is SSE class (every field overlapping it is floating-point) — so the
+# SysV classifier can place a float-bearing aggregate's SSE eightbytes in vector
+# registers. it is meaningful only for a ≤16 byte aggregate; 0 for scalars and
+# integer-only aggregates.
+# ---
+# size:          value size in bytes
+# align:         value alignment in bytes
+# is_float:      true if the value is FP-register-eligible
+# fp_eightbytes: per-eightbyte SSE mask (bit e -> eightbyte e is SSE class)
+# is_aggregate:  true if the value is a record/array (recursively classified)
+# gp_used:       GP registers already consumed
+# fp_used:       FP registers already consumed
+# ret:           the placement decision
+pub def ClassifyFn: fun(u64, u64, bool, u8, bool, i32, i32) ParamSlot;
+
+# assign the registers or stack slot for a single argument, given the GP/FP usage
+# counters the caller tracks across the call's argument list. arch-specific by
+# selection, so no `arch_id` is threaded. `fp_eightbytes` is the per-eightbyte SSE
+# mask (see `ClassifyFn`).
+# ---
+# index:         zero-based logical argument position
+# size:          argument size in bytes
+# align:         argument alignment in bytes
+# is_float:      true if the argument goes in FP registers
+# fp_eightbytes: per-eightbyte SSE mask (bit e -> eightbyte e is SSE class)
+# is_aggregate:  true if the argument is an aggregate
+# gp_used:       GP registers already consumed
+# fp_used:       FP registers already consumed
+# ret:           the placement decision
+pub def ArgPassingFn: fun(i32, u64, u64, bool, u8, bool, i32, i32) ParamSlot;
+
+# assign the registers or sret slot for a return value. arch-specific by
+# selection, so no `arch_id` is threaded. `fp_eightbytes` is the per-eightbyte SSE
+# mask (see `ClassifyFn`).
+# ---
+# size:          return-value size in bytes
+# align:         return-value alignment in bytes
+# is_float:      true if the value is returned in FP registers
+# fp_eightbytes: per-eightbyte SSE mask (bit e -> eightbyte e is SSE class)
+# is_aggregate:  true if the value is an aggregate
+# ret:           the placement decision
+pub def RetPassingFn: fun(u64, u64, bool, u8, bool) ParamSlot;
+
+# fill a caller-owned `out` buffer with a register bank in canonical order and
+# return the count written. the erased `gp_arg_regs` / `fp_arg_regs` /
+# `callee_saved` pointers are all cast back to this. the caller must size `out`
+# to hold at least the bank's maximum count.
+# ---
+# out: caller-owned buffer receiving the register descriptors
+# ret: the number of registers written
+pub def RegFileFn: fun(*isa.Register) i32;
+
+# return the convention's `VaModel` — the variadic save model the backend's
+# prologue / va_start / va_arg expansion dispatches on. the erased `va_model`
+# pointer is cast back to this.
+# ---
+# ret: the convention's variadic save model
+pub def VaModelFn: fun() VaModel;
+
 # the ABI runtime-dispatch interface. exactly one of these exists per calling
 # convention; the backend reads stack alignment and red-zone size directly and
 # casts the erased function pointers back to the convention's concrete
@@ -75,10 +153,10 @@ pub rec ParamSlot {
 # spills across a call) and the callee-saved set (which the prologue preserves).
 # regalloc derives the caller-saved set as the complement: every allocatable
 # physical register in a class that is NOT in the callee-saved set. all six
-# function pointers are type-erased (`*u8`) — their concrete signatures name
-# `isa.Register` / `abi.ParamSlot`, so the vtable stays free of an ISA dependency
-# and each consumer casts back to the convention's typed signature (declared in
-# the per-ABI impl, e.g. `sysv.RegFileFn` / `sysv.ClassifyFn`).
+# function pointers are type-erased (`*u8`) — the vtable's fields name no ISA or
+# ABI value type — and each consumer casts back to the neutral typed signature
+# declared above (`RegFileFn` / `ClassifyFn` / ...), so a consumer typing any
+# convention's vtable never routes through a concrete convention's module.
 # ---
 # id:           calling-convention id (one of ABI_*)
 # name:         interned convention name ("sysv", "win64")
@@ -200,39 +278,71 @@ pub rec SigLayout {
 # VA_MODEL_REG_SAVE (SysV): the prologue spills the GP and FP argument registers
 # into a frame-local register-save area, and `va_list` is the four-field
 # `__va_list_tag` (gp_offset / fp_offset / overflow_arg_area / reg_save_area) the
-# `va_arg` cursors index.
+# `va_arg` cursors index. all the register-save geometry the backend needs — the
+# save-area size, the FP region offset and per-XMM stride, the exhaustion
+# thresholds, and the four `__va_list_tag` field offsets — rides on the model so
+# the backend reads no convention-specific constant from the SysV module.
 #
 # VA_MODEL_HOME (win64): the caller's 32-byte home/shadow space (just above the
-# return address) holds the register arguments; the variadic prologue spills the
-# integer argument registers at/after the last named parameter into their home
-# slots so the named and unnamed arguments form one contiguous stack array, and
-# `va_list` is a single pointer that `va_start` seeds just past the named
-# arguments and `va_arg` walks up by `arg_stride` bytes per argument. win64 has
-# no separate FP save area — a variadic float is passed in both the XMM register
-# and the matching integer register, and `va_arg` reads the integer/stack slot —
-# so `fp_save_count` is 0.
+# return address, at the ISA's `incoming_arg_base`) holds the register arguments;
+# the variadic prologue spills the integer argument registers at/after the last
+# named parameter into their home slots so the named and unnamed arguments form
+# one contiguous stack array, and `va_list` is a single pointer that `va_start`
+# seeds just past the named arguments and `va_arg` walks up by `arg_stride` bytes
+# per argument. win64 has no separate FP save area — a variadic float is passed in
+# both the XMM register and the matching integer register (`float_dup_gp`), and
+# `va_arg` reads the integer/stack slot — so `fp_save_count` is 0.
 pub val VA_MODEL_REG_SAVE: u8 = 0;
 pub val VA_MODEL_HOME:     u8 = 1;
 
 # the variadic-argument save model a calling convention uses. produced by the ABI
 # vtable's `va_model` accessor; the backend dispatches its prologue / va_start /
-# va_arg expansion on `kind` and reads the home-model layout facts from the rest.
+# va_arg expansion on `kind` and reads every convention-specific layout fact from
+# the rest of the model — never from a concrete convention module.
 # ---
-# kind:          one of VA_MODEL_*
-# gp_save_count: GP argument registers the variadic prologue spills (the full file
-#                for REG_SAVE; the home-slot count for HOME)
-# fp_save_count: FP argument registers the prologue spills (REG_SAVE only; 0 for HOME)
-# home_base_off: `[rbp + off]` of the first home/save slot for the HOME model — the
-#                first caller-home slot above the saved frame pointer and return
-#                address (unused by REG_SAVE)
-# arg_stride:    bytes `va_arg` advances the single-pointer cursor per argument for
-#                the HOME model (unused by REG_SAVE)
+# kind:             one of VA_MODEL_*
+# gp_save_count:    GP argument registers the variadic prologue spills (the full
+#                   file for REG_SAVE; the home-slot count for HOME)
+# fp_save_count:    FP argument registers the prologue spills (REG_SAVE only; 0 for
+#                   HOME). also the XMM dump count the AL-guarded spill writes.
+# arg_stride:       bytes `va_arg` advances the single-pointer cursor per argument
+#                   for the HOME model (unused by REG_SAVE)
+# float_dup_gp:     HOME model — a variadic float argument is duplicated into the
+#                   matching integer argument register (the GP register of its
+#                   positional slot) in addition to its XMM register, so a `va_arg`
+#                   reader that only knows the integer/home slots sees it. false for
+#                   REG_SAVE (the FP save area captures floats directly).
+# vector_count_reg: the register a variadic caller sets to the number of vector
+#                   registers the call uses (SysV's AL/RAX, read by the AL-guarded
+#                   FP spill), or -1 when the convention encodes no vector count
+#                   (win64). the pre-call vector-count move is emitted only when
+#                   this is non-negative.
+# save_size:        REG_SAVE — frame-local register-save area size in bytes
+# fp_save_offset:   REG_SAVE — byte offset of the FP dump within the save area
+#                   (after the GP registers)
+# fp_save_stride:   REG_SAVE — per-XMM save/advance stride in bytes (16)
+# gp_offset_max:    REG_SAVE — gp_offset value at which the GP save area is exhausted
+# fp_offset_max:    REG_SAVE — fp_offset value at which the FP save area is exhausted
+# gp_offset_field:  REG_SAVE — `__va_list_tag` byte offset of gp_offset
+# fp_offset_field:  REG_SAVE — `__va_list_tag` byte offset of fp_offset
+# overflow_field:   REG_SAVE — `__va_list_tag` byte offset of overflow_arg_area
+# reg_save_field:   REG_SAVE — `__va_list_tag` byte offset of reg_save_area
 pub rec VaModel {
-    kind:          u8;
-    gp_save_count: i32;
-    fp_save_count: i32;
-    home_base_off: i64;
-    arg_stride:    i64;
+    kind:             u8;
+    gp_save_count:    i32;
+    fp_save_count:    i32;
+    arg_stride:       i64;
+    float_dup_gp:     bool;
+    vector_count_reg: i32;
+    save_size:        u64;
+    fp_save_offset:   u64;
+    fp_save_stride:   u64;
+    gp_offset_max:    u32;
+    fp_offset_max:    u32;
+    gp_offset_field:  u32;
+    fp_offset_field:  u32;
+    overflow_field:   u32;
+    reg_save_field:   u32;
 }
 
 # make_slot: build a ParamSlot. convenience for ABI implementations.

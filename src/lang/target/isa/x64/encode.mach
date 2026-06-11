@@ -49,6 +49,7 @@ use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.reallocate;
 use std.allocator.deallocate;
+use page: std.allocator.page;
 
 use std.system.panic.panic;
 use os: std.system.os;
@@ -284,7 +285,14 @@ fun encode_mem_operand(buf: *ByteBuf, reg: i32, op: *isa.Operand) {
         if (op.scale <= 1) { scale_bits = 0; }
         or (op.scale == 2) { scale_bits = 1; }
         or (op.scale == 4) { scale_bits = 2; }
-        or { scale_bits = 3; }
+        or (op.scale == 8) { scale_bits = 3; }
+        or {
+            # the x86 SIB scale field encodes 1/2/4/8 only; lowering produces only
+            # those and parse_asm_mem rejects any other inline-asm scale, so a
+            # non-power-of-two scale here is a backend bug -- rejected loudly rather
+            # than silently encoded as *8.
+            panic("encode: invalid SIB scale (must be 1, 2, 4, or 8)\n");
+        }
     }
 
     if (base == -1 && has_index) {
@@ -380,28 +388,58 @@ fun emit_rex_mem(buf: *ByteBuf, w: u8, reg: i32, mem: *isa.Operand) {
     }
 }
 
+# emit_prefix_reg: emit the operand-size (0x66) and REX prefixes for an instruction
+# whose r/m operand is a register — the single place the byte-register REX rule lives
+# for register-register and /digit forms. a size-1 operand naming SPL/BPL/SIL/DIL
+# (regs 4-7) forces a bare REX so it is not encoded as AH/CH/DH/BH; a 16-bit operand
+# takes the 0x66 prefix. `reg` is the ModR/M reg-field register (an opcode-extension
+# digit for /digit forms, where the fixed digit 0 never trips the byte rule), `rm`
+# the r/m-field register. centralizing this is what makes the byte-reg REX gap (the
+# XCHG/XADD class) structurally unable to recur per-opcode.
+fun emit_prefix_reg(buf: *ByteBuf, size: u8, flags: u16, reg: i32, rm: i32) {
+    if (size == 2 || (flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
+    if (size == 1 && (needs_rex_for_byte_reg(reg) || needs_rex_for_byte_reg(rm))) {
+        emit_byte(buf, encode_rex(0, reg, rm));
+    } or {
+        emit_rex_if_needed(buf, size_to_w(size, flags), reg, rm);
+    }
+}
+
+# emit_prefix_mem: emit the operand-size (0x66) and REX prefixes for an instruction
+# whose r/m operand is a memory reference, threading the SIB index into REX.X — the
+# memory counterpart of emit_prefix_reg under the same single byte-register REX rule
+# (a size-1 reg-field register in 4-7 forces a bare REX). `reg` is the ModR/M
+# reg-field register (an opcode-extension digit for /digit forms).
+fun emit_prefix_mem(buf: *ByteBuf, size: u8, flags: u16, reg: i32, mem: *isa.Operand) {
+    if (size == 2 || (flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
+    if (size == 1 && needs_rex_for_byte_reg(reg)) {
+        emit_rex_byte_mem(buf, reg, mem);
+    } or {
+        emit_rex_mem(buf, size_to_w(size, flags), reg, mem);
+    }
+}
+
+# emit_imm_sized: emit a trailing immediate at the operand width — imm8 for size 1,
+# imm16 for size 2, imm32 otherwise (a 64-bit operand still takes a sign-extended
+# imm32). the single place the trailing-immediate width is decided, so no per-opcode
+# encoder can desync the immediate from the operand-size prefix (the bug class behind
+# the pre-1.0 encode_alu_imm fault, #1198, and the encode_imul imm16 fault).
+fun emit_imm_sized(buf: *ByteBuf, imm: i64, size: u8) {
+    if (size == 1) { emit_byte(buf, imm::u8); }
+    or (size == 2) { emit_u16(buf, imm::u16); }
+    or { emit_u32(buf, imm::u32); }
+}
+
 # encode_alu_rr: encode a two-register ALU op (opcode reg,reg).
 fun encode_alu_rr(buf: *ByteBuf, opcode: u8, dst: i32, src: i32, size: u8, flags: u16) {
-    val w: u8 = size_to_w(size, flags);
-    if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-    if (size == 1 && (needs_rex_for_byte_reg(dst) || needs_rex_for_byte_reg(src))) {
-        emit_byte(buf, encode_rex(0, src, dst));
-    } or {
-        emit_rex_if_needed(buf, w, src, dst);
-    }
+    emit_prefix_reg(buf, size, flags, src, dst);
     emit_byte(buf, opcode);
     emit_byte(buf, encode_modrm(3, reg_bits(src), reg_bits(dst)));
 }
 
 # encode_alu_rm: encode an ALU op with a memory operand.
 fun encode_alu_rm(buf: *ByteBuf, opcode: u8, reg: i32, mem: *isa.Operand, size: u8, flags: u16) {
-    val w: u8 = size_to_w(size, flags);
-    if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-    if (size == 1 && needs_rex_for_byte_reg(reg)) {
-        emit_rex_byte_mem(buf, reg, mem);
-    } or {
-        emit_rex_mem(buf, w, reg, mem);
-    }
+    emit_prefix_mem(buf, size, flags, reg, mem);
     emit_byte(buf, opcode);
     encode_mem_operand(buf, reg, mem);
 }
@@ -431,30 +469,20 @@ fun encode_alu_imm(buf: *ByteBuf, opcode: u16, reg: i32, imm: i64, size: u8, fla
     }
 
     val group: u8 = alu_group(opcode);
-    val w: u8 = size_to_w(size, flags);
-    if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-    if (size == 1 && needs_rex_for_byte_reg(reg)) {
-        emit_byte(buf, encode_rex(0, 0, reg));
-    } or {
-        emit_rex_if_needed(buf, w, 0, reg);
-    }
+    emit_prefix_reg(buf, size, flags, 0, reg);
 
+    # the imm8 short form (0x83) sign-extends to the operand width for size > 1; the
+    # full form (0x80 byte / 0x81 wider) takes an operand-width immediate.
     if (imm >= -128 && imm <= 127 && size > 1) {
         emit_byte(buf, 0x83);
         emit_byte(buf, encode_modrm(3, group, reg_bits(reg)));
         emit_byte(buf, imm::u8);
-    } or (size == 1) {
-        emit_byte(buf, 0x80);
-        emit_byte(buf, encode_modrm(3, group, reg_bits(reg)));
-        emit_byte(buf, imm::u8);
-    } or (size == 2) {
-        emit_byte(buf, 0x81);
-        emit_byte(buf, encode_modrm(3, group, reg_bits(reg)));
-        emit_u16(buf, imm::u16);
     } or {
-        emit_byte(buf, 0x81);
+        var opc: u8 = 0x81;
+        if (size == 1) { opc = 0x80; }
+        emit_byte(buf, opc);
         emit_byte(buf, encode_modrm(3, group, reg_bits(reg)));
-        emit_u32(buf, imm::u32);
+        emit_imm_sized(buf, imm, size);
     }
 }
 
@@ -569,11 +597,15 @@ fun encode_fp_mov(mi: *isa.Inst, buf: *ByteBuf) i32 {
     }
 
     # a same-bank float move: load the source into the float scratch and store it to
-    # the destination, so every register / frame-slot / immediate shape encodes.
+    # the destination, so every register / frame-slot / immediate shape encodes. a
+    # load/store error means an operand reached here in a bank the move cannot model
+    # (a regalloc / lowering bug); surface its specific message loudly rather than
+    # returning zero bytes the driver would report as the generic "produced no bytes",
+    # matching encode_mem_operand's handling of the same class of backend bug.
     val ld: Result[bool, str] = emit_float_load(@src1, FLOAT_SCRATCH0, w, buf);
-    if (is_err[bool, str](ld)) { ret 0; }
+    if (is_err[bool, str](ld)) { panic(unwrap_err[bool, str](ld)::*u8); }
     val st: Result[bool, str] = emit_float_store(@dst, FLOAT_SCRATCH0, w, buf);
-    if (is_err[bool, str](st)) { ret 0; }
+    if (is_err[bool, str](st)) { panic(unwrap_err[bool, str](st)::*u8); }
     ret (buf.len - start)::i32;
 }
 
@@ -593,13 +625,7 @@ fun encode_mov(mi: *isa.Inst, buf: *ByteBuf) i32 {
     }
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
-        val w: u8 = size_to_w(size, flags);
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        if (size == 1 && (needs_rex_for_byte_reg(dst.reg) || needs_rex_for_byte_reg(src1.reg))) {
-            emit_byte(buf, encode_rex(0, src1.reg, dst.reg));
-        } or {
-            emit_rex_if_needed(buf, w, src1.reg, dst.reg);
-        }
+        emit_prefix_reg(buf, size, flags, src1.reg, dst.reg);
         if (size == 1) {
             emit_byte(buf, 0x88);
         } or {
@@ -612,7 +638,11 @@ fun encode_mov(mi: *isa.Inst, buf: *ByteBuf) i32 {
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_IMM) {
         val w: u8 = size_to_w(size, flags);
         val imm: i64 = src1.imm;
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
+        # the immediate-to-register forms (B0+rb / B8+rd) carry the operand-width
+        # immediate in the opcode itself, so the 0x66 must track the operand size, not
+        # just the flag — a size-2 MOV without FLAG_16BIT would otherwise emit B8+imm16
+        # with no prefix and desync the stream.
+        if (size == 2 || (flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
         if (size == 1) {
             if (needs_rex_byte(dst.reg)) {
                 emit_byte(buf, encode_rex(0, 0, dst.reg));
@@ -643,13 +673,7 @@ fun encode_mov(mi: *isa.Inst, buf: *ByteBuf) i32 {
     }
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
-        val w: u8 = size_to_w(size, flags);
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        if (size == 1 && needs_rex_for_byte_reg(dst.reg)) {
-            emit_rex_byte_mem(buf, dst.reg, src1);
-        } or {
-            emit_rex_mem(buf, w, dst.reg, src1);
-        }
+        emit_prefix_mem(buf, size, flags, dst.reg, src1);
         if (size == 1) {
             emit_byte(buf, 0x8A);
         } or {
@@ -660,13 +684,7 @@ fun encode_mov(mi: *isa.Inst, buf: *ByteBuf) i32 {
     }
 
     if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
-        val w: u8 = size_to_w(size, flags);
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        if (size == 1 && needs_rex_for_byte_reg(src1.reg)) {
-            emit_rex_byte_mem(buf, src1.reg, dst);
-        } or {
-            emit_rex_mem(buf, w, src1.reg, dst);
-        }
+        emit_prefix_mem(buf, size, flags, src1.reg, dst);
         if (size == 1) {
             emit_byte(buf, 0x88);
         } or {
@@ -736,22 +754,14 @@ fun encode_mov(mi: *isa.Inst, buf: *ByteBuf) i32 {
             val st_sz: i32 = encode_mov(?st, buf);
             ret ld_sz + st_sz;
         }
-        val w: u8 = size_to_w(size, flags);
-        if (size == 2 || (flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_mem(buf, w, 0, dst);
+        emit_prefix_mem(buf, size, flags, 0, dst);
         if (size == 1) {
             emit_byte(buf, 0xC6);
         } or {
             emit_byte(buf, 0xC7);
         }
         encode_mem_operand(buf, 0, dst);
-        if (size == 1) {
-            emit_byte(buf, src1.imm::u8);
-        } or (size == 2) {
-            emit_u16(buf, src1.imm::u16);
-        } or {
-            emit_u32(buf, src1.imm::u32);
-        }
+        emit_imm_sized(buf, src1.imm, size);
         ret (buf.len - start)::i32;
     }
 
@@ -797,9 +807,15 @@ fun encode_push(mi: *isa.Inst, buf: *ByteBuf) i32 {
         if (imm >= -128 && imm <= 127) {
             emit_byte(buf, 0x6A);
             emit_byte(buf, imm::u8);
-        } or {
+        } or (imm >= -2147483648 && imm <= 2147483647) {
             emit_byte(buf, 0x68);
             emit_u32(buf, imm::u32);
+        } or {
+            # PUSH imm has no 64-bit form and 0x68 sign-extends its imm32, so a value
+            # outside signed-imm32 range cannot be encoded without silently corrupting
+            # it. reject loudly (no bytes) rather than truncate -- materialize it into a
+            # register and push that instead.
+            ret 0;
         }
     }
     ret (buf.len - start)::i32;
@@ -917,19 +933,13 @@ fun encode_unary_grp3(mi: *isa.Inst, buf: *ByteBuf) i32 {
     if (size == 1) { opc = 0xF6; }
 
     if (dst.kind == isa.OPK_REG) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        if (size == 1 && needs_rex_for_byte_reg(dst.reg)) {
-            emit_byte(buf, encode_rex(0, 0, dst.reg));
-        } or {
-            emit_rex_if_needed(buf, size_to_w(size, flags), 0, dst.reg);
-        }
+        emit_prefix_reg(buf, size, flags, 0, dst.reg);
         emit_byte(buf, opc);
         emit_byte(buf, encode_modrm(3, modrm_ext, reg_bits(dst.reg)));
         ret (buf.len - start)::i32;
     }
     if (dst.kind == isa.OPK_MEM) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_mem(buf, size_to_w(size, flags), modrm_ext::i32, dst);
+        emit_prefix_mem(buf, size, flags, 0, dst);
         emit_byte(buf, opc);
         encode_mem_operand(buf, modrm_ext::i32, dst);
         ret (buf.len - start)::i32;
@@ -951,19 +961,13 @@ fun encode_unary_grp5(mi: *isa.Inst, buf: *ByteBuf) i32 {
     if (size == 1) { opc = 0xFE; }
 
     if (dst.kind == isa.OPK_REG) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        if (size == 1 && needs_rex_for_byte_reg(dst.reg)) {
-            emit_byte(buf, encode_rex(0, 0, dst.reg));
-        } or {
-            emit_rex_if_needed(buf, size_to_w(size, flags), 0, dst.reg);
-        }
+        emit_prefix_reg(buf, size, flags, 0, dst.reg);
         emit_byte(buf, opc);
         emit_byte(buf, encode_modrm(3, modrm_ext, reg_bits(dst.reg)));
         ret (buf.len - start)::i32;
     }
     if (dst.kind == isa.OPK_MEM) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_mem(buf, size_to_w(size, flags), modrm_ext::i32, dst);
+        emit_prefix_mem(buf, size, flags, 0, dst);
         emit_byte(buf, opc);
         encode_mem_operand(buf, modrm_ext::i32, dst);
         ret (buf.len - start)::i32;
@@ -985,22 +989,19 @@ fun encode_xchg(mi: *isa.Inst, buf: *ByteBuf) i32 {
     if (size == 1) { opc = 0x86; }
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_if_needed(buf, size_to_w(size, flags), src1.reg, dst.reg);
+        emit_prefix_reg(buf, size, flags, src1.reg, dst.reg);
         emit_byte(buf, opc);
         emit_byte(buf, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
         ret (buf.len - start)::i32;
     }
     if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_mem(buf, size_to_w(size, flags), src1.reg, dst);
+        emit_prefix_mem(buf, size, flags, src1.reg, dst);
         emit_byte(buf, opc);
         encode_mem_operand(buf, src1.reg, dst);
         ret (buf.len - start)::i32;
     }
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_mem(buf, size_to_w(size, flags), dst.reg, src1);
+        emit_prefix_mem(buf, size, flags, dst.reg, src1);
         emit_byte(buf, opc);
         encode_mem_operand(buf, dst.reg, src1);
         ret (buf.len - start)::i32;
@@ -1025,17 +1026,16 @@ fun encode_xadd_cmpxchg(mi: *isa.Inst, buf: *ByteBuf) i32 {
     if (size == 1) { opc2 = opc2 - 1; }
 
     maybe_emit_lock(buf, flags);
-    if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
 
     if (dst.kind == isa.OPK_REG) {
-        emit_rex_if_needed(buf, size_to_w(size, flags), src1.reg, dst.reg);
+        emit_prefix_reg(buf, size, flags, src1.reg, dst.reg);
         emit_byte(buf, 0x0F);
         emit_byte(buf, opc2);
         emit_byte(buf, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
         ret (buf.len - start)::i32;
     }
     if (dst.kind == isa.OPK_MEM) {
-        emit_rex_mem(buf, size_to_w(size, flags), src1.reg, dst);
+        emit_prefix_mem(buf, size, flags, src1.reg, dst);
         emit_byte(buf, 0x0F);
         emit_byte(buf, opc2);
         encode_mem_operand(buf, src1.reg, dst);
@@ -1053,13 +1053,7 @@ fun encode_test(mi: *isa.Inst, buf: *ByteBuf) i32 {
     val flags: u16 = mi.flags;
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
-        val w: u8 = size_to_w(size, flags);
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        if (size == 1 && (needs_rex_for_byte_reg(dst.reg) || needs_rex_for_byte_reg(src1.reg))) {
-            emit_byte(buf, encode_rex(0, src1.reg, dst.reg));
-        } or {
-            emit_rex_if_needed(buf, w, src1.reg, dst.reg);
-        }
+        emit_prefix_reg(buf, size, flags, src1.reg, dst.reg);
         if (size == 1) {
             emit_byte(buf, 0x84);
         } or {
@@ -1070,57 +1064,27 @@ fun encode_test(mi: *isa.Inst, buf: *ByteBuf) i32 {
     }
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_IMM) {
-        val w: u8 = size_to_w(size, flags);
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        if (size == 1 && needs_rex_for_byte_reg(dst.reg)) {
-            emit_byte(buf, encode_rex(0, 0, dst.reg));
-        } or {
-            emit_rex_if_needed(buf, w, 0, dst.reg);
-        }
-        if (size == 1) {
-            emit_byte(buf, 0xF6);
-            emit_byte(buf, encode_modrm(3, 0, reg_bits(dst.reg)));
-            emit_byte(buf, src1.imm::u8);
-        } or (size == 2) {
-            emit_byte(buf, 0xF7);
-            emit_byte(buf, encode_modrm(3, 0, reg_bits(dst.reg)));
-            emit_u16(buf, src1.imm::u16);
-        } or {
-            emit_byte(buf, 0xF7);
-            emit_byte(buf, encode_modrm(3, 0, reg_bits(dst.reg)));
-            emit_u32(buf, src1.imm::u32);
-        }
+        emit_prefix_reg(buf, size, flags, 0, dst.reg);
+        var opc: u8 = 0xF7;
+        if (size == 1) { opc = 0xF6; }
+        emit_byte(buf, opc);
+        emit_byte(buf, encode_modrm(3, 0, reg_bits(dst.reg)));
+        emit_imm_sized(buf, src1.imm, size);
         ret (buf.len - start)::i32;
     }
 
     if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_IMM) {
-        val w: u8 = size_to_w(size, flags);
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_mem(buf, w, 0, dst);
-        if (size == 1) {
-            emit_byte(buf, 0xF6);
-            encode_mem_operand(buf, 0, dst);
-            emit_byte(buf, src1.imm::u8);
-        } or (size == 2) {
-            emit_byte(buf, 0xF7);
-            encode_mem_operand(buf, 0, dst);
-            emit_u16(buf, src1.imm::u16);
-        } or {
-            emit_byte(buf, 0xF7);
-            encode_mem_operand(buf, 0, dst);
-            emit_u32(buf, src1.imm::u32);
-        }
+        emit_prefix_mem(buf, size, flags, 0, dst);
+        var opc: u8 = 0xF7;
+        if (size == 1) { opc = 0xF6; }
+        emit_byte(buf, opc);
+        encode_mem_operand(buf, 0, dst);
+        emit_imm_sized(buf, src1.imm, size);
         ret (buf.len - start)::i32;
     }
 
     if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
-        val w: u8 = size_to_w(size, flags);
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        if (size == 1 && needs_rex_for_byte_reg(src1.reg)) {
-            emit_rex_byte_mem(buf, src1.reg, dst);
-        } or {
-            emit_rex_mem(buf, w, src1.reg, dst);
-        }
+        emit_prefix_mem(buf, size, flags, src1.reg, dst);
         if (size == 1) {
             emit_byte(buf, 0x84);
         } or {
@@ -1140,11 +1104,9 @@ fun encode_imul(mi: *isa.Inst, buf: *ByteBuf) i32 {
     val src1: *isa.Operand = ?mi.src1;
     val size: u8 = mi.size;
     val flags: u16 = mi.flags;
-    val w: u8 = size_to_w(size, flags);
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_if_needed(buf, w, dst.reg, src1.reg);
+        emit_prefix_reg(buf, size, flags, dst.reg, src1.reg);
         emit_byte(buf, 0x0F);
         emit_byte(buf, 0xAF);
         emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
@@ -1152,8 +1114,7 @@ fun encode_imul(mi: *isa.Inst, buf: *ByteBuf) i32 {
     }
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_mem(buf, w, dst.reg, src1);
+        emit_prefix_mem(buf, size, flags, dst.reg, src1);
         emit_byte(buf, 0x0F);
         emit_byte(buf, 0xAF);
         encode_mem_operand(buf, dst.reg, src1);
@@ -1162,6 +1123,11 @@ fun encode_imul(mi: *isa.Inst, buf: *ByteBuf) i32 {
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_IMM) {
         val imm: i64 = src1.imm;
+        # IMUL's immediate forms (6B imm8, 69 imm16/imm32) exist only for 16/32/64-bit
+        # operands -- there is no `imul r/m8, imm8`. lowering clamps integer ALU widths
+        # to >= 4, so size 1 never reaches here; reject it loudly (no bytes) rather than
+        # emit a malformed encoding.
+        if (size < 2) { ret 0; }
         # the imm forms here -- `imul r64, r/m64, imm8` (6B) and `imul r64, r/m64,
         # imm32` (69) -- carry at most a 32-bit field that the CPU sign-extends to
         # the operand width; x86-64 has no `imul r64, imm64`. a 64-bit immediate
@@ -1188,16 +1154,17 @@ fun encode_imul(mi: *isa.Inst, buf: *ByteBuf) i32 {
             encode_imul(?rr, buf);
             ret (buf.len - start)::i32;
         }
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_if_needed(buf, w, dst.reg, dst.reg);
+        emit_prefix_reg(buf, size, flags, dst.reg, dst.reg);
         if (imm >= -128 && imm <= 127) {
             emit_byte(buf, 0x6B);
             emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(dst.reg)));
             emit_byte(buf, imm::u8);
         } or {
+            # the 0x69 form takes an operand-width immediate -- imm16 under the 0x66
+            # prefix (size 2), imm32 otherwise; emit_imm_sized keeps it from desyncing.
             emit_byte(buf, 0x69);
             emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(dst.reg)));
-            emit_u32(buf, imm::u32);
+            emit_imm_sized(buf, imm, size);
         }
         ret (buf.len - start)::i32;
     }
@@ -1211,17 +1178,11 @@ fun encode_div(mi: *isa.Inst, buf: *ByteBuf, is_signed: bool) i32 {
     val src: *isa.Operand = ?mi.src1;
     val size: u8 = mi.size;
     val flags: u16 = mi.flags;
-    val w: u8 = size_to_w(size, flags);
     var modrm_ext: u8 = 6;
     if (is_signed) { modrm_ext = 7; }
 
     if (src.kind == isa.OPK_REG) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        if (size == 1 && needs_rex_for_byte_reg(src.reg)) {
-            emit_byte(buf, encode_rex(0, 0, src.reg));
-        } or {
-            emit_rex_if_needed(buf, w, 0, src.reg);
-        }
+        emit_prefix_reg(buf, size, flags, 0, src.reg);
         if (size == 1) {
             emit_byte(buf, 0xF6);
         } or {
@@ -1232,8 +1193,7 @@ fun encode_div(mi: *isa.Inst, buf: *ByteBuf, is_signed: bool) i32 {
     }
 
     if (src.kind == isa.OPK_MEM) {
-        if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-        emit_rex_mem(buf, w, modrm_ext::i32, src);
+        emit_prefix_mem(buf, size, flags, 0, src);
         if (size == 1) {
             emit_byte(buf, 0xF6);
         } or {
@@ -1253,20 +1213,13 @@ fun encode_shift(mi: *isa.Inst, buf: *ByteBuf) i32 {
     val src1: *isa.Operand = ?mi.src1;
     val size: u8 = mi.size;
     val flags: u16 = mi.flags;
-    val w: u8 = size_to_w(size, flags);
     val opcode: u16 = mi.opcode;
     var modrm_ext: u8 = 4;
     if (opcode == x64.SHR) { modrm_ext = 5; }
     if (opcode == x64.SAR) { modrm_ext = 7; }
 
-    if ((flags & x64.FLAG_16BIT::u16) != 0) { emit_byte(buf, 0x66); }
-
     if (src1.kind == isa.OPK_REG) {
-        if (size == 1 && needs_rex_for_byte_reg(dst.reg)) {
-            emit_byte(buf, encode_rex(0, 0, dst.reg));
-        } or {
-            emit_rex_if_needed(buf, w, 0, dst.reg);
-        }
+        emit_prefix_reg(buf, size, flags, 0, dst.reg);
         if (size == 1) {
             emit_byte(buf, 0xD2);
         } or {
@@ -1275,11 +1228,7 @@ fun encode_shift(mi: *isa.Inst, buf: *ByteBuf) i32 {
         emit_byte(buf, encode_modrm(3, modrm_ext, reg_bits(dst.reg)));
     } or (src1.kind == isa.OPK_IMM) {
         val imm: i64 = src1.imm;
-        if (size == 1 && needs_rex_for_byte_reg(dst.reg)) {
-            emit_byte(buf, encode_rex(0, 0, dst.reg));
-        } or {
-            emit_rex_if_needed(buf, w, 0, dst.reg);
-        }
+        emit_prefix_reg(buf, size, flags, 0, dst.reg);
         if (imm == 1) {
             if (size == 1) {
                 emit_byte(buf, 0xD0);
@@ -1381,9 +1330,10 @@ fun encode_setcc(mi: *isa.Inst, buf: *ByteBuf) i32 {
     val cc: u8 = cc_to_x86(mi.opcode);
 
     if (dst.kind == isa.OPK_REG) {
-        if (needs_rex(dst.reg) || dst.reg == 4 || dst.reg == 5 || dst.reg == 6 || dst.reg == 7) {
-            emit_byte(buf, encode_rex(0, 0, dst.reg));
-        }
+        # SETcc writes a byte: route through the byte-operand prefix (size 1, no
+        # operand-size prefix) so SPL/BPL/SIL/DIL force a bare REX in the one place
+        # that rule lives, rather than the open-coded `dst.reg == 4 || ...` it used.
+        emit_prefix_reg(buf, 1, 0, 0, dst.reg);
         emit_byte(buf, 0x0F);
         emit_byte(buf, 0x90 + cc);
         emit_byte(buf, encode_modrm(3, 0, reg_bits(dst.reg)));
@@ -1505,12 +1455,15 @@ fun encode_movzx(mi: *isa.Inst, buf: *ByteBuf) i32 {
     ret 0;
 }
 
-# encode_movsx: encode a sign-extending move from an 8- or 16-bit source.
+# encode_movsx: encode a sign-extending move. an 8- or 16-bit source uses the
+# 0F BE / 0F BF forms; a 32-bit source must use MOVSXD (0x63), since those forms
+# read only one or two bytes and would truncate a 32-bit operand.
 fun encode_movsx(mi: *isa.Inst, buf: *ByteBuf) i32 {
     val start: usize = buf.len;
     val dst: *isa.Operand = ?mi.dst;
     val src1: *isa.Operand = ?mi.src1;
     val src_size: u8 = src1.size;
+    if (src_size == 4) { ret encode_movsxd(mi, buf); }
     val w: u8 = size_to_w(mi.size, mi.flags);
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
@@ -1619,6 +1572,36 @@ fun encode_sse_mov(mi: *isa.Inst, buf: *ByteBuf) i32 {
         emit_rex_mem(buf, 0, src1.reg, dst);
         emit_byte(buf, 0x0F);
         emit_byte(buf, 0x11);
+        encode_mem_operand(buf, src1.reg, dst);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+# encode_movaps: encode MOVAPS in reg<-mem (`0F 28 /r`, a 128-bit aligned load)
+# and mem<-reg (`0F 29 /r`, a 128-bit aligned store) forms — the prologue /
+# epilogue callee-saved XMM save and restore. MOVAPS takes no mandatory SSE prefix.
+# the memory operand must be 16-byte aligned, which the frame layout guarantees
+# (RBP is 16-aligned after `push rbp; mov rbp, rsp`, and the XMM slots sit at
+# 16-aligned `[rbp - k*16]`). reg<->reg is unused here and not emitted.
+fun encode_movaps(mi: *isa.Inst, buf: *ByteBuf) i32 {
+    val start: usize = buf.len;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_rex_mem(buf, 0, dst.reg, src1);
+        emit_byte(buf, 0x0F);
+        emit_byte(buf, 0x28);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
+        emit_rex_mem(buf, 0, src1.reg, dst);
+        emit_byte(buf, 0x0F);
+        emit_byte(buf, 0x29);
         encode_mem_operand(buf, src1.reg, dst);
         ret (buf.len - start)::i32;
     }
@@ -1919,6 +1902,10 @@ pub fun encode_inst(mi: *isa.Inst, buf: *ByteBuf) i32 {
         ret encode_sse_mov(mi, buf);
     }
 
+    if (opcode == x64.MOVAPS) {
+        ret encode_movaps(mi, buf);
+    }
+
     if (is_sse_alu(opcode)) {
         ret encode_sse_alu(mi, buf);
     }
@@ -2055,11 +2042,37 @@ fun count_callee_saved(abi_vt: *abi.AbiVTable, mask: u32) i32 {
 # the outgoing region as the bottommost slice puts its base exactly at the new
 # RSP, so a caller's `[rsp + off]` argument store lands in it, and keeping every
 # addend 16-aligned holds RSP 16-byte aligned at each call boundary.
-fun frame_total(abi_vt: *abi.AbiVTable, frame_size: u32, callee_mask: u32, outgoing_size: u32) usize {
-    val callee_space: usize = count_callee_saved(abi_vt, callee_mask)::usize * 8;
-    var base: usize = frame_size::usize + callee_space;
+pub fun frame_total(abi_vt: *abi.AbiVTable, frame_size: u32, callee_mask: u32, callee_mask_fp: u32, outgoing_size: u32) usize {
+    var base: usize = fp_save_base(abi_vt, frame_size, callee_mask);
+    # the callee-saved XMM save area (16 bytes per register, MOVAPS-aligned) sits
+    # below the 16-aligned GP-area base. `fp_save_base` is already 16-aligned, so
+    # adding 16-byte slots keeps the whole area 16-aligned.
+    base = base + popcount32(callee_mask_fp)::usize * 16;
     if (base > 0 && (base & 15) != 0) { base = (base + 15) & ~15::usize; }
     ret base + outgoing_size::usize;
+}
+
+# fp_save_base: the 16-byte-aligned offset (from RBP) at which the callee-saved
+# XMM save area begins — just below the local frame and the GP save area. the XMM
+# slots are then at `[rbp - (fp_save_base + 16*k)]`, each 16-aligned because RBP and
+# fp_save_base are. shared by `frame_total`, `emit_prologue`, and `emit_epilogue` so
+# the reserved size and the actual save offsets always agree.
+fun fp_save_base(abi_vt: *abi.AbiVTable, frame_size: u32, callee_mask: u32) usize {
+    val gp_space: usize = count_callee_saved(abi_vt, callee_mask)::usize * 8;
+    var base: usize = frame_size::usize + gp_space;
+    if ((base & 15) != 0) { base = (base + 15) & ~15::usize; }
+    ret base;
+}
+
+# popcount32: the number of set bits in a 32-bit mask.
+fun popcount32(m: u32) i32 {
+    var n: i32 = 0;
+    var x: u32 = m;
+    for (x != 0) {
+        n = n + (x & 1)::i32;
+        x = x >> 1;
+    }
+    ret n;
 }
 
 # emit_inst: encode one fully-formed `isa.Inst` into the encoder byte sink. used
@@ -2095,6 +2108,32 @@ fun emit_frame_load(st: *EncodeState, reg: i32, disp: i32) {
     emit_inst(st, ?mi);
 }
 
+# emit_xmm_store: encode a `movaps [rbp+disp], xmm` saving a callee-saved vector
+# register into the frame. `idx` is the XMM within-bank index (0–15); the operand
+# is built on its composite SSE id so the encoder selects the SSE form. `disp` must
+# be 16-aligned (the frame layout guarantees it) for the aligned MOVAPS.
+fun emit_xmm_store(st: *EncodeState, idx: i32, disp: i32) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = x64.MOVAPS;
+    mi.dst    = isa.make_mem(x64.RBP, disp, -1, 0, 16);
+    mi.src1   = isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, idx), 16);
+    mi.size   = 16;
+    emit_inst(st, ?mi);
+}
+
+# emit_xmm_load: encode a `movaps xmm, [rbp+disp]` restoring a callee-saved vector
+# register from the frame, mirroring emit_xmm_store.
+fun emit_xmm_load(st: *EncodeState, idx: i32, disp: i32) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = x64.MOVAPS;
+    mi.dst    = isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, idx), 16);
+    mi.src1   = isa.make_mem(x64.RBP, disp, -1, 0, 16);
+    mi.size   = 16;
+    emit_inst(st, ?mi);
+}
+
 # emit_prologue: encode the standard x86-64 function prologue into the `.text`
 # byte sink.
 #
@@ -2107,11 +2146,13 @@ fun emit_frame_load(st: *EncodeState, reg: i32, disp: i32) {
 # the call. the callee-save offsets are frame_size-relative and so are unaffected
 # by the outgoing region reserved below them.
 # ---
-# st:            encoder state whose byte sink the prologue bytes are appended to
-# frame_size:    size of the local frame in bytes (locals + va-save; pre callee-save)
-# callee_mask:   bitmask of callee-saved GP registers regalloc assigned
-# outgoing_size: bytes reserved at the bottom of the frame for stack-passed call args
-fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_size: u32) {
+# st:             encoder state whose byte sink the prologue bytes are appended to
+# frame_size:     size of the local frame in bytes (locals + va-save; pre callee-save)
+# callee_mask:    bitmask of callee-saved GP registers regalloc assigned
+# callee_mask_fp: bitmask of callee-saved XMM register indices regalloc assigned
+#                 (win64 only; 0 under SysV, where the XMM save path is inert)
+# outgoing_size:  bytes reserved at the bottom of the frame for stack-passed call args
+fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, callee_mask_fp: u32, outgoing_size: u32) {
     var push_rbp: isa.Inst;
     zero_inst(?push_rbp);
     push_rbp.opcode = x64.PUSH;
@@ -2129,7 +2170,7 @@ fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_
     mov_rbp.flags  = x64.FLAG_REX_W;
     emit_inst(st, ?mov_rbp);
 
-    val total: usize = frame_total(st.abi, frame_size, callee_mask, outgoing_size);
+    val total: usize = frame_total(st.abi, frame_size, callee_mask, callee_mask_fp, outgoing_size);
     if (total > 0) {
         var sub_rsp: isa.Inst;
         zero_inst(?sub_rsp);
@@ -2152,6 +2193,19 @@ fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_
         }
         i = i + 1;
     }
+
+    # callee-saved XMM saves (win64): each at a 16-aligned `[rbp - (base + 16*k)]`
+    # below the GP save area, in ascending index order (matching the epilogue).
+    val xbase: i32 = fp_save_base(st.abi, frame_size, callee_mask)::i32;
+    var xoff: i32 = xbase + 16;
+    var x: i32 = 0;
+    for (x < 16) {
+        if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
+            emit_xmm_store(st, x, -xoff);
+            xoff = xoff + 16;
+        }
+        x = x + 1;
+    }
 }
 
 # emit_epilogue: encode the standard x86-64 function epilogue into the `.text`
@@ -2163,10 +2217,24 @@ fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, outgoing_
 # so each is reloaded from the slot it was saved into. the RET itself is encoded
 # from the MIR_RET instruction that follows.
 # ---
-# st:          encoder state whose byte sink the epilogue bytes are appended to
-# frame_size:  size of the local frame in bytes (locals + va-save; pre callee-save)
-# callee_mask: bitmask of callee-saved GP registers regalloc assigned
-fun emit_epilogue(st: *EncodeState, frame_size: u32, callee_mask: u32) {
+# st:             encoder state whose byte sink the epilogue bytes are appended to
+# frame_size:     size of the local frame in bytes (locals + va-save; pre callee-save)
+# callee_mask:    bitmask of callee-saved GP registers regalloc assigned
+# callee_mask_fp: bitmask of callee-saved XMM register indices regalloc assigned
+fun emit_epilogue(st: *EncodeState, frame_size: u32, callee_mask: u32, callee_mask_fp: u32) {
+    # restore the callee-saved XMM registers first (the reverse of the prologue's
+    # last stores), from the same 16-aligned slots in ascending index order.
+    val xbase: i32 = fp_save_base(st.abi, frame_size, callee_mask)::i32;
+    var xoff: i32 = xbase + 16;
+    var x: i32 = 0;
+    for (x < 16) {
+        if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
+            emit_xmm_load(st, x, -xoff);
+            xoff = xoff + 16;
+        }
+        x = x + 1;
+    }
+
     var list: [16]i32;
     val ln: i32 = x64.callee_saved_gp_list(st.abi, ?list[0]);
     var coff: i32 = frame_size::i32 + 8;
@@ -2441,7 +2509,11 @@ pub fun encode_x64(alloc: *Allocator, tgt: *target.Target, m: *mir.MirModule) Re
         fi = fi + 1;
     }
 
-    patch_branches(?st);
+    val pb: Result[bool, str] = patch_branches(?st);
+    if (is_err[bool, str](pb)) {
+        free_state(?st);
+        ret err[enc.EncoderOutput, str](unwrap_err[bool, str](pb));
+    }
 
     # right-size the text buffer so its allocation length equals `text_len`: the
     # object builder owns these bytes and frees them by `len`, so the backing
@@ -2514,6 +2586,7 @@ fun shrink_text(st: *EncodeState) Result[bool, str] {
 fun function_is_naked(f: *mir.MirFunction) bool {
     if (f.frame.size != 0) { ret false; }
     if (f.callee_mask != 0) { ret false; }
+    if (f.callee_mask_fp != 0) { ret false; }
     if (f.frame.outgoing_size != 0) { ret false; }
 
     var bi: u32 = 0;
@@ -2548,8 +2621,9 @@ fun encode_function(st: *EncodeState, f: *mir.MirFunction) Result[bool, str] {
     val naked: bool = function_is_naked(f);
     val frame_size: u32 = f.frame.size;
     val callee_mask: u32 = f.callee_mask;
+    val callee_mask_fp: u32 = f.callee_mask_fp;
     val outgoing_size: u32 = f.frame.outgoing_size;
-    if (!naked) { emit_prologue(st, frame_size, callee_mask, outgoing_size); }
+    if (!naked) { emit_prologue(st, frame_size, callee_mask, callee_mask_fp, outgoing_size); }
 
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -2563,7 +2637,7 @@ fun encode_function(st: *EncodeState, f: *mir.MirFunction) Result[bool, str] {
             # the function epilogue precedes every RET: restore callee-saved
             # registers and tear down the frame, then encode the RET itself.
             if (mi.opcode::u16 == x64.RET::u16 && !naked) {
-                emit_epilogue(st, frame_size, callee_mask);
+                emit_epilogue(st, frame_size, callee_mask, callee_mask_fp);
             }
             val ei: Result[bool, str] = encode_mir_instr(st, f, fn_base, mi);
             if (is_err[bool, str](ei)) { ret ei; }
@@ -2721,15 +2795,27 @@ fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
     }
 
     if (has_block) {
+        # a block-referencing branch must have a rel32 patch site; a missing one means
+        # a branch shape reached the encoder without a relocation field (a backend
+        # bug), rejected loudly rather than guessed at `inst_size - 4` -- the symbol
+        # path below rejects the identical condition.
         val reloc_off: i32 = x86_reloc_offset(nil, ?inst, inst_size);
-        var patch_off: i32 = reloc_off;
-        if (patch_off < 0) { patch_off = inst_size - 4; }
-        val patch_pos: u32 = (inst_start + patch_off::usize)::u32;
+        if (reloc_off < 0) {
+            ret err[bool, str]("encode: block-referencing instruction has no relocation patch site");
+        }
+        val patch_pos: u32 = (inst_start + reloc_off::usize)::u32;
         val next_ip: u32 = (inst_start + inst_size::usize)::u32;
         ret push_fixup(st, patch_pos, next_ip, target_block, fn_base);
     }
 
-    if (has_sym && sym != intern.STR_NIL) {
+    if (has_sym) {
+        # has_sym means classify_refs found a MIR_OP_SYM operand, so it must carry a
+        # resolved interned name; a nil name means a symbol operand reached the encoder
+        # unresolved (a backend bug), rejected loudly rather than emitted as
+        # unrelocated bytes the linker would leave pointing at the wrong address.
+        if (sym == intern.STR_NIL) {
+            ret err[bool, str]("encode: symbol-referencing instruction has no resolved symbol name");
+        }
         # the instruction names a relocatable symbol, so it must have a patch site;
         # a missing one means an instruction shape reached the encoder without a
         # reloc field (a backend bug), rejected loudly rather than emitted as
@@ -3101,27 +3187,6 @@ fun is_mir_float_conv(op: mir.MirOpcode) bool {
         op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP;
 }
 
-# emit_gp_load: load a GP integer operand into the GP scratch register `gp` at byte
-# width `w`. the operand resolves after register allocation to a physical register
-# (a plain MOV), a frame slot (a `MOV reg, [rbp + off]` reload), or an immediate (a
-# `MOV reg, imm`). a float-bank operand would mean the allocator placed an integer
-# value in the wrong bank — rejected loudly. mirrors `emit_float_load` for the GP
-# side of a conversion.
-fun emit_gp_load(op: isa.Operand, gp: i32, w: u8, buf: *ByteBuf) Result[bool, str] {
-    if (op.kind == isa.OPK_REG || op.kind == isa.OPK_MEM || op.kind == isa.OPK_IMM) {
-        var ld: isa.Inst;
-        zero_inst(?ld);
-        ld.opcode = x64.MOV;
-        ld.dst    = isa.make_reg(gp, w);
-        ld.src1   = op;
-        ld.size   = w;
-        ld.flags  = width_flags(w);
-        encode_inst(?ld, buf);
-        ret ok[bool, str](true);
-    }
-    ret err[bool, str]("encode: conversion integer operand is not a register, frame slot, or immediate");
-}
-
 # emit_gp_store: store the GP scratch register `gp` to a conversion's integer
 # destination at byte width `w` — a physical register (a plain MOV) or a frame slot
 # (a `MOV [rbp + off], reg` spill). a float-bank destination is a backend bug,
@@ -3155,6 +3220,159 @@ fun emit_cvt_reg(cvt_op: u16, dst_reg: i32, src_reg: i32, int_w: u8, buf: *ByteB
     encode_inst(?cvt, buf);
 }
 
+# patch_rel32: overwrite the 4-byte little-endian rel32 placeholder at `pos` with
+# `disp`. fills an intra-instruction forward jump once its target offset is known —
+# the self-contained sequences that branch within a single MIR instruction.
+fun patch_rel32(buf: *ByteBuf, pos: usize, disp: i32) {
+    buf.data[pos]     = (disp & 0xFF)::u8;
+    buf.data[pos + 1] = ((disp >> 8) & 0xFF)::u8;
+    buf.data[pos + 2] = ((disp >> 16) & 0xFF)::u8;
+    buf.data[pos + 3] = ((disp >> 24) & 0xFF)::u8;
+}
+
+# emit_gp_rr8: emit a 64-bit register-register GP op (`opcode dst_reg, src_reg`).
+fun emit_gp_rr8(opcode: u16, dst_reg: i32, src_reg: i32, buf: *ByteBuf) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = opcode;
+    mi.dst    = isa.make_reg(dst_reg, 8);
+    mi.src1   = isa.make_reg(src_reg, 8);
+    mi.size   = 8;
+    mi.flags  = width_flags(8);
+    encode_inst(?mi, buf);
+}
+
+# emit_gp_ri8: emit a 64-bit register-immediate GP op (`opcode dst_reg, imm`).
+fun emit_gp_ri8(opcode: u16, dst_reg: i32, imm: i64, buf: *ByteBuf) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = opcode;
+    mi.dst    = isa.make_reg(dst_reg, 8);
+    mi.src1   = isa.make_imm(imm, 8);
+    mi.size   = 8;
+    mi.flags  = width_flags(8);
+    encode_inst(?mi, buf);
+}
+
+# emit_fp_rr: emit a register-register SSE op (`opcode dst_reg, src_reg`) at float
+# width `w` (4 -> single, 8 -> double).
+fun emit_fp_rr(opcode: u16, dst_reg: i32, src_reg: i32, w: u8, buf: *ByteBuf) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = opcode;
+    mi.dst    = isa.make_reg(dst_reg, 16);
+    mi.src1   = isa.make_reg(src_reg, 16);
+    mi.size   = w;
+    encode_inst(?mi, buf);
+}
+
+# normalize_int_imm: reduce an integer constant to the value its `width`-byte source
+# represents, zero- or sign-extended (by `signed`) to 64 bits, so a constant
+# conversion source converts the same value a runtime register of that width would.
+fun normalize_int_imm(imm: i64, width: u8, signed: bool) i64 {
+    if (width >= 8) { ret imm; }
+    val bits: u64 = width::u64 * 8;
+    val mask: u64 = (1::u64 << bits) - 1;
+    var v: u64 = imm::u64 & mask;
+    if (signed) {
+        val sign: u64 = 1::u64 << (bits - 1);
+        if ((v & sign) != 0) { v = v | ~mask; }
+    }
+    ret v::i64;
+}
+
+# emit_gp_load_ext: load an integer conversion source into the full 64-bit GP scratch
+# `gp`, extending a sub-64-bit value by signedness so the CVTSI2SS/SD that follows
+# reads a clean register rather than stale upper bits. a u32 source rides a 4-byte MOV
+# (which already zero-extends into the 64-bit register); a u8/u16 source uses MOVZX
+# (unsigned) / MOVSX (signed); a 32-bit signed source uses MOVSXD; a 64-bit source
+# loads as-is; an immediate is re-normalized to its source width and materialized.
+# accepts the same operand shapes regalloc can produce (register, frame slot,
+# immediate); a float-bank operand is a regalloc bug, rejected loudly.
+fun emit_gp_load_ext(op: isa.Operand, gp: i32, src_w: u8, signed: bool, buf: *ByteBuf) Result[bool, str] {
+    if (op.kind == isa.OPK_IMM) {
+        emit_gp_ri8(x64.MOV, gp, normalize_int_imm(op.imm, src_w, signed), buf);
+        ret ok[bool, str](true);
+    }
+    if (op.kind != isa.OPK_REG && op.kind != isa.OPK_MEM) {
+        ret err[bool, str]("encode: conversion integer operand is not a register, frame slot, or immediate");
+    }
+
+    var ld: isa.Inst;
+    zero_inst(?ld);
+    ld.dst       = isa.make_reg(gp, 8);
+    ld.src1      = op;
+    ld.src1.size = src_w;
+    ld.size      = 8;
+    ld.flags     = width_flags(8);
+    if (src_w >= 8) {
+        ld.opcode = x64.MOV;
+    } or (signed && src_w >= 4) {
+        ld.opcode = x64.MOVSXD;
+    } or (signed) {
+        ld.opcode = x64.MOVSX;
+    } or {
+        # MOVZX with a >= 4-byte source emits a plain 32-bit MOV whose write clears the
+        # upper 32 bits; a sub-word source emits the true MOVZX.
+        ld.opcode = x64.MOVZX;
+    }
+    encode_inst(?ld, buf);
+    ret ok[bool, str](true);
+}
+
+# emit_u64_to_fp: convert the unsigned 64-bit value in SCRATCH_REG to the float in
+# FLOAT_SCRATCH0 and store it to `dst`. the signed CVTSI2SS/SD treats bit 63 as a
+# sign, so a value >= 2^63 would convert negative; branch on the sign (`test`; with OF
+# cleared, JL is "jump if sign") — a value < 2^63 converts exactly, a value >= 2^63 is
+# halved with a low-bit-preserving round-to-odd, converted, then doubled. SCRATCH_REG2
+# is the halving temp. the two forward rel32 jumps are intra-instruction, patched here
+# from the measured branch lengths.
+fun emit_u64_to_fp(dst: isa.Operand, dst_w: u8, cvt_op: u16, buf: *ByteBuf) Result[bool, str] {
+    var test_inst: isa.Inst;
+    zero_inst(?test_inst);
+    test_inst.opcode = x64.TEST;
+    test_inst.dst    = isa.make_reg(x64.SCRATCH_REG, 8);
+    test_inst.src1   = isa.make_reg(x64.SCRATCH_REG, 8);
+    test_inst.size   = 8;
+    test_inst.flags  = width_flags(8);
+    encode_inst(?test_inst, buf);
+
+    var jl: isa.Inst;
+    zero_inst(?jl);
+    jl.opcode = x64.JL;
+    jl.dst    = isa.make_label(nil);
+    jl.size   = DEFAULT_OPERAND_SIZE;
+    encode_inst(?jl, buf);
+    val jl_patch: usize = buf.len - 4;
+    val after_jl: usize = buf.len;
+
+    # value < 2^63: the signed conversion is exact.
+    emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, x64.SCRATCH_REG, 8, buf);
+
+    var jmp: isa.Inst;
+    zero_inst(?jmp);
+    jmp.opcode = x64.JMP;
+    jmp.dst    = isa.make_label(nil);
+    jmp.size   = DEFAULT_OPERAND_SIZE;
+    encode_inst(?jmp, buf);
+    val jmp_patch: usize = buf.len - 4;
+    val after_jmp: usize = buf.len;
+
+    # value >= 2^63: r11 = (r11 >> 1) | (r11 & 1); convert; double.
+    patch_rel32(buf, jl_patch, (buf.len - after_jl)::i32);
+    emit_gp_rr8(x64.MOV, x64.SCRATCH_REG2, x64.SCRATCH_REG, buf);
+    emit_gp_ri8(x64.SHR, x64.SCRATCH_REG2, 1, buf);
+    emit_gp_ri8(x64.AND, x64.SCRATCH_REG, 1, buf);
+    emit_gp_rr8(x64.OR, x64.SCRATCH_REG, x64.SCRATCH_REG2, buf);
+    emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, x64.SCRATCH_REG, 8, buf);
+    var add_op: u16 = x64.ADDSD;
+    if (dst_w == 4) { add_op = x64.ADDSS; }
+    emit_fp_rr(add_op, FLOAT_SCRATCH0, FLOAT_SCRATCH0, dst_w, buf);
+
+    patch_rel32(buf, jmp_patch, (buf.len - after_jmp)::i32);
+    ret emit_float_store(dst, FLOAT_SCRATCH0, dst_w, buf);
+}
+
 # encode_float_conv: materialize a fully-resolved float conversion into its SSE byte
 # sequence, routing operands through the fixed scratch registers (XMM FLOAT_SCRATCH0
 # for the float side, the GP SCRATCH_REG for the integer side) exactly as
@@ -3162,8 +3380,14 @@ fun emit_cvt_reg(cvt_op: u16, dst_reg: i32, src_reg: i32, int_w: u8, buf: *ByteB
 # register, a spilled `[rbp + off]` frame slot, or an immediate) encodes without the
 # reg-reg-only `encode_cvt` path. the carried widths (`mi.width` = result type,
 # `mi.src_width` = operand-0 type, both from `set_conv_widths`) select the
-# single-precision SS vs double SD form on the float side and size the GP integer
-# side for REX.W. operand layout is `[dst, src]`.
+# single-precision SS vs double SD form on the float side; the integer side is always
+# extended to a clean 64-bit value and converted with the REX.W CVT. operand layout is
+# `[dst, src]`.
+#
+# SI_TO_FP / UI_TO_FP extend the integer source to 64 bits by signedness (so a u32 is
+# not converted as a signed i32 and a sub-word source carries no stale upper bits); an
+# unsigned 64-bit value >= 2^63 takes a range-fixup path (`emit_u64_to_fp`) since the
+# signed CVTSI2SS/SD has no direct unsigned-64 form.
 #
 # FP_TO_SI / FP_TO_UI map to the signed CVTTSS2SI / CVTTSD2SI: a full unsigned
 # 64-bit conversion needs a range-fixup sequence x86-64 lacks a single instruction
@@ -3194,8 +3418,11 @@ fun encode_float_conv(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Res
         ret emit_float_store(dst, FLOAT_SCRATCH0, dst_w, buf);
     }
 
-    # SI_TO_FP / UI_TO_FP (int -> float): dst is float (dst_w picks SS / SD), src is
-    # an integer (src_w sizes the GP load + REX.W of the CVTSI2SS/SD).
+    # SI_TO_FP / UI_TO_FP (int -> float): dst is float (dst_w picks SS / SD), src is an
+    # integer. the source is extended to a clean 64-bit value by signedness (so a u32
+    # is not converted as a signed i32 and a u8/u16 is not read off stale upper bits),
+    # then the REX.W signed CVTSI2SS/SD converts it. an unsigned 64-bit source whose
+    # top bit is set has no signed CVT form, so it takes the range-fixup path.
     if (op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP) {
         val rd: Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], 16);
         if (is_err[isa.Operand, str](rd)) { ret err[bool, str](unwrap_err[isa.Operand, str](rd)); }
@@ -3204,11 +3431,15 @@ fun encode_float_conv(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Res
         if (is_err[isa.Operand, str](rs)) { ret err[bool, str](unwrap_err[isa.Operand, str](rs)); }
         val src: isa.Operand = unwrap_ok[isa.Operand, str](rs);
 
-        val ld: Result[bool, str] = emit_gp_load(src, x64.SCRATCH_REG, src_w, buf);
+        val signed: bool = op == mir.MIR_SI_TO_FP;
+        val ld: Result[bool, str] = emit_gp_load_ext(src, x64.SCRATCH_REG, src_w, signed, buf);
         if (is_err[bool, str](ld)) { ret ld; }
         var cvt_op: u16 = x64.CVTSI2SD;
         if (dst_w == 4) { cvt_op = x64.CVTSI2SS; }
-        emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, x64.SCRATCH_REG, src_w, buf);
+        if (!signed && src_w >= 8) {
+            ret emit_u64_to_fp(dst, dst_w, cvt_op, buf);
+        }
+        emit_cvt_reg(cvt_op, FLOAT_SCRATCH0, x64.SCRATCH_REG, 8, buf);
         ret emit_float_store(dst, FLOAT_SCRATCH0, dst_w, buf);
     }
 
@@ -4304,7 +4535,11 @@ fun parse_asm_mem(tok: str, len: usize, op: *AsmOperand) bool {
         if (!copy_trimmed(tok, star + 1, bi_hi, ?buf[0], 32)) { ret false; }
         val scr: Result[i64, str] = parse.parse_i64_exact((?buf[0])::str, 0);
         if (is_err[i64, str](scr)) { ret false; }
-        op.scale = unwrap_ok[i64, str](scr)::u8;
+        val scale_val: i64 = unwrap_ok[i64, str](scr);
+        # the x86 SIB scale field encodes 1/2/4/8 only; reject any other scale here so
+        # it surfaces as an inline-asm parse failure rather than silently encoding *8.
+        if (scale_val != 1 && scale_val != 2 && scale_val != 4 && scale_val != 8) { ret false; }
+        op.scale = scale_val::u8;
     } or {
         # `[ base ]` or `[ symbol ]` (no index term).
         if (!copy_trimmed(tok, inner_lo, bi_hi, ?buf[0], 32)) { ret false; }
@@ -4412,6 +4647,173 @@ fun encode_asm_text(st: *EncodeState, fn_base: u32, text: str) Result[bool, str]
         start = end + 1;
     }
     ret ok[bool, str](true);
+}
+
+# asm_clobbers: the `AsmClobbersFn` the x86-64 ISA vtable exposes — infer the
+# registers an inline-asm body writes so the allocator never leaves a live value
+# in one and the prologue preserves any callee-saved register the body clobbers.
+#
+# the doc (`doc/language/asm.md`) promises clobber inference from the instruction
+# stream; this implements it for the x86-64 inline-asm grammar `encode_asm_stmt`
+# accepts. the body still carries `{name}` placeholders (they substitute to
+# `[rbp+off]` memory operands at encode time, never registers), so they contribute
+# no register. the grammar admits no SSE mnemonic, so a register operand is always
+# a GP write and `fp_out` stays empty — except the opaque `.byte` directive (and
+# any unrecognized statement), which is treated as clobbering every register so
+# the result is always a sound over-approximation. RSP/RBP moves (push/pop) touch
+# only the reserved stack/frame pointers and are not reported.
+pub fun asm_clobbers(body: str, gp_out: *u32, fp_out: *u32) {
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    val len: usize = str_len(body);
+    var start: usize = 0;
+    for (start < len) {
+        var end: usize = start;
+        for (end < len && body[end] != '\n'::char && body[end] != ';'::char) { end = end + 1; }
+        var lo: usize = start;
+        for (lo < end && is_asm_space(body[lo])) { lo = lo + 1; }
+        var hi: usize = lo;
+        for (hi < end && body[hi] != '#'::char) { hi = hi + 1; }
+        for (hi > lo && is_asm_space(body[hi - 1])) { hi = hi - 1; }
+        if (hi > lo) {
+            var line: [256]u8;
+            val ll: usize = hi - lo;
+            if (ll >= 256) {
+                # an over-long statement the encoder will reject; be conservative.
+                gp = gp | 0xFFFF::u32;
+                fp = fp | 0xFFFF::u32;
+            } or {
+                var c: usize = 0;
+                for (c < ll) { line[c] = body[lo + c]::u8; c = c + 1; }
+                line[ll] = 0;
+                stmt_clobbers((?line[0])::str, ?gp, ?fp);
+            }
+        }
+        start = end + 1;
+    }
+    @gp_out = gp;
+    @fp_out = fp;
+}
+
+# clobber_reg_operand: OR a register operand's GP-index bit into `@gp`. the inline
+# grammar produces only GP register operands; a memory / immediate / symbol
+# operand contributes no register write (a memory destination writes memory, its
+# base register is only read).
+fun clobber_reg_operand(op: *AsmOperand, gp: *u32) {
+    if (op.kind == ASMOP_REG && op.reg >= 0 && op.reg < 16) {
+        @gp = @gp | (1::u32 << op.reg::u32);
+    }
+}
+
+# clobber_two_dst: mark the destination (first) operand of a two-operand statement
+# as written. a malformed operand list the encoder will reject is treated
+# conservatively (every GP register written).
+fun clobber_two_dst(args: str, gp: *u32) {
+    var dst: AsmOperand;
+    var src: AsmOperand;
+    var dbuf: [128]u8;
+    var sbuf: [128]u8;
+    if (split_two_op(args, ?dst, ?src, ?dbuf[0], ?sbuf[0])) {
+        clobber_reg_operand(?dst, gp);
+    } or {
+        @gp = @gp | 0xFFFF::u32;
+    }
+}
+
+# clobber_two_both: mark both operands of a two-operand statement as written (the
+# XCHG / XADD exchange forms).
+fun clobber_two_both(args: str, gp: *u32) {
+    var dst: AsmOperand;
+    var src: AsmOperand;
+    var dbuf: [128]u8;
+    var sbuf: [128]u8;
+    if (split_two_op(args, ?dst, ?src, ?dbuf[0], ?sbuf[0])) {
+        clobber_reg_operand(?dst, gp);
+        clobber_reg_operand(?src, gp);
+    } or {
+        @gp = @gp | 0xFFFF::u32;
+    }
+}
+
+# clobber_one: mark the sole operand of a one-operand write form (neg / not / inc
+# / dec / pop) as written.
+fun clobber_one(args: str, gp: *u32) {
+    var op: AsmOperand;
+    if (parse_asm_operand(trim_str(args), ?op)) {
+        clobber_reg_operand(?op, gp);
+    } or {
+        @gp = @gp | 0xFFFF::u32;
+    }
+}
+
+# stmt_clobbers: OR the registers one trimmed inline-asm statement writes into
+# `@gp` / `@fp`. covers exactly the grammar `encode_asm_stmt` encodes; an
+# unrecognized statement (including `.byte`) is opaque and conservatively clobbers
+# every register.
+fun stmt_clobbers(stmt: str, gp: *u32, fp: *u32) {
+    # zero-operand forms: syscall implicitly clobbers RAX (return), RCX and R11.
+    if (str_equals(stmt, "syscall")) {
+        @gp = @gp | (1::u32 << x64.RAX::u32) | (1::u32 << x64.RCX::u32) | (1::u32 << x64.R11::u32);
+        ret;
+    }
+    if (str_equals(stmt, "ret") || str_equals(stmt, "hlt") || str_equals(stmt, "mfence")
+        || str_equals(stmt, "pause") || str_equals(stmt, "nop")) { ret; }
+
+    # a control transfer writes no callee-saved register; the surrounding asm
+    # barrier already covers a call's caller-saved clobbers.
+    if (mnemonic_is(stmt, "call") || mnemonic_is(stmt, "jmp")
+        || mnemonic_is(stmt, "je") || mnemonic_is(stmt, "jz")
+        || mnemonic_is(stmt, "jne") || mnemonic_is(stmt, "jnz")) { ret; }
+
+    # cmp / test write only the flags.
+    if (mnemonic_is(stmt, "cmp"))  { ret; }
+    if (mnemonic_is(stmt, "test")) { ret; }
+
+    # exchange forms write both operands.
+    if (mnemonic_is(stmt, "lock xadd")) { clobber_two_both(arg_str(stmt, 9), gp); ret; }
+    if (mnemonic_is(stmt, "xadd"))      { clobber_two_both(arg_str(stmt, 4), gp); ret; }
+    if (mnemonic_is(stmt, "xchg"))      { clobber_two_both(arg_str(stmt, 4), gp); ret; }
+
+    # cmpxchg writes its destination and implicitly RAX.
+    if (mnemonic_is(stmt, "lock cmpxchg")) {
+        clobber_two_dst(arg_str(stmt, 12), gp);
+        @gp = @gp | (1::u32 << x64.RAX::u32);
+        ret;
+    }
+    if (mnemonic_is(stmt, "cmpxchg")) {
+        clobber_two_dst(arg_str(stmt, 7), gp);
+        @gp = @gp | (1::u32 << x64.RAX::u32);
+        ret;
+    }
+
+    # two-operand write-first forms.
+    if (mnemonic_is(stmt, "mov"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "lea"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "add"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "sub"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "and"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "or"))    { clobber_two_dst(arg_str(stmt, 2), gp); ret; }
+    if (mnemonic_is(stmt, "xor"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "shl"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "shr"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "sar"))   { clobber_two_dst(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "movzx")) { clobber_two_dst(arg_str(stmt, 5), gp); ret; }
+    if (mnemonic_is(stmt, "movsx")) { clobber_two_dst(arg_str(stmt, 5), gp); ret; }
+
+    # one-operand write forms.
+    if (mnemonic_is(stmt, "neg")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "not")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "inc")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "dec")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+    if (mnemonic_is(stmt, "pop")) { clobber_one(arg_str(stmt, 3), gp); ret; }
+
+    # push reads its operand and adjusts the reserved RSP; nothing else is written.
+    if (mnemonic_is(stmt, "push")) { ret; }
+
+    # `.byte` raw bytes or any statement outside the grammar is opaque: assume it
+    # writes every register so no live value is left in one it might overwrite.
+    @gp = @gp | 0xFFFF::u32;
+    @fp = @fp | 0xFFFF::u32;
 }
 
 # encode_asm_stmt: parse and encode one trimmed inline-asm statement.
@@ -4738,6 +5140,61 @@ test "x64.encode: inline-asm stack-slot used as memory base gets actionable diag
     ret 0;
 }
 
+test "x64.encode: imul r16, imm16 emits a 16-bit immediate (not imm32)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var buf: ByteBuf = buf_init(?alloc);
+
+    # imul ax, ax, 0x1234 -> 66 69 C0 34 12 (the 0x66 prefix makes 0x69 take an imm16).
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = x64.IMUL;
+    mi.dst    = isa.make_reg(x64.RAX, 2);
+    mi.src1   = isa.make_imm(0x1234, 2);
+    mi.size   = 2;
+    mi.flags  = x64.FLAG_16BIT;
+    val n: i32 = encode_imul(?mi, ?buf);
+
+    var bad: i32 = 0;
+    if (n != 5) { bad = 1; }
+    or (buf.data[0] != 0x66) { bad = 1; }
+    or (buf.data[1] != 0x69) { bad = 1; }
+    or (buf.data[2] != 0xC0) { bad = 1; }
+    or (buf.data[3] != 0x34) { bad = 1; }
+    or (buf.data[4] != 0x12) { bad = 1; }
+
+    # a size-1 immediate IMUL has no encoding -- it must emit nothing (loud failure).
+    var mi8: isa.Inst;
+    zero_inst(?mi8);
+    mi8.opcode = x64.IMUL;
+    mi8.dst    = isa.make_reg(x64.RAX, 1);
+    mi8.src1   = isa.make_imm(5, 1);
+    mi8.size   = 1;
+    if (encode_imul(?mi8, ?buf) != 0) { bad = 1; }
+
+    buf_dnit(?buf);
+    ret bad;
+}
+
+test "x64.encode: byte ALU on SIL/DIL forces a bare REX (shared prefix core)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var buf: ByteBuf = buf_init(?alloc);
+
+    # and sil, dil -> 40 20 FE: the byte-register rule (a single place now) must emit
+    # a bare REX so SIL/DIL are not misencoded as DH/BH.
+    encode_alu_rr(?buf, alu_opcode_rr(x64.AND, 1), x64.RSI, x64.RDI, 1, 0);
+
+    var bad: i32 = 0;
+    if (buf.len != 3) { bad = 1; }
+    or (buf.data[0] != 0x40) { bad = 1; }
+    or (buf.data[1] != 0x20) { bad = 1; }
+    or (buf.data[2] != 0xFE) { bad = 1; }
+
+    buf_dnit(?buf);
+    ret bad;
+}
+
 # determine whether an instruction names an intra-module branch target (a
 # MIR_OP_BLOCK operand) or a relocatable symbol (a MIR_OP_SYM operand), reporting
 # the target block id / interned symbol name through the out-parameters.
@@ -4770,33 +5227,43 @@ fun classify_refs(mi: *mir.MirInstr, target_block: *u32, has_block: *bool,
 
 # pass 2: patch each recorded intra-module branch fixup with the rel32
 # displacement from the end of the branch to the start of its target block.
-fun patch_branches(st: *EncodeState) {
-    if (st.buf.data == nil) { ret; }
+fun patch_branches(st: *EncodeState) Result[bool, str] {
+    if (st.buf.data == nil) { ret ok[bool, str](true); }
     var i: u32 = 0;
     for (i < st.fixup_count) {
         val fx: *BranchFixup = ?st.fixups[i];
-        val target_off: u32 = block_offset(st, fx.fn_text_base, fx.target_block);
+        val tr: Result[u32, str] = block_offset(st, fx.fn_text_base, fx.target_block);
+        if (is_err[u32, str](tr)) { ret err[bool, str](unwrap_err[u32, str](tr)); }
+        val target_off: u32 = unwrap_ok[u32, str](tr);
         val disp: i32 = target_off::i32 - fx.next_ip::i32;
-        if (fx.patch_pos::usize + 4 <= st.buf.len) {
-            st.buf.data[fx.patch_pos]     = (disp & 0xFF)::u8;
-            st.buf.data[fx.patch_pos + 1] = ((disp >> 8) & 0xFF)::u8;
-            st.buf.data[fx.patch_pos + 2] = ((disp >> 16) & 0xFF)::u8;
-            st.buf.data[fx.patch_pos + 3] = ((disp >> 24) & 0xFF)::u8;
+        # the fixup site was recorded when its branch was emitted, so it must lie
+        # within the text buffer; an out-of-range site is a backend bug, rejected
+        # loudly rather than skipped (which would leave a zero rel32 branching into
+        # the first function).
+        if (fx.patch_pos::usize + 4 > st.buf.len) {
+            ret err[bool, str]("encode: branch fixup site is outside the text buffer");
         }
+        st.buf.data[fx.patch_pos]     = (disp & 0xFF)::u8;
+        st.buf.data[fx.patch_pos + 1] = ((disp >> 8) & 0xFF)::u8;
+        st.buf.data[fx.patch_pos + 2] = ((disp >> 16) & 0xFF)::u8;
+        st.buf.data[fx.patch_pos + 3] = ((disp >> 24) & 0xFF)::u8;
         i = i + 1;
     }
+    ret ok[bool, str](true);
 }
 
-# resolve a function-local block id to its `.text` offset (0 if unrecorded).
-fun block_offset(st: *EncodeState, fn_base: u32, block_id: u32) u32 {
+# resolve a function-local block id to its `.text` offset. an unrecorded target is
+# a backend bug (a branch to a block the encoder never emitted), rejected loudly
+# rather than resolved to offset 0 (a branch into the first function's middle).
+fun block_offset(st: *EncodeState, fn_base: u32, block_id: u32) Result[u32, str] {
     var i: u32 = 0;
     for (i < st.block_count) {
         if (st.blocks[i].fn_text_base == fn_base && st.blocks[i].block_id == block_id) {
-            ret st.blocks[i].offset;
+            ret ok[u32, str](st.blocks[i].offset);
         }
         i = i + 1;
     }
-    ret 0;
+    ret err[u32, str]("encode: branch target block was never recorded");
 }
 
 # build an inactive (OPK_NONE) operand with no register references.

@@ -10,8 +10,9 @@
 # as a primitive here. Compound types are interned by their canonical
 # form: pointer types by base, array types by `(base, count)`, nominal
 # types (`rec`/`uni`) by `(origin, decl)`, generic parameters by
-# `(owner, index)`. Function types are not deduplicated; structural
-# equality of function types is available via `type_equals_signatures`.
+# `(owner, index)`, function types by a content hash of their signature, and
+# instances by `(origin, decl, args)`. Structural equality of function types is
+# also available via `type_equals_signatures`.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -223,11 +224,30 @@ pub rec TypeInterner {
 
     dedup: map.Map[Type, TypeId];
 
+    # TYPE_FUN also bypasses `dedup` (its params live in the side pool); a
+    # content hash of (ret, params, variadic) -> TypeId deduplicates structurally
+    # equal function types, collapsing the per-generic-call TYPE_FUN explosion. a
+    # hash collision degrades to a fresh append (the prior non-deduped default),
+    # never to a wrong identity, since the candidate is verified against the
+    # mapped type before reuse.
+    fun_index: map.Map[u64, TypeId];
+
+    # TYPE_INSTANCE bypasses `dedup` (its args live in the side pool, which the
+    # context-free dedup hash cannot read), so instance TypeIds are tracked in
+    # their own list and deduped by scanning it — O(instances), not O(type_len).
+    instances:     *TypeId;
+    instances_len: u32;
+    instances_cap: u32;
+
     prims: [11]TypeId;
 
     field_tables:    *FieldTable;
     field_table_len: u32;
     field_table_cap: u32;
+
+    # nominal / instance TypeId -> its index in field_tables, so a field-table
+    # lookup is O(1) rather than a linear scan of every registered table.
+    field_index: map.Map[TypeId, u32];
 
     field_pool:     *FieldEntry;
     field_pool_len: u32;
@@ -251,15 +271,22 @@ pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
     ti.params_len = 0;
     ti.params_cap = 0;
     ti.dedup      = map.init[Type, TypeId](alloc, hash_type, eq_type);
+    ti.fun_index     = map.init[u64, TypeId](alloc, map.hash_u64, map.eq_u64);
+    ti.instances     = nil;
+    ti.instances_len = 0;
+    ti.instances_cap = 0;
     ti.field_tables    = nil;
     ti.field_table_len = 0;
     ti.field_table_cap = 0;
+    ti.field_index     = map.init[TypeId, u32](alloc, map.hash_u32, map.eq_u32);
     ti.field_pool      = nil;
     ti.field_pool_len  = 0;
     ti.field_pool_cap  = 0;
 
     val ra: Result[*Type, str] = allocate[Type](alloc, INITIAL_TYPE_CAP::usize);
     if (is_err[*Type, str](ra)) {
+        map.dnit[u64, TypeId](?ti.fun_index);
+        map.dnit[TypeId, u32](?ti.field_index);
         map.dnit[Type, TypeId](?ti.dedup);
         ret err[TypeInterner, str](unwrap_err[*Type, str](ra));
     }
@@ -269,12 +296,18 @@ pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
     val rp: Result[*TypeId, str] = allocate[TypeId](alloc, INITIAL_PARAMS_CAP::usize);
     if (is_err[*TypeId, str](rp)) {
         deallocate[Type](alloc, ti.types, ti.type_cap::usize);
+        map.dnit[u64, TypeId](?ti.fun_index);
+        map.dnit[TypeId, u32](?ti.field_index);
         map.dnit[Type, TypeId](?ti.dedup);
         ret err[TypeInterner, str](unwrap_err[*TypeId, str](rp));
     }
     ti.params     = unwrap_ok[*TypeId, str](rp);
     ti.params_cap = INITIAL_PARAMS_CAP;
 
+    # seed the primitives in kind order; `prim(kind)` indexes the resulting
+    # `prims[]` table to recover a primitive's TypeId. sema classifies a type by
+    # reading its interned kind (is_integer / is_numeric / byte_size / ...), so
+    # nothing depends on a primitive's TypeId happening to equal its ordinal.
     var k: u32 = 0;
     for (k < PRIM_COUNT) {
         var prim: Type;
@@ -283,6 +316,8 @@ pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
         if (is_err[TypeId, str](pr)) {
             deallocate[TypeId](alloc, ti.params, ti.params_cap::usize);
             deallocate[Type](alloc, ti.types, ti.type_cap::usize);
+            map.dnit[u64, TypeId](?ti.fun_index);
+            map.dnit[TypeId, u32](?ti.field_index);
             map.dnit[Type, TypeId](?ti.dedup);
             ret err[TypeInterner, str](unwrap_err[TypeId, str](pr));
         }
@@ -292,6 +327,8 @@ pub fun init(alloc: *Allocator) Result[TypeInterner, str] {
         if (is_err[bool, str](ins)) {
             deallocate[TypeId](alloc, ti.params, ti.params_cap::usize);
             deallocate[Type](alloc, ti.types, ti.type_cap::usize);
+            map.dnit[u64, TypeId](?ti.fun_index);
+            map.dnit[TypeId, u32](?ti.field_index);
             map.dnit[Type, TypeId](?ti.dedup);
             ret err[TypeInterner, str](unwrap_err[bool, str](ins));
         }
@@ -312,12 +349,17 @@ pub fun dnit(ti: *TypeInterner) {
     if (ti.params != nil && ti.params_cap > 0) {
         deallocate[TypeId](ti.alloc, ti.params, ti.params_cap::usize);
     }
+    if (ti.instances != nil && ti.instances_cap > 0) {
+        deallocate[TypeId](ti.alloc, ti.instances, ti.instances_cap::usize);
+    }
     if (ti.field_tables != nil && ti.field_table_cap > 0) {
         deallocate[FieldTable](ti.alloc, ti.field_tables, ti.field_table_cap::usize);
     }
     if (ti.field_pool != nil && ti.field_pool_cap > 0) {
         deallocate[FieldEntry](ti.alloc, ti.field_pool, ti.field_pool_cap::usize);
     }
+    map.dnit[u64, TypeId](?ti.fun_index);
+    map.dnit[TypeId, u32](?ti.field_index);
     map.dnit[Type, TypeId](?ti.dedup);
     ti.types      = nil;
     ti.type_len   = 0;
@@ -325,6 +367,9 @@ pub fun dnit(ti: *TypeInterner) {
     ti.params     = nil;
     ti.params_len = 0;
     ti.params_cap = 0;
+    ti.instances     = nil;
+    ti.instances_len = 0;
+    ti.instances_cap = 0;
     ti.field_tables    = nil;
     ti.field_table_len = 0;
     ti.field_table_cap = 0;
@@ -343,18 +388,66 @@ pub fun prim(ti: *TypeInterner, kind: TypeKind) Option[TypeId] {
     ret some[TypeId](ti.prims[kind::u32]);
 }
 
+# is_integer: whether `tid` is an integer primitive (u8..i64). reads the kind
+# through the interner, so — unlike a bare `tid == TYPE_U8` ordinal test — it
+# never depends on a primitive's TypeId equaling its kind ordinal. the single
+# shared predicate for sema's infer / check / coerce passes.
+# ---
+# ti:  the interner
+# tid: the TypeId to classify
+# ret: true for u8..u64 and i8..i64
+pub fun is_integer(ti: *TypeInterner, tid: TypeId) bool {
+    val t_opt: Option[*Type] = get(ti, tid);
+    if (is_none[*Type](t_opt)) { ret false; }
+    ret unwrap[*Type](t_opt).kind::u32 <= TYPE_I64::u32;
+}
+
+# is_numeric: whether `tid` is an integer or float primitive (u8..f64).
+# ---
+# ti:  the interner
+# tid: the TypeId to classify
+# ret: true for any integer or float primitive
+pub fun is_numeric(ti: *TypeInterner, tid: TypeId) bool {
+    val t_opt: Option[*Type] = get(ti, tid);
+    if (is_none[*Type](t_opt)) { ret false; }
+    ret unwrap[*Type](t_opt).kind::u32 <= TYPE_F64::u32;
+}
+
+# is_float: whether `tid` is a float primitive (f32 or f64).
+# ---
+# ti:  the interner
+# tid: the TypeId to classify
+# ret: true for f32 or f64
+pub fun is_float(ti: *TypeInterner, tid: TypeId) bool {
+    val t_opt: Option[*Type] = get(ti, tid);
+    if (is_none[*Type](t_opt)) { ret false; }
+    val k: u32 = unwrap[*Type](t_opt).kind::u32;
+    ret k == TYPE_F32::u32 || k == TYPE_F64::u32;
+}
+
+# is_pointer_like: whether `tid` is address-shaped — a raw `ptr`, a typed `*T`,
+# or a function (a code address). used to relate `nil` and reinterpret casts
+# against pointer and function operands.
+# ---
+# ti:  the interner
+# tid: the TypeId to classify
+# ret: true for TYPE_PTR / TYPE_POINTER / TYPE_FUN
+pub fun is_pointer_like(ti: *TypeInterner, tid: TypeId) bool {
+    val t_opt: Option[*Type] = get(ti, tid);
+    if (is_none[*Type](t_opt)) { ret false; }
+    val k: TypeKind = unwrap[*Type](t_opt).kind;
+    ret k == TYPE_PTR || k == TYPE_POINTER || k == TYPE_FUN;
+}
+
 # field_table_for: the field table describing nominal or instance TypeId `ty`, or none when none has been registered yet.
 # ---
 # ti: the interner
 # ty: the TypeId to look up
 # ret: some(*FieldTable) when present, none otherwise
 pub fun field_table_for(ti: *TypeInterner, ty: TypeId) Option[*FieldTable] {
-    var i: u32 = 0;
-    for (i < ti.field_table_len) {
-        if (ti.field_tables[i].ty == ty) { ret some[*FieldTable](?ti.field_tables[i]); }
-        i = i + 1;
-    }
-    ret none[*FieldTable]();
+    val idx: Result[*u32, str] = map.get[TypeId, u32](?ti.field_index, ?ty);
+    if (is_err[*u32, str](idx)) { ret none[*FieldTable](); }
+    ret some[*FieldTable](?ti.field_tables[@unwrap_ok[*u32, str](idx)]);
 }
 
 # field_table_begin: begin a new field table for TypeId `ty`, returning its index; fields are appended with field_table_push. each TypeId interns to a stable id, so a table is built once and shared session-wide.
@@ -377,11 +470,13 @@ pub fun field_table_begin(ti: *TypeInterner, ty: TypeId) Result[u32, str] {
         }
         ti.field_table_cap = new_cap;
     }
+    val idx: u32 = ti.field_table_len;
+    val ins: Result[bool, str] = map.insert[TypeId, u32](?ti.field_index, ty, idx);
+    if (is_err[bool, str](ins)) { ret err[u32, str](unwrap_err[bool, str](ins)); }
     var ft: FieldTable;
     ft.ty           = ty;
     ft.fields_start = ti.field_pool_len;
     ft.fields_len   = 0;
-    val idx: u32 = ti.field_table_len;
     ti.field_tables[idx] = ft;
     ti.field_table_len = ti.field_table_len + 1;
     ret ok[u32, str](idx);
@@ -441,6 +536,18 @@ pub fun field_at(ti: *TypeInterner, ty: TypeId, ix: u32) Option[*FieldEntry] {
     val ft: *FieldTable = unwrap[*FieldTable](ft_opt);
     if (ix >= ft.fields_len) { ret none[*FieldEntry](); }
     ret some[*FieldEntry](?ti.field_pool[ft.fields_start + ix]);
+}
+
+# field_entry_at: the FieldEntry at ordinal `ix` of an already-fetched table,
+# read straight from the field pool — O(1) with no table re-resolution. the
+# caller holds `ft` and guarantees `ix < ft.fields_len`.
+# ---
+# ti: the interner
+# ft: a field table previously returned by field_table_for / field_table_begin
+# ix: the field ordinal, in range [0, ft.fields_len)
+# ret: a borrowed pointer to the field entry
+pub fun field_entry_at(ti: *TypeInterner, ft: *FieldTable, ix: u32) *FieldEntry {
+    ret ?ti.field_pool[ft.fields_start + ix];
 }
 
 # intern_pointer: intern a pointer-to type. returns an existing TypeId
@@ -518,19 +625,28 @@ pub fun intern_generic_param(ti: *TypeInterner, name: intern.StrId, owner: id.De
     ret intern_dedup(ti, t);
 }
 
-# intern_function: append a function type. parameter list is copied into
-# the side pool. function types are not currently deduplicated; structural
-# equivalence is available via `type_equals_signatures`. callers that need
-# pointer-equal function types (e.g. cached vtable slots) should
-# canonicalize at a higher layer.
+# intern_function: intern a function type, deduplicating structurally equal
+# signatures through a content-hash index so a generic call's repeated
+# substitute_fun does not grow the universe without bound. on a hash hit the
+# candidate is verified against the mapped type before reuse, so a collision
+# degrades to a fresh append (the historical non-deduped default), never to a
+# wrong identity. structural equivalence is also available via
+# `type_equals_signatures`.
 # ---
 # ti:       the interner
 # ret_ty:   return type
 # params:   pointer to a contiguous array of fixed parameter TypeIds
 # count:    number of fixed parameter types
 # variadic: true when the function accepts trailing variadic arguments
-# ret:      a fresh TypeId for the function, or an allocation error
+# ret:      the (deduped) TypeId for the function, or an allocation error
 pub fun intern_function(ti: *TypeInterner, ret_ty: TypeId, params: *TypeId, count: u32, variadic: bool) Result[TypeId, str] {
+    val h: u64 = hash_fun(ret_ty, params, count, variadic);
+    val cached: Result[*TypeId, str] = map.get[u64, TypeId](?ti.fun_index, ?h);
+    if (is_ok[*TypeId, str](cached)) {
+        val ex: TypeId = @unwrap_ok[*TypeId, str](cached);
+        if (fun_matches(ti, ex, ret_ty, params, count, variadic)) { ret ok[TypeId, str](ex); }
+    }
+
     val start: u32 = ti.params_len;
     val rp: Result[bool, str] = reserve_params(ti, count);
     if (is_err[bool, str](rp)) { ret err[TypeId, str](unwrap_err[bool, str](rp)); }
@@ -543,19 +659,59 @@ pub fun intern_function(ti: *TypeInterner, ret_ty: TypeId, params: *TypeId, coun
 
     var t: Type;
     t.kind = TYPE_FUN;
-    t.data.fn.ret_ty          = ret_ty;
+    t.data.fn.ret_ty       = ret_ty;
     t.data.fn.params_start = start;
     t.data.fn.params_len   = count;
     t.data.fn.variadic     = variadic;
-    ret append_type(ti, t);
+    val ap: Result[TypeId, str] = append_type(ti, t);
+    if (is_err[TypeId, str](ap)) { ret ap; }
+    val tid: TypeId = unwrap_ok[TypeId, str](ap);
+    # last-writer-wins on a hash collision: the most recently interned signature
+    # for this hash is the one reused next, so equal signatures still collapse.
+    val ins: Result[bool, str] = map.insert[u64, TypeId](?ti.fun_index, h, tid);
+    if (is_err[bool, str](ins)) { ret err[TypeId, str](unwrap_err[bool, str](ins)); }
+    ret ok[TypeId, str](tid);
+}
+
+# hash_fun: FNV-1a content hash over a function signature (ret, params, variadic),
+# matching the identity `fun_matches` verifies.
+fun hash_fun(ret_ty: TypeId, params: *TypeId, count: u32, variadic: bool) u64 {
+    var h: u64 = fnv1a.init();
+    h = fnv1a.step_u8(h, TYPE_FUN::u8);
+    h = fnv1a.step_u32(h, ret_ty::u32);
+    if (variadic) { h = fnv1a.step_u8(h, 1); } or { h = fnv1a.step_u8(h, 0); }
+    h = fnv1a.step_u32(h, count);
+    var i: u32 = 0;
+    for (i < count) {
+        h = fnv1a.step_u32(h, params[i]::u32);
+        i = i + 1;
+    }
+    ret h;
+}
+
+# fun_matches: whether the interned TYPE_FUN at `tid` has exactly the given
+# signature (ret, params slice, variadic).
+fun fun_matches(ti: *TypeInterner, tid: TypeId, ret_ty: TypeId, params: *TypeId, count: u32, variadic: bool) bool {
+    if (tid >= ti.type_len) { ret false; }
+    val t: *Type = ?ti.types[tid];
+    if (t.kind != TYPE_FUN) { ret false; }
+    if (t.data.fn.ret_ty != ret_ty) { ret false; }
+    if (t.data.fn.variadic != variadic) { ret false; }
+    if (t.data.fn.params_len != count) { ret false; }
+    var i: u32 = 0;
+    for (i < count) {
+        if (ti.params[t.data.fn.params_start + i] != params[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # intern_instance: intern a generic instantiation `(target_origin,
-# target_decl)<args>`. linear-scans existing TYPE_INSTANCE entries for a
-# match before appending; on miss, copies args into the params pool and
-# appends a fresh TypeInstance record. TYPE_INSTANCE bypasses the dedup
-# map (hash is awkward with args living in a side pool); instance counts
-# are small enough that linear scan is acceptable.
+# target_decl)<args>`. scans the instance list for a match before appending;
+# on miss, copies args into the params pool, appends a fresh TypeInstance
+# record, and records it in the instance list. TYPE_INSTANCE bypasses the dedup
+# map (its args live in the side pool, which the context-free dedup hash cannot
+# read), so dedup walks the instance list — O(instances), not O(type_len).
 # ---
 # ti:            the interner
 # target_origin: module that declared the generic
@@ -565,10 +721,10 @@ pub fun intern_function(ti: *TypeInterner, ret_ty: TypeId, params: *TypeId, coun
 # ret:           the (deduped) TypeId for the instance, or an allocation error
 pub fun intern_instance(ti: *TypeInterner, target_origin: sess.ModuleId, target_decl: id.DeclId, args: *TypeId, count: u32) Result[TypeId, str] {
     var i: u32 = 0;
-    for (i < ti.type_len) {
-        val ex: *Type = ?ti.types[i];
-        if (ex.kind == TYPE_INSTANCE
-            && ex.data.instance.target_origin == target_origin
+    for (i < ti.instances_len) {
+        val tid: TypeId = ti.instances[i];
+        val ex: *Type = ?ti.types[tid];
+        if (ex.data.instance.target_origin == target_origin
             && ex.data.instance.target_decl   == target_decl
             && ex.data.instance.args_len      == count) {
             var match: bool = true;
@@ -580,7 +736,7 @@ pub fun intern_instance(ti: *TypeInterner, target_origin: sess.ModuleId, target_
                 }
                 j = j + 1;
             }
-            if (match) { ret ok[TypeId, str](i); }
+            if (match) { ret ok[TypeId, str](tid); }
         }
         i = i + 1;
     }
@@ -601,7 +757,33 @@ pub fun intern_instance(ti: *TypeInterner, target_origin: sess.ModuleId, target_
     t.data.instance.target_decl   = target_decl;
     t.data.instance.args_start    = start;
     t.data.instance.args_len      = count;
-    ret append_type(ti, t);
+    val ap: Result[TypeId, str] = append_type(ti, t);
+    if (is_err[TypeId, str](ap)) { ret ap; }
+    val tid: TypeId = unwrap_ok[TypeId, str](ap);
+    val tr: Result[bool, str] = track_instance(ti, tid);
+    if (is_err[bool, str](tr)) { ret err[TypeId, str](unwrap_err[bool, str](tr)); }
+    ret ok[TypeId, str](tid);
+}
+
+# track_instance: append `tid` to the instance list, growing it as needed.
+fun track_instance(ti: *TypeInterner, tid: TypeId) Result[bool, str] {
+    if (ti.instances_len == ti.instances_cap) {
+        var new_cap: u32 = ti.instances_cap * 2;
+        if (new_cap == 0) { new_cap = 16; }
+        if (ti.instances == nil) {
+            val ar: Result[*TypeId, str] = allocate[TypeId](ti.alloc, new_cap::usize);
+            if (is_err[*TypeId, str](ar)) { ret err[bool, str](unwrap_err[*TypeId, str](ar)); }
+            ti.instances = unwrap_ok[*TypeId, str](ar);
+        } or {
+            val rr: Result[*TypeId, str] = reallocate[TypeId](ti.alloc, ti.instances, ti.instances_cap::usize, new_cap::usize);
+            if (is_err[*TypeId, str](rr)) { ret err[bool, str](unwrap_err[*TypeId, str](rr)); }
+            ti.instances = unwrap_ok[*TypeId, str](rr);
+        }
+        ti.instances_cap = new_cap;
+    }
+    ti.instances[ti.instances_len] = tid;
+    ti.instances_len = ti.instances_len + 1;
+    ret ok[bool, str](true);
 }
 
 # get: return a pointer to the Type for a given TypeId, or none when tid

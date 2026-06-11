@@ -716,11 +716,9 @@ pub fun try_lower_comptime_intrinsic(ctx: *lower.LowerContext, eid: aid.ExprId, 
     if (is_none[*aexpr.Expr](ce_opt)) { ret none[Result[value.Value, str]](); }
     val ce: *aexpr.Expr = unwrap[*aexpr.Expr](ce_opt);
     if (ce.kind != aexpr.EXPR_KIND_COMPTIME_IDENT) { ret none[Result[value.Value, str]](); }
-    if (ce.span.len <= 1) { ret none[Result[value.Value, str]](); }
 
-    var ns: token.Span = ce.span;
-    ns.offset = ns.offset + 1;
-    ns.len    = ns.len - 1;
+    val ns: token.Span = comptime.comptime_ident_name(ce.span);
+    if (ns.len == 0) { ret none[Result[value.Value, str]](); }
     val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, lower.module_source(ctx), ns);
     if (is_err[intern.StrId, str](name_r)) {
         ret some[Result[value.Value, str]](err[value.Value, str](unwrap_err[intern.StrId, str](name_r)));
@@ -731,7 +729,15 @@ pub fun try_lower_comptime_intrinsic(ctx: *lower.LowerContext, eid: aid.ExprId, 
     val is_offset: bool = name == interned_literal(ctx, "offset_of");
     if (!is_size && !is_align && !is_offset) { ret none[Result[value.Value, str]](); }
 
-    if (e.data.call.args_len::usize > ctx.a.expr_id_len) {
+    # bound the argument pool slice this call reads: arg0 (and, for offset_of,
+    # arg1) must lie within the expr-id pool. sema validates intrinsic arities, so
+    # this only guards the indexing — `args_start + args_len <= pool` makes every
+    # ordinal in [args_start, args_start + args_len) addressable, and the per-
+    # intrinsic arity requires the ordinals actually read to be present.
+    var arity: u32 = 1;
+    if (is_offset) { arity = 2; }
+    if (e.data.call.args_len < arity ||
+        e.data.call.args_start::usize + e.data.call.args_len::usize > ctx.a.expr_id_len) {
         ret some[Result[value.Value, str]](err[value.Value, str]("lower: comptime intrinsic argument index out of range"));
     }
     val arg0_eid: aid.ExprId = ctx.a.expr_ids[e.data.call.args_start];
@@ -1340,17 +1346,13 @@ fun lower_binary(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Resu
     val rty: ty.TypeId = lower.expr_type_of(ctx, e.data.binary.rhs);
     val signed: bool = is_signed_type(ctx, lty);
 
-    # a mixed-width integer comparison reads both operands at one width (the
-    # back end sizes the CMP from operand 0), so a narrower operand must be
-    # extended to the wider operand's width here, where signedness is known:
-    # sign-extension for a signed narrower operand (i8/i16), zero-extension for
-    # an unsigned one. the IR type carries no signedness, so the back end could
-    # not make this choice. non-comparison integer ops share the operand type
-    # via sema, so they need no unification.
-    if (is_compare_binop(op)) {
-        val ur: Result[bool, str] = unify_int_compare_widths(ctx, ?lhs, lty, ?rhs, rty);
-        if (is_err[bool, str](ur)) { ret err[value.Value, str](unwrap_err[bool, str](ur)); }
-    }
+    # comparisons compare mathematical values across any integer signedness /
+    # width mix and across float widths. lower_cmp owns the value-correct
+    # widening and the irreducible i64/u64 sign-test sequence; the back end's
+    # single-width CMP and the IR's signedness-free types make this the only
+    # layer that can choose extension and compare signedness from the semantic
+    # types. non-comparison integer ops share the operand type via sema.
+    if (is_compare_binop(op)) { ret lower_cmp(ctx, op, lhs, lty, rhs, rty); }
 
     if (op == aexpr.BIN_ADD) { ret builder.emit_add(?ctx.builder, lhs, rhs); }
     if (op == aexpr.BIN_SUB) { ret builder.emit_sub(?ctx.builder, lhs, rhs); }
@@ -1372,27 +1374,6 @@ fun lower_binary(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Resu
         ret builder.emit_shr_u(?ctx.builder, lhs, rhs);
     }
 
-    if (op == aexpr.BIN_EQ)  { ret builder.emit_cmp_eq(?ctx.builder, lhs, rhs); }
-    if (op == aexpr.BIN_NEQ) { ret builder.emit_cmp_ne(?ctx.builder, lhs, rhs); }
-    if (op == aexpr.BIN_LT) {
-        if (signed) { ret builder.emit_cmp_lt_s(?ctx.builder, lhs, rhs); }
-        ret builder.emit_cmp_lt_u(?ctx.builder, lhs, rhs);
-    }
-    if (op == aexpr.BIN_LEQ) {
-        if (signed) { ret builder.emit_cmp_le_s(?ctx.builder, lhs, rhs); }
-        ret builder.emit_cmp_le_u(?ctx.builder, lhs, rhs);
-    }
-    if (op == aexpr.BIN_GT) {
-        # a > b  ==  b < a
-        if (signed) { ret builder.emit_cmp_lt_s(?ctx.builder, rhs, lhs); }
-        ret builder.emit_cmp_lt_u(?ctx.builder, rhs, lhs);
-    }
-    if (op == aexpr.BIN_GEQ) {
-        # a >= b  ==  b <= a
-        if (signed) { ret builder.emit_cmp_le_s(?ctx.builder, rhs, lhs); }
-        ret builder.emit_cmp_le_u(?ctx.builder, rhs, lhs);
-    }
-
     ret err[value.Value, str]("lower: unsupported binary operator");
 }
 
@@ -1404,15 +1385,198 @@ fun is_compare_binop(op: aexpr.BinOp) bool {
         op == aexpr.BIN_GT  || op == aexpr.BIN_GEQ;
 }
 
-# extends the narrower operand of a mixed-width integer comparison up to the
+# lowers a comparison to its value-correct u8 result. comparisons relate the
+# mathematical values of the operands, so the result is identical in both
+# operand orders regardless of signedness or width:
+#   - float vs float: widen the narrower side (exact) and compare as floats;
+#     sema rejects int vs float, so a float operand implies both are floats.
+#   - same signedness: widen the narrower side per that signedness, compare as
+#     it (pointers fall here: unsigned, equal width).
+#   - mixed signedness with the unsigned operand narrower than 64 bits: it fits
+#     positive in i64, so widen each per its own signedness to 64 bits and
+#     compare signed.
+#   - the irreducible i64/u64 pair: no common wider integer, so emit a sign-test
+#     on the signed operand plus an unsigned compare (a negative signed value is
+#     less than every u64 and equal to none).
+fun lower_cmp(ctx: *lower.LowerContext, op: aexpr.BinOp, lhs: value.Value, lty: ty.TypeId, rhs: value.Value, rty: ty.TypeId) Result[value.Value, str] {
+    if (is_float_type(ctx, lty) || is_float_type(ctx, rty)) {
+        var fl: value.Value = lhs;
+        var fr: value.Value = rhs;
+        val ur: Result[bool, str] = unify_float_compare_widths(ctx, ?fl, lty, ?fr, rty);
+        if (is_err[bool, str](ur)) { ret err[value.Value, str](unwrap_err[bool, str](ur)); }
+        ret emit_cmp_int(ctx, op, false, fl, fr);
+    }
+
+    val ls: bool = is_signed_type(ctx, lty);
+    val rs: bool = is_signed_type(ctx, rty);
+
+    if (ls == rs) {
+        var sl: value.Value = lhs;
+        var sr: value.Value = rhs;
+        val ur: Result[bool, str] = unify_int_compare_widths(ctx, ?sl, lty, ?sr, rty);
+        if (is_err[bool, str](ur)) { ret err[value.Value, str](unwrap_err[bool, str](ur)); }
+        ret emit_cmp_int(ctx, op, ls, sl, sr);
+    }
+
+    # mixed signedness: name the signed and unsigned operand, keeping track of
+    # which one was the left-hand side so the operator stays oriented.
+    var s_val: value.Value = lhs;
+    var s_ty:  ty.TypeId   = lty;
+    var u_val: value.Value = rhs;
+    var u_ty:  ty.TypeId   = rty;
+    var s_is_lhs: bool     = true;
+    if (!ls) {
+        s_val = rhs; s_ty = rty; u_val = lhs; u_ty = lty; s_is_lhs = false;
+    }
+
+    val ty64r: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?ctx.m.types, 64);
+    if (is_err[ir_type.IrTypeId, str](ty64r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](ty64r)); }
+    val ty64: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ty64r);
+
+    val s64r: Result[value.Value, str] = widen_signed_to_i64(ctx, s_val, s_ty, ty64);
+    if (is_err[value.Value, str](s64r)) { ret s64r; }
+    val s64: value.Value = unwrap_ok[value.Value, str](s64r);
+
+    if (scalar_bits(ctx, u_ty) < 64) {
+        # reducible: the unsigned operand zero-extends to a positive i64, so a
+        # signed 64-bit compare in the original operand order is value-correct.
+        val u64r: Result[value.Value, str] = builder.emit_zext(?ctx.builder, u_val, ty64);
+        if (is_err[value.Value, str](u64r)) { ret u64r; }
+        val u64v: value.Value = unwrap_ok[value.Value, str](u64r);
+        if (s_is_lhs) { ret emit_cmp_int(ctx, op, true, s64, u64v); }
+        ret emit_cmp_int(ctx, op, true, u64v, s64);
+    }
+
+    ret lower_cmp_signed_u64(ctx, op, s64, u_val, s_is_lhs, ty64);
+}
+
+# emits an integer (or, with `signed` false, a float-or-unsigned) comparison for
+# `op` over operands already unified to a single width. `>` and `>=` reuse `<` /
+# `<=` with the operands swapped.
+fun emit_cmp_int(ctx: *lower.LowerContext, op: aexpr.BinOp, signed: bool, lhs: value.Value, rhs: value.Value) Result[value.Value, str] {
+    if (op == aexpr.BIN_EQ)  { ret builder.emit_cmp_eq(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_NEQ) { ret builder.emit_cmp_ne(?ctx.builder, lhs, rhs); }
+    if (op == aexpr.BIN_LT) {
+        if (signed) { ret builder.emit_cmp_lt_s(?ctx.builder, lhs, rhs); }
+        ret builder.emit_cmp_lt_u(?ctx.builder, lhs, rhs);
+    }
+    if (op == aexpr.BIN_LEQ) {
+        if (signed) { ret builder.emit_cmp_le_s(?ctx.builder, lhs, rhs); }
+        ret builder.emit_cmp_le_u(?ctx.builder, lhs, rhs);
+    }
+    if (op == aexpr.BIN_GT) {
+        if (signed) { ret builder.emit_cmp_lt_s(?ctx.builder, rhs, lhs); }
+        ret builder.emit_cmp_lt_u(?ctx.builder, rhs, lhs);
+    }
+    if (op == aexpr.BIN_GEQ) {
+        if (signed) { ret builder.emit_cmp_le_s(?ctx.builder, rhs, lhs); }
+        ret builder.emit_cmp_le_u(?ctx.builder, rhs, lhs);
+    }
+    ret err[value.Value, str]("lower: unsupported comparison operator");
+}
+
+# sign-extends a signed integer value to 64 bits, or returns it unchanged when
+# it is already 64-bit wide.
+fun widen_signed_to_i64(ctx: *lower.LowerContext, v: value.Value, vty: ty.TypeId, ty64: ir_type.IrTypeId) Result[value.Value, str] {
+    if (scalar_bits(ctx, vty) >= 64) { ret ok[value.Value, str](v); }
+    ret builder.emit_sext(?ctx.builder, v, ty64);
+}
+
+# lowers the irreducible i64/u64 comparison. `s64` is the signed operand widened
+# to 64 bits, `u` the u64 operand, and `s_is_lhs` records whether the signed
+# operand was the left-hand side (so the operator can be re-oriented to `s op u`
+# form). a negative signed value is below every u64; a non-negative one compares
+# bit-identically as unsigned. composition is branch-free: every input is a 0/1
+# setcc result, so `||` is a bitwise OR and `&&` a bitwise AND.
+fun lower_cmp_signed_u64(ctx: *lower.LowerContext, op: aexpr.BinOp, s64: value.Value, u: value.Value, s_is_lhs: bool, ty64: ir_type.IrTypeId) Result[value.Value, str] {
+    var nop: aexpr.BinOp = op;
+    if (!s_is_lhs) { nop = swap_cmp_op(op); }
+    val zero: value.Value = value.const_int(0, ty64);
+
+    if (nop == aexpr.BIN_LT) {
+        # s < u  ==  s < 0 || s::u64 < u
+        ret cmp_or(ctx, builder.emit_cmp_lt_s(?ctx.builder, s64, zero),
+                        builder.emit_cmp_lt_u(?ctx.builder, s64, u));
+    }
+    if (nop == aexpr.BIN_LEQ) {
+        # s <= u  ==  s < 0 || s::u64 <= u
+        ret cmp_or(ctx, builder.emit_cmp_lt_s(?ctx.builder, s64, zero),
+                        builder.emit_cmp_le_u(?ctx.builder, s64, u));
+    }
+    if (nop == aexpr.BIN_GT) {
+        # s > u  ==  s >= 0 && u < s::u64
+        ret cmp_and(ctx, builder.emit_cmp_le_s(?ctx.builder, zero, s64),
+                         builder.emit_cmp_lt_u(?ctx.builder, u, s64));
+    }
+    if (nop == aexpr.BIN_GEQ) {
+        # s >= u  ==  s >= 0 && u <= s::u64
+        ret cmp_and(ctx, builder.emit_cmp_le_s(?ctx.builder, zero, s64),
+                         builder.emit_cmp_le_u(?ctx.builder, u, s64));
+    }
+    if (nop == aexpr.BIN_EQ) {
+        # s == u  ==  s >= 0 && s::u64 == u
+        ret cmp_and(ctx, builder.emit_cmp_le_s(?ctx.builder, zero, s64),
+                         builder.emit_cmp_eq(?ctx.builder, s64, u));
+    }
+    if (nop == aexpr.BIN_NEQ) {
+        # s != u  ==  s < 0 || s::u64 != u
+        ret cmp_or(ctx, builder.emit_cmp_lt_s(?ctx.builder, s64, zero),
+                        builder.emit_cmp_ne(?ctx.builder, s64, u));
+    }
+    ret err[value.Value, str]("lower: unsupported comparison operator");
+}
+
+# returns the operator that compares the same pair with the operands swapped:
+# `<`<->`>`, `<=`<->`>=`; equality and inequality are symmetric.
+fun swap_cmp_op(op: aexpr.BinOp) aexpr.BinOp {
+    if (op == aexpr.BIN_LT)  { ret aexpr.BIN_GT; }
+    if (op == aexpr.BIN_LEQ) { ret aexpr.BIN_GEQ; }
+    if (op == aexpr.BIN_GT)  { ret aexpr.BIN_LT; }
+    if (op == aexpr.BIN_GEQ) { ret aexpr.BIN_LEQ; }
+    ret op;
+}
+
+# bitwise-ORs two 0/1 comparison results, short-circuiting on either error.
+fun cmp_or(ctx: *lower.LowerContext, a: Result[value.Value, str], b: Result[value.Value, str]) Result[value.Value, str] {
+    if (is_err[value.Value, str](a)) { ret a; }
+    if (is_err[value.Value, str](b)) { ret b; }
+    ret builder.emit_or(?ctx.builder, unwrap_ok[value.Value, str](a), unwrap_ok[value.Value, str](b));
+}
+
+# bitwise-ANDs two 0/1 comparison results, short-circuiting on either error.
+fun cmp_and(ctx: *lower.LowerContext, a: Result[value.Value, str], b: Result[value.Value, str]) Result[value.Value, str] {
+    if (is_err[value.Value, str](a)) { ret a; }
+    if (is_err[value.Value, str](b)) { ret b; }
+    ret builder.emit_and(?ctx.builder, unwrap_ok[value.Value, str](a), unwrap_ok[value.Value, str](b));
+}
+
+# widens the narrower operand of a mixed-width float comparison up to the wider
+# operand's precision, in place, via an exact float extension. equal-width pairs
+# are left untouched.
+fun unify_float_compare_widths(ctx: *lower.LowerContext, lhs: *value.Value, lty: ty.TypeId, rhs: *value.Value, rty: ty.TypeId) Result[bool, str] {
+    val lw: u32 = scalar_bits(ctx, lty);
+    val rw: u32 = scalar_bits(ctx, rty);
+    if (lw == rw) { ret ok[bool, str](true); }
+    if (lw < rw) {
+        val xr: Result[value.Value, str] = builder.emit_fp_ext(?ctx.builder, @lhs, rhs.ty);
+        if (is_err[value.Value, str](xr)) { ret err[bool, str](unwrap_err[value.Value, str](xr)); }
+        @lhs = unwrap_ok[value.Value, str](xr);
+        ret ok[bool, str](true);
+    }
+    val xr: Result[value.Value, str] = builder.emit_fp_ext(?ctx.builder, @rhs, lhs.ty);
+    if (is_err[value.Value, str](xr)) { ret err[bool, str](unwrap_err[value.Value, str](xr)); }
+    @rhs = unwrap_ok[value.Value, str](xr);
+    ret ok[bool, str](true);
+}
+
+# extends the narrower operand of a same-signedness integer comparison up to the
 # wider operand's bit width, in place, so the back end's single-width CMP reads
 # two correctly-extended values. a signed narrower operand is sign-extended, an
 # unsigned one zero-extended (the IR type carries no signedness, so this choice
-# must be made here from the semantic types). float and equal-width / non-scalar
-# pairs are left untouched. the narrower operand takes on the wider operand's
-# own IR type, the width the back end already sizes the CMP from.
+# must be made here from the semantic types). equal-width / non-scalar pairs are
+# left untouched. the narrower operand takes on the wider operand's own IR type,
+# the width the back end already sizes the CMP from.
 fun unify_int_compare_widths(ctx: *lower.LowerContext, lhs: *value.Value, lty: ty.TypeId, rhs: *value.Value, rty: ty.TypeId) Result[bool, str] {
-    if (is_float_type(ctx, lty) || is_float_type(ctx, rty)) { ret ok[bool, str](true); }
     val lw: u32 = scalar_bits(ctx, lty);
     val rw: u32 = scalar_bits(ctx, rty);
     if (lw == 0 || rw == 0 || lw == rw) { ret ok[bool, str](true); }
@@ -1594,9 +1758,7 @@ fun lower_cast(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result
 # comptime context. the `$ident` span carries the leading `$`; constants are
 # registered under the bare name, so strip it before interning the lookup key.
 fun lower_comptime_ident(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
-    var name_span: token.Span = e.span;
-    name_span.offset = name_span.offset + 1;
-    name_span.len    = name_span.len - 1;
+    val name_span: token.Span = comptime.comptime_ident_name(e.span);
     val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, lower.module_source(ctx), name_span);
     if (is_err[intern.StrId, str](name_r)) { ret err[value.Value, str](unwrap_err[intern.StrId, str](name_r)); }
     val nc: Option[*comptime.NamedConst] = comptime.lookup(ctx.ctx, unwrap_ok[intern.StrId, str](name_r));
@@ -1702,14 +1864,39 @@ fun lower_struct_lit(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) 
 }
 
 # materialises a comptime CTValue as an IR constant Value at the expression's
-# IR type. used by COMPTIME_IDENT lowering and by the decl lowerer for
-# comptime-evaluable global initialisers.
+# IR type, in EXPRESSION position: a folded CT_KIND_STR is committed to an
+# anonymous `.rodata` global and the Value is a pointer to it, exactly as
+# `lower_lit_str` routes a string literal — a raw byte blob must never reach the
+# back end as an operand. used by COMPTIME_IDENT / comptime-path lowering, the
+# imported-const fallback, and comptime value-parameter references.
 # ---
 # ctx: the context
 # eid: the expression whose IR type the constant takes
 # v:   the folded comptime value
 # ret: the corresponding constant Value, or an error
 pub fun const_value_of(ctx: *lower.LowerContext, eid: aid.ExprId, v: comptime.CTValue) Result[value.Value, str] {
+    ret materialize_const_value(ctx, eid, v, true);
+}
+
+# the global-initialiser counterpart of `const_value_of`: a folded CT_KIND_STR is
+# returned as the raw VAL_CONST_BYTES blob the global-init emission lays out as
+# initialised data in place, rather than committed to a separate rodata global
+# and referenced by pointer. every other value kind is identical.
+# ---
+# ctx: the context
+# eid: the initialiser expression whose IR type the constant takes
+# v:   the folded comptime value
+# ret: the corresponding constant Value, or an error
+pub fun const_value_of_init(ctx: *lower.LowerContext, eid: aid.ExprId, v: comptime.CTValue) Result[value.Value, str] {
+    ret materialize_const_value(ctx, eid, v, false);
+}
+
+# materialises a comptime CTValue as an IR constant Value at the expression's IR
+# type. `expr_pos` selects how a CT_KIND_STR is realised: an expression-position
+# string constant becomes a rodata global plus a pointer to it (a raw blob must
+# never become an operand), while a global initialiser keeps the raw blob for
+# in-place data emission. the int / bool / float kinds are position-independent.
+fun materialize_const_value(ctx: *lower.LowerContext, eid: aid.ExprId, v: comptime.CTValue, expr_pos: bool) Result[value.Value, str] {
     val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
     if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
     val ty_id: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
@@ -1727,7 +1914,9 @@ pub fun const_value_of(ctx: *lower.LowerContext, eid: aid.ExprId, v: comptime.CT
         val s: str = unwrap[str](txt);
         # include the trailing '\0' so the emitted blob is a valid null-terminated
         # `str` rather than relying on section padding (see lower_lit_str).
-        ret ok[value.Value, str](value.const_bytes(s::*u8, (str_len(s) + 1::usize)::u32, ty_id));
+        val blob: value.Value = value.const_bytes(s::*u8, (str_len(s) + 1::usize)::u32, ty_id);
+        if (expr_pos) { ret lower.add_rodata_bytes(ctx, blob, ty_id); }
+        ret ok[value.Value, str](blob);
     }
     ret err[value.Value, str]("lower: unsupported comptime value kind");
 }
@@ -1824,21 +2013,14 @@ pub fun field_index_in_type(ctx: *lower.LowerContext, rec_ty: ty.TypeId, name: t
 }
 
 # finds the module function index whose interned name matches `name`, or none.
+# the module keeps a name -> index map updated on every append, so this is an
+# O(1) lookup rather than a linear scan over every emitted function.
 fun find_function(ctx: *lower.LowerContext, name: intern.StrId) Option[u32] {
-    var i: u32 = 0;
-    for (i < ctx.m.function_len) {
-        if (ctx.m.functions[i].name == name) { ret some[u32](i); }
-        i = i + 1;
-    }
-    ret none[u32]();
+    ret ir.lookup_function(ctx.m, name);
 }
 
 # finds the module global index whose interned name matches `name`, or none.
+# resolves through the module's name -> index map (user / extern globals).
 fun find_global(ctx: *lower.LowerContext, name: intern.StrId) Option[u32] {
-    var i: u32 = 0;
-    for (i < ctx.m.global_len) {
-        if (ctx.m.globals[i].name == name) { ret some[u32](i); }
-        i = i + 1;
-    }
-    ret none[u32]();
+    ret ir.lookup_global(ctx.m, name);
 }

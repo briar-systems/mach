@@ -12,8 +12,9 @@
 # an external revision source). Validation is revision-based: an entry is
 # valid iff every recorded dependency's current `last_changed` still
 # equals the value captured when the entry was computed. Recomputes that
-# reproduce identical bytes leave `last_changed` untouched (early
-# cutoff), which is what keeps `last_changed` distinct from `computed_at`.
+# reproduce identical bytes leave `last_changed` untouched (early cutoff), so
+# `last_changed` tracks when an entry's bytes actually changed, not when it was
+# last revalidated.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -33,6 +34,7 @@ use std.allocator.allocate;
 use std.allocator.deallocate;
 use std.allocator.reallocate;
 
+use page: std.allocator.page;
 use mem: std.memory;
 
 # QueryKind: discriminator identifying a particular query function. one
@@ -128,7 +130,6 @@ pub rec Dep {
 # key:          hashed key; the kind-key-type -> u64 mapping is the registrar's responsibility
 # value:        owned opaque value buffer (layout is the registered query's responsibility)
 # value_len:    length of value in bytes
-# computed_at:  revision at which value was last recomputed
 # last_changed: revision at which value's bytes last actually changed
 # deps:         queries read while computing value
 # dep_count:    number of entries in deps
@@ -137,7 +138,6 @@ pub rec QueryEntry {
     key:          u64;
     value:        *u8;
     value_len:    u32;
-    computed_at:  Revision;
     last_changed: Revision;
     deps:         *Dep;
     dep_count:    u32;
@@ -286,7 +286,6 @@ pub fun set_input(db: *QueryDb, kind: QueryKind, key: u64, value: *u8, value_len
         }
         existing.value     = unwrap_ok[*u8, str](rcopy);
         existing.value_len = value_len;
-        existing.computed_at = db.revision;
         if (!same) {
             existing.last_changed = db.revision;
         }
@@ -305,7 +304,6 @@ pub fun set_input(db: *QueryDb, kind: QueryKind, key: u64, value: *u8, value_len
     val entry: *QueryEntry = unwrap_ok[*QueryEntry, str](rentry);
     entry.value        = unwrap_ok[*u8, str](rcopy);
     entry.value_len    = value_len;
-    entry.computed_at  = db.revision;
     entry.last_changed = db.revision;
     ret ok[bool, str](true);
 }
@@ -323,6 +321,14 @@ pub fun invalidate(db: *QueryDb, kind: QueryKind, key: u64) Result[bool, str] {
     if (is_err[*QueryShard, str](rsh)) { ret err[bool, str](unwrap_err[*QueryShard, str](rsh)); }
     val sh: *QueryShard = unwrap_ok[*QueryShard, str](rsh);
 
+    remove_entry(db, sh, key);
+    ret ok[bool, str](true);
+}
+
+# remove_entry: free and swap-remove the entry keyed by `key` from `sh`, if
+# present. a no-op when absent. swap-remove leaves entry order unspecified, so
+# callers must not hold entry pointers across it.
+fun remove_entry(db: *QueryDb, sh: *QueryShard, key: u64) {
     var i: u32 = 0;
     for (i < sh.len) {
         val e: *QueryEntry = ?sh.entries[i];
@@ -331,11 +337,10 @@ pub fun invalidate(db: *QueryDb, kind: QueryKind, key: u64) Result[bool, str] {
             val last: u32 = sh.len - 1;
             if (i != last) { sh.entries[i] = sh.entries[last]; }
             sh.len = last;
-            ret ok[bool, str](true);
+            ret;
         }
         i = i + 1;
     }
-    ret ok[bool, str](true);
 }
 
 # get: the single public lookup. returns the cached entry for `(kind,
@@ -366,7 +371,6 @@ pub fun get(db: *QueryDb, kind: QueryKind, key: u64) Result[*QueryEntry, str] {
     val existing: *QueryEntry = find_entry(sh, key);
     if (existing != nil) {
         if (entry_valid(db, existing)) {
-            existing.computed_at = db.revision;
             ret ok[*QueryEntry, str](existing);
         }
         ret recompute(db, sh, existing, key);
@@ -480,7 +484,6 @@ fun append_entry(db: *QueryDb, sh: *QueryShard, key: u64) Result[*QueryEntry, st
     e.key          = key;
     e.value        = nil;
     e.value_len    = 0;
-    e.computed_at  = 0;
     e.last_changed = 0;
     e.deps         = nil;
     e.dep_count    = 0;
@@ -535,11 +538,14 @@ fun recompute(db: *QueryDb, sh: *QueryShard, e: *QueryEntry, key: u64) Result[*Q
 
     val rout: Result[QueryOutput, str] = sh.compute(db, key, db.alloc);
     if (is_err[QueryOutput, str](rout)) {
+        # a failed compute must not leave a poisoned entry behind: it now has
+        # zero deps, which entry_valid reads as vacuously valid, so the next get
+        # would return its stale (or never-computed nil) bytes as a success.
+        # drop it so the next get re-runs compute. `e` may dangle after this.
+        remove_entry(db, sh, key);
         ret err[*QueryEntry, str](unwrap_err[QueryOutput, str](rout));
     }
     val out: QueryOutput = unwrap_ok[QueryOutput, str](rout);
-
-    e.computed_at = db.revision;
 
     val same: bool = bytes_equal(e.value, e.value_len, out.bytes, out.len);
     if (same) {
@@ -666,4 +672,30 @@ fun bytes_equal(a: *u8, a_len: u32, b: *u8, b_len: u32) bool {
         i = i + 1;
     }
     ret true;
+}
+
+# a derived compute that always fails, to exercise the failed-recompute path.
+fun t_always_fail(db: *QueryDb, key: u64, alloc: *Allocator) Result[QueryOutput, str] {
+    ret err[QueryOutput, str]("compute always fails");
+}
+
+test "query: a failed recompute is not laundered into a cached success (#1249)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    val dr: Result[QueryDb, str] = init(?alloc);
+    if (is_err[QueryDb, str](dr)) { ret 1; }
+    var db: QueryDb = unwrap_ok[QueryDb, str](dr);
+
+    val rr: Result[bool, str] = register_derived(?db, Q_TOKENIZE, t_always_fail);
+    if (is_err[bool, str](rr)) { dnit(?db); ret 1; }
+
+    # first get: compute fails, so get errs.
+    if (!is_err[*QueryEntry, str](get(?db, Q_TOKENIZE, 42))) { dnit(?db); ret 1; }
+    # second get: the failed entry must not be cached as a vacuously-valid (zero-
+    # dep) success; get must re-run compute and err again rather than return the
+    # poisoned nil value.
+    if (!is_err[*QueryEntry, str](get(?db, Q_TOKENIZE, 42))) { dnit(?db); ret 1; }
+
+    dnit(?db);
+    ret 0;
 }

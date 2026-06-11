@@ -860,7 +860,7 @@ fun intern_required(i: *intern.Interner, text: str, missing: str) Result[intern.
 # find_target: resolve a target selector against the config's [targets.*]
 # entries. an empty selector defers to [project].target. the selectors
 # "native" and "host" resolve to the entry whose os/isa match the build
-# host (host_os_id()/host_arch_id()); any other selector matches an entry by
+# host (tgt.host_os_id()/host_arch_id()); any other selector matches an entry by
 # name. returns nil when nothing matches.
 fun find_target(c: *ProjectConfig, name: str, i: *intern.Interner) *TargetEntry {
     var sel: str = name;
@@ -885,30 +885,12 @@ fun find_target(c: *ProjectConfig, name: str, i: *intern.Interner) *TargetEntry 
     ret nil;
 }
 
-# host_os_id / host_arch_id: the os/arch id this compiler binary was built for,
-# which is the host it runs on. the `$mach.target.{os,arch}` predicate folds at
-# comptime to the active build target, and each branch returns the matching
-# os.OS_* / isa.ARCH_* id — the same numeric space `os_id_for`/`arch_id_for`
-# produce. resolving the host inside a function body (not a read-only global
-# initializer) keeps the const reference an ordinary runtime load, sidestepping
-# the comptime-only fold path globals take.
-fun host_os_id() u32 {
-    $if ($mach.target.os == $mach.os.linux)   { ret os.OS_LINUX; }
-    $or ($mach.target.os == $mach.os.darwin)  { ret os.OS_DARWIN; }
-    $or ($mach.target.os == $mach.os.windows) { ret os.OS_WINDOWS; }
-    $or                                        { ret os.OS_UNKNOWN; }
-}
-fun host_arch_id() u32 {
-    $if ($mach.target.arch == $mach.arch.x86_64)  { ret isa.ARCH_X86_64; }
-    $or ($mach.target.arch == $mach.arch.aarch64) { ret isa.ARCH_AARCH64; }
-    $or                                            { ret isa.ARCH_UNKNOWN; }
-}
-
 # find_host_target: pick the [targets.<name>] entry whose os/isa map to the
-# build host's os/arch ids. returns nil when no entry matches the host.
+# build host's os/arch ids (tgt.host_os_id()/host_arch_id()). returns nil when
+# no entry matches the host.
 fun find_host_target(c: *ProjectConfig, i: *intern.Interner) *TargetEntry {
-    val h_os:   u32 = host_os_id();
-    val h_arch: u32 = host_arch_id();
+    val h_os:   u32 = tgt.host_os_id();
+    val h_arch: u32 = tgt.host_arch_id();
     var k: u32 = 0;
     for (k < c.target_count) {
         val os_opt: Option[str] = intern.lookup(i, c.targets[k].os_name);
@@ -949,7 +931,10 @@ fun select_target(p: *Project, t: *TargetEntry) Result[bool, str] {
     if (is_err[intern.StrId, str](rcn)) { ret err[bool, str](unwrap_err[intern.StrId, str](rcn)); }
     p.compiler_name = unwrap_ok[intern.StrId, str](rcn);
 
-    val rcv: Result[intern.StrId, str] = intern.intern(?p.s.interner, "1.2.0");
+    # note: the compiler version literal stays here until #1217 lands the
+    # `$project.version` design, which sources it from the manifest and retires
+    # this hardcoded string. left in place deliberately (see #1258).
+    val rcv: Result[intern.StrId, str] = intern.intern(?p.s.interner, "1.3.0");
     if (is_err[intern.StrId, str](rcv)) { ret err[bool, str](unwrap_err[intern.StrId, str](rcv)); }
     p.compiler_ver = unwrap_ok[intern.StrId, str](rcv);
 
@@ -1271,8 +1256,11 @@ fun parse_module(p: *Project, mid: sess.ModuleId, fqn: intern.StrId) Result[bool
         lexer.dnit(?stream, p.s.alloc);
         ret err[bool, str](unwrap_err[bool, str](le_r));
     }
-    parser.parse(?stream, ?m.a, ?p.s.diags);
+    val fatal: bool = parser.parse(?stream, ?m.a, ?p.s.diags);
     lexer.dnit(?stream, p.s.alloc);
+    # a fatal allocation failure leaves the AST incomplete; refuse to walk it
+    # (the parser already emitted the OOM diagnostic onto the sink).
+    if (fatal) { ret err[bool, str]("out of memory while parsing module"); }
     ret ok[bool, str](true);
 }
 
@@ -1690,30 +1678,100 @@ fun run_resolve_one(p: *Project, mid: sess.ModuleId) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
+# build_resolve_deps: the dependency surface resolve sees for module `m` — its
+# direct deps plus the transitive closure of the modules those deps re-export as
+# a `fwd` module alias. a re-exported module is nameable from `m` (as
+# `dep.alias`), so its exports must be present in the dep set or the re-export
+# resolves to nothing downstream. all closure members are earlier in topo order
+# and thus already resolved.
 fun build_resolve_deps(p: *Project, m: *ModuleEntry) Result[resolve.ResolveDeps, str] {
     var deps: resolve.ResolveDeps;
     deps.entries = nil;
     deps.count   = 0;
     if (m.dep_count == 0) { ret ok[resolve.ResolveDeps, str](deps); }
 
-    val r: Result[*resolve.ModuleExports, str] = allocate[resolve.ModuleExports](p.s.alloc, m.dep_count::usize);
-    if (is_err[*resolve.ModuleExports, str](r)) { ret err[resolve.ResolveDeps, str](unwrap_err[*resolve.ModuleExports, str](r)); }
-    deps.entries = unwrap_ok[*resolve.ModuleExports, str](r);
-    deps.count   = m.dep_count;
+    val vr: Result[*bool, str] = allocate[bool](p.s.alloc, p.module_len::usize);
+    if (is_err[*bool, str](vr)) { ret err[resolve.ResolveDeps, str](unwrap_err[*bool, str](vr)); }
+    val visited: *bool = unwrap_ok[*bool, str](vr);
+    var vi: u32 = 0;
+    for (vi < p.module_len) { visited[vi] = false; vi = vi + 1; }
+
+    val lr: Result[*sess.ModuleId, str] = allocate[sess.ModuleId](p.s.alloc, p.module_len::usize);
+    if (is_err[*sess.ModuleId, str](lr)) {
+        deallocate[bool](p.s.alloc, visited, p.module_len::usize);
+        ret err[resolve.ResolveDeps, str](unwrap_err[*sess.ModuleId, str](lr));
+    }
+    val list: *sess.ModuleId = unwrap_ok[*sess.ModuleId, str](lr);
+    var list_len: u32 = 0;
 
     var i: u32 = 0;
     for (i < m.dep_count) {
-        val dep_id: sess.ModuleId = m.deps[i];
+        val d: sess.ModuleId = m.deps[i];
+        if (d::u32 < p.module_len && !visited[d::u32]) {
+            visited[d::u32] = true;
+            list[list_len] = d;
+            list_len = list_len + 1;
+        }
+        i = i + 1;
+    }
+
+    var head: u32 = 0;
+    for (head < list_len) {
+        add_reexport_targets(p, list[head], visited, list, ?list_len);
+        head = head + 1;
+    }
+
+    val r: Result[*resolve.ModuleExports, str] = allocate[resolve.ModuleExports](p.s.alloc, list_len::usize);
+    if (is_err[*resolve.ModuleExports, str](r)) {
+        deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
+        deallocate[bool](p.s.alloc, visited, p.module_len::usize);
+        ret err[resolve.ResolveDeps, str](unwrap_err[*resolve.ModuleExports, str](r));
+    }
+    deps.entries = unwrap_ok[*resolve.ModuleExports, str](r);
+    deps.count   = list_len;
+
+    var k: u32 = 0;
+    for (k < list_len) {
+        val dep_id: sess.ModuleId = list[k];
         val dep:    *ModuleEntry = ?p.modules[dep_id::u32];
         val mx_r: Result[resolve.ModuleExports, str] = build_module_exports(p, dep_id, dep);
         if (is_err[resolve.ModuleExports, str](mx_r)) {
             free_resolve_deps(p.s.alloc, ?deps);
+            deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
+            deallocate[bool](p.s.alloc, visited, p.module_len::usize);
             ret err[resolve.ResolveDeps, str](unwrap_err[resolve.ModuleExports, str](mx_r));
         }
-        deps.entries[i] = unwrap_ok[resolve.ModuleExports, str](mx_r);
+        deps.entries[k] = unwrap_ok[resolve.ModuleExports, str](mx_r);
+        k = k + 1;
+    }
+
+    deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
+    deallocate[bool](p.s.alloc, visited, p.module_len::usize);
+    ret ok[resolve.ResolveDeps, str](deps);
+}
+
+# add_reexport_targets: append every module that `mid` re-exports as a `fwd`
+# module alias — a pub SYM_USE among its resolved symbols, whose slot names the
+# target module — to `list`, marking each in `visited` so the closure never
+# revisits a module.
+fun add_reexport_targets(p: *Project, mid: sess.ModuleId, visited: *bool, list: *sess.ModuleId, list_len: *u32) {
+    val dep: *ModuleEntry = ?p.modules[mid::u32];
+    if (!dep.resolved) { ret; }
+    val rr: *resolve.ResolveResult = ?dep.resolve_result;
+    if (rr.symbols == nil) { ret; }
+    var i: u32 = 0;
+    for (i < rr.pub_count) {
+        val s: *resolve.Symbol = ?rr.symbols[i];
+        if (s.kind == resolve.SYM_USE) {
+            val tgt: sess.ModuleId = s.slot::sess.ModuleId;
+            if (tgt::u32 < p.module_len && !visited[tgt::u32]) {
+                visited[tgt::u32] = true;
+                list[@list_len] = tgt;
+                @list_len = @list_len + 1;
+            }
+        }
         i = i + 1;
     }
-    ret ok[resolve.ResolveDeps, str](deps);
 }
 
 fun build_module_exports(p: *Project, dep_id: sess.ModuleId, dep: *ModuleEntry) Result[resolve.ModuleExports, str] {
@@ -1737,6 +1795,7 @@ fun build_module_exports(p: *Project, dep_id: sess.ModuleId, dep: *ModuleEntry) 
         ps.kind   = sym.kind;
         ps.name   = sym.name;
         ps.decl   = sym.decl;
+        ps.slot   = sym.slot;
         ps.origin = sym.origin;
         syms[i] = ps;
         i = i + 1;

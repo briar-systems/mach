@@ -88,7 +88,6 @@ fwd ctxm.field_table_begin;
 fwd ctxm.field_table_push;
 fwd ctxm.field_table_for;
 fwd ctxm.field_lookup;
-fwd ctxm.next_anon_ordinal;
 
 # sema: runs semantic analysis on one module, allocating the three parallel TypeId arrays, resolving every syntactic type, computing every decl's declared type, then walking every decl body inferring and checking expressions; diagnostics are pushed into the session and sema does not halt on errors.
 # ---
@@ -177,7 +176,6 @@ fun init_context(
     sc.type_resolved_ty = nil;
     sc.decl_type        = nil;
 
-    sc.anon_counter = 0;
     sc.callee_eid   = id.EXPR_NIL;
 
     if (a.expr_len > 0) {
@@ -373,10 +371,15 @@ fun test_return_type(sc: *ctxm.SemaContext) type.TypeId {
 # declared (or inferred) type recorded in decl_type by the decl-type pass.
 fun infer_binding_init(sc: *ctxm.SemaContext, did: id.DeclId, d: *decl.Decl) Result[bool, str] {
     if (d.data.bind.init == id.EXPR_NIL) { ret ok[bool, str](true); }
+    # an unannotated binding's initializer was already inferred — and any error
+    # in it already reported — by the decl-type pass, which records its type in
+    # decl_type and expr_type. re-inferring here would duplicate every
+    # diagnostic verbatim, so only an annotated binding (whose decl pass never
+    # walked the initializer) needs the body-pass infer-and-check.
+    if (d.data.bind.ty == id.TYPE_NIL) { ret ok[bool, str](true); }
     val actual: type.TypeId = infer.infer_expr(sc, d.data.bind.init);
     val expected: type.TypeId = sc.decl_type[did];
-    if (expected != type.TYPE_NIL && expected != type.TYPE_ERROR
-        && actual != type.TYPE_ERROR && d.data.bind.ty != id.TYPE_NIL) {
+    if (expected != type.TYPE_NIL && expected != type.TYPE_ERROR && actual != type.TYPE_ERROR) {
         check_binding(sc, expected, d.data.bind.init, actual, d.span);
     }
     ret ok[bool, str](true);
@@ -563,10 +566,24 @@ fun check_comptime_gate(sc: *ctxm.SemaContext, eid: id.ExprId) {
         ret;
     }
 
-    # literals and `$mach.*` comptime paths fold directly.
+    # literals fold directly.
     if (k == expr.EXPR_KIND_LIT_INT || k == expr.EXPR_KIND_LIT_FLOAT
-     || k == expr.EXPR_KIND_LIT_CHAR || k == expr.EXPR_KIND_LIT_STR
-     || k == expr.EXPR_KIND_COMPTIME_IDENT) {
+     || k == expr.EXPR_KIND_LIT_CHAR || k == expr.EXPR_KIND_LIT_STR) {
+        ret;
+    }
+
+    # a bare `$ident` is only comptime-foldable when the evaluator accepts it
+    # (today: a `$mach.*` path; a single-segment `$mach` or a `$param` reference
+    # is not). fold-test it so an unfoldable one is reported here with a span
+    # rather than aborting lowering with a span-less `comptime path root must be
+    # $mach` error. a standalone bare `$ident` is not one of the four comptime
+    # channel shapes; its semantics remain the open `$ident` design question
+    # tracked in #1249.
+    if (k == expr.EXPR_KIND_COMPTIME_IDENT) {
+        val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
+        if (is_err[comptime.CTValue, str](ev)) {
+            ctxm.report(sc, e.span, "comptime `$if` gate is not a compile-time constant");
+        }
         ret;
     }
 
@@ -583,11 +600,21 @@ fun check_comptime_gate(sc: *ctxm.SemaContext, eid: id.ExprId) {
             ret;
         }
         # a `val` / imported binding is foldable ONLY if it actually resolves to a
-        # comptime constant — a runtime block-local `val n = f();` is SYM_VAL but
-        # not foldable. test by folding it through the comptime evaluator.
+        # comptime constant. a runtime block-local `val n = f();` is SYM_VAL but
+        # not foldable — and the comptime env is name-keyed, so folding it would
+        # spuriously succeed against a same-named MODULE const it shadows (a real
+        # miscompile of the gate). decide on resolution identity first: only a
+        # module-scope val (or an import) reaches the fold test; a block-local val
+        # is rejected outright regardless of any name collision.
         if (sym.kind == resolve.SYM_VAL || sym.kind == resolve.SYM_IMPORTED) {
+            val is_module: bool = sym.kind == resolve.SYM_IMPORTED
+                                || (sym.flags & resolve.SYM_FLAG_MODULE) != 0;
+            if (!is_module) {
+                ctxm.report(sc, e.span, "comptime `$if` gate cannot reference a runtime value");
+                ret;
+            }
             val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
-            if (is_err[comptime.CTValue, str](ev) && !arg_names_module_const_sym(sym)) {
+            if (is_err[comptime.CTValue, str](ev) && !check.imported_module_const_sym(sc, sym)) {
                 ctxm.report(sc, e.span, "comptime `$if` gate cannot reference a runtime value");
             }
             ret;
@@ -602,7 +629,7 @@ fun check_comptime_gate(sc: *ctxm.SemaContext, eid: id.ExprId) {
         val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
         if (is_err[comptime.CTValue, str](ev)) {
             val so: Option[*resolve.Symbol] = ctxm.symbol_for_expr(sc, eid);
-            if (is_none[*resolve.Symbol](so) || !arg_names_module_const_sym(unwrap[*resolve.Symbol](so))) {
+            if (is_none[*resolve.Symbol](so) || !check.imported_module_const_sym(sc, unwrap[*resolve.Symbol](so))) {
                 ctxm.report(sc, e.span, "comptime `$if` gate is not a compile-time constant");
             }
         }
@@ -613,13 +640,6 @@ fun check_comptime_gate(sc: *ctxm.SemaContext, eid: id.ExprId) {
     # gate. report against the whole subexpression.
     ctxm.report(sc, e.span, "comptime `$if` gate is not a compile-time constant");
     ret;
-}
-
-# reports whether a symbol names a module-origin constant (an import, or a
-# module-level `val`) whose value lives in the defining module's comptime context
-# — foldable at lowering even when sema cannot fold it here.
-fun arg_names_module_const_sym(sym: *resolve.Symbol) bool {
-    ret sym.kind == resolve.SYM_IMPORTED;
 }
 
 # types a local val/var: records its declared (or inferred) type in
@@ -674,9 +694,10 @@ fun check_return_stmt(sc: *ctxm.SemaContext, ret_ty: type.TypeId, value: id.Expr
 }
 
 # evaluates a comptime-branch condition through the shared comptime
-# evaluator. an empty cond (`$or { }`) is the unconditional final arm;
-# evaluation failures and non-bool results report a diagnostic and yield
-# false (the arm is treated as inactive).
+# evaluator. an empty cond (`$or { }`) is the unconditional final arm; an
+# evaluation failure or a non-bool result yields false (the arm is treated as
+# inactive) without a diagnostic — resolve's matching check runs first and
+# already reported it, so reporting again here would duplicate it.
 fun comptime_branch_active(sc: *ctxm.SemaContext, br: *decl.ComptimeBranch) Result[bool, str] {
     if (br.cond == id.EXPR_NIL) { ret ok[bool, str](true); }
     val r: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, br.cond, ?sc.s.interner);
@@ -699,7 +720,9 @@ fun build_result(sc: *ctxm.SemaContext) Result[ctxm.SemaResult, str] {
     out.decl_count       = sc.a.decl_len::u32;
 
     # ownership of the three parallel arrays passes to the result; clear the
-    # context handles so dnit_context releases only the field-table storage.
+    # context handles so they are not double-freed (dnit_context frees exactly
+    # these arrays — the field tables it once owned now live in the
+    # session-global type interner and outlive the context).
     sc.expr_type        = nil;
     sc.type_resolved_ty = nil;
     sc.decl_type        = nil;

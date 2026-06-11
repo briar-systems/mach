@@ -92,6 +92,13 @@ pub val SYM_FLAG_PUB: u8 = 1;
 # SYM_FLAG_COMPTIME: comptime-flag bit, set on a SYM_PARAM declared with a leading `$` (comptime value parameter).
 pub val SYM_FLAG_COMPTIME: u8 = 2;
 
+# SYM_FLAG_MODULE: module-scope bit, set on every symbol declared at module
+# scope. distinguishes a module-level `val` (a comptime-foldable constant whose
+# name is unique in its module) from a block-local `val` that merely shares a
+# name with one, so the comptime-gate check folds on resolution identity rather
+# than on name text a shadowing local would spuriously satisfy.
+pub val SYM_FLAG_MODULE: u8 = 4;
+
 # Symbol: a resolved symbol.
 # ---
 # kind:   one of SYM_*
@@ -117,11 +124,15 @@ pub rec Symbol {
 # kind:   one of SYM_*
 # name:   interned identifier
 # decl:   DeclId in the owning module's Ast
+# slot:   kind-dependent payload, mirrored from the source Symbol; for a
+#         re-exported module alias (SYM_USE) it carries the target ModuleId so a
+#         downstream consumer can resolve through the `fwd`
 # origin: ModuleId of the owning module (= the dep this entry came from)
 pub rec PublicSymbol {
     kind:   SymKind;
     name:   intern.StrId;
     decl:   id.DeclId;
+    slot:   u32;
     origin: sess.ModuleId;
 }
 
@@ -220,6 +231,9 @@ val PRIM_COUNT: u32 = 12;
 # expr_count:    length of expr_resolved (= ast.expr_len), for teardown
 # type_count:    length of type_resolved (= ast.type_len), for teardown
 # decl_count:    length of decl_symbol (= ast.decl_len), for teardown
+# param_index:   (decl::u64 << 32 | slot) -> SymbolId for every SYM_PARAM, so a
+#                consumer resolves a function parameter by (owning decl, ordinal)
+#                in O(1) instead of scanning the whole symbol universe per param
 pub rec ResolveResult {
     alloc:         *Allocator;
     symbols:       *Symbol;
@@ -231,6 +245,23 @@ pub rec ResolveResult {
     expr_count:    u32;
     type_count:    u32;
     decl_count:    u32;
+
+    param_index:   map.Map[u64, SymbolId];
+}
+
+# param_symbol: the SymbolId of function `decl`'s parameter at ordinal `slot`,
+# or SYMBOL_NIL when no such parameter exists. resolves through `param_index`
+# in O(1).
+# ---
+# r:    the resolve result
+# decl: the function declaration owning the parameter
+# slot: the parameter ordinal
+# ret:  the parameter's SymbolId, or SYMBOL_NIL
+pub fun param_symbol(r: *ResolveResult, decl: id.DeclId, slot: u32) SymbolId {
+    var key: u64 = (decl::u64 << 32) | slot::u64;
+    val g: Result[*SymbolId, str] = map.get[u64, SymbolId](?r.param_index, ?key);
+    if (is_ok[*SymbolId, str](g)) { ret @unwrap_ok[*SymbolId, str](g); }
+    ret SYMBOL_NIL;
 }
 
 # dnit_result: releases every array owned by the result and zeroes its fields.
@@ -250,6 +281,7 @@ pub fun dnit_result(r: *ResolveResult) {
     if (r.decl_symbol != nil) {
         deallocate[SymbolId](r.alloc, r.decl_symbol, r.decl_count::usize);
     }
+    map.dnit[u64, SymbolId](?r.param_index);
     r.symbols       = nil;
     r.symbol_count  = 0;
     r.pub_count     = 0;
@@ -363,8 +395,13 @@ fun init_context(
 
     rc.imported_cache = map.init[u64, SymbolId](s.alloc, map.hash_u64, map.eq_u64);
 
+    # every allocation past this point is owned by the context; on a failure
+    # dnit_context tears down whatever has been allocated so far (the array
+    # handles are nil and the cache is initialised), leaving no partial state
+    # leaked on the OOM path.
     val sa: Result[*Symbol, str] = allocate[Symbol](s.alloc, INITIAL_SYMBOLS_CAP::usize);
     if (is_err[*Symbol, str](sa)) {
+        dnit_context(rc);
         ret err[bool, str](unwrap_err[*Symbol, str](sa));
     }
     rc.symbols = unwrap_ok[*Symbol, str](sa);
@@ -372,9 +409,7 @@ fun init_context(
 
     val sca: Result[*Scope, str] = allocate[Scope](s.alloc, INITIAL_SCOPES_CAP::usize);
     if (is_err[*Scope, str](sca)) {
-        deallocate[Symbol](s.alloc, rc.symbols, rc.sym_cap::usize);
-        rc.symbols = nil;
-        rc.sym_cap = 0;
+        dnit_context(rc);
         ret err[bool, str](unwrap_err[*Scope, str](sca));
     }
     rc.scopes    = unwrap_ok[*Scope, str](sca);
@@ -382,19 +417,19 @@ fun init_context(
 
     if (a.expr_len > 0) {
         val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.expr_len);
-        if (is_err[*SymbolId, str](r)) { ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
+        if (is_err[*SymbolId, str](r)) { dnit_context(rc); ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
         rc.expr_resolved = unwrap_ok[*SymbolId, str](r);
         fill_nil(rc.expr_resolved, a.expr_len::u32);
     }
     if (a.type_len > 0) {
         val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.type_len);
-        if (is_err[*SymbolId, str](r)) { ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
+        if (is_err[*SymbolId, str](r)) { dnit_context(rc); ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
         rc.type_resolved = unwrap_ok[*SymbolId, str](r);
         fill_nil(rc.type_resolved, a.type_len::u32);
     }
     if (a.decl_len > 0) {
         val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.decl_len);
-        if (is_err[*SymbolId, str](r)) { ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
+        if (is_err[*SymbolId, str](r)) { dnit_context(rc); ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
         rc.decl_symbol = unwrap_ok[*SymbolId, str](r);
         fill_nil(rc.decl_symbol, a.decl_len::u32);
     }
@@ -691,10 +726,10 @@ fun declare_decl(rc: *ResolveContext, kind: SymKind, flags: u8, name_span: token
 }
 
 fun symbol_flags_from(decl_flags: u8, at_module_scope: bool) u8 {
-    if (at_module_scope && (decl_flags & decl.DECL_FLAG_PUB) != 0) {
-        ret SYM_FLAG_PUB;
-    }
-    ret 0;
+    if (!at_module_scope) { ret 0; }
+    var f: u8 = SYM_FLAG_MODULE;
+    if ((decl_flags & decl.DECL_FLAG_PUB) != 0) { f = f | SYM_FLAG_PUB; }
+    ret f;
 }
 
 # binds a module-level comptime-evaluable val into the module frame. idempotent:
@@ -850,15 +885,24 @@ fun bind_imported_symbol(rc: *ResolveContext, decl_id: id.DeclId, bind_span: tok
     ret ok[bool, str](true);
 }
 
-# returns a SYM_IMPORTED SymbolId for `ps`, reusing the cached one when an
-# earlier use-site already imported the same (origin, decl) pair.
+# returns a Symbol for `ps`, reusing the cached one when an earlier use-site
+# already imported the same (origin, decl) pair. an ordinary export degrades to
+# a plain SYM_IMPORTED reference; a re-exported module alias (SYM_USE) keeps its
+# kind and target-module slot so a downstream consumer can resolve through the
+# `fwd` (the slot is a project-wide ModuleId, shared across the one build).
 fun imported_symbol_for(rc: *ResolveContext, ps: *PublicSymbol) Result[SymbolId, str] {
     val key: u64 = (ps.origin::u64 << 32) | ps.decl::u64;
     val cached: Result[*SymbolId, str] = map.get[u64, SymbolId](?rc.imported_cache, ?key);
     if (is_ok[*SymbolId, str](cached)) {
         ret ok[SymbolId, str](@unwrap_ok[*SymbolId, str](cached));
     }
-    val r: Result[SymbolId, str] = add_symbol(rc, SYM_IMPORTED, 0, ps.name, ps.decl, 0, ps.origin);
+    var kind: SymKind = SYM_IMPORTED;
+    var slot: u32     = 0;
+    if (ps.kind == SYM_USE) {
+        kind = SYM_USE;
+        slot = ps.slot;
+    }
+    val r: Result[SymbolId, str] = add_symbol(rc, kind, 0, ps.name, ps.decl, slot, ps.origin);
     if (is_err[SymbolId, str](r)) { ret r; }
     val sid: SymbolId = unwrap_ok[SymbolId, str](r);
     val ins: Result[bool, str] = map.insert[u64, SymbolId](?rc.imported_cache, key, sid);
@@ -976,7 +1020,11 @@ fun bind_member_qualified(rc: *ResolveContext, eid: id.ExprId, member: *expr.Exp
         ret ok[bool, str](true);
     }
 
-    val r_sym: Result[SymbolId, str] = add_symbol(rc, SYM_IMPORTED, 0, leaf_id, ps.decl, 0, ps.origin);
+    # reuse the imported-symbol cache instead of minting a fresh Symbol per
+    # qualified reference, the exact use-case the cache documents; this also
+    # preserves a re-exported module alias as SYM_USE so `alias.member` chains
+    # through a `fwd`.
+    val r_sym: Result[SymbolId, str] = imported_symbol_for(rc, ps);
     if (is_err[SymbolId, str](r_sym)) { ret err[bool, str](unwrap_err[SymbolId, str](r_sym)); }
     rc.expr_resolved[eid] = unwrap_ok[SymbolId, str](r_sym);
     ret ok[bool, str](true);
@@ -1216,6 +1264,18 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
     var bi: u32 = 0;
     for (bi < branches_len) {
         val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[branches_start + bi];
+        # resolve the gate's identifiers before folding it, recording each leaf's
+        # resolution identity, then reject any leaf whose binding the name-keyed
+        # fold would silently misread (a runtime local/param shadowing a comptime
+        # constant). eval failures themselves are reported by
+        # comptime_branch_active; this check covers exactly the case where the
+        # fold SUCCEEDS against the wrong binding.
+        if (br.cond != id.EXPR_NIL) {
+            val rce: Result[bool, str] = bind_expr(rc, br.cond);
+            if (is_err[bool, str](rce)) { ret rce; }
+            val rcs: Result[bool, str] = check_gate_shadowing(rc, br.cond);
+            if (is_err[bool, str](rcs)) { ret rcs; }
+        }
         val take_r: Result[bool, str] = comptime_branch_active(rc, br);
         if (is_err[bool, str](take_r)) { ret take_r; }
         if (unwrap_ok[bool, str](take_r)) {
@@ -1227,6 +1287,55 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
         bi = bi + 1;
     }
     ret ok[bool, str](true);
+}
+
+# check_gate_shadowing: walks a folded (non-param) `$if` gate and rejects any
+# leaf identifier that resolves to a runtime binding whose NAME also names a
+# comptime constant in the env. the comptime fold is name-keyed, so such a gate
+# folds against the constant while the resolver bound the ident to the runtime
+# local / parameter — a silent wrong-arm miscompile. a runtime ident whose name
+# is not in the env is left alone: the fold fails on it and
+# comptime_branch_active reports that failure, so reporting here would
+# duplicate it. reports at the offending leaf's span.
+fun check_gate_shadowing(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
+    if (eid == id.EXPR_NIL) { ret ok[bool, str](true); }
+    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret ok[bool, str](true); }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+
+    if (e.kind == expr.EXPR_KIND_BINARY) {
+        val rl: Result[bool, str] = check_gate_shadowing(rc, e.data.binary.lhs);
+        if (is_err[bool, str](rl)) { ret rl; }
+        ret check_gate_shadowing(rc, e.data.binary.rhs);
+    }
+    if (e.kind == expr.EXPR_KIND_UNARY) {
+        ret check_gate_shadowing(rc, e.data.unary.operand);
+    }
+    if (e.kind != expr.EXPR_KIND_IDENT) { ret ok[bool, str](true); }
+
+    if (rc.expr_resolved == nil) { ret ok[bool, str](true); }
+    val sid: SymbolId = rc.expr_resolved[eid];
+    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret ok[bool, str](true); }
+    val sym: *Symbol = ?rc.symbols[sid];
+
+    # runtime by resolution identity: a block-local val/var, or a non-`$`
+    # parameter. module-scope vals, imports, and comptime params are foldable.
+    var runtime: bool = false;
+    if (sym.kind == SYM_VAL || sym.kind == SYM_VAR) {
+        runtime = (sym.flags & SYM_FLAG_MODULE) == 0;
+    }
+    if (sym.kind == SYM_PARAM) {
+        runtime = (sym.flags & SYM_FLAG_COMPTIME) == 0;
+    }
+    if (!runtime) { ret ok[bool, str](true); }
+
+    val id_r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
+    if (is_err[intern.StrId, str](id_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](id_r)); }
+    val nc: Option[*comptime.NamedConst] = comptime.lookup(rc.ctx, unwrap_ok[intern.StrId, str](id_r));
+    if (is_none[*comptime.NamedConst](nc)) { ret ok[bool, str](true); }
+
+    ret diag.error(?rc.s.diags, rc.a.file_id, e.span,
+        "comptime branch condition references a runtime binding that shadows a comptime constant");
 }
 
 # reports whether any arm gate of a `$if` chain references a comptime value
@@ -1515,6 +1624,14 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
         ret bind_expr(rc, e.data.unary.operand);
     }
     if (e.kind == expr.EXPR_KIND_CALL) {
+        # a provisional bracket call `callee[x](args)` whose payload read as both
+        # a type list and an index expression: choose the reading now from the
+        # callee's resolved kind and canonicalize the node before ordinary call
+        # binding sees it.
+        if (e.data.call.index_callee != id.EXPR_NIL) {
+            ret resolve_bracket_call(rc, eid);
+        }
+
         # a comptime value intrinsic (`$size_of`/`$align_of`/`$offset_of`) takes
         # a type-naming first argument (and, for `$offset_of`, a bare field name)
         # rather than value expressions, so it binds its arguments specially.
@@ -1530,14 +1647,7 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
             val rc_e: Result[bool, str] = bind_expr(rc, e.data.call.callee);
             if (is_err[bool, str](rc_e)) { ret rc_e; }
         }
-        var ti: u32 = 0;
-        for (ti < e.data.call.type_args_len) {
-            val arg_id: id.TypeId = rc.a.type_ids[e.data.call.type_args_start + ti];
-            val rt: Result[bool, str] = bind_type(rc, arg_id);
-            if (is_err[bool, str](rt)) { ret rt; }
-            ti = ti + 1;
-        }
-        ret bind_expr_list(rc, e.data.call.args_start, e.data.call.args_len);
+        ret bind_generic_call(rc, e.data.call.type_args_start, e.data.call.type_args_len, e.data.call.args_start, e.data.call.args_len);
     }
     if (e.kind == expr.EXPR_KIND_INDEX) {
         val ro: Result[bool, str] = bind_expr(rc, e.data.index.object);
@@ -1583,6 +1693,98 @@ fun bind_expr_list(rc: *ResolveContext, start: u32, len: u32) Result[bool, str] 
         i = i + 1;
     }
     ret ok[bool, str](true);
+}
+
+# resolves a provisional bracket call `callee[x](args)` (ExprCall.index_callee
+# set) that the parser could not classify: `[x]` read as both a type-argument
+# list and an index expression. the choice is the callee's resolved kind — a
+# function, type, or imported name takes the type arguments (a generic call); a
+# value, or any non-name callee, makes `[x]` an index (index-then-call). the
+# node is canonicalized to the chosen shape (index_callee cleared) and its parts
+# bound exactly once, so sema sees an ordinary generic call or index-then-call.
+fun resolve_bracket_call(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
+    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("ExprId out of range"); }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+
+    val callee:          id.ExprId = e.data.call.callee;
+    val index_callee:    id.ExprId = e.data.call.index_callee;
+    val type_args_start: u32       = e.data.call.type_args_start;
+    val type_args_len:   u32       = e.data.call.type_args_len;
+    val args_start:      u32       = e.data.call.args_start;
+    val args_len:        u32       = e.data.call.args_len;
+
+    # a provisional node always carries at least one type argument (the type
+    # reading) alongside its index reading, so the type-argument reading wins for
+    # the variadic intrinsics (`va_arg[T](ap)`), whose callee is a builtin name
+    # rather than a bindable symbol and is left unbound, exactly as in an
+    # ordinary va call.
+    if (is_va_intrinsic_callee(rc, callee)) {
+        e.data.call.index_callee = id.EXPR_NIL;
+        ret bind_generic_call(rc, type_args_start, type_args_len, args_start, args_len);
+    }
+
+    # bind the callee once and read its kind: a function, type, or imported name
+    # takes the type arguments; anything else (a value, an index/call result, or
+    # an unresolved name) makes the bracket an index.
+    val rc_e: Result[bool, str] = bind_expr(rc, callee);
+    if (is_err[bool, str](rc_e)) { ret rc_e; }
+
+    if (callee_accepts_type_args(rc, callee)) {
+        # generic call: drop the index reading and bind the type arguments.
+        # `e` stays valid — resolve binding never appends to ast.exprs.
+        e.data.call.index_callee = id.EXPR_NIL;
+        ret bind_generic_call(rc, type_args_start, type_args_len, args_start, args_len);
+    }
+
+    # index-then-call: the effective callee is the pre-built `INDEX(callee, x)`,
+    # whose object (the now-bound callee) needs no rebinding. bind the subscript,
+    # then canonicalize the call onto the index.
+    val idx_opt: Option[*expr.Expr] = ast.get_expr(rc.a, index_callee);
+    if (is_none[*expr.Expr](idx_opt)) { ret err[bool, str]("ExprId out of range"); }
+    val idxn: *expr.Expr = unwrap[*expr.Expr](idx_opt);
+    val rs: Result[bool, str] = bind_expr(rc, idxn.data.index.index);
+    if (is_err[bool, str](rs)) { ret rs; }
+
+    e.data.call.callee          = index_callee;
+    e.data.call.index_callee    = id.EXPR_NIL;
+    e.data.call.type_args_start = 0;
+    e.data.call.type_args_len   = 0;
+    ret bind_expr_list(rc, args_start, args_len);
+}
+
+# binds a generic call's type arguments and value arguments — the tail shared by
+# the ordinary call path and a provisional bracket call resolved to a generic
+# call.
+fun bind_generic_call(rc: *ResolveContext, type_args_start: u32, type_args_len: u32, args_start: u32, args_len: u32) Result[bool, str] {
+    var ti: u32 = 0;
+    for (ti < type_args_len) {
+        val arg_id: id.TypeId = rc.a.type_ids[type_args_start + ti];
+        val rt: Result[bool, str] = bind_type(rc, arg_id);
+        if (is_err[bool, str](rt)) { ret rt; }
+        ti = ti + 1;
+    }
+    ret bind_expr_list(rc, args_start, args_len);
+}
+
+# true when a provisional bracket call's callee resolves to a name that can take
+# generic type arguments (a function, type, or imported symbol). a value callee
+# — or a non-name callee such as an index or call result — means the bracket was
+# an index. an unresolved name returns false so the index reading is taken and
+# the single unresolved diagnostic from binding the callee is not compounded by
+# spurious type-argument errors.
+fun callee_accepts_type_args(rc: *ResolveContext, callee: id.ExprId) bool {
+    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, callee);
+    if (is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+    if (e.kind != expr.EXPR_KIND_IDENT && e.kind != expr.EXPR_KIND_MEMBER) { ret false; }
+    if (rc.expr_resolved == nil) { ret false; }
+    val sid: SymbolId = rc.expr_resolved[callee];
+    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret false; }
+    val sym: *Symbol = ?rc.symbols[sid];
+    ret sym.kind == SYM_FUN || sym.kind == SYM_REC || sym.kind == SYM_UNI
+     || sym.kind == SYM_DEF || sym.kind == SYM_GENERIC || sym.kind == SYM_PRIM
+     || sym.kind == SYM_IMPORTED;
 }
 
 fun bind_ident(rc: *ResolveContext, eid: id.ExprId, span: token.Span) Result[bool, str] {
@@ -1752,11 +1954,9 @@ fun comptime_intrinsic_kind(rc: *ResolveContext, callee: id.ExprId) u8 {
     if (is_none[*expr.Expr](ce_opt)) { ret 0; }
     val ce: *expr.Expr = unwrap[*expr.Expr](ce_opt);
     if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret 0; }
-    if (ce.span.len <= 1) { ret 0; }
 
-    var ns: token.Span = ce.span;
-    ns.offset = ns.offset + 1;
-    ns.len    = ns.len - 1;
+    val ns: token.Span = comptime.comptime_ident_name(ce.span);
+    if (ns.len == 0) { ret 0; }
     val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, ns);
     if (is_err[intern.StrId, str](r)) { ret 0; }
     val name: intern.StrId = unwrap_ok[intern.StrId, str](r);
@@ -2071,6 +2271,25 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
 
     if (remap != nil) { deallocate[u32](rc.s.alloc, remap, rc.sym_len::usize); }
 
+    # index every parameter by (owning decl, ordinal) over the final symbol
+    # array, so lowering resolves a parameter symbol in O(1) rather than scanning
+    # the whole universe per parameter.
+    var param_index: map.Map[u64, SymbolId] = map.init[u64, SymbolId](rc.s.alloc, map.hash_u64, map.eq_u64);
+    var pk: u32 = 0;
+    for (pk < rc.sym_len) {
+        if (out_syms[pk].kind == SYM_PARAM) {
+            val key: u64 = (out_syms[pk].decl::u64 << 32) | out_syms[pk].slot::u64;
+            val ins: Result[bool, str] = map.insert[u64, SymbolId](?param_index, key, pk);
+            if (is_err[bool, str](ins)) {
+                map.dnit[u64, SymbolId](?param_index);
+                deallocate[Symbol](rc.s.alloc, out_syms, rc.sym_len::usize);
+                dnit_context(rc);
+                ret err[ResolveResult, str](unwrap_err[bool, str](ins));
+            }
+        }
+        pk = pk + 1;
+    }
+
     var out: ResolveResult;
     out.alloc         = rc.s.alloc;
     out.symbols       = out_syms;
@@ -2082,6 +2301,7 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
     out.expr_count    = rc.a.expr_len::u32;
     out.type_count    = rc.a.type_len::u32;
     out.decl_count    = rc.a.decl_len::u32;
+    out.param_index   = param_index;
 
     rc.expr_resolved = nil;
     rc.type_resolved = nil;
