@@ -17,6 +17,7 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.char.char;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.option.Option;
 use std.types.option.none;
 use std.types.option.is_none;
@@ -34,6 +35,8 @@ use std.allocator.deallocate;
 use std.allocator.reallocate;
 
 use intern:   mach.lang.intern;
+use diag:     mach.lang.diagnostic;
+use token:    mach.lang.fe.token;
 
 use ast:      mach.lang.fe.ast;
 use aid:      mach.lang.fe.ast.id;
@@ -386,7 +389,7 @@ fun lower_asm(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
     payload.bind_count = 0;
     payload.bind_cap   = 0;
 
-    val br: Result[bool, str] = collect_asm_binds(ctx, body_id, ?payload);
+    val br: Result[bool, str] = collect_asm_binds(ctx, body_id, s.data.asm_.body, ?payload);
     if (is_err[bool, str](br)) {
         if (payload.binds != nil) { deallocate[ir.IrAsmBind](ctx.s.alloc, payload.binds, payload.bind_cap::usize); }
         ret br;
@@ -407,12 +410,44 @@ fun lower_asm(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
+# report_asm: file a located error at the asm body `span` and return the
+# REPORTED sentinel so the driver shows a single file:line:col diagnostic.
+fun report_asm(ctx: *lower.LowerContext, span: token.Span, message: str) Result[bool, str] {
+    diag.error(?ctx.s.diags, ctx.a.file_id, span, message);
+    ret err[bool, str](lower.REPORTED);
+}
+
+# report_asm_named: report_asm with the interned `name_id` interpolated between
+# `prefix` and `suffix`. degrades to `prefix` alone on any lookup/alloc failure.
+fun report_asm_named(ctx: *lower.LowerContext, span: token.Span, prefix: str, name_id: intern.StrId, suffix: str) Result[bool, str] {
+    val no: Option[str] = intern.lookup(?ctx.s.interner, name_id);
+    if (is_none[str](no)) { ret report_asm(ctx, span, prefix); }
+    val nm: str = unwrap[str](no);
+
+    val total: usize = str_len(prefix) + str_len(nm) + str_len(suffix);
+    val r: Result[*u8, str] = allocate[u8](ctx.s.alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret report_asm(ctx, span, prefix); }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    var j: usize = 0;
+    for (j < str_len(prefix)) { buf[k] = prefix[j]; k = k + 1; j = j + 1; }
+    j = 0;
+    for (j < str_len(nm)) { buf[k] = nm[j]; k = k + 1; j = j + 1; }
+    j = 0;
+    for (j < str_len(suffix)) { buf[k] = suffix[j]; k = k + 1; j = j + 1; }
+    buf[total] = 0;
+    diag.error(?ctx.s.diags, ctx.a.file_id, span, buf::str);
+    deallocate[u8](ctx.s.alloc, buf, total + 1);
+    ret err[bool, str](lower.REPORTED);
+}
+
 # scans an inline-asm body for `{name}` references and records each as a
 # `{name}` -> alloca binding in `payload.binds`. a name is interned and resolved
 # against the locals in scope (`lookup_local_name`); a duplicate `{name}` is
 # recorded once. an unknown name, or one bound to a non-alloca Value, is a hard
-# error rather than a silently dropped substitution.
-fun collect_asm_binds(ctx: *lower.LowerContext, body_id: intern.StrId, payload: *ir.IrAsm) Result[bool, str] {
+# error rather than a silently dropped substitution. `body_span` locates every
+# diagnostic on the inline-asm body in the source.
+fun collect_asm_binds(ctx: *lower.LowerContext, body_id: intern.StrId, body_span: token.Span, payload: *ir.IrAsm) Result[bool, str] {
     val bopt: Option[str] = intern.lookup(?ctx.s.interner, body_id);
     if (is_none[str](bopt)) { ret err[bool, str]("lower: inline-asm body interning failed"); }
     val body: str = unwrap[str](bopt);
@@ -425,15 +460,15 @@ fun collect_asm_binds(ctx: *lower.LowerContext, body_id: intern.StrId, payload: 
         val name_start: usize = i + 1;
         var j: usize = name_start;
         for (body[j] != 0 && body[j] != '}'::char) { j = j + 1; }
-        if (body[j] == 0) { ret err[bool, str]("lower: unterminated '{' in inline asm body"); }
+        if (body[j] == 0) { ret report_asm(ctx, body_span, "unterminated '{' in inline asm body"); }
         val name_len: usize = j - name_start;
-        if (name_len == 0) { ret err[bool, str]("lower: empty '{}' reference in inline asm body"); }
+        if (name_len == 0) { ret report_asm(ctx, body_span, "empty '{}' in asm body; write '{name}' to reference a local"); }
 
         val nr: Result[intern.StrId, str] = intern.intern_bytes(?ctx.s.interner, (body::usize + name_start)::str, name_len);
         if (is_err[intern.StrId, str](nr)) { ret err[bool, str](unwrap_err[intern.StrId, str](nr)); }
         val name_id: intern.StrId = unwrap_ok[intern.StrId, str](nr);
 
-        val ar: Result[bool, str] = add_asm_bind(ctx, payload, name_id);
+        val ar: Result[bool, str] = add_asm_bind(ctx, body_span, payload, name_id);
         if (is_err[bool, str](ar)) { ret ar; }
 
         i = j + 1;
@@ -445,7 +480,7 @@ fun collect_asm_binds(ctx: *lower.LowerContext, body_id: intern.StrId, payload: 
 # `payload.binds` (once per distinct name). the local's storage Value must be a
 # VAL_INSTR naming the alloca whose slot the back end addresses; anything else
 # (an unbound name, a parameter still in a register, a constant) is rejected.
-fun add_asm_bind(ctx: *lower.LowerContext, payload: *ir.IrAsm, name_id: intern.StrId) Result[bool, str] {
+fun add_asm_bind(ctx: *lower.LowerContext, body_span: token.Span, payload: *ir.IrAsm, name_id: intern.StrId) Result[bool, str] {
     var k: u32 = 0;
     for (k < payload.bind_count) {
         if (payload.binds[k].name == name_id) { ret ok[bool, str](true); }
@@ -454,11 +489,11 @@ fun add_asm_bind(ctx: *lower.LowerContext, payload: *ir.IrAsm, name_id: intern.S
 
     val vopt: Option[value.Value] = lower.lookup_local_name(ctx, name_id);
     if (!is_some[value.Value](vopt)) {
-        ret err[bool, str]("lower: unknown local in inline asm '{name}' reference");
+        ret report_asm_named(ctx, body_span, "unknown local '", name_id, "' in inline asm; only stack-allocated variables in scope can be referenced");
     }
     val v: value.Value = unwrap[value.Value](vopt);
     if (v.kind != value.VAL_INSTR) {
-        ret err[bool, str]("lower: inline-asm '{name}' local has no addressable storage slot");
+        ret report_asm_named(ctx, body_span, "'", name_id, "' is not stack-allocated and cannot be used in inline asm");
     }
 
     if (payload.bind_count == payload.bind_cap) {
