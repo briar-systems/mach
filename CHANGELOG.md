@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-06-11
+
+Correctness and foundations release. A full-compiler audit (125 findings,
+45 confirmed bugs) was executed end to end: every confirmed miscompile is
+fixed, the ABI abstraction boundary is complete ahead of new targets, and
+mixed-numeric comparisons joined the language with value-correct semantics.
+
+### Added
+
+- **Mixed-numeric comparisons**: integer comparisons across any signedness
+  and width are now legal and compare mathematical values, with results
+  identical in both operand orders (`i64`/`u64` lowers to a sign-test plus
+  unsigned compare). Float widths mix exactly; int↔float still requires an
+  explicit cast. Comptime evaluation agrees with runtime semantics on the
+  same boundary cases.
+- Variable-index function-pointer dispatch: `table[i]()` now parses correctly
+  (the bracket payload is resolved against the callee — generic call vs
+  index-then-call — instead of guessed in the parser).
+- C interop, win64 variadic, float-argument, conversion-boundary, comptime/
+  runtime-agreement, and release-verifier integration suites run in CI.
+
+### Fixed
+
+- **Miscompiles**: FP-register interference tracking (swapped float arguments
+  collapsing); win64 callee-saved XMM6–13 never preserved (with full
+  `UWOP_SAVE_XMM128` unwind coverage); inline-asm clobber inference
+  implemented as documented; `u32`→float converting as signed; register
+  `i32`→`i64` sign-extension reading only 16 bits; SysV float-bearing
+  aggregates never classified to SSE registers (C FFI divergence); comptime
+  `u64`-range constants evaluating as negative.
+- The program entrypoint entered every callee with an 8-byte misaligned
+  stack (mach-std v0.4.2) — fatal for C callees using aligned SSE accesses.
+- The IR verifier now verifies: real dominance (near-linear), reachability,
+  operand type agreement, dangling-definition detection; `--release
+  --verify-ir` passes on the full compiler and is enforced in CI.
+- Optimization passes: constant folding no longer crashes the compiler on
+  `INT64_MIN / -1`; dead phis are eliminated; phi simplification unblocks
+  constant propagation across inlining; the inliner refuses call-graph
+  cycles.
+- The ELF/COFF writers and linker fail loudly on unresolved relocation
+  symbols, unknown relocation kinds, and malformed objects; weak/strong
+  symbol resolution is order-independent; section/relocation counts are
+  validated before narrowing.
+- IR teardown frees operand arrays and aggregate blobs by true capacity —
+  correct under any allocator.
+- CLI: `mach run --` argument passthrough, `mach init --name`,
+  `mach build <path>`, a lockfile-writer heap overflow, `--quiet`/`--color`
+  now functional, unified exit/signal handling.
+- Frontend: the grammar holes vs the locked spec (multi-line strings,
+  `val`/`var` forms, integer-literal overflow) are rejected with diagnostics;
+  parser OOM can no longer yield a silently corrupt AST.
+- Generics: cross-module arity checking, deeply nested parameter
+  substitution, `fwd` module re-export, duplicate diagnostics.
+
+### Changed
+
+- The ABI layer is complete and arch-keyed: selection consults (isa, os),
+  classifiers carry an explicit by-reference class, the variadic model is
+  vtable-driven end to end, and the test runner's output primitive comes
+  from the target OS — groundwork for the aarch64 and darwin targets.
+- `mir` is split into per-concern modules (data model, lowering context,
+  IR→MIR core, calling-convention lowering, variadic expansion) with
+  byte-identical output.
+- `mach init` scaffolds mach-std pinned to `branch/main` (v0.4.x); the
+  vendored std is v0.4.2.
+- Object-format writers share a common binary-IO layer.
+
 ## [1.2.0] - 2026-06-10
 
 Native Windows release. `mach.exe` now builds Mach itself on the win64 target
