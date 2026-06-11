@@ -233,11 +233,14 @@ keys. They drive `mach dep`, which fetches a dependency from git into
 `type` (e.g. `"remote"`) is informational — parsed by TOML, read by nothing.
 
 A bare branch/tag name and a 7–40 char hex string are auto-detected as a branch
-and a commit respectively; the explicit `branch/` / `tag/` prefixes remove the
-ambiguity. `mach dep sync` records the resolved commit of every git-fetched dep
-in `mach.lock`, and honours that lockfile on the next sync for reproducible
-builds. A hand-vendored tree or a git submodule under `<dir_dep>` (anything
-`mach dep` did not clone) is left untouched and excluded from the lockfile.
+and a commit respectively; the explicit `branch/` / `tag/` / `commit/` prefixes
+remove the ambiguity. `mach dep pull` records the resolved commit of every
+git-fetched dep in `mach.lock`, honours that lockfile on the next pull, and
+resolves transitive deps into the flat tree under `<dir_dep>`. mach performs only
+plain git operations, so a checkout the user also commits as a **submodule**
+composes naturally; mach never invokes `git submodule`. A directory under
+`<dir_dep>` without a `.git` entry, while the manifest declares it a git dep, is a
+hard error — declare it a `path` dependency (v2) if those are vendored files.
 
 The dependency at `<dir_dep>/<alias>/` must itself be a valid project (have its
 own `mach.toml` with a `[project].id`), or the build fails resolving the dep.
@@ -270,9 +273,10 @@ url = "https://github.com/octalide/mach-std"  # git url cloned by `mach dep`
 ref = "branch/dev"                            # git ref to check out
 ```
 
-The compiler's own `mach.toml` carries `mach-std` as a git **submodule** rather
-than a `mach dep`-managed clone; `mach dep sync` recognises the submodule and
-skips it, so its keys remain informational there.
+The compiler's own `mach.toml` carries `mach-std` as a git **submodule**. Because
+`mach dep` performs only plain git operations, `mach dep pull` operates on the
+submodule checkout directly (fetch/checkout) the same as any other git dep — no
+special casing — while git tracks the gitlink in the parent repo.
 
 With this manifest, `mach build` (no `--target`) selects `linux` because
 `[project].target = "native"` resolves to the host-matching entry, compiles
