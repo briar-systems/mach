@@ -72,6 +72,25 @@ expect_exit "native debug --bin bye"   9 "$APP/out/linux/debug/bin/bye"
 ( cd "$APP" && "$MACH" build . --bin tier )
 expect_exit "defines fold target<artifact<cell into \$mach.build.*" 43 "$APP/out/linux/debug/bin/tier"
 
+# `mach build .` with no selector builds every declared artifact (the multi-
+# artifact matrix), each to its own resolved path.
+rm -rf "$APP/out/linux"
+( cd "$APP" && "$MACH" build . )
+expect_exit "matrix build . builds hello" 7  "$APP/out/linux/debug/bin/hello"
+expect_exit "matrix build . builds bye"   9  "$APP/out/linux/debug/bin/bye"
+expect_exit "matrix build . builds tier"  43 "$APP/out/linux/debug/bin/tier"
+
+# --all-targets crosses every artifact with every declared target.
+rm -rf "$APP/out"
+( cd "$APP" && "$MACH" build . --all-targets )
+expect_exit "all-targets builds the linux cell" 7 "$APP/out/linux/debug/bin/hello"
+WEXE="$APP/out/windows/debug/bin/hello.exe"
+if [ -f "$WEXE" ] && head -c2 "$WEXE" | grep -q MZ; then
+    echo "PASS manifestv2: --all-targets builds the windows cell too"
+else
+    echo "FAIL manifestv2: --all-targets did not build the windows .exe" >&2; fail=1
+fi
+
 # release profile routes outputs to a separate directory (no debug overwrite).
 ( cd "$APP" && "$MACH" build . --bin hello --release )
 expect_exit "native release --bin hello" 7 "$APP/out/linux/release/bin/hello"
@@ -114,11 +133,18 @@ else
     echo "FAIL manifestv2: windows cross-compile produced no PE at $EXE" >&2; fail=1
 fi
 
-# loud failures: ambiguous default, unknown artifact, unknown target/profile.
-expect_fail "ambiguous default (two bins, no selector)" .
+# loud failures: unknown artifact, unknown target/profile.
 expect_fail "unknown bin selector" . --bin nope
 expect_fail "unknown target selector" . --bin hello --target bsd
 expect_fail "unknown profile selector" . --bin hello --profile fast
+
+# mach run builds exactly one artifact to exec, so an ambiguous default must
+# require --bin (naming the candidates) rather than silently picking one.
+if ( cd "$APP" && "$MACH" run . ) >/dev/null 2>&1; then
+    echo "FAIL manifestv2: ambiguous 'mach run .' did not require --bin" >&2; fail=1
+else
+    echo "PASS manifestv2: ambiguous 'mach run .' requires --bin"
+fi
 
 # a path collision (both bins to one fixed path) is rejected at build start.
 COLL="$WORK/coll"
