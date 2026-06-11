@@ -66,6 +66,12 @@ expect_fail() {
 expect_exit "native debug --bin hello" 7 "$APP/out/linux/debug/bin/hello"
 expect_exit "native debug --bin bye"   9 "$APP/out/linux/debug/bin/bye"
 
+# manifest defines (#1191) fold into the comptime context at each precedence
+# level: tier exits 43 only when the target flag, artifact flag, and per-cell
+# integer override of `tier` all reached `$if ($mach.build.<name>)`.
+( cd "$APP" && "$MACH" build . --bin tier )
+expect_exit "defines fold target<artifact<cell into \$mach.build.*" 43 "$APP/out/linux/debug/bin/tier"
+
 # release profile routes outputs to a separate directory (no debug overwrite).
 ( cd "$APP" && "$MACH" build . --bin hello --release )
 expect_exit "native release --bin hello" 7 "$APP/out/linux/release/bin/hello"

@@ -163,6 +163,10 @@ pub rec DepEntry {
 # v2_asm_root:  interned resolved ASM-dump dir (root-relative), v2 only
 # v2_emit_ir:   selected profile's IR-emission default, v2 only
 # v2_emit_asm:  selected profile's ASM-emission default, v2 only
+# v2_defines:      merged comptime defines for the selected unit (artifact < target
+#                  < cell), each `NAME` or `NAME=VALUE`; bound into every module's
+#                  comptime ctx during load (#1191). v2 only; nil when none
+# v2_define_count: number of entries in v2_defines
 pub rec ProjectConfig {
     id:           intern.StrId;
     dir_src:      intern.StrId;
@@ -181,6 +185,8 @@ pub rec ProjectConfig {
     v2_asm_root:  intern.StrId;
     v2_emit_ir:   bool;
     v2_emit_asm:  bool;
+    v2_defines:      *intern.StrId;
+    v2_define_count: u32;
 }
 
 # PubConst: one comptime constant exported by a module to its importers.
@@ -598,6 +604,8 @@ fun init_project(p: *Project, s: *sess.Session) {
     p.config.v2_asm_root  = intern.STR_NIL;
     p.config.v2_emit_ir   = false;
     p.config.v2_emit_asm  = false;
+    p.config.v2_defines       = nil;
+    p.config.v2_define_count  = 0;
     p.modules       = nil;
     p.module_len    = 0;
     p.module_cap    = 0;
@@ -624,10 +632,15 @@ fun deallocate_config(c: *ProjectConfig, alloc: *Allocator) {
     if (c.deps != nil && c.dep_count > 0) {
         deallocate[DepEntry](alloc, c.deps, c.dep_count::usize);
     }
+    if (c.v2_defines != nil && c.v2_define_count > 0) {
+        deallocate[intern.StrId](alloc, c.v2_defines, c.v2_define_count::usize);
+    }
     c.targets      = nil;
     c.target_count = 0;
     c.deps         = nil;
     c.dep_count    = 0;
+    c.v2_defines       = nil;
+    c.v2_define_count  = 0;
 }
 
 fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection) Result[bool, str] {
@@ -745,6 +758,8 @@ fun load_v2_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifes
     p.config.v2_asm_root  = bu.asm_root;
     p.config.v2_emit_ir   = bu.emit_ir;
     p.config.v2_emit_asm  = bu.emit_asm;
+    p.config.v2_defines       = bu.defines;
+    p.config.v2_define_count  = bu.define_count;
     p.target_entry        = ?p.config.targets[0];
 
     val dr: Result[bool, str] = resolve_v2_deps(p, ?m, project_root);
@@ -1413,9 +1428,145 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) Result[sess.ModuleId, s
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
 
+    # bind the selected unit's manifest defines (#1191) into this module's ctx so
+    # `$if ($mach.build.NAME)` folds identically in every module of the graph.
+    val bd_r: Result[bool, str] = bind_v2_defines(p, ?p.modules[mid::u32].ctx);
+    if (is_err[bool, str](bd_r)) { ret err[sess.ModuleId, str](unwrap_err[bool, str](bd_r)); }
+
     val ins_r: Result[bool, str] = map.insert[intern.StrId, sess.ModuleId](?p.by_fqn, fqn, mid);
     if (is_err[bool, str](ins_r)) { ret err[sess.ModuleId, str](unwrap_err[bool, str](ins_r)); }
     ret ok[sess.ModuleId, str](mid);
+}
+
+# bind_v2_defines: bind every selected-unit manifest define (#1191) into a freshly
+# initialised module ctx. each entry is `NAME` (a comptime bool flag, `true`) or
+# `NAME=VALUE` where VALUE is a comptime literal — `true`/`false` (bool), an
+# integer literal (int), else a string. an empty define list is a strict no-op, so
+# a manifest declaring no defines stays fixpoint-stable.
+fun bind_v2_defines(p: *Project, ctx: *comptime.ComptimeCtx) Result[bool, str] {
+    if (!p.config.is_v2 || p.config.v2_define_count == 0) { ret ok[bool, str](true); }
+    var i: u32 = 0;
+    for (i < p.config.v2_define_count) {
+        val s_opt: Option[str] = intern.lookup(?p.s.interner, p.config.v2_defines[i]);
+        if (is_none[str](s_opt)) { ret err[bool, str]("define StrId not interned"); }
+        val r: Result[bool, str] = bind_one_define(p, ctx, unwrap[str](s_opt));
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# bind_one_define: parse a single `NAME` / `NAME=VALUE` define and bind it as a
+# named comptime constant. the value typing is explicit: no `=` is a bool `true`
+# flag; `true`/`false` is a bool; a decimal/`0x`/`0b`/`0o` integer literal is an
+# int; anything else is a string.
+fun bind_one_define(p: *Project, ctx: *comptime.ComptimeCtx, s: str) Result[bool, str] {
+    val n: usize = str_len(s);
+    var eq: usize = n;
+    var k: usize = 0;
+    for (k < n) {
+        if (s[k] == '=') { eq = k; brk; }
+        k = k + 1;
+    }
+    if (eq == 0) { ret err[bool, str]("mach.toml: a define has an empty name"); }
+
+    val name_r: Result[intern.StrId, str] = intern.intern_bytes(?p.s.interner, s, eq);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    var v: comptime.CTValue;
+    v.int_unsigned = false;
+
+    if (eq == n) {
+        v.kind   = comptime.CT_KIND_BOOL;
+        v.data.b = true;
+    }
+    or {
+        val vstart: usize = eq + 1;
+        val vlen:   usize = n - vstart;
+        var iv: i64 = 0;
+        if (define_value_is(s, vstart, vlen, "true")) {
+            v.kind = comptime.CT_KIND_BOOL; v.data.b = true;
+        }
+        or (define_value_is(s, vstart, vlen, "false")) {
+            v.kind = comptime.CT_KIND_BOOL; v.data.b = false;
+        }
+        or (parse_define_int(s, vstart, vlen, ?iv)) {
+            v.kind = comptime.CT_KIND_INT; v.data.i = iv;
+        }
+        or {
+            val vr: Result[intern.StrId, str] = intern.intern_bytes(?p.s.interner, (s::usize + vstart)::str, vlen);
+            if (is_err[intern.StrId, str](vr)) { ret err[bool, str](unwrap_err[intern.StrId, str](vr)); }
+            v.kind = comptime.CT_KIND_STR; v.data.s = unwrap_ok[intern.StrId, str](vr);
+        }
+    }
+
+    ret comptime.bind_define(ctx, name_id, v);
+}
+
+# define_value_is: whether the value substring s[start, start+len) equals `lit`.
+fun define_value_is(s: str, start: usize, len: usize, lit: str) bool {
+    if (len != str_len(lit)) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (s[start + i] != lit[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# parse_define_int: parse the value substring s[start, start+len) as an integer
+# literal (optional leading `-`, optional `0x`/`0b`/`0o` base prefix, digit
+# separators `_`), writing the i64 into `out` and returning true. a value that is
+# not a clean integer returns false so the caller treats it as a string. an
+# out-of-range value also returns false (a string is the honest fallback).
+fun parse_define_int(s: str, start: usize, len: usize, out: *i64) bool {
+    if (len == 0) { ret false; }
+    var i: usize = 0;
+    var neg: bool = false;
+    if (s[start] == '-') {
+        if (len == 1) { ret false; }
+        neg = true;
+        i = 1;
+    }
+    var base: u64 = 10;
+    if (len - i >= 2 && s[start + i] == '0') {
+        val c1: u8 = s[start + i + 1];
+        if (c1 == 'x') { base = 16; i = i + 2; }
+        or (c1 == 'b') { base = 2;  i = i + 2; }
+        or (c1 == 'o') { base = 8;  i = i + 2; }
+    }
+
+    var value:     u64 = 0;
+    var saw_digit: bool = false;
+    val u64_max:   u64 = 0xFFFFFFFFFFFFFFFF;
+    for (i < len) {
+        val c: u8 = s[start + i];
+        if (c == '_') { i = i + 1; cnt; }
+        var digit: i64 = 0 - 1;
+        if      (c >= '0' && c <= '9') { digit = (c - '0')::i64; }
+        or      (c >= 'a' && c <= 'f') { digit = (c - 'a')::i64 + 10; }
+        or      (c >= 'A' && c <= 'F') { digit = (c - 'A')::i64 + 10; }
+        if (digit < 0 || digit::u64 >= base) { ret false; }
+        val d: u64 = digit::u64;
+        if (value > (u64_max - d) / base) { ret false; }
+        value = value * base + d;
+        saw_digit = true;
+        i = i + 1;
+    }
+    if (!saw_digit) { ret false; }
+
+    # reject a magnitude that has no i64 representation (the string fallback keeps
+    # it honest rather than wrapping).
+    val signed_max: u64 = 0x7FFFFFFFFFFFFFFF;
+    if (neg) {
+        if (value > signed_max + 1) { ret false; }
+        @out = 0 - value::i64;
+        ret true;
+    }
+    if (value > signed_max) { ret false; }
+    @out = value::i64;
+    ret true;
 }
 
 fun parse_module(p: *Project, mid: sess.ModuleId, fqn: intern.StrId) Result[bool, str] {

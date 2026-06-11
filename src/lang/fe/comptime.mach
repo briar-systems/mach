@@ -28,6 +28,7 @@ use std.types.option.Option;
 use std.types.option.some;
 use std.types.option.none;
 use std.types.option.is_none;
+use std.types.option.is_some;
 use std.types.option.unwrap;
 
 use std.types.bool.bool;
@@ -123,6 +124,11 @@ pub def FrameMark: u32;
 #                 so an innermost (later-bound) name shadows an outer one
 # entries_len:    number of entries currently stored
 # entries_cap:    allocated slots in entries
+# defines:        manifest comptime defines (#1191), keyed by name, resolved only
+#                 through the `$mach.build.<name>` path — kept out of `entries` so a
+#                 define never shadows (nor is shadowed by) a bare comptime const
+# define_len:     number of defines stored
+# define_cap:     allocated slots in defines
 pub rec ComptimeCtx {
     alloc:          *Allocator;
     target_os_id:   u32;
@@ -133,6 +139,9 @@ pub rec ComptimeCtx {
     entries:        *NamedConst;
     entries_len:    u32;
     entries_cap:    u32;
+    defines:        *NamedConst;
+    define_len:     u32;
+    define_cap:     u32;
 }
 
 val INITIAL_CONST_CAP: u32 = 8;
@@ -175,6 +184,9 @@ pub fun init(
     c.entries        = nil;
     c.entries_len    = 0;
     c.entries_cap    = 0;
+    c.defines        = nil;
+    c.define_len     = 0;
+    c.define_cap     = 0;
     ret c;
 }
 
@@ -186,9 +198,15 @@ pub fun dnit(c: *ComptimeCtx) {
     if (c.entries != nil && c.entries_cap > 0) {
         deallocate[NamedConst](c.alloc, c.entries, c.entries_cap::usize);
     }
+    if (c.defines != nil && c.define_cap > 0) {
+        deallocate[NamedConst](c.alloc, c.defines, c.define_cap::usize);
+    }
     c.entries     = nil;
     c.entries_len = 0;
     c.entries_cap = 0;
+    c.defines     = nil;
+    c.define_len  = 0;
+    c.define_cap  = 0;
 }
 
 # bind: appends a comptime constant under `name` to the current (innermost)
@@ -268,6 +286,59 @@ pub fun lookup(c: *ComptimeCtx, name: intern.StrId) Option[*NamedConst] {
         if (c.entries[i].name == name) {
             ret some[*NamedConst](?c.entries[i]);
         }
+    }
+    ret none[*NamedConst]();
+}
+
+# bind_define: register a manifest comptime define (#1191) under `name`, readable
+# only through the `$mach.build.<name>` path. defines live in their own table,
+# isolated from the scoped `entries` environment, so a define neither shadows nor
+# is shadowed by a bare comptime constant. a later bind of the same name replaces
+# the earlier value (the manifest merge has already applied precedence).
+# ---
+# c:     context to extend
+# name:  interned define name
+# value: pre-evaluated define value
+# ret:   true on success, or an allocation error
+pub fun bind_define(c: *ComptimeCtx, name: intern.StrId, value: CTValue) Result[bool, str] {
+    var k: u32 = 0;
+    for (k < c.define_len) {
+        if (c.defines[k].name == name) { c.defines[k].value = value; ret ok[bool, str](true); }
+        k = k + 1;
+    }
+    if (c.defines == nil) {
+        val r: Result[*NamedConst, str] = allocate[NamedConst](c.alloc, INITIAL_CONST_CAP::usize);
+        if (is_err[*NamedConst, str](r)) { ret err[bool, str](unwrap_err[*NamedConst, str](r)); }
+        c.defines     = unwrap_ok[*NamedConst, str](r);
+        c.define_cap  = INITIAL_CONST_CAP;
+    }
+    or (c.define_len == c.define_cap) {
+        val new_cap: u32 = c.define_cap * 2;
+        val r: Result[*NamedConst, str] = reallocate[NamedConst](c.alloc, c.defines, c.define_cap::usize, new_cap::usize);
+        if (is_err[*NamedConst, str](r)) { ret err[bool, str](unwrap_err[*NamedConst, str](r)); }
+        c.defines    = unwrap_ok[*NamedConst, str](r);
+        c.define_cap = new_cap;
+    }
+
+    var nc: NamedConst;
+    nc.name  = name;
+    nc.value = value;
+    c.defines[c.define_len] = nc;
+    c.define_len = c.define_len + 1;
+    ret ok[bool, str](true);
+}
+
+# lookup_define: find a manifest define by interned name, or none. used by
+# `resolve_mach_path` to fold `$mach.build.<name>`.
+# ---
+# c:    context to search
+# name: interned define name
+# ret:  some(*NamedConst) when defined, none otherwise
+pub fun lookup_define(c: *ComptimeCtx, name: intern.StrId) Option[*NamedConst] {
+    var k: u32 = 0;
+    for (k < c.define_len) {
+        if (c.defines[k].name == name) { ret some[*NamedConst](?c.defines[k]); }
+        k = k + 1;
     }
     ret none[*NamedConst]();
 }
@@ -989,7 +1060,7 @@ fun eval_path(
         ret err[CTValue, str]("comptime path must start with a `$` identifier");
     }
 
-    ret resolve_mach_path(c, source, ?stack[0], depth);
+    ret resolve_mach_path(c, source, ?stack[0], depth, interner);
 }
 
 # comptime_ident_name: the span of the identifier portion of a `$ident` token,
@@ -1021,10 +1092,12 @@ pub fun comptime_ident_name(full: token.Span) token.Span {
 #   $mach.project.{name,version,root} — project metadata stubs.
 #   $mach.build.{mode,timestamp,host} / build.git.{commit,dirty} — build
 #     metadata stubs.
+#   $mach.build.<name> — a manifest comptime define (#1191); folds to the
+#     define's value, or errors when no such define was declared.
 #   $mach.source.{file,line,module,function} — source-location stubs.
 # stubbed paths report that the value is not yet populated rather than
 # silently folding to a placeholder.
-fun resolve_mach_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u32) Result[CTValue, str] {
+fun resolve_mach_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u32, interner: *intern.Interner) Result[CTValue, str] {
     if (depth == 0) { ret err[CTValue, str]("empty comptime path"); }
 
     val root: StrView = span_text(source, stack[depth - 1]);
@@ -1080,7 +1153,8 @@ fun resolve_mach_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u
         ret err[CTValue, str]("`$mach.project.*` is not yet available");
     }
 
-    # $mach.build.{mode,timestamp,host} — build metadata stubs
+    # $mach.build.{mode,timestamp,host} — build metadata stubs. checked before the
+    # dynamic define lookup so a manifest define can never shadow a reserved name.
     if (depth == 3 && seg_is(source, stack, 1, "build")
      && (seg_is(source, stack, 0, "mode") || seg_is(source, stack, 0, "timestamp") || seg_is(source, stack, 0, "host"))) {
         ret err[CTValue, str]("`$mach.build.*` is not yet available");
@@ -1089,6 +1163,15 @@ fun resolve_mach_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u
     if (depth == 4 && seg_is(source, stack, 2, "build") && seg_is(source, stack, 1, "git")
      && (seg_is(source, stack, 0, "commit") || seg_is(source, stack, 0, "dirty"))) {
         ret err[CTValue, str]("`$mach.build.git.*` is not yet available");
+    }
+    # $mach.build.<name> — a manifest comptime define (#1191). folds to the
+    # define's value; an undeclared name is a loud error, never a silent default.
+    if (depth == 3 && seg_is(source, stack, 1, "build")) {
+        val nr: Result[intern.StrId, str] = intern.intern_span(interner, source, stack[0]);
+        if (is_err[intern.StrId, str](nr)) { ret err[CTValue, str](unwrap_err[intern.StrId, str](nr)); }
+        val d_opt: Option[*NamedConst] = lookup_define(c, unwrap_ok[intern.StrId, str](nr));
+        if (is_some[*NamedConst](d_opt)) { ret ok[CTValue, str](unwrap[*NamedConst](d_opt).value); }
+        ret err[CTValue, str]("no manifest define named in `$mach.build.<name>`");
     }
 
     # $mach.source.{file,line,module,function} — source-location stubs
