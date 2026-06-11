@@ -50,6 +50,7 @@ use instr: mach.lang.me.ir.instruction;
 use value: mach.lang.me.ir.value;
 use id:    mach.lang.me.ir.id;
 use float: mach.lang.float;
+use fnv1a: std.crypto.hash.fnv1a;
 
 # Pass entry. Runs local CSE on every non-extern function in the module.
 # ---
@@ -74,6 +75,12 @@ pub fun run(m: *ir.Module) Result[bool, str] {
 # instructions are visited in program order, and a candidate that matches an
 # earlier in-block candidate records a substitution. After every block the
 # substitutions are applied to every operand in the function.
+#
+# Candidates are matched through a per-block hash table (keyed by the structural
+# hash of opcode / flags / types / resolved operands) rather than a linear scan
+# of every prior candidate, so a block of n candidates costs O(n) rather than
+# O(n^2). The table chains collisions through `chain` and is invalidated between
+# blocks by bumping `epoch` instead of clearing it.
 fun cse_function(m: *ir.Module, fn: *ir.Function) Result[bool, str] {
     val ilen: u32 = fn.instr_len;
     if (ilen == 0) { ret ok[bool, str](true); }
@@ -89,41 +96,81 @@ fun cse_function(m: *ir.Module, fn: *ir.Function) Result[bool, str] {
     }
     val has_sub: *bool = unwrap_ok[*bool, str](rh);
 
-    # `seen` collects the canonical (kept) candidate instruction ids of the block
-    # currently being processed; it is reused per block.
-    val rw: Result[*id.InstructionId, str] = allocate[id.InstructionId](m.alloc, ilen::usize);
-    if (is_err[*id.InstructionId, str](rw)) {
+    # hash table sized to a power of two >= ilen: `bucket[idx]` heads a chain of
+    # candidate ids (linked through `chain`) that hashed to `idx`, valid only
+    # while `bucket_epoch[idx]` equals the block's current `epoch`.
+    val tsize: u32 = round_pow2(ilen);
+    val rb: Result[*id.InstructionId, str] = allocate[id.InstructionId](m.alloc, tsize::usize);
+    if (is_err[*id.InstructionId, str](rb)) {
         deallocate[value.Value](m.alloc, subst, ilen::usize);
         deallocate[bool](m.alloc, has_sub, ilen::usize);
-        ret err[bool, str](unwrap_err[*id.InstructionId, str](rw));
+        ret err[bool, str](unwrap_err[*id.InstructionId, str](rb));
     }
-    val seen: *id.InstructionId = unwrap_ok[*id.InstructionId, str](rw);
+    val bucket: *id.InstructionId = unwrap_ok[*id.InstructionId, str](rb);
+
+    val re: Result[*u32, str] = allocate[u32](m.alloc, tsize::usize);
+    if (is_err[*u32, str](re)) {
+        deallocate[value.Value](m.alloc, subst, ilen::usize);
+        deallocate[bool](m.alloc, has_sub, ilen::usize);
+        deallocate[id.InstructionId](m.alloc, bucket, tsize::usize);
+        ret err[bool, str](unwrap_err[*u32, str](re));
+    }
+    val bucket_epoch: *u32 = unwrap_ok[*u32, str](re);
+
+    val rc: Result[*id.InstructionId, str] = allocate[id.InstructionId](m.alloc, ilen::usize);
+    if (is_err[*id.InstructionId, str](rc)) {
+        deallocate[value.Value](m.alloc, subst, ilen::usize);
+        deallocate[bool](m.alloc, has_sub, ilen::usize);
+        deallocate[id.InstructionId](m.alloc, bucket, tsize::usize);
+        deallocate[u32](m.alloc, bucket_epoch, tsize::usize);
+        ret err[bool, str](unwrap_err[*id.InstructionId, str](rc));
+    }
+    val chain: *id.InstructionId = unwrap_ok[*id.InstructionId, str](rc);
 
     var i: u32 = 0;
     for (i < ilen) { has_sub[i] = false; i = i + 1; }
+    var j: u32 = 0;
+    for (j < tsize) { bucket_epoch[j] = 0; j = j + 1; }
 
+    val mask: u32 = tsize - 1;
     var any: bool = false;
+    var epoch: u32 = 0;
     var b: u32 = 0;
     for (b < fn.block_count) {
-        if (cse_block(m, fn, ?fn.blocks[b], subst, has_sub, ilen, seen)) { any = true; }
+        epoch = epoch + 1;
+        if (cse_block(m, fn, ?fn.blocks[b], subst, has_sub, ilen,
+                      bucket, bucket_epoch, chain, mask, epoch)) { any = true; }
         b = b + 1;
     }
     if (any) { apply_substitutions(fn, subst, has_sub, ilen); }
 
     deallocate[value.Value](m.alloc, subst, ilen::usize);
     deallocate[bool](m.alloc, has_sub, ilen::usize);
-    deallocate[id.InstructionId](m.alloc, seen, ilen::usize);
+    deallocate[id.InstructionId](m.alloc, bucket, tsize::usize);
+    deallocate[u32](m.alloc, bucket_epoch, tsize::usize);
+    deallocate[id.InstructionId](m.alloc, chain, ilen::usize);
     ret ok[bool, str](true);
+}
+
+# smallest power of two >= n (at least 1). sizes the per-block hash table.
+fun round_pow2(n: u32) u32 {
+    var p: u32 = 1;
+    for (p < n) { p = p * 2; }
+    ret p;
 }
 
 # processes one block: walks its instruction list in order, and for each pure
 # candidate either matches it against an already-seen canonical candidate (and
 # records a substitution to that candidate's result) or records it as a new
-# canonical candidate. Returns true if any substitution was recorded.
+# canonical candidate. Matching goes through the per-block hash table: a
+# candidate's structural hash selects a bucket whose (short) chain of distinct
+# canonicals is checked for an exact match. Returns true if any substitution was
+# recorded.
 fun cse_block(m: *ir.Module, fn: *ir.Function, blk: *ir.Block,
-              subst: *value.Value, has_sub: *bool, ilen: u32, seen: *id.InstructionId) bool {
+              subst: *value.Value, has_sub: *bool, ilen: u32,
+              bucket: *id.InstructionId, bucket_epoch: *u32, chain: *id.InstructionId,
+              mask: u32, epoch: u32) bool {
     var any: bool = false;
-    var seen_count: u32 = 0;
     var ix: u32 = 0;
     for (ix < blk.instr_count) {
         val iid: id.InstructionId = blk.instructions[ix];
@@ -131,33 +178,79 @@ fun cse_block(m: *ir.Module, fn: *ir.Function, blk: *ir.Block,
         if (is_some[*instr.Instruction](inst_opt)) {
             val inst: *instr.Instruction = unwrap[*instr.Instruction](inst_opt);
             if (is_candidate(inst)) {
-                # search the canonical candidates already seen in this block.
+                val h: u64 = hash_candidate(inst, subst, has_sub, ilen);
+                val idx: u32 = (h::u32) & mask;
                 var matched: bool = false;
-                var s: u32 = 0;
-                for (s < seen_count && matched == false) {
-                    val cid: id.InstructionId = seen[s];
-                    val cand_opt: Option[*instr.Instruction] = ir.get_instruction(fn, cid);
-                    if (is_some[*instr.Instruction](cand_opt)) {
-                        val cand: *instr.Instruction = unwrap[*instr.Instruction](cand_opt);
-                        if (instrs_equal(inst, cand, subst, has_sub, ilen)) {
-                            # redundant: reuse the canonical candidate's result.
-                            subst[iid::u32]   = value.instr_value(cid, inst.ty);
-                            has_sub[iid::u32] = true;
-                            matched           = true;
-                            any               = true;
+                # walk the bucket chain, but only if it belongs to this block.
+                if (bucket_epoch[idx] == epoch) {
+                    var cur: id.InstructionId = bucket[idx];
+                    for (cur != id.INSTR_NIL && matched == false) {
+                        val cand_opt: Option[*instr.Instruction] = ir.get_instruction(fn, cur);
+                        if (is_some[*instr.Instruction](cand_opt)) {
+                            val cand: *instr.Instruction = unwrap[*instr.Instruction](cand_opt);
+                            if (instrs_equal(inst, cand, subst, has_sub, ilen)) {
+                                # redundant: reuse the canonical candidate's result.
+                                subst[iid::u32]   = value.instr_value(cur, inst.ty);
+                                has_sub[iid::u32] = true;
+                                matched           = true;
+                                any               = true;
+                            }
                         }
+                        cur = chain[cur::u32];
                     }
-                    s = s + 1;
                 }
                 if (matched == false) {
-                    seen[seen_count] = iid;
-                    seen_count       = seen_count + 1;
+                    # prepend this candidate as a new canonical in its bucket.
+                    if (bucket_epoch[idx] == epoch) { chain[iid::u32] = bucket[idx]; }
+                    or { chain[iid::u32] = id.INSTR_NIL; }
+                    bucket[idx]       = iid;
+                    bucket_epoch[idx] = epoch;
                 }
             }
         }
         ix = ix + 1;
     }
     ret any;
+}
+
+# structural hash of a candidate matching instrs_equal: opcode, flag word,
+# result type, auxiliary type, operand count, and every operand resolved through
+# the substitution table. Two candidates instrs_equal therefore hash alike.
+fun hash_candidate(inst: *instr.Instruction, subst: *value.Value, has_sub: *bool, ilen: u32) u64 {
+    var h: u64 = fnv1a.init();
+    h = fnv1a.step_u8(h, inst.kind::u8);
+    h = fnv1a.step_u32(h, inst.flags::u32);
+    h = fnv1a.step_u32(h, inst.ty::u32);
+    h = fnv1a.step_u32(h, inst.aux_ty::u32);
+    h = fnv1a.step_u32(h, inst.operand_count);
+    var o: u32 = 0;
+    for (o < inst.operand_count) {
+        h = hash_value(h, resolve(inst.operands[o], subst, has_sub, ilen));
+        o = o + 1;
+    }
+    ret h;
+}
+
+# folds a resolved operand value into the running hash by the same identity
+# values_equal compares: kind plus the kind's payload (instruction id, parameter
+# index, integer / float bits, global / function index). VAL_CONST_NULL hashes by
+# kind alone; byte-blob / aggregate constants (which values_equal never treats as
+# equal) hash by kind alone too, so they share a bucket but never match.
+fun hash_value(h: u64, v: value.Value) u64 {
+    var hv: u64 = fnv1a.step_u8(h, v.kind::u8);
+    if (v.kind == value.VAL_INSTR)       { ret fnv1a.step_u32(hv, v.data.instr::u32); }
+    if (v.kind == value.VAL_PARAM)       { ret fnv1a.step_u32(hv, v.data.param_ix); }
+    if (v.kind == value.VAL_CONST_INT)   { ret step_u64(hv, v.data.int_lit); }
+    if (v.kind == value.VAL_CONST_FLOAT) { ret step_u64(hv, float.f64_bits(v.data.float_lit)); }
+    if (v.kind == value.VAL_GLOBAL)      { ret fnv1a.step_u32(hv, v.data.global_ix); }
+    if (v.kind == value.VAL_FN)          { ret fnv1a.step_u32(hv, v.data.fn_ix); }
+    ret hv;
+}
+
+# folds a 64-bit value into the hash as its low then high 32-bit halves
+# (fnv1a exposes only 8- and 32-bit steps).
+fun step_u64(h: u64, v: u64) u64 {
+    ret fnv1a.step_u32(fnv1a.step_u32(h, v::u32), (v >> 32)::u32);
 }
 
 # true when an instruction is a CSE candidate: a pure, value-producing opcode
