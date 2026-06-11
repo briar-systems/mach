@@ -66,6 +66,31 @@ expect_fail() {
 expect_exit "native debug --bin hello" 7 "$APP/out/linux/debug/bin/hello"
 expect_exit "native debug --bin bye"   9 "$APP/out/linux/debug/bin/bye"
 
+# manifest defines (#1191) fold into the comptime context at each precedence
+# level: tier exits 43 only when the target flag, artifact flag, and per-cell
+# integer override of `tier` all reached `$if ($mach.build.<name>)`.
+( cd "$APP" && "$MACH" build . --bin tier )
+expect_exit "defines fold target<artifact<cell into \$mach.build.*" 43 "$APP/out/linux/debug/bin/tier"
+
+# `mach build .` with no selector builds every declared artifact (the multi-
+# artifact matrix), each to its own resolved path.
+rm -rf "$APP/out/linux"
+( cd "$APP" && "$MACH" build . )
+expect_exit "matrix build . builds hello" 7  "$APP/out/linux/debug/bin/hello"
+expect_exit "matrix build . builds bye"   9  "$APP/out/linux/debug/bin/bye"
+expect_exit "matrix build . builds tier"  43 "$APP/out/linux/debug/bin/tier"
+
+# --all-targets crosses every artifact with every declared target.
+rm -rf "$APP/out"
+( cd "$APP" && "$MACH" build . --all-targets )
+expect_exit "all-targets builds the linux cell" 7 "$APP/out/linux/debug/bin/hello"
+WEXE="$APP/out/windows/debug/bin/hello.exe"
+if [ -f "$WEXE" ] && head -c2 "$WEXE" | grep -q MZ; then
+    echo "PASS manifestv2: --all-targets builds the windows cell too"
+else
+    echo "FAIL manifestv2: --all-targets did not build the windows .exe" >&2; fail=1
+fi
+
 # release profile routes outputs to a separate directory (no debug overwrite).
 ( cd "$APP" && "$MACH" build . --bin hello --release )
 expect_exit "native release --bin hello" 7 "$APP/out/linux/release/bin/hello"
@@ -108,11 +133,18 @@ else
     echo "FAIL manifestv2: windows cross-compile produced no PE at $EXE" >&2; fail=1
 fi
 
-# loud failures: ambiguous default, unknown artifact, unknown target/profile.
-expect_fail "ambiguous default (two bins, no selector)" .
+# loud failures: unknown artifact, unknown target/profile.
 expect_fail "unknown bin selector" . --bin nope
 expect_fail "unknown target selector" . --bin hello --target bsd
 expect_fail "unknown profile selector" . --bin hello --profile fast
+
+# mach run builds exactly one artifact to exec, so an ambiguous default must
+# require --bin (naming the candidates) rather than silently picking one.
+if ( cd "$APP" && "$MACH" run . ) >/dev/null 2>&1; then
+    echo "FAIL manifestv2: ambiguous 'mach run .' did not require --bin" >&2; fail=1
+else
+    echo "PASS manifestv2: ambiguous 'mach run .' requires --bin"
+fi
 
 # a path collision (both bins to one fixed path) is rejected at build start.
 COLL="$WORK/coll"
@@ -122,6 +154,34 @@ if ( cd "$COLL" && "$MACH" build . --bin hello ) >/dev/null 2>&1; then
     echo "FAIL manifestv2: a path collision did not fail the build" >&2; fail=1
 else
     echo "PASS manifestv2: colliding artifact paths fail at build start"
+fi
+
+# cascading transitive dep libs (#1218): the consumer declares no platform libs;
+# its windows .exe must inherit kernel32.dll (from the v2 dep kdep) and user32.dll
+# (from the v1 dep vdep) by target-tuple equality, while the native (linux) build
+# inherits neither — proving tuple gating (a leak would fail the link with a DLL
+# against a non-PE target).
+CASC="$WORK/cascade"
+cp -r "$HERE/cascade" "$CASC"
+ln -s "$STD" "$CASC/dep/mach-std"
+
+( cd "$CASC" && "$MACH" build . --target windows )
+CEXE="$CASC/out/windows/debug/bin/cons.exe"
+if [ -f "$CEXE" ] && strings "$CEXE" | grep -qi kernel32 && strings "$CEXE" | grep -qi user32; then
+    echo "PASS manifestv2: windows .exe inherits kernel32 (v2 dep) + user32 (v1 dep) via cascade"
+else
+    echo "FAIL manifestv2: cascade did not import both dep libs into the windows .exe" >&2; fail=1
+fi
+
+if ( cd "$CASC" && "$MACH" build . ) >/dev/null 2>&1; then
+    CBIN="$CASC/out/linux/debug/bin/cons"
+    if [ -x "$CBIN" ] && ! strings "$CBIN" | grep -qiE "kernel32|user32"; then
+        echo "PASS manifestv2: linux build inherits no windows-only dep libs (tuple gating)"
+    else
+        echo "FAIL manifestv2: a windows-only dep lib leaked into the linux build" >&2; fail=1
+    fi
+else
+    echo "FAIL manifestv2: native cascade build failed (windows-only dep libs wrongly inherited?)" >&2; fail=1
 fi
 
 exit "$fail"

@@ -23,6 +23,7 @@ use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
+use std.types.string.str_contains;
 use std.text.string.str_free;
 
 use std.types.option.Option;
@@ -102,17 +103,22 @@ pub rec TargetDef {
 # CellDef: one `[bin.<a>.target.<t>]` per-cell exception refining an artifact
 # for a single target. an unset override (STR_NIL) inherits the artifact field.
 # ---
-# target:    interned name of the target this cell refines
-# entry:     interned entry-file override, STR_NIL to inherit
-# out:       interned `out` template override, STR_NIL to inherit
-# libs:      interned per-cell link inputs appended to the merge; nil when none
-# lib_count: number of entries in libs
+# target:       interned name of the target this cell refines
+# entry:        interned entry-file override, STR_NIL to inherit
+# out:          interned `out` template override, STR_NIL to inherit
+# libs:         interned per-cell link inputs appended to the merge; nil when none
+# lib_count:    number of entries in libs
+# defines:      interned per-cell comptime defines, the highest precedence level
+#               (#1191); nil when none
+# define_count: number of entries in defines
 pub rec CellDef {
-    target:    intern.StrId;
-    entry:     intern.StrId;
-    out:       intern.StrId;
-    libs:      *intern.StrId;
-    lib_count: u32;
+    target:       intern.StrId;
+    entry:        intern.StrId;
+    out:          intern.StrId;
+    libs:         *intern.StrId;
+    lib_count:    u32;
+    defines:      *intern.StrId;
+    define_count: u32;
 }
 
 # ArtifactDef: one `[bin.<name>]` or `[lib.<name>]` artifact. every artifact is
@@ -745,8 +751,10 @@ fun parse_cells(alloc: *Allocator, i: *intern.Interner, sub: *toml.Table, kind_t
         if (is_err[bool, str](ck)) { ret ck; }
 
         var c: CellDef;
-        c.libs      = nil;
-        c.lib_count = 0;
+        c.libs         = nil;
+        c.lib_count    = 0;
+        c.defines      = nil;
+        c.define_count = 0;
         c.target = intern_unwrap(i, tname);
         c.entry  = intern_opt_unwrap(i, toml.get_str(cs, "entry"));
         c.out    = intern_opt_unwrap(i, toml.get_str(cs, "out"));
@@ -756,6 +764,12 @@ fun parse_cells(alloc: *Allocator, i: *intern.Interner, sub: *toml.Table, kind_t
         if (is_err[StrArr, str](lr)) { ret err[bool, str](unwrap_err[StrArr, str](lr)); }
         val laa: StrArr = unwrap_ok[StrArr, str](lr);
         c.libs = laa.items; c.lib_count = laa.count;
+
+        val dr: Result[StrArr, str] = parse_str_array(alloc, i, toml.get_array(cs, "defines"),
+            cc3(alloc, "mach.toml: ", label, ".defines must be an array of strings"));
+        if (is_err[StrArr, str](dr)) { ret err[bool, str](unwrap_err[StrArr, str](dr)); }
+        val daa: StrArr = unwrap_ok[StrArr, str](dr);
+        c.defines = daa.items; c.define_count = daa.count;
 
         a.cells[k] = c;
         k = k + 1;
@@ -883,6 +897,7 @@ pub fun dnit(m: *Manifest, alloc: *Allocator) {
                 var c: u32 = 0;
                 for (c < a.cell_count) {
                     free_strarr(alloc, a.cells[c].libs, a.cells[c].lib_count);
+                    free_strarr(alloc, a.cells[c].defines, a.cells[c].define_count);
                     c = c + 1;
                 }
                 deallocate[CellDef](alloc, a.cells, a.cell_count::usize);
@@ -1040,6 +1055,9 @@ pub rec Selection {
 # kind:         library link kind (meaningful when is_lib)
 # libs:         merged interned link overlay; nil when none
 # lib_count:    number of entries in libs
+# defines:      merged interned comptime-define overlay (artifact < target < cell,
+#               override by name); nil when none
+# define_count: number of entries in defines
 # warned:       native resolution found no host match and fell back to the first target
 pub rec BuildUnit {
     target:       *TargetDef;
@@ -1058,6 +1076,8 @@ pub rec BuildUnit {
     kind:         LibKind;
     libs:         *intern.StrId;
     lib_count:    u32;
+    defines:      *intern.StrId;
+    define_count: u32;
     warned:       bool;
 }
 
@@ -1294,6 +1314,99 @@ fun append_unique(buf: *intern.StrId, c: u32, src: *intern.StrId, n: u32) u32 {
     ret w;
 }
 
+# define_name_len: the length of a define's NAME part — every byte before the
+# first `=` (the whole string when no `=` is present). a define is `NAME` (a
+# comptime flag) or `NAME=VALUE`; the merge keys on the NAME alone.
+fun define_name_len(s: str) usize {
+    val n: usize = str_len(s);
+    var i: usize = 0;
+    for (i < n) {
+        if (s[i] == '=') { ret i; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# define_name_eq: whether two define strings name the same constant — equal NAME
+# parts (up to the first `=`). a later precedence level redefining a NAME shadows
+# an earlier one, so the merge dedups on the NAME, not the full `NAME=VALUE`.
+fun define_name_eq(i: *intern.Interner, a: intern.StrId, b: intern.StrId) bool {
+    if (a == b) { ret true; }
+    val ao: Option[str] = intern.lookup(i, a);
+    val bo: Option[str] = intern.lookup(i, b);
+    if (is_none[str](ao) || is_none[str](bo)) { ret false; }
+    val as_: str = unwrap[str](ao);
+    val bs:  str = unwrap[str](bo);
+    val an: usize = define_name_len(as_);
+    if (an != define_name_len(bs)) { ret false; }
+    var k: usize = 0;
+    for (k < an) {
+        if (as_[k] != bs[k]) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# append_override: merge each define in `src` into buf[0, c), replacing any entry
+# whose NAME already appears (so a later precedence level wins) and appending a
+# new NAME in first-seen position. returns the new count.
+fun append_override(i: *intern.Interner, buf: *intern.StrId, c: u32, src: *intern.StrId, n: u32) u32 {
+    var w: u32 = c;
+    var k: u32 = 0;
+    for (k < n) {
+        val id: intern.StrId = src[k];
+        var found: bool = false;
+        var j: u32 = 0;
+        for (j < w) {
+            if (define_name_eq(i, buf[j], id)) { buf[j] = id; found = true; }
+            j = j + 1;
+        }
+        if (!found) { buf[w] = id; w = w + 1; }
+        k = k + 1;
+    }
+    ret w;
+}
+
+# merge_defines: the target+artifact+cell comptime-define overlay, resolved with
+# the spec precedence artifact < target < per-cell. a later level's `NAME=VALUE`
+# overrides an earlier level's same NAME, so each named constant appears once with
+# its highest-precedence value, in first-seen order. owned by `alloc`; nil/0 when
+# empty.
+fun merge_defines(alloc: *Allocator, i: *intern.Interner, t: *TargetDef, a: *ArtifactDef, cell: *CellDef) Result[StrArr, str] {
+    var out: StrArr;
+    out.items = nil;
+    out.count = 0;
+    var cell_n: u32 = 0;
+    var cell_items: *intern.StrId = nil;
+    if (cell != nil) { cell_n = cell.define_count; cell_items = cell.defines; }
+    val max: u32 = t.define_count + a.define_count + cell_n;
+    if (max == 0) { ret ok[StrArr, str](out); }
+
+    val r: Result[*intern.StrId, str] = allocate[intern.StrId](alloc, max::usize);
+    if (is_err[*intern.StrId, str](r)) { ret err[StrArr, str](unwrap_err[*intern.StrId, str](r)); }
+    val buf: *intern.StrId = unwrap_ok[*intern.StrId, str](r);
+    var c: u32 = 0;
+    c = append_override(i, buf, c, a.defines, a.define_count);
+    c = append_override(i, buf, c, t.defines, t.define_count);
+    c = append_override(i, buf, c, cell_items, cell_n);
+
+    if (c == 0) {
+        deallocate[intern.StrId](alloc, buf, max::usize);
+        ret ok[StrArr, str](out);
+    }
+    if (c < max) {
+        val sr: Result[*intern.StrId, str] = reallocate[intern.StrId](alloc, buf, max::usize, c::usize);
+        if (is_ok[*intern.StrId, str](sr)) {
+            out.items = unwrap_ok[*intern.StrId, str](sr);
+            out.count = c;
+            ret ok[StrArr, str](out);
+        }
+    }
+    out.items = buf;
+    out.count = c;
+    ret ok[StrArr, str](out);
+}
+
 # effective_out: the effective `out` template for an artifact under a cell —
 # cell override, else artifact override, else the project template.
 fun effective_out(m: *Manifest, a: *ArtifactDef, cell: *CellDef) intern.StrId {
@@ -1314,7 +1427,7 @@ pub fun resolve_build_unit(alloc: *Allocator, i: *intern.Interner, m: *Manifest,
     val rp: ResolvedProfile = unwrap_ok[ResolvedProfile, str](rp_r);
 
     val a: *ArtifactDef = resolve_artifact(alloc, i, m, sel);
-    if (a == nil) { ret err[BuildUnit, str](artifact_err(alloc, m, sel)); }
+    if (a == nil) { ret err[BuildUnit, str](artifact_err(alloc, i, m, sel)); }
 
     val cell: *CellDef = find_cell(a, rt.target.name);
 
@@ -1338,6 +1451,12 @@ pub fun resolve_build_unit(alloc: *Allocator, i: *intern.Interner, m: *Manifest,
     val merged: StrArr = unwrap_ok[StrArr, str](lm);
     u.libs = merged.items;
     u.lib_count = merged.count;
+
+    val dm: Result[StrArr, str] = merge_defines(alloc, i, rt.target, a, cell);
+    if (is_err[StrArr, str](dm)) { ret err[BuildUnit, str](unwrap_err[StrArr, str](dm)); }
+    val mdef: StrArr = unwrap_ok[StrArr, str](dm);
+    u.defines = mdef.items;
+    u.define_count = mdef.count;
 
     # expansion variables, all from stanzas present in the file.
     val tn_r: Result[str, str] = must_lookup(i, rt.target.name);
@@ -1373,14 +1492,35 @@ pub fun resolve_build_unit(alloc: *Allocator, i: *intern.Interner, m: *Manifest,
     ret ok[BuildUnit, str](u);
 }
 
-# artifact_err: the diagnostic for a failed artifact selection.
-fun artifact_err(alloc: *Allocator, m: *Manifest, sel: Selection) str {
+# artifact_err: the diagnostic for a failed artifact selection. an ambiguous
+# default (several artifacts, none selected) names every candidate so `mach run`
+# and `mach test`, which build exactly one artifact, point straight at the choice.
+fun artifact_err(alloc: *Allocator, i: *intern.Interner, m: *Manifest, sel: Selection) str {
     if (m.artifact_count == 0) { ret "mach.toml: no [bin.*] or [lib.*] artifacts declared"; }
     if (sel.has_artifact) {
         if (sel.want_lib) { ret cc3(alloc, "mach.toml: no lib named '", sel.artifact, "'"); }
         ret cc3(alloc, "mach.toml: no bin named '", sel.artifact, "'");
     }
-    ret "mach.toml: multiple artifacts declared; select one with --bin or --lib";
+    ret cc3(alloc, "mach.toml: multiple artifacts declared; select one with --bin/--lib (",
+        artifact_candidates(alloc, i, m), ")");
+}
+
+# artifact_candidates: a comma-separated `bin <name>`/`lib <name>` list of every
+# declared artifact, in declaration order, for the ambiguous-selection diagnostic.
+fun artifact_candidates(alloc: *Allocator, i: *intern.Interner, m: *Manifest) str {
+    var s: str = "";
+    var k: u32 = 0;
+    for (k < m.artifact_count) {
+        if (k > 0) { s = cc(alloc, s, ", "); }
+        var label: str = "bin ";
+        if (m.artifacts[k].is_lib) { label = "lib "; }
+        var name: str = "?";
+        val no: Option[str] = intern.lookup(i, m.artifacts[k].name);
+        if (is_some[str](no)) { name = unwrap[str](no); }
+        s = cc(alloc, s, cc(alloc, label, name));
+        k = k + 1;
+    }
+    ret s;
 }
 
 # expand_intern: expand a template then intern the result.
@@ -1744,6 +1884,64 @@ test "manifest: two artifacts resolving to the same path collide at build start"
         var m: Manifest = unwrap_ok[Manifest, str](mr);
         val cr: Result[bool, str] = check_collisions(?alloc, ?itn, ?m, ?m.targets[0], "debug");
         if (is_ok[bool, str](cr) || !str_equals(unwrap_err[bool, str](cr), "mach.toml: artifacts 'a' and 'b' both build to 'bin/app'")) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+# strarr_has: whether the interned StrId array holds an entry equal to `lit`.
+fun strarr_has(itn: *intern.Interner, items: *intern.StrId, count: u32, lit: str) bool {
+    var k: u32 = 0;
+    for (k < count) {
+        if (str_equals(idstr(itn, items[k]), lit)) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+test "manifest: defines merge with precedence artifact < target < per-cell" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\ntarget=\"windows\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\ndefines=[\"plat=win\",\"shared_flag\"]\n[bin.app]\nentry=\"main.mach\"\ndefines=[\"plat=app\",\"art_flag\"]\n[bin.app.target.windows]\ndefines=[\"plat=cell\"]\n");
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        val u: Result[BuildUnit, str] = resolve_build_unit(?alloc, ?itn, ?m, mk_sel("windows", "", "app", false, true));
+        if (is_err[BuildUnit, str](u)) { code = 1; }
+        or {
+            val bu: BuildUnit = unwrap_ok[BuildUnit, str](u);
+            # plat resolves once at its first-seen position, with the cell value.
+            if (bu.define_count != 3) { code = 1; }
+            if (!strarr_has(?itn, bu.defines, bu.define_count, "plat=cell")) { code = 1; }
+            if (strarr_has(?itn, bu.defines, bu.define_count, "plat=win"))   { code = 1; }
+            if (strarr_has(?itn, bu.defines, bu.define_count, "plat=app"))   { code = 1; }
+            if (!strarr_has(?itn, bu.defines, bu.define_count, "shared_flag")) { code = 1; }
+            if (!strarr_has(?itn, bu.defines, bu.define_count, "art_flag"))    { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "manifest: an ambiguous artifact selection errors naming every candidate" {
+    var backing: Allocator; var ar: arena.Arena; var alloc: Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val mr: Result[Manifest, str] = tparse(?alloc, ?itn, demo_src());
+    if (is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = unwrap_ok[Manifest, str](mr);
+        # no artifact selector with two bins is ambiguous; the error names both.
+        val u: Result[BuildUnit, str] = resolve_build_unit(?alloc, ?itn, ?m, mk_sel("", "", "", false, false));
+        if (is_ok[BuildUnit, str](u)) { code = 1; }
+        or {
+            val msg: str = unwrap_err[BuildUnit, str](u);
+            if (!str_contains(msg, "bin ls"))  { code = 1; }
+            if (!str_contains(msg, "bin cat")) { code = 1; }
+        }
     }
     arena.dnit(?ar);
     ret code;
