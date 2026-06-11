@@ -267,6 +267,12 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
     # path also corrupts callers from a value-free asm-only function).
     if (f.vreg_count == 0)  {
         f.callee_mask = asm_callee_mask(tgt, f);
+        # a vreg-free function can still perform float work on memory operands (or
+        # move a float constant into a return register), clobbering the callee-saved
+        # float scratch the prologue must then preserve. empty under SysV.
+        if (function_uses_fp_scratch(f)) {
+            f.callee_mask_fp = fp_scratch_callee_mask(tgt);
+        }
         ret ok[bool, str](true);
     }
 
@@ -1895,6 +1901,96 @@ fun abi_callee_saved_gp_mask(tgt: *target.Target) u32 {
     ret m;
 }
 
+# abi_callee_saved_fp_mask: the FP-bank twin of `abi_callee_saved_gp_mask` — a
+# bitmask (XMM within-bank index n -> bit n) of the ABI's callee-saved vector
+# registers (win64's XMM6–15; empty under SysV, whose vector bank is wholly
+# caller-saved). keyed on the within-bank index so it composes with the FP bank's
+# index-keyed masks.
+fun abi_callee_saved_fp_mask(tgt: *target.Target) u32 {
+    var regs: [32]isa.Register;
+    val fill: abi.RegFileFn = tgt.abi.callee_saved::abi.RegFileFn;
+    val n: i32 = fill(?regs[0]);
+    var m: u32 = 0;
+    var i: i32 = 0;
+    for (i < n && i < MAX_REG_FILE) {
+        val id: i32 = regs[i].id;
+        if (isa.regid_class(id) == isa.REG_CLASS_ID_XMM) {
+            val idx: i32 = isa.regid_index(id);
+            if (idx >= 0 && idx < 32) { m = m | (1::u32 << idx::u32); }
+        }
+        i = i + 1;
+    }
+    ret m;
+}
+
+# fp_scratch_callee_mask: the bitmask (XMM within-bank index n -> bit n) of
+# callee-saved vector registers the ISA holds back from the allocatable bank as
+# fixed float scratch — the callee-saved XMM registers the encoder may clobber but
+# the allocator never assigns. derived structurally as (ABI callee-saved vector
+# set) minus (allocatable FP bank): the FP bank is capped below the full register
+# file precisely to reserve those scratch registers (x86-64's XMM14/15, the SSE
+# analogue of the GP R10/R11), so any callee-saved register past the bank is a
+# reserved scratch register. empty under SysV (no callee-saved XMM) and for any ISA
+# whose float scratch is caller-saved, so it never perturbs such a target's
+# codegen. names no architecture register, so a new ISA whose float scratch sits in
+# a callee-saved slot needs no edit here.
+fun fp_scratch_callee_mask(tgt: *target.Target) u32 {
+    val cs: u32 = abi_callee_saved_fp_mask(tgt);
+    if (cs == 0) { ret 0; }
+    val fpc: u32 = bank_count(tgt, fp_class_index(tgt));
+    var alloc_mask: u32 = 0;
+    var i: u32 = 0;
+    for (i < fpc && i < 32) {
+        alloc_mask = alloc_mask | (1::u32 << i);
+        i = i + 1;
+    }
+    ret cs & ~alloc_mask;
+}
+
+# function_uses_fp_scratch: true when any instruction in `f` is lowered through the
+# ISA's fixed XMM scratch pair — a scalar float arithmetic / comparison / negation /
+# conversion op (the encoder routes every operand through the scratch), or a float
+# move naming a vector register (a same-bank float move loads through the scratch;
+# a both-memory float copy uses the GP scratch instead and so names no vector
+# register, correctly excluding it). a function that hits one of these clobbers the
+# callee-saved float scratch and must preserve it for its caller, exactly as it
+# preserves an allocated callee-saved register.
+fun function_uses_fp_scratch(f: *mir.MirFunction) bool {
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            val o: mir.MirOpcode = mi.opcode;
+            if (o == mir.MIR_FADD || o == mir.MIR_FSUB || o == mir.MIR_FMUL ||
+                o == mir.MIR_FDIV || o == mir.MIR_FCMP || o == mir.MIR_FNEG ||
+                o == mir.MIR_FP_TRUNC || o == mir.MIR_FP_EXT ||
+                o == mir.MIR_FP_TO_SI || o == mir.MIR_FP_TO_UI ||
+                o == mir.MIR_SI_TO_FP || o == mir.MIR_UI_TO_FP) {
+                ret true;
+            }
+            if (o == mir.MIR_MOV) {
+                var k: u32 = 0;
+                for (k < mi.operand_count) {
+                    val op: *mir.MirOperand = ?mi.operands[k];
+                    if (op.kind == mir.MIR_OP_VREG && mir.vreg_is_fp(f, op.vreg)) {
+                        ret true;
+                    }
+                    if (op.kind == mir.MIR_OP_PREG &&
+                        isa.regid_class(op.preg::i32) == isa.REG_CLASS_ID_XMM) {
+                        ret true;
+                    }
+                    k = k + 1;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
 # isa_reserved_gp_mask: GP-register bitmask the ISA reserves from allocation (the
 # stack / frame pointers, the reload-scratch pool, and the encoder's split
 # scratch) — the bitmask form of `seed_reserved`'s always-reserved set, so a
@@ -2034,6 +2130,14 @@ fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
     # writes, so the prologue preserves it for the caller even when no allocated
     # value lives there.
     mask = mask | asm_callee_mask(tgt, ctx.f);
+
+    # OR in the callee-saved float scratch (win64's XMM14/15) when the function
+    # performs float work: the encoder clobbers those registers lowering float ops,
+    # and the allocator never assigns them, so the prologue must preserve them for
+    # the caller. empty under SysV, so this leaves the linux mask unchanged.
+    if (function_uses_fp_scratch(ctx.f)) {
+        fp_mask = fp_mask | fp_scratch_callee_mask(tgt);
+    }
 
     ctx.f.callee_mask    = mask;
     ctx.f.callee_mask_fp = fp_mask;
