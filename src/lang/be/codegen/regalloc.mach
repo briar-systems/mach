@@ -163,6 +163,15 @@ rec LiveRange {
 #                 allocation and drawn from for spill reloads (borrowed pointer
 #                 into the ISA vtable; nil when the ISA wires no pool)
 # reload_scratch_count: number of reload-scratch registers
+# BlockSpan: the flat-position span of one block.
+# ---
+# start: first flat position in the block (-1 when the block is empty)
+# end:   last flat position in the block (-1 when the block is empty)
+rec BlockSpan {
+    start: i64;
+    end:   i64;
+}
+
 rec AllocCtx {
     alloc:         *Allocator;
     f:             *mir.MirFunction;
@@ -197,6 +206,25 @@ rec AllocCtx {
     cur_end:       i64;
     reload_scratch:       *isa.Register;
     reload_scratch_count: i32;
+    # block_id_index: map from a block's id to its current index in `f.blocks`,
+    # sized `block_id_index_cap` (max block id + 1) with `RANGE_NIL` in unused
+    # slots. block ids stay fixed while `apply_order` permutes the array, so the map
+    # is refilled after the reorder. replaces the O(blocks) `block_index_of` scan in
+    # the DFS and the liveness fixpoint with an O(1) lookup; the lookups are
+    # unchanged, so allocation is unaffected.
+    block_id_index:     *u32;
+    block_id_index_cap: u32;
+    # block_spans: each block's [first, last] flat-stream position, sized
+    # `f.block_count`, precomputed once from the flat stream so the liveness
+    # range-extension reads a block's span in O(1) instead of rescanning the whole
+    # stream per block.
+    block_spans:        *BlockSpan;
+    # vreg_slot_flag: per-vreg flag — does the vreg own a lowering storage slot
+    # (alloca / by-value aggregate), sized `f.vreg_count`. precomputed once so
+    # `vreg_has_slot` is an O(1) read instead of an O(slots) scan per vreg. spill
+    # slots added later name only spilled vregs, which `is_spilled` rejects before
+    # consulting this, so the flag stays correct after the scan.
+    vreg_slot_flag:     *bool;
 }
 
 # run: allocate physical registers for every function in a MIR module.
@@ -269,9 +297,11 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
         f.callee_mask = asm_callee_mask(tgt, f);
         # a vreg-free function can still perform float work on memory operands (or
         # move a float constant into a return register), clobbering the callee-saved
-        # float scratch the prologue must then preserve. empty under SysV.
-        if (function_uses_fp_scratch(f)) {
-            f.callee_mask_fp = fp_scratch_callee_mask(tgt);
+        # float scratch the prologue must then preserve. the scratch mask is empty
+        # under SysV, so the float-op scan is skipped entirely off win64.
+        val fp_scratch: u32 = fp_scratch_callee_mask(tgt);
+        if (fp_scratch != 0 && function_uses_fp_scratch(f)) {
+            f.callee_mask_fp = fp_scratch;
         }
         ret ok[bool, str](true);
     }
@@ -329,12 +359,20 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
     val fl: Result[bool, str] = flatten(?ctx);
     if (is_err[bool, str](fl)) { ctx_dnit(?ctx); ret fl; }
 
+    # precompute the per-block flat spans and per-vreg storage-slot flags the
+    # liveness and scan passes would otherwise rebuild by rescanning.
+    val bs: Result[bool, str] = build_block_spans(?ctx);
+    if (is_err[bool, str](bs)) { ctx_dnit(?ctx); ret bs; }
+    val vs: Result[bool, str] = build_vreg_slot_flags(?ctx);
+    if (is_err[bool, str](vs)) { ctx_dnit(?ctx); ret vs; }
+
     build_ranges(?ctx);
 
     val lv: Result[bool, str] = extend_liveness(?ctx);
     if (is_err[bool, str](lv)) { ctx_dnit(?ctx); ret lv; }
 
-    mark_call_crossing(?ctx);
+    val mc: Result[bool, str] = mark_call_crossing(?ctx);
+    if (is_err[bool, str](mc)) { ctx_dnit(?ctx); ret mc; }
 
     val sc: Result[bool, str] = linear_scan(tgt, ?ctx);
     if (is_err[bool, str](sc)) { ctx_dnit(?ctx); ret sc; }
@@ -383,6 +421,10 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.cur_end       = 0;
     ctx.reload_scratch       = tgt.arch.reload_scratch_regs;
     ctx.reload_scratch_count = tgt.arch.reload_scratch_count;
+    ctx.block_id_index       = nil;
+    ctx.block_id_index_cap   = 0;
+    ctx.block_spans          = nil;
+    ctx.vreg_slot_flag       = nil;
 
     val ro: Result[*u32, str] = allocate[u32](m.alloc, f.block_count::usize);
     if (is_err[*u32, str](ro)) { ret err[bool, str](unwrap_err[*u32, str](ro)); }
@@ -538,6 +580,18 @@ fun ctx_dnit(ctx: *AllocCtx) {
     if (ctx.active != nil) {
         deallocate[u32](ctx.alloc, ctx.active, ctx.f.vreg_count::usize);
         ctx.active = nil;
+    }
+    if (ctx.block_id_index != nil && ctx.block_id_index_cap > 0) {
+        deallocate[u32](ctx.alloc, ctx.block_id_index, ctx.block_id_index_cap::usize);
+        ctx.block_id_index = nil;
+    }
+    if (ctx.block_spans != nil && ctx.f.block_count > 0) {
+        deallocate[BlockSpan](ctx.alloc, ctx.block_spans, ctx.f.block_count::usize);
+        ctx.block_spans = nil;
+    }
+    if (ctx.vreg_slot_flag != nil && ctx.f.vreg_count > 0) {
+        deallocate[bool](ctx.alloc, ctx.vreg_slot_flag, ctx.f.vreg_count::usize);
+        ctx.vreg_slot_flag = nil;
     }
 }
 
@@ -707,6 +761,10 @@ fun build_order(ctx: *AllocCtx) Result[bool, str] {
     val f: *mir.MirFunction = ctx.f;
     val n: u32 = f.block_count;
 
+    # the DFS resolves successor ids to block indices in the original layout.
+    val bx: Result[bool, str] = fill_block_id_index(ctx);
+    if (is_err[bool, str](bx)) { ret bx; }
+
     val rv: Result[*bool, str] = allocate[bool](ctx.alloc, n::usize);
     if (is_err[*bool, str](rv)) { ret err[bool, str](unwrap_err[*bool, str](rv)); }
     val visited: *bool = unwrap_ok[*bool, str](rv);
@@ -805,15 +863,45 @@ fun next_unvisited_succ(ctx: *AllocCtx, b: u32, six: *u32, visited: *bool) u32 {
     ret RANGE_NIL;
 }
 
-# block_index_of: the block-array index whose `id` equals `bid`, or RANGE_NIL.
-fun block_index_of(ctx: *AllocCtx, bid: u32) u32 {
+# fill_block_id_index: (re)build the block-id -> block-array-index map from the
+# current `f.blocks` layout. allocated once (block ids are stable while
+# `apply_order` permutes the array, so the cap never changes) and refilled after
+# the reorder. unused id slots hold RANGE_NIL. must run before any
+# `block_index_of` on the current layout — `build_order` calls it before its DFS
+# and `apply_order` rebuilds it after permuting the blocks. block ids are unique,
+# so the last writer per id is also the only one.
+fun fill_block_id_index(ctx: *AllocCtx) Result[bool, str] {
     val f: *mir.MirFunction = ctx.f;
-    var i: u32 = 0;
-    for (i < f.block_count) {
-        if (f.blocks[i].id == bid) { ret i; }
-        i = i + 1;
+    val n: u32 = f.block_count;
+    if (n == 0) { ret ok[bool, str](true); }
+
+    if (ctx.block_id_index == nil) {
+        var max_id: u32 = 0;
+        var i: u32 = 0;
+        for (i < n) {
+            if (f.blocks[i].id > max_id) { max_id = f.blocks[i].id; }
+            i = i + 1;
+        }
+        val cap: u32 = max_id + 1;
+        val r: Result[*u32, str] = allocate[u32](ctx.alloc, cap::usize);
+        if (is_err[*u32, str](r)) { ret err[bool, str](unwrap_err[*u32, str](r)); }
+        ctx.block_id_index     = unwrap_ok[*u32, str](r);
+        ctx.block_id_index_cap = cap;
     }
-    ret RANGE_NIL;
+
+    var j: u32 = 0;
+    for (j < ctx.block_id_index_cap) { ctx.block_id_index[j] = RANGE_NIL; j = j + 1; }
+    var k: u32 = 0;
+    for (k < n) { ctx.block_id_index[f.blocks[k].id] = k; k = k + 1; }
+    ret ok[bool, str](true);
+}
+
+# block_index_of: the block-array index whose `id` equals `bid`, or RANGE_NIL. an
+# O(1) read of the id map `fill_block_id_index` builds; a `bid` past the largest
+# id names no block (RANGE_NIL), matching the former linear scan's miss result.
+fun block_index_of(ctx: *AllocCtx, bid: u32) u32 {
+    if (bid >= ctx.block_id_index_cap) { ret RANGE_NIL; }
+    ret ctx.block_id_index[bid];
 }
 
 # apply_order: permute `f.blocks` into the computed reverse-postorder. the entry
@@ -846,7 +934,10 @@ fun apply_order(ctx: *AllocCtx) Result[bool, str] {
     # after reordering, the order array is identity (blocks are physically in RPO).
     i = 0;
     for (i < n) { ctx.order[i] = i; i = i + 1; }
-    ret ok[bool, str](true);
+
+    # the blocks moved, so the id -> index map must reflect the new RPO layout for
+    # the liveness fixpoint's successor lookups.
+    ret fill_block_id_index(ctx);
 }
 
 # flatten: count every instruction across all blocks (now in RPO) and build the
@@ -1018,7 +1109,7 @@ fun extend_liveness(ctx: *AllocCtx) Result[bool, str] {
     # extend ranges to cover blocks where the vreg is live-in or live-out.
     var bi: u32 = 0;
     for (bi < nb) {
-        val span: BlockSpan = block_span(ctx, bi);
+        val span: BlockSpan = ctx.block_spans[bi];
         val base: usize = (bi::usize) * (nv::usize);
         var v: u32 = 0;
         for (v < nv) {
@@ -1040,29 +1131,29 @@ fun extend_liveness(ctx: *AllocCtx) Result[bool, str] {
     ret ok[bool, str](true);
 }
 
-# BlockSpan: the flat-position span of one block.
-# ---
-# start: first flat position in the block (-1 when the block is empty)
-# end:   last flat position in the block (-1 when the block is empty)
-rec BlockSpan {
-    start: i64;
-    end:   i64;
-}
+# build_block_spans: precompute each block's [first, last] flat-stream position in
+# one pass over the flat stream, so the liveness range-extension reads a span in
+# O(1) instead of rescanning the whole stream per block. an empty block keeps
+# [-1, -1]. must run after `flatten`.
+fun build_block_spans(ctx: *AllocCtx) Result[bool, str] {
+    val f: *mir.MirFunction = ctx.f;
+    val n: u32 = f.block_count;
+    if (n == 0) { ret ok[bool, str](true); }
 
-# block_span: the [first, last] flat positions belonging to block index `bi`.
-fun block_span(ctx: *AllocCtx, bi: u32) BlockSpan {
-    var span: BlockSpan;
-    span.start = -1;
-    span.end   = -1;
+    val r: Result[*BlockSpan, str] = allocate[BlockSpan](ctx.alloc, n::usize);
+    if (is_err[*BlockSpan, str](r)) { ret err[bool, str](unwrap_err[*BlockSpan, str](r)); }
+    ctx.block_spans = unwrap_ok[*BlockSpan, str](r);
+
+    var i: u32 = 0;
+    for (i < n) { ctx.block_spans[i].start = -1; ctx.block_spans[i].end = -1; i = i + 1; }
     var pos: u32 = 0;
     for (pos < ctx.flat_count) {
-        if (ctx.flat[pos].block == bi) {
-            if (span.start < 0) { span.start = pos::i64; }
-            span.end = pos::i64;
-        }
+        val b: u32 = ctx.flat[pos].block;
+        if (ctx.block_spans[b].start < 0) { ctx.block_spans[b].start = pos::i64; }
+        ctx.block_spans[b].end = pos::i64;
         pos = pos + 1;
     }
-    ret span;
+    ret ok[bool, str](true);
 }
 
 # compute_use_def: fill per-block upward-exposed uses and definitions. operand 0
@@ -1204,23 +1295,43 @@ fun or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
     }
 }
 
-# mark_call_crossing: flag every range whose interval contains a MIR_CALL barrier
-# so the scan prefers a callee-saved register for it.
-fun mark_call_crossing(ctx: *AllocCtx) {
-    var ci: u32 = 0;
-    for (ci < ctx.flat_count) {
-        if (ctx.flat[ci].is_call) {
-            var v: u32 = 0;
-            for (v < ctx.f.vreg_count) {
-                val lr: *LiveRange = ?ctx.ranges[v];
-                if (lr.end_pos >= 0 && lr.start <= ci::i64 && lr.end_pos >= ci::i64) {
-                    lr.crosses_call = true;
-                }
-                v = v + 1;
+# mark_call_crossing: flag every range whose interval contains a call barrier so
+# the scan prefers a callee-saved register for it. a prefix count of call barriers
+# over the flat stream turns the "does [start, end] contain a call" test into a
+# subtraction, so the pass is O(flat + vregs) instead of O(calls * vregs); the
+# per-range result is identical, so allocation is unaffected.
+fun mark_call_crossing(ctx: *AllocCtx) Result[bool, str] {
+    val n: u32 = ctx.flat_count;
+    if (n == 0) { ret ok[bool, str](true); }
+
+    # prefix[p] = number of call barriers in flat[0..p); a range [s, e] crosses a
+    # call iff prefix[e + 1] - prefix[s] > 0.
+    val r: Result[*u32, str] = allocate[u32](ctx.alloc, (n + 1)::usize);
+    if (is_err[*u32, str](r)) { ret err[bool, str](unwrap_err[*u32, str](r)); }
+    val prefix: *u32 = unwrap_ok[*u32, str](r);
+    prefix[0] = 0;
+    var p: u32 = 0;
+    for (p < n) {
+        var inc: u32 = 0;
+        if (ctx.flat[p].is_call) { inc = 1; }
+        prefix[p + 1] = prefix[p] + inc;
+        p = p + 1;
+    }
+
+    var v: u32 = 0;
+    for (v < ctx.f.vreg_count) {
+        val lr: *LiveRange = ?ctx.ranges[v];
+        # a referenced range has 0 <= start <= end_pos < flat_count.
+        if (lr.end_pos >= 0) {
+            if (prefix[(lr.end_pos + 1)::u32] - prefix[lr.start::u32] > 0) {
+                lr.crosses_call = true;
             }
         }
-        ci = ci + 1;
+        v = v + 1;
     }
+
+    deallocate[u32](ctx.alloc, prefix, (n + 1)::usize);
+    ret ok[bool, str](true);
 }
 
 # linear_scan: assign each vreg a physical register (writing `MirVReg.assigned`)
@@ -1499,17 +1610,39 @@ fun release_pins(ctx: *AllocCtx, current_start: i64) {
     }
 }
 
+# build_vreg_slot_flags: precompute, in one pass over the frame slots, whether each
+# vreg owns a lowering storage slot (alloca / by-value aggregate), so `vreg_has_slot`
+# is an O(1) read instead of an O(slots) scan per vreg. spill slots the scan adds
+# later name only spilled vregs, which the one caller that runs post-scan
+# (`is_storage_slot`) rejects via `is_spilled` before consulting this flag, so the
+# flag stays correct without rebuilding.
+fun build_vreg_slot_flags(ctx: *AllocCtx) Result[bool, str] {
+    val f: *mir.MirFunction = ctx.f;
+    val nv: u32 = f.vreg_count;
+    if (nv == 0) { ret ok[bool, str](true); }
+
+    val r: Result[*bool, str] = allocate[bool](ctx.alloc, nv::usize);
+    if (is_err[*bool, str](r)) { ret err[bool, str](unwrap_err[*bool, str](r)); }
+    ctx.vreg_slot_flag = unwrap_ok[*bool, str](r);
+    var i: u32 = 0;
+    for (i < nv) { ctx.vreg_slot_flag[i] = false; i = i + 1; }
+
+    val frame: *mir.MirFrame = ?f.frame;
+    var s: u32 = 0;
+    for (s < frame.slot_count) {
+        val owner: u32 = frame.slots[s].value;
+        if (owner < nv) { ctx.vreg_slot_flag[owner] = true; }
+        s = s + 1;
+    }
+    ret ok[bool, str](true);
+}
+
 # vreg_has_slot: true when a vreg owns a frame slot (alloca pointer or by-value
 # aggregate / spill). such vregs are addressed as `[rbp + offset]` and never
-# register-allocated.
+# register-allocated. an O(1) read of the flags `build_vreg_slot_flags` precomputes.
 fun vreg_has_slot(ctx: *AllocCtx, v: u32) bool {
-    val frame: *mir.MirFrame = ?ctx.f.frame;
-    var i: u32 = 0;
-    for (i < frame.slot_count) {
-        if (frame.slots[i].value == v) { ret true; }
-        i = i + 1;
-    }
-    ret false;
+    if (v >= ctx.f.vreg_count) { ret false; }
+    ret ctx.vreg_slot_flag[v];
 }
 
 # sort_by_start: insertion-sort vreg ids in `order` by ascending range start,
@@ -2134,9 +2267,11 @@ fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
     # OR in the callee-saved float scratch (win64's XMM14/15) when the function
     # performs float work: the encoder clobbers those registers lowering float ops,
     # and the allocator never assigns them, so the prologue must preserve them for
-    # the caller. empty under SysV, so this leaves the linux mask unchanged.
-    if (function_uses_fp_scratch(ctx.f)) {
-        fp_mask = fp_mask | fp_scratch_callee_mask(tgt);
+    # the caller. the scratch mask is empty under SysV, so the float-op scan is
+    # skipped entirely off win64 and the linux mask is unchanged.
+    val fp_scratch: u32 = fp_scratch_callee_mask(tgt);
+    if (fp_scratch != 0 && function_uses_fp_scratch(ctx.f)) {
+        fp_mask = fp_mask | fp_scratch;
     }
 
     ctx.f.callee_mask    = mask;
