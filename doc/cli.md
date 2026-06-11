@@ -24,6 +24,7 @@ matched exactly: `--flag value` (a value follows in the next argument) or a bare
 | `dep`   | manage git-backed dependencies (clone, lock, vendor) under `<dir_dep>` |
 | `init`  | scaffold a new project |
 | `doc`   | generate Markdown reference docs from source doc-comments |
+| `info`  | print compiler version, build host, and registered target capabilities |
 | `help`  | print usage; `mach help <command>` for detail |
 
 ## Global flags
@@ -299,6 +300,38 @@ hand-written `doc/language/` material is never touched.
 | `--target <name>`| name  | select a `[targets.<name>]` entry for module discovery |
 
 Plus the global flags. Exit codes: `0` ok, `1` user error, `2` internal error.
+
+## `mach info`
+
+```
+mach info [--version]
+```
+
+Prints an at-a-glance identity of the binary: its version, the host (`os/isa`)
+it was built for, and the registered capability surface — the instruction sets,
+operating systems, ABIs, and object formats it can compose into a target. This
+needs no project (it runs from anywhere, with or without a `mach.toml`). The
+output is line-oriented and stable for scripts:
+
+```
+mach 1.3.0
+host: linux/x86_64
+isa: x86_64 aarch64
+os: linux darwin windows
+abi: sysv win64
+object: elf macho coff
+```
+
+The version line and `host:` line fold at compile time; the four capability
+lines are read from the binary's target registries, so they report exactly what
+this build can target. `mach info --version` prints the version string alone on
+one line, for tooling.
+
+| Flag        | Value | Effect |
+|-------------|-------|--------|
+| `--version` | —     | print the version string alone, on one line |
+
+Exit codes: `0` ok, `2` internal error.
 
 ## `mach help`
 
