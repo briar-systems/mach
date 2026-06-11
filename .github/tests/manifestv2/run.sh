@@ -130,4 +130,32 @@ else
     echo "PASS manifestv2: colliding artifact paths fail at build start"
 fi
 
+# cascading transitive dep libs (#1218): the consumer declares no platform libs;
+# its windows .exe must inherit kernel32.dll (from the v2 dep kdep) and user32.dll
+# (from the v1 dep vdep) by target-tuple equality, while the native (linux) build
+# inherits neither — proving tuple gating (a leak would fail the link with a DLL
+# against a non-PE target).
+CASC="$WORK/cascade"
+cp -r "$HERE/cascade" "$CASC"
+ln -s "$STD" "$CASC/dep/mach-std"
+
+( cd "$CASC" && "$MACH" build . --target windows )
+CEXE="$CASC/out/windows/debug/bin/cons.exe"
+if [ -f "$CEXE" ] && strings "$CEXE" | grep -qi kernel32 && strings "$CEXE" | grep -qi user32; then
+    echo "PASS manifestv2: windows .exe inherits kernel32 (v2 dep) + user32 (v1 dep) via cascade"
+else
+    echo "FAIL manifestv2: cascade did not import both dep libs into the windows .exe" >&2; fail=1
+fi
+
+if ( cd "$CASC" && "$MACH" build . ) >/dev/null 2>&1; then
+    CBIN="$CASC/out/linux/debug/bin/cons"
+    if [ -x "$CBIN" ] && ! strings "$CBIN" | grep -qiE "kernel32|user32"; then
+        echo "PASS manifestv2: linux build inherits no windows-only dep libs (tuple gating)"
+    else
+        echo "FAIL manifestv2: a windows-only dep lib leaked into the linux build" >&2; fail=1
+    fi
+else
+    echo "FAIL manifestv2: native cascade build failed (windows-only dep libs wrongly inherited?)" >&2; fail=1
+fi
+
 exit "$fail"

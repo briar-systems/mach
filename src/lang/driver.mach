@@ -167,6 +167,11 @@ pub rec DepEntry {
 #                  < cell), each `NAME` or `NAME=VALUE`; bound into every module's
 #                  comptime ctx during load (#1191). v2 only; nil when none
 # v2_define_count: number of entries in v2_defines
+# cascade_libs:      transitive dependency link inputs whose declared target tuple
+#                    (isa, os, abi) matches the selected target's, in topological
+#                    dep then declaration order, deduplicated by name and excluding
+#                    the consumer's own libs (#1218); nil when none
+# cascade_lib_count: number of entries in cascade_libs
 pub rec ProjectConfig {
     id:           intern.StrId;
     dir_src:      intern.StrId;
@@ -187,6 +192,8 @@ pub rec ProjectConfig {
     v2_emit_asm:  bool;
     v2_defines:      *intern.StrId;
     v2_define_count: u32;
+    cascade_libs:      *intern.StrId;
+    cascade_lib_count: u32;
 }
 
 # PubConst: one comptime constant exported by a module to its importers.
@@ -606,6 +613,8 @@ fun init_project(p: *Project, s: *sess.Session) {
     p.config.v2_emit_asm  = false;
     p.config.v2_defines       = nil;
     p.config.v2_define_count  = 0;
+    p.config.cascade_libs      = nil;
+    p.config.cascade_lib_count = 0;
     p.modules       = nil;
     p.module_len    = 0;
     p.module_cap    = 0;
@@ -635,12 +644,17 @@ fun deallocate_config(c: *ProjectConfig, alloc: *Allocator) {
     if (c.v2_defines != nil && c.v2_define_count > 0) {
         deallocate[intern.StrId](alloc, c.v2_defines, c.v2_define_count::usize);
     }
+    if (c.cascade_libs != nil && c.cascade_lib_count > 0) {
+        deallocate[intern.StrId](alloc, c.cascade_libs, c.cascade_lib_count::usize);
+    }
     c.targets      = nil;
     c.target_count = 0;
     c.deps         = nil;
     c.dep_count    = 0;
     c.v2_defines       = nil;
     c.v2_define_count  = 0;
+    c.cascade_libs      = nil;
+    c.cascade_lib_count = 0;
 }
 
 fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection) Result[bool, str] {
@@ -765,6 +779,20 @@ fun load_v2_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifes
     val dr: Result[bool, str] = resolve_v2_deps(p, ?m, project_root);
     if (is_err[bool, str](dr)) { manifest.dnit(?m, p.s.alloc); ret dr; }
 
+    # cascade the transitive deps' tuple-matched link libs into the build. the
+    # tuple strings come from the selected target (interner-owned, so stable past
+    # the manifest teardown below); the dep manifests are read fresh.
+    val isa_opt: Option[str] = intern.lookup(?p.s.interner, bu.target.isa);
+    val os_opt:  Option[str] = intern.lookup(?p.s.interner, bu.target.os);
+    val abi_opt: Option[str] = intern.lookup(?p.s.interner, bu.target.abi);
+    if (is_none[str](isa_opt) || is_none[str](os_opt) || is_none[str](abi_opt)) {
+        manifest.dnit(?m, p.s.alloc);
+        ret err[bool, str]("internal: selected target tuple not interned");
+    }
+    val cr2: Result[bool, str] = resolve_cascade_libs(p, project_root,
+        unwrap[str](isa_opt), unwrap[str](os_opt), unwrap[str](abi_opt), bu.libs, bu.lib_count);
+    if (is_err[bool, str](cr2)) { manifest.dnit(?m, p.s.alloc); ret cr2; }
+
     manifest.dnit(?m, p.s.alloc);
     ret ok[bool, str](true);
 }
@@ -823,6 +851,188 @@ fun resolve_v2_deps(p: *Project, m: *manifest.Manifest, project_root: str) Resul
         i = i + 1;
     }
     ret ok[bool, str](true);
+}
+
+# resolve_cascade_libs: gather the transitive dependencies' tuple-matched link
+# libs into `p.config.cascade_libs` (#1218). a dependency declares its own
+# `[target.*].libs` (v2) or `[targets.*].libs`/`.link` (v1) — both formats are read
+# on the dep side during the transition — and a consumer inherits every such lib
+# whose target tuple (isa, os, abi) equals the one being built, so a platform link
+# requirement (e.g. `kernel32.dll`) lives once in the providing dependency's
+# manifest. order is topological (a dep's own deps first) then declaration order;
+# libs are deduplicated by name and the consumer's own `own_libs` are excluded, so
+# a shared requirement is never linked twice. an empty result leaves the cascade
+# nil/0, so a build with no inheriting deps is unaffected.
+fun resolve_cascade_libs(p: *Project, project_root: str, isa: str, os: str, abi: str,
+                         own_libs: *intern.StrId, own_count: u32) Result[bool, str] {
+    p.config.cascade_libs      = nil;
+    p.config.cascade_lib_count = 0;
+    val n: u32 = p.config.dep_count;
+    if (n == 0) { ret ok[bool, str](true); }
+
+    # parse every dep manifest once and resolve its alias string up front; both
+    # drive the ordering and lib collection below.
+    val tr: Result[*toml.Table, str] = allocate[toml.Table](p.s.alloc, n::usize);
+    if (is_err[*toml.Table, str](tr)) { ret err[bool, str](unwrap_err[*toml.Table, str](tr)); }
+    val tables: *toml.Table = unwrap_ok[*toml.Table, str](tr);
+    val ar: Result[*str, str] = allocate[str](p.s.alloc, n::usize);
+    if (is_err[*str, str](ar)) { ret err[bool, str](unwrap_err[*str, str](ar)); }
+    val aliases: *str = unwrap_ok[*str, str](ar);
+
+    var i: u32 = 0;
+    for (i < n) {
+        val vr_opt: Option[str] = intern.lookup(?p.s.interner, p.config.deps[i].vendor_root);
+        val al_opt: Option[str] = intern.lookup(?p.s.interner, p.config.deps[i].alias);
+        if (is_none[str](vr_opt) || is_none[str](al_opt)) { ret err[bool, str]("internal: dep metadata not interned"); }
+        aliases[i] = unwrap[str](al_opt);
+        val tp_r: Result[str, str] = join_path(p.s.alloc, unwrap[str](vr_opt), "mach.toml");
+        if (is_err[str, str](tp_r)) { ret err[bool, str](unwrap_err[str, str](tp_r)); }
+        val tp: str = unwrap_ok[str, str](tp_r);
+        val pr: Result[toml.Table, str] = parse_toml_file(p.s.alloc, tp);
+        str_free(p.s.alloc, tp);
+        if (is_err[toml.Table, str](pr)) { ret err[bool, str](unwrap_err[toml.Table, str](pr)); }
+        tables[i] = unwrap_ok[toml.Table, str](pr);
+        i = i + 1;
+    }
+
+    # topological dep order via post-order DFS over the inter-dep `[deps.*]` graph.
+    val ov: Result[*u32, str] = allocate[u32](p.s.alloc, n::usize);
+    if (is_err[*u32, str](ov)) { ret err[bool, str](unwrap_err[*u32, str](ov)); }
+    val order: *u32 = unwrap_ok[*u32, str](ov);
+    val vv: Result[*bool, str] = allocate[bool](p.s.alloc, n::usize);
+    if (is_err[*bool, str](vv)) { ret err[bool, str](unwrap_err[*bool, str](vv)); }
+    val visited: *bool = unwrap_ok[*bool, str](vv);
+    i = 0;
+    for (i < n) { visited[i] = false; i = i + 1; }
+    var order_len: u32 = 0;
+    i = 0;
+    for (i < n) { cascade_dfs(?tables[0], aliases, visited, order, ?order_len, n, i); i = i + 1; }
+
+    # upper-bound by the total tuple-matched lib count, then fill with dedup.
+    var max: u32 = 0;
+    i = 0;
+    for (i < n) {
+        val arr: *toml.Array = tuple_libs(?tables[i], isa, os, abi);
+        if (arr != nil) { max = max + toml.array_len(arr)::u32; }
+        i = i + 1;
+    }
+    if (max == 0) { ret ok[bool, str](true); }
+
+    val br: Result[*intern.StrId, str] = allocate[intern.StrId](p.s.alloc, max::usize);
+    if (is_err[*intern.StrId, str](br)) { ret err[bool, str](unwrap_err[*intern.StrId, str](br)); }
+    val buf: *intern.StrId = unwrap_ok[*intern.StrId, str](br);
+    var w: u32 = 0;
+
+    var oi: u32 = 0;
+    for (oi < order_len) {
+        val di: u32 = order[oi];
+        val arr: *toml.Array = tuple_libs(?tables[di], isa, os, abi);
+        if (arr != nil) {
+            val cnt: usize = toml.array_len(arr);
+            var k: usize = 0;
+            for (k < cnt) {
+                val v: *toml.Value = toml.array_get(arr, k);
+                if (v == nil || v.tag != toml.TYPE_STRING) {
+                    deallocate[intern.StrId](p.s.alloc, buf, max::usize);
+                    ret err[bool, str]("dep mach.toml: a target's libs entry is not a string");
+                }
+                val idr: Result[intern.StrId, str] = intern.intern(?p.s.interner, v.data.string);
+                if (is_err[intern.StrId, str](idr)) {
+                    deallocate[intern.StrId](p.s.alloc, buf, max::usize);
+                    ret err[bool, str](unwrap_err[intern.StrId, str](idr));
+                }
+                val id: intern.StrId = unwrap_ok[intern.StrId, str](idr);
+                if (!strid_in(buf, w, id) && !strid_in(own_libs, own_count, id)) {
+                    buf[w] = id; w = w + 1;
+                }
+                k = k + 1;
+            }
+        }
+        oi = oi + 1;
+    }
+
+    if (w == 0) {
+        deallocate[intern.StrId](p.s.alloc, buf, max::usize);
+        ret ok[bool, str](true);
+    }
+    if (w < max) {
+        val sr: Result[*intern.StrId, str] = reallocate[intern.StrId](p.s.alloc, buf, max::usize, w::usize);
+        if (is_ok[*intern.StrId, str](sr)) {
+            p.config.cascade_libs      = unwrap_ok[*intern.StrId, str](sr);
+            p.config.cascade_lib_count = w;
+            ret ok[bool, str](true);
+        }
+    }
+    p.config.cascade_libs      = buf;
+    p.config.cascade_lib_count = w;
+    ret ok[bool, str](true);
+}
+
+# cascade_dfs: post-order DFS visiting a dep's own declared deps before the dep
+# itself, so the emitted order is topological (dependencies first) with siblings
+# kept in declaration order. `base` points at the dep manifest table array.
+fun cascade_dfs(base: *toml.Table, aliases: *str, visited: *bool, order: *u32, order_len: *u32, n: u32, i: u32) {
+    if (visited[i]) { ret; }
+    visited[i] = true;
+    var j: u32 = 0;
+    for (j < n) {
+        if (j != i && dep_declares(?base[i], aliases[j])) {
+            cascade_dfs(base, aliases, visited, order, order_len, n, j);
+        }
+        j = j + 1;
+    }
+    order[@order_len] = i;
+    @order_len = @order_len + 1;
+}
+
+# dep_declares: whether dep manifest `t` lists `alias` under its own `[deps.*]`.
+fun dep_declares(t: *toml.Table, alias: str) bool {
+    val deps_tab: *toml.Table = toml.get_table(t, "deps");
+    if (deps_tab == nil) { ret false; }
+    val m: usize = toml.table_len(deps_tab);
+    var k: usize = 0;
+    for (k < m) {
+        if (str_equals(toml.table_key(deps_tab, k), alias)) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# tuple_libs: the `libs`/`link` array of the dep target whose (isa, os, abi) tuple
+# matches the build's, reading the v2 `[target.*]` table then the v1 `[targets.*]`
+# table. nil when the dep declares no matching target or it carries no libs.
+fun tuple_libs(t: *toml.Table, isa: str, os: str, abi: str) *toml.Array {
+    var parent: *toml.Table = toml.get_table(t, "target");
+    if (parent == nil) { parent = toml.get_table(t, "targets"); }
+    if (parent == nil) { ret nil; }
+    val m: usize = toml.table_len(parent);
+    var k: usize = 0;
+    for (k < m) {
+        val v: *toml.Value = toml.table_value(parent, k);
+        if (v != nil && v.tag == toml.TYPE_TABLE) {
+            val sub: *toml.Table = ?v.data.table;
+            if (str_equals(toml.get_str(sub, "isa"), isa)
+             && str_equals(toml.get_str(sub, "os"),  os)
+             && str_equals(toml.get_str(sub, "abi"), abi)) {
+                var arr: *toml.Array = toml.get_array(sub, "libs");
+                if (arr == nil) { arr = toml.get_array(sub, "link"); }
+                ret arr;
+            }
+        }
+        k = k + 1;
+    }
+    ret nil;
+}
+
+# strid_in: whether `id` already appears in the first `count` entries of `arr`.
+fun strid_in(arr: *intern.StrId, count: u32, id: intern.StrId) bool {
+    if (arr == nil) { ret false; }
+    var k: u32 = 0;
+    for (k < count) {
+        if (arr[k] == id) { ret true; }
+        k = k + 1;
+    }
+    ret false;
 }
 
 fun parse_targets_table(p: *Project, t: *toml.Table) Result[bool, str] {
