@@ -42,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `nil` coerces to function types, so a fun-typed binding can be explicitly
+  nil-initialised, not only default-initialised. Previously `var q: fun(u32) =
+  nil` was rejected with `type mismatch: expected fun(u32), found *u8` and the
+  cast spelling `var r: F = nil::F` failed lowering with `global initialiser
+  must be a constant expression`, even though a fun-typed value already compares
+  `== nil` and `nil::F` was accepted in argument position. nil now coerces to
+  any pointer-like target — `ptr`, `*T`, or `fun(...)` — uniformly across
+  globals, locals, record fields, array elements, arguments, and return slots,
+  and a nil global initialiser (bare or written through pointer casts) folds to
+  the null constant. nil into a non-pointer slot remains a type error (#1369).
 - Sema reports a teaching diagnostic for every symbol kind that can never be a
   value reaching value position — a record, union, or `def` type name (local
   or imported, bare or `alias.member`), a generic type parameter, and a member
