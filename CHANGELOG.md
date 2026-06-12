@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- One-line install scripts: `install.sh` (Linux) and `install.ps1` (Windows),
+  shipped in the repo and as release assets. They resolve the latest tag from
+  the `releases/latest` redirect, download the versioned archive for the host,
+  verify it against `SHA256SUMS`, and install to `~/.local/bin`
+  (`%LOCALAPPDATA%\mach\bin` on Windows); `MACH_VERSION` and
+  `MACH_INSTALL_DIR` override the release and destination (#1352).
+- Releases now ship versioned archives — `mach-<version>-x86_64-linux.tar.gz`
+  and `mach-<version>-x86_64-windows.zip`, each containing the binary and
+  LICENSE — alongside the existing assets, with `SHA256SUMS` covering the
+  full set (#1352).
+
 ## [1.4.1] - 2026-06-12
 
 Patch release clearing the open bug board: environment forwarding for spawned
