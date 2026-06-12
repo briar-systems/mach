@@ -1,0 +1,166 @@
+name: PE probe (TEMPORARY #1374)
+
+# temporary diagnostic workflow for #1374: the native windows loader rejects the
+# PE the emitter produces (ERROR_BAD_EXE_FORMAT) while wine accepts it. a linux
+# job cross-compiles mach.exe + a tiny test exe from this tree; a windows-latest
+# job dumps their headers, builds a known-good cl baseline for a field-by-field
+# diff, and launches both originals plus structurally-patched variants to bisect
+# the violated loader invariant. removed before the PR is marked ready.
+
+on:
+  push:
+    branches: [fix/1374-pe-loader-conformance]
+
+permissions:
+  contents: read
+
+jobs:
+  cross:
+    name: Cross-compile (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Fetch released mach (build seed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R ${{ github.repository }} -p mach -D /usr/local/bin
+          chmod +x /usr/local/bin/mach
+
+      - name: Build the compiler
+        run: mach build .
+
+      - name: Cross-compile mach.exe
+        run: out/linux/bin/mach build . --target windows
+
+      - name: Cross-compile a tiny test exe
+        run: |
+          set -euo pipefail
+          APP=.github/tests/win64runner/app
+          mkdir -p "$APP/dep"
+          ln -sfn "$GITHUB_WORKSPACE/dep/mach-std" "$APP/dep/mach-std"
+          ( cd "$APP" && "$GITHUB_WORKSPACE/out/linux/bin/mach" build . )
+          find "$APP/out" -name '*.exe'
+          cp "$APP/out/windows/bin/win64runner.exe" "$GITHUB_WORKSPACE/test.exe"
+          cp out/windows/bin/mach.exe "$GITHUB_WORKSPACE/mach.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pe-exes
+          path: |
+            mach.exe
+            test.exe
+
+  load:
+    name: Load + bisect (windows)
+    needs: cross
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pe-exes
+          path: exes
+
+      - name: Sanity — a known-good exe launches here
+        run: |
+          $p = Start-Process cmd.exe -ArgumentList '/c ver' -PassThru -Wait -NoNewWindow
+          "cmd /c ver exit = $($p.ExitCode)"
+
+      - name: Build a known-good cl baseline + dump its headers
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64'
+          Set-Content baseline.c "int main(void){return 7;}"
+          cl /nologo /Fe:baseline.exe baseline.c | Out-Host
+          "=== baseline.exe launch ==="
+          $p = Start-Process .\baseline.exe -PassThru -Wait -NoNewWindow
+          "baseline exit = $($p.ExitCode)"
+          "=== baseline.exe /headers ==="
+          dumpbin /headers /loadconfig baseline.exe | Out-Host
+
+      - name: Dump mach.exe + test.exe headers
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64'
+          foreach ($e in 'exes\mach.exe','exes\test.exe') {
+            "=== $e /headers /loadconfig ==="
+            dumpbin /headers /loadconfig $e | Out-Host
+          }
+
+      - name: Launch originals + patched bisection variants
+        run: |
+          python - << 'PY'
+          import struct, subprocess, shutil, sys, os
+
+          def launch(path):
+              # returns (started:bool, detail). a structurally-bad PE makes
+              # CreateProcess fail with ERROR_BAD_EXE_FORMAT (193). anything that
+              # starts (even if it then crashes) cleared the loader's structural gate.
+              try:
+                  p = subprocess.Popen([path])
+              except OSError as ex:
+                  return (False, f"{type(ex).__name__}: winerror={getattr(ex,'winerror',None)} {ex}")
+              try:
+                  rc = p.wait(timeout=20)
+              except subprocess.TimeoutExpired:
+                  p.kill(); return (True, "started (timeout)")
+              return (True, f"started, exit={rc} ({rc & 0xffffffff:#x})")
+
+          class PE:
+              def __init__(self, path):
+                  self.b = bytearray(open(path,'rb').read())
+                  self.pe = self.u32(0x3C)
+                  self.ch = self.pe + 4
+                  self.nsec = self.u16(self.ch + 2)
+                  self.oh = self.ch + 20
+                  self.sect = self.oh + self.u16(self.ch + 16)
+              def u16(self,o): return struct.unpack_from('<H', self.b, o)[0]
+              def u32(self,o): return struct.unpack_from('<I', self.b, o)[0]
+              def u64(self,o): return struct.unpack_from('<Q', self.b, o)[0]
+              def w16(self,o,v): struct.pack_into('<H', self.b, o, v & 0xffff)
+              def w32(self,o,v): struct.pack_into('<I', self.b, o, v & 0xffffffff)
+              def save(self,path): open(path,'wb').write(self.b)
+
+          def variant_dynbase(src, dst):
+              # clear RELOCS_STRIPPED, set DYNAMIC_BASE — no real .reloc emitted.
+              p = PE(src)
+              p.w16(p.ch + 18, p.u16(p.ch + 18) & ~0x0001)
+              p.w16(p.oh + 70, p.u16(p.oh + 70) | 0x0040)
+              p.save(dst)
+
+          def variant_compact(src, dst):
+              # slide every section (and the dirs/entry/sizes that name RVAs) down
+              # by 0xF000 so the first section sits at RVA 0x1000, adjacent to the
+              # headers — removing the 64 KiB headers->first-section gap. ImageBase
+              # is left untouched (still 64 KiB-aligned). isolates the gap.
+              p = PE(src)
+              shift = 0xF000
+              p.w32(p.oh + 16, p.u32(p.oh + 16) - shift)   # AddressOfEntryPoint
+              p.w32(p.oh + 20, p.u32(p.oh + 20) - shift)   # BaseOfCode
+              p.w32(p.oh + 56, p.u32(p.oh + 56) - shift)   # SizeOfImage
+              dd = p.oh + 112
+              for i in range(16):
+                  rva = p.u32(dd + i*8)
+                  if rva: p.w32(dd + i*8, rva - shift)
+              for s in range(p.nsec):
+                  o = p.sect + s*40
+                  p.w32(o + 12, p.u32(o + 12) - shift)     # VirtualAddress
+              p.save(dst)
+
+          for base in ('exes\\mach.exe','exes\\test.exe'):
+              tag = os.path.basename(base)
+              print(f"\n##### {tag}")
+              print(f"  [original ] {launch(base)}")
+              variant_dynbase(base, f"{tag}.dynbase.exe")
+              print(f"  [dynbase  ] {launch(f'{tag}.dynbase.exe')}")
+              variant_compact(base, f"{tag}.compact.exe")
+              print(f"  [compact  ] {launch(f'{tag}.compact.exe')}")
+          PY
