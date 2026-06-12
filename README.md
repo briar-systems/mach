@@ -7,33 +7,19 @@ MACH
 ![Last Commit](https://img.shields.io/github/last-commit/octalide/mach)
 ![Issues](https://img.shields.io/github/issues/octalide/mach)
 
-Mach is a statically-typed, compiled systems language designed to be simple, fast, verbose, and intuitive.
-
 We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
 
 # Overview
 
-- [Core Philosophy](#core-philosophy)
-- [Getting Started](#getting-started)
-- [Usage](#usage)
-- [Examples](#examples)
-- [Documentation](#documentation)
-- [Credit](#credit)
-- [License](#license)
+Mach is a statically-typed, compiled systems language designed to be simple, fast, verbose, and intuitive. Mach is built for projects like compilers, runtimes, operating systems, tooling -- anywhere performance is a requirement and hidden behavior is a liability. The language is deliberately small and explicit: what you read is what executes, every cost is visible in the code that incurs it. Nothing happens by convention or inference.
 
+Mach does not rely on any external dependencies for the compiler or during runtime -- no LLVM, no linking to libc, no system linker or other tools. The entire compiler and all base language features are written in native Mach. 
 
-## Core Philosophy
+Memory is managed manually. There is no garbage collector and no hidden allocation. Memory flows through allocators that you create and pass explicitly, and the standard library is built around that style end to end: anything that allocates takes an allocator, and anything that doesn't never will. 
 
-Mach is designed with the following principles in mind:
-- **Simplicity**: Mach is built to be easy to learn, read, write, and maintain.
-- **Explicivity**: Mach is explicit and verbose. WYSIWYG, always. Computers are not magic. Your code should not promote this illusion.
-- **Maintainability**: Mach's semantics and design principles prioritize long-term maintainability over short-term convenience.
+Batteries are not included. Many ways to do the same thing are not provided, and the language will not stop you from doing dangerous things. Safety is a decision made by the programmer, not a restriction imposed upon them.
 
-Mach is NOT designed to prioritize:
-- **Features**: Batteries are not included. Ever.
-- **Flexibility**: Mach does not allow for many ways to do the same thing.
-- **Code Reduction**: Mach is explicit and verbose by design. More code is not worse code.
-- **Hand-holding**: Mach will not stop you from doing dangerous things. Safety is a decision made by the programmer, not a restriction to be imposed upon them.
+Use Mach when you want C's reach with one coherent toolchain: a single binary that builds, links (no external linker), tests, vendors dependencies, and cross-compiles.
 
 
 # Getting Started
@@ -43,35 +29,17 @@ Read the [language reference](doc/language/README.md) before installing. The doc
 
 ## Building Mach
 
-Mach builds itself, so building from source needs an existing `mach` — install the latest [release](https://github.com/octalide/mach/releases) first.
+Mach builds itself, so building from source needs an existing `mach` installation.
+You can download precompiled binaries for your system on the [releases](https://github.com/octalide/mach/releases) page.
 
 ```bash
-git clone --recurse-submodules https://github.com/octalide/mach
+git clone https://github.com/octalide/mach
 cd mach
+mach dep pull
 mach build .
 ```
 
-The compiler is written to `out/<target>/bin/mach`.
-
-
-# Usage
-
-```
-mach <command> [options]
-```
-
-| Command | Description |
-|---|---|
-| `build` | compile the current project to an executable or object |
-| `run`   | build and execute the current project (`-- args...` forward to the program) |
-| `test`  | build and run the project's tests |
-| `dep`   | manage vendored dependencies (`list`, `add`, `remove`, `sync`, `vendor`) |
-| `init`  | scaffold a new project (`--lib`, `--name`, `--force`) |
-| `doc`   | generate Markdown reference docs from source doc-comments |
-| `help`  | show usage; `mach help <command>` for detail |
-
-Run `mach help <command>` for more information about a specific subcommand, or
-see the full [CLI reference](doc/cli.md).
+The compiler is written to `out/<target>/bin/mach`, where `<target>` is the selected target name.
 
 
 # Examples
@@ -140,8 +108,8 @@ fun main(argc: i64, argv: **u8) i64 {
 The full language reference is in [`doc/language/`](doc/language/README.md). The
 build system is documented in:
 
-- [`doc/manifest.md`](doc/manifest.md) — the `mach.toml` manifest reference
-- [`doc/cli.md`](doc/cli.md) — the `mach` command-line reference
+- [`doc/manifest.md`](doc/manifest.md): the `mach.toml` manifest reference
+- [`doc/cli.md`](doc/cli.md): the `mach` command-line reference
 
 
 # Credit
