@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed reference is a hard compile error. This unblocks block-local forward
   branches such as the `jc 1f` / `1:` shape in std's darwin syscall wrappers
   (#1365).
+- `$<sym>.library = "<dll>"` pins an `ext` import to a specific dependency DLL,
+  giving the PE (Windows) import directory per-symbol attribution. Imports were
+  previously all forced onto the first dependency (kernel32.dll), so extra DLLs
+  in `[target.*].libs` emitted only empty descriptors; an attributed import now
+  lands under its named library, an unattributed one still binds to the first,
+  and pinning to a library absent from the link's dependencies is a hard link
+  error rather than a silent fallback. Composes with `.symbol` — the rename sets
+  the imported name, `.library` the DLL it is imported from (#1382).
 
 ### Fixed
 
@@ -83,6 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   segment, so the first section maps immediately after the headers with no gap,
   matching the layout MSVC emits. Every `mach`-built Windows binary, including
   the published `mach.exe`, now launches natively (#1374).
+- A `$<sym>.symbol` rename on an `ext fun` is no longer clobbered. The bare `ext`
+  identifier was re-registered over the rename after `scan_export_directives`
+  recorded it, so renames on foreign imports silently did nothing and bound under
+  the mach identifier; the bare name is now only a default that an explicit
+  `.symbol` override wins, order-independently (#1382).
 
 ## [1.4.1] - 2026-06-12
 
