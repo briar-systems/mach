@@ -15,6 +15,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stripped to end-of-line when the asm body is materialized, before any
   substitution or statement tokenization (#1297).
 
+## [1.3.1] - 2026-06-11
+
+Transitional self-seeding release. Carries the v1.4.0 feature line developed
+so far and exists so the next release can drop the old manifest format
+entirely: this binary reads both manifest formats; the next reads only the
+current one.
+
+### Added
+
+- The new `mach.toml` manifest format: explicit `[target.*]`/`[bin.*]`/
+  `[lib.*]`/`[profile.*]`/`[deps.*]` stanzas, path templates, `native` target
+  resolution, multi-artifact matrix builds, tuple-matched cascading dependency
+  libs, per-target comptime `defines`.
+- The `mach dep` model: `pull`/`update` with a manifest-is-intent lockfile
+  law, `git`/`path` source forms, transitive resolution.
+- Comptime namespace roots `$project.*`, `$target.*`, `$bin.*`; bare `$ident`
+  is now rejected with a teaching diagnostic.
+- `mach info` (and `mach info --version`): compiler version, build host, and
+  the registered target capability surface.
+- Mixed-numeric comparisons: legal and value-correct across signedness and
+  widths (comptime agrees with runtime); int↔float still requires a cast.
+- A diagnostics overhaul: ~70 audited messages now carry spans, name the
+  offending symbol, and say what to do.
+
+### Changed
+
+- Release-mode builds are ~5x faster (quadratic pass costs removed); the
+  optimizer gained phi simplification, post-inline promotion, and call-graph
+  aware inlining.
+- The IR verifier is real (dominance, reachability, type agreement) and CI
+  enforces `--release --verify-ir`.
+- Relocation kinds are a closed enum; the object-format layer no longer
+  captures per-session interners.
+- The inline corpus grew to ~390 tests; comment content inside `asm` blocks
+  is now fully opaque to the instruction parser.
+
 ## [1.3.0] - 2026-06-11
 
 Correctness and foundations release. A full-compiler audit (125 findings,
