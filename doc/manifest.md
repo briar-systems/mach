@@ -70,6 +70,7 @@ ref = "v0.4.0"
 |-----------|--------|----------|------------|---------|
 | `id`      | string | yes      | —          | Root segment of every module path the project exposes. A file at `<src>/foo/bar.mach` is reachable as `<id>.foo.bar`. |
 | `version` | string | yes      | —          | Project version. Read by the `$project.version` comptime root. |
+| `module`  | string | no       | —          | Src-relative path of the module a bare `use <id>;` / `fwd <id>;` resolves to (see [Bare project-id imports](#bare-project-id-imports)). Never inferred; a library that wants to be importable by its id declares it. A declared path naming no file is an error at build start. |
 | `src`     | string | no       | `"src"`    | Source root, relative to the project root. Module paths resolve under it. |
 | `dep`     | string | no       | `"dep"`    | Vendored-dependency root, relative to the project root. Each dep lives at `<dep>/<alias>/`. |
 | `target`  | string | no       | `"native"` | Default target selector when `--target` is not passed. `native` resolves to the declared target whose tuple matches the host. |
@@ -172,12 +173,62 @@ as a **submodule** composes naturally; mach never invokes `git submodule`.
 
 ### Cascading link requirements
 
-A dependency declares its own `[target.*].libs`, and a consumer inherits every
-such lib whose target tuple `(isa, os, abi)` equals the one being built — so a
-platform link requirement (e.g. `kernel32.dll`) lives once, in the providing
-dependency's manifest, and out of every consumer. Matching is by tuple equality;
-target *names* are local to each manifest. Inherited libs are deduplicated by
-name in topological-dependency then declaration order.
+A dependency declares its own link requirements as `[target.*].libs` (full-tuple)
+or `[os.<name>].libs` (os-component) overlays, and a consumer inherits every such
+lib that matches the build it is producing — so a platform link requirement (e.g.
+`kernel32.dll`) lives once, in the providing dependency's manifest, and out of
+every consumer. Matching is by tuple/component equality; target *names* are local
+to each manifest. Within each dependency the matching os overlays precede the
+matching target libs; across dependencies the order is topological then
+declaration order, and the union is deduplicated by name. See
+[Link inputs](#link-inputs) for the overlay merge law.
+
+## `[os.<name>]`
+
+An os overlay scopes a link requirement to a single tuple component — the
+operating system — rather than a full `(isa, os, abi)` tuple. A build matches the
+overlay iff its selected target's `os` equals `<name>`, so a requirement that
+holds for every windows ISA and ABI is stated once:
+
+```toml
+[os.windows]
+libs = ["kernel32.dll"]   # linked into every windows build, this project's and any consumer's
+```
+
+| Key    | Type             | Default | Meaning |
+|--------|------------------|---------|---------|
+| `libs` | array of strings | `[]`    | Link inputs added to every build whose os matches `<name>` (see [Link inputs](#link-inputs)). |
+
+Os overlays cascade to consumers exactly like `[target.*].libs`. The
+single-component `[isa.<name>]` and `[abi.<name>]` overlays are **reserved**:
+declaring either is an error until a real case demands them.
+
+## Bare project-id imports
+
+A one-segment `use`/`fwd` path equal to a resolvable project id — a dependency's
+`[project].id`, or the current project's own id — resolves to that project's
+declared `[project].module`. So a library that sets `module = "glfw.mach"` is
+imported as `use glfw;` (binding the `glfw` module) instead of by the full path to
+its surface file. Longer paths are unaffected; a single segment is otherwise
+unresolvable, so this is purely additive.
+
+```toml
+# in glfw's manifest:
+[project]
+id     = "glfw"
+module = "glfw.mach"   # the surface a bare `use glfw;` binds
+```
+
+```mach
+// in a consumer:
+use glfw;              // binds the glfw module (glfw's [project].module)
+```
+
+A bare import of a project that declares no `module` is a resolution error naming
+the fix (import a full path, or add a `module` to the project's manifest). A
+declared `module` that names no file is a manifest error at build start whether or
+not anything imports it. A project module that `fwd`s its own id is caught by the
+existing circular-module detection.
 
 ## Path templates
 
