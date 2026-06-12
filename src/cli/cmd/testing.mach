@@ -1,20 +1,26 @@
-# mach.cli.cmd.testing: `mach test` — builds the test binary and runs the collected tests.
+# mach.cli.cmd.testing: `mach test` — builds one executable per test and runs each
+# as a separate process.
 #
-# builds the project with the test-runner entry point and runs the
-# collected tests, surfacing the runner's exit code (0 = all passed, 1 =
-# any failed, 2 = build/internal error). the runner stub iterates every
-# test declaration the resolver collected; this command forwards `--filter
-# <pattern>` and `--list` to it as the child argv so the runner can select
-# or enumerate tests itself.
+# `mach test` compiles every `test "..."` block into its own standalone executable
+# (the test plus the project's transitive code, with a synthesized `main` that
+# calls just that test). this command then spawns each executable as a separate
+# process, reads its exit status, and reports a per-test line: `name file:line
+# PASS` / `FAIL(exit n)` / `FAIL(signal s)`. a crashing test (a signal) is reported
+# and the run continues — one SIGSEGV no longer kills the suite. the run ends with
+# a `passed/failed/total` summary. `--list` prints the collected tests without
+# building or running them; `--filter <substr>` selects tests whose name contains
+# the substring.
+#
+# execution is currently linux-only (the spawn path is POSIX `fork`/`exec`); a
+# win64 runner needs `CreateProcess` (tracked on #1235).
 
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
 use std.types.option.is_some;
 use std.types.option.unwrap;
 use std.types.result.Result;
@@ -22,46 +28,45 @@ use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 
 use std.allocator.Allocator;
-use std.allocator.allocate;
 
 use page:  std.allocator.page;
 use arena: std.allocator.arena;
 
-use os:    std.system.os;
 use exec:  std.process.exec;
 use print: std.print;
 
 use build: mach.cli.cmd.build;
 use util:  mach.cli.util;
 
-# run: `mach test` subcommand entry point. builds the test binary, then
-# execs it forwarding `--filter`/`--list` so the runner selects tests.
-# called by cmd.dispatch.
+# run: `mach test` subcommand entry point. builds one executable per test, then
+# spawns each as a separate process and reports the results. called by
+# cmd.dispatch.
 # ---
 # argc: argument count including argv[0]
 # argv: the argument vector (argc null-terminated byte pointers)
-# ret:  0 if all tests passed, 1 if any failed, 2 on a build/internal error
+# ret:  0 if all selected tests passed, 1 if any failed, 2 on a build/internal error
 pub fun run(argc: usize, argv: **u8) i64 {
     val filter_opt: Option[*u8] = util.get_value(argc, argv, "--filter");
     val list:       bool        = util.has_flag(argc, argv, "--list");
 
-    # back the build with an arena over a page allocator, matching `mach
-    # build`. the build's internal teardown frees through this allocator;
-    # the page allocator would munmap each block individually, unmapping the
-    # page `output_path` lives in before we exec it. the arena defers all
-    # reclamation to a single `arena.dnit`, keeping `output_path` mapped.
+    var filter: *u8 = nil;
+    if (is_some[*u8](filter_opt)) { filter = unwrap[*u8](filter_opt); }
+
+    # back the build with an arena over a page allocator, matching `mach build`.
+    # the build's internal teardown frees through this allocator; the page
+    # allocator would munmap each block individually, unmapping the page a test
+    # executable path lives in before we exec it. the arena defers all reclamation
+    # to a single `arena.dnit`, keeping every artifact path mapped until we are done.
     var backing: Allocator;
     if (is_some[str](page.make(?backing))) {
         print.eprint("error: failed to initialise allocator\n");
         ret 2;
     }
-
     var ar: arena.Arena;
     if (is_some[str](arena.init(?ar, ?backing, 0))) {
         print.eprint("error: failed to initialise allocator\n");
         ret 2;
     }
-
     var alloc: Allocator;
     if (is_some[str](arena.make(?alloc, ?ar))) {
         arena.dnit(?ar);
@@ -69,60 +74,99 @@ pub fun run(argc: usize, argv: **u8) i64 {
         ret 2;
     }
 
-    val br: build.BuildResult = build.build(?alloc, argc, argv, false, true);
-    if (br.code != 0) {
-        # propagate the build's own exit-code contract (1 user error, 2
-        # internal) rather than collapsing every build failure to 2 — a
-        # compile error in a test build is a user error, exactly as in
-        # `mach build`/`mach run`.
+    val tbr: build.TestBuildResult = build.build_tests(?alloc, argc, argv, list);
+    if (tbr.code != 0) {
         arena.dnit(?ar);
-        ret br.code;
-    }
-    if (br.output_path == nil) {
-        arena.dnit(?ar);
-        print.eprint("error: build produced no test binary\n");
-        ret 2;
+        ret tbr.code;
     }
 
-    # child argv: [binary, ("--list")?, ("--filter" pattern)?, nil]
-    var extra: usize = 0;
-    if (list)                       { extra = extra + 1; }
-    if (is_some[*u8](filter_opt))   { extra = extra + 2; }
-
-    val total: usize = 1 + extra + 1;
-    val cv_r: Result[**u8, str] = allocate[*u8](?alloc, total);
-    if (is_err[**u8, str](cv_r)) {
+    # `--list`: report each selected test's `label file:line`, no execution.
+    if (list) {
+        var i: u32 = 0;
+        for (i < tbr.count) {
+            val a: *build.TestArtifact = ?tbr.tests[i];
+            if (selected(a, filter)) { report_location(a); print.print("\n"); }
+            i = i + 1;
+        }
         arena.dnit(?ar);
-        print.eprint("error: out of memory\n");
-        ret 2;
+        ret 0;
     }
-    val child_argv: **u8 = unwrap_ok[**u8, str](cv_r);
-    var k: usize = 0;
-    child_argv[k] = br.output_path; k = k + 1;
-    if (list) { child_argv[k] = "--list"; k = k + 1; }
-    if (is_some[*u8](filter_opt)) {
-        child_argv[k] = "--filter"; k = k + 1;
-        child_argv[k] = unwrap[*u8](filter_opt); k = k + 1;
-    }
-    child_argv[k] = nil;
 
-    val exec_r: Result[exec.ExitStatus, str] = exec.run(br.output_path, child_argv, nil);
+    # run mode: spawn each selected test as its own process and report its result.
+    var passed: u32 = 0;
+    var failed: u32 = 0;
+    var total:  u32 = 0;
+    var i: u32 = 0;
+    for (i < tbr.count) {
+        val a: *build.TestArtifact = ?tbr.tests[i];
+        if (!selected(a, filter)) { i = i + 1; cnt; }
+        total = total + 1;
 
-    if (is_err[exec.ExitStatus, str](exec_r)) {
-        arena.dnit(?ar);
-        print.eprint("error: failed to execute the test binary\n");
-        ret 2;
+        var child_argv: [2]*u8;
+        child_argv[0] = a.exe;
+        child_argv[1] = nil;
+
+        report_location(a);
+        print.print(" ");
+
+        val exec_r: Result[exec.ExitStatus, str] = exec.run(a.exe, ?child_argv[0], nil);
+        if (is_err[exec.ExitStatus, str](exec_r)) {
+            print.print("FAIL(spawn)\n");
+            failed = failed + 1;
+            i = i + 1;
+            cnt;
+        }
+        val status: exec.ExitStatus = unwrap_ok[exec.ExitStatus, str](exec_r);
+
+        if (exec.exited(status) && exec.code(status) == 0) {
+            print.print("PASS\n");
+            passed = passed + 1;
+        }
+        or (exec.signaled(status)) {
+            # a crash reports the signal and the run continues to the next test.
+            print.print("FAIL(signal ");
+            print.u64(exec.signal(status)::u64);
+            print.print(")\n");
+            failed = failed + 1;
+        }
+        or (exec.exited(status)) {
+            print.print("FAIL(exit ");
+            print.u64(exec.code(status)::u64);
+            print.print(")\n");
+            failed = failed + 1;
+        }
+        or {
+            print.print("FAIL\n");
+            failed = failed + 1;
+        }
+        i = i + 1;
     }
-    val status: exec.ExitStatus = unwrap_ok[exec.ExitStatus, str](exec_r);
+
+    print.print("\n");
+    print.u64(passed::u64);
+    print.print(" passed, ");
+    print.u64(failed::u64);
+    print.print(" failed, ");
+    print.u64(total::u64);
+    print.print(" total\n");
+
     arena.dnit(?ar);
-    if (exec.exited(status)) {
-        ret exec.code(status)::i64;
-    }
-    # a runner killed by a signal (e.g. a test SIGSEGV) maps to 128+signal, the
-    # same shell convention `mach run` uses — distinguishing a crash from a
-    # plain test failure rather than collapsing both to 1.
-    if (exec.signaled(status)) {
-        ret 128 + exec.signal(status)::i64;
-    }
-    ret 1;
+    if (failed > 0) { ret 1; }
+    ret 0;
+}
+
+# selected: whether a test passes the name filter — every test when no filter is
+# set, else those whose label contains the filter substring.
+fun selected(a: *build.TestArtifact, filter: *u8) bool {
+    if (filter == nil) { ret true; }
+    ret str_contains(util.cstr_str(a.label), util.cstr_str(filter));
+}
+
+# report_location: print a test's `name file:line` prefix (no trailing newline).
+fun report_location(a: *build.TestArtifact) {
+    print.print(a.label::str);
+    print.print(" ");
+    print.print(a.file::str);
+    print.print(":");
+    print.u64(a.line::u64);
 }
