@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<cmd> <binary> <args...>`, the declared host-side launcher for
   foreign-target artifacts (e.g. `--target windows --runner wine`). The value
   is a single command name or path (no shell-style word splitting), resolved
-  on `PATH`. Absent the flag, binaries are exec'd directly and a spawn failure
-  reports exactly that — no auto-detection (#1345).
+  on `PATH`. Absent the flag, binaries are exec'd directly and a launch
+  failure is reported as a failure — no auto-detection (#1345).
 
 ## [1.4.1] - 2026-06-12
 

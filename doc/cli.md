@@ -158,9 +158,10 @@ child's exit code becomes this command's exit code.
 `--runner` names a host-side launcher for binaries the host cannot exec
 directly — e.g. `mach run . --target windows --runner wine`. `<cmd>` is a single
 command name or path (no shell-style word splitting); a bare name is resolved on
-`PATH`. Without the flag the binary is exec'd directly, and a spawn failure (such
-as a foreign-format binary on a host without a binfmt handler) reports exactly
-that — there is no auto-detection.
+`PATH`. Without the flag the binary is exec'd directly, and a launch failure
+(such as a foreign-format binary on a host without a binfmt handler) is reported
+as a failure — exit `127` when `execve` rejects the binary in the spawned
+child — with no auto-detection.
 
 Exit codes: the child's exit code, `1` on a build/user error, `2` on internal
 error.
@@ -187,7 +188,9 @@ Plus the `build` and global flags. `--runner` has the same semantics as on
 `mach run`: a single command name or path (no shell-style word splitting),
 resolved on `PATH`, for foreign-target tests the host cannot exec directly —
 e.g. `mach test . --target windows --runner wine`. Without it, a test executable
-that fails to spawn reports `FAIL(spawn)`.
+the host cannot launch reports a per-test failure — `FAIL(exit 127)` when
+`execve` rejects the binary in the spawned child, `FAIL(spawn)` when the spawn
+itself fails — with no auto-detection.
 
 Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
 
