@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Inline-asm comments are now opaque to the instruction parser regardless of
+  their bytes. A comment containing `;` was split into a phantom instruction
+  and one containing `{...}` was misread as a local binding; comments are now
+  stripped to end-of-line when the asm body is materialized, before any
+  substitution or statement tokenization (#1297).
+
 ## [1.3.0] - 2026-06-11
 
 Correctness and foundations release. A full-compiler audit (125 findings,
