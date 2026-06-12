@@ -6,7 +6,7 @@
 # builds a tiny library (`extlib`) to a loose object exporting `mach_ext_add`,
 # then links a consumer (`app`) — which declares that symbol `ext` and calls it
 # — against the object via each supported surface (explicit path, `-L`/`-l`, and
-# the `[targets.*].libs` manifest field). the same surfaces are then exercised
+# the `[target.*].libs` manifest field). the same surfaces are then exercised
 # against a `.a` archive of that object (built with `ar`, skipped when `ar` is
 # absent). the program returns `mach_ext_add(20, 21)` which must be 42. a build
 # with no external input must fail on the undefined `ext` symbol, proving the
@@ -84,9 +84,9 @@ expect_42 "-L dir -l name"       . -L "$WORK/libs" -l extadd
 # must be skipped by the link-input scan even though it ends in '/'.
 expect_42 "project-path positional skipped" ./ -L "$WORK/libs" -l extadd
 
-# manifest libs: point `[targets.linux].libs` at the object by absolute path.
-sed "s|^binary = \"linux/bin/extapp\"|&\nlibs = [\"$OBJ\"]|" "$HERE/app/mach.toml" > "$WORK/app/mach.toml"
-expect_42 "[targets.*].libs manifest" .
+# manifest libs: point `[target.linux].libs` at the object by absolute path.
+sed "s|^abi = \"sysv64\"|&\nlibs = [\"$OBJ\"]|" "$HERE/app/mach.toml" > "$WORK/app/mach.toml"
+expect_42 "[target.*].libs manifest" .
 cp "$HERE/app/mach.toml" "$WORK/app/mach.toml"
 
 # static `.a` archive surfaces — the archive's member object supplies the
@@ -94,8 +94,8 @@ cp "$HERE/app/mach.toml" "$WORK/app/mach.toml"
 if [ -n "$AR" ]; then
     expect_42 "explicit archive path"        . "$AR"
     expect_42 "-L dir -l name (.a)"          . -L "$WORK/alibs" -l extadd
-    sed "s|^binary = \"linux/bin/extapp\"|&\nlibs = [\"$AR\"]|" "$HERE/app/mach.toml" > "$WORK/app/mach.toml"
-    expect_42 "[targets.*].libs manifest (.a)" .
+    sed "s|^abi = \"sysv64\"|&\nlibs = [\"$AR\"]|" "$HERE/app/mach.toml" > "$WORK/app/mach.toml"
+    expect_42 "[target.*].libs manifest (.a)" .
     cp "$HERE/app/mach.toml" "$WORK/app/mach.toml"
 else
     echo "SKIP extlink: .a archive cases — 'ar' not available"

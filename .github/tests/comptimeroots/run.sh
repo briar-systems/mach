@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # comptime roots integration test (#1217, #1249). two halves:
 #
-#   folding — the `$project.*` / `$target.*` / `$bin.*` roots must fold to the
-#   manifest's declared values for BOTH a v2 manifest and the legacy v1 format.
-#   each app asserts every root against its own manifest and exits 0 only when
-#   all match; a mismatch returns the drifted root's id. this is the end-to-end
-#   proof that the driver feeds the roots from the manifest model and the
-#   selected build unit.
+#   folding — the `$project.*` / `$target.*` / `$bin.*` roots must fold to each
+#   manifest's declared values. two apps with distinct declared values each
+#   assert every root against their own manifest and exit 0 only when all match;
+#   a mismatch returns the drifted root's id. this is the end-to-end proof that
+#   the driver feeds the roots from the manifest model and the selected build
+#   unit, not from hardcoded values.
 #
 #   rejection — a standalone bare `$ident` is none of the closed comptime
 #   channel shapes (#1249); the build must FAIL with the one teaching diagnostic,
@@ -83,8 +83,8 @@ expect_reject() {
     echo "PASS comptimeroots/$label: bare \$ident rejected with the teaching diagnostic"
 }
 
-build_and_run v1app "v1 manifest"
-build_and_run v2app "v2 manifest"
+build_and_run app    "manifest with profiles"
+build_and_run altapp "alternate declared values"
 
 expect_reject bareident_gate  "bare \$ident gate"  "$BARE_IDENT_DIAG"
 expect_reject bareident_value "bare \$ident value" "$BARE_IDENT_DIAG"
