@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-06-12
+
+Inline-asm & foundations: carry-flag mnemonics and numeric local labels in x64
+inline assembly, per-symbol DLL attribution for windows imports, the first PE
+output the native Windows loader accepts, float `%` correctness, `nil`
+coercion to function types, materialized `path` dependencies, declared
+foreign-target runners, and session-owned target registries under the hood.
+
 ### Added
 
 - `mach test` and `mach run` accept `--runner <cmd>`: every child exec becomes
@@ -96,6 +104,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recorded it, so renames on foreign imports silently did nothing and bound under
   the mach identifier; the bare name is now only a default that an explicit
   `.symbol` override wins, order-independently (#1382).
+- `mach init` validates the project id before scaffolding: a name the manifest
+  grammar would reject (`.`, path separators, spaces) is refused with nothing
+  written, instead of silently scaffolding an ungrammatical `[bin..]` manifest.
+  The positional name is taken verbatim — no basename derivation (#1355).
+- A type mismatch against a call with no return type reads `expected i64, found
+  no value` (with a clarifying note) instead of rendering the misleading
+  `<error>` placeholder, and diagnostics consistently say "returns nothing" /
+  "no value" — mach has no `void` (#1360).
+- `infer_generic_call` reports internal generic-substitution and type-argument
+  allocation failures instead of silently poisoning the expression (#1361).
 
 ## [1.4.1] - 2026-06-12
 
