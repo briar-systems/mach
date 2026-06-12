@@ -49,8 +49,9 @@ values**, so the result is identical in either operand order:
 - **integer vs float** — a compile error; cast one operand explicitly with
   `::`. An implicit widening would hide `f64` rounding above `2^53`.
 
-A pointer may be compared against `nil` (the null-address literal). On the
-planned SIMD vectors, comparison produces a mask vector (lane-wise).
+A pointer-like value — a pointer or a function — may be compared against `nil`
+(the null-address literal). On the planned SIMD vectors, comparison produces a
+mask vector (lane-wise).
 
 ## Logical
 

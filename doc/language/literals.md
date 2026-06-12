@@ -43,14 +43,22 @@ long content uses `\n` escapes or lives in external files.
 ## `nil`
 
 The `nil` keyword is the null-address literal. With no context it types as
-`*u8`; it coerces to any pointer type. It is not assignable to a function
-type — function/`nil` relationships are expressed through `==` / `!=`
-comparison, not assignment.
+`*u8`; it coerces to any pointer-like type — a raw `ptr`, a typed `*T`, or a
+function type `fun(...)` (a function value is a code address, so the null
+address is a valid null callback). The coercion is uniform across every
+position a value flows into: globals, locals, record fields, array elements,
+call arguments, and return slots.
 
 ```mach
+def F: fun(u32);
 var p: *i64 = nil;          # null pointer
-val absent: u8 = p == nil;  # nil compares against any pointer
+var cb: fun(u32) = nil;     # null function pointer
+var k:  F = nil::F;         # the cast spelling works too
+val absent: u8 = p == nil;  # nil compares against any pointer-like value
 ```
+
+nil coerces only to pointer-like targets; assigning it to a non-pointer slot
+(`var x: u32 = nil;`) is a type error.
 
 ## Backticks
 

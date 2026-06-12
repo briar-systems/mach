@@ -165,13 +165,22 @@ A stanza declares exactly one source key:
 | Key    | Type   | Read by    | Meaning |
 |--------|--------|------------|---------|
 | `git`  | string | `mach dep` | Git URL to clone into `<dep>/<alias>/`. |
-| `path` | string | `mach dep` | Local path into the project's own tree; never fetched. |
+| `path` | string | `mach dep` | Local path to another project tree, resolved relative to this manifest's directory; never fetched. `mach dep pull` materialises it at `<dep>/<alias>/` as a relative symlink to the resolved source, so the build reaches its modules by the same vendor layout as a git dep. |
 | `ref`  | string | `mach dep` | Git ref to check out (with `git`): a `tag/<name>`, `branch/<name>`, bare tag/branch, or commit SHA. An absent ref means the remote default branch. |
 
 A registry-style `version =` is reserved and rejected. Cloning, lockfile
 handling, and transitive resolution are documented in [cli.md](cli.md#mach-dep).
 `mach dep` performs only plain git operations, so a checkout the user also commits
 as a **submodule** composes naturally; mach never invokes `git submodule`.
+
+A **git** dep is pinned to a resolved commit in `mach.lock`; a **path** dep has no
+pinned content, so it carries no lock entry — its `path` in the manifest is the
+whole record. `mach dep pull` materialises a path dep at `<dep>/<alias>/` as a
+relative symlink to the resolved source and is idempotent: a stale link is
+replaced, an already-correct one is left untouched, and a source that already
+lives at the vendor location is a no-op. A path that does not exist, that holds no
+`mach.toml`, or whose vendor location is occupied by a real directory (a stale git
+checkout, foreign vendored files) is a hard error — never silent success.
 
 ### Cascading link requirements
 

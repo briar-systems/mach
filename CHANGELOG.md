@@ -50,6 +50,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   near-zero-above shape), and the comptime fold rejected it as non-constant. Both
   now synthesize the remainder from the existing float divide / truncating
   conversion / multiply / subtract primitives, exact for `|a / b| < 2^63` (#1378).
+- `nil` coerces to function types, so a fun-typed binding can be explicitly
+  nil-initialised, not only default-initialised. Previously `var q: fun(u32) =
+  nil` was rejected with `type mismatch: expected fun(u32), found *u8` and the
+  cast spelling `var r: F = nil::F` failed lowering with `global initialiser
+  must be a constant expression`, even though a fun-typed value already compares
+  `== nil` and `nil::F` was accepted in argument position. nil now coerces to
+  any pointer-like target — `ptr`, `*T`, or `fun(...)` — uniformly across
+  globals, locals, record fields, array elements, arguments, and return slots,
+  and a nil global initialiser (bare or written through pointer casts) folds to
+  the null constant. nil into a non-pointer slot remains a type error (#1369).
+- `mach dep pull` now materialises a `path` dependency at `<dep>/<alias>/` as a
+  relative symlink to the resolved source instead of silently doing nothing —
+  previously it printed "mach.lock up to date", exited 0, and never created the
+  dep directory, so any later build failed to resolve the dep's modules. The
+  `path` is resolved relative to the requiring manifest's directory; a stale link
+  is replaced and an already-correct one left in place (idempotent), while a
+  missing directory, a directory without a `mach.toml`, or a vendor location
+  occupied by a real directory is a hard error. A path dep carries no lock entry —
+  its manifest `path` is the record (#1370).
 - Sema reports a teaching diagnostic for every symbol kind that can never be a
   value reaching value position — a record, union, or `def` type name (local
   or imported, bare or `alias.member`), a generic type parameter, and a member
