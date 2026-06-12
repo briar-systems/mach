@@ -42,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `mach dep pull` now materialises a `path` dependency at `<dep>/<alias>/` as a
+  relative symlink to the resolved source instead of silently doing nothing —
+  previously it printed "mach.lock up to date", exited 0, and never created the
+  dep directory, so any later build failed to resolve the dep's modules. The
+  `path` is resolved relative to the requiring manifest's directory; a stale link
+  is replaced and an already-correct one left in place (idempotent), while a
+  missing directory, a directory without a `mach.toml`, or a vendor location
+  occupied by a real directory is a hard error. A path dep carries no lock entry —
+  its manifest `path` is the record (#1370).
 - Sema reports a teaching diagnostic for every symbol kind that can never be a
   value reaching value position — a record, union, or `def` type name (local
   or imported, bare or `alias.member`), a generic type parameter, and a member
