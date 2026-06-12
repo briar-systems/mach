@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `mach-<version>-x86_64-windows.zip`, each containing the binary and
   LICENSE — alongside the existing assets, with `SHA256SUMS` covering the
   full set (#1352).
+- x64 inline assembly accepts the carry-flag mnemonics `jc` / `jnc` (and the
+  `jb` / `jae` / `jnb` aliases) and `setc` (and the `setb` / `setae` / `setnb`
+  aliases), reusing the existing conditional-branch and SETcc encoders. Previously
+  only `je` / `jz` / `jne` / `jnz` were recognized, forcing carry-flag handling
+  through `.byte` escape hatches (#1359).
 
 ### Fixed
 
