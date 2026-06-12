@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# per-target opt-level integration test: confirm `[targets.*].opt` drives the
-# build's optimization level and that an explicit CLI `-O*` flag overrides it.
+# profile opt-level integration test: confirm the selected profile's `opt` drives
+# the build's optimization level and that an explicit CLI `-O*` flag overrides it.
 #
-# the `app` project declares `opt = "O2"`. building it three ways — no flag
-# (manifest default), forced `-O2`, forced `-O0` — must produce a binary that
-# (1) runs correctly in every case, (2) is byte-identical between the manifest
-# default and explicit `-O2` (the manifest opt-level IS the default), and
+# the `app` project's default profile declares `opt = 2`. building it three ways —
+# no flag (profile default), forced `-O2`, forced `-O0` — must produce a binary
+# that (1) runs correctly in every case, (2) is byte-identical between the profile
+# default and explicit `-O2` (the profile opt-level IS the default), and
 # (3) differs under `-O0` (the CLI flag overrides the manifest). a bogus opt
 # value must be rejected as a manifest error.
 #
@@ -34,20 +34,20 @@ ln -s "$STD" "$WORK/app/dep/mach-std"
 
 fail=0
 
-# build_into <artifacts-subdir> <out-binary> <extra build args...>
+# build_into <out-binary> <extra build args...>
 build_into() {
-    local art="$1"; local out="$2"; shift 2
-    ( cd "$WORK/app" && "$MACH" build . --artifacts "$art" -o "$out" "$@" ) >/dev/null 2>&1
+    local out="$1"; shift
+    ( cd "$WORK/app" && "$MACH" build . -o "$out" "$@" ) >/dev/null 2>&1
 }
 
-# manifest default (opt = "O2"), forced -O2, forced -O0.
-if ! build_into manifest out/manifest_bin; then
-    echo "FAIL opt: manifest opt=O2 build failed" >&2; fail=1
+# profile default (opt = 2), forced -O2, forced -O0.
+if ! build_into out/manifest_bin; then
+    echo "FAIL opt: profile opt=2 build failed" >&2; fail=1
 fi
-if ! build_into forced_o2 out/o2_bin -O2; then
+if ! build_into out/o2_bin -O2; then
     echo "FAIL opt: -O2 build failed" >&2; fail=1
 fi
-if ! build_into forced_o0 out/o0_bin -O0; then
+if ! build_into out/o0_bin -O0; then
     echo "FAIL opt: -O0 build failed" >&2; fail=1
 fi
 
@@ -62,22 +62,22 @@ for bin in manifest_bin o2_bin o0_bin; do
     fi
 done
 
-# the manifest opt-level IS the default: it must match explicit -O2 byte-for-byte.
+# the profile opt-level IS the default: it must match explicit -O2 byte-for-byte.
 if cmp -s "$WORK/app/out/manifest_bin" "$WORK/app/out/o2_bin"; then
-    echo "PASS opt: manifest opt=O2 produces the -O2 binary"
+    echo "PASS opt: profile opt=2 produces the -O2 binary"
 else
-    echo "FAIL opt: manifest opt=O2 binary differs from -O2" >&2; fail=1
+    echo "FAIL opt: profile opt=2 binary differs from -O2" >&2; fail=1
 fi
 
-# an explicit CLI flag overrides the manifest: -O0 must differ from opt=O2.
+# an explicit CLI flag overrides the manifest: -O0 must differ from opt=2.
 if cmp -s "$WORK/app/out/manifest_bin" "$WORK/app/out/o0_bin"; then
-    echo "FAIL opt: -O0 did not override manifest opt=O2 (binaries identical)" >&2; fail=1
+    echo "FAIL opt: -O0 did not override profile opt=2 (binaries identical)" >&2; fail=1
 else
-    echo "PASS opt: -O0 overrides manifest opt=O2"
+    echo "PASS opt: -O0 overrides profile opt=2"
 fi
 
 # a bogus opt value is a manifest error.
-sed 's/^opt = "O2"/opt = "ofast"/' "$HERE/app/mach.toml" > "$WORK/app/mach.toml"
+sed 's/^opt = 2/opt = 9/' "$HERE/app/mach.toml" > "$WORK/app/mach.toml"
 rm -rf "$WORK/app/out"
 if ( cd "$WORK/app" && "$MACH" build . ) >/dev/null 2>&1; then
     echo "FAIL opt: invalid opt value did not fail the build" >&2; fail=1

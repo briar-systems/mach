@@ -5,7 +5,7 @@
 # the consumer (`app`) declares libc's `getpid` `ext` and calls it; no in-graph
 # definition exists, so the symbol can only be satisfied by a dynamic import. it
 # is linked against `libc` (which resolves to `libc.so.6`) through each supported
-# surface — `-l c` and the `[targets.*].libs` manifest field — producing a
+# surface — `-l c` and the `[target.*].libs` manifest field — producing a
 # dynamically-linked ELF (PT_INTERP + .dynamic/PLT/GOT). the program returns 0
 # only when `getpid()` returns a positive pid, proving the import resolved and
 # the PLT call ran at load time. a build with no shared dependency must fail on
@@ -76,9 +76,9 @@ expect_0() {
 # `-l c` resolves libc.so.6 and binds getpid dynamically.
 expect_0 "-l c (libc.so.6)" . -l c
 
-# manifest libs: `[targets.linux].libs = ["c"]` resolves the same shared lib.
-sed 's|^binary = "linux/bin/dynapp"|&\nlibs = ["c"]|' "$HERE/app/mach.toml" > "$WORK/app/mach.toml"
-expect_0 "[targets.*].libs manifest" .
+# manifest libs: `[target.linux].libs = ["c"]` resolves the same shared lib.
+sed 's|^abi = "sysv64"|&\nlibs = ["c"]|' "$HERE/app/mach.toml" > "$WORK/app/mach.toml"
+expect_0 "[target.*].libs manifest" .
 cp "$HERE/app/mach.toml" "$WORK/app/mach.toml"
 
 # no shared dependency: the undefined `ext getpid` must make the link fail.
