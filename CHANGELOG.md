@@ -15,6 +15,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stripped to end-of-line when the asm body is materialized, before any
   substitution or statement tokenization (#1297).
 
+## [1.4.0] - 2026-06-12
+
+The clean-break release: one manifest format, the project module, and the
+test infrastructure the language was designed around.
+
+### Added
+
+- **The project module**: `[project] module = "lib.mach"` — a bare project-id
+  `use glfw;` / `fwd glfw;` resolves to the project's declared module. Never
+  inferred; module-less bare imports and dangling declarations error loudly.
+- **OS link overlays**: `[os.<name>] libs = [...]` — link requirements scoped
+  to one tuple component, cascading to consumers across every ISA/ABI of that
+  OS (`[isa.*]`/`[abi.*]` reserved).
+- **Per-test executables**: every `test` block builds to its own standalone
+  program under the `tests` path template; `mach test` runs each in its own
+  process — a crashing test reports `FAIL(signal n)` and the run continues —
+  with `--list` and `--filter`. Test artifacts never touch the project binary
+  path.
+- The compiler versions itself from its manifest (`$project.version`):
+  release bumps are now a one-file change.
+
+### Changed
+
+- **One manifest format.** The pre-1.3 manifest system is removed entirely —
+  `[targets.*]`, `dir_*` keys, string opt levels, and `type/path/version`
+  dep stanzas no longer parse. Projects update their manifests by hand;
+  doc/manifest.md documents the format.
+- `[profile.*] opt` is an integer (`0 | 1 | 2`).
+- `mach dep pull` clones into an empty dependency placeholder directory
+  (plain-clone installs work without `--recurse-submodules`).
+- Inline-asm comments are fully opaque to the instruction parser; every
+  audited diagnostic now names its subject and carries a span.
+
 ## [1.3.1] - 2026-06-11
 
 Transitional self-seeding release. Carries the v1.4.0 feature line developed
