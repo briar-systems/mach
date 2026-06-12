@@ -9,9 +9,11 @@
 #
 # a dependency stanza `[deps.<name>]` has exactly one source key: a `git` url plus
 # an optional `ref`, which mach acquires into `dep/<name>/` with plain git
-# operations (submodule-compatible, never `git submodule`), or a `path` pointing
-# into the project's own tree, which is never fetched. git is the only fetch
-# transport: `mach build` never needs it, but the network-shaped commands here do.
+# operations (submodule-compatible, never `git submodule`), or a `path` pointing at
+# a local project tree, never fetched but materialized at `dep/<name>/` as a
+# relative symlink so the build resolves it by the same vendor layout. git is the
+# only fetch transport: `mach build` never needs it, but the network-shaped
+# commands here do.
 # transitive deps resolve into the flat dep tree; the same name required from two
 # different sources/refs is a hard error.
 
@@ -214,7 +216,8 @@ pub fun pull_project(root: str, quiet: bool) i64 {
     }
     var mt: toml.Table = unwrap_ok[toml.Table, str](tr);
 
-    val dep_root_r: Result[str, str] = join2(?alloc, root, dep_dir_name(?mt)::*u8);
+    val dep_name: str = dep_dir_name(?mt);
+    val dep_root_r: Result[str, str] = join2(?alloc, root, dep_name::*u8);
     if (is_err[str, str](dep_root_r)) { print.eprint("error: out of memory\n"); ret 2; }
     val dep_root: str = unwrap_ok[str, str](dep_root_r);
 
@@ -253,13 +256,8 @@ pub fun pull_project(root: str, quiet: bool) i64 {
             if (rc != 0) { ret rc; }
         }
         or {
-            if (!fs.exists(nv.data[i].dir)) {
-                print.eprint("warning: path dependency '");
-                print.eprint(nv.data[i].name);
-                print.eprint("' points at a missing directory: ");
-                print.eprint(nv.data[i].path);
-                print.eprint("\n");
-            }
+            val rc: i64 = materialize_path_node(?alloc, ?nv.data[i], dep_root, dep_name, quiet);
+            if (rc != 0) { ret rc; }
         }
 
         # descend into the dep's own manifest to grow the flat tree transitively.
@@ -378,6 +376,144 @@ fun process_git_node(alloc: *Allocator, gt: *GitTool, node: *DepNode, dep_root: 
         print.print("\n");
     }
     ret 0;
+}
+
+# materialize_path_node: realize one path dependency at its flat-tree vendor
+# location `<dep_root>/<name>` as a symlink to the resolved source `node.dir`, so
+# the build (which resolves every dep purely by vendor layout) reaches the dep's
+# modules through it. the source must exist and carry a mach.toml — a missing
+# directory or manifest is a hard error, never silent success (#1370). a path that
+# already resolves to the vendor location (in-tree vendoring, `path = "<dep>/<name>"`)
+# is left as is. a real directory squatting the vendor location (a stale git
+# checkout, foreign vendored files) is a hard error rather than a clobber; a prior
+# symlink is replaced, so re-pull is idempotent. path deps carry no lock entry: the
+# manifest's `path` is the record.
+fun materialize_path_node(alloc: *Allocator, node: *DepNode, dep_root: str, dep_name: str, quiet: bool) i64 {
+    if (!fs.exists(node.dir)) {
+        print.eprint("error: path dependency '");
+        print.eprint(node.name);
+        print.eprint("' points at a missing directory: ");
+        print.eprint(node.path);
+        print.eprint("\n");
+        ret 1;
+    }
+    val mp_r: Result[str, str] = join2(alloc, node.dir, MANIFEST);
+    if (is_err[str, str](mp_r)) { print.eprint("error: out of memory\n"); ret 2; }
+    if (!fs.exists(unwrap_ok[str, str](mp_r))) {
+        print.eprint("error: path dependency '");
+        print.eprint(node.name);
+        print.eprint("' has no mach.toml: ");
+        print.eprint(node.path);
+        print.eprint("\n");
+        ret 1;
+    }
+
+    val v_r: Result[str, str] = join2(alloc, dep_root, node.name::*u8);
+    if (is_err[str, str](v_r)) { print.eprint("error: out of memory\n"); ret 2; }
+    val vendor: str = unwrap_ok[str, str](v_r);
+
+    # in-tree vendoring: the source already lives at the vendor location.
+    if (str_equals(node.dir, vendor)) { ret 0; }
+
+    fs.create_dir_all(alloc, dep_root, 0o755);
+    val pre_exists: bool = fs.exists(vendor);
+
+    # drop a stale symlink (its target may have moved); a real directory here is a
+    # hard error — unlink leaves a directory intact (EISDIR), so it remains a dir.
+    fs.unlink(vendor);
+    if (fs.is_dir(vendor)) {
+        print.eprint("error: ");
+        print.eprint(vendor);
+        print.eprint(" is a real directory, not a path-dependency link; remove it (e.g. `mach dep remove ");
+        print.eprint(node.name);
+        print.eprint(" --purge`) and re-pull\n");
+        ret 1;
+    }
+
+    val target_r: Result[str, str] = link_target(alloc, dep_name, node.dir);
+    if (is_err[str, str](target_r)) { print.eprint("error: out of memory\n"); ret 2; }
+    val target: str = unwrap_ok[str, str](target_r);
+    if (is_err[bool, str](make_symlink(alloc, target, vendor))) {
+        print.eprint("error: failed to link ");
+        print.eprint(vendor);
+        print.eprint(" -> ");
+        print.eprint(target);
+        print.eprint("\n");
+        ret 2;
+    }
+    if (!quiet && !pre_exists) {
+        print.print("linked ");
+        print.print(node.name);
+        print.print(" -> ");
+        print.print(node.path);
+        print.print("\n");
+    }
+    ret 0;
+}
+
+# link_target: the symlink target for a path dependency — a relative path from the
+# vendor location `<dep_root>/<name>` back to the resolved source `src` (expressed
+# relative to the project root). the symlink sits one directory below the project
+# root per path segment of the dep dir, so the target climbs that many `..` before
+# applying the source path. a relative target keeps a tree that moves as a whole (a
+# monorepo, a committed examples dir) linked without a re-pull. errors only on a
+# failed allocation.
+fun link_target(alloc: *Allocator, dep_name: str, src: str) Result[str, str] {
+    val depth: usize = path_segments(dep_name);
+    val sl: usize = str_len(src);
+    val r: Result[*u8, str] = allocate[u8](alloc, depth * 3 + sl + 1);
+    if (is_err[*u8, str](r)) { ret err[str, str](unwrap_err[*u8, str](r)); }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    var d: usize = 0;
+    for (d < depth) {
+        buf[k] = '.'::u8; buf[k + 1] = '.'::u8; buf[k + 2] = '/'::u8;
+        k = k + 3; d = d + 1;
+    }
+    k = put_n(buf, k, src::*u8, sl);
+    buf[k] = 0;
+    ret ok[str, str](buf::str);
+}
+
+# path_segments: the number of real path components in a `/`-separated path,
+# ignoring empty (`//`, leading/trailing `/`) and `.` components — the climb depth
+# from a `<dep>/<name>` link back to the project root.
+fun path_segments(s: str) usize {
+    val n: usize = str_len(s);
+    var count: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        if (s[i] == '/'::u8) { i = i + 1; cnt; }
+        val start: usize = i;
+        for (i < n && s[i] != '/'::u8) { i = i + 1; }
+        if (!(i - start == 1 && s[start] == '.'::u8)) { count = count + 1; }
+    }
+    ret count;
+}
+
+# make_symlink: create a symbolic link at `linkpath` pointing at `target` by
+# shelling to `ln -s`. resolution already shells to system git/rm; reusing `ln`
+# avoids a hand-rolled symlinkat across every host os. the caller has cleared any
+# prior link, so no `-f` is needed. ln's absence is a clean error.
+fun make_symlink(alloc: *Allocator, target: str, linkpath: str) Result[bool, str] {
+    val ln_r: Result[str, str] = find_on_path(alloc, "ln");
+    if (is_err[str, str](ln_r)) { ret err[bool, str]("ln not found on PATH (needed to materialize path dependencies)"); }
+    val ln: str = unwrap_ok[str, str](ln_r);
+    val env_r: Result[**u8, str] = build_env(alloc);
+    if (is_err[**u8, str](env_r)) { ret err[bool, str]("failed to build child environment for ln"); }
+    val env: **u8 = unwrap_ok[**u8, str](env_r);
+
+    var argv: [5]usize;
+    argv[0] = ln::usize;
+    argv[1] = "-s"::usize;
+    argv[2] = target::usize;
+    argv[3] = linkpath::usize;
+    argv[4] = 0;
+    val rr: Result[exec.ExitStatus, str] = exec.run(ln, (?argv[0])::**u8, env);
+    if (is_err[exec.ExitStatus, str](rr)) { ret err[bool, str]("failed to spawn ln"); }
+    val s: exec.ExitStatus = unwrap_ok[exec.ExitStatus, str](rr);
+    if (!exec.exited(s) || exec.code(s) != 0) { ret err[bool, str]("ln exited non-zero"); }
+    ret ok[bool, str](true);
 }
 
 # git_fail: the generic per-dep git failure exit, naming the dependency.
@@ -1577,5 +1713,29 @@ test "dep: ref_advanceable advances branches and the default, freezes tags/commi
     if (ref_advanceable("tag/v1.0.0")) { ret 1; }
     if (ref_advanceable("commit/abcdef0")) { ret 1; }
     if (ref_advanceable("0123456789abcdef0123456789abcdef01234567")) { ret 1; }
+    ret 0;
+}
+
+test "dep: path_segments counts real components, ignoring empty and '.' (#1370)" {
+    if (path_segments("dep") != 1)         { ret 1; }
+    if (path_segments("vendor/deps") != 2) { ret 1; }
+    if (path_segments("./dep") != 1)       { ret 1; }
+    if (path_segments("a//b") != 2)        { ret 1; }
+    if (path_segments("") != 0)            { ret 1; }
+    if (path_segments("/") != 0)           { ret 1; }
+    ret 0;
+}
+
+test "dep: link_target climbs the dep dir, then applies the source path (#1370)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    # the vendor location sits one dir below the root for a single-segment dep dir.
+    val t1: Result[str, str] = link_target(?alloc, "dep", "./../lib-x");
+    if (is_err[str, str](t1)) { ret 1; }
+    if (!str_equals(unwrap_ok[str, str](t1), ".././../lib-x")) { ret 1; }
+    # a two-segment dep dir climbs twice.
+    val t2: Result[str, str] = link_target(?alloc, "a/b", "x");
+    if (is_err[str, str](t2)) { ret 1; }
+    if (!str_equals(unwrap_ok[str, str](t2), "../../x")) { ret 1; }
     ret 0;
 }
