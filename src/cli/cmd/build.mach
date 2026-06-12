@@ -22,6 +22,7 @@ use std.types.string.str;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.types.string.str_contains;
 use std.types.option.Option;
 use std.types.option.some;
 use std.types.option.none;
@@ -85,6 +86,46 @@ use cli_diag: mach.cli.diagnostic;
 pub rec BuildResult {
     code:        i64;
     output_path: *u8;
+}
+
+# TestArtifact: one built test — its reporting metadata and the executable path.
+# all owned strings come from the build allocator, so they outlive the session
+# teardown inside `build_tests` and stay valid until the caller frees that
+# allocator (after it has run every test).
+# ---
+# label: owned printable test name (the `test "..."` literal's inner text)
+# file:  owned source file path of the declaring module
+# line:  1-based source line of the `test` keyword
+# exe:   owned absolute path to the test executable; nil in `--list` mode
+pub rec TestArtifact {
+    label: *u8;
+    file:  *u8;
+    line:  u32;
+    exe:   *u8;
+}
+
+# TestList: the growing `TestArtifact` array a test build fills, in collection
+# order. allocated from the build allocator.
+# ---
+# tests: owned array of artifacts
+# count: number of populated entries
+# cap:   allocated length of `tests`
+pub rec TestList {
+    tests: *TestArtifact;
+    count: u32;
+    cap:   u32;
+}
+
+# TestBuildResult: the outcome of a `build_tests` invocation: the exit code plus
+# the collected test artifacts (owned by the caller's allocator).
+# ---
+# code:  process exit code (0 ok, 1 user error, 2 internal error)
+# tests: built test artifacts; nil when the build failed before collection
+# count: number of artifacts
+pub rec TestBuildResult {
+    code:  i64;
+    tests: *TestArtifact;
+    count: u32;
 }
 
 # EmitArtifacts: the debug-artifact emission settings threaded into the per-module
@@ -341,29 +382,58 @@ fun free_modules(p: *driver.Project,
 
 
 # build: compile a single build unit selected from the CLI flags. the shared body
-# behind `run` that `cmd.run` and `cmd.test` reuse so they can build one artifact
-# and then exec it; `mach build` itself iterates the build matrix (`run` below).
-# the returned `output_path`, when non-nil, is owned by `alloc` — the caller frees
-# it (and tears `alloc` down) once done with it.
+# behind `run` that `cmd.run` reuses so it can build one artifact and then exec it;
+# `mach build` itself iterates the build matrix (`run` below). the returned
+# `output_path`, when non-nil, is owned by `alloc` — the caller frees it (and tears
+# `alloc` down) once done with it.
 # ---
 # alloc:    allocator owning the session and the returned artifact path;
 #           must outlive the returned BuildResult
 # argc:     argument count including argv[0]
 # argv:     the argument vector (argc null-terminated byte pointers)
 # emit_obj: when true, emit a relocatable object instead of an executable
-# test_mode: when true, build a test binary — synthesize a test-runner `main`
-#            over every collected `test` declaration instead of the project's own
-#            entry point, and always link an executable (even a library target)
 # ret:      a BuildResult carrying the exit code and artifact path
-pub fun build(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mode: bool) BuildResult {
-    ret build_unit(alloc, argc, argv, emit_obj, test_mode, nil);
+pub fun build(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool) BuildResult {
+    ret build_unit(alloc, argc, argv, emit_obj, false, nil, nil, false);
+}
+
+# build_tests: build one standalone executable per `test` declaration, returning
+# the per-test artifacts (label, source `file:line`, and executable path) for the
+# `mach test` runner to spawn. every test executable is the project's transitive
+# code plus a synthesized `main` that calls just that test and exits with its
+# `i32` result — independently runnable, never the project's own binary path
+# (#1274). with `list_only` the build stops after collecting the tests, leaving
+# each artifact's `exe` nil. the returned strings are owned by `alloc` and outlive
+# this call's internal session teardown, so the caller frees `alloc` once it has
+# run every test.
+# ---
+# alloc:     allocator owning the session and the returned artifacts; must outlive
+#            the returned TestBuildResult
+# argc:      argument count including argv[0]
+# argv:      the argument vector (argc null-terminated byte pointers)
+# list_only: collect the tests without building executables (`--list`)
+# ret:       a TestBuildResult carrying the exit code and the test artifacts
+pub fun build_tests(alloc: *Allocator, argc: usize, argv: **u8, list_only: bool) TestBuildResult {
+    var list: TestList;
+    list.tests = nil;
+    list.count = 0;
+    list.cap   = 0;
+    val br: BuildResult = build_unit(alloc, argc, argv, false, true, nil, ?list, list_only);
+    var tbr: TestBuildResult;
+    tbr.code  = br.code;
+    tbr.tests = list.tests;
+    tbr.count = list.count;
+    ret tbr;
 }
 
 # build_unit: the single-unit build body. with `ovr` nil the target/artifact are
 # derived from the CLI flags (the `cmd.run`/`cmd.test` path); with `ovr` set they
 # come from one enumerated matrix cell (the `mach build` loop), the only field the
-# override replaces — profile and every other flag still apply to each unit.
-fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mode: bool, ovr: *driver.MatrixUnit) BuildResult {
+# override replaces — profile and every other flag still apply to each unit. when
+# `tests_out` is non-nil the build is a test build: it produces one executable per
+# `test` declaration and fills `tests_out` instead of linking a single artifact
+# (`list_only` stops after collection). `test_mode` mirrors `tests_out != nil`.
+fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mode: bool, ovr: *driver.MatrixUnit, tests_out: *TestList, list_only: bool) BuildResult {
     var br: BuildResult;
     br.code        = 2;
     br.output_path = nil;
@@ -504,7 +574,7 @@ fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_
     if (config.emit_ir)     { eff_emit_ir = true; }
     if (config.no_emit_ir)  { eff_emit_ir = false; }
 
-    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, config.verbose, eff_emit_asm, eff_emit_ir, ?root[0], config.output, eff, argv, ?br.output_path);
+    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, config.verbose, eff_emit_asm, eff_emit_ir, ?root[0], config.output, eff, argv, ?br.output_path, tests_out, list_only);
 
     cli_diag.flush(?s, ?s.diags, cfg.color_enabled(config.color));
     driver.dnit_project(?p);
@@ -529,11 +599,15 @@ fun resolve_opt_level(p: *driver.Project, cli_level: u8, cli_set: bool) u8 {
 # sets `*out_path` to the produced artifact path on success. `out_override`
 # (-o), when non-nil, replaces the resolved artifact path. when `verbose` is set,
 # per-stage progress is written to stderr. `emit_asm` / `emit_ir` request the
-# per-module `.s` / `.ir` debug artifacts.
+# per-module `.s` / `.ir` debug artifacts. when `tests_out` is non-nil the build
+# is a test build: per-module objects are written once and one executable is
+# linked per `test` (filling `tests_out`) rather than a single artifact;
+# `list_only` stops after collecting the tests.
 fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: bool, verify_ir: bool, verbose: bool,
                      emit_asm: bool, emit_ir: bool,
                      root: *u8, out_override: *u8,
-                     argc: usize, argv: **u8, out_path: **u8) i64 {
+                     argc: usize, argv: **u8, out_path: **u8,
+                     tests_out: *TestList, list_only: bool) i64 {
     val n: usize = p.module_len::usize;
     if (n == 0) {
         print.eprint("error: project graph is empty; the entrypoint loaded no modules\n");
@@ -596,13 +670,6 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         i = i + 1;
     }
 
-    # the synthesized test-runner module + its codegen image, materialized only
-    # in test mode and only when the build collected at least one test.
-    var runner_ir:    ir.Module;
-    var runner_img:   of.ObjectImage;
-    var runner_ir_ok:  bool = false;
-    var runner_img_ok: bool = false;
-
     var code: i64 = 0;
     val comp_r: Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, verbose, ?ea, results, ready, irs, ir_ready, images, image_ready);
     if (is_err[bool, str](comp_r)) {
@@ -619,17 +686,13 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
     or (diag.has_errors(?p.s.diags)) {
         code = 1;
     }
+    or (tests_out != nil) {
+        code = build_test_executables(p, level, verify_ir, verbose, root, argc, argv, images, irs, list_only, tests_out);
+    }
     or {
-        if (test_mode) {
-            code = build_test_runner(p, level, verify_ir, irs, ?runner_ir, ?runner_ir_ok, ?runner_img, ?runner_img_ok);
-        }
-        if (code == 0) {
-            code = link_artifact(p, emit_obj, test_mode, runner_img_ok, ?runner_img, verbose, root, out_override, argc, argv, images, out_path);
-        }
+        code = link_artifact(p, emit_obj, verbose, root, out_override, argc, argv, images, out_path);
     }
 
-    if (runner_img_ok) { obj.dnit(?runner_img); }
-    if (runner_ir_ok)  { ir.dnit_module(?runner_ir); }
     free_modules(p, results, ready, irs, ir_ready, images, image_ready);
     deallocate[bool](p.s.alloc, image_ready, n);
     deallocate[of.ObjectImage](p.s.alloc, images, n);
@@ -640,49 +703,382 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
     ret code;
 }
 
-# build_test_runner: synthesize the test-runner IR module over every collected
-# `test` declaration in the freshly-lowered module set, then optimise and codegen
-# it into an extra object image. on success `*runner_ir`/`*runner_img` hold the
-# module and its image and the corresponding `*_ok` flags are set; a build with no
-# tests leaves both flags false (a no-op the caller treats as success). returns 0
-# on success, 2 on an internal error.
-fun build_test_runner(p: *driver.Project, level: u8, verify_ir: bool,
-                      irs: *ir.Module,
-                      runner_ir: *ir.Module, runner_ir_ok: *bool,
-                      runner_img: *of.ObjectImage, runner_img_ok: *bool) i64 {
-    val syn_r: Result[Option[ir.Module], str] = testrunner.synthesize(p.s, ?p.target, irs, p.module_len);
-    if (is_err[Option[ir.Module], str](syn_r)) {
+# build_test_executables: build one standalone executable per collected `test`.
+# the per-module objects are written once under the resolved `obj` template; the
+# external link inputs (libc, manifest/CLI libs) are resolved once. then, for each
+# `test`, a tiny entry module (`main(){ret <test>();}`) is synthesized, optimised,
+# codegen'd to its own object, and linked with the shared object set into a
+# standalone executable at the resolved `tests` template path. each test's
+# reporting metadata (label, source `file:line`) and executable path are appended
+# to `tests_out`. with `list_only` the collection alone is reported and no objects
+# or executables are produced. a build with no tests is a user error. returns 0 on
+# success, 1 on a user error, 2 on an internal error.
+fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbose: bool,
+                           root: *u8, argc: usize, argv: **u8,
+                           images: *of.ObjectImage, irs: *ir.Module,
+                           list_only: bool, tests_out: *TestList) i64 {
+    val cr: Result[testrunner.Collected, str] = testrunner.collect(p.s, irs, p.module_len);
+    if (is_err[testrunner.Collected, str](cr)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[Option[ir.Module], str](syn_r));
+        print.eprint(unwrap_err[testrunner.Collected, str](cr));
         print.eprint("\n");
         ret 2;
     }
-    val syn: Option[ir.Module] = unwrap_ok[Option[ir.Module], str](syn_r);
-    if (is_none[ir.Module](syn)) {
-        print.eprint("error: no 'test' declarations found (add 'test <name> { ... }' blocks)\n");
+    var col: testrunner.Collected = unwrap_ok[testrunner.Collected, str](cr);
+    if (col.count == 0) {
+        testrunner.free(p.s, ?col);
+        print.eprint("error: no 'test' declarations found (add 'test \"name\" { ... }' blocks)\n");
         ret 1;
     }
-    @runner_ir    = unwrap[ir.Module](syn);
-    @runner_ir_ok = true;
 
-    val opt_r: Result[bool, str] = pipeline.run(runner_ir, ?p.target, level, verify_ir);
+    # `--filter <substr>`: only the tests whose label contains the substring are
+    # built and reported. applied at build time so a filtered run builds only the
+    # matching executables. nil filter = every test.
+    val filter: *u8 = filter_value(argc, argv);
+
+    # `--list`: report each selected test's metadata without producing any object.
+    if (list_only) {
+        var ti: u32 = 0;
+        for (ti < col.count) {
+            if (test_selected(p, ?col.tests[ti], filter)) {
+                val rc: i64 = record_test(p, ?col.tests[ti], nil, tests_out);
+                if (rc != 0) { testrunner.free(p.s, ?col); ret rc; }
+            }
+            ti = ti + 1;
+        }
+        testrunner.free(p.s, ?col);
+        ret 0;
+    }
+
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te == nil) { testrunner.free(p.s, ?col); print.eprint("error: no target selected\n"); ret 2; }
+
+    var obj_base: [4096]u8;
+    if (!resolve_obj_base(p, root, ?obj_base[0], 4096)) {
+        testrunner.free(p.s, ?col);
+        print.eprint("error: project obj output dir not interned\n");
+        ret 2;
+    }
+
+    # the per-module objects, written once and shared by every test link.
+    var shared: **u8 = nil;
+    val oc: i64 = write_objects(p, images, ?obj_base[0], ?shared);
+    if (oc != 0) { testrunner.free(p.s, ?col); ret oc; }
+    var shared_count: u32 = p.topo_len;
+
+    # the external link inputs (libc, manifest/CLI libs), resolved once and shared.
+    var sonames: *intern.StrId = nil;
+    var soname_count: u32 = 0;
+    val ec: i64 = append_external_inputs(p, root, argc, argv, ?shared, ?shared_count, ?sonames, ?soname_count);
+    if (ec != 0) {
+        free_paths(p.s.alloc, shared, shared_count, shared_count);
+        free_sonames(p.s.alloc, sonames, soname_count);
+        testrunner.free(p.s, ?col);
+        ret ec;
+    }
+
+    if (verbose) {
+        print.eprint("test ");
+        print.eu64(col.count::u64);
+        print.eprint(" executable(s)\n");
+    }
+
+    var code: i64 = 0;
+    var ti: u32 = 0;
+    for (ti < col.count) {
+        if (test_selected(p, ?col.tests[ti], filter)) {
+            # `ti` is the stable collection index, so a test's executable name is
+            # unchanged whether or not a filter is in effect.
+            code = build_one_test(p, level, verify_ir, ?obj_base[0], root, ti, ?col.tests[ti],
+                                  shared, shared_count, sonames, soname_count, tests_out);
+            if (code != 0) { brk; }
+        }
+        ti = ti + 1;
+    }
+
+    free_paths(p.s.alloc, shared, shared_count, shared_count);
+    free_sonames(p.s.alloc, sonames, soname_count);
+    testrunner.free(p.s, ?col);
+    ret code;
+}
+
+# filter_value: the `--filter <substr>` value from argv, or nil when absent.
+fun filter_value(argc: usize, argv: **u8) *u8 {
+    val o: Option[*u8] = util.get_value(argc, argv, "--filter");
+    if (is_some[*u8](o)) { ret unwrap[*u8](o); }
+    ret nil;
+}
+
+# test_selected: whether a test passes the name filter — every test when `filter`
+# is nil, else those whose label contains the filter substring.
+fun test_selected(p: *driver.Project, t: *testrunner.Test, filter: *u8) bool {
+    if (filter == nil) { ret true; }
+    val lo: Option[str] = intern.lookup(?p.s.interner, t.label);
+    if (is_none[str](lo)) { ret false; }
+    ret str_contains(unwrap[str](lo), util.cstr_str(filter));
+}
+
+# build_one_test: synthesize, codegen, and link a single test's executable, then
+# record its artifact. the entry module is `main(){ret <test>();}`; its object is
+# written to `<obj_base>/__mach_test_entry_<idx>.o` and linked with the shared
+# object set into the resolved `tests` path. returns 0 on success or a non-zero
+# exit code; all per-test resources are released before returning.
+fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8, root: *u8,
+                   idx: u32, t: *testrunner.Test,
+                   shared: **u8, shared_count: u32,
+                   sonames: *intern.StrId, soname_count: u32,
+                   tests_out: *TestList) i64 {
+    val syn_r: Result[ir.Module, str] = testrunner.synthesize_entry(p.s, t.linkage);
+    if (is_err[ir.Module, str](syn_r)) {
+        print.eprint("error: ");
+        print.eprint(unwrap_err[ir.Module, str](syn_r));
+        print.eprint("\n");
+        ret 2;
+    }
+    var entry_ir: ir.Module = unwrap_ok[ir.Module, str](syn_r);
+
+    val opt_r: Result[bool, str] = pipeline.run(?entry_ir, ?p.target, level, verify_ir);
     if (is_err[bool, str](opt_r)) {
+        ir.dnit_module(?entry_ir);
         print.eprint("error: ");
         print.eprint(unwrap_err[bool, str](opt_r));
         print.eprint("\n");
         ret 2;
     }
 
-    val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, runner_ir, nil);
+    val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?entry_ir, nil);
     if (is_err[of.ObjectImage, str](cg_r)) {
+        ir.dnit_module(?entry_ir);
         print.eprint("error: ");
         print.eprint(unwrap_err[of.ObjectImage, str](cg_r));
         print.eprint("\n");
         ret 2;
     }
-    @runner_img    = unwrap_ok[of.ObjectImage, str](cg_r);
-    @runner_img_ok = true;
+    var entry_img: of.ObjectImage = unwrap_ok[of.ObjectImage, str](cg_r);
+
+    # write the entry object alongside the per-module objects.
+    var entry_path: [4096]u8;
+    if (!entry_object_path(obj_base, idx, ?entry_path[0], 4096) || !util.ensure_parents(?entry_path[0])) {
+        obj.dnit(?entry_img);
+        ir.dnit_module(?entry_ir);
+        print.eprint("error: failed to create test object directory\n");
+        ret 2;
+    }
+    val em: Result[bool, str] = obj.emit(?entry_img, ?p.target, ?entry_path[0]);
+    obj.dnit(?entry_img);
+    ir.dnit_module(?entry_ir);
+    if (is_err[bool, str](em)) {
+        print.eprint("error: ");
+        print.eprint(unwrap_err[bool, str](em));
+        print.eprint("\n");
+        ret 1;
+    }
+
+    # the executable path: `<root>/<tests template with {name} = the sanitized name>`.
+    var name_buf: [256]u8;
+    sanitize_test_name(?name_buf[0], 256, idx, t.label, ?p.s.interner);
+    var exe_path: [4096]u8;
+    if (!resolve_test_exe(p, root, util.cstr_str(?name_buf[0]), ?exe_path[0], 4096) || !util.ensure_parents(?exe_path[0])) {
+        print.eprint("error: failed to resolve the test executable path; check the `tests` template in mach.toml\n");
+        ret 2;
+    }
+
+    val lc: i64 = link_one_test(p, shared, shared_count, sonames, soname_count, ?entry_path[0], ?exe_path[0]);
+    if (lc != 0) { ret lc; }
+
+    ret record_test(p, t, ?exe_path[0], tests_out);
+}
+
+# link_one_test: link the shared object set plus one test's entry object into the
+# test executable at `exe_path`. the shared paths are reused across tests, so the
+# combined array borrows their string pointers and only the array wrapper is
+# freed. returns 0 on success or a non-zero exit code.
+fun link_one_test(p: *driver.Project, shared: **u8, shared_count: u32,
+                  sonames: *intern.StrId, soname_count: u32,
+                  entry_path: *u8, exe_path: *u8) i64 {
+    val total: u32 = shared_count + 1;
+    val ar: Result[**u8, str] = allocate[*u8](p.s.alloc, total::usize);
+    if (is_err[**u8, str](ar)) { print.eprint("error: out of memory\n"); ret 2; }
+    val paths: **u8 = unwrap_ok[**u8, str](ar);
+    var i: u32 = 0;
+    for (i < shared_count) { paths[i] = shared[i]; i = i + 1; }
+    paths[shared_count] = entry_path;
+
+    val link_r: Result[bool, str] =
+        linker.link(p.s, ?p.target, paths, total, sonames, soname_count, exe_path, linker.LINK_EXE);
+    deallocate[*u8](p.s.alloc, paths, total::usize);
+    if (is_err[bool, str](link_r)) {
+        print.eprint("error: ");
+        print.eprint(unwrap_err[bool, str](link_r));
+        print.eprint("\n");
+        ret 1;
+    }
     ret 0;
+}
+
+# record_test: append a test's reporting artifact (label, source `file:line`, and
+# executable path) to `tests_out`, duplicating every string into the build
+# allocator so it outlives the session teardown. `exe` is nil in `--list` mode.
+# returns 0 on success or a non-zero exit code.
+fun record_test(p: *driver.Project, t: *testrunner.Test, exe: *u8, tests_out: *TestList) i64 {
+    var a: TestArtifact;
+    a.line = t.line;
+
+    val lo: Option[str] = intern.lookup(?p.s.interner, t.label);
+    var label_src: *u8 = "<test>";
+    if (is_some[str](lo)) { label_src = unwrap[str](lo)::*u8; }
+    a.label = dup_cstr(p.s.alloc, label_src);
+    if (a.label == nil) { print.eprint("error: out of memory\n"); ret 2; }
+
+    a.file = dup_cstr(p.s.alloc, test_source_path(p, t.mod_idx));
+    if (a.file == nil) { print.eprint("error: out of memory\n"); ret 2; }
+
+    a.exe = nil;
+    if (exe != nil) {
+        a.exe = dup_cstr(p.s.alloc, exe);
+        if (a.exe == nil) { print.eprint("error: out of memory\n"); ret 2; }
+    }
+
+    if (!push_artifact(p.s.alloc, tests_out, a)) { print.eprint("error: out of memory\n"); ret 2; }
+    ret 0;
+}
+
+# push_artifact: append one artifact to a TestList, doubling the backing array
+# when full. returns false on allocation failure.
+fun push_artifact(alloc: *Allocator, list: *TestList, a: TestArtifact) bool {
+    if (list.count == list.cap) {
+        var new_cap: u32 = list.cap * 2;
+        if (new_cap < 8) { new_cap = 8; }
+        if (list.tests == nil) {
+            val r: Result[*TestArtifact, str] = allocate[TestArtifact](alloc, new_cap::usize);
+            if (is_err[*TestArtifact, str](r)) { ret false; }
+            list.tests = unwrap_ok[*TestArtifact, str](r);
+        }
+        or {
+            val r: Result[*TestArtifact, str] = reallocate[TestArtifact](alloc, list.tests, list.cap::usize, new_cap::usize);
+            if (is_err[*TestArtifact, str](r)) { ret false; }
+            list.tests = unwrap_ok[*TestArtifact, str](r);
+        }
+        list.cap = new_cap;
+    }
+    list.tests[list.count] = a;
+    list.count = list.count + 1;
+    ret true;
+}
+
+# test_source_path: the source file path of the module a test was declared in,
+# borrowed from the session source map (caller duplicates). "<unknown>" when the
+# module's file is not registered.
+fun test_source_path(p: *driver.Project, mod_idx: u32) *u8 {
+    if (mod_idx >= p.module_len) { ret "<unknown>"; }
+    val m: *driver.ModuleEntry = ?p.modules[mod_idx];
+    val sf_o: Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
+    if (is_none[*src.SourceFile](sf_o)) { ret "<unknown>"; }
+    ret unwrap[*src.SourceFile](sf_o).path::*u8;
+}
+
+# entry_object_path: compose `<obj_base>/__mach_test_entry_<idx>.o` into `buf`.
+# returns false if it would not fit.
+fun entry_object_path(obj_base: *u8, idx: u32, buf: *u8, cap: usize) bool {
+    var leaf: [64]u8;
+    var k: usize = 0;
+    val prefix: str = "__mach_test_entry_";
+    val pl: usize = str_len(prefix);
+    var i: usize = 0;
+    for (i < pl) { leaf[k] = prefix[i]; k = k + 1; i = i + 1; }
+    k = k + write_u32(?leaf[k], 64 - k, idx);
+    leaf[k] = '.'; k = k + 1;
+    leaf[k] = 'o'; k = k + 1;
+    leaf[k] = 0;
+    ret util.join_into(buf, cap, obj_base, ?leaf[0]) > 0;
+}
+
+# sanitize_test_name: write the `{name}` for a test's executable into `buf` as
+# `<idx>-<sanitized label>` — the collection index keeps it unique (labels are not
+# globally unique) and stable, and every byte of the label outside
+# `[A-Za-z0-9._-]` becomes `_` so the name is filesystem-safe. the label portion
+# is truncated to keep the name bounded. always null-terminated.
+fun sanitize_test_name(buf: *u8, cap: usize, idx: u32, label: intern.StrId, i: *intern.Interner) usize {
+    var k: usize = write_u32(buf, cap, idx);
+    if (k + 1 < cap) { buf[k] = '-'; k = k + 1; }
+
+    val lo: Option[str] = intern.lookup(i, label);
+    if (is_some[str](lo)) {
+        val s: str = unwrap[str](lo);
+        val n: usize = str_len(s);
+        var j: usize = 0;
+        # bound the label portion so the file name stays short and path-safe.
+        for (j < n && j < 60::usize && k + 1 < cap) {
+            buf[k] = sanitize_byte(s[j]);
+            k = k + 1;
+            j = j + 1;
+        }
+    }
+    if (k < cap) { buf[k] = 0; }
+    or { buf[cap - 1] = 0; }
+    ret k;
+}
+
+# sanitize_byte: keep `[A-Za-z0-9._-]`; map every other byte to `_`.
+fun sanitize_byte(c: u8) u8 {
+    if (c >= 'a' && c <= 'z') { ret c; }
+    if (c >= 'A' && c <= 'Z') { ret c; }
+    if (c >= '0' && c <= '9') { ret c; }
+    if (c == '.' || c == '_' || c == '-') { ret c; }
+    ret '_';
+}
+
+# write_u32: write the decimal text of `n` into `buf` (null terminator excluded),
+# returning the number of digits written. a single `0` for zero.
+fun write_u32(buf: *u8, cap: usize, n: u32) usize {
+    if (cap == 0) { ret 0; }
+    if (n == 0) { buf[0] = '0'; ret 1; }
+    var tmp: [16]u8;
+    var t: usize = 0;
+    var v: u32 = n;
+    for (v > 0) { tmp[t] = (v % 10)::u8 + '0'; v = v / 10; t = t + 1; }
+    var k: usize = 0;
+    for (k < t && k < cap) { buf[k] = tmp[t - 1 - k]; k = k + 1; }
+    ret k;
+}
+
+# resolve_test_exe: write `<root>/<tests template with {name} = name>` into `buf`.
+# the resolved `tests` template carries a literal `{name}` placeholder (filled
+# here per test). returns false when the template is not interned or it would not
+# fit.
+fun resolve_test_exe(p: *driver.Project, root: *u8, name: str, buf: *u8, cap: usize) bool {
+    val o: Option[str] = intern.lookup(?p.s.interner, p.config.test_root);
+    if (is_none[str](o)) { ret false; }
+    var rel: [4096]u8;
+    if (subst_name(unwrap[str](o), name, ?rel[0], 4096) == 0) { ret false; }
+    ret join_into_str(buf, cap, root, util.cstr_str(?rel[0])) > 0;
+}
+
+# subst_name: copy `tmpl` into `out`, replacing every `{name}` occurrence with
+# `name`. returns the byte length written (excluding the terminator), or 0 if it
+# would not fit.
+fun subst_name(tmpl: str, name: str, out: *u8, cap: usize) usize {
+    val tn: usize = str_len(tmpl);
+    val nn: usize = str_len(name);
+    var k: usize = 0;
+    var i: usize = 0;
+    for (i < tn) {
+        if (i + 6 <= tn && tmpl[i] == '{' && tmpl[i + 1] == 'n' && tmpl[i + 2] == 'a'
+            && tmpl[i + 3] == 'm' && tmpl[i + 4] == 'e' && tmpl[i + 5] == '}') {
+            var j: usize = 0;
+            for (j < nn) {
+                if (k + 1 >= cap) { ret 0; }
+                out[k] = name[j]; k = k + 1; j = j + 1;
+            }
+            i = i + 6;
+        }
+        or {
+            if (k + 1 >= cap) { ret 0; }
+            out[k] = tmpl[i]; k = k + 1; i = i + 1;
+        }
+    }
+    out[k] = 0;
+    ret k;
 }
 
 # link_artifact: write each per-module image to a relocatable `.o` on disk
@@ -698,8 +1094,7 @@ fun build_test_runner(p: *driver.Project, level: u8, verify_ir: bool,
 # reads its inputs from disk, so the per-module objects are materialised
 # before linking. when `verbose` is set, the object count and output path are
 # written to stderr.
-fun link_artifact(p: *driver.Project, emit_obj: bool, test_mode: bool, have_runner: bool,
-                  runner_img: *of.ObjectImage, verbose: bool, root: *u8,
+fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
                   out_override: *u8,
                   argc: usize, argv: **u8,
                   images: *of.ObjectImage, out_path: **u8) i64 {
@@ -718,22 +1113,9 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, test_mode: bool, have_runn
     if (obj_code != 0) { ret obj_code; }
     var count: u32 = p.topo_len;
 
-    # in test mode the synthesized runner object joins the link as one extra
-    # input. it is written alongside the per-module objects and appended to the
-    # path set; `paths` is grown by one and re-bound here.
-    if (test_mode && have_runner) {
-        val rcode: i64 = append_runner_object(p, runner_img, ?obj_base[0], ?paths, count);
-        if (rcode != 0) {
-            free_paths(p.s.alloc, paths, count, count);
-            ret rcode;
-        }
-        count = count + 1;
-    }
-
     # library mode (or `--emit obj`): the per-module objects are the deliverable;
-    # do not link an executable. a test build always links an executable, even
-    # for a library target, since the test runner needs a runnable entry point.
-    if ((te.mode == driver.MODE_LIBRARY || emit_obj) && !test_mode) {
+    # do not link an executable.
+    if (te.mode == driver.MODE_LIBRARY || emit_obj) {
         if (verbose) {
             print.eprint("output ");
             print.eprint((?obj_base[0])::str);
@@ -1479,37 +1861,6 @@ fun write_objects(p: *driver.Project, images: *of.ObjectImage,
     ret 0;
 }
 
-# append_runner_object: write the synthesized test-runner image to
-# `<obj_base>/__mach_test.o` and append its owned path to the existing `*paths`
-# array (grown from `count` to `count + 1`). `*paths` is re-bound to the grown
-# array. returns 0 on success, or a non-zero exit code (the caller frees the
-# original array on failure).
-fun append_runner_object(p: *driver.Project, runner_img: *of.ObjectImage,
-                         obj_base: *u8, paths: ***u8, count: u32) i64 {
-    var path: [4096]u8;
-    util.join_into(?path[0], 4096, obj_base, "__mach_test.o");
-    if (!util.ensure_parents(?path[0])) {
-        print.eprint("error: failed to create object directory\n");
-        ret 2;
-    }
-
-    val em: Result[bool, str] = obj.emit(runner_img, ?p.target, ?path[0]);
-    if (is_err[bool, str](em)) {
-        print.eprint("error: ");
-        print.eprint(unwrap_err[bool, str](em));
-        print.eprint("\n");
-        ret 1;
-    }
-
-    val gr: Result[**u8, str] = reallocate[*u8](p.s.alloc, @paths, count::usize, (count + 1)::usize);
-    if (is_err[**u8, str](gr)) { print.eprint("error: out of memory\n"); ret 2; }
-    @paths = unwrap_ok[**u8, str](gr);
-
-    (@paths)[count] = dup_cstr(p.s.alloc, ?path[0]);
-    if ((@paths)[count] == nil) { print.eprint("error: out of memory\n"); ret 2; }
-    ret 0;
-}
-
 # mirror_fqn: write `<base>/<rel>.<ext>` into `buf`, where `<rel>` is the module
 # FQN with every '.' replaced by '/' (so `a.b.c` with ext `o` becomes
 # `<base>/a/b/c.o`). returns the byte length written (excluding the terminator),
@@ -1712,7 +2063,7 @@ pub fun run(argc: usize, argv: **u8) i64 {
             ret 2;
         }
 
-        val br: BuildResult = build_unit(?u_alloc, argc, argv, emit_obj, false, unit);
+        val br: BuildResult = build_unit(?u_alloc, argc, argv, emit_obj, false, unit, nil, false);
         if (br.code != 0 && code == 0) { code = br.code; }
         arena.dnit(?u_ar);
         ui = ui + 1;
