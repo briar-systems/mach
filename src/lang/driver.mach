@@ -131,11 +131,15 @@ pub rec TargetEntry {
 # alias:           interned alias as written in `[deps.<alias>]`
 # project_id:      interned `[project].id` from the dep's own mach.toml
 # project_dir_src: interned `[project].src` from the dep's own mach.toml
+# project_module:  interned `[project].module` from the dep's own mach.toml — the
+#                  src-relative module a bare project-id import resolves to;
+#                  STR_NIL when the dep declares none
 # vendor_root:     interned absolute filesystem path to the dep root
 pub rec DepEntry {
     alias:           intern.StrId;
     project_id:      intern.StrId;
     project_dir_src: intern.StrId;
+    project_module:  intern.StrId;
     vendor_root:     intern.StrId;
 }
 
@@ -148,6 +152,8 @@ pub rec DepEntry {
 # description:  interned `[project].description` metadata; read by
 #               `$project.description`. STR_NIL when the manifest omits it
 # bin_name:     interned name of the selected artifact; read by `$bin.name`
+# module:       interned `[project].module` — the src-relative module a bare
+#               project-id import of this project resolves to; STR_NIL when none
 # dir_src:      interned `[project].src` (default "src")
 # dir_dep:      interned `[project].dep` (default "dep")
 # project_root: interned absolute filesystem path of the project root
@@ -176,6 +182,7 @@ pub rec ProjectConfig {
     name:         intern.StrId;
     description:  intern.StrId;
     bin_name:     intern.StrId;
+    module:       intern.StrId;
     dir_src:      intern.StrId;
     dir_dep:      intern.StrId;
     project_root: intern.StrId;
@@ -691,6 +698,7 @@ fun init_project(p: *Project, s: *sess.Session) {
     p.config.name         = intern.STR_NIL;
     p.config.description  = intern.STR_NIL;
     p.config.bin_name     = intern.STR_NIL;
+    p.config.module       = intern.STR_NIL;
     p.config.targets      = nil;
     p.config.target_count = 0;
     p.config.deps         = nil;
@@ -816,6 +824,7 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     p.config.description  = m.description;
     # the artifact name feeds `$bin.name`; STR_NIL when the selection bound none.
     if (bu.artifact != nil) { p.config.bin_name = bu.artifact.name; }
+    p.config.module       = m.module;
     p.config.dir_src      = m.src;
     p.config.dir_dep      = m.dep;
     p.config.targets      = targets;
@@ -847,8 +856,39 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
         unwrap[str](isa_opt), unwrap[str](os_opt), unwrap[str](abi_opt), bu.libs, bu.lib_count);
     if (is_err[bool, str](cr2)) { manifest.dnit(?m, p.s.alloc); ret cr2; }
 
+    # a declared `[project].module` that names no file is a manifest error at
+    # build start, imported or not (#1326).
+    val mc: Result[bool, str] = check_own_module(p, project_root);
+    if (is_err[bool, str](mc)) { manifest.dnit(?m, p.s.alloc); ret mc; }
+
     manifest.dnit(?m, p.s.alloc);
     ret ok[bool, str](true);
+}
+
+# check_own_module: verify the project's declared `[project].module` (if any)
+# names a real file under the project's src dir.
+fun check_own_module(p: *Project, project_root: str) Result[bool, str] {
+    if (p.config.module == intern.STR_NIL) { ret ok[bool, str](true); }
+    val mod_opt: Option[str] = intern.lookup(?p.s.interner, p.config.module);
+    val src_opt: Option[str] = intern.lookup(?p.s.interner, p.config.dir_src);
+    if (is_none[str](mod_opt) || is_none[str](src_opt)) { ret err[bool, str]("internal: project module/src not interned"); }
+    val mod_text: str = unwrap[str](mod_opt);
+    if (module_file_present(p.s.alloc, project_root, unwrap[str](src_opt), mod_text)) { ret ok[bool, str](true); }
+    ret err[bool, str](diag_join3(p.s, "mach.toml: [project].module '", mod_text, "' names no file", "mach.toml: [project].module names no file"));
+}
+
+# module_file_present: whether `<root>/<src_dir>/<module_rel>` is an existing file.
+fun module_file_present(alloc: *Allocator, root: str, src_dir: str, module_rel: str) bool {
+    val a: Result[str, str] = join_path(alloc, root, src_dir);
+    if (is_err[str, str](a)) { ret false; }
+    val mid: str = unwrap_ok[str, str](a);
+    val b: Result[str, str] = join_path(alloc, mid, module_rel);
+    str_free(alloc, mid);
+    if (is_err[str, str](b)) { ret false; }
+    val full: str = unwrap_ok[str, str](b);
+    val ok_: bool = fs.is_file(full);
+    str_free(alloc, full);
+    ret ok_;
 }
 
 # map_opt: map a manifest profile opt level to the driver's TargetOpt.
@@ -932,15 +972,16 @@ fun resolve_deps(p: *Project, m: *manifest.Manifest, project_root: str) Result[b
     ret ok[bool, str](true);
 }
 
-# resolve_cascade_libs: gather the transitive dependencies' tuple-matched link
-# libs into `p.config.cascade_libs` (#1218). a dependency declares its own
-# `[target.*].libs`, and a consumer inherits every such lib whose target tuple
-# (isa, os, abi) equals the one being built, so a platform link requirement (e.g.
-# `kernel32.dll`) lives once in the providing dependency's manifest. order is
-# topological (a dep's own deps first) then declaration order; libs are
-# deduplicated by name and the consumer's own `own_libs` are excluded, so a shared
-# requirement is never linked twice. an empty result leaves the cascade nil/0, so
-# a build with no inheriting deps is unaffected.
+# resolve_cascade_libs: gather the transitive dependencies' matched link libs into
+# `p.config.cascade_libs` (#1218, #1326). a dependency declares its own
+# `[os.<name>].libs` (matched on the os component) and `[target.*].libs` (matched
+# on the full (isa, os, abi) tuple), and a consumer inherits every such lib for the
+# build it is producing — so a platform link requirement (e.g. `kernel32.dll`)
+# lives once in the providing dependency's manifest. order is topological (a dep's
+# own deps first); within each dep the matching os overlays precede the matching
+# target libs. libs are deduplicated by name and the consumer's own `own_libs` are
+# excluded, so a shared requirement is never linked twice. an empty result leaves
+# the cascade nil/0, so a build with no inheriting deps is unaffected.
 fun resolve_cascade_libs(p: *Project, project_root: str, isa: str, os: str, abi: str,
                          own_libs: *intern.StrId, own_count: u32) Result[bool, str] {
     p.config.cascade_libs      = nil;
@@ -986,10 +1027,13 @@ fun resolve_cascade_libs(p: *Project, project_root: str, isa: str, os: str, abi:
     i = 0;
     for (i < n) { cascade_dfs(?tables[0], aliases, visited, order, ?order_len, n, i); i = i + 1; }
 
-    # upper-bound by the total tuple-matched lib count, then fill with dedup.
+    # upper-bound by the total matched lib count (os overlays + target libs), then
+    # fill with dedup.
     var max: u32 = 0;
     i = 0;
     for (i < n) {
+        val oarr: *toml.Array = os_libs(?tables[i], os);
+        if (oarr != nil) { max = max + toml.array_len(oarr)::u32; }
         val arr: *toml.Array = tuple_libs(?tables[i], isa, os, abi);
         if (arr != nil) { max = max + toml.array_len(arr)::u32; }
         i = i + 1;
@@ -1001,31 +1045,16 @@ fun resolve_cascade_libs(p: *Project, project_root: str, isa: str, os: str, abi:
     val buf: *intern.StrId = unwrap_ok[*intern.StrId, str](br);
     var w: u32 = 0;
 
+    # per dep in topological order: matching os overlays first, then matching
+    # target libs (the merge law), each deduplicated and excluding the consumer's
+    # own libs.
     var oi: u32 = 0;
     for (oi < order_len) {
         val di: u32 = order[oi];
-        val arr: *toml.Array = tuple_libs(?tables[di], isa, os, abi);
-        if (arr != nil) {
-            val cnt: usize = toml.array_len(arr);
-            var k: usize = 0;
-            for (k < cnt) {
-                val v: *toml.Value = toml.array_get(arr, k);
-                if (v == nil || v.tag != toml.TYPE_STRING) {
-                    deallocate[intern.StrId](p.s.alloc, buf, max::usize);
-                    ret err[bool, str]("dep mach.toml: a target's libs entry is not a string");
-                }
-                val idr: Result[intern.StrId, str] = intern.intern(?p.s.interner, v.data.string);
-                if (is_err[intern.StrId, str](idr)) {
-                    deallocate[intern.StrId](p.s.alloc, buf, max::usize);
-                    ret err[bool, str](unwrap_err[intern.StrId, str](idr));
-                }
-                val id: intern.StrId = unwrap_ok[intern.StrId, str](idr);
-                if (!strid_in(buf, w, id) && !strid_in(own_libs, own_count, id)) {
-                    buf[w] = id; w = w + 1;
-                }
-                k = k + 1;
-            }
-        }
+        val osr: Result[bool, str] = append_cascade_array(p, buf, ?w, max, os_libs(?tables[di], os), own_libs, own_count);
+        if (is_err[bool, str](osr)) { ret err[bool, str](unwrap_err[bool, str](osr)); }
+        val tlr: Result[bool, str] = append_cascade_array(p, buf, ?w, max, tuple_libs(?tables[di], isa, os, abi), own_libs, own_count);
+        if (is_err[bool, str](tlr)) { ret err[bool, str](unwrap_err[bool, str](tlr)); }
         oi = oi + 1;
     }
 
@@ -1099,6 +1128,52 @@ fun tuple_libs(t: *toml.Table, isa: str, os: str, abi: str) *toml.Array {
     ret nil;
 }
 
+# os_libs: the `[os.<os>].libs` overlay array of a dep matching the build's os
+# component (#1326). nil when the dep declares no overlay for this os or it
+# carries no libs.
+fun os_libs(t: *toml.Table, os: str) *toml.Array {
+    val parent: *toml.Table = toml.get_table(t, "os");
+    if (parent == nil) { ret nil; }
+    val m: usize = toml.table_len(parent);
+    var k: usize = 0;
+    for (k < m) {
+        if (str_equals(toml.table_key(parent, k), os)) {
+            val v: *toml.Value = toml.table_value(parent, k);
+            if (v != nil && v.tag == toml.TYPE_TABLE) { ret toml.get_array(?v.data.table, "libs"); }
+        }
+        k = k + 1;
+    }
+    ret nil;
+}
+
+# append_cascade_array: intern each string in `arr` and append it to `buf[0,w)`,
+# advancing `w`, skipping any id already present or in the consumer's own libs.
+# frees `buf` and errors on a non-string element. a nil `arr` is a no-op.
+fun append_cascade_array(p: *Project, buf: *intern.StrId, w: *u32, max: u32, arr: *toml.Array,
+                         own_libs: *intern.StrId, own_count: u32) Result[bool, str] {
+    if (arr == nil) { ret ok[bool, str](true); }
+    val cnt: usize = toml.array_len(arr);
+    var k: usize = 0;
+    for (k < cnt) {
+        val v: *toml.Value = toml.array_get(arr, k);
+        if (v == nil || v.tag != toml.TYPE_STRING) {
+            deallocate[intern.StrId](p.s.alloc, buf, max::usize);
+            ret err[bool, str]("dep mach.toml: a libs entry is not a string");
+        }
+        val idr: Result[intern.StrId, str] = intern.intern(?p.s.interner, v.data.string);
+        if (is_err[intern.StrId, str](idr)) {
+            deallocate[intern.StrId](p.s.alloc, buf, max::usize);
+            ret err[bool, str](unwrap_err[intern.StrId, str](idr));
+        }
+        val id: intern.StrId = unwrap_ok[intern.StrId, str](idr);
+        if (!strid_in(buf, @w, id) && !strid_in(own_libs, own_count, id)) {
+            buf[@w] = id; @w = @w + 1;
+        }
+        k = k + 1;
+    }
+    ret ok[bool, str](true);
+}
+
 # strid_in: whether `id` already appears in the first `count` entries of `arr`.
 fun strid_in(arr: *intern.StrId, count: u32, id: intern.StrId) bool {
     if (arr == nil) { ret false; }
@@ -1165,6 +1240,26 @@ fun resolve_dep(s: *sess.Session, alias: str, project_root: str, dir_dep: str) R
     }
     entry.project_dir_src = unwrap_ok[intern.StrId, str](rds);
 
+    # the dep's declared `[project].module` (bare project-id import target). a
+    # declared-but-dangling module is a manifest error at build start, imported or
+    # not — so it is checked here for every resolved dep.
+    entry.project_module = intern.STR_NIL;
+    val dep_src_text: str = unwrap[str](intern.lookup(?s.interner, entry.project_dir_src));
+    val mod_text: str = toml.get_str(?t, "project.module");
+    if (!str_empty(mod_text)) {
+        if (!module_file_present(s.alloc, dep_dir, dep_src_text, mod_text)) {
+            val msg: str = diag_join_named(s, "dep '", entry.alias, "' mach.toml: [project].module names no file", "dep mach.toml: [project].module names no file");
+            str_free(s.alloc, dep_dir);
+            ret err[DepEntry, str](msg);
+        }
+        val rmd: Result[intern.StrId, str] = intern.intern(?s.interner, mod_text);
+        if (is_err[intern.StrId, str](rmd)) {
+            str_free(s.alloc, dep_dir);
+            ret err[DepEntry, str](unwrap_err[intern.StrId, str](rmd));
+        }
+        entry.project_module = unwrap_ok[intern.StrId, str](rmd);
+    }
+
     val rvr: Result[intern.StrId, str] = intern.intern(?s.interner, dep_dir);
     if (is_err[intern.StrId, str](rvr)) {
         str_free(s.alloc, dep_dir);
@@ -1226,9 +1321,9 @@ fun select_target(p: *Project, t: *TargetEntry) Result[bool, str] {
     if (is_err[intern.StrId, str](rcn)) { ret err[bool, str](unwrap_err[intern.StrId, str](rcn)); }
     p.compiler_name = unwrap_ok[intern.StrId, str](rcn);
 
-    # the compiler version is single-sourced in `mach.lang.version`; both this
-    # `$mach.compiler.version` feed and `mach info` read it through one function,
-    # so the staged `$project.version` flip (#1311) touches a single place.
+    # the compiler version is single-sourced in `mach.lang.version`, which folds
+    # `[project].version` from the manifest; both this `$mach.compiler.version`
+    # feed and `mach info` read it through that one function (#1311).
     val rcv: Result[intern.StrId, str] = intern.intern(?p.s.interner, version.string());
     if (is_err[intern.StrId, str](rcv)) { ret err[bool, str](unwrap_err[intern.StrId, str](rcv)); }
     p.compiler_ver = unwrap_ok[intern.StrId, str](rcv);
@@ -1257,12 +1352,19 @@ fun entry_module_fqn(p: *Project, t: *TargetEntry) Result[intern.StrId, str] {
 
     val id_opt: Option[str] = intern.lookup(?p.s.interner, p.config.id);
     if (is_none[str](id_opt)) { ret err[intern.StrId, str]("project id StrId not interned"); }
-    val id_text: str = unwrap[str](id_opt);
 
-    val ep_stripped: StrView = strip_mach_suffix(ep_text);
+    ret compose_module_fqn(p, unwrap[str](id_opt), ep_text);
+}
+
+# compose_module_fqn: build `<id>.<rel stripped of .mach, with `/`/`\` turned
+# into `.`>` and intern it. shared by the entrypoint FQN and bare project-id
+# `use`/`fwd` resolution, so a project's `[project].module` resolves to the same
+# canonical FQN a full path to that file would name.
+fun compose_module_fqn(p: *Project, id_text: str, rel_text: str) Result[intern.StrId, str] {
+    val rel_stripped: StrView = strip_mach_suffix(rel_text);
 
     val id_len: usize = str_len(id_text);
-    val total:  usize = id_len + 1 + ep_stripped.len;
+    val total:  usize = id_len + 1 + rel_stripped.len;
     val r_buf: Result[*u8, str] = allocate[u8](p.s.alloc, total);
     if (is_err[*u8, str](r_buf)) { ret err[intern.StrId, str](unwrap_err[*u8, str](r_buf)); }
     val buf: *u8 = unwrap_ok[*u8, str](r_buf);
@@ -1273,8 +1375,8 @@ fun entry_module_fqn(p: *Project, t: *TargetEntry) Result[intern.StrId, str] {
     buf[k] = '.';
     k = k + 1;
     j = 0;
-    for (j < ep_stripped.len) {
-        val c: u8 = ep_stripped.data[j];
+    for (j < rel_stripped.len) {
+        val c: u8 = rel_stripped.data[j];
         if (c == '/' || c == '\\') { buf[k] = '.'; }
         or                          { buf[k] = c; }
         k = k + 1;
@@ -1592,7 +1694,7 @@ fun bind_one_define(p: *Project, ctx: *comptime.ComptimeCtx, s: str) Result[bool
         if (s[k] == '=') { eq = k; brk; }
         k = k + 1;
     }
-    if (eq == 0) { ret err[bool, str]("mach.toml: a define has an empty name"); }
+    if (eq == 0) { ret err[bool, str](diag_join3(p.s, "mach.toml: define '", s, "' has an empty name", "mach.toml: a define has an empty name")); }
 
     val name_r: Result[intern.StrId, str] = intern.intern_bytes(?p.s.interner, s, eq);
     if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
@@ -1901,6 +2003,41 @@ pub rec UseTarget {
 # a symbol, and an unaliased import binds the final path segment as its
 # leaf. resolution always interns the full path first so an exact module
 # file short-circuits before any prefix probing.
+# span_single_segment: whether the dotted path covers exactly one segment (no
+# `.` separator) — the shape a bare project-id import takes.
+fun span_single_segment(source: str, path: token.Span) bool {
+    var k: usize = path.offset;
+    val end: usize = path.offset + path.len;
+    for (k < end) {
+        if (source[k] == '.') { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# project_module_lookup: resolve a bare project id against this project and its
+# direct deps. on a match sets `out_found` and reports the project's declared
+# module (`out_module`, STR_NIL when the project declares none). project ids and
+# the path id share one interner, so StrId equality is the lookup.
+fun project_module_lookup(p: *Project, id: intern.StrId, out_found: *bool, out_module: *intern.StrId) {
+    @out_found  = false;
+    @out_module = intern.STR_NIL;
+    if (id == p.config.id) {
+        @out_found  = true;
+        @out_module = p.config.module;
+        ret;
+    }
+    var k: u32 = 0;
+    for (k < p.config.dep_count) {
+        if (p.config.deps[k].project_id == id) {
+            @out_found  = true;
+            @out_module = p.config.deps[k].project_module;
+            ret;
+        }
+        k = k + 1;
+    }
+}
+
 fun resolve_use_target(p: *Project, source: str, path: token.Span) Result[UseTarget, str] {
     val full_r: Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, path);
     if (is_err[intern.StrId, str](full_r)) { ret err[UseTarget, str](unwrap_err[intern.StrId, str](full_r)); }
@@ -1909,6 +2046,30 @@ fun resolve_use_target(p: *Project, source: str, path: token.Span) Result[UseTar
     val leaf_r: Result[intern.StrId, str] = leaf_name(?p.s.interner, source, path);
     if (is_err[intern.StrId, str](leaf_r)) { ret err[UseTarget, str](unwrap_err[intern.StrId, str](leaf_r)); }
     val leaf: intern.StrId = unwrap_ok[intern.StrId, str](leaf_r);
+
+    # a one-segment path equal to a resolvable project id (a dependency's manifest
+    # id or this project's own id) names that project's declared `[project].module`
+    # (#1326). length-≥2 paths are unchanged; a single segment is unresolvable as a
+    # file, so this interception is purely additive.
+    if (span_single_segment(source, path)) {
+        var found:  bool = false;
+        var mod_id: intern.StrId = intern.STR_NIL;
+        project_module_lookup(p, full_id, ?found, ?mod_id);
+        if (found) {
+            if (mod_id == intern.STR_NIL) {
+                ret err[UseTarget, str](diag_join_named(p.s, "project '", full_id, "' declares no module; import a full path or add one to its manifest", "project declares no module; import a full path or add one to its manifest"));
+            }
+            val id_opt:  Option[str] = intern.lookup(?p.s.interner, full_id);
+            val mod_opt: Option[str] = intern.lookup(?p.s.interner, mod_id);
+            if (is_none[str](id_opt) || is_none[str](mod_opt)) { ret err[UseTarget, str]("internal: project id/module not interned"); }
+            val fqn_r: Result[intern.StrId, str] = compose_module_fqn(p, unwrap[str](id_opt), unwrap[str](mod_opt));
+            if (is_err[intern.StrId, str](fqn_r)) { ret err[UseTarget, str](unwrap_err[intern.StrId, str](fqn_r)); }
+            var ut: UseTarget;
+            ut.module_fqn = unwrap_ok[intern.StrId, str](fqn_r);
+            ut.leaf       = leaf;
+            ret ok[UseTarget, str](ut);
+        }
+    }
 
     # the full path is itself a module file: bind it as a module, leaf is its own name.
     if (fqn_names_file(p, full_id)) {
@@ -2192,15 +2353,46 @@ fun build_resolve_deps(p: *Project, m: *ModuleEntry) Result[resolve.ResolveDeps,
         head = head + 1;
     }
 
-    val r: Result[*resolve.ModuleExports, str] = allocate[resolve.ModuleExports](p.s.alloc, list_len::usize);
+    # a dep that is a project's declared `[project].module` is also nameable by the
+    # project's bare id (#1326), so it needs a second exports entry keyed by that
+    # id — matching the load walk, where `use <id>;` resolves to this same module.
+    val ar: Result[*intern.StrId, str] = allocate[intern.StrId](p.s.alloc, list_len::usize);
+    if (is_err[*intern.StrId, str](ar)) {
+        deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
+        deallocate[bool](p.s.alloc, visited, p.module_len::usize);
+        ret err[resolve.ResolveDeps, str](unwrap_err[*intern.StrId, str](ar));
+    }
+    val aliases: *intern.StrId = unwrap_ok[*intern.StrId, str](ar);
+    var alias_n: u32 = 0;
+    var ai: u32 = 0;
+    for (ai < list_len) {
+        aliases[ai] = bare_alias_for_module(p, p.modules[list[ai]::u32].fqn);
+        if (aliases[ai] != intern.STR_NIL) { alias_n = alias_n + 1; }
+        ai = ai + 1;
+    }
+
+    val total: u32 = list_len + alias_n;
+    val r: Result[*resolve.ModuleExports, str] = allocate[resolve.ModuleExports](p.s.alloc, total::usize);
     if (is_err[*resolve.ModuleExports, str](r)) {
+        deallocate[intern.StrId](p.s.alloc, aliases, list_len::usize);
         deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
         deallocate[bool](p.s.alloc, visited, p.module_len::usize);
         ret err[resolve.ResolveDeps, str](unwrap_err[*resolve.ModuleExports, str](r));
     }
     deps.entries = unwrap_ok[*resolve.ModuleExports, str](r);
-    deps.count   = list_len;
+    deps.count   = total;
 
+    # initialise every slot empty so a partial fill is teardown-safe: an error
+    # mid-loop frees only the slots already built (the rest carry nil symbols),
+    # while the array deallocation always sees the full `total` size.
+    var z: u32 = 0;
+    for (z < total) {
+        deps.entries[z].symbols = nil;
+        deps.entries[z].count   = 0;
+        z = z + 1;
+    }
+
+    var w: u32 = 0;
     var k: u32 = 0;
     for (k < list_len) {
         val dep_id: sess.ModuleId = list[k];
@@ -2208,17 +2400,63 @@ fun build_resolve_deps(p: *Project, m: *ModuleEntry) Result[resolve.ResolveDeps,
         val mx_r: Result[resolve.ModuleExports, str] = build_module_exports(p, dep_id, dep);
         if (is_err[resolve.ModuleExports, str](mx_r)) {
             free_resolve_deps(p.s.alloc, ?deps);
+            deallocate[intern.StrId](p.s.alloc, aliases, list_len::usize);
             deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
             deallocate[bool](p.s.alloc, visited, p.module_len::usize);
             ret err[resolve.ResolveDeps, str](unwrap_err[resolve.ModuleExports, str](mx_r));
         }
-        deps.entries[k] = unwrap_ok[resolve.ModuleExports, str](mx_r);
+        deps.entries[w] = unwrap_ok[resolve.ModuleExports, str](mx_r);
+        w = w + 1;
+        if (aliases[k] != intern.STR_NIL) {
+            val ax_r: Result[resolve.ModuleExports, str] = build_module_exports(p, dep_id, dep);
+            if (is_err[resolve.ModuleExports, str](ax_r)) {
+                free_resolve_deps(p.s.alloc, ?deps);
+                deallocate[intern.StrId](p.s.alloc, aliases, list_len::usize);
+                deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
+                deallocate[bool](p.s.alloc, visited, p.module_len::usize);
+                ret err[resolve.ResolveDeps, str](unwrap_err[resolve.ModuleExports, str](ax_r));
+            }
+            var ax: resolve.ModuleExports = unwrap_ok[resolve.ModuleExports, str](ax_r);
+            ax.path = aliases[k];
+            deps.entries[w] = ax;
+            w = w + 1;
+        }
         k = k + 1;
     }
 
+    deallocate[intern.StrId](p.s.alloc, aliases, list_len::usize);
     deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
     deallocate[bool](p.s.alloc, visited, p.module_len::usize);
     ret ok[resolve.ResolveDeps, str](deps);
+}
+
+# bare_alias_for_module: the project id whose declared `[project].module` resolves
+# to module `mod_fqn`, or STR_NIL when `mod_fqn` is not any project's declared
+# module. lets resolve name such a module by the project's bare id (#1326). a
+# no-op when no project in the build declares a module.
+fun bare_alias_for_module(p: *Project, mod_fqn: intern.StrId) intern.StrId {
+    if (p.config.module != intern.STR_NIL && canonical_module_fqn_is(p, p.config.id, p.config.module, mod_fqn)) {
+        ret p.config.id;
+    }
+    var k: u32 = 0;
+    for (k < p.config.dep_count) {
+        val dep: *DepEntry = ?p.config.deps[k];
+        if (dep.project_module != intern.STR_NIL && canonical_module_fqn_is(p, dep.project_id, dep.project_module, mod_fqn)) {
+            ret dep.project_id;
+        }
+        k = k + 1;
+    }
+    ret intern.STR_NIL;
+}
+
+# canonical_module_fqn_is: whether `<id>.<module>` composes to the FQN `fqn`.
+fun canonical_module_fqn_is(p: *Project, id: intern.StrId, module: intern.StrId, fqn: intern.StrId) bool {
+    val id_opt:  Option[str] = intern.lookup(?p.s.interner, id);
+    val mod_opt: Option[str] = intern.lookup(?p.s.interner, module);
+    if (is_none[str](id_opt) || is_none[str](mod_opt)) { ret false; }
+    val cf_r: Result[intern.StrId, str] = compose_module_fqn(p, unwrap[str](id_opt), unwrap[str](mod_opt));
+    if (is_err[intern.StrId, str](cf_r)) { ret false; }
+    ret unwrap_ok[intern.StrId, str](cf_r) == fqn;
 }
 
 # add_reexport_targets: append every module that `mid` re-exports as a `fwd`

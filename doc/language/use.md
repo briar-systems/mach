@@ -28,7 +28,12 @@ use std.types.size;             # binds module 'size'; use as `size.usize`
 use sz: std.types.size;         # binds module under 'sz'; use as `sz.usize`
 use std.types.size.usize;       # binds symbol 'usize'; use bare as `usize`
 use my_usize: std.types.size.usize;  # binds symbol under 'my_usize'
+use glfw;                        # bare project id: binds glfw's [project].module
 ```
+
+A one-segment path equal to a resolvable project id resolves to that project's
+declared `[project].module` — see
+[modules.md](modules.md#bare-project-id-imports).
 
 ## Design rule
 
