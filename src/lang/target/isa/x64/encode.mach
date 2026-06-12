@@ -3234,8 +3234,8 @@ fun emit_cvt_reg(cvt_op: u16, dst_reg: i32, src_reg: i32, int_w: u8, buf: *ByteB
 }
 
 # patch_rel32: overwrite the 4-byte little-endian rel32 placeholder at `pos` with
-# `disp`. fills an intra-instruction forward jump once its target offset is known —
-# the self-contained sequences that branch within a single MIR instruction.
+# `disp`. shared by every rel32 resolver: intra-instruction forward jumps, the CFG
+# branch fixups (`patch_branches`), and inline-asm numeric-local-label references.
 fun patch_rel32(buf: *ByteBuf, pos: usize, disp: i32) {
     buf.data[pos]     = (disp & 0xFF)::u8;
     buf.data[pos + 1] = ((disp >> 8) & 0xFF)::u8;
@@ -4184,6 +4184,249 @@ val ASMOP_MEM:  u8 = 3;
 # a bare symbol / branch-target name (resolved to a relocation).
 val ASMOP_SYM:  u8 = 4;
 
+# a numeric local label's most recent definition within an asm block: the label
+# `number` and the `.text` offset its `N:` definition marks. a redefinition of the
+# same number updates `offset`, so a backward `Nb` reference always binds to the
+# nearest preceding definition.
+# ---
+# number: the numeric label
+# offset: byte offset of the definition within `.text`
+rec AsmLabelDef {
+    number: u64;
+    offset: u32;
+}
+
+# a pending forward reference to a numeric local label: the branch's rel32 field is
+# at `patch_pos`, the byte after the branch is `next_ip`, and the target is the
+# nearest following definition of `number`. resolved when that definition is
+# reached; an entry still pending at the end of the block is an undefined-label
+# error.
+# ---
+# patch_pos: byte offset of the rel32 field within `.text`
+# next_ip:   byte offset of the instruction after the branch within `.text`
+# number:    the referenced numeric label
+rec AsmLabelFixup {
+    patch_pos: u32;
+    next_ip:   u32;
+    number:    u64;
+}
+
+# per-asm-block numeric-local-label scope. `defs` tracks the nearest preceding
+# definition of each number for backward references; `fixups` holds forward
+# references awaiting their definition. both arrays are owned and freed when the
+# block finishes encoding.
+# ---
+# alloc:       backing allocator
+# defs:        recorded label definitions (latest offset per number)
+# def_count:   number of definitions
+# def_cap:     capacity of `defs`
+# fixups:      pending forward references
+# fixup_count: number of pending forward references
+# fixup_cap:   capacity of `fixups`
+rec AsmLabelState {
+    alloc:       *Allocator;
+    defs:        *AsmLabelDef;
+    def_count:   u32;
+    def_cap:     u32;
+    fixups:      *AsmLabelFixup;
+    fixup_count: u32;
+    fixup_cap:   u32;
+}
+
+# asm_labels_init: initialize an empty numeric-local-label scope backed by `alloc`.
+fun asm_labels_init(labels: *AsmLabelState, alloc: *Allocator) {
+    labels.alloc       = alloc;
+    labels.defs        = nil;
+    labels.def_count   = 0;
+    labels.def_cap     = 0;
+    labels.fixups      = nil;
+    labels.fixup_count = 0;
+    labels.fixup_cap   = 0;
+}
+
+# asm_labels_dnit: release a label scope's owned arrays.
+fun asm_labels_dnit(labels: *AsmLabelState) {
+    if (labels.defs != nil && labels.def_cap > 0) {
+        deallocate[AsmLabelDef](labels.alloc, labels.defs, labels.def_cap::usize);
+        labels.defs      = nil;
+        labels.def_cap   = 0;
+        labels.def_count = 0;
+    }
+    if (labels.fixups != nil && labels.fixup_cap > 0) {
+        deallocate[AsmLabelFixup](labels.alloc, labels.fixups, labels.fixup_cap::usize);
+        labels.fixups      = nil;
+        labels.fixup_cap   = 0;
+        labels.fixup_count = 0;
+    }
+}
+
+# is_asm_digit: true for an ASCII decimal digit.
+fun is_asm_digit(c: char) bool { ret c >= '0'::char && c <= '9'::char; }
+
+# asm_label_def_len: if `tok` begins with a numeric local-label definition
+# `<digits>:`, return the byte length of that prefix (through the colon) and the
+# parsed number via `num_out`; otherwise return 0.
+fun asm_label_def_len(tok: str, num_out: *u64) usize {
+    if (!is_asm_digit(tok[0])) { ret 0; }
+    var i: usize = 0;
+    var n: u64 = 0;
+    for (is_asm_digit(tok[i])) {
+        n = n * 10 + (tok[i]::u64 - '0'::u64);
+        i = i + 1;
+    }
+    if (tok[i] != ':'::char) { ret 0; }
+    @num_out = n;
+    ret i + 1;
+}
+
+# asm_label_ref: parse a numeric local-label reference token `<digits>f` /
+# `<digits>b` into its number and direction. returns false when `tok` is not that
+# shape (leading digit, all-digit body, trailing 'f' or 'b').
+fun asm_label_ref(tok: str, num_out: *u64, fwd_out: *bool) bool {
+    val len: usize = str_len(tok);
+    if (len < 2) { ret false; }
+    if (!is_asm_digit(tok[0])) { ret false; }
+    var n: u64 = 0;
+    var i: usize = 0;
+    for (i < len - 1) {
+        if (!is_asm_digit(tok[i])) { ret false; }
+        n = n * 10 + (tok[i]::u64 - '0'::u64);
+        i = i + 1;
+    }
+    val suf: char = tok[len - 1];
+    if (suf == 'f'::char) { @fwd_out = true; }
+    or (suf == 'b'::char) { @fwd_out = false; }
+    or { ret false; }
+    @num_out = n;
+    ret true;
+}
+
+# asm_label_record_def: record a definition of `number` at `.text` offset `off`,
+# patching every pending forward reference to it (this is their nearest following
+# definition) and updating the nearest-preceding-definition offset backward
+# references resolve against. a redefinition of the same number is allowed.
+fun asm_label_record_def(labels: *AsmLabelState, buf: *ByteBuf, number: u64, off: u32) Result[bool, str] {
+    # patch and drop every pending forward fixup for this number.
+    var w: u32 = 0;
+    var r: u32 = 0;
+    for (r < labels.fixup_count) {
+        if (labels.fixups[r].number == number) {
+            val disp: i32 = off::i32 - labels.fixups[r].next_ip::i32;
+            patch_rel32(buf, labels.fixups[r].patch_pos::usize, disp);
+        } or {
+            labels.fixups[w].patch_pos = labels.fixups[r].patch_pos;
+            labels.fixups[w].next_ip   = labels.fixups[r].next_ip;
+            labels.fixups[w].number    = labels.fixups[r].number;
+            w = w + 1;
+        }
+        r = r + 1;
+    }
+    labels.fixup_count = w;
+
+    # update (or insert) the nearest-preceding-definition offset.
+    var i: u32 = 0;
+    for (i < labels.def_count) {
+        if (labels.defs[i].number == number) {
+            labels.defs[i].offset = off;
+            ret ok[bool, str](true);
+        }
+        i = i + 1;
+    }
+    if (labels.def_count >= labels.def_cap) {
+        val gr: Result[bool, str] = grow_asm_label_defs(labels);
+        if (is_err[bool, str](gr)) { ret gr; }
+    }
+    labels.defs[labels.def_count].number = number;
+    labels.defs[labels.def_count].offset = off;
+    labels.def_count = labels.def_count + 1;
+    ret ok[bool, str](true);
+}
+
+# asm_label_lookup_def: the nearest preceding definition offset of `number`, or
+# none when the number has not yet been defined in this block.
+fun asm_label_lookup_def(labels: *AsmLabelState, number: u64) Option[u32] {
+    var i: u32 = 0;
+    for (i < labels.def_count) {
+        if (labels.defs[i].number == number) { ret some[u32](labels.defs[i].offset); }
+        i = i + 1;
+    }
+    ret none[u32]();
+}
+
+# asm_label_push_fixup: record a pending forward reference to `number` whose rel32
+# field is at `patch_pos` (the byte after the branch is `next_ip`).
+fun asm_label_push_fixup(labels: *AsmLabelState, patch_pos: u32, next_ip: u32, number: u64) Result[bool, str] {
+    if (labels.fixup_count >= labels.fixup_cap) {
+        val gr: Result[bool, str] = grow_asm_label_fixups(labels);
+        if (is_err[bool, str](gr)) { ret gr; }
+    }
+    labels.fixups[labels.fixup_count].patch_pos = patch_pos;
+    labels.fixups[labels.fixup_count].next_ip   = next_ip;
+    labels.fixups[labels.fixup_count].number    = number;
+    labels.fixup_count = labels.fixup_count + 1;
+    ret ok[bool, str](true);
+}
+
+# grow the label-definition array (or allocate it on first use).
+fun grow_asm_label_defs(labels: *AsmLabelState) Result[bool, str] {
+    if (labels.defs == nil) {
+        val r: Result[*AsmLabelDef, str] = allocate[AsmLabelDef](labels.alloc, DRIVER_INIT_CAP::usize);
+        if (is_err[*AsmLabelDef, str](r)) { ret err[bool, str](unwrap_err[*AsmLabelDef, str](r)); }
+        labels.defs    = unwrap_ok[*AsmLabelDef, str](r);
+        labels.def_cap = DRIVER_INIT_CAP;
+        ret ok[bool, str](true);
+    }
+    val nc: u32 = labels.def_cap * 2;
+    val r: Result[*AsmLabelDef, str] = reallocate[AsmLabelDef](labels.alloc, labels.defs, labels.def_cap::usize, nc::usize);
+    if (is_err[*AsmLabelDef, str](r)) { ret err[bool, str](unwrap_err[*AsmLabelDef, str](r)); }
+    labels.defs    = unwrap_ok[*AsmLabelDef, str](r);
+    labels.def_cap = nc;
+    ret ok[bool, str](true);
+}
+
+# grow the label-fixup array (or allocate it on first use).
+fun grow_asm_label_fixups(labels: *AsmLabelState) Result[bool, str] {
+    if (labels.fixups == nil) {
+        val r: Result[*AsmLabelFixup, str] = allocate[AsmLabelFixup](labels.alloc, DRIVER_INIT_CAP::usize);
+        if (is_err[*AsmLabelFixup, str](r)) { ret err[bool, str](unwrap_err[*AsmLabelFixup, str](r)); }
+        labels.fixups    = unwrap_ok[*AsmLabelFixup, str](r);
+        labels.fixup_cap = DRIVER_INIT_CAP;
+        ret ok[bool, str](true);
+    }
+    val nc: u32 = labels.fixup_cap * 2;
+    val r: Result[*AsmLabelFixup, str] = reallocate[AsmLabelFixup](labels.alloc, labels.fixups, labels.fixup_cap::usize, nc::usize);
+    if (is_err[*AsmLabelFixup, str](r)) { ret err[bool, str](unwrap_err[*AsmLabelFixup, str](r)); }
+    labels.fixups    = unwrap_ok[*AsmLabelFixup, str](r);
+    labels.fixup_cap = nc;
+    ret ok[bool, str](true);
+}
+
+# u64_to_dec: write the decimal digits of `n` into `dst` (at least one digit) and
+# return the digit count; `dst` must hold at least 20 bytes.
+fun u64_to_dec(n: u64, dst: *u8) usize {
+    if (n == 0) { dst[0] = '0'::u8; ret 1; }
+    var tmp: [20]u8;
+    var len: usize = 0;
+    var v: u64 = n;
+    for (v > 0) {
+        tmp[len] = (v % 10)::u8 + '0'::u8;
+        v = v / 10;
+        len = len + 1;
+    }
+    var k: usize = 0;
+    for (k < len) { dst[k] = tmp[len - 1 - k]; k = k + 1; }
+    ret len;
+}
+
+# asm_label_error: build an interned encode error naming the numeric local label
+# `number`, e.g. "<prefix>1<suffix>"; falls back to `fallback` when interning fails.
+fun asm_label_error(st: *EncodeState, prefix: str, number: u64, suffix: str, fallback: str) str {
+    var buf: [24]u8;
+    val len: usize = u64_to_dec(number, ?buf[0]);
+    buf[len] = 0;
+    ret enc_named_message(st, prefix, (?buf[0])::str, suffix, fallback);
+}
+
 # encode_asm_block: expand an inline-asm MIR_ASM instruction into machine bytes.
 #
 # resolves the body's `{name}` references to `[rbp+off]` text using the carried
@@ -4208,9 +4451,29 @@ fun encode_asm_block(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
     if (is_err[str, str](sr)) { ret err[bool, str](unwrap_err[str, str](sr)); }
     val text: str = unwrap_ok[str, str](sr);
 
-    val er: Result[bool, str] = encode_asm_text(st, fn_base, text);
+    # numeric local labels are scoped to this block; their definitions and
+    # references resolve within it before the block finishes encoding.
+    var labels: AsmLabelState;
+    asm_labels_init(?labels, st.alloc);
+    val er: Result[bool, str] = encode_asm_text(st, fn_base, ?labels, text);
     deallocate[u8](st.alloc, text::*u8, (str_len(text) + 1)::usize);
-    ret er;
+    if (is_err[bool, str](er)) {
+        asm_labels_dnit(?labels);
+        ret er;
+    }
+
+    # a forward reference whose label was never defined in the block is a hard
+    # error, not a silently zero-displacement branch.
+    if (labels.fixup_count > 0) {
+        val msg: str = asm_label_error(st,
+            "encode: inline-asm forward reference to local label '", labels.fixups[0].number,
+            "f' has no definition in this asm block",
+            "encode: inline-asm forward reference to a local label has no definition in this asm block");
+        asm_labels_dnit(?labels);
+        ret err[bool, str](msg);
+    }
+    asm_labels_dnit(?labels);
+    ret ok[bool, str](true);
 }
 
 # substitute_asm_locals: produce a NUL-terminated copy of the asm body with each
@@ -4617,7 +4880,7 @@ fun arg_str(tok: str, mlen: usize) str {
 # (`lower_asm`), so none reach here. mirrors `masm_x86_parse_inline_asm`. each
 # emitted instruction is written through `encode_inst`; a `call` / `jmp` /
 # bare-symbol operand records a PC32 relocation against the named symbol.
-fun encode_asm_text(st: *EncodeState, fn_base: u32, text: str) Result[bool, str] {
+fun encode_asm_text(st: *EncodeState, fn_base: u32, labels: *AsmLabelState, text: str) Result[bool, str] {
     val len: usize = str_len(text);
     var start: usize = 0;
     for (start < len) {
@@ -4642,7 +4905,7 @@ fun encode_asm_text(st: *EncodeState, fn_base: u32, text: str) Result[bool, str]
             for (c < ll) { line[c] = text[lo + c]::u8; c = c + 1; }
             line[ll] = 0;
 
-            val er: Result[bool, str] = encode_asm_stmt(st, fn_base, (?line[0])::str);
+            val er: Result[bool, str] = encode_asm_stmt(st, fn_base, labels, (?line[0])::str);
             if (is_err[bool, str](er)) { ret er; }
         }
 
@@ -4753,6 +5016,18 @@ fun clobber_one(args: str, gp: *u32) {
 # unrecognized statement (including `.byte`) is opaque and conservatively clobbers
 # every register.
 fun stmt_clobbers(stmt: str, gp: *u32, fp: *u32) {
+    # a numeric local-label definition `<digits>:` clobbers nothing; strip the
+    # prefix and analyze any instruction that follows it on the same statement so a
+    # label line never trips the conservative all-clobber fallback below.
+    var label_num: u64 = 0;
+    val dlen: usize = asm_label_def_len(stmt, ?label_num);
+    if (dlen > 0) {
+        val rest: str = trim_str((stmt::usize + dlen)::str);
+        if (rest[0] == 0) { ret; }
+        stmt_clobbers(rest, gp, fp);
+        ret;
+    }
+
     # zero-operand forms: syscall implicitly clobbers RAX (return), RCX and R11.
     if (str_equals(stmt, "syscall")) {
         @gp = @gp | (1::u32 << x64.RAX::u32) | (1::u32 << x64.RCX::u32) | (1::u32 << x64.R11::u32);
@@ -4825,7 +5100,21 @@ fun stmt_clobbers(stmt: str, gp: *u32, fp: *u32) {
 }
 
 # encode_asm_stmt: parse and encode one trimmed inline-asm statement.
-fun encode_asm_stmt(st: *EncodeState, fn_base: u32, tok: str) Result[bool, str] {
+fun encode_asm_stmt(st: *EncodeState, fn_base: u32, labels: *AsmLabelState, tok: str) Result[bool, str] {
+    # a numeric local-label definition `<digits>:` records the current offset
+    # (resolving pending forward references to it) and is allowed to be followed by
+    # an instruction on the same statement, which is encoded by re-dispatching the
+    # remainder.
+    var label_num: u64 = 0;
+    val dlen: usize = asm_label_def_len(tok, ?label_num);
+    if (dlen > 0) {
+        val dr: Result[bool, str] = asm_label_record_def(labels, ?st.buf, label_num, st.buf.len::u32);
+        if (is_err[bool, str](dr)) { ret dr; }
+        val rest: str = trim_str((tok::usize + dlen)::str);
+        if (rest[0] == 0) { ret ok[bool, str](true); }
+        ret encode_asm_stmt(st, fn_base, labels, rest);
+    }
+
     # zero-operand mnemonics.
     if (str_equals(tok, "syscall")) { ret emit_simple(st, x64.SYSCALL); }
     if (str_equals(tok, "ret"))     { ret emit_simple(st, x64.RET); }
@@ -4834,14 +5123,14 @@ fun encode_asm_stmt(st: *EncodeState, fn_base: u32, tok: str) Result[bool, str] 
     if (str_equals(tok, "pause"))   { ret emit_simple(st, x64.PAUSE); }
     if (str_equals(tok, "nop"))     { ret emit_simple(st, x64.NOP); }
 
-    # control transfers to a symbol.
-    if (mnemonic_is(tok, "call")) { ret emit_branch_sym(st, fn_base, x64.CALL, arg_str(tok, 4)); }
-    if (mnemonic_is(tok, "jmp"))  { ret emit_branch_sym(st, fn_base, x64.JMP, arg_str(tok, 3)); }
-    if (mnemonic_is(tok, "je") || mnemonic_is(tok, "jz"))   { ret emit_branch_sym(st, fn_base, x64.JE, arg_str(tok, 2)); }
-    if (mnemonic_is(tok, "jne") || mnemonic_is(tok, "jnz")) { ret emit_branch_sym(st, fn_base, x64.JNE, arg_str(tok, 3)); }
+    # control transfers to a symbol or numeric local label.
+    if (mnemonic_is(tok, "call")) { ret emit_branch(st, fn_base, labels, x64.CALL, arg_str(tok, 4)); }
+    if (mnemonic_is(tok, "jmp"))  { ret emit_branch(st, fn_base, labels, x64.JMP, arg_str(tok, 3)); }
+    if (mnemonic_is(tok, "je") || mnemonic_is(tok, "jz"))   { ret emit_branch(st, fn_base, labels, x64.JE, arg_str(tok, 2)); }
+    if (mnemonic_is(tok, "jne") || mnemonic_is(tok, "jnz")) { ret emit_branch(st, fn_base, labels, x64.JNE, arg_str(tok, 3)); }
     # carry-flag conditionals: jc == jb (CF=1), jnc == jae == jnb (CF=0).
-    if (mnemonic_is(tok, "jc") || mnemonic_is(tok, "jb"))   { ret emit_branch_sym(st, fn_base, x64.JB, arg_str(tok, 2)); }
-    if (mnemonic_is(tok, "jnc") || mnemonic_is(tok, "jae") || mnemonic_is(tok, "jnb")) { ret emit_branch_sym(st, fn_base, x64.JAE, arg_str(tok, 3)); }
+    if (mnemonic_is(tok, "jc") || mnemonic_is(tok, "jb"))   { ret emit_branch(st, fn_base, labels, x64.JB, arg_str(tok, 2)); }
+    if (mnemonic_is(tok, "jnc") || mnemonic_is(tok, "jae") || mnemonic_is(tok, "jnb")) { ret emit_branch(st, fn_base, labels, x64.JAE, arg_str(tok, 3)); }
 
     # conditional set into a byte register: setc == setb (CF=1), setnc == setae
     # == setnb (CF=0). routed through the one-operand encoder, which dispatches the
@@ -4892,6 +5181,55 @@ fun emit_simple(st: *EncodeState, opcode: u16) Result[bool, str] {
     inst.opcode = opcode;
     val n: i32 = encode_inst(?inst, ?st.buf);
     if (n <= 0) { ret err[bool, str]("encode: inline-asm zero-operand encode produced no bytes"); }
+    ret ok[bool, str](true);
+}
+
+# emit_branch: encode a CALL / JMP / Jcc whose target is either a named symbol or a
+# numeric local label. a `<digits>f` / `<digits>b` token resolves to a block-local
+# rel32 (forward references are recorded as fixups, backward ones patched against
+# the nearest preceding definition); any other token is a symbol relocated by name.
+# a digit-led token that is neither shape is a malformed local label, not a symbol
+# (a bare symbol never starts with a digit).
+fun emit_branch(st: *EncodeState, fn_base: u32, labels: *AsmLabelState, opcode: u16, target: str) Result[bool, str] {
+    val name: str = trim_str(target);
+    var number: u64 = 0;
+    var fwd: bool = false;
+    if (asm_label_ref(name, ?number, ?fwd)) {
+        ret emit_branch_label(st, labels, opcode, number, fwd);
+    }
+    if (str_len(name) > 0 && is_asm_digit(name[0])) {
+        ret err[bool, str]("encode: inline-asm numeric local-label reference must be '<digits>f' or '<digits>b'");
+    }
+    ret emit_branch_sym(st, fn_base, opcode, name);
+}
+
+# emit_branch_label: encode a branch to a numeric local label. the branch is
+# emitted with a zero rel32 placeholder; a forward reference is recorded as a fixup
+# patched when its definition is reached, a backward reference is patched
+# immediately against the label's nearest preceding definition (an undefined one is
+# a hard error).
+fun emit_branch_label(st: *EncodeState, labels: *AsmLabelState, opcode: u16, number: u64, fwd: bool) Result[bool, str] {
+    var inst: isa.Inst;
+    zero_inst(?inst);
+    inst.opcode = opcode;
+    val inst_start: usize = st.buf.len;
+    val n: i32 = encode_inst(?inst, ?st.buf);
+    if (n <= 0) { ret err[bool, str]("encode: inline-asm branch encode produced no bytes"); }
+
+    val patch_pos: u32 = (inst_start + (n - 4)::usize)::u32;
+    val next_ip:   u32 = (inst_start + n::usize)::u32;
+    if (fwd) {
+        ret asm_label_push_fixup(labels, patch_pos, next_ip, number);
+    }
+    val def: Option[u32] = asm_label_lookup_def(labels, number);
+    if (!is_some[u32](def)) {
+        ret err[bool, str](asm_label_error(st,
+            "encode: inline-asm backward reference to local label '", number,
+            "b' has no preceding definition in this asm block",
+            "encode: inline-asm backward reference to a local label has no preceding definition in this asm block"));
+    }
+    val disp: i32 = unwrap[u32](def)::i32 - next_ip::i32;
+    patch_rel32(?st.buf, patch_pos::usize, disp);
     ret ok[bool, str](true);
 }
 
@@ -5356,10 +5694,7 @@ fun patch_branches(st: *EncodeState) Result[bool, str] {
         if (fx.patch_pos::usize + 4 > st.buf.len) {
             ret err[bool, str]("encode: branch fixup site is outside the text buffer");
         }
-        st.buf.data[fx.patch_pos]     = (disp & 0xFF)::u8;
-        st.buf.data[fx.patch_pos + 1] = ((disp >> 8) & 0xFF)::u8;
-        st.buf.data[fx.patch_pos + 2] = ((disp >> 16) & 0xFF)::u8;
-        st.buf.data[fx.patch_pos + 3] = ((disp >> 24) & 0xFF)::u8;
+        patch_rel32(?st.buf, fx.patch_pos::usize, disp);
         i = i + 1;
     }
     ret ok[bool, str](true);
