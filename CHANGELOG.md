@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Float `%` now evaluates to the truncated (C `fmod`) remainder
+  `a - trunc(a / b) * b`, whose result takes the dividend's sign
+  (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). The operator had no float lowering:
+  the runtime path fell through to the integer IDIV/DIV opcodes, running an
+  integer divide over the raw IEEE-754 bit patterns (a passthrough-below-divisor,
+  near-zero-above shape), and the comptime fold rejected it as non-constant. Both
+  now synthesize the remainder from the existing float divide / truncating
+  conversion / multiply / subtract primitives, exact for `|a / b| < 2^63` (#1378).
 - Sema reports a teaching diagnostic for every symbol kind that can never be a
   value reaching value position — a record, union, or `def` type name (local
   or imported, bare or `alias.member`), a generic type parameter, and a member

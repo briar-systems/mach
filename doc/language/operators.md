@@ -14,6 +14,16 @@ val q: f32    = 1.5 * 2.0;
 val v: f32x4  = a + b;       # lane-wise add (vectors not yet implemented)
 ```
 
+`%` is the remainder. On integers it is the native truncated remainder, taking
+the sign of the dividend (`-7 % 3 == -1`). On floats it is the truncated (C
+`fmod`) remainder `a - trunc(a / b) * b`, likewise taking the sign of the
+dividend (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). The exact float result is
+defined for `|a / b| < 2^63`.
+
+```mach
+val r: f64 = 5.5 % 3.0;      # 2.5
+```
+
 ## Bitwise
 
 `&` `|` `^` `~` `<<` `>>` — work on integer scalars and (planned) integer
