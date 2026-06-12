@@ -15,6 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a single command name or path (no shell-style word splitting), resolved
   on `PATH`. Absent the flag, binaries are exec'd directly and a launch
   failure is reported as a failure — no auto-detection (#1345).
+- One-line install scripts: `install.sh` (Linux) and `install.ps1` (Windows),
+  shipped in the repo and as release assets. They resolve the latest tag from
+  the `releases/latest` redirect, download the versioned archive for the host,
+  verify it against `SHA256SUMS`, and install to `~/.local/bin`
+  (`%LOCALAPPDATA%\mach\bin` on Windows); `MACH_VERSION` and
+  `MACH_INSTALL_DIR` override the release and destination (#1352).
+- Releases now ship versioned archives — `mach-<version>-x86_64-linux.tar.gz`
+  and `mach-<version>-x86_64-windows.zip`, each containing the binary and
+  LICENSE — alongside the existing assets, with `SHA256SUMS` covering the
+  full set (#1352).
+
+### Fixed
+
+- Sema reports a teaching diagnostic for every symbol kind that can never be a
+  value reaching value position — a record, union, or `def` type name (local
+  or imported, bare or `alias.member`), a generic type parameter, and a member
+  access on an expression with no value (a call with no return type) — instead
+  of silently poisoning and surfacing link `undefined symbol` or span-less
+  lowering errors; completes the #1343 silent-poison audit (#1348).
 
 ## [1.4.1] - 2026-06-12
 

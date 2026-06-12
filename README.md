@@ -27,10 +27,28 @@ Use Mach when you want C's reach with one coherent toolchain: a single binary th
 Read the [language reference](doc/language/README.md) before installing. The docs are written more like a pamphlet than a bible and assume familiarity with basic programming concepts from other languages.
 
 
+## Installing Mach
+
+Install the latest release with one line:
+
+```bash
+curl -fsSL https://github.com/octalide/mach/releases/latest/download/install.sh | sh
+```
+
+On Windows (PowerShell):
+
+```powershell
+irm https://github.com/octalide/mach/releases/latest/download/install.ps1 | iex
+```
+
+The scripts verify the download against the release `SHA256SUMS` and install to
+`~/.local/bin` (`%LOCALAPPDATA%\mach\bin` on Windows). Precompiled binaries are
+also available directly on the [releases](https://github.com/octalide/mach/releases) page.
+
+
 ## Building Mach
 
 Mach builds itself, so building from source needs an existing `mach` installation.
-You can download precompiled binaries for your system on the [releases](https://github.com/octalide/mach/releases) page.
 
 ```bash
 git clone https://github.com/octalide/mach
