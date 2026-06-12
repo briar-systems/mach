@@ -21,6 +21,7 @@ use std.types.char.char;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_empty;
+use std.types.string.str_ends_with;
 use std.text.string.str_dup;
 use std.text.string.str_free;
 use std.types.string.StrView;
@@ -71,6 +72,9 @@ use resolve:  mach.lang.fe.resolve;
 use os:  mach.lang.target.os;
 use isa: mach.lang.target.isa;
 use tgt: mach.lang.target;
+use version: mach.lang.version;
+
+use manifest: mach.lang.manifest;
 
 # BuildMode: the kind of artifact a target build produces.
 pub def BuildMode: u8;
@@ -95,8 +99,9 @@ pub val TARGET_OPT_RELEASE: TargetOpt = 2;
 # TargetEntry: one entry under `[targets.<name>]` in mach.toml.
 # ---
 # name:       interned target selector (e.g. "linux")
-# os_name:    interned os name (e.g. "linux")
-# isa_name:   interned isa name (e.g. "x86_64")
+# os_name:    interned os name (e.g. "linux"); read by `$target.os`
+# isa_name:   interned isa name (e.g. "x86_64"); read by `$target.isa`
+# abi_name:   interned abi name (e.g. "sysv64"); read by `$target.abi`
 # entrypoint: interned entrypoint file path, relative to dir_src (e.g. "main.mach")
 # artifacts:  interned artifact subdirectory under `out` (e.g. "linux"); may be
 #             nested (e.g. "smach/linux")
@@ -114,6 +119,7 @@ pub rec TargetEntry {
     name:       intern.StrId;
     os_name:    intern.StrId;
     isa_name:   intern.StrId;
+    abi_name:   intern.StrId;
     entrypoint: intern.StrId;
     artifacts:  intern.StrId;
     binary:     intern.StrId;
@@ -139,7 +145,15 @@ pub rec DepEntry {
 
 # ProjectConfig: parsed mach.toml plus the resolved dep metadata.
 # ---
-# id:           interned `[project].id`
+# id:           interned `[project].id`; read by `$project.id`
+# version:      interned `[project].version`; read by `$project.version`. STR_NIL
+#               when a v1 manifest omits it
+# name:         interned `[project].name` metadata; read by `$project.name`.
+#               STR_NIL when the manifest omits it
+# description:  interned `[project].description` metadata; read by
+#               `$project.description`. STR_NIL when the manifest omits it
+# bin_name:     interned name of the selected artifact; read by `$bin.name`.
+#               STR_NIL for a v1 manifest, which has no artifact stanza
 # dir_src:      interned `[project].dir_src` (default "src")
 # dir_dep:      interned `[project].dir_dep` (default "dep")
 # out:          interned `[project].dir_out` output root, with legacy `out`
@@ -150,8 +164,30 @@ pub rec DepEntry {
 # target_count: number of entries in targets
 # deps:         flat array of DepEntry records
 # dep_count:    number of entries in deps
+# is_v2:        true when this config came from the v2 manifest reader; the
+#               build then takes its concrete output paths from the resolved
+#               `v2_*` fields below rather than composing `out`/`binary`
+# v2_bin:       interned resolved artifact path (root-relative), v2 only
+# v2_obj_root:  interned resolved intermediate-object dir (root-relative), v2 only
+# v2_ir_root:   interned resolved IR-dump dir (root-relative), v2 only
+# v2_asm_root:  interned resolved ASM-dump dir (root-relative), v2 only
+# v2_emit_ir:   selected profile's IR-emission default, v2 only
+# v2_emit_asm:  selected profile's ASM-emission default, v2 only
+# v2_defines:      merged comptime defines for the selected unit (artifact < target
+#                  < cell), each `NAME` or `NAME=VALUE`; bound into every module's
+#                  comptime ctx during load (#1191). v2 only; nil when none
+# v2_define_count: number of entries in v2_defines
+# cascade_libs:      transitive dependency link inputs whose declared target tuple
+#                    (isa, os, abi) matches the selected target's, in topological
+#                    dep then declaration order, deduplicated by name and excluding
+#                    the consumer's own libs (#1218); nil when none
+# cascade_lib_count: number of entries in cascade_libs
 pub rec ProjectConfig {
     id:           intern.StrId;
+    version:      intern.StrId;
+    name:         intern.StrId;
+    description:  intern.StrId;
+    bin_name:     intern.StrId;
     dir_src:      intern.StrId;
     dir_dep:      intern.StrId;
     out:          intern.StrId;
@@ -161,6 +197,17 @@ pub rec ProjectConfig {
     target_count: u32;
     deps:         *DepEntry;
     dep_count:    u32;
+    is_v2:        bool;
+    v2_bin:       intern.StrId;
+    v2_obj_root:  intern.StrId;
+    v2_ir_root:   intern.StrId;
+    v2_asm_root:  intern.StrId;
+    v2_emit_ir:   bool;
+    v2_emit_asm:  bool;
+    v2_defines:      *intern.StrId;
+    v2_define_count: u32;
+    cascade_libs:      *intern.StrId;
+    cascade_lib_count: u32;
 }
 
 # PubConst: one comptime constant exported by a module to its importers.
@@ -244,28 +291,185 @@ val INITIAL_PUB_CAP:    u32 = 4;
 val INITIAL_DEP_CAP:    u32 = 4;
 
 # build_project: load `project_root/mach.toml`, select `target_name`, and
-# build the full module graph plus per-module ResolveResults.
+# build the full module graph plus per-module ResolveResults. a convenience
+# wrapper over build_project_sel that selects only a target (no profile/artifact
+# narrowing) — used by read-only consumers such as `mach doc`.
 # ---
 # s:            shared session
 # project_root: filesystem path to the project root (containing mach.toml)
-# target_name:  selector that must match a `[targets.<name>]` entry
+# target_name:  selector that must match a declared target
 # ret:          fully populated Project, or an error message
 pub fun build_project(s: *sess.Session, project_root: str, target_name: str) Result[Project, str] {
+    var sel: manifest.Selection;
+    sel.target       = target_name;
+    sel.profile      = "";
+    sel.artifact     = "";
+    sel.want_lib     = false;
+    sel.has_artifact = false;
+    ret build_project_sel(s, project_root, ?sel);
+}
+
+# MatrixUnit: one (target, artifact) cell a `mach build` invocation compiles.
+# `target` is a declared target name, "native"/"host", or "" for the manifest
+# default; `artifact` is a `[bin.*]`/`[lib.*]` name, "" when none is named.
+# strings borrow the enumeration allocator and are valid for the build loop.
+# ---
+# target:       target selector for this cell
+# artifact:     artifact selector for this cell
+# want_lib:     the artifact is a `[lib.*]` (disambiguates a name)
+# has_artifact: an artifact is named
+pub rec MatrixUnit {
+    target:       str;
+    artifact:     str;
+    want_lib:     bool;
+    has_artifact: bool;
+}
+
+# Matrix: the enumerated build matrix for a `mach build` invocation.
+# ---
+# units: one MatrixUnit per (target, artifact) cell, in build order
+# count: number of units
+pub rec Matrix {
+    units: *MatrixUnit;
+    count: u32;
+}
+
+# enumerate_matrix: expand the build matrix a `mach build` invocation drives.
+# reads `project_root/mach.toml` and, for a v2 manifest, produces one MatrixUnit
+# per (target, artifact) cell to build: every declared `[bin.*]`/`[lib.*]` in
+# declaration order (bins then libs) unless narrowed by `bin`/`lib`, crossed with
+# the selected target(s) — `target_filter` when named, every declared target when
+# `all_targets`, else the single manifest default. an old-format manifest yields a
+# single target-only unit, its artifact model unchanged. the manifest and its
+# interned selector strings are allocated in `alloc` and must remain valid for the
+# whole build loop (so `alloc` outlives every per-unit build).
+pub fun enumerate_matrix(alloc: *Allocator, project_root: str,
+                         target_filter: str, all_targets: bool,
+                         bin: str, lib: str, has_bin: bool, has_lib: bool) Result[Matrix, str] {
+    val toml_path_r: Result[str, str] = join_path(alloc, project_root, "mach.toml");
+    if (is_err[str, str](toml_path_r)) { ret err[Matrix, str](unwrap_err[str, str](toml_path_r)); }
+    val toml_path: str = unwrap_ok[str, str](toml_path_r);
+    val toml_r: Result[toml.Table, str] = parse_toml_file(alloc, toml_path);
+    str_free(alloc, toml_path);
+    if (is_err[toml.Table, str](toml_r)) { ret err[Matrix, str](unwrap_err[toml.Table, str](toml_r)); }
+    var t: toml.Table = unwrap_ok[toml.Table, str](toml_r);
+
+    # the old reader has no artifact axis: a single target-only unit reproduces
+    # the legacy single-build behaviour exactly.
+    if (!manifest.is_v2(?t)) {
+        ret single_matrix(alloc, target_filter, "", false, false);
+    }
+
+    var itn: intern.Interner = intern.init(alloc);
+    val mr: Result[manifest.Manifest, str] = manifest.parse(alloc, ?itn, ?t);
+    if (is_err[manifest.Manifest, str](mr)) { ret err[Matrix, str](unwrap_err[manifest.Manifest, str](mr)); }
+    var m: manifest.Manifest = unwrap_ok[manifest.Manifest, str](mr);
+
+    # the target axis: a named filter, every declared target, or the default.
+    var tn: u32 = 1;
+    if (all_targets && str_empty(target_filter)) { tn = m.target_count; }
+    if (tn == 0) { ret err[Matrix, str]("mach.toml: --all-targets but no [target.*] declared"); }
+
+    # the artifact axis: a named bin/lib, or every declared artifact.
+    var an: u32 = 1;
+    if (!has_bin && !has_lib) { an = m.artifact_count; }
+    if (an == 0) { ret err[Matrix, str]("mach.toml: no [bin.*] or [lib.*] artifacts declared"); }
+
+    val ur: Result[*MatrixUnit, str] = allocate[MatrixUnit](alloc, (tn * an)::usize);
+    if (is_err[*MatrixUnit, str](ur)) { ret err[Matrix, str](unwrap_err[*MatrixUnit, str](ur)); }
+    val units: *MatrixUnit = unwrap_ok[*MatrixUnit, str](ur);
+
+    var w: u32 = 0;
+    var ti: u32 = 0;
+    for (ti < tn) {
+        var tname: str = target_filter;
+        if (all_targets && str_empty(target_filter)) {
+            val to: Option[str] = intern.lookup(?itn, m.targets[ti].name);
+            if (is_none[str](to)) { ret err[Matrix, str]("internal: target name not interned"); }
+            tname = unwrap[str](to);
+        }
+        var ai: u32 = 0;
+        for (ai < an) {
+            var u: MatrixUnit;
+            u.target       = tname;
+            u.has_artifact = true;
+            if (has_bin)      { u.artifact = bin; u.want_lib = false; }
+            or (has_lib)      { u.artifact = lib; u.want_lib = true;  }
+            or {
+                val ao: Option[str] = intern.lookup(?itn, m.artifacts[ai].name);
+                if (is_none[str](ao)) { ret err[Matrix, str]("internal: artifact name not interned"); }
+                u.artifact = unwrap[str](ao);
+                u.want_lib = m.artifacts[ai].is_lib;
+            }
+            units[w] = u;
+            w = w + 1;
+            ai = ai + 1;
+        }
+        ti = ti + 1;
+    }
+
+    var mx: Matrix;
+    mx.units = units;
+    mx.count = w;
+    ret ok[Matrix, str](mx);
+}
+
+# single_matrix: a one-unit matrix for the given selector — the old reader's only
+# shape, and the v2 narrowing where exactly one cell results.
+fun single_matrix(alloc: *Allocator, target: str, artifact: str, want_lib: bool, has_artifact: bool) Result[Matrix, str] {
+    val ur: Result[*MatrixUnit, str] = allocate[MatrixUnit](alloc, 1::usize);
+    if (is_err[*MatrixUnit, str](ur)) { ret err[Matrix, str](unwrap_err[*MatrixUnit, str](ur)); }
+    val units: *MatrixUnit = unwrap_ok[*MatrixUnit, str](ur);
+    var u: MatrixUnit;
+    u.target       = target;
+    u.artifact     = artifact;
+    u.want_lib     = want_lib;
+    u.has_artifact = has_artifact;
+    units[0] = u;
+    var mx: Matrix;
+    mx.units = units;
+    mx.count = 1;
+    ret ok[Matrix, str](mx);
+}
+
+# build_project_sel: load `project_root/mach.toml` and build the module graph
+# for the given build selection (target, profile, and one artifact). the v2
+# reader resolves the selection into the project's single target entry and
+# concrete output paths; the old reader uses the selection's target only.
+# ---
+# s:            shared session
+# project_root: filesystem path to the project root (containing mach.toml)
+# sel:          the build selection narrowing target/profile/artifact
+# ret:          fully populated Project, or an error message
+pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Selection) Result[Project, str] {
     var p: Project;
     init_project(?p, s);
 
-    val cfg_r: Result[bool, str] = load_project_config(?p, project_root);
+    val cfg_r: Result[bool, str] = load_project_config(?p, project_root, sel);
     if (is_err[bool, str](cfg_r)) {
         dnit_project(?p);
         ret err[Project, str](unwrap_err[bool, str](cfg_r));
     }
 
-    val te: *TargetEntry = find_target(?p.config, target_name, ?p.s.interner);
-    if (te == nil) {
-        dnit_project(?p);
-        ret err[Project, str]("target not found in mach.toml");
+    var te: *TargetEntry = nil;
+    if (p.config.is_v2) {
+        # the v2 reader already selected and synthesized the target entry.
+        te = p.target_entry;
+        if (te == nil) {
+            dnit_project(?p);
+            ret err[Project, str]("internal: v2 manifest selected no target");
+        }
     }
-    p.target_entry = te;
+    or {
+        te = find_target(?p.config, sel.target, ?p.s.interner);
+        if (te == nil) {
+            val msg: str = diag_join3(p.s, "mach.toml: target '", sel.target, "' is not declared", "target not found in mach.toml");
+            dnit_project(?p);
+            ret err[Project, str](msg);
+        }
+        p.target_entry = te;
+    }
+
     val fp_r: Result[bool, str] = select_target(?p, te);
     if (is_err[bool, str](fp_r)) {
         dnit_project(?p);
@@ -534,6 +738,26 @@ fun init_project(p: *Project, s: *sess.Session) {
     p.target.of      = nil;
     p.compiler_name = intern.STR_NIL;
     p.compiler_ver  = intern.STR_NIL;
+    p.config.id           = intern.STR_NIL;
+    p.config.version      = intern.STR_NIL;
+    p.config.name         = intern.STR_NIL;
+    p.config.description  = intern.STR_NIL;
+    p.config.bin_name     = intern.STR_NIL;
+    p.config.targets      = nil;
+    p.config.target_count = 0;
+    p.config.deps         = nil;
+    p.config.dep_count    = 0;
+    p.config.is_v2        = false;
+    p.config.v2_bin       = intern.STR_NIL;
+    p.config.v2_obj_root  = intern.STR_NIL;
+    p.config.v2_ir_root   = intern.STR_NIL;
+    p.config.v2_asm_root  = intern.STR_NIL;
+    p.config.v2_emit_ir   = false;
+    p.config.v2_emit_asm  = false;
+    p.config.v2_defines       = nil;
+    p.config.v2_define_count  = 0;
+    p.config.cascade_libs      = nil;
+    p.config.cascade_lib_count = 0;
     p.modules       = nil;
     p.module_len    = 0;
     p.module_cap    = 0;
@@ -560,13 +784,23 @@ fun deallocate_config(c: *ProjectConfig, alloc: *Allocator) {
     if (c.deps != nil && c.dep_count > 0) {
         deallocate[DepEntry](alloc, c.deps, c.dep_count::usize);
     }
+    if (c.v2_defines != nil && c.v2_define_count > 0) {
+        deallocate[intern.StrId](alloc, c.v2_defines, c.v2_define_count::usize);
+    }
+    if (c.cascade_libs != nil && c.cascade_lib_count > 0) {
+        deallocate[intern.StrId](alloc, c.cascade_libs, c.cascade_lib_count::usize);
+    }
     c.targets      = nil;
     c.target_count = 0;
     c.deps         = nil;
     c.dep_count    = 0;
+    c.v2_defines       = nil;
+    c.v2_define_count  = 0;
+    c.cascade_libs      = nil;
+    c.cascade_lib_count = 0;
 }
 
-fun load_project_config(p: *Project, project_root: str) Result[bool, str] {
+fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection) Result[bool, str] {
     val abs_root_r: Result[intern.StrId, str] = intern.intern(?p.s.interner, project_root);
     if (is_err[intern.StrId, str](abs_root_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](abs_root_r)); }
     p.config.project_root = unwrap_ok[intern.StrId, str](abs_root_r);
@@ -580,11 +814,32 @@ fun load_project_config(p: *Project, project_root: str) Result[bool, str] {
     if (is_err[toml.Table, str](toml_r)) { ret err[bool, str](unwrap_err[toml.Table, str](toml_r)); }
     var t: toml.Table = unwrap_ok[toml.Table, str](toml_r);
 
+    # transitional dual-format dispatch (#1218): a manifest with the new
+    # singular `[target.*]` schema (no plural `[targets.*]`) routes to the v2
+    # reader; everything below is the old reader, removed in the final phase.
+    if (manifest.is_v2(?t)) {
+        ret load_v2_config(p, project_root, ?t, sel);
+    }
+
     val id_str: str = toml.get_str(?t, "project.id");
     if (str_empty(id_str)) { ret err[bool, str]("mach.toml is missing [project].id"); }
     val id_iv: Result[intern.StrId, str] = intern.intern(?p.s.interner, id_str);
     if (is_err[intern.StrId, str](id_iv)) { ret err[bool, str](unwrap_err[intern.StrId, str](id_iv)); }
     p.config.id = unwrap_ok[intern.StrId, str](id_iv);
+
+    # project metadata for the `$project.*` comptime root; each is optional in a
+    # v1 manifest, so an absent key folds to "not available" rather than "".
+    val ver_iv: Result[intern.StrId, str] = intern_meta(?p.s.interner, toml.get_str(?t, "project.version"));
+    if (is_err[intern.StrId, str](ver_iv)) { ret err[bool, str](unwrap_err[intern.StrId, str](ver_iv)); }
+    p.config.version = unwrap_ok[intern.StrId, str](ver_iv);
+
+    val pname_iv: Result[intern.StrId, str] = intern_meta(?p.s.interner, toml.get_str(?t, "project.name"));
+    if (is_err[intern.StrId, str](pname_iv)) { ret err[bool, str](unwrap_err[intern.StrId, str](pname_iv)); }
+    p.config.name = unwrap_ok[intern.StrId, str](pname_iv);
+
+    val pdesc_iv: Result[intern.StrId, str] = intern_meta(?p.s.interner, toml.get_str(?t, "project.description"));
+    if (is_err[intern.StrId, str](pdesc_iv)) { ret err[bool, str](unwrap_err[intern.StrId, str](pdesc_iv)); }
+    p.config.description = unwrap_ok[intern.StrId, str](pdesc_iv);
 
     val dir_src_r: Result[intern.StrId, str] = intern_or(?p.s.interner, toml.get_str(?t, "project.dir_src"), "src");
     if (is_err[intern.StrId, str](dir_src_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](dir_src_r)); }
@@ -611,6 +866,362 @@ fun load_project_config(p: *Project, project_root: str) Result[bool, str] {
     if (is_err[bool, str](deps_r)) { ret deps_r; }
 
     ret ok[bool, str](true);
+}
+
+# load_v2_config: parse a v2 manifest, resolve the build selection into one
+# build unit, and synthesize the ProjectConfig the rest of the driver consumes —
+# a single target entry plus the unit's concrete, template-expanded output paths
+# (`v2_*`). collisions are checked before anything is built. a `native`
+# selection that finds no host match emits an unmissable warning here.
+fun load_v2_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.Selection) Result[bool, str] {
+    val mr: Result[manifest.Manifest, str] = manifest.parse(p.s.alloc, ?p.s.interner, t);
+    if (is_err[manifest.Manifest, str](mr)) { ret err[bool, str](unwrap_err[manifest.Manifest, str](mr)); }
+    var m: manifest.Manifest = unwrap_ok[manifest.Manifest, str](mr);
+
+    val ur: Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(p.s.alloc, ?p.s.interner, ?m, @sel);
+    if (is_err[manifest.BuildUnit, str](ur)) {
+        manifest.dnit(?m, p.s.alloc);
+        ret err[bool, str](unwrap_err[manifest.BuildUnit, str](ur));
+    }
+    val bu: manifest.BuildUnit = unwrap_ok[manifest.BuildUnit, str](ur);
+
+    # honest collision guard over every artifact for the selected target/profile.
+    val pn_opt: Option[str] = intern.lookup(?p.s.interner, bu.profile_name);
+    if (is_some[str](pn_opt)) {
+        val cr: Result[bool, str] = manifest.check_collisions(p.s.alloc, ?p.s.interner, ?m, bu.target, unwrap[str](pn_opt));
+        if (is_err[bool, str](cr)) {
+            manifest.dnit(?m, p.s.alloc);
+            ret err[bool, str](unwrap_err[bool, str](cr));
+        }
+    }
+
+    if (bu.warned) { emit_native_warning(p, bu.target_name); }
+
+    # synthesize the single target entry the downstream driver selects on.
+    val ter: Result[*TargetEntry, str] = allocate[TargetEntry](p.s.alloc, 1::usize);
+    if (is_err[*TargetEntry, str](ter)) { manifest.dnit(?m, p.s.alloc); ret err[bool, str](unwrap_err[*TargetEntry, str](ter)); }
+    val targets: *TargetEntry = unwrap_ok[*TargetEntry, str](ter);
+    var entry: TargetEntry;
+    entry.name       = bu.target_name;
+    entry.os_name    = bu.target.os;
+    entry.isa_name   = bu.target.isa;
+    entry.abi_name   = bu.target.abi;
+    entry.entrypoint = bu.entry;
+    entry.artifacts  = intern.STR_NIL;
+    entry.binary     = bu.bin_path;
+    entry.mode       = MODE_EXECUTABLE;
+    if (bu.is_lib) { entry.mode = MODE_LIBRARY; }
+    entry.opt        = map_v2_opt(bu.opt);
+    entry.libs       = bu.libs;
+    entry.lib_count  = bu.lib_count;
+    targets[0] = entry;
+
+    p.config.id           = m.id;
+    p.config.version      = m.version;
+    p.config.name         = m.name;
+    p.config.description  = m.description;
+    # the artifact name feeds `$bin.name`; STR_NIL when the selection bound none.
+    if (bu.artifact != nil) { p.config.bin_name = bu.artifact.name; }
+    p.config.dir_src      = m.src;
+    p.config.dir_dep      = m.dep;
+    p.config.out          = m.out_tmpl;
+    p.config.target       = bu.target_name;
+    p.config.targets      = targets;
+    p.config.target_count = 1;
+    p.config.is_v2        = true;
+    p.config.v2_bin       = bu.bin_path;
+    p.config.v2_obj_root  = bu.obj_root;
+    p.config.v2_ir_root   = bu.ir_root;
+    p.config.v2_asm_root  = bu.asm_root;
+    p.config.v2_emit_ir   = bu.emit_ir;
+    p.config.v2_emit_asm  = bu.emit_asm;
+    p.config.v2_defines       = bu.defines;
+    p.config.v2_define_count  = bu.define_count;
+    p.target_entry        = ?p.config.targets[0];
+
+    val dr: Result[bool, str] = resolve_v2_deps(p, ?m, project_root);
+    if (is_err[bool, str](dr)) { manifest.dnit(?m, p.s.alloc); ret dr; }
+
+    # cascade the transitive deps' tuple-matched link libs into the build. the
+    # tuple strings come from the selected target (interner-owned, so stable past
+    # the manifest teardown below); the dep manifests are read fresh.
+    val isa_opt: Option[str] = intern.lookup(?p.s.interner, bu.target.isa);
+    val os_opt:  Option[str] = intern.lookup(?p.s.interner, bu.target.os);
+    val abi_opt: Option[str] = intern.lookup(?p.s.interner, bu.target.abi);
+    if (is_none[str](isa_opt) || is_none[str](os_opt) || is_none[str](abi_opt)) {
+        manifest.dnit(?m, p.s.alloc);
+        ret err[bool, str]("internal: selected target tuple not interned");
+    }
+    val cr2: Result[bool, str] = resolve_cascade_libs(p, project_root,
+        unwrap[str](isa_opt), unwrap[str](os_opt), unwrap[str](abi_opt), bu.libs, bu.lib_count);
+    if (is_err[bool, str](cr2)) { manifest.dnit(?m, p.s.alloc); ret cr2; }
+
+    manifest.dnit(?m, p.s.alloc);
+    ret ok[bool, str](true);
+}
+
+# map_v2_opt: map a manifest profile opt level to the driver's TargetOpt.
+fun map_v2_opt(o: manifest.MOpt) TargetOpt {
+    if (o == manifest.MOPT_RELEASE) { ret TARGET_OPT_RELEASE; }
+    if (o == manifest.MOPT_DEBUG)   { ret TARGET_OPT_DEBUG; }
+    ret TARGET_OPT_DEFAULT;
+}
+
+# emit_native_warning: file the `native` no-match warning on the session
+# diagnostic sink, naming the host tuple and the target being built instead.
+# filing it (rather than racing a raw stderr write) gives it a `warning:` label
+# and renders it in order with the structured diagnostics. the warning is not
+# tied to a source span, so it carries an out-of-range file id and renders
+# message-only.
+fun emit_native_warning(p: *Project, target_name: intern.StrId) {
+    val tuple: str = manifest.host_tuple(p.s.alloc);
+    val name_opt: Option[str] = intern.lookup(?p.s.interner, target_name);
+    var name: str = "?";
+    if (is_some[str](name_opt)) { name = unwrap[str](name_opt); }
+
+    val a: str = "no declared target matches the host (";
+    val b: str = "); building '";
+    val c: str = "'";
+    val total: usize = str_len(a) + str_len(tuple) + str_len(b) + str_len(name) + str_len(c);
+
+    val r: Result[*u8, str] = allocate[u8](p.s.alloc, total + 1);
+    if (is_err[*u8, str](r)) { str_free(p.s.alloc, tuple); ret; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    k = dcopy(buf, k, a);
+    k = dcopy(buf, k, tuple);
+    k = dcopy(buf, k, b);
+    k = dcopy(buf, k, name);
+    k = dcopy(buf, k, c);
+    buf[total] = 0;
+
+    var span: token.Span;
+    span.offset = 0;
+    span.len    = 0;
+    diag.warning(?p.s.diags, 0xFFFFFFFF::src.FileId, span, buf::str);
+
+    deallocate[u8](p.s.alloc, buf, total + 1);
+    str_free(p.s.alloc, tuple);
+}
+
+# dcopy: append `s`'s bytes into `buf` at offset `k`, returning the new offset.
+fun dcopy(buf: *u8, k: usize, s: str) usize {
+    val n: usize = str_len(s);
+    var j: usize = 0;
+    for (j < n) { buf[k + j] = s[j]; j = j + 1; }
+    ret k + n;
+}
+
+# resolve_v2_deps: resolve each `[deps.*]` into a DepEntry by vendor layout,
+# reading the dependency's own mach.toml — identical to the old reader's dep
+# resolution, just driven off the v2 dependency list.
+fun resolve_v2_deps(p: *Project, m: *manifest.Manifest, project_root: str) Result[bool, str] {
+    if (m.dep_count == 0) {
+        p.config.deps      = nil;
+        p.config.dep_count = 0;
+        ret ok[bool, str](true);
+    }
+    val r: Result[*DepEntry, str] = allocate[DepEntry](p.s.alloc, m.dep_count::usize);
+    if (is_err[*DepEntry, str](r)) { ret err[bool, str](unwrap_err[*DepEntry, str](r)); }
+    p.config.deps      = unwrap_ok[*DepEntry, str](r);
+    p.config.dep_count = m.dep_count;
+
+    val dir_dep_opt: Option[str] = intern.lookup(?p.s.interner, p.config.dir_dep);
+    if (is_none[str](dir_dep_opt)) { ret err[bool, str]("dep dir StrId not interned"); }
+    val dir_dep: str = unwrap[str](dir_dep_opt);
+
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val alias_opt: Option[str] = intern.lookup(?p.s.interner, m.deps[i].name);
+        if (is_none[str](alias_opt)) { ret err[bool, str]("dep alias StrId not interned"); }
+        val rd: Result[DepEntry, str] = resolve_dep(p.s, unwrap[str](alias_opt), project_root, dir_dep);
+        if (is_err[DepEntry, str](rd)) { ret err[bool, str](unwrap_err[DepEntry, str](rd)); }
+        p.config.deps[i] = unwrap_ok[DepEntry, str](rd);
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# resolve_cascade_libs: gather the transitive dependencies' tuple-matched link
+# libs into `p.config.cascade_libs` (#1218). a dependency declares its own
+# `[target.*].libs` (v2) or `[targets.*].libs`/`.link` (v1) — both formats are read
+# on the dep side during the transition — and a consumer inherits every such lib
+# whose target tuple (isa, os, abi) equals the one being built, so a platform link
+# requirement (e.g. `kernel32.dll`) lives once in the providing dependency's
+# manifest. order is topological (a dep's own deps first) then declaration order;
+# libs are deduplicated by name and the consumer's own `own_libs` are excluded, so
+# a shared requirement is never linked twice. an empty result leaves the cascade
+# nil/0, so a build with no inheriting deps is unaffected.
+fun resolve_cascade_libs(p: *Project, project_root: str, isa: str, os: str, abi: str,
+                         own_libs: *intern.StrId, own_count: u32) Result[bool, str] {
+    p.config.cascade_libs      = nil;
+    p.config.cascade_lib_count = 0;
+    val n: u32 = p.config.dep_count;
+    if (n == 0) { ret ok[bool, str](true); }
+
+    # parse every dep manifest once and resolve its alias string up front; both
+    # drive the ordering and lib collection below.
+    val tr: Result[*toml.Table, str] = allocate[toml.Table](p.s.alloc, n::usize);
+    if (is_err[*toml.Table, str](tr)) { ret err[bool, str](unwrap_err[*toml.Table, str](tr)); }
+    val tables: *toml.Table = unwrap_ok[*toml.Table, str](tr);
+    val ar: Result[*str, str] = allocate[str](p.s.alloc, n::usize);
+    if (is_err[*str, str](ar)) { ret err[bool, str](unwrap_err[*str, str](ar)); }
+    val aliases: *str = unwrap_ok[*str, str](ar);
+
+    var i: u32 = 0;
+    for (i < n) {
+        val vr_opt: Option[str] = intern.lookup(?p.s.interner, p.config.deps[i].vendor_root);
+        val al_opt: Option[str] = intern.lookup(?p.s.interner, p.config.deps[i].alias);
+        if (is_none[str](vr_opt) || is_none[str](al_opt)) { ret err[bool, str]("internal: dep metadata not interned"); }
+        aliases[i] = unwrap[str](al_opt);
+        val tp_r: Result[str, str] = join_path(p.s.alloc, unwrap[str](vr_opt), "mach.toml");
+        if (is_err[str, str](tp_r)) { ret err[bool, str](unwrap_err[str, str](tp_r)); }
+        val tp: str = unwrap_ok[str, str](tp_r);
+        val pr: Result[toml.Table, str] = parse_toml_file(p.s.alloc, tp);
+        str_free(p.s.alloc, tp);
+        if (is_err[toml.Table, str](pr)) { ret err[bool, str](unwrap_err[toml.Table, str](pr)); }
+        tables[i] = unwrap_ok[toml.Table, str](pr);
+        i = i + 1;
+    }
+
+    # topological dep order via post-order DFS over the inter-dep `[deps.*]` graph.
+    val ov: Result[*u32, str] = allocate[u32](p.s.alloc, n::usize);
+    if (is_err[*u32, str](ov)) { ret err[bool, str](unwrap_err[*u32, str](ov)); }
+    val order: *u32 = unwrap_ok[*u32, str](ov);
+    val vv: Result[*bool, str] = allocate[bool](p.s.alloc, n::usize);
+    if (is_err[*bool, str](vv)) { ret err[bool, str](unwrap_err[*bool, str](vv)); }
+    val visited: *bool = unwrap_ok[*bool, str](vv);
+    i = 0;
+    for (i < n) { visited[i] = false; i = i + 1; }
+    var order_len: u32 = 0;
+    i = 0;
+    for (i < n) { cascade_dfs(?tables[0], aliases, visited, order, ?order_len, n, i); i = i + 1; }
+
+    # upper-bound by the total tuple-matched lib count, then fill with dedup.
+    var max: u32 = 0;
+    i = 0;
+    for (i < n) {
+        val arr: *toml.Array = tuple_libs(?tables[i], isa, os, abi);
+        if (arr != nil) { max = max + toml.array_len(arr)::u32; }
+        i = i + 1;
+    }
+    if (max == 0) { ret ok[bool, str](true); }
+
+    val br: Result[*intern.StrId, str] = allocate[intern.StrId](p.s.alloc, max::usize);
+    if (is_err[*intern.StrId, str](br)) { ret err[bool, str](unwrap_err[*intern.StrId, str](br)); }
+    val buf: *intern.StrId = unwrap_ok[*intern.StrId, str](br);
+    var w: u32 = 0;
+
+    var oi: u32 = 0;
+    for (oi < order_len) {
+        val di: u32 = order[oi];
+        val arr: *toml.Array = tuple_libs(?tables[di], isa, os, abi);
+        if (arr != nil) {
+            val cnt: usize = toml.array_len(arr);
+            var k: usize = 0;
+            for (k < cnt) {
+                val v: *toml.Value = toml.array_get(arr, k);
+                if (v == nil || v.tag != toml.TYPE_STRING) {
+                    deallocate[intern.StrId](p.s.alloc, buf, max::usize);
+                    ret err[bool, str]("dep mach.toml: a target's libs entry is not a string");
+                }
+                val idr: Result[intern.StrId, str] = intern.intern(?p.s.interner, v.data.string);
+                if (is_err[intern.StrId, str](idr)) {
+                    deallocate[intern.StrId](p.s.alloc, buf, max::usize);
+                    ret err[bool, str](unwrap_err[intern.StrId, str](idr));
+                }
+                val id: intern.StrId = unwrap_ok[intern.StrId, str](idr);
+                if (!strid_in(buf, w, id) && !strid_in(own_libs, own_count, id)) {
+                    buf[w] = id; w = w + 1;
+                }
+                k = k + 1;
+            }
+        }
+        oi = oi + 1;
+    }
+
+    if (w == 0) {
+        deallocate[intern.StrId](p.s.alloc, buf, max::usize);
+        ret ok[bool, str](true);
+    }
+    if (w < max) {
+        val sr: Result[*intern.StrId, str] = reallocate[intern.StrId](p.s.alloc, buf, max::usize, w::usize);
+        if (is_ok[*intern.StrId, str](sr)) {
+            p.config.cascade_libs      = unwrap_ok[*intern.StrId, str](sr);
+            p.config.cascade_lib_count = w;
+            ret ok[bool, str](true);
+        }
+    }
+    p.config.cascade_libs      = buf;
+    p.config.cascade_lib_count = w;
+    ret ok[bool, str](true);
+}
+
+# cascade_dfs: post-order DFS visiting a dep's own declared deps before the dep
+# itself, so the emitted order is topological (dependencies first) with siblings
+# kept in declaration order. `base` points at the dep manifest table array.
+fun cascade_dfs(base: *toml.Table, aliases: *str, visited: *bool, order: *u32, order_len: *u32, n: u32, i: u32) {
+    if (visited[i]) { ret; }
+    visited[i] = true;
+    var j: u32 = 0;
+    for (j < n) {
+        if (j != i && dep_declares(?base[i], aliases[j])) {
+            cascade_dfs(base, aliases, visited, order, order_len, n, j);
+        }
+        j = j + 1;
+    }
+    order[@order_len] = i;
+    @order_len = @order_len + 1;
+}
+
+# dep_declares: whether dep manifest `t` lists `alias` under its own `[deps.*]`.
+fun dep_declares(t: *toml.Table, alias: str) bool {
+    val deps_tab: *toml.Table = toml.get_table(t, "deps");
+    if (deps_tab == nil) { ret false; }
+    val m: usize = toml.table_len(deps_tab);
+    var k: usize = 0;
+    for (k < m) {
+        if (str_equals(toml.table_key(deps_tab, k), alias)) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# tuple_libs: the `libs`/`link` array of the dep target whose (isa, os, abi) tuple
+# matches the build's, reading the v2 `[target.*]` table then the v1 `[targets.*]`
+# table. nil when the dep declares no matching target or it carries no libs.
+fun tuple_libs(t: *toml.Table, isa: str, os: str, abi: str) *toml.Array {
+    var parent: *toml.Table = toml.get_table(t, "target");
+    if (parent == nil) { parent = toml.get_table(t, "targets"); }
+    if (parent == nil) { ret nil; }
+    val m: usize = toml.table_len(parent);
+    var k: usize = 0;
+    for (k < m) {
+        val v: *toml.Value = toml.table_value(parent, k);
+        if (v != nil && v.tag == toml.TYPE_TABLE) {
+            val sub: *toml.Table = ?v.data.table;
+            if (str_equals(toml.get_str(sub, "isa"), isa)
+             && str_equals(toml.get_str(sub, "os"),  os)
+             && str_equals(toml.get_str(sub, "abi"), abi)) {
+                var arr: *toml.Array = toml.get_array(sub, "libs");
+                if (arr == nil) { arr = toml.get_array(sub, "link"); }
+                ret arr;
+            }
+        }
+        k = k + 1;
+    }
+    ret nil;
+}
+
+# strid_in: whether `id` already appears in the first `count` entries of `arr`.
+fun strid_in(arr: *intern.StrId, count: u32, id: intern.StrId) bool {
+    if (arr == nil) { ret false; }
+    var k: u32 = 0;
+    for (k < count) {
+        if (arr[k] == id) { ret true; }
+        k = k + 1;
+    }
+    ret false;
 }
 
 fun parse_targets_table(p: *Project, t: *toml.Table) Result[bool, str] {
@@ -643,6 +1254,10 @@ fun parse_targets_table(p: *Project, t: *toml.Table) Result[bool, str] {
         val ris: Result[intern.StrId, str] = intern_required(?p.s.interner, toml.get_str(sub, "isa"), "mach.toml: a [targets.*] entry is missing required key 'isa'");
         if (is_err[intern.StrId, str](ris)) { ret err[bool, str](unwrap_err[intern.StrId, str](ris)); }
         entry.isa_name = unwrap_ok[intern.StrId, str](ris);
+
+        val rab: Result[intern.StrId, str] = intern_meta(?p.s.interner, toml.get_str(sub, "abi"));
+        if (is_err[intern.StrId, str](rab)) { ret err[bool, str](unwrap_err[intern.StrId, str](rab)); }
+        entry.abi_name = unwrap_ok[intern.StrId, str](rab);
 
         val rep: Result[intern.StrId, str] = intern_required(?p.s.interner, toml.get_str(sub, "entrypoint"), "mach.toml: a [targets.*] entry is missing required key 'entrypoint'");
         if (is_err[intern.StrId, str](rep)) { ret err[bool, str](unwrap_err[intern.StrId, str](rep)); }
@@ -786,8 +1401,9 @@ fun resolve_dep(s: *sess.Session, alias: str, project_root: str, dir_dep: str) R
 
     val id_str: str = toml.get_str(?t, "project.id");
     if (str_empty(id_str)) {
+        val msg: str = diag_join3(s, "dep '", alias, "' mach.toml is missing [project].id", "dep mach.toml is missing [project].id");
         str_free(s.alloc, dep_dir);
-        ret err[DepEntry, str]("dep mach.toml is missing [project].id");
+        ret err[DepEntry, str](msg);
     }
 
     var entry: DepEntry;
@@ -806,7 +1422,12 @@ fun resolve_dep(s: *sess.Session, alias: str, project_root: str, dir_dep: str) R
     }
     entry.project_id = unwrap_ok[intern.StrId, str](rp);
 
-    val rds: Result[intern.StrId, str] = intern_or(?s.interner, toml.get_str(?t, "project.dir_src"), "src");
+    # the dep's source dir: `dir_src` (old) or `src` (v2), defaulting to "src".
+    # reading both lets a consumer depend on a dep in either format during the
+    # transition (#1218); resolution is purely by vendor layout otherwise.
+    var dep_src_key: str = toml.get_str(?t, "project.dir_src");
+    if (str_empty(dep_src_key)) { dep_src_key = toml.get_str(?t, "project.src"); }
+    val rds: Result[intern.StrId, str] = intern_or(?s.interner, dep_src_key, "src");
     if (is_err[intern.StrId, str](rds)) {
         str_free(s.alloc, dep_dir);
         ret err[DepEntry, str](unwrap_err[intern.StrId, str](rds));
@@ -846,6 +1467,14 @@ fun intern_or(i: *intern.Interner, text: str, default: str) Result[intern.StrId,
     var t: str = text;
     if (str_empty(t)) { t = default; }
     ret intern.intern(i, t);
+}
+
+# intern_meta: intern an optional manifest metadata value, yielding STR_NIL when
+# the key is absent/empty so the comptime root reads it as "not available"
+# rather than folding to an empty string.
+fun intern_meta(i: *intern.Interner, text: str) Result[intern.StrId, str] {
+    if (str_empty(text)) { ret ok[intern.StrId, str](intern.STR_NIL); }
+    ret intern.intern(i, text);
 }
 
 # intern_required: intern a required manifest value, erroring with `missing`
@@ -931,10 +1560,10 @@ fun select_target(p: *Project, t: *TargetEntry) Result[bool, str] {
     if (is_err[intern.StrId, str](rcn)) { ret err[bool, str](unwrap_err[intern.StrId, str](rcn)); }
     p.compiler_name = unwrap_ok[intern.StrId, str](rcn);
 
-    # note: the compiler version literal stays here until #1217 lands the
-    # `$project.version` design, which sources it from the manifest and retires
-    # this hardcoded string. left in place deliberately (see #1258).
-    val rcv: Result[intern.StrId, str] = intern.intern(?p.s.interner, "1.3.0");
+    # the compiler version is single-sourced in `mach.lang.version`; both this
+    # `$mach.compiler.version` feed and `mach info` read it through one function,
+    # so the staged `$project.version` flip (#1311) touches a single place.
+    val rcv: Result[intern.StrId, str] = intern.intern(?p.s.interner, version.string());
     if (is_err[intern.StrId, str](rcv)) { ret err[bool, str](unwrap_err[intern.StrId, str](rcv)); }
     p.compiler_ver = unwrap_ok[intern.StrId, str](rcv);
 
@@ -993,15 +1622,9 @@ fun entry_module_fqn(p: *Project, t: *TargetEntry) Result[intern.StrId, str] {
 
 fun strip_mach_suffix(s: str) StrView {
     val suffix: str = ".mach";
-    val s_len:   usize = str_len(s);
-    val suf_len: usize = str_len(suffix);
-    if (s_len < suf_len) { ret view(s::*char, s_len); }
-    var i: usize = 0;
-    for (i < suf_len) {
-        if (s[s_len - suf_len + i] != suffix[i]) { ret view(s::*char, s_len); }
-        i = i + 1;
-    }
-    ret view(s::*char, s_len - suf_len);
+    val s_len: usize = str_len(s);
+    if (!str_ends_with(s, suffix)) { ret view(s::*char, s_len); }
+    ret view(s::*char, s_len - str_len(suffix));
 }
 
 # fqn_to_file_path: resolve an FQN like "std.types.bool" against the
@@ -1101,6 +1724,46 @@ fun build_module_path(alloc: *Allocator, root: str, src_dir: str, dotted_tail: S
     ret ok[str, str](buf::str);
 }
 
+# diag_join3: build `<a><b><c>` interned on the session, returning a borrowed
+# view valid for the session's lifetime. the module-load walk returns bare error
+# strings that surface before the diagnostic flush, so these name the offending
+# entity inline. returns the static `fallback` on any allocation/intern failure.
+fun diag_join3(s: *sess.Session, a: str, b: str, c: str, fallback: str) str {
+    val la: usize = str_len(a);
+    val lb: usize = str_len(b);
+    val lc: usize = str_len(c);
+    val total: usize = la + lb + lc;
+
+    val r: Result[*u8, str] = allocate[u8](s.alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret fallback; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    var k: usize = 0;
+    var j: usize = 0;
+    for (j < la) { buf[k] = a[j]; k = k + 1; j = j + 1; }
+    j = 0;
+    for (j < lb) { buf[k] = b[j]; k = k + 1; j = j + 1; }
+    j = 0;
+    for (j < lc) { buf[k] = c[j]; k = k + 1; j = j + 1; }
+    buf[total] = 0;
+
+    val ir: Result[intern.StrId, str] = intern.intern(?s.interner, buf::str);
+    deallocate[u8](s.alloc, buf, total + 1);
+    if (is_err[intern.StrId, str](ir)) { ret fallback; }
+
+    val nm: Option[str] = intern.lookup(?s.interner, unwrap_ok[intern.StrId, str](ir));
+    if (is_some[str](nm)) { ret unwrap[str](nm); }
+    ret fallback;
+}
+
+# diag_join_named: diag_join3 with the middle drawn from an interned id's text;
+# falls back to the static message when the id has no recorded text.
+fun diag_join_named(s: *sess.Session, prefix: str, name_id: intern.StrId, suffix: str, fallback: str) str {
+    val no: Option[str] = intern.lookup(?s.interner, name_id);
+    if (is_none[str](no)) { ret fallback; }
+    ret diag_join3(s, prefix, unwrap[str](no), suffix, fallback);
+}
+
 # join_path: join two path segments with a single '/' separator and return an owned str.
 fun join_path(alloc: *Allocator, a: str, b: str) Result[str, str] {
     val a_len: usize = str_len(a);
@@ -1150,7 +1813,7 @@ fun dfs_load(p: *Project, fqn: intern.StrId) Result[sess.ModuleId, str] {
     if (is_ok[*sess.ModuleId, str](existing_r)) {
         val mid: sess.ModuleId = @unwrap_ok[*sess.ModuleId, str](existing_r);
         if (p.load_status[mid::u32] == LOAD_LOADING) {
-            ret err[sess.ModuleId, str]("circular module dependency");
+            ret err[sess.ModuleId, str](diag_join_named(p.s, "circular module dependency: '", fqn, "' is already being loaded", "circular module dependency"));
         }
         ret ok[sess.ModuleId, str](mid);
     }
@@ -1207,6 +1870,12 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) Result[sess.ModuleId, s
     # even if parsing never runs (parse_module overwrites it with the real one)
     m.a                 = ast.init(p.s.alloc, 0);
     m.ctx               = comptime.init(p.s.alloc, p.target.os_id, p.target.arch_id, p.target.arch.pointer_width, p.compiler_name, p.compiler_ver);
+    # feed the manifest-derived `$project.*`/`$target.*`/`$bin.*` roots; the
+    # target tuple comes from the selected entry (set before any module loads).
+    comptime.set_build_context(?m.ctx,
+        p.config.id, p.config.version, p.config.name, p.config.description,
+        p.target_entry.os_name, p.target_entry.isa_name, p.target_entry.abi_name,
+        p.config.bin_name);
     m.pub_consts        = nil;
     m.pub_const_count   = 0;
     m.pub_const_cap     = 0;
@@ -1217,9 +1886,145 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) Result[sess.ModuleId, s
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
 
+    # bind the selected unit's manifest defines (#1191) into this module's ctx so
+    # `$if ($mach.build.NAME)` folds identically in every module of the graph.
+    val bd_r: Result[bool, str] = bind_v2_defines(p, ?p.modules[mid::u32].ctx);
+    if (is_err[bool, str](bd_r)) { ret err[sess.ModuleId, str](unwrap_err[bool, str](bd_r)); }
+
     val ins_r: Result[bool, str] = map.insert[intern.StrId, sess.ModuleId](?p.by_fqn, fqn, mid);
     if (is_err[bool, str](ins_r)) { ret err[sess.ModuleId, str](unwrap_err[bool, str](ins_r)); }
     ret ok[sess.ModuleId, str](mid);
+}
+
+# bind_v2_defines: bind every selected-unit manifest define (#1191) into a freshly
+# initialised module ctx. each entry is `NAME` (a comptime bool flag, `true`) or
+# `NAME=VALUE` where VALUE is a comptime literal — `true`/`false` (bool), an
+# integer literal (int), else a string. an empty define list is a strict no-op, so
+# a manifest declaring no defines stays fixpoint-stable.
+fun bind_v2_defines(p: *Project, ctx: *comptime.ComptimeCtx) Result[bool, str] {
+    if (!p.config.is_v2 || p.config.v2_define_count == 0) { ret ok[bool, str](true); }
+    var i: u32 = 0;
+    for (i < p.config.v2_define_count) {
+        val s_opt: Option[str] = intern.lookup(?p.s.interner, p.config.v2_defines[i]);
+        if (is_none[str](s_opt)) { ret err[bool, str]("define StrId not interned"); }
+        val r: Result[bool, str] = bind_one_define(p, ctx, unwrap[str](s_opt));
+        if (is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# bind_one_define: parse a single `NAME` / `NAME=VALUE` define and bind it as a
+# named comptime constant. the value typing is explicit: no `=` is a bool `true`
+# flag; `true`/`false` is a bool; a decimal/`0x`/`0b`/`0o` integer literal is an
+# int; anything else is a string.
+fun bind_one_define(p: *Project, ctx: *comptime.ComptimeCtx, s: str) Result[bool, str] {
+    val n: usize = str_len(s);
+    var eq: usize = n;
+    var k: usize = 0;
+    for (k < n) {
+        if (s[k] == '=') { eq = k; brk; }
+        k = k + 1;
+    }
+    if (eq == 0) { ret err[bool, str]("mach.toml: a define has an empty name"); }
+
+    val name_r: Result[intern.StrId, str] = intern.intern_bytes(?p.s.interner, s, eq);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    var v: comptime.CTValue;
+    v.int_unsigned = false;
+
+    if (eq == n) {
+        v.kind   = comptime.CT_KIND_BOOL;
+        v.data.b = true;
+    }
+    or {
+        val vstart: usize = eq + 1;
+        val vlen:   usize = n - vstart;
+        var iv: i64 = 0;
+        if (define_value_is(s, vstart, vlen, "true")) {
+            v.kind = comptime.CT_KIND_BOOL; v.data.b = true;
+        }
+        or (define_value_is(s, vstart, vlen, "false")) {
+            v.kind = comptime.CT_KIND_BOOL; v.data.b = false;
+        }
+        or (parse_define_int(s, vstart, vlen, ?iv)) {
+            v.kind = comptime.CT_KIND_INT; v.data.i = iv;
+        }
+        or {
+            val vr: Result[intern.StrId, str] = intern.intern_bytes(?p.s.interner, (s::usize + vstart)::str, vlen);
+            if (is_err[intern.StrId, str](vr)) { ret err[bool, str](unwrap_err[intern.StrId, str](vr)); }
+            v.kind = comptime.CT_KIND_STR; v.data.s = unwrap_ok[intern.StrId, str](vr);
+        }
+    }
+
+    ret comptime.bind_define(ctx, name_id, v);
+}
+
+# define_value_is: whether the value substring s[start, start+len) equals `lit`.
+fun define_value_is(s: str, start: usize, len: usize, lit: str) bool {
+    if (len != str_len(lit)) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (s[start + i] != lit[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# parse_define_int: parse the value substring s[start, start+len) as an integer
+# literal (optional leading `-`, optional `0x`/`0b`/`0o` base prefix, digit
+# separators `_`), writing the i64 into `out` and returning true. a value that is
+# not a clean integer returns false so the caller treats it as a string. an
+# out-of-range value also returns false (a string is the honest fallback).
+fun parse_define_int(s: str, start: usize, len: usize, out: *i64) bool {
+    if (len == 0) { ret false; }
+    var i: usize = 0;
+    var neg: bool = false;
+    if (s[start] == '-') {
+        if (len == 1) { ret false; }
+        neg = true;
+        i = 1;
+    }
+    var base: u64 = 10;
+    if (len - i >= 2 && s[start + i] == '0') {
+        val c1: u8 = s[start + i + 1];
+        if (c1 == 'x') { base = 16; i = i + 2; }
+        or (c1 == 'b') { base = 2;  i = i + 2; }
+        or (c1 == 'o') { base = 8;  i = i + 2; }
+    }
+
+    var value:     u64 = 0;
+    var saw_digit: bool = false;
+    val u64_max:   u64 = 0xFFFFFFFFFFFFFFFF;
+    for (i < len) {
+        val c: u8 = s[start + i];
+        if (c == '_') { i = i + 1; cnt; }
+        var digit: i64 = 0 - 1;
+        if      (c >= '0' && c <= '9') { digit = (c - '0')::i64; }
+        or      (c >= 'a' && c <= 'f') { digit = (c - 'a')::i64 + 10; }
+        or      (c >= 'A' && c <= 'F') { digit = (c - 'A')::i64 + 10; }
+        if (digit < 0 || digit::u64 >= base) { ret false; }
+        val d: u64 = digit::u64;
+        if (value > (u64_max - d) / base) { ret false; }
+        value = value * base + d;
+        saw_digit = true;
+        i = i + 1;
+    }
+    if (!saw_digit) { ret false; }
+
+    # reject a magnitude that has no i64 representation (the string fallback keeps
+    # it honest rather than wrapping).
+    val signed_max: u64 = 0x7FFFFFFFFFFFFFFF;
+    if (neg) {
+        if (value > signed_max + 1) { ret false; }
+        @out = 0 - value::i64;
+        ret true;
+    }
+    if (value > signed_max) { ret false; }
+    @out = value::i64;
+    ret true;
 }
 
 fun parse_module(p: *Project, mid: sess.ModuleId, fqn: intern.StrId) Result[bool, str] {
@@ -1453,7 +2258,7 @@ fun resolve_use_target(p: *Project, source: str, path: token.Span) Result[UseTar
     for (seg_end > path.offset) {
         var dot: usize = seg_end;
         for (dot > path.offset && source[dot - 1] != '.') { dot = dot - 1; }
-        if (dot == path.offset) { ret err[UseTarget, str]("use path does not name a module"); }
+        if (dot == path.offset) { ret err[UseTarget, str](diag_join_named(p.s, "use path '", full_id, "' does not name a module", "use path does not name a module")); }
         var prefix: token.Span;
         prefix.offset = path.offset;
         prefix.len    = (dot - 1) - path.offset;
@@ -1468,7 +2273,7 @@ fun resolve_use_target(p: *Project, source: str, path: token.Span) Result[UseTar
         }
         seg_end = dot - 1;
     }
-    ret err[UseTarget, str]("use path does not name a module");
+    ret err[UseTarget, str](diag_join_named(p.s, "use path '", full_id, "' does not name a module", "use path does not name a module"));
 }
 
 # fqn_names_file: true when an FQN resolves to an existing `.mach` file.

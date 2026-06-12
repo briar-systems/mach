@@ -24,6 +24,7 @@ matched exactly: `--flag value` (a value follows in the next argument) or a bare
 | `dep`   | manage git-backed dependencies (clone, lock, vendor) under `<dir_dep>` |
 | `init`  | scaffold a new project |
 | `doc`   | generate Markdown reference docs from source doc-comments |
+| `info`  | print compiler version, build host, and registered target capabilities |
 | `help`  | print usage; `mach help <command>` for detail |
 
 ## Global flags
@@ -37,11 +38,16 @@ Read by `build`, `run`, `test`, and `doc` (they share one config parser).
 | `--quiet`, `-q`  | —                | suppress non-error output |
 | `--color <mode>` | `auto`\|`always`\|`never` | color preference for terminal output (default `auto`); an unknown mode is a parse error |
 | `--cwd <path>`   | path             | run as if started in `<path>` (project-root search begins there) |
-| `--target <name>`| target name      | select a `[targets.<name>]` entry; absent, defers to `[project].target` |
+| `--target <name>`| target name      | select a declared target; absent, defers to `[project].target` |
+| `--profile <name>`| profile name    | select a `[profile.<name>]` build variant (v2 manifest); absent, the first declared profile |
+| `--bin <name>`   | artifact name    | narrow a v2 build to one `[bin.<name>]` artifact |
+| `--lib <name>`   | artifact name    | narrow a v2 build to one `[lib.<name>]` artifact (mutually exclusive with `--bin`) |
 | `-o <path>`      | path             | override the linked-binary path, rooted at the project root (build/run/test) |
-| `--artifacts <dir>` | dir           | override the per-target object directory, rooted at `<dir_out>` (build/run/test) |
-| `--emit-asm`     | —                | emit per-module assembly text (`.s`) beside each object |
-| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`) beside each object |
+| `--artifacts <dir>` | dir           | override the per-target object directory, rooted at `<dir_out>` (old manifest only) |
+| `--emit-asm`     | —                | emit per-module assembly text (`.s`); on a v2 manifest, forces the profile toggle on |
+| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`); on a v2 manifest, forces the profile toggle on |
+| `--no-emit-asm`  | —                | force per-module assembly emission off, overriding a v2 profile's `emit_asm` |
+| `--no-emit-ir`   | —                | force per-module IR emission off, overriding a v2 profile's `emit_ir` |
 | `--verify-ir`    | —                | run the IR verifier after each optimisation pass |
 
 > `mach dep` and `mach init` do not use the shared config parser; they read only
@@ -171,43 +177,63 @@ Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
 mach dep <action> [args]
 ```
 
-Manages git-backed dependencies under `<dir_dep>`. Dispatches on `argv[2]`. A
-dependency is a git URL plus a ref; `mach dep` clones it into
-`<dir_dep>/<alias>/` and records the resolved commit in a lockfile.
+Manages the project's dependency tree under `<dir_dep>`. Dispatches on `argv[2]`.
+A dependency has exactly one source form: a **git** URL plus a ref, which mach
+acquires into `<dir_dep>/<name>/` with plain git operations, or a **path** into
+the project's own tree, which is never fetched.
 
 | Action   | Args | Effect |
 |----------|------|--------|
-| `list`   | — | print each `[deps.<alias>]` entry from `mach.toml`, with its `url=` and `ref=` |
-| `add`    | `<alias> <url> [--ref <ref>]` | append a `[deps.<alias>]` entry to `mach.toml`, then `sync` |
-| `remove` | `<alias> [--purge]` | drop the entry from `mach.toml` and `mach.lock`; `--purge` also deletes `<dir_dep>/<alias>/` |
-| `sync`   | — | fetch every declared dep into `<dir_dep>/<alias>/`, honouring `mach.lock` |
-| `vendor` | — | alias for `sync` — materialise all deps under `<dir_dep>` for committing into the project |
+| `pull`   | — | realise the manifest: clone missing git deps (transitively), re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; the command routine use needs. |
+| `update` | `<name> \| --all` | the only lock-advancer: re-resolve branch refs to current remote tips. Tag/commit refs are an immutable no-op. Never edits the manifest. |
+| `add`    | `<name> --git <url> [--ref <ref>] \| --path <dir>` | append a `[deps.<name>]` stanza in the manifest's own format, then `pull`. |
+| `remove` | `<name> [--purge]` | drop the entry from `mach.toml` and `mach.lock`; `--purge` also deletes `<dir_dep>/<name>/`. |
+| `list`   | — | print each `[deps.<name>]` entry with its source form, ref, locked commit, and state (`synced`/`missing`/`drifted`/`path`). |
 
-### Git fetch
+`sync` is the pre-`pull` name, kept one cycle as a hidden alias that prints a
+deprecation note and runs `pull`.
 
-`mach dep` shells out to the `git` on `PATH` (resolved by scanning `$PATH`, since
-the process spawn API uses `execve` with no path search). For each declared git
-dependency `sync`:
+### Transport policy
 
-1. clones the `url` into `<dir_dep>/<alias>/` if no clone is present there;
-2. checks out the `ref` as a **detached HEAD** (`git checkout --detach`), so the
-   working tree sits on a concrete commit;
-3. reads the resolved commit SHA from `<alias>/.git/HEAD` and records it.
+`mach build` never requires git or the network: a project whose dep tree is
+present builds on a bare machine. Only the network-shaped commands (`pull`,
+`update`, `add`) use git — the single fetch transport, discovered on `PATH`
+(scanned directly, since the spawn API uses `execve` with no path search) and
+invoked with an allowlisted environment (`PATH`, `HOME`, and the common
+git/ssh/proxy/CA variables). Git's absence is a clean error naming the operation
+that needed it.
 
-The child process receives an allowlisted environment (`PATH`, `HOME`, and the
-common git/ssh/proxy/CA variables) so https and ssh transports work.
+For each git dependency, `pull` clones the `git` URL into `<dir_dep>/<name>/` when
+absent, then checks out the resolved commit as a **detached HEAD**
+(`git checkout --detach`). A ref resolves as: `branch/<n>` (the remote-tracking
+branch tip), `tag/<n>`, `commit/<n>` or a 7–40 char hex SHA (the literal commit),
+the empty ref (the remote default branch), or a bare name auto-detected as a
+remote branch (tracking its tip) else a literal tag/commit. mach performs only
+plain git operations, so a checkout the user also commits as a **submodule**
+composes naturally — a moved checkout surfaces as gitlink drift in the parent
+repo's `git status`. mach never invokes `git submodule`.
 
-A `ref` is resolved as: an explicit `tag/<name>` or `branch/<name>`; a bare name
-auto-detected as a branch (resolved against `origin/<name>` so a moved branch
-tracks its tip) or a tag; or a 7–40 char hex commit SHA checked out directly.
+A directory present under `<dir_dep>/<name>/` without a `.git` entry, while the
+manifest declares it a git dep, is a hard error: declare it a `path` dependency
+if those are vendored files. (`.git` as a file — a submodule gitlink — counts as
+a checkout.)
+
+### Transitive resolution
+
+Transitive deps resolve into the **flat dep tree**: every git dep, direct or
+transitive, lives at `<dir_dep>/<name>/`, so a dependency's own
+`[target.*].libs` cascade into the consumer's build (see `manifest.md`). The same
+name required from two different sources or refs is a hard error naming both
+requirers; there is no version resolution (reserved for the registry era).
 
 ### Lockfile (`mach.lock`)
 
-After a successful `sync`, `mach dep` writes `mach.lock` — a TOML file recording
-each git dep's `url`, `ref`, and resolved `commit`:
+The manifest is intent; the lock is the record of resolving it. After a `pull`,
+`mach dep` writes `mach.lock` — a TOML file recording each git dep's `url`, `ref`,
+and resolved `commit` (path deps have no lock entry):
 
 ```toml
-# generated by `mach dep sync`; do not edit by hand.
+# generated by `mach dep pull`; do not edit by hand.
 version = 1
 
 [deps.mach-std]
@@ -216,21 +242,19 @@ ref = "branch/dev"
 commit = "6b78ae1e8c3c9cc45e4ab4b916fd191d61e76aff"
 ```
 
-On the next `sync`, a dep with a `commit` in `mach.lock` is checked out at that
-exact commit for reproducibility; delete its lock entry (or the file) to let the
-declared `ref` re-resolve to its current tip. Commit `mach.lock` to pin builds.
+`pull` honours the lock except where the manifest ref was edited — there it
+re-resolves loudly (`re-resolved <name> (manifest ref changed: <old> → <new>)`).
+A checked-out commit that differs from the lock is drift, repaired by `pull` and
+reported, never silent. `update` is the only other writer, advancing branch refs
+to their current tips. The lock writer is idempotent: an up-to-date lock is left
+untouched. Commit `mach.lock` to pin builds.
 
-### Backward compatibility
-
-`sync` only manages directories it cloned (where `<alias>/.git` is a directory).
-A hand-vendored source tree, a symlink, or a git **submodule** (whose `.git` is a
-file) is reported as `vendored <alias> (skipped)`, left untouched, and excluded
-from the lockfile. This is how the compiler's own `dep/mach-std` submodule is
-preserved.
-
-`mach dep list` reads `mach.toml` from the current directory directly (it does
-not walk up to find a project root). Exit codes: `0` ok, `1` user error, `2`
-internal error.
+`mach dep` reads `mach.toml` from the current directory directly (it does not walk
+up to find a project root). Both manifest formats are read during the v2
+transition (see `manifest.md`): a v2 manifest uses `git`/`path`/`ref`; a v1
+manifest (with a plural `[targets.*]` table) reads `url`/`source` and
+`ref`/`version` and has no path-dep form. Exit codes: `0` ok, `1` user error,
+`2` internal error.
 
 ## `mach init`
 
@@ -242,7 +266,7 @@ Scaffolds a new project in `[dir]` (default: the current directory). Writes a
 complete `mach.toml` with a `[project]` block, default targets for
 `linux`/`windows`/`darwin` (on the host ISA), a `[deps.mach-std]` dependency, a
 starter source file, and `dep/mach-std/` cloned from the declared ref (through
-the same path as `mach dep sync`). Refuses to overwrite an existing `mach.toml`,
+the same path as `mach dep pull`). Refuses to overwrite an existing `mach.toml`,
 `src/main.mach`, or `src/lib.mach` unless `--force`; every collision is checked
 before any file is written, so a refused init leaves nothing behind.
 
@@ -276,6 +300,38 @@ hand-written `doc/language/` material is never touched.
 | `--target <name>`| name  | select a `[targets.<name>]` entry for module discovery |
 
 Plus the global flags. Exit codes: `0` ok, `1` user error, `2` internal error.
+
+## `mach info`
+
+```
+mach info [--version]
+```
+
+Prints an at-a-glance identity of the binary: its version, the host (`os/isa`)
+it was built for, and the registered capability surface — the instruction sets,
+operating systems, ABIs, and object formats it can compose into a target. This
+needs no project (it runs from anywhere, with or without a `mach.toml`). The
+output is line-oriented and stable for scripts:
+
+```
+mach 1.3.0
+host: linux/x86_64
+isa: x86_64 aarch64
+os: linux darwin windows
+abi: sysv win64
+object: elf macho coff
+```
+
+The version line and `host:` line fold at compile time; the four capability
+lines are read from the binary's target registries, so they report exactly what
+this build can target. `mach info --version` prints the version string alone on
+one line, for tooling.
+
+| Flag        | Value | Effect |
+|-------------|-------|--------|
+| `--version` | —     | print the version string alone, on one line |
+
+Exit codes: `0` ok, `2` internal error.
 
 ## `mach help`
 

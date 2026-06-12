@@ -48,6 +48,11 @@ $mach.project.version
 $mach.project.root
 ```
 
+> Project metadata now lives at the top-level `$project.*` root
+> (`$project.{id,version,name,description}`), fed from `[project]` in
+> `mach.toml` — see [comptime.md](comptime.md). These `$mach.project.*` paths
+> remain reserved stubs.
+
 ### `$mach.source.*` — current source position (stubs)
 
 ```mach

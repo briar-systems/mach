@@ -6,7 +6,7 @@
 # runtime-dispatch interface plus a process-global registry let per-format
 # implementations (elf, coff, macho) self-register from module init. The back
 # end emits relocations using the abstract `RK_*` kinds; each format maps those
-# to its own machine relocation types through its `relocation_kinds` table.
+# to its own machine relocation types internally with a plain integer compare.
 
 use std.types.result.Result;
 use std.types.string.str;
@@ -46,8 +46,9 @@ pub val SK_BSS:    SectionKind = 3;
 # debug information.
 pub val SK_DEBUG:  SectionKind = 4;
 
-# abstract relocation kinds emitted by the back end. each object format maps
-# these to its own machine relocation types via its `relocation_kinds` table.
+# abstract relocation kinds emitted by the back end — a closed enum owned here.
+# each object format maps these to its own machine relocation types internally
+# with a plain integer compare; `reloc_kind_name` gives a kind its diagnostic name.
 pub def RelocKind: u8;
 
 # 64-bit absolute address (R_X86_64_64 / R_AARCH64_ABS64 / IMAGE_REL_*_ADDR64).
@@ -123,26 +124,31 @@ pub rec Symbol {
     flags:   u32;
 }
 
-# one relocation in an object image. `kind` names an abstract relocation kind
-# (an interned RK_* name); the format writer maps it to a machine type.
+# one relocation in an object image. `kind` is an abstract relocation kind (a
+# closed `RK_*` enum owned here); the format writer maps it to a machine type
+# with a plain integer compare, no interner involved.
 # ---
 # section: index of the section being patched
 # offset:  byte offset of the patch site within that section
-# kind:    interned abstract relocation-kind name ("abs64", "pc32", ...)
+# kind:    abstract relocation kind (one of RK_*)
 # symbol:  interned name of the referenced symbol
 # addend:  constant added to the resolved symbol address
 pub rec Relocation {
     section: u32;
     offset:  u32;
-    kind:    intern.StrId;
+    kind:    RelocKind;
     symbol:  intern.StrId;
     addend:  i64;
 }
 
 # the complete, format-agnostic image the back end builds and the format
-# writer serializes. owns its section/symbol/relocation arrays.
+# writer serializes. owns its section/symbol/relocation arrays. carries the
+# session interner beside `alloc`: every name on the image is an interned StrId
+# that only means anything against this interner, so the format writer resolves
+# names through `image.interner` rather than a captured module global.
 # ---
 # alloc:         allocator backing the owned arrays
+# interner:      session interner backing every StrId name on the image
 # name:          interned object/module name
 # sections:      array of sections
 # section_count: number of sections
@@ -152,6 +158,7 @@ pub rec Relocation {
 # reloc_count:   number of relocations
 pub rec ObjectImage {
     alloc:         *Allocator;
+    interner:      *intern.Interner;
     name:          intern.StrId;
     sections:      *Section;
     section_count: u32;
@@ -268,27 +275,15 @@ pub rec ExecFunction {
     size:       u32;
 }
 
-# one entry in a format's relocation-kind table: the format's mapping of an
-# abstract relocation kind to its machine type and encoding properties.
-# ---
-# id:        abstract relocation kind this entry implements (one of RK_*)
-# name:      interned abstract kind name ("abs64", "pc32", ...)
-# bit_width: width in bits of the patched field
-# pc_rel:    true if the relocation is pc-relative
-pub rec RelocationKind {
-    id:        u32;
-    name:      intern.StrId;
-    bit_width: u32;
-    pc_rel:    bool;
-}
-
 # a format writer: serializes an `ObjectImage` to a relocatable object file at
 # the given path. takes the `IsaVTable` (not the full Target) to break the
 # target↔object-format import cycle; the writer uses only what the ISA exposes
-# (machine type, endianness, pointer width).
+# (machine type, endianness, pointer width). it resolves the image's interned
+# names through `image.interner`, which the back end set when it built the image —
+# no module-global interner is captured.
 # ---
 # arg 0: the instruction-set vtable describing the machine
-# arg 1: the object image to serialize
+# arg 1: the object image to serialize (carries its allocator and interner)
 # arg 2: null-terminated output file path
 # ret:   true on success, or an error string
 pub def WriterFn: fun(*isa.IsaVTable, *ObjectImage, *u8) Result[bool, str];
@@ -298,14 +293,17 @@ pub def WriterFn: fun(*isa.IsaVTable, *ObjectImage, *u8) Result[bool, str];
 # the mirror of `WriterFn`; `parse_object` round-trips what `emit_object`
 # writes. names and relocation kinds are kept interned so the linker matches
 # symbols and maps relocations across objects; section bytes are copied into
-# the image, which owns them through `out.alloc`.
+# the image, which owns them through `out.alloc`. the interner is passed
+# explicitly (like the allocator) and recorded on `out.interner` so the names the
+# parser produces resolve against the linking session's interner.
 # ---
 # arg 0: allocator backing the image's owned section/symbol/relocation arrays
-# arg 1: the object file bytes
-# arg 2: length of the object file bytes
-# arg 3: image to populate (its arrays are allocated here)
+# arg 1: interner the parsed names are interned into and recorded on `out`
+# arg 2: the object file bytes
+# arg 3: length of the object file bytes
+# arg 4: image to populate (its arrays are allocated here)
 # ret:   true on success, or an error string
-pub def ParserFn: fun(*Allocator, *u8, usize, *ObjectImage) Result[bool, str];
+pub def ParserFn: fun(*Allocator, *intern.Interner, *u8, usize, *ObjectImage) Result[bool, str];
 
 # a static-executable writer: serializes the linker's laid-out load segments
 # into a static executable at the given path. like `WriterFn` it takes the
@@ -316,15 +314,16 @@ pub def ParserFn: fun(*Allocator, *u8, usize, *ObjectImage) Result[bool, str];
 # program headers, Mach-O load commands) with a leading header-covering segment.
 # ---
 # arg 0: allocator backing the writer's output buffer
-# arg 1: the instruction-set vtable describing the machine
-# arg 2: the loadable segments, in ascending virtual-address order
-# arg 3: number of load segments
-# arg 4: program entry-point virtual address
-# arg 5: per-function descriptors (may be nil when count is 0)
-# arg 6: number of per-function descriptors
-# arg 7: null-terminated output file path
+# arg 1: interner used to build located I/O-failure diagnostics (may be nil)
+# arg 2: the instruction-set vtable describing the machine
+# arg 3: the loadable segments, in ascending virtual-address order
+# arg 4: number of load segments
+# arg 5: program entry-point virtual address
+# arg 6: per-function descriptors (may be nil when count is 0)
+# arg 7: number of per-function descriptors
+# arg 8: null-terminated output file path
 # ret:   true on success, or an error string
-pub def ExecFn: fun(*Allocator, *isa.IsaVTable, *LoadSegment, u32, u64,
+pub def ExecFn: fun(*Allocator, *intern.Interner, *isa.IsaVTable, *LoadSegment, u32, u64,
                     *ExecFunction, u32, *u8) Result[bool, str];
 
 # a dynamically-linked-executable writer: serializes the linker's laid-out load
@@ -335,29 +334,32 @@ pub def ExecFn: fun(*Allocator, *isa.IsaVTable, *LoadSegment, u32, u64,
 # fixups the linker could not resolve. the writer places each import's call-thunk
 # (ELF PLT stub) in its own layout, then patches every `PltFixup` to point at the
 # matching thunk. like the other writers it takes the `IsaVTable`, not the full
-# Target, to break the target↔object-format import cycle. used in place of
+# Target, to break the target↔object-format import cycle. the interner is passed
+# explicitly so the writer can resolve the interned names the `DynamicInfo` plan
+# carries (sonames, import symbols, interpreter path). used in place of
 # `emit_exec` when `DynamicInfo` carries any dependency or import.
 # ---
-# arg 0: allocator backing the writer's output buffer
-# arg 1: the instruction-set vtable describing the machine
-# arg 2: the loadable segments, in ascending virtual-address order
-# arg 3: number of load segments
-# arg 4: program entry-point virtual address
-# arg 5: per-function descriptors (may be nil when count is 0)
-# arg 6: number of per-function descriptors
-# arg 7: the dynamic-link plan (dependencies, imports, interpreter)
-# arg 8: the import call-site fixups to redirect to call-thunks
-# arg 9: number of fixups
-# arg 10: null-terminated output file path
-# ret:   true on success, or an error string
-pub def DynExecFn: fun(*Allocator, *isa.IsaVTable, *LoadSegment, u32, u64,
+# arg 0:  allocator backing the writer's output buffer
+# arg 1:  interner resolving the DynamicInfo names (sonames, imports, interp)
+# arg 2:  the instruction-set vtable describing the machine
+# arg 3:  the loadable segments, in ascending virtual-address order
+# arg 4:  number of load segments
+# arg 5:  program entry-point virtual address
+# arg 6:  per-function descriptors (may be nil when count is 0)
+# arg 7:  number of per-function descriptors
+# arg 8:  the dynamic-link plan (dependencies, imports, interpreter)
+# arg 9:  the import call-site fixups to redirect to call-thunks
+# arg 10: number of fixups
+# arg 11: null-terminated output file path
+# ret:    true on success, or an error string
+pub def DynExecFn: fun(*Allocator, *intern.Interner, *isa.IsaVTable, *LoadSegment, u32, u64,
                        *ExecFunction, u32, *DynamicInfo, *PltFixup, u32, *u8) Result[bool, str];
 
 # the object-format runtime-dispatch interface. exactly one of these exists
 # per format; the back end serializes through `emit_object`, the linker reads
 # through `parse_object` and writes executables through `emit_exec` (or
-# `emit_dyn_exec` for a dynamic link), and all consult `relocation_kinds` to map
-# abstract relocations. it never branches on `id`.
+# `emit_dyn_exec` for a dynamic link). each format maps the abstract `RK_*`
+# kinds to its own machine relocation types internally. it never branches on `id`.
 # ---
 # id:               object-format id (one of OF_*)
 # name:             interned format name ("elf", "coff", "macho")
@@ -367,8 +369,6 @@ pub def DynExecFn: fun(*Allocator, *isa.IsaVTable, *LoadSegment, u32, u64,
 # emit_exec:        serializes laid-out load segments into a static executable
 # emit_dyn_exec:    serializes them into a dynamically-linked executable, or nil
 #                   when the format has no dynamic-link writer yet
-# relocation_kinds: array mapping abstract RK_* kinds to machine types
-# relocation_count: number of relocation-kind entries
 pub rec OfVTable {
     id:               u32;
     name:             intern.StrId;
@@ -377,8 +377,6 @@ pub rec OfVTable {
     parse_object:     ParserFn;
     emit_exec:        ExecFn;
     emit_dyn_exec:    DynExecFn;
-    relocation_kinds: *RelocationKind;
-    relocation_count: u32;
 }
 
 val OF_REGISTRY_CAP: u32 = 8;
@@ -423,22 +421,52 @@ pub fun lookup(of_id: u32) Option[*OfVTable] {
     ret some[*OfVTable](of_registry[of_id]);
 }
 
-# reloc_kind_name: the interned abstract relocation-kind name an `RK_*` id maps
-# to in a format vtable's `relocation_kinds` table — the StrId a `Relocation.kind`
-# must carry so the format writer matches it. returns intern.STR_NIL for a nil
-# vtable or an unmapped kind.
-# ---
-# vt:   the object-format vtable (nil yields STR_NIL)
-# kind: the abstract relocation kind (one of RK_*)
-# ret:  the interned kind name, or intern.STR_NIL
-pub fun reloc_kind_name(vt: *OfVTable, kind: RelocKind) intern.StrId {
-    if (vt == nil) { ret intern.STR_NIL; }
+# registered_count: the number of object-format implementations registered.
+# ret: count of non-empty registry slots
+pub fun registered_count() u32 {
+    ensure_of_registry();
+    var n: u32 = 0;
     var i: u32 = 0;
-    for (i < vt.relocation_count) {
-        if (vt.relocation_kinds[i].id == kind::u32) {
-            ret vt.relocation_kinds[i].name;
+    for (i < OF_REGISTRY_CAP) {
+        if (of_registry[i] != nil) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# registered: the object-format vtable at enumeration index `idx` (0-based, in
+# id order), skipping empty slots. pairs with registered_count to walk the
+# registry.
+# ---
+# idx: enumeration index in [0, registered_count)
+# ret: the vtable at that index, or none when idx is out of range
+pub fun registered(idx: u32) Option[*OfVTable] {
+    ensure_of_registry();
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < OF_REGISTRY_CAP) {
+        if (of_registry[i] != nil) {
+            if (n == idx) { ret some[*OfVTable](of_registry[i]); }
+            n = n + 1;
         }
         i = i + 1;
     }
-    ret intern.STR_NIL;
+    ret none[*OfVTable]();
+}
+
+# reloc_kind_name: the stable, format-independent name of an abstract relocation
+# kind, for diagnostics. unlike a format's machine mapping this is a plain string
+# constant — no interner, no per-format table — so any layer can name a kind in an
+# error without resolving an interned id.
+# ---
+# kind: the abstract relocation kind (one of RK_*)
+# ret:  the kind's diagnostic name, or "unknown" for an unrecognized id
+pub fun reloc_kind_name(kind: RelocKind) str {
+    if (kind == RK_ABS64)    { ret "abs64"; }
+    if (kind == RK_PC32)     { ret "pc32"; }
+    if (kind == RK_PLT32)    { ret "plt32"; }
+    if (kind == RK_GOTPCREL) { ret "gotpcrel"; }
+    if (kind == RK_ABS32S)   { ret "abs32s"; }
+    if (kind == RK_ADDR32NB) { ret "addr32nb"; }
+    ret "unknown";
 }

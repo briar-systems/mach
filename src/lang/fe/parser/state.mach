@@ -16,15 +16,13 @@ use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.reallocate;
 use std.allocator.deallocate;
 
 use token:  mach.lang.fe.token;
 use lexer:  mach.lang.fe.lexer;
 use diag:   mach.lang.diagnostic;
 use ast:    mach.lang.fe.ast;
+use pool:   mach.lang.fe.pool;
 use id:     mach.lang.fe.ast.id;
 use expr:   mach.lang.fe.ast.expr;
 use stmt:   mach.lang.fe.ast.stmt;
@@ -204,6 +202,22 @@ pub fun fatal_oom(p: *Parser) {
     fatal_oom_at(p, current(p).span);
 }
 
+# fatal_ice_at: records an internal compiler error at `span`. an ICE is a real
+# compiler defect (not a malformed program), so it bypasses the `panic` guard,
+# carries the `internal compiler error:` prefix, and sets the sticky `fatal`
+# flag so the driver refuses to consume the (now suspect) AST instead of
+# letting downstream passes read it out of bounds.
+# ---
+# p:       parser state
+# span:    span to pin the diagnostic to
+# message: description of the invariant that was violated
+pub fun fatal_ice_at(p: *Parser, span: token.Span, message: str) {
+    if (p.fatal) { ret; }
+    p.fatal = true;
+    val r: Result[bool, str] = diag.error(p.diags, p.tokens.file_id, span, message);
+    if (is_err[bool, str](r)) { ret; }
+}
+
 # sync_to: advances until the current token is EOF or matches one of the synchronization kinds, then clears panic.
 # ---
 # p:  parser state
@@ -351,60 +365,62 @@ pub fun push_decl_id(p: *Parser, id_: id.DeclId) u32 {
     ret unwrap_ok[u32, str](r);
 }
 
-# DeclIdBuf: a temporary, contiguous buffer of DeclIds collected while
-# parsing a decl-list (a module body or a comptime branch body). because the
-# `ast.decl_ids` pool is shared and append-only, pushing a parent list's ids
-# directly would interleave with the ids a nested decl-list (e.g. a comptime
-# branch body) pushes mid-parse, breaking the parent's contiguous (start,len)
-# slice. buffering the parent's direct children and flushing them as one block
-# after all nested lists are parsed keeps every slice contiguous and disjoint.
+# ListBuf: a temporary, contiguous buffer of elements collected while parsing
+# one nested list. the matching `ast.*` pool is shared and append-only, and
+# fully parsing one element can append that element's own children to the same
+# pool mid-parse; buffering the parent's direct elements here and flushing them
+# as one block after every nested parse keeps each node's (start, len) slice
+# contiguous and disjoint. each pool keeps its own thin `*_buf_flush` helper
+# that appends the buffer to its pool and frees it.
 # ---
-# data: heap buffer of collected DeclIds
-# len:  number of ids buffered
+# data: heap buffer of collected elements
+# len:  number of elements buffered
 # cap:  allocated slots
-pub rec DeclIdBuf {
-    data: *id.DeclId;
-    len:  u32;
-    cap:  u32;
+pub rec ListBuf[T] {
+    data: *T;
+    len:  usize;
+    cap:  usize;
 }
 
-# decl_id_buf_init: start an empty DeclIdBuf.
-pub fun decl_id_buf_init() DeclIdBuf {
-    var b: DeclIdBuf;
+# list_buf_init: start an empty ListBuf.
+pub fun list_buf_init[T]() ListBuf[T] {
+    var b: ListBuf[T];
     b.data = nil;
     b.len  = 0;
     b.cap  = 0;
     ret b;
 }
 
-# decl_id_buf_push: buffer one DeclId, growing on demand. on allocation
-# failure it reports through the parser and leaves the buffer unchanged.
-pub fun decl_id_buf_push(p: *Parser, b: *DeclIdBuf, id_: id.DeclId) {
+# list_buf_push: buffer one element, growing on demand (seeded at 8, then
+# doubling). on allocation failure it flags the parse fatal and leaves the
+# buffer unchanged.
+pub fun list_buf_push[T](p: *Parser, b: *ListBuf[T], x: T) {
     if (b.len == b.cap) {
-        var new_cap: u32 = b.cap * 2;
-        if (new_cap == 0) { new_cap = 8; }
-        if (b.data == nil) {
-            val r: Result[*id.DeclId, str] = allocate[id.DeclId](p.ast.alloc, new_cap::usize);
-            if (is_err[*id.DeclId, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*id.DeclId, str](r);
-        }
-        or {
-            val r: Result[*id.DeclId, str] = reallocate[id.DeclId](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
-            if (is_err[*id.DeclId, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*id.DeclId, str](r);
-        }
-        b.cap = new_cap;
+        val r: Result[*T, str] = pool.grow[T](p.ast.alloc, b.data, b.cap, 8, ?b.cap);
+        if (is_err[*T, str](r)) { fatal_oom(p); ret; }
+        b.data = unwrap_ok[*T, str](r);
     }
-    b.data[b.len] = id_;
+    b.data[b.len] = x;
     b.len = b.len + 1;
+}
+
+# list_buf_free: release a buffer's storage and reset it to empty. the shared
+# tail of every `*_buf_flush`.
+pub fun list_buf_free[T](p: *Parser, b: *ListBuf[T]) {
+    if (b.data != nil && b.cap > 0) {
+        deallocate[T](p.ast.alloc, b.data, b.cap);
+    }
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
 }
 
 # decl_id_buf_flush: append the buffered DeclIds to `ast.decl_ids` as one
 # contiguous block and free the buffer. returns the pool start index of the
 # block (the run's `decls_start`/`body_start`); `*out_len` receives its length.
-pub fun decl_id_buf_flush(p: *Parser, b: *DeclIdBuf, out_len: *u32) u32 {
+pub fun decl_id_buf_flush(p: *Parser, b: *ListBuf[id.DeclId], out_len: *u32) u32 {
     val start: u32 = p.ast.decl_id_len::u32;
-    var i: u32 = 0;
+    var i: usize = 0;
     for (i < b.len) {
         push_decl_id(p, b.data[i]);
         i = i + 1;
@@ -412,70 +428,16 @@ pub fun decl_id_buf_flush(p: *Parser, b: *DeclIdBuf, out_len: *u32) u32 {
     # the count actually appended, not b.len: a fatal alloc failure mid-flush
     # leaves the slice covering only the ids that reached the pool.
     @out_len = (p.ast.decl_id_len::u32) - start;
-    if (b.data != nil && b.cap > 0) {
-        deallocate[id.DeclId](p.ast.alloc, b.data, b.cap::usize);
-    }
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
+    list_buf_free[id.DeclId](p, b);
     ret start;
-}
-
-# ExprIdBuf: a temporary, contiguous buffer of ExprIds collected while parsing
-# an expr-list (call arguments, array-literal elements). the `ast.expr_ids`
-# pool is shared and append-only, and parsing one element fully — including any
-# nested call/array-literal it contains — appends that element's own child ids
-# to the same pool. pushing the parent's element ids directly would therefore
-# interleave with a nested element's ids, corrupting the parent's (start, len)
-# slice. buffering the parent's direct elements and flushing them as one block
-# after every nested parse completes keeps each slice contiguous and disjoint.
-# ---
-# data: heap buffer of collected ExprIds
-# len:  number of ids buffered
-# cap:  allocated slots
-pub rec ExprIdBuf {
-    data: *id.ExprId;
-    len:  u32;
-    cap:  u32;
-}
-
-# expr_id_buf_init: start an empty ExprIdBuf.
-pub fun expr_id_buf_init() ExprIdBuf {
-    var b: ExprIdBuf;
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
-    ret b;
-}
-
-# expr_id_buf_push: buffer one ExprId, growing on demand. on allocation failure
-# it reports through the parser and leaves the buffer unchanged.
-pub fun expr_id_buf_push(p: *Parser, b: *ExprIdBuf, id_: id.ExprId) {
-    if (b.len == b.cap) {
-        var new_cap: u32 = b.cap * 2;
-        if (new_cap == 0) { new_cap = 8; }
-        if (b.data == nil) {
-            val r: Result[*id.ExprId, str] = allocate[id.ExprId](p.ast.alloc, new_cap::usize);
-            if (is_err[*id.ExprId, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*id.ExprId, str](r);
-        }
-        or {
-            val r: Result[*id.ExprId, str] = reallocate[id.ExprId](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
-            if (is_err[*id.ExprId, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*id.ExprId, str](r);
-        }
-        b.cap = new_cap;
-    }
-    b.data[b.len] = id_;
-    b.len = b.len + 1;
 }
 
 # expr_id_buf_flush: append the buffered ExprIds to `ast.expr_ids` as one
 # contiguous block and free the buffer. returns the pool start index of the
 # block (the list's `args_start`/`elems_start`); `*out_len` receives its length.
-pub fun expr_id_buf_flush(p: *Parser, b: *ExprIdBuf, out_len: *u32) u32 {
+pub fun expr_id_buf_flush(p: *Parser, b: *ListBuf[id.ExprId], out_len: *u32) u32 {
     val start: u32 = p.ast.expr_id_len::u32;
-    var i: u32 = 0;
+    var i: usize = 0;
     for (i < b.len) {
         push_expr_id(p, b.data[i]);
         i = i + 1;
@@ -483,69 +445,16 @@ pub fun expr_id_buf_flush(p: *Parser, b: *ExprIdBuf, out_len: *u32) u32 {
     # the count actually appended, not b.len: a fatal alloc failure mid-flush
     # leaves the slice covering only the ids that reached the pool.
     @out_len = (p.ast.expr_id_len::u32) - start;
-    if (b.data != nil && b.cap > 0) {
-        deallocate[id.ExprId](p.ast.alloc, b.data, b.cap::usize);
-    }
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
+    list_buf_free[id.ExprId](p, b);
     ret start;
-}
-
-# TypeIdBuf: a temporary, contiguous buffer of TypeIds collected while parsing
-# a type-list (call-site or named-type generic arguments, function-type
-# parameters). the `ast.type_ids` pool is shared and append-only, and parsing
-# one element fully — including any nested generic type it contains — appends
-# that element's own child ids to the same pool. buffering the parent's direct
-# elements and flushing them after every nested parse completes keeps each
-# slice contiguous and disjoint, exactly as ExprIdBuf does for expr-lists.
-# ---
-# data: heap buffer of collected TypeIds
-# len:  number of ids buffered
-# cap:  allocated slots
-pub rec TypeIdBuf {
-    data: *id.TypeId;
-    len:  u32;
-    cap:  u32;
-}
-
-# type_id_buf_init: start an empty TypeIdBuf.
-pub fun type_id_buf_init() TypeIdBuf {
-    var b: TypeIdBuf;
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
-    ret b;
-}
-
-# type_id_buf_push: buffer one TypeId, growing on demand. on allocation failure
-# it reports through the parser and leaves the buffer unchanged.
-pub fun type_id_buf_push(p: *Parser, b: *TypeIdBuf, id_: id.TypeId) {
-    if (b.len == b.cap) {
-        var new_cap: u32 = b.cap * 2;
-        if (new_cap == 0) { new_cap = 8; }
-        if (b.data == nil) {
-            val r: Result[*id.TypeId, str] = allocate[id.TypeId](p.ast.alloc, new_cap::usize);
-            if (is_err[*id.TypeId, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*id.TypeId, str](r);
-        }
-        or {
-            val r: Result[*id.TypeId, str] = reallocate[id.TypeId](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
-            if (is_err[*id.TypeId, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*id.TypeId, str](r);
-        }
-        b.cap = new_cap;
-    }
-    b.data[b.len] = id_;
-    b.len = b.len + 1;
 }
 
 # type_id_buf_flush: append the buffered TypeIds to `ast.type_ids` as one
 # contiguous block and free the buffer. returns the pool start index of the
 # block (the list's `args_start`/`params_start`); `*out_len` receives its length.
-pub fun type_id_buf_flush(p: *Parser, b: *TypeIdBuf, out_len: *u32) u32 {
+pub fun type_id_buf_flush(p: *Parser, b: *ListBuf[id.TypeId], out_len: *u32) u32 {
     val start: u32 = p.ast.type_id_len::u32;
-    var i: u32 = 0;
+    var i: usize = 0;
     for (i < b.len) {
         push_type_id(p, b.data[i]);
         i = i + 1;
@@ -553,68 +462,16 @@ pub fun type_id_buf_flush(p: *Parser, b: *TypeIdBuf, out_len: *u32) u32 {
     # the count actually appended, not b.len: a fatal alloc failure mid-flush
     # leaves the slice covering only the ids that reached the pool.
     @out_len = (p.ast.type_id_len::u32) - start;
-    if (b.data != nil && b.cap > 0) {
-        deallocate[id.TypeId](p.ast.alloc, b.data, b.cap::usize);
-    }
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
+    list_buf_free[id.TypeId](p, b);
     ret start;
-}
-
-# FieldInitBuf: a temporary, contiguous buffer of FieldInits collected while
-# parsing a struct literal's field list. the `ast.field_inits` pool is shared
-# and append-only, and a field's initializer may itself be a nested struct
-# literal that appends its own FieldInits to the same pool. buffering the
-# parent's direct fields and flushing them after every nested parse completes
-# keeps each literal's (start, len) slice contiguous and disjoint.
-# ---
-# data: heap buffer of collected FieldInits
-# len:  number of entries buffered
-# cap:  allocated slots
-pub rec FieldInitBuf {
-    data: *expr.FieldInit;
-    len:  u32;
-    cap:  u32;
-}
-
-# field_init_buf_init: start an empty FieldInitBuf.
-pub fun field_init_buf_init() FieldInitBuf {
-    var b: FieldInitBuf;
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
-    ret b;
-}
-
-# field_init_buf_push: buffer one FieldInit, growing on demand. on allocation
-# failure it reports through the parser and leaves the buffer unchanged.
-pub fun field_init_buf_push(p: *Parser, b: *FieldInitBuf, fi: expr.FieldInit) {
-    if (b.len == b.cap) {
-        var new_cap: u32 = b.cap * 2;
-        if (new_cap == 0) { new_cap = 8; }
-        if (b.data == nil) {
-            val r: Result[*expr.FieldInit, str] = allocate[expr.FieldInit](p.ast.alloc, new_cap::usize);
-            if (is_err[*expr.FieldInit, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*expr.FieldInit, str](r);
-        }
-        or {
-            val r: Result[*expr.FieldInit, str] = reallocate[expr.FieldInit](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
-            if (is_err[*expr.FieldInit, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*expr.FieldInit, str](r);
-        }
-        b.cap = new_cap;
-    }
-    b.data[b.len] = fi;
-    b.len = b.len + 1;
 }
 
 # field_init_buf_flush: append the buffered FieldInits to `ast.field_inits` as
 # one contiguous block and free the buffer. returns the pool start index of the
 # block (the literal's `fields_start`); `*out_len` receives its length.
-pub fun field_init_buf_flush(p: *Parser, b: *FieldInitBuf, out_len: *u32) u32 {
+pub fun field_init_buf_flush(p: *Parser, b: *ListBuf[expr.FieldInit], out_len: *u32) u32 {
     val start: u32 = p.ast.field_init_len::u32;
-    var i: u32 = 0;
+    var i: usize = 0;
     for (i < b.len) {
         val r: Result[u32, str] = ast.add_field_init(p.ast, b.data[i]);
         if (is_err[u32, str](r)) { fatal_oom(p); }
@@ -623,69 +480,16 @@ pub fun field_init_buf_flush(p: *Parser, b: *FieldInitBuf, out_len: *u32) u32 {
     # the count actually appended, not b.len: a fatal alloc failure mid-flush
     # leaves the slice covering only the entries that reached the pool.
     @out_len = (p.ast.field_init_len::u32) - start;
-    if (b.data != nil && b.cap > 0) {
-        deallocate[expr.FieldInit](p.ast.alloc, b.data, b.cap::usize);
-    }
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
+    list_buf_free[expr.FieldInit](p, b);
     ret start;
-}
-
-# TypedNameBuf: a temporary, contiguous buffer of TypedNames collected while
-# parsing a typed-name list (function parameters, record/union fields). the
-# `ast.typed_names` pool is shared and append-only, and a parameter or field
-# whose type is an inline anonymous `rec {...}` / `uni {...}` appends that
-# inline type's own fields to the same pool mid-parse. buffering the parent's
-# direct entries and flushing them after every nested parse completes keeps
-# each list's (start, len) slice contiguous and disjoint.
-# ---
-# data: heap buffer of collected TypedNames
-# len:  number of entries buffered
-# cap:  allocated slots
-pub rec TypedNameBuf {
-    data: *decl.TypedName;
-    len:  u32;
-    cap:  u32;
-}
-
-# typed_name_buf_init: start an empty TypedNameBuf.
-pub fun typed_name_buf_init() TypedNameBuf {
-    var b: TypedNameBuf;
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
-    ret b;
-}
-
-# typed_name_buf_push: buffer one TypedName, growing on demand. on allocation
-# failure it reports through the parser and leaves the buffer unchanged.
-pub fun typed_name_buf_push(p: *Parser, b: *TypedNameBuf, tn: decl.TypedName) {
-    if (b.len == b.cap) {
-        var new_cap: u32 = b.cap * 2;
-        if (new_cap == 0) { new_cap = 8; }
-        if (b.data == nil) {
-            val r: Result[*decl.TypedName, str] = allocate[decl.TypedName](p.ast.alloc, new_cap::usize);
-            if (is_err[*decl.TypedName, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*decl.TypedName, str](r);
-        }
-        or {
-            val r: Result[*decl.TypedName, str] = reallocate[decl.TypedName](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
-            if (is_err[*decl.TypedName, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*decl.TypedName, str](r);
-        }
-        b.cap = new_cap;
-    }
-    b.data[b.len] = tn;
-    b.len = b.len + 1;
 }
 
 # typed_name_buf_flush: append the buffered TypedNames to `ast.typed_names` as
 # one contiguous block and free the buffer. returns the pool start index of the
 # block (the list's `params_start`/`fields_start`); `*out_len` receives its length.
-pub fun typed_name_buf_flush(p: *Parser, b: *TypedNameBuf, out_len: *u32) u32 {
+pub fun typed_name_buf_flush(p: *Parser, b: *ListBuf[decl.TypedName], out_len: *u32) u32 {
     val start: u32 = p.ast.typed_name_len::u32;
-    var i: u32 = 0;
+    var i: usize = 0;
     for (i < b.len) {
         val r: Result[u32, str] = ast.add_typed_name(p.ast, b.data[i]);
         if (is_err[u32, str](r)) { fatal_oom(p); }
@@ -694,68 +498,16 @@ pub fun typed_name_buf_flush(p: *Parser, b: *TypedNameBuf, out_len: *u32) u32 {
     # the count actually appended, not b.len: a fatal alloc failure mid-flush
     # leaves the slice covering only the entries that reached the pool.
     @out_len = (p.ast.typed_name_len::u32) - start;
-    if (b.data != nil && b.cap > 0) {
-        deallocate[decl.TypedName](p.ast.alloc, b.data, b.cap::usize);
-    }
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
+    list_buf_free[decl.TypedName](p, b);
     ret start;
-}
-
-# StmtIdBuf: a temporary, contiguous buffer of StmtIds collected while parsing
-# a block or comptime-branch statement body. the `ast.stmt_ids` pool is shared
-# and append-only, and a statement that contains a nested block (an inner `{}`,
-# or an `if`/`for` body) appends that block's own statement ids to the same pool
-# mid-parse. buffering the parent's direct statements and flushing them after
-# every nested parse completes keeps each body's (start, len) slice contiguous.
-# ---
-# data: heap buffer of collected StmtIds
-# len:  number of ids buffered
-# cap:  allocated slots
-pub rec StmtIdBuf {
-    data: *id.StmtId;
-    len:  u32;
-    cap:  u32;
-}
-
-# stmt_id_buf_init: start an empty StmtIdBuf.
-pub fun stmt_id_buf_init() StmtIdBuf {
-    var b: StmtIdBuf;
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
-    ret b;
-}
-
-# stmt_id_buf_push: buffer one StmtId, growing on demand. on allocation failure
-# it reports through the parser and leaves the buffer unchanged.
-pub fun stmt_id_buf_push(p: *Parser, b: *StmtIdBuf, id_: id.StmtId) {
-    if (b.len == b.cap) {
-        var new_cap: u32 = b.cap * 2;
-        if (new_cap == 0) { new_cap = 8; }
-        if (b.data == nil) {
-            val r: Result[*id.StmtId, str] = allocate[id.StmtId](p.ast.alloc, new_cap::usize);
-            if (is_err[*id.StmtId, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*id.StmtId, str](r);
-        }
-        or {
-            val r: Result[*id.StmtId, str] = reallocate[id.StmtId](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
-            if (is_err[*id.StmtId, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*id.StmtId, str](r);
-        }
-        b.cap = new_cap;
-    }
-    b.data[b.len] = id_;
-    b.len = b.len + 1;
 }
 
 # stmt_id_buf_flush: append the buffered StmtIds to `ast.stmt_ids` as one
 # contiguous block and free the buffer. returns the pool start index of the
 # block (the body's `stmts_start`/`body_start`); `*out_len` receives its length.
-pub fun stmt_id_buf_flush(p: *Parser, b: *StmtIdBuf, out_len: *u32) u32 {
+pub fun stmt_id_buf_flush(p: *Parser, b: *ListBuf[id.StmtId], out_len: *u32) u32 {
     val start: u32 = p.ast.stmt_id_len::u32;
-    var i: u32 = 0;
+    var i: usize = 0;
     for (i < b.len) {
         push_stmt_id(p, b.data[i]);
         i = i + 1;
@@ -763,70 +515,17 @@ pub fun stmt_id_buf_flush(p: *Parser, b: *StmtIdBuf, out_len: *u32) u32 {
     # the count actually appended, not b.len: a fatal alloc failure mid-flush
     # leaves the slice covering only the ids that reached the pool.
     @out_len = (p.ast.stmt_id_len::u32) - start;
-    if (b.data != nil && b.cap > 0) {
-        deallocate[id.StmtId](p.ast.alloc, b.data, b.cap::usize);
-    }
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
+    list_buf_free[id.StmtId](p, b);
     ret start;
-}
-
-# ComptimeBranchBuf: a temporary, contiguous buffer of ComptimeBranches
-# collected while parsing one `$if`/`$or` chain. the `ast.comptime_branches`
-# pool is shared and append-only, and a branch body may contain a nested
-# `$if`/`$or` chain that appends its own branches to the same pool mid-parse.
-# buffering this chain's direct branches and flushing them after every nested
-# parse completes keeps each chain's (start, len) slice contiguous and disjoint.
-# ---
-# data: heap buffer of collected ComptimeBranches
-# len:  number of branches buffered
-# cap:  allocated slots
-pub rec ComptimeBranchBuf {
-    data: *decl.ComptimeBranch;
-    len:  u32;
-    cap:  u32;
-}
-
-# comptime_branch_buf_init: start an empty ComptimeBranchBuf.
-pub fun comptime_branch_buf_init() ComptimeBranchBuf {
-    var b: ComptimeBranchBuf;
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
-    ret b;
-}
-
-# comptime_branch_buf_push: buffer one ComptimeBranch, growing on demand. on
-# allocation failure it reports through the parser and leaves the buffer
-# unchanged.
-pub fun comptime_branch_buf_push(p: *Parser, b: *ComptimeBranchBuf, br: decl.ComptimeBranch) {
-    if (b.len == b.cap) {
-        var new_cap: u32 = b.cap * 2;
-        if (new_cap == 0) { new_cap = 8; }
-        if (b.data == nil) {
-            val r: Result[*decl.ComptimeBranch, str] = allocate[decl.ComptimeBranch](p.ast.alloc, new_cap::usize);
-            if (is_err[*decl.ComptimeBranch, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*decl.ComptimeBranch, str](r);
-        }
-        or {
-            val r: Result[*decl.ComptimeBranch, str] = reallocate[decl.ComptimeBranch](p.ast.alloc, b.data, b.cap::usize, new_cap::usize);
-            if (is_err[*decl.ComptimeBranch, str](r)) { fatal_oom(p); ret; }
-            b.data = unwrap_ok[*decl.ComptimeBranch, str](r);
-        }
-        b.cap = new_cap;
-    }
-    b.data[b.len] = br;
-    b.len = b.len + 1;
 }
 
 # comptime_branch_buf_flush: append the buffered ComptimeBranches to
 # `ast.comptime_branches` as one contiguous block and free the buffer. returns
 # the pool start index of the block (the chain's `branches_start`); `*out_len`
 # receives its length.
-pub fun comptime_branch_buf_flush(p: *Parser, b: *ComptimeBranchBuf, out_len: *u32) u32 {
+pub fun comptime_branch_buf_flush(p: *Parser, b: *ListBuf[decl.ComptimeBranch], out_len: *u32) u32 {
     val start: u32 = p.ast.comptime_branch_len::u32;
-    var i: u32 = 0;
+    var i: usize = 0;
     for (i < b.len) {
         val r: Result[u32, str] = ast.add_comptime_branch(p.ast, b.data[i]);
         if (is_err[u32, str](r)) { fatal_oom(p); }
@@ -835,12 +534,7 @@ pub fun comptime_branch_buf_flush(p: *Parser, b: *ComptimeBranchBuf, out_len: *u
     # the count actually appended, not b.len: a fatal alloc failure mid-flush
     # leaves the slice covering only the branches that reached the pool.
     @out_len = (p.ast.comptime_branch_len::u32) - start;
-    if (b.data != nil && b.cap > 0) {
-        deallocate[decl.ComptimeBranch](p.ast.alloc, b.data, b.cap::usize);
-    }
-    b.data = nil;
-    b.len  = 0;
-    b.cap  = 0;
+    list_buf_free[decl.ComptimeBranch](p, b);
     ret start;
 }
 
