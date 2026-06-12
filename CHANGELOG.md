@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped the vendored mach-std to v0.6.0 (adds `std.process.env.environ()`).
+
 ### Fixed
 
+- `mach test` and `mach run` now forward the parent environment to spawned
+  user programs instead of execing them with an empty `envp`; `getenv` in a
+  test or run child sees the inherited variables (mach-std#197).
 - Inline-asm comments are now opaque to the instruction parser regardless of
   their bytes. A comment containing `;` was split into a phantom instruction
   and one containing `{...}` was misread as a local binding; comments are now
