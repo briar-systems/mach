@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LICENSE — alongside the existing assets, with `SHA256SUMS` covering the
   full set (#1352).
 
+### Fixed
+
+- Sema reports a teaching diagnostic for every symbol kind that can never be a
+  value reaching value position — a record, union, or `def` type name (local
+  or imported, bare or `alias.member`), a generic type parameter, and a member
+  access on a void expression — instead of silently poisoning and surfacing
+  link `undefined symbol` or span-less lowering errors; completes the #1343
+  silent-poison audit (#1348).
+
 ## [1.4.1] - 2026-06-12
 
 Patch release clearing the open bug board: environment forwarding for spawned
