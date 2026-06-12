@@ -7,13 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-06-12
+
+Patch release clearing the open bug board: environment forwarding for spawned
+user programs, the `-o` absolute-path override, `fwd` module re-export
+consumption, and inline-asm comment handling.
+
+### Changed
+
+- Bumped the vendored mach-std to v0.6.0 (adds `std.process.env.environ()`;
+  fixes the thread spawn/join deadlock and json key lookup).
+
 ### Fixed
 
+- `mach test` and `mach run` now forward the parent environment to spawned
+  user programs instead of execing them with an empty `envp`; `getenv` in a
+  test or run child sees the inherited variables (mach-std#197).
+- An absolute `-o` path is honored verbatim; previously its leading slash was
+  swallowed by an unconditional join with the project root and the output
+  landed project-relative (#1340).
+- A consumer can chain through `fwd` module re-exports in expression position
+  (`lib.alpha.answer()`), at any depth including a `fwd` of another library's
+  `fwd`; a module alias referenced in value position now reports
+  `a module alias is not a value` instead of silently poisoning and surfacing
+  internal lowering errors (#1343).
 - Inline-asm comments are now opaque to the instruction parser regardless of
   their bytes. A comment containing `;` was split into a phantom instruction
   and one containing `{...}` was misread as a local binding; comments are now
   stripped to end-of-line when the asm body is materialized, before any
   substitution or statement tokenization (#1297).
+
+### Removed
+
+- The unused test-runner write-primitive machinery (`RunnerWrite`,
+  `OsVTable.runner_write`): since 1.4.0's per-test executables, test binaries
+  perform no OS output — the host process reports — so the vtable hook had no
+  consumers on any OS (#1292).
 
 ## [1.4.0] - 2026-06-12
 
