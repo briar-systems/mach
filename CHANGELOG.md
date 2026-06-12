@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aliases), reusing the existing conditional-branch and SETcc encoders. Previously
   only `je` / `jz` / `jne` / `jnz` were recognized, forcing carry-flag handling
   through `.byte` escape hatches (#1359).
+- x64 inline assembly accepts NASM-style numeric local labels: a `<digits>:`
+  statement defines a block-local label and `<digits>f` / `<digits>b` branch
+  targets resolve to a rel32 within the function (no relocation). Every branch
+  mnemonic takes a symbol or a local-label target; a backward reference binds to
+  the nearest preceding definition and a forward reference to the nearest
+  following one, redefinition of a number is allowed, and an unresolved or
+  malformed reference is a hard compile error. This unblocks block-local forward
+  branches such as the `jc 1f` / `1:` shape in std's darwin syscall wrappers
+  (#1365).
 
 ### Fixed
 
