@@ -131,8 +131,10 @@ val IMAGE_DIRECTORY_ENTRY_IAT:       u32 = 12;
 val IMAGE_NUMBEROF_DIRECTORY_ENTRIES: u32 = 16;
 
 # PE32+ on-disk structure sizes and alignments. SectionAlignment is the in-memory
-# page granularity; FileAlignment the on-disk granularity; ImageBase is reserved
-# one 64 KiB region below the first segment so the PE headers map at RVA 0.
+# page granularity; FileAlignment the on-disk granularity. ImageBase sits one
+# header span below the first segment so the headers map at RVA 0 and the first
+# section follows immediately, with no unmapped gap (which the Windows loader
+# rejects with ERROR_BAD_EXE_FORMAT).
 val DOS_HEADER_SIZE:     usize = 64;
 val PE_SIGNATURE_SIZE:   usize = 4;
 val OPTIONAL_HEADER_SIZE: usize = 240;
@@ -140,7 +142,6 @@ val OPTIONAL_HEADER_SIZE: usize = 240;
 val DATA_DIR_SIZE:       usize = 8;
 val PE_SECTION_ALIGN:    u64   = 0x1000;
 val PE_FILE_ALIGN:       u64   = 0x200;
-val PE_IMAGE_BASE_RESERVE: u64 = 0x10000;
 
 # one IMAGE_IMPORT_DESCRIPTOR (20 bytes) and one PE thunk slot (8 bytes, PE32+).
 val IMPORT_DESCRIPTOR_SIZE: usize = 20;
@@ -1566,7 +1567,7 @@ rec PeSection {
 # the section-table entries (linker segments + synthesized stubs/import/unwind
 # sections, present only when used).
 # ---
-# image_base:    PE ImageBase (64 KiB-aligned, one reserve region below seg[0])
+# image_base:    PE ImageBase (64 KiB-aligned, one header span below seg[0])
 # header_size:   SizeOfHeaders (file-aligned span of DOS+PE+section headers)
 # image_size:    SizeOfImage (section-aligned span covering every section)
 # seg_secs:      per-linker-segment PeSection (rva/file_off/sizes)
@@ -1939,12 +1940,6 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     lay.have_xdata = xdata_vsize > 0;
     lay.have_pdata = pdata_vsize > 0;
 
-    # ImageBase: 64 KiB-aligned, one reserve region below the first segment's page
-    # so the PE headers map at RVA 0 and segment[0] sits at RVA >= the reserve.
-    var seg0: u64 = 0x140000000;
-    if (seg_count > 0) { seg0 = segs[0].vaddr; }
-    lay.image_base = (seg0 & ~(0xFFFF::u64)) - PE_IMAGE_BASE_RESERVE;
-
     # the synthesized section count: the linker segments, then the stub and idata
     # sections when present.
     var nsec: u32 = seg_count;
@@ -1961,8 +1956,20 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         + OPTIONAL_HEADER_SIZE + nsec::usize * SECTION_HEADER_SIZE;
     lay.header_size = bin.align_up(headers_raw, PE_FILE_ALIGN::usize);
 
+    # ImageBase: the headers map at RVA 0, so ImageBase sits one header span (the
+    # section-aligned SizeOfHeaders) below the first segment — mirroring the ELF
+    # header reserve. the first segment then maps immediately after the headers,
+    # leaving no unmapped gap (the Windows loader rejects a header->section gap with
+    # ERROR_BAD_EXE_FORMAT, even though wine tolerates it). ImageBase stays
+    # 64 KiB-aligned because the OS places the first segment one header span above a
+    # 64 KiB boundary (see target.os.windows base_addr).
+    var seg0: u64 = 0x140000000 + PE_SECTION_ALIGN;
+    if (seg_count > 0) { seg0 = segs[0].vaddr; }
+    val header_reserve: u64 = bin.align_up_u64(lay.header_size::u64, PE_SECTION_ALIGN);
+    lay.image_base = seg0 - header_reserve;
+
     var file_off: usize = lay.header_size;
-    var rva: u64 = bin.align_up_u64(lay.header_size::u64, PE_SECTION_ALIGN);
+    var rva: u64 = header_reserve;
 
     # the linker segments map at their assigned vaddrs; the writer copies their
     # bytes to file offsets that advance under FileAlignment. RVA = vaddr - base.
@@ -3127,8 +3134,9 @@ test "coff: emit_exec writes a well-formed PE32+ header" {
     var isa_vt: isa.IsaVTable;
     isa_vt.id = isa.ARCH_X86_64;
 
-    # a single executable load segment at the windows base, plus a writable data
-    # segment one page up. emit a static PE (no imports) and assert the header.
+    # the first content segment maps one page above the 64 KiB-aligned ImageBase
+    # (RVA 0x1000, right after the headers), plus a writable data segment one page
+    # up. emit a static PE (no imports) and assert the header.
     var text_bytes: [16]u8;
     var k: usize = 0;
     for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }  # nop sled
@@ -3136,7 +3144,7 @@ test "coff: emit_exec writes a well-formed PE32+ header" {
     k = 0;
     for (k < 8) { data_bytes[k] = 0; k = k + 1; }
 
-    val base:  u64 = 0x140000000;
+    val base:  u64 = 0x140001000;
     val entry: u64 = base + 4;
 
     var segs: [2]of.LoadSegment;
@@ -3175,10 +3183,20 @@ test "coff: emit_exec writes a well-formed PE32+ header" {
     if (bin.read_u16_le(buf.data, oh + 68) != IMAGE_SUBSYSTEM_WINDOWS_CUI) { ret 1; }
 
     # AddressOfEntryPoint is the entry vaddr relative to ImageBase, and ImageBase
-    # is the 64 KiB-reserved base — so entry maps back to the provided address.
+    # is one header span below the first segment — so entry maps back to the
+    # provided address.
     val image_base: u64 = bin.read_u64_le(buf.data, oh + 24);
     val entry_rva:  u32 = bin.read_u32_le(buf.data, oh + 16);
     if (image_base + entry_rva::u64 != entry) { ret 1; }
+
+    # the Windows loader invariant #1374 guards: ImageBase is 64 KiB-aligned and the
+    # first section starts immediately after the headers (RVA == section-aligned
+    # SizeOfHeaders), leaving no unmapped header->section gap.
+    if ((image_base & 0xFFFF) != 0) { ret 1; }
+    val sect_align: u32 = bin.read_u32_le(buf.data, oh + 32);
+    val hdr_size:   u32 = bin.read_u32_le(buf.data, oh + 60);
+    val first_rva:  u32 = bin.read_u32_le(buf.data, oh + OPTIONAL_HEADER_SIZE + 12);
+    if (first_rva != bin.align_up_u64(hdr_size::u64, sect_align::u64)::u32) { ret 1; }
 
     ret 0;
 }
@@ -3364,7 +3382,8 @@ test "coff: emit_exec emits .xdata/.pdata for a canonical x64 prologue" {
     text_bytes[12] = 0x90;
     text_bytes[13] = 0xC3;
 
-    val base:  u64 = 0x140000000;
+    # the first content segment maps one page above the 64 KiB-aligned ImageBase.
+    val base:  u64 = 0x140001000;
     val entry: u64 = base;
 
     var segs: [1]of.LoadSegment;

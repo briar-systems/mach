@@ -48,6 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   access on an expression with no value (a call with no return type) — instead
   of silently poisoning and surfacing link `undefined symbol` or span-less
   lowering errors; completes the #1343 silent-poison audit (#1348).
+- The PE emitter no longer produces executables the native Windows loader
+  rejects with `ERROR_BAD_EXE_FORMAT`. The image base reserved a full 64 KiB
+  below the first segment, placing the first section at RVA `0x10000` while the
+  headers spanned one page — a 15-page unmapped gap the loader refuses (wine
+  tolerated it). ImageBase now sits exactly one header span below the first
+  segment, so the first section maps immediately after the headers with no gap,
+  matching the layout MSVC emits. Every `mach`-built Windows binary, including
+  the published `mach.exe`, now launches natively (#1374).
 
 ## [1.4.1] - 2026-06-12
 
