@@ -202,12 +202,13 @@ mach dep <action> [args]
 
 Manages the project's dependency tree under `<dep>`. Dispatches on `argv[2]`.
 A dependency has exactly one source form: a **git** URL plus a ref, which mach
-acquires into `<dep>/<name>/` with plain git operations, or a **path** into
-the project's own tree, which is never fetched.
+acquires into `<dep>/<name>/` with plain git operations, or a **path** to another
+project tree, never fetched but materialised at `<dep>/<name>/` as a relative
+symlink so the build resolves it by the same vendor layout.
 
 | Action   | Args | Effect |
 |----------|------|--------|
-| `pull`   | — | realise the manifest: clone missing git deps (transitively), re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; the command routine use needs. |
+| `pull`   | — | realise the manifest: clone missing git deps (transitively), link path deps, re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; the command routine use needs. |
 | `update` | `<name> \| --all` | the only lock-advancer: re-resolve branch refs to current remote tips. Tag/commit refs are an immutable no-op. Never edits the manifest. |
 | `add`    | `<name> --git <url> [--ref <ref>] \| --path <dir>` | append a `[deps.<name>]` `git`/`path` stanza to the manifest, then `pull`. |
 | `remove` | `<name> [--purge]` | drop the entry from `mach.toml` and `mach.lock`; `--purge` also deletes `<dep>/<name>/`. |
@@ -243,6 +244,17 @@ counts as a checkout.) An **empty** directory has nothing to vendor and is treat
 as absent — `pull` clones into it — so a plain `git clone` (without
 `--recurse-submodules`), which leaves a submodule dep dir empty, is repaired by a
 plain `mach dep pull` (#1329).
+
+For each **path** dependency, `pull` materialises the source at `<dep>/<name>/` as
+a relative symlink, so the build resolves its modules by the same vendor layout as
+a git dep. The `path` is resolved relative to the requiring manifest's directory;
+the link is relative, so a tree that moves as a whole (a monorepo, a committed
+examples dir) stays linked without a re-pull. The step is idempotent: a stale link
+is replaced, an already-correct link is left in place, and a source that already
+lives at the vendor location (in-tree vendoring) is a no-op. A `path` pointing at a
+missing directory, a directory without a `mach.toml`, or a vendor location occupied
+by a real directory (a stale git checkout, foreign vendored files) is a hard error
+— never silent success (#1370).
 
 ### Transitive resolution
 
