@@ -2,13 +2,15 @@
 # Never-value teaching diagnostics (#1348, the #1343 silent-poison class). A
 # symbol that resolves cleanly but can never carry a value type — a record,
 # union, or def type name (local or imported), a generic type parameter, a
-# module alias — and a member access on a void expression used to pass sema
-# with ZERO diagnostics, surfacing only as link `undefined symbol` or span-less
-# `lower:` errors. Each misuse must now fail the build with a located teaching
-# diagnostic, and every adjacent legitimate construct must keep building.
+# module alias — a member access on a value-less call, and a binding initialized
+# from a value-less call used to pass sema with ZERO diagnostics, surfacing only
+# as link `undefined symbol` or span-less `lower:` errors. Each misuse must now
+# fail the build with a located teaching diagnostic, and every adjacent
+# legitimate construct must keep building.
 #
-#   local    — local rec/uni/def names, a generic parameter, and a void-object
-#              member access, all in value position in one module.
+#   local    — local rec/uni/def names, a generic parameter, a member access on
+#              a value-less call, and a value-less-call binding, all in value
+#              position in one module.
 #   imported — a module alias, an imported record, and an imported def alias in
 #              value position, reached through `use plib.lib`.
 #   ok       — the positives: record literal, function reference, `$size_of(T)`,
@@ -80,7 +82,8 @@ if out="$(build_expect_fail local)"; then
     expect_located local "is a union type, not a value" "$out"
     expect_located local "is a type alias, not a value" "$out"
     expect_located local "is a generic type parameter, not a value" "$out"
-    expect_located local "a void expression has no members" "$out"
+    expect_located local "a call that returns nothing has no members" "$out"
+    expect_located local "found no value" "$out"
 else
     fail=1
 fi
