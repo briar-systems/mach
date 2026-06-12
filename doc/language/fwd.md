@@ -1,7 +1,7 @@
 # `fwd` — re-exports
 
-`fwd` re-exports a symbol from another module under this module's public
-surface. It is the public counterpart to `use`.
+`fwd` re-exports a symbol or module from another module under this
+module's public surface. It is the public counterpart to `use`.
 
 ## Grammar
 
@@ -24,6 +24,29 @@ fwd Pt: impl.Point;         # re-exports as 'Pt'
 
 The surface file in a shadow-module pattern is typically a long list of
 `fwd` lines — one per symbol the surface exposes.
+
+## Module re-exports
+
+A `fwd` path that ends at a **module** re-exports the whole module as a
+public module alias, mirroring `use`'s module binding:
+
+```mach
+fwd demo.alpha;             # re-exports module 'alpha'
+fwd deep: demo.deep.beta;   # re-exports module under 'deep'
+```
+
+A consumer reaches the alias's members with qualified access, chaining
+through any depth of re-export — including a `fwd` of another library's
+`fwd`:
+
+```mach
+use demo.lib;               # lib.mach contains `fwd demo.alpha;`
+
+lib.alpha.answer();         # resolves through the module re-export
+```
+
+As with `use`, a module alias is not a value; only its members can be
+named.
 
 ## When to use
 
