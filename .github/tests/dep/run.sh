@@ -5,8 +5,7 @@
 # is fully offline (the network-shaped commands hit file:// urls only). it proves
 # the #1223 command surface: transitive clone into the flat dep tree, idempotent
 # pull, loud checkout-drift repair and ref re-resolution, the only-lock-advancer
-# `update`, the same-name conflict and vendored-shape hard errors, add/remove, and
-# pull of a legacy v1 manifest (url/version keys).
+# `update`, the same-name conflict and vendored-shape hard errors, and add/remove.
 #
 # usage: run.sh [path-to-mach]   (defaults to `mach` on PATH)
 set -euo pipefail
@@ -140,31 +139,27 @@ AD="$WORK/add"; mkdir -p "$AD/vendored/src"
 printf '[project]\nid = "add"\n' > "$AD/mach.toml"
 printf '[project]\nid = "vd"\n' > "$AD/vendored/mach.toml"
 ( cd "$AD" && "$MACH" dep add foo --git "file://$WORK/remotes/leaf" --ref tag/v1.0.0 ) >"$OUT" 2>&1
-has "add writes a v2 git stanza" 'git = "file://' "$AD/mach.toml"
+has "add writes a git stanza" 'git = "file://' "$AD/mach.toml"
 ( cd "$AD" && "$MACH" dep add vd --path vendored ) >"$OUT" 2>&1
-has "add writes a v2 path stanza" 'path = "vendored"' "$AD/mach.toml"
+has "add writes a path stanza" 'path = "vendored"' "$AD/mach.toml"
 ( cd "$AD" && "$MACH" dep remove foo --purge ) >"$OUT" 2>&1
 hasnt "remove drops the manifest entry" "[deps.foo]" "$AD/mach.toml"
 [ ! -d "$AD/dep/foo" ] && ok "remove --purge deletes the dep dir" || bad "remove --purge left dep/foo"
 
-# --- v1 manifest pull (legacy url/version keys) --------------------------------
-V1="$WORK/v1"; mkdir -p "$V1"
-cat > "$V1/mach.toml" <<TOML
+# --- empty dep dir is treated as missing and cloned into (#1329) ----------------
+# a plain `git clone` (no --recurse-submodules) leaves a submodule dep dir as an
+# empty placeholder; pull must clone into it, not mistake it for a vendored tree.
+EMP="$WORK/empty"; mkdir -p "$EMP/dep/leaf"
+cat > "$EMP/mach.toml" <<TOML
 [project]
-id = "v1"
-dir_dep = "dep"
-
-[targets.linux]
-os = "linux"
-isa = "x86_64"
+id = "emp"
+dep = "dep"
 
 [deps.leaf]
-type = "remote"
-path = "file://$WORK/remotes/leaf"
-version = "branch/main"
+git = "file://$WORK/remotes/leaf"
+ref = "branch/main"
 TOML
-( cd "$V1" && "$MACH" dep pull ) >"$OUT" 2>&1 || bad "v1 pull exited nonzero"
-[ -d "$V1/dep/leaf" ] && ok "v1 manifest pull clones via url/version keys" || bad "v1 pull did not clone"
-if ( cd "$V1" && "$MACH" dep add p --path foo ) >"$OUT" 2>&1; then bad "add --path on v1 did not fail"; else ok "add --path is rejected on a v1 manifest"; fi
+( cd "$EMP" && "$MACH" dep pull ) >"$OUT" 2>&1 || bad "pull into an empty dep placeholder exited nonzero"
+[ -e "$EMP/dep/leaf/.git" ] && ok "pull clones into an empty dep placeholder dir" || bad "pull did not clone into the empty dep dir"
 
 exit "$fail"
