@@ -151,6 +151,18 @@ child's exit code becomes this command's exit code.
 `--emit` is rejected — running a relocatable object is not meaningful. All other
 `build` and global flags apply.
 
+| Flag             | Value   | Effect |
+|------------------|---------|--------|
+| `--runner <cmd>` | command | execute the binary as `<cmd> <binary> <args...>` instead of directly |
+
+`--runner` names a host-side launcher for binaries the host cannot exec
+directly — e.g. `mach run . --target windows --runner wine`. `<cmd>` is a single
+command name or path (no shell-style word splitting); a bare name is resolved on
+`PATH`. Without the flag the binary is exec'd directly, and a launch failure
+(such as a foreign-format binary on a host without a binfmt handler) is reported
+as a failure — exit `127` when `execve` rejects the binary in the spawned
+child — with no auto-detection.
+
 Exit codes: the child's exit code, `1` on a build/user error, `2` on internal
 error.
 
@@ -160,17 +172,25 @@ error.
 mach test [options]
 ```
 
-Builds a test binary — a synthesized runner over every `test` declaration the
-resolver collected, replacing the project's own entry point — then runs it.
-A test build always links an executable, even for a library target.
+Builds one standalone executable per `test` declaration (the test plus the
+project's transitive code, with a synthesized `main` calling just that test),
+then spawns each as a separate process and reports a per-test
+`name file:line PASS|FAIL` line. A crashing test reports its signal and the run
+continues. A test build always links executables, even for a library target.
 
 | Flag                | Value   | Effect |
 |---------------------|---------|--------|
-| `--filter <pattern>`| pattern | forwarded to the runner: run only tests whose name matches `<pattern>` |
-| `--list`            | —       | forwarded to the runner: list the collected tests and exit |
+| `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
+| `--list`            | —       | list the collected tests and exit |
+| `--runner <cmd>`    | command | launch every test as `<cmd> <exe>` instead of exec'ing it directly |
 
-Plus the `build` and global flags. `--filter`/`--list` are passed through to the
-test runner as its argv; the runner itself selects or enumerates the tests.
+Plus the `build` and global flags. `--runner` has the same semantics as on
+`mach run`: a single command name or path (no shell-style word splitting),
+resolved on `PATH`, for foreign-target tests the host cannot exec directly —
+e.g. `mach test . --target windows --runner wine`. Without it, a test executable
+the host cannot launch reports a per-test failure — `FAIL(exit 127)` when
+`execve` rejects the binary in the spawned child, `FAIL(spawn)` when the spawn
+itself fails — with no auto-detection.
 
 Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
 
@@ -182,12 +202,13 @@ mach dep <action> [args]
 
 Manages the project's dependency tree under `<dep>`. Dispatches on `argv[2]`.
 A dependency has exactly one source form: a **git** URL plus a ref, which mach
-acquires into `<dep>/<name>/` with plain git operations, or a **path** into
-the project's own tree, which is never fetched.
+acquires into `<dep>/<name>/` with plain git operations, or a **path** to another
+project tree, never fetched but materialised at `<dep>/<name>/` as a relative
+symlink so the build resolves it by the same vendor layout.
 
 | Action   | Args | Effect |
 |----------|------|--------|
-| `pull`   | — | realise the manifest: clone missing git deps (transitively), re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; the command routine use needs. |
+| `pull`   | — | realise the manifest: clone missing git deps (transitively), link path deps, re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; the command routine use needs. |
 | `update` | `<name> \| --all` | the only lock-advancer: re-resolve branch refs to current remote tips. Tag/commit refs are an immutable no-op. Never edits the manifest. |
 | `add`    | `<name> --git <url> [--ref <ref>] \| --path <dir>` | append a `[deps.<name>]` `git`/`path` stanza to the manifest, then `pull`. |
 | `remove` | `<name> [--purge]` | drop the entry from `mach.toml` and `mach.lock`; `--purge` also deletes `<dep>/<name>/`. |
@@ -223,6 +244,17 @@ counts as a checkout.) An **empty** directory has nothing to vendor and is treat
 as absent — `pull` clones into it — so a plain `git clone` (without
 `--recurse-submodules`), which leaves a submodule dep dir empty, is repaired by a
 plain `mach dep pull` (#1329).
+
+For each **path** dependency, `pull` materialises the source at `<dep>/<name>/` as
+a relative symlink, so the build resolves its modules by the same vendor layout as
+a git dep. The `path` is resolved relative to the requiring manifest's directory;
+the link is relative, so a tree that moves as a whole (a monorepo, a committed
+examples dir) stays linked without a re-pull. The step is idempotent: a stale link
+is replaced, an already-correct link is left in place, and a source that already
+lives at the vendor location (in-tree vendoring) is a no-op. A `path` pointing at a
+missing directory, a directory without a `mach.toml`, or a vendor location occupied
+by a real directory (a stale git checkout, foreign vendored files) is a hard error
+— never silent success (#1370).
 
 ### Transitive resolution
 

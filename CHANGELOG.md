@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-06-12
+
+Inline-asm & foundations: carry-flag mnemonics and numeric local labels in x64
+inline assembly, per-symbol DLL attribution for windows imports, the first PE
+output the native Windows loader accepts, float `%` correctness, `nil`
+coercion to function types, materialized `path` dependencies, declared
+foreign-target runners, and session-owned target registries under the hood.
+
+### Added
+
+- `mach test` and `mach run` accept `--runner <cmd>`: every child exec becomes
+  `<cmd> <binary> <args...>`, the declared host-side launcher for
+  foreign-target artifacts (e.g. `--target windows --runner wine`). The value
+  is a single command name or path (no shell-style word splitting), resolved
+  on `PATH`. Absent the flag, binaries are exec'd directly and a launch
+  failure is reported as a failure — no auto-detection (#1345).
+- One-line install scripts: `install.sh` (Linux) and `install.ps1` (Windows),
+  shipped in the repo and as release assets. They resolve the latest tag from
+  the `releases/latest` redirect, download the versioned archive for the host,
+  verify it against `SHA256SUMS`, and install to `~/.local/bin`
+  (`%LOCALAPPDATA%\mach\bin` on Windows); `MACH_VERSION` and
+  `MACH_INSTALL_DIR` override the release and destination (#1352).
+- Releases now ship versioned archives — `mach-<version>-x86_64-linux.tar.gz`
+  and `mach-<version>-x86_64-windows.zip`, each containing the binary and
+  LICENSE — alongside the existing assets, with `SHA256SUMS` covering the
+  full set (#1352).
+- x64 inline assembly accepts the carry-flag mnemonics `jc` / `jnc` (and the
+  `jb` / `jae` / `jnb` aliases) and `setc` (and the `setb` / `setae` / `setnb`
+  aliases), reusing the existing conditional-branch and SETcc encoders. Previously
+  only `je` / `jz` / `jne` / `jnz` were recognized, forcing carry-flag handling
+  through `.byte` escape hatches (#1359).
+- x64 inline assembly accepts NASM-style numeric local labels: a `<digits>:`
+  statement defines a block-local label and `<digits>f` / `<digits>b` branch
+  targets resolve to a rel32 within the function (no relocation). Every branch
+  mnemonic takes a symbol or a local-label target; a backward reference binds to
+  the nearest preceding definition and a forward reference to the nearest
+  following one, redefinition of a number is allowed, and an unresolved or
+  malformed reference is a hard compile error. This unblocks block-local forward
+  branches such as the `jc 1f` / `1:` shape in std's darwin syscall wrappers
+  (#1365).
+- `$<sym>.library = "<dll>"` pins an `ext` import to a specific dependency DLL,
+  giving the PE (Windows) import directory per-symbol attribution. Imports were
+  previously all forced onto the first dependency (kernel32.dll), so extra DLLs
+  in `[target.*].libs` emitted only empty descriptors; an attributed import now
+  lands under its named library, an unattributed one still binds to the first,
+  and pinning to a library absent from the link's dependencies is a hard link
+  error rather than a silent fallback. Composes with `.symbol` — the rename sets
+  the imported name, `.library` the DLL it is imported from (#1382).
+
+### Fixed
+
+- Float `%` now evaluates to the truncated (C `fmod`) remainder
+  `a - trunc(a / b) * b`, whose result takes the dividend's sign
+  (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). The operator had no float lowering:
+  the runtime path fell through to the integer IDIV/DIV opcodes, running an
+  integer divide over the raw IEEE-754 bit patterns (a passthrough-below-divisor,
+  near-zero-above shape), and the comptime fold rejected it as non-constant. Both
+  now synthesize the remainder from the existing float divide / truncating
+  conversion / multiply / subtract primitives, exact for `|a / b| < 2^63` (#1378).
+- `nil` coerces to function types, so a fun-typed binding can be explicitly
+  nil-initialised, not only default-initialised. Previously `var q: fun(u32) =
+  nil` was rejected with `type mismatch: expected fun(u32), found *u8` and the
+  cast spelling `var r: F = nil::F` failed lowering with `global initialiser
+  must be a constant expression`, even though a fun-typed value already compares
+  `== nil` and `nil::F` was accepted in argument position. nil now coerces to
+  any pointer-like target — `ptr`, `*T`, or `fun(...)` — uniformly across
+  globals, locals, record fields, array elements, arguments, and return slots,
+  and a nil global initialiser (bare or written through pointer casts) folds to
+  the null constant. nil into a non-pointer slot remains a type error (#1369).
+- `mach dep pull` now materialises a `path` dependency at `<dep>/<alias>/` as a
+  relative symlink to the resolved source instead of silently doing nothing —
+  previously it printed "mach.lock up to date", exited 0, and never created the
+  dep directory, so any later build failed to resolve the dep's modules. The
+  `path` is resolved relative to the requiring manifest's directory; a stale link
+  is replaced and an already-correct one left in place (idempotent), while a
+  missing directory, a directory without a `mach.toml`, or a vendor location
+  occupied by a real directory is a hard error. A path dep carries no lock entry —
+  its manifest `path` is the record (#1370).
+- Sema reports a teaching diagnostic for every symbol kind that can never be a
+  value reaching value position — a record, union, or `def` type name (local
+  or imported, bare or `alias.member`), a generic type parameter, and a member
+  access on an expression with no value (a call with no return type) — instead
+  of silently poisoning and surfacing link `undefined symbol` or span-less
+  lowering errors; completes the #1343 silent-poison audit (#1348).
+- The PE emitter no longer produces executables the native Windows loader
+  rejects with `ERROR_BAD_EXE_FORMAT`. The image base reserved a full 64 KiB
+  below the first segment, placing the first section at RVA `0x10000` while the
+  headers spanned one page — a 15-page unmapped gap the loader refuses (wine
+  tolerated it). ImageBase now sits exactly one header span below the first
+  segment, so the first section maps immediately after the headers with no gap,
+  matching the layout MSVC emits. Every `mach`-built Windows binary, including
+  the published `mach.exe`, now launches natively (#1374).
+- A `$<sym>.symbol` rename on an `ext fun` is no longer clobbered. The bare `ext`
+  identifier was re-registered over the rename after `scan_export_directives`
+  recorded it, so renames on foreign imports silently did nothing and bound under
+  the mach identifier; the bare name is now only a default that an explicit
+  `.symbol` override wins, order-independently (#1382).
+- `mach init` validates the project id before scaffolding: a name the manifest
+  grammar would reject (`.`, path separators, spaces) is refused with nothing
+  written, instead of silently scaffolding an ungrammatical `[bin..]` manifest.
+  The positional name is taken verbatim — no basename derivation (#1355).
+- A type mismatch against a call with no return type reads `expected i64, found
+  no value` (with a clarifying note) instead of rendering the misleading
+  `<error>` placeholder, and diagnostics consistently say "returns nothing" /
+  "no value" — mach has no `void` (#1360).
+- `infer_generic_call` reports internal generic-substitution and type-argument
+  allocation failures instead of silently poisoning the expression (#1361).
+
 ## [1.4.1] - 2026-06-12
 
 Patch release clearing the open bug board: environment forwarding for spawned

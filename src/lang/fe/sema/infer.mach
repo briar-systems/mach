@@ -284,14 +284,11 @@ fun infer_ident(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
     if (is_none[*resolve.Symbol](sym_opt)) { ret type.TYPE_ERROR; }
     val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
 
-    # a module alias (`use`/`fwd` binding) names a module, not a value. a
-    # qualified member access consumes the alias in resolve and never infers
-    # it, so an alias reaching value inference is a misuse; report it loudly —
-    # resolve recorded the symbol without error, and a silent TYPE_ERROR here
-    # would let a clean sema pass hand the broken access to lowering.
-    if (sym.kind == resolve.SYM_USE) {
-        ret report_module_alias_value(sc, eid);
-    }
+    # a symbol that names a module or a type (module alias, record, union,
+    # def alias, generic parameter, primitive) resolves cleanly but can never
+    # be a value; report it loudly — a silent poison here lets a clean sema
+    # pass hand the broken expression to lowering (#1343, #1348).
+    if (report_never_value(sc, eid, sym)) { ret type.TYPE_ERROR; }
 
     # a comptime-parameter function is a TEMPLATE: it is only ever emitted as a
     # per-value instance at a call site, never as a standalone symbol. referencing
@@ -329,14 +326,64 @@ fun ident_is_comptime_param_fn(sc: *sema.SemaContext, sym: *resolve.Symbol) bool
     ret false;
 }
 
-# reports a module alias referenced in value position against the expression's
-# span and poisons the expression.
-fun report_module_alias_value(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
+# reports a symbol that can never carry a value type (a module alias, a type
+# name, or a generic type parameter) referenced in value position, with a
+# per-kind teaching diagnostic. returns true when the reference was reported,
+# so the caller poisons the expression; false when `sym` can legitimately be a
+# value. an imported symbol is classified by its origin declaration's kind.
+fun report_never_value(sc: *sema.SemaContext, eid: id.ExprId, sym: *resolve.Symbol) bool {
     val e_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
-    if (is_some[*expr.Expr](e_opt)) {
-        sema.report(sc, unwrap[*expr.Expr](e_opt).span, "a module alias is not a value; name one of the module's members");
+    if (is_none[*expr.Expr](e_opt)) { ret false; }
+    val span: token.Span = unwrap[*expr.Expr](e_opt).span;
+
+    if (sym.kind == resolve.SYM_USE) {
+        sema.report(sc, span, "a module alias is not a value; name one of the module's members");
+        ret true;
     }
-    ret type.TYPE_ERROR;
+    if (sym.kind == resolve.SYM_GENERIC) {
+        check.report_named(sc, span, "`", sym.name, "` is a generic type parameter, not a value; use it in type position or a comptime intrinsic like `$size_of(T)`", "a generic type parameter is not a value");
+        ret true;
+    }
+    if (sym.kind == resolve.SYM_PRIM) {
+        check.report_named(sc, span, "`", sym.name, "` is a primitive type, not a value; write a literal of that type", "a primitive type is not a value");
+        ret true;
+    }
+
+    # a local type declaration carries its kind on the symbol; an imported one
+    # is uniformly SYM_IMPORTED and is classified by its origin decl.
+    var dk: decl.DeclKind = decl.DECL_KIND_ERROR;
+    if (sym.kind == resolve.SYM_REC) { dk = decl.DECL_KIND_REC; }
+    or (sym.kind == resolve.SYM_UNI) { dk = decl.DECL_KIND_UNI; }
+    or (sym.kind == resolve.SYM_DEF) { dk = decl.DECL_KIND_DEF; }
+    or (sym.kind == resolve.SYM_IMPORTED) { dk = symbol_decl_kind(sc, sym); }
+
+    if (dk == decl.DECL_KIND_REC) {
+        check.report_named(sc, span, "`", sym.name, "` is a record type, not a value; construct an instance with `Type{ ... }`", "a record type is not a value");
+        ret true;
+    }
+    if (dk == decl.DECL_KIND_UNI) {
+        check.report_named(sc, span, "`", sym.name, "` is a union type, not a value; construct an instance with `Type{ ... }`", "a union type is not a value");
+        ret true;
+    }
+    if (dk == decl.DECL_KIND_DEF) {
+        check.report_named(sc, span, "`", sym.name, "` is a type alias, not a value; use a value of the aliased type", "a type alias is not a value");
+        ret true;
+    }
+    ret false;
+}
+
+# the declaration kind behind a symbol, read from its origin module's AST (the
+# symbol may be imported). DECL_KIND_ERROR when the decl is unavailable.
+fun symbol_decl_kind(sc: *sema.SemaContext, sym: *resolve.Symbol) decl.DeclKind {
+    if (sym.decl == id.DECL_NIL) { ret decl.DECL_KIND_ERROR; }
+    var a: *ast.Ast = sc.a;
+    if (sym.origin != sc.own_module) {
+        a = sess.module_ast(sc.s, sym.origin);
+        if (a == nil) { ret decl.DECL_KIND_ERROR; }
+    }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (is_none[*decl.Decl](d_opt)) { ret decl.DECL_KIND_ERROR; }
+    ret unwrap[*decl.Decl](d_opt).kind;
 }
 
 # reports a comptime-parameter-function value reference against the ident span and
@@ -387,9 +434,10 @@ fun infer_binary(sc: *sema.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, spa
 
     if (b.op == expr.BIN_EQ || b.op == expr.BIN_NEQ) {
         # equality also relates two address-shaped operands (pointers and
-        # functions, both runtime code/data addresses). this covers `fn == nil`
-        # / `fn != nil`, where `nil` types as `*u8`, without permitting nil to
-        # be assignable to a function type.
+        # functions, both runtime code/data addresses). this covers a bare
+        # `fn == fn2` where neither side is a coercible literal; a comparison
+        # against `nil` instead coerces nil to the function type first (see
+        # `coerce`), so it arrives here already address-typed on both sides.
         if (int_float_mix) { report_int_float_cmp(sc, span); ret type.TYPE_ERROR; }
         val addr_ok: bool = is_pointer_like(sc, lt) && is_pointer_like(sc, rt);
         if (!operands_ok && !both_float && !addr_ok) { type_mismatch(sc, span, lt, rt); ret type.TYPE_ERROR; }
@@ -739,7 +787,12 @@ fun infer_generic_call(sc: *sema.SemaContext, c: *expr.ExprCall, ct: type.TypeId
     val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
 
     val pr: Result[*type.TypeId, str] = allocate_params(sc, c.type_args_len);
-    if (is_err[*type.TypeId, str](pr)) { ret type.TYPE_ERROR; }
+    if (is_err[*type.TypeId, str](pr)) {
+        # the type-argument scratch buffer failed to allocate; without a report
+        # the call would reach lowering on a clean sema pass (#1348).
+        sema.report(sc, span, "internal: out of memory allocating generic type arguments");
+        ret type.TYPE_ERROR;
+    }
     val args: *type.TypeId = unwrap_ok[*type.TypeId, str](pr);
 
     var i: u32 = 0;
@@ -771,7 +824,14 @@ fun infer_generic_call(sc: *sema.SemaContext, c: *expr.ExprCall, ct: type.TypeId
 
     val sig: type.TypeId = generics.substitute(sc.s, ct, args, c.type_args_len);
     free_params(sc, args, c.type_args_len);
-    if (sig == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    if (sig == type.TYPE_ERROR) {
+        # substitute collapses every failure (an out-of-range generic parameter,
+        # an allocation failure interning a rebuilt type) to the poison type;
+        # arity is pre-checked, so reaching here is an internal failure that must
+        # be reported rather than poisoning the call on a clean sema pass (#1348).
+        sema.report(sc, span, "internal: generic substitution failed");
+        ret type.TYPE_ERROR;
+    }
 
     val sfn_opt: Option[*type.Type] = type.get(?sc.s.types, sig);
     if (is_none[*type.Type](sfn_opt)) { ret type.TYPE_ERROR; }
@@ -805,12 +865,10 @@ fun infer_member(sc: *sema.SemaContext, eid: id.ExprId, m: *expr.ExprMember, spa
     val qsym_opt: Option[*resolve.Symbol] = sema.symbol_for_expr(sc, eid);
     if (is_some[*resolve.Symbol](qsym_opt)) {
         val qsym: *resolve.Symbol = unwrap[*resolve.Symbol](qsym_opt);
-        # a member that resolved to a module alias (`lib.alpha` through a `fwd`
-        # module re-export) names a module, not a value; in value position it
-        # is a misuse, exactly like a bare alias ident (see infer_ident).
-        if (qsym.kind == resolve.SYM_USE) {
-            ret report_module_alias_value(sc, eid);
-        }
+        # a qualified member that resolved to a module alias (`lib.alpha`
+        # through a `fwd` re-export) or to an exported type name is a misuse
+        # in value position, exactly like a bare ident (see infer_ident).
+        if (report_never_value(sc, eid, qsym)) { ret type.TYPE_ERROR; }
         ret sema.decl_type_for(sc, qsym);
     }
 
@@ -833,7 +891,14 @@ fun infer_member(sc: *sema.SemaContext, eid: id.ExprId, m: *expr.ExprMember, spa
     if (cts != type.TYPE_NIL) { ret cts; }
 
     val ot: type.TypeId = infer_expr(sc, m.object);
-    if (ot == type.TYPE_ERROR || ot == type.TYPE_NIL) { ret type.TYPE_ERROR; }
+    if (ot == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    if (ot == type.TYPE_NIL) {
+        # a value-less object (a call to a function with no return type) yields
+        # no value; without a report the broken access would reach lowering with
+        # a clean sema pass (#1348).
+        sema.report(sc, span, "a call that returns nothing has no members; a member access requires a record or union value");
+        ret type.TYPE_ERROR;
+    }
 
     ensure_record_fields(sc, ot);
 

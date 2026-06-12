@@ -470,6 +470,14 @@ pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Se
         ret err[Project, str](unwrap_err[bool, str](exp_r));
     }
 
+    # project `$<sym>.library` attributions onto link-name keys now that every
+    # import's final link name (`.symbol` override or bare `ext` name) is settled.
+    val imp_r: Result[bool, str] = register_import_libraries(?p);
+    if (is_err[bool, str](imp_r)) {
+        dnit_project(?p);
+        ret err[Project, str](unwrap_err[bool, str](imp_r));
+    }
+
     ret ok[Project, str](p);
 }
 
@@ -501,6 +509,68 @@ fun register_module_export_names(p: *Project, mid: sess.ModuleId) Result[bool, s
     val source: str = unwrap[*src.SourceFile](src_opt).text;
 
     ret scan_export_directives(p, mid, source, mod_node.decls_start, mod_node.decls_len);
+}
+
+# register_import_libraries: project the per-decl `$<sym>.library` attributions
+# (keyed by decl) onto the session's link-name-keyed `import_libraries` map. run
+# after every `.symbol`/`.library` directive and `ext fun` default is recorded,
+# so each import's final link name is settled. for every `ext` decl pinned to a
+# library, the binding `<final link name> -> <library>` lets the back-end linker
+# route the import to a specific PE import descriptor rather than the first one.
+fun register_import_libraries(p: *Project) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *ModuleEntry = ?p.modules[i];
+        val m_opt: Option[*module.Module] = ast.get_module(?m.a, m.a.root_module);
+        if (is_some[*module.Module](m_opt)) {
+            val mod_node: *module.Module = unwrap[*module.Module](m_opt);
+            val r: Result[bool, str] = bind_import_libraries(p, i::sess.ModuleId, mod_node.decls_start, mod_node.decls_len);
+            if (is_err[bool, str](r)) { ret r; }
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# bind_import_libraries: walk a decl list (recursing into comptime-if branch
+# bodies, where target-selected `ext` bindings live) and, for each `ext fun`
+# pinned by a `$<sym>.library` directive, record `<final link name> -> <library>`
+# on the session. the final link name is the decl's `export_name` (the `.symbol`
+# value when present, else the bare identifier), so the key matches the object
+# symbol the linker later sees.
+fun bind_import_libraries(p: *Project, mid: sess.ModuleId, start: u32, len: u32) Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = m.a.decl_ids[start + i];
+        val d_opt: Option[*decl.Decl] = ast.get_decl(?m.a, did);
+        if (is_some[*decl.Decl](d_opt)) {
+            val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+            if (d.kind == decl.DECL_KIND_FUN && (d.flags & decl.DECL_FLAG_EXT) != 0) {
+                val lib_opt: Option[intern.StrId] = sess.export_library(p.s, mid, did::u32);
+                if (is_some[intern.StrId](lib_opt)) {
+                    val name_opt: Option[intern.StrId] = sess.export_name(p.s, mid, did::u32);
+                    if (is_some[intern.StrId](name_opt)) {
+                        val r: Result[bool, str] = sess.register_import_library(p.s,
+                            unwrap[intern.StrId](name_opt), unwrap[intern.StrId](lib_opt));
+                        if (is_err[bool, str](r)) { ret r; }
+                    }
+                }
+            }
+            or (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+                val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
+                var bi: u32 = 0;
+                for (bi < ci.branches_len) {
+                    val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+                    val rb: Result[bool, str] = bind_import_libraries(p, mid, br.body_start, br.body_len);
+                    if (is_err[bool, str](rb)) { ret rb; }
+                    bi = bi + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
 }
 
 # scan_export_directives: walk a decl list (recursing into comptime-if branch
@@ -542,12 +612,14 @@ fun scan_export_directives(p: *Project, mid: sess.ModuleId, source: str, start: 
     ret ok[bool, str](true);
 }
 
-# register_one_export_directive: register one `$<sym>.symbol = "..."` directive.
-# the target must be a member access `<comptime-ident>.symbol` and the value a
-# string literal; the comptime-ident's bare identifier is matched against a
-# sibling decl in `[start, start+len)`, and the literal string is interned as
-# that decl's link-name override. directives that are not `.symbol` writes, or
-# whose target names no sibling, are ignored.
+# register_one_export_directive: register one `$<sym>.symbol = "..."` or
+# `$<sym>.library = "..."` directive. the target must be a member access
+# `<comptime-ident>.<attr>` and the value a string literal; the comptime-ident's
+# bare identifier is matched against a sibling decl in `[start, start+len)`, and
+# the literal string is interned. a `.symbol` write records the decl's link-name
+# override; a `.library` write records the dynamic library the named `ext` import
+# is pinned to. directives naming any other attribute, or whose target names no
+# sibling, are ignored.
 fun register_one_export_directive(p: *Project, mid: sess.ModuleId, source: str, d: *decl.Decl, start: u32, len: u32) Result[bool, str] {
     val m: *ModuleEntry = ?p.modules[mid::u32];
     val ca: *decl.DeclComptimeAttr = ?d.data.comptime_attr;
@@ -558,8 +630,11 @@ fun register_one_export_directive(p: *Project, mid: sess.ModuleId, source: str, 
     val te: *expr.Expr = unwrap[*expr.Expr](tgt_opt);
     if (te.kind != expr.EXPR_KIND_MEMBER) { ret ok[bool, str](true); }
 
-    # the attribute being written must be `.symbol`.
-    if (!span_eq_str(source, te.data.member.name, "symbol")) { ret ok[bool, str](true); }
+    # the attribute being written must be one the link-name machinery owns:
+    # `.symbol` (literal link name) or `.library` (import-library pin).
+    val is_symbol:  bool = span_eq_str(source, te.data.member.name, "symbol");
+    val is_library: bool = span_eq_str(source, te.data.member.name, "library");
+    if (!is_symbol && !is_library) { ret ok[bool, str](true); }
 
     val obj_opt: Option[*expr.Expr] = ast.get_expr(?m.a, te.data.member.object);
     if (is_none[*expr.Expr](obj_opt)) { ret ok[bool, str](true); }
@@ -591,13 +666,21 @@ fun register_one_export_directive(p: *Project, mid: sess.ModuleId, source: str, 
     val name_r: Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, inner);
     if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
 
+    if (is_library) {
+        ret sess.register_export_library(p.s, mid, target_did::u32, unwrap_ok[intern.StrId, str](name_r));
+    }
     ret sess.register_export_name(p.s, mid, target_did::u32, unwrap_ok[intern.StrId, str](name_r));
 }
 
 # register_ext_fun: record an `ext fun` foreign symbol's literal link name (its
 # bare source identifier) as the decl's export override, so it is never mangled.
-# the linker binds it to the imported C / syscall symbol of that name.
+# the linker binds it to the imported C / syscall symbol of that name. the bare
+# name is only the default: a `$<sym>.symbol = "..."` directive for the same decl
+# is an explicit override that must win, so registration is skipped when one is
+# already recorded (the directive having been scanned first as a sibling). a
+# directive scanned later still overwrites the default through register_export_name.
 fun register_ext_fun(p: *Project, mid: sess.ModuleId, source: str, d: *decl.Decl, did: id.DeclId) Result[bool, str] {
+    if (is_some[intern.StrId](sess.export_name(p.s, mid, did::u32))) { ret ok[bool, str](true); }
     val name_r: Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, d.data.fun_.name);
     if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
     ret sess.register_export_name(p.s, mid, did::u32, unwrap_ok[intern.StrId, str](name_r));
@@ -1318,7 +1401,7 @@ fun select_target(p: *Project, t: *TargetEntry) Result[bool, str] {
     val os_id:   u32 = os_id_for(os_name);
     val arch_id: u32 = arch_id_for(isa_name);
 
-    val tr: Result[tgt.Target, str] = tgt.select(os_id, arch_id);
+    val tr: Result[tgt.Target, str] = tgt.select(?p.s.registry, os_id, arch_id);
     if (is_err[tgt.Target, str](tr)) { ret err[bool, str](unwrap_err[tgt.Target, str](tr)); }
     p.target = unwrap_ok[tgt.Target, str](tr);
 
