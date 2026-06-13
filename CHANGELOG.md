@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default target's branches win" — and a module that does not fully resolve there
   records diagnostics without aborting the build (#1391).
 
+### Changed
+
+- The `OsVTable` `entry_symbol`, `syscall_layer`, `libdir`, and `dynamic_linker`
+  fields are immutable `str` constants set directly by the OS registrars, no longer
+  `StrId` fields re-interned per session; the linker now interns these at the point
+  of use (the entry-symbol lookup and the dynamic interpreter path), completing the
+  interner-elimination from the OS vtable started in #1377. Behavior-preserving,
+  verified by the byte-identical self-host fixpoint (#1402).
+
 ## [1.5.3] - 2026-06-13
 
 Correctness patch for two silent defects in shipped v1.5.2: a relocation
