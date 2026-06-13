@@ -17,6 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default target's branches win" — and a module that does not fully resolve there
   records diagnostics without aborting the build (#1391).
 
+### Fixed
+
+- codegen (x86-64): an 8-byte store of an immediate outside signed-`imm32` range to
+  a global is legalized into `MOVABS r11, imm64` + a register store, but the PC32
+  relocation was patched at the pre-legalization offset — landing 4 bytes early,
+  corrupting the encoding and leaving the store pointed at `rip+0`. The patch site
+  now tracks the legalized `disp32` (the same fix covers the ALU memory-destination
+  and inline-asm `mov [sym], imm64` paths). No diagnostic was emitted; ordinary code
+  storing a large constant to a global silently miscompiled (#1407).
+- comptime: a float literal with an extreme exponent (e.g. `1.0e2000000000`) hung the
+  compiler in the unbounded decimal-scale loop and could silently fold to its mantissa
+  on i64 exponent overflow. The exponent accumulator is now clamped past the point
+  f64 saturates, so such literals fold to `inf`/`0.0` instead (#1408).
+
 ## [1.5.2] - 2026-06-13
 
 Maintenance patch: path dependencies materialize through the standard library
