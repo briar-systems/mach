@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- driver: `build_project_union` builds the union of every manifest target's import
+  closure into one deduplicated Project, so long-lived multi-target tooling (e.g. the
+  language server) sees modules reachable only on a non-default target. Each `$if`
+  chain follows the first active branch of every declared target; the Project resolves
+  under the default (native-resolved) target's tuple — the documented v1 default, "the
+  default target's branches win" — and a module that does not fully resolve there
+  records diagnostics without aborting the build (#1391).
+
+### Changed
+
+- target: the os/arch name↔id mapping is consolidated to one canonical table per
+  dimension — `os.os_id_for`/`os.os_name_for` and `isa.arch_id_for`/`isa.arch_name_for`
+  — replacing the copies that lived in `driver.mach` and `manifest.mach`. An
+  unrecognized manifest `os`/`isa` name now reports a distinct "unknown target os/isa
+  name '<name>' (expected: ...)" diagnostic instead of folding to `*_UNKNOWN` and being
+  mis-reported as an unsupported pair (#1412).
+- The `OsVTable` `entry_symbol`, `syscall_layer`, `libdir`, and `dynamic_linker`
+  fields are immutable `str` constants set directly by the OS registrars, no longer
+  `StrId` fields re-interned per session; the linker now interns these at the point
+  of use (the entry-symbol lookup and the dynamic interpreter path), completing the
+  interner-elimination from the OS vtable started in #1377. Behavior-preserving,
+  verified by the byte-identical self-host fixpoint (#1402).
+
+## [1.5.3] - 2026-06-13
+
+Correctness patch for two silent defects in shipped v1.5.2: a relocation
+patch-site miscompute that corrupted out-of-`imm32` constant stores to globals,
+and an extreme float-literal exponent that hung the compiler.
+
 ### Fixed
 
 - objfmt: the COFF and ELF object-file parsers allocate the section/symbol/relocation
