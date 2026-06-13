@@ -46,6 +46,7 @@ use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
 use std.allocator.reallocate;
+use page: std.allocator.page;
 
 use fs:   std.filesystem;
 use toml: std.data.toml;
@@ -259,11 +260,36 @@ val LOAD_DONE:    LoadStatus = 2;
 # modules:      flat array of ModuleEntry, indexed by ModuleId
 # topo:         module ids in dep-order (topo[0] has no deps within the graph)
 # load:         DFS bookkeeping; cleared when build_project completes
+# TargetTuple: a manifest target's comptime-relevant axes — what a `$if` can fork
+# on (`$mach.target.{os,arch}`, `$target.{os,isa,abi}`). The #1391 union build
+# precomputes one per manifest target and evaluates each load-walk `$if` branch
+# under every tuple, so a branch taken by any target is followed (see
+# `comptime_branch_active_load`). Inert on a single-target build.
+rec TargetTuple {
+    os_id:         u32;
+    arch_id:       u32;
+    pointer_width: u32;
+    os_name:       intern.StrId;
+    isa_name:      intern.StrId;
+    abi_name:      intern.StrId;
+}
+
 pub rec Project {
     s:            *sess.Session;
     config:       ProjectConfig;
     target_entry: *TargetEntry;
     target:       tgt.Target;
+
+    # union build (#1391): true when this Project unions every manifest target's
+    # import closure for tooling (multi-target dedup). The load walk then takes a
+    # `$if` branch active under ANY `union_tuples` entry, not just the selected
+    # target, so modules reachable only from a non-default target are present
+    # (visible to workspace-wide rename). Modules still resolve under the selected
+    # (default) target's ctx — "default target's branches win". False/empty on an
+    # ordinary single-target build (`build_project_sel`), which is unchanged.
+    union:              bool;
+    union_tuples:       *TargetTuple;
+    union_tuple_count:  u32;
 
     compiler_name:  intern.StrId;
     compiler_ver:   intern.StrId;
@@ -411,11 +437,15 @@ pub fun enumerate_matrix(alloc: *Allocator, project_root: str,
 # project_root: filesystem path to the project root (containing mach.toml)
 # sel:          the build selection narrowing target/profile/artifact
 # ret:          fully populated Project, or an error message
-pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Selection) Result[Project, str] {
+# build_project_impl: the shared build pipeline behind both build_project_sel
+# (single target) and build_project_union (all targets). `for_union` records every
+# manifest target's tuple and flips on the union load walk (see load_config /
+# walk_comptime_if_union).
+fun build_project_impl(s: *sess.Session, project_root: str, sel: *manifest.Selection, for_union: bool) Result[Project, str] {
     var p: Project;
     init_project(?p, s);
 
-    val cfg_r: Result[bool, str] = load_project_config(?p, project_root, sel);
+    val cfg_r: Result[bool, str] = load_project_config(?p, project_root, sel, for_union);
     if (is_err[bool, str](cfg_r)) {
         dnit_project(?p);
         ret err[Project, str](unwrap_err[bool, str](cfg_r));
@@ -479,6 +509,72 @@ pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Se
     }
 
     ret ok[Project, str](p);
+}
+
+# build_project_sel: build the module graph for one build selection (target,
+# profile, artifact). The manifest reader resolves the selection into the
+# project's single target entry and concrete output paths.
+pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Selection) Result[Project, str] {
+    ret build_project_impl(s, project_root, sel, false);
+}
+
+# build_project_union: build the union of EVERY manifest target's import closure
+# into one deduplicated Project, for long-lived multi-target tooling (#1391).
+# Modules are deduped by FQN. A module reachable only via a non-default target's
+# `$if` is still loaded and present — so workspace-wide tooling (e.g. rename) sees
+# it (lsp #58) — and is resolved under the DEFAULT target's ctx ("default target's
+# branches win", the documented v1 default). A module that does not fully resolve
+# under that ctx records per-module diagnostics and the Project stays usable; the
+# union build is not aborted. For ordinary single-target builds use
+# build_project_sel.
+pub fun build_project_union(s: *sess.Session, project_root: str) Result[Project, str] {
+    var sel: manifest.Selection;
+    sel.target       = "";
+    sel.profile      = "";
+    sel.artifact     = "";
+    sel.want_lib     = false;
+    sel.has_artifact = false;
+    ret build_project_impl(s, project_root, ?sel, true);
+}
+
+# populate_union_tuples: record one TargetTuple per declared manifest target and
+# turn on union mode (#1391). The union load walk evaluates each `$if` branch
+# under every tuple, so a branch some target takes is followed. A manifest with no
+# `[target.*]` leaves the Project single-target (union stays off).
+fun populate_union_tuples(p: *Project, m: *manifest.Manifest) Result[bool, str] {
+    val n: u32 = m.target_count;
+    if (n == 0) { ret ok[bool, str](true); }
+    val tr: Result[*TargetTuple, str] = allocate[TargetTuple](p.s.alloc, n::usize);
+    if (is_err[*TargetTuple, str](tr)) { ret err[bool, str](unwrap_err[*TargetTuple, str](tr)); }
+    val tuples: *TargetTuple = unwrap_ok[*TargetTuple, str](tr);
+    var k: u32 = 0;
+    for (k < n) {
+        val td: *manifest.TargetDef = ?m.targets[k];
+        val os_opt:  Option[str] = intern.lookup(?p.s.interner, td.os);
+        val isa_opt: Option[str] = intern.lookup(?p.s.interner, td.isa);
+        if (is_none[str](os_opt) || is_none[str](isa_opt)) {
+            deallocate[TargetTuple](p.s.alloc, tuples, n::usize);
+            ret err[bool, str]("internal: union target tuple name not interned");
+        }
+        val os_id:   u32 = os_id_for(unwrap[str](os_opt));
+        val arch_id: u32 = arch_id_for(unwrap[str](isa_opt));
+        val sr: Result[tgt.Target, str] = tgt.select(?p.s.registry, os_id, arch_id);
+        if (is_err[tgt.Target, str](sr)) {
+            deallocate[TargetTuple](p.s.alloc, tuples, n::usize);
+            ret err[bool, str](unwrap_err[tgt.Target, str](sr));
+        }
+        tuples[k].os_id         = os_id;
+        tuples[k].arch_id       = arch_id;
+        tuples[k].pointer_width = unwrap_ok[tgt.Target, str](sr).arch.pointer_width;
+        tuples[k].os_name       = td.os;
+        tuples[k].isa_name      = td.isa;
+        tuples[k].abi_name      = td.abi;
+        k = k + 1;
+    }
+    p.union_tuples      = tuples;
+    p.union_tuple_count = n;
+    p.union             = true;
+    ret ok[bool, str](true);
 }
 
 # register_export_names: scan every module for `$<sym>.symbol = "..."` directives
@@ -762,6 +858,9 @@ pub fun dnit_project(p: *Project) {
     if (p.topo != nil && p.topo_cap > 0) {
         deallocate[sess.ModuleId](p.s.alloc, p.topo, p.topo_cap::usize);
     }
+    if (p.union_tuples != nil && p.union_tuple_count > 0) {
+        deallocate[TargetTuple](p.s.alloc, p.union_tuples, p.union_tuple_count::usize);
+    }
     map.dnit[intern.StrId, sess.ModuleId](?p.by_fqn);
     deallocate_config(?p.config, p.s.alloc);
 }
@@ -769,6 +868,9 @@ pub fun dnit_project(p: *Project) {
 fun init_project(p: *Project, s: *sess.Session) {
     p.s             = s;
     p.target_entry  = nil;
+    p.union              = false;
+    p.union_tuples       = nil;
+    p.union_tuple_count  = 0;
     p.target.os_id   = os.OS_UNKNOWN;
     p.target.arch_id = isa.ARCH_UNKNOWN;
     p.target.abi_id  = 0;
@@ -842,7 +944,7 @@ fun deallocate_config(c: *ProjectConfig, alloc: *Allocator) {
     c.cascade_lib_count = 0;
 }
 
-fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection) Result[bool, str] {
+fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection, for_union: bool) Result[bool, str] {
     val abs_root_r: Result[intern.StrId, str] = intern.intern(?p.s.interner, project_root);
     if (is_err[intern.StrId, str](abs_root_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](abs_root_r)); }
     p.config.project_root = unwrap_ok[intern.StrId, str](abs_root_r);
@@ -856,7 +958,7 @@ fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection
     if (is_err[toml.Table, str](toml_r)) { ret err[bool, str](unwrap_err[toml.Table, str](toml_r)); }
     var t: toml.Table = unwrap_ok[toml.Table, str](toml_r);
 
-    ret load_config(p, project_root, ?t, sel);
+    ret load_config(p, project_root, ?t, sel, for_union);
 }
 
 # load_config: parse the manifest, resolve the build selection into one build
@@ -864,7 +966,7 @@ fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection
 # single target entry plus the unit's concrete, template-expanded output paths.
 # collisions are checked before anything is built. a `native` selection that
 # finds no host match emits an unmissable warning here.
-fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.Selection) Result[bool, str] {
+fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.Selection, for_union: bool) Result[bool, str] {
     val mr: Result[manifest.Manifest, str] = manifest.parse(p.s.alloc, ?p.s.interner, t);
     if (is_err[manifest.Manifest, str](mr)) { ret err[bool, str](unwrap_err[manifest.Manifest, str](mr)); }
     var m: manifest.Manifest = unwrap_ok[manifest.Manifest, str](mr);
@@ -948,6 +1050,13 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     # build start, imported or not (#1326).
     val mc: Result[bool, str] = check_own_module(p, project_root);
     if (is_err[bool, str](mc)) { manifest.dnit(?m, p.s.alloc); ret mc; }
+
+    # multi-target tooling build (#1391): record every manifest target's tuple so
+    # the union load walk can follow each target's `$if` branches.
+    if (for_union) {
+        val ut: Result[bool, str] = populate_union_tuples(p, ?m);
+        if (is_err[bool, str](ut)) { manifest.dnit(?m, p.s.alloc); ret ut; }
+    }
 
     manifest.dnit(?m, p.s.alloc);
     ret ok[bool, str](true);
@@ -1974,10 +2083,16 @@ fun walk_comptime_if_for_load(p: *Project, mid: sess.ModuleId, ci: *decl.DeclCom
     val src_opt: Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
     if (is_none[*src.SourceFile](src_opt)) { ret err[bool, str]("module file_id not found in SourceMap"); }
     val source: str = unwrap[*src.SourceFile](src_opt).text;
+
+    # union build (#1391): load every branch taken by SOME manifest target, not
+    # just the selected target's branch (see walk_comptime_if_union).
+    if (p.union) { ret walk_comptime_if_union(p, mid, ci, source); }
+
+    # single-target build: the first branch active under the selected target wins.
     var bi: u32 = 0;
     for (bi < ci.branches_len) {
         val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
-        val take_r: Result[bool, str] = comptime_branch_active_load(p, mid, br, source);
+        val take_r: Result[bool, str] = comptime_branch_active_load(p, mid, br, source, true);
         if (is_err[bool, str](take_r)) { ret take_r; }
         if (unwrap_ok[bool, str](take_r)) {
             ret walk_decl_list_for_load(p, mid, br.body_start, br.body_len);
@@ -1987,7 +2102,13 @@ fun walk_comptime_if_for_load(p: *Project, mid: sess.ModuleId, ci: *decl.DeclCom
     ret ok[bool, str](true);
 }
 
-fun comptime_branch_active_load(p: *Project, mid: sess.ModuleId, br: *decl.ComptimeBranch, source: str) Result[bool, str] {
+# comptime_branch_active_load: whether a `$if`-chain branch's condition is active
+# under the module's CURRENT comptime ctx (its target tuple). An else branch
+# (`cond == EXPR_NIL`) is always active. A malformed / non-bool condition reports
+# a diagnostic and reads as inactive — but only when `emit_diag` is true, so the
+# union walk (which re-evaluates under every target) reports a bad cond once,
+# under the default tuple, not once per target.
+fun comptime_branch_active_load(p: *Project, mid: sess.ModuleId, br: *decl.ComptimeBranch, source: str, emit_diag: bool) Result[bool, str] {
     if (br.cond == id.EXPR_NIL) { ret ok[bool, str](true); }
     val m: *ModuleEntry = ?p.modules[mid::u32];
     val r: Result[comptime.CTValue, str] = comptime.eval(?m.ctx, ?m.a, source, br.cond, ?p.s.interner);
@@ -1995,17 +2116,111 @@ fun comptime_branch_active_load(p: *Project, mid: sess.ModuleId, br: *decl.Compt
     if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("comptime branch cond ExprId out of range"); }
     val cond_span: token.Span = unwrap[*expr.Expr](e_opt).span;
     if (is_err[comptime.CTValue, str](r)) {
-        val de: Result[bool, str] = diag.error(?p.s.diags, m.file_id, cond_span, unwrap_err[comptime.CTValue, str](r));
-        if (is_err[bool, str](de)) { ret de; }
+        if (emit_diag) {
+            val de: Result[bool, str] = diag.error(?p.s.diags, m.file_id, cond_span, unwrap_err[comptime.CTValue, str](r));
+            if (is_err[bool, str](de)) { ret de; }
+        }
         ret ok[bool, str](false);
     }
     val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r);
     if (v.kind != comptime.CT_KIND_BOOL) {
-        val de: Result[bool, str] = diag.error(?p.s.diags, m.file_id, cond_span, "comptime branch condition must be a bool");
-        if (is_err[bool, str](de)) { ret de; }
+        if (emit_diag) {
+            val de: Result[bool, str] = diag.error(?p.s.diags, m.file_id, cond_span, "comptime branch condition must be a bool");
+            if (is_err[bool, str](de)) { ret de; }
+        }
         ret ok[bool, str](false);
     }
     ret ok[bool, str](v.data.b);
+}
+
+# first_active_branch: index of the first branch in the `$if` chain active under
+# the module's current comptime ctx, or `branches_len` when none is (no else).
+# The union walk calls this once per manifest target (swapping the ctx tuple in
+# beforehand): that target's taken branch is its first active one.
+fun first_active_branch(p: *Project, mid: sess.ModuleId, ci: *decl.DeclComptimeIf, source: str, emit_diag: bool) Result[u32, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+        val a_r: Result[bool, str] = comptime_branch_active_load(p, mid, br, source, emit_diag);
+        if (is_err[bool, str](a_r)) { ret err[u32, str](unwrap_err[bool, str](a_r)); }
+        if (unwrap_ok[bool, str](a_r)) { ret ok[u32, str](bi); }
+        bi = bi + 1;
+    }
+    ret ok[u32, str](ci.branches_len);
+}
+
+# walk_comptime_if_union: load-walk a `$if` chain in union mode — load every
+# branch taken by SOME manifest target. Each target's taken branch is its first
+# active one (computed under that target's tuple, swapped into the module ctx and
+# restored after); the union of those branches is walked. Diagnostics fire only
+# under the default (selected) tuple. Modules pulled in by a non-default target's
+# branch thus land in the Project — visible to workspace-wide tooling — and still
+# resolve under the default ctx ("default target's branches win"). The default
+# tuple is the module's existing ctx; `union_tuples` covers every manifest target
+# (re-checking the default there is harmless).
+fun walk_comptime_if_union(p: *Project, mid: sess.ModuleId, ci: *decl.DeclComptimeIf, source: str) Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val n: u32 = ci.branches_len;
+    if (n == 0) { ret ok[bool, str](true); }
+
+    val tk_r: Result[*bool, str] = allocate[bool](p.s.alloc, n::usize);
+    if (is_err[*bool, str](tk_r)) { ret err[bool, str](unwrap_err[*bool, str](tk_r)); }
+    val taken: *bool = unwrap_ok[*bool, str](tk_r);
+    var z: u32 = 0;
+    for (z < n) { taken[z] = false; z = z + 1; }
+
+    # default tuple (the module's current ctx = selected target), WITH diagnostics.
+    val d_r: Result[u32, str] = first_active_branch(p, mid, ci, source, true);
+    if (is_err[u32, str](d_r)) { deallocate[bool](p.s.alloc, taken, n::usize); ret err[bool, str](unwrap_err[u32, str](d_r)); }
+    val d_idx: u32 = unwrap_ok[u32, str](d_r);
+    if (d_idx < n) { taken[d_idx] = true; }
+
+    # every other manifest target: swap its tuple into the ctx, no diagnostics.
+    val s_os_id: u32 = m.ctx.target_os_id;
+    val s_arch:  u32 = m.ctx.target_arch_id;
+    val s_pw:    u32 = m.ctx.pointer_width;
+    val s_os:  intern.StrId = m.ctx.target_os;
+    val s_isa: intern.StrId = m.ctx.target_isa;
+    val s_abi: intern.StrId = m.ctx.target_abi;
+    # INVARIANT: m.ctx is the same object resolve uses afterward, with the default
+    # target tuple. A leaked non-default tuple would silently corrupt resolve with
+    # no diagnostic. So each iteration restores the default tuple IMMEDIATELY after
+    # the eval — before the result is inspected or any error returns. Do not add a
+    # return between the override and the restore below.
+    var ti: u32 = 0;
+    for (ti < p.union_tuple_count) {
+        m.ctx.target_os_id   = p.union_tuples[ti].os_id;
+        m.ctx.target_arch_id = p.union_tuples[ti].arch_id;
+        m.ctx.pointer_width  = p.union_tuples[ti].pointer_width;
+        m.ctx.target_os      = p.union_tuples[ti].os_name;
+        m.ctx.target_isa     = p.union_tuples[ti].isa_name;
+        m.ctx.target_abi     = p.union_tuples[ti].abi_name;
+        val a_r: Result[u32, str] = first_active_branch(p, mid, ci, source, false);
+        m.ctx.target_os_id   = s_os_id;
+        m.ctx.target_arch_id = s_arch;
+        m.ctx.pointer_width  = s_pw;
+        m.ctx.target_os      = s_os;
+        m.ctx.target_isa     = s_isa;
+        m.ctx.target_abi     = s_abi;
+        if (is_err[u32, str](a_r)) { deallocate[bool](p.s.alloc, taken, n::usize); ret err[bool, str](unwrap_err[u32, str](a_r)); }
+        val idx: u32 = unwrap_ok[u32, str](a_r);
+        if (idx < n) { taken[idx] = true; }
+        ti = ti + 1;
+    }
+
+    # walk every taken branch's body into the load graph.
+    var bi: u32 = 0;
+    for (bi < n) {
+        if (taken[bi]) {
+            val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+            val w: Result[bool, str] = walk_decl_list_for_load(p, mid, br.body_start, br.body_len);
+            if (is_err[bool, str](w)) { deallocate[bool](p.s.alloc, taken, n::usize); ret w; }
+        }
+        bi = bi + 1;
+    }
+    deallocate[bool](p.s.alloc, taken, n::usize);
+    ret ok[bool, str](true);
 }
 
 # walk_use_for_load: handle one `use` decl during the load walk: interns
@@ -2616,4 +2831,361 @@ fun free_resolve_deps(alloc: *Allocator, deps: *resolve.ResolveDeps) {
     deallocate[resolve.ModuleExports](alloc, deps.entries, deps.count::usize);
     deps.entries = nil;
     deps.count   = 0;
+}
+
+# ut_cc3: concatenate three strings into a fresh nul-terminated buffer owned by
+# `alloc`. a path-join helper for the union-build tests below.
+fun ut_cc3(alloc: *Allocator, a: str, b: str, c: str) str {
+    val la: usize = str_len(a);
+    val lb: usize = str_len(b);
+    val lc: usize = str_len(c);
+    val r: Result[*u8, str] = allocate[u8](alloc, la + lb + lc + 1);
+    if (is_err[*u8, str](r)) { ret a; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    var j: usize = 0;
+    for (j < la) { buf[k] = a[j]; k = k + 1; j = j + 1; }
+    j = 0;
+    for (j < lb) { buf[k] = b[j]; k = k + 1; j = j + 1; }
+    j = 0;
+    for (j < lc) { buf[k] = c[j]; k = k + 1; j = j + 1; }
+    buf[k] = 0;
+    ret buf::str;
+}
+
+# ut_manifest: the shared two-target manifest the union tests scaffold. `native`
+# resolves the default to the host-matching target (linux or windows in CI).
+fun ut_manifest() str {
+    ret "[project]\nid = \"uniontest\"\nname = \"u\"\nversion = \"0.0.0\"\nsrc = \"src\"\ntarget = \"native\"\nout = \"out/{target}/bin/{name}{ext}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\next = \".exe\"\n\n[bin.uniontest]\nentry = \"main.mach\"\n";
+}
+
+# ut_scaffold: materialize a temp project (mach.toml + src/<files>) on disk and
+# return its root path; the caller removes the tree via fs.remove_all.
+fun ut_scaffold(alloc: *Allocator, names: *str, texts: *str, n: u32) Result[str, str] {
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(alloc, "mach_union_test");
+    if (is_err[fs.TempFile, str](tf_r)) { ret err[str, str](unwrap_err[fs.TempFile, str](tf_r)); }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+    val dup_r: Result[str, str] = str_dup(alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[str, str](dup_r)) { ret dup_r; }
+    val root: str = unwrap_ok[str, str](dup_r);
+
+    val d1: Result[bool, str] = fs.create_dir_all(alloc, root, 493);
+    if (is_err[bool, str](d1)) { ret err[str, str](unwrap_err[bool, str](d1)); }
+    val src_dir: str = ut_cc3(alloc, root, "/", "src");
+    val d2: Result[bool, str] = fs.create_dir_all(alloc, src_dir, 493);
+    if (is_err[bool, str](d2)) { ret err[str, str](unwrap_err[bool, str](d2)); }
+
+    val mf: str = ut_cc3(alloc, root, "/", "mach.toml");
+    val mb: str = ut_manifest();
+    val w0: Result[bool, str] = fs.write_file(mf, mb, str_len(mb), 420);
+    if (is_err[bool, str](w0)) { ret err[str, str](unwrap_err[bool, str](w0)); }
+
+    var i: u32 = 0;
+    for (i < n) {
+        val fp: str = ut_cc3(alloc, src_dir, "/", names[i]);
+        val w: Result[bool, str] = fs.write_file(fp, texts[i], str_len(texts[i]), 420);
+        if (is_err[bool, str](w)) { ret err[str, str](unwrap_err[bool, str](w)); }
+        i = i + 1;
+    }
+    ret ok[str, str](root);
+}
+
+# ut_build: scaffold the module set, build the multi-target union Project, remove
+# the temp tree, and return the Project. the session is the caller's to tear down.
+fun ut_build(s: *sess.Session, alloc: *Allocator, names: *str, texts: *str, n: u32) Result[Project, str] {
+    val root_r: Result[str, str] = ut_scaffold(alloc, names, texts, n);
+    if (is_err[str, str](root_r)) { ret err[Project, str](unwrap_err[str, str](root_r)); }
+    val root: str = unwrap_ok[str, str](root_r);
+    val rr: Result[bool, str] = tgt.register_all(?s.registry, ?s.interner);
+    if (is_err[bool, str](rr)) { fs.remove_all(alloc, root); ret err[Project, str](unwrap_err[bool, str](rr)); }
+    val pr: Result[Project, str] = build_project_union(s, root);
+    fs.remove_all(alloc, root);
+    ret pr;
+}
+
+# ut_has: whether the union Project loaded a module with the given FQN.
+fun ut_has(p: *Project, s: *sess.Session, fqn: str) bool {
+    val idr: Result[intern.StrId, str] = intern.intern(?s.interner, fqn);
+    if (is_err[intern.StrId, str](idr)) { ret false; }
+    var id: intern.StrId = unwrap_ok[intern.StrId, str](idr);
+    ret is_ok[*sess.ModuleId, str](map.get[intern.StrId, sess.ModuleId](?p.by_fqn, ?id));
+}
+
+# ut_ctx: the comptime ctx of the named module, or nil if it was not loaded.
+fun ut_ctx(p: *Project, s: *sess.Session, fqn: str) *comptime.ComptimeCtx {
+    val idr: Result[intern.StrId, str] = intern.intern(?s.interner, fqn);
+    if (is_err[intern.StrId, str](idr)) { ret nil; }
+    var id: intern.StrId = unwrap_ok[intern.StrId, str](idr);
+    val mr: Result[*sess.ModuleId, str] = map.get[intern.StrId, sess.ModuleId](?p.by_fqn, ?id);
+    if (is_err[*sess.ModuleId, str](mr)) { ret nil; }
+    val mid: sess.ModuleId = @unwrap_ok[*sess.ModuleId, str](mr);
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    ret ?m.ctx;
+}
+
+# ut_count_errors: number of error-severity diagnostics recorded on the session.
+fun ut_count_errors(d: *diag.DiagList) u32 {
+    var c: u32 = 0;
+    var i: usize = 0;
+    for (i < d.len) {
+        if (d.items[i].severity == diag.SEVERITY_ERROR) { c = c + 1; }
+        i = i + 1;
+    }
+    ret c;
+}
+
+test "driver union: a module gated behind a non-default target's $if is still loaded (#1391/lsp#58)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "$if ($mach.target.os == $mach.os.linux) { use uniontest.a; }\n$or ($mach.target.os == $mach.os.windows) { use uniontest.b; }\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+
+    val pr: Result[Project, str] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 3);
+    if (is_err[Project, str](pr)) { sess.dnit(?s); ret 1; }
+    var p: Project = unwrap_ok[Project, str](pr);
+
+    # both the default-target module (a, on a linux host) and the non-default
+    # module (b, windows-only) are present, so workspace tooling sees the full graph.
+    var bad: i32 = 0;
+    if (!ut_has(?p, ?s, "uniontest.main")) { bad = 1; }
+    or (!ut_has(?p, ?s, "uniontest.a"))    { bad = 1; }
+    or (!ut_has(?p, ?s, "uniontest.b"))    { bad = 1; }
+
+    dnit_project(?p);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver union: each target contributes only its first active branch (#1391)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    # both targets are 64-bit, so the first branch (a) is every target's first active
+    # one; b's condition is true on linux but b is never a FIRST match, so the union
+    # includes a and excludes b (first-active per target, not include-every-true).
+    texts[0] = "$if ($mach.target.pointer_width == 8) { use uniontest.a; }\n$or ($mach.target.os == $mach.os.linux) { use uniontest.b; }\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+
+    val pr: Result[Project, str] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 3);
+    if (is_err[Project, str](pr)) { sess.dnit(?s); ret 1; }
+    var p: Project = unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    if (!ut_has(?p, ?s, "uniontest.a")) { bad = 1; }
+    or (ut_has(?p, ?s, "uniontest.b"))  { bad = 1; }
+
+    dnit_project(?p);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver union: every module's comptime ctx is restored to the default tuple (#1391)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "$if ($mach.target.os == $mach.os.linux) { use uniontest.a; }\n$or ($mach.target.os == $mach.os.windows) { use uniontest.b; }\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+
+    val pr: Result[Project, str] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 3);
+    if (is_err[Project, str](pr)) { sess.dnit(?s); ret 1; }
+    var p: Project = unwrap_ok[Project, str](pr);
+
+    # the per-target tuple is overridden then restored per union-walk iteration; no
+    # module may carry a leaked non-default tuple afterward, so every loaded module's
+    # ctx tuple must match and equal the host (native-resolved default) tuple.
+    val cm: *comptime.ComptimeCtx = ut_ctx(?p, ?s, "uniontest.main");
+    val ca: *comptime.ComptimeCtx = ut_ctx(?p, ?s, "uniontest.a");
+    val cb: *comptime.ComptimeCtx = ut_ctx(?p, ?s, "uniontest.b");
+
+    var bad: i32 = 0;
+    if (cm == nil || ca == nil || cb == nil)     { bad = 1; }
+    or (cm.target_os_id != ca.target_os_id)      { bad = 1; }
+    or (cm.target_os_id != cb.target_os_id)      { bad = 1; }
+    or (cm.target_arch_id != ca.target_arch_id)  { bad = 1; }
+    or (cm.target_arch_id != cb.target_arch_id)  { bad = 1; }
+    or (cm.pointer_width != ca.pointer_width)    { bad = 1; }
+    or (cm.pointer_width != cb.pointer_width)    { bad = 1; }
+    or (cm.target_os_id != tgt.host_os_id())     { bad = 1; }
+    or (cm.target_arch_id != tgt.host_arch_id()) { bad = 1; }
+
+    dnit_project(?p);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver union: a comptime const in a branch condition survives the tuple override (#1391)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    # FLAG is a module const, not a target parameter, so it must read 1 under every
+    # per-target tuple the walk swaps in — selecting the second branch (b) for all.
+    texts[0] = "pub val FLAG: i32 = 1;\n$if (FLAG == 0) { use uniontest.a; }\n$or (FLAG == 1) { use uniontest.b; }\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+
+    val pr: Result[Project, str] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 3);
+    if (is_err[Project, str](pr)) { sess.dnit(?s); ret 1; }
+    var p: Project = unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    if (ut_has(?p, ?s, "uniontest.a"))  { bad = 1; }
+    or (!ut_has(?p, ?s, "uniontest.b")) { bad = 1; }
+
+    dnit_project(?p);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver union: a non-default module that fails to resolve degrades gracefully (#1391)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "$if ($mach.target.os == $mach.os.linux) { use uniontest.a; }\n$or ($mach.target.os == $mach.os.windows) { use uniontest.b; }\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    # b references an undefined symbol, so it fails to resolve under the default ctx.
+    texts[2] = "pub fun fb() i32 { ret undefined_symbol_xyz; }\n";
+
+    val pr: Result[Project, str] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 3);
+    # the union build must NOT abort on a per-module resolve failure.
+    if (is_err[Project, str](pr)) { sess.dnit(?s); ret 1; }
+    var p: Project = unwrap_ok[Project, str](pr);
+
+    # the broken module is still loaded (tooling sees it) and its failure surfaces as
+    # a diagnostic rather than aborting the whole Project.
+    var bad: i32 = 0;
+    if (!ut_has(?p, ?s, "uniontest.b")) { bad = 1; }
+    or (!diag.has_errors(?s.diags))     { bad = 1; }
+
+    dnit_project(?p);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver union: a malformed branch condition is reported once, not once per target (#1391)" {
+    # build the same malformed-condition project two ways — a single-target build and
+    # the multi-target union — and require equal error counts. the union evaluates the
+    # condition under every target tuple but emits diagnostics only under the default
+    # one, so it must not multiply the condition error per target.
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "$if (5) { use uniontest.a; }\n\nfun main() i32 { ret 0; }\n";
+
+    var a1: Allocator;
+    if (is_some[str](page.make(?a1))) { ret 1; }
+    val sr1: Result[sess.Session, str] = sess.init(?a1);
+    if (is_err[sess.Session, str](sr1)) { ret 1; }
+    var s1: sess.Session = unwrap_ok[sess.Session, str](sr1);
+    val root1_r: Result[str, str] = ut_scaffold(?a1, ?names[0], ?texts[0], 1);
+    if (is_err[str, str](root1_r)) { sess.dnit(?s1); ret 1; }
+    val root1: str = unwrap_ok[str, str](root1_r);
+    val rr1: Result[bool, str] = tgt.register_all(?s1.registry, ?s1.interner);
+    if (is_err[bool, str](rr1)) { fs.remove_all(?a1, root1); sess.dnit(?s1); ret 1; }
+    var sel: manifest.Selection;
+    sel.target = ""; sel.profile = ""; sel.artifact = ""; sel.want_lib = false; sel.has_artifact = false;
+    val p1r: Result[Project, str] = build_project_sel(?s1, root1, ?sel);
+    fs.remove_all(?a1, root1);
+    if (is_err[Project, str](p1r)) { sess.dnit(?s1); ret 1; }
+    var p1: Project = unwrap_ok[Project, str](p1r);
+    val single_errs: u32 = ut_count_errors(?s1.diags);
+
+    var a2: Allocator;
+    if (is_some[str](page.make(?a2))) { dnit_project(?p1); sess.dnit(?s1); ret 1; }
+    val sr2: Result[sess.Session, str] = sess.init(?a2);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?p1); sess.dnit(?s1); ret 1; }
+    var s2: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    val p2r: Result[Project, str] = ut_build(?s2, ?a2, ?names[0], ?texts[0], 1);
+    if (is_err[Project, str](p2r)) { dnit_project(?p1); sess.dnit(?s1); sess.dnit(?s2); ret 1; }
+    var p2: Project = unwrap_ok[Project, str](p2r);
+    val union_errs: u32 = ut_count_errors(?s2.diags);
+
+    var bad: i32 = 0;
+    if (single_errs == 0)          { bad = 1; }
+    or (union_errs != single_errs) { bad = 1; }
+
+    dnit_project(?p1);
+    dnit_project(?p2);
+    sess.dnit(?s1);
+    sess.dnit(?s2);
+    ret bad;
+}
+
+test "driver union: branch selection via the $target.os string tag exercises and restores the StrId tuple (#1391)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    # gate on the $target.os STRING tag (the StrId-backed ctx field), not the numeric
+    # $mach.target.os — so the per-target StrId override and its restore are both
+    # load-bearing (the numeric-tag tests would pass even with a broken StrId restore).
+    texts[0] = "$if ($target.os == \"linux\") { use uniontest.a; }\n$or ($target.os == \"windows\") { use uniontest.b; }\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+
+    val pr: Result[Project, str] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 3);
+    if (is_err[Project, str](pr)) { sess.dnit(?s); ret 1; }
+    var p: Project = unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    # both string-gated branches are taken — the per-target StrId override drives selection.
+    if (!ut_has(?p, ?s, "uniontest.a")) { bad = 1; }
+    or (!ut_has(?p, ?s, "uniontest.b")) { bad = 1; }
+
+    # the StrId tuple fields (target_os/isa/abi) must be restored to the default after
+    # the walk: main runs the union $if walk, a and b do not, so a broken StrId restore
+    # would leave main carrying a non-default tuple while a/b keep the default.
+    val cm: *comptime.ComptimeCtx = ut_ctx(?p, ?s, "uniontest.main");
+    val ca: *comptime.ComptimeCtx = ut_ctx(?p, ?s, "uniontest.a");
+    val cb: *comptime.ComptimeCtx = ut_ctx(?p, ?s, "uniontest.b");
+    if (cm == nil || ca == nil || cb == nil) { bad = 1; }
+    or (cm.target_os != ca.target_os)        { bad = 1; }
+    or (cm.target_os != cb.target_os)        { bad = 1; }
+    or (cm.target_isa != ca.target_isa)      { bad = 1; }
+    or (cm.target_isa != cb.target_isa)      { bad = 1; }
+    or (cm.target_abi != ca.target_abi)      { bad = 1; }
+    or (cm.target_abi != cb.target_abi)      { bad = 1; }
+
+    dnit_project(?p);
+    sess.dnit(?s);
+    ret bad;
 }
