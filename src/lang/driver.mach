@@ -436,11 +436,15 @@ pub fun enumerate_matrix(alloc: *Allocator, project_root: str,
 # project_root: filesystem path to the project root (containing mach.toml)
 # sel:          the build selection narrowing target/profile/artifact
 # ret:          fully populated Project, or an error message
-pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Selection) Result[Project, str] {
+# build_project_impl: the shared build pipeline behind both build_project_sel
+# (single target) and build_project_union (all targets). `for_union` records every
+# manifest target's tuple and flips on the union load walk (see load_config /
+# walk_comptime_if_union).
+fun build_project_impl(s: *sess.Session, project_root: str, sel: *manifest.Selection, for_union: bool) Result[Project, str] {
     var p: Project;
     init_project(?p, s);
 
-    val cfg_r: Result[bool, str] = load_project_config(?p, project_root, sel);
+    val cfg_r: Result[bool, str] = load_project_config(?p, project_root, sel, for_union);
     if (is_err[bool, str](cfg_r)) {
         dnit_project(?p);
         ret err[Project, str](unwrap_err[bool, str](cfg_r));
@@ -504,6 +508,72 @@ pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Se
     }
 
     ret ok[Project, str](p);
+}
+
+# build_project_sel: build the module graph for one build selection (target,
+# profile, artifact). The manifest reader resolves the selection into the
+# project's single target entry and concrete output paths.
+pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Selection) Result[Project, str] {
+    ret build_project_impl(s, project_root, sel, false);
+}
+
+# build_project_union: build the union of EVERY manifest target's import closure
+# into one deduplicated Project, for long-lived multi-target tooling (#1391).
+# Modules are deduped by FQN. A module reachable only via a non-default target's
+# `$if` is still loaded and present — so workspace-wide tooling (e.g. rename) sees
+# it (lsp #58) — and is resolved under the DEFAULT target's ctx ("default target's
+# branches win", the documented v1 default). A module that does not fully resolve
+# under that ctx records per-module diagnostics and the Project stays usable; the
+# union build is not aborted. For ordinary single-target builds use
+# build_project_sel.
+pub fun build_project_union(s: *sess.Session, project_root: str) Result[Project, str] {
+    var sel: manifest.Selection;
+    sel.target       = "";
+    sel.profile      = "";
+    sel.artifact     = "";
+    sel.want_lib     = false;
+    sel.has_artifact = false;
+    ret build_project_impl(s, project_root, ?sel, true);
+}
+
+# populate_union_tuples: record one TargetTuple per declared manifest target and
+# turn on union mode (#1391). The union load walk evaluates each `$if` branch
+# under every tuple, so a branch some target takes is followed. A manifest with no
+# `[target.*]` leaves the Project single-target (union stays off).
+fun populate_union_tuples(p: *Project, m: *manifest.Manifest) Result[bool, str] {
+    val n: u32 = m.target_count;
+    if (n == 0) { ret ok[bool, str](true); }
+    val tr: Result[*TargetTuple, str] = allocate[TargetTuple](p.s.alloc, n::usize);
+    if (is_err[*TargetTuple, str](tr)) { ret err[bool, str](unwrap_err[*TargetTuple, str](tr)); }
+    val tuples: *TargetTuple = unwrap_ok[*TargetTuple, str](tr);
+    var k: u32 = 0;
+    for (k < n) {
+        val td: *manifest.TargetDef = ?m.targets[k];
+        val os_opt:  Option[str] = intern.lookup(?p.s.interner, td.os);
+        val isa_opt: Option[str] = intern.lookup(?p.s.interner, td.isa);
+        if (is_none[str](os_opt) || is_none[str](isa_opt)) {
+            deallocate[TargetTuple](p.s.alloc, tuples, n::usize);
+            ret err[bool, str]("internal: union target tuple name not interned");
+        }
+        val os_id:   u32 = os_id_for(unwrap[str](os_opt));
+        val arch_id: u32 = arch_id_for(unwrap[str](isa_opt));
+        val sr: Result[tgt.Target, str] = tgt.select(?p.s.registry, os_id, arch_id);
+        if (is_err[tgt.Target, str](sr)) {
+            deallocate[TargetTuple](p.s.alloc, tuples, n::usize);
+            ret err[bool, str](unwrap_err[tgt.Target, str](sr));
+        }
+        tuples[k].os_id         = os_id;
+        tuples[k].arch_id       = arch_id;
+        tuples[k].pointer_width = unwrap_ok[tgt.Target, str](sr).arch.pointer_width;
+        tuples[k].os_name       = td.os;
+        tuples[k].isa_name      = td.isa;
+        tuples[k].abi_name      = td.abi;
+        k = k + 1;
+    }
+    p.union_tuples      = tuples;
+    p.union_tuple_count = n;
+    p.union             = true;
+    ret ok[bool, str](true);
 }
 
 # register_export_names: scan every module for `$<sym>.symbol = "..."` directives
@@ -873,7 +943,7 @@ fun deallocate_config(c: *ProjectConfig, alloc: *Allocator) {
     c.cascade_lib_count = 0;
 }
 
-fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection) Result[bool, str] {
+fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection, for_union: bool) Result[bool, str] {
     val abs_root_r: Result[intern.StrId, str] = intern.intern(?p.s.interner, project_root);
     if (is_err[intern.StrId, str](abs_root_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](abs_root_r)); }
     p.config.project_root = unwrap_ok[intern.StrId, str](abs_root_r);
@@ -887,7 +957,7 @@ fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection
     if (is_err[toml.Table, str](toml_r)) { ret err[bool, str](unwrap_err[toml.Table, str](toml_r)); }
     var t: toml.Table = unwrap_ok[toml.Table, str](toml_r);
 
-    ret load_config(p, project_root, ?t, sel);
+    ret load_config(p, project_root, ?t, sel, for_union);
 }
 
 # load_config: parse the manifest, resolve the build selection into one build
@@ -895,7 +965,7 @@ fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection
 # single target entry plus the unit's concrete, template-expanded output paths.
 # collisions are checked before anything is built. a `native` selection that
 # finds no host match emits an unmissable warning here.
-fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.Selection) Result[bool, str] {
+fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.Selection, for_union: bool) Result[bool, str] {
     val mr: Result[manifest.Manifest, str] = manifest.parse(p.s.alloc, ?p.s.interner, t);
     if (is_err[manifest.Manifest, str](mr)) { ret err[bool, str](unwrap_err[manifest.Manifest, str](mr)); }
     var m: manifest.Manifest = unwrap_ok[manifest.Manifest, str](mr);
@@ -979,6 +1049,13 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     # build start, imported or not (#1326).
     val mc: Result[bool, str] = check_own_module(p, project_root);
     if (is_err[bool, str](mc)) { manifest.dnit(?m, p.s.alloc); ret mc; }
+
+    # multi-target tooling build (#1391): record every manifest target's tuple so
+    # the union load walk can follow each target's `$if` branches.
+    if (for_union) {
+        val ut: Result[bool, str] = populate_union_tuples(p, ?m);
+        if (is_err[bool, str](ut)) { manifest.dnit(?m, p.s.alloc); ret ut; }
+    }
 
     manifest.dnit(?m, p.s.alloc);
     ret ok[bool, str](true);
