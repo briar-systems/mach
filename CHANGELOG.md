@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-06-13
+
+Native Windows lane: CI now builds `mach.exe` and runs the in-source test suite
+on real Windows, not just the wine cross-compile path. Two codegen fixes complete
+the windows backend end to end — per-page stack probing for frames over a page,
+and per-descriptor PE import call-thunks — and the vendored standard library is
+updated to its windows-complete release. The native lane passes 468/468.
+
+### Fixed
+
+- Windows function prologues now probe the stack one page at a time for frames
+  larger than a page, instead of a bare `sub rsp, N`. Windows commits the stack
+  one guard page at a time, so a single large subtraction skipped the guard page
+  and the first write near the bottom of the frame faulted on reserved memory
+  (`STATUS_ACCESS_VIOLATION`); Linux and wine auto-grow the stack on any in-range
+  fault and so never surfaced it. The encoder now emits the inline `__chkstk`
+  page-walk (mach links no runtime) when the target OS commits incrementally — a
+  new `OsVTable.stack_probe` flag (true on Windows, false on Linux/Darwin) gated
+  by the OS `page_size`. This was the root cause of the native-Windows exec
+  failures in octalide/mach-std#262 (a 32 KiB `spawn_redirected` cmdline frame)
+  (#1395).
+- PE import call-thunks for the **last** import descriptor jumped through the
+  previous descriptor's null IAT slot (a `jmp 0` access violation on the first
+  call). `pe_iat_slot_rva` never advanced its dependency index, so it re-scanned
+  only the first descriptor when mapping an import ordinal to its IAT slot — the
+  trailing descriptor's stubs landed short of its `FirstThunk`. Reordering the
+  `libs` list moved the breakage to whichever DLL was last. Now every import's
+  thunk targets its own descriptor's slot, so the trailing descriptor's calls
+  (e.g. advapi32's `SystemFunction036`) dispatch correctly (#1388).
+
 ## [1.5.0] - 2026-06-12
 
 Inline-asm & foundations: carry-flag mnemonics and numeric local labels in x64
