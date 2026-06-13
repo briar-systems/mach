@@ -32,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interner-elimination from the OS vtable started in #1377. Behavior-preserving,
   verified by the byte-identical self-host fixpoint (#1402).
 
+### Fixed
+
+- objfmt: the COFF and ELF object-file parsers allocate the section/symbol/relocation
+  arrays up front but left each `ObjectImage` count at `0` until its populate loop
+  finished, so an error return before or within those loops (a truncated or hostile
+  object) leaked the arrays — `obj.dnit` frees nothing when the counts are `0`. Each
+  count is now set to its populated size immediately after the array is allocated (the
+  loops use local write cursors), so teardown reclaims the full arrays on any later
+  parse error; the ELF symbol array is sized and counted to the populated count
+  (excluding the reserved index-0 entry) so allocation, count, and entries all agree.
+  Emitted output is unchanged (#1410).
+
 ## [1.5.3] - 2026-06-13
 
 Correctness patch for two silent defects in shipped v1.5.2: a relocation
@@ -40,13 +52,6 @@ and an extreme float-literal exponent that hung the compiler.
 
 ### Fixed
 
-- objfmt: the COFF and ELF object-file parsers allocate the section/symbol/relocation
-  arrays up front but left each `ObjectImage` count at `0` until its populate loop
-  finished, so an error return before or within those loops (a truncated or hostile
-  object) leaked the arrays — `obj.dnit` frees nothing when the counts are `0`. Each
-  count is now set to its allocation size immediately after the array is allocated
-  (the loops use local write cursors), so teardown reclaims the full arrays on any
-  later parse error. Emitted output is unchanged (#1410).
 - codegen (x86-64): an 8-byte store of an immediate outside signed-`imm32` range to
   a global is legalized into `MOVABS r11, imm64` + a register store, but the PC32
   relocation was patched at the pre-legalization offset — landing 4 bytes early,
