@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrecognized manifest `os`/`isa` name now reports a distinct "unknown target os/isa
   name '<name>' (expected: ...)" diagnostic instead of folding to `*_UNKNOWN` and being
   mis-reported as an unsupported pair (#1412).
+- The `OsVTable` `entry_symbol`, `syscall_layer`, `libdir`, and `dynamic_linker`
+  fields are immutable `str` constants set directly by the OS registrars, no longer
+  `StrId` fields re-interned per session; the linker now interns these at the point
+  of use (the entry-symbol lookup and the dynamic interpreter path), completing the
+  interner-elimination from the OS vtable started in #1377. Behavior-preserving,
+  verified by the byte-identical self-host fixpoint (#1402).
 
 ## [1.5.3] - 2026-06-13
 
