@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default target's branches win" — and a module that does not fully resolve there
   records diagnostics without aborting the build (#1391).
 
+## [1.5.3] - 2026-06-13
+
+Correctness patch for two silent defects in shipped v1.5.2: a relocation
+patch-site miscompute that corrupted out-of-`imm32` constant stores to globals,
+and an extreme float-literal exponent that hung the compiler.
+
 ### Fixed
 
 - codegen (x86-64): an 8-byte store of an immediate outside signed-`imm32` range to
