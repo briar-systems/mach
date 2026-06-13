@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default target's branches win" — and a module that does not fully resolve there
   records diagnostics without aborting the build (#1391).
 
+### Changed
+
+- target: the os/arch name↔id mapping is consolidated to one canonical table per
+  dimension — `os.os_id_for`/`os.os_name_for` and `isa.arch_id_for`/`isa.arch_name_for`
+  — replacing the copies that lived in `driver.mach` and `manifest.mach`. An
+  unrecognized manifest `os`/`isa` name now reports a distinct "unknown target os/isa
+  name '<name>' (expected: ...)" diagnostic instead of folding to `*_UNKNOWN` and being
+  mis-reported as an unsupported pair (#1412).
+
 ## [1.5.3] - 2026-06-13
 
 Correctness patch for two silent defects in shipped v1.5.2: a relocation
