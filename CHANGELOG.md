@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of use (the entry-symbol lookup and the dynamic interpreter path), completing the
   interner-elimination from the OS vtable started in #1377. Behavior-preserving,
   verified by the byte-identical self-host fixpoint (#1402).
+- objfmt (COFF): the writer/reader resolve every relocation's target symbol through a
+  name→index map built once per pass instead of a linear symbol-table scan per
+  relocation, turning the two reloc passes from O(reloc × symbol) into O(reloc +
+  symbol). Behavior-preserving (same indices resolved, same unresolved-symbol error),
+  verified by the byte-identical self-host fixpoint (#1413).
 
 ### Fixed
 
