@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- PE import call-thunks for the **last** import descriptor jumped through the
+  previous descriptor's null IAT slot (a `jmp 0` access violation on the first
+  call). `pe_iat_slot_rva` never advanced its dependency index, so it re-scanned
+  only the first descriptor when mapping an import ordinal to its IAT slot — the
+  trailing descriptor's stubs landed short of its `FirstThunk`. Reordering the
+  `libs` list moved the breakage to whichever DLL was last. Now every import's
+  thunk targets its own descriptor's slot, so the trailing descriptor's calls
+  (e.g. advapi32's `SystemFunction036`) dispatch correctly (#1388).
+
 ## [1.5.0] - 2026-06-12
 
 Inline-asm & foundations: carry-flag mnemonics and numeric local labels in x64

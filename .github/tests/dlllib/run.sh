@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# dlllib integration test (#1382): per-symbol windows DLL attribution.
+# dlllib integration test (#1382 attribution, #1388 trailing call-thunk):
+# per-symbol windows DLL attribution and the import call-thunk dispatch.
 #
 # the PE import directory used to be built position-based — build_dynamic_info
 # pinned every undefined `ext` import to DYNLIB_ANY, which the COFF writer
@@ -8,15 +9,22 @@
 # renames silently did nothing. winsock bindings therefore landed on kernel32
 # under their mach identifiers and aborted at call time on real windows.
 #
-# this builds a windows app that spreads imports across kernel32.dll and
-# ws2_32.dll with `$<sym>.library`, renames decls with `$<sym>.symbol`, and uses
-# both directives on one decl, then verifies three ways:
+# #1388 then exposed the call-thunk side: pe_iat_slot_rva never advanced the
+# dependency index, so the *trailing* import descriptor's stubs jumped through
+# the previous descriptor's null IAT slot (a `jmp 0` access violation on the
+# first call). advapi32.dll is the trailing descriptor here and its import is
+# actually called, so a clean run proves the last thunk dispatches.
+#
+# this builds a windows app that spreads imports across kernel32.dll, ws2_32.dll
+# and advapi32.dll with `$<sym>.library`, renames decls with `$<sym>.symbol`, and
+# uses both directives on one decl, then verifies three ways:
 #   1. structurally — parse the emitted PE's import directory and assert each
 #      import sits under the DLL it was attributed to, by its final (renamed)
 #      link name. uses binutils objdump (BFD's pei support), falling back to
 #      llvm-readobj, and skips this half with a notice when neither reads a PE.
 #   2. behaviorally — run the binary under wine; WSAStartup/WSACleanup resolve
-#      only through a correct ws2_32 attribution, so exit 0 proves the routing.
+#      only through a correct ws2_32 attribution, and SystemFunction036 dispatches
+#      only through a correct trailing-descriptor thunk, so exit 0 proves both.
 #   3. negatively — a `$<sym>.library` naming a DLL absent from the link's
 #      dependencies must fail the build rather than silently fall back.
 #
@@ -91,6 +99,7 @@ fi
 if [ -n "$INSPECT" ]; then
     k32="$(imports_under kernel32.dll)"
     ws2="$(imports_under ws2_32.dll)"
+    adv="$(imports_under advapi32.dll)"
 
     # assert <list> contains <symbol> under <dll-label>.
     has() {
@@ -109,26 +118,33 @@ if [ -n "$INSPECT" ]; then
         fi
     }
 
-    has Sleep      "$k32" kernel32.dll   # `.symbol` rename, default attribution
-    has WSAStartup "$ws2" ws2_32.dll     # `.library` pin, bare name
-    has WSACleanup "$ws2" ws2_32.dll     # `.library` + `.symbol` on one decl
+    has Sleep            "$k32" kernel32.dll   # `.symbol` rename, default attribution
+    has WSAStartup       "$ws2" ws2_32.dll     # `.library` pin, bare name
+    has WSACleanup       "$ws2" ws2_32.dll     # `.library` + `.symbol` on one decl
+    has SystemFunction036 "$adv" advapi32.dll  # trailing descriptor (#1388)
     # the winsock imports must be attributed away from the first dependency.
     lacks WSAStartup  "$k32" kernel32.dll
     lacks WSACleanup  "$k32" kernel32.dll
+    # advapi32's import must not land on the first dependency either.
+    lacks SystemFunction036 "$k32" kernel32.dll
     # the mach identifiers must not survive their `.symbol` renames.
     lacks sleep_ms    "$k32" kernel32.dll
     lacks ws2_cleanup "$ws2" ws2_32.dll
+    lacks rng_fill    "$adv" advapi32.dll
 else
     echo "INFO dlllib: no PE import inspector (objdump/llvm-readobj); skipping the structural check"
 fi
 
 # behavioral: run the binary under wine. the winsock calls resolve only through
-# the ws2_32 attribution, so a clean exit proves the imports route correctly.
+# the ws2_32 attribution, and the trailing advapi32 call (SystemFunction036)
+# dispatches only through a correct last-descriptor thunk (#1388) — under the bug
+# it jumped through a null IAT slot and faulted with rip=0. a clean exit proves
+# both the attribution and the trailing call-thunk.
 if command -v wine >/dev/null 2>&1; then
     if WINEDEBUG=-all wine "$EXE" >"$WORK/wine.out" 2>&1; then
-        echo "PASS dlllib: WSAStartup/WSACleanup resolve through ws2_32.dll under wine"
+        echo "PASS dlllib: winsock and the trailing advapi32 call resolve under wine"
     else
-        echo "FAIL dlllib: ws2_32 program aborted under wine (mis-attribution?)" >&2
+        echo "FAIL dlllib: program aborted under wine (mis-attribution or trailing thunk?)" >&2
         cat "$WORK/wine.out" >&2
         fail=1
     fi
