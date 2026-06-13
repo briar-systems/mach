@@ -50,8 +50,11 @@ fi
 EXE="$WORK/app/out/windows/bin/win64fnptr.exe"
 test -f "$EXE" || { echo "error: windows binary not produced at $EXE" >&2; exit 1; }
 
+# bound the run with `timeout`: a regressed binary faults, and wine's crash
+# handler (winedbg --auto) can hang rather than exit, which would stall the
+# integration job — the timeout turns that hang into a fast nonzero exit (124).
 set +e
-WINEDEBUG=-all wine "$EXE" >/dev/null 2>&1
+WINEDEBUG=-all timeout 60 wine "$EXE" >/dev/null 2>&1
 code=$?
 set -e
 
