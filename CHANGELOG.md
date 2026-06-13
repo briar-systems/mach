@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- target: the dead `IsaVTable.endianness` field is removed. It was set by the ISA
+  registrars but read by nobody — the object-format writers hardcode little-endian —
+  so the field documented a behavior that did not exist. The `ENDIAN_LITTLE`/
+  `ENDIAN_BIG` enum is retained for the eventual big-endian abstraction, and the
+  comments that claimed endianness was honored now state the little-endian
+  assumption plainly (#1411).
+
+### Fixed
+
+- target (aarch64): `IsaVTable.fp_scratch_reg` for the (stub) arm64 backend is now
+  the composite vector register id `regid_make(REG_CLASS_ID_XMM, 31)` instead of the
+  raw bank index `31`, which would have read as a GP register. Dead today (the arm64
+  backend has no encoder), corrected before it seeds the future backend (#1414).
+
 ## [1.5.3] - 2026-06-13
 
 Correctness patch for two silent defects in shipped v1.5.2: a relocation
