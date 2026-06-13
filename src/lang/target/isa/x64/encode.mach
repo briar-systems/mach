@@ -2137,6 +2137,20 @@ fun emit_xmm_load(st: *EncodeState, idx: i32, disp: i32) {
     emit_inst(st, ?mi);
 }
 
+# needs_stack_probe: whether a frame of `total` bytes must be allocated with a
+# per-page guard-page walk rather than a single `sub rsp`. true only when the
+# target OS commits the stack incrementally (`stack_probe`) and the frame exceeds
+# one page — at or below a page the first frame access takes the single legitimate
+# guard fault the OS handles, so a bare subtraction is safe. an OS that auto-grows
+# on any in-range fault (Linux, Darwin) never probes.
+# ---
+# os:    resolved OS vtable supplying the stack-growth policy and page size
+# total: the frame bytes the prologue will subtract from RSP
+# ret:   true to emit the page-walk, false for a bare subtraction
+fun needs_stack_probe(os: *tos.OsVTable, total: usize) bool {
+    ret os.stack_probe && total > os.page_size::usize;
+}
+
 # emit_stack_probe: allocate `total` stack bytes with a per-page guard-page walk.
 #
 # on an OS that commits the stack one page at a time (Windows), a frame larger
@@ -2272,7 +2286,7 @@ fun emit_prologue(st: *EncodeState, frame_size: u32, callee_mask: u32, callee_ma
         # the guard and faults on reserved memory; emit the inline page-probe.
         # otherwise the OS auto-grows on the first in-range fault and a single
         # subtraction suffices.
-        if (st.os.stack_probe && total > st.os.page_size::usize) {
+        if (needs_stack_probe(st.os, total)) {
             emit_stack_probe(st, total, st.os.page_size::usize);
         } or {
             var sub_rsp: isa.Inst;
@@ -6057,49 +6071,65 @@ fun free_state(st: *EncodeState) {
     free_scratch(st);
 }
 
-test "x64.encode: stack probe walks pages with a backward branch and a final reg sub (#1395)" {
+test "x64.encode: stack probe emits the exact __chkstk page-walk body (#1395)" {
     var alloc: Allocator;
     page.make(?alloc);
     var st: EncodeState;
     st.buf = buf_init(?alloc);
 
-    # a 12 KiB frame at a 4 KiB page: the inline page-walk runs as a runtime loop
-    # (body emitted once), so the static bytes are mov-counter / page-step / touch /
-    # decrement / compare / backward-branch / final-sub regardless of frame size.
+    # a 12 KiB (0x3000) frame at a 4 KiB (0x1000) page. the page-walk is a runtime
+    # loop (body emitted once), so the static bytes are fixed regardless of frame
+    # size; only the mov-counter immediate scales. expected disassembly:
+    #   49 c7 c3 00 30 00 00   mov  r11, 0x3000   ; bytes to allocate
+    #   48 81 ec 00 10 00 00   sub  rsp, 0x1000   ; loop top: descend one page
+    #   4c 89 1c 24            mov  [rsp], r11     ; touch the guard page
+    #   49 81 eb 00 10 00 00   sub  r11, 0x1000    ; remaining -= page
+    #   49 81 fb 00 10 00 00   cmp  r11, 0x1000
+    #   0f 87 e1 ff ff ff      ja   loop top       ; rel32 = -31 (backward)
+    #   4c 29 dc               sub  rsp, r11       ; allocate the final partial page
     emit_stack_probe(?st, 12288, 4096);
 
+    var want: [41]u8;
+    want[0]  = 0x49; want[1]  = 0xc7; want[2]  = 0xc3; want[3]  = 0x00; want[4]  = 0x30; want[5]  = 0x00; want[6]  = 0x00;
+    want[7]  = 0x48; want[8]  = 0x81; want[9]  = 0xec; want[10] = 0x00; want[11] = 0x10; want[12] = 0x00; want[13] = 0x00;
+    want[14] = 0x4c; want[15] = 0x89; want[16] = 0x1c; want[17] = 0x24;
+    want[18] = 0x49; want[19] = 0x81; want[20] = 0xeb; want[21] = 0x00; want[22] = 0x10; want[23] = 0x00; want[24] = 0x00;
+    want[25] = 0x49; want[26] = 0x81; want[27] = 0xfb; want[28] = 0x00; want[29] = 0x10; want[30] = 0x00; want[31] = 0x00;
+    want[32] = 0x0f; want[33] = 0x87; want[34] = 0xe1; want[35] = 0xff; want[36] = 0xff; want[37] = 0xff;
+    want[38] = 0x4c; want[39] = 0x29; want[40] = 0xdc;
+
     val b: *u8   = st.buf.data;
-    val n: usize = st.buf.len;
     var bad: i32 = 0;
-
-    # the final allocation is `sub rsp, r11` (REX.W 29 /r, ModRM 11 011 100 = 0xDC).
-    if (n < 3)             { bad = 1; }
-    or (b[n - 3] != 0x4C)  { bad = 1; }
-    or (b[n - 2] != 0x29)  { bad = 1; }
-    or (b[n - 1] != 0xDC)  { bad = 1; }
-
-    # locate the `ja` (0F 87) and confirm it branches backward onto the page-step
-    # `sub rsp, imm32` (REX.W 81 /5 = 48 81 EC) — i.e. the loop re-probes each page.
-    var j: usize = 0;
-    var found: bool = false;
-    for (j + 1 < n) {
-        if (b[j] == 0x0F && b[j + 1] == 0x87) { found = true; brk; }
-        j = j + 1;
-    }
-    if (!found) {
-        bad = 1;
-    } or {
-        val p: usize   = j + 2;
-        val rel: i32   = b[p]::i32 | (b[p + 1]::i32 << 8) | (b[p + 2]::i32 << 16) | (b[p + 3]::i32 << 24);
-        val tgt: i64   = (p + 4)::i64 + rel::i64;
-        if (rel >= 0)          { bad = 1; }
-        or (tgt < 0)           { bad = 1; }
-        or (tgt::usize + 2 >= n){ bad = 1; }
-        or (b[tgt::usize]     != 0x48) { bad = 1; }
-        or (b[tgt::usize + 1] != 0x81) { bad = 1; }
-        or (b[tgt::usize + 2] != 0xEC) { bad = 1; }
+    if (st.buf.len != 41) { bad = 1; }
+    or {
+        var k: usize = 0;
+        for (k < 41) {
+            if (b[k] != want[k]) { bad = 1; brk; }
+            k = k + 1;
+        }
     }
 
     buf_dnit(?st.buf);
+    ret bad;
+}
+
+test "x64.encode: needs_stack_probe gates on the OS commit model and the page boundary (#1395)" {
+    # an incremental-commit OS (Windows) probes strictly above one page; at or below
+    # a page the single guard fault suffices.
+    var win: tos.OsVTable;
+    win.stack_probe = true;
+    win.page_size   = 4096;
+    # an auto-grow OS (Linux/Darwin) never probes, at any frame size.
+    var auto: tos.OsVTable;
+    auto.stack_probe = false;
+    auto.page_size   = 4096;
+
+    var bad: i32 = 0;
+    if (needs_stack_probe(?auto, 1))         { bad = 1; }   # auto-grow: never
+    or (needs_stack_probe(?auto, 1048576))   { bad = 1; }
+    or (needs_stack_probe(?win, 1))          { bad = 1; }   # sub-page: no
+    or (needs_stack_probe(?win, 4096))       { bad = 1; }   # exactly one page: no
+    or (!needs_stack_probe(?win, 4097))      { bad = 1; }   # one byte over: yes
+    or (!needs_stack_probe(?win, 1048576))   { bad = 1; }   # large frame: yes
     ret bad;
 }
