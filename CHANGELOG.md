@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-06-13
+
+Native Windows lane: CI now builds `mach.exe` and runs the in-source test suite
+on real Windows, not just the wine cross-compile path. Two codegen fixes complete
+the windows backend end to end — per-page stack probing for frames over a page,
+and per-descriptor PE import call-thunks — and the vendored standard library is
+updated to its windows-complete release. The native lane passes 468/468.
+
 ### Fixed
 
 - Windows function prologues now probe the stack one page at a time for frames
