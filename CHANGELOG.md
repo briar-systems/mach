@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-06-13
+
+Maintenance patch: path dependencies materialize through the standard library
+instead of host `ln`/`rm`, the target vtables become immutable `str`-named
+singletons, and the windows CI gains a trailing-import-descriptor regression
+guard.
+
+### Fixed
+
+- Path dependencies materialize via the std filesystem primitives (`fs.symlink`,
+  `fs.remove_all`) instead of shelling to `ln -s` / `rm -rf`, so they no longer
+  require host `ln`/`rm` — fixing path-dependency materialization on native
+  Windows, where `ln` is not on `PATH`. The `git` transport is unchanged (#1392).
+
+### Changed
+
+- The OF/ISA/OS/ABI vtable `name` and register-class names are immutable `str`
+  constants set directly by the registrars, no longer `StrId` fields re-interned
+  per session; the dead `OfVTable.file_extension` is removed. Behavior-preserving,
+  verified by the byte-identical self-host fixpoint (#1377; the remaining
+  interner-elimination is tracked in #1402).
+- CI: a `threadsync` wine integration test guards the trailing PE
+  import-descriptor call-thunk against regression (#1388), and the win64 wine
+  tests are bounded with a `timeout` so a faulting binary fails fast instead of
+  hanging the lane (#1399, #1404).
+
 ## [1.5.1] - 2026-06-13
 
 Native Windows lane: CI now builds `mach.exe` and runs the in-source test suite
