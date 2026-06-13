@@ -2005,10 +2005,16 @@ fun walk_comptime_if_for_load(p: *Project, mid: sess.ModuleId, ci: *decl.DeclCom
     val src_opt: Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
     if (is_none[*src.SourceFile](src_opt)) { ret err[bool, str]("module file_id not found in SourceMap"); }
     val source: str = unwrap[*src.SourceFile](src_opt).text;
+
+    # union build (#1391): load every branch taken by SOME manifest target, not
+    # just the selected target's branch (see walk_comptime_if_union).
+    if (p.union) { ret walk_comptime_if_union(p, mid, ci, source); }
+
+    # single-target build: the first branch active under the selected target wins.
     var bi: u32 = 0;
     for (bi < ci.branches_len) {
         val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
-        val take_r: Result[bool, str] = comptime_branch_active_load(p, mid, br, source);
+        val take_r: Result[bool, str] = comptime_branch_active_load(p, mid, br, source, true);
         if (is_err[bool, str](take_r)) { ret take_r; }
         if (unwrap_ok[bool, str](take_r)) {
             ret walk_decl_list_for_load(p, mid, br.body_start, br.body_len);
@@ -2018,7 +2024,13 @@ fun walk_comptime_if_for_load(p: *Project, mid: sess.ModuleId, ci: *decl.DeclCom
     ret ok[bool, str](true);
 }
 
-fun comptime_branch_active_load(p: *Project, mid: sess.ModuleId, br: *decl.ComptimeBranch, source: str) Result[bool, str] {
+# comptime_branch_active_load: whether a `$if`-chain branch's condition is active
+# under the module's CURRENT comptime ctx (its target tuple). An else branch
+# (`cond == EXPR_NIL`) is always active. A malformed / non-bool condition reports
+# a diagnostic and reads as inactive — but only when `emit_diag` is true, so the
+# union walk (which re-evaluates under every target) reports a bad cond once,
+# under the default tuple, not once per target.
+fun comptime_branch_active_load(p: *Project, mid: sess.ModuleId, br: *decl.ComptimeBranch, source: str, emit_diag: bool) Result[bool, str] {
     if (br.cond == id.EXPR_NIL) { ret ok[bool, str](true); }
     val m: *ModuleEntry = ?p.modules[mid::u32];
     val r: Result[comptime.CTValue, str] = comptime.eval(?m.ctx, ?m.a, source, br.cond, ?p.s.interner);
@@ -2026,17 +2038,109 @@ fun comptime_branch_active_load(p: *Project, mid: sess.ModuleId, br: *decl.Compt
     if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("comptime branch cond ExprId out of range"); }
     val cond_span: token.Span = unwrap[*expr.Expr](e_opt).span;
     if (is_err[comptime.CTValue, str](r)) {
-        val de: Result[bool, str] = diag.error(?p.s.diags, m.file_id, cond_span, unwrap_err[comptime.CTValue, str](r));
-        if (is_err[bool, str](de)) { ret de; }
+        if (emit_diag) {
+            val de: Result[bool, str] = diag.error(?p.s.diags, m.file_id, cond_span, unwrap_err[comptime.CTValue, str](r));
+            if (is_err[bool, str](de)) { ret de; }
+        }
         ret ok[bool, str](false);
     }
     val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r);
     if (v.kind != comptime.CT_KIND_BOOL) {
-        val de: Result[bool, str] = diag.error(?p.s.diags, m.file_id, cond_span, "comptime branch condition must be a bool");
-        if (is_err[bool, str](de)) { ret de; }
+        if (emit_diag) {
+            val de: Result[bool, str] = diag.error(?p.s.diags, m.file_id, cond_span, "comptime branch condition must be a bool");
+            if (is_err[bool, str](de)) { ret de; }
+        }
         ret ok[bool, str](false);
     }
     ret ok[bool, str](v.data.b);
+}
+
+# first_active_branch: index of the first branch in the `$if` chain active under
+# the module's current comptime ctx, or `branches_len` when none is (no else).
+# The union walk calls this once per manifest target (swapping the ctx tuple in
+# beforehand): that target's taken branch is its first active one.
+fun first_active_branch(p: *Project, mid: sess.ModuleId, ci: *decl.DeclComptimeIf, source: str, emit_diag: bool) Result[u32, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+        val a_r: Result[bool, str] = comptime_branch_active_load(p, mid, br, source, emit_diag);
+        if (is_err[bool, str](a_r)) { ret err[u32, str](unwrap_err[bool, str](a_r)); }
+        if (unwrap_ok[bool, str](a_r)) { ret ok[u32, str](bi); }
+        bi = bi + 1;
+    }
+    ret ok[u32, str](ci.branches_len);
+}
+
+# walk_comptime_if_union: load-walk a `$if` chain in union mode — load every
+# branch taken by SOME manifest target. Each target's taken branch is its first
+# active one (computed under that target's tuple, swapped into the module ctx and
+# restored after); the union of those branches is walked. Diagnostics fire only
+# under the default (selected) tuple. Modules pulled in by a non-default target's
+# branch thus land in the Project — visible to workspace-wide tooling — and still
+# resolve under the default ctx ("default target's branches win"). The default
+# tuple is the module's existing ctx; `union_tuples` covers every manifest target
+# (re-checking the default there is harmless).
+fun walk_comptime_if_union(p: *Project, mid: sess.ModuleId, ci: *decl.DeclComptimeIf, source: str) Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val n: u32 = ci.branches_len;
+    if (n == 0) { ret ok[bool, str](true); }
+
+    val tk_r: Result[*bool, str] = allocate[bool](p.s.alloc, n::usize);
+    if (is_err[*bool, str](tk_r)) { ret err[bool, str](unwrap_err[*bool, str](tk_r)); }
+    val taken: *bool = unwrap_ok[*bool, str](tk_r);
+    var z: u32 = 0;
+    for (z < n) { taken[z] = false; z = z + 1; }
+
+    # default tuple (the module's current ctx = selected target), WITH diagnostics.
+    val d_r: Result[u32, str] = first_active_branch(p, mid, ci, source, true);
+    if (is_err[u32, str](d_r)) { deallocate[bool](p.s.alloc, taken, n::usize); ret err[bool, str](unwrap_err[u32, str](d_r)); }
+    val d_idx: u32 = unwrap_ok[u32, str](d_r);
+    if (d_idx < n) { taken[d_idx] = true; }
+
+    # every other manifest target: swap its tuple into the ctx, no diagnostics.
+    val s_os_id: u32 = m.ctx.target_os_id;
+    val s_arch:  u32 = m.ctx.target_arch_id;
+    val s_pw:    u32 = m.ctx.pointer_width;
+    val s_os:  intern.StrId = m.ctx.target_os;
+    val s_isa: intern.StrId = m.ctx.target_isa;
+    val s_abi: intern.StrId = m.ctx.target_abi;
+    var ferr: bool = false;
+    var ferr_msg: str = "";
+    var ti: u32 = 0;
+    for (ti < p.union_tuple_count) {
+        m.ctx.target_os_id   = p.union_tuples[ti].os_id;
+        m.ctx.target_arch_id = p.union_tuples[ti].arch_id;
+        m.ctx.pointer_width  = p.union_tuples[ti].pointer_width;
+        m.ctx.target_os      = p.union_tuples[ti].os_name;
+        m.ctx.target_isa     = p.union_tuples[ti].isa_name;
+        m.ctx.target_abi     = p.union_tuples[ti].abi_name;
+        val a_r: Result[u32, str] = first_active_branch(p, mid, ci, source, false);
+        if (is_err[u32, str](a_r)) { ferr = true; ferr_msg = unwrap_err[u32, str](a_r); brk; }
+        val idx: u32 = unwrap_ok[u32, str](a_r);
+        if (idx < n) { taken[idx] = true; }
+        ti = ti + 1;
+    }
+    m.ctx.target_os_id   = s_os_id;
+    m.ctx.target_arch_id = s_arch;
+    m.ctx.pointer_width  = s_pw;
+    m.ctx.target_os      = s_os;
+    m.ctx.target_isa     = s_isa;
+    m.ctx.target_abi     = s_abi;
+    if (ferr) { deallocate[bool](p.s.alloc, taken, n::usize); ret err[bool, str](ferr_msg); }
+
+    # walk every taken branch's body into the load graph.
+    var bi: u32 = 0;
+    for (bi < n) {
+        if (taken[bi]) {
+            val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+            val w: Result[bool, str] = walk_decl_list_for_load(p, mid, br.body_start, br.body_len);
+            if (is_err[bool, str](w)) { deallocate[bool](p.s.alloc, taken, n::usize); ret w; }
+        }
+        bi = bi + 1;
+    }
+    deallocate[bool](p.s.alloc, taken, n::usize);
+    ret ok[bool, str](true);
 }
 
 # walk_use_for_load: handle one `use` decl during the load walk: interns
