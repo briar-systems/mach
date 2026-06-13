@@ -214,10 +214,16 @@ fun validate_reloc_kinds(img: *of.ObjectImage) Result[bool, str] {
 }
 
 # read_inplace_addend: recover a COFF relocation's in-place addend from the
-# patched field of section `sec`. COFF has no RELA addend field — the addend is
-# the existing value at the field, which the linker adds to the resolved target.
-# an ADDR64 field is a full 64-bit value; every other type is a 32-bit field
-# sign-extended to i64. a bss/no-data section or an out-of-range offset yields 0.
+# patched field of section `sec`, in the abstract (ELF field-relative) convention
+# the RK_* kinds use. COFF has no RELA addend field — the addend is the existing
+# value at the field, which the linker adds to the resolved target. an ADDR64
+# field is a full 64-bit value; every other type is a 32-bit field sign-extended
+# to i64. a bss/no-data section or an out-of-range offset yields 0.
+#
+# REL32 is next-byte-relative: link.exe/lld resolve `S + A_coff - (P+4)`, four
+# bytes more than the abstract `S + A_elf - P`. so the recovered abstract addend
+# is `A_elf = A_coff - 4` — subtract 4 from the field for REL32 only. ADDR64
+# (absolute) and ADDR32NB (image-relative) carry no P+4 term and are unchanged.
 fun read_inplace_addend(sec: *of.Section, r_type: u16, offset: u32) i64 {
     if (sec.bytes == nil) { ret 0; }
     if (r_type == IMAGE_REL_AMD64_ADDR64) {
@@ -225,7 +231,9 @@ fun read_inplace_addend(sec: *of.Section, r_type: u16, offset: u32) i64 {
         ret bin.read_u64_le(sec.bytes, offset::usize)::i64;
     }
     if (offset::usize + 4 > sec.len::usize) { ret 0; }
-    ret (bin.read_u32_le(sec.bytes, offset::usize)::i32)::i64;
+    val field: i64 = (bin.read_u32_le(sec.bytes, offset::usize)::i32)::i64;
+    if (r_type == IMAGE_REL_AMD64_REL32) { ret field - 4; }
+    ret field;
 }
 
 # map a COFF x86-64 machine relocation type back to its abstract RK_* kind. an
@@ -984,18 +992,26 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) Result[
     # fold each relocation's addend into its patch-site field. unlike ELF RELA,
     # a COFF IMAGE_RELOCATION carries no addend field — the addend is the in-place
     # value the linker adds to the resolved target, so it must live in the section
-    # bytes. (a `call sym` carries addend -4 for the pc32 field-to-next-ip
-    # correction; without folding it the call would land 4 bytes past its target.)
-    # `validate_reloc_ranges` already proved every field lies within its section.
+    # bytes. the abstract addend is in the ELF field-relative convention; a REL32
+    # field is next-byte-relative (link.exe/lld resolve `S + A_coff - (P+4)`), so
+    # the on-wire field must hold `A_coff = A_elf + 4`. fold that effective value:
+    # a `call sym` (RK_PC32/RK_PLT32, abstract addend -4) then writes 0, the
+    # correct COFF convention. ADDR64/ADDR32NB carry no P+4 term and fold the
+    # addend unchanged. `validate_reloc_ranges` already proved every field is in
+    # range; `read_inplace_addend` recovers `A_elf` on parse, so the round-trip
+    # is identity.
     var ridx: u32 = 0;
     for (ridx < img.reloc_count) {
         val rsec: u32 = img.relocations[ridx].section;
-        if (img.relocations[ridx].addend != 0) {
+        val rk: of.RelocKind = img.relocations[ridx].kind;
+        var eff: i64 = img.relocations[ridx].addend;
+        if (rk == of.RK_PC32 || rk == of.RK_PLT32) { eff = eff + 4; }
+        if (eff != 0) {
             val fld: usize = data_offsets[rsec] + img.relocations[ridx].offset::usize;
-            if (reloc_field_width(img.relocations[ridx].kind) == 8) {
-                bin.write_u64_le(buf, fld, bin.read_u64_le(buf, fld) + img.relocations[ridx].addend::u64);
+            if (reloc_field_width(rk) == 8) {
+                bin.write_u64_le(buf, fld, bin.read_u64_le(buf, fld) + eff::u64);
             } or {
-                bin.write_u32_le(buf, fld, bin.read_u32_le(buf, fld) + (img.relocations[ridx].addend::u64)::u32);
+                bin.write_u32_le(buf, fld, bin.read_u32_le(buf, fld) + (eff::u64)::u32);
             }
         }
         ridx = ridx + 1;
@@ -2743,9 +2759,12 @@ test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
     syms[2].offset = 0; syms[2].size = 0; syms[2].flags = of.SYM_OBJ_FLAG_EXTERN;
 
 
+    # the pc32 carries the -4 a `call` does (the abstract field-relative addend);
+    # the REL32 fold writes A_coff = A_elf + 4 = 0, leaving the .text field at its
+    # placeholder so the byte round-trip below holds.
     var relocs: [2]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[2].name; relocs[0].addend = 0;
+    relocs[0].symbol = syms[2].name; relocs[0].addend = -4;
     relocs[1].section = 0; relocs[1].offset = 4; relocs[1].kind = of.RK_ABS64;
     relocs[1].symbol = syms[1].name; relocs[1].addend = 0;
 
@@ -2851,6 +2870,110 @@ test "coff: emit/parse round-trips an ObjectImage and writes a valid header" {
     ret 0;
 }
 
+test "coff: REL32 addend translates the COFF P+4 convention at parse and emit (#1409)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    # read side: a REL32 field is next-byte-relative, so the recovered abstract
+    # (ELF field-relative) addend is `field - 4`. ADDR32NB (image-relative) and
+    # ADDR64 (absolute) carry no P+4 term and read through unchanged.
+    var f0: [4]u8;
+    f0[0] = 0; f0[1] = 0; f0[2] = 0; f0[3] = 0;
+    var sec0: of.Section;
+    sec0.bytes = ?f0[0]; sec0.len = 4;
+    if (read_inplace_addend(?sec0, IMAGE_REL_AMD64_REL32, 0) != -4) { ret 1; }
+    if (read_inplace_addend(?sec0, IMAGE_REL_AMD64_ADDR32NB, 0) != 0) { ret 1; }
+
+    var f7: [4]u8;
+    f7[0] = 7; f7[1] = 0; f7[2] = 0; f7[3] = 0;
+    var sec7: of.Section;
+    sec7.bytes = ?f7[0]; sec7.len = 4;
+    if (read_inplace_addend(?sec7, IMAGE_REL_AMD64_REL32, 0) != 3) { ret 1; }
+    if (read_inplace_addend(?sec7, IMAGE_REL_AMD64_ADDR32NB, 0) != 7) { ret 1; }
+
+    # an 8-byte ADDR64 field reads the full 64-bit value, unchanged.
+    var f8: [8]u8;
+    var b: usize = 0;
+    for (b < 8) { f8[b] = 0; b = b + 1; }
+    f8[0] = 0x21; f8[1] = 0x43;
+    var sec8: of.Section;
+    sec8.bytes = ?f8[0]; sec8.len = 8;
+    if (read_inplace_addend(?sec8, IMAGE_REL_AMD64_ADDR64, 0) != 0x4321) { ret 1; }
+
+    # round-trip through the full emit/parse path: a REL32 reloc with abstract
+    # addend 0 folds A_coff = A_elf + 4 = 4 into the on-wire field, and the reader
+    # recovers A_elf = 4 - 4 = 0. a `call`'s -4 addend folds to 0 the same way.
+    var i: intern.Interner = intern.init(?alloc);
+    var of_reg: of.OfRegistry = of.registry_init();
+    val rr: Result[bool, str] = register_coff(?of_reg, ?i);
+    if (is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes: [8]u8;
+    var k: usize = 0;
+    for (k < 8) { text_bytes[k] = 0; k = k + 1; }
+    text_bytes[0] = 0xE8;  # call rel32, the 4-byte field at offset 1 is zero
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "callee"); syms[1].section = of.SECTION_EXTERNAL;
+    syms[1].offset = 0; syms[1].size = 0;
+    syms[1].flags =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
+    relocs[0].symbol = syms[1].name; relocs[0].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_p4");
+    if (is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: Result[fs.Buffer, str] = fs.read_all_sized(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (is_err[fs.Buffer, str](rb)) { ret 1; }
+    val buf: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
+
+    var out: of.ObjectImage;
+    val pr: Result[bool, str] = coff_parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (is_err[bool, str](pr)) { ret 1; }
+
+    var saw: bool = false;
+    var rj: u32 = 0;
+    for (rj < out.reloc_count) {
+        if (out.relocations[rj].kind == of.RK_PC32 && out.relocations[rj].offset == 1) {
+            saw = true;
+            # the on-wire field carries the folded COFF addend (A_elf 0 + 4).
+            if (out.sections[0].bytes == nil) { ret 1; }
+            if (bin.read_u32_le(out.sections[0].bytes, 1) != 4) { ret 1; }
+            # the reader recovers the abstract addend (4 - 4 = 0).
+            if (out.relocations[rj].addend != 0) { ret 1; }
+        }
+        rj = rj + 1;
+    }
+    if (!saw) { ret 1; }
+
+    ret 0;
+}
+
 test "coff: emit rejects a relocation naming an unresolved symbol (#1196)" {
     var alloc: Allocator;
     page.make(?alloc);
@@ -2926,9 +3049,9 @@ test "coff: a defined weak symbol round-trips its weak flag through a COMDAT sec
 
     # a .text holding two functions: a strong global `main` in [0,8) and a weak
     # monomorphized instance `okI3u64P2u8E` in [8,16), the kind emitted into every
-    # using object. a relocation patches a field inside the weak body (offset 12),
-    # so the COMDAT carve must move it with the symbol and the round-trip recover
-    # it. an undefined extern `puts` is the relocation's target.
+    # using object. a call relocation patches a field inside the weak body (offset
+    # 12), so the COMDAT carve must move it with the symbol and the round-trip
+    # recover it. an undefined extern `puts` is the relocation's target.
     var text_bytes: [16]u8;
     var k: usize = 0;
     for (k < 16) { text_bytes[k] = (0x10 + k)::u8; k = k + 1; }
@@ -2947,9 +3070,11 @@ test "coff: a defined weak symbol round-trips its weak flag through a COMDAT sec
     syms[2].offset = 0; syms[2].size = 0; syms[2].flags = of.SYM_OBJ_FLAG_EXTERN;
 
 
+    # the -4 a `call` carries: the REL32 fold writes A_coff = A_elf + 4 = 0, so the
+    # weak body bytes are unchanged and the carve's byte round-trip holds.
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 12; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[2].name; relocs[0].addend = 0;
+    relocs[0].symbol = syms[2].name; relocs[0].addend = -4;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;

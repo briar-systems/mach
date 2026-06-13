@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interner-elimination from the OS vtable started in #1377. Behavior-preserving,
   verified by the byte-identical self-host fixpoint (#1402).
 
+### Fixed
+
+- objfmt (COFF): REL32 relocations are next-byte-relative (`S + A − (P+4)`), but the
+  abstract addend uses ELF's field-relative convention (`S + A − P`), so the writer's
+  on-wire field and the reader's recovered addend were off by 4 — a foreign
+  (MSVC/clang/GAS) COFF read by mach landed calls 4 bytes past target, and mach's
+  emitted `.obj` was off by −4 under link.exe/lld. The writer now folds `A_coff =
+  A_elf + 4` and the reader recovers `A_elf = A_coff − 4` for REL32 only; ABS64
+  (ADDR64) and ADDR32NB are unaffected. mach↔mach output is byte-identical (the fold
+  and recovery cancel), so the fix changes only foreign-COFF interop (#1409).
+
 ## [1.5.3] - 2026-06-13
 
 Correctness patch for two silent defects in shipped v1.5.2: a relocation
