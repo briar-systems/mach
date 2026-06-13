@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- target: the os/arch name↔id mapping is consolidated to one canonical table per
+  dimension — `os.os_id_for`/`os.os_name_for` and `isa.arch_id_for`/`isa.arch_name_for`
+  — replacing the copies that lived in `driver.mach` and `manifest.mach`. An
+  unrecognized manifest `os`/`isa` name now reports a distinct "unknown target os/isa
+  name '<name>' (expected: ...)" diagnostic instead of folding to `*_UNKNOWN` and being
+  mis-reported as an unsupported pair (#1412).
 - The `OsVTable` `entry_symbol`, `syscall_layer`, `libdir`, and `dynamic_linker`
   fields are immutable `str` constants set directly by the OS registrars, no longer
   `StrId` fields re-interned per session; the linker now interns these at the point
@@ -45,15 +51,6 @@ and an extreme float-literal exponent that hung the compiler.
   compiler in the unbounded decimal-scale loop and could silently fold to its mantissa
   on i64 exponent overflow. The exponent accumulator is now clamped past the point
   f64 saturates, so such literals fold to `inf`/`0.0` instead (#1408).
-
-### Changed
-
-- The `OsVTable` `entry_symbol`, `syscall_layer`, `libdir`, and `dynamic_linker`
-  fields are immutable `str` constants set directly by the OS registrars, no longer
-  `StrId` fields re-interned per session; the linker now interns these at the point
-  of use (the entry-symbol lookup and the dynamic interpreter path), completing the
-  interner-elimination from the OS vtable started in #1377. Behavior-preserving,
-  verified by the byte-identical self-host fixpoint (#1402).
 
 ## [1.5.2] - 2026-06-13
 
