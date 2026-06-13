@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now tracks the legalized `disp32` (the same fix covers the ALU memory-destination
   and inline-asm `mov [sym], imm64` paths). No diagnostic was emitted; ordinary code
   storing a large constant to a global silently miscompiled (#1407).
+- comptime: a float literal with an extreme exponent (e.g. `1.0e2000000000`) hung the
+  compiler in the unbounded decimal-scale loop and could silently fold to its mantissa
+  on i64 exponent overflow. The exponent accumulator is now clamped past the point
+  f64 saturates, so such literals fold to `inf`/`0.0` instead (#1408).
 
 ## [1.5.2] - 2026-06-13
 
