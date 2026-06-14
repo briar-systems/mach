@@ -32,13 +32,13 @@ Read the [language reference](doc/language/README.md) before installing. The doc
 Install the latest release with one line:
 
 ```bash
-curl -fsSL https://github.com/octalide/mach/releases/latest/download/install.sh | sh
+curl -fsSL https://machlang.org/install.sh | sh
 ```
 
 On Windows (PowerShell):
 
 ```powershell
-irm https://github.com/octalide/mach/releases/latest/download/install.ps1 | iex
+irm https://machlang.org/install.ps1 | iex
 ```
 
 The scripts verify the download against the release `SHA256SUMS` and install to

@@ -1,6 +1,6 @@
 #!/bin/sh
 # installs the mach release binary.
-# usage: curl -fsSL https://github.com/octalide/mach/releases/latest/download/install.sh | sh
+# usage: curl -fsSL https://machlang.org/install.sh | sh
 #
 # MACH_VERSION      version to install (e.g. 1.4.2); defaults to the latest release
 # MACH_INSTALL_DIR  install directory; defaults to ~/.local/bin
