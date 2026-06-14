@@ -26,20 +26,30 @@
 # GP BITCAST), the direct (`BL` + RK_PLT32→CALL26) and indirect (`BLR Xn`) call, the
 # folded-global load/store (`ADRP IP0` + `LDR/STR :lo12:`, RK_PAGE21 + the per-width
 # RK_LDST*_LO12), and the address-of rvalue (`ADRP` + `ADD :lo12:`, RK_PAGE21 +
-# RK_ADD_LO12). The contract gaps DEFERRED to a later phase (an in-scope function
-# never reaches them, so they fail loudly rather than emit wrong bytes): inline asm
-# (Phase 3c), callee-saved FP registers, and the float / float-conversion families
-# (Phase 4).
+# RK_ADD_LO12). Phase 3c adds the inline-asm assembler (`encode_asm_block_arm64`):
+# it parses an `asm aarch64 { ... }` body, resolves `{name}` locals to `[x29, #off]`
+# frame slots and bare-symbol / `:lo12:` operands to the #1163 relocations, and
+# emits A64 words for the std `_start` / syscall path. The contract gaps DEFERRED to
+# a later phase (an in-scope function never reaches them, so they fail loudly rather
+# than emit wrong bytes): callee-saved FP registers and the float / float-conversion
+# families (Phase 4).
 
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
+use std.types.char.char;
 use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+use std.types.string.str_starts_with;
+use std.types.string.str_region_equals;
+use std.types.string.str_contains;
 
 use std.types.result.Result;
 use std.types.result.ok;
 use std.types.result.err;
+use std.types.result.is_ok;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
@@ -50,7 +60,11 @@ use std.types.option.none;
 use std.types.option.is_some;
 use std.types.option.unwrap;
 
+use parse: std.text.parse;
+
 use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.reallocate;
 use std.allocator.deallocate;
 use page: std.allocator.page;
 
@@ -71,6 +85,7 @@ use mach.lang.be.codegen.encode.BranchFixup;
 use mach.lang.be.codegen.encode.EncodeHooks;
 use mach.lang.be.codegen.encode.buf_init;
 use mach.lang.be.codegen.encode.buf_dnit;
+use mach.lang.be.codegen.encode.emit_byte;
 use mach.lang.be.codegen.encode.emit_u32;
 use mach.lang.be.codegen.encode.classify_refs;
 use mach.lang.be.codegen.encode.push_symbol;
@@ -155,10 +170,22 @@ val STR_REG_X: u32 = 0xF8206800; val LDR_REG_X: u32 = 0xF8606800;
 val B_BASE:    u32 = 0x14000000;
 val BCOND:     u32 = 0x54000000;
 val CBNZ_X:    u32 = 0xB5000000; val CBNZ_W: u32 = 0x35000000;
+# compare-and-branch-if-zero (the CBNZ twin) by width, for inline-asm `cbz`.
+val CBZ_X:     u32 = 0xB4000000; val CBZ_W: u32 = 0x34000000;
 # RET x30, BRK #0, NOP.
 val RET_WORD:  u32 = 0xD65F03C0;
+# RET base (Rn[9:5] zeroed; RET_WORD is `ret x30`), for an explicit `ret Xn`.
+val RET_BASE:  u32 = 0xD65F0000;
 val BRK_BASE:  u32 = 0xD4200000;
 val NOP_WORD:  u32 = 0xD503201F;
+# register-indirect branch (no link), for inline-asm `br Xn` — Rn[9:5] OR-ed in.
+val BR_BASE:   u32 = 0xD61F0000;
+# supervisor call, for inline-asm `svc #imm` — `0xD4000001 | (imm16 << 5)`.
+val SVC_BASE:  u32 = 0xD4000001;
+# load/store-pair pre-index and post-index bases (64-bit) the inline-asm `stp`/`ldp`
+# writeback forms use; the signed-offset STP_OFF_X / LDP_OFF_X are above.
+val STP_POST_X: u32 = 0xA8800000;
+val LDP_PRE_X:  u32 = 0xA9C00000;
 # the call family: BL (imm26 displacement placeholder, the RK_PLT32 patch site for a
 # direct call) and the register-indirect BLR (Rn[9:5] zeroed in the base).
 val BL_BASE:   u32 = 0x94000000;
@@ -195,10 +222,19 @@ val MAX_FRAME_SUB: u32 = 0xFFFFF0;
 # encodings read these directly; `pack_cset` writes the inverted condition.
 val CC_EQ: u32 = 0;
 val CC_NE: u32 = 1;
+val CC_HS: u32 = 2;
 val CC_CC: u32 = 3;
+val CC_MI: u32 = 4;
+val CC_PL: u32 = 5;
+val CC_VS: u32 = 6;
+val CC_VC: u32 = 7;
+val CC_HI: u32 = 8;
 val CC_LS: u32 = 9;
+val CC_GE: u32 = 10;
 val CC_LT: u32 = 11;
+val CC_GT: u32 = 12;
 val CC_LE: u32 = 13;
+val CC_AL: u32 = 14;
 
 # ---- bitfield packers (pure: each returns one A64 word) ----
 
@@ -1284,7 +1320,7 @@ fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
         ret encode_call(st, mi);
     }
     if (mi.opcode == mir.MIR_ASM) {
-        ret err[bool, str]("aarch64 inline asm not implemented (Phase 3c)");
+        ret encode_asm_block_arm64(st, f, fn_base, mi);
     }
 
     # concrete A64 opcodes.
@@ -1416,6 +1452,1150 @@ pub fun encode_arm64(alloc: *Allocator, tgt: *target.Target, m: *mir.MirModule) 
     hooks.encode_function = encode_function_arm64;
     hooks.patch_branch    = patch_branch_arm64;
     ret encode_driver(alloc, tgt, m, ?hooks);
+}
+
+# ============================================================================
+# inline-asm assembler (Phase 3c)
+#
+# parses an `asm aarch64 { ... }` body line-by-line and emits A64 words, resolving
+# `{name}` locals to frame slots (`[x29, #off]`) and bare-symbol / `:lo12:`
+# operands to the #1163 relocations — the AArch64 analogue of x86-64's
+# `encode_asm_block`. numeric local labels (1:/1f/1b) resolve within the block; the
+# imm26 / imm19 displacement insert reuses the shared `patch_branch_arm64`. an
+# unrecognized mnemonic or malformed operand is a hard error rather than wrong bytes.
+# ============================================================================
+
+# a parsed inline-asm operand. distinguishes a register / immediate / memory form
+# (encoded directly) from a bare symbol or `:lo12:sym` (resolved to a relocation).
+# ---
+# kind:      one of ASMOP_*
+# reg:       register index (0..31) for ASMOP_REG
+# is64:      true for an X register / 64-bit form, false for W
+# is_sp:     true when register 31 names SP/WSP (false when it names XZR/WZR)
+# imm:       immediate (ASMOP_IMM) or memory displacement (ASMOP_MEM)
+# base:      memory base register index (ASMOP_MEM)
+# base_sp:   true when the memory base register 31 is SP
+# index:     memory scaled-index register index (ASMOP_MEM, when has_index)
+# index64:   true when the index register is an X register
+# has_index: true when an ASMOP_MEM carries a `[Xn, Xm]` index
+# has_disp:  true when an ASMOP_MEM carries a `[Xn, #imm]` displacement
+# wb_pre:    true when an ASMOP_MEM is a pre-index writeback `[Xn, #imm]!`
+# is_lo12:   true when the operand (or the memory offset) is `:lo12:sym`
+# name:      borrowed symbol name (ASMOP_SYM / ASMOP_LO12 / lo12 memory offset)
+# name_len:  length of `name`
+rec AsmOp {
+    kind:      u8;
+    reg:       u32;
+    is64:      bool;
+    is_sp:     bool;
+    imm:       i64;
+    base:      u32;
+    base_sp:   bool;
+    index:     u32;
+    index64:   bool;
+    has_index: bool;
+    has_disp:  bool;
+    wb_pre:    bool;
+    is_lo12:   bool;
+    name:      str;
+    name_len:  usize;
+}
+
+# no operand parsed.
+val ASMOP_NONE: u8 = 0;
+# a register operand.
+val ASMOP_REG:  u8 = 1;
+# an immediate constant.
+val ASMOP_IMM:  u8 = 2;
+# a `[base (, #imm | , Xm | , :lo12:sym)?]` memory operand.
+val ASMOP_MEM:  u8 = 3;
+# a bare symbol / branch-target name (resolved to a relocation).
+val ASMOP_SYM:  u8 = 4;
+# a `:lo12:sym` relocation specifier (the low-half ADD / LDR/STR operand).
+val ASMOP_LO12: u8 = 5;
+
+# asm_op_clear: reset an operand to the empty (ASMOP_NONE) state.
+fun asm_op_clear(op: *AsmOp) {
+    op.kind = ASMOP_NONE; op.reg = 0; op.is64 = false; op.is_sp = false;
+    op.imm = 0; op.base = 0; op.base_sp = false; op.index = 0; op.index64 = false;
+    op.has_index = false; op.has_disp = false; op.wb_pre = false;
+    op.is_lo12 = false; op.name = nil; op.name_len = 0;
+}
+
+# initial capacity for the numeric local-label definition / forward-ref arrays.
+val ASM_LABEL_INIT_CAP: u32 = 8;
+
+# a numeric local label's nearest definition: the label number and its `.text` offset.
+# ---
+# number: the numeric label
+# offset: byte offset of the definition within `.text`
+rec AsmLabelDef { number: u64; offset: u32; }
+
+# a pending forward reference to a numeric local label: the placeholder branch word
+# is at `patch_pos`, resolved by `patch_branch_arm64` when the definition is reached.
+# ---
+# patch_pos: byte offset of the branch instruction word within `.text`
+# number:    the referenced numeric label
+rec AsmLabelRef { patch_pos: u32; number: u64; }
+
+# per-asm-block numeric-local-label scope (1:/1f/1b). owns its def / forward-ref
+# arrays, freed when the block finishes. the displacement insert reuses the shared
+# `patch_branch_arm64` (imm26 for B, imm19 for B.cond/CBZ/CBNZ — distinguished there
+# by the placeholder word's top bits), so this bookkeeping carries no encoding.
+# ---
+# alloc:     backing allocator
+# defs:      recorded label definitions (latest offset per number)
+# def_count: number of definitions
+# def_cap:   capacity of `defs`
+# refs:      pending forward references
+# ref_count: number of pending forward references
+# ref_cap:   capacity of `refs`
+rec AsmLabels {
+    alloc:     *Allocator;
+    defs:      *AsmLabelDef;
+    def_count: u32;
+    def_cap:   u32;
+    refs:      *AsmLabelRef;
+    ref_count: u32;
+    ref_cap:   u32;
+}
+
+# asm_labels_init: initialize an empty numeric-local-label scope backed by `alloc`.
+fun asm_labels_init(labels: *AsmLabels, alloc: *Allocator) {
+    labels.alloc = alloc;
+    labels.defs = nil; labels.def_count = 0; labels.def_cap = 0;
+    labels.refs = nil; labels.ref_count = 0; labels.ref_cap = 0;
+}
+
+# asm_labels_dnit: release a label scope's owned arrays.
+fun asm_labels_dnit(labels: *AsmLabels) {
+    if (labels.defs != nil && labels.def_cap > 0) {
+        deallocate[AsmLabelDef](labels.alloc, labels.defs, labels.def_cap::usize);
+        labels.defs = nil; labels.def_cap = 0; labels.def_count = 0;
+    }
+    if (labels.refs != nil && labels.ref_cap > 0) {
+        deallocate[AsmLabelRef](labels.alloc, labels.refs, labels.ref_cap::usize);
+        labels.refs = nil; labels.ref_cap = 0; labels.ref_count = 0;
+    }
+}
+
+# grow the label-definition array (or allocate it on first use).
+fun grow_asm_defs(labels: *AsmLabels) Result[bool, str] {
+    if (labels.defs == nil) {
+        val r: Result[*AsmLabelDef, str] = allocate[AsmLabelDef](labels.alloc, ASM_LABEL_INIT_CAP::usize);
+        if (is_err[*AsmLabelDef, str](r)) { ret err[bool, str](unwrap_err[*AsmLabelDef, str](r)); }
+        labels.defs = unwrap_ok[*AsmLabelDef, str](r); labels.def_cap = ASM_LABEL_INIT_CAP;
+        ret ok[bool, str](true);
+    }
+    val nc: u32 = labels.def_cap * 2;
+    val r: Result[*AsmLabelDef, str] = reallocate[AsmLabelDef](labels.alloc, labels.defs, labels.def_cap::usize, nc::usize);
+    if (is_err[*AsmLabelDef, str](r)) { ret err[bool, str](unwrap_err[*AsmLabelDef, str](r)); }
+    labels.defs = unwrap_ok[*AsmLabelDef, str](r); labels.def_cap = nc;
+    ret ok[bool, str](true);
+}
+
+# grow the forward-reference array (or allocate it on first use).
+fun grow_asm_refs(labels: *AsmLabels) Result[bool, str] {
+    if (labels.refs == nil) {
+        val r: Result[*AsmLabelRef, str] = allocate[AsmLabelRef](labels.alloc, ASM_LABEL_INIT_CAP::usize);
+        if (is_err[*AsmLabelRef, str](r)) { ret err[bool, str](unwrap_err[*AsmLabelRef, str](r)); }
+        labels.refs = unwrap_ok[*AsmLabelRef, str](r); labels.ref_cap = ASM_LABEL_INIT_CAP;
+        ret ok[bool, str](true);
+    }
+    val nc: u32 = labels.ref_cap * 2;
+    val r: Result[*AsmLabelRef, str] = reallocate[AsmLabelRef](labels.alloc, labels.refs, labels.ref_cap::usize, nc::usize);
+    if (is_err[*AsmLabelRef, str](r)) { ret err[bool, str](unwrap_err[*AsmLabelRef, str](r)); }
+    labels.refs = unwrap_ok[*AsmLabelRef, str](r); labels.ref_cap = nc;
+    ret ok[bool, str](true);
+}
+
+# asm_label_lookup: the nearest preceding definition offset of `number`, or none.
+fun asm_label_lookup(labels: *AsmLabels, number: u64) Option[u32] {
+    var i: u32 = 0;
+    for (i < labels.def_count) {
+        if (labels.defs[i].number == number) { ret some[u32](labels.defs[i].offset); }
+        i = i + 1;
+    }
+    ret none[u32]();
+}
+
+# asm_label_push_ref: record a pending forward reference to `number` whose branch
+# word is at `patch_pos`.
+fun asm_label_push_ref(labels: *AsmLabels, patch_pos: u32, number: u64) Result[bool, str] {
+    if (labels.ref_count >= labels.ref_cap) {
+        val gr: Result[bool, str] = grow_asm_refs(labels);
+        if (is_err[bool, str](gr)) { ret gr; }
+    }
+    labels.refs[labels.ref_count].patch_pos = patch_pos;
+    labels.refs[labels.ref_count].number    = number;
+    labels.ref_count = labels.ref_count + 1;
+    ret ok[bool, str](true);
+}
+
+# asm_label_record_def: record a definition of `number` at `.text` offset `off`,
+# patching (and dropping) every pending forward reference to it through the shared
+# `patch_branch_arm64`, and updating the nearest-preceding-definition offset.
+fun asm_label_record_def(st: *EncodeState, labels: *AsmLabels, number: u64, off: u32) Result[bool, str] {
+    var w: u32 = 0;
+    var r: u32 = 0;
+    for (r < labels.ref_count) {
+        if (labels.refs[r].number == number) {
+            var fx: BranchFixup;
+            fx.patch_pos = labels.refs[r].patch_pos; fx.next_ip = 0;
+            fx.target_block = 0; fx.fn_text_base = 0;
+            val pr: Result[bool, str] = patch_branch_arm64(st, ?fx, off);
+            if (is_err[bool, str](pr)) { ret pr; }
+        } or {
+            labels.refs[w].patch_pos = labels.refs[r].patch_pos;
+            labels.refs[w].number    = labels.refs[r].number;
+            w = w + 1;
+        }
+        r = r + 1;
+    }
+    labels.ref_count = w;
+
+    var i: u32 = 0;
+    for (i < labels.def_count) {
+        if (labels.defs[i].number == number) { labels.defs[i].offset = off; ret ok[bool, str](true); }
+        i = i + 1;
+    }
+    if (labels.def_count >= labels.def_cap) {
+        val gr: Result[bool, str] = grow_asm_defs(labels);
+        if (is_err[bool, str](gr)) { ret gr; }
+    }
+    labels.defs[labels.def_count].number = number;
+    labels.defs[labels.def_count].offset = off;
+    labels.def_count = labels.def_count + 1;
+    ret ok[bool, str](true);
+}
+
+# ---- inline-asm lexing helpers ----
+
+# asm_is_space: true for the ASCII whitespace the asm tokenizer trims.
+fun asm_is_space(c: char) bool { ret c == ' '::char || c == '\t'::char || c == '\r'::char; }
+
+# asm_is_digit: true for an ASCII decimal digit.
+fun asm_is_digit(c: char) bool { ret c >= '0'::char && c <= '9'::char; }
+
+# asm_is_sym_char: true for a character valid inside a bare symbol name.
+fun asm_is_sym_char(c: char) bool {
+    ret c == '_'::char || c == '.'::char ||
+        (c >= 'a'::char && c <= 'z'::char) ||
+        (c >= 'A'::char && c <= 'Z'::char) ||
+        (c >= '0'::char && c <= '9'::char);
+}
+
+# asm_is_sym_token: true when `tok[0..len)` is a valid bare symbol name (leading
+# char a letter / underscore, the rest symbol characters).
+fun asm_is_sym_token(tok: str, len: usize) bool {
+    if (len == 0) { ret false; }
+    val c0: char = tok[0];
+    if (!(c0 == '_'::char || (c0 >= 'a'::char && c0 <= 'z'::char) || (c0 >= 'A'::char && c0 <= 'Z'::char))) {
+        ret false;
+    }
+    var i: usize = 1;
+    for (i < len) { if (!asm_is_sym_char(tok[i])) { ret false; } i = i + 1; }
+    ret true;
+}
+
+# asm_trim: a pointer past leading whitespace in `s` (trailing whitespace already
+# stripped by the statement tokenizer).
+fun asm_trim(s: str) str {
+    var i: usize = 0;
+    for (s[i] != 0 && asm_is_space(s[i])) { i = i + 1; }
+    ret (s::usize + i)::str;
+}
+
+# asm_copy_region: copy `s[lo..hi)` (trimming surrounding whitespace) into `dst` as
+# a NUL-terminated string. returns false on an empty or oversized slice.
+fun asm_copy_region(s: str, lo: usize, hi: usize, dst: *u8, cap: usize) bool {
+    var a: usize = lo;
+    var b: usize = hi;
+    for (a < b && asm_is_space(s[a])) { a = a + 1; }
+    for (b > a && asm_is_space(s[b - 1])) { b = b - 1; }
+    val n: usize = b - a;
+    if (n == 0 || n + 1 > cap) { ret false; }
+    var i: usize = 0;
+    for (i < n) { dst[i] = s[a + i]::u8; i = i + 1; }
+    dst[n] = 0;
+    ret true;
+}
+
+# asm_region_is_lo12: true when `tok[s..e)` begins with the `:lo12:` prefix.
+fun asm_region_is_lo12(tok: str, s: usize, e: usize) bool {
+    if (e - s < 6) { ret false; }
+    ret tok[s] == ':'::char && tok[s + 1] == 'l'::char && tok[s + 2] == 'o'::char &&
+        tok[s + 3] == '1'::char && tok[s + 4] == '2'::char && tok[s + 5] == ':'::char;
+}
+
+# asm_label_def_len: if `tok` begins with `<digits>:`, return the prefix length
+# (through the colon) and the parsed number via `num_out`; otherwise return 0.
+fun asm_label_def_len(tok: str, num_out: *u64) usize {
+    if (!asm_is_digit(tok[0])) { ret 0; }
+    var i: usize = 0;
+    var n: u64 = 0;
+    for (asm_is_digit(tok[i])) { n = n * 10 + (tok[i]::u64 - '0'::u64); i = i + 1; }
+    if (tok[i] != ':'::char) { ret 0; }
+    @num_out = n;
+    ret i + 1;
+}
+
+# asm_label_ref: parse a numeric local-label reference `<digits>f` / `<digits>b`
+# into its number and direction. returns false when `tok` is not that shape.
+fun asm_label_ref(tok: str, num_out: *u64, fwd_out: *bool) bool {
+    val len: usize = str_len(tok);
+    if (len < 2) { ret false; }
+    if (!asm_is_digit(tok[0])) { ret false; }
+    var n: u64 = 0;
+    var i: usize = 0;
+    for (i < len - 1) {
+        if (!asm_is_digit(tok[i])) { ret false; }
+        n = n * 10 + (tok[i]::u64 - '0'::u64);
+        i = i + 1;
+    }
+    val suf: char = tok[len - 1];
+    if (suf == 'f'::char) { @fwd_out = true; }
+    or (suf == 'b'::char) { @fwd_out = false; }
+    or { ret false; }
+    @num_out = n;
+    ret true;
+}
+
+# asm_first_token: copy the first whitespace-delimited token of `tok` (the mnemonic)
+# into `mbuf` NUL-terminated and set `args_out` to the trimmed remainder. returns
+# false when the mnemonic exceeds `cap`.
+fun asm_first_token(tok: str, mbuf: *u8, cap: usize, args_out: *str) bool {
+    var i: usize = 0;
+    for (tok[i] != 0 && asm_is_space(tok[i])) { i = i + 1; }
+    var k: usize = 0;
+    for (tok[i] != 0 && !asm_is_space(tok[i])) {
+        if (k + 1 >= cap) { ret false; }
+        mbuf[k] = tok[i]::u8; k = k + 1; i = i + 1;
+    }
+    mbuf[k] = 0;
+    for (tok[i] != 0 && asm_is_space(tok[i])) { i = i + 1; }
+    @args_out = (tok::usize + i)::str;
+    ret true;
+}
+
+# asm_named_err: build "<prefix><name><suffix>" interned into the session interner so
+# the diagnostic outlives this call; degrades to `fallback` when interning is
+# unavailable. mirrors the x86-64 `enc_named_message`.
+fun asm_named_err(st: *EncodeState, prefix: str, name: str, suffix: str, fallback: str) str {
+    if (st.interner == nil || name == nil) { ret fallback; }
+    val lp: usize = str_len(prefix);
+    val ln: usize = str_len(name);
+    val ls: usize = str_len(suffix);
+    val total: usize = lp + ln + ls;
+    val r: Result[*u8, str] = allocate[u8](st.alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret fallback; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    var j: usize = 0;
+    for (j < lp) { buf[k] = prefix[j]::u8; k = k + 1; j = j + 1; }
+    j = 0;
+    for (j < ln) { buf[k] = name[j]::u8; k = k + 1; j = j + 1; }
+    j = 0;
+    for (j < ls) { buf[k] = suffix[j]::u8; k = k + 1; j = j + 1; }
+    buf[total] = 0;
+    val ir: Result[intern.StrId, str] = intern.intern(st.interner, buf::str);
+    deallocate[u8](st.alloc, buf, total + 1);
+    if (is_err[intern.StrId, str](ir)) { ret fallback; }
+    val nm: Option[str] = intern.lookup(st.interner, unwrap_ok[intern.StrId, str](ir));
+    if (is_some[str](nm)) { ret unwrap[str](nm); }
+    ret fallback;
+}
+
+# ---- inline-asm operand parsing ----
+
+# asm_parse_reg: map a register token to its (index, width, SP-ness). recognizes
+# x0–x30 / w0–w30, sp / wsp (register 31, SP), and xzr / wzr (register 31, zero).
+fun asm_parse_reg(name: str, op: *AsmOp) bool {
+    val len: usize = str_len(name);
+    if (len == 0) { ret false; }
+    if (str_equals(name, "xzr")) { op.kind = ASMOP_REG; op.reg = 31; op.is64 = true;  op.is_sp = false; ret true; }
+    if (str_equals(name, "wzr")) { op.kind = ASMOP_REG; op.reg = 31; op.is64 = false; op.is_sp = false; ret true; }
+    if (str_equals(name, "sp"))  { op.kind = ASMOP_REG; op.reg = 31; op.is64 = true;  op.is_sp = true;  ret true; }
+    if (str_equals(name, "wsp")) { op.kind = ASMOP_REG; op.reg = 31; op.is64 = false; op.is_sp = true;  ret true; }
+    val c0: char = name[0];
+    if (c0 != 'x'::char && c0 != 'w'::char) { ret false; }
+    if (len < 2 || len > 3) { ret false; }
+    var n: u32 = 0;
+    var i: usize = 1;
+    for (i < len) {
+        if (!asm_is_digit(name[i])) { ret false; }
+        n = n * 10 + (name[i]::u32 - '0'::u32);
+        i = i + 1;
+    }
+    if (n > 30) { ret false; }
+    op.kind = ASMOP_REG; op.reg = n; op.is64 = (c0 == 'x'::char); op.is_sp = false;
+    ret true;
+}
+
+# asm_parse_mem: parse the inner text of a `[...]` memory operand into `op`. forms:
+# `[Xn]`, `[Xn, #imm]`, `[Xn, #imm]!` (pre-index writeback), `[Xn, Xm]` (register
+# offset), and `[Xn, :lo12:sym]` (folded-global low half). the `:lo12:` symbol name
+# is recorded as a borrowed slice of `tok` (stable for the statement).
+fun asm_parse_mem(tok: str, len: usize, op: *AsmOp) bool {
+    op.kind = ASMOP_MEM;
+    var hi: usize = len;
+    if (tok[hi - 1] == '!'::char) { op.wb_pre = true; hi = hi - 1; }
+    if (hi < 2) { ret false; }
+    if (tok[0] != '['::char || tok[hi - 1] != ']'::char) { ret false; }
+    val ilo: usize = 1;
+    val ihi: usize = hi - 1;
+
+    var comma: usize = ihi;
+    var found: bool = false;
+    var i: usize = ilo;
+    for (i < ihi && !found) {
+        if (tok[i] == ','::char) { comma = i; found = true; }
+        i = i + 1;
+    }
+
+    var bbuf: [16]u8;
+    if (!asm_copy_region(tok, ilo, comma, ?bbuf[0], 16)) { ret false; }
+    var bop: AsmOp;
+    if (!asm_parse_reg((?bbuf[0])::str, ?bop)) { ret false; }
+    op.base = bop.reg; op.base_sp = bop.is_sp;
+    if (!found) { ret true; }
+
+    var s: usize = comma + 1;
+    var e: usize = ihi;
+    for (s < e && asm_is_space(tok[s])) { s = s + 1; }
+    for (e > s && asm_is_space(tok[e - 1])) { e = e - 1; }
+    if (e <= s) { ret false; }
+
+    # the `:lo12:sym` folded-global low half (symbol name borrowed from `tok`).
+    if (asm_region_is_lo12(tok, s, e)) {
+        op.is_lo12 = true;
+        op.name = (tok::usize + s + 6)::str;
+        op.name_len = e - (s + 6);
+        if (op.name_len == 0) { ret false; }
+        ret true;
+    }
+    # a scaled-index register `[Xn, Xm]`, else a displacement. the displacement is
+    # written bare (`[Xn, 8]`) — `#` is the inline-asm comment character, stripped at
+    # lower time — though a leading `#` is also tolerated here.
+    var ibuf: [32]u8;
+    var ds: usize = s;
+    if (tok[ds] == '#'::char) { ds = ds + 1; }
+    if (!asm_copy_region(tok, ds, e, ?ibuf[0], 32)) { ret false; }
+    var iop: AsmOp;
+    if (tok[s] != '#'::char && asm_parse_reg((?ibuf[0])::str, ?iop)) {
+        op.has_index = true; op.index = iop.reg; op.index64 = iop.is64;
+        ret true;
+    }
+    val r: Result[i64, str] = parse.parse_i64_exact((?ibuf[0])::str, 0);
+    if (is_err[i64, str](r)) { ret false; }
+    op.imm = unwrap_ok[i64, str](r); op.has_disp = true;
+    ret true;
+}
+
+# asm_parse_operand: parse one trimmed operand token into `op` — a register, an
+# `#imm` / bare immediate, a `[...]` memory reference, a `:lo12:sym` low-half
+# specifier, or a bare symbol. returns false when the token matches none.
+fun asm_parse_operand(tok: str, op: *AsmOp) bool {
+    asm_op_clear(op);
+    val len: usize = str_len(tok);
+    if (len == 0) { ret false; }
+    if (asm_parse_reg(tok, op)) { ret true; }
+    asm_op_clear(op);
+    if (tok[0] == '['::char) { ret asm_parse_mem(tok, len, op); }
+    if (tok[0] == '#'::char) {
+        val r: Result[i64, str] = parse.parse_i64_exact((tok::usize + 1)::str, 0);
+        if (is_ok[i64, str](r)) { op.kind = ASMOP_IMM; op.imm = unwrap_ok[i64, str](r); ret true; }
+        ret false;
+    }
+    if (str_starts_with(tok, ":lo12:")) {
+        op.kind = ASMOP_LO12; op.is_lo12 = true;
+        op.name = (tok::usize + 6)::str; op.name_len = len - 6;
+        if (op.name_len == 0) { ret false; }
+        ret true;
+    }
+    if (asm_is_sym_token(tok, len)) {
+        op.kind = ASMOP_SYM; op.name = tok; op.name_len = len;
+        ret true;
+    }
+    val r2: Result[i64, str] = parse.parse_i64_exact(tok, 0);
+    if (is_ok[i64, str](r2)) { op.kind = ASMOP_IMM; op.imm = unwrap_ok[i64, str](r2); ret true; }
+    ret false;
+}
+
+# asm_split: split `args` into trimmed top-level operand tokens (commas outside
+# `[...]`), copying each NUL-terminated into `b0`..`b3` (each `cap` bytes). returns
+# false on more than four operands, an empty token, or an oversized token.
+fun asm_split(args: str, b0: *u8, b1: *u8, b2: *u8, b3: *u8, cap: usize, count_out: *u32) bool {
+    val len: usize = str_len(args);
+    var count: u32 = 0;
+    var depth: i32 = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    for (i <= len) {
+        var is_sep: bool = false;
+        if (i == len) { is_sep = true; }
+        or (args[i] == '['::char) { depth = depth + 1; }
+        or (args[i] == ']'::char) { depth = depth - 1; }
+        or (args[i] == ','::char && depth == 0) { is_sep = true; }
+        if (is_sep) {
+            if (count >= 4) { ret false; }
+            var dst: *u8 = b0;
+            if (count == 1) { dst = b1; }
+            or (count == 2) { dst = b2; }
+            or (count == 3) { dst = b3; }
+            if (!asm_copy_region(args, start, i, dst, cap)) { ret false; }
+            count = count + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    @count_out = count;
+    ret true;
+}
+
+# asm_parse_cond: map an A64 condition mnemonic (eq/ne/cs/hs/cc/lo/.../le/al) to its
+# 4-bit condition code, or return false for an unknown condition.
+fun asm_parse_cond(s: str, out: *u32) bool {
+    if (str_equals(s, "eq")) { @out = CC_EQ; ret true; }
+    if (str_equals(s, "ne")) { @out = CC_NE; ret true; }
+    if (str_equals(s, "cs") || str_equals(s, "hs")) { @out = CC_HS; ret true; }
+    if (str_equals(s, "cc") || str_equals(s, "lo")) { @out = CC_CC; ret true; }
+    if (str_equals(s, "mi")) { @out = CC_MI; ret true; }
+    if (str_equals(s, "pl")) { @out = CC_PL; ret true; }
+    if (str_equals(s, "vs")) { @out = CC_VS; ret true; }
+    if (str_equals(s, "vc")) { @out = CC_VC; ret true; }
+    if (str_equals(s, "hi")) { @out = CC_HI; ret true; }
+    if (str_equals(s, "ls")) { @out = CC_LS; ret true; }
+    if (str_equals(s, "ge")) { @out = CC_GE; ret true; }
+    if (str_equals(s, "lt")) { @out = CC_LT; ret true; }
+    if (str_equals(s, "gt")) { @out = CC_GT; ret true; }
+    if (str_equals(s, "le")) { @out = CC_LE; ret true; }
+    if (str_equals(s, "al")) { @out = CC_AL; ret true; }
+    ret false;
+}
+
+# asm_parse_lsl_amount: parse a `lsl #N` (or `lsl N`) shift token into the amount.
+fun asm_parse_lsl_amount(s: str, out: *u32) bool {
+    if (!str_starts_with(s, "lsl")) { ret false; }
+    var rest: str = asm_trim((s::usize + 3)::str);
+    if (rest[0] == '#'::char) { rest = (rest::usize + 1)::str; }
+    val r: Result[i64, str] = parse.parse_i64_exact(rest, 0);
+    if (is_err[i64, str](r)) { ret false; }
+    val v: i64 = unwrap_ok[i64, str](r);
+    if (v < 0) { ret false; }
+    @out = v::u32;
+    ret true;
+}
+
+# asm_push_sym_reloc: intern a borrowed symbol name and record a relocation of
+# `kind` at the instruction-word start `pos` (the A64 reloc-offset convention).
+fun asm_push_sym_reloc(st: *EncodeState, pos: u32, kind: of.RelocKind, name: str, name_len: usize, addend: i32) Result[bool, str] {
+    val r: Result[intern.StrId, str] = intern.intern_bytes(st.interner, name, name_len);
+    if (is_err[intern.StrId, str](r)) { ret err[bool, str](unwrap_err[intern.StrId, str](r)); }
+    ret push_reloc(st, arm64_reloc_offset(pos), kind, unwrap_ok[intern.StrId, str](r), addend);
+}
+
+# ---- inline-asm `{name}` substitution ----
+
+# asm_emit_dec: append the base-10 digits of `n` (at least one digit for zero).
+fun asm_emit_dec(out: *ByteBuf, n: u64) {
+    if (n == 0) { emit_byte(out, '0'::u8); ret; }
+    var tmp: [20]u8;
+    var len: usize = 0;
+    var v: u64 = n;
+    for (v > 0) { tmp[len] = (v % 10)::u8 + '0'::u8; v = v / 10; len = len + 1; }
+    var k: usize = 0;
+    for (k < len) { emit_byte(out, tmp[len - 1 - k]); k = k + 1; }
+}
+
+# asm_emit_frame_ref: append the `[x29, #off]` / `[x29, #-off]` text for a local's
+# frame-slot displacement (the AArch64 analogue of x86-64's `[rbp+off]`).
+fun asm_emit_frame_ref(out: *ByteBuf, off: i64) {
+    emit_byte(out, '['::u8); emit_byte(out, 'x'::u8); emit_byte(out, '2'::u8); emit_byte(out, '9'::u8);
+    emit_byte(out, ','::u8); emit_byte(out, ' '::u8); emit_byte(out, '#'::u8);
+    var mag: i64 = off;
+    if (off < 0) { emit_byte(out, '-'::u8); mag = -off; }
+    asm_emit_dec(out, mag::u64);
+    emit_byte(out, ']'::u8);
+}
+
+# asm_bind_name_eq: true when the interned binding name equals `body[start..start+n)`.
+fun asm_bind_name_eq(interner: *intern.Interner, name: intern.StrId, body: str, start: usize, name_len: usize) bool {
+    val nopt: Option[str] = intern.lookup(interner, name);
+    if (!is_some[str](nopt)) { ret false; }
+    ret str_region_equals(body, start, name_len, unwrap[str](nopt));
+}
+
+# asm_free_buf: release a byte buffer's backing storage on an error path.
+fun asm_free_buf(b: *ByteBuf) {
+    if (b.data != nil && b.cap > 0) {
+        deallocate[u8](b.alloc, b.data, b.cap);
+        b.data = nil; b.cap = 0; b.len = 0;
+    }
+}
+
+# substitute_asm_locals_arm64: produce a NUL-terminated copy of the asm body with
+# each `{name}` replaced by its local's `[x29, #off]` frame-slot text. the offset
+# comes from the slot-vreg binding resolved against the laid-out frame. an unbound
+# `{name}` is a hard error. mirrors x86-64's `substitute_asm_locals`.
+fun substitute_asm_locals_arm64(alloc: *Allocator, interner: *intern.Interner, f: *mir.MirFunction, pl: *mir.MirAsm) Result[str, str] {
+    var out: ByteBuf = buf_init(alloc);
+    val body: str = pl.body;
+    var i: usize = 0;
+    for (body[i] != 0) {
+        if (body[i] != '{'::char) {
+            emit_byte(?out, body[i]::u8);
+            i = i + 1;
+            cnt;
+        }
+        val name_start: usize = i + 1;
+        var j: usize = name_start;
+        for (body[j] != 0 && body[j] != '}'::char) { j = j + 1; }
+        if (body[j] == 0) {
+            asm_free_buf(?out);
+            ret err[str, str]("encode: unterminated '{' in inline asm body");
+        }
+        val name_len: usize = j - name_start;
+
+        var off: i64 = 0;
+        var found: bool = false;
+        var b: u32 = 0;
+        for (b < pl.bind_count) {
+            if (asm_bind_name_eq(interner, pl.binds[b].name, body, name_start, name_len)) {
+                val so: Option[i64] = frame_slot_offset(f, pl.binds[b].slot_vreg);
+                if (!is_some[i64](so)) {
+                    asm_free_buf(?out);
+                    ret err[str, str]("encode: inline-asm '{name}' local has no frame slot");
+                }
+                off = unwrap[i64](so);
+                found = true;
+                b = pl.bind_count;
+            } or {
+                b = b + 1;
+            }
+        }
+        if (!found) {
+            asm_free_buf(?out);
+            ret err[str, str]("encode: unknown local in inline asm '{name}' reference");
+        }
+
+        asm_emit_frame_ref(?out, off);
+        i = j + 1;
+    }
+    emit_byte(?out, 0);
+
+    if (out.data == nil || out.len == 0) {
+        asm_free_buf(?out);
+        val r: Result[*u8, str] = allocate[u8](alloc, 1::usize);
+        if (is_err[*u8, str](r)) { ret err[str, str](unwrap_err[*u8, str](r)); }
+        val one: *u8 = unwrap_ok[*u8, str](r);
+        one[0] = 0;
+        ret ok[str, str](one::str);
+    }
+    if (out.cap != out.len) {
+        val r: Result[*u8, str] = reallocate[u8](alloc, out.data, out.cap, out.len);
+        if (is_err[*u8, str](r)) { ret err[str, str](unwrap_err[*u8, str](r)); }
+        out.data = unwrap_ok[*u8, str](r);
+        out.cap  = out.len;
+    }
+    ret ok[str, str](out.data::str);
+}
+
+# ---- inline-asm per-mnemonic encoders ----
+
+# emit_asm_mov_imm: materialize `mov Rd, #imm`. a value representable as a single
+# 16-bit chunk at one of the `lsl #{0,16,32,48}` positions emits one MOVZ (matching
+# llvm-mc's alias); any other value falls back to the full MOVZ/MOVK sequence (the
+# exact bit pattern; no MOVN form).
+fun emit_asm_mov_imm(st: *EncodeState, rd: u32, value: u64, use64: bool) {
+    var v: u64 = value;
+    if (!use64) { v = value & 0xFFFFFFFF; }
+    var chunks: u32 = 2;
+    if (use64) { chunks = 4; }
+    var i: u32 = 0;
+    for (i < chunks) {
+        val sh: u64 = 16::u64 * i::u64;
+        val chunk: u64 = (v >> sh) & 0xFFFF;
+        if ((chunk << sh) == v) {
+            emit_word(st, pack_movewide(sel(use64, MOVZ_X, MOVZ_W), rd, i, chunk::u32));
+            ret;
+        }
+        i = i + 1;
+    }
+    emit_movewide_seq(st, rd, value, use64);
+}
+
+# emit_asm_mov: `mov Rd, Rm` (an `add` when SP is involved, else `orr Rd, XZR, Rm`)
+# or `mov Rd, #imm` (MOVZ / MOVZ+MOVK).
+fun emit_asm_mov(st: *EncodeState, args: str) Result[bool, str] {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { ret err[bool, str]("encode: malformed inline-asm 'mov' operands"); }
+    if (n != 2) { ret err[bool, str]("encode: inline-asm 'mov' expects two operands"); }
+    var dst: AsmOp;
+    var src: AsmOp;
+    if (!asm_parse_operand((?b0[0])::str, ?dst)) { ret err[bool, str]("encode: malformed inline-asm 'mov' destination"); }
+    if (!asm_parse_operand((?b1[0])::str, ?src)) { ret err[bool, str]("encode: malformed inline-asm 'mov' source"); }
+    if (dst.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm 'mov' destination must be a register"); }
+    val use64: bool = dst.is64;
+    if (src.kind == ASMOP_REG) {
+        if (dst.is_sp || src.is_sp) {
+            emit_word(st, pack_addsub_imm(sel(use64, ADDI_X, ADDI_W), dst.reg, src.reg, 0, 0));
+        } or {
+            emit_word(st, pack_alu3(sel(use64, ORR_X, ORR_W), dst.reg, ZR, src.reg));
+        }
+        ret ok[bool, str](true);
+    }
+    if (src.kind == ASMOP_IMM) {
+        emit_asm_mov_imm(st, dst.reg, src.imm::u64, use64);
+        ret ok[bool, str](true);
+    }
+    ret err[bool, str]("encode: inline-asm 'mov' source must be a register or immediate");
+}
+
+# emit_asm_movewide: `movz` / `movk Rd, #imm16 [, lsl #N]`.
+fun emit_asm_movewide(st: *EncodeState, args: str, is_movk: bool) Result[bool, str] {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { ret err[bool, str]("encode: malformed inline-asm movz/movk operands"); }
+    if (n < 2 || n > 3) { ret err[bool, str]("encode: inline-asm movz/movk expects Rd, #imm [, lsl #N]"); }
+    var rd: AsmOp;
+    var im: AsmOp;
+    if (!asm_parse_operand((?b0[0])::str, ?rd) || rd.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm movz/movk destination must be a register"); }
+    if (!asm_parse_operand((?b1[0])::str, ?im) || im.kind != ASMOP_IMM) { ret err[bool, str]("encode: inline-asm movz/movk needs an immediate"); }
+    if (im.imm < 0 || im.imm > 0xFFFF) { ret err[bool, str]("encode: inline-asm movz/movk immediate is out of 16-bit range"); }
+    var hw: u32 = 0;
+    if (n == 3) {
+        if (!asm_parse_lsl_amount((?b2[0])::str, ?hw)) { ret err[bool, str]("encode: inline-asm movz/movk shift must be 'lsl #N'"); }
+        if ((hw & 0xF) != 0) { ret err[bool, str]("encode: inline-asm movz/movk shift must be a multiple of 16"); }
+        hw = hw / 16;
+        if (rd.is64) {
+            if (hw > 3) { ret err[bool, str]("encode: inline-asm movz/movk 64-bit shift exceeds lsl #48"); }
+        } or {
+            if (hw > 1) { ret err[bool, str]("encode: inline-asm movz/movk 32-bit shift exceeds lsl #16"); }
+        }
+    }
+    var base: u32 = sel(rd.is64, MOVZ_X, MOVZ_W);
+    if (is_movk) { base = sel(rd.is64, MOVK_X, MOVK_W); }
+    emit_word(st, pack_movewide(base, rd.reg, hw, im.imm::u32));
+    ret ok[bool, str](true);
+}
+
+# emit_asm_addsub: `add` / `sub Rd, Rn, (#imm | Rm | :lo12:sym)`. an immediate folds
+# into the imm12 (or imm12<<12) form; a `:lo12:sym` (add only) emits the low-half ADD
+# with RK_ADD_LO12; a register uses the shifted-register form. SP with a register
+# operand needs the extended-register form (unsupported, rejected loud).
+fun emit_asm_addsub(st: *EncodeState, args: str, is_sub: bool) Result[bool, str] {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { ret err[bool, str]("encode: malformed inline-asm add/sub operands"); }
+    if (n != 3) { ret err[bool, str]("encode: inline-asm add/sub expects three operands"); }
+    var rd: AsmOp;
+    var rn: AsmOp;
+    var op3: AsmOp;
+    if (!asm_parse_operand((?b0[0])::str, ?rd) || rd.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm add/sub destination must be a register"); }
+    if (!asm_parse_operand((?b1[0])::str, ?rn) || rn.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm add/sub first source must be a register"); }
+    if (!asm_parse_operand((?b2[0])::str, ?op3)) { ret err[bool, str]("encode: malformed inline-asm add/sub operand"); }
+    val use64: bool = rd.is64;
+
+    if (op3.kind == ASMOP_IMM) {
+        val v: i64 = op3.imm;
+        var base_i: u32 = sel(use64, ADDI_X, ADDI_W);
+        if (is_sub) { base_i = sel(use64, SUBI_X, SUBI_W); }
+        if (v >= 0 && v <= 4095) {
+            emit_word(st, pack_addsub_imm(base_i, rd.reg, rn.reg, v::u32, 0));
+            ret ok[bool, str](true);
+        }
+        if (v > 0 && (v & 0xFFF) == 0 && (v >> 12) <= 4095) {
+            emit_word(st, pack_addsub_imm(base_i, rd.reg, rn.reg, (v >> 12)::u32, 1));
+            ret ok[bool, str](true);
+        }
+        ret err[bool, str]("encode: inline-asm add/sub immediate is out of imm12 range");
+    }
+    if (op3.kind == ASMOP_LO12) {
+        if (is_sub) { ret err[bool, str]("encode: inline-asm 'sub' has no :lo12: form"); }
+        val pos: u32 = st.buf.len::u32;
+        emit_word(st, pack_addsub_imm(sel(use64, ADDI_X, ADDI_W), rd.reg, rn.reg, 0, 0));
+        ret asm_push_sym_reloc(st, pos, of.RK_ADD_LO12, op3.name, op3.name_len, 0);
+    }
+    if (op3.kind == ASMOP_REG) {
+        if (rd.is_sp || rn.is_sp || op3.is_sp) {
+            ret err[bool, str]("encode: inline-asm add/sub with SP and a register operand requires the extended-register form (unsupported)");
+        }
+        var base_r: u32 = sel(use64, ADD_X, ADD_W);
+        if (is_sub) { base_r = sel(use64, SUB_X, SUB_W); }
+        emit_word(st, pack_alu3(base_r, rd.reg, rn.reg, op3.reg));
+        ret ok[bool, str](true);
+    }
+    ret err[bool, str]("encode: malformed inline-asm add/sub operand");
+}
+
+# emit_asm_logical: `and` / `orr` / `eor Rd, Rn, Rm` (register form). the logical
+# immediate (bitmask) form is unsupported and rejected loud.
+fun emit_asm_logical(st: *EncodeState, args: str, base_x: u32, base_w: u32) Result[bool, str] {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { ret err[bool, str]("encode: malformed inline-asm logical operands"); }
+    if (n != 3) { ret err[bool, str]("encode: inline-asm and/orr/eor expects three operands"); }
+    var rd: AsmOp;
+    var rn: AsmOp;
+    var rm: AsmOp;
+    if (!asm_parse_operand((?b0[0])::str, ?rd) || rd.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm and/orr/eor destination must be a register"); }
+    if (!asm_parse_operand((?b1[0])::str, ?rn) || rn.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm and/orr/eor first source must be a register"); }
+    if (!asm_parse_operand((?b2[0])::str, ?rm) || rm.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm and/orr/eor immediate (bitmask) form unsupported; use a register operand"); }
+    emit_word(st, pack_alu3(sel(rd.is64, base_x, base_w), rd.reg, rn.reg, rm.reg));
+    ret ok[bool, str](true);
+}
+
+# emit_asm_cmp: `cmp Rn, (#imm | Rm)` — the SUBS XZR alias.
+fun emit_asm_cmp(st: *EncodeState, args: str) Result[bool, str] {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { ret err[bool, str]("encode: malformed inline-asm 'cmp' operands"); }
+    if (n != 2) { ret err[bool, str]("encode: inline-asm 'cmp' expects two operands"); }
+    var rn: AsmOp;
+    var op2: AsmOp;
+    if (!asm_parse_operand((?b0[0])::str, ?rn) || rn.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm 'cmp' first operand must be a register"); }
+    if (!asm_parse_operand((?b1[0])::str, ?op2)) { ret err[bool, str]("encode: malformed inline-asm 'cmp' operand"); }
+    val use64: bool = rn.is64;
+    if (op2.kind == ASMOP_IMM && op2.imm >= 0 && op2.imm <= 4095) {
+        emit_word(st, pack_cmp_imm(sel(use64, SUBS_IMM_X, SUBS_IMM_W), rn.reg, op2.imm::u32));
+        ret ok[bool, str](true);
+    }
+    if (op2.kind == ASMOP_REG) {
+        emit_word(st, pack_cmp_reg(sel(use64, SUBS_REG_X, SUBS_REG_W), rn.reg, op2.reg));
+        ret ok[bool, str](true);
+    }
+    ret err[bool, str]("encode: inline-asm 'cmp' second operand must be a register or imm12");
+}
+
+# emit_asm_adrp: `adrp Xd, sym` — the page-relative high half, RK_PAGE21.
+fun emit_asm_adrp(st: *EncodeState, args: str) Result[bool, str] {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { ret err[bool, str]("encode: malformed inline-asm 'adrp' operands"); }
+    if (n != 2) { ret err[bool, str]("encode: inline-asm 'adrp' expects Xd, symbol"); }
+    var rd: AsmOp;
+    var sym: AsmOp;
+    if (!asm_parse_operand((?b0[0])::str, ?rd) || rd.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm 'adrp' destination must be a register"); }
+    if (!asm_parse_operand((?b1[0])::str, ?sym) || sym.kind != ASMOP_SYM) { ret err[bool, str]("encode: inline-asm 'adrp' target must be a symbol"); }
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_adrp(rd.reg));
+    ret asm_push_sym_reloc(st, pos, of.RK_PAGE21, sym.name, sym.name_len, 0);
+}
+
+# emit_asm_ldst: `ldr` / `str` / `ldrb` / `strb` / `ldrh` / `strh Rt, <mem>`. the
+# `[Xn, :lo12:sym]` form emits the per-width RK_LDST*_LO12 folded-global low half;
+# `[Xn, Xm]` the register-offset form; `[Xn]` / `[Xn, #imm]` legalize through
+# `emit_mem_access`. writeback (`!`) is rejected.
+fun emit_asm_ldst(st: *EncodeState, mnem: str, args: str) Result[bool, str] {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { ret err[bool, str]("encode: malformed inline-asm ldr/str operands"); }
+    if (n != 2) { ret err[bool, str]("encode: inline-asm ldr/str expects Rt, [mem]"); }
+    var rt: AsmOp;
+    var mem: AsmOp;
+    if (!asm_parse_operand((?b0[0])::str, ?rt) || rt.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm ldr/str value must be a register"); }
+    if (!asm_parse_operand((?b1[0])::str, ?mem) || mem.kind != ASMOP_MEM) { ret err[bool, str]("encode: inline-asm ldr/str address must be a memory operand"); }
+    if (mem.wb_pre) { ret err[bool, str]("encode: inline-asm ldr/str writeback addressing unsupported"); }
+
+    val is_load: bool = mnem[0] == 'l'::char;
+    var w: u8 = 4;
+    if (rt.is64) { w = 8; }
+    if (str_len(mnem) == 4) {
+        if (mnem[3] == 'b'::char) { w = 1; }
+        or (mnem[3] == 'h'::char) { w = 2; }
+        or { ret err[bool, str]("encode: unsupported aarch64 inline-asm load/store width"); }
+    }
+
+    if (mem.is_lo12) {
+        val pos: u32 = st.buf.len::u32;
+        emit_word(st, pack_ldst(ldst_base_scaled(w, is_load), rt.reg, mem.base, 0));
+        ret asm_push_sym_reloc(st, pos, ldst_lo12_kind(w), mem.name, mem.name_len, 0);
+    }
+    if (mem.has_index) {
+        emit_word(st, pack_ldst_reg(ldst_base_reg(w, is_load), rt.reg, mem.base, mem.index));
+        ret ok[bool, str](true);
+    }
+    var off: i64 = 0;
+    if (mem.has_disp) { off = mem.imm; }
+    emit_mem_access(st, rt.reg, mem.base, off, w, is_load);
+    ret ok[bool, str](true);
+}
+
+# emit_asm_ldstp: `stp` / `ldp Xa, Xb, <mem>` for the signed-offset, pre-index, and
+# post-index 64-bit forms. the W-register pair forms are unsupported.
+fun emit_asm_ldstp(st: *EncodeState, args: str, is_load: bool) Result[bool, str] {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { ret err[bool, str]("encode: malformed inline-asm stp/ldp operands"); }
+    if (n < 3 || n > 4) { ret err[bool, str]("encode: inline-asm stp/ldp expects Xa, Xb, [mem] [, #imm]"); }
+    var ra: AsmOp;
+    var rb: AsmOp;
+    if (!asm_parse_operand((?b0[0])::str, ?ra) || ra.kind != ASMOP_REG || !ra.is64) { ret err[bool, str]("encode: inline-asm stp/ldp registers must be X registers"); }
+    if (!asm_parse_operand((?b1[0])::str, ?rb) || rb.kind != ASMOP_REG || !rb.is64) { ret err[bool, str]("encode: inline-asm stp/ldp registers must be X registers"); }
+    var mem: AsmOp;
+    if (!asm_parse_operand((?b2[0])::str, ?mem) || mem.kind != ASMOP_MEM) { ret err[bool, str]("encode: inline-asm stp/ldp address must be a memory operand"); }
+    if (mem.has_index || mem.is_lo12) { ret err[bool, str]("encode: inline-asm stp/ldp address must be [Xn] or [Xn, #imm]"); }
+
+    var disp: i64 = 0;
+    var base_word: u32 = sel(is_load, LDP_OFF_X, STP_OFF_X);
+    if (n == 4) {
+        if (mem.has_disp || mem.wb_pre) { ret err[bool, str]("encode: inline-asm stp/ldp post-index base must be a bare [Xn]"); }
+        var imo: AsmOp;
+        if (!asm_parse_operand((?b3[0])::str, ?imo) || imo.kind != ASMOP_IMM) { ret err[bool, str]("encode: inline-asm stp/ldp post-index needs an immediate"); }
+        disp = imo.imm;
+        base_word = sel(is_load, LDP_POST_X, STP_POST_X);
+    } or {
+        if (mem.has_disp) { disp = mem.imm; }
+        if (mem.wb_pre) { base_word = sel(is_load, LDP_PRE_X, STP_PRE_X); }
+    }
+
+    if ((disp & 7) != 0) { ret err[bool, str]("encode: inline-asm stp/ldp offset must be a multiple of 8"); }
+    val q: i64 = disp / 8;
+    if (q < -64 || q > 63) { ret err[bool, str]("encode: inline-asm stp/ldp offset is out of the imm7 range"); }
+    emit_word(st, pack_ldstp(base_word, ra.reg, rb.reg, mem.base, q::u32 & 0x7F));
+    ret ok[bool, str](true);
+}
+
+# emit_asm_branch_label: emit a branch (B / B.cond / CBZ / CBNZ) to a numeric local
+# label. a backward reference patches immediately against the nearest preceding
+# definition; a forward reference is recorded and patched when its definition is
+# reached. the imm26 / imm19 insert is the shared `patch_branch_arm64`.
+fun emit_asm_branch_label(st: *EncodeState, labels: *AsmLabels, word: u32, number: u64, fwd: bool) Result[bool, str] {
+    val patch_pos: u32 = st.buf.len::u32;
+    emit_word(st, word);
+    if (fwd) { ret asm_label_push_ref(labels, patch_pos, number); }
+    val def: Option[u32] = asm_label_lookup(labels, number);
+    if (!is_some[u32](def)) {
+        ret err[bool, str]("encode: inline-asm backward reference to a local label has no preceding definition in this asm block");
+    }
+    var fx: BranchFixup;
+    fx.patch_pos = patch_pos; fx.next_ip = 0; fx.target_block = 0; fx.fn_text_base = 0;
+    ret patch_branch_arm64(st, ?fx, unwrap[u32](def));
+}
+
+# emit_asm_b: `b target` — an unconditional branch to a numeric local label (imm26
+# fixup) or a bare symbol (RK_PLT32, the branch26 the linker resolves).
+fun emit_asm_b(st: *EncodeState, labels: *AsmLabels, args: str) Result[bool, str] {
+    val target: str = asm_trim(args);
+    var number: u64 = 0;
+    var fwd: bool = false;
+    if (asm_label_ref(target, ?number, ?fwd)) {
+        ret emit_asm_branch_label(st, labels, B_BASE, number, fwd);
+    }
+    if (str_len(target) > 0 && asm_is_digit(target[0])) {
+        ret err[bool, str]("encode: inline-asm numeric local-label reference must be 'Nf' or 'Nb'");
+    }
+    var op: AsmOp;
+    if (!asm_parse_operand(target, ?op) || op.kind != ASMOP_SYM) {
+        ret err[bool, str]("encode: inline-asm 'b' target must be a symbol or a numeric local label");
+    }
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, B_BASE);
+    ret asm_push_sym_reloc(st, pos, of.RK_PLT32, op.name, op.name_len, 0);
+}
+
+# emit_asm_bcond: `b.<cond> target` — a conditional branch (imm19). a numeric local
+# label resolves in-block; a bare symbol has no imm19 relocation kind in the object
+# format and is rejected loud (x86-64 resolves the analogous `jz <sym>` with a
+# PC32 relocation, which the A64 conditional-branch field cannot express).
+fun emit_asm_bcond(st: *EncodeState, labels: *AsmLabels, cond: u32, args: str) Result[bool, str] {
+    val target: str = asm_trim(args);
+    var number: u64 = 0;
+    var fwd: bool = false;
+    if (asm_label_ref(target, ?number, ?fwd)) {
+        ret emit_asm_branch_label(st, labels, BCOND | (cond & 0xF), number, fwd);
+    }
+    if (str_len(target) > 0 && asm_is_digit(target[0])) {
+        ret err[bool, str]("encode: inline-asm numeric local-label reference must be 'Nf' or 'Nb'");
+    }
+    ret err[bool, str]("encode: inline-asm conditional branch to a symbol is unsupported (no imm19 relocation kind); branch to a numeric local label instead");
+}
+
+# emit_asm_cbr: `cbz` / `cbnz Rt, target` (imm19). a numeric local label resolves
+# in-block; a bare symbol is rejected loud (no imm19 relocation kind).
+fun emit_asm_cbr(st: *EncodeState, labels: *AsmLabels, args: str, is_nz: bool) Result[bool, str] {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { ret err[bool, str]("encode: malformed inline-asm cbz/cbnz operands"); }
+    if (n != 2) { ret err[bool, str]("encode: inline-asm cbz/cbnz expects Rt, target"); }
+    var rt: AsmOp;
+    if (!asm_parse_operand((?b0[0])::str, ?rt) || rt.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm cbz/cbnz first operand must be a register"); }
+    var base: u32 = sel(rt.is64, CBZ_X, CBZ_W);
+    if (is_nz) { base = sel(rt.is64, CBNZ_X, CBNZ_W); }
+    val word: u32 = pack_cbnz(base, rt.reg);
+
+    val target: str = asm_trim((?b1[0])::str);
+    var number: u64 = 0;
+    var fwd: bool = false;
+    if (asm_label_ref(target, ?number, ?fwd)) {
+        ret emit_asm_branch_label(st, labels, word, number, fwd);
+    }
+    if (str_len(target) > 0 && asm_is_digit(target[0])) {
+        ret err[bool, str]("encode: inline-asm numeric local-label reference must be 'Nf' or 'Nb'");
+    }
+    ret err[bool, str]("encode: inline-asm cbz/cbnz to a symbol is unsupported (no imm19 relocation kind); branch to a numeric local label instead");
+}
+
+# emit_asm_one_reg: a single-register-operand instruction (`blr Xn` / `br Xn`).
+fun emit_asm_one_reg(st: *EncodeState, args: str, word_is_blr: bool) Result[bool, str] {
+    val s: str = asm_trim(args);
+    var op: AsmOp;
+    if (!asm_parse_operand(s, ?op) || op.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm blr/br operand must be a register"); }
+    if (word_is_blr) { emit_word(st, pack_blr(op.reg)); }
+    or { emit_word(st, BR_BASE | ((op.reg & 0x1F) << 5)); }
+    ret ok[bool, str](true);
+}
+
+# emit_asm_bl: `bl sym` — a direct call, RK_PLT32 (the CALL26 the linker resolves).
+fun emit_asm_bl(st: *EncodeState, args: str) Result[bool, str] {
+    val s: str = asm_trim(args);
+    var op: AsmOp;
+    if (!asm_parse_operand(s, ?op) || op.kind != ASMOP_SYM) { ret err[bool, str]("encode: inline-asm 'bl' target must be a symbol"); }
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, BL_BASE);
+    ret asm_push_sym_reloc(st, pos, of.RK_PLT32, op.name, op.name_len, 0);
+}
+
+# emit_asm_imm16_op: a single-immediate instruction whose imm16 sits at bits[20:5]
+# (`svc #imm` / `brk #imm`). the value must fit 16 bits.
+fun emit_asm_imm16_op(st: *EncodeState, args: str, base: u32) Result[bool, str] {
+    val s: str = asm_trim(args);
+    var op: AsmOp;
+    if (!asm_parse_operand(s, ?op) || op.kind != ASMOP_IMM) { ret err[bool, str]("encode: inline-asm svc/brk needs an immediate"); }
+    if (op.imm < 0 || op.imm > 0xFFFF) { ret err[bool, str]("encode: inline-asm svc/brk immediate is out of 16-bit range"); }
+    emit_word(st, base | ((op.imm::u32 & 0xFFFF) << 5));
+    ret ok[bool, str](true);
+}
+
+# emit_asm_ret: `ret` (return through x30) or `ret Xn`.
+fun emit_asm_ret(st: *EncodeState, args: str) Result[bool, str] {
+    val s: str = asm_trim(args);
+    if (s[0] == 0) { emit_word(st, RET_WORD); ret ok[bool, str](true); }
+    var op: AsmOp;
+    if (!asm_parse_operand(s, ?op) || op.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm 'ret' operand must be a register"); }
+    emit_word(st, RET_BASE | ((op.reg & 0x1F) << 5));
+    ret ok[bool, str](true);
+}
+
+# encode_asm_stmt_arm64: parse and encode one trimmed inline-asm statement. a numeric
+# local-label definition `<digits>:` records the current offset (resolving forward
+# references) and re-dispatches any instruction following it. an unrecognized
+# mnemonic is a hard error so the assembler is cleanly extensible.
+fun encode_asm_stmt_arm64(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, labels: *AsmLabels, tok: str) Result[bool, str] {
+    var label_num: u64 = 0;
+    val dlen: usize = asm_label_def_len(tok, ?label_num);
+    if (dlen > 0) {
+        val dr: Result[bool, str] = asm_label_record_def(st, labels, label_num, st.buf.len::u32);
+        if (is_err[bool, str](dr)) { ret dr; }
+        val rest: str = asm_trim((tok::usize + dlen)::str);
+        if (rest[0] == 0) { ret ok[bool, str](true); }
+        ret encode_asm_stmt_arm64(st, f, fn_base, labels, rest);
+    }
+
+    var mbuf: [24]u8;
+    var args: str;
+    if (!asm_first_token(tok, ?mbuf[0], 24, ?args)) { ret err[bool, str]("encode: inline-asm mnemonic too long"); }
+    val mnem: str = (?mbuf[0])::str;
+
+    if (str_equals(mnem, "nop"))  { emit_word(st, NOP_WORD); ret ok[bool, str](true); }
+    if (str_equals(mnem, "ret"))  { ret emit_asm_ret(st, args); }
+    if (str_equals(mnem, "svc"))  { ret emit_asm_imm16_op(st, args, SVC_BASE); }
+    if (str_equals(mnem, "brk"))  { ret emit_asm_imm16_op(st, args, BRK_BASE); }
+    if (str_equals(mnem, "mov"))  { ret emit_asm_mov(st, args); }
+    if (str_equals(mnem, "movz")) { ret emit_asm_movewide(st, args, false); }
+    if (str_equals(mnem, "movk")) { ret emit_asm_movewide(st, args, true); }
+    if (str_equals(mnem, "add"))  { ret emit_asm_addsub(st, args, false); }
+    if (str_equals(mnem, "sub"))  { ret emit_asm_addsub(st, args, true); }
+    if (str_equals(mnem, "and"))  { ret emit_asm_logical(st, args, AND_X, AND_W); }
+    if (str_equals(mnem, "orr"))  { ret emit_asm_logical(st, args, ORR_X, ORR_W); }
+    if (str_equals(mnem, "eor"))  { ret emit_asm_logical(st, args, EOR_X, EOR_W); }
+    if (str_equals(mnem, "cmp"))  { ret emit_asm_cmp(st, args); }
+    if (str_equals(mnem, "adrp")) { ret emit_asm_adrp(st, args); }
+    if (str_equals(mnem, "bl"))   { ret emit_asm_bl(st, args); }
+    if (str_equals(mnem, "blr"))  { ret emit_asm_one_reg(st, args, true); }
+    if (str_equals(mnem, "br"))   { ret emit_asm_one_reg(st, args, false); }
+    if (str_equals(mnem, "b"))    { ret emit_asm_b(st, labels, args); }
+    if (str_starts_with(mnem, "b.")) {
+        var cond: u32 = 0;
+        if (!asm_parse_cond((mnem::usize + 2)::str, ?cond)) {
+            ret err[bool, str](asm_named_err(st, "unsupported aarch64 inline-asm condition '", mnem, "'", "unsupported aarch64 inline-asm condition"));
+        }
+        ret emit_asm_bcond(st, labels, cond, args);
+    }
+    if (str_equals(mnem, "cbz"))  { ret emit_asm_cbr(st, labels, args, false); }
+    if (str_equals(mnem, "cbnz")) { ret emit_asm_cbr(st, labels, args, true); }
+    if (str_equals(mnem, "ldr") || str_equals(mnem, "str") ||
+        str_equals(mnem, "ldrb") || str_equals(mnem, "strb") ||
+        str_equals(mnem, "ldrh") || str_equals(mnem, "strh")) {
+        ret emit_asm_ldst(st, mnem, args);
+    }
+    if (str_equals(mnem, "stp")) { ret emit_asm_ldstp(st, args, false); }
+    if (str_equals(mnem, "ldp")) { ret emit_asm_ldstp(st, args, true); }
+
+    ret err[bool, str](asm_named_err(st, "unsupported aarch64 inline-asm mnemonic '", mnem, "'", "unsupported aarch64 inline-asm mnemonic"));
+}
+
+# encode_asm_text_arm64: tokenize the (already `{name}`-substituted) asm body on
+# newlines / `;`, trim each statement, and encode it. `#` line comments were stripped
+# at lower time, so none reach here. mirrors x86-64's `encode_asm_text`.
+fun encode_asm_text_arm64(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, labels: *AsmLabels, text: str) Result[bool, str] {
+    val len: usize = str_len(text);
+    var start: usize = 0;
+    for (start < len) {
+        var end: usize = start;
+        for (end < len && text[end] != '\n'::char && text[end] != ';'::char) { end = end + 1; }
+
+        var lo: usize = start;
+        for (lo < end && asm_is_space(text[lo])) { lo = lo + 1; }
+        var hi: usize = end;
+        for (hi > lo && asm_is_space(text[hi - 1])) { hi = hi - 1; }
+
+        if (hi > lo) {
+            var line: [512]u8;
+            val ll: usize = hi - lo;
+            if (ll >= 512) { ret err[bool, str]("encode: inline asm statement too long"); }
+            var c: usize = 0;
+            for (c < ll) { line[c] = text[lo + c]::u8; c = c + 1; }
+            line[ll] = 0;
+            val er: Result[bool, str] = encode_asm_stmt_arm64(st, f, fn_base, labels, (?line[0])::str);
+            if (is_err[bool, str](er)) { ret er; }
+        }
+        start = end + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# encode_asm_block_arm64: expand an inline-asm MIR_ASM instruction into A64 bytes.
+# substitutes `{name}` locals to `[x29, #off]`, encodes each statement, and verifies
+# every forward local-label reference was defined within the block. the A64 analogue
+# of x86-64's `encode_asm_block`.
+fun encode_asm_block_arm64(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir.MirInstr) Result[bool, str] {
+    if (mi.asm_block == nil) { ret err[bool, str]("encode: MIR_ASM has no payload"); }
+    val pl: *mir.MirAsm = mi.asm_block;
+    if (!str_equals(pl.isa, "aarch64")) {
+        ret err[bool, str]("encode: inline-asm block is not aarch64");
+    }
+
+    val sr: Result[str, str] = substitute_asm_locals_arm64(st.alloc, st.interner, f, pl);
+    if (is_err[str, str](sr)) { ret err[bool, str](unwrap_err[str, str](sr)); }
+    val text: str = unwrap_ok[str, str](sr);
+
+    var labels: AsmLabels;
+    asm_labels_init(?labels, st.alloc);
+    val er: Result[bool, str] = encode_asm_text_arm64(st, f, fn_base, ?labels, text);
+    deallocate[u8](st.alloc, text::*u8, (str_len(text) + 1)::usize);
+    if (is_err[bool, str](er)) {
+        asm_labels_dnit(?labels);
+        ret er;
+    }
+    if (labels.ref_count > 0) {
+        asm_labels_dnit(?labels);
+        ret err[bool, str]("encode: inline-asm forward reference to a local label has no definition in this asm block");
+    }
+    asm_labels_dnit(?labels);
+    ret ok[bool, str](true);
 }
 
 # ---- in-source encode tests (byte-exact vs llvm-mc goldens) ----
@@ -2151,6 +3331,353 @@ test "arm64.encode: oversized SUB SP uses the register form" {
     if (read_word(?st.buf, 0) != pack_movewide(MOVZ_X, 16, 1, 0x100)) { bad = 1; }
     if (read_word(?st.buf, 4) != (SUB_SP_REG_X | (16 << 16)))         { bad = 1; }
 
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# ---- inline-asm assembler tests (Phase 3c, byte-exact vs llvm-mc goldens) ----
+
+# tasm: a page-backed EncodeState with a live interner, for exercising the inline-asm
+# assembler (which interns symbol names and resolves `{name}` bindings).
+fun tasm(st: *EncodeState, alloc: *Allocator, interner: *intern.Interner) {
+    page.make(alloc);
+    @interner = intern.init(alloc);
+    st.alloc       = alloc;
+    st.buf         = buf_init(alloc);
+    st.interner    = interner;
+    st.syms        = nil; st.sym_count   = 0; st.sym_cap   = 0;
+    st.relocs      = nil; st.reloc_count = 0; st.reloc_cap = 0;
+    st.fixups      = nil; st.fixup_count = 0; st.fixup_cap = 0;
+    st.blocks      = nil; st.block_count = 0; st.block_cap = 0;
+}
+
+# every data-processing form the std `_start` / syscall path uses, byte-exact against
+# `llvm-mc -triple=aarch64 --show-encoding`. each statement is one 32-bit word.
+test "arm64.encode: inline-asm data-processing forms match llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: AsmLabels;
+    asm_labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "nop");                    # 0
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ret");                    # 4
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "svc #0");                 # 8
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "svc 0x1");               # 12
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "brk #0");                # 16
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "mov x0, x1");           # 20
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "mov sp, x0");           # 24
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "mov x0, sp");           # 28
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "mov w0, w1");           # 32
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "mov x8, #93");          # 36
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "mov x0, #0");           # 40
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "movz x0, #0x1234");     # 44
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "movz x0, #0x1234, lsl #16"); # 48
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "movk x0, #0x5678, lsl #16"); # 52
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "add x0, x1, #5");       # 56
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "add x0, x1, x2");       # 60
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "sub x0, x1, #5");       # 64
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "sub sp, sp, #16");      # 68
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "and x0, x1, x2");       # 72
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "orr x0, x1, x2");       # 76
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "eor x0, x1, x2");       # 80
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "cmp x0, #5");           # 84
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "cmp x0, x1");           # 88
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "cmp w0, w1");           # 92
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "blr x0");              # 96
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "br x0");               # 100
+
+    if (read_word(?st.buf, 0)   != 0xD503201F) { bad = 1; }
+    if (read_word(?st.buf, 4)   != 0xD65F03C0) { bad = 1; }
+    if (read_word(?st.buf, 8)   != 0xD4000001) { bad = 1; }
+    if (read_word(?st.buf, 12)  != 0xD4000021) { bad = 1; }
+    if (read_word(?st.buf, 16)  != 0xD4200000) { bad = 1; }
+    if (read_word(?st.buf, 20)  != 0xAA0103E0) { bad = 1; }
+    if (read_word(?st.buf, 24)  != 0x9100001F) { bad = 1; }
+    if (read_word(?st.buf, 28)  != 0x910003E0) { bad = 1; }
+    if (read_word(?st.buf, 32)  != 0x2A0103E0) { bad = 1; }
+    if (read_word(?st.buf, 36)  != 0xD2800BA8) { bad = 1; }
+    if (read_word(?st.buf, 40)  != 0xD2800000) { bad = 1; }
+    if (read_word(?st.buf, 44)  != 0xD2824680) { bad = 1; }
+    if (read_word(?st.buf, 48)  != 0xD2A24680) { bad = 1; }
+    if (read_word(?st.buf, 52)  != 0xF2AACF00) { bad = 1; }
+    if (read_word(?st.buf, 56)  != 0x91001420) { bad = 1; }
+    if (read_word(?st.buf, 60)  != 0x8B020020) { bad = 1; }
+    if (read_word(?st.buf, 64)  != 0xD1001420) { bad = 1; }
+    if (read_word(?st.buf, 68)  != 0xD10043FF) { bad = 1; }
+    if (read_word(?st.buf, 72)  != 0x8A020020) { bad = 1; }
+    if (read_word(?st.buf, 76)  != 0xAA020020) { bad = 1; }
+    if (read_word(?st.buf, 80)  != 0xCA020020) { bad = 1; }
+    if (read_word(?st.buf, 84)  != 0xF100141F) { bad = 1; }
+    if (read_word(?st.buf, 88)  != 0xEB01001F) { bad = 1; }
+    if (read_word(?st.buf, 92)  != 0x6B01001F) { bad = 1; }
+    if (read_word(?st.buf, 96)  != 0xD63F0000) { bad = 1; }
+    if (read_word(?st.buf, 100) != 0xD61F0000) { bad = 1; }
+
+    asm_labels_dnit(?labels);
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# every load / store form (single registers + pairs) the std frame / syscall path
+# uses, byte-exact against llvm-mc.
+test "arm64.encode: inline-asm load/store forms match llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: AsmLabels;
+    asm_labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldr x0, [x1]");          # 0
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldr x0, [x1, #8]");      # 4
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldr x0, [x1, x2]");      # 8
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "str w0, [x1, #4]");      # 12
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldrb w0, [x1]");         # 16
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldrh w0, [x1, #2]");     # 20
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "strb w0, [x1, #1]");     # 24
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldr x0, [x1, #-8]");     # 28
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "str x0, [sp, #8]");      # 32
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldr x0, [sp]");          # 36
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "stp x29, x30, [sp, #-16]!"); # 40
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldp x29, x30, [sp], #16");   # 44
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "stp x19, x20, [sp, #16]");   # 48
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldp x19, x20, [sp, #16]");   # 52
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "stp x0, x1, [sp]");          # 56
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "stp x0, x1, [sp], #16");     # 60
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldp x0, x1, [sp, #16]!");    # 64
+
+    if (read_word(?st.buf, 0)  != 0xF9400020) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0xF9400420) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0xF8626820) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0xB9000420) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0x39400020) { bad = 1; }
+    if (read_word(?st.buf, 20) != 0x79400420) { bad = 1; }
+    if (read_word(?st.buf, 24) != 0x39000420) { bad = 1; }
+    if (read_word(?st.buf, 28) != 0xF85F8020) { bad = 1; }
+    if (read_word(?st.buf, 32) != 0xF90007E0) { bad = 1; }
+    if (read_word(?st.buf, 36) != 0xF94003E0) { bad = 1; }
+    if (read_word(?st.buf, 40) != 0xA9BF7BFD) { bad = 1; }
+    if (read_word(?st.buf, 44) != 0xA8C17BFD) { bad = 1; }
+    if (read_word(?st.buf, 48) != 0xA90153F3) { bad = 1; }
+    if (read_word(?st.buf, 52) != 0xA94153F3) { bad = 1; }
+    if (read_word(?st.buf, 56) != 0xA90007E0) { bad = 1; }
+    if (read_word(?st.buf, 60) != 0xA88107E0) { bad = 1; }
+    if (read_word(?st.buf, 64) != 0xA9C107E0) { bad = 1; }
+
+    asm_labels_dnit(?labels);
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the symbol-operand forms: `adrp` (RK_PAGE21), `add :lo12:` (RK_ADD_LO12), `bl`
+# (RK_PLT32 / CALL26), and the per-width folded-global `ldr/str [Xn, :lo12:]`
+# (RK_LDST*_LO12). base words match llvm-mc; the reloc fields are zero placeholders.
+test "arm64.encode: inline-asm symbol relocations record #1163 kinds" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: AsmLabels;
+    asm_labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    val gr: Result[intern.StrId, str] = intern.intern(?interner, "gsym");
+    val fr: Result[intern.StrId, str] = intern.intern(?interner, "fsym");
+    if (is_err[intern.StrId, str](gr) || is_err[intern.StrId, str](fr)) { ret 1; }
+    val g: intern.StrId    = unwrap_ok[intern.StrId, str](gr);
+    val fsym: intern.StrId = unwrap_ok[intern.StrId, str](fr);
+
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "adrp x0, gsym");            # 0
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "add x0, x0, :lo12:gsym");   # 4
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "bl fsym");                  # 8
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldr x0, [x16, :lo12:gsym]"); # 12
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "str w1, [x16, :lo12:gsym]"); # 16
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldrb w0, [x16, :lo12:gsym]"); # 20
+
+    if (read_word(?st.buf, 0)  != 0x90000000) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0x91000000) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0x94000000) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0xF9400200) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0xB9000201) { bad = 1; }
+    if (read_word(?st.buf, 20) != 0x39400200) { bad = 1; }
+
+    if (st.reloc_count != 6) { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PAGE21      || st.relocs[0].offset != 0  || st.relocs[0].sym != g)    { bad = 1; }
+        if (st.relocs[1].kind != of.RK_ADD_LO12    || st.relocs[1].offset != 4  || st.relocs[1].sym != g)    { bad = 1; }
+        if (st.relocs[2].kind != of.RK_PLT32       || st.relocs[2].offset != 8  || st.relocs[2].sym != fsym) { bad = 1; }
+        if (st.relocs[3].kind != of.RK_LDST64_LO12 || st.relocs[3].offset != 12 || st.relocs[3].sym != g)    { bad = 1; }
+        if (st.relocs[4].kind != of.RK_LDST32_LO12 || st.relocs[4].offset != 16 || st.relocs[4].sym != g)    { bad = 1; }
+        if (st.relocs[5].kind != of.RK_LDST8_LO12  || st.relocs[5].offset != 20 || st.relocs[5].sym != g)    { bad = 1; }
+    }
+
+    if (st.relocs != nil && st.reloc_cap > 0) {
+        deallocate[enc.PendingReloc](?alloc, st.relocs, st.reloc_cap::usize);
+    }
+    asm_labels_dnit(?labels);
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the in-block numeric-local-label path (the only intra-module branch target for a
+# conditional/compare branch, mirroring x86-64's 1f/1b handling): forward references
+# patch when the label is defined, backward references patch immediately. the imm26 /
+# imm19 insert reuses `patch_branch_arm64`, so the patched words match llvm-mc.
+test "arm64.encode: inline-asm branches to numeric local labels (b/b.cond/cbz/cbnz)" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: AsmLabels;
+    asm_labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "nop");          # 0
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "cbz x0, 1f");   # 4  (forward)
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "b.eq 1f");      # 8  (forward)
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "1: nop");       # 12 (define label 1; patch fwd refs)
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "b 1b");         # 16 (backward, imm26)
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "cbnz w1, 1b");  # 20 (backward, imm19)
+
+    # cbz x0 @4 -> 12: disp 8, imm19=2 -> 0xb4000040
+    if (read_word(?st.buf, 4)  != 0xB4000040) { bad = 1; }
+    # b.eq @8 -> 12: disp 4, imm19=1 -> 0x54000020
+    if (read_word(?st.buf, 8)  != 0x54000020) { bad = 1; }
+    # b @16 -> 12: disp -4, imm26 -> 0x17ffffff
+    if (read_word(?st.buf, 16) != 0x17FFFFFF) { bad = 1; }
+    # cbnz w1 @20 -> 12: disp -8, imm19 -> 0x35ffffc1
+    if (read_word(?st.buf, 20) != 0x35FFFFC1) { bad = 1; }
+    # all forward references resolved.
+    if (labels.ref_count != 0) { bad = 1; }
+
+    asm_labels_dnit(?labels);
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# a `{name}` local substitutes to its `[x29, #off]` frame slot (the AArch64 analogue
+# of x86-64's `[rbp+off]`); a slot at -8 loads/stores through the LDUR/STUR forms.
+test "arm64.encode: inline-asm {name} local resolves to a frame slot" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+
+    var slots: [1]mir.MirSlot;
+    slots[0].value  = 100;
+    slots[0].kind   = mir.SLOT_SPILL;
+    slots[0].offset = -8;
+    slots[0].size   = 4;
+    slots[0].align  = 4;
+    var f: mir.MirFunction;
+    f.frame.slots      = ?slots[0];
+    f.frame.slot_count = 1;
+
+    val xr: Result[intern.StrId, str] = intern.intern(?interner, "x");
+    if (is_err[intern.StrId, str](xr)) { ret 1; }
+    var binds: [1]mir.MirAsmBind;
+    binds[0].name      = unwrap_ok[intern.StrId, str](xr);
+    binds[0].slot_vreg = 100;
+
+    var pl: mir.MirAsm;
+    pl.isa        = "aarch64";
+    pl.body       = "ldr w0, {x}\nstr w0, {x}";
+    pl.binds      = ?binds[0];
+    pl.bind_count = 1;
+
+    var mi: mir.MirInstr;
+    mi.opcode        = mir.MIR_ASM;
+    mi.operands      = nil;
+    mi.operand_count = 0;
+    mi.width         = 0;
+    mi.src_width     = 0;
+    mi.asm_block     = ?pl;
+
+    val r: Result[bool, str] = encode_asm_block_arm64(?st, ?f, 0, ?mi);
+    if (is_err[bool, str](r)) { bad = 1; }
+    or {
+        # ldr w0, [x29, #-8] -> ldur w0,[x29,#-8] = 0xb85f83a0
+        if (read_word(?st.buf, 0) != 0xB85F83A0) { bad = 1; }
+        # str w0, [x29, #-8] -> stur w0,[x29,#-8] = 0xb81f83a0
+        if (read_word(?st.buf, 4) != 0xB81F83A0) { bad = 1; }
+    }
+
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# in a mach inline-asm body `#` is the comment character (stripped at lower time), so
+# A64 immediates are written BARE — `mov x8, 93`, `ldr x0, [x1, 8]`, `stp ..., -16]!`.
+# the bare forms must encode identically to the `#`-prefixed forms.
+test "arm64.encode: inline-asm bare immediates (no '#') match llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: AsmLabels;
+    asm_labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "mov x8, 93");              # 0  0xd2800ba8
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "add x0, x1, 5");          # 4  0x91001420
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "cmp x0, 5");              # 8  0xf100141f
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "svc 0");                  # 12 0xd4000001
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "movz x0, 0x1234, lsl 16"); # 16 0xd2a24680
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldr x0, [x1, 8]");        # 20 0xf9400420
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "str x0, [x1, -8]");       # 24 0xf81f8020
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "stp x29, x30, [sp, -16]!"); # 28 0xa9bf7bfd
+    encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "ldp x29, x30, [sp], 16");   # 32 0xa8c17bfd
+
+    if (read_word(?st.buf, 0)  != 0xD2800BA8) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0x91001420) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0xF100141F) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0xD4000001) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0xD2A24680) { bad = 1; }
+    if (read_word(?st.buf, 20) != 0xF9400420) { bad = 1; }
+    if (read_word(?st.buf, 24) != 0xF81F8020) { bad = 1; }
+    if (read_word(?st.buf, 28) != 0xA9BF7BFD) { bad = 1; }
+    if (read_word(?st.buf, 32) != 0xA8C17BFD) { bad = 1; }
+
+    asm_labels_dnit(?labels);
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# an unrecognized mnemonic is a hard error naming the offending mnemonic, so the
+# assembler stays cleanly extensible; a conditional branch to a SYMBOL (no imm19
+# relocation kind) is likewise rejected loud rather than mis-encoded.
+test "arm64.encode: inline-asm rejects unknown mnemonic and condbr-to-symbol" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: AsmLabels;
+    asm_labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    val r1: Result[bool, str] = encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "frobnicate x0, x1");
+    if (!is_err[bool, str](r1)) { bad = 1; }
+    or { if (!str_contains(unwrap_err[bool, str](r1), "unsupported aarch64 inline-asm mnemonic")) { bad = 1; } }
+
+    val r2: Result[bool, str] = encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "cbz x0, some_symbol");
+    if (!is_err[bool, str](r2)) { bad = 1; }
+    or { if (!str_contains(unwrap_err[bool, str](r2), "no imm19 relocation kind")) { bad = 1; } }
+
+    val r3: Result[bool, str] = encode_asm_stmt_arm64(?st, ?f, 0, ?labels, "b.eq some_symbol");
+    if (!is_err[bool, str](r3)) { bad = 1; }
+
+    asm_labels_dnit(?labels);
     buf_dnit(?st.buf);
     ret bad;
 }
