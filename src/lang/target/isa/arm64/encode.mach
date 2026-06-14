@@ -157,6 +157,10 @@ val STP_PRE_X:  u32 = 0xA9800000;
 val LDP_POST_X: u32 = 0xA8C00000;
 val STP_OFF_X:  u32 = 0xA9000000;
 val LDP_OFF_X:  u32 = 0xA9400000;
+# the 64-bit SIMD&FP signed-offset pair forms (callee-saved D8-D15 spills): the load
+# bit (0x400000) distinguishes LDP from STP, the FP twins of STP_OFF_X / LDP_OFF_X.
+val STP_OFF_D:  u32 = 0x6D000000;
+val LDP_OFF_D:  u32 = 0x6D400000;
 val STR_OFF_X:  u32 = 0xF9000000;
 val LDR_OFF_X:  u32 = 0xF9400000;
 # single-register load/store base words by access size, for the three addressing
@@ -1800,7 +1804,9 @@ fun align16(n: u32) u32 {
 # `SUB SP` and the byte stream matches the verified Phase 2b leaf output exactly.
 fun frame_subsize(f: *mir.MirFunction) u32 {
     val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
-    val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 16;
+    # only the low 64 bits (Dn) of V8-V15 are callee-saved under AAPCS64, so each FP
+    # callee-save occupies 8 bytes (a D register), not a full 16-byte Q register.
+    val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 8;
     ret align16(gp_bytes + fp_bytes + f.frame.size + f.frame.outgoing_size);
 }
 
@@ -1830,23 +1836,26 @@ fun emit_sp_sub(st: *EncodeState, subsize: u32) {
 # x29, sp, #0`) pins the frame pointer at the record, and — when the frame needs
 # more — `SUB SP, SP, #subsize` allocates the locals / spills / callee-save / outgoing
 # region. callee-saved GP registers are then saved in STP/LDP pairs (a trailing odd
-# one with STUR) at x29-relative offsets just below the local frame. when `subsize`
-# is 0 (a leaf with no frame) the `SUB SP` and the callee-save stores are skipped, so
-# the output is byte-identical to Phase 2b's `stp ; mov x29, sp`.
+# one with STUR) at x29-relative offsets just below the local frame, then the callee-
+# saved FP registers (D8-D15) in the area just below them. when `subsize` is 0 (a leaf
+# with no frame) the `SUB SP` and the callee-save stores are skipped, so the output is
+# byte-identical to Phase 2b's `stp ; mov x29, sp`.
 fun emit_prologue(st: *EncodeState, f: *mir.MirFunction, subsize: u32) {
     emit_word(st, pack_ldstp(STP_PRE_X, 29, 30, ZR, (0::u32 - 2) & 0x7F));
     emit_word(st, pack_addsub_imm(ADDI_X, 29, ZR, 0, 0));
     if (subsize > 0) { emit_sp_sub(st, subsize); }
     save_callee_gp(st, f, true);
+    save_callee_fp(st, f, true);
 }
 
-# emit_epilogue: the AArch64 record-at-top epilogue. it restores the callee-saved GP
-# registers (x29-relative, mirroring the prologue), deallocates the frame with `MOV
-# SP, X29` (an `add sp, x29, #0`, which reverses any `SUB SP` regardless of size),
-# then reloads the record with `LDP X29, X30, [SP], #16`. the RET that follows
-# returns through X30. when `subsize` is 0 the `MOV SP, X29` is skipped, so the leaf
-# output is byte-identical to Phase 2b's `ldp ; ret`.
+# emit_epilogue: the AArch64 record-at-top epilogue. it restores the callee-saved FP
+# then GP registers (x29-relative, reversing the prologue's save order), deallocates
+# the frame with `MOV SP, X29` (an `add sp, x29, #0`, which reverses any `SUB SP`
+# regardless of size), then reloads the record with `LDP X29, X30, [SP], #16`. the RET
+# that follows returns through X30. when `subsize` is 0 the `MOV SP, X29` is skipped,
+# so the leaf output is byte-identical to Phase 2b's `ldp ; ret`.
 fun emit_epilogue(st: *EncodeState, f: *mir.MirFunction, subsize: u32) {
+    save_callee_fp(st, f, false);
     save_callee_gp(st, f, false);
     if (subsize > 0) {
         # mov sp, x29  (add sp, x29, #0)
@@ -1905,6 +1914,50 @@ fun save_callee_gp(st: *EncodeState, f: *mir.MirFunction, store: bool) {
     if ((n & 1) == 1) {
         val single_off: i32 = 0 - (anchor + (16 * num_pairs)::i32 - 8);
         emit_mem_access(st, regs[n - 1], base_reg, single_off::i64, 8, !store);
+    }
+}
+
+# save_callee_fp: save (or restore) the callee-saved FP registers `callee_mask_fp`
+# selects (only the low 64 bits / Dn of V8-V15 are callee-saved under AAPCS64), in
+# ascending order, in the FP-save area that sits just below the GP callee-save area.
+# the mask bits are the raw V-register indices (V8 = bit 8), used directly in the
+# D-register STP/LDP pairs (a trailing odd one with STUR/LDUR). it addresses x29-
+# relatively, or through an IP0 anchor when the frame is past the imm7 reach — the FP
+# twin of save_callee_gp.
+fun save_callee_fp(st: *EncodeState, f: *mir.MirFunction, store: bool) {
+    var regs: [32]u32;
+    var n: u32 = 0;
+    var r: u32 = 0;
+    for (r < 32) {
+        if ((f.callee_mask_fp & (1::u32 << r)) != 0) { regs[n] = r; n = n + 1; }
+        r = r + 1;
+    }
+    if (n == 0) { ret; }
+
+    val fs: i32 = f.frame.size::i32;
+    val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
+    val fp_bytes: u32 = n * 8;
+    val num_pairs: u32 = n / 2;
+
+    var base_reg: u32 = 29;
+    var anchor: i32 = fs + gp_bytes::i32 + 16;
+    if (f.frame.size + gp_bytes + fp_bytes > MAX_CALLEE_SAVE_REACH) {
+        emit_add_imm(st, SCRATCH0, 29, 0 - ((fs + gp_bytes::i32 + 16)::i64));
+        base_reg = SCRATCH0;
+        anchor = 0;
+    }
+
+    var p: u32 = 0;
+    for (p < num_pairs) {
+        val base_off: i32 = 0 - (anchor + (16 * p)::i32);
+        val imm7: u32 = (base_off / 8)::u32 & 0x7F;
+        if (store) { emit_word(st, pack_ldstp(STP_OFF_D, regs[2 * p], regs[2 * p + 1], base_reg, imm7)); }
+        or         { emit_word(st, pack_ldstp(LDP_OFF_D, regs[2 * p], regs[2 * p + 1], base_reg, imm7)); }
+        p = p + 1;
+    }
+    if ((n & 1) == 1) {
+        val single_off: i32 = 0 - (anchor + (16 * num_pairs)::i32 - 8);
+        emit_fp_mem(st, regs[n - 1], base_reg, single_off::i64, 8, !store);
     }
 }
 
@@ -2019,9 +2072,6 @@ fun encode_function_arm64(st: *EncodeState, f: *mir.MirFunction) Result[bool, st
     val ms: Result[bool, str] = push_symbol(st, f.name, fn_base, of.SYM_OBJ_FLAG_FUNCTION);
     if (is_err[bool, str](ms)) { ret ms; }
 
-    if (f.callee_mask_fp != 0) {
-        ret err[bool, str]("aarch64 callee-saved FP registers not implemented (Phase 4)");
-    }
     val subsize: u32 = frame_subsize(f);
     emit_prologue(st, f, subsize);
 
@@ -3757,6 +3807,41 @@ test "arm64.encode: non-leaf prologue/epilogue + callee-save STP/LDP match llvm-
     ret bad;
 }
 
+# the callee-saved FP registers (D8-D15) save below the GP area: their D-register
+# STP/LDP pairs (a trailing odd one with STUR/LDUR) sit just under the GP saves, the
+# FP twin of the GP path. with no GP saves the FP area abuts the local frame directly.
+test "arm64.encode: callee-save FP STP/LDP/STUR D-register prologue/epilogue match llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    # three FP callee-saves (v8,v9,v10), frame.size 16 -> subsize align16(24+16)=48.
+    var f: mir.MirFunction;
+    f.callee_mask = 0;
+    f.callee_mask_fp = (1::u32 << 8) | (1::u32 << 9) | (1::u32 << 10);
+    f.frame.size = 16;
+    f.frame.outgoing_size = 0;
+    if (frame_subsize(?f) != 48) { bad = 1; }
+    emit_prologue(?st, ?f, 48);
+    # stp x29,x30,[sp,#-16]! ; mov x29,sp ; sub sp,sp,#48
+    if (read_word(?st.buf, 0)  != 0xA9BF7BFD) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0x910003FD) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0xD100C3FF) { bad = 1; }
+    # stp d8,d9,[x29,#-32] ; stur d10,[x29,#-40]
+    if (read_word(?st.buf, 12) != 0x6D3E27A8) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0xFC1D83AA) { bad = 1; }
+    emit_epilogue(?st, ?f, 48);
+    # ldp d8,d9,[x29,#-32] ; ldur d10,[x29,#-40] ; mov sp,x29 ; ldp x29,x30,[sp],#16
+    if (read_word(?st.buf, 20) != 0x6D7E27A8) { bad = 1; }
+    if (read_word(?st.buf, 24) != 0xFC5D83AA) { bad = 1; }
+    if (read_word(?st.buf, 28) != 0x910003BF) { bad = 1; }
+    if (read_word(?st.buf, 32) != 0xA8C17BFD) { bad = 1; }
+
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
 # the GP callee-save pair packers, asserted directly against llvm-mc for the
 # x29-relative negative-offset forms the prologue/epilogue emit.
 test "arm64.encode: callee-save STP/LDP/STUR pair words match llvm-mc" {
@@ -3769,6 +3854,12 @@ test "arm64.encode: callee-save STP/LDP/STUR pair words match llvm-mc" {
     # stur/ldur x21,[x29,#-40] = 0xf81d83b5 / 0xf85d83b5 (imm9 = -40 & 0x1ff)
     if (pack_ldur(STUR_X, 21, 29, (0::u32 - 40) & 0x1FF) != 0xF81D83B5) { bad = 1; }
     if (pack_ldur(LDUR_X, 21, 29, (0::u32 - 40) & 0x1FF) != 0xF85D83B5) { bad = 1; }
+    # the FP D-register twins: stp/ldp d8,d9,[x29,#-16] = 0x6d3f27a8 / 0x6d7f27a8.
+    if (pack_ldstp(STP_OFF_D, 8, 9, 29, (0::u32 - 2) & 0x7F) != 0x6D3F27A8) { bad = 1; }
+    if (pack_ldstp(LDP_OFF_D, 8, 9, 29, (0::u32 - 2) & 0x7F) != 0x6D7F27A8) { bad = 1; }
+    # stur/ldur d10,[x29,#-40] = 0xfc1d83aa / 0xfc5d83aa (imm9 = -40 & 0x1ff)
+    if (pack_ldur(STUR_D_FP, 10, 29, (0::u32 - 40) & 0x1FF) != 0xFC1D83AA) { bad = 1; }
+    if (pack_ldur(LDUR_D_FP, 10, 29, (0::u32 - 40) & 0x1FF) != 0xFC5D83AA) { bad = 1; }
     ret bad;
 }
 
