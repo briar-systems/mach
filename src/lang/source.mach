@@ -28,8 +28,13 @@ use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
 use std.allocator.reallocate;
+use page: std.allocator.page;
 
-use query: mach.lang.query;
+use map:     std.collections.map;
+use maphash: std.collections.map;
+
+use query:  mach.lang.query;
+use intern: mach.lang.intern;
 
 # FileId: stable handle into a SourceMap's file array.
 pub def FileId: u32;
@@ -60,15 +65,18 @@ pub rec SourceFile {
 
 # SourceMap: registry of loaded source files indexed by FileId.
 # ---
-# alloc: allocator used for all owned storage in this map
-# files: contiguous array of SourceFile records
-# len:   number of files currently stored
-# cap:   allocated slots in files
+# alloc:   allocator used for all owned storage in this map
+# files:   contiguous array of SourceFile records
+# len:     number of files currently stored
+# cap:     allocated slots in files
+# by_path: interned path StrId -> FileId index, maintained by load() so a path
+#          re-loaded in a long-lived session reuses its FileId instead of appending
 pub rec SourceMap {
-    alloc: *Allocator;
-    files: *SourceFile;
-    len:   usize;
-    cap:   usize;
+    alloc:   *Allocator;
+    files:   *SourceFile;
+    len:     usize;
+    cap:     usize;
+    by_path: map.Map[intern.StrId, FileId];
 }
 
 val INITIAL_MAP_CAP: usize = 8;
@@ -79,10 +87,11 @@ val INITIAL_MAP_CAP: usize = 8;
 # ret:   a new empty SourceMap
 pub fun init(alloc: *Allocator) SourceMap {
     var m: SourceMap;
-    m.alloc = alloc;
-    m.files = nil;
-    m.len   = 0;
-    m.cap   = 0;
+    m.alloc   = alloc;
+    m.files   = nil;
+    m.len     = 0;
+    m.cap     = 0;
+    m.by_path = map.init[intern.StrId, FileId](alloc, maphash.hash_u32, maphash.eq_u32);
     ret m;
 }
 
@@ -106,6 +115,7 @@ pub fun dnit(m: *SourceMap) {
     if (m.files != nil && m.cap > 0) {
         deallocate[SourceFile](m.alloc, m.files, m.cap);
     }
+    map.dnit[intern.StrId, FileId](?m.by_path);
     m.files = nil;
     m.len   = 0;
     m.cap   = 0;
@@ -263,6 +273,42 @@ pub fun update(m: *SourceMap, db: *query.QueryDb, id: FileId, text: str) Result[
     ret ok[bool, str](true);
 }
 
+# load: register a source file deduped by path. dedups by path: re-loading a
+# path returns its existing FileId and updates the text in place, so a long-lived
+# session (e.g. an LSP reloading project graphs on save) does not grow on reload.
+# a path seen for the first time appends a new file via add(); a path already
+# known is text-swapped in place via update() (id-stable, revision-bumping). the
+# by_path index is maintained only here; add/update remain raw primitives.
+# ---
+# m:        the source map
+# db:       query database whose revision is bumped so derived entries invalidate
+# interner: interner the path is interned into for the by_path lookup key
+# path:     file path to load
+# text:     source text to index and store; the stored copy is null-terminated
+# ret:      the FileId the path is registered under (stable across reloads of the same path), or an error
+pub fun load(m: *SourceMap, db: *query.QueryDb, interner: *intern.Interner, path: str, text: str) Result[FileId, str] {
+    val pid_r: Result[intern.StrId, str] = intern.intern(interner, path);
+    if (is_err[intern.StrId, str](pid_r)) {
+        ret err[FileId, str](unwrap_err[intern.StrId, str](pid_r));
+    }
+    var pid: intern.StrId = unwrap_ok[intern.StrId, str](pid_r);
+
+    val existing: Result[*FileId, str] = map.get[intern.StrId, FileId](?m.by_path, ?pid);
+    if (is_err[*FileId, str](existing)) {
+        val add_r: Result[FileId, str] = add(m, db, path, text);
+        if (is_err[FileId, str](add_r)) { ret add_r; }
+        val fid: FileId = unwrap_ok[FileId, str](add_r);
+        val ins_r: Result[bool, str] = map.insert[intern.StrId, FileId](?m.by_path, pid, fid);
+        if (is_err[bool, str](ins_r)) { ret err[FileId, str](unwrap_err[bool, str](ins_r)); }
+        ret ok[FileId, str](fid);
+    }
+
+    val fid: FileId = @unwrap_ok[*FileId, str](existing);
+    val up_r: Result[bool, str] = update(m, db, fid, text);
+    if (is_err[bool, str](up_r)) { ret err[FileId, str](unwrap_err[bool, str](up_r)); }
+    ret ok[FileId, str](fid);
+}
+
 # get: return a pointer to the SourceFile for a given FileId.
 # ---
 # m:   the source map
@@ -339,4 +385,45 @@ pub fun line_bounds(file: *SourceFile, line: usize) Option[LineSpan] {
     ls.start = start;
     ls.end   = end;
     ret some[LineSpan](ls);
+}
+
+test "source: load dedups by path, reusing the FileId and swapping text in place (#1389)" {
+    var a: Allocator;
+    page.make(?a);
+
+    val qr: Result[query.QueryDb, str] = query.init(?a);
+    if (is_err[query.QueryDb, str](qr)) { ret 1; }
+    var db: query.QueryDb = unwrap_ok[query.QueryDb, str](qr);
+    var ix: intern.Interner = intern.init(?a);
+    var m: SourceMap = init(?a);
+
+    val r1: Result[FileId, str] = load(?m, ?db, ?ix, "p1.mach", "a");
+    if (is_err[FileId, str](r1)) { ret 1; }
+    val fid1: FileId = unwrap_ok[FileId, str](r1);
+
+    # re-loading the SAME path returns the SAME FileId, updates text, no growth.
+    val r2: Result[FileId, str] = load(?m, ?db, ?ix, "p1.mach", "b");
+    if (is_err[FileId, str](r2)) { ret 1; }
+    val fid2: FileId = unwrap_ok[FileId, str](r2);
+
+    if (fid1 != fid2) { ret 1; }
+    if (m.by_path.len != 1) { ret 1; }
+    if (m.len != 1) { ret 1; }
+
+    val f1: *SourceFile = ?m.files[fid1::usize];
+    if (str_len(f1.text) != 1) { ret 1; }
+    if (f1.text[0] != 'b') { ret 1; }
+
+    # a DIFFERENT path appends a distinct new FileId, growing the map.
+    val r3: Result[FileId, str] = load(?m, ?db, ?ix, "p2.mach", "c");
+    if (is_err[FileId, str](r3)) { ret 1; }
+    val fid3: FileId = unwrap_ok[FileId, str](r3);
+    if (fid3 == fid1) { ret 1; }
+    if (m.by_path.len != 2) { ret 1; }
+    if (m.len != 2) { ret 1; }
+
+    dnit(?m);
+    intern.dnit(?ix);
+    query.dnit(?db);
+    ret 0;
 }
