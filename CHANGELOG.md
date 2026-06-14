@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-06-14
+
+Stabilization + multi-target-prep release. Adds the multi-target union Project for
+long-lived tooling (the language server now sees modules reachable only on a
+non-default target), lands the post-windows compiler-stability audit fixes
+(object-format parse-leak reclamation + truthful ELF symbol counts, the COFF REL32
+addend convention, a distinct unknown-target-name diagnostic, and an arm64
+register-id correction), and completes the OS-vtable interner-elimination — readying
+the target layer for the v1.6 architectures.
+
 ### Added
 
 - driver: `build_project_union` builds the union of every manifest target's import
@@ -64,8 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (MSVC/clang/GAS) COFF read by mach landed calls 4 bytes past target, and mach's
   emitted `.obj` was off by −4 under link.exe/lld. The writer now folds `A_coff =
   A_elf + 4` and the reader recovers `A_elf = A_coff − 4` for REL32 only; ABS64
-  (ADDR64) and ADDR32NB are unaffected. mach↔mach output is byte-identical (the fold
-  and recovery cancel), so the fix changes only foreign-COFF interop (#1409).
+  (ADDR64) and ADDR32NB are unaffected. A mach-emitted `.obj`'s REL32 wire field
+  changes (that is the fix — a `call`'s field is now 0, the COFF convention), but a
+  mach→mach round-trip recovers the same abstract addend and links to the same final
+  binary; only foreign-COFF interop behavior changes (#1409).
 
 ## [1.5.3] - 2026-06-13
 
