@@ -1188,11 +1188,29 @@ fun emit_fp_slot_store(st: *EncodeState, f: *mir.MirFunction, memop: *mir.MirOpe
     ret ok[bool, str](true);
 }
 
+# emit_fp_imm: materialize a float-constant bit pattern into vector register index
+# `vd`. the bits — a 32-bit pattern for an f32, a 64-bit pattern for an f64 (the
+# shape a float CONSTANT carries through lowering) — are materialized into the IP0 GP
+# scratch via the shared movewide sequence, then bit-copied into `vd` with the GP->FP
+# reinterpret FMOV (Sd,Wn for an f32, Dd,Xn for an f64). the AArch64 twin of x86-64's
+# float-constant load (MOVABS R11 + MOVQ xmm); IP0 is the reserved encoder scratch,
+# so a single instruction's materialization never collides with a live value.
+# `width` is 4 (S) or 8 (D).
+fun emit_fp_imm(st: *EncodeState, vd: u32, bits: u64, width: u8) {
+    val use64: bool = width == 8;
+    emit_movewide_seq(st, SCRATCH0, bits, use64);
+    var base: u32 = FMOV_S_FROM_W;
+    if (use64) { base = FMOV_D_FROM_X; }
+    emit_word(st, pack_alu3(base, vd, SCRATCH0, 0));
+}
+
 # resolve_fp_source: the vector register index a float source operand contributes.
 # a physical vector register is used directly; a spilled float arrives as a frame-
 # slot MEM operand (the shared allocator leaves a spilled float in place rather than
 # reloading it through a GP temp) and is loaded into `scratch`, whose index is then
-# returned. `width` (4 / 8) sizes the load.
+# returned; a float-constant immediate is materialized into `scratch` through IP0 +
+# a GP->FP FMOV (mirroring x86-64), whose index is returned. `width` (4 / 8) sizes
+# the load / the S-vs-D materialization.
 fun resolve_fp_source(st: *EncodeState, f: *mir.MirFunction, op: *mir.MirOperand, scratch: u32, width: u8) Result[i32, str] {
     if (op.kind == mir.MIR_OP_MEM) {
         val mr: Result[A64Mem, str] = resolve_mem(f, op);
@@ -1200,6 +1218,10 @@ fun resolve_fp_source(st: *EncodeState, f: *mir.MirFunction, op: *mir.MirOperand
         val m: A64Mem = unwrap_ok[A64Mem, str](mr);
         if (m.has_index) { ret err[i32, str]("encode: indexed float spill operand not expected"); }
         emit_fp_mem(st, scratch, m.base, m.off, width, true);
+        ret ok[i32, str](scratch::i32);
+    }
+    if (op.kind == mir.MIR_OP_IMM) {
+        emit_fp_imm(st, scratch, op.imm::u64, width);
         ret ok[i32, str](scratch::i32);
     }
     ret req_vec(op);
@@ -1437,8 +1459,12 @@ fun encode_fp_conv(st: *EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) Res
     ret ok[bool, str](true);
 }
 
-# encode_fmov: materialize a float register copy or a GP<->FP `:~` bitcast (both
-# selected to FMOV), dispatching on operand register CLASS and spill state:
+# encode_fmov: materialize a float register copy, a GP<->FP `:~` bitcast (both
+# selected to FMOV), or a float-constant immediate move, dispatching on the source
+# shape, operand register CLASS, and spill state:
+#   - immediate source (a float CONSTANT): the bit pattern is materialized into the
+#     destination vector register (or V31 then stored for a spilled destination) via
+#     IP0 + a GP->FP FMOV — see `emit_fp_imm`.
 #   - vector <- vector: `fmov Sd|Dd, Sn|Dn` (float copy).
 #   - vector <- GP / GP <- vector: the cross-bank `fmov Sd,Wn` / `fmov Dd,Xn` and
 #     `fmov Wd,Sn` / `fmov Xd,Dn` bit reinterprets.
@@ -1453,6 +1479,22 @@ fun encode_fmov(st: *EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) Result
     val dbl: bool = w == 8;
     val dst: *mir.MirOperand = ?mi.operands[0];
     val src: *mir.MirOperand = ?mi.operands[1];
+
+    # a float-constant immediate source: the FP isel's CONSTANT move and the pre-colored
+    # FP return move to V0 both reach here as `FMOV vec <- imm`. materialize the bit
+    # pattern into the destination vector register (the register IS the target, IP0 for
+    # the bits + a GP->FP FMOV), or into V31 then store for a spilled destination — never
+    # routed to the GP req_* paths, which would mis-read the float constant.
+    if (src.kind == mir.MIR_OP_IMM) {
+        if (dst.kind == mir.MIR_OP_MEM) {
+            emit_fp_imm(st, FP_SCRATCH0, src.imm::u64, w);
+            ret emit_fp_slot_store(st, f, dst, FP_SCRATCH0, w);
+        }
+        val rdr: Result[i32, str] = req_vec(dst);
+        if (is_err[i32, str](rdr)) { ret err[bool, str](unwrap_err[i32, str](rdr)); }
+        emit_fp_imm(st, unwrap_ok[i32, str](rdr)::u32, src.imm::u64, w);
+        ret ok[bool, str](true);
+    }
 
     if (dst.kind != mir.MIR_OP_MEM && src.kind != mir.MIR_OP_MEM) {
         val dvec: bool = reg_is_vec(dst);
@@ -3934,6 +3976,56 @@ test "arm64.encode: FCVT S<->D and GP<->FP bitcast FMOV match llvm-mc" {
     encode_fmov(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x1E260020) { bad = 1; }
     mi.width = 8; st.buf.len = 0;
     encode_fmov(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x9E660020) { bad = 1; }
+
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# float-constant immediate materialization: a float CONSTANT reaches the encoder as a
+# MIR_OP_IMM carrying the value's bit pattern (an f32's 32-bit / an f64's 64-bit
+# pattern). a `FMOV vec <- imm` (the FP isel's CONSTANT move and the pre-colored FP
+# return move) materializes the bits into IP0 with the movewide sequence then bit-
+# copies them into the destination vector register with the GP->FP FMOV; an FP-arith
+# immediate operand routes the same materialization into the held-back FP scratch.
+test "arm64.encode: float-constant immediate materialization matches llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+    var f: mir.MirFunction;
+    var ops: [3]mir.MirOperand;
+    var mi: mir.MirInstr;
+    mi.operands = ?ops[0]; mi.operand_count = 2;
+
+    # f64 0.1 = 0x3FB999999999999A -> v0:
+    #   movz x16,#0x999a ; movk x16,#0x9999,lsl#16 ; movk x16,#0x9999,lsl#32 ;
+    #   movk x16,#0x3fb9,lsl#48 ; fmov d0, x16
+    ops[0] = tvec(0); ops[1] = mir.op_imm(0x3FB999999999999A);
+    mi.opcode = arm64.FMOV::u32; mi.width = 8; st.buf.len = 0;
+    encode_fmov(?st, ?f, ?mi);
+    if (read_word(?st.buf, 0)  != 0xD2933350) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0xF2B33330) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0xF2D33330) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0xF2E7F730) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0x9E670200) { bad = 1; }
+
+    # f32 0.1 = 0x3DCCCCCD -> v0: movz w16,#0xcccd ; movk w16,#0x3dcc,lsl#16 ; fmov s0, w16
+    ops[1] = mir.op_imm(0x3DCCCCCD);
+    mi.width = 4; st.buf.len = 0;
+    encode_fmov(?st, ?f, ?mi);
+    if (read_word(?st.buf, 0) != 0x529999B0) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x72A7B990) { bad = 1; }
+    if (read_word(?st.buf, 8) != 0x1E270200) { bad = 1; }
+
+    # FP-arith immediate operand: a * 2.0 (rhs 2.0 = 0x4000000000000000) -> fmul d0, d1, d30
+    #   movz x16,#0x4000,lsl#48 ; fmov d30, x16 ; fmul d0, d1, d30
+    mi.operand_count = 3;
+    ops[0] = tvec(0); ops[1] = tvec(1); ops[2] = mir.op_imm(0x4000000000000000);
+    mi.opcode = mir.MIR_FMUL; mi.width = 8; mi.src_width = 8; st.buf.len = 0;
+    encode_fp_arith(?st, ?f, ?mi);
+    if (read_word(?st.buf, 0) != 0xD2E80010) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x9E67021E) { bad = 1; }
+    if (read_word(?st.buf, 8) != 0x1E7E0820) { bad = 1; }
 
     buf_dnit(?st.buf);
     ret bad;
