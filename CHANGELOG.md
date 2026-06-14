@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ENDIAN_BIG` enum is retained for the eventual big-endian abstraction, and the
   comments that claimed endianness was honored now state the little-endian
   assumption plainly (#1411).
+- objfmt (COFF): the writer/reader resolve every relocation's target symbol through a
+  name→index map built once per pass instead of a linear symbol-table scan per
+  relocation, turning the two reloc passes from O(reloc × symbol) into O(reloc +
+  symbol). Behavior-preserving (same indices resolved, same unresolved-symbol error),
+  verified by the byte-identical self-host fixpoint (#1413).
 
 ### Fixed
 
@@ -44,9 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the composite vector register id `regid_make(REG_CLASS_ID_XMM, 31)` instead of the
   raw bank index `31`, which would have read as a GP register. Dead today (the arm64
   backend has no encoder), corrected before it seeds the future backend (#1414).
-
-### Fixed
-
 - objfmt: the COFF and ELF object-file parsers allocate the section/symbol/relocation
   arrays up front but left each `ObjectImage` count at `0` until its populate loop
   finished, so an error return before or within those loops (a truncated or hostile
@@ -56,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse error; the ELF symbol array is sized and counted to the populated count
   (excluding the reserved index-0 entry) so allocation, count, and entries all agree.
   Emitted output is unchanged (#1410).
+- objfmt (COFF): REL32 relocations are next-byte-relative (`S + A − (P+4)`), but the
+  abstract addend uses ELF's field-relative convention (`S + A − P`), so the writer's
+  on-wire field and the reader's recovered addend were off by 4 — a foreign
+  (MSVC/clang/GAS) COFF read by mach landed calls 4 bytes past target, and mach's
+  emitted `.obj` was off by −4 under link.exe/lld. The writer now folds `A_coff =
+  A_elf + 4` and the reader recovers `A_elf = A_coff − 4` for REL32 only; ABS64
+  (ADDR64) and ADDR32NB are unaffected. mach↔mach output is byte-identical (the fold
+  and recovery cancel), so the fix changes only foreign-COFF interop (#1409).
 
 ## [1.5.3] - 2026-06-13
 
