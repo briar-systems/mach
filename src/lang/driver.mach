@@ -513,7 +513,9 @@ fun build_project_impl(s: *sess.Session, project_root: str, sel: *manifest.Selec
 
 # build_project_sel: build the module graph for one build selection (target,
 # profile, artifact). The manifest reader resolves the selection into the
-# project's single target entry and concrete output paths.
+# project's single target entry and concrete output paths. Safe to call
+# repeatedly on one long-lived Session: sources dedup by path and dnit_project
+# resets the session's module registries (see dnit_project's reload contract).
 pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Selection) Result[Project, str] {
     ret build_project_impl(s, project_root, sel, false);
 }
@@ -828,7 +830,18 @@ fun span_eq_span(source: str, a: token.Span, b: token.Span) bool {
     ret true;
 }
 
-# dnit_project: release every owned array on the project.
+# dnit_project: release every owned array on the project, then clear the session's
+# per-build module registries so the session is reusable for the next build.
+#
+# reload contract: a long-lived consumer (an LSP reloading on save) keeps ONE
+# Session and, per reload, calls build_project_sel / build_project_union, drives
+# the build, then dnit_project. sources dedup by path (source.load) so re-reading
+# the same closure reuses FileIds instead of growing the SourceMap, and this call's
+# reset_module_registry drops the borrowed AST/sema/resolve/comptime references the
+# freed Project leaves behind — so memory stays bounded and the session stays clean
+# across rebuilds. this does NOT reuse untouched ASTs/resolve results across builds
+# (true incremental rebuild is tracked separately in #1164); each reload re-parses
+# and re-resolves the full closure.
 # ---
 # p: project to tear down; nil is a no-op
 pub fun dnit_project(p: *Project) {
@@ -863,6 +876,10 @@ pub fun dnit_project(p: *Project) {
     }
     map.dnit[intern.StrId, sess.ModuleId](?p.by_fqn);
     deallocate_config(?p.config, p.s.alloc);
+
+    # the freed Project leaves the session's module registries pointing at freed
+    # AST/sema/resolve/comptime storage; clear them so the session is reusable.
+    sess.reset_module_registry(p.s);
 }
 
 fun init_project(p: *Project, s: *sess.Session) {
@@ -2891,7 +2908,7 @@ fun ut_build(s: *sess.Session, alloc: *Allocator, names: *str, texts: *str, n: u
     val root_r: Result[str, str] = ut_scaffold(alloc, names, texts, n);
     if (is_err[str, str](root_r)) { ret err[Project, str](unwrap_err[str, str](root_r)); }
     val root: str = unwrap_ok[str, str](root_r);
-    val rr: Result[bool, str] = tgt.register_all(?s.registry, ?s.interner);
+    val rr: Result[bool, str] = tgt.register_all(?s.registry);
     if (is_err[bool, str](rr)) { fs.remove_all(alloc, root); ret err[Project, str](unwrap_err[bool, str](rr)); }
     val pr: Result[Project, str] = build_project_union(s, root);
     fs.remove_all(alloc, root);
@@ -3108,7 +3125,7 @@ test "driver union: a malformed branch condition is reported once, not once per 
     val root1_r: Result[str, str] = ut_scaffold(?a1, ?names[0], ?texts[0], 1);
     if (is_err[str, str](root1_r)) { sess.dnit(?s1); ret 1; }
     val root1: str = unwrap_ok[str, str](root1_r);
-    val rr1: Result[bool, str] = tgt.register_all(?s1.registry, ?s1.interner);
+    val rr1: Result[bool, str] = tgt.register_all(?s1.registry);
     if (is_err[bool, str](rr1)) { fs.remove_all(?a1, root1); sess.dnit(?s1); ret 1; }
     var sel: manifest.Selection;
     sel.target = ""; sel.profile = ""; sel.artifact = ""; sel.want_lib = false; sel.has_artifact = false;
@@ -3180,6 +3197,65 @@ test "driver union: branch selection via the $target.os string tag exercises and
     or (cm.target_abi != cb.target_abi)      { bad = 1; }
 
     dnit_project(?p);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver reload: a Session rebuilds after dnit_project, deduping changed sources by path (#1389)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    val rr: Result[bool, str] = tgt.register_all(?s.registry);
+    if (is_err[bool, str](rr)) { sess.dnit(?s); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "a.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.a;\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+
+    # materialize the project once; both builds run against this same root so the
+    # changed file keeps its path and dedups instead of growing the SourceMap.
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (is_err[str, str](root_r)) { sess.dnit(?s); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # first build.
+    val p1r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p1r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p1: Project = unwrap_ok[Project, str](p1r);
+    if (!ut_has(?p1, ?s, "uniontest.main")) { bad = 1; }
+    or (!ut_has(?p1, ?s, "uniontest.a"))    { bad = 1; }
+    val len1: usize = s.sources.len;
+    if (len1 == 0) { bad = 1; }
+    dnit_project(?p1);
+
+    # change a.mach's content in place (same path), then rebuild on the SAME session.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path: str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val new_a: str = "pub fun fa() i32 { ret 2; }\n";
+    val wr: Result[bool, str] = fs.write_file(a_path, new_a, str_len(new_a), 420);
+    if (is_err[bool, str](wr)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+
+    # second build on the reused session must succeed and stay valid.
+    val p2r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p2r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p2: Project = unwrap_ok[Project, str](p2r);
+    if (!ut_has(?p2, ?s, "uniontest.main")) { bad = 1; }
+    or (!ut_has(?p2, ?s, "uniontest.a"))    { bad = 1; }
+    val len2: usize = s.sources.len;
+
+    # every path is identical across the two builds (the changed file reuses its
+    # FileId via dedup), so the SourceMap did NOT grow: a long-lived session is bounded.
+    if (len2 != len1) { bad = 1; }
+
+    dnit_project(?p2);
+    fs.remove_all(?alloc, root);
     sess.dnit(?s);
     ret bad;
 }

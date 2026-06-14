@@ -5,7 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.5] - 2026-06-14
+
+Tooling-prep patch. Adds reload-friendly source handling so a long-lived session
+(e.g. the language server) can rebuild its project graph on every save without
+growing without bound, and completes the target-layer interner-elimination by
+dropping the now-dead interner parameter from `register_all` and every target
+registrar — the target vtables are now immutable singletons.
+
+### Added
+
+- driver/source: reload-friendly source handling for long-lived sessions. The
+  session `SourceMap` now dedups by path (`source.load`): re-loading a path returns
+  its existing `FileId` and swaps the text in place rather than appending, so a
+  session that reloads its project graph on every save no longer grows without
+  bound. `dnit_project` now also resets the session's per-build module registries
+  (AST/sema/resolve/comptime/fqn and export/import maps), dropping the borrowed
+  references the freed Project leaves behind so one Session is reusable across
+  rebuilds. This is path-dedup + reclamation only; reusing untouched ASTs/resolve
+  results across a rebuild (true incremental rebuild) is tracked separately in
+  #1164 (#1389).
+
+### Changed
+
+- target: `register_all` and the target registrars no longer take an interner (or
+  the vestigial allocator) parameter. The registrars set immutable `str` vtable
+  fields and intern nothing, so the parameter had been dead since the OS-vtable
+  interner-elimination — each registrar is now trimmed to exactly the registry it
+  installs into, and `mach info` no longer builds a throwaway interner to call them.
+  Behavior-preserving, verified by the byte-identical self-host fixpoint; completes
+  the interner-elimination begun in #1402 (#1418).
 
 ## [1.5.4] - 2026-06-14
 
