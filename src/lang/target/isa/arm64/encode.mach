@@ -999,6 +999,16 @@ fun emit_store_mem(st: *EncodeState, f: *mir.MirFunction, dst_mem: *mir.MirOpera
     val m: A64Mem = unwrap_ok[A64Mem, str](mr);
     if (m.has_index) { ret err[bool, str]("encode: indexed store not expected"); }
 
+    # a FLOAT store names a vector source: dispatch on the source class to the scalar-
+    # FP store (`str Sd|Dd, [base, #off]`). a symbol destination never reaches here for
+    # a float (lowering LEA-materializes it into a base vreg first).
+    if (reg_is_vec(val_op)) {
+        val rvr: Result[i32, str] = req_vec(val_op);
+        if (is_err[i32, str](rvr)) { ret err[bool, str](unwrap_err[i32, str](rvr)); }
+        emit_fp_mem(st, unwrap_ok[i32, str](rvr)::u32, m.base, m.off, width, false);
+        ret ok[bool, str](true);
+    }
+
     var rt: u32 = ZR;
     if (val_op.kind == mir.MIR_OP_IMM) {
         if (val_op.imm != 0) {
@@ -1018,13 +1028,30 @@ fun emit_store_mem(st: *EncodeState, f: *mir.MirFunction, dst_mem: *mir.MirOpera
 # is a frame-slot or pointer-register memory operand loaded at the access width
 # (`src_width`) with the zero-extending form, or a folded-global symbol source
 # (`adrp IP0, sym` + `ldr Xt, [IP0, :lo12:sym]`, the two-reloc primary global path).
+# a FLOAT load names a vector destination: it dispatches on the destination class to
+# the scalar-FP load (`ldr Sd|Dd, [base, #off]`) off the resolved frame-slot /
+# pointer MEM — lowering has already LEA-materialized any symbol pointer into a base
+# vreg, so a float load's source is never a bare symbol here.
 fun encode_load(st: *EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) Result[bool, str] {
     if (mi.operand_count < 2) { ret err[bool, str]("encode: load missing operands"); }
-    val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
+    val dstop: *mir.MirOperand = ?mi.operands[0];
+    val src: *mir.MirOperand = ?mi.operands[1];
+
+    if (reg_is_vec(dstop)) {
+        val rvr: Result[i32, str] = req_vec(dstop);
+        if (is_err[i32, str](rvr)) { ret err[bool, str](unwrap_err[i32, str](rvr)); }
+        val fmr: Result[A64Mem, str] = resolve_mem(f, src);
+        if (is_err[A64Mem, str](fmr)) { ret err[bool, str](unwrap_err[A64Mem, str](fmr)); }
+        val fm: A64Mem = unwrap_ok[A64Mem, str](fmr);
+        if (fm.has_index) { ret err[bool, str]("encode: indexed float load not expected"); }
+        emit_fp_mem(st, unwrap_ok[i32, str](rvr)::u32, fm.base, fm.off, mi.src_width, true);
+        ret ok[bool, str](true);
+    }
+
+    val rdr: Result[i32, str] = req_gpr(dstop);
     if (is_err[i32, str](rdr)) { ret err[bool, str](unwrap_err[i32, str](rdr)); }
     val rd: u32 = unwrap_ok[i32, str](rdr)::u32;
 
-    val src: *mir.MirOperand = ?mi.operands[1];
     if (src.kind == mir.MIR_OP_SYM) {
         ret emit_global_load(st, rd, src, mi.src_width);
     }
@@ -2058,13 +2085,39 @@ fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
     ret err[bool, str]("internal compiler error: unhandled opcode in arm64 encode");
 }
 
+# function_is_naked: a function whose inline asm owns the stack and must be emitted
+# with NO compiler prologue/epilogue — no frame (frame.size), no callee-saved GP/FP
+# registers, no outgoing-argument area, and a body containing an inline-asm block.
+# the entry-point `_start` reads the kernel-supplied SP directly (`mov x9, sp; ldr x0,
+# [x9]` = argc), so a frame-record `stp x29, x30, [sp, #-16]!` ahead of it would shift
+# SP and corrupt the argc/argv it extracts. mirrors x86-64's `function_is_naked` (the
+# asm-block opcode survives selection as `mir.MIR_ASM` on AArch64).
+fun function_is_naked(f: *mir.MirFunction) bool {
+    if (f.frame.size != 0) { ret false; }
+    if (f.callee_mask != 0) { ret false; }
+    if (f.callee_mask_fp != 0) { ret false; }
+    if (f.frame.outgoing_size != 0) { ret false; }
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode == mir.MIR_ASM) { ret true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
 # encode_function_arm64: the per-function encode hook (pass 1). marks the function
-# entry symbol, emits the record-at-top prologue, then each block — emitting the
-# epilogue before every RET — recording each block's `.text` offset for branch
-# patching. extern / body-less functions contribute no text. an oversized frame (a
-# `SUB SP` past the two-immediate range, or GP callee-saves below the STP/LDP imm7
-# reach) is materialized through a scratch base; callee-saved FP registers remain a
-# Phase 4 loud defer.
+# entry symbol, emits the record-at-top prologue (skipped for a naked asm-only
+# function, whose inline asm owns the stack), then each block — emitting the epilogue
+# before every RET — recording each block's `.text` offset for branch patching. extern
+# / body-less functions contribute no text. an oversized frame (a `SUB SP` past the
+# two-immediate range, or GP callee-saves below the STP/LDP imm7 reach) is materialized
+# through a scratch base.
 fun encode_function_arm64(st: *EncodeState, f: *mir.MirFunction) Result[bool, str] {
     val fn_base: u32 = st.buf.len::u32;
     if (f.block_count == 0) { ret ok[bool, str](true); }
@@ -2072,8 +2125,9 @@ fun encode_function_arm64(st: *EncodeState, f: *mir.MirFunction) Result[bool, st
     val ms: Result[bool, str] = push_symbol(st, f.name, fn_base, of.SYM_OBJ_FLAG_FUNCTION);
     if (is_err[bool, str](ms)) { ret ms; }
 
+    val naked: bool = function_is_naked(f);
     val subsize: u32 = frame_subsize(f);
-    emit_prologue(st, f, subsize);
+    if (!naked) { emit_prologue(st, f, subsize); }
 
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -2084,7 +2138,7 @@ fun encode_function_arm64(st: *EncodeState, f: *mir.MirFunction) Result[bool, st
         var ii: u32 = 0;
         for (ii < blk.instr_count) {
             val mi: *mir.MirInstr = ?blk.instrs[ii];
-            if (mi.opcode::u16 == arm64.RET::u16) {
+            if (mi.opcode::u16 == arm64.RET::u16 && !naked) {
                 emit_epilogue(st, f, subsize);
             }
             val ei: Result[bool, str] = encode_mir_instr(st, f, fn_base, mi);
@@ -3301,6 +3355,115 @@ fun emit_asm_ret(st: *EncodeState, args: str) Result[bool, str] {
     if (!asm_parse_operand(s, ?op) || op.kind != ASMOP_REG) { ret err[bool, str]("encode: inline-asm 'ret' operand must be a register"); }
     emit_word(st, RET_BASE | ((op.reg & 0x1F) << 5));
     ret ok[bool, str](true);
+}
+
+# asm_clobbers: the AsmClobbersFn the arm64 ISA vtable exposes — infer the registers
+# an inline-asm body writes, so the allocator leaves no live value in one and the
+# prologue preserves any callee-saved register the body clobbers. without this hook a
+# nil slot forced a conservative all-register clobber, framing every asm function
+# (e.g. `_start`, whose frame `sub sp` then mis-reads argc off the entry stack).
+# mirrors x86-64's `asm_clobbers` for the grammar encode_asm_stmt_arm64 accepts:
+# `{name}` locals substitute to `[x29,#off]` memory (never registers) and contribute
+# nothing; the grammar has no FP mnemonic, so `fp_out` stays empty; an unrecognized
+# statement is opaque and conservatively clobbers every register.
+pub fun asm_clobbers(body: str, gp_out: *u32, fp_out: *u32) {
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    val len: usize = str_len(body);
+    var start: usize = 0;
+    for (start < len) {
+        var end: usize = start;
+        for (end < len && body[end] != '\n'::char && body[end] != ';'::char) { end = end + 1; }
+        var lo: usize = start;
+        for (lo < end && asm_is_space(body[lo])) { lo = lo + 1; }
+        var hi: usize = end;
+        for (hi > lo && asm_is_space(body[hi - 1])) { hi = hi - 1; }
+        if (hi > lo) {
+            var line: [512]u8;
+            val ll: usize = hi - lo;
+            if (ll >= 512) { gp = 0xFFFFFFFF; fp = 0xFFFFFFFF; }
+            or {
+                var c: usize = 0;
+                for (c < ll) { line[c] = body[lo + c]::u8; c = c + 1; }
+                line[ll] = 0;
+                asm_stmt_clobbers((?line[0])::str, ?gp, ?fp);
+            }
+        }
+        start = end + 1;
+    }
+    @gp_out = gp;
+    @fp_out = fp;
+}
+
+# asm_mark_op: OR the GP register named by operand `idx` of `args` into `@gp`. a non-
+# register operand (memory / immediate / barrier option / symbol) writes no register;
+# a malformed operand list the encoder will reject clobbers conservatively.
+fun asm_mark_op(args: str, idx: u32, gp: *u32) {
+    var b0: [128]u8; var b1: [128]u8; var b2: [128]u8; var b3: [128]u8;
+    var n: u32 = 0;
+    if (!asm_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 128, ?n)) { @gp = @gp | 0xFFFFFFFF; ret; }
+    if (idx >= n) { ret; }
+    var bp: *u8 = ?b0[0];
+    if (idx == 1) { bp = ?b1[0]; } or (idx == 2) { bp = ?b2[0]; } or (idx == 3) { bp = ?b3[0]; }
+    var op: AsmOp;
+    if (asm_parse_operand((bp)::str, ?op) && op.kind == ASMOP_REG && op.reg < 32) {
+        @gp = @gp | (1::u32 << op.reg);
+    }
+}
+
+# asm_stmt_clobbers: OR the registers one trimmed aarch64 inline-asm statement writes
+# into `@gp` (the grammar has no FP write). a dest-writing form clobbers operand 0 (ldp
+# both loaded registers; stlxr the status result); a `bl`/`blr`/`br` call clobbers the
+# caller-saved file (x0-x18, x30) and `svc` clobbers x0 — none callee-saved, so they add
+# no frame; stores / compares / branches / barriers write nothing. an unrecognized
+# statement conservatively clobbers everything.
+fun asm_stmt_clobbers(stmt: str, gp: *u32, fp: *u32) {
+    var lnum: u64 = 0;
+    val dlen: usize = asm_label_def_len(stmt, ?lnum);
+    if (dlen > 0) {
+        val rest: str = asm_trim((stmt::usize + dlen)::str);
+        if (rest[0] == 0) { ret; }
+        asm_stmt_clobbers(rest, gp, fp);
+        ret;
+    }
+    var mbuf: [24]u8;
+    var args: str;
+    if (!asm_first_token(stmt, ?mbuf[0], 24, ?args)) { @gp = @gp | 0xFFFFFFFF; @fp = @fp | 0xFFFFFFFF; ret; }
+    val mnem: str = (?mbuf[0])::str;
+
+    # write nothing: barriers, return, trap, compare, stores, plain/conditional branches.
+    if (str_equals(mnem, "nop") || str_equals(mnem, "yield") || str_equals(mnem, "dmb") ||
+        str_equals(mnem, "ret") || str_equals(mnem, "brk") || str_equals(mnem, "cmp") ||
+        str_equals(mnem, "str") || str_equals(mnem, "strb") || str_equals(mnem, "strh") ||
+        str_equals(mnem, "stp") || str_equals(mnem, "stlr") ||
+        str_equals(mnem, "b") || str_equals(mnem, "cbz") || str_equals(mnem, "cbnz")) { ret; }
+    if (str_starts_with(mnem, "b.")) { ret; }
+
+    # a call clobbers the caller-saved file (+ LR); svc clobbers x0. none callee-saved.
+    if (str_equals(mnem, "bl") || str_equals(mnem, "blr") || str_equals(mnem, "br")) {
+        @gp = @gp | 0x4007FFFF;
+        ret;
+    }
+    if (str_equals(mnem, "svc")) { @gp = @gp | 0x1; ret; }
+
+    # ldp writes both loaded registers.
+    if (str_equals(mnem, "ldp")) { asm_mark_op(args, 0, gp); asm_mark_op(args, 1, gp); ret; }
+
+    # dest = operand 0: data-processing / load / shift forms and stlxr's status reg.
+    if (str_equals(mnem, "mov") || str_equals(mnem, "movz") || str_equals(mnem, "movk") ||
+        str_equals(mnem, "add") || str_equals(mnem, "sub") || str_equals(mnem, "and") ||
+        str_equals(mnem, "orr") || str_equals(mnem, "eor") || str_equals(mnem, "adrp") ||
+        str_equals(mnem, "ldr") || str_equals(mnem, "ldrb") || str_equals(mnem, "ldrh") ||
+        str_equals(mnem, "ldar") || str_equals(mnem, "ldaxr") || str_equals(mnem, "stlxr") ||
+        str_equals(mnem, "lsl") || str_equals(mnem, "lsr") || str_equals(mnem, "asr") ||
+        str_equals(mnem, "lslv") || str_equals(mnem, "lsrv") || str_equals(mnem, "asrv")) {
+        asm_mark_op(args, 0, gp);
+        ret;
+    }
+
+    # unrecognized: opaque, clobber everything (a sound over-approximation).
+    @gp = @gp | 0xFFFFFFFF;
+    @fp = @fp | 0xFFFFFFFF;
 }
 
 # encode_asm_stmt_arm64: parse and encode one trimmed inline-asm statement. a numeric
