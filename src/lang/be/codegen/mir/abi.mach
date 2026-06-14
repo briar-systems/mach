@@ -15,6 +15,7 @@
 
 use std.types.bool.bool;
 use std.types.bool.true;
+use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.option.Option;
@@ -73,10 +74,10 @@ pub fun require_abi(tgt: *target.Target) Result[bool, str] {
 
 # abi_gp_arg_reg: the physical register id of the `index`-th GP argument register
 # of the active ABI, read from `tgt.abi.gp_arg_regs` (the convention's GP argument
-# bank in passing order). used for the hidden sret-pointer argument, which rides
-# in the first GP argument register the same way an ordinary argument does. errors
-# loudly when `index` is past the convention's GP argument file (a classification
-# bug) rather than returning a wrong register.
+# bank in passing order). used to find the integer register a win64 variadic float
+# duplicates into (the hidden sret pointer rides `tgt.abi.indirect_result_reg`,
+# which may be a dedicated register outside this file). errors loudly when `index`
+# is past the convention's GP argument file rather than returning a wrong register.
 # ---
 # tgt:   the active target
 # index: zero-based GP argument-register index
@@ -225,6 +226,53 @@ fun advance_arg_cursors(slot: *abi.ParamSlot, gp_used: *i32, fp_used: *i32) {
     advance_one_cursor(slot.reg2, gp_used, fp_used);
 }
 
+# sret_reserves_gp: whether a CLASS_SRET return reserves the first GP argument
+# register for its hidden result-storage pointer. true only when the convention
+# routes the pointer through the argument file (`indirect_result_in_argfile` — the
+# AMD64 conventions, whose pointer rides RDI / RCX), so the fixed parameters
+# classify against `gp_used = 1`; a dedicated indirect-result register outside the
+# argument file (AAPCS64's X8) reserves no argument register, leaving the GP cursor
+# at 0 so the first real argument lands in the first GP argument register.
+# ---
+# ret_class:  the return value's classification
+# in_argfile: the convention's `indirect_result_in_argfile`
+# ret:        true when an argument GP register must be reserved for the sret pointer
+fun sret_reserves_gp(ret_class: abi.ParamClass, in_argfile: bool) bool {
+    ret ret_class == abi.CLASS_SRET && in_argfile;
+}
+
+# round_up_i64: round `value` up to the next multiple of `align` (a power-of-two
+# alignment). an alignment of 0 or 1 returns `value` unchanged. used to align an
+# outgoing stack-argument offset to its slot's required alignment.
+# ---
+# value: the offset to align
+# align: the alignment to round up to
+# ret:   the smallest multiple of `align` that is >= `value`
+fun round_up_i64(value: i64, align: u64) i64 {
+    if (align <= 1) { ret value; }
+    val a:   i64 = align::i64;
+    val rem: i64 = value % a;
+    if (rem == 0) { ret value; }
+    ret value + (a - rem);
+}
+
+# stack_arg_align: the alignment in bytes a stack-passed argument's slot rounds to.
+# a by-value stack slot (CLASS_STACK) rounds to the value's natural alignment,
+# clamped to the eight-byte outgoing-slot granularity; a by-reference spill
+# (CLASS_STACK_BYREF) holds only an eight-byte pointer, so it rounds to eight
+# regardless of the aggregate's alignment. on x86 every stack argument is
+# ≤8-aligned, so this is always eight and the round-up is identity; AAPCS64 honors a
+# 16-byte-aligned by-value argument.
+# ---
+# class: the slot's classification (CLASS_STACK or CLASS_STACK_BYREF)
+# align: the value's natural alignment in bytes
+# ret:   the slot's stack alignment in bytes
+fun stack_arg_align(class: abi.ParamClass, align: u64) u64 {
+    if (class == abi.CLASS_STACK_BYREF) { ret 8; }
+    if (align < 8) { ret 8; }
+    ret align;
+}
+
 # classify_signature: classify a whole function ABI in ONE left-to-right walk and
 # fill `out` with the resulting `SigLayout`. this is the single ABI-lowering oracle
 # the param / return / call lowering all read, so they can never disagree on a
@@ -289,9 +337,12 @@ pub fun classify_signature(ctx: *lctx.LowerCtx, sig: ir_type.IrTypeId, ret_ty: i
     # into this region, so a stack argument placed below it would be clobbered.
     var stack_off: i64 = ctx.tgt.abi.shadow_space::i64;
 
-    # a CLASS_SRET return reserves the first GP argument register for the hidden
-    # result-storage pointer, so the parameters classify against that reservation.
-    if (out.ret_slot.class == abi.CLASS_SRET) {
+    # a CLASS_SRET return whose hidden result-storage pointer rides the first GP
+    # argument register (the AMD64 conventions) reserves that register, so the
+    # parameters classify against it; a convention with a dedicated indirect-result
+    # register outside the argument file (AAPCS64's X8) reserves none, leaving the GP
+    # cursor at 0 so the first real argument lands in the first GP argument register.
+    if (sret_reserves_gp(out.ret_slot.class, ctx.tgt.abi.indirect_result_in_argfile)) {
         gp_used = 1;
     }
 
@@ -325,10 +376,11 @@ pub fun classify_signature(ctx: *lctx.LowerCtx, sig: ir_type.IrTypeId, ret_ty: i
     for (pi < pc) {
         val pty:  ir_type.IrTypeId = t.data.fn.params[pi];
         val psz:  u64  = ir_type.byte_size(ctx.types, pty, ctx.tgt)::u64;
+        val pal:  u64  = ir_type.byte_align(ctx.types, pty, ctx.tgt)::u64;
         val pfl:  bool = lctx.value_is_float(ctx, pty);
         val pag:  bool = lctx.value_is_aggregate(ctx, pty);
         val peb:  u8   = aggregate_sse_mask(ctx, pty);
-        var slot: abi.ParamSlot = classify_arg(pi::i32, psz, 0, pfl, peb, pag, gp_used, fp_used);
+        var slot: abi.ParamSlot = classify_arg(pi::i32, psz, pal, pfl, peb, pag, gp_used, fp_used);
 
         # record the real outgoing stack offset on the slot (the ABI classifier
         # returns a sizing-only slot with offset 0); the param / call lowering
@@ -336,8 +388,11 @@ pub fun classify_signature(ctx: *lctx.LowerCtx, sig: ir_type.IrTypeId, ret_ty: i
         # occupies the same eight-byte slot as a by-value one — only its contents
         # (a hidden pointer) differ — so it advances the cursor identically. a
         # register slot advances each assigned register's bank cursor (a mixed
-        # GP/SSE aggregate consumes one of each).
+        # GP/SSE aggregate consumes one of each). a by-value stack slot is first
+        # rounded up to the value's alignment (identity on x86, where every stack
+        # argument is ≤8-aligned; honors a 16-aligned AAPCS64 by-value argument).
         if (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
+            stack_off   = round_up_i64(stack_off, stack_arg_align(slot.class, pal));
             slot.offset = stack_off;
             stack_off   = stack_off + lctx.stack_slot_bytes(slot.size);
         } or {
@@ -438,16 +493,11 @@ pub fun lower_call(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruct
 
     if (rslot.class == abi.CLASS_SRET) {
         # the caller allocates the return storage (above) and passes its address in
-        # the first GP argument register (the ABI's GP argument file, RDI under
-        # SysV); the result vreg names that storage. the layout already reserved the
-        # GP slot in `gp_used`, so emit the pre-coloring move into the first register.
+        # the convention's indirect-result register (RDI under SysV, RCX under win64,
+        # the dedicated X8 under AAPCS64); the result vreg names that storage. for an
+        # in-argfile convention the layout already reserved the GP slot in `gp_used`.
         if (res_dst != mir.MIR_VREG_NIL) {
-            var sret_reg: i32 = 0;
-            val sr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, 0, ?sret_reg);
-            if (is_err[bool, str](sr)) {
-                sig_layout_free(ctx, ?layout);
-                ret sr;
-            }
+            val sret_reg: i32 = ctx.tgt.abi.indirect_result_reg;
             val pre: Result[bool, str] = lctx.emit_mov(ctx, mb,
                 mir.op_preg(sret_reg::u32), mir.op_vreg(res_dst));
             if (is_err[bool, str](pre)) {
@@ -472,13 +522,19 @@ pub fun lower_call(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruct
             soff = slot.offset;
         } or {
             val asz:  u64  = ir_type.byte_size(ctx.types, av.ty, ctx.tgt)::u64;
+            val aal:  u64  = ir_type.byte_align(ctx.types, av.ty, ctx.tgt)::u64;
             val afl:  bool = lctx.value_is_float(ctx, av.ty);
             val aag:  bool = lctx.value_is_aggregate(ctx, av.ty);
             # a variadic tail aggregate is classified as integer eightbytes (mask 0):
             # the va_arg read path walks the GP register-save / overflow areas, so the
             # caller and callee stay consistent. SSE-eightbyte aggregate passing is for
             # fixed parameters and returns (the C-FFI boundary), not the varargs tail.
-            slot = classify_arg(pidx::i32, asz, 0, afl, 0, aag, gp_used, fp_used);
+            slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, gp_used, fp_used);
+            # round a stack-passed tail argument up to its slot alignment before
+            # placing it (identity on x86; honors a 16-aligned AAPCS64 by-value arg).
+            if (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
+                stack_off = round_up_i64(stack_off, stack_arg_align(slot.class, aal));
+            }
             soff = stack_off;
         }
 
@@ -574,8 +630,9 @@ pub fun lower_call(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruct
     val pc: Result[bool, str] = lctx.push_instr(ctx, mb, cmi);
     if (is_err[bool, str](pc)) { ret pc; }
 
-    # bind the result. an sret call already named its storage via RDI; otherwise
-    # move the value out of the canonical return register(s) into the result vreg.
+    # bind the result. an sret call already named its storage via the indirect-result
+    # register; otherwise move the value out of the canonical return register(s) into
+    # the result vreg.
     val dst: u32 = lctx.result_vreg(ctx, iid);
     if (dst != mir.MIR_VREG_NIL && rslot.class != abi.CLASS_SRET) {
         val rr: Result[bool, str] = emit_ret_slot_to_vreg(ctx, mb, rslot, dst, ret_aggr);
@@ -747,23 +804,20 @@ fun emit_ret_slot_to_vreg(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
 pub fun lower_params(ctx: *lctx.LowerCtx, mb: *mir.MirBlock) Result[bool, str] {
     # classify the whole function signature once: the same layout the caller's
     # `lower_call` derives, so a parameter is placed exactly where the call passed
-    # it. an sret return reserves the first GP register (in the layout); the per-
-    # parameter slots carry their real `[rbp + 16 + offset]` stack offsets.
+    # it. an in-argfile sret return reserves the first GP register (in the layout);
+    # an out-of-argfile one (AAPCS64's X8) reserves none. the per-parameter slots
+    # carry their real `[rbp + 16 + offset]` stack offsets.
     val ret_ty: ir_type.IrTypeId = lctx.fn_return_type(ctx);
     var layout: abi.SigLayout;
     val cls: Result[bool, str] = classify_signature(ctx, ctx.fn.sig, ret_ty, ?layout);
     if (is_err[bool, str](cls)) { ret cls; }
 
     # an sret return: the caller passes the hidden result-storage pointer in the
-    # first GP argument register; capture it into a vreg so `lower_ret` copies the
-    # returned aggregate into that storage and returns the pointer in RAX.
+    # convention's indirect-result register (RDI/RCX in the argument file, or the
+    # dedicated X8 under AAPCS64); capture it into a vreg so `lower_ret` copies the
+    # returned aggregate into that storage and returns the pointer in the return reg.
     if (layout.ret_slot.class == abi.CLASS_SRET) {
-        var sret_reg: i32 = 0;
-        val sr: Result[bool, str] = abi_gp_arg_reg(ctx.tgt, 0, ?sret_reg);
-        if (is_err[bool, str](sr)) {
-            sig_layout_free(ctx, ?layout);
-            ret sr;
-        }
+        val sret_reg: i32 = ctx.tgt.abi.indirect_result_reg;
         val svr: Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
         if (is_err[u32, str](svr)) {
             sig_layout_free(ctx, ?layout);
@@ -952,4 +1006,32 @@ fun emit_bare_ret(ctx: *lctx.LowerCtx, mb: *mir.MirBlock) Result[bool, str] {
     mi.width         = mir.WORD_WIDTH;
     mi.src_width     = mir.WORD_WIDTH;
     ret lctx.push_instr(ctx, mb, mi);
+}
+
+test "mir.abi: an sret return seeds a GP argument slot only when the pointer is in the argument file" {
+    # x86 (SysV/win64): the hidden result pointer rides the first GP argument
+    # register, so classify_signature seeds gp_used = 1 (reserves a GP slot).
+    if (!sret_reserves_gp(abi.CLASS_SRET, true)) { ret 1; }
+    # AAPCS64: a dedicated X8 indirect-result register reserves no argument register,
+    # so the first real argument still lands in X0.
+    if (sret_reserves_gp(abi.CLASS_SRET, false)) { ret 1; }
+    # a non-sret return never reserves a GP slot regardless of the convention.
+    if (sret_reserves_gp(abi.CLASS_GP, true)) { ret 1; }
+    ret 0;
+}
+
+test "mir.abi: a stack argument offset rounds up to its slot alignment" {
+    # an 8-aligned argument at an already-8-aligned cursor is identity (the x86 path).
+    if (round_up_i64(8, 8) != 8)   { ret 1; }
+    if (round_up_i64(0, 8) != 0)   { ret 1; }
+    # a 16-aligned by-value argument rounds the cursor up to 16 (the AAPCS64 path).
+    if (round_up_i64(8, 16) != 16) { ret 1; }
+    if (round_up_i64(24, 16) != 32) { ret 1; }
+    # a by-reference spill holds an 8-byte pointer, so it rounds to 8 regardless of
+    # the aggregate's natural alignment.
+    if (stack_arg_align(abi.CLASS_STACK_BYREF, 16) != 8) { ret 1; }
+    # a by-value slot honors the value's alignment, clamped to the 8-byte minimum.
+    if (stack_arg_align(abi.CLASS_STACK, 16) != 16) { ret 1; }
+    if (stack_arg_align(abi.CLASS_STACK, 4) != 8)   { ret 1; }
+    ret 0;
 }
