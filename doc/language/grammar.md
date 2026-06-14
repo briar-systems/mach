@@ -95,7 +95,10 @@ nil  or   pub  rec  ret  test uni  use  val  var
 `nil` is an expression literal; the rest are statement/declaration/type
 introducers. Note these are *contextual*: nothing in the lexer prevents a
 binding or field from being named after one, but the parser will treat the
-keyword in its keyword position. The primitive type names (`u8`, `u16`,
+keyword in its keyword position. The operand-less statement keywords `brk`
+and `cnt` are keywords only in their bare form (`brk;` / `cnt;`); the same
+word followed by anything else is an ordinary identifier, so `cnt = x;` is an
+assignment to a variable named `cnt`. The primitive type names (`u8`, `u16`,
 `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `ptr`) are *not*
 keywords — they are ordinary identifiers resolved by name later.
 
