@@ -2,23 +2,62 @@
 #
 # This is the AArch64 implementation of the ISA vtable's `select` operation,
 # reached only through `tgt.arch.select` by the shared `be.codegen.isel`
-# dispatcher. Instruction selection is not yet implemented: `select` is a total
-# function that fails loudly with an "not implemented" error so an AArch64 build
-# reaches the backend and stops here rather than miscompiling. The selector that
-# rewrites generic MIR opcodes into concrete AArch64 forms is filled in a later
-# phase; the four-file ISA shape (`arm64` defs, `arm64.register` vtable seam,
-# `arm64.isel`, `arm64.encode`) mirrors the x86-64 backend.
+# dispatcher. It is the only target-specific back-end selection phase; register
+# allocation, frame layout, and encoding are shared. `mir.lower_ir` has already
+# produced a `MirFunction` whose instructions carry *generic* MIR opcodes that
+# mirror the IR `OP_*` values, plus the call/phi pseudo-opcodes. Instruction
+# selection rewrites each generic opcode into the concrete AArch64 encoder opcode
+# this ISA owns (see `arm64` and `arm64.encode`).
+#
+# The A64 ALU is three-address (`Rd, Rn, Rm`), so unlike x86-64 the integer
+# binary ops are rewritten IN PLACE to a concrete three-address opcode rather than
+# surviving as a generic sentinel: register allocation keys an instruction's
+# def/use shape on its operands (operand 0 a pure def), not its opcode, so a
+# concrete three-address form is read correctly. Every rewrite is therefore 1:1 —
+# the operand list already matches the machine form and only `opcode` changes —
+# and no block-list rebuild is ever needed (the x86-64 NEG/NOT multi-instruction
+# expansion has no A64 analogue: NEG is a single `sub Rd, XZR, Rm` and NOT a
+# single `mvn Rd, Rm`).
+#
+# A handful of generic opcodes survive selection with a high selection-output
+# sentinel so the encoder can materialize a short byte sequence from them:
+#   - the comparison family (`MIR_CMP_*` -> `MIR_SEL_CMP_*`): the encoder lowers it
+#     to `SUBS XZR, lhs, rhs ; CSET dst, cc`, keeping operand 0 a clean boolean def
+#     the register allocator reads correctly (a flag-setting compare carries a
+#     source in operand 0, which the allocator's def convention would misread).
+#   - the conditional branch (`MIR_CBR` -> `MIR_SEL_CBR`): the encoder lowers it to
+#     `CBNZ cond, then ; B else`, keeping both block targets and the condition on
+#     one terminator so the allocator can read the condition as a use and resolve
+#     both successor edges for liveness.
+#
+# The call / phi pseudo-opcodes (`MIR_CALL`, `MIR_CALL_RES`, `MIR_ARG`, `MIR_PHI`)
+# pass through unchanged for the shared ABI / register-allocation passes (a leaf
+# function has none, but the selector must not choke on them). The scalar float
+# arithmetic / comparison ops and the width / representation conversions also pass
+# through unchanged — their AArch64 encoding lands in a later phase (Phase 3/4);
+# selection only needs to not reject them. The variadic FP-register spill
+# (`MIR_VA_FP_SAVE`) is rejected with a Phase-4 message (a leaf function never
+# emits it). Any opcode this selector does not model fails loudly with an ICE so
+# `select` is total — every opcode path returns a definite result.
 
 use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use std.types.size.usize;
 
 use std.types.string.str;
 
 use std.types.result.Result;
+use std.types.result.ok;
 use std.types.result.err;
+use std.types.result.is_err;
 
 use std.allocator.Allocator;
 
+use os:     std.system.os;
 use target: mach.lang.target.resolved;
+use arm64:  mach.lang.target.isa.arm64;
 use mir:    mach.lang.be.codegen.mir;
 
 # SelectFn: the concrete signature the erased `isa.IsaVTable.select` pointer is
@@ -26,7 +65,8 @@ use mir:    mach.lang.be.codegen.mir;
 # `select` type-erased (`*u8`); the shared dispatcher casts it back to this type
 # before calling it.
 # ---
-# alloc: backing allocator used to rebuild expanded blocks' instruction lists
+# alloc: backing allocator (threaded for parity with the shared SelectFn; the
+#        AArch64 selector rewrites in place and never reallocates a block)
 # tgt:   resolved compilation target (must be AArch64)
 # fn:    the MIR function to select instructions for; mutated in place
 # ret:   ok(true) on success, or an error naming the failure
@@ -34,16 +74,146 @@ pub def SelectFn: fun(*Allocator, *target.Target, *mir.MirFunction) Result[bool,
 
 # select: select concrete AArch64 instructions for one MIR function.
 #
-# the AArch64 implementation behind the ISA vtable's `select` slot; the shared
-# `be.codegen.isel.run` dispatcher reaches it only through `tgt.arch.select`.
-# instruction selection is not yet implemented, so this fails loudly — a total
-# function that signals the unimplemented backend rather than producing wrong
-# instructions.
+# walks every block and rewrites each generic MIR opcode in place into the
+# concrete AArch64 encoder opcode (or leaves it as a surviving sentinel / pass-
+# through). fails loudly on an opcode this selector does not model. the AArch64
+# implementation behind the ISA vtable's `select` slot; reached only through
+# `tgt.arch.select` by the shared `be.codegen.isel.run` dispatcher.
 # ---
-# alloc: backing allocator (unused until selection is implemented)
+# alloc: backing allocator (unused; the AArch64 selector rewrites in place)
 # tgt:   resolved compilation target (must be AArch64)
-# fn:    the MIR function to select instructions for
-# ret:   an error reporting that AArch64 instruction selection is unimplemented
+# fn:    the MIR function to select instructions for; mutated in place
+# ret:   ok(true) on success, or an error naming the failure
 pub fun select(alloc: *Allocator, tgt: *target.Target, fn: *mir.MirFunction) Result[bool, str] {
-    ret err[bool, str]("aarch64 isel not implemented");
+    if (alloc == nil) { ret err[bool, str]("isel: nil allocator"); }
+    if (tgt == nil)   { ret err[bool, str]("isel: nil target"); }
+    if (fn == nil)    { ret err[bool, str]("isel: nil mir function"); }
+
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val b: *mir.MirBlock = ?fn.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < b.instr_count) {
+            val r: Result[bool, str] = rewrite(?b.instrs[ii]);
+            if (is_err[bool, str](r)) { ret r; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    ret ok[bool, str](true);
+}
+
+# write_opcode_ice: writes "internal compiler error: unhandled MIR opcode <N>\n"
+# to stderr before an ICE return so the numeric opcode is visible in crash logs.
+fun write_opcode_ice(opcode: u32) {
+    os.write(os.STDERR_FD, "internal compiler error: unhandled MIR opcode ", 46);
+    var buf: [16]u8;
+    var len: usize = 0;
+    var v: u32 = opcode;
+    if (v == 0) { buf[0] = '0'; len = 1; }
+    or {
+        var tmp: [16]u8;
+        var t: usize = 0;
+        for (v > 0) { tmp[t] = (v % 10)::u8 + '0'; v = v / 10; t = t + 1; }
+        var ri: usize = 0;
+        for (ri < t) { buf[ri] = tmp[t - 1 - ri]; ri = ri + 1; }
+        len = t;
+    }
+    os.write(os.STDERR_FD, ?buf[0], len);
+    os.write(os.STDERR_FD, "\n", 1);
+}
+
+# rewrite a single generic MIR opcode in place into its concrete AArch64 encoder
+# opcode (or leave it as a surviving sentinel / pass-through). the operand list
+# already matches the machine form, so only `opcode` changes. fails loudly on an
+# opcode the AArch64 leaf backend does not model.
+fun rewrite(mi: *mir.MirInstr) Result[bool, str] {
+    val o: mir.MirOpcode = mi.opcode;
+
+    # the three-address integer binary ALU ops rewrite to a concrete A64
+    # three-address opcode (N=1): A64 ALU is three-address, so operand 0 stays a
+    # pure def and the encoder packs one `op Rd, Rn, Rm` word (folding an immediate
+    # right operand into the immediate form or materializing it through a scratch).
+    if (o == mir.MIR_ADD) { mi.opcode = arm64.ADD::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_SUB) { mi.opcode = arm64.SUB::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_MUL) { mi.opcode = arm64.MUL::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_AND) { mi.opcode = arm64.AND::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_OR)  { mi.opcode = arm64.ORR::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_XOR) { mi.opcode = arm64.EOR::u32; ret ok[bool, str](true); }
+
+    # the shifts rewrite to a single A64 shift opcode (no x86-64 CL constraint): the
+    # encoder selects the register variant (LSLV/LSRV/ASRV) or the immediate variant
+    # (UBFM/SBFM alias) from operand 2's kind.
+    if (o == mir.MIR_SHL)   { mi.opcode = arm64.LSL::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_SHR_U) { mi.opcode = arm64.LSR::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_SHR_S) { mi.opcode = arm64.ASR::u32; ret ok[bool, str](true); }
+
+    # negate and complement are single A64 instructions (no x86-64 multi-instruction
+    # expansion): NEG is `sub Rd, XZR, Rm` and NOT is `mvn Rd, Rm` (`orn Rd, XZR,
+    # Rm`). the encoder supplies the XZR operand from the surviving `[dst, src]`.
+    if (o == mir.MIR_NEG) { mi.opcode = arm64.NEG::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_NOT) { mi.opcode = arm64.MVN::u32; ret ok[bool, str](true); }
+
+    # the register-to-register / ABI pre-coloring move selects to a plain MOV; the
+    # encoder emits `orr Rd, XZR, Rm` for a register source or a MOVZ/MOVK sequence
+    # for an immediate source.
+    if (o == mir.MIR_MOV) { mi.opcode = arm64.MOV::u32; ret ok[bool, str](true); }
+
+    # control flow. an unconditional branch selects to B; a return to RET; an
+    # unreachable terminator to a `brk #0` trap.
+    if (o == mir.MIR_BR)          { mi.opcode = arm64.B::u32;   ret ok[bool, str](true); }
+    if (o == mir.MIR_RET)         { mi.opcode = arm64.RET::u32; ret ok[bool, str](true); }
+    if (o == mir.MIR_UNREACHABLE) { mi.opcode = arm64.BRK::u32; ret ok[bool, str](true); }
+
+    # the comparison family survives selection as a single `[dst, lhs, rhs]`
+    # instruction keeping its generic opcode, rewritten to a high SELECTION-OUTPUT
+    # sentinel so the encoder never confuses it with a concrete A64 opcode of the
+    # same low value; the encoder materializes the `SUBS XZR, lhs, rhs ; CSET dst,
+    # cc` byte sequence, reading the condition (and its signedness) from the opcode.
+    if (o == mir.MIR_CMP_EQ)   { mi.opcode = mir.MIR_SEL_CMP_EQ;   ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_NE)   { mi.opcode = mir.MIR_SEL_CMP_NE;   ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_LT_S) { mi.opcode = mir.MIR_SEL_CMP_LT_S; ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_LT_U) { mi.opcode = mir.MIR_SEL_CMP_LT_U; ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_LE_S) { mi.opcode = mir.MIR_SEL_CMP_LE_S; ret ok[bool, str](true); }
+    if (o == mir.MIR_CMP_LE_U) { mi.opcode = mir.MIR_SEL_CMP_LE_U; ret ok[bool, str](true); }
+
+    # the conditional branch survives selection as a single
+    # `[cond, then_block, else_block]` instruction (high sentinel): the allocator
+    # reads `cond` as a use and both block operands as the two successor edges; the
+    # encoder materializes the `CBNZ cond, then ; B else` byte sequence.
+    if (o == mir.MIR_CBR) { mi.opcode = mir.MIR_SEL_CBR; ret ok[bool, str](true); }
+
+    # call / phi pseudo-opcodes survive selection unchanged. MIR_CALL is the
+    # caller-saved clobber barrier the shared register allocator keys on; the
+    # argument, result, and phi pseudos are resolved (or skipped) downstream. a leaf
+    # function has none, but the selector must pass them through (Phase 3 lowers calls).
+    if (o == mir.MIR_CALL || o == mir.MIR_ARG || o == mir.MIR_CALL_RES ||
+        o == mir.MIR_PHI) { ret ok[bool, str](true); }
+
+    # the scalar float arithmetic / comparison / negate ops survive selection
+    # unchanged: their AArch64 encoding lands in a later phase (Phase 3/4). a leaf
+    # integer function never emits them; selection only needs to not reject them.
+    if (o == mir.MIR_FADD || o == mir.MIR_FSUB || o == mir.MIR_FMUL ||
+        o == mir.MIR_FDIV || o == mir.MIR_FCMP || o == mir.MIR_FNEG) {
+        ret ok[bool, str](true);
+    }
+
+    # the width / representation conversions survive selection unchanged (Phase 3/4).
+    if (o == mir.MIR_TRUNC || o == mir.MIR_SEXT || o == mir.MIR_ZEXT ||
+        o == mir.MIR_BITCAST ||
+        o == mir.MIR_FP_TRUNC || o == mir.MIR_FP_EXT ||
+        o == mir.MIR_FP_TO_SI || o == mir.MIR_FP_TO_UI ||
+        o == mir.MIR_SI_TO_FP || o == mir.MIR_UI_TO_FP) {
+        ret ok[bool, str](true);
+    }
+
+    # the AL-guarded variadic FP-register spill: AArch64 varargs land in Phase 4. a
+    # leaf function never emits it, so this is reported rather than modeled.
+    if (o == mir.MIR_VA_FP_SAVE) {
+        ret err[bool, str]("aarch64 varargs not implemented (Phase 4)");
+    }
+
+    write_opcode_ice(o);
+    ret err[bool, str]("internal compiler error: unhandled MIR opcode in instruction selection");
 }
