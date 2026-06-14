@@ -46,13 +46,14 @@
 #
 # The call / phi pseudo-opcodes (`MIR_CALL`, `MIR_CALL_RES`, `MIR_ARG`, `MIR_PHI`)
 # pass through unchanged for the shared ABI / register-allocation passes. The scalar
-# float arithmetic / comparison ops and the float conversions pass through unchanged
-# — their AArch64 encoding lands in Phase 4; selection only needs to not reject
-# them. Inline asm (`MIR_ASM`, Phase 3c) passes through unchanged for the encoder to
-# assemble its body. The variadic FP-register spill (`MIR_VA_FP_SAVE`, Phase 4) is
-# rejected with a phase message. Any opcode this selector does not model fails
-# loudly with an ICE so `select` is total — every opcode path returns a definite
-# result.
+# float arithmetic / comparison / negate ops and the float conversions pass through
+# unchanged (high-sentinel MIR opcodes the encoder materializes into A64 scalar-FP
+# byte sequences); a float register copy and a GP<->FP `:~` bitcast are rewritten to
+# the concrete FMOV. Inline asm (`MIR_ASM`, Phase 3c) passes through unchanged for
+# the encoder to assemble its body. The variadic FP-register spill
+# (`MIR_VA_FP_SAVE`, Phase 4) is rejected with a phase message. Any opcode this
+# selector does not model fails loudly with an ICE so `select` is total — every
+# opcode path returns a definite result.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -71,6 +72,7 @@ use std.allocator.Allocator;
 
 use os:     std.system.os;
 use target: mach.lang.target.resolved;
+use isa:    mach.lang.target.isa;
 use arm64:  mach.lang.target.isa.arm64;
 use mir:    mach.lang.be.codegen.mir;
 
@@ -108,7 +110,7 @@ pub fun select(alloc: *Allocator, tgt: *target.Target, fn: *mir.MirFunction) Res
         val b: *mir.MirBlock = ?fn.blocks[bi];
         var ii: u32 = 0;
         for (ii < b.instr_count) {
-            val r: Result[bool, str] = rewrite(?b.instrs[ii]);
+            val r: Result[bool, str] = rewrite(fn, ?b.instrs[ii]);
             if (is_err[bool, str](r)) { ret r; }
             ii = ii + 1;
         }
@@ -138,11 +140,21 @@ fun write_opcode_ice(opcode: u32) {
     os.write(os.STDERR_FD, "\n", 1);
 }
 
+# operand_is_fp: true when a MIR operand names a float/vector-bank value — a float
+# vreg (read from the function's vreg classes) or a vector-class physical register
+# (an ABI argument / return pre-color, read from the composite register id's class
+# tag). drives the float-vs-GP move classification without hardcoding a register.
+fun operand_is_fp(fn: *mir.MirFunction, op: *mir.MirOperand) bool {
+    if (op.kind == mir.MIR_OP_VREG) { ret mir.vreg_is_fp(fn, op.vreg); }
+    if (op.kind == mir.MIR_OP_PREG) { ret isa.regid_class(op.preg::i32) == isa.REG_CLASS_ID_XMM; }
+    ret false;
+}
+
 # rewrite a single generic MIR opcode in place into its concrete AArch64 encoder
 # opcode (or leave it as a surviving sentinel / pass-through). the operand list
 # already matches the machine form, so only `opcode` changes. fails loudly on an
 # opcode the AArch64 leaf backend does not model.
-fun rewrite(mi: *mir.MirInstr) Result[bool, str] {
+fun rewrite(fn: *mir.MirFunction, mi: *mir.MirInstr) Result[bool, str] {
     val o: mir.MirOpcode = mi.opcode;
 
     # the three-address integer binary ALU ops rewrite to a concrete A64
@@ -180,10 +192,23 @@ fun rewrite(mi: *mir.MirInstr) Result[bool, str] {
     if (o == mir.MIR_NEG) { mi.opcode = arm64.NEG::u32; ret ok[bool, str](true); }
     if (o == mir.MIR_NOT) { mi.opcode = arm64.MVN::u32; ret ok[bool, str](true); }
 
-    # the register-to-register / ABI pre-coloring move selects to a plain MOV; the
-    # encoder emits `orr Rd, XZR, Rm` for a register source or a MOVZ/MOVK sequence
-    # for an immediate source.
-    if (o == mir.MIR_MOV) { mi.opcode = arm64.MOV::u32; ret ok[bool, str](true); }
+    # the register-to-register / ABI pre-coloring move selects to a plain MOV (`orr
+    # Rd, XZR, Rm` for a register source, a MOVZ/MOVK sequence for an immediate). a
+    # FLOAT move — either operand a float vreg or a vector-class pre-color — selects
+    # to FMOV instead, whose encoder emits the S/D `fmov` and dispatches the spilled
+    # frame-slot forms by register class, so a float copy never mis-encodes as a GP
+    # move of the aliasing register index. the spill reload / store moves regalloc
+    # inserts after selection keep the generic MIR_MOV (the GP encoder handles their
+    # frame-slot operand); a spilled FLOAT operand is left in place as a frame-slot
+    # MEM the float ops resolve, so no float MIR_MOV spill reaches the GP path.
+    if (o == mir.MIR_MOV) {
+        if (operand_is_fp(fn, ?mi.operands[0]) || operand_is_fp(fn, ?mi.operands[1])) {
+            mi.opcode = arm64.FMOV::u32;
+        } or {
+            mi.opcode = arm64.MOV::u32;
+        }
+        ret ok[bool, str](true);
+    }
 
     # control flow. an unconditional branch selects to B; a return to RET; an
     # unreachable terminator to a `brk #0` trap.
@@ -228,17 +253,36 @@ fun rewrite(mi: *mir.MirInstr) Result[bool, str] {
     if (o == mir.MIR_CALL || o == mir.MIR_ARG || o == mir.MIR_CALL_RES ||
         o == mir.MIR_PHI) { ret ok[bool, str](true); }
 
-    # the scalar float arithmetic / comparison / negate ops survive selection
-    # unchanged: their AArch64 encoding lands in a later phase (Phase 3/4). a leaf
-    # integer function never emits them; selection only needs to not reject them.
+    # the scalar float arithmetic / comparison / negate ops survive selection keeping
+    # their dedicated high-sentinel MIR opcode (0x1114+), like the integer compare /
+    # divide families: each is a clean `[dst, lhs, rhs]` (or `[dst, src]`) the
+    # register allocator reads by operand shape, and the encoder materializes the A64
+    # scalar-FP byte sequence (FADD/FSUB/FMUL/FDIV/FNEG single words; FCMP + CSET for
+    # the comparison) from the surviving opcode, sizing the S-vs-D form by `mi.width`.
     if (o == mir.MIR_FADD || o == mir.MIR_FSUB || o == mir.MIR_FMUL ||
         o == mir.MIR_FDIV || o == mir.MIR_FCMP || o == mir.MIR_FNEG) {
         ret ok[bool, str](true);
     }
 
-    # the width / representation conversions survive selection unchanged (Phase 3/4).
+    # a bit reinterpret crossing the GP and float banks (`f64 :~ i64` / `i32 :~ f32`)
+    # selects to FMOV, which transfers the raw bits between an X/W register and an S/D
+    # register; the encoder picks the direction from operand register class. a
+    # same-bank reinterpret (GP<->GP) stays MIR_BITCAST — a plain register copy the
+    # integer conversion encoder handles. a float-to-float bitcast cannot occur (a
+    # reinterpret is equal-size and the only two float widths differ).
+    if (o == mir.MIR_BITCAST) {
+        if (operand_is_fp(fn, ?mi.operands[0]) != operand_is_fp(fn, ?mi.operands[1])) {
+            mi.opcode = arm64.FMOV::u32;
+        }
+        ret ok[bool, str](true);
+    }
+
+    # the integer width conversions and the float conversions survive selection
+    # unchanged: their generic opcode values sit above the concrete A64 opcode space,
+    # so the encoder dispatches each directly (SXTB/UXTB/width-MOV for the integer
+    # forms; FCVT / SCVTF / UCVTF / FCVTZS / FCVTZU for the float forms) and the
+    # allocator reads operand 0 as a clean def.
     if (o == mir.MIR_TRUNC || o == mir.MIR_SEXT || o == mir.MIR_ZEXT ||
-        o == mir.MIR_BITCAST ||
         o == mir.MIR_FP_TRUNC || o == mir.MIR_FP_EXT ||
         o == mir.MIR_FP_TO_SI || o == mir.MIR_FP_TO_UI ||
         o == mir.MIR_SI_TO_FP || o == mir.MIR_UI_TO_FP) {
