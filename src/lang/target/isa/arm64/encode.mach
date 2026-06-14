@@ -15,7 +15,9 @@
 # SCOPE (Phase 3b — calls + symbol relocations, atop the Phase 3a frames + memory +
 # conversions core). Every modeled form is byte-exact against llvm-mc: the three-
 # address integer ALU (ADD/SUB/MUL/AND/ORR/EOR), the shifts (register LSLV/LSRV/ASRV
-# and immediate UBFM/SBFM aliases), NEG/MVN/MOV, the MOVZ/MOVK immediate
+# and immediate UBFM/SBFM aliases), the integer divides (SDIV/UDIV, remainder via
+# MSUB) with the defined division-by-zero / signed-overflow trap checks (CBNZ/CMN/
+# CMP + BRK), NEG/MVN/MOV, the MOVZ/MOVK immediate
 # materialization, RET, CMP (SUBS XZR) + CSET, the unconditional branch B, the
 # conditional branch (CBNZ + B), and the BRK unreachable trap; plus the record-at-top
 # non-leaf prologue (STP/MOV record, `SUB SP` frame, GP callee-save STP/LDP pairs)
@@ -125,6 +127,13 @@ val MUL_X: u32 = 0x9B007C00; val MUL_W: u32 = 0x1B007C00;
 val LSLV_X: u32 = 0x9AC02000; val LSLV_W: u32 = 0x1AC02000;
 val LSRV_X: u32 = 0x9AC02400; val LSRV_W: u32 = 0x1AC02400;
 val ASRV_X: u32 = 0x9AC02800; val ASRV_W: u32 = 0x1AC02800;
+# the integer divides (SDIV signed / UDIV unsigned), same data-processing-2-source
+# group as the register shifts (op2 = 0x03 signed / 0x02 unsigned).
+val SDIV_X: u32 = 0x9AC00C00; val SDIV_W: u32 = 0x1AC00C00;
+val UDIV_X: u32 = 0x9AC00800; val UDIV_W: u32 = 0x1AC00800;
+# MSUB Rd,Rn,Rm,Ra (Rd = Ra - Rn*Rm) — the multiply-subtract the remainder uses to
+# recover `Rn - (Rn/Rm)*Rm`; the o0 bit (bit 15) distinguishes it from MADD.
+val MSUB_X: u32 = 0x9B008000; val MSUB_W: u32 = 0x1B008000;
 # ADD / SUB immediate (imm12, optional left-shift by 12 via the `sh` bit).
 val ADDI_X: u32 = 0x91000000; val ADDI_W: u32 = 0x11000000;
 val SUBI_X: u32 = 0xD1000000; val SUBI_W: u32 = 0x51000000;
@@ -137,6 +146,9 @@ val MOVK_X: u32 = 0xF2800000; val MOVK_W: u32 = 0x72800000;
 # SUBS XZR (the CMP alias), register and immediate forms.
 val SUBS_REG_X: u32 = 0xEB000000; val SUBS_REG_W: u32 = 0x6B000000;
 val SUBS_IMM_X: u32 = 0xF1000000; val SUBS_IMM_W: u32 = 0x71000000;
+# ADDS XZR, Rn, #imm (the CMN-immediate alias) — the signed-overflow check compares
+# the divisor to -1 with `cmn Rm, #1` (sets Z when Rm + 1 == 0, i.e. Rm == -1).
+val ADDS_IMM_X: u32 = 0xB1000000; val ADDS_IMM_W: u32 = 0x31000000;
 # CSINC Rd,XZR,XZR (the CSET alias): the base bakes the XZR sources and op2 bit.
 val CSINC_X: u32 = 0x9A800400; val CSINC_W: u32 = 0x1A800400;
 # STP pre-index / LDP post-index (the FP/LR frame record) and the signed-offset
@@ -302,6 +314,26 @@ fun pack_ldst(base: u32, rt: u32, rn: u32, imm12: u32) u32 {
 # pass 2 inserts the resolved imm19 displacement.
 fun pack_cbnz(base: u32, rt: u32) u32 {
     ret base | (rt & 0x1F);
+}
+
+# pack_cbnz_off: a compare-and-branch word with a resolved (signed) imm19 word
+# displacement — imm19[23:5], Rt[4:0]. used by the self-contained divide trap checks,
+# whose forward skip distance is fixed at emit time (no pass-2 fixup needed).
+fun pack_cbnz_off(base: u32, rt: u32, imm19: u32) u32 {
+    ret base | ((imm19 & 0x7FFFF) << 5) | (rt & 0x1F);
+}
+
+# pack_bcond: a conditional-branch (B.cond) word — imm19[23:5] (the signed word
+# displacement), cond[3:0]. used by the divide trap checks' fixed forward skips.
+fun pack_bcond(imm19: u32, cond: u32) u32 {
+    ret BCOND | ((imm19 & 0x7FFFF) << 5) | (cond & 0xF);
+}
+
+# pack_madd: a multiply-add/sub word — Rm[20:16], Ra[14:10], Rn[9:5], Rd[4:0] OR-ed
+# into `base` (MADD or MSUB, which bakes the o0 bit). used for the remainder's
+# `msub Rd, Rn, Rm, Ra` = Rd = Ra - Rn*Rm.
+fun pack_madd(base: u32, rd: u32, rn: u32, rm: u32, ra: u32) u32 {
+    ret base | ((rm & 0x1F) << 16) | ((ra & 0x1F) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F);
 }
 
 # pack_alu3_sh: a three-register data-processing word with a left-shift amount —
@@ -1125,6 +1157,83 @@ fun encode_cbr(st: *EncodeState, fn_base: u32, mi: *mir.MirInstr) Result[bool, s
     ret push_fixup(st, b_pos, b_next, else_block, fn_base);
 }
 
+# is_mir_divide: true when a post-isel opcode is a surviving division / remainder
+# sentinel (MIR_SEL_DIV_*/MIR_SEL_REM_*) — the encoder materializes the SDIV/UDIV
+# (+ MSUB for a remainder) and the defined division-by-zero / signed-overflow traps
+# from it. AArch64 wires no fixed division register, so the divide reaches the
+# encoder as the clean three-address `[dst, dividend, divisor]` op the shared
+# lowering emitted and arm64 isel rewrote to the high sentinel.
+fun is_mir_divide(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_SEL_DIV_S || op == mir.MIR_SEL_DIV_U ||
+        op == mir.MIR_SEL_REM_S || op == mir.MIR_SEL_REM_U;
+}
+
+# encode_divide: materialize a surviving division / remainder `[dst, dividend,
+# divisor]` into the A64 SDIV/UDIV (+ MSUB for a remainder), guarded by the runtime
+# traps mach defines for integer division. unlike x86-64's IDIV/DIV, AArch64
+# SDIV/UDIV do NOT fault, so the trapping semantics are made explicit:
+#   - division by zero (all forms): `cbnz Rm, .Lok ; brk #0` — the BRK fires when the
+#     divisor is zero (cbnz skips it otherwise).
+#   - signed overflow INT_MIN / -1 (signed forms only): `cmn Rm, #1` (Rm == -1?) then,
+#     only when equal, `movz IP1, #INT_MIN ; cmp Rn, IP1` (Rn == INT_MIN?) reach a brk.
+# the quotient is `sdiv/udiv Rd, Rn, Rm`; the remainder is `sdiv/udiv IP0, Rn, Rm ;
+# msub Rd, IP0, Rm, Rn` (Rd = Rn - (Rn/Rm)*Rm). IP0/IP1 are the reserved encoder
+# scratch (never an allocated operand), so the divisor / dividend survive to every
+# use; the trap skips are fixed forward word displacements (no pass-2 fixup).
+fun encode_divide(st: *EncodeState, mi: *mir.MirInstr) Result[bool, str] {
+    if (mi.operand_count < 3) { ret err[bool, str]("encode: divide missing operands"); }
+    val use64: bool = is64(mi.width);
+
+    val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (is_err[i32, str](rdr)) { ret err[bool, str](unwrap_err[i32, str](rdr)); }
+    val rd: u32 = unwrap_ok[i32, str](rdr)::u32;
+
+    val rnr: Result[i32, str] = req_gpr(?mi.operands[1]);
+    if (is_err[i32, str](rnr)) { ret err[bool, str](unwrap_err[i32, str](rnr)); }
+    val rn: u32 = unwrap_ok[i32, str](rnr)::u32;
+
+    val rmr: Result[i32, str] = req_gpr(?mi.operands[2]);
+    if (is_err[i32, str](rmr)) { ret err[bool, str](unwrap_err[i32, str](rmr)); }
+    val rm: u32 = unwrap_ok[i32, str](rmr)::u32;
+
+    val op: mir.MirOpcode = mi.opcode;
+    val signed: bool = op == mir.MIR_SEL_DIV_S || op == mir.MIR_SEL_REM_S;
+    val rem:    bool = op == mir.MIR_SEL_REM_S || op == mir.MIR_SEL_REM_U;
+
+    # division-by-zero trap: skip the brk (one word ahead) when the divisor is non-zero.
+    emit_word(st, pack_cbnz_off(sel(use64, CBNZ_X, CBNZ_W), rm, 2));
+    emit_word(st, BRK_BASE);
+
+    # signed-overflow (INT_MIN / -1) trap: only the signed divides can overflow.
+    if (signed) {
+        # cmn Rm, #1 sets Z iff Rm == -1; if not, no overflow — skip the rest (5 words).
+        emit_word(st, pack_addsub_imm(sel(use64, ADDS_IMM_X, ADDS_IMM_W), ZR, rm, 1, 0));
+        emit_word(st, pack_bcond(5, CC_NE));
+        # IP1 = INT_MIN for this width (a single MOVZ: 0x80000000 W / 0x8000000000000000
+        # X); cmp Rn, IP1 sets Z iff the dividend is INT_MIN — then the brk (2 words).
+        var hw: u32 = 1;
+        if (use64) { hw = 3; }
+        emit_word(st, pack_movewide(sel(use64, MOVZ_X, MOVZ_W), SCRATCH1, hw, 0x8000));
+        emit_word(st, pack_cmp_reg(sel(use64, SUBS_REG_X, SUBS_REG_W), rn, SCRATCH1));
+        emit_word(st, pack_bcond(2, CC_NE));
+        emit_word(st, BRK_BASE);
+    }
+
+    # the divide base (SDIV signed / UDIV unsigned) for this form.
+    var dbase_x: u32 = SDIV_X; var dbase_w: u32 = SDIV_W;
+    if (!signed) { dbase_x = UDIV_X; dbase_w = UDIV_W; }
+
+    if (rem) {
+        # remainder: the quotient lands in IP0, then `msub Rd, IP0, Rm, Rn`.
+        emit_word(st, pack_alu3(sel(use64, dbase_x, dbase_w), SCRATCH0, rn, rm));
+        emit_word(st, pack_madd(sel(use64, MSUB_X, MSUB_W), rd, SCRATCH0, rm, rn));
+        ret ok[bool, str](true);
+    }
+    # quotient: Rd = Rn / Rm.
+    emit_word(st, pack_alu3(sel(use64, dbase_x, dbase_w), rd, rn, rm));
+    ret ok[bool, str](true);
+}
+
 # ---- frame layout, prologue, epilogue ----
 
 # popcount32: the number of set bits in a 32-bit mask.
@@ -1288,6 +1397,10 @@ fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
     # multi-instruction byte sequences.
     if (is_mir_compare(mi.opcode)) { ret encode_compare(st, mi); }
     if (mi.opcode == mir.MIR_SEL_CBR) { ret encode_cbr(st, fn_base, mi); }
+
+    # the surviving division / remainder sentinel expands into its SDIV/UDIV (+ MSUB)
+    # byte sequence with the defined division-by-zero / signed-overflow traps.
+    if (is_mir_divide(mi.opcode)) { ret encode_divide(st, mi); }
 
     # the register-allocator's spill reload / store, inserted after instruction
     # selection, carries the GENERIC MIR_MOV opcode (isel only rewrites the moves
@@ -2781,6 +2894,145 @@ test "arm64.encode: compare with an immediate lhs materializes (real-std char ga
     if (read_word(?st.buf, 4) != 0x6B01023F) { bad = 1; }  # cmp w17, w1
     if (read_word(?st.buf, 8) != 0x1A9F87E0) { bad = 1; }  # cset w0, ls
 
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the divide / remainder packers and the trap-check building blocks, byte-exact vs
+# `llvm-mc -triple=aarch64 --show-encoding`. registers x0/x1/x2 = Rd/Rn/Rm, IP1 = x17.
+test "arm64.encode: SDIV/UDIV/MSUB + divide trap packers match llvm-mc" {
+    var bad: i32 = 0;
+    # sdiv / udiv w0,w1,w2 and x0,x1,x2
+    if (pack_alu3(SDIV_W, 0, 1, 2) != 0x1AC20C20) { bad = 1; }  # sdiv w0, w1, w2
+    if (pack_alu3(SDIV_X, 0, 1, 2) != 0x9AC20C20) { bad = 1; }  # sdiv x0, x1, x2
+    if (pack_alu3(UDIV_W, 0, 1, 2) != 0x1AC20820) { bad = 1; }  # udiv w0, w1, w2
+    if (pack_alu3(UDIV_X, 0, 1, 2) != 0x9AC20820) { bad = 1; }  # udiv x0, x1, x2
+    # msub w0,w16,w2,w1 and x0,x16,x2,x1 (Rd = Rn - IP0*Rm, the remainder recovery)
+    if (pack_madd(MSUB_W, 0, 16, 2, 1) != 0x1B028600) { bad = 1; }  # msub w0, w16, w2, w1
+    if (pack_madd(MSUB_X, 0, 16, 2, 1) != 0x9B028600) { bad = 1; }  # msub x0, x16, x2, x1
+    # division-by-zero check: cbnz w2/x2, #8 (imm19 = 2 words, skipping the brk)
+    if (pack_cbnz_off(CBNZ_W, 2, 2) != 0x35000042) { bad = 1; }  # cbnz w2, #8
+    if (pack_cbnz_off(CBNZ_X, 2, 2) != 0xB5000042) { bad = 1; }  # cbnz x2, #8
+    # signed-overflow check: cmn w2/x2,#1 ; b.ne #20 ; movz IP1,#INT_MIN ; b.ne #8
+    if (pack_addsub_imm(ADDS_IMM_W, ZR, 2, 1, 0) != 0x3100045F) { bad = 1; }  # cmn w2, #1
+    if (pack_addsub_imm(ADDS_IMM_X, ZR, 2, 1, 0) != 0xB100045F) { bad = 1; }  # cmn x2, #1
+    if (pack_bcond(5, CC_NE) != 0x540000A1) { bad = 1; }  # b.ne #20
+    if (pack_bcond(2, CC_NE) != 0x54000041) { bad = 1; }  # b.ne #8
+    if (pack_movewide(MOVZ_W, 17, 1, 0x8000) != 0x52B00011) { bad = 1; }  # movz w17, #0x80000000
+    if (pack_movewide(MOVZ_X, 17, 3, 0x8000) != 0xD2F00011) { bad = 1; }  # movz x17, #0x8000000000000000
+    ret bad;
+}
+
+# the full encode_divide byte sequences — quotient / remainder plus the defined
+# division-by-zero (all forms) and signed-overflow INT_MIN/-1 (signed forms) trap
+# checks — byte-exact vs llvm-mc. operands [dst x0/w0, dividend x1/w1, divisor x2/w2];
+# a remainder uses IP0 (x16) as the quotient temp, the overflow check IP1 (x17).
+test "arm64.encode: unsigned divide (UDIV X) + div-by-zero trap matches llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    var mi: mir.MirInstr;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(0); ops[1] = mir.op_preg(1); ops[2] = mir.op_preg(2);
+    mi.operands = ?ops[0]; mi.operand_count = 3;
+    mi.opcode = mir.MIR_SEL_DIV_U; mi.width = 8;
+
+    val r: Result[bool, str] = encode_divide(?st, ?mi);
+    if (is_err[bool, str](r)) { bad = 1; }
+    if (st.buf.len != 12) { bad = 1; }
+    or {
+        if (read_word(?st.buf, 0) != 0xB5000042) { bad = 1; }   # cbnz x2, #8
+        if (read_word(?st.buf, 4) != 0xD4200000) { bad = 1; }   # brk #0
+        if (read_word(?st.buf, 8) != 0x9AC20820) { bad = 1; }   # udiv x0, x1, x2
+    }
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+test "arm64.encode: signed divide (SDIV X) + zero/overflow traps matches llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    var mi: mir.MirInstr;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(0); ops[1] = mir.op_preg(1); ops[2] = mir.op_preg(2);
+    mi.operands = ?ops[0]; mi.operand_count = 3;
+    mi.opcode = mir.MIR_SEL_DIV_S; mi.width = 8;
+
+    val r: Result[bool, str] = encode_divide(?st, ?mi);
+    if (is_err[bool, str](r)) { bad = 1; }
+    if (st.buf.len != 36) { bad = 1; }
+    or {
+        if (read_word(?st.buf, 0)  != 0xB5000042) { bad = 1; }  # cbnz x2, #8
+        if (read_word(?st.buf, 4)  != 0xD4200000) { bad = 1; }  # brk #0
+        if (read_word(?st.buf, 8)  != 0xB100045F) { bad = 1; }  # cmn x2, #1
+        if (read_word(?st.buf, 12) != 0x540000A1) { bad = 1; }  # b.ne #20
+        if (read_word(?st.buf, 16) != 0xD2F00011) { bad = 1; }  # movz x17, #INT_MIN
+        if (read_word(?st.buf, 20) != 0xEB11003F) { bad = 1; }  # cmp x1, x17
+        if (read_word(?st.buf, 24) != 0x54000041) { bad = 1; }  # b.ne #8
+        if (read_word(?st.buf, 28) != 0xD4200000) { bad = 1; }  # brk #0
+        if (read_word(?st.buf, 32) != 0x9AC20C20) { bad = 1; }  # sdiv x0, x1, x2
+    }
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+test "arm64.encode: signed remainder (SREM W) + zero/overflow traps matches llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    var mi: mir.MirInstr;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(0); ops[1] = mir.op_preg(1); ops[2] = mir.op_preg(2);
+    mi.operands = ?ops[0]; mi.operand_count = 3;
+    mi.opcode = mir.MIR_SEL_REM_S; mi.width = 4;
+
+    val r: Result[bool, str] = encode_divide(?st, ?mi);
+    if (is_err[bool, str](r)) { bad = 1; }
+    if (st.buf.len != 40) { bad = 1; }
+    or {
+        if (read_word(?st.buf, 0)  != 0x35000042) { bad = 1; }  # cbnz w2, #8
+        if (read_word(?st.buf, 4)  != 0xD4200000) { bad = 1; }  # brk #0
+        if (read_word(?st.buf, 8)  != 0x3100045F) { bad = 1; }  # cmn w2, #1
+        if (read_word(?st.buf, 12) != 0x540000A1) { bad = 1; }  # b.ne #20
+        if (read_word(?st.buf, 16) != 0x52B00011) { bad = 1; }  # movz w17, #INT_MIN
+        if (read_word(?st.buf, 20) != 0x6B11003F) { bad = 1; }  # cmp w1, w17
+        if (read_word(?st.buf, 24) != 0x54000041) { bad = 1; }  # b.ne #8
+        if (read_word(?st.buf, 28) != 0xD4200000) { bad = 1; }  # brk #0
+        if (read_word(?st.buf, 32) != 0x1AC20C30) { bad = 1; }  # sdiv w16, w1, w2
+        if (read_word(?st.buf, 36) != 0x1B028600) { bad = 1; }  # msub w0, w16, w2, w1
+    }
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+test "arm64.encode: unsigned remainder (UREM X) + div-by-zero trap matches llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    var mi: mir.MirInstr;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(0); ops[1] = mir.op_preg(1); ops[2] = mir.op_preg(2);
+    mi.operands = ?ops[0]; mi.operand_count = 3;
+    mi.opcode = mir.MIR_SEL_REM_U; mi.width = 8;
+
+    val r: Result[bool, str] = encode_divide(?st, ?mi);
+    if (is_err[bool, str](r)) { bad = 1; }
+    if (st.buf.len != 16) { bad = 1; }
+    or {
+        if (read_word(?st.buf, 0)  != 0xB5000042) { bad = 1; }  # cbnz x2, #8
+        if (read_word(?st.buf, 4)  != 0xD4200000) { bad = 1; }  # brk #0
+        if (read_word(?st.buf, 8)  != 0x9AC20830) { bad = 1; }  # udiv x16, x1, x2
+        if (read_word(?st.buf, 12) != 0x9B028600) { bad = 1; }  # msub x0, x16, x2, x1
+    }
     buf_dnit(?st.buf);
     ret bad;
 }
