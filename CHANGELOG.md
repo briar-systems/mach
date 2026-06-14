@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-06-14
+
+Stabilization + multi-target-prep release. Adds the multi-target union Project for
+long-lived tooling (the language server now sees modules reachable only on a
+non-default target), lands the post-windows compiler-stability audit fixes
+(object-format parse-leak reclamation + truthful ELF symbol counts, the COFF REL32
+addend convention, a distinct unknown-target-name diagnostic, and an arm64
+register-id correction), and completes the OS-vtable interner-elimination — readying
+the target layer for the v1.6 architectures.
+
+### Added
+
+- driver: `build_project_union` builds the union of every manifest target's import
+  closure into one deduplicated Project, so long-lived multi-target tooling (e.g. the
+  language server) sees modules reachable only on a non-default target. Each `$if`
+  chain follows the first active branch of every declared target; the Project resolves
+  under the default (native-resolved) target's tuple — the documented v1 default, "the
+  default target's branches win" — and a module that does not fully resolve there
+  records diagnostics without aborting the build (#1391).
+
+### Changed
+
+- target: the os/arch name↔id mapping is consolidated to one canonical table per
+  dimension — `os.os_id_for`/`os.os_name_for` and `isa.arch_id_for`/`isa.arch_name_for`
+  — replacing the copies that lived in `driver.mach` and `manifest.mach`. An
+  unrecognized manifest `os`/`isa` name now reports a distinct "unknown target os/isa
+  name '<name>' (expected: ...)" diagnostic instead of folding to `*_UNKNOWN` and being
+  mis-reported as an unsupported pair (#1412).
+- The `OsVTable` `entry_symbol`, `syscall_layer`, `libdir`, and `dynamic_linker`
+  fields are immutable `str` constants set directly by the OS registrars, no longer
+  `StrId` fields re-interned per session; the linker now interns these at the point
+  of use (the entry-symbol lookup and the dynamic interpreter path), completing the
+  interner-elimination from the OS vtable started in #1377. Behavior-preserving,
+  verified by the byte-identical self-host fixpoint (#1402).
+- target: the dead `IsaVTable.endianness` field is removed. It was set by the ISA
+  registrars but read by nobody — the object-format writers hardcode little-endian —
+  so the field documented a behavior that did not exist. The `ENDIAN_LITTLE`/
+  `ENDIAN_BIG` enum is retained for the eventual big-endian abstraction, and the
+  comments that claimed endianness was honored now state the little-endian
+  assumption plainly (#1411).
+- objfmt (COFF): the writer/reader resolve every relocation's target symbol through a
+  name→index map built once per pass instead of a linear symbol-table scan per
+  relocation, turning the two reloc passes from O(reloc × symbol) into O(reloc +
+  symbol). Behavior-preserving (same indices resolved, same unresolved-symbol error),
+  verified by the byte-identical self-host fixpoint (#1413).
+
+### Fixed
+
+- target (aarch64): `IsaVTable.fp_scratch_reg` for the (stub) arm64 backend is now
+  the composite vector register id `regid_make(REG_CLASS_ID_XMM, 31)` instead of the
+  raw bank index `31`, which would have read as a GP register. Dead today (the arm64
+  backend has no encoder), corrected before it seeds the future backend (#1414).
+- objfmt: the COFF and ELF object-file parsers allocate the section/symbol/relocation
+  arrays up front but left each `ObjectImage` count at `0` until its populate loop
+  finished, so an error return before or within those loops (a truncated or hostile
+  object) leaked the arrays — `obj.dnit` frees nothing when the counts are `0`. Each
+  count is now set to its populated size immediately after the array is allocated (the
+  loops use local write cursors), so teardown reclaims the full arrays on any later
+  parse error; the ELF symbol array is sized and counted to the populated count
+  (excluding the reserved index-0 entry) so allocation, count, and entries all agree.
+  Emitted output is unchanged (#1410).
+- objfmt (COFF): REL32 relocations are next-byte-relative (`S + A − (P+4)`), but the
+  abstract addend uses ELF's field-relative convention (`S + A − P`), so the writer's
+  on-wire field and the reader's recovered addend were off by 4 — a foreign
+  (MSVC/clang/GAS) COFF read by mach landed calls 4 bytes past target, and mach's
+  emitted `.obj` was off by −4 under link.exe/lld. The writer now folds `A_coff =
+  A_elf + 4` and the reader recovers `A_elf = A_coff − 4` for REL32 only; ABS64
+  (ADDR64) and ADDR32NB are unaffected. A mach-emitted `.obj`'s REL32 wire field
+  changes (that is the fix — a `call`'s field is now 0, the COFF convention), but a
+  mach→mach round-trip recovers the same abstract addend and links to the same final
+  binary; only foreign-COFF interop behavior changes (#1409).
+
 ## [1.5.3] - 2026-06-13
 
 Correctness patch for two silent defects in shipped v1.5.2: a relocation
