@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of use (the entry-symbol lookup and the dynamic interpreter path), completing the
   interner-elimination from the OS vtable started in #1377. Behavior-preserving,
   verified by the byte-identical self-host fixpoint (#1402).
+- target: the dead `IsaVTable.endianness` field is removed. It was set by the ISA
+  registrars but read by nobody — the object-format writers hardcode little-endian —
+  so the field documented a behavior that did not exist. The `ENDIAN_LITTLE`/
+  `ENDIAN_BIG` enum is retained for the eventual big-endian abstraction, and the
+  comments that claimed endianness was honored now state the little-endian
+  assumption plainly (#1411).
 - objfmt (COFF): the writer/reader resolve every relocation's target symbol through a
   name→index map built once per pass instead of a linear symbol-table scan per
   relocation, turning the two reloc passes from O(reloc × symbol) into O(reloc +
@@ -39,6 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- target (aarch64): `IsaVTable.fp_scratch_reg` for the (stub) arm64 backend is now
+  the composite vector register id `regid_make(REG_CLASS_ID_XMM, 31)` instead of the
+  raw bank index `31`, which would have read as a GP register. Dead today (the arm64
+  backend has no encoder), corrected before it seeds the future backend (#1414).
+- objfmt: the COFF and ELF object-file parsers allocate the section/symbol/relocation
+  arrays up front but left each `ObjectImage` count at `0` until its populate loop
+  finished, so an error return before or within those loops (a truncated or hostile
+  object) leaked the arrays — `obj.dnit` frees nothing when the counts are `0`. Each
+  count is now set to its populated size immediately after the array is allocated (the
+  loops use local write cursors), so teardown reclaims the full arrays on any later
+  parse error; the ELF symbol array is sized and counted to the populated count
+  (excluding the reserved index-0 entry) so allocation, count, and entries all agree.
+  Emitted output is unchanged (#1410).
 - objfmt (COFF): REL32 relocations are next-byte-relative (`S + A − (P+4)`), but the
   abstract addend uses ELF's field-relative convention (`S + A − P`), so the writer's
   on-wire field and the reader's recovered addend were off by 4 — a foreign
