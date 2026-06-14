@@ -2,22 +2,67 @@
 #
 # This is the AArch64 implementation of the ISA vtable's `encode` operation,
 # reached only through `tgt.arch.encode` by the shared `be.codegen.encode`
-# dispatcher. Byte encoding is not yet implemented: `encode_arm64` is a total
-# function that fails loudly with an "not implemented" error. The encoder that
-# turns the resolved `isa.Inst` stream into AArch64 bytes (with prologue/epilogue
-# emission, branch fixups, and relocation offsets) is filled in a later phase; the
-# four-file ISA shape mirrors the x86-64 backend.
+# dispatcher. It turns the resolved (post-isel, post-regalloc, post-frame)
+# `MirModule` into fixed-width little-endian A64 `.text` bytes, driving the
+# shared two-pass `enc.encode_driver` with two per-ISA hooks: `encode_function_arm64`
+# (prologue / instruction stream / epilogue, recording symbol marks and intra-
+# module branch fixups) and `patch_branch_arm64` (the imm26 / imm19 bitfield insert
+# in pass 2). The ISA-general driving — state lifetime, the function loop, pass-2
+# block resolution, text right-sizing, and `enc.EncoderOutput` assembly — lives in
+# the shared `enc` module; this backend supplies only the A64 bitfield packers,
+# prologue/epilogue emission, and branch patching.
+#
+# SCOPE (Phase 2b — leaf integer). Every modeled form is byte-exact against
+# llvm-mc: the three-address integer ALU (ADD/SUB/MUL/AND/ORR/EOR), the shifts
+# (register LSLV/LSRV/ASRV and immediate UBFM/SBFM aliases), NEG/MVN/MOV, the
+# MOVZ/MOVK immediate materialization, RET, the STP/MOV prologue and LDP/RET
+# epilogue, CMP (SUBS XZR) + CSET, the unconditional branch B, the conditional
+# branch (CBNZ + B), and the BRK unreachable trap. The contract gaps DEFERRED to a
+# later phase (a leaf integer function never reaches them, so they fail loudly
+# rather than emit wrong bytes): frame-slot / spill memory operands, callee-saved
+# FP registers, frames larger than the pre-index STP range, inline asm, calls and
+# their relocations, and the float / conversion families.
 
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
 use std.types.string.str;
 
 use std.types.result.Result;
+use std.types.result.ok;
 use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
 
 use std.allocator.Allocator;
+use page: std.allocator.page;
 
+use intern: mach.lang.intern;
+use isa:    mach.lang.target.isa;
+use arm64:  mach.lang.target.isa.arm64;
 use target: mach.lang.target.resolved;
+use of:     mach.lang.target.of;
 use mir:    mach.lang.be.codegen.mir;
 use enc:    mach.lang.be.codegen.encode;
+
+# the ISA-agnostic two-pass driver, its state, byte sink, and array helpers live
+# in the shared `enc` module; this backend consumes them by name and supplies the
+# two `enc.EncodeHooks` — `encode_function_arm64` and `patch_branch_arm64`.
+use mach.lang.be.codegen.encode.ByteBuf;
+use mach.lang.be.codegen.encode.EncodeState;
+use mach.lang.be.codegen.encode.BranchFixup;
+use mach.lang.be.codegen.encode.EncodeHooks;
+use mach.lang.be.codegen.encode.buf_init;
+use mach.lang.be.codegen.encode.buf_dnit;
+use mach.lang.be.codegen.encode.emit_u32;
+use mach.lang.be.codegen.encode.classify_refs;
+use mach.lang.be.codegen.encode.push_symbol;
+use mach.lang.be.codegen.encode.push_reloc;
+use mach.lang.be.codegen.encode.push_fixup;
+use mach.lang.be.codegen.encode.push_block;
+use mach.lang.be.codegen.encode.encode_driver;
 
 # EncodeFn: the concrete signature the erased `isa.IsaVTable.encode` pointer is
 # cast back to, matching the shared `be.codegen.encode.EncodeFn`. the vtable stores
@@ -30,18 +75,1024 @@ use enc:    mach.lang.be.codegen.encode;
 # ret:   the populated enc.EncoderOutput, or an error string
 pub def EncodeFn: fun(*Allocator, *target.Target, *mir.MirModule) Result[enc.EncoderOutput, str];
 
-# encode_arm64: encode a fully-resolved MIR module into AArch64 `.text` bytes,
-# symbol marks, and pending relocations.
-#
-# the AArch64 implementation behind the ISA vtable's `encode` slot; the shared
-# `be.codegen.encode.run` dispatcher reaches it only through `tgt.arch.encode`.
-# byte encoding is not yet implemented, so this fails loudly — a total function
-# that signals the unimplemented backend rather than emitting wrong bytes.
+# ---- A64 base words (Rd/Rn/Rm fields zeroed) ----
+# every base is the instruction word with its register and immediate fields clear;
+# a packer ORs the encoded fields in. each was confirmed byte-exact against
+# `llvm-mc -triple=aarch64 --show-encoding`. the `_X` forms set the 64-bit `sf`
+# bit (bit 31); the `_W` forms are the 32-bit variants.
+
+# ADD (shifted register), sub, and the logical / multiply three-address forms.
+val ADD_X: u32 = 0x8B000000; val ADD_W: u32 = 0x0B000000;
+val SUB_X: u32 = 0xCB000000; val SUB_W: u32 = 0x4B000000;
+val AND_X: u32 = 0x8A000000; val AND_W: u32 = 0x0A000000;
+val ORR_X: u32 = 0xAA000000; val ORR_W: u32 = 0x2A000000;
+val EOR_X: u32 = 0xCA000000; val EOR_W: u32 = 0x4A000000;
+# ORN (the MVN alias) sets the logical N bit (bit 21) of the ORR encoding.
+val ORN_X: u32 = 0xAA200000; val ORN_W: u32 = 0x2A200000;
+# MUL is MADD Rd,Rn,Rm,XZR — the base bakes the XZR accumulator (Ra=31 at [14:10]).
+val MUL_X: u32 = 0x9B007C00; val MUL_W: u32 = 0x1B007C00;
+# the register-variable shifts (LSLV / LSRV / ASRV).
+val LSLV_X: u32 = 0x9AC02000; val LSLV_W: u32 = 0x1AC02000;
+val LSRV_X: u32 = 0x9AC02400; val LSRV_W: u32 = 0x1AC02400;
+val ASRV_X: u32 = 0x9AC02800; val ASRV_W: u32 = 0x1AC02800;
+# ADD / SUB immediate (imm12, optional left-shift by 12 via the `sh` bit).
+val ADDI_X: u32 = 0x91000000; val ADDI_W: u32 = 0x11000000;
+val SUBI_X: u32 = 0xD1000000; val SUBI_W: u32 = 0x51000000;
+# the bitfield-move bases the immediate shifts alias (UBFM for LSL/LSR, SBFM for ASR).
+val UBFM_X: u32 = 0xD3400000; val UBFM_W: u32 = 0x53000000;
+val SBFM_X: u32 = 0x93400000; val SBFM_W: u32 = 0x13000000;
+# move-wide (MOVZ keeps, MOVK inserts) with a 16-bit immediate and an `hw` shift.
+val MOVZ_X: u32 = 0xD2800000; val MOVZ_W: u32 = 0x52800000;
+val MOVK_X: u32 = 0xF2800000; val MOVK_W: u32 = 0x72800000;
+# SUBS XZR (the CMP alias), register and immediate forms.
+val SUBS_REG_X: u32 = 0xEB000000; val SUBS_REG_W: u32 = 0x6B000000;
+val SUBS_IMM_X: u32 = 0xF1000000; val SUBS_IMM_W: u32 = 0x71000000;
+# CSINC Rd,XZR,XZR (the CSET alias): the base bakes the XZR sources and op2 bit.
+val CSINC_X: u32 = 0x9A800400; val CSINC_W: u32 = 0x1A800400;
+# STP pre-index / LDP post-index (the FP/LR frame record) and the signed-offset
+# pair / single forms (callee-saved register spills), all 64-bit.
+val STP_PRE_X:  u32 = 0xA9800000;
+val LDP_POST_X: u32 = 0xA8C00000;
+val STP_OFF_X:  u32 = 0xA9000000;
+val LDP_OFF_X:  u32 = 0xA9400000;
+val STR_OFF_X:  u32 = 0xF9000000;
+val LDR_OFF_X:  u32 = 0xF9400000;
+# the unconditional branch (imm26) and the conditional / compare-branch family (imm19).
+val B_BASE:    u32 = 0x14000000;
+val BCOND:     u32 = 0x54000000;
+val CBNZ_X:    u32 = 0xB5000000; val CBNZ_W: u32 = 0x35000000;
+# RET x30, BRK #0, NOP.
+val RET_WORD:  u32 = 0xD65F03C0;
+val BRK_BASE:  u32 = 0xD4200000;
+val NOP_WORD:  u32 = 0xD503201F;
+
+# the zero register / stack pointer encode as register 31 in the relevant fields.
+val ZR: u32 = 31;
+# the intra-procedure-call scratch registers (IP0 = X16, IP1 = X17) the encoder
+# claims for immediate materialization; both are caller-saved and never hold a live
+# value across the point the encoder uses them.
+val SCRATCH0: u32 = 16;
+val SCRATCH1: u32 = 17;
+
+# the largest frame the pre-index STP can allocate in one instruction: the scaled
+# 7-bit signed immediate spans -64..63 eightbytes, so -512..504 bytes; the negative
+# pre-index offset is `-total`, bounded below by -512, i.e. total <= 504.
+val MAX_PREINDEX_FRAME: u32 = 504;
+
+# A64 condition codes (bits[3:0] of a conditional form). the CSET / B.cond
+# encodings read these directly; `pack_cset` writes the inverted condition.
+val CC_EQ: u32 = 0;
+val CC_NE: u32 = 1;
+val CC_CC: u32 = 3;
+val CC_LS: u32 = 9;
+val CC_LT: u32 = 11;
+val CC_LE: u32 = 13;
+
+# ---- bitfield packers (pure: each returns one A64 word) ----
+
+# pack_alu3: a three-register data-processing word — Rm[20:16], Rn[9:5], Rd[4:0]
+# OR-ed into `base`. used for the register ALU forms (ADD/SUB/AND/ORR/EOR), the
+# register shifts (LSLV/LSRV/ASRV), MUL (whose base bakes the XZR accumulator),
+# and the NEG/MVN aliases (whose Rn is XZR).
+fun pack_alu3(base: u32, rd: u32, rn: u32, rm: u32) u32 {
+    ret base | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F);
+}
+
+# pack_addsub_imm: an ADD/SUB immediate word — `sh`[22], imm12[21:10], Rn[9:5],
+# Rd[4:0]. `sh` selects the optional left-shift-by-12 of the 12-bit immediate.
+fun pack_addsub_imm(base: u32, rd: u32, rn: u32, imm12: u32, sh: u32) u32 {
+    ret base | ((sh & 0x1) << 22) | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F);
+}
+
+# pack_bitfield: a bitfield-move word — immr[21:16], imms[15:10], Rn[9:5], Rd[4:0].
+# used for the immediate shift aliases (UBFM for LSL/LSR, SBFM for ASR).
+fun pack_bitfield(base: u32, rd: u32, rn: u32, immr: u32, imms: u32) u32 {
+    ret base | ((immr & 0x3F) << 16) | ((imms & 0x3F) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F);
+}
+
+# pack_movewide: a move-wide word — hw[22:21], imm16[20:5], Rd[4:0]. `hw` is the
+# 16-bit shift group (0..3 selecting lsl #0/16/32/48).
+fun pack_movewide(base: u32, rd: u32, hw: u32, imm16: u32) u32 {
+    ret base | ((hw & 0x3) << 21) | ((imm16 & 0xFFFF) << 5) | (rd & 0x1F);
+}
+
+# pack_cmp_reg: a SUBS XZR, Rn, Rm word (the register CMP) — Rm[20:16], Rn[9:5],
+# Rd = XZR.
+fun pack_cmp_reg(base: u32, rn: u32, rm: u32) u32 {
+    ret base | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | ZR;
+}
+
+# pack_cmp_imm: a SUBS XZR, Rn, #imm12 word (the immediate CMP) — imm12[21:10],
+# Rn[9:5], Rd = XZR.
+fun pack_cmp_imm(base: u32, rn: u32, imm12: u32) u32 {
+    ret base | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | ZR;
+}
+
+# pack_cset: a CSINC Rd, XZR, XZR, invert(cc) word — the CSET alias. `cc` is the
+# condition the boolean captures; CSET encodes its inverse (`cc ^ 1`) in the
+# cond[15:12] field, with both sources held at XZR.
+fun pack_cset(base: u32, rd: u32, cc: u32) u32 {
+    val inv: u32 = cc ^ 1;
+    ret base | (ZR << 16) | ((inv & 0xF) << 12) | (ZR << 5) | (rd & 0x1F);
+}
+
+# pack_ldstp: a load/store-pair word — imm7[21:15] (the scaled, signed offset),
+# Rt2[14:10], Rn[9:5], Rt[4:0]. used for the FP/LR frame record (pre/post-index
+# bases) and callee-saved register pairs (signed-offset bases).
+fun pack_ldstp(base: u32, rt: u32, rt2: u32, rn: u32, imm7: u32) u32 {
+    ret base | ((imm7 & 0x7F) << 15) | ((rt2 & 0x1F) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F);
+}
+
+# pack_ldst: a scaled unsigned-offset load/store word — imm12[21:10] (the byte
+# offset divided by the access size), Rn[9:5], Rt[4:0]. used to spill a trailing
+# odd callee-saved register the pair forms cannot cover.
+fun pack_ldst(base: u32, rt: u32, rn: u32, imm12: u32) u32 {
+    ret base | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F);
+}
+
+# pack_cbnz: a compare-and-branch word with a zero imm19 placeholder — Rt[4:0].
+# pass 2 inserts the resolved imm19 displacement.
+fun pack_cbnz(base: u32, rt: u32) u32 {
+    ret base | (rt & 0x1F);
+}
+
+# ---- low-level emit / patch helpers ----
+
+# emit_word: append one 32-bit A64 instruction word to the text sink (little-endian).
+fun emit_word(st: *EncodeState, word: u32) {
+    emit_u32(?st.buf, word);
+}
+
+# read_word: read the 32-bit little-endian word at `pos` in the text sink.
+fun read_word(buf: *ByteBuf, pos: usize) u32 {
+    ret buf.data[pos]::u32 |
+        (buf.data[pos + 1]::u32 << 8) |
+        (buf.data[pos + 2]::u32 << 16) |
+        (buf.data[pos + 3]::u32 << 24);
+}
+
+# write_word: overwrite the 32-bit little-endian word at `pos` in the text sink.
+fun write_word(buf: *ByteBuf, pos: usize, word: u32) {
+    buf.data[pos]     = (word & 0xFF)::u8;
+    buf.data[pos + 1] = ((word >> 8) & 0xFF)::u8;
+    buf.data[pos + 2] = ((word >> 16) & 0xFF)::u8;
+    buf.data[pos + 3] = ((word >> 24) & 0xFF)::u8;
+}
+
+# sel: choose the 64-bit or 32-bit base word for an operation width.
+fun sel(use64: bool, base_x: u32, base_w: u32) u32 {
+    if (use64) { ret base_x; }
+    ret base_w;
+}
+
+# is64: true when an operation width selects the 64-bit (X-register, `sf`=1) form.
+# a width of 0 (a pseudo with no natural width) falls back to the machine word.
+fun is64(width: u8) bool {
+    if (width == 0) { ret true; }
+    ret width >= 8;
+}
+
+# emit_movewide_seq: materialize `value` into GP register index `rd` with a MOVZ
+# (the first non-zero 16-bit chunk) followed by a MOVK per remaining non-zero
+# chunk — up to four for a 64-bit value, two for a 32-bit one. a zero value emits
+# a single `MOVZ rd, #0`. always produces the exact bit pattern (no MOVN
+# optimization), so an out-of-range immediate legalizes correctly into a scratch.
+fun emit_movewide_seq(st: *EncodeState, rd: u32, value: u64, use64: bool) {
+    val base_z: u32 = sel(use64, MOVZ_X, MOVZ_W);
+    val base_k: u32 = sel(use64, MOVK_X, MOVK_W);
+    var chunks: u32 = 2;
+    if (use64) { chunks = 4; }
+    var v: u64 = value;
+    if (!use64) { v = value & 0xFFFFFFFF; }
+
+    if (v == 0) {
+        emit_word(st, pack_movewide(base_z, rd, 0, 0));
+        ret;
+    }
+
+    var first: bool = true;
+    var i: u32 = 0;
+    for (i < chunks) {
+        val chunk: u32 = ((v >> (16::u64 * i::u64)) & 0xFFFF)::u32;
+        if (chunk != 0) {
+            if (first) {
+                emit_word(st, pack_movewide(base_z, rd, i, chunk));
+                first = false;
+            } or {
+                emit_word(st, pack_movewide(base_k, rd, i, chunk));
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# ---- operand resolution ----
+
+# req_gpr: the GP register index a post-regalloc operand names. only a physical
+# register survives to encode; a surviving virtual register is a register-
+# allocation bug, and a frame-slot / memory operand is deferred to Phase 3. both
+# are rejected loudly rather than mis-encoded.
+fun req_gpr(op: *mir.MirOperand) Result[i32, str] {
+    if (op.kind == mir.MIR_OP_PREG) {
+        ret ok[i32, str](isa.regid_index(op.preg::i32));
+    }
+    if (op.kind == mir.MIR_OP_VREG) {
+        ret err[i32, str]("encode: virtual register survived register allocation");
+    }
+    if (op.kind == mir.MIR_OP_MEM) {
+        ret err[i32, str]("aarch64 frame-slot/memory operands not implemented (Phase 3)");
+    }
+    ret err[i32, str]("encode: expected a register operand");
+}
+
+# resolve_source: the GP register index a source operand contributes. a physical
+# register is used directly; an immediate is materialized into `scratch` (and that
+# index returned). every other shape is rejected through `req_gpr`.
+fun resolve_source(st: *EncodeState, op: *mir.MirOperand, scratch: u32, use64: bool) Result[i32, str] {
+    if (op.kind == mir.MIR_OP_IMM) {
+        emit_movewide_seq(st, scratch, op.imm::u64, use64);
+        ret ok[i32, str](scratch::i32);
+    }
+    ret req_gpr(op);
+}
+
+# ---- per-opcode encoders ----
+
+# encode_alu3: a three-address integer ALU op `op Rd, Rn, Rm`. the right operand
+# folds into the ADD/SUB immediate form when it is a small non-negative immediate;
+# otherwise (and for the logical / multiply forms, which have no modeled immediate
+# encoding) it is materialized into the scratch register and the register form is
+# emitted. operand 0 is the destination, operand 1 the left source, operand 2 the
+# right source.
+fun encode_alu3(st: *EncodeState, mi: *mir.MirInstr, base_x: u32, base_w: u32) Result[bool, str] {
+    if (mi.operand_count < 3) { ret err[bool, str]("encode: ALU op missing operands"); }
+    val use64: bool = is64(mi.width);
+
+    val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (is_err[i32, str](rdr)) { ret err[bool, str](unwrap_err[i32, str](rdr)); }
+    val rd: u32 = unwrap_ok[i32, str](rdr)::u32;
+
+    val rnr: Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH1, use64);
+    if (is_err[i32, str](rnr)) { ret err[bool, str](unwrap_err[i32, str](rnr)); }
+    val rn: u32 = unwrap_ok[i32, str](rnr)::u32;
+
+    val rmr: Result[i32, str] = resolve_source(st, ?mi.operands[2], SCRATCH0, use64);
+    if (is_err[i32, str](rmr)) { ret err[bool, str](unwrap_err[i32, str](rmr)); }
+    val rm: u32 = unwrap_ok[i32, str](rmr)::u32;
+
+    emit_word(st, pack_alu3(sel(use64, base_x, base_w), rd, rn, rm));
+    ret ok[bool, str](true);
+}
+
+# encode_addsub: ADD / SUB, taking the immediate form for a non-negative immediate
+# in imm12 (or imm12<<12) range and falling back to the register form (operand
+# materialized into the scratch) otherwise. mirrors `encode_alu3` for the register
+# case but reaches the dedicated immediate encoding the ALU bases cannot.
+fun encode_addsub(st: *EncodeState, mi: *mir.MirInstr, is_sub: bool) Result[bool, str] {
+    if (mi.operand_count < 3) { ret err[bool, str]("encode: add/sub missing operands"); }
+    val use64: bool = is64(mi.width);
+
+    val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (is_err[i32, str](rdr)) { ret err[bool, str](unwrap_err[i32, str](rdr)); }
+    val rd: u32 = unwrap_ok[i32, str](rdr)::u32;
+
+    val rnr: Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH1, use64);
+    if (is_err[i32, str](rnr)) { ret err[bool, str](unwrap_err[i32, str](rnr)); }
+    val rn: u32 = unwrap_ok[i32, str](rnr)::u32;
+
+    val rhs: *mir.MirOperand = ?mi.operands[2];
+    if (rhs.kind == mir.MIR_OP_IMM) {
+        val v: i64 = rhs.imm;
+        if (v >= 0 && v <= 4095) {
+            var base_i: u32 = sel(use64, ADDI_X, ADDI_W);
+            if (is_sub) { base_i = sel(use64, SUBI_X, SUBI_W); }
+            emit_word(st, pack_addsub_imm(base_i, rd, rn, v::u32, 0));
+            ret ok[bool, str](true);
+        }
+        if (v > 0 && (v & 0xFFF) == 0 && (v >> 12) <= 4095) {
+            var base_i: u32 = sel(use64, ADDI_X, ADDI_W);
+            if (is_sub) { base_i = sel(use64, SUBI_X, SUBI_W); }
+            emit_word(st, pack_addsub_imm(base_i, rd, rn, (v >> 12)::u32, 1));
+            ret ok[bool, str](true);
+        }
+    }
+
+    val rmr: Result[i32, str] = resolve_source(st, rhs, SCRATCH0, use64);
+    if (is_err[i32, str](rmr)) { ret err[bool, str](unwrap_err[i32, str](rmr)); }
+    val rm: u32 = unwrap_ok[i32, str](rmr)::u32;
+    var base_r: u32 = sel(use64, ADD_X, ADD_W);
+    if (is_sub) { base_r = sel(use64, SUB_X, SUB_W); }
+    emit_word(st, pack_alu3(base_r, rd, rn, rm));
+    ret ok[bool, str](true);
+}
+
+# encode_shift: a left / logical-right / arithmetic-right shift. an immediate count
+# emits the UBFM / SBFM bitfield alias (the LSL immediate maps to immr=(width-sh),
+# imms=(width-1-sh); LSR / ASR map to immr=sh, imms=width-1); a register count
+# emits the register-variable form (LSLV / LSRV / ASRV).
+fun encode_shift(st: *EncodeState, mi: *mir.MirInstr, kind: u32) Result[bool, str] {
+    if (mi.operand_count < 3) { ret err[bool, str]("encode: shift missing operands"); }
+    val use64: bool = is64(mi.width);
+
+    val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (is_err[i32, str](rdr)) { ret err[bool, str](unwrap_err[i32, str](rdr)); }
+    val rd: u32 = unwrap_ok[i32, str](rdr)::u32;
+
+    val rnr: Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH1, use64);
+    if (is_err[i32, str](rnr)) { ret err[bool, str](unwrap_err[i32, str](rnr)); }
+    val rn: u32 = unwrap_ok[i32, str](rnr)::u32;
+
+    val cnt: *mir.MirOperand = ?mi.operands[2];
+    if (cnt.kind == mir.MIR_OP_IMM) {
+        var width_bits: u32 = 32;
+        if (use64) { width_bits = 64; }
+        val sh: u32 = cnt.imm::u32 & (width_bits - 1);
+        if (kind == arm64.LSL::u32) {
+            val immr: u32 = (width_bits - sh) & (width_bits - 1);
+            val imms: u32 = (width_bits - 1) - sh;
+            emit_word(st, pack_bitfield(sel(use64, UBFM_X, UBFM_W), rd, rn, immr, imms));
+            ret ok[bool, str](true);
+        }
+        if (kind == arm64.LSR::u32) {
+            emit_word(st, pack_bitfield(sel(use64, UBFM_X, UBFM_W), rd, rn, sh, width_bits - 1));
+            ret ok[bool, str](true);
+        }
+        emit_word(st, pack_bitfield(sel(use64, SBFM_X, SBFM_W), rd, rn, sh, width_bits - 1));
+        ret ok[bool, str](true);
+    }
+
+    val rmr: Result[i32, str] = req_gpr(cnt);
+    if (is_err[i32, str](rmr)) { ret err[bool, str](unwrap_err[i32, str](rmr)); }
+    val rm: u32 = unwrap_ok[i32, str](rmr)::u32;
+    var base_x: u32 = LSLV_X; var base_w: u32 = LSLV_W;
+    if (kind == arm64.LSR::u32) { base_x = LSRV_X; base_w = LSRV_W; }
+    or (kind == arm64.ASR::u32) { base_x = ASRV_X; base_w = ASRV_W; }
+    emit_word(st, pack_alu3(sel(use64, base_x, base_w), rd, rn, rm));
+    ret ok[bool, str](true);
+}
+
+# encode_neg_mvn: NEG (`sub Rd, XZR, Rm`) or MVN (`orn Rd, XZR, Rm`), both reading
+# the `[dst, src]` operand pair and supplying XZR as Rn from the encoding.
+fun encode_neg_mvn(st: *EncodeState, mi: *mir.MirInstr, base_x: u32, base_w: u32) Result[bool, str] {
+    if (mi.operand_count < 2) { ret err[bool, str]("encode: neg/not missing operands"); }
+    val use64: bool = is64(mi.width);
+
+    val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (is_err[i32, str](rdr)) { ret err[bool, str](unwrap_err[i32, str](rdr)); }
+    val rd: u32 = unwrap_ok[i32, str](rdr)::u32;
+
+    val rmr: Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH0, use64);
+    if (is_err[i32, str](rmr)) { ret err[bool, str](unwrap_err[i32, str](rmr)); }
+    val rm: u32 = unwrap_ok[i32, str](rmr)::u32;
+
+    emit_word(st, pack_alu3(sel(use64, base_x, base_w), rd, ZR, rm));
+    ret ok[bool, str](true);
+}
+
+# encode_mov: a register move (`orr Rd, XZR, Rm`) or, for an immediate source, a
+# MOVZ/MOVK materialization directly into the destination.
+fun encode_mov(st: *EncodeState, mi: *mir.MirInstr) Result[bool, str] {
+    if (mi.operand_count < 2) { ret err[bool, str]("encode: mov missing operands"); }
+    val use64: bool = is64(mi.width);
+
+    val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (is_err[i32, str](rdr)) { ret err[bool, str](unwrap_err[i32, str](rdr)); }
+    val rd: u32 = unwrap_ok[i32, str](rdr)::u32;
+
+    val src: *mir.MirOperand = ?mi.operands[1];
+    if (src.kind == mir.MIR_OP_IMM) {
+        emit_movewide_seq(st, rd, src.imm::u64, use64);
+        ret ok[bool, str](true);
+    }
+    val rmr: Result[i32, str] = req_gpr(src);
+    if (is_err[i32, str](rmr)) { ret err[bool, str](unwrap_err[i32, str](rmr)); }
+    val rm: u32 = unwrap_ok[i32, str](rmr)::u32;
+    emit_word(st, pack_alu3(sel(use64, ORR_X, ORR_W), rd, ZR, rm));
+    ret ok[bool, str](true);
+}
+
+# cmp_cond: the A64 condition a surviving comparison sentinel captures. only the
+# EQ / NE / LT / LE forms exist in the generic opcode space (the lowerer
+# canonicalizes GT/GE by swapping operands); signedness selects the signed
+# (LT/LE) versus unsigned (CC/LS) condition.
+fun cmp_cond(op: mir.MirOpcode) u32 {
+    if (op == mir.MIR_SEL_CMP_EQ)   { ret CC_EQ; }
+    if (op == mir.MIR_SEL_CMP_NE)   { ret CC_NE; }
+    if (op == mir.MIR_SEL_CMP_LT_S) { ret CC_LT; }
+    if (op == mir.MIR_SEL_CMP_LT_U) { ret CC_CC; }
+    if (op == mir.MIR_SEL_CMP_LE_S) { ret CC_LE; }
+    ret CC_LS;
+}
+
+# is_mir_compare: true when a post-isel opcode is a surviving generic comparison
+# sentinel — the encoder materializes the SUBS XZR + CSET byte sequence from it.
+fun is_mir_compare(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_SEL_CMP_EQ || op == mir.MIR_SEL_CMP_NE ||
+        op == mir.MIR_SEL_CMP_LT_S || op == mir.MIR_SEL_CMP_LT_U ||
+        op == mir.MIR_SEL_CMP_LE_S || op == mir.MIR_SEL_CMP_LE_U;
+}
+
+# encode_compare: materialize a surviving comparison `[dst, lhs, rhs]` into
+# `SUBS XZR, lhs, rhs` (the flag-setting compare; an immediate right operand folds
+# into the immediate form) followed by `CSET dst, cc` (capture the condition into a
+# zero-extended boolean). the comparison runs at the operand width; the boolean is
+# captured in the 32-bit CSET form (a 0/1 value the W write zero-extends to 64).
+fun encode_compare(st: *EncodeState, mi: *mir.MirInstr) Result[bool, str] {
+    if (mi.operand_count < 3) { ret err[bool, str]("encode: compare missing operands"); }
+    val use64: bool = is64(mi.width);
+
+    val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (is_err[i32, str](rdr)) { ret err[bool, str](unwrap_err[i32, str](rdr)); }
+    val rd: u32 = unwrap_ok[i32, str](rdr)::u32;
+
+    val rnr: Result[i32, str] = req_gpr(?mi.operands[1]);
+    if (is_err[i32, str](rnr)) { ret err[bool, str](unwrap_err[i32, str](rnr)); }
+    val rn: u32 = unwrap_ok[i32, str](rnr)::u32;
+
+    val rhs: *mir.MirOperand = ?mi.operands[2];
+    if (rhs.kind == mir.MIR_OP_IMM && rhs.imm >= 0 && rhs.imm <= 4095) {
+        emit_word(st, pack_cmp_imm(sel(use64, SUBS_IMM_X, SUBS_IMM_W), rn, rhs.imm::u32));
+    } or {
+        val rmr: Result[i32, str] = resolve_source(st, rhs, SCRATCH0, use64);
+        if (is_err[i32, str](rmr)) { ret err[bool, str](unwrap_err[i32, str](rmr)); }
+        val rm: u32 = unwrap_ok[i32, str](rmr)::u32;
+        emit_word(st, pack_cmp_reg(sel(use64, SUBS_REG_X, SUBS_REG_W), rn, rm));
+    }
+
+    emit_word(st, pack_cset(CSINC_W, rd, cmp_cond(mi.opcode)));
+    ret ok[bool, str](true);
+}
+
+# encode_branch: an unconditional branch to a block. emits the B word with a zero
+# imm26 placeholder and records a fixup (patch site = the instruction word start,
+# per `arm64_reloc_offset`) for pass 2 to fill with the resolved displacement.
+fun encode_branch(st: *EncodeState, fn_base: u32, mi: *mir.MirInstr) Result[bool, str] {
+    if (mi.operand_count < 1 || mi.operands[0].kind != mir.MIR_OP_BLOCK) {
+        ret err[bool, str]("encode: branch target is not a block");
+    }
+    val target_block: u32 = mi.operands[0].imm::u32;
+    val patch_pos: u32 = st.buf.len::u32;
+    emit_word(st, B_BASE);
+    val next_ip: u32 = st.buf.len::u32;
+    ret push_fixup(st, patch_pos, next_ip, target_block, fn_base);
+}
+
+# encode_cbr: a conditional branch `[cond, then_block, else_block]` materialized as
+# `CBNZ cond, then` (taken when the condition is non-zero) ; `B else` (the
+# fall-through edge, always emitted). each branch records a fixup against its
+# target block; pass 2 inserts the imm19 / imm26 displacement once both block
+# offsets are known.
+fun encode_cbr(st: *EncodeState, fn_base: u32, mi: *mir.MirInstr) Result[bool, str] {
+    if (mi.operand_count < 3) { ret err[bool, str]("encode: conditional branch missing operands"); }
+    if (mi.operands[1].kind != mir.MIR_OP_BLOCK || mi.operands[2].kind != mir.MIR_OP_BLOCK) {
+        ret err[bool, str]("encode: conditional branch target is not a block");
+    }
+    val then_block: u32 = mi.operands[1].imm::u32;
+    val else_block: u32 = mi.operands[2].imm::u32;
+    val use64: bool = is64(mi.width);
+
+    val rcr: Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (is_err[i32, str](rcr)) { ret err[bool, str](unwrap_err[i32, str](rcr)); }
+    val cond: u32 = unwrap_ok[i32, str](rcr)::u32;
+
+    val cbnz_pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_cbnz(sel(use64, CBNZ_X, CBNZ_W), cond));
+    val cbnz_next: u32 = st.buf.len::u32;
+    val f1: Result[bool, str] = push_fixup(st, cbnz_pos, cbnz_next, then_block, fn_base);
+    if (is_err[bool, str](f1)) { ret f1; }
+
+    val b_pos: u32 = st.buf.len::u32;
+    emit_word(st, B_BASE);
+    val b_next: u32 = st.buf.len::u32;
+    ret push_fixup(st, b_pos, b_next, else_block, fn_base);
+}
+
+# ---- frame layout, prologue, epilogue ----
+
+# popcount32: the number of set bits in a 32-bit mask.
+fun popcount32(m: u32) u32 {
+    var n: u32 = 0;
+    var x: u32 = m;
+    for (x != 0) {
+        n = n + (x & 1);
+        x = x >> 1;
+    }
+    ret n;
+}
+
+# align16: round a byte count up to a 16-byte boundary (the AAPCS64 stack alignment).
+fun align16(n: u32) u32 {
+    ret (n + 15) & ~15::u32;
+}
+
+# frame_total: the 16-byte-aligned byte count the prologue reserves below the
+# caller's SP — the FP/LR frame record (16 bytes) plus the callee-saved GP/FP save
+# area, the local frame, and the outgoing-argument region, read from the SAME
+# shared frame facts the x86-64 encoder reads. SP stays 16-byte aligned.
+fun frame_total(f: *mir.MirFunction) u32 {
+    val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
+    val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 16;
+    ret align16(16 + gp_bytes + fp_bytes + f.frame.size + f.frame.outgoing_size);
+}
+
+# emit_prologue: the standard AArch64 leaf prologue — `STP X29, X30, [SP, #-total]!`
+# (save the FP/LR frame record and allocate the whole frame) then `MOV X29, SP`
+# (an `add x29, sp, #0`). callee-saved GP registers are then saved in STP pairs
+# (a trailing odd one with STR) just above the frame record. SP stays 16-aligned.
+fun emit_prologue(st: *EncodeState, f: *mir.MirFunction, total: u32) {
+    val neg_off: u32 = (0::u32 - (total / 8)) & 0x7F;
+    emit_word(st, pack_ldstp(STP_PRE_X, 29, 30, ZR, neg_off));
+    emit_word(st, pack_addsub_imm(ADDI_X, 29, ZR, 0, 0));
+    save_callee_gp(st, f, true);
+}
+
+# emit_epilogue: the standard AArch64 leaf epilogue — restore the callee-saved GP
+# registers, then `LDP X29, X30, [SP], #total` (reload the FP/LR frame record and
+# deallocate the whole frame). the RET that follows returns through X30.
+fun emit_epilogue(st: *EncodeState, f: *mir.MirFunction, total: u32) {
+    save_callee_gp(st, f, false);
+    val pos_off: u32 = (total / 8) & 0x7F;
+    emit_word(st, pack_ldstp(LDP_POST_X, 29, 30, ZR, pos_off));
+}
+
+# save_callee_gp: save (or restore) the callee-saved GP registers `callee_mask`
+# selects, in ascending register order, in STP pairs at ascending 16-aligned
+# offsets above the FP/LR frame record (`[sp, #16]`, `[sp, #32]`, …). a trailing
+# odd register is handled with a single STR/LDR. SP-relative and self-contained,
+# so it is correct regardless of where X29 points.
+fun save_callee_gp(st: *EncodeState, f: *mir.MirFunction, store: bool) {
+    var regs: [32]u32;
+    var n: u32 = 0;
+    var r: u32 = 0;
+    for (r < 31) {
+        if ((f.callee_mask & (1::u32 << r)) != 0) { regs[n] = r; n = n + 1; }
+        r = r + 1;
+    }
+
+    var off: u32 = 16;
+    var i: u32 = 0;
+    for (i + 1 < n) {
+        val imm7: u32 = (off / 8) & 0x7F;
+        if (store) { emit_word(st, pack_ldstp(STP_OFF_X, regs[i], regs[i + 1], ZR, imm7)); }
+        or         { emit_word(st, pack_ldstp(LDP_OFF_X, regs[i], regs[i + 1], ZR, imm7)); }
+        off = off + 16;
+        i = i + 2;
+    }
+    if (i < n) {
+        val imm12: u32 = off / 8;
+        if (store) { emit_word(st, pack_ldst(STR_OFF_X, regs[i], ZR, imm12)); }
+        or         { emit_word(st, pack_ldst(LDR_OFF_X, regs[i], ZR, imm12)); }
+    }
+}
+
+# ---- per-instruction dispatch ----
+
+# encode_mir_instr: translate one post-regalloc MIR instruction into A64 bytes,
+# recording any intra-module branch fixup. the regalloc parallel-copy / liveness
+# pseudos emit nothing; the surviving comparison and conditional-branch sentinels
+# expand into their byte sequences; the float / conversion families, calls, inline
+# asm, and varargs are rejected loudly (a leaf integer function never reaches them).
+fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir.MirInstr) Result[bool, str] {
+    val op: u16 = mi.opcode::u16;
+
+    # pseudo-opcodes the regalloc phase leaves behind emit no bytes.
+    if (op == isa.ISA_PCOPY || op == isa.ISA_PCOPY_FENCE ||
+        op == isa.ISA_USE || op == isa.ISA_LABEL) {
+        ret ok[bool, str](true);
+    }
+    if (mi.opcode == mir.MIR_CALL_RES || mi.opcode == mir.MIR_ARG) {
+        ret ok[bool, str](true);
+    }
+    if (mi.opcode == mir.MIR_PHI) {
+        ret err[bool, str]("internal compiler error: phi survived register allocation");
+    }
+
+    # the surviving comparison / conditional-branch sentinels expand into their
+    # multi-instruction byte sequences.
+    if (is_mir_compare(mi.opcode)) { ret encode_compare(st, mi); }
+    if (mi.opcode == mir.MIR_SEL_CBR) { ret encode_cbr(st, fn_base, mi); }
+
+    # deferred families: a leaf integer function never emits these, so they are
+    # rejected loudly rather than mis-encoded.
+    if (mi.opcode == mir.MIR_VA_FP_SAVE) {
+        ret err[bool, str]("aarch64 varargs not implemented (Phase 4)");
+    }
+    if (mi.opcode == mir.MIR_FADD || mi.opcode == mir.MIR_FSUB ||
+        mi.opcode == mir.MIR_FMUL || mi.opcode == mir.MIR_FDIV ||
+        mi.opcode == mir.MIR_FCMP || mi.opcode == mir.MIR_FNEG) {
+        ret err[bool, str]("aarch64 floating-point ops not implemented (Phase 3)");
+    }
+    if (mi.opcode == mir.MIR_TRUNC || mi.opcode == mir.MIR_SEXT ||
+        mi.opcode == mir.MIR_ZEXT || mi.opcode == mir.MIR_BITCAST ||
+        mi.opcode == mir.MIR_FP_TRUNC || mi.opcode == mir.MIR_FP_EXT ||
+        mi.opcode == mir.MIR_FP_TO_SI || mi.opcode == mir.MIR_FP_TO_UI ||
+        mi.opcode == mir.MIR_SI_TO_FP || mi.opcode == mir.MIR_UI_TO_FP) {
+        ret err[bool, str]("aarch64 conversions not implemented (Phase 3)");
+    }
+    if (mi.opcode == mir.MIR_CALL) {
+        ret err[bool, str]("aarch64 calls not implemented (Phase 3)");
+    }
+
+    # concrete A64 opcodes.
+    if (op == arm64.ADD::u16) { ret encode_addsub(st, mi, false); }
+    if (op == arm64.SUB::u16) { ret encode_addsub(st, mi, true); }
+    if (op == arm64.MUL::u16) { ret encode_alu3(st, mi, MUL_X, MUL_W); }
+    if (op == arm64.AND::u16) { ret encode_alu3(st, mi, AND_X, AND_W); }
+    if (op == arm64.ORR::u16) { ret encode_alu3(st, mi, ORR_X, ORR_W); }
+    if (op == arm64.EOR::u16) { ret encode_alu3(st, mi, EOR_X, EOR_W); }
+    if (op == arm64.LSL::u16) { ret encode_shift(st, mi, arm64.LSL::u32); }
+    if (op == arm64.LSR::u16) { ret encode_shift(st, mi, arm64.LSR::u32); }
+    if (op == arm64.ASR::u16) { ret encode_shift(st, mi, arm64.ASR::u32); }
+    if (op == arm64.NEG::u16) { ret encode_neg_mvn(st, mi, SUB_X, SUB_W); }
+    if (op == arm64.MVN::u16) { ret encode_neg_mvn(st, mi, ORN_X, ORN_W); }
+    if (op == arm64.MOV::u16) { ret encode_mov(st, mi); }
+    if (op == arm64.B::u16)   { ret encode_branch(st, fn_base, mi); }
+    if (op == arm64.RET::u16) { emit_word(st, RET_WORD); ret ok[bool, str](true); }
+    if (op == arm64.BRK::u16) { emit_word(st, BRK_BASE); ret ok[bool, str](true); }
+    if (op == arm64.NOP::u16) { emit_word(st, NOP_WORD); ret ok[bool, str](true); }
+
+    ret err[bool, str]("internal compiler error: unhandled opcode in arm64 encode");
+}
+
+# encode_function_arm64: the per-function encode hook (pass 1). marks the function
+# entry symbol, emits the prologue, then each block — emitting the epilogue before
+# every RET — recording each block's `.text` offset for branch patching. extern /
+# body-less functions contribute no text. a frame beyond the leaf-supported shape
+# (callee-saved FP registers, or a frame larger than the pre-index STP range) is
+# rejected loudly rather than mis-encoded.
+fun encode_function_arm64(st: *EncodeState, f: *mir.MirFunction) Result[bool, str] {
+    val fn_base: u32 = st.buf.len::u32;
+    if (f.block_count == 0) { ret ok[bool, str](true); }
+
+    val ms: Result[bool, str] = push_symbol(st, f.name, fn_base, of.SYM_OBJ_FLAG_FUNCTION);
+    if (is_err[bool, str](ms)) { ret ms; }
+
+    if (f.callee_mask_fp != 0) {
+        ret err[bool, str]("aarch64 callee-saved FP registers not implemented (Phase 3)");
+    }
+    val total: u32 = frame_total(f);
+    if (total > MAX_PREINDEX_FRAME) {
+        ret err[bool, str]("aarch64 frame larger than the pre-index STP range not implemented (Phase 3)");
+    }
+
+    emit_prologue(st, f, total);
+
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        val rb: Result[bool, str] = push_block(st, fn_base, blk.id, st.buf.len::u32);
+        if (is_err[bool, str](rb)) { ret rb; }
+
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode::u16 == arm64.RET::u16) {
+                emit_epilogue(st, f, total);
+            }
+            val ei: Result[bool, str] = encode_mir_instr(st, f, fn_base, mi);
+            if (is_err[bool, str](ei)) { ret ei; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# patch_branch_arm64: the per-branch patch hook (pass 2). reads the placeholder
+# instruction word at the fixup's patch site, inserts the resolved displacement
+# (instruction-relative: `target_off - patch_pos`, with no x86-64 next-instruction
+# bias), and writes the word back. an unconditional B takes an imm26[25:0]; a
+# B.cond / CBZ / CBNZ takes an imm19[23:5] — distinguished by the word's top bits
+# (a read-modify-write bitfield insert, not a byte overwrite).
+fun patch_branch_arm64(st: *EncodeState, fx: *BranchFixup, target_off: u32) Result[bool, str] {
+    val pos: usize = fx.patch_pos::usize;
+    if (pos + 4 > st.buf.len) {
+        ret err[bool, str]("encode: branch fixup site is outside the text buffer");
+    }
+    val word: u32 = read_word(?st.buf, pos);
+    val disp: u32 = target_off - fx.patch_pos;
+
+    var patched: u32 = 0;
+    if ((word & 0xFC000000) == B_BASE) {
+        patched = (word & 0xFC000000) | ((disp & 0x0FFFFFFC) >> 2);
+    } or {
+        patched = (word & 0xFF00001F) | (((disp >> 2) & 0x7FFFF) << 5);
+    }
+    write_word(?st.buf, pos, patched);
+    ret ok[bool, str](true);
+}
+
+# arm64_reloc_offset: the byte offset, within an encoded instruction, where a
+# relocation field begins — always the instruction-word start on A64 (the linker
+# packers read the access kind from the relocation, not an instruction decode). a
+# leaf integer function emits no symbol references, so no relocation is recorded in
+# this phase; this is the patch-site convention the call/global lowering of Phase 3
+# will record against.
+fun arm64_reloc_offset(inst_start: u32) u32 {
+    ret inst_start;
+}
+
+# encode_arm64: the AArch64 ISA's `encode` entry point — a thin wrapper that
+# supplies the two A64 `enc.EncodeHooks` and runs the shared two-pass driver. the
+# ISA-general driving lives in `enc.encode_driver`; this backend contributes only
+# its per-function encode (`encode_function_arm64`) and per-branch patch
+# (`patch_branch_arm64`). the erased vtable pointer is cast back to this exact
+# signature, so it must not change.
 # ---
-# alloc: allocator (unused until encoding is implemented)
-# tgt:   resolved compilation target (must be AArch64)
-# m:     the fully-resolved MIR module
-# ret:   an error reporting that AArch64 encoding is unimplemented
+# alloc: allocator backing the encoder output's owned arrays
+# tgt:   resolved target; must be AArch64
+# m:     the fully-resolved MIR module (post isel / regalloc / frame)
+# ret:   the populated enc.EncoderOutput (owned arrays), or an error string
 pub fun encode_arm64(alloc: *Allocator, tgt: *target.Target, m: *mir.MirModule) Result[enc.EncoderOutput, str] {
-    ret err[enc.EncoderOutput, str]("aarch64 encode not implemented");
+    var hooks: EncodeHooks;
+    hooks.encode_function = encode_function_arm64;
+    hooks.patch_branch    = patch_branch_arm64;
+    ret encode_driver(alloc, tgt, m, ?hooks);
+}
+
+# ---- in-source encode tests (byte-exact vs llvm-mc goldens) ----
+
+# tbuf: a fresh page-backed EncodeState carrying only a byte sink, for exercising
+# the emit-level helpers (prologue / epilogue / branch patch) directly.
+fun tbuf(st: *EncodeState, alloc: *Allocator) {
+    page.make(alloc);
+    st.buf = buf_init(alloc);
+}
+
+test "arm64.encode: three-address ALU register forms match llvm-mc" {
+    var bad: i32 = 0;
+    # add x0, x1, x2 ; add w0, w1, w2
+    if (pack_alu3(ADD_X, 0, 1, 2) != 0x8B020020) { bad = 1; }
+    if (pack_alu3(ADD_W, 0, 1, 2) != 0x0B020020) { bad = 1; }
+    # sub x/w
+    if (pack_alu3(SUB_X, 0, 1, 2) != 0xCB020020) { bad = 1; }
+    if (pack_alu3(SUB_W, 0, 1, 2) != 0x4B020020) { bad = 1; }
+    # mul x/w (madd ...,xzr)
+    if (pack_alu3(MUL_X, 0, 1, 2) != 0x9B027C20) { bad = 1; }
+    if (pack_alu3(MUL_W, 0, 1, 2) != 0x1B027C20) { bad = 1; }
+    # and / orr / eor x
+    if (pack_alu3(AND_X, 0, 1, 2) != 0x8A020020) { bad = 1; }
+    if (pack_alu3(ORR_X, 0, 1, 2) != 0xAA020020) { bad = 1; }
+    if (pack_alu3(EOR_X, 0, 1, 2) != 0xCA020020) { bad = 1; }
+    if (pack_alu3(AND_W, 0, 1, 2) != 0x0A020020) { bad = 1; }
+    if (pack_alu3(ORR_W, 0, 1, 2) != 0x2A020020) { bad = 1; }
+    if (pack_alu3(EOR_W, 0, 1, 2) != 0x4A020020) { bad = 1; }
+    ret bad;
+}
+
+test "arm64.encode: register shifts (LSLV/LSRV/ASRV) match llvm-mc" {
+    var bad: i32 = 0;
+    if (pack_alu3(LSLV_X, 0, 1, 2) != 0x9AC22020) { bad = 1; }
+    if (pack_alu3(LSLV_W, 0, 1, 2) != 0x1AC22020) { bad = 1; }
+    if (pack_alu3(LSRV_X, 0, 1, 2) != 0x9AC22420) { bad = 1; }
+    if (pack_alu3(LSRV_W, 0, 1, 2) != 0x1AC22420) { bad = 1; }
+    if (pack_alu3(ASRV_X, 0, 1, 2) != 0x9AC22820) { bad = 1; }
+    if (pack_alu3(ASRV_W, 0, 1, 2) != 0x1AC22820) { bad = 1; }
+    ret bad;
+}
+
+test "arm64.encode: immediate shifts (UBFM/SBFM aliases) match llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    var mi: mir.MirInstr;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(0);
+    ops[1] = mir.op_preg(1);
+    ops[2] = mir.op_imm(3);
+    mi.operands = ?ops[0];
+    mi.operand_count = 3;
+
+    # lsl x0, x1, #3 = 0xd37df020 ; lsl w0, w1, #3 = 0x531d7020
+    mi.width = 8; encode_shift(?st, ?mi, arm64.LSL::u32);
+    if (read_word(?st.buf, 0) != 0xD37DF020) { bad = 1; }
+    mi.width = 4; encode_shift(?st, ?mi, arm64.LSL::u32);
+    if (read_word(?st.buf, 4) != 0x531D7020) { bad = 1; }
+    # lsr x0, x1, #3 = 0xd343fc20 ; lsr w0, w1, #3 = 0x53037c20
+    mi.width = 8; encode_shift(?st, ?mi, arm64.LSR::u32);
+    if (read_word(?st.buf, 8) != 0xD343FC20) { bad = 1; }
+    mi.width = 4; encode_shift(?st, ?mi, arm64.LSR::u32);
+    if (read_word(?st.buf, 12) != 0x53037C20) { bad = 1; }
+    # asr x0, x1, #3 = 0x9343fc20 ; asr w0, w1, #3 = 0x13037c20
+    mi.width = 8; encode_shift(?st, ?mi, arm64.ASR::u32);
+    if (read_word(?st.buf, 16) != 0x9343FC20) { bad = 1; }
+    mi.width = 4; encode_shift(?st, ?mi, arm64.ASR::u32);
+    if (read_word(?st.buf, 20) != 0x13037C20) { bad = 1; }
+
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+test "arm64.encode: NEG/MVN/MOV register forms match llvm-mc" {
+    var bad: i32 = 0;
+    # neg x0,x1 = 0xcb0103e0 ; neg w0,w1 = 0x4b0103e0
+    if (pack_alu3(SUB_X, 0, ZR, 1) != 0xCB0103E0) { bad = 1; }
+    if (pack_alu3(SUB_W, 0, ZR, 1) != 0x4B0103E0) { bad = 1; }
+    # mvn x0,x1 = 0xaa2103e0 ; mvn w0,w1 = 0x2a2103e0
+    if (pack_alu3(ORN_X, 0, ZR, 1) != 0xAA2103E0) { bad = 1; }
+    if (pack_alu3(ORN_W, 0, ZR, 1) != 0x2A2103E0) { bad = 1; }
+    # mov x0,x1 = 0xaa0103e0 ; mov w0,w1 = 0x2a0103e0
+    if (pack_alu3(ORR_X, 0, ZR, 1) != 0xAA0103E0) { bad = 1; }
+    if (pack_alu3(ORR_W, 0, ZR, 1) != 0x2A0103E0) { bad = 1; }
+    ret bad;
+}
+
+test "arm64.encode: MOVZ/MOVK materialization matches llvm-mc" {
+    var bad: i32 = 0;
+    # movz x0, #0x1234 lsl {0,16,32,48}
+    if (pack_movewide(MOVZ_X, 0, 0, 0x1234) != 0xD2824680) { bad = 1; }
+    if (pack_movewide(MOVZ_X, 0, 1, 0x1234) != 0xD2A24680) { bad = 1; }
+    if (pack_movewide(MOVZ_X, 0, 2, 0x1234) != 0xD2C24680) { bad = 1; }
+    if (pack_movewide(MOVZ_X, 0, 3, 0x1234) != 0xD2E24680) { bad = 1; }
+    # movk x0, #0x5678 lsl {0,16}
+    if (pack_movewide(MOVK_X, 0, 0, 0x5678) != 0xF28ACF00) { bad = 1; }
+    if (pack_movewide(MOVK_X, 0, 1, 0x5678) != 0xF2AACF00) { bad = 1; }
+    # 32-bit movz/movk
+    if (pack_movewide(MOVZ_W, 0, 0, 0x1234) != 0x52824680) { bad = 1; }
+    if (pack_movewide(MOVK_W, 0, 1, 0x5678) != 0x72AACF00) { bad = 1; }
+
+    # the emitted sequence for 0x12345678 (32-bit): movz w0,#0x5678 ; movk w0,#0x1234,lsl#16
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+    emit_movewide_seq(?st, 0, 0x12345678, false);
+    if (st.buf.len != 8) { bad = 1; }
+    or {
+        if (read_word(?st.buf, 0) != pack_movewide(MOVZ_W, 0, 0, 0x5678)) { bad = 1; }
+        if (read_word(?st.buf, 4) != pack_movewide(MOVK_W, 0, 1, 0x1234)) { bad = 1; }
+    }
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+test "arm64.encode: ADD/SUB immediate forms match llvm-mc" {
+    var bad: i32 = 0;
+    # add x0,x1,#5 = 0x91001420 ; sub x0,x1,#5 = 0xd1001420
+    if (pack_addsub_imm(ADDI_X, 0, 1, 5, 0) != 0x91001420) { bad = 1; }
+    if (pack_addsub_imm(SUBI_X, 0, 1, 5, 0) != 0xD1001420) { bad = 1; }
+    # add w0,w1,#5 = 0x11001420 ; sub w0,w1,#5 = 0x51001420
+    if (pack_addsub_imm(ADDI_W, 0, 1, 5, 0) != 0x11001420) { bad = 1; }
+    if (pack_addsub_imm(SUBI_W, 0, 1, 5, 0) != 0x51001420) { bad = 1; }
+    # add x0,x1,#5,lsl#12 = 0x91401420 ; add w0,w1,#5,lsl#12 = 0x11401420
+    if (pack_addsub_imm(ADDI_X, 0, 1, 5, 1) != 0x91401420) { bad = 1; }
+    if (pack_addsub_imm(ADDI_W, 0, 1, 5, 1) != 0x11401420) { bad = 1; }
+    # add sp,sp,#16 = 0x910043ff ; sub sp,sp,#16 = 0xd10043ff ; mov x29,sp = 0x910003fd
+    if (pack_addsub_imm(ADDI_X, ZR, ZR, 16, 0) != 0x910043FF) { bad = 1; }
+    if (pack_addsub_imm(SUBI_X, ZR, ZR, 16, 0) != 0xD10043FF) { bad = 1; }
+    if (pack_addsub_imm(ADDI_X, 29, ZR, 0, 0) != 0x910003FD) { bad = 1; }
+    ret bad;
+}
+
+test "arm64.encode: CMP + CSET match llvm-mc" {
+    var bad: i32 = 0;
+    # cmp x0,x1 = 0xeb01001f ; cmp w0,w1 = 0x6b01001f ; cmp x0,#5 = 0xf100141f ; cmp w0,#5 = 0x7100141f
+    if (pack_cmp_reg(SUBS_REG_X, 0, 1) != 0xEB01001F) { bad = 1; }
+    if (pack_cmp_reg(SUBS_REG_W, 0, 1) != 0x6B01001F) { bad = 1; }
+    if (pack_cmp_imm(SUBS_IMM_X, 0, 5) != 0xF100141F) { bad = 1; }
+    if (pack_cmp_imm(SUBS_IMM_W, 0, 5) != 0x7100141F) { bad = 1; }
+    # cset w0, <cc> family
+    if (pack_cset(CSINC_W, 0, CC_EQ) != 0x1A9F17E0) { bad = 1; }  # cset w0, eq
+    if (pack_cset(CSINC_W, 0, CC_NE) != 0x1A9F07E0) { bad = 1; }  # cset w0, ne
+    if (pack_cset(CSINC_W, 0, CC_LT) != 0x1A9FA7E0) { bad = 1; }  # cset w0, lt
+    if (pack_cset(CSINC_W, 0, CC_LE) != 0x1A9FC7E0) { bad = 1; }  # cset w0, le
+    if (pack_cset(CSINC_W, 0, CC_CC) != 0x1A9F27E0) { bad = 1; }  # cset w0, cc (lo)
+    if (pack_cset(CSINC_W, 0, CC_LS) != 0x1A9F87E0) { bad = 1; }  # cset w0, ls
+    if (pack_cset(CSINC_X, 0, CC_EQ) != 0x9A9F17E0) { bad = 1; }  # cset x0, eq
+    ret bad;
+}
+
+test "arm64.encode: RET / BRK / NOP / B base match llvm-mc" {
+    var bad: i32 = 0;
+    if (RET_WORD != 0xD65F03C0) { bad = 1; }  # ret
+    if (BRK_BASE != 0xD4200000) { bad = 1; }  # brk #0
+    if (NOP_WORD != 0xD503201F) { bad = 1; }  # nop
+    if (B_BASE   != 0x14000000) { bad = 1; }  # b (imm26=0)
+    ret bad;
+}
+
+test "arm64.encode: prologue STP/MOV and epilogue LDP/RET match llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    # a leaf function: no callee saves, no locals, no outgoing -> total = 16.
+    var f: mir.MirFunction;
+    f.callee_mask = 0;
+    f.callee_mask_fp = 0;
+    f.frame.size = 0;
+    f.frame.outgoing_size = 0;
+    val total: u32 = frame_total(?f);
+    if (total != 16) { bad = 1; }
+
+    emit_prologue(?st, ?f, total);
+    # stp x29, x30, [sp, #-16]! = 0xa9bf7bfd ; mov x29, sp = 0x910003fd
+    if (read_word(?st.buf, 0) != 0xA9BF7BFD) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x910003FD) { bad = 1; }
+
+    emit_epilogue(?st, ?f, total);
+    # ldp x29, x30, [sp], #16 = 0xa8c17bfd
+    if (read_word(?st.buf, 8) != 0xA8C17BFD) { bad = 1; }
+
+    # a 32-byte frame's pre/post-index immediates: stp ...[sp,#-32]! = 0xa9be7bfd,
+    # ldp ...[sp],#32 = 0xa8c27bfd.
+    st.buf.len = 0;
+    var f2: mir.MirFunction;
+    f2.callee_mask = 0;
+    f2.callee_mask_fp = 0;
+    f2.frame.size = 8;
+    f2.frame.outgoing_size = 0;
+    val total2: u32 = frame_total(?f2);
+    if (total2 != 32) { bad = 1; }
+    emit_prologue(?st, ?f2, total2);
+    if (read_word(?st.buf, 0) != 0xA9BE7BFD) { bad = 1; }
+    emit_epilogue(?st, ?f2, total2);
+    if (read_word(?st.buf, 8) != 0xA8C27BFD) { bad = 1; }
+
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+test "arm64.encode: callee-saved STP/STR pair spills match llvm-mc" {
+    var bad: i32 = 0;
+    # stp x19,x20,[sp,#16] = 0xa90153f3 ; ldp x19,x20,[sp,#16] = 0xa94153f3
+    if (pack_ldstp(STP_OFF_X, 19, 20, ZR, 2) != 0xA90153F3) { bad = 1; }
+    if (pack_ldstp(LDP_OFF_X, 19, 20, ZR, 2) != 0xA94153F3) { bad = 1; }
+    # str x19,[sp,#16] = 0xf9000bf3 ; ldr x19,[sp,#16] = 0xf9400bf3
+    if (pack_ldst(STR_OFF_X, 19, ZR, 2) != 0xF9000BF3) { bad = 1; }
+    if (pack_ldst(LDR_OFF_X, 19, ZR, 2) != 0xF9400BF3) { bad = 1; }
+    ret bad;
+}
+
+test "arm64.encode: branch fixups insert imm26 / imm19 like llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    # lay down four placeholder words: B (off 0), B.eq (off 4), CBZ x0 (off 8),
+    # CBNZ x1 (off 12), then patch each against a known target.
+    emit_word(?st, B_BASE);                       # off 0
+    emit_word(?st, BCOND | CC_EQ);                # off 4 (b.eq)
+    emit_word(?st, pack_cbnz(0xB4000000, 0));     # off 8 (cbz x0) — same imm19 field as cbnz
+    emit_word(?st, pack_cbnz(CBNZ_X, 1));         # off 12 (cbnz x1)
+
+    var fx: BranchFixup;
+    # B at 0 -> target 8: disp 8, imm26=2 -> 0x14000002.
+    fx.patch_pos = 0; fx.next_ip = 4;
+    patch_branch_arm64(?st, ?fx, 8);
+    if (read_word(?st.buf, 0) != 0x14000002) { bad = 1; }
+    # B.eq at 4 -> target 12: disp 8, imm19=2 -> 0x54000040.
+    fx.patch_pos = 4; fx.next_ip = 8;
+    patch_branch_arm64(?st, ?fx, 12);
+    if (read_word(?st.buf, 4) != 0x54000040) { bad = 1; }
+    # CBZ x0 at 8 -> target 16: disp 8, imm19=2 -> 0xb4000040.
+    fx.patch_pos = 8; fx.next_ip = 12;
+    patch_branch_arm64(?st, ?fx, 16);
+    if (read_word(?st.buf, 8) != 0xB4000040) { bad = 1; }
+    # CBNZ x1 at 12 -> target 12 (self): disp 0 -> 0xb5000001.
+    fx.patch_pos = 12; fx.next_ip = 16;
+    patch_branch_arm64(?st, ?fx, 12);
+    if (read_word(?st.buf, 12) != 0xB5000001) { bad = 1; }
+
+    # a backward B at 28 -> target 0: disp -28 -> 0x17fffff9 (matches llvm-objdump).
+    st.buf.len = 0;
+    var k: u32 = 0;
+    for (k < 8) { emit_word(?st, B_BASE); k = k + 1; }
+    fx.patch_pos = 28; fx.next_ip = 32;
+    patch_branch_arm64(?st, ?fx, 0);
+    if (read_word(?st.buf, 28) != 0x17FFFFF9) { bad = 1; }
+    # a backward B.eq at 32 -> target 0: disp -32 -> 0x54ffff00.
+    emit_word(?st, BCOND | CC_EQ);
+    fx.patch_pos = 32; fx.next_ip = 36;
+    patch_branch_arm64(?st, ?fx, 0);
+    if (read_word(?st.buf, 32) != 0x54FFFF00) { bad = 1; }
+
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+test "arm64.encode: end-to-end leaf add(w0,w1) body matches llvm-mc" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    # add w0, w0, w1  — the leaf integer body (operands already register-resolved).
+    var mi: mir.MirInstr;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(0);
+    ops[1] = mir.op_preg(0);
+    ops[2] = mir.op_preg(1);
+    mi.operands = ?ops[0];
+    mi.operand_count = 3;
+    mi.width = 4;
+    encode_addsub(?st, ?mi, false);
+    # add w0, w0, w1 = 0x0b010000
+    if (read_word(?st.buf, 0) != 0x0B010000) { bad = 1; }
+
+    buf_dnit(?st.buf);
+    ret bad;
 }
