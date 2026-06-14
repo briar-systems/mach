@@ -18,6 +18,7 @@ command -v sha256sum >/dev/null || err "sha256sum is required"
 
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) target="x86_64-linux" ;;
+    Linux-aarch64|Linux-arm64) target="aarch64-linux" ;;
     *) err "unsupported host $(uname -s)-$(uname -m); prebuilt binaries: https://github.com/octalide/mach/releases" ;;
 esac
 
