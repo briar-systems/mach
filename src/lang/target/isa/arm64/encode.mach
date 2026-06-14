@@ -12,22 +12,24 @@
 # the shared `enc` module; this backend supplies only the A64 bitfield packers,
 # prologue/epilogue emission, and branch patching.
 #
-# SCOPE (Phase 3a — frames + non-symbol memory + integer conversions, atop the
-# Phase 2b leaf integer core). Every modeled form is byte-exact against llvm-mc:
-# the three-address integer ALU (ADD/SUB/MUL/AND/ORR/EOR), the shifts (register
-# LSLV/LSRV/ASRV and immediate UBFM/SBFM aliases), NEG/MVN/MOV, the MOVZ/MOVK
-# immediate materialization, RET, CMP (SUBS XZR) + CSET, the unconditional branch
-# B, the conditional branch (CBNZ + B), and the BRK unreachable trap; plus the
-# record-at-top non-leaf prologue (STP/MOV record, `SUB SP` frame, GP callee-save
-# STP/LDP pairs) and epilogue, frame-slot / spill memory operands addressed
-# `[x29 + slot.offset]`, non-symbol LDR/STR with scaled-imm12 / unscaled-imm9 /
-# register-offset legalization, GEP / ALLOCA address arithmetic, and the integer
-# conversions (TRUNC / SEXT-SXTB/SXTH/SXTW / ZEXT-UXTB/UXTH / GP BITCAST). The
-# contract gaps DEFERRED to a later phase (an in-scope function never reaches them,
-# so they fail loudly rather than emit wrong bytes): calls and their relocations
-# (Phase 3b), symbol relocations incl. folded-global ADRP+LDR and address-of
-# ADRP+ADD (Phase 3b), inline asm (Phase 3c), callee-saved FP registers, and the
-# float / float-conversion families (Phase 4).
+# SCOPE (Phase 3b — calls + symbol relocations, atop the Phase 3a frames + memory +
+# conversions core). Every modeled form is byte-exact against llvm-mc: the three-
+# address integer ALU (ADD/SUB/MUL/AND/ORR/EOR), the shifts (register LSLV/LSRV/ASRV
+# and immediate UBFM/SBFM aliases), NEG/MVN/MOV, the MOVZ/MOVK immediate
+# materialization, RET, CMP (SUBS XZR) + CSET, the unconditional branch B, the
+# conditional branch (CBNZ + B), and the BRK unreachable trap; plus the record-at-top
+# non-leaf prologue (STP/MOV record, `SUB SP` frame, GP callee-save STP/LDP pairs)
+# and epilogue — oversized frames materialized through a scratch base — frame-slot /
+# spill memory operands addressed `[x29 + slot.offset]`, non-symbol LDR/STR with
+# scaled-imm12 / unscaled-imm9 / register-offset legalization, GEP / ALLOCA address
+# arithmetic, the integer conversions (TRUNC / SEXT-SXTB/SXTH/SXTW / ZEXT-UXTB/UXTH /
+# GP BITCAST), the direct (`BL` + RK_PLT32→CALL26) and indirect (`BLR Xn`) call, the
+# folded-global load/store (`ADRP IP0` + `LDR/STR :lo12:`, RK_PAGE21 + the per-width
+# RK_LDST*_LO12), and the address-of rvalue (`ADRP` + `ADD :lo12:`, RK_PAGE21 +
+# RK_ADD_LO12). The contract gaps DEFERRED to a later phase (an in-scope function
+# never reaches them, so they fail loudly rather than emit wrong bytes): inline asm
+# (Phase 3c), callee-saved FP registers, and the float / float-conversion families
+# (Phase 4).
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -49,6 +51,7 @@ use std.types.option.is_some;
 use std.types.option.unwrap;
 
 use std.allocator.Allocator;
+use std.allocator.deallocate;
 use page: std.allocator.page;
 
 use intern: mach.lang.intern;
@@ -156,6 +159,18 @@ val CBNZ_X:    u32 = 0xB5000000; val CBNZ_W: u32 = 0x35000000;
 val RET_WORD:  u32 = 0xD65F03C0;
 val BRK_BASE:  u32 = 0xD4200000;
 val NOP_WORD:  u32 = 0xD503201F;
+# the call family: BL (imm26 displacement placeholder, the RK_PLT32 patch site for a
+# direct call) and the register-indirect BLR (Rn[9:5] zeroed in the base).
+val BL_BASE:   u32 = 0x94000000;
+val BLR_BASE:  u32 = 0xD63F0000;
+# ADRP (page-relative high-21 address, immlo/immhi zeroed) — the high half of a
+# symbol reference; it pairs with an ADD `:lo12:` (address-of) or an LDR/STR
+# `:lo12:` (folded global) low half, both naming the same symbol.
+val ADRP_BASE: u32 = 0x90000000;
+# SUB SP, SP, Xm (extended-register, UXTX, imm3=0) — the oversized-frame `SUB SP`
+# fallback when the allocation exceeds the imm12 / imm12<<12 two-immediate reach.
+# the base bakes Rn=SP, Rd=SP, option=UXTX; only Rm[20:16] is OR-ed in.
+val SUB_SP_REG_X: u32 = 0xCB2063FF;
 
 # the zero register / stack pointer encode as register 31 in the relevant fields.
 val ZR: u32 = 31;
@@ -168,12 +183,12 @@ val SCRATCH1: u32 = 17;
 # the deepest the GP callee-save STP/LDP pairs reach below x29: the scaled 7-bit
 # signed immediate spans -64..63 eightbytes, so the pair offset `-(frame.size +
 # pair_bytes)` is bounded below by -512. a function whose `frame.size + GP-save
-# area` exceeds this reaches Phase 3b's scratch-base callee-save addressing; until
-# then it fails loudly rather than truncate the STP immediate.
+# area` exceeds this switches `save_callee_gp` to scratch-base (IP0-anchored)
+# addressing rather than truncate the STP immediate.
 val MAX_CALLEE_SAVE_REACH: u32 = 504;
-# the largest frame the prologue's `SUB SP` can allocate with the two-immediate
+# the largest frame the prologue's `SUB SP` allocates with the two-immediate
 # (imm12 + imm12<<12) form: `(0xFFF << 12) + 0xFF0` rounded to 16. a frame beyond
-# ~16 MiB fails loudly rather than mis-encode the subtraction.
+# ~16 MiB falls back to materializing the size into IP0 and `SUB SP, SP, X16`.
 val MAX_FRAME_SUB: u32 = 0xFFFFF0;
 
 # A64 condition codes (bits[3:0] of a conditional form). the CSET / B.cond
@@ -273,6 +288,29 @@ fun pack_ldur(base: u32, rt: u32, rn: u32, imm9: u32) u32 {
 # materialized into the scratch register).
 fun pack_ldst_reg(base: u32, rt: u32, rn: u32, rm: u32) u32 {
     ret base | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rt & 0x1F);
+}
+
+# pack_blr: a register-indirect branch-with-link word — Rn[9:5] OR-ed into BLR_BASE.
+fun pack_blr(rn: u32) u32 {
+    ret BLR_BASE | ((rn & 0x1F) << 5);
+}
+
+# pack_adrp: an ADRP word with a zero page-delta placeholder — Rd[4:0] OR-ed into
+# ADRP_BASE. the linker's RK_PAGE21 packer fills immlo/immhi at link time.
+fun pack_adrp(rd: u32) u32 {
+    ret ADRP_BASE | (rd & 0x1F);
+}
+
+# ldst_lo12_kind: the per-width LDR/STR low-12 relocation kind for an access width
+# (Option B — the linker derives the imm12 scale from the kind, never an instruction
+# decode). mirrors `ldst_base_scaled`'s width branching: 1/2/4 select the byte /
+# halfword / word kinds, every other width (8, or a 0 pseudo-width defaulted to the
+# machine word) the doubleword kind.
+fun ldst_lo12_kind(w: u8) of.RelocKind {
+    if (w == 1) { ret of.RK_LDST8_LO12; }
+    if (w == 2) { ret of.RK_LDST16_LO12; }
+    if (w == 4) { ret of.RK_LDST32_LO12; }
+    ret of.RK_LDST64_LO12;
 }
 
 # width_shift: the log2 of an access size (1/2/4/8 -> 0/1/2/3) — the scaled-offset
@@ -540,6 +578,105 @@ fun scale_shift(scale: u8) u32 {
     ret 0;
 }
 
+# ---- symbol relocations (ADRP page + lo12 low half) ----
+
+# emit_adrp_reloc: emit `adrp Xd, sym` with a zero page-delta placeholder and record
+# the RK_PAGE21 relocation at the instruction-word start (the A64 reloc-offset
+# convention). the high half of every symbol reference; the caller pairs it with an
+# ADD or LDR/STR `:lo12:` low half naming the same symbol.
+fun emit_adrp_reloc(st: *EncodeState, rd: u32, sym: intern.StrId, addend: i32) Result[bool, str] {
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_adrp(rd));
+    ret push_reloc(st, arm64_reloc_offset(pos), of.RK_PAGE21, sym, addend);
+}
+
+# emit_global_addr: a symbol address as an rvalue (the LEA equivalent) —
+# `adrp Xd, sym` (RK_PAGE21) ; `add Xd, Xd, :lo12:sym` (RK_ADD_LO12). both immediates
+# are zero placeholders the linker fills; the addend is the symbol's own constant
+# only (no pc-relative correction — the ADD low half is absolute).
+fun emit_global_addr(st: *EncodeState, rd: u32, symop: *mir.MirOperand) Result[bool, str] {
+    if (symop.sym == intern.STR_NIL) {
+        ret err[bool, str]("encode: address-of has no resolved symbol name");
+    }
+    val ar: Result[bool, str] = emit_adrp_reloc(st, rd, symop.sym, symop.sym_off);
+    if (is_err[bool, str](ar)) { ret ar; }
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_addsub_imm(ADDI_X, rd, rd, 0, 0));
+    ret push_reloc(st, arm64_reloc_offset(pos), of.RK_ADD_LO12, symop.sym, symop.sym_off);
+}
+
+# emit_global_load: a folded-global load — `adrp IP0, sym` (RK_PAGE21) ;
+# `ldr Xt, [IP0, :lo12:sym]` (the per-width RK_LDST*_LO12). IP0 (reserved scratch)
+# holds the page base; the LDR imm12 is a zero placeholder the linker shifts the
+# low-12 into by the kind's access-width scale (Option B). the zero-extending load
+# form covers a sub-word access exactly as the non-symbol path does.
+fun emit_global_load(st: *EncodeState, rt: u32, symop: *mir.MirOperand, width: u8) Result[bool, str] {
+    if (symop.sym == intern.STR_NIL) {
+        ret err[bool, str]("encode: folded-global load has no resolved symbol name");
+    }
+    var w: u8 = width;
+    if (w == 0) { w = 8; }
+    val ar: Result[bool, str] = emit_adrp_reloc(st, SCRATCH0, symop.sym, symop.sym_off);
+    if (is_err[bool, str](ar)) { ret ar; }
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_ldst(ldst_base_scaled(w, true), rt, SCRATCH0, 0));
+    ret push_reloc(st, arm64_reloc_offset(pos), ldst_lo12_kind(w), symop.sym, symop.sym_off);
+}
+
+# emit_global_store: a folded-global store — `adrp IP0, sym` (RK_PAGE21) ;
+# `str Xt, [IP0, :lo12:sym]` (the per-width RK_LDST*_LO12). the stored value resolves
+# first (the zero register for an immediate 0, IP1 for a non-zero immediate, the
+# value's own register otherwise) so the page-base materialization in IP0 never
+# clobbers it. IP0 / IP1 are reserved scratch, never an allocated value.
+fun emit_global_store(st: *EncodeState, symop: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) Result[bool, str] {
+    if (symop.sym == intern.STR_NIL) {
+        ret err[bool, str]("encode: folded-global store has no resolved symbol name");
+    }
+    var w: u8 = width;
+    if (w == 0) { w = 8; }
+
+    var rt: u32 = ZR;
+    if (val_op.kind == mir.MIR_OP_IMM) {
+        if (val_op.imm != 0) {
+            emit_movewide_seq(st, SCRATCH1, val_op.imm::u64, is64(width));
+            rt = SCRATCH1;
+        }
+    } or {
+        val rr: Result[i32, str] = req_gpr(val_op);
+        if (is_err[i32, str](rr)) { ret err[bool, str](unwrap_err[i32, str](rr)); }
+        rt = unwrap_ok[i32, str](rr)::u32;
+    }
+
+    val ar: Result[bool, str] = emit_adrp_reloc(st, SCRATCH0, symop.sym, symop.sym_off);
+    if (is_err[bool, str](ar)) { ret ar; }
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_ldst(ldst_base_scaled(w, false), rt, SCRATCH0, 0));
+    ret push_reloc(st, arm64_reloc_offset(pos), ldst_lo12_kind(w), symop.sym, symop.sym_off);
+}
+
+# encode_call: a direct or indirect call. a MIR_OP_SYM callee emits `bl sym` with a
+# zero imm26 placeholder and records RK_PLT32 at the instruction-word start (the
+# linker maps it to CALL26; addend is the symbol's own constant only — no x86 -4
+# correction, per the Phase-0 CALL26 packer). a register callee (a function pointer
+# regalloc placed in a preg) emits the register-indirect `blr Xn`. MIR_CALL stays the
+# caller-saved clobber barrier the allocator keyed on; this only emits its bytes.
+fun encode_call(st: *EncodeState, mi: *mir.MirInstr) Result[bool, str] {
+    if (mi.operand_count < 1) { ret err[bool, str]("encode: call missing callee operand"); }
+    val callee: *mir.MirOperand = ?mi.operands[0];
+    if (callee.kind == mir.MIR_OP_SYM) {
+        if (callee.sym == intern.STR_NIL) {
+            ret err[bool, str]("encode: direct call has no resolved symbol name");
+        }
+        val pos: u32 = st.buf.len::u32;
+        emit_word(st, BL_BASE);
+        ret push_reloc(st, arm64_reloc_offset(pos), of.RK_PLT32, callee.sym, callee.sym_off);
+    }
+    val rr: Result[i32, str] = req_gpr(callee);
+    if (is_err[i32, str](rr)) { ret err[bool, str](unwrap_err[i32, str](rr)); }
+    emit_word(st, pack_blr(unwrap_ok[i32, str](rr)::u32));
+    ret ok[bool, str](true);
+}
+
 # ---- per-opcode encoders ----
 
 # encode_alu3: a three-address integer ALU op `op Rd, Rn, Rm`. the right operand
@@ -718,10 +855,10 @@ fun encode_mov(st: *EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) Result[
 # emit_store_mem: store the value operand `val_op` to the resolved memory operand
 # `dst_mem` at byte `width`. a register value stores directly; an immediate 0 stores
 # the zero register; a non-zero immediate is materialized into IP1 first. a symbol
-# destination (a folded-global store) is a Phase 3b relocation, deferred loudly.
+# destination is a folded-global store: `adrp IP0, sym` + `str Xt, [IP0, :lo12:sym]`.
 fun emit_store_mem(st: *EncodeState, f: *mir.MirFunction, dst_mem: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) Result[bool, str] {
     if (dst_mem.kind == mir.MIR_OP_SYM) {
-        ret err[bool, str]("aarch64 folded-global store relocation not implemented (Phase 3b)");
+        ret emit_global_store(st, dst_mem, val_op, width);
     }
     val mr: Result[A64Mem, str] = resolve_mem(f, dst_mem);
     if (is_err[A64Mem, str](mr)) { ret err[bool, str](unwrap_err[A64Mem, str](mr)); }
@@ -744,9 +881,9 @@ fun emit_store_mem(st: *EncodeState, f: *mir.MirFunction, dst_mem: *mir.MirOpera
 }
 
 # encode_load: a `MIR_LOAD reg <- [mem]`. the destination is a register; the source
-# is a non-symbol frame-slot or pointer-register memory operand loaded at the access
-# width (`src_width`) with the zero-extending form. a symbol source (a folded-global
-# load) is a Phase 3b relocation, deferred loudly.
+# is a frame-slot or pointer-register memory operand loaded at the access width
+# (`src_width`) with the zero-extending form, or a folded-global symbol source
+# (`adrp IP0, sym` + `ldr Xt, [IP0, :lo12:sym]`, the two-reloc primary global path).
 fun encode_load(st: *EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) Result[bool, str] {
     if (mi.operand_count < 2) { ret err[bool, str]("encode: load missing operands"); }
     val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
@@ -755,7 +892,7 @@ fun encode_load(st: *EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) Result
 
     val src: *mir.MirOperand = ?mi.operands[1];
     if (src.kind == mir.MIR_OP_SYM) {
-        ret err[bool, str]("aarch64 folded-global load relocation not implemented (Phase 3b)");
+        ret emit_global_load(st, rd, src, mi.src_width);
     }
     val mr: Result[A64Mem, str] = resolve_mem(f, src);
     if (is_err[A64Mem, str](mr)) { ret err[bool, str](unwrap_err[A64Mem, str](mr)); }
@@ -775,8 +912,8 @@ fun encode_store(st: *EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) Resul
 # encode_addr: a `MIR_GEP` / `MIR_ALLOCA` address computation `Rd <- base +
 # index*scale + disp` (the x86-64 LEA analogue). the constant displacement folds
 # into an ADD/SUB immediate (or a materialized add); a scaled runtime index folds
-# into an `add Rd, base, index, lsl #shift`. a symbol base (an address-of relocation)
-# is a Phase 3b ADRP+ADD sequence, deferred loudly.
+# into an `add Rd, base, index, lsl #shift`. a symbol base is the address-of
+# `adrp Rd, sym` + `add Rd, Rd, :lo12:sym` rvalue sequence.
 fun encode_addr(st: *EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) Result[bool, str] {
     if (mi.operand_count < 2) { ret err[bool, str]("encode: address op missing operands"); }
     val rdr: Result[i32, str] = req_gpr(?mi.operands[0]);
@@ -785,7 +922,7 @@ fun encode_addr(st: *EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) Result
 
     val memop: *mir.MirOperand = ?mi.operands[1];
     if (memop.kind == mir.MIR_OP_SYM) {
-        ret err[bool, str]("aarch64 address-of relocation not implemented (Phase 3b)");
+        ret emit_global_addr(st, rd, memop);
     }
     val mr: Result[A64Mem, str] = resolve_mem(f, memop);
     if (is_err[A64Mem, str](mr)) { ret err[bool, str](unwrap_err[A64Mem, str](mr)); }
@@ -978,19 +1115,25 @@ fun frame_subsize(f: *mir.MirFunction) u32 {
     ret align16(gp_bytes + fp_bytes + f.frame.size + f.frame.outgoing_size);
 }
 
-# emit_sp_sub: subtract a 16-aligned frame size from SP, folding it into a single
-# `SUB SP, SP, #imm12`, a `SUB SP, SP, #imm12, lsl #12` (plus a low `SUB` remainder)
-# for a frame beyond 12 bits, per the imm12 / imm12<<12 split. `subsize` is non-zero
-# and within `MAX_FRAME_SUB` (the caller range-checks).
+# emit_sp_sub: subtract a 16-aligned frame size from SP. a frame within 12 bits folds
+# into a single `SUB SP, SP, #imm12`; one within the imm12 / imm12<<12 two-immediate
+# split (up to `MAX_FRAME_SUB`) into `SUB SP, SP, #hi, lsl #12` plus a low `SUB`
+# remainder; a larger frame materializes the size into IP0 and subtracts the register
+# (`SUB SP, SP, X16`, the extended-register form SP requires). `subsize` is non-zero.
 fun emit_sp_sub(st: *EncodeState, subsize: u32) {
     if (subsize <= 0xFFF) {
         emit_word(st, pack_addsub_imm(SUBI_X, ZR, ZR, subsize, 0));
         ret;
     }
-    val hi: u32 = subsize >> 12;
-    val lo: u32 = subsize & 0xFFF;
-    emit_word(st, pack_addsub_imm(SUBI_X, ZR, ZR, hi, 1));
-    if (lo != 0) { emit_word(st, pack_addsub_imm(SUBI_X, ZR, ZR, lo, 0)); }
+    if (subsize <= MAX_FRAME_SUB) {
+        val hi: u32 = subsize >> 12;
+        val lo: u32 = subsize & 0xFFF;
+        emit_word(st, pack_addsub_imm(SUBI_X, ZR, ZR, hi, 1));
+        if (lo != 0) { emit_word(st, pack_addsub_imm(SUBI_X, ZR, ZR, lo, 0)); }
+        ret;
+    }
+    emit_movewide_seq(st, SCRATCH0, subsize::u64, true);
+    emit_word(st, SUB_SP_REG_X | ((SCRATCH0 & 0x1F) << 16));
 }
 
 # emit_prologue: the AArch64 record-at-top prologue. `STP X29, X30, [SP, #-16]!`
@@ -1025,11 +1168,18 @@ fun emit_epilogue(st: *EncodeState, f: *mir.MirFunction, subsize: u32) {
 
 # save_callee_gp: save (or restore) the callee-saved GP registers `callee_mask`
 # selects, in ascending register order, just below the local frame (`frame.size`).
-# they are addressed x29-relatively at descending negative offsets: each STP/LDP
-# pair occupies a 16-byte slot (the first at `[x29, #-(frame.size + 16)]`), and a
-# trailing odd register takes an 8-byte STUR/LDUR slot below the last pair. the
-# whole area sits within `frame_subsize`'s GP region, below the locals and above the
-# outgoing-argument region, so it overlaps neither.
+# they are addressed at descending negative offsets: each STP/LDP pair occupies a
+# 16-byte slot (the first at offset `-(frame.size + 16)`), and a trailing odd
+# register takes an 8-byte STUR/LDUR slot below the last pair. the whole area sits
+# within `frame_subsize`'s GP region, below the locals and above the outgoing-
+# argument region, so it overlaps neither.
+#
+# the area is addressed x29-relatively (the Phase 3a form, byte-identical for an
+# in-reach frame) while `frame.size + GP-save area` is within the STP/LDP scaled
+# imm7 reach (`MAX_CALLEE_SAVE_REACH`). beyond it, a scratch base (IP0) is anchored
+# at the area start (`IP0 = x29 - (frame.size + 16)`) so the per-pair offsets — which
+# span only the small callee-save area (at most ~31 registers, far within imm7) —
+# stay encodable; the deep `frame.size` distance is absorbed once into the anchor.
 fun save_callee_gp(st: *EncodeState, f: *mir.MirFunction, store: bool) {
     var regs: [32]u32;
     var n: u32 = 0;
@@ -1038,31 +1188,46 @@ fun save_callee_gp(st: *EncodeState, f: *mir.MirFunction, store: bool) {
         if ((f.callee_mask & (1::u32 << r)) != 0) { regs[n] = r; n = n + 1; }
         r = r + 1;
     }
+    if (n == 0) { ret; }
 
     val fs: i32 = f.frame.size::i32;
+    val gp_bytes: u32 = n * 8;
     val num_pairs: u32 = n / 2;
+
+    # the base register and the magnitude of the first pair's offset from it: x29
+    # directly (anchor = frame.size + 16) when in reach, else IP0 anchored at the
+    # area start (anchor = 0).
+    var base_reg: u32 = 29;
+    var anchor: i32 = fs + 16;
+    if (f.frame.size + gp_bytes > MAX_CALLEE_SAVE_REACH) {
+        emit_add_imm(st, SCRATCH0, 29, 0 - ((fs + 16)::i64));
+        base_reg = SCRATCH0;
+        anchor = 0;
+    }
+
     var p: u32 = 0;
     for (p < num_pairs) {
-        val base_off: i32 = 0 - (fs + 16 + (16 * p)::i32);
+        val base_off: i32 = 0 - (anchor + (16 * p)::i32);
         val imm7: u32 = (base_off / 8)::u32 & 0x7F;
-        if (store) { emit_word(st, pack_ldstp(STP_OFF_X, regs[2 * p], regs[2 * p + 1], 29, imm7)); }
-        or         { emit_word(st, pack_ldstp(LDP_OFF_X, regs[2 * p], regs[2 * p + 1], 29, imm7)); }
+        if (store) { emit_word(st, pack_ldstp(STP_OFF_X, regs[2 * p], regs[2 * p + 1], base_reg, imm7)); }
+        or         { emit_word(st, pack_ldstp(LDP_OFF_X, regs[2 * p], regs[2 * p + 1], base_reg, imm7)); }
         p = p + 1;
     }
     if ((n & 1) == 1) {
-        val single_off: i32 = 0 - (fs + 8 + (16 * num_pairs)::i32);
-        emit_mem_access(st, regs[n - 1], 29, single_off::i64, 8, !store);
+        val single_off: i32 = 0 - (anchor + (16 * num_pairs)::i32 - 8);
+        emit_mem_access(st, regs[n - 1], base_reg, single_off::i64, 8, !store);
     }
 }
 
 # ---- per-instruction dispatch ----
 
 # encode_mir_instr: translate one post-regalloc MIR instruction into A64 bytes,
-# recording any intra-module branch fixup. the regalloc parallel-copy / liveness
-# pseudos emit nothing; the surviving comparison / conditional-branch / memory /
-# conversion opcodes expand into their byte sequences; the float, call, symbol-
-# relocation, inline-asm, and varargs families are rejected loudly (an in-scope
-# function never reaches them).
+# recording any intra-module branch fixup or symbol relocation. the regalloc
+# parallel-copy / liveness pseudos emit nothing; the surviving comparison /
+# conditional-branch / memory / conversion opcodes expand into their byte sequences;
+# MIR_CALL emits the direct/indirect call (recording its CALL26 relocation); the
+# float, inline-asm, and varargs families are rejected loudly (an in-scope function
+# never reaches them).
 fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir.MirInstr) Result[bool, str] {
     val op: u16 = mi.opcode::u16;
 
@@ -1116,7 +1281,7 @@ fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
         ret err[bool, str]("aarch64 float conversions not implemented (Phase 4)");
     }
     if (mi.opcode == mir.MIR_CALL) {
-        ret err[bool, str]("aarch64 calls not implemented (Phase 3b)");
+        ret encode_call(st, mi);
     }
     if (mi.opcode == mir.MIR_ASM) {
         ret err[bool, str]("aarch64 inline asm not implemented (Phase 3c)");
@@ -1146,10 +1311,10 @@ fun encode_mir_instr(st: *EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *m
 # encode_function_arm64: the per-function encode hook (pass 1). marks the function
 # entry symbol, emits the record-at-top prologue, then each block — emitting the
 # epilogue before every RET — recording each block's `.text` offset for branch
-# patching. extern / body-less functions contribute no text. a frame beyond this
-# phase's reach (callee-saved FP registers, a `SUB SP` past the two-immediate range,
-# or GP callee-saves below the STP/LDP immediate reach) is rejected loudly rather
-# than mis-encoded.
+# patching. extern / body-less functions contribute no text. an oversized frame (a
+# `SUB SP` past the two-immediate range, or GP callee-saves below the STP/LDP imm7
+# reach) is materialized through a scratch base; callee-saved FP registers remain a
+# Phase 4 loud defer.
 fun encode_function_arm64(st: *EncodeState, f: *mir.MirFunction) Result[bool, str] {
     val fn_base: u32 = st.buf.len::u32;
     if (f.block_count == 0) { ret ok[bool, str](true); }
@@ -1161,17 +1326,6 @@ fun encode_function_arm64(st: *EncodeState, f: *mir.MirFunction) Result[bool, st
         ret err[bool, str]("aarch64 callee-saved FP registers not implemented (Phase 4)");
     }
     val subsize: u32 = frame_subsize(f);
-    if (subsize > MAX_FRAME_SUB) {
-        ret err[bool, str]("aarch64 frame larger than the SUB SP two-immediate range not implemented (Phase 3b)");
-    }
-    # the GP callee-save STP/LDP pairs address x29-relatively below `frame.size`; a
-    # frame whose locals + GP-save area exceed the scaled imm7 reach needs Phase 3b's
-    # scratch-base addressing, so reject it rather than truncate the STP immediate.
-    val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
-    if (gp_bytes != 0 && f.frame.size + gp_bytes > MAX_CALLEE_SAVE_REACH) {
-        ret err[bool, str]("aarch64 callee-save area beyond the STP/LDP immediate reach not implemented (Phase 3b)");
-    }
-
     emit_prologue(st, f, subsize);
 
     var bi: u32 = 0;
@@ -1238,10 +1392,10 @@ fun patch_branch_arm64(st: *EncodeState, fx: *BranchFixup, target_off: u32) Resu
 
 # arm64_reloc_offset: the byte offset, within an encoded instruction, where a
 # relocation field begins — always the instruction-word start on A64 (the linker
-# packers read the access kind from the relocation, not an instruction decode). a
-# leaf integer function emits no symbol references, so no relocation is recorded in
-# this phase; this is the patch-site convention the call/global lowering of Phase 3
-# will record against.
+# packers read the access kind from the relocation, not an instruction decode). every
+# A64 relocation (CALL26, PAGE21, ADD_LO12, the per-width LDST*_LO12) patches a
+# single 32-bit instruction word, so the call / folded-global / address-of encoders
+# record their relocs against this offset.
 fun arm64_reloc_offset(inst_start: u32) u32 {
     ret inst_start;
 }
@@ -1825,6 +1979,177 @@ test "arm64.encode: end-to-end leaf add(w0,w1) body matches llvm-mc" {
     encode_addsub(?st, ?mi, false);
     # add w0, w0, w1 = 0x0b010000
     if (read_word(?st.buf, 0) != 0x0B010000) { bad = 1; }
+
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the Phase 3b call + symbol-relocation base words (reloc fields zero pre-link): the
+# direct/indirect call, the folded-global ADRP+LDR/STR per width, and the address-of
+# ADRP+ADD, all asserted against llvm-mc, plus the per-width LO12 kind mapping.
+test "arm64.encode: call + symbol-reloc base words match llvm-mc" {
+    var bad: i32 = 0;
+    # bl 0 = 0x94000000 ; blr x0 = 0xd63f0000 ; blr x9 = 0xd63f0120 ; blr x16 = 0xd63f0200
+    if (BL_BASE != 0x94000000) { bad = 1; }
+    if (pack_blr(0)  != 0xD63F0000) { bad = 1; }
+    if (pack_blr(9)  != 0xD63F0120) { bad = 1; }
+    if (pack_blr(16) != 0xD63F0200) { bad = 1; }
+    # adrp x0,#0 = 0x90000000 ; adrp x16,#0 = 0x90000010 (zero page-delta placeholder)
+    if (pack_adrp(0)  != 0x90000000) { bad = 1; }
+    if (pack_adrp(16) != 0x90000010) { bad = 1; }
+    # add x0,x0,#0 = 0x91000000 ; add x16,x16,#0 = 0x91000210 (zero lo12 placeholder)
+    if (pack_addsub_imm(ADDI_X, 0, 0, 0, 0)   != 0x91000000) { bad = 1; }
+    if (pack_addsub_imm(ADDI_X, 16, 16, 0, 0) != 0x91000210) { bad = 1; }
+    # folded-global ldr/str x0,[x16] per access width (zero lo12 placeholder):
+    # ldrb 0x39400200 ; ldrh 0x79400200 ; ldr w 0xb9400200 ; ldr x 0xf9400200
+    if (pack_ldst(ldst_base_scaled(1, true), 0, 16, 0) != 0x39400200) { bad = 1; }
+    if (pack_ldst(ldst_base_scaled(2, true), 0, 16, 0) != 0x79400200) { bad = 1; }
+    if (pack_ldst(ldst_base_scaled(4, true), 0, 16, 0) != 0xB9400200) { bad = 1; }
+    if (pack_ldst(ldst_base_scaled(8, true), 0, 16, 0) != 0xF9400200) { bad = 1; }
+    # strb 0x39000200 ; strh 0x79000200 ; str w 0xb9000200 ; str x 0xf9000200
+    if (pack_ldst(ldst_base_scaled(1, false), 0, 16, 0) != 0x39000200) { bad = 1; }
+    if (pack_ldst(ldst_base_scaled(2, false), 0, 16, 0) != 0x79000200) { bad = 1; }
+    if (pack_ldst(ldst_base_scaled(4, false), 0, 16, 0) != 0xB9000200) { bad = 1; }
+    if (pack_ldst(ldst_base_scaled(8, false), 0, 16, 0) != 0xF9000200) { bad = 1; }
+    # the per-width LO12 kind mapping (Option B: the linker reads the scale from the kind).
+    if (ldst_lo12_kind(1) != of.RK_LDST8_LO12)  { bad = 1; }
+    if (ldst_lo12_kind(2) != of.RK_LDST16_LO12) { bad = 1; }
+    if (ldst_lo12_kind(4) != of.RK_LDST32_LO12) { bad = 1; }
+    if (ldst_lo12_kind(8) != of.RK_LDST64_LO12) { bad = 1; }
+    ret bad;
+}
+
+# the call / folded-global / address-of emitters drive the byte words AND record the
+# correct relocation kinds at the instruction-word starts (the reloc fields are zero
+# placeholders pre-link; the linker fills them).
+test "arm64.encode: call/global emitters record relocs + base words" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+    st.alloc       = ?alloc;
+    st.relocs      = nil;
+    st.reloc_count = 0;
+    st.reloc_cap   = 0;
+
+    val sym: intern.StrId = 7::intern.StrId;
+
+    # direct call: bl sym -> 0x94000000, RK_PLT32 @0 addend 0.
+    var ci: mir.MirInstr;
+    var cops: [1]mir.MirOperand;
+    cops[0] = mir.op_sym(sym, 0);
+    ci.operands = ?cops[0]; ci.operand_count = 1;
+    encode_call(?st, ?ci);
+    if (read_word(?st.buf, 0) != 0x94000000) { bad = 1; }
+    if (st.reloc_count != 1) { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PLT32) { bad = 1; }
+        if (st.relocs[0].offset != 0)         { bad = 1; }
+        if (st.relocs[0].sym != sym)          { bad = 1; }
+        if (st.relocs[0].addend != 0)         { bad = 1; }
+    }
+
+    # indirect call: blr x9 -> 0xd63f0120, no new reloc.
+    var ii: mir.MirInstr;
+    var iops: [1]mir.MirOperand;
+    iops[0] = mir.op_preg(9);
+    ii.operands = ?iops[0]; ii.operand_count = 1;
+    encode_call(?st, ?ii);
+    if (read_word(?st.buf, 4) != 0xD63F0120) { bad = 1; }
+    if (st.reloc_count != 1) { bad = 1; }
+
+    # address-of: adrp x0,sym ; add x0,x0,:lo12:sym -> 0x90000000 ; 0x91000000,
+    # RK_PAGE21 @8, RK_ADD_LO12 @12.
+    var ao: mir.MirOperand = mir.op_sym(sym, 0);
+    emit_global_addr(?st, 0, ?ao);
+    if (read_word(?st.buf, 8)  != 0x90000000) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0x91000000) { bad = 1; }
+    if (st.reloc_count != 3) { bad = 1; }
+    or {
+        if (st.relocs[1].kind != of.RK_PAGE21)   { bad = 1; }
+        if (st.relocs[1].offset != 8)            { bad = 1; }
+        if (st.relocs[2].kind != of.RK_ADD_LO12) { bad = 1; }
+        if (st.relocs[2].offset != 12)           { bad = 1; }
+    }
+
+    # folded-global 8-byte load: adrp x16,sym ; ldr x0,[x16,:lo12:sym] ->
+    # 0x90000010 ; 0xf9400200, RK_PAGE21 @16, RK_LDST64_LO12 @20.
+    var lo: mir.MirOperand = mir.op_sym(sym, 0);
+    emit_global_load(?st, 0, ?lo, 8);
+    if (read_word(?st.buf, 16) != 0x90000010) { bad = 1; }
+    if (read_word(?st.buf, 20) != 0xF9400200) { bad = 1; }
+    if (st.reloc_count != 5) { bad = 1; }
+    or {
+        if (st.relocs[3].kind != of.RK_PAGE21)      { bad = 1; }
+        if (st.relocs[4].kind != of.RK_LDST64_LO12) { bad = 1; }
+        if (st.relocs[4].offset != 20)              { bad = 1; }
+    }
+
+    # folded-global 4-byte register store: adrp x16,sym ; str w1,[x16,:lo12:sym] ->
+    # 0x90000010 ; 0xb9000201, RK_PAGE21 @24, RK_LDST32_LO12 @28.
+    var so: mir.MirOperand = mir.op_sym(sym, 0);
+    var sv: mir.MirOperand = mir.op_preg(1);
+    emit_global_store(?st, ?so, ?sv, 4);
+    if (read_word(?st.buf, 24) != 0x90000010) { bad = 1; }
+    if (read_word(?st.buf, 28) != 0xB9000201) { bad = 1; }
+    if (st.reloc_count != 7) { bad = 1; }
+    or {
+        if (st.relocs[6].kind != of.RK_LDST32_LO12) { bad = 1; }
+        if (st.relocs[6].offset != 28)              { bad = 1; }
+    }
+
+    buf_dnit(?st.buf);
+    if (st.relocs != nil && st.reloc_cap > 0) {
+        deallocate[enc.PendingReloc](?alloc, st.relocs, st.reloc_cap::usize);
+    }
+    ret bad;
+}
+
+# an oversized callee-save frame (locals + GP-save area beyond the STP imm7 reach)
+# anchors a scratch base (IP0 = x29 - (frame.size + 16)) and addresses the small
+# callee-save area off it, rather than truncating the STP immediate.
+test "arm64.encode: oversized callee-save frame uses scratch-base STP" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    # three GP callee-saves (x19,x20,x21), frame.size 4000 -> 4000+24 > 504.
+    var f: mir.MirFunction;
+    f.callee_mask = (1::u32 << 19) | (1::u32 << 20) | (1::u32 << 21);
+    f.callee_mask_fp = 0;
+    f.frame.size = 4000;
+    f.frame.outgoing_size = 0;
+
+    save_callee_gp(?st, ?f, true);
+    # sub x16,x29,#4016 ; stp x19,x20,[x16] ; stur x21,[x16,#-8]
+    if (read_word(?st.buf, 0) != 0xD13EC3B0) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0xA9005213) { bad = 1; }
+    if (read_word(?st.buf, 8) != 0xF81F8215) { bad = 1; }
+
+    save_callee_gp(?st, ?f, false);
+    # sub x16,x29,#4016 ; ldp x19,x20,[x16] ; ldur x21,[x16,#-8]
+    if (read_word(?st.buf, 12) != 0xD13EC3B0) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0xA9405213) { bad = 1; }
+    if (read_word(?st.buf, 20) != 0xF85F8215) { bad = 1; }
+
+    buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the oversized `SUB SP` fallback: a frame beyond the imm12 / imm12<<12 two-immediate
+# reach materializes the size into IP0 and subtracts the register (`SUB SP, SP, X16`).
+test "arm64.encode: oversized SUB SP uses the register form" {
+    var bad: i32 = 0;
+    var st: EncodeState;
+    var alloc: Allocator;
+    tbuf(?st, ?alloc);
+
+    # 0x1000000 (16 MiB) is one past MAX_FRAME_SUB -> register-form sub.
+    emit_sp_sub(?st, 0x1000000);
+    # movz x16,#0x100,lsl#16 ; sub sp,sp,x16
+    if (read_word(?st.buf, 0) != pack_movewide(MOVZ_X, 16, 1, 0x100)) { bad = 1; }
+    if (read_word(?st.buf, 4) != (SUB_SP_REG_X | (16 << 16)))         { bad = 1; }
 
     buf_dnit(?st.buf);
     ret bad;
