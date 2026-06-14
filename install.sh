@@ -1,6 +1,6 @@
 #!/bin/sh
 # installs the mach release binary.
-# usage: curl -fsSL https://github.com/octalide/mach/releases/latest/download/install.sh | sh
+# usage: curl -fsSL https://machlang.org/install.sh | sh
 #
 # MACH_VERSION      version to install (e.g. 1.4.2); defaults to the latest release
 # MACH_INSTALL_DIR  install directory; defaults to ~/.local/bin
@@ -18,6 +18,7 @@ command -v sha256sum >/dev/null || err "sha256sum is required"
 
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) target="x86_64-linux" ;;
+    Linux-aarch64|Linux-arm64) target="aarch64-linux" ;;
     *) err "unsupported host $(uname -s)-$(uname -m); prebuilt binaries: https://github.com/octalide/mach/releases" ;;
 esac
 
