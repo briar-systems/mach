@@ -58,6 +58,7 @@ use page: std.allocator.page;
 use sess:   mach.lang.session;
 use intern: mach.lang.intern;
 use target: mach.lang.target;
+use isa:    mach.lang.target.isa;
 use of:     mach.lang.target.of;
 use bin:    mach.lang.target.of.bin;
 use ar:     mach.lang.target.of.ar;
@@ -315,7 +316,7 @@ pub fun link(s: *sess.Session, tgt: *target.Target, obj_paths: **u8,
         }
 
         val patch_r: Result[bool, str] =
-            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, ?sym_locs, ?dyn);
+            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, ?sym_locs, ?dyn, tgt.arch_id);
         if (is_err[bool, str](patch_r)) {
             free_dynstate(alloc, ?dyn);
             obj.dnit(?out_img);
@@ -1175,7 +1176,7 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
                      modules: *of.ObjectImage, module_count: u32,
                      placements: *Placement, sec_base: *u32,
                      sym_locs: *map.Map[intern.StrId, SymbolLoc],
-                     dyn: *DynState) Result[bool, str] {
+                     dyn: *DynState, arch_id: u32) Result[bool, str] {
     val alloc: *Allocator = s.alloc;
 
     var m: u32 = 0;
@@ -1194,7 +1195,7 @@ fun patch_relocations(s: *sess.Session, out_img: *of.ObjectImage,
         }
 
         val pr: Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
-            placements, sec_base, sym_locs, dyn, ?local_map);
+            placements, sec_base, sym_locs, dyn, ?local_map, arch_id);
         map.dnit[intern.StrId, u64](?local_map);
         if (is_err[bool, str](pr)) { ret err[bool, str](unwrap_err[bool, str](pr)); }
 
@@ -1235,7 +1236,7 @@ fun patch_module_relocations(s: *sess.Session, out_img: *of.ObjectImage,
                              modules: *of.ObjectImage, m: u32,
                              placements: *Placement, sec_base: *u32,
                              sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
-                             local_map: *map.Map[intern.StrId, u64]) Result[bool, str] {
+                             local_map: *map.Map[intern.StrId, u64], arch_id: u32) Result[bool, str] {
     var ri: u32 = 0;
     for (ri < modules[m].reloc_count) {
         val r: *of.Relocation = ?modules[m].relocations[ri];
@@ -1302,7 +1303,7 @@ fun patch_module_relocations(s: *sess.Session, out_img: *of.ObjectImage,
         }
 
         val pr: Result[bool, str] =
-            apply_one(s, r.kind, dst, patch_off, out_img.sections[out_ix].len, sym_va, r.addend, patch_va, r.symbol);
+            apply_one(s, r.kind, dst, patch_off, out_img.sections[out_ix].len, sym_va, r.addend, patch_va, r.symbol, arch_id);
         if (is_err[bool, str](pr)) {
             ret err[bool, str](unwrap_err[bool, str](pr));
         }
@@ -1544,15 +1545,18 @@ fun dynstate_add_fixup(s: *sess.Session, dyn: *DynState, seg_index: u32, seg_off
     ret ok[bool, str](true);
 }
 
-# apply_one: write a single resolved relocation into the merged bytes. `abs64`
-# writes a 64-bit little-endian absolute address; `pc32`/`plt32` write a 32-bit
-# little-endian pc-relative displacement. bounds and 32-bit range are checked.
+# apply_one: write a single resolved relocation into the merged bytes. RK_ABS64
+# writes a 64-bit absolute and RK_PC32 a 32-bit field-relative displacement, both
+# arch-independent (R_X86_64_64/PC32 == R_AARCH64_ABS64/PREL32). The remaining
+# kinds are arch-specific: x86_64 RK_PLT32/RK_ABS32S are flat little-endian writes;
+# aarch64 routes to `apply_one_aarch64` for the A64 instruction-field packers
+# (CALL26/PAGE21/ADD_LO12/per-width LDST*_LO12). bounds and range are checked.
 # `sym_name` is the interned symbol name used in overflow diagnostics; pass
 # `intern.STR_NIL` when the name is unavailable (e.g. in tests).
 fun apply_one(s: *sess.Session, kind: of.RelocKind,
              dst: *u8, patch_off: u32, sec_len: u32,
              sym_va: u64, addend: i64, patch_va: u64,
-             sym_name: intern.StrId) Result[bool, str] {
+             sym_name: intern.StrId, arch_id: u32) Result[bool, str] {
     if (kind == of.RK_ABS64) {
         # bound the patch site in u64: patch_off + width can wrap a u32 for an
         # offset near 0xFFFFFFFF, which would pass a u32 check and then scribble
@@ -1565,7 +1569,9 @@ fun apply_one(s: *sess.Session, kind: of.RelocKind,
         ret ok[bool, str](true);
     }
 
-    if (kind == of.RK_PC32 || kind == of.RK_PLT32) {
+    # RK_PC32 is a flat 32-bit field-relative displacement on both arches
+    # (R_X86_64_PC32 / R_AARCH64_PREL32).
+    if (kind == of.RK_PC32) {
         if (patch_off::u64 + 4 > sec_len::u64) {
             ret err[bool, str](overflow_message(s, kind, sym_name));
         }
@@ -1577,7 +1583,25 @@ fun apply_one(s: *sess.Session, kind: of.RelocKind,
         ret ok[bool, str](true);
     }
 
-    # abs32s: 32-bit signed absolute.
+    # aarch64 instruction-field relocations are bit-packed read-modify-write.
+    if (arch_id == isa.ARCH_AARCH64) {
+        ret apply_one_aarch64(s, kind, dst, patch_off, sec_len, sym_va, addend, patch_va, sym_name);
+    }
+
+    # x86_64 RK_PLT32: a flat 32-bit pc-relative displacement, identical to PC32.
+    if (kind == of.RK_PLT32) {
+        if (patch_off::u64 + 4 > sec_len::u64) {
+            ret err[bool, str](overflow_message(s, kind, sym_name));
+        }
+        val disp: i64 = (sym_va::i64) + addend - (patch_va::i64);
+        if (disp > 2147483647 || disp < -2147483648) {
+            ret err[bool, str](overflow_message(s, kind, sym_name));
+        }
+        bin.write_u32_le(dst, patch_off::usize, ((disp::u64) & 0xFFFFFFFF)::u32);
+        ret ok[bool, str](true);
+    }
+
+    # x86_64 RK_ABS32S: 32-bit signed absolute.
     if (kind == of.RK_ABS32S) {
         if (patch_off::u64 + 4 > sec_len::u64) {
             ret err[bool, str](overflow_message(s, kind, sym_name));
@@ -1591,6 +1615,91 @@ fun apply_one(s: *sess.Session, kind: of.RelocKind,
     }
 
     ret err[bool, str](unsupported_message(s, kind));
+}
+
+# apply_one_aarch64: patch an aarch64 instruction-field relocation. Each kind is a
+# read-modify-write of the 4-byte little-endian instruction word at the patch site:
+# the immediate is computed, range/alignment checked where the field is bounded, and
+# inserted into the instruction's bitfield without disturbing the opcode bits. The
+# LO12 access-size scale is carried by the reloc KIND (Option B), so the access
+# width is never recovered by decoding the instruction word.
+fun apply_one_aarch64(s: *sess.Session, kind: of.RelocKind,
+                     dst: *u8, patch_off: u32, sec_len: u32,
+                     sym_va: u64, addend: i64, patch_va: u64,
+                     sym_name: intern.StrId) Result[bool, str] {
+    # every A64 relocation patches a single 32-bit instruction word.
+    if (patch_off::u64 + 4 > sec_len::u64) {
+        ret err[bool, str](overflow_message(s, kind, sym_name));
+    }
+    val word: u32 = bin.read_u32_le(dst, patch_off::usize);
+
+    # RK_PLT32 -> R_AARCH64_CALL26: imm26 = (S + A - P) >> 2 into bits[25:0], the
+    # branch displacement in instruction units. range +-128MB, 4-aligned, and NO
+    # x86 -4 addend correction (the addend is the symbol's own addend only).
+    if (kind == of.RK_PLT32) {
+        val disp: i64 = (sym_va::i64) + addend - (patch_va::i64);
+        val lim: i64 = 134217728;   # 1 << 27
+        if (disp < -lim || disp >= lim || (disp & 3) != 0) {
+            ret err[bool, str](overflow_message(s, kind, sym_name));
+        }
+        val imm26: u32 = (((disp::u64) & 0x0FFFFFFC) >> 2)::u32;
+        bin.write_u32_le(dst, patch_off::usize, (word & 0xFC000000) | imm26);
+        ret ok[bool, str](true);
+    }
+
+    # RK_PAGE21 -> R_AARCH64_ADR_PREL_PG_HI21: ADRP page delta
+    # (Page(S+A) - Page(P)) >> 12 into immlo (bits[30:29]) + immhi (bits[23:5]);
+    # range +-4GB. Page(x) = x with its low 12 bits cleared.
+    if (kind == of.RK_PAGE21) {
+        val abs_addr: u64 = sym_va + (addend::u64);
+        val tgt_page: i64 = (abs_addr::i64)  - ((abs_addr::i64)  & 0xFFF);
+        val pc_page:  i64 = (patch_va::i64) - ((patch_va::i64) & 0xFFF);
+        val delta: i64 = tgt_page - pc_page;
+        val lim: i64 = 4294967296;   # 1 << 32
+        if (delta < -lim || delta >= lim) {
+            ret err[bool, str](overflow_message(s, kind, sym_name));
+        }
+        val imm21: u32 = (((delta::u64) >> 12) & 0x1FFFFF)::u32;
+        val immlo: u32 = imm21 & 0x3;
+        val immhi: u32 = (imm21 >> 2) & 0x7FFFF;
+        # keep bit[31] (op), bits[28:24] (opcode), bits[4:0] (Rd); replace immlo/immhi.
+        bin.write_u32_le(dst, patch_off::usize, (word & 0x9F00001F) | (immlo << 29) | (immhi << 5));
+        ret ok[bool, str](true);
+    }
+
+    # RK_ADD_LO12 -> R_AARCH64_ADD_ABS_LO12_NC: (S+A) & 0xFFF into the ADD imm12
+    # field (bits[21:10]). _NC: no overflow check (12 bits always fit).
+    if (kind == of.RK_ADD_LO12) {
+        val abs_addr: u64 = sym_va + (addend::u64);
+        val imm12: u32 = ((abs_addr & 0xFFF)::u32);
+        bin.write_u32_le(dst, patch_off::usize, (word & 0xFFC003FF) | (imm12 << 10));
+        ret ok[bool, str](true);
+    }
+
+    # RK_LDST{8,16,32,64,128}_LO12 -> R_AARCH64_LDST*_ABS_LO12_NC: ((S+A) & 0xFFF)
+    # >> scale into the LDR/STR imm12 field (bits[21:10]); the scale comes from the
+    # kind (Option B), never an instruction decode. _NC: assumes the global address
+    # is access-width aligned (verified by the data-section layout, not here).
+    val scale: i32 = ldst_lo12_scale(kind);
+    if (scale >= 0) {
+        val abs_addr: u64 = sym_va + (addend::u64);
+        val imm12: u32 = (((abs_addr & 0xFFF) >> (scale::u64))::u32);
+        bin.write_u32_le(dst, patch_off::usize, (word & 0xFFC003FF) | (imm12 << 10));
+        ret ok[bool, str](true);
+    }
+
+    ret err[bool, str](unsupported_message(s, kind));
+}
+
+# ldst_lo12_scale: the access-width shift {0,1,2,3,4} carried by a per-width
+# RK_LDST*_LO12 kind, or -1 if `kind` is not one of them.
+fun ldst_lo12_scale(kind: of.RelocKind) i32 {
+    if (kind == of.RK_LDST8_LO12)   { ret 0; }
+    if (kind == of.RK_LDST16_LO12)  { ret 1; }
+    if (kind == of.RK_LDST32_LO12)  { ret 2; }
+    if (kind == of.RK_LDST64_LO12)  { ret 3; }
+    if (kind == of.RK_LDST128_LO12) { ret 4; }
+    ret -1;
 }
 
 # carry_relocations: in relocatable mode, copy each input relocation onto the
@@ -1922,16 +2031,16 @@ test "linker: apply_one pc32/plt32 boundary range checks (#1242)" {
     dst[4] = 0; dst[5] = 0; dst[6] = 0; dst[7] = 0;
 
     # max valid positive displacement: must succeed and round-trip
-    val r1: Result[bool, str] = apply_one(?s, of.RK_PC32, ?dst[0], 0, 8, 0x7FFFFFFF, 0, 0, intern.STR_NIL);
+    val r1: Result[bool, str] = apply_one(?s, of.RK_PC32, ?dst[0], 0, 8, 0x7FFFFFFF, 0, 0, intern.STR_NIL, isa.ARCH_X86_64);
     if (is_err[bool, str](r1)) { ret 1; }
     if (bin.read_u32_le(?dst[0], 0) != 0x7FFFFFFF) { ret 1; }
 
     # one past the positive boundary: disp=2147483648 > INT32_MAX
-    val r2: Result[bool, str] = apply_one(?s, of.RK_PC32, ?dst[0], 0, 8, 0x80000000, 0, 0, intern.STR_NIL);
+    val r2: Result[bool, str] = apply_one(?s, of.RK_PC32, ?dst[0], 0, 8, 0x80000000, 0, 0, intern.STR_NIL, isa.ARCH_X86_64);
     if (!is_err[bool, str](r2)) { ret 1; }
 
     # negative underflow via plt32: patch_va=0x80000000, addend=-1 -> disp=-2147483649 < INT32_MIN
-    val r3: Result[bool, str] = apply_one(?s, of.RK_PLT32, ?dst[0], 0, 8, 0, -1, 0x80000000, intern.STR_NIL);
+    val r3: Result[bool, str] = apply_one(?s, of.RK_PLT32, ?dst[0], 0, 8, 0, -1, 0x80000000, intern.STR_NIL, isa.ARCH_X86_64);
     if (!is_err[bool, str](r3)) { ret 1; }
 
     ret 0;
@@ -1949,24 +2058,123 @@ test "linker: apply_one abs32s boundary range checks (#1242)" {
     dst[4] = 0; dst[5] = 0; dst[6] = 0; dst[7] = 0;
 
     # sym_va=0x7FFFFFFF, addend=0 -> v=2147483647, within range; must round-trip
-    val r1: Result[bool, str] = apply_one(?s, of.RK_ABS32S, ?dst[0], 0, 8, 0x7FFFFFFF, 0, 0, intern.STR_NIL);
+    val r1: Result[bool, str] = apply_one(?s, of.RK_ABS32S, ?dst[0], 0, 8, 0x7FFFFFFF, 0, 0, intern.STR_NIL, isa.ARCH_X86_64);
     if (is_err[bool, str](r1)) { ret 1; }
     if (bin.read_u32_le(?dst[0], 0) != 0x7FFFFFFF) { ret 1; }
 
     # sym_va=0x80000000 -> v=2147483648 > INT32_MAX
-    val r2: Result[bool, str] = apply_one(?s, of.RK_ABS32S, ?dst[0], 0, 8, 0x80000000, 0, 0, intern.STR_NIL);
+    val r2: Result[bool, str] = apply_one(?s, of.RK_ABS32S, ?dst[0], 0, 8, 0x80000000, 0, 0, intern.STR_NIL, isa.ARCH_X86_64);
     if (!is_err[bool, str](r2)) { ret 1; }
 
     # sym_va=0, addend=INT32_MIN -> v=-2147483648, at boundary (valid); encodes as 0x80000000
     dst[0] = 0; dst[1] = 0; dst[2] = 0; dst[3] = 0;
-    val r3: Result[bool, str] = apply_one(?s, of.RK_ABS32S, ?dst[0], 0, 8, 0, -2147483648, 0, intern.STR_NIL);
+    val r3: Result[bool, str] = apply_one(?s, of.RK_ABS32S, ?dst[0], 0, 8, 0, -2147483648, 0, intern.STR_NIL, isa.ARCH_X86_64);
     if (is_err[bool, str](r3)) { ret 1; }
     if (bin.read_u32_le(?dst[0], 0) != 0x80000000) { ret 1; }
 
     # addend=INT32_MIN-1 -> v=-2147483649 < INT32_MIN
     val below_min: i64 = -2147483648 - 1;
-    val r4: Result[bool, str] = apply_one(?s, of.RK_ABS32S, ?dst[0], 0, 8, 0, below_min, 0, intern.STR_NIL);
+    val r4: Result[bool, str] = apply_one(?s, of.RK_ABS32S, ?dst[0], 0, 8, 0, below_min, 0, intern.STR_NIL, isa.ARCH_X86_64);
     if (!is_err[bool, str](r4)) { ret 1; }
+
+    ret 0;
+}
+
+# the aarch64 bit-packers reproduce the exact instruction words the LLVM assembler
+# emits for the resolved immediates: each base instruction (zero immediate) is
+# patched and compared to the llvm-mc golden for the equivalent concrete form.
+test "linker: apply_one aarch64 reloc bit-packers match llvm-mc goldens (#1432)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    var dst: [8]u8;
+    dst[4] = 0; dst[5] = 0; dst[6] = 0; dst[7] = 0;
+
+    # CALL26 (RK_PLT32): `bl #0` patched with disp 0x2000 -> `bl #0x2000` = 0x94000800
+    bin.write_u32_le(?dst[0], 0, 0x94000000);
+    val c1: Result[bool, str] = apply_one(?s, of.RK_PLT32, ?dst[0], 0, 8, 0x2000, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (is_err[bool, str](c1)) { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0x94000800) { ret 1; }
+
+    # PAGE21 (RK_PAGE21): `adrp x0` patched with page delta 0x3000 -> 0xF0000000
+    bin.write_u32_le(?dst[0], 0, 0x90000000);
+    val p1: Result[bool, str] = apply_one(?s, of.RK_PAGE21, ?dst[0], 0, 8, 0x3000, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (is_err[bool, str](p1)) { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0xF0000000) { ret 1; }
+
+    # ADD_LO12 (RK_ADD_LO12): `add x0,x0` patched with lo12 0xABC -> 0x912AF000
+    bin.write_u32_le(?dst[0], 0, 0x91000000);
+    val a1: Result[bool, str] = apply_one(?s, of.RK_ADD_LO12, ?dst[0], 0, 8, 0xABC, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (is_err[bool, str](a1)) { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0x912AF000) { ret 1; }
+
+    # LDST8_LO12 (scale 0): `ldrb w0,[x0]` + lo12 0xABC -> 0x396AF000
+    bin.write_u32_le(?dst[0], 0, 0x39400000);
+    val l8: Result[bool, str] = apply_one(?s, of.RK_LDST8_LO12, ?dst[0], 0, 8, 0xABC, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (is_err[bool, str](l8)) { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0x396AF000) { ret 1; }
+
+    # LDST16_LO12 (scale 1): `ldrh w0,[x0]` + lo12 0xABC -> 0x79557800
+    bin.write_u32_le(?dst[0], 0, 0x79400000);
+    val l16: Result[bool, str] = apply_one(?s, of.RK_LDST16_LO12, ?dst[0], 0, 8, 0xABC, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (is_err[bool, str](l16)) { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0x79557800) { ret 1; }
+
+    # LDST32_LO12 (scale 2): `ldr w0,[x0]` + lo12 0xABC -> 0xB94ABC00
+    bin.write_u32_le(?dst[0], 0, 0xB9400000);
+    val l32: Result[bool, str] = apply_one(?s, of.RK_LDST32_LO12, ?dst[0], 0, 8, 0xABC, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (is_err[bool, str](l32)) { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0xB94ABC00) { ret 1; }
+
+    # LDST64_LO12 (scale 3): `ldr x0,[x0]` + lo12 0xAB8 -> 0xF9455C00
+    bin.write_u32_le(?dst[0], 0, 0xF9400000);
+    val l64: Result[bool, str] = apply_one(?s, of.RK_LDST64_LO12, ?dst[0], 0, 8, 0xAB8, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (is_err[bool, str](l64)) { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0xF9455C00) { ret 1; }
+
+    # LDST128_LO12 (scale 4): `ldr q0,[x0]` + lo12 0xAB0 -> 0x3DC2AC00
+    bin.write_u32_le(?dst[0], 0, 0x3DC00000);
+    val l128: Result[bool, str] = apply_one(?s, of.RK_LDST128_LO12, ?dst[0], 0, 8, 0xAB0, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (is_err[bool, str](l128)) { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0x3DC2AC00) { ret 1; }
+
+    ret 0;
+}
+
+# the bounded A64 fields (CALL26 +-128MB 4-aligned, PAGE21 +-4GB) reject
+# out-of-range / misaligned displacements; the _NC LO12 kinds never overflow.
+test "linker: apply_one aarch64 reloc overflow + alignment rejection (#1432)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    var dst: [8]u8;
+    dst[4] = 0; dst[5] = 0; dst[6] = 0; dst[7] = 0;
+
+    # CALL26: disp = +2^27 is one past the +-128MB branch range -> reject
+    bin.write_u32_le(?dst[0], 0, 0x94000000);
+    val o1: Result[bool, str] = apply_one(?s, of.RK_PLT32, ?dst[0], 0, 8, 134217728, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (!is_err[bool, str](o1)) { ret 1; }
+
+    # CALL26: disp = -2^27 is the valid negative boundary -> succeed
+    bin.write_u32_le(?dst[0], 0, 0x94000000);
+    val o2: Result[bool, str] = apply_one(?s, of.RK_PLT32, ?dst[0], 0, 8, 0, 0, 134217728, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (is_err[bool, str](o2)) { ret 1; }
+
+    # CALL26: a non-4-aligned displacement is not a valid branch target -> reject
+    bin.write_u32_le(?dst[0], 0, 0x94000000);
+    val o3: Result[bool, str] = apply_one(?s, of.RK_PLT32, ?dst[0], 0, 8, 0x2002, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (!is_err[bool, str](o3)) { ret 1; }
+
+    # PAGE21: page delta = +2^32 is one past the +-4GB ADRP range -> reject
+    bin.write_u32_le(?dst[0], 0, 0x90000000);
+    val o4: Result[bool, str] = apply_one(?s, of.RK_PAGE21, ?dst[0], 0, 8, 4294967296, 0, 0, intern.STR_NIL, isa.ARCH_AARCH64);
+    if (!is_err[bool, str](o4)) { ret 1; }
 
     ret 0;
 }
