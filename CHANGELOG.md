@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- driver/source: reload-friendly source handling for long-lived sessions. The
+  session `SourceMap` now dedups by path (`source.load`): re-loading a path returns
+  its existing `FileId` and swaps the text in place rather than appending, so a
+  session that reloads its project graph on every save no longer grows without
+  bound. `dnit_project` now also resets the session's per-build module registries
+  (AST/sema/resolve/comptime/fqn and export/import maps), dropping the borrowed
+  references the freed Project leaves behind so one Session is reusable across
+  rebuilds. This is path-dedup + reclamation only; reusing untouched ASTs/resolve
+  results across a rebuild (true incremental rebuild) is tracked separately in
+  #1164 (#1389).
+
 ## [1.5.4] - 2026-06-14
 
 Stabilization + multi-target-prep release. Adds the multi-target union Project for
