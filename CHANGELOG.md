@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-06-14
+
+The aarch64-linux debut: mach now cross-compiles and self-hosts on 64-bit ARM
+linux (AAPCS64) alongside x86_64 linux and windows. The compiler itself makes no
+variadic calls, so the self-host fixpoint converges byte-identical on aarch64
+under qemu exactly as it does natively on x86_64.
+
+### Added
+
+- target/aarch64: a complete aarch64-linux back end (#1431). The A64 fixed-width
+  encoder emits 32-bit instruction words directly; instruction selection covers
+  the scalar integer and floating-point paths; integer division and remainder
+  lower to `sdiv`/`udiv` + `msub` with the defined divide-by-zero and
+  signed-overflow trap semantics; and variable (runtime-count) shifts lower to
+  the register-operand shift forms.
+- target/aarch64: the AAPCS64 calling convention — argument and result
+  classification across the general-purpose (x0–x7) and SIMD/FP (v0–v7) register
+  banks, the x8 indirect-result register for large/`sret` returns, and
+  natural-alignment of stack-passed arguments.
+- target/aarch64: calls, relocations, and frames — `bl` calls and the
+  `adrp`+`add`/`ldr` symbol-address idiom emitting the R_AARCH64_CALL26,
+  ADR_PREL_PG_HI21, ADD_ABS_LO12_NC, and LDST\*_ABS_LO12_NC relocation kinds,
+  with the leaf and non-leaf frame prologue/epilogue (`stp`/`ldp` of x29/x30).
+- target/aarch64: inline-asm mnemonic support for the A64 instruction set, so the
+  mach-std aarch64 runtime entry (`_start`) and OS layer assemble through the same
+  per-architecture asm path as the x86_64 runtime.
+- ci/release: the aarch64-linux release asset is enabled (`RELEASE_AARCH64`), with
+  a qemu-aarch64 smoke-test that proves the cross-built aarch64 `mach` can both
+  build and run a real project under emulation before it ships — mirroring the
+  windows/wine compiler smoke. CI's aarch64 lane cross-builds mach to aarch64 and
+  byte-verifies the emitted encodings; the runtime is exercised by that qemu smoke
+  and the aarch64 self-host fixpoint, with the in-source test corpus run under
+  qemu-user-static gated pending #1464.
+
+### Fixed
+
+- target/aarch64: f64 and f32 memory loads and stores selected the wrong register
+  class — addressing a general-purpose register where a SIMD/FP register was
+  required — so a float loaded from or stored to memory (a struct field, array
+  element, or pointer dereference) now uses the SIMD `ldr`/`str` forms (#1459).
+- parser: the bare statement keywords `cnt` / `brk` are disambiguated from
+  identifiers via lookahead — they are keywords only in the bare `cnt;` / `brk;`
+  statement form, so `cnt = expr;` now parses as an assignment instead of failing
+  with the misleading "expected ';' after 'cnt'" (#1458). This was a prerequisite
+  for aarch64: the aarch64 std runtime's inline asm uses the `brk` mnemonic
+  (`asm aarch64 { brk 0 }`), which the pre-fix parser mis-parsed as the keyword.
+
+### Known limitations
+
+- aarch64-linux v1.6.0 ships without variadic formatting (`printf`/`format`/
+  `vformat`): mach-std gates the variadic surface out of the aarch64 build, with
+  the redesign deferred to v1.6.x as a cross-platform varargs effort. The
+  compiler makes no variadic calls, so self-host is unaffected; only aarch64
+  programs that call the variadic formatting helpers are impacted.
+
 ## [1.5.5] - 2026-06-14
 
 Tooling-prep patch. Adds reload-friendly source handling so a long-lived session

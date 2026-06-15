@@ -15,22 +15,46 @@
 # `of.ObjectImage`, and the per-arch encoder (e.g. `target/isa/x64/encode.mach`)
 # allocates and populates them. Keeping the records here lets the driver and every
 # ISA agree on one common output without depending on any specific architecture.
+#
+# It also owns the ISA-agnostic two-pass *encoder driver* every architecture's
+# encoder runs over a module: `encode_driver` initialises an `EncodeState`
+# (the growable text `ByteBuf` plus the symbol / relocation / branch-fixup /
+# block-offset arrays), walks every function through an ISA-supplied per-function
+# encode hook (recording marks, relocs, fixups, and block offsets via the shared
+# `push_*` helpers), patches every intra-module branch in pass 2 through an
+# ISA-supplied per-branch patch hook, right-sizes the text, and assembles the
+# `EncoderOutput`. The two `EncodeHooks` are the only per-ISA seams: how one
+# function's bytes are emitted (opcodes, prologue/epilogue, relocation offsets)
+# and how one resolved branch displacement is written into the text. No opcode,
+# register, displacement-width, or byte-encoding knowledge lives here.
 
 use std.types.bool.bool;
 use std.types.bool.true;
+use std.types.bool.false;
 use std.types.string.str;
+use std.types.size.usize;
 
 use std.types.result.Result;
 use std.types.result.ok;
 use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
 
 use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.reallocate;
+use std.allocator.deallocate;
+
+use std.system.panic.panic;
 
 use writer: std.io.writer;
 
 use intern: mach.lang.intern;
 use of:     mach.lang.target.of;
 use target: mach.lang.target.resolved;
+use abi:    mach.lang.target.abi;
+use tos:    mach.lang.target.os;
 use mir:    mach.lang.be.codegen.mir;
 
 # EncoderOutput: the per-module result an ISA's encoder produces — the encoded
@@ -167,4 +191,543 @@ pub fun print_asm(tgt: *target.Target, m: *mir.MirModule, out: *writer.Writer) R
 
     val emit_asm: PrintAsmFn = tgt.arch.emit_asm::PrintAsmFn;
     ret emit_asm(tgt, m, out);
+}
+
+# initial capacity of a freshly grown encoder byte buffer.
+val BYTEBUF_INIT_CAP: usize = 256;
+
+# a growable byte sink the encoders write machine code into. the back end drains
+# `data[0..len]` into the object image's `.text` section after every function is
+# encoded; keeping the growth bookkeeping here lets `of.Section` stay a finalized
+# container. the sink is ISA-general — it carries no opcode or width knowledge, so
+# every architecture's encoder writes its bytes through the same buffer.
+# ---
+# data:  backing byte array (nil until the first byte is appended)
+# len:   number of bytes written
+# cap:   allocated capacity
+# alloc: allocator backing `data`
+pub rec ByteBuf {
+    data:  *u8;
+    len:   usize;
+    cap:   usize;
+    alloc: *Allocator;
+}
+
+# buf_init: construct an empty encoder byte buffer.
+# ---
+# alloc: allocator backing the buffer's storage
+# ret:   an empty ByteBuf
+pub fun buf_init(alloc: *Allocator) ByteBuf {
+    var buf: ByteBuf;
+    buf.data  = nil;
+    buf.len   = 0;
+    buf.cap   = 0;
+    buf.alloc = alloc;
+    ret buf;
+}
+
+# buf_dnit: free a byte buffer's backing storage.
+# ---
+# buf: buffer to destroy; safe on nil
+pub fun buf_dnit(buf: *ByteBuf) {
+    if (buf == nil) { ret; }
+    if (buf.data != nil && buf.cap > 0) {
+        deallocate[u8](buf.alloc, buf.data, buf.cap);
+        buf.data = nil;
+    }
+    buf.len = 0;
+    buf.cap = 0;
+}
+
+# emit_byte: append a single byte to the buffer, growing it if needed.
+pub fun emit_byte(buf: *ByteBuf, byte: u8) {
+    if (buf.len >= buf.cap) {
+        var new_cap: usize = BYTEBUF_INIT_CAP;
+        if (buf.cap > 0) { new_cap = buf.cap * 2; }
+        val res_realloc: Result[*u8, str] = reallocate[u8](
+            buf.alloc, buf.data, buf.cap, new_cap
+        );
+        if (is_err[*u8, str](res_realloc)) {
+            panic("encode: byte buffer realloc failed\n");
+        }
+        buf.data = unwrap_ok[*u8, str](res_realloc);
+        buf.cap = new_cap;
+    }
+    buf.data[buf.len] = byte;
+    buf.len = buf.len + 1;
+}
+
+# emit_u16: append 2 bytes little-endian.
+pub fun emit_u16(buf: *ByteBuf, value: u16) {
+    emit_byte(buf, (value & 0xFF)::u8);
+    emit_byte(buf, ((value >> 8) & 0xFF)::u8);
+}
+
+# emit_u32: append 4 bytes little-endian.
+pub fun emit_u32(buf: *ByteBuf, value: u32) {
+    emit_byte(buf, (value & 0xFF)::u8);
+    emit_byte(buf, ((value >> 8) & 0xFF)::u8);
+    emit_byte(buf, ((value >> 16) & 0xFF)::u8);
+    emit_byte(buf, ((value >> 24) & 0xFF)::u8);
+}
+
+# emit_u64: append 8 bytes little-endian.
+pub fun emit_u64(buf: *ByteBuf, value: u64) {
+    emit_u32(buf, (value & 0xFFFFFFFF)::u32);
+    emit_u32(buf, ((value >> 32) & 0xFFFFFFFF)::u32);
+}
+
+# initial capacity for the encoder driver's symbol, relocation, fixup, and
+# block-offset arrays.
+val DRIVER_INIT_CAP: u32 = 16;
+
+# a single pending branch fixup recorded in pass 1 and patched in pass 2: an
+# intra-module branch whose displacement field is at `patch_pos` and whose target
+# is block `target_block` within the function based at `fn_text_base`. the field's
+# width and how a resolved displacement is written into it are ISA-specific (the
+# `EncodeHooks.patch_branch` hook), so this record names only the offsets the
+# shared driver resolves.
+# ---
+# patch_pos:    byte offset of the displacement field within `.text`
+# next_ip:      byte offset of the instruction following the branch within `.text`
+# target_block: destination MIR block id (function-local)
+# fn_text_base: text offset of the owning function's first block
+pub rec BranchFixup {
+    patch_pos:    u32;
+    next_ip:      u32;
+    target_block: u32;
+    fn_text_base: u32;
+}
+
+# one resolved block start: a function-local block id paired with its `.text`
+# offset, used to compute branch displacements in pass 2.
+# ---
+# fn_text_base: text offset of the owning function's first block
+# block_id:     function-local MIR block id
+# offset:       byte offset of the block's first instruction within `.text`
+rec BlockOffset {
+    fn_text_base: u32;
+    block_id:     u32;
+    offset:       u32;
+}
+
+# mutable bookkeeping shared across the encoder driver's two passes. owns the
+# growable text / symbol / relocation / fixup / block-offset arrays until
+# `encode_driver` either transfers the text + symbol + relocation arrays into the
+# returned `EncoderOutput` or frees everything on error. carries no
+# architecture-specific state — every field is ISA-general bookkeeping the shared
+# driver and every ISA's encode hook populate through the `push_*` helpers.
+# ---
+# alloc:        backing allocator
+# buf:          text byte sink
+# syms:         symbol marks
+# sym_count:    number of symbol marks
+# sym_cap:      capacity of `syms`
+# relocs:       pending relocations
+# reloc_count:  number of relocations
+# reloc_cap:    capacity of `relocs`
+# fixups:       pending branch fixups
+# fixup_count:  number of fixups
+# fixup_cap:    capacity of `fixups`
+# blocks:       resolved block offsets
+# block_count:  number of block offsets
+# block_cap:    capacity of `blocks`
+# interner:     session interner; resolves inline-asm `{name}` binding names and
+#               interns symbol names referenced from inline asm into relocations
+# abi:          the target ABI vtable (frame / argument model the encode hook reads)
+# os:           the target OS vtable (stack-probe / commit model the encode hook reads)
+pub rec EncodeState {
+    alloc:       *Allocator;
+    buf:         ByteBuf;
+    syms:        *SymbolMark;
+    sym_count:   u32;
+    sym_cap:     u32;
+    relocs:      *PendingReloc;
+    reloc_count: u32;
+    reloc_cap:   u32;
+    fixups:      *BranchFixup;
+    fixup_count: u32;
+    fixup_cap:   u32;
+    blocks:      *BlockOffset;
+    block_count: u32;
+    block_cap:   u32;
+    interner:    *intern.Interner;
+    abi:         *abi.AbiVTable;
+    os:          *tos.OsVTable;
+}
+
+# EncodeFunctionFn: the per-function encode hook. emits one function's machine
+# code into the shared `EncodeState` — the prologue, the instruction stream, and
+# the epilogue — recording its entry `SymbolMark`, every block's `.text` offset
+# (`push_block`), each cross-function / global symbol reference as a
+# `PendingReloc` (`push_reloc`), and each intra-module branch as a `BranchFixup`
+# (`push_fixup`) for pass 2. owns all opcode, register, relocation-offset, and
+# prologue/epilogue knowledge; the driver supplies only the shared state.
+# ---
+# st: the shared encode state (text sink + mark / reloc / fixup / block arrays)
+# f:  the function to encode
+# ret: ok(true) on success, or an error string from the per-arch encoder
+pub def EncodeFunctionFn: fun(*EncodeState, *mir.MirFunction) Result[bool, str];
+
+# PatchBranchFn: the per-branch patch hook. writes the resolved displacement of
+# one pass-1 `BranchFixup` into its `.text` field now that its target block's
+# offset is known. owns the ISA's branch encoding — the field width and the byte /
+# bitfield layout (x86-64 overwrites a 4-byte rel32; AArch64 inserts an imm26 /
+# imm19 into a 32-bit instruction word) and the displacement convention (relative
+# to `next_ip`, the branch start, etc.). the driver resolves `target_off` and
+# leaves the displacement computation and the write to the hook.
+# ---
+# st:         the shared encode state (its `buf` holds the text being patched)
+# fx:         the fixup to patch (its `patch_pos` / `next_ip` name the site)
+# target_off: the `.text` offset of the branch's resolved target block
+# ret:        ok(true) on success, or an error string (e.g. an out-of-range site)
+pub def PatchBranchFn: fun(*EncodeState, *BranchFixup, u32) Result[bool, str];
+
+# EncodeHooks: the per-ISA seam of the shared two-pass encoder driver. an
+# architecture's encoder supplies one of each and calls `encode_driver`; the
+# driver owns everything else (state lifetime, the function loop, pass-2 block
+# resolution, text right-sizing, and output assembly). these two are the only
+# operations that carry opcode / register / displacement knowledge.
+# ---
+# encode_function: emit one function's bytes into the shared state (pass 1)
+# patch_branch:    write one resolved branch displacement into the text (pass 2)
+pub rec EncodeHooks {
+    encode_function: EncodeFunctionFn;
+    patch_branch:    PatchBranchFn;
+}
+
+# encode_driver: the ISA-agnostic two-pass encoder driver every architecture runs
+# over a fully-resolved MIR module to produce its `EncoderOutput`.
+#
+# initialises an `EncodeState` (empty text sink and mark / reloc / fixup / block
+# arrays, threading the module interner and the target ABI / OS vtables), then
+# runs pass 1 — walking every function in layout order through the ISA's
+# `encode_function` hook, which appends bytes and records symbol marks, pending
+# relocations, branch fixups, and block offsets through the shared `push_*`
+# helpers. pass 2 resolves every recorded `BranchFixup`'s target block offset and
+# hands it to the ISA's `patch_branch` hook to write the displacement. the text is
+# then right-sized (so the object builder's free-by-length matches the allocation)
+# and transferred, with the symbol and relocation arrays, into the returned
+# `EncoderOutput`; the driver-internal fixup and block arrays are released. on any
+# error every owned array is freed and the error propagated. carries no
+# architecture-specific knowledge — the two hooks own all of it.
+# ---
+# alloc: backing allocator for the encoder's output arrays (threaded for parity
+#        with `EncodeFn`; the state is backed by the module allocator, as before)
+# tgt:   resolved compilation target; supplies the ABI / OS vtables the hook reads
+# m:     the fully-resolved MIR module (post isel / regalloc / frame)
+# hooks: the per-ISA encode / patch operations
+# ret:   the populated `EncoderOutput` (owned arrays), or an error string
+pub fun encode_driver(alloc: *Allocator, tgt: *target.Target, m: *mir.MirModule, hooks: *EncodeHooks) Result[EncoderOutput, str] {
+    if (tgt == nil)   { ret err[EncoderOutput, str]("encode: nil target"); }
+    if (m == nil)     { ret err[EncoderOutput, str]("encode: nil mir module"); }
+    if (hooks == nil) { ret err[EncoderOutput, str]("encode: nil encode hooks"); }
+    if (hooks.encode_function == nil) {
+        ret err[EncoderOutput, str]("encode: ISA supplied no per-function encode hook");
+    }
+    if (hooks.patch_branch == nil) {
+        ret err[EncoderOutput, str]("encode: ISA supplied no per-branch patch hook");
+    }
+
+    var st: EncodeState;
+    st.alloc       = m.alloc;
+    st.buf         = buf_init(m.alloc);
+    st.syms        = nil;
+    st.sym_count   = 0;
+    st.sym_cap     = 0;
+    st.relocs      = nil;
+    st.reloc_count = 0;
+    st.reloc_cap   = 0;
+    st.fixups      = nil;
+    st.fixup_count = 0;
+    st.fixup_cap   = 0;
+    st.blocks      = nil;
+    st.block_count = 0;
+    st.block_cap   = 0;
+    st.interner    = m.interner;
+    st.abi         = tgt.abi;
+    st.os          = tgt.os;
+
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val ef: Result[bool, str] = hooks.encode_function(?st, ?m.functions[fi]);
+        if (is_err[bool, str](ef)) {
+            free_state(?st);
+            ret err[EncoderOutput, str](unwrap_err[bool, str](ef));
+        }
+        fi = fi + 1;
+    }
+
+    val pb: Result[bool, str] = patch_branches(?st, hooks);
+    if (is_err[bool, str](pb)) {
+        free_state(?st);
+        ret err[EncoderOutput, str](unwrap_err[bool, str](pb));
+    }
+
+    # right-size the text buffer so its allocation length equals `text_len`: the
+    # object builder owns these bytes and frees them by `len`, so the backing
+    # allocation must match exactly rather than the byte buffer's over-allocated
+    # capacity.
+    val tr: Result[bool, str] = shrink_text(?st);
+    if (is_err[bool, str](tr)) {
+        free_state(?st);
+        ret err[EncoderOutput, str](unwrap_err[bool, str](tr));
+    }
+
+    var out: EncoderOutput;
+    out.text         = st.buf.data;
+    out.text_len     = st.buf.len::u32;
+    out.relocations  = st.relocs;
+    out.reloc_count  = st.reloc_count;
+    out.symbols      = st.syms;
+    out.symbol_count = st.sym_count;
+
+    # the text / symbol / relocation arrays are transferred to the output; the
+    # driver-internal fixup and block-offset arrays are released.
+    free_scratch(?st);
+    ret ok[EncoderOutput, str](out);
+}
+
+# shrink the text byte sink so its backing allocation length equals the number of
+# bytes written. the object builder frees the transferred `.text` buffer by its
+# `len`, so the allocation must be exactly `len` bytes wide. a no-op when the
+# buffer is already exact, empty, or unallocated.
+fun shrink_text(st: *EncodeState) Result[bool, str] {
+    if (st.buf.data == nil) { ret ok[bool, str](true); }
+    if (st.buf.len == 0) {
+        deallocate[u8](st.alloc, st.buf.data, st.buf.cap);
+        st.buf.data = nil;
+        st.buf.cap  = 0;
+        ret ok[bool, str](true);
+    }
+    if (st.buf.cap == st.buf.len) { ret ok[bool, str](true); }
+    val r: Result[*u8, str] = reallocate[u8](st.alloc, st.buf.data, st.buf.cap, st.buf.len);
+    if (is_err[*u8, str](r)) { ret err[bool, str](unwrap_err[*u8, str](r)); }
+    st.buf.data = unwrap_ok[*u8, str](r);
+    st.buf.cap  = st.buf.len;
+    ret ok[bool, str](true);
+}
+
+# pass 2: resolve each recorded intra-module branch fixup's target block offset
+# and hand it to the ISA's `patch_branch` hook, which writes the displacement into
+# the text. the displacement convention and field layout are the hook's; the
+# driver only resolves block offsets in the shared block-offset table.
+fun patch_branches(st: *EncodeState, hooks: *EncodeHooks) Result[bool, str] {
+    if (st.buf.data == nil) { ret ok[bool, str](true); }
+    var i: u32 = 0;
+    for (i < st.fixup_count) {
+        val fx: *BranchFixup = ?st.fixups[i];
+        val tr: Result[u32, str] = block_offset(st, fx.fn_text_base, fx.target_block);
+        if (is_err[u32, str](tr)) { ret err[bool, str](unwrap_err[u32, str](tr)); }
+        val target_off: u32 = unwrap_ok[u32, str](tr);
+        val pr: Result[bool, str] = hooks.patch_branch(st, fx, target_off);
+        if (is_err[bool, str](pr)) { ret err[bool, str](unwrap_err[bool, str](pr)); }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# resolve a function-local block id to its `.text` offset. an unrecorded target is
+# a backend bug (a branch to a block the encoder never emitted), rejected loudly
+# rather than resolved to offset 0 (a branch into the first function's middle).
+fun block_offset(st: *EncodeState, fn_base: u32, block_id: u32) Result[u32, str] {
+    var i: u32 = 0;
+    for (i < st.block_count) {
+        if (st.blocks[i].fn_text_base == fn_base && st.blocks[i].block_id == block_id) {
+            ret ok[u32, str](st.blocks[i].offset);
+        }
+        i = i + 1;
+    }
+    ret err[u32, str]("encode: branch target block was never recorded");
+}
+
+# classify_refs: determine whether an instruction names an intra-module branch
+# target (a MIR_OP_BLOCK operand) or a relocatable symbol (a MIR_OP_SYM operand),
+# reporting the target block id / interned symbol name through the out-parameters.
+# MIR-level and ISA-agnostic — it reads only the generic operand model, so every
+# architecture's encode hook uses it to drive fixup / relocation recording.
+# ---
+# mi:           the instruction to inspect
+# target_block: out — the referenced block id (0 when none)
+# has_block:    out — true when a MIR_OP_BLOCK operand was found
+# sym:          out — the referenced interned symbol name (STR_NIL when none)
+# has_sym:      out — true when a MIR_OP_SYM operand was found
+# sym_addend:   out — the symbol operand's constant offset
+pub fun classify_refs(mi: *mir.MirInstr, target_block: *u32, has_block: *bool,
+                      sym: *intern.StrId, has_sym: *bool, sym_addend: *i32) {
+    var found_block: bool = false;
+    var found_sym: bool = false;
+    @has_block = false;
+    @has_sym   = false;
+    @target_block = 0;
+    @sym = intern.STR_NIL;
+    @sym_addend = 0;
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        if (op.kind == mir.MIR_OP_BLOCK && found_block == false) {
+            found_block = true;
+            @has_block = true;
+            @target_block = op.imm::u32;
+        }
+        if (op.kind == mir.MIR_OP_SYM && found_sym == false) {
+            found_sym = true;
+            @has_sym = true;
+            @sym = op.sym;
+            @sym_addend = op.sym_off;
+        }
+        k = k + 1;
+    }
+}
+
+# push_symbol: append a symbol mark, growing the symbol array on demand.
+pub fun push_symbol(st: *EncodeState, name: intern.StrId, offset: u32, flags: u32) Result[bool, str] {
+    if (st.sym_count >= st.sym_cap) {
+        val gr: Result[bool, str] = grow_symbols(st);
+        if (is_err[bool, str](gr)) { ret gr; }
+    }
+    st.syms[st.sym_count].name   = name;
+    st.syms[st.sym_count].offset = offset;
+    st.syms[st.sym_count].flags  = flags;
+    st.sym_count = st.sym_count + 1;
+    ret ok[bool, str](true);
+}
+
+# push_reloc: append a pending relocation, growing the relocation array on demand.
+pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i32) Result[bool, str] {
+    if (st.reloc_count >= st.reloc_cap) {
+        val gr: Result[bool, str] = grow_relocs(st);
+        if (is_err[bool, str](gr)) { ret gr; }
+    }
+    st.relocs[st.reloc_count].offset = offset;
+    st.relocs[st.reloc_count].kind   = kind;
+    st.relocs[st.reloc_count].sym    = sym;
+    st.relocs[st.reloc_count].addend = addend;
+    st.reloc_count = st.reloc_count + 1;
+    ret ok[bool, str](true);
+}
+
+# push_fixup: append a branch fixup, growing the fixup array on demand.
+pub fun push_fixup(st: *EncodeState, patch_pos: u32, next_ip: u32, target_block: u32, fn_text_base: u32) Result[bool, str] {
+    if (st.fixup_count >= st.fixup_cap) {
+        val gr: Result[bool, str] = grow_fixups(st);
+        if (is_err[bool, str](gr)) { ret gr; }
+    }
+    st.fixups[st.fixup_count].patch_pos    = patch_pos;
+    st.fixups[st.fixup_count].next_ip      = next_ip;
+    st.fixups[st.fixup_count].target_block = target_block;
+    st.fixups[st.fixup_count].fn_text_base = fn_text_base;
+    st.fixup_count = st.fixup_count + 1;
+    ret ok[bool, str](true);
+}
+
+# push_block: append a resolved block offset, growing the block-offset array on demand.
+pub fun push_block(st: *EncodeState, fn_text_base: u32, block_id: u32, offset: u32) Result[bool, str] {
+    if (st.block_count >= st.block_cap) {
+        val gr: Result[bool, str] = grow_blocks(st);
+        if (is_err[bool, str](gr)) { ret gr; }
+    }
+    st.blocks[st.block_count].fn_text_base = fn_text_base;
+    st.blocks[st.block_count].block_id     = block_id;
+    st.blocks[st.block_count].offset       = offset;
+    st.block_count = st.block_count + 1;
+    ret ok[bool, str](true);
+}
+
+# grow the symbol-mark array (or allocate it on first use).
+fun grow_symbols(st: *EncodeState) Result[bool, str] {
+    if (st.syms == nil) {
+        val r: Result[*SymbolMark, str] = allocate[SymbolMark](st.alloc, DRIVER_INIT_CAP::usize);
+        if (is_err[*SymbolMark, str](r)) { ret err[bool, str](unwrap_err[*SymbolMark, str](r)); }
+        st.syms    = unwrap_ok[*SymbolMark, str](r);
+        st.sym_cap = DRIVER_INIT_CAP;
+        ret ok[bool, str](true);
+    }
+    val nc: u32 = st.sym_cap * 2;
+    val r: Result[*SymbolMark, str] = reallocate[SymbolMark](st.alloc, st.syms, st.sym_cap::usize, nc::usize);
+    if (is_err[*SymbolMark, str](r)) { ret err[bool, str](unwrap_err[*SymbolMark, str](r)); }
+    st.syms    = unwrap_ok[*SymbolMark, str](r);
+    st.sym_cap = nc;
+    ret ok[bool, str](true);
+}
+
+# grow the relocation array (or allocate it on first use).
+fun grow_relocs(st: *EncodeState) Result[bool, str] {
+    if (st.relocs == nil) {
+        val r: Result[*PendingReloc, str] = allocate[PendingReloc](st.alloc, DRIVER_INIT_CAP::usize);
+        if (is_err[*PendingReloc, str](r)) { ret err[bool, str](unwrap_err[*PendingReloc, str](r)); }
+        st.relocs    = unwrap_ok[*PendingReloc, str](r);
+        st.reloc_cap = DRIVER_INIT_CAP;
+        ret ok[bool, str](true);
+    }
+    val nc: u32 = st.reloc_cap * 2;
+    val r: Result[*PendingReloc, str] = reallocate[PendingReloc](st.alloc, st.relocs, st.reloc_cap::usize, nc::usize);
+    if (is_err[*PendingReloc, str](r)) { ret err[bool, str](unwrap_err[*PendingReloc, str](r)); }
+    st.relocs    = unwrap_ok[*PendingReloc, str](r);
+    st.reloc_cap = nc;
+    ret ok[bool, str](true);
+}
+
+# grow the branch-fixup array (or allocate it on first use).
+fun grow_fixups(st: *EncodeState) Result[bool, str] {
+    if (st.fixups == nil) {
+        val r: Result[*BranchFixup, str] = allocate[BranchFixup](st.alloc, DRIVER_INIT_CAP::usize);
+        if (is_err[*BranchFixup, str](r)) { ret err[bool, str](unwrap_err[*BranchFixup, str](r)); }
+        st.fixups    = unwrap_ok[*BranchFixup, str](r);
+        st.fixup_cap = DRIVER_INIT_CAP;
+        ret ok[bool, str](true);
+    }
+    val nc: u32 = st.fixup_cap * 2;
+    val r: Result[*BranchFixup, str] = reallocate[BranchFixup](st.alloc, st.fixups, st.fixup_cap::usize, nc::usize);
+    if (is_err[*BranchFixup, str](r)) { ret err[bool, str](unwrap_err[*BranchFixup, str](r)); }
+    st.fixups    = unwrap_ok[*BranchFixup, str](r);
+    st.fixup_cap = nc;
+    ret ok[bool, str](true);
+}
+
+# grow the block-offset array (or allocate it on first use).
+fun grow_blocks(st: *EncodeState) Result[bool, str] {
+    if (st.blocks == nil) {
+        val r: Result[*BlockOffset, str] = allocate[BlockOffset](st.alloc, DRIVER_INIT_CAP::usize);
+        if (is_err[*BlockOffset, str](r)) { ret err[bool, str](unwrap_err[*BlockOffset, str](r)); }
+        st.blocks    = unwrap_ok[*BlockOffset, str](r);
+        st.block_cap = DRIVER_INIT_CAP;
+        ret ok[bool, str](true);
+    }
+    val nc: u32 = st.block_cap * 2;
+    val r: Result[*BlockOffset, str] = reallocate[BlockOffset](st.alloc, st.blocks, st.block_cap::usize, nc::usize);
+    if (is_err[*BlockOffset, str](r)) { ret err[bool, str](unwrap_err[*BlockOffset, str](r)); }
+    st.blocks    = unwrap_ok[*BlockOffset, str](r);
+    st.block_cap = nc;
+    ret ok[bool, str](true);
+}
+
+# free_scratch: release the driver-internal scratch arrays (fixups, block offsets)
+# once their work is done; the text / symbol / relocation arrays survive into
+# EncoderOutput.
+fun free_scratch(st: *EncodeState) {
+    if (st.fixups != nil && st.fixup_cap > 0) {
+        deallocate[BranchFixup](st.alloc, st.fixups, st.fixup_cap::usize);
+        st.fixups = nil;
+    }
+    if (st.blocks != nil && st.block_cap > 0) {
+        deallocate[BlockOffset](st.alloc, st.blocks, st.block_cap::usize);
+        st.blocks = nil;
+    }
+}
+
+# free_state: release every owned array on the error path, including the text sink
+# and the symbol / relocation arrays that would otherwise transfer into
+# EncoderOutput.
+fun free_state(st: *EncodeState) {
+    buf_dnit(?st.buf);
+    if (st.syms != nil && st.sym_cap > 0) {
+        deallocate[SymbolMark](st.alloc, st.syms, st.sym_cap::usize);
+        st.syms = nil;
+    }
+    if (st.relocs != nil && st.reloc_cap > 0) {
+        deallocate[PendingReloc](st.alloc, st.relocs, st.reloc_cap::usize);
+        st.relocs = nil;
+    }
+    free_scratch(st);
 }

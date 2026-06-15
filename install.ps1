@@ -1,5 +1,5 @@
 # installs the mach release binary.
-# usage: irm https://github.com/octalide/mach/releases/latest/download/install.ps1 | iex
+# usage: irm https://machlang.org/install.ps1 | iex
 #
 # MACH_VERSION      version to install (e.g. 1.4.2); defaults to the latest release
 # MACH_INSTALL_DIR  install directory; defaults to $env:LOCALAPPDATA\mach\bin

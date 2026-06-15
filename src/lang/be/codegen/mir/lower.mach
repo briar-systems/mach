@@ -771,11 +771,10 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
         ret lower_div(ctx, mb, inst, iid);
     }
 
-    # a shift (SHL / SHR_S / SHR_U) is two-address on x86-64 (`value op= count`),
-    # and a register count must occupy the ISA's shift-count register (x86-64 CL).
-    # it is lowered into the two-address form with a runtime count pre-colored into
-    # `tgt.arch.shift_count_reg`; an ISA wiring no fixed shift-count register reports
-    # -1 and `lower_shift` errors loudly rather than emitting an un-pre-colored shift.
+    # a shift (SHL / SHR_S / SHR_U): an ISA whose variable-shift form hard-wires the
+    # count register (x86-64 CL) pre-colors a runtime count into `tgt.arch.shift_count_reg`;
+    # an ISA wiring no fixed shift-count register (-1, e.g. AArch64 LSLV/LSRV/ASRV)
+    # passes the count straight through to the three-address register-shift form.
     if (inst.kind == instr.OP_SHL || inst.kind == instr.OP_SHR_S ||
         inst.kind == instr.OP_SHR_U) {
         ret lower_shift(ctx, mb, inst, iid);
@@ -978,18 +977,20 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
 
     var count_op: mir.MirOperand = count;
     if (count.kind != mir.MIR_OP_IMM) {
-        # a runtime count must occupy the ISA's shift-count register (x86-64 CL);
-        # move it there and reference it so the encoder selects the `shift r/m, CL`
-        # form. the register is reserved from allocation for the whole function, so
-        # this move cannot clobber a live value. an ISA wiring no fixed shift-count
-        # register (`shift_count_reg < 0`) cannot lower a runtime-count shift here.
+        # an ISA whose variable-shift form hard-wires the count register (x86-64 CL,
+        # `shift_count_reg >= 0`) pre-colors the runtime count into it and references it
+        # so the encoder selects the `shift r/m, CL` form; the register is reserved from
+        # allocation for the whole function, so the move cannot clobber a live value. an
+        # ISA wiring no fixed shift-count register (`shift_count_reg < 0`, e.g. AArch64
+        # LSLV/LSRV/ASRV, which read the count from any GP register) passes the count
+        # straight through to the three-address register-shift form — mirroring the
+        # division's `div_reg < 0` three-address path.
         val cnt_reg: i32 = ctx.tgt.arch.shift_count_reg;
-        if (cnt_reg < 0) {
-            ret err[bool, str]("mir.lower_ir: ISA wires no shift-count register for a runtime shift count");
+        if (cnt_reg >= 0) {
+            val mc: Result[bool, str] = lctx.emit_mov_w(ctx, mb, mir.op_preg(cnt_reg::u32), count, w);
+            if (is_err[bool, str](mc)) { ret mc; }
+            count_op = mir.op_preg(cnt_reg::u32);
         }
-        val mc: Result[bool, str] = lctx.emit_mov_w(ctx, mb, mir.op_preg(cnt_reg::u32), count, w);
-        if (is_err[bool, str](mc)) { ret mc; }
-        count_op = mir.op_preg(cnt_reg::u32);
     }
 
     # the three-address shift: operand 0 is the pure-def destination, operand 1 the
@@ -1009,8 +1010,15 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower_div: lower an integer OP_DIV_*/OP_REM_* into the x86-64 RAX:RDX division
-# sequence with explicit register pre-coloring, mirroring the call/return ABI
+# lower_div: lower an integer OP_DIV_*/OP_REM_*. an ISA whose division form
+# hard-wires the dividend / quotient accumulator and the high-half / remainder
+# register (`div_reg >= 0`, x86-64 RAX:RDX) takes the pre-coloring path below; an ISA
+# that wires no fixed division register (`div_reg < 0`, e.g. AArch64 SDIV/UDIV, which
+# write a normal destination register) takes the generic three-address path
+# (`lower_div_three_address`).
+#
+# the pre-coloring path lowers into the x86-64 RAX:RDX division sequence with explicit
+# register pre-coloring, mirroring the call/return ABI
 # pre-coloring approach. the IR operands are `[a, b]` (dividend, divisor). the
 # emitted sequence is, in order:
 #   - `mir.MIR_MOV RAX <- a` — the dividend occupies the accumulator;
@@ -1042,13 +1050,13 @@ fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     }
     # the ISA's division form hard-wires the dividend / quotient accumulator and the
     # high-half / remainder register (x86-64 RAX:RDX). an ISA wiring no fixed
-    # division register (`div_reg < 0` / `div_hi_reg < 0`) cannot lower an integer
-    # division through this pre-coloring path; fail loudly rather than emit one with
-    # an invalid register.
+    # division register (`div_reg < 0` / `div_hi_reg < 0`, e.g. AArch64 SDIV/UDIV)
+    # lowers to the generic three-address divide the per-ISA encoder realizes, rather
+    # than this pre-coloring path.
     val acc_reg: i32 = ctx.tgt.arch.div_reg;
     val hi_reg:  i32 = ctx.tgt.arch.div_hi_reg;
     if (acc_reg < 0 || hi_reg < 0) {
-        ret err[bool, str]("mir.lower_ir: ISA wires no division registers for an integer divide");
+        ret lower_div_three_address(ctx, mb, inst, iid, dst);
     }
     val signed: bool = inst.kind == instr.OP_DIV_S || inst.kind == instr.OP_REM_S;
 
@@ -1110,6 +1118,73 @@ fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
         res_reg = hi_reg;
     }
     ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(dst), mir.op_preg(res_reg::u32), natural_w);
+}
+
+# lower_div_three_address: lower an integer division / remainder on an ISA that wires
+# no fixed division register (`div_reg < 0`, e.g. AArch64 SDIV/UDIV, which write a
+# normal destination register). emits a clean three-address divide
+# `[dst, dividend, divisor]` carrying the OP_DIV_*/OP_REM_* kind and the operation
+# width; instruction selection rewrites it to the per-ISA selection-output sentinel
+# and the encoder materializes the quotient / remainder plus the defined
+# division-by-zero and signed-overflow traps. operand 0 is a pure def the register
+# allocator reads directly (no RAX/RDX pre-coloring). mirrors the pre-coloring path's
+# operand handling — a narrower-than-32-bit operand is promoted to the divide width
+# (the encoder's divides have only 32- and 64-bit forms) and an immediate operand is
+# materialized into a value vreg (so both operands reach the divide in a register,
+# which the SDIV/UDIV and the trap checks require; a constant-zero divisor thus lands
+# in a register and still traps). the destination IS the divide result, so a promoted
+# narrow result needs no truncating move (a consumer reads its low bytes).
+fun lower_div_three_address(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
+                            iid: id.InstructionId, dst: u32) Result[bool, str] {
+    val signed: bool = inst.kind == instr.OP_DIV_S || inst.kind == instr.OP_REM_S;
+
+    val natural_w: u8 = lctx.op_width_of(ctx, inst.ty);
+    var w: u8 = natural_w;
+    if (w < 4) { w = 4; }
+
+    val dividend: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
+    val divisor:  mir.MirOperand = lctx.lower_value(ctx, inst.operands[1]);
+
+    # the dividend reaches the divide in a register at the divide width: a promoted
+    # narrow value is widened into a fresh vreg, an immediate is materialized into one,
+    # and a register already at the divide width is used directly.
+    var n_op: mir.MirOperand = dividend;
+    if (natural_w < w || dividend.kind == mir.MIR_OP_IMM) {
+        val nvr: Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (is_err[u32, str](nvr)) { ret err[bool, str](unwrap_err[u32, str](nvr)); }
+        val nv: u32 = unwrap_ok[u32, str](nvr);
+        val ne: Result[bool, str] = emit_promote(ctx, mb, mir.op_vreg(nv), dividend, w, natural_w, signed);
+        if (is_err[bool, str](ne)) { ret ne; }
+        n_op = mir.op_vreg(nv);
+    }
+
+    # the divisor likewise reaches the divide in a register at the divide width.
+    var m_op: mir.MirOperand = divisor;
+    if (natural_w < w || divisor.kind == mir.MIR_OP_IMM) {
+        val mvr: Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (is_err[u32, str](mvr)) { ret err[bool, str](unwrap_err[u32, str](mvr)); }
+        val mv: u32 = unwrap_ok[u32, str](mvr);
+        val me: Result[bool, str] = emit_promote(ctx, mb, mir.op_vreg(mv), divisor, w, natural_w, signed);
+        if (is_err[bool, str](me)) { ret me; }
+        m_op = mir.op_vreg(mv);
+    }
+
+    # the three-address divide: operand 0 the pure-def destination, operand 1 the
+    # dividend, operand 2 the divisor. the OP_DIV_*/OP_REM_* opcode survives isel
+    # (rewritten to the selection-output sentinel) into the encoder.
+    val rop: Result[*mir.MirOperand, str] = allocate[mir.MirOperand](ctx.alloc, 3::usize);
+    if (is_err[*mir.MirOperand, str](rop)) { ret err[bool, str](unwrap_err[*mir.MirOperand, str](rop)); }
+    val ops: *mir.MirOperand = unwrap_ok[*mir.MirOperand, str](rop);
+    ops[0] = mir.op_vreg(dst);
+    ops[1] = n_op;
+    ops[2] = m_op;
+    var mi: mir.MirInstr;
+    mi.opcode        = inst.kind::u32;
+    mi.operands      = ops;
+    mi.operand_count = 3;
+    mi.width         = w;
+    mi.src_width     = w;
+    ret lctx.push_instr(ctx, mb, mi);
 }
 
 # emit_promote: move `src` into `dst` at `dst_w` bytes, widening from `src_w` when

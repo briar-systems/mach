@@ -51,6 +51,11 @@ for (i < 10) {
 }
 ```
 
+Both are operand-less, so they are keywords only in their bare `brk;` / `cnt;`
+form. The same word followed by anything else is an ordinary identifier — a
+variable named `cnt` reads and assigns normally (`cnt = x;`), even inside a
+loop that also uses bare `cnt;` for control flow.
+
 ## `fin` — deferred statement
 
 `fin` schedules a statement (or block) to execute when the enclosing scope
