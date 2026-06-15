@@ -83,8 +83,9 @@ expect_reject() {
     echo "PASS comptimeroots/$label: bare \$ident rejected with the teaching diagnostic"
 }
 
-build_and_run app    "manifest with profiles"
-build_and_run altapp "alternate declared values"
+build_and_run app     "manifest with profiles"
+build_and_run altapp  "alternate declared values"
+build_and_run machabi "\$mach.abi tag namespace"
 
 expect_reject bareident_gate  "bare \$ident gate"  "$BARE_IDENT_DIAG"
 expect_reject bareident_value "bare \$ident value" "$BARE_IDENT_DIAG"
