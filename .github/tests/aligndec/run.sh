@@ -79,6 +79,8 @@ if command -v readelf >/dev/null 2>&1 && [ -f "$OBJ" ]; then
     expect_align g_cmp16 16
     expect_align g_cmp8  8
     expect_align g_plain 8
+    # a global of an `align(32)` record inherits the type's raised alignment.
+    expect_align g_over  32
 else
     echo "INFO aligndec: readelf unavailable or object missing; skipping the alignment check"
 fi
