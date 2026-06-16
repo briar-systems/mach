@@ -24,9 +24,13 @@ use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
 use std.types.size.usize;
 use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
 use std.types.option.is_none;
 use std.types.option.unwrap;
 use std.allocator.allocate;
+use std.allocator.deallocate;
 
 use writer: std.io.writer;
 
@@ -168,13 +172,27 @@ fun pack_image(s: *sess.Session, tgt: *target.Target, irmod: *ir.Module,
     }
     val text_sec: u32 = unwrap_ok[u32, str](rtext);
 
-    val rsym: Result[bool, str] = pack_symbols(?image, irmod, enc, text_sec);
+    # `section("...")` decorators move individual functions out of the shared
+    # `.text` into named sections. build one placement per sectioned function
+    # (and create its section); the list is empty when no function is sectioned,
+    # in which case symbols and relocations all land in `.text` exactly as before.
+    var placements:      *SectionPlacement = nil;
+    var placement_count: u32 = 0;
+    val rpl: Result[bool, str] = build_section_placements(s, ?image, irmod, enc, ?placements, ?placement_count);
+    if (is_err[bool, str](rpl)) {
+        obj.dnit(?image);
+        ret err[of.ObjectImage, str](unwrap_err[bool, str](rpl));
+    }
+
+    val rsym: Result[bool, str] = pack_symbols(?image, irmod, enc, text_sec, placements, placement_count);
     if (is_err[bool, str](rsym)) {
+        if (placements != nil) { deallocate[SectionPlacement](s.alloc, placements, enc.symbol_count::usize); }
         obj.dnit(?image);
         ret err[of.ObjectImage, str](unwrap_err[bool, str](rsym));
     }
 
-    val rrel: Result[bool, str] = pack_relocs(?image, enc, text_sec);
+    val rrel: Result[bool, str] = pack_relocs(?image, enc, text_sec, placements, placement_count);
+    if (placements != nil) { deallocate[SectionPlacement](s.alloc, placements, enc.symbol_count::usize); }
     if (is_err[bool, str](rrel)) {
         obj.dnit(?image);
         ret err[of.ObjectImage, str](unwrap_err[bool, str](rrel));
@@ -281,6 +299,114 @@ fun image_has_symbol(image: *of.ObjectImage, name: intern.StrId) bool {
     ret false;
 }
 
+# SectionPlacement: a function moved out of `.text` by a `section("...")`
+# decorator. its [text_start, text_end) byte range in the encoder blob is copied
+# into the named section `sec`; a mark or relocation at offset O in that range is
+# re-homed to (sec, O - text_start). its bytes remain in `.text` as dead,
+# unreferenced content (no symbol or relocation points at them there).
+rec SectionPlacement {
+    text_start: u32;
+    text_end:   u32;
+    sec:        u32;
+}
+
+# function_section: the object section name a `section("...")` decorator places
+# the defined function `name` in, or STR_NIL for the default `.text`.
+fun function_section(irmod: *ir.Module, name: intern.StrId) intern.StrId {
+    var i: u32 = 0;
+    for (i < irmod.function_len) {
+        val fn: *ir.Function = ?irmod.functions[i];
+        if (fn.name == name && (fn.flags & ir.FN_FLAG_EXTERN) == 0) { ret fn.section; }
+        i = i + 1;
+    }
+    ret intern.STR_NIL;
+}
+
+# next_func_entry_offset: the encoder-blob offset of the first function-entry mark
+# after index `i`, or the total text length when `i` marks the last function. marks
+# are emitted in increasing offset order, so this bounds the function at index `i`.
+fun next_func_entry_offset(irmod: *ir.Module, enc: *encode.EncoderOutput, i: u32) u32 {
+    var j: u32 = i + 1;
+    for (j < enc.symbol_count) {
+        val m: *encode.SymbolMark = ?enc.symbols[j];
+        if (function_defined(irmod, m.name)) { ret m.offset; }
+        j = j + 1;
+    }
+    ret enc.text_len;
+}
+
+# placement_for: the placement whose text range contains `offset`, or none.
+fun placement_for(placements: *SectionPlacement, count: u32, offset: u32) Option[*SectionPlacement] {
+    var i: u32 = 0;
+    for (i < count) {
+        val p: *SectionPlacement = ?placements[i];
+        if (offset >= p.text_start && offset < p.text_end) { ret some[*SectionPlacement](p); }
+        i = i + 1;
+    }
+    ret none[*SectionPlacement]();
+}
+
+# make_func_section: copy the encoder blob's [start, end) bytes (one sectioned
+# function) into a fresh image-owned buffer, append a text-kind section named
+# `sname`, and return its index. same-named sections from sibling functions are
+# concatenated by the linker.
+fun make_func_section(s: *sess.Session, image: *of.ObjectImage, sname: intern.StrId,
+                      enc: *encode.EncoderOutput, start: u32, end: u32) Result[u32, str] {
+    val len: u32 = end - start;
+    val br: Result[*u8, str] = allocate[u8](s.alloc, len::usize);
+    if (is_err[*u8, str](br)) { ret err[u32, str](unwrap_err[*u8, str](br)); }
+    val buf: *u8 = unwrap_ok[*u8, str](br);
+    var k: u32 = 0;
+    for (k < len) { buf[k] = enc.text[start + k]; k = k + 1; }
+
+    var sec: of.Section;
+    sec.name  = sname;
+    sec.kind  = of.SK_TEXT;
+    sec.bytes = buf;
+    sec.len   = len;
+    sec.align = 16;
+    ret obj.add_section(image, sec);
+}
+
+# build_section_placements: create a named section for every sectioned defined
+# function and record its placement. writes the owned placement array (sized to the
+# mark count, freed by the caller) and the entry count through the out-params; an
+# empty result means no function is sectioned and emission is byte-for-byte unchanged.
+fun build_section_placements(s: *sess.Session, image: *of.ObjectImage, irmod: *ir.Module,
+                             enc: *encode.EncoderOutput, out_buf: **SectionPlacement, out_count: *u32) Result[bool, str] {
+    @out_buf   = nil;
+    @out_count = 0;
+    if (enc.symbol_count == 0) { ret ok[bool, str](true); }
+
+    val br: Result[*SectionPlacement, str] = allocate[SectionPlacement](s.alloc, enc.symbol_count::usize);
+    if (is_err[*SectionPlacement, str](br)) { ret err[bool, str](unwrap_err[*SectionPlacement, str](br)); }
+    val buf: *SectionPlacement = unwrap_ok[*SectionPlacement, str](br);
+
+    var count: u32 = 0;
+    var i: u32 = 0;
+    for (i < enc.symbol_count) {
+        val mark: *encode.SymbolMark = ?enc.symbols[i];
+        if (function_defined(irmod, mark.name)) {
+            val sname: intern.StrId = function_section(irmod, mark.name);
+            if (sname != intern.STR_NIL) {
+                val start: u32 = mark.offset;
+                val end:   u32 = next_func_entry_offset(irmod, enc, i);
+                val rsec: Result[u32, str] = make_func_section(s, image, sname, enc, start, end);
+                if (is_err[u32, str](rsec)) {
+                    deallocate[SectionPlacement](s.alloc, buf, enc.symbol_count::usize);
+                    ret err[bool, str](unwrap_err[u32, str](rsec));
+                }
+                buf[count] = SectionPlacement{text_start: start, text_end: end, sec: unwrap_ok[u32, str](rsec)};
+                count = count + 1;
+            }
+        }
+        i = i + 1;
+    }
+    @out_buf   = buf;
+    @out_count = count;
+    ret ok[bool, str](true);
+}
+
 # append the encoded `.text` section to the image.
 # ---
 # s:     session, for interning the section name
@@ -321,7 +447,8 @@ fun pack_text(s: *sess.Session, image: *of.ObjectImage,
 # text_sec: index of the `.text` section the marks are defined in
 # ret:      true on success, or an error string
 fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
-                 enc: *encode.EncoderOutput, text_sec: u32) Result[bool, str] {
+                 enc: *encode.EncoderOutput, text_sec: u32,
+                 placements: *SectionPlacement, placement_count: u32) Result[bool, str] {
     var i: u32 = 0;
     for (i < enc.symbol_count) {
         val mark: *encode.SymbolMark = ?enc.symbols[i];
@@ -334,10 +461,21 @@ fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
             flags = flags | of.SYM_OBJ_FLAG_WEAK;
         }
 
+        # a mark inside a sectioned function is re-homed to that function's named
+        # section at the rebased offset; everything else stays in `.text`.
+        var sec_ix: u32 = text_sec;
+        var off:    u32 = mark.offset;
+        val pl: Option[*SectionPlacement] = placement_for(placements, placement_count, mark.offset);
+        if (is_some[*SectionPlacement](pl)) {
+            val p: *SectionPlacement = unwrap[*SectionPlacement](pl);
+            sec_ix = p.sec;
+            off    = mark.offset - p.text_start;
+        }
+
         var sym: of.Symbol;
         sym.name    = mark.name;
-        sym.section = text_sec;
-        sym.offset  = mark.offset;
+        sym.section = sec_ix;
+        sym.offset  = off;
         sym.size    = 0;
         sym.flags   = flags;
 
@@ -398,14 +536,26 @@ fun function_is_weak(irmod: *ir.Module, name: intern.StrId) bool {
 # text_sec: index of the `.text` section the relocations patch
 # ret:      true on success, or an error string
 fun pack_relocs(image: *of.ObjectImage, enc: *encode.EncoderOutput,
-                text_sec: u32) Result[bool, str] {
+                text_sec: u32, placements: *SectionPlacement, placement_count: u32) Result[bool, str] {
     var i: u32 = 0;
     for (i < enc.reloc_count) {
         val pr: *encode.PendingReloc = ?enc.relocations[i];
 
+        # a patch site inside a sectioned function is re-homed to that function's
+        # named section at the rebased offset; the symbol target is unchanged
+        # (resolved by the linker), so cross-section calls just work.
+        var sec_ix: u32 = text_sec;
+        var off:    u32 = pr.offset;
+        val pl: Option[*SectionPlacement] = placement_for(placements, placement_count, pr.offset);
+        if (is_some[*SectionPlacement](pl)) {
+            val p: *SectionPlacement = unwrap[*SectionPlacement](pl);
+            sec_ix = p.sec;
+            off    = pr.offset - p.text_start;
+        }
+
         var rel: of.Relocation;
-        rel.section = text_sec;
-        rel.offset  = pr.offset;
+        rel.section = sec_ix;
+        rel.offset  = off;
         rel.kind    = pr.kind;
         rel.symbol  = pr.sym;
         rel.addend  = pr.addend::i64;

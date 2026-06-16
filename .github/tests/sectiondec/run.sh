@@ -72,6 +72,9 @@ if command -v objdump >/dev/null 2>&1 && [ -f "$OBJ" ]; then
     }
     expect_sec g_sec .machsec
     expect_sec g_def .data
+    # a function placed in a named text section; the default function stays in .text.
+    expect_sec f_sec .hottext
+    expect_sec main  .text
 else
     echo "INFO sectiondec: objdump unavailable or object missing; skipping the section check"
 fi
