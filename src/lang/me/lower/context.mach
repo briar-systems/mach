@@ -120,6 +120,26 @@ pub rec ValueInstance {
     name:    intern.StrId;
 }
 
+# one collected comptime variadic-pack instance awaiting body emission: a
+# `(decl, origin, pack element type-list)` triple plus the mangled symbol name
+# the instance is emitted under. mirrors `Instance` but keys on the concrete
+# TYPES the pack absorbs at a call site (#1475), so a pack-tailed function is
+# monomorphized once per distinct trailing arg-type sequence. the worklist
+# dedups by `name`.
+# ---
+# decl:     DeclId of the pack-tailed function in `origin`'s AST
+# origin:   ModuleId that declares the function
+# types:    owned copy of the pack element type-list (by pack ordinal)
+# type_len: number of pack element types
+# name:     instance linkage name (mangled, with the type-list suffix)
+pub rec PackInstance {
+    decl:     aid.DeclId;
+    origin:   sess.ModuleId;
+    types:    *ty.TypeId;
+    type_len: u32;
+    name:     intern.StrId;
+}
+
 # per-module lowering state, threaded through every decl / stmt / expr.
 # the leading fields are the phase inputs and the IR being built; the
 # trailing fields are the working state for the function currently being
@@ -167,6 +187,12 @@ pub rec ValueInstance {
 #              active so the comptime evaluator selects each `$if` arm
 # vinst_len:   number of value-instance worklist entries
 # vinst_cap:   allocated capacity of the value-instance worklist
+# pinsts:      per-module worklist of comptime variadic-pack instances collected at
+#              call sites, drained to fixpoint alongside the type / value worklists;
+#              each emits one concrete weak body with the pack expanded to N params
+#              typed by the instance's element type-list
+# pinst_len:   number of pack-instance worklist entries
+# pinst_cap:   allocated capacity of the pack-instance worklist
 pub rec LowerContext {
     s:           *sess.Session;
     tgt:         *target.Target;
@@ -203,6 +229,10 @@ pub rec LowerContext {
     vinsts:      *ValueInstance;
     vinst_len:   u32;
     vinst_cap:   u32;
+
+    pinsts:      *PackInstance;
+    pinst_len:   u32;
+    pinst_cap:   u32;
 }
 
 
@@ -291,6 +321,9 @@ pub fun init_context(
     lc.vinsts    = nil;
     lc.vinst_len = 0;
     lc.vinst_cap = 0;
+    lc.pinsts    = nil;
+    lc.pinst_len = 0;
+    lc.pinst_cap = 0;
 
     ret ok[bool, str](true);
 }
@@ -338,6 +371,16 @@ pub fun dnit_context(lc: *LowerContext) {
         }
         deallocate[ValueInstance](lc.s.alloc, lc.vinsts, lc.vinst_cap::usize);
     }
+    if (lc.pinsts != nil && lc.pinst_cap > 0) {
+        var pi: u32 = 0;
+        for (pi < lc.pinst_len) {
+            if (lc.pinsts[pi].types != nil && lc.pinsts[pi].type_len > 0) {
+                deallocate[ty.TypeId](lc.s.alloc, lc.pinsts[pi].types, lc.pinsts[pi].type_len::usize);
+            }
+            pi = pi + 1;
+        }
+        deallocate[PackInstance](lc.s.alloc, lc.pinsts, lc.pinst_cap::usize);
+    }
     lc.loops    = nil;
     lc.loop_len = 0;
     lc.loop_cap = 0;
@@ -351,6 +394,9 @@ pub fun dnit_context(lc: *LowerContext) {
     lc.vinsts    = nil;
     lc.vinst_len = 0;
     lc.vinst_cap = 0;
+    lc.pinsts    = nil;
+    lc.pinst_len = 0;
+    lc.pinst_cap = 0;
 }
 
 # resolve_module_member_const: the `alias.CONST` member resolver lowering
@@ -692,6 +738,62 @@ pub fun enqueue_value_instance(lc: *LowerContext, decl: aid.DeclId, origin: sess
     inst.name    = name;
     lc.vinsts[lc.vinst_len] = inst;
     lc.vinst_len = lc.vinst_len + 1;
+    ret ok[bool, str](true);
+}
+
+# enqueue_pack_instance: record a comptime variadic-pack instance `(decl, origin,
+# type-list)` on the per-module worklist under its mangled `name`, deduped by name
+# (identical to `enqueue_instance` — a linear scan, no map/hash, so determinism is
+# preserved). takes an OWNED copy of `types` so the caller's buffer can be reused /
+# freed; the copy is released when the context is torn down.
+# ---
+# lc:       the context
+# decl:     DeclId of the pack-tailed function in `origin`'s AST
+# origin:   ModuleId declaring the function
+# types:    pack element type-list (copied), by pack ordinal
+# type_len: number of pack element types
+# name:     instance linkage name
+# ret:      true on success, or an allocation error
+pub fun enqueue_pack_instance(lc: *LowerContext, decl: aid.DeclId, origin: sess.ModuleId,
+                              types: *ty.TypeId, type_len: u32, name: intern.StrId) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < lc.pinst_len) {
+        if (lc.pinsts[i].name == name) { ret ok[bool, str](true); }
+        i = i + 1;
+    }
+
+    if (lc.pinst_len == lc.pinst_cap) {
+        var new_cap: u32 = lc.pinst_cap * 2;
+        if (new_cap == 0) { new_cap = INITIAL_STACK_CAP; }
+        if (lc.pinsts == nil) {
+            val r: Result[*PackInstance, str] = allocate[PackInstance](lc.s.alloc, new_cap::usize);
+            if (is_err[*PackInstance, str](r)) { ret err[bool, str](unwrap_err[*PackInstance, str](r)); }
+            lc.pinsts = unwrap_ok[*PackInstance, str](r);
+        } or {
+            val r: Result[*PackInstance, str] = reallocate[PackInstance](lc.s.alloc, lc.pinsts, lc.pinst_cap::usize, new_cap::usize);
+            if (is_err[*PackInstance, str](r)) { ret err[bool, str](unwrap_err[*PackInstance, str](r)); }
+            lc.pinsts = unwrap_ok[*PackInstance, str](r);
+        }
+        lc.pinst_cap = new_cap;
+    }
+
+    var copy: *ty.TypeId = nil;
+    if (type_len > 0) {
+        val r: Result[*ty.TypeId, str] = allocate[ty.TypeId](lc.s.alloc, type_len::usize);
+        if (is_err[*ty.TypeId, str](r)) { ret err[bool, str](unwrap_err[*ty.TypeId, str](r)); }
+        copy = unwrap_ok[*ty.TypeId, str](r);
+        var j: u32 = 0;
+        for (j < type_len) { copy[j] = types[j]; j = j + 1; }
+    }
+
+    var inst: PackInstance;
+    inst.decl     = decl;
+    inst.origin   = origin;
+    inst.types    = copy;
+    inst.type_len = type_len;
+    inst.name     = name;
+    lc.pinsts[lc.pinst_len] = inst;
+    lc.pinst_len = lc.pinst_len + 1;
     ret ok[bool, str](true);
 }
 
