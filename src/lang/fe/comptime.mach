@@ -185,6 +185,36 @@ pub val COMPTIME_TYPE_NO_RESOLVER_MSG: str =
 pub val COMPTIME_TYPE_UNRESOLVED_MSG: str =
     "type comparison operand does not name a type";
 
+# field-descriptor member selectors (#1473): which attribute of a `CT_KIND_FIELD`
+# descriptor a `.name` / `.type` / `.offset` projection reads.
+pub val FIELD_SEL_NAME:   u8 = 0;
+pub val FIELD_SEL_TYPE:   u8 = 1;
+pub val FIELD_SEL_OFFSET: u8 = 2;
+
+# FieldMemberFn: projects an attribute of a comptime field descriptor (#1473).
+# given the owning record's sema TypeId, the field ordinal, and a FIELD_SEL_*
+# selector, it returns the attribute as a CTValue (`.name` -> str, `.type` ->
+# type, `.offset` -> int), or none when the attribute is unavailable in this
+# context (`.offset` before lowering, which needs the target layout). eval has no
+# type system, so the typed layer (sema for name/type, lowering for all three)
+# installs this hook with `set_field_resolver`.
+pub def FieldMemberFn: fun(ptr, u32, u32, u8) Result[Option[CTValue], str];
+
+# COMPTIME_FIELD_NO_RESOLVER_MSG: surfaced when a field-descriptor member is read
+# in a context that installed no field resolver (every pass before sema).
+pub val COMPTIME_FIELD_NO_RESOLVER_MSG: str =
+    "a field descriptor member is only comptime-evaluable after type checking";
+
+# COMPTIME_FIELD_UNKNOWN_MEMBER_MSG: surfaced when a field descriptor is projected
+# with a member other than `.name` / `.type` / `.offset`.
+pub val COMPTIME_FIELD_UNKNOWN_MEMBER_MSG: str =
+    "a field descriptor has only `.name`, `.type`, and `.offset`";
+
+# COMPTIME_FIELD_UNAVAILABLE_MSG: surfaced when a field-descriptor member is not
+# available in the active context (e.g. `.offset` before lowering).
+pub val COMPTIME_FIELD_UNAVAILABLE_MSG: str =
+    "this field descriptor member is not available until lowering";
+
 # COMPTIME_MEMBER_NOT_CONST_MSG: surfaced when a module-qualified member path
 # resolves but does not name a module-level comptime constant (a function, a
 # `var`, a non-constant `val`, or an unexported / unknown member).
@@ -273,6 +303,8 @@ pub rec ComptimeCtx {
     member_data:    ptr;
     type_fn:        *u8;
     type_data:      ptr;
+    field_fn:       *u8;
+    field_data:     ptr;
 }
 
 val INITIAL_CONST_CAP: u32 = 8;
@@ -336,6 +368,8 @@ pub fun init(
     c.member_data    = nil;
     c.type_fn        = nil;
     c.type_data      = nil;
+    c.field_fn       = nil;
+    c.field_data     = nil;
     ret c;
 }
 
@@ -365,6 +399,19 @@ pub fun set_member_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
 pub fun set_type_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
     c.type_fn   = fn;
     c.type_data = data;
+}
+
+# set_field_resolver: install (or clear) the field-descriptor member resolver
+# this context consults when comptime.eval projects `.name` / `.type` / `.offset`
+# off a `CT_KIND_FIELD` value (#1473). sema installs the name/type half; lowering
+# installs all three. passing `nil` for both clears it.
+# ---
+# c:    context to update
+# fn:   erased FieldMemberFn, or nil to clear
+# data: opaque context handed back to fn, or nil to clear
+pub fun set_field_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
+    c.field_fn   = fn;
+    c.field_data = data;
 }
 
 # set_build_context: bind the manifest-derived project metadata, the selected
@@ -605,6 +652,13 @@ pub fun eval(
     # resolved through the installed member resolver.
     if (k == expr.EXPR_KIND_MEMBER) {
         if (is_comptime_path(a, e)) { ret eval_path(c, a, source, e, interner); }
+        # a `.name` / `.type` / `.offset` projection off a comptime field
+        # descriptor (#1473): fires only when the object evaluates to a
+        # CT_KIND_FIELD, so a member of any other value falls through to the
+        # module-member path (no collision with a record field named `type`).
+        val fld: Option[Result[CTValue, str]] =
+            eval_field_member(c, a, source, node.data.member.object, node.data.member.name, interner);
+        if (is_some[Result[CTValue, str]](fld)) { ret unwrap[Result[CTValue, str]](fld); }
         ret eval_module_member(c, e);
     }
 
@@ -1410,6 +1464,40 @@ fun eval_module_member(c: *ComptimeCtx, e: id.ExprId) Result[CTValue, str] {
     ret err[CTValue, str](COMPTIME_MEMBER_NOT_CONST_MSG);
 }
 
+# eval_field_member: projects `.name` / `.type` / `.offset` off a comptime field
+# descriptor (#1473). returns none when `object` does not evaluate to a
+# CT_KIND_FIELD — so the MEMBER dispatch falls through to the module-member path,
+# leaving an ordinary `value.field` access untouched. some(...) carries the
+# projected value, or the error explaining why it could not fold.
+fun eval_field_member(
+    c:           *ComptimeCtx,
+    a:           *ast.Ast,
+    source:      str,
+    object_eid:  id.ExprId,
+    member_span: token.Span,
+    interner:    *intern.Interner
+) Option[Result[CTValue, str]] {
+    val obj_r: Result[CTValue, str] = eval(c, a, source, object_eid, interner);
+    if (is_err[CTValue, str](obj_r)) { ret none[Result[CTValue, str]](); }
+    val obj: CTValue = unwrap_ok[CTValue, str](obj_r);
+    if (obj.kind != CT_KIND_FIELD) { ret none[Result[CTValue, str]](); }
+
+    val mtext: StrView = span_text(source, member_span);
+    var sel: u8 = FIELD_SEL_NAME;
+    if      (view_eq_str(mtext, "name"))   { sel = FIELD_SEL_NAME; }
+    or      (view_eq_str(mtext, "type"))   { sel = FIELD_SEL_TYPE; }
+    or      (view_eq_str(mtext, "offset")) { sel = FIELD_SEL_OFFSET; }
+    or      { ret some[Result[CTValue, str]](err[CTValue, str](COMPTIME_FIELD_UNKNOWN_MEMBER_MSG)); }
+
+    if (c.field_fn == nil) { ret some[Result[CTValue, str]](err[CTValue, str](COMPTIME_FIELD_NO_RESOLVER_MSG)); }
+    val fn: FieldMemberFn = c.field_fn::FieldMemberFn;
+    val r: Result[Option[CTValue], str] = fn(c.field_data, obj.data.fld.owner, obj.data.fld.index, sel);
+    if (is_err[Option[CTValue], str](r)) { ret some[Result[CTValue, str]](err[CTValue, str](unwrap_err[Option[CTValue], str](r))); }
+    val o: Option[CTValue] = unwrap_ok[Option[CTValue], str](r);
+    if (is_none[CTValue](o)) { ret some[Result[CTValue, str]](err[CTValue, str](COMPTIME_FIELD_UNAVAILABLE_MSG)); }
+    ret some[Result[CTValue, str]](ok[CTValue, str](unwrap[CTValue](o)));
+}
+
 # reports whether `e` is a comptime path expression: a bare COMPTIME_IDENT
 # (`$foo`) or a chain of MEMBER expressions whose leftmost root is a
 # COMPTIME_IDENT (`$mach.target.os`). a path is comptime-evaluable in form
@@ -1907,6 +1995,34 @@ pub fun field_value(owner: u32, index: u32) CTValue {
     v.kind          = CT_KIND_FIELD;
     v.data.fld.owner = owner;
     v.data.fld.index = index;
+    ret v;
+}
+
+# ct_str: a comptime string value over an interned StrId. used by the field
+# resolver to build a `f.name` projection (#1473).
+pub fun ct_str(s: intern.StrId) CTValue {
+    var v: CTValue;
+    v.kind   = CT_KIND_STR;
+    v.data.s = s;
+    ret v;
+}
+
+# ct_type: a comptime TYPE value over a sema TypeId token. used by the field
+# resolver to build a `f.type` projection (#1473).
+pub fun ct_type(t: u32) CTValue {
+    var v: CTValue;
+    v.kind   = CT_KIND_TYPE;
+    v.data.t = t;
+    ret v;
+}
+
+# ct_uint: a comptime unsigned-integer value. used by the field resolver to build
+# a `f.offset` projection (#1473), an unsigned `usize` magnitude.
+pub fun ct_uint(n: u64) CTValue {
+    var v: CTValue;
+    v.kind         = CT_KIND_INT;
+    v.int_unsigned = true;
+    v.data.i       = n:~i64;
     ret v;
 }
 
