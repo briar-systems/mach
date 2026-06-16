@@ -45,6 +45,7 @@ use ast:      mach.lang.fe.ast;
 use aid:      mach.lang.fe.ast.id;
 use aexpr:    mach.lang.fe.ast.expr;
 use adecl:    mach.lang.fe.ast.decl;
+use atype:    mach.lang.fe.ast.type;
 use resolve:  mach.lang.fe.resolve;
 use comptime: mach.lang.fe.comptime;
 use token:    mach.lang.fe.token;
@@ -295,6 +296,14 @@ fun lower_ident_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.V
         ret const_value_of(ctx, eid, unwrap[comptime.CTValue](cv));
     }
 
+    # a `$each a in va` pack loop variable (#1475): bound in the comptime context
+    # to a pack-element descriptor; its rvalue is a load from the matching expanded
+    # parameter slot recorded on the context by lower_pack_instance.
+    val pe: Option[u32] = pack_elem_ordinal(ctx, sid);
+    if (is_some[u32](pe)) {
+        ret load_pack_elem(ctx, eid, unwrap[u32](pe));
+    }
+
     val local: Option[value.Value] = lower.lookup_local(ctx, sid);
     if (is_some[value.Value](local)) {
         val slot: value.Value = unwrap[value.Value](local);
@@ -312,6 +321,40 @@ fun lower_ident_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.V
         ret builder.emit_load(?ctx.builder, slot, ity);
     }
     ret symbol_reference(ctx, eid, sid);
+}
+
+# pack_elem_ordinal: the expanded-parameter ordinal of a `$each a in va` pack loop
+# variable (#1475), or none when `sid` is not such a variable. the loop variable is
+# a comptime-flagged SYM_VAL with no declaration, bound by the unroll to a
+# CT_KIND_PACK_ELEM descriptor whose `.index` is the element's ordinal among the
+# instance's expanded pack parameters.
+fun pack_elem_ordinal(ctx: *lower.LowerContext, sid: resolve.SymbolId) Option[u32] {
+    val so: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](so)) { ret none[u32](); }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+    if (sym.kind != resolve.SYM_VAL || (sym.flags & resolve.SYM_FLAG_COMPTIME) == 0) { ret none[u32](); }
+    if (sym.decl != aid.DECL_NIL) { ret none[u32](); }
+    val nc: Option[*comptime.NamedConst] = comptime.lookup(ctx.ctx, sym.name);
+    if (is_none[*comptime.NamedConst](nc)) { ret none[u32](); }
+    val cval: comptime.CTValue = unwrap[*comptime.NamedConst](nc).value;
+    if (cval.kind != comptime.CT_KIND_PACK_ELEM) { ret none[u32](); }
+    ret some[u32](cval.data.pelem.index);
+}
+
+# load_pack_elem: the rvalue of a pack element at ordinal `i` — a load from the
+# expanded parameter slot lower_pack_instance recorded on the context. an aggregate
+# element flows by its storage address tagged with the aggregate IR type, mirroring
+# an ordinary local rvalue.
+fun load_pack_elem(ctx: *lower.LowerContext, eid: aid.ExprId, i: u32) Result[value.Value, str] {
+    if (ctx.pack_slots == nil || i >= ctx.pack_len) {
+        ret err[value.Value, str]("lower: pack element ordinal out of range");
+    }
+    val slot: value.Value = ctx.pack_slots[i];
+    val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    val ity: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+    if (is_aggregate_ir(ctx, ity)) { ret ok[value.Value, str](value.retype(slot, ity)); }
+    ret builder.emit_load(?ctx.builder, slot, ity);
 }
 
 # the folded comptime value of a symbol, when it is a comptime value parameter
@@ -1161,6 +1204,11 @@ fun lower_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Resu
             }
             ret lower_value_callee(ctx, eid, e, f);
         }
+        # a pack-tailed callee (`va: ...`) resolves to a per-type-list monomorphized
+        # instance (#1475), keyed by the trailing arguments' concrete types.
+        if (decl_fun_has_pack_param(ctx, e.data.call.callee, f)) {
+            ret lower_pack_callee(ctx, eid, e, f);
+        }
     }
     if (e.data.call.type_args_len == 0) {
         ret lower_rvalue(ctx, e.data.call.callee);
@@ -1201,6 +1249,21 @@ fun decl_fun_has_comptime_param(ctx: *lower.LowerContext, callee: aid.ExprId, f:
         i = i + 1;
     }
     ret false;
+}
+
+# reports whether the callee's DeclFun ends in a comptime variadic-pack parameter
+# (`va: ...`, #1475), read syntactically from the callee's origin AST — the
+# trailing parameter's AstType is a TYPE_KIND_PACK. detected without sema (mirrors
+# the comptime-flag check) so it works for a cross-module callee whose resolved
+# types live in another module.
+fun decl_fun_has_pack_param(ctx: *lower.LowerContext, callee: aid.ExprId, f: *adecl.DeclFun) bool {
+    val a: *ast.Ast = callee_ast(ctx, callee);
+    if (a == nil) { ret false; }
+    if (f.params_len == 0) { ret false; }
+    val tn: *adecl.TypedName = ?a.typed_names[f.params_start + (f.params_len - 1)];
+    val t_opt: Option[*atype.Type] = ast.get_type(a, tn.ty);
+    if (is_none[*atype.Type](t_opt)) { ret false; }
+    ret unwrap[*atype.Type](t_opt).kind == atype.TYPE_KIND_PACK;
 }
 
 # the AST the callee is declared in: the caller's own AST for a local callee, the
@@ -1425,6 +1488,82 @@ fun lower_generic_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Ex
 
     val enq: Result[bool, str] = lower.enqueue_instance(ctx, sym.decl, sym.origin, args, argc, link);
     deallocate[ty.TypeId](ctx.s.alloc, args, argc::usize);
+    if (is_err[bool, str](enq)) { ret err[value.Value, str](unwrap_err[bool, str](enq)); }
+
+    val vtr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
+    if (is_err[ir_type.IrTypeId, str](vtr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](vtr)); }
+    val vty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](vtr);
+
+    val fi: Option[u32] = find_function(ctx, link);
+    if (is_some[u32](fi)) {
+        ret ok[value.Value, str](value.fn_value(unwrap[u32](fi), vty));
+    }
+    val xr: Result[u32, str] = lower.ensure_extern_function(ctx, link, vty);
+    if (is_err[u32, str](xr)) { ret err[value.Value, str](unwrap_err[u32, str](xr)); }
+    ret ok[value.Value, str](value.fn_value(unwrap_ok[u32, str](xr), vty));
+}
+
+# resolves a pack-tailed call to its monomorphized instance (#1475): reads the
+# trailing arguments' concrete types — the collected pack element type-list,
+# substituting any enclosing generic substitution so a transitive pack call
+# resolves element types to the concrete args — computes the instance's mangled
+# linkage name under the disjoint `Q...E` pack namespace, enqueues the instance for
+# body emission, and returns a function reference to it. the leading fixed
+# arguments and the collected elements are all passed at runtime (the instance's
+# expanded signature), so no argument is dropped here; the back end emits a
+# name-based call the linker binds to the (weak, deduped) instance body.
+fun lower_pack_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr, f: *adecl.DeclFun) Result[value.Value, str] {
+    val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, e.data.call.callee);
+    val so: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
+    if (is_none[*resolve.Symbol](so)) {
+        ret err[value.Value, str]("lower: unresolved pack-tailed call target");
+    }
+    val sym: *resolve.Symbol = unwrap[*resolve.Symbol](so);
+
+    # the pack is the trailing parameter; every argument past the leading fixed
+    # parameters is a collected pack element.
+    val fixed_count: u32 = f.params_len - 1;
+    if (e.data.call.args_len < fixed_count) {
+        ret err[value.Value, str]("lower: pack-tailed call has fewer arguments than fixed parameters");
+    }
+    val elem_count: u32 = e.data.call.args_len - fixed_count;
+
+    var types: *ty.TypeId = nil;
+    if (elem_count > 0) {
+        val ab: Result[*ty.TypeId, str] = allocate[ty.TypeId](ctx.s.alloc, elem_count::usize);
+        if (is_err[*ty.TypeId, str](ab)) { ret err[value.Value, str](unwrap_err[*ty.TypeId, str](ab)); }
+        types = unwrap_ok[*ty.TypeId, str](ab);
+
+        var j: u32 = 0;
+        for (j < elem_count) {
+            val pool_ix: u32 = e.data.call.args_start + fixed_count + j;
+            if (pool_ix::usize >= ctx.a.expr_id_len) {
+                deallocate[ty.TypeId](ctx.s.alloc, types, elem_count::usize);
+                ret err[value.Value, str]("lower: pack-tailed call argument index out of range");
+            }
+            val arg_eid: aid.ExprId = ctx.a.expr_ids[pool_ix];
+            var et: ty.TypeId = lower.expr_type_of(ctx, arg_eid);
+            if (ctx.subst != nil && ctx.subst_len > 0) {
+                et = generics.substitute(ctx.s, et, ctx.subst, ctx.subst_len);
+            }
+            types[j] = et;
+            j = j + 1;
+        }
+    }
+
+    # the instance is owned by the function's origin module; mangle against that
+    # module's FQN so the definition (emitted by the drain) and every reference
+    # agree byte-for-byte.
+    val fqn: intern.StrId = sess.module_fqn(ctx.s, sym.origin);
+    val name_r: Result[intern.StrId, str] = mangle.pack_instance_name(ctx.s, fqn, sym.name, types, elem_count);
+    if (is_err[intern.StrId, str](name_r)) {
+        if (types != nil) { deallocate[ty.TypeId](ctx.s.alloc, types, elem_count::usize); }
+        ret err[value.Value, str](unwrap_err[intern.StrId, str](name_r));
+    }
+    val link: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    val enq: Result[bool, str] = lower.enqueue_pack_instance(ctx, sym.decl, sym.origin, types, elem_count, link);
+    if (types != nil) { deallocate[ty.TypeId](ctx.s.alloc, types, elem_count::usize); }
     if (is_err[bool, str](enq)) { ret err[value.Value, str](unwrap_err[bool, str](enq)); }
 
     val vtr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
