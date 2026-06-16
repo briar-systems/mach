@@ -312,6 +312,9 @@ pub fun infer_expr(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
     or (e.kind == expr.EXPR_KIND_MEMBER) {
         t = infer_member(sc, eid, ?e.data.member, e.span);
     }
+    or (e.kind == expr.EXPR_KIND_PROJECT) {
+        t = infer_project(sc, ?e.data.project, e.span);
+    }
     or (e.kind == expr.EXPR_KIND_CAST) {
         t = infer_cast(sc, ?e.data.cast, e.span);
     }
@@ -462,7 +465,9 @@ fun infer_binary(sc: *sema.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, spa
     # never reach the value comparison below (which would mis-infer the
     # `$type_of(...)` call).
     if ((b.op == expr.BIN_EQ || b.op == expr.BIN_NEQ)
-        && comptime.is_type_comparison(sc.a, sc.source, b)) {
+        && (comptime.is_type_comparison(sc.a, sc.source, b)
+         || sema_is_field_type_operand(sc, b.lhs)
+         || sema_is_field_type_operand(sc, b.rhs))) {
         ret infer_type_comparison(sc, b, span);
     }
 
@@ -563,9 +568,41 @@ fun infer_type_operand(sc: *sema.SemaContext, operand: id.ExprId, span: token.Sp
         }
         ret infer_expr(sc, arg);
     }
+    # an `f.type` field-descriptor type names the bound field's type (#1473).
+    if (sema_is_field_type_operand(sc, operand)) {
+        ret field_type_operand_type(sc, operand);
+    }
     val op_ty: type.TypeId = intrinsic_operand_type(sc, operand, span);
     set_expr_type(sc, operand, op_ty);
     ret op_ty;
+}
+
+# whether `eid` is an `f.type` operand whose object evaluates to a comptime field
+# descriptor — the sema-time recognition of a field-descriptor type operand,
+# valid during the `$each` unroll where the loop variable is bound.
+pub fun sema_is_field_type_operand(sc: *sema.SemaContext, eid: id.ExprId) bool {
+    if (!comptime.is_field_type_member(sc.a, sc.source, eid)) { ret false; }
+    val n_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](n_opt)) { ret false; }
+    val obj: id.ExprId = unwrap[*expr.Expr](n_opt).data.member.object;
+    val r: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, obj, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](r)) { ret false; }
+    ret unwrap_ok[comptime.CTValue, str](r).kind == comptime.CT_KIND_FIELD;
+}
+
+# the type an `f.type` operand names: the bound field's type, read from the
+# descriptor the object evaluates to.
+fun field_type_operand_type(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
+    val n_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](n_opt)) { ret type.TYPE_ERROR; }
+    val obj: id.ExprId = unwrap[*expr.Expr](n_opt).data.member.object;
+    val r: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, obj, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](r)) { ret type.TYPE_ERROR; }
+    val fv: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r);
+    if (fv.kind != comptime.CT_KIND_FIELD) { ret type.TYPE_ERROR; }
+    val fa: Option[*type.FieldEntry] = type.field_at(?sc.s.types, fv.data.fld.owner::type.TypeId, fv.data.fld.index);
+    if (is_none[*type.FieldEntry](fa)) { ret type.TYPE_ERROR; }
+    ret unwrap[*type.FieldEntry](fa).ty;
 }
 
 # ASSIGN: RHS must be assignable to LHS; result is the LHS type. a literal
@@ -873,6 +910,104 @@ fun set_expr_type(sc: *sema.SemaContext, eid: id.ExprId, ty: type.TypeId) {
     sc.expr_type[eid] = ty;
 }
 
+# field_seq_owner: resolves a `$fields(T)` sequence (#1473) to its owning record
+# TypeId, requiring T to be a record. the type-argument's expr_type slot is
+# populated for the lowerer. TYPE_ERROR when the sequence is malformed or T is
+# not a record. shared by the `$each` unroll (sema and lowering).
+pub fun field_seq_owner(sc: *sema.SemaContext, seq_eid: id.ExprId, span: token.Span) type.TypeId {
+    val targ: id.ExprId = comptime.fields_type_arg(sc.a, seq_eid);
+    if (targ == id.EXPR_NIL) {
+        sema.report(sc, span, "$fields: expected one type argument `$fields(T)`");
+        ret type.TYPE_ERROR;
+    }
+    val owner: type.TypeId = intrinsic_operand_type(sc, targ, span);
+    set_expr_type(sc, targ, owner);
+    if (owner == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    if (!type_is_record(sc, owner)) {
+        sema.report(sc, span, "$fields requires a record type");
+        ret type.TYPE_ERROR;
+    }
+    ret owner;
+}
+
+# types a `.name` / `.type` / `.offset` projection off a `$each` field descriptor
+# (#1473), or TYPE_NIL when the object is not a field descriptor (a normal member
+# access). detection evaluates the object: only a CT_KIND_FIELD is a descriptor,
+# so a member of any other value falls through. `.name` is a string (`*u8`),
+# `.offset` an unsigned `usize` (`u64`); `.type` is a comptime-only TYPE value,
+# valid only as a type-comparison operand, rejected here in a value position.
+fun infer_field_member(sc: *sema.SemaContext, m: *expr.ExprMember, span: token.Span) type.TypeId {
+    val obj_r: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, m.object, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](obj_r)) { ret type.TYPE_NIL; }
+    if (unwrap_ok[comptime.CTValue, str](obj_r).kind != comptime.CT_KIND_FIELD) { ret type.TYPE_NIL; }
+
+    if (str_region_equals(sc.source, m.name.offset, m.name.len, "name")) {
+        ret ptr_to(sc, prim_or_error(sc, type.TYPE_U8));
+    }
+    if (str_region_equals(sc.source, m.name.offset, m.name.len, "offset")) {
+        ret prim_or_error(sc, type.TYPE_U64);
+    }
+    if (str_region_equals(sc.source, m.name.offset, m.name.len, "type")) {
+        sema.report(sc, span, "`f.type` is a comptime type, not a value; use it as a type-comparison operand inside a `$if` gate");
+        ret type.TYPE_ERROR;
+    }
+    sema.report(sc, span, "a field descriptor has only `.name`, `.type`, and `.offset`");
+    ret type.TYPE_ERROR;
+}
+
+# whether a `v.[f]` receiver type names the field's owning record directly or via
+# a single pointer indirection (auto-deref, mirroring member access).
+fun project_receiver_matches(sc: *sema.SemaContext, obj_ty: type.TypeId, owner: type.TypeId) bool {
+    if (obj_ty == owner) { ret true; }
+    val to: Option[*type.Type] = type.get(?sc.s.types, obj_ty);
+    if (is_none[*type.Type](to)) { ret false; }
+    val t: *type.Type = unwrap[*type.Type](to);
+    ret t.kind == type.TYPE_POINTER && t.data.pointer.base == owner;
+}
+
+# whether `ty` is a record (or a generic record instance), the aggregate
+# `$fields` accepts. unions and non-aggregates are rejected.
+fun type_is_record(sc: *sema.SemaContext, ty: type.TypeId) bool {
+    val to: Option[*type.Type] = type.get(?sc.s.types, ty);
+    if (is_none[*type.Type](to)) { ret false; }
+    val k: type.TypeKind = unwrap[*type.Type](to).kind;
+    if (k == type.TYPE_REC) { ret true; }
+    if (k == type.TYPE_INSTANCE && is_some[*type.FieldTable](type.field_table_for(?sc.s.types, ty))) { ret true; }
+    ret false;
+}
+
+# infer_project: types a `v.[f]` field projection (#1473). the field operand `f`
+# evaluates to a comptime FIELD descriptor (bound by an enclosing `$each`) naming
+# the owning record and a field ordinal; the projection's type is that field's
+# type, and the instance `v` must be of the owning record type.
+fun infer_project(sc: *sema.SemaContext, p: *expr.ExprProject, span: token.Span) type.TypeId {
+    val obj_ty: type.TypeId = infer_expr(sc, p.object);
+    val fr: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, p.field, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](fr)) {
+        sema.report(sc, span, "`v.[f]` requires a comptime field descriptor bound by an enclosing `$each`");
+        ret type.TYPE_ERROR;
+    }
+    val fv: comptime.CTValue = unwrap_ok[comptime.CTValue, str](fr);
+    if (fv.kind != comptime.CT_KIND_FIELD) {
+        sema.report(sc, span, "`v.[f]` requires a comptime field descriptor bound by an enclosing `$each`");
+        ret type.TYPE_ERROR;
+    }
+    if (obj_ty == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    val owner: type.TypeId = fv.data.fld.owner::type.TypeId;
+    # the instance is the owning record, or a pointer to it (auto-deref, like a
+    # member access `p.field` on `p: *T`).
+    if (!project_receiver_matches(sc, obj_ty, owner)) {
+        sema.report(sc, span, "`v.[f]`: the instance type does not match the field descriptor's owning record");
+        ret type.TYPE_ERROR;
+    }
+    val fa: Option[*type.FieldEntry] = type.field_at(?sc.s.types, owner, fv.data.fld.index);
+    if (is_none[*type.FieldEntry](fa)) {
+        sema.report(sc, span, "`v.[f]`: field ordinal out of range");
+        ret type.TYPE_ERROR;
+    }
+    ret unwrap[*type.FieldEntry](fa).ty;
+}
+
 # interns the identifier text of a `$ident` comptime ident, with the leading
 # `$` stripped, returning its StrId (STR_NIL on failure or an empty name). the
 # span surgery is owned by `comptime.comptime_ident_name`.
@@ -1003,6 +1138,10 @@ fun infer_member(sc: *sema.SemaContext, eid: id.ExprId, m: *expr.ExprMember, spa
     if (cti != type.TYPE_NIL) { ret cti; }
     val cts: type.TypeId = infer_comptime_str_path(sc, eid);
     if (cts != type.TYPE_NIL) { ret cts; }
+
+    # `f.name` / `f.type` / `f.offset` on a `$each` field descriptor (#1473).
+    val fdm: type.TypeId = infer_field_member(sc, m, span);
+    if (fdm != type.TYPE_NIL) { ret fdm; }
 
     val ot: type.TypeId = infer_expr(sc, m.object);
     if (ot == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
