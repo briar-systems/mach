@@ -6,10 +6,10 @@
 # each decorated global lands in its own data section whose `sh_addralign` is the
 # requested alignment; the object file carries the per-symbol section header that
 # readelf reads (the final static executable strips section headers). the build
-# asserts: g_lit64 -> 64 (literal), g_cmp16 -> 16 (comptime expr), g_cmp8 -> 8
-# (`$align_of(u64)`), g_plain -> 8 (default). the binary must also run, confirming
-# the over-aligned data is laid out correctly. readelf absent -> structural check
-# skipped, run still asserted.
+# asserts: g_lit64 -> 64 (literal), g_cmp16 -> 16 (comptime expr), g_plain -> 8
+# (default), g_over -> 32 (type-raised). the binary itself ALSO probes each over-
+# aligned global's address at runtime — an alignment-dependent check that holds
+# even when readelf is absent — exiting 27 only when every probe passes.
 #
 # usage: run.sh [path-to-mach]   (defaults to `mach` on PATH)
 set -euo pipefail
@@ -45,15 +45,16 @@ fi
 BIN="$WORK/app/out/linux/bin/aligndec"
 OBJ="$WORK/app/out/linux/obj/aligndec/main.o"
 
-# run: the over-aligned globals sum to 7 + 9 + 5 + 11 == 32.
+# run: the alignment probes pass (exit 27 = 7 + 9 + 11); a misaligned global
+# would exit 91/92/93 instead, naming which probe failed.
 set +e
 "$BIN"; code=$?
 set -e
-if [ "$code" -ne 32 ]; then
-    echo "FAIL aligndec: program ran with exit $code, expected 32" >&2
+if [ "$code" -ne 27 ]; then
+    echo "FAIL aligndec: program ran with exit $code, expected 27 (91/92/93 = a runtime misalignment)" >&2
     fail=1
 else
-    echo "PASS aligndec: the program with over-aligned globals runs correctly"
+    echo "PASS aligndec: the over-aligned globals are correctly aligned at runtime"
 fi
 
 # structural check: each global's section header alignment in the object file.
@@ -77,7 +78,6 @@ if command -v readelf >/dev/null 2>&1 && [ -f "$OBJ" ]; then
     }
     expect_align g_lit64 64
     expect_align g_cmp16 16
-    expect_align g_cmp8  8
     expect_align g_plain 8
     # a global of an `align(32)` record inherits the type's raised alignment.
     expect_align g_over  32

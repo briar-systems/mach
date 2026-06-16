@@ -6,8 +6,13 @@
 # sites, so neither the size nor the single-use heuristic inlines it — only
 # FN_FLAG_INLINE does. building at -O2 with `--emit-asm`, the decorated build
 # must contain NO call to `big` in the caller's assembly (fully inlined), while a
-# control build with the decorator stripped must still call it. the binary must
-# also run, confirming the inlined code is correct.
+# control build with the `inline` decorator stripped must still call it.
+#
+# `big` is fed a runtime value and its result is returned, so the calls can't be
+# constant-folded or dead-code-eliminated — without that the control's surviving-
+# call signal would be a no-op. its link name is pinned with `symbol`, so the
+# `call big` grep matches a stable mnemonic. run with no arguments the program is
+# deterministic: exit 204 (the low byte of big(big(1,2),3)).
 #
 # usage: run.sh [path-to-mach]   (defaults to `mach` on PATH)
 set -euo pipefail
@@ -61,16 +66,17 @@ else
     "$WORK/app/out/linux/bin/inldec"
     code=$?
     set -e
-    if [ "$code" -ne 42 ]; then
-        echo "FAIL inline: inlined program ran with exit $code, expected 42" >&2
+    if [ "$code" -ne 204 ]; then
+        echo "FAIL inline: inlined program ran with exit $code, expected 204" >&2
         fail=1
     else
         echo "PASS inline: the inlined program runs correctly"
     fi
 fi
 
-# control: strip the decorator; the cost model must now leave the calls in place,
-# proving the decorator — not the heuristic — is what inlined `big`.
+# control: strip the `inline` decorator; the cost model must now leave the calls
+# in place, proving the decorator — not the heuristic — is what inlined `big`.
+# the `symbol("big")` pin is on its own line and survives, so `big` keeps its name.
 sed '/`inline`/d' "$HERE/app/src/main.mach" > "$WORK/app/src/main.mach"
 rm -rf "$WORK/app/out"
 if ! ( cd "$WORK/app" && "$MACH" build . --emit-asm -O2 ) >/dev/null 2>&1; then
