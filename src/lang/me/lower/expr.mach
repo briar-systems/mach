@@ -82,6 +82,7 @@ pub fun lower_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Val
     if (k == aexpr.EXPR_KIND_LIT_NIL)        { ret lower_lit_nil(ctx, eid); }
     if (k == aexpr.EXPR_KIND_IDENT)          { ret lower_ident_rvalue(ctx, eid); }
     if (k == aexpr.EXPR_KIND_MEMBER)         { ret lower_member_rvalue(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_PROJECT)        { ret lower_project_rvalue(ctx, eid, e); }
     if (k == aexpr.EXPR_KIND_INDEX)          { ret lower_index_rvalue(ctx, eid, e); }
     if (k == aexpr.EXPR_KIND_CALL)           { ret lower_call(ctx, eid, e); }
     if (k == aexpr.EXPR_KIND_BINARY)         { ret lower_binary(ctx, eid, e); }
@@ -111,6 +112,7 @@ pub fun lower_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId) Result[value.Val
 
     if (k == aexpr.EXPR_KIND_IDENT)  { ret lower_ident_lvalue(ctx, eid); }
     if (k == aexpr.EXPR_KIND_MEMBER) { ret lower_member_lvalue(ctx, eid, e); }
+    if (k == aexpr.EXPR_KIND_PROJECT) { ret lower_project_lvalue(ctx, eid, e); }
     if (k == aexpr.EXPR_KIND_INDEX)  { ret lower_index_lvalue(ctx, eid, e); }
     if (k == aexpr.EXPR_KIND_UNARY) {
         # @p as an lvalue is the rvalue of p (already a pointer)
@@ -608,6 +610,77 @@ fun lower_member_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Exp
     }
 
     val field_ix: u32 = field_index_in_type(ctx, rec_ty, e.data.member.name);
+
+    val rec_ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, rec_ty);
+    if (is_err[ir_type.IrTypeId, str](rec_ir_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](rec_ir_r)); }
+    val rec_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](rec_ir_r);
+
+    val xr: Result[ir_type.IrTypeId, str] = index_type(ctx);
+    if (is_err[ir_type.IrTypeId, str](xr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](xr)); }
+    val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](xr);
+
+    var idx: [2]value.Value;
+    idx[0] = value.const_int(0, xty);
+    idx[1] = value.const_int(field_ix::u64, xty);
+    ret builder.emit_gep(?ctx.builder, base, rec_ir, ?idx[0], 2);
+}
+
+# project_field_index: the field ordinal a `v.[f]` projection names, read from the
+# comptime FIELD descriptor its field operand evaluates to (bound by an enclosing
+# `$each`). errors when the operand is not a field descriptor.
+fun project_field_index(ctx: *lower.LowerContext, field_eid: aid.ExprId) Result[u32, str] {
+    val fr: Result[comptime.CTValue, str] =
+        comptime.eval(ctx.ctx, ctx.a, lower.module_source(ctx), field_eid, ?ctx.s.interner);
+    if (is_err[comptime.CTValue, str](fr)) { ret err[u32, str](unwrap_err[comptime.CTValue, str](fr)); }
+    val fv: comptime.CTValue = unwrap_ok[comptime.CTValue, str](fr);
+    if (fv.kind != comptime.CT_KIND_FIELD) {
+        ret err[u32, str]("lower: `v.[f]` field operand is not a comptime field descriptor");
+    }
+    ret ok[u32, str](fv.data.fld.index);
+}
+
+# a `v.[f]` rvalue: a load from the projected field pointer, except for an
+# aggregate field whose rvalue is its storage address (mirrors lower_member_rvalue).
+fun lower_project_rvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val ptr_r: Result[value.Value, str] = lower_project_lvalue(ctx, eid, e);
+    if (is_err[value.Value, str](ptr_r)) { ret ptr_r; }
+    val tr: Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    val ity: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+    if (is_aggregate_ir(ctx, ity)) { ret ok[value.Value, str](value.retype(unwrap_ok[value.Value, str](ptr_r), ity)); }
+    ret builder.emit_load(?ctx.builder, unwrap_ok[value.Value, str](ptr_r), ity);
+}
+
+# computes the field pointer of a `v.[f]` projection: like a member access, but
+# the field index comes from the comptime field descriptor rather than a name. a
+# pointer receiver auto-derefs; a value receiver uses its own storage.
+fun lower_project_lvalue(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result[value.Value, str] {
+    val fix_r: Result[u32, str] = project_field_index(ctx, e.data.project.field);
+    if (is_err[u32, str](fix_r)) { ret err[value.Value, str](unwrap_err[u32, str](fix_r)); }
+    val field_ix: u32 = unwrap_ok[u32, str](fix_r);
+
+    val obj_ty: ty.TypeId = lower.expr_type_of(ctx, e.data.project.object);
+    val is_ptr: bool = is_pointer_type(ctx, obj_ty);
+
+    var rec_ty: ty.TypeId = obj_ty;
+    var base:   value.Value;
+    if (is_ptr) {
+        val pt_opt: Option[*ty.Type] = ty.get(?ctx.s.types, obj_ty);
+        if (is_none[*ty.Type](pt_opt)) { ret err[value.Value, str]("lower: projection base has no pointer type"); }
+        val pt: *ty.Type = unwrap[*ty.Type](pt_opt);
+        if (pt.kind != ty.TYPE_POINTER) {
+            ret report_expr(ctx, eid, "field projection on untyped pointer; cast to a typed pointer (*T) first");
+        }
+        rec_ty = pt.data.pointer.base;
+        val br: Result[value.Value, str] = lower_rvalue(ctx, e.data.project.object);
+        if (is_err[value.Value, str](br)) { ret br; }
+        base = unwrap_ok[value.Value, str](br);
+    }
+    or {
+        val br: Result[value.Value, str] = lower_lvalue(ctx, e.data.project.object);
+        if (is_err[value.Value, str](br)) { ret br; }
+        base = unwrap_ok[value.Value, str](br);
+    }
 
     val rec_ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, rec_ty);
     if (is_err[ir_type.IrTypeId, str](rec_ir_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](rec_ir_r)); }
