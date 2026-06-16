@@ -147,10 +147,11 @@ pub fun codegen_module(s: *sess.Session, tgt: *target.Target,
 
 # build the object image from the encoder output and the module's globals.
 #
-# creates the `.text` section from the encoded bytes, registers every symbol
-# mark against it, attaches the encoder's relocations, then materialises each
-# module global into a data / rodata / bss section with its defining symbol. on
-# any builder failure the partially built image is torn down before returning.
+# moves each `section("...")` function into its named section, builds `.text`
+# from the remaining non-sectioned bytes, registers every symbol mark against its
+# section, attaches the encoder's relocations, then materialises each module
+# global into a data / rodata / bss section with its defining symbol. on any
+# builder failure the partially built image is torn down before returning.
 # ---
 # s:     shared session; supplies the allocator and interner
 # tgt:   resolved target; supplies type sizes for bss global layout
@@ -165,24 +166,31 @@ fun pack_image(s: *sess.Session, tgt: *target.Target, irmod: *ir.Module,
     }
     var image: of.ObjectImage = unwrap_ok[of.ObjectImage, str](rimg);
 
-    val rtext: Result[u32, str] = pack_text(s, ?image, enc);
-    if (is_err[u32, str](rtext)) {
-        obj.dnit(?image);
-        ret err[of.ObjectImage, str](unwrap_err[u32, str](rtext));
-    }
-    val text_sec: u32 = unwrap_ok[u32, str](rtext);
-
     # `section("...")` decorators move individual functions out of the shared
     # `.text` into named sections. build one placement per sectioned function
-    # (and create its section); the list is empty when no function is sectioned,
-    # in which case symbols and relocations all land in `.text` exactly as before.
+    # (creating its section and copying the sectioned bytes out of the encoder
+    # blob) first, so pack_text can then assemble `.text` from the remaining
+    # non-sectioned bytes. the list is empty when no function is sectioned, in
+    # which case `.text` adopts the encoder blob whole and symbols / relocations
+    # all land in `.text` exactly as before.
     var placements:      *SectionPlacement = nil;
     var placement_count: u32 = 0;
     val rpl: Result[bool, str] = build_section_placements(s, ?image, irmod, enc, ?placements, ?placement_count);
     if (is_err[bool, str](rpl)) {
+        # the encoder blob was never adopted into a section; release it (the nil
+        # guard mirrors obj.dnit) before tearing the partial image down.
+        if (enc.text != nil) { deallocate[u8](s.alloc, enc.text, enc.text_len::usize); }
         obj.dnit(?image);
         ret err[of.ObjectImage, str](unwrap_err[bool, str](rpl));
     }
+
+    val rtext: Result[u32, str] = pack_text(s, ?image, enc, placements, placement_count);
+    if (is_err[u32, str](rtext)) {
+        if (placements != nil) { deallocate[SectionPlacement](s.alloc, placements, enc.symbol_count::usize); }
+        obj.dnit(?image);
+        ret err[of.ObjectImage, str](unwrap_err[u32, str](rtext));
+    }
+    val text_sec: u32 = unwrap_ok[u32, str](rtext);
 
     val rsym: Result[bool, str] = pack_symbols(?image, irmod, enc, text_sec, placements, placement_count);
     if (is_err[bool, str](rsym)) {
@@ -301,9 +309,9 @@ fun image_has_symbol(image: *of.ObjectImage, name: intern.StrId) bool {
 
 # SectionPlacement: a function moved out of `.text` by a `section("...")`
 # decorator. its [text_start, text_end) byte range in the encoder blob is copied
-# into the named section `sec`; a mark or relocation at offset O in that range is
-# re-homed to (sec, O - text_start). its bytes remain in `.text` as dead,
-# unreferenced content (no symbol or relocation points at them there).
+# into the named section `sec` and excised from `.text`; a mark or relocation at
+# offset O in that range is re-homed to (sec, O - text_start), while every
+# `.text`-resident site below the range shifts down by the range's length.
 rec SectionPlacement {
     text_start: u32;
     text_end:   u32;
@@ -344,6 +352,35 @@ fun placement_for(placements: *SectionPlacement, count: u32, offset: u32) Option
         i = i + 1;
     }
     ret none[*SectionPlacement]();
+}
+
+# total_excised: the summed byte length of every sectioned-function range. the
+# rebuilt `.text` is exactly this much shorter than the encoder blob.
+fun total_excised(placements: *SectionPlacement, count: u32) u32 {
+    var sum: u32 = 0;
+    var i: u32 = 0;
+    for (i < count) {
+        val p: *SectionPlacement = ?placements[i];
+        sum = sum + (p.text_end - p.text_start);
+        i = i + 1;
+    }
+    ret sum;
+}
+
+# rebased_text_offset: where a `.text`-resident site at encoder-blob offset `offset`
+# lands once every sectioned range below it is excised. each sectioned range lies
+# entirely below or entirely above a non-sectioned site, so the shift is the summed
+# length of the ranges ending at or before `offset`. with no sectioned function the
+# shift is zero and the offset is returned unchanged.
+fun rebased_text_offset(placements: *SectionPlacement, count: u32, offset: u32) u32 {
+    var shift: u32 = 0;
+    var i: u32 = 0;
+    for (i < count) {
+        val p: *SectionPlacement = ?placements[i];
+        if (p.text_end <= offset) { shift = shift + (p.text_end - p.text_start); }
+        i = i + 1;
+    }
+    ret offset - shift;
 }
 
 # make_func_section: copy the encoder blob's [start, end) bytes (one sectioned
@@ -407,14 +444,25 @@ fun build_section_placements(s: *sess.Session, image: *of.ObjectImage, irmod: *i
     ret ok[bool, str](true);
 }
 
-# append the encoded `.text` section to the image.
+# assemble the `.text` section from the NON-sectioned functions.
+#
+# with no `section("...")` decorator (`count == 0`) the encoder blob is adopted
+# whole and emission is byte-for-byte unchanged. otherwise each sectioned
+# function's [start, end) range — already copied into its named section by
+# build_section_placements — is excised and the remaining bytes are packed
+# contiguously into a fresh image-owned buffer; the now-orphaned encoder blob is
+# released. a module whose every function is sectioned yields an empty `.text`
+# (nil bytes, length 0). pack_text is the last reader of `enc.text`, so it owns
+# the blob's disposition: adopt it (default path) or free it (repartition path).
 # ---
-# s:     session, for interning the section name
-# image: object image being built
-# enc:   encoder output supplying the text bytes
-# ret:   the new section's index, or an error string
-fun pack_text(s: *sess.Session, image: *of.ObjectImage,
-              enc: *encode.EncoderOutput) Result[u32, str] {
+# s:          session, for interning the section name and allocating the buffer
+# image:      object image being built
+# enc:        encoder output supplying the text bytes (adopted or freed here)
+# placements: the sectioned-function ranges to excise, in increasing text offset
+# count:      number of placements (0 = default path, adopt the blob unchanged)
+# ret:        the new section's index, or an error string
+fun pack_text(s: *sess.Session, image: *of.ObjectImage, enc: *encode.EncoderOutput,
+              placements: *SectionPlacement, count: u32) Result[u32, str] {
     val rname: Result[intern.StrId, str] = intern.intern(?s.interner, ".text");
     if (is_err[intern.StrId, str](rname)) {
         ret err[u32, str](unwrap_err[intern.StrId, str](rname));
@@ -423,10 +471,48 @@ fun pack_text(s: *sess.Session, image: *of.ObjectImage,
     var sec: of.Section;
     sec.name  = unwrap_ok[intern.StrId, str](rname);
     sec.kind  = of.SK_TEXT;
-    sec.bytes = enc.text;
-    sec.len   = enc.text_len;
     sec.align = 16;
 
+    if (count == 0) {
+        sec.bytes = enc.text;
+        sec.len   = enc.text_len;
+        ret obj.add_section(image, sec);
+    }
+
+    val new_len: u32 = enc.text_len - total_excised(placements, count);
+    if (new_len == 0) {
+        # every function is sectioned: `.text` carries no bytes.
+        sec.bytes = nil;
+        sec.len   = 0;
+    }
+    or {
+        val br: Result[*u8, str] = allocate[u8](s.alloc, new_len::usize);
+        if (is_err[*u8, str](br)) {
+            deallocate[u8](s.alloc, enc.text, enc.text_len::usize);
+            ret err[u32, str](unwrap_err[*u8, str](br));
+        }
+        val buf: *u8 = unwrap_ok[*u8, str](br);
+
+        # copy the gaps between the excised ranges in order; placements are recorded
+        # in increasing text offset, so one forward walk packs `.text` contiguously.
+        var w: u32 = 0;
+        var prev_end: u32 = 0;
+        var i: u32 = 0;
+        for (i < count) {
+            val p: *SectionPlacement = ?placements[i];
+            var k: u32 = prev_end;
+            for (k < p.text_start) { buf[w] = enc.text[k]; w = w + 1; k = k + 1; }
+            prev_end = p.text_end;
+            i = i + 1;
+        }
+        var k2: u32 = prev_end;
+        for (k2 < enc.text_len) { buf[w] = enc.text[k2]; w = w + 1; k2 = k2 + 1; }
+
+        sec.bytes = buf;
+        sec.len   = new_len;
+    }
+
+    deallocate[u8](s.alloc, enc.text, enc.text_len::usize);
     ret obj.add_section(image, sec);
 }
 
@@ -462,14 +548,18 @@ fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
         }
 
         # a mark inside a sectioned function is re-homed to that function's named
-        # section at the rebased offset; everything else stays in `.text`.
+        # section at the rebased offset; a `.text`-resident mark shifts down by the
+        # sectioned ranges excised below it (zero shift, unchanged, by default).
         var sec_ix: u32 = text_sec;
-        var off:    u32 = mark.offset;
+        var off:    u32 = 0;
         val pl: Option[*SectionPlacement] = placement_for(placements, placement_count, mark.offset);
         if (is_some[*SectionPlacement](pl)) {
             val p: *SectionPlacement = unwrap[*SectionPlacement](pl);
             sec_ix = p.sec;
             off    = mark.offset - p.text_start;
+        }
+        or {
+            off = rebased_text_offset(placements, placement_count, mark.offset);
         }
 
         var sym: of.Symbol;
@@ -542,15 +632,20 @@ fun pack_relocs(image: *of.ObjectImage, enc: *encode.EncoderOutput,
         val pr: *encode.PendingReloc = ?enc.relocations[i];
 
         # a patch site inside a sectioned function is re-homed to that function's
-        # named section at the rebased offset; the symbol target is unchanged
-        # (resolved by the linker), so cross-section calls just work.
+        # named section at the rebased offset; a `.text`-resident site shifts down
+        # by the sectioned ranges excised below it (zero shift, unchanged, by
+        # default). the symbol target is unchanged (resolved by the linker), so
+        # cross-section calls just work.
         var sec_ix: u32 = text_sec;
-        var off:    u32 = pr.offset;
+        var off:    u32 = 0;
         val pl: Option[*SectionPlacement] = placement_for(placements, placement_count, pr.offset);
         if (is_some[*SectionPlacement](pl)) {
             val p: *SectionPlacement = unwrap[*SectionPlacement](pl);
             sec_ix = p.sec;
             off    = pr.offset - p.text_start;
+        }
+        or {
+            off = rebased_text_offset(placements, placement_count, pr.offset);
         }
 
         var rel: of.Relocation;
