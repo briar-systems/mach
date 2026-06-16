@@ -82,6 +82,13 @@ pub val CT_KIND_FLOAT: CTKind = 1;
 pub val CT_KIND_BOOL:  CTKind = 2;
 pub val CT_KIND_STR:   CTKind = 3;
 
+# a comptime TYPE value (#1472): `$type_of(expr)` and a type-name operand fold to
+# one of these so a type `==` / `!=` inside a `$if` gate is a plain identity
+# compare. the payload `data.t` is an opaque type-identity token minted by the
+# typed layer's resolver (a canonical sema TypeId): equal tokens name the same
+# type. eval never interprets the token, only compares it.
+pub val CT_KIND_TYPE:  CTKind = 4;
+
 # COMPTIME_BARE_IDENT_MSG: the single teaching diagnostic for a standalone bare
 # `$ident` (#1249). the comptime channel's shapes are a closed set; a lone
 # `$ident` is none of them — a comptime parameter is referenced without `$`, and
@@ -108,6 +115,7 @@ pub rec CTValue {
         f: f64;
         b: bool;
         s: intern.StrId;
+        t: u32;
     };
 }
 
@@ -135,6 +143,29 @@ pub def ModuleMemberFn: fun(ptr, id.ExprId) Result[Option[CTValue], str];
 # is not available before lowering, so such a path cannot fold there.
 pub val COMPTIME_MEMBER_NO_RESOLVER_MSG: str =
     "a module-qualified member path is only comptime-evaluable after name resolution";
+
+# TypeIdentFn: resolves a type-comparison operand expression to its opaque
+# type-identity token (a canonical sema TypeId), or none when the operand has no
+# resolvable type. eval recognizes the type-comparison shape structurally
+# (`$type_of(...)` against a type name) but has no type system, so the typed
+# layer (lowering, where monomorphized concrete types are known) installs this
+# hook with `set_type_resolver`. the first argument is the installer's opaque
+# context; the second is the operand expression id, already unwrapped past a
+# `$type_of(...)` to its inner value expression.
+pub def TypeIdentFn: fun(ptr, id.ExprId) Result[Option[u32], str];
+
+# COMPTIME_TYPE_NO_RESOLVER_MSG: surfaced when a type comparison is evaluated in
+# a context that installed no type resolver — type identities are only available
+# after types exist, so arm selection on a `$type_of(...)` gate is deferred to
+# lowering.
+pub val COMPTIME_TYPE_NO_RESOLVER_MSG: str =
+    "a type comparison is only comptime-evaluable after type checking";
+
+# COMPTIME_TYPE_UNRESOLVED_MSG: surfaced when a type-comparison operand has no
+# resolvable type identity (an untyped or erroneous operand) even though a
+# resolver is installed.
+pub val COMPTIME_TYPE_UNRESOLVED_MSG: str =
+    "type comparison operand does not name a type";
 
 # COMPTIME_MEMBER_NOT_CONST_MSG: surfaced when a module-qualified member path
 # resolves but does not name a module-level comptime constant (a function, a
@@ -193,6 +224,10 @@ pub def FrameMark: u32;
 # member_fn:      erased ModuleMemberFn resolving `alias.CONST` member paths, or
 #                 nil when no resolver is installed (every pass before lowering)
 # member_data:    opaque context passed to member_fn (the *LowerContext)
+# type_fn:        erased TypeIdentFn resolving a type-comparison operand to its
+#                 type-identity token, or nil when no resolver is installed (every
+#                 pass before lowering)
+# type_data:      opaque context passed to type_fn (the *LowerContext)
 pub rec ComptimeCtx {
     alloc:          *Allocator;
     target_os_id:   u32;
@@ -218,6 +253,8 @@ pub rec ComptimeCtx {
     bin_name:       intern.StrId;
     member_fn:      *u8;
     member_data:    ptr;
+    type_fn:        *u8;
+    type_data:      ptr;
 }
 
 val INITIAL_CONST_CAP: u32 = 8;
@@ -279,6 +316,8 @@ pub fun init(
     c.bin_name       = intern.STR_NIL;
     c.member_fn      = nil;
     c.member_data    = nil;
+    c.type_fn        = nil;
+    c.type_data      = nil;
     ret c;
 }
 
@@ -294,6 +333,20 @@ pub fun init(
 pub fun set_member_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
     c.member_fn   = fn;
     c.member_data = data;
+}
+
+# set_type_resolver: install (or clear) the type-comparison operand resolver this
+# context consults when comptime.eval folds a `$type_of(...)` type comparison.
+# lowering installs it pointing at the active LowerContext; passing `nil` for
+# both clears it. kept out of the build/target setters because it is per-pass
+# state, not manifest-derived.
+# ---
+# c:    context to update
+# fn:   erased TypeIdentFn, or nil to clear
+# data: opaque context handed back to fn, or nil to clear
+pub fun set_type_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
+    c.type_fn   = fn;
+    c.type_data = data;
 }
 
 # set_build_context: bind the manifest-derived project metadata, the selected
@@ -856,6 +909,16 @@ fun eval_binary(
         ret eval_logical(c, a, source, bin, interner);
     }
 
+    # a type comparison (`$type_of(...) == TypeName`, #1472) is a closed shape: an
+    # `==` / `!=` with a `$type_of(...)` operand. each operand folds to a TYPE
+    # value through the installed type resolver, and the result is an identity
+    # compare. recognized structurally here so a type operand never reaches the
+    # numeric / value evaluator below.
+    if ((bin.op == expr.BIN_EQ || bin.op == expr.BIN_NEQ)
+        && is_type_comparison(a, source, bin)) {
+        ret eval_type_comparison(c, a, source, bin, interner);
+    }
+
     val lhs_r: Result[CTValue, str] = eval(c, a, source, bin.lhs, interner);
     if (is_err[CTValue, str](lhs_r)) { ret lhs_r; }
     val rhs_r: Result[CTValue, str] = eval(c, a, source, bin.rhs, interner);
@@ -931,6 +994,109 @@ fun eval_logical(
     ret bool_value(rhs.data.b);
 }
 
+# is_type_of_call: whether `eid` is a `$type_of(arg)` intrinsic call, recognized
+# structurally by a `$`-rooted COMPTIME_IDENT callee spelled `type_of`. arity is
+# validated by sema, not here.
+# ---
+# a:      the ast that owns `eid`
+# source: source text (for the callee span)
+# eid:    expression id to test
+# ret:    true when `eid` is a `$type_of(...)` call
+pub fun is_type_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
+    if (eid == id.EXPR_NIL) { ret false; }
+    val n_opt: Option[*expr.Expr] = ast.get_expr(a, eid);
+    if (is_none[*expr.Expr](n_opt)) { ret false; }
+    val node: *expr.Expr = unwrap[*expr.Expr](n_opt);
+    if (node.kind != expr.EXPR_KIND_CALL) { ret false; }
+    val ce_opt: Option[*expr.Expr] = ast.get_expr(a, node.data.call.callee);
+    if (is_none[*expr.Expr](ce_opt)) { ret false; }
+    val ce: *expr.Expr = unwrap[*expr.Expr](ce_opt);
+    if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret false; }
+    val ns: token.Span = comptime_ident_name(ce.span);
+    if (ns.len == 0) { ret false; }
+    ret view_eq_str(span_text(source, ns), "type_of");
+}
+
+# type_of_arg: the single value-argument expression of a `$type_of(arg)` call, or
+# EXPR_NIL when `eid` is not such a call or carries no argument.
+# ---
+# a:   the ast that owns `eid`
+# eid: a `$type_of(...)` call expression id
+# ret: the argument expression id, or EXPR_NIL
+pub fun type_of_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId {
+    if (eid == id.EXPR_NIL) { ret id.EXPR_NIL; }
+    val n_opt: Option[*expr.Expr] = ast.get_expr(a, eid);
+    if (is_none[*expr.Expr](n_opt)) { ret id.EXPR_NIL; }
+    val node: *expr.Expr = unwrap[*expr.Expr](n_opt);
+    if (node.kind != expr.EXPR_KIND_CALL) { ret id.EXPR_NIL; }
+    if (node.data.call.args_len < 1) { ret id.EXPR_NIL; }
+    ret a.expr_ids[node.data.call.args_start];
+}
+
+# type_operand_value: the expression whose type identity a type-comparison operand
+# denotes. `$type_of(e)` denotes the type of its inner value `e`; any other
+# operand is a type-name spelling (`i64`, `module.Foo`) and denotes itself. the
+# installed type resolver reads the resulting expression's type slot either way.
+# ---
+# a:       the ast that owns `operand`
+# source:  source text (for the callee span)
+# operand: a type-comparison operand expression id
+# ret:     the inner value expression for `$type_of(...)`, else `operand`
+pub fun type_operand_value(a: *ast.Ast, source: str, operand: id.ExprId) id.ExprId {
+    if (is_type_of_call(a, source, operand)) { ret type_of_arg(a, operand); }
+    ret operand;
+}
+
+# is_type_comparison: whether a binary `==` / `!=` is a type comparison — true
+# when at least one operand is a `$type_of(...)` call. shared by resolve (to bind
+# the type-name operand as a type), sema (to type the comparison), and the
+# evaluator (to fold it).
+# ---
+# a:      the ast that owns `bin`
+# source: source text (for callee spans)
+# bin:    the binary expression
+# ret:    true when the binary is a type comparison
+pub fun is_type_comparison(a: *ast.Ast, source: str, bin: *expr.ExprBinary) bool {
+    ret is_type_of_call(a, source, bin.lhs) || is_type_of_call(a, source, bin.rhs);
+}
+
+# folds a type comparison: each operand resolves to a TYPE value through the
+# installed resolver, and the result is an identity compare. a context with no
+# resolver (every pass before lowering) defers loudly so arm selection happens at
+# lowering, where monomorphized concrete types are known.
+fun eval_type_comparison(
+    c:        *ComptimeCtx,
+    a:        *ast.Ast,
+    source:   str,
+    bin:      *expr.ExprBinary,
+    interner: *intern.Interner
+) Result[CTValue, str] {
+    val l_r: Result[CTValue, str] = eval_type_operand(c, a, source, bin.lhs);
+    if (is_err[CTValue, str](l_r)) { ret l_r; }
+    val r_r: Result[CTValue, str] = eval_type_operand(c, a, source, bin.rhs);
+    if (is_err[CTValue, str](r_r)) { ret r_r; }
+    ret apply_equality(bin.op, unwrap_ok[CTValue, str](l_r), unwrap_ok[CTValue, str](r_r));
+}
+
+# resolves one type-comparison operand to its TYPE value through the installed
+# type resolver. errors when no resolver is installed, or when the operand has no
+# resolvable type identity.
+fun eval_type_operand(
+    c:       *ComptimeCtx,
+    a:       *ast.Ast,
+    source:  str,
+    operand: id.ExprId
+) Result[CTValue, str] {
+    if (c.type_fn == nil) { ret err[CTValue, str](COMPTIME_TYPE_NO_RESOLVER_MSG); }
+    val fn: TypeIdentFn = c.type_fn::TypeIdentFn;
+    val value_eid: id.ExprId = type_operand_value(a, source, operand);
+    val r: Result[Option[u32], str] = fn(c.type_data, value_eid);
+    if (is_err[Option[u32], str](r)) { ret err[CTValue, str](unwrap_err[Option[u32], str](r)); }
+    val o: Option[u32] = unwrap_ok[Option[u32], str](r);
+    if (is_none[u32](o)) { ret err[CTValue, str](COMPTIME_TYPE_UNRESOLVED_MSG); }
+    ret type_value(unwrap[u32](o));
+}
+
 # ct_is_negative: whether an integer CTValue denotes a negative mathematical
 # value. only a signed payload with its high bit set is negative; an unsigned
 # payload is always a non-negative magnitude. non-integer values are never
@@ -970,6 +1136,7 @@ fun apply_equality(op: expr.BinOp, lhs: CTValue, rhs: CTValue) Result[CTValue, s
     or (lhs.kind == CT_KIND_FLOAT) { eq = lhs.data.f == rhs.data.f; }
     or (lhs.kind == CT_KIND_BOOL)  { eq = lhs.data.b == rhs.data.b; }
     or (lhs.kind == CT_KIND_STR)   { eq = lhs.data.s == rhs.data.s; }
+    or (lhs.kind == CT_KIND_TYPE)  { eq = lhs.data.t == rhs.data.t; }
 
     if (op == expr.BIN_EQ)  { ret bool_value(eq); }
     ret bool_value(!eq);
@@ -1664,6 +1831,15 @@ fun str_value(s: intern.StrId) Result[CTValue, str] {
     var v: CTValue;
     v.kind   = CT_KIND_STR;
     v.data.s = s;
+    ret ok[CTValue, str](v);
+}
+
+# type_value: a comptime TYPE value carrying an opaque type-identity token (a
+# canonical sema TypeId minted by the resolver). compared only for identity.
+fun type_value(t: u32) Result[CTValue, str] {
+    var v: CTValue;
+    v.kind   = CT_KIND_TYPE;
+    v.data.t = t;
     ret ok[CTValue, str](v);
 }
 
