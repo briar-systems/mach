@@ -343,10 +343,9 @@ ref = "branch/dev"
 `mach build` (no `--target`) selects `linux` because `[project].target = "native"`
 resolves to the host-matching tuple, compiles `src/main.mach` and its transitive
 imports — including modules from `mach-std` vendored at `dep/mach-std/` — into
-objects under `out/linux/obj/`, and links `out/linux/bin/mach`. The compiler
-carries `mach-std` as a git **submodule**; because `mach dep` performs only plain
-git operations, `mach dep pull` operates on the submodule checkout directly the
-same as any other git dep.
+objects under `out/linux/obj/`, and links `out/linux/bin/mach`. `mach-std` is
+realized into `dep/mach-std/` by `mach dep pull` from the manifest pin, and
+`mach build` then resolves it purely by that vendor path — no git at build time.
 
 ## See also
 
