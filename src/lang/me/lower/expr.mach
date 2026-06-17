@@ -357,6 +357,41 @@ fun load_pack_elem(ctx: *lower.LowerContext, eid: aid.ExprId, i: u32) Result[val
     ret builder.emit_load(?ctx.builder, slot, ity);
 }
 
+# is_spread_expr: true when `eid` is a `va...` pack spread expression (#1474/#1475).
+fun is_spread_expr(ctx: *lower.LowerContext, eid: aid.ExprId) bool {
+    val e_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
+    if (is_none[*aexpr.Expr](e_opt)) { ret false; }
+    ret unwrap[*aexpr.Expr](e_opt).kind == aexpr.EXPR_KIND_SPREAD;
+}
+
+# call_has_spread: true when call expression `e` has any `va...` spread argument.
+fun call_has_spread(ctx: *lower.LowerContext, e: *aexpr.Expr) bool {
+    var i: u32 = 0;
+    for (i < e.data.call.args_len) {
+        val pool_ix: u32 = e.data.call.args_start + i;
+        if (pool_ix::usize >= ctx.a.expr_id_len) { ret false; }
+        if (is_spread_expr(ctx, ctx.a.expr_ids[pool_ix])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# load_pack_slot: rvalue of pack slot `k` — typed from `ctx.pack_types[k]` rather
+# than an expr's sema type. used when splicing the whole pack into a `va...` forward.
+# aggregates flow by storage address tagged with the aggregate IR type, mirroring
+# load_pack_elem.
+fun load_pack_slot(ctx: *lower.LowerContext, k: u32) Result[value.Value, str] {
+    if (ctx.pack_slots == nil || k >= ctx.pack_len) {
+        ret err[value.Value, str]("lower: pack slot index out of range");
+    }
+    val slot: value.Value = ctx.pack_slots[k];
+    val ir_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, ctx.pack_types[k]);
+    if (is_err[ir_type.IrTypeId, str](ir_r)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](ir_r)); }
+    val ity: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ir_r);
+    if (is_aggregate_ir(ctx, ity)) { ret ok[value.Value, str](value.retype(slot, ity)); }
+    ret builder.emit_load(?ctx.builder, slot, ity);
+}
+
 # the folded comptime value of a symbol, when it is a comptime value parameter
 # (SYM_PARAM with SYM_FLAG_COMPTIME) currently bound in the comptime context by a
 # value-instance drain. none for any other symbol, or when not in a value-instance
@@ -1144,7 +1179,10 @@ fun lower_call(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result
 
     val argc: u32 = e.data.call.args_len;
     var rtc: u32 = argc;
+    val has_spread: bool = call_has_spread(ctx, e);
     if (has_ct) { rtc = runtime_arg_count(ctx, cf_ast, cf_decl, argc); }
+    # a va... spread replaces one spread arg with ctx.pack_len concrete slot args.
+    if (has_spread) { rtc = (argc - 1) + ctx.pack_len; }
 
     var args: *value.Value = nil;
     if (rtc > 0) {
@@ -1162,6 +1200,22 @@ fun lower_call(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) Result
                 ret err[value.Value, str]("lower: call argument index out of range");
             }
             val arg_eid: aid.ExprId = ctx.a.expr_ids[pool_ix];
+            # va... spread: splice the current pack's N concrete slots into the arg list.
+            if (has_spread && is_spread_expr(ctx, arg_eid)) {
+                var k: u32 = 0;
+                for (k < ctx.pack_len) {
+                    val sr: Result[value.Value, str] = load_pack_slot(ctx, k);
+                    if (is_err[value.Value, str](sr)) {
+                        deallocate[value.Value](ctx.s.alloc, args, rtc::usize);
+                        ret sr;
+                    }
+                    args[w] = unwrap_ok[value.Value, str](sr);
+                    w = w + 1;
+                    k = k + 1;
+                }
+                i = i + 1;
+                cnt;
+            }
             val vr: Result[value.Value, str] = lower_rvalue(ctx, arg_eid);
             if (is_err[value.Value, str](vr)) {
                 deallocate[value.Value](ctx.s.alloc, args, rtc::usize);
@@ -1528,15 +1582,14 @@ fun lower_generic_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Ex
     ret ok[value.Value, str](value.fn_value(unwrap_ok[u32, str](xr), vty));
 }
 
-# resolves a pack-tailed call to its monomorphized instance (#1475): reads the
-# trailing arguments' concrete types — the collected pack element type-list,
-# substituting any enclosing generic substitution so a transitive pack call
-# resolves element types to the concrete args — computes the instance's mangled
-# linkage name under the disjoint `Q...E` pack namespace, enqueues the instance for
-# body emission, and returns a function reference to it. the leading fixed
-# arguments and the collected elements are all passed at runtime (the instance's
-# expanded signature), so no argument is dropped here; the back end emits a
-# name-based call the linker binds to the (weak, deduped) instance body.
+# resolves a pack-tailed call to its monomorphized instance (#1475). two paths:
+#   - `va...` spread: the call is a forward of the current pack instance; the
+#     type-list is borrowed from ctx.pack_types (enqueue copies it).
+#   - collected: the type-list is gathered from the trailing call-site arguments,
+#     with any enclosing generic substitution applied.
+# in both cases the instance's mangled linkage name is computed under the disjoint
+# `Q...E` pack namespace, the instance is enqueued for body emission, and a
+# function reference to it is returned. all arguments are passed at runtime.
 fun lower_pack_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr, f: *adecl.DeclFun) Result[value.Value, str] {
     val sid: resolve.SymbolId = lower.expr_symbol_of(ctx, e.data.call.callee);
     val so: Option[*resolve.Symbol] = lower.symbol_of(ctx, sid);
@@ -1548,31 +1601,41 @@ fun lower_pack_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr,
     # the pack is the trailing parameter; every argument past the leading fixed
     # parameters is a collected pack element.
     val fixed_count: u32 = f.params_len - 1;
-    if (e.data.call.args_len < fixed_count) {
-        ret err[value.Value, str]("lower: pack-tailed call has fewer arguments than fixed parameters");
-    }
-    val elem_count: u32 = e.data.call.args_len - fixed_count;
-
+    var elem_count: u32 = 0;
     var types: *ty.TypeId = nil;
-    if (elem_count > 0) {
-        val ab: Result[*ty.TypeId, str] = allocate[ty.TypeId](ctx.s.alloc, elem_count::usize);
-        if (is_err[*ty.TypeId, str](ab)) { ret err[value.Value, str](unwrap_err[*ty.TypeId, str](ab)); }
-        types = unwrap_ok[*ty.TypeId, str](ab);
+    var owns_types: bool = false;
 
-        var j: u32 = 0;
-        for (j < elem_count) {
-            val pool_ix: u32 = e.data.call.args_start + fixed_count + j;
-            if (pool_ix::usize >= ctx.a.expr_id_len) {
-                deallocate[ty.TypeId](ctx.s.alloc, types, elem_count::usize);
-                ret err[value.Value, str]("lower: pack-tailed call argument index out of range");
+    if (call_has_spread(ctx, e)) {
+        # va... forward: borrow the current instance's type-list directly; enqueue
+        # copies it, so we must not free it after enqueueing.
+        elem_count = ctx.pack_len;
+        types = ctx.pack_types;
+    } or {
+        if (e.data.call.args_len < fixed_count) {
+            ret err[value.Value, str]("lower: pack-tailed call has fewer arguments than fixed parameters");
+        }
+        elem_count = e.data.call.args_len - fixed_count;
+        if (elem_count > 0) {
+            val ab: Result[*ty.TypeId, str] = allocate[ty.TypeId](ctx.s.alloc, elem_count::usize);
+            if (is_err[*ty.TypeId, str](ab)) { ret err[value.Value, str](unwrap_err[*ty.TypeId, str](ab)); }
+            types = unwrap_ok[*ty.TypeId, str](ab);
+            owns_types = true;
+
+            var j: u32 = 0;
+            for (j < elem_count) {
+                val pool_ix: u32 = e.data.call.args_start + fixed_count + j;
+                if (pool_ix::usize >= ctx.a.expr_id_len) {
+                    deallocate[ty.TypeId](ctx.s.alloc, types, elem_count::usize);
+                    ret err[value.Value, str]("lower: pack-tailed call argument index out of range");
+                }
+                val arg_eid: aid.ExprId = ctx.a.expr_ids[pool_ix];
+                var et: ty.TypeId = lower.expr_type_of(ctx, arg_eid);
+                if (ctx.subst != nil && ctx.subst_len > 0) {
+                    et = generics.substitute(ctx.s, et, ctx.subst, ctx.subst_len);
+                }
+                types[j] = et;
+                j = j + 1;
             }
-            val arg_eid: aid.ExprId = ctx.a.expr_ids[pool_ix];
-            var et: ty.TypeId = lower.expr_type_of(ctx, arg_eid);
-            if (ctx.subst != nil && ctx.subst_len > 0) {
-                et = generics.substitute(ctx.s, et, ctx.subst, ctx.subst_len);
-            }
-            types[j] = et;
-            j = j + 1;
         }
     }
 
@@ -1582,13 +1645,13 @@ fun lower_pack_callee(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr,
     val fqn: intern.StrId = sess.module_fqn(ctx.s, sym.origin);
     val name_r: Result[intern.StrId, str] = mangle.pack_instance_name(ctx.s, fqn, sym.name, types, elem_count);
     if (is_err[intern.StrId, str](name_r)) {
-        if (types != nil) { deallocate[ty.TypeId](ctx.s.alloc, types, elem_count::usize); }
+        if (owns_types && types != nil) { deallocate[ty.TypeId](ctx.s.alloc, types, elem_count::usize); }
         ret err[value.Value, str](unwrap_err[intern.StrId, str](name_r));
     }
     val link: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
 
     val enq: Result[bool, str] = lower.enqueue_pack_instance(ctx, sym.decl, sym.origin, types, elem_count, link);
-    if (types != nil) { deallocate[ty.TypeId](ctx.s.alloc, types, elem_count::usize); }
+    if (owns_types && types != nil) { deallocate[ty.TypeId](ctx.s.alloc, types, elem_count::usize); }
     if (is_err[bool, str](enq)) { ret err[value.Value, str](unwrap_err[bool, str](enq)); }
 
     val vtr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?ctx.m.types);
