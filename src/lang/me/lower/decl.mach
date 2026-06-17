@@ -116,6 +116,12 @@ pub fun lower_fun(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, is_
     # cannot fold without a bound value.
     if (fun_has_comptime_param(ctx, d)) { ret ok[bool, str](true); }
 
+    # a pack-tailed function (`va: ...`) is likewise a TEMPLATE: it is emitted once
+    # per distinct call-site pack type-list through the pack-instance worklist
+    # (lower_pack_instance), never as a standalone body here. emitting it directly
+    # would fail — its pack `$each` cannot unroll without a concrete element list.
+    if (fun_has_pack_param(ctx, d)) { ret ok[bool, str](true); }
+
     val sig_r: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, lower.decl_type_of(ctx, did));
     if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
     val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
@@ -263,6 +269,242 @@ pub fun lower_value_instance(ctx: *lower.LowerContext, did: aid.DeclId, d: *adec
     ret close_function(ctx, ret_ir);
 }
 
+# lowers one comptime variadic-pack instance: a concrete body for the pack-tailed
+# template `did` under the instance linkage `name`, with the trailing pack
+# parameter EXPANDED into `type_len` concrete parameters typed by the call site's
+# element type-list (`types`). the context must already be bound to the template's
+# origin module (AST / typing / name-resolution / comptime ctx). the lowered
+# signature is the leading fixed parameters followed by the N expanded element
+# parameters; the body's `$each a in va` unrolls over those N parameters, binding
+# the loop variable to each (lower_comptime_each). the emitted function is
+# PUB | WEAK so any using object binds to it and the linker collapses the copies.
+# a body-less template is not a valid instance and is skipped.
+# ---
+# ctx:      the context, already bound to the origin module
+# did:      DeclId of the pack-tailed template in the origin AST
+# d:        the resolved template Decl
+# name:     the instance's mangled linkage name
+# types:    the concrete pack element type-list (by pack ordinal)
+# type_len: number of pack element types (the expanded parameter count)
+# ret:      true on success, or an error
+pub fun lower_pack_instance(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl,
+                            name: intern.StrId, types: *ty.TypeId, type_len: u32) Result[bool, str] {
+    if (d.data.fun_.body == aid.STMT_NIL) { ret ok[bool, str](true); }
+
+    # leading fixed parameter count: every declared parameter except the trailing
+    # pack. the pack expands to `type_len` concrete parameters after them.
+    val fixed_count: u32 = d.data.fun_.params_len - 1;
+
+    val ret_ir_r: Result[ir_type.IrTypeId, str] = function_return_ir(ctx, did);
+    if (is_err[ir_type.IrTypeId, str](ret_ir_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](ret_ir_r)); }
+    val ret_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ret_ir_r);
+
+    val sig_r: Result[ir_type.IrTypeId, str] = pack_instance_sig(ctx, d, fixed_count, types, type_len, ret_ir);
+    if (is_err[ir_type.IrTypeId, str](sig_r)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](sig_r)); }
+    val sig: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](sig_r);
+
+    val flags: u32 = ir.FN_FLAG_PUB | ir.FN_FLAG_WEAK;
+    val idx_r: Result[u32, str] = append_function(ctx, name, sig, flags, fixed_count + type_len);
+    if (is_err[u32, str](idx_r)) { ret err[bool, str](unwrap_err[u32, str](idx_r)); }
+    val fn_index: u32 = unwrap_ok[u32, str](idx_r);
+
+    lower.begin_function(ctx, fn_index, ret_ir);
+
+    # publish the pack body state the `$each a in va` unroll reads: the N element
+    # types and the semantic return type now; the N alloca slots are filled by
+    # lower_pack_params below.
+    ctx.pack_types  = types;
+    ctx.pack_len    = type_len;
+    ctx.pack_ret_ty = pack_instance_ret_sem(ctx, did);
+
+    builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
+
+    val entry_r: Result[ir.BlockId, str] = builder.new_block(?ctx.builder);
+    if (is_err[ir.BlockId, str](entry_r)) { ret err[bool, str](unwrap_err[ir.BlockId, str](entry_r)); }
+    builder.set_block(?ctx.builder, unwrap_ok[ir.BlockId, str](entry_r));
+
+    val params_r: Result[bool, str] = lower_pack_params(ctx, did, d, fn_index, fixed_count, types, type_len);
+    if (is_err[bool, str](params_r)) { clear_pack_state(ctx); ret params_r; }
+
+    val br: Result[bool, str] = stmt.lower_stmt(ctx, d.data.fun_.body);
+    if (is_err[bool, str](br)) { clear_pack_state(ctx); ret br; }
+
+    val cr: Result[bool, str] = close_function(ctx, ret_ir);
+    clear_pack_state(ctx);
+    ret cr;
+}
+
+# clear_pack_state: releases the pack instance body's expanded-parameter slot
+# buffer and clears the pack body state, so the next function lowered sees no
+# stale pack parameters. the element type-list (`pack_types`) is borrowed from the
+# worklist entry, so it is not freed here.
+fun clear_pack_state(ctx: *lower.LowerContext) {
+    if (ctx.pack_slots != nil && ctx.pack_len > 0) {
+        deallocate[value.Value](ctx.s.alloc, ctx.pack_slots, ctx.pack_len::usize);
+    }
+    ctx.pack_slots  = nil;
+    ctx.pack_types  = nil;
+    ctx.pack_len    = 0;
+    ctx.pack_ret_ty = ty.TYPE_NIL;
+}
+
+# pack_instance_sig: interns the IR function type of a pack instance — the leading
+# fixed parameter IR types followed by the N expanded element IR types, returning
+# `ret_ir`. the expanded elements take the place of the single TYPE_PACK parameter,
+# so the instance's ABI matches the collected call rather than the opaque pack.
+fun pack_instance_sig(ctx: *lower.LowerContext, d: *adecl.Decl, fixed_count: u32,
+                      types: *ty.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) Result[ir_type.IrTypeId, str] {
+    val total: u32 = fixed_count + type_len;
+    if (total == 0) {
+        ret ir_type.intern_fn(?ctx.m.types, ret_ir, nil, 0, false);
+    }
+
+    val buf_r: Result[*ir_type.IrTypeId, str] = allocate[ir_type.IrTypeId](ctx.s.alloc, total::usize);
+    if (is_err[*ir_type.IrTypeId, str](buf_r)) { ret err[ir_type.IrTypeId, str](unwrap_err[*ir_type.IrTypeId, str](buf_r)); }
+    val buf: *ir_type.IrTypeId = unwrap_ok[*ir_type.IrTypeId, str](buf_r);
+
+    var i: u32 = 0;
+    for (i < fixed_count) {
+        val pool_ix: u32 = d.data.fun_.params_start + i;
+        var p_sem: ty.TypeId = ty.TYPE_NIL;
+        if (pool_ix::usize < ctx.a.typed_name_len) {
+            p_sem = lower.type_resolved_of(ctx, ctx.a.typed_names[pool_ix].ty);
+        }
+        val pr: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, p_sem);
+        if (is_err[ir_type.IrTypeId, str](pr)) {
+            deallocate[ir_type.IrTypeId](ctx.s.alloc, buf, total::usize);
+            ret pr;
+        }
+        buf[i] = unwrap_ok[ir_type.IrTypeId, str](pr);
+        i = i + 1;
+    }
+
+    var j: u32 = 0;
+    for (j < type_len) {
+        val er: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, types[j]);
+        if (is_err[ir_type.IrTypeId, str](er)) {
+            deallocate[ir_type.IrTypeId](ctx.s.alloc, buf, total::usize);
+            ret er;
+        }
+        buf[fixed_count + j] = unwrap_ok[ir_type.IrTypeId, str](er);
+        j = j + 1;
+    }
+
+    val fr: Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?ctx.m.types, ret_ir, buf, total, false);
+    deallocate[ir_type.IrTypeId](ctx.s.alloc, buf, total::usize);
+    ret fr;
+}
+
+# pack_instance_ret_sem: the semantic return type of a pack instance, recovered
+# from its template's TYPE_FUN signature; supplied to the per-element body
+# re-inference so a `ret` inside the `$each` body checks against it.
+fun pack_instance_ret_sem(ctx: *lower.LowerContext, did: aid.DeclId) ty.TypeId {
+    val sem: ty.TypeId = lower.decl_type_of(ctx, did);
+    val t_opt: Option[*ty.Type] = ty.get(?ctx.s.types, sem);
+    if (is_none[*ty.Type](t_opt)) { ret ty.TYPE_NIL; }
+    val t: *ty.Type = unwrap[*ty.Type](t_opt);
+    if (t.kind != ty.TYPE_FUN) { ret ty.TYPE_NIL; }
+    ret t.data.fn.ret_ty;
+}
+
+# lower_pack_params: materialises the pack instance's parameters. the leading fixed
+# parameters are spilled and bound to their symbols exactly like lower_params; the
+# N expanded element parameters are spilled into alloca slots recorded on
+# `ctx.pack_slots` (by pack ordinal) for the `$each a in va` unroll to load, and
+# are NOT bound to any source symbol (the pack itself names no runtime value). the
+# function's `params` / `param_count` cover the fixed plus expanded parameters.
+fun lower_pack_params(ctx: *lower.LowerContext, did: aid.DeclId, d: *adecl.Decl, fn_index: u32,
+                      fixed_count: u32, types: *ty.TypeId, type_len: u32) Result[bool, str] {
+    val cr: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?ctx.m.types, 64);
+    if (is_err[ir_type.IrTypeId, str](cr)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](cr)); }
+    val xty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](cr);
+
+    val total: u32 = fixed_count + type_len;
+    var params: *value.Value = nil;
+    if (total > 0) {
+        val ar: Result[*value.Value, str] = allocate[value.Value](ctx.s.alloc, total::usize);
+        if (is_err[*value.Value, str](ar)) { ret err[bool, str](unwrap_err[*value.Value, str](ar)); }
+        params = unwrap_ok[*value.Value, str](ar);
+    }
+
+    var slots: *value.Value = nil;
+    if (type_len > 0) {
+        val sr: Result[*value.Value, str] = allocate[value.Value](ctx.s.alloc, type_len::usize);
+        if (is_err[*value.Value, str](sr)) {
+            if (params != nil) { deallocate[value.Value](ctx.s.alloc, params, total::usize); }
+            ret err[bool, str](unwrap_err[*value.Value, str](sr));
+        }
+        slots = unwrap_ok[*value.Value, str](sr);
+    }
+
+    var w: u32 = 0;
+    var i: u32 = 0;
+    for (i < fixed_count) {
+        val pool_ix: u32 = d.data.fun_.params_start + i;
+        var p_sem: ty.TypeId = ty.TYPE_NIL;
+        if (pool_ix::usize < ctx.a.typed_name_len) {
+            p_sem = lower.type_resolved_of(ctx, ctx.a.typed_names[pool_ix].ty);
+        }
+        val pr: Result[value.Value, str] = emit_pack_param(ctx, params, w, p_sem, xty);
+        if (is_err[value.Value, str](pr)) { free_pack_param_bufs(ctx, params, total, slots, type_len); ret err[bool, str](unwrap_err[value.Value, str](pr)); }
+        val slot: value.Value = unwrap_ok[value.Value, str](pr);
+
+        # a fixed parameter is read through its slot, like an ordinary parameter.
+        val sid: resolve.SymbolId = param_symbol(ctx, did, i);
+        if (sid != resolve.SYMBOL_NIL) {
+            val bind_r: Result[bool, str] = lower.bind_local(ctx, sid, slot);
+            if (is_err[bool, str](bind_r)) { free_pack_param_bufs(ctx, params, total, slots, type_len); ret bind_r; }
+        }
+        w = w + 1;
+        i = i + 1;
+    }
+
+    var j: u32 = 0;
+    for (j < type_len) {
+        val pr: Result[value.Value, str] = emit_pack_param(ctx, params, w, types[j], xty);
+        if (is_err[value.Value, str](pr)) { free_pack_param_bufs(ctx, params, total, slots, type_len); ret err[bool, str](unwrap_err[value.Value, str](pr)); }
+        # an expanded element is reached by ordinal: its slot is the storage the
+        # `$each a in va` unroll loads for the matching iteration.
+        slots[j] = unwrap_ok[value.Value, str](pr);
+        w = w + 1;
+        j = j + 1;
+    }
+
+    ctx.m.functions[fn_index].params      = params;
+    ctx.m.functions[fn_index].param_count = total;
+    ctx.pack_slots = slots;
+    ret ok[bool, str](true);
+}
+
+# emit_pack_param: materialise one parameter at ordinal `w` of the IR type lowered
+# from `p_sem` — a VAL_PARAM recorded in `params[w]`, spilled into a fresh alloca —
+# and returns the alloca slot pointer (a fixed parameter binds it to its symbol; an
+# expanded element keeps it by ordinal for the `$each` unroll).
+fun emit_pack_param(ctx: *lower.LowerContext, params: *value.Value, w: u32, p_sem: ty.TypeId, xty: ir_type.IrTypeId) Result[value.Value, str] {
+    val tr: Result[ir_type.IrTypeId, str] = lower.lower_type(ctx, p_sem);
+    if (is_err[ir_type.IrTypeId, str](tr)) { ret err[value.Value, str](unwrap_err[ir_type.IrTypeId, str](tr)); }
+    val p_ir: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
+
+    val pval: value.Value = value.param_value(w, p_ir);
+
+    val slot_r: Result[value.Value, str] = builder.emit_alloca(?ctx.builder, p_ir, value.const_int(1, xty));
+    if (is_err[value.Value, str](slot_r)) { ret slot_r; }
+    val slot: value.Value = unwrap_ok[value.Value, str](slot_r);
+
+    val sr: Result[bool, str] = builder.emit_store(?ctx.builder, pval, slot);
+    if (is_err[bool, str](sr)) { ret err[value.Value, str](unwrap_err[bool, str](sr)); }
+
+    params[w] = pval;
+    ret ok[value.Value, str](slot);
+}
+
+# free_pack_param_bufs: releases the parameter / slot buffers on a lowering error
+# before they are handed to the function / context.
+fun free_pack_param_bufs(ctx: *lower.LowerContext, params: *value.Value, total: u32, slots: *value.Value, type_len: u32) {
+    if (params != nil && total > 0) { deallocate[value.Value](ctx.s.alloc, params, total::usize); }
+    if (slots != nil && type_len > 0) { deallocate[value.Value](ctx.s.alloc, slots, type_len::usize); }
+}
+
 # reports whether a function declaration declares any comptime value parameter,
 # read from its own AST typed_names.
 pub fun fun_has_comptime_param(ctx: *lower.LowerContext, d: *adecl.Decl) bool {
@@ -273,6 +515,23 @@ pub fun fun_has_comptime_param(ctx: *lower.LowerContext, d: *adecl.Decl) bool {
         i = i + 1;
     }
     ret false;
+}
+
+# reports whether a function declaration ends in a comptime variadic-pack parameter
+# (`va: ...`, #1475), read from its own AST typed_names. a pack-tailed function is a
+# TEMPLATE — monomorphized once per distinct call-site pack type-list — so it is
+# never emitted as a standalone body. the pack may only be the trailing parameter,
+# so only the last param's resolved type is consulted.
+pub fun fun_has_pack_param(ctx: *lower.LowerContext, d: *adecl.Decl) bool {
+    val n: u32 = d.data.fun_.params_len;
+    if (n == 0) { ret false; }
+    val pool_ix: u32 = d.data.fun_.params_start + (n - 1);
+    if (pool_ix::usize >= ctx.a.typed_name_len) { ret false; }
+    val tn: *adecl.TypedName = ?ctx.a.typed_names[pool_ix];
+    val pt: ty.TypeId = lower.type_resolved_of(ctx, tn.ty);
+    val to: Option[*ty.Type] = ty.get(?ctx.s.types, pt);
+    if (is_none[*ty.Type](to)) { ret false; }
+    ret unwrap[*ty.Type](to).kind == ty.TYPE_PACK;
 }
 
 # reports a duplicate test label, naming the label text when lookup succeeds.
