@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 STD="$REPO_ROOT/dep/mach-std"
 
 if [ ! -d "$STD/src" ]; then
-    echo "error: vendored std not found at $STD (run: git submodule update --init)" >&2
+    echo "error: vendored std not found at $STD (run: mach dep pull)" >&2
     exit 2
 fi
 
