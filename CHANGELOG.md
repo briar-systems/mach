@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-06-19
+
+Minor — comptime type-directed-dispatch ergonomics and multi-artifact tooling
+graphs, surfaced while building the mach-std `{}` formatter and loading
+multi-binary projects in mach-lsp.
+
+### Added
+
+- driver: the long-lived tooling union (`build_project_union`) now unions the
+  import closure over **every declared artifact** (the full target × artifact
+  matrix), not just one — a multi-artifact project (`[bin.*]` + `[lib.*]`) loads
+  its whole module graph in tooling/LSP instead of erroring on artifact
+  ambiguity. Single-artifact builds and the `mach build`/`mach run` ambiguity
+  guard are unchanged (#1505).
+- comptime: `$error("msg")` is now a real compile-time directive — it fails the
+  build with its message when reached on a live path (an unconditional position
+  or a selected `$if`/`$or` arm; a dead arm's `$error` never fires) and is valid
+  in both declaration and statement scope. It was previously parsed as a silent
+  no-op (#1511).
+
+### Changed
+
+- comptime/sema: a `$type_of`-comparison `$if`/`$or` chain now type-checks only
+  the **selected** arm, pruning provably-dead arms at monomorphization.
+  Type-directed dispatch over a concrete type no longer needs per-arm identity
+  casts and is statically total (#1511).
+
 ## [2.0.1] - 2026-06-19
 
 Patch — parser error-recovery and a grammar-doc fix surfaced while migrating the
