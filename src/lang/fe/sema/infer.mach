@@ -32,6 +32,7 @@ use std.types.option.unwrap;
 use std.types.size.usize;
 
 use std.types.string.str;
+use std.types.string.str_region_equals;
 
 use std.types.result.Result;
 use std.types.result.ok;
@@ -149,6 +150,7 @@ fun infer_nominal(sc: *sema.SemaContext, did: id.DeclId, name_span: token.Span, 
     val ty: type.TypeId = unwrap_ok[type.TypeId, str](tr);
 
     build_field_table(sc, ty, r.fields_start, r.fields_len);
+    record_type_align(sc, did, ty);
     ret ty;
 }
 
@@ -160,7 +162,60 @@ fun infer_nominal_uni(sc: *sema.SemaContext, did: id.DeclId, name_span: token.Sp
     val ty: type.TypeId = unwrap_ok[type.TypeId, str](tr);
 
     build_field_table(sc, ty, u.fields_start, u.fields_len);
+    record_type_align(sc, did, ty);
     ret ty;
+}
+
+# folds an `align(...)` decorator on the record/union declaration `did` and
+# records the resulting alignment for nominal TypeId `ty` on the session, so the
+# middle end can over-align the lowered IR struct. the argument is a compile-time
+# constant (a literal or `$mach.build.*`) folded by `comptime.eval`; a non-constant
+# (e.g. a layout intrinsic, which has no value before layout) or non-power-of-two
+# is reported. absent decorator or a non-`align` set leaves the natural alignment.
+fun record_type_align(sc: *sema.SemaContext, did: id.DeclId, ty: type.TypeId) {
+    val d_opt: Option[*decl.Decl] = ast.get_decl(sc.a, did);
+    if (is_none[*decl.Decl](d_opt)) { ret; }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    var k: u32 = 0;
+    for (k < d.decorators_len) {
+        val dec: *decl.Decorator = ?sc.a.decorators[d.decorators_start + k];
+        if (str_region_equals(sc.source, dec.name.offset, dec.name.len, "align")) {
+            if (dec.args_len != 1) { ret; }
+            val arg: id.ExprId = sc.a.expr_ids[dec.args_start];
+            val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, arg, ?sc.s.interner);
+            if (is_err[comptime.CTValue, str](ev)) {
+                sema.report(sc, dec.name, "`align` on a type must be a compile-time constant");
+                ret;
+            }
+            val cv: comptime.CTValue = unwrap_ok[comptime.CTValue, str](ev);
+            # the body-pass validator skips the type-arg checks for rec/uni (it
+            # would double-report against this fold), so every invalid case is
+            # reported here — a non-integer, a negative, a non-power-of-two, or one
+            # overflowing the u32 alignment field — never silently dropped.
+            if (cv.kind != comptime.CT_KIND_INT) {
+                sema.report(sc, dec.name, "`align` value must be an integer");
+                ret;
+            }
+            if (comptime.ct_is_negative(cv)) {
+                sema.report(sc, dec.name, "`align` value must be a non-zero power of two");
+                ret;
+            }
+            val n: u64 = cv.data.i:~u64;
+            if (n == 0 || (n & (n - 1)) != 0) {
+                sema.report(sc, dec.name, "`align` value must be a non-zero power of two");
+                ret;
+            }
+            if (n > 0xFFFFFFFF) {
+                sema.report(sc, dec.name, "`align` value exceeds the maximum alignment");
+                ret;
+            }
+            val rr: Result[bool, str] = sess.register_type_align(sc.s, ty::u32, n::u32);
+            if (is_err[bool, str](rr)) { ret; }
+            ret;
+        }
+        k = k + 1;
+    }
 }
 
 # populates a field table for nominal `ty` from a typed_names slice, mapping
@@ -257,6 +312,12 @@ pub fun infer_expr(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
     or (e.kind == expr.EXPR_KIND_MEMBER) {
         t = infer_member(sc, eid, ?e.data.member, e.span);
     }
+    or (e.kind == expr.EXPR_KIND_PROJECT) {
+        t = infer_project(sc, ?e.data.project, e.span);
+    }
+    or (e.kind == expr.EXPR_KIND_SPREAD) {
+        t = infer_spread(sc, ?e.data.spread, e.span);
+    }
     or (e.kind == expr.EXPR_KIND_CAST) {
         t = infer_cast(sc, ?e.data.cast, e.span);
     }
@@ -284,6 +345,13 @@ fun infer_ident(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
     if (is_none[*resolve.Symbol](sym_opt)) { ret type.TYPE_ERROR; }
     val sym: *resolve.Symbol = unwrap[*resolve.Symbol](sym_opt);
 
+    # a `$each a in va` pack loop variable (#1475): a comptime-flagged `SYM_VAL`
+    # with no declaration, bound during monomorphization to a pack-element
+    # descriptor carrying the element's concrete type. its value-position type is
+    # that element type (the body is re-inferred per element at instantiation).
+    val pe: type.TypeId = pack_elem_loop_var_type(sc, sym);
+    if (pe != type.TYPE_NIL) { ret pe; }
+
     # a symbol that names a module or a type (module alias, record, union,
     # def alias, generic parameter, primitive) resolves cleanly but can never
     # be a value; report it loudly — a silent poison here lets a clean sema
@@ -300,6 +368,24 @@ fun infer_ident(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
     }
 
     ret sema.decl_type_for(sc, sym);
+}
+
+# pack_elem_loop_var_type: the concrete element type of a `$each a in va` pack
+# loop variable (#1475), or TYPE_NIL when `sym` is not such a variable. the loop
+# variable is a comptime-flagged `SYM_VAL` with no declaration (DECL_NIL); during
+# monomorphization the unroller binds its name in the comptime context to a
+# CT_KIND_PACK_ELEM descriptor whose `.ty` carries the element's concrete sema
+# type. consulted before the general symbol-type path so the body re-infers `a`
+# to the right element type per iteration.
+fun pack_elem_loop_var_type(sc: *sema.SemaContext, sym: *resolve.Symbol) type.TypeId {
+    if (sym.kind != resolve.SYM_VAL) { ret type.TYPE_NIL; }
+    if ((sym.flags & resolve.SYM_FLAG_COMPTIME) == 0) { ret type.TYPE_NIL; }
+    if (sym.decl != id.DECL_NIL) { ret type.TYPE_NIL; }
+    val nc: Option[*comptime.NamedConst] = comptime.lookup(sc.ctx, sym.name);
+    if (is_none[*comptime.NamedConst](nc)) { ret type.TYPE_NIL; }
+    val cv: comptime.CTValue = unwrap[*comptime.NamedConst](nc).value;
+    if (cv.kind != comptime.CT_KIND_PACK_ELEM) { ret type.TYPE_NIL; }
+    ret cv.data.pelem.ty::type.TypeId;
 }
 
 # reports whether `sym` names a function declaring at least one comptime value
@@ -402,6 +488,17 @@ fun report_comptime_param_fn_ref(sc: *sema.SemaContext, eid: id.ExprId) type.Typ
 fun infer_binary(sc: *sema.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, span: token.Span) type.TypeId {
     if (b.op == expr.BIN_ASSIGN) { ret infer_assign(sc, b, span); }
 
+    # a type comparison (`$type_of(...) == TypeName`, #1472) is a comptime-only
+    # bool: its operands name types, not values, so they are typed specially and
+    # never reach the value comparison below (which would mis-infer the
+    # `$type_of(...)` call).
+    if ((b.op == expr.BIN_EQ || b.op == expr.BIN_NEQ)
+        && (comptime.is_type_comparison(sc.a, sc.source, b)
+         || sema_is_field_type_operand(sc, b.lhs)
+         || sema_is_field_type_operand(sc, b.rhs))) {
+        ret infer_type_comparison(sc, b, span);
+    }
+
     var lt: type.TypeId = infer_expr(sc, b.lhs);
     var rt: type.TypeId = infer_expr(sc, b.rhs);
     if (lt == type.TYPE_ERROR || rt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
@@ -463,6 +560,77 @@ fun infer_binary(sc: *sema.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, spa
     # arithmetic: ADD, SUB, MUL, DIV, MOD
     if ((!operands_ok) || !is_numeric(sc, lt)) { type_mismatch(sc, span, lt, rt); ret type.TYPE_ERROR; }
     ret lt;
+}
+
+# types a type comparison (`$type_of(...) == TypeName`, #1472). each operand is
+# typed for its type identity — a `$type_of(e)` operand by inferring its inner
+# value `e`, a type-name operand by resolving the named type into its expr_type
+# slot — so the lowering-time resolver reads a populated type either way. the
+# comparison itself is a bool (u8), foldable only at lowering where the resolver
+# is installed.
+fun infer_type_comparison(sc: *sema.SemaContext, b: *expr.ExprBinary, span: token.Span) type.TypeId {
+    # a type comparison is comptime-only: it folds to a selected arm at lowering
+    # and has no runtime value. valid only as a `$if` gate condition; in any
+    # runtime value position it is a misuse, reported at its own span.
+    if (!sc.in_comptime_gate) {
+        sema.report(sc, span, "a `$type_of` type comparison is comptime-only; it is valid only as a `$if` gate condition");
+        ret type.TYPE_ERROR;
+    }
+    val lt: type.TypeId = infer_type_operand(sc, b.lhs, span);
+    val rt: type.TypeId = infer_type_operand(sc, b.rhs, span);
+    if (lt == type.TYPE_ERROR || rt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    ret prim_or_error(sc, type.TYPE_U8);
+}
+
+# types one type-comparison operand and returns the type it names. a `$type_of(e)`
+# operand names the type of its inner value `e` (inferred so its expr_type slot
+# populates); any other operand is a type-name spelling resolved through the same
+# path as a `$size_of` argument, with the named type written into its expr_type
+# slot.
+fun infer_type_operand(sc: *sema.SemaContext, operand: id.ExprId, span: token.Span) type.TypeId {
+    if (comptime.is_type_of_call(sc.a, sc.source, operand)) {
+        val arg: id.ExprId = comptime.type_of_arg(sc.a, operand);
+        if (arg == id.EXPR_NIL) {
+            sema.report(sc, span, "$type_of: expected one argument");
+            ret type.TYPE_ERROR;
+        }
+        ret infer_expr(sc, arg);
+    }
+    # an `f.type` field-descriptor type names the bound field's type (#1473).
+    if (sema_is_field_type_operand(sc, operand)) {
+        ret field_type_operand_type(sc, operand);
+    }
+    val op_ty: type.TypeId = intrinsic_operand_type(sc, operand, span);
+    set_expr_type(sc, operand, op_ty);
+    ret op_ty;
+}
+
+# whether `eid` is an `f.type` operand whose object evaluates to a comptime field
+# descriptor — the sema-time recognition of a field-descriptor type operand,
+# valid during the `$each` unroll where the loop variable is bound.
+pub fun sema_is_field_type_operand(sc: *sema.SemaContext, eid: id.ExprId) bool {
+    if (!comptime.is_field_type_member(sc.a, sc.source, eid)) { ret false; }
+    val n_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](n_opt)) { ret false; }
+    val obj: id.ExprId = unwrap[*expr.Expr](n_opt).data.member.object;
+    val r: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, obj, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](r)) { ret false; }
+    ret unwrap_ok[comptime.CTValue, str](r).kind == comptime.CT_KIND_FIELD;
+}
+
+# the type an `f.type` operand names: the bound field's type, read from the
+# descriptor the object evaluates to.
+fun field_type_operand_type(sc: *sema.SemaContext, eid: id.ExprId) type.TypeId {
+    val n_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](n_opt)) { ret type.TYPE_ERROR; }
+    val obj: id.ExprId = unwrap[*expr.Expr](n_opt).data.member.object;
+    val r: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, obj, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](r)) { ret type.TYPE_ERROR; }
+    val fv: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r);
+    if (fv.kind != comptime.CT_KIND_FIELD) { ret type.TYPE_ERROR; }
+    val fa: Option[*type.FieldEntry] = type.field_at(?sc.s.types, fv.data.fld.owner::type.TypeId, fv.data.fld.index);
+    if (is_none[*type.FieldEntry](fa)) { ret type.TYPE_ERROR; }
+    ret unwrap[*type.FieldEntry](fa).ty;
 }
 
 # ASSIGN: RHS must be assignable to LHS; result is the LHS type. a literal
@@ -660,6 +828,17 @@ fun infer_comptime_intrinsic(sc: *sema.SemaContext, c: *expr.ExprCall, span: tok
 
     val name: intern.StrId = comptime_ident_name(sc, ce.span);
     if (name == intern.STR_NIL) { ret type.TYPE_NIL; }
+
+    # `$type_of(...)` (#1472) is not a value: it yields a comptime TYPE, valid only
+    # as a type-comparison operand inside a `$if` gate (typed by
+    # infer_type_comparison, which never reaches here). any `$type_of` arriving in
+    # a value call position is a misuse, reported precisely rather than left to
+    # surface as an opaque bare-comptime-ident error at lowering.
+    if (name == interned(sc, "type_of")) {
+        sema.report(sc, span, "`$type_of` yields a comptime type, not a value; use it as a type-comparison operand inside a `$if` gate");
+        ret type.TYPE_ERROR;
+    }
+
     val is_size:   bool = name == interned(sc, "size_of");
     val is_align:  bool = name == interned(sc, "align_of");
     val is_offset: bool = name == interned(sc, "offset_of");
@@ -757,6 +936,125 @@ fun set_expr_type(sc: *sema.SemaContext, eid: id.ExprId, ty: type.TypeId) {
     if (sc.expr_type == nil) { ret; }
     if (eid >= sc.a.expr_len::u32) { ret; }
     sc.expr_type[eid] = ty;
+}
+
+# field_seq_owner: resolves a `$fields(T)` sequence (#1473) to its owning record
+# TypeId, requiring T to be a record. the type-argument's expr_type slot is
+# populated for the lowerer. TYPE_ERROR when the sequence is malformed or T is
+# not a record. shared by the `$each` unroll (sema and lowering).
+pub fun field_seq_owner(sc: *sema.SemaContext, seq_eid: id.ExprId, span: token.Span) type.TypeId {
+    val targ: id.ExprId = comptime.fields_type_arg(sc.a, seq_eid);
+    if (targ == id.EXPR_NIL) {
+        sema.report(sc, span, "$fields: expected one type argument `$fields(T)`");
+        ret type.TYPE_ERROR;
+    }
+    val owner: type.TypeId = intrinsic_operand_type(sc, targ, span);
+    set_expr_type(sc, targ, owner);
+    if (owner == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    if (!type_is_record(sc, owner)) {
+        sema.report(sc, span, "$fields requires a record type");
+        ret type.TYPE_ERROR;
+    }
+    ret owner;
+}
+
+# types a `.name` / `.type` / `.offset` projection off a `$each` field descriptor
+# (#1473), or TYPE_NIL when the object is not a field descriptor (a normal member
+# access). detection evaluates the object: only a CT_KIND_FIELD is a descriptor,
+# so a member of any other value falls through. `.name` is a string (`*u8`),
+# `.offset` an unsigned `usize` (`u64`); `.type` is a comptime-only TYPE value,
+# valid only as a type-comparison operand, rejected here in a value position.
+fun infer_field_member(sc: *sema.SemaContext, m: *expr.ExprMember, span: token.Span) type.TypeId {
+    val obj_r: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, m.object, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](obj_r)) { ret type.TYPE_NIL; }
+    if (unwrap_ok[comptime.CTValue, str](obj_r).kind != comptime.CT_KIND_FIELD) { ret type.TYPE_NIL; }
+
+    if (str_region_equals(sc.source, m.name.offset, m.name.len, "name")) {
+        ret ptr_to(sc, prim_or_error(sc, type.TYPE_U8));
+    }
+    if (str_region_equals(sc.source, m.name.offset, m.name.len, "offset")) {
+        ret prim_or_error(sc, type.TYPE_U64);
+    }
+    if (str_region_equals(sc.source, m.name.offset, m.name.len, "type")) {
+        sema.report(sc, span, "`f.type` is a comptime type, not a value; use it as a type-comparison operand inside a `$if` gate");
+        ret type.TYPE_ERROR;
+    }
+    sema.report(sc, span, "a field descriptor has only `.name`, `.type`, and `.offset`");
+    ret type.TYPE_ERROR;
+}
+
+# whether a `v.[f]` receiver type names the field's owning record directly or via
+# a single pointer indirection (auto-deref, mirroring member access).
+fun project_receiver_matches(sc: *sema.SemaContext, obj_ty: type.TypeId, owner: type.TypeId) bool {
+    if (obj_ty == owner) { ret true; }
+    val to: Option[*type.Type] = type.get(?sc.s.types, obj_ty);
+    if (is_none[*type.Type](to)) { ret false; }
+    val t: *type.Type = unwrap[*type.Type](to);
+    ret t.kind == type.TYPE_POINTER && t.data.pointer.base == owner;
+}
+
+# whether `ty` is a comptime variadic pack (#1474).
+fun type_is_pack(sc: *sema.SemaContext, ty: type.TypeId) bool {
+    val to: Option[*type.Type] = type.get(?sc.s.types, ty);
+    if (is_none[*type.Type](to)) { ret false; }
+    ret unwrap[*type.Type](to).kind == type.TYPE_PACK;
+}
+
+# infer_spread: types a `va...` pack spread (#1474). a spread may only spread a
+# comptime variadic pack; its type is that pack. it forwards the whole pack into
+# a trailing pack parameter — that placement is validated at the call site
+# (check_call). a spread of a non-pack operand is malformed.
+fun infer_spread(sc: *sema.SemaContext, sp: *expr.ExprSpread, span: token.Span) type.TypeId {
+    val it: type.TypeId = infer_expr(sc, sp.inner);
+    if (it == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    if (!type_is_pack(sc, it)) {
+        sema.report(sc, span, "`...` may only spread a variadic pack");
+        ret type.TYPE_ERROR;
+    }
+    ret it;
+}
+
+# whether `ty` is a record (or a generic record instance), the aggregate
+# `$fields` accepts. unions and non-aggregates are rejected.
+fun type_is_record(sc: *sema.SemaContext, ty: type.TypeId) bool {
+    val to: Option[*type.Type] = type.get(?sc.s.types, ty);
+    if (is_none[*type.Type](to)) { ret false; }
+    val k: type.TypeKind = unwrap[*type.Type](to).kind;
+    if (k == type.TYPE_REC) { ret true; }
+    if (k == type.TYPE_INSTANCE && is_some[*type.FieldTable](type.field_table_for(?sc.s.types, ty))) { ret true; }
+    ret false;
+}
+
+# infer_project: types a `v.[f]` field projection (#1473). the field operand `f`
+# evaluates to a comptime FIELD descriptor (bound by an enclosing `$each`) naming
+# the owning record and a field ordinal; the projection's type is that field's
+# type, and the instance `v` must be of the owning record type.
+fun infer_project(sc: *sema.SemaContext, p: *expr.ExprProject, span: token.Span) type.TypeId {
+    val obj_ty: type.TypeId = infer_expr(sc, p.object);
+    val fr: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, p.field, ?sc.s.interner);
+    if (is_err[comptime.CTValue, str](fr)) {
+        sema.report(sc, span, "`v.[f]` requires a comptime field descriptor bound by an enclosing `$each`");
+        ret type.TYPE_ERROR;
+    }
+    val fv: comptime.CTValue = unwrap_ok[comptime.CTValue, str](fr);
+    if (fv.kind != comptime.CT_KIND_FIELD) {
+        sema.report(sc, span, "`v.[f]` requires a comptime field descriptor bound by an enclosing `$each`");
+        ret type.TYPE_ERROR;
+    }
+    if (obj_ty == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    val owner: type.TypeId = fv.data.fld.owner::type.TypeId;
+    # the instance is the owning record, or a pointer to it (auto-deref, like a
+    # member access `p.field` on `p: *T`).
+    if (!project_receiver_matches(sc, obj_ty, owner)) {
+        sema.report(sc, span, "`v.[f]`: the instance type does not match the field descriptor's owning record");
+        ret type.TYPE_ERROR;
+    }
+    val fa: Option[*type.FieldEntry] = type.field_at(?sc.s.types, owner, fv.data.fld.index);
+    if (is_none[*type.FieldEntry](fa)) {
+        sema.report(sc, span, "`v.[f]`: field ordinal out of range");
+        ret type.TYPE_ERROR;
+    }
+    ret unwrap[*type.FieldEntry](fa).ty;
 }
 
 # interns the identifier text of a `$ident` comptime ident, with the leading
@@ -890,8 +1188,22 @@ fun infer_member(sc: *sema.SemaContext, eid: id.ExprId, m: *expr.ExprMember, spa
     val cts: type.TypeId = infer_comptime_str_path(sc, eid);
     if (cts != type.TYPE_NIL) { ret cts; }
 
+    # `f.name` / `f.type` / `f.offset` on a `$each` field descriptor (#1473).
+    val fdm: type.TypeId = infer_field_member(sc, m, span);
+    if (fdm != type.TYPE_NIL) { ret fdm; }
+
     val ot: type.TypeId = infer_expr(sc, m.object);
     if (ot == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    # `va.len` on a comptime variadic pack (#1474) is the comptime element count.
+    if (type_is_pack(sc, ot)) {
+        if (str_region_equals(sc.source, m.name.offset, m.name.len, "len")) {
+            ret prim_or_error(sc, type.TYPE_U64);
+        }
+        sema.report(sc, span, "a variadic pack has only `.len`; iterate its elements with `$each`");
+        ret type.TYPE_ERROR;
+    }
+
     if (ot == type.TYPE_NIL) {
         # a value-less object (a call to a function with no return type) yields
         # no value; without a report the broken access would reach lowering with
@@ -1060,6 +1372,12 @@ pub fun resolve_type_ref(sc: *sema.SemaContext, tid: id.TypeId) type.TypeId {
     if (t.kind == atype.TYPE_KIND_FUN)   { ret resolve_type_fun(sc, ?t.data.fun_); }
     if (t.kind == atype.TYPE_KIND_REC)   { ret resolve_type_anon(sc, tid, t.data.rec_.fields_start, t.data.rec_.fields_len, type.TYPE_REC); }
     if (t.kind == atype.TYPE_KIND_UNI)   { ret resolve_type_anon(sc, tid, t.data.uni_.fields_start, t.data.uni_.fields_len, type.TYPE_UNI); }
+    # a `...` comptime variadic pack (#1474): the singleton pack type.
+    if (t.kind == atype.TYPE_KIND_PACK) {
+        val r: Result[type.TypeId, str] = type.intern_pack(?sc.s.types);
+        if (is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+        ret unwrap_ok[type.TypeId, str](r);
+    }
     ret type.TYPE_ERROR;
 }
 

@@ -45,6 +45,7 @@ use astmt:    mach.lang.fe.ast.stmt;
 use adecl:    mach.lang.fe.ast.decl;
 use resolve:  mach.lang.fe.resolve;
 use comptime: mach.lang.fe.comptime;
+use ty:       mach.lang.type;
 
 use ir:       mach.lang.me.ir;
 use ir_type:  mach.lang.me.ir.type;
@@ -52,6 +53,8 @@ use value:    mach.lang.me.ir.value;
 use builder:  mach.lang.me.ir.builder;
 
 use map: std.collections.map;
+
+use sema:  mach.lang.fe.sema;
 
 use lower: mach.lang.me.lower.context;
 use expr:  mach.lang.me.lower.expr;
@@ -80,6 +83,7 @@ pub fun lower_stmt(ctx: *lower.LowerContext, sid: aid.StmtId) Result[bool, str] 
     if (k == astmt.STMT_KIND_DECL)        { ret lower_decl_stmt(ctx, s); }
     if (k == astmt.STMT_KIND_ASM)         { ret lower_asm(ctx, s); }
     if (k == astmt.STMT_KIND_COMPTIME_IF) { ret lower_comptime_if(ctx, s); }
+    if (k == astmt.STMT_KIND_COMPTIME_EACH) { ret lower_comptime_each(ctx, s); }
     if (k == astmt.STMT_KIND_ERROR) {
         # an error stmt must never reach lowering: the driver aborts on
         # accumulated diagnostics before the middle end runs.
@@ -586,6 +590,117 @@ fun lower_comptime_if(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str
         bi = bi + 1;
     }
     ret ok[bool, str](true);
+}
+
+# lowers a `$each <ident> in $fields(T) { body }` (#1473) by unrolling it: the
+# body is lowered once per field of T, with the loop variable bound in the
+# comptime frame to that field's descriptor, so a `v.[f]` in the body projects
+# the concrete field of each iteration. the lowering half of the splice sema
+# mirrors. the owning type was resolved and recorded on the `$fields(T)` argument
+# by sema.
+fun lower_comptime_each(ctx: *lower.LowerContext, s: *astmt.Stmt) Result[bool, str] {
+    val ce: *astmt.StmtComptimeEach = ?s.data.comptime_each;
+    val src: str = lower.module_source(ctx);
+
+    # a pack `$each a in va` (#1475): the sequence is a variadic-pack value (not a
+    # `$fields(T)` call), so unroll over the pack instance's expanded elements —
+    # re-typing then lowering the body per element, the loop variable bound to each.
+    if (is_pack_type(ctx, lower.expr_type_of(ctx, ce.seq))) {
+        ret lower_pack_each(ctx, ce);
+    }
+
+    if (!comptime.is_fields_call(ctx.a, src, ce.seq)) {
+        ret err[bool, str]("lower: a `$each` sequence must be `$fields(T)` or a variadic pack");
+    }
+    val targ: aid.ExprId = comptime.fields_type_arg(ctx.a, ce.seq);
+    if (targ == aid.EXPR_NIL) { ret err[bool, str]("lower: `$fields` is missing its type argument"); }
+    val owner: ty.TypeId = lower.expr_type_of(ctx, targ);
+
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, src, ce.var_name);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+    val fname: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    val n: u32 = ty.field_count(?ctx.s.types, owner);
+    var i: u32 = 0;
+    for (i < n) {
+        val mark: comptime.FrameMark = comptime.frame_open(ctx.ctx);
+        val br: Result[bool, str] = comptime.bind(ctx.ctx, fname, comptime.field_value(owner::u32, i));
+        if (is_err[bool, str](br)) {
+            val cc: Result[bool, str] = comptime.frame_close(ctx.ctx, mark);
+            if (is_err[bool, str](cc)) { ret cc; }
+            ret br;
+        }
+        val rb: Result[bool, str] = lower_stmt_list(ctx, ce.body_start, ce.body_len);
+        val cc: Result[bool, str] = comptime.frame_close(ctx.ctx, mark);
+        if (is_err[bool, str](rb)) { ret rb; }
+        if (is_err[bool, str](cc)) { ret cc; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# lowers a pack `$each a in va { body }` (#1475) by unrolling it over the pack
+# instance's expanded elements (lower_pack_instance recorded the element slots and
+# types on the context). per element: the loop variable is bound in the comptime
+# frame to the element's descriptor — carrying the element's type (so the body
+# re-infers the loop variable to it) and its ordinal (so a body reference loads the
+# matching expanded parameter slot) — then the body is re-typed for that element
+# and lowered. typing and lowering interleave per element because a pack element's
+# type is fixed only at the call site; the body was deferred at the original sema
+# pass. the re-traverse-no-clone model mirrors the `$fields` unroll.
+fun lower_pack_each(ctx: *lower.LowerContext, ce: *astmt.StmtComptimeEach) Result[bool, str] {
+    val src: str = lower.module_source(ctx);
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, src, ce.var_name);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+    val fname: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    # one typing-snapshot set spanning every module, so the per-element body
+    # re-inference can resolve cross-module references the pack body makes (a call
+    # to a function in another module needs that module's signature types). built
+    # once here and shared across the element iterations.
+    val deps_r: Result[sema.SemaDeps, str] = sema.collect_module_deps(ctx.s);
+    if (is_err[sema.SemaDeps, str](deps_r)) { ret err[bool, str](unwrap_err[sema.SemaDeps, str](deps_r)); }
+    var deps: sema.SemaDeps = unwrap_ok[sema.SemaDeps, str](deps_r);
+
+    var i: u32 = 0;
+    for (i < ctx.pack_len) {
+        val mark: comptime.FrameMark = comptime.frame_open(ctx.ctx);
+        val desc: comptime.CTValue = comptime.pack_elem_value(i, ctx.pack_types[i]::u32);
+        val br: Result[bool, str] = comptime.bind(ctx.ctx, fname, desc);
+        if (is_err[bool, str](br)) {
+            val cc: Result[bool, str] = comptime.frame_close(ctx.ctx, mark);
+            sema.free_module_deps(ctx.s, ?deps);
+            if (is_err[bool, str](cc)) { ret cc; }
+            ret br;
+        }
+
+        # re-type the body for this element (its type is fixed only here), writing
+        # the body expressions' types into the shared array lowering reads next.
+        val ir: Result[bool, str] = sema.reinfer_pack_each_body(ctx.s, ctx.a, ctx.rr, ?deps, ctx.ctx,
+            ctx.own_module, ctx.sema_result, ctx.pack_ret_ty, ce.body_start, ce.body_len);
+        if (is_err[bool, str](ir)) {
+            val cc: Result[bool, str] = comptime.frame_close(ctx.ctx, mark);
+            sema.free_module_deps(ctx.s, ?deps);
+            if (is_err[bool, str](cc)) { ret cc; }
+            ret ir;
+        }
+
+        val rb: Result[bool, str] = lower_stmt_list(ctx, ce.body_start, ce.body_len);
+        val cc: Result[bool, str] = comptime.frame_close(ctx.ctx, mark);
+        if (is_err[bool, str](rb)) { sema.free_module_deps(ctx.s, ?deps); ret rb; }
+        if (is_err[bool, str](cc)) { sema.free_module_deps(ctx.s, ?deps); ret cc; }
+        i = i + 1;
+    }
+    sema.free_module_deps(ctx.s, ?deps);
+    ret ok[bool, str](true);
+}
+
+# true when a semantic type is a comptime variadic pack (TYPE_PACK), the marker
+# that selects the pack unroll over the `$fields` unroll in lower_comptime_each.
+fun is_pack_type(ctx: *lower.LowerContext, t: ty.TypeId) bool {
+    val to: Option[*ty.Type] = ty.get(?ctx.s.types, t);
+    if (is_none[*ty.Type](to)) { ret false; }
+    ret unwrap[*ty.Type](to).kind == ty.TYPE_PACK;
 }
 
 # true when the builder's current block already has a terminator. used to

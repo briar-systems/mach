@@ -89,6 +89,17 @@ pub fun parse_type(p: *parser.Parser) id.TypeId {
     if (parser.at_kw(p, "fun"))            { ret parse_fun(p, start.span); }
     if (parser.at_kw(p, "rec"))            { ret parse_rec_or_uni(p, start.span, m_type.TYPE_KIND_REC); }
     if (parser.at_kw(p, "uni"))            { ret parse_rec_or_uni(p, start.span, m_type.TYPE_KIND_UNI); }
+    # a `...` in type position is a comptime variadic pack (#1474), e.g. the type
+    # of a `va: ...` parameter. distinct from a standalone trailing `...` in a
+    # parameter list, which the legacy va_list variadic marker consumes before a
+    # type is ever parsed.
+    if (parser.at(p, token.KIND_DOT_DOT_DOT)) {
+        parser.advance(p);
+        var pk: m_type.Type;
+        pk.span = start.span;
+        pk.kind = m_type.TYPE_KIND_PACK;
+        ret parser.push_type(p, pk);
+    }
     if (parser.at(p, token.KIND_IDENT))    { ret parse_named(p, start.span); }
 
     parser.error_at_current(p, "expected a type; named, '*T', '[N]T', 'fun(...)', or inline 'rec'/'uni' forms are valid here");
@@ -122,7 +133,7 @@ fun parse_prefix(p: *parser.Parser) id.ExprId {
 
     if (t.kind == token.KIND_IDENT) {
         if (parser.at_kw(p, "nil"))      { ret parse_lit_nil(p); }
-        if (looks_like_typed_literal(p)) { ret parse_typed_literal(p); }
+        if (!p.no_struct_lit && looks_like_typed_literal(p)) { ret parse_typed_literal(p); }
         ret parse_ident(p);
     }
 
@@ -152,7 +163,15 @@ fun parse_postfix(p: *parser.Parser, base: id.ExprId) id.ExprId {
                 lhs = parse_index(p, lhs);
             }
         }
-        or      (k == token.KIND_DOT)         { lhs = parse_member(p, lhs); }
+        or      (k == token.KIND_DOT) {
+            # `v.[f]` is a field projection (#1473); a plain `v.field` is a member.
+            if (parser.peek(p, 1).kind == token.KIND_LBRACKET) {
+                lhs = parse_project(p, lhs);
+            }
+            or {
+                lhs = parse_member(p, lhs);
+            }
+        }
         or      (k == token.KIND_COLON_COLON) { lhs = parse_cast(p, lhs, false); }
         or      (k == token.KIND_COLON_TILDE) { lhs = parse_cast(p, lhs, true); }
         or                                    { brk; }
@@ -463,6 +482,33 @@ fun parse_paren(p: *parser.Parser) id.ExprId {
     ret inner;
 }
 
+# parses one call argument: an expression optionally suffixed with a postfix
+# `...` pack spread (#1474), e.g. `va...`, forwarding a whole comptime variadic
+# pack. the spread is recognized ONLY here, in call-argument position — never
+# globally in parse_postfix — so it cannot collide with the legacy standalone
+# `...` parameter marker (which is consumed in a parameter list, never after a
+# call argument). validity (a pack operand, the sole trailing argument of a
+# pack-tailed callee) is checked in sema.
+fun parse_call_arg(p: *parser.Parser) id.ExprId {
+    val e: id.ExprId = parse_expr(p);
+    if (!parser.at(p, token.KIND_DOT_DOT_DOT)) { ret e; }
+    val dots: token.Token = parser.advance(p);
+
+    var sp: expr.ExprSpread;
+    sp.inner = e;
+
+    var start_span: token.Span = dots.span;
+    if (e != id.EXPR_NIL) {
+        start_span = unwrap[*expr.Expr](ast.get_expr(p.ast, e)).span;
+    }
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start_span, dots.span);
+    node.kind = expr.EXPR_KIND_SPREAD;
+    node.data.spread = sp;
+    ret parser.push_expr(p, node);
+}
+
 # parses a call expression `callee(args)`. type_args_start/type_args_len carry
 # any call-site generic arguments parsed by parse_generic_call; both are 0 for
 # a plain call. index_callee is EXPR_NIL except for a provisional bracket call,
@@ -479,10 +525,10 @@ fun parse_call(p: *parser.Parser, callee: id.ExprId, type_args_start: u32, type_
     var buf: parser.ListBuf[id.ExprId] = parser.list_buf_init[id.ExprId]();
 
     if (!parser.at(p, token.KIND_RPAREN)) {
-        parser.list_buf_push[id.ExprId](p, ?buf, parse_expr(p));
+        parser.list_buf_push[id.ExprId](p, ?buf, parse_call_arg(p));
         for (parser.eat(p, token.KIND_COMMA)) {
             if (parser.at(p, token.KIND_RPAREN)) { brk; }
-            parser.list_buf_push[id.ExprId](p, ?buf, parse_expr(p));
+            parser.list_buf_push[id.ExprId](p, ?buf, parse_call_arg(p));
         }
     }
 
@@ -560,6 +606,32 @@ fun parse_member(p: *parser.Parser, object: id.ExprId) id.ExprId {
     node.span = parser.span_of(start_span, name_tok.span);
     node.kind = expr.EXPR_KIND_MEMBER;
     node.data.member = member;
+    ret parser.push_expr(p, node);
+}
+
+# parses a field projection `v.[f]` (#1473): the field operand `f` is a comptime
+# field descriptor (the `$each` loop variable). the leading `.` is the current
+# token; `[` immediately follows.
+fun parse_project(p: *parser.Parser, object: id.ExprId) id.ExprId {
+    parser.expect(p, token.KIND_DOT, "expected '.' before '[' in a field projection");
+    parser.expect(p, token.KIND_LBRACKET, "expected '[' in a field projection");
+    val field: id.ExprId = parse_expr(p);
+    val close: token.Token = parser.current(p);
+    parser.expect(p, token.KIND_RBRACKET, "expected ']' to close a field projection");
+
+    var proj: expr.ExprProject;
+    proj.object = object;
+    proj.field  = field;
+
+    var start_span: token.Span = close.span;
+    if (object != id.EXPR_NIL) {
+        start_span = unwrap[*expr.Expr](ast.get_expr(p.ast, object)).span;
+    }
+
+    var node: expr.Expr;
+    node.span = parser.span_of(start_span, close.span);
+    node.kind = expr.EXPR_KIND_PROJECT;
+    node.data.project = proj;
     ret parser.push_expr(p, node);
 }
 

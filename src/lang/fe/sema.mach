@@ -35,6 +35,7 @@ use std.types.option.unwrap;
 use std.types.size.usize;
 
 use std.types.string.str;
+use std.types.string.str_region_equals;
 
 use std.types.result.Result;
 use std.types.result.ok;
@@ -133,6 +134,112 @@ pub fun sema(
     ret build_result(?sc);
 }
 
+# reinfer_pack_each_body: re-type a `$each a in va` pack-unroll body for ONE
+# concrete element at monomorphization (#1475). a pack element's type is fixed
+# only at the call site, so the body cannot be typed at the original sema pass;
+# the monomorphizer binds the loop variable in the comptime context to the
+# element's CT_KIND_PACK_ELEM descriptor (so `infer_ident` types `a` to the
+# element type) and calls this to write the body expressions' types into the
+# origin module's shared `expr_type` array — exactly the array lowering then
+# reads. distinct elements / instances are typed in turn (the array is overwritten
+# per element; lowering interleaves typing and emission), so one shared array
+# suffices. the transient context reuses the origin SemaResult's arrays in place
+# rather than allocating, so it must not be torn down.
+# ---
+# s, a, rr, deps, ctx, own_module: the origin module's phase inputs (the module
+#   declaring the pack-tailed template)
+# sema_result: the origin module's SemaResult, whose arrays this reuses in place
+# fn_ret:      the instance's semantic return type (checks any body `ret`)
+# body_start / body_len: the `$each` body statement slice
+# ret:         true once the body is typed, or the first inference error
+pub fun reinfer_pack_each_body(
+    s:           *sess.Session,
+    a:           *ast.Ast,
+    rr:          *resolve.ResolveResult,
+    deps:        *ctxm.SemaDeps,
+    ctx:         *comptime.ComptimeCtx,
+    own_module:  sess.ModuleId,
+    sema_result: *ctxm.SemaResult,
+    fn_ret:      type.TypeId,
+    body_start:  u32,
+    body_len:    u32
+) Result[bool, str] {
+    var sc: ctxm.SemaContext;
+    sc.s          = s;
+    sc.a          = a;
+    sc.rr         = rr;
+    sc.deps       = deps;
+    sc.ctx        = ctx;
+    sc.own_module = own_module;
+    sc.source     = source_text_of(s, a);
+    sc.expr_type        = sema_result.expr_type;
+    sc.type_resolved_ty = sema_result.type_resolved_ty;
+    sc.decl_type        = sema_result.decl_type;
+    sc.callee_eid       = id.EXPR_NIL;
+    sc.in_comptime_gate = false;
+    ret infer_stmt_list(?sc, body_start, body_len, fn_ret);
+}
+
+# collect_module_deps: assemble a typing-snapshot set spanning EVERY registered
+# module, for a re-inference that runs after the whole program is sema'd (#1475).
+# the original per-module sema pass receives only its actual dependencies, but the
+# pack-body re-inference at monomorphization may reach any module the body
+# references, so it consults the full set. each entry borrows a module's
+# SemaResult.decl_type array (owned by the session), so the returned SemaDeps must
+# be released with `free_module_deps` (which frees only the entries array) before
+# the SemaResults are torn down. a module with no registered SemaResult yields a
+# decl-type-less entry (a lookup against it returns TYPE_ERROR, like a miss).
+# ---
+# s:   the session (its module registries)
+# ret: a SemaDeps spanning every module, or an allocation error
+pub fun collect_module_deps(s: *sess.Session) Result[ctxm.SemaDeps, str] {
+    var deps: ctxm.SemaDeps;
+    deps.entries = nil;
+    deps.count   = 0;
+
+    val n: u32 = sess.module_count(s);
+    if (n == 0) { ret ok[ctxm.SemaDeps, str](deps); }
+
+    val r: Result[*ctxm.ModuleSema, str] = allocate[ctxm.ModuleSema](s.alloc, n::usize);
+    if (is_err[*ctxm.ModuleSema, str](r)) { ret err[ctxm.SemaDeps, str](unwrap_err[*ctxm.ModuleSema, str](r)); }
+    val arr: *ctxm.ModuleSema = unwrap_ok[*ctxm.ModuleSema, str](r);
+
+    var mid: u32 = 0;
+    for (mid < n) {
+        var ms: ctxm.ModuleSema;
+        ms.path       = sess.module_fqn(s, mid::sess.ModuleId);
+        ms.module     = mid::sess.ModuleId;
+        ms.decl_type  = nil;
+        ms.decl_count = 0;
+        val sp: ptr = sess.module_sema_ptr(s, mid::sess.ModuleId);
+        if (sp != nil) {
+            val sr: *ctxm.SemaResult = sp::*ctxm.SemaResult;
+            ms.decl_type  = sr.decl_type;
+            ms.decl_count = sr.decl_count;
+        }
+        arr[mid] = ms;
+        mid = mid + 1;
+    }
+
+    deps.entries = arr;
+    deps.count   = n;
+    ret ok[ctxm.SemaDeps, str](deps);
+}
+
+# free_module_deps: release the entries array a `collect_module_deps` allocated.
+# the borrowed decl_type arrays it points into are owned by the session and are
+# NOT freed here.
+# ---
+# s:    the session (allocator)
+# deps: the SemaDeps to release (entries freed, fields zeroed)
+pub fun free_module_deps(s: *sess.Session, deps: *ctxm.SemaDeps) {
+    if (deps.entries != nil && deps.count > 0) {
+        deallocate[ctxm.ModuleSema](s.alloc, deps.entries, deps.count::usize);
+    }
+    deps.entries = nil;
+    deps.count   = 0;
+}
+
 # dnit_result: releases the parallel arrays held by the result and zeroes its fields; nil is a no-op.
 # ---
 # r: result to tear down; nil is a no-op
@@ -176,7 +283,8 @@ fun init_context(
     sc.type_resolved_ty = nil;
     sc.decl_type        = nil;
 
-    sc.callee_eid   = id.EXPR_NIL;
+    sc.callee_eid       = id.EXPR_NIL;
+    sc.in_comptime_gate = false;
 
     if (a.expr_len > 0) {
         val r: Result[*type.TypeId, str] = allocate[type.TypeId](s.alloc, a.expr_len);
@@ -328,6 +436,12 @@ fun infer_one_body(sc: *ctxm.SemaContext, did: id.DeclId) Result[bool, str] {
     if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
 
+    # a decl's backtick decorator arguments are comptime expressions; infer them
+    # so their types resolve (e.g. `align($size_of(T))`) before the middle end
+    # folds them.
+    infer_decorator_args(sc, d);
+    validate_decorators(sc, d);
+
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
         ret infer_bodies_comptime_if(sc, ?d.data.comptime_if);
     }
@@ -356,6 +470,131 @@ fun infer_one_body(sc: *ctxm.SemaContext, did: id.DeclId) Result[bool, str] {
         ret ok[bool, str](true);
     }
     ret ok[bool, str](true);
+}
+
+# infers each of decl `d`'s backtick decorator arguments so their types resolve.
+fun infer_decorator_args(sc: *ctxm.SemaContext, d: *decl.Decl) {
+    var k: u32 = 0;
+    for (k < d.decorators_len) {
+        val dec: *decl.Decorator = ?sc.a.decorators[d.decorators_start + k];
+        var j: u32 = 0;
+        for (j < dec.args_len) {
+            infer.infer_expr(sc, sc.a.expr_ids[dec.args_start + j]);
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+}
+
+# validates a decl's backtick decorators: each must name a directive from the
+# closed set (symbol/section/inline/align/library), carry the right argument
+# shape, and apply to a compatible declaration. diagnostics are reported against
+# the offending span; sema does not halt.
+fun validate_decorators(sc: *ctxm.SemaContext, d: *decl.Decl) {
+    var k: u32 = 0;
+    for (k < d.decorators_len) {
+        validate_one_decorator(sc, d, ?sc.a.decorators[d.decorators_start + k]);
+        k = k + 1;
+    }
+}
+
+# true when decorator `dec`'s directive name equals `name`.
+fun decorator_named(sc: *ctxm.SemaContext, dec: *decl.Decorator, name: str) bool {
+    ret str_region_equals(sc.source, dec.name.offset, dec.name.len, name);
+}
+
+# reports unless decorator `dec` carries exactly one string-literal argument.
+fun require_string_arg(sc: *ctxm.SemaContext, dec: *decl.Decorator, count_msg: str, kind_msg: str) {
+    if (dec.args_len != 1) { ctxm.report(sc, dec.name, count_msg); ret; }
+    val ae_opt: Option[*expr.Expr] = ast.get_expr(sc.a, sc.a.expr_ids[dec.args_start]);
+    if (is_some[*expr.Expr](ae_opt)) {
+        val ae: *expr.Expr = unwrap[*expr.Expr](ae_opt);
+        if (ae.kind != expr.EXPR_KIND_LIT_STR) { ctxm.report(sc, ae.span, kind_msg); }
+    }
+}
+
+# true for an `align` decorator target: a global binding (val/var) or a record /
+# union nominal. a `def` alias is excluded — it is transparent (no layout of its
+# own and emits no symbol), so an alignment on it would silently no-op.
+fun is_align_target(kind: decl.DeclKind) bool {
+    ret kind == decl.DECL_KIND_VAL || kind == decl.DECL_KIND_VAR ||
+        kind == decl.DECL_KIND_REC || kind == decl.DECL_KIND_UNI;
+}
+
+# true for a global binding (val/var) — the targets whose `align` argument the
+# body-pass validator type-checks (a rec/uni's argument is validated by the
+# decl-pass fold in record_type_align instead, to avoid a double report).
+fun is_global_binding(kind: decl.DeclKind) bool {
+    ret kind == decl.DECL_KIND_VAL || kind == decl.DECL_KIND_VAR;
+}
+
+# true for a function or a global binding (the `symbol`/`section` targets).
+fun is_fun_or_global(kind: decl.DeclKind) bool {
+    ret kind == decl.DECL_KIND_FUN || kind == decl.DECL_KIND_VAL || kind == decl.DECL_KIND_VAR;
+}
+
+# the inferred type of decorator-argument expression `eid`, or TYPE_ERROR when
+# the id is out of range (infer_decorator_args has already typed it).
+fun decorator_arg_type(sc: *ctxm.SemaContext, eid: id.ExprId) type.TypeId {
+    if (eid == id.EXPR_NIL) { ret type.TYPE_ERROR; }
+    if (eid::usize >= sc.a.expr_len) { ret type.TYPE_ERROR; }
+    ret sc.expr_type[eid];
+}
+
+fun validate_one_decorator(sc: *ctxm.SemaContext, d: *decl.Decl, dec: *decl.Decorator) {
+    if (decorator_named(sc, dec, "symbol")) {
+        require_string_arg(sc, dec,
+            "`symbol` decorator takes one string argument",
+            "`symbol` decorator argument must be a string literal");
+        if (!is_fun_or_global(d.kind)) {
+            ctxm.report(sc, dec.name, "`symbol` decorator applies only to functions and globals");
+        }
+        ret;
+    }
+    if (decorator_named(sc, dec, "library")) {
+        require_string_arg(sc, dec,
+            "`library` decorator takes one string argument",
+            "`library` decorator argument must be a string literal");
+        if ((d.flags & decl.DECL_FLAG_EXT) == 0) {
+            ctxm.report(sc, dec.name, "`library` decorator applies only to ext imports");
+        }
+        ret;
+    }
+    if (decorator_named(sc, dec, "inline")) {
+        if (dec.args_len != 0) { ctxm.report(sc, dec.name, "`inline` decorator takes no arguments"); }
+        if (d.kind != decl.DECL_KIND_FUN) {
+            ctxm.report(sc, dec.name, "`inline` decorator applies only to functions");
+        }
+        ret;
+    }
+    if (decorator_named(sc, dec, "align")) {
+        if (dec.args_len != 1) {
+            ctxm.report(sc, dec.name, "`align` decorator takes one argument");
+        } or (is_global_binding(d.kind)) {
+            # for a global the value is folded at lowering (type layout available);
+            # here only its type is checked. a rec/uni argument is validated wholly
+            # by the decl-pass fold (record_type_align) — checking it here too would
+            # double-report — so the type check is global-only.
+            val ae: id.ExprId = sc.a.expr_ids[dec.args_start];
+            if (!type.is_integer(?sc.s.types, decorator_arg_type(sc, ae))) {
+                ctxm.report(sc, dec.name, "`align` decorator argument must be an integer comptime expression");
+            }
+        }
+        if (!is_align_target(d.kind)) {
+            ctxm.report(sc, dec.name, "`align` decorator applies only to records, unions, and globals");
+        }
+        ret;
+    }
+    if (decorator_named(sc, dec, "section")) {
+        require_string_arg(sc, dec,
+            "`section` decorator takes one string argument",
+            "`section` decorator argument must be a string literal");
+        if (!is_fun_or_global(d.kind)) {
+            ctxm.report(sc, dec.name, "`section` decorator applies only to functions and globals");
+        }
+        ret;
+    }
+    ctxm.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, align, library");
 }
 
 # the return type a `test` body is checked against: the canonical i32
@@ -442,7 +681,58 @@ fun infer_stmt(sc: *ctxm.SemaContext, sid: id.StmtId, fn_ret: type.TypeId) Resul
     if (st.kind == stmt.STMT_KIND_COMPTIME_IF) {
         ret infer_stmt_comptime_if(sc, st.data.comptime_if.branches_start, st.data.comptime_if.branches_len, fn_ret);
     }
+    if (st.kind == stmt.STMT_KIND_COMPTIME_EACH) {
+        ret infer_stmt_comptime_each(sc, ?st.data.comptime_each, st.span, fn_ret);
+    }
     # BRK, CNT, ASM, ERROR carry no expressions to infer
+    ret ok[bool, str](true);
+}
+
+# type-checks a `$each <ident> in $fields(T) { body }` (#1473) by unrolling it:
+# the body is inferred once per field of T, with the loop variable bound in the
+# comptime frame to that field's descriptor, so a `v.[f]` / `f.type` in the body
+# is typed against the concrete field of each iteration. this is the sema half of
+# the splice the lowerer mirrors; heterogeneous field types are handled because
+# each iteration re-types the body.
+fun infer_stmt_comptime_each(sc: *ctxm.SemaContext, ce: *stmt.StmtComptimeEach, span: token.Span, fn_ret: type.TypeId) Result[bool, str] {
+    if (!comptime.is_fields_call(sc.a, sc.source, ce.seq)) {
+        # a variadic-pack sequence (`$each a in va`, #1474): the element types are
+        # fixed per call site, so the body is type-checked per instantiation at
+        # monomorphization (#1475), not here. accept the well-formed construct and
+        # defer; a non-pack, non-`$fields` sequence is malformed.
+        val seq_ty: type.TypeId = infer.infer_expr(sc, ce.seq);
+        val st_opt: Option[*type.Type] = type.get(?sc.s.types, seq_ty);
+        if (is_some[*type.Type](st_opt) && unwrap[*type.Type](st_opt).kind == type.TYPE_PACK) {
+            ret ok[bool, str](true);
+        }
+        if (seq_ty != type.TYPE_ERROR) {
+            ctxm.report(sc, span, "a `$each` sequence must be `$fields(T)` or a variadic pack");
+        }
+        ret ok[bool, str](true);
+    }
+    val owner: type.TypeId = infer.field_seq_owner(sc, ce.seq, span);
+    if (owner == type.TYPE_ERROR) { ret ok[bool, str](true); }
+
+    val name_r: Result[intern.StrId, str] = intern.intern_span(?sc.s.interner, sc.source, ce.var_name);
+    if (is_err[intern.StrId, str](name_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](name_r)); }
+    val fname: intern.StrId = unwrap_ok[intern.StrId, str](name_r);
+
+    val n: u32 = type.field_count(?sc.s.types, owner);
+    var i: u32 = 0;
+    for (i < n) {
+        val mark: comptime.FrameMark = comptime.frame_open(sc.ctx);
+        val br: Result[bool, str] = comptime.bind(sc.ctx, fname, comptime.field_value(owner::u32, i));
+        if (is_err[bool, str](br)) {
+            val cc: Result[bool, str] = comptime.frame_close(sc.ctx, mark);
+            if (is_err[bool, str](cc)) { ret cc; }
+            ret br;
+        }
+        val rb: Result[bool, str] = infer_stmt_list(sc, ce.body_start, ce.body_len, fn_ret);
+        val cc: Result[bool, str] = comptime.frame_close(sc.ctx, mark);
+        if (is_err[bool, str](rb)) { ret rb; }
+        if (is_err[bool, str](cc)) { ret cc; }
+        i = i + 1;
+    }
     ret ok[bool, str](true);
 }
 
@@ -458,15 +748,23 @@ fun infer_stmt_list(sc: *ctxm.SemaContext, start: u32, len: u32, fn_ret: type.Ty
 }
 
 fun infer_stmt_comptime_if(sc: *ctxm.SemaContext, start: u32, len: u32, fn_ret: type.TypeId) Result[bool, str] {
-    # a chain gated on a comptime value parameter cannot select an arm at sema
-    # time (the parameter's value is fixed per call site). type-check EVERY arm
+    # a chain gated on a comptime value parameter, or on a type comparison
+    # (`$type_of(...)`, #1472), cannot select an arm at sema time — the
+    # parameter's value is fixed per call site, and a type comparison folds only
+    # once the type resolver is installed at lowering. type-check EVERY arm
     # structurally; arm selection is deferred to per-value monomorphization.
-    if (stmt_comptime_if_gated_on_param(sc, start, len)) {
+    if (stmt_comptime_if_gated_on_param(sc, start, len)
+        || stmt_comptime_if_has_type_comparison(sc, start, len)) {
         var ai: u32 = 0;
         for (ai < len) {
             val arm: *decl.ComptimeBranch = ?sc.a.comptime_branches[start + ai];
             if (arm.cond != id.EXPR_NIL) {
+                # mark gate context so a `$type_of(...)` type comparison is accepted
+                # here (and rejected as a value elsewhere).
+                val saved_gate: bool = sc.in_comptime_gate;
+                sc.in_comptime_gate = true;
                 infer.infer_expr(sc, arm.cond);
+                sc.in_comptime_gate = saved_gate;
                 # every arm gate of a param-gated chain must itself be comptime-
                 # foldable: its free identifiers must all be comptime (comptime
                 # params or comptime constants), never a runtime local/param/var.
@@ -506,6 +804,43 @@ fun stmt_comptime_if_gated_on_param(sc: *ctxm.SemaContext, start: u32, len: u32)
             ret true;
         }
         bi = bi + 1;
+    }
+    ret false;
+}
+
+# reports whether any arm gate of a statement-level `$if` chain is a type
+# comparison (`$type_of(...) == TypeName`, #1472). such a gate folds only at
+# lowering, so — like a comptime-param gate — its chain defers arm selection.
+fun stmt_comptime_if_has_type_comparison(sc: *ctxm.SemaContext, start: u32, len: u32) bool {
+    var bi: u32 = 0;
+    for (bi < len) {
+        val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[start + bi];
+        if (br.cond != id.EXPR_NIL && gate_has_type_comparison(sc, br.cond)) {
+            ret true;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# walks a `$if` gate reporting whether it contains a type comparison at any depth.
+fun gate_has_type_comparison(sc: *ctxm.SemaContext, eid: id.ExprId) bool {
+    if (eid == id.EXPR_NIL) { ret false; }
+    val e_opt: Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+    if (e.kind == expr.EXPR_KIND_BINARY) {
+        if ((e.data.binary.op == expr.BIN_EQ || e.data.binary.op == expr.BIN_NEQ)
+            && (comptime.is_type_comparison(sc.a, sc.source, ?e.data.binary)
+             || infer.sema_is_field_type_operand(sc, e.data.binary.lhs)
+             || infer.sema_is_field_type_operand(sc, e.data.binary.rhs))) {
+            ret true;
+        }
+        ret gate_has_type_comparison(sc, e.data.binary.lhs)
+         || gate_has_type_comparison(sc, e.data.binary.rhs);
+    }
+    if (e.kind == expr.EXPR_KIND_UNARY) {
+        ret gate_has_type_comparison(sc, e.data.unary.operand);
     }
     ret false;
 }
@@ -552,6 +887,15 @@ fun check_comptime_gate(sc: *ctxm.SemaContext, eid: id.ExprId) {
     # composite operators: recurse into operands so a runtime leaf is reported at
     # its own span rather than masked by the parent.
     if (k == expr.EXPR_KIND_BINARY) {
+        # a type comparison (`$type_of(...) == TypeName`, #1472) is a well-formed
+        # comptime gate; its operands name types (validated by infer) and it folds
+        # at lowering, so it is not recursed into as value subexpressions.
+        if ((e.data.binary.op == expr.BIN_EQ || e.data.binary.op == expr.BIN_NEQ)
+            && (comptime.is_type_comparison(sc.a, sc.source, ?e.data.binary)
+             || infer.sema_is_field_type_operand(sc, e.data.binary.lhs)
+             || infer.sema_is_field_type_operand(sc, e.data.binary.rhs))) {
+            ret;
+        }
         check_comptime_gate(sc, e.data.binary.lhs);
         check_comptime_gate(sc, e.data.binary.rhs);
         ret;

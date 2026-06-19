@@ -1092,10 +1092,31 @@ fun bind_decl_list(rc: *ResolveContext, start: u32, len: u32) Result[bool, str] 
     ret ok[bool, str](true);
 }
 
+# binds the identifiers in each of decl `d`'s backtick decorator arguments.
+fun bind_decorator_args(rc: *ResolveContext, d: *decl.Decl) Result[bool, str] {
+    var k: u32 = 0;
+    for (k < d.decorators_len) {
+        val dec: *decl.Decorator = ?rc.a.decorators[d.decorators_start + k];
+        var j: u32 = 0;
+        for (j < dec.args_len) {
+            val r: Result[bool, str] = bind_expr(rc, rc.a.expr_ids[dec.args_start + j]);
+            if (is_err[bool, str](r)) { ret r; }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    ret ok[bool, str](true);
+}
+
 fun bind_one_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
     val d_opt: Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
     if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    # a decl's backtick decorator arguments are comptime expressions; bind their
+    # identifiers (e.g. the operand of `align($size_of(T))`) so sema can type them.
+    val rda: Result[bool, str] = bind_decorator_args(rc, d);
+    if (is_err[bool, str](rda)) { ret rda; }
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
         val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
@@ -1266,7 +1287,8 @@ fun bind_fwd_module(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, 
 # value is fixed only per call site, at lowering — so EVERY arm is bound
 # structurally; arm selection is deferred to per-value monomorphization.
 fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32, at_decl_scope: bool) Result[bool, str] {
-    if (!at_decl_scope && comptime_if_gated_on_param(rc, branches_start, branches_len)) {
+    if (!at_decl_scope && (comptime_if_gated_on_param(rc, branches_start, branches_len)
+                        || comptime_if_has_type_comparison(rc, branches_start, branches_len))) {
         var ai: u32 = 0;
         for (ai < branches_len) {
             val arm: *decl.ComptimeBranch = ?rc.a.comptime_branches[branches_start + ai];
@@ -1370,6 +1392,45 @@ fun comptime_if_gated_on_param(rc: *ResolveContext, branches_start: u32, branche
             ret true;
         }
         bi = bi + 1;
+    }
+    ret false;
+}
+
+# reports whether any arm of a `$if` chain is gated on a type comparison
+# (`$type_of(...) == TypeName`, #1472). a type comparison cannot fold before
+# types exist, so — like a comptime-param gate — its chain binds every arm and
+# defers arm selection to lowering, where the type resolver is installed.
+fun comptime_if_has_type_comparison(rc: *ResolveContext, branches_start: u32, branches_len: u32) bool {
+    var bi: u32 = 0;
+    for (bi < branches_len) {
+        val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[branches_start + bi];
+        if (br.cond != id.EXPR_NIL && gate_has_type_comparison(rc, br.cond)) {
+            ret true;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# walks a `$if` gate reporting whether it contains a type comparison — an
+# `==` / `!=` with a `$type_of(...)` operand — at any depth.
+fun gate_has_type_comparison(rc: *ResolveContext, eid: id.ExprId) bool {
+    if (eid == id.EXPR_NIL) { ret false; }
+    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+    if (e.kind == expr.EXPR_KIND_BINARY) {
+        if ((e.data.binary.op == expr.BIN_EQ || e.data.binary.op == expr.BIN_NEQ)
+            && (comptime.is_type_comparison(rc.a, rc.source, ?e.data.binary)
+             || is_field_type_operand(rc, e.data.binary.lhs)
+             || is_field_type_operand(rc, e.data.binary.rhs))) {
+            ret true;
+        }
+        ret gate_has_type_comparison(rc, e.data.binary.lhs)
+         || gate_has_type_comparison(rc, e.data.binary.rhs);
+    }
+    if (e.kind == expr.EXPR_KIND_UNARY) {
+        ret gate_has_type_comparison(rc, e.data.unary.operand);
     }
     ret false;
 }
@@ -1566,7 +1627,40 @@ fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) Result[bool, str] {
     if (s.kind == stmt.STMT_KIND_COMPTIME_IF) {
         ret bind_comptime_if(rc, s.data.comptime_if.branches_start, s.data.comptime_if.branches_len, false);
     }
+    if (s.kind == stmt.STMT_KIND_COMPTIME_EACH) {
+        ret bind_comptime_each(rc, ?s.data.comptime_each);
+    }
     ret ok[bool, str](true);
+}
+
+# binds a `$each <ident> in <seq> { body }` (#1473): the sequence's `$fields(T)`
+# binds T as a type; the loop variable is declared in a fresh scope as a comptime
+# binding visible to the body, which is then bound. arm selection / expansion is
+# deferred to sema + lowering.
+fun bind_comptime_each(rc: *ResolveContext, ce: *stmt.StmtComptimeEach) Result[bool, str] {
+    if (comptime.is_fields_call(rc.a, rc.source, ce.seq)) {
+        val targ: id.ExprId = comptime.fields_type_arg(rc.a, ce.seq);
+        if (targ != id.EXPR_NIL) {
+            val rt: Result[bool, str] = bind_intrinsic_type_arg(rc, targ);
+            if (is_err[bool, str](rt)) { ret rt; }
+        }
+    }
+    or {
+        val rs: Result[bool, str] = bind_expr(rc, ce.seq);
+        if (is_err[bool, str](rs)) { ret rs; }
+    }
+
+    val r_s: Result[ScopeId, str] = open_scope(rc, rc.current_scope);
+    if (is_err[ScopeId, str](r_s)) { ret err[bool, str](unwrap_err[ScopeId, str](r_s)); }
+    val saved: ScopeId = rc.current_scope;
+    rc.current_scope = unwrap_ok[ScopeId, str](r_s);
+
+    val rd: Result[SymbolId, str] = declare(rc, SYM_VAL, SYM_FLAG_COMPTIME, ce.var_name, id.DECL_NIL, 0, rc.own_module, rc.current_scope);
+    if (is_err[SymbolId, str](rd)) { rc.current_scope = saved; ret err[bool, str](unwrap_err[SymbolId, str](rd)); }
+
+    val rb: Result[bool, str] = bind_stmt_list(rc, ce.body_start, ce.body_len);
+    rc.current_scope = saved;
+    ret rb;
 }
 
 fun bind_block(rc: *ResolveContext, b: *stmt.StmtBlock) Result[bool, str] {
@@ -1636,12 +1730,26 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
         ret bind_ident(rc, eid, e.span);
     }
     if (e.kind == expr.EXPR_KIND_BINARY) {
+        # a type comparison (`$type_of(...) == TypeName`, #1472) binds its operands
+        # specially: a `$type_of(e)` operand binds only its inner value `e` (the
+        # comptime-ident callee is a builtin), and the other operand is a type-name
+        # spelling bound as a type so sema can recover the named type.
+        if ((e.data.binary.op == expr.BIN_EQ || e.data.binary.op == expr.BIN_NEQ)
+            && (comptime.is_type_comparison(rc.a, rc.source, ?e.data.binary)
+             || is_field_type_operand(rc, e.data.binary.lhs)
+             || is_field_type_operand(rc, e.data.binary.rhs))) {
+            ret bind_type_comparison(rc, ?e.data.binary);
+        }
         val rl: Result[bool, str] = bind_expr(rc, e.data.binary.lhs);
         if (is_err[bool, str](rl)) { ret rl; }
         ret bind_expr(rc, e.data.binary.rhs);
     }
     if (e.kind == expr.EXPR_KIND_UNARY) {
         ret bind_expr(rc, e.data.unary.operand);
+    }
+    if (e.kind == expr.EXPR_KIND_SPREAD) {
+        # `va...`: bind the spread operand (the pack identifier).
+        ret bind_expr(rc, e.data.spread.inner);
     }
     if (e.kind == expr.EXPR_KIND_CALL) {
         # a provisional bracket call `callee[x](args)` whose payload read as both
@@ -1673,6 +1781,13 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
         val ro: Result[bool, str] = bind_expr(rc, e.data.index.object);
         if (is_err[bool, str](ro)) { ret ro; }
         ret bind_expr(rc, e.data.index.index);
+    }
+    if (e.kind == expr.EXPR_KIND_PROJECT) {
+        # `v.[f]`: bind the instance, then the field descriptor (the `$each` loop
+        # variable, resolved against the enclosing `$each` scope).
+        val ro: Result[bool, str] = bind_expr(rc, e.data.project.object);
+        if (is_err[bool, str](ro)) { ret ro; }
+        ret bind_expr(rc, e.data.project.field);
     }
     if (e.kind == expr.EXPR_KIND_MEMBER) {
         val ro: Result[bool, str] = bind_expr(rc, e.data.member.object);
@@ -2077,6 +2192,55 @@ fun bind_intrinsic_type_arg(rc: *ResolveContext, eid: id.ExprId) Result[bool, st
     # any other argument shape is not a type spelling; bind it as a normal
     # expression so a diagnostic surfaces the misuse.
     ret bind_expr(rc, eid);
+}
+
+# binds the two operands of a type comparison (`$type_of(...) == TypeName`,
+# #1472). each operand binds through `bind_type_operand`.
+fun bind_type_comparison(rc: *ResolveContext, bin: *expr.ExprBinary) Result[bool, str] {
+    val rl: Result[bool, str] = bind_type_operand(rc, bin.lhs);
+    if (is_err[bool, str](rl)) { ret rl; }
+    ret bind_type_operand(rc, bin.rhs);
+}
+
+# binds one type-comparison operand. a `$type_of(e)` operand binds only its inner
+# value `e` (the `$`-rooted comptime-ident callee is a builtin, bound nowhere); a
+# type-name operand binds as a type spelling so its resolved symbol is recorded
+# for sema to recover the named type.
+fun bind_type_operand(rc: *ResolveContext, operand: id.ExprId) Result[bool, str] {
+    if (comptime.is_type_of_call(rc.a, rc.source, operand)) {
+        val arg: id.ExprId = comptime.type_of_arg(rc.a, operand);
+        if (arg == id.EXPR_NIL) { ret ok[bool, str](true); }
+        ret bind_expr(rc, arg);
+    }
+    # an `f.type` field-descriptor type (#1473): bind only the object (the `$each`
+    # loop variable); `.type` is a descriptor projection, not a record field.
+    if (is_field_type_operand(rc, operand)) {
+        val n_opt: Option[*expr.Expr] = ast.get_expr(rc.a, operand);
+        if (is_none[*expr.Expr](n_opt)) { ret ok[bool, str](true); }
+        ret bind_expr(rc, unwrap[*expr.Expr](n_opt).data.member.object);
+    }
+    ret bind_intrinsic_type_arg(rc, operand);
+}
+
+# whether `eid` is an `f.type` operand whose object resolves, in the current
+# scope, to a `$each` comptime loop variable (a field descriptor). this keys the
+# `f.type` type-comparison recognition on the loop variable, so a real record
+# field named `type` (`s.type`) is never treated as a descriptor projection.
+fun is_field_type_operand(rc: *ResolveContext, eid: id.ExprId) bool {
+    if (!comptime.is_field_type_member(rc.a, rc.source, eid)) { ret false; }
+    val n_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (is_none[*expr.Expr](n_opt)) { ret false; }
+    val obj: id.ExprId = unwrap[*expr.Expr](n_opt).data.member.object;
+    val o_opt: Option[*expr.Expr] = ast.get_expr(rc.a, obj);
+    if (is_none[*expr.Expr](o_opt)) { ret false; }
+    val oe: *expr.Expr = unwrap[*expr.Expr](o_opt);
+    if (oe.kind != expr.EXPR_KIND_IDENT) { ret false; }
+    val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, oe.span);
+    if (is_err[intern.StrId, str](r)) { ret false; }
+    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, unwrap_ok[intern.StrId, str](r));
+    if (sid == SYMBOL_NIL) { ret false; }
+    val sym: *Symbol = ?rc.symbols[sid];
+    ret sym.kind == SYM_VAL && (sym.flags & SYM_FLAG_COMPTIME) != 0;
 }
 
 # interns a static literal in the session interner, returning its StrId or
