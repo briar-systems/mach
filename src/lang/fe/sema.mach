@@ -466,8 +466,10 @@ fun infer_one_body(sc: *ctxm.SemaContext, did: id.DeclId) Result[bool, str] {
         ret infer_binding_init(sc, did, d);
     }
     if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
-        # a bare comptime directive (`$error(...)`) carries no assignable value
-        # to type; its evaluation is handled out of band.
+        # a bare comptime directive (`$error(...)`): evaluated here, on the body
+        # pass that recurses only into the selected comptime-if arm, so a reached
+        # `$error` fails the build (#1511) while a dead arm's directive is skipped.
+        eval_comptime_directive(sc, d.data.comptime_attr.target, d.span);
         ret ok[bool, str](true);
     }
     ret ok[bool, str](true);
@@ -685,8 +687,29 @@ fun infer_stmt(sc: *ctxm.SemaContext, sid: id.StmtId, fn_ret: type.TypeId) Resul
     if (st.kind == stmt.STMT_KIND_COMPTIME_EACH) {
         ret infer_stmt_comptime_each(sc, ?st.data.comptime_each, st.span, fn_ret);
     }
+    if (st.kind == stmt.STMT_KIND_COMPTIME_ATTR) {
+        eval_comptime_directive(sc, st.data.comptime_attr.target, st.span);
+        ret ok[bool, str](true);
+    }
     # BRK, CNT, ASM, ERROR carry no expressions to infer
     ret ok[bool, str](true);
+}
+
+# evaluates a reached comptime directive (`$error("msg")`, #1511). a `$error`
+# directive fails the build with its folded message. the directive is reached
+# only on a live path — a selected comptime arm or an unconditional position — so
+# sema's per-arm walk (decl-scope active-arm recursion, statement-scope fold /
+# prune) fires it exactly when the surrounding code would compile, and never for a
+# pruned dead arm. a non-`$error` directive target is left as a no-op.
+fun eval_comptime_directive(sc: *ctxm.SemaContext, target: id.ExprId, span: token.Span) {
+    if (target == id.EXPR_NIL) { ret; }
+    if (!comptime.is_error_call(sc.a, sc.source, target)) { ret; }
+    val m: Result[str, str] = comptime.error_message(sc.ctx, sc.a, sc.source, target, ?sc.s.interner);
+    if (is_err[str, str](m)) {
+        ctxm.report(sc, span, unwrap_err[str, str](m));
+        ret;
+    }
+    ctxm.report(sc, span, unwrap_ok[str, str](m));
 }
 
 # type-checks a `$each <ident> in $fields(T) { body }` (#1473) by unrolling it:
@@ -749,13 +772,28 @@ fun infer_stmt_list(sc: *ctxm.SemaContext, start: u32, len: u32, fn_ret: type.Ty
 }
 
 fun infer_stmt_comptime_if(sc: *ctxm.SemaContext, start: u32, len: u32, fn_ret: type.TypeId) Result[bool, str] {
-    # a chain gated on a comptime value parameter, or on a type comparison
-    # (`$type_of(...)`, #1472), cannot select an arm at sema time — the
-    # parameter's value is fixed per call site, and a type comparison folds only
-    # once the type resolver is installed at lowering. type-check EVERY arm
-    # structurally; arm selection is deferred to per-value monomorphization.
-    if (stmt_comptime_if_gated_on_param(sc, start, len)
-        || stmt_comptime_if_has_type_comparison(sc, start, len)) {
+    val param_gated:  bool = stmt_comptime_if_gated_on_param(sc, start, len);
+    val has_type_cmp: bool = stmt_comptime_if_has_type_comparison(sc, start, len);
+
+    # a type-comparison chain (`$type_of(x) == T`, #1472) NOT gated on a comptime
+    # value parameter folds at monomorphization, where the type resolver is
+    # installed and x's concrete type is known: prune the provably-dead arms and
+    # type-check ONLY the selected one (#1511), so a clean no-cast skeleton
+    # compiles directly. when a gate cannot fold yet — the original sema pass
+    # installs no resolver, or x is still an abstract generic param — the prune
+    # defers and the all-arms check below runs unchanged.
+    if (has_type_cmp && !param_gated) {
+        val pr: Result[bool, str] = prune_type_comparison_chain(sc, start, len, fn_ret);
+        if (is_err[bool, str](pr)) { ret pr; }
+        if (unwrap_ok[bool, str](pr)) { ret ok[bool, str](true); }
+    }
+
+    # a chain gated on a comptime value parameter, or a type-comparison chain that
+    # did not fold above, cannot select an arm at sema time — the parameter's value
+    # is fixed per call site, and an unresolved type comparison folds only once the
+    # resolver is installed at lowering. type-check EVERY arm structurally; arm
+    # selection is deferred to per-value monomorphization.
+    if (param_gated || has_type_cmp) {
         var ai: u32 = 0;
         for (ai < len) {
             val arm: *decl.ComptimeBranch = ?sc.a.comptime_branches[start + ai];
@@ -791,6 +829,48 @@ fun infer_stmt_comptime_if(sc: *ctxm.SemaContext, start: u32, len: u32, fn_ret: 
         }
         bi = bi + 1;
     }
+    ret ok[bool, str](true);
+}
+
+# folds a non-param-gated type-comparison `$if` chain and type-checks only the
+# selected arm, pruning the provably-dead arms (#1511). returns true once the
+# chain fully folds — the selected arm (if any) is checked and the rest are left
+# untyped — and false when a gate cannot be folded yet, in which case the caller
+# type-checks every arm. only the live arm is checked, so an arm written for one
+# concrete type never fails against another. the chain folds during monomorphization
+# (the type resolver installed, x's type concrete); in the original sema pass no
+# resolver is installed, so the first gate defers and every arm is checked instead.
+fun prune_type_comparison_chain(sc: *ctxm.SemaContext, start: u32, len: u32, fn_ret: type.TypeId) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val arm: *decl.ComptimeBranch = ?sc.a.comptime_branches[start + i];
+        if (arm.cond == id.EXPR_NIL) {
+            # the unconditional final `$or {}` arm: reached only when every prior
+            # gate folded false, so it is the selected arm.
+            val rb: Result[bool, str] = infer_stmt_list(sc, arm.body_start, arm.body_len, fn_ret);
+            if (is_err[bool, str](rb)) { ret rb; }
+            ret ok[bool, str](true);
+        }
+        # type the gate (populating the operand types the resolver reads), then
+        # fold it. a gate that does not fold to a bool defers the whole chain.
+        val saved_gate: bool = sc.in_comptime_gate;
+        sc.in_comptime_gate = true;
+        infer.infer_expr(sc, arm.cond);
+        sc.in_comptime_gate = saved_gate;
+
+        val ev: Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, arm.cond, ?sc.s.interner);
+        if (is_err[comptime.CTValue, str](ev)) { ret ok[bool, str](false); }
+        val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](ev);
+        if (v.kind != comptime.CT_KIND_BOOL) { ret ok[bool, str](false); }
+        if (v.data.b) {
+            val rb: Result[bool, str] = infer_stmt_list(sc, arm.body_start, arm.body_len, fn_ret);
+            if (is_err[bool, str](rb)) { ret rb; }
+            ret ok[bool, str](true);
+        }
+        # gate folded false: this arm is provably dead — prune it (skip checking).
+        i = i + 1;
+    }
+    # every gated arm folded false with no final `$or {}`: no arm is selected.
     ret ok[bool, str](true);
 }
 
