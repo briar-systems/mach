@@ -17,6 +17,7 @@ neighboring links; start from the index below.
 ## Declarations
 
 - [visibility.md](visibility.md) — `pub` and `ext` modifiers
+- [decorators.md](decorators.md) — backtick codegen decorators (`symbol`, `library`, `inline`, `align`, `section`)
 - [def.md](def.md) — type alias
 - [rec.md](rec.md) — record
 - [uni.md](uni.md) — raw union and the discriminated-value convention
@@ -24,6 +25,7 @@ neighboring links; start from the index below.
 - [ext-fun.md](ext-fun.md) — external function
 - [val-var.md](val-var.md) — immutable and mutable bindings
 - [test.md](test.md) — `test` declaration and the `mach test` workflow
+- [variadics.md](variadics.md) — variadic packs (`va: ...`, `$each`, `va.len`, `va...`)
 
 ## Values and types
 
@@ -40,8 +42,8 @@ neighboring links; start from the index below.
 
 - [comptime.md](comptime.md) — channel overview
 - [comptime-mach.md](comptime-mach.md) — `$mach.*` compiler-owned namespace
-- [comptime-attrs.md](comptime-attrs.md) — symbol attributes
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`, `$offset_of`, `$error`, `$assert`
+- [comptime-attrs.md](comptime-attrs.md) — symbol attributes (see [decorators.md](decorators.md))
+- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`, `$offset_of`, `$type_of`, `$fields`, `$each`, `$error`, `$assert`
 - [comptime-control.md](comptime-control.md) — `$if` / `$or`
 
 ## Low-level
