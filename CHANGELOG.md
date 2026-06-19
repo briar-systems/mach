@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-06-19
+
+Minor — Phase 1 of the `#[attr]` decorator migration (#1526): the parser now accepts
+Rust-style `#[attr]` decorators **alongside** the existing backtick decorators. Purely
+additive and backward-compatible — both surfaces produce the same declaration AST, and
+the compiler's own source is unchanged (still backticks), so it stays byte-reproducible
+from the v2.2.0 seed. The v2.4.0 collapse migrates all source to `#[attr]` and removes
+the backtick form.
+
+### Added
+
+- syntax: `#[symbol("...")]`, `#[library("...")]`, `#[align(N)]`, `#[section("...")]`,
+  `#[inline]` decorator forms. The lexer opens an attribute when `#` is *immediately*
+  followed by `[` (otherwise `#` stays a line comment — a literal comment beginning
+  `#[` must insert a space). `#[...]` and the backtick form attach identically; the
+  decorator AST and sema/resolve/validate are unchanged (#1532).
+
 ## [2.2.0] - 2026-06-19
 
 Minor — correctness and cross-arch coverage, hardening the compiler ahead of a manual
