@@ -21,8 +21,9 @@ Be respectful, constructive, and professional. Treat Mach like a passion project
 Mach builds its own source with an existing `mach`:
 
 ```bash
-git clone --recurse-submodules https://github.com/octalide/mach.git
+git clone https://github.com/octalide/mach.git
 cd mach
+mach dep pull
 mach build .
 ```
 
@@ -122,15 +123,15 @@ Mach coding standards are in flux while syntax stabilizes and the userbase grows
 
 ```
 mach/
-├── dep/
-│   └── mach-std/      # standard library (git submodule)
+├── dep/                # dep checkouts realized by `mach dep pull` (git-ignored)
+│   └── mach-std/       # standard library
 ├── doc/               # documentation
 ├── src/               # self-hosting mach compiler
 ├── out/               # build output (git-ignored); compiler at out/<target>/bin/mach
 └── mach.toml          # project configuration
 ```
 
-The standard library lives in a separate repository ([mach-std](https://github.com/octalide/mach-std)) and is included as a git submodule under `dep/mach-std/`.
+The standard library lives in a separate repository ([mach-std](https://github.com/octalide/mach-std)) and is realized into `dep/mach-std/` by `mach dep pull` from the pin in `mach.toml`. The dep is currently frozen at an immutable `commit/<sha>` (the v1.7 self-host seed freeze, [#1486](https://github.com/octalide/mach/issues/1486)); it reverts to `branch/main` after the post-v1.7 re-seed.
 
 Building from source uses an existing `mach` (the latest release) — see [Getting Started](#getting-started). The original bootstrap seed ([mach-boot](https://github.com/octalide/mach-boot)) is no longer part of the build; it remains only as a from-scratch cold-start hatch.
 
