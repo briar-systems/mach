@@ -187,8 +187,10 @@ none of the token forms above is an **unexpected character**. The lexer
 records a `LEX_ERR_UNEXPECTED_CHAR`, emits a one-byte `ERROR` token
 (`KIND_ERROR`) for it, and continues.
 
-The backtick `` ` `` is a real punctuation token (`KIND_BACKTICK`); `#[` is the
-two-byte attribute-open token (`KIND_ATTR_OPEN`). Both delimit decorators (see
+The backtick `` ` `` is a real punctuation token (`KIND_BACKTICK`) but has no
+grammar production: it delimited decorators through v2.3.0 and was removed in
+v2.4.0, so a backtick at decorator position is now a migration error. `#[` is the
+two-byte attribute-open token (`KIND_ATTR_OPEN`) that opens a decorator (see
 [Decorators](#decorators) below).
 
 
@@ -203,33 +205,25 @@ module ::= { decl }
 
 ## Decorators
 
-Zero or more leading decorator clauses may appear before any declaration. Each
-clause is a comptime directive name, optionally followed by a parenthesized
-argument list of comptime expressions. A clause is written in either of two
-interchangeable surfaces: the backtick form `` `name(args)` `` or the attribute
-form `#[name(args)]`.
+Zero or more leading `#[...]` decorator clauses may appear before any
+declaration. Each clause is a comptime directive name, optionally followed by a
+parenthesized argument list of comptime expressions.
 
 ```ebnf
-decorator          ::= backtick-decorator | attr-decorator
-backtick-decorator ::= "`"  IDENT [ "(" [ expr { "," expr } ] ")" ] "`"
-attr-decorator     ::= "#[" IDENT [ "(" [ expr { "," expr } ] ")" ] "]"
-decorated-decl     ::= { decorator } decl
+decorator      ::= "#[" IDENT [ "(" [ expr { "," expr } ] ")" ] "]"
+decorated-decl ::= { decorator } decl
 ```
 
-- Both surfaces produce the **same** decorator and feed the same sema /
-  codegen path; only the delimiters differ. `#[name]` is the going-forward
-  preferred form; backticks remain accepted (the compiler's own source still
-  uses them this phase).
 - Decorators attach to the **immediately following** declaration and do not
   bleed across declarations.
-- The two surfaces may be mixed freely, on the same line (space-separated) or
-  one per line.
-- The argument list is optional; a bare `#[inline]` / `` `inline` `` carries no
-  arguments.
+- Clauses may appear on the same line (space-separated) or one per line.
+- The argument list is optional; a bare `#[inline]` carries no arguments.
 - Arguments are comptime expressions (not types): `$size_of(T)` is a valid
   argument; `T` as a raw type name is not.
 - The closed directive set is `symbol`, `section`, `inline`, `align`,
   `library`. See [decorators.md](decorators.md).
+- A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
+  v2.4.0; a backtick at decorator position is a migration error.
 
 
 ## Declarations
@@ -369,7 +363,7 @@ comptime-directive ::= expr-no-assign ";"
 - `comptime-directive` is a bare **comptime intrinsic / directive call**
   (`$error("msg");`). The legacy attribute-write setter (`$sym.attr = value;`)
   was removed in v2.0.0 — per-declaration codegen attributes are written as
-  backtick decorators now (see [decorators.md](decorators.md)) — so a stray `=`
+  `#[...]` decorators now (see [decorators.md](decorators.md)) — so a stray `=`
   after the target is a parse error. The target is parsed at a binding power
   above assignment so that `=` is detected rather than swallowed into the
   expression.
@@ -690,8 +684,8 @@ Productions verified directly against the parser source:
 - **Precedence ladder** — `token.infix_precedence` / `token.is_right_assoc`
   (the table is a direct transcription; only `=` is right-associative).
 - **Decorators** — `parser/decl.mach` `parse_decorators` / `parse_one_decorator`:
-  leading `` `name(args)` `` and `#[name(args)]` clauses (both surfaces converge
-  on one Decorator node), closed directive set.
+  leading `#[name(args)]` clauses (one Decorator node); a backtick at decorator
+  position is rejected as the removed surface (v2.4.0), closed directive set.
 - **Declarations** — `parser/decl.mach`: `use`, `fwd` (incl. `pub fwd`
   rejection), `fun` (generics, params, variadic `...`, named pack `name: ...`,
   comptime `$` params, optional return type, block-or-`;` body), `rec`, `uni`,
@@ -727,8 +721,8 @@ Doc-only (intended surface, not a distinct parser production):
   `$type_of`, `$fields`, `$error`, `$assert`) — syntactically
   indistinguishable from any other `comptime-ident` call.
 - The closed decorator directive set (`symbol`, `library`, `inline`, `align`,
-  `section`) — the parser accepts any `IDENT` after `` ` `` or `#[`; sema
-  enforces the closed set.
+  `section`) — the parser accepts any `IDENT` after `#[`; sema enforces the
+  closed set.
 
 Divergences flagged inline:
 

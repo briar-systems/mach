@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # decorator-argument resolution test (#1491, fast-follow #1476): bind_decorator_args
-# (resolve.mach) walks the comptime expression in each backtick decorator, so an
+# (resolve.mach) walks the comptime expression in each `#[...]` decorator, so an
 # unresolved identifier there must surface a name-resolution error rather than be
 # silently dropped. two placements are covered:
 #   unresolved — a top-level decl whose decorator names an undeclared identifier.

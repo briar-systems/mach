@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# decorator integration test (#1476): prove a `symbol` backtick decorator drives
+# decorator integration test (#1476): prove a `#[symbol(...)]` decorator drives
 # the emitted link name, the 1:1 replacement for the legacy `$<sym>.symbol`
 # setter.
 #
 # builds a tiny library (`declib`) to a loose object whose `pub fun mach_dec_add`
-# carries a `` `symbol("mach_dec_add")` `` decorator, then links a consumer
+# carries a `#[symbol("mach_dec_add")]` decorator, then links a consumer
 # (`app`) — which declares that symbol `ext` and whose `main` carries a
-# `` `symbol("main")` `` decorator — against the object. the program returns
+# `#[symbol("main")]` decorator — against the object. the program returns
 # `mach_dec_add(20, 21)` which must be 42. if the decorator did not route the
 # link name, the library symbol would be mangled and the `ext` reference would
 # not resolve, failing the link — so a clean 42 proves emission followed the

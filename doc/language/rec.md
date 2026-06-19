@@ -43,8 +43,8 @@ val n: i64            = p.x;            # field access via .
 ## Layout
 
 By default the compiler may insert padding between fields for alignment. The
-`` `align(N)` `` backtick decorator on a record raises its minimum type
-alignment to `N` bytes (a power of two); see [decorators.md](decorators.md).
+`#[align(N)]` decorator on a record raises its minimum type alignment to `N`
+bytes (a power of two); see [decorators.md](decorators.md).
 
 > Disabling padding entirely (a `packed` layout for binary-protocol / on-disk
 > structs) is not yet available — the field-to-field padding always follows the
