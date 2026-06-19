@@ -83,7 +83,7 @@ TOML
 use std.runtime;
 use libx.lib.answer;
 
-`symbol("main")`
+#[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     ret answer();
 }

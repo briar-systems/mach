@@ -17,7 +17,7 @@ neighboring links; start from the index below.
 ## Declarations
 
 - [visibility.md](visibility.md) — `pub` and `ext` modifiers
-- [decorators.md](decorators.md) — codegen decorators, `#[name]` or `` `name` `` (`symbol`, `library`, `inline`, `align`, `section`)
+- [decorators.md](decorators.md) — codegen decorators, `#[name]` (`symbol`, `library`, `inline`, `align`, `section`)
 - [def.md](def.md) — type alias
 - [rec.md](rec.md) — record
 - [uni.md](uni.md) — raw union and the discriminated-value convention
@@ -42,7 +42,7 @@ neighboring links; start from the index below.
 
 - [comptime.md](comptime.md) — channel overview
 - [comptime-mach.md](comptime-mach.md) — `$mach.*` compiler-owned namespace
-- [decorators.md](decorators.md) — codegen decorators, `#[name]` or `` `name` `` (replaces the removed `$sym.attr` setters)
+- [decorators.md](decorators.md) — codegen decorators, `#[name]` (replaces the removed `$sym.attr` setters)
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`, `$offset_of`, `$type_of`, `$fields`, `$each`, `$error`, `$assert`
 - [comptime-control.md](comptime-control.md) — `$if` / `$or`
 

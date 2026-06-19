@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-06-19
+
+Minor — Phase 2 (collapse) of the `#[attr]` decorator migration (#1526): `#[attr]` is now
+the **only** decorator syntax; the backtick form is removed. Treated as pre-stable churn
+rather than a breaking major — the backtick form shipped days ago (2.0.0) with ~0 external
+adoption, and the change is purely surface-level (same Decorator AST, same codegen).
+Byte-reproducible from the v2.3.0 seed; the vendored-std advance to mach-std 0.14.0 is
+inert.
+
+### Removed
+
+- syntax: backtick decorators (`` `symbol(...)` ``, `` `library(...)` ``, `` `inline` ``,
+  `` `align(N)` ``, `` `section(...)` ``). Use the `#[attr]` form (`#[symbol("...")]`,
+  `#[inline]`, …) added in v2.3.0. A backtick at decorator position now reports a
+  migration diagnostic — `backtick decorators were removed in v2.4.0; use #[name(...)]` —
+  and recovers at the next declaration (#1535).
+
+### Changed
+
+- deps: the vendored mach-std advances to **v0.14.0** — the `#[attr]`-migrated standard
+  library.
+
 ## [2.3.0] - 2026-06-19
 
 Minor — Phase 1 of the `#[attr]` decorator migration (#1526): the parser now accepts

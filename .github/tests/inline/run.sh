@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# inline decorator integration test (#1476): prove an `inline` backtick decorator
+# inline decorator integration test (#1476): prove an `#[inline]` decorator
 # forces inlining of a function the cost model would otherwise leave alone.
 #
 # `big` exceeds the inline pass's instruction threshold and is called from two
@@ -74,10 +74,10 @@ else
     fi
 fi
 
-# control: strip the `inline` decorator; the cost model must now leave the calls
+# control: strip the `#[inline]` decorator; the cost model must now leave the calls
 # in place, proving the decorator — not the heuristic — is what inlined `big`.
-# the `symbol("big")` pin is on its own line and survives, so `big` keeps its name.
-sed '/`inline`/d' "$HERE/app/src/main.mach" > "$WORK/app/src/main.mach"
+# the `#[symbol("big")]` pin is on its own line and survives, so `big` keeps its name.
+sed '/#\[inline\]/d' "$HERE/app/src/main.mach" > "$WORK/app/src/main.mach"
 rm -rf "$WORK/app/out"
 if ! ( cd "$WORK/app" && "$MACH" build . --emit-asm -O2 ) >/dev/null 2>&1; then
     echo "FAIL inline: control build failed" >&2

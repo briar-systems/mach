@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Parser error-recovery at declaration scope. A removed-syntax error — a comptime
 # attribute setter (`$sym.attr = value;`) or a C-style `...` variadic parameter,
-# both removed in v2.0.0 — must emit its ONE migration diagnostic and resync on
-# the NEXT declaration. It must NOT skip that declaration and reparse its body at
-# module scope, which used to spray a spurious "expected a declaration" for every
+# both removed in v2.0.0, or a backtick decorator (`` `name(...)` ``), removed in
+# v2.4.0 — must emit its ONE migration diagnostic and resync on the NEXT
+# declaration. It must NOT skip that declaration and reparse its body at module
+# scope, which used to spray a spurious "expected a declaration" for every
 # non-`val` body statement (sync_to_decl's unconditional leading advance, fixed
 # for v2.0.1). Each app's function body is all-valid, so a correct compiler emits
-# exactly the migration diagnostic and zero "expected a declaration" cascade.
+# exactly the migration diagnostic and zero "expected a declaration" cascade. The
+# backtick case additionally proves the going-forward `#[name(...)]` twin checks
+# clean — the same decl in the surviving surface.
 #
 # usage: run.sh [path-to-mach]   (defaults to `mach` on PATH)
 set -euo pipefail
@@ -39,7 +42,22 @@ check() {
     echo "PASS recovery/$app: one migration diagnostic, recovered at the next decl (no cascade)"
 }
 
-check setter  "comptime attribute setters were removed in v2.0.0"
-check varargs 'C-style variadic `...` was removed in v2.0.0'
+check setter   "comptime attribute setters were removed in v2.0.0"
+check varargs  'C-style variadic `...` was removed in v2.0.0'
+check backtick "backtick decorators were removed in v2.4.0"
+
+# positive twin: rewriting the rejected backtick clause to the going-forward
+# `#[name(...)]` surface must check clean — `mach check` (single file, parse + sema,
+# no link) emits no diagnostic for the surviving form, proving the migration target
+# is the same decl in a parseable surface.
+twin="$WORK/backtick-attr.mach"
+sed -E 's/`([^`]*)`/#[\1]/g' "$HERE/backtick/src/main.mach" > "$twin"
+if "$MACH" check "$twin" >/dev/null 2>&1; then
+    echo "PASS recovery/backtick: the #[name(...)] twin checks clean"
+else
+    echo "FAIL recovery/backtick: the #[name(...)] twin did not check clean:" >&2
+    "$MACH" check "$twin" >&2 || true
+    fail=1
+fi
 
 exit "$fail"

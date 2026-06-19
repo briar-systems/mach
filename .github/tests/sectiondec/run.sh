@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# section decorator integration test (#1476): prove a `section("...")` decorator
+# section decorator integration test (#1476): prove a `#[section("...")]` decorator
 # places a global's symbol in the named object section, carried into ELF object
 # emission, while an un-decorated global stays in .data.
 #
