@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-06-19
+
+**BREAKING.** The comptime collapse completes the v1.7 metaprogramming arc and is
+the first new-only, post-migration release — hence the major version bump from
+the 1.7.0 transition, which kept the legacy surfaces resolving for seed
+compatibility. Code that still uses `$mach.target.*`, the top-level `$target.*`
+root, `$<sym>.*` attribute setters, or C-style varargs must migrate (see Removed).
+The self-host fixpoint holds — stage1==stage2==stage3 byte-identical on x86_64 and
+aarch64 (the compiler binary shrinks as the legacy paths are deleted, but it
+reproduces itself exactly).
+
+### Removed
+
+- comptime: the legacy `$mach.target.*` and top-level `$target.*` namespace
+  spellings — build facts read through `$mach.build.*` and the declared target
+  tuple through `$project.target.*` (#1480).
+- comptime: the C-style varargs feature — the trailing `...` parameter marker,
+  the `variadic` signature flag, `va_arg`/`va_start`/`va_end`, the `va_list`
+  type, the OP_VA_* IR opcodes, and the per-ABI register-save callee prologue
+  (superseded by comptime variadic packs in v1.7.0) (#1478).
+- comptime: the `$<sym>.symbol` / `$<sym>.library` / `$main.symbol` attribute
+  setters — superseded by `` `symbol(...)` `` / `` `library(...)` `` backtick
+  decorators (#1476); a stray `=` after a comptime directive now reports a
+  migration diagnostic (#1478).
+- ci: the content-based seed-safety guard (#1486) — obsolete now that the seed is
+  v1.7.0 and the vendored std legitimately uses `va:` / `$each` / `$mach.build.*`.
+- abi: the vestigial VaModel register-save geometry left behind by the varargs
+  removal — the 12 save-area fields, the per-ABI `va_save` helpers, and the
+  never-emitted `MIR_VA_FP_SAVE` pseudo. The functional call-ABI facts (the SysV
+  vector-count register and the win64 float-duplication) are retained (#1478).
+
+### Changed
+
+- deps: the vendored mach-std pin advances to v0.12.0 — the migrated, new-only
+  std (comptime packs + `$mach.build.*`) (#1480, #1478).
+- comptime: float-literal folding imports `std.math.bignum` from the vendored std
+  instead of the temporary in-tree bignum port added for v1.7.0 seeding (#1483).
+
 ## [1.7.0] - 2026-06-19
 
 Comptime rework and first-class variadics — the last big breaking change before

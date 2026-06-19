@@ -93,9 +93,9 @@ reserved name — declaring `[target.native]` is an error.
 
 | Key       | Type   | Required | Default | Meaning |
 |-----------|--------|----------|---------|---------|
-| `isa`     | string | yes      | —       | Instruction-set architecture. Read by `$target.isa`. See the accepted set below. |
-| `os`      | string | yes      | —       | Operating system. Read by `$target.os`. See the accepted set below. |
-| `abi`     | string | yes      | —       | Application binary interface (e.g. `sysv64`, `win64`). Read by `$target.abi`. |
+| `isa`     | string | yes      | —       | Instruction-set architecture. Read by `$project.target.arch`. See the accepted set below. |
+| `os`      | string | yes      | —       | Operating system. Read by `$project.target.os`. See the accepted set below. |
+| `abi`     | string | yes      | —       | Application binary interface (e.g. `sysv64`, `win64`). Read by `$project.target.abi`. |
 | `ext`     | string | no       | `""`    | Artifact filename extension expanded by `{ext}` (e.g. `".exe"`). |
 | `libs`    | array of strings | no | `[]` | Platform link overlay — external link inputs inherited by every artifact built for this target (see [Link inputs](#link-inputs)). |
 | `defines` | array of strings | no | `[]` | Per-target comptime defines (#1191). Each is `NAME` (a `true` flag) or `NAME=VALUE`; readable as `$mach.build.NAME`. |

@@ -1,6 +1,6 @@
 ---
 name: mach-lowlevel
-description: Use when writing or reviewing Mach inline assembly, syscalls, or other target-specific code. Covers the asm <isa> { ... } form with {name} operand substitution, multi-arch dispatch via $if on $mach.target.arch, the compiler-infers-operands-and-clobbers model, and when to write asm versus call a standard-library wrapper.
+description: Use when writing or reviewing Mach inline assembly, syscalls, or other target-specific code. Covers the asm <isa> { ... } form with {name} operand substitution, multi-arch dispatch via $if on $mach.build.arch, the compiler-infers-operands-and-clobbers model, and when to write asm versus call a standard-library wrapper.
 ---
 
 # Mach low-level layer
@@ -55,15 +55,15 @@ There is no clobber list and no operand-direction declaration. Writing one is in
 
 ## Multi-arch dispatch
 
-No nested arch-block construct exists inside `asm`. Dispatch at the outer level by wrapping each block in `$if` on `$mach.target.arch`:
+No nested arch-block construct exists inside `asm`. Dispatch at the outer level by wrapping each block in `$if` on `$mach.build.arch`:
 
 ```mach
-$if ($mach.target.arch == $mach.arch.x86_64) {
+$if ($mach.build.arch == $mach.arch.x86_64) {
     asm x86_64 {
         # x86_64 instructions
     }
 }
-$or ($mach.target.arch == $mach.arch.aarch64) {
+$or ($mach.build.arch == $mach.arch.aarch64) {
     asm aarch64 {
         # aarch64 instructions
     }
@@ -74,9 +74,9 @@ $or {
 ```
 
 - Only the taken branch compiles; discarded branches are not resolved or codegen'd. Each `asm` block only needs to be valid for its own tagged ISA.
-- Compare with path values: `$mach.target.arch == $mach.arch.x86_64`. No `.id` suffix, no string compare.
+- Compare with path values: `$mach.build.arch == $mach.arch.x86_64`. No `.id` suffix, no string compare.
 - `$or` has **no condition** for the final else arm — `$or { ... }`. A conditional middle arm is `$or (COND) { ... }`. There is no `$or $if`.
-- Same pattern keys off `$mach.target.os` against `$mach.os.linux` / `.darwin` / `.windows` / `.freestanding` for OS-specific bodies (e.g. syscall ABIs).
+- Same pattern keys off `$mach.build.os` against `$mach.os.linux` / `.darwin` / `.windows` / `.freestanding` for OS-specific bodies (e.g. syscall ABIs).
 
 ## When to write `asm` vs call stdlib
 
@@ -115,8 +115,8 @@ Vector types follow `<u|i|f><width>x<count>`: `f32x4`, `i32x8`, `u8x16`. Higher 
 
 - **No type inference.** Every binding declares its type: `var result: i64 = 0;`. The `asm` block does not infer the result type from usage.
 - **No compiler-known type aliases.** `usize`, `str` are stdlib `def`s, not built-ins. `$size_of`/`$align_of`/`$offset_of` resolve to comptime constant unsigned integers stored in whatever type the binding declares.
-- **Strings are `"..."` → `*u8`, null-terminated** in the data segment. Backtick has **no role**: the lexer treats it as an unexpected character (a lex error) — never use it for an `asm` body or anything else.
-- **`ext fun` is the only body-less function form.** No forward declarations; body-less signatures are reserved for C-ABI externals. Symbol rename via `$NAME.symbol = "real_name";`.
+- **Strings are `"..."` → `*u8`, null-terminated** in the data segment. Backtick delimits a per-declaration decorator (`` `symbol(...)` `` etc.) on the line before a decl; it has no role inside an `asm` body or expression.
+- **`ext fun` is the only body-less function form.** No forward declarations; body-less signatures are reserved for C-ABI externals. Symbol rename via the `` `symbol("real_name")` `` decorator.
 - **`fwd` is bare** (no `pub fwd`) and **always publishes** — it re-exports a symbol through a surface file, used by both topical splits (all impls forwarded unconditionally) and multiplatform splits (one impl forwarded per target).
 - **No tagged unions, no `match`.** Discriminated values are a `rec` carrying a discriminator plus a `uni` payload (`rec{ kind: ValueKind; data: uni{...} }`); consumers branch with `if`/`or`. The compiler does not enforce kind/payload consistency.
 - **Atomic / volatile are not in the primitive type name.** There are no bare-letter modifiers (`u32a` etc.); those concerns live outside the primitive name, via stdlib atomics.
@@ -126,6 +126,6 @@ Vector types follow `<u|i|f><width>x<count>`: `f32x4`, `i32x8`, `u8x16`. Higher 
 The authoritative low-level reference lives in the Mach repository under
 [`doc/language/`](https://github.com/octalide/mach/tree/dev/doc/language) —
 `asm.md` (the `asm` form, operand substitution, inferred clobbers, multi-arch
-dispatch), `comptime-control.md` (`$if`/`$or` over `$mach.target.arch`), and
+dispatch), `comptime-control.md` (`$if`/`$or` over `$mach.build.arch`), and
 `policy.md` (the full compiler-vs-stdlib boundary). When a skill and the
 reference disagree, the reference wins.

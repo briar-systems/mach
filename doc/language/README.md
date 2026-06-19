@@ -42,7 +42,7 @@ neighboring links; start from the index below.
 
 - [comptime.md](comptime.md) — channel overview
 - [comptime-mach.md](comptime-mach.md) — `$mach.*` compiler-owned namespace
-- [comptime-attrs.md](comptime-attrs.md) — symbol attributes (see [decorators.md](decorators.md))
+- [decorators.md](decorators.md) — backtick codegen decorators (replaces the removed `$sym.attr` setters)
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`, `$offset_of`, `$type_of`, `$fields`, `$each`, `$error`, `$assert`
 - [comptime-control.md](comptime-control.md) — `$if` / `$or`
 

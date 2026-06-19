@@ -10,7 +10,7 @@ for **writing Mach programs**, not for working on the compiler.
 | Skill | Purpose | Triggers when |
 |---|---|---|
 | [writing-mach](writing-mach/SKILL.md) | Core language: project/module structure, `use`/`fwd`, the shadow-module pattern, every declaration form, the type grammar, literals, operators, statements, expressions, docstrings, and the entrypoint / `std.print` idioms. | Writing, editing, or reviewing any `.mach` source. The default entry point. |
-| [mach-comptime](mach-comptime/SKILL.md) | The comptime channel (`$`): `$mach.*` reads, `$sym.attr` symbol attributes, the closed intrinsic set, `$if`/`$or` control flow, and `$name: T` comptime parameters. | Code touches `$` — conditional compilation, target/build queries, attributes, intrinsics, or comptime params. |
+| [mach-comptime](mach-comptime/SKILL.md) | The comptime channel (`$`): `$mach.*` reads, backtick codegen decorators, the closed intrinsic set, `$if`/`$or` control flow, and `$name: T` comptime parameters. | Code touches `$` — conditional compilation, target/build queries, decorators, intrinsics, or comptime params. |
 | [mach-lowlevel](mach-lowlevel/SKILL.md) | Inline assembly (`asm <isa> { ... }` with `{name}` substitution, multi-arch dispatch, inferred operands/clobbers) and when to write `asm` versus call the standard library. | Writing/reviewing inline `asm`, syscalls, or other target-specific code. |
 
 Scope is partitioned: core language lives in **writing-mach**, the `$` channel in

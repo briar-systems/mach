@@ -1,70 +1,74 @@
 ---
 name: mach-comptime
-description: Use when writing or reviewing Mach code that touches the comptime channel: the $ namespace, conditional compilation, target/compiler/build/project/source queries ($mach.*), symbol attributes ($sym.attr), compiler intrinsics ($size_of/$align_of/$offset_of/$error/$assert), $if/$or comptime control flow, and comptime function parameters ($name: T).
+description: Use when writing or reviewing Mach code that touches the comptime channel: the $ namespace, conditional compilation, target/compiler/build/project/source queries ($mach.*), backtick codegen decorators (symbol/library/inline/align/section), compiler intrinsics ($size_of/$align_of/$offset_of/$error/$assert), $if/$or comptime control flow, and comptime function parameters ($name: T).
 ---
 
 # Mach comptime channel
 
-`$` opens the single bidirectional channel between developer and compiler. Reads
-observe compiler-provided state; writes annotate developer-declared symbols.
-Four structurally distinct shapes — the parser disambiguates by shape, not by a
-mode flag:
+`$` opens the compiler-owned comptime channel — read-only: it *selects and
+expands*, never executes or mutates. Three structurally distinct shapes — the
+parser disambiguates by shape, not by a mode flag:
 
 | Shape | Meaning |
 |---|---|
 | `$mach.path.to.value` | read compiler-owned value |
-| `$sym.attr = value` / `$sym.attr` | write/read attribute on a declared symbol |
 | `$sym(args)` | comptime call — closed intrinsic set, or a user call passing comptime args (no user comptime defs) |
 | `$if` / `$or` | comptime control flow |
 
 `mach` is reserved at the top of `$`; user symbols cannot collide there.
+Per-declaration codegen directives are backtick decorators (a separate
+mechanism — see Decorators below), not `$` writes.
 
 ## `$mach.*` — read-only compiler state
 
 All reads, all comptime constants. Closed tree. Subtrees:
 
 ```mach
-$mach.target.os                 # compare against $mach.os.* tags
-$mach.target.arch               # compare against $mach.arch.* tags
-$mach.target.pointer_width      # integer byte count
-$mach.target.abi
+$mach.build.os                  # live; compare against $mach.os.* tags
+$mach.build.arch                # live; compare against $mach.arch.* tags
+$mach.build.abi                 # live; compare against $mach.abi.* tags
+$mach.build.pointer_width       # live; integer byte count
+$mach.build.mode                # live; compare against $mach.mode.* tags
+$mach.build.timestamp           # stub
+$mach.build.git.commit          # stub
+$mach.build.git.dirty           # stub
+$mach.build.host                # stub
 
-$mach.compiler.name
-$mach.compiler.version
+$mach.version                   # live; version string, e.g. "2.0.0"
+$mach.version.major             # live; integer component
+$mach.version.minor             # live
+$mach.version.patch             # live
+$mach.compiler.name             # live
+$mach.compiler.version          # live
 
-$mach.build.mode
-$mach.build.timestamp
-$mach.build.git.commit
-$mach.build.git.dirty
-$mach.build.host
+$mach.project.name              # stub
+$mach.project.version           # stub
+$mach.project.root              # stub
 
-$mach.project.name
-$mach.project.version
-$mach.project.root
-
-$mach.source.file
-$mach.source.line
-$mach.source.module
-$mach.source.function
+$mach.source.file               # stub
+$mach.source.line               # stub
+$mach.source.module             # stub
+$mach.source.function           # stub
 
 $mach.os.linux $mach.os.darwin $mach.os.windows $mach.os.freestanding
 $mach.arch.x86_64 $mach.arch.aarch64
+$mach.abi.sysv $mach.abi.win64 $mach.abi.aapcs64
+$mach.mode.debug $mach.mode.release
 ```
 
-> **Implementation status.** Only a subset resolves today:
-> `$mach.target.{os,arch,pointer_width}`, `$mach.os.*`, `$mach.arch.*`, and
-> `$mach.compiler.{name,version}`. The `$mach.target.abi`, `$mach.build.*`,
-> `$mach.project.*`, and `$mach.source.*` paths are reserved stubs — reading one
-> is a compile error. Prefer the live reads in real code. Note `$mach.arch.aarch64`
-> resolves as a value, but only `$mach.arch.x86_64` is a working backend target
-> today ([#1045](https://github.com/octalide/mach/issues/1045)) — aarch64 dispatch
-> branches below illustrate the pattern but are comptime-discarded on an x86_64 build.
+> **Implementation status.** The resolved-build facts
+> `$mach.build.{os,arch,abi,pointer_width,mode}`, the tag tables
+> `$mach.{os,arch,abi,mode}.*`, `$mach.version[.{major,minor,patch}]`, and
+> `$mach.compiler.{name,version}` are live. `$mach.build.{timestamp,host,git.*}`,
+> `$mach.project.*`, and `$mach.source.*` are reserved stubs — reading one is a
+> compile error. `$mach.arch.aarch64` resolves as a value; the aarch64 dispatch
+> branches below illustrate the multi-arch pattern.
 
 Tag comparison is path-value — no `.id` suffix, no unwrapping:
 
 ```mach
-$if ($mach.target.os == $mach.os.linux) { ... }
-$if ($mach.target.arch == $mach.arch.x86_64) { ... }
+$if ($mach.build.os == $mach.os.linux) { ... }
+$if ($mach.build.arch == $mach.arch.x86_64) { ... }
 ```
 
 `$mach.os.*` / `$mach.arch.*` are closed lists; a tag exists only because the
@@ -72,62 +76,36 @@ compiler can target it. A `$mach.*` read can fold into a runtime binding (no
 type inference — the binding still declares its type):
 
 ```mach
-pub val IS_LINUX: u8  = $mach.target.os == $mach.os.linux;
+pub val IS_LINUX: u8  = $mach.build.os == $mach.os.linux;
 pub val COMPILER: *u8 = $mach.compiler.name;
 ```
 
-## Symbol attributes — `$sym.attr`
+## Decorators — backtick codegen directives
 
-Metadata written onto a declared symbol; the compiler reads it during codegen.
+Per-declaration codegen directives are **backtick decorators** (#1476), on the
+line(s) above the decl — not `$` writes. The `$sym.attr = value;` setter form was
+removed in v2.0.0. Closed set:
 
-```mach
-$sym.attr = value;          # write
-$sym.attr                   # read
-```
-
-Rules:
-
-- `sym` must be declared **in the same module** (resolver verifies).
-- Path is flat: exactly one symbol component, one attribute component. No nesting.
-- Writes are write-once; RHS must be comptime-evaluable.
-- `attr` must be from the closed set below.
-- Convention: write the attribute **before** the decl so it reads as a header.
-  Purely lexical — order doesn't affect correctness (resolution is module-scope).
-
-```mach
-$panic.noreturn = true;
-pub fun panic(msg: *u8) {
-    asm x86_64 { ud2 }
-}
-```
-
-Closed attribute set:
-
-| Attribute | Applies to | Value | Purpose |
+| Decorator | Applies to | Argument | Purpose |
 |---|---|---|---|
-| `.symbol` | functions, vars | `*u8` literal | linker name override |
-| `.noreturn` | functions | `u8` flag | never returns; dead code after calls omitted |
-| `.inline` | functions | `u8` flag | strong inline hint |
-| `.align` | vars, records, unions | power-of-two int | alignment in bytes |
-| `.section` | functions, vars | `*u8` literal | linker section name |
-| `.packed` | records, unions | `u8` flag | disable field padding |
-
-> **Implementation status.** Any well-formed attribute write parses, but only
-> `.symbol` currently changes compiler output (the linker name). The rest are
-> accepted and ignored — layout uses the natural C-style rule regardless of
-> `.align` / `.packed`, and `.noreturn` / `.inline` / `.section` do not yet
-> feed codegen. Flag attributes take a `u8`; `true` and `1` are equivalent when
-> stdlib `bool` is in scope.
-
-The `ext fun` rename uses `.symbol`:
+| `` `symbol(str)` `` | functions, vars | `*u8` literal | linker name override |
+| `` `library(str)` `` | `ext` functions | `*u8` literal | PE import DLL routing |
+| `` `inline` `` | functions | none | strong inline hint |
+| `` `align(expr)` `` | vars, records, unions | comptime int | alignment in bytes |
+| `` `section(str)` `` | functions, vars | `*u8` literal | linker section name |
 
 ```mach
-$read.symbol = "read";
+`symbol("read")`
 ext fun read(fd: i32, buf: *u8, n: u64) i64;
+
+`align(64)`
+pub var cache_line: u8 = 0;
 ```
 
-There is **no** decl-attached prefix sugar (`$inline pub fun ...` does not
-exist). Always use an attribute write.
+Each directive is its own backtick pair; stack several on one decl (e.g.
+`` `library("ws2_32.dll")` `` `` `symbol("socket")` ``). There is **no** `$`-write
+setter and **no** decl-attached prefix sugar (`$inline pub fun ...` does not
+exist). See `doc/language/decorators.md` for argument rules and applicability.
 
 ## Intrinsics — `$name(args)`
 
@@ -178,10 +156,10 @@ backend doesn't know.
 `cond` must be comptime: `$mach.*` reads, or comparisons of comptime constants.
 
 ```mach
-$if ($mach.target.os == $mach.os.linux) {
+$if ($mach.build.os == $mach.os.linux) {
     use std.runtime.linux;
 }
-$or ($mach.target.os == $mach.os.windows) {
+$or ($mach.build.os == $mach.os.windows) {
     use std.runtime.windows;
 }
 $or {
@@ -203,7 +181,7 @@ idiom for passing memory orderings and similar variants into stdlib wrappers.
 pub fun load($order: Order, ptr: *i64) i64 {
     var result: i64 = 0;
 
-    $if ($mach.target.arch == $mach.arch.aarch64) {
+    $if ($mach.build.arch == $mach.arch.aarch64) {
         $if (order == RELAXED) {
             asm aarch64 { ldr {result}, [{ptr}] }
         }
@@ -229,15 +207,16 @@ brackets and are a separate mechanism.
 
 ## Pitfalls
 
-- **Tag comparison is path-value.** Write `$mach.target.os == $mach.os.linux`,
+- **Tag comparison is path-value.** Write `$mach.build.os == $mach.os.linux`,
   never an `.id` suffix or any unwrap.
 - **No `$or $if`.** The else arm is bare `$or { ... }` with no condition. A
   conditional alternative is `$or (cond) { ... }`.
-- **Attribute symbol must be local.** `$sym.attr` only attaches to a symbol
-  declared in the same module; writes are write-once.
-- **No prefix-sugar attributes.** `$inline`/`$noreturn` as decl prefixes do not
-  exist — use `$sym.inline = true;` / `$sym.noreturn = true;` before the decl.
-- **Closed sets.** Intrinsic names, attribute names, and `$mach.os.*`/`.arch.*`
+- **Codegen directives are backtick decorators, not `$` writes.** Use
+  `` `symbol("...")` `` / `` `inline` `` / `` `align(N)` `` on the line above the
+  decl; the `$sym.attr = value;` setter form was removed in v2.0.0.
+- **No prefix sugar.** `$inline pub fun ...` does not exist — a decorator sits on
+  its own line above the decl.
+- **Closed sets.** Intrinsic names, decorator names, and `$mach.os.*`/`.arch.*`
   tags are all closed. Don't invent members; new ones require a compiler change.
 - **Value intrinsics are unsigned constants with no implicit type.** The binding
   declares the storage type (Mach has no type inference and no `usize`).

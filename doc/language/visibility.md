@@ -25,14 +25,14 @@ Declares a function with C ABI as a forward reference — body-less. The
 linker resolves the symbol at link time. Only functions can be `ext`.
 
 ```mach
-$libc_write.symbol = "write";
+`symbol("write")`
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
 - `ext fun` declarations have no body.
 - The C ABI is the contract; argument and return types must be
   representable in C.
-- Use `$NAME.symbol = "real_name";` to override the linker name.
+- Use the `` `symbol("real_name")` `` decorator to override the linker name.
 
 There are no body-less functions outside of `ext fun`. Regular forward
 declarations do not exist.
