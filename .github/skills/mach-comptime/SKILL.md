@@ -34,7 +34,7 @@ $mach.build.git.commit          # stub
 $mach.build.git.dirty           # stub
 $mach.build.host                # stub
 
-$mach.version                   # live; version string, e.g. "1.7.1"
+$mach.version                   # live; version string, e.g. "2.0.0"
 $mach.version.major             # live; integer component
 $mach.version.minor             # live
 $mach.version.patch             # live
@@ -84,7 +84,7 @@ pub val COMPILER: *u8 = $mach.compiler.name;
 
 Per-declaration codegen directives are **backtick decorators** (#1476), on the
 line(s) above the decl — not `$` writes. The `$sym.attr = value;` setter form was
-removed in v1.7.1. Closed set:
+removed in v2.0.0. Closed set:
 
 | Decorator | Applies to | Argument | Purpose |
 |---|---|---|---|
@@ -213,7 +213,7 @@ brackets and are a separate mechanism.
   conditional alternative is `$or (cond) { ... }`.
 - **Codegen directives are backtick decorators, not `$` writes.** Use
   `` `symbol("...")` `` / `` `inline` `` / `` `align(N)` `` on the line above the
-  decl; the `$sym.attr = value;` setter form was removed in v1.7.1.
+  decl; the `$sym.attr = value;` setter form was removed in v2.0.0.
 - **No prefix sugar.** `$inline pub fun ...` does not exist — a decorator sits on
   its own line above the decl.
 - **Closed sets.** Intrinsic names, decorator names, and `$mach.os.*`/`.arch.*`

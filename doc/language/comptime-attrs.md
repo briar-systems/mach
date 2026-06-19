@@ -15,7 +15,7 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 pub var cache_line: u8 = 0;
 ```
 
-The previous `$sym.attr = value;` setter form was removed in v1.7.1 in favor of
+The previous `$sym.attr = value;` setter form was removed in v2.0.0 in favor of
 decorators; a stray `=` after a comptime directive is now a parse error.
 
 ## See also

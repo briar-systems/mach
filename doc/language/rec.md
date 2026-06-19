@@ -49,7 +49,7 @@ alignment to `N` bytes (a power of two); see [decorators.md](decorators.md).
 > Disabling padding entirely (a `packed` layout for binary-protocol / on-disk
 > structs) is not yet available — the field-to-field padding always follows the
 > natural C-style rule. The legacy `$NAME.align = N;` / `$NAME.packed = true;`
-> attribute setters were removed in v1.7.1.
+> attribute setters were removed in v2.0.0.
 
 ## See also
 

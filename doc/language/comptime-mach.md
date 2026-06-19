@@ -40,7 +40,7 @@ define was declared.
 ### `$mach.version` — the compiler version
 
 ```mach
-$mach.version                   # live; the version string, e.g. "1.7.1"
+$mach.version                   # live; the version string, e.g. "2.0.0"
 $mach.version.major             # live; integer component
 $mach.version.minor             # live; integer component
 $mach.version.patch             # live; integer component

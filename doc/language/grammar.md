@@ -355,7 +355,7 @@ comptime-directive ::= expr-no-assign ";"
 
 - `comptime-directive` is a bare **comptime intrinsic / directive call**
   (`$error("msg");`). The legacy attribute-write setter (`$sym.attr = value;`)
-  was removed in v1.7.1 — per-declaration codegen attributes are written as
+  was removed in v2.0.0 — per-declaration codegen attributes are written as
   backtick decorators now (see [decorators.md](decorators.md)) — so a stray `=`
   after the target is a parse error. The target is parsed at a binding power
   above assignment so that `=` is detected rather than swallowed into the

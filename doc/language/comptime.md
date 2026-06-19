@@ -17,7 +17,7 @@ this channel.
 > Per-declaration codegen attributes (symbol rename, library pin, inline,
 > align, section) are written as **backtick decorators**, not `$`-comptime
 > shapes — see [decorators.md](decorators.md). The legacy `$sym.attr = value`
-> attribute setters were removed in v1.7.1.
+> attribute setters were removed in v2.0.0.
 
 The parser distinguishes these by structure:
 
@@ -42,7 +42,7 @@ The parser distinguishes these by structure:
 `$project.target.*` carries the manifest's declared **string** spellings
 (`"linux"`, `"x86_64"`, `"sysv64"`), distinct from `$mach.build.*`'s numeric tags
 used for `$mach.{os,arch,abi}.*` comparison. Flat `$project.version` is the whole
-version **string** (`"1.7.1"`); the structured `$project.version.{major,minor,
+version **string** (`"2.0.0"`); the structured `$project.version.{major,minor,
 patch}` folds its integer components — both are available. A root field the
 manifest does not declare (`$project.description` on a v1 manifest, `$bin.name`
 on a v1 manifest with no artifact stanza) reports the read as unavailable rather
@@ -50,7 +50,7 @@ than folding to an empty string. See [comptime-mach.md](comptime-mach.md) for th
 `$mach.*` subtree.
 
 ```mach
-val ver: str = $project.version;                 # "1.7.1", from [project].version
+val ver: str = $project.version;                 # "2.0.0", from [project].version
 $if ($project.target.os == "windows") { ... }    # the declared os string
 ```
 

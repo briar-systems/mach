@@ -5,11 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.7.1] - 2026-06-19
+## [2.0.0] - 2026-06-19
 
-Comptime collapse — the legacy surfaces v1.7.0 kept resolving for seed
-compatibility are removed now that v1.7.0 is the released seed. No new compiler
-syntax, so the self-host fixpoint stays byte-identical on x86_64 and aarch64.
+**BREAKING.** The comptime collapse completes the v1.7 metaprogramming arc and is
+the first new-only, post-migration release — hence the major version bump from
+the 1.7.0 transition, which kept the legacy surfaces resolving for seed
+compatibility. Code that still uses `$mach.target.*`, the top-level `$target.*`
+root, `$<sym>.*` attribute setters, or C-style varargs must migrate (see Removed).
+The self-host fixpoint holds — stage1==stage2==stage3 byte-identical on x86_64 and
+aarch64 (the compiler binary shrinks as the legacy paths are deleted, but it
+reproduces itself exactly).
 
 ### Removed
 
@@ -26,6 +31,10 @@ syntax, so the self-host fixpoint stays byte-identical on x86_64 and aarch64.
   migration diagnostic (#1478).
 - ci: the content-based seed-safety guard (#1486) — obsolete now that the seed is
   v1.7.0 and the vendored std legitimately uses `va:` / `$each` / `$mach.build.*`.
+- abi: the vestigial VaModel register-save geometry left behind by the varargs
+  removal — the 12 save-area fields, the per-ABI `va_save` helpers, and the
+  never-emitted `MIR_VA_FP_SAVE` pseudo. The functional call-ABI facts (the SysV
+  vector-count register and the win64 float-duplication) are retained (#1478).
 
 ### Changed
 
