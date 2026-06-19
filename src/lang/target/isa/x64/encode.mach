@@ -3425,30 +3425,51 @@ fun emit_movd_movq_reg(gp: i32, xmm: i32, w: u8, gp_to_xmm: bool, buf: *ByteBuf)
 }
 
 
-# float_setcc_opcode: the concrete UNSIGNED SETcc opcode realizing a float
-# comparison condition. a UCOMISD/UCOMISS sets CF/ZF/PF (CF on below, ZF on equal;
-# an UNORDERED result sets CF=ZF=PF=1), so the float compare maps to the UNSIGNED
-# conditions SETE/SETNE/SETB/SETBE/SETA/SETAE — NOT the signed SETL/SETLE/SETG/SETGE
-# the integer compare path uses.
+# float_cmp_swap: true when an IEEE-754 float compare is realized by reversing its
+# operands. `<` / `<=` map to the NaN-false `>` / `>=` of the swapped operands
+# (`a < b` is `b > a`, which UCOMISD reads as false when unordered), so those two
+# conditions compare RHS against LHS. the lowerer already canonicalizes source
+# `>` / `>=` to LT / LE, so in practice these are the only relations that reach the
+# encoder; GT / GE remain handled identically for completeness.
+fun float_cmp_swap(cc: u8) bool {
+    ret cc == mir.FCC_LT || cc == mir.FCC_LE;
+}
+
+# float_setcc_opcode: the primary UNSIGNED SETcc realizing an IEEE-754 float
+# comparison. UCOMISD/UCOMISS sets CF/ZF/PF (CF on below, ZF on equal) and leaves
+# CF=ZF=PF=1 when unordered (a NaN operand), so an honest compare must read false
+# there for every relation except `!=`. the relations use the NaN-false SETA /
+# SETAE: `>` and `<` (operands reversed by float_cmp_swap) map to SETA, `>=` and
+# `<=` to SETAE. equality stays SETE / SETNE and is corrected for the unordered
+# case by the parity combine in encode_float_cmp. these are the UNSIGNED conditions
+# — NOT the signed SETL/SETLE/SETG/SETGE the integer compare path uses.
 fun float_setcc_opcode(cc: u8) u16 {
     if (cc == mir.FCC_EQ) { ret x64.SETE; }
     if (cc == mir.FCC_NE) { ret x64.SETNE; }
-    if (cc == mir.FCC_LT) { ret x64.SETB; }
-    if (cc == mir.FCC_LE) { ret x64.SETBE; }
+    if (cc == mir.FCC_LT) { ret x64.SETA; }
+    if (cc == mir.FCC_LE) { ret x64.SETAE; }
     if (cc == mir.FCC_GT) { ret x64.SETA; }
     ret x64.SETAE;
 }
 
 # encode_float_cmp: materialize a fully-resolved float comparison
-# `MIR_FCMP [dst, lhs, rhs]` into its SSE byte sequence, mirroring cmach's
-# `emit_float_cmp`: load `lhs` -> FLOAT_SCRATCH0 and `rhs` -> FLOAT_SCRATCH1, run
-# `UCOMISS/UCOMISD SCRATCH0, SCRATCH1` (set CF/ZF/PF), capture the condition into
-# the destination's low byte with the UNSIGNED SETcc selected from the FCC_* code
-# (carried on `mi.src_width`), then zero-extend the byte boolean to the machine
-# word (MOVZX). the compared operand width (`mi.width`: 4 -> UCOMISS, 8 -> UCOMISD)
-# selects the compare form; the i8 result is sized independently. the destination
-# is a GP register (the i8 result vreg is GP-classed); a spilled result is reloaded
-# into a register destination by the allocator before here.
+# `MIR_FCMP [dst, lhs, rhs]` into its IEEE-754 SSE byte sequence: load `lhs` ->
+# FLOAT_SCRATCH0 and `rhs` -> FLOAT_SCRATCH1, run `UCOMISS/UCOMISD` (set CF/ZF/PF),
+# capture the condition into the destination's low byte, then zero-extend the byte
+# boolean to the machine word (MOVZX). the compared operand width (`mi.width`:
+# 4 -> UCOMISS, 8 -> UCOMISD) selects the compare form; the i8 result is sized
+# independently. the destination is a GP register (the i8 result vreg is GP-classed);
+# a spilled result is reloaded into a register destination by the allocator here.
+#
+# an unordered (NaN-involving) compare leaves CF=ZF=PF=1, so an honest IEEE-754
+# result reads false for every relation except `!=`:
+#   - `<` / `<=`: the operands are reversed (float_cmp_swap) and read with the
+#     NaN-false SETA / SETAE, since `a < b` is `b > a`;
+#   - `>` / `>=`: SETA / SETAE directly (already NaN-false);
+#   - `==` / `!=`: SETE / SETNE alone ignore PF, so a NaN would read as ordered.
+#     the parity flag is folded in — `==` is ordered-and-equal (ZF & !PF), `!=` is
+#     unordered-or-unequal (!ZF | PF) — by capturing PF into the reserved R11 scratch
+#     (SETNP / SETP) and combining it with the primary byte (AND / OR) before MOVZX.
 fun encode_float_cmp(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Result[bool, str] {
     if (mi.operand_count < 3) {
         ret err[bool, str]("encode: float comparison missing operands");
@@ -3477,17 +3498,22 @@ fun encode_float_cmp(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Resu
     val lr: Result[bool, str] = emit_float_load(rhs, FLOAT_SCRATCH1, w, buf);
     if (is_err[bool, str](lr)) { ret lr; }
 
-    # UCOMISS / UCOMISD SCRATCH0, SCRATCH1  (set CF/ZF/PF)
+    # UCOMISS / UCOMISD lhs, rhs  (set CF/ZF/PF); `<` / `<=` reverse the operands so
+    # the relation reads as the NaN-false `>` / `>=` of the swapped pair.
     var ucom: isa.Inst;
     zero_inst(?ucom);
     ucom.opcode = x64.UCOMISD;
     if (w == 4) { ucom.opcode = x64.UCOMISS; }
     ucom.dst  = isa.make_reg(FLOAT_SCRATCH0, 16);
     ucom.src1 = isa.make_reg(FLOAT_SCRATCH1, 16);
+    if (float_cmp_swap(cc)) {
+        ucom.dst  = isa.make_reg(FLOAT_SCRATCH1, 16);
+        ucom.src1 = isa.make_reg(FLOAT_SCRATCH0, 16);
+    }
     ucom.size = w;
     encode_inst(?ucom, buf);
 
-    # SETcc dst  (one byte; UNSIGNED condition from the FCC_* code)
+    # SETcc dst  (one byte; the NaN-false UNSIGNED condition from the FCC_* code)
     var setcc: isa.Inst;
     zero_inst(?setcc);
     setcc.opcode   = float_setcc_opcode(cc);
@@ -3495,6 +3521,31 @@ fun encode_float_cmp(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *ByteBuf) Resu
     setcc.dst.size = 1;
     setcc.size     = 1;
     encode_inst(?setcc, buf);
+
+    # `==` / `!=`: fold the parity flag in so an unordered (NaN) compare is not read
+    # as ordered. capture PF into the reserved R11 scratch (SETNP for `==` -> !PF,
+    # SETP for `!=` -> PF) — both SETcc read the flags before the combine clobbers
+    # them — then AND (`==`: ZF & !PF) or OR (`!=`: !ZF | PF) it into the primary byte.
+    if (cc == mir.FCC_EQ || cc == mir.FCC_NE) {
+        var par: isa.Inst;
+        zero_inst(?par);
+        par.opcode   = x64.SETNP;
+        if (cc == mir.FCC_NE) { par.opcode = x64.SETP; }
+        par.dst      = isa.make_reg(x64.R11, 1);
+        par.dst.size = 1;
+        par.size     = 1;
+        encode_inst(?par, buf);
+
+        var comb: isa.Inst;
+        zero_inst(?comb);
+        comb.opcode   = x64.AND;
+        if (cc == mir.FCC_NE) { comb.opcode = x64.OR; }
+        comb.dst      = dst;
+        comb.dst.size = 1;
+        comb.src1     = isa.make_reg(x64.R11, 1);
+        comb.size     = 1;
+        encode_inst(?comb, buf);
+    }
 
     # MOVZX dst, dst  (zero-extend the byte boolean to the machine word)
     var movzx: isa.Inst;
