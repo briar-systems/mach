@@ -1,4 +1,4 @@
-# Backtick decorators
+# Decorators
 
 A decorator is a codegen directive attached to a declaration. It expresses
 metadata that influences how the compiler emits the symbol: its linker name,
@@ -7,14 +7,33 @@ alignment, section placement, inlining, or PE import routing.
 Decorators are **codegen-only**. Visibility (`pub` / `ext`) is separate and
 unaffected by decorators.
 
+## Surfaces
+
+A decorator is written in either of two interchangeable surfaces:
+
+```
+#[name]            # attribute form — preferred going forward
+`name`             # backtick form — original, still accepted
+```
+
+Both surfaces parse into the **same** decorator and feed the same sema and
+codegen path; only the delimiters differ. New code should prefer `#[...]`; the
+backtick form remains accepted this phase (the compiler's own source still uses
+it until the migration completes), and the two may be mixed freely. The
+examples below use the preferred `#[...]` form.
+
+> One caveat the attribute form introduces: a line comment that begins `#[`
+> (with no space) now opens an attribute. Write such a comment with a separating
+> space — `# [...]`.
+
 ## Grammar
 
 ```
-`symbol("name")`    # linker name override
-`library("dep")`    # PE import routing (ext only)
-`inline`            # force inlining (no arguments)
-`align(expr)`       # alignment; expr is a comptime integer
-`section(".name")`  # place in a named object section
+#[symbol("name")]    # linker name override
+#[library("dep")]    # PE import routing (ext only)
+#[inline]            # force inlining (no arguments)
+#[align(expr)]       # alignment; expr is a comptime integer
+#[section(".name")]  # place in a named object section
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -22,17 +41,18 @@ space-separated on the same line. They attach to the immediately following
 declaration only and do not bleed across declarations.
 
 ```mach
-`inline`
-`symbol("big")`
+#[inline]
+#[symbol("big")]
 fun big(a: i64, b: i64) i64 { ... }
 
-`align(64)` `symbol("g_lit64")`
+#[align(64)] #[symbol("g_lit64")]
 pub var g_lit64: u8 = 7;
 ```
 
-Each directive is wrapped in its own backtick pair: `` `name` `` for a bare
-flag or `` `name(args)` `` for a directive that takes arguments. Arguments are
-comptime expressions.
+Each directive is wrapped in its own clause: `#[name]` for a bare flag or
+`#[name(args)]` for a directive that takes arguments. Arguments are comptime
+expressions. The backtick form is the same with `` ` `` delimiters: `` `name` ``
+or `` `name(args)` ``.
 
 ## Directives
 
@@ -42,10 +62,10 @@ Overrides the emitted or imported symbol name. Applies to functions and
 globals.
 
 ```mach
-`symbol("main")`
+#[symbol("main")]
 fun entry(argc: i64, argv: **u8) i64 { ... }
 
-`symbol("write")`
+#[symbol("write")]
 ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
@@ -58,7 +78,7 @@ Pins an `ext` import to a specific DLL in the link's dependency set. Applies
 to `ext` functions only.
 
 ```mach
-`library("ws2_32.dll")` `symbol("WSAStartup")`
+#[library("ws2_32.dll")] #[symbol("WSAStartup")]
 ext fun wsa_startup(ver: u16, data: *u8) i32;
 ```
 
@@ -80,7 +100,7 @@ Marks a function for inlining at every call site, overriding the compiler's
 size- and use-count heuristics. Applies to functions only; takes no arguments.
 
 ```mach
-`inline`
+#[inline]
 fun fast_path(x: i64) i64 { ret x * 2; }
 ```
 
@@ -91,13 +111,13 @@ be a comptime integer — either a literal or a comptime expression such as
 `$size_of(T)` or `$align_of(T)`.
 
 ```mach
-`align(64)`
+#[align(64)]
 pub var cache_line: u8 = 0;
 
-`align($size_of(Pair))`
+#[align($size_of(Pair))]
 pub var g_cmp: u8 = 0;
 
-`align(32)`
+#[align(32)]
 rec Over { a: u8; }
 ```
 
@@ -114,10 +134,10 @@ Places a function or global variable in a named section instead of the
 default `.text` / `.data`.
 
 ```mach
-`section(".hottext")` `symbol("f_hot")`
+#[section(".hottext")] #[symbol("f_hot")]
 fun f_hot(x: i64) i64 { ret x + 1; }
 
-`section(".machsec")` `symbol("g_sec")`
+#[section(".machsec")] #[symbol("g_sec")]
 pub var g_sec: u64 = 100;
 ```
 
