@@ -50,13 +50,13 @@ then declarations.
 ## Executable entrypoint
 
 The standard library provides the platform `_start` symbol that calls your
-`main`. Pull it in with `use std.runtime;`, tag `main` with the `.symbol`
-attribute so the linker finds it, and return an exit code:
+`main`. Pull it in with `use std.runtime;`, tag `main` with the `` `symbol` ``
+decorator so the linker finds it, and return an exit code:
 
 ```mach
 use std.runtime;
 
-$main.symbol = "main";
+`symbol("main")`
 fun main(argc: i64, argv: **u8) i64 {
     ret 0;
 }
@@ -203,7 +203,7 @@ pub fun identity[T](value: T) T { ret value; }
 ### `ext fun` — external function
 
 ```mach
-$libc_write.symbol = "write";              # optional linker-name override
+`symbol("write")`                          # optional linker-name override
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
@@ -348,9 +348,9 @@ Attribute writes follow the docstring, immediately above the decl.
 
 ## Comptime channel (`$`) — brief
 
-`$mach.*` reads compiler-provided state; `$sym.attr = v;` writes a symbol
-attribute (write-once, before the decl, same module). Closed attribute set:
-`.symbol .noreturn .inline .align .section .packed`. Comptime control:
+`$mach.*` reads compiler-provided state; per-declaration backtick decorators
+`` `name(args)` `` attach codegen attributes to the following decl. Closed
+decorator set: `` `symbol` `` `` `library` `` `` `inline` `` `` `align` `` `` `section` ``. Comptime control:
 `$if (C) {} $or (C) {} $or {}` — only the taken branch compiles. Value
 intrinsics `$size_of(T) $align_of(T) $offset_of(T, f)` yield comptime unsigned
 integers; `$error("msg")` / `$assert(C, "msg")` are diagnostics. The full

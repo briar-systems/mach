@@ -115,8 +115,8 @@ Vector types follow `<u|i|f><width>x<count>`: `f32x4`, `i32x8`, `u8x16`. Higher 
 
 - **No type inference.** Every binding declares its type: `var result: i64 = 0;`. The `asm` block does not infer the result type from usage.
 - **No compiler-known type aliases.** `usize`, `str` are stdlib `def`s, not built-ins. `$size_of`/`$align_of`/`$offset_of` resolve to comptime constant unsigned integers stored in whatever type the binding declares.
-- **Strings are `"..."` → `*u8`, null-terminated** in the data segment. Backtick has **no role**: the lexer treats it as an unexpected character (a lex error) — never use it for an `asm` body or anything else.
-- **`ext fun` is the only body-less function form.** No forward declarations; body-less signatures are reserved for C-ABI externals. Symbol rename via `$NAME.symbol = "real_name";`.
+- **Strings are `"..."` → `*u8`, null-terminated** in the data segment. Backtick delimits a per-declaration decorator (`` `symbol(...)` `` etc.) on the line before a decl; it has no role inside an `asm` body or expression.
+- **`ext fun` is the only body-less function form.** No forward declarations; body-less signatures are reserved for C-ABI externals. Symbol rename via the `` `symbol("real_name")` `` decorator.
 - **`fwd` is bare** (no `pub fwd`) and **always publishes** — it re-exports a symbol through a surface file, used by both topical splits (all impls forwarded unconditionally) and multiplatform splits (one impl forwarded per target).
 - **No tagged unions, no `match`.** Discriminated values are a `rec` carrying a discriminator plus a `uni` payload (`rec{ kind: ValueKind; data: uni{...} }`); consumers branch with `if`/`or`. The compiler does not enforce kind/payload consistency.
 - **Atomic / volatile are not in the primitive type name.** There are no bare-letter modifiers (`u32a` etc.); those concerns live outside the primitive name, via stdlib atomics.

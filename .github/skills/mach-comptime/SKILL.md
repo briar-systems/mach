@@ -119,15 +119,15 @@ Closed attribute set:
 > feed codegen. Flag attributes take a `u8`; `true` and `1` are equivalent when
 > stdlib `bool` is in scope.
 
-The `ext fun` rename uses `.symbol`:
+The `ext fun` rename uses the `` `symbol` `` backtick decorator:
 
 ```mach
-$read.symbol = "read";
+`symbol("read")`
 ext fun read(fd: i32, buf: *u8, n: u64) i64;
 ```
 
 There is **no** decl-attached prefix sugar (`$inline pub fun ...` does not
-exist). Always use an attribute write.
+exist). Always use a backtick decorator on the line before the decl.
 
 ## Intrinsics — `$name(args)`
 

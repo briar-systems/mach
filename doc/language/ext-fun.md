@@ -26,10 +26,10 @@ ext fun strlen(s: *u8) i64;             # private, file-local
 ## Symbol rename
 
 By default the linker symbol matches the Mach name. Override it with the
-`.symbol` attribute:
+`` `symbol` `` decorator:
 
 ```mach
-$libc_write.symbol = "write";
+`symbol("write")`
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
@@ -42,11 +42,11 @@ Common reasons to rename:
 ## Library attribution
 
 On a dynamic format that attributes each import to a specific dependency — the
-PE (Windows) import directory — the `.library` attribute pins an `ext` import to
+PE (Windows) import directory — the `` `library` `` decorator pins an `ext` import to
 the DLL that exports it:
 
 ```mach
-$WSAStartup.library = "ws2_32.dll";
+`library("ws2_32.dll")`
 ext fun WSAStartup(ver: u16, data: *u8) i32;
 ```
 
