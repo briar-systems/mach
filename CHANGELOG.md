@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-06-19
+
+Patch — parser error-recovery and a grammar-doc fix surfaced while migrating the
+mach ecosystem (blit, mach-glfw, mach-sieve, …) to 2.0.0.
+
+### Fixed
+
+- parser: a removed-syntax error at declaration scope — a comptime attribute
+  setter (`$sym.attr = value;`) or a C-style `...` variadic parameter — now
+  recovers at the **next** declaration instead of skipping it and reparsing its
+  body at module scope, which sprayed a spurious "expected a declaration" for
+  every non-`val` body statement. `sync_to_decl` no longer advances past a token
+  that already begins a declaration; a regression suite (`tests/recovery`)
+  guards both cases.
+
+### Documentation
+
+- grammar.md: removed the stale C-style `...` variadic **parameter** production
+  (rejected since 2.0.0) — the comptime variadic pack `name: ...` is the only
+  declaration form; function **pointer types** still carry `...` for FFI (#1518).
+
 ## [2.0.0] - 2026-06-19
 
 **BREAKING.** The comptime collapse completes the v1.7 metaprogramming arc and is
