@@ -291,6 +291,14 @@ pub rec Project {
     union_tuples:       *TargetTuple;
     union_tuple_count:  u32;
 
+    # union build (#1505): the entry-module FQN of every declared artifact, so the
+    # union loads the import closure over the whole (target × artifact) matrix — not
+    # just the primary artifact's. Recorded in `load_config` under `for_union`,
+    # walked after the primary `dfs_load` in `build_project_impl` (dedup by FQN is
+    # automatic). nil/0 on a single-artifact or single-target build.
+    union_entries:      *intern.StrId;
+    union_entry_count:  u32;
+
     compiler_name:  intern.StrId;
     compiler_ver:   intern.StrId;
 
@@ -477,6 +485,20 @@ fun build_project_impl(s: *sess.Session, project_root: str, sel: *manifest.Selec
         ret err[Project, str](unwrap_err[sess.ModuleId, str](load_r));
     }
 
+    # union build (#1505): load every other declared artifact's entry into the same
+    # Project so tooling sees the closure over the whole (target × artifact) matrix,
+    # not just the primary artifact's. dfs_load dedups by FQN, so the primary entry
+    # (also present in union_entries) re-loads as a no-op, as do shared modules.
+    var ei: u32 = 0;
+    for (ei < p.union_entry_count) {
+        val ear: Result[sess.ModuleId, str] = dfs_load(?p, p.union_entries[ei]);
+        if (is_err[sess.ModuleId, str](ear)) {
+            dnit_project(?p);
+            ret err[Project, str](unwrap_err[sess.ModuleId, str](ear));
+        }
+        ei = ei + 1;
+    }
+
     # the module table is stable past the load pass; publish every module's
     # AST to the session registry so later phases can reach cross-module
     # declarations (imported record fields, generics from transitive deps).
@@ -520,15 +542,18 @@ pub fun build_project_sel(s: *sess.Session, project_root: str, sel: *manifest.Se
     ret build_project_impl(s, project_root, sel, false);
 }
 
-# build_project_union: build the union of EVERY manifest target's import closure
-# into one deduplicated Project, for long-lived multi-target tooling (#1391).
-# Modules are deduped by FQN. A module reachable only via a non-default target's
-# `$if` is still loaded and present — so workspace-wide tooling (e.g. rename) sees
-# it (lsp #58) — and is resolved under the DEFAULT target's ctx ("default target's
-# branches win", the documented v1 default). A module that does not fully resolve
-# under that ctx records per-module diagnostics and the Project stays usable; the
-# union build is not aborted. For ordinary single-target builds use
-# build_project_sel.
+# build_project_union: build the union of EVERY manifest target's AND artifact's
+# import closure into one deduplicated Project, for long-lived multi-target tooling
+# (#1391, #1505). Modules are deduped by FQN. A module reachable only via a
+# non-default target's `$if`, or only from a non-primary artifact's entry, is still
+# loaded and present — so workspace-wide tooling (e.g. rename) sees it (lsp #58) —
+# and is resolved under the DEFAULT target's ctx ("default target's branches win",
+# the documented v1 default). Several declared artifacts with no `--bin/--lib`
+# selector is NOT the ambiguity error `build_project_sel` raises: the union takes
+# the first declared artifact as the primary (ctx) and loads the rest's entries
+# too. A module that does not fully resolve under the default ctx records per-module
+# diagnostics and the Project stays usable; the union build is not aborted. For
+# ordinary single-target builds use build_project_sel.
 pub fun build_project_union(s: *sess.Session, project_root: str) Result[Project, str] {
     var sel: manifest.Selection;
     sel.target       = "";
@@ -577,6 +602,91 @@ fun populate_union_tuples(p: *Project, m: *manifest.Manifest) Result[bool, str] 
     p.union_tuple_count = n;
     p.union             = true;
     ret ok[bool, str](true);
+}
+
+# populate_union_entries: record the entry-module FQN of every declared artifact —
+# each artifact's base `entry` plus any per-cell `[*.target.*]` entry override —
+# deduped by FQN, so the union load walk covers the whole (target × artifact)
+# matrix (#1505). Requires `p.config.id` set (the FQN head). A manifest with no
+# artifacts is a no-op. Idempotent re-loads (the primary entry is among these) are
+# absorbed by `dfs_load`'s FQN dedup.
+fun populate_union_entries(p: *Project, m: *manifest.Manifest) Result[bool, str] {
+    if (m.artifact_count == 0) { ret ok[bool, str](true); }
+
+    # upper bound: one base entry per artifact plus every cell entry override.
+    var cap: u32 = 0;
+    var k: u32 = 0;
+    for (k < m.artifact_count) {
+        cap = cap + 1 + m.artifacts[k].cell_count;
+        k = k + 1;
+    }
+
+    val er: Result[*intern.StrId, str] = allocate[intern.StrId](p.s.alloc, cap::usize);
+    if (is_err[*intern.StrId, str](er)) { ret err[bool, str](unwrap_err[*intern.StrId, str](er)); }
+    val entries: *intern.StrId = unwrap_ok[*intern.StrId, str](er);
+
+    val id_opt: Option[str] = intern.lookup(?p.s.interner, p.config.id);
+    if (is_none[str](id_opt)) {
+        deallocate[intern.StrId](p.s.alloc, entries, cap::usize);
+        ret err[bool, str]("internal: union project id not interned");
+    }
+    val id_text: str = unwrap[str](id_opt);
+
+    var w: u32 = 0;
+    k = 0;
+    for (k < m.artifact_count) {
+        val a: *manifest.ArtifactDef = ?m.artifacts[k];
+        val br: Result[u32, str] = add_union_entry(p, entries, w, cap, id_text, a.entry);
+        if (is_err[u32, str](br)) { deallocate[intern.StrId](p.s.alloc, entries, cap::usize); ret err[bool, str](unwrap_err[u32, str](br)); }
+        w = unwrap_ok[u32, str](br);
+        var c: u32 = 0;
+        for (c < a.cell_count) {
+            if (a.cells[c].entry != intern.STR_NIL) {
+                val cr: Result[u32, str] = add_union_entry(p, entries, w, cap, id_text, a.cells[c].entry);
+                if (is_err[u32, str](cr)) { deallocate[intern.StrId](p.s.alloc, entries, cap::usize); ret err[bool, str](unwrap_err[u32, str](cr)); }
+                w = unwrap_ok[u32, str](cr);
+            }
+            c = c + 1;
+        }
+        k = k + 1;
+    }
+
+    # shrink to the deduped count so the freed size matches the allocation exactly
+    # (the page allocator's deallocate munmaps the recorded byte span).
+    if (w < cap) {
+        val sr: Result[*intern.StrId, str] = reallocate[intern.StrId](p.s.alloc, entries, cap::usize, w::usize);
+        if (is_err[*intern.StrId, str](sr)) {
+            deallocate[intern.StrId](p.s.alloc, entries, cap::usize);
+            ret err[bool, str](unwrap_err[*intern.StrId, str](sr));
+        }
+        p.union_entries = unwrap_ok[*intern.StrId, str](sr);
+    }
+    or {
+        p.union_entries = entries;
+    }
+    p.union_entry_count = w;
+    ret ok[bool, str](true);
+}
+
+# add_union_entry: compose the FQN of `entry_id` (an artifact/cell entry-source
+# path) under project id `id_text` and append it to `entries[0, w)` if not already
+# present, returning the new count. dedups by FQN StrId so shared entries are
+# recorded once.
+fun add_union_entry(p: *Project, entries: *intern.StrId, w: u32, cap: u32, id_text: str, entry_id: intern.StrId) Result[u32, str] {
+    val ep_opt: Option[str] = intern.lookup(?p.s.interner, entry_id);
+    if (is_none[str](ep_opt)) { ret err[u32, str]("internal: union artifact entry not interned"); }
+    val fqn_r: Result[intern.StrId, str] = compose_module_fqn(p, id_text, unwrap[str](ep_opt));
+    if (is_err[intern.StrId, str](fqn_r)) { ret err[u32, str](unwrap_err[intern.StrId, str](fqn_r)); }
+    val fqn: intern.StrId = unwrap_ok[intern.StrId, str](fqn_r);
+
+    var i: u32 = 0;
+    for (i < w) {
+        if (entries[i] == fqn) { ret ok[u32, str](w); }
+        i = i + 1;
+    }
+    if (w >= cap) { ret err[u32, str]("internal: union entry count exceeded capacity"); }
+    entries[w] = fqn;
+    ret ok[u32, str](w + 1);
 }
 
 # register_export_names: scan every module for `` `symbol("...")` `` decorators
@@ -830,6 +940,9 @@ pub fun dnit_project(p: *Project) {
     if (p.union_tuples != nil && p.union_tuple_count > 0) {
         deallocate[TargetTuple](p.s.alloc, p.union_tuples, p.union_tuple_count::usize);
     }
+    if (p.union_entries != nil && p.union_entry_count > 0) {
+        deallocate[intern.StrId](p.s.alloc, p.union_entries, p.union_entry_count::usize);
+    }
     map.dnit[intern.StrId, sess.ModuleId](?p.by_fqn);
     deallocate_config(?p.config, p.s.alloc);
 
@@ -844,6 +957,8 @@ fun init_project(p: *Project, s: *sess.Session) {
     p.union              = false;
     p.union_tuples       = nil;
     p.union_tuple_count  = 0;
+    p.union_entries      = nil;
+    p.union_entry_count  = 0;
     p.target.os_id   = os.OS_UNKNOWN;
     p.target.arch_id = isa.ARCH_UNKNOWN;
     p.target.abi_id  = 0;
@@ -944,7 +1059,26 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     if (is_err[manifest.Manifest, str](mr)) { ret err[bool, str](unwrap_err[manifest.Manifest, str](mr)); }
     var m: manifest.Manifest = unwrap_ok[manifest.Manifest, str](mr);
 
-    val ur: Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(p.s.alloc, ?p.s.interner, ?m, @sel);
+    # the primary selection drives the ctx every module resolves under. union mode
+    # (#1505): several declared artifacts with no selector is NOT the ambiguity
+    # `build_project_sel` raises — the union takes the first declared artifact as the
+    # primary (mirroring resolve_native's first-declared-target fallback) and unions
+    # the rest's entries below. a single-artifact or selected build is untouched.
+    var eff_sel: manifest.Selection;
+    eff_sel.target       = sel.target;
+    eff_sel.profile      = sel.profile;
+    eff_sel.artifact     = sel.artifact;
+    eff_sel.want_lib     = sel.want_lib;
+    eff_sel.has_artifact = sel.has_artifact;
+    if (for_union && !eff_sel.has_artifact && m.artifact_count > 1) {
+        val an_opt: Option[str] = intern.lookup(?p.s.interner, m.artifacts[0].name);
+        if (is_none[str](an_opt)) { manifest.dnit(?m, p.s.alloc); ret err[bool, str]("internal: union primary artifact name not interned"); }
+        eff_sel.artifact     = unwrap[str](an_opt);
+        eff_sel.want_lib     = m.artifacts[0].is_lib;
+        eff_sel.has_artifact = true;
+    }
+
+    val ur: Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(p.s.alloc, ?p.s.interner, ?m, eff_sel);
     if (is_err[manifest.BuildUnit, str](ur)) {
         manifest.dnit(?m, p.s.alloc);
         ret err[bool, str](unwrap_err[manifest.BuildUnit, str](ur));
@@ -1025,10 +1159,14 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     if (is_err[bool, str](mc)) { manifest.dnit(?m, p.s.alloc); ret mc; }
 
     # multi-target tooling build (#1391): record every manifest target's tuple so
-    # the union load walk can follow each target's `$if` branches.
+    # the union load walk can follow each target's `$if` branches. multi-artifact
+    # tooling build (#1505): record every artifact's entry FQN so the union loads
+    # the closure over the whole (target × artifact) matrix.
     if (for_union) {
         val ut: Result[bool, str] = populate_union_tuples(p, ?m);
         if (is_err[bool, str](ut)) { manifest.dnit(?m, p.s.alloc); ret ut; }
+        val ue: Result[bool, str] = populate_union_entries(p, ?m);
+        if (is_err[bool, str](ue)) { manifest.dnit(?m, p.s.alloc); ret ue; }
     }
 
     manifest.dnit(?m, p.s.alloc);
@@ -2836,9 +2974,23 @@ fun ut_manifest() str {
     ret "[project]\nid = \"uniontest\"\nname = \"u\"\nversion = \"0.0.0\"\nsrc = \"src\"\ntarget = \"native\"\nout = \"out/{target}/bin/{name}{ext}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\next = \".exe\"\n\n[bin.uniontest]\nentry = \"main.mach\"\n";
 }
 
-# ut_scaffold: materialize a temp project (mach.toml + src/<files>) on disk and
-# return its root path; the caller removes the tree via fs.remove_all.
+# ut_manifest_multi: a two-target, two-bin manifest for the multi-artifact union
+# tests (#1505). bin.alpha is the first declared artifact (the union/sel primary);
+# bin.beta is a second whose entry the union must also load. id is "uniontest" so
+# the per-file `use uniontest.*` paths and FQN assertions match ut_manifest's.
+fun ut_manifest_multi() str {
+    ret "[project]\nid = \"uniontest\"\nname = \"u\"\nversion = \"0.0.0\"\nsrc = \"src\"\ntarget = \"native\"\nout = \"out/{target}/bin/{name}{ext}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\next = \".exe\"\n\n[bin.alpha]\nentry = \"alpha.mach\"\n\n[bin.beta]\nentry = \"beta.mach\"\n";
+}
+
+# ut_scaffold: materialize a temp project (the shared ut_manifest + src/<files>) on
+# disk and return its root path; the caller removes the tree via fs.remove_all.
 fun ut_scaffold(alloc: *Allocator, names: *str, texts: *str, n: u32) Result[str, str] {
+    ret ut_scaffold_m(alloc, ut_manifest(), names, texts, n);
+}
+
+# ut_scaffold_m: ut_scaffold with a caller-supplied mach.toml, so the multi-artifact
+# tests can scaffold a different manifest over the same src-file mechanism.
+fun ut_scaffold_m(alloc: *Allocator, manifest_text: str, names: *str, texts: *str, n: u32) Result[str, str] {
     val tf_r: Result[fs.TempFile, str] = fs.temp_create(alloc, "mach_union_test");
     if (is_err[fs.TempFile, str](tf_r)) { ret err[str, str](unwrap_err[fs.TempFile, str](tf_r)); }
     var tf: fs.TempFile = unwrap_ok[fs.TempFile, str](tf_r);
@@ -2854,8 +3006,7 @@ fun ut_scaffold(alloc: *Allocator, names: *str, texts: *str, n: u32) Result[str,
     if (is_err[bool, str](d2)) { ret err[str, str](unwrap_err[bool, str](d2)); }
 
     val mf: str = ut_cc3(alloc, root, "/", "mach.toml");
-    val mb: str = ut_manifest();
-    val w0: Result[bool, str] = fs.write_file(mf, mb, str_len(mb), 420);
+    val w0: Result[bool, str] = fs.write_file(mf, manifest_text, str_len(manifest_text), 420);
     if (is_err[bool, str](w0)) { ret err[str, str](unwrap_err[bool, str](w0)); }
 
     var i: u32 = 0;
@@ -2872,6 +3023,20 @@ fun ut_scaffold(alloc: *Allocator, names: *str, texts: *str, n: u32) Result[str,
 # the temp tree, and return the Project. the session is the caller's to tear down.
 fun ut_build(s: *sess.Session, alloc: *Allocator, names: *str, texts: *str, n: u32) Result[Project, str] {
     val root_r: Result[str, str] = ut_scaffold(alloc, names, texts, n);
+    if (is_err[str, str](root_r)) { ret err[Project, str](unwrap_err[str, str](root_r)); }
+    val root: str = unwrap_ok[str, str](root_r);
+    val rr: Result[bool, str] = tgt.register_all(?s.registry);
+    if (is_err[bool, str](rr)) { fs.remove_all(alloc, root); ret err[Project, str](unwrap_err[bool, str](rr)); }
+    val pr: Result[Project, str] = build_project_union(s, root);
+    fs.remove_all(alloc, root);
+    ret pr;
+}
+
+# ut_build_multi: ut_build over the two-bin ut_manifest_multi, for the multi-artifact
+# union tests (#1505). scaffolds the src files, builds the union Project, removes the
+# temp tree, and returns it. the session is the caller's to tear down.
+fun ut_build_multi(s: *sess.Session, alloc: *Allocator, names: *str, texts: *str, n: u32) Result[Project, str] {
+    val root_r: Result[str, str] = ut_scaffold_m(alloc, ut_manifest_multi(), names, texts, n);
     if (is_err[str, str](root_r)) { ret err[Project, str](unwrap_err[str, str](root_r)); }
     val root: str = unwrap_ok[str, str](root_r);
     val rr: Result[bool, str] = tgt.register_all(?s.registry);
@@ -3163,6 +3328,98 @@ test "driver union: branch selection via the $project.target.os string tag exerc
     or (cm.target_abi != cb.target_abi)      { bad = 1; }
 
     dnit_project(?p);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver union: every artifact's entry closure is loaded, not just the primary's (#1505)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    var names: [4]str;
+    names[0] = "alpha.mach"; names[1] = "beta.mach"; names[2] = "shared_a.mach"; names[3] = "beta_only.mach";
+    var texts: [4]str;
+    # alpha is the primary (first declared) bin; beta is a second bin. beta_only is
+    # reachable ONLY from beta's entry — a single-artifact build resolving alpha alone
+    # would never see it, so its presence proves the artifact axis is unioned.
+    texts[0] = "use uniontest.shared_a;\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "use uniontest.beta_only;\n\nfun main() i32 { ret 0; }\n";
+    texts[2] = "pub fun sa() i32 { ret 1; }\n";
+    texts[3] = "pub fun bo() i32 { ret 2; }\n";
+
+    val pr: Result[Project, str] = ut_build_multi(?s, ?alloc, ?names[0], ?texts[0], 4);
+    if (is_err[Project, str](pr)) { sess.dnit(?s); ret 1; }
+    var p: Project = unwrap_ok[Project, str](pr);
+
+    # both artifacts' entries and their closures land in one deduplicated Project.
+    var bad: i32 = 0;
+    if (!ut_has(?p, ?s, "uniontest.alpha"))     { bad = 1; }
+    or (!ut_has(?p, ?s, "uniontest.beta"))      { bad = 1; }
+    or (!ut_has(?p, ?s, "uniontest.shared_a"))  { bad = 1; }
+    or (!ut_has(?p, ?s, "uniontest.beta_only")) { bad = 1; }
+
+    dnit_project(?p);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver union: an ambiguous multi-artifact default errors for a single build but loads for the union (#1505)" {
+    # the SAME multi-artifact project, built three ways on one reused session: a
+    # selector-less single build is ambiguous and must error; a --bin alpha build
+    # loads only alpha's closure (never beta_only); the union loads every artifact.
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+    val rr: Result[bool, str] = tgt.register_all(?s.registry);
+    if (is_err[bool, str](rr)) { sess.dnit(?s); ret 1; }
+
+    var names: [4]str;
+    names[0] = "alpha.mach"; names[1] = "beta.mach"; names[2] = "shared_a.mach"; names[3] = "beta_only.mach";
+    var texts: [4]str;
+    texts[0] = "use uniontest.shared_a;\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "use uniontest.beta_only;\n\nfun main() i32 { ret 0; }\n";
+    texts[2] = "pub fun sa() i32 { ret 1; }\n";
+    texts[3] = "pub fun bo() i32 { ret 2; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold_m(?alloc, ut_manifest_multi(), ?names[0], ?texts[0], 4);
+    if (is_err[str, str](root_r)) { sess.dnit(?s); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # 1) no selector: the ambiguity error build_project_sel raises must still fire.
+    var sel_none: manifest.Selection;
+    sel_none.target = ""; sel_none.profile = ""; sel_none.artifact = ""; sel_none.want_lib = false; sel_none.has_artifact = false;
+    val p0r: Result[Project, str] = build_project_sel(?s, root, ?sel_none);
+    if (is_ok[Project, str](p0r)) { var p0: Project = unwrap_ok[Project, str](p0r); dnit_project(?p0); bad = 1; }
+
+    # 2) --bin alpha: the single-selected build loads alpha's closure and NOT beta's.
+    var sel_alpha: manifest.Selection;
+    sel_alpha.target = ""; sel_alpha.profile = ""; sel_alpha.artifact = "alpha"; sel_alpha.want_lib = false; sel_alpha.has_artifact = true;
+    val par: Result[Project, str] = build_project_sel(?s, root, ?sel_alpha);
+    if (is_err[Project, str](par)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var pa: Project = unwrap_ok[Project, str](par);
+    if (!ut_has(?pa, ?s, "uniontest.alpha"))    { bad = 1; }
+    or (!ut_has(?pa, ?s, "uniontest.shared_a")) { bad = 1; }
+    or (ut_has(?pa, ?s, "uniontest.beta"))      { bad = 1; }
+    or (ut_has(?pa, ?s, "uniontest.beta_only")) { bad = 1; }
+    dnit_project(?pa);
+
+    # 3) the union loads every artifact, including the beta-only module.
+    val pur: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](pur)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var pu: Project = unwrap_ok[Project, str](pur);
+    if (!ut_has(?pu, ?s, "uniontest.alpha"))     { bad = 1; }
+    or (!ut_has(?pu, ?s, "uniontest.beta"))      { bad = 1; }
+    or (!ut_has(?pu, ?s, "uniontest.beta_only")) { bad = 1; }
+    dnit_project(?pu);
+
+    fs.remove_all(?alloc, root);
     sess.dnit(?s);
     ret bad;
 }
