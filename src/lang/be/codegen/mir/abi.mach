@@ -204,6 +204,99 @@ fun aggregate_sse_mask(ctx: *lctx.LowerCtx, ty: ir_type.IrTypeId) u8 {
     ret mask;
 }
 
+# hfa_walk: recursively test whether `ty` is a homogeneous floating-point aggregate
+# and, if so, report its fundamental member width (`out_elem`) and flattened member
+# count (`out_count`). a float leaf is one member of its own width; a struct flattens
+# its fields (all of which must share the same fundamental width); an array multiplies
+# its element's member count by the length; a union takes the widest member's count
+# (its members overlap). any non-FP leaf, an empty aggregate, or a mix of fundamental
+# widths makes the whole aggregate non-homogeneous (returns false, out params unset).
+# member counting is by recursion, never `size / width`, so an explicit `align(...)`
+# that pads the aggregate's size never inflates the count.
+fun hfa_walk(ctx: *lctx.LowerCtx, ty: ir_type.IrTypeId, out_elem: *u32, out_count: *u32) bool {
+    val it: Option[*ir_type.IrType] = ir_type.get(ctx.types, ty);
+    if (!is_some[*ir_type.IrType](it)) { ret false; }
+    val t: *ir_type.IrType = unwrap[*ir_type.IrType](it);
+
+    if (t.kind == ir_type.IRT_FLOAT) {
+        @out_elem  = ir_type.byte_size(ctx.types, ty, ctx.tgt);
+        @out_count = 1;
+        ret true;
+    }
+    if (t.kind == ir_type.IRT_ARRAY) {
+        var ee: u32 = 0;
+        var ec: u32 = 0;
+        if (!hfa_walk(ctx, t.data.array_.element, ?ee, ?ec)) { ret false; }
+        @out_elem  = ee;
+        @out_count = ec * ir_type.array_count(ctx.types, ty);
+        ret true;
+    }
+    if (t.kind == ir_type.IRT_STRUCT) {
+        var elem:  u32 = 0;
+        var total: u32 = 0;
+        var i:     u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            var fe: u32 = 0;
+            var fc: u32 = 0;
+            if (!hfa_walk(ctx, t.data.struct_.fields[i], ?fe, ?fc)) { ret false; }
+            if (elem == 0) { elem = fe; } or (elem != fe) { ret false; }
+            total = total + fc;
+            i = i + 1;
+        }
+        if (total == 0) { ret false; }
+        @out_elem  = elem;
+        @out_count = total;
+        ret true;
+    }
+    if (t.kind == ir_type.IRT_UNION) {
+        var elem: u32 = 0;
+        var maxc: u32 = 0;
+        var i:    u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            var me: u32 = 0;
+            var mc: u32 = 0;
+            if (!hfa_walk(ctx, t.data.struct_.fields[i], ?me, ?mc)) { ret false; }
+            if (elem == 0) { elem = me; } or (elem != me) { ret false; }
+            if (mc > maxc) { maxc = mc; }
+            i = i + 1;
+        }
+        if (elem == 0) { ret false; }
+        @out_elem  = elem;
+        @out_count = maxc;
+        ret true;
+    }
+    ret false;
+}
+
+# hfa_info: the AAPCS64 HFA descriptor for a type — its member count (1–4) in
+# `out_members` and fundamental member width in `out_elem` — or (0, 0) when `ty` is
+# not a Homogeneous Floating-point Aggregate: a non-aggregate, a heterogeneous or
+# over-4-member aggregate, or one whose fundamental width is not a width mach's FP
+# types expose. computed once per value by the backend and threaded to the ABI
+# classifier; only the AAPCS64 classifier acts on it (the AMD64 conventions ignore
+# it, as they do the SSE-eightbyte mask).
+fun hfa_info(ctx: *lctx.LowerCtx, ty: ir_type.IrTypeId, out_members: *u8, out_elem: *u8) {
+    @out_members = 0;
+    @out_elem    = 0;
+    if (!lctx.value_is_aggregate(ctx, ty)) { ret; }
+    var elem:  u32 = 0;
+    var count: u32 = 0;
+    if (!hfa_walk(ctx, ty, ?elem, ?count)) { ret; }
+    if (count < 1 || count > 4) { ret; }
+    # mach exposes only f32 / f64 fundamentals, so an HFA member is 4 or 8 bytes —
+    # the widths the scalar-FP move encoders are sized for.
+    if (elem != 4 && elem != 8) { ret; }
+    @out_members = count::u8;
+    @out_elem    = elem::u8;
+}
+
+# hfa_member_reg: the physical V register for member `i` of a CLASS_HFA run — the
+# i-th register above the run's base (`slot.reg`). used to place each HFA member into
+# its consecutive argument / return register.
+fun hfa_member_reg(base_reg: i32, i: u32) i32 {
+    ret isa.regid_make(isa.REG_CLASS_ID_XMM, isa.regid_index(base_reg) + i::i32);
+}
+
 # advance_one_cursor: advance the GP or FP argument-register cursor for one assigned
 # register, dispatching on the register's bank (the composite id encodes it). a
 # negative id (no register) advances neither. so a register aggregate's GP and SSE
@@ -220,8 +313,13 @@ fun advance_one_cursor(reg: i32, gp_used: *i32, fp_used: *i32) {
 # advance_arg_cursors: advance the GP / FP cursors for a register-passed slot by the
 # bank of each register it occupies (`reg` and, for a two-register aggregate, `reg2`),
 # so a scalar, a by-reference pointer, and a mixed GP/SSE aggregate each consume the
-# correct registers. stack slots carry no register and advance neither.
+# correct registers. a CLASS_HFA run consumes `reg_count` consecutive V registers from
+# the FP bank. stack slots carry no register and advance neither.
 fun advance_arg_cursors(slot: *abi.ParamSlot, gp_used: *i32, fp_used: *i32) {
+    if (slot.class == abi.CLASS_HFA) {
+        @fp_used = @fp_used + slot.reg_count::i32;
+        ret;
+    }
     advance_one_cursor(slot.reg, gp_used, fp_used);
     advance_one_cursor(slot.reg2, gp_used, fp_used);
 }
@@ -328,7 +426,10 @@ pub fun classify_signature(ctx: *lctx.LowerCtx, sig: ir_type.IrTypeId, ret_ty: i
     val ret_float: bool = lctx.value_is_float(ctx, ret_ty);
     val ret_aggr:  bool = lctx.value_is_aggregate(ctx, ret_ty);
     val ret_eb:    u8   = aggregate_sse_mask(ctx, ret_ty);
-    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr);
+    var ret_hm:    u8   = 0;
+    var ret_he:    u8   = 0;
+    hfa_info(ctx, ret_ty, ?ret_hm, ?ret_he);
+    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_hm, ret_he);
 
     var gp_used:   i32 = 0;
     var fp_used:   i32 = 0;
@@ -380,7 +481,10 @@ pub fun classify_signature(ctx: *lctx.LowerCtx, sig: ir_type.IrTypeId, ret_ty: i
         val pfl:  bool = lctx.value_is_float(ctx, pty);
         val pag:  bool = lctx.value_is_aggregate(ctx, pty);
         val peb:  u8   = aggregate_sse_mask(ctx, pty);
-        var slot: abi.ParamSlot = classify_arg(pi::i32, psz, pal, pfl, peb, pag, gp_used, fp_used);
+        var phm:  u8   = 0;
+        var phe:  u8   = 0;
+        hfa_info(ctx, pty, ?phm, ?phe);
+        var slot: abi.ParamSlot = classify_arg(pi::i32, psz, pal, pfl, peb, pag, gp_used, fp_used, phm, phe);
 
         # record the real outgoing stack offset on the slot (the ABI classifier
         # returns a sizing-only slot with offset 0); the param / call lowering
@@ -525,11 +629,12 @@ pub fun lower_call(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruct
             val aal:  u64  = ir_type.byte_align(ctx.types, av.ty, ctx.tgt)::u64;
             val afl:  bool = lctx.value_is_float(ctx, av.ty);
             val aag:  bool = lctx.value_is_aggregate(ctx, av.ty);
-            # a variadic tail aggregate is classified as integer eightbytes (mask 0):
-            # the va_arg read path walks the GP register-save / overflow areas, so the
-            # caller and callee stay consistent. SSE-eightbyte aggregate passing is for
-            # fixed parameters and returns (the C-FFI boundary), not the varargs tail.
-            slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, gp_used, fp_used);
+            # a variadic tail aggregate is classified as integer eightbytes (mask 0)
+            # and never as an HFA (members 0): the va_arg read path walks the GP
+            # register-save / overflow areas, so the caller and callee stay consistent.
+            # SSE-eightbyte and HFA V-register passing are for fixed parameters and
+            # returns (the C-FFI boundary), not the varargs tail.
+            slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, gp_used, fp_used, 0, 0);
             # round a stack-passed tail argument up to its slot alignment before
             # placing it (identity on x86; honors a 16-aligned AAPCS64 by-value arg).
             if (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
@@ -687,9 +792,25 @@ fun lower_value_addr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, v: value.Value) Res
 # exhausted-slot case) stores only that pointer value, the stack analog of BYREF.
 # `lctx.addr_to_vreg` normalizes a global's symbol address into a value vreg so the
 # two-register / by-reference forms index a register pointer base. a scalar argop
-# is the value itself, placed directly.
+# is the value itself, placed directly. a CLASS_HFA argument loads each member from
+# `[base + i*reg_width]` into its consecutive V argument register (AAPCS64 HFA/HVA).
 fun emit_arg_slot(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, argop: mir.MirOperand,
                   stack_off: i64, is_aggr: bool, size: u64) Result[bool, str] {
+    if (slot.class == abi.CLASS_HFA) {
+        # an HFA argument flows by address; load each member into its V register.
+        var base: u32 = mir.MIR_VREG_NIL;
+        val ar: Result[bool, str] = lctx.addr_to_vreg(ctx, mb, argop, ?base);
+        if (is_err[bool, str](ar)) { ret ar; }
+        var i: u32 = 0;
+        for (i < slot.reg_count::u32) {
+            val off: i64 = (i * slot.reg_width::u32)::i64;
+            val mr: Result[bool, str] = lctx.emit_fmov(ctx, mb,
+                mir.op_preg(hfa_member_reg(slot.reg, i)::u32), mir.op_mem_value(base, off), slot.reg_width);
+            if (is_err[bool, str](mr)) { ret mr; }
+            i = i + 1;
+        }
+        ret ok[bool, str](true);
+    }
     if (slot.class == abi.CLASS_STACK_BYREF) {
         # win64 by-reference overflow: store the hidden aggregate pointer into the
         # outgoing stack slot, not a by-value copy of the aggregate bytes.
@@ -778,11 +899,25 @@ fun record_outgoing_size(ctx: *lctx.LowerCtx, bytes: i64) {
 
 # emit_ret_slot_to_vreg: move a call's return value out of its canonical return
 # register(s) into the result vreg. for an aggregate return `dst` is the caller-
-# owned result storage pointer (see `lctx.alloc_result_storage`): a 9–16 byte RAX:RDX
-# pair stores each half into `[dst+0]` / `[dst+8]`, and a ≤8 byte single-register
-# aggregate stores RAX into `[dst+0]` so `dst` stays the storage pointer downstream
-# consumers read by. a scalar return is a plain move into the value vreg `dst`.
+# owned result storage pointer (see `lctx.alloc_result_storage`): an HFA stores each
+# V member into `[dst + i*reg_width]`, a 9–16 byte RAX:RDX pair stores each half into
+# `[dst+0]` / `[dst+8]`, and a ≤8 byte single-register aggregate stores RAX into
+# `[dst+0]` so `dst` stays the storage pointer downstream consumers read by. a scalar
+# return is a plain move into the value vreg `dst`.
 fun emit_ret_slot_to_vreg(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, dst: u32, is_aggr: bool) Result[bool, str] {
+    if (slot.class == abi.CLASS_HFA) {
+        # an HFA return arrives in V0..V(reg_count-1); store each member into the
+        # caller-owned result storage so `dst` stays the storage pointer.
+        var i: u32 = 0;
+        for (i < slot.reg_count::u32) {
+            val off: i64 = (i * slot.reg_width::u32)::i64;
+            val st: Result[bool, str] = lctx.emit_store_to_w(ctx, mb,
+                mir.op_mem_value(dst, off), mir.op_preg(hfa_member_reg(slot.reg, i)::u32), slot.reg_width);
+            if (is_err[bool, str](st)) { ret st; }
+            i = i + 1;
+        }
+        ret ok[bool, str](true);
+    }
     if (slot.reg2 >= 0) {
         val lo: Result[bool, str] = lctx.emit_store_to(ctx, mb, mir.op_mem_value(dst, 0), mir.op_preg(slot.reg::u32));
         if (is_err[bool, str](lo)) { ret lo; }
@@ -866,15 +1001,33 @@ pub fun lower_params(ctx: *lctx.LowerCtx, mb: *mir.MirBlock) Result[bool, str] {
 # is the caller's by-value copy at `[rbp + 16 + stack_off]`, whose address is LEA'd
 # into `pv`; a STACK_BYREF aggregate is the caller's spilled hidden pointer at that
 # slot, LOADED into `pv` (the stack analog of BYREF). a scalar parameter moves its
-# single register / stack word into the parameter value vreg `pv`. `stack_off` is
-# the callee-tracked running offset (the ABI classifier returns a sizing-only slot
-# — see `lower_params`).
+# single register / stack word into the parameter value vreg `pv`. an HFA parameter
+# arrives in V[reg]..V[reg+reg_count-1]; each member is stored into a fresh spill
+# slot keyed on `pv` so `pv` names that storage like the register-aggregate forms.
+# `stack_off` is the callee-tracked running offset (the ABI classifier returns a
+# sizing-only slot — see `lower_params`).
 fun emit_param_slot(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, pv: u32, size: u64,
                     stack_off: i64, is_aggr: bool) Result[bool, str] {
     # incoming stack parameters are addressed off the ISA's frame pointer at the
     # arch's incoming-argument base (`[fp + incoming_arg_base + off]`), both named
     # through the ISA vtable rather than bare literals.
     val arg_base: i64 = ctx.tgt.arch.incoming_arg_base;
+    if (slot.class == abi.CLASS_HFA) {
+        # spill each incoming V member into a slot keyed on `pv` so `pv` is the
+        # aggregate's storage pointer for downstream uses (the FP twin of the
+        # register-aggregate spill).
+        val sr: Result[bool, str] = lctx.add_spill_slot(ctx, pv, size);
+        if (is_err[bool, str](sr)) { ret sr; }
+        var i: u32 = 0;
+        for (i < slot.reg_count::u32) {
+            val off: i64 = (i * slot.reg_width::u32)::i64;
+            val st: Result[bool, str] = lctx.emit_store_to_w(ctx, mb,
+                mir.op_mem_slot(pv, off), mir.op_preg(hfa_member_reg(slot.reg, i)::u32), slot.reg_width);
+            if (is_err[bool, str](st)) { ret st; }
+            i = i + 1;
+        }
+        ret ok[bool, str](true);
+    }
     if (slot.class == abi.CLASS_STACK_BYREF) {
         # win64 by-reference overflow: the caller stored the hidden aggregate
         # pointer into this stack slot; load it so `pv` is the aggregate's address,
@@ -961,6 +1114,20 @@ pub fun lower_ret(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
         if (is_err[bool, str](cr)) { ret cr; }
         val mr: Result[bool, str] = lctx.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(ctx.sret_vreg));
         if (is_err[bool, str](mr)) { ret mr; }
+    } or (slot.class == abi.CLASS_HFA) {
+        # HFA return: the aggregate flows by address; load each member from its
+        # storage into the consecutive V return register (V0..V(reg_count-1)).
+        var base: u32 = mir.MIR_VREG_NIL;
+        val ar: Result[bool, str] = lctx.addr_to_vreg(ctx, mb, rvop, ?base);
+        if (is_err[bool, str](ar)) { ret ar; }
+        var i: u32 = 0;
+        for (i < slot.reg_count::u32) {
+            val off: i64 = (i * slot.reg_width::u32)::i64;
+            val mr: Result[bool, str] = lctx.emit_fmov(ctx, mb,
+                mir.op_preg(hfa_member_reg(slot.reg, i)::u32), mir.op_mem_value(base, off), slot.reg_width);
+            if (is_err[bool, str](mr)) { ret mr; }
+            i = i + 1;
+        }
     } or (slot.reg2 >= 0 && rag) {
         # 9–16 byte aggregate: load each half from the aggregate's storage (a
         # value-pointer base), materializing a global's symbol address first.

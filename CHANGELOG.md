@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-06-19
+
+Minor — correctness and cross-arch coverage, hardening the compiler ahead of a manual
+audit. This release changes how the compiler emits float comparisons (#1446), so it
+**re-seeds** the self-host baseline: it is intentionally *not* byte-reproducible from the
+2.1.0 seed (stage1≠stage2 by design) but converges to a byte-identical fixpoint
+(stage2==stage3) on both x86_64 and aarch64.
+
+### Added
+
+- target/aarch64: AAPCS64 **HFA/HVA** classification — a homogeneous floating-point
+  aggregate (1–4 members of the same FP type, counted recursively, including >16 bytes)
+  is passed and returned in consecutive SIMD/FP registers (V0–V7), with all-or-memory
+  spill when the run doesn't fit. Completes the aarch64 by-value float-aggregate ABI;
+  x86_64 SysV and win64 emission are unchanged (#1174).
+
+### Fixed
+
+- codegen/x86_64: floating-point comparisons now follow **IEEE-754** for NaN, matching
+  aarch64 — an unordered (NaN) operand yields false for `<`, `<=`, `>`, `>=`, `==` and
+  true for `!=` (`<`/`<=` via operand-reversed `SETA`/`SETAE`; `==` as `SETE ∧ SETNP`;
+  `!=` as `SETNE ∨ SETP`). Cross-arch NaN comparisons now agree (#1446).
+- comptime: `$each f in $fields(T)` over a **generic** type parameter no longer errors at
+  template sema — it defers to monomorphization (mirroring variadic packs), so reusable
+  generic derive helpers (`debug[T]`, `equals[T]`, …) compile. A non-record instantiation
+  is diagnosed at instantiation (#1523).
+- ci/aarch64: the `Test corpus under qemu-aarch64` step is un-gated — `ut_manifest`
+  gained the `[target.linux-arm64]` stanza so `target = "native"` resolves to the aarch64
+  host under qemu (#1391) — and the Integration lane installs `qemu-user-static`, so the
+  aarch64 integration suites (HFA register placement, `aarch64run`) **execute** under
+  emulation in CI instead of skipping (#1464).
+
 ## [2.1.0] - 2026-06-19
 
 Minor — comptime type-directed-dispatch ergonomics and multi-artifact tooling
@@ -161,9 +193,9 @@ under qemu exactly as it does natively on x86_64.
   a qemu-aarch64 smoke-test that proves the cross-built aarch64 `mach` can both
   build and run a real project under emulation before it ships — mirroring the
   windows/wine compiler smoke. CI's aarch64 lane cross-builds mach to aarch64 and
-  byte-verifies the emitted encodings; the runtime is exercised by that qemu smoke
-  and the aarch64 self-host fixpoint, with the in-source test corpus run under
-  qemu-user-static gated pending #1464.
+  byte-verifies the emitted encodings; the runtime is exercised by that qemu smoke,
+  the aarch64 self-host fixpoint, and the in-source test corpus run under qemu-aarch64
+  (#1464).
 
 ### Fixed
 
