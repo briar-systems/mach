@@ -7,23 +7,21 @@ alignment, section placement, inlining, or PE import routing.
 Decorators are **codegen-only**. Visibility (`pub` / `ext`) is separate and
 unaffected by decorators.
 
-## Surfaces
+## Surface
 
-A decorator is written in either of two interchangeable surfaces:
+A decorator is written as an attribute:
 
 ```
-#[name]            # attribute form — preferred going forward
-`name`             # backtick form — original, still accepted
+#[name]            # bare flag (e.g. inline)
+#[name(args)]      # directive with comptime-expr arguments
 ```
 
-Both surfaces parse into the **same** decorator and feed the same sema and
-codegen path; only the delimiters differ. New code should prefer `#[...]`; the
-backtick form remains accepted this phase (the compiler's own source still uses
-it until the migration completes), and the two may be mixed freely. The
-examples below use the preferred `#[...]` form.
+> A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
+> v2.4.0; a backtick at decorator position is now a migration error. `#[...]` is
+> the only decorator surface.
 
 > One caveat the attribute form introduces: a line comment that begins `#[`
-> (with no space) now opens an attribute. Write such a comment with a separating
+> (with no space) opens an attribute. Write such a comment with a separating
 > space — `# [...]`.
 
 ## Grammar
@@ -51,8 +49,7 @@ pub var g_lit64: u8 = 7;
 
 Each directive is wrapped in its own clause: `#[name]` for a bare flag or
 `#[name(args)]` for a directive that takes arguments. Arguments are comptime
-expressions. The backtick form is the same with `` ` `` delimiters: `` `name` ``
-or `` `name(args)` ``.
+expressions.
 
 ## Directives
 

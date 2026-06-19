@@ -42,7 +42,7 @@ follow the docstring, immediately above the decl:
 # panic: terminate the program with a message.
 # ---
 # msg: text to emit before terminating
-`symbol("panic")`
+#[symbol("panic")]
 pub fun panic(msg: *u8) { ... }
 ```
 

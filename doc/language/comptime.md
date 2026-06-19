@@ -15,7 +15,7 @@ this channel.
 | `$if`, `$or` | Comptime control flow | structural |
 
 > Per-declaration codegen attributes (symbol rename, library pin, inline,
-> align, section) are written as **backtick decorators**, not `$`-comptime
+> align, section) are written as **`#[...]` decorators**, not `$`-comptime
 > shapes — see [decorators.md](decorators.md). The legacy `$sym.attr = value`
 > attribute setters were removed in v2.0.0.
 
@@ -72,14 +72,14 @@ than each carrying their own.
 - No reflection-via-`$<Type>.*` subtree. Types are not first-class
   comptime values.
 - No decl-attached prefix sugar (`$inline pub fun ...` does not exist) —
-  use backtick decorators (see [decorators.md](decorators.md)).
+  use `#[...]` decorators (see [decorators.md](decorators.md)).
 - No comptime function definitions, no comptime loops.
 - No bare `$ident` — see above.
 
 ## See also
 
 - [comptime-mach.md](comptime-mach.md) — the `$mach.*` namespace
-- [decorators.md](decorators.md) — backtick codegen decorators
+- [decorators.md](decorators.md) — `#[...]` codegen decorators
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`,
   `$assert`, …
 - [comptime-control.md](comptime-control.md) — `$if` / `$or`

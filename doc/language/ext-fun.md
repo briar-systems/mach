@@ -29,7 +29,7 @@ By default the linker symbol matches the Mach name. Override it with the
 `symbol` decorator:
 
 ```mach
-`symbol("write")`
+#[symbol("write")]
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
@@ -46,7 +46,7 @@ PE (Windows) import directory — the `library` decorator pins an `ext` import t
 the DLL that exports it:
 
 ```mach
-`library("ws2_32.dll")`
+#[library("ws2_32.dll")]
 ext fun WSAStartup(ver: u16, data: *u8) i32;
 ```
 
@@ -68,7 +68,7 @@ under the renamed symbol within the named library.
 
 ```mach
 # imported as `socket` from ws2_32.dll, called as `ws2_socket` in Mach.
-`library("ws2_32.dll")` `symbol("socket")`
+#[library("ws2_32.dll")] #[symbol("socket")]
 ext fun ws2_socket(af: i32, kind: i32, proto: i32) i64;
 ```
 
