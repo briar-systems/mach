@@ -350,15 +350,16 @@ comptime-if-decl ::= "$" "if" "(" expr ")" decl-branch-body
 
 decl-branch-body ::= "{" { decl } "}"
 
-comptime-directive ::= expr-no-assign [ "=" expr ] ";"
+comptime-directive ::= expr-no-assign ";"
 ```
 
-- `comptime-directive` covers both an **attribute write**
-  (`$sym.attr = value;`) and a bare **comptime intrinsic / directive call**
-  (`$error("msg");`, `$assert(cond, "msg");`). When the `= value` part is
-  absent it is a directive; when present it is an attribute write. The
-  target is parsed at a binding power above assignment so the `=` is not
-  swallowed into the expression.
+- `comptime-directive` is a bare **comptime intrinsic / directive call**
+  (`$error("msg");`). The legacy attribute-write setter (`$sym.attr = value;`)
+  was removed in v1.7.1 — per-declaration codegen attributes are written as
+  backtick decorators now (see [decorators.md](decorators.md)) — so a stray `=`
+  after the target is a parse error. The target is parsed at a binding power
+  above assignment so that `=` is detected rather than swallowed into the
+  expression.
 - `expr-no-assign` is `expr` parsed with the assignment operator excluded
   at the top level (binding power >= 2; see [Expressions](#expressions)). It
   still begins with the leading `$` because the first prefix atom is a
@@ -637,7 +638,7 @@ stubs).
 comptime-ident ::= "$" IDENT                       (* $size_of, $mach, $type_of, ... *)
 
 intrinsic-call ::= comptime-ident call-args         (* $size_of(T), $fields(T), $type_of(e) *)
-mach-read      ::= comptime-ident { member }        (* $mach.target.os, $mach.arch.x86_64 *)
+mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arch.x86_64 *)
 ```
 
 - Intrinsic calls (`$size_of(T)`, `$align_of(T)`, `$offset_of(T, field)`,
@@ -649,8 +650,8 @@ mach-read      ::= comptime-ident { member }        (* $mach.target.os, $mach.ar
   expression and produces a comptime type value.
 - `$mach.*` reads are a `comptime-ident` followed by a `.`-member chain. They
   appear in `$if` conditions and as comptime initializers.
-- An **attribute write** `$sym.attr = value;` and a bare **directive**
-  `$intrinsic(args);` are the `comptime-directive` declaration form above.
+- A bare **directive** `$intrinsic(args);` (e.g. `$error("msg");`) is the
+  `comptime-directive` declaration form above.
 
 The `$mach.*` tag/path set is closed and documented in
 [comptime-mach.md](comptime-mach.md); this grammar treats every `$ident`

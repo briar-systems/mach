@@ -10,18 +10,20 @@ uses one of the shapes on this channel.
 
 | Shape | Meaning | Direction |
 |---|---|---|
-| `$mach.*` / `$project.*` / `$target.*` / `$bin.*` | Rooted compiler-owned read | compiler → developer |
-| `$sym.attr = value` / `$sym.attr` | Attribute on declared symbol | bidirectional |
+| `$mach.*` / `$project.*` / `$bin.*` | Rooted compiler-owned read | compiler → developer |
 | `$sym(args)` | Comptime function call (intrinsic) | call |
 | `$if`, `$or` | Comptime control flow | structural |
+
+> Per-declaration codegen attributes (symbol rename, library pin, inline,
+> align, section) are written as **backtick decorators**, not `$`-comptime
+> shapes — see [decorators.md](decorators.md). The legacy `$sym.attr = value`
+> attribute setters were removed in v1.7.1.
 
 The parser distinguishes these by structure:
 
 - `$<root>.<path>`, where `<root>` is one of the reserved roots `mach`,
-  `project`, `target`, `bin` — a read into a compiler-owned tree. The roots
-  are reserved at the top of `$`; user symbols cannot collide with them.
-- `$ident.attr = ...` — write to an attribute slot on `ident`, which must
-  be a symbol declared in this module.
+  `project`, `bin` — a read into a compiler-owned tree. The roots are reserved
+  at the top of `$`; user symbols cannot collide with them.
 - `$ident(args)` — comptime call; the closed compiler-intrinsic set lives
   here.
 - `$if` / `$or` — comptime branches, structurally distinct from runtime
@@ -31,22 +33,25 @@ The parser distinguishes these by structure:
 
 | Root | Reads | Source |
 |---|---|---|
-| `$mach.*` | target/os/arch tags, pointer width, compiler identity | active target + compiler |
+| `$mach.*` | resolved build os/arch/abi/mode tags, pointer width, compiler identity | active build + compiler |
 | `$project.{id,version,name,description}` | project metadata | `[project]` in `mach.toml` |
-| `$target.{os,isa,abi}` | the selected target's declared tuple, as strings | the selected `mach.toml` target |
+| `$project.version.{major,minor,patch}` | structured version components | `[project].version` |
+| `$project.target.{os,arch,abi}` | the selected target's declared tuple, as strings | the selected `mach.toml` target |
 | `$bin.name` | the artifact being built | the selected build unit (`[bin.*]` / `[lib.*]`) |
 
-`$target.*` carries the manifest's declared **string** spellings (`"linux"`,
-`"x86_64"`, `"sysv64"`), distinct from `$mach.target.*`'s numeric tags used for
-`$mach.os.*` comparison — both keep working. A root field the manifest does not
-declare (`$project.description` on a v1 manifest, `$bin.name` on a v1 manifest
-with no artifact stanza) reports the read as unavailable rather than folding to
-an empty string. See [comptime-mach.md](comptime-mach.md) for the `$mach.*`
-subtree.
+`$project.target.*` carries the manifest's declared **string** spellings
+(`"linux"`, `"x86_64"`, `"sysv64"`), distinct from `$mach.build.*`'s numeric tags
+used for `$mach.{os,arch,abi}.*` comparison. Flat `$project.version` is the whole
+version **string** (`"1.7.1"`); the structured `$project.version.{major,minor,
+patch}` folds its integer components — both are available. A root field the
+manifest does not declare (`$project.description` on a v1 manifest, `$bin.name`
+on a v1 manifest with no artifact stanza) reports the read as unavailable rather
+than folding to an empty string. See [comptime-mach.md](comptime-mach.md) for the
+`$mach.*` subtree.
 
 ```mach
-val ver: str = $project.version;            # "1.3.0", from [project].version
-$if ($target.os == "windows") { ... }       # the declared os string
+val ver: str = $project.version;                 # "1.7.1", from [project].version
+$if ($project.target.os == "windows") { ... }    # the declared os string
 ```
 
 ## The bare `$ident` is rejected
@@ -55,7 +60,7 @@ A standalone bare `$ident` — `$mode`, `$foo` — is **none** of the shapes abo
 and is rejected with one teaching diagnostic, owned by the comptime evaluator:
 
 > comptime parameters are referenced without `$`; comptime paths are rooted:
-> `` $mach ``, `` $project ``, `` $target ``, `` $bin ``
+> `` $mach ``, `` $project ``, `` $bin ``
 
 A comptime **parameter** is referenced by its bare name (no `$`); every comptime
 **path** is rooted. The rule applies identically in a `$if` gate and in value

@@ -38,10 +38,10 @@ range is a compile error rather than a silent wrap.
 ### Target-conditional code
 
 ```mach
-$if ($mach.target.os == $mach.os.linux) {
+$if ($mach.build.os == $mach.os.linux) {
     use full.os.linux;
 }
-$or ($mach.target.os == $mach.os.windows) {
+$or ($mach.build.os == $mach.os.windows) {
     use full.os.windows;
 }
 $or {
@@ -106,7 +106,7 @@ Rules:
 pub fun load($order: Order, ptr: *i64) i64 {
     var result: i64 = 0;
 
-    $if ($mach.target.arch == $mach.arch.aarch64) {
+    $if ($mach.build.arch == $mach.arch.aarch64) {
         $if (order == RELAXED) {
             asm aarch64 { ldr {result}, [{ptr}] }
         }
