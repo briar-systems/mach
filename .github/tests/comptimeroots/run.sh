@@ -18,7 +18,7 @@ set -euo pipefail
 
 # the exact teaching diagnostic comptime.eval emits for a bare `$ident`
 # (comptime.COMPTIME_BARE_IDENT_MSG); both rejection apps must surface it verbatim.
-BARE_IDENT_DIAG='comptime parameters are referenced without `$`; comptime paths are rooted: `$mach`, `$project`, `$target`, `$bin`'
+BARE_IDENT_DIAG='comptime parameters are referenced without `$`; comptime paths are rooted: `$mach`, `$project`, `$bin`'
 
 MACH="${1:-mach}"
 # absolutize a path argument: the suite cds into temp dirs, so a relative
