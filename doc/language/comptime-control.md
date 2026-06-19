@@ -133,6 +133,12 @@ type checking run over **all** arms structurally, and only the selected arm is
 emitted into each instance. Each arm must therefore be independently
 resolvable and type-checkable.
 
+A `$if` gated on a `$type_of` type comparison is *not* such an exception: at
+monomorphization the operand's concrete type is known, so the provably-dead arms
+are **pruned** and only the selected arm is type-checked (and emitted). Each arm
+may therefore use its value at its own concrete type with no per-arm cast — see
+[comptime-intrinsics.md](comptime-intrinsics.md).
+
 ## See also
 
 - [comptime-mach.md](comptime-mach.md) — `$mach.*` for target reads
