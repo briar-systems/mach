@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # dlllibdec integration test (#1476): the decorator-spelled twin of dlllib —
-# prove `library(...)` / `symbol(...)` backtick decorators drive per-symbol
+# prove `#[library(...)]` / `#[symbol(...)]` decorators drive per-symbol
 # windows DLL attribution identically to the legacy `$<sym>.library` /
 # `$<sym>.symbol` setters. the acceptance-criteria case: a windows extern with
-# `` `library("ws2_32.dll")` `` + `` `symbol("...")` `` importing correctly.
+# `#[library("ws2_32.dll")]` + `#[symbol("...")]` importing correctly.
 #
 # builds the windows binary, reads its PE import directory, and asserts each
 # renamed symbol lands under the decorator-named DLL (and the mach identifiers do

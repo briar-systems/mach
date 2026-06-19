@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # section decorator COFF integration test (#1491, fast-follow #1476): the
-# windows/COFF twin of sectiondec — prove a `section("...")` decorator places a
+# windows/COFF twin of sectiondec — prove a `#[section("...")]` decorator places a
 # global's symbol and a function's code in the named COFF section, carried into
 # PE/COFF object emission, while an un-decorated global stays in .data.
 #
