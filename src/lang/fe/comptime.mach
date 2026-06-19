@@ -73,6 +73,8 @@ use token:  mach.lang.fe.token;
 use os:     mach.lang.target.os;
 use isa:    mach.lang.target.isa;
 use abi:    mach.lang.target.abi;
+use float:  mach.lang.float;
+use bignum: mach.lang.bignum;
 
 # CTKind: discriminator for CTValue.data.
 pub def CTKind: u8;
@@ -766,13 +768,117 @@ pub fun eval_lit_int(source: str, span: token.Span) Result[CTValue, str] {
 
 # parses a float literal from its source text. supports decimal `digit.digit`
 # form with optional exponent and `f<n>` width suffix; rejects malformed input
+# cmp_ratio_pow2: sign of (num/den - 2^p) — compares the rational num/den to 2^p.
+fun cmp_ratio_pow2(num: *bignum.Big, den: *bignum.Big, p: i64) i64 {
+    var a: bignum.Big;
+    var b: bignum.Big;
+    bignum.copy(?a, num);
+    bignum.copy(?b, den);
+    if (p >= 0) { bignum.shl(?b, p::usize); }
+    or { bignum.shl(?a, (0 - p)::usize); }
+    ret bignum.cmp(?a, ?b);
+}
+
+# decimal_to_f64: nearest f64 bit pattern (sign excluded) to M * 10^D, round-to-
+# nearest-even, via exact bignum arithmetic. M is non-negative. trunc records
+# that nonzero significand digits were dropped past the 768-digit cap (the sticky
+# bit), so an apparent exact midpoint is really above it and rounds up. handles
+# subnormals, overflow (-> inf), and underflow (-> 0).
+fun decimal_to_f64(M: *bignum.Big, D: i64, trunc: bool) u64 {
+    if (bignum.is_zero(M)) { ret 0; }
+
+    # short-circuit clearly out-of-range magnitudes (keeps the bignum bounded).
+    val approx: i64 = D + (bignum.bitlen(M)::i64 * 1233) / 4096;
+    if (approx > 320) { ret 0x7FF0000000000000; }
+    if (approx < -340) { ret 0; }
+
+    # exact rational num/den = M * 10^D.
+    var num: bignum.Big;
+    var den: bignum.Big;
+    bignum.copy(?num, M);
+    bignum.from_u64(?den, 1);
+    if (D >= 0) { bignum.mul_pow10(?num, D::usize); }
+    or { bignum.mul_pow10(?den, (0 - D)::usize); }
+
+    # find e2 with 2^(e2+52) <= value < 2^(e2+53) (53-bit normal mantissa window).
+    var e2: i64 = bignum.bitlen(?num)::i64 - bignum.bitlen(?den)::i64 - 53;
+    var done: bool = false;
+    for (!done) {
+        if (cmp_ratio_pow2(?num, ?den, e2 + 53) >= 0) { e2 = e2 + 1; cnt; }
+        if (cmp_ratio_pow2(?num, ?den, e2 + 52) < 0)  { e2 = e2 - 1; cnt; }
+        done = true;
+    }
+
+    # clamp the mantissa LSB to the subnormal floor (2^-1074) — a single rounding.
+    var lsb: i64 = e2;
+    if (lsb < -1074) { lsb = -1074; }
+
+    # nn/dd = value / 2^lsb.
+    var nn: bignum.Big;
+    var dd: bignum.Big;
+    bignum.copy(?nn, ?num);
+    bignum.copy(?dd, ?den);
+    if (lsb >= 0) { bignum.shl(?dd, lsb::usize); }
+    or { bignum.shl(?nn, (0 - lsb)::usize); }
+
+    # q = floor(nn / dd) via binary long division; remainder left in rem.
+    var q: u64 = 0;
+    var rem: bignum.Big;
+    bignum.copy(?rem, ?nn);
+    var b: i64 = 53;
+    for (b >= 0) {
+        var t: bignum.Big;
+        bignum.copy(?t, ?dd);
+        bignum.shl(?t, b::usize);
+        if (bignum.cmp(?rem, ?t) >= 0) {
+            bignum.sub(?rem, ?t);
+            q = q | (1::u64 << b::usize);
+        }
+        b = b - 1;
+    }
+
+    # round-to-nearest-even using 2*rem vs dd.
+    var rem2: bignum.Big;
+    bignum.copy(?rem2, ?rem);
+    bignum.shl(?rem2, 1);
+    val c: i64 = bignum.cmp(?rem2, ?dd);
+    if (c > 0) { q = q + 1; }
+    or (c == 0) {
+        # M*10^D sits exactly on the midpoint: dropped nonzero digits (trunc)
+        # push the true value above it, so round up instead of to-even.
+        if (trunc) { q = q + 1; }
+        or { if ((q & 1) == 1) { q = q + 1; } }
+    }
+
+    if (lsb == -1074) {
+        # subnormal regime (and the smallest normals): the bit pattern is q itself.
+        ret q;
+    }
+    var biased: i64 = e2 + 1075;
+    if (q == 0x20000000000000) {
+        q = 0x10000000000000;
+        biased = biased + 1;
+    }
+    if (biased >= 2047) { ret 0x7FF0000000000000; }
+    ret (biased::u64 << 52) | (q & 0xFFFFFFFFFFFFF);
+}
+
 pub fun eval_lit_float(source: str, span: token.Span) Result[CTValue, str] {
     val text: StrView = span_text(source, span);
     if (text.len == 0) { ret err[CTValue, str]("empty float literal"); }
 
-    var i: usize = 0;
-    var integer_part: f64 = 0.0;
+    # exact significand M and its decimal exponent: value-so-far = M * 10^dexp.
+    # at most 768 significant digits are kept (well past what f64 rounding can
+    # use); excess digits only set the sticky `trunc` bit.
+    var M: bignum.Big;
+    bignum.from_u64(?M, 0);
+    var dexp:      i64  = 0;
+    var sig:       i64  = 0;
+    var trunc:     bool = false;
     var saw_digit: bool = false;
+    val MAXSIG:    i64  = 768;
+
+    var i: usize = 0;
     for (i < text.len) {
         val c: u8 = text.data[i];
         if (c == '_') { i = i + 1; cnt; }
@@ -780,13 +886,19 @@ pub fun eval_lit_float(source: str, span: token.Span) Result[CTValue, str] {
         if (c == 'e' || c == 'E') { brk; }
         if (c == 'f') { brk; }
         if (c < '0' || c > '9') { ret err[CTValue, str]("invalid character in float literal"); }
-        integer_part = integer_part * 10.0 + (c - '0')::f64;
         saw_digit = true;
+        if (sig < MAXSIG) {
+            bignum.mul_small(?M, 10);
+            bignum.add_small(?M, (c - '0')::u32);
+            if (!bignum.is_zero(?M)) { sig = sig + 1; }
+        }
+        or {
+            dexp = dexp + 1;
+            if (c != '0') { trunc = true; }
+        }
         i = i + 1;
     }
 
-    var fraction: f64 = 0.0;
-    var fdiv:     f64 = 1.0;
     if (i < text.len && text.data[i] == '.') {
         i = i + 1;
         for (i < text.len) {
@@ -795,55 +907,51 @@ pub fun eval_lit_float(source: str, span: token.Span) Result[CTValue, str] {
             if (c == 'e' || c == 'E') { brk; }
             if (c == 'f') { brk; }
             if (c < '0' || c > '9') { ret err[CTValue, str]("invalid character in float literal"); }
-            fraction = fraction * 10.0 + (c - '0')::f64;
-            fdiv = fdiv * 10.0;
             saw_digit = true;
+            if (sig < MAXSIG) {
+                bignum.mul_small(?M, 10);
+                bignum.add_small(?M, (c - '0')::u32);
+                if (!bignum.is_zero(?M)) { sig = sig + 1; }
+                dexp = dexp - 1;
+            }
+            or {
+                if (c != '0') { trunc = true; }
+            }
             i = i + 1;
         }
     }
 
-    var value: f64 = integer_part + fraction / fdiv;
-
+    var exp: i64 = 0;
     if (i < text.len && (text.data[i] == 'e' || text.data[i] == 'E')) {
         i = i + 1;
         var neg: bool = false;
         if (i < text.len && text.data[i] == '-') { neg = true; i = i + 1; }
         or (i < text.len && text.data[i] == '+') { i = i + 1; }
 
-        var exp: i64 = 0;
         var saw_exp_digit: bool = false;
         for (i < text.len) {
             val c: u8 = text.data[i];
             if (c == 'f') { brk; }
+            if (c == '_') { i = i + 1; cnt; }
             if (c < '0' || c > '9') { ret err[CTValue, str]("invalid character in float exponent"); }
-            # f64 saturates to inf/0 long before 10^1000, so clamp the accumulator: a
-            # larger exponent (e.g. 1.0e2000000000) would otherwise overflow i64 —
-            # silently folding to the mantissa — or spin the scale loop for billions of
-            # iterations. any exponent >= ~309 already yields the same saturated result.
-            if (exp < 1000) { exp = exp * 10 + (c - '0')::i64; }
+            # |exp| >= 1e6 always saturates f64 to inf/0 (range ~1e+-308), so clamp
+            # the accumulator: it bounds the bignum and avoids i64 overflow on absurd
+            # exponents while yielding the same saturated result decimal_to_f64 gives.
+            if (exp < 1000000) { exp = exp * 10 + (c - '0')::i64; }
             saw_exp_digit = true;
             i = i + 1;
         }
         if (!saw_exp_digit) { ret err[CTValue, str]("missing digits in float exponent"); }
-
-        var scale: f64 = 1.0;
-        var k: i64 = 0;
-        for (k < exp) {
-            scale = scale * 10.0;
-            k = k + 1;
-        }
-        # a zero mantissa stays zero at any exponent; the guard also avoids
-        # 0.0 * inf = NaN once the clamped exponent drives the scale to inf.
-        if (value != 0.0) {
-            if (neg) { value = value / scale; } or { value = value * scale; }
-        }
+        if (neg) { exp = 0 - exp; }
     }
 
     if (!saw_digit) { ret err[CTValue, str]("float literal has no digits"); }
 
+    val bits: u64 = decimal_to_f64(?M, dexp + exp, trunc);
+
     var v: CTValue;
     v.kind   = CT_KIND_FLOAT;
-    v.data.f = value;
+    v.data.f = float.bits_f64(bits);
     ret ok[CTValue, str](v);
 }
 
@@ -2446,6 +2554,14 @@ fun t_float(s: str) Result[CTValue, str] {
     ret eval_lit_float(s, span);
 }
 
+# helper: folds a float literal and returns its raw f64 bits, or all-ones (a NaN
+# pattern none of the goldens fold to) on error.
+fun t_fbits(s: str) u64 {
+    val r: Result[CTValue, str] = t_float(s);
+    if (is_err[CTValue, str](r)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret float.f64_bits(unwrap_ok[CTValue, str](r).data.f);
+}
+
 test "comptime: eval_lit_char decodes escape sequences and rejects malformed literals (#1242)" {
     # \n escape — mach source "'\n'" contains a literal newline byte passed
     # through as-is; "'\\ n'" (backslash + n in runtime string) tests the escape
@@ -2515,6 +2631,58 @@ test "comptime: an extreme float exponent saturates instead of hanging or silent
     val rz: Result[CTValue, str] = t_float("0.0e2000000000");
     if (is_err[CTValue, str](rz))                          { ret 1; }
     if (unwrap_ok[CTValue, str](rz).data.f != 0.0)         { ret 1; }
+    ret 0;
+}
+
+test "comptime: eval_lit_float is correctly-rounded to exact bits (#1483)" {
+    # headline regression: 1.0e100 folded to 1.0000000000000006e100 (~6 ULP off)
+    # under the old naive *=10 path; it must now be the exact nearest double.
+    if (t_fbits("1.0e100")                  != 0x54B249AD2594C37D) { ret 1; }
+
+    # large magnitudes, both signs of exponent.
+    if (t_fbits("1.0e308")                  != 0x7FE1CCF385EBC8A0) { ret 2; }
+    if (t_fbits("1.0e-308")                 != 0x000730D67819E8D2) { ret 3; }
+    if (t_fbits("1.0e-300")                 != 0x01A56E1FC2F8F359) { ret 4; }
+    if (t_fbits("1.0e23")                   != 0x44B52D02C7E14AF6) { ret 5; }
+    if (t_fbits("9.999999999999999e307")    != 0x7FE1CCF385EBC89F) { ret 6; }
+    if (t_fbits("8.98846567431158e307")     != 0x7FE0000000000000) { ret 7; }
+
+    # IEEE-754 boundary values.
+    if (t_fbits("1.7976931348623157e308")   != 0x7FEFFFFFFFFFFFFF) { ret 8; }  # largest normal
+    if (t_fbits("2.2250738585072014e-308")  != 0x0010000000000000) { ret 9; }  # smallest normal
+    if (t_fbits("2.2250738585072009e-308")  != 0x000FFFFFFFFFFFFF) { ret 10; } # largest subnormal
+    if (t_fbits("5.0e-324")                 != 0x0000000000000001) { ret 11; } # smallest subnormal
+    if (t_fbits("1.0e-323")                 != 0x0000000000000002) { ret 12; }
+    if (t_fbits("7.5e-324")                 != 0x0000000000000002) { ret 13; } # subnormal tie -> even
+
+    # ties-to-even at the 1.0 .. 1+ulp boundary (exact half-way decimals).
+    # exact midpoint 1.0 <-> 1+2^-52 -> ties to even (down) = 1.0
+    if (t_fbits("1.00000000000000011102230246251565404236316680908203125")
+                                            != 0x3FF0000000000000) { ret 14; }
+    # exact midpoint 1+2^-52 <-> 1+2*2^-52 -> ties to even (up) = ...0002
+    if (t_fbits("1.00000000000000033306690738754696212708950042724609375")
+                                            != 0x3FF0000000000002) { ret 15; }
+    # same lower midpoint plus a tiny nonzero tail (past 768 digits would be the
+    # sticky path; here it is within range) -> strictly above midpoint -> rounds up
+    if (t_fbits("1.000000000000000111022302462515654042363166809082031250000001")
+                                            != 0x3FF0000000000001) { ret 16; }
+
+    # overflow to +inf and small exact values.
+    if (t_fbits("1.0e320")                  != 0x7FF0000000000000) { ret 17; }
+    if (t_fbits("0.1")                      != 0x3FB999999999999A) { ret 18; }
+    if (t_fbits("3.141592653589793")        != 0x400921FB54442D18) { ret 19; }
+    if (t_fbits("1.5e2")                    != 0x4062C00000000000) { ret 20; }
+    if (t_fbits("123456789.0")              != 0x419D6F3454000000) { ret 21; }
+    ret 0;
+}
+
+test "comptime: eval_lit_float sticky bit rounds a truncated tie up (#1483)" {
+    # 769 significant digits: an exact midpoint in the first 768, then a nonzero
+    # digit past the cap. without the sticky bit this reads as an exact tie and
+    # rounds to-even (down); the dropped nonzero digit must push it up.
+    # value = 1 + 2^-53 (the 1.0 <-> 1+ulp midpoint), 768 sig digits, +1 ulp tail.
+    if (t_fbits("1.0000000000000001110223024625156540423631668090820312500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001")
+                                            != 0x3FF0000000000001) { ret 1; }
     ret 0;
 }
 
