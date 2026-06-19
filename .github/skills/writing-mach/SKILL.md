@@ -126,7 +126,7 @@ fwd ops.add;
 
 - **Topical split** — forward all impls unconditionally.
 - **Multiplatform split** — pick one impl per target with `$if` on
-  `$mach.target.os` / `$mach.target.arch`, then `use` + `fwd` the chosen one.
+  `$mach.build.os` / `$mach.build.arch`, then `use` + `fwd` the chosen one.
 
 ## Declarations
 
@@ -344,7 +344,7 @@ pub fun spin_hint() { ... }
 A module file opens with a module docstring (full dotted path as `<name>`)
 before any `use`/`fwd`/attribute. Modules may add paragraphs separated by blank
 `#` lines; other declaration kinds do not extend past the component block.
-Attribute writes follow the docstring, immediately above the decl.
+Backtick decorators follow the docstring, immediately above the decl.
 
 ## Comptime channel (`$`) — brief
 

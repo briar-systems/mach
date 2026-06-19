@@ -1,10 +1,10 @@
 # Comptime channel
 
-The `$` prefix opens the **bidirectional channel** between the developer
-and the compiler. Reads observe compiler-provided state; writes annotate
-declarations the developer made. Everything that touches comptime in
-Mach — conditional compilation, attributes, intrinsics, target queries —
-uses one of the shapes on this channel.
+The `$` prefix opens the **comptime channel** — the compiler-owned namespace a
+program reads at compile time. It is read-only: `$` *selects and expands*, it
+never executes or mutates. Everything that touches comptime in Mach —
+conditional compilation, intrinsics, target queries — uses one of the shapes on
+this channel.
 
 ## The shapes
 
@@ -79,7 +79,7 @@ than each carrying their own.
 ## See also
 
 - [comptime-mach.md](comptime-mach.md) — the `$mach.*` namespace
-- [comptime-attrs.md](comptime-attrs.md) — symbol attributes
+- [decorators.md](decorators.md) — backtick codegen decorators
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`,
   `$assert`, …
 - [comptime-control.md](comptime-control.md) — `$if` / `$or`
