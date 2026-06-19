@@ -281,8 +281,7 @@ fun-decl ::= "fun" IDENT [ generic-params ] param-list [ type ] ( block | ";" )
 ```ebnf
 param-list ::= "(" [ params ] ")"
 
-params ::= "..."
-         | typed-name { "," typed-name } [ "," ( "..." | pack-param ) ]
+params ::= typed-name { "," typed-name } [ "," pack-param ]
          | pack-param
 
 pack-param ::= IDENT ":" "..."
@@ -290,11 +289,11 @@ pack-param ::= IDENT ":" "..."
 typed-name ::= [ "$" ] IDENT ":" type
 ```
 
-- A trailing standalone `...` marks the function variadic (C-style; it may
-  appear alone or after the last named parameter). It must be last.
 - A trailing `name: ...` declares a **comptime variadic pack parameter**
-  (`TYPE_KIND_PACK`). The two forms are grammatically distinct: `name: ...`
-  is a pack; bare `...` is the C-style variadic marker. It must be last.
+  (`TYPE_KIND_PACK`); it must be the last parameter. The C-style bare `...`
+  variadic-parameter marker was **removed in v2.0.0** — the parser rejects it
+  with a migration diagnostic pointing to `name: ...`. (A function *pointer
+  type* may still carry `...` for FFI; see `fun-type-params` below.)
 - A leading `$` on a `typed-name` marks it a **comptime value parameter**.
 
 > **Divergence (parser vs. doc).** `typed-name` is shared between function
