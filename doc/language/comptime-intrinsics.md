@@ -44,6 +44,11 @@ A bare type name (e.g. `i64`, `str`, `Point`) is the other valid operand.
 The comparison selects one branch at compile time per monomorphization
 instance — useful for per-element type dispatch inside `$each` bodies.
 
+The provably-dead arms are **pruned** before type-checking, so each arm uses
+`arg` at its own concrete type with no per-arm cast: the `str` arm above is
+never checked against a `u64` element. Only the selected arm is type-checked
+and emitted.
+
 ## Field intrinsic and projection
 
 `$fields(T)` produces a comptime sequence of field descriptors for record or
@@ -156,26 +161,31 @@ See [variadics.md](variadics.md) for the pack form (`$each a in va`).
 
 ## Diagnostic intrinsics
 
-> **Not yet implemented.** `$error` and `$assert` parse as comptime
-> directives but the compiler does not yet evaluate them — a `$error(...)`
-> directive is currently accepted and ignored rather than failing
-> compilation. The shapes below describe the intended behavior.
+`$error("msg")` fails compilation with `msg` when it is **reached** — on a live
+path: an unconditional position, or a `$if` / `$or` arm the compiler selects. A
+`$error` in a discarded (dead) arm never fires, so it is the natural total-
+coverage fallback for a `$type_of` dispatch — the unhandled-type `$or {}` arm
+fails the build at compile time instead of falling through to a runtime error.
 
-Operate at compile time. `$error` fails compilation; `$assert` is sugar
-over `$if` plus `$error`.
-
-```mach
-$error("msg")
-$assert(cond, "msg")    # sugar: $if (!cond) { $error("msg"); }
-```
+`$error` is valid in both declaration and statement scope and takes one
+string-literal message.
 
 ```mach
-$assert($size_of(i64) == 8, "expected 64-bit i64");
+$error("msg")           # fails compilation when reached
 
 $if (!supported) {
     $error("this target is not supported");
 }
+
+$if ($type_of(arg) == i64) { write_i64(w, arg); }
+$or ($type_of(arg) == str) { write_str(w, arg); }
+$or { $error("no writer for this argument type"); }    # compile error on an unhandled type
 ```
+
+> **`$assert` not yet implemented.** `$assert` parses as a comptime directive
+> but the compiler does not yet evaluate it. It is intended as sugar over `$if`
+> plus `$error` — `$assert(cond, "msg")` ≡ `$if (!cond) { $error("msg"); }`,
+> e.g. `$assert($size_of(i64) == 8, "expected 64-bit i64");`.
 
 ## Not provided as intrinsics
 
