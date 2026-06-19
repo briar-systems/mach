@@ -50,9 +50,10 @@ the DLL that exports it:
 ext fun WSAStartup(ver: u16, data: *u8) i32;
 ```
 
-- The value names one of the target's dependency libraries (the manifest
-  `[target.*].libs` / `-l` set). The named library **must** be among the link's
-  dependencies; pinning to a library that is not is a hard link error
+- The value names one of the OS's dependency libraries (the manifest
+  `[os.*].libs` set, e.g. `[os.windows].libs = ["kernel32.dll", "ws2_32.dll"]`).
+  The named library **must** be among the link's dependencies; pinning to a
+  library that is not is a hard link error
   (`import '<sym>' pinned to library '<lib>' not among the link's dependencies`),
   never a silent fallback.
 - An `ext` import with no `library` is unattributed. On PE the loader has no

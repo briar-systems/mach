@@ -62,8 +62,9 @@ to `ext` functions only.
 ext fun wsa_startup(ver: u16, data: *u8) i32;
 ```
 
-- The named DLL must appear in `[target.*].libs` in `mach.toml`. Pinning to
-  an absent library is a link error, never a silent fallback.
+- The named DLL must appear in the manifest's `[os.*].libs` for the target OS
+  (e.g. `[os.windows].libs = ["kernel32.dll", "ws2_32.dll", ...]`). Pinning
+  to an absent library is a link error, never a silent fallback.
 - Without `library`, an unattributed PE import binds to the **first** declared
   dependency. Every import that belongs to a different DLL needs an explicit
   `library` pin.
