@@ -49,7 +49,7 @@ token ::= IDENT
         | ERROR    (* emitted for an unexpected character, see below *)
 
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
-              | ";" | ":" | "," | "." | "?" | "@" | "$"
+              | ";" | ":" | "," | "." | "?" | "@" | "$" | "`"
               | "::" | ":~" | "..."
 
 operator ::= "+" | "-" | "*" | "/" | "%"
@@ -179,10 +179,12 @@ tokens and are otherwise discarded.
 ### Unexpected characters
 
 The lexer has no fall-through quote or reserved class: any byte that begins
-none of the token forms above — the backtick `` ` `` among them — is an
-**unexpected character**. The lexer records a `LEX_ERR_UNEXPECTED_CHAR`,
-emits a one-byte `ERROR` token (`KIND_ERROR`) for it, and continues. The
-backtick carries no special role; it is just one such character.
+none of the token forms above is an **unexpected character**. The lexer
+records a `LEX_ERR_UNEXPECTED_CHAR`, emits a one-byte `ERROR` token
+(`KIND_ERROR`) for it, and continues.
+
+The backtick `` ` `` is a real punctuation token (`KIND_BACKTICK`) used to
+delimit backtick decorators (see [Decorators](#decorators) below).
 
 
 ## Module
@@ -192,6 +194,28 @@ A source file is a single module: a sequence of declarations.
 ```ebnf
 module ::= { decl }
 ```
+
+
+## Decorators
+
+Zero or more leading backtick decorator clauses may appear before any
+declaration. Each clause is a comptime directive name, optionally followed
+by a parenthesized argument list of comptime expressions.
+
+```ebnf
+decorator     ::= "`" IDENT [ "(" [ expr { "," expr } ] ")" ] "`"
+decorated-decl ::= { decorator } decl
+```
+
+- Decorators attach to the **immediately following** declaration and do not
+  bleed across declarations.
+- Multiple decorators may appear on the same line (space-separated) or one
+  per line.
+- The argument list is optional; a bare `` `inline` `` carries no arguments.
+- Arguments are comptime expressions (not types): `$size_of(T)` is a valid
+  argument; `T` as a raw type name is not.
+- The closed directive set is `symbol`, `section`, `inline`, `align`,
+  `library`. See [decorators.md](decorators.md).
 
 
 ## Declarations
@@ -258,14 +282,20 @@ fun-decl ::= "fun" IDENT [ generic-params ] param-list [ type ] ( block | ";" )
 param-list ::= "(" [ params ] ")"
 
 params ::= "..."
-         | typed-name { "," typed-name } [ "," "..." ]
+         | typed-name { "," typed-name } [ "," ( "..." | pack-param ) ]
+         | pack-param
+
+pack-param ::= IDENT ":" "..."
 
 typed-name ::= [ "$" ] IDENT ":" type
 ```
 
-- A trailing `...` marks the function variadic (it may appear alone, or
-  after the last named parameter). It must be last.
-- A leading `$` on a parameter marks it a **comptime value parameter**.
+- A trailing standalone `...` marks the function variadic (C-style; it may
+  appear alone or after the last named parameter). It must be last.
+- A trailing `name: ...` declares a **comptime variadic pack parameter**
+  (`TYPE_KIND_PACK`). The two forms are grammatically distinct: `name: ...`
+  is a pack; bare `...` is the C-style variadic marker. It must be last.
+- A leading `$` on a `typed-name` marks it a **comptime value parameter**.
 
 > **Divergence (parser vs. doc).** `typed-name` is shared between function
 > parameters and `rec`/`uni` fields, so the parser will *accept* a leading
@@ -426,12 +456,15 @@ postfix ::= call-args
           | generic-call
           | index
           | member
+          | project
           | cast
 
-call-args    ::= "(" [ expr { "," expr } [ "," ] ] ")"
+call-args    ::= "(" [ call-arg { "," call-arg } [ "," ] ] ")"
+call-arg     ::= expr [ "..." ]     (* trailing "..." makes it a va... spread *)
 generic-call ::= type-args call-args        (* callee[T, U](args) *)
 index        ::= "[" expr "]"
 member       ::= "." IDENT
+project      ::= "." "[" expr "]"          (* v.[f]: comptime field projection *)
 cast         ::= ( "::" | ":~" ) type
 ```
 
@@ -527,6 +560,7 @@ stmt ::= block
        | asm-stmt
        | local-decl-stmt
        | comptime-if-stmt
+       | comptime-each-stmt
        | expr-stmt
 
 block ::= "{" { stmt } "}"
@@ -550,7 +584,13 @@ comptime-if-stmt ::= "$" "if" "(" expr ")" stmt-branch-body
                      { "$" "or" "(" expr ")" stmt-branch-body }
                      [ "$" "or" stmt-branch-body ]
 stmt-branch-body ::= "{" { stmt } "}"
+
+comptime-each-stmt ::= "$" "each" IDENT "in" expr stmt-branch-body
 ```
+
+`$each` is a compile-time unroll: the body is duplicated once per element of
+the sequence, which must be `$fields(T)` or a variadic pack identifier. `in`
+is a contextual keyword.
 
 Notes:
 - `if` / `or`: the `or` chain models both `else if` (`or (cond) { ... }`)
@@ -594,22 +634,21 @@ compiler actually resolves is a semantic concern (several are documented
 stubs).
 
 ```ebnf
-comptime-ident ::= "$" IDENT                       (* $size_of, $mach, $assert, ... *)
+comptime-ident ::= "$" IDENT                       (* $size_of, $mach, $type_of, ... *)
 
-intrinsic-call ::= comptime-ident call-args         (* $size_of(T), $offset_of(T, field) *)
+intrinsic-call ::= comptime-ident call-args         (* $size_of(T), $fields(T), $type_of(e) *)
 mach-read      ::= comptime-ident { member }        (* $mach.target.os, $mach.arch.x86_64 *)
 ```
 
 - Intrinsic calls (`$size_of(T)`, `$align_of(T)`, `$offset_of(T, field)`,
-  `$error("msg")`, `$assert(cond, "msg")`) are syntactically just a
-  `comptime-ident` callee with `call-args`. Their *arguments* are parsed as
-  ordinary expressions — note `$size_of(T)` passes a type name that the
-  expression grammar reads as an `IDENT` / `named` reference; the intrinsic
-  reinterprets it as a type at evaluation time.
-- `$mach.*` reads (`$mach.target.os`, `$mach.compiler.version`,
-  `$mach.os.linux`, `$mach.arch.x86_64`, …) are a `comptime-ident` followed
-  by a `.`-member chain. They appear in `$if` conditions and as comptime
-  initializers.
+  `$type_of(e)`, `$fields(T)`, `$error("msg")`, `$assert(cond, "msg")`) are
+  syntactically a `comptime-ident` callee with `call-args`. Their *arguments*
+  are parsed as ordinary expressions — `$size_of(T)` and `$fields(T)` pass a
+  type name that the expression grammar reads as an `IDENT`; the intrinsic
+  reinterprets it as a type at evaluation time. `$type_of(e)` takes a value
+  expression and produces a comptime type value.
+- `$mach.*` reads are a `comptime-ident` followed by a `.`-member chain. They
+  appear in `$if` conditions and as comptime initializers.
 - An **attribute write** `$sym.attr = value;` and a bare **directive**
   `$intrinsic(args);` are the `comptime-directive` declaration form above.
 
@@ -617,33 +656,44 @@ The `$mach.*` tag/path set is closed and documented in
 [comptime-mach.md](comptime-mach.md); this grammar treats every `$ident`
 and `.`-chain off it uniformly.
 
+### Field projection (`v.[f]`)
+
+`v.[f]` is a postfix form that projects the field described by a comptime
+field descriptor `f` (bound by a `$each f in $fields(T)` loop) off an
+instance `v`. Syntactically: `.` followed immediately by `[expr]`. It is
+disambiguated from a regular member access `v.name` by the `[` lookahead:
+`.` then `[` = projection; `.` then `IDENT` = member.
+
 
 ## Verification notes
 
 Productions verified directly against the parser source:
 
-- **Lexical grammar** — `lexer.mach` / `token.mach`: token set, operator
-  maximal-munch, number/char/string scanning and escapes, comment and
-  whitespace handling, the "keywords are `IDENT`s" model.
+- **Lexical grammar** — `lexer.mach` / `token.mach`: token set (incl.
+  `KIND_BACKTICK`), operator maximal-munch, number/char/string scanning and
+  escapes, comment and whitespace handling, the "keywords are `IDENT`s" model.
 - **Precedence ladder** — `token.infix_precedence` / `token.is_right_assoc`
   (the table is a direct transcription; only `=` is right-associative).
+- **Decorators** — `parser/decl.mach` `parse_decorators` / `parse_one_decorator`:
+  leading `` `name` `` / `` `name(args)` `` clauses, closed directive set.
 - **Declarations** — `parser/decl.mach`: `use`, `fwd` (incl. `pub fwd`
-  rejection), `fun` (generics, params, variadic `...`, comptime `$` params,
-  optional return type, block-or-`;` body), `rec`, `uni`, `val`/`var`
-  (both annotations optional), `def`, `test`, `flags` (`pub`/`ext` any
-  order/count), the decl-scope `$if`/`$or` chain, and the
+  rejection), `fun` (generics, params, variadic `...`, named pack `name: ...`,
+  comptime `$` params, optional return type, block-or-`;` body), `rec`, `uni`,
+  `val`/`var` (both annotations optional), `def`, `test`, `flags`
+  (`pub`/`ext` any order/count), the decl-scope `$if`/`$or` chain, and the
   `comptime-directive` (attribute-write vs. bare directive) form.
 - **Statements** — `parser/decl.mach`: `block`, `if`/`or` chain, `for`
   (optional condition), `ret`/`brk`/`cnt`/`fin`, local `val`/`var`, the
-  stmt-scope `$if`/`$or` chain, and `expr-stmt`.
+  stmt-scope `$if`/`$or` chain, `$each … in … { }`, and `expr-stmt`.
 - **Expressions** — `parser/expr.mach`: prefix atoms, all five unary
   prefix operators (`-`, `!`, `~`, `?`, `@`), the postfix chain
-  (call, generic-call, index, member, cast), struct/array literals and the
+  (call with optional `...` spread on arguments, generic-call, index,
+  member, field projection `.[f]`, cast), struct/array literals and the
   typed-literal lookahead, the generic-call-vs-index `[` disambiguation,
   and `comptime-ident`.
-- **Types** — `parser/expr.mach`: `*T`, `[N]T`, `fun(...) R` (with variadic
-  and optional return), anonymous `rec {...}` / `uni {...}`, and named types
-  with generic args / dotted paths.
+- **Types** — `parser/expr.mach`: `*T`, `[N]T`, `fun(...) R` (with variadic,
+  pack `name: ...`, and optional return), anonymous `rec {...}` / `uni {...}`,
+  and named types with generic args / dotted paths.
 - **Inline asm** — `parser/iasm.mach`: mandatory ISA tag, raw brace-balanced
   body, no operand/clobber list.
 
@@ -658,8 +708,11 @@ Doc-only (intended surface, not a distinct parser production):
   sets are enforced later (see [asm.md](asm.md),
   [comptime-mach.md](comptime-mach.md)).
 - The closed intrinsic set (`$size_of`, `$align_of`, `$offset_of`,
-  `$error`, `$assert`) — syntactically indistinguishable from any other
-  `comptime-ident` call.
+  `$type_of`, `$fields`, `$error`, `$assert`) — syntactically
+  indistinguishable from any other `comptime-ident` call.
+- The closed decorator directive set (`symbol`, `library`, `inline`, `align`,
+  `section`) — the parser accepts any `IDENT` after `` ` ``; sema enforces
+  the closed set.
 
 Divergences flagged inline:
 

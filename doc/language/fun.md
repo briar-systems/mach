@@ -10,7 +10,7 @@ fun NAME(args) RET { ... }              # function with return type
 fun NAME(args) { ... }                  # no return type
 fun NAME[T](args) RET { ... }           # generic over type parameters
 fun NAME($p: T, args) RET { ... }       # comptime value parameter
-fun NAME(a, b, ...) RET { ... }         # variadic (trailing ...)
+fun NAME(fixed, va: ...) RET { ... }    # variadic pack parameter
 ```
 
 ## Examples
@@ -35,18 +35,6 @@ pub fun make_pair[T, U](a: T, b: U) Pair[T, U] {
     ret p;
 }
 
-pub fun sum(count: i64, ...) i64 {
-    var ap: va_list;
-    va_start(?ap);
-    var total: i64 = 0;
-    var i:     i64 = 0;
-    for (i < count) {
-        total = total + va_arg[i64](?ap);
-        i = i + 1;
-    }
-    va_end(?ap);
-    ret total;
-}
 ```
 
 ## Generic type parameters
@@ -84,21 +72,38 @@ pub fun pick_op($mode: Mode, a: i64, b: i64) i64 {
 Comptime value parameters apply to function parameters only — not record
 fields, not other contexts.
 
-## Variadic functions
+## Variadic packs
 
-> **Partially implemented.** The parser accepts a trailing `...` parameter
-> and the function type carries a `variadic` flag, but the `va_list` type
-> and the `va_start` / `va_arg` / `va_end` intrinsics are not yet seeded or
-> lowered. The `sum` example above describes the intended form, not what
-> compiles today. Tracked in #1028.
+A function with a trailing named pack parameter (`va: ...`) accepts a
+variable number of trailing arguments. The compiler monomorphizes the
+function once per distinct call-site type-list; the pack is consumed by
+`$each a in va` at compile time — there is no runtime `va_list`.
 
-A function ending in `...` accepts a variable number of trailing arguments.
-The body accesses them through `va_list` / `va_start` / `va_arg` / `va_end`,
-matching C's convention.
+```mach
+pub fun sum(va: ...) i64 {
+    var t: i64 = 0;
+    $each a in va {
+        t = t + a;
+    }
+    ret t;
+}
+
+# leading fixed params are allowed before the pack
+pub fun bias(base: i64, va: ...) i64 {
+    var t: i64 = base;
+    $each a in va { t = t + a; }
+    ret t;
+}
+```
+
+`va.len` folds to the element count. `g(va...)` forwards the whole pack to
+another pack-tailed callee. See [variadics.md](variadics.md) for the full
+reference.
 
 ## See also
 
 - [ext-fun.md](ext-fun.md) — body-less external functions
+- [variadics.md](variadics.md) — variadic pack parameter reference
 - [comptime-control.md](comptime-control.md) — `$if` inside function bodies
 - [expressions.md](expressions.md) — function calls and generic
   instantiation
