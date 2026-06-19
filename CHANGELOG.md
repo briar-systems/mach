@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-06-19
+
+Comptime rework and first-class variadics — the last big breaking change before
+stability. The C-style `va_list` surface is gone, replaced by comptime variadic
+packs that monomorphize per call; the `$` comptime channel gains first-class type
+values; and per-declaration attribute directives move onto backtick decorators.
+The compiler source uses no new syntax, so the self-host fixpoint converges
+byte-identical on x86_64 and aarch64 — except that float-literal folding is now
+correctly rounded, which intentionally changes the compiler's own float constants
+relative to the v1.6.0 seed (this release re-seeds).
+
+### Added
+
+- comptime: first-class type values — `$type_of`, `$fields(T)`, field projection
+  `v.[f]`, bounded `$each` expansion, and type `==` in `$if` (#1472, #1473).
+- variadics: comptime variadic packs — a `va: ...` pack parameter consumed by
+  `$each arg in va`, monomorphized per call-site type-list (no `any`, no runtime
+  `va_list`); `va...` forward, `va.len` (#1474, #1475). aarch64 variadics work.
+- decorators: per-declaration backtick decorators `` `symbol` ``/`` `library` ``/
+  `` `inline` ``/`` `align` ``/`` `section` `` (codegen-only; `align`/`section`
+  emit, including per-function section placement) (#1476).
+- comptime: provenance-rooted namespaces — resolved `$mach.build.*`, fixed
+  `$mach.{os,arch,abi,mode}.*` tag tables, and `$project.*` from the manifest
+  (#1471). The legacy `$mach.target.*` spellings still resolve this release.
+- comptime: correctly-rounded float-literal folding via exact bignum — large
+  exponents no longer lose precision (e.g. `1.0e100`) (#1483).
+- ci: a self-host fixpoint lane that byte-diffs seed→stage1 vs stage1→stage2 on
+  PRs, catching uniform codegen changes the release `cmp` can't see (#1488).
+
+### Changed
+
+- deps: the vendored mach-std seed freeze is now single-source — `mach.lock` +
+  `mach dep pull` with an immutable `commit/` pin, the redundant submodule
+  removed, and a content-based seed-safety guard (#1486).
+
+### Fixed
+
+- dep: `mach dep pull` now finds `git.exe` on Windows (the lookup missed the
+  `.exe` extension) (#1506).
+
 ## [1.6.0] - 2026-06-14
 
 The aarch64-linux debut: mach now cross-compiles and self-hosts on 64-bit ARM
