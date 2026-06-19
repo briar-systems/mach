@@ -26,10 +26,10 @@ ext fun strlen(s: *u8) i64;             # private, file-local
 ## Symbol rename
 
 By default the linker symbol matches the Mach name. Override it with the
-`.symbol` attribute:
+`symbol` decorator:
 
 ```mach
-$libc_write.symbol = "write";
+`symbol("write")`
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
@@ -42,38 +42,38 @@ Common reasons to rename:
 ## Library attribution
 
 On a dynamic format that attributes each import to a specific dependency — the
-PE (Windows) import directory — the `.library` attribute pins an `ext` import to
+PE (Windows) import directory — the `library` decorator pins an `ext` import to
 the DLL that exports it:
 
 ```mach
-$WSAStartup.library = "ws2_32.dll";
+`library("ws2_32.dll")`
 ext fun WSAStartup(ver: u16, data: *u8) i32;
 ```
 
-- The value names one of the target's dependency libraries (the manifest
-  `[target.*].libs` / `-l` set). The named library **must** be among the link's
-  dependencies; pinning to a library that is not is a hard link error
+- The value names one of the OS's dependency libraries (the manifest
+  `[os.*].libs` set, e.g. `[os.windows].libs = ["kernel32.dll", "ws2_32.dll"]`).
+  The named library **must** be among the link's dependencies; pinning to a
+  library that is not is a hard link error
   (`import '<sym>' pinned to library '<lib>' not among the link's dependencies`),
   never a silent fallback.
-- An `ext` import with no `.library` is unattributed. On PE the loader has no
+- An `ext` import with no `library` is unattributed. On PE the loader has no
   global search, so an unattributed import binds to the **first** declared
   dependency. Pin every import that does not belong to that first library —
   adding extra DLLs to `libs` without attribution only emits empty import
   descriptors.
 
-`.library` composes with `.symbol`: the rename sets the imported symbol's name,
-`.library` sets the DLL it is imported from. On one decl the import is emitted
+`library` composes with `symbol`: the rename sets the imported symbol's name,
+`library` sets the DLL it is imported from. On one decl the import is emitted
 under the renamed symbol within the named library.
 
 ```mach
 # imported as `socket` from ws2_32.dll, called as `ws2_socket` in Mach.
-$ws2_socket.library = "ws2_32.dll";
-$ws2_socket.symbol  = "socket";
+`library("ws2_32.dll")` `symbol("socket")`
 ext fun ws2_socket(af: i32, kind: i32, proto: i32) i64;
 ```
 
 On a format whose loader resolves imports by global search (ELF), an import is
-not bound to a single dependency, so `.library` has no effect on the emitted
+not bound to a single dependency, so `library` has no effect on the emitted
 binary — the value is still validated against the link's dependencies, but every
 dependency is searched at load time regardless.
 
@@ -145,4 +145,4 @@ is currently implemented for the ELF (Linux) target; the PE (Windows) and Mach-O
 
 - [fun.md](fun.md) — regular function declarations
 - [visibility.md](visibility.md) — `pub` and `ext` modifiers
-- [comptime-attrs.md](comptime-attrs.md) — `.symbol` and other attributes
+- [decorators.md](decorators.md) — `symbol`, `library`, and other codegen decorators

@@ -22,6 +22,138 @@ pub val POINT_SIZE: i64 = $size_of(Point);
 pub val POINT_X:    i64 = $offset_of(Point, x);
 ```
 
+## Type intrinsic
+
+`$type_of(expr)` produces a comptime type value — the resolved type of its
+argument `expr`. Type values have no runtime representation; they are only
+meaningful as operands in comptime type comparisons.
+
+```mach
+$type_of(expr)          # comptime type value of expr
+```
+
+Type values can be compared with `==` / `!=` inside `$if` conditions:
+
+```mach
+$if ($type_of(arg) == i64) { write_i64(w, arg); }
+$or ($type_of(arg) == str) { write_str(w, arg); }
+$or { $error("unsupported type"); }
+```
+
+A bare type name (e.g. `i64`, `str`, `Point`) is the other valid operand.
+The comparison selects one branch at compile time per monomorphization
+instance — useful for per-element type dispatch inside `$each` bodies.
+
+## Field intrinsic and projection
+
+`$fields(T)` produces a comptime sequence of field descriptors for record or
+union type `T`. Each descriptor carries three readable properties:
+
+| Property   | Type     | Value                                        |
+|------------|----------|----------------------------------------------|
+| `f.name`   | `*u8`    | field name as a NUL-terminated string        |
+| `f.type`   | type val | comptime type value of the field's type      |
+| `f.offset` | integer  | byte offset of the field in `T`'s layout     |
+
+`$fields(T)` is consumed by `$each f in $fields(T)`. Inside the loop body,
+`v.[f]` projects the concrete field off an instance `v` — it is an lvalue
+(readable and writable, including through a pointer receiver).
+
+```mach
+$fields(T)              # comptime field sequence for record/union T
+v.[f]                   # comptime field projection: access the field f on v
+```
+
+```mach
+rec Pair { x: i64; y: i64; }
+
+fun sum(p: Pair) i64 {
+    var total: i64 = 0;
+    $each f in $fields(Pair) {
+        total = total + p.[f];      # p.x on iteration 1, p.y on iteration 2
+    }
+    ret total;
+}
+```
+
+`$each f in $fields(Empty)` expands to nothing when `T` has no fields.
+
+### Heterogeneous fields
+
+Because each `$each` iteration re-types `v.[f]` to the concrete field type,
+heterogeneous records work naturally:
+
+```mach
+rec Mixed { a: i64; b: u8; }
+
+fun total(m: Mixed) i64 {
+    var t: i64 = 0;
+    $each f in $fields(Mixed) {
+        t = t + m.[f]::i64;     # m.a (i64) on iter 1, m.b (u8) cast to i64 on iter 2
+    }
+    ret t;
+}
+```
+
+### Descriptor reads
+
+Field descriptor properties can be read inside the loop body:
+
+```mach
+fun offsum(m: Mixed) i64 {
+    var s: i64 = 0;
+    $each f in $fields(Mixed) {
+        s = s + f.offset::i64;    # 0 + 8 = 8 for Mixed { a: i64; b: u8; }
+    }
+    ret s;
+}
+
+fun count_i64(m: Mixed) i64 {
+    var n: i64 = 0;
+    $each f in $fields(Mixed) {
+        $if (f.type == i64) { n = n + 1; } $or { }
+    }
+    ret n;
+}
+```
+
+Note: if a record has a field literally named `type`, that ordinary field
+access (`v.type`) is unaffected — `v.[f]` projection uses the `$each` loop
+variable, which is always a field descriptor, never a regular member.
+
+### Nested `$each`
+
+`$each` can be nested:
+
+```mach
+fun cross(p: Pair, q: Pair) i64 {
+    var t: i64 = 0;
+    $each f in $fields(Pair) {
+        $each g in $fields(Pair) {
+            t = t + p.[f] * q.[g];
+        }
+    }
+    ret t;
+}
+```
+
+## `$each` — compile-time unroll
+
+`$each` is a statement form that splices its body once per element of a
+comptime sequence. There are two sequence forms:
+
+```mach
+$each f in $fields(T) { ... }    # one iteration per field of T
+$each a in va { ... }            # one iteration per element of pack va
+```
+
+`$each` is valid only in statement scope (inside a function body). It is not
+a loop — the body is duplicated at compile time, not iterated at runtime.
+Enclosing runtime variables (e.g. an index or accumulator) are shared across
+all unrolled copies.
+
+See [variadics.md](variadics.md) for the pack form (`$each a in va`).
+
 ## Diagnostic intrinsics
 
 > **Not yet implemented.** `$error` and `$assert` parse as comptime
@@ -55,3 +187,4 @@ functions with per-arch `asm` bodies. See [policy.md](policy.md).
 
 - [comptime.md](comptime.md) — channel overview
 - [comptime-control.md](comptime-control.md) — `$if` / `$or`
+- [variadics.md](variadics.md) — `$each a in va`, `va: ...`, `va.len`, `va...`
