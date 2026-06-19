@@ -42,16 +42,14 @@ val n: i64            = p.x;            # field access via .
 
 ## Layout
 
-By default the compiler may insert padding between fields for alignment.
-Two attributes are intended to adjust this:
+By default the compiler may insert padding between fields for alignment. The
+`` `align(N)` `` backtick decorator on a record raises its minimum type
+alignment to `N` bytes (a power of two); see [decorators.md](decorators.md).
 
-- `$NAME.align = N;` — minimum type alignment in bytes (power of two).
-- `$NAME.packed = true;` — disable padding entirely (binary protocol /
-  on-disk layouts).
-
-> **Not yet honored.** Both attributes parse but do not currently affect
-> layout — the compiler always uses the natural C-style rule. See the
-> status note in [comptime-attrs.md](comptime-attrs.md).
+> Disabling padding entirely (a `packed` layout for binary-protocol / on-disk
+> structs) is not yet available — the field-to-field padding always follows the
+> natural C-style rule. The legacy `$NAME.align = N;` / `$NAME.packed = true;`
+> attribute setters were removed in v2.0.0.
 
 ## See also
 

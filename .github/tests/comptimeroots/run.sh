@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # comptime roots integration test (#1217, #1249). two halves:
 #
-#   folding — the `$project.*` / `$target.*` / `$bin.*` roots must fold to each
+#   folding — the `$project.*` / `$project.target.*` / `$bin.*` roots must fold to each
 #   manifest's declared values. two apps with distinct declared values each
 #   assert every root against their own manifest and exit 0 only when all match;
 #   a mismatch returns the drifted root's id. this is the end-to-end proof that
@@ -18,7 +18,7 @@ set -euo pipefail
 
 # the exact teaching diagnostic comptime.eval emits for a bare `$ident`
 # (comptime.COMPTIME_BARE_IDENT_MSG); both rejection apps must surface it verbatim.
-BARE_IDENT_DIAG='comptime parameters are referenced without `$`; comptime paths are rooted: `$mach`, `$project`, `$target`, `$bin`'
+BARE_IDENT_DIAG='comptime parameters are referenced without `$`; comptime paths are rooted: `$mach`, `$project`, `$bin`'
 
 MACH="${1:-mach}"
 # absolutize a path argument: the suite cds into temp dirs, so a relative

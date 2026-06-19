@@ -52,13 +52,13 @@ pub fun add_via_asm(a: i64, b: i64) i64 {
 
 Different architectures use different mnemonics, registers, and calling
 conventions. There is no nested arch-block construct inside `asm`; instead,
-wrap each `asm` block in `$if` on `$mach.target.arch`:
+wrap each `asm` block in `$if` on `$mach.build.arch`:
 
 ```mach
-$if ($mach.target.arch == $mach.arch.x86_64) {
+$if ($mach.build.arch == $mach.arch.x86_64) {
     asm x86_64 { ... }
 }
-$or ($mach.target.arch == $mach.arch.aarch64) {
+$or ($mach.build.arch == $mach.arch.aarch64) {
     asm aarch64 { ... }
 }
 ```
@@ -80,4 +80,4 @@ arch-dispatched `asm`.
 ## See also
 
 - [policy.md](policy.md) — compiler vs stdlib boundary
-- [comptime-control.md](comptime-control.md) — `$if` over `$mach.target.arch`
+- [comptime-control.md](comptime-control.md) — `$if` over `$mach.build.arch`
