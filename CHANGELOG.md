@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-06-19
+
+Comptime collapse — the legacy surfaces v1.7.0 kept resolving for seed
+compatibility are removed now that v1.7.0 is the released seed. No new compiler
+syntax, so the self-host fixpoint stays byte-identical on x86_64 and aarch64.
+
+### Removed
+
+- comptime: the legacy `$mach.target.*` and top-level `$target.*` namespace
+  spellings — build facts read through `$mach.build.*` and the declared target
+  tuple through `$project.target.*` (#1480).
+- comptime: the C-style varargs machinery — `va_arg`/`va_start`/`va_end`, the
+  `va_list` type, the `VaModel` vtable, and the per-ABI register-save callee path
+  (superseded by comptime variadic packs in v1.7.0) (#1478).
+- comptime: the `$<sym>.symbol` / `$<sym>.library` / `$main.symbol` attribute
+  setters — superseded by `` `symbol(...)` `` / `` `library(...)` `` backtick
+  decorators (#1476); a stray `=` after a comptime directive now reports a
+  migration diagnostic (#1478).
+- ci: the content-based seed-safety guard (#1486) — obsolete now that the seed is
+  v1.7.0 and the vendored std legitimately uses `va:` / `$each` / `$mach.build.*`.
+
+### Changed
+
+- deps: the vendored mach-std pin advances to v0.12.0 — the migrated, new-only
+  std (comptime packs + `$mach.build.*`) (#1480, #1478).
+- comptime: float-literal folding imports `std.math.bignum` from the vendored std
+  instead of the temporary in-tree bignum port added for v1.7.0 seeding (#1483).
+
 ## [1.7.0] - 2026-06-19
 
 Comptime rework and first-class variadics — the last big breaking change before
