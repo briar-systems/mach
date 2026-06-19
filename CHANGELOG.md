@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- ci/aarch64: the `Test corpus under qemu-aarch64` CI step is un-gated. The step
+  was blocked on `ut_manifest` lacking a `[target.linux-arm64]` stanza, so
+  `target = "native"` couldn't resolve to the aarch64 host under qemu (#1391).
+  Adding the stanza brings the corpus to 500/500 under qemu-aarch64 (#1464).
+
 ## [2.1.0] - 2026-06-19
 
 Minor — comptime type-directed-dispatch ergonomics and multi-artifact tooling
@@ -161,9 +170,9 @@ under qemu exactly as it does natively on x86_64.
   a qemu-aarch64 smoke-test that proves the cross-built aarch64 `mach` can both
   build and run a real project under emulation before it ships — mirroring the
   windows/wine compiler smoke. CI's aarch64 lane cross-builds mach to aarch64 and
-  byte-verifies the emitted encodings; the runtime is exercised by that qemu smoke
-  and the aarch64 self-host fixpoint, with the in-source test corpus run under
-  qemu-user-static gated pending #1464.
+  byte-verifies the emitted encodings; the runtime is exercised by that qemu smoke,
+  the aarch64 self-host fixpoint, and the in-source test corpus run under qemu-aarch64
+  (#1464).
 
 ### Fixed
 
