@@ -16,8 +16,9 @@ syntax, so the self-host fixpoint stays byte-identical on x86_64 and aarch64.
 - comptime: the legacy `$mach.target.*` and top-level `$target.*` namespace
   spellings — build facts read through `$mach.build.*` and the declared target
   tuple through `$project.target.*` (#1480).
-- comptime: the C-style varargs machinery — `va_arg`/`va_start`/`va_end`, the
-  `va_list` type, the `VaModel` vtable, and the per-ABI register-save callee path
+- comptime: the C-style varargs feature — the trailing `...` parameter marker,
+  the `variadic` signature flag, `va_arg`/`va_start`/`va_end`, the `va_list`
+  type, the OP_VA_* IR opcodes, and the per-ABI register-save callee prologue
   (superseded by comptime variadic packs in v1.7.0) (#1478).
 - comptime: the `$<sym>.symbol` / `$<sym>.library` / `$main.symbol` attribute
   setters — superseded by `` `symbol(...)` `` / `` `library(...)` `` backtick
