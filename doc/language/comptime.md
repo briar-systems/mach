@@ -72,7 +72,7 @@ than each carrying their own.
 - No reflection-via-`$<Type>.*` subtree. Types are not first-class
   comptime values.
 - No decl-attached prefix sugar (`$inline pub fun ...` does not exist) —
-  use attribute writes.
+  use backtick decorators (see [decorators.md](decorators.md)).
 - No comptime function definitions, no comptime loops.
 - No bare `$ident` — see above.
 

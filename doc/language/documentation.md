@@ -35,14 +35,14 @@ component block.
 
 ## Placement
 
-The docstring is the first thing above the declaration. Attribute writes
+The docstring is the first thing above the declaration. Backtick decorators
 follow the docstring, immediately above the decl:
 
 ```mach
 # panic: terminate the program with a message.
 # ---
 # msg: text to emit before terminating
-$panic.noreturn = true;
+`symbol("panic")`
 pub fun panic(msg: *u8) { ... }
 ```
 
@@ -102,7 +102,7 @@ pub def Age: i64;
 ## Module
 
 A `.mach` file begins with a module docstring as the first content in the
-file — before any `use`, `fwd`, or attribute write. The summary uses the
+file — before any `use`, `fwd`, or decorator. The summary uses the
 module's full dotted path as `<name>`.
 
 ```mach

@@ -17,8 +17,8 @@ Things that need to feel like the language:
   per supported ISA.
 - **`asm` parsing, encoding, and operand allocation** for each supported
   ISA.
-- **The comptime channel** — `$mach.*` reads, attribute writes, the closed
-  intrinsic set, `$if` / `$or`.
+- **The comptime channel** — `$mach.*` reads, the closed intrinsic set,
+  `$if` / `$or`.
 - **Comptime function parameter dispatch** — turning `$name: T` parameters
   into per-instantiation specializations.
 

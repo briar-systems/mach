@@ -339,7 +339,7 @@ A bracketed list of bare type-parameter names with no constraints. An empty
 ## Comptime declarations and directives
 
 A `$` at declaration scope is either a comptime `$if` chain or a comptime
-directive / attribute write.
+directive (`$intrinsic(args);`).
 
 ```ebnf
 comptime-decl ::= comptime-if-decl | comptime-directive
