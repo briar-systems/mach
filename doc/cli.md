@@ -5,9 +5,10 @@ mach <command> [options]
 ```
 
 The compiler dispatches on `argv[1]`. With no command, or an unknown one, it
-prints usage and exits non-zero. Every command except `init` runs from inside a
-project tree: it walks up from the working directory until a `mach.toml` is
-found.
+prints usage and exits non-zero. The project commands — `build`, `run`, `test`,
+and `doc` — take the project root as a **required** positional (`mach build
+<path>`) and walk up from it until a `mach.toml` is found; a bare invocation with
+no path is a user error.
 
 This page documents the flags the current binary actually parses. Flags are
 matched exactly: `--flag value` (a value follows in the next argument) or a bare
@@ -37,7 +38,6 @@ Read by `build`, `run`, `test`, and `doc` (they share one config parser).
 | `--verbose`, `-v`| —                | write extra detail (per-stage compile progress) to stderr |
 | `--quiet`, `-q`  | —                | suppress non-error output |
 | `--color <mode>` | `auto`\|`always`\|`never` | color preference for terminal output (default `auto`); an unknown mode is a parse error |
-| `--cwd <path>`   | path             | run as if started in `<path>` (project-root search begins there) |
 | `--target <name>`| target name      | select a declared target; absent, defers to `[project].target` |
 | `--profile <name>`| profile name    | select a `[profile.<name>]` build variant; absent, the first declared profile |
 | `--bin <name>`   | artifact name    | narrow the build to one `[bin.<name>]` artifact |
@@ -56,10 +56,11 @@ Read by `build`, `run`, `test`, and `doc` (they share one config parser).
 ## `mach build`
 
 ```
-mach build [options]
+mach build <path> [options]
 ```
 
-Compiles the current project. With no `--bin`/`--lib`, it builds every declared
+Compiles the project rooted at `<path>` (e.g. `mach build .`). With no
+`--bin`/`--lib`, it builds every declared
 artifact for the default target and profile. Every reachable module is driven
 through sema → lower → optimise → codegen to one relocatable object, written
 under the manifest's resolved `obj` template at `<obj>/<fqn-as-path>.o`. For a
@@ -135,16 +136,17 @@ giving a stable, deterministic link order.
 > Dynamic linking is implemented for the ELF (Linux) and PE (Windows) targets;
 > the Mach-O (Darwin) import path is not yet implemented (#1176).
 
-Exit codes: `0` ok, `1` user error (no `mach.toml`, unknown target, compile
-errors, an unresolvable link input), `2` internal error.
+Exit codes: `0` ok, `1` user error (missing project path, no `mach.toml`,
+unknown target, compile errors, an unresolvable link input), `2` internal error.
 
 ## `mach run`
 
 ```
-mach run [options] [-- args...]
+mach run <path> [options] [-- args...]
 ```
 
-Builds the project exactly like `mach build`, then executes the produced binary.
+Builds the project at `<path>` exactly like `mach build`, then executes the
+produced binary.
 Arguments after a `--` separator are forwarded to the child as its `argv`. The
 child's exit code becomes this command's exit code.
 
@@ -169,7 +171,7 @@ error.
 ## `mach test`
 
 ```
-mach test [options]
+mach test <path> [options]
 ```
 
 Builds one standalone executable per `test` declaration (the test plus the
@@ -323,7 +325,7 @@ Exit codes: `0` ok, `1` user error, `2` internal error.
 ## `mach doc`
 
 ```
-mach doc [options]
+mach doc <path> [options]
 ```
 
 Loads the project's module graph and generates Markdown reference docs from
