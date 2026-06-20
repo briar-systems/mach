@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-06-20
+
+Patch — fetching git dependencies (`mach init`, `mach dep pull`) failed on windows
+in two distinct ways; both are fixed and now covered by the `Windows (native)` CI
+lane, which resolves the vendored std with `mach dep pull` instead of a manual
+clone (#1538).
+
+### Fixed
+
+- dep: `resolve_cmd` searched `PATH` with POSIX separators (`:` list, `/` path),
+  so it never resolved an executable on windows — `PATH` is `;`-separated there
+  and drive-letter prefixes (`C:\…`) embed a `:` that shattered every entry. it
+  now selects the list/path separators by target os, so `git.exe` is found on
+  windows as it is on linux. also fixes runner resolution in `mach run`/`mach test`.
+- dep: git was spawned on windows with a reconstructed allowlist environment that
+  omitted `SystemRoot`, so its winsock initialization failed with
+  `getaddrinfo() thread failed to start` once git was found. the allowlist exists
+  only for posix `execve` (which does not inherit and exposes no `environ`
+  handle); on windows `CreateProcess` inherits the full parent environment
+  natively, so git is now spawned with a nil child env there.
+
 ## [2.4.0] - 2026-06-19
 
 Minor — Phase 2 (collapse) of the `#[attr]` decorator migration (#1526): `#[attr]` is now
