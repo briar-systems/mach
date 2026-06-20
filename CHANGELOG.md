@@ -7,10 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.4.1] - 2026-06-20
 
-Patch — fetching git dependencies (`mach init`, `mach dep pull`) failed on windows
-in two distinct ways; both are fixed and now covered by the `Windows (native)` CI
-lane, which resolves the vendored std with `mach dep pull` instead of a manual
-clone (#1538).
+Patch — windows git dependency resolution (#1538) and a multi-target union-build
+crash (#1540). The windows git path failed in two distinct ways, both now covered
+by the `Windows (native)` CI lane, which resolves the vendored std with
+`mach dep pull` instead of a manual clone.
 
 ### Fixed
 
@@ -18,13 +18,19 @@ clone (#1538).
   so it never resolved an executable on windows — `PATH` is `;`-separated there
   and drive-letter prefixes (`C:\…`) embed a `:` that shattered every entry. it
   now selects the list/path separators by target os, so `git.exe` is found on
-  windows as it is on linux. also fixes runner resolution in `mach run`/`mach test`.
+  windows as it is on linux. also fixes runner resolution in `mach run`/`mach test`
+  (#1538).
 - dep: git was spawned on windows with a reconstructed allowlist environment that
   omitted `SystemRoot`, so its winsock initialization failed with
   `getaddrinfo() thread failed to start` once git was found. the allowlist exists
   only for posix `execve` (which does not inherit and exposes no `environ`
   handle); on windows `CreateProcess` inherits the full parent environment
-  natively, so git is now spawned with a nil child env there.
+  natively, so git is now spawned with a nil child env there (#1538).
+- driver: `walk_comptime_if_union` cached a `*ModuleEntry` (and AST-arena pointers
+  into it) across a recursive load that can `reallocate` the `p.modules` array,
+  so multi-target union builds spanning ≥3 OS/arch tuples dereferenced freed
+  memory and crashed (SIGSEGV in tooling/LSP). the taken branches are now
+  snapshotted before recursing, mirroring `walk_use_for_load` (#1540).
 
 ## [2.4.0] - 2026-06-19
 
