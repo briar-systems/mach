@@ -71,7 +71,7 @@ The following examples require the standard library as a dependency. For a stand
 use          std.runtime;
 use print:   std.print;
 
-`symbol("main")`
+#[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     print.println("Hello, World!");
     ret 0;
@@ -92,9 +92,9 @@ fun fibr(n: u64) u64 {
     ret fibr(n - 1) + fibr(n - 2);
 }
 
-`symbol("main")`
+#[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    print.printf("fib(%d) = %d\n", 10::i64, fibr(10));
+    print.printf("fib({}) = {}\n", 10::i64, fibr(10));
     ret 0;
 }
 ```
@@ -113,9 +113,9 @@ fun fact(n: u64) u64 {
     ret n * fact(n - 1);
 }
 
-`symbol("main")`
+#[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    print.printf("fact(%d) = %d\n", 10::i64, fact(10));
+    print.printf("fact({}) = {}\n", 10::i64, fact(10));
     ret 0;
 }
 ```

@@ -274,8 +274,8 @@ A build cell is one artifact × one target × one profile.
   target. `--bin <name>` / `--lib <name>` narrow to one artifact; `--target
   <name>` selects a declared target; `--profile <name>` (with `--release` sugar)
   selects a profile.
-- `mach run` and `mach test` build exactly one artifact; with several declared and
-  no `--bin`/`--lib`, they ask you to pick one, naming every candidate.
+- `mach run .` and `mach test .` build exactly one artifact; with several declared
+  and no `--bin`/`--lib`, they ask you to pick one, naming every candidate.
 
 ### `native` target resolution
 
@@ -340,12 +340,12 @@ git = "https://github.com/octalide/mach-std"
 ref = "branch/dev"
 ```
 
-`mach build` (no `--target`) selects `linux` because `[project].target = "native"`
+`mach build .` (no `--target`) selects `linux` because `[project].target = "native"`
 resolves to the host-matching tuple, compiles `src/main.mach` and its transitive
 imports — including modules from `mach-std` vendored at `dep/mach-std/` — into
 objects under `out/linux/obj/`, and links `out/linux/bin/mach`. `mach-std` is
 realized into `dep/mach-std/` by `mach dep pull` from the manifest pin, and
-`mach build` then resolves it purely by that vendor path — no git at build time.
+`mach build .` then resolves it purely by that vendor path — no git at build time.
 
 ## See also
 
