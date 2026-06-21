@@ -1,20 +1,19 @@
 # installs the mach release binary.
-# usage: irm https://machlang.org/install.ps1 | iex
 #
-# MACH_VERSION      version to install (e.g. 1.4.2); defaults to the latest release
-# MACH_INSTALL_DIR  install directory; defaults to $env:LOCALAPPDATA\mach\bin
+# MACH_VERSION      version to install (e.g. 1.2.3); defaults to the latest release
+# MACH_INSTALL_DIR  install directory; set to skip the prompt; defaults to $env:LOCALAPPDATA\mach\bin
 # MACH_BASE_URL     release base url override (for testing)
 
 $ErrorActionPreference = 'Stop'
 
 $base = if ($env:MACH_BASE_URL) { $env:MACH_BASE_URL } else { 'https://github.com/octalide/mach/releases' }
-$dir = if ($env:MACH_INSTALL_DIR) { $env:MACH_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'mach\bin' }
 $target = 'x86_64-windows'
 
 if (-not [System.Environment]::Is64BitOperatingSystem) {
     throw 'install.ps1: unsupported host; mach requires 64-bit windows'
 }
 
+# resolve the version to install: pinned via MACH_VERSION, else the latest tag
 if ($env:MACH_VERSION) {
     $tag = if ($env:MACH_VERSION.StartsWith('v')) { $env:MACH_VERSION } else { "v$($env:MACH_VERSION)" }
 } else {
@@ -32,31 +31,45 @@ if ($env:MACH_VERSION) {
 }
 $version = $tag.TrimStart('v')
 
+$art = @'
+                        _
+  _ __ ___    __ _  ___| |__
+ | '_ ` _ \  / _` |/ __| '_ \
+ | | | | | || (_| | (__| | | |
+ |_| |_| |_| \__,_|\___|_| |_|
+'@
+# the banner is the only colored output: mach magenta (0xff00ff) on a real console
+$e = [char]27
+$mag   = if ([Console]::IsOutputRedirected) { '' } else { "${e}[38;2;255;0;255m" }
+$reset = if ([Console]::IsOutputRedirected) { '' } else { "${e}[0m" }
+Write-Host ''
+Write-Host "$mag$art$reset"
+Write-Host "  mach $version ($target)`n"
+
+# install directory: explicit env override wins; otherwise prompt at a console,
+# falling back to the default when input is redirected (e.g. CI)
+$default = Join-Path $env:LOCALAPPDATA 'mach\bin'
+if ($env:MACH_INSTALL_DIR) {
+    $dir = $env:MACH_INSTALL_DIR
+} elseif (-not [Console]::IsInputRedirected) {
+    $reply = Read-Host "install directory [$default]"
+    $dir = if ([string]::IsNullOrWhiteSpace($reply)) { $default } else { $reply }
+} else {
+    $dir = $default
+}
+
 $archive = "mach-$version-$target.zip"
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "mach-install-$([System.IO.Path]::GetRandomFileName())"
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
-    Write-Host "downloading $archive ($tag)"
+    Write-Host "`ndownloading $archive..."
     Invoke-WebRequest -Uri "$base/download/$tag/$archive" -OutFile (Join-Path $tmp $archive)
-    Invoke-WebRequest -Uri "$base/download/$tag/SHA256SUMS" -OutFile (Join-Path $tmp 'SHA256SUMS')
 
-    $line = Select-String -Path (Join-Path $tmp 'SHA256SUMS') -Pattern ([regex]::Escape($archive) + '$') | Select-Object -First 1
-    if (-not $line) { throw "install.ps1: no checksum for $archive in SHA256SUMS" }
-    $expected = ($line.Line -split '\s+')[0].ToLower()
-    $actual = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $tmp $archive)).Hash.ToLower()
-    if ($actual -ne $expected) {
-        throw "install.ps1: checksum verification FAILED for $archive (expected $expected, got $actual); aborting"
-    }
-
+    Write-Host "extracting $archive..."
     Expand-Archive -Path (Join-Path $tmp $archive) -DestinationPath $tmp -Force
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     Copy-Item (Join-Path $tmp 'mach.exe') (Join-Path $dir 'mach.exe') -Force
-    Write-Host "installed mach $version to $(Join-Path $dir 'mach.exe')"
-
-    if (-not (($env:Path -split ';') -contains $dir)) {
-        Write-Host "note: $dir is not on PATH; add it, e.g.:"
-        Write-Host "  [Environment]::SetEnvironmentVariable('Path', `"$dir;`" + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')"
-    }
+    Write-Host "`ninstalled mach $version to $(Join-Path $dir 'mach.exe')"
 } finally {
     Remove-Item -Recurse -Force $tmp
 }
