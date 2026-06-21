@@ -20,7 +20,7 @@ main() {
         *) err "unsupported host $(uname -s)-$(uname -m); prebuilt binaries: https://github.com/octalide/mach/releases" ;;
     esac
 
-    # the banner is the only colored output: mach magenta (0xff00ff) on a tty
+    # mach magenta (0xff00ff) on a tty
     if [ -t 1 ]; then
         esc=$(printf '\033')
         c="${esc}[38;2;255;0;255m"; r="${esc}[0m"
