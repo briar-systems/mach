@@ -41,9 +41,7 @@ On Windows (PowerShell):
 irm https://machlang.org/install.ps1 | iex
 ```
 
-The scripts verify the download against the release `SHA256SUMS` and install to
-`~/.local/bin` (`%LOCALAPPDATA%\mach\bin` on Windows). Precompiled binaries are
-also available directly on the [releases](https://github.com/octalide/mach/releases) page.
+Precompiled binaries are also available directly on the [releases](https://github.com/octalide/mach/releases) page.
 
 
 ## Building Mach
