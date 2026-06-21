@@ -5,13 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.5.0] - 2026-06-20
 
-Breaking CLI change — the project commands now resolve the project root one way
-only. `build`, `run`, `test`, and `doc` each take the project root as a required
-positional (`mach build .`); a bare invocation with no path is a user error. This
-collapses the three redundant resolution paths (bare-cwd default, positional, and
-`--cwd`) that had drifted in, restoring a single rule (#1545).
+Minor — a breaking CLI change to project-root resolution (#1545) and a codegen
+fix for field access on struct-typed `$each` pack elements (#1549). The project
+commands now resolve the project root one way only: `build`, `run`, `test`, and
+`doc` each take the project root as a required positional (`mach build .`); a
+bare invocation with no path is a user error, collapsing the three redundant
+resolution paths (bare-cwd default, positional, and `--cwd`) that had drifted
+in.
 
 ### Changed
 
@@ -25,6 +27,13 @@ collapses the three redundant resolution paths (bare-cwd default, positional, an
 
 - cli: the `--cwd <path>` flag. Pass the project root as the positional instead
   (`mach build .`) (#1545).
+
+### Fixed
+
+- lower: field access (`a.x`) or address-of (`?a`) on a struct-typed `$each` pack
+  element fabricated an extern global named after the loop variable, failing at
+  link with `undefined symbol`. `lower_ident_lvalue` now resolves a pack element
+  to its expanded-parameter storage slot, mirroring the rvalue path (#1549).
 
 ## [2.4.1] - 2026-06-20
 
