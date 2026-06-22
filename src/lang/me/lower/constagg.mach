@@ -122,11 +122,12 @@ pub fun try_const_aggregate(ctx: *lower.LowerContext, eid: aid.ExprId, gty: ir_t
 
     # a struct / array literal always routes here. a pointer-typed global routes
     # here when its initializer is a constant address the linker must patch in:
-    # a `str` literal (a rodata blob), an address-of `?G` / `?G.field`, or a bare
-    # function name. the global holds that *address* (a relocation), never bytes
-    # inline — and there is no init-synthesis pass, so an unfolded pointer global
-    # would stay a NULL placeholder. any other initializer is a scalar the caller
-    # folds through its own path.
+    # a `str` literal (a rodata blob), a string-valued comptime path
+    # (`$project.version`), an address-of `?G` / `?G.field`, or a bare function
+    # name. the global holds that *address* (a relocation), never bytes inline —
+    # and there is no init-synthesis pass, so an unfolded pointer global would
+    # stay a NULL placeholder. any other initializer is a scalar the caller folds
+    # through its own path.
     var is_agg: bool = e.kind == aexpr.EXPR_KIND_STRUCT_LIT || e.kind == aexpr.EXPR_KIND_ARRAY_LIT;
     if (ir_is_ptr_or_fn(ctx, gty) && is_const_addr_init(ctx, eid, e)) { is_agg = true; }
     if (!is_agg) {
@@ -270,10 +271,10 @@ fun place_array(ctx: *lower.LowerContext, eid: aid.ExprId, ity: ir_type.IrTypeId
 }
 
 # lays out a pointer leaf. records a relocation patching this slot with a symbol
-# address: a `str` literal materializes an anonymous `.rodata` global; `&G` (or
-# `&G.field`) takes the address of a module global with a field-offset addend.
-# `nil` stays zero. any other pointer initializer (a runtime pointer) -> fall
-# back.
+# address: a `str` literal or a string-valued comptime path (`$project.version`)
+# materializes an anonymous `.rodata` global; `&G` (or `&G.field`) takes the
+# address of a module global with a field-offset addend. `nil` stays zero. any
+# other pointer initializer (a runtime pointer) -> fall back.
 fun place_ptr(ctx: *lower.LowerContext, eid: aid.ExprId, blob: *u8, base: u32, rb: *RelocBuf, fold: *FoldResult) Result[bool, str] {
     val e_opt: Option[*aexpr.Expr] = ast.get_expr(ctx.a, eid);
     if (is_none[*aexpr.Expr](e_opt)) { ret err[bool, str]("constagg: pointer leaf expr out of range"); }
@@ -296,6 +297,25 @@ fun place_ptr(ctx: *lower.LowerContext, eid: aid.ExprId, blob: *u8, base: u32, r
     # without emitting any IR (no active builder block at global scope).
     if (e.kind == aexpr.EXPR_KIND_UNARY && e.data.unary.op == aexpr.UN_ADDR) {
         ret place_addr_of(ctx, e.data.unary.operand, blob, base, rb, fold);
+    }
+
+    # a comptime path (`$project.version`, `$mach.*`, ...) that folds to a string
+    # is the address of a rodata blob, exactly like a `str` literal: materialise
+    # the blob and record a relocation, mirroring expression-position folding
+    # (lower_comptime_path -> const_value_of). a path that fails to fold or folds
+    # to a non-string is not a constant address -> fall back.
+    if (comptime.is_comptime_path(ctx.a, eid)) {
+        val ev: Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a, lower.module_source(ctx), eid, ?ctx.s.interner);
+        if (is_err[comptime.CTValue, str](ev)) { @fold = FOLD_FALLBACK; ret ok[bool, str](true); }
+        val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](ev);
+        if (v.kind != comptime.CT_KIND_STR) { @fold = FOLD_FALLBACK; ret ok[bool, str](true); }
+        val gv_r: Result[value.Value, str] = expr.const_value_of(ctx, eid, v);
+        if (is_err[value.Value, str](gv_r)) { ret err[bool, str](unwrap_err[value.Value, str](gv_r)); }
+        val gv: value.Value = unwrap_ok[value.Value, str](gv_r);
+        if (gv.kind != value.VAL_GLOBAL || gv.data.global_ix >= ctx.m.global_len) {
+            ret err[bool, str]("constagg: comptime string leaf did not lower to a global");
+        }
+        ret push_sym_reloc(ctx, rb, base, ctx.m.globals[gv.data.global_ix].name, 0, false);
     }
 
     # a bare function name stored in a pointer slot is a constant (a function is
@@ -458,16 +478,20 @@ fun ir_is_ptr_or_fn(ctx: *lower.LowerContext, ity: ir_type.IrTypeId) bool {
 }
 
 # true when `e` initializes a pointer global with a compile-time-constant address
-# the back end emits as a relocation: a string literal, an address-of (`?G` /
-# `?mod.G`), or a bare name resolving to a module function. routing these through
-# the folder keeps a top-level pointer global from staying a NULL placeholder
-# (there is no init-synthesis pass to fill it later). a `nil` initializer is
-# already a correct zero placeholder on the scalar path, so it is left there. a
-# bare *data* global name is the runtime contents of that global, not a constant
-# address, so it is excluded here (it would only zalloc a blob and fall back).
+# the back end emits as a relocation: a string literal, a string-valued comptime
+# path (`$project.version`, `$mach.*`), an address-of (`?G` / `?mod.G`), or a bare
+# name resolving to a module function. routing these through the folder keeps a
+# top-level pointer global from staying a NULL placeholder (there is no init-
+# synthesis pass to fill it later). a `nil` initializer is already a correct zero
+# placeholder on the scalar path, so it is left there. a bare *data* global name
+# is the runtime contents of that global, not a constant address, so it is
+# excluded here (it would only zalloc a blob and fall back). the comptime-path
+# test is structural (cheap); place_ptr folds it and falls back if it is not a
+# string, so a path resolving to a non-address constant is handled correctly.
 fun is_const_addr_init(ctx: *lower.LowerContext, eid: aid.ExprId, e: *aexpr.Expr) bool {
     if (e.kind == aexpr.EXPR_KIND_LIT_STR) { ret true; }
     if (e.kind == aexpr.EXPR_KIND_UNARY && e.data.unary.op == aexpr.UN_ADDR) { ret true; }
+    if (comptime.is_comptime_path(ctx.a, eid)) { ret true; }
     if (e.kind == aexpr.EXPR_KIND_IDENT || e.kind == aexpr.EXPR_KIND_MEMBER) {
         ret expr.references_function(ctx, eid);
     }
