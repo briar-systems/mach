@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1] - 2026-06-22
+
+Patch — global initializers now fold comptime intrinsic paths (#1557).
+
+### Fixed
+
+- lower: a module-level `val`/`var` initialized to a comptime intrinsic path
+  (`$project.version`, `$mach.*`) that folds to a string is now lowered to a
+  pointer-to-rodata relocation instead of being mis-emitted as raw inline bytes,
+  so a global like `pub val X: str = $project.version;` folds correctly. The
+  global-init aggregate folder routes string-valued comptime paths through
+  `comptime.eval`, mirroring expression-position folding (#1557).
+
 ## [2.5.0] - 2026-06-20
 
 Minor — a breaking CLI change to project-root resolution (#1545) and a codegen
