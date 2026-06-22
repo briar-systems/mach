@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.2] - 2026-06-22
+
+Patch — const-string global references now fold correctly.
+
+### Fixed
+
+- lower: a `str`/pointer-typed global initialized to a reference to a const-string
+  `val` (`pub val B: str = A;`) emitted the string as raw inline bytes in the
+  pointer slot instead of a pointer-to-rodata relocation. The global-init folder
+  now routes any initializer that comptime-folds to a string through the rodata +
+  relocation path, generalizing the v2.5.1 comptime-path fix (#1559).
+
 ## [2.5.1] - 2026-06-22
 
 Patch — global initializers now fold comptime intrinsic paths (#1557).
