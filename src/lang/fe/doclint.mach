@@ -1,0 +1,455 @@
+# mach.lang.fe.doclint: the docstring component lint.
+#
+# a post-parse pass over a module AST that validates `# <component>:` lines in a
+# declaration's docstring against the declaration's documentable items. it fires
+# only for `pub` declarations whose docstring carries a `# ---` component block;
+# a non-`pub` decl, a decl with no docstring, and a summary-only docstring are
+# all silent. a docstring is never required. validated kinds are `fun`, `rec`,
+# and `uni` — the declaration forms that expose documentable items.
+#
+# documentation may be partial: an item with no component line is never flagged.
+# the lint only validates the lines that ARE written — a component naming no real
+# item (misspelled), a component with no description, and documented components
+# in the wrong relative order. completeness (warning on undocumented items) is
+# left to an opt-in per-project flag, not the default.
+#
+# the lint emits WARNINGs to the session diagnostic list (source `mach`) and runs
+# from the parser's public entry, so both the build/check path and the editor
+# parse path surface it.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use page:     std.allocator.page;
+use strutil:  std.types.string;
+
+use token:  mach.lang.fe.token;
+use ast:    mach.lang.fe.ast;
+use id:     mach.lang.fe.ast.id;
+use decl:   mach.lang.fe.ast.decl;
+use doc:    mach.lang.fe.doc;
+use diag:   mach.lang.diagnostic;
+use src:    mach.lang.source;
+use lexer:  mach.lang.fe.lexer;
+use parser: mach.lang.fe.parser.state;
+use pdecl:  mach.lang.fe.parser.decl;
+
+# ItemKind: how a documentable item's component name is spelled.
+def ItemKind: u8;
+# ITEM_GENERIC: a generic type parameter, written `[T]`.
+val ITEM_GENERIC: ItemKind = 0;
+# ITEM_COMPTIME: a comptime value parameter, written `$name`.
+val ITEM_COMPTIME: ItemKind = 1;
+# ITEM_PLAIN: a value parameter or field, written by its bare name.
+val ITEM_PLAIN: ItemKind = 2;
+# ITEM_RET: a function return value, written `ret`.
+val ITEM_RET: ItemKind = 3;
+
+# Item: one documentable item of a declaration in declaration order.
+# ---
+# kind:     how the component name is spelled
+# name_off: byte offset of the item's base identifier in source (unused for ret)
+# name_len: byte length of the base identifier (unused for ret)
+rec Item {
+    kind:     ItemKind;
+    name_off: usize;
+    name_len: usize;
+}
+
+# lint_module: validate every documentable `pub` declaration in `a` and append a
+# WARNING to `diags` for each mismatch. a no-op for decls that are non-`pub`, have
+# no docstring, or carry a summary-only docstring. walks the flat decl pool, so
+# module-scope, comptime-branch, and (never-`pub`) local decls are all covered.
+# ---
+# a:      the parsed module AST
+# source: the module's source text (the doc spans point into it)
+# diags:  diagnostic sink the warnings are appended to
+pub fun lint_module(a: *ast.Ast, source: str, diags: *diag.DiagList) {
+    var i: usize = 0;
+    for (i < a.decl_len) {
+        lint_decl(a, ?a.decls[i], source, diags);
+        i = i + 1;
+    }
+}
+
+# lint_decl: run the component lint for one declaration when it is in scope —
+# `pub`, documentable (fun/rec/uni), and carrying a `# ---` component block.
+fun lint_decl(a: *ast.Ast, d: *decl.Decl, source: str, diags: *diag.DiagList) {
+    if ((d.flags & decl.DECL_FLAG_PUB) == 0) { ret; }
+    if (d.doc.len == 0) { ret; }
+    if (!is_documentable(d.kind)) { ret; }
+    if (!doc.has_component_block(source, d.doc)) { ret; }
+    check_components(a, d, source, diags);
+}
+
+# is_documentable: true for the declaration kinds that expose documentable items
+# (functions, records, unions) — the kinds whose docstrings carry component lines.
+fun is_documentable(kind: decl.DeclKind) bool {
+    ret kind == decl.DECL_KIND_FUN
+     || kind == decl.DECL_KIND_REC
+     || kind == decl.DECL_KIND_UNI;
+}
+
+# item_count: the number of documentable items a declaration exposes: generics
+# plus parameters/fields, plus one for a function's non-nil return.
+fun item_count(d: *decl.Decl) usize {
+    if (d.kind == decl.DECL_KIND_FUN) {
+        val f: *decl.DeclFun = ?d.data.fun_;
+        var n: usize = f.generics_len::usize + f.params_len::usize;
+        if (f.return_type != id.TYPE_NIL) { n = n + 1; }
+        ret n;
+    }
+    if (d.kind == decl.DECL_KIND_REC) {
+        val r: *decl.DeclRec = ?d.data.rec_;
+        ret r.generics_len::usize + r.fields_len::usize;
+    }
+    if (d.kind == decl.DECL_KIND_UNI) {
+        val u: *decl.DeclUni = ?d.data.uni_;
+        ret u.generics_len::usize + u.fields_len::usize;
+    }
+    ret 0;
+}
+
+# check_components: the lint body for a decl already known to be in scope. builds
+# the declaration's ordered item list, then walks the docstring's component lines
+# once, validating each. partial documentation is allowed: an item with no
+# component line is never flagged. a buffer allocation failure drops the lint
+# silently — a missing warning never aborts the parse.
+#
+# per component line:
+#   - matches no documentable item            -> unknown (misspelled)
+#   - matches an item but has a blank value    -> missing value
+#   - matches an item earlier than the previous documented one -> out of order
+# the order check runs against only the items that ARE documented: the documented
+# components must keep the underlying items' relative order, but gaps between them
+# (undocumented items) are permitted, so a doc covering only `ret`, or only some
+# parameters, is never flagged for order.
+fun check_components(a: *ast.Ast, d: *decl.Decl, source: str, diags: *diag.DiagList) {
+    val count: usize = item_count(d);
+
+    var items: *Item = nil;
+    if (count > 0) {
+        val r: Result[*Item, str] = allocate[Item](a.alloc, count);
+        if (is_err[*Item, str](r)) { ret; }
+        items = unwrap_ok[*Item, str](r);
+        fill_items(a, d, items);
+    }
+
+    var it:   doc.DocComponentIter = doc.component_iter(source, d.doc);
+    var c:    doc.DocComponent;
+    var prev: usize = 0;
+    var have_prev: bool = false;
+
+    for (doc.component_next(?it, ?c)) {
+        val idx: usize = match_item(source, items, count, c.name_span);
+        if (idx == count) {
+            warn(diags, a.file_id, c.name_span, "documented component matches no parameter, field, generic, or `ret` of this declaration");
+            cnt;
+        }
+        if (c.desc_span.len == 0) {
+            warn(diags, a.file_id, c.name_span, "documented component has no description");
+        }
+        if (have_prev && idx < prev) {
+            warn(diags, a.file_id, c.name_span, "documented components are out of declaration order");
+        }
+        prev = idx;
+        have_prev = true;
+    }
+
+    if (items != nil) {
+        deallocate[Item](a.alloc, items, count);
+    }
+}
+
+# fill_items: write the declaration's documentable items into `out` (sized to
+# item_count) in declaration order: for a function its generics, then value
+# parameters, then `ret` when the return type is non-nil; for a rec/uni its
+# generics, then fields.
+fun fill_items(a: *ast.Ast, d: *decl.Decl, out: *Item) {
+    var n: usize = 0;
+
+    if (d.kind == decl.DECL_KIND_FUN) {
+        val f: *decl.DeclFun = ?d.data.fun_;
+        n = put_generics(a, f.generics_start, f.generics_len, out, n);
+        n = put_typed_names(a, f.params_start, f.params_len, out, n);
+        if (f.return_type != id.TYPE_NIL) {
+            out[n].kind     = ITEM_RET;
+            out[n].name_off = 0;
+            out[n].name_len = 0;
+            n = n + 1;
+        }
+        ret;
+    }
+    if (d.kind == decl.DECL_KIND_REC) {
+        val r: *decl.DeclRec = ?d.data.rec_;
+        n = put_generics(a, r.generics_start, r.generics_len, out, n);
+        n = put_typed_names(a, r.fields_start, r.fields_len, out, n);
+        ret;
+    }
+    if (d.kind == decl.DECL_KIND_UNI) {
+        val u: *decl.DeclUni = ?d.data.uni_;
+        n = put_generics(a, u.generics_start, u.generics_len, out, n);
+        n = put_typed_names(a, u.fields_start, u.fields_len, out, n);
+        ret;
+    }
+}
+
+# put_generics: write the generics in `[start, start+len)` as ITEM_GENERIC
+# entries beginning at `n`, returning the new count.
+fun put_generics(a: *ast.Ast, start: u32, len: u32, out: *Item, n: usize) usize {
+    var i: u32 = 0;
+    var cur: usize = n;
+    for (i < len) {
+        val sp: token.Span = a.generic_names[start + i];
+        out[cur].kind     = ITEM_GENERIC;
+        out[cur].name_off = sp.offset;
+        out[cur].name_len = sp.len;
+        cur = cur + 1;
+        i = i + 1;
+    }
+    ret cur;
+}
+
+# put_typed_names: write the parameters/fields in `[start, start+len)` as
+# ITEM_COMPTIME (a `$name` comptime parameter) or ITEM_PLAIN entries beginning at
+# `n`, returning the new count.
+fun put_typed_names(a: *ast.Ast, start: u32, len: u32, out: *Item, n: usize) usize {
+    var i: u32 = 0;
+    var cur: usize = n;
+    for (i < len) {
+        val tn: *decl.TypedName = ?a.typed_names[start + i];
+        if (tn.comptime) { out[cur].kind = ITEM_COMPTIME; } or { out[cur].kind = ITEM_PLAIN; }
+        out[cur].name_off = tn.name.offset;
+        out[cur].name_len = tn.name.len;
+        cur = cur + 1;
+        i = i + 1;
+    }
+    ret cur;
+}
+
+# match_item: the index of the item whose component spelling equals the byte
+# content of `name` within `source`, or `count` when none matches.
+fun match_item(source: str, items: *Item, count: usize, name: token.Span) usize {
+    var i: usize = 0;
+    for (i < count) {
+        if (item_name_eq(source, ?items[i], name)) { ret i; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+# item_name_eq: true when the component span `name` spells item `it` — `[T]` for a
+# generic, `$x` for a comptime parameter, `ret` for the return value, the bare
+# identifier otherwise.
+fun item_name_eq(source: str, it: *Item, name: token.Span) bool {
+    if (it.kind == ITEM_RET) {
+        ret span_eq_str(source, name, "ret");
+    }
+    if (it.kind == ITEM_GENERIC) {
+        # `[` + base + `]`
+        if (name.len != it.name_len + 2) { ret false; }
+        if (source[name.offset] != '[') { ret false; }
+        if (source[name.offset + name.len - 1] != ']') { ret false; }
+        ret bytes_eq(source, name.offset + 1, it.name_off, it.name_len);
+    }
+    if (it.kind == ITEM_COMPTIME) {
+        # `$` + base
+        if (name.len != it.name_len + 1) { ret false; }
+        if (source[name.offset] != '$') { ret false; }
+        ret bytes_eq(source, name.offset + 1, it.name_off, it.name_len);
+    }
+    # plain
+    if (name.len != it.name_len) { ret false; }
+    ret bytes_eq(source, name.offset, it.name_off, it.name_len);
+}
+
+# bytes_eq: true when the `len` bytes at `a_off` equal the `len` bytes at `b_off`
+# within `source`.
+fun bytes_eq(source: str, a_off: usize, b_off: usize, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (source[a_off + i] != source[b_off + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# span_eq_str: true when `span`'s bytes equal the null-terminated string `s`.
+fun span_eq_str(source: str, span: token.Span, s: str) bool {
+    var i: usize = 0;
+    for (i < span.len) {
+        if (s[i] == 0)                       { ret false; }
+        if (source[span.offset + i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret s[span.len] == 0;
+}
+
+# warn: append a docstring warning to the sink, swallowing an allocation failure
+# (a dropped lint warning never aborts a parse).
+fun warn(diags: *diag.DiagList, file_id: src.FileId, span: token.Span, message: str) {
+    val r: Result[bool, str] = diag.warning(diags, file_id, span, message);
+    if (is_err[bool, str](r)) { ret; }
+}
+
+# MSG_UNKNOWN / MSG_NO_DESC / MSG_ORDER: the three lint messages, shared with the
+# tests so an assertion tracks the emitted text exactly.
+val MSG_UNKNOWN: str = "documented component matches no parameter, field, generic, or `ret` of this declaration";
+val MSG_NO_DESC: str = "documented component has no description";
+val MSG_ORDER:   str = "documented components are out of declaration order";
+
+# t_warns: lex+parse `source`, run the lint, and return the number of warnings
+# whose message equals `msg` (the empty string counts every warning). frees all
+# temporaries before returning. a lex/parse setup failure returns a sentinel that
+# never equals a real count, failing the asserting test.
+fun t_warns(source: str, msg: str) usize {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    val tr: Result[lexer.TokenStream, str] = lexer.tokenize(source, ?alloc, 0::src.FileId);
+    if (is_err[lexer.TokenStream, str](tr)) { ret 0xFFFF; }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+
+    var a: ast.Ast = ast.init(?alloc, 0::src.FileId);
+    var diags: diag.DiagList = diag.init(?alloc);
+    var p: parser.Parser = parser.init(?stream, ?a, ?diags);
+    pdecl.parse_module(?p);
+
+    lint_module(?a, stream.source, ?diags);
+
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < diags.len) {
+        val d: *diag.Diagnostic = ?diags.items[i];
+        if (d.severity == diag.SEVERITY_WARNING) {
+            if (strutil.str_empty(msg) || strutil.str_equals(d.message, msg)) { n = n + 1; }
+        }
+        i = i + 1;
+    }
+
+    diag.dnit(?diags);
+    ast.dnit(?a);
+    lexer.dnit(?stream, ?alloc);
+    ret n;
+}
+
+test "doclint: a fully correct fun (generics, comptime, params, ret) warns nothing" {
+    val src: str = "# atomic load\n# ---\n# [T]: element type\n# $order: ordering\n# ptr: pointer\n# ret: loaded value\npub fun load[T]($order: i64, ptr: *T) T { ret @ptr; }";
+    if (t_warns(src, "") != 0) { ret 1; }
+    ret 0;
+}
+
+test "doclint: a misspelled component warns unknown, with no missing-item warning" {
+    # `z` matches no field; the real field `y` simply going undocumented is fine.
+    val src: str = "# a point\n# ---\n# x: horizontal\n# z: misspelled\npub rec Point { x: i64; y: i64; }";
+    if (t_warns(src, MSG_UNKNOWN) != 1) { ret 1; }
+    if (t_warns(src, "")          != 1) { ret 1; }
+    ret 0;
+}
+
+test "doclint: an undocumented item is never flagged (partial documentation is allowed)" {
+    # only `x` documented, `y` omitted: no warning at all.
+    val src: str = "# a point\n# ---\n# x: horizontal\npub rec Point { x: i64; y: i64; }";
+    if (t_warns(src, "") != 0) { ret 1; }
+    ret 0;
+}
+
+test "doclint: a component line with no description warns" {
+    val src: str = "# a point\n# ---\n# x:\npub rec Point { x: i64; y: i64; }";
+    if (t_warns(src, MSG_NO_DESC) != 1) { ret 1; }
+    if (t_warns(src, "")          != 1) { ret 1; }
+    ret 0;
+}
+
+test "doclint: documented components out of declaration order warn order" {
+    # `ret` then `ptr` reverses the underlying order (ptr precedes ret).
+    val src: str = "# swap order\n# ---\n# ret: result\n# ptr: pointer\npub fun oo(ptr: *i64) i64 { ret @ptr; }";
+    if (t_warns(src, MSG_ORDER) != 1) { ret 1; }
+    if (t_warns(src, "")        != 1) { ret 1; }
+    ret 0;
+}
+
+test "doclint: order judges only the documented items, so gaps are not out of order" {
+    # b and d documented (a, c skipped) in their real relative order: clean.
+    val gapped: str = "# four fields\n# ---\n# b: second\n# d: fourth\npub rec R { a: i64; b: i64; c: i64; d: i64; }";
+    if (t_warns(gapped, "") != 0) { ret 1; }
+
+    # documenting only `ret` of a multi-param fun is clean (no order, no missing).
+    val ret_only: str = "# adds\n# ---\n# ret: the sum\npub fun add(x: i64, y: i64) i64 { ret x + y; }";
+    if (t_warns(ret_only, "") != 0) { ret 1; }
+    ret 0;
+}
+
+test "doclint: ret is validated when present and not an item on a void fun" {
+    # a non-nil return with ret documented: clean.
+    val with_ret: str = "# id\n# ---\n# x: the value\n# ret: the value back\npub fun id(x: i64) i64 { ret x; }";
+    if (t_warns(with_ret, "") != 0) { ret 1; }
+
+    # a non-nil return WITHOUT ret documented: allowed (partial docs), no warning.
+    val no_ret_doc: str = "# id\n# ---\n# x: the value\npub fun id(x: i64) i64 { ret x; }";
+    if (t_warns(no_ret_doc, "") != 0) { ret 1; }
+
+    # a void function: ret is not an item, so documenting only the param is clean.
+    val void_fn: str = "# noop\n# ---\n# x: ignored\npub fun noop(x: i64) {}";
+    if (t_warns(void_fn, "") != 0) { ret 1; }
+
+    # a void function that documents ret: ret matches no item -> unknown.
+    val void_ret: str = "# noop\n# ---\n# x: ignored\n# ret: nothing\npub fun noop(x: i64) {}";
+    if (t_warns(void_ret, MSG_UNKNOWN) != 1) { ret 1; }
+    if (t_warns(void_ret, "")          != 1) { ret 1; }
+    ret 0;
+}
+
+test "doclint: a summary-only docstring (no `# ---`) warns nothing" {
+    val src: str = "# yield the CPU\npub fun spin(x: i64) {}";
+    if (t_warns(src, "") != 0) { ret 1; }
+    ret 0;
+}
+
+test "doclint: a decl with no docstring warns nothing" {
+    val src: str = "pub fun bare(x: i64, y: i64) {}";
+    if (t_warns(src, "") != 0) { ret 1; }
+    ret 0;
+}
+
+test "doclint: a non-pub decl with a mismatched block warns nothing" {
+    val src: str = "# private\n# ---\n# bogus: nope\nfun priv(x: i64) {}";
+    if (t_warns(src, "") != 0) { ret 1; }
+    ret 0;
+}
+
+test "doclint: the docstring is read above a `#[...]` decorator, not the decorator" {
+    # the doc sits above the `#[inline]` line; capture skips the decorator, so a
+    # correct block warns nothing.
+    val ok_src: str = "# the answer\n# ---\n# ret: always 42\n#[inline]\npub fun answer() i64 { ret 42; }";
+    if (t_warns(ok_src, "") != 0) { ret 1; }
+
+    # and an unknown component above the decorator is still caught.
+    val bad_src: str = "# the answer\n# ---\n# bogus: nope\n#[inline]\npub fun answer() i64 { ret 42; }";
+    if (t_warns(bad_src, MSG_UNKNOWN) != 1) { ret 1; }
+    if (t_warns(bad_src, "")          != 1) { ret 1; }
+    ret 0;
+}
+
+test "doclint: generic and comptime components must use their [T] / $name forms" {
+    # documenting a generic as the bare `T` (not `[T]`) matches no item -> unknown;
+    # the generic going otherwise undocumented is fine.
+    val bare_generic: str = "# load\n# ---\n# T: element\n# ptr: pointer\npub fun load[T](ptr: *T) { }";
+    if (t_warns(bare_generic, MSG_UNKNOWN) != 1) { ret 1; }
+    if (t_warns(bare_generic, "")          != 1) { ret 1; }
+
+    # the correct `[T]` form is clean.
+    val ok_generic: str = "# load\n# ---\n# [T]: element\n# ptr: pointer\npub fun load[T](ptr: *T) { }";
+    if (t_warns(ok_generic, "") != 0) { ret 1; }
+    ret 0;
+}

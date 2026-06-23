@@ -43,6 +43,21 @@ pub rec LexError {
     code: u8;
 }
 
+# CommentRun: a maximal block of consecutive `#` comment lines, recorded so the
+# parser can attach a declaration's doc-comment block. a run grows while each
+# successive comment line sits directly under the previous one (no blank or code
+# line between); a gap starts a new run. `#[...]` attribute decorators are real
+# tokens, never comments, so they never appear in a run.
+# ---
+# span:       byte range spanning the first comment line's `#` to the end of the last
+# start_line: 1-based source line of the first comment line
+# end_line:   1-based source line of the last comment line
+pub rec CommentRun {
+    span:       token.Span;
+    start_line: usize;
+    end_line:   usize;
+}
+
 # TokenStream: a flat, owning buffer of tokens and lex errors produced over one source file.
 # ---
 # tokens:    contiguous array of tokens ending in KIND_EOF
@@ -53,6 +68,9 @@ pub rec LexError {
 # errors:    contiguous array of LexError; nil if none
 # error_len: number of errors currently stored
 # error_cap: allocated slots in errors (0 when errors is nil)
+# comments:    contiguous array of CommentRun in source order; nil if none
+# comment_len: number of comment runs currently stored
+# comment_cap: allocated slots in comments (0 when comments is nil)
 pub rec TokenStream {
     tokens:    *token.Token;
     len:       usize;
@@ -62,10 +80,14 @@ pub rec TokenStream {
     errors:    *LexError;
     error_len: usize;
     error_cap: usize;
+    comments:    *CommentRun;
+    comment_len: usize;
+    comment_cap: usize;
 }
 
-val INITIAL_CAP:       usize = 256;
-val INITIAL_ERROR_CAP: usize = 8;
+val INITIAL_CAP:         usize = 256;
+val INITIAL_ERROR_CAP:   usize = 8;
+val INITIAL_COMMENT_CAP: usize = 16;
 
 # tokenize: lexes source text into a TokenStream terminated by KIND_EOF.
 # ---
@@ -75,13 +97,16 @@ val INITIAL_ERROR_CAP: usize = 8;
 # ret:     an owning TokenStream, or an allocation error
 pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[TokenStream, str] {
     var stream: TokenStream;
-    stream.source    = source;
-    stream.file_id   = file_id;
-    stream.len       = 0;
-    stream.cap       = INITIAL_CAP;
-    stream.errors    = nil;
-    stream.error_len = 0;
-    stream.error_cap = 0;
+    stream.source      = source;
+    stream.file_id     = file_id;
+    stream.len         = 0;
+    stream.cap         = INITIAL_CAP;
+    stream.errors      = nil;
+    stream.error_len   = 0;
+    stream.error_cap   = 0;
+    stream.comments    = nil;
+    stream.comment_len = 0;
+    stream.comment_cap = 0;
 
     val r_init: Result[*token.Token, str] = allocate[token.Token](alloc, stream.cap);
     if (is_err[*token.Token, str](r_init)) {
@@ -89,11 +114,13 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
     }
     stream.tokens = unwrap_ok[*token.Token, str](r_init);
 
-    var pos: usize = 0;
+    var pos:  usize = 0;
+    var line: usize = 1;
     for (source[pos] != 0) {
         val c: u8 = source[pos];
 
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            if (c == '\n') { line = line + 1; }
             pos = pos + 1;
             cnt;
         }
@@ -102,8 +129,15 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
         # any other `#` is a line comment to end-of-line. a literal comment that
         # begins `#[` therefore needs an intervening space (`# [...]`).
         if (c == '#' && source[pos + 1] != '[') {
+            val comment_start: usize = pos;
+            val comment_line:  usize = line;
             for (source[pos] != 0 && source[pos] != '\n') {
                 pos = pos + 1;
+            }
+            val r_cmt: Result[bool, str] = record_comment(?stream, alloc, comment_start, pos, comment_line);
+            if (is_err[bool, str](r_cmt)) {
+                deallocate[token.Token](alloc, stream.tokens, stream.cap);
+                ret err[TokenStream, str](unwrap_err[bool, str](r_cmt));
             }
             cnt;
         }
@@ -389,12 +423,18 @@ pub fun dnit(stream: *TokenStream, alloc: *Allocator) {
     if (stream.errors != nil && stream.error_cap > 0) {
         deallocate[LexError](alloc, stream.errors, stream.error_cap);
     }
-    stream.tokens    = nil;
-    stream.len       = 0;
-    stream.cap       = 0;
-    stream.errors    = nil;
-    stream.error_len = 0;
-    stream.error_cap = 0;
+    if (stream.comments != nil && stream.comment_cap > 0) {
+        deallocate[CommentRun](alloc, stream.comments, stream.comment_cap);
+    }
+    stream.tokens      = nil;
+    stream.len         = 0;
+    stream.cap         = 0;
+    stream.errors      = nil;
+    stream.error_len   = 0;
+    stream.error_cap   = 0;
+    stream.comments    = nil;
+    stream.comment_len = 0;
+    stream.comment_cap = 0;
 }
 
 # text: returns a length-counted view into the source buffer covering the token's span.
@@ -436,6 +476,94 @@ pub fun emit_diagnostics(stream: *TokenStream, diags: *diag.DiagList) Result[boo
         i = i + 1;
     }
     ret ok[bool, str](true);
+}
+
+# record_comment: fold one `#` comment line into the stream's comment runs. when
+# the line sits directly under the previous run's last line the run is extended
+# (its span and end_line grow to cover this line); otherwise a new run begins. on
+# allocation failure the comment buffer is freed and the error returned.
+# ---
+# stream: stream whose comment runs are updated
+# alloc:  allocator backing the comment buffer
+# start:  byte offset of the `#` opening this comment line
+# end:    byte offset just past the comment line (exclusive of any newline)
+# line:   1-based source line of this comment line
+# ret:    true on success, or an allocation error
+fun record_comment(stream: *TokenStream, alloc: *Allocator, start: usize, end: usize, line: usize) Result[bool, str] {
+    if (stream.comment_len > 0) {
+        val last: *CommentRun = ?stream.comments[stream.comment_len - 1];
+        if (line == last.end_line + 1) {
+            last.span.len = end - last.span.offset;
+            last.end_line = line;
+            ret ok[bool, str](true);
+        }
+    }
+
+    if (stream.comment_len == stream.comment_cap) {
+        val r: Result[*CommentRun, str] = pool.grow[CommentRun](alloc, stream.comments, stream.comment_cap, INITIAL_COMMENT_CAP, ?stream.comment_cap);
+        if (is_err[*CommentRun, str](r)) {
+            if (stream.comments != nil && stream.comment_cap > 0) {
+                deallocate[CommentRun](alloc, stream.comments, stream.comment_cap);
+            }
+            stream.comments    = nil;
+            stream.comment_cap = 0;
+            ret err[bool, str](unwrap_err[*CommentRun, str](r));
+        }
+        stream.comments = unwrap_ok[*CommentRun, str](r);
+    }
+
+    var run: CommentRun;
+    run.span.offset = start;
+    run.span.len    = end - start;
+    run.start_line  = line;
+    run.end_line    = line;
+    stream.comments[stream.comment_len] = run;
+    stream.comment_len = stream.comment_len + 1;
+    ret ok[bool, str](true);
+}
+
+# doc_run_above: the byte span of the comment run whose last line sits directly
+# above the declaration starting at `decl_offset`, or an empty span (len 0) when
+# no comment run abuts it. the parser passes the offset of a declaration's first
+# leading token — its first `#[...]` decorator when decorators are present, else
+# the keyword — so the run found is the doc block above the whole declaration
+# unit, with any attribute lines (which are tokens, not comments) skipped.
+# ---
+# stream:      lexed stream whose comment runs are searched
+# decl_offset: byte offset of the declaration's first leading token
+# ret:         the doc-block span, or a zero-length span when absent
+pub fun doc_run_above(stream: *TokenStream, decl_offset: usize) token.Span {
+    var empty: token.Span;
+    empty.offset = 0;
+    empty.len    = 0;
+
+    if (stream.comment_len == 0) { ret empty; }
+
+    val decl_line: usize = line_at(stream.source, decl_offset);
+
+    var i: usize = stream.comment_len;
+    for (i > 0) {
+        i = i - 1;
+        val run: *CommentRun = ?stream.comments[i];
+        if (run.end_line + 1 == decl_line) { ret run.span; }
+        # runs are stored in source order; once a run ends above the decl line we
+        # can stop — earlier runs end even higher.
+        if (run.end_line < decl_line) { ret empty; }
+    }
+    ret empty;
+}
+
+# line_at: the 1-based source line containing byte `offset`, counting newlines
+# from the start of `source`. used by doc_run_above to place a declaration's
+# first token relative to the recorded comment runs.
+fun line_at(source: str, offset: usize) usize {
+    var line: usize = 1;
+    var i:    usize = 0;
+    for (i < offset && source[i] != 0) {
+        if (source[i] == '\n') { line = line + 1; }
+        i = i + 1;
+    }
+    ret line;
 }
 
 fun push_error(stream: *TokenStream, alloc: *Allocator, offset: usize, len: usize, code: u8) Result[bool, str] {
@@ -659,4 +787,67 @@ test "lexer: a string literal stops at a newline and is reported unterminated (#
 
     dnit(?stream, ?alloc);
     ret 0;
+}
+
+test "lexer: consecutive comment lines fold into one run, a gap splits runs" {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    # two comment lines directly stacked, then a blank line, then a third comment:
+    # the first two fold into one run; the blank line breaks it so the third is
+    # its own run.
+    val tr: Result[TokenStream, str] = tokenize("# a\n# b\n\n# c\nval x: i64 = 1;", ?alloc, 0::src.FileId);
+    if (is_err[TokenStream, str](tr)) { ret 1; }
+    var stream: TokenStream = unwrap_ok[TokenStream, str](tr);
+
+    var rc: i32 = 0;
+    if (stream.comment_len != 2) { rc = 1; }
+    or {
+        # run 0 spans "# a\n# b" (offset 0, lines 1..2)
+        if (stream.comments[0].start_line != 1) { rc = 1; }
+        or (stream.comments[0].end_line  != 2) { rc = 1; }
+        or (stream.comments[0].span.offset != 0) { rc = 1; }
+        or (stream.comments[0].span.len  != 7) { rc = 1; }
+        # run 1 is the lone "# c" on line 4
+        or (stream.comments[1].start_line != 4) { rc = 1; }
+        or (stream.comments[1].end_line  != 4) { rc = 1; }
+    }
+
+    dnit(?stream, ?alloc);
+    ret rc;
+}
+
+test "lexer: doc_run_above finds the run abutting a decl and skips attribute lines" {
+    var alloc: Allocator;
+    page.make(?alloc);
+
+    # doc block, then a `#[...]` attribute line (a real token, never a comment),
+    # then the decl. the doc run ends on line 1; the decl unit's first token is
+    # the `#[` on line 2, so doc_run_above keyed on that offset finds the run.
+    val source: str = "# the doc\n#[inline]\npub fun f() {}";
+    val tr: Result[TokenStream, str] = tokenize(source, ?alloc, 0::src.FileId);
+    if (is_err[TokenStream, str](tr)) { ret 1; }
+    var stream: TokenStream = unwrap_ok[TokenStream, str](tr);
+
+    var rc: i32 = 0;
+    # exactly one comment run (the attribute is not a comment)
+    if (stream.comment_len != 1) { rc = 1; }
+    or {
+        # the first non-comment token is the `#[` attribute opener at offset 10
+        val attr_off: usize = stream.tokens[0].span.offset;
+        if (stream.tokens[0].kind != token.KIND_ATTR_OPEN) { rc = 1; }
+        or (attr_off != 10) { rc = 1; }
+        or {
+            val span: token.Span = doc_run_above(?stream, attr_off);
+            if (span.len == 0) { rc = 1; }
+            or (span.offset != 0) { rc = 1; }
+            or (span.len != 9) { rc = 1; }
+        }
+        # a decl with no abutting comment yields an empty span
+        val none_span: token.Span = doc_run_above(?stream, 999);
+        if (none_span.len != 0) { rc = 1; }
+    }
+
+    dnit(?stream, ?alloc);
+    ret rc;
 }
