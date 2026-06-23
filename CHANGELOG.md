@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.5] - 2026-06-23
+
+`mach doc` now reads first-class documentation, so the compiler, the docstring
+lint, and editor hover all share one doc source.
+
+### Changed
+
+- doc: `mach doc` sources documentation from each decl's `Decl.doc` span via
+  `mach.lang.fe.doc` (walking the parsed AST, recursing into comptime branches)
+  instead of re-scanning raw source text. `#[attr]` decorator lines no longer
+  leak into rendered docs, and component whitespace is normalized. Content after
+  `# ---` that is not a valid `name: desc` component is dropped, matching the
+  lint and hover.
+
 ## [2.5.4] - 2026-06-23
 
 First-class documentation. Doc-comment blocks are now captured on declarations
