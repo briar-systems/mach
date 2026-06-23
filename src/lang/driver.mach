@@ -58,6 +58,7 @@ use src:    mach.lang.source;
 use diag:   mach.lang.diagnostic;
 use intern: mach.lang.intern;
 use sess:   mach.lang.session;
+use astcache: mach.lang.astcache;
 
 use lexer:  mach.lang.fe.lexer;
 use parser: mach.lang.fe.parser;
@@ -220,7 +221,7 @@ pub rec PubConst {
 # ---
 # fqn:            interned fully-qualified module path (e.g. "std.types.bool")
 # file_id:        FileId of the module's source in session.sources
-# a:              parsed AST (owned by the entry; freed by Project.dnit)
+# a:              borrowed parsed AST, owned by the session AST cache (keyed by file_id); nil until parse_module sets it. NOT freed by dnit_project — the cache owns it and reuses it across rebuilds of an unchanged file (#1164)
 # ctx:            comptime context populated during DFS load: target params,
 #                 imports' pub consts, and this-module's pub comptime vals
 # pub_consts:     snapshot of comptime vals declared `pub` in this module
@@ -230,7 +231,7 @@ pub rec PubConst {
 pub rec ModuleEntry {
     fqn:               intern.StrId;
     file_id:           src.FileId;
-    a:                 ast.Ast;
+    a:                 *ast.Ast;
     ctx:               comptime.ComptimeCtx;
     pub_consts:        *PubConst;
     pub_const_count:   u32;
@@ -709,7 +710,7 @@ fun register_export_names(p: *Project) Result[bool, str] {
 
 fun register_module_export_names(p: *Project, mid: sess.ModuleId) Result[bool, str] {
     val m: *ModuleEntry = ?p.modules[mid::u32];
-    val m_opt: Option[*module.Module] = ast.get_module(?m.a, m.a.root_module);
+    val m_opt: Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
     if (is_none[*module.Module](m_opt)) { ret ok[bool, str](true); }
     val mod_node: *module.Module = unwrap[*module.Module](m_opt);
 
@@ -730,7 +731,7 @@ fun register_import_libraries(p: *Project) Result[bool, str] {
     var i: u32 = 0;
     for (i < p.module_len) {
         val m: *ModuleEntry = ?p.modules[i];
-        val m_opt: Option[*module.Module] = ast.get_module(?m.a, m.a.root_module);
+        val m_opt: Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
         if (is_some[*module.Module](m_opt)) {
             val mod_node: *module.Module = unwrap[*module.Module](m_opt);
             val r: Result[bool, str] = bind_import_libraries(p, i::sess.ModuleId, mod_node.decls_start, mod_node.decls_len);
@@ -752,7 +753,7 @@ fun bind_import_libraries(p: *Project, mid: sess.ModuleId, start: u32, len: u32)
     var i: u32 = 0;
     for (i < len) {
         val did: id.DeclId = m.a.decl_ids[start + i];
-        val d_opt: Option[*decl.Decl] = ast.get_decl(?m.a, did);
+        val d_opt: Option[*decl.Decl] = ast.get_decl(m.a, did);
         if (is_some[*decl.Decl](d_opt)) {
             val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
             if (d.kind == decl.DECL_KIND_FUN && (d.flags & decl.DECL_FLAG_EXT) != 0) {
@@ -794,7 +795,7 @@ fun scan_export_directives(p: *Project, mid: sess.ModuleId, source: str, start: 
     var i: u32 = 0;
     for (i < len) {
         val did: id.DeclId = m.a.decl_ids[start + i];
-        val d_opt: Option[*decl.Decl] = ast.get_decl(?m.a, did);
+        val d_opt: Option[*decl.Decl] = ast.get_decl(m.a, did);
         if (is_some[*decl.Decl](d_opt)) {
             val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
             if (d.kind == decl.DECL_KIND_FUN && (d.flags & decl.DECL_FLAG_EXT) != 0) {
@@ -843,7 +844,7 @@ fun register_decl_decorators(p: *Project, mid: sess.ModuleId, source: str, d: *d
 
         if ((is_symbol || is_library) && dec.args_len == 1::u32) {
             val eid: id.ExprId = m.a.expr_ids[dec.args_start];
-            val ve_opt: Option[*expr.Expr] = ast.get_expr(?m.a, eid);
+            val ve_opt: Option[*expr.Expr] = ast.get_expr(m.a, eid);
             if (is_some[*expr.Expr](ve_opt)) {
                 val ve: *expr.Expr = unwrap[*expr.Expr](ve_opt);
                 if (ve.kind == expr.EXPR_KIND_LIT_STR && ve.span.len >= 2::usize) {
@@ -906,9 +907,11 @@ fun span_eq_str(source: str, span: token.Span, s: str) bool {
 # the same closure reuses FileIds instead of growing the SourceMap, and this call's
 # reset_module_registry drops the borrowed AST/sema/resolve/comptime references the
 # freed Project leaves behind — so memory stays bounded and the session stays clean
-# across rebuilds. this does NOT reuse untouched ASTs/resolve results across builds
-# (true incremental rebuild is tracked separately in #1164); each reload re-parses
-# and re-resolves the full closure.
+# across rebuilds. parsed ASTs ARE reused across builds: each `ModuleEntry.a` is
+# borrowed from the session AST cache, which this teardown leaves intact, so an
+# unchanged module's AST survives to the next build (the first slice of incremental
+# rebuild, #1164). resolve results are NOT reused — each reload re-resolves the full
+# closure (resolve-level incremental is a separate, larger effort).
 # ---
 # p: project to tear down; nil is a no-op
 pub fun dnit_project(p: *Project) {
@@ -920,7 +923,8 @@ pub fun dnit_project(p: *Project) {
             resolve.dnit_result(?m.resolve_result);
         }
         comptime.dnit(?m.ctx);
-        ast.dnit(?m.a);
+        # m.a is BORROWED from the session AST cache (parse_module), which owns and
+        # frees it (and reuses it across rebuilds). do NOT free it here.
         if (m.pub_consts != nil && m.pub_const_cap > 0) {
             deallocate[PubConst](p.s.alloc, m.pub_consts, m.pub_const_cap::usize);
         }
@@ -1937,9 +1941,9 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) Result[sess.ModuleId, s
     var m: ModuleEntry;
     m.fqn               = fqn;
     m.file_id           = 0;
-    # initialise an empty Ast up front so the entry is always teardown-safe,
-    # even if parsing never runs (parse_module overwrites it with the real one)
-    m.a                 = ast.init(p.s.alloc, 0);
+    # the AST is borrowed from the session cache; nil until parse_module sets it.
+    # teardown never frees m.a, so a never-parsed entry needs no placeholder AST.
+    m.a                 = nil;
     # resolve the active optimization mode for `$mach.build.mode`: an explicit CLI
     # `-O*`/`--release` flag wins, else the selected target's manifest opt, else
     # debug — mirroring cmd.build.resolve_opt_level so the gate matches the pipeline.
@@ -2148,26 +2152,67 @@ fun parse_module(p: *Project, mid: sess.ModuleId, fqn: intern.StrId) Result[bool
     if (is_none[*src.SourceFile](file_opt)) { ret err[bool, str]("registered FileId not found in SourceMap"); }
     val file: *src.SourceFile = unwrap[*src.SourceFile](file_opt);
 
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    m.file_id = file_id;
+
+    # incremental parse cache (#1164): an unchanged file across rebuilds keeps its
+    # source revision (source.update's identical-text cutoff), so a cache entry at
+    # that revision is a hit — borrow the cached AST and skip tokenize + parse. the
+    # cache owns the AST; m.a only borrows it (dnit_project never frees it).
+    val cached: *ast.Ast = astcache.lookup(?p.s.ast_cache, file_id, file.revision);
+    if (cached != nil) {
+        m.a = cached;
+        ret ok[bool, str](true);
+    }
+
     emit_stage(p, "lex", fqn);
     val tok_r: Result[lexer.TokenStream, str] = lexer.tokenize(file.text, p.s.alloc, file_id);
     if (is_err[lexer.TokenStream, str](tok_r)) { ret err[bool, str](unwrap_err[lexer.TokenStream, str](tok_r)); }
     var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tok_r);
 
-    val m: *ModuleEntry = ?p.modules[mid::u32];
-    m.file_id = file_id;
-    m.a       = ast.init(p.s.alloc, file_id);
+    # allocate the heap AST the cache will own; parse writes into it. on any failure
+    # before it is published to the cache, free it here (it is owned by nobody yet).
+    val ar: Result[*ast.Ast, str] = allocate[ast.Ast](p.s.alloc, 1::usize);
+    if (is_err[*ast.Ast, str](ar)) {
+        lexer.dnit(?stream, p.s.alloc);
+        ret err[bool, str](unwrap_err[*ast.Ast, str](ar));
+    }
+    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](ar);
+    a[0] = ast.init(p.s.alloc, file_id);
+
     val le_r: Result[bool, str] = lexer.emit_diagnostics(?stream, ?p.s.diags);
     if (is_err[bool, str](le_r)) {
+        free_uncached_ast(p, a);
         lexer.dnit(?stream, p.s.alloc);
         ret err[bool, str](unwrap_err[bool, str](le_r));
     }
     emit_stage(p, "parse", fqn);
-    val fatal: bool = parser.parse(?stream, ?m.a, ?p.s.diags);
+    val fatal: bool = parser.parse(?stream, a, ?p.s.diags);
     lexer.dnit(?stream, p.s.alloc);
     # a fatal allocation failure leaves the AST incomplete; refuse to walk it
     # (the parser already emitted the OOM diagnostic onto the sink).
-    if (fatal) { ret err[bool, str]("out of memory while parsing module"); }
+    if (fatal) {
+        free_uncached_ast(p, a);
+        ret err[bool, str]("out of memory while parsing module");
+    }
+
+    # publish into the cache, which takes ownership and frees any stale entry for
+    # this FileId from a prior, now-superseded revision. m.a then borrows it.
+    val store_r: Result[bool, str] = astcache.store(?p.s.ast_cache, file_id, file.revision, a);
+    if (is_err[bool, str](store_r)) {
+        free_uncached_ast(p, a);
+        ret err[bool, str](unwrap_err[bool, str](store_r));
+    }
+    m.a = a;
     ret ok[bool, str](true);
+}
+
+# free_uncached_ast: tear down a freshly-parsed heap AST that never reached the
+# session cache (an error path in parse_module). the cache owns every AST it
+# accepts, so this only fires before the store hands ownership over.
+fun free_uncached_ast(p: *Project, a: *ast.Ast) {
+    ast.dnit(a);
+    deallocate[ast.Ast](p.s.alloc, a, 1::usize);
 }
 
 # walk_module_for_load: walk the module's decls in source order,
@@ -2176,7 +2221,7 @@ fun parse_module(p: *Project, mid: sess.ModuleId, fqn: intern.StrId) Result[bool
 # val initializers for export.
 fun walk_module_for_load(p: *Project, mid: sess.ModuleId) Result[bool, str] {
     val m: *ModuleEntry = ?p.modules[mid::u32];
-    val m_opt: Option[*module.Module] = ast.get_module(?m.a, m.a.root_module);
+    val m_opt: Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
     if (is_none[*module.Module](m_opt)) { ret err[bool, str]("module root not set on Ast"); }
     val mod_node: *module.Module = unwrap[*module.Module](m_opt);
     ret walk_decl_list_for_load(p, mid, mod_node.decls_start, mod_node.decls_len);
@@ -2195,7 +2240,7 @@ fun walk_decl_list_for_load(p: *Project, mid: sess.ModuleId, start: u32, len: u3
 
 fun walk_one_decl_for_load(p: *Project, mid: sess.ModuleId, did: id.DeclId) Result[bool, str] {
     val m: *ModuleEntry = ?p.modules[mid::u32];
-    val d_opt: Option[*decl.Decl] = ast.get_decl(?m.a, did);
+    val d_opt: Option[*decl.Decl] = ast.get_decl(m.a, did);
     if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range during walk"); }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
 
@@ -2247,8 +2292,8 @@ fun walk_comptime_if_for_load(p: *Project, mid: sess.ModuleId, ci: *decl.DeclCom
 fun comptime_branch_active_load(p: *Project, mid: sess.ModuleId, br: *decl.ComptimeBranch, source: str, emit_diag: bool) Result[bool, str] {
     if (br.cond == id.EXPR_NIL) { ret ok[bool, str](true); }
     val m: *ModuleEntry = ?p.modules[mid::u32];
-    val r: Result[comptime.CTValue, str] = comptime.eval(?m.ctx, ?m.a, source, br.cond, ?p.s.interner);
-    val e_opt: Option[*expr.Expr] = ast.get_expr(?m.a, br.cond);
+    val r: Result[comptime.CTValue, str] = comptime.eval(?m.ctx, m.a, source, br.cond, ?p.s.interner);
+    val e_opt: Option[*expr.Expr] = ast.get_expr(m.a, br.cond);
     if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("comptime branch cond ExprId out of range"); }
     val cond_span: token.Span = unwrap[*expr.Expr](e_opt).span;
     if (is_err[comptime.CTValue, str](r)) {
@@ -2675,7 +2720,7 @@ fun register_val_for_load(p: *Project, mid: sess.ModuleId, d: *decl.Decl, _did: 
     # evaluation errors "identifier is not a comptime constant in scope" if the
     # name was never registered. do not promote this skip to a hard
     # definition-site error.
-    val r_val: Result[comptime.CTValue, str] = comptime.eval(?m.ctx, ?m.a, source, d.data.bind.init, ?p.s.interner);
+    val r_val: Result[comptime.CTValue, str] = comptime.eval(?m.ctx, m.a, source, d.data.bind.init, ?p.s.interner);
     if (is_err[comptime.CTValue, str](r_val)) { ret ok[bool, str](true); }
     val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r_val);
 
@@ -2741,7 +2786,7 @@ fun register_module_asts(p: *Project) Result[bool, str] {
     var i: u32 = 0;
     for (i < p.module_len) {
         val m: *ModuleEntry = ?p.modules[i];
-        val r: Result[bool, str] = sess.register_module_ast(p.s, i, ?m.a);
+        val r: Result[bool, str] = sess.register_module_ast(p.s, i, m.a);
         if (is_err[bool, str](r)) { ret r; }
         val rf: Result[bool, str] = sess.register_module_fqn(p.s, i, m.fqn);
         if (is_err[bool, str](rf)) { ret rf; }
@@ -2794,7 +2839,7 @@ fun run_resolve_one(p: *Project, mid: sess.ModuleId, visited: *bool, list: *sess
     if (is_err[resolve.ResolveDeps, str](deps_r)) { ret err[bool, str](unwrap_err[resolve.ResolveDeps, str](deps_r)); }
     var deps: resolve.ResolveDeps = unwrap_ok[resolve.ResolveDeps, str](deps_r);
 
-    val rr_r: Result[resolve.ResolveResult, str] = resolve.resolve(p.s, ?m.a, ?deps, ?m.ctx, mid);
+    val rr_r: Result[resolve.ResolveResult, str] = resolve.resolve(p.s, m.a, ?deps, ?m.ctx, mid);
     free_resolve_deps(p.s.alloc, ?deps);
     if (is_err[resolve.ResolveResult, str](rr_r)) { ret err[bool, str](unwrap_err[resolve.ResolveResult, str](rr_r)); }
 
@@ -3627,6 +3672,73 @@ test "driver reload: a Session rebuilds after dnit_project, deduping changed sou
     if (len2 != len1) { bad = 1; }
 
     dnit_project(?p2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver incremental: an unchanged rebuild reuses cached ASTs; an edit re-parses only the changed file (#1576)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    val rr: Result[bool, str] = tgt.register_all(?s.registry);
+    if (is_err[bool, str](rr)) { sess.dnit(?s); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "a.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.a;\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+
+    # one root, three builds on it: the source paths stay identical so each module's
+    # FileId is stable and the session AST cache can hit across builds.
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (is_err[str, str](root_r)) { sess.dnit(?s); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: a cold cache — every module parses and is stored, none reused.
+    val p1r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p1r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p1: Project = unwrap_ok[Project, str](p1r);
+    val n_mods: u32 = s.ast_cache.len;
+    if (n_mods == 0) { bad = 1; }
+    if (s.ast_cache.hits != 0) { bad = 1; }
+    if (s.ast_cache.misses != n_mods::u64) { bad = 1; }
+    dnit_project(?p1);
+
+    # build 2: nothing changed. source.update's identical-text cutoff keeps every
+    # file's revision, so every module is a cache hit — no module re-parses and the
+    # cache neither grows nor records a new miss.
+    val p2r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p2r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p2: Project = unwrap_ok[Project, str](p2r);
+    if (s.ast_cache.len != n_mods) { bad = 1; }
+    if (s.ast_cache.hits != n_mods::u64) { bad = 1; }
+    if (s.ast_cache.misses != n_mods::u64) { bad = 1; }
+    dnit_project(?p2);
+
+    # edit a.mach in place (same path → same FileId). its revision bumps, so it is a
+    # cache miss that re-parses and replaces the stale AST; main is unchanged and
+    # still hits. exactly one new miss, one new hit, and no new cache entry.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path: str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val new_a: str = "pub fun fa() i32 { ret 2; }\n";
+    val wr: Result[bool, str] = fs.write_file(a_path, new_a, str_len(new_a), 420);
+    if (is_err[bool, str](wr)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+
+    val p3r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p3r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p3: Project = unwrap_ok[Project, str](p3r);
+    if (s.ast_cache.len != n_mods) { bad = 1; }
+    if (s.ast_cache.misses != (n_mods + 1)::u64) { bad = 1; }
+    if (s.ast_cache.hits != (n_mods + n_mods - 1)::u64) { bad = 1; }
+    dnit_project(?p3);
+
     fs.remove_all(?alloc, root);
     sess.dnit(?s);
     ret bad;
