@@ -1,0 +1,309 @@
+# mach.lang.fe.doclint: the docstring component lint.
+#
+# a post-parse pass over a module AST that validates `# <component>:` lines in a
+# declaration's docstring against the declaration's documentable items. it fires
+# only for `pub` declarations whose docstring carries a `# ---` component block;
+# a non-`pub` decl, a decl with no docstring, and a summary-only docstring are
+# all silent. a docstring is never required. validated kinds are `fun`, `rec`,
+# and `uni` — the declaration forms that expose documentable items.
+#
+# the lint emits WARNINGs to the session diagnostic list (source `mach`) and runs
+# from the parser's public entry, so both the build/check path and the editor
+# parse path surface it.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use token: mach.lang.fe.token;
+use ast:   mach.lang.fe.ast;
+use id:    mach.lang.fe.ast.id;
+use decl:  mach.lang.fe.ast.decl;
+use doc:   mach.lang.fe.doc;
+use diag:  mach.lang.diagnostic;
+use src:   mach.lang.source;
+
+# ItemKind: how a documentable item's component name is spelled.
+def ItemKind: u8;
+# ITEM_GENERIC: a generic type parameter, written `[T]`.
+val ITEM_GENERIC: ItemKind = 0;
+# ITEM_COMPTIME: a comptime value parameter, written `$name`.
+val ITEM_COMPTIME: ItemKind = 1;
+# ITEM_PLAIN: a value parameter or field, written by its bare name.
+val ITEM_PLAIN: ItemKind = 2;
+# ITEM_RET: a function return value, written `ret`.
+val ITEM_RET: ItemKind = 3;
+
+# Item: one documentable item of a declaration in declaration order.
+# ---
+# kind:     how the component name is spelled
+# name_off: byte offset of the item's base identifier in source (unused for ret)
+# name_len: byte length of the base identifier (unused for ret)
+rec Item {
+    kind:     ItemKind;
+    name_off: usize;
+    name_len: usize;
+}
+
+# lint_module: validate every documentable `pub` declaration in `a` and append a
+# WARNING to `diags` for each mismatch. a no-op for decls that are non-`pub`, have
+# no docstring, or carry a summary-only docstring. walks the flat decl pool, so
+# module-scope, comptime-branch, and (never-`pub`) local decls are all covered.
+# ---
+# a:      the parsed module AST
+# source: the module's source text (the doc spans point into it)
+# diags:  diagnostic sink the warnings are appended to
+pub fun lint_module(a: *ast.Ast, source: str, diags: *diag.DiagList) {
+    var i: usize = 0;
+    for (i < a.decl_len) {
+        lint_decl(a, ?a.decls[i], source, diags);
+        i = i + 1;
+    }
+}
+
+# lint_decl: run the component lint for one declaration when it is in scope —
+# `pub`, documentable (fun/rec/uni), and carrying a `# ---` component block.
+fun lint_decl(a: *ast.Ast, d: *decl.Decl, source: str, diags: *diag.DiagList) {
+    if ((d.flags & decl.DECL_FLAG_PUB) == 0) { ret; }
+    if (d.doc.len == 0) { ret; }
+    if (!is_documentable(d.kind)) { ret; }
+    if (!doc.has_component_block(source, d.doc)) { ret; }
+    check_components(a, d, source, diags);
+}
+
+# is_documentable: true for the declaration kinds that expose documentable items
+# (functions, records, unions) — the kinds whose docstrings carry component lines.
+fun is_documentable(kind: decl.DeclKind) bool {
+    ret kind == decl.DECL_KIND_FUN
+     || kind == decl.DECL_KIND_REC
+     || kind == decl.DECL_KIND_UNI;
+}
+
+# item_count: the number of documentable items a declaration exposes: generics
+# plus parameters/fields, plus one for a function's non-nil return.
+fun item_count(d: *decl.Decl) usize {
+    if (d.kind == decl.DECL_KIND_FUN) {
+        val f: *decl.DeclFun = ?d.data.fun_;
+        var n: usize = f.generics_len::usize + f.params_len::usize;
+        if (f.return_type != id.TYPE_NIL) { n = n + 1; }
+        ret n;
+    }
+    if (d.kind == decl.DECL_KIND_REC) {
+        val r: *decl.DeclRec = ?d.data.rec_;
+        ret r.generics_len::usize + r.fields_len::usize;
+    }
+    if (d.kind == decl.DECL_KIND_UNI) {
+        val u: *decl.DeclUni = ?d.data.uni_;
+        ret u.generics_len::usize + u.fields_len::usize;
+    }
+    ret 0;
+}
+
+# check_components: the lint body for a decl already known to be in scope. builds
+# the declaration's ordered item list, then walks the docstring's component lines
+# once for unknown / out-of-order findings and the item list once for missing
+# findings. a buffer allocation failure drops the lint silently — a missing
+# warning never aborts the parse.
+fun check_components(a: *ast.Ast, d: *decl.Decl, source: str, diags: *diag.DiagList) {
+    val count: usize = item_count(d);
+
+    var items: *Item = nil;
+    if (count > 0) {
+        val r: Result[*Item, str] = allocate[Item](a.alloc, count);
+        if (is_err[*Item, str](r)) { ret; }
+        items = unwrap_ok[*Item, str](r);
+        fill_items(a, d, items);
+    }
+
+    var it:   doc.DocComponentIter = doc.component_iter(source, d.doc);
+    var c:    doc.DocComponent;
+    var prev: usize = 0;
+    var have_prev: bool = false;
+
+    for (doc.component_next(?it, ?c)) {
+        val idx: usize = match_item(source, items, count, c.name_span);
+        if (idx == count) {
+            warn(diags, a.file_id, c.name_span, "documented component matches no parameter, field, generic, or `ret` of this declaration");
+            cnt;
+        }
+        if (have_prev && idx < prev) {
+            warn(diags, a.file_id, c.name_span, "documented components are out of declaration order");
+        }
+        prev = idx;
+        have_prev = true;
+    }
+
+    # missing: any item never named by a component line.
+    var k: usize = 0;
+    for (k < count) {
+        if (!item_documented(source, d.doc, ?items[k])) {
+            warn(diags, a.file_id, decl_name_span(d), "declaration item is missing a documented component");
+        }
+        k = k + 1;
+    }
+
+    if (items != nil) {
+        deallocate[Item](a.alloc, items, count);
+    }
+}
+
+# fill_items: write the declaration's documentable items into `out` (sized to
+# item_count) in declaration order: for a function its generics, then value
+# parameters, then `ret` when the return type is non-nil; for a rec/uni its
+# generics, then fields.
+fun fill_items(a: *ast.Ast, d: *decl.Decl, out: *Item) {
+    var n: usize = 0;
+
+    if (d.kind == decl.DECL_KIND_FUN) {
+        val f: *decl.DeclFun = ?d.data.fun_;
+        n = put_generics(a, f.generics_start, f.generics_len, out, n);
+        n = put_typed_names(a, f.params_start, f.params_len, out, n);
+        if (f.return_type != id.TYPE_NIL) {
+            out[n].kind     = ITEM_RET;
+            out[n].name_off = 0;
+            out[n].name_len = 0;
+            n = n + 1;
+        }
+        ret;
+    }
+    if (d.kind == decl.DECL_KIND_REC) {
+        val r: *decl.DeclRec = ?d.data.rec_;
+        n = put_generics(a, r.generics_start, r.generics_len, out, n);
+        n = put_typed_names(a, r.fields_start, r.fields_len, out, n);
+        ret;
+    }
+    if (d.kind == decl.DECL_KIND_UNI) {
+        val u: *decl.DeclUni = ?d.data.uni_;
+        n = put_generics(a, u.generics_start, u.generics_len, out, n);
+        n = put_typed_names(a, u.fields_start, u.fields_len, out, n);
+        ret;
+    }
+}
+
+# put_generics: write the generics in `[start, start+len)` as ITEM_GENERIC
+# entries beginning at `n`, returning the new count.
+fun put_generics(a: *ast.Ast, start: u32, len: u32, out: *Item, n: usize) usize {
+    var i: u32 = 0;
+    var cur: usize = n;
+    for (i < len) {
+        val sp: token.Span = a.generic_names[start + i];
+        out[cur].kind     = ITEM_GENERIC;
+        out[cur].name_off = sp.offset;
+        out[cur].name_len = sp.len;
+        cur = cur + 1;
+        i = i + 1;
+    }
+    ret cur;
+}
+
+# put_typed_names: write the parameters/fields in `[start, start+len)` as
+# ITEM_COMPTIME (a `$name` comptime parameter) or ITEM_PLAIN entries beginning at
+# `n`, returning the new count.
+fun put_typed_names(a: *ast.Ast, start: u32, len: u32, out: *Item, n: usize) usize {
+    var i: u32 = 0;
+    var cur: usize = n;
+    for (i < len) {
+        val tn: *decl.TypedName = ?a.typed_names[start + i];
+        if (tn.comptime) { out[cur].kind = ITEM_COMPTIME; } or { out[cur].kind = ITEM_PLAIN; }
+        out[cur].name_off = tn.name.offset;
+        out[cur].name_len = tn.name.len;
+        cur = cur + 1;
+        i = i + 1;
+    }
+    ret cur;
+}
+
+# match_item: the index of the item whose component spelling equals the byte
+# content of `name` within `source`, or `count` when none matches.
+fun match_item(source: str, items: *Item, count: usize, name: token.Span) usize {
+    var i: usize = 0;
+    for (i < count) {
+        if (item_name_eq(source, ?items[i], name)) { ret i; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+# item_name_eq: true when the component span `name` spells item `it` — `[T]` for a
+# generic, `$x` for a comptime parameter, `ret` for the return value, the bare
+# identifier otherwise.
+fun item_name_eq(source: str, it: *Item, name: token.Span) bool {
+    if (it.kind == ITEM_RET) {
+        ret span_eq_str(source, name, "ret");
+    }
+    if (it.kind == ITEM_GENERIC) {
+        # `[` + base + `]`
+        if (name.len != it.name_len + 2) { ret false; }
+        if (source[name.offset] != '[') { ret false; }
+        if (source[name.offset + name.len - 1] != ']') { ret false; }
+        ret bytes_eq(source, name.offset + 1, it.name_off, it.name_len);
+    }
+    if (it.kind == ITEM_COMPTIME) {
+        # `$` + base
+        if (name.len != it.name_len + 1) { ret false; }
+        if (source[name.offset] != '$') { ret false; }
+        ret bytes_eq(source, name.offset + 1, it.name_off, it.name_len);
+    }
+    # plain
+    if (name.len != it.name_len) { ret false; }
+    ret bytes_eq(source, name.offset, it.name_off, it.name_len);
+}
+
+# item_documented: true when some component line in doc block `doc_span` spells
+# item `it`. used for the missing-component pass.
+fun item_documented(source: str, doc_span: token.Span, it: *Item) bool {
+    var iter: doc.DocComponentIter = doc.component_iter(source, doc_span);
+    var c: doc.DocComponent;
+    for (doc.component_next(?iter, ?c)) {
+        if (item_name_eq(source, it, c.name_span)) { ret true; }
+    }
+    ret false;
+}
+
+# bytes_eq: true when the `len` bytes at `a_off` equal the `len` bytes at `b_off`
+# within `source`.
+fun bytes_eq(source: str, a_off: usize, b_off: usize, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (source[a_off + i] != source[b_off + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# span_eq_str: true when `span`'s bytes equal the null-terminated string `s`.
+fun span_eq_str(source: str, span: token.Span, s: str) bool {
+    var i: usize = 0;
+    for (i < span.len) {
+        if (s[i] == 0)                       { ret false; }
+        if (source[span.offset + i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret s[span.len] == 0;
+}
+
+# decl_name_span: the span of a declaration's identifier, used to anchor a
+# missing-component warning. falls back to the decl's full span for kinds without
+# a single name (never reached for the documentable kinds).
+fun decl_name_span(d: *decl.Decl) token.Span {
+    if (d.kind == decl.DECL_KIND_FUN) { ret (?d.data.fun_).name; }
+    if (d.kind == decl.DECL_KIND_REC) { ret (?d.data.rec_).name; }
+    if (d.kind == decl.DECL_KIND_UNI) { ret (?d.data.uni_).name; }
+    ret d.span;
+}
+
+# warn: append a docstring warning to the sink, swallowing an allocation failure
+# (a dropped lint warning never aborts a parse).
+fun warn(diags: *diag.DiagList, file_id: src.FileId, span: token.Span, message: str) {
+    val r: Result[bool, str] = diag.warning(diags, file_id, span, message);
+    if (is_err[bool, str](r)) { ret; }
+}
