@@ -228,6 +228,9 @@ pub rec PubConst {
 # deps:           ModuleIds this module directly depends on (active uses only)
 # resolve_result: filled in by run_resolve_pass (zero-initialized otherwise)
 # resolved:       true once resolve has run
+# stable_id:      this module's build-stable identity (session-assigned by FQN);
+#                 unlike the discovery-order ModuleId, it survives a graph reshape,
+#                 so cross-build resolve/sema reuse remaps through it (#1579)
 pub rec ModuleEntry {
     fqn:               intern.StrId;
     file_id:           src.FileId;
@@ -241,6 +244,7 @@ pub rec ModuleEntry {
     dep_cap:           u32;
     resolve_result:    resolve.ResolveResult;
     resolved:          bool;
+    stable_id:         sess.StableModuleId;
 }
 
 # LoadStatus: load state for one module during DFS.
@@ -1946,9 +1950,16 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) Result[sess.ModuleId, s
     }
     val mid: sess.ModuleId = p.module_len;
 
+    # the build-stable identity for this FQN (session-assigned, persisted across
+    # rebuilds) — the discovery-order `mid` above reshuffles on a graph reshape,
+    # this does not (#1579).
+    val sid_r: Result[sess.StableModuleId, str] = sess.stable_module_id(p.s, fqn);
+    if (is_err[sess.StableModuleId, str](sid_r)) { ret err[sess.ModuleId, str](unwrap_err[sess.StableModuleId, str](sid_r)); }
+
     var m: ModuleEntry;
     m.fqn               = fqn;
     m.file_id           = 0;
+    m.stable_id         = unwrap_ok[sess.StableModuleId, str](sid_r);
     # the AST is borrowed from the session cache; nil until parse_module sets it.
     # teardown never frees m.a, so a never-parsed entry needs no placeholder AST.
     m.a                 = nil;
@@ -3244,6 +3255,26 @@ fun ut_ast(p: *Project, s: *sess.Session, fqn: str) *ast.Ast {
     ret p.modules[mid::u32].a;
 }
 
+# ut_mid: the discovery-order ModuleId of module `fqn` in project `p`, or
+# MODULE_NIL when absent. used by the stable-identity test to observe the
+# per-build id reshuffling a graph reshape causes.
+fun ut_mid(p: *Project, s: *sess.Session, fqn: str) sess.ModuleId {
+    val idr: Result[intern.StrId, str] = intern.intern(?s.interner, fqn);
+    if (is_err[intern.StrId, str](idr)) { ret sess.MODULE_NIL; }
+    var id: intern.StrId = unwrap_ok[intern.StrId, str](idr);
+    val mr: Result[*sess.ModuleId, str] = map.get[intern.StrId, sess.ModuleId](?p.by_fqn, ?id);
+    if (is_err[*sess.ModuleId, str](mr)) { ret sess.MODULE_NIL; }
+    ret @unwrap_ok[*sess.ModuleId, str](mr);
+}
+
+# ut_stable: the build-stable StableModuleId of module `fqn` in project `p` (the
+# session-assigned identity), or STABLE_MODULE_NIL when absent.
+fun ut_stable(p: *Project, s: *sess.Session, fqn: str) sess.StableModuleId {
+    val mid: sess.ModuleId = ut_mid(p, s, fqn);
+    if (mid == sess.MODULE_NIL) { ret sess.STABLE_MODULE_NIL; }
+    ret p.modules[mid::u32].stable_id;
+}
+
 # ut_ctx: the comptime ctx of the named module, or nil if it was not loaded.
 fun ut_ctx(p: *Project, s: *sess.Session, fqn: str) *comptime.ComptimeCtx {
     val idr: Result[intern.StrId, str] = intern.intern(?s.interner, fqn);
@@ -3817,6 +3848,74 @@ test "driver incremental: an unchanged rebuild reuses Q_PARSE ASTs; an edit re-p
     if (ut_ast(?p3, ?s, "uniontest.main") != main1) { bad = 1; }   # unchanged: reused
     if (ut_ast(?p3, ?s, "uniontest.a")    == a1)    { bad = 1; }   # edited: re-parsed
     dnit_project(?p3);
+
+    fs.remove_all(?alloc, root);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver incremental: a module keeps its stable identity across a graph reshape (#1579)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    val rr: Result[bool, str] = tgt.register_all(?s.registry);
+    if (is_err[bool, str](rr)) { sess.dnit(?s); ret 1; }
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a;\nuse uniontest.b;\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (is_err[str, str](root_r)) { sess.dnit(?s); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: main uses a then b, so the DFS discovers a before b.
+    val p1r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p1r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p1: Project = unwrap_ok[Project, str](p1r);
+    val mid_a1: sess.ModuleId = ut_mid(?p1, ?s, "uniontest.a");
+    val mid_b1: sess.ModuleId = ut_mid(?p1, ?s, "uniontest.b");
+    val sid_main1: sess.StableModuleId = ut_stable(?p1, ?s, "uniontest.main");
+    val sid_a1: sess.StableModuleId = ut_stable(?p1, ?s, "uniontest.a");
+    val sid_b1: sess.StableModuleId = ut_stable(?p1, ?s, "uniontest.b");
+    if (mid_a1 == sess.MODULE_NIL || mid_b1 == sess.MODULE_NIL) { bad = 1; }
+    if (sid_a1 == sess.STABLE_MODULE_NIL || sid_b1 == sess.STABLE_MODULE_NIL) { bad = 1; }
+    dnit_project(?p1);
+
+    # reshape the graph: swap main's use order so the DFS discovers b before a.
+    # their discovery-order ModuleIds swap; their stable identities must not.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val main_path: str = ut_cc3(?alloc, src_dir, "/", "main.mach");
+    val new_main: str = "use uniontest.b;\nuse uniontest.a;\n\nfun main() i32 { ret 0; }\n";
+    val wr: Result[bool, str] = fs.write_file(main_path, new_main, str_len(new_main), 420);
+    if (is_err[bool, str](wr)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+
+    # build 2 on the same session.
+    val p2r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p2r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p2: Project = unwrap_ok[Project, str](p2r);
+    val mid_a2: sess.ModuleId = ut_mid(?p2, ?s, "uniontest.a");
+    val mid_b2: sess.ModuleId = ut_mid(?p2, ?s, "uniontest.b");
+    val sid_main2: sess.StableModuleId = ut_stable(?p2, ?s, "uniontest.main");
+    val sid_a2: sess.StableModuleId = ut_stable(?p2, ?s, "uniontest.a");
+    val sid_b2: sess.StableModuleId = ut_stable(?p2, ?s, "uniontest.b");
+
+    # the reshape moved at least one module's discovery-order ModuleId (proving the
+    # test exercises a real renumbering) ...
+    if (mid_a1 == mid_a2 && mid_b1 == mid_b2) { bad = 1; }
+    # ... while every module kept its build-stable identity across it.
+    if (sid_main2 != sid_main1) { bad = 1; }
+    if (sid_a2 != sid_a1) { bad = 1; }
+    if (sid_b2 != sid_b1) { bad = 1; }
+    dnit_project(?p2);
 
     fs.remove_all(?alloc, root);
     sess.dnit(?s);
