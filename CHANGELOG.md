@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.3] - 2026-06-23
+
+Front-end performance and visibility. Bumps mach-std to 0.14.1, whose
+linear-time `str_region_equals` removes the quadratic-parse stall that froze the
+front-end of stdlib-heavy builds.
+
+### Added
+
+- build: `--verbose` now streams per-module `lex`/`parse`/`resolve` lines during
+  the front-end, alongside the existing `sema`/`lower`/`codegen` stages (#1567).
+
+### Changed
+
+- resolve: hash-index the module scope for O(1) name lookups instead of a linear
+  scan (#1565).
+- driver: hoist the resolve dep-closure scratch out of the per-module loop,
+  removing O(modules²) allocation during the resolve pass (#1565).
+- deps: bump mach-std to 0.14.1 (linear `str_region_equals`).
+
 ## [2.5.2] - 2026-06-22
 
 Patch — const-string global references now fold correctly.
