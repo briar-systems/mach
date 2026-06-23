@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.4] - 2026-06-23
+
+First-class documentation. Doc-comment blocks are now captured on declarations
+and validated by a docstring lint, laying the groundwork for editor hover and
+`mach doc` to share one source of truth.
+
+### Added
+
+- fe: capture each declaration's doc-comment block as a span on `Decl`
+  (attribute-aware — `#[...]` lines between the docstring and the decl are
+  skipped), plus `fe/doc.mach`, an allocation-free doc-block parser exposing the
+  summary and component lines with their name/description spans.
+- fe: a `pub`-scoped docstring lint (`fe/doclint.mach`) that warns when a
+  documented component names no real parameter/field/generic/`ret`
+  (misspelled), is out of declaration order (judged over the documented subset,
+  so partial docs are fine), or has an empty description. It does NOT require
+  completeness — undocumented items are never flagged.
+
+### Fixed
+
+- fe: the doc-block parser no longer mistakes a wrapped prose continuation line
+  beginning `word:` for a component head (continuation lines are indented past
+  the `# name` column).
+
 ## [2.5.3] - 2026-06-23
 
 Front-end performance and visibility. Bumps mach-std to 0.14.1, whose
