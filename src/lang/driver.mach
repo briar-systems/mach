@@ -66,6 +66,8 @@ use ast:    mach.lang.fe.ast;
 use id:     mach.lang.fe.ast.id;
 use module: mach.lang.fe.ast.module;
 use decl:   mach.lang.fe.ast.decl;
+use stmt:   mach.lang.fe.ast.stmt;
+use mem:    std.memory;
 use expr:   mach.lang.fe.ast.expr;
 use token:  mach.lang.fe.token;
 
@@ -2187,12 +2189,21 @@ fun parse_module(p: *Project, mid: sess.ModuleId, fqn: intern.StrId) Result[bool
 
 # ensure_query_pipeline: bind the query db's compute context to the session and
 # register the driver-owned derived kinds the build routes through. set_ctx is
-# refreshed every build (the session address is stable); Q_PARSE is registered
-# exactly once per session (registered() guards the idempotent re-call).
+# refreshed every build (the session address is stable); each kind is registered
+# exactly once per session (registered() guards the idempotent re-call). Q_PARSE
+# carries an opaque AST handle (owned); Q_EXPORTS is a plain byte fingerprint with
+# output early-cutoff — the firewall — so it is a plain derived kind.
 fun ensure_query_pipeline(s: *sess.Session) Result[bool, str] {
     query.set_ctx(?s.queries, s::ptr);
-    if (query.registered(?s.queries, query.Q_PARSE)) { ret ok[bool, str](true); }
-    ret query.register_derived_owned(?s.queries, query.Q_PARSE, q_parse_compute, q_parse_finalize);
+    if (!query.registered(?s.queries, query.Q_PARSE)) {
+        val rp: Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_PARSE, q_parse_compute, q_parse_finalize);
+        if (is_err[bool, str](rp)) { ret rp; }
+    }
+    if (!query.registered(?s.queries, query.Q_EXPORTS)) {
+        val re: Result[bool, str] = query.register_derived(?s.queries, query.Q_EXPORTS, q_exports_compute);
+        if (is_err[bool, str](re)) { ret re; }
+    }
+    ret ok[bool, str](true);
 }
 
 # q_parse_compute: the Q_PARSE derived compute — lex + parse one file into a heap
@@ -2292,6 +2303,200 @@ fun q_parse_emit_stage(s: *sess.Session, stage: str, path: str) {
     print.eprint(" ");
     print.eprint(path);
     print.eprint("\n");
+}
+
+# q_exports_compute: the Q_EXPORTS derived compute — a deterministic byte
+# fingerprint of one module's public surface (#1581). reaches the module's parsed
+# AST through db.ctx and records the Q_PARSE dep, so any re-parse re-runs this;
+# but the fingerprint covers only each pub decl's kind, name, and signature shape
+# (a function body is excluded), so a private-only edit reproduces identical
+# bytes and the engine's output early-cutoff firewalls importers. a plain
+# byte-valued derived kind (early-cutoff ON), not an owned handle.
+fun q_exports_compute(db: *query.QueryDb, key: u64, alloc: *Allocator) Result[query.QueryOutput, str] {
+    val s: *sess.Session = db.ctx::*sess.Session;
+    if (s == nil) { ret err[query.QueryOutput, str]("Q_EXPORTS: query db has no session context"); }
+    val mid: sess.ModuleId = key::u32;
+
+    val a: *ast.Ast = sess.module_ast(s, mid);
+    if (a == nil) { ret err[query.QueryOutput, str]("Q_EXPORTS: module has no registered AST"); }
+
+    val rd: Result[bool, str] = query.record_dep(db, query.Q_EXPORTS, key, query.Q_PARSE, a.file_id::u64);
+    if (is_err[bool, str](rd)) { ret err[query.QueryOutput, str](unwrap_err[bool, str](rd)); }
+
+    val src_opt: Option[*src.SourceFile] = src.get(?s.sources, a.file_id);
+    if (is_none[*src.SourceFile](src_opt)) { ret err[query.QueryOutput, str]("Q_EXPORTS: FileId not registered with the session"); }
+    val source: str = unwrap[*src.SourceFile](src_opt).text;
+
+    var fb: FpBuf;
+    fb.alloc = alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+
+    val m_opt: Option[*module.Module] = ast.get_module(a, a.root_module);
+    if (is_some[*module.Module](m_opt)) {
+        val mnode: *module.Module = unwrap[*module.Module](m_opt);
+        val wr: Result[bool, str] = fp_walk_decls(?fb, a, source, mnode.decls_start, mnode.decls_len);
+        if (is_err[bool, str](wr)) {
+            if (fb.buf != nil && fb.cap > 0) { deallocate[u8](alloc, fb.buf, fb.cap::usize); }
+            ret err[query.QueryOutput, str](unwrap_err[bool, str](wr));
+        }
+    }
+
+    var out: query.QueryOutput;
+    out.bytes = fb.buf;
+    out.len   = fb.len;
+    ret ok[query.QueryOutput, str](out);
+}
+
+# FpBuf: a growable byte buffer the export fingerprint is appended into.
+# ---
+# alloc: backing allocator
+# buf:   owned byte buffer (transfers to the QueryOutput on success)
+# len:   bytes written so far
+# cap:   allocated capacity
+rec FpBuf {
+    alloc: *Allocator;
+    buf:   *u8;
+    len:   u32;
+    cap:   u32;
+}
+
+# fp_reserve: ensure the buffer has room for `extra` more bytes.
+fun fp_reserve(b: *FpBuf, extra: u32) Result[bool, str] {
+    if (b.len + extra <= b.cap) { ret ok[bool, str](true); }
+    var new_cap: u32 = b.cap;
+    if (new_cap == 0) { new_cap = 64; }
+    for (b.len + extra > new_cap) { new_cap = new_cap * 2; }
+    if (b.buf == nil) {
+        val r: Result[*u8, str] = allocate[u8](b.alloc, new_cap::usize);
+        if (is_err[*u8, str](r)) { ret err[bool, str](unwrap_err[*u8, str](r)); }
+        b.buf = unwrap_ok[*u8, str](r);
+    } or {
+        val r: Result[*u8, str] = reallocate[u8](b.alloc, b.buf, b.cap::usize, new_cap::usize);
+        if (is_err[*u8, str](r)) { ret err[bool, str](unwrap_err[*u8, str](r)); }
+        b.buf = unwrap_ok[*u8, str](r);
+    }
+    b.cap = new_cap;
+    ret ok[bool, str](true);
+}
+
+# fp_u8: append one byte.
+fun fp_u8(b: *FpBuf, v: u8) Result[bool, str] {
+    val r: Result[bool, str] = fp_reserve(b, 1);
+    if (is_err[bool, str](r)) { ret r; }
+    b.buf[b.len] = v;
+    b.len = b.len + 1;
+    ret ok[bool, str](true);
+}
+
+# fp_u32: append a u32 in little-endian, so a length prefix is unambiguous.
+fun fp_u32(b: *FpBuf, v: u32) Result[bool, str] {
+    val r: Result[bool, str] = fp_reserve(b, 4);
+    if (is_err[bool, str](r)) { ret r; }
+    b.buf[b.len]     = (v & 0xFF)::u8;
+    b.buf[b.len + 1] = ((v >> 8) & 0xFF)::u8;
+    b.buf[b.len + 2] = ((v >> 16) & 0xFF)::u8;
+    b.buf[b.len + 3] = ((v >> 24) & 0xFF)::u8;
+    b.len = b.len + 4;
+    ret ok[bool, str](true);
+}
+
+# fp_span: append a length prefix and the source bytes covered by `span`.
+fun fp_span(b: *FpBuf, source: str, span: token.Span) Result[bool, str] {
+    val n: u32 = span.len::u32;
+    val rl: Result[bool, str] = fp_u32(b, n);
+    if (is_err[bool, str](rl)) { ret rl; }
+    val rr: Result[bool, str] = fp_reserve(b, n);
+    if (is_err[bool, str](rr)) { ret rr; }
+    var i: usize = 0;
+    for (i < span.len) {
+        b.buf[b.len] = source[span.offset + i];
+        b.len = b.len + 1;
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# fp_walk_decls: append every pub declaration in a decl list to the fingerprint,
+# recursing into comptime-if branches (where target-gated pub decls live). decls
+# are walked in source order, which is deterministic for a given AST.
+fun fp_walk_decls(b: *FpBuf, a: *ast.Ast, source: str, start: u32, len: u32) Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = a.decl_ids[start + i];
+        val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
+        if (is_some[*decl.Decl](d_opt)) {
+            val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+            if ((d.flags & decl.DECL_FLAG_PUB) != 0::u8) {
+                val r: Result[bool, str] = fp_emit_decl(b, a, source, d);
+                if (is_err[bool, str](r)) { ret r; }
+            }
+            if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+                val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
+                var bi: u32 = 0;
+                for (bi < ci.branches_len) {
+                    val br: *decl.ComptimeBranch = ?a.comptime_branches[ci.branches_start + bi];
+                    val rb: Result[bool, str] = fp_walk_decls(b, a, source, br.body_start, br.body_len);
+                    if (is_err[bool, str](rb)) { ret rb; }
+                    bi = bi + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# fp_emit_decl: append one pub decl's kind, name, and signature shape. the shape
+# is the decl's source span with a function body excluded (so a body-only edit is
+# invisible to the fingerprint); for every other kind the whole decl span is the
+# public contract (a record's fields, a pub val's initializer, a def's underlying
+# type all matter to importers).
+fun fp_emit_decl(b: *FpBuf, a: *ast.Ast, source: str, d: *decl.Decl) Result[bool, str] {
+    val rk: Result[bool, str] = fp_u8(b, d.kind::u8);
+    if (is_err[bool, str](rk)) { ret rk; }
+    val rn: Result[bool, str] = fp_span(b, source, decl_name_span(d));
+    if (is_err[bool, str](rn)) { ret rn; }
+    ret fp_span(b, source, decl_shape_span(a, d));
+}
+
+# decl_name_span: the span of a decl's declared identifier (the alias for a
+# use/fwd re-export, falling back to its path when the alias is elided).
+fun decl_name_span(d: *decl.Decl) token.Span {
+    if (d.kind == decl.DECL_KIND_FUN) { ret d.data.fun_.name; }
+    if (d.kind == decl.DECL_KIND_REC) { ret d.data.rec_.name; }
+    if (d.kind == decl.DECL_KIND_UNI) { ret d.data.uni_.name; }
+    if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) { ret d.data.bind.name; }
+    if (d.kind == decl.DECL_KIND_DEF) { ret d.data.def_.name; }
+    if (d.kind == decl.DECL_KIND_USE) {
+        if (d.data.use_.alias.len > 0::usize) { ret d.data.use_.alias; }
+        ret d.data.use_.path;
+    }
+    if (d.kind == decl.DECL_KIND_FWD) {
+        if (d.data.fwd_.alias.len > 0::usize) { ret d.data.fwd_.alias; }
+        ret d.data.fwd_.path;
+    }
+    ret d.span;
+}
+
+# decl_shape_span: the source span that is a decl's public contract — a function's
+# signature (its decl span up to the body block, body excluded) or the whole decl
+# span otherwise.
+fun decl_shape_span(a: *ast.Ast, d: *decl.Decl) token.Span {
+    if (d.kind == decl.DECL_KIND_FUN && d.data.fun_.body != id.STMT_NIL) {
+        val s_opt: Option[*stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
+        if (is_some[*stmt.Stmt](s_opt)) {
+            val body_off: usize = unwrap[*stmt.Stmt](s_opt).span.offset;
+            if (body_off > d.span.offset) {
+                var sig: token.Span;
+                sig.offset = d.span.offset;
+                sig.len    = body_off - d.span.offset;
+                ret sig;
+            }
+        }
+    }
+    ret d.span;
 }
 
 # walk_module_for_load: walk the module's decls in source order,
@@ -3917,6 +4122,86 @@ test "driver incremental: a module keeps its stable identity across a graph resh
     if (sid_b2 != sid_b1) { bad = 1; }
     dnit_project(?p2);
 
+    fs.remove_all(?alloc, root);
+    sess.dnit(?s);
+    ret bad;
+}
+
+test "driver incremental: Q_EXPORTS fingerprints the pub surface, firewalls a private body edit (#1581)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+
+    val rr: Result[bool, str] = tgt.register_all(?s.registry);
+    if (is_err[bool, str](rr)) { sess.dnit(?s); ret 1; }
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "pub fun f(a: i32) i32 { ret a; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (is_err[str, str](root_r)) { sess.dnit(?s); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: capture the module's Q_EXPORTS fingerprint and its last_changed.
+    val p1r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p1r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p1: Project = unwrap_ok[Project, str](p1r);
+    val mid: sess.ModuleId = ut_mid(?p1, ?s, "uniontest.main");
+    if (mid == sess.MODULE_NIL) { bad = 1; }
+    val q1: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_EXPORTS, mid::u64);
+    if (is_err[*query.QueryEntry, str](q1)) { dnit_project(?p1); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    val ent1: *query.QueryEntry = unwrap_ok[*query.QueryEntry, str](q1);
+    val lc1: query.Revision = ent1.last_changed;
+    val len1: u32 = ent1.value_len;
+    # copy the fingerprint bytes — the entry's buffer is replaced on a recompute.
+    val fr: Result[*u8, str] = allocate[u8](?alloc, len1::usize);
+    if (is_err[*u8, str](fr)) { dnit_project(?p1); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    val fp1: *u8 = unwrap_ok[*u8, str](fr);
+    mem.raw_copy(fp1::ptr, ent1.value::ptr, len1::usize);
+    if (len1 == 0) { bad = 1; }
+    dnit_project(?p1);
+
+    # edit only the body: the signature is byte-identical, so Q_EXPORTS reproduces
+    # the same fingerprint and the engine early-cuts — last_changed must NOT advance.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val main_path: str = ut_cc3(?alloc, src_dir, "/", "main.mach");
+    val body_edit: str = "pub fun f(a: i32) i32 { val t: i32 = a; ret t; }\n";
+    val w2: Result[bool, str] = fs.write_file(main_path, body_edit, str_len(body_edit), 420);
+    if (is_err[bool, str](w2)) { deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+
+    val p2r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p2r)) { deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p2: Project = unwrap_ok[Project, str](p2r);
+    val q2: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_EXPORTS, mid::u64);
+    if (is_err[*query.QueryEntry, str](q2)) { dnit_project(?p2); deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    val ent2: *query.QueryEntry = unwrap_ok[*query.QueryEntry, str](q2);
+    if (ent2.last_changed != lc1) { bad = 1; }                                   # firewall: no change
+    if (ent2.value_len != len1) { bad = 1; }
+    or (!mem.raw_equal(ent2.value::ptr, fp1::ptr, len1::usize)) { bad = 1; }      # byte-identical
+    dnit_project(?p2);
+
+    # edit the pub signature: the fingerprint must change and last_changed advance.
+    val sig_edit: str = "pub fun f(a: i64) i32 { ret 0::i32; }\n";
+    val w3: Result[bool, str] = fs.write_file(main_path, sig_edit, str_len(sig_edit), 420);
+    if (is_err[bool, str](w3)) { deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+
+    val p3r: Result[Project, str] = build_project_union(?s, root);
+    if (is_err[Project, str](p3r)) { deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    var p3: Project = unwrap_ok[Project, str](p3r);
+    val q3: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_EXPORTS, mid::u64);
+    if (is_err[*query.QueryEntry, str](q3)) { dnit_project(?p3); deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
+    val ent3: *query.QueryEntry = unwrap_ok[*query.QueryEntry, str](q3);
+    if (ent3.last_changed == lc1) { bad = 1; }                                   # pub change: advanced
+    if (ent3.value_len == len1 && mem.raw_equal(ent3.value::ptr, fp1::ptr, len1::usize)) { bad = 1; }
+    dnit_project(?p3);
+
+    deallocate[u8](?alloc, fp1, len1::usize);
     fs.remove_all(?alloc, root);
     sess.dnit(?s);
     ret bad;
