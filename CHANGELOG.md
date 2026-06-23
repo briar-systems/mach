@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.6] - 2026-06-23
+
+Incremental parse caching (first increment of #1164): unchanged modules are no
+longer re-parsed across builds, so a one-file edit's rebuild re-lexes/re-parses
+only the changed file instead of the whole reachable closure.
+
+### Changed
+
+- driver: parsed ASTs are cached in a session-owned `AstCache` keyed by
+  `(FileId, source revision)` and reused across builds; `parse_module` skips
+  tokenize+parse on a cache hit. `ModuleEntry` now borrows its AST from the
+  cache (the cache is the sole owner; `dnit_project` no longer frees it), so the
+  cache survives a project teardown and rebuild.
+- source: `update` no longer bumps a file's revision when the new text is
+  byte-identical to the old, so an unchanged file keeps its revision (and stays
+  a cache hit) across rebuilds.
+
 ## [2.5.5] - 2026-06-23
 
 `mach doc` now reads first-class documentation, so the compiler, the docstring
